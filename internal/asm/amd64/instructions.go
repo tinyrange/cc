@@ -1,9 +1,13 @@
 package amd64
 
-import "fmt"
+import (
+	"fmt"
 
-func MovImmediate(dst Reg, value int64) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+	"github.com/tinyrange/cc/internal/asm"
+)
+
+func MovImmediate(dst Reg, value int64) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeMovRegImm(dst, value)
 		if err != nil {
 			return err
@@ -13,8 +17,8 @@ func MovImmediate(dst Reg, value int64) Fragment {
 	})
 }
 
-func MovReg(dst, src Reg) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func MovReg(dst, src Reg) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeMovRegReg(dst, src)
 		if err != nil {
 			return err
@@ -24,8 +28,8 @@ func MovReg(dst, src Reg) Fragment {
 	})
 }
 
-func MovToMemory(mem Memory, src Reg) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func MovToMemory(mem Memory, src Reg) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeMovMemReg(mem, src)
 		if err != nil {
 			return err
@@ -35,8 +39,8 @@ func MovToMemory(mem Memory, src Reg) Fragment {
 	})
 }
 
-func MovFromMemory(dst Reg, mem Memory) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func MovFromMemory(dst Reg, mem Memory) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeMovRegMem(dst, mem)
 		if err != nil {
 			return err
@@ -46,8 +50,8 @@ func MovFromMemory(dst Reg, mem Memory) Fragment {
 	})
 }
 
-func CallReg(target Reg) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func CallReg(target Reg) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeCallReg(target)
 		if err != nil {
 			return err
@@ -57,8 +61,8 @@ func CallReg(target Reg) Fragment {
 	})
 }
 
-func MovZX8(dst Reg, mem Memory) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func MovZX8(dst Reg, mem Memory) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeMovZXRegMem(dst, mem, size8)
 		if err != nil {
 			return err
@@ -68,8 +72,8 @@ func MovZX8(dst Reg, mem Memory) Fragment {
 	})
 }
 
-func MovZX16(dst Reg, mem Memory) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func MovZX16(dst Reg, mem Memory) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeMovZXRegMem(dst, mem, size16)
 		if err != nil {
 			return err
@@ -79,8 +83,8 @@ func MovZX16(dst Reg, mem Memory) Fragment {
 	})
 }
 
-func MovStoreImm8(mem Memory, value byte) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func MovStoreImm8(mem Memory, value byte) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeMovMemImm8(mem, value)
 		if err != nil {
 			return err
@@ -90,8 +94,8 @@ func MovStoreImm8(mem Memory, value byte) Fragment {
 	})
 }
 
-func AddRegImm(reg Reg, value int32) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func AddRegImm(reg Reg, value int32) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeAddRegImm(reg, value)
 		if err != nil {
 			return err
@@ -101,8 +105,8 @@ func AddRegImm(reg Reg, value int32) Fragment {
 	})
 }
 
-func AddRegReg(dst, src Reg) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func AddRegReg(dst, src Reg) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeAddRegReg(dst, src)
 		if err != nil {
 			return err
@@ -112,8 +116,8 @@ func AddRegReg(dst, src Reg) Fragment {
 	})
 }
 
-func SubRegReg(dst, src Reg) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func SubRegReg(dst, src Reg) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeSubRegReg(dst, src)
 		if err != nil {
 			return err
@@ -123,8 +127,8 @@ func SubRegReg(dst, src Reg) Fragment {
 	})
 }
 
-func OrRegReg(dst, src Reg) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func OrRegReg(dst, src Reg) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeOrRegReg(dst, src)
 		if err != nil {
 			return err
@@ -134,8 +138,8 @@ func OrRegReg(dst, src Reg) Fragment {
 	})
 }
 
-func CmpRegImm(reg Reg, value int32) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func CmpRegImm(reg Reg, value int32) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeCmpRegImm(reg, value)
 		if err != nil {
 			return err
@@ -145,8 +149,8 @@ func CmpRegImm(reg Reg, value int32) Fragment {
 	})
 }
 
-func CmpRegReg(dst, src Reg) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func CmpRegReg(dst, src Reg) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeCmpRegReg(dst, src)
 		if err != nil {
 			return err
@@ -156,8 +160,8 @@ func CmpRegReg(dst, src Reg) Fragment {
 	})
 }
 
-func AndRegReg(dst, src Reg) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func AndRegReg(dst, src Reg) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeAndRegReg(dst, src)
 		if err != nil {
 			return err
@@ -167,8 +171,8 @@ func AndRegReg(dst, src Reg) Fragment {
 	})
 }
 
-func AndRegImm(reg Reg, value int32) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func AndRegImm(reg Reg, value int32) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeAndRegImm(reg, value)
 		if err != nil {
 			return err
@@ -178,8 +182,8 @@ func AndRegImm(reg Reg, value int32) Fragment {
 	})
 }
 
-func OrRegImm(reg Reg, value int32) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func OrRegImm(reg Reg, value int32) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeOrRegImm(reg, value)
 		if err != nil {
 			return err
@@ -189,8 +193,8 @@ func OrRegImm(reg Reg, value int32) Fragment {
 	})
 }
 
-func XorRegReg(dst, src Reg) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func XorRegReg(dst, src Reg) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeXorRegRegSized(dst, src)
 		if err != nil {
 			return err
@@ -200,8 +204,8 @@ func XorRegReg(dst, src Reg) Fragment {
 	})
 }
 
-func ImulRegImm(dst, src Reg, value int32) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func ImulRegImm(dst, src Reg, value int32) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeImulRegImm(dst, src, value)
 		if err != nil {
 			return err
@@ -211,29 +215,29 @@ func ImulRegImm(dst, src Reg, value int32) Fragment {
 	})
 }
 
-func Hlt() Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func Hlt() asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		ctx.EmitBytes(encodeHlt())
 		return nil
 	})
 }
 
-func OutDXAL() Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func OutDXAL() asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		ctx.EmitBytes(encodeOutDXAL())
 		return nil
 	})
 }
 
-func Rdmsr() Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func Rdmsr() asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		ctx.EmitBytes(encodeRdmsr())
 		return nil
 	})
 }
 
-func ShrRegImm(reg Reg, count uint8) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func ShrRegImm(reg Reg, count uint8) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeShrRegImm(reg, count)
 		if err != nil {
 			return err
@@ -243,8 +247,8 @@ func ShrRegImm(reg Reg, count uint8) Fragment {
 	})
 }
 
-func ShlRegImm(reg Reg, count uint8) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func ShlRegImm(reg Reg, count uint8) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeShlRegImm(reg, count)
 		if err != nil {
 			return err
@@ -254,15 +258,16 @@ func ShlRegImm(reg Reg, count uint8) Fragment {
 	})
 }
 
-func Wrmsr() Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func Wrmsr() asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
 		ctx.EmitBytes(encodeWrmsr())
 		return nil
 	})
 }
 
-func LoadAddress(dst Reg, variable Variable) Fragment {
-	return fragmentFunc(func(ctx *Context) error {
+func LoadAddress(dst Reg, variable asm.Variable) asm.Fragment {
+	return fragmentFunc(func(_ctx asm.Context) error {
+		ctx := _ctx.(*Context)
 		if dst.size != size64 {
 			return fmt.Errorf("load address requires 64-bit register")
 		}
@@ -279,34 +284,34 @@ func LoadAddress(dst Reg, variable Variable) Fragment {
 	})
 }
 
-func JumpIfNotEqual(label Label) Fragment {
+func JumpIfNotEqual(label asm.Label) asm.Fragment {
 	return &jump{label: label, kind: jumpNotEqual}
 }
 
-func JumpIfNotZero(label Label) Fragment {
+func JumpIfNotZero(label asm.Label) asm.Fragment {
 	return &jump{label: label, kind: jumpNotZero}
 }
 
-func JumpIfAboveOrEqual(label Label) Fragment {
+func JumpIfAboveOrEqual(label asm.Label) asm.Fragment {
 	return &jump{label: label, kind: jumpAboveOrEqual}
 }
 
-func JumpIfBelowOrEqual(label Label) Fragment {
+func JumpIfBelowOrEqual(label asm.Label) asm.Fragment {
 	return &jump{label: label, kind: jumpBelowOrEqual}
 }
 
-func JumpIfEqual(label Label) Fragment {
+func JumpIfEqual(label asm.Label) asm.Fragment {
 	return &jump{label: label, kind: jumpEqual}
 }
 
-func JumpIfLess(label Label) Fragment {
+func JumpIfLess(label asm.Label) asm.Fragment {
 	return &jump{label: label, kind: jumpLess}
 }
 
-func JumpIfAbove(label Label) Fragment {
+func JumpIfAbove(label asm.Label) asm.Fragment {
 	return &jump{label: label, kind: jumpAbove}
 }
 
-func JumpIfGreater(label Label) Fragment {
+func JumpIfGreater(label asm.Label) asm.Fragment {
 	return &jump{label: label, kind: jumpGreater}
 }

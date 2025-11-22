@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+
+	"github.com/tinyrange/cc/internal/asm"
 )
 
 type rexState struct {
@@ -34,7 +36,7 @@ func (r rexState) prefix() byte {
 	return p
 }
 
-func needsByteREX(id Variable) bool {
+func needsByteREX(id asm.Variable) bool {
 	switch id {
 	case RSP, RBP, RSI, RDI:
 		return true

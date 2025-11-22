@@ -1,6 +1,10 @@
 package amd64
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/tinyrange/cc/internal/asm"
+)
 
 type operandSize uint8
 
@@ -13,7 +17,7 @@ const (
 
 // Reg represents a general-purpose register with an explicit operand size.
 type Reg struct {
-	id   Variable
+	id   asm.Variable
 	size operandSize
 }
 
@@ -25,16 +29,16 @@ func (r Reg) checkWidth(expected operandSize) error {
 }
 
 // Reg64 constructs a 64-bit register operand backed by the provided register id.
-func Reg64(id Variable) Reg { return Reg{id: id, size: size64} }
+func Reg64(id asm.Variable) Reg { return Reg{id: id, size: size64} }
 
 // Reg32 constructs a 32-bit register operand backed by the provided register id.
-func Reg32(id Variable) Reg { return Reg{id: id, size: size32} }
+func Reg32(id asm.Variable) Reg { return Reg{id: id, size: size32} }
 
 // Reg16 constructs a 16-bit register operand backed by the provided register id.
-func Reg16(id Variable) Reg { return Reg{id: id, size: size16} }
+func Reg16(id asm.Variable) Reg { return Reg{id: id, size: size16} }
 
 // Reg8 constructs an 8-bit register operand backed by the provided register id.
-func Reg8(id Variable) Reg { return Reg{id: id, size: size8} }
+func Reg8(id asm.Variable) Reg { return Reg{id: id, size: size8} }
 
 // Memory describes an effective address used by memory operands.
 type Memory struct {
@@ -95,6 +99,6 @@ func (m Memory) validate() error {
 	return nil
 }
 
-type fragmentFunc func(*Context) error
+type fragmentFunc func(asm.Context) error
 
-func (f fragmentFunc) Emit(ctx *Context) error { return f(ctx) }
+func (f fragmentFunc) Emit(ctx asm.Context) error { return f(ctx) }

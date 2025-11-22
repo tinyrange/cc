@@ -9,17 +9,18 @@ import (
 	"os"
 	"testing"
 
+	"github.com/tinyrange/cc/internal/asm"
 	"golang.org/x/sys/unix"
 )
 
 func TestASMFunctionCall(t *testing.T) {
-	callee := Label("callee")
-	fn := MustCompile(Group{
+	callee := asm.Label("callee")
+	fn := MustCompile(asm.Group{
 		MovImmediate(Reg64(RDI), 5),
 		Call(callee),
 		AddRegImm(Reg64(RAX), 1),
 		Ret(),
-		MarkLabel(callee),
+		asm.MarkLabel(callee),
 		MovReg(Reg64(RAX), Reg64(RDI)),
 		AddRegImm(Reg64(RAX), 10),
 		Ret(),
@@ -31,13 +32,13 @@ func TestASMFunctionCall(t *testing.T) {
 }
 
 func TestASMCallBetweenCompiledFunctions(t *testing.T) {
-	callee := MustCompile(Group{
+	callee := MustCompile(asm.Group{
 		AddRegImm(Reg64(RDI), 2),
 		MovReg(Reg64(RAX), Reg64(RDI)),
 		Ret(),
 	})
 
-	caller := MustCompile(Group{
+	caller := MustCompile(asm.Group{
 		AddRegImm(Reg64(RDI), 5),
 		MovImmediate(Reg64(R11), int64(callee.Entry())),
 		CallReg(Reg64(R11)),
@@ -51,7 +52,7 @@ func TestASMCallBetweenCompiledFunctions(t *testing.T) {
 }
 
 func TestASMPrintf(t *testing.T) {
-	frag := Group{
+	frag := asm.Group{
 		MovImmediate(Reg64(RAX), 0x1234),
 		MovImmediate(Reg64(RBX), 0xABCD),
 		Printf("Value: rax=0x%x, rbx=0x%x\n", Reg64(RAX), Reg64(RBX)),

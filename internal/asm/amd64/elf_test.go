@@ -6,19 +6,20 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"github.com/tinyrange/cc/internal/asm"
 	"github.com/tinyrange/cc/internal/linux"
 )
 
-func Exit(code int) Fragment {
+func Exit(code int) asm.Fragment {
 	return Syscall(
 		linux.SYS_EXIT,
-		Immediate(code),
+		asm.Immediate(code),
 	)
 }
 
 func TestStandaloneELFHeader(t *testing.T) {
-	frag := Group{
-		SyscallWriteString(Immediate(1), "Hello, ELF!\n"),
+	frag := asm.Group{
+		SyscallWriteString(asm.Immediate(1), "Hello, ELF!\n"),
 		Exit(0),
 	}
 
@@ -28,7 +29,7 @@ func TestStandaloneELFHeader(t *testing.T) {
 	}
 
 	cfg := DefaultStandaloneELFConfig()
-	elfBytes, err := prog.StandaloneELF()
+	elfBytes, err := StandaloneELF(prog)
 	if err != nil {
 		t.Fatalf("StandaloneELF failed: %v", err)
 	}
@@ -82,9 +83,9 @@ func TestStandaloneELFHeader(t *testing.T) {
 }
 
 func TestStandaloneELFRelocations(t *testing.T) {
-	frag := Group{
+	frag := asm.Group{
 		LoadConstantString(R8, "greetings"),
-		SyscallWrite(Immediate(1), R8, Immediate(9)),
+		SyscallWrite(asm.Immediate(1), R8, asm.Immediate(9)),
 		Exit(0),
 	}
 	prog, err := EmitProgram(frag)
@@ -93,7 +94,7 @@ func TestStandaloneELFRelocations(t *testing.T) {
 	}
 
 	cfg := DefaultStandaloneELFConfig()
-	elfBytes, err := prog.StandaloneELF()
+	elfBytes, err := StandaloneELF(prog)
 	if err != nil {
 		t.Fatalf("StandaloneELF failed: %v", err)
 	}
@@ -116,7 +117,7 @@ func TestStandaloneELFRelocations(t *testing.T) {
 }
 
 func TestStandaloneELFCustomConfig(t *testing.T) {
-	prog, err := EmitProgram(Group{
+	prog, err := EmitProgram(asm.Group{
 		Exit(123),
 	})
 	if err != nil {
@@ -130,7 +131,7 @@ func TestStandaloneELFCustomConfig(t *testing.T) {
 		SegmentFlags:     elf.PF_R | elf.PF_X,
 	}
 
-	elfBytes, err := prog.StandaloneELFWithConfig(cfg)
+	elfBytes, err := StandaloneELFWithConfig(prog, cfg)
 	if err != nil {
 		t.Fatalf("StandaloneELFWithConfig failed: %v", err)
 	}

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"sync/atomic"
 
-	asm "github.com/tinyrange/cc/internal/asm/amd64"
+	"github.com/tinyrange/cc/internal/asm"
 )
 
 // SyscallCheckedConfig describes a syscall invocation that assigns the result
@@ -48,16 +48,16 @@ func SyscallChecked(cfg SyscallCheckedConfig) Fragment {
 	return block
 }
 
-const defaultStageResultShift = 32
+const DefaultStageResultShift = 32
 
 var (
 	helperVarCounter uint64
 	stackSlotCounter uint64
 )
 
-type constantBytesFragment struct {
-	target asm.Variable
-	data   []byte
+type ConstantBytesFragment struct {
+	Target asm.Variable
+	Data   []byte
 }
 
 // ConstantBytesConfig describes how a constant byte slice should be bound to an
@@ -115,9 +115,9 @@ func LoadConstantBytesConfig(cfg ConstantBytesConfig) Fragment {
 	}
 
 	frags := Block{
-		constantBytesFragment{
-			target: cfg.Target,
-			data:   raw,
+		ConstantBytesFragment{
+			Target: cfg.Target,
+			Data:   raw,
 		},
 	}
 
@@ -134,17 +134,17 @@ func LoadConstantBytesConfig(cfg ConstantBytesConfig) Fragment {
 	return frags
 }
 
-type constantPointerFragment struct {
-	target asm.Variable
+type ConstantPointerFragment struct {
+	Target asm.Variable
 }
 
 // ConstantPointer loads the address of a constant declared via LoadConstantBytes.
 func ConstantPointer(variable asm.Variable) Fragment {
-	return constantPointerFragment{target: variable}
+	return ConstantPointerFragment{Target: variable}
 }
 
-type methodPointerFragment struct {
-	name string
+type MethodPointerFragment struct {
+	Name string
 }
 
 // MethodPointer returns a placeholder for the entry address of the named IR method.
@@ -154,7 +154,7 @@ func MethodPointer(name string) Fragment {
 	if name == "" {
 		panic("ir: MethodPointer requires a method name")
 	}
-	return methodPointerFragment{name: name}
+	return MethodPointerFragment{Name: name}
 }
 
 // CallMethod emits an indirect call to another IR method.
@@ -162,8 +162,8 @@ func CallMethod(name string, result ...Var) Fragment {
 	return Call(MethodPointer(name), result...)
 }
 
-type globalPointerFragment struct {
-	name string
+type GlobalPointerFragment struct {
+	Name string
 }
 
 // Pointer returns a placeholder pointing at the base address of the global
@@ -173,7 +173,7 @@ func (g GlobalVar) Pointer() Fragment {
 	if g == "" {
 		panic("ir: global pointer requires a name")
 	}
-	return globalPointerFragment{name: string(g)}
+	return GlobalPointerFragment{Name: string(g)}
 }
 
 // AssignGlobal stores value into the provided global variable. It behaves like
@@ -212,7 +212,7 @@ func WriteStageResult(cfg StageResultStoreConfig) Fragment {
 	}
 	shift := cfg.Shift
 	if shift <= 0 {
-		shift = defaultStageResultShift
+		shift = DefaultStageResultShift
 	}
 	scratch := cfg.Scratch
 	if scratch == "" {
@@ -250,24 +250,24 @@ type StackSlot struct {
 
 // Base returns a MemoryFragment covering the start of the slot.
 func (s StackSlot) Base() MemoryFragment {
-	return stackSlotMemFragment{slotID: s.id}
+	return StackSlotMemFragment{SlotID: s.id}
 }
 
 // At returns a MemoryFragment located at the provided displacement from the
 // slot base.
 func (s StackSlot) At(disp any) MemoryFragment {
-	return stackSlotMemFragment{slotID: s.id, disp: asFragment(disp)}
+	return StackSlotMemFragment{SlotID: s.id, Disp: asFragment(disp)}
 }
 
 // Pointer returns the address of the slot base.
 func (s StackSlot) Pointer() Fragment {
-	return stackSlotPtrFragment{slotID: s.id}
+	return StackSlotPtrFragment{SlotID: s.id}
 }
 
 // PointerWithDisp returns the address of the slot plus the provided
 // displacement.
 func (s StackSlot) PointerWithDisp(disp any) Fragment {
-	return stackSlotPtrFragment{slotID: s.id, disp: asFragment(disp)}
+	return StackSlotPtrFragment{SlotID: s.id, Disp: asFragment(disp)}
 }
 
 // Size reports the total number of bytes reserved for the slot.
@@ -275,11 +275,11 @@ func (s StackSlot) Size() int64 {
 	return s.size
 }
 
-type stackSlotFragment struct {
-	id     uint64
-	size   int64
-	body   Fragment
-	chunks []string
+type StackSlotFragment struct {
+	Id     uint64
+	Size   int64
+	Body   Fragment
+	Chunks []string
 }
 
 // WithStackSlot creates a temporary stack allocation for the duration of Body.
@@ -303,24 +303,24 @@ func WithStackSlot(cfg StackSlotConfig) Fragment {
 		names[i] = fmt.Sprintf("__ir_slot_%d_%04d", id, i)
 	}
 	slot := StackSlot{id: id, size: totalSize}
-	return stackSlotFragment{
-		id:     id,
-		size:   totalSize,
-		body:   cfg.Body(slot),
-		chunks: names,
+	return StackSlotFragment{
+		Id:     id,
+		Size:   totalSize,
+		Body:   cfg.Body(slot),
+		Chunks: names,
 	}
 }
 
-type stackSlotMemFragment struct {
-	slotID uint64
-	disp   Fragment
+type StackSlotMemFragment struct {
+	SlotID uint64
+	Disp   Fragment
 }
 
-func (m stackSlotMemFragment) WithDisp(disp any) Fragment {
-	return stackSlotMemFragment{slotID: m.slotID, disp: asFragment(disp)}
+func (m StackSlotMemFragment) WithDisp(disp any) Fragment {
+	return StackSlotMemFragment{SlotID: m.SlotID, Disp: asFragment(disp)}
 }
 
-type stackSlotPtrFragment struct {
-	slotID uint64
-	disp   Fragment
+type StackSlotPtrFragment struct {
+	SlotID uint64
+	Disp   Fragment
 }

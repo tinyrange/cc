@@ -9,11 +9,13 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/tinyrange/cc/internal/asm"
 )
 
 func TestStandaloneELFExecutes(t *testing.T) {
-	elfBytes, err := EmitStandaloneELF(Group{
-		SyscallWriteString(Immediate(1), "standalone-ok\n"),
+	elfBytes, err := EmitStandaloneELF(asm.Group{
+		SyscallWriteString(asm.Immediate(1), "standalone-ok\n"),
 		Exit(0),
 	})
 	if err != nil {

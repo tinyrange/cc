@@ -4,6 +4,8 @@ import (
 	"debug/elf"
 	"encoding/binary"
 	"fmt"
+
+	"github.com/tinyrange/cc/internal/asm"
 )
 
 const (
@@ -50,22 +52,22 @@ func DefaultStandaloneELFConfig() StandaloneELFConfig {
 
 // StandaloneELF emits the program as a standalone ELF binary using the default
 // configuration.
-func (p Program) StandaloneELF() ([]byte, error) {
-	return p.StandaloneELFWithConfig(DefaultStandaloneELFConfig())
+func StandaloneELF(prog asm.Program) ([]byte, error) {
+	return StandaloneELFWithConfig(prog, DefaultStandaloneELFConfig())
 }
 
 // StandaloneELFWithConfig emits the program as a standalone ELF binary using
 // the provided configuration. Zero-valued configuration fields are replaced
 // with sensible defaults.
-func (p Program) StandaloneELFWithConfig(cfg StandaloneELFConfig) ([]byte, error) {
+func StandaloneELFWithConfig(prog asm.Program, cfg StandaloneELFConfig) ([]byte, error) {
 	cfg = cfg.withDefaults()
 
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 
-	code := p.RelocatedCopy(uintptr(cfg.BaseAddress))
-	bssSize := p.BSSSize()
+	code := prog.RelocatedCopy(uintptr(cfg.BaseAddress))
+	bssSize := prog.BSSSize()
 	fileSize := uint64(len(code))
 	memSize := fileSize + uint64(bssSize)
 
@@ -86,22 +88,22 @@ func (p Program) StandaloneELFWithConfig(cfg StandaloneELFConfig) ([]byte, error
 
 // EmitStandaloneELF emits the provided fragment as a standalone ELF binary
 // using the default configuration.
-func EmitStandaloneELF(f Fragment) ([]byte, error) {
+func EmitStandaloneELF(f asm.Fragment) ([]byte, error) {
 	prog, err := EmitProgram(f)
 	if err != nil {
 		return nil, err
 	}
-	return prog.StandaloneELF()
+	return StandaloneELF(prog)
 }
 
 // EmitStandaloneELFWithConfig emits the provided fragment as a standalone ELF
 // binary using the supplied configuration.
-func EmitStandaloneELFWithConfig(f Fragment, cfg StandaloneELFConfig) ([]byte, error) {
+func EmitStandaloneELFWithConfig(f asm.Fragment, cfg StandaloneELFConfig) ([]byte, error) {
 	prog, err := EmitProgram(f)
 	if err != nil {
 		return nil, err
 	}
-	return prog.StandaloneELFWithConfig(cfg)
+	return StandaloneELFWithConfig(prog, cfg)
 }
 
 func (cfg StandaloneELFConfig) withDefaults() StandaloneELFConfig {

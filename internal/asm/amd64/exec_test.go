@@ -3,10 +3,12 @@ package amd64
 import (
 	"testing"
 	"unsafe"
+
+	"github.com/tinyrange/cc/internal/asm"
 )
 
 func TestPrepareAssemblyWithArgs(t *testing.T) {
-	prog, err := EmitProgram(Group{
+	prog, err := EmitProgram(asm.Group{
 		MovToMemory(Mem(Reg64(RDI)), Reg64(RSI)),
 		MovToMemory(Mem(Reg64(RDI)).WithDisp(8), Reg64(RDX)),
 		MovToMemory(Mem(Reg64(RDI)).WithDisp(16), Reg64(RCX)),

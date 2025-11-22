@@ -8,13 +8,14 @@ import (
 	"reflect"
 	"unsafe"
 
+	"github.com/tinyrange/cc/internal/asm"
 	"golang.org/x/sys/unix"
 )
 
 type Func struct {
 	entry uintptr
 	call  func(...any) uintptr
-	prog  Program
+	prog  asm.Program
 }
 
 // Call executes the compiled assembly with the provided arguments.
@@ -31,17 +32,17 @@ func (fn Func) Entry() uintptr {
 }
 
 // Program returns a deep copy of the Program backing the compiled function.
-func (fn Func) Program() Program {
+func (fn Func) Program() asm.Program {
 	return fn.prog.Clone()
 }
 
-func Compile(f Fragment) (Func, func(), error) {
+func Compile(f asm.Fragment) (Func, func(), error) {
 	prog, err := EmitProgram(f)
 	if err != nil {
 		return Func{}, nil, fmt.Errorf("emit assembly program: %w", err)
 	}
 
-	fn, release, err := PrepareAssemblyWithArgs(prog.code, prog.relocations)
+	fn, release, err := PrepareAssemblyWithArgs(prog.Bytes(), prog.Relocations())
 	if err != nil {
 		return Func{}, nil, fmt.Errorf("prepare assembly with args: %w", err)
 	}
@@ -51,7 +52,7 @@ func Compile(f Fragment) (Func, func(), error) {
 	return fn, release, nil
 }
 
-func MustCompile(f Fragment) Func {
+func MustCompile(f asm.Fragment) Func {
 	fn, _, err := Compile(f)
 	if err != nil {
 		panic(err)
