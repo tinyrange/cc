@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -213,15 +214,26 @@ func main() {
 		}
 		defer f.Close()
 
+		// if git is available, get the commit hash
+		commitHash := "unknown"
+		if cmd := exec.Command("git", "rev-parse", "HEAD"); cmd != nil {
+			if out, err := cmd.Output(); err == nil {
+				commitHash = string(out)
+				commitHash = strings.TrimSpace(commitHash)
+			}
+		}
+
 		// write a first line with the go version, GOOS, GOARCH
 		if err := json.NewEncoder(f).Encode(struct {
 			GoVersion string `json:"go_version"`
 			GOOS      string `json:"go_os"`
 			GOARCH    string `json:"go_arch"`
+			Commit    string `json:"commit"`
 		}{
 			GoVersion: runtime.Version(),
 			GOOS:      runtime.GOOS,
 			GOARCH:    runtime.GOARCH,
+			Commit:    commitHash,
 		}); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to write benchmark metadata: %v\n", err)
 			os.Exit(1)

@@ -1,0 +1,7 @@
+{"go_version":"go1.25.1","go_os":"linux","go_arch":"amd64","commit":"fca955df215d556b89e063cef32e641d6b2606b9"}
+{"Time":"2025-11-22T17:48:32.074728479+10:00","Action":"start","Package":"github.com/tinyrange/cc/cmd/quest"}
+{"Time":"2025-11-22T17:48:32.074891404+10:00","Action":"output","Package":"github.com/tinyrange/cc/cmd/quest","Output":"?   \tgithub.com/tinyrange/cc/cmd/quest\t[no test files]\n"}
+{"Time":"2025-11-22T17:48:32.074908852+10:00","Action":"skip","Package":"github.com/tinyrange/cc/cmd/quest","Elapsed":0}
+{"Time":"2025-11-22T17:48:32.109100397+10:00","Action":"start","Package":"github.com/tinyrange/cc/tools"}
+{"Time":"2025-11-22T17:48:32.109144709+10:00","Action":"output","Package":"github.com/tinyrange/cc/tools","Output":"?   \tgithub.com/tinyrange/cc/tools\t[no test files]\n"}
+{"Time":"2025-11-22T17:48:32.109159217+10:00","Action":"skip","Package":"github.com/tinyrange/cc/tools","Elapsed":0}
