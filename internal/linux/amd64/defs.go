@@ -1,5 +1,3 @@
-//go:build amd64
-
 // Just all the defs from golang.org/x/sys/unix for linux/amd64
 
 package linux
