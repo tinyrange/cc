@@ -1,0 +1,92 @@
+package helpers
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/tinyrange/cc/internal/hv"
+	"github.com/tinyrange/cc/internal/ir"
+	irAmd64 "github.com/tinyrange/cc/internal/ir/amd64"
+)
+
+type LoadMode int
+
+const (
+	ModeInvalid LoadMode = iota
+	ModeProtectedMode
+	Mode64BitIdentityMapping
+)
+
+func (m LoadMode) String() string {
+	switch m {
+	case ModeProtectedMode:
+		return "protected-mode"
+	case Mode64BitIdentityMapping:
+		return "64bit-identity-mapping"
+	default:
+		return "invalid"
+	}
+}
+
+type ProgramLoader struct {
+	Program  ir.Program
+	Mode     LoadMode
+	BaseAddr uint64
+}
+
+// Run implements hv.RunConfig.
+func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
+	arch := vcpu.VirtualMachine().Hypervisor().Architecture()
+	switch arch {
+	case hv.ArchitectureX86_64:
+		switch p.Mode {
+		case ModeProtectedMode:
+			if err := vcpu.(hv.VirtualCPUAmd64).SetProtectedMode(); err != nil {
+				return fmt.Errorf("set protected mode: %w", err)
+			}
+		default:
+			return fmt.Errorf("unsupported load mode %v for architecture %v", p.Mode, arch)
+		}
+
+		if err := vcpu.SetRegisters(map[hv.Register]hv.RegisterValue{
+			hv.RegisterAMD64Rflags: hv.Register64(0x2),
+			hv.RegisterAMD64Rip:    hv.Register64(p.BaseAddr),
+		}); err != nil {
+			return fmt.Errorf("set initial registers: %w", err)
+		}
+
+		if err := vcpu.Run(ctx); err != nil {
+			return fmt.Errorf("run vCPU: %w", err)
+		}
+
+		return nil
+	default:
+		return fmt.Errorf("unsupported architecture: %v", arch)
+	}
+}
+
+// Load implements hv.VMLoader.
+func (p *ProgramLoader) Load(vm hv.VirtualMachine) error {
+	switch vm.Hypervisor().Architecture() {
+	case hv.ArchitectureX86_64:
+		prog, err := irAmd64.BuildStandaloneProgram(&p.Program)
+		if err != nil {
+			return fmt.Errorf("build standalone program: %w", err)
+		}
+
+		bytes := prog.RelocatedCopy(uintptr(p.BaseAddr))
+
+		if _, err := vm.WriteAt(bytes, int64(p.BaseAddr)); err != nil {
+			return fmt.Errorf("write program to vm memory: %w", err)
+		}
+
+		return nil
+	default:
+		return fmt.Errorf("unsupported architecture: %v", vm.Hypervisor().Architecture())
+	}
+}
+
+var (
+	_ hv.VMLoader  = &ProgramLoader{}
+	_ hv.RunConfig = &ProgramLoader{}
+)
