@@ -10,11 +10,13 @@ import (
 
 	"github.com/tinyrange/cc/internal/asm"
 	"github.com/tinyrange/cc/internal/asm/amd64"
+	"github.com/tinyrange/cc/internal/asm/arm64"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/factory"
 	"github.com/tinyrange/cc/internal/hv/helpers"
 	"github.com/tinyrange/cc/internal/ir"
 	amd64ir "github.com/tinyrange/cc/internal/ir/amd64"
+	arm64ir "github.com/tinyrange/cc/internal/ir/arm64"
 )
 
 type bringUpQuest struct {
@@ -100,6 +102,23 @@ func (q *bringUpQuest) Run() error {
 		}
 
 		if _, err := amd64.EmitStandaloneELF(frag); err != nil {
+			return fmt.Errorf("emit ELF: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if err := q.runTask("Compile arm64 test program", func() error {
+		frag, err := arm64ir.Compile(ir.Method{
+			ir.Printf("bringup-quest-ok\n"),
+			ir.Return(ir.Int64(42)),
+		})
+		if err != nil {
+			return fmt.Errorf("compile test program: %w", err)
+		}
+
+		if _, err := arm64.EmitStandaloneELF(frag); err != nil {
 			return fmt.Errorf("emit ELF: %w", err)
 		}
 		return nil

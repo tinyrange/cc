@@ -172,7 +172,13 @@ func (c *Context) appendDataPatch(pos int, section dataSection, target constantL
 }
 
 func (c *Context) addPointerLiteral(target constantLocation) int {
-	offset := len(c.literalData)
+	const literalAlign = 4
+	aligned := alignTo(len(c.literalData), literalAlign)
+	if aligned > len(c.literalData) {
+		padding := aligned - len(c.literalData)
+		c.literalData = append(c.literalData, make([]byte, padding)...)
+	}
+	offset := aligned
 	c.literalData = append(c.literalData, make([]byte, 8)...)
 	c.appendDataPatch(offset, sectionLiteral, target)
 	return offset
