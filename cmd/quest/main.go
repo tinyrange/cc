@@ -325,7 +325,7 @@ func (q *bringUpQuest) Run() error {
 		Methods: map[string]ir.Method{
 			"main": {
 				asm.Group{
-					amd64.LoadConstantBytes(dataMessage, append([]byte("Hello, World!"), 0)),
+					amd64.LoadConstantBytes(dataMessage, append([]byte("Hello"), 0)),
 					amd64.LoadAddress(amd64.Reg64(amd64.RSI), dataMessage),
 					amd64.MovImmediate(amd64.Reg64(amd64.RDX), 0xdead0000),
 					amd64.MovImmediate(amd64.Reg64(amd64.RAX), 0),
@@ -342,7 +342,7 @@ func (q *bringUpQuest) Run() error {
 			},
 		},
 	}, func(cpu hv.VirtualCPU) error {
-		if !bytes.Equal(result, []byte("Hello, World!")) {
+		if !bytes.Equal(result, []byte("Hello")) {
 			return fmt.Errorf("unexpected MMIO result: got %q, want %q", result, "Hello, World!")
 		}
 

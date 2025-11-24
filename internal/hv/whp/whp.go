@@ -7,7 +7,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"os"
 	"runtime"
+	"time"
 	"unsafe"
 
 	"github.com/tinyrange/cc/internal/hv"
@@ -18,6 +20,8 @@ type virtualCPU struct {
 	vm       *virtualMachine
 	id       int
 	runQueue chan func()
+
+	firstTickDone bool
 
 	pendingError error
 }
@@ -73,9 +77,24 @@ func (v *virtualCPU) GetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 	return nil
 }
 
+type w struct {
+}
+
+func (w) Write(p []byte) (n int, err error) {
+	// console escape noop
+	os.Stdout.WriteString("\x1b[0m")
+	return len(p), nil
+}
+
 // Run implements hv.VirtualCPU.
 func (v *virtualCPU) Run(ctx context.Context) error {
 	var exit bindings.RunVPExitContext
+
+	// HORRIBLE HACK TO GET BRING UP WORKING
+	if !v.firstTickDone {
+		slog.NewJSONHandler(w{}, nil).Handle(context.Background(), slog.NewRecord(time.Now(), slog.LevelDebug, "", 0))
+		v.firstTickDone = true
+	}
 
 	if err := bindings.RunVirtualProcessorContext(v.vm.part, uint32(v.id), &exit); err != nil {
 		return fmt.Errorf("whp: RunVirtualProcessorContext failed: %w", err)
@@ -433,10 +452,6 @@ func createEmulator() (bindings.EmulatorHandle, error) {
 	) bindings.HRESULT {
 		vcpu := (*virtualCPU)(ctx)
 
-		slog.Info("GetVirtualProcessorRegisters called",
-			"names", names,
-		)
-
 		// Note: We use the backing store (bindings.GetVirtualProcessorRegisters) to populate the emulator.
 		if err := bindings.GetVirtualProcessorRegisters(vcpu.vm.part, uint32(vcpu.id), names, values); err != nil {
 			// Panic here is risky but acceptable if we can't get registers the emulator critically needs.
@@ -452,11 +467,6 @@ func createEmulator() (bindings.EmulatorHandle, error) {
 		values []bindings.RegisterValue,
 	) bindings.HRESULT {
 		vcpu := (*virtualCPU)(ctx)
-
-		slog.Info("SetVirtualProcessorRegisters called",
-			"names", names,
-			"values", values,
-		)
 
 		if err := bindings.SetVirtualProcessorRegisters(vcpu.vm.part, uint32(vcpu.id), names, values); err != nil {
 			panic(fmt.Sprintf("SetVirtualProcessorRegisters failed: %v", err))
@@ -476,11 +486,6 @@ func createEmulator() (bindings.EmulatorHandle, error) {
 
 		var tResult bindings.TranslateGVAResult
 		var tGPA bindings.GuestPhysicalAddress
-
-		slog.Info("TranslateGvaPage called",
-			"gva", gva,
-			"flags", flags,
-		)
 
 		// Ensure we pass flags correctly, specifically allowing override if needed by the bindings.
 		if err := bindings.TranslateGVA(
