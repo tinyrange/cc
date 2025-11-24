@@ -15,11 +15,12 @@ CrumbleCracker is a high performance embeddable virtualization platform designed
 - [x] Setup build and testing tools including continuous benchmarking and cross-platform testing.
 - [x] Add a assembler and compiler for running small programs.
 - [x] Write a basic x86_64 KVM abstraction and a start to a **Bringup Quest** with VCPU, MMIO, and IO support.
+- [ ] Add automatic downloader for Alpine Linux kernels.
 - [ ] Add a serial device and boot a Linux kernel from Alpine Linux into a minimal Init program written using the assembler.
-- [ ] Add automatic downloader for Alpine Linux kernels loading necessary kernel modules.
 - [ ] Add `virtio-mmio` support starting with a `virtio-console` driver.
 - [ ] Write a more advanced init program supporting multiple entries into the virtual guest.
-- [ ] Add a downloader for OCI images to pull a root filesystem for the virtual machine.
+- [ ] Support loading necessary kernel modules in Alpine Linux.
+l- [ ] Add a downloader for OCI images to pull a root filesystem for the virtual machine.
 - [ ] Add support for `virtio-block` and my Ext4 driver derived from TinyRange2 to run simple binaries from the OCI image.
 - [ ] Add snapshotting support with support for capturing multiple snapshots tied to a MMIO control device.
 - [ ] Add a custom optimized TCP/IP stack tied to a `virtio-net` driver to add network support without privileges.
