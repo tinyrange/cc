@@ -9,11 +9,11 @@ import (
 )
 
 type rexState struct {
-	w     bool // 64-bit operand size
-	r     bool // Extension of the ModR/M reg field
-	x     bool // Extension of the SIB index field
-	b     bool // Extension of the ModR/M r/m field, SIB base field, or Opcode reg field
-	force bool // Force REX prefix (e.g. for SPL/BPL/SIL/DIL or Byte regs)
+	w     bool
+	r     bool
+	x     bool
+	b     bool
+	force bool
 }
 
 func (r rexState) prefix() byte {
@@ -36,15 +36,17 @@ func (r rexState) prefix() byte {
 	return p
 }
 
+// isExtendedPhys checks if the register is R8-R15 regardless of what regInfo says.
+func isExtendedPhys(id asm.Variable) bool {
+	return id >= R8 && id <= R15
+}
+
 func needsByteREX(id asm.Variable) bool {
 	switch id {
 	case RSP, RBP, RSI, RDI:
 		return true
 	}
-	if id >= R8 && id <= R15 {
-		return true
-	}
-	return false
+	return isExtendedPhys(id)
 }
 
 func operandPrefix(size operandSize) (byte, bool) {
@@ -58,6 +60,10 @@ func regEncoding(reg Reg) (registerCode, error) {
 	info, err := regInfo(reg.id)
 	if err != nil {
 		return registerCode{}, err
+	}
+	// Paranoid override: Ensure 'high' (REX extension) is set for R8-R15
+	if isExtendedPhys(reg.id) {
+		info.high = true
 	}
 	return info, nil
 }
@@ -126,7 +132,6 @@ func encodeMemoryOperand(mem Memory) (memEncoding, error) {
 
 		baseCode := baseInfo.code
 		if !mem.hasBase {
-			// Logic for no-base SIB (Mod=00, Base=5) could go here
 			baseCode = 5
 		}
 
@@ -146,7 +151,6 @@ func encodeMemoryOperand(mem Memory) (memEncoding, error) {
 
 		enc.sib = []byte{byte(scaleBits<<6) | byte(indexCode<<3) | byte(baseCode)}
 	} else if enc.modrm == 0x00 && rm == 5 {
-		// [rbp] / [r13] with zero displacement must use 8-bit displacement zero.
 		enc.modrm = 0x40
 		enc.disp = []byte{0}
 	}
@@ -173,22 +177,19 @@ func encodeMovRegImm(reg Reg, value int64) ([]byte, error) {
 
 	switch reg.size {
 	case size64:
-		// MOV r64, imm64 (REX.W + B8 + rd)
+		// MOV r64, imm64
 		opcode = 0xB8 + info.code
 		imm = make([]byte, 8)
 		binary.LittleEndian.PutUint64(imm, uint64(value))
 	case size32:
-		// MOV r32, imm32 (B8 + rd)
 		opcode = 0xB8 + info.code
 		imm = make([]byte, 4)
 		binary.LittleEndian.PutUint32(imm, uint32(value))
 	case size16:
-		// MOV r16, imm16 (66 + B8 + rd)
 		opcode = 0xB8 + info.code
 		imm = make([]byte, 2)
 		binary.LittleEndian.PutUint16(imm, uint16(value))
 	case size8:
-		// MOV r8, imm8 (B0 + rd)
 		opcode = 0xB0 + info.code
 		imm = []byte{byte(value)}
 	default:
@@ -224,8 +225,8 @@ func encodeMovRegReg(dst, src Reg) ([]byte, error) {
 	prefix, hasPrefix := operandPrefix(dst.size)
 	rex := rexState{
 		w:     dst.size == size64,
-		r:     srcInfo.high, // Src is Reg (ModRM.reg) -> REX.R
-		b:     dstInfo.high, // Dst is R/M (ModRM.r/m) -> REX.B
+		r:     srcInfo.high, // Source is Reg -> REX.R
+		b:     dstInfo.high, // Dst is R/M -> REX.B
 		force: (dst.size == size8 && (dstInfo.needsRex || srcInfo.needsRex)),
 	}
 
@@ -724,14 +725,11 @@ func encodeLeaRegRipRelative(dst Reg, offset int32) ([]byte, error) {
 		return nil, err
 	}
 
-	// LEA encodes the destination in the ModRM.reg field.
-	// Therefore, the REX.R bit extends the destination register.
-	// REX.B is not needed for RIP-relative (Mod=00, RM=101) unless
-	// we were using R13 encoding which is distinct.
+	// LEA encodes destination in Reg field. REX.R needed for high regs.
 	rex := rexState{
-		w:     true,         // 64-bit address calculation/operand
-		r:     dstInfo.high, // Correct: Extend Destination
-		b:     false,        // RIP relative does not use B extension
+		w:     true,
+		r:     dstInfo.high, // Correct extension for destination
+		b:     false,
 		force: dstInfo.needsRex,
 	}
 
@@ -740,7 +738,6 @@ func encodeLeaRegRipRelative(dst Reg, offset int32) ([]byte, error) {
 		out = append(out, rexByte)
 	}
 	out = append(out, 0x8D)
-	// ModRM: Mod=00, Reg=dst, R/M=101 (RIP-relative)
 	modrm := byte(0x05 | (dstInfo.code << 3))
 	out = append(out, modrm)
 	var buf [4]byte
