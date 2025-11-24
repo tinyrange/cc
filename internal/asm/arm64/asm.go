@@ -479,6 +479,17 @@ func Syscall(number int, args ...asm.Value) asm.Fragment {
 	return &syscallFragment{number: number, args: args}
 }
 
+func Hvc() asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		c.emit32(0xD4000002) // hvc #0
+		return nil
+	})
+}
+
 func UseRegister(v asm.Variable) asm.Value {
 	return asm.Register(v)
 }

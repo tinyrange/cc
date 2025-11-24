@@ -19,6 +19,11 @@ import (
 	arm64ir "github.com/tinyrange/cc/internal/ir/arm64"
 )
 
+const (
+	psciSystemOff = 0x84000008
+	arm64MMIOAddr = 0xdead0000
+)
+
 type bringUpQuest struct {
 	dev hv.Hypervisor
 }
@@ -294,6 +299,134 @@ func (q *bringUpQuest) Run() error {
 			// Collect the MMIO writes to verify the output
 			if addr == 0xdead0000 {
 				result = append(result, data[0])
+				return nil
+			}
+
+			return fmt.Errorf("unexpected MMIO write to address 0x%08x", addr)
+		},
+	}); err != nil {
+		return err
+	}
+
+	if err := q.runVMTask("PSCI SYSTEM_OFF Test", hv.ArchitectureARM64, ir.Program{
+		Entrypoint: "main",
+		Methods: map[string]ir.Method{
+			"main": {
+				arm64.MovImmediate(arm64.Reg64(arm64.X0), psciSystemOff),
+				arm64.Hvc(),
+			},
+		},
+	}, func(cpu hv.VirtualCPU) error {
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if err := q.runVMTask("Addition Test (arm64)", hv.ArchitectureARM64, ir.Program{
+		Entrypoint: "main",
+		Methods: map[string]ir.Method{
+			"main": {
+				arm64.MovImmediate(arm64.Reg64(arm64.X1), 40),
+				arm64.AddRegImm(arm64.Reg64(arm64.X1), 2),
+				arm64.MovImmediate(arm64.Reg64(arm64.X0), psciSystemOff),
+				arm64.Hvc(),
+			},
+		},
+	}, func(cpu hv.VirtualCPU) error {
+		regs := map[hv.Register]hv.RegisterValue{
+			hv.RegisterARM64X1: hv.Register64(0),
+		}
+
+		if err := cpu.GetRegisters(regs); err != nil {
+			return fmt.Errorf("get X1 register: %w", err)
+		}
+
+		x1 := uint64(regs[hv.RegisterARM64X1].(hv.Register64))
+		if x1 != 42 {
+			return fmt.Errorf("unexpected X1 value: got %d, want 42", x1)
+		}
+
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	const arm64MemorySlot asm.Variable = 200
+
+	if err := q.runVMTask("Memory Read/Write Test (arm64)", hv.ArchitectureARM64, ir.Program{
+		Entrypoint: "main",
+		Methods: map[string]ir.Method{
+			"main": {
+				asm.Group{
+					arm64.ReserveZero(arm64MemorySlot, 8),
+					arm64.LoadAddress(arm64.Reg64(arm64.X1), arm64MemorySlot),
+					arm64.MovImmediate(arm64.Reg64(arm64.X2), 0xcafebabe),
+					arm64.MovToMemory(arm64.Mem(arm64.Reg64(arm64.X1)), arm64.Reg64(arm64.X2)),
+					arm64.MovFromMemory(arm64.Reg64(arm64.X3), arm64.Mem(arm64.Reg64(arm64.X1))),
+					arm64.MovImmediate(arm64.Reg64(arm64.X0), psciSystemOff),
+					arm64.Hvc(),
+				},
+			},
+		},
+	}, func(cpu hv.VirtualCPU) error {
+		regs := map[hv.Register]hv.RegisterValue{
+			hv.RegisterARM64X3: hv.Register64(0),
+		}
+
+		if err := cpu.GetRegisters(regs); err != nil {
+			return fmt.Errorf("get X3 register: %w", err)
+		}
+
+		x3 := uint64(regs[hv.RegisterARM64X3].(hv.Register64))
+		if x3 != 0xcafebabe {
+			return fmt.Errorf("unexpected X3 value: got 0x%08x, want 0xcafebabe", x3)
+		}
+
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	const arm64MMIOMessage asm.Variable = 201
+	arm64Loop := asm.Label("arm64_mmio_loop")
+	arm64Done := asm.Label("arm64_mmio_done")
+
+	arm64Result := make([]byte, 0, 64)
+
+	if err := q.runVMTask("MMIO Test (arm64)", hv.ArchitectureARM64, ir.Program{
+		Entrypoint: "main",
+		Methods: map[string]ir.Method{
+			"main": {
+				asm.Group{
+					arm64.LoadConstantBytes(arm64MMIOMessage, append([]byte("Hello, World!"), 0)),
+					arm64.LoadAddress(arm64.Reg64(arm64.X1), arm64MMIOMessage),
+					arm64.MovImmediate(arm64.Reg64(arm64.X2), arm64MMIOAddr),
+					asm.MarkLabel(arm64Loop),
+					arm64.MovFromMemory8(arm64.Reg64(arm64.X3), arm64.Mem(arm64.Reg64(arm64.X1))),
+					arm64.CmpRegImm(arm64.Reg64(arm64.X3), 0),
+					arm64.JumpIfZero(arm64Done),
+					arm64.MovToMemory8(arm64.Mem(arm64.Reg64(arm64.X2)), arm64.Reg32(arm64.X3)),
+					arm64.AddRegImm(arm64.Reg64(arm64.X1), 1),
+					arm64.Jump(arm64Loop),
+					asm.MarkLabel(arm64Done),
+					arm64.MovImmediate(arm64.Reg64(arm64.X0), psciSystemOff),
+					arm64.Hvc(),
+				},
+			},
+		},
+	}, func(cpu hv.VirtualCPU) error {
+		if !bytes.Equal(arm64Result, []byte("Hello, World!")) {
+			return fmt.Errorf("unexpected MMIO result: got %q, want %q", arm64Result, "Hello, World!")
+		}
+
+		return nil
+	}, hv.SimpleMMIODevice{
+		Regions: []hv.MMIORegion{
+			{Address: arm64MMIOAddr, Size: 0x1000},
+		},
+		WriteFunc: func(addr uint64, data []byte) error {
+			if addr == arm64MMIOAddr {
+				arm64Result = append(arm64Result, data[0])
 				return nil
 			}
 
