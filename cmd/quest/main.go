@@ -267,6 +267,7 @@ func (q *bringUpQuest) Run() error {
 					amd64.LoadConstantBytes(dataMessage, append([]byte("Hello, World!"), 0)),
 					amd64.LoadAddress(amd64.Reg64(amd64.RSI), dataMessage),
 					amd64.MovImmediate(amd64.Reg64(amd64.RDX), 0xdead0000),
+					amd64.MovImmediate(amd64.Reg64(amd64.RAX), 0),
 					asm.MarkLabel(loop),
 					amd64.MovFromMemory(amd64.Reg8(amd64.RAX), amd64.Mem(amd64.Reg64(amd64.RSI))),
 					amd64.AddRegImm(amd64.Reg64(amd64.RSI), 1),

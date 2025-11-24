@@ -87,10 +87,10 @@ func makeSegmentAttributes(typeVal, s, dpl, p, avl, l, db, g uint16) uint16 {
 		((s & 0x1) << 4) |
 		((dpl & 0x3) << 5) |
 		((p & 0x1) << 7) |
-		((avl & 0xF) << 8) |
-		((l & 0x1) << 12) |
-		((db & 0x1) << 13) |
-		((g & 0x1) << 14)
+		((avl & 0x1) << 12) | // AVL is bit 12
+		((l & 0x1) << 13) | // L (Long Mode) is bit 13
+		((db & 0x1) << 14) | // D/B is bit 14
+		((g & 0x1) << 15) // G is bit 15
 }
 
 // SetLongModeWithSelectors implements hv.VirtualCPUAmd64.
