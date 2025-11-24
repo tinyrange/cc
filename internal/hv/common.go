@@ -17,6 +17,7 @@ type CpuArchitecture string
 const (
 	ArchitectureInvalid CpuArchitecture = "invalid"
 	ArchitectureX86_64  CpuArchitecture = "x86_64"
+	ArchitectureARM64   CpuArchitecture = "arm64"
 )
 
 type RegisterValue interface {

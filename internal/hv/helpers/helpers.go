@@ -6,7 +6,6 @@ import (
 
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/ir"
-	irAmd64 "github.com/tinyrange/cc/internal/ir/amd64"
 )
 
 type LoadMode int
@@ -79,23 +78,28 @@ func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 
 // Load implements hv.VMLoader.
 func (p *ProgramLoader) Load(vm hv.VirtualMachine) error {
+	var target ir.Architecture
 	switch vm.Hypervisor().Architecture() {
 	case hv.ArchitectureX86_64:
-		prog, err := irAmd64.BuildStandaloneProgram(&p.Program)
-		if err != nil {
-			return fmt.Errorf("build standalone program: %w", err)
-		}
-
-		bytes := prog.RelocatedCopy(uintptr(p.BaseAddr))
-
-		if _, err := vm.WriteAt(bytes, int64(p.BaseAddr)); err != nil {
-			return fmt.Errorf("write program to vm memory: %w", err)
-		}
-
-		return nil
+		target = ir.ArchitectureX86_64
+	case hv.ArchitectureARM64:
+		target = ir.ArchitectureARM64
 	default:
 		return fmt.Errorf("unsupported architecture: %v", vm.Hypervisor().Architecture())
 	}
+
+	prog, err := ir.BuildStandaloneProgramForArch(target, &p.Program)
+	if err != nil {
+		return fmt.Errorf("build standalone program: %w", err)
+	}
+
+	bytes := prog.RelocatedCopy(uintptr(p.BaseAddr))
+
+	if _, err := vm.WriteAt(bytes, int64(p.BaseAddr)); err != nil {
+		return fmt.Errorf("write program to vm memory: %w", err)
+	}
+
+	return nil
 }
 
 var (
