@@ -29,9 +29,10 @@ func (m LoadMode) String() string {
 }
 
 type ProgramLoader struct {
-	Program  ir.Program
-	Mode     LoadMode
-	BaseAddr uint64
+	Program           ir.Program
+	Mode              LoadMode
+	BaseAddr          uint64
+	MaxLoopIterations uint64
 }
 
 // Run implements hv.RunConfig.
@@ -44,6 +45,15 @@ func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 			if err := vcpu.(hv.VirtualCPUAmd64).SetProtectedMode(); err != nil {
 				return fmt.Errorf("set protected mode: %w", err)
 			}
+		case Mode64BitIdentityMapping:
+			if err := vcpu.(hv.VirtualCPUAmd64).SetLongModeWithSelectors(
+				0x00020000, // paging structures base addr in guest memory
+				256,        // 256 GiB address space
+				0x10,       // code selector
+				0x18,       // data selector
+			); err != nil {
+				return fmt.Errorf("set long mode with selectors: %w", err)
+			}
 		default:
 			return fmt.Errorf("unsupported load mode %v for architecture %v", p.Mode, arch)
 		}
@@ -55,11 +65,13 @@ func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 			return fmt.Errorf("set initial registers: %w", err)
 		}
 
-		if err := vcpu.Run(ctx); err != nil {
-			return fmt.Errorf("run vCPU: %w", err)
+		for range p.MaxLoopIterations {
+			if err := vcpu.Run(ctx); err != nil {
+				return fmt.Errorf("run vCPU: %w", err)
+			}
 		}
 
-		return nil
+		return fmt.Errorf("maximum loop iterations (%d) exceeded", p.MaxLoopIterations)
 	default:
 		return fmt.Errorf("unsupported architecture: %v", arch)
 	}

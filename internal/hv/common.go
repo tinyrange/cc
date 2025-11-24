@@ -3,6 +3,7 @@ package hv
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -66,6 +67,11 @@ type VirtualCPUAmd64 interface {
 	VirtualCPU
 
 	SetProtectedMode() error
+	SetLongModeWithSelectors(
+		pagingBase uint64,
+		addrSpaceSize int,
+		codeSelector, dataSelector uint16,
+	) error
 }
 
 type RunConfig interface {
@@ -102,13 +108,13 @@ func (d SimpleMMIODevice) ReadMMIO(addr uint64, data []byte) error {
 	if d.ReadFunc != nil {
 		return d.ReadFunc(addr, data)
 	}
-	return nil
+	return fmt.Errorf("unhandled read from MMIO address 0x%X", addr)
 }
 func (d SimpleMMIODevice) WriteMMIO(addr uint64, data []byte) error {
 	if d.WriteFunc != nil {
 		return d.WriteFunc(addr, data)
 	}
-	return nil
+	return fmt.Errorf("unhandled write to MMIO address 0x%X", addr)
 }
 func (d SimpleMMIODevice) Init(vm VirtualMachine) error {
 	return nil
@@ -135,13 +141,13 @@ func (d SimpleX86IOPortDevice) ReadIOPort(port uint16, data []byte) error {
 	if d.ReadFunc != nil {
 		return d.ReadFunc(port, data)
 	}
-	return nil
+	return fmt.Errorf("unhandled read from I/O port 0x%X", port)
 }
 func (d SimpleX86IOPortDevice) WriteIOPort(port uint16, data []byte) error {
 	if d.WriteFunc != nil {
 		return d.WriteFunc(port, data)
 	}
-	return nil
+	return fmt.Errorf("unhandled write to I/O port 0x%X", port)
 }
 func (d SimpleX86IOPortDevice) Init(vm VirtualMachine) error {
 	return nil
@@ -161,6 +167,8 @@ type VirtualMachine interface {
 	Hypervisor() Hypervisor
 
 	Run(ctx context.Context, cfg RunConfig) error
+
+	VirtualCPUCall(id int, f func(vcpu VirtualCPU) error) error
 
 	AddDevice(dev Device) error
 }

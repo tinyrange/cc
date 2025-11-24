@@ -235,3 +235,23 @@ type kvmRunData struct {
 	kvm_dirty_regs                uint64
 	s                             struct{ padding [syncRegsSizeBytes]byte }
 }
+
+type kvmExitIoData struct {
+	// __u8 direction;
+	// __u8 size; /* bytes */
+	// __u16 port;
+	// __u32 count;
+	// __u64 data_offset; /* relative to kvm_run start */
+	direction  uint8
+	size       uint8
+	port       uint16
+	count      uint32
+	dataOffset uint64
+}
+
+type kvmExitMMIOData struct {
+	physAddr uint64
+	data     [8]byte
+	len      uint32
+	isWrite  uint8
+}

@@ -136,6 +136,21 @@ func (v *virtualMachine) WriteAt(p []byte, off int64) (n int, err error) {
 	return n, err
 }
 
+func (v *virtualMachine) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error {
+	vcpu, ok := v.vcpus[id]
+	if !ok {
+		return fmt.Errorf("kvm: no vCPU %d found", id)
+	}
+
+	done := make(chan error, 1)
+
+	vcpu.runQueue <- func() {
+		done <- f(vcpu)
+	}
+
+	return <-done
+}
+
 var (
 	_ hv.VirtualMachine = &virtualMachine{}
 )
