@@ -1,4 +1,4 @@
-//go:build windows && !cgo
+//go:build windows
 
 package bindings
 
@@ -31,6 +31,10 @@ const (
 	EmulatorStatusInterruptCausedIntercept   EmulatorStatus = 1 << 8
 	EmulatorStatusGuestCannotBeFaulted       EmulatorStatus = 1 << 9
 )
+
+func (s EmulatorStatus) EmulationSuccessful() bool {
+	return s&EmulatorStatusSuccess != 0 && s&(EmulatorStatusInternalFailure|EmulatorStatusIoPortCallbackFailed|EmulatorStatusMemoryCallbackFailed|EmulatorStatusTranslateGvaCallbackFailed|EmulatorStatusGetRegistersCallbackFailed|EmulatorStatusSetRegistersCallbackFailed) == 0
+}
 
 func (s EmulatorStatus) String() string {
 	var flags []string
@@ -70,6 +74,8 @@ func (s EmulatorStatus) String() string {
 	return fmt.Sprintf("%v", flags)
 }
 
+// EmulatorMemoryAccessDirection mirrors WHV_EMULATOR_MEMORY_ACCESS_DIRECTION.
+// NOTE: Enums in Windows C ABI are 32-bit ints by default.
 type EmulatorMemoryAccessDirection uint8
 
 const (
@@ -77,14 +83,39 @@ const (
 	EmulatorMemoryAccessDirectionWrite EmulatorMemoryAccessDirection = 1
 )
 
-// EmulatorMemoryAccessInfo mirrors WHV_EMULATOR_MEMORY_ACCESS_INFO.
-type EmulatorMemoryAccessInfo struct {
-	GpaAddress GuestPhysicalAddress
-	Direction  EmulatorMemoryAccessDirection
-	AccessSize uint8
-	Data       [8]uint8
+func (d EmulatorMemoryAccessDirection) String() string {
+	switch d {
+	case EmulatorMemoryAccessDirectionRead:
+		return "Read"
+	case EmulatorMemoryAccessDirectionWrite:
+		return "Write"
+	default:
+		return fmt.Sprintf("Unknown(%d)", d)
+	}
 }
 
+// EmulatorMemoryAccessInfo mirrors WHV_EMULATOR_MEMORY_ACCESS_INFO.
+// C Layout:
+//
+//	GpaAddress (8 bytes)
+//	Direction  (1 byte)
+//	AccessSize (1 byte)
+//	ByteData   (8 bytes)
+type EmulatorMemoryAccessInfo struct {
+	// typedef struct _WHV_EMULATOR_MEMORY_ACCESS_INFO {
+	//     UINT64 GpaAddress;
+	//     UINT8 Direction; // 0 for read, 1 for write
+	//     UINT8 AccessSize; // 1 thru 8
+	//     UINT8 Data[8]; // Raw byte contents to be read from/written to memory
+	// } WHV_EMULATOR_MEMORY_ACCESS_INFO;
+	GpaAddress uint64                        // Offset 0
+	Direction  EmulatorMemoryAccessDirection // Offset 8
+	AccessSize uint8                         // Offset 9
+	Data       [8]byte                       // Offset 10
+}
+
+// EmulatorIOAccessDirection mirrors WHV_EMULATOR_IO_ACCESS_DIRECTION.
+// NOTE: Enums in Windows C ABI are 32-bit ints by default.
 type EmulatorIOAccessDirection uint8
 
 const (
@@ -92,12 +123,35 @@ const (
 	EmulatorIOAccessDirectionOut EmulatorIOAccessDirection = 1
 )
 
+func (d EmulatorIOAccessDirection) String() string {
+	switch d {
+	case EmulatorIOAccessDirectionIn:
+		return "In"
+	case EmulatorIOAccessDirectionOut:
+		return "Out"
+	default:
+		return fmt.Sprintf("Unknown(%d)", d)
+	}
+}
+
 // EmulatorIOAccessInfo mirrors WHV_EMULATOR_IO_ACCESS_INFO.
+// C Layout:
+//
+//	Direction  (1 byte)
+//	Port       (2 bytes)
+//	AccessSize (2 bytes)
+//	Data       (4 bytes)
 type EmulatorIOAccessInfo struct {
-	Direction  EmulatorIOAccessDirection
-	Port       uint16
-	AccessSize uint16
-	Data       uint32
+	// typedef struct _WHV_EMULATOR_IO_ACCESS_INFO {
+	//     UINT8 Direction; // 0 for in, 1 for out
+	//     UINT16 Port;
+	//     UINT16 AccessSize; // only 1, 2, 4
+	//     UINT32 Data[4];
+	// } WHV_EMULATOR_IO_ACCESS_INFO;\
+	Direction  EmulatorIOAccessDirection // Offset 0
+	Port       uint16                    // Offset 1
+	AccessSize uint16                    // Offset 3
+	Data       [4]uint32                 // Offset 5
 }
 
 // EmulatorIoPortFunc is the Go representation of WHV_EMULATOR_IO_PORT_CALLBACK.

@@ -1,8 +1,11 @@
-//go:build windows && !cgo
+//go:build windows
 
 package bindings
 
-import "unsafe"
+import (
+	"fmt"
+	"unsafe"
+)
 
 // Uint128 mirrors WHV_UINT128.
 type Uint128 struct {
@@ -107,6 +110,10 @@ type X64CpuidResult struct {
 // RegisterValue mirrors WHV_REGISTER_VALUE.
 type RegisterValue struct {
 	Raw Uint128
+}
+
+func (v RegisterValue) String() string {
+	return fmt.Sprintf("{Raw: {Low64: %#x, High64: %#x}}", v.Raw.Low64, v.Raw.High64)
 }
 
 // SetUint64 sets the union to a 64-bit register.
@@ -266,7 +273,7 @@ type X64IOPortAccessContext struct {
 	Reserved             [3]uint8
 	InstructionBytes     [16]uint8
 	AccessInfo           X64IOPortAccessInfo
-	PortNumber           uint16
+	Port                 uint16
 	Reserved2            [3]uint16
 	Rax                  uint64
 	Rcx                  uint64

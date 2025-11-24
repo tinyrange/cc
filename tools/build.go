@@ -52,10 +52,11 @@ var crossBuilds = []crossBuild{
 }
 
 type buildOptions struct {
-	Package    string
-	OutputName string
-	CgoEnabled bool
-	Build      crossBuild
+	Package     string
+	OutputName  string
+	CgoEnabled  bool
+	Build       crossBuild
+	RaceEnabled bool
 }
 
 type buildOutput struct {
@@ -74,10 +75,14 @@ func goBuild(opts buildOptions) (buildOutput, error) {
 	env := os.Environ()
 	env = append(env, "GOOS="+opts.Build.GOOS)
 	env = append(env, "GOARCH="+opts.Build.GOARCH)
-	if opts.CgoEnabled {
+	if opts.CgoEnabled || opts.RaceEnabled {
 		env = append(env, "CGO_ENABLED=1")
 	} else {
 		env = append(env, "CGO_ENABLED=0")
+	}
+
+	if opts.RaceEnabled {
+		env = append(env, "GOFLAGS=-race")
 	}
 
 	cmd := exec.Command("go", "build", "-o", output, pkg)
@@ -133,6 +138,7 @@ func getOrCreateHostID() (string, error) {
 func main() {
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
+	race := fs.Bool("race", false, "build with race detector enabled")
 	quest := fs.Bool("quest", false, "build and execute the bringup quest")
 	cross := fs.Bool("cross", false, "attempt to cross compile the quest for all supported platforms")
 	test := fs.String("test", "", "run go tests in the specified package")
@@ -144,9 +150,10 @@ func main() {
 
 	if *quest {
 		out, err := goBuild(buildOptions{
-			Package:    "cmd/quest",
-			OutputName: "quest",
-			Build:      hostBuild,
+			Package:     "cmd/quest",
+			OutputName:  "quest",
+			Build:       hostBuild,
+			RaceEnabled: *race,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to build quest: %v\n", err)
