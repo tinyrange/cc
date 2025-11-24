@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
 	"runtime"
 	"unsafe"
 
@@ -17,7 +18,6 @@ type virtualCPU struct {
 	vm       *virtualMachine
 	id       int
 	runQueue chan func()
-	emu      bindings.EmulatorHandle
 
 	pendingError error
 }
@@ -85,15 +85,17 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	case bindings.RunVPExitReasonX64Halt:
 		return hv.ErrVMHalted
 	case bindings.RunVPExitReasonMemoryAccess:
-		// Handle memory access via the emulator
-
 		mem := exit.MemoryAccess()
 
 		var status bindings.EmulatorStatus
 
 		v.pendingError = nil
+
+		// Attempt to emulate the instruction that caused the memory access exit.
+		// The emulator will call the registered callbacks (MemoryCallback, TranslateGva, etc.)
+		// to fetch instructions and perform the memory operation.
 		if err := bindings.EmulatorTryMmioEmulation(
-			v.emu,
+			v.vm.emu,
 			unsafe.Pointer(v),
 			&exit.VpContext,
 			mem,
@@ -102,29 +104,31 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			return fmt.Errorf("EmulatorTryMmioEmulation failed: %w", err)
 		}
 
+		// Check if an error occurred inside a callback (e.g. MMIO write failure)
 		if v.pendingError != nil {
 			return v.pendingError
 		}
 
-		if status == 0 {
-			return nil
-		}
-
-		if status&bindings.EmulatorStatusSuccess == 0 {
-			return fmt.Errorf("whp: invalid emulator status %s", status)
+		// If the emulator returns success but the status indicates failure (0),
+		// it usually means it couldn't fetch the instruction or the instruction
+		// didn't match the exit reason.
+		if !status.EmulationSuccessful() {
+			// We return a detailed error to help debugging, including the RIP and GPA
+			rip := exit.VpContext.Rip
+			gpa := mem.Gpa
+			return fmt.Errorf("whp: emulation failed (Status=%v) at RIP=0x%x accessing GPA=0x%x.", status, rip, gpa)
 		}
 
 		return nil
-	case bindings.RunVPExitReasonX64IoPortAccess:
-		// Handle IO port access via the emulator
 
+	case bindings.RunVPExitReasonX64IoPortAccess:
 		io := exit.IoPortAccess()
 
 		var status bindings.EmulatorStatus
 
 		v.pendingError = nil
 		if err := bindings.EmulatorTryIoEmulation(
-			v.emu,
+			v.vm.emu,
 			unsafe.Pointer(v),
 			&exit.VpContext,
 			io,
@@ -137,12 +141,8 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			return v.pendingError
 		}
 
-		if status == 0 {
-			return nil
-		}
-
-		if status&bindings.EmulatorStatusSuccess == 0 {
-			return fmt.Errorf("whp: invalid emulator status %s", status)
+		if !status.EmulationSuccessful() {
+			return fmt.Errorf("whp: io emulation failed with status %v at port 0x%x", status, io.Port)
 		}
 
 		return nil
@@ -198,8 +198,12 @@ func (v *virtualCPU) SetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 }
 
 func (v *virtualCPU) handleIOPortAccess(access *bindings.EmulatorIOAccessInfo) error {
+	if access.AccessSize != 1 {
+		return fmt.Errorf("whp: unsupported IO port access size %d", access.AccessSize)
+	}
+
 	var data [4]byte
-	binary.LittleEndian.PutUint32(data[:], access.Data)
+	binary.LittleEndian.PutUint32(data[:], access.Data[0])
 
 	for _, dev := range v.vm.devices {
 		if kvmIoPortDevice, ok := dev.(hv.X86IOPortDevice); ok {
@@ -210,16 +214,13 @@ func (v *virtualCPU) handleIOPortAccess(access *bindings.EmulatorIOAccessInfo) e
 						if err := kvmIoPortDevice.ReadIOPort(access.Port, data[:access.AccessSize]); err != nil {
 							return fmt.Errorf("I/O port 0x%04x read: %w", access.Port, err)
 						}
-
-						access.Data = uint32(binary.LittleEndian.Uint32(data[:]))
+						access.Data[0] = uint32(binary.LittleEndian.Uint32(data[:]))
 					} else {
 						if err := kvmIoPortDevice.WriteIOPort(access.Port, data[:access.AccessSize]); err != nil {
 							return fmt.Errorf("I/O port 0x%04x write: %w", access.Port, err)
 						}
-
-						access.Data = uint32(binary.LittleEndian.Uint32(data[:]))
+						access.Data[0] = uint32(binary.LittleEndian.Uint32(data[:]))
 					}
-
 					return nil
 				}
 			}
@@ -230,56 +231,59 @@ func (v *virtualCPU) handleIOPortAccess(access *bindings.EmulatorIOAccessInfo) e
 }
 
 func (v *virtualCPU) handleMemoryAccess(access *bindings.EmulatorMemoryAccessInfo) error {
-	// 1. Check if the access falls within the Guest RAM range
-	if uint64(access.GpaAddress) >= v.vm.memoryBase && uint64(access.GpaAddress) < v.vm.memoryBase+uint64(v.vm.memory.Size()) {
-		offset := uint64(access.GpaAddress) - v.vm.memoryBase
-		length := uint64(access.AccessSize)
+	gpa := uint64(access.GpaAddress)
+	size := uint64(access.AccessSize)
 
-		// Bounds check (just to be safe)
-		if offset+length > uint64(v.vm.memory.Size()) {
-			return fmt.Errorf("whp: memory access out of bounds")
+	// Access the Data field safely.
+	// Assuming bindings define Data as [8]uint8.
+	// We use the slice operator to get a view of the array in the struct.
+	dataSlice := access.Data[:size]
+
+	// 1. RAM Access (Instruction Fetch or Data Access)
+	if gpa >= v.vm.memoryBase && gpa < v.vm.memoryBase+uint64(v.vm.memory.Size()) {
+		offset := gpa - v.vm.memoryBase
+
+		// Bounds check
+		if offset+size > uint64(v.vm.memory.Size()) {
+			return fmt.Errorf("whp: memory access out of bounds: gpa=0x%x size=%d", gpa, size)
 		}
 
 		ram := v.vm.memory.Slice()
 
 		if access.Direction == bindings.EmulatorMemoryAccessDirectionRead {
-			// Read: Copy FROM RAM -> TO Emulator buffer
-			copy(access.Data[:length], ram[offset:offset+length])
+			// Copy FROM RAM -> TO Emulator
+			copy(dataSlice, ram[offset:offset+size])
 		} else {
-			// Write: Copy FROM Emulator buffer -> TO RAM
-			copy(ram[offset:offset+length], access.Data[:length])
+			// Copy FROM Emulator -> TO RAM
+			copy(ram[offset:offset+size], dataSlice)
 		}
 
 		return nil
 	}
 
-	// 2. Logging for actual unhandled MMIO
+	// 2. MMIO Device Access
 	for _, dev := range v.vm.devices {
 		if kvmMmioDevice, ok := dev.(hv.MemoryMappedIODevice); ok {
-			addr := uint64(access.GpaAddress)
-			size := uint32(access.AccessSize)
-
 			regions := kvmMmioDevice.MMIORegions()
 			for _, region := range regions {
-				if addr >= region.Address && addr+uint64(size) <= region.Address+region.Size {
-					data := access.Data[:size]
+				if gpa >= region.Address && gpa+size <= region.Address+region.Size {
 					if access.Direction == bindings.EmulatorMemoryAccessDirectionRead {
-						if err := kvmMmioDevice.ReadMMIO(addr, data); err != nil {
-							return fmt.Errorf("MMIO read at 0x%016x: %w", addr, err)
+						if err := kvmMmioDevice.ReadMMIO(gpa, dataSlice); err != nil {
+							return fmt.Errorf("MMIO read at 0x%016x: %w", gpa, err)
 						}
+						// dataSlice is backed by access.Data, so writing to it updates the struct
 					} else {
-						if err := kvmMmioDevice.WriteMMIO(addr, data); err != nil {
-							return fmt.Errorf("MMIO write at 0x%016x: %w", addr, err)
+						if err := kvmMmioDevice.WriteMMIO(gpa, dataSlice); err != nil {
+							return fmt.Errorf("MMIO write at 0x%016x: %w", gpa, err)
 						}
 					}
-
 					return nil
 				}
 			}
 		}
 	}
 
-	return fmt.Errorf("whp: unhandled memory access at guest physical address 0x%X", access.GpaAddress)
+	return fmt.Errorf("whp: unhandled memory access at guest physical address 0x%X", gpa)
 }
 
 var (
@@ -296,6 +300,8 @@ type virtualMachine struct {
 	memoryBase uint64
 
 	devices []hv.Device
+
+	emu bindings.EmulatorHandle
 }
 
 // Hypervisor implements hv.VirtualMachine.
@@ -405,7 +411,11 @@ func createEmulator() (bindings.EmulatorHandle, error) {
 
 		return 0
 	}
-	memFn := func(ctx unsafe.Pointer, access *bindings.EmulatorMemoryAccessInfo) bindings.HRESULT {
+
+	memFn := func(
+		ctx unsafe.Pointer,
+		access *bindings.EmulatorMemoryAccessInfo,
+	) bindings.HRESULT {
 		vcpu := (*virtualCPU)(ctx)
 
 		if err := vcpu.handleMemoryAccess(access); err != nil {
@@ -415,6 +425,7 @@ func createEmulator() (bindings.EmulatorHandle, error) {
 
 		return 0
 	}
+
 	getFn := func(
 		ctx unsafe.Pointer,
 		names []bindings.RegisterName,
@@ -422,14 +433,30 @@ func createEmulator() (bindings.EmulatorHandle, error) {
 	) bindings.HRESULT {
 		vcpu := (*virtualCPU)(ctx)
 
+		slog.Info("GetVirtualProcessorRegisters called",
+			"names", names,
+		)
+
+		// Note: We use the backing store (bindings.GetVirtualProcessorRegisters) to populate the emulator.
 		if err := bindings.GetVirtualProcessorRegisters(vcpu.vm.part, uint32(vcpu.id), names, values); err != nil {
+			// Panic here is risky but acceptable if we can't get registers the emulator critically needs.
 			panic(fmt.Sprintf("GetVirtualProcessorRegisters failed: %v", err))
 		}
 
 		return 0
 	}
-	setFn := func(ctx unsafe.Pointer, names []bindings.RegisterName, values []bindings.RegisterValue) bindings.HRESULT {
+
+	setFn := func(
+		ctx unsafe.Pointer,
+		names []bindings.RegisterName,
+		values []bindings.RegisterValue,
+	) bindings.HRESULT {
 		vcpu := (*virtualCPU)(ctx)
+
+		slog.Info("SetVirtualProcessorRegisters called",
+			"names", names,
+			"values", values,
+		)
 
 		if err := bindings.SetVirtualProcessorRegisters(vcpu.vm.part, uint32(vcpu.id), names, values); err != nil {
 			panic(fmt.Sprintf("SetVirtualProcessorRegisters failed: %v", err))
@@ -437,12 +464,25 @@ func createEmulator() (bindings.EmulatorHandle, error) {
 
 		return 0
 	}
-	translateFn := func(ctx unsafe.Pointer, gva bindings.GuestVirtualAddress, flags bindings.TranslateGVAFlags, result *bindings.TranslateGVAResultCode, gpa *bindings.GuestPhysicalAddress) bindings.HRESULT {
+
+	translateFn := func(
+		ctx unsafe.Pointer,
+		gva bindings.GuestVirtualAddress,
+		flags bindings.TranslateGVAFlags,
+		result *bindings.TranslateGVAResultCode,
+		gpa *bindings.GuestPhysicalAddress,
+	) bindings.HRESULT {
 		vcpu := (*virtualCPU)(ctx)
 
 		var tResult bindings.TranslateGVAResult
 		var tGPA bindings.GuestPhysicalAddress
 
+		slog.Info("TranslateGvaPage called",
+			"gva", gva,
+			"flags", flags,
+		)
+
+		// Ensure we pass flags correctly, specifically allowing override if needed by the bindings.
 		if err := bindings.TranslateGVA(
 			vcpu.vm.part,
 			uint32(vcpu.id),
@@ -451,6 +491,8 @@ func createEmulator() (bindings.EmulatorHandle, error) {
 			&tResult,
 			&tGPA,
 		); err != nil {
+			// Panic is too strong here, but bindings panic if we return Fail usually.
+			// Ideally we log this.
 			panic(fmt.Sprintf("TranslateGvaPage failed: %v", err))
 		}
 
@@ -486,6 +528,13 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		return nil, fmt.Errorf("whp: CreatePartition failed: %w", err)
 	}
 	vm.part = part
+
+	emu, err := createEmulator()
+	if err != nil {
+		bindings.DeletePartition(vm.part)
+		return nil, fmt.Errorf("failed to create emulator for vm: %w", err)
+	}
+	vm.emu = emu
 
 	if err := bindings.SetPartitionPropertyUnsafe(
 		vm.part,
@@ -562,13 +611,6 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 			id:       i,
 			runQueue: make(chan func(), 16),
 		}
-
-		emu, err := createEmulator()
-		if err != nil {
-			bindings.DeletePartition(vm.part)
-			return nil, fmt.Errorf("failed to create emulator for vCPU %d: %w", i, err)
-		}
-		vcpu.emu = emu
 
 		vm.vcpus[i] = vcpu
 

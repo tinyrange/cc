@@ -1,6 +1,8 @@
-//go:build windows && !cgo
+//go:build windows
 
 package bindings
+
+import "fmt"
 
 // RegisterName mirrors WHV_REGISTER_NAME.
 type RegisterName uint32
@@ -143,3 +145,92 @@ const (
 	RegisterInternalActivityState       RegisterName = 0x80000005
 	RegisterPendingDebugException       RegisterName = 0x80000006
 )
+
+func (r RegisterName) String() string {
+	switch r {
+	case RegisterRax:
+		return "RAX"
+	case RegisterRcx:
+		return "RCX"
+	case RegisterRdx:
+		return "RDX"
+	case RegisterRbx:
+		return "RBX"
+	case RegisterRsp:
+		return "RSP"
+	case RegisterRbp:
+		return "RBP"
+	case RegisterRsi:
+		return "RSI"
+	case RegisterRdi:
+		return "RDI"
+	case RegisterR8:
+		return "R8"
+	case RegisterR9:
+		return "R9"
+	case RegisterR10:
+		return "R10"
+	case RegisterR11:
+		return "R11"
+	case RegisterR12:
+		return "R12"
+	case RegisterR13:
+		return "R13"
+	case RegisterR14:
+		return "R14"
+	case RegisterR15:
+		return "R15"
+	case RegisterRip:
+		return "RIP"
+	case RegisterRflags:
+		return "RFLAGS"
+	case RegisterEs:
+		return "ES"
+	case RegisterCs:
+		return "CS"
+	case RegisterSs:
+		return "SS"
+	case RegisterDs:
+		return "DS"
+	case RegisterFs:
+		return "FS"
+	case RegisterGs:
+		return "GS"
+	case RegisterLdtr:
+		return "LDTR"
+	case RegisterTr:
+		return "TR"
+	case RegisterIdtr:
+		return "IDTR"
+	case RegisterGdtr:
+		return "GDTR"
+	case RegisterCr0:
+		return "CR0"
+	case RegisterCr2:
+		return "CR2"
+	case RegisterCr3:
+		return "CR3"
+	case RegisterCr4:
+		return "CR4"
+	case RegisterCr8:
+		return "CR8"
+	case RegisterDr0:
+		return "DR0"
+	case RegisterDr1:
+		return "DR1"
+	case RegisterDr2:
+		return "DR2"
+	case RegisterDr3:
+		return "DR3"
+	case RegisterDr6:
+		return "DR6"
+	case RegisterDr7:
+		return "DR7"
+	case RegisterXCr0:
+		return "XCR0"
+	case RegisterEfer:
+		return "EFER"
+	default:
+		return fmt.Sprintf("RegisterName(0x%X)", uint32(r))
+	}
+}

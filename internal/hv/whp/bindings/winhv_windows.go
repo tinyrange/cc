@@ -1,4 +1,4 @@
-//go:build windows && !cgo
+//go:build windows
 
 package bindings
 
@@ -51,6 +51,7 @@ func callHRESULT(proc *syscall.LazyProc, args ...uintptr) (HRESULT, error) {
 	if callErr != syscall.Errno(0) && r1 == 0 {
 		return 0, callErr
 	}
+	// slog.Info("callHRESULT", "proc", proc.Name, "r1", r1, "r2", r2, "callErr", callErr)
 	hr := toHRESULT(r1)
 	if err := hr.Err(); err != nil {
 		return hr, err
