@@ -12,6 +12,7 @@ import (
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/helpers"
 	"github.com/tinyrange/cc/internal/ir"
+	_ "github.com/tinyrange/cc/internal/ir/amd64"
 )
 
 func TestRunSimpleHalt(t *testing.T) {
@@ -32,8 +33,9 @@ func TestRunSimpleHalt(t *testing.T) {
 				},
 			},
 		},
-		BaseAddr: 0x100000,
-		Mode:     helpers.ModeProtectedMode,
+		BaseAddr:          0x100000,
+		Mode:              helpers.ModeProtectedMode,
+		MaxLoopIterations: 1,
 	}
 
 	vm, err := kvm.NewVirtualMachine(hv.SimpleVMConfig{
@@ -74,8 +76,9 @@ func TestRunSimpleAddition(t *testing.T) {
 				},
 			},
 		},
-		BaseAddr: 0x100000,
-		Mode:     helpers.Mode64BitIdentityMapping,
+		BaseAddr:          0x100000,
+		Mode:              helpers.Mode64BitIdentityMapping,
+		MaxLoopIterations: 1,
 	}
 
 	vm, err := kvm.NewVirtualMachine(hv.SimpleVMConfig{
