@@ -180,27 +180,33 @@ func (q *bringUpQuest) Run() error {
 		Methods: map[string]ir.Method{
 			"main": {
 				// load RIP+0x1000 into RCX
-				amd64.LeaRelative(amd64.Reg64(amd64.RCX), 0x1000),
+				amd64.LeaRelative(amd64.Reg64(amd64.R8), 0x1000),
 				// write value to memory at address in RCX
 				// load 0xcafebabe into RAX
-				amd64.MovImmediate(amd64.Reg32(amd64.RAX), 0xcafebabe),
-				amd64.MovToMemory(amd64.Mem(amd64.Reg64(amd64.RCX)), amd64.Reg64(amd64.RAX)),
-				amd64.MovFromMemory(amd64.Reg64(amd64.RBX), amd64.Mem(amd64.Reg64(amd64.RCX))),
+				amd64.MovImmediate(amd64.Reg64(amd64.R9), 0x12345678),
+				amd64.MovToMemory(amd64.Mem(amd64.Reg64(amd64.R8)), amd64.Reg64(amd64.R9)),
+				amd64.MovFromMemory(amd64.Reg64(amd64.R10), amd64.Mem(amd64.Reg64(amd64.R8))),
 				amd64.Hlt(),
 			},
 		},
 	}, func(cpu hv.VirtualCPU) error {
 		regs := map[hv.Register]hv.RegisterValue{
-			hv.RegisterAMD64Rbx: hv.Register64(0),
+			hv.RegisterAMD64R9:  hv.Register64(0),
+			hv.RegisterAMD64R10: hv.Register64(0),
 		}
 
 		if err := cpu.GetRegisters(regs); err != nil {
 			return fmt.Errorf("get RBX register: %w", err)
 		}
 
-		rbx := uint64(regs[hv.RegisterAMD64Rbx].(hv.Register64))
-		if rbx != 0xcafebabe {
-			return fmt.Errorf("unexpected RBX value: got 0x%08x, want 0xcafebabe", rbx)
+		r9 := uint64(regs[hv.RegisterAMD64R9].(hv.Register64))
+		if r9 != 0x12345678 {
+			return fmt.Errorf("unexpected R9 value: got 0x%08x, want 0x12345678", r9)
+		}
+
+		r10 := uint64(regs[hv.RegisterAMD64R10].(hv.Register64))
+		if r10 != 0x12345678 {
+			return fmt.Errorf("unexpected R10 value: got 0x%08x, want 0x12345678", r10)
 		}
 
 		return nil
