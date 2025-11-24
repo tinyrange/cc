@@ -4,8 +4,8 @@ package whp
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
-	"log/slog"
 	"runtime"
 	"unsafe"
 
@@ -115,6 +115,37 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		}
 
 		return nil
+	case bindings.RunVPExitReasonX64IoPortAccess:
+		// Handle IO port access via the emulator
+
+		io := exit.IoPortAccess()
+
+		var status bindings.EmulatorStatus
+
+		v.pendingError = nil
+		if err := bindings.EmulatorTryIoEmulation(
+			v.emu,
+			unsafe.Pointer(v),
+			&exit.VpContext,
+			io,
+			&status,
+		); err != nil {
+			return fmt.Errorf("EmulatorTryIoEmulation failed: %w", err)
+		}
+
+		if v.pendingError != nil {
+			return v.pendingError
+		}
+
+		if status == 0 {
+			return nil
+		}
+
+		if status&bindings.EmulatorStatusSuccess == 0 {
+			return fmt.Errorf("whp: invalid emulator status %s", status)
+		}
+
+		return nil
 	default:
 		return fmt.Errorf("whp: unsupported vCPU exit reason %s", exit.ExitReason)
 	}
@@ -166,6 +197,38 @@ func (v *virtualCPU) SetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 	return bindings.SetVirtualProcessorRegisters(v.vm.part, uint32(v.id), names, values)
 }
 
+func (v *virtualCPU) handleIOPortAccess(access *bindings.EmulatorIOAccessInfo) error {
+	var data [4]byte
+	binary.LittleEndian.PutUint32(data[:], access.Data)
+
+	for _, dev := range v.vm.devices {
+		if kvmIoPortDevice, ok := dev.(hv.X86IOPortDevice); ok {
+			ports := kvmIoPortDevice.IOPorts()
+			for _, port := range ports {
+				if port == access.Port {
+					if access.Direction == 0 {
+						if err := kvmIoPortDevice.ReadIOPort(access.Port, data[:access.AccessSize]); err != nil {
+							return fmt.Errorf("I/O port 0x%04x read: %w", access.Port, err)
+						}
+
+						access.Data = uint32(binary.LittleEndian.Uint32(data[:]))
+					} else {
+						if err := kvmIoPortDevice.WriteIOPort(access.Port, data[:access.AccessSize]); err != nil {
+							return fmt.Errorf("I/O port 0x%04x write: %w", access.Port, err)
+						}
+
+						access.Data = uint32(binary.LittleEndian.Uint32(data[:]))
+					}
+
+					return nil
+				}
+			}
+		}
+	}
+
+	return fmt.Errorf("whp: unhandled IO port access at port 0x%X", access.Port)
+}
+
 func (v *virtualCPU) handleMemoryAccess(access *bindings.EmulatorMemoryAccessInfo) error {
 	// 1. Check if the access falls within the Guest RAM range
 	if uint64(access.GpaAddress) >= v.vm.memoryBase && uint64(access.GpaAddress) < v.vm.memoryBase+uint64(v.vm.memory.Size()) {
@@ -191,11 +254,30 @@ func (v *virtualCPU) handleMemoryAccess(access *bindings.EmulatorMemoryAccessInf
 	}
 
 	// 2. Logging for actual unhandled MMIO
-	slog.Info("memory access",
-		"gpa_address", fmt.Sprintf("0x%X", access.GpaAddress),
-		"direction", access.Direction,
-		"access_size", access.AccessSize,
-	)
+	for _, dev := range v.vm.devices {
+		if kvmMmioDevice, ok := dev.(hv.MemoryMappedIODevice); ok {
+			addr := uint64(access.GpaAddress)
+			size := uint32(access.AccessSize)
+
+			regions := kvmMmioDevice.MMIORegions()
+			for _, region := range regions {
+				if addr >= region.Address && addr+uint64(size) <= region.Address+region.Size {
+					data := access.Data[:size]
+					if access.Direction == bindings.EmulatorMemoryAccessDirectionRead {
+						if err := kvmMmioDevice.ReadMMIO(addr, data); err != nil {
+							return fmt.Errorf("MMIO read at 0x%016x: %w", addr, err)
+						}
+					} else {
+						if err := kvmMmioDevice.WriteMMIO(addr, data); err != nil {
+							return fmt.Errorf("MMIO write at 0x%016x: %w", addr, err)
+						}
+					}
+
+					return nil
+				}
+			}
+		}
+	}
 
 	return fmt.Errorf("whp: unhandled memory access at guest physical address 0x%X", access.GpaAddress)
 }
@@ -314,7 +396,14 @@ func (h *hypervisor) Close() error {
 
 func createEmulator() (bindings.EmulatorHandle, error) {
 	ioFn := func(ctx unsafe.Pointer, access *bindings.EmulatorIOAccessInfo) bindings.HRESULT {
-		panic("NewEmulatorIoPortCallback unimplemented")
+		vcpu := (*virtualCPU)(ctx)
+
+		if err := vcpu.handleIOPortAccess(access); err != nil {
+			vcpu.pendingError = err
+			return bindings.HRESULTFail
+		}
+
+		return 0
 	}
 	memFn := func(ctx unsafe.Pointer, access *bindings.EmulatorMemoryAccessInfo) bindings.HRESULT {
 		vcpu := (*virtualCPU)(ctx)
