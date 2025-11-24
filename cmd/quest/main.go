@@ -53,15 +53,15 @@ func (q *bringUpQuest) runVMTask(
 	return q.runArchitectureTask(name, arch, func() error {
 		loader := helpers.ProgramLoader{
 			Program:           prog,
-			BaseAddr:          0x100000,
+			BaseAddr:          0,
 			Mode:              helpers.Mode64BitIdentityMapping,
 			MaxLoopIterations: 128,
 		}
 
 		vm, err := q.dev.NewVirtualMachine(hv.SimpleVMConfig{
 			NumCPUs: 1,
-			MemSize: 0x200000,
-			MemBase: 0x100000,
+			MemSize: 64 * 1024 * 1024,
+			MemBase: 0,
 
 			VMLoader: &loader,
 		})
@@ -148,6 +148,40 @@ func (q *bringUpQuest) Run() error {
 		rax := uint64(regs[hv.RegisterAMD64Rax].(hv.Register64))
 		if rax != 42 {
 			return fmt.Errorf("unexpected RAX value: got %d, want 42", rax)
+		}
+
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// Test reading and writing memory
+	if err := q.runVMTask("Memory Read/Write Test", hv.ArchitectureX86_64, ir.Program{
+		Entrypoint: "main",
+		Methods: map[string]ir.Method{
+			"main": {
+				// load RIP+0x1000 into RCX
+				amd64.LeaRelative(amd64.Reg64(amd64.RCX), 0x1000),
+				// write value to memory at address in RCX
+				// load 0xcafebabe into RAX
+				amd64.MovImmediate(amd64.Reg32(amd64.RAX), 0xcafebabe),
+				amd64.MovToMemory(amd64.Mem(amd64.Reg64(amd64.RCX)), amd64.Reg64(amd64.RAX)),
+				amd64.MovFromMemory(amd64.Reg64(amd64.RBX), amd64.Mem(amd64.Reg64(amd64.RCX))),
+				amd64.Hlt(),
+			},
+		},
+	}, func(cpu hv.VirtualCPU) error {
+		regs := map[hv.Register]hv.RegisterValue{
+			hv.RegisterAMD64Rbx: hv.Register64(0),
+		}
+
+		if err := cpu.GetRegisters(regs); err != nil {
+			return fmt.Errorf("get RBX register: %w", err)
+		}
+
+		rbx := uint64(regs[hv.RegisterAMD64Rbx].(hv.Register64))
+		if rbx != 0xcafebabe {
+			return fmt.Errorf("unexpected RBX value: got 0x%08x, want 0xcafebabe", rbx)
 		}
 
 		return nil

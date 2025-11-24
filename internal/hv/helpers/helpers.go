@@ -47,10 +47,10 @@ func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 			}
 		case Mode64BitIdentityMapping:
 			if err := vcpu.(hv.VirtualCPUAmd64).SetLongModeWithSelectors(
-				0x00020000, // paging structures base addr in guest memory
-				256,        // 256 GiB address space
-				0x10,       // code selector
-				0x18,       // data selector
+				0x20000, // paging structures base addr in guest memory
+				4,       // 4GiB address space
+				0x10,    // code selector
+				0x18,    // data selector
 			); err != nil {
 				return fmt.Errorf("set long mode with selectors: %w", err)
 			}

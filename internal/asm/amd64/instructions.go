@@ -284,6 +284,17 @@ func LoadAddress(dst Reg, variable asm.Variable) asm.Fragment {
 	})
 }
 
+func LeaRelative(dst Reg, offset int32) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		bytes, err := encodeLeaRegRipRelative(dst, offset)
+		if err != nil {
+			return err
+		}
+		ctx.EmitBytes(bytes)
+		return nil
+	})
+}
+
 func JumpIfNotEqual(label asm.Label) asm.Fragment {
 	return &jump{label: label, kind: jumpNotEqual}
 }

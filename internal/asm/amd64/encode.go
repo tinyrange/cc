@@ -725,3 +725,32 @@ func encodeShrRegImm(reg Reg, count uint8) ([]byte, error) {
 func encodeShlRegImm(reg Reg, count uint8) ([]byte, error) {
 	return encodeShiftRegImm(reg, count, 4)
 }
+
+func encodeLeaRegRipRelative(dst Reg, offset int32) ([]byte, error) {
+	if dst.size != size64 {
+		return nil, fmt.Errorf("lea relative requires 64-bit register")
+	}
+
+	dstInfo, err := regEncoding(dst)
+	if err != nil {
+		return nil, err
+	}
+
+	rex := rexState{
+		w:     true,
+		b:     dstInfo.high,
+		force: dstInfo.needsRex,
+	}
+
+	out := make([]byte, 0, 7)
+	if rexByte := rex.prefix(); rexByte != 0 {
+		out = append(out, rexByte)
+	}
+	out = append(out, 0x8D)
+	modrm := byte(0x05 | (dstInfo.code << 3))
+	out = append(out, modrm)
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], uint32(offset))
+	out = append(out, buf[:]...)
+	return out, nil
+}
