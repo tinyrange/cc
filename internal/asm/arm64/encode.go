@@ -202,3 +202,33 @@ func encodeLiteralLoad(reg Reg, width literalWidth) (uint32, error) {
 		return 0, fmt.Errorf("arm64 asm: unsupported literal load width %d", width)
 	}
 }
+
+type systemRegister struct {
+	op0 uint8
+	op1 uint8
+	crn uint8
+	crm uint8
+	op2 uint8
+}
+
+var systemRegVBAR = systemRegister{
+	op0: 3,
+	op1: 0,
+	crn: 12,
+	crm: 0,
+	op2: 0,
+}
+
+func encodeMSR(reg systemRegister, src Reg) (uint32, error) {
+	if src.size != size64 {
+		return 0, fmt.Errorf("arm64 asm: MSR requires 64-bit source")
+	}
+	word := uint32(0xD5000000)
+	word |= uint32(reg.op0&0x3) << 19
+	word |= uint32(reg.op1&0x7) << 16
+	word |= uint32(reg.crn&0xF) << 12
+	word |= uint32(reg.crm&0xF) << 8
+	word |= uint32(reg.op2&0x7) << 5
+	word |= uint32(src.id & 0x1F)
+	return word, nil
+}

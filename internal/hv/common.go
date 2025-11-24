@@ -88,6 +88,7 @@ const (
 	RegisterARM64Sp
 	RegisterARM64Pc
 	RegisterARM64Pstate
+	RegisterARM64Vbar
 )
 
 type VirtualCPU interface {

@@ -209,9 +209,11 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		return nil, fmt.Errorf("mmap guest memory: %w", err)
 	}
 
-	if err := unix.Madvise(mem, unix.MADV_MERGEABLE); err != nil {
-		unix.Munmap(mem)
-		return nil, fmt.Errorf("madvise memory: %w", err)
+	if h.Architecture() == hv.ArchitectureX86_64 {
+		if err := unix.Madvise(mem, unix.MADV_MERGEABLE); err != nil {
+			unix.Munmap(mem)
+			return nil, fmt.Errorf("madvise memory: %w", err)
+		}
 	}
 
 	vm.memory = mem

@@ -15,14 +15,37 @@ const (
 	kvmRegSizeU64       uint64 = 0x0030000000000000
 	kvmRegArmCoproShift        = 16
 	kvmRegArmCore       uint64 = 0x0010 << kvmRegArmCoproShift
+	kvmRegArm64SysReg   uint64 = 0x0013 << kvmRegArmCoproShift
+
+	kvmRegArm64SysRegOp0Mask  uint64 = 0x000000000000c000
+	kvmRegArm64SysRegOp0Shift        = 14
+	kvmRegArm64SysRegOp1Mask  uint64 = 0x0000000000003800
+	kvmRegArm64SysRegOp1Shift        = 11
+	kvmRegArm64SysRegCrnMask  uint64 = 0x0000000000000780
+	kvmRegArm64SysRegCrnShift        = 7
+	kvmRegArm64SysRegCrmMask  uint64 = 0x0000000000000078
+	kvmRegArm64SysRegCrmShift        = 3
+	kvmRegArm64SysRegOp2Mask  uint64 = 0x0000000000000007
+	kvmRegArm64SysRegOp2Shift        = 0
 )
+
+func arm64SysReg(op0, op1, crn, crm, op2 uint64) uint64 {
+	return kvmRegArm64 | kvmRegSizeU64 | kvmRegArm64SysReg |
+		((op0 << kvmRegArm64SysRegOp0Shift) & kvmRegArm64SysRegOp0Mask) |
+		((op1 << kvmRegArm64SysRegOp1Shift) & kvmRegArm64SysRegOp1Mask) |
+		((crn << kvmRegArm64SysRegCrnShift) & kvmRegArm64SysRegCrnMask) |
+		((crm << kvmRegArm64SysRegCrmShift) & kvmRegArm64SysRegCrmMask) |
+		((op2 << kvmRegArm64SysRegOp2Shift) & kvmRegArm64SysRegOp2Mask)
+}
 
 func arm64CoreRegister(offsetBytes uintptr) uint64 {
 	return kvmRegArm64 | kvmRegSizeU64 | kvmRegArmCore | uint64(offsetBytes/4)
 }
 
+var arm64SysRegVbarEl1 = arm64SysReg(3, 0, 12, 0, 0)
+
 var arm64RegisterIDs = func() map[hv.Register]uint64 {
-	regs := make(map[hv.Register]uint64, 35)
+	regs := make(map[hv.Register]uint64, 36)
 
 	for i := 0; i <= 30; i++ {
 		reg := hv.Register(int(hv.RegisterARM64X0) + i)
@@ -32,6 +55,7 @@ var arm64RegisterIDs = func() map[hv.Register]uint64 {
 	regs[hv.RegisterARM64Sp] = arm64CoreRegister(uintptr(31 * 8))
 	regs[hv.RegisterARM64Pc] = arm64CoreRegister(uintptr(32 * 8))
 	regs[hv.RegisterARM64Pstate] = arm64CoreRegister(uintptr(33 * 8))
+	regs[hv.RegisterARM64Vbar] = arm64SysRegVbarEl1
 
 	return regs
 }()
@@ -137,7 +161,7 @@ func (hv *hypervisor) archVMInit(vmFd int) error {
 }
 
 func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int) error {
-	init, err := armPreferredTarget(hv.fd)
+	init, err := armPreferredTarget(vm.vmFd)
 	if err != nil {
 		return fmt.Errorf("getting preferred target: %w", err)
 	}

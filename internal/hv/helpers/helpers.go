@@ -32,6 +32,15 @@ type ProgramLoader struct {
 	Mode              LoadMode
 	BaseAddr          uint64
 	MaxLoopIterations uint64
+
+	Arm64ExceptionVectors *Arm64ExceptionVectorConfig
+
+	arm64VectorBase uint64
+}
+
+type Arm64ExceptionVectorConfig struct {
+	Table []byte
+	Align uint64
 }
 
 const (
@@ -84,10 +93,17 @@ func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 			return fmt.Errorf("unsupported load mode %v for architecture %v", p.Mode, arch)
 		}
 
-		if err := vcpu.SetRegisters(map[hv.Register]hv.RegisterValue{
+		regs := map[hv.Register]hv.RegisterValue{
 			hv.RegisterARM64Pc:     hv.Register64(p.BaseAddr),
 			hv.RegisterARM64Pstate: hv.Register64(psrModeEL1h | psrDBit | psrABit | psrIBit | psrFBit),
-		}); err != nil {
+		}
+		if p.Arm64ExceptionVectors != nil {
+			if p.arm64VectorBase == 0 {
+				return fmt.Errorf("arm64 exception vectors requested but not initialized by loader")
+			}
+			regs[hv.RegisterARM64Vbar] = hv.Register64(p.arm64VectorBase)
+		}
+		if err := vcpu.SetRegisters(regs); err != nil {
 			return fmt.Errorf("set initial registers: %w", err)
 		}
 
@@ -121,9 +137,26 @@ func (p *ProgramLoader) Load(vm hv.VirtualMachine) error {
 	}
 
 	bytes := prog.RelocatedCopy(uintptr(p.BaseAddr))
-
 	if _, err := vm.WriteAt(bytes, int64(p.BaseAddr)); err != nil {
 		return fmt.Errorf("write program to vm memory: %w", err)
+	}
+
+	if target == ir.ArchitectureARM64 && p.Arm64ExceptionVectors != nil {
+		if len(p.Arm64ExceptionVectors.Table) == 0 {
+			return fmt.Errorf("arm64 exception vector table is empty")
+		}
+		align := p.Arm64ExceptionVectors.Align
+		if align == 0 {
+			align = 0x800
+		}
+		if align&(align-1) != 0 {
+			return fmt.Errorf("arm64 exception vector alignment must be power of two (got %d)", align)
+		}
+		base := alignUp(uint64(p.BaseAddr)+uint64(len(bytes))+uint64(prog.BSSSize()), align)
+		if _, err := vm.WriteAt(p.Arm64ExceptionVectors.Table, int64(base)); err != nil {
+			return fmt.Errorf("write arm64 vector table: %w", err)
+		}
+		p.arm64VectorBase = base
 	}
 
 	return nil
@@ -133,3 +166,11 @@ var (
 	_ hv.VMLoader  = &ProgramLoader{}
 	_ hv.RunConfig = &ProgramLoader{}
 )
+
+func alignUp(value, align uint64) uint64 {
+	if align == 0 {
+		return value
+	}
+	mask := align - 1
+	return (value + mask) &^ mask
+}

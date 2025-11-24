@@ -494,6 +494,24 @@ func UseRegister(v asm.Variable) asm.Value {
 	return asm.Register(v)
 }
 
+func SetVectorBase(src Reg) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		if err := src.validate(); err != nil {
+			return err
+		}
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		word, err := encodeMSR(systemRegVBAR, src)
+		if err != nil {
+			return err
+		}
+		c.emit32(word)
+		return nil
+	})
+}
+
 func SyscallWrite(fd asm.Value, buf asm.Value, count asm.Value) asm.Fragment {
 	return Syscall(linux.SYS_WRITE, fd, buf, count)
 }
