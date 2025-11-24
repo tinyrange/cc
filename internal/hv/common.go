@@ -52,6 +52,42 @@ const (
 	RegisterAMD64R15
 	RegisterAMD64Rip
 	RegisterAMD64Rflags
+
+	// ARM64 General-Purpose Registers
+	RegisterARM64X0
+	RegisterARM64X1
+	RegisterARM64X2
+	RegisterARM64X3
+	RegisterARM64X4
+	RegisterARM64X5
+	RegisterARM64X6
+	RegisterARM64X7
+	RegisterARM64X8
+	RegisterARM64X9
+	RegisterARM64X10
+	RegisterARM64X11
+	RegisterARM64X12
+	RegisterARM64X13
+	RegisterARM64X14
+	RegisterARM64X15
+	RegisterARM64X16
+	RegisterARM64X17
+	RegisterARM64X18
+	RegisterARM64X19
+	RegisterARM64X20
+	RegisterARM64X21
+	RegisterARM64X22
+	RegisterARM64X23
+	RegisterARM64X24
+	RegisterARM64X25
+	RegisterARM64X26
+	RegisterARM64X27
+	RegisterARM64X28
+	RegisterARM64X29
+	RegisterARM64X30
+	RegisterARM64Sp
+	RegisterARM64Pc
+	RegisterARM64Pstate
 )
 
 type VirtualCPU interface {

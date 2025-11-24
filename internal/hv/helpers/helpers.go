@@ -34,6 +34,14 @@ type ProgramLoader struct {
 	MaxLoopIterations uint64
 }
 
+const (
+	psrModeEL1h = 0x5
+	psrDBit     = 0x200
+	psrABit     = 0x100
+	psrIBit     = 0x80
+	psrFBit     = 0x40
+)
+
 // Run implements hv.RunConfig.
 func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 	arch := vcpu.VirtualMachine().Hypervisor().Architecture()
@@ -60,6 +68,25 @@ func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 		if err := vcpu.SetRegisters(map[hv.Register]hv.RegisterValue{
 			hv.RegisterAMD64Rflags: hv.Register64(0x2),
 			hv.RegisterAMD64Rip:    hv.Register64(p.BaseAddr),
+		}); err != nil {
+			return fmt.Errorf("set initial registers: %w", err)
+		}
+
+		for range p.MaxLoopIterations {
+			if err := vcpu.Run(ctx); err != nil {
+				return fmt.Errorf("run vCPU: %w", err)
+			}
+		}
+
+		return fmt.Errorf("maximum loop iterations (%d) exceeded", p.MaxLoopIterations)
+	case hv.ArchitectureARM64:
+		if p.Mode != Mode64BitIdentityMapping {
+			return fmt.Errorf("unsupported load mode %v for architecture %v", p.Mode, arch)
+		}
+
+		if err := vcpu.SetRegisters(map[hv.Register]hv.RegisterValue{
+			hv.RegisterARM64Pc:     hv.Register64(p.BaseAddr),
+			hv.RegisterARM64Pstate: hv.Register64(psrModeEL1h | psrDBit | psrABit | psrIBit | psrFBit),
 		}); err != nil {
 			return fmt.Errorf("set initial registers: %w", err)
 		}

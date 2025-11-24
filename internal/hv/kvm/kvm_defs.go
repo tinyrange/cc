@@ -25,6 +25,8 @@ const (
 	kvmSetUserMemoryRegion    = 0x4020ae46
 	kvmGetClock               = 0x8030ae7c
 	kvmSetClock               = 0x4030ae7b
+	kvmGetOneReg              = 0x4010aeab
+	kvmSetOneReg              = 0x4010aeac
 	kvmGetPit2                = 0x8070ae9f
 	kvmSetPit2                = 0x4070aea0
 	kvmGetRegs                = 0x8090ae81
@@ -43,6 +45,8 @@ const (
 	kvmSetCpuid2              = 0x4008ae90
 	kvmGetMsrs                = 0xc008ae88
 	kvmSetMsrs                = 0x4008ae89
+	kvmArmVcpuInitIoctl       = 0x4020aeae
+	kvmArmPreferredTarget     = 0x8020aeaf
 
 	kvmCapNrMemslots = 10
 )
@@ -177,4 +181,14 @@ const (
 	kvmExitLoongarchIocsr kvmExitReason = 38
 	kvmExitMemoryFault    kvmExitReason = 39
 	kvmExitTdx            kvmExitReason = 40
+)
+
+const (
+	kvmSystemEventShutdown = 1
+	kvmSystemEventReset    = 2
+	kvmSystemEventCrash    = 3
+	kvmSystemEventWakeup   = 4
+	kvmSystemEventSuspend  = 5
+	kvmSystemEventSevTerm  = 6
+	kvmSystemEventTdxFatal = 7
 )
