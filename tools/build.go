@@ -52,11 +52,12 @@ var crossBuilds = []crossBuild{
 }
 
 type buildOptions struct {
-	Package     string
-	OutputName  string
-	CgoEnabled  bool
-	Build       crossBuild
-	RaceEnabled bool
+	Package          string
+	OutputName       string
+	CgoEnabled       bool
+	Build            crossBuild
+	RaceEnabled      bool
+	EntitlementsPath string
 }
 
 type buildOutput struct {
@@ -92,6 +93,30 @@ func goBuild(opts buildOptions) (buildOutput, error) {
 
 	if err := cmd.Run(); err != nil {
 		return buildOutput{}, fmt.Errorf("go build failed: %w", err)
+	}
+
+	// if entitlements path is set and building for darwin/arm64, codesign the output
+	if opts.EntitlementsPath != "" && opts.Build.GOOS == "darwin" && opts.Build.GOARCH == "arm64" {
+		// build internal/cmd/codesign first
+		codesignOut, err := goBuild(buildOptions{
+			Package:    "internal/cmd/codesign",
+			OutputName: "codesign",
+			Build:      hostBuild,
+		})
+		if err != nil {
+			return buildOutput{}, fmt.Errorf("failed to build codesign tool: %w", err)
+		}
+
+		cmd := exec.Command(codesignOut.Path,
+			"-entitlements", opts.EntitlementsPath,
+			"-bin", output,
+		)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+
+		if err := cmd.Run(); err != nil {
+			return buildOutput{}, fmt.Errorf("failed to codesign output: %w", err)
+		}
 	}
 
 	return buildOutput{Path: output}, nil
@@ -143,17 +168,37 @@ func main() {
 	cross := fs.Bool("cross", false, "attempt to cross compile the quest for all supported platforms")
 	test := fs.String("test", "", "run go tests in the specified package")
 	bench := fs.Bool("bench", false, "run all benchmarks and output results to benchmarks/<hostid>/<date>.json")
+	codesign := fs.Bool("codesign", false, "build the macos codesign tool")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
 	}
 
+	if *codesign {
+		out, err := goBuild(buildOptions{
+			Package:    "internal/cmd/codesign",
+			OutputName: "codesign",
+			Build:      hostBuild,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build codesign: %v\n", err)
+			os.Exit(1)
+		}
+
+		if err := runBuildOutput(out, fs.Args()); err != nil {
+			os.Exit(1)
+		}
+
+		return
+	}
+
 	if *quest {
 		out, err := goBuild(buildOptions{
-			Package:     "cmd/quest",
-			OutputName:  "quest",
-			Build:       hostBuild,
-			RaceEnabled: *race,
+			Package:          "cmd/quest",
+			OutputName:       "quest",
+			Build:            hostBuild,
+			RaceEnabled:      *race,
+			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to build quest: %v\n", err)
@@ -171,9 +216,10 @@ func main() {
 		for _, cb := range crossBuilds {
 			fmt.Printf("Building for %s/%s...\n", cb.GOOS, cb.GOARCH)
 			_, err := goBuild(buildOptions{
-				Package:    "cmd/quest",
-				OutputName: "quest",
-				Build:      cb,
+				Package:          "cmd/quest",
+				OutputName:       "quest",
+				Build:            cb,
+				EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
 			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "failed to build for %s/%s: %v\n", cb.GOOS, cb.GOARCH, err)

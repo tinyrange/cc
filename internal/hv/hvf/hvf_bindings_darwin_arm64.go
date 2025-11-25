@@ -22,6 +22,7 @@ const (
 	hvBadArgument  hvReturn = 0xFAE94003
 	hvNoResources  hvReturn = 0xFAE94005
 	hvNoDevice     hvReturn = 0xFAE94006
+	hvDenied       hvReturn = 0xFAE94007
 	hvUnsupported  hvReturn = 0xFAE9400F
 	hvAlignmentErr hvReturn = 0xFAE94010
 )
@@ -40,6 +41,8 @@ func (r hvReturn) Error() string {
 		return "no resources"
 	case hvNoDevice:
 		return "no device"
+	case hvDenied:
+		return "denied"
 	case hvUnsupported:
 		return "unsupported"
 	case hvAlignmentErr:
@@ -176,9 +179,7 @@ func ensureInitialized() error {
 			if hvErr != nil {
 				return
 			}
-			if err := purego.RegisterLibFunc(sym, libHypervisor, name); err != nil {
-				hvErr = fmt.Errorf("hvf: register %s: %w", name, err)
-			}
+			purego.RegisterLibFunc(sym, libHypervisor, name)
 		}
 
 		register(&hvVmCreate, "hv_vm_create")
