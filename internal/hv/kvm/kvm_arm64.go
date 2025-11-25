@@ -4,10 +4,12 @@ package kvm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"unsafe"
 
 	"github.com/tinyrange/cc/internal/hv"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -100,11 +102,35 @@ func (v *virtualCPU) GetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 }
 
 func (v *virtualCPU) Run(ctx context.Context) error {
-	if _, err := ioctlWithRetry(uintptr(v.fd), uint64(kvmRun), 0); err != nil {
-		return fmt.Errorf("kvm: run vCPU %d: %w", v.id, err)
+	usingContext := false
+	var stopNotify func() bool
+	if done := ctx.Done(); done != nil {
+		usingContext = true
+		tid := unix.Gettid()
+		stopNotify = context.AfterFunc(ctx, func() {
+			_ = v.RequestImmediateExit(tid)
+		})
+	}
+	if stopNotify != nil {
+		defer stopNotify()
 	}
 
 	run := (*kvmRunData)(unsafe.Pointer(&v.run[0]))
+
+	// clear immediate_exit in case it was set
+	run.immediate_exit = 0
+
+	_, err := ioctl(uintptr(v.fd), uint64(kvmRun), 0)
+	if errors.Is(err, unix.EINTR) {
+		if usingContext && (errors.Is(ctx.Err(), context.Canceled) ||
+			errors.Is(ctx.Err(), context.DeadlineExceeded)) {
+			return ctx.Err()
+		}
+
+		return unix.EINTR
+	} else if err != nil {
+		return fmt.Errorf("kvm: run vCPU %d: %w", v.id, err)
+	}
 
 	reason := kvmExitReason(run.exit_reason)
 

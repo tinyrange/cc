@@ -33,6 +33,20 @@ func (v *virtualCPU) start() {
 	}
 }
 
+func (v *virtualCPU) RequestImmediateExit(tid int) error {
+	run := (*kvmRunData)(unsafe.Pointer(&v.run[0]))
+
+	// set immediate_exit to request vCPU exit
+	run.immediate_exit = 1
+
+	// send signal to the vCPU thread to interrupt it
+	if err := unix.Tgkill(unix.Getpid(), tid, unix.SIGUSR1); err != nil {
+		return fmt.Errorf("kvm: request immediate exit: %w", err)
+	}
+
+	return nil
+}
+
 var (
 	_ hv.VirtualCPU = &virtualCPU{}
 )
@@ -98,12 +112,8 @@ func (v *virtualMachine) Run(ctx context.Context, cfg hv.RunConfig) error {
 		done <- cfg.Run(ctx, vcpu)
 	}
 
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	err := <-done
+	return err
 }
 
 func (v *virtualMachine) ReadAt(p []byte, off int64) (n int, err error) {

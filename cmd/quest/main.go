@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/tinyrange/cc/internal/asm"
 	"github.com/tinyrange/cc/internal/asm/amd64"
@@ -64,7 +65,7 @@ func mustBuildArm64VectorTable() []byte {
 	}
 
 	table := make([]byte, arm64VectorEntrySize*arm64VectorEntryCount)
-	for i := 0; i < arm64VectorEntryCount; i++ {
+	for i := range arm64VectorEntryCount {
 		copy(table[i*arm64VectorEntrySize:], entry)
 	}
 	return table
@@ -145,6 +146,74 @@ func (q *bringUpQuest) runVMTask(
 		if err := vm.VirtualCPUCall(0, f); err != nil {
 			return fmt.Errorf("sync vCPU: %w", err)
 		}
+
+		return nil
+	})
+}
+
+func (q *bringUpQuest) runVMTaskWithTimeout(
+	name string,
+	arch hv.CpuArchitecture,
+	timeout time.Duration,
+	prog ir.Program,
+	f func(cpu hv.VirtualCPU) error,
+	devs ...hv.Device,
+) error {
+	return q.runArchitectureTask(name, arch, func() error {
+		loader := helpers.ProgramLoader{
+			Program:           prog,
+			BaseAddr:          0,
+			Mode:              helpers.Mode64BitIdentityMapping,
+			MaxLoopIterations: 128,
+		}
+		if arch == hv.ArchitectureARM64 {
+			arm64ExceptionVectorInit(&loader)
+		}
+
+		vm, err := q.dev.NewVirtualMachine(hv.SimpleVMConfig{
+			NumCPUs: 1,
+			MemSize: 64 * 1024 * 1024,
+			MemBase: 0,
+
+			VMLoader: &loader,
+		})
+		if err != nil {
+			return fmt.Errorf("create virtual machine: %w", err)
+		}
+		defer vm.Close()
+
+		for _, dev := range devs {
+			if err := vm.AddDevice(dev); err != nil {
+				return fmt.Errorf("add device to virtual machine: %w", err)
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		closed := make(chan struct{})
+
+		// just in case the timeout doesn't work, we set a deadline on the process
+		go func() {
+			select {
+			case <-closed:
+				return
+			case <-time.After(timeout * 4):
+				slog.Error("VM task timed out, killing process", "name", name)
+				os.Exit(1)
+			}
+		}()
+
+		err = vm.Run(ctx, &loader)
+		if !errors.Is(err, hv.ErrVMHalted) && !errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("run virtual machine: %w", err)
+		}
+
+		if err := vm.VirtualCPUCall(0, f); err != nil {
+			return fmt.Errorf("sync vCPU: %w", err)
+		}
+
+		close(closed)
 
 		return nil
 	})
@@ -364,6 +433,22 @@ func (q *bringUpQuest) Run() error {
 		return err
 	}
 
+	// Timeout test
+	if err := q.runVMTaskWithTimeout("Timeout Test", hv.ArchitectureX86_64, 100*time.Millisecond, ir.Program{
+		Entrypoint: "main",
+		Methods: map[string]ir.Method{
+			"main": {
+				asm.MarkLabel(asm.Label("loop")),
+				amd64.Jump(asm.Label("loop")),
+			},
+		},
+	}, func(cpu hv.VirtualCPU) error {
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// ARM64 tests
 	if err := q.runVMTask("PSCI SYSTEM_OFF Test", hv.ArchitectureARM64, ir.Program{
 		Entrypoint: "main",
 		Methods: map[string]ir.Method{
