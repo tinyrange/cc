@@ -1,6 +1,6 @@
-//go:build !((linux && amd64) || (linux && arm64) || (windows && amd64) || (darwin && arm64))
+//go:build !darwin || !arm64
 
-package factory
+package hvf
 
 import "github.com/tinyrange/cc/internal/hv"
 
