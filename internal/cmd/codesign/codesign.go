@@ -20,6 +20,7 @@ import (
 	"hash"
 	"io"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -722,7 +723,10 @@ func main() {
 		}
 	}
 
-	log.Printf("signed %s with entitlements %s", *binPath, *entPath)
+	slog.Info("code signing completed",
+		"path", *binPath,
+		"entitlements", *entPath,
+	)
 }
 
 func textSegmentInfo(f *macho.File) (int64, int64, error) {

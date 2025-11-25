@@ -5,13 +5,12 @@ package hvf
 import "github.com/tinyrange/cc/internal/hv"
 
 var arm64GeneralRegisterMap = func() map[hv.Register]hvReg {
-	regs := make(map[hv.Register]hvReg, 36)
+	regs := make(map[hv.Register]hvReg, 35)
 
 	for i := 0; i <= 30; i++ {
 		regs[hv.Register(int(hv.RegisterARM64X0)+i)] = hvReg(hvRegX0 + hvReg(i))
 	}
 
-	regs[hv.RegisterARM64Sp] = hvRegSp
 	regs[hv.RegisterARM64Pc] = hvRegPc
 	regs[hv.RegisterARM64Pstate] = hvRegCpsr
 
@@ -20,6 +19,7 @@ var arm64GeneralRegisterMap = func() map[hv.Register]hvReg {
 
 var arm64SysRegisterMap = map[hv.Register]hvSysReg{
 	hv.RegisterARM64Vbar: hvSysRegVBAR,
+	hv.RegisterARM64Sp:   hvSysRegSpEl1,
 }
 
 func arm64RegisterFromIndex(idx int) (hv.Register, bool) {

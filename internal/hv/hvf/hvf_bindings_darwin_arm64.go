@@ -122,7 +122,6 @@ const (
 	hvRegX28
 	hvRegX29
 	hvRegX30
-	hvRegSp
 	hvRegPc
 	hvRegFpcr
 	hvRegFpsr
@@ -140,6 +139,7 @@ func makeHvSysReg(op0, op1, crn, crm, op2 uint32) hvSysReg {
 }
 
 var hvSysRegVBAR = makeHvSysReg(3, 0, 12, 0, 0)
+var hvSysRegSpEl1 = hvSysReg(0xe208)
 
 var (
 	hvOnce sync.Once

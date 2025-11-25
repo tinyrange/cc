@@ -94,8 +94,6 @@ func (h *hypervisor) newVirtualMachine(config hv.VMConfig) (*virtualMachine, err
 		}
 		vm.vcpus[i] = vcpu
 
-		go vcpu.start()
-
 		if err := config.Callbacks().OnCreateVCPU(vcpu); err != nil {
 			vm.closeInternal()
 			return nil, fmt.Errorf("hvf: VM callback OnCreateVCPU %d: %w", i, err)
@@ -247,16 +245,14 @@ func (v *virtualMachine) createVCPU(id int) (*virtualCPU, error) {
 		vm:       v,
 		index:    id,
 		runQueue: make(chan func(), 16),
+		initErr:  make(chan error, 1),
 	}
 
-	var exitPtr *hvVcpuExit
-	var hostID uint64
-	ret := hvVcpuCreate(&hostID, &exitPtr, 0)
-	if err := ret.toError("hv_vcpu_create"); err != nil {
+	go vcpu.start()
+
+	if err := <-vcpu.initErr; err != nil {
 		return nil, err
 	}
-	vcpu.hostID = hostID
-	vcpu.exit = exitPtr
 
 	return vcpu, nil
 }
@@ -267,11 +263,26 @@ type virtualCPU struct {
 	index    int
 	exit     *hvVcpuExit
 	runQueue chan func()
+	initErr  chan error
 }
 
 func (v *virtualCPU) start() {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+
+	var exitPtr *hvVcpuExit
+	var hostID uint64
+	ret := hvVcpuCreate(&hostID, &exitPtr, 0)
+	if err := ret.toError("hv_vcpu_create"); err != nil {
+		v.initErr <- err
+		close(v.initErr)
+		close(v.runQueue)
+		return
+	}
+	v.hostID = hostID
+	v.exit = exitPtr
+	v.initErr <- nil
+	close(v.initErr)
 
 	for fn := range v.runQueue {
 		fn()
