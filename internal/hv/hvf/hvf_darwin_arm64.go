@@ -139,6 +139,10 @@ func (v *virtualMachine) Run(ctx context.Context, cfg hv.RunConfig) error {
 		return fmt.Errorf("hvf: RunConfig is nil")
 	}
 
+	if _, ok := ctx.Deadline(); ok {
+		return fmt.Errorf("hvf: Run does not support context deadlines or timeouts")
+	}
+
 	vcpu, ok := v.vcpus[0]
 	if !ok {
 		return fmt.Errorf("hvf: vCPU 0 not found")
