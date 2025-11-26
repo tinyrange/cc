@@ -588,6 +588,21 @@ func (q *bringUpQuest) Run() error {
 
 			return fmt.Errorf("unexpected MMIO write to address 0x%08x", addr)
 		},
+		}); err != nil {
+			return err
+		}
+
+	// Timeout test (ARM64)
+	if err := q.runVMTaskWithTimeout("Timeout Test (ARM64)", hv.ArchitectureARM64, 100*time.Millisecond, ir.Program{
+		Entrypoint: "main",
+		Methods: map[string]ir.Method{
+			"main": {
+				asm.MarkLabel(asm.Label("loop")),
+				arm64.Jump(asm.Label("loop")),
+			},
+		},
+	}, func(cpu hv.VirtualCPU) error {
+		return nil
 	}); err != nil {
 		return err
 	}
