@@ -169,6 +169,7 @@ func main() {
 	test := fs.String("test", "", "run go tests in the specified package")
 	bench := fs.Bool("bench", false, "run all benchmarks and output results to benchmarks/<hostid>/<date>.json")
 	codesign := fs.Bool("codesign", false, "build the macos codesign tool")
+	alpine := fs.Bool("alpine", false, "build the alpine linux package downloader")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
@@ -182,6 +183,24 @@ func main() {
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to build codesign: %v\n", err)
+			os.Exit(1)
+		}
+
+		if err := runBuildOutput(out, fs.Args()); err != nil {
+			os.Exit(1)
+		}
+
+		return
+	}
+
+	if *alpine {
+		out, err := goBuild(buildOptions{
+			Package:    "cmd/alpine",
+			OutputName: "alpine",
+			Build:      hostBuild,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build alpine downloader: %v\n", err)
 			os.Exit(1)
 		}
 

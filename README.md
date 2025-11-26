@@ -16,7 +16,7 @@ CrumbleCracker is a high performance embeddable virtualization platform designed
 - [x] Add a assembler and compiler for running small programs.
 - [x] Write a basic x86_64 KVM abstraction and a start to a **Bringup Quest** with VCPU, MMIO, and IO support.
 - [x] Add support for timing out a VM run after a period.
-- [ ] Add automatic downloader for Alpine Linux kernels.
+- [x] Add automatic downloader for Alpine Linux kernels.
 - [ ] Add a serial device and boot a Linux kernel from Alpine Linux into a minimal Init program written using the assembler.
 - [ ] Add `virtio-mmio` support starting with a `virtio-console` driver.
 - [ ] Write a more advanced init program supporting multiple entries into the virtual guest.
@@ -42,3 +42,7 @@ Currently I've decided to license the code under GPL-3.0 in a public preview per
 The private version of CrumbleCracker has been written mostly with AI models mostly GPT-5.1. This is a extraordinarily capbile model that produces working production ready code but architecture I feel it has been lacking. Over the short span of weeks with the current version of CrumbleCracker it has generated code that is generally difficult to read and maintain. The parts performing well have mostly been hand architecture with AI assistance.
 
 For this version of CrumbleCracker I expect to primarily architect/write the production code myself using AI written code as a foundation.
+
+## Getting Start Notes
+
+To download Linux from Alpine repos `./tools/build.go -alpine -- -name linux-virt -extract-filename boot/vmlinuz-virt -extract-output local/vmlinux`
