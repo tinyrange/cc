@@ -1,4 +1,4 @@
-//go:build windows
+//go:build windows && (amd64 || arm64)
 
 package whp
 
@@ -6,11 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"log/slog"
-	"os"
 	"runtime"
-	"time"
-	"unsafe"
 
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/whp/bindings"
@@ -77,99 +73,6 @@ func (v *virtualCPU) GetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 	return nil
 }
 
-type w struct {
-}
-
-func (w) Write(p []byte) (n int, err error) {
-	// console escape noop
-	os.Stdout.WriteString("\x1b[0m")
-	return len(p), nil
-}
-
-// Run implements hv.VirtualCPU.
-func (v *virtualCPU) Run(ctx context.Context) error {
-	var exit bindings.RunVPExitContext
-
-	// HORRIBLE HACK TO GET BRING UP WORKING
-	if !v.firstTickDone {
-		slog.NewJSONHandler(w{}, nil).Handle(context.Background(), slog.NewRecord(time.Now(), slog.LevelDebug, "", 0))
-		v.firstTickDone = true
-	}
-
-	if err := bindings.RunVirtualProcessorContext(v.vm.part, uint32(v.id), &exit); err != nil {
-		return fmt.Errorf("whp: RunVirtualProcessorContext failed: %w", err)
-	}
-
-	switch exit.ExitReason {
-	case bindings.RunVPExitReasonX64Halt:
-		return hv.ErrVMHalted
-	case bindings.RunVPExitReasonMemoryAccess:
-		mem := exit.MemoryAccess()
-
-		var status bindings.EmulatorStatus
-
-		v.pendingError = nil
-
-		// Attempt to emulate the instruction that caused the memory access exit.
-		// The emulator will call the registered callbacks (MemoryCallback, TranslateGva, etc.)
-		// to fetch instructions and perform the memory operation.
-		if err := bindings.EmulatorTryMmioEmulation(
-			v.vm.emu,
-			unsafe.Pointer(v),
-			&exit.VpContext,
-			mem,
-			&status,
-		); err != nil {
-			return fmt.Errorf("EmulatorTryMmioEmulation failed: %w", err)
-		}
-
-		// Check if an error occurred inside a callback (e.g. MMIO write failure)
-		if v.pendingError != nil {
-			return v.pendingError
-		}
-
-		// If the emulator returns success but the status indicates failure (0),
-		// it usually means it couldn't fetch the instruction or the instruction
-		// didn't match the exit reason.
-		if !status.EmulationSuccessful() {
-			// We return a detailed error to help debugging, including the RIP and GPA
-			rip := exit.VpContext.Rip
-			gpa := mem.Gpa
-			return fmt.Errorf("whp: emulation failed (Status=%v) at RIP=0x%x accessing GPA=0x%x.", status, rip, gpa)
-		}
-
-		return nil
-
-	case bindings.RunVPExitReasonX64IoPortAccess:
-		io := exit.IoPortAccess()
-
-		var status bindings.EmulatorStatus
-
-		v.pendingError = nil
-		if err := bindings.EmulatorTryIoEmulation(
-			v.vm.emu,
-			unsafe.Pointer(v),
-			&exit.VpContext,
-			io,
-			&status,
-		); err != nil {
-			return fmt.Errorf("EmulatorTryIoEmulation failed: %w", err)
-		}
-
-		if v.pendingError != nil {
-			return v.pendingError
-		}
-
-		if !status.EmulationSuccessful() {
-			return fmt.Errorf("whp: io emulation failed with status %v at port 0x%x", status, io.Port)
-		}
-
-		return nil
-	default:
-		return fmt.Errorf("whp: unsupported vCPU exit reason %s", exit.ExitReason)
-	}
-}
-
 var whpRegisterMap = map[hv.Register]bindings.RegisterName{
 	hv.RegisterAMD64Rax:    bindings.RegisterRax,
 	hv.RegisterAMD64Rbx:    bindings.RegisterRbx,
@@ -189,6 +92,40 @@ var whpRegisterMap = map[hv.Register]bindings.RegisterName{
 	hv.RegisterAMD64R15:    bindings.RegisterR15,
 	hv.RegisterAMD64Rip:    bindings.RegisterRip,
 	hv.RegisterAMD64Rflags: bindings.RegisterRflags,
+
+	hv.RegisterARM64X0:     bindings.Arm64RegisterX0,
+	hv.RegisterARM64X1:     bindings.Arm64RegisterX1,
+	hv.RegisterARM64X2:     bindings.Arm64RegisterX2,
+	hv.RegisterARM64X3:     bindings.Arm64RegisterX3,
+	hv.RegisterARM64X4:     bindings.Arm64RegisterX4,
+	hv.RegisterARM64X5:     bindings.Arm64RegisterX5,
+	hv.RegisterARM64X6:     bindings.Arm64RegisterX6,
+	hv.RegisterARM64X7:     bindings.Arm64RegisterX7,
+	hv.RegisterARM64X8:     bindings.Arm64RegisterX8,
+	hv.RegisterARM64X9:     bindings.Arm64RegisterX9,
+	hv.RegisterARM64X10:    bindings.Arm64RegisterX10,
+	hv.RegisterARM64X11:    bindings.Arm64RegisterX11,
+	hv.RegisterARM64X12:    bindings.Arm64RegisterX12,
+	hv.RegisterARM64X13:    bindings.Arm64RegisterX13,
+	hv.RegisterARM64X14:    bindings.Arm64RegisterX14,
+	hv.RegisterARM64X15:    bindings.Arm64RegisterX15,
+	hv.RegisterARM64X16:    bindings.Arm64RegisterX16,
+	hv.RegisterARM64X17:    bindings.Arm64RegisterX17,
+	hv.RegisterARM64X18:    bindings.Arm64RegisterX18,
+	hv.RegisterARM64X19:    bindings.Arm64RegisterX19,
+	hv.RegisterARM64X20:    bindings.Arm64RegisterX20,
+	hv.RegisterARM64X21:    bindings.Arm64RegisterX21,
+	hv.RegisterARM64X22:    bindings.Arm64RegisterX22,
+	hv.RegisterARM64X23:    bindings.Arm64RegisterX23,
+	hv.RegisterARM64X24:    bindings.Arm64RegisterX24,
+	hv.RegisterARM64X25:    bindings.Arm64RegisterX25,
+	hv.RegisterARM64X26:    bindings.Arm64RegisterX26,
+	hv.RegisterARM64X27:    bindings.Arm64RegisterX27,
+	hv.RegisterARM64X28:    bindings.Arm64RegisterX28,
+	hv.RegisterARM64Sp:     bindings.Arm64RegisterSp,
+	hv.RegisterARM64Pc:     bindings.Arm64RegisterPc,
+	hv.RegisterARM64Pstate: bindings.Arm64RegisterPstate,
+	hv.RegisterARM64Vbar:   bindings.Arm64RegisterVbarEl1,
 }
 
 // SetRegisters implements hv.VirtualCPU.
@@ -419,108 +356,6 @@ func (h *hypervisor) Close() error {
 	return nil
 }
 
-func createEmulator() (bindings.EmulatorHandle, error) {
-	ioFn := func(ctx unsafe.Pointer, access *bindings.EmulatorIOAccessInfo) bindings.HRESULT {
-		vcpu := (*virtualCPU)(ctx)
-
-		if err := vcpu.handleIOPortAccess(access); err != nil {
-			vcpu.pendingError = err
-			return bindings.HRESULTFail
-		}
-
-		return 0
-	}
-
-	memFn := func(
-		ctx unsafe.Pointer,
-		access *bindings.EmulatorMemoryAccessInfo,
-	) bindings.HRESULT {
-		vcpu := (*virtualCPU)(ctx)
-
-		if err := vcpu.handleMemoryAccess(access); err != nil {
-			vcpu.pendingError = err
-			return bindings.HRESULTFail
-		}
-
-		return 0
-	}
-
-	getFn := func(
-		ctx unsafe.Pointer,
-		names []bindings.RegisterName,
-		values []bindings.RegisterValue,
-	) bindings.HRESULT {
-		vcpu := (*virtualCPU)(ctx)
-
-		// Note: We use the backing store (bindings.GetVirtualProcessorRegisters) to populate the emulator.
-		if err := bindings.GetVirtualProcessorRegisters(vcpu.vm.part, uint32(vcpu.id), names, values); err != nil {
-			// Panic here is risky but acceptable if we can't get registers the emulator critically needs.
-			panic(fmt.Sprintf("GetVirtualProcessorRegisters failed: %v", err))
-		}
-
-		return 0
-	}
-
-	setFn := func(
-		ctx unsafe.Pointer,
-		names []bindings.RegisterName,
-		values []bindings.RegisterValue,
-	) bindings.HRESULT {
-		vcpu := (*virtualCPU)(ctx)
-
-		if err := bindings.SetVirtualProcessorRegisters(vcpu.vm.part, uint32(vcpu.id), names, values); err != nil {
-			panic(fmt.Sprintf("SetVirtualProcessorRegisters failed: %v", err))
-		}
-
-		return 0
-	}
-
-	translateFn := func(
-		ctx unsafe.Pointer,
-		gva bindings.GuestVirtualAddress,
-		flags bindings.TranslateGVAFlags,
-		result *bindings.TranslateGVAResultCode,
-		gpa *bindings.GuestPhysicalAddress,
-	) bindings.HRESULT {
-		vcpu := (*virtualCPU)(ctx)
-
-		var tResult bindings.TranslateGVAResult
-		var tGPA bindings.GuestPhysicalAddress
-
-		// Ensure we pass flags correctly, specifically allowing override if needed by the bindings.
-		if err := bindings.TranslateGVA(
-			vcpu.vm.part,
-			uint32(vcpu.id),
-			gva,
-			flags,
-			&tResult,
-			&tGPA,
-		); err != nil {
-			// Panic is too strong here, but bindings panic if we return Fail usually.
-			// Ideally we log this.
-			panic(fmt.Sprintf("TranslateGvaPage failed: %v", err))
-		}
-
-		*result = tResult.ResultCode
-		*gpa = tGPA
-
-		return 0
-	}
-
-	emu, err := bindings.EmulatorCreate(&bindings.EmulatorCallbacks{
-		IoPortCallback:               bindings.NewEmulatorIoPortCallback(ioFn),
-		MemoryCallback:               bindings.NewEmulatorMemoryCallback(memFn),
-		GetVirtualProcessorRegisters: bindings.NewEmulatorGetRegistersCallback(getFn),
-		SetVirtualProcessorRegisters: bindings.NewEmulatorSetRegistersCallback(setFn),
-		TranslateGvaPage:             bindings.NewEmulatorTranslateGvaCallback(translateFn),
-	})
-	if err != nil {
-		return 0, fmt.Errorf("failed to create emulator: %w", err)
-	}
-
-	return emu, nil
-}
-
 // NewVirtualMachine implements hv.Hypervisor.
 func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, error) {
 	vm := &virtualMachine{
@@ -533,13 +368,6 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		return nil, fmt.Errorf("whp: CreatePartition failed: %w", err)
 	}
 	vm.part = part
-
-	emu, err := createEmulator()
-	if err != nil {
-		bindings.DeletePartition(vm.part)
-		return nil, fmt.Errorf("failed to create emulator for vm: %w", err)
-	}
-	vm.emu = emu
 
 	if err := bindings.SetPartitionPropertyUnsafe(
 		vm.part,

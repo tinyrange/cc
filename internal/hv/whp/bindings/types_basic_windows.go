@@ -282,6 +282,9 @@ const (
 	PartitionPropertyCodeProcessorFeaturesBanks  PartitionPropertyCode = 0x0000100A
 	PartitionPropertyCodeReferenceTime           PartitionPropertyCode = 0x0000100B
 	PartitionPropertyCodeProcessorCount          PartitionPropertyCode = 0x00001fff
+
+	// ARM64 specific
+	PartitionPropertyCodeArm64IcParameters PartitionPropertyCode = 0x00001012
 )
 
 // ExceptionType mirrors WHV_EXCEPTION_TYPE.
