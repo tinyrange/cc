@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bufio"
 	"compress/gzip"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -90,68 +91,18 @@ func (d *alpineDownloader) cacheFilePath(cachePath []string) string {
 	return filepath.Join(append([]string{d.CacheDir}, cachePath...)...)
 }
 
-func (d *alpineDownloader) downloadCached(url string, cachePath []string) (io.ReadCloser, error) {
-	// if the cachePath exists, return it
+func (d *alpineDownloader) expireCache(cachePath []string) {
 	cacheFile := d.cacheFilePath(cachePath)
-	if f, err := os.Open(cacheFile); err == nil {
-		return f, nil
+	for _, suffix := range []string{".idx", ".idx.tmp", ".bin"} {
+		filePath := cacheFile + suffix
+		if err := os.Remove(filePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("Failed to remove cache file", "path", filePath, "err", err)
+		}
 	}
-
-	// ensure the cache directory exists
-	if err := os.MkdirAll(filepath.Dir(cacheFile), 0755); err != nil {
-		return nil, fmt.Errorf("create cache directory for %q: %v", cacheFile, err)
-	}
-
-	// download the file
-	out, err := os.Create(cacheFile + ".tmp")
-	if err != nil {
-		return nil, fmt.Errorf("create cache file %q: %v", cacheFile, err)
-	}
-	defer out.Close()
-
-	slog.Info("Downloading Alpine Linux file",
-		"url", url,
-		"cacheFile", cacheFile,
-	)
-
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, fmt.Errorf("download %q: %v", url, err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("download %q: status code %d", url, resp.StatusCode)
-	}
-
-	if _, err := io.Copy(out, resp.Body); err != nil {
-		return nil, fmt.Errorf("save download %q to %q: %v", url, cacheFile, err)
-	}
-
-	if err := os.Rename(cacheFile+".tmp", cacheFile); err != nil {
-		return nil, fmt.Errorf("rename cache file %q: %v", cacheFile, err)
-	}
-
-	if err := out.Close(); err != nil {
-		return nil, fmt.Errorf("close cache file %q: %v", cacheFile, err)
-	}
-
-	// open the cached file
-	f, err := os.Open(cacheFile)
-	if err != nil {
-		return nil, fmt.Errorf("open cache file %q: %v", cacheFile, err)
-	}
-
-	return f, nil
 }
 
 func (d *alpineDownloader) convertToPackage(r io.Reader, kind string, cachePath []string) (*alpinePackage, error) {
-	// if the cachePath exists, return it
 	cacheFile := d.cacheFilePath(cachePath)
-	pkg, err := openPackage(cacheFile)
-	if err == nil {
-		return pkg, nil
-	}
 
 	// ensure the cache directory exists
 	if err := os.MkdirAll(filepath.Dir(cacheFile), 0755); err != nil {
@@ -231,12 +182,36 @@ func (d *alpineDownloader) convertToPackage(r io.Reader, kind string, cachePath 
 	}
 
 	// open the package
-	pkg, err = openPackage(cacheFile)
+	pkg, err := openPackage(cacheFile)
 	if err != nil {
 		return nil, fmt.Errorf("open package %q: %v", cacheFile, err)
 	}
 
 	return pkg, nil
+}
+
+func (d *alpineDownloader) downloadAndConvert(url string, kind string, cachePath []string) (*alpinePackage, error) {
+	cacheFile := d.cacheFilePath(cachePath)
+	if pkg, err := openPackage(cacheFile); err == nil {
+		return pkg, nil
+	}
+
+	slog.Info("Downloading Alpine Linux file",
+		"url", url,
+		"cacheFile", cacheFile,
+	)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("download %q: %v", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("download %q: status code %d", url, resp.StatusCode)
+	}
+
+	return d.convertToPackage(resp.Body, kind, cachePath)
 }
 
 func (d *alpineDownloader) parseIndex(r io.Reader) (map[string]map[string]string, error) {
@@ -283,13 +258,10 @@ func (d *alpineDownloader) parseIndex(r io.Reader) (map[string]map[string]string
 func (d *alpineDownloader) Download(name string) (*alpinePackage, error) {
 	indexUrl := fmt.Sprintf("%s/%s/%s/%s/APKINDEX.tar.gz", d.Mirror, d.Version, d.Repo, d.Arch)
 
-	index, err := d.downloadCached(indexUrl, []string{d.Version, d.Repo, d.Arch, "APKINDEX"})
-	if err != nil {
-		return nil, fmt.Errorf("download APKINDEX: %v", err)
-	}
-	defer index.Close()
+	indexCachePath := []string{d.Version, d.Repo, d.Arch, "APKINDEX.pkg"}
+	d.expireCache(indexCachePath)
 
-	indexPkg, err := d.convertToPackage(index, "tar.gz", []string{d.Version, d.Repo, d.Arch, "APKINDEX.pkg"})
+	indexPkg, err := d.downloadAndConvert(indexUrl, "tar.gz", indexCachePath)
 	if err != nil {
 		return nil, fmt.Errorf("parse APKINDEX: %v", err)
 	}
@@ -323,13 +295,7 @@ func (d *alpineDownloader) Download(name string) (*alpinePackage, error) {
 	pkgFilename := fmt.Sprintf("%s-%s.apk", name, version)
 	pkgUrl := fmt.Sprintf("%s/%s/%s/%s/%s", d.Mirror, d.Version, d.Repo, d.Arch, pkgFilename)
 
-	pkgFile, err := d.downloadCached(pkgUrl, []string{d.Version, d.Repo, d.Arch, "packages", pkgFilename})
-	if err != nil {
-		return nil, fmt.Errorf("download package %q: %v", name, err)
-	}
-	defer pkgFile.Close()
-
-	apkPkg, err := d.convertToPackage(pkgFile, "tar.gz", []string{d.Version, d.Repo, d.Arch, "packages", name + "-" + version + ".pkg"})
+	apkPkg, err := d.downloadAndConvert(pkgUrl, "tar.gz", []string{d.Version, d.Repo, d.Arch, "packages", name + "-" + version + ".pkg"})
 	if err != nil {
 		return nil, fmt.Errorf("convert package %q to internal format: %v", name, err)
 	}
