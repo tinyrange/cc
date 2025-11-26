@@ -135,6 +135,23 @@ func runBuildOutput(output buildOutput, args []string) error {
 	return nil
 }
 
+func runAlpineDownloader(args []string) error {
+	out, err := goBuild(buildOptions{
+		Package:    "cmd/alpine",
+		OutputName: "alpine",
+		Build:      hostBuild,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to build alpine downloader: %w", err)
+	}
+
+	if err := runBuildOutput(out, args); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func getOrCreateHostID() (string, error) {
 	idFile := filepath.Join("local", "hostid")
 	if data, err := os.ReadFile(idFile); err == nil {
@@ -170,6 +187,7 @@ func main() {
 	bench := fs.Bool("bench", false, "run all benchmarks and output results to benchmarks/<hostid>/<date>.json")
 	codesign := fs.Bool("codesign", false, "build the macos codesign tool")
 	alpine := fs.Bool("alpine", false, "build the alpine linux package downloader")
+	linux := fs.Bool("linux", false, "download the recommended linux kernel via the alpine downloader")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
@@ -194,17 +212,30 @@ func main() {
 	}
 
 	if *alpine {
-		out, err := goBuild(buildOptions{
-			Package:    "cmd/alpine",
-			OutputName: "alpine",
-			Build:      hostBuild,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build alpine downloader: %v\n", err)
+		if err := runAlpineDownloader(fs.Args()); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.Exit(1)
 		}
 
-		if err := runBuildOutput(out, fs.Args()); err != nil {
+		return
+	}
+
+	if *linux {
+		if err := os.MkdirAll("local", 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create local directory: %v\n", err)
+			os.Exit(1)
+		}
+
+		args := []string{
+			"-name", "linux-virt",
+			"-extract-filename", "boot/vmlinuz-virt",
+			"-extract-output", filepath.Join("local", "vmlinux"),
+		}
+
+		args = append(args, fs.Args()...)
+
+		if err := runAlpineDownloader(args); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.Exit(1)
 		}
 
