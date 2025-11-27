@@ -13,6 +13,7 @@ import (
 	"github.com/tinyrange/cc/internal/asm"
 	"github.com/tinyrange/cc/internal/asm/amd64"
 	"github.com/tinyrange/cc/internal/asm/arm64"
+	"github.com/tinyrange/cc/internal/devices/amd64/serial"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/factory"
 	"github.com/tinyrange/cc/internal/hv/helpers"
@@ -349,8 +350,7 @@ func (q *bringUpQuest) Run() error {
 	loop := asm.Label("next_char")
 	done := asm.Label("done")
 
-	result := make([]byte, 0, 64)
-	if err := q.runVMTask("I/O Test", hv.ArchitectureX86_64, ir.Program{
+	ioHelloWorld := ir.Program{
 		Entrypoint: "main",
 		Methods: map[string]ir.Method{
 			"main": {
@@ -370,7 +370,10 @@ func (q *bringUpQuest) Run() error {
 				},
 			},
 		},
-	}, func(cpu hv.VirtualCPU) error {
+	}
+
+	result := make([]byte, 0, 64)
+	if err := q.runVMTask("I/O Test", hv.ArchitectureX86_64, ioHelloWorld, func(cpu hv.VirtualCPU) error {
 		if !bytes.Equal(result, []byte("Hello, World!")) {
 			return fmt.Errorf("unexpected I/O result: got %q, want %q", result, "Hello, World!")
 		}
@@ -383,6 +386,18 @@ func (q *bringUpQuest) Run() error {
 			return nil
 		},
 	}); err != nil {
+		return err
+	}
+
+	serialBuf := &bytes.Buffer{}
+	serialDev := serial.NewSerial16550(0x3f8, 4, serialBuf)
+	if err := q.runVMTask("Serial Port Test", hv.ArchitectureX86_64, ioHelloWorld, func(cpu hv.VirtualCPU) error {
+		serialOutput := serialBuf.String()
+		if serialOutput != "Hello, World!" {
+			return fmt.Errorf("unexpected serial output: got %q, want %q", serialOutput, "Hello, World!")
+		}
+		return nil
+	}, serialDev); err != nil {
 		return err
 	}
 
@@ -588,9 +603,9 @@ func (q *bringUpQuest) Run() error {
 
 			return fmt.Errorf("unexpected MMIO write to address 0x%08x", addr)
 		},
-		}); err != nil {
-			return err
-		}
+	}); err != nil {
+		return err
+	}
 
 	// Timeout test (ARM64)
 	if err := q.runVMTaskWithTimeout("Timeout Test (ARM64)", hv.ArchitectureARM64, 100*time.Millisecond, ir.Program{

@@ -182,7 +182,7 @@ func (v *virtualCPU) handleMMIO(mmioData *kvmExitMMIOData) error {
 	return fmt.Errorf("no device handles MMIO at 0x%016x", mmioData.physAddr)
 }
 
-func (hv *hypervisor) archVMInit(vmFd int) error {
+func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 	return nil
 }
 

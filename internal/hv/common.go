@@ -211,6 +211,12 @@ type VirtualMachine interface {
 	AddDevice(dev Device) error
 }
 
+type VirtualMachineAmd64 interface {
+	VirtualMachine
+
+	PulseIRQ(irqLine uint32) error
+}
+
 type VMLoader interface {
 	Load(vm VirtualMachine) error
 }
@@ -231,15 +237,17 @@ type VMConfig interface {
 	CPUCount() int
 	MemorySize() uint64
 	MemoryBase() uint64
+	NeedsInterruptSupport() bool
 	Callbacks() VMCallbacks
 	Loader() VMLoader
 }
 
 type SimpleVMConfig struct {
-	NumCPUs  int
-	MemSize  uint64
-	MemBase  uint64
-	VMLoader VMLoader
+	NumCPUs          int
+	MemSize          uint64
+	MemBase          uint64
+	InterruptSupport bool
+	VMLoader         VMLoader
 
 	CreateVM   func(vm VirtualMachine) error
 	CreateVCPU func(vCpu VirtualCPU) error
@@ -264,11 +272,12 @@ func (c SimpleVMConfig) OnCreateVCPU(vCpu VirtualCPU) error {
 	return nil
 }
 
-func (c SimpleVMConfig) CPUCount() int          { return c.NumCPUs }
-func (c SimpleVMConfig) MemorySize() uint64     { return c.MemSize }
-func (c SimpleVMConfig) MemoryBase() uint64     { return c.MemBase }
-func (c SimpleVMConfig) Callbacks() VMCallbacks { return c }
-func (c SimpleVMConfig) Loader() VMLoader       { return c.VMLoader }
+func (c SimpleVMConfig) CPUCount() int               { return c.NumCPUs }
+func (c SimpleVMConfig) MemorySize() uint64          { return c.MemSize }
+func (c SimpleVMConfig) MemoryBase() uint64          { return c.MemBase }
+func (c SimpleVMConfig) NeedsInterruptSupport() bool { return c.InterruptSupport }
+func (c SimpleVMConfig) Callbacks() VMCallbacks      { return c }
+func (c SimpleVMConfig) Loader() VMLoader            { return c.VMLoader }
 
 var (
 	_ VMConfig = SimpleVMConfig{}

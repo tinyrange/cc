@@ -276,9 +276,17 @@ func (v *virtualCPU) handleMMIO(mmioData *kvmExitMMIOData) error {
 	return fmt.Errorf("no device handles MMIO at 0x%016x", mmioData.physAddr)
 }
 
-func (hv *hypervisor) archVMInit(vmFd int) error {
-	if err := setTSSAddr(vmFd, 0xfffbd000); err != nil {
+func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
+	if err := setTSSAddr(vm.vmFd, 0xfffbd000); err != nil {
 		return fmt.Errorf("setting TSS addr: %w", err)
+	}
+
+	if config.NeedsInterruptSupport() {
+		if err := createIRQChip(vm.vmFd); err != nil {
+			return fmt.Errorf("creating IRQ chip: %w", err)
+		}
+
+		vm.hasIRQChip = true
 	}
 
 	return nil
@@ -503,4 +511,16 @@ func (vcpu *virtualCPU) SetLongModeWithSelectors(
 
 var (
 	_ hv.VirtualCPUAmd64 = &virtualCPU{}
+)
+
+func (v *virtualMachine) PulseIRQ(irqLine uint32) error {
+	if !v.hasIRQChip {
+		return fmt.Errorf("kvm: cannot pulse IRQ without irqchip")
+	}
+
+	return pulseIRQ(v.vmFd, irqLine)
+}
+
+var (
+	_ hv.VirtualMachineAmd64 = &virtualMachine{}
 )

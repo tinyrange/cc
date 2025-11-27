@@ -58,6 +58,9 @@ type virtualMachine struct {
 	memory     []byte
 	memoryBase uint64
 	devices    []hv.Device
+
+	// amd64-specific fields
+	hasIRQChip bool
 }
 
 // Hypervisor implements hv.VirtualMachine.
@@ -191,7 +194,7 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 	vm.vmFd = vmFd
 
-	if err := h.archVMInit(vmFd); err != nil {
+	if err := h.archVMInit(vm, config); err != nil {
 		unix.Close(vmFd)
 		return nil, fmt.Errorf("initialize VM: %w", err)
 	}

@@ -60,3 +60,36 @@ func setSRegs(vcpuFd int, sregs *kvmSRegs) error {
 	_, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmSetSregs), uintptr(unsafe.Pointer(sregs)))
 	return err
 }
+
+func createIRQChip(vmFd int) error {
+	_, err := ioctlWithRetry(uintptr(vmFd), uint64(kvmCreateIrqchip), 0)
+	return err
+}
+
+func irqLevel(vmFd int, irqLine uint32, level bool) error {
+	var line kvmIRQLevel
+
+	line.IRQOrStatus = irqLine
+	if level {
+		line.Level = 1
+	} else {
+		line.Level = 0
+	}
+
+	_, err := ioctlWithRetry(uintptr(vmFd), uint64(kvmIrqLine), uintptr(unsafe.Pointer(&line)))
+	return err
+}
+
+func pulseIRQ(vmFd int, irqLine uint32) error {
+	// Set the IRQ line to high
+	if err := irqLevel(vmFd, irqLine, true); err != nil {
+		return fmt.Errorf("setting IRQ line high: %w", err)
+	}
+
+	// Set the IRQ line to low
+	if err := irqLevel(vmFd, irqLine, false); err != nil {
+		return fmt.Errorf("setting IRQ line low: %w", err)
+	}
+
+	return nil
+}
