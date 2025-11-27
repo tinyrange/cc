@@ -32,6 +32,14 @@ func (w) Write(p []byte) (n int, err error) {
 func (v *virtualCPU) Run(ctx context.Context) error {
 	var exit bindings.RunVPExitContext
 
+	if ctx.Done() != nil {
+		stop := context.AfterFunc(ctx, func() {
+			// Best-effort request to break out of WHP run loop.
+			_ = bindings.CancelRunVirtualProcessor(v.vm.part, uint32(v.id), 0)
+		})
+		defer stop()
+	}
+
 	// HORRIBLE HACK TO GET BRING UP WORKING
 	if !v.firstTickDone {
 		slog.NewJSONHandler(w{}, nil).Handle(context.Background(), slog.NewRecord(time.Now(), slog.LevelDebug, "", 0))
@@ -107,6 +115,11 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		}
 
 		return nil
+	case bindings.RunVPExitReasonCanceled:
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return fmt.Errorf("whp: virtual processor canceled without context error")
 	default:
 		return fmt.Errorf("whp: unsupported vCPU exit reason %s", exit.ExitReason)
 	}

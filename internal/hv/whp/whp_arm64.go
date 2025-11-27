@@ -103,6 +103,13 @@ func decodeDataAbort(syndrome uint64) (dataAbortInfo, error) {
 func (v *virtualCPU) Run(ctx context.Context) error {
 	var exit bindings.RunVPExitContext
 
+	if ctx.Done() != nil {
+		stop := context.AfterFunc(ctx, func() {
+			_ = bindings.CancelRunVirtualProcessor(v.vm.part, uint32(v.id), 0)
+		})
+		defer stop()
+	}
+
 	if err := bindings.RunVirtualProcessorContext(v.vm.part, uint32(v.id), &exit); err != nil {
 		return fmt.Errorf("whp: RunVirtualProcessorContext failed: %w", err)
 	}
@@ -160,6 +167,11 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		}
 
 		return v.advanceProgramCounter()
+	case bindings.WHvRunVpExitReasonCanceled:
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return fmt.Errorf("whp: virtual processor canceled without context error")
 	default:
 		return fmt.Errorf("whp: unsupported vCPU exit reason %s", exit.ExitReason)
 	}
