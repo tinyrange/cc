@@ -21,7 +21,7 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	return fmt.Errorf("kvm: Run not supported on this architecture")
 }
 
-func (hv *hypervisor) archVMInit(vmFd int) error {
+func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 	return nil
 }
 
