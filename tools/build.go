@@ -5,8 +5,10 @@ package main
 import (
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -50,6 +52,10 @@ var crossBuilds = []crossBuild{
 	{"linux", "arm64"},
 	{"darwin", "arm64"},
 }
+
+const linuxKernelRefreshInterval = 24 * time.Hour
+
+var linuxKernelPath = filepath.Join("local", "vmlinux")
 
 type buildOptions struct {
 	Package          string
@@ -152,6 +158,54 @@ func runAlpineDownloader(args []string) error {
 	return nil
 }
 
+func downloadLinuxKernel(extraArgs []string) error {
+	if err := os.MkdirAll("local", 0755); err != nil {
+		return fmt.Errorf("failed to create local directory: %w", err)
+	}
+
+	args := []string{
+		"-name", "linux-virt",
+		"-extract-filename", "boot/vmlinuz-virt",
+		"-extract-output", linuxKernelPath,
+	}
+
+	if len(extraArgs) > 0 {
+		args = append(args, extraArgs...)
+	}
+
+	if err := runAlpineDownloader(args); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func maybeAutoUpdateLinuxKernel() error {
+	info, err := os.Stat(linuxKernelPath)
+	reason := ""
+
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			reason = "no cached kernel found"
+		} else {
+			return fmt.Errorf("stat linux kernel %q: %w", linuxKernelPath, err)
+		}
+	} else {
+		age := time.Since(info.ModTime())
+		if age < linuxKernelRefreshInterval {
+			return nil
+		}
+		reason = fmt.Sprintf("cached kernel last updated %s ago", age.Round(time.Minute))
+	}
+
+	slog.Info("Refreshing linux kernel", "reason", reason)
+	if err := downloadLinuxKernel(nil); err != nil {
+		return fmt.Errorf("automatic linux kernel refresh: %w", err)
+	}
+
+	return nil
+}
+
 func getOrCreateHostID() (string, error) {
 	idFile := filepath.Join("local", "hostid")
 	if data, err := os.ReadFile(idFile); err == nil {
@@ -193,6 +247,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	if !*linux {
+		if err := maybeAutoUpdateLinuxKernel(); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+		}
+	}
+
 	if *codesign {
 		out, err := goBuild(buildOptions{
 			Package:    "internal/cmd/codesign",
@@ -221,20 +281,7 @@ func main() {
 	}
 
 	if *linux {
-		if err := os.MkdirAll("local", 0755); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to create local directory: %v\n", err)
-			os.Exit(1)
-		}
-
-		args := []string{
-			"-name", "linux-virt",
-			"-extract-filename", "boot/vmlinuz-virt",
-			"-extract-output", filepath.Join("local", "vmlinux"),
-		}
-
-		args = append(args, fs.Args()...)
-
-		if err := runAlpineDownloader(args); err != nil {
+		if err := downloadLinuxKernel(fs.Args()); err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.Exit(1)
 		}
