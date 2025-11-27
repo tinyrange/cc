@@ -155,6 +155,7 @@ var (
 	hvVcpuCreate  func(vcpu *uint64, exit **hvVcpuExit, config uintptr) hvReturn
 	hvVcpuDestroy func(vcpu uint64) hvReturn
 	hvVcpuRun     func(vcpu uint64) hvReturn
+	hvVcpusExit   func(vcpus *uint64, count uint32) hvReturn
 	hvVcpuGetReg  func(vcpu uint64, reg hvReg, value *uint64) hvReturn
 	hvVcpuSetReg  func(vcpu uint64, reg hvReg, value uint64) hvReturn
 	hvVcpuGetSys  func(vcpu uint64, reg hvSysReg, value *uint64) hvReturn
@@ -190,6 +191,7 @@ func ensureInitialized() error {
 		register(&hvVcpuCreate, "hv_vcpu_create")
 		register(&hvVcpuDestroy, "hv_vcpu_destroy")
 		register(&hvVcpuRun, "hv_vcpu_run")
+		register(&hvVcpusExit, "hv_vcpus_exit")
 		register(&hvVcpuGetReg, "hv_vcpu_get_reg")
 		register(&hvVcpuSetReg, "hv_vcpu_set_reg")
 		register(&hvVcpuGetSys, "hv_vcpu_get_sys_reg")

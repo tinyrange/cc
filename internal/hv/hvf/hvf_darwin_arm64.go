@@ -139,10 +139,6 @@ func (v *virtualMachine) Run(ctx context.Context, cfg hv.RunConfig) error {
 		return fmt.Errorf("hvf: RunConfig is nil")
 	}
 
-	if _, ok := ctx.Deadline(); ok {
-		return fmt.Errorf("hvf: Run does not support context deadlines or timeouts")
-	}
-
 	vcpu, ok := v.vcpus[0]
 	if !ok {
 		return fmt.Errorf("hvf: vCPU 0 not found")
@@ -360,12 +356,26 @@ func (v *virtualCPU) GetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 }
 
 func (v *virtualCPU) Run(ctx context.Context) error {
+	var stopExit func() bool
+	if ctx.Done() != nil {
+		stopExit = context.AfterFunc(ctx, func() {
+			hostID := v.hostID
+			_ = hvVcpusExit(&hostID, 1).toError("hv_vcpus_exit")
+		})
+	}
+	if stopExit != nil {
+		defer stopExit()
+	}
+
 	if err := hvVcpuRun(v.hostID).toError("hv_vcpu_run"); err != nil {
 		return err
 	}
 
 	switch v.exit.Reason {
 	case hvExitReasonCanceled:
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		return context.Canceled
 	case hvExitReasonException:
 		return v.handleException()
