@@ -650,7 +650,11 @@ func (q *bringUpQuest) RunLinux() error {
 		NumCPUs: 1,
 		MemSize: 256 * 1024 * 1024, // 256 MiB
 
-		Cmdline: []string{"console=ttyS0", "earlycon=uart8250,io,0x3f8,115200,keep"},
+		Cmdline: []string{
+			"console=ttyS0",
+			"earlycon=uart8250,io,0x3f8,115200,keep",
+			"i8042.nopnp",
+		},
 
 		GetKernel: func() (io.ReaderAt, int64, error) {
 			f, err := os.Open(filepath.Join("local", "vmlinux"))

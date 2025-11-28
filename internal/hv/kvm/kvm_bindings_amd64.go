@@ -66,6 +66,12 @@ func createIRQChip(vmFd int) error {
 	return err
 }
 
+func createPIT(vmFd int) error {
+	var cfg kvmPitConfig
+	_, err := ioctlWithRetry(uintptr(vmFd), uint64(kvmCreatePit2), uintptr(unsafe.Pointer(&cfg)))
+	return err
+}
+
 func irqLevel(vmFd int, irqLine uint32, level bool) error {
 	var line kvmIRQLevel
 

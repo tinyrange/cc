@@ -37,12 +37,6 @@ func (k *KernelImage) BuildZeroPage(vm hv.VirtualMachine, zeroPageGPA, loadAddr 
 	}
 
 	zp := make([]byte, zeroPageSize)
-	for i := range zp {
-		zp[i] = 0
-	}
-	if _, err := vm.WriteAt(zp, int64(zpOff)); err != nil {
-		return fmt.Errorf("WriteAt zero page: %w", err)
-	}
 
 	if len(k.HeaderBytes) > zeroPageSize-setupHeaderOffset {
 		return errors.New("setup header larger than zero page space")
@@ -117,6 +111,10 @@ func (k *KernelImage) BuildZeroPage(vm hv.VirtualMachine, zeroPageGPA, loadAddr 
 		binary.LittleEndian.PutUint64(zp[base:], ent.Addr)
 		binary.LittleEndian.PutUint64(zp[base+8:], ent.Size)
 		binary.LittleEndian.PutUint32(zp[base+16:], ent.Type)
+	}
+
+	if _, err := vm.WriteAt(zp, int64(zpOff)); err != nil {
+		return fmt.Errorf("WriteAt zero page: %w", err)
 	}
 	return nil
 }

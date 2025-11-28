@@ -2,16 +2,22 @@ package boot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/tinyrange/cc/internal/asm/amd64"
+	"github.com/tinyrange/cc/internal/devices/amd64/input"
+	"github.com/tinyrange/cc/internal/devices/amd64/pci"
 	"github.com/tinyrange/cc/internal/devices/amd64/serial"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/ir"
 	_ "github.com/tinyrange/cc/internal/ir/amd64"
+	"golang.org/x/sys/unix"
 )
 
 type programRunner struct {
@@ -24,8 +30,26 @@ func (p *programRunner) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 		return fmt.Errorf("configure vCPU: %w", err)
 	}
 
+	p.loader.powerState.Store(false)
+
+	ctx, cancel := context.WithCancel(ctx)
+	p.loader.setRunCancel(cancel)
+	defer func() {
+		p.loader.clearRunCancel(cancel)
+		cancel()
+	}()
+
 	for {
 		if err := vcpu.Run(ctx); err != nil {
+			if errors.Is(err, hv.ErrVMHalted) {
+				return nil
+			}
+			if errors.Is(err, context.Canceled) && p.loader.powerState.Load() {
+				return nil
+			}
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
 			return fmt.Errorf("run vCPU: %w", err)
 		}
 	}
@@ -61,6 +85,36 @@ type LinuxLoader struct {
 	Stdout io.Writer
 
 	plan *BootPlan
+
+	cancelMu   sync.Mutex
+	cancelFn   context.CancelFunc
+	powerState atomic.Bool
+}
+
+func (l *LinuxLoader) setRunCancel(cancel context.CancelFunc) {
+	l.cancelMu.Lock()
+	l.cancelFn = cancel
+	l.cancelMu.Unlock()
+}
+
+func (l *LinuxLoader) clearRunCancel(cancel context.CancelFunc) {
+	l.cancelMu.Lock()
+	l.cancelFn = nil
+	l.cancelMu.Unlock()
+}
+
+func (l *LinuxLoader) requestPowerOff() {
+	if !l.powerState.CompareAndSwap(false, true) {
+		return
+	}
+
+	l.cancelMu.Lock()
+	cancel := l.cancelFn
+	l.cancelMu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
 }
 
 // OnCreateVCPU implements hv.VMCallbacks.
@@ -126,9 +180,55 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 	l.plan = plan
 
 	// Add devices
-	serial := serial.NewSerial16550(0x3F8, 4, &convertCRLF{l.Stdout})
-	if err := vm.AddDevice(serial); err != nil {
+	consoleSerial := serial.NewSerial16550(0x3F8, 4, &convertCRLF{l.Stdout})
+	if err := vm.AddDevice(consoleSerial); err != nil {
 		return fmt.Errorf("add serial device: %w", err)
+	}
+
+	auxSerial := serial.NewSerial16550(0x2F8, 3, io.Discard)
+	if err := vm.AddDevice(auxSerial); err != nil {
+		return fmt.Errorf("add aux serial device: %w", err)
+	}
+
+	if err := vm.AddDevice(pci.NewHostBridge()); err != nil {
+		return fmt.Errorf("add pci host bridge: %w", err)
+	}
+
+	var legacyPorts []uint16
+	for _, rng := range []struct {
+		start uint16
+		end   uint16
+	}{
+		{0x70, 0x71},
+		{0x80, 0x8f},
+		{0x2e8, 0x2ef},
+		{0x3e8, 0x3ef},
+	} {
+		for port := rng.start; port <= rng.end; port++ {
+			legacyPorts = append(legacyPorts, port)
+		}
+	}
+
+	legacy := hv.SimpleX86IOPortDevice{
+		Ports: legacyPorts,
+		ReadFunc: func(port uint16, data []byte) error {
+			fmt.Printf("legacy port read 0x%X\n", port)
+			for i := range data {
+				data[i] = 0
+			}
+			return nil
+		},
+		WriteFunc: func(port uint16, data []byte) error {
+			fmt.Printf("legacy port write 0x%X\n", port)
+			return nil
+		},
+	}
+	if err := vm.AddDevice(legacy); err != nil {
+		return fmt.Errorf("add legacy port stub: %w", err)
+	}
+
+	if err := vm.AddDevice(input.NewI8042()); err != nil {
+		return fmt.Errorf("add i8042 controller: %w", err)
 	}
 
 	return nil

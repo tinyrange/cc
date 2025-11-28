@@ -215,6 +215,14 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		mmioData := (*kvmExitMMIOData)(unsafe.Pointer(&run.anon0[0]))
 
 		return v.handleMMIO(mmioData)
+	case kvmExitShutdown:
+		return hv.ErrVMHalted
+	case kvmExitSystemEvent:
+		system := (*kvmSystemEvent)(unsafe.Pointer(&run.anon0[0]))
+		if system.typ == uint32(kvmSystemEventShutdown) {
+			return hv.ErrVMHalted
+		}
+		return fmt.Errorf("kvm: vCPU %d exited with system event %d", v.id, system.typ)
 	default:
 		return fmt.Errorf("kvm: vCPU %d exited with unknown reason %s", v.id, reason)
 	}
@@ -287,6 +295,10 @@ func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 		}
 
 		vm.hasIRQChip = true
+
+		if err := createPIT(vm.vmFd); err != nil {
+			return fmt.Errorf("creating PIT: %w", err)
+		}
 	}
 
 	return nil
