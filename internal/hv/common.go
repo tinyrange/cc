@@ -190,6 +190,10 @@ type Device interface {
 	Init(vm VirtualMachine) error
 }
 
+type DeviceTemplate interface {
+	Create(vm VirtualMachine) (Device, error)
+}
+
 type MMIORegion struct {
 	Address uint64
 	Size    uint64
@@ -282,6 +286,7 @@ type VirtualMachine interface {
 	VirtualCPUCall(id int, f func(vcpu VirtualCPU) error) error
 
 	AddDevice(dev Device) error
+	AddDeviceFromTemplate(template DeviceTemplate) error
 }
 
 type VirtualMachineAmd64 interface {

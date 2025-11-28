@@ -15,10 +15,11 @@ type stubVM struct {
 	memoryBase uint64
 }
 
-func (s *stubVM) AddDevice(dev hv.Device) error                   { panic("unimplemented") }
-func (s *stubVM) Close() error                                    { panic("unimplemented") }
-func (s *stubVM) Hypervisor() hv.Hypervisor                       { panic("unimplemented") }
-func (s *stubVM) Run(ctx context.Context, cfg hv.RunConfig) error { panic("unimplemented") }
+func (s *stubVM) AddDevice(dev hv.Device) error                          { panic("unimplemented") }
+func (s *stubVM) AddDeviceFromTemplate(template hv.DeviceTemplate) error { panic("unimplemented") }
+func (s *stubVM) Close() error                                           { panic("unimplemented") }
+func (s *stubVM) Hypervisor() hv.Hypervisor                              { panic("unimplemented") }
+func (s *stubVM) Run(ctx context.Context, cfg hv.RunConfig) error        { panic("unimplemented") }
 func (s *stubVM) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error {
 	panic("unimplemented")
 }

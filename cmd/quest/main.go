@@ -17,6 +17,7 @@ import (
 	"github.com/tinyrange/cc/internal/asm/amd64"
 	"github.com/tinyrange/cc/internal/asm/arm64"
 	"github.com/tinyrange/cc/internal/devices/amd64/serial"
+	"github.com/tinyrange/cc/internal/devices/virtio"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/factory"
 	"github.com/tinyrange/cc/internal/hv/helpers"
@@ -629,7 +630,7 @@ func (q *bringUpQuest) Run() error {
 
 	slog.Info("Bringup Quest Completed")
 
-	return nil
+	return q.RunLinux()
 }
 
 func (q *bringUpQuest) RunLinux() error {
@@ -646,14 +647,17 @@ func (q *bringUpQuest) RunLinux() error {
 		return fmt.Errorf("linux boot only supported on x86_64 hypervisors")
 	}
 
+	buf := &bytes.Buffer{}
 	loader := &boot.LinuxLoader{
 		NumCPUs: 1,
 		MemSize: 256 * 1024 * 1024, // 256 MiB
 
 		Cmdline: []string{
-			"console=ttyS0",
-			"earlycon=uart8250,io,0x3f8,115200,keep",
-			"i8042.nopnp",
+			"console=hvc0",
+			// "console=ttyS0,115200n8",
+			// "earlycon=uart8250,io,0x3f8,115200,keep",
+			// "i8042.nopnp",
+			"quiet",
 		},
 
 		GetKernel: func() (io.ReaderAt, int64, error) {
@@ -692,7 +696,11 @@ func (q *bringUpQuest) RunLinux() error {
 			},
 		},
 
-		Stdout: os.Stdout,
+		SerialStdout: os.Stdout,
+
+		Devices: []hv.DeviceTemplate{
+			virtio.ConsoleTemplate{Out: buf, In: os.Stdin},
+		},
 	}
 
 	vm, err := q.dev.NewVirtualMachine(loader)
@@ -710,7 +718,11 @@ func (q *bringUpQuest) RunLinux() error {
 		return fmt.Errorf("run linux boot: %w", err)
 	}
 
-	slog.Info("Linux Boot Completed")
+	if !bytes.Contains(buf.Bytes(), []byte("Hello, World")) {
+		return fmt.Errorf("linux did not print expected output")
+	}
+
+	slog.Info("Linux Boot Completed Successfully")
 
 	return nil
 }

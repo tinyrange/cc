@@ -13,16 +13,15 @@ import (
 	"github.com/tinyrange/cc/internal/devices/amd64/input"
 	"github.com/tinyrange/cc/internal/devices/amd64/pci"
 	"github.com/tinyrange/cc/internal/devices/amd64/serial"
+	"github.com/tinyrange/cc/internal/devices/virtio"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/ir"
 	_ "github.com/tinyrange/cc/internal/ir/amd64"
-	"golang.org/x/sys/unix"
 )
 
 type programRunner struct {
-	loader    *LinuxLoader
-	linux     io.ReaderAt
-	systemMap io.ReaderAt
+	loader *LinuxLoader
+	linux  io.ReaderAt
 }
 
 // Run implements hv.RunConfig.
@@ -42,18 +41,17 @@ func (p *programRunner) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 			if errors.Is(err, hv.ErrGuestRequestedReboot) {
 				return nil
 			}
-			if errors.Is(err, unix.EINTR) {
-				continue
-			}
 			if errors.Is(err, context.DeadlineExceeded) {
 				// dump a stacktrace
-				frames, err := CaptureStackTrace(vcpu, p.linux, p.systemMap, 0)
-				if err != nil {
-					fmt.Printf("capture stack trace: %v\n", err)
-				} else {
-					fmt.Printf("ran for over 100ms, stack trace:\n")
-					for _, frame := range frames {
-						fmt.Printf("  %s+%#x (%#x)\n", frame.Symbol, frame.Offset, frame.PC)
+				if p.loader.EnableStackTrace {
+					frames, err := CaptureStackTrace(vcpu, p.linux, p.loader.GetSystemMap, 0)
+					if err != nil {
+						fmt.Printf("capture stack trace: %v\n", err)
+					} else {
+						fmt.Printf("ran for over 100ms, stack trace:\n")
+						for _, frame := range frames {
+							fmt.Printf("  %s+%#x (%#x)\n", frame.Symbol, frame.Offset, frame.PC)
+						}
 					}
 				}
 				continue
@@ -91,7 +89,11 @@ type LinuxLoader struct {
 	GetKernel    func() (io.ReaderAt, int64, error)
 	GetSystemMap func() (io.ReaderAt, error)
 
-	Stdout io.Writer
+	SerialStdout io.Writer
+
+	Devices []hv.DeviceTemplate
+
+	EnableStackTrace bool
 
 	plan *BootPlan
 }
@@ -148,6 +150,16 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 		return fmt.Errorf("build initramfs: %w", err)
 	}
 
+	for _, dev := range l.Devices {
+		if vdev, ok := dev.(virtio.VirtioMMIODevice); ok {
+			params, err := vdev.GetLinuxCommandLineParam()
+			if err != nil {
+				return fmt.Errorf("get virtio mmio device linux cmdline param: %w", err)
+			}
+			l.Cmdline = append(l.Cmdline, params...)
+		}
+	}
+
 	// prepare the kernel
 	plan, err := kernelImage.Prepare(vm, bootOptions{
 		Cmdline: strings.Join(l.Cmdline, " "),
@@ -159,7 +171,7 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 	l.plan = plan
 
 	// Add devices
-	consoleSerial := serial.NewSerial16550(0x3F8, 4, &convertCRLF{l.Stdout})
+	consoleSerial := serial.NewSerial16550(0x3F8, 4, &convertCRLF{l.SerialStdout})
 	if err := vm.AddDevice(consoleSerial); err != nil {
 		return fmt.Errorf("add serial device: %w", err)
 	}
@@ -191,14 +203,12 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 	legacy := hv.SimpleX86IOPortDevice{
 		Ports: legacyPorts,
 		ReadFunc: func(port uint16, data []byte) error {
-			fmt.Printf("legacy port read 0x%X\n", port)
 			for i := range data {
 				data[i] = 0
 			}
 			return nil
 		},
 		WriteFunc: func(port uint16, data []byte) error {
-			fmt.Printf("legacy port write 0x%X\n", port)
 			return nil
 		},
 	}
@@ -208,6 +218,12 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 
 	if err := vm.AddDevice(input.NewI8042()); err != nil {
 		return fmt.Errorf("add i8042 controller: %w", err)
+	}
+
+	for _, dev := range l.Devices {
+		if err := vm.AddDeviceFromTemplate(dev); err != nil {
+			return fmt.Errorf("add device from template: %w", err)
+		}
 	}
 
 	return nil
@@ -220,15 +236,6 @@ func (l *LinuxLoader) RunConfig() (hv.RunConfig, error) {
 	}
 
 	loader := &programRunner{loader: l, linux: linux}
-
-	if l.GetSystemMap != nil {
-		systemMapReader, err := l.GetSystemMap()
-		if err != nil {
-			return nil, fmt.Errorf("get System.map: %w", err)
-		}
-
-		loader.systemMap = systemMapReader
-	}
 
 	return loader, nil
 }

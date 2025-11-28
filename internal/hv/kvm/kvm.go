@@ -75,6 +75,16 @@ func (v *virtualMachine) AddDevice(dev hv.Device) error {
 	return dev.Init(v)
 }
 
+// AddDeviceFromTemplate implements hv.VirtualMachine.
+func (v *virtualMachine) AddDeviceFromTemplate(template hv.DeviceTemplate) error {
+	dev, err := template.Create(v)
+	if err != nil {
+		return fmt.Errorf("create device from template: %w", err)
+	}
+
+	return v.AddDevice(dev)
+}
+
 // Close implements hv.VirtualMachine.
 func (v *virtualMachine) Close() error {
 	for _, vcpu := range v.vcpus {

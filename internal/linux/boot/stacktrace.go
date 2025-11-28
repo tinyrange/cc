@@ -34,11 +34,11 @@ type StackFrame struct {
 // the number of frames collected; if zero or negative a default of 16 is used.
 // Symbol resolution assumes KASLR is disabled (for example by building without
 // CONFIG_RANDOMIZE_BASE or booting with nokaslr).
-func CaptureStackTrace(vcpu hv.VirtualCPU, vmlinux io.ReaderAt, systemMap io.ReaderAt, maxFrames int) ([]StackFrame, error) {
+func CaptureStackTrace(vcpu hv.VirtualCPU, vmlinux io.ReaderAt, systemMapLoader func() (io.ReaderAt, error), maxFrames int) ([]StackFrame, error) {
 	if vcpu == nil {
 		return nil, errors.New("vcpu is nil")
 	}
-	if vmlinux == nil && systemMap == nil {
+	if vmlinux == nil && systemMapLoader == nil {
 		return nil, errors.New("both vmlinux and system map readers are nil")
 	}
 	if maxFrames <= 0 {
@@ -64,7 +64,16 @@ func CaptureStackTrace(vcpu hv.VirtualCPU, vmlinux io.ReaderAt, systemMap io.Rea
 			symErr = fmt.Errorf("load vmlinux symbols: %w", err)
 		}
 	}
-	if (symtab == nil || symErr != nil) && systemMap != nil {
+	if (symtab == nil || symErr != nil) && systemMapLoader != nil {
+		var systemMap io.ReaderAt
+		systemMap, err = systemMapLoader()
+		if err != nil {
+			if symErr != nil {
+				return nil, fmt.Errorf("get System.map: %w (fallback after %v)", err, symErr)
+			}
+			return nil, fmt.Errorf("get System.map: %w", err)
+		}
+
 		symtab, err = loadSymbolTable(systemMap, readSystemMapSymbols)
 		if err != nil {
 			if symErr != nil {

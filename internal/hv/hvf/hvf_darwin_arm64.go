@@ -137,6 +137,16 @@ func (v *virtualMachine) AddDevice(dev hv.Device) error {
 	return dev.Init(v)
 }
 
+// AddDeviceFromTemplate implements hv.VirtualMachine.
+func (v *virtualMachine) AddDeviceFromTemplate(template hv.DeviceTemplate) error {
+	dev, err := template.Create(v)
+	if err != nil {
+		return fmt.Errorf("create device from template: %w", err)
+	}
+
+	return v.AddDevice(dev)
+}
+
 func (v *virtualMachine) Run(ctx context.Context, cfg hv.RunConfig) error {
 	if cfg == nil {
 		return fmt.Errorf("hvf: RunConfig is nil")
