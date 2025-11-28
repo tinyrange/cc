@@ -668,6 +668,14 @@ func (q *bringUpQuest) RunLinux() error {
 			return f, info.Size(), nil
 		},
 
+		GetSystemMap: func() (io.ReaderAt, error) {
+			f, err := os.Open(filepath.Join("local", "System.map"))
+			if err != nil {
+				return nil, fmt.Errorf("open System.map: %w", err)
+			}
+			return f, nil
+		},
+
 		Init: ir.Program{
 			Entrypoint: "main",
 			Methods: map[string]ir.Method{
@@ -677,7 +685,7 @@ func (q *bringUpQuest) RunLinux() error {
 						amd64defs.SYS_REBOOT,
 						ir.Int64(amd64defs.LINUX_REBOOT_MAGIC1),
 						ir.Int64(amd64defs.LINUX_REBOOT_MAGIC2),
-						ir.Int64(amd64defs.LINUX_REBOOT_CMD_POWER_OFF),
+						ir.Int64(amd64defs.LINUX_REBOOT_CMD_RESTART),
 						ir.Int64(0),
 					),
 				},

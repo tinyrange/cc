@@ -10,6 +10,7 @@ import (
 var (
 	ErrVMHalted              = errors.New("virtual machine halted")
 	ErrHypervisorUnsupported = errors.New("hypervisor unsupported on this platform")
+	ErrGuestRequestedReboot  = errors.New("guest requested reboot")
 )
 
 type CpuArchitecture string
@@ -53,6 +54,9 @@ const (
 	RegisterAMD64Rip
 	RegisterAMD64Rflags
 
+	// AMD64 Special Registers
+	RegisterAMD64Cr3
+
 	// ARM64 General-Purpose Registers
 	RegisterARM64X0
 	RegisterARM64X1
@@ -90,6 +94,72 @@ const (
 	RegisterARM64Pstate
 	RegisterARM64Vbar
 )
+
+var registerNames = map[Register]string{
+	RegisterAMD64Rax:    "RAX",
+	RegisterAMD64Rbx:    "RBX",
+	RegisterAMD64Rcx:    "RCX",
+	RegisterAMD64Rdx:    "RDX",
+	RegisterAMD64Rsi:    "RSI",
+	RegisterAMD64Rdi:    "RDI",
+	RegisterAMD64Rsp:    "RSP",
+	RegisterAMD64Rbp:    "RBP",
+	RegisterAMD64R8:     "R8",
+	RegisterAMD64R9:     "R9",
+	RegisterAMD64R10:    "R10",
+	RegisterAMD64R11:    "R11",
+	RegisterAMD64R12:    "R12",
+	RegisterAMD64R13:    "R13",
+	RegisterAMD64R14:    "R14",
+	RegisterAMD64R15:    "R15",
+	RegisterAMD64Rip:    "RIP",
+	RegisterAMD64Rflags: "RFLAGS",
+
+	RegisterAMD64Cr3: "CR3",
+
+	RegisterARM64X0:     "X0",
+	RegisterARM64X1:     "X1",
+	RegisterARM64X2:     "X2",
+	RegisterARM64X3:     "X3",
+	RegisterARM64X4:     "X4",
+	RegisterARM64X5:     "X5",
+	RegisterARM64X6:     "X6",
+	RegisterARM64X7:     "X7",
+	RegisterARM64X8:     "X8",
+	RegisterARM64X9:     "X9",
+	RegisterARM64X10:    "X10",
+	RegisterARM64X11:    "X11",
+	RegisterARM64X12:    "X12",
+	RegisterARM64X13:    "X13",
+	RegisterARM64X14:    "X14",
+	RegisterARM64X15:    "X15",
+	RegisterARM64X16:    "X16",
+	RegisterARM64X17:    "X17",
+	RegisterARM64X18:    "X18",
+	RegisterARM64X19:    "X19",
+	RegisterARM64X20:    "X20",
+	RegisterARM64X21:    "X21",
+	RegisterARM64X22:    "X22",
+	RegisterARM64X23:    "X23",
+	RegisterARM64X24:    "X24",
+	RegisterARM64X25:    "X25",
+	RegisterARM64X26:    "X26",
+	RegisterARM64X27:    "X27",
+	RegisterARM64X28:    "X28",
+	RegisterARM64X29:    "X29",
+	RegisterARM64X30:    "X30",
+	RegisterARM64Sp:     "SP",
+	RegisterARM64Pc:     "PC",
+	RegisterARM64Pstate: "PSTATE",
+	RegisterARM64Vbar:   "VBAR",
+}
+
+func (r Register) String() string {
+	if name, ok := registerNames[r]; ok {
+		return name
+	}
+	return fmt.Sprintf("Register(0x%X)", uint64(r))
+}
 
 type VirtualCPU interface {
 	VirtualMachine() VirtualMachine

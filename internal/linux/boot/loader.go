@@ -7,8 +7,7 @@ import (
 	"io"
 	"os"
 	"strings"
-	"sync"
-	"sync/atomic"
+	"time"
 
 	"github.com/tinyrange/cc/internal/asm/amd64"
 	"github.com/tinyrange/cc/internal/devices/amd64/input"
@@ -21,7 +20,9 @@ import (
 )
 
 type programRunner struct {
-	loader *LinuxLoader
+	loader    *LinuxLoader
+	linux     io.ReaderAt
+	systemMap io.ReaderAt
 }
 
 // Run implements hv.RunConfig.
@@ -30,24 +31,31 @@ func (p *programRunner) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 		return fmt.Errorf("configure vCPU: %w", err)
 	}
 
-	p.loader.powerState.Store(false)
-
-	ctx, cancel := context.WithCancel(ctx)
-	p.loader.setRunCancel(cancel)
-	defer func() {
-		p.loader.clearRunCancel(cancel)
-		cancel()
-	}()
-
 	for {
-		if err := vcpu.Run(ctx); err != nil {
+		subCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		defer cancel()
+
+		if err := vcpu.Run(subCtx); err != nil {
 			if errors.Is(err, hv.ErrVMHalted) {
 				return nil
 			}
-			if errors.Is(err, context.Canceled) && p.loader.powerState.Load() {
+			if errors.Is(err, hv.ErrGuestRequestedReboot) {
 				return nil
 			}
 			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				// dump a stacktrace
+				frames, err := CaptureStackTrace(vcpu, p.linux, p.systemMap, 0)
+				if err != nil {
+					fmt.Printf("capture stack trace: %v\n", err)
+				} else {
+					fmt.Printf("ran for over 100ms, stack trace:\n")
+					for _, frame := range frames {
+						fmt.Printf("  %s+%#x (%#x)\n", frame.Symbol, frame.Offset, frame.PC)
+					}
+				}
 				continue
 			}
 			return fmt.Errorf("run vCPU: %w", err)
@@ -78,43 +86,14 @@ type LinuxLoader struct {
 	NumCPUs int
 	MemSize uint64
 
-	Cmdline   []string
-	Init      ir.Program
-	GetKernel func() (io.ReaderAt, int64, error)
+	Cmdline      []string
+	Init         ir.Program
+	GetKernel    func() (io.ReaderAt, int64, error)
+	GetSystemMap func() (io.ReaderAt, error)
 
 	Stdout io.Writer
 
 	plan *BootPlan
-
-	cancelMu   sync.Mutex
-	cancelFn   context.CancelFunc
-	powerState atomic.Bool
-}
-
-func (l *LinuxLoader) setRunCancel(cancel context.CancelFunc) {
-	l.cancelMu.Lock()
-	l.cancelFn = cancel
-	l.cancelMu.Unlock()
-}
-
-func (l *LinuxLoader) clearRunCancel(cancel context.CancelFunc) {
-	l.cancelMu.Lock()
-	l.cancelFn = nil
-	l.cancelMu.Unlock()
-}
-
-func (l *LinuxLoader) requestPowerOff() {
-	if !l.powerState.CompareAndSwap(false, true) {
-		return
-	}
-
-	l.cancelMu.Lock()
-	cancel := l.cancelFn
-	l.cancelMu.Unlock()
-
-	if cancel != nil {
-		cancel()
-	}
 }
 
 // OnCreateVCPU implements hv.VMCallbacks.
@@ -235,7 +214,23 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 }
 
 func (l *LinuxLoader) RunConfig() (hv.RunConfig, error) {
-	return &programRunner{loader: l}, nil
+	linux, _, err := l.GetKernel()
+	if err != nil {
+		return nil, fmt.Errorf("get kernel: %w", err)
+	}
+
+	loader := &programRunner{loader: l, linux: linux}
+
+	if l.GetSystemMap != nil {
+		systemMapReader, err := l.GetSystemMap()
+		if err != nil {
+			return nil, fmt.Errorf("get System.map: %w", err)
+		}
+
+		loader.systemMap = systemMapReader
+	}
+
+	return loader, nil
 }
 
 var (

@@ -22,6 +22,21 @@ func setRegisters(vcpuFd int, regs *kvmRegs) error {
 	return err
 }
 
+func getSpecialRegisters(vcpuFd int) (kvmSRegs, error) {
+	var sregs kvmSRegs
+
+	if _, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmGetSregs), uintptr(unsafe.Pointer(&sregs))); err != nil {
+		return kvmSRegs{}, err
+	}
+
+	return sregs, nil
+}
+
+func setSpecialRegisters(vcpuFd int, sregs *kvmSRegs) error {
+	_, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmSetSregs), uintptr(unsafe.Pointer(sregs)))
+	return err
+}
+
 func setTSSAddr(vmFd int, addr uint64) error {
 	_, err := ioctlWithRetry(uintptr(vmFd), uint64(kvmSetTssAddr), uintptr(addr))
 	return err

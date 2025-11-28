@@ -33,14 +33,20 @@ var (
 		hv.RegisterAMD64Rip:    true,
 		hv.RegisterAMD64Rflags: true,
 	}
+
+	specialRegisters = map[hv.Register]bool{
+		hv.RegisterAMD64Cr3: true,
+	}
 )
 
 func (v *virtualCPU) SetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 	hasRegularRegister := false
+	hasSpecialRegisters := false
 	for reg := range regs {
 		if regularRegisters[reg] {
 			hasRegularRegister = true
-			break
+		} else if specialRegisters[reg] {
+			hasSpecialRegisters = true
 		} else {
 			return fmt.Errorf("kvm: unsupported register %v for architecture x86_64", reg)
 		}
@@ -112,55 +118,97 @@ func (v *virtualCPU) SetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 		}
 	}
 
+	if hasSpecialRegisters {
+		specialRegs, err := getSRegs(v.fd)
+		if err != nil {
+			return fmt.Errorf("kvm: get special registers: %w", err)
+		}
+
+		if v, ok := regs[hv.RegisterAMD64Cr3]; ok {
+			specialRegs.Cr3 = uint64(v.(hv.Register64))
+		}
+
+		if err := setSRegs(v.fd, &specialRegs); err != nil {
+			return fmt.Errorf("kvm: set special registers: %w", err)
+		}
+	}
+
 	return nil
 }
 
 func (v *virtualCPU) GetRegisters(regs map[hv.Register]hv.RegisterValue) error {
-	regularRegs, err := getRegisters(v.fd)
-	if err != nil {
-		return fmt.Errorf("kvm: get registers: %w", err)
-	}
+	hasRegularRegister := false
+	hasSpecialRegisters := false
 
 	for reg := range regs {
-		switch reg {
-		case hv.RegisterAMD64Rax:
-			regs[reg] = hv.Register64(regularRegs.Rax)
-		case hv.RegisterAMD64Rbx:
-			regs[reg] = hv.Register64(regularRegs.Rbx)
-		case hv.RegisterAMD64Rcx:
-			regs[reg] = hv.Register64(regularRegs.Rcx)
-		case hv.RegisterAMD64Rdx:
-			regs[reg] = hv.Register64(regularRegs.Rdx)
-		case hv.RegisterAMD64Rsi:
-			regs[reg] = hv.Register64(regularRegs.Rsi)
-		case hv.RegisterAMD64Rdi:
-			regs[reg] = hv.Register64(regularRegs.Rdi)
-		case hv.RegisterAMD64Rsp:
-			regs[reg] = hv.Register64(regularRegs.Rsp)
-		case hv.RegisterAMD64Rbp:
-			regs[reg] = hv.Register64(regularRegs.Rbp)
-		case hv.RegisterAMD64R8:
-			regs[reg] = hv.Register64(regularRegs.R8)
-		case hv.RegisterAMD64R9:
-			regs[reg] = hv.Register64(regularRegs.R9)
-		case hv.RegisterAMD64R10:
-			regs[reg] = hv.Register64(regularRegs.R10)
-		case hv.RegisterAMD64R11:
-			regs[reg] = hv.Register64(regularRegs.R11)
-		case hv.RegisterAMD64R12:
-			regs[reg] = hv.Register64(regularRegs.R12)
-		case hv.RegisterAMD64R13:
-			regs[reg] = hv.Register64(regularRegs.R13)
-		case hv.RegisterAMD64R14:
-			regs[reg] = hv.Register64(regularRegs.R14)
-		case hv.RegisterAMD64R15:
-			regs[reg] = hv.Register64(regularRegs.R15)
-		case hv.RegisterAMD64Rip:
-			regs[reg] = hv.Register64(regularRegs.Rip)
-		case hv.RegisterAMD64Rflags:
-			regs[reg] = hv.Register64(regularRegs.Rflags)
-		default:
+		if regularRegisters[reg] {
+			hasRegularRegister = true
+		} else if specialRegisters[reg] {
+			hasSpecialRegisters = true
+		} else {
 			return fmt.Errorf("kvm: unsupported register %v for architecture x86_64", reg)
+		}
+	}
+
+	if hasRegularRegister {
+		regularRegs, err := getRegisters(v.fd)
+		if err != nil {
+			return fmt.Errorf("kvm: get registers: %w", err)
+		}
+
+		for reg := range regs {
+			switch reg {
+			case hv.RegisterAMD64Rax:
+				regs[reg] = hv.Register64(regularRegs.Rax)
+			case hv.RegisterAMD64Rbx:
+				regs[reg] = hv.Register64(regularRegs.Rbx)
+			case hv.RegisterAMD64Rcx:
+				regs[reg] = hv.Register64(regularRegs.Rcx)
+			case hv.RegisterAMD64Rdx:
+				regs[reg] = hv.Register64(regularRegs.Rdx)
+			case hv.RegisterAMD64Rsi:
+				regs[reg] = hv.Register64(regularRegs.Rsi)
+			case hv.RegisterAMD64Rdi:
+				regs[reg] = hv.Register64(regularRegs.Rdi)
+			case hv.RegisterAMD64Rsp:
+				regs[reg] = hv.Register64(regularRegs.Rsp)
+			case hv.RegisterAMD64Rbp:
+				regs[reg] = hv.Register64(regularRegs.Rbp)
+			case hv.RegisterAMD64R8:
+				regs[reg] = hv.Register64(regularRegs.R8)
+			case hv.RegisterAMD64R9:
+				regs[reg] = hv.Register64(regularRegs.R9)
+			case hv.RegisterAMD64R10:
+				regs[reg] = hv.Register64(regularRegs.R10)
+			case hv.RegisterAMD64R11:
+				regs[reg] = hv.Register64(regularRegs.R11)
+			case hv.RegisterAMD64R12:
+				regs[reg] = hv.Register64(regularRegs.R12)
+			case hv.RegisterAMD64R13:
+				regs[reg] = hv.Register64(regularRegs.R13)
+			case hv.RegisterAMD64R14:
+				regs[reg] = hv.Register64(regularRegs.R14)
+			case hv.RegisterAMD64R15:
+				regs[reg] = hv.Register64(regularRegs.R15)
+			case hv.RegisterAMD64Rip:
+				regs[reg] = hv.Register64(regularRegs.Rip)
+			case hv.RegisterAMD64Rflags:
+				regs[reg] = hv.Register64(regularRegs.Rflags)
+			}
+		}
+	}
+
+	if hasSpecialRegisters {
+		specialRegs, err := getSRegs(v.fd)
+		if err != nil {
+			return fmt.Errorf("kvm: get special registers: %w", err)
+		}
+
+		for reg := range regs {
+			switch reg {
+			case hv.RegisterAMD64Cr3:
+				regs[reg] = hv.Register64(specialRegs.Cr3)
+			}
 		}
 	}
 

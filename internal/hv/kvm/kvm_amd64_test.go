@@ -117,3 +117,43 @@ func TestRunSimpleAddition(t *testing.T) {
 		t.Fatalf("Sync vCPU registers: %v", err)
 	}
 }
+
+func TestGetSetCR3(t *testing.T) {
+	checkKVMAvailable(t)
+
+	kvm, err := Open()
+	if err != nil {
+		t.Fatalf("Open KVM hypervisor: %v", err)
+	}
+	defer kvm.Close()
+
+	vm, err := kvm.NewVirtualMachine(hv.SimpleVMConfig{
+		NumCPUs: 1,
+		MemSize: 0x200000,
+		MemBase: 0x100000,
+	})
+	if err != nil {
+		t.Fatalf("Create KVM virtual machine: %v", err)
+	}
+	defer vm.Close()
+
+	if err := vm.VirtualCPUCall(0, func(vcpu hv.VirtualCPU) error {
+		regs := map[hv.Register]hv.RegisterValue{
+			hv.RegisterAMD64Cr3: hv.Register64(0),
+		}
+
+		if err := vcpu.GetRegisters(regs); err != nil {
+			return fmt.Errorf("Get CR3 register: %w", err)
+		}
+
+		regs[hv.RegisterAMD64Cr3] = hv.Register64(0x12345000)
+
+		if err := vcpu.SetRegisters(regs); err != nil {
+			return fmt.Errorf("Set CR3 register: %w", err)
+		}
+
+		return nil
+	}); err != nil {
+		t.Fatalf("Sync vCPU registers: %v", err)
+	}
+}

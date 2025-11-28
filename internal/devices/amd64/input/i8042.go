@@ -1,7 +1,6 @@
 package input
 
 import (
-	"errors"
 	"fmt"
 	"sync"
 
@@ -23,7 +22,7 @@ const (
 
 const (
 	i8042StatusOutputFull = 1 << 0
-	i8042StatusKeyLock   = 1 << 4
+	i8042StatusKeyLock    = 1 << 4
 )
 
 const (
@@ -35,8 +34,6 @@ const (
 	i8042ResponseSelfTestOK = 0x55
 	i8042ResponsePortOK     = 0x00
 )
-
-var ErrGuestRequestedReboot = errors.New("guest requested reboot")
 
 type I8042 struct {
 	mu sync.Mutex
@@ -118,7 +115,7 @@ func (c *I8042) handleCommandLocked(command byte) error {
 	case i8042CommandEnableFirstPort:
 		c.commandByte &^= i8042CommandByteDisablePort1Clk
 	case i8042CommandResetCPU:
-		return ErrGuestRequestedReboot
+		return hv.ErrGuestRequestedReboot
 	default:
 		return nil
 	}
