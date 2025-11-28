@@ -351,9 +351,25 @@ const (
 	InterruptTriggerLevel InterruptTriggerMode = 1
 )
 
+type InterruptControlKind uint64
+
+// UINT64 Type : 8; // WHV_INTERRUPT_TYPE
+// UINT64 DestinationMode : 4; // WHV_INTERRUPT_DESTINATION_MODE
+// UINT64 TriggerMode : 4; // WHV_INTERRUPT_TRIGGER_MODE
+
+func MakeInterruptControlKind(
+	intType InterruptType,
+	destMode InterruptDestinationMode,
+	trigMode InterruptTriggerMode,
+) InterruptControlKind {
+	return InterruptControlKind(uint64(intType)&0xF) |
+		(InterruptControlKind(uint64(destMode)&0xF) << 8) |
+		(InterruptControlKind(uint64(trigMode)&0xF) << 12)
+}
+
 // InterruptControl mirrors WHV_INTERRUPT_CONTROL.
 type InterruptControl struct {
-	Control     uint64
+	Control     InterruptControlKind
 	Destination uint32
 	Vector      uint32
 }

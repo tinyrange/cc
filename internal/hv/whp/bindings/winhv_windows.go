@@ -290,11 +290,11 @@ func SetVirtualProcessorInterruptControllerState(partition PartitionHandle, vpIn
 }
 
 // RequestInterrupt wraps WHvRequestInterrupt.
-func RequestInterrupt(partition PartitionHandle, control *InterruptControl, size uint32) error {
+func RequestInterrupt(partition PartitionHandle, control *InterruptControl) error {
 	_, err := callHRESULT(procWHvRequestInterrupt,
 		uintptr(partition),
 		uintptr(unsafe.Pointer(control)),
-		uintptr(size),
+		uintptr(unsafe.Sizeof(*control)),
 	)
 	return err
 }

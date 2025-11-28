@@ -227,12 +227,82 @@ func createEmulator() (bindings.EmulatorHandle, error) {
 	return emu, nil
 }
 
+func (vm *virtualMachine) installACPI() error {
+	const (
+		IOAPIC_BASE = 0xFEC00000
+		HPET_BASE   = 0xFED00000
+	)
+
+	// 1. Choose safe area for ACPI tables at top of RAM
+	memBase := vm.memoryBase
+	memSize := uint64(vm.memory.Size())
+
+	acpiRegionSize := uint64(0x10000) // 64 KiB for all tables
+	acpiBase := memBase + memSize - acpiRegionSize
+
+	// Layout:
+	//   acpiBase + 0x0000 : XSDT
+	//   acpiBase + 0x0100 : MADT
+	//   acpiBase + 0x0200 : HPET
+
+	xsdtAddr := acpiBase
+	madtAddr := acpiBase + 0x0100
+	hpetAddr := acpiBase + 0x0200
+
+	// 2. Build tables
+	madt := BuildMADT(0xFEE00000, 0, IOAPIC_BASE, 0)
+	hpet := BuildHPET(HPET_BASE, 2)
+	xsdt := BuildXSDT([]uint64{
+		uint64(madtAddr),
+		uint64(hpetAddr),
+	})
+
+	// 3. Write tables into guest RAM
+	if _, err := vm.WriteAt(xsdt, int64(xsdtAddr-memBase)); err != nil {
+		return fmt.Errorf("write XSDT: %w", err)
+	}
+	if _, err := vm.WriteAt(madt, int64(madtAddr-memBase)); err != nil {
+		return fmt.Errorf("write MADT: %w", err)
+	}
+	if _, err := vm.WriteAt(hpet, int64(hpetAddr-memBase)); err != nil {
+		return fmt.Errorf("write HPET: %w", err)
+	}
+
+	// 4. Build RSDP in BIOS area 0xE0000 (must be identity mapped)
+	const rsdpPhys = 0x000E0000
+	rsdp := BuildRSDP(uint64(xsdtAddr))
+
+	if _, err := vm.WriteAt(rsdp, int64(rsdpPhys-memBase)); err != nil {
+		return fmt.Errorf("write RSDP: %w", err)
+	}
+
+	return nil
+}
+
 func (h *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 	emu, err := createEmulator()
 	if err != nil {
 		return fmt.Errorf("failed to create emulator for vm: %w", err)
 	}
 	vm.emu = emu
+
+	if config.NeedsInterruptSupport() {
+		if err := bindings.SetPartitionPropertyUnsafe(
+			vm.part,
+			bindings.PartitionPropertyCodeLocalApicEmulationMode,
+			bindings.LocalApicEmulationModeXApic,
+		); err != nil {
+			return fmt.Errorf("failed to enable xAPIC mode: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (h *hypervisor) archVMInitWithMemory(vm *virtualMachine, config hv.VMConfig) error {
+	if config.NeedsInterruptSupport() {
+		vm.installACPI()
+	}
 
 	return nil
 }
@@ -446,6 +516,19 @@ func (v *virtualCPU) SetProtectedMode() error {
 	panic("unimplemented")
 }
 
+func (v *virtualMachine) PulseIRQ(irqLine uint32) error {
+	return bindings.RequestInterrupt(v.part, &bindings.InterruptControl{
+		Control: bindings.MakeInterruptControlKind(
+			bindings.InterruptTypeFixed,
+			bindings.InterruptDestinationPhysical,
+			bindings.InterruptTriggerEdge,
+		),
+		Destination: 0, // TODO(joshua): Move this to target vCPU ID?
+		Vector:      irqLine,
+	})
+}
+
 var (
-	_ hv.VirtualCPUAmd64 = &virtualCPU{}
+	_ hv.VirtualCPUAmd64     = &virtualCPU{}
+	_ hv.VirtualMachineAmd64 = &virtualMachine{}
 )

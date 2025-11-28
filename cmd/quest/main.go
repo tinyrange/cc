@@ -650,11 +650,11 @@ func (q *bringUpQuest) RunLinux() error {
 		MemSize: 256 * 1024 * 1024, // 256 MiB
 
 		Cmdline: []string{
-			"console=hvc0",
-			// "console=ttyS0,115200n8",
-			// "earlycon=uart8250,io,0x3f8,115200,keep",
+			// "console=hvc0",
+			"console=ttyS0,115200n8",
+			"earlycon=uart8250,io,0x3f8,115200,keep",
 			// "i8042.nopnp",
-			"quiet",
+			// "quiet",
 		},
 
 		GetKernel: func() (io.ReaderAt, int64, error) {
@@ -714,6 +714,8 @@ func (q *bringUpQuest) RunLinux() error {
 				return nil, fmt.Errorf("unsupported architecture for init program: %s", arch)
 			}
 		},
+
+		SerialStdout: os.Stdout,
 
 		Devices: []hv.DeviceTemplate{
 			virtio.ConsoleTemplate{Out: buf, In: os.Stdin},

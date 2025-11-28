@@ -154,7 +154,7 @@ func (v *virtualCPU) SetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 }
 
 func (v *virtualCPU) handleIOPortAccess(access *bindings.EmulatorIOAccessInfo) error {
-	if access.AccessSize != 1 {
+	if access.AccessSize != 1 && access.AccessSize != 2 && access.AccessSize != 4 {
 		return fmt.Errorf("whp: unsupported IO port access size %d", access.AccessSize)
 	}
 
@@ -433,6 +433,10 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 	); err != nil {
 		bindings.DeletePartition(vm.part)
 		return nil, fmt.Errorf("whp: MapGPARange failed: %w", err)
+	}
+
+	if err := h.archVMInitWithMemory(vm, config); err != nil {
+		return nil, fmt.Errorf("whp: archVMInit failed: %w", err)
 	}
 
 	// Create vCPUs

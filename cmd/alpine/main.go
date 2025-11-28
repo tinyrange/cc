@@ -168,15 +168,17 @@ func (d *alpineDownloader) convertToPackage(r io.Reader, kind string, cachePath 
 		}
 	}
 
+	// Close the index file to flush all data
+	if err := idxFile.Close(); err != nil {
+		return nil, fmt.Errorf("close package index file %q: %v", cacheFile+".idx", err)
+	}
+
 	// rename the index file
 	if err := os.Rename(cacheFile+".idx.tmp", cacheFile+".idx"); err != nil {
 		return nil, fmt.Errorf("rename package index file %q: %v", cacheFile+".idx", err)
 	}
 
 	// close both files
-	if err := idxFile.Close(); err != nil {
-		return nil, fmt.Errorf("close package index file %q: %v", cacheFile+".idx", err)
-	}
 	if err := binFile.Close(); err != nil {
 		return nil, fmt.Errorf("close package contents file %q: %v", cacheFile+".bin", err)
 	}
