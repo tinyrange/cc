@@ -190,6 +190,7 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 		start uint16
 		end   uint16
 	}{
+		{0x60, 0x61},
 		{0x70, 0x71},
 		{0x80, 0x8f},
 		{0x2e8, 0x2ef},
