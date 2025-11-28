@@ -26,6 +26,7 @@ import (
 	arm64ir "github.com/tinyrange/cc/internal/ir/arm64"
 	"github.com/tinyrange/cc/internal/linux/boot"
 	amd64defs "github.com/tinyrange/cc/internal/linux/defs/amd64"
+	arm64defs "github.com/tinyrange/cc/internal/linux/defs/arm64"
 )
 
 const (
@@ -643,10 +644,6 @@ func (q *bringUpQuest) RunLinux() error {
 	q.dev = dev
 	defer q.dev.Close()
 
-	if dev.Architecture() != hv.ArchitectureX86_64 {
-		return fmt.Errorf("linux boot only supported on x86_64 hypervisors")
-	}
-
 	buf := &bytes.Buffer{}
 	loader := &boot.LinuxLoader{
 		NumCPUs: 1,
@@ -680,23 +677,43 @@ func (q *bringUpQuest) RunLinux() error {
 			return f, nil
 		},
 
-		Init: ir.Program{
-			Entrypoint: "main",
-			Methods: map[string]ir.Method{
-				"main": {
-					ir.Printf("Hello, World\n"),
-					ir.Syscall(
-						amd64defs.SYS_REBOOT,
-						ir.Int64(amd64defs.LINUX_REBOOT_MAGIC1),
-						ir.Int64(amd64defs.LINUX_REBOOT_MAGIC2),
-						ir.Int64(amd64defs.LINUX_REBOOT_CMD_RESTART),
-						ir.Int64(0),
-					),
-				},
-			},
+		GetInit: func(arch hv.CpuArchitecture) (*ir.Program, error) {
+			if arch == hv.ArchitectureX86_64 {
+				return &ir.Program{
+					Entrypoint: "main",
+					Methods: map[string]ir.Method{
+						"main": {
+							ir.Printf("Hello, World\n"),
+							ir.Syscall(
+								amd64defs.SYS_REBOOT,
+								ir.Int64(amd64defs.LINUX_REBOOT_MAGIC1),
+								ir.Int64(amd64defs.LINUX_REBOOT_MAGIC2),
+								ir.Int64(amd64defs.LINUX_REBOOT_CMD_RESTART),
+								ir.Int64(0),
+							),
+						},
+					},
+				}, nil
+			} else if arch == hv.ArchitectureARM64 {
+				return &ir.Program{
+					Entrypoint: "main",
+					Methods: map[string]ir.Method{
+						"main": {
+							ir.Printf("Hello, World\n"),
+							ir.Syscall(
+								arm64defs.SYS_REBOOT,
+								ir.Int64(amd64defs.LINUX_REBOOT_MAGIC1),
+								ir.Int64(amd64defs.LINUX_REBOOT_MAGIC2),
+								ir.Int64(amd64defs.LINUX_REBOOT_CMD_RESTART),
+								ir.Int64(0),
+							),
+						},
+					},
+				}, nil
+			} else {
+				return nil, fmt.Errorf("unsupported architecture for init program: %s", arch)
+			}
 		},
-
-		SerialStdout: os.Stdout,
 
 		Devices: []hv.DeviceTemplate{
 			virtio.ConsoleTemplate{Out: buf, In: os.Stdin},

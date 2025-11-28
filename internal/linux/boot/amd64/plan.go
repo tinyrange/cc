@@ -1,4 +1,4 @@
-package boot
+package amd64
 
 import (
 	"errors"
@@ -7,8 +7,8 @@ import (
 	"github.com/tinyrange/cc/internal/hv"
 )
 
-// bootOptions parameterise how the kernel is placed into guest RAM.
-type bootOptions struct {
+// BootOptions parameterise how the kernel is placed into guest RAM.
+type BootOptions struct {
 	// Cmdline is the kernel command line (without trailing NUL).
 	Cmdline string
 	// LoadAddr explicitly sets the payload load GPA. If zero, a default is
@@ -39,7 +39,7 @@ type bootOptions struct {
 	E820 []E820Entry
 }
 
-func (o *bootOptions) withDefaults() bootOptions {
+func (o *BootOptions) withDefaults() BootOptions {
 	out := *o
 	if out.ZeroPageGPA == 0 {
 		out.ZeroPageGPA = 0x00090000
@@ -167,7 +167,7 @@ type BootPlan struct {
 
 // Prepare loads the kernel payload, builds the zero page and returns the
 // derived boot parameters. Call ConfigureVCPU to apply the plan to a vCPU.
-func (k *KernelImage) Prepare(vm hv.VirtualMachine, opts bootOptions) (*BootPlan, error) {
+func (k *KernelImage) Prepare(vm hv.VirtualMachine, opts BootOptions) (*BootPlan, error) {
 	if vm == nil || vm.MemorySize() == 0 {
 		return nil, errors.New("memory mapping is nil")
 	}
@@ -179,7 +179,7 @@ func (k *KernelImage) Prepare(vm hv.VirtualMachine, opts bootOptions) (*BootPlan
 	}
 }
 
-func (k *KernelImage) prepareBzImage(vm hv.VirtualMachine, opts bootOptions) (*BootPlan, error) {
+func (k *KernelImage) prepareBzImage(vm hv.VirtualMachine, opts BootOptions) (*BootPlan, error) {
 	opts = opts.withDefaults()
 	var initrdAddr uint64
 	var initrdSize uint64
@@ -292,7 +292,7 @@ func (k *KernelImage) prepareBzImage(vm hv.VirtualMachine, opts bootOptions) (*B
 	}, nil
 }
 
-func (k *KernelImage) prepareELF(vm hv.VirtualMachine, opts bootOptions) (*BootPlan, error) {
+func (k *KernelImage) prepareELF(vm hv.VirtualMachine, opts BootOptions) (*BootPlan, error) {
 	opts = opts.withDefaults()
 	if opts.LoadAddr != 0 {
 		return nil, errors.New("ELF kernels do not support overriding load address")

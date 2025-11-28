@@ -1,4 +1,4 @@
-package boot
+package amd64
 
 import (
 	"context"
@@ -99,7 +99,7 @@ func TestPrepareSetsE820ToFullGuestRAM(t *testing.T) {
 		memoryBase: 0x0,
 	}
 
-	plan, err := kernel.Prepare(vm, bootOptions{})
+	plan, err := kernel.Prepare(vm, BootOptions{})
 	if err != nil {
 		t.Fatalf("Prepare: %v", err)
 	}

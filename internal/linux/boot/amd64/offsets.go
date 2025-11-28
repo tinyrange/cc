@@ -1,4 +1,4 @@
-package boot
+package amd64
 
 const (
 	zeroPageSize = 4096
