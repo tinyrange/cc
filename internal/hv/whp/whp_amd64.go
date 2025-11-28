@@ -14,6 +14,11 @@ import (
 	"github.com/tinyrange/cc/internal/hv/whp/bindings"
 )
 
+const (
+	ioapicBaseAddress = 0xFEC00000
+	hpetBaseAddress   = 0xFED00000
+)
+
 // Architecture implements hv.Hypervisor.
 func (h *hypervisor) Architecture() hv.CpuArchitecture {
 	return hv.ArchitectureX86_64
@@ -228,11 +233,6 @@ func createEmulator() (bindings.EmulatorHandle, error) {
 }
 
 func (vm *virtualMachine) installACPI() error {
-	const (
-		IOAPIC_BASE = 0xFEC00000
-		HPET_BASE   = 0xFED00000
-	)
-
 	// 1. Choose safe area for ACPI tables at top of RAM
 	memBase := vm.memoryBase
 	memSize := uint64(vm.memory.Size())
@@ -250,8 +250,8 @@ func (vm *virtualMachine) installACPI() error {
 	hpetAddr := acpiBase + 0x0200
 
 	// 2. Build tables
-	madt := BuildMADT(0xFEE00000, 0, IOAPIC_BASE, 0)
-	hpet := BuildHPET(HPET_BASE, 2)
+	madt := BuildMADT(0xFEE00000, 0, ioapicBaseAddress, 0)
+	hpet := BuildHPET(hpetBaseAddress, 2)
 	xsdt := BuildXSDT([]uint64{
 		uint64(madtAddr),
 		uint64(hpetAddr),
@@ -301,7 +301,12 @@ func (h *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 
 func (h *hypervisor) archVMInitWithMemory(vm *virtualMachine, config hv.VMConfig) error {
 	if config.NeedsInterruptSupport() {
-		vm.installACPI()
+		if err := vm.installACPI(); err != nil {
+			return fmt.Errorf("install ACPI tables: %w", err)
+		}
+		if err := vm.AddDevice(newHPETDevice(hpetBaseAddress)); err != nil {
+			return fmt.Errorf("add HPET device: %w", err)
+		}
 	}
 
 	return nil
