@@ -127,6 +127,9 @@ type virtualMachine struct {
 	closeOnce sync.Once
 }
 
+// implements hv.VirtualMachine.
+func (v *virtualMachine) MemoryBase() uint64        { return v.memoryBase }
+func (v *virtualMachine) MemorySize() uint64        { return uint64(len(v.memory)) }
 func (v *virtualMachine) Hypervisor() hv.Hypervisor { return v.hv }
 
 func (v *virtualMachine) AddDevice(dev hv.Device) error {

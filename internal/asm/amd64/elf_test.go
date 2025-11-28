@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/tinyrange/cc/internal/asm"
-	linux "github.com/tinyrange/cc/internal/linux/amd64"
+	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 )
 
 func Exit(code int) asm.Fragment {

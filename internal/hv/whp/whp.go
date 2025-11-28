@@ -260,7 +260,9 @@ type virtualMachine struct {
 	emu bindings.EmulatorHandle
 }
 
-// Hypervisor implements hv.VirtualMachine.
+// implements hv.VirtualMachine.
+func (v *virtualMachine) MemoryBase() uint64        { return v.memoryBase }
+func (v *virtualMachine) MemorySize() uint64        { return uint64(v.memory.Size()) }
 func (v *virtualMachine) Hypervisor() hv.Hypervisor { return v.hv }
 
 // AddDevice implements hv.VirtualMachine.

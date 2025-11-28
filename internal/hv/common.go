@@ -204,6 +204,9 @@ type VirtualMachine interface {
 
 	Hypervisor() Hypervisor
 
+	MemorySize() uint64
+	MemoryBase() uint64
+
 	Run(ctx context.Context, cfg RunConfig) error
 
 	VirtualCPUCall(id int, f func(vcpu VirtualCPU) error) error
@@ -222,15 +225,11 @@ type VMLoader interface {
 }
 
 type VMCallbacks interface {
-	isVMCallbacks()
-
 	OnCreateVM(vm VirtualMachine) error
 	OnCreateVCPU(vCpu VirtualCPU) error
 }
 
 type VMConfig interface {
-	isVMConfig()
-
 	// Assume all methods here will be treated aw dumb getters
 	// which can be called multiple times across multiple threads.
 
@@ -252,9 +251,6 @@ type SimpleVMConfig struct {
 	CreateVM   func(vm VirtualMachine) error
 	CreateVCPU func(vCpu VirtualCPU) error
 }
-
-func (c SimpleVMConfig) isVMCallbacks() {}
-func (c SimpleVMConfig) isVMConfig()    {}
 
 // OnCreateVM implements VMCallbacks.
 func (c SimpleVMConfig) OnCreateVM(vm VirtualMachine) error {

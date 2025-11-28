@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/tinyrange/cc/internal/asm"
@@ -20,6 +23,8 @@ import (
 	"github.com/tinyrange/cc/internal/ir"
 	amd64ir "github.com/tinyrange/cc/internal/ir/amd64"
 	arm64ir "github.com/tinyrange/cc/internal/ir/arm64"
+	"github.com/tinyrange/cc/internal/linux/boot"
+	amd64defs "github.com/tinyrange/cc/internal/linux/defs/amd64"
 )
 
 const (
@@ -627,8 +632,96 @@ func (q *bringUpQuest) Run() error {
 	return nil
 }
 
+func (q *bringUpQuest) RunLinux() error {
+	slog.Info("Starting Bringup Quest: Linux Boot")
+
+	dev, err := factory.Open()
+	if err != nil {
+		return fmt.Errorf("open hypervisor factory: %w", err)
+	}
+	q.dev = dev
+	defer q.dev.Close()
+
+	if dev.Architecture() != hv.ArchitectureX86_64 {
+		return fmt.Errorf("linux boot only supported on x86_64 hypervisors")
+	}
+
+	loader := &boot.LinuxLoader{
+		NumCPUs: 1,
+		MemSize: 256 * 1024 * 1024, // 256 MiB
+
+		Cmdline: []string{"console=ttyS0", "earlycon=uart8250,io,0x3f8,115200,keep"},
+
+		GetKernel: func() (io.ReaderAt, int64, error) {
+			f, err := os.Open(filepath.Join("local", "vmlinux"))
+			if err != nil {
+				return nil, 0, fmt.Errorf("open kernel image: %w", err)
+			}
+			info, err := f.Stat()
+			if err != nil {
+				return nil, 0, fmt.Errorf("stat kernel image: %w", err)
+			}
+			return f, info.Size(), nil
+		},
+
+		Init: ir.Program{
+			Entrypoint: "main",
+			Methods: map[string]ir.Method{
+				"main": {
+					ir.Printf("Hello, World\n"),
+					ir.Syscall(
+						amd64defs.SYS_REBOOT,
+						ir.Int64(amd64defs.LINUX_REBOOT_MAGIC1),
+						ir.Int64(amd64defs.LINUX_REBOOT_MAGIC2),
+						ir.Int64(amd64defs.LINUX_REBOOT_CMD_POWER_OFF),
+						ir.Int64(0),
+					),
+				},
+			},
+		},
+
+		Stdout: os.Stdout,
+	}
+
+	vm, err := q.dev.NewVirtualMachine(loader)
+	if err != nil {
+		return fmt.Errorf("create virtual machine: %w", err)
+	}
+	defer vm.Close()
+
+	run, err := loader.RunConfig()
+	if err != nil {
+		return fmt.Errorf("prepare linux boot: %w", err)
+	}
+
+	if err := vm.Run(context.Background(), run); err != nil {
+		return fmt.Errorf("run linux boot: %w", err)
+	}
+
+	slog.Info("Linux Boot Completed")
+
+	return nil
+}
+
 func main() {
+	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+
+	linux := fs.Bool("linux", false, "Try booting Linux")
+
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		slog.Error("failed to parse flags", "error", err)
+		os.Exit(1)
+	}
+
 	q := &bringUpQuest{}
+
+	if *linux {
+		if err := q.RunLinux(); err != nil {
+			slog.Error("failed bringup quest linux", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if err := q.Run(); err != nil {
 		slog.Error("failed bringup quest", "error", err)

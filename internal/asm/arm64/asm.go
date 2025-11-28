@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"sync/atomic"
 
-	linux "github.com/tinyrange/cc/internal/linux/arm64"
+	linux "github.com/tinyrange/cc/internal/linux/defs/arm64"
 
 	"github.com/tinyrange/cc/internal/asm"
 )
