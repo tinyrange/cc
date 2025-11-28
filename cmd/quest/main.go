@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/tinyrange/cc/internal/asm"
@@ -45,6 +46,14 @@ var arm64VectorTableBytes = mustBuildArm64VectorTable()
 
 type bringUpQuest struct {
 	dev hv.Hypervisor
+}
+
+func defaultKernelImagePath() string {
+	path := filepath.Join("local", fmt.Sprintf("vmlinux_%s", runtime.GOARCH))
+	if _, err := os.Stat(path); err == nil {
+		return path
+	}
+	return filepath.Join("local", "vmlinux")
 }
 
 func arm64ExceptionVectorInit(loader *helpers.ProgramLoader) {
@@ -658,13 +667,14 @@ func (q *bringUpQuest) RunLinux() error {
 		},
 
 		GetKernel: func() (io.ReaderAt, int64, error) {
-			f, err := os.Open(filepath.Join("local", "vmlinux"))
+			kernelPath := defaultKernelImagePath()
+			f, err := os.Open(kernelPath)
 			if err != nil {
-				return nil, 0, fmt.Errorf("open kernel image: %w", err)
+				return nil, 0, fmt.Errorf("open kernel image %q: %w", kernelPath, err)
 			}
 			info, err := f.Stat()
 			if err != nil {
-				return nil, 0, fmt.Errorf("stat kernel image: %w", err)
+				return nil, 0, fmt.Errorf("stat kernel image %q: %w", kernelPath, err)
 			}
 			return f, info.Size(), nil
 		},

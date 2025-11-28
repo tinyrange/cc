@@ -55,7 +55,9 @@ var crossBuilds = []crossBuild{
 
 const linuxKernelRefreshInterval = 24 * time.Hour
 
-var linuxKernelPath = filepath.Join("local", "vmlinux")
+func linuxKernelPath() string {
+	return filepath.Join("local", fmt.Sprintf("vmlinux_%s", runtime.GOARCH))
+}
 
 type buildOptions struct {
 	Package          string
@@ -166,7 +168,7 @@ func downloadLinuxKernel(extraArgs []string) error {
 	args := []string{
 		"-name", "linux-virt",
 		"-extract-filename", "boot/vmlinuz-virt",
-		"-extract-output", linuxKernelPath,
+		"-extract-output", linuxKernelPath(),
 	}
 
 	if len(extraArgs) > 0 {
@@ -181,21 +183,22 @@ func downloadLinuxKernel(extraArgs []string) error {
 }
 
 func maybeAutoUpdateLinuxKernel() error {
-	info, err := os.Stat(linuxKernelPath)
+	path := linuxKernelPath()
+	info, err := os.Stat(path)
 	reason := ""
 
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			reason = "no cached kernel found"
 		} else {
-			return fmt.Errorf("stat linux kernel %q: %w", linuxKernelPath, err)
+			return fmt.Errorf("stat linux kernel %q: %w", path, err)
 		}
 	} else {
 		age := time.Since(info.ModTime())
 		if age < linuxKernelRefreshInterval {
 			return nil
 		}
-		reason = fmt.Sprintf("cached kernel last updated %s ago", age.Round(time.Minute))
+		reason = fmt.Sprintf("cached kernel %q last updated %s ago", path, age.Round(time.Minute))
 	}
 
 	slog.Info("Refreshing linux kernel", "reason", reason)

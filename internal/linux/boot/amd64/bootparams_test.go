@@ -69,7 +69,7 @@ var (
 )
 
 func TestPrepareSetsE820ToFullGuestRAM(t *testing.T) {
-	kernelPath := filepath.Join("..", "local", "vmlinux")
+	kernelPath := filepath.Join("..", "local", "vmlinux_amd64")
 	if _, err := os.Stat(kernelPath); err != nil {
 		t.Skipf("skipping: %v", err)
 	}

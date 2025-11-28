@@ -45,4 +45,4 @@ For this version of CrumbleCracker I expect to primarily architect/write the pro
 
 ## Getting Start Notes
 
-To download Linux from Alpine repos `./tools/build.go -alpine -- -name linux-virt -extract-filename boot/vmlinuz-virt -extract-output local/vmlinux`
+To download Linux from Alpine repos `./tools/build.go -alpine -- -name linux-virt -extract-filename boot/vmlinuz-virt -extract-output local/vmlinux_<arch>` (e.g. `local/vmlinux_amd64`).
