@@ -158,6 +158,7 @@ func readGzipKernelHeader(reader io.ReaderAt, offset, size int64) (KernelHeader,
 	if err != nil {
 		return KernelHeader{}, fmt.Errorf("open gzip reader: %w", err)
 	}
+	gz.Multistream(false)
 	defer gz.Close()
 
 	buf := make([]byte, imageHeaderSizeBytes)
@@ -194,6 +195,7 @@ func (p ImageProbe) ExtractImage(reader io.ReaderAt, size int64) ([]byte, error)
 	if err != nil {
 		return nil, fmt.Errorf("open gzip reader: %w", err)
 	}
+	gz.Multistream(false)
 	defer gz.Close()
 
 	data, err := io.ReadAll(gz)

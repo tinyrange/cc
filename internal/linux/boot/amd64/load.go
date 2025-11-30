@@ -3,6 +3,7 @@ package amd64
 import (
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/tinyrange/cc/internal/hv"
 )
@@ -60,10 +61,6 @@ func (k *KernelImage) LoadIntoMemory(vm hv.VirtualMachine, loadAddr uint64) erro
 	if loadAddr < memStart {
 		return fmt.Errorf("load address %#x below RAM base %#x", loadAddr, memStart)
 	}
-	offset := int(loadAddr - memStart)
-	if offset < 0 || offset >= int(vm.MemorySize()) {
-		return fmt.Errorf("load address %#x outside RAM", loadAddr)
-	}
 	clearLen := len(payload)
 	if init := int(k.Header.InitSize); init > clearLen {
 		clearLen = init
@@ -71,11 +68,14 @@ func (k *KernelImage) LoadIntoMemory(vm hv.VirtualMachine, loadAddr uint64) erro
 	if loadAddr+uint64(clearLen) > memEnd {
 		return fmt.Errorf("kernel requires %#x bytes at %#x but RAM ends at %#x", clearLen, loadAddr, memEnd)
 	}
+	if loadAddr > math.MaxInt64 {
+		return fmt.Errorf("load address %#x out of host range", loadAddr)
+	}
 	clear := make([]byte, clearLen)
-	if _, err := vm.WriteAt(clear, int64(offset)); err != nil {
+	if _, err := vm.WriteAt(clear, int64(loadAddr)); err != nil {
 		return fmt.Errorf("clear kernel memory: %w", err)
 	}
-	if _, err := vm.WriteAt(payload, int64(offset)); err != nil {
+	if _, err := vm.WriteAt(payload, int64(loadAddr)); err != nil {
 		return fmt.Errorf("write kernel payload: %w", err)
 	}
 	return nil
@@ -102,19 +102,20 @@ func (k *KernelImage) loadELFSegments(vm hv.VirtualMachine) error {
 		if start < memStart || end > memEnd {
 			return fmt.Errorf("ELF segment [%#x, %#x) outside RAM [%#x, %#x)", start, end, memStart, memEnd)
 		}
-		offset := start - memStart
-		hostStart := int(offset)
-		hostEnd := hostStart + int(seg.memSize)
-		if hostStart < 0 || hostEnd > int(vm.MemorySize()) {
-			return fmt.Errorf("ELF segment [%#x, %#x) outside RAM slice", start, end)
+		if start > math.MaxInt64 {
+			return fmt.Errorf("ELF segment start %#x out of host range", start)
 		}
-		region := make([]byte, hostEnd-hostStart)
-		if _, err := vm.WriteAt(region, int64(hostStart)); err != nil {
+		regionLen := int(seg.memSize)
+		if uint64(regionLen) != seg.memSize {
+			return fmt.Errorf("ELF segment size %#x exceeds host limits", seg.memSize)
+		}
+		region := make([]byte, regionLen)
+		if _, err := vm.WriteAt(region, int64(start)); err != nil {
 			return fmt.Errorf("WriteAt zeroing ELF segment memory: %w", err)
 		}
 		if seg.fileSize > 0 {
 			fileSize := int(seg.fileSize)
-			if _, err := vm.WriteAt(seg.data[:fileSize], int64(hostStart)); err != nil {
+			if _, err := vm.WriteAt(seg.data[:fileSize], int64(start)); err != nil {
 				return fmt.Errorf("WriteAt ELF segment data: %w", err)
 			}
 		}

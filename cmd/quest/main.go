@@ -17,7 +17,8 @@ import (
 	"github.com/tinyrange/cc/internal/asm"
 	"github.com/tinyrange/cc/internal/asm/amd64"
 	"github.com/tinyrange/cc/internal/asm/arm64"
-	"github.com/tinyrange/cc/internal/devices/amd64/serial"
+	amd64serial "github.com/tinyrange/cc/internal/devices/amd64/serial"
+	"github.com/tinyrange/cc/internal/devices/serial"
 	"github.com/tinyrange/cc/internal/devices/virtio"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/factory"
@@ -31,9 +32,10 @@ import (
 )
 
 const (
-	psciSystemOff   = 0x84000008
-	arm64MMIOAddr   = 0xdead0000
-	arm64MessageBuf = 0x2000
+	psciSystemOff     = 0x84000008
+	arm64MMIOAddr     = 0xdead0000
+	arm64MessageBuf   = 0x2000
+	arm64UARTMMIOBase = 0x09000000
 )
 
 const (
@@ -48,12 +50,33 @@ type bringUpQuest struct {
 	dev hv.Hypervisor
 }
 
+func runWithTiming(name string, fn func() error) error {
+	start := time.Now()
+	err := fn()
+	duration := time.Since(start)
+	if err != nil {
+		slog.Error("Step failed", "step", name, "duration", duration, "error", err)
+		return err
+	}
+	slog.Info("Step completed", "step", name, "duration", duration)
+	return nil
+}
+
 func defaultKernelImagePath() string {
 	path := filepath.Join("local", fmt.Sprintf("vmlinux_%s", runtime.GOARCH))
 	if _, err := os.Stat(path); err == nil {
 		return path
 	}
 	return filepath.Join("local", "vmlinux")
+}
+
+func linuxMemoryBaseForArch(arch hv.CpuArchitecture) uint64 {
+	switch arch {
+	case hv.ArchitectureARM64:
+		return 0x80000000
+	default:
+		return 0
+	}
 }
 
 func arm64ExceptionVectorInit(loader *helpers.ProgramLoader) {
@@ -99,12 +122,7 @@ func arm64VectorHandlerFragment() asm.Fragment {
 }
 
 func (q *bringUpQuest) runTask(name string, f func() error) error {
-	if err := f(); err != nil {
-		slog.Error("Task failed", "name", name, "error", err)
-		return err
-	}
-
-	return nil
+	return runWithTiming(name, f)
 }
 
 func (q *bringUpQuest) runArchitectureTask(name string, arch hv.CpuArchitecture, f func() error) error {
@@ -273,11 +291,16 @@ func (q *bringUpQuest) Run() error {
 		return err
 	}
 
-	dev, err := factory.Open()
-	if err != nil {
+	if err := runWithTiming("Open Hypervisor", func() error {
+		dev, err := factory.Open()
+		if err != nil {
+			return err
+		}
+		q.dev = dev
+		return nil
+	}); err != nil {
 		return fmt.Errorf("open hypervisor factory: %w", err)
 	}
-	q.dev = dev
 	defer q.dev.Close()
 
 	if err := q.runVMTask("HLT Test", hv.ArchitectureX86_64, ir.Program{
@@ -406,7 +429,7 @@ func (q *bringUpQuest) Run() error {
 	}
 
 	serialBuf := &bytes.Buffer{}
-	serialDev := serial.NewSerial16550(0x3f8, 4, serialBuf)
+	serialDev := amd64serial.NewSerial16550(0x3f8, 4, serialBuf)
 	if err := q.runVMTask("Serial Port Test", hv.ArchitectureX86_64, ioHelloWorld, func(cpu hv.VirtualCPU) error {
 		serialOutput := serialBuf.String()
 		if serialOutput != "Hello, World!" {
@@ -654,17 +677,37 @@ func (q *bringUpQuest) RunLinux() error {
 	defer q.dev.Close()
 
 	buf := &bytes.Buffer{}
+	var cmdline []string
+	switch q.dev.Architecture() {
+	case hv.ArchitectureARM64:
+		cmdline = []string{
+			"console=ttyS0,115200n8",
+			fmt.Sprintf("earlycon=uart8250,mmio,0x%x", arm64UARTMMIOBase),
+		}
+	default:
+		cmdline = []string{
+			"console=ttyS0,115200n8",
+			"earlycon=uart8250,io,0x3f8,115200,keep",
+		}
+	}
+
+	devices := []hv.DeviceTemplate{
+		virtio.ConsoleTemplate{Out: buf, In: os.Stdin},
+	}
+	if q.dev.Architecture() == hv.ArchitectureARM64 {
+		devices = append(devices, serial.UART8250Template{
+			Base:     arm64UARTMMIOBase,
+			RegShift: 0,
+			Out:      buf,
+		})
+	}
+
 	loader := &boot.LinuxLoader{
 		NumCPUs: 1,
 		MemSize: 256 * 1024 * 1024, // 256 MiB
+		MemBase: linuxMemoryBaseForArch(q.dev.Architecture()),
 
-		Cmdline: []string{
-			// "console=hvc0",
-			"console=ttyS0,115200n8",
-			"earlycon=uart8250,io,0x3f8,115200,keep",
-			// "i8042.nopnp",
-			// "quiet",
-		},
+		Cmdline: cmdline,
 
 		GetKernel: func() (io.ReaderAt, int64, error) {
 			kernelPath := defaultKernelImagePath()
@@ -727,23 +770,31 @@ func (q *bringUpQuest) RunLinux() error {
 
 		SerialStdout: os.Stdout,
 
-		Devices: []hv.DeviceTemplate{
-			virtio.ConsoleTemplate{Out: buf, In: os.Stdin},
-		},
+		Devices: devices,
 	}
 
-	vm, err := q.dev.NewVirtualMachine(loader)
-	if err != nil {
+	var vm hv.VirtualMachine
+	if err := runWithTiming("Create Virtual Machine", func() error {
+		var err error
+		vm, err = q.dev.NewVirtualMachine(loader)
+		return err
+	}); err != nil {
 		return fmt.Errorf("create virtual machine: %w", err)
 	}
 	defer vm.Close()
 
-	run, err := loader.RunConfig()
-	if err != nil {
+	var run hv.RunConfig
+	if err := runWithTiming("Prepare Run Config", func() error {
+		var err error
+		run, err = loader.RunConfig()
+		return err
+	}); err != nil {
 		return fmt.Errorf("prepare linux boot: %w", err)
 	}
 
-	if err := vm.Run(context.Background(), run); err != nil {
+	if err := runWithTiming("Run Linux VM", func() error {
+		return vm.Run(context.Background(), run)
+	}); err != nil {
 		return fmt.Errorf("run linux boot: %w", err)
 	}
 

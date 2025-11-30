@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/tinyrange/cc/internal/hv"
 )
@@ -28,12 +29,13 @@ func (k *KernelImage) BuildZeroPage(vm hv.VirtualMachine, zeroPageGPA, loadAddr 
 	if vm == nil {
 		return errors.New("memory mapping is nil")
 	}
-	if zeroPageGPA < vm.MemoryBase() {
-		return fmt.Errorf("zero page GPA %#x below memory base %#x", zeroPageGPA, vm.MemoryBase())
+	memStart := vm.MemoryBase()
+	memEnd := memStart + vm.MemorySize()
+	if zeroPageGPA < memStart || zeroPageGPA+zeroPageSize > memEnd {
+		return fmt.Errorf("zero page range [%#x, %#x) outside RAM [%#x, %#x)", zeroPageGPA, zeroPageGPA+zeroPageSize, memStart, memEnd)
 	}
-	zpOff := int(zeroPageGPA - vm.MemoryBase())
-	if zpOff < 0 || zpOff+zeroPageSize > int(vm.MemorySize()) {
-		return fmt.Errorf("zero page GPA %#x outside allocated memory", zeroPageGPA)
+	if zeroPageGPA > math.MaxInt64 {
+		return fmt.Errorf("zero page GPA %#x out of host range", zeroPageGPA)
 	}
 
 	zp := make([]byte, zeroPageSize)
@@ -113,23 +115,27 @@ func (k *KernelImage) BuildZeroPage(vm hv.VirtualMachine, zeroPageGPA, loadAddr 
 		binary.LittleEndian.PutUint32(zp[base+16:], ent.Type)
 	}
 
-	if _, err := vm.WriteAt(zp, int64(zpOff)); err != nil {
+	if _, err := vm.WriteAt(zp, int64(zeroPageGPA)); err != nil {
 		return fmt.Errorf("WriteAt zero page: %w", err)
 	}
 	return nil
 }
 
 func placeCmdline(vm hv.VirtualMachine, cmdlineGPA uint64, cmdline string) error {
-	if cmdlineGPA < vm.MemoryBase() {
-		return fmt.Errorf("cmdline GPA %#x below memory base %#x", cmdlineGPA, vm.MemoryBase())
+	memStart := vm.MemoryBase()
+	memEnd := memStart + vm.MemorySize()
+	if cmdlineGPA < memStart {
+		return fmt.Errorf("cmdline GPA %#x below memory base %#x", cmdlineGPA, memStart)
 	}
-	offset := int(cmdlineGPA - vm.MemoryBase())
 	need := len(cmdline) + 1
-	if offset < 0 || offset+need > int(vm.MemorySize()) {
+	if cmdlineGPA+uint64(need) > memEnd {
 		return fmt.Errorf("command line does not fit in guest memory (need %d bytes)", need)
 	}
+	if cmdlineGPA > math.MaxInt64 {
+		return fmt.Errorf("cmdline GPA %#x out of host range", cmdlineGPA)
+	}
 	cmdlineBytes := append([]byte(cmdline), 0)
-	if _, err := vm.WriteAt(cmdlineBytes, int64(offset)); err != nil {
+	if _, err := vm.WriteAt(cmdlineBytes, int64(cmdlineGPA)); err != nil {
 		return fmt.Errorf("WriteAt command line: %w", err)
 	}
 	return nil

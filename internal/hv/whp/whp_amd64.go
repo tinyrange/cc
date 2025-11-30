@@ -258,13 +258,13 @@ func (vm *virtualMachine) installACPI() error {
 	})
 
 	// 3. Write tables into guest RAM
-	if _, err := vm.WriteAt(xsdt, int64(xsdtAddr-memBase)); err != nil {
+	if _, err := vm.WriteAt(xsdt, int64(xsdtAddr)); err != nil {
 		return fmt.Errorf("write XSDT: %w", err)
 	}
-	if _, err := vm.WriteAt(madt, int64(madtAddr-memBase)); err != nil {
+	if _, err := vm.WriteAt(madt, int64(madtAddr)); err != nil {
 		return fmt.Errorf("write MADT: %w", err)
 	}
-	if _, err := vm.WriteAt(hpet, int64(hpetAddr-memBase)); err != nil {
+	if _, err := vm.WriteAt(hpet, int64(hpetAddr)); err != nil {
 		return fmt.Errorf("write HPET: %w", err)
 	}
 
@@ -272,7 +272,7 @@ func (vm *virtualMachine) installACPI() error {
 	const rsdpPhys = 0x000E0000
 	rsdp := BuildRSDP(uint64(xsdtAddr))
 
-	if _, err := vm.WriteAt(rsdp, int64(rsdpPhys-memBase)); err != nil {
+	if _, err := vm.WriteAt(rsdp, int64(rsdpPhys)); err != nil {
 		return fmt.Errorf("write RSDP: %w", err)
 	}
 

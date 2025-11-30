@@ -9,19 +9,28 @@ import (
 	"strings"
 
 	"github.com/tinyrange/cc/internal/asm/amd64"
-	"github.com/tinyrange/cc/internal/devices/amd64/input"
+	"github.com/tinyrange/cc/internal/asm/arm64"
+	amd64input "github.com/tinyrange/cc/internal/devices/amd64/input"
 	"github.com/tinyrange/cc/internal/devices/amd64/pci"
-	"github.com/tinyrange/cc/internal/devices/amd64/serial"
+	amd64serial "github.com/tinyrange/cc/internal/devices/amd64/serial"
+	"github.com/tinyrange/cc/internal/devices/serial"
 	"github.com/tinyrange/cc/internal/devices/virtio"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/ir"
 	_ "github.com/tinyrange/cc/internal/ir/amd64"
 	amd64boot "github.com/tinyrange/cc/internal/linux/boot/amd64"
+	arm64boot "github.com/tinyrange/cc/internal/linux/boot/arm64"
 )
 
 type bootPlan interface {
 	ConfigureVCPU(vcpu hv.VirtualCPU) error
 }
+
+const (
+	arm64UARTMMIOBase = 0x09000000
+	arm64UARTRegShift = 0
+	arm64UARTBaudRate = 115200
+)
 
 type programRunner struct {
 	loader *LinuxLoader
@@ -69,6 +78,7 @@ func (c *convertCRLF) Write(p []byte) (n int, err error) {
 type LinuxLoader struct {
 	NumCPUs int
 	MemSize uint64
+	MemBase uint64
 
 	Cmdline      []string
 	GetInit      func(arch hv.CpuArchitecture) (*ir.Program, error)
@@ -96,137 +106,224 @@ func (l *LinuxLoader) OnCreateVM(vm hv.VirtualMachine) error {
 func (l *LinuxLoader) CPUCount() int               { return l.NumCPUs }
 func (l *LinuxLoader) Callbacks() hv.VMCallbacks   { return l }
 func (l *LinuxLoader) Loader() hv.VMLoader         { return l }
-func (l *LinuxLoader) MemoryBase() uint64          { return 0x0 }
+func (l *LinuxLoader) MemoryBase() uint64          { return l.MemBase }
 func (l *LinuxLoader) MemorySize() uint64          { return l.MemSize }
 func (l *LinuxLoader) NeedsInterruptSupport() bool { return true }
 
 // Load implements hv.VMLoader.
 func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
+	if l.GetKernel == nil {
+		return errors.New("linux loader missing kernel provider")
+	}
+
 	kernelReader, kernelSize, err := l.GetKernel()
 	if err != nil {
 		return fmt.Errorf("get kernel: %w", err)
 	}
 
-	if vm.Hypervisor().Architecture() == hv.ArchitectureX86_64 {
-		kernelImage, err := amd64boot.LoadKernel(kernelReader, kernelSize)
-		if err != nil {
-			return fmt.Errorf("load kernel: %w", err)
-		}
+	arch := vm.Hypervisor().Architecture()
 
-		initProg, err := l.GetInit(hv.ArchitectureX86_64)
-		if err != nil {
-			return fmt.Errorf("get init program: %w", err)
-		}
-
-		// build the init payload
-		fac, err := ir.BuildStandaloneProgramForArch(ir.ArchitectureX86_64, initProg)
-		if err != nil {
-			return fmt.Errorf("build init program: %w", err)
-		}
-
-		initPayload, err := amd64.StandaloneELF(fac)
-		if err != nil {
-			return fmt.Errorf("build init payload ELF: %w", err)
-		}
-
-		// build the initramfs
-		files := []initramfsFile{
-			{Path: "/init", Data: initPayload, Mode: os.FileMode(0o755)},
-			// add /dev/mem as /mem
-			{Path: "/mem", Data: nil, Mode: os.FileMode(0o600), DevMajor: 1, DevMinor: 1},
-		}
-		initrd, err := buildInitramfs(files)
-		if err != nil {
-			return fmt.Errorf("build initramfs: %w", err)
-		}
-
-		for _, dev := range l.Devices {
-			if vdev, ok := dev.(virtio.VirtioMMIODevice); ok {
-				params, err := vdev.GetLinuxCommandLineParam()
-				if err != nil {
-					return fmt.Errorf("get virtio mmio device linux cmdline param: %w", err)
-				}
-				l.Cmdline = append(l.Cmdline, params...)
-			}
-		}
-
-		// prepare the kernel
-		plan, err := kernelImage.Prepare(vm, amd64boot.BootOptions{
-			Cmdline: strings.Join(l.Cmdline, " "),
-			Initrd:  initrd,
-		})
-		if err != nil {
-			return fmt.Errorf("prepare kernel: %w", err)
-		}
-		l.plan = plan
-
-		// Add devices
-		consoleSerial := serial.NewSerial16550(0x3F8, 4, &convertCRLF{l.SerialStdout})
-		if err := vm.AddDevice(consoleSerial); err != nil {
-			return fmt.Errorf("add serial device: %w", err)
-		}
-
-		auxSerial := serial.NewSerial16550(0x2F8, 3, io.Discard)
-		if err := vm.AddDevice(auxSerial); err != nil {
-			return fmt.Errorf("add aux serial device: %w", err)
-		}
-
-		if err := vm.AddDevice(pci.NewHostBridge()); err != nil {
-			return fmt.Errorf("add pci host bridge: %w", err)
-		}
-
-		var legacyPorts []uint16
-		for _, rng := range []struct {
-			start uint16
-			end   uint16
-		}{
-			{0x21, 0x22},
-			{0x40, 0x41},
-			{0x42, 0x43},
-			{0x60, 0x61},
-			{0x70, 0x71},
-			{0x80, 0x8f},
-			{0xA1, 0xA1},
-			{0x2e8, 0x2ef},
-			{0x3e8, 0x3ef},
-		} {
-			for port := rng.start; port <= rng.end; port++ {
-				legacyPorts = append(legacyPorts, port)
-			}
-		}
-
-		legacy := hv.SimpleX86IOPortDevice{
-			Ports: legacyPorts,
-			ReadFunc: func(port uint16, data []byte) error {
-				for i := range data {
-					data[i] = 0
-				}
-				return nil
-			},
-			WriteFunc: func(port uint16, data []byte) error {
-				return nil
-			},
-		}
-		if err := vm.AddDevice(legacy); err != nil {
-			return fmt.Errorf("add legacy port stub: %w", err)
-		}
-
-		if err := vm.AddDevice(input.NewI8042()); err != nil {
-			return fmt.Errorf("add i8042 controller: %w", err)
-		}
-
-		for _, dev := range l.Devices {
-			if err := vm.AddDeviceFromTemplate(dev); err != nil {
-				return fmt.Errorf("add device from template: %w", err)
-			}
-		}
-
-		return nil
-	} else if vm.Hypervisor().Architecture() == hv.ArchitectureARM64 {
-		return fmt.Errorf("ARM64 boot not implemented yet")
-	} else {
-		return fmt.Errorf("unsupported architecture: %v", vm.Hypervisor().Architecture())
+	initPayload, err := l.buildInitPayload(arch)
+	if err != nil {
+		return err
 	}
+
+	files := []initramfsFile{
+		{Path: "/init", Data: initPayload, Mode: os.FileMode(0o755)},
+		// add /dev/mem as /mem
+		{Path: "/mem", Data: nil, Mode: os.FileMode(0o600), DevMajor: 1, DevMinor: 1},
+	}
+	initrd, err := buildInitramfs(files)
+	if err != nil {
+		return fmt.Errorf("build initramfs: %w", err)
+	}
+
+	cmdline := append([]string(nil), l.Cmdline...)
+	for _, dev := range l.Devices {
+		if vdev, ok := dev.(virtio.VirtioMMIODevice); ok {
+			params, err := vdev.GetLinuxCommandLineParam()
+			if err != nil {
+				return fmt.Errorf("get virtio mmio device linux cmdline param: %w", err)
+			}
+			cmdline = append(cmdline, params...)
+		}
+	}
+	cmdlineStr := strings.Join(cmdline, " ")
+
+	switch arch {
+	case hv.ArchitectureX86_64:
+		return l.loadAMD64(vm, kernelReader, kernelSize, cmdlineStr, initrd)
+	case hv.ArchitectureARM64:
+		return l.loadARM64(vm, kernelReader, kernelSize, cmdlineStr, initrd)
+	default:
+		return fmt.Errorf("unsupported architecture: %v", arch)
+	}
+}
+
+func (l *LinuxLoader) buildInitPayload(arch hv.CpuArchitecture) ([]byte, error) {
+	if l.GetInit == nil {
+		return nil, errors.New("linux loader missing init program provider")
+	}
+
+	initProg, err := l.GetInit(arch)
+	if err != nil {
+		return nil, fmt.Errorf("get init program: %w", err)
+	}
+	if initProg == nil {
+		return nil, fmt.Errorf("init program for %s is nil", arch)
+	}
+
+	var irArch ir.Architecture
+	switch arch {
+	case hv.ArchitectureX86_64:
+		irArch = ir.ArchitectureX86_64
+	case hv.ArchitectureARM64:
+		irArch = ir.ArchitectureARM64
+	default:
+		return nil, fmt.Errorf("unsupported architecture for init payload: %s", arch)
+	}
+
+	fac, err := ir.BuildStandaloneProgramForArch(irArch, initProg)
+	if err != nil {
+		return nil, fmt.Errorf("build init program: %w", err)
+	}
+
+	switch arch {
+	case hv.ArchitectureX86_64:
+		payload, err := amd64.StandaloneELF(fac)
+		if err != nil {
+			return nil, fmt.Errorf("build init payload ELF: %w", err)
+		}
+		return payload, nil
+	case hv.ArchitectureARM64:
+		payload, err := arm64.StandaloneELF(fac)
+		if err != nil {
+			return nil, fmt.Errorf("build init payload ELF: %w", err)
+		}
+		return payload, nil
+	default:
+		return nil, fmt.Errorf("unsupported architecture for init payload: %s", arch)
+	}
+}
+
+func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, kernelSize int64, cmdline string, initrd []byte) error {
+	kernelImage, err := amd64boot.LoadKernel(kernelReader, kernelSize)
+	if err != nil {
+		return fmt.Errorf("load kernel: %w", err)
+	}
+
+	plan, err := kernelImage.Prepare(vm, amd64boot.BootOptions{
+		Cmdline: cmdline,
+		Initrd:  initrd,
+	})
+	if err != nil {
+		return fmt.Errorf("prepare kernel: %w", err)
+	}
+	l.plan = plan
+
+	consoleSerial := amd64serial.NewSerial16550(0x3F8, 4, &convertCRLF{l.SerialStdout})
+	if err := vm.AddDevice(consoleSerial); err != nil {
+		return fmt.Errorf("add serial device: %w", err)
+	}
+
+	auxSerial := amd64serial.NewSerial16550(0x2F8, 3, io.Discard)
+	if err := vm.AddDevice(auxSerial); err != nil {
+		return fmt.Errorf("add aux serial device: %w", err)
+	}
+
+	if err := vm.AddDevice(pci.NewHostBridge()); err != nil {
+		return fmt.Errorf("add pci host bridge: %w", err)
+	}
+
+	var legacyPorts []uint16
+	for _, rng := range []struct {
+		start uint16
+		end   uint16
+	}{
+		{0x21, 0x22},
+		{0x40, 0x41},
+		{0x42, 0x43},
+		{0x60, 0x61},
+		{0x70, 0x71},
+		{0x80, 0x8f},
+		{0xA1, 0xA1},
+		{0x2e8, 0x2ef},
+		{0x3e8, 0x3ef},
+	} {
+		for port := rng.start; port <= rng.end; port++ {
+			legacyPorts = append(legacyPorts, port)
+		}
+	}
+
+	legacy := hv.SimpleX86IOPortDevice{
+		Ports: legacyPorts,
+		ReadFunc: func(port uint16, data []byte) error {
+			for i := range data {
+				data[i] = 0
+			}
+			return nil
+		},
+		WriteFunc: func(port uint16, data []byte) error {
+			return nil
+		},
+	}
+	if err := vm.AddDevice(legacy); err != nil {
+		return fmt.Errorf("add legacy port stub: %w", err)
+	}
+
+	if err := vm.AddDevice(amd64input.NewI8042()); err != nil {
+		return fmt.Errorf("add i8042 controller: %w", err)
+	}
+
+	for _, dev := range l.Devices {
+		if err := vm.AddDeviceFromTemplate(dev); err != nil {
+			return fmt.Errorf("add device from template: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (l *LinuxLoader) loadARM64(vm hv.VirtualMachine, kernelReader io.ReaderAt, kernelSize int64, cmdline string, initrd []byte) error {
+	kernelImage, err := arm64boot.LoadKernel(kernelReader, kernelSize)
+	if err != nil {
+		return fmt.Errorf("load kernel: %w", err)
+	}
+
+	numCPUs := l.NumCPUs
+	if numCPUs <= 0 {
+		numCPUs = 1
+	}
+
+	plan, err := kernelImage.Prepare(vm, arm64boot.BootOptions{
+		Cmdline: cmdline,
+		Initrd:  initrd,
+		NumCPUs: numCPUs,
+		UART: &arm64boot.UARTConfig{
+			Base:     arm64UARTMMIOBase,
+			Size:     serial.UART8250MMIOSize,
+			ClockHz:  serial.UART8250DefaultClock,
+			RegShift: arm64UARTRegShift,
+			BaudRate: arm64UARTBaudRate,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("prepare kernel: %w", err)
+	}
+	l.plan = plan
+
+	uartDev := serial.NewUART8250MMIO(arm64UARTMMIOBase, arm64UARTRegShift, &convertCRLF{l.SerialStdout})
+	if err := vm.AddDevice(uartDev); err != nil {
+		return fmt.Errorf("add arm64 uart device: %w", err)
+	}
+
+	for _, dev := range l.Devices {
+		if err := vm.AddDeviceFromTemplate(dev); err != nil {
+			return fmt.Errorf("add device from template: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func (l *LinuxLoader) RunConfig() (hv.RunConfig, error) {

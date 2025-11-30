@@ -3,6 +3,7 @@ package amd64
 import (
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/tinyrange/cc/internal/hv"
 )
@@ -239,9 +240,10 @@ func (k *KernelImage) prepareBzImage(vm hv.VirtualMachine, opts BootOptions) (*B
 		if max := uint64(k.Header.InitrdAddrMax); max != 0 && initrdEnd-1 > max {
 			return nil, fmt.Errorf("initrd end %#x exceeds kernel limit %#x", initrdEnd-1, max)
 		}
-		offset := int(initrdAddr - memStart)
-		// copy(mem.Data[offset:offset+len(opts.Initrd)], opts.Initrd)
-		if _, err := vm.WriteAt(opts.Initrd, int64(offset)); err != nil {
+		if initrdAddr > math.MaxInt64 {
+			return nil, fmt.Errorf("initrd address %#x out of host range", initrdAddr)
+		}
+		if _, err := vm.WriteAt(opts.Initrd, int64(initrdAddr)); err != nil {
 			return nil, fmt.Errorf("write initrd: %w", err)
 		}
 	}
@@ -337,8 +339,10 @@ func (k *KernelImage) prepareELF(vm hv.VirtualMachine, opts BootOptions) (*BootP
 		if max := uint64(k.Header.InitrdAddrMax); max != 0 && initrdEnd-1 > max {
 			return nil, fmt.Errorf("initrd end %#x exceeds kernel limit %#x", initrdEnd-1, max)
 		}
-		offset := int(initrdAddr - memStart)
-		if _, err := vm.WriteAt(opts.Initrd, int64(offset)); err != nil {
+		if initrdAddr > math.MaxInt64 {
+			return nil, fmt.Errorf("initrd address %#x out of host range", initrdAddr)
+		}
+		if _, err := vm.WriteAt(opts.Initrd, int64(initrdAddr)); err != nil {
 			return nil, fmt.Errorf("write initrd: %w", err)
 		}
 	}

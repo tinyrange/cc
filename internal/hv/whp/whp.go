@@ -332,12 +332,14 @@ func (v *virtualMachine) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error
 }
 
 // WriteAt implements hv.VirtualMachine.
+
 func (v *virtualMachine) WriteAt(p []byte, off int64) (n int, err error) {
-	if off < 0 || uint64(off) >= v.memory.Size() {
+	offset := off - int64(v.memoryBase)
+	if offset < 0 || uint64(offset) >= v.memory.Size() {
 		return 0, fmt.Errorf("whp: WriteAt offset out of bounds")
 	}
 
-	n = copy(v.memory.Slice()[off:], p)
+	n = copy(v.memory.Slice()[offset:], p)
 	if n < len(p) {
 		err = fmt.Errorf("whp: WriteAt short write")
 	}
@@ -346,11 +348,12 @@ func (v *virtualMachine) WriteAt(p []byte, off int64) (n int, err error) {
 
 // ReadAt implements hv.VirtualMachine.
 func (v *virtualMachine) ReadAt(p []byte, off int64) (n int, err error) {
-	if off < 0 || uint64(off) >= v.memory.Size() {
+	offset := off - int64(v.memoryBase)
+	if offset < 0 || uint64(offset) >= v.memory.Size() {
 		return 0, fmt.Errorf("whp: ReadAt offset out of bounds")
 	}
 
-	n = copy(p, v.memory.Slice()[off:])
+	n = copy(p, v.memory.Slice()[offset:])
 	if n < len(p) {
 		err = fmt.Errorf("whp: ReadAt short read")
 	}
