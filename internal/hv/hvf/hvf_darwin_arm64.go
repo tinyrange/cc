@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"runtime"
 	"sync"
 	"unsafe"
@@ -405,6 +406,7 @@ func (v *virtualCPU) handleException() error {
 		exceptionClassShift            = 26
 		exceptionClassHvc              = 0x16
 		exceptionClassSmc              = 0x17
+		exceptionClassMsrAccess        = 0x18
 		exceptionClassDataAbortLowerEL = 0x24
 	)
 
@@ -414,12 +416,123 @@ func (v *virtualCPU) handleException() error {
 	switch ec {
 	case exceptionClassHvc, exceptionClassSmc:
 		return v.handleHypercall()
+	case exceptionClassMsrAccess:
+		return v.handleMsrAccess(syndrome)
 	case exceptionClassDataAbortLowerEL:
 		return v.handleDataAbort(syndrome, v.exit.Exception.PhysicalAddress, v.exit.Exception.VirtualAddress)
 	default:
 		return fmt.Errorf("hvf: unsupported exception class 0x%x (syndrome=0x%x)", ec, syndrome)
 	}
 }
+
+type msrAccessInfo struct {
+	op0, op1, op2 uint8
+	crn, crm      uint8
+	read          bool // true = MRS (sysreg -> Rt), false = MSR (Rt -> sysreg)
+	target        hv.Register
+}
+
+func decodeMsrAccess(syndrome uint64) (msrAccessInfo, error) {
+	const (
+		issMask uint64 = (1 << 25) - 1 // bits [24:0]
+
+		directionBit = 0
+
+		crmShift = 1
+		crmMask  = 0xF
+
+		rtShift = 5
+		rtMask  = 0x1F
+
+		crnShift = 10
+		crnMask  = 0xF
+
+		op1Shift = 14
+		op1Mask  = 0x7
+
+		op2Shift = 17
+		op2Mask  = 0x7
+
+		op0Shift = 20
+		op0Mask  = 0x3
+	)
+
+	iss := syndrome & issMask
+
+	read := ((iss >> directionBit) & 0x1) == 1
+
+	crm := uint8((iss >> crmShift) & crmMask)
+	rtIndex := int((iss >> rtShift) & rtMask)
+	crn := uint8((iss >> crnShift) & crnMask)
+	op1 := uint8((iss >> op1Shift) & op1Mask)
+	op2 := uint8((iss >> op2Shift) & op2Mask)
+	op0 := uint8((iss >> op0Shift) & op0Mask)
+
+	reg, ok := arm64RegisterFromIndex(rtIndex)
+	if !ok {
+		return msrAccessInfo{}, fmt.Errorf("hvf: unsupported MSR/MRS target register index %d", rtIndex)
+	}
+
+	return msrAccessInfo{
+		op0:    op0,
+		op1:    op1,
+		op2:    op2,
+		crn:    crn,
+		crm:    crm,
+		read:   read,
+		target: reg,
+	}, nil
+}
+
+// Small helper so you can pattern-match on specific system registers.
+func (m msrAccessInfo) matches(op0, op1, crn, crm, op2 uint8) bool {
+	return m.op0 == op0 && m.op1 == op1 && m.crn == crn && m.crm == crm && m.op2 == op2
+}
+
+func (v *virtualCPU) handleMsrAccess(syndrome uint64) error {
+	info, err := decodeMsrAccess(syndrome)
+	if err != nil {
+		return err
+	}
+
+	// Example: recognize specific system registers by encoding if you want
+	// to emulate them specially. For now, everything is treated as:
+	//   - MSR: write-ignored
+	//   - MRS: read-as-zero
+	//
+	// Example (CNTVCT_EL0: op0=3, op1=3, CRn=14, CRm=0, op2=2) :contentReference[oaicite:1]{index=1}
+	//
+	// if info.matches(3, 3, 14, 0, 2) { // CNTVCT_EL0
+	//     if info.read {
+	//         // TODO: provide a virtual counter value
+	//         if err := v.writeRegister(info.target, someCounterValue); err != nil {
+	//             return err
+	//         }
+	//     } else {
+	//         // Writes to CNTVCT_EL0 are architecturally ignored.
+	//     }
+	// } else {
+	//     // fall through to default handling below
+	// }
+
+	if info.read {
+		// Default: read-as-zero for unhandled sysregs.
+		if err := v.writeRegister(info.target, 0); err != nil {
+			return err
+		}
+	} else {
+		// Default: ignore writes for unhandled sysregs.
+		// You *could* log here if you want visibility:
+		log.Printf("hvf: ignoring MSR op0=%d op1=%d CRn=%d CRm=%d op2=%d", info.op0, info.op1, info.crn, info.crm, info.op2)
+	}
+
+	return v.advanceProgramCounter()
+}
+
+const (
+	psciVersion   = 0x84000000
+	psciSystemOff = 0x84000008
+)
 
 func (v *virtualCPU) handleHypercall() error {
 	val, err := v.readRegister(hv.RegisterARM64X0)
@@ -432,8 +545,13 @@ func (v *virtualCPU) handleHypercall() error {
 	}
 
 	switch val {
-	case psciSystemOffFunctionID:
+	case psciVersion:
+		// Reply PSCI version 1.0 (most common + acceptable default)
+		return v.writeRegister(hv.RegisterARM64X0, 0x00010000)
+
+	case psciSystemOff:
 		return hv.ErrVMHalted
+
 	default:
 		return fmt.Errorf("hvf: unhandled hypercall 0x%x", val)
 	}
