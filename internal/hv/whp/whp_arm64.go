@@ -239,6 +239,11 @@ func (h *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 	return nil
 }
 
+func (h *hypervisor) archVMInitWithMemory(vm *virtualMachine, config hv.VMConfig) error {
+	// Currently, there are no architecture-specific initializations needed for AMD64.
+	return nil
+}
+
 func (h *hypervisor) archVCPUInit(vm *virtualMachine, vcpu *virtualCPU) error {
 	// Currently, there are no architecture-specific initializations needed for AMD64.
 	return nil

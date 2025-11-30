@@ -5,17 +5,20 @@ import (
 	"encoding/binary"
 )
 
-// Common ACPI SDT header (36 bytes)
-func makeSDT(sig string, length uint32, revision uint8, oemTableID string) []byte {
+// makeSDT creates the Standard Description Table Header (36 bytes).
+func makeSDT(sig string, revision uint8, oemTableID string) *bytes.Buffer {
 	buf := &bytes.Buffer{}
 
-	// Signature
+	// Signature (4 bytes)
 	buf.WriteString(sig)
-	// Length (we'll overwrite this later if needed)
-	binary.Write(buf, binary.LittleEndian, length)
-	// Revision
+
+	// Length (4 bytes) - placeholder
+	binary.Write(buf, binary.LittleEndian, uint32(0))
+
+	// Revision (1 byte)
 	buf.WriteByte(revision)
-	// Checksum (placeholder 0 for now)
+
+	// Checksum (1 byte) - placeholder
 	buf.WriteByte(0)
 
 	// OEMID (6 bytes)
@@ -27,76 +30,74 @@ func makeSDT(sig string, length uint32, revision uint8, oemTableID string) []byt
 
 	// OEM Table ID (8 bytes)
 	ot := []byte(oemTableID)
-	if len(ot) > 8 {
-		ot = ot[:8]
+	outOT := make([]byte, 8)
+	copy(outOT, ot)
+	for i := len(ot); i < 8; i++ {
+		outOT[i] = ' '
 	}
-	for len(ot) < 8 {
-		ot = append(ot, ' ')
-	}
-	buf.Write(ot)
+	buf.Write(outOT)
 
-	// OEM Revision
+	// OEM Revision (4 bytes)
 	binary.Write(buf, binary.LittleEndian, uint32(1))
-	// Creator ID
+	// Creator ID (4 bytes)
 	binary.Write(buf, binary.LittleEndian, uint32(0x5452594E)) // "TRYN"
-	// Creator Revision
+	// Creator Revision (4 bytes)
 	binary.Write(buf, binary.LittleEndian, uint32(1))
 
-	// Ensure length at least header
-	if length < uint32(buf.Len()) {
-		length = uint32(buf.Len())
-	}
-	// fix length
-	b := buf.Bytes()
-	binary.LittleEndian.PutUint32(b[4:], length)
-
-	b = append(b, make([]byte, length-uint32(len(b)))...) // pad to length
-
-	return b
+	return buf
 }
 
-func acpiChecksum(b []byte) {
+// finalizeSDT updates the Length field and calculates the Checksum.
+func finalizeSDT(buf *bytes.Buffer) []byte {
+	b := buf.Bytes()
+
+	// 1. Update Length (at offset 4)
+	length := uint32(len(b))
+	binary.LittleEndian.PutUint32(b[4:], length)
+
+	// 2. Calculate Checksum (at offset 9)
 	var sum uint8
-	for _, v := range b {
+	for i, v := range b {
+		if i == 9 {
+			continue
+		}
 		sum += v
 	}
-	b[9] = uint8(0 - sum) // SDT checksum at offset 9
+	b[9] = uint8(0 - sum)
+
+	return b
 }
 
 // ----------------- RSDP (v2) -----------------
 
 func BuildRSDP(xsdtAddr uint64) []byte {
-	// ACPI 2.0+ RSDP is 36 bytes
 	b := make([]byte, 36)
 
-	copy(b[0:], []byte("RSD PTR ")) // signature
+	copy(b[0:], []byte("RSD PTR ")) // Signature
+	copy(b[9:], []byte("TINYR "))   // OEMID
 
-	// checksum over first 20 bytes
-	// we'll fill at [8]
-	// OEMID (6)
-	copy(b[9:], []byte("TINYR "))
+	b[15] = 2 // Revision (ACPI 2.0+)
 
-	b[15] = 2 // revision (ACPI 2.0+)
+	binary.LittleEndian.PutUint32(b[16:], 0)              // RSDT address
+	binary.LittleEndian.PutUint32(b[20:], uint32(len(b))) // Length
+	binary.LittleEndian.PutUint64(b[24:], xsdtAddr)       // XSDT address
 
-	// RSDT address (ACPI 1.0) – we can set 0 if we only use XSDT
-	binary.LittleEndian.PutUint32(b[16:], 0)
-
-	// Length
-	binary.LittleEndian.PutUint32(b[20:], uint32(len(b)))
-
-	// XSDT address
-	binary.LittleEndian.PutUint64(b[24:], xsdtAddr)
-
-	// extended checksum (byte 32) over full table
-	// first compute 1.0 checksum over first 20 bytes
+	// 1. Checksum (byte 8) over first 20 bytes
 	var sum20 uint8
 	for i := 0; i < 20; i++ {
+		if i == 8 {
+			continue
+		}
 		sum20 += b[i]
 	}
 	b[8] = uint8(0 - sum20)
 
+	// 2. Extended Checksum (byte 32) over full table
 	var sumAll uint8
-	for _, v := range b {
+	for i, v := range b {
+		if i == 32 {
+			continue
+		}
 		sumAll += v
 	}
 	b[32] = uint8(0 - sumAll)
@@ -107,90 +108,226 @@ func BuildRSDP(xsdtAddr uint64) []byte {
 // ----------------- XSDT -----------------
 
 func BuildXSDT(entries []uint64) []byte {
-	// header (36 bytes) + 8 bytes per entry
-	length := uint32(36 + 8*len(entries))
-	b := makeSDT("XSDT", length, 1, "TINYRXSD")
+	buf := makeSDT("XSDT", 1, "TINYRXSD")
 
-	// append entries
-	buf := bytes.NewBuffer(b)
 	for _, e := range entries {
 		binary.Write(buf, binary.LittleEndian, e)
 	}
 
-	out := buf.Bytes()
-	// fix length
-	binary.LittleEndian.PutUint32(out[4:], uint32(len(out)))
-	acpiChecksum(out)
-	return out
+	return finalizeSDT(buf)
+}
+
+// ----------------- FADT (Fixed ACPI Description Table) -----------------
+
+// BuildFADT is required for Windows to boot. It defines power state and DSDT location.
+func BuildFADT(dsdtAddr uint64) []byte {
+	// ACPI 5.0 FADT is 268 bytes, but 5.0+ rev usually 244 or 268.
+	// We use Revision 5.
+	buf := makeSDT("FACP", 5, "TINYRFACP")
+
+	// Payload starts at offset 36
+
+	// FIRMWARE_CTRL (4 bytes) - 36
+	binary.Write(buf, binary.LittleEndian, uint32(0))
+	// DSDT (4 bytes) - 40 (Legacy 32-bit pointer)
+	binary.Write(buf, binary.LittleEndian, uint32(dsdtAddr))
+
+	// Reserved (1 byte) - 44
+	buf.WriteByte(0)
+
+	// Preferred_PM_Profile (1 byte) - 45 (0 = Unspecified, 1 = Desktop)
+	buf.WriteByte(1)
+
+	// SCI_INT (2 bytes) - 46 (System Control Interrupt vector, usually 9)
+	binary.Write(buf, binary.LittleEndian, uint16(9))
+
+	// SMI_CMD (4 bytes) - 48 (System Management Mode command port)
+	binary.Write(buf, binary.LittleEndian, uint32(0))
+
+	// ACPI_ENABLE (1 byte) - 52
+	buf.WriteByte(0)
+	// ACPI_DISABLE (1 byte) - 53
+	buf.WriteByte(0)
+	// S4BIOS_REQ (1 byte) - 54
+	buf.WriteByte(0)
+	// PSTATE_CNT (1 byte) - 55
+	buf.WriteByte(0)
+
+	// PM1a_EVT_BLK (4 bytes) - 56
+	binary.Write(buf, binary.LittleEndian, uint32(0))
+	// PM1b_EVT_BLK (4 bytes) - 60
+	binary.Write(buf, binary.LittleEndian, uint32(0))
+	// PM1a_CNT_BLK (4 bytes) - 64
+	binary.Write(buf, binary.LittleEndian, uint32(0))
+	// PM1b_CNT_BLK (4 bytes) - 68
+	binary.Write(buf, binary.LittleEndian, uint32(0))
+	// PM2_CNT_BLK (4 bytes) - 72
+	binary.Write(buf, binary.LittleEndian, uint32(0))
+	// PM_TMR_BLK (4 bytes) - 76
+	binary.Write(buf, binary.LittleEndian, uint32(0))
+
+	// GPE0_BLK (4 bytes) - 80
+	binary.Write(buf, binary.LittleEndian, uint32(0))
+	// GPE1_BLK (4 bytes) - 84
+	binary.Write(buf, binary.LittleEndian, uint32(0))
+
+	// PM1_EVT_LEN (1 byte) - 88
+	buf.WriteByte(0)
+	// PM1_CNT_LEN (1 byte) - 89
+	buf.WriteByte(0)
+	// PM2_CNT_LEN (1 byte) - 90
+	buf.WriteByte(0)
+	// PM_TMR_LEN (1 byte) - 91
+	buf.WriteByte(0)
+	// GPE0_BLK_LEN (1 byte) - 92
+	buf.WriteByte(0)
+	// GPE1_BLK_LEN (1 byte) - 93
+	buf.WriteByte(0)
+	// GPE1_BASE (1 byte) - 94
+	buf.WriteByte(0)
+
+	// CST_CNT (1 byte) - 95
+	buf.WriteByte(0)
+	// P_LVL2_LAT (2 bytes) - 96
+	binary.Write(buf, binary.LittleEndian, uint16(0))
+	// P_LVL3_LAT (2 bytes) - 98
+	binary.Write(buf, binary.LittleEndian, uint16(0))
+	// FLUSH_SIZE (2 bytes) - 100
+	binary.Write(buf, binary.LittleEndian, uint16(0))
+	// FLUSH_STRIDE (2 bytes) - 102
+	binary.Write(buf, binary.LittleEndian, uint16(0))
+	// DUTY_OFFSET (1 byte) - 104
+	buf.WriteByte(0)
+	// DUTY_WIDTH (1 byte) - 105
+	buf.WriteByte(0)
+	// DAY_ALRM (1 byte) - 106
+	buf.WriteByte(0)
+	// MON_ALRM (1 byte) - 107
+	buf.WriteByte(0)
+	// CENTURY (1 byte) - 108
+	buf.WriteByte(0)
+
+	// IAPC_BOOT_ARCH (2 bytes) - 109
+	// Bit 0: LEGACY_DEVICES (has 8042 kbd controller)
+	// Bit 1: 8042 (1)
+	// Bit 4: VGA Not Present (0 - we have VGA usually)
+	binary.Write(buf, binary.LittleEndian, uint16(3)) // Legacy + 8042
+
+	// Reserved (1 byte) - 111
+	buf.WriteByte(0)
+
+	// Flags (4 bytes) - 112
+	// Bit 20: HW_REDUCED_ACPI (1) - Since we have no PM timer/buttons
+	binary.Write(buf, binary.LittleEndian, uint32(1<<20))
+
+	// RESET_REG (12 bytes, GAS) - 116
+	// Reset via IO port 0xCF9 (standard PCI reset) or 0x64 (KBC)
+	buf.Write([]byte{1, 8, 0, 0}) // IO space
+	binary.Write(buf, binary.LittleEndian, uint64(0xCF9))
+
+	// RESET_VALUE (1 byte) - 128
+	buf.WriteByte(6) // Warm reset
+
+	// ARM_BOOT_ARCH (2 bytes) - 129
+	binary.Write(buf, binary.LittleEndian, uint16(0))
+
+	// FADT Minor Version (1 byte) - 131
+	buf.WriteByte(1)
+
+	// X_FIRMWARE_CTRL (8 bytes) - 132
+	binary.Write(buf, binary.LittleEndian, uint64(0))
+
+	// X_DSDT (8 bytes) - 140 (64-bit pointer)
+	binary.Write(buf, binary.LittleEndian, uint64(dsdtAddr))
+
+	// ... P_BLK fields would go here, simplified ...
+
+	// We need to pad to at least 244 bytes for ACPI 5.0
+	currentLen := buf.Len()
+	if currentLen < 244 {
+		padding := make([]byte, 244-currentLen)
+		buf.Write(padding)
+	}
+
+	return finalizeSDT(buf)
 }
 
 // ----------------- MADT (APIC) -----------------
 
 func BuildMADT(lapicBase uint32, ioapicID uint8, ioapicAddr uint32, gsiBase uint32) []byte {
-	// We'll build into a buffer then fix length/checksum
-	h := makeSDT("APIC", 44, 1, "TINYRAPC")
-	buf := bytes.NewBuffer(h)
+	// Header
+	buf := makeSDT("APIC", 1, "TINYRAPC")
 
-	// MADT fields
-	binary.Write(buf, binary.LittleEndian, lapicBase) // Local APIC Address
-	// Flags: PC-AT compat (bit0)
+	// --- MADT Body ---
+
+	// Local APIC Address (4 bytes) - Offset 36
+	binary.Write(buf, binary.LittleEndian, lapicBase)
+
+	// Flags (4 bytes) - Offset 40. PC-AT compat (bit0)
+	// We set this to 1 to indicate we support 8259A legacy PICs.
 	binary.Write(buf, binary.LittleEndian, uint32(1))
 
-	// --- Processor Local APIC (type 0) for CPU0 only ---
+	// --- Structures start at Offset 44 ---
+
+	// 1. Processor Local APIC (Type 0) - generated outside typically, but we assume CPU0 here for example
+	// In reality you loop this for all CPUs.
 	buf.WriteByte(0)                                  // Type
 	buf.WriteByte(8)                                  // Length
 	buf.WriteByte(0)                                  // ACPI Processor ID
 	buf.WriteByte(0)                                  // APIC ID
 	binary.Write(buf, binary.LittleEndian, uint32(1)) // Flags: enabled
 
-	// --- IOAPIC (type 1) ---
-	buf.WriteByte(1)  // Type
-	buf.WriteByte(12) // Length
-	buf.WriteByte(ioapicID)
-	buf.WriteByte(0) // reserved
-	binary.Write(buf, binary.LittleEndian, ioapicAddr)
-	binary.Write(buf, binary.LittleEndian, gsiBase)
+	// 2. I/O APIC (Type 1) [NEW]
+	buf.WriteByte(1)                                   // Type
+	buf.WriteByte(12)                                  // Length
+	buf.WriteByte(ioapicID)                            // IOAPIC ID
+	buf.WriteByte(0)                                   // Reserved
+	binary.Write(buf, binary.LittleEndian, ioapicAddr) // Address (0xFEC00000)
+	binary.Write(buf, binary.LittleEndian, gsiBase)    // GSI Base (0)
 
-	out := buf.Bytes()
-	binary.LittleEndian.PutUint32(out[4:], uint32(len(out)))
-	acpiChecksum(out)
-	return out
+	// 3. Interrupt Source Override (Type 2) [NEW]
+	// Critical: Remap ISA IRQ 0 (PIT) to GSI 2
+	buf.WriteByte(2)                                  // Type
+	buf.WriteByte(10)                                 // Length
+	buf.WriteByte(0)                                  // Bus (0=ISA)
+	buf.WriteByte(0)                                  // Source (IRQ 0)
+	binary.Write(buf, binary.LittleEndian, uint32(2)) // Global System Interrupt
+	binary.Write(buf, binary.LittleEndian, uint16(0)) // Flags (0=Conform to bus specs)
+
+	return finalizeSDT(buf)
 }
 
 // ----------------- HPET table -----------------
 
 func BuildHPET(acpiHPETAddr uint64, hpetGSI uint32) []byte {
-	// HPET table is 56 bytes for minimal implementation
-	b := makeSDT("HPET", 56, 1, "TINYRHPT")
+	// HPET header
+	buf := makeSDT("HPET", 1, "TINYRHPT")
 
-	if len(b) != 56 {
-		panic("HPET table must be 56 bytes")
-	}
+	// Event Timer Block ID (offset 36) [UPDATED]
+	// 31:16 = Vendor (0x8086)
+	// 15 = Legacy Replacement Route Capable (1)
+	// 13 = Count Size Cap (1 = 64-bit)
+	// 12:8 = Num Comparators - 1 (2 => 3 timers)
+	// 7:0 = Hardare Rev (1)
+	// Value: 0x8086A201
+	binary.Write(buf, binary.LittleEndian, uint32(0x8086A201))
 
-	// offset 36: Hardware ID (UINT32)
-	//   Bits 0-15: vendor id, 16-31: device id. We'll use Intel/1.
-	binary.LittleEndian.PutUint32(b[36:], 0x80860001)
+	// Base Address (ACPI Generic Address Structure - 12 bytes) (offset 40)
+	// [SpaceID(1), BitWidth(1), BitOffset(1), AccessSize(1), Address(8)]
+	buf.WriteByte(0)  // 0=System Memory
+	buf.WriteByte(64) // Bit Width
+	buf.WriteByte(0)  // Bit Offset
+	buf.WriteByte(0)  // Access Size
+	binary.Write(buf, binary.LittleEndian, acpiHPETAddr)
 
-	// offset 40: base address (ACPI Generic Address Structure, 12 bytes)
-	// GAS: [SpaceID(1), BitWidth(1), BitOffset(1), AccessSize(1), Address(8)]
-	// We'll say system memory, 64-bit, address HPET_BASE
-	gas := make([]byte, 12)
-	gas[0] = 0  // System Memory
-	gas[1] = 64 // bit width
-	gas[2] = 0  // bit offset
-	gas[3] = 0  // access size (undefined or 0)
-	binary.LittleEndian.PutUint64(gas[4:], acpiHPETAddr)
-	copy(b[40:], gas)
+	// HPET Number (offset 52)
+	buf.WriteByte(0)
 
-	// offset 52: HPET Number (uint8)
-	b[52] = 0
+	// Main Counter Minimum Clock Tick (offset 53)
+	binary.Write(buf, binary.LittleEndian, uint16(0x0080))
 
-	// offset 53: Minimum Clock Tick in periodic mode (uint16 at 53..54)
-	binary.LittleEndian.PutUint16(b[53:], 0x0080) // arbitrary small-ish value
+	// Page Protection (offset 55)
+	buf.WriteByte(0) // No page protection
 
-	// offset 55: Page Protection (uint8)
-	b[55] = 0
-
-	acpiChecksum(b)
-	return b
+	return finalizeSDT(buf)
 }

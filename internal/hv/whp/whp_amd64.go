@@ -250,7 +250,7 @@ func (vm *virtualMachine) installACPI() error {
 	hpetAddr := acpiBase + 0x0200
 
 	// 2. Build tables
-	madt := BuildMADT(0xFEE00000, 0, ioapicBaseAddress, 0)
+	madt := BuildMADT(0xFEE00000, 0, 0, 0)
 	hpet := BuildHPET(hpetBaseAddress, 2)
 	xsdt := BuildXSDT([]uint64{
 		uint64(madtAddr),
@@ -304,8 +304,11 @@ func (h *hypervisor) archVMInitWithMemory(vm *virtualMachine, config hv.VMConfig
 		if err := vm.installACPI(); err != nil {
 			return fmt.Errorf("install ACPI tables: %w", err)
 		}
-		if err := vm.AddDevice(newHPETDevice(hpetBaseAddress)); err != nil {
+		if err := vm.AddDevice(NewHPETDevice(hpetBaseAddress, vm)); err != nil {
 			return fmt.Errorf("add HPET device: %w", err)
+		}
+		if err := vm.AddDevice(NewIOAPIC(ioapicBaseAddress, 0, vm)); err != nil {
+			return fmt.Errorf("add IOAPIC device: %w", err)
 		}
 	}
 
@@ -530,6 +533,18 @@ func (v *virtualMachine) PulseIRQ(irqLine uint32) error {
 		),
 		Destination: 0, // TODO(joshua): Move this to target vCPU ID?
 		Vector:      irqLine,
+	})
+}
+
+func (v *virtualMachine) RequestInterrupt(dest uint32, vector uint32, intType bindings.InterruptType, destMode uint32) error {
+	return bindings.RequestInterrupt(v.part, &bindings.InterruptControl{
+		Control: bindings.MakeInterruptControlKind(
+			intType,
+			bindings.InterruptDestinationMode(destMode),
+			bindings.InterruptTriggerEdge,
+		),
+		Destination: dest,
+		Vector:      vector,
 	})
 }
 
