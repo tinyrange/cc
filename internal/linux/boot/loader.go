@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 
@@ -264,17 +265,15 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 		start uint16
 		end   uint16
 	}{
-		{0x0, 0x1f},
+		{0x0, 0xf},
+		{0x11, 0x1f},
 		{0x80, 0x8f},
+		{0xBD, 0xBD}, // scratch port
 		{0x2e8, 0x2ef},
 		{0x3e8, 0x3ef},
 		{0xbb00, 0xbbff},
 	} {
 		for port := rng.start; port <= rng.end; port++ {
-			if port == 0x10 {
-				// Handled by ResetControlPort.
-				continue
-			}
 			legacyPorts = append(legacyPorts, port)
 		}
 	}
@@ -282,12 +281,14 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	legacy := hv.SimpleX86IOPortDevice{
 		Ports: legacyPorts,
 		ReadFunc: func(port uint16, data []byte) error {
+			slog.Info("legacy port read", "port", fmt.Sprintf("0x%04x", port), "size", len(data))
 			for i := range data {
 				data[i] = 0
 			}
 			return nil
 		},
 		WriteFunc: func(port uint16, data []byte) error {
+			slog.Info("legacy port write", "port", fmt.Sprintf("0x%04x", port), "size", len(data), "data", data)
 			return nil
 		},
 	}

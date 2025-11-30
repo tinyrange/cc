@@ -694,6 +694,8 @@ func (q *bringUpQuest) RunLinux() error {
 			cmdline = []string{
 				"console=ttyS0,115200n8",
 				"earlycon=uart8250,io,0x3f8,115200,keep",
+				"tsc=reliable",
+				"tsc_early_khz=3000000",
 			}
 		}
 	default:

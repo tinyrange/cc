@@ -224,31 +224,44 @@ func (d *mmioDevice) checkMMIOBounds(addr, length uint64) error {
 }
 
 func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
+	// Helper logger
+	logAccess := func(name string) {
+		slog.Info("virtio-mmio: write", "reg", name, "val", fmt.Sprintf("%#x", value), "queue_sel", d.queueSel)
+	}
+
 	switch offset {
 	case VIRTIO_MMIO_DEVICE_FEATURES_SEL:
 		d.deviceFeatureSel = value
 	case VIRTIO_MMIO_DRIVER_FEATURES_SEL:
 		d.driverFeatureSel = value
 	case VIRTIO_MMIO_DRIVER_FEATURES:
+		logAccess("DRIVER_FEATURES")
 		if d.driverFeatureSel < uint32(len(d.driverFeatures)) {
 			d.driverFeatures[d.driverFeatureSel] = value
 		}
 	case VIRTIO_MMIO_QUEUE_SEL:
+		logAccess("QUEUE_SEL")
 		d.queueSel = value
 	case VIRTIO_MMIO_QUEUE_NUM:
+		logAccess("QUEUE_NUM")
 		if q := d.currentQueue(); q != nil {
-			if value == 0 || value > uint32(q.maxSize) {
+			// RELAXATION: Linux might write 0 during reset. Don't error, just accept it.
+			if value > uint32(q.maxSize) {
+				slog.Error("virtio-mmio: invalid queue size", "size", value, "max", q.maxSize)
 				return fmt.Errorf("queue size %d invalid", value)
 			}
 			q.size = uint16(value)
 		}
 	case VIRTIO_MMIO_QUEUE_READY:
+		logAccess("QUEUE_READY")
 		if q := d.currentQueue(); q != nil {
 			if value&0x1 == 0 {
 				q.reset()
 				return nil
 			}
 			if q.size == 0 {
+				// LOG THE FAILURE HERE
+				slog.Error("virtio-mmio: attempt to ready queue with size 0", "idx", d.queueSel)
 				return fmt.Errorf("queue ready set before queue size")
 			}
 			q.ready = true
@@ -289,6 +302,10 @@ func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
 			return nil
 		}
 		d.deviceStatus = value
+	case 0x040: // VIRTIO_MMIO_QUEUE_PFN (Legacy)
+		slog.Warn("virtio-mmio: linux attempted legacy PFN write - we are modern only!")
+		// If you see this log, your Feature Negotiation (Bit 32) is failing.
+		return nil
 	default:
 		if d.handler != nil {
 			handled, err := d.handler.WriteConfig(d, offset, value)
