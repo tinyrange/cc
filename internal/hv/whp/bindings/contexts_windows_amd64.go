@@ -2,7 +2,10 @@
 
 package bindings
 
-import "unsafe"
+import (
+	"fmt"
+	"unsafe"
+)
 
 // RunVPExitReason mirrors WHV_RUN_VP_EXIT_REASON.
 type RunVPExitReason uint32
@@ -17,14 +20,18 @@ const (
 	RunVPExitReasonX64InterruptWindow     RunVPExitReason = 0x00000007
 	RunVPExitReasonX64Halt                RunVPExitReason = 0x00000008
 	RunVPExitReasonX64ApicEoi             RunVPExitReason = 0x00000009
-	RunVPExitReasonX64MsrAccess           RunVPExitReason = 0x00001000
-	RunVPExitReasonX64Cpuid               RunVPExitReason = 0x00001001
-	RunVPExitReasonException              RunVPExitReason = 0x00001002
-	RunVPExitReasonX64Rdtsc               RunVPExitReason = 0x00001003
-	RunVPExitReasonX64ApicSmiTrap         RunVPExitReason = 0x00001004
-	RunVPExitReasonHypercall              RunVPExitReason = 0x00001005
-	RunVPExitReasonX64ApicInitSipiTrap    RunVPExitReason = 0x00001006
-	RunVPExitReasonCanceled               RunVPExitReason = 0x00002001
+	RunVPExitReasonSynicSintDeliverable   RunVPExitReason = 0x0000000A // Added in newer versions
+
+	RunVPExitReasonX64MsrAccess        RunVPExitReason = 0x00001000
+	RunVPExitReasonX64Cpuid            RunVPExitReason = 0x00001001
+	RunVPExitReasonException           RunVPExitReason = 0x00001002
+	RunVPExitReasonX64Rdtsc            RunVPExitReason = 0x00001003
+	RunVPExitReasonX64ApicSmiTrap      RunVPExitReason = 0x00001004
+	RunVPExitReasonHypercall           RunVPExitReason = 0x00001005
+	RunVPExitReasonX64ApicInitSipiTrap RunVPExitReason = 0x00001006
+	RunVPExitReasonX64ApicWriteTrap    RunVPExitReason = 0x00001007 // Added in newer versions
+
+	RunVPExitReasonCanceled RunVPExitReason = 0x00002001
 )
 
 func (r RunVPExitReason) String() string {
@@ -47,6 +54,8 @@ func (r RunVPExitReason) String() string {
 		return "X64Halt"
 	case RunVPExitReasonX64ApicEoi:
 		return "X64ApicEoi"
+	case RunVPExitReasonSynicSintDeliverable:
+		return "SynicSintDeliverable"
 	case RunVPExitReasonX64MsrAccess:
 		return "X64MsrAccess"
 	case RunVPExitReasonX64Cpuid:
@@ -61,19 +70,43 @@ func (r RunVPExitReason) String() string {
 		return "Hypercall"
 	case RunVPExitReasonX64ApicInitSipiTrap:
 		return "X64ApicInitSipiTrap"
+	case RunVPExitReasonX64ApicWriteTrap:
+		return "X64ApicWriteTrap"
 	case RunVPExitReasonCanceled:
 		return "Canceled"
 	default:
-		return "Unknown"
+		return fmt.Sprintf("Unknown(%d)", r)
 	}
 }
+
+// SegmentRegister mirrors WHV_X64_SEGMENT_REGISTER (16 bytes).
+type SegmentRegister struct {
+	Base       uint64
+	Limit      uint32
+	Selector   uint16
+	Attributes uint16 // Bitfield
+}
+
+// RunVPExitContext mirrors WHV_RUN_VP_EXIT_CONTEXT.
+// Size is exactly 224 bytes on AMD64.
+type RunVPExitContext struct {
+	ExitReason RunVPExitReason
+	Reserved   uint32
+	VpContext  VPExitContext
+	// The C union starts here. Total struct size 224 - 48 (header) = 176 bytes payload.
+	unionPayload [176]byte
+}
+
+// -------------------------------------------------------------------------
+// Union Member Accessors
+// -------------------------------------------------------------------------
 
 // MemoryAccessInfo mirrors WHV_MEMORY_ACCESS_INFO.
 type MemoryAccessInfo struct {
 	AsUINT32 uint32
 }
 
-// MemoryAccessContext mirrors WHV_MEMORY_ACCESS_CONTEXT.
+// MemoryAccessContext mirrors WHV_MEMORY_ACCESS_CONTEXT (40 bytes).
 type MemoryAccessContext struct {
 	InstructionByteCount uint8
 	Reserved             [3]uint8
@@ -83,75 +116,81 @@ type MemoryAccessContext struct {
 	Gva                  GuestVirtualAddress
 }
 
-// RunVPExitContext mirrors WHV_RUN_VP_EXIT_CONTEXT.
-type RunVPExitContext struct {
-	ExitReason RunVPExitReason
-	Reserved   uint32
-	VpContext  VPExitContext
-	payload    [176]byte
-}
-
-// MemoryAccess returns the WHV_MEMORY_ACCESS_CONTEXT view of the payload.
 func (c *RunVPExitContext) MemoryAccess() *MemoryAccessContext {
-	return (*MemoryAccessContext)(unsafe.Pointer(&c.payload[0]))
+	return (*MemoryAccessContext)(unsafe.Pointer(&c.unionPayload[0]))
 }
 
-// IoPortAccess returns the WHV_X64_IO_PORT_ACCESS_CONTEXT view of the payload.
+// X64IoPortAccessInfo mirrors WHV_X64_IO_PORT_ACCESS_INFO.
+type X64IoPortAccessInfo struct {
+	AsUINT32 uint32
+}
+
 func (c *RunVPExitContext) IoPortAccess() *X64IOPortAccessContext {
-	return (*X64IOPortAccessContext)(unsafe.Pointer(&c.payload[0]))
+	return (*X64IOPortAccessContext)(unsafe.Pointer(&c.unionPayload[0]))
 }
 
-// MsrAccess returns the WHV_X64_MSR_ACCESS_CONTEXT view of the payload.
 func (c *RunVPExitContext) MsrAccess() *X64MsrAccessContext {
-	return (*X64MsrAccessContext)(unsafe.Pointer(&c.payload[0]))
+	return (*X64MsrAccessContext)(unsafe.Pointer(&c.unionPayload[0]))
 }
 
-// CpuidAccess returns the WHV_X64_CPUID_ACCESS_CONTEXT view of the payload.
 func (c *RunVPExitContext) CpuidAccess() *X64CpuidAccessContext {
-	return (*X64CpuidAccessContext)(unsafe.Pointer(&c.payload[0]))
+	return (*X64CpuidAccessContext)(unsafe.Pointer(&c.unionPayload[0]))
 }
 
-// VpException returns the WHV_VP_EXCEPTION_CONTEXT view of the payload.
 func (c *RunVPExitContext) VpException() *VPExceptionContext {
-	return (*VPExceptionContext)(unsafe.Pointer(&c.payload[0]))
+	return (*VPExceptionContext)(unsafe.Pointer(&c.unionPayload[0]))
 }
 
-// InterruptWindow returns the WHV_X64_INTERRUPTION_DELIVERABLE_CONTEXT view.
 func (c *RunVPExitContext) InterruptWindow() *X64InterruptionDeliverableContext {
-	return (*X64InterruptionDeliverableContext)(unsafe.Pointer(&c.payload[0]))
+	return (*X64InterruptionDeliverableContext)(unsafe.Pointer(&c.unionPayload[0]))
 }
 
-// UnsupportedFeature returns the WHV_X64_UNSUPPORTED_FEATURE_CONTEXT view.
 func (c *RunVPExitContext) UnsupportedFeature() *X64UnsupportedFeatureContext {
-	return (*X64UnsupportedFeatureContext)(unsafe.Pointer(&c.payload[0]))
+	return (*X64UnsupportedFeatureContext)(unsafe.Pointer(&c.unionPayload[0]))
 }
 
-// CancelReason returns the WHV_RUN_VP_CANCELED_CONTEXT view.
 func (c *RunVPExitContext) CancelReason() *RunVPCanceledContext {
-	return (*RunVPCanceledContext)(unsafe.Pointer(&c.payload[0]))
+	return (*RunVPCanceledContext)(unsafe.Pointer(&c.unionPayload[0]))
 }
 
-// ApicEoi returns the WHV_X64_APIC_EOI_CONTEXT view.
 func (c *RunVPExitContext) ApicEoi() *X64ApicEoiContext {
-	return (*X64ApicEoiContext)(unsafe.Pointer(&c.payload[0]))
+	return (*X64ApicEoiContext)(unsafe.Pointer(&c.unionPayload[0]))
 }
 
-// ReadTsc returns the WHV_X64_RDTSC_CONTEXT view.
 func (c *RunVPExitContext) ReadTsc() *X64RdtscContext {
-	return (*X64RdtscContext)(unsafe.Pointer(&c.payload[0]))
+	return (*X64RdtscContext)(unsafe.Pointer(&c.unionPayload[0]))
 }
 
-// ApicSmi returns the WHV_X64_APIC_SMI_CONTEXT view.
 func (c *RunVPExitContext) ApicSmi() *X64ApicSmiContext {
-	return (*X64ApicSmiContext)(unsafe.Pointer(&c.payload[0]))
+	return (*X64ApicSmiContext)(unsafe.Pointer(&c.unionPayload[0]))
 }
 
-// Hypercall returns the WHV_HYPERCALL_CONTEXT view.
 func (c *RunVPExitContext) Hypercall() *HypercallContext {
-	return (*HypercallContext)(unsafe.Pointer(&c.payload[0]))
+	return (*HypercallContext)(unsafe.Pointer(&c.unionPayload[0]))
 }
 
-// ApicInitSipi returns the WHV_X64_APIC_INIT_SIPI_CONTEXT view.
 func (c *RunVPExitContext) ApicInitSipi() *X64ApicInitSipiContext {
-	return (*X64ApicInitSipiContext)(unsafe.Pointer(&c.payload[0]))
+	return (*X64ApicInitSipiContext)(unsafe.Pointer(&c.unionPayload[0]))
+}
+
+// X64ApicWriteContext mirrors WHV_X64_APIC_WRITE_CONTEXT (16 bytes).
+type X64ApicWriteContext struct {
+	Type       uint32 // WHV_X64_APIC_WRITE_TYPE
+	Reserved   uint32
+	WriteValue uint64
+}
+
+func (c *RunVPExitContext) ApicWrite() *X64ApicWriteContext {
+	return (*X64ApicWriteContext)(unsafe.Pointer(&c.unionPayload[0]))
+}
+
+// SynicSintDeliverableContext mirrors WHV_SYNIC_SINT_DELIVERABLE_CONTEXT (8 bytes).
+type SynicSintDeliverableContext struct {
+	DeliverableSints uint16
+	Reserved1        uint16
+	Reserved2        uint32
+}
+
+func (c *RunVPExitContext) SynicSintDeliverable() *SynicSintDeliverableContext {
+	return (*SynicSintDeliverableContext)(unsafe.Pointer(&c.unionPayload[0]))
 }

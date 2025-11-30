@@ -11,35 +11,97 @@ import (
 var (
 	modWinHvPlatform = syscall.NewLazyDLL("winhvplatform.dll")
 
-	procWHvGetCapability                                = modWinHvPlatform.NewProc("WHvGetCapability")
-	procWHvCreatePartition                              = modWinHvPlatform.NewProc("WHvCreatePartition")
-	procWHvSetupPartition                               = modWinHvPlatform.NewProc("WHvSetupPartition")
-	procWHvDeletePartition                              = modWinHvPlatform.NewProc("WHvDeletePartition")
-	procWHvGetPartitionProperty                         = modWinHvPlatform.NewProc("WHvGetPartitionProperty")
-	procWHvSetPartitionProperty                         = modWinHvPlatform.NewProc("WHvSetPartitionProperty")
-	procWHvSuspendPartitionTime                         = modWinHvPlatform.NewProc("WHvSuspendPartitionTime")
-	procWHvResumePartitionTime                          = modWinHvPlatform.NewProc("WHvResumePartitionTime")
-	procWHvMapGpaRange                                  = modWinHvPlatform.NewProc("WHvMapGpaRange")
-	procWHvUnmapGpaRange                                = modWinHvPlatform.NewProc("WHvUnmapGpaRange")
-	procWHvTranslateGva                                 = modWinHvPlatform.NewProc("WHvTranslateGva")
-	procWHvCreateVirtualProcessor                       = modWinHvPlatform.NewProc("WHvCreateVirtualProcessor")
-	procWHvDeleteVirtualProcessor                       = modWinHvPlatform.NewProc("WHvDeleteVirtualProcessor")
-	procWHvRunVirtualProcessor                          = modWinHvPlatform.NewProc("WHvRunVirtualProcessor")
-	procWHvCancelRunVirtualProcessor                    = modWinHvPlatform.NewProc("WHvCancelRunVirtualProcessor")
-	procWHvGetVirtualProcessorRegisters                 = modWinHvPlatform.NewProc("WHvGetVirtualProcessorRegisters")
-	procWHvSetVirtualProcessorRegisters                 = modWinHvPlatform.NewProc("WHvSetVirtualProcessorRegisters")
+	// Platform Capabilities
+	procWHvGetCapability = modWinHvPlatform.NewProc("WHvGetCapability")
+
+	// Partition Management
+	procWHvCreatePartition      = modWinHvPlatform.NewProc("WHvCreatePartition")
+	procWHvSetupPartition       = modWinHvPlatform.NewProc("WHvSetupPartition")
+	procWHvResetPartition       = modWinHvPlatform.NewProc("WHvResetPartition")
+	procWHvDeletePartition      = modWinHvPlatform.NewProc("WHvDeletePartition")
+	procWHvGetPartitionProperty = modWinHvPlatform.NewProc("WHvGetPartitionProperty")
+	procWHvSetPartitionProperty = modWinHvPlatform.NewProc("WHvSetPartitionProperty")
+	procWHvSuspendPartitionTime = modWinHvPlatform.NewProc("WHvSuspendPartitionTime")
+	procWHvResumePartitionTime  = modWinHvPlatform.NewProc("WHvResumePartitionTime")
+
+	// Memory Management
+	procWHvMapGpaRange              = modWinHvPlatform.NewProc("WHvMapGpaRange")
+	procWHvMapGpaRange2             = modWinHvPlatform.NewProc("WHvMapGpaRange2")
+	procWHvUnmapGpaRange            = modWinHvPlatform.NewProc("WHvUnmapGpaRange")
+	procWHvTranslateGva             = modWinHvPlatform.NewProc("WHvTranslateGva")
+	procWHvQueryGpaRangeDirtyBitmap = modWinHvPlatform.NewProc("WHvQueryGpaRangeDirtyBitmap")
+	procWHvAdviseGpaRange           = modWinHvPlatform.NewProc("WHvAdviseGpaRange")
+	procWHvReadGpaRange             = modWinHvPlatform.NewProc("WHvReadGpaRange")
+	procWHvWriteGpaRange            = modWinHvPlatform.NewProc("WHvWriteGpaRange")
+
+	// Virtual Processors
+	procWHvCreateVirtualProcessor       = modWinHvPlatform.NewProc("WHvCreateVirtualProcessor")
+	procWHvCreateVirtualProcessor2      = modWinHvPlatform.NewProc("WHvCreateVirtualProcessor2")
+	procWHvDeleteVirtualProcessor       = modWinHvPlatform.NewProc("WHvDeleteVirtualProcessor")
+	procWHvRunVirtualProcessor          = modWinHvPlatform.NewProc("WHvRunVirtualProcessor")
+	procWHvCancelRunVirtualProcessor    = modWinHvPlatform.NewProc("WHvCancelRunVirtualProcessor")
+	procWHvGetVirtualProcessorRegisters = modWinHvPlatform.NewProc("WHvGetVirtualProcessorRegisters")
+	procWHvSetVirtualProcessorRegisters = modWinHvPlatform.NewProc("WHvSetVirtualProcessorRegisters")
+	procWHvGetVirtualProcessorState     = modWinHvPlatform.NewProc("WHvGetVirtualProcessorState")
+	procWHvSetVirtualProcessorState     = modWinHvPlatform.NewProc("WHvSetVirtualProcessorState")
+
+	// Interrupts & Synic
+	procWHvRequestInterrupt                 = modWinHvPlatform.NewProc("WHvRequestInterrupt")
+	procWHvSignalVirtualProcessorSynicEvent = modWinHvPlatform.NewProc("WHvSignalVirtualProcessorSynicEvent")
+	procWHvPostVirtualProcessorSynicMessage = modWinHvPlatform.NewProc("WHvPostVirtualProcessorSynicMessage")
+
+	// Counters
+	procWHvGetPartitionCounters        = modWinHvPlatform.NewProc("WHvGetPartitionCounters")
+	procWHvGetVirtualProcessorCounters = modWinHvPlatform.NewProc("WHvGetVirtualProcessorCounters")
+
+	// Virtual PCI (VPCI)
+	procWHvAllocateVpciResource         = modWinHvPlatform.NewProc("WHvAllocateVpciResource")
+	procWHvCreateVpciDevice             = modWinHvPlatform.NewProc("WHvCreateVpciDevice")
+	procWHvDeleteVpciDevice             = modWinHvPlatform.NewProc("WHvDeleteVpciDevice")
+	procWHvGetVpciDeviceProperty        = modWinHvPlatform.NewProc("WHvGetVpciDeviceProperty")
+	procWHvGetVpciDeviceNotification    = modWinHvPlatform.NewProc("WHvGetVpciDeviceNotification")
+	procWHvMapVpciDeviceMmioRanges      = modWinHvPlatform.NewProc("WHvMapVpciDeviceMmioRanges")
+	procWHvUnmapVpciDeviceMmioRanges    = modWinHvPlatform.NewProc("WHvUnmapVpciDeviceMmioRanges")
+	procWHvSetVpciDevicePowerState      = modWinHvPlatform.NewProc("WHvSetVpciDevicePowerState")
+	procWHvReadVpciDeviceRegister       = modWinHvPlatform.NewProc("WHvReadVpciDeviceRegister")
+	procWHvWriteVpciDeviceRegister      = modWinHvPlatform.NewProc("WHvWriteVpciDeviceRegister")
+	procWHvMapVpciDeviceInterrupt       = modWinHvPlatform.NewProc("WHvMapVpciDeviceInterrupt")
+	procWHvUnmapVpciDeviceInterrupt     = modWinHvPlatform.NewProc("WHvUnmapVpciDeviceInterrupt")
+	procWHvRetargetVpciDeviceInterrupt  = modWinHvPlatform.NewProc("WHvRetargetVpciDeviceInterrupt")
+	procWHvRequestVpciDeviceInterrupt   = modWinHvPlatform.NewProc("WHvRequestVpciDeviceInterrupt")
+	procWHvGetVpciDeviceInterruptTarget = modWinHvPlatform.NewProc("WHvGetVpciDeviceInterruptTarget")
+
+	// Triggers
+	procWHvCreateTrigger           = modWinHvPlatform.NewProc("WHvCreateTrigger")
+	procWHvUpdateTriggerParameters = modWinHvPlatform.NewProc("WHvUpdateTriggerParameters")
+	procWHvDeleteTrigger           = modWinHvPlatform.NewProc("WHvDeleteTrigger")
+
+	// Notification Ports
+	procWHvCreateNotificationPort      = modWinHvPlatform.NewProc("WHvCreateNotificationPort")
+	procWHvSetNotificationPortProperty = modWinHvPlatform.NewProc("WHvSetNotificationPortProperty")
+	procWHvDeleteNotificationPort      = modWinHvPlatform.NewProc("WHvDeleteNotificationPort")
+
+	// Migration
+	procWHvStartPartitionMigration    = modWinHvPlatform.NewProc("WHvStartPartitionMigration")
+	procWHvCancelPartitionMigration   = modWinHvPlatform.NewProc("WHvCancelPartitionMigration")
+	procWHvCompletePartitionMigration = modWinHvPlatform.NewProc("WHvCompletePartitionMigration")
+	procWHvAcceptPartitionMigration   = modWinHvPlatform.NewProc("WHvAcceptPartitionMigration")
+
+	// Deprecated / Legacy Wrappers (Maintained for compatibility)
 	procWHvGetVirtualProcessorInterruptControllerState  = modWinHvPlatform.NewProc("WHvGetVirtualProcessorInterruptControllerState")
 	procWHvSetVirtualProcessorInterruptControllerState  = modWinHvPlatform.NewProc("WHvSetVirtualProcessorInterruptControllerState")
-	procWHvRequestInterrupt                             = modWinHvPlatform.NewProc("WHvRequestInterrupt")
 	procWHvGetVirtualProcessorXsaveState                = modWinHvPlatform.NewProc("WHvGetVirtualProcessorXsaveState")
 	procWHvSetVirtualProcessorXsaveState                = modWinHvPlatform.NewProc("WHvSetVirtualProcessorXsaveState")
-	procWHvQueryGpaRangeDirtyBitmap                     = modWinHvPlatform.NewProc("WHvQueryGpaRangeDirtyBitmap")
-	procWHvGetPartitionCounters                         = modWinHvPlatform.NewProc("WHvGetPartitionCounters")
-	procWHvGetVirtualProcessorCounters                  = modWinHvPlatform.NewProc("WHvGetVirtualProcessorCounters")
 	procWHvGetVirtualProcessorInterruptControllerState2 = modWinHvPlatform.NewProc("WHvGetVirtualProcessorInterruptControllerState2")
 	procWHvSetVirtualProcessorInterruptControllerState2 = modWinHvPlatform.NewProc("WHvSetVirtualProcessorInterruptControllerState2")
 	procWHvRegisterPartitionDoorbellEvent               = modWinHvPlatform.NewProc("WHvRegisterPartitionDoorbellEvent")
 	procWHvUnregisterPartitionDoorbellEvent             = modWinHvPlatform.NewProc("WHvUnregisterPartitionDoorbellEvent")
+)
+
+// AMD64 Specific Procs
+var (
+	procWHvGetVirtualProcessorCpuidOutput = modWinHvPlatform.NewProc("WHvGetVirtualProcessorCpuidOutput")
+	procWHvGetInterruptTargetVpSet        = modWinHvPlatform.NewProc("WHvGetInterruptTargetVpSet")
 )
 
 func toHRESULT(r uintptr) HRESULT {
@@ -82,7 +144,7 @@ func GetCapabilityUnsafe[T any](code CapabilityCode) (T, error) {
 }
 
 func IsHypervisorPresent() (bool, error) {
-	var present uint32
+	var present uint32 // Using uint32 for BOOL
 	written, err := GetCapability(
 		CapabilityCodeHypervisorPresent,
 		unsafe.Pointer(&present),
@@ -107,6 +169,12 @@ func CreatePartition() (PartitionHandle, error) {
 // SetupPartition wraps WHvSetupPartition.
 func SetupPartition(partition PartitionHandle) error {
 	_, err := callHRESULT(procWHvSetupPartition, uintptr(partition))
+	return err
+}
+
+// ResetPartition wraps WHvResetPartition.
+func ResetPartition(partition PartitionHandle) error {
+	_, err := callHRESULT(procWHvResetPartition, uintptr(partition))
 	return err
 }
 
@@ -175,6 +243,19 @@ func MapGPARange(partition PartitionHandle, source unsafe.Pointer, guestAddress 
 	return err
 }
 
+// MapGPARange2 wraps WHvMapGpaRange2.
+func MapGPARange2(partition PartitionHandle, process syscall.Handle, source unsafe.Pointer, guestAddress GuestPhysicalAddress, sizeInBytes uint64, flags MapGPARangeFlags) error {
+	_, err := callHRESULT(procWHvMapGpaRange2,
+		uintptr(partition),
+		uintptr(process),
+		uintptr(source),
+		uintptr(guestAddress),
+		uintptr(sizeInBytes),
+		uintptr(flags),
+	)
+	return err
+}
+
 // UnmapGPARange wraps WHvUnmapGpaRange.
 func UnmapGPARange(partition PartitionHandle, guestAddress GuestPhysicalAddress, sizeInBytes uint64) error {
 	_, err := callHRESULT(procWHvUnmapGpaRange,
@@ -198,12 +279,70 @@ func TranslateGVA(partition PartitionHandle, vpIndex uint32, gva GuestVirtualAdd
 	return err
 }
 
+// AdviseGpaRange wraps WHvAdviseGpaRange.
+func AdviseGpaRange(partition PartitionHandle, ranges []MemoryRangeEntry, advice AdviseGpaRangeCode, adviceBuffer unsafe.Pointer, adviceBufferSize uint32) error {
+	var rangesPtr uintptr
+	if len(ranges) > 0 {
+		rangesPtr = uintptr(unsafe.Pointer(&ranges[0]))
+	}
+	_, err := callHRESULT(procWHvAdviseGpaRange,
+		uintptr(partition),
+		rangesPtr,
+		uintptr(len(ranges)),
+		uintptr(advice),
+		uintptr(adviceBuffer),
+		uintptr(adviceBufferSize),
+	)
+	return err
+}
+
+// ReadGpaRange wraps WHvReadGpaRange.
+func ReadGpaRange(partition PartitionHandle, vpIndex uint32, guestAddress GuestPhysicalAddress, controls AccessGpaControls, data unsafe.Pointer, sizeInBytes uint32) error {
+	_, err := callHRESULT(procWHvReadGpaRange,
+		uintptr(partition),
+		uintptr(vpIndex),
+		uintptr(guestAddress),
+		uintptr(controls.AsUINT64()),
+		uintptr(data),
+		uintptr(sizeInBytes),
+	)
+	return err
+}
+
+// WriteGpaRange wraps WHvWriteGpaRange.
+func WriteGpaRange(partition PartitionHandle, vpIndex uint32, guestAddress GuestPhysicalAddress, controls AccessGpaControls, data unsafe.Pointer, sizeInBytes uint32) error {
+	_, err := callHRESULT(procWHvWriteGpaRange,
+		uintptr(partition),
+		uintptr(vpIndex),
+		uintptr(guestAddress),
+		uintptr(controls.AsUINT64()),
+		uintptr(data),
+		uintptr(sizeInBytes),
+	)
+	return err
+}
+
 // CreateVirtualProcessor wraps WHvCreateVirtualProcessor.
 func CreateVirtualProcessor(partition PartitionHandle, vpIndex uint32, flags uint32) error {
 	_, err := callHRESULT(procWHvCreateVirtualProcessor,
 		uintptr(partition),
 		uintptr(vpIndex),
 		uintptr(flags),
+	)
+	return err
+}
+
+// CreateVirtualProcessor2 wraps WHvCreateVirtualProcessor2.
+func CreateVirtualProcessor2(partition PartitionHandle, vpIndex uint32, properties []VirtualProcessorProperty) error {
+	var propsPtr uintptr
+	if len(properties) > 0 {
+		propsPtr = uintptr(unsafe.Pointer(&properties[0]))
+	}
+	_, err := callHRESULT(procWHvCreateVirtualProcessor2,
+		uintptr(partition),
+		uintptr(vpIndex),
+		propsPtr,
+		uintptr(len(properties)),
 	)
 	return err
 }
@@ -292,12 +431,13 @@ func SetVirtualProcessorRegisters(partition PartitionHandle, vpIndex uint32, nam
 	return err
 }
 
-// GetVirtualProcessorInterruptControllerState wraps WHvGetVirtualProcessorInterruptControllerState.
-func GetVirtualProcessorInterruptControllerState(partition PartitionHandle, vpIndex uint32, buffer unsafe.Pointer, bufferSize uint32) (uint32, error) {
+// GetVirtualProcessorState wraps WHvGetVirtualProcessorState.
+func GetVirtualProcessorState(partition PartitionHandle, vpIndex uint32, stateType VirtualProcessorStateType, buffer unsafe.Pointer, bufferSize uint32) (uint32, error) {
 	var written uint32
-	_, err := callHRESULT(procWHvGetVirtualProcessorInterruptControllerState,
+	_, err := callHRESULT(procWHvGetVirtualProcessorState,
 		uintptr(partition),
 		uintptr(vpIndex),
+		uintptr(stateType),
 		uintptr(buffer),
 		uintptr(bufferSize),
 		uintptr(unsafe.Pointer(&written)),
@@ -305,13 +445,37 @@ func GetVirtualProcessorInterruptControllerState(partition PartitionHandle, vpIn
 	return written, err
 }
 
-// SetVirtualProcessorInterruptControllerState wraps WHvSetVirtualProcessorInterruptControllerState.
-func SetVirtualProcessorInterruptControllerState(partition PartitionHandle, vpIndex uint32, buffer unsafe.Pointer, bufferSize uint32) error {
-	_, err := callHRESULT(procWHvSetVirtualProcessorInterruptControllerState,
+// SetVirtualProcessorState wraps WHvSetVirtualProcessorState.
+func SetVirtualProcessorState(partition PartitionHandle, vpIndex uint32, stateType VirtualProcessorStateType, buffer unsafe.Pointer, bufferSize uint32) error {
+	_, err := callHRESULT(procWHvSetVirtualProcessorState,
 		uintptr(partition),
 		uintptr(vpIndex),
+		uintptr(stateType),
 		uintptr(buffer),
 		uintptr(bufferSize),
+	)
+	return err
+}
+
+// SignalVirtualProcessorSynicEvent wraps WHvSignalVirtualProcessorSynicEvent.
+func SignalVirtualProcessorSynicEvent(partition PartitionHandle, synicEvent SynicEventParameters) (bool, error) {
+	var newlySignaled uint32 // BOOL
+	_, err := callHRESULT(procWHvSignalVirtualProcessorSynicEvent,
+		uintptr(partition),
+		uintptr(unsafe.Pointer(&synicEvent)),
+		uintptr(unsafe.Pointer(&newlySignaled)),
+	)
+	return newlySignaled != 0, err
+}
+
+// PostVirtualProcessorSynicMessage wraps WHvPostVirtualProcessorSynicMessage.
+func PostVirtualProcessorSynicMessage(partition PartitionHandle, vpIndex uint32, sintIndex uint32, message unsafe.Pointer, messageSize uint32) error {
+	_, err := callHRESULT(procWHvPostVirtualProcessorSynicMessage,
+		uintptr(partition),
+		uintptr(vpIndex),
+		uintptr(sintIndex),
+		uintptr(message),
+		uintptr(messageSize),
 	)
 	return err
 }
@@ -322,30 +486,6 @@ func RequestInterrupt(partition PartitionHandle, control *InterruptControl) erro
 		uintptr(partition),
 		uintptr(unsafe.Pointer(control)),
 		uintptr(unsafe.Sizeof(*control)),
-	)
-	return err
-}
-
-// GetVirtualProcessorXsaveState wraps WHvGetVirtualProcessorXsaveState.
-func GetVirtualProcessorXsaveState(partition PartitionHandle, vpIndex uint32, buffer unsafe.Pointer, bufferSize uint32) (uint32, error) {
-	var written uint32
-	_, err := callHRESULT(procWHvGetVirtualProcessorXsaveState,
-		uintptr(partition),
-		uintptr(vpIndex),
-		uintptr(buffer),
-		uintptr(bufferSize),
-		uintptr(unsafe.Pointer(&written)),
-	)
-	return written, err
-}
-
-// SetVirtualProcessorXsaveState wraps WHvSetVirtualProcessorXsaveState.
-func SetVirtualProcessorXsaveState(partition PartitionHandle, vpIndex uint32, buffer unsafe.Pointer, bufferSize uint32) error {
-	_, err := callHRESULT(procWHvSetVirtualProcessorXsaveState,
-		uintptr(partition),
-		uintptr(vpIndex),
-		uintptr(buffer),
-		uintptr(bufferSize),
 	)
 	return err
 }
@@ -389,7 +529,397 @@ func GetVirtualProcessorCounters(partition PartitionHandle, vpIndex uint32, coun
 	return written, err
 }
 
-// GetVirtualProcessorInterruptControllerState2 wraps WHvGetVirtualProcessorInterruptControllerState2.
+// --- Virtual PCI ---
+
+// AllocateVpciResource wraps WHvAllocateVpciResource.
+func AllocateVpciResource(providerID *syscall.GUID, flags AllocateVpciResourceFlags, resourceDescriptor unsafe.Pointer, resourceDescriptorSize uint32) (syscall.Handle, error) {
+	var resource syscall.Handle
+	_, err := callHRESULT(procWHvAllocateVpciResource,
+		uintptr(unsafe.Pointer(providerID)),
+		uintptr(flags),
+		uintptr(resourceDescriptor),
+		uintptr(resourceDescriptorSize),
+		uintptr(unsafe.Pointer(&resource)),
+	)
+	return resource, err
+}
+
+// CreateVpciDevice wraps WHvCreateVpciDevice.
+func CreateVpciDevice(partition PartitionHandle, logicalDeviceID uint64, vpciResource syscall.Handle, flags CreateVpciDeviceFlags, notificationEvent syscall.Handle) error {
+	_, err := callHRESULT(procWHvCreateVpciDevice,
+		uintptr(partition),
+		uintptr(logicalDeviceID),
+		uintptr(vpciResource),
+		uintptr(flags),
+		uintptr(notificationEvent),
+	)
+	return err
+}
+
+// DeleteVpciDevice wraps WHvDeleteVpciDevice.
+func DeleteVpciDevice(partition PartitionHandle, logicalDeviceID uint64) error {
+	_, err := callHRESULT(procWHvDeleteVpciDevice,
+		uintptr(partition),
+		uintptr(logicalDeviceID),
+	)
+	return err
+}
+
+// GetVpciDeviceProperty wraps WHvGetVpciDeviceProperty.
+func GetVpciDeviceProperty(partition PartitionHandle, logicalDeviceID uint64, propertyCode VpciDevicePropertyCode, propertyBuffer unsafe.Pointer, propertyBufferSize uint32) (uint32, error) {
+	var written uint32
+	_, err := callHRESULT(procWHvGetVpciDeviceProperty,
+		uintptr(partition),
+		uintptr(logicalDeviceID),
+		uintptr(propertyCode),
+		uintptr(propertyBuffer),
+		uintptr(propertyBufferSize),
+		uintptr(unsafe.Pointer(&written)),
+	)
+	return written, err
+}
+
+// GetVpciDeviceNotification wraps WHvGetVpciDeviceNotification.
+func GetVpciDeviceNotification(partition PartitionHandle, logicalDeviceID uint64, notification *VpciDeviceNotification, notificationSize uint32) error {
+	_, err := callHRESULT(procWHvGetVpciDeviceNotification,
+		uintptr(partition),
+		uintptr(logicalDeviceID),
+		uintptr(unsafe.Pointer(notification)),
+		uintptr(notificationSize),
+	)
+	return err
+}
+
+// MapVpciDeviceMmioRanges wraps WHvMapVpciDeviceMmioRanges.
+// Note: This API returns an array of pointers to WHV_VPCI_MMIO_MAPPING structures allocated by the system.
+// Handling this correctly in Go usually requires reading the memory at the returned pointers.
+func MapVpciDeviceMmioRanges(partition PartitionHandle, logicalDeviceID uint64) ([]*VpciMmioMapping, error) {
+	var mappingCount uint32
+	var mappingsPtr uintptr // WHV_VPCI_MMIO_MAPPING**
+
+	_, err := callHRESULT(procWHvMapVpciDeviceMmioRanges,
+		uintptr(partition),
+		uintptr(logicalDeviceID),
+		uintptr(unsafe.Pointer(&mappingCount)),
+		uintptr(unsafe.Pointer(&mappingsPtr)),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if mappingCount == 0 || mappingsPtr == 0 {
+		return nil, nil
+	}
+
+	// Iterate over the array of pointers returned
+	result := make([]*VpciMmioMapping, mappingCount)
+	// The mappingsPtr is a pointer to an array of pointers to VpciMmioMapping
+	ptrSlice := (*[1 << 30]*VpciMmioMapping)(unsafe.Pointer(mappingsPtr))[:mappingCount:mappingCount]
+	copy(result, ptrSlice)
+
+	return result, nil
+}
+
+// UnmapVpciDeviceMmioRanges wraps WHvUnmapVpciDeviceMmioRanges.
+func UnmapVpciDeviceMmioRanges(partition PartitionHandle, logicalDeviceID uint64) error {
+	_, err := callHRESULT(procWHvUnmapVpciDeviceMmioRanges,
+		uintptr(partition),
+		uintptr(logicalDeviceID),
+	)
+	return err
+}
+
+// SetVpciDevicePowerState wraps WHvSetVpciDevicePowerState.
+func SetVpciDevicePowerState(partition PartitionHandle, logicalDeviceID uint64, powerState DevicePowerState) error {
+	_, err := callHRESULT(procWHvSetVpciDevicePowerState,
+		uintptr(partition),
+		uintptr(logicalDeviceID),
+		uintptr(powerState),
+	)
+	return err
+}
+
+// ReadVpciDeviceRegister wraps WHvReadVpciDeviceRegister.
+func ReadVpciDeviceRegister(partition PartitionHandle, logicalDeviceID uint64, register *VpciDeviceRegister, data unsafe.Pointer) error {
+	_, err := callHRESULT(procWHvReadVpciDeviceRegister,
+		uintptr(partition),
+		uintptr(logicalDeviceID),
+		uintptr(unsafe.Pointer(register)),
+		uintptr(data),
+	)
+	return err
+}
+
+// WriteVpciDeviceRegister wraps WHvWriteVpciDeviceRegister.
+func WriteVpciDeviceRegister(partition PartitionHandle, logicalDeviceID uint64, register *VpciDeviceRegister, data unsafe.Pointer) error {
+	_, err := callHRESULT(procWHvWriteVpciDeviceRegister,
+		uintptr(partition),
+		uintptr(logicalDeviceID),
+		uintptr(unsafe.Pointer(register)),
+		uintptr(data),
+	)
+	return err
+}
+
+// MapVpciDeviceInterrupt wraps WHvMapVpciDeviceInterrupt.
+func MapVpciDeviceInterrupt(partition PartitionHandle, logicalDeviceID uint64, index uint32, messageCount uint32, target *VpciInterruptTarget) (uint64, uint32, error) {
+	var msiAddress uint64
+	var msiData uint32
+	_, err := callHRESULT(procWHvMapVpciDeviceInterrupt,
+		uintptr(partition),
+		uintptr(logicalDeviceID),
+		uintptr(index),
+		uintptr(messageCount),
+		uintptr(unsafe.Pointer(target)),
+		uintptr(unsafe.Pointer(&msiAddress)),
+		uintptr(unsafe.Pointer(&msiData)),
+	)
+	return msiAddress, msiData, err
+}
+
+// UnmapVpciDeviceInterrupt wraps WHvUnmapVpciDeviceInterrupt.
+func UnmapVpciDeviceInterrupt(partition PartitionHandle, logicalDeviceID uint64, index uint32) error {
+	_, err := callHRESULT(procWHvUnmapVpciDeviceInterrupt,
+		uintptr(partition),
+		uintptr(logicalDeviceID),
+		uintptr(index),
+	)
+	return err
+}
+
+// RetargetVpciDeviceInterrupt wraps WHvRetargetVpciDeviceInterrupt.
+func RetargetVpciDeviceInterrupt(partition PartitionHandle, logicalDeviceID uint64, msiAddress uint64, msiData uint32, target *VpciInterruptTarget) error {
+	_, err := callHRESULT(procWHvRetargetVpciDeviceInterrupt,
+		uintptr(partition),
+		uintptr(logicalDeviceID),
+		uintptr(msiAddress),
+		uintptr(msiData),
+		uintptr(unsafe.Pointer(target)),
+	)
+	return err
+}
+
+// RequestVpciDeviceInterrupt wraps WHvRequestVpciDeviceInterrupt.
+func RequestVpciDeviceInterrupt(partition PartitionHandle, logicalDeviceID uint64, msiAddress uint64, msiData uint32) error {
+	_, err := callHRESULT(procWHvRequestVpciDeviceInterrupt,
+		uintptr(partition),
+		uintptr(logicalDeviceID),
+		uintptr(msiAddress),
+		uintptr(msiData),
+	)
+	return err
+}
+
+// GetVpciDeviceInterruptTarget wraps WHvGetVpciDeviceInterruptTarget.
+func GetVpciDeviceInterruptTarget(partition PartitionHandle, logicalDeviceID uint64, index uint32, multiMessageNumber uint32, target unsafe.Pointer, targetSize uint32) (uint32, error) {
+	var written uint32
+	_, err := callHRESULT(procWHvGetVpciDeviceInterruptTarget,
+		uintptr(partition),
+		uintptr(logicalDeviceID),
+		uintptr(index),
+		uintptr(multiMessageNumber),
+		uintptr(target),
+		uintptr(targetSize),
+		uintptr(unsafe.Pointer(&written)),
+	)
+	return written, err
+}
+
+// --- Triggers ---
+
+// CreateTrigger wraps WHvCreateTrigger.
+func CreateTrigger(partition PartitionHandle, parameters *TriggerParameters) (TriggerHandle, syscall.Handle, error) {
+	var triggerHandle TriggerHandle
+	var eventHandle syscall.Handle
+	_, err := callHRESULT(procWHvCreateTrigger,
+		uintptr(partition),
+		uintptr(unsafe.Pointer(parameters)),
+		uintptr(unsafe.Pointer(&triggerHandle)),
+		uintptr(unsafe.Pointer(&eventHandle)),
+	)
+	return triggerHandle, eventHandle, err
+}
+
+// UpdateTriggerParameters wraps WHvUpdateTriggerParameters.
+func UpdateTriggerParameters(partition PartitionHandle, parameters *TriggerParameters, triggerHandle TriggerHandle) error {
+	_, err := callHRESULT(procWHvUpdateTriggerParameters,
+		uintptr(partition),
+		uintptr(unsafe.Pointer(parameters)),
+		uintptr(triggerHandle),
+	)
+	return err
+}
+
+// DeleteTrigger wraps WHvDeleteTrigger.
+func DeleteTrigger(partition PartitionHandle, triggerHandle TriggerHandle) error {
+	_, err := callHRESULT(procWHvDeleteTrigger,
+		uintptr(partition),
+		uintptr(triggerHandle),
+	)
+	return err
+}
+
+// --- Notification Ports ---
+
+// CreateNotificationPort wraps WHvCreateNotificationPort.
+func CreateNotificationPort(partition PartitionHandle, parameters *NotificationPortParameters, event syscall.Handle) (NotificationPortHandle, error) {
+	var portHandle NotificationPortHandle
+	_, err := callHRESULT(procWHvCreateNotificationPort,
+		uintptr(partition),
+		uintptr(unsafe.Pointer(parameters)),
+		uintptr(event),
+		uintptr(unsafe.Pointer(&portHandle)),
+	)
+	return portHandle, err
+}
+
+// SetNotificationPortProperty wraps WHvSetNotificationPortProperty.
+func SetNotificationPortProperty(partition PartitionHandle, portHandle NotificationPortHandle, propertyCode NotificationPortPropertyCode, propertyValue NotificationPortProperty) error {
+	_, err := callHRESULT(procWHvSetNotificationPortProperty,
+		uintptr(partition),
+		uintptr(portHandle),
+		uintptr(propertyCode),
+		uintptr(propertyValue),
+	)
+	return err
+}
+
+// DeleteNotificationPort wraps WHvDeleteNotificationPort.
+func DeleteNotificationPort(partition PartitionHandle, portHandle NotificationPortHandle) error {
+	_, err := callHRESULT(procWHvDeleteNotificationPort,
+		uintptr(partition),
+		uintptr(portHandle),
+	)
+	return err
+}
+
+// --- Migration ---
+
+// StartPartitionMigration wraps WHvStartPartitionMigration.
+func StartPartitionMigration(partition PartitionHandle) (syscall.Handle, error) {
+	var migrationHandle syscall.Handle
+	_, err := callHRESULT(procWHvStartPartitionMigration,
+		uintptr(partition),
+		uintptr(unsafe.Pointer(&migrationHandle)),
+	)
+	return migrationHandle, err
+}
+
+// CancelPartitionMigration wraps WHvCancelPartitionMigration.
+func CancelPartitionMigration(partition PartitionHandle) error {
+	_, err := callHRESULT(procWHvCancelPartitionMigration, uintptr(partition))
+	return err
+}
+
+// CompletePartitionMigration wraps WHvCompletePartitionMigration.
+func CompletePartitionMigration(partition PartitionHandle) error {
+	_, err := callHRESULT(procWHvCompletePartitionMigration, uintptr(partition))
+	return err
+}
+
+// AcceptPartitionMigration wraps WHvAcceptPartitionMigration.
+func AcceptPartitionMigration(migrationHandle syscall.Handle) (PartitionHandle, error) {
+	var partition PartitionHandle
+	_, err := callHRESULT(procWHvAcceptPartitionMigration,
+		uintptr(migrationHandle),
+		uintptr(unsafe.Pointer(&partition)),
+	)
+	return partition, err
+}
+
+// --- AMD64 Specific ---
+
+// GetVirtualProcessorCpuidOutput wraps WHvGetVirtualProcessorCpuidOutput.
+// Note: Only available on AMD64.
+func GetVirtualProcessorCpuidOutput(partition PartitionHandle, vpIndex uint32, eax uint32, ecx uint32) (CpuidOutput, error) {
+	var output CpuidOutput
+	if procWHvGetVirtualProcessorCpuidOutput.Find() != nil {
+		return output, syscall.Errno(ERROR_NOT_SUPPORTED)
+	}
+	_, err := callHRESULT(procWHvGetVirtualProcessorCpuidOutput,
+		uintptr(partition),
+		uintptr(vpIndex),
+		uintptr(eax),
+		uintptr(ecx),
+		uintptr(unsafe.Pointer(&output)),
+	)
+	return output, err
+}
+
+// GetInterruptTargetVpSet wraps WHvGetInterruptTargetVpSet.
+// Note: Only available on AMD64.
+func GetInterruptTargetVpSet(partition PartitionHandle, destination uint64, destinationMode InterruptDestinationMode, targetVps []uint32) (uint32, error) {
+	if procWHvGetInterruptTargetVpSet.Find() != nil {
+		return 0, syscall.Errno(ERROR_NOT_SUPPORTED)
+	}
+	var targetVpCount uint32
+	var vpsPtr uintptr
+	if len(targetVps) > 0 {
+		vpsPtr = uintptr(unsafe.Pointer(&targetVps[0]))
+	}
+
+	_, err := callHRESULT(procWHvGetInterruptTargetVpSet,
+		uintptr(partition),
+		uintptr(destination),
+		uintptr(destinationMode),
+		vpsPtr,
+		uintptr(len(targetVps)),
+		uintptr(unsafe.Pointer(&targetVpCount)),
+	)
+	return targetVpCount, err
+}
+
+// --- Legacy / Deprecated Functions ---
+
+// GetVirtualProcessorInterruptControllerState wraps WHvGetVirtualProcessorInterruptControllerState (Deprecated).
+func GetVirtualProcessorInterruptControllerState(partition PartitionHandle, vpIndex uint32, buffer unsafe.Pointer, bufferSize uint32) (uint32, error) {
+	var written uint32
+	_, err := callHRESULT(procWHvGetVirtualProcessorInterruptControllerState,
+		uintptr(partition),
+		uintptr(vpIndex),
+		uintptr(buffer),
+		uintptr(bufferSize),
+		uintptr(unsafe.Pointer(&written)),
+	)
+	return written, err
+}
+
+// SetVirtualProcessorInterruptControllerState wraps WHvSetVirtualProcessorInterruptControllerState (Deprecated).
+func SetVirtualProcessorInterruptControllerState(partition PartitionHandle, vpIndex uint32, buffer unsafe.Pointer, bufferSize uint32) error {
+	_, err := callHRESULT(procWHvSetVirtualProcessorInterruptControllerState,
+		uintptr(partition),
+		uintptr(vpIndex),
+		uintptr(buffer),
+		uintptr(bufferSize),
+	)
+	return err
+}
+
+// GetVirtualProcessorXsaveState wraps WHvGetVirtualProcessorXsaveState (Deprecated).
+func GetVirtualProcessorXsaveState(partition PartitionHandle, vpIndex uint32, buffer unsafe.Pointer, bufferSize uint32) (uint32, error) {
+	var written uint32
+	_, err := callHRESULT(procWHvGetVirtualProcessorXsaveState,
+		uintptr(partition),
+		uintptr(vpIndex),
+		uintptr(buffer),
+		uintptr(bufferSize),
+		uintptr(unsafe.Pointer(&written)),
+	)
+	return written, err
+}
+
+// SetVirtualProcessorXsaveState wraps WHvSetVirtualProcessorXsaveState (Deprecated).
+func SetVirtualProcessorXsaveState(partition PartitionHandle, vpIndex uint32, buffer unsafe.Pointer, bufferSize uint32) error {
+	_, err := callHRESULT(procWHvSetVirtualProcessorXsaveState,
+		uintptr(partition),
+		uintptr(vpIndex),
+		uintptr(buffer),
+		uintptr(bufferSize),
+	)
+	return err
+}
+
+// GetVirtualProcessorInterruptControllerState2 wraps WHvGetVirtualProcessorInterruptControllerState2 (Deprecated).
 func GetVirtualProcessorInterruptControllerState2(partition PartitionHandle, vpIndex uint32, buffer unsafe.Pointer, bufferSize uint32) (uint32, error) {
 	var written uint32
 	_, err := callHRESULT(procWHvGetVirtualProcessorInterruptControllerState2,
@@ -402,7 +932,7 @@ func GetVirtualProcessorInterruptControllerState2(partition PartitionHandle, vpI
 	return written, err
 }
 
-// SetVirtualProcessorInterruptControllerState2 wraps WHvSetVirtualProcessorInterruptControllerState2.
+// SetVirtualProcessorInterruptControllerState2 wraps WHvSetVirtualProcessorInterruptControllerState2 (Deprecated).
 func SetVirtualProcessorInterruptControllerState2(partition PartitionHandle, vpIndex uint32, buffer unsafe.Pointer, bufferSize uint32) error {
 	_, err := callHRESULT(procWHvSetVirtualProcessorInterruptControllerState2,
 		uintptr(partition),
@@ -413,7 +943,7 @@ func SetVirtualProcessorInterruptControllerState2(partition PartitionHandle, vpI
 	return err
 }
 
-// RegisterPartitionDoorbellEvent wraps WHvRegisterPartitionDoorbellEvent.
+// RegisterPartitionDoorbellEvent wraps WHvRegisterPartitionDoorbellEvent (Deprecated).
 func RegisterPartitionDoorbellEvent(partition PartitionHandle, matchData *DoorbellMatchData, event syscall.Handle) error {
 	_, err := callHRESULT(procWHvRegisterPartitionDoorbellEvent,
 		uintptr(partition),
@@ -423,7 +953,7 @@ func RegisterPartitionDoorbellEvent(partition PartitionHandle, matchData *Doorbe
 	return err
 }
 
-// UnregisterPartitionDoorbellEvent wraps WHvUnregisterPartitionDoorbellEvent.
+// UnregisterPartitionDoorbellEvent wraps WHvUnregisterPartitionDoorbellEvent (Deprecated).
 func UnregisterPartitionDoorbellEvent(partition PartitionHandle, matchData *DoorbellMatchData) error {
 	_, err := callHRESULT(procWHvUnregisterPartitionDoorbellEvent,
 		uintptr(partition),

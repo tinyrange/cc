@@ -16,7 +16,11 @@ var (
 	procWHvEmulatorTryMmioEmulation = modWinHvEmulation.NewProc("WHvEmulatorTryMmioEmulation")
 )
 
+// EmulatorHandle mirrors WHV_EMULATOR_HANDLE.
+type EmulatorHandle uintptr
+
 // EmulatorStatus mirrors WHV_EMULATOR_STATUS.
+// This is a C Union containing a bitfield.
 type EmulatorStatus uint32
 
 const (
@@ -33,49 +37,27 @@ const (
 )
 
 func (s EmulatorStatus) EmulationSuccessful() bool {
-	return s&EmulatorStatusSuccess != 0 && s&(EmulatorStatusInternalFailure|EmulatorStatusIoPortCallbackFailed|EmulatorStatusMemoryCallbackFailed|EmulatorStatusTranslateGvaCallbackFailed|EmulatorStatusGetRegistersCallbackFailed|EmulatorStatusSetRegistersCallbackFailed) == 0
+	// Check if Success bit is set AND no failure bits are set.
+	failureMask := EmulatorStatusInternalFailure |
+		EmulatorStatusIoPortCallbackFailed |
+		EmulatorStatusMemoryCallbackFailed |
+		EmulatorStatusTranslateGvaCallbackFailed |
+		EmulatorStatusGetRegistersCallbackFailed |
+		EmulatorStatusSetRegistersCallbackFailed
+
+	return (s&EmulatorStatusSuccess != 0) && (s&failureMask == 0)
 }
 
 func (s EmulatorStatus) String() string {
-	var flags []string
-	if s&EmulatorStatusSuccess != 0 {
-		flags = append(flags, "Success")
-	}
-	if s&EmulatorStatusInternalFailure != 0 {
-		flags = append(flags, "InternalFailure")
-	}
-	if s&EmulatorStatusIoPortCallbackFailed != 0 {
-		flags = append(flags, "IoPortCallbackFailed")
-	}
-	if s&EmulatorStatusMemoryCallbackFailed != 0 {
-		flags = append(flags, "MemoryCallbackFailed")
-	}
-	if s&EmulatorStatusTranslateGvaCallbackFailed != 0 {
-		flags = append(flags, "TranslateGvaCallbackFailed")
-	}
-	if s&EmulatorStatusTranslateGvaGpaNotAligned != 0 {
-		flags = append(flags, "TranslateGvaGpaNotAligned")
-	}
-	if s&EmulatorStatusGetRegistersCallbackFailed != 0 {
-		flags = append(flags, "GetRegistersCallbackFailed")
-	}
-	if s&EmulatorStatusSetRegistersCallbackFailed != 0 {
-		flags = append(flags, "SetRegistersCallbackFailed")
-	}
-	if s&EmulatorStatusInterruptCausedIntercept != 0 {
-		flags = append(flags, "InterruptCausedIntercept")
-	}
-	if s&EmulatorStatusGuestCannotBeFaulted != 0 {
-		flags = append(flags, "GuestCannotBeFaulted")
-	}
-	if len(flags) == 0 {
+	if s == 0 {
 		return "None"
 	}
-	return fmt.Sprintf("%v", flags)
+	// Note: Simple output format, can be expanded if needed.
+	return fmt.Sprintf("EmulatorStatus(0x%x)", uint32(s))
 }
 
-// EmulatorMemoryAccessDirection mirrors WHV_EMULATOR_MEMORY_ACCESS_DIRECTION.
-// NOTE: Enums in Windows C ABI are 32-bit ints by default.
+// EmulatorMemoryAccessDirection mirrors internal UINT8 usage in access info structs.
+// Although 32-bit in standard enums, the struct explicitly uses UINT8.
 type EmulatorMemoryAccessDirection uint8
 
 const (
@@ -95,27 +77,22 @@ func (d EmulatorMemoryAccessDirection) String() string {
 }
 
 // EmulatorMemoryAccessInfo mirrors WHV_EMULATOR_MEMORY_ACCESS_INFO.
-// C Layout:
+// Layout:
 //
 //	GpaAddress (8 bytes)
 //	Direction  (1 byte)
 //	AccessSize (1 byte)
-//	ByteData   (8 bytes)
+//	Data       (8 bytes)
+//
+// Total aligned size: 24 bytes (Go pads end to align to 8 bytes).
 type EmulatorMemoryAccessInfo struct {
-	// typedef struct _WHV_EMULATOR_MEMORY_ACCESS_INFO {
-	//     UINT64 GpaAddress;
-	//     UINT8 Direction; // 0 for read, 1 for write
-	//     UINT8 AccessSize; // 1 thru 8
-	//     UINT8 Data[8]; // Raw byte contents to be read from/written to memory
-	// } WHV_EMULATOR_MEMORY_ACCESS_INFO;
-	GpaAddress uint64                        // Offset 0
-	Direction  EmulatorMemoryAccessDirection // Offset 8
-	AccessSize uint8                         // Offset 9
-	Data       [8]byte                       // Offset 10
+	GpaAddress uint64
+	Direction  EmulatorMemoryAccessDirection // UINT8
+	AccessSize uint8                         // UINT8
+	Data       [8]byte                       // UINT8 Data[8]
 }
 
-// EmulatorIOAccessDirection mirrors WHV_EMULATOR_IO_ACCESS_DIRECTION.
-// NOTE: Enums in Windows C ABI are 32-bit ints by default.
+// EmulatorIOAccessDirection mirrors internal UINT8 usage.
 type EmulatorIOAccessDirection uint8
 
 const (
@@ -135,29 +112,32 @@ func (d EmulatorIOAccessDirection) String() string {
 }
 
 // EmulatorIOAccessInfo mirrors WHV_EMULATOR_IO_ACCESS_INFO.
-// C Layout:
+// Layout:
 //
 //	Direction  (1 byte)
+//	(Pad 1 byte)
 //	Port       (2 bytes)
 //	AccessSize (2 bytes)
+//	(Pad 2 bytes)
 //	Data       (4 bytes)
 type EmulatorIOAccessInfo struct {
-	// typedef struct _WHV_EMULATOR_IO_ACCESS_INFO {
-	//     UINT8 Direction; // 0 for in, 1 for out
-	//     UINT16 Port;
-	//     UINT16 AccessSize; // only 1, 2, 4
-	//     UINT32 Data[4];
-	// } WHV_EMULATOR_IO_ACCESS_INFO;\
-	Direction  EmulatorIOAccessDirection // Offset 0
-	Port       uint16                    // Offset 1
-	AccessSize uint16                    // Offset 3
-	Data       [4]uint32                 // Offset 5
+	Direction  EmulatorIOAccessDirection // UINT8
+	Port       uint16                    // UINT16
+	AccessSize uint16                    // UINT16
+	// FIXED: C header defines this as "UINT32 Data;" not an array.
+	Data uint32 // UINT32
 }
 
+// --------------------------------------------------------------------------
+// Callbacks
+// --------------------------------------------------------------------------
+
 // EmulatorIoPortFunc is the Go representation of WHV_EMULATOR_IO_PORT_CALLBACK.
+// Returns HRESULT.
 type EmulatorIoPortFunc func(ctx unsafe.Pointer, access *EmulatorIOAccessInfo) HRESULT
 
 // EmulatorMemoryFunc is the Go representation of WHV_EMULATOR_MEMORY_CALLBACK.
+// Returns HRESULT.
 type EmulatorMemoryFunc func(ctx unsafe.Pointer, access *EmulatorMemoryAccessInfo) HRESULT
 
 // EmulatorGetRegistersFunc mirrors WHV_EMULATOR_GET_VIRTUAL_PROCESSOR_REGISTERS_CALLBACK.
@@ -169,6 +149,7 @@ type EmulatorSetRegistersFunc func(ctx unsafe.Pointer, names []RegisterName, val
 // EmulatorTranslateGvaPageFunc mirrors WHV_EMULATOR_TRANSLATE_GVA_PAGE_CALLBACK.
 type EmulatorTranslateGvaPageFunc func(ctx unsafe.Pointer, gva GuestVirtualAddress, flags TranslateGVAFlags, result *TranslateGVAResultCode, gpa *GuestPhysicalAddress) HRESULT
 
+// Helper to slice pointer arithmetic
 func makeRegisterNameSlice(ptr uintptr, count uint32) []RegisterName {
 	if ptr == 0 || count == 0 {
 		return nil
@@ -183,7 +164,7 @@ func makeRegisterValueSlice(ptr uintptr, count uint32) []RegisterValue {
 	return unsafe.Slice((*RegisterValue)(unsafe.Pointer(ptr)), int(count))
 }
 
-// NewEmulatorIoPortCallback converts a Go function into a CALLBACK-compatible pointer.
+// NewEmulatorIoPortCallback creates a trampoline for WHV_EMULATOR_IO_PORT_CALLBACK.
 func NewEmulatorIoPortCallback(fn EmulatorIoPortFunc) uintptr {
 	if fn == nil {
 		return 0
@@ -193,7 +174,7 @@ func NewEmulatorIoPortCallback(fn EmulatorIoPortFunc) uintptr {
 	})
 }
 
-// NewEmulatorMemoryCallback converts a Go function into a CALLBACK-compatible pointer.
+// NewEmulatorMemoryCallback creates a trampoline for WHV_EMULATOR_MEMORY_CALLBACK.
 func NewEmulatorMemoryCallback(fn EmulatorMemoryFunc) uintptr {
 	if fn == nil {
 		return 0
@@ -203,7 +184,7 @@ func NewEmulatorMemoryCallback(fn EmulatorMemoryFunc) uintptr {
 	})
 }
 
-// NewEmulatorGetRegistersCallback converts a Go function into a CALLBACK-compatible pointer.
+// NewEmulatorGetRegistersCallback creates a trampoline for WHV_EMULATOR_GET_VIRTUAL_PROCESSOR_REGISTERS_CALLBACK.
 func NewEmulatorGetRegistersCallback(fn EmulatorGetRegistersFunc) uintptr {
 	if fn == nil {
 		return 0
@@ -215,19 +196,20 @@ func NewEmulatorGetRegistersCallback(fn EmulatorGetRegistersFunc) uintptr {
 	})
 }
 
-// NewEmulatorSetRegistersCallback converts a Go function into a CALLBACK-compatible pointer.
+// NewEmulatorSetRegistersCallback creates a trampoline for WHV_EMULATOR_SET_VIRTUAL_PROCESSOR_REGISTERS_CALLBACK.
 func NewEmulatorSetRegistersCallback(fn EmulatorSetRegistersFunc) uintptr {
 	if fn == nil {
 		return 0
 	}
 	return syscall.NewCallback(func(ctx, namesPtr, count, valuesPtr uintptr) uintptr {
 		names := makeRegisterNameSlice(namesPtr, uint32(count))
+		// C Header: _In_reads_(RegisterCount) const WHV_REGISTER_VALUE* RegisterValues
 		values := makeRegisterValueSlice(valuesPtr, uint32(count))
 		return uintptr(fn(unsafe.Pointer(ctx), names, values))
 	})
 }
 
-// NewEmulatorTranslateGvaCallback converts a Go function into a CALLBACK-compatible pointer.
+// NewEmulatorTranslateGvaCallback creates a trampoline for WHV_EMULATOR_TRANSLATE_GVA_PAGE_CALLBACK.
 func NewEmulatorTranslateGvaCallback(fn EmulatorTranslateGvaPageFunc) uintptr {
 	if fn == nil {
 		return 0
@@ -259,6 +241,3 @@ func (c *EmulatorCallbacks) ensureSize() {
 		c.Size = uint32(unsafe.Sizeof(*c))
 	}
 }
-
-// EmulatorHandle mirrors WHV_EMULATOR_HANDLE.
-type EmulatorHandle uintptr

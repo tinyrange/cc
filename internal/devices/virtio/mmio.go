@@ -311,6 +311,8 @@ func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
 			handled, err := d.handler.WriteConfig(d, offset, value)
 			if handled {
 				return err
+			} else {
+				logAccess(fmt.Sprintf("CONFIG_OFFSET_%#x", offset))
 			}
 		}
 	}

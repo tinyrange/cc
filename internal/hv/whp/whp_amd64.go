@@ -56,6 +56,12 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		return fmt.Errorf("whp: RunVirtualProcessorContext failed: %w", err)
 	}
 
+	// slog.Info(
+	// 	"vCPU exited",
+	// 	"reason", exit.ExitReason.String(),
+	// 	"rip", fmt.Sprintf("0x%x", exit.VpContext.Rip),
+	// )
+
 	switch exit.ExitReason {
 	case bindings.RunVPExitReasonX64Halt:
 		return hv.ErrVMHalted
@@ -95,7 +101,6 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		}
 
 		return nil
-
 	case bindings.RunVPExitReasonX64IoPortAccess:
 		io := exit.IoPortAccess()
 
@@ -121,13 +126,82 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		}
 
 		return nil
+	case bindings.RunVPExitReasonX64Cpuid:
+		info := exit.CpuidAccess()
+
+		return v.handleCpuid(exit.VpContext, info)
+	case bindings.RunVPExitReasonX64MsrAccess:
+		info := exit.MsrAccess()
+
+		return v.handleMsr(exit.VpContext, info)
 	case bindings.RunVPExitReasonCanceled:
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		return fmt.Errorf("whp: virtual processor canceled without context error")
+	case bindings.RunVPExitReasonUnrecoverableException:
+		return fmt.Errorf("whp: unrecoverable exception in guest")
 	default:
 		return fmt.Errorf("whp: unsupported vCPU exit reason %s", exit.ExitReason)
+	}
+}
+
+func (vm *virtualCPU) handleCpuid(ctx bindings.VPExitContext, info *bindings.X64CpuidAccessContext) error {
+	slog.Info(
+		"CPUID access",
+		"rax", fmt.Sprintf("0x%X", info.Rax),
+		"rbx", fmt.Sprintf("0x%X", info.Rbx),
+		"rcx", fmt.Sprintf("0x%X", info.Rcx),
+		"rdx", fmt.Sprintf("0x%X", info.Rdx),
+	)
+
+	if err := vm.SetRegisters(map[hv.Register]hv.RegisterValue{
+		hv.RegisterAMD64Rax: hv.Register64(info.DefaultResultRax),
+		hv.RegisterAMD64Rbx: hv.Register64(info.DefaultResultRbx),
+		hv.RegisterAMD64Rcx: hv.Register64(info.DefaultResultRcx),
+		hv.RegisterAMD64Rdx: hv.Register64(info.DefaultResultRdx),
+		hv.RegisterAMD64Rip: hv.Register64(ctx.Rip + uint64(2)),
+	}); err != nil {
+		return fmt.Errorf("handleCpuid: set registers: %w", err)
+	}
+
+	return nil
+}
+
+func (vm *virtualCPU) handleMsr(ctx bindings.VPExitContext, info *bindings.X64MsrAccessContext) error {
+	if info.AccessInfo.IsWrite() {
+		slog.Info(
+			"MSR write",
+			"msr", fmt.Sprintf("0x%X", info.MsrNumber),
+			"rax", fmt.Sprintf("0x%X", info.Rax),
+			"rdx", fmt.Sprintf("0x%X", info.Rdx),
+		)
+
+		// do nothing and increment RIP by 2
+
+		if err := vm.SetRegisters(map[hv.Register]hv.RegisterValue{
+			hv.RegisterAMD64Rip: hv.Register64(ctx.Rip + uint64(2)),
+		}); err != nil {
+			return fmt.Errorf("handleMsr: set registers: %w", err)
+		}
+
+		return nil
+	} else {
+		slog.Info(
+			"MSR read",
+			"msr", fmt.Sprintf("0x%X", info.MsrNumber),
+		)
+
+		// set rax and rdx to 0 and increment RIP by 2
+		if err := vm.SetRegisters(map[hv.Register]hv.RegisterValue{
+			hv.RegisterAMD64Rax: hv.Register64(0),
+			hv.RegisterAMD64Rdx: hv.Register64(0),
+			hv.RegisterAMD64Rip: hv.Register64(ctx.Rip + uint64(2)),
+		}); err != nil {
+			return fmt.Errorf("handleMsr: set registers: %w", err)
+		}
+
+		return nil
 	}
 }
 
@@ -271,10 +345,13 @@ func (h *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 		return fmt.Errorf("failed to get processor xsave features: %w", err)
 	}
 
+	exits := bindings.ExtendedVmExitX64Msr | bindings.ExtendedVmExitX64Cpuid
+
 	if err := bindings.SetPartitionProperties(vm.part,
 		bindings.PartitionProperties{
 			ProcessorFeatures:      &features,
 			ProcessorXsaveFeatures: &xsaveFeatures,
+			ExtendedVmExits:        &exits,
 		},
 	); err != nil {
 		return fmt.Errorf("failed to set processor features: %w", err)
@@ -514,6 +591,7 @@ func (v *virtualMachine) PulseIRQ(irqLine uint32) error {
 			bindings.InterruptTypeFixed,
 			bindings.InterruptDestinationPhysical,
 			bindings.InterruptTriggerEdge,
+			0,
 		),
 		Destination: 0, // TODO(joshua): Move this to target vCPU ID?
 		Vector:      irqLine,
@@ -526,6 +604,7 @@ func (v *virtualMachine) RequestInterrupt(dest uint32, vector uint32, intType bi
 			intType,
 			bindings.InterruptDestinationMode(destMode),
 			bindings.InterruptTriggerEdge,
+			0,
 		),
 		Destination: dest,
 		Vector:      vector,

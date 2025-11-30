@@ -158,24 +158,39 @@ func (v *virtualCPU) handleIOPortAccess(access *bindings.EmulatorIOAccessInfo) e
 		return fmt.Errorf("whp: unsupported IO port access size %d", access.AccessSize)
 	}
 
+	// Buffer to bridge the gap between WHP's uint32 Data and Go's []byte device interfaces.
+	// We initialize it to zero to ensure clean upper bytes when reading partial sizes.
 	var data [4]byte
-	binary.LittleEndian.PutUint32(data[:], access.Data[0])
 
 	for _, dev := range v.vm.devices {
 		if kvmIoPortDevice, ok := dev.(hv.X86IOPortDevice); ok {
 			ports := kvmIoPortDevice.IOPorts()
 			for _, port := range ports {
 				if port == access.Port {
-					if access.Direction == 0 {
+					if access.Direction == bindings.EmulatorIOAccessDirectionIn {
+						// READ: Device -> Emulator (Guest IN instruction)
+
+						// Pass a slice of the exact size requested to the device.
 						if err := kvmIoPortDevice.ReadIOPort(access.Port, data[:access.AccessSize]); err != nil {
 							return fmt.Errorf("I/O port 0x%04x read: %w", access.Port, err)
 						}
-						access.Data[0] = uint32(binary.LittleEndian.Uint32(data[:]))
+
+						// Convert the byte slice back to uint32 for the C struct.
+						// Since 'data' was zeroed, we can safely read the whole uint32
+						// even if AccessSize < 4.
+						access.Data = binary.LittleEndian.Uint32(data[:])
+
 					} else {
+						// WRITE: Emulator -> Device (Guest OUT instruction)
+
+						// Put the C uint32 data into the byte buffer.
+						binary.LittleEndian.PutUint32(data[:], access.Data)
+
+						// Pass the relevant bytes to the device.
 						if err := kvmIoPortDevice.WriteIOPort(access.Port, data[:access.AccessSize]); err != nil {
 							return fmt.Errorf("I/O port 0x%04x write: %w", access.Port, err)
 						}
-						access.Data[0] = uint32(binary.LittleEndian.Uint32(data[:]))
+						// For writes, we don't need to update access.Data.
 					}
 					return nil
 				}
@@ -187,12 +202,11 @@ func (v *virtualCPU) handleIOPortAccess(access *bindings.EmulatorIOAccessInfo) e
 }
 
 func (v *virtualCPU) handleMemoryAccess(access *bindings.EmulatorMemoryAccessInfo) error {
-	gpa := uint64(access.GpaAddress)
+	gpa := access.GpaAddress
 	size := uint64(access.AccessSize)
 
-	// Access the Data field safely.
-	// Assuming bindings define Data as [8]uint8.
-	// We use the slice operator to get a view of the array in the struct.
+	// access.Data is now [8]byte in the bindings, backed directly by C memory.
+	// We slice it to the operation size to read/write directly without extra allocation.
 	dataSlice := access.Data[:size]
 
 	// 1. RAM Access (Instruction Fetch or Data Access)
@@ -207,10 +221,10 @@ func (v *virtualCPU) handleMemoryAccess(access *bindings.EmulatorMemoryAccessInf
 		ram := v.vm.memory.Slice()
 
 		if access.Direction == bindings.EmulatorMemoryAccessDirectionRead {
-			// Copy FROM RAM -> TO Emulator
+			// Read: RAM -> Emulator (Guest Load)
 			copy(dataSlice, ram[offset:offset+size])
 		} else {
-			// Copy FROM Emulator -> TO RAM
+			// Write: Emulator -> RAM (Guest Store)
 			copy(ram[offset:offset+size], dataSlice)
 		}
 
@@ -223,12 +237,19 @@ func (v *virtualCPU) handleMemoryAccess(access *bindings.EmulatorMemoryAccessInf
 			regions := kvmMmioDevice.MMIORegions()
 			for _, region := range regions {
 				if gpa >= region.Address && gpa+size <= region.Address+region.Size {
+
+					// Virtio Console debug logging
+					if gpa >= 0xd000_0000 && gpa <= 0xd000_00ff {
+						fmt.Printf("Virtio Console Config Access GPA=%x Size=%d Dir=%v\n", gpa, size, access.Direction)
+					}
+
 					if access.Direction == bindings.EmulatorMemoryAccessDirectionRead {
+						// Read: Device -> Emulator
 						if err := kvmMmioDevice.ReadMMIO(gpa, dataSlice); err != nil {
 							return fmt.Errorf("MMIO read at 0x%016x: %w", gpa, err)
 						}
-						// dataSlice is backed by access.Data, so writing to it updates the struct
 					} else {
+						// Write: Emulator -> Device
 						if err := kvmMmioDevice.WriteMMIO(gpa, dataSlice); err != nil {
 							return fmt.Errorf("MMIO write at 0x%016x: %w", gpa, err)
 						}

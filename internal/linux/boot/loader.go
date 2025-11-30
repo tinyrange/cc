@@ -281,6 +281,9 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	legacy := hv.SimpleX86IOPortDevice{
 		Ports: legacyPorts,
 		ReadFunc: func(port uint16, data []byte) error {
+			if port == 0x12 {
+				return hv.ErrGuestRequestedReboot
+			}
 			slog.Info("legacy port read", "port", fmt.Sprintf("0x%04x", port), "size", len(data))
 			for i := range data {
 				data[i] = 0
