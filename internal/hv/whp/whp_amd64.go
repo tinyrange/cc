@@ -296,6 +296,26 @@ func (h *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 		}
 	}
 
+	// set the processor features
+	features, err := bindings.GetProcessorFeatures()
+	if err != nil {
+		return fmt.Errorf("failed to get processor features: %w", err)
+	}
+
+	xsaveFeatures, err := bindings.GetProcessorXsaveFeatures()
+	if err != nil {
+		return fmt.Errorf("failed to get processor xsave features: %w", err)
+	}
+
+	if err := bindings.SetPartitionProperties(vm.part,
+		bindings.PartitionProperties{
+			ProcessorFeatures:      &features,
+			ProcessorXsaveFeatures: &xsaveFeatures,
+		},
+	); err != nil {
+		return fmt.Errorf("failed to set processor features: %w", err)
+	}
+
 	return nil
 }
 

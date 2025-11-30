@@ -493,5 +493,14 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 }
 
 func Open() (hv.Hypervisor, error) {
+	present, err := bindings.IsHypervisorPresent()
+	if err != nil {
+		return nil, fmt.Errorf("whp: check hypervisor present: %w", err)
+	}
+
+	if !present {
+		return nil, fmt.Errorf("whp: hypervisor not present")
+	}
+
 	return &hypervisor{}, nil
 }

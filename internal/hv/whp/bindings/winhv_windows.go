@@ -70,6 +70,33 @@ func GetCapability(code CapabilityCode, buffer unsafe.Pointer, bufferSize uint32
 	return written, err
 }
 
+func GetCapabilityUnsafe[T any](code CapabilityCode) (T, error) {
+	var value T
+	size := uint32(unsafe.Sizeof(value))
+	_, err := callHRESULT(procWHvGetCapability,
+		uintptr(code),
+		uintptr(unsafe.Pointer(&value)),
+		uintptr(size),
+	)
+	return value, err
+}
+
+func IsHypervisorPresent() (bool, error) {
+	var present uint32
+	written, err := GetCapability(
+		CapabilityCodeHypervisorPresent,
+		unsafe.Pointer(&present),
+		uint32(unsafe.Sizeof(present)),
+	)
+	if err != nil {
+		return false, fmt.Errorf("WHvGetCapability failed: %w", err)
+	}
+	if written < uint32(unsafe.Sizeof(present)) {
+		return false, fmt.Errorf("expected at least %d bytes, got %d", unsafe.Sizeof(present), written)
+	}
+	return present != 0, nil
+}
+
 // CreatePartition wraps WHvCreatePartition.
 func CreatePartition() (PartitionHandle, error) {
 	var handle PartitionHandle
