@@ -289,9 +289,27 @@ func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
 	}
 	b.endNode()
 
+	// PSCI node
 	b.beginNode("psci")
 	b.propStrings("compatible", "arm,psci-0.2", "arm,psci")
 	b.propStrings("method", "hvc")
+	b.endNode()
+
+	// Timer node
+	b.beginNode("timer")
+	b.propStrings("compatible", "arm,armv8-timer")
+	b.property("always-on", nil)
+	interrupts := []uint32{
+		// Secure Phys (PPI 13)
+		1, 13, 4,
+		// Non-Secure Phys (PPI 14)
+		1, 14, 4,
+		// Virtual (PPI 11) - Critical for KVM Guest
+		1, 11, 4,
+		// Hypervisor (PPI 10)
+		1, 10, 4,
+	}
+	b.propU32("interrupts", interrupts...)
 	b.endNode()
 
 	b.endNode() // root

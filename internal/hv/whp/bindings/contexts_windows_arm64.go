@@ -76,7 +76,7 @@ type Arm64ResetType uint32
 
 const (
 	Arm64ResetTypePowerOff Arm64ResetType = iota
-	WHvArm64ResetTypeReboot
+	Arm64ResetTypeReboot
 )
 
 type Arm64ResetContext struct {

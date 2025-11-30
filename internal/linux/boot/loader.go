@@ -10,6 +10,7 @@ import (
 
 	"github.com/tinyrange/cc/internal/asm/amd64"
 	"github.com/tinyrange/cc/internal/asm/arm64"
+	chipset "github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	amd64input "github.com/tinyrange/cc/internal/devices/amd64/input"
 	"github.com/tinyrange/cc/internal/devices/amd64/pci"
 	amd64serial "github.com/tinyrange/cc/internal/devices/amd64/serial"
@@ -235,22 +236,45 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 		return fmt.Errorf("add pci host bridge: %w", err)
 	}
 
+	pic := chipset.NewDualPIC()
+	if err := vm.AddDevice(pic); err != nil {
+		return fmt.Errorf("add dual PIC: %w", err)
+	}
+
+	const ioApicLegacyEntries = 24
+	ioapic := chipset.NewIOAPIC(ioApicLegacyEntries)
+	if err := vm.AddDevice(ioapic); err != nil {
+		return fmt.Errorf("add IOAPIC: %w", err)
+	}
+
+	if err := vm.AddDevice(chipset.NewPIT(pic)); err != nil {
+		return fmt.Errorf("add PIT: %w", err)
+	}
+
+	if err := vm.AddDevice(chipset.NewCMOS(pic)); err != nil {
+		return fmt.Errorf("add CMOS/RTC: %w", err)
+	}
+
+	if err := vm.AddDevice(chipset.NewResetControlPort()); err != nil {
+		return fmt.Errorf("add reset control port: %w", err)
+	}
+
 	var legacyPorts []uint16
 	for _, rng := range []struct {
 		start uint16
 		end   uint16
 	}{
-		{0x21, 0x22},
-		{0x40, 0x41},
-		{0x42, 0x43},
-		{0x60, 0x61},
-		{0x70, 0x71},
+		{0x0, 0x1f},
 		{0x80, 0x8f},
-		{0xA1, 0xA1},
 		{0x2e8, 0x2ef},
 		{0x3e8, 0x3ef},
+		{0xbb00, 0xbbff},
 	} {
 		for port := rng.start; port <= rng.end; port++ {
+			if port == 0x10 {
+				// Handled by ResetControlPort.
+				continue
+			}
 			legacyPorts = append(legacyPorts, port)
 		}
 	}

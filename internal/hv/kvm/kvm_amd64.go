@@ -274,6 +274,8 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		system := (*kvmSystemEvent)(unsafe.Pointer(&run.anon0[0]))
 		if system.typ == uint32(kvmSystemEventShutdown) {
 			return hv.ErrVMHalted
+		} else if system.typ == uint32(kvmSystemEventReset) {
+			return hv.ErrGuestRequestedReboot
 		}
 		return fmt.Errorf("kvm: vCPU %d exited with system event %d", v.id, system.typ)
 	default:

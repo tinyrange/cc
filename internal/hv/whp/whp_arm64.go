@@ -121,6 +121,8 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		switch resetCtx.ResetType {
 		case bindings.Arm64ResetTypePowerOff:
 			return hv.ErrVMHalted
+		case bindings.Arm64ResetTypeReboot:
+			return hv.ErrGuestRequestedReboot
 		default:
 			return fmt.Errorf("whp: unsupported ARM64 reset type %d", resetCtx.ResetType)
 		}

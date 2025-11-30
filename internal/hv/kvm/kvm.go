@@ -255,6 +255,17 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		return nil, fmt.Errorf("set user memory region: %w", err)
 	}
 
+	// Currently breaks virtio.
+	// if h.Architecture() == hv.ArchitectureX86_64 && config.NeedsInterruptSupport() {
+	// 	if err := acpi.Install(vm, acpi.Config{
+	// 		MemoryBase: config.MemoryBase(),
+	// 		MemorySize: config.MemorySize(),
+	// 	}); err != nil {
+	// 		unix.Close(vmFd)
+	// 		return nil, fmt.Errorf("install ACPI tables: %w", err)
+	// 	}
+	// }
+
 	// Create vCPUs
 	if config.CPUCount() != 1 {
 		unix.Close(vmFd)
