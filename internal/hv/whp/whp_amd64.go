@@ -10,6 +10,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/tinyrange/cc/internal/acpi"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/whp/bindings"
 )
@@ -233,50 +234,13 @@ func createEmulator() (bindings.EmulatorHandle, error) {
 }
 
 func (vm *virtualMachine) installACPI() error {
-	// 1. Choose safe area for ACPI tables at top of RAM
-	memBase := vm.memoryBase
-	memSize := uint64(vm.memory.Size())
-
-	acpiRegionSize := uint64(0x10000) // 64 KiB for all tables
-	acpiBase := memBase + memSize - acpiRegionSize
-
-	// Layout:
-	//   acpiBase + 0x0000 : XSDT
-	//   acpiBase + 0x0100 : MADT
-	//   acpiBase + 0x0200 : HPET
-
-	xsdtAddr := acpiBase
-	madtAddr := acpiBase + 0x0100
-	hpetAddr := acpiBase + 0x0200
-
-	// 2. Build tables
-	madt := BuildMADT(0xFEE00000, 0, 0, 0)
-	hpet := BuildHPET(hpetBaseAddress, 2)
-	xsdt := BuildXSDT([]uint64{
-		uint64(madtAddr),
-		uint64(hpetAddr),
+	return acpi.Install(vm, acpi.Config{
+		MemoryBase: vm.memoryBase,
+		MemorySize: uint64(vm.memory.Size()),
+		HPET: &acpi.HPETConfig{
+			Address: hpetBaseAddress,
+		},
 	})
-
-	// 3. Write tables into guest RAM
-	if _, err := vm.WriteAt(xsdt, int64(xsdtAddr)); err != nil {
-		return fmt.Errorf("write XSDT: %w", err)
-	}
-	if _, err := vm.WriteAt(madt, int64(madtAddr)); err != nil {
-		return fmt.Errorf("write MADT: %w", err)
-	}
-	if _, err := vm.WriteAt(hpet, int64(hpetAddr)); err != nil {
-		return fmt.Errorf("write HPET: %w", err)
-	}
-
-	// 4. Build RSDP in BIOS area 0xE0000 (must be identity mapped)
-	const rsdpPhys = 0x000E0000
-	rsdp := BuildRSDP(uint64(xsdtAddr))
-
-	if _, err := vm.WriteAt(rsdp, int64(rsdpPhys)); err != nil {
-		return fmt.Errorf("write RSDP: %w", err)
-	}
-
-	return nil
 }
 
 func (h *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
