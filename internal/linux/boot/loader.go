@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"strings"
 
@@ -278,14 +277,14 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 			if port == 0x12 {
 				return hv.ErrGuestRequestedReboot
 			}
-			slog.Info("legacy port read", "port", fmt.Sprintf("0x%04x", port), "size", len(data))
+			// slog.Info("legacy port read", "port", fmt.Sprintf("0x%04x", port), "size", len(data))
 			for i := range data {
 				data[i] = 0
 			}
 			return nil
 		},
 		WriteFunc: func(port uint16, data []byte) error {
-			slog.Info("legacy port write", "port", fmt.Sprintf("0x%04x", port), "size", len(data), "data", data)
+			// slog.Info("legacy port write", "port", fmt.Sprintf("0x%04x", port), "size", len(data), "data", data)
 			return nil
 		},
 	}

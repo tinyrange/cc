@@ -226,7 +226,7 @@ func (d *mmioDevice) checkMMIOBounds(addr, length uint64) error {
 func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
 	// Helper logger
 	logAccess := func(name string) {
-		slog.Info("virtio-mmio: write", "reg", name, "val", fmt.Sprintf("%#x", value), "queue_sel", d.queueSel)
+		// slog.Info("virtio-mmio: write", "reg", name, "val", fmt.Sprintf("%#x", value), "queue_sel", d.queueSel)
 	}
 
 	switch offset {

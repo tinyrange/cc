@@ -10,7 +10,6 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/tinyrange/cc/internal/acpi"
 	"github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/whp/bindings"
@@ -309,13 +308,14 @@ func createEmulator() (bindings.EmulatorHandle, error) {
 }
 
 func (vm *virtualMachine) installACPI() error {
-	return acpi.Install(vm, acpi.Config{
-		MemoryBase: vm.memoryBase,
-		MemorySize: uint64(vm.memory.Size()),
-		HPET: &acpi.HPETConfig{
-			Address: hpetBaseAddress,
-		},
-	})
+	return nil
+	// return acpi.Install(vm, acpi.Config{
+	// 	MemoryBase: vm.memoryBase,
+	// 	MemorySize: uint64(vm.memory.Size()),
+	// 	HPET: &acpi.HPETConfig{
+	// 		Address: hpetBaseAddress,
+	// 	},
+	// })
 }
 
 func (h *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {

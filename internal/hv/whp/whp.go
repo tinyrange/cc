@@ -159,6 +159,13 @@ func (v *virtualCPU) handleIOPortAccess(access *bindings.EmulatorIOAccessInfo) e
 		return fmt.Errorf("whp: unsupported IO port access size %d", access.AccessSize)
 	}
 
+	// slog.Info(
+	// 	"vCPU I/O port access",
+	// 	"port", fmt.Sprintf("0x%04X", access.Port),
+	// 	"size", access.AccessSize,
+	// 	"direction", access.Direction,
+	// )
+
 	// Buffer to bridge the gap between WHP's uint32 Data and Go's []byte device interfaces.
 	// We initialize it to zero to ensure clean upper bytes when reading partial sizes.
 	var data [4]byte
@@ -240,9 +247,9 @@ func (v *virtualCPU) handleMemoryAccess(access *bindings.EmulatorMemoryAccessInf
 				if gpa >= region.Address && gpa+size <= region.Address+region.Size {
 
 					// Virtio Console debug logging
-					if gpa >= 0xd000_0000 && gpa <= 0xd000_00ff {
-						fmt.Printf("Virtio Console Config Access GPA=%x Size=%d Dir=%v\n", gpa, size, access.Direction)
-					}
+					// if gpa >= 0xd000_0000 && gpa <= 0xd000_00ff {
+					// 	fmt.Printf("Virtio Console Config Access GPA=%x Size=%d Dir=%v\n", gpa, size, access.Direction)
+					// }
 
 					if access.Direction == bindings.EmulatorMemoryAccessDirectionRead {
 						// Read: Device -> Emulator

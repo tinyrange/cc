@@ -76,6 +76,8 @@ func (hb *HostBridge) IOPorts() []uint16 {
 
 // ReadIOPort implements hv.X86IOPortDevice.
 func (hb *HostBridge) ReadIOPort(port uint16, data []byte) error {
+	// slog.Info("pci host bridge: read I/O port", "port", fmt.Sprintf("0x%04x", port), "size", len(data))
+
 	for i := range data {
 		cur := port + uint16(i)
 		switch {
@@ -97,6 +99,8 @@ func (hb *HostBridge) ReadIOPort(port uint16, data []byte) error {
 
 // WriteIOPort implements hv.X86IOPortDevice.
 func (hb *HostBridge) WriteIOPort(port uint16, data []byte) error {
+	// slog.Info("pci host bridge: write I/O port", "port", fmt.Sprintf("0x%04x", port), "size", len(data), "data", data)
+
 	for i, b := range data {
 		cur := port + uint16(i)
 		switch {

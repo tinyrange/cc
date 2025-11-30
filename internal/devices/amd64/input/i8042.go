@@ -146,6 +146,7 @@ func (c *I8042) handleCommandLocked(command byte) error {
 		// Return 0xFF (Test Failed) or similar if we want to say "No Mouse".
 		// But usually just ignoring it or returning a dummy value works.
 		// For now, let's just ignore it to avoid fallback to default.
+		return nil
 	case i8042CommandResetCPU:
 		return hv.ErrGuestRequestedReboot
 	default:

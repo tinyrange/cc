@@ -18,7 +18,6 @@ import (
 	"github.com/tinyrange/cc/internal/asm/amd64"
 	"github.com/tinyrange/cc/internal/asm/arm64"
 	amd64serial "github.com/tinyrange/cc/internal/devices/amd64/serial"
-	"github.com/tinyrange/cc/internal/devices/serial"
 	"github.com/tinyrange/cc/internal/devices/virtio"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/factory"
@@ -685,32 +684,22 @@ func (q *bringUpQuest) RunLinux() error {
 			fmt.Sprintf("earlycon=uart8250,mmio,0x%x", arm64UARTMMIOBase),
 		}
 	case hv.ArchitectureX86_64:
-		if runtime.GOOS == "linux" {
-			cmdline = []string{
-				"console=hvc0",
-				"quiet",
-			}
-		} else {
-			cmdline = []string{
-				"console=ttyS0,115200n8",
-				"earlycon=uart8250,io,0x3f8,115200,keep",
-				"tsc=reliable",
-				"tsc_early_khz=3000000",
-			}
+		// if runtime.GOOS == "linux" {
+		cmdline = []string{
+			"console=hvc0",
+			"quiet",
+			"reboot=k",
+			"panic=-1",
+			"tsc=reliable",
+			"tsc_early_khz=3000000",
 		}
+		// }
 	default:
 		return fmt.Errorf("unsupported architecture for linux boot: %s", q.dev.Architecture())
 	}
 
 	devices := []hv.DeviceTemplate{
-		virtio.ConsoleTemplate{Out: buf, In: os.Stdin},
-	}
-	if q.dev.Architecture() == hv.ArchitectureARM64 {
-		devices = append(devices, serial.UART8250Template{
-			Base:     arm64UARTMMIOBase,
-			RegShift: 0,
-			Out:      buf,
-		})
+		virtio.ConsoleTemplate{Out: io.MultiWriter(os.Stdout, buf), In: os.Stdin},
 	}
 
 	loader := &boot.LinuxLoader{
@@ -750,12 +739,16 @@ func (q *bringUpQuest) RunLinux() error {
 						"main": {
 							ir.Printf("Hello, World\n"),
 							ir.Syscall(
-								amd64defs.SYS_REBOOT,
-								ir.Int64(amd64defs.LINUX_REBOOT_MAGIC1),
-								ir.Int64(amd64defs.LINUX_REBOOT_MAGIC2),
-								ir.Int64(amd64defs.LINUX_REBOOT_CMD_RESTART),
-								ir.Int64(0),
+								amd64defs.SYS_EXIT,
+								0,
 							),
+							// ir.Syscall(
+							// 	amd64defs.SYS_REBOOT,
+							// 	ir.Int64(amd64defs.LINUX_REBOOT_MAGIC1),
+							// 	ir.Int64(amd64defs.LINUX_REBOOT_MAGIC2),
+							// 	ir.Int64(amd64defs.LINUX_REBOOT_CMD_POWER_OFF),
+							// 	ir.Int64(0),
+							// ),
 						},
 					},
 				}, nil
