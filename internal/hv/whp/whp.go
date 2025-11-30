@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"runtime"
 
+	"github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/whp/bindings"
 )
@@ -279,6 +280,8 @@ type virtualMachine struct {
 	devices []hv.Device
 
 	emu bindings.EmulatorHandle
+
+	ioapic *chipset.IOAPIC
 }
 
 // implements hv.VirtualMachine.

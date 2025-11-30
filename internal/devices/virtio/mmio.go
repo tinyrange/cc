@@ -451,7 +451,7 @@ func (d *mmioDevice) raiseInterrupt(bit uint32) {
 		return
 	}
 	if vm, ok := d.vm.(hv.VirtualMachineAmd64); ok {
-		if err := vm.PulseIRQ(d.irqLine); err != nil {
+		if err := vm.SetIRQ(d.irqLine, d.interruptStatus != 0); err != nil {
 			slog.Error("virtio: pulse irq failed", "irq", d.irqLine, "err", err)
 		}
 	}

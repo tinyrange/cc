@@ -292,7 +292,7 @@ type VirtualMachine interface {
 type VirtualMachineAmd64 interface {
 	VirtualMachine
 
-	PulseIRQ(irqLine uint32) error
+	SetIRQ(irqLine uint32, level bool) error
 }
 
 type VMLoader interface {

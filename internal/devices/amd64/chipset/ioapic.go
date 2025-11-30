@@ -13,7 +13,7 @@ const (
 	IOAPICBaseAddress uint64 = 0xFEC00000
 
 	ioapicRegisterWindowSize = 0x20
-	ioapicMMIOMask           = ioapicRegisterWindowSize - 1
+	// ioapicMMIOMask           = ioapicRegisterWindowSize - 1 // Unused
 
 	ioapicRegisterSelect = 0x00
 	ioapicRegisterData   = 0x10
@@ -60,22 +60,27 @@ func (i *IOAPIC) Init(vm hv.VirtualMachine) error {
 // IoApicRouting allows the IO-APIC to notify the rest of the VMM when an
 // interrupt should be injected into a vCPU.
 type IoApicRouting interface {
-	Assert(line uint8, vector uint8)
+	// Assert requests an interrupt injection.
+	// vector: The IDT vector (0-255).
+	// dest: The target CPU ID or APIC ID.
+	// destMode: 0 for Physical, 1 for Logical.
+	// deliveryMode: 0 for Fixed, 1 for LowestPriority, etc.
+	Assert(vector uint8, dest uint8, destMode uint8, deliveryMode uint8)
 }
 
 // IoApicRoutingFunc adapts a simple function to IoApicRouting.
-type IoApicRoutingFunc func(line uint8, vector uint8)
+type IoApicRoutingFunc func(vector uint8, dest uint8, destMode uint8, deliveryMode uint8)
 
 // Assert implements IoApicRouting.
-func (f IoApicRoutingFunc) Assert(line uint8, vector uint8) {
+func (f IoApicRoutingFunc) Assert(vector uint8, dest uint8, destMode uint8, deliveryMode uint8) {
 	if f != nil {
-		f(line, vector)
+		f(vector, dest, destMode, deliveryMode)
 	}
 }
 
 type noopIoApicRouting struct{}
 
-func (noopIoApicRouting) Assert(uint8, uint8) {}
+func (noopIoApicRouting) Assert(uint8, uint8, uint8, uint8) {}
 
 // NewIOAPIC builds an IO-APIC exposing numEntries redirection slots.
 func NewIOAPIC(numEntries int) *IOAPIC {
@@ -185,6 +190,7 @@ func (i *IOAPIC) WriteMMIO(addr uint64, data []byte) error {
 		if len(data) == 0 {
 			return fmt.Errorf("ioapic: empty write to select register")
 		}
+		// If data is larger than 1 byte, we take the LSB (Little Endian).
 		i.index = data[0]
 	case ioapicRegisterData:
 		if len(data) != 4 {
@@ -241,11 +247,15 @@ func (i *IOAPIC) writeRedirection(index uint8, value uint32) {
 	if entry == nil {
 		return
 	}
+
 	raw := entry.redirection.raw()
 	val := uint64(value)
 	lowMask := redirectionWriteMask & 0xffffffff
 	highMask := redirectionWriteMask & 0xffffffff00000000
 	line := uint8(index / 2)
+
+	wasMasked := entry.redirection.masked()
+
 	if index&1 == 1 {
 		raw &= ^highMask
 		raw |= (val << 32) & highMask
@@ -254,7 +264,15 @@ func (i *IOAPIC) writeRedirection(index uint8, value uint32) {
 		raw |= val & lowMask
 	}
 	entry.redirection.setRaw(raw)
-	entry.evaluate(i.routing, &i.stats, line, false)
+
+	isMasked := entry.redirection.masked()
+
+	// If the line was masked and is now unmasked, and the line is currently High,
+	// we must treat this as a rising edge for Edge-Triggered interrupts.
+	// Without this, Serial ports waiting for an interrupt will hang forever.
+	forceEdge := wasMasked && !isMasked && entry.lineLevel
+
+	entry.evaluate(i.routing, &i.stats, line, forceEdge)
 }
 
 func (i *IOAPIC) entryForIndex(index uint8) *irqRedirection {
@@ -312,7 +330,18 @@ func (r *irqRedirection) evaluate(router IoApicRouting, stats *ioapicStats, line
 	if int(line) < len(stats.perIRQ) {
 		stats.perIRQ[line]++
 	}
-	router.Assert(line, r.redirection.vector())
+
+	destMode := uint8(0) // Physical
+	if r.redirection.destinationModeLogical() {
+		destMode = 1
+	}
+
+	router.Assert(
+		r.redirection.vector(),
+		r.redirection.destination(),
+		destMode,
+		r.redirection.deliveryMode(),
+	)
 }
 
 type redirectionEntry struct {
@@ -332,6 +361,11 @@ func (r redirectionEntry) raw() uint64 {
 
 func (r *redirectionEntry) setRaw(value uint64) {
 	r.value = value
+}
+
+// destination returns bits 56-63 (Destination Field)
+func (r redirectionEntry) destination() uint8 {
+	return uint8((r.value >> 56) & 0xFF)
 }
 
 func (r redirectionEntry) vector() uint8 {

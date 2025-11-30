@@ -100,17 +100,3 @@ func irqLevel(vmFd int, irqLine uint32, level bool) error {
 	_, err := ioctlWithRetry(uintptr(vmFd), uint64(kvmIrqLine), uintptr(unsafe.Pointer(&line)))
 	return err
 }
-
-func pulseIRQ(vmFd int, irqLine uint32) error {
-	// Set the IRQ line to high
-	if err := irqLevel(vmFd, irqLine, true); err != nil {
-		return fmt.Errorf("setting IRQ line high: %w", err)
-	}
-
-	// Set the IRQ line to low
-	if err := irqLevel(vmFd, irqLine, false); err != nil {
-		return fmt.Errorf("setting IRQ line low: %w", err)
-	}
-
-	return nil
-}

@@ -11,6 +11,7 @@ import (
 	"unsafe"
 
 	"github.com/tinyrange/cc/internal/acpi"
+	"github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/whp/bindings"
 )
@@ -147,7 +148,7 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 }
 
 func (vm *virtualCPU) handleCpuid(ctx bindings.VPExitContext, info *bindings.X64CpuidAccessContext) error {
-	slog.Info(
+	slog.Debug(
 		"CPUID access",
 		"rax", fmt.Sprintf("0x%X", info.Rax),
 		"rbx", fmt.Sprintf("0x%X", info.Rbx),
@@ -170,7 +171,7 @@ func (vm *virtualCPU) handleCpuid(ctx bindings.VPExitContext, info *bindings.X64
 
 func (vm *virtualCPU) handleMsr(ctx bindings.VPExitContext, info *bindings.X64MsrAccessContext) error {
 	if info.AccessInfo.IsWrite() {
-		slog.Info(
+		slog.Debug(
 			"MSR write",
 			"msr", fmt.Sprintf("0x%X", info.MsrNumber),
 			"rax", fmt.Sprintf("0x%X", info.Rax),
@@ -187,7 +188,7 @@ func (vm *virtualCPU) handleMsr(ctx bindings.VPExitContext, info *bindings.X64Ms
 
 		return nil
 	} else {
-		slog.Info(
+		slog.Debug(
 			"MSR read",
 			"msr", fmt.Sprintf("0x%X", info.MsrNumber),
 		)
@@ -368,7 +369,8 @@ func (h *hypervisor) archVMInitWithMemory(vm *virtualMachine, config hv.VMConfig
 		if err := vm.AddDevice(NewHPETDevice(hpetBaseAddress, vm)); err != nil {
 			return fmt.Errorf("add HPET device: %w", err)
 		}
-		if err := vm.AddDevice(NewIOAPIC(ioapicBaseAddress, 0, vm)); err != nil {
+		vm.ioapic = chipset.NewIOAPIC(24)
+		if err := vm.AddDevice(vm.ioapic); err != nil {
 			return fmt.Errorf("add IOAPIC device: %w", err)
 		}
 	}
@@ -585,17 +587,12 @@ func (v *virtualCPU) SetProtectedMode() error {
 	panic("unimplemented")
 }
 
-func (v *virtualMachine) PulseIRQ(irqLine uint32) error {
-	return bindings.RequestInterrupt(v.part, &bindings.InterruptControl{
-		Control: bindings.MakeInterruptControlKind(
-			bindings.InterruptTypeFixed,
-			bindings.InterruptDestinationPhysical,
-			bindings.InterruptTriggerEdge,
-			0,
-		),
-		Destination: 0, // TODO(joshua): Move this to target vCPU ID?
-		Vector:      irqLine,
-	})
+func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
+	if v.ioapic == nil {
+		return fmt.Errorf("ioapic not initialized")
+	}
+	v.ioapic.SetIRQ(irqLine, level)
+	return nil
 }
 
 func (v *virtualMachine) RequestInterrupt(dest uint32, vector uint32, intType bindings.InterruptType, destMode uint32) error {

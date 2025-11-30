@@ -98,6 +98,13 @@ func (s *Serial16550) writeRegister(port uint16, value byte) {
 		if s.lcr&serialLCRDLAB != 0 {
 			s.dll = value
 		} else {
+			// FIX: Simulate the buffer becoming full before it becomes empty again.
+			// 1. Clear THRE (Buffer Full)
+			s.lsr &^= serialLSRTHRE
+			// 2. Drop the IRQ Line (Update Interrupts sees THRE is gone)
+			s.updateInterrupts()
+
+			// 3. Perform Transmission (Instantly empties buffer)
 			s.transmit(value)
 		}
 	case 1:
@@ -113,7 +120,9 @@ func (s *Serial16550) writeRegister(port uint16, value byte) {
 	case 4:
 		s.setMCR(value)
 	case 5:
+		// Factory Test (Write to LSR) - usually ignored or resets LSR
 	case 6:
+		// MSR is read-only
 	case 7:
 		s.scr = value
 	}
@@ -176,11 +185,14 @@ func (s *Serial16550) updateInterrupts() {
 		interrupt = 0x00
 	}
 
-	prev := s.pendingIIR
 	s.pendingIIR = interrupt
 
-	if s.vm != nil && s.irqLine != 0 && interrupt != 0x01 && prev == 0x01 {
-		_ = s.vm.(hv.VirtualMachineAmd64).PulseIRQ(s.irqLine)
+	if s.vm != nil && s.irqLine != 0 {
+		isAsserted := (interrupt != 0x01)
+
+		if vm, ok := s.vm.(hv.VirtualMachineAmd64); ok {
+			_ = vm.SetIRQ(s.irqLine, isAsserted)
+		}
 	}
 }
 
@@ -204,7 +216,11 @@ func (s *Serial16550) transmit(value byte) {
 			_, _ = s.out.Write([]byte{value})
 		}
 	}
+
+	// 4. Set THRE (Buffer Empty)
 	s.lsr |= serialLSRTHRE | serialLSRTEMT
+
+	// 5. Raise the IRQ Line (Edge Trigger!)
 	s.updateInterrupts()
 }
 

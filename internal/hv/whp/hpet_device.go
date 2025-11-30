@@ -12,7 +12,7 @@ import (
 
 // InterruptSink defines where the HPET sends its signals (usually the IOAPIC)
 type InterruptSink interface {
-	PulseIRQ(irq uint32) error
+	SetIRQ(irq uint32, level bool) error
 }
 
 const (
@@ -218,7 +218,8 @@ func (d *hpetDevice) updateCounterLocked() {
 
 				if d.sink != nil {
 					// Pulse the interrupt (High then Low for Edge)
-					d.sink.PulseIRQ(uint32(irq))
+					d.sink.SetIRQ(uint32(irq), true)
+					d.sink.SetIRQ(uint32(irq), false)
 				}
 
 				// Set interrupt status bit

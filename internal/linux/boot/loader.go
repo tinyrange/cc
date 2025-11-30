@@ -242,12 +242,6 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 		return fmt.Errorf("add dual PIC: %w", err)
 	}
 
-	const ioApicLegacyEntries = 24
-	ioapic := chipset.NewIOAPIC(ioApicLegacyEntries)
-	if err := vm.AddDevice(ioapic); err != nil {
-		return fmt.Errorf("add IOAPIC: %w", err)
-	}
-
 	if err := vm.AddDevice(chipset.NewPIT(pic)); err != nil {
 		return fmt.Errorf("add PIT: %w", err)
 	}
