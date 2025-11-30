@@ -684,11 +684,20 @@ func (q *bringUpQuest) RunLinux() error {
 			"console=ttyS0,115200n8",
 			fmt.Sprintf("earlycon=uart8250,mmio,0x%x", arm64UARTMMIOBase),
 		}
-	default:
-		cmdline = []string{
-			"console=ttyS0,115200n8",
-			"earlycon=uart8250,io,0x3f8,115200,keep",
+	case hv.ArchitectureX86_64:
+		if runtime.GOOS == "linux" {
+			cmdline = []string{
+				"console=hvc0",
+				"quiet",
+			}
+		} else {
+			cmdline = []string{
+				"console=ttyS0,115200n8",
+				"earlycon=uart8250,io,0x3f8,115200,keep",
+			}
 		}
+	default:
+		return fmt.Errorf("unsupported architecture for linux boot: %s", q.dev.Architecture())
 	}
 
 	devices := []hv.DeviceTemplate{
@@ -731,7 +740,8 @@ func (q *bringUpQuest) RunLinux() error {
 		},
 
 		GetInit: func(arch hv.CpuArchitecture) (*ir.Program, error) {
-			if arch == hv.ArchitectureX86_64 {
+			switch arch {
+			case hv.ArchitectureX86_64:
 				return &ir.Program{
 					Entrypoint: "main",
 					Methods: map[string]ir.Method{
@@ -747,7 +757,7 @@ func (q *bringUpQuest) RunLinux() error {
 						},
 					},
 				}, nil
-			} else if arch == hv.ArchitectureARM64 {
+			case hv.ArchitectureARM64:
 				return &ir.Program{
 					Entrypoint: "main",
 					Methods: map[string]ir.Method{
@@ -763,7 +773,7 @@ func (q *bringUpQuest) RunLinux() error {
 						},
 					},
 				}, nil
-			} else {
+			default:
 				return nil, fmt.Errorf("unsupported architecture for init program: %s", arch)
 			}
 		},
