@@ -18,7 +18,7 @@ CrumbleCracker is a high performance embeddable virtualization platform designed
 - [x] Add support for timing out a VM run after a period.
 - [x] Add automatic downloader for Alpine Linux kernels.
 - [x] Add a serial device and boot a Linux kernel from Alpine Linux into a minimal Init program written using the assembler.
-- [ ] Add `virtio-mmio` support starting with a `virtio-console` driver.
+- [x] Add `virtio-mmio` support starting with a `virtio-console` driver.
 - [ ] Write a more advanced init program supporting multiple entries into the virtual guest.
 - [ ] Support loading necessary kernel modules in Alpine Linux.
 - [ ] Add a downloader for OCI images to pull a root filesystem for the virtual machine.
@@ -26,6 +26,18 @@ CrumbleCracker is a high performance embeddable virtualization platform designed
 - [ ] Add snapshotting support with support for capturing multiple snapshots tied to a MMIO control device.
 - [ ] Add a custom optimized TCP/IP stack tied to a `virtio-net` driver to add network support without privileges.
 - [ ] Add filesystem sharing using `virtio-fs`.
+
+## Cross-Platform Status
+
+Only Linux Guests and bare-metal code are currently supported.
+
+### Platforms
+
+- **Linux x86_64**: Works, **primary platform**.
+- **Windows x86_64**: Works (up to current step in the plan) with Quirks
+- **Linux arm64**: Missing `virtio` bring-up.
+- **Windows arm64**: Missing `virtio` bring-up.
+- **macOS arm64**: Work in Progress.
 
 ## Relationship to TinyRange
 
