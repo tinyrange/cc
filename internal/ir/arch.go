@@ -5,16 +5,7 @@ import (
 	"sync"
 
 	"github.com/tinyrange/cc/internal/asm"
-)
-
-// Architecture identifies the backend required to lower IR fragments into
-// machine code.
-type Architecture string
-
-const (
-	ArchitectureInvalid Architecture = ""
-	ArchitectureX86_64  Architecture = "x86_64"
-	ArchitectureARM64   Architecture = "arm64"
+	"github.com/tinyrange/cc/internal/hv"
 )
 
 // Backend exposes the architecture-specific pieces required by the top-level
@@ -25,14 +16,14 @@ type Backend interface {
 
 var (
 	backendsMu sync.RWMutex
-	backends   = make(map[Architecture]Backend)
+	backends   = make(map[hv.CpuArchitecture]Backend)
 )
 
 // RegisterBackend wires an architecture-specific backend into the shared IR
 // helpers. It panics when attempting to register the same architecture more
 // than once so mistakes are caught during init.
-func RegisterBackend(arch Architecture, backend Backend) {
-	if arch == ArchitectureInvalid {
+func RegisterBackend(arch hv.CpuArchitecture, backend Backend) {
+	if arch == hv.ArchitectureInvalid {
 		panic("ir: cannot register backend for invalid architecture")
 	}
 	if backend == nil {
@@ -48,14 +39,14 @@ func RegisterBackend(arch Architecture, backend Backend) {
 	backends[arch] = backend
 }
 
-func lookupBackend(arch Architecture) (Backend, error) {
+func lookupBackend(arch hv.CpuArchitecture) (Backend, error) {
 	backendsMu.RLock()
 	defer backendsMu.RUnlock()
 
 	if backend, ok := backends[arch]; ok {
 		return backend, nil
 	}
-	if arch == ArchitectureInvalid {
+	if arch == hv.ArchitectureInvalid {
 		return nil, fmt.Errorf("ir: architecture must be specified")
 	}
 	return nil, fmt.Errorf("ir: no backend registered for %q", arch)
@@ -63,7 +54,7 @@ func lookupBackend(arch Architecture) (Backend, error) {
 
 // BuildStandaloneProgramForArch lowers the requested Program using the backend
 // registered for arch.
-func BuildStandaloneProgramForArch(arch Architecture, prog *Program) (asm.Program, error) {
+func BuildStandaloneProgramForArch(arch hv.CpuArchitecture, prog *Program) (asm.Program, error) {
 	if prog == nil {
 		return asm.Program{}, fmt.Errorf("ir: program must be non-nil")
 	}

@@ -93,6 +93,14 @@ type LinuxLoader struct {
 	plan bootPlan
 }
 
+func (l *LinuxLoader) ConfigureVCPU(vcpu hv.VirtualCPU) error {
+	if l.plan == nil {
+		return errors.New("linux loader not loaded")
+	}
+
+	return l.plan.ConfigureVCPU(vcpu)
+}
+
 // OnCreateVCPU implements hv.VMCallbacks.
 func (l *LinuxLoader) OnCreateVCPU(vCpu hv.VirtualCPU) error {
 	return nil
@@ -174,17 +182,7 @@ func (l *LinuxLoader) buildInitPayload(arch hv.CpuArchitecture) ([]byte, error) 
 		return nil, fmt.Errorf("init program for %s is nil", arch)
 	}
 
-	var irArch ir.Architecture
-	switch arch {
-	case hv.ArchitectureX86_64:
-		irArch = ir.ArchitectureX86_64
-	case hv.ArchitectureARM64:
-		irArch = ir.ArchitectureARM64
-	default:
-		return nil, fmt.Errorf("unsupported architecture for init payload: %s", arch)
-	}
-
-	fac, err := ir.BuildStandaloneProgramForArch(irArch, initProg)
+	fac, err := ir.BuildStandaloneProgramForArch(arch, initProg)
 	if err != nil {
 		return nil, fmt.Errorf("build init program: %w", err)
 	}

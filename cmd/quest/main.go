@@ -22,6 +22,7 @@ import (
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/factory"
 	"github.com/tinyrange/cc/internal/hv/helpers"
+	"github.com/tinyrange/cc/internal/initx"
 	"github.com/tinyrange/cc/internal/ir"
 	amd64ir "github.com/tinyrange/cc/internal/ir/amd64"
 	arm64ir "github.com/tinyrange/cc/internal/ir/arm64"
@@ -684,7 +685,6 @@ func (q *bringUpQuest) RunLinux() error {
 			fmt.Sprintf("earlycon=uart8250,mmio,0x%x", arm64UARTMMIOBase),
 		}
 	case hv.ArchitectureX86_64:
-		// if runtime.GOOS == "linux" {
 		cmdline = []string{
 			"console=hvc0",
 			"quiet",
@@ -693,7 +693,6 @@ func (q *bringUpQuest) RunLinux() error {
 			"tsc=reliable",
 			"tsc_early_khz=3000000",
 		}
-		// }
 	default:
 		return fmt.Errorf("unsupported architecture for linux boot: %s", q.dev.Architecture())
 	}
@@ -812,10 +811,73 @@ func (q *bringUpQuest) RunLinux() error {
 	return nil
 }
 
+type defaultKernelLoader struct{}
+
+// GetKernel implements initx.KernelLoader.
+func (d *defaultKernelLoader) GetKernel() (io.ReaderAt, int64, error) {
+	kernelPath := defaultKernelImagePath()
+	f, err := os.Open(kernelPath)
+	if err != nil {
+		return nil, 0, fmt.Errorf("open kernel image %q: %w", kernelPath, err)
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return nil, 0, fmt.Errorf("stat kernel image %q: %w", kernelPath, err)
+	}
+	return f, info.Size(), nil
+}
+
+var (
+	_ initx.KernelLoader = &defaultKernelLoader{}
+)
+
+func RunInitX() error {
+	slog.Info("Starting Bringup Quest: InitX Boot")
+
+	hv, err := factory.Open()
+	if err != nil {
+		return fmt.Errorf("open hypervisor factory: %w", err)
+	}
+	defer hv.Close()
+
+	vm, err := initx.NewVirtualMachine(
+		hv,
+		1,
+		256,
+		&defaultKernelLoader{},
+	)
+	if err != nil {
+		return fmt.Errorf("create initx virtual machine: %w", err)
+	}
+	defer vm.Close()
+
+	for i := range 10 {
+		if err := vm.Run(
+			context.Background(),
+			&ir.Program{
+				Entrypoint: "main",
+				Methods: map[string]ir.Method{
+					"main": {
+						ir.Printf(fmt.Sprintf("initx-bringup-quest-%d\n", i)),
+						ir.Return(ir.Int64(0)),
+					},
+				},
+			},
+		); err != nil {
+			return fmt.Errorf("run initx virtual machine: %w", err)
+		}
+	}
+
+	slog.Info("InitX Bringup Quest Completed Successfully")
+
+	return nil
+}
+
 func main() {
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
 	linux := fs.Bool("linux", false, "Try booting Linux")
+	initX := fs.Bool("initx", false, "Run bringup tests for initx")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		slog.Error("failed to parse flags", "error", err)
@@ -823,6 +885,14 @@ func main() {
 	}
 
 	q := &bringUpQuest{}
+
+	if *initX {
+		if err := RunInitX(); err != nil {
+			slog.Error("failed bringup quest initx", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *linux {
 		if err := q.RunLinux(); err != nil {

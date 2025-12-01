@@ -121,12 +121,12 @@ func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 
 // Load implements hv.VMLoader.
 func (p *ProgramLoader) Load(vm hv.VirtualMachine) error {
-	var target ir.Architecture
+	var target hv.CpuArchitecture
 	switch vm.Hypervisor().Architecture() {
 	case hv.ArchitectureX86_64:
-		target = ir.ArchitectureX86_64
+		target = hv.ArchitectureX86_64
 	case hv.ArchitectureARM64:
-		target = ir.ArchitectureARM64
+		target = hv.ArchitectureARM64
 	default:
 		return fmt.Errorf("unsupported architecture: %v", vm.Hypervisor().Architecture())
 	}
@@ -141,7 +141,7 @@ func (p *ProgramLoader) Load(vm hv.VirtualMachine) error {
 		return fmt.Errorf("write program to vm memory: %w", err)
 	}
 
-	if target == ir.ArchitectureARM64 && p.Arm64ExceptionVectors != nil {
+	if target == hv.ArchitectureARM64 && p.Arm64ExceptionVectors != nil {
 		if len(p.Arm64ExceptionVectors.Table) == 0 {
 			return fmt.Errorf("arm64 exception vector table is empty")
 		}
