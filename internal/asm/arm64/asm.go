@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"sync/atomic"
 
-	linux "github.com/tinyrange/cc/internal/linux/defs/arm64"
-
 	"github.com/tinyrange/cc/internal/asm"
+	"github.com/tinyrange/cc/internal/linux/defs"
+	arm64defs "github.com/tinyrange/cc/internal/linux/defs/arm64"
 )
 
 func requireContext(ctx asm.Context) (*Context, error) {
@@ -475,7 +475,7 @@ func Ret() asm.Fragment {
 	})
 }
 
-func Syscall(number int, args ...asm.Value) asm.Fragment {
+func Syscall(number defs.Syscall, args ...asm.Value) asm.Fragment {
 	return &syscallFragment{number: number, args: args}
 }
 
@@ -513,7 +513,7 @@ func SetVectorBase(src Reg) asm.Fragment {
 }
 
 func SyscallWrite(fd asm.Value, buf asm.Value, count asm.Value) asm.Fragment {
-	return Syscall(linux.SYS_WRITE, fd, buf, count)
+	return Syscall(defs.SYS_WRITE, fd, buf, count)
 }
 
 func SyscallWriteString(fd asm.Value, s string) asm.Fragment {
@@ -521,7 +521,7 @@ func SyscallWriteString(fd asm.Value, s string) asm.Fragment {
 }
 
 type syscallFragment struct {
-	number int
+	number defs.Syscall
 	args   []asm.Value
 }
 
@@ -530,7 +530,11 @@ func (s *syscallFragment) Emit(ctx asm.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := emitMovImmediate(c, Reg64(X8), uint64(s.number)); err != nil {
+	num, ok := arm64defs.SyscallMap[s.number]
+	if !ok {
+		return fmt.Errorf("arm64 asm: unknown syscall number %d", s.number)
+	}
+	if err := emitMovImmediate(c, Reg64(X8), uint64(num)); err != nil {
 		return err
 	}
 	argRegs := []Reg{

@@ -563,7 +563,7 @@ func (c *compiler) compileSyscall(sc ir.SyscallFragment, needResult bool) (asm.V
 		}
 	}
 
-	c.emit(amd64.Syscall(int(sc.Num), args...))
+	c.emit(amd64.Syscall(sc.Num, args...))
 
 	for _, reg := range regs {
 		c.freeReg(reg)

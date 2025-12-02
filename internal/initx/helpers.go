@@ -7,6 +7,7 @@ import (
 
 	"github.com/tinyrange/cc/internal/asm"
 	"github.com/tinyrange/cc/internal/ir"
+	"github.com/tinyrange/cc/internal/linux/defs"
 	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 )
 
@@ -52,7 +53,7 @@ func ReportRunResult(stage any, detail any) ir.Fragment {
 		ir.Assign(stageVar, stage),
 		ir.Assign(detailVar, detail),
 		ir.Assign(fd, ir.Syscall(
-			linux.SYS_OPENAT,
+			defs.SYS_OPENAT,
 			ir.Int64(linux.AT_FDCWD),
 			"/dev/mem",
 			ir.Int64(linux.O_RDWR|linux.O_SYNC),
@@ -60,7 +61,7 @@ func ReportRunResult(stage any, detail any) ir.Fragment {
 		)),
 		ir.If(ir.IsNegative(fd), ir.Goto(done)),
 		ir.Assign(ptr, ir.Syscall(
-			linux.SYS_MMAP,
+			defs.SYS_MMAP,
 			ir.Int64(0),
 			ir.Int64(mailboxMapSize),
 			ir.Int64(linux.PROT_READ|linux.PROT_WRITE),
@@ -69,13 +70,13 @@ func ReportRunResult(stage any, detail any) ir.Fragment {
 			ir.Int64(snapshotSignalPhysAddr),
 		)),
 		ir.If(ir.IsNegative(ptr), ir.Block{
-			ir.Syscall(linux.SYS_CLOSE, fd),
+			ir.Syscall(defs.SYS_CLOSE, fd),
 			ir.Goto(failed),
 		}),
 		ir.Assign(ptr.MemWithDisp(mailboxRunResultDetailOffset).As32(), detailVar.As32()),
 		ir.Assign(ptr.MemWithDisp(mailboxRunResultStageOffset).As32(), stageVar.As32()),
-		ir.Syscall(linux.SYS_MUNMAP, ptr, ir.Int64(mailboxMapSize)),
-		ir.Syscall(linux.SYS_CLOSE, fd),
+		ir.Syscall(defs.SYS_MUNMAP, ptr, ir.Int64(mailboxMapSize)),
+		ir.Syscall(defs.SYS_CLOSE, fd),
 		ir.Goto(done),
 		ir.DeclareLabel(failed, ir.Block{}),
 		ir.DeclareLabel(done, ir.Block{}),
@@ -93,7 +94,7 @@ func RequestSnapshot() ir.Fragment {
 	return ir.Block{
 		ir.Assign(val, ir.Int64(snapshotRequestValue)),
 		ir.Assign(fd, ir.Syscall(
-			linux.SYS_OPENAT,
+			defs.SYS_OPENAT,
 			ir.Int64(linux.AT_FDCWD),
 			"/dev/mem",
 			ir.Int64(linux.O_RDWR|linux.O_SYNC),
@@ -101,7 +102,7 @@ func RequestSnapshot() ir.Fragment {
 		)),
 		ir.If(ir.IsNegative(fd), ir.Goto(done)),
 		ir.Assign(ptr, ir.Syscall(
-			linux.SYS_MMAP,
+			defs.SYS_MMAP,
 			ir.Int64(0),
 			ir.Int64(mailboxMapSize),
 			ir.Int64(linux.PROT_READ|linux.PROT_WRITE),
@@ -110,12 +111,12 @@ func RequestSnapshot() ir.Fragment {
 			ir.Int64(snapshotSignalPhysAddr),
 		)),
 		ir.If(ir.IsNegative(ptr), ir.Block{
-			ir.Syscall(linux.SYS_CLOSE, fd),
+			ir.Syscall(defs.SYS_CLOSE, fd),
 			ir.Goto(failed),
 		}),
 		ir.Assign(ptr.Mem().As32(), val.As32()),
-		ir.Syscall(linux.SYS_MUNMAP, ptr, ir.Int64(mailboxMapSize)),
-		ir.Syscall(linux.SYS_CLOSE, fd),
+		ir.Syscall(defs.SYS_MUNMAP, ptr, ir.Int64(mailboxMapSize)),
+		ir.Syscall(defs.SYS_CLOSE, fd),
 		ir.Goto(done),
 		ir.DeclareLabel(failed, ir.Block{}),
 		ir.DeclareLabel(done, ir.Block{}),
@@ -133,7 +134,7 @@ func Mount(
 ) ir.Fragment {
 	return ir.Block{
 		ir.Assign(errVar, ir.Syscall(
-			linux.SYS_MOUNT,
+			defs.SYS_MOUNT,
 			source,
 			target,
 			fstype,
@@ -152,7 +153,7 @@ func Mount(
 func Mkdir(path string, mode uint32, errLabel ir.Label, errVar ir.Var) ir.Fragment {
 	return ir.Block{
 		ir.Assign(errVar, ir.Syscall(
-			linux.SYS_MKDIRAT,
+			defs.SYS_MKDIRAT,
 			ir.Int64(linux.AT_FDCWD),
 			path,
 			ir.Int64(int64(mode)),
@@ -172,12 +173,12 @@ func Mkdir(path string, mode uint32, errLabel ir.Label, errVar ir.Var) ir.Fragme
 func Chroot(path string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
 	return ir.Block{
 		ir.Assign(errVar, ir.Syscall(
-			linux.SYS_CHROOT,
+			defs.SYS_CHROOT,
 			path,
 		)),
 		ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
 		ir.Assign(errVar, ir.Syscall(
-			linux.SYS_CHDIR,
+			defs.SYS_CHDIR,
 			"/",
 		)),
 		ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
@@ -196,7 +197,7 @@ func SetClock(sec int64, nsec int64, errLabel ir.Label, errVar ir.Var) ir.Fragme
 				ir.Assign(slot.At(8), ir.Int64(nsec)),
 				ir.Assign(ptr, slot.Pointer()),
 				ir.Assign(errVar, ir.Syscall(
-					linux.SYS_CLOCK_SETTIME,
+					defs.SYS_CLOCK_SETTIME,
 					ir.Int64(linux.CLOCK_REALTIME),
 					ptr,
 				)),
@@ -216,7 +217,7 @@ func SyncClockFromPTP(ptpPath string, errLabel ir.Label, errVar ir.Var) ir.Fragm
 
 			return ir.Block{
 				ir.Assign(fd, ir.Syscall(
-					linux.SYS_OPENAT,
+					defs.SYS_OPENAT,
 					ir.Int64(linux.AT_FDCWD),
 					ptpPath,
 					ir.Int64(linux.O_RDWR|linux.O_CLOEXEC),
@@ -234,21 +235,21 @@ func SyncClockFromPTP(ptpPath string, errLabel ir.Label, errVar ir.Var) ir.Fragm
 				ir.Assign(clockId, ir.Op(ir.OpAdd, clockId, ir.Int64(3))),
 
 				ir.Assign(errVar, ir.Syscall(
-					linux.SYS_CLOCK_GETTIME,
+					defs.SYS_CLOCK_GETTIME,
 					clockId,
 					ptr,
 				)),
 				ir.If(ir.IsNegative(errVar), ir.Block{
-					ir.Syscall(linux.SYS_CLOSE, fd),
+					ir.Syscall(defs.SYS_CLOSE, fd),
 					ir.Goto(errLabel),
 				}),
 
 				ir.Assign(errVar, ir.Syscall(
-					linux.SYS_CLOCK_SETTIME,
+					defs.SYS_CLOCK_SETTIME,
 					ir.Int64(linux.CLOCK_REALTIME),
 					ptr,
 				)),
-				ir.Syscall(linux.SYS_CLOSE, fd),
+				ir.Syscall(defs.SYS_CLOSE, fd),
 				ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
 			}
 		},
@@ -269,7 +270,7 @@ func ConfigureInterface(ifName string, ip uint32, mask uint32, errLabel ir.Label
 			flagsVal := int64(linux.IFF_UP | linux.IFF_RUNNING)
 
 			return ir.Block{
-				ir.Assign(fd, ir.Syscall(linux.SYS_SOCKET, ir.Int64(linux.AF_INET), ir.Int64(linux.SOCK_DGRAM), ir.Int64(0))),
+				ir.Assign(fd, ir.Syscall(defs.SYS_SOCKET, ir.Int64(linux.AF_INET), ir.Int64(linux.SOCK_DGRAM), ir.Int64(0))),
 				ir.Assign(errVar, fd),
 				ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
 
@@ -279,24 +280,24 @@ func ConfigureInterface(ifName string, ip uint32, mask uint32, errLabel ir.Label
 
 				// Set IP
 				ir.Assign(slot.At(16), ir.Int64(familyIP)),
-				ir.Assign(errVar, ir.Syscall(linux.SYS_IOCTL, fd, ir.Int64(linux.SIOCSIFADDR), ptr)),
+				ir.Assign(errVar, ir.Syscall(defs.SYS_IOCTL, fd, ir.Int64(linux.SIOCSIFADDR), ptr)),
 				ir.If(ir.IsNegative(errVar), ir.Block{
-					ir.Syscall(linux.SYS_CLOSE, fd),
+					ir.Syscall(defs.SYS_CLOSE, fd),
 					ir.Goto(errLabel),
 				}),
 
 				// Set Mask
 				ir.Assign(slot.At(16), ir.Int64(familyMask)),
-				ir.Assign(errVar, ir.Syscall(linux.SYS_IOCTL, fd, ir.Int64(linux.SIOCSIFNETMASK), ptr)),
+				ir.Assign(errVar, ir.Syscall(defs.SYS_IOCTL, fd, ir.Int64(linux.SIOCSIFNETMASK), ptr)),
 				ir.If(ir.IsNegative(errVar), ir.Block{
-					ir.Syscall(linux.SYS_CLOSE, fd),
+					ir.Syscall(defs.SYS_CLOSE, fd),
 					ir.Goto(errLabel),
 				}),
 
 				// Bring up
 				ir.Assign(slot.At(16), ir.Int64(flagsVal)),
-				ir.Assign(errVar, ir.Syscall(linux.SYS_IOCTL, fd, ir.Int64(linux.SIOCSIFFLAGS), ptr)),
-				ir.Syscall(linux.SYS_CLOSE, fd),
+				ir.Assign(errVar, ir.Syscall(defs.SYS_IOCTL, fd, ir.Int64(linux.SIOCSIFFLAGS), ptr)),
+				ir.Syscall(defs.SYS_CLOSE, fd),
 				ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
 			}
 		},
@@ -365,14 +366,14 @@ func AddDefaultRoute(gateway uint32, errLabel ir.Label, errVar ir.Var) ir.Fragme
 			}
 
 			return ir.Block{
-				ir.Assign(fd, ir.Syscall(linux.SYS_SOCKET, ir.Int64(linux.AF_NETLINK), ir.Int64(linux.SOCK_RAW), ir.Int64(linux.NETLINK_ROUTE))),
+				ir.Assign(fd, ir.Syscall(defs.SYS_SOCKET, ir.Int64(linux.AF_NETLINK), ir.Int64(linux.SOCK_RAW), ir.Int64(linux.NETLINK_ROUTE))),
 				ir.Assign(errVar, fd),
 				ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
 
 				ir.Assign(ptr, slot.Pointer()),
 				ir.Block(copyFrags),
-				ir.Assign(errVar, ir.Syscall(linux.SYS_SENDTO, fd, ptr, ir.Int64(36), ir.Int64(0), ir.Int64(0), ir.Int64(0))),
-				ir.Syscall(linux.SYS_CLOSE, fd),
+				ir.Assign(errVar, ir.Syscall(defs.SYS_SENDTO, fd, ptr, ir.Int64(36), ir.Int64(0), ir.Int64(0), ir.Int64(0))),
+				ir.Syscall(defs.SYS_CLOSE, fd),
 				ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
 			}
 		},
@@ -439,7 +440,7 @@ func Exec(path string, argv []string, envp []string, errLabel ir.Label, errVar i
 				ir.Assign(argvPtr, slot.Pointer()),
 				ir.Assign(envpPtr, slot.PointerWithDisp(argvLen*8)),
 				ir.Assign(errVar, ir.Syscall(
-					linux.SYS_EXECVE,
+					defs.SYS_EXECVE,
 					path,
 					argvPtr,
 					envpPtr,
@@ -456,7 +457,7 @@ func ForkExecWait(path string, argv []string, envp []string, errLabel ir.Label, 
 	pid := ir.Var("pid")
 
 	return ir.Block{
-		ir.Assign(pid, ir.Syscall(linux.SYS_FORK)),
+		ir.Assign(pid, ir.Syscall(defs.SYS_FORK)),
 		ir.If(ir.IsNegative(pid), ir.Block{
 			ir.Assign(errVar, pid),
 			ir.Goto(errLabel),
@@ -464,7 +465,7 @@ func ForkExecWait(path string, argv []string, envp []string, errLabel ir.Label, 
 		ir.If(ir.IsZero(pid), ir.Block{
 			// Child
 			Exec(path, argv, envp, errLabel, errVar),
-			ir.Syscall(linux.SYS_EXIT, ir.Int64(1)),
+			ir.Syscall(defs.SYS_EXIT, ir.Int64(1)),
 		}),
 		// Parent
 		ir.WithStackSlot(ir.StackSlotConfig{
@@ -473,7 +474,7 @@ func ForkExecWait(path string, argv []string, envp []string, errLabel ir.Label, 
 				ptr := ir.Var("statusPtr")
 				return ir.Block{
 					ir.Assign(ptr, slot.Pointer()),
-					ir.Assign(errVar, ir.Syscall(linux.SYS_WAIT4, pid, ptr, ir.Int64(0), ir.Int64(0))),
+					ir.Assign(errVar, ir.Syscall(defs.SYS_WAIT4, pid, ptr, ir.Int64(0), ir.Int64(0))),
 					ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
 				}
 			},
@@ -494,7 +495,7 @@ func SetupProfiling(basePtr ir.Var, errLabel ir.Label, errVar ir.Var) ir.Fragmen
 			fd := ir.Var("memFd")
 			return ir.Block{
 				ir.Assign(fd, ir.Syscall(
-					linux.SYS_OPENAT,
+					defs.SYS_OPENAT,
 					ir.Int64(linux.AT_FDCWD),
 					"/dev/mem",
 					ir.Int64(linux.O_RDWR|linux.O_SYNC),
@@ -504,7 +505,7 @@ func SetupProfiling(basePtr ir.Var, errLabel ir.Label, errVar ir.Var) ir.Fragmen
 				ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
 
 				ir.Assign(basePtr, ir.Syscall(
-					linux.SYS_MMAP,
+					defs.SYS_MMAP,
 					ir.Int64(0),      // addr
 					ir.Int64(0x2000), // size
 					ir.Int64(linux.PROT_READ|linux.PROT_WRITE),
@@ -514,7 +515,7 @@ func SetupProfiling(basePtr ir.Var, errLabel ir.Label, errVar ir.Var) ir.Fragmen
 				)),
 				ir.Assign(errVar, basePtr), // mmap returns addr or -errno
 
-				ir.Syscall(linux.SYS_CLOSE, fd),
+				ir.Syscall(defs.SYS_CLOSE, fd),
 
 				ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
 			}
@@ -554,7 +555,7 @@ func SendProfilingEvent(basePtr ir.Var, name string) ir.Fragment {
 func SetHostname(name string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
 	return ir.Block{
 		ir.Assign(errVar, ir.Syscall(
-			linux.SYS_SETHOSTNAME,
+			defs.SYS_SETHOSTNAME,
 			name,
 			ir.Int64(int64(len(name))),
 		)),

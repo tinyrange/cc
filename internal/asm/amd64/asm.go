@@ -7,7 +7,8 @@ import (
 	"sync/atomic"
 
 	"github.com/tinyrange/cc/internal/asm"
-	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
+	"github.com/tinyrange/cc/internal/linux/defs"
+	amd64defs "github.com/tinyrange/cc/internal/linux/defs/amd64"
 )
 
 const (
@@ -107,11 +108,11 @@ type ret struct {
 }
 
 type syscall struct {
-	number int
+	number defs.Syscall
 	args   []asm.Value
 }
 
-func Syscall(number int, args ...asm.Value) asm.Fragment {
+func Syscall(number defs.Syscall, args ...asm.Value) asm.Fragment {
 	return &syscall{
 		number: number,
 		args:   args,
@@ -124,7 +125,7 @@ func UseRegister(v asm.Variable) asm.Value {
 
 func SyscallWrite(fd asm.Value, buf asm.Value, count asm.Value) asm.Fragment {
 	return &syscall{
-		number: linux.SYS_WRITE,
+		number: defs.SYS_WRITE,
 		args:   []asm.Value{fd, buf, count},
 	}
 }
@@ -456,7 +457,13 @@ func (c *call) Emit(_ctx asm.Context) error {
 
 func (s *syscall) Emit(_ctx asm.Context) error {
 	ctx := _ctx.(*Context)
-	if err := appendMovImmediate(ctx, RAX, int64(s.number)); err != nil {
+
+	num, ok := amd64defs.SyscallMap[s.number]
+	if !ok {
+		return fmt.Errorf("amd64 asm: unknown syscall number %d", s.number)
+	}
+
+	if err := appendMovImmediate(ctx, RAX, int64(num)); err != nil {
 		return err
 	}
 

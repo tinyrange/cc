@@ -2,6 +2,8 @@ package ir
 
 import (
 	"fmt"
+
+	"github.com/tinyrange/cc/internal/linux/defs"
 )
 
 type Fragment interface{}
@@ -232,11 +234,11 @@ func (g GlobalVar) MemWithDisp(disp any) GlobalMem {
 type Label string
 
 type SyscallFragment struct {
-	Num  int64
+	Num  defs.Syscall
 	Args []Fragment
 }
 
-func Syscall(num int64, args ...any) Fragment {
+func Syscall(num defs.Syscall, args ...any) Fragment {
 	argsFragments := make([]Fragment, 0, len(args))
 	for _, arg := range args {
 		argsFragments = append(argsFragments, asFragment(arg))

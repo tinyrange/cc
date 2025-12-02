@@ -1,10 +1,9 @@
 package initx
 
 import (
-	"fmt"
-
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/ir"
+	"github.com/tinyrange/cc/internal/linux/defs"
 	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 )
 
@@ -27,15 +26,14 @@ const (
 )
 
 var (
-	mailboxGlobal  = ir.Global("mailboxMem")
-	configGlobal   = ir.Global("configMem")
 	devMemDeviceID = linux.Mkdev(1, 1)
 )
 
 func openFile(dest ir.Var, filename string, flags int) ir.Block {
 	return ir.Block{
 		ir.Assign(dest, ir.Syscall(
-			linux.SYS_OPEN,
+			defs.SYS_OPENAT,
+			ir.Int64(linux.AT_FDCWD),
 			filename,
 			ir.Int64(flags),
 			ir.Int64(0),
@@ -46,7 +44,7 @@ func openFile(dest ir.Var, filename string, flags int) ir.Block {
 func mmapFile(dest ir.Var, fd any, length any, prot int, flags int, offset any) ir.Block {
 	return ir.Block{
 		ir.Assign(dest, ir.Syscall(
-			linux.SYS_MMAP,
+			defs.SYS_MMAP,
 			ir.Int64(0),
 			length,
 			ir.Int64(prot),
@@ -58,20 +56,18 @@ func mmapFile(dest ir.Var, fd any, length any, prot int, flags int, offset any) 
 }
 
 func Build(cfg BuilderConfig) (*ir.Program, error) {
-	if cfg.Arch != hv.ArchitectureX86_64 {
-		return nil, fmt.Errorf("unsupported architecture for initx: %v", cfg.Arch)
-	}
-
 	main := ir.Method{
+		ir.Printf("Hello, World\n"),
+
 		// ensure /dev exists and expose /dev/mem
 		ir.Syscall(
-			linux.SYS_MKDIRAT,
+			defs.SYS_MKDIRAT,
 			ir.Int64(linux.AT_FDCWD),
 			"/dev",
 			ir.Int64(0o755),
 		),
 		ir.Syscall(
-			linux.SYS_MKNODAT,
+			defs.SYS_MKNODAT,
 			ir.Int64(linux.AT_FDCWD),
 			"/dev/mem",
 			ir.Int64(devMemMode),
@@ -80,7 +76,7 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 
 		// ensure devtmpfs is mounted so block devices like /dev/vda exist before runtime payloads run
 		ir.Assign(ir.Var("devMountErr"), ir.Syscall(
-			linux.SYS_MOUNT,
+			defs.SYS_MOUNT,
 			"devtmpfs",
 			"/dev",
 			"devtmpfs",
@@ -95,10 +91,9 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 				ir.Printf("failed to mount devtmpfs on /dev: 0x%x\n",
 					ir.Op(ir.OpSub, ir.Int64(0), ir.Var("devMountErr")),
 				),
-				ir.Syscall(linux.SYS_REBOOT,
+				ir.Syscall(defs.SYS_REBOOT,
 					linux.LINUX_REBOOT_MAGIC1,
 					linux.LINUX_REBOOT_MAGIC2,
-					0,
 					linux.LINUX_REBOOT_CMD_RESTART,
 				),
 			}),
@@ -116,7 +111,6 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 			linux.MAP_SHARED,
 			ir.Int64(0xf000_0000),
 		),
-		ir.AssignGlobal(mailboxGlobal, ir.Var("mailboxMem")),
 
 		// map config region
 		mmapFile(
@@ -127,7 +121,6 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 			linux.MAP_SHARED,
 			ir.Int64(0xf000_3000),
 		),
-		ir.AssignGlobal(configGlobal, ir.Var("configMem")),
 
 		// map anon a 4MB region r/w/x for copying binaries into
 		mmapFile(
@@ -140,7 +133,6 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 		),
 
 		ir.DeclareLabel("loop", ir.Block{
-			ClearRunResults(ir.Var("mailboxMem")),
 			// read uint32(configMem[0]) and compare to 0xcafebabe. If not equal print a error (magic value not found) and power off.
 			ir.If(ir.IsEqual(
 				ir.Var("configMem").Mem().As32(),
@@ -199,10 +191,9 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 			}, ir.Block{
 				// magic value not found, print error and power off
 				ir.Printf("Magic value not found in config region: %x\n", ir.Var("configMem").Mem().As32()),
-				ir.Syscall(linux.SYS_REBOOT,
+				ir.Syscall(defs.SYS_REBOOT,
 					linux.LINUX_REBOOT_MAGIC1,
 					linux.LINUX_REBOOT_MAGIC2,
-					0,
 					linux.LINUX_REBOOT_CMD_RESTART,
 				),
 			}),
@@ -214,10 +205,6 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 	return &ir.Program{
 		Methods: map[string]ir.Method{
 			"main": main,
-		},
-		Globals: map[string]ir.GlobalConfig{
-			mailboxGlobal.Name(): {Size: 8},
-			configGlobal.Name():  {Size: 8},
 		},
 		Entrypoint: "main",
 	}, nil

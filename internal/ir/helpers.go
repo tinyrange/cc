@@ -5,6 +5,7 @@ import (
 	"sync/atomic"
 
 	"github.com/tinyrange/cc/internal/asm"
+	"github.com/tinyrange/cc/internal/linux/defs"
 )
 
 // SyscallCheckedConfig describes a syscall invocation that assigns the result
@@ -14,7 +15,7 @@ type SyscallCheckedConfig struct {
 	// the helper can emit the common negative-result check.
 	Result Var
 	// Number is the syscall number (for example linux.SYS_OPENAT).
-	Number int64
+	Number defs.Syscall
 	// Args provides the syscall arguments. Each element must be compatible with
 	// Syscall (Var, string, or int-convertible value).
 	Args []any

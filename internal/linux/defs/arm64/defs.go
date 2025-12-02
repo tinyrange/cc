@@ -1,328 +1,330 @@
 package arm64
 
-const (
-	SYS_IO_SETUP                = 0
-	SYS_IO_DESTROY              = 1
-	SYS_IO_SUBMIT               = 2
-	SYS_IO_CANCEL               = 3
-	SYS_IO_GETEVENTS            = 4
-	SYS_SETXATTR                = 5
-	SYS_LSETXATTR               = 6
-	SYS_FSETXATTR               = 7
-	SYS_GETXATTR                = 8
-	SYS_LGETXATTR               = 9
-	SYS_FGETXATTR               = 10
-	SYS_LISTXATTR               = 11
-	SYS_LLISTXATTR              = 12
-	SYS_FLISTXATTR              = 13
-	SYS_REMOVEXATTR             = 14
-	SYS_LREMOVEXATTR            = 15
-	SYS_FREMOVEXATTR            = 16
-	SYS_GETCWD                  = 17
-	SYS_LOOKUP_DCOOKIE          = 18
-	SYS_EVENTFD2                = 19
-	SYS_EPOLL_CREATE1           = 20
-	SYS_EPOLL_CTL               = 21
-	SYS_EPOLL_PWAIT             = 22
-	SYS_DUP                     = 23
-	SYS_DUP3                    = 24
-	SYS_FCNTL                   = 25
-	SYS_INOTIFY_INIT1           = 26
-	SYS_INOTIFY_ADD_WATCH       = 27
-	SYS_INOTIFY_RM_WATCH        = 28
-	SYS_IOCTL                   = 29
-	SYS_IOPRIO_SET              = 30
-	SYS_IOPRIO_GET              = 31
-	SYS_FLOCK                   = 32
-	SYS_MKNODAT                 = 33
-	SYS_MKDIRAT                 = 34
-	SYS_UNLINKAT                = 35
-	SYS_SYMLINKAT               = 36
-	SYS_LINKAT                  = 37
-	SYS_RENAMEAT                = 38
-	SYS_UMOUNT2                 = 39
-	SYS_MOUNT                   = 40
-	SYS_PIVOT_ROOT              = 41
-	SYS_NFSSERVCTL              = 42
-	SYS_STATFS                  = 43
-	SYS_FSTATFS                 = 44
-	SYS_TRUNCATE                = 45
-	SYS_FTRUNCATE               = 46
-	SYS_FALLOCATE               = 47
-	SYS_FACCESSAT               = 48
-	SYS_CHDIR                   = 49
-	SYS_FCHDIR                  = 50
-	SYS_CHROOT                  = 51
-	SYS_FCHMOD                  = 52
-	SYS_FCHMODAT                = 53
-	SYS_FCHOWNAT                = 54
-	SYS_FCHOWN                  = 55
-	SYS_OPENAT                  = 56
-	SYS_CLOSE                   = 57
-	SYS_VHANGUP                 = 58
-	SYS_PIPE2                   = 59
-	SYS_QUOTACTL                = 60
-	SYS_GETDENTS64              = 61
-	SYS_LSEEK                   = 62
-	SYS_READ                    = 63
-	SYS_WRITE                   = 64
-	SYS_READV                   = 65
-	SYS_WRITEV                  = 66
-	SYS_PREAD64                 = 67
-	SYS_PWRITE64                = 68
-	SYS_PREADV                  = 69
-	SYS_PWRITEV                 = 70
-	SYS_SENDFILE                = 71
-	SYS_PSELECT6                = 72
-	SYS_PPOLL                   = 73
-	SYS_SIGNALFD4               = 74
-	SYS_VMSPLICE                = 75
-	SYS_SPLICE                  = 76
-	SYS_TEE                     = 77
-	SYS_READLINKAT              = 78
-	SYS_NEWFSTATAT              = 79
-	SYS_FSTAT                   = 80
-	SYS_SYNC                    = 81
-	SYS_FSYNC                   = 82
-	SYS_FDATASYNC               = 83
-	SYS_SYNC_FILE_RANGE         = 84
-	SYS_TIMERFD_CREATE          = 85
-	SYS_TIMERFD_SETTIME         = 86
-	SYS_TIMERFD_GETTIME         = 87
-	SYS_UTIMENSAT               = 88
-	SYS_ACCT                    = 89
-	SYS_CAPGET                  = 90
-	SYS_CAPSET                  = 91
-	SYS_PERSONALITY             = 92
-	SYS_EXIT                    = 93
-	SYS_EXIT_GROUP              = 94
-	SYS_WAITID                  = 95
-	SYS_SET_TID_ADDRESS         = 96
-	SYS_UNSHARE                 = 97
-	SYS_FUTEX                   = 98
-	SYS_SET_ROBUST_LIST         = 99
-	SYS_GET_ROBUST_LIST         = 100
-	SYS_NANOSLEEP               = 101
-	SYS_GETITIMER               = 102
-	SYS_SETITIMER               = 103
-	SYS_KEXEC_LOAD              = 104
-	SYS_INIT_MODULE             = 105
-	SYS_DELETE_MODULE           = 106
-	SYS_TIMER_CREATE            = 107
-	SYS_TIMER_GETTIME           = 108
-	SYS_TIMER_GETOVERRUN        = 109
-	SYS_TIMER_SETTIME           = 110
-	SYS_TIMER_DELETE            = 111
-	SYS_CLOCK_SETTIME           = 112
-	SYS_CLOCK_GETTIME           = 113
-	SYS_CLOCK_GETRES            = 114
-	SYS_CLOCK_NANOSLEEP         = 115
-	SYS_SYSLOG                  = 116
-	SYS_PTRACE                  = 117
-	SYS_SCHED_SETPARAM          = 118
-	SYS_SCHED_SETSCHEDULER      = 119
-	SYS_SCHED_GETSCHEDULER      = 120
-	SYS_SCHED_GETPARAM          = 121
-	SYS_SCHED_SETAFFINITY       = 122
-	SYS_SCHED_GETAFFINITY       = 123
-	SYS_SCHED_YIELD             = 124
-	SYS_SCHED_GET_PRIORITY_MAX  = 125
-	SYS_SCHED_GET_PRIORITY_MIN  = 126
-	SYS_SCHED_RR_GET_INTERVAL   = 127
-	SYS_RESTART_SYSCALL         = 128
-	SYS_KILL                    = 129
-	SYS_TKILL                   = 130
-	SYS_TGKILL                  = 131
-	SYS_SIGALTSTACK             = 132
-	SYS_RT_SIGSUSPEND           = 133
-	SYS_RT_SIGACTION            = 134
-	SYS_RT_SIGPROCMASK          = 135
-	SYS_RT_SIGPENDING           = 136
-	SYS_RT_SIGTIMEDWAIT         = 137
-	SYS_RT_SIGQUEUEINFO         = 138
-	SYS_RT_SIGRETURN            = 139
-	SYS_SETPRIORITY             = 140
-	SYS_GETPRIORITY             = 141
-	SYS_REBOOT                  = 142
-	SYS_SETREGID                = 143
-	SYS_SETGID                  = 144
-	SYS_SETREUID                = 145
-	SYS_SETUID                  = 146
-	SYS_SETRESUID               = 147
-	SYS_GETRESUID               = 148
-	SYS_SETRESGID               = 149
-	SYS_GETRESGID               = 150
-	SYS_SETFSUID                = 151
-	SYS_SETFSGID                = 152
-	SYS_TIMES                   = 153
-	SYS_SETPGID                 = 154
-	SYS_GETPGID                 = 155
-	SYS_GETSID                  = 156
-	SYS_SETSID                  = 157
-	SYS_GETGROUPS               = 158
-	SYS_SETGROUPS               = 159
-	SYS_UNAME                   = 160
-	SYS_SETHOSTNAME             = 161
-	SYS_SETDOMAINNAME           = 162
-	SYS_GETRLIMIT               = 163
-	SYS_SETRLIMIT               = 164
-	SYS_GETRUSAGE               = 165
-	SYS_UMASK                   = 166
-	SYS_PRCTL                   = 167
-	SYS_GETCPU                  = 168
-	SYS_GETTIMEOFDAY            = 169
-	SYS_SETTIMEOFDAY            = 170
-	SYS_ADJTIMEX                = 171
-	SYS_GETPID                  = 172
-	SYS_GETPPID                 = 173
-	SYS_GETUID                  = 174
-	SYS_GETEUID                 = 175
-	SYS_GETGID                  = 176
-	SYS_GETEGID                 = 177
-	SYS_GETTID                  = 178
-	SYS_SYSINFO                 = 179
-	SYS_MQ_OPEN                 = 180
-	SYS_MQ_UNLINK               = 181
-	SYS_MQ_TIMEDSEND            = 182
-	SYS_MQ_TIMEDRECEIVE         = 183
-	SYS_MQ_NOTIFY               = 184
-	SYS_MQ_GETSETATTR           = 185
-	SYS_MSGGET                  = 186
-	SYS_MSGCTL                  = 187
-	SYS_MSGRCV                  = 188
-	SYS_MSGSND                  = 189
-	SYS_SEMGET                  = 190
-	SYS_SEMCTL                  = 191
-	SYS_SEMTIMEDOP              = 192
-	SYS_SEMOP                   = 193
-	SYS_SHMGET                  = 194
-	SYS_SHMCTL                  = 195
-	SYS_SHMAT                   = 196
-	SYS_SHMDT                   = 197
-	SYS_SOCKET                  = 198
-	SYS_SOCKETPAIR              = 199
-	SYS_BIND                    = 200
-	SYS_LISTEN                  = 201
-	SYS_ACCEPT                  = 202
-	SYS_CONNECT                 = 203
-	SYS_GETSOCKNAME             = 204
-	SYS_GETPEERNAME             = 205
-	SYS_SENDTO                  = 206
-	SYS_RECVFROM                = 207
-	SYS_SETSOCKOPT              = 208
-	SYS_GETSOCKOPT              = 209
-	SYS_SHUTDOWN                = 210
-	SYS_SENDMSG                 = 211
-	SYS_RECVMSG                 = 212
-	SYS_READAHEAD               = 213
-	SYS_BRK                     = 214
-	SYS_MUNMAP                  = 215
-	SYS_MREMAP                  = 216
-	SYS_ADD_KEY                 = 217
-	SYS_REQUEST_KEY             = 218
-	SYS_KEYCTL                  = 219
-	SYS_CLONE                   = 220
-	SYS_EXECVE                  = 221
-	SYS_MMAP                    = 222
-	SYS_FADVISE64               = 223
-	SYS_SWAPON                  = 224
-	SYS_SWAPOFF                 = 225
-	SYS_MPROTECT                = 226
-	SYS_MSYNC                   = 227
-	SYS_MLOCK                   = 228
-	SYS_MUNLOCK                 = 229
-	SYS_MLOCKALL                = 230
-	SYS_MUNLOCKALL              = 231
-	SYS_MINCORE                 = 232
-	SYS_MADVISE                 = 233
-	SYS_REMAP_FILE_PAGES        = 234
-	SYS_MBIND                   = 235
-	SYS_GET_MEMPOLICY           = 236
-	SYS_SET_MEMPOLICY           = 237
-	SYS_MIGRATE_PAGES           = 238
-	SYS_MOVE_PAGES              = 239
-	SYS_RT_TGSIGQUEUEINFO       = 240
-	SYS_PERF_EVENT_OPEN         = 241
-	SYS_ACCEPT4                 = 242
-	SYS_RECVMMSG                = 243
-	SYS_ARCH_SPECIFIC_SYSCALL   = 244
-	SYS_WAIT4                   = 260
-	SYS_PRLIMIT64               = 261
-	SYS_FANOTIFY_INIT           = 262
-	SYS_FANOTIFY_MARK           = 263
-	SYS_NAME_TO_HANDLE_AT       = 264
-	SYS_OPEN_BY_HANDLE_AT       = 265
-	SYS_CLOCK_ADJTIME           = 266
-	SYS_SYNCFS                  = 267
-	SYS_SETNS                   = 268
-	SYS_SENDMMSG                = 269
-	SYS_PROCESS_VM_READV        = 270
-	SYS_PROCESS_VM_WRITEV       = 271
-	SYS_KCMP                    = 272
-	SYS_FINIT_MODULE            = 273
-	SYS_SCHED_SETATTR           = 274
-	SYS_SCHED_GETATTR           = 275
-	SYS_RENAMEAT2               = 276
-	SYS_SECCOMP                 = 277
-	SYS_GETRANDOM               = 278
-	SYS_MEMFD_CREATE            = 279
-	SYS_BPF                     = 280
-	SYS_EXECVEAT                = 281
-	SYS_USERFAULTFD             = 282
-	SYS_MEMBARRIER              = 283
-	SYS_MLOCK2                  = 284
-	SYS_COPY_FILE_RANGE         = 285
-	SYS_PREADV2                 = 286
-	SYS_PWRITEV2                = 287
-	SYS_PKEY_MPROTECT           = 288
-	SYS_PKEY_ALLOC              = 289
-	SYS_PKEY_FREE               = 290
-	SYS_STATX                   = 291
-	SYS_IO_PGETEVENTS           = 292
-	SYS_RSEQ                    = 293
-	SYS_KEXEC_FILE_LOAD         = 294
-	SYS_PIDFD_SEND_SIGNAL       = 424
-	SYS_IO_URING_SETUP          = 425
-	SYS_IO_URING_ENTER          = 426
-	SYS_IO_URING_REGISTER       = 427
-	SYS_OPEN_TREE               = 428
-	SYS_MOVE_MOUNT              = 429
-	SYS_FSOPEN                  = 430
-	SYS_FSCONFIG                = 431
-	SYS_FSMOUNT                 = 432
-	SYS_FSPICK                  = 433
-	SYS_PIDFD_OPEN              = 434
-	SYS_CLONE3                  = 435
-	SYS_CLOSE_RANGE             = 436
-	SYS_OPENAT2                 = 437
-	SYS_PIDFD_GETFD             = 438
-	SYS_FACCESSAT2              = 439
-	SYS_PROCESS_MADVISE         = 440
-	SYS_EPOLL_PWAIT2            = 441
-	SYS_MOUNT_SETATTR           = 442
-	SYS_QUOTACTL_FD             = 443
-	SYS_LANDLOCK_CREATE_RULESET = 444
-	SYS_LANDLOCK_ADD_RULE       = 445
-	SYS_LANDLOCK_RESTRICT_SELF  = 446
-	SYS_MEMFD_SECRET            = 447
-	SYS_PROCESS_MRELEASE        = 448
-	SYS_FUTEX_WAITV             = 449
-	SYS_SET_MEMPOLICY_HOME_NODE = 450
-	SYS_CACHESTAT               = 451
-	SYS_FCHMODAT2               = 452
-	SYS_MAP_SHADOW_STACK        = 453
-	SYS_FUTEX_WAKE              = 454
-	SYS_FUTEX_WAIT              = 455
-	SYS_FUTEX_REQUEUE           = 456
-	SYS_STATMOUNT               = 457
-	SYS_LISTMOUNT               = 458
-	SYS_LSM_GET_SELF_ATTR       = 459
-	SYS_LSM_SET_SELF_ATTR       = 460
-	SYS_LSM_LIST_MODULES        = 461
-	SYS_MSEAL                   = 462
-	SYS_SETXATTRAT              = 463
-	SYS_GETXATTRAT              = 464
-	SYS_LISTXATTRAT             = 465
-	SYS_REMOVEXATTRAT           = 466
-	SYS_OPEN_TREE_ATTR          = 467
-)
+import "github.com/tinyrange/cc/internal/linux/defs"
+
+var SyscallMap = map[defs.Syscall]uint32{
+	defs.SYS_IO_SETUP:                0,
+	defs.SYS_IO_DESTROY:              1,
+	defs.SYS_IO_SUBMIT:               2,
+	defs.SYS_IO_CANCEL:               3,
+	defs.SYS_IO_GETEVENTS:            4,
+	defs.SYS_SETXATTR:                5,
+	defs.SYS_LSETXATTR:               6,
+	defs.SYS_FSETXATTR:               7,
+	defs.SYS_GETXATTR:                8,
+	defs.SYS_LGETXATTR:               9,
+	defs.SYS_FGETXATTR:               10,
+	defs.SYS_LISTXATTR:               11,
+	defs.SYS_LLISTXATTR:              12,
+	defs.SYS_FLISTXATTR:              13,
+	defs.SYS_REMOVEXATTR:             14,
+	defs.SYS_LREMOVEXATTR:            15,
+	defs.SYS_FREMOVEXATTR:            16,
+	defs.SYS_GETCWD:                  17,
+	defs.SYS_LOOKUP_DCOOKIE:          18,
+	defs.SYS_EVENTFD2:                19,
+	defs.SYS_EPOLL_CREATE1:           20,
+	defs.SYS_EPOLL_CTL:               21,
+	defs.SYS_EPOLL_PWAIT:             22,
+	defs.SYS_DUP:                     23,
+	defs.SYS_DUP3:                    24,
+	defs.SYS_FCNTL:                   25,
+	defs.SYS_INOTIFY_INIT1:           26,
+	defs.SYS_INOTIFY_ADD_WATCH:       27,
+	defs.SYS_INOTIFY_RM_WATCH:        28,
+	defs.SYS_IOCTL:                   29,
+	defs.SYS_IOPRIO_SET:              30,
+	defs.SYS_IOPRIO_GET:              31,
+	defs.SYS_FLOCK:                   32,
+	defs.SYS_MKNODAT:                 33,
+	defs.SYS_MKDIRAT:                 34,
+	defs.SYS_UNLINKAT:                35,
+	defs.SYS_SYMLINKAT:               36,
+	defs.SYS_LINKAT:                  37,
+	defs.SYS_RENAMEAT:                38,
+	defs.SYS_UMOUNT2:                 39,
+	defs.SYS_MOUNT:                   40,
+	defs.SYS_PIVOT_ROOT:              41,
+	defs.SYS_NFSSERVCTL:              42,
+	defs.SYS_STATFS:                  43,
+	defs.SYS_FSTATFS:                 44,
+	defs.SYS_TRUNCATE:                45,
+	defs.SYS_FTRUNCATE:               46,
+	defs.SYS_FALLOCATE:               47,
+	defs.SYS_FACCESSAT:               48,
+	defs.SYS_CHDIR:                   49,
+	defs.SYS_FCHDIR:                  50,
+	defs.SYS_CHROOT:                  51,
+	defs.SYS_FCHMOD:                  52,
+	defs.SYS_FCHMODAT:                53,
+	defs.SYS_FCHOWNAT:                54,
+	defs.SYS_FCHOWN:                  55,
+	defs.SYS_OPENAT:                  56,
+	defs.SYS_CLOSE:                   57,
+	defs.SYS_VHANGUP:                 58,
+	defs.SYS_PIPE2:                   59,
+	defs.SYS_QUOTACTL:                60,
+	defs.SYS_GETDENTS64:              61,
+	defs.SYS_LSEEK:                   62,
+	defs.SYS_READ:                    63,
+	defs.SYS_WRITE:                   64,
+	defs.SYS_READV:                   65,
+	defs.SYS_WRITEV:                  66,
+	defs.SYS_PREAD64:                 67,
+	defs.SYS_PWRITE64:                68,
+	defs.SYS_PREADV:                  69,
+	defs.SYS_PWRITEV:                 70,
+	defs.SYS_SENDFILE:                71,
+	defs.SYS_PSELECT6:                72,
+	defs.SYS_PPOLL:                   73,
+	defs.SYS_SIGNALFD4:               74,
+	defs.SYS_VMSPLICE:                75,
+	defs.SYS_SPLICE:                  76,
+	defs.SYS_TEE:                     77,
+	defs.SYS_READLINKAT:              78,
+	defs.SYS_NEWFSTATAT:              79,
+	defs.SYS_FSTAT:                   80,
+	defs.SYS_SYNC:                    81,
+	defs.SYS_FSYNC:                   82,
+	defs.SYS_FDATASYNC:               83,
+	defs.SYS_SYNC_FILE_RANGE:         84,
+	defs.SYS_TIMERFD_CREATE:          85,
+	defs.SYS_TIMERFD_SETTIME:         86,
+	defs.SYS_TIMERFD_GETTIME:         87,
+	defs.SYS_UTIMENSAT:               88,
+	defs.SYS_ACCT:                    89,
+	defs.SYS_CAPGET:                  90,
+	defs.SYS_CAPSET:                  91,
+	defs.SYS_PERSONALITY:             92,
+	defs.SYS_EXIT:                    93,
+	defs.SYS_EXIT_GROUP:              94,
+	defs.SYS_WAITID:                  95,
+	defs.SYS_SET_TID_ADDRESS:         96,
+	defs.SYS_UNSHARE:                 97,
+	defs.SYS_FUTEX:                   98,
+	defs.SYS_SET_ROBUST_LIST:         99,
+	defs.SYS_GET_ROBUST_LIST:         100,
+	defs.SYS_NANOSLEEP:               101,
+	defs.SYS_GETITIMER:               102,
+	defs.SYS_SETITIMER:               103,
+	defs.SYS_KEXEC_LOAD:              104,
+	defs.SYS_INIT_MODULE:             105,
+	defs.SYS_DELETE_MODULE:           106,
+	defs.SYS_TIMER_CREATE:            107,
+	defs.SYS_TIMER_GETTIME:           108,
+	defs.SYS_TIMER_GETOVERRUN:        109,
+	defs.SYS_TIMER_SETTIME:           110,
+	defs.SYS_TIMER_DELETE:            111,
+	defs.SYS_CLOCK_SETTIME:           112,
+	defs.SYS_CLOCK_GETTIME:           113,
+	defs.SYS_CLOCK_GETRES:            114,
+	defs.SYS_CLOCK_NANOSLEEP:         115,
+	defs.SYS_SYSLOG:                  116,
+	defs.SYS_PTRACE:                  117,
+	defs.SYS_SCHED_SETPARAM:          118,
+	defs.SYS_SCHED_SETSCHEDULER:      119,
+	defs.SYS_SCHED_GETSCHEDULER:      120,
+	defs.SYS_SCHED_GETPARAM:          121,
+	defs.SYS_SCHED_SETAFFINITY:       122,
+	defs.SYS_SCHED_GETAFFINITY:       123,
+	defs.SYS_SCHED_YIELD:             124,
+	defs.SYS_SCHED_GET_PRIORITY_MAX:  125,
+	defs.SYS_SCHED_GET_PRIORITY_MIN:  126,
+	defs.SYS_SCHED_RR_GET_INTERVAL:   127,
+	defs.SYS_RESTART_SYSCALL:         128,
+	defs.SYS_KILL:                    129,
+	defs.SYS_TKILL:                   130,
+	defs.SYS_TGKILL:                  131,
+	defs.SYS_SIGALTSTACK:             132,
+	defs.SYS_RT_SIGSUSPEND:           133,
+	defs.SYS_RT_SIGACTION:            134,
+	defs.SYS_RT_SIGPROCMASK:          135,
+	defs.SYS_RT_SIGPENDING:           136,
+	defs.SYS_RT_SIGTIMEDWAIT:         137,
+	defs.SYS_RT_SIGQUEUEINFO:         138,
+	defs.SYS_RT_SIGRETURN:            139,
+	defs.SYS_SETPRIORITY:             140,
+	defs.SYS_GETPRIORITY:             141,
+	defs.SYS_REBOOT:                  142,
+	defs.SYS_SETREGID:                143,
+	defs.SYS_SETGID:                  144,
+	defs.SYS_SETREUID:                145,
+	defs.SYS_SETUID:                  146,
+	defs.SYS_SETRESUID:               147,
+	defs.SYS_GETRESUID:               148,
+	defs.SYS_SETRESGID:               149,
+	defs.SYS_GETRESGID:               150,
+	defs.SYS_SETFSUID:                151,
+	defs.SYS_SETFSGID:                152,
+	defs.SYS_TIMES:                   153,
+	defs.SYS_SETPGID:                 154,
+	defs.SYS_GETPGID:                 155,
+	defs.SYS_GETSID:                  156,
+	defs.SYS_SETSID:                  157,
+	defs.SYS_GETGROUPS:               158,
+	defs.SYS_SETGROUPS:               159,
+	defs.SYS_UNAME:                   160,
+	defs.SYS_SETHOSTNAME:             161,
+	defs.SYS_SETDOMAINNAME:           162,
+	defs.SYS_GETRLIMIT:               163,
+	defs.SYS_SETRLIMIT:               164,
+	defs.SYS_GETRUSAGE:               165,
+	defs.SYS_UMASK:                   166,
+	defs.SYS_PRCTL:                   167,
+	defs.SYS_GETCPU:                  168,
+	defs.SYS_GETTIMEOFDAY:            169,
+	defs.SYS_SETTIMEOFDAY:            170,
+	defs.SYS_ADJTIMEX:                171,
+	defs.SYS_GETPID:                  172,
+	defs.SYS_GETPPID:                 173,
+	defs.SYS_GETUID:                  174,
+	defs.SYS_GETEUID:                 175,
+	defs.SYS_GETGID:                  176,
+	defs.SYS_GETEGID:                 177,
+	defs.SYS_GETTID:                  178,
+	defs.SYS_SYSINFO:                 179,
+	defs.SYS_MQ_OPEN:                 180,
+	defs.SYS_MQ_UNLINK:               181,
+	defs.SYS_MQ_TIMEDSEND:            182,
+	defs.SYS_MQ_TIMEDRECEIVE:         183,
+	defs.SYS_MQ_NOTIFY:               184,
+	defs.SYS_MQ_GETSETATTR:           185,
+	defs.SYS_MSGGET:                  186,
+	defs.SYS_MSGCTL:                  187,
+	defs.SYS_MSGRCV:                  188,
+	defs.SYS_MSGSND:                  189,
+	defs.SYS_SEMGET:                  190,
+	defs.SYS_SEMCTL:                  191,
+	defs.SYS_SEMTIMEDOP:              192,
+	defs.SYS_SEMOP:                   193,
+	defs.SYS_SHMGET:                  194,
+	defs.SYS_SHMCTL:                  195,
+	defs.SYS_SHMAT:                   196,
+	defs.SYS_SHMDT:                   197,
+	defs.SYS_SOCKET:                  198,
+	defs.SYS_SOCKETPAIR:              199,
+	defs.SYS_BIND:                    200,
+	defs.SYS_LISTEN:                  201,
+	defs.SYS_ACCEPT:                  202,
+	defs.SYS_CONNECT:                 203,
+	defs.SYS_GETSOCKNAME:             204,
+	defs.SYS_GETPEERNAME:             205,
+	defs.SYS_SENDTO:                  206,
+	defs.SYS_RECVFROM:                207,
+	defs.SYS_SETSOCKOPT:              208,
+	defs.SYS_GETSOCKOPT:              209,
+	defs.SYS_SHUTDOWN:                210,
+	defs.SYS_SENDMSG:                 211,
+	defs.SYS_RECVMSG:                 212,
+	defs.SYS_READAHEAD:               213,
+	defs.SYS_BRK:                     214,
+	defs.SYS_MUNMAP:                  215,
+	defs.SYS_MREMAP:                  216,
+	defs.SYS_ADD_KEY:                 217,
+	defs.SYS_REQUEST_KEY:             218,
+	defs.SYS_KEYCTL:                  219,
+	defs.SYS_CLONE:                   220,
+	defs.SYS_EXECVE:                  221,
+	defs.SYS_MMAP:                    222,
+	defs.SYS_FADVISE64:               223,
+	defs.SYS_SWAPON:                  224,
+	defs.SYS_SWAPOFF:                 225,
+	defs.SYS_MPROTECT:                226,
+	defs.SYS_MSYNC:                   227,
+	defs.SYS_MLOCK:                   228,
+	defs.SYS_MUNLOCK:                 229,
+	defs.SYS_MLOCKALL:                230,
+	defs.SYS_MUNLOCKALL:              231,
+	defs.SYS_MINCORE:                 232,
+	defs.SYS_MADVISE:                 233,
+	defs.SYS_REMAP_FILE_PAGES:        234,
+	defs.SYS_MBIND:                   235,
+	defs.SYS_GET_MEMPOLICY:           236,
+	defs.SYS_SET_MEMPOLICY:           237,
+	defs.SYS_MIGRATE_PAGES:           238,
+	defs.SYS_MOVE_PAGES:              239,
+	defs.SYS_RT_TGSIGQUEUEINFO:       240,
+	defs.SYS_PERF_EVENT_OPEN:         241,
+	defs.SYS_ACCEPT4:                 242,
+	defs.SYS_RECVMMSG:                243,
+	defs.SYS_ARCH_SPECIFIC_SYSCALL:   244,
+	defs.SYS_WAIT4:                   260,
+	defs.SYS_PRLIMIT64:               261,
+	defs.SYS_FANOTIFY_INIT:           262,
+	defs.SYS_FANOTIFY_MARK:           263,
+	defs.SYS_NAME_TO_HANDLE_AT:       264,
+	defs.SYS_OPEN_BY_HANDLE_AT:       265,
+	defs.SYS_CLOCK_ADJTIME:           266,
+	defs.SYS_SYNCFS:                  267,
+	defs.SYS_SETNS:                   268,
+	defs.SYS_SENDMMSG:                269,
+	defs.SYS_PROCESS_VM_READV:        270,
+	defs.SYS_PROCESS_VM_WRITEV:       271,
+	defs.SYS_KCMP:                    272,
+	defs.SYS_FINIT_MODULE:            273,
+	defs.SYS_SCHED_SETATTR:           274,
+	defs.SYS_SCHED_GETATTR:           275,
+	defs.SYS_RENAMEAT2:               276,
+	defs.SYS_SECCOMP:                 277,
+	defs.SYS_GETRANDOM:               278,
+	defs.SYS_MEMFD_CREATE:            279,
+	defs.SYS_BPF:                     280,
+	defs.SYS_EXECVEAT:                281,
+	defs.SYS_USERFAULTFD:             282,
+	defs.SYS_MEMBARRIER:              283,
+	defs.SYS_MLOCK2:                  284,
+	defs.SYS_COPY_FILE_RANGE:         285,
+	defs.SYS_PREADV2:                 286,
+	defs.SYS_PWRITEV2:                287,
+	defs.SYS_PKEY_MPROTECT:           288,
+	defs.SYS_PKEY_ALLOC:              289,
+	defs.SYS_PKEY_FREE:               290,
+	defs.SYS_STATX:                   291,
+	defs.SYS_IO_PGETEVENTS:           292,
+	defs.SYS_RSEQ:                    293,
+	defs.SYS_KEXEC_FILE_LOAD:         294,
+	defs.SYS_PIDFD_SEND_SIGNAL:       424,
+	defs.SYS_IO_URING_SETUP:          425,
+	defs.SYS_IO_URING_ENTER:          426,
+	defs.SYS_IO_URING_REGISTER:       427,
+	defs.SYS_OPEN_TREE:               428,
+	defs.SYS_MOVE_MOUNT:              429,
+	defs.SYS_FSOPEN:                  430,
+	defs.SYS_FSCONFIG:                431,
+	defs.SYS_FSMOUNT:                 432,
+	defs.SYS_FSPICK:                  433,
+	defs.SYS_PIDFD_OPEN:              434,
+	defs.SYS_CLONE3:                  435,
+	defs.SYS_CLOSE_RANGE:             436,
+	defs.SYS_OPENAT2:                 437,
+	defs.SYS_PIDFD_GETFD:             438,
+	defs.SYS_FACCESSAT2:              439,
+	defs.SYS_PROCESS_MADVISE:         440,
+	defs.SYS_EPOLL_PWAIT2:            441,
+	defs.SYS_MOUNT_SETATTR:           442,
+	defs.SYS_QUOTACTL_FD:             443,
+	defs.SYS_LANDLOCK_CREATE_RULESET: 444,
+	defs.SYS_LANDLOCK_ADD_RULE:       445,
+	defs.SYS_LANDLOCK_RESTRICT_SELF:  446,
+	defs.SYS_MEMFD_SECRET:            447,
+	defs.SYS_PROCESS_MRELEASE:        448,
+	defs.SYS_FUTEX_WAITV:             449,
+	defs.SYS_SET_MEMPOLICY_HOME_NODE: 450,
+	defs.SYS_CACHESTAT:               451,
+	defs.SYS_FCHMODAT2:               452,
+	defs.SYS_MAP_SHADOW_STACK:        453,
+	defs.SYS_FUTEX_WAKE:              454,
+	defs.SYS_FUTEX_WAIT:              455,
+	defs.SYS_FUTEX_REQUEUE:           456,
+	defs.SYS_STATMOUNT:               457,
+	defs.SYS_LISTMOUNT:               458,
+	defs.SYS_LSM_GET_SELF_ATTR:       459,
+	defs.SYS_LSM_SET_SELF_ATTR:       460,
+	defs.SYS_LSM_LIST_MODULES:        461,
+	defs.SYS_MSEAL:                   462,
+	defs.SYS_SETXATTRAT:              463,
+	defs.SYS_GETXATTRAT:              464,
+	defs.SYS_LISTXATTRAT:             465,
+	defs.SYS_REMOVEXATTRAT:           466,
+	defs.SYS_OPEN_TREE_ATTR:          467,
+}

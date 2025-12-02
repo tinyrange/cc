@@ -27,8 +27,8 @@ import (
 	amd64ir "github.com/tinyrange/cc/internal/ir/amd64"
 	arm64ir "github.com/tinyrange/cc/internal/ir/arm64"
 	"github.com/tinyrange/cc/internal/linux/boot"
+	"github.com/tinyrange/cc/internal/linux/defs"
 	amd64defs "github.com/tinyrange/cc/internal/linux/defs/amd64"
-	arm64defs "github.com/tinyrange/cc/internal/linux/defs/arm64"
 )
 
 const (
@@ -738,7 +738,7 @@ func (q *bringUpQuest) RunLinux() error {
 						"main": {
 							ir.Printf("Hello, World\n"),
 							ir.Syscall(
-								amd64defs.SYS_EXIT,
+								defs.SYS_EXIT,
 								0,
 							),
 							// ir.Syscall(
@@ -758,7 +758,7 @@ func (q *bringUpQuest) RunLinux() error {
 						"main": {
 							ir.Printf("Hello, World\n"),
 							ir.Syscall(
-								arm64defs.SYS_REBOOT,
+								defs.SYS_REBOOT,
 								ir.Int64(amd64defs.LINUX_REBOOT_MAGIC1),
 								ir.Int64(amd64defs.LINUX_REBOOT_MAGIC2),
 								ir.Int64(amd64defs.LINUX_REBOOT_CMD_RESTART),

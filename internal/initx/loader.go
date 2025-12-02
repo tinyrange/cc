@@ -244,10 +244,6 @@ func NewVirtualMachine(
 	kernelLoader KernelLoader,
 	devices ...hv.DeviceTemplate,
 ) (*VirtualMachine, error) {
-	if h.Architecture() != hv.ArchitectureX86_64 {
-		return nil, fmt.Errorf("unsupported architecture for initx VM: %v", h.Architecture())
-	}
-
 	in := &proxyReader{update: make(chan io.Reader)}
 	out := &proxyWriter{w: os.Stderr} // default to stderr so we can see debugging output
 
@@ -288,6 +284,8 @@ func NewVirtualMachine(
 				})
 			},
 
+			SerialStdout: out,
+
 			Cmdline: func() []string {
 				switch h.Architecture() {
 				case hv.ArchitectureX86_64:
@@ -298,6 +296,14 @@ func NewVirtualMachine(
 						"panic=-1",
 						"tsc=reliable",
 						"tsc_early_khz=3000000",
+					}
+				case hv.ArchitectureARM64:
+					return []string{
+						"console=ttyS0,115200n8",
+						// fmt.Sprintf("earlycon=uart8250,mmio,0x%x", arm64UARTMMIOBase),
+						"quiet",
+						"reboot=k",
+						"panic=-1",
 					}
 				default:
 					panic("unsupported architecture for initx cmdline")

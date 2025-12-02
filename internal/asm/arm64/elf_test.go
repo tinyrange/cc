@@ -7,12 +7,12 @@ import (
 	"testing"
 
 	"github.com/tinyrange/cc/internal/asm"
-	linux "github.com/tinyrange/cc/internal/linux/defs/arm64"
+	"github.com/tinyrange/cc/internal/linux/defs"
 )
 
 func exit(code int) asm.Fragment {
 	return Syscall(
-		linux.SYS_EXIT,
+		defs.SYS_EXIT,
 		asm.Immediate(code),
 	)
 }

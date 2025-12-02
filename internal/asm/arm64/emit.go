@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/tinyrange/cc/internal/asm"
+	"github.com/tinyrange/cc/internal/hv"
 )
 
 // EmitProgram lowers a fragment into machine code for AArch64.
@@ -12,7 +13,7 @@ func EmitProgram(fragment asm.Fragment) (asm.Program, error) {
 		return asm.Program{}, fmt.Errorf("arm64 asm: fragment is nil")
 	}
 
-	ctx := newContext()
+	ctx := newContext(hv.ArchitectureARM64)
 	if err := fragment.Emit(ctx); err != nil {
 		return asm.Program{}, err
 	}

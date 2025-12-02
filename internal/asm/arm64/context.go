@@ -5,9 +5,11 @@ import (
 	"fmt"
 
 	"github.com/tinyrange/cc/internal/asm"
+	"github.com/tinyrange/cc/internal/hv"
 )
 
 type Context struct {
+	arch           hv.CpuArchitecture
 	text           []byte
 	constData      []byte
 	literalData    []byte
@@ -71,8 +73,9 @@ type branchPatch struct {
 	cond  condition
 }
 
-func newContext() *Context {
+func newContext(arch hv.CpuArchitecture) *Context {
 	return &Context{
+		arch:           arch,
 		constLocations: make(map[asm.Variable]constantLocation),
 		labels:         make(map[asm.Label]int),
 	}
