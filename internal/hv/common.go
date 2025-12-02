@@ -8,6 +8,7 @@ import (
 )
 
 var (
+	ErrInterrupted           = errors.New("operation interrupted")
 	ErrVMHalted              = errors.New("virtual machine halted")
 	ErrHypervisorUnsupported = errors.New("hypervisor unsupported on this platform")
 	ErrGuestRequestedReboot  = errors.New("guest requested reboot")

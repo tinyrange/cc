@@ -12,7 +12,6 @@ import (
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/ir"
 	"github.com/tinyrange/cc/internal/linux/boot"
-	"golang.org/x/sys/unix"
 )
 
 var ErrYield = errors.New("yield to host")
@@ -187,9 +186,6 @@ func (p *programRunner) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 
 	for {
 		if err := vcpu.Run(ctx); err != nil {
-			if errors.Is(err, unix.EINTR) {
-				continue
-			}
 			if errors.Is(err, hv.ErrVMHalted) {
 				return nil
 			}

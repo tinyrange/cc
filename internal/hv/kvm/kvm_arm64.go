@@ -120,16 +120,21 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	// clear immediate_exit in case it was set
 	run.immediate_exit = 0
 
-	_, err := ioctl(uintptr(v.fd), uint64(kvmRun), 0)
-	if errors.Is(err, unix.EINTR) {
-		if usingContext && (errors.Is(ctx.Err(), context.Canceled) ||
-			errors.Is(ctx.Err(), context.DeadlineExceeded)) {
-			return ctx.Err()
+	// keep trying to run the vCPU until it exits or an error occurs
+	for {
+		_, err := ioctl(uintptr(v.fd), uint64(kvmRun), 0)
+		if errors.Is(err, unix.EINTR) {
+			if usingContext && (errors.Is(ctx.Err(), context.Canceled) ||
+				errors.Is(ctx.Err(), context.DeadlineExceeded)) {
+				return ctx.Err()
+			}
+
+			continue
+		} else if err != nil {
+			return fmt.Errorf("kvm: run vCPU %d: %w", v.id, err)
 		}
 
-		return unix.EINTR
-	} else if err != nil {
-		return fmt.Errorf("kvm: run vCPU %d: %w", v.id, err)
+		break
 	}
 
 	reason := kvmExitReason(run.exit_reason)
