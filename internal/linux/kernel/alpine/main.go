@@ -1,22 +1,19 @@
-package main
+package alpine
 
 import (
 	"archive/tar"
 	"bufio"
 	"compress/gzip"
-	"errors"
-	"flag"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
-	"runtime"
+	"time"
 
 	"github.com/tinyrange/cc/internal/archive"
+	"github.com/tinyrange/cc/internal/hv"
 )
 
 type File interface {
@@ -24,17 +21,17 @@ type File interface {
 	io.ReaderAt
 }
 
-type alpinePackage struct {
+type AlpinePackage struct {
 	files          map[string]archive.Entry
 	contentsReader io.ReaderAt
 	closer         io.Closer
 }
 
-func (p *alpinePackage) Close() error {
+func (p *AlpinePackage) Close() error {
 	return p.closer.Close()
 }
 
-func (p *alpinePackage) Open(filename string) (File, error) {
+func (p *AlpinePackage) Open(filename string) (File, error) {
 	ent, ok := p.files[filename]
 	if !ok {
 		return nil, fmt.Errorf("file %q not found in package", filename)
@@ -48,12 +45,40 @@ func (p *alpinePackage) Open(filename string) (File, error) {
 	return r, nil
 }
 
-func openPackage(base string) (*alpinePackage, error) {
+func (p *AlpinePackage) ListFiles() []string {
+	var files []string
+	for name := range p.files {
+		files = append(files, name)
+	}
+	return files
+}
+
+func (p *AlpinePackage) Size(filename string) (int64, error) {
+	ent, ok := p.files[filename]
+	if !ok {
+		return 0, fmt.Errorf("file %q not found in package", filename)
+	}
+
+	return ent.Size, nil
+}
+
+func openPackage(base string, maxAge time.Duration) (*AlpinePackage, error) {
 	idx, err := os.Open(base + ".idx")
 	if err != nil {
 		return nil, fmt.Errorf("open package index %q: %v", base+".idx", err)
 	}
 	defer idx.Close()
+
+	// check age if requested
+	if maxAge > 0 {
+		info, err := os.Stat(base + ".idx")
+		if err != nil {
+			return nil, fmt.Errorf("stat package index %q: %v", base+".idx", err)
+		}
+		if time.Since(info.ModTime()) > maxAge {
+			return nil, fmt.Errorf("package index %q is too old", base+".idx")
+		}
+	}
 
 	contents, err := os.Open(base + ".bin")
 	if err != nil {
@@ -65,7 +90,7 @@ func openPackage(base string) (*alpinePackage, error) {
 		return nil, fmt.Errorf("create package archive reader: %v", err)
 	}
 
-	ret := &alpinePackage{
+	ret := &AlpinePackage{
 		files: make(map[string]archive.Entry),
 	}
 
@@ -79,7 +104,7 @@ func openPackage(base string) (*alpinePackage, error) {
 	return ret, nil
 }
 
-type alpineDownloader struct {
+type AlpineDownloader struct {
 	Mirror   string
 	Version  string
 	Arch     string
@@ -87,21 +112,11 @@ type alpineDownloader struct {
 	CacheDir string
 }
 
-func (d *alpineDownloader) cacheFilePath(cachePath []string) string {
+func (d *AlpineDownloader) cacheFilePath(cachePath []string) string {
 	return filepath.Join(append([]string{d.CacheDir}, cachePath...)...)
 }
 
-func (d *alpineDownloader) expireCache(cachePath []string) {
-	cacheFile := d.cacheFilePath(cachePath)
-	for _, suffix := range []string{".idx", ".idx.tmp", ".bin"} {
-		filePath := cacheFile + suffix
-		if err := os.Remove(filePath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			slog.Warn("Failed to remove cache file", "path", filePath, "err", err)
-		}
-	}
-}
-
-func (d *alpineDownloader) convertToPackage(r io.Reader, kind string, cachePath []string) (*alpinePackage, error) {
+func (d *AlpineDownloader) convertToPackage(r io.Reader, kind string, cachePath []string) (*AlpinePackage, error) {
 	cacheFile := d.cacheFilePath(cachePath)
 
 	// ensure the cache directory exists
@@ -184,7 +199,7 @@ func (d *alpineDownloader) convertToPackage(r io.Reader, kind string, cachePath 
 	}
 
 	// open the package
-	pkg, err := openPackage(cacheFile)
+	pkg, err := openPackage(cacheFile, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open package %q: %v", cacheFile, err)
 	}
@@ -192,9 +207,9 @@ func (d *alpineDownloader) convertToPackage(r io.Reader, kind string, cachePath 
 	return pkg, nil
 }
 
-func (d *alpineDownloader) downloadAndConvert(url string, kind string, cachePath []string) (*alpinePackage, error) {
+func (d *AlpineDownloader) downloadAndConvert(url string, kind string, cachePath []string) (*AlpinePackage, error) {
 	cacheFile := d.cacheFilePath(cachePath)
-	if pkg, err := openPackage(cacheFile); err == nil {
+	if pkg, err := openPackage(cacheFile, 24*time.Hour); err == nil {
 		return pkg, nil
 	}
 
@@ -216,7 +231,7 @@ func (d *alpineDownloader) downloadAndConvert(url string, kind string, cachePath
 	return d.convertToPackage(resp.Body, kind, cachePath)
 }
 
-func (d *alpineDownloader) parseIndex(r io.Reader) (map[string]map[string]string, error) {
+func (d *AlpineDownloader) parseIndex(r io.Reader) (map[string]map[string]string, error) {
 	entries := make(map[string]map[string]string)
 
 	scan := bufio.NewScanner(r)
@@ -257,11 +272,36 @@ func (d *alpineDownloader) parseIndex(r io.Reader) (map[string]map[string]string
 	return entries, nil
 }
 
-func (d *alpineDownloader) Download(name string) (*alpinePackage, error) {
+func (d *AlpineDownloader) SetForArchitecture(arch hv.CpuArchitecture, cacheDir string) error {
+	if d.Mirror == "" {
+		d.Mirror = "https://dl-cdn.alpinelinux.org"
+	}
+	if d.Version == "" {
+		d.Version = "latest-stable"
+	}
+	if d.Repo == "" {
+		d.Repo = "main"
+	}
+	if d.Arch == "" {
+		switch arch {
+		case hv.ArchitectureX86_64:
+			d.Arch = "x86_64"
+		case hv.ArchitectureARM64:
+			d.Arch = "aarch64"
+		default:
+			return fmt.Errorf("unsupported architecture for Alpine Linux: %v", arch)
+		}
+	}
+	if d.CacheDir == "" {
+		d.CacheDir = cacheDir
+	}
+	return nil
+}
+
+func (d *AlpineDownloader) Download(name string) (*AlpinePackage, error) {
 	indexUrl := fmt.Sprintf("%s/%s/%s/%s/APKINDEX.tar.gz", d.Mirror, d.Version, d.Repo, d.Arch)
 
 	indexCachePath := []string{d.Version, d.Repo, d.Arch, "APKINDEX.pkg"}
-	d.expireCache(indexCachePath)
 
 	indexPkg, err := d.downloadAndConvert(indexUrl, "tar.gz", indexCachePath)
 	if err != nil {
@@ -283,10 +323,6 @@ func (d *alpineDownloader) Download(name string) (*alpinePackage, error) {
 		return nil, fmt.Errorf("package %q not found in index", name)
 	}
 
-	slog.Info("Found Alpine Linux package",
-		"package", pkg,
-	)
-
 	version := pkg["V"]
 	arch := pkg["A"]
 
@@ -303,85 +339,4 @@ func (d *alpineDownloader) Download(name string) (*alpinePackage, error) {
 	}
 
 	return apkPkg, nil
-}
-
-func getAlpineArch() string {
-	switch runtime.GOARCH {
-	case "amd64":
-		return "x86_64"
-	case "arm64":
-		return "aarch64"
-	default:
-		return ""
-	}
-}
-
-func main() {
-	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
-
-	mirror := fs.String("mirror", "http://dl-cdn.alpinelinux.org", "Alpine Linux mirror URL")
-	version := fs.String("version", "latest-stable", "Alpine Linux version to download")
-	arch := fs.String("arch", getAlpineArch(), "Alpine Linux architecture to download")
-	repo := fs.String("repo", "main", "Alpine Linux repository to download from")
-	cacheDir := fs.String("cache-dir", filepath.Join("local", "alpine"), "Output directory for downloaded files")
-	name := fs.String("name", "", "Name of the package to download")
-	list := fs.Bool("list", false, "If set, list all files in the package")
-	extractFilename := fs.String("extract-filename", "", "If set, extract the following file from the package")
-	extractOutput := fs.String("extract-output", "", "If set, write the extracted file to this path")
-
-	if err := fs.Parse(os.Args[1:]); err != nil {
-		log.Fatalf("Parse flags: %v", err)
-	}
-
-	if *arch == "" {
-		log.Fatalf("Unsupported architecture: %s", runtime.GOARCH)
-	}
-
-	if *name == "" {
-		log.Fatalf("Package name is required")
-	}
-
-	dl := &alpineDownloader{
-		Mirror:   *mirror,
-		Version:  *version,
-		Arch:     *arch,
-		Repo:     *repo,
-		CacheDir: *cacheDir,
-	}
-
-	if err := os.MkdirAll(dl.CacheDir, 0755); err != nil {
-		log.Fatalf("Create cache directory %q: %v", dl.CacheDir, err)
-	}
-
-	pkg, err := dl.Download(*name)
-	if err != nil {
-		log.Fatalf("Download Alpine Linux package: %v", err)
-	}
-
-	if *list {
-		for file, ent := range pkg.files {
-			fmt.Printf("%s (size: %d, mode: %o)\n", file, ent.Size, ent.Mode)
-		}
-	}
-
-	if *extractFilename != "" {
-		if *extractOutput == "" {
-			*extractOutput = path.Base(*extractFilename)
-		}
-
-		r, err := pkg.Open(*extractFilename)
-		if err != nil {
-			log.Fatalf("Open file %q in package: %v", *extractFilename, err)
-		}
-
-		outFile, err := os.Create(*extractOutput)
-		if err != nil {
-			log.Fatalf("Create output file %q: %v", *extractOutput, err)
-		}
-		defer outFile.Close()
-
-		if _, err := io.Copy(outFile, r); err != nil {
-			log.Fatalf("Extract file %q to %q: %v", *extractFilename, *extractOutput, err)
-		}
-	}
 }

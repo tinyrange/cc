@@ -90,7 +90,8 @@ type LinuxLoader struct {
 
 	Devices []hv.DeviceTemplate
 
-	plan bootPlan
+	plan         bootPlan
+	kernelReader io.ReaderAt
 }
 
 func (l *LinuxLoader) ConfigureVCPU(vcpu hv.VirtualCPU) error {
@@ -129,6 +130,8 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 	if err != nil {
 		return fmt.Errorf("get kernel: %w", err)
 	}
+
+	l.kernelReader = kernelReader
 
 	arch := vm.Hypervisor().Architecture()
 
@@ -347,12 +350,7 @@ func (l *LinuxLoader) loadARM64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 }
 
 func (l *LinuxLoader) RunConfig() (hv.RunConfig, error) {
-	linux, _, err := l.GetKernel()
-	if err != nil {
-		return nil, fmt.Errorf("get kernel: %w", err)
-	}
-
-	loader := &programRunner{loader: l, linux: linux}
+	loader := &programRunner{loader: l, linux: l.kernelReader}
 
 	return loader, nil
 }

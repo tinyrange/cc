@@ -5,10 +5,8 @@ package main
 import (
 	"crypto/rand"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -52,12 +50,6 @@ var crossBuilds = []crossBuild{
 	{"linux", "arm64"},
 	{"darwin", "arm64"},
 	{"windows", "arm64"},
-}
-
-const linuxKernelRefreshInterval = 24 * time.Hour
-
-func linuxKernelPath() string {
-	return filepath.Join("local", fmt.Sprintf("vmlinux_%s", runtime.GOARCH))
 }
 
 type buildOptions struct {
@@ -144,72 +136,6 @@ func runBuildOutput(output buildOutput, args []string) error {
 	return nil
 }
 
-func runAlpineDownloader(args []string) error {
-	out, err := goBuild(buildOptions{
-		Package:    "cmd/alpine",
-		OutputName: "alpine",
-		Build:      hostBuild,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to build alpine downloader: %w", err)
-	}
-
-	if err := runBuildOutput(out, args); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func downloadLinuxKernel(extraArgs []string) error {
-	if err := os.MkdirAll("local", 0755); err != nil {
-		return fmt.Errorf("failed to create local directory: %w", err)
-	}
-
-	args := []string{
-		"-name", "linux-virt",
-		"-extract-filename", "boot/vmlinuz-virt",
-		"-extract-output", linuxKernelPath(),
-	}
-
-	if len(extraArgs) > 0 {
-		args = append(args, extraArgs...)
-	}
-
-	if err := runAlpineDownloader(args); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func maybeAutoUpdateLinuxKernel() error {
-	path := linuxKernelPath()
-	info, err := os.Stat(path)
-	reason := ""
-
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			reason = "no cached kernel found"
-		} else {
-			return fmt.Errorf("stat linux kernel %q: %w", path, err)
-		}
-	} else {
-		age := time.Since(info.ModTime())
-		if age < linuxKernelRefreshInterval {
-			return nil
-		}
-		reason = fmt.Sprintf("cached kernel %q last updated %s ago", path, age.Round(time.Minute))
-	}
-
-	slog.Info("Refreshing linux kernel", "reason", reason)
-	if err := downloadLinuxKernel(nil); err != nil {
-		return fmt.Errorf("automatic linux kernel refresh: %w", err)
-	}
-
-	return nil
-}
-
 func getOrCreateHostID() (string, error) {
 	idFile := filepath.Join("local", "hostid")
 	if data, err := os.ReadFile(idFile); err == nil {
@@ -244,18 +170,10 @@ func main() {
 	test := fs.String("test", "", "run go tests in the specified package")
 	bench := fs.Bool("bench", false, "run all benchmarks and output results to benchmarks/<hostid>/<date>.json")
 	codesign := fs.Bool("codesign", false, "build the macos codesign tool")
-	alpine := fs.Bool("alpine", false, "build the alpine linux package downloader")
-	linux := fs.Bool("linux", false, "download the recommended linux kernel via the alpine downloader")
 	oci := fs.Bool("oci", false, "build and execute the OCI image tool")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
-	}
-
-	if !*linux {
-		if err := maybeAutoUpdateLinuxKernel(); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: %v\n", err)
-		}
 	}
 
 	if *codesign {
@@ -276,15 +194,6 @@ func main() {
 		return
 	}
 
-	if *alpine {
-		if err := runAlpineDownloader(fs.Args()); err != nil {
-			fmt.Fprintf(os.Stderr, "%v\n", err)
-			os.Exit(1)
-		}
-
-		return
-	}
-
 	if *oci {
 		out, err := goBuild(buildOptions{
 			Package:    "cmd/oci",
@@ -297,15 +206,6 @@ func main() {
 		}
 
 		if err := runBuildOutput(out, fs.Args()); err != nil {
-			os.Exit(1)
-		}
-
-		return
-	}
-
-	if *linux {
-		if err := downloadLinuxKernel(fs.Args()); err != nil {
-			fmt.Fprintf(os.Stderr, "%v\n", err)
 			os.Exit(1)
 		}
 

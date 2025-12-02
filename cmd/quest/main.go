@@ -29,6 +29,7 @@ import (
 	"github.com/tinyrange/cc/internal/linux/boot"
 	"github.com/tinyrange/cc/internal/linux/defs"
 	amd64defs "github.com/tinyrange/cc/internal/linux/defs/amd64"
+	"github.com/tinyrange/cc/internal/linux/kernel"
 )
 
 const (
@@ -709,16 +710,22 @@ func (q *bringUpQuest) RunLinux() error {
 		Cmdline: cmdline,
 
 		GetKernel: func() (io.ReaderAt, int64, error) {
-			kernelPath := defaultKernelImagePath()
-			f, err := os.Open(kernelPath)
+			kernel, err := kernel.LoadForArchitecture(q.dev.Architecture())
 			if err != nil {
-				return nil, 0, fmt.Errorf("open kernel image %q: %w", kernelPath, err)
+				return nil, 0, fmt.Errorf("load kernel for architecture %s: %w", q.dev.Architecture(), err)
 			}
-			info, err := f.Stat()
+
+			f, err := kernel.Open()
 			if err != nil {
-				return nil, 0, fmt.Errorf("stat kernel image %q: %w", kernelPath, err)
+				return nil, 0, fmt.Errorf("open kernel image: %w", err)
 			}
-			return f, info.Size(), nil
+
+			size, err := kernel.Size()
+			if err != nil {
+				return nil, 0, fmt.Errorf("get kernel size: %w", err)
+			}
+
+			return f, size, nil
 		},
 
 		GetSystemMap: func() (io.ReaderAt, error) {
