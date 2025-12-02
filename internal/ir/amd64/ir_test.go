@@ -12,6 +12,7 @@ import (
 	"github.com/tinyrange/cc/internal/asm/amd64"
 	"github.com/tinyrange/cc/internal/ir"
 	"github.com/tinyrange/cc/internal/linux/defs"
+	amd64defs "github.com/tinyrange/cc/internal/linux/defs/amd64"
 	"golang.org/x/sys/unix"
 )
 
@@ -168,7 +169,7 @@ func TestCompileMethodStoreByte(t *testing.T) {
 
 func TestCompileMethodSyscall(t *testing.T) {
 	method := ir.Method{
-		ir.Assign(ir.Var("pid"), ir.Syscall(unix.SYS_GETPID)),
+		ir.Assign(ir.Var("pid"), ir.Syscall(defs.SYS_GETPID)),
 		ir.Return(ir.Var("pid")),
 	}
 
@@ -279,7 +280,7 @@ func TestSyscallMultipleVarArguments(t *testing.T) {
 		ir.Assign(ir.Var("countCopy"), ir.Var("count")),
 		ir.Assign(ir.Var("result"),
 			ir.Syscall(
-				unix.SYS_WRITE,
+				defs.SYS_WRITE,
 				ir.Var("fdCopy"),
 				ir.Var("bufCopy"),
 				ir.Var("countCopy"),
@@ -466,11 +467,11 @@ func TestSyscallCheckedErrorPath(t *testing.T) {
 	method := ir.Method{
 		ir.SyscallChecked(ir.SyscallCheckedConfig{
 			Result: ir.Var("fd"),
-			Number: unix.SYS_OPENAT,
+			Number: defs.SYS_OPENAT,
 			Args: []any{
-				unix.AT_FDCWD,
+				amd64defs.AT_FDCWD,
 				missingPath,
-				unix.O_RDONLY,
+				amd64defs.O_RDONLY,
 				0,
 			},
 			OnError: ir.Block{
@@ -487,7 +488,7 @@ func TestSyscallCheckedErrorPath(t *testing.T) {
 
 	fn := amd64.MustCompile(frag)
 	got := int64(fn.Call())
-	if got != -int64(unix.ENOENT) {
+	if got != -int64(amd64defs.ENOENT) {
 		t.Fatalf("expected -ENOENT, got %d", got)
 	}
 }
