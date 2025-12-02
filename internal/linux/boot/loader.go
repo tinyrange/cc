@@ -199,6 +199,7 @@ func (l *LinuxLoader) buildInitPayload(arch hv.CpuArchitecture) ([]byte, error) 
 		if err != nil {
 			return nil, fmt.Errorf("build init payload ELF: %w", err)
 		}
+
 		return payload, nil
 	default:
 		return nil, fmt.Errorf("unsupported architecture for init payload: %s", arch)

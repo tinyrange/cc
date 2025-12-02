@@ -687,7 +687,7 @@ func (c *compiler) evalValue(expr ir.Fragment) (asm.Variable, ir.ValueWidth, err
 		default:
 			c.emit(arm64asm.MovFromMemory(arm64asm.Reg64(base), mem))
 		}
-		return base, ir.Width64, nil
+		return base, width, nil
 	case ir.GlobalMem:
 		base, err := c.loadGlobalAddress(v.Name)
 		if err != nil {
@@ -713,7 +713,7 @@ func (c *compiler) evalValue(expr ir.Fragment) (asm.Variable, ir.ValueWidth, err
 		default:
 			c.emit(arm64asm.MovFromMemory(arm64asm.Reg64(base), mem))
 		}
-		return base, ir.Width64, nil
+		return base, width, nil
 	case ir.StackSlotMemFragment:
 		offset, err := c.stackSlotOffset(v.SlotID, v.Disp)
 		if err != nil {

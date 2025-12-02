@@ -55,10 +55,41 @@ func mmapFile(dest ir.Var, fd any, length any, prot int, flags int, offset any) 
 	}
 }
 
+func rebootOnError(val ir.Var, msg string) ir.Block {
+	return ir.Block{
+		ir.If(ir.IsNegative(val), ir.Block{
+			ir.Printf(msg, ir.Op(ir.OpSub, ir.Int64(0), val)),
+			ir.Syscall(
+				defs.SYS_REBOOT,
+				linux.LINUX_REBOOT_MAGIC1,
+				linux.LINUX_REBOOT_MAGIC2,
+				linux.LINUX_REBOOT_CMD_RESTART,
+				ir.Int64(0),
+			),
+		}),
+	}
+}
+
+func logKmsg(msg string) ir.Block {
+	fd := ir.Var("__initx_kmsg_fd")
+	done := nextHelperLabel("kmsg_done")
+	return ir.Block{
+		ir.Assign(fd, ir.Syscall(
+			defs.SYS_OPENAT,
+			ir.Int64(linux.AT_FDCWD),
+			"/dev/kmsg",
+			ir.Int64(linux.O_WRONLY),
+			ir.Int64(0),
+		)),
+		ir.If(ir.IsNegative(fd), ir.Goto(done)),
+		ir.Syscall(defs.SYS_WRITE, fd, msg, ir.Int64(int64(len(msg)))),
+		ir.Syscall(defs.SYS_CLOSE, fd),
+		ir.DeclareLabel(done, ir.Block{}),
+	}
+}
+
 func Build(cfg BuilderConfig) (*ir.Program, error) {
 	main := ir.Method{
-		ir.Printf("Hello, World\n"),
-
 		// ensure /dev exists and expose /dev/mem
 		ir.Syscall(
 			defs.SYS_MKDIRAT,
@@ -95,12 +126,17 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 					linux.LINUX_REBOOT_MAGIC1,
 					linux.LINUX_REBOOT_MAGIC2,
 					linux.LINUX_REBOOT_CMD_RESTART,
+					ir.Int64(0),
 				),
 			}),
 		}),
 
+		logKmsg("initx: dev tmpfs ready\n"),
+
 		// open /dev/mem
 		openFile(ir.Var("memFd"), "/dev/mem", linux.O_RDWR|linux.O_SYNC),
+		rebootOnError(ir.Var("memFd"), "initx: failed to open /dev/mem (errno=0x%x)\n"),
+		logKmsg("initx: opened /dev/mem\n"),
 
 		// map mailbox region
 		mmapFile(
@@ -111,6 +147,8 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 			linux.MAP_SHARED,
 			ir.Int64(0xf000_0000),
 		),
+		rebootOnError(ir.Var("mailboxMem"), "initx: failed to map mailbox region (errno=0x%x)\n"),
+		logKmsg("initx: mapped mailbox\n"),
 
 		// map config region
 		mmapFile(
@@ -121,6 +159,8 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 			linux.MAP_SHARED,
 			ir.Int64(0xf000_3000),
 		),
+		rebootOnError(ir.Var("configMem"), "initx: failed to map config region (errno=0x%x)\n"),
+		logKmsg("initx: mapped config region\n"),
 
 		// map anon a 4MB region r/w/x for copying binaries into
 		mmapFile(
@@ -131,8 +171,11 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 			linux.MAP_PRIVATE|linux.MAP_ANONYMOUS,
 			ir.Int64(0),
 		),
+		rebootOnError(ir.Var("anonMem"), "initx: failed to map anonymous payload region (errno=0x%x)\n"),
+		logKmsg("initx: mapped anon payload region\n"),
 
 		ir.DeclareLabel("loop", ir.Block{
+			logKmsg("initx: entering main loop\n"),
 			// read uint32(configMem[0]) and compare to 0xcafebabe. If not equal print a error (magic value not found) and power off.
 			ir.If(ir.IsEqual(
 				ir.Var("configMem").Mem().As32(),
@@ -143,21 +186,40 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 				ir.Assign(ir.Var("relocBytes"), ir.Op(ir.OpShl, ir.Var("relocCount"), int64(2))),
 				ir.Assign(ir.Var("codeOffset"), ir.Op(ir.OpAdd, int64(16), ir.Var("relocBytes"))),
 
+				logKmsg("initx: loading payload\n"),
+
 				// copy binary payload from configMem+codeOffset to anonMem
 				ir.Assign(ir.Var("copySrc"), ir.Op(ir.OpAdd, ir.Var("configMem"), ir.Var("codeOffset"))),
 				ir.Assign(ir.Var("copyDst"), ir.Var("anonMem")),
 				ir.Assign(ir.Var("remaining"), ir.Var("codeLen")),
-				ir.DeclareLabel("copy_loop", ir.Block{
+
+				// copy 4 bytes at a time while possible
+				ir.DeclareLabel("copy_qword_loop", ir.Block{
+					ir.If(ir.IsLessThan(ir.Var("remaining"), ir.Int64(4)), ir.Block{
+						ir.Goto(ir.Label("copy_qword_done")),
+					}),
+					ir.Assign(ir.Var("copyDst").Mem().As32(), ir.Var("copySrc").Mem().As32()),
+					ir.Assign(ir.Var("copyDst"), ir.Op(ir.OpAdd, ir.Var("copyDst"), int64(4))),
+					ir.Assign(ir.Var("copySrc"), ir.Op(ir.OpAdd, ir.Var("copySrc"), int64(4))),
+					ir.Assign(ir.Var("remaining"), ir.Op(ir.OpSub, ir.Var("remaining"), int64(4))),
+					ir.Goto(ir.Label("copy_qword_loop")),
+				}),
+				ir.DeclareLabel("copy_qword_done", ir.Block{}),
+
+				// copy any leftover tail bytes
+				ir.DeclareLabel("copy_tail_loop", ir.Block{
 					ir.If(ir.IsZero(ir.Var("remaining")), ir.Block{
 						ir.Goto(ir.Label("copy_done")),
 					}),
-					ir.Assign(ir.Var("copyDst").Mem(), ir.Var("copySrc").Mem()),
+					ir.Assign(ir.Var("copyDst").Mem().As8(), ir.Var("copySrc").Mem().As8()),
 					ir.Assign(ir.Var("copyDst"), ir.Op(ir.OpAdd, ir.Var("copyDst"), int64(1))),
 					ir.Assign(ir.Var("copySrc"), ir.Op(ir.OpAdd, ir.Var("copySrc"), int64(1))),
 					ir.Assign(ir.Var("remaining"), ir.Op(ir.OpSub, ir.Var("remaining"), int64(1))),
-					ir.Goto(ir.Label("copy_loop")),
+					ir.Goto(ir.Label("copy_tail_loop")),
 				}),
 				ir.DeclareLabel("copy_done", ir.Block{}),
+
+				logKmsg("initx: applying relocations\n"),
 
 				// apply relocations
 				ir.Assign(ir.Var("relocPtr"), ir.Op(ir.OpAdd, ir.Var("configMem"), int64(16))),
@@ -180,8 +242,12 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 				}),
 				ir.DeclareLabel("reloc_done", ir.Block{}),
 
+				logKmsg("initx: jumping to payload\n"),
+
 				// call anonMem
 				ir.Call(ir.Var("anonMem")),
+
+				logKmsg("initx: payload returned, yielding to host\n"),
 
 				// signal completion to the host without clobbering run results
 				ir.Assign(ir.Var("tmp32"), ir.Int64(0x444f4e45)),
@@ -195,6 +261,7 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 					linux.LINUX_REBOOT_MAGIC1,
 					linux.LINUX_REBOOT_MAGIC2,
 					linux.LINUX_REBOOT_CMD_RESTART,
+					ir.Int64(0),
 				),
 			}),
 			ir.Goto(ir.Label("loop")),

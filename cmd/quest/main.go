@@ -852,8 +852,11 @@ func RunInitX() error {
 	defer vm.Close()
 
 	for i := range 10 {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
 		if err := vm.Run(
-			context.Background(),
+			ctx,
 			&ir.Program{
 				Entrypoint: "main",
 				Methods: map[string]ir.Method{
