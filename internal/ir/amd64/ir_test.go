@@ -11,6 +11,7 @@ import (
 	"github.com/tinyrange/cc/internal/asm"
 	"github.com/tinyrange/cc/internal/asm/amd64"
 	"github.com/tinyrange/cc/internal/ir"
+	"github.com/tinyrange/cc/internal/linux/defs"
 	"golang.org/x/sys/unix"
 )
 
@@ -439,7 +440,7 @@ func TestSyscallCheckedSuccess(t *testing.T) {
 	method := ir.Method{
 		ir.SyscallChecked(ir.SyscallCheckedConfig{
 			Result: ir.Var("pid"),
-			Number: unix.SYS_GETPID,
+			Number: defs.SYS_GETPID,
 			OnError: ir.Block{
 				ir.Return(ir.Int64(-1)),
 			},
