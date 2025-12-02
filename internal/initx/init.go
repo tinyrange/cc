@@ -1,14 +1,23 @@
 package initx
 
 import (
+	"fmt"
+
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/ir"
 	"github.com/tinyrange/cc/internal/linux/defs"
 	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 )
 
+type Module struct {
+	Name string
+	Data []byte
+}
+
 type BuilderConfig struct {
 	Arch hv.CpuArchitecture
+
+	PreloadModules []Module
 }
 
 const (
@@ -89,6 +98,10 @@ func logKmsg(msg string) ir.Block {
 }
 
 func Build(cfg BuilderConfig) (*ir.Program, error) {
+	if len(cfg.PreloadModules) > 0 {
+		return nil, fmt.Errorf("preload modules not yet supported in initx builder")
+	}
+
 	main := ir.Method{
 		// ensure /dev exists and expose /dev/mem
 		ir.Syscall(

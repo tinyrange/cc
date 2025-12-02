@@ -12,6 +12,7 @@ import (
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/ir"
 	"github.com/tinyrange/cc/internal/linux/boot"
+	"github.com/tinyrange/cc/internal/linux/kernel"
 )
 
 var ErrYield = errors.New("yield to host")
@@ -241,7 +242,7 @@ func NewVirtualMachine(
 	h hv.Hypervisor,
 	numCPUs int,
 	memSizeMB uint64,
-	kernelLoader KernelLoader,
+	kernelLoader kernel.Kernel,
 	devices ...hv.DeviceTemplate,
 ) (*VirtualMachine, error) {
 	in := &proxyReader{update: make(chan io.Reader)}
@@ -275,13 +276,38 @@ func NewVirtualMachine(
 			),
 
 			GetKernel: func() (io.ReaderAt, int64, error) {
-				return kernelLoader.GetKernel()
+				size, err := kernelLoader.Size()
+				if err != nil {
+					return nil, 0, fmt.Errorf("get kernel size: %v", err)
+				}
+
+				kernel, err := kernelLoader.Open()
+				if err != nil {
+					return nil, 0, fmt.Errorf("open kernel: %v", err)
+				}
+
+				return kernel, size, nil
 			},
 
 			GetInit: func(arch hv.CpuArchitecture) (*ir.Program, error) {
-				return Build(BuilderConfig{
+				cfg := BuilderConfig{
 					Arch: arch,
-				})
+				}
+
+				if arch == hv.ArchitectureARM64 {
+					mod, err := kernelLoader.GetModule("virtio-mmio")
+					if err != nil {
+						return nil, fmt.Errorf("get virtio-mmio module: %v", err)
+					}
+					cfg.PreloadModules = []Module{
+						{
+							Name: "virtio-mmio",
+							Data: mod,
+						},
+					}
+				}
+
+				return Build(cfg)
 			},
 
 			SerialStdout: out,

@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"runtime"
 	"time"
 
 	"github.com/tinyrange/cc/internal/asm"
@@ -61,14 +60,6 @@ func runWithTiming(name string, fn func() error) error {
 	}
 	slog.Info("Step completed", "step", name, "duration", duration)
 	return nil
-}
-
-func defaultKernelImagePath() string {
-	path := filepath.Join("local", fmt.Sprintf("vmlinux_%s", runtime.GOARCH))
-	if _, err := os.Stat(path); err == nil {
-		return path
-	}
-	return filepath.Join("local", "vmlinux")
 }
 
 func linuxMemoryBaseForArch(arch hv.CpuArchitecture) uint64 {
@@ -818,26 +809,6 @@ func (q *bringUpQuest) RunLinux() error {
 	return nil
 }
 
-type defaultKernelLoader struct{}
-
-// GetKernel implements initx.KernelLoader.
-func (d *defaultKernelLoader) GetKernel() (io.ReaderAt, int64, error) {
-	kernelPath := defaultKernelImagePath()
-	f, err := os.Open(kernelPath)
-	if err != nil {
-		return nil, 0, fmt.Errorf("open kernel image %q: %w", kernelPath, err)
-	}
-	info, err := f.Stat()
-	if err != nil {
-		return nil, 0, fmt.Errorf("stat kernel image %q: %w", kernelPath, err)
-	}
-	return f, info.Size(), nil
-}
-
-var (
-	_ initx.KernelLoader = &defaultKernelLoader{}
-)
-
 func RunInitX() error {
 	slog.Info("Starting Bringup Quest: InitX Boot")
 
@@ -847,12 +818,12 @@ func RunInitX() error {
 	}
 	defer hv.Close()
 
-	vm, err := initx.NewVirtualMachine(
-		hv,
-		1,
-		256,
-		&defaultKernelLoader{},
-	)
+	kernel, err := kernel.LoadForArchitecture(hv.Architecture())
+	if err != nil {
+		return fmt.Errorf("load kernel for architecture %s: %w", hv.Architecture(), err)
+	}
+
+	vm, err := initx.NewVirtualMachine(hv, 1, 256, kernel)
 	if err != nil {
 		return fmt.Errorf("create initx virtual machine: %w", err)
 	}
