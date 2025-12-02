@@ -228,7 +228,7 @@ func (h *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 	if err := bindings.SetPartitionPropertyUnsafe(vm.part, bindings.PartitionPropertyCodeArm64IcParameters, Arm64IcParameters{
 		EmulationMode: Arm64IcEmulationModeGicV3,
 		GicV3Parameters: Arm64GicV3Parameters{
-			GicdBaseAddress:                    0xffff0000,
+			GicdBaseAddress:                    0x08000000,
 			GitsTranslatorBaseAddress:          0xeff68000,
 			GicLpiIntIdBits:                    1,
 			GicPpiOverflowInterruptFromCntv:    0x1B,

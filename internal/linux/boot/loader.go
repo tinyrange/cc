@@ -356,10 +356,6 @@ func (l *LinuxLoader) loadARM64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	return nil
 }
 
-const (
-	windowsGICDistributorBase = 0xffff0000
-)
-
 func detectArm64GICConfig(vm hv.VirtualMachine) (*arm64boot.GICConfig, error) {
 	if vm == nil {
 		return nil, errors.New("vm is nil")
@@ -368,12 +364,13 @@ func detectArm64GICConfig(vm hv.VirtualMachine) (*arm64boot.GICConfig, error) {
 	config := arm64boot.DefaultGICConfig()
 
 	if runtime.GOOS == "windows" {
-		config.DistributorBase = windowsGICDistributorBase
 		base, err := queryArm64GICRBase(vm)
 		if err != nil {
 			return nil, fmt.Errorf("query GIC redistributor base: %w", err)
 		}
-		config.RedistributorBase = base
+		if base != 0 {
+			config.RedistributorBase = base
+		}
 	}
 
 	return &config, nil
