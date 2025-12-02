@@ -29,6 +29,11 @@ const (
 	kvmSetOneReg              = 0x4010aeac
 	kvmGetPit2                = 0x8070ae9f
 	kvmSetPit2                = 0x4070aea0
+	kvmArmSetDeviceAddr       = 0x4010aeab
+	kvmCreateDevice           = 0xc00caee0
+	kvmSetDeviceAttr          = 0x4018aee1
+	kvmGetDeviceAttr          = 0x4018aee2
+	kvmHasDeviceAttr          = 0x4018aee3
 	kvmGetRegs                = 0x8090ae81
 	kvmSetRegs                = 0x4090ae82
 	kvmGetSregs               = 0x8138ae83
@@ -49,6 +54,42 @@ const (
 	kvmArmPreferredTarget     = 0x8020aeaf
 
 	kvmCapNrMemslots = 10
+)
+
+const (
+	kvmDevTypeArmVgicV2 = 5
+	kvmDevTypeArmVgicV3 = 7
+)
+
+const (
+	kvmArmDeviceIdShift = 16
+	kvmArmDeviceVgicV2  = 0
+)
+
+const (
+	kvmDevArmVgicGrpAddr       = 0
+	kvmDevArmVgicGrpDistRegs   = 1
+	kvmDevArmVgicGrpCpuRegs    = 2
+	kvmDevArmVgicGrpNrIrqs     = 3
+	kvmDevArmVgicGrpCtrl       = 4
+	kvmDevArmVgicGrpRedistRegs = 5
+	kvmDevArmVgicGrpCpuSysRegs = 6
+	kvmDevArmVgicGrpLevelInfo  = 7
+	kvmDevArmVgicGrpItsRegs    = 8
+)
+
+const (
+	kvmDevArmVgicCtrlInit = 0
+)
+
+const (
+	kvmVgicV2AddrTypeDist = 0
+	kvmVgicV2AddrTypeCpu  = 1
+)
+
+const (
+	kvmVgicV3AddrTypeDist   = 2
+	kvmVgicV3AddrTypeRedist = 3
 )
 
 type kvmExitReason uint32

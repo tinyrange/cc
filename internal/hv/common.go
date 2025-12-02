@@ -357,6 +357,35 @@ var (
 	_ VMConfig = SimpleVMConfig{}
 )
 
+type Arm64GICVersion int
+
+const (
+	Arm64GICVersionUnknown Arm64GICVersion = iota
+	Arm64GICVersion2
+	Arm64GICVersion3
+)
+
+type Arm64Interrupt struct {
+	Type  uint32
+	Num   uint32
+	Flags uint32
+}
+
+type Arm64GICInfo struct {
+	Version              Arm64GICVersion
+	DistributorBase      uint64
+	DistributorSize      uint64
+	RedistributorBase    uint64
+	RedistributorSize    uint64
+	CpuInterfaceBase     uint64
+	CpuInterfaceSize     uint64
+	MaintenanceInterrupt Arm64Interrupt
+}
+
+type Arm64GICProvider interface {
+	Arm64GICInfo() (Arm64GICInfo, bool)
+}
+
 type Hypervisor interface {
 	io.Closer
 

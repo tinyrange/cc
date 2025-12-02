@@ -61,6 +61,9 @@ type virtualMachine struct {
 
 	// amd64-specific fields
 	hasIRQChip bool
+
+	// arm64-specific fields
+	arm64GICInfo hv.Arm64GICInfo
 }
 
 // implements hv.VirtualMachine.
@@ -161,6 +164,16 @@ func (v *virtualMachine) WriteAt(p []byte, off int64) (n int, err error) {
 	return n, err
 }
 
+func (v *virtualMachine) Arm64GICInfo() (hv.Arm64GICInfo, bool) {
+	if v.hv.Architecture() != hv.ArchitectureARM64 {
+		return hv.Arm64GICInfo{}, false
+	}
+	if v.arm64GICInfo.Version == hv.Arm64GICVersionUnknown {
+		return hv.Arm64GICInfo{}, false
+	}
+	return v.arm64GICInfo, true
+}
+
 func (v *virtualMachine) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error {
 	vcpu, ok := v.vcpus[id]
 	if !ok {
@@ -177,7 +190,8 @@ func (v *virtualMachine) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error
 }
 
 var (
-	_ hv.VirtualMachine = &virtualMachine{}
+	_ hv.VirtualMachine   = &virtualMachine{}
+	_ hv.Arm64GICProvider = &virtualMachine{}
 )
 
 type hypervisor struct {

@@ -363,7 +363,40 @@ func detectArm64GICConfig(vm hv.VirtualMachine) (*arm64boot.GICConfig, error) {
 
 	config := arm64boot.DefaultGICConfig()
 
-	if runtime.GOOS == "windows" {
+	if provider, ok := vm.(hv.Arm64GICProvider); ok {
+		if info, ok := provider.Arm64GICInfo(); ok {
+			if ver := convertArm64GICVersion(info.Version); ver != arm64boot.GICVersionUnknown {
+				config.Version = ver
+			}
+			if info.DistributorBase != 0 {
+				config.DistributorBase = info.DistributorBase
+			}
+			if info.DistributorSize != 0 {
+				config.DistributorSize = info.DistributorSize
+			}
+			if info.RedistributorBase != 0 {
+				config.RedistributorBase = info.RedistributorBase
+			}
+			if info.RedistributorSize != 0 {
+				config.RedistributorSize = info.RedistributorSize
+			}
+			if info.CpuInterfaceBase != 0 {
+				config.CpuInterfaceBase = info.CpuInterfaceBase
+			}
+			if info.CpuInterfaceSize != 0 {
+				config.CpuInterfaceSize = info.CpuInterfaceSize
+			}
+			if info.MaintenanceInterrupt != (hv.Arm64Interrupt{}) {
+				config.MaintenanceInterrupt = arm64boot.InterruptSpec{
+					Type:  info.MaintenanceInterrupt.Type,
+					Num:   info.MaintenanceInterrupt.Num,
+					Flags: info.MaintenanceInterrupt.Flags,
+				}
+			}
+		}
+	}
+
+	if runtime.GOOS == "windows" && config.Version == arm64boot.GICVersion3 {
 		base, err := queryArm64GICRBase(vm)
 		if err != nil {
 			return nil, fmt.Errorf("query GIC redistributor base: %w", err)
@@ -374,6 +407,17 @@ func detectArm64GICConfig(vm hv.VirtualMachine) (*arm64boot.GICConfig, error) {
 	}
 
 	return &config, nil
+}
+
+func convertArm64GICVersion(ver hv.Arm64GICVersion) arm64boot.GICVersion {
+	switch ver {
+	case hv.Arm64GICVersion2:
+		return arm64boot.GICVersion2
+	case hv.Arm64GICVersion3:
+		return arm64boot.GICVersion3
+	default:
+		return arm64boot.GICVersionUnknown
+	}
 }
 
 func queryArm64GICRBase(vm hv.VirtualMachine) (uint64, error) {

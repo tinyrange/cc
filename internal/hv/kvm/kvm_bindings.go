@@ -55,3 +55,18 @@ func setUserMemoryRegion(fd int, region *kvmUserspaceMemoryRegion) error {
 	_, err := ioctlWithRetry(uintptr(fd), uint64(kvmSetUserMemoryRegion), uintptr(unsafe.Pointer(region)))
 	return err
 }
+
+func createDevice(fd int, dev *kvmCreateDeviceArgs) error {
+	_, err := ioctlWithRetry(uintptr(fd), uint64(kvmCreateDevice), uintptr(unsafe.Pointer(dev)))
+	return err
+}
+
+func setDeviceAttr(fd int, attr *kvmDeviceAttr) error {
+	_, err := ioctlWithRetry(uintptr(fd), uint64(kvmSetDeviceAttr), uintptr(unsafe.Pointer(attr)))
+	return err
+}
+
+func setArmDeviceAddr(fd int, addr *kvmArmDeviceAddr) error {
+	_, err := ioctlWithRetry(uintptr(fd), uint64(kvmArmSetDeviceAddr), uintptr(unsafe.Pointer(addr)))
+	return err
+}

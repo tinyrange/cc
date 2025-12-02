@@ -73,11 +73,22 @@ func (s InterruptSpec) isZero() bool {
 	return s == (InterruptSpec{})
 }
 
+type GICVersion int
+
+const (
+	GICVersionUnknown GICVersion = iota
+	GICVersion2
+	GICVersion3
+)
+
 type GICConfig struct {
+	Version              GICVersion
 	DistributorBase      uint64
 	DistributorSize      uint64
 	RedistributorBase    uint64
 	RedistributorSize    uint64
+	CpuInterfaceBase     uint64
+	CpuInterfaceSize     uint64
 	MaintenanceInterrupt InterruptSpec
 }
 
@@ -86,6 +97,8 @@ const (
 	defaultGICDistributorSize          = 0x00010000
 	defaultGICRedistributorBase        = 0x080a0000
 	defaultGICRedistributorSize        = 0x00020000
+	defaultGICCpuInterfaceBase         = 0x08010000
+	defaultGICCpuInterfaceSize         = 0x00002000
 	gicDefaultPhandle           uint32 = 1
 )
 
@@ -94,10 +107,13 @@ var defaultGICMaintenanceInterrupt = InterruptSpec{Type: 1, Num: 9, Flags: 0x4}
 // DefaultGICConfig returns the standard tinyrange GIC description.
 func DefaultGICConfig() GICConfig {
 	return GICConfig{
+		Version:              GICVersion3,
 		DistributorBase:      defaultGICDistributorBase,
 		DistributorSize:      defaultGICDistributorSize,
 		RedistributorBase:    defaultGICRedistributorBase,
 		RedistributorSize:    defaultGICRedistributorSize,
+		CpuInterfaceBase:     defaultGICCpuInterfaceBase,
+		CpuInterfaceSize:     defaultGICCpuInterfaceSize,
 		MaintenanceInterrupt: defaultGICMaintenanceInterrupt,
 	}
 }
@@ -107,6 +123,9 @@ func (c *GICConfig) withDefaults() GICConfig {
 		return DefaultGICConfig()
 	}
 	out := *c
+	if out.Version == GICVersionUnknown {
+		out.Version = GICVersion3
+	}
 	if out.DistributorBase == 0 {
 		out.DistributorBase = defaultGICDistributorBase
 	}
@@ -118,6 +137,12 @@ func (c *GICConfig) withDefaults() GICConfig {
 	}
 	if out.RedistributorSize == 0 {
 		out.RedistributorSize = defaultGICRedistributorSize
+	}
+	if out.CpuInterfaceBase == 0 {
+		out.CpuInterfaceBase = defaultGICCpuInterfaceBase
+	}
+	if out.CpuInterfaceSize == 0 {
+		out.CpuInterfaceSize = defaultGICCpuInterfaceSize
 	}
 	if out.MaintenanceInterrupt.isZero() {
 		out.MaintenanceInterrupt = defaultGICMaintenanceInterrupt
@@ -383,20 +408,29 @@ func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
 	b.propU32("interrupts", interrupts...)
 	b.endNode()
 
-	// GICv3 Node
+	// GIC Node
 	gicNodeName := fmt.Sprintf("interrupt-controller@%x", gicCfg.DistributorBase)
 	b.beginNode(gicNodeName)
-	b.propStrings("compatible", "arm,gic-v3")
 	b.propU32("#interrupt-cells", 3)
 	b.propU32("#address-cells", 2)
 	b.propU32("#size-cells", 2)
 	b.property("interrupt-controller", nil)
 	b.propU32("phandle", gicDefaultPhandle)
 	b.propU32("linux,phandle", gicDefaultPhandle)
-	b.propU64("reg",
-		gicCfg.DistributorBase, gicCfg.DistributorSize,
-		gicCfg.RedistributorBase, gicCfg.RedistributorSize,
-	)
+	switch gicCfg.Version {
+	case GICVersion2:
+		b.propStrings("compatible", "arm,gic-400")
+		b.propU64("reg",
+			gicCfg.DistributorBase, gicCfg.DistributorSize,
+			gicCfg.CpuInterfaceBase, gicCfg.CpuInterfaceSize,
+		)
+	default:
+		b.propStrings("compatible", "arm,gic-v3")
+		b.propU64("reg",
+			gicCfg.DistributorBase, gicCfg.DistributorSize,
+			gicCfg.RedistributorBase, gicCfg.RedistributorSize,
+		)
+	}
 	b.propU32("interrupts",
 		gicCfg.MaintenanceInterrupt.Type,
 		gicCfg.MaintenanceInterrupt.Num,

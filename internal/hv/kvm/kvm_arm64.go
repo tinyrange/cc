@@ -64,6 +64,10 @@ var arm64RegisterIDs = func() map[hv.Register]uint64 {
 
 func (v *virtualCPU) SetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 	for reg, value := range regs {
+		if reg == hv.RegisterARM64GicrBase {
+			return fmt.Errorf("kvm: register %v is read-only for architecture arm64", reg)
+		}
+
 		kvmReg, ok := arm64RegisterIDs[reg]
 		if !ok {
 			return fmt.Errorf("kvm: unsupported register %v for architecture arm64", reg)
@@ -85,6 +89,15 @@ func (v *virtualCPU) SetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 
 func (v *virtualCPU) GetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 	for reg := range regs {
+		if reg == hv.RegisterARM64GicrBase {
+			info := v.vm.arm64GICInfo
+			if info.Version != hv.Arm64GICVersion3 || info.RedistributorBase == 0 {
+				return fmt.Errorf("kvm: register %v not available", reg)
+			}
+			regs[reg] = hv.Register64(info.RedistributorBase)
+			continue
+		}
+
 		kvmReg, ok := arm64RegisterIDs[reg]
 		if !ok {
 			return fmt.Errorf("kvm: unsupported register %v for architecture arm64", reg)
@@ -190,6 +203,14 @@ func (v *virtualCPU) handleMMIO(mmioData *kvmExitMMIOData) error {
 }
 
 func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
+	if !config.NeedsInterruptSupport() {
+		return nil
+	}
+
+	if err := hv.initArm64VGIC(vm); err != nil {
+		return fmt.Errorf("configure VGIC: %w", err)
+	}
+
 	return nil
 }
 

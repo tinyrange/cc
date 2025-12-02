@@ -12,6 +12,24 @@ type kvmUserspaceMemoryRegion struct {
 	UserspaceAddr uint64
 }
 
+type kvmCreateDeviceArgs struct {
+	Type  uint32
+	Fd    uint32
+	Flags uint32
+}
+
+type kvmDeviceAttr struct {
+	Flags uint32
+	Group uint32
+	Attr  uint64
+	Addr  uint64
+}
+
+type kvmArmDeviceAddr struct {
+	id   uint64
+	addr uint64
+}
+
 const syncRegsSizeBytes = 2048
 
 type internalErrorSubReason uint32
