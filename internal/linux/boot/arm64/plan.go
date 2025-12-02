@@ -36,6 +36,7 @@ type BootOptions struct {
 
 	NumCPUs int
 	UART    *UARTConfig
+	GIC     *GICConfig
 }
 
 func (o BootOptions) withDefaults() BootOptions {
@@ -60,6 +61,68 @@ type BootPlan struct {
 	EntryGPA      uint64
 	StackTopGPA   uint64
 	DeviceTreeGPA uint64
+}
+
+type InterruptSpec struct {
+	Type  uint32
+	Num   uint32
+	Flags uint32
+}
+
+func (s InterruptSpec) isZero() bool {
+	return s == (InterruptSpec{})
+}
+
+type GICConfig struct {
+	DistributorBase      uint64
+	DistributorSize      uint64
+	RedistributorBase    uint64
+	RedistributorSize    uint64
+	MaintenanceInterrupt InterruptSpec
+}
+
+const (
+	defaultGICDistributorBase          = 0x08000000
+	defaultGICDistributorSize          = 0x00010000
+	defaultGICRedistributorBase        = 0x080a0000
+	defaultGICRedistributorSize        = 0x00020000
+	gicDefaultPhandle           uint32 = 1
+)
+
+var defaultGICMaintenanceInterrupt = InterruptSpec{Type: 1, Num: 9, Flags: 0x4}
+
+// DefaultGICConfig returns the standard tinyrange GIC description.
+func DefaultGICConfig() GICConfig {
+	return GICConfig{
+		DistributorBase:      defaultGICDistributorBase,
+		DistributorSize:      defaultGICDistributorSize,
+		RedistributorBase:    defaultGICRedistributorBase,
+		RedistributorSize:    defaultGICRedistributorSize,
+		MaintenanceInterrupt: defaultGICMaintenanceInterrupt,
+	}
+}
+
+func (c *GICConfig) withDefaults() GICConfig {
+	if c == nil {
+		return DefaultGICConfig()
+	}
+	out := *c
+	if out.DistributorBase == 0 {
+		out.DistributorBase = defaultGICDistributorBase
+	}
+	if out.DistributorSize == 0 {
+		out.DistributorSize = defaultGICDistributorSize
+	}
+	if out.RedistributorBase == 0 {
+		out.RedistributorBase = defaultGICRedistributorBase
+	}
+	if out.RedistributorSize == 0 {
+		out.RedistributorSize = defaultGICRedistributorSize
+	}
+	if out.MaintenanceInterrupt.isZero() {
+		out.MaintenanceInterrupt = defaultGICMaintenanceInterrupt
+	}
+	return out
 }
 
 // Prepare loads the kernel payload and supporting blobs into guest RAM and
@@ -117,6 +180,7 @@ func (k *KernelImage) Prepare(vm hv.VirtualMachine, opts BootOptions) (*BootPlan
 		InitrdStart: initrdStart,
 		InitrdEnd:   initrdEnd,
 		UART:        opts.UART,
+		GIC:         opts.GIC,
 	}
 	dtb, err := buildDeviceTree(dtbConfig)
 	if err != nil {
@@ -203,6 +267,7 @@ type deviceTreeConfig struct {
 	InitrdStart uint64
 	InitrdEnd   uint64
 	UART        *UARTConfig
+	GIC         *GICConfig
 }
 
 func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
@@ -213,6 +278,11 @@ func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
 		return nil, errors.New("device tree requires at least one CPU")
 	}
 
+	gicCfg := DefaultGICConfig()
+	if cfg.GIC != nil {
+		gicCfg = cfg.GIC.withDefaults()
+	}
+
 	b := newFDTBuilder()
 
 	b.beginNode("")
@@ -220,6 +290,7 @@ func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
 	b.propU32("#size-cells", 2)
 	b.propStrings("compatible", "tinyrange,cc-arm64", "tinyrange,cc")
 	b.propStrings("model", "tinyrange-cc")
+	b.propU32("interrupt-parent", gicDefaultPhandle)
 
 	b.beginNode("cpus")
 	b.propU32("#address-cells", 2)
@@ -310,6 +381,27 @@ func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
 		1, 10, 4,
 	}
 	b.propU32("interrupts", interrupts...)
+	b.endNode()
+
+	// GICv3 Node
+	gicNodeName := fmt.Sprintf("interrupt-controller@%x", gicCfg.DistributorBase)
+	b.beginNode(gicNodeName)
+	b.propStrings("compatible", "arm,gic-v3")
+	b.propU32("#interrupt-cells", 3)
+	b.propU32("#address-cells", 2)
+	b.propU32("#size-cells", 2)
+	b.property("interrupt-controller", nil)
+	b.propU32("phandle", gicDefaultPhandle)
+	b.propU32("linux,phandle", gicDefaultPhandle)
+	b.propU64("reg",
+		gicCfg.DistributorBase, gicCfg.DistributorSize,
+		gicCfg.RedistributorBase, gicCfg.RedistributorSize,
+	)
+	b.propU32("interrupts",
+		gicCfg.MaintenanceInterrupt.Type,
+		gicCfg.MaintenanceInterrupt.Num,
+		gicCfg.MaintenanceInterrupt.Flags,
+	)
 	b.endNode()
 
 	b.endNode() // root

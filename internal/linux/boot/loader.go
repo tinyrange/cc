@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"strings"
 
 	"github.com/tinyrange/cc/internal/asm/amd64"
@@ -318,6 +319,11 @@ func (l *LinuxLoader) loadARM64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 		numCPUs = 1
 	}
 
+	gicConfig, err := detectArm64GICConfig(vm)
+	if err != nil {
+		return fmt.Errorf("detect GIC config: %w", err)
+	}
+
 	plan, err := kernelImage.Prepare(vm, arm64boot.BootOptions{
 		Cmdline: cmdline,
 		Initrd:  initrd,
@@ -329,6 +335,7 @@ func (l *LinuxLoader) loadARM64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 			RegShift: arm64UARTRegShift,
 			BaudRate: arm64UARTBaudRate,
 		},
+		GIC: gicConfig,
 	})
 	if err != nil {
 		return fmt.Errorf("prepare kernel: %w", err)
@@ -347,6 +354,51 @@ func (l *LinuxLoader) loadARM64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	}
 
 	return nil
+}
+
+const (
+	windowsGICDistributorBase = 0xffff0000
+)
+
+func detectArm64GICConfig(vm hv.VirtualMachine) (*arm64boot.GICConfig, error) {
+	if vm == nil {
+		return nil, errors.New("vm is nil")
+	}
+
+	config := arm64boot.DefaultGICConfig()
+
+	if runtime.GOOS == "windows" {
+		config.DistributorBase = windowsGICDistributorBase
+		base, err := queryArm64GICRBase(vm)
+		if err != nil {
+			return nil, fmt.Errorf("query GIC redistributor base: %w", err)
+		}
+		config.RedistributorBase = base
+	}
+
+	return &config, nil
+}
+
+func queryArm64GICRBase(vm hv.VirtualMachine) (uint64, error) {
+	var base uint64
+	err := vm.VirtualCPUCall(0, func(cpu hv.VirtualCPU) error {
+		regs := map[hv.Register]hv.RegisterValue{
+			hv.RegisterARM64GicrBase: hv.Register64(0),
+		}
+		if err := cpu.GetRegisters(regs); err != nil {
+			return fmt.Errorf("get GICR base register: %w", err)
+		}
+		value, ok := regs[hv.RegisterARM64GicrBase].(hv.Register64)
+		if !ok {
+			return fmt.Errorf("unexpected register value type %T for GICR base", regs[hv.RegisterARM64GicrBase])
+		}
+		base = uint64(value)
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return base, nil
 }
 
 func (l *LinuxLoader) RunConfig() (hv.RunConfig, error) {

@@ -98,8 +98,43 @@ func logKmsg(msg string) ir.Block {
 }
 
 func Build(cfg BuilderConfig) (*ir.Program, error) {
+	var preloads ir.Block
+	moduleParamArg := any(ir.Int64(0))
+
 	if len(cfg.PreloadModules) > 0 {
-		return nil, fmt.Errorf("preload modules not yet supported in initx builder")
+		moduleParamPtr := ir.Var("__initx_module_params_ptr")
+		moduleParamArg = moduleParamPtr
+
+		preloads = append(preloads, ir.LoadConstantBytesConfig(ir.ConstantBytesConfig{
+			Target:        nextExecVar(),
+			Data:          nil,
+			ZeroTerminate: true,
+			Pointer:       moduleParamPtr,
+		}))
+	}
+
+	for idx, mod := range cfg.PreloadModules {
+		dataPtr := ir.Var(fmt.Sprintf("__initx_module_%d_data_ptr", idx))
+		dataLen := ir.Var(fmt.Sprintf("__initx_module_%d_data_len", idx))
+		resultVar := ir.Var(fmt.Sprintf("__initx_module_%d_result", idx))
+
+		preloads = append(preloads, ir.Block{
+			ir.LoadConstantBytesConfig(ir.ConstantBytesConfig{
+				Target:  nextExecVar(),
+				Data:    mod.Data,
+				Pointer: dataPtr,
+				Length:  dataLen,
+			}),
+			logKmsg(fmt.Sprintf("initx: loading module %s\n", mod.Name)),
+			ir.Assign(resultVar, ir.Syscall(
+				defs.SYS_INIT_MODULE,
+				dataPtr,
+				dataLen,
+				moduleParamArg,
+			)),
+			rebootOnError(resultVar, fmt.Sprintf("initx: failed to load module %s (errno=0x%%x)\n", mod.Name)),
+			logKmsg(fmt.Sprintf("initx: module %s ready\n", mod.Name)),
+		})
 	}
 
 	main := ir.Method{
@@ -145,6 +180,7 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 		}),
 
 		logKmsg("initx: dev tmpfs ready\n"),
+		preloads,
 
 		// open /dev/mem
 		openFile(ir.Var("memFd"), "/dev/mem", linux.O_RDWR|linux.O_SYNC),

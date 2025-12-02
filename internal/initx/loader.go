@@ -295,16 +295,14 @@ func NewVirtualMachine(
 				}
 
 				if arch == hv.ArchitectureARM64 {
-					mod, err := kernelLoader.GetModule("virtio-mmio")
+					mmio, err := kernelLoader.OpenModule("virtio_mmio")
 					if err != nil {
-						return nil, fmt.Errorf("get virtio-mmio module: %v", err)
+						return nil, fmt.Errorf("get virtio_mmio module: %v", err)
 					}
-					cfg.PreloadModules = []Module{
-						{
-							Name: "virtio-mmio",
-							Data: mod,
-						},
-					}
+					cfg.PreloadModules = []Module{{
+						Name: "virtio_mmio",
+						Data: mmio,
+					}}
 				}
 
 				return Build(cfg)
@@ -327,7 +325,7 @@ func NewVirtualMachine(
 					return []string{
 						"console=ttyS0,115200n8",
 						// fmt.Sprintf("earlycon=uart8250,mmio,0x%x", arm64UARTMMIOBase),
-						"quiet",
+						// "quiet",
 						"reboot=k",
 						"panic=-1",
 					}
