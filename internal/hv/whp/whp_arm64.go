@@ -16,9 +16,8 @@ const (
 	gic64KAlignment           = 64 * 1024
 	whpGicDistributorBase     = 0x08000000
 	whpGicDistributorSize     = 0x00010000
+	whpGicRedistributorBase   = 0x080a0000
 	whpGicRedistributorSize   = 0x00020000
-	whpGicItsBase             = 0xeff68000
-	whpGicItsSize             = 0x00020000
 )
 
 type Arm64InterruptVector uint32
@@ -148,6 +147,8 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			return err
 		}
 
+		var pendingError error = nil
+
 		data := make([]byte, decoded.sizeBytes)
 		if isWrite {
 			value, err := v.readRegister(decoded.target)
@@ -159,11 +160,11 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			}
 
 			if err := dev.WriteMMIO(physAddr, data); err != nil {
-				return fmt.Errorf("whp: MMIO write 0x%x (%d bytes): %w", physAddr, decoded.sizeBytes, err)
+				pendingError = fmt.Errorf("whp: MMIO write 0x%x (%d bytes): %w", physAddr, decoded.sizeBytes, err)
 			}
 		} else {
 			if err := dev.ReadMMIO(physAddr, data); err != nil {
-				return fmt.Errorf("whp: MMIO read 0x%x (%d bytes): %w", physAddr, decoded.sizeBytes, err)
+				pendingError = fmt.Errorf("whp: MMIO read 0x%x (%d bytes): %w", physAddr, decoded.sizeBytes, err)
 			}
 
 			var tmp [8]byte
@@ -174,7 +175,11 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			}
 		}
 
-		return v.advanceProgramCounter()
+		if err := v.advanceProgramCounter(); err != nil {
+			return fmt.Errorf("whp: advance PC after MMIO access: %w", err)
+		}
+
+		return pendingError
 	case bindings.WHvRunVpExitReasonCanceled:
 		if err := ctx.Err(); err != nil {
 			return err
@@ -234,14 +239,23 @@ func (h *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 	if whpGicDistributorBase%gic64KAlignment != 0 {
 		return fmt.Errorf("failed to set ARM64 IC parameters: GIC distributor base %#x must be 64KB aligned", whpGicDistributorBase)
 	}
+	if whpGicRedistributorBase%gic64KAlignment != 0 {
+		return fmt.Errorf("failed to set ARM64 IC parameters: GIC redistributor base %#x must be 64KB aligned", whpGicRedistributorBase)
+	}
+
+	numCPUs := config.CPUCount()
+	var gicrRegionSize uint64
+	if numCPUs > 0 {
+		gicrRegionSize = whpGicRedistributorSize * uint64(numCPUs)
+	}
 
 	if err := bindings.SetPartitionPropertyUnsafe(vm.part, bindings.PartitionPropertyCodeArm64IcParameters, Arm64IcParameters{
 		EmulationMode: Arm64IcEmulationModeGicV3,
 		GicV3Parameters: Arm64GicV3Parameters{
 			GicdBaseAddress:                    whpGicDistributorBase,
-			GitsTranslatorBaseAddress:          whpGicItsBase,
-			GicLpiIntIdBits:                    32,
-			GicPpiOverflowInterruptFromCntv:    0x1B,
+			GitsTranslatorBaseAddress:          0,
+			GicLpiIntIdBits:                    1,
+			GicPpiOverflowInterruptFromCntv:    0x14,
 			GicPpiPerformanceMonitorsInterrupt: 0x17,
 		},
 	}); err != nil {
@@ -252,9 +266,10 @@ func (h *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 		Version:           hv.Arm64GICVersion3,
 		DistributorBase:   whpGicDistributorBase,
 		DistributorSize:   whpGicDistributorSize,
-		RedistributorSize: whpGicRedistributorSize,
-		ItsBase:           whpGicItsBase,
-		ItsSize:           whpGicItsSize,
+		RedistributorBase: whpGicRedistributorBase,
+		RedistributorSize: gicrRegionSize,
+		ItsBase:           0,
+		ItsSize:           0,
 		MaintenanceInterrupt: hv.Arm64Interrupt{
 			Type:  1,
 			Num:   9,
@@ -271,6 +286,11 @@ func (h *hypervisor) archVMInitWithMemory(vm *virtualMachine, config hv.VMConfig
 }
 
 func (h *hypervisor) archVCPUInit(vm *virtualMachine, vcpu *virtualCPU) error {
-	// Currently, there are no architecture-specific initializations needed for AMD64.
+	gicrBase := whpGicRedistributorBase + uint64(vcpu.id)*whpGicRedistributorSize
+	if err := vcpu.SetRegisters(map[hv.Register]hv.RegisterValue{
+		hv.RegisterARM64GicrBase: hv.Register64(gicrBase),
+	}); err != nil {
+		return fmt.Errorf("failed to set ARM64 GICR base: %w", err)
+	}
 	return nil
 }

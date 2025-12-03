@@ -225,7 +225,6 @@ func createEmulator() (bindings.EmulatorHandle, error) {
 
 		if err := vcpu.handleMemoryAccess(access); err != nil {
 			vcpu.pendingError = err
-			return bindings.HRESULTFail
 		}
 
 		return 0

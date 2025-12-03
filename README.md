@@ -37,7 +37,7 @@ Only Linux Guests and bare-metal code are currently supported.
 - **Linux x86_64**: Works, **primary platform**.
 - **Windows x86_64**: Works (up to current step in the plan) with Quirks
 - **Linux arm64**: Works.
-- **Windows arm64**: Work in Progress.
+- **Windows arm64**: Works.
 - **macOS arm64**: Work in Progress.
 
 ## Relationship to TinyRange
