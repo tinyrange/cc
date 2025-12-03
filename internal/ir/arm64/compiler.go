@@ -735,7 +735,7 @@ func (c *compiler) evalValue(expr ir.Fragment) (asm.Variable, ir.ValueWidth, err
 		if err != nil {
 			return 0, 0, err
 		}
-		c.emit(arm64asm.MovReg(arm64asm.Reg64(reg), arm64asm.Reg64(arm64asm.SP)))
+		c.emit(arm64asm.MovRegFromSP(arm64asm.Reg64(reg)))
 		if offset != 0 {
 			c.emit(arm64asm.AddRegImm(arm64asm.Reg64(reg), offset))
 		}
