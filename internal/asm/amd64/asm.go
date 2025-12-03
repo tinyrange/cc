@@ -135,7 +135,7 @@ func SyscallWriteString(fd asm.Value, s string) asm.Fragment {
 }
 
 func Print(s string) asm.Fragment {
-	saved := []asm.Variable{RAX, RDI, RSI, RDX, RCX, R11}
+	saved := []asm.Variable{RAX, RDI, RSI, RDX, RCX, R11, R15}
 	const regWidth = 8
 	stackSize := int32(len(saved) * regWidth)
 
@@ -147,7 +147,10 @@ func Print(s string) asm.Fragment {
 		frags = append(frags, MovToMemory(Mem(Reg64(RSP)).WithDisp(offset), Reg64(reg)))
 	}
 
-	frags = append(frags, SyscallWriteString(asm.Immediate(1), s))
+	frags = append(frags, writeStdoutWithKmsgFallback(
+		asm.LiteralBytes([]byte(s)),
+		asm.Immediate(len(s)),
+	))
 
 	for idx := len(saved) - 1; idx >= 0; idx-- {
 		offset := int32(idx * regWidth)
@@ -160,6 +163,32 @@ func Print(s string) asm.Fragment {
 }
 
 var printfLabelCounter uint64
+
+func writeStdoutWithKmsgFallback(buf asm.Value, count asm.Value) asm.Fragment {
+	id := atomic.AddUint64(&printfLabelCounter, 1)
+	errLabel := asm.Label(fmt.Sprintf("__printf_write_err_%d", id))
+	doneLabel := asm.Label(fmt.Sprintf("__printf_write_done_%d", id))
+
+	return asm.Group{
+		SyscallWrite(asm.Immediate(1), buf, count),
+		TestZero(RAX),
+		JumpIfNegative(errLabel),
+		Jump(doneLabel),
+		asm.MarkLabel(errLabel),
+		Syscall(defs.SYS_OPENAT,
+			asm.Immediate(amd64defs.AT_FDCWD),
+			asm.String("/dev/kmsg"),
+			asm.Immediate(amd64defs.O_WRONLY),
+			asm.Immediate(0),
+		),
+		TestZero(RAX),
+		JumpIfNegative(doneLabel),
+		MovReg(Reg64(R15), Reg64(RAX)),
+		SyscallWrite(UseRegister(R15), buf, count),
+		Syscall(defs.SYS_CLOSE, UseRegister(R15)),
+		asm.MarkLabel(doneLabel),
+	}
+}
 
 // Printf writes a formatted string to stdout.
 // Format only supports %x for hexadecimal output.
@@ -218,15 +247,7 @@ func Printf(format string, args ...asm.Value) asm.Fragment {
 	if len(parts) == 0 {
 		return asm.Group{}
 	}
-	if placeholderCount == 0 {
-		text := ""
-		for _, part := range parts {
-			text += part.text
-		}
-		return Print(text)
-	}
-
-	saved := []asm.Variable{RAX, RDI, RSI, RDX, RCX, R8, R9, R10, R11, R12, R13, R14}
+	saved := []asm.Variable{RAX, RDI, RSI, RDX, RCX, R8, R9, R10, R11, R12, R13, R14, R15}
 	regAreaSize := len(saved) * regWidth
 	totalStack := int32(regAreaSize + bufferSize)
 	bufferOffset := int32(regAreaSize)
@@ -289,7 +310,10 @@ func Printf(format string, args ...asm.Value) asm.Fragment {
 			if len(part.text) == 0 {
 				continue
 			}
-			frags = append(frags, SyscallWriteString(asm.Immediate(1), part.text))
+			frags = append(frags, writeStdoutWithKmsgFallback(
+				asm.LiteralBytes([]byte(part.text)),
+				asm.Immediate(len(part.text)),
+			))
 			continue
 		}
 
@@ -338,7 +362,7 @@ func Printf(format string, args ...asm.Value) asm.Fragment {
 			AddRegReg(Reg64(R9), Reg64(R14)),
 			MovImmediate(Reg64(R13), hexDigits),
 			SubRegReg(Reg64(R13), Reg64(R14)),
-			SyscallWrite(asm.Immediate(1), UseRegister(R9), UseRegister(R13)),
+			writeStdoutWithKmsgFallback(UseRegister(R9), UseRegister(R13)),
 		)
 	}
 

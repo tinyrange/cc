@@ -646,6 +646,38 @@ func emitAddRegImm(c *Context, reg Reg, value int32) error {
 
 var printfLabelCounter uint64
 
+const (
+	atFdcwd = -100
+	oWronly = 1
+)
+
+func writeStdoutWithKmsgFallback(buf asm.Value, count asm.Value) asm.Fragment {
+	id := atomic.AddUint64(&printfLabelCounter, 1)
+	errLabel := asm.Label(fmt.Sprintf("__arm64_printf_write_err_%d", id))
+	doneLabel := asm.Label(fmt.Sprintf("__arm64_printf_write_done_%d", id))
+	fdReg := Reg64(X23)
+
+	return asm.Group{
+		SyscallWrite(asm.Immediate(1), buf, count),
+		TestZero(Reg64(X0)),
+		JumpIfNegative(errLabel),
+		Jump(doneLabel),
+		asm.MarkLabel(errLabel),
+		Syscall(defs.SYS_OPENAT,
+			asm.Immediate(atFdcwd),
+			asm.String("/dev/kmsg"),
+			asm.Immediate(oWronly),
+			asm.Immediate(0),
+		),
+		TestZero(Reg64(X0)),
+		JumpIfNegative(doneLabel),
+		MovReg(fdReg, Reg64(X0)),
+		SyscallWrite(UseRegister(fdReg.id), buf, count),
+		Syscall(defs.SYS_CLOSE, UseRegister(fdReg.id)),
+		asm.MarkLabel(doneLabel),
+	}
+}
+
 // Printf writes a formatted string (currently only supporting %x) to stdout.
 func Printf(format string, args ...asm.Value) asm.Fragment {
 	const (
@@ -701,14 +733,6 @@ func Printf(format string, args ...asm.Value) asm.Fragment {
 	if len(parts) == 0 {
 		return asm.Group{}
 	}
-	if placeholderCount == 0 {
-		text := ""
-		for _, part := range parts {
-			text += part.text
-		}
-		return SyscallWriteString(asm.Immediate(1), text)
-	}
-
 	saved := []asm.Variable{
 		X0, X1, X2, X3, X4, X5, X6, X7,
 		X8, X9, X10, X11, X12, X13, X14,
@@ -779,7 +803,10 @@ func Printf(format string, args ...asm.Value) asm.Fragment {
 			if len(part.text) == 0 {
 				continue
 			}
-			frags = append(frags, SyscallWriteString(asm.Immediate(1), part.text))
+			frags = append(frags, writeStdoutWithKmsgFallback(
+				asm.LiteralBytes([]byte(part.text)),
+				asm.Immediate(len(part.text)),
+			))
 			continue
 		}
 
@@ -840,7 +867,7 @@ func Printf(format string, args ...asm.Value) asm.Fragment {
 			MovImmediate(tmp3, hexDigits),
 			MovReg(tmp4, indexReg),
 			SubRegReg(tmp3, tmp4),
-			SyscallWrite(asm.Immediate(1), UseRegister(tmp0.id), UseRegister(tmp3.id)),
+			writeStdoutWithKmsgFallback(UseRegister(tmp0.id), UseRegister(tmp3.id)),
 		)
 	}
 
