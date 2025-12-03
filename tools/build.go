@@ -171,6 +171,7 @@ func main() {
 	bench := fs.Bool("bench", false, "run all benchmarks and output results to benchmarks/<hostid>/<date>.json")
 	codesign := fs.Bool("codesign", false, "build the macos codesign tool")
 	oci := fs.Bool("oci", false, "build and execute the OCI image tool")
+	kernel := fs.Bool("kernel", false, "build and execute the kernel tool")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
@@ -202,6 +203,24 @@ func main() {
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to build oci tool: %v\n", err)
+			os.Exit(1)
+		}
+
+		if err := runBuildOutput(out, fs.Args()); err != nil {
+			os.Exit(1)
+		}
+
+		return
+	}
+
+	if *kernel {
+		out, err := goBuild(buildOptions{
+			Package:    "cmd/kernel",
+			OutputName: "kernel",
+			Build:      hostBuild,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build kernel tool: %v\n", err)
 			os.Exit(1)
 		}
 

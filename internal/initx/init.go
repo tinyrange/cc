@@ -7,6 +7,7 @@ import (
 	"github.com/tinyrange/cc/internal/ir"
 	"github.com/tinyrange/cc/internal/linux/defs"
 	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
+	"github.com/tinyrange/cc/internal/linux/kernel"
 )
 
 type Module struct {
@@ -17,7 +18,7 @@ type Module struct {
 type BuilderConfig struct {
 	Arch hv.CpuArchitecture
 
-	PreloadModules []Module
+	PreloadModules []kernel.Module
 }
 
 const (

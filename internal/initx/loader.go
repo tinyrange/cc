@@ -294,16 +294,24 @@ func NewVirtualMachine(
 					Arch: arch,
 				}
 
-				if arch == hv.ArchitectureARM64 {
-					mmio, err := kernelLoader.OpenModule("virtio_mmio")
-					if err != nil {
-						return nil, fmt.Errorf("get virtio_mmio module: %v", err)
-					}
-					cfg.PreloadModules = []Module{{
-						Name: "virtio_mmio",
-						Data: mmio,
-					}}
+				modules, err := kernelLoader.PlanModuleLoad(
+					[]string{
+						"CONFIG_VIRTIO_MMIO",
+						"CONFIG_VIRTIO_BLK",
+						"CONFIG_VIRTIO_NET",
+						"CONFIG_VIRTIO_CONSOLE",
+					},
+					map[string]string{
+						"CONFIG_VIRTIO_BLK":  "kernel/drivers/block/virtio_blk.ko.gz",
+						"CONFIG_VIRTIO_NET":  "kernel/drivers/net/virtio_net.ko.gz",
+						"CONFIG_VIRTIO_MMIO": "kernel/drivers/virtio/virtio_mmio.ko.gz",
+					},
+				)
+				if err != nil {
+					return nil, fmt.Errorf("plan module load: %v", err)
 				}
+
+				cfg.PreloadModules = append(cfg.PreloadModules, modules...)
 
 				return Build(cfg)
 			},
