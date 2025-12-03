@@ -135,6 +135,27 @@ func MovReg(dst, src Reg) asm.Fragment {
 	})
 }
 
+// MovRegFromSP copies the stack pointer into dst. ARM64 treats the SP
+// register differently from general-purpose registers, so MOV cannot use it
+// as a source operand.
+func MovRegFromSP(dst Reg) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		if err := dst.validate(); err != nil {
+			return err
+		}
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		word, err := encodeAddImm64(dst, Reg64(SP), 0)
+		if err != nil {
+			return err
+		}
+		c.emit32(word)
+		return nil
+	})
+}
+
 func AddRegImm(dst Reg, value int32) asm.Fragment {
 	return fragmentFunc(func(ctx asm.Context) error {
 		if err := dst.validate(); err != nil {
@@ -734,23 +755,38 @@ func Printf(format string, args ...asm.Value) asm.Fragment {
 	if len(parts) == 0 {
 		return asm.Group{}
 	}
+
 	saved := []asm.Variable{
 		X0, X1, X2, X3, X4, X5, X6, X7,
 		X8, X9, X10, X11, X12, X13, X14,
 		X15, X16, X17, X18, X19, X20, X21, X22, X23,
+		X29, X30,
 	}
+
+	// Stack Alignment Check:
+	// 26 registers * 8 bytes = 208 bytes.
+	// 208 + 32 (buffer) = 240 bytes.
+	// 240 is divisible by 16 (required for SP alignment on ARM64).
 	regAreaSize := len(saved) * regWidth
 	totalStack := int32(regAreaSize + bufferSize)
 	bufferOffset := int32(regAreaSize)
 	savedOffsets := make(map[asm.Variable]int32, len(saved))
 
 	frags := make([]asm.Fragment, 0, len(parts)*10+len(saved)*2+8)
+
+	// Allocate stack space
 	frags = append(frags, AddRegImm(Reg64(SP), -totalStack))
+
+	// Save registers
 	for idx, reg := range saved {
 		offset := int32(idx * regWidth)
 		savedOffsets[reg] = offset
 		frags = append(frags, MovToMemory(Mem(Reg64(SP)).WithDisp(offset), Reg64(reg)))
 	}
+
+	// Setup Frame Pointer (optional but recommended for debugging/unwinding)
+	// Effectively: MOV FP, SP (after adjusting for where FP is saved)
+	// If you want strict ABI compliance, you would set X29 to point to the saved X29 location here.
 
 	bufferReg := Reg64(X20)
 	valueReg := Reg64(X8)
@@ -762,7 +798,7 @@ func Printf(format string, args ...asm.Value) asm.Fragment {
 	indexReg := Reg64(X14)
 
 	frags = append(frags,
-		MovReg(bufferReg, Reg64(SP)),
+		MovRegFromSP(bufferReg),
 		AddRegImm(bufferReg, bufferOffset),
 	)
 
@@ -872,11 +908,14 @@ func Printf(format string, args ...asm.Value) asm.Fragment {
 		)
 	}
 
+	// Restore registers
 	for idx := len(saved) - 1; idx >= 0; idx-- {
 		offset := int32(idx * regWidth)
 		reg := saved[idx]
 		frags = append(frags, MovFromMemory(Reg64(reg), Mem(Reg64(SP)).WithDisp(offset)))
 	}
+
+	// Deallocate stack
 	frags = append(frags, AddRegImm(Reg64(SP), totalStack))
 
 	return asm.Group(frags)
