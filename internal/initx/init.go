@@ -181,6 +181,7 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 		}),
 
 		logKmsg("initx: dev tmpfs ready\n"),
+
 		preloads,
 
 		// open /dev/mem

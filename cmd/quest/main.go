@@ -690,7 +690,7 @@ func (q *bringUpQuest) RunLinux() error {
 	}
 
 	devices := []hv.DeviceTemplate{
-		virtio.ConsoleTemplate{Out: io.MultiWriter(os.Stdout, buf), In: os.Stdin},
+		virtio.ConsoleTemplate{Out: io.MultiWriter(os.Stdout, buf), In: os.Stdin, Arch: dev.Architecture()},
 	}
 
 	loader := &boot.LinuxLoader{

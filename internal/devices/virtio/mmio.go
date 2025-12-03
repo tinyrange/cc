@@ -15,6 +15,10 @@ type VirtioMMIODevice interface {
 	DeviceTreeNodes() ([]fdt.Node, error)
 }
 
+type irqSetter interface {
+	SetIRQ(irqLine uint32, level bool) error
+}
+
 const (
 	VIRTIO_MMIO_MAGIC_VALUE         = 0x000
 	VIRTIO_MMIO_VERSION             = 0x004
@@ -452,8 +456,8 @@ func (d *mmioDevice) raiseInterrupt(bit uint32) {
 	if d.vm == nil || d.irqLine == 0 {
 		return
 	}
-	if vm, ok := d.vm.(hv.VirtualMachineAmd64); ok {
-		if err := vm.SetIRQ(d.irqLine, d.interruptStatus != 0); err != nil {
+	if setter, ok := d.vm.(irqSetter); ok {
+		if err := setter.SetIRQ(d.irqLine, d.interruptStatus != 0); err != nil {
 			slog.Error("virtio: pulse irq failed", "irq", d.irqLine, "err", err)
 		}
 	}

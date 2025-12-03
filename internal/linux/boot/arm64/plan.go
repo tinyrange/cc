@@ -40,11 +40,12 @@ func (o BootOptions) withDefaults() BootOptions {
 
 // UARTConfig describes an optional ns16550-compatible console.
 type UARTConfig struct {
-	Base     uint64
-	Size     uint64
-	ClockHz  uint32
-	RegShift uint32
-	BaudRate uint32
+	Base      uint64
+	Size      uint64
+	ClockHz   uint32
+	RegShift  uint32
+	BaudRate  uint32
+	Interrupt InterruptSpec
 }
 
 // BootPlan captures the derived addresses needed to enter the kernel.
@@ -363,6 +364,14 @@ func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
 		}
 		if cfg.UART.RegShift != 0 {
 			serialNode.Properties["reg-shift"] = fdt.Property{U32: []uint32{cfg.UART.RegShift}}
+		}
+		if !cfg.UART.Interrupt.isZero() {
+			serialNode.Properties["interrupts"] = fdt.Property{U32: []uint32{
+				cfg.UART.Interrupt.Type,
+				cfg.UART.Interrupt.Num,
+				cfg.UART.Interrupt.Flags,
+			}}
+			serialNode.Properties["interrupt-parent"] = fdt.Property{U32: []uint32{gicDefaultPhandle}}
 		}
 		root.Children = append(root.Children, serialNode)
 

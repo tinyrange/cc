@@ -38,3 +38,17 @@ func armVcpuInit(vcpuFd int, init *kvmVcpuInit) error {
 	_, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmArmVcpuInitIoctl), uintptr(unsafe.Pointer(init)))
 	return err
 }
+
+func irqLevel(vmFd int, irqLine uint32, level bool) error {
+	var line kvmIRQLevel
+
+	line.IRQOrStatus = irqLine
+	if level {
+		line.Level = 1
+	} else {
+		line.Level = 0
+	}
+
+	_, err := ioctlWithRetry(uintptr(vmFd), uint64(kvmIrqLine), uintptr(unsafe.Pointer(&line)))
+	return err
+}

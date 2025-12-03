@@ -578,20 +578,5 @@ func (vcpu *virtualCPU) SetLongModeWithSelectors(
 
 var (
 	_ hv.VirtualCPUAmd64 = &virtualCPU{}
-)
-
-func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
-	if !v.hasIRQChip {
-		return fmt.Errorf("kvm: cannot pulse IRQ without irqchip")
-	}
-
-	if err := irqLevel(v.vmFd, irqLine, level); err != nil {
-		return fmt.Errorf("setting IRQ line: %w", err)
-	}
-
-	return nil
-}
-
-var (
 	_ hv.VirtualMachineAmd64 = &virtualMachine{}
 )

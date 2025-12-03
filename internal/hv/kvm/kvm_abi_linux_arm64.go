@@ -16,3 +16,8 @@ type kvmOneReg struct {
 	id   uint64
 	addr uint64
 }
+
+type kvmIRQLevel struct {
+	IRQOrStatus uint32
+	Level       uint32
+}

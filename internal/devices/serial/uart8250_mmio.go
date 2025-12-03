@@ -25,9 +25,11 @@ const (
 
 // UART8250MMIO implements a minimal 16550-compatible UART exposed via MMIO.
 type UART8250MMIO struct {
-	base   uint64
-	stride uint64
-	out    io.Writer
+	vm      hv.VirtualMachine
+	base    uint64
+	stride  uint64
+	irqLine uint32
+	out     io.Writer
 
 	dll       byte
 	dlm       byte
@@ -41,22 +43,25 @@ type UART8250MMIO struct {
 	scr       byte
 	rbr       byte
 
+	pendingIIR  byte
 	fifoEnabled bool
 	skipLF      bool
 }
 
 // NewUART8250MMIO builds a UART with the supplied base address. regShift controls
 // the spacing of successive registers (stride = 1 << regShift).
-func NewUART8250MMIO(base uint64, regShift uint32, out io.Writer) *UART8250MMIO {
+func NewUART8250MMIO(base uint64, regShift uint32, irqLine uint32, out io.Writer) *UART8250MMIO {
 	stride := uint64(1) << regShift
 	if stride == 0 {
 		stride = 1
 	}
 	return &UART8250MMIO{
-		base:   base,
-		stride: stride,
-		out:    out,
-		lsr:    uartLSRTHRE | uartLSRTEMT,
+		base:       base,
+		stride:     stride,
+		irqLine:    irqLine,
+		out:        out,
+		lsr:        uartLSRTHRE | uartLSRTEMT,
+		pendingIIR: 0x01,
 	}
 }
 
@@ -65,7 +70,9 @@ func (s *UART8250MMIO) Init(vm hv.VirtualMachine) error {
 	if vm == nil {
 		return fmt.Errorf("uart8250-mmio: virtual machine is nil")
 	}
+	s.vm = vm
 	s.updateModemStatus()
+	s.updateInterrupts()
 	return nil
 }
 
@@ -130,6 +137,8 @@ func (s *UART8250MMIO) writeRegister(offset uint16, value byte) {
 		if s.lcr&uartLCRDLAB != 0 {
 			s.dll = value
 		} else {
+			s.lsr &^= uartLSRTHRE
+			s.updateInterrupts()
 			s.transmit(value)
 		}
 	case 1:
@@ -151,8 +160,37 @@ func (s *UART8250MMIO) writeRegister(offset uint16, value byte) {
 	}
 }
 
+type irqSetter interface {
+	SetIRQ(line uint32, level bool) error
+}
+
 func (s *UART8250MMIO) setIER(value byte) {
 	s.ier = value & 0x0F
+	s.updateInterrupts()
+}
+
+func (s *UART8250MMIO) updateInterrupts() {
+	interrupt := byte(0x01)
+
+	switch {
+	case s.ier&0x04 != 0 && (s.lsr&0x1E) != 0:
+		interrupt = 0x06
+	case s.ier&0x01 != 0 && s.lsr&uartLSRDataReady != 0:
+		interrupt = 0x04
+	case s.ier&0x02 != 0 && s.lsr&uartLSRTHRE != 0:
+		interrupt = 0x02
+	case s.ier&0x08 != 0 && s.msrDelta != 0:
+		interrupt = 0x00
+	}
+
+	s.pendingIIR = interrupt
+
+	if s.vm == nil || s.irqLine == 0 {
+		return
+	}
+	if setter, ok := s.vm.(irqSetter); ok {
+		_ = setter.SetIRQ(s.irqLine, interrupt != 0x01)
+	}
 }
 
 func (s *UART8250MMIO) readRegister(offset uint16) byte {
@@ -171,7 +209,7 @@ func (s *UART8250MMIO) readRegister(offset uint16) byte {
 		}
 		return s.ier
 	case 2:
-		return 0x01 // no interrupts supported
+		return s.interruptIdentification()
 	case 3:
 		return s.lcr
 	case 4:
@@ -185,6 +223,10 @@ func (s *UART8250MMIO) readRegister(offset uint16) byte {
 	default:
 		return 0
 	}
+}
+
+func (s *UART8250MMIO) interruptIdentification() byte {
+	return s.pendingIIR
 }
 
 func (s *UART8250MMIO) transmit(value byte) {
@@ -208,11 +250,13 @@ func (s *UART8250MMIO) transmit(value byte) {
 		}
 	}
 	s.lsr |= uartLSRTHRE | uartLSRTEMT
+	s.updateInterrupts()
 }
 
 func (s *UART8250MMIO) clearRX() {
 	s.rbr = 0
 	s.lsr &^= uartLSRDataReady
+	s.updateInterrupts()
 }
 
 func (s *UART8250MMIO) setFCR(value byte) {
@@ -232,6 +276,7 @@ func (s *UART8250MMIO) setMCR(value byte) {
 	}
 
 	s.updateModemStatus()
+	s.updateInterrupts()
 }
 
 func (s *UART8250MMIO) modemStatus() byte {
@@ -257,12 +302,13 @@ func (s *UART8250MMIO) updateModemStatus() {
 type UART8250Template struct {
 	Base     uint64
 	RegShift uint32
+	IRQLine  uint32
 	Out      io.Writer
 }
 
 // Create implements hv.DeviceTemplate.
 func (t UART8250Template) Create(vm hv.VirtualMachine) (hv.Device, error) {
-	dev := NewUART8250MMIO(t.Base, t.RegShift, t.Out)
+	dev := NewUART8250MMIO(t.Base, t.RegShift, t.IRQLine, t.Out)
 	if err := dev.Init(vm); err != nil {
 		return nil, err
 	}

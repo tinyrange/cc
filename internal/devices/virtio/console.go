@@ -15,6 +15,7 @@ const (
 	ConsoleDefaultMMIOBase = 0xd0000000
 	ConsoleDefaultMMIOSize = 0x200
 	ConsoleDefaultIRQLine  = 5
+	armConsoleDefaultIRQ   = 40
 
 	consoleQueueCount   = 2
 	consoleQueueNumMax  = 256
@@ -28,28 +29,55 @@ const (
 )
 
 type ConsoleTemplate struct {
-	Out io.Writer
-	In  io.Reader
+	Out  io.Writer
+	In   io.Reader
+	Arch hv.CpuArchitecture
+	// IRQLine identifies the interrupt number that should show up in the device
+	// tree. When zero an architecture-specific default is used (PIC line 5 on
+	// x86, SPI 40 on arm64).
+	IRQLine uint32
+}
+
+func (t ConsoleTemplate) archOrDefault(vm hv.VirtualMachine) hv.CpuArchitecture {
+	if t.Arch != "" && t.Arch != hv.ArchitectureInvalid {
+		return t.Arch
+	}
+	if vm != nil && vm.Hypervisor() != nil {
+		return vm.Hypervisor().Architecture()
+	}
+	return hv.ArchitectureInvalid
+}
+
+func (t ConsoleTemplate) irqLineForArch(arch hv.CpuArchitecture) uint32 {
+	if t.IRQLine != 0 {
+		return t.IRQLine
+	}
+	if arch == hv.ArchitectureARM64 {
+		return armConsoleDefaultIRQ
+	}
+	return ConsoleDefaultIRQLine
 }
 
 // GetLinuxCommandLineParam implements VirtioMMIODevice.
 func (t ConsoleTemplate) GetLinuxCommandLineParam() ([]string, error) {
+	irqLine := t.irqLineForArch(t.Arch)
 	param := fmt.Sprintf(
 		"virtio_mmio.device=4k@0x%x:%d",
 		ConsoleDefaultMMIOBase,
-		ConsoleDefaultIRQLine,
+		irqLine,
 	)
 	return []string{param}, nil
 }
 
 // DeviceTreeNodes implements VirtioMMIODevice.
 func (t ConsoleTemplate) DeviceTreeNodes() ([]fdt.Node, error) {
+	irqLine := t.irqLineForArch(t.Arch)
 	node := fdt.Node{
 		Name: fmt.Sprintf("virtio@%x", ConsoleDefaultMMIOBase),
 		Properties: map[string]fdt.Property{
 			"compatible": {Strings: []string{"virtio,mmio"}},
 			"reg":        {U64: []uint64{ConsoleDefaultMMIOBase, ConsoleDefaultMMIOSize}},
-			"interrupts": {U32: []uint32{0, ConsoleDefaultIRQLine, 4}},
+			"interrupts": {U32: []uint32{0, irqLine, 4}},
 			"status":     {Strings: []string{"okay"}},
 		},
 	}
@@ -57,10 +85,13 @@ func (t ConsoleTemplate) DeviceTreeNodes() ([]fdt.Node, error) {
 }
 
 func (t ConsoleTemplate) Create(vm hv.VirtualMachine) (hv.Device, error) {
+	arch := t.archOrDefault(vm)
+	irqLine := t.irqLineForArch(arch)
+	encodedLine := encodeConsoleIRQLine(arch, irqLine)
 	console := &Console{
 		base:    ConsoleDefaultMMIOBase,
 		size:    ConsoleDefaultMMIOSize,
-		irqLine: ConsoleDefaultIRQLine,
+		irqLine: encodedLine,
 		out:     t.Out,
 		in:      t.In,
 	}
@@ -138,6 +169,17 @@ func (vc *Console) requireDevice() (device, error) {
 		return nil, fmt.Errorf("virtio-console: device not initialized")
 	}
 	return vc.device, nil
+}
+
+func encodeConsoleIRQLine(arch hv.CpuArchitecture, irqLine uint32) uint32 {
+	if arch != hv.ArchitectureARM64 {
+		return irqLine
+	}
+	const (
+		armKVMIRQTypeShift = 24
+		armKVMIRQTypeSPI   = 1
+	)
+	return (armKVMIRQTypeSPI << armKVMIRQTypeShift) | (irqLine & 0xFFFF)
 }
 
 func NewConsole(vm hv.VirtualMachine, base uint64, size uint64, irqLine uint32, out io.Writer, in io.Reader) *Console {

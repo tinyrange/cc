@@ -35,6 +35,36 @@ const (
 	arm64UARTBaudRate = 115200
 )
 
+const (
+	armGICInterruptTypeSPI = 0
+	armGICInterruptTypePPI = 1
+
+	armKVMIRQTypeShift = 24
+	armKVMIRQTypeSPI   = 1
+	armKVMIRQTypePPI   = 2
+)
+
+var arm64UARTInterrupt = arm64boot.InterruptSpec{
+	Type:  armGICInterruptTypeSPI,
+	Num:   33, // Matches qemu-virt UART
+	Flags: 0x4,
+}
+
+var arm64UARTIRQLine = armInterruptLine(arm64UARTInterrupt)
+
+func armInterruptLine(spec arm64boot.InterruptSpec) uint32 {
+	var irqType uint32
+	switch spec.Type {
+	case armGICInterruptTypeSPI:
+		irqType = armKVMIRQTypeSPI
+	case armGICInterruptTypePPI:
+		irqType = armKVMIRQTypePPI
+	default:
+		panic(fmt.Sprintf("unsupported GIC interrupt type %d", spec.Type))
+	}
+	return (irqType << armKVMIRQTypeShift) | (spec.Num & 0xFFFF)
+}
+
 type programRunner struct {
 	loader *LinuxLoader
 	linux  io.ReaderAt
@@ -339,11 +369,12 @@ func (l *LinuxLoader) loadARM64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 		Initrd:  initrd,
 		NumCPUs: numCPUs,
 		UART: &arm64boot.UARTConfig{
-			Base:     arm64UARTMMIOBase,
-			Size:     serial.UART8250MMIOSize,
-			ClockHz:  serial.UART8250DefaultClock,
-			RegShift: arm64UARTRegShift,
-			BaudRate: arm64UARTBaudRate,
+			Base:      arm64UARTMMIOBase,
+			Size:      serial.UART8250MMIOSize,
+			ClockHz:   serial.UART8250DefaultClock,
+			RegShift:  arm64UARTRegShift,
+			BaudRate:  arm64UARTBaudRate,
+			Interrupt: arm64UARTInterrupt,
 		},
 		GIC:             gicConfig,
 		DeviceTreeNodes: deviceTree,
@@ -353,7 +384,7 @@ func (l *LinuxLoader) loadARM64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	}
 	l.plan = plan
 
-	uartDev := serial.NewUART8250MMIO(arm64UARTMMIOBase, arm64UARTRegShift, &convertCRLF{l.SerialStdout})
+	uartDev := serial.NewUART8250MMIO(arm64UARTMMIOBase, arm64UARTRegShift, arm64UARTIRQLine, &convertCRLF{l.SerialStdout})
 	if err := vm.AddDevice(uartDev); err != nil {
 		return fmt.Errorf("add arm64 uart device: %w", err)
 	}

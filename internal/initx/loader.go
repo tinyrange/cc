@@ -271,7 +271,7 @@ func NewVirtualMachine(
 
 			Devices: append(
 				devices,
-				virtio.ConsoleTemplate{Out: out, In: in},
+				virtio.ConsoleTemplate{Out: out, In: in, Arch: h.Architecture()},
 				programLoader,
 			),
 
@@ -331,7 +331,8 @@ func NewVirtualMachine(
 					}
 				case hv.ArchitectureARM64:
 					return []string{
-						"console=ttyS0,115200n8",
+						// "console=ttyS0,115200n8",
+						"console=hvc0",
 						// fmt.Sprintf("earlycon=uart8250,mmio,0x%x", arm64UARTMMIOBase),
 						// "quiet",
 						"reboot=k",
