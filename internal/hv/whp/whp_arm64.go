@@ -147,6 +147,8 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			return err
 		}
 
+		var pendingError error = nil
+
 		data := make([]byte, decoded.sizeBytes)
 		if isWrite {
 			value, err := v.readRegister(decoded.target)
@@ -158,11 +160,11 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			}
 
 			if err := dev.WriteMMIO(physAddr, data); err != nil {
-				return fmt.Errorf("whp: MMIO write 0x%x (%d bytes): %w", physAddr, decoded.sizeBytes, err)
+				pendingError = fmt.Errorf("whp: MMIO write 0x%x (%d bytes): %w", physAddr, decoded.sizeBytes, err)
 			}
 		} else {
 			if err := dev.ReadMMIO(physAddr, data); err != nil {
-				return fmt.Errorf("whp: MMIO read 0x%x (%d bytes): %w", physAddr, decoded.sizeBytes, err)
+				pendingError = fmt.Errorf("whp: MMIO read 0x%x (%d bytes): %w", physAddr, decoded.sizeBytes, err)
 			}
 
 			var tmp [8]byte
@@ -173,7 +175,11 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			}
 		}
 
-		return v.advanceProgramCounter()
+		if err := v.advanceProgramCounter(); err != nil {
+			return fmt.Errorf("whp: advance PC after MMIO access: %w", err)
+		}
+
+		return pendingError
 	case bindings.WHvRunVpExitReasonCanceled:
 		if err := ctx.Err(); err != nil {
 			return err
