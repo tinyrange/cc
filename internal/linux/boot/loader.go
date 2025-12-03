@@ -17,6 +17,7 @@ import (
 	amd64serial "github.com/tinyrange/cc/internal/devices/amd64/serial"
 	"github.com/tinyrange/cc/internal/devices/serial"
 	"github.com/tinyrange/cc/internal/devices/virtio"
+	"github.com/tinyrange/cc/internal/fdt"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/ir"
 	_ "github.com/tinyrange/cc/internal/ir/amd64"
@@ -151,23 +152,32 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 		return fmt.Errorf("build initramfs: %w", err)
 	}
 
-	cmdline := append([]string(nil), l.Cmdline...)
+	cmdlineBase := append([]string(nil), l.Cmdline...)
+	var virtioCmdline []string
+	var virtioNodes []fdt.Node
 	for _, dev := range l.Devices {
 		if vdev, ok := dev.(virtio.VirtioMMIODevice); ok {
 			params, err := vdev.GetLinuxCommandLineParam()
 			if err != nil {
 				return fmt.Errorf("get virtio mmio device linux cmdline param: %w", err)
 			}
-			cmdline = append(cmdline, params...)
+			virtioCmdline = append(virtioCmdline, params...)
+			nodes, err := vdev.DeviceTreeNodes()
+			if err != nil {
+				return fmt.Errorf("get virtio mmio device tree nodes: %w", err)
+			}
+			virtioNodes = append(virtioNodes, nodes...)
 		}
 	}
-	cmdlineStr := strings.Join(cmdline, " ")
 
 	switch arch {
 	case hv.ArchitectureX86_64:
+		cmdline := append(cmdlineBase, virtioCmdline...)
+		cmdlineStr := strings.Join(cmdline, " ")
 		return l.loadAMD64(vm, kernelReader, kernelSize, cmdlineStr, initrd)
 	case hv.ArchitectureARM64:
-		return l.loadARM64(vm, kernelReader, kernelSize, cmdlineStr, initrd)
+		cmdlineStr := strings.Join(cmdlineBase, " ")
+		return l.loadARM64(vm, kernelReader, kernelSize, cmdlineStr, initrd, virtioNodes)
 	default:
 		return fmt.Errorf("unsupported architecture: %v", arch)
 	}
@@ -308,7 +318,7 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	return nil
 }
 
-func (l *LinuxLoader) loadARM64(vm hv.VirtualMachine, kernelReader io.ReaderAt, kernelSize int64, cmdline string, initrd []byte) error {
+func (l *LinuxLoader) loadARM64(vm hv.VirtualMachine, kernelReader io.ReaderAt, kernelSize int64, cmdline string, initrd []byte, deviceTree []fdt.Node) error {
 	kernelImage, err := arm64boot.LoadKernel(kernelReader, kernelSize)
 	if err != nil {
 		return fmt.Errorf("load kernel: %w", err)
@@ -335,7 +345,8 @@ func (l *LinuxLoader) loadARM64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 			RegShift: arm64UARTRegShift,
 			BaudRate: arm64UARTBaudRate,
 		},
-		GIC: gicConfig,
+		GIC:             gicConfig,
+		DeviceTreeNodes: deviceTree,
 	})
 	if err != nil {
 		return fmt.Errorf("prepare kernel: %w", err)

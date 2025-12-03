@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sync"
 
+	"github.com/tinyrange/cc/internal/fdt"
 	"github.com/tinyrange/cc/internal/hv"
 )
 
@@ -39,6 +40,20 @@ func (t ConsoleTemplate) GetLinuxCommandLineParam() ([]string, error) {
 		ConsoleDefaultIRQLine,
 	)
 	return []string{param}, nil
+}
+
+// DeviceTreeNodes implements VirtioMMIODevice.
+func (t ConsoleTemplate) DeviceTreeNodes() ([]fdt.Node, error) {
+	node := fdt.Node{
+		Name: fmt.Sprintf("virtio@%x", ConsoleDefaultMMIOBase),
+		Properties: map[string]fdt.Property{
+			"compatible": {Strings: []string{"virtio,mmio"}},
+			"reg":        {U64: []uint64{ConsoleDefaultMMIOBase, ConsoleDefaultMMIOSize}},
+			"interrupts": {U32: []uint32{0, ConsoleDefaultIRQLine, 4}},
+			"status":     {Strings: []string{"okay"}},
+		},
+	}
+	return []fdt.Node{node}, nil
 }
 
 func (t ConsoleTemplate) Create(vm hv.VirtualMachine) (hv.Device, error) {

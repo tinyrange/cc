@@ -6,11 +6,13 @@ import (
 	"log/slog"
 	"math"
 
+	"github.com/tinyrange/cc/internal/fdt"
 	"github.com/tinyrange/cc/internal/hv"
 )
 
 type VirtioMMIODevice interface {
 	GetLinuxCommandLineParam() ([]string, error)
+	DeviceTreeNodes() ([]fdt.Node, error)
 }
 
 const (

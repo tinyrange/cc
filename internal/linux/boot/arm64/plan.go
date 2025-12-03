@@ -1,28 +1,18 @@
 package arm64
 
 import (
-	"bytes"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
 
+	"github.com/tinyrange/cc/internal/fdt"
 	"github.com/tinyrange/cc/internal/hv"
 )
 
 const (
-	dtbAlignment           = 0x8
-	initrdAlignment        = 0x1000
-	stackGuardBytes        = 0x2000
-	fdtHeaderSize          = 0x28
-	fdtVersion             = 17
-	fdtLastCompVer         = 16
-	fdtMagic        uint32 = 0xd00dfeed
-
-	fdtBeginNode uint32 = 0x1
-	fdtEndNode   uint32 = 0x2
-	fdtProp      uint32 = 0x3
-	fdtEnd       uint32 = 0x9
+	dtbAlignment    = 0x8
+	initrdAlignment = 0x1000
+	stackGuardBytes = 0x2000
 )
 
 // BootOptions describes how the ARM64 kernel should be placed into guest RAM.
@@ -34,9 +24,10 @@ type BootOptions struct {
 	DeviceTreeGPA uint64
 	StackTopGPA   uint64
 
-	NumCPUs int
-	UART    *UARTConfig
-	GIC     *GICConfig
+	NumCPUs         int
+	UART            *UARTConfig
+	GIC             *GICConfig
+	DeviceTreeNodes []fdt.Node
 }
 
 func (o BootOptions) withDefaults() BootOptions {
@@ -206,6 +197,7 @@ func (k *KernelImage) Prepare(vm hv.VirtualMachine, opts BootOptions) (*BootPlan
 		InitrdEnd:   initrdEnd,
 		UART:        opts.UART,
 		GIC:         opts.GIC,
+		Devices:     opts.DeviceTreeNodes,
 	}
 	dtb, err := buildDeviceTree(dtbConfig)
 	if err != nil {
@@ -293,6 +285,7 @@ type deviceTreeConfig struct {
 	InitrdEnd   uint64
 	UART        *UARTConfig
 	GIC         *GICConfig
+	Devices     []fdt.Node
 }
 
 func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
@@ -308,71 +301,90 @@ func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
 		gicCfg = cfg.GIC.withDefaults()
 	}
 
-	b := newFDTBuilder()
-
-	b.beginNode("")
-	b.propU32("#address-cells", 2)
-	b.propU32("#size-cells", 2)
-	b.propStrings("compatible", "tinyrange,cc-arm64", "tinyrange,cc")
-	b.propStrings("model", "tinyrange-cc")
-	b.propU32("interrupt-parent", gicDefaultPhandle)
-
-	b.beginNode("cpus")
-	b.propU32("#address-cells", 2)
-	b.propU32("#size-cells", 0)
-	for cpu := 0; cpu < cfg.NumCPUs; cpu++ {
-		name := fmt.Sprintf("cpu@%d", cpu)
-		b.beginNode(name)
-		b.propStrings("device_type", "cpu")
-		b.propStrings("compatible", "arm,armv8")
-		b.propU64("reg", uint64(cpu))
-		b.propStrings("enable-method", "psci")
-		b.endNode()
+	root := fdt.Node{
+		Name: "",
+		Properties: map[string]fdt.Property{
+			"#address-cells":   {U32: []uint32{2}},
+			"#size-cells":      {U32: []uint32{2}},
+			"compatible":       {Strings: []string{"tinyrange,cc-arm64", "tinyrange,cc"}},
+			"model":            {Strings: []string{"tinyrange-cc"}},
+			"interrupt-parent": {U32: []uint32{gicDefaultPhandle}},
+		},
 	}
-	b.endNode()
 
-	memNodeName := fmt.Sprintf("memory@%x", cfg.MemoryBase)
-	b.beginNode(memNodeName)
-	b.propStrings("device_type", "memory")
-	b.propU64("reg", cfg.MemoryBase, cfg.MemorySize)
-	b.endNode()
+	cpus := fdt.Node{
+		Name: "cpus",
+		Properties: map[string]fdt.Property{
+			"#address-cells": {U32: []uint32{2}},
+			"#size-cells":    {U32: []uint32{0}},
+		},
+	}
+	for cpu := 0; cpu < cfg.NumCPUs; cpu++ {
+		cpuNode := fdt.Node{
+			Name: fmt.Sprintf("cpu@%d", cpu),
+			Properties: map[string]fdt.Property{
+				"device_type":   {Strings: []string{"cpu"}},
+				"compatible":    {Strings: []string{"arm,armv8"}},
+				"reg":           {U64: []uint64{uint64(cpu)}},
+				"enable-method": {Strings: []string{"psci"}},
+			},
+		}
+		cpus.Children = append(cpus.Children, cpuNode)
+	}
+	root.Children = append(root.Children, cpus)
 
+	memoryNode := fdt.Node{
+		Name: fmt.Sprintf("memory@%x", cfg.MemoryBase),
+		Properties: map[string]fdt.Property{
+			"device_type": {Strings: []string{"memory"}},
+			"reg":         {U64: []uint64{cfg.MemoryBase, cfg.MemorySize}},
+		},
+	}
+	root.Children = append(root.Children, memoryNode)
+
+	var aliasesProps map[string]fdt.Property
 	stdoutAlias := ""
 	stdoutBaud := uint32(0)
 	if cfg.UART != nil {
 		if cfg.UART.Size == 0 {
 			return nil, errors.New("uart config requires non-zero size")
 		}
-		serialNodeName := fmt.Sprintf("serial@%x", cfg.UART.Base)
-		serialPath := fmt.Sprintf("/%s", serialNodeName)
-		b.beginNode(serialNodeName)
-		b.propStrings("compatible", "ns16550a")
-		b.propU64("reg", cfg.UART.Base, cfg.UART.Size)
+		serialNode := fdt.Node{
+			Name: fmt.Sprintf("serial@%x", cfg.UART.Base),
+			Properties: map[string]fdt.Property{
+				"compatible":   {Strings: []string{"ns16550a"}},
+				"reg":          {U64: []uint64{cfg.UART.Base, cfg.UART.Size}},
+				"reg-io-width": {U32: []uint32{1}},
+				"status":       {Strings: []string{"okay"}},
+			},
+		}
 		if cfg.UART.ClockHz != 0 {
-			b.propU32("clock-frequency", cfg.UART.ClockHz)
+			serialNode.Properties["clock-frequency"] = fdt.Property{U32: []uint32{cfg.UART.ClockHz}}
 		}
 		if cfg.UART.RegShift != 0 {
-			b.propU32("reg-shift", cfg.UART.RegShift)
+			serialNode.Properties["reg-shift"] = fdt.Property{U32: []uint32{cfg.UART.RegShift}}
 		}
-		b.propU32("reg-io-width", 1)
-		b.propStrings("status", "okay")
-		b.endNode()
+		root.Children = append(root.Children, serialNode)
 
-		b.beginNode("aliases")
-		b.propStrings("serial0", serialPath)
-		b.endNode()
-
+		serialPath := fmt.Sprintf("/%s", serialNode.Name)
+		aliasesProps = map[string]fdt.Property{
+			"serial0": {Strings: []string{serialPath}},
+		}
 		stdoutAlias = "serial0"
 		stdoutBaud = cfg.UART.BaudRate
 	}
 
-	b.beginNode("chosen")
+	if len(aliasesProps) > 0 {
+		root.Children = append(root.Children, fdt.Node{Name: "aliases", Properties: aliasesProps})
+	}
+
+	chosenProps := map[string]fdt.Property{}
 	if cfg.Cmdline != "" {
-		b.propStrings("bootargs", cfg.Cmdline)
+		chosenProps["bootargs"] = fdt.Property{Strings: []string{cfg.Cmdline}}
 	}
 	if cfg.InitrdEnd > cfg.InitrdStart {
-		b.propU64("linux,initrd-start", cfg.InitrdStart)
-		b.propU64("linux,initrd-end", cfg.InitrdEnd)
+		chosenProps["linux,initrd-start"] = fdt.Property{U64: []uint64{cfg.InitrdStart}}
+		chosenProps["linux,initrd-end"] = fdt.Property{U64: []uint64{cfg.InitrdEnd}}
 	}
 	if stdoutAlias != "" {
 		baud := stdoutBaud
@@ -380,185 +392,64 @@ func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
 			baud = 115200
 		}
 		stdout := fmt.Sprintf("%s:%dn8", stdoutAlias, baud)
-		b.propStrings("stdout-path", stdout)
-		b.propStrings("linux,stdout-path", stdout)
+		chosenProps["stdout-path"] = fdt.Property{Strings: []string{stdout}}
+		chosenProps["linux,stdout-path"] = fdt.Property{Strings: []string{stdout}}
 	}
-	b.endNode()
+	root.Children = append(root.Children, fdt.Node{Name: "chosen", Properties: chosenProps})
 
-	// PSCI node
-	b.beginNode("psci")
-	b.propStrings("compatible", "arm,psci-0.2", "arm,psci")
-	b.propStrings("method", "hvc")
-	b.endNode()
+	root.Children = append(root.Children, fdt.Node{
+		Name: "psci",
+		Properties: map[string]fdt.Property{
+			"compatible": {Strings: []string{"arm,psci-0.2", "arm,psci"}},
+			"method":     {Strings: []string{"hvc"}},
+		},
+	})
 
-	// Timer node
-	b.beginNode("timer")
-	b.propStrings("compatible", "arm,armv8-timer")
-	b.property("always-on", nil)
-	interrupts := []uint32{
-		// Secure Phys (PPI 13)
-		1, 13, 4,
-		// Non-Secure Phys (PPI 14)
-		1, 14, 4,
-		// Virtual (PPI 11) - Critical for KVM Guest
-		1, 11, 4,
-		// Hypervisor (PPI 10)
-		1, 10, 4,
+	timerInterrupts := []uint32{1, 13, 4, 1, 14, 4, 1, 11, 4, 1, 10, 4}
+	root.Children = append(root.Children, fdt.Node{
+		Name: "timer",
+		Properties: map[string]fdt.Property{
+			"compatible": {Strings: []string{"arm,armv8-timer"}},
+			"always-on":  {Flag: true},
+			"interrupts": {U32: timerInterrupts},
+		},
+	})
+
+	gicNode := fdt.Node{
+		Name: fmt.Sprintf("interrupt-controller@%x", gicCfg.DistributorBase),
+		Properties: map[string]fdt.Property{
+			"#interrupt-cells":     {U32: []uint32{3}},
+			"#address-cells":       {U32: []uint32{2}},
+			"#size-cells":          {U32: []uint32{2}},
+			"interrupt-controller": {Flag: true},
+			"phandle":              {U32: []uint32{gicDefaultPhandle}},
+			"linux,phandle":        {U32: []uint32{gicDefaultPhandle}},
+			"interrupts": {U32: []uint32{
+				gicCfg.MaintenanceInterrupt.Type,
+				gicCfg.MaintenanceInterrupt.Num,
+				gicCfg.MaintenanceInterrupt.Flags,
+			}},
+		},
 	}
-	b.propU32("interrupts", interrupts...)
-	b.endNode()
-
-	// GIC Node
-	gicNodeName := fmt.Sprintf("interrupt-controller@%x", gicCfg.DistributorBase)
-	b.beginNode(gicNodeName)
-	b.propU32("#interrupt-cells", 3)
-	b.propU32("#address-cells", 2)
-	b.propU32("#size-cells", 2)
-	b.property("interrupt-controller", nil)
-	b.propU32("phandle", gicDefaultPhandle)
-	b.propU32("linux,phandle", gicDefaultPhandle)
 	switch gicCfg.Version {
 	case GICVersion2:
-		b.propStrings("compatible", "arm,gic-400")
-		b.propU64("reg",
+		gicNode.Properties["compatible"] = fdt.Property{Strings: []string{"arm,gic-400"}}
+		gicNode.Properties["reg"] = fdt.Property{U64: []uint64{
 			gicCfg.DistributorBase, gicCfg.DistributorSize,
 			gicCfg.CpuInterfaceBase, gicCfg.CpuInterfaceSize,
-		)
+		}}
 	default:
-		b.propStrings("compatible", "arm,gic-v3")
-		b.propU64("reg",
+		gicNode.Properties["compatible"] = fdt.Property{Strings: []string{"arm,gic-v3"}}
+		gicNode.Properties["reg"] = fdt.Property{U64: []uint64{
 			gicCfg.DistributorBase, gicCfg.DistributorSize,
 			gicCfg.RedistributorBase, gicCfg.RedistributorSize,
-		)
+		}}
 	}
-	b.propU32("interrupts",
-		gicCfg.MaintenanceInterrupt.Type,
-		gicCfg.MaintenanceInterrupt.Num,
-		gicCfg.MaintenanceInterrupt.Flags,
-	)
-	b.endNode()
+	root.Children = append(root.Children, gicNode)
 
-	b.endNode() // root
+	root.Children = append(root.Children, cfg.Devices...)
 
-	return b.finish()
-}
-
-type fdtBuilder struct {
-	structBuf  bytes.Buffer
-	strings    bytes.Buffer
-	stringsOff map[string]uint32
-}
-
-func newFDTBuilder() *fdtBuilder {
-	return &fdtBuilder{stringsOff: make(map[string]uint32)}
-}
-
-func (b *fdtBuilder) beginNode(name string) {
-	b.writeToken(fdtBeginNode)
-	b.structBuf.WriteString(name)
-	b.structBuf.WriteByte(0)
-	b.padStruct()
-}
-
-func (b *fdtBuilder) endNode() {
-	b.writeToken(fdtEndNode)
-}
-
-func (b *fdtBuilder) propStrings(name string, values ...string) {
-	var buf bytes.Buffer
-	for _, v := range values {
-		buf.WriteString(v)
-		buf.WriteByte(0)
-	}
-	b.property(name, buf.Bytes())
-}
-
-func (b *fdtBuilder) propU32(name string, values ...uint32) {
-	data := make([]byte, 0, len(values)*4)
-	for _, v := range values {
-		var tmp [4]byte
-		binary.BigEndian.PutUint32(tmp[:], v)
-		data = append(data, tmp[:]...)
-	}
-	b.property(name, data)
-}
-
-func (b *fdtBuilder) propU64(name string, values ...uint64) {
-	data := make([]byte, 0, len(values)*8)
-	for _, v := range values {
-		var tmp [8]byte
-		binary.BigEndian.PutUint64(tmp[:], v)
-		data = append(data, tmp[:]...)
-	}
-	b.property(name, data)
-}
-
-func (b *fdtBuilder) property(name string, value []byte) {
-	b.writeToken(fdtProp)
-	var tmp [4]byte
-	binary.BigEndian.PutUint32(tmp[:], uint32(len(value)))
-	b.structBuf.Write(tmp[:])
-	binary.BigEndian.PutUint32(tmp[:], b.stringOffset(name))
-	b.structBuf.Write(tmp[:])
-	b.structBuf.Write(value)
-	b.padStruct()
-}
-
-func (b *fdtBuilder) finish() ([]byte, error) {
-	b.writeToken(fdtEnd)
-	b.padStruct()
-
-	structBytes := b.structBuf.Bytes()
-	stringsBytes := b.strings.Bytes()
-
-	memReserve := make([]byte, 16) // single terminating entry
-
-	offMemReserve := fdtHeaderSize
-	offStruct := offMemReserve + len(memReserve)
-	offStrings := offStruct + len(structBytes)
-	totalSize := offStrings + len(stringsBytes)
-
-	blob := make([]byte, totalSize)
-	header := blob[:fdtHeaderSize]
-	binary.BigEndian.PutUint32(header[0:4], fdtMagic)
-	binary.BigEndian.PutUint32(header[4:8], uint32(totalSize))
-	binary.BigEndian.PutUint32(header[8:12], uint32(offStruct))
-	binary.BigEndian.PutUint32(header[12:16], uint32(offStrings))
-	binary.BigEndian.PutUint32(header[16:20], uint32(offMemReserve))
-	binary.BigEndian.PutUint32(header[20:24], fdtVersion)
-	binary.BigEndian.PutUint32(header[24:28], fdtLastCompVer)
-	binary.BigEndian.PutUint32(header[28:32], 0) // boot_cpuid_phys
-	binary.BigEndian.PutUint32(header[32:36], uint32(len(stringsBytes)))
-	binary.BigEndian.PutUint32(header[36:40], uint32(len(structBytes)))
-
-	copy(blob[offMemReserve:], memReserve)
-	copy(blob[offStruct:], structBytes)
-	copy(blob[offStrings:], stringsBytes)
-
-	return blob, nil
-}
-
-func (b *fdtBuilder) stringOffset(name string) uint32 {
-	if off, ok := b.stringsOff[name]; ok {
-		return off
-	}
-	off := uint32(b.strings.Len())
-	b.strings.WriteString(name)
-	b.strings.WriteByte(0)
-	b.stringsOff[name] = off
-	return off
-}
-
-func (b *fdtBuilder) writeToken(token uint32) {
-	var tmp [4]byte
-	binary.BigEndian.PutUint32(tmp[:], token)
-	b.structBuf.Write(tmp[:])
-}
-
-func (b *fdtBuilder) padStruct() {
-	for b.structBuf.Len()%4 != 0 {
-		b.structBuf.WriteByte(0)
-	}
+	return fdt.Build(root)
 }
 
 func alignUp(value, align uint64) uint64 {
