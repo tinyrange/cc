@@ -560,7 +560,7 @@ func ForkExecWait(path string, argv []string, envp []string, errLabel ir.Label, 
 	pid := ir.Var("pid")
 
 	return ir.Block{
-		ir.Assign(pid, ir.Syscall(defs.SYS_FORK)),
+		ir.Assign(pid, ir.Syscall(defs.SYS_CLONE, ir.Int64(defs.SIGCHLD), 0, 0, 0, 0)),
 		ir.If(ir.IsNegative(pid), ir.Block{
 			ir.Assign(errVar, pid),
 			ir.Goto(errLabel),
@@ -583,11 +583,6 @@ func ForkExecWait(path string, argv []string, envp []string, errLabel ir.Label, 
 			},
 		}),
 	}
-}
-
-// SpawnExecutable runs path with the provided argv/envp and waits for completion.
-func SpawnExecutable(path string, argv []string, envp []string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
-	return ForkExecWait(path, argv, envp, errLabel, errVar)
 }
 
 // Profiling & Misc

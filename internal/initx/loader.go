@@ -644,7 +644,9 @@ func (vm *VirtualMachine) Spawn(ctx context.Context, path string, args ...string
 		Entrypoint: "main",
 		Methods: map[string]ir.Method{
 			"main": {
-				SpawnExecutable(path, args, nil, errLabel, errVar),
+				ir.Printf(fmt.Sprintf("initx: spawning %s\n", path)),
+				ForkExecWait(path, args, nil, errLabel, errVar),
+				ir.Printf(fmt.Sprintf("initx: %s completed\n", path)),
 				ir.Return(ir.Int64(0)),
 				ir.DeclareLabel(errLabel, ir.Block{
 					ir.Printf(errorFmt, ir.Op(ir.OpSub, ir.Int64(0), errVar)),
