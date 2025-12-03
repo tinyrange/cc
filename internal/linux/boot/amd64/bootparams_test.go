@@ -23,6 +23,9 @@ func (s *stubVM) Run(ctx context.Context, cfg hv.RunConfig) error        { panic
 func (s *stubVM) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error {
 	panic("unimplemented")
 }
+func (s *stubVM) AllocateMemory(physAddr uint64, size uint64) (hv.MemoryRegion, error) {
+	panic("unimplemented")
+}
 
 func (s *stubVM) MemorySize() uint64 {
 	return uint64(len(s.mem))

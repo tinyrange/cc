@@ -146,6 +146,11 @@ type fakeVM struct {
 	base uint64
 }
 
+// AllocateMemory implements hv.VirtualMachine.
+func (f *fakeVM) AllocateMemory(physAddr uint64, size uint64) (hv.MemoryRegion, error) {
+	panic("unimplemented")
+}
+
 func newFakeVM(size int) *fakeVM {
 	return &fakeVM{mem: make([]byte, size)}
 }

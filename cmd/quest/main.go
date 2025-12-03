@@ -875,8 +875,21 @@ func RunExecutable(path string) error {
 	}
 	defer vm.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	if err := vm.Run(ctx, &ir.Program{
+		Entrypoint: "main",
+		Methods: map[string]ir.Method{
+			"main": {
+				ir.Return(ir.Int64(0)),
+			},
+		},
+	}); err != nil {
+		return fmt.Errorf("run initx virtual machine: %w", err)
+	}
+
+	start := time.Now()
 
 	slog.Info("Writing Executable to InitX Virtual Machine", "path", path)
 
@@ -894,6 +907,8 @@ func RunExecutable(path string) error {
 	if err := vm.WriteFile(ctx, in, info.Size(), "/initx-exec"); err != nil {
 		return fmt.Errorf("write executable to initx virtual machine: %w", err)
 	}
+
+	slog.Info("Executable Write Completed", "duration", time.Since(start))
 
 	slog.Info("Running Executable in InitX Virtual Machine", "path", path)
 

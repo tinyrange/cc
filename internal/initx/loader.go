@@ -13,10 +13,32 @@ import (
 	"github.com/tinyrange/cc/internal/ir"
 	"github.com/tinyrange/cc/internal/linux/boot"
 	"github.com/tinyrange/cc/internal/linux/defs"
+	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 	"github.com/tinyrange/cc/internal/linux/kernel"
 )
 
+const (
+	mailboxPhysAddr        = 0xf000_0000
+	mailboxRegionSize      = 0x1000
+	configRegionPhysAddr   = 0xf000_3000
+	configRegionSize       = 4 * 1024 * 1024
+	configRegionPageOffset = configRegionPhysAddr - mailboxPhysAddr
+
+	configHeaderMagicValue = 0xcafebabe
+	configHeaderSize       = 24
+	configHeaderRelocOff   = configHeaderSize
+	configDataOffsetField  = 12
+	configDataLengthField  = 16
+
+	writeFileLengthPrefix   = 2
+	writeFileMaxChunkLen    = (1 << 16) - 1
+	writeFileTransferRegion = writeFileMaxChunkLen + writeFileLengthPrefix
+
+	userYieldValue = 0x5553_4552 // "USER"
+)
+
 var ErrYield = errors.New("yield to host")
+var ErrUserYield = errors.New("user yield to host")
 
 type proxyReader struct {
 	r      io.Reader
@@ -71,11 +93,19 @@ type KernelLoader interface {
 }
 
 type programLoader struct {
+	region hv.MemoryRegion
+
 	arch hv.CpuArchitecture
 
-	code            []byte
-	relocationBytes []byte
-	relocationCount uint32
+	requestedDataLen int
+	dataRegionOffset int64
+}
+
+func (p *programLoader) ReserveDataRegion(size int) {
+	if size < 0 {
+		size = 0
+	}
+	p.requestedDataLen = size
 }
 
 // Create implements hv.DeviceTemplate.
@@ -93,62 +123,32 @@ func (p *programLoader) Init(vm hv.VirtualMachine) error {
 // MMIORegions implements hv.MemoryMappedIODevice.
 func (p *programLoader) MMIORegions() []hv.MMIORegion {
 	return []hv.MMIORegion{
-		{Address: 0xf000_0000, Size: 0x1000},
-		{Address: 0xf000_3000, Size: 4 * 1024 * 1024},
+		{Address: mailboxPhysAddr, Size: mailboxRegionSize},
 	}
 }
 
 // ReadMMIO implements hv.MemoryMappedIODevice.
 func (p *programLoader) ReadMMIO(addr uint64, data []byte) error {
-	addr = addr - 0xf000_0000
-
-	relocOffset := uint64(0x3010)
-	codeOffset := relocOffset + uint64(len(p.relocationBytes))
-
-	switch true {
-	case addr == 0x3000:
-		// put the 0xcafebabe magic value
-		binary.LittleEndian.PutUint32(data[0:], 0xcafebabe)
-		return nil
-	case addr == 0x3004:
-		// code
-		binary.LittleEndian.PutUint32(data[0:], uint32(len(p.code)))
-		return nil
-	case addr == 0x3008:
-		// relocation count
-		binary.LittleEndian.PutUint32(data[0:], p.relocationCount)
-		return nil
-	case addr >= relocOffset && addr < relocOffset+uint64(len(p.relocationBytes)):
-		// relocation bytes
-		offset := addr - relocOffset
-		copy(data, p.relocationBytes[offset:])
-		return nil
-	case addr >= codeOffset && addr < codeOffset+uint64(len(p.code)): // code comes right after relocation bytes
-		// code bytes
-		offset := addr - codeOffset
-		copy(data, p.code[offset:])
-		return nil
-	case addr >= codeOffset+uint64(len(p.code)): // handle reads after the end of the code
-		for i := range data {
-			data[i] = 0
-		}
-		return nil
-	}
-
-	return fmt.Errorf("unimplemented read at address 0x%x", addr)
+	return fmt.Errorf("unimplemented read at address 0x%x", addr+mailboxPhysAddr)
 }
 
 // WriteMMIO implements hv.MemoryMappedIODevice.
 func (p *programLoader) WriteMMIO(addr uint64, data []byte) error {
-	addr = addr - 0xf000_0000
+	addr = addr - mailboxPhysAddr
 
 	// ignore stage information writes
 	if addr == 8 || addr == 12 || addr == 16 || addr == 20 {
 		return nil
 	}
 
-	if addr == 0x0 && binary.LittleEndian.Uint32(data) == 0x444f4e45 {
-		return ErrYield
+	if addr == 0x0 {
+		value := binary.LittleEndian.Uint32(data)
+		switch value {
+		case 0x444f4e45:
+			return ErrYield
+		case userYieldValue:
+			return ErrUserYield
+		}
 	}
 
 	return fmt.Errorf("unimplemented write at address 0x%x", addr)
@@ -160,14 +160,43 @@ func (p *programLoader) LoadProgram(prog *ir.Program) error {
 		return fmt.Errorf("build standalone program: %w", err)
 	}
 
-	p.code = asmProg.Bytes()
+	// write the program into p.region
+	// magic value at offset 0
+	p.region.WriteAt(binary.LittleEndian.AppendUint32(nil, configHeaderMagicValue), 0)
+	// program size at offset 4
+	progBytes := asmProg.Bytes()
+	p.region.WriteAt(binary.LittleEndian.AppendUint32(nil, uint32(len(progBytes))), 4)
+	// relocation count at offset 8
 	relocs := asmProg.Relocations()
-	p.relocationBytes = make([]byte, 4*len(relocs))
-	p.relocationCount = uint32(len(relocs))
+	p.region.WriteAt(binary.LittleEndian.AppendUint32(nil, uint32(len(relocs))), 8)
+	// relocation entries at offset 24
+	relocBytes := make([]byte, 4*len(relocs))
 	for i, reloc := range relocs {
 		offset := 4 * i
-		binary.LittleEndian.PutUint32(p.relocationBytes[offset:], uint32(reloc))
+		binary.LittleEndian.PutUint32(relocBytes[offset:], uint32(reloc))
 	}
+	p.region.WriteAt(relocBytes, configHeaderRelocOff)
+	// program code at offset 24 + relocation size
+	codeOffset := configHeaderRelocOff + int64(len(relocBytes))
+	p.region.WriteAt(progBytes, codeOffset)
+	// data region at offset 24 + relocation size + program size
+	dataOffset := codeOffset + int64(len(progBytes))
+	if p.requestedDataLen > 0 {
+		p.dataRegionOffset = dataOffset
+		p.region.WriteAt(
+			binary.LittleEndian.AppendUint32(nil, uint32(p.dataRegionOffset)),
+			int64(configDataOffsetField),
+		)
+		p.region.WriteAt(
+			binary.LittleEndian.AppendUint32(nil, uint32(p.requestedDataLen)),
+			int64(configDataLengthField),
+		)
+	} else {
+		p.dataRegionOffset = 0
+		p.region.WriteAt(binary.LittleEndian.AppendUint32(nil, 0), int64(configDataOffsetField))
+		p.region.WriteAt(binary.LittleEndian.AppendUint32(nil, 0), int64(configDataLengthField))
+	}
+
 	return nil
 }
 
@@ -177,10 +206,12 @@ var (
 )
 
 type programRunner struct {
-	loader *programLoader
+	configRegion hv.MemoryRegion
+	loader       *programLoader
 
 	program       *ir.Program
 	configureVcpu func(vcpu hv.VirtualCPU) error
+	onUserYield   func(context.Context, hv.VirtualCPU) error
 }
 
 // Run implements hv.RunConfig.
@@ -206,6 +237,15 @@ func (p *programRunner) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 			if errors.Is(err, ErrYield) {
 				return nil
 			}
+			if errors.Is(err, ErrUserYield) {
+				if p.onUserYield != nil {
+					if err := p.onUserYield(ctx, vcpu); err != nil {
+						return err
+					}
+					continue
+				}
+				return ErrUserYield
+			}
 			return fmt.Errorf("run vCPU: %w", err)
 		}
 	}
@@ -225,6 +265,8 @@ type VirtualMachine struct {
 	inBuffer  *proxyReader
 
 	programLoader *programLoader
+
+	configRegion hv.MemoryRegion
 }
 
 func (vm *VirtualMachine) Close() error {
@@ -232,6 +274,14 @@ func (vm *VirtualMachine) Close() error {
 }
 
 func (vm *VirtualMachine) Run(ctx context.Context, prog *ir.Program) error {
+	return vm.runProgram(ctx, prog, nil)
+}
+
+func (vm *VirtualMachine) runProgram(
+	ctx context.Context,
+	prog *ir.Program,
+	onUserYield func(context.Context, hv.VirtualCPU) error,
+) error {
 	var configureVcpu func(vcpu hv.VirtualCPU) error
 
 	if !vm.firstRunComplete {
@@ -242,9 +292,11 @@ func (vm *VirtualMachine) Run(ctx context.Context, prog *ir.Program) error {
 	}
 
 	return vm.vm.Run(ctx, &programRunner{
+		configRegion:  vm.configRegion,
 		program:       prog,
 		loader:        vm.programLoader,
 		configureVcpu: configureVcpu,
+		onUserYield:   onUserYield,
 	})
 }
 
@@ -353,6 +405,18 @@ func NewVirtualMachine(
 		},
 	}
 
+	ret.loader.OnCreateVMCallback = func(vm hv.VirtualMachine) error {
+		mem, err := vm.AllocateMemory(configRegionPhysAddr, configRegionSize)
+		if err != nil {
+			return fmt.Errorf("allocate initx config region: %v", err)
+		}
+
+		ret.configRegion = mem
+		programLoader.region = mem
+
+		return nil
+	}
+
 	var err error
 	ret.vm, err = h.NewVirtualMachine(ret.loader)
 	if err != nil {
@@ -362,7 +426,8 @@ func NewVirtualMachine(
 	return ret, nil
 }
 
-// WriteFile copies the host file at hostPath into the guest at guestPath.
+// WriteFile copies data from in into the guest at guestPath using a shared buffer
+// handshake between host and guest.
 func (vm *VirtualMachine) WriteFile(ctx context.Context, in io.Reader, size int64, guestPath string) error {
 	if vm == nil {
 		return fmt.Errorf("initx: virtual machine is nil")
@@ -370,22 +435,148 @@ func (vm *VirtualMachine) WriteFile(ctx context.Context, in io.Reader, size int6
 	if guestPath == "" {
 		return fmt.Errorf("initx: guest path must not be empty")
 	}
+	if in == nil {
+		return fmt.Errorf("initx: reader must not be nil")
+	}
+	if size < 0 {
+		return fmt.Errorf("initx: file size must be non-negative (got %d)", size)
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
+	vm.programLoader.ReserveDataRegion(writeFileTransferRegion)
+	defer vm.programLoader.ReserveDataRegion(0)
+
 	errLabel := ir.Label("__initx_write_file_err")
 	errVar := ir.Var("__initx_write_file_errno")
-	errorFmt := fmt.Sprintf("initx: failed to create %s errno=0x%%x\n", guestPath)
+	errorFmt := fmt.Sprintf("initx: failed to write %s errno=0x%%x\n", guestPath)
 
-	vm.inBuffer.SetReader(in)
+	fd := ir.Var("__initx_write_file_fd")
+	memFd := ir.Var("__initx_write_file_mem_fd")
+	mailboxPtr := ir.Var("__initx_write_file_mailbox_ptr")
+	configPtr := ir.Var("__initx_write_file_config_ptr")
+	bufferOffset := ir.Var("__initx_write_file_buffer_offset")
+	bufferPtr := ir.Var("__initx_write_file_buffer_ptr")
+	bufferLen := ir.Var("__initx_write_file_buffer_len")
+	chunkLen := ir.Var("__initx_write_file_chunk_len")
+	chunkPtr := ir.Var("__initx_write_file_chunk_ptr")
+
+	cleanup := func() ir.Fragment {
+		return ir.Block{
+			ir.Syscall(defs.SYS_MUNMAP, configPtr, ir.Int64(configRegionSize)),
+			ir.Syscall(defs.SYS_MUNMAP, mailboxPtr, ir.Int64(mailboxRegionSize)),
+			ir.Syscall(defs.SYS_CLOSE, memFd),
+			ir.Syscall(defs.SYS_CLOSE, fd),
+		}
+	}
+
+	requestChunk := func() ir.Fragment {
+		signal := ir.Var("__initx_write_file_signal")
+		return ir.Block{
+			ir.Assign(signal, ir.Int64(userYieldValue)),
+			ir.Assign(mailboxPtr.Mem().As32(), signal.As32()),
+		}
+	}
+
+	loopLabel := nextHelperLabel("write_file_loop")
+	doneLabel := nextHelperLabel("write_file_done")
 
 	prog := &ir.Program{
 		Entrypoint: "main",
 		Methods: map[string]ir.Method{
 			"main": {
-				CreateFileFromStdin(guestPath, size, 0o644, errLabel, errVar),
-				ir.Return(ir.Int64(0)),
+				ir.Assign(fd, ir.Syscall(
+					defs.SYS_OPENAT,
+					ir.Int64(linux.AT_FDCWD),
+					guestPath,
+					ir.Int64(linux.O_WRONLY|linux.O_CREAT|linux.O_TRUNC),
+					ir.Int64(0o755),
+				)),
+				ir.Assign(errVar, fd),
+				ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
+
+				ir.Assign(memFd, ir.Syscall(
+					defs.SYS_OPENAT,
+					ir.Int64(linux.AT_FDCWD),
+					"/dev/mem",
+					ir.Int64(linux.O_RDWR|linux.O_SYNC),
+					ir.Int64(0),
+				)),
+				ir.Assign(errVar, memFd),
+				ir.If(ir.IsNegative(errVar), ir.Block{
+					ir.Syscall(defs.SYS_CLOSE, fd),
+					ir.Goto(errLabel),
+				}),
+
+				ir.Assign(mailboxPtr, ir.Syscall(
+					defs.SYS_MMAP,
+					ir.Int64(0),
+					ir.Int64(mailboxRegionSize),
+					ir.Int64(linux.PROT_READ|linux.PROT_WRITE),
+					ir.Int64(linux.MAP_SHARED),
+					memFd,
+					ir.Int64(mailboxPhysAddr),
+				)),
+				ir.Assign(errVar, mailboxPtr),
+				ir.If(ir.IsNegative(errVar), ir.Block{
+					ir.Syscall(defs.SYS_CLOSE, memFd),
+					ir.Syscall(defs.SYS_CLOSE, fd),
+					ir.Goto(errLabel),
+				}),
+
+				ir.Assign(configPtr, ir.Syscall(
+					defs.SYS_MMAP,
+					ir.Int64(0),
+					ir.Int64(configRegionSize),
+					ir.Int64(linux.PROT_READ),
+					ir.Int64(linux.MAP_SHARED),
+					memFd,
+					ir.Int64(configRegionPhysAddr),
+				)),
+				ir.Assign(errVar, configPtr),
+				ir.If(ir.IsNegative(errVar), ir.Block{
+					ir.Syscall(defs.SYS_MUNMAP, mailboxPtr, ir.Int64(mailboxRegionSize)),
+					ir.Syscall(defs.SYS_CLOSE, memFd),
+					ir.Syscall(defs.SYS_CLOSE, fd),
+					ir.Goto(errLabel),
+				}),
+
+				ir.Assign(bufferOffset, configPtr.MemWithDisp(configDataOffsetField).As32()),
+				ir.Assign(bufferLen, configPtr.MemWithDisp(configDataLengthField).As32()),
+				ir.Assign(bufferPtr, ir.Op(ir.OpAdd, configPtr, bufferOffset)),
+				ir.If(ir.IsLessThan(bufferLen, ir.Int64(writeFileTransferRegion)), ir.Block{
+					cleanup(),
+					ir.Assign(errVar, ir.Int64(-int64(linux.EINVAL))),
+					ir.Goto(errLabel),
+				}),
+
+				ir.Assign(chunkPtr, ir.Op(ir.OpAdd, bufferPtr, ir.Int64(writeFileLengthPrefix))),
+				ir.Goto(loopLabel),
+
+				ir.DeclareLabel(loopLabel, ir.Block{
+					requestChunk(),
+					ir.Assign(chunkLen, bufferPtr.Mem().As16()),
+					ir.Assign(chunkLen, ir.Op(ir.OpAnd, chunkLen, ir.Int64(0xffff))),
+					ir.If(ir.IsZero(chunkLen), ir.Goto(doneLabel)),
+					ir.Assign(errVar, ir.Syscall(
+						defs.SYS_WRITE,
+						fd,
+						chunkPtr,
+						chunkLen,
+					)),
+					ir.If(ir.IsNegative(errVar), ir.Block{
+						cleanup(),
+						ir.Goto(errLabel),
+					}),
+					ir.Goto(loopLabel),
+				}),
+
+				ir.DeclareLabel(doneLabel, ir.Block{
+					cleanup(),
+					ir.Return(ir.Int64(0)),
+				}),
+
 				ir.DeclareLabel(errLabel, ir.Block{
 					ir.Printf(errorFmt, ir.Op(ir.OpSub, ir.Int64(0), errVar)),
 					ir.Syscall(defs.SYS_EXIT, ir.Int64(1)),
@@ -394,7 +585,43 @@ func (vm *VirtualMachine) WriteFile(ctx context.Context, in io.Reader, size int6
 		},
 	}
 
-	return vm.Run(ctx, prog)
+	buf := make([]byte, writeFileTransferRegion)
+	payloadBuf := buf[writeFileLengthPrefix : writeFileLengthPrefix+writeFileMaxChunkLen]
+
+	handler := func(ctx context.Context, vcpu hv.VirtualCPU) error {
+		if vm.programLoader.region == nil {
+			return fmt.Errorf("initx: config region unavailable")
+		}
+		if vm.programLoader.dataRegionOffset == 0 {
+			return fmt.Errorf("initx: transfer buffer offset unavailable")
+		}
+
+		n, err := in.Read(payloadBuf)
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("initx: read input data: %w", err)
+		}
+
+		if n == 0 {
+			// signal zero-length chunk to guest
+			binary.LittleEndian.PutUint16(buf[:writeFileLengthPrefix], 0)
+		} else {
+			if n > writeFileMaxChunkLen {
+				n = writeFileMaxChunkLen
+			}
+			binary.LittleEndian.PutUint16(buf[:writeFileLengthPrefix], uint16(n))
+		}
+
+		if _, err := vm.programLoader.region.WriteAt(
+			buf[:writeFileTransferRegion],
+			vm.programLoader.dataRegionOffset,
+		); err != nil {
+			return fmt.Errorf("initx: write transfer chunk: %w", err)
+		}
+
+		return nil
+	}
+
+	return vm.runProgram(ctx, prog, handler)
 }
 
 // Spawn executes path inside the guest using fork/exec, waiting for it to complete.

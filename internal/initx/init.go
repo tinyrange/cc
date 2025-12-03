@@ -252,15 +252,15 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 
 		ir.DeclareLabel("loop", ir.Block{
 			logKmsg("initx: entering main loop\n"),
-			// read uint32(configMem[0]) and compare to 0xcafebabe. If not equal print a error (magic value not found) and power off.
+			// read uint32(configMem[0]) and compare to config header magic. If not equal print a error (magic value not found) and power off.
 			ir.If(ir.IsEqual(
 				ir.Var("configMem").Mem().As32(),
-				ir.Int64(0xcafebabe),
+				ir.Int64(configHeaderMagicValue),
 			), ir.Block{
 				ir.Assign(ir.Var("codeLen"), ir.Var("configMem").MemWithDisp(4).As32()),
 				ir.Assign(ir.Var("relocCount"), ir.Var("configMem").MemWithDisp(8).As32()),
 				ir.Assign(ir.Var("relocBytes"), ir.Op(ir.OpShl, ir.Var("relocCount"), int64(2))),
-				ir.Assign(ir.Var("codeOffset"), ir.Op(ir.OpAdd, int64(16), ir.Var("relocBytes"))),
+				ir.Assign(ir.Var("codeOffset"), ir.Op(ir.OpAdd, ir.Int64(configHeaderSize), ir.Var("relocBytes"))),
 
 				logKmsg("initx: loading payload\n"),
 
@@ -298,7 +298,7 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 				logKmsg("initx: applying relocations\n"),
 
 				// apply relocations
-				ir.Assign(ir.Var("relocPtr"), ir.Op(ir.OpAdd, ir.Var("configMem"), int64(16))),
+				ir.Assign(ir.Var("relocPtr"), ir.Op(ir.OpAdd, ir.Var("configMem"), ir.Int64(configHeaderSize))),
 				ir.Assign(ir.Var("relocIndex"), ir.Int64(0)),
 				ir.DeclareLabel("reloc_loop", ir.Block{
 					ir.If(ir.IsGreaterOrEqual(ir.Var("relocIndex"), ir.Var("relocCount")), ir.Block{

@@ -51,13 +51,49 @@ var (
 	_ hv.VirtualCPU = &virtualCPU{}
 )
 
+type memoryRegion struct {
+	mem []byte
+}
+
+// implements hv.MemoryRegion.
+func (m *memoryRegion) Size() uint64 {
+	return uint64(len(m.mem))
+}
+
+func (m *memoryRegion) ReadAt(p []byte, off int64) (n int, err error) {
+	if off < 0 || int(off) >= len(m.mem) {
+		return 0, fmt.Errorf("kvm: ReadAt offset out of bounds")
+	}
+
+	n = copy(p, m.mem[off:])
+	if n < len(p) {
+		err = fmt.Errorf("kvm: ReadAt short read")
+	}
+
+	return n, err
+}
+
+func (m *memoryRegion) WriteAt(p []byte, off int64) (n int, err error) {
+	if off < 0 || int(off) >= len(m.mem) {
+		return 0, fmt.Errorf("kvm: WriteAt offset out of bounds")
+	}
+
+	n = copy(m.mem[off:], p)
+	if n < len(p) {
+		err = fmt.Errorf("kvm: WriteAt short write")
+	}
+
+	return n, err
+}
+
 type virtualMachine struct {
-	hv         *hypervisor
-	vmFd       int
-	vcpus      map[int]*virtualCPU
-	memory     []byte
-	memoryBase uint64
-	devices    []hv.Device
+	hv             *hypervisor
+	vmFd           int
+	vcpus          map[int]*virtualCPU
+	memory         []byte
+	memoryBase     uint64
+	devices        []hv.Device
+	lastMemorySlot uint32
 
 	// amd64-specific fields
 	hasIRQChip bool
@@ -70,6 +106,40 @@ type virtualMachine struct {
 func (v *virtualMachine) MemoryBase() uint64        { return v.memoryBase }
 func (v *virtualMachine) MemorySize() uint64        { return uint64(len(v.memory)) }
 func (v *virtualMachine) Hypervisor() hv.Hypervisor { return v.hv }
+
+// AllocateMemory implements hv.VirtualMachine.
+func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.MemoryRegion, error) {
+	mem, err := unix.Mmap(
+		-1,
+		0,
+		int(size),
+		unix.PROT_READ|unix.PROT_WRITE,
+		unix.MAP_ANONYMOUS|unix.MAP_PRIVATE,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("allocate memory: %w", err)
+	}
+
+	if v.hv.Architecture() == hv.ArchitectureX86_64 {
+		if err := unix.Madvise(mem, unix.MADV_MERGEABLE); err != nil {
+			unix.Munmap(mem)
+			return nil, fmt.Errorf("madvise memory: %w", err)
+		}
+	}
+
+	v.lastMemorySlot++
+	if err := setUserMemoryRegion(v.vmFd, &kvmUserspaceMemoryRegion{
+		Slot:          v.lastMemorySlot,
+		Flags:         0,
+		GuestPhysAddr: physAddr,
+		MemorySize:    size,
+		UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[0]))),
+	}); err != nil {
+		return nil, fmt.Errorf("set user memory region: %w", err)
+	}
+
+	return &memoryRegion{mem: mem}, nil
+}
 
 // AddDevice implements hv.VirtualMachine.
 func (v *virtualMachine) AddDevice(dev hv.Device) error {

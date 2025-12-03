@@ -273,6 +273,13 @@ var (
 	_ X86IOPortDevice      = SimpleX86IOPortDevice{}
 )
 
+type MemoryRegion interface {
+	io.ReaderAt
+	io.WriterAt
+
+	Size() uint64
+}
+
 type VirtualMachine interface {
 	io.ReaderAt
 	io.WriterAt
@@ -290,6 +297,8 @@ type VirtualMachine interface {
 
 	AddDevice(dev Device) error
 	AddDeviceFromTemplate(template DeviceTemplate) error
+
+	AllocateMemory(physAddr, size uint64) (MemoryRegion, error)
 }
 
 type VirtualMachineAmd64 interface {

@@ -113,10 +113,11 @@ type LinuxLoader struct {
 	MemSize uint64
 	MemBase uint64
 
-	Cmdline      []string
-	GetInit      func(arch hv.CpuArchitecture) (*ir.Program, error)
-	GetKernel    func() (io.ReaderAt, int64, error)
-	GetSystemMap func() (io.ReaderAt, error)
+	Cmdline            []string
+	GetInit            func(arch hv.CpuArchitecture) (*ir.Program, error)
+	GetKernel          func() (io.ReaderAt, int64, error)
+	GetSystemMap       func() (io.ReaderAt, error)
+	OnCreateVMCallback func(vm hv.VirtualMachine) error
 
 	SerialStdout io.Writer
 
@@ -141,6 +142,10 @@ func (l *LinuxLoader) OnCreateVCPU(vCpu hv.VirtualCPU) error {
 
 // OnCreateVM implements hv.VMCallbacks.
 func (l *LinuxLoader) OnCreateVM(vm hv.VirtualMachine) error {
+	if l.OnCreateVMCallback != nil {
+		return l.OnCreateVMCallback(vm)
+	}
+
 	return nil
 }
 

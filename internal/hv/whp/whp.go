@@ -299,6 +299,11 @@ func (v *virtualMachine) MemoryBase() uint64        { return v.memoryBase }
 func (v *virtualMachine) MemorySize() uint64        { return uint64(v.memory.Size()) }
 func (v *virtualMachine) Hypervisor() hv.Hypervisor { return v.hv }
 
+// AllocateMemory implements hv.VirtualMachine.
+func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.MemoryRegion, error) {
+	panic("unimplemented")
+}
+
 // AddDevice implements hv.VirtualMachine.
 func (v *virtualMachine) AddDevice(dev hv.Device) error {
 	v.devices = append(v.devices, dev)
