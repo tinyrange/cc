@@ -341,10 +341,8 @@ func NewVirtualMachine(
 					}
 				case hv.ArchitectureARM64:
 					return []string{
-						// "console=ttyS0,115200n8",
 						"console=hvc0",
-						// fmt.Sprintf("earlycon=uart8250,mmio,0x%x", arm64UARTMMIOBase),
-						// "quiet",
+						"quiet",
 						"reboot=k",
 						"panic=-1",
 					}

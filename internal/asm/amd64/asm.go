@@ -184,6 +184,7 @@ func writeStdoutWithKmsgFallback(buf asm.Value, count asm.Value) asm.Fragment {
 		TestZero(RAX),
 		JumpIfNegative(doneLabel),
 		MovReg(Reg64(R15), Reg64(RAX)),
+		SyscallWriteString(UseRegister(R15), "printf error: using fallback kmsg\n"),
 		SyscallWrite(UseRegister(R15), buf, count),
 		Syscall(defs.SYS_CLOSE, UseRegister(R15)),
 		asm.MarkLabel(doneLabel),

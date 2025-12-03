@@ -184,6 +184,31 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 
 		preloads,
 
+		// once the preloads are done assume we can open /dev/console and replace stdin/stdout/stderr
+		ir.Assign(ir.Var("consoleFd"), ir.Syscall(
+			defs.SYS_OPENAT,
+			ir.Int64(linux.AT_FDCWD),
+			"/dev/console",
+			ir.Int64(linux.O_WRONLY),
+			ir.Int64(0),
+		)),
+		ir.If(ir.IsNegative(ir.Var("consoleFd")), ir.Block{
+			ir.Printf("initx: failed to open /dev/console (errno=0x%x)\n",
+				ir.Op(ir.OpSub, ir.Int64(0), ir.Var("consoleFd")),
+			),
+			ir.Syscall(defs.SYS_REBOOT,
+				linux.LINUX_REBOOT_MAGIC1,
+				linux.LINUX_REBOOT_MAGIC2,
+				linux.LINUX_REBOOT_CMD_RESTART,
+				ir.Int64(0),
+			),
+		}),
+		// dup2 consoleFd to stdin (0), stdout (1) and stderr (2)
+		ir.Syscall(defs.SYS_DUP3, ir.Var("consoleFd"), ir.Int64(0), ir.Int64(0)),
+		ir.Syscall(defs.SYS_DUP3, ir.Var("consoleFd"), ir.Int64(1), ir.Int64(0)),
+		ir.Syscall(defs.SYS_DUP3, ir.Var("consoleFd"), ir.Int64(2), ir.Int64(0)),
+		logKmsg("initx: console ready\n"),
+
 		// open /dev/mem
 		openFile(ir.Var("memFd"), "/dev/mem", linux.O_RDWR|linux.O_SYNC),
 		rebootOnError(ir.Var("memFd"), "initx: failed to open /dev/mem (errno=0x%x)\n"),
