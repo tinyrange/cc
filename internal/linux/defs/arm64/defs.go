@@ -247,7 +247,6 @@ var SyscallMap = map[defs.Syscall]uint32{
 	defs.SYS_PERF_EVENT_OPEN:         241,
 	defs.SYS_ACCEPT4:                 242,
 	defs.SYS_RECVMMSG:                243,
-	defs.SYS_ARCH_SPECIFIC_SYSCALL:   244,
 	defs.SYS_WAIT4:                   260,
 	defs.SYS_PRLIMIT64:               261,
 	defs.SYS_FANOTIFY_INIT:           262,
