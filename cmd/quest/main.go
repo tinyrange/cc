@@ -831,9 +831,8 @@ func RunInitX() error {
 
 	for i := range 10 {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
 
-		if err := vm.Run(
+		err := vm.Run(
 			ctx,
 			&ir.Program{
 				Entrypoint: "main",
@@ -844,7 +843,9 @@ func RunInitX() error {
 					},
 				},
 			},
-		); err != nil {
+		)
+		cancel()
+		if err != nil {
 			return fmt.Errorf("run initx virtual machine: %w", err)
 		}
 	}
