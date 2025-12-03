@@ -136,6 +136,7 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	// keep trying to run the vCPU until it exits or an error occurs
 	for {
 		_, err := ioctl(uintptr(v.fd), uint64(kvmRun), 0)
+		// slog.Info("kvm: vCPU run ioctl returned", "err", err)
 		if errors.Is(err, unix.EINTR) {
 			if usingContext && (errors.Is(ctx.Err(), context.Canceled) ||
 				errors.Is(ctx.Err(), context.DeadlineExceeded)) {

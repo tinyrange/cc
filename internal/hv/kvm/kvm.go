@@ -350,6 +350,11 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 	// 	}
 	// }
 
+	if err := config.Callbacks().OnCreateVMWithMemory(vm); err != nil {
+		unix.Close(vmFd)
+		return nil, fmt.Errorf("VM callback OnCreateVMWithMemory: %w", err)
+	}
+
 	// Create vCPUs
 	if config.CPUCount() != 1 {
 		unix.Close(vmFd)
@@ -362,7 +367,7 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		return nil, fmt.Errorf("get kvm_run mmap size: %w", err)
 	}
 
-	for i := 0; i < config.CPUCount(); i++ {
+	for i := range config.CPUCount() {
 		vcpuFd, err := createVCPU(vm.vmFd, i)
 		if err != nil {
 			unix.Close(vmFd)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 
 	"github.com/tinyrange/cc/internal/devices/virtio"
 	"github.com/tinyrange/cc/internal/hv"
@@ -99,6 +100,8 @@ type programLoader struct {
 
 	requestedDataLen int
 	dataRegionOffset int64
+
+	dataRegion []byte
 }
 
 func (p *programLoader) ReserveDataRegion(size int) {
@@ -124,12 +127,19 @@ func (p *programLoader) Init(vm hv.VirtualMachine) error {
 func (p *programLoader) MMIORegions() []hv.MMIORegion {
 	return []hv.MMIORegion{
 		{Address: mailboxPhysAddr, Size: mailboxRegionSize},
+		{Address: configRegionPhysAddr, Size: configRegionSize},
 	}
 }
 
 // ReadMMIO implements hv.MemoryMappedIODevice.
 func (p *programLoader) ReadMMIO(addr uint64, data []byte) error {
-	return fmt.Errorf("unimplemented read at address 0x%x", addr+mailboxPhysAddr)
+	if addr >= configRegionPhysAddr && addr < configRegionPhysAddr+configRegionSize {
+		offset := addr - configRegionPhysAddr
+		copy(data, p.dataRegion[offset:])
+		return nil
+	}
+
+	return fmt.Errorf("unimplemented read at address 0x%x", addr)
 }
 
 // WriteMMIO implements hv.MemoryMappedIODevice.
@@ -160,41 +170,68 @@ func (p *programLoader) LoadProgram(prog *ir.Program) error {
 		return fmt.Errorf("build standalone program: %w", err)
 	}
 
-	// write the program into p.region
+	if len(p.dataRegion) < configRegionSize {
+		p.dataRegion = make([]byte, configRegionSize)
+	}
+
+	// assume p.regionBuf is an already-allocated []byte with enough capacity
+
 	// magic value at offset 0
-	p.region.WriteAt(binary.LittleEndian.AppendUint32(nil, configHeaderMagicValue), 0)
+	binary.LittleEndian.PutUint32(p.dataRegion[0:], configHeaderMagicValue)
+
 	// program size at offset 4
 	progBytes := asmProg.Bytes()
-	p.region.WriteAt(binary.LittleEndian.AppendUint32(nil, uint32(len(progBytes))), 4)
+	binary.LittleEndian.PutUint32(p.dataRegion[4:], uint32(len(progBytes)))
 	// relocation count at offset 8
 	relocs := asmProg.Relocations()
-	p.region.WriteAt(binary.LittleEndian.AppendUint32(nil, uint32(len(relocs))), 8)
-	// relocation entries at offset 24
-	relocBytes := make([]byte, 4*len(relocs))
+	binary.LittleEndian.PutUint32(p.dataRegion[8:], uint32(len(relocs)))
+
+	// relocation entries at offset configHeaderRelocOff
+	relocBytes := p.dataRegion[configHeaderRelocOff:]
 	for i, reloc := range relocs {
 		offset := 4 * i
 		binary.LittleEndian.PutUint32(relocBytes[offset:], uint32(reloc))
 	}
-	p.region.WriteAt(relocBytes, configHeaderRelocOff)
-	// program code at offset 24 + relocation size
-	codeOffset := configHeaderRelocOff + int64(len(relocBytes))
-	p.region.WriteAt(progBytes, codeOffset)
-	// data region at offset 24 + relocation size + program size
-	dataOffset := codeOffset + int64(len(progBytes))
+	relocBytes = relocBytes[:4*len(relocs)]
+
+	// program code at offset configHeaderRelocOff + relocation size
+	codeOffset := int(configHeaderRelocOff) + len(relocBytes)
+	copy(p.dataRegion[codeOffset:], progBytes)
+
+	// data region at offset reloc + program size
+	dataOffset := int64(codeOffset + len(progBytes))
+
 	if p.requestedDataLen > 0 {
 		p.dataRegionOffset = dataOffset
-		p.region.WriteAt(
-			binary.LittleEndian.AppendUint32(nil, uint32(p.dataRegionOffset)),
-			int64(configDataOffsetField),
+
+		// data offset field
+		binary.LittleEndian.PutUint32(
+			p.dataRegion[configDataOffsetField:],
+			uint32(p.dataRegionOffset),
 		)
-		p.region.WriteAt(
-			binary.LittleEndian.AppendUint32(nil, uint32(p.requestedDataLen)),
-			int64(configDataLengthField),
+
+		// data length field
+		binary.LittleEndian.PutUint32(
+			p.dataRegion[configDataLengthField:],
+			uint32(p.requestedDataLen),
 		)
 	} else {
 		p.dataRegionOffset = 0
-		p.region.WriteAt(binary.LittleEndian.AppendUint32(nil, 0), int64(configDataOffsetField))
-		p.region.WriteAt(binary.LittleEndian.AppendUint32(nil, 0), int64(configDataLengthField))
+
+		binary.LittleEndian.PutUint32(
+			p.dataRegion[configDataOffsetField:],
+			0,
+		)
+		binary.LittleEndian.PutUint32(
+			p.dataRegion[configDataLengthField:],
+			0,
+		)
+	}
+
+	if p.region != nil {
+		if _, err := p.region.WriteAt(p.dataRegion, 0); err != nil {
+			return fmt.Errorf("write program loader region: %w", err)
+		}
 	}
 
 	return nil
@@ -397,6 +434,8 @@ func NewVirtualMachine(
 						"quiet",
 						"reboot=k",
 						"panic=-1",
+						"iomem=relaxed",
+						"memmap=0xf0003000$0x400000",
 					}
 				default:
 					panic("unsupported architecture for initx cmdline")
@@ -406,6 +445,10 @@ func NewVirtualMachine(
 	}
 
 	ret.loader.CreateVMWithMemory = func(vm hv.VirtualMachine) error {
+		if runtime.GOOS == "linux" && h.Architecture() == hv.ArchitectureARM64 {
+			return nil
+		}
+
 		mem, err := vm.AllocateMemory(configRegionPhysAddr, configRegionSize)
 		if err != nil {
 			return fmt.Errorf("allocate initx config region: %v", err)
@@ -589,9 +632,6 @@ func (vm *VirtualMachine) WriteFile(ctx context.Context, in io.Reader, size int6
 	payloadBuf := buf[writeFileLengthPrefix : writeFileLengthPrefix+writeFileMaxChunkLen]
 
 	handler := func(ctx context.Context, vcpu hv.VirtualCPU) error {
-		if vm.programLoader.region == nil {
-			return fmt.Errorf("initx: config region unavailable")
-		}
 		if vm.programLoader.dataRegionOffset == 0 {
 			return fmt.Errorf("initx: transfer buffer offset unavailable")
 		}
@@ -611,11 +651,15 @@ func (vm *VirtualMachine) WriteFile(ctx context.Context, in io.Reader, size int6
 			binary.LittleEndian.PutUint16(buf[:writeFileLengthPrefix], uint16(n))
 		}
 
-		if _, err := vm.programLoader.region.WriteAt(
-			buf[:writeFileTransferRegion],
-			vm.programLoader.dataRegionOffset,
-		); err != nil {
-			return fmt.Errorf("initx: write transfer chunk: %w", err)
+		if vm.programLoader.region != nil {
+			if _, err := vm.programLoader.region.WriteAt(
+				buf[:writeFileTransferRegion],
+				vm.programLoader.dataRegionOffset,
+			); err != nil {
+				return fmt.Errorf("initx: write transfer chunk: %w", err)
+			}
+		} else {
+			copy(vm.programLoader.dataRegion[vm.programLoader.dataRegionOffset:], buf)
 		}
 
 		return nil
