@@ -13,6 +13,12 @@ import (
 
 const (
 	arm64InstructionSizeBytes = 4
+	gic64KAlignment           = 64 * 1024
+	whpGicDistributorBase     = 0x08000000
+	whpGicDistributorSize     = 0x00010000
+	whpGicRedistributorSize   = 0x00020000
+	whpGicItsBase             = 0xeff68000
+	whpGicItsSize             = 0x00020000
 )
 
 type Arm64InterruptVector uint32
@@ -225,17 +231,35 @@ func (h *hypervisor) Architecture() hv.CpuArchitecture {
 }
 
 func (h *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
+	if whpGicDistributorBase%gic64KAlignment != 0 {
+		return fmt.Errorf("failed to set ARM64 IC parameters: GIC distributor base %#x must be 64KB aligned", whpGicDistributorBase)
+	}
+
 	if err := bindings.SetPartitionPropertyUnsafe(vm.part, bindings.PartitionPropertyCodeArm64IcParameters, Arm64IcParameters{
 		EmulationMode: Arm64IcEmulationModeGicV3,
 		GicV3Parameters: Arm64GicV3Parameters{
-			GicdBaseAddress:                    0x08000000,
-			GitsTranslatorBaseAddress:          0xeff68000,
-			GicLpiIntIdBits:                    1,
+			GicdBaseAddress:                    whpGicDistributorBase,
+			GitsTranslatorBaseAddress:          whpGicItsBase,
+			GicLpiIntIdBits:                    32,
 			GicPpiOverflowInterruptFromCntv:    0x1B,
 			GicPpiPerformanceMonitorsInterrupt: 0x17,
 		},
 	}); err != nil {
 		return fmt.Errorf("failed to set ARM64 IC parameters: %w", err)
+	}
+
+	vm.arm64GICInfo = hv.Arm64GICInfo{
+		Version:           hv.Arm64GICVersion3,
+		DistributorBase:   whpGicDistributorBase,
+		DistributorSize:   whpGicDistributorSize,
+		RedistributorSize: whpGicRedistributorSize,
+		ItsBase:           whpGicItsBase,
+		ItsSize:           whpGicItsSize,
+		MaintenanceInterrupt: hv.Arm64Interrupt{
+			Type:  1,
+			Num:   9,
+			Flags: 0xF04,
+		},
 	}
 
 	return nil

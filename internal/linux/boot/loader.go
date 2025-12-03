@@ -428,6 +428,12 @@ func detectArm64GICConfig(vm hv.VirtualMachine) (*arm64boot.GICConfig, error) {
 			if info.CpuInterfaceSize != 0 {
 				config.CpuInterfaceSize = info.CpuInterfaceSize
 			}
+			if info.ItsBase != 0 {
+				config.ItsBase = info.ItsBase
+			}
+			if info.ItsSize != 0 {
+				config.ItsSize = info.ItsSize
+			}
 			if info.MaintenanceInterrupt != (hv.Arm64Interrupt{}) {
 				config.MaintenanceInterrupt = arm64boot.InterruptSpec{
 					Type:  info.MaintenanceInterrupt.Type,

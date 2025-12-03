@@ -81,6 +81,8 @@ type GICConfig struct {
 	RedistributorSize    uint64
 	CpuInterfaceBase     uint64
 	CpuInterfaceSize     uint64
+	ItsBase              uint64
+	ItsSize              uint64
 	MaintenanceInterrupt InterruptSpec
 }
 
@@ -91,10 +93,12 @@ const (
 	defaultGICRedistributorSize        = 0x00020000
 	defaultGICCpuInterfaceBase         = 0x08010000
 	defaultGICCpuInterfaceSize         = 0x00002000
+	defaultGICItsSize                  = 0x00020000
 	gicDefaultPhandle           uint32 = 1
+	gicDefaultItsPhandle        uint32 = 2
 )
 
-var defaultGICMaintenanceInterrupt = InterruptSpec{Type: 1, Num: 9, Flags: 0x4}
+var defaultGICMaintenanceInterrupt = InterruptSpec{Type: 1, Num: 9, Flags: 0xF04}
 
 // DefaultGICConfig returns the standard tinyrange GIC description.
 func DefaultGICConfig() GICConfig {
@@ -106,6 +110,7 @@ func DefaultGICConfig() GICConfig {
 		RedistributorSize:    defaultGICRedistributorSize,
 		CpuInterfaceBase:     defaultGICCpuInterfaceBase,
 		CpuInterfaceSize:     defaultGICCpuInterfaceSize,
+		ItsSize:              defaultGICItsSize,
 		MaintenanceInterrupt: defaultGICMaintenanceInterrupt,
 	}
 }
@@ -135,6 +140,9 @@ func (c *GICConfig) withDefaults() GICConfig {
 	}
 	if out.CpuInterfaceSize == 0 {
 		out.CpuInterfaceSize = defaultGICCpuInterfaceSize
+	}
+	if out.ItsBase != 0 && out.ItsSize == 0 {
+		out.ItsSize = defaultGICItsSize
 	}
 	if out.MaintenanceInterrupt.isZero() {
 		out.MaintenanceInterrupt = defaultGICMaintenanceInterrupt
@@ -453,6 +461,24 @@ func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
 			gicCfg.DistributorBase, gicCfg.DistributorSize,
 			gicCfg.RedistributorBase, gicCfg.RedistributorSize,
 		}}
+	}
+	if gicCfg.ItsBase != 0 {
+		itsSize := gicCfg.ItsSize
+		if itsSize == 0 {
+			itsSize = defaultGICItsSize
+		}
+		itsNode := fdt.Node{
+			Name: fmt.Sprintf("its@%x", gicCfg.ItsBase),
+			Properties: map[string]fdt.Property{
+				"compatible":     {Strings: []string{"arm,gic-v3-its"}},
+				"msi-controller": {Flag: true},
+				"#msi-cells":     {U32: []uint32{1}},
+				"reg":            {U64: []uint64{gicCfg.ItsBase, itsSize}},
+				"phandle":        {U32: []uint32{gicDefaultItsPhandle}},
+				"linux,phandle":  {U32: []uint32{gicDefaultItsPhandle}},
+			},
+		}
+		gicNode.Children = append(gicNode.Children, itsNode)
 	}
 	root.Children = append(root.Children, gicNode)
 

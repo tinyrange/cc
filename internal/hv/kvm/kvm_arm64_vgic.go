@@ -24,7 +24,7 @@ const (
 
 var (
 	errArmVGICUnsupported         = errors.New("kvm: VGIC device unsupported")
-	arm64VGICMaintenanceInterrupt = hvpkg.Arm64Interrupt{Type: 1, Num: 9, Flags: 0x4}
+	arm64VGICMaintenanceInterrupt = hvpkg.Arm64Interrupt{Type: 1, Num: 9, Flags: 0xF04}
 )
 
 func (hv *hypervisor) initArm64VGIC(vm *virtualMachine) error {

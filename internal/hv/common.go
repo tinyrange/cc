@@ -379,6 +379,8 @@ type Arm64GICInfo struct {
 	RedistributorSize    uint64
 	CpuInterfaceBase     uint64
 	CpuInterfaceSize     uint64
+	ItsBase              uint64
+	ItsSize              uint64
 	MaintenanceInterrupt Arm64Interrupt
 }
 

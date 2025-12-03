@@ -290,6 +290,8 @@ type virtualMachine struct {
 	emu bindings.EmulatorHandle
 
 	ioapic *chipset.IOAPIC
+	// arm64GICInfo caches the configured interrupt controller details when available.
+	arm64GICInfo hv.Arm64GICInfo
 }
 
 // implements hv.VirtualMachine.
@@ -393,8 +395,16 @@ func (v *virtualMachine) ReadAt(p []byte, off int64) (n int, err error) {
 }
 
 var (
-	_ hv.VirtualMachine = &virtualMachine{}
+	_ hv.VirtualMachine   = &virtualMachine{}
+	_ hv.Arm64GICProvider = &virtualMachine{}
 )
+
+func (v *virtualMachine) Arm64GICInfo() (hv.Arm64GICInfo, bool) {
+	if v == nil || v.arm64GICInfo.Version == hv.Arm64GICVersionUnknown {
+		return hv.Arm64GICInfo{}, false
+	}
+	return v.arm64GICInfo, true
+}
 
 type hypervisor struct{}
 
