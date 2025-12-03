@@ -301,7 +301,11 @@ func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
 			return d.handler.OnQueueNotify(d, int(value))
 		}
 	case VIRTIO_MMIO_INTERRUPT_ACK:
+		prev := d.interruptStatus
 		d.interruptStatus &^= value
+		if prev != d.interruptStatus {
+			d.updateInterruptLine()
+		}
 	case VIRTIO_MMIO_STATUS:
 		if value == 0 {
 			d.reset()
@@ -453,11 +457,16 @@ func (d *mmioDevice) queue(index int) *queue {
 
 func (d *mmioDevice) raiseInterrupt(bit uint32) {
 	d.interruptStatus |= bit
+	d.updateInterruptLine()
+}
+
+func (d *mmioDevice) updateInterruptLine() {
 	if d.vm == nil || d.irqLine == 0 {
 		return
 	}
 	if setter, ok := d.vm.(irqSetter); ok {
-		if err := setter.SetIRQ(d.irqLine, d.interruptStatus != 0); err != nil {
+		levelAsserted := d.interruptStatus != 0
+		if err := setter.SetIRQ(d.irqLine, levelAsserted); err != nil {
 			slog.Error("virtio: pulse irq failed", "irq", d.irqLine, "err", err)
 		}
 	}

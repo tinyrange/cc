@@ -192,7 +192,6 @@ func Chroot(path string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
 // CreateFileFromStdin reads length bytes from stdin and writes them into path.
 func CreateFileFromStdin(path string, length int64, mode uint32, errLabel ir.Label, errVar ir.Var) ir.Fragment {
 	fd := ir.Var("__stdin_file_fd")
-	consoleFd := ir.Var("__stdin_file_console_fd")
 	bufPtr := ir.Var("__stdin_file_buf_ptr")
 	chunkSize := ir.Var("__stdin_file_chunk_size")
 	chunkRemaining := ir.Var("__stdin_file_chunk_remaining")
@@ -217,18 +216,6 @@ func CreateFileFromStdin(path string, length int64, mode uint32, errLabel ir.Lab
 		)),
 		ir.Assign(errVar, fd),
 		ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
-		ir.Assign(consoleFd, ir.Syscall(
-			defs.SYS_OPENAT,
-			ir.Int64(linux.AT_FDCWD),
-			"/dev/hvc0",
-			ir.Int64(linux.O_RDONLY),
-			ir.Int64(0),
-		)),
-		ir.Assign(errVar, consoleFd),
-		ir.If(ir.IsNegative(errVar), ir.Block{
-			ir.Syscall(defs.SYS_CLOSE, fd),
-			ir.Goto(errLabel),
-		}),
 		ir.Assign(totalRemaining, ir.Int64(length)),
 		ir.WithStackSlot(ir.StackSlotConfig{
 			Size: stdinCopyBufferSize,
@@ -246,21 +233,20 @@ func CreateFileFromStdin(path string, length int64, mode uint32, errLabel ir.Lab
 					}),
 					ir.DeclareLabel(readChunkLoop, ir.Block{
 						ir.If(ir.IsZero(chunkRemaining), ir.Goto(chunkReady)),
+						ir.Printf("Reading %x bytes from stdin...\n", chunkRemaining),
 						ir.Assign(errVar, ir.Syscall(
 							defs.SYS_READ,
-							consoleFd,
+							ir.Int64(0),
 							readPtr,
 							chunkRemaining,
 						)),
 						ir.If(ir.IsNegative(errVar), ir.Block{
 							ir.Syscall(defs.SYS_CLOSE, fd),
-							ir.Syscall(defs.SYS_CLOSE, consoleFd),
 							ir.Goto(errLabel),
 						}),
 						ir.If(ir.IsZero(errVar), ir.Block{
 							ir.Assign(errVar, ir.Int64(-int64(linux.EPIPE))),
 							ir.Syscall(defs.SYS_CLOSE, fd),
-							ir.Syscall(defs.SYS_CLOSE, consoleFd),
 							ir.Goto(errLabel),
 						}),
 						ir.Assign(readPtr, ir.Op(ir.OpAdd, readPtr, errVar)),
@@ -274,6 +260,7 @@ func CreateFileFromStdin(path string, length int64, mode uint32, errLabel ir.Lab
 					}),
 					ir.DeclareLabel(writeLoop, ir.Block{
 						ir.If(ir.IsZero(writeRemaining), ir.Goto(writeDone)),
+						ir.Printf("Writing %x bytes to file...\n", writeRemaining),
 						ir.Assign(errVar, ir.Syscall(
 							defs.SYS_WRITE,
 							fd,
@@ -282,7 +269,6 @@ func CreateFileFromStdin(path string, length int64, mode uint32, errLabel ir.Lab
 						)),
 						ir.If(ir.IsNegative(errVar), ir.Block{
 							ir.Syscall(defs.SYS_CLOSE, fd),
-							ir.Syscall(defs.SYS_CLOSE, consoleFd),
 							ir.Goto(errLabel),
 						}),
 						ir.Assign(writePtr, ir.Op(ir.OpAdd, writePtr, errVar)),
@@ -298,8 +284,6 @@ func CreateFileFromStdin(path string, length int64, mode uint32, errLabel ir.Lab
 			},
 		}),
 		ir.Assign(errVar, ir.Syscall(defs.SYS_CLOSE, fd)),
-		ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
-		ir.Assign(errVar, ir.Syscall(defs.SYS_CLOSE, consoleFd)),
 		ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
 	}
 }

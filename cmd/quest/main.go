@@ -874,7 +874,7 @@ func RunExecutable(path string) error {
 	}
 	defer vm.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	slog.Info("Writing Executable to InitX Virtual Machine", "path", path)
