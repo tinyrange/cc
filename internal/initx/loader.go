@@ -12,6 +12,7 @@ import (
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/ir"
 	"github.com/tinyrange/cc/internal/linux/boot"
+	"github.com/tinyrange/cc/internal/linux/defs"
 	"github.com/tinyrange/cc/internal/linux/kernel"
 )
 
@@ -23,16 +24,25 @@ type proxyReader struct {
 }
 
 func (p *proxyReader) Read(b []byte) (int, error) {
-	// if r is nil then hang until data is available
-	if p.r == nil {
-		newR, ok := <-p.update
-		if !ok {
-			return 0, io.EOF
+	for {
+		if p.r == nil {
+			newR, ok := <-p.update
+			if !ok {
+				return 0, io.EOF
+			}
+			p.r = newR
 		}
-		p.r = newR
-	}
 
-	return p.r.Read(b)
+		n, err := p.r.Read(b)
+		if err == io.EOF {
+			p.r = nil
+			if n > 0 {
+				return n, nil
+			}
+			continue
+		}
+		return n, err
+	}
 }
 
 func (p *proxyReader) SetReader(r io.Reader) {
@@ -352,4 +362,72 @@ func NewVirtualMachine(
 	}
 
 	return ret, nil
+}
+
+// WriteFile copies the host file at hostPath into the guest at guestPath.
+func (vm *VirtualMachine) WriteFile(ctx context.Context, in io.Reader, size int64, guestPath string) error {
+	if vm == nil {
+		return fmt.Errorf("initx: virtual machine is nil")
+	}
+	if guestPath == "" {
+		return fmt.Errorf("initx: guest path must not be empty")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	errLabel := ir.Label("__initx_write_file_err")
+	errVar := ir.Var("__initx_write_file_errno")
+	errorFmt := fmt.Sprintf("initx: failed to create %s errno=0x%%x\n", guestPath)
+
+	vm.inBuffer.SetReader(in)
+
+	prog := &ir.Program{
+		Entrypoint: "main",
+		Methods: map[string]ir.Method{
+			"main": {
+				CreateFileFromStdin(guestPath, size, 0o644, errLabel, errVar),
+				ir.Return(ir.Int64(0)),
+				ir.DeclareLabel(errLabel, ir.Block{
+					ir.Printf(errorFmt, ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+					ir.Syscall(defs.SYS_EXIT, ir.Int64(1)),
+				}),
+			},
+		},
+	}
+
+	return vm.Run(ctx, prog)
+}
+
+// Spawn executes path inside the guest using fork/exec, waiting for it to complete.
+func (vm *VirtualMachine) Spawn(ctx context.Context, path string, args ...string) error {
+	if vm == nil {
+		return fmt.Errorf("initx: virtual machine is nil")
+	}
+	if path == "" {
+		return fmt.Errorf("initx: executable path must not be empty")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	errLabel := ir.Label("__initx_spawn_err")
+	errVar := ir.Var("__initx_spawn_errno")
+	errorFmt := fmt.Sprintf("initx: failed to spawn %s errno=0x%%x\n", path)
+
+	prog := &ir.Program{
+		Entrypoint: "main",
+		Methods: map[string]ir.Method{
+			"main": {
+				SpawnExecutable(path, args, nil, errLabel, errVar),
+				ir.Return(ir.Int64(0)),
+				ir.DeclareLabel(errLabel, ir.Block{
+					ir.Printf(errorFmt, ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+					ir.Syscall(defs.SYS_EXIT, ir.Int64(1)),
+				}),
+			},
+		},
+	}
+
+	return vm.Run(ctx, prog)
 }

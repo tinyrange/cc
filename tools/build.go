@@ -172,6 +172,7 @@ func main() {
 	codesign := fs.Bool("codesign", false, "build the macos codesign tool")
 	oci := fs.Bool("oci", false, "build and execute the OCI image tool")
 	kernel := fs.Bool("kernel", false, "build and execute the kernel tool")
+	bringup := fs.Bool("bringup", false, "build and execute the bringup tool inside a linux VM")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
@@ -245,6 +246,40 @@ func main() {
 		}
 
 		if err := runBuildOutput(out, fs.Args()); err != nil {
+			os.Exit(1)
+		}
+
+		return
+	}
+
+	if *bringup {
+		bringupOut, err := goBuild(buildOptions{
+			Package:          "cmd/bringup",
+			OutputName:       "bringup",
+			CgoEnabled:       false,
+			Build:            crossBuild{GOOS: "linux", GOARCH: hostBuild.GOARCH},
+			RaceEnabled:      *race,
+			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build bringup tool: %v\n", err)
+			os.Exit(1)
+		}
+
+		out, err := goBuild(buildOptions{
+			Package:          "cmd/quest",
+			OutputName:       "quest",
+			Build:            hostBuild,
+			RaceEnabled:      *race,
+			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build bringup quest: %v\n", err)
+			os.Exit(1)
+		}
+
+		args := append([]string{"-exec", bringupOut.Path}, fs.Args()...)
+		if err := runBuildOutput(out, args); err != nil {
 			os.Exit(1)
 		}
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"sync"
 
 	"github.com/tinyrange/cc/internal/fdt"
@@ -324,6 +325,10 @@ func (vc *Console) processReceiveQueue(dev device, q *queue) error {
 		written, consumed, err := vc.fillReceiveDescriptorChain(dev, q, head, vc.pending)
 		if err != nil {
 			return err
+		}
+
+		if written > 0 {
+			fmt.Fprintf(os.Stderr, "virtio-console: delivered %d bytes to guest (consumed %d)\n", written, consumed)
 		}
 
 		vc.pending = vc.pending[consumed:]

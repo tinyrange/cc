@@ -14,6 +14,10 @@ import (
 var execVarCounter uint64
 var helperLabelCounter uint64
 
+const (
+	stdinCopyBufferSize = 4096
+)
+
 func nextExecVar() asm.Variable {
 	// Start from a high number to avoid conflicts with registers (0-32)
 	// and other manually assigned variables.
@@ -181,6 +185,121 @@ func Chroot(path string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
 			defs.SYS_CHDIR,
 			"/",
 		)),
+		ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
+	}
+}
+
+// CreateFileFromStdin reads length bytes from stdin and writes them into path.
+func CreateFileFromStdin(path string, length int64, mode uint32, errLabel ir.Label, errVar ir.Var) ir.Fragment {
+	fd := ir.Var("__stdin_file_fd")
+	consoleFd := ir.Var("__stdin_file_console_fd")
+	bufPtr := ir.Var("__stdin_file_buf_ptr")
+	chunkSize := ir.Var("__stdin_file_chunk_size")
+	chunkRemaining := ir.Var("__stdin_file_chunk_remaining")
+	totalRemaining := ir.Var("__stdin_file_total_remaining")
+	readPtr := ir.Var("__stdin_file_read_ptr")
+	writePtr := ir.Var("__stdin_file_write_ptr")
+	writeRemaining := ir.Var("__stdin_file_write_remaining")
+	readLoop := nextHelperLabel("stdin_file_read_loop")
+	readChunkLoop := nextHelperLabel("stdin_file_read_chunk_loop")
+	chunkReady := nextHelperLabel("stdin_file_chunk_ready")
+	writeLoop := nextHelperLabel("stdin_file_write_loop")
+	writeDone := nextHelperLabel("stdin_file_write_done")
+	done := nextHelperLabel("stdin_file_done")
+
+	return ir.Block{
+		ir.Assign(fd, ir.Syscall(
+			defs.SYS_OPENAT,
+			ir.Int64(linux.AT_FDCWD),
+			path,
+			ir.Int64(linux.O_WRONLY|linux.O_CREAT|linux.O_TRUNC),
+			ir.Int64(int64(mode)),
+		)),
+		ir.Assign(errVar, fd),
+		ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
+		ir.Assign(consoleFd, ir.Syscall(
+			defs.SYS_OPENAT,
+			ir.Int64(linux.AT_FDCWD),
+			"/dev/hvc0",
+			ir.Int64(linux.O_RDONLY),
+			ir.Int64(0),
+		)),
+		ir.Assign(errVar, consoleFd),
+		ir.If(ir.IsNegative(errVar), ir.Block{
+			ir.Syscall(defs.SYS_CLOSE, fd),
+			ir.Goto(errLabel),
+		}),
+		ir.Assign(totalRemaining, ir.Int64(length)),
+		ir.WithStackSlot(ir.StackSlotConfig{
+			Size: stdinCopyBufferSize,
+			Body: func(slot ir.StackSlot) ir.Fragment {
+				return ir.Block{
+					ir.Assign(bufPtr, slot.Pointer()),
+					ir.Goto(readLoop),
+					ir.DeclareLabel(readLoop, ir.Block{
+						ir.If(ir.IsZero(totalRemaining), ir.Goto(done)),
+						ir.Assign(chunkSize, totalRemaining),
+						ir.If(ir.IsGreaterThan(chunkSize, ir.Int64(stdinCopyBufferSize)), ir.Assign(chunkSize, ir.Int64(stdinCopyBufferSize))),
+						ir.Assign(chunkRemaining, chunkSize),
+						ir.Assign(readPtr, bufPtr),
+						ir.Goto(readChunkLoop),
+					}),
+					ir.DeclareLabel(readChunkLoop, ir.Block{
+						ir.If(ir.IsZero(chunkRemaining), ir.Goto(chunkReady)),
+						ir.Assign(errVar, ir.Syscall(
+							defs.SYS_READ,
+							consoleFd,
+							readPtr,
+							chunkRemaining,
+						)),
+						ir.If(ir.IsNegative(errVar), ir.Block{
+							ir.Syscall(defs.SYS_CLOSE, fd),
+							ir.Syscall(defs.SYS_CLOSE, consoleFd),
+							ir.Goto(errLabel),
+						}),
+						ir.If(ir.IsZero(errVar), ir.Block{
+							ir.Assign(errVar, ir.Int64(-int64(linux.EPIPE))),
+							ir.Syscall(defs.SYS_CLOSE, fd),
+							ir.Syscall(defs.SYS_CLOSE, consoleFd),
+							ir.Goto(errLabel),
+						}),
+						ir.Assign(readPtr, ir.Op(ir.OpAdd, readPtr, errVar)),
+						ir.Assign(chunkRemaining, ir.Op(ir.OpSub, chunkRemaining, errVar)),
+						ir.Goto(readChunkLoop),
+					}),
+					ir.DeclareLabel(chunkReady, ir.Block{
+						ir.Assign(writePtr, bufPtr),
+						ir.Assign(writeRemaining, chunkSize),
+						ir.Goto(writeLoop),
+					}),
+					ir.DeclareLabel(writeLoop, ir.Block{
+						ir.If(ir.IsZero(writeRemaining), ir.Goto(writeDone)),
+						ir.Assign(errVar, ir.Syscall(
+							defs.SYS_WRITE,
+							fd,
+							writePtr,
+							writeRemaining,
+						)),
+						ir.If(ir.IsNegative(errVar), ir.Block{
+							ir.Syscall(defs.SYS_CLOSE, fd),
+							ir.Syscall(defs.SYS_CLOSE, consoleFd),
+							ir.Goto(errLabel),
+						}),
+						ir.Assign(writePtr, ir.Op(ir.OpAdd, writePtr, errVar)),
+						ir.Assign(writeRemaining, ir.Op(ir.OpSub, writeRemaining, errVar)),
+						ir.Goto(writeLoop),
+					}),
+					ir.DeclareLabel(writeDone, ir.Block{
+						ir.Assign(totalRemaining, ir.Op(ir.OpSub, totalRemaining, chunkSize)),
+						ir.Goto(readLoop),
+					}),
+					ir.DeclareLabel(done, ir.Block{}),
+				}
+			},
+		}),
+		ir.Assign(errVar, ir.Syscall(defs.SYS_CLOSE, fd)),
+		ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
+		ir.Assign(errVar, ir.Syscall(defs.SYS_CLOSE, consoleFd)),
 		ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
 	}
 }
@@ -480,6 +599,11 @@ func ForkExecWait(path string, argv []string, envp []string, errLabel ir.Label, 
 			},
 		}),
 	}
+}
+
+// SpawnExecutable runs path with the provided argv/envp and waits for completion.
+func SpawnExecutable(path string, argv []string, envp []string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
+	return ForkExecWait(path, argv, envp, errLabel, errVar)
 }
 
 // Profiling & Misc

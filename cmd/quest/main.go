@@ -854,11 +854,63 @@ func RunInitX() error {
 	return nil
 }
 
+func RunExecutable(path string) error {
+	slog.Info("Starting Bringup Quest: Run Executable", "path", path)
+
+	hv, err := factory.Open()
+	if err != nil {
+		return fmt.Errorf("open hypervisor factory: %w", err)
+	}
+	defer hv.Close()
+
+	kernel, err := kernel.LoadForArchitecture(hv.Architecture())
+	if err != nil {
+		return fmt.Errorf("load kernel for architecture %s: %w", hv.Architecture(), err)
+	}
+
+	vm, err := initx.NewVirtualMachine(hv, 1, 256, kernel)
+	if err != nil {
+		return fmt.Errorf("create initx virtual machine: %w", err)
+	}
+	defer vm.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	slog.Info("Writing Executable to InitX Virtual Machine", "path", path)
+
+	in, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open executable file: %w", err)
+	}
+	defer in.Close()
+
+	info, err := in.Stat()
+	if err != nil {
+		return fmt.Errorf("stat executable file: %w", err)
+	}
+
+	if err := vm.WriteFile(ctx, in, info.Size(), "/initx-exec"); err != nil {
+		return fmt.Errorf("write executable to initx virtual machine: %w", err)
+	}
+
+	slog.Info("Running Executable in InitX Virtual Machine", "path", path)
+
+	if err := vm.Spawn(ctx, "/initx-exec"); err != nil {
+		return fmt.Errorf("run executable in initx virtual machine: %w", err)
+	}
+
+	slog.Info("Executable Run Completed Successfully")
+
+	return nil
+}
+
 func main() {
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
 	linux := fs.Bool("linux", false, "Try booting Linux")
 	initX := fs.Bool("initx", false, "Run bringup tests for initx")
+	exec := fs.String("exec", "", "Run the executable using initx")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		slog.Error("failed to parse flags", "error", err)
@@ -870,6 +922,14 @@ func main() {
 	if *initX {
 		if err := RunInitX(); err != nil {
 			slog.Error("failed bringup quest initx", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *exec != "" {
+		if err := RunExecutable(*exec); err != nil {
+			slog.Error("failed to run executable", "error", err)
 			os.Exit(1)
 		}
 		return
