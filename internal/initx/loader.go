@@ -405,7 +405,7 @@ func NewVirtualMachine(
 		},
 	}
 
-	ret.loader.OnCreateVMCallback = func(vm hv.VirtualMachine) error {
+	ret.loader.CreateVMWithMemory = func(vm hv.VirtualMachine) error {
 		mem, err := vm.AllocateMemory(configRegionPhysAddr, configRegionSize)
 		if err != nil {
 			return fmt.Errorf("allocate initx config region: %v", err)

@@ -276,6 +276,47 @@ var (
 	_ hv.VirtualCPU = &virtualCPU{}
 )
 
+type memoryRegion struct {
+	memory *bindings.Allocation
+}
+
+// Size implements hv.MemoryRegion.
+func (m *memoryRegion) Size() uint64 {
+	return uint64(m.memory.Size())
+}
+
+// ReadAt implements hv.MemoryRegion.
+func (m *memoryRegion) ReadAt(p []byte, off int64) (n int, err error) {
+	slice := m.memory.Slice()
+	if off < 0 || uint64(off) >= uint64(len(slice)) {
+		return 0, fmt.Errorf("whp: ReadAt offset out of bounds")
+	}
+
+	n = copy(p, slice[off:])
+	if n < len(p) {
+		err = fmt.Errorf("whp: ReadAt short read")
+	}
+	return n, err
+}
+
+// WriteAt implements hv.MemoryRegion.
+func (m *memoryRegion) WriteAt(p []byte, off int64) (n int, err error) {
+	slice := m.memory.Slice()
+	if off < 0 || uint64(off) >= uint64(len(slice)) {
+		return 0, fmt.Errorf("whp: WriteAt offset out of bounds")
+	}
+
+	n = copy(slice[off:], p)
+	if n < len(p) {
+		err = fmt.Errorf("whp: WriteAt short write")
+	}
+	return n, err
+}
+
+var (
+	_ hv.MemoryRegion = &memoryRegion{}
+)
+
 type virtualMachine struct {
 	hv   *hypervisor
 	part bindings.PartitionHandle
@@ -301,7 +342,29 @@ func (v *virtualMachine) Hypervisor() hv.Hypervisor { return v.hv }
 
 // AllocateMemory implements hv.VirtualMachine.
 func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.MemoryRegion, error) {
-	panic("unimplemented")
+	mem, err := bindings.VirtualAlloc(
+		0,
+		uintptr(size),
+		bindings.MEM_RESERVE|bindings.MEM_COMMIT,
+		bindings.PAGE_EXECUTE_READWRITE,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("whp: VirtualAlloc failed: %w", err)
+	}
+
+	if err := bindings.MapGPARange(
+		v.part,
+		mem.Pointer(),
+		bindings.GuestPhysicalAddress(physAddr),
+		uint64(mem.Size()),
+		bindings.MapGPARangeFlagRead|bindings.MapGPARangeFlagWrite|bindings.MapGPARangeFlagExecute,
+	); err != nil {
+		return nil, fmt.Errorf("whp: MapGPARange failed: %w", err)
+	}
+
+	return &memoryRegion{
+		memory: mem,
+	}, nil
 }
 
 // AddDevice implements hv.VirtualMachine.
@@ -487,6 +550,11 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 	if err := h.archVMInitWithMemory(vm, config); err != nil {
 		return nil, fmt.Errorf("whp: archVMInit failed: %w", err)
+	}
+
+	if err := config.Callbacks().OnCreateVMWithMemory(vm); err != nil {
+		bindings.DeletePartition(vm.part)
+		return nil, fmt.Errorf("VM callback OnCreateVM: %w", err)
 	}
 
 	// Create vCPUs

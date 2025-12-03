@@ -117,7 +117,8 @@ type LinuxLoader struct {
 	GetInit            func(arch hv.CpuArchitecture) (*ir.Program, error)
 	GetKernel          func() (io.ReaderAt, int64, error)
 	GetSystemMap       func() (io.ReaderAt, error)
-	OnCreateVMCallback func(vm hv.VirtualMachine) error
+	CreateVM           func(vm hv.VirtualMachine) error
+	CreateVMWithMemory func(vm hv.VirtualMachine) error
 
 	SerialStdout io.Writer
 
@@ -142,10 +143,18 @@ func (l *LinuxLoader) OnCreateVCPU(vCpu hv.VirtualCPU) error {
 
 // OnCreateVM implements hv.VMCallbacks.
 func (l *LinuxLoader) OnCreateVM(vm hv.VirtualMachine) error {
-	if l.OnCreateVMCallback != nil {
-		return l.OnCreateVMCallback(vm)
+	if l.CreateVM != nil {
+		return l.CreateVM(vm)
 	}
 
+	return nil
+}
+
+// OnCreateVMWithMemory implements hv.VMCallbacks.
+func (l *LinuxLoader) OnCreateVMWithMemory(vm hv.VirtualMachine) error {
+	if l.CreateVMWithMemory != nil {
+		return l.CreateVMWithMemory(vm)
+	}
 	return nil
 }
 

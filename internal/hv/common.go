@@ -313,6 +313,7 @@ type VMLoader interface {
 
 type VMCallbacks interface {
 	OnCreateVM(vm VirtualMachine) error
+	OnCreateVMWithMemory(vm VirtualMachine) error
 	OnCreateVCPU(vCpu VirtualCPU) error
 }
 
@@ -335,8 +336,17 @@ type SimpleVMConfig struct {
 	InterruptSupport bool
 	VMLoader         VMLoader
 
-	CreateVM   func(vm VirtualMachine) error
-	CreateVCPU func(vCpu VirtualCPU) error
+	CreateVM           func(vm VirtualMachine) error
+	CreateVMWithMemory func(vm VirtualMachine) error
+	CreateVCPU         func(vCpu VirtualCPU) error
+}
+
+// OnCreateVMWithMemory implements VMCallbacks.
+func (c SimpleVMConfig) OnCreateVMWithMemory(vm VirtualMachine) error {
+	if c.CreateVMWithMemory != nil {
+		return c.CreateVMWithMemory(vm)
+	}
+	return nil
 }
 
 // OnCreateVM implements VMCallbacks.
