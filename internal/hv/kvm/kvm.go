@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sync"
 	"unsafe"
 
 	"github.com/tinyrange/cc/internal/hv"
@@ -97,6 +98,7 @@ type virtualMachine struct {
 
 	// amd64-specific fields
 	hasIRQChip bool
+	hasPIT     bool
 
 	// arm64-specific fields
 	arm64GICInfo hv.Arm64GICInfo
@@ -266,6 +268,14 @@ var (
 
 type hypervisor struct {
 	fd int
+
+	supportedMsrsOnce sync.Once
+	supportedMsrs     []uint32
+	supportedMsrsErr  error
+
+	snapshotMsrsOnce sync.Once
+	snapshotMsrs     []uint32
+	snapshotMsrsErr  error
 }
 
 func (h *hypervisor) Close() error {

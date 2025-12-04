@@ -354,6 +354,7 @@ func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 		if err := createPIT(vm.vmFd); err != nil {
 			return fmt.Errorf("creating PIT: %w", err)
 		}
+		vm.hasPIT = true
 	}
 
 	return nil
@@ -583,15 +584,31 @@ var (
 
 // Snapshot Support
 
+const (
+	irqChipPICMaster = 0
+	irqChipPICSlave  = 1
+	irqChipIOAPIC    = 2
+)
+
 type vcpuSnapshot struct {
-	Regs  kvmRegs
-	SRegs kvmSRegs
+	Regs         kvmRegs
+	SRegs        kvmSRegs
+	FPU          kvmFPU
+	Lapic        kvmLapicState
+	LapicPresent bool
+	Xsave        kvmXsave
+	Xcrs         kvmXcrs
+	Msrs         []kvmMsrEntry
 }
 
 type snapshot struct {
 	cpuStates map[int]vcpuSnapshot
 
 	deviceSnapshots map[string]interface{}
+	memory          []byte
+	clockData       *kvmClockData
+	irqChips        []kvmIRQChip
+	pitState        *kvmPitState2
 }
 
 func (v *virtualCPU) captureSnapshot() (vcpuSnapshot, error) {
@@ -609,15 +626,44 @@ func (v *virtualCPU) captureSnapshot() (vcpuSnapshot, error) {
 	}
 	ret.SRegs = sregs
 
-	// TODO(): fpu
+	fpu, err := getFPU(v.fd)
+	if err != nil {
+		return ret, fmt.Errorf("capture FPU state: %w", err)
+	}
+	ret.FPU = fpu
 
-	// TODO(): lapic
+	lapic, err := getLapic(v.fd)
+	if err != nil {
+		if !errors.Is(err, unix.EINVAL) {
+			return ret, fmt.Errorf("capture LAPIC state: %w", err)
+		}
+	} else {
+		ret.Lapic = lapic
+		ret.LapicPresent = true
+	}
 
-	// TODO(): xsave
+	xsave, err := getXsave(v.fd)
+	if err != nil {
+		return ret, fmt.Errorf("capture XSAVE state: %w", err)
+	}
+	ret.Xsave = xsave
 
-	// TODO(): xcrs
+	xcrs, err := getXcrs(v.fd)
+	if err != nil {
+		return ret, fmt.Errorf("capture XCRs: %w", err)
+	}
+	ret.Xcrs = xcrs
 
-	// TODO(): msrs
+	msrIndices, err := v.vm.hv.snapshotMSRs()
+	if err != nil {
+		return ret, fmt.Errorf("enumerate snapshot MSRs: %w", err)
+	}
+
+	msrs, err := getMsrs(v.fd, msrIndices)
+	if err != nil {
+		return ret, fmt.Errorf("capture MSRs: %w", err)
+	}
+	ret.Msrs = msrs
 
 	return ret, nil
 }
@@ -631,15 +677,27 @@ func (v *virtualCPU) restoreSnapshot(snap vcpuSnapshot) error {
 		return fmt.Errorf("restore special registers: %w", err)
 	}
 
-	// TODO(): fpu
+	if err := setFPU(v.fd, &snap.FPU); err != nil {
+		return fmt.Errorf("restore FPU state: %w", err)
+	}
 
-	// TODO(): lapic
+	if snap.LapicPresent {
+		if err := setLapic(v.fd, &snap.Lapic); err != nil {
+			return fmt.Errorf("restore LAPIC state: %w", err)
+		}
+	}
 
-	// TODO(): xsave
+	if err := setXsave(v.fd, &snap.Xsave); err != nil {
+		return fmt.Errorf("restore XSAVE state: %w", err)
+	}
 
-	// TODO(): xcrs
+	if err := setXcrs(v.fd, &snap.Xcrs); err != nil {
+		return fmt.Errorf("restore XCRs: %w", err)
+	}
 
-	// TODO(): msrs
+	if err := setMsrs(v.fd, snap.Msrs); err != nil {
+		return fmt.Errorf("restore MSRs: %w", err)
+	}
 
 	return nil
 }
@@ -667,11 +725,39 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 		}
 	}
 
-	// TODO(): Clock
+	if clock, err := getClock(v.vmFd); err != nil {
+		if !errors.Is(err, unix.ENOTTY) {
+			return nil, fmt.Errorf("capture clock: %w", err)
+		}
+	} else {
+		ret.clockData = &clock
+	}
 
-	// TODO(): IRQChip
+	if v.hasIRQChip {
+		var chips []kvmIRQChip
+		for _, chipID := range []uint32{irqChipPICMaster, irqChipPICSlave, irqChipIOAPIC} {
+			chip, err := getIRQChip(v.vmFd, chipID)
+			if err != nil {
+				if errors.Is(err, unix.EINVAL) {
+					continue
+				}
+				return nil, fmt.Errorf("capture IRQ chip %d: %w", chipID, err)
+			}
+			chips = append(chips, chip)
+		}
+		if len(chips) == 0 {
+			return nil, fmt.Errorf("capture IRQ chip: no chip data returned")
+		}
+		ret.irqChips = chips
+	}
 
-	// TODO(): PIT2
+	if v.hasPIT {
+		pit, err := getPitState(v.vmFd)
+		if err != nil {
+			return nil, fmt.Errorf("capture PIT state: %w", err)
+		}
+		ret.pitState = &pit
+	}
 
 	// Capture state from each device
 	for _, dev := range v.devices {
@@ -687,7 +773,10 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 		}
 	}
 
-	// TOOD(): Memory
+	if len(v.memory) > 0 {
+		ret.memory = make([]byte, len(v.memory))
+		copy(ret.memory, v.memory)
+	}
 
 	return ret, nil
 }
@@ -698,6 +787,14 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 	snapshotData, ok := snap.(*snapshot)
 	if !ok {
 		return fmt.Errorf("invalid snapshot type")
+	}
+
+	if len(v.memory) != len(snapshotData.memory) {
+		return fmt.Errorf("snapshot memory size mismatch: got %d bytes, want %d bytes",
+			len(snapshotData.memory), len(v.memory))
+	}
+	if len(v.memory) > 0 {
+		copy(v.memory, snapshotData.memory)
 	}
 
 	// Restore state to each vCPU
@@ -718,11 +815,36 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 		}
 	}
 
-	// TODO(): Clock
+	if snapshotData.clockData != nil {
+		if err := setClock(v.vmFd, snapshotData.clockData); err != nil {
+			return fmt.Errorf("restore clock: %w", err)
+		}
+	}
 
-	// TODO(): IRQChip
+	if len(snapshotData.irqChips) > 0 {
+		if !v.hasIRQChip {
+			return fmt.Errorf("snapshot contains IRQ chip state but VM lacks irqchip")
+		}
+		for _, chip := range snapshotData.irqChips {
+			chipCopy := chip
+			if err := setIRQChip(v.vmFd, &chipCopy); err != nil {
+				return fmt.Errorf("restore IRQ chip %d: %w", chipCopy.ChipID, err)
+			}
+		}
+	} else if v.hasIRQChip {
+		return fmt.Errorf("snapshot missing IRQ chip state")
+	}
 
-	// TODO(): PIT2
+	switch {
+	case snapshotData.pitState != nil && v.hasPIT:
+		if err := setPitState(v.vmFd, snapshotData.pitState); err != nil {
+			return fmt.Errorf("restore PIT state: %w", err)
+		}
+	case snapshotData.pitState == nil && v.hasPIT:
+		return fmt.Errorf("snapshot missing PIT state")
+	case snapshotData.pitState != nil && !v.hasPIT:
+		return fmt.Errorf("snapshot provides PIT state but VM lacks PIT")
+	}
 
 	// Restore state to each device
 	for _, dev := range v.devices {
@@ -739,8 +861,6 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 			}
 		}
 	}
-
-	// TOOD(): Memory
 
 	return nil
 }
