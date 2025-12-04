@@ -726,7 +726,7 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 	}
 
 	if clock, err := getClock(v.vmFd); err != nil {
-		if !errors.Is(err, unix.ENOTTY) {
+		if !errors.Is(err, unix.ENOTTY) && !errors.Is(err, unix.EINVAL) {
 			return nil, fmt.Errorf("capture clock: %w", err)
 		}
 	} else {

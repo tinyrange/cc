@@ -225,7 +225,7 @@ func (v *virtualMachine) WriteAt(p []byte, off int64) (n int, err error) {
 	off = off - int64(v.memoryBase)
 
 	if off < 0 || int(off) >= len(v.memory) {
-		return 0, fmt.Errorf("kvm: WriteAt offset out of bounds")
+		return 0, fmt.Errorf("kvm: WriteAt offset 0x%x out of bounds 0x%x", off, len(v.memory))
 	}
 
 	n = copy(v.memory[off:], p)
