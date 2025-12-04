@@ -494,6 +494,158 @@ func (q *bringUpQuest) Run() error {
 		return err
 	}
 
+	// Snapshot quest
+	if err := q.runArchitectureTask("Snapshot Quest", hv.ArchitectureX86_64, func() error {
+		loader := &helpers.ProgramLoader{
+			Program: ir.Program{
+				Entrypoint: "main",
+				Methods: map[string]ir.Method{
+					"main": {
+						// Set RCX to 0 to indicate start
+						amd64.MovImmediate(amd64.Reg64(amd64.RCX), 0),
+
+						// do a raw memory write to 0xf000_0000 to trigger the yield
+						amd64.MovImmediate(amd64.Reg64(amd64.RAX), 0xdeadbeef),
+						amd64.MovImmediate(amd64.Reg64(amd64.RBX), 0xf0000000),
+						amd64.MovToMemory(amd64.Mem(amd64.Reg64(amd64.RBX)), amd64.Reg64(amd64.RAX)),
+
+						// Set RCX to 42 to indicate success
+						amd64.MovImmediate(amd64.Reg64(amd64.RCX), 42),
+
+						// Do a raw memory write to 0xf000_0000 again to trigger another yield
+						amd64.MovImmediate(amd64.Reg64(amd64.RAX), 0xdeadbeef),
+						amd64.MovImmediate(amd64.Reg64(amd64.RBX), 0xf0000000),
+						amd64.MovToMemory(amd64.Mem(amd64.Reg64(amd64.RBX)), amd64.Reg64(amd64.RAX)),
+
+						// Halt the CPU
+						amd64.Hlt(),
+					},
+				},
+			},
+			BaseAddr:          0,
+			Mode:              helpers.Mode64BitIdentityMapping,
+			MaxLoopIterations: 1,
+		}
+
+		vm, err := q.dev.NewVirtualMachine(hv.SimpleVMConfig{
+			NumCPUs:  1,
+			MemSize:  64 * 1024 * 1024,
+			MemBase:  0,
+			VMLoader: loader,
+		})
+		if err != nil {
+			return fmt.Errorf("create virtual machine: %w", err)
+		}
+		defer vm.Close()
+
+		if err := vm.AddDevice(hv.SimpleMMIODevice{
+			Regions: []hv.MMIORegion{
+				{Address: 0xf000_0000, Size: 4096},
+			},
+			WriteFunc: func(addr uint64, data []byte) error {
+				if addr != 0xf000_0000 {
+					return fmt.Errorf("unexpected MMIO write to address 0x%08x", addr)
+				}
+
+				// get the data as a uint32
+				value := binary.LittleEndian.Uint32(data)
+
+				if value != 0xdeadbeef {
+					return fmt.Errorf("unexpected MMIO write value: 0x%08x", value)
+				}
+
+				// Yield the VM
+				return hv.ErrYield
+			},
+		}); err != nil {
+			return fmt.Errorf("add MMIO device: %w", err)
+		}
+
+		if err := vm.Run(context.Background(), loader); err != nil && !errors.Is(err, hv.ErrYield) {
+			return fmt.Errorf("run virtual machine: %w", err)
+		}
+
+		if err := vm.VirtualCPUCall(0, func(cpu hv.VirtualCPU) error {
+			// Verify that RCX is 0
+			regs := map[hv.Register]hv.RegisterValue{
+				hv.RegisterAMD64Rcx: hv.Register64(0),
+			}
+
+			if err := cpu.GetRegisters(regs); err != nil {
+				return fmt.Errorf("get RCX register: %w", err)
+			}
+
+			rcx := uint64(regs[hv.RegisterAMD64Rcx].(hv.Register64))
+			if rcx != 0 {
+				return fmt.Errorf("unexpected RCX value after first yield: got %d, want 0", rcx)
+			}
+
+			return nil
+		}); err != nil {
+			return fmt.Errorf("sync vCPU after first yield: %w", err)
+		}
+
+		// Capture an initial snapshot
+		snapshot, err := vm.CaptureSnapshot()
+		if err != nil {
+			return fmt.Errorf("create snapshot: %w", err)
+		}
+
+		// Let the virtual machine continue and yield again
+		if err := vm.Run(context.Background(), nil); err != nil {
+			return fmt.Errorf("run virtual machine: %w", err)
+		}
+
+		// Verify that RCX is 42
+		if err := vm.VirtualCPUCall(0, func(cpu hv.VirtualCPU) error {
+			regs := map[hv.Register]hv.RegisterValue{
+				hv.RegisterAMD64Rcx: hv.Register64(0),
+			}
+
+			if err := cpu.GetRegisters(regs); err != nil {
+				return fmt.Errorf("get RCX register: %w", err)
+			}
+
+			rcx := uint64(regs[hv.RegisterAMD64Rcx].(hv.Register64))
+			if rcx != 42 {
+				return fmt.Errorf("unexpected RCX value after second yield: got %d, want 42", rcx)
+			}
+
+			return nil
+		}); err != nil {
+			return fmt.Errorf("sync vCPU after second yield: %w", err)
+		}
+
+		// Restore from the snapshot
+		if err := vm.RestoreSnapshot(snapshot); err != nil {
+			return fmt.Errorf("restore snapshot: %w", err)
+		}
+
+		// Verify that RCX is back to 0
+		if err := vm.VirtualCPUCall(0, func(cpu hv.VirtualCPU) error {
+			regs := map[hv.Register]hv.RegisterValue{
+				hv.RegisterAMD64Rcx: hv.Register64(0),
+			}
+
+			if err := cpu.GetRegisters(regs); err != nil {
+				return fmt.Errorf("get RCX register: %w", err)
+			}
+
+			rcx := uint64(regs[hv.RegisterAMD64Rcx].(hv.Register64))
+			if rcx != 0 {
+				return fmt.Errorf("unexpected RCX value after restore: got %d, want 0", rcx)
+			}
+
+			return nil
+		}); err != nil {
+			return fmt.Errorf("sync vCPU after restore: %w", err)
+		}
+
+		return nil
+	}); err != nil {
+		return err
+	}
+
 	// ARM64 tests
 	if err := q.runVMTask("PSCI SYSTEM_OFF Test", hv.ArchitectureARM64, ir.Program{
 		Entrypoint: "main",
@@ -639,7 +791,7 @@ func (q *bringUpQuest) Run() error {
 	}
 
 	// Timeout test (ARM64)
-	if err := q.runVMTaskWithTimeout("Timeout Test (ARM64)", hv.ArchitectureARM64, 100*time.Millisecond, ir.Program{
+	if err := q.runVMTaskWithTimeout("Timeout Test", hv.ArchitectureARM64, 100*time.Millisecond, ir.Program{
 		Entrypoint: "main",
 		Methods: map[string]ir.Method{
 			"main": {

@@ -115,6 +115,44 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 	return h.newVirtualMachine(config)
 }
 
+type memoryRegion struct {
+	memory []byte
+}
+
+func (m *memoryRegion) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 || int(off) >= len(m.memory) {
+		return 0, fmt.Errorf("hvf: MemoryRegion ReadAt offset 0x%x out of bounds", off)
+	}
+
+	n := copy(p, m.memory[off:])
+	if n < len(p) {
+		return n, fmt.Errorf("hvf: MemoryRegion ReadAt short read")
+	}
+
+	return n, nil
+}
+
+func (m *memoryRegion) WriteAt(p []byte, off int64) (int, error) {
+	if off < 0 || int(off) >= len(m.memory) {
+		return 0, fmt.Errorf("hvf: MemoryRegion WriteAt offset 0x%x out of bounds", off)
+	}
+
+	n := copy(m.memory[off:], p)
+	if n < len(p) {
+		return n, fmt.Errorf("hvf: MemoryRegion WriteAt short write")
+	}
+
+	return n, nil
+}
+
+func (m *memoryRegion) Size() uint64 {
+	return uint64(len(m.memory))
+}
+
+var (
+	_ hv.MemoryRegion = &memoryRegion{}
+)
+
 type virtualMachine struct {
 	hv         hv.Hypervisor
 	vcpus      map[int]*virtualCPU
@@ -135,7 +173,39 @@ func (v *virtualMachine) Hypervisor() hv.Hypervisor { return v.hv }
 
 // AllocateMemory implements hv.VirtualMachine.
 func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.MemoryRegion, error) {
-	panic("unimplemented")
+	mem, err := unix.Mmap(
+		-1,
+		0,
+		int(size),
+		unix.PROT_READ|unix.PROT_WRITE,
+		unix.MAP_ANON|unix.MAP_PRIVATE,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("hvf: mmap guest memory: %w", err)
+	}
+
+	if err := hvVmMap(
+		unsafe.Pointer(&mem[0]),
+		physAddr,
+		size,
+		hvMemoryRead|hvMemoryWrite|hvMemoryExec,
+	).toError("hv_vm_map"); err != nil {
+		return nil, err
+	}
+
+	return &memoryRegion{
+		memory: mem,
+	}, nil
+}
+
+// CaptureSnapshot implements hv.VirtualMachine.
+func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
+	return nil, fmt.Errorf("CaptureSnapshot unimplemented")
+}
+
+// RestoreSnapshot implements hv.VirtualMachine.
+func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
+	return fmt.Errorf("RestoreSnapshot unimplemented")
 }
 
 func (v *virtualMachine) AddDevice(dev hv.Device) error {

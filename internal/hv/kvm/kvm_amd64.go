@@ -577,6 +577,152 @@ func (vcpu *virtualCPU) SetLongModeWithSelectors(
 }
 
 var (
-	_ hv.VirtualCPUAmd64 = &virtualCPU{}
+	_ hv.VirtualCPUAmd64     = &virtualCPU{}
 	_ hv.VirtualMachineAmd64 = &virtualMachine{}
 )
+
+// Snapshot Support
+
+type vcpuSnapshot struct {
+}
+
+type snapshot struct {
+	cpuStates map[int]vcpuSnapshot
+
+	deviceSnapshots map[string]interface{}
+}
+
+func (v *virtualCPU) captureSnapshot() (vcpuSnapshot, error) {
+	var ret vcpuSnapshot
+
+	// TODO(): regs
+
+	// TODO(): sregs
+
+	// TODO(): fpu
+
+	// TODO(): lapic
+
+	// TODO(): xsave
+
+	// TODO(): xcrs
+
+	// TODO(): msrs
+
+	return ret, fmt.Errorf("captureSnapshot unimplemented")
+}
+
+func (v *virtualCPU) restoreSnapshot(snap vcpuSnapshot) error {
+	// TODO(): regs
+
+	// TODO(): sregs
+
+	// TODO(): fpu
+
+	// TODO(): lapic
+
+	// TODO(): xsave
+
+	// TODO(): xcrs
+
+	// TODO(): msrs
+
+	return fmt.Errorf("restoreSnapshot unimplemented")
+}
+
+// CaptureSnapshot implements hv.VirtualMachine.
+func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
+	ret := &snapshot{
+		cpuStates:       make(map[int]vcpuSnapshot),
+		deviceSnapshots: make(map[string]interface{}),
+	}
+
+	// Capture state from each vCPU
+	for i := range v.vcpus {
+		if err := v.VirtualCPUCall(i, func(vcpu hv.VirtualCPU) error {
+			state, err := vcpu.(*virtualCPU).captureSnapshot()
+			if err != nil {
+				return err
+			}
+
+			ret.cpuStates[i] = state
+
+			return nil
+		}); err != nil {
+			return nil, fmt.Errorf("capture vCPU %d snapshot: %w", i, err)
+		}
+	}
+
+	// TODO(): Clock
+
+	// TODO(): IRQChip
+
+	// TODO(): PIT2
+
+	// Capture state from each device
+	for _, dev := range v.devices {
+		if snapshotter, ok := dev.(hv.DeviceSnapshotter); ok {
+			id := snapshotter.DeviceId()
+
+			snap, err := snapshotter.CaptureSnapshot()
+			if err != nil {
+				return nil, fmt.Errorf("capture device %s snapshot: %w", id, err)
+			}
+
+			ret.deviceSnapshots[id] = snap
+		}
+	}
+
+	return ret, nil
+}
+
+// RestoreSnapshot implements hv.VirtualMachine.
+func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
+	// Type assert to our snapshot type
+	snapshotData, ok := snap.(*snapshot)
+	if !ok {
+		return fmt.Errorf("invalid snapshot type")
+	}
+
+	// Restore state to each vCPU
+	for i := range v.vcpus {
+		state, ok := snapshotData.cpuStates[i]
+		if !ok {
+			return fmt.Errorf("missing vCPU %d state in snapshot", i)
+		}
+
+		if err := v.VirtualCPUCall(i, func(vcpu hv.VirtualCPU) error {
+			if err := vcpu.(*virtualCPU).restoreSnapshot(state); err != nil {
+				return err
+			}
+
+			return nil
+		}); err != nil {
+			return fmt.Errorf("restore vCPU %d snapshot: %w", i, err)
+		}
+	}
+
+	// TODO(): Clock
+
+	// TODO(): IRQChip
+
+	// TODO(): PIT2
+
+	// Restore state to each device
+	for _, dev := range v.devices {
+		if snapshotter, ok := dev.(hv.DeviceSnapshotter); ok {
+			id := snapshotter.DeviceId()
+
+			snapData, ok := snapshotData.deviceSnapshots[id]
+			if !ok {
+				return fmt.Errorf("missing device %s snapshot", id)
+			}
+
+			if err := snapshotter.RestoreSnapshot(snapData); err != nil {
+				return fmt.Errorf("restore device %s snapshot: %w", id, err)
+			}
+		}
+	}
+
+	return nil
+}

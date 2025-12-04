@@ -294,3 +294,15 @@ func (h *hypervisor) archVCPUInit(vm *virtualMachine, vcpu *virtualCPU) error {
 	}
 	return nil
 }
+
+// Snapshot Support
+
+// CaptureSnapshot implements hv.VirtualMachine.
+func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
+	return nil, fmt.Errorf("CaptureSnapshot unimplemented")
+}
+
+// RestoreSnapshot implements hv.VirtualMachine.
+func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
+	return fmt.Errorf("RestoreSnapshot unimplemented")
+}

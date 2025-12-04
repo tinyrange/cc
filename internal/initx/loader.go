@@ -38,9 +38,6 @@ const (
 	userYieldValue = 0x5553_4552 // "USER"
 )
 
-var ErrYield = errors.New("yield to host")
-var ErrUserYield = errors.New("user yield to host")
-
 type proxyReader struct {
 	r      io.Reader
 	update chan io.Reader
@@ -155,9 +152,9 @@ func (p *programLoader) WriteMMIO(addr uint64, data []byte) error {
 		value := binary.LittleEndian.Uint32(data)
 		switch value {
 		case 0x444f4e45:
-			return ErrYield
+			return hv.ErrYield
 		case userYieldValue:
-			return ErrUserYield
+			return hv.ErrUserYield
 		}
 	}
 
@@ -271,17 +268,17 @@ func (p *programRunner) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 			if errors.Is(err, hv.ErrGuestRequestedReboot) {
 				return nil
 			}
-			if errors.Is(err, ErrYield) {
+			if errors.Is(err, hv.ErrYield) {
 				return nil
 			}
-			if errors.Is(err, ErrUserYield) {
+			if errors.Is(err, hv.ErrUserYield) {
 				if p.onUserYield != nil {
 					if err := p.onUserYield(ctx, vcpu); err != nil {
 						return err
 					}
 					continue
 				}
-				return ErrUserYield
+				return hv.ErrUserYield
 			}
 			return fmt.Errorf("run vCPU: %w", err)
 		}

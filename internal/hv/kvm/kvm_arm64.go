@@ -244,3 +244,15 @@ func enableArmVcpuFeature(init *kvmVcpuInit, feature uint32) {
 func (*hypervisor) Architecture() hv.CpuArchitecture {
 	return hv.ArchitectureARM64
 }
+
+// Snapshot Support
+
+// CaptureSnapshot implements hv.VirtualMachine.
+func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
+	return nil, fmt.Errorf("CaptureSnapshot unimplemented")
+}
+
+// RestoreSnapshot implements hv.VirtualMachine.
+func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
+	return fmt.Errorf("RestoreSnapshot unimplemented")
+}

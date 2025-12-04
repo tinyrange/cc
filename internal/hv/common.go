@@ -12,6 +12,8 @@ var (
 	ErrVMHalted              = errors.New("virtual machine halted")
 	ErrHypervisorUnsupported = errors.New("hypervisor unsupported on this platform")
 	ErrGuestRequestedReboot  = errors.New("guest requested reboot")
+	ErrYield                 = errors.New("yield to host")
+	ErrUserYield             = errors.New("user yield to host")
 )
 
 type CpuArchitecture string
@@ -193,6 +195,18 @@ type Device interface {
 	Init(vm VirtualMachine) error
 }
 
+type DeviceSnapshot interface {
+}
+
+type DeviceSnapshotter interface {
+	Device
+
+	DeviceId() string
+
+	CaptureSnapshot() (DeviceSnapshot, error)
+	RestoreSnapshot(snap DeviceSnapshot) error
+}
+
 type DeviceTemplate interface {
 	Create(vm VirtualMachine) (Device, error)
 }
@@ -280,6 +294,9 @@ type MemoryRegion interface {
 	Size() uint64
 }
 
+type Snapshot interface {
+}
+
 type VirtualMachine interface {
 	io.ReaderAt
 	io.WriterAt
@@ -299,6 +316,9 @@ type VirtualMachine interface {
 	AddDeviceFromTemplate(template DeviceTemplate) error
 
 	AllocateMemory(physAddr, size uint64) (MemoryRegion, error)
+
+	CaptureSnapshot() (Snapshot, error)
+	RestoreSnapshot(snap Snapshot) error
 }
 
 type VirtualMachineAmd64 interface {
