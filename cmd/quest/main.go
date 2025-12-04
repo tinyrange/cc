@@ -32,10 +32,11 @@ import (
 )
 
 const (
-	psciSystemOff     = 0x84000008
-	arm64MMIOAddr     = 0xdead0000
-	arm64MessageBuf   = 0x2000
-	arm64UARTMMIOBase = 0x09000000
+	psciSystemOff         = 0x84000008
+	arm64MMIOAddr         = 0xdead0000
+	arm64MessageBuf       = 0x2000
+	arm64UARTMMIOBase     = 0x09000000
+	arm64SnapshotMMIOAddr = 0xf0000000
 )
 
 const (
@@ -653,6 +654,136 @@ func (q *bringUpQuest) Run() error {
 				return fmt.Errorf("unexpected RCX value after restore: got %d, want 0", rcx)
 			}
 
+			return nil
+		}); err != nil {
+			return fmt.Errorf("sync vCPU after restore: %w", err)
+		}
+
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// Snapshot quest (ARM64)
+	if err := q.runArchitectureTask("Snapshot Quest", hv.ArchitectureARM64, func() error {
+		loader := &helpers.ProgramLoader{
+			Program: ir.Program{
+				Entrypoint: "main",
+				Methods: map[string]ir.Method{
+					"main": {
+						arm64.MovImmediate(arm64.Reg64(arm64.X1), 0),
+						arm64.MovImmediate(arm64.Reg64(arm64.X2), arm64SnapshotMMIOAddr),
+						arm64.MovImmediate(arm64.Reg32(arm64.X3), 0xdeadbeef),
+
+						// Trigger first yield.
+						arm64.MovToMemory32(arm64.Mem(arm64.Reg64(arm64.X2)), arm64.Reg32(arm64.X3)),
+
+						// Indicate success and trigger another yield.
+						arm64.MovImmediate(arm64.Reg64(arm64.X1), 42),
+						arm64.MovToMemory32(arm64.Mem(arm64.Reg64(arm64.X2)), arm64.Reg32(arm64.X3)),
+
+						arm64.MovImmediate(arm64.Reg64(arm64.X0), psciSystemOff),
+						arm64.Hvc(),
+					},
+				},
+			},
+			BaseAddr:          0,
+			Mode:              helpers.Mode64BitIdentityMapping,
+			MaxLoopIterations: 1,
+		}
+
+		vm, err := q.dev.NewVirtualMachine(hv.SimpleVMConfig{
+			NumCPUs:  1,
+			MemSize:  64 * 1024 * 1024,
+			MemBase:  linuxMemoryBaseForArch(hv.ArchitectureARM64),
+			VMLoader: loader,
+		})
+		if err != nil {
+			return fmt.Errorf("create virtual machine: %w", err)
+		}
+		defer vm.Close()
+
+		if err := vm.AddDevice(hv.SimpleMMIODevice{
+			Regions: []hv.MMIORegion{
+				{Address: arm64SnapshotMMIOAddr, Size: 4096},
+			},
+			WriteFunc: func(addr uint64, data []byte) error {
+				if addr != arm64SnapshotMMIOAddr {
+					return fmt.Errorf("unexpected MMIO write to address 0x%08x", addr)
+				}
+				if len(data) < 4 {
+					return fmt.Errorf("unexpected MMIO data size: got %d, want >=4", len(data))
+				}
+
+				value := binary.LittleEndian.Uint32(data)
+				if value != 0xdeadbeef {
+					return fmt.Errorf("unexpected MMIO write value: 0x%08x", value)
+				}
+
+				return hv.ErrYield
+			},
+		}); err != nil {
+			return fmt.Errorf("add MMIO device: %w", err)
+		}
+
+		if err := vm.Run(context.Background(), loader); err != nil && !errors.Is(err, hv.ErrYield) {
+			return fmt.Errorf("run virtual machine: %w", err)
+		}
+
+		if err := vm.VirtualCPUCall(0, func(cpu hv.VirtualCPU) error {
+			regs := map[hv.Register]hv.RegisterValue{
+				hv.RegisterARM64X1: hv.Register64(0),
+			}
+			if err := cpu.GetRegisters(regs); err != nil {
+				return fmt.Errorf("get X1 register: %w", err)
+			}
+
+			if val := uint64(regs[hv.RegisterARM64X1].(hv.Register64)); val != 0 {
+				return fmt.Errorf("unexpected X1 value after first yield: got %d, want 0", val)
+			}
+			return nil
+		}); err != nil {
+			return fmt.Errorf("sync vCPU after first yield: %w", err)
+		}
+
+		snapshot, err := vm.CaptureSnapshot()
+		if err != nil {
+			return fmt.Errorf("create snapshot: %w", err)
+		}
+
+		if err := vm.Run(context.Background(), resumeRunConfig{}); err != nil {
+			return fmt.Errorf("run virtual machine: %w", err)
+		}
+
+		if err := vm.VirtualCPUCall(0, func(cpu hv.VirtualCPU) error {
+			regs := map[hv.Register]hv.RegisterValue{
+				hv.RegisterARM64X1: hv.Register64(0),
+			}
+			if err := cpu.GetRegisters(regs); err != nil {
+				return fmt.Errorf("get X1 register: %w", err)
+			}
+			if val := uint64(regs[hv.RegisterARM64X1].(hv.Register64)); val != 42 {
+				return fmt.Errorf("unexpected X1 value after second yield: got %d, want 42", val)
+			}
+			return nil
+		}); err != nil {
+			return fmt.Errorf("sync vCPU after second yield: %w", err)
+		}
+
+		if err := vm.RestoreSnapshot(snapshot); err != nil {
+			return fmt.Errorf("restore snapshot: %w", err)
+		}
+
+		if err := vm.VirtualCPUCall(0, func(cpu hv.VirtualCPU) error {
+			regs := map[hv.Register]hv.RegisterValue{
+				hv.RegisterARM64X1: hv.Register64(0),
+			}
+			if err := cpu.GetRegisters(regs); err != nil {
+				return fmt.Errorf("get X1 register: %w", err)
+			}
+			if val := uint64(regs[hv.RegisterARM64X1].(hv.Register64)); val != 0 {
+				return fmt.Errorf("unexpected X1 value after restore: got %d, want 0", val)
+			}
 			return nil
 		}); err != nil {
 			return fmt.Errorf("sync vCPU after restore: %w", err)

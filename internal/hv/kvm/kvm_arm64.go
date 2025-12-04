@@ -247,12 +247,145 @@ func (*hypervisor) Architecture() hv.CpuArchitecture {
 
 // Snapshot Support
 
+type arm64VcpuSnapshot struct {
+	Registers map[hv.Register]uint64
+}
+
+type arm64Snapshot struct {
+	cpuStates       map[int]arm64VcpuSnapshot
+	deviceSnapshots map[string]interface{}
+	memory          []byte
+	clockData       *kvmClockData
+}
+
+func (v *virtualCPU) captureSnapshot() (arm64VcpuSnapshot, error) {
+	ret := arm64VcpuSnapshot{
+		Registers: make(map[hv.Register]uint64, len(arm64RegisterIDs)),
+	}
+
+	regRequest := make(map[hv.Register]hv.RegisterValue, len(arm64RegisterIDs))
+	for reg := range arm64RegisterIDs {
+		regRequest[reg] = hv.Register64(0)
+	}
+
+	if err := v.GetRegisters(regRequest); err != nil {
+		return ret, fmt.Errorf("capture registers: %w", err)
+	}
+
+	for reg, value := range regRequest {
+		ret.Registers[reg] = uint64(value.(hv.Register64))
+	}
+
+	return ret, nil
+}
+
+func (v *virtualCPU) restoreSnapshot(snap arm64VcpuSnapshot) error {
+	regs := make(map[hv.Register]hv.RegisterValue, len(snap.Registers))
+	for reg, value := range snap.Registers {
+		regs[reg] = hv.Register64(value)
+	}
+
+	if err := v.SetRegisters(regs); err != nil {
+		return fmt.Errorf("restore registers: %w", err)
+	}
+
+	return nil
+}
+
 // CaptureSnapshot implements hv.VirtualMachine.
 func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
-	return nil, fmt.Errorf("CaptureSnapshot unimplemented")
+	ret := &arm64Snapshot{
+		cpuStates:       make(map[int]arm64VcpuSnapshot),
+		deviceSnapshots: make(map[string]interface{}),
+	}
+
+	for i := range v.vcpus {
+		if err := v.VirtualCPUCall(i, func(vcpu hv.VirtualCPU) error {
+			state, err := vcpu.(*virtualCPU).captureSnapshot()
+			if err != nil {
+				return err
+			}
+
+			ret.cpuStates[i] = state
+			return nil
+		}); err != nil {
+			return nil, fmt.Errorf("capture vCPU %d snapshot: %w", i, err)
+		}
+	}
+
+	if clock, err := getClock(v.vmFd); err != nil {
+		if !errors.Is(err, unix.ENOTTY) {
+			return nil, fmt.Errorf("capture clock: %w", err)
+		}
+	} else {
+		ret.clockData = &clock
+	}
+
+	for _, dev := range v.devices {
+		if snapshotter, ok := dev.(hv.DeviceSnapshotter); ok {
+			id := snapshotter.DeviceId()
+			snap, err := snapshotter.CaptureSnapshot()
+			if err != nil {
+				return nil, fmt.Errorf("capture device %s snapshot: %w", id, err)
+			}
+			ret.deviceSnapshots[id] = snap
+		}
+	}
+
+	if len(v.memory) > 0 {
+		ret.memory = make([]byte, len(v.memory))
+		copy(ret.memory, v.memory)
+	}
+
+	return ret, nil
 }
 
 // RestoreSnapshot implements hv.VirtualMachine.
 func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
-	return fmt.Errorf("RestoreSnapshot unimplemented")
+	snapshotData, ok := snap.(*arm64Snapshot)
+	if !ok {
+		return fmt.Errorf("invalid snapshot type")
+	}
+
+	if len(v.memory) != len(snapshotData.memory) {
+		return fmt.Errorf("snapshot memory size mismatch: got %d bytes, want %d bytes",
+			len(snapshotData.memory), len(v.memory))
+	}
+	if len(v.memory) > 0 {
+		copy(v.memory, snapshotData.memory)
+	}
+
+	for i := range v.vcpus {
+		state, ok := snapshotData.cpuStates[i]
+		if !ok {
+			return fmt.Errorf("missing vCPU %d state in snapshot", i)
+		}
+
+		if err := v.VirtualCPUCall(i, func(vcpu hv.VirtualCPU) error {
+			return vcpu.(*virtualCPU).restoreSnapshot(state)
+		}); err != nil {
+			return fmt.Errorf("restore vCPU %d snapshot: %w", i, err)
+		}
+	}
+
+	if snapshotData.clockData != nil {
+		if err := setClock(v.vmFd, snapshotData.clockData); err != nil {
+			return fmt.Errorf("restore clock: %w", err)
+		}
+	}
+
+	for _, dev := range v.devices {
+		if snapshotter, ok := dev.(hv.DeviceSnapshotter); ok {
+			id := snapshotter.DeviceId()
+			snapData, ok := snapshotData.deviceSnapshots[id]
+			if !ok {
+				return fmt.Errorf("missing device %s snapshot", id)
+			}
+			if err := snapshotter.RestoreSnapshot(snapData); err != nil {
+				return fmt.Errorf("restore device %s snapshot: %w", id, err)
+			}
+		}
+	}
+
+	return nil
 }
