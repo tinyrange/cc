@@ -16,8 +16,9 @@ import (
 )
 
 const (
-	ioapicBaseAddress = 0xFEC00000
-	hpetBaseAddress   = 0xFED00000
+	ioapicBaseAddress        = 0xFEC00000
+	hpetBaseAddress          = 0xFED00000
+	hpetAlternateBaseAddress = 0xFED80000
 )
 
 // Architecture implements hv.Hypervisor.
@@ -365,7 +366,7 @@ func (h *hypervisor) archVMInitWithMemory(vm *virtualMachine, config hv.VMConfig
 		if err := vm.installACPI(); err != nil {
 			return fmt.Errorf("install ACPI tables: %w", err)
 		}
-		if err := vm.AddDevice(NewHPETDevice(hpetBaseAddress, vm)); err != nil {
+		if err := vm.AddDevice(NewHPETDevice(hpetBaseAddress, vm, hpetAlternateBaseAddress)); err != nil {
 			return fmt.Errorf("add HPET device: %w", err)
 		}
 		vm.ioapic = chipset.NewIOAPIC(24)

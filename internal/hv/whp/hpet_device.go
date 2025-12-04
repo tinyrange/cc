@@ -36,9 +36,13 @@ type hpetTimer struct {
 	fsRoute    uint64
 }
 
+const (
+	hpetMMIOWindowSize = 0x400
+)
+
 type hpetDevice struct {
-	base uint64
-	sink InterruptSink
+	bases []uint64
+	sink  InterruptSink
 
 	mu            sync.Mutex
 	generalConfig uint64
@@ -50,16 +54,47 @@ type hpetDevice struct {
 	timers [hpetNumTimers]hpetTimer
 }
 
-func NewHPETDevice(base uint64, sink InterruptSink) *hpetDevice {
+func NewHPETDevice(base uint64, sink InterruptSink, aliases ...uint64) *hpetDevice {
+	bases := make([]uint64, 0, 1+len(aliases))
+	seen := make(map[uint64]struct{}, 1+len(aliases))
+	addBase := func(addr uint64) {
+		if addr == 0 {
+			return
+		}
+		if _, ok := seen[addr]; ok {
+			return
+		}
+		seen[addr] = struct{}{}
+		bases = append(bases, addr)
+	}
+
+	addBase(base)
+	for _, alias := range aliases {
+		addBase(alias)
+	}
+
 	return &hpetDevice{
-		base:       base,
+		bases:      bases,
 		sink:       sink,
 		lastUpdate: time.Now(),
 	}
 }
 
 func (d *hpetDevice) MMIORegions() []hv.MMIORegion {
-	return []hv.MMIORegion{{Address: d.base, Size: 0x400}}
+	regions := make([]hv.MMIORegion, 0, len(d.bases))
+	for _, base := range d.bases {
+		regions = append(regions, hv.MMIORegion{Address: base, Size: hpetMMIOWindowSize})
+	}
+	return regions
+}
+
+func (d *hpetDevice) offsetFor(addr uint64) (uint64, error) {
+	for _, base := range d.bases {
+		if addr >= base && addr < base+hpetMMIOWindowSize {
+			return addr - base, nil
+		}
+	}
+	return 0, fmt.Errorf("hpet: address 0x%x outside configured MMIO windows", addr)
 }
 
 // ReadMMIO handles standard reads. Windows relies heavily on the Main Counter read.
@@ -70,7 +105,10 @@ func (d *hpetDevice) ReadMMIO(addr uint64, data []byte) error {
 	// Update counter before read to ensure freshness
 	d.updateCounterLocked()
 
-	offset := addr - d.base
+	offset, err := d.offsetFor(addr)
+	if err != nil {
+		return err
+	}
 	val := uint64(0)
 
 	switch {
@@ -116,7 +154,10 @@ func (d *hpetDevice) WriteMMIO(addr uint64, data []byte) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	offset := addr - d.base
+	offset, err := d.offsetFor(addr)
+	if err != nil {
+		return err
+	}
 
 	// Convert data to uint64 for easier handling
 	var val uint64
