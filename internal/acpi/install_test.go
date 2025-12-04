@@ -146,6 +146,16 @@ type fakeVM struct {
 	base uint64
 }
 
+// CaptureSnapshot implements hv.VirtualMachine.
+func (f *fakeVM) CaptureSnapshot() (hv.Snapshot, error) {
+	panic("unimplemented")
+}
+
+// RestoreSnapshot implements hv.VirtualMachine.
+func (f *fakeVM) RestoreSnapshot(snap hv.Snapshot) error {
+	panic("unimplemented")
+}
+
 // AllocateMemory implements hv.VirtualMachine.
 func (f *fakeVM) AllocateMemory(physAddr uint64, size uint64) (hv.MemoryRegion, error) {
 	panic("unimplemented")

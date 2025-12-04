@@ -50,6 +50,23 @@ type bringUpQuest struct {
 	dev hv.Hypervisor
 }
 
+type resumeRunConfig struct{}
+
+// Run implements hv.RunConfig.
+func (resumeRunConfig) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
+	if err := vcpu.Run(ctx); err != nil {
+		if errors.Is(err, hv.ErrVMHalted) ||
+			errors.Is(err, hv.ErrGuestRequestedReboot) ||
+			errors.Is(err, hv.ErrYield) {
+			return nil
+		}
+
+		return err
+	}
+
+	return nil
+}
+
 func runWithTiming(name string, fn func() error) error {
 	start := time.Now()
 	err := fn()
@@ -592,7 +609,7 @@ func (q *bringUpQuest) Run() error {
 		}
 
 		// Let the virtual machine continue and yield again
-		if err := vm.Run(context.Background(), nil); err != nil {
+		if err := vm.Run(context.Background(), resumeRunConfig{}); err != nil {
 			return fmt.Errorf("run virtual machine: %w", err)
 		}
 

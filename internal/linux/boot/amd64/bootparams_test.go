@@ -15,6 +15,8 @@ type stubVM struct {
 	memoryBase uint64
 }
 
+func (s *stubVM) CaptureSnapshot() (hv.Snapshot, error)                  { panic("unimplemented") }
+func (s *stubVM) RestoreSnapshot(snap hv.Snapshot) error                 { panic("unimplemented") }
 func (s *stubVM) AddDevice(dev hv.Device) error                          { panic("unimplemented") }
 func (s *stubVM) AddDeviceFromTemplate(template hv.DeviceTemplate) error { panic("unimplemented") }
 func (s *stubVM) Close() error                                           { panic("unimplemented") }

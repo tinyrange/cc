@@ -584,6 +584,8 @@ var (
 // Snapshot Support
 
 type vcpuSnapshot struct {
+	Regs  kvmRegs
+	SRegs kvmSRegs
 }
 
 type snapshot struct {
@@ -595,9 +597,17 @@ type snapshot struct {
 func (v *virtualCPU) captureSnapshot() (vcpuSnapshot, error) {
 	var ret vcpuSnapshot
 
-	// TODO(): regs
+	regs, err := getRegisters(v.fd)
+	if err != nil {
+		return ret, fmt.Errorf("capture general registers: %w", err)
+	}
+	ret.Regs = regs
 
-	// TODO(): sregs
+	sregs, err := getSRegs(v.fd)
+	if err != nil {
+		return ret, fmt.Errorf("capture special registers: %w", err)
+	}
+	ret.SRegs = sregs
 
 	// TODO(): fpu
 
@@ -609,13 +619,17 @@ func (v *virtualCPU) captureSnapshot() (vcpuSnapshot, error) {
 
 	// TODO(): msrs
 
-	return ret, fmt.Errorf("captureSnapshot unimplemented")
+	return ret, nil
 }
 
 func (v *virtualCPU) restoreSnapshot(snap vcpuSnapshot) error {
-	// TODO(): regs
+	if err := setRegisters(v.fd, &snap.Regs); err != nil {
+		return fmt.Errorf("restore general registers: %w", err)
+	}
 
-	// TODO(): sregs
+	if err := setSRegs(v.fd, &snap.SRegs); err != nil {
+		return fmt.Errorf("restore special registers: %w", err)
+	}
 
 	// TODO(): fpu
 
@@ -627,7 +641,7 @@ func (v *virtualCPU) restoreSnapshot(snap vcpuSnapshot) error {
 
 	// TODO(): msrs
 
-	return fmt.Errorf("restoreSnapshot unimplemented")
+	return nil
 }
 
 // CaptureSnapshot implements hv.VirtualMachine.
@@ -672,6 +686,8 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 			ret.deviceSnapshots[id] = snap
 		}
 	}
+
+	// TOOD(): Memory
 
 	return ret, nil
 }
@@ -723,6 +739,8 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 			}
 		}
 	}
+
+	// TOOD(): Memory
 
 	return nil
 }
