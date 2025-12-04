@@ -611,15 +611,3 @@ var (
 	_ hv.VirtualCPUAmd64     = &virtualCPU{}
 	_ hv.VirtualMachineAmd64 = &virtualMachine{}
 )
-
-// Snapshot Support
-
-// CaptureSnapshot implements hv.VirtualMachine.
-func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
-	return nil, fmt.Errorf("CaptureSnapshot unimplemented")
-}
-
-// RestoreSnapshot implements hv.VirtualMachine.
-func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
-	return fmt.Errorf("RestoreSnapshot unimplemented")
-}

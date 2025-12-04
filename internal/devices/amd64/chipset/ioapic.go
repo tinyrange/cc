@@ -421,6 +421,67 @@ func decodeIoApicID(value uint32) uint8 {
 	return uint8((value >> 24) & 0x0f)
 }
 
+// Snapshot support ----------------------------------------------------------
+
+type ioapicEntrySnapshot struct {
+	Value     uint64
+	LineLevel bool
+}
+
+type ioapicSnapshot struct {
+	Index   uint8
+	ID      uint8
+	Entries []ioapicEntrySnapshot
+}
+
+func (i *IOAPIC) DeviceId() string { return "ioapic" }
+
+func (i *IOAPIC) CaptureSnapshot() (hv.DeviceSnapshot, error) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	snap := &ioapicSnapshot{
+		Index:   i.index,
+		ID:      i.id,
+		Entries: make([]ioapicEntrySnapshot, len(i.entries)),
+	}
+
+	for idx, entry := range i.entries {
+		snap.Entries[idx] = ioapicEntrySnapshot{
+			Value:     entry.redirection.raw(),
+			LineLevel: entry.lineLevel,
+		}
+	}
+
+	return snap, nil
+}
+
+func (i *IOAPIC) RestoreSnapshot(snap hv.DeviceSnapshot) error {
+	data, ok := snap.(*ioapicSnapshot)
+	if !ok {
+		return fmt.Errorf("ioapic: invalid snapshot type")
+	}
+
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	if len(data.Entries) != len(i.entries) {
+		return fmt.Errorf("ioapic: snapshot entry count mismatch: got %d, want %d", len(data.Entries), len(i.entries))
+	}
+
+	i.index = data.Index
+	i.id = data.ID
+
+	for idx, entry := range data.Entries {
+		i.entries[idx].redirection.setRaw(entry.Value)
+		i.entries[idx].lineLevel = entry.LineLevel
+	}
+
+	return nil
+}
+
+var _ hv.DeviceSnapshotter = (*IOAPIC)(nil)
+
 func encodeIoApicVersion(maxEntry uint8) uint32 {
 	val := uint32(ioapicVersion)
 	val |= uint32(maxEntry) << 16
