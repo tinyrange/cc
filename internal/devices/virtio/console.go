@@ -116,6 +116,25 @@ type Console struct {
 	in      io.Reader
 	mu      sync.Mutex
 	pending []byte
+	arch    hv.CpuArchitecture
+}
+
+func (vc *Console) setupDevice(vm hv.VirtualMachine) {
+	if vm != nil && vm.Hypervisor() != nil {
+		vc.arch = vm.Hypervisor().Architecture()
+	}
+	vc.device = newMMIODevice(vm, vc.base, vc.size, vc.irqLine, consoleDeviceID, consoleVendorID, consoleVersion, []uint64{virtioFeatureVersion1}, vc)
+	if mmio, ok := vc.device.(*mmioDevice); ok && vm != nil {
+		mmio.vm = vm
+	}
+}
+
+type consoleSnapshot struct {
+	Arch    hv.CpuArchitecture
+	Base    uint64
+	Size    uint64
+	IRQLine uint32
+	Pending []byte
 }
 
 // Init implements hv.MemoryMappedIODevice.
@@ -124,7 +143,7 @@ func (vc *Console) Init(vm hv.VirtualMachine) error {
 		if vm == nil {
 			return fmt.Errorf("virtio-console: virtual machine is nil")
 		}
-		vc.device = newMMIODevice(vm, vc.base, vc.size, vc.irqLine, consoleDeviceID, consoleVendorID, consoleVersion, []uint64{virtioFeatureVersion1}, vc)
+		vc.setupDevice(vm)
 		if vc.in != nil {
 			go vc.readInput()
 		}
@@ -191,7 +210,10 @@ func NewConsole(vm hv.VirtualMachine, base uint64, size uint64, irqLine uint32, 
 		out:     out,
 		in:      in,
 	}
-	console.device = newMMIODevice(vm, base, size, irqLine, consoleDeviceID, consoleVendorID, consoleVersion, []uint64{virtioFeatureVersion1}, console)
+	if vm != nil && vm.Hypervisor() != nil {
+		console.arch = vm.Hypervisor().Architecture()
+	}
+	console.setupDevice(vm)
 	if in != nil {
 		go console.readInput()
 	}
@@ -427,4 +449,49 @@ func (vc *Console) readInput() {
 var (
 	_ hv.MemoryMappedIODevice = (*Console)(nil)
 	_ deviceHandler           = (*Console)(nil)
+	_ hv.DeviceSnapshotter    = (*Console)(nil)
 )
+
+// DeviceSnapshot support ----------------------------------------------------
+
+func (vc *Console) DeviceId() string { return "virtio-console" }
+
+func (vc *Console) CaptureSnapshot() (hv.DeviceSnapshot, error) {
+	vc.mu.Lock()
+	defer vc.mu.Unlock()
+
+	snap := &consoleSnapshot{
+		Arch:    vc.arch,
+		Base:    vc.base,
+		Size:    vc.size,
+		IRQLine: vc.irqLine,
+	}
+	if len(vc.pending) > 0 {
+		snap.Pending = append([]byte(nil), vc.pending...)
+	}
+
+	return snap, nil
+}
+
+func (vc *Console) RestoreSnapshot(snap hv.DeviceSnapshot) error {
+	data, ok := snap.(*consoleSnapshot)
+	if !ok {
+		return fmt.Errorf("virtio-console: invalid snapshot type")
+	}
+
+	vc.mu.Lock()
+	defer vc.mu.Unlock()
+
+	vc.arch = data.Arch
+	vc.base = data.Base
+	vc.size = data.Size
+	vc.irqLine = data.IRQLine
+	vc.pending = append(vc.pending[:0], data.Pending...)
+
+	if mmio, ok := vc.device.(*mmioDevice); ok {
+		mmio.base = vc.base
+		mmio.size = vc.size
+	}
+
+	return nil
+}
