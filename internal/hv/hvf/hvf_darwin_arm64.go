@@ -211,12 +211,84 @@ func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.Memory
 
 // CaptureSnapshot implements hv.VirtualMachine.
 func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
-	return nil, fmt.Errorf("CaptureSnapshot unimplemented")
+	ret := &arm64Snapshot{
+		cpuStates:       make(map[int]arm64VcpuSnapshot),
+		deviceSnapshots: make(map[string]interface{}),
+	}
+
+	for i := range v.vcpus {
+		if err := v.VirtualCPUCall(i, func(vcpu hv.VirtualCPU) error {
+			state, err := vcpu.(*virtualCPU).captureSnapshot()
+			if err != nil {
+				return err
+			}
+			ret.cpuStates[i] = state
+			return nil
+		}); err != nil {
+			return nil, fmt.Errorf("hvf: capture vCPU %d snapshot: %w", i, err)
+		}
+	}
+
+	for _, dev := range v.devices {
+		if snapshotter, ok := dev.(hv.DeviceSnapshotter); ok {
+			id := snapshotter.DeviceId()
+			snap, err := snapshotter.CaptureSnapshot()
+			if err != nil {
+				return nil, fmt.Errorf("hvf: capture device %s snapshot: %w", id, err)
+			}
+			ret.deviceSnapshots[id] = snap
+		}
+	}
+
+	if len(v.memory) > 0 {
+		ret.memory = make([]byte, len(v.memory))
+		copy(ret.memory, v.memory)
+	}
+
+	return ret, nil
 }
 
 // RestoreSnapshot implements hv.VirtualMachine.
 func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
-	return fmt.Errorf("RestoreSnapshot unimplemented")
+	snapshotData, ok := snap.(*arm64Snapshot)
+	if !ok {
+		return fmt.Errorf("hvf: invalid snapshot type")
+	}
+
+	if len(v.memory) != len(snapshotData.memory) {
+		return fmt.Errorf("hvf: snapshot memory size mismatch: got %d bytes, want %d bytes", len(snapshotData.memory), len(v.memory))
+	}
+	if len(v.memory) > 0 {
+		copy(v.memory, snapshotData.memory)
+	}
+
+	for i := range v.vcpus {
+		state, ok := snapshotData.cpuStates[i]
+		if !ok {
+			return fmt.Errorf("hvf: missing vCPU %d state in snapshot", i)
+		}
+
+		if err := v.VirtualCPUCall(i, func(vcpu hv.VirtualCPU) error {
+			return vcpu.(*virtualCPU).restoreSnapshot(state)
+		}); err != nil {
+			return fmt.Errorf("hvf: restore vCPU %d snapshot: %w", i, err)
+		}
+	}
+
+	for _, dev := range v.devices {
+		if snapshotter, ok := dev.(hv.DeviceSnapshotter); ok {
+			id := snapshotter.DeviceId()
+			snapData, ok := snapshotData.deviceSnapshots[id]
+			if !ok {
+				return fmt.Errorf("hvf: missing device %s snapshot", id)
+			}
+			if err := snapshotter.RestoreSnapshot(snapData); err != nil {
+				return fmt.Errorf("hvf: restore device %s snapshot: %w", id, err)
+			}
+		}
+	}
+
+	return nil
 }
 
 func (v *virtualMachine) AddDevice(dev hv.Device) error {
@@ -387,6 +459,8 @@ type virtualCPU struct {
 	exit     *hvVcpuExit
 	runQueue chan func()
 	initErr  chan error
+
+	pendingPC *uint64
 }
 
 func (v *virtualCPU) start() {
@@ -504,22 +578,25 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		defer stopExit()
 	}
 
-	if err := hvVcpuRun(v.hostID).toError("hv_vcpu_run"); err != nil {
-		return err
-	}
-
-	switch v.exit.Reason {
-	case hvExitReasonCanceled:
-		if err := ctx.Err(); err != nil {
+	for {
+		if err := hvVcpuRun(v.hostID).toError("hv_vcpu_run"); err != nil {
 			return err
 		}
-		return context.Canceled
-	case hvExitReasonException:
-		return v.handleException()
-	case hvExitReasonVTimerActivated, hvExitReasonVTimerDeactivated:
-		return nil
-	default:
-		return fmt.Errorf("hvf: unsupported vCPU exit reason %d", v.exit.Reason)
+
+		switch v.exit.Reason {
+		case hvExitReasonCanceled:
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return context.Canceled
+		case hvExitReasonException:
+			return v.handleException()
+		case hvExitReasonVTimerActivated, hvExitReasonVTimerDeactivated:
+			// Spurious timer exits; continue running.
+			continue
+		default:
+			return fmt.Errorf("hvf: unsupported vCPU exit reason %d", v.exit.Reason)
+		}
 	}
 }
 
@@ -739,6 +816,8 @@ func (v *virtualCPU) handleDataAbort(syndrome, physAddr, virtAddr uint64) error 
 		return err
 	}
 
+	var pendingError error
+
 	data := make([]byte, access.sizeBytes)
 	if access.write {
 		value, err := v.readRegister(access.target)
@@ -750,11 +829,11 @@ func (v *virtualCPU) handleDataAbort(syndrome, physAddr, virtAddr uint64) error 
 		}
 
 		if err := dev.WriteMMIO(addr, data); err != nil {
-			return fmt.Errorf("hvf: MMIO write 0x%x (%d bytes): %w", addr, access.sizeBytes, err)
+			pendingError = fmt.Errorf("hvf: MMIO write 0x%x (%d bytes): %w", addr, access.sizeBytes, err)
 		}
 	} else {
 		if err := dev.ReadMMIO(addr, data); err != nil {
-			return fmt.Errorf("hvf: MMIO read 0x%x (%d bytes): %w", addr, access.sizeBytes, err)
+			pendingError = fmt.Errorf("hvf: MMIO read 0x%x (%d bytes): %w", addr, access.sizeBytes, err)
 		}
 
 		var tmp [8]byte
@@ -765,7 +844,11 @@ func (v *virtualCPU) handleDataAbort(syndrome, physAddr, virtAddr uint64) error 
 		}
 	}
 
-	return v.advanceProgramCounter()
+	if err := v.advanceProgramCounter(); err != nil {
+		return err
+	}
+
+	return pendingError
 }
 
 func (v *virtualCPU) findMMIODevice(addr, size uint64) (hv.MemoryMappedIODevice, error) {
@@ -821,7 +904,59 @@ func (v *virtualCPU) advanceProgramCounter() error {
 	if err != nil {
 		return fmt.Errorf("hvf: read PC: %w", err)
 	}
-	return v.writeRegister(hv.RegisterARM64Pc, pc+arm64InstructionSizeBytes)
+	newPC := pc + arm64InstructionSizeBytes
+	if err := v.writeRegister(hv.RegisterARM64Pc, newPC); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Snapshot helpers
+
+type arm64VcpuSnapshot struct {
+	Registers map[hv.Register]uint64
+}
+
+type arm64Snapshot struct {
+	cpuStates       map[int]arm64VcpuSnapshot
+	deviceSnapshots map[string]interface{}
+	memory          []byte
+}
+
+func (v *virtualCPU) captureSnapshot() (arm64VcpuSnapshot, error) {
+	regs := make(map[hv.Register]hv.RegisterValue, len(arm64GeneralRegisterMap)+len(arm64SysRegisterMap))
+	for reg := range arm64GeneralRegisterMap {
+		regs[reg] = hv.Register64(0)
+	}
+	for reg := range arm64SysRegisterMap {
+		regs[reg] = hv.Register64(0)
+	}
+
+	if err := v.GetRegisters(regs); err != nil {
+		return arm64VcpuSnapshot{}, fmt.Errorf("hvf: capture registers: %w", err)
+	}
+
+	out := arm64VcpuSnapshot{
+		Registers: make(map[hv.Register]uint64, len(regs)),
+	}
+	for reg, val := range regs {
+		out.Registers[reg] = uint64(val.(hv.Register64))
+	}
+
+	return out, nil
+}
+
+func (v *virtualCPU) restoreSnapshot(snap arm64VcpuSnapshot) error {
+	regs := make(map[hv.Register]hv.RegisterValue, len(snap.Registers))
+	for reg, val := range snap.Registers {
+		regs[reg] = hv.Register64(val)
+	}
+
+	if err := v.SetRegisters(regs); err != nil {
+		return fmt.Errorf("hvf: restore registers: %w", err)
+	}
+
+	return nil
 }
 
 var (
