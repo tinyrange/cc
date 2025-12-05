@@ -3,12 +3,14 @@ package initx
 import (
 	"encoding/binary"
 	"fmt"
+	"sync"
 	"sync/atomic"
 
 	"github.com/tinyrange/cc/internal/asm"
 	"github.com/tinyrange/cc/internal/ir"
 	"github.com/tinyrange/cc/internal/linux/defs"
 	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
+	"github.com/tinyrange/cc/internal/rtg"
 )
 
 var execVarCounter uint64
@@ -29,102 +31,318 @@ func nextHelperLabel(prefix string) ir.Label {
 	return ir.Label(fmt.Sprintf("__initx_%s_%d", prefix, id))
 }
 
+type rtgHelperSpec struct {
+	params []string
+}
+
+var (
+	rtgHelperSource = fmt.Sprintf(`package main
+func ClearRunResults(mailbox uintptr) {
+	store32(mailbox, %d, 0)
+	store32(mailbox, %d, 0)
+	store32(mailbox, %d, 0)
+	store32(mailbox, %d, 0)
+}
+
+func ReportRunResult(stage int64, detail int64) {
+	rrFd := syscall(SYS_OPENAT, %d, "/dev/mem", %d, 0)
+	if rrFd < 0 {
+		goto done
+	}
+
+	rrPtr := syscall(SYS_MMAP, 0, %d, %d, %d, rrFd, %d)
+	if rrPtr < 0 {
+		syscall(SYS_CLOSE, rrFd)
+		goto fail
+	}
+
+	store32(rrPtr, %d, detail)
+	store32(rrPtr, %d, stage)
+	syscall(SYS_MUNMAP, rrPtr, %d)
+	syscall(SYS_CLOSE, rrFd)
+	goto done
+
+fail:
+	goto done
+done:
+	return
+}
+
+func RequestSnapshot() {
+	snapFd := syscall(SYS_OPENAT, %d, "/dev/mem", %d, 0)
+	if snapFd < 0 {
+		goto done
+	}
+
+	snapPtr := syscall(SYS_MMAP, 0, %d, %d, %d, snapFd, %d)
+	if snapPtr < 0 {
+		syscall(SYS_CLOSE, snapFd)
+		goto fail
+	}
+
+	store32(snapPtr, 0, %d)
+	syscall(SYS_MUNMAP, snapPtr, %d)
+	syscall(SYS_CLOSE, snapFd)
+	goto done
+
+fail:
+	goto done
+done:
+	return
+}
+
+func Mount(source string, target string, fstype string, flags uintptr, data string, errLabel label, errVar int64) {
+	errVar = syscall(SYS_MOUNT, source, target, fstype, flags, data)
+	if errVar == %d {
+		errVar = 0
+	}
+	if errVar < 0 {
+		gotoLabel(errLabel)
+	}
+}
+
+func Mkdir(path string, mode int64, errLabel label, errVar int64) {
+	errVar = syscall(SYS_MKDIRAT, %d, path, mode)
+	if errVar == %d {
+		errVar = 0
+	}
+	if errVar < 0 {
+		gotoLabel(errLabel)
+	}
+}
+
+func Chroot(path string, errLabel label, errVar int64) {
+	errVar = syscall(SYS_CHROOT, path)
+	if errVar < 0 {
+		gotoLabel(errLabel)
+	}
+
+	errVar = syscall(SYS_CHDIR, "/")
+	if errVar < 0 {
+		gotoLabel(errLabel)
+	}
+}
+
+func SetHostname(name string, nameLen int64, errLabel label, errVar int64) {
+	errVar = syscall(SYS_SETHOSTNAME, name, nameLen)
+	if errVar < 0 {
+		gotoLabel(errLabel)
+	}
+}
+`,
+		mailboxRunResultDetailOffset,
+		mailboxRunResultStageOffset,
+		mailboxStartResultDetailOffset,
+		mailboxStartResultStageOffset,
+		linux.AT_FDCWD,
+		linux.O_RDWR|linux.O_SYNC,
+		mailboxMapSize,
+		linux.PROT_READ|linux.PROT_WRITE,
+		linux.MAP_SHARED,
+		snapshotSignalPhysAddr,
+		mailboxRunResultDetailOffset,
+		mailboxRunResultStageOffset,
+		mailboxMapSize,
+		linux.AT_FDCWD,
+		linux.O_RDWR|linux.O_SYNC,
+		mailboxMapSize,
+		linux.PROT_READ|linux.PROT_WRITE,
+		linux.MAP_SHARED,
+		snapshotSignalPhysAddr,
+		snapshotRequestValue,
+		mailboxMapSize,
+		-int64(linux.EBUSY),
+		linux.AT_FDCWD,
+		-int64(linux.EEXIST),
+	)
+
+	rtgHelperSpecs = map[string]rtgHelperSpec{
+		"ClearRunResults": {params: []string{"mailbox"}},
+		"ReportRunResult": {params: []string{"stage", "detail"}},
+		"RequestSnapshot": {params: nil},
+		"Mount":           {params: []string{"source", "target", "fstype", "flags", "data", "errLabel", "errVar"}},
+		"Mkdir":           {params: []string{"path", "mode", "errLabel", "errVar"}},
+		"Chroot":          {params: []string{"path", "errLabel", "errVar"}},
+		"SetHostname":     {params: []string{"name", "nameLen", "errLabel", "errVar"}},
+	}
+
+	rtgHelpersOnce sync.Once
+	rtgHelpers     map[string]ir.Method
+	rtgHelpersErr  error
+)
+
+func loadRtgHelpers() error {
+	rtgHelpersOnce.Do(func() {
+		prog, err := rtg.CompileProgram(rtgHelperSource)
+		if err != nil {
+			rtgHelpersErr = err
+			return
+		}
+		rtgHelpers = prog.Methods
+	})
+	return rtgHelpersErr
+}
+
+func instantiateHelper(name string, bindings map[string]any) ir.Block {
+	if err := loadRtgHelpers(); err != nil {
+		panic(fmt.Sprintf("initx: compile rtg helper %s: %v", name, err))
+	}
+
+	spec, ok := rtgHelperSpecs[name]
+	if !ok {
+		panic(fmt.Sprintf("initx: unknown rtg helper %s", name))
+	}
+	for _, param := range spec.params {
+		if _, ok := bindings[param]; !ok {
+			panic(fmt.Sprintf("initx: helper %s missing binding for %s", name, param))
+		}
+	}
+
+	method, ok := rtgHelpers[name]
+	if !ok {
+		panic(fmt.Sprintf("initx: helper %s missing compiled method", name))
+	}
+
+	return rewriteHelper(method, bindings)
+}
+
+func rewriteHelper(method ir.Method, bindings map[string]any) ir.Block {
+	var out ir.Block
+	for _, frag := range method {
+		if _, ok := frag.(ir.DeclareParam); ok {
+			continue
+		}
+		out = append(out, rewriteFragment(frag, bindings))
+	}
+	return out
+}
+
+func rewriteFragment(frag ir.Fragment, bindings map[string]any) ir.Fragment {
+	switch v := frag.(type) {
+	case ir.Block:
+		var rewritten ir.Block
+		for _, inner := range v {
+			rewritten = append(rewritten, rewriteFragment(inner, bindings))
+		}
+		return rewritten
+	case ir.AssignFragment:
+		return ir.Assign(rewriteFragment(v.Dst, bindings), rewriteFragment(v.Src, bindings))
+	case ir.SyscallFragment:
+		args := make([]ir.Fragment, len(v.Args))
+		for i, arg := range v.Args {
+			args[i] = rewriteFragment(arg, bindings)
+		}
+		return ir.SyscallFragment{Num: v.Num, Args: args}
+	case ir.IfFragment:
+		thenFrag := rewriteFragment(v.Then, bindings)
+		var elseFrag ir.Fragment
+		if v.Otherwise != nil {
+			elseFrag = rewriteFragment(v.Otherwise, bindings)
+		}
+		return ir.IfFragment{
+			Cond:      rewriteCondition(v.Cond, bindings),
+			Then:      thenFrag,
+			Otherwise: elseFrag,
+		}
+	case ir.CompareCondition:
+		return ir.CompareCondition{
+			Kind:  v.Kind,
+			Left:  rewriteFragment(v.Left, bindings),
+			Right: rewriteFragment(v.Right, bindings),
+		}
+	case ir.IsNegativeCondition:
+		return ir.IsNegativeCondition{Value: rewriteFragment(v.Value, bindings)}
+	case ir.IsZeroCondition:
+		return ir.IsZeroCondition{Value: rewriteFragment(v.Value, bindings)}
+	case ir.OpFragment:
+		return ir.OpFragment{Kind: v.Kind, Left: rewriteFragment(v.Left, bindings), Right: rewriteFragment(v.Right, bindings)}
+	case ir.GotoFragment:
+		return ir.Goto(rewriteFragment(v.Label, bindings))
+	case ir.LabelFragment:
+		return ir.LabelFragment{Label: v.Label, Block: rewriteFragment(v.Block, bindings).(ir.Block)}
+	case ir.MemVar:
+		base := v.Base
+		if repl, ok := bindings[string(v.Base)]; ok {
+			if bVar, ok := repl.(ir.Var); ok {
+				base = bVar
+			} else {
+				panic(fmt.Sprintf("initx: mem base %s requires ir.Var binding", v.Base))
+			}
+		}
+		var disp ir.Fragment
+		if v.Disp != nil {
+			disp = rewriteFragment(v.Disp, bindings)
+		}
+		return ir.MemVar{Base: base, Disp: disp, Width: v.Width}
+	case ir.Var:
+		if repl, ok := bindings[string(v)]; ok {
+			if replVar, ok := repl.(ir.Var); ok {
+				return replVar
+			}
+			return repl
+		}
+		return v
+	case ir.Label:
+		if repl, ok := bindings[string(v)]; ok {
+			if lbl, ok := repl.(ir.Label); ok {
+				return lbl
+			}
+			return repl
+		}
+		return v
+	case ir.Int64, ir.Int32, ir.Int16, ir.Int8:
+		return v
+	case string:
+		return v
+	case ir.ReturnFragment:
+		return ir.ReturnFragment{Value: rewriteFragment(v.Value, bindings)}
+	case ir.PrintfFragment:
+		args := make([]ir.Fragment, len(v.Args))
+		for i, arg := range v.Args {
+			args[i] = rewriteFragment(arg, bindings)
+		}
+		return ir.PrintfFragment{Format: v.Format, Args: args}
+	default:
+		return frag
+	}
+}
+
+func rewriteCondition(cond ir.Condition, bindings map[string]any) ir.Condition {
+	switch c := cond.(type) {
+	case ir.CompareCondition:
+		return rewriteFragment(c, bindings).(ir.CompareCondition)
+	case ir.IsNegativeCondition:
+		return rewriteFragment(c, bindings).(ir.IsNegativeCondition)
+	case ir.IsZeroCondition:
+		return rewriteFragment(c, bindings).(ir.IsZeroCondition)
+	default:
+		return cond
+	}
+}
+
 // Mailbox helpers
 
 // ClearRunResults zeros the run/start result slots so the host observes a clean
 // state once the payload completes.
 func ClearRunResults(mailbox ir.Var) ir.Fragment {
-	zero := ir.Var("__rr_zero")
-	return ir.Block{
-		ir.Assign(zero, ir.Int64(0)),
-		ir.Assign(mailbox.MemWithDisp(mailboxRunResultDetailOffset).As32(), zero.As32()),
-		ir.Assign(mailbox.MemWithDisp(mailboxRunResultStageOffset).As32(), zero.As32()),
-		ir.Assign(mailbox.MemWithDisp(mailboxStartResultDetailOffset).As32(), zero.As32()),
-		ir.Assign(mailbox.MemWithDisp(mailboxStartResultStageOffset).As32(), zero.As32()),
-	}
+	return instantiateHelper("ClearRunResults", map[string]any{
+		"mailbox": mailbox,
+	})
 }
 
 // ReportRunResult stores the provided detail/stage pair into the mailbox so the
 // host can decode the error reason.
 func ReportRunResult(stage any, detail any) ir.Fragment {
-	failed := nextHelperLabel("mailbox_fail")
-	done := nextHelperLabel("mailbox_done")
-	fd := ir.Var("__mailbox_fd")
-	ptr := ir.Var("__mailbox_ptr")
-	stageVar := ir.Var("__mailbox_stage")
-	detailVar := ir.Var("__mailbox_detail")
-	return ir.Block{
-		ir.Assign(stageVar, stage),
-		ir.Assign(detailVar, detail),
-		ir.Assign(fd, ir.Syscall(
-			defs.SYS_OPENAT,
-			ir.Int64(linux.AT_FDCWD),
-			"/dev/mem",
-			ir.Int64(linux.O_RDWR|linux.O_SYNC),
-			ir.Int64(0),
-		)),
-		ir.If(ir.IsNegative(fd), ir.Goto(done)),
-		ir.Assign(ptr, ir.Syscall(
-			defs.SYS_MMAP,
-			ir.Int64(0),
-			ir.Int64(mailboxMapSize),
-			ir.Int64(linux.PROT_READ|linux.PROT_WRITE),
-			ir.Int64(linux.MAP_SHARED),
-			fd,
-			ir.Int64(snapshotSignalPhysAddr),
-		)),
-		ir.If(ir.IsNegative(ptr), ir.Block{
-			ir.Syscall(defs.SYS_CLOSE, fd),
-			ir.Goto(failed),
-		}),
-		ir.Assign(ptr.MemWithDisp(mailboxRunResultDetailOffset).As32(), detailVar.As32()),
-		ir.Assign(ptr.MemWithDisp(mailboxRunResultStageOffset).As32(), stageVar.As32()),
-		ir.Syscall(defs.SYS_MUNMAP, ptr, ir.Int64(mailboxMapSize)),
-		ir.Syscall(defs.SYS_CLOSE, fd),
-		ir.Goto(done),
-		ir.DeclareLabel(failed, ir.Block{}),
-		ir.DeclareLabel(done, ir.Block{}),
-	}
+	return instantiateHelper("ReportRunResult", map[string]any{
+		"stage":  stage,
+		"detail": detail,
+	})
 }
 
 // RequestSnapshot asks the host to capture a snapshot by writing the dedicated
 // doorbell value to the mailbox.
 func RequestSnapshot() ir.Fragment {
-	failed := nextHelperLabel("snapshot_fail")
-	done := nextHelperLabel("snapshot_done")
-	fd := ir.Var("__snapshot_fd")
-	ptr := ir.Var("__snapshot_ptr")
-	val := ir.Var("__snapshot_signal")
-	return ir.Block{
-		ir.Assign(val, ir.Int64(snapshotRequestValue)),
-		ir.Assign(fd, ir.Syscall(
-			defs.SYS_OPENAT,
-			ir.Int64(linux.AT_FDCWD),
-			"/dev/mem",
-			ir.Int64(linux.O_RDWR|linux.O_SYNC),
-			ir.Int64(0),
-		)),
-		ir.If(ir.IsNegative(fd), ir.Goto(done)),
-		ir.Assign(ptr, ir.Syscall(
-			defs.SYS_MMAP,
-			ir.Int64(0),
-			ir.Int64(mailboxMapSize),
-			ir.Int64(linux.PROT_READ|linux.PROT_WRITE),
-			ir.Int64(linux.MAP_SHARED),
-			fd,
-			ir.Int64(snapshotSignalPhysAddr),
-		)),
-		ir.If(ir.IsNegative(ptr), ir.Block{
-			ir.Syscall(defs.SYS_CLOSE, fd),
-			ir.Goto(failed),
-		}),
-		ir.Assign(ptr.Mem().As32(), val.As32()),
-		ir.Syscall(defs.SYS_MUNMAP, ptr, ir.Int64(mailboxMapSize)),
-		ir.Syscall(defs.SYS_CLOSE, fd),
-		ir.Goto(done),
-		ir.DeclareLabel(failed, ir.Block{}),
-		ir.DeclareLabel(done, ir.Block{}),
-	}
+	return instantiateHelper("RequestSnapshot", nil)
 }
 
 // Filesystem
@@ -136,57 +354,32 @@ func Mount(
 	errLabel ir.Label,
 	errVar ir.Var,
 ) ir.Fragment {
-	return ir.Block{
-		ir.Assign(errVar, ir.Syscall(
-			defs.SYS_MOUNT,
-			source,
-			target,
-			fstype,
-			ir.Int64(int64(flags)),
-			data,
-		)),
-
-		// if the error is EBUSY, ignore
-		ir.If(ir.IsEqual(errVar, ir.Int64(-int64(linux.EBUSY))), ir.Assign(errVar, ir.Int64(0))),
-
-		// check for other errors
-		ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
-	}
+	return instantiateHelper("Mount", map[string]any{
+		"source":   source,
+		"target":   target,
+		"fstype":   fstype,
+		"flags":    flags,
+		"data":     data,
+		"errLabel": errLabel,
+		"errVar":   errVar,
+	})
 }
 
 func Mkdir(path string, mode uint32, errLabel ir.Label, errVar ir.Var) ir.Fragment {
-	return ir.Block{
-		ir.Assign(errVar, ir.Syscall(
-			defs.SYS_MKDIRAT,
-			ir.Int64(linux.AT_FDCWD),
-			path,
-			ir.Int64(int64(mode)),
-		)),
-		// check if errVar == -EEXIST, if so, ignore
-		ir.If(
-			ir.IsEqual(errVar, ir.Int64(-int64(linux.EEXIST))),
-			ir.Assign(errVar, ir.Int64(0)),
-		),
-		ir.If(
-			ir.IsNegative(errVar),
-			ir.Goto(errLabel),
-		),
-	}
+	return instantiateHelper("Mkdir", map[string]any{
+		"path":     path,
+		"mode":     int64(mode),
+		"errLabel": errLabel,
+		"errVar":   errVar,
+	})
 }
 
 func Chroot(path string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
-	return ir.Block{
-		ir.Assign(errVar, ir.Syscall(
-			defs.SYS_CHROOT,
-			path,
-		)),
-		ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
-		ir.Assign(errVar, ir.Syscall(
-			defs.SYS_CHDIR,
-			"/",
-		)),
-		ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
-	}
+	return instantiateHelper("Chroot", map[string]any{
+		"path":     path,
+		"errLabel": errLabel,
+		"errVar":   errVar,
+	})
 }
 
 // CreateFileFromStdin reads length bytes from stdin and writes them into path.
@@ -656,12 +849,10 @@ func SendProfilingEvent(basePtr ir.Var, name string) ir.Fragment {
 }
 
 func SetHostname(name string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
-	return ir.Block{
-		ir.Assign(errVar, ir.Syscall(
-			defs.SYS_SETHOSTNAME,
-			name,
-			ir.Int64(int64(len(name))),
-		)),
-		ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
-	}
+	return instantiateHelper("SetHostname", map[string]any{
+		"name":     name,
+		"nameLen":  int64(len(name)),
+		"errLabel": errLabel,
+		"errVar":   errVar,
+	})
 }

@@ -23,6 +23,8 @@ const (
 	TypeI8
 	TypeBool
 	TypeUintptr
+	TypeString
+	TypeLabel
 )
 
 type Type struct {
@@ -43,6 +45,10 @@ func (t Type) String() string {
 		return "bool"
 	case TypeUintptr:
 		return "uintptr"
+	case TypeString:
+		return "string"
+	case TypeLabel:
+		return "label"
 	default:
 		return "invalid"
 	}
@@ -155,9 +161,6 @@ func (c *Compiler) lowerFunc(fn *ast.FuncDecl) (ir.Method, error) {
 	if fn.Type.TypeParams != nil && fn.Type.TypeParams.NumFields() > 0 {
 		return nil, fmt.Errorf("rtg: type parameters are not supported (%s)", fn.Name.Name)
 	}
-	if fn.Type.Params != nil && fn.Type.Params.NumFields() > 0 {
-		return nil, fmt.Errorf("rtg: parameters are not supported (%s)", fn.Name.Name)
-	}
 
 	var retType Type
 	if fn.Type.Results != nil && fn.Type.Results.NumFields() > 0 {
@@ -189,6 +192,23 @@ func (c *Compiler) lowerFunc(fn *ast.FuncDecl) (ir.Method, error) {
 	}
 
 	var method ir.Method
+	if fn.Type.Params != nil {
+		for _, field := range fn.Type.Params.List {
+			if len(field.Names) != 1 {
+				return nil, fmt.Errorf("rtg: parameters must be named (%s)", fn.Name.Name)
+			}
+			name := field.Names[0].Name
+			typ, err := resolveType(field.Type)
+			if err != nil {
+				return nil, fmt.Errorf("rtg: parameter %s: %w", name, err)
+			}
+			if err := c.scope.define(name, typ); err != nil {
+				return nil, fmt.Errorf("rtg: parameter %s: %w", name, err)
+			}
+			method = append(method, ir.DeclareParam(name))
+		}
+	}
+
 	sawReturn := false
 	for _, stmt := range fn.Body.List {
 		frags, err := c.lowerStmt(stmt)
@@ -228,6 +248,10 @@ func resolveType(expr ast.Expr) (Type, error) {
 		return Type{Kind: TypeBool}, nil
 	case "uintptr":
 		return Type{Kind: TypeUintptr}, nil
+	case "string":
+		return Type{Kind: TypeString}, nil
+	case "label":
+		return Type{Kind: TypeLabel}, nil
 	default:
 		return Type{}, fmt.Errorf("unsupported type %q", id.Name)
 	}
@@ -243,6 +267,14 @@ func (c *Compiler) lowerStmt(stmt ast.Stmt) ([]ir.Fragment, error) {
 		return c.lowerReturn(s)
 	case *ast.DeclStmt:
 		return c.lowerDecl(s)
+	case *ast.IfStmt:
+		return c.lowerIf(s)
+	case *ast.LabeledStmt:
+		return c.lowerLabeled(s)
+	case *ast.BranchStmt:
+		return c.lowerBranch(s)
+	case *ast.EmptyStmt:
+		return nil, nil
 	default:
 		return nil, fmt.Errorf("rtg: unsupported statement %T", stmt)
 	}
@@ -331,6 +363,81 @@ func (c *Compiler) lowerAssign(assign *ast.AssignStmt) ([]ir.Fragment, error) {
 	return []ir.Fragment{ir.Assign(ir.Var(ident.Name), value)}, nil
 }
 
+func (c *Compiler) lowerIf(stmt *ast.IfStmt) ([]ir.Fragment, error) {
+	if stmt.Init != nil {
+		return nil, fmt.Errorf("rtg: if init statements are not supported")
+	}
+
+	cond, err := c.lowerCondition(stmt.Cond)
+	if err != nil {
+		return nil, err
+	}
+
+	thenBlock, err := c.lowerBlock(stmt.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if stmt.Else == nil {
+		return []ir.Fragment{ir.If(cond, thenBlock)}, nil
+	}
+
+	elseBlock, err := c.lowerElse(stmt.Else)
+	if err != nil {
+		return nil, err
+	}
+
+	return []ir.Fragment{ir.If(cond, thenBlock, elseBlock)}, nil
+}
+
+func (c *Compiler) lowerElse(stmt ast.Stmt) (ir.Fragment, error) {
+	switch s := stmt.(type) {
+	case *ast.BlockStmt:
+		return c.lowerBlock(s)
+	case *ast.IfStmt:
+		frags, err := c.lowerIf(s)
+		if err != nil {
+			return nil, err
+		}
+		if len(frags) != 1 {
+			return nil, fmt.Errorf("rtg: expected single fragment in else-if lowering")
+		}
+		return frags[0], nil
+	default:
+		return nil, fmt.Errorf("rtg: unsupported else branch %T", stmt)
+	}
+}
+
+func (c *Compiler) lowerBlock(block *ast.BlockStmt) (ir.Block, error) {
+	var frags ir.Block
+	for _, stmt := range block.List {
+		lowered, err := c.lowerStmt(stmt)
+		if err != nil {
+			return nil, err
+		}
+		frags = append(frags, lowered...)
+	}
+	return frags, nil
+}
+
+func (c *Compiler) lowerLabeled(stmt *ast.LabeledStmt) ([]ir.Fragment, error) {
+	body, err := c.lowerStmt(stmt.Stmt)
+	if err != nil {
+		return nil, err
+	}
+	return []ir.Fragment{ir.DeclareLabel(ir.Label(stmt.Label.Name), ir.Block(body))}, nil
+}
+
+func (c *Compiler) lowerBranch(stmt *ast.BranchStmt) ([]ir.Fragment, error) {
+	if stmt.Tok != token.GOTO {
+		return nil, fmt.Errorf("rtg: unsupported branch %s", stmt.Tok.String())
+	}
+	if stmt.Label == nil {
+		return nil, fmt.Errorf("rtg: goto requires a label")
+	}
+	return []ir.Fragment{ir.Goto(ir.Label(stmt.Label.Name))}, nil
+}
+
 func (c *Compiler) lowerReturn(ret *ast.ReturnStmt) ([]ir.Fragment, error) {
 	if len(ret.Results) > 1 {
 		return nil, fmt.Errorf("rtg: multiple return values are not supported")
@@ -340,8 +447,7 @@ func (c *Compiler) lowerReturn(ret *ast.ReturnStmt) ([]ir.Fragment, error) {
 		if c.returnType.Kind != TypeInvalid {
 			return nil, fmt.Errorf("rtg: return value required (expected %s)", c.returnType)
 		}
-		// Void return; terminate the method.
-		return []ir.Fragment{ir.Return(ir.Int64(0))}, nil
+		return nil, nil
 	}
 
 	if c.returnType.Kind == TypeInvalid {
@@ -381,6 +487,18 @@ func (c *Compiler) lowerCallStmt(call *ast.CallExpr) ([]ir.Fragment, error) {
 			return nil, err
 		}
 		return []ir.Fragment{frag}, nil
+	case "store32":
+		frag, err := c.lowerStore(call, 32)
+		if err != nil {
+			return nil, err
+		}
+		return []ir.Fragment{frag}, nil
+	case "gotoLabel":
+		frag, err := c.lowerGotoCall(call)
+		if err != nil {
+			return nil, err
+		}
+		return []ir.Fragment{frag}, nil
 	default:
 		return nil, fmt.Errorf("rtg: unsupported call %q", target.Name)
 	}
@@ -398,6 +516,8 @@ func (c *Compiler) lowerExpr(expr ast.Expr) (ir.Fragment, Type, error) {
 		return c.lowerExprCall(v)
 	case *ast.ParenExpr:
 		return c.lowerExpr(v.X)
+	case *ast.UnaryExpr:
+		return c.lowerUnary(v)
 	default:
 		return nil, Type{}, fmt.Errorf("rtg: unsupported expression %T", expr)
 	}
@@ -412,7 +532,11 @@ func (c *Compiler) lowerBasicLit(lit *ast.BasicLit) (ir.Fragment, Type, error) {
 		}
 		return ir.Int64(val), Type{Kind: TypeI64}, nil
 	case token.STRING:
-		return nil, Type{}, fmt.Errorf("string literals are only allowed in printf calls")
+		val, err := strconv.Unquote(lit.Value)
+		if err != nil {
+			return nil, Type{}, fmt.Errorf("invalid string literal %q: %w", lit.Value, err)
+		}
+		return val, Type{Kind: TypeString}, nil
 	default:
 		return nil, Type{}, fmt.Errorf("unsupported literal %s", lit.Kind.String())
 	}
@@ -420,6 +544,9 @@ func (c *Compiler) lowerBasicLit(lit *ast.BasicLit) (ir.Fragment, Type, error) {
 
 func (c *Compiler) lowerIdent(id *ast.Ident) (ir.Fragment, Type, error) {
 	if typ, ok := c.scope.lookup(id.Name); ok {
+		if typ.Kind == TypeLabel {
+			return ir.Label(id.Name), typ, nil
+		}
 		return ir.Var(id.Name), typ, nil
 	}
 	switch id.Name {
@@ -429,6 +556,22 @@ func (c *Compiler) lowerIdent(id *ast.Ident) (ir.Fragment, Type, error) {
 		return ir.Int64(0), Type{Kind: TypeBool}, nil
 	default:
 		return nil, Type{}, fmt.Errorf("rtg: unknown identifier %q", id.Name)
+	}
+}
+
+func (c *Compiler) lowerUnary(expr *ast.UnaryExpr) (ir.Fragment, Type, error) {
+	switch expr.Op {
+	case token.SUB:
+		if val, err := c.evalInt(expr.X); err == nil {
+			return ir.Int64(-val), Type{Kind: TypeI64}, nil
+		}
+		val, typ, err := c.lowerExpr(expr.X)
+		if err != nil {
+			return nil, Type{}, err
+		}
+		return ir.Op(ir.OpSub, ir.Int64(0), val), typ, nil
+	default:
+		return nil, Type{}, fmt.Errorf("rtg: unsupported unary operator %s", expr.Op)
 	}
 }
 
@@ -451,6 +594,39 @@ func (c *Compiler) lowerBinary(expr *ast.BinaryExpr) (ir.Fragment, Type, error) 
 	}
 
 	return ir.Op(op, left, right), lType, nil
+}
+
+func (c *Compiler) lowerCondition(expr ast.Expr) (ir.Condition, error) {
+	switch v := expr.(type) {
+	case *ast.BinaryExpr:
+		kind, ok := comparisonOps[v.Op]
+		if !ok {
+			return nil, fmt.Errorf("rtg: unsupported comparison %s", v.Op)
+		}
+		left, lType, err := c.lowerExpr(v.X)
+		if err != nil {
+			return nil, err
+		}
+		right, rType, err := c.lowerExpr(v.Y)
+		if err != nil {
+			return nil, err
+		}
+		if !typesCompatible(lType, rType) {
+			return nil, fmt.Errorf("rtg: type mismatch in comparison (%s vs %s)", lType, rType)
+		}
+		return ir.CompareCondition{Kind: kind, Left: left, Right: right}, nil
+	default:
+		val, typ, err := c.lowerExpr(expr)
+		if err != nil {
+			return nil, err
+		}
+		switch typ.Kind {
+		case TypeBool, TypeI64, TypeUintptr:
+			return ir.IsNotEqual(val, ir.Int64(0)), nil
+		default:
+			return nil, fmt.Errorf("rtg: unsupported condition type %s", typ)
+		}
+	}
 }
 
 func (c *Compiler) lowerExprCall(call *ast.CallExpr) (ir.Fragment, Type, error) {
@@ -485,6 +661,97 @@ func (c *Compiler) lowerSyscall(call *ast.CallExpr) (ir.Fragment, Type, error) {
 	}
 
 	return ir.Syscall(num, args...), Type{Kind: TypeI64}, nil
+}
+
+func (c *Compiler) lowerGotoCall(call *ast.CallExpr) (ir.Fragment, error) {
+	if len(call.Args) != 1 {
+		return nil, fmt.Errorf("rtg: gotoLabel expects a single label argument")
+	}
+	arg, typ, err := c.lowerExpr(call.Args[0])
+	if err != nil {
+		return nil, err
+	}
+	if typ.Kind != TypeLabel {
+		return nil, fmt.Errorf("rtg: gotoLabel requires a label argument")
+	}
+	return ir.Goto(arg), nil
+}
+
+func (c *Compiler) lowerStore(call *ast.CallExpr, width int) (ir.Fragment, error) {
+	if len(call.Args) != 3 {
+		return nil, fmt.Errorf("rtg: store%d expects (ptr, offset, value)", width)
+	}
+
+	mem, err := c.lowerMemRef(call.Args[0], call.Args[1], width)
+	if err != nil {
+		return nil, err
+	}
+	value, _, err := c.lowerExpr(call.Args[2])
+	if err != nil {
+		return nil, err
+	}
+
+	return ir.Assign(mem, value), nil
+}
+
+func (c *Compiler) lowerMemRef(ptr ast.Expr, offset ast.Expr, width int) (ir.Fragment, error) {
+	base, disp, err := c.extractPointer(ptr, offset)
+	if err != nil {
+		return nil, err
+	}
+
+	mem := ir.Var(base).Mem()
+	if disp != nil {
+		mem = mem.WithDisp(disp).(ir.MemVar)
+	}
+
+	switch width {
+	case 32:
+		return mem.As32(), nil
+	default:
+		return nil, fmt.Errorf("rtg: unsupported store width %d", width)
+	}
+}
+
+func (c *Compiler) extractPointer(ptr ast.Expr, offset ast.Expr) (string, ir.Fragment, error) {
+	base, err := c.pointerBase(ptr)
+	if err != nil {
+		return "", nil, err
+	}
+	offVal, err := c.evalInt(offset)
+	if err != nil {
+		return "", nil, fmt.Errorf("rtg: pointer offset: %w", err)
+	}
+	var disp ir.Fragment
+	if offVal != 0 {
+		disp = ir.Int64(offVal)
+	}
+	return base, disp, nil
+}
+
+func (c *Compiler) pointerBase(expr ast.Expr) (string, error) {
+	switch v := expr.(type) {
+	case *ast.Ident:
+		typ, ok := c.scope.lookup(v.Name)
+		if !ok {
+			return "", fmt.Errorf("rtg: unknown pointer %q", v.Name)
+		}
+		if typ.Kind != TypeUintptr && typ.Kind != TypeI64 {
+			return "", fmt.Errorf("rtg: %s is not a pointer", v.Name)
+		}
+		return v.Name, nil
+	case *ast.BinaryExpr:
+		if v.Op != token.ADD && v.Op != token.SUB {
+			return "", fmt.Errorf("rtg: pointer arithmetic only supports + or -")
+		}
+		base, err := c.pointerBase(v.X)
+		if err == nil {
+			return base, nil
+		}
+		return c.pointerBase(v.Y)
+	default:
+		return "", fmt.Errorf("rtg: unsupported pointer expression %T", expr)
+	}
 }
 
 func (c *Compiler) lowerPrintf(call *ast.CallExpr) ([]ir.Fragment, error) {
@@ -561,7 +828,13 @@ func (c *Compiler) evalSyscallNumber(expr ast.Expr) (defs.Syscall, error) {
 }
 
 func typesCompatible(left, right Type) bool {
-	return left.Kind == right.Kind
+	if left.Kind == right.Kind {
+		return true
+	}
+	if (left.Kind == TypeUintptr && right.Kind == TypeI64) || (left.Kind == TypeI64 && right.Kind == TypeUintptr) {
+		return true
+	}
+	return false
 }
 
 var binaryOps = map[token.Token]ir.OpKind{
@@ -574,13 +847,29 @@ var binaryOps = map[token.Token]ir.OpKind{
 	token.AND: ir.OpAnd,
 }
 
+var comparisonOps = map[token.Token]ir.CompareKind{
+	token.EQL: ir.CompareEqual,
+	token.NEQ: ir.CompareNotEqual,
+	token.LSS: ir.CompareLess,
+	token.LEQ: ir.CompareLessOrEqual,
+	token.GTR: ir.CompareGreater,
+	token.GEQ: ir.CompareGreaterOrEqual,
+}
+
 var syscallNames = map[string]defs.Syscall{
-	"SYS_EXIT":       defs.SYS_EXIT,
-	"SYS_EXIT_GROUP": defs.SYS_EXIT_GROUP,
-	"SYS_WRITE":      defs.SYS_WRITE,
-	"SYS_READ":       defs.SYS_READ,
-	"SYS_OPENAT":     defs.SYS_OPENAT,
-	"SYS_CLOSE":      defs.SYS_CLOSE,
+	"SYS_EXIT":        defs.SYS_EXIT,
+	"SYS_EXIT_GROUP":  defs.SYS_EXIT_GROUP,
+	"SYS_WRITE":       defs.SYS_WRITE,
+	"SYS_READ":        defs.SYS_READ,
+	"SYS_OPENAT":      defs.SYS_OPENAT,
+	"SYS_CLOSE":       defs.SYS_CLOSE,
+	"SYS_MMAP":        defs.SYS_MMAP,
+	"SYS_MUNMAP":      defs.SYS_MUNMAP,
+	"SYS_MOUNT":       defs.SYS_MOUNT,
+	"SYS_MKDIRAT":     defs.SYS_MKDIRAT,
+	"SYS_CHROOT":      defs.SYS_CHROOT,
+	"SYS_CHDIR":       defs.SYS_CHDIR,
+	"SYS_SETHOSTNAME": defs.SYS_SETHOSTNAME,
 }
 
 // FormatErrors joins multiple errors when tests want deterministic output.
