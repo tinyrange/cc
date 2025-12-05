@@ -1410,9 +1410,9 @@ func (vm *VirtualMachine) buildFdt(
 	s.propStr("compatible", "riscv")
 
 	isaString := "rv64"
-	for i := 0; i < 26; i++ {
+	for i := range 26 {
 		if vm.misa&(1<<i) != 0 {
-			isaString += string('a' + i)
+			isaString += string(rune('a' + i))
 		}
 	}
 	s.propStr("riscv,isa", isaString)
