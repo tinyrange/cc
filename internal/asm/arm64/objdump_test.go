@@ -1,10 +1,14 @@
 package arm64
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/tinyrange/cc/internal/asm"
 	"github.com/tinyrange/cc/internal/asm/testutil"
+	"github.com/tinyrange/cc/internal/hv"
+	"github.com/tinyrange/cc/internal/linux/defs"
+	"github.com/tinyrange/cc/internal/linux/syscallnum"
 )
 
 func TestKitchenSinkDisassemblyARM64(t *testing.T) {
@@ -121,8 +125,9 @@ func buildARM64KitchenSink() (asm.Fragment, []testutil.Expectation) {
 	builder.add("call_reg", "blr", CallReg(Reg64(X29)), "x29")
 	builder.add("hvc", "hvc", Hvc(), "#0")
 
-	builder.addMulti(Syscall(0x80, asm.Immediate(5)),
-		testutil.Expectation{Name: "syscall_mov_imm", Mnemonic: "mov", Contains: []string{"x8", "#0x80"}},
+	sysGetSockName := fmt.Sprintf("#0x%x", syscallnum.MustNumber(hv.ArchitectureARM64, defs.SYS_GETSOCKNAME))
+	builder.addMulti(Syscall(defs.SYS_GETSOCKNAME, asm.Immediate(5)),
+		testutil.Expectation{Name: "syscall_mov_imm", Mnemonic: "mov", Contains: []string{"x8", sysGetSockName}},
 		testutil.Expectation{Name: "syscall_arg", Mnemonic: "mov", Contains: []string{"x0", "#0x5"}},
 		testutil.Expectation{Name: "syscall_svc", Mnemonic: "svc", Contains: []string{"#0"}},
 	)
