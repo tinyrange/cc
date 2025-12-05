@@ -285,6 +285,8 @@ func (d *AlpineDownloader) SetForArchitecture(arch hv.CpuArchitecture, cacheDir 
 			d.Arch = "x86_64"
 		case hv.ArchitectureARM64:
 			d.Arch = "aarch64"
+		case hv.ArchitectureRISCV64:
+			d.Arch = "riscv64"
 		default:
 			return fmt.Errorf("unsupported architecture for Alpine Linux: %v", arch)
 		}

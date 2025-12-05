@@ -109,6 +109,25 @@ func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 
 		for range p.MaxLoopIterations {
 			if err := vcpu.Run(ctx); err != nil {
+			return fmt.Errorf("run vCPU: %w", err)
+		}
+	}
+
+	return fmt.Errorf("maximum loop iterations (%d) exceeded", p.MaxLoopIterations)
+	case hv.ArchitectureRISCV64:
+		if p.Mode != Mode64BitIdentityMapping {
+			return fmt.Errorf("unsupported load mode %v for architecture %v", p.Mode, arch)
+		}
+
+		regs := map[hv.Register]hv.RegisterValue{
+			hv.RegisterRISCVPc: hv.Register64(p.BaseAddr),
+		}
+		if err := vcpu.SetRegisters(regs); err != nil {
+			return fmt.Errorf("set initial registers: %w", err)
+		}
+
+		for range p.MaxLoopIterations {
+			if err := vcpu.Run(ctx); err != nil {
 				return fmt.Errorf("run vCPU: %w", err)
 			}
 		}
@@ -127,6 +146,8 @@ func (p *ProgramLoader) Load(vm hv.VirtualMachine) error {
 		target = hv.ArchitectureX86_64
 	case hv.ArchitectureARM64:
 		target = hv.ArchitectureARM64
+	case hv.ArchitectureRISCV64:
+		target = hv.ArchitectureRISCV64
 	default:
 		return fmt.Errorf("unsupported architecture: %v", vm.Hypervisor().Architecture())
 	}

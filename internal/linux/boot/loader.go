@@ -227,6 +227,8 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 	case hv.ArchitectureARM64:
 		cmdlineStr := strings.Join(cmdlineBase, " ")
 		return l.loadARM64(vm, kernelReader, kernelSize, cmdlineStr, initrd, virtioNodes)
+	case hv.ArchitectureRISCV64:
+		return fmt.Errorf("linux loader for riscv64 is not implemented yet (pending kernel/initrd support)")
 	default:
 		return fmt.Errorf("unsupported architecture: %v", arch)
 	}
@@ -264,6 +266,8 @@ func (l *LinuxLoader) buildInitPayload(arch hv.CpuArchitecture) ([]byte, error) 
 		}
 
 		return payload, nil
+	case hv.ArchitectureRISCV64:
+		return nil, fmt.Errorf("init payload for riscv64 is not implemented yet")
 	default:
 		return nil, fmt.Errorf("unsupported architecture for init payload: %s", arch)
 	}

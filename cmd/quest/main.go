@@ -11,11 +11,13 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/tinyrange/cc/internal/asm"
 	"github.com/tinyrange/cc/internal/asm/amd64"
 	"github.com/tinyrange/cc/internal/asm/arm64"
+	riscvasm "github.com/tinyrange/cc/internal/asm/riscv"
 	amd64serial "github.com/tinyrange/cc/internal/devices/amd64/serial"
 	"github.com/tinyrange/cc/internal/devices/virtio"
 	"github.com/tinyrange/cc/internal/hv"
@@ -25,6 +27,7 @@ import (
 	"github.com/tinyrange/cc/internal/ir"
 	amd64ir "github.com/tinyrange/cc/internal/ir/amd64"
 	arm64ir "github.com/tinyrange/cc/internal/ir/arm64"
+	_ "github.com/tinyrange/cc/internal/ir/riscv"
 	"github.com/tinyrange/cc/internal/linux/boot"
 	"github.com/tinyrange/cc/internal/linux/defs"
 	amd64defs "github.com/tinyrange/cc/internal/linux/defs/amd64"
@@ -37,6 +40,7 @@ const (
 	arm64MessageBuf       = 0x2000
 	arm64UARTMMIOBase     = 0x09000000
 	arm64SnapshotMMIOAddr = 0xf0000000
+	riscvMemoryBase       = 0x80000000
 )
 
 const (
@@ -48,7 +52,19 @@ const (
 var arm64VectorTableBytes = mustBuildArm64VectorTable()
 
 type bringUpQuest struct {
-	dev hv.Hypervisor
+	dev          hv.Hypervisor
+	riscv        hv.Hypervisor
+	architecture hv.CpuArchitecture
+}
+
+func (q *bringUpQuest) hypervisorForArch(arch hv.CpuArchitecture) hv.Hypervisor {
+	if q.dev != nil && q.dev.Architecture() == arch {
+		return q.dev
+	}
+	if q.riscv != nil && q.riscv.Architecture() == arch {
+		return q.riscv
+	}
+	return nil
 }
 
 type resumeRunConfig struct{}
@@ -84,8 +100,36 @@ func linuxMemoryBaseForArch(arch hv.CpuArchitecture) uint64 {
 	switch arch {
 	case hv.ArchitectureARM64:
 		return 0x80000000
+	case hv.ArchitectureRISCV64:
+		return riscvMemoryBase
 	default:
 		return 0
+	}
+}
+
+func hostArchitecture() (hv.CpuArchitecture, error) {
+	switch runtime.GOARCH {
+	case "amd64":
+		return hv.ArchitectureX86_64, nil
+	case "arm64":
+		return hv.ArchitectureARM64, nil
+	default:
+		return hv.ArchitectureInvalid, fmt.Errorf("unsupported host architecture %q", runtime.GOARCH)
+	}
+}
+
+func parseArchitecture(value string) (hv.CpuArchitecture, error) {
+	switch value {
+	case "", "all":
+		return hv.ArchitectureInvalid, nil
+	case "x86_64", "amd64":
+		return hv.ArchitectureX86_64, nil
+	case "arm64", "aarch64":
+		return hv.ArchitectureARM64, nil
+	case "riscv64":
+		return hv.ArchitectureRISCV64, nil
+	default:
+		return hv.ArchitectureInvalid, fmt.Errorf("unknown architecture %q", value)
 	}
 }
 
@@ -136,11 +180,10 @@ func (q *bringUpQuest) runTask(name string, f func() error) error {
 }
 
 func (q *bringUpQuest) runArchitectureTask(name string, arch hv.CpuArchitecture, f func() error) error {
-	if q.dev == nil {
-		return fmt.Errorf("hypervisor device not initialized")
+	if q.architecture != hv.ArchitectureInvalid && q.architecture != arch {
+		return nil
 	}
-
-	if arch != q.dev.Architecture() {
+	if q.hypervisorForArch(arch) == nil {
 		return nil
 	}
 
@@ -155,9 +198,19 @@ func (q *bringUpQuest) runVMTask(
 	devs ...hv.Device,
 ) error {
 	return q.runArchitectureTask(name, arch, func() error {
+		dev := q.hypervisorForArch(arch)
+		if dev == nil {
+			return fmt.Errorf("hypervisor not initialized for %s", arch)
+		}
+
+		baseAddr := uint64(0)
+		if arch == hv.ArchitectureRISCV64 {
+			baseAddr = linuxMemoryBaseForArch(arch)
+		}
+
 		loader := helpers.ProgramLoader{
 			Program:           prog,
-			BaseAddr:          0,
+			BaseAddr:          baseAddr,
 			Mode:              helpers.Mode64BitIdentityMapping,
 			MaxLoopIterations: 128,
 		}
@@ -165,10 +218,10 @@ func (q *bringUpQuest) runVMTask(
 			arm64ExceptionVectorInit(&loader)
 		}
 
-		vm, err := q.dev.NewVirtualMachine(hv.SimpleVMConfig{
+		vm, err := dev.NewVirtualMachine(hv.SimpleVMConfig{
 			NumCPUs: 1,
 			MemSize: 64 * 1024 * 1024,
-			MemBase: 0,
+			MemBase: baseAddr,
 
 			VMLoader: &loader,
 		})
@@ -205,9 +258,19 @@ func (q *bringUpQuest) runVMTaskWithTimeout(
 	devs ...hv.Device,
 ) error {
 	return q.runArchitectureTask(name, arch, func() error {
+		dev := q.hypervisorForArch(arch)
+		if dev == nil {
+			return fmt.Errorf("hypervisor not initialized for %s", arch)
+		}
+
+		baseAddr := uint64(0)
+		if arch == hv.ArchitectureRISCV64 {
+			baseAddr = linuxMemoryBaseForArch(arch)
+		}
+
 		loader := helpers.ProgramLoader{
 			Program:           prog,
-			BaseAddr:          0,
+			BaseAddr:          baseAddr,
 			Mode:              helpers.Mode64BitIdentityMapping,
 			MaxLoopIterations: 128,
 		}
@@ -215,10 +278,10 @@ func (q *bringUpQuest) runVMTaskWithTimeout(
 			arm64ExceptionVectorInit(&loader)
 		}
 
-		vm, err := q.dev.NewVirtualMachine(hv.SimpleVMConfig{
+		vm, err := dev.NewVirtualMachine(hv.SimpleVMConfig{
 			NumCPUs: 1,
 			MemSize: 64 * 1024 * 1024,
-			MemBase: 0,
+			MemBase: baseAddr,
 
 			VMLoader: &loader,
 		})
@@ -267,6 +330,11 @@ func (q *bringUpQuest) runVMTaskWithTimeout(
 func (q *bringUpQuest) Run() error {
 	slog.Info("Starting Bringup Quest")
 
+	hostArch, err := hostArchitecture()
+	if err != nil {
+		return fmt.Errorf("detect host architecture: %w", err)
+	}
+
 	if err := q.runTask("Compile x86_64 test program", func() error {
 		frag, err := amd64ir.Compile(ir.Method{
 			ir.Printf("bringup-quest-ok\n"),
@@ -301,17 +369,38 @@ func (q *bringUpQuest) Run() error {
 		return err
 	}
 
-	if err := runWithTiming("Open Hypervisor", func() error {
-		dev, err := factory.Open()
-		if err != nil {
-			return err
+	if q.architecture != hv.ArchitectureRISCV64 {
+		if err := runWithTiming("Open Hypervisor", func() error {
+			dev, err := factory.Open()
+			if err != nil {
+				return err
+			}
+			q.dev = dev
+			return nil
+		}); err != nil {
+			return fmt.Errorf("open hypervisor factory: %w", err)
 		}
-		q.dev = dev
-		return nil
-	}); err != nil {
-		return fmt.Errorf("open hypervisor factory: %w", err)
+		defer q.dev.Close()
+		if q.architecture != hv.ArchitectureInvalid && q.architecture != q.dev.Architecture() {
+			return fmt.Errorf("requested architecture %s not available on this host (%s)", q.architecture, hostArch)
+		}
 	}
-	defer q.dev.Close()
+
+	if q.architecture == hv.ArchitectureInvalid || q.architecture == hv.ArchitectureRISCV64 {
+		if err := q.runTask("Open RISC-V Hypervisor", func() error {
+			dev, err := factory.NewWithArchitecture(hv.ArchitectureRISCV64)
+			if err != nil {
+				return err
+			}
+			q.riscv = dev
+			return nil
+		}); err != nil {
+			return fmt.Errorf("open riscv hypervisor: %w", err)
+		}
+		if q.riscv != nil {
+			defer q.riscv.Close()
+		}
+	}
 
 	if err := q.runVMTask("HLT Test", hv.ArchitectureX86_64, ir.Program{
 		Entrypoint: "main",
@@ -749,6 +838,82 @@ func (q *bringUpQuest) Run() error {
 		return err
 	}
 
+	if err := q.runVMTask("HLT Test", hv.ArchitectureRISCV64, ir.Program{
+		Entrypoint: "main",
+		Methods: map[string]ir.Method{
+			"main": {
+				riscvasm.Halt(),
+			},
+		},
+	}, func(cpu hv.VirtualCPU) error {
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if err := q.runVMTask("Addition Test", hv.ArchitectureRISCV64, ir.Program{
+		Entrypoint: "main",
+		Methods: map[string]ir.Method{
+			"main": {
+				riscvasm.MovImmediate(riscvasm.Reg64(riscvasm.X5), 40),
+				riscvasm.AddRegImm(riscvasm.Reg64(riscvasm.X5), 2),
+				riscvasm.Halt(),
+			},
+		},
+	}, func(cpu hv.VirtualCPU) error {
+		regs := map[hv.Register]hv.RegisterValue{
+			hv.RegisterRISCVX5: hv.Register64(0),
+		}
+
+		if err := cpu.GetRegisters(regs); err != nil {
+			return fmt.Errorf("get X5 register: %w", err)
+		}
+
+		x5 := uint64(regs[hv.RegisterRISCVX5].(hv.Register64))
+		if x5 != 42 {
+			return fmt.Errorf("unexpected X5 value: got %d, want 42", x5)
+		}
+
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if err := q.runVMTask("Memory Read/Write Test", hv.ArchitectureRISCV64, ir.Program{
+		Entrypoint: "main",
+		Methods: map[string]ir.Method{
+			"main": {
+				riscvasm.MovImmediate(riscvasm.Reg64(riscvasm.X10), int64(riscvMemoryBase+0x1000)),
+				riscvasm.MovImmediate(riscvasm.Reg64(riscvasm.X11), 0xcafebabe),
+				riscvasm.MovToMemory(riscvasm.Reg64(riscvasm.X10), riscvasm.Reg64(riscvasm.X11), 0),
+				riscvasm.MovFromMemory(riscvasm.Reg64(riscvasm.X12), riscvasm.Reg64(riscvasm.X10), 0),
+				riscvasm.Halt(),
+			},
+		},
+	}, func(cpu hv.VirtualCPU) error {
+		regs := map[hv.Register]hv.RegisterValue{
+			hv.RegisterRISCVX10: hv.Register64(0),
+			hv.RegisterRISCVX11: hv.Register64(0),
+			hv.RegisterRISCVX12: hv.Register64(0),
+		}
+
+		if err := cpu.GetRegisters(regs); err != nil {
+			return fmt.Errorf("get riscv registers: %w", err)
+		}
+
+		if val := uint64(regs[hv.RegisterRISCVX11].(hv.Register64)); val != 0xcafebabe {
+			return fmt.Errorf("unexpected X11 value: got 0x%08x, want 0xcafebabe", val)
+		}
+
+		if val := uint64(regs[hv.RegisterRISCVX12].(hv.Register64)); val != 0xcafebabe {
+			return fmt.Errorf("unexpected X12 value: got 0x%08x, want 0xcafebabe", val)
+		}
+
+		return nil
+	}); err != nil {
+		return err
+	}
+
 	const arm64MMIOMessage asm.Variable = 201
 	arm64Loop := asm.Label("arm64_mmio_loop")
 	arm64Done := asm.Label("arm64_mmio_done")
@@ -961,12 +1126,26 @@ func (q *bringUpQuest) Run() error {
 func (q *bringUpQuest) RunLinux() error {
 	slog.Info("Starting Bringup Quest: Linux Boot")
 
-	dev, err := factory.Open()
+	hostArch, err := hostArchitecture()
+	if err != nil {
+		return fmt.Errorf("detect host architecture: %w", err)
+	}
+
+	targetArch := q.architecture
+	if targetArch == hv.ArchitectureInvalid {
+		targetArch = hostArch
+	}
+
+	dev, err := factory.OpenWithArchitecture(targetArch)
 	if err != nil {
 		return fmt.Errorf("open hypervisor factory: %w", err)
 	}
 	q.dev = dev
 	defer q.dev.Close()
+
+	if targetArch != q.dev.Architecture() {
+		return fmt.Errorf("linux boot requested for %s but host hypervisor is %s", targetArch, q.dev.Architecture())
+	}
 
 	buf := &bytes.Buffer{}
 	var cmdline []string
@@ -984,6 +1163,11 @@ func (q *bringUpQuest) RunLinux() error {
 			"panic=-1",
 			"tsc=reliable",
 			"tsc_early_khz=3000000",
+		}
+	case hv.ArchitectureRISCV64:
+		cmdline = []string{
+			"console=hvc0",
+			"panic=-1",
 		}
 	default:
 		return fmt.Errorf("unsupported architecture for linux boot: %s", q.dev.Architecture())
@@ -1052,6 +1236,22 @@ func (q *bringUpQuest) RunLinux() error {
 					},
 				}, nil
 			case hv.ArchitectureARM64:
+				return &ir.Program{
+					Entrypoint: "main",
+					Methods: map[string]ir.Method{
+						"main": {
+							ir.Printf("Hello, World\n"),
+							ir.Syscall(
+								defs.SYS_REBOOT,
+								ir.Int64(amd64defs.LINUX_REBOOT_MAGIC1),
+								ir.Int64(amd64defs.LINUX_REBOOT_MAGIC2),
+								ir.Int64(amd64defs.LINUX_REBOOT_CMD_RESTART),
+								ir.Int64(0),
+							),
+						},
+					},
+				}, nil
+			case hv.ArchitectureRISCV64:
 				return &ir.Program{
 					Entrypoint: "main",
 					Methods: map[string]ir.Method{
@@ -1230,13 +1430,33 @@ func main() {
 	initX := fs.Bool("initx", false, "Run bringup tests for initx")
 	exec := fs.String("exec", "", "Run the executable using initx")
 	debug := fs.Bool("debug", false, "Enable debug logging")
+	hostArch, err := hostArchitecture()
+	if err != nil {
+		slog.Error("failed to determine host architecture", "error", err)
+		os.Exit(1)
+	}
+	archFlag := fs.String("arch", string(hostArch), "Architecture to run (x86_64|arm64|riscv64|all)")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		slog.Error("failed to parse flags", "error", err)
 		os.Exit(1)
 	}
 
-	q := &bringUpQuest{}
+	selectedArch, err := parseArchitecture(*archFlag)
+	if err != nil {
+		slog.Error("invalid architecture", "arch", *archFlag, "error", err)
+		os.Exit(1)
+	}
+	if selectedArch != hv.ArchitectureInvalid &&
+		selectedArch != hv.ArchitectureRISCV64 &&
+		selectedArch != hostArch {
+		slog.Error("requested architecture not supported on this host", "arch", selectedArch, "host", hostArch)
+		os.Exit(1)
+	}
+
+	q := &bringUpQuest{
+		architecture: selectedArch,
+	}
 
 	if *initX {
 		if err := RunInitX(*debug); err != nil {

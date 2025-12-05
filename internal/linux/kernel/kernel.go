@@ -62,15 +62,25 @@ type Kernel interface {
 type alpineKernel struct {
 	pkg *alpine.AlpinePackage
 
+	arch hv.CpuArchitecture
+
 	dependsList  map[string][]string
 	modulePrefix string
 }
 
 func (k *alpineKernel) Open() (File, error) {
+	if k.arch == hv.ArchitectureRISCV64 {
+		return k.pkg.Open("boot/vmlinuz-lts")
+	}
+
 	return k.pkg.Open("boot/vmlinuz-virt")
 }
 
 func (k *alpineKernel) Size() (int64, error) {
+	if k.arch == hv.ArchitectureRISCV64 {
+		return k.pkg.Size("boot/vmlinuz-lts")
+	}
+
 	return k.pkg.Size("boot/vmlinuz-virt")
 }
 
@@ -350,12 +360,18 @@ func LoadForArchitecture(arch hv.CpuArchitecture) (Kernel, error) {
 		return nil, err
 	}
 
-	pkg, err := dl.Download("linux-virt")
+	pkgName := "linux-virt"
+	if arch == hv.ArchitectureRISCV64 {
+		pkgName = "linux-lts"
+	}
+
+	pkg, err := dl.Download(pkgName)
 	if err != nil {
 		return nil, err
 	}
 
 	return &alpineKernel{
-		pkg: pkg,
+		arch: arch,
+		pkg:  pkg,
 	}, nil
 }

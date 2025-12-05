@@ -22,6 +22,7 @@ const (
 	ArchitectureInvalid CpuArchitecture = "invalid"
 	ArchitectureX86_64  CpuArchitecture = "x86_64"
 	ArchitectureARM64   CpuArchitecture = "arm64"
+	ArchitectureRISCV64 CpuArchitecture = "riscv64"
 )
 
 type RegisterValue interface {
@@ -97,6 +98,41 @@ const (
 	RegisterARM64Pstate
 	RegisterARM64Vbar
 	RegisterARM64GicrBase
+
+	// RISC-V General-Purpose Registers
+	RegisterRISCVX0
+	RegisterRISCVX1
+	RegisterRISCVX2
+	RegisterRISCVX3
+	RegisterRISCVX4
+	RegisterRISCVX5
+	RegisterRISCVX6
+	RegisterRISCVX7
+	RegisterRISCVX8
+	RegisterRISCVX9
+	RegisterRISCVX10
+	RegisterRISCVX11
+	RegisterRISCVX12
+	RegisterRISCVX13
+	RegisterRISCVX14
+	RegisterRISCVX15
+	RegisterRISCVX16
+	RegisterRISCVX17
+	RegisterRISCVX18
+	RegisterRISCVX19
+	RegisterRISCVX20
+	RegisterRISCVX21
+	RegisterRISCVX22
+	RegisterRISCVX23
+	RegisterRISCVX24
+	RegisterRISCVX25
+	RegisterRISCVX26
+	RegisterRISCVX27
+	RegisterRISCVX28
+	RegisterRISCVX29
+	RegisterRISCVX30
+	RegisterRISCVX31
+	RegisterRISCVPc
 )
 
 var registerNames = map[Register]string{
@@ -157,6 +193,40 @@ var registerNames = map[Register]string{
 	RegisterARM64Pstate:   "PSTATE",
 	RegisterARM64Vbar:     "VBAR",
 	RegisterARM64GicrBase: "GICR_BASE",
+
+	RegisterRISCVX0:  "X0",
+	RegisterRISCVX1:  "X1",
+	RegisterRISCVX2:  "X2",
+	RegisterRISCVX3:  "X3",
+	RegisterRISCVX4:  "X4",
+	RegisterRISCVX5:  "X5",
+	RegisterRISCVX6:  "X6",
+	RegisterRISCVX7:  "X7",
+	RegisterRISCVX8:  "X8",
+	RegisterRISCVX9:  "X9",
+	RegisterRISCVX10: "X10",
+	RegisterRISCVX11: "X11",
+	RegisterRISCVX12: "X12",
+	RegisterRISCVX13: "X13",
+	RegisterRISCVX14: "X14",
+	RegisterRISCVX15: "X15",
+	RegisterRISCVX16: "X16",
+	RegisterRISCVX17: "X17",
+	RegisterRISCVX18: "X18",
+	RegisterRISCVX19: "X19",
+	RegisterRISCVX20: "X20",
+	RegisterRISCVX21: "X21",
+	RegisterRISCVX22: "X22",
+	RegisterRISCVX23: "X23",
+	RegisterRISCVX24: "X24",
+	RegisterRISCVX25: "X25",
+	RegisterRISCVX26: "X26",
+	RegisterRISCVX27: "X27",
+	RegisterRISCVX28: "X28",
+	RegisterRISCVX29: "X29",
+	RegisterRISCVX30: "X30",
+	RegisterRISCVX31: "X31",
+	RegisterRISCVPc:  "PC",
 }
 
 func (r Register) String() string {
