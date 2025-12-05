@@ -82,6 +82,11 @@ func (h *hypervisor) newVirtualMachine(config hv.VMConfig) (*virtualMachine, err
 	}
 	vm.memoryMapped = true
 
+	if err := h.configureGIC(vm, config); err != nil {
+		vm.closeInternal()
+		return nil, err
+	}
+
 	if err := config.Callbacks().OnCreateVM(vm); err != nil {
 		vm.closeInternal()
 		return nil, fmt.Errorf("hvf: VM callback OnCreateVM: %w", err)
@@ -159,6 +164,12 @@ type virtualMachine struct {
 	memory     []byte
 	memoryBase uint64
 	devices    []hv.Device
+
+	arm64GICInfo hv.Arm64GICInfo
+
+	gicConfigured bool
+	gicSPIBase    uint32
+	gicSPICount   uint32
 
 	vmCreated    bool
 	memoryMapped bool
@@ -285,6 +296,29 @@ func (v *virtualMachine) WriteAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
+func (v *virtualMachine) Arm64GICInfo() (hv.Arm64GICInfo, bool) {
+	if v == nil || !v.gicConfigured || v.arm64GICInfo.Version == hv.Arm64GICVersionUnknown {
+		return hv.Arm64GICInfo{}, false
+	}
+	return v.arm64GICInfo, true
+}
+
+func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
+	if !v.gicConfigured {
+		return fmt.Errorf("hvf: interrupt controller not configured")
+	}
+
+	if hvGicSetSpi == nil {
+		return fmt.Errorf("hvf: hv_gic_set_spi unavailable")
+	}
+
+	if irqLine < v.gicSPIBase || irqLine >= v.gicSPIBase+v.gicSPICount {
+		return fmt.Errorf("hvf: SPI %d out of range (%d-%d)", irqLine, v.gicSPIBase, v.gicSPIBase+v.gicSPICount-1)
+	}
+
+	return hvGicSetSpi(irqLine, level).toError("hv_gic_set_spi")
+}
+
 func (v *virtualMachine) Close() error {
 	var closeErr error
 
@@ -396,6 +430,10 @@ func (v *virtualCPU) ID() int                           { return v.index }
 
 func (v *virtualCPU) SetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 	for reg, value := range regs {
+		if reg == hv.RegisterARM64GicrBase {
+			return fmt.Errorf("hvf: register %v is read-only", reg)
+		}
+
 		raw, ok := value.(hv.Register64)
 		if !ok {
 			return fmt.Errorf("hvf: unsupported register value type %T for %v", value, reg)
@@ -421,6 +459,16 @@ func (v *virtualCPU) SetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 
 func (v *virtualCPU) GetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 	for reg := range regs {
+		if reg == hv.RegisterARM64GicrBase {
+			info := v.vm.arm64GICInfo
+			if info.Version != hv.Arm64GICVersion3 || info.RedistributorBase == 0 || info.RedistributorSize == 0 {
+				return fmt.Errorf("hvf: register %v not available", reg)
+			}
+			base := info.RedistributorBase + uint64(v.index)*info.RedistributorSize
+			regs[reg] = hv.Register64(base)
+			continue
+		}
+
 		if sys, ok := hvSysRegFromRegister(reg); ok {
 			var val uint64
 			if err := hvVcpuGetSys(v.hostID, sys, &val).toError("hv_vcpu_get_sys_reg"); err != nil {
@@ -777,9 +825,10 @@ func (v *virtualCPU) advanceProgramCounter() error {
 }
 
 var (
-	_ hv.Hypervisor     = (*hypervisor)(nil)
-	_ hv.VirtualCPU     = (*virtualCPU)(nil)
-	_ hv.VirtualMachine = (*virtualMachine)(nil)
+	_ hv.Hypervisor       = (*hypervisor)(nil)
+	_ hv.VirtualCPU       = (*virtualCPU)(nil)
+	_ hv.VirtualMachine   = (*virtualMachine)(nil)
+	_ hv.Arm64GICProvider = (*virtualMachine)(nil)
 )
 
 func Open() (hv.Hypervisor, error) {

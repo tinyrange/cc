@@ -141,6 +141,8 @@ func makeHvSysReg(op0, op1, crn, crm, op2 uint32) hvSysReg {
 var hvSysRegVBAR = makeHvSysReg(3, 0, 12, 0, 0)
 var hvSysRegSpEl1 = hvSysReg(0xe208)
 
+type hvGicConfig uintptr
+
 var (
 	hvOnce sync.Once
 	hvErr  error
@@ -160,6 +162,17 @@ var (
 	hvVcpuSetReg  func(vcpu uint64, reg hvReg, value uint64) hvReturn
 	hvVcpuGetSys  func(vcpu uint64, reg hvSysReg, value *uint64) hvReturn
 	hvVcpuSetSys  func(vcpu uint64, reg hvSysReg, value uint64) hvReturn
+
+	hvGicConfigCreate                  func() hvGicConfig
+	hvGicConfigSetDistributorBase      func(cfg hvGicConfig, base uint64) hvReturn
+	hvGicConfigSetRedistributorBase    func(cfg hvGicConfig, base uint64) hvReturn
+	hvGicCreate                        func(cfg hvGicConfig) hvReturn
+	hvGicGetDistributorSize            func(size *uint64) hvReturn
+	hvGicGetDistributorBaseAlignment   func(alignment *uint64) hvReturn
+	hvGicGetRedistributorSize          func(size *uint64) hvReturn
+	hvGicGetRedistributorBaseAlignment func(alignment *uint64) hvReturn
+	hvGicGetSpiInterruptRange          func(base *uint32, count *uint32) hvReturn
+	hvGicSetSpi                        func(intid uint32, level bool) hvReturn
 )
 
 func ensureInitialized() error {
@@ -196,6 +209,16 @@ func ensureInitialized() error {
 		register(&hvVcpuSetReg, "hv_vcpu_set_reg")
 		register(&hvVcpuGetSys, "hv_vcpu_get_sys_reg")
 		register(&hvVcpuSetSys, "hv_vcpu_set_sys_reg")
+		register(&hvGicConfigCreate, "hv_gic_config_create")
+		register(&hvGicConfigSetDistributorBase, "hv_gic_config_set_distributor_base")
+		register(&hvGicConfigSetRedistributorBase, "hv_gic_config_set_redistributor_base")
+		register(&hvGicCreate, "hv_gic_create")
+		register(&hvGicGetDistributorSize, "hv_gic_get_distributor_size")
+		register(&hvGicGetDistributorBaseAlignment, "hv_gic_get_distributor_base_alignment")
+		register(&hvGicGetRedistributorSize, "hv_gic_get_redistributor_size")
+		register(&hvGicGetRedistributorBaseAlignment, "hv_gic_get_redistributor_base_alignment")
+		register(&hvGicGetSpiInterruptRange, "hv_gic_get_spi_interrupt_range")
+		register(&hvGicSetSpi, "hv_gic_set_spi")
 	})
 
 	return hvErr
