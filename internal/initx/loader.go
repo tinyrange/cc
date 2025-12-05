@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"runtime"
 
@@ -301,6 +302,8 @@ type VirtualMachine struct {
 	programLoader *programLoader
 
 	configRegion hv.MemoryRegion
+
+	debugLogging bool
 }
 
 func (vm *VirtualMachine) Close() error {
@@ -339,6 +342,7 @@ func NewVirtualMachine(
 	numCPUs int,
 	memSizeMB uint64,
 	kernelLoader kernel.Kernel,
+	debug bool,
 	devices ...hv.DeviceTemplate,
 ) (*VirtualMachine, error) {
 	in := &proxyReader{update: make(chan io.Reader)}
@@ -346,98 +350,115 @@ func NewVirtualMachine(
 
 	programLoader := &programLoader{}
 
-	ret := &VirtualMachine{
-		outBuffer: out,
-		inBuffer:  in,
+	var ret VirtualMachine
 
-		programLoader: programLoader,
+	ret.debugLogging = debug
 
-		loader: &boot.LinuxLoader{
-			NumCPUs: numCPUs,
+	ret.outBuffer = out
+	ret.inBuffer = in
 
-			MemSize: memSizeMB << 20,
-			MemBase: func() uint64 {
-				switch h.Architecture() {
-				case hv.ArchitectureARM64:
-					return 0x80000000
-				default:
-					return 0
-				}
-			}(),
+	ret.programLoader = programLoader
 
-			Devices: append(
-				devices,
-				virtio.ConsoleTemplate{Out: out, In: in, Arch: h.Architecture()},
-				programLoader,
-			),
+	ret.loader = &boot.LinuxLoader{
+		NumCPUs: numCPUs,
 
-			GetKernel: func() (io.ReaderAt, int64, error) {
-				size, err := kernelLoader.Size()
-				if err != nil {
-					return nil, 0, fmt.Errorf("get kernel size: %v", err)
-				}
+		MemSize: memSizeMB << 20,
+		MemBase: func() uint64 {
+			switch h.Architecture() {
+			case hv.ArchitectureARM64:
+				return 0x80000000
+			default:
+				return 0
+			}
+		}(),
 
-				kernel, err := kernelLoader.Open()
-				if err != nil {
-					return nil, 0, fmt.Errorf("open kernel: %v", err)
-				}
+		Devices: append(
+			devices,
+			virtio.ConsoleTemplate{Out: out, In: in, Arch: h.Architecture()},
+			programLoader,
+		),
 
-				return kernel, size, nil
-			},
+		GetKernel: func() (io.ReaderAt, int64, error) {
+			size, err := kernelLoader.Size()
+			if err != nil {
+				return nil, 0, fmt.Errorf("get kernel size: %v", err)
+			}
 
-			GetInit: func(arch hv.CpuArchitecture) (*ir.Program, error) {
-				cfg := BuilderConfig{
-					Arch: arch,
-				}
+			kernel, err := kernelLoader.Open()
+			if err != nil {
+				return nil, 0, fmt.Errorf("open kernel: %v", err)
+			}
 
-				modules, err := kernelLoader.PlanModuleLoad(
-					[]string{
-						"CONFIG_VIRTIO_MMIO",
-						"CONFIG_VIRTIO_BLK",
-						"CONFIG_VIRTIO_NET",
-						"CONFIG_VIRTIO_CONSOLE",
-					},
-					map[string]string{
-						"CONFIG_VIRTIO_BLK":  "kernel/drivers/block/virtio_blk.ko.gz",
-						"CONFIG_VIRTIO_NET":  "kernel/drivers/net/virtio_net.ko.gz",
-						"CONFIG_VIRTIO_MMIO": "kernel/drivers/virtio/virtio_mmio.ko.gz",
-					},
+			return kernel, size, nil
+		},
+
+		GetInit: func(arch hv.CpuArchitecture) (*ir.Program, error) {
+			cfg := BuilderConfig{
+				Arch: arch,
+			}
+
+			modules, err := kernelLoader.PlanModuleLoad(
+				[]string{
+					"CONFIG_VIRTIO_MMIO",
+					"CONFIG_VIRTIO_BLK",
+					"CONFIG_VIRTIO_NET",
+					"CONFIG_VIRTIO_CONSOLE",
+				},
+				map[string]string{
+					"CONFIG_VIRTIO_BLK":  "kernel/drivers/block/virtio_blk.ko.gz",
+					"CONFIG_VIRTIO_NET":  "kernel/drivers/net/virtio_net.ko.gz",
+					"CONFIG_VIRTIO_MMIO": "kernel/drivers/virtio/virtio_mmio.ko.gz",
+				},
+			)
+			if err != nil {
+				return nil, fmt.Errorf("plan module load: %v", err)
+			}
+
+			cfg.PreloadModules = append(cfg.PreloadModules, modules...)
+
+			return Build(cfg)
+		},
+
+		SerialStdout: out,
+
+		GetCmdline: func(arch hv.CpuArchitecture) ([]string, error) {
+			var args []string
+
+			if ret.debugLogging {
+				args = append(args,
+					"console=ttyS0,115200n8",
+					"earlycon=uart,mmio,0x09000000,115200",
 				)
-				if err != nil {
-					return nil, fmt.Errorf("plan module load: %v", err)
-				}
+			} else {
+				args = append(args,
+					"console=hvc0",
+					"quiet",
+				)
+			}
 
-				cfg.PreloadModules = append(cfg.PreloadModules, modules...)
+			args = append(args,
+				"reboot=k",
+				"panic=-1",
+			)
 
-				return Build(cfg)
-			},
+			switch h.Architecture() {
+			case hv.ArchitectureX86_64:
+				args = append(args, []string{
+					"tsc=reliable",
+					"tsc_early_khz=3000000",
+				}...)
+			case hv.ArchitectureARM64:
+				args = append(args, []string{
+					"iomem=relaxed",
+					"memmap=0xf0003000$0x400000",
+				}...)
+			default:
+				return nil, fmt.Errorf("unsupported architecture for cmdline: %v", arch)
+			}
 
-			SerialStdout: out,
+			slog.Info("booting with cmdline", "args", args)
 
-			Cmdline: func() []string {
-				switch h.Architecture() {
-				case hv.ArchitectureX86_64:
-					return []string{
-						"console=hvc0",
-						"quiet",
-						"reboot=k",
-						"panic=-1",
-						"tsc=reliable",
-						"tsc_early_khz=3000000",
-					}
-				case hv.ArchitectureARM64:
-					return []string{
-						"console=hvc0",
-						"quiet",
-						"reboot=k",
-						"panic=-1",
-						"iomem=relaxed",
-						"memmap=0xf0003000$0x400000",
-					}
-				default:
-					panic("unsupported architecture for initx cmdline")
-				}
-			}(),
+			return args, nil
 		},
 	}
 
@@ -463,7 +484,7 @@ func NewVirtualMachine(
 		return nil, err
 	}
 
-	return ret, nil
+	return &ret, nil
 }
 
 // WriteFile copies data from in into the guest at guestPath using a shared buffer

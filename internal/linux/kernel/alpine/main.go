@@ -213,10 +213,7 @@ func (d *AlpineDownloader) downloadAndConvert(url string, kind string, cachePath
 		return pkg, nil
 	}
 
-	slog.Info("Downloading Alpine Linux file",
-		"url", url,
-		"cacheFile", cacheFile,
-	)
+	slog.Info("Downloading Alpine Linux file", "url", url)
 
 	resp, err := http.Get(url)
 	if err != nil {

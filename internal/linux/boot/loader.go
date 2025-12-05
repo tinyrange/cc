@@ -113,7 +113,7 @@ type LinuxLoader struct {
 	MemSize uint64
 	MemBase uint64
 
-	Cmdline            []string
+	GetCmdline         func(arch hv.CpuArchitecture) ([]string, error)
 	GetInit            func(arch hv.CpuArchitecture) (*ir.Program, error)
 	GetKernel          func() (io.ReaderAt, int64, error)
 	GetSystemMap       func() (io.ReaderAt, error)
@@ -196,7 +196,12 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 		return fmt.Errorf("build initramfs: %w", err)
 	}
 
-	cmdlineBase := append([]string(nil), l.Cmdline...)
+	cmdline, err := l.GetCmdline(arch)
+	if err != nil {
+		return fmt.Errorf("get cmdline: %w", err)
+	}
+
+	cmdlineBase := append([]string(nil), cmdline...)
 	var virtioCmdline []string
 	var virtioNodes []fdt.Node
 	for _, dev := range l.Devices {

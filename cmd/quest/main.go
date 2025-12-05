@@ -998,7 +998,9 @@ func (q *bringUpQuest) RunLinux() error {
 		MemSize: 256 * 1024 * 1024, // 256 MiB
 		MemBase: linuxMemoryBaseForArch(q.dev.Architecture()),
 
-		Cmdline: cmdline,
+		GetCmdline: func(arch hv.CpuArchitecture) ([]string, error) {
+			return cmdline, nil
+		},
 
 		GetKernel: func() (io.ReaderAt, int64, error) {
 			kernel, err := kernel.LoadForArchitecture(q.dev.Architecture())
@@ -1109,7 +1111,7 @@ func (q *bringUpQuest) RunLinux() error {
 	return nil
 }
 
-func RunInitX() error {
+func RunInitX(debug bool) error {
 	slog.Info("Starting Bringup Quest: InitX Boot")
 
 	hv, err := factory.Open()
@@ -1123,7 +1125,7 @@ func RunInitX() error {
 		return fmt.Errorf("load kernel for architecture %s: %w", hv.Architecture(), err)
 	}
 
-	vm, err := initx.NewVirtualMachine(hv, 1, 256, kernel)
+	vm, err := initx.NewVirtualMachine(hv, 1, 256, kernel, debug)
 	if err != nil {
 		return fmt.Errorf("create initx virtual machine: %w", err)
 	}
@@ -1169,13 +1171,13 @@ func RunExecutable(path string) error {
 		return fmt.Errorf("load kernel for architecture %s: %w", hv.Architecture(), err)
 	}
 
-	vm, err := initx.NewVirtualMachine(hv, 1, 256, kernel)
+	vm, err := initx.NewVirtualMachine(hv, 1, 256, kernel, false)
 	if err != nil {
 		return fmt.Errorf("create initx virtual machine: %w", err)
 	}
 	defer vm.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
 	if err := vm.Run(ctx, &ir.Program{
@@ -1227,6 +1229,7 @@ func main() {
 	linux := fs.Bool("linux", false, "Try booting Linux")
 	initX := fs.Bool("initx", false, "Run bringup tests for initx")
 	exec := fs.String("exec", "", "Run the executable using initx")
+	debug := fs.Bool("debug", false, "Enable debug logging")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		slog.Error("failed to parse flags", "error", err)
@@ -1236,7 +1239,7 @@ func main() {
 	q := &bringUpQuest{}
 
 	if *initX {
-		if err := RunInitX(); err != nil {
+		if err := RunInitX(*debug); err != nil {
 			slog.Error("failed bringup quest initx", "error", err)
 			os.Exit(1)
 		}
