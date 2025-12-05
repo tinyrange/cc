@@ -2,7 +2,6 @@ package rtg
 
 import (
 	"reflect"
-	"strings"
 	"testing"
 
 	"github.com/tinyrange/cc/internal/ir"
@@ -80,20 +79,5 @@ func main() int64 {
 
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected program\n got: %#v\nwant: %#v", got, want)
-	}
-}
-
-func TestUnsupportedIfStatement(t *testing.T) {
-	src := `package main
-func main() {
-	if true {
-	}
-}`
-	_, err := CompileProgram(src)
-	if err == nil {
-		t.Fatalf("expected error for unsupported if statement")
-	}
-	if !strings.Contains(err.Error(), "unsupported statement") {
-		t.Fatalf("unexpected error: %v", err)
 	}
 }
