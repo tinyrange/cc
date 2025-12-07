@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"sync"
 
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/whp/bindings"
