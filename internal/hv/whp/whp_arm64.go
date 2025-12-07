@@ -321,13 +321,16 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 			true,  // Asserted
 			false, // Retarget
 		),
-		TargetPartition:    0,
-		DestinationAddress: bindings.GuestPhysicalAddress(intid),
-		RequestedVector:    uint32(intid),
-		TargetVtl:          0,
+		TargetPartition: 0,
+		// WHP uses RequestedVector as the INTID when delivering to the vCPU.
+		RequestedVector: uint32(intid),
+		TargetVtl:       0,
 	}
 
 	// TODO: plumb a minimal GIC pending INTID model so the guest can observe
 	// intid as pending when it samples the distributor/CPU interface.
+	if irqType != 0 {
+		_ = irqType
+	}
 	return bindings.RequestInterrupt(v.part, &ctrl)
 }
