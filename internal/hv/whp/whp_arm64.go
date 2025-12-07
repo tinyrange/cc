@@ -294,3 +294,36 @@ func (h *hypervisor) archVCPUInit(vm *virtualMachine, vcpu *virtualCPU) error {
 	}
 	return nil
 }
+
+// SetIRQ asserts an interrupt line. WHP only supports edge-triggered delivery for
+// our simple GIC setup, so we drop deassertions and inject the interrupt to vCPU0.
+func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
+	if v == nil {
+		return fmt.Errorf("whp: virtual machine is nil")
+	}
+	if !level {
+		return nil
+	}
+
+	const armIRQTypeShift = 24
+	irqType := (irqLine >> armIRQTypeShift) & 0xff
+	if irqType == 0 {
+		return fmt.Errorf("whp: interrupt type missing in irqLine %#x", irqLine)
+	}
+
+	vector := irqLine & 0xffff // INTID
+
+	ctrl := bindings.InterruptControl{
+		Control: bindings.MakeInterruptControlKind(
+			bindings.InterruptTypeFixed,
+			bindings.InterruptDestinationModePhysical,
+			bindings.InterruptTriggerEdge,
+			0,
+		),
+		// Single vCPU (0) for bringup.
+		Destination: 0,
+		Vector:      vector,
+	}
+
+	return bindings.RequestInterrupt(v.part, &ctrl)
+}
