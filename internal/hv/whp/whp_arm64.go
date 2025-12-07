@@ -304,15 +304,26 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 		return fmt.Errorf("whp: virtual machine is nil")
 	}
 
-	const armIRQTypeShift = 24
+	const (
+		armIRQTypeShift = 24
+		armIRQTypeSPI   = 1
+		armSPIBase      = 32 // GIC SPIs start at INTID 32
+	)
+
 	irqType := (irqLine >> armIRQTypeShift) & 0xff
 	if irqType == 0 {
 		return fmt.Errorf("whp: interrupt type missing in irqLine %#x", irqLine)
 	}
 
-	// INTID carried in irqLine low bits; WHP doesn’t take it directly when
-	// asserting the line. We still decode it for future pending-state plumb.
-	intid := irqLine & 0xffff
+	// The low bits contain the SPI number (offset from SPI base).
+	// For SPIs, we need to add 32 to convert to the full GIC INTID.
+	spiNum := irqLine & 0xffff
+	var intid uint32
+	if irqType == armIRQTypeSPI {
+		intid = spiNum + armSPIBase
+	} else {
+		intid = spiNum
+	}
 
 	if !v.arm64ShouldFire(intid, level) {
 		return nil
@@ -330,10 +341,5 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 		TargetVtl:       0,
 	}
 
-	// TODO: plumb a minimal GIC pending INTID model so the guest can observe
-	// intid as pending when it samples the distributor/CPU interface.
-	if irqType != 0 {
-		_ = irqType
-	}
 	return bindings.RequestInterrupt(v.part, &ctrl)
 }
