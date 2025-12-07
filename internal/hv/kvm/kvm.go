@@ -104,7 +104,8 @@ type virtualMachine struct {
 	ioapic     *chipset.IOAPIC
 
 	// arm64-specific fields
-	arm64GICInfo hv.Arm64GICInfo
+	arm64GICInfo  hv.Arm64GICInfo
+	arm64VGICFd   int // vGIC device file descriptor
 }
 
 // implements hv.VirtualMachine.
@@ -426,6 +427,12 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 			unix.Close(vmFd)
 			return nil, fmt.Errorf("VM callback OnCreateVCPU %d: %w", i, err)
 		}
+	}
+
+	// Post-vCPU architecture-specific initialization (e.g., vGIC finalization on ARM64)
+	if err := h.archPostVCPUInit(vm, config); err != nil {
+		unix.Close(vmFd)
+		return nil, fmt.Errorf("post-vCPU initialization: %w", err)
 	}
 
 	// Run Loader

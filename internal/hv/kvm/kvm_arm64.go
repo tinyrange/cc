@@ -215,6 +215,20 @@ func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 	return nil
 }
 
+// archPostVCPUInit is called after all vCPUs are created.
+// On ARM64, we need to finalize the vGIC after vCPUs exist.
+func (hv *hypervisor) archPostVCPUInit(vm *virtualMachine, config hv.VMConfig) error {
+	if !config.NeedsInterruptSupport() {
+		return nil
+	}
+
+	if err := hv.finalizeArm64VGIC(vm); err != nil {
+		return fmt.Errorf("finalize VGIC: %w", err)
+	}
+
+	return nil
+}
+
 func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int) error {
 	init, err := armPreferredTarget(vm.vmFd)
 	if err != nil {

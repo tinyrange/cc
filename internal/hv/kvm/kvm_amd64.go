@@ -383,6 +383,12 @@ func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 	return nil
 }
 
+// archPostVCPUInit is called after all vCPUs are created.
+// On x86, no post-vCPU initialization is needed.
+func (hv *hypervisor) archPostVCPUInit(vm *virtualMachine, config hv.VMConfig) error {
+	return nil
+}
+
 func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int) error {
 	cpuId, err := getSupportedCpuId(hv.fd)
 	if err != nil {
