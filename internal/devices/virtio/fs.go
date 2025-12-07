@@ -9,7 +9,7 @@ import (
 
 	"github.com/tinyrange/cc/internal/fdt"
 	"github.com/tinyrange/cc/internal/hv"
-	"golang.org/x/sys/unix"
+	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 )
 
 // -----------------------------
@@ -303,7 +303,7 @@ func (emptyBackend) Init() (uint32, uint32) { return 128 * 1024, 0 }
 func (emptyBackend) GetAttr(nodeID uint64) (FuseAttr, int32) {
 	// Root dir with 0755
 	if nodeID != 1 {
-		return FuseAttr{}, -int32(unix.ENOENT)
+		return FuseAttr{}, -int32(linux.ENOENT)
 	}
 	return FuseAttr{
 		Ino: 1, Mode: 0040000 | 0755, NLink: 2, UID: 0, GID: 0,
@@ -311,22 +311,22 @@ func (emptyBackend) GetAttr(nodeID uint64) (FuseAttr, int32) {
 	}, 0
 }
 func (emptyBackend) Lookup(_ uint64, _ string) (uint64, FuseAttr, int32) {
-	return 0, FuseAttr{}, -int32(unix.ENOENT)
+	return 0, FuseAttr{}, -int32(linux.ENOENT)
 }
 func (emptyBackend) Open(nodeID uint64, _ uint32) (uint64, int32) {
 	if nodeID == 1 {
-		return 0, -int32(unix.EISDIR)
+		return 0, -int32(linux.EISDIR)
 	}
-	return 0, -int32(unix.ENOENT)
+	return 0, -int32(linux.ENOENT)
 }
 func (emptyBackend) Release(uint64, uint64) {}
 func (emptyBackend) Read(uint64, uint64, uint64, uint32) ([]byte, int32) {
-	return nil, -int32(unix.EISDIR)
+	return nil, -int32(linux.EISDIR)
 }
 func (emptyBackend) ReadDir(nodeID uint64, off uint64, _ uint32) ([]byte, int32) {
 	// Return "." and ".." only when off==0. Use Linux dirent layout for FUSE.
 	if nodeID != 1 {
-		return nil, -int32(unix.ENOENT)
+		return nil, -int32(linux.ENOENT)
 	}
 	if off != 0 {
 		return []byte{}, 0
@@ -823,7 +823,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
 		}
 	default:
-		errno = -int32(unix.ENOSYS)
+		errno = -int32(linux.ENOSYS)
 	}
 
 	return w(fuseOutHeader{Len: fuseHdrOutSize, Error: errno, Unique: in.Unique}, nil), nil

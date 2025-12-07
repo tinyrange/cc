@@ -34,8 +34,8 @@ import (
 	"github.com/tinyrange/cc/internal/linux/boot"
 	"github.com/tinyrange/cc/internal/linux/defs"
 	amd64defs "github.com/tinyrange/cc/internal/linux/defs/amd64"
+	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 	"github.com/tinyrange/cc/internal/linux/kernel"
-	"golang.org/x/sys/unix"
 )
 
 const (
@@ -1404,7 +1404,7 @@ func (v *virtioFsBackend) GetAttr(nodeID uint64) (attr virtio.FuseAttr, errno in
 	case virtioFsFileNodeID:
 		return virtioFileAttr(nodeID, len(virtioFsFileContent)), 0
 	default:
-		return virtio.FuseAttr{}, -int32(unix.ENOENT)
+		return virtio.FuseAttr{}, -int32(linux.ENOENT)
 	}
 }
 
@@ -1416,7 +1416,7 @@ func (v *virtioFsBackend) Init() (maxWrite uint32, flags uint32) {
 // Lookup implements virtio.FsBackend.
 func (v *virtioFsBackend) Lookup(parent uint64, name string) (nodeID uint64, attr virtio.FuseAttr, errno int32) {
 	if parent != virtioFsRootNodeID {
-		return 0, virtio.FuseAttr{}, -int32(unix.ENOENT)
+		return 0, virtio.FuseAttr{}, -int32(linux.ENOENT)
 	}
 
 	name = strings.TrimPrefix(path.Clean(name), "/")
@@ -1428,25 +1428,25 @@ func (v *virtioFsBackend) Lookup(parent uint64, name string) (nodeID uint64, att
 		return virtioFsFileNodeID, virtioFileAttr(virtioFsFileNodeID, len(virtioFsFileContent)), 0
 	}
 
-	return 0, virtio.FuseAttr{}, -int32(unix.ENOENT)
+	return 0, virtio.FuseAttr{}, -int32(linux.ENOENT)
 }
 
 // Open implements virtio.FsBackend.
 func (v *virtioFsBackend) Open(nodeID uint64, flags uint32) (fh uint64, errno int32) {
 	switch nodeID {
 	case virtioFsRootNodeID:
-		return 0, -int32(unix.EISDIR)
+		return 0, -int32(linux.EISDIR)
 	case virtioFsFileNodeID:
 		return 1, 0
 	default:
-		return 0, -int32(unix.ENOENT)
+		return 0, -int32(linux.ENOENT)
 	}
 }
 
 // Read implements virtio.FsBackend.
 func (v *virtioFsBackend) Read(nodeID uint64, fh uint64, off uint64, size uint32) ([]byte, int32) {
 	if nodeID != virtioFsFileNodeID {
-		return nil, -int32(unix.ENOENT)
+		return nil, -int32(linux.ENOENT)
 	}
 
 	if off >= uint64(len(virtioFsFileContent)) {
@@ -1464,7 +1464,7 @@ func (v *virtioFsBackend) Read(nodeID uint64, fh uint64, off uint64, size uint32
 // ReadDir implements virtio.FsBackend.
 func (v *virtioFsBackend) ReadDir(nodeID uint64, off uint64, maxBytes uint32) ([]byte, int32) {
 	if nodeID != virtioFsRootNodeID {
-		return nil, -int32(unix.ENOENT)
+		return nil, -int32(linux.ENOENT)
 	}
 	if off != 0 {
 		return []byte{}, 0
@@ -1475,9 +1475,9 @@ func (v *virtioFsBackend) ReadDir(nodeID uint64, off uint64, maxBytes uint32) ([
 		name string
 		typ  uint32
 	}{
-		{virtioFsRootNodeID, ".", unix.DT_DIR},
-		{virtioFsRootNodeID, "..", unix.DT_DIR},
-		{virtioFsFileNodeID, "testfile.txt", unix.DT_REG},
+		{virtioFsRootNodeID, ".", linux.DT_DIR},
+		{virtioFsRootNodeID, "..", linux.DT_DIR},
+		{virtioFsFileNodeID, "testfile.txt", linux.DT_REG},
 	}
 
 	var buf []byte
@@ -1499,7 +1499,7 @@ func (v *virtioFsBackend) Release(nodeID uint64, fh uint64) {
 // StatFS implements virtio.FsBackend.
 func (v *virtioFsBackend) StatFS(nodeID uint64) (blocks uint64, bfree uint64, bavail uint64, files uint64, ffree uint64, bsize uint64, frsize uint64, namelen uint64, errno int32) {
 	if nodeID != virtioFsRootNodeID {
-		return 0, 0, 0, 0, 0, 0, 0, 0, -int32(unix.ENOENT)
+		return 0, 0, 0, 0, 0, 0, 0, 0, -int32(linux.ENOENT)
 	}
 
 	return 1, 1, 1, 2, 2, 4096, 4096, 255, 0
