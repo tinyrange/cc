@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"os"
 
 	"github.com/tinyrange/cc/internal/fdt"
 	"github.com/tinyrange/cc/internal/hv"
@@ -197,6 +198,7 @@ func newMMIODevice(vm hv.VirtualMachine, base uint64, size uint64, irqLine uint3
 }
 
 func (d *mmioDevice) writeMMIO(addr uint64, data []byte) error {
+	fmt.Fprintf(os.Stderr, "virtio-mmio: write addr=%#x len=%d\n", addr, len(data))
 	if err := d.checkMMIOBounds(addr, uint64(len(data))); err != nil {
 		return err
 	}
@@ -208,6 +210,7 @@ func (d *mmioDevice) writeMMIO(addr uint64, data []byte) error {
 }
 
 func (d *mmioDevice) readMMIO(addr uint64, data []byte) error {
+	fmt.Fprintf(os.Stderr, "virtio-mmio: read addr=%#x len=%d\n", addr, len(data))
 	if err := d.checkMMIOBounds(addr, uint64(len(data))); err != nil {
 		return err
 	}
@@ -237,11 +240,14 @@ func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
 
 	switch offset {
 	case VIRTIO_MMIO_DEVICE_FEATURES_SEL:
+		fmt.Fprintf(os.Stderr, "virtio-mmio: write DEVICE_FEATURES_SEL -> %d\n", value)
 		d.deviceFeatureSel = value
 	case VIRTIO_MMIO_DRIVER_FEATURES_SEL:
+		fmt.Fprintf(os.Stderr, "virtio-mmio: write DRIVER_FEATURES_SEL -> %d\n", value)
 		d.driverFeatureSel = value
 	case VIRTIO_MMIO_DRIVER_FEATURES:
 		logAccess("DRIVER_FEATURES")
+		fmt.Fprintf(os.Stderr, "virtio-mmio: write DRIVER_FEATURES sel=%d val=%#x\n", d.driverFeatureSel, value)
 		if d.driverFeatureSel < uint32(len(d.driverFeatures)) {
 			d.driverFeatures[d.driverFeatureSel] = value
 		}
@@ -250,6 +256,7 @@ func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
 		d.queueSel = value
 	case VIRTIO_MMIO_QUEUE_NUM:
 		logAccess("QUEUE_NUM")
+		fmt.Fprintf(os.Stderr, "virtio-mmio: queue %d size -> %d\n", d.queueSel, value)
 		if q := d.currentQueue(); q != nil {
 			// RELAXATION: Linux might write 0 during reset. Don't error, just accept it.
 			if value > uint32(q.maxSize) {
@@ -270,31 +277,38 @@ func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
 				slog.Error("virtio-mmio: attempt to ready queue with size 0", "idx", d.queueSel)
 				return fmt.Errorf("queue ready set before queue size")
 			}
+			fmt.Fprintf(os.Stderr, "virtio-mmio: queue %d ready size=%d desc=%#x avail=%#x used=%#x\n", d.queueSel, q.size, q.descAddr, q.availAddr, q.usedAddr)
 			q.ready = true
 		}
 	case VIRTIO_MMIO_QUEUE_DESC_LOW:
 		if q := d.currentQueue(); q != nil {
 			q.descAddr = (q.descAddr &^ 0xffffffff) | uint64(value)
+			fmt.Fprintf(os.Stderr, "virtio-mmio: queue %d desc low -> %#x\n", d.queueSel, q.descAddr)
 		}
 	case VIRTIO_MMIO_QUEUE_DESC_HIGH:
 		if q := d.currentQueue(); q != nil {
 			q.descAddr = (q.descAddr &^ (uint64(0xffffffff) << 32)) | (uint64(value) << 32)
+			fmt.Fprintf(os.Stderr, "virtio-mmio: queue %d desc high -> %#x\n", d.queueSel, q.descAddr)
 		}
 	case VIRTIO_MMIO_QUEUE_AVAIL_LOW:
 		if q := d.currentQueue(); q != nil {
 			q.availAddr = (q.availAddr &^ 0xffffffff) | uint64(value)
+			fmt.Fprintf(os.Stderr, "virtio-mmio: queue %d avail low -> %#x\n", d.queueSel, q.availAddr)
 		}
 	case VIRTIO_MMIO_QUEUE_AVAIL_HIGH:
 		if q := d.currentQueue(); q != nil {
 			q.availAddr = (q.availAddr &^ (uint64(0xffffffff) << 32)) | (uint64(value) << 32)
+			fmt.Fprintf(os.Stderr, "virtio-mmio: queue %d avail high -> %#x\n", d.queueSel, q.availAddr)
 		}
 	case VIRTIO_MMIO_QUEUE_USED_LOW:
 		if q := d.currentQueue(); q != nil {
 			q.usedAddr = (q.usedAddr &^ 0xffffffff) | uint64(value)
+			fmt.Fprintf(os.Stderr, "virtio-mmio: queue %d used low -> %#x\n", d.queueSel, q.usedAddr)
 		}
 	case VIRTIO_MMIO_QUEUE_USED_HIGH:
 		if q := d.currentQueue(); q != nil {
 			q.usedAddr = (q.usedAddr &^ (uint64(0xffffffff) << 32)) | (uint64(value) << 32)
+			fmt.Fprintf(os.Stderr, "virtio-mmio: queue %d used high -> %#x\n", d.queueSel, q.usedAddr)
 		}
 	case VIRTIO_MMIO_QUEUE_NOTIFY:
 		if d.handler != nil {
@@ -307,6 +321,7 @@ func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
 			d.updateInterruptLine()
 		}
 	case VIRTIO_MMIO_STATUS:
+		fmt.Fprintf(os.Stderr, "virtio-mmio: write STATUS -> %#x\n", value)
 		if value == 0 {
 			d.reset()
 			return nil
@@ -332,23 +347,31 @@ func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
 func (d *mmioDevice) readRegister(offset uint64) (uint32, error) {
 	switch offset {
 	case VIRTIO_MMIO_MAGIC_VALUE:
+		fmt.Fprintf(os.Stderr, "virtio-mmio: read MAGIC -> %#x\n", 0x74726976)
 		return 0x74726976, nil
 	case VIRTIO_MMIO_VERSION:
+		fmt.Fprintf(os.Stderr, "virtio-mmio: read VERSION -> %d\n", d.version)
 		return d.version, nil
 	case VIRTIO_MMIO_DEVICE_ID:
+		fmt.Fprintf(os.Stderr, "virtio-mmio: read DEVICE_ID -> %d\n", d.deviceID)
 		return d.deviceID, nil
 	case VIRTIO_MMIO_VENDOR_ID:
+		fmt.Fprintf(os.Stderr, "virtio-mmio: read VENDOR_ID -> %d\n", d.vendorID)
 		return d.vendorID, nil
 	case VIRTIO_MMIO_DEVICE_FEATURES:
 		if d.deviceFeatureSel < uint32(len(d.deviceFeatures)) {
-			return d.deviceFeatures[d.deviceFeatureSel], nil
+			val := d.deviceFeatures[d.deviceFeatureSel]
+			fmt.Fprintf(os.Stderr, "virtio-mmio: read DEVICE_FEATURES sel=%d -> %#x\n", d.deviceFeatureSel, val)
+			return val, nil
 		}
 		return 0, nil
 	case VIRTIO_MMIO_DEVICE_FEATURES_SEL:
 		return d.deviceFeatureSel, nil
 	case VIRTIO_MMIO_DRIVER_FEATURES:
 		if d.driverFeatureSel < uint32(len(d.driverFeatures)) {
-			return d.driverFeatures[d.driverFeatureSel], nil
+			val := d.driverFeatures[d.driverFeatureSel]
+			fmt.Fprintf(os.Stderr, "virtio-mmio: read DRIVER_FEATURES sel=%d -> %#x\n", d.driverFeatureSel, val)
+			return val, nil
 		}
 		return 0, nil
 	case VIRTIO_MMIO_DRIVER_FEATURES_SEL:
@@ -357,52 +380,62 @@ func (d *mmioDevice) readRegister(offset uint64) (uint32, error) {
 		return d.queueSel, nil
 	case VIRTIO_MMIO_QUEUE_NUM_MAX:
 		if q := d.selectedQueue(); q != nil {
+			fmt.Fprintf(os.Stderr, "virtio-mmio: read queue %d max -> %d\n", d.queueSel, q.maxSize)
 			return uint32(q.maxSize), nil
 		}
 		return 0, nil
 	case VIRTIO_MMIO_QUEUE_NUM:
 		if q := d.currentQueue(); q != nil {
+			fmt.Fprintf(os.Stderr, "virtio-mmio: read queue %d size -> %d\n", d.queueSel, q.size)
 			return uint32(q.size), nil
 		}
 		return 0, nil
 	case VIRTIO_MMIO_QUEUE_READY:
 		if q := d.currentQueue(); q != nil && q.ready {
+			fmt.Fprintf(os.Stderr, "virtio-mmio: read queue %d ready -> %t\n", d.queueSel, q.ready)
 			return 1, nil
 		}
 		return 0, nil
 	case VIRTIO_MMIO_QUEUE_DESC_LOW:
 		if q := d.currentQueue(); q != nil {
+			fmt.Fprintf(os.Stderr, "virtio-mmio: read queue %d desc low -> %#x\n", d.queueSel, q.descAddr)
 			return uint32(q.descAddr), nil
 		}
 		return 0, nil
 	case VIRTIO_MMIO_QUEUE_DESC_HIGH:
 		if q := d.currentQueue(); q != nil {
+			fmt.Fprintf(os.Stderr, "virtio-mmio: read queue %d desc high -> %#x\n", d.queueSel, q.descAddr)
 			return uint32(q.descAddr >> 32), nil
 		}
 		return 0, nil
 	case VIRTIO_MMIO_QUEUE_AVAIL_LOW:
 		if q := d.currentQueue(); q != nil {
+			fmt.Fprintf(os.Stderr, "virtio-mmio: read queue %d avail low -> %#x\n", d.queueSel, q.availAddr)
 			return uint32(q.availAddr), nil
 		}
 		return 0, nil
 	case VIRTIO_MMIO_QUEUE_AVAIL_HIGH:
 		if q := d.currentQueue(); q != nil {
+			fmt.Fprintf(os.Stderr, "virtio-mmio: read queue %d avail high -> %#x\n", d.queueSel, q.availAddr)
 			return uint32(q.availAddr >> 32), nil
 		}
 		return 0, nil
 	case VIRTIO_MMIO_QUEUE_USED_LOW:
 		if q := d.currentQueue(); q != nil {
+			fmt.Fprintf(os.Stderr, "virtio-mmio: read queue %d used low -> %#x\n", d.queueSel, q.usedAddr)
 			return uint32(q.usedAddr), nil
 		}
 		return 0, nil
 	case VIRTIO_MMIO_QUEUE_USED_HIGH:
 		if q := d.currentQueue(); q != nil {
+			fmt.Fprintf(os.Stderr, "virtio-mmio: read queue %d used high -> %#x\n", d.queueSel, q.usedAddr)
 			return uint32(q.usedAddr >> 32), nil
 		}
 		return 0, nil
 	case VIRTIO_MMIO_INTERRUPT_STATUS:
 		return d.interruptStatus, nil
 	case VIRTIO_MMIO_STATUS:
+		fmt.Fprintf(os.Stderr, "virtio-mmio: read STATUS -> %#x\n", d.deviceStatus)
 		return d.deviceStatus, nil
 	case VIRTIO_MMIO_CONFIG_GENERATION:
 		return 0, nil

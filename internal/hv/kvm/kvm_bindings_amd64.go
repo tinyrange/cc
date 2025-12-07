@@ -166,6 +166,15 @@ func createPIT(vmFd int) error {
 	return err
 }
 
+func enableSplitIRQChip(vmFd int, numIrqs int) error {
+	var cap kvmEnableCapArgs
+	cap.Cap = kvmCapSplitIrqchip
+	cap.Flags = 0
+	cap.Args[0] = uint64(numIrqs)
+	_, err := ioctlWithRetry(uintptr(vmFd), uint64(kvmEnableCap), uintptr(unsafe.Pointer(&cap)))
+	return err
+}
+
 func getPitState(vmFd int) (kvmPitState2, error) {
 	var state kvmPitState2
 

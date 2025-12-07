@@ -85,7 +85,96 @@ func Install(vm hv.VirtualMachine, cfg Config) error {
 }
 
 func buildMinimalDSDT() []byte {
-	return nil
+	// Build AML:
+	// Scope (\_SB) {
+	//   Device (UAR0) { _HID "PNP0501"; _CRS (IO 0x3f8 len 8, IRQ4) }
+	//   Device (RTC0) { _HID "PNP0B00"; _CRS (IO 0x70 len 2,  IRQ8) }
+	// }
+	scopeBody := bytes.Buffer{}
+	scopeBody.WriteString("\\_SB_") // NameString for scope
+
+	for _, dev := range []struct {
+		name string
+		hid  string
+		io   ioRange
+		irq  uint8
+	}{
+		{name: "UAR0", hid: "PNP0501", io: ioRange{base: 0x3f8, length: 8}, irq: 4},
+		{name: "RTC0", hid: "PNP0B00", io: ioRange{base: 0x70, length: 2}, irq: 8},
+	} {
+		devBody := bytes.Buffer{}
+		devBody.WriteString(dev.name) // Device NameString
+
+		// Name(_HID, "<hid>")
+		devBody.WriteByte(0x08)                        // NameOp
+		devBody.WriteString("_HID")                    // NameString
+		devBody.WriteByte(0x0d)                        // StringPrefix
+		devBody.WriteString(dev.hid)                   // HID value
+		devBody.WriteByte(0x00)                        // Null terminator
+		emitCRS(&devBody, dev.io, dev.irq)             // _CRS
+		device := wrapPkg(0x5b, 0x82, devBody.Bytes()) // DeviceOp
+		scopeBody.Write(device)
+	}
+
+	scope := wrapPkg(0x10, 0x00, scopeBody.Bytes()) // ScopeOp (second byte unused)
+	return scope
+}
+
+type ioRange struct {
+	base   uint16
+	length uint8
+}
+
+func emitCRS(buf *bytes.Buffer, io ioRange, irq uint8) {
+	buf.WriteByte(0x08)     // NameOp
+	buf.WriteString("_CRS") // NameString
+
+	template := bytes.Buffer{}
+	// I/O Port Descriptor (Decode16)
+	template.WriteByte(0x47) // Descriptor type/length (0x8 IO | len 7)
+	template.WriteByte(0x01) // Information: 16-bit decode
+	binary.Write(&template, binary.LittleEndian, io.base)
+	binary.Write(&template, binary.LittleEndian, io.base)
+	template.WriteByte(0x00)      // Alignment
+	template.WriteByte(io.length) // Length
+	// IRQNoFlags descriptor
+	template.WriteByte(0x22) // IRQ descriptor, length 2 bytes
+	irqMask := uint16(1) << irq
+	binary.Write(&template, binary.LittleEndian, irqMask)
+	// End tag
+	template.Write([]byte{0x79, 0x00})
+
+	rt := template.Bytes()
+	bufferBody := bytes.Buffer{}
+	bufferBody.WriteByte(byte(len(rt))) // Buffer length
+	bufferBody.Write(rt)
+
+	buffer := wrapPkg(0x11, 0x00, bufferBody.Bytes()) // BufferOp
+	buf.Write(buffer)
+}
+
+// wrapPkg emits an AML opcode with a computed PkgLength and body.
+func wrapPkg(opcode byte, opcode2 byte, body []byte) []byte {
+	var out bytes.Buffer
+	out.WriteByte(opcode)
+	if opcode2 != 0x00 {
+		out.WriteByte(opcode2)
+	}
+	out.Write(pkgLength(len(body)))
+	out.Write(body)
+	return out.Bytes()
+}
+
+// pkgLength encodes AML PkgLength for bodies that fit in 2 bytes.
+func pkgLength(bodyLen int) []byte {
+	// PkgLength encodes the length of following bytes (excluding opcode bytes).
+	if bodyLen < 0x40 {
+		return []byte{byte(bodyLen)}
+	}
+	// two-byte encoding: bits 6:0 hold low byte, bits 7-6 set count-1
+	low := byte(bodyLen & 0xFF)
+	high := byte((bodyLen >> 8) & 0x0F)
+	return []byte{0x40 | (low & 0x3F), high}
 }
 
 func buildMADTBody(cfg Config) []byte {
@@ -109,12 +198,14 @@ func buildMADTBody(cfg Config) []byte {
 	binary.Write(buf, binary.LittleEndian, cfg.IOAPIC.Address)
 	binary.Write(buf, binary.LittleEndian, cfg.IOAPIC.GSIBase)
 
-	buf.WriteByte(2)
-	buf.WriteByte(10)
-	buf.WriteByte(0)
-	buf.WriteByte(0)
-	binary.Write(buf, binary.LittleEndian, uint32(2))
-	binary.Write(buf, binary.LittleEndian, uint16(0))
+	for _, ovr := range cfg.ISAOverrides {
+		buf.WriteByte(2)  // Type = Interrupt Source Override
+		buf.WriteByte(10) // Length
+		buf.WriteByte(ovr.Bus)
+		buf.WriteByte(ovr.IRQ)
+		binary.Write(buf, binary.LittleEndian, ovr.GSI)
+		binary.Write(buf, binary.LittleEndian, ovr.Flags)
+	}
 
 	return buf.Bytes()
 }

@@ -6,6 +6,8 @@ import (
 	"os"
 	"syscall"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestHello(t *testing.T) {
@@ -33,6 +35,19 @@ func TestInterruptMapping(t *testing.T) {
 	}
 
 	t.Logf("guest /proc/interrupts:\n%s", data)
+}
+
+func TestKernelLog(t *testing.T) {
+	// use syscalls to read kernel log
+	const klogSize = 1024 * 1024
+	buf := make([]byte, klogSize)
+	n, err := unix.Klogctl(unix.SYSLOG_ACTION_READ_ALL, buf)
+	if err != nil {
+		t.Fatalf("failed to read kernel log: %v", err)
+	}
+
+	logData := buf[:n]
+	t.Logf("kernel log:\n%s", logData)
 }
 
 func TestVirtioFs(t *testing.T) {

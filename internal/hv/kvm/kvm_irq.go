@@ -17,6 +17,10 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 		return fmt.Errorf("kvm: cannot pulse IRQ without irqchip")
 	}
 
+	if v.hv.Architecture() == hv.ArchitectureX86_64 && irqLine>>16 == 0 {
+		irqLine = (irqChipIOAPIC << 16) | irqLine
+	}
+
 	if err := irqLevel(v.vmFd, irqLine, level); err != nil {
 		return fmt.Errorf("setting IRQ line: %w", err)
 	}

@@ -1220,8 +1220,10 @@ func (q *bringUpQuest) RunLinux() error {
 		}
 	case hv.ArchitectureX86_64:
 		cmdline = []string{
-			"console=hvc0",
-			"quiet",
+			// "console=hvc0",
+			// "quiet",
+			"console=ttyS0,115200n8",
+			"earlycon=uart8250,io,0x3f8",
 			"reboot=k",
 			"panic=-1",
 			"tsc=reliable",

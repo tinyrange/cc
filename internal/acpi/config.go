@@ -18,6 +18,9 @@ type Config struct {
 
 	HPET *HPETConfig
 
+	// ISAOverrides emits MADT interrupt source overrides for legacy ISA IRQs.
+	ISAOverrides []InterruptOverride
+
 	OEM OEMInfo
 }
 
@@ -31,6 +34,14 @@ type IOAPICConfig struct {
 // HPETConfig describes the optional HPET ACPI table.
 type HPETConfig struct {
 	Address uint64
+}
+
+// InterruptOverride describes a single MADT INT_SRC_OVR entry.
+type InterruptOverride struct {
+	Bus   uint8  // typically 0 (ISA)
+	IRQ   uint8  // source IRQ
+	GSI   uint32 // destination GSI
+	Flags uint16 // polarity/trigger encoding per ACPI spec
 }
 
 // OEMInfo mirrors the ACPI table header OEM fields.
