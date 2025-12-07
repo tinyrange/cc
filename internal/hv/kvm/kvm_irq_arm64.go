@@ -32,9 +32,10 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 	// Extract the GIC INTID from the low 16 bits.
 	intid := irqLine & 0xffff
 
-	// Note: Testing whether kernel expects full INTID or SPI offset.
-	// According to kernel source, it expects SPI offset (INTID - 32).
-	// But let's try both formats.
+	// TODO: Determine definitively whether kernel expects full INTID or SPI offset.
+	// According to kernel source, it expects SPI offset (INTID - 32),
+	// but this implementation currently tries the full INTID format.
+	// This is experimental and may not be correct.
 
 	// Try full INTID first (don't subtract armSPIBase)
 	kvmIRQ := (irqType << armIRQTypeShift) | intid
