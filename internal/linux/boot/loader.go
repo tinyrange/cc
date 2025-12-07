@@ -215,19 +215,24 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 	cmdlineBase := append([]string(nil), cmdline...)
 	var virtioCmdline []string
 	var virtioNodes []fdt.Node
-	allocator := NewGSIAllocator(16, []uint32{0, 1, 2, 4, 8, 9, 10})
-	for idx, dev := range l.Devices {
-		// Opportunistically assign GSIs to devices that haven't chosen one.
-		switch d := dev.(type) {
-		case virtio.ConsoleTemplate:
-			if d.IRQLine == 0 {
-				d.IRQLine = allocator.Allocate()
-				l.Devices[idx] = d
-			}
-		case virtio.FSTemplate:
-			if d.IRQLine == 0 {
-				d.IRQLine = allocator.Allocate()
-				l.Devices[idx] = d
+	// Only allocate GSIs on x86. ARM64 virtio devices have architecture-specific
+	// defaults that work correctly with the GIC. Using the x86-style GSI allocator
+	// on ARM64 causes KVM_IRQ_LINE to fail with EINVAL.
+	if arch == hv.ArchitectureX86_64 {
+		allocator := NewGSIAllocator(16, []uint32{0, 1, 2, 4, 8, 9, 10})
+		for idx, dev := range l.Devices {
+			// Opportunistically assign GSIs to devices that haven't chosen one.
+			switch d := dev.(type) {
+			case virtio.ConsoleTemplate:
+				if d.IRQLine == 0 {
+					d.IRQLine = allocator.Allocate()
+					l.Devices[idx] = d
+				}
+			case virtio.FSTemplate:
+				if d.IRQLine == 0 {
+					d.IRQLine = allocator.Allocate()
+					l.Devices[idx] = d
+				}
 			}
 		}
 	}
