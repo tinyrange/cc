@@ -314,7 +314,6 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 	// INTID carried in irqLine low bits; WHP doesn’t take it directly when
 	// asserting the line. We still decode it for future pending-state plumb.
 	intid := irqLine & 0xffff
-	_ = intid
 
 	ctrl := bindings.InterruptControl{
 		InterruptControl: bindings.MakeInterruptControl2(
@@ -323,8 +322,8 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 			false, // Retarget
 		),
 		TargetPartition:    0,
-		DestinationAddress: 0,
-		RequestedVector:    0, // must be zero for ARM64 WHP IRQ assertion
+		DestinationAddress: bindings.GuestPhysicalAddress(intid),
+		RequestedVector:    uint32(intid),
 		TargetVtl:          0,
 	}
 

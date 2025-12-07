@@ -312,6 +312,7 @@ func (r *irqRedirection) assert(router IoApicRouting, stats *ioapicStats, line u
 
 func (r *irqRedirection) deassert() {
 	r.lineLevel = false
+	r.redirection.setRemoteIRR(false)
 }
 
 func (r *irqRedirection) evaluate(router IoApicRouting, stats *ioapicStats, line uint8, edge bool) {

@@ -135,6 +135,13 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		info := exit.MsrAccess()
 
 		return v.handleMsr(exit.VpContext, info)
+	case bindings.RunVPExitReasonX64ApicEoi:
+		if v.vm != nil && v.vm.ioapic != nil {
+			if ctx := exit.ApicEoi(); ctx != nil {
+				v.vm.ioapic.HandleEOI(ctx.InterruptVector)
+			}
+		}
+		return nil
 	case bindings.RunVPExitReasonCanceled:
 		if err := ctx.Err(); err != nil {
 			return err
