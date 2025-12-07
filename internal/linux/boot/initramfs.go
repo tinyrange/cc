@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-type initramfsFile struct {
+type InitFile struct {
 	Path     string
 	Mode     os.FileMode
 	Data     []byte
@@ -22,7 +22,7 @@ const (
 	newcRegularFileBit = 0o100000
 )
 
-func buildInitramfs(files []initramfsFile) ([]byte, error) {
+func buildInitramfs(files []InitFile) ([]byte, error) {
 	buf := &bytes.Buffer{}
 	ino := uint32(1)
 

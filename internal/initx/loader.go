@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"runtime"
 
@@ -337,13 +336,51 @@ func (vm *VirtualMachine) runProgram(
 	})
 }
 
+type Option interface {
+	apply(vm *VirtualMachine) error
+}
+
+type funcOption func(vm *VirtualMachine) error
+
+// apply implements Option.
+func (f funcOption) apply(vm *VirtualMachine) error {
+	return f(vm)
+}
+
+var (
+	_ Option = funcOption(nil)
+)
+
+func WithDevice(dev hv.Device) Option {
+	return funcOption(func(vm *VirtualMachine) error {
+		return vm.vm.AddDevice(dev)
+	})
+}
+
+func WithFileFromBytes(guestPath string, data []byte, mode os.FileMode) Option {
+	return funcOption(func(vm *VirtualMachine) error {
+		vm.loader.AdditionalFiles = append(vm.loader.AdditionalFiles, boot.InitFile{
+			Path: guestPath,
+			Data: data,
+			Mode: mode,
+		})
+		return nil
+	})
+}
+
+func WithDebugLogging(enabled bool) Option {
+	return funcOption(func(vm *VirtualMachine) error {
+		vm.debugLogging = enabled
+		return nil
+	})
+}
+
 func NewVirtualMachine(
 	h hv.Hypervisor,
 	numCPUs int,
 	memSizeMB uint64,
 	kernelLoader kernel.Kernel,
-	debug bool,
-	devices ...hv.DeviceTemplate,
+	options ...Option,
 ) (*VirtualMachine, error) {
 	in := &proxyReader{update: make(chan io.Reader)}
 	out := &proxyWriter{w: os.Stderr} // default to stderr so we can see debugging output
@@ -351,8 +388,6 @@ func NewVirtualMachine(
 	programLoader := &programLoader{}
 
 	var ret VirtualMachine
-
-	ret.debugLogging = debug
 
 	ret.outBuffer = out
 	ret.inBuffer = in
@@ -371,12 +406,6 @@ func NewVirtualMachine(
 				return 0
 			}
 		}(),
-
-		Devices: append(
-			devices,
-			virtio.ConsoleTemplate{Out: out, In: in, Arch: h.Architecture()},
-			programLoader,
-		),
 
 		GetKernel: func() (io.ReaderAt, int64, error) {
 			size, err := kernelLoader.Size()
@@ -456,11 +485,16 @@ func NewVirtualMachine(
 				return nil, fmt.Errorf("unsupported architecture for cmdline: %v", arch)
 			}
 
-			slog.Info("booting with cmdline", "args", args)
+			// slog.Info("booting with cmdline", "args", args)
 
 			return args, nil
 		},
 	}
+
+	ret.loader.Devices = append(ret.loader.Devices,
+		virtio.ConsoleTemplate{Out: out, In: in, Arch: h.Architecture()},
+		programLoader,
+	)
 
 	ret.loader.CreateVMWithMemory = func(vm hv.VirtualMachine) error {
 		if runtime.GOOS == "linux" && h.Architecture() == hv.ArchitectureARM64 {
@@ -476,6 +510,12 @@ func NewVirtualMachine(
 		programLoader.region = mem
 
 		return nil
+	}
+
+	for _, option := range options {
+		if err := option.apply(&ret); err != nil {
+			return nil, err
+		}
 	}
 
 	var err error

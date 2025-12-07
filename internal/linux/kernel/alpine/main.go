@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bufio"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/schollz/progressbar/v3"
 	"github.com/tinyrange/cc/internal/archive"
 	"github.com/tinyrange/cc/internal/hv"
 )
@@ -62,6 +64,8 @@ func (p *AlpinePackage) Size(filename string) (int64, error) {
 	return ent.Size, nil
 }
 
+var ErrPackageExpired = errors.New("package has expired")
+
 func openPackage(base string, maxAge time.Duration) (*AlpinePackage, error) {
 	idx, err := os.Open(base + ".idx")
 	if err != nil {
@@ -76,7 +80,7 @@ func openPackage(base string, maxAge time.Duration) (*AlpinePackage, error) {
 			return nil, fmt.Errorf("stat package index %q: %v", base+".idx", err)
 		}
 		if time.Since(info.ModTime()) > maxAge {
-			return nil, fmt.Errorf("package index %q is too old", base+".idx")
+			return nil, ErrPackageExpired
 		}
 	}
 
@@ -208,18 +212,35 @@ func (d *AlpineDownloader) convertToPackage(r io.Reader, kind string, cachePath 
 }
 
 func (d *AlpineDownloader) downloadAndConvert(url string, kind string, cachePath []string) (*AlpinePackage, error) {
+	var openError error
+
 	cacheFile := d.cacheFilePath(cachePath)
 	if pkg, err := openPackage(cacheFile, 24*time.Hour); err == nil {
 		return pkg, nil
+	} else {
+		openError = err
 	}
 
-	slog.Info("Downloading Alpine Linux file", "url", url)
+	slog.Info("Downloading Alpine Linux file",
+		"url", url,
+	)
 
 	resp, err := http.Get(url)
 	if err != nil {
+		if errors.Is(openError, ErrPackageExpired) {
+			slog.Warn("could not update package", "error", err)
+			return openPackage(cacheFile, 0)
+		}
 		return nil, fmt.Errorf("download %q: %v", url, err)
 	}
 	defer resp.Body.Close()
+
+	pb := progressbar.DefaultBytes(
+		resp.ContentLength,
+		"downloading",
+	)
+	defer pb.Close()
+	resp.Body = io.NopCloser(io.TeeReader(resp.Body, pb))
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("download %q: status code %d", url, resp.StatusCode)

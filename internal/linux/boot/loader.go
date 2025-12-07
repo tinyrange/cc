@@ -124,6 +124,8 @@ type LinuxLoader struct {
 
 	Devices []hv.DeviceTemplate
 
+	AdditionalFiles []InitFile
+
 	plan         bootPlan
 	kernelReader io.ReaderAt
 }
@@ -186,11 +188,12 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 		return err
 	}
 
-	files := []initramfsFile{
+	files := []InitFile{
 		{Path: "/init", Data: initPayload, Mode: os.FileMode(0o755)},
 		// add /dev/mem as /mem
 		{Path: "/mem", Data: nil, Mode: os.FileMode(0o600), DevMajor: 1, DevMinor: 1},
 	}
+	files = append(files, l.AdditionalFiles...)
 	initrd, err := buildInitramfs(files)
 	if err != nil {
 		return fmt.Errorf("build initramfs: %w", err)

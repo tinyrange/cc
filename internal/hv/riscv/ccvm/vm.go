@@ -11,7 +11,6 @@ import (
 	"os"
 	"runtime"
 	"slices"
-	"syscall"
 	"time"
 )
 
@@ -1728,26 +1727,26 @@ func RunVirtualMachine(memSize uint64, diskContents []byte, kernelContents []byt
 
 	start := time.Now()
 
-	if runtime.GOOS == "linux" {
-		if err := syscall.SetNonblock(int(os.Stdin.Fd()), true); err != nil {
-			return err
-		}
-	}
+	// if runtime.GOOS == "linux" {
+	// 	if err := syscall.SetNonblock(int(os.Stdin.Fd()), true); err != nil {
+	// 		return err
+	// 	}
+	// }
 
-	buf := make([]byte, 128)
+	// buf := make([]byte, 128)
 
 	for {
-		if runtime.GOOS == "linux" || runtime.GOOS == "wasip1" {
-			n, err := syscall.Read(int(os.Stdin.Fd()), buf)
-			if err == nil {
-				for i := 0; i < n; i++ {
-					select {
-					case vm.inputBytes <- buf[i]:
-					default:
-					}
-				}
-			}
-		}
+		// if runtime.GOOS == "linux" || runtime.GOOS == "wasip1" {
+		// 	n, err := syscall.Read(int(os.Stdin.Fd()), buf)
+		// 	if err == nil {
+		// 		for i := 0; i < n; i++ {
+		// 			select {
+		// 			case vm.inputBytes <- buf[i]:
+		// 			default:
+		// 			}
+		// 		}
+		// 	}
+		// }
 
 		if err := vm.Step(500000); err != nil {
 			if err == ErrStopOnZero {

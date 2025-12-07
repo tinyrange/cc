@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -1325,7 +1326,9 @@ func RunInitX(debug bool) error {
 		return fmt.Errorf("load kernel for architecture %s: %w", hv.Architecture(), err)
 	}
 
-	vm, err := initx.NewVirtualMachine(hv, 1, 256, kernel, debug)
+	vm, err := initx.NewVirtualMachine(hv, 1, 256, kernel,
+		initx.WithDebugLogging(debug),
+	)
 	if err != nil {
 		return fmt.Errorf("create initx virtual machine: %w", err)
 	}
@@ -1371,50 +1374,25 @@ func RunExecutable(path string) error {
 		return fmt.Errorf("load kernel for architecture %s: %w", hv.Architecture(), err)
 	}
 
-	vm, err := initx.NewVirtualMachine(hv, 1, 256, kernel, false)
+	fileData, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read executable file: %w", err)
+	}
+
+	vm, err := initx.NewVirtualMachine(hv, 1, 256, kernel,
+		initx.WithFileFromBytes("/initx-exec", fileData, fs.FileMode(0755)),
+	)
 	if err != nil {
 		return fmt.Errorf("create initx virtual machine: %w", err)
 	}
 	defer vm.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-
-	if err := vm.Run(ctx, &ir.Program{
-		Entrypoint: "main",
-		Methods: map[string]ir.Method{
-			"main": {
-				ir.Return(ir.Int64(0)),
-			},
-		},
-	}); err != nil {
-		return fmt.Errorf("run initx virtual machine: %w", err)
-	}
-
-	start := time.Now()
-
-	slog.Info("Writing Executable to InitX Virtual Machine", "path", path)
-
-	in, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open executable file: %w", err)
-	}
-	defer in.Close()
-
-	info, err := in.Stat()
-	if err != nil {
-		return fmt.Errorf("stat executable file: %w", err)
-	}
-
-	if err := vm.WriteFile(ctx, in, info.Size(), "/initx-exec"); err != nil {
-		return fmt.Errorf("write executable to initx virtual machine: %w", err)
-	}
-
-	slog.Info("Executable Write Completed", "duration", time.Since(start))
 
 	slog.Info("Running Executable in InitX Virtual Machine", "path", path)
 
-	if err := vm.Spawn(ctx, "/initx-exec"); err != nil {
+	if err := vm.Spawn(ctx, "/initx-exec", "-test.v"); err != nil {
 		return fmt.Errorf("run executable in initx virtual machine: %w", err)
 	}
 

@@ -59,6 +59,7 @@ type buildOptions struct {
 	Build            crossBuild
 	RaceEnabled      bool
 	EntitlementsPath string
+	BuildTests       bool
 }
 
 type buildOutput struct {
@@ -87,7 +88,14 @@ func goBuild(opts buildOptions) (buildOutput, error) {
 		env = append(env, "GOFLAGS=-race")
 	}
 
-	cmd := exec.Command("go", "build", "-o", output, pkg)
+	var args []string
+	if opts.BuildTests {
+		args = []string{"go", "test", "-c", "-o", output, pkg}
+	} else {
+		args = []string{"go", "build", "-o", output, pkg}
+	}
+
+	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Env = env
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -254,12 +262,11 @@ func main() {
 
 	if *bringup {
 		bringupOut, err := goBuild(buildOptions{
-			Package:          "cmd/bringup",
-			OutputName:       "bringup",
-			CgoEnabled:       false,
-			Build:            crossBuild{GOOS: "linux", GOARCH: hostBuild.GOARCH},
-			RaceEnabled:      *race,
-			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
+			Package:    "cmd/bringup",
+			OutputName: "bringup",
+			CgoEnabled: false,
+			Build:      crossBuild{GOOS: "linux", GOARCH: hostBuild.GOARCH},
+			BuildTests: true,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to build bringup tool: %v\n", err)
