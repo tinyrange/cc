@@ -3,7 +3,6 @@ package chipset
 import (
 	"encoding/binary"
 	"fmt"
-	"os"
 	"sync"
 
 	"github.com/tinyrange/cc/internal/hv"
@@ -152,7 +151,7 @@ func (i *IOAPIC) MMIORegions() []hv.MMIORegion {
 
 // ReadMMIO implements hv.MemoryMappedIODevice.
 func (i *IOAPIC) ReadMMIO(addr uint64, data []byte) error {
-	fmt.Fprintf(os.Stderr, "ioapic: read addr=%#x size=%d\n", addr, len(data))
+	// fmt.Fprintf(os.Stderr, "ioapic: read addr=%#x size=%d\n", addr, len(data))
 	if !i.inRange(addr, uint64(len(data))) {
 		return fmt.Errorf("ioapic: read outside MMIO window: 0x%x", addr)
 	}
@@ -180,7 +179,7 @@ func (i *IOAPIC) ReadMMIO(addr uint64, data []byte) error {
 
 // WriteMMIO implements hv.MemoryMappedIODevice.
 func (i *IOAPIC) WriteMMIO(addr uint64, data []byte) error {
-	fmt.Fprintf(os.Stderr, "ioapic: write addr=%#x size=%d data=%#v\n", addr, len(data), data)
+	// fmt.Fprintf(os.Stderr, "ioapic: write addr=%#x size=%d data=%#v\n", addr, len(data), data)
 	if !i.inRange(addr, uint64(len(data))) {
 		return fmt.Errorf("ioapic: write outside MMIO window: 0x%x", addr)
 	}

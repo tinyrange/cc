@@ -249,8 +249,9 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 
 	switch arch {
 	case hv.ArchitectureX86_64:
-		cmdline := append(cmdlineBase, virtioCmdline...)
-		cmdlineStr := strings.Join(cmdline, " ")
+		// For x86_64 with ACPI, don't add virtio_mmio command line params
+		// because the devices will be discovered via ACPI DSDT.
+		cmdlineStr := strings.Join(cmdlineBase, " ")
 		return l.loadAMD64(vm, kernelReader, kernelSize, cmdlineStr, initrd)
 	case hv.ArchitectureARM64:
 		cmdlineStr := strings.Join(cmdlineBase, " ")
@@ -458,6 +459,20 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 		}
 	}
 
+	// Collect virtio-mmio device info for ACPI DSDT
+	var virtioACPIDevices []acpi.VirtioMMIODevice
+	for i, dev := range l.Devices {
+		if vdev, ok := dev.(virtio.VirtioMMIODevice); ok {
+			info := vdev.GetACPIDeviceInfo()
+			virtioACPIDevices = append(virtioACPIDevices, acpi.VirtioMMIODevice{
+				Name:     fmt.Sprintf("VIO%d", i),
+				BaseAddr: info.BaseAddr,
+				Size:     info.Size,
+				GSI:      info.GSI,
+			})
+		}
+	}
+
 	if err := acpi.Install(vm, acpi.Config{
 		MemoryBase: memBase,
 		MemorySize: memSize,
@@ -472,6 +487,7 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 		HPET: &acpi.HPETConfig{
 			Address: hpetBaseAddress,
 		},
+		VirtioDevices: virtioACPIDevices,
 		ISAOverrides: []acpi.InterruptOverride{
 			// Legacy ISA routing: IRQ0->GSI2 (already used), IRQ1 keyboard, IRQ4 serial, IRQ8 RTC.
 			{Bus: 0, IRQ: 0, GSI: 2, Flags: 0},   // Timer (edge/high)

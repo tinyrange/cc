@@ -204,6 +204,18 @@ func irqLevel(vmFd int, irqLine uint32, level bool) error {
 	return err
 }
 
+// signalMSI sends an MSI interrupt to the guest.
+// This is used in split IRQ chip mode to inject interrupts from the userspace IOAPIC.
+func signalMSI(vmFd int, addressLo, addressHi, data uint32) error {
+	msi := kvmMSI{
+		AddressLo: addressLo,
+		AddressHi: addressHi,
+		Data:      data,
+	}
+	_, err := ioctlWithRetry(uintptr(vmFd), uint64(kvmSignalMsi), uintptr(unsafe.Pointer(&msi)))
+	return err
+}
+
 func getMsrIndexList(fd int) ([]uint32, error) {
 	baseSize := unsafe.Sizeof(kvmMsrList{})
 	buf := make([]byte, baseSize)

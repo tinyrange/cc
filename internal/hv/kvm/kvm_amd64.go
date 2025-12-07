@@ -365,10 +365,14 @@ func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 
 		vm.ioapic = chipset.NewIOAPIC(24)
 		vm.ioapic.SetRouting(chipset.IoApicRoutingFunc(func(vector, dest, destMode, deliveryMode uint8, level bool) {
-			// For KVM in-kernel routing, we assert via SetIRQ on the VM, which forwards to KVM_IRQ_LINE.
-			if err := vm.SetIRQ(uint32(vector), level); err != nil {
+			// In split IRQ chip mode, we inject interrupts via MSI to the in-kernel LAPIC.
+			// Only inject on assert (level=true); de-assert is handled by EOI.
+			if !level {
+				return
+			}
+			if err := vm.InjectInterrupt(vector, dest, destMode, deliveryMode); err != nil {
 				// Best-effort log; avoid hard fail to keep guest progressing.
-				fmt.Printf("kvm: inject IOAPIC interrupt vec=%d level=%t err=%v\n", vector, level, err)
+				fmt.Printf("kvm: inject IOAPIC interrupt vec=%d dest=%d err=%v\n", vector, dest, err)
 			}
 		}))
 		if err := vm.AddDevice(vm.ioapic); err != nil {

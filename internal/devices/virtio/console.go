@@ -90,6 +90,15 @@ func (t ConsoleTemplate) DeviceTreeNodes() ([]fdt.Node, error) {
 	return []fdt.Node{node}, nil
 }
 
+// GetACPIDeviceInfo implements VirtioMMIODevice.
+func (t ConsoleTemplate) GetACPIDeviceInfo() ACPIDeviceInfo {
+	return ACPIDeviceInfo{
+		BaseAddr: ConsoleDefaultMMIOBase,
+		Size:     ConsoleDefaultMMIOSize,
+		GSI:      t.IRQLine,
+	}
+}
+
 func (t ConsoleTemplate) Create(vm hv.VirtualMachine) (hv.Device, error) {
 	arch := t.archOrDefault(vm)
 	irqLine := t.irqLineForArch(arch)
