@@ -296,25 +296,39 @@ func (h *hypervisor) archVCPUInit(vm *virtualMachine, vcpu *virtualCPU) error {
 }
 
 // SetIRQ asserts an interrupt line. WHP only supports edge-triggered delivery for
-// our simple GIC setup, so we drop deassertions and inject the interrupt to vCPU0.
+// our simple GIC setup; we emulate level semantics by tracking asserted state
+// per INTID and only issuing a WHP request on rising edges. Deassert is recorded
+// for bookkeeping even though WHP currently has no explicit deassert.
 func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 	if v == nil {
 		return fmt.Errorf("whp: virtual machine is nil")
 	}
-	if !level {
-		return nil
-	}
 
-	const armIRQTypeShift = 24
+	const (
+		armIRQTypeShift = 24
+		armIRQTypeSPI   = 1
+		armSPIBase      = 32 // GIC SPIs start at INTID 32
+	)
+
 	irqType := (irqLine >> armIRQTypeShift) & 0xff
 	if irqType == 0 {
 		return fmt.Errorf("whp: interrupt type missing in irqLine %#x", irqLine)
 	}
 
-	// INTID carried in irqLine low bits; WHP doesn’t take it directly when
-	// asserting the line. We still decode it for future pending-state plumb.
-	intid := irqLine & 0xffff
-	_ = intid
+	// The low bits contain the SPI number (0-indexed offset from INTID 32).
+	// WHP's RequestInterrupt RequestedVector expects the full GIC INTID.
+	// For SPIs, we add 32 to convert from SPI number to INTID.
+	spiNum := irqLine & 0xffff
+	var intid uint32
+	if irqType == armIRQTypeSPI {
+		intid = spiNum + armSPIBase
+	} else {
+		intid = spiNum
+	}
+
+	if !v.arm64ShouldFire(intid, level) {
+		return nil
+	}
 
 	ctrl := bindings.InterruptControl{
 		InterruptControl: bindings.MakeInterruptControl2(
@@ -322,13 +336,12 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 			true,  // Asserted
 			false, // Retarget
 		),
-		TargetPartition:    0,
-		DestinationAddress: 0,
-		RequestedVector:    0, // must be zero for ARM64 WHP IRQ assertion
-		TargetVtl:          0,
+		TargetPartition: 0,
+		// WHP expects the GIC INTID in RequestedVector.
+		// For ARM64 GIC SPIs, this is the SPI number + 32.
+		RequestedVector: uint32(intid),
+		TargetVtl:       0,
 	}
 
-	// TODO: plumb a minimal GIC pending INTID model so the guest can observe
-	// intid as pending when it samples the distributor/CPU interface.
 	return bindings.RequestInterrupt(v.part, &ctrl)
 }

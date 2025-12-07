@@ -153,6 +153,11 @@ func defaultE820Map(memStart, memEnd uint64) []E820Entry {
 	return entries
 }
 
+// DefaultE820Map exposes the standard memory layout used by the loader.
+func DefaultE820Map(memStart, memEnd uint64) []E820Entry {
+	return defaultE820Map(memStart, memEnd)
+}
+
 // BootPlan captures the derived addresses required to hand control to the
 // kernel. After Prepare completes successfully, ConfigureVCPU can be used to
 // program the first vCPU.

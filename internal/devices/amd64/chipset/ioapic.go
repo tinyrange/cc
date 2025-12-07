@@ -151,6 +151,7 @@ func (i *IOAPIC) MMIORegions() []hv.MMIORegion {
 
 // ReadMMIO implements hv.MemoryMappedIODevice.
 func (i *IOAPIC) ReadMMIO(addr uint64, data []byte) error {
+	// fmt.Fprintf(os.Stderr, "ioapic: read addr=%#x size=%d\n", addr, len(data))
 	if !i.inRange(addr, uint64(len(data))) {
 		return fmt.Errorf("ioapic: read outside MMIO window: 0x%x", addr)
 	}
@@ -170,9 +171,9 @@ func (i *IOAPIC) ReadMMIO(addr uint64, data []byte) error {
 	}
 	i.mu.Unlock()
 
-	buf := make([]byte, 4)
+	buf := make([]byte, 8)
 	binary.LittleEndian.PutUint32(buf, value)
-	copy(data, buf[:min(len(data), 4)])
+	copy(data, buf[:min(len(data), 8)])
 	return nil
 }
 
@@ -194,7 +195,7 @@ func (i *IOAPIC) WriteMMIO(addr uint64, data []byte) error {
 		// If data is larger than 1 byte, we take the LSB (Little Endian).
 		i.index = data[0]
 	case ioapicRegisterData:
-		if len(data) != 4 {
+		if len(data) != 4 && len(data) != 8 {
 			return fmt.Errorf("ioapic: invalid data register write size %d", len(data))
 		}
 		value := binary.LittleEndian.Uint32(data)
@@ -312,6 +313,7 @@ func (r *irqRedirection) assert(router IoApicRouting, stats *ioapicStats, line u
 
 func (r *irqRedirection) deassert() {
 	r.lineLevel = false
+	r.redirection.setRemoteIRR(false)
 }
 
 func (r *irqRedirection) evaluate(router IoApicRouting, stats *ioapicStats, line uint8, edge bool) {

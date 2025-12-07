@@ -38,6 +38,25 @@ func (hv *hypervisor) initArm64VGIC(vm *virtualMachine) error {
 	return nil
 }
 
+// finalizeArm64VGIC completes vGIC initialization after vCPUs are created.
+// On ARM64, KVM requires at least one vCPU to exist before the vGIC can be finalized.
+func (hv *hypervisor) finalizeArm64VGIC(vm *virtualMachine) error {
+	if vm.arm64GICInfo.Version == hvpkg.Arm64GICVersionUnknown {
+		// vGIC was not configured
+		return nil
+	}
+
+	if vm.arm64VGICFd == 0 {
+		return fmt.Errorf("kvm: vGIC device fd not set")
+	}
+
+	if err := setDeviceAttr(vm.arm64VGICFd, &kvmDeviceAttr{Group: kvmDevArmVgicGrpCtrl, Attr: kvmDevArmVgicCtrlInit}); err != nil {
+		return fmt.Errorf("kvm: finalize VGIC (version=%d, fd=%d): %w", vm.arm64GICInfo.Version, vm.arm64VGICFd, err)
+	}
+
+	return nil
+}
+
 func (hv *hypervisor) initArm64VGICv3(vm *virtualMachine) error {
 	dev := kvmCreateDeviceArgs{
 		Type:  kvmDevTypeArmVgicV3,
@@ -51,21 +70,23 @@ func (hv *hypervisor) initArm64VGICv3(vm *virtualMachine) error {
 		return fmt.Errorf("kvm: create VGIC device: %w", err)
 	}
 
-	if err := setDeviceAttrU32(vm.vmFd, kvmDevArmVgicGrpNrIrqs, 0, arm64VGICNumIRQs); err != nil {
+	// Store the device fd for later use (finalization and attribute setting)
+	vm.arm64VGICFd = int(dev.Fd)
+
+	if err := setDeviceAttrU32(vm.arm64VGICFd, kvmDevArmVgicGrpNrIrqs, 0, arm64VGICNumIRQs); err != nil {
 		return fmt.Errorf("kvm: set VGIC IRQ count: %w", err)
 	}
 
-	if err := setDeviceAttrU64(vm.vmFd, kvmDevArmVgicGrpAddr, kvmVgicV3AddrTypeDist, arm64VGICDistributorBase); err != nil {
+	if err := setDeviceAttrU64(vm.arm64VGICFd, kvmDevArmVgicGrpAddr, kvmVgicV3AddrTypeDist, arm64VGICDistributorBase); err != nil {
 		return fmt.Errorf("kvm: set VGIC distributor address: %w", err)
 	}
 
-	if err := setDeviceAttrU64(vm.vmFd, kvmDevArmVgicGrpAddr, kvmVgicV3AddrTypeRedist, arm64VGICRedistributorBase); err != nil {
+	if err := setDeviceAttrU64(vm.arm64VGICFd, kvmDevArmVgicGrpAddr, kvmVgicV3AddrTypeRedist, arm64VGICRedistributorBase); err != nil {
 		return fmt.Errorf("kvm: set VGIC redistributor address: %w", err)
 	}
 
-	if err := setDeviceAttr(vm.vmFd, &kvmDeviceAttr{Group: kvmDevArmVgicGrpCtrl, Attr: kvmDevArmVgicCtrlInit}); err != nil {
-		return fmt.Errorf("kvm: initialize VGIC: %w", err)
-	}
+	// Note: KVM_DEV_ARM_VGIC_CTRL_INIT is called later in finalizeArm64VGIC
+	// after vCPUs are created, as required by the Linux kernel.
 
 	vm.arm64GICInfo = hvpkg.Arm64GICInfo{
 		Version:              hvpkg.Arm64GICVersion3,
@@ -89,13 +110,25 @@ func (hv *hypervisor) initArm64VGICv2(vm *virtualMachine) error {
 		return fmt.Errorf("kvm: create VGIC device: %w", err)
 	}
 
-	if err := setVgicV2Addr(vm.vmFd, kvmVgicV2AddrTypeDist, arm64VGICDistributorBase); err != nil {
+	// Store the device fd for later use (finalization)
+	vm.arm64VGICFd = int(dev.Fd)
+
+	// Set the number of IRQs
+	if err := setDeviceAttrU32(vm.arm64VGICFd, kvmDevArmVgicGrpNrIrqs, 0, arm64VGICNumIRQs); err != nil {
+		return fmt.Errorf("kvm: set VGIC IRQ count: %w", err)
+	}
+
+	// Set VGICv2 addresses via device attributes (preferred over legacy KVM_ARM_SET_DEVICE_ADDR)
+	if err := setDeviceAttrU64(vm.arm64VGICFd, kvmDevArmVgicGrpAddr, kvmVgicV2AddrTypeDist, arm64VGICDistributorBase); err != nil {
 		return fmt.Errorf("kvm: set VGIC distributor address: %w", err)
 	}
 
-	if err := setVgicV2Addr(vm.vmFd, kvmVgicV2AddrTypeCpu, arm64VGICv2CpuInterfaceBase); err != nil {
+	if err := setDeviceAttrU64(vm.arm64VGICFd, kvmDevArmVgicGrpAddr, kvmVgicV2AddrTypeCpu, arm64VGICv2CpuInterfaceBase); err != nil {
 		return fmt.Errorf("kvm: set VGIC CPU interface address: %w", err)
 	}
+
+	// Note: KVM_DEV_ARM_VGIC_CTRL_INIT is called later in finalizeArm64VGIC
+	// after vCPUs are created, as required by the Linux kernel.
 
 	vm.arm64GICInfo = hvpkg.Arm64GICInfo{
 		Version:              hvpkg.Arm64GICVersion2,

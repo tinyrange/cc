@@ -179,6 +179,27 @@ func arm64VectorHandlerFragment() asm.Fragment {
 	}
 }
 
+func validateIRQEncoding(arch hv.CpuArchitecture) error {
+	const irq = 58
+	encoded := virtio.EncodeIRQLineForArch(arch, irq)
+	switch arch {
+	case hv.ArchitectureARM64:
+		const armTypeShift = 24
+		const armTypeSPI = 1
+		want := uint32((armTypeSPI << armTypeShift) | (irq & 0xffff))
+		if encoded != want {
+			return fmt.Errorf("arm64 irq encoding: got %#x want %#x", encoded, want)
+		}
+	case hv.ArchitectureX86_64:
+		if encoded != irq {
+			return fmt.Errorf("amd64 irq encoding: got %d want %d", encoded, irq)
+		}
+	default:
+		// Other arches currently don't use EncodeIRQLineForArch; skip.
+	}
+	return nil
+}
+
 func (q *bringUpQuest) runTask(name string, f func() error) error {
 	return runWithTiming(name, f)
 }
@@ -387,6 +408,40 @@ func (q *bringUpQuest) Run() error {
 		defer q.dev.Close()
 		if q.architecture != hv.ArchitectureInvalid && q.architecture != q.dev.Architecture() {
 			return fmt.Errorf("requested architecture %s not available on this host (%s)", q.architecture, hostArch)
+		}
+	}
+
+	if q.dev != nil {
+		if err := q.runTask(fmt.Sprintf("IRQ smoke (%s)", q.dev.Architecture()), func() error {
+			arch := q.dev.Architecture()
+			vm, err := q.dev.NewVirtualMachine(hv.SimpleVMConfig{
+				NumCPUs:          1,
+				MemSize:          64 << 20, // 64 MiB
+				MemBase:          0,
+				InterruptSupport: true,
+			})
+			if err != nil {
+				return fmt.Errorf("create vm: %w", err)
+			}
+			defer vm.Close()
+
+			setter, ok := vm.(interface {
+				SetIRQ(uint32, bool) error
+			})
+			if !ok {
+				return fmt.Errorf("hypervisor %s does not expose SetIRQ", arch)
+			}
+
+			irq := virtio.EncodeIRQLineForArch(arch, 40)
+			if err := setter.SetIRQ(irq, true); err != nil {
+				return fmt.Errorf("assert irq: %w", err)
+			}
+			if err := setter.SetIRQ(irq, false); err != nil {
+				return fmt.Errorf("deassert irq: %w", err)
+			}
+			return nil
+		}); err != nil {
+			return err
 		}
 	}
 
@@ -1151,6 +1206,10 @@ func (q *bringUpQuest) RunLinux() error {
 		return fmt.Errorf("linux boot requested for %s but host hypervisor is %s", targetArch, q.dev.Architecture())
 	}
 
+	if err := validateIRQEncoding(targetArch); err != nil {
+		return fmt.Errorf("irq encoding validation failed: %w", err)
+	}
+
 	buf := &bytes.Buffer{}
 	var cmdline []string
 	switch q.dev.Architecture() {
@@ -1163,6 +1222,8 @@ func (q *bringUpQuest) RunLinux() error {
 		cmdline = []string{
 			"console=hvc0",
 			"quiet",
+			// "console=ttyS0,115200n8",
+			// "earlycon=uart8250,io,0x3f8",
 			"reboot=k",
 			"panic=-1",
 			"tsc=reliable",

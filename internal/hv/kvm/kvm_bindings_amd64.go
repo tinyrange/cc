@@ -166,6 +166,15 @@ func createPIT(vmFd int) error {
 	return err
 }
 
+func enableSplitIRQChip(vmFd int, numIrqs int) error {
+	var cap kvmEnableCapArgs
+	cap.Cap = kvmCapSplitIrqchip
+	cap.Flags = 0
+	cap.Args[0] = uint64(numIrqs)
+	_, err := ioctlWithRetry(uintptr(vmFd), uint64(kvmEnableCap), uintptr(unsafe.Pointer(&cap)))
+	return err
+}
+
 func getPitState(vmFd int) (kvmPitState2, error) {
 	var state kvmPitState2
 
@@ -192,6 +201,18 @@ func irqLevel(vmFd int, irqLine uint32, level bool) error {
 	}
 
 	_, err := ioctlWithRetry(uintptr(vmFd), uint64(kvmIrqLine), uintptr(unsafe.Pointer(&line)))
+	return err
+}
+
+// signalMSI sends an MSI interrupt to the guest.
+// This is used in split IRQ chip mode to inject interrupts from the userspace IOAPIC.
+func signalMSI(vmFd int, addressLo, addressHi, data uint32) error {
+	msi := kvmMSI{
+		AddressLo: addressLo,
+		AddressHi: addressHi,
+		Data:      data,
+	}
+	_, err := ioctlWithRetry(uintptr(vmFd), uint64(kvmSignalMsi), uintptr(unsafe.Pointer(&msi)))
 	return err
 }
 

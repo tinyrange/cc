@@ -5,16 +5,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"runtime"
 	"strings"
 
+	"github.com/tinyrange/cc/internal/acpi"
 	"github.com/tinyrange/cc/internal/asm/amd64"
 	"github.com/tinyrange/cc/internal/asm/arm64"
 	chipset "github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	amd64input "github.com/tinyrange/cc/internal/devices/amd64/input"
 	"github.com/tinyrange/cc/internal/devices/amd64/pci"
 	amd64serial "github.com/tinyrange/cc/internal/devices/amd64/serial"
+	"github.com/tinyrange/cc/internal/devices/hpet"
 	"github.com/tinyrange/cc/internal/devices/serial"
 	"github.com/tinyrange/cc/internal/devices/virtio"
 	"github.com/tinyrange/cc/internal/fdt"
@@ -30,9 +33,14 @@ type bootPlan interface {
 }
 
 const (
+	amd64ACPITablesSize = 0x10000
+	amd64StackGuard     = 0x1000
+
 	arm64UARTMMIOBase = 0x09000000
 	arm64UARTRegShift = 0
 	arm64UARTBaudRate = 115200
+
+	hpetBaseAddress = 0xFED00000
 )
 
 const (
@@ -207,6 +215,28 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 	cmdlineBase := append([]string(nil), cmdline...)
 	var virtioCmdline []string
 	var virtioNodes []fdt.Node
+	// Only allocate GSIs on x86. ARM64 virtio devices have architecture-specific
+	// defaults that work correctly with the GIC. Using the x86-style GSI allocator
+	// on ARM64 causes KVM_IRQ_LINE to fail with EINVAL.
+	if arch == hv.ArchitectureX86_64 {
+		allocator := NewGSIAllocator(16, []uint32{0, 1, 2, 4, 8, 9, 10})
+		for idx, dev := range l.Devices {
+			// Opportunistically assign GSIs to devices that haven't chosen one.
+			switch d := dev.(type) {
+			case virtio.ConsoleTemplate:
+				if d.IRQLine == 0 {
+					d.IRQLine = allocator.Allocate()
+					l.Devices[idx] = d
+				}
+			case virtio.FSTemplate:
+				if d.IRQLine == 0 {
+					d.IRQLine = allocator.Allocate()
+					l.Devices[idx] = d
+				}
+			}
+		}
+	}
+
 	for _, dev := range l.Devices {
 		if vdev, ok := dev.(virtio.VirtioMMIODevice); ok {
 			params, err := vdev.GetLinuxCommandLineParam()
@@ -224,8 +254,9 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 
 	switch arch {
 	case hv.ArchitectureX86_64:
-		cmdline := append(cmdlineBase, virtioCmdline...)
-		cmdlineStr := strings.Join(cmdline, " ")
+		// For x86_64 with ACPI, don't add virtio_mmio command line params
+		// because the devices will be discovered via ACPI DSDT.
+		cmdlineStr := strings.Join(cmdlineBase, " ")
 		return l.loadAMD64(vm, kernelReader, kernelSize, cmdlineStr, initrd)
 	case hv.ArchitectureARM64:
 		cmdlineStr := strings.Join(cmdlineBase, " ")
@@ -282,10 +313,54 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 		return fmt.Errorf("load kernel: %w", err)
 	}
 
-	plan, err := kernelImage.Prepare(vm, amd64boot.BootOptions{
+	numCPUs := l.NumCPUs
+	if numCPUs <= 0 {
+		numCPUs = 1
+	}
+
+	memBase := vm.MemoryBase()
+	memSize := vm.MemorySize()
+	if memSize <= amd64ACPITablesSize {
+		return fmt.Errorf("guest memory (%d bytes) too small for ACPI tables", memSize)
+	}
+	tablesBase := memBase + memSize - amd64ACPITablesSize
+
+	e820 := amd64boot.DefaultE820Map(memBase, memBase+memSize)
+	e820, err = reserveE820Region(e820, tablesBase, amd64ACPITablesSize)
+	if err != nil {
+		return fmt.Errorf("reserve ACPI tables in e820 map: %w", err)
+	}
+
+	opts := amd64boot.BootOptions{
 		Cmdline: cmdline,
 		Initrd:  initrd,
-	})
+		E820:    e820,
+	}
+
+	if len(initrd) > 0 {
+		reserveTop := tablesBase
+		initrdSize := uint64(len(initrd))
+		guard := uint64(amd64StackGuard)
+
+		if reserveTop <= memBase+guard || initrdSize >= reserveTop-memBase {
+			return fmt.Errorf("not enough space to place initrd below ACPI tables")
+		}
+
+		top := reserveTop - guard
+		if top <= memBase || top < initrdSize {
+			return fmt.Errorf("not enough space for initrd (size %d) with guard below ACPI tables", initrdSize)
+		}
+
+		opts.InitrdGPA = alignDown(top-initrdSize, 0x1000)
+	} else {
+		stackTop := tablesBase - amd64StackGuard
+		if stackTop <= memBase {
+			return fmt.Errorf("insufficient space for stack below ACPI tables")
+		}
+		opts.StackTopGPA = alignDown(stackTop, 0x10)
+	}
+
+	plan, err := kernelImage.Prepare(vm, opts)
 	if err != nil {
 		return fmt.Errorf("prepare kernel: %w", err)
 	}
@@ -310,12 +385,30 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 		return fmt.Errorf("add dual PIC: %w", err)
 	}
 
-	if err := vm.AddDevice(chipset.NewPIT(pic)); err != nil {
+	setter, _ := vm.(interface {
+		SetIRQ(uint32, bool) error
+	})
+	irqForwarder := chipset.IRQLineFunc(func(line uint8, level bool) {
+		if setter == nil {
+			return
+		}
+		if err := setter.SetIRQ(uint32(line), level); err != nil {
+			slog.Warn("set IRQ line", "line", line, "level", level, "err", err)
+		}
+	})
+
+	if err := vm.AddDevice(chipset.NewPIT(irqForwarder)); err != nil {
 		return fmt.Errorf("add PIT: %w", err)
 	}
 
-	if err := vm.AddDevice(chipset.NewCMOS(pic)); err != nil {
+	if err := vm.AddDevice(chipset.NewCMOS(irqForwarder)); err != nil {
 		return fmt.Errorf("add CMOS/RTC: %w", err)
+	}
+
+	if setter != nil {
+		if err := vm.AddDevice(hpet.New(hpetBaseAddress, setter)); err != nil {
+			return fmt.Errorf("add HPET device: %w", err)
+		}
 	}
 
 	if err := vm.AddDevice(chipset.NewResetControlPort()); err != nil {
@@ -371,7 +464,112 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 		}
 	}
 
+	// Collect virtio-mmio device info for ACPI DSDT
+	var virtioACPIDevices []acpi.VirtioMMIODevice
+	for i, dev := range l.Devices {
+		if vdev, ok := dev.(virtio.VirtioMMIODevice); ok {
+			info := vdev.GetACPIDeviceInfo()
+			virtioACPIDevices = append(virtioACPIDevices, acpi.VirtioMMIODevice{
+				Name:     fmt.Sprintf("VIO%d", i),
+				BaseAddr: info.BaseAddr,
+				Size:     info.Size,
+				GSI:      info.GSI,
+			})
+		}
+	}
+
+	if err := acpi.Install(vm, acpi.Config{
+		MemoryBase: memBase,
+		MemorySize: memSize,
+		TablesBase: tablesBase,
+		TablesSize: amd64ACPITablesSize,
+		NumCPUs:    numCPUs,
+		IOAPIC: acpi.IOAPICConfig{
+			ID:      0,
+			Address: uint32(chipset.IOAPICBaseAddress),
+			GSIBase: 0,
+		},
+		HPET: &acpi.HPETConfig{
+			Address: hpetBaseAddress,
+		},
+		VirtioDevices: virtioACPIDevices,
+		ISAOverrides: []acpi.InterruptOverride{
+			// Legacy ISA routing: IRQ0->GSI2 (already used), IRQ1 keyboard, IRQ4 serial, IRQ8 RTC.
+			{Bus: 0, IRQ: 0, GSI: 2, Flags: 0},   // Timer (edge/high)
+			{Bus: 0, IRQ: 1, GSI: 1, Flags: 0},   // Keyboard
+			{Bus: 0, IRQ: 4, GSI: 4, Flags: 0},   // COM1
+			{Bus: 0, IRQ: 8, GSI: 8, Flags: 0x0}, // RTC (edge/high)
+		},
+	}); err != nil {
+		return fmt.Errorf("install ACPI tables: %w", err)
+	}
+
 	return nil
+}
+
+func reserveE820Region(entries []amd64boot.E820Entry, base, size uint64) ([]amd64boot.E820Entry, error) {
+	if size == 0 {
+		return entries, nil
+	}
+	end := base + size
+
+	var out []amd64boot.E820Entry
+	var reserved bool
+
+	for _, ent := range entries {
+		entEnd := ent.Addr + ent.Size
+		if end <= ent.Addr || base >= entEnd {
+			out = append(out, ent)
+			continue
+		}
+
+		if base > ent.Addr {
+			out = append(out, amd64boot.E820Entry{
+				Addr: ent.Addr,
+				Size: base - ent.Addr,
+				Type: ent.Type,
+			})
+		}
+
+		resStart := base
+		if resStart < ent.Addr {
+			resStart = ent.Addr
+		}
+		resEnd := end
+		if resEnd > entEnd {
+			resEnd = entEnd
+		}
+
+		if resEnd > resStart {
+			out = append(out, amd64boot.E820Entry{
+				Addr: resStart,
+				Size: resEnd - resStart,
+				Type: 2, // Reserved
+			})
+			reserved = true
+		}
+
+		if resEnd < entEnd {
+			out = append(out, amd64boot.E820Entry{
+				Addr: resEnd,
+				Size: entEnd - resEnd,
+				Type: ent.Type,
+			})
+		}
+	}
+
+	if !reserved {
+		return entries, fmt.Errorf("reserved region [%#x, %#x) outside e820 map", base, end)
+	}
+
+	return out, nil
+}
+
+func alignDown(value, align uint64) uint64 {
+	if align == 0 {
+		return value
+	}
+	return value &^ (align - 1)
 }
 
 func (l *LinuxLoader) loadARM64(vm hv.VirtualMachine, kernelReader io.ReaderAt, kernelSize int64, cmdline string, initrd []byte, deviceTree []fdt.Node) error {

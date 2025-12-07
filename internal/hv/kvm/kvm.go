@@ -9,6 +9,8 @@ import (
 	"sync"
 	"unsafe"
 
+	"github.com/tinyrange/cc/internal/acpi"
+	"github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	"github.com/tinyrange/cc/internal/hv"
 	"golang.org/x/sys/unix"
 )
@@ -99,9 +101,11 @@ type virtualMachine struct {
 	// amd64-specific fields
 	hasIRQChip bool
 	hasPIT     bool
+	ioapic     *chipset.IOAPIC
 
 	// arm64-specific fields
 	arm64GICInfo hv.Arm64GICInfo
+	arm64VGICFd  int // vGIC device file descriptor
 }
 
 // implements hv.VirtualMachine.
@@ -146,6 +150,11 @@ func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.Memory
 // AddDevice implements hv.VirtualMachine.
 func (v *virtualMachine) AddDevice(dev hv.Device) error {
 	v.devices = append(v.devices, dev)
+
+	// Capture IOAPIC device for routing integration.
+	if ioa, ok := dev.(*chipset.IOAPIC); ok {
+		v.ioapic = ioa
+	}
 
 	return dev.Init(v)
 }
@@ -349,16 +358,15 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		return nil, fmt.Errorf("set user memory region: %w", err)
 	}
 
-	// Currently breaks virtio.
-	// if h.Architecture() == hv.ArchitectureX86_64 && config.NeedsInterruptSupport() {
-	// 	if err := acpi.Install(vm, acpi.Config{
-	// 		MemoryBase: config.MemoryBase(),
-	// 		MemorySize: config.MemorySize(),
-	// 	}); err != nil {
-	// 		unix.Close(vmFd)
-	// 		return nil, fmt.Errorf("install ACPI tables: %w", err)
-	// 	}
-	// }
+	if h.Architecture() == hv.ArchitectureX86_64 && config.NeedsInterruptSupport() {
+		if err := acpi.Install(vm, acpi.Config{
+			MemoryBase: config.MemoryBase(),
+			MemorySize: config.MemorySize(),
+		}); err != nil {
+			unix.Close(vmFd)
+			return nil, fmt.Errorf("install ACPI tables: %w", err)
+		}
+	}
 
 	if err := config.Callbacks().OnCreateVMWithMemory(vm); err != nil {
 		unix.Close(vmFd)
@@ -419,6 +427,12 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 			unix.Close(vmFd)
 			return nil, fmt.Errorf("VM callback OnCreateVCPU %d: %w", i, err)
 		}
+	}
+
+	// Post-vCPU architecture-specific initialization (e.g., vGIC finalization on ARM64)
+	if err := h.archPostVCPUInit(vm, config); err != nil {
+		unix.Close(vmFd)
+		return nil, fmt.Errorf("post-vCPU initialization: %w", err)
 	}
 
 	// Run Loader

@@ -18,6 +18,12 @@ type Config struct {
 
 	HPET *HPETConfig
 
+	// VirtioDevices describes virtio-mmio devices to add to the DSDT.
+	VirtioDevices []VirtioMMIODevice
+
+	// ISAOverrides emits MADT interrupt source overrides for legacy ISA IRQs.
+	ISAOverrides []InterruptOverride
+
 	OEM OEMInfo
 }
 
@@ -28,9 +34,25 @@ type IOAPICConfig struct {
 	GSIBase uint32
 }
 
+// VirtioMMIODevice describes a virtio-mmio device for DSDT generation.
+type VirtioMMIODevice struct {
+	Name     string // 4-char ACPI name (e.g., "VIO0")
+	BaseAddr uint64
+	Size     uint64
+	GSI      uint32 // Global System Interrupt number
+}
+
 // HPETConfig describes the optional HPET ACPI table.
 type HPETConfig struct {
 	Address uint64
+}
+
+// InterruptOverride describes a single MADT INT_SRC_OVR entry.
+type InterruptOverride struct {
+	Bus   uint8  // typically 0 (ISA)
+	IRQ   uint8  // source IRQ
+	GSI   uint32 // destination GSI
+	Flags uint16 // polarity/trigger encoding per ACPI spec
 }
 
 // OEMInfo mirrors the ACPI table header OEM fields.

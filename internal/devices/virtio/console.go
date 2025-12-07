@@ -1,6 +1,7 @@
 package virtio
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -15,7 +16,7 @@ import (
 const (
 	ConsoleDefaultMMIOBase = 0xd0000000
 	ConsoleDefaultMMIOSize = 0x200
-	ConsoleDefaultIRQLine  = 5
+	ConsoleDefaultIRQLine  = 10
 	armConsoleDefaultIRQ   = 40
 
 	consoleQueueCount   = 2
@@ -27,6 +28,10 @@ const (
 
 	queueReceive  = 0
 	queueTransmit = 1
+)
+
+const (
+	consoleFeatureSize = 1 << 0
 )
 
 type ConsoleTemplate struct {
@@ -85,10 +90,19 @@ func (t ConsoleTemplate) DeviceTreeNodes() ([]fdt.Node, error) {
 	return []fdt.Node{node}, nil
 }
 
+// GetACPIDeviceInfo implements VirtioMMIODevice.
+func (t ConsoleTemplate) GetACPIDeviceInfo() ACPIDeviceInfo {
+	return ACPIDeviceInfo{
+		BaseAddr: ConsoleDefaultMMIOBase,
+		Size:     ConsoleDefaultMMIOSize,
+		GSI:      t.IRQLine,
+	}
+}
+
 func (t ConsoleTemplate) Create(vm hv.VirtualMachine) (hv.Device, error) {
 	arch := t.archOrDefault(vm)
 	irqLine := t.irqLineForArch(arch)
-	encodedLine := encodeConsoleIRQLine(arch, irqLine)
+	encodedLine := EncodeIRQLineForArch(arch, irqLine)
 	console := &Console{
 		base:    ConsoleDefaultMMIOBase,
 		size:    ConsoleDefaultMMIOSize,
@@ -117,13 +131,22 @@ type Console struct {
 	mu      sync.Mutex
 	pending []byte
 	arch    hv.CpuArchitecture
+	config  consoleConfig
+}
+
+type consoleConfig struct {
+	cols       uint16
+	rows       uint16
+	maxNrPorts uint32
+	emergWrite uint32
 }
 
 func (vc *Console) setupDevice(vm hv.VirtualMachine) {
 	if vm != nil && vm.Hypervisor() != nil {
 		vc.arch = vm.Hypervisor().Architecture()
 	}
-	vc.device = newMMIODevice(vm, vc.base, vc.size, vc.irqLine, consoleDeviceID, consoleVendorID, consoleVersion, []uint64{virtioFeatureVersion1}, vc)
+	vc.setDefaultConfig()
+	vc.device = newMMIODevice(vm, vc.base, vc.size, vc.irqLine, consoleDeviceID, consoleVendorID, consoleVersion, []uint64{virtioFeatureVersion1 | consoleFeatureSize}, vc)
 	if mmio, ok := vc.device.(*mmioDevice); ok && vm != nil {
 		mmio.vm = vm
 	}
@@ -191,7 +214,10 @@ func (vc *Console) requireDevice() (device, error) {
 	return vc.device, nil
 }
 
-func encodeConsoleIRQLine(arch hv.CpuArchitecture, irqLine uint32) uint32 {
+// EncodeIRQLineForArch returns the hypervisor-specific IRQ line encoding. On
+// arm64 we embed the SPI type in the high bits as expected by KVM/WHP; on other
+// architectures the line is returned unchanged.
+func EncodeIRQLineForArch(arch hv.CpuArchitecture, irqLine uint32) uint32 {
 	if arch != hv.ArchitectureARM64 {
 		return irqLine
 	}
@@ -244,12 +270,29 @@ func (vc *Console) OnQueueNotify(dev device, queue int) error {
 	return nil
 }
 
-func (vc *Console) ReadConfig(device, uint64) (uint32, bool, error) {
-	return 0, false, nil
+func (vc *Console) ReadConfig(device device, offset uint64) (uint32, bool, error) {
+	if offset < VIRTIO_MMIO_CONFIG {
+		return 0, false, nil
+	}
+
+	rel := offset - VIRTIO_MMIO_CONFIG
+	cfg := vc.configBytes()
+	if int(rel) >= len(cfg) {
+		return 0, true, nil
+	}
+
+	var buf [4]byte
+	copy(buf[:], cfg[rel:])
+	return binary.LittleEndian.Uint32(buf[:]), true, nil
 }
 
-func (vc *Console) WriteConfig(device, uint64, uint32) (bool, error) {
-	return false, nil
+func (vc *Console) WriteConfig(device device, offset uint64, value uint32) (bool, error) {
+	if offset < VIRTIO_MMIO_CONFIG {
+		return false, nil
+	}
+	// The current console device exposes read-only config.
+	_ = value
+	return true, nil
 }
 
 func (vc *Console) processTransmitQueue(dev device, q *queue) error {
@@ -487,6 +530,7 @@ func (vc *Console) RestoreSnapshot(snap hv.DeviceSnapshot) error {
 	vc.size = data.Size
 	vc.irqLine = data.IRQLine
 	vc.pending = append(vc.pending[:0], data.Pending...)
+	vc.setDefaultConfig()
 
 	if mmio, ok := vc.device.(*mmioDevice); ok {
 		mmio.base = vc.base
@@ -494,4 +538,23 @@ func (vc *Console) RestoreSnapshot(snap hv.DeviceSnapshot) error {
 	}
 
 	return nil
+}
+
+func (vc *Console) setDefaultConfig() {
+	vc.config = consoleConfig{
+		cols:       80,
+		rows:       25,
+		maxNrPorts: 1,
+		emergWrite: 0,
+	}
+}
+
+func (vc *Console) configBytes() []byte {
+	cfg := vc.config
+	var buf [12]byte
+	binary.LittleEndian.PutUint16(buf[0:2], cfg.cols)
+	binary.LittleEndian.PutUint16(buf[2:4], cfg.rows)
+	binary.LittleEndian.PutUint32(buf[4:8], cfg.maxNrPorts)
+	binary.LittleEndian.PutUint32(buf[8:12], cfg.emergWrite)
+	return buf[:]
 }

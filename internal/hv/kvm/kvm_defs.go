@@ -25,6 +25,7 @@ const (
 	kvmSetUserMemoryRegion    = 0x4020ae46
 	kvmGetClock               = 0x8030ae7c
 	kvmSetClock               = 0x4030ae7b
+	kvmSetGsiRouting          = 0x4008ae6a
 	kvmGetOneReg              = 0x4010aeab
 	kvmSetOneReg              = 0x4010aeac
 	kvmGetPit2                = 0x8070ae9f
@@ -52,6 +53,7 @@ const (
 	kvmSetMsrs                = 0x4008ae89
 	kvmArmVcpuInitIoctl       = 0x4020aeae
 	kvmArmPreferredTarget     = 0x8020aeaf
+	kvmEnableCap              = 0x4068aea3
 
 	kvmCapNrMemslots = 10
 )
@@ -59,7 +61,15 @@ const (
 const (
 	kvmDevTypeArmVgicV2 = 5
 	kvmDevTypeArmVgicV3 = 7
+
+	kvmCapSplitIrqchip = 121
 )
+
+type kvmEnableCapArgs struct {
+	Cap   uint32
+	Flags uint32
+	Args  [4]uint64
+}
 
 const (
 	kvmArmDeviceIdShift = 16

@@ -105,10 +105,19 @@ func (t FSTemplate) DeviceTreeNodes() ([]fdt.Node, error) {
 	return []fdt.Node{node}, nil
 }
 
+// GetACPIDeviceInfo implements VirtioMMIODevice.
+func (t FSTemplate) GetACPIDeviceInfo() ACPIDeviceInfo {
+	return ACPIDeviceInfo{
+		BaseAddr: FsDefaultMMIOBase,
+		Size:     FsDefaultMMIOSize,
+		GSI:      t.IRQLine,
+	}
+}
+
 func (t FSTemplate) Create(vm hv.VirtualMachine) (hv.Device, error) {
 	arch := t.archOrDefault(vm)
 	irqLine := t.irqLineForArch(arch)
-	fs := NewFS(vm, FsDefaultMMIOBase, FsDefaultMMIOSize, encodeConsoleIRQLine(arch, irqLine), t.Tag, t.Backend)
+	fs := NewFS(vm, FsDefaultMMIOBase, FsDefaultMMIOSize, EncodeIRQLineForArch(arch, irqLine), t.Tag, t.Backend)
 	if err := fs.Init(vm); err != nil {
 		return nil, fmt.Errorf("virtio-fs: initialize device: %w", err)
 	}

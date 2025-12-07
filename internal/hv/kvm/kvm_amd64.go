@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"unsafe"
 
+	"github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	"github.com/tinyrange/cc/internal/hv"
 	"golang.org/x/sys/unix"
 )
@@ -345,18 +346,46 @@ func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 	}
 
 	if config.NeedsInterruptSupport() {
-		if err := createIRQChip(vm.vmFd); err != nil {
+		// Enable split IRQ chip so IOAPIC is handled in userspace and PIC remains in-kernel.
+		if err := enableSplitIRQChip(vm.vmFd, 24); err != nil && err != unix.EINVAL && err != unix.ENOTTY {
+			return fmt.Errorf("enable split irqchip: %w", err)
+		}
+
+		if err := createIRQChip(vm.vmFd); err != nil && err != unix.EEXIST {
 			return fmt.Errorf("creating IRQ chip: %w", err)
 		}
 
 		vm.hasIRQChip = true
 
-		if err := createPIT(vm.vmFd); err != nil {
+		if err := createPIT(vm.vmFd); err != nil && err != unix.ENOENT {
 			return fmt.Errorf("creating PIT: %w", err)
+		} else if err == nil {
+			vm.hasPIT = true
 		}
-		vm.hasPIT = true
+
+		vm.ioapic = chipset.NewIOAPIC(24)
+		vm.ioapic.SetRouting(chipset.IoApicRoutingFunc(func(vector, dest, destMode, deliveryMode uint8, level bool) {
+			// In split IRQ chip mode, we inject interrupts via MSI to the in-kernel LAPIC.
+			// Only inject on assert (level=true); de-assert is handled by EOI.
+			if !level {
+				return
+			}
+			if err := vm.InjectInterrupt(vector, dest, destMode, deliveryMode); err != nil {
+				// Best-effort log; avoid hard fail to keep guest progressing.
+				fmt.Printf("kvm: inject IOAPIC interrupt vec=%d dest=%d err=%v\n", vector, dest, err)
+			}
+		}))
+		if err := vm.AddDevice(vm.ioapic); err != nil {
+			return fmt.Errorf("add IOAPIC device: %w", err)
+		}
 	}
 
+	return nil
+}
+
+// archPostVCPUInit is called after all vCPUs are created.
+// On x86, no post-vCPU initialization is needed.
+func (hv *hypervisor) archPostVCPUInit(vm *virtualMachine, config hv.VMConfig) error {
 	return nil
 }
 
