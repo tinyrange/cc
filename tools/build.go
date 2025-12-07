@@ -213,7 +213,7 @@ func main() {
 
 	if *oci {
 		out, err := goBuild(buildOptions{
-			Package:    "cmd/oci",
+			Package:    "internal/cmd/oci",
 			OutputName: "oci",
 			Build:      hostBuild,
 		})
@@ -231,7 +231,7 @@ func main() {
 
 	if *kernel {
 		out, err := goBuild(buildOptions{
-			Package:    "cmd/kernel",
+			Package:    "internal/cmd/kernel",
 			OutputName: "kernel",
 			Build:      hostBuild,
 		})
@@ -249,7 +249,7 @@ func main() {
 
 	if *quest {
 		out, err := goBuild(buildOptions{
-			Package:          "cmd/quest",
+			Package:          "internal/cmd/quest",
 			OutputName:       "quest",
 			Build:            hostBuild,
 			RaceEnabled:      *race,
@@ -269,7 +269,7 @@ func main() {
 
 	if *bringup {
 		bringupOut, err := goBuild(buildOptions{
-			Package:    "cmd/bringup",
+			Package:    "internal/cmd/bringup",
 			OutputName: "bringup",
 			CgoEnabled: false,
 			Build:      crossBuild{GOOS: "linux", GOARCH: hostBuild.GOARCH},
@@ -282,7 +282,7 @@ func main() {
 		}
 
 		out, err := goBuild(buildOptions{
-			Package:          "cmd/quest",
+			Package:          "internal/cmd/quest",
 			OutputName:       "quest",
 			Build:            hostBuild,
 			RaceEnabled:      *race,
@@ -305,7 +305,7 @@ func main() {
 		for _, cb := range crossBuilds {
 			fmt.Printf("Building for %s/%s...\n", cb.GOOS, cb.GOARCH)
 			_, err := goBuild(buildOptions{
-				Package:          "cmd/quest",
+				Package:          "internal/cmd/quest",
 				OutputName:       "quest",
 				Build:            cb,
 				EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
