@@ -197,7 +197,7 @@ const (
 // Minimal structs we need on the wire (host end)
 // Note: All little-endian.
 
-type fuseAttr struct {
+type FuseAttr struct {
 	Ino       uint64
 	Size      uint64
 	Blocks    uint64
@@ -218,7 +218,7 @@ type fuseAttr struct {
 
 const fuseEntryOutSize = 8 + 8 + 8 + 8 + 8 + 8 + 8 + 0 // we’ll compose manually
 
-func encodeFuseAttr(dst []byte, attr fuseAttr) {
+func encodeFuseAttr(dst []byte, attr FuseAttr) {
 	if len(dst) < 88 {
 		return
 	}
@@ -278,11 +278,11 @@ type FsBackend interface {
 	Init() (maxWrite uint32, flags uint32)
 
 	// Root attributes; NodeID 1 is the root.
-	GetAttr(nodeID uint64) (attr fuseAttr, errno int32)
+	GetAttr(nodeID uint64) (attr FuseAttr, errno int32)
 
 	// Lookup child by name under a directory nodeID. Must return new Ino,
 	// attributes and a generation (we pass 0).
-	Lookup(parent uint64, name string) (nodeID uint64, attr fuseAttr, errno int32)
+	Lookup(parent uint64, name string) (nodeID uint64, attr FuseAttr, errno int32)
 
 	Open(nodeID uint64, flags uint32) (fh uint64, errno int32)
 	Release(nodeID uint64, fh uint64)
@@ -300,18 +300,18 @@ type FsBackend interface {
 type emptyBackend struct{}
 
 func (emptyBackend) Init() (uint32, uint32) { return 128 * 1024, 0 }
-func (emptyBackend) GetAttr(nodeID uint64) (fuseAttr, int32) {
+func (emptyBackend) GetAttr(nodeID uint64) (FuseAttr, int32) {
 	// Root dir with 0755
 	if nodeID != 1 {
-		return fuseAttr{}, -int32(unix.ENOENT)
+		return FuseAttr{}, -int32(unix.ENOENT)
 	}
-	return fuseAttr{
+	return FuseAttr{
 		Ino: 1, Mode: 0040000 | 0755, NLink: 2, UID: 0, GID: 0,
 		BlkSize: 4096,
 	}, 0
 }
-func (emptyBackend) Lookup(_ uint64, _ string) (uint64, fuseAttr, int32) {
-	return 0, fuseAttr{}, -int32(unix.ENOENT)
+func (emptyBackend) Lookup(_ uint64, _ string) (uint64, FuseAttr, int32) {
+	return 0, FuseAttr{}, -int32(unix.ENOENT)
 }
 func (emptyBackend) Open(nodeID uint64, _ uint32) (uint64, int32) {
 	if nodeID == 1 {

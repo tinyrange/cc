@@ -351,9 +351,10 @@ var (
 	_ Option = funcOption(nil)
 )
 
-func WithDevice(dev hv.Device) Option {
+func WithDeviceTemplate(dev hv.DeviceTemplate) Option {
 	return funcOption(func(vm *VirtualMachine) error {
-		return vm.vm.AddDevice(dev)
+		vm.loader.Devices = append(vm.loader.Devices, dev)
+		return nil
 	})
 }
 
@@ -432,11 +433,13 @@ func NewVirtualMachine(
 					"CONFIG_VIRTIO_BLK",
 					"CONFIG_VIRTIO_NET",
 					"CONFIG_VIRTIO_CONSOLE",
+					"CONFIG_VIRTIO_FS",
 				},
 				map[string]string{
 					"CONFIG_VIRTIO_BLK":  "kernel/drivers/block/virtio_blk.ko.gz",
 					"CONFIG_VIRTIO_NET":  "kernel/drivers/net/virtio_net.ko.gz",
 					"CONFIG_VIRTIO_MMIO": "kernel/drivers/virtio/virtio_mmio.ko.gz",
+					"CONFIG_VIRTIO_FS":   "kernel/fs/fuse/virtiofs.ko.gz",
 				},
 			)
 			if err != nil {
