@@ -52,6 +52,13 @@ const (
 	psrFBit     = 0x40
 )
 
+// isSuccessfulVMExit checks if an error from vcpu.Run indicates successful VM termination
+func isSuccessfulVMExit(err error) bool {
+	return errors.Is(err, hv.ErrVMHalted) ||
+		errors.Is(err, hv.ErrGuestRequestedReboot) ||
+		errors.Is(err, hv.ErrYield)
+}
+
 // Run implements hv.RunConfig.
 func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 	arch := vcpu.VirtualMachine().Hypervisor().Architecture()
@@ -84,9 +91,7 @@ func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 
 		for range p.MaxLoopIterations {
 			if err := vcpu.Run(ctx); err != nil {
-				if errors.Is(err, hv.ErrVMHalted) ||
-					errors.Is(err, hv.ErrGuestRequestedReboot) ||
-					errors.Is(err, hv.ErrYield) {
+				if isSuccessfulVMExit(err) {
 					return nil
 				}
 				return fmt.Errorf("run vCPU: %w", err)
@@ -115,9 +120,7 @@ func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 
 		for range p.MaxLoopIterations {
 			if err := vcpu.Run(ctx); err != nil {
-				if errors.Is(err, hv.ErrVMHalted) ||
-					errors.Is(err, hv.ErrGuestRequestedReboot) ||
-					errors.Is(err, hv.ErrYield) {
+				if isSuccessfulVMExit(err) {
 					return nil
 				}
 				return fmt.Errorf("run vCPU: %w", err)
@@ -139,9 +142,7 @@ func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 
 		for range p.MaxLoopIterations {
 			if err := vcpu.Run(ctx); err != nil {
-				if errors.Is(err, hv.ErrVMHalted) ||
-					errors.Is(err, hv.ErrGuestRequestedReboot) ||
-					errors.Is(err, hv.ErrYield) {
+				if isSuccessfulVMExit(err) {
 					return nil
 				}
 				return fmt.Errorf("run vCPU: %w", err)
