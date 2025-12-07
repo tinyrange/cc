@@ -65,22 +65,23 @@ type IoApicRouting interface {
 	// dest: The target CPU ID or APIC ID.
 	// destMode: 0 for Physical, 1 for Logical.
 	// deliveryMode: 0 for Fixed, 1 for LowestPriority, etc.
-	Assert(vector uint8, dest uint8, destMode uint8, deliveryMode uint8)
+	// level: true when the redirection entry is configured for level-triggered delivery.
+	Assert(vector uint8, dest uint8, destMode uint8, deliveryMode uint8, level bool)
 }
 
 // IoApicRoutingFunc adapts a simple function to IoApicRouting.
-type IoApicRoutingFunc func(vector uint8, dest uint8, destMode uint8, deliveryMode uint8)
+type IoApicRoutingFunc func(vector uint8, dest uint8, destMode uint8, deliveryMode uint8, level bool)
 
 // Assert implements IoApicRouting.
-func (f IoApicRoutingFunc) Assert(vector uint8, dest uint8, destMode uint8, deliveryMode uint8) {
+func (f IoApicRoutingFunc) Assert(vector uint8, dest uint8, destMode uint8, deliveryMode uint8, level bool) {
 	if f != nil {
-		f(vector, dest, destMode, deliveryMode)
+		f(vector, dest, destMode, deliveryMode, level)
 	}
 }
 
 type noopIoApicRouting struct{}
 
-func (noopIoApicRouting) Assert(uint8, uint8, uint8, uint8) {}
+func (noopIoApicRouting) Assert(uint8, uint8, uint8, uint8, bool) {}
 
 // NewIOAPIC builds an IO-APIC exposing numEntries redirection slots.
 func NewIOAPIC(numEntries int) *IOAPIC {
@@ -341,6 +342,7 @@ func (r *irqRedirection) evaluate(router IoApicRouting, stats *ioapicStats, line
 		r.redirection.destination(),
 		destMode,
 		r.redirection.deliveryMode(),
+		isLevel,
 	)
 }
 

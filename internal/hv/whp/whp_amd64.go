@@ -370,6 +370,31 @@ func (h *hypervisor) archVMInitWithMemory(vm *virtualMachine, config hv.VMConfig
 			return fmt.Errorf("add HPET device: %w", err)
 		}
 		vm.ioapic = chipset.NewIOAPIC(24)
+		vm.ioapic.SetRouting(chipset.IoApicRoutingFunc(func(vector, dest, destMode, deliveryMode uint8, level bool) {
+			intType := bindings.InterruptTypeFixed
+			switch deliveryMode {
+			case 0x1: // Lowest priority
+				intType = bindings.InterruptTypeLowestPriority
+			case 0x4: // NMI
+				intType = bindings.InterruptTypeNmi
+			default:
+				intType = bindings.InterruptTypeFixed
+			}
+
+			destModeKind := bindings.InterruptDestinationPhysical
+			if destMode != 0 {
+				destModeKind = bindings.InterruptDestinationLogical
+			}
+
+			trigger := bindings.InterruptTriggerEdge
+			if level {
+				trigger = bindings.InterruptTriggerLevel
+			}
+
+			if err := vm.RequestInterrupt(uint32(dest), uint32(vector), intType, destModeKind, trigger); err != nil {
+				slog.Error("inject IOAPIC interrupt", "vector", vector, "dest", dest, "err", err)
+			}
+		}))
 		if err := vm.AddDevice(vm.ioapic); err != nil {
 			return fmt.Errorf("add IOAPIC device: %w", err)
 		}
@@ -595,12 +620,15 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 	return nil
 }
 
-func (v *virtualMachine) RequestInterrupt(dest uint32, vector uint32, intType bindings.InterruptType, destMode uint32) error {
+func (v *virtualMachine) RequestInterrupt(dest uint32, vector uint32, intType bindings.InterruptType, destMode bindings.InterruptDestinationMode, trigger bindings.InterruptTriggerMode) error {
+	if trigger == 0 {
+		trigger = bindings.InterruptTriggerEdge
+	}
 	return bindings.RequestInterrupt(v.part, &bindings.InterruptControl{
 		Control: bindings.MakeInterruptControlKind(
 			intType,
-			bindings.InterruptDestinationMode(destMode),
-			bindings.InterruptTriggerEdge,
+			destMode,
+			trigger,
 			0,
 		),
 		Destination: dest,
