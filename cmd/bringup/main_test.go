@@ -1,3 +1,5 @@
+//go:build guest
+
 package main
 
 import "testing"

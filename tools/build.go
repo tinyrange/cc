@@ -60,6 +60,7 @@ type buildOptions struct {
 	RaceEnabled      bool
 	EntitlementsPath string
 	BuildTests       bool
+	Tags             []string
 }
 
 type buildOutput struct {
@@ -90,10 +91,16 @@ func goBuild(opts buildOptions) (buildOutput, error) {
 
 	var args []string
 	if opts.BuildTests {
-		args = []string{"go", "test", "-c", "-o", output, pkg}
+		args = []string{"go", "test", "-c", "-o", output}
 	} else {
-		args = []string{"go", "build", "-o", output, pkg}
+		args = []string{"go", "build", "-o", output}
 	}
+
+	if len(opts.Tags) > 0 {
+		args = append(args, "-tags", strings.Join(opts.Tags, " "))
+	}
+
+	args = append(args, pkg)
 
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Env = env
@@ -267,6 +274,7 @@ func main() {
 			CgoEnabled: false,
 			Build:      crossBuild{GOOS: "linux", GOARCH: hostBuild.GOARCH},
 			BuildTests: true,
+			Tags:       []string{"guest"},
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to build bringup tool: %v\n", err)
