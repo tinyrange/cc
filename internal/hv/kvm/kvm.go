@@ -104,8 +104,8 @@ type virtualMachine struct {
 	ioapic     *chipset.IOAPIC
 
 	// arm64-specific fields
-	arm64GICInfo  hv.Arm64GICInfo
-	arm64VGICFd   int // vGIC device file descriptor
+	arm64GICInfo hv.Arm64GICInfo
+	arm64VGICFd  int // vGIC device file descriptor
 }
 
 // implements hv.VirtualMachine.

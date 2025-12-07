@@ -109,11 +109,11 @@ func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 
 		for range p.MaxLoopIterations {
 			if err := vcpu.Run(ctx); err != nil {
-			return fmt.Errorf("run vCPU: %w", err)
+				return fmt.Errorf("run vCPU: %w", err)
+			}
 		}
-	}
 
-	return fmt.Errorf("maximum loop iterations (%d) exceeded", p.MaxLoopIterations)
+		return fmt.Errorf("maximum loop iterations (%d) exceeded", p.MaxLoopIterations)
 	case hv.ArchitectureRISCV64:
 		if p.Mode != Mode64BitIdentityMapping {
 			return fmt.Errorf("unsupported load mode %v for architecture %v", p.Mode, arch)

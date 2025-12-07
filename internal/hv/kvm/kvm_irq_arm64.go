@@ -6,9 +6,9 @@ import "fmt"
 
 // ARM64 KVM IRQ type encoding (bits 31-24 of irq field)
 const (
-	kvmArmIRQTypeSPI   = 1  // Shared Peripheral Interrupt
-	armIRQTypeShift    = 24 // Shift for IRQ type in encoded irqLine
-	armSPIBase         = 32 // GIC SPIs start at INTID 32
+	kvmArmIRQTypeSPI = 1  // Shared Peripheral Interrupt
+	armIRQTypeShift  = 24 // Shift for IRQ type in encoded irqLine
+	armSPIBase       = 32 // GIC SPIs start at INTID 32
 )
 
 // SetIRQ asserts or deasserts an interrupt line on arm64.

@@ -176,7 +176,7 @@ func emitCRS(buf *bytes.Buffer, io ioRange, irq uint8) {
 
 	rt := template.Bytes()
 	bufferBody := bytes.Buffer{}
-	bufferBody.WriteByte(0x0a)        // BytePrefix for AML integer
+	bufferBody.WriteByte(0x0a)          // BytePrefix for AML integer
 	bufferBody.WriteByte(byte(len(rt))) // Buffer size
 	bufferBody.Write(rt)
 
@@ -194,20 +194,20 @@ func emitVirtioCRS(buf *bytes.Buffer, baseAddr, size uint64, gsi uint32) {
 
 	// Memory32Fixed Descriptor (large resource, type 0x86)
 	// Format: Tag(2) + Length(1) + ReadWrite(1) + BaseAddr(4) + Length(4)
-	template.WriteByte(0x86)       // Memory32Fixed tag
-	template.WriteByte(0x09)       // Length low byte (9 bytes follow)
-	template.WriteByte(0x00)       // Length high byte
-	template.WriteByte(0x01)       // Read/Write (1 = read-write)
+	template.WriteByte(0x86) // Memory32Fixed tag
+	template.WriteByte(0x09) // Length low byte (9 bytes follow)
+	template.WriteByte(0x00) // Length high byte
+	template.WriteByte(0x01) // Read/Write (1 = read-write)
 	binary.Write(&template, binary.LittleEndian, uint32(baseAddr))
 	binary.Write(&template, binary.LittleEndian, uint32(size))
 
 	// Extended Interrupt Descriptor (large resource, type 0x89)
 	// Format: Tag(2) + Length(2) + Flags(1) + Count(1) + Interrupts(4*count)
-	template.WriteByte(0x89)       // Extended Interrupt tag
-	template.WriteByte(0x06)       // Length low byte (6 bytes follow)
-	template.WriteByte(0x00)       // Length high byte
-	template.WriteByte(0x09)       // Flags: consumer, level, active-high, exclusive (for IOAPIC)
-	template.WriteByte(0x01)       // Interrupt count
+	template.WriteByte(0x89) // Extended Interrupt tag
+	template.WriteByte(0x06) // Length low byte (6 bytes follow)
+	template.WriteByte(0x00) // Length high byte
+	template.WriteByte(0x09) // Flags: consumer, level, active-high, exclusive (for IOAPIC)
+	template.WriteByte(0x01) // Interrupt count
 	binary.Write(&template, binary.LittleEndian, gsi)
 
 	// End tag
