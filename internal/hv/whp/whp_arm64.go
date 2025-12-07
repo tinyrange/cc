@@ -315,8 +315,9 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 		return fmt.Errorf("whp: interrupt type missing in irqLine %#x", irqLine)
 	}
 
-	// The low bits contain the SPI number (offset from SPI base).
-	// For SPIs, we need to add 32 to convert to the full GIC INTID.
+	// The low bits contain the SPI number (0-indexed offset from INTID 32).
+	// WHP's RequestInterrupt RequestedVector expects the full GIC INTID.
+	// For SPIs, we add 32 to convert from SPI number to INTID.
 	spiNum := irqLine & 0xffff
 	var intid uint32
 	if irqType == armIRQTypeSPI {
@@ -336,7 +337,8 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 			false, // Retarget
 		),
 		TargetPartition: 0,
-		// WHP uses RequestedVector as the INTID when delivering to the vCPU.
+		// WHP expects the GIC INTID in RequestedVector.
+		// For ARM64 GIC SPIs, this is the SPI number + 32.
 		RequestedVector: uint32(intid),
 		TargetVtl:       0,
 	}
