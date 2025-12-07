@@ -88,7 +88,7 @@ func (t ConsoleTemplate) DeviceTreeNodes() ([]fdt.Node, error) {
 func (t ConsoleTemplate) Create(vm hv.VirtualMachine) (hv.Device, error) {
 	arch := t.archOrDefault(vm)
 	irqLine := t.irqLineForArch(arch)
-	encodedLine := encodeConsoleIRQLine(arch, irqLine)
+	encodedLine := EncodeIRQLineForArch(arch, irqLine)
 	console := &Console{
 		base:    ConsoleDefaultMMIOBase,
 		size:    ConsoleDefaultMMIOSize,
@@ -191,7 +191,10 @@ func (vc *Console) requireDevice() (device, error) {
 	return vc.device, nil
 }
 
-func encodeConsoleIRQLine(arch hv.CpuArchitecture, irqLine uint32) uint32 {
+// EncodeIRQLineForArch returns the hypervisor-specific IRQ line encoding. On
+// arm64 we embed the SPI type in the high bits as expected by KVM/WHP; on other
+// architectures the line is returned unchanged.
+func EncodeIRQLineForArch(arch hv.CpuArchitecture, irqLine uint32) uint32 {
 	if arch != hv.ArchitectureARM64 {
 		return irqLine
 	}

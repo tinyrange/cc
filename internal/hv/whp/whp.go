@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"runtime"
+	"sync"
 
 	"github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	"github.com/tinyrange/cc/internal/hv"
@@ -333,6 +334,9 @@ type virtualMachine struct {
 	ioapic *chipset.IOAPIC
 	// arm64GICInfo caches the configured interrupt controller details when available.
 	arm64GICInfo hv.Arm64GICInfo
+	// arm64 interrupt bookkeeping for level-aware delivery.
+	arm64GICMu       sync.Mutex
+	arm64GICAsserted map[uint32]bool
 }
 
 // implements hv.VirtualMachine.

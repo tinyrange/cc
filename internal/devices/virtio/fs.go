@@ -108,7 +108,7 @@ func (t FSTemplate) DeviceTreeNodes() ([]fdt.Node, error) {
 func (t FSTemplate) Create(vm hv.VirtualMachine) (hv.Device, error) {
 	arch := t.archOrDefault(vm)
 	irqLine := t.irqLineForArch(arch)
-	fs := NewFS(vm, FsDefaultMMIOBase, FsDefaultMMIOSize, encodeConsoleIRQLine(arch, irqLine), t.Tag, t.Backend)
+	fs := NewFS(vm, FsDefaultMMIOBase, FsDefaultMMIOSize, EncodeIRQLineForArch(arch, irqLine), t.Tag, t.Backend)
 	if err := fs.Init(vm); err != nil {
 		return nil, fmt.Errorf("virtio-fs: initialize device: %w", err)
 	}

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"sync"
 
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/whp/bindings"
@@ -296,13 +297,12 @@ func (h *hypervisor) archVCPUInit(vm *virtualMachine, vcpu *virtualCPU) error {
 }
 
 // SetIRQ asserts an interrupt line. WHP only supports edge-triggered delivery for
-// our simple GIC setup, so we drop deassertions and inject the interrupt to vCPU0.
+// our simple GIC setup; we emulate level semantics by tracking asserted state
+// per INTID and only issuing a WHP request on rising edges. Deassert is recorded
+// for bookkeeping even though WHP currently has no explicit deassert.
 func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 	if v == nil {
 		return fmt.Errorf("whp: virtual machine is nil")
-	}
-	if !level {
-		return nil
 	}
 
 	const armIRQTypeShift = 24
@@ -314,6 +314,10 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 	// INTID carried in irqLine low bits; WHP doesn’t take it directly when
 	// asserting the line. We still decode it for future pending-state plumb.
 	intid := irqLine & 0xffff
+
+	if !v.arm64ShouldFire(intid, level) {
+		return nil
+	}
 
 	ctrl := bindings.InterruptControl{
 		InterruptControl: bindings.MakeInterruptControl2(
