@@ -179,7 +179,6 @@ func (i *IOAPIC) ReadMMIO(addr uint64, data []byte) error {
 
 // WriteMMIO implements hv.MemoryMappedIODevice.
 func (i *IOAPIC) WriteMMIO(addr uint64, data []byte) error {
-	// fmt.Fprintf(os.Stderr, "ioapic: write addr=%#x size=%d data=%#v\n", addr, len(data), data)
 	if !i.inRange(addr, uint64(len(data))) {
 		return fmt.Errorf("ioapic: write outside MMIO window: 0x%x", addr)
 	}
