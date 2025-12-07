@@ -19,7 +19,7 @@ const (
 	FsDefaultMMIOBase = 0xd0004000
 	FsDefaultMMIOSize = 0x200
 	FsDefaultIRQLine  = 9
-	fsArmDefaultIRQ   = 40
+	fsArmDefaultIRQ   = 41
 
 	fsHiprioQueueIndex  = 0
 	fsRequestQueueBase  = 1

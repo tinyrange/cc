@@ -1561,7 +1561,7 @@ func RunExecutable(path string) error {
 
 	slog.Info("Running Executable in InitX Virtual Machine", "path", path)
 
-	if err := vm.Spawn(ctx, "/initx-exec", "-test.v"); err != nil {
+	if err := vm.Spawn(ctx, "/initx-exec", "-test.v", "-test.timeout=5s"); err != nil {
 		return fmt.Errorf("run executable in initx virtual machine: %w", err)
 	}
 
