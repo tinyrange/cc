@@ -1104,15 +1104,16 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		if errno == 0 {
 			extra := make([]byte, 56)
 			putU64 := func(off int, val uint64) { binary.LittleEndian.PutUint64(extra[off:off+8], val) }
+			putU32 := func(off int, val uint32) { binary.LittleEndian.PutUint32(extra[off:off+4], val) }
 			putU64(0, b)
 			putU64(8, bf)
 			putU64(16, ba)
 			putU64(24, files)
 			putU64(32, ff)
-			putU64(40, bsize)
-			putU64(48, fr)
-			// namelen as u32 — we’ll just stuff it into low bits of frsize for simplicity
-			_ = name
+			// Layout matches struct fuse_kstatfs through padding; spare slots stay zeroed.
+			putU32(40, uint32(bsize))
+			putU32(44, uint32(name))
+			putU32(48, uint32(fr))
 			return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
 		}
 	default:

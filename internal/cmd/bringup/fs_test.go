@@ -377,7 +377,7 @@ func testRaceConditions(t *testing.T, dir string) {
 		<-start
 		for i := 0; i < 500; i++ {
 			fname := filepath.Join(raceDir, fmt.Sprintf("%d", i))
-			f, err := os.Create(fname)
+			f, _ := os.Create(fname)
 			if f != nil {
 				f.Close()
 			}
