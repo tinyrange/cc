@@ -186,9 +186,6 @@ func mergeExtents(extents []fsExtent) []fsExtent {
 		lastEnd := last.off + uint64(len(last.data))
 		if cur.off <= lastEnd {
 			overlap := int(lastEnd - cur.off)
-			if overlap < 0 {
-				overlap = 0
-			}
 			if overlap < len(cur.data) {
 				last.data = append(last.data, cur.data[overlap:]...)
 			}
