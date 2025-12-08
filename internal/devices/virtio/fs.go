@@ -201,6 +201,8 @@ const (
 	FUSE_READDIR    = 28
 	FUSE_RELEASEDIR = 29
 	FUSE_FSYNCDIR   = 30
+	FUSE_CREATE     = 35
+	FUSE_LSEEK      = 45
 )
 
 // Minimal structs we need on the wire (host end)
@@ -301,6 +303,44 @@ type FsBackend interface {
 	ReadDir(nodeID uint64, off uint64, maxBytes uint32) ([]byte, int32)
 
 	StatFS(nodeID uint64) (blocks, bfree, bavail, files, ffree, bsize, frsize, namelen uint64, errno int32)
+}
+
+type fsCreateBackend interface {
+	Create(parent uint64, name string, mode uint32, flags uint32, umask uint32) (nodeID uint64, fh uint64, attr FuseAttr, errno int32)
+}
+
+type fsMkdirBackend interface {
+	Mkdir(parent uint64, name string, mode uint32, umask uint32) (nodeID uint64, attr FuseAttr, errno int32)
+}
+
+type fsMknodBackend interface {
+	Mknod(parent uint64, name string, mode uint32, rdev uint32, umask uint32) (nodeID uint64, attr FuseAttr, errno int32)
+}
+
+type fsWriteBackend interface {
+	Write(nodeID uint64, fh uint64, off uint64, data []byte) (uint32, int32)
+}
+
+type fsXattrBackend interface {
+	SetXattr(nodeID uint64, name string, value []byte, flags uint32) int32
+	GetXattr(nodeID uint64, name string) ([]byte, int32)
+}
+
+type fsRenameBackend interface {
+	Rename(oldParent uint64, oldName string, newParent uint64, newName string, flags uint32) int32
+}
+
+type fsRemoveBackend interface {
+	Unlink(parent uint64, name string) int32
+	Rmdir(parent uint64, name string) int32
+}
+
+type fsSetattrBackend interface {
+	SetAttr(nodeID uint64, size *uint64) int32
+}
+
+type fsLseekBackend interface {
+	Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32) (uint64, int32)
 }
 
 // A trivial in-memory backend placeholder that exposes an empty root.
@@ -540,8 +580,8 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 	if err != nil {
 		return 0, err
 	}
-	if len(descs) < 2 {
-		return 0, errors.New("virtio-fs: need at least 2 descriptors (req, resp)")
+	if len(descs) == 0 {
+		return 0, errors.New("virtio-fs: no descriptors in request")
 	}
 
 	var reqDescs, respDescs []fsDesc
@@ -557,9 +597,6 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 	}
 	if len(reqDescs) == 0 {
 		return 0, errors.New("virtio-fs: no request descriptors")
-	}
-	if len(respDescs) == 0 {
-		return 0, errors.New("virtio-fs: no response descriptors")
 	}
 
 	var reqLen int
@@ -583,6 +620,14 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 		}
 		copy(reqBuf[copyOffset:], seg[:segLen])
 		copyOffset += segLen
+	}
+
+	opcode := binary.LittleEndian.Uint32(reqBuf[4:8])
+	if len(respDescs) == 0 {
+		if opcode == FUSE_FORGET {
+			return 0, nil
+		}
+		return 0, errors.New("virtio-fs: no response descriptors")
 	}
 
 	var respCap int
@@ -753,6 +798,75 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
 		}
 
+	case FUSE_CREATE:
+		if len(req) < fuseHdrInSize+16 {
+			return 0, fmt.Errorf("FUSE_CREATE too short")
+		}
+		flags := binary.LittleEndian.Uint32(req[40:44])
+		mode := binary.LittleEndian.Uint32(req[44:48])
+		umask := binary.LittleEndian.Uint32(req[48:52])
+		name := readName(req[fuseHdrInSize+16:])
+		if be, ok := v.backend.(fsCreateBackend); ok {
+			nodeID, fh, attr, e := be.Create(in.NodeID, name, mode, flags, umask)
+			errno = e
+			if errno == 0 {
+				extra := make([]byte, 40+88+16)
+				binary.LittleEndian.PutUint64(extra[0:8], nodeID)
+				binary.LittleEndian.PutUint64(extra[16:24], 1)
+				binary.LittleEndian.PutUint64(extra[24:32], 1)
+				encodeFuseAttr(extra[40:], attr)
+				binary.LittleEndian.PutUint64(extra[40+88:40+96], fh)
+				return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_MKNOD:
+		if len(req) < fuseHdrInSize+16 {
+			return 0, fmt.Errorf("FUSE_MKNOD too short")
+		}
+		mode := binary.LittleEndian.Uint32(req[40:44])
+		rdev := binary.LittleEndian.Uint32(req[44:48])
+		umask := binary.LittleEndian.Uint32(req[48:52])
+		name := readName(req[fuseHdrInSize+16:])
+		if be, ok := v.backend.(fsMknodBackend); ok {
+			nodeID, attr, e := be.Mknod(in.NodeID, name, mode, rdev, umask)
+			errno = e
+			if errno == 0 {
+				extra := make([]byte, 40+88)
+				binary.LittleEndian.PutUint64(extra[0:8], nodeID)
+				binary.LittleEndian.PutUint64(extra[16:24], 1)
+				binary.LittleEndian.PutUint64(extra[24:32], 1)
+				encodeFuseAttr(extra[40:], attr)
+				return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_MKDIR:
+		if len(req) < fuseHdrInSize+8 {
+			return 0, fmt.Errorf("FUSE_MKDIR too short")
+		}
+		mode := binary.LittleEndian.Uint32(req[40:44])
+		umask := binary.LittleEndian.Uint32(req[44:48])
+		name := readName(req[fuseHdrInSize+8:])
+		if be, ok := v.backend.(fsMkdirBackend); ok {
+			nodeID, attr, e := be.Mkdir(in.NodeID, name, mode, umask)
+			errno = e
+			if errno == 0 {
+				extra := make([]byte, 40+88)
+				binary.LittleEndian.PutUint64(extra[0:8], nodeID)
+				binary.LittleEndian.PutUint64(extra[16:24], 1)
+				binary.LittleEndian.PutUint64(extra[24:32], 1)
+				encodeFuseAttr(extra[40:], attr)
+				return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
 	case FUSE_OPEN:
 		if len(req) < fuseHdrInSize+8 {
 			return 0, fmt.Errorf("FUSE_OPEN too short")
@@ -794,6 +908,30 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			return w(fuseOutHeader{Len: outLen, Error: 0, Unique: in.Unique}, nil), nil
 		}
 
+	case FUSE_WRITE:
+		if len(req) < fuseHdrInSize+32 {
+			return 0, fmt.Errorf("FUSE_WRITE too short")
+		}
+		fh := binary.LittleEndian.Uint64(req[40:48])
+		off := binary.LittleEndian.Uint64(req[48:56])
+		size := binary.LittleEndian.Uint32(req[56:60])
+		writeHeader := fuseHdrInSize + 32
+		if len(req) < writeHeader+int(size) {
+			return 0, fmt.Errorf("FUSE_WRITE payload too short")
+		}
+		data := req[writeHeader : writeHeader+int(size)]
+		if be, ok := v.backend.(fsWriteBackend); ok {
+			written, e := be.Write(in.NodeID, fh, off, data)
+			errno = e
+			if errno == 0 {
+				extra := make([]byte, 8)
+				binary.LittleEndian.PutUint32(extra[0:4], written)
+				return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
 	case FUSE_READDIR:
 		if len(req) < fuseHdrInSize+24 {
 			return 0, fmt.Errorf("FUSE_READDIR too short")
@@ -812,6 +950,152 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			}
 			copy(resp[fuseHdrOutSize:], payload)
 			return w(fuseOutHeader{Len: outLen, Error: 0, Unique: in.Unique}, nil), nil
+		}
+
+	case FUSE_RENAME:
+		if len(req) < fuseHdrInSize+8 {
+			return 0, fmt.Errorf("FUSE_RENAME too short")
+		}
+		newParent := binary.LittleEndian.Uint64(req[40:48])
+		nameStart := fuseHdrInSize + 8
+		flags := uint32(0)
+		if len(req) >= fuseHdrInSize+16 {
+			flags = binary.LittleEndian.Uint32(req[48:52])
+		}
+		oldName, rest := readCString(req[nameStart:])
+		if rest == nil {
+			return 0, fmt.Errorf("FUSE_RENAME missing new name")
+		}
+		newName := readName(rest)
+		if be, ok := v.backend.(fsRenameBackend); ok {
+			errno = be.Rename(in.NodeID, oldName, newParent, newName, flags)
+			if errno == 0 {
+				return w(fuseOutHeader{Len: fuseHdrOutSize, Error: 0, Unique: in.Unique}, nil), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_UNLINK:
+		name := readName(req[fuseHdrInSize:])
+		if be, ok := v.backend.(fsRemoveBackend); ok {
+			errno = be.Unlink(in.NodeID, name)
+			if errno == 0 {
+				return w(fuseOutHeader{Len: fuseHdrOutSize, Error: 0, Unique: in.Unique}, nil), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_RMDIR:
+		name := readName(req[fuseHdrInSize:])
+		if be, ok := v.backend.(fsRemoveBackend); ok {
+			errno = be.Rmdir(in.NodeID, name)
+			if errno == 0 {
+				return w(fuseOutHeader{Len: fuseHdrOutSize, Error: 0, Unique: in.Unique}, nil), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_SETXATTR:
+		if len(req) < fuseHdrInSize+8 {
+			return 0, fmt.Errorf("FUSE_SETXATTR too short")
+		}
+		size := binary.LittleEndian.Uint32(req[40:44])
+		flags := binary.LittleEndian.Uint32(req[44:48])
+		name, value := readCString(req[fuseHdrInSize+8:])
+		if value == nil {
+			return 0, fmt.Errorf("FUSE_SETXATTR missing value")
+		}
+		if uint32(len(value)) < size {
+			return 0, fmt.Errorf("FUSE_SETXATTR value short")
+		}
+		if be, ok := v.backend.(fsXattrBackend); ok {
+			errno = be.SetXattr(in.NodeID, name, value[:size], flags)
+			if errno == 0 {
+				return w(fuseOutHeader{Len: fuseHdrOutSize, Error: 0, Unique: in.Unique}, nil), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_GETXATTR:
+		if len(req) < fuseHdrInSize+8 {
+			return 0, fmt.Errorf("FUSE_GETXATTR too short")
+		}
+		size := binary.LittleEndian.Uint32(req[40:44])
+		name := readName(req[fuseHdrInSize+8:])
+		if be, ok := v.backend.(fsXattrBackend); ok {
+			value, e := be.GetXattr(in.NodeID, name)
+			errno = e
+			if errno == 0 {
+				if size == 0 {
+					extra := make([]byte, 8)
+					binary.LittleEndian.PutUint32(extra[0:4], uint32(len(value)))
+					return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
+				}
+				if uint32(len(value)) > size {
+					value = value[:size]
+				}
+				outLen := fuseHdrOutSize + uint32(len(value))
+				if int(outLen) > len(resp) {
+					value = value[:len(resp)-fuseHdrOutSize]
+					outLen = uint32(len(resp))
+				}
+				copy(resp[fuseHdrOutSize:], value)
+				return w(fuseOutHeader{Len: outLen, Error: 0, Unique: in.Unique}, nil), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_SETATTR:
+		if len(req) < fuseHdrInSize+56 {
+			return 0, fmt.Errorf("FUSE_SETATTR too short")
+		}
+		valid := binary.LittleEndian.Uint32(req[40:44])
+		const fattrSize = 1 << 3
+		var sizeVal *uint64
+		if valid&fattrSize != 0 {
+			val := binary.LittleEndian.Uint64(req[56:64])
+			sizeVal = &val
+		}
+		if be, ok := v.backend.(fsSetattrBackend); ok {
+			errno = be.SetAttr(in.NodeID, sizeVal)
+			if errno == 0 {
+				attr, e := v.backend.GetAttr(in.NodeID)
+				errno = e
+				if errno == 0 {
+					extra := make([]byte, 16+88)
+					binary.LittleEndian.PutUint64(extra[0:8], 1)
+					binary.LittleEndian.PutUint32(extra[8:12], 0)
+					binary.LittleEndian.PutUint32(extra[12:16], 0)
+					encodeFuseAttr(extra[16:], attr)
+					return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
+				}
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_LSEEK:
+		if len(req) < fuseHdrInSize+24 {
+			return 0, fmt.Errorf("FUSE_LSEEK too short")
+		}
+		fh := binary.LittleEndian.Uint64(req[40:48])
+		offset := binary.LittleEndian.Uint64(req[48:56])
+		whence := binary.LittleEndian.Uint32(req[56:60])
+		if be, ok := v.backend.(fsLseekBackend); ok {
+			newOff, e := be.Lseek(in.NodeID, fh, offset, whence)
+			errno = e
+			if errno == 0 {
+				extra := make([]byte, 8)
+				binary.LittleEndian.PutUint64(extra[0:8], newOff)
+				return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
 		}
 
 	case FUSE_STATFS:
@@ -845,6 +1129,29 @@ func indexNull(s string) int {
 		}
 	}
 	return -1
+}
+
+func indexNullBytes(b []byte) int {
+	for i := 0; i < len(b); i++ {
+		if b[i] == 0 {
+			return i
+		}
+	}
+	return -1
+}
+
+func readName(b []byte) string {
+	if idx := indexNullBytes(b); idx >= 0 {
+		return string(b[:idx])
+	}
+	return string(b)
+}
+
+func readCString(b []byte) (string, []byte) {
+	if idx := indexNullBytes(b); idx >= 0 {
+		return string(b[:idx]), b[idx+1:]
+	}
+	return string(b), nil
 }
 
 // Buffer helpers

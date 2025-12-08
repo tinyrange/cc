@@ -11,10 +11,8 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"path"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"time"
 
 	"github.com/tinyrange/cc/internal/asm"
@@ -34,8 +32,8 @@ import (
 	"github.com/tinyrange/cc/internal/linux/boot"
 	"github.com/tinyrange/cc/internal/linux/defs"
 	amd64defs "github.com/tinyrange/cc/internal/linux/defs/amd64"
-	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 	"github.com/tinyrange/cc/internal/linux/kernel"
+	"github.com/tinyrange/cc/internal/vfs"
 )
 
 const (
@@ -1424,168 +1422,6 @@ func RunInitX(debug bool) error {
 	return nil
 }
 
-type virtioFsBackend struct {
-}
-
-const (
-	virtioFsRootNodeID = 1
-	virtioFsFileNodeID = 2
-)
-
-var virtioFsFileContent = []byte("Hello from virtio-fs!")
-
-func virtioDirAttr(nodeID uint64) virtio.FuseAttr {
-	return virtio.FuseAttr{
-		Ino:     nodeID,
-		Mode:    0040000 | 0755,
-		NLink:   2,
-		UID:     0,
-		GID:     0,
-		BlkSize: 4096,
-	}
-}
-
-func virtioFileAttr(nodeID uint64, size int) virtio.FuseAttr {
-	return virtio.FuseAttr{
-		Ino:     nodeID,
-		Size:    uint64(size),
-		Mode:    0100000 | 0644,
-		NLink:   1,
-		UID:     0,
-		GID:     0,
-		BlkSize: 4096,
-	}
-}
-
-// GetAttr implements virtio.FsBackend.
-func (v *virtioFsBackend) GetAttr(nodeID uint64) (attr virtio.FuseAttr, errno int32) {
-	switch nodeID {
-	case virtioFsRootNodeID:
-		return virtioDirAttr(nodeID), 0
-	case virtioFsFileNodeID:
-		return virtioFileAttr(nodeID, len(virtioFsFileContent)), 0
-	default:
-		return virtio.FuseAttr{}, -int32(linux.ENOENT)
-	}
-}
-
-// Init implements virtio.FsBackend.
-func (v *virtioFsBackend) Init() (maxWrite uint32, flags uint32) {
-	return 128 * 1024, 0
-}
-
-// Lookup implements virtio.FsBackend.
-func (v *virtioFsBackend) Lookup(parent uint64, name string) (nodeID uint64, attr virtio.FuseAttr, errno int32) {
-	if parent != virtioFsRootNodeID {
-		return 0, virtio.FuseAttr{}, -int32(linux.ENOENT)
-	}
-
-	name = strings.TrimPrefix(path.Clean(name), "/")
-	if name == "." || name == "" {
-		return virtioFsRootNodeID, virtioDirAttr(virtioFsRootNodeID), 0
-	}
-
-	if name == "testfile.txt" {
-		return virtioFsFileNodeID, virtioFileAttr(virtioFsFileNodeID, len(virtioFsFileContent)), 0
-	}
-
-	return 0, virtio.FuseAttr{}, -int32(linux.ENOENT)
-}
-
-// Open implements virtio.FsBackend.
-func (v *virtioFsBackend) Open(nodeID uint64, flags uint32) (fh uint64, errno int32) {
-	switch nodeID {
-	case virtioFsRootNodeID:
-		return 0, -int32(linux.EISDIR)
-	case virtioFsFileNodeID:
-		return 1, 0
-	default:
-		return 0, -int32(linux.ENOENT)
-	}
-}
-
-// Read implements virtio.FsBackend.
-func (v *virtioFsBackend) Read(nodeID uint64, fh uint64, off uint64, size uint32) ([]byte, int32) {
-	if nodeID != virtioFsFileNodeID {
-		return nil, -int32(linux.ENOENT)
-	}
-
-	if off >= uint64(len(virtioFsFileContent)) {
-		return []byte{}, 0
-	}
-
-	end := off + uint64(size)
-	if end > uint64(len(virtioFsFileContent)) {
-		end = uint64(len(virtioFsFileContent))
-	}
-
-	return virtioFsFileContent[off:end], 0
-}
-
-// ReadDir implements virtio.FsBackend.
-func (v *virtioFsBackend) ReadDir(nodeID uint64, off uint64, maxBytes uint32) ([]byte, int32) {
-	if nodeID != virtioFsRootNodeID {
-		return nil, -int32(linux.ENOENT)
-	}
-	if off != 0 {
-		return []byte{}, 0
-	}
-
-	entries := []struct {
-		ino  uint64
-		name string
-		typ  uint32
-	}{
-		{virtioFsRootNodeID, ".", linux.DT_DIR},
-		{virtioFsRootNodeID, "..", linux.DT_DIR},
-		{virtioFsFileNodeID, "testfile.txt", linux.DT_REG},
-	}
-
-	var buf []byte
-	for _, e := range entries {
-		dirent := buildFuseDirent(e.ino, e.name, e.typ, uint64(len(buf))+1)
-		buf = append(buf, dirent...)
-		if uint32(len(buf)) >= maxBytes {
-			break
-		}
-	}
-
-	return buf, 0
-}
-
-// Release implements virtio.FsBackend.
-func (v *virtioFsBackend) Release(nodeID uint64, fh uint64) {
-}
-
-// StatFS implements virtio.FsBackend.
-func (v *virtioFsBackend) StatFS(nodeID uint64) (blocks uint64, bfree uint64, bavail uint64, files uint64, ffree uint64, bsize uint64, frsize uint64, namelen uint64, errno int32) {
-	if nodeID != virtioFsRootNodeID {
-		return 0, 0, 0, 0, 0, 0, 0, 0, -int32(linux.ENOENT)
-	}
-
-	return 1, 1, 1, 2, 2, 4096, 4096, 255, 0
-}
-
-var (
-	_ virtio.FsBackend = &virtioFsBackend{}
-)
-
-func buildFuseDirent(ino uint64, name string, typ uint32, nextOffset uint64) []byte {
-	// struct fuse_dirent { uint64 ino; uint64 off; uint32 namelen; uint32 type; char name[]; }
-	const headerSize = 8 + 8 + 4 + 4
-	namelen := len(name)
-	recordLen := headerSize + namelen
-	alignedLen := (recordLen + 7) &^ 7
-
-	buf := make([]byte, alignedLen)
-	binary.LittleEndian.PutUint64(buf[0:8], ino)
-	binary.LittleEndian.PutUint64(buf[8:16], nextOffset)
-	binary.LittleEndian.PutUint32(buf[16:20], uint32(namelen))
-	binary.LittleEndian.PutUint32(buf[20:24], typ)
-	copy(buf[24:], []byte(name))
-	return buf
-}
-
 func RunExecutable(path string) error {
 	slog.Info("Starting Bringup Quest: Run Executable", "path", path)
 
@@ -1609,7 +1445,7 @@ func RunExecutable(path string) error {
 		initx.WithFileFromBytes("/initx-exec", fileData, fs.FileMode(0755)),
 		initx.WithDeviceTemplate(virtio.FSTemplate{
 			Tag:     "bringup",
-			Backend: &virtioFsBackend{},
+			Backend: vfs.NewVirtioFsBackend(),
 		}),
 	)
 	if err != nil {
