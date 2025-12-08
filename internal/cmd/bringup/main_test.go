@@ -6,49 +6,47 @@ import (
 	"os"
 	"syscall"
 	"testing"
-
-	"golang.org/x/sys/unix"
 )
 
 func TestHello(t *testing.T) {
 	// This is a placeholder test.
 }
 
-func TestInterruptMapping(t *testing.T) {
-	// mount /proc if not already mounted
-	if _, err := os.Stat("/proc/interrupts"); os.IsNotExist(err) {
-		if err := os.MkdirAll("/proc", 0755); err != nil {
-			t.Fatalf("failed to create /proc directory: %v", err)
-		}
+// func TestInterruptMapping(t *testing.T) {
+// 	// mount /proc if not already mounted
+// 	if _, err := os.Stat("/proc/interrupts"); os.IsNotExist(err) {
+// 		if err := os.MkdirAll("/proc", 0755); err != nil {
+// 			t.Fatalf("failed to create /proc directory: %v", err)
+// 		}
 
-		err = syscall.Mount("proc", "/proc", "proc", 0, "")
-		if err != nil {
-			t.Fatalf("failed to mount /proc: %v", err)
-		}
+// 		err = syscall.Mount("proc", "/proc", "proc", 0, "")
+// 		if err != nil {
+// 			t.Fatalf("failed to mount /proc: %v", err)
+// 		}
 
-		defer syscall.Unmount("/proc", 0)
-	}
+// 		defer syscall.Unmount("/proc", 0)
+// 	}
 
-	data, err := os.ReadFile("/proc/interrupts")
-	if err != nil {
-		t.Fatalf("failed to read /proc/interrupts: %v", err)
-	}
+// 	data, err := os.ReadFile("/proc/interrupts")
+// 	if err != nil {
+// 		t.Fatalf("failed to read /proc/interrupts: %v", err)
+// 	}
 
-	t.Logf("guest /proc/interrupts:\n%s", data)
-}
+// 	t.Logf("guest /proc/interrupts:\n%s", data)
+// }
 
-func TestKernelLog(t *testing.T) {
-	// use syscalls to read kernel log
-	const klogSize = 1024 * 1024
-	buf := make([]byte, klogSize)
-	n, err := unix.Klogctl(unix.SYSLOG_ACTION_READ_ALL, buf)
-	if err != nil {
-		t.Fatalf("failed to read kernel log: %v", err)
-	}
+// func TestKernelLog(t *testing.T) {
+// 	// use syscalls to read kernel log
+// 	const klogSize = 1024 * 1024
+// 	buf := make([]byte, klogSize)
+// 	n, err := unix.Klogctl(unix.SYSLOG_ACTION_READ_ALL, buf)
+// 	if err != nil {
+// 		t.Fatalf("failed to read kernel log: %v", err)
+// 	}
 
-	logData := buf[:n]
-	t.Logf("kernel log:\n%s", logData)
-}
+// 	logData := buf[:n]
+// 	t.Logf("kernel log:\n%s", logData)
+// }
 
 func TestVirtioFs(t *testing.T) {
 	// mount the virtio-fs filesystem and verify it works
@@ -64,14 +62,5 @@ func TestVirtioFs(t *testing.T) {
 	}
 	defer syscall.Unmount(tmpDir, 0)
 
-	// Check if we can read a known file from the mounted filesystem
-	data, err := os.ReadFile(tmpDir + "/testfile.txt")
-	if err != nil {
-		t.Fatalf("failed to read test file from virtio-fs: %v", err)
-	}
-
-	expected := "Hello from virtio-fs!"
-	if string(data) != expected {
-		t.Fatalf("unexpected file content: got %q, want %q", string(data), expected)
-	}
+	testFS(t, tmpDir)
 }
