@@ -375,6 +375,12 @@ func (v *virtualMachine) Arm64GICInfo() (hv.Arm64GICInfo, bool) {
 	return v.arm64GICInfo, true
 }
 
+// ARM64 KVM IRQ type encoding (bits 31-24 of irq field)
+const (
+	armIRQTypeShift = 24 // Shift for IRQ type in encoded irqLine
+	armIRQTypeSPI   = 1  // Shared Peripheral Interrupt
+)
+
 func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 	if !v.gicConfigured {
 		return fmt.Errorf("hvf: interrupt controller not configured")
@@ -382,6 +388,17 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 
 	if hvGicSetSpi == nil {
 		return fmt.Errorf("hvf: hv_gic_set_spi unavailable")
+	}
+
+	// Decode the KVM-style IRQ encoding used by EncodeIRQLineForArch.
+	// Bits 31-24 contain the IRQ type, bits 15-0 contain the GIC INTID.
+	irqType := (irqLine >> armIRQTypeShift) & 0xff
+	if irqType != 0 {
+		if irqType != armIRQTypeSPI {
+			return fmt.Errorf("hvf: unsupported IRQ type %d in irqLine %#x", irqType, irqLine)
+		}
+		// Extract the GIC INTID from low 16 bits.
+		irqLine = irqLine & 0xffff
 	}
 
 	if irqLine < v.gicSPIBase || irqLine >= v.gicSPIBase+v.gicSPICount {
