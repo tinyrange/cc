@@ -91,6 +91,7 @@ type mmioDevice struct {
 	base    uint64
 	size    uint64
 	irqLine uint32
+	irqHigh bool
 
 	deviceID uint32
 	vendorID uint32
@@ -503,6 +504,10 @@ func (d *mmioDevice) updateInterruptLine() {
 	}
 	if setter, ok := d.vm.(irqSetter); ok {
 		levelAsserted := d.interruptStatus != 0
+		if levelAsserted == d.irqHigh {
+			return
+		}
+		d.irqHigh = levelAsserted
 		if err := setter.SetIRQ(d.irqLine, levelAsserted); err != nil {
 			slog.Error("virtio: pulse irq failed", "irq", d.irqLine, "err", err)
 		}

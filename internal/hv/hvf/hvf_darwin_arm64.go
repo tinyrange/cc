@@ -403,16 +403,21 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 	}
 
 	// hv_gic_get_spi_interrupt_range returns base=32 (first SPI INTID) and count=988 (number of SPIs).
-	// However, hv_gic_set_spi expects the SPI number (0-based), NOT the INTID.
-	// Our irqLine is already the SPI number (e.g., 40 for virtio console).
+	// hv_gic_set_spi expects the INTID number (not zero-based).
+	// Our irqLine is the SPI offset (e.g., 40 for virtio console), so add gicSPIBase.
 	spiNum := irqLine
-
-	// Range check: SPI numbers should be 0 to (spiCount-1)
-	if spiNum >= v.gicSPICount {
-		return fmt.Errorf("hvf: SPI %d out of range (0-%d)", spiNum, v.gicSPICount-1)
+	if v.gicSPIBase != 0 {
+		spiNum += v.gicSPIBase
 	}
 
-	// slog.Info("hvf: SetIRQ", "spi", spiNum, "level", level, "spiBase", v.gicSPIBase, "spiCount", v.gicSPICount)
+	// Range check: SPI numbers should be 0 to (spiCount-1)
+	if spiNum >= v.gicSPIBase+v.gicSPICount {
+		return fmt.Errorf("hvf: SPI %d out of range (base=%d count=%d)", spiNum, v.gicSPIBase, v.gicSPICount)
+	}
+
+	if level {
+		slog.Info("hvf: SetIRQ", "spi", spiNum, "level", level, "spiBase", v.gicSPIBase, "spiCount", v.gicSPICount)
+	}
 
 	ret := hvGicSetSpi(spiNum, level)
 	if ret != 0 {
