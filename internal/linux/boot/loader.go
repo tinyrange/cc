@@ -608,7 +608,8 @@ func (l *LinuxLoader) loadARM64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	}
 	l.plan = plan
 
-	uartDev := serial.NewUART8250MMIO(arm64UARTMMIOBase, arm64UARTRegShift, arm64UARTIRQLine, &convertCRLF{l.SerialStdout})
+	// Connect UART to the same output as the console - SerialStdout typically goes to both stdout and test buffer
+	uartDev := serial.NewUART8250MMIO(arm64UARTMMIOBase, arm64UARTRegShift, arm64UARTIRQLine, l.SerialStdout)
 	if err := vm.AddDevice(uartDev); err != nil {
 		return fmt.Errorf("add arm64 uart device: %w", err)
 	}

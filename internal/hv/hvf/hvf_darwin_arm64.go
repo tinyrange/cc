@@ -607,7 +607,10 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			}
 			return context.Canceled
 		case hvExitReasonException:
-			return v.handleException()
+			if err := v.handleException(); err != nil {
+				return err
+			}
+			// Continue running after successfully handling the exception
 		case hvExitReasonVTimerActivated, hvExitReasonVTimerDeactivated:
 			// Spurious timer exits; continue running.
 			continue
@@ -617,22 +620,22 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	}
 }
 
-func (v *virtualCPU) handleException() error {
-	const (
-		exceptionClassMask             = 0x3F
-		exceptionClassShift            = 26
-		exceptionClassHvc              = 0x16
-		exceptionClassSmc              = 0x17
-		exceptionClassMsrAccess        = 0x18
-		exceptionClassDataAbortLowerEL = 0x24
-	)
+const (
+	exceptionClassMask             = 0x3F
+	exceptionClassShift            = 26
+	exceptionClassHvc              = 0x16
+	exceptionClassSmc              = 0x17
+	exceptionClassMsrAccess        = 0x18
+	exceptionClassDataAbortLowerEL = 0x24
+)
 
+func (v *virtualCPU) handleException() error {
 	syndrome := v.exit.Exception.Syndrome
 	ec := (syndrome >> exceptionClassShift) & exceptionClassMask
 
 	switch ec {
 	case exceptionClassHvc, exceptionClassSmc:
-		return v.handleHypercall()
+		return v.handleHypercall(ec)
 	case exceptionClassMsrAccess:
 		return v.handleMsrAccess(syndrome)
 	case exceptionClassDataAbortLowerEL:
@@ -746,31 +749,84 @@ func (v *virtualCPU) handleMsrAccess(syndrome uint64) error {
 	return v.advanceProgramCounter()
 }
 
+// PSCI function IDs (SMC32 calling convention)
 const (
-	psciVersion   = 0x84000000
-	psciSystemOff = 0x84000008
+	psciVersion         = 0x84000000
+	psciCpuSuspend      = 0x84000001
+	psciCpuOff          = 0x84000002
+	psciCpuOn           = 0x84000003
+	psciAffinityInfo    = 0x84000004
+	psciMigrateInfoType = 0x84000006
+	psciSystemOff       = 0x84000008
+	psciSystemReset     = 0x84000009
+	psciFeatures        = 0x8400000A
+
+	// PSCI return values
+	psciSuccess            = 0
+	psciNotSupported       = 0xFFFFFFFF // -1 as uint32
+	psciInvalidParameters  = 0xFFFFFFFE // -2 as uint32
+	psciDenied             = 0xFFFFFFFD // -3 as uint32
+	psciAlreadyOn          = 0xFFFFFFFC // -4 as uint32
+	psciOnPending          = 0xFFFFFFFB // -5 as uint32
+	psciInternalFailure    = 0xFFFFFFFA // -6 as uint32
+	psciNotPresent         = 0xFFFFFFF9 // -7 as uint32
+	psciDisabled           = 0xFFFFFFF8 // -8 as uint32
+	psciInvalidAddress     = 0xFFFFFFF7 // -9 as uint32
+	psciTosNotPresent      = 2          // For MIGRATE_INFO_TYPE: no trusted OS
 )
 
-func (v *virtualCPU) handleHypercall() error {
+func (v *virtualCPU) handleHypercall(ec uint64) error {
 	val, err := v.readRegister(hv.RegisterARM64X0)
 	if err != nil {
 		return err
 	}
 
-	if err := v.advanceProgramCounter(); err != nil {
-		return err
+	// HVC (EC 0x16) automatically advances PC in Apple's Hypervisor Framework.
+	// SMC (EC 0x17) does NOT automatically advance PC, so we must do it manually.
+	if ec == exceptionClassSmc {
+		if err := v.advanceProgramCounter(); err != nil {
+			return err
+		}
 	}
 
 	switch val {
 	case psciVersion:
-		// Reply PSCI version 1.0 (most common + acceptable default)
+		// Reply PSCI version 1.0
 		return v.writeRegister(hv.RegisterARM64X0, 0x00010000)
+
+	case psciCpuOff:
+		// Single CPU VM - CPU_OFF halts the VM
+		return hv.ErrVMHalted
+
+	case psciCpuOn:
+		// Single CPU VM - CPU_ON not supported
+		return v.writeRegister(hv.RegisterARM64X0, psciAlreadyOn)
+
+	case psciAffinityInfo:
+		// For single CPU VM, CPU 0 is always ON (return 0)
+		return v.writeRegister(hv.RegisterARM64X0, 0)
+
+	case psciMigrateInfoType:
+		// Return "Trusted OS not present" - no migration support needed
+		return v.writeRegister(hv.RegisterARM64X0, psciTosNotPresent)
 
 	case psciSystemOff:
 		return hv.ErrVMHalted
 
+	case psciSystemReset:
+		return hv.ErrGuestRequestedReboot
+
+	case psciFeatures:
+		// Return NOT_SUPPORTED for feature queries we don't implement
+		return v.writeRegister(hv.RegisterARM64X0, psciNotSupported)
+
+	case psciCpuSuspend:
+		// For simplicity, treat suspend as a no-op (return success)
+		return v.writeRegister(hv.RegisterARM64X0, psciSuccess)
+
 	default:
-		return fmt.Errorf("hvf: unhandled hypercall 0x%x", val)
+		// Unknown PSCI function - return NOT_SUPPORTED
+		return v.writeRegister(hv.RegisterARM64X0, psciNotSupported)
 	}
 }
 
@@ -884,6 +940,11 @@ func (v *virtualCPU) findMMIODevice(addr, size uint64) (hv.MemoryMappedIODevice,
 }
 
 func (v *virtualCPU) readRegister(reg hv.Register) (uint64, error) {
+	// XZR (zero register) always reads as 0
+	if reg == hv.RegisterARM64Xzr {
+		return 0, nil
+	}
+
 	if sys, ok := hvSysRegFromRegister(reg); ok {
 		var val uint64
 		if err := hvVcpuGetSys(v.hostID, sys, &val).toError("hv_vcpu_get_sys_reg"); err != nil {
@@ -905,6 +966,11 @@ func (v *virtualCPU) readRegister(reg hv.Register) (uint64, error) {
 }
 
 func (v *virtualCPU) writeRegister(reg hv.Register, value uint64) error {
+	// XZR (zero register) writes are discarded
+	if reg == hv.RegisterARM64Xzr {
+		return nil
+	}
+
 	if sys, ok := hvSysRegFromRegister(reg); ok {
 		return hvVcpuSetSys(v.hostID, sys, value).toError("hv_vcpu_set_sys_reg")
 	}
