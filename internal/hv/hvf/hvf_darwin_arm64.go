@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"log/slog"
 	"runtime"
 	"sync"
 	"unsafe"
@@ -391,21 +392,46 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 	}
 
 	// Decode the KVM-style IRQ encoding used by EncodeIRQLineForArch.
-	// Bits 31-24 contain the IRQ type, bits 15-0 contain the GIC INTID.
+	// Bits 31-24 contain the IRQ type, bits 15-0 contain the SPI number.
 	irqType := (irqLine >> armIRQTypeShift) & 0xff
 	if irqType != 0 {
 		if irqType != armIRQTypeSPI {
 			return fmt.Errorf("hvf: unsupported IRQ type %d in irqLine %#x", irqType, irqLine)
 		}
-		// Extract the GIC INTID from low 16 bits.
+		// Extract the SPI number from low 16 bits.
 		irqLine = irqLine & 0xffff
 	}
 
-	if irqLine < v.gicSPIBase || irqLine >= v.gicSPIBase+v.gicSPICount {
-		return fmt.Errorf("hvf: SPI %d out of range (%d-%d)", irqLine, v.gicSPIBase, v.gicSPIBase+v.gicSPICount-1)
+	// hv_gic_get_spi_interrupt_range returns base=32 (first SPI INTID) and count=988 (number of SPIs).
+	// However, hv_gic_set_spi expects the SPI number (0-based), NOT the INTID.
+	// Our irqLine is already the SPI number (e.g., 40 for virtio console).
+	spiNum := irqLine
+
+	// Range check: SPI numbers should be 0 to (spiCount-1)
+	if spiNum >= v.gicSPICount {
+		return fmt.Errorf("hvf: SPI %d out of range (0-%d)", spiNum, v.gicSPICount-1)
 	}
 
-	return hvGicSetSpi(irqLine, level).toError("hv_gic_set_spi")
+	// slog.Info("hvf: SetIRQ", "spi", spiNum, "level", level, "spiBase", v.gicSPIBase, "spiCount", v.gicSPICount)
+
+	ret := hvGicSetSpi(spiNum, level)
+	if ret != 0 {
+		slog.Error("hvf: hv_gic_set_spi failed", "spi", spiNum, "level", level, "ret", ret)
+		return ret.toError("hv_gic_set_spi")
+	}
+
+	// When asserting an interrupt, mark all vCPUs as having a pending IRQ
+	// and kick them so they can inject it.
+	if level {
+		for _, vcpu := range v.vcpus {
+			vcpu.pendingIRQ = true
+			hostID := vcpu.hostID
+			// Kick the vCPU so it exits hvVcpuRun and can inject the interrupt
+			_ = hvVcpusExit(&hostID, 1)
+		}
+	}
+
+	return nil
 }
 
 func (v *virtualMachine) Close() error {
@@ -478,6 +504,11 @@ type virtualCPU struct {
 	initErr  chan error
 
 	pendingPC *uint64
+
+	// pendingIRQ is set when an IRQ needs to be injected into the vCPU.
+	// Access should be synchronized, but since we only set from SetIRQ
+	// and check from the vCPU thread, a simple bool is sufficient.
+	pendingIRQ bool
 }
 
 func (v *virtualCPU) start() {
@@ -596,6 +627,21 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	}
 
 	for {
+		// Inject pending interrupts before running the vCPU.
+		// This must be done from the vCPU thread.
+		if v.pendingIRQ {
+			v.pendingIRQ = false
+			if hvVcpuSetPendingInterrupt != nil {
+				ret := hvVcpuSetPendingInterrupt(v.hostID, hvInterruptTypeIRQ, true)
+				// slog.Info("hvf: injecting IRQ into vCPU", "vcpu", v.index, "ret", ret)
+				if err := ret.toError("hv_vcpu_set_pending_interrupt"); err != nil {
+					slog.Error("hvf: failed to set pending IRQ", "err", err)
+				}
+			} else {
+				slog.Warn("hvf: hvVcpuSetPendingInterrupt not available")
+			}
+		}
+
 		if err := hvVcpuRun(v.hostID).toError("hv_vcpu_run"); err != nil {
 			return err
 		}
@@ -605,7 +651,9 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			return context.Canceled
+			// If context isn't canceled, this might be a kick from SetIRQ.
+			// Continue running to process the interrupt.
+			continue
 		case hvExitReasonException:
 			if err := v.handleException(); err != nil {
 				return err
@@ -762,17 +810,17 @@ const (
 	psciFeatures        = 0x8400000A
 
 	// PSCI return values
-	psciSuccess            = 0
-	psciNotSupported       = 0xFFFFFFFF // -1 as uint32
-	psciInvalidParameters  = 0xFFFFFFFE // -2 as uint32
-	psciDenied             = 0xFFFFFFFD // -3 as uint32
-	psciAlreadyOn          = 0xFFFFFFFC // -4 as uint32
-	psciOnPending          = 0xFFFFFFFB // -5 as uint32
-	psciInternalFailure    = 0xFFFFFFFA // -6 as uint32
-	psciNotPresent         = 0xFFFFFFF9 // -7 as uint32
-	psciDisabled           = 0xFFFFFFF8 // -8 as uint32
-	psciInvalidAddress     = 0xFFFFFFF7 // -9 as uint32
-	psciTosNotPresent      = 2          // For MIGRATE_INFO_TYPE: no trusted OS
+	psciSuccess           = 0
+	psciNotSupported      = 0xFFFFFFFF // -1 as uint32
+	psciInvalidParameters = 0xFFFFFFFE // -2 as uint32
+	psciDenied            = 0xFFFFFFFD // -3 as uint32
+	psciAlreadyOn         = 0xFFFFFFFC // -4 as uint32
+	psciOnPending         = 0xFFFFFFFB // -5 as uint32
+	psciInternalFailure   = 0xFFFFFFFA // -6 as uint32
+	psciNotPresent        = 0xFFFFFFF9 // -7 as uint32
+	psciDisabled          = 0xFFFFFFF8 // -8 as uint32
+	psciInvalidAddress    = 0xFFFFFFF7 // -9 as uint32
+	psciTosNotPresent     = 2          // For MIGRATE_INFO_TYPE: no trusted OS
 )
 
 func (v *virtualCPU) handleHypercall(ec uint64) error {

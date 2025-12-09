@@ -173,6 +173,15 @@ var (
 	hvGicGetRedistributorBaseAlignment func(alignment *uint64) hvReturn
 	hvGicGetSpiInterruptRange          func(base *uint32, count *uint32) hvReturn
 	hvGicSetSpi                        func(intid uint32, level bool) hvReturn
+
+	// hv_vcpu_set_pending_interrupt signals an IRQ or FIQ to the vCPU
+	hvVcpuSetPendingInterrupt func(vcpu uint64, intType uint32, pending bool) hvReturn
+)
+
+// Interrupt types for hv_vcpu_set_pending_interrupt
+const (
+	hvInterruptTypeIRQ = 0
+	hvInterruptTypeFIQ = 1
 )
 
 func ensureInitialized() error {
@@ -219,6 +228,7 @@ func ensureInitialized() error {
 		register(&hvGicGetRedistributorBaseAlignment, "hv_gic_get_redistributor_base_alignment")
 		register(&hvGicGetSpiInterruptRange, "hv_gic_get_spi_interrupt_range")
 		register(&hvGicSetSpi, "hv_gic_set_spi")
+		register(&hvVcpuSetPendingInterrupt, "hv_vcpu_set_pending_interrupt")
 	})
 
 	return hvErr
