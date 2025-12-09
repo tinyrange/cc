@@ -504,10 +504,6 @@ func (d *mmioDevice) updateInterruptLine() {
 	}
 	if setter, ok := d.vm.(irqSetter); ok {
 		levelAsserted := d.interruptStatus != 0
-		if levelAsserted == d.irqHigh {
-			return
-		}
-		d.irqHigh = levelAsserted
 		if err := setter.SetIRQ(d.irqLine, levelAsserted); err != nil {
 			slog.Error("virtio: pulse irq failed", "irq", d.irqLine, "err", err)
 		}
