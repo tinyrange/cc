@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"runtime"
+	"runtime/pprof"
 
 	"github.com/tinyrange/cc/internal/devices/virtio"
 	"github.com/tinyrange/cc/internal/hv"
@@ -33,6 +34,9 @@ func run() error {
 	cpus := flag.Int("cpus", 1, "Number of vCPUs")
 	memory := flag.Uint64("memory", 256, "Memory in MB")
 	debug := flag.Bool("debug", false, "Enable debug logging")
+	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
+	memprofile := flag.String("memprofile", "", "Write memory profile to file")
+	dmesg := flag.Bool("dmesg", false, "Print kernel dmesg during boot and runtime")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <image> [command] [args...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Run a command inside an OCI container image in a virtual machine.\n\n")
@@ -44,6 +48,38 @@ func run() error {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if *debug {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	}
+
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			return fmt.Errorf("create cpu profile file: %w", err)
+		}
+		defer f.Close()
+
+		if err := pprof.StartCPUProfile(f); err != nil {
+			return fmt.Errorf("start cpu profile: %w", err)
+		}
+		defer pprof.StopCPUProfile()
+	}
+
+	if *memprofile != "" {
+		defer func() {
+			f, err := os.Create(*memprofile)
+			if err != nil {
+				slog.Error("create memory profile file", "error", err)
+				return
+			}
+			defer f.Close()
+
+			if err := pprof.Lookup("heap").WriteTo(f, 0); err != nil {
+				slog.Error("write memory profile", "error", err)
+			}
+		}()
+	}
 
 	args := flag.Args()
 	if len(args) < 1 {
@@ -69,7 +105,7 @@ func run() error {
 		return fmt.Errorf("create OCI client: %w", err)
 	}
 
-	slog.Info("Pulling image", "ref", imageRef, "arch", *arch)
+	slog.Debug("Pulling image", "ref", imageRef, "arch", *arch)
 
 	// Pull image
 	img, err := client.PullForArch(imageRef, *arch)
@@ -77,7 +113,7 @@ func run() error {
 		return fmt.Errorf("pull image: %w", err)
 	}
 
-	slog.Info("Image pulled", "layers", len(img.Layers))
+	slog.Debug("Image pulled", "layers", len(img.Layers))
 
 	// Determine command to run
 	execCmd := img.Command(cmd)
@@ -85,7 +121,7 @@ func run() error {
 		return fmt.Errorf("no command specified and image has no entrypoint/cmd")
 	}
 
-	slog.Info("Running command", "cmd", execCmd)
+	slog.Debug("Running command", "cmd", execCmd)
 
 	// Create container filesystem
 	containerFS, err := oci.NewContainerFS(img)
@@ -125,6 +161,8 @@ func run() error {
 			Arch:    hvArch,
 		}),
 		initx.WithDebugLogging(*debug),
+		initx.WithDmesgLogging(*dmesg),
+		initx.WithStdin(os.Stdin),
 	)
 	if err != nil {
 		return fmt.Errorf("create VM: %w", err)
@@ -135,7 +173,7 @@ func run() error {
 	ctx := context.Background()
 	prog := buildContainerInit(img, execCmd)
 
-	slog.Info("Starting VM")
+	slog.Debug("Starting VM")
 
 	if err := vm.Run(ctx, prog); err != nil {
 		return fmt.Errorf("run VM: %w", err)

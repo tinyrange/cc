@@ -41,13 +41,18 @@ const (
 type proxyReader struct {
 	r      io.Reader
 	update chan io.Reader
+	eof    bool
 }
 
 func (p *proxyReader) Read(b []byte) (int, error) {
 	for {
+		if p.eof {
+			return 0, io.EOF
+		}
 		if p.r == nil {
 			newR, ok := <-p.update
 			if !ok {
+				p.eof = true
 				return 0, io.EOF
 			}
 			p.r = newR
@@ -56,10 +61,11 @@ func (p *proxyReader) Read(b []byte) (int, error) {
 		n, err := p.r.Read(b)
 		if err == io.EOF {
 			p.r = nil
+			p.eof = true
 			if n > 0 {
 				return n, nil
 			}
-			continue
+			return 0, io.EOF
 		}
 		return n, err
 	}
@@ -303,6 +309,7 @@ type VirtualMachine struct {
 	configRegion hv.MemoryRegion
 
 	debugLogging bool
+	dmesgLogging bool
 }
 
 func (vm *VirtualMachine) Close() error {
@@ -372,6 +379,26 @@ func WithFileFromBytes(guestPath string, data []byte, mode os.FileMode) Option {
 func WithDebugLogging(enabled bool) Option {
 	return funcOption(func(vm *VirtualMachine) error {
 		vm.debugLogging = enabled
+		return nil
+	})
+}
+
+func WithDmesgLogging(enabled bool) Option {
+	return funcOption(func(vm *VirtualMachine) error {
+		if enabled {
+			vm.dmesgLogging = true
+		}
+		return nil
+	})
+}
+
+func WithStdin(r io.Reader) Option {
+	return funcOption(func(vm *VirtualMachine) error {
+		if r != nil {
+			// Directly set the reader field since the console's input
+			// reader goroutine hasn't started yet at this point.
+			vm.inBuffer.r = r
+		}
 		return nil
 	})
 }
@@ -457,15 +484,25 @@ func NewVirtualMachine(
 			var args []string
 
 			if ret.debugLogging {
-				args = append(args,
-					"console=ttyS0,115200n8",
-					"earlycon=uart,mmio,0x09000000,115200",
-				)
+				if arch == hv.ArchitectureX86_64 {
+					args = append(args,
+						"console=ttyS0,115200n8",
+						"earlycon=uart8250,io,0x3f8",
+					)
+				} else {
+					args = append(args,
+						"console=ttyS0,115200n8",
+						"earlycon=uart,mmio,0x09000000,115200",
+					)
+				}
 			} else {
-				args = append(args,
-					"console=hvc0",
-					"quiet",
-				)
+				args = append(args, "console=hvc0")
+			}
+
+			if ret.dmesgLogging {
+				args = append(args, "loglevel=7")
+			} else {
+				args = append(args, "loglevel=3")
 			}
 
 			args = append(args,
@@ -475,10 +512,15 @@ func NewVirtualMachine(
 
 			switch h.Architecture() {
 			case hv.ArchitectureX86_64:
-				args = append(args, []string{
-					"tsc=reliable",
-					"tsc_early_khz=3000000",
-				}...)
+				// Disable i8042 keyboard/mouse probing to avoid 1s delay
+				args = append(args, "i8042.noaux", "i8042.nokbd")
+				if runtime.GOOS == "windows" {
+					// hack since Windows doesn't have kvm_clock
+					args = append(args, []string{
+						"tsc=reliable",
+						"tsc_early_khz=3000000",
+					}...)
+				}
 			case hv.ArchitectureARM64:
 				args = append(args, []string{
 					"iomem=relaxed",

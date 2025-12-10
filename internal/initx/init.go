@@ -189,7 +189,7 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 			defs.SYS_OPENAT,
 			ir.Int64(linux.AT_FDCWD),
 			"/dev/console",
-			ir.Int64(linux.O_WRONLY),
+			ir.Int64(linux.O_RDWR),
 			ir.Int64(0),
 		)),
 		ir.If(ir.IsNegative(ir.Var("consoleFd")), ir.Block{
