@@ -751,6 +751,9 @@ func Exec(path string, argv []string, envp []string, errLabel ir.Label, errVar i
 
 func ForkExecWait(path string, argv []string, envp []string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
 	pid := ir.Var("pid")
+	status := ir.Var("waitStatus")
+	signal := ir.Var("waitSignal")
+	exitCode := ir.Var("waitExitCode")
 
 	return ir.Block{
 		ir.Assign(pid, ir.Syscall(defs.SYS_CLONE, ir.Int64(defs.SIGCHLD), 0, 0, 0, 0)),
@@ -772,6 +775,17 @@ func ForkExecWait(path string, argv []string, envp []string, errLabel ir.Label, 
 					ir.Assign(ptr, slot.Pointer()),
 					ir.Assign(errVar, ir.Syscall(defs.SYS_WAIT4, pid, ptr, ir.Int64(0), ir.Int64(0))),
 					ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
+					ir.Assign(status, ptr.Mem().As32()),
+					ir.Assign(signal, ir.Op(ir.OpAnd, status, ir.Int64(0x7f))),
+					ir.Assign(exitCode, ir.Op(
+						ir.OpAnd,
+						ir.Op(ir.OpShr, status, ir.Int64(8)),
+						ir.Int64(0xff),
+					)),
+					ir.If(ir.IsNotEqual(signal, ir.Int64(0)), ir.Block{
+						ir.Assign(exitCode, ir.Op(ir.OpAdd, signal, ir.Int64(128))),
+					}),
+					ir.Assign(errVar, exitCode),
 				}
 			},
 		}),

@@ -270,6 +270,7 @@ func main() {
 	kernel := fs.Bool("kernel", false, "build and execute the kernel tool")
 	bringup := fs.Bool("bringup", false, "build and execute the bringup tool inside a linux VM")
 	remote := fs.String("remote", "", "run quest/bringup on remote host alias from local/remotes.json")
+	run := fs.Bool("run", false, "run the built cc tool after building")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
@@ -550,6 +551,22 @@ func main() {
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "main build not implemented\n")
-	os.Exit(1)
+	// build cmd/cc by default
+	out, err := goBuild(buildOptions{
+		Package:    "cmd/cc",
+		OutputName: "cc",
+		Build:      hostBuild,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to build cc: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("built %s\n", out.Path)
+
+	if *run {
+		fmt.Printf("running %s %s\n", out.Path, strings.Join(fs.Args(), " "))
+		if err := runBuildOutput(out, fs.Args()); err != nil {
+			os.Exit(1)
+		}
+	}
 }

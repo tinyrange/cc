@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/tinyrange/cc/internal/devices/virtio"
 	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
@@ -20,6 +21,8 @@ import (
 type AbstractFile interface {
 	// Stat returns the file size and mode.
 	Stat() (size uint64, mode fs.FileMode)
+	// ModTime returns the file's modified time.
+	ModTime() time.Time
 	// ReadAt reads up to size bytes starting at offset off.
 	ReadAt(off uint64, size uint32) ([]byte, error)
 	// WriteAt writes data at offset off. Returns error if not writable.
@@ -33,6 +36,8 @@ type AbstractFile interface {
 type AbstractDir interface {
 	// Stat returns the directory mode.
 	Stat() (mode fs.FileMode)
+	// ModTime returns the directory's modified time.
+	ModTime() time.Time
 	// ReadDir returns all entries in the directory.
 	ReadDir() ([]AbstractDirEntry, error)
 	// Lookup returns the entry for the given name, or nil if not found.
@@ -80,6 +85,7 @@ type fsNode struct {
 	extents []fsExtent
 	entries map[string]uint64
 	xattr   map[string][]byte
+	modTime time.Time
 
 	// Abstract backing - if set, delegates to these instead of in-memory storage.
 	abstractFile AbstractFile
@@ -94,16 +100,18 @@ func newDirNode(id uint64, name string, parent uint64, perm fs.FileMode) *fsNode
 		mode:    fs.ModeDir | perm,
 		entries: make(map[string]uint64),
 		xattr:   make(map[string][]byte),
+		modTime: time.Now(),
 	}
 }
 
 func newFileNode(id uint64, name string, parent uint64, perm fs.FileMode) *fsNode {
 	return &fsNode{
-		id:     id,
-		name:   name,
-		parent: parent,
-		mode:   perm,
-		xattr:  make(map[string][]byte),
+		id:      id,
+		name:    name,
+		parent:  parent,
+		mode:    perm,
+		xattr:   make(map[string][]byte),
+		modTime: time.Now(),
 	}
 }
 
@@ -135,14 +143,25 @@ func (n *fsNode) blockUsage() uint64 {
 func (n *fsNode) attr() virtio.FuseAttr {
 	var perm fs.FileMode
 	var size uint64
+	modTime := n.modTime
 
 	if n.abstractFile != nil {
 		size, perm = n.abstractFile.Stat()
+		if mt := n.abstractFile.ModTime(); !mt.IsZero() {
+			modTime = mt
+		}
 	} else if n.abstractDir != nil {
 		perm = n.abstractDir.Stat()
+		if mt := n.abstractDir.ModTime(); !mt.IsZero() {
+			modTime = mt
+		}
 	} else {
 		perm = n.mode.Perm()
 		size = n.size
+	}
+
+	if modTime.IsZero() {
+		modTime = time.Unix(0, 0)
 	}
 
 	mode := uint32(perm)
@@ -163,15 +182,24 @@ func (n *fsNode) attr() virtio.FuseAttr {
 		nlink = 2 + uint32(entryCount)
 	}
 
+	sec := uint64(modTime.Unix())
+	nsec := uint32(modTime.Nanosecond())
+
 	return virtio.FuseAttr{
-		Ino:     n.id,
-		Mode:    mode,
-		Size:    size,
-		NLink:   nlink,
-		UID:     0,
-		GID:     0,
-		Blocks:  n.blockUsage(),
-		BlkSize: 4096,
+		Ino:       n.id,
+		Mode:      mode,
+		Size:      size,
+		NLink:     nlink,
+		UID:       0,
+		GID:       0,
+		Blocks:    n.blockUsage(),
+		BlkSize:   4096,
+		ATimeSec:  sec,
+		ATimeNsec: nsec,
+		MTimeSec:  sec,
+		MTimeNsec: nsec,
+		CTimeSec:  sec,
+		CTimeNsec: nsec,
 	}
 }
 
@@ -248,6 +276,7 @@ func (v *virtioFsBackend) createAbstractNode(parent *fsNode, name string, entry 
 	id := v.nextID
 	v.nextID++
 
+	modTime := time.Now()
 	node := &fsNode{
 		id:     id,
 		name:   name,
@@ -259,15 +288,22 @@ func (v *virtioFsBackend) createAbstractNode(parent *fsNode, name string, entry 
 		node.abstractDir = entry.Dir
 		node.mode = fs.ModeDir | entry.Dir.Stat()
 		node.entries = make(map[string]uint64)
+		if mt := entry.Dir.ModTime(); !mt.IsZero() {
+			modTime = mt
+		}
 	} else if entry.File != nil {
 		node.abstractFile = entry.File
 		size, mode := entry.File.Stat()
 		node.mode = mode
 		node.size = size
+		if mt := entry.File.ModTime(); !mt.IsZero() {
+			modTime = mt
+		}
 	} else {
 		return nil, -int32(linux.ENOENT)
 	}
 
+	node.modTime = modTime
 	v.nodes[id] = node
 	// Cache in parent's entries for future lookups
 	if parent.entries == nil {
@@ -328,6 +364,7 @@ func (n *fsNode) write(off uint64, data []byte) error {
 	if off+uint64(len(data)) > n.size {
 		n.size = off + uint64(len(data))
 	}
+	n.modTime = time.Now()
 	return nil
 }
 
@@ -337,6 +374,7 @@ func (n *fsNode) truncate(size uint64) error {
 	}
 	if size >= n.size {
 		n.size = size
+		n.modTime = time.Now()
 		return nil
 	}
 	var kept []fsExtent
@@ -351,6 +389,7 @@ func (n *fsNode) truncate(size uint64) error {
 	}
 	n.extents = kept
 	n.size = size
+	n.modTime = time.Now()
 	return nil
 }
 
@@ -617,6 +656,9 @@ func (v *virtioFsBackend) Create(parent uint64, name string, mode uint32, flags 
 	perm := fs.FileMode(mode&^umask) & 0777
 	node := newFileNode(id, clean, parentNode.id, perm)
 	parentNode.entries[clean] = id
+	if parentNode.abstractDir == nil {
+		parentNode.modTime = time.Now()
+	}
 	v.nodes[id] = node
 
 	fh = v.nextFH
@@ -652,6 +694,9 @@ func (v *virtioFsBackend) Mkdir(parent uint64, name string, mode uint32, umask u
 	perm := fs.FileMode(mode&^umask) & 0777
 	node := newDirNode(id, clean, parentNode.id, perm)
 	parentNode.entries[clean] = id
+	if parentNode.abstractDir == nil {
+		parentNode.modTime = time.Now()
+	}
 	v.nodes[id] = node
 	return id, node.attr(), 0
 }
@@ -683,6 +728,9 @@ func (v *virtioFsBackend) Mknod(parent uint64, name string, mode uint32, _ uint3
 	perm := fs.FileMode(mode & 0777)
 	node := newFileNode(id, clean, parentNode.id, perm)
 	parentNode.entries[clean] = id
+	if parentNode.abstractDir == nil {
+		parentNode.modTime = time.Now()
+	}
 	v.nodes[id] = node
 	return id, node.attr(), 0
 }
@@ -842,6 +890,16 @@ func (v *virtioFsBackend) Rename(oldParent uint64, oldName string, newParent uin
 	node := v.nodes[srcID]
 	node.parent = dstParent.id
 	node.name = dstName
+	now := time.Now()
+	if srcParent.abstractDir == nil {
+		srcParent.modTime = now
+	}
+	if dstParent.abstractDir == nil {
+		dstParent.modTime = now
+	}
+	if node.abstractFile == nil && node.abstractDir == nil {
+		node.modTime = now
+	}
 	return 0
 }
 
@@ -870,6 +928,9 @@ func (v *virtioFsBackend) Unlink(parent uint64, name string) int32 {
 		return -int32(linux.EISDIR)
 	}
 	delete(parentNode.entries, clean)
+	if parentNode.abstractDir == nil {
+		parentNode.modTime = time.Now()
+	}
 	delete(v.nodes, id)
 	return 0
 }
@@ -902,6 +963,9 @@ func (v *virtioFsBackend) Rmdir(parent uint64, name string) int32 {
 		return -errNotEmpty
 	}
 	delete(parentNode.entries, clean)
+	if parentNode.abstractDir == nil {
+		parentNode.modTime = time.Now()
+	}
 	delete(v.nodes, id)
 	return 0
 }
@@ -978,6 +1042,10 @@ func (v *virtioFsBackend) AddAbstractFile(filePath string, file AbstractFile) er
 	v.nextID++
 
 	size, mode := file.Stat()
+	modTime := file.ModTime()
+	if modTime.IsZero() {
+		modTime = time.Now()
+	}
 	node := &fsNode{
 		id:           id,
 		name:         name,
@@ -986,9 +1054,13 @@ func (v *virtioFsBackend) AddAbstractFile(filePath string, file AbstractFile) er
 		size:         size,
 		xattr:        make(map[string][]byte),
 		abstractFile: file,
+		modTime:      modTime,
 	}
 
 	parent.entries[name] = id
+	if parent.abstractDir == nil {
+		parent.modTime = time.Now()
+	}
 	v.nodes[id] = node
 	return nil
 }
@@ -1019,6 +1091,10 @@ func (v *virtioFsBackend) AddAbstractDir(dirPath string, dir AbstractDir) error 
 	v.nextID++
 
 	mode := dir.Stat()
+	modTime := dir.ModTime()
+	if modTime.IsZero() {
+		modTime = time.Now()
+	}
 	node := &fsNode{
 		id:          id,
 		name:        name,
@@ -1027,9 +1103,13 @@ func (v *virtioFsBackend) AddAbstractDir(dirPath string, dir AbstractDir) error 
 		xattr:       make(map[string][]byte),
 		entries:     make(map[string]uint64),
 		abstractDir: dir,
+		modTime:     modTime,
 	}
 
 	parent.entries[name] = id
+	if parent.abstractDir == nil {
+		parent.modTime = time.Now()
+	}
 	v.nodes[id] = node
 	return nil
 }
@@ -1046,6 +1126,11 @@ func (v *virtioFsBackend) SetAbstractRoot(dir AbstractDir) error {
 	root := v.nodes[virtioFsRootNodeID]
 	root.abstractDir = dir
 	root.mode = fs.ModeDir | dir.Stat()
+	if mt := dir.ModTime(); !mt.IsZero() {
+		root.modTime = mt
+	} else {
+		root.modTime = time.Now()
+	}
 
 	return nil
 }

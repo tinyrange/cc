@@ -41,13 +41,18 @@ const (
 type proxyReader struct {
 	r      io.Reader
 	update chan io.Reader
+	eof    bool
 }
 
 func (p *proxyReader) Read(b []byte) (int, error) {
 	for {
+		if p.eof {
+			return 0, io.EOF
+		}
 		if p.r == nil {
 			newR, ok := <-p.update
 			if !ok {
+				p.eof = true
 				return 0, io.EOF
 			}
 			p.r = newR
@@ -56,10 +61,11 @@ func (p *proxyReader) Read(b []byte) (int, error) {
 		n, err := p.r.Read(b)
 		if err == io.EOF {
 			p.r = nil
+			p.eof = true
 			if n > 0 {
 				return n, nil
 			}
-			continue
+			return 0, io.EOF
 		}
 		return n, err
 	}
@@ -99,6 +105,9 @@ type programLoader struct {
 	dataRegionOffset int64
 
 	dataRegion []byte
+
+	runResultDetail uint32
+	runResultStage  uint32
 }
 
 func (p *programLoader) ReserveDataRegion(size int) {
@@ -143,12 +152,16 @@ func (p *programLoader) ReadMMIO(addr uint64, data []byte) error {
 func (p *programLoader) WriteMMIO(addr uint64, data []byte) error {
 	addr = addr - mailboxPhysAddr
 
-	// ignore stage information writes
-	if addr == 8 || addr == 12 || addr == 16 || addr == 20 {
+	switch addr {
+	case mailboxRunResultDetailOffset:
+		p.runResultDetail = binary.LittleEndian.Uint32(data)
 		return nil
-	}
-
-	if addr == 0x0 {
+	case mailboxRunResultStageOffset:
+		p.runResultStage = binary.LittleEndian.Uint32(data)
+		return nil
+	case mailboxStartResultDetailOffset, mailboxStartResultStageOffset:
+		return nil
+	case 0x0:
 		value := binary.LittleEndian.Uint32(data)
 		switch value {
 		case 0x444f4e45:
@@ -156,6 +169,8 @@ func (p *programLoader) WriteMMIO(addr uint64, data []byte) error {
 		case userYieldValue:
 			return hv.ErrUserYield
 		}
+	default:
+		// no-op
 	}
 
 	return fmt.Errorf("unimplemented write at address 0x%x", addr)
@@ -166,6 +181,8 @@ func (p *programLoader) LoadProgram(prog *ir.Program) error {
 	if err != nil {
 		return fmt.Errorf("build standalone program: %w", err)
 	}
+	p.runResultDetail = 0
+	p.runResultStage = 0
 
 	if len(p.dataRegion) < configRegionSize {
 		p.dataRegion = make([]byte, configRegionSize)
@@ -269,6 +286,9 @@ func (p *programRunner) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 				return nil
 			}
 			if errors.Is(err, hv.ErrYield) {
+				if code := p.loader.runResultDetail; code != 0 {
+					return &ExitError{Code: int(code)}
+				}
 				return nil
 			}
 			if errors.Is(err, hv.ErrUserYield) {
@@ -303,6 +323,7 @@ type VirtualMachine struct {
 	configRegion hv.MemoryRegion
 
 	debugLogging bool
+	dmesgLogging bool
 }
 
 func (vm *VirtualMachine) Close() error {
@@ -372,6 +393,26 @@ func WithFileFromBytes(guestPath string, data []byte, mode os.FileMode) Option {
 func WithDebugLogging(enabled bool) Option {
 	return funcOption(func(vm *VirtualMachine) error {
 		vm.debugLogging = enabled
+		return nil
+	})
+}
+
+func WithDmesgLogging(enabled bool) Option {
+	return funcOption(func(vm *VirtualMachine) error {
+		if enabled {
+			vm.dmesgLogging = true
+		}
+		return nil
+	})
+}
+
+func WithStdin(r io.Reader) Option {
+	return funcOption(func(vm *VirtualMachine) error {
+		if r != nil {
+			// Directly set the reader field since the console's input
+			// reader goroutine hasn't started yet at this point.
+			vm.inBuffer.r = r
+		}
 		return nil
 	})
 }
@@ -457,15 +498,25 @@ func NewVirtualMachine(
 			var args []string
 
 			if ret.debugLogging {
-				args = append(args,
-					"console=ttyS0,115200n8",
-					"earlycon=uart,mmio,0x09000000,115200",
-				)
+				if arch == hv.ArchitectureX86_64 {
+					args = append(args,
+						"console=ttyS0,115200n8",
+						"earlycon=uart8250,io,0x3f8",
+					)
+				} else {
+					args = append(args,
+						"console=ttyS0,115200n8",
+						"earlycon=uart,mmio,0x09000000,115200",
+					)
+				}
 			} else {
-				args = append(args,
-					"console=hvc0",
-					"quiet",
-				)
+				args = append(args, "console=hvc0")
+			}
+
+			if ret.dmesgLogging {
+				args = append(args, "loglevel=7")
+			} else {
+				args = append(args, "loglevel=3")
 			}
 
 			args = append(args,
@@ -475,10 +526,15 @@ func NewVirtualMachine(
 
 			switch h.Architecture() {
 			case hv.ArchitectureX86_64:
-				args = append(args, []string{
-					"tsc=reliable",
-					"tsc_early_khz=3000000",
-				}...)
+				// Disable i8042 keyboard/mouse probing to avoid 1s delay
+				args = append(args, "i8042.noaux", "i8042.nokbd")
+				if runtime.GOOS == "windows" {
+					// hack since Windows doesn't have kvm_clock
+					args = append(args, []string{
+						"tsc=reliable",
+						"tsc_early_khz=3000000",
+					}...)
+				}
 			case hv.ArchitectureARM64:
 				args = append(args, []string{
 					"iomem=relaxed",
@@ -750,7 +806,7 @@ func (vm *VirtualMachine) Spawn(ctx context.Context, path string, args ...string
 		Methods: map[string]ir.Method{
 			"main": {
 				ForkExecWait(path, args, nil, errLabel, errVar),
-				ir.Return(ir.Int64(0)),
+				ir.Return(errVar),
 				ir.DeclareLabel(errLabel, ir.Block{
 					ir.Printf(errorFmt, ir.Op(ir.OpSub, ir.Int64(0), errVar)),
 					ir.Syscall(defs.SYS_EXIT, ir.Int64(1)),

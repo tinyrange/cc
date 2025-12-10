@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/tinyrange/cc/internal/archive"
 	"github.com/tinyrange/cc/internal/vfs"
@@ -89,9 +90,49 @@ func (cfs *ContainerFS) Close() error {
 	return nil
 }
 
+func normalizePath(filePath string) string {
+	filePath = strings.TrimPrefix(filePath, "/")
+	filePath = strings.TrimPrefix(filePath, "./")
+	if filePath == "." {
+		return ""
+	}
+	return filePath
+}
+
+func (cfs *ContainerFS) entryForPath(filePath string) (archive.Entry, bool) {
+	normalized := normalizePath(filePath)
+	if normalized == "" {
+		normalized = "."
+	}
+	for i := len(cfs.layers) - 1; i >= 0; i-- {
+		lr := cfs.layers[i]
+		ent, ok := lr.entries[normalized]
+		if !ok {
+			continue
+		}
+		if ent.Kind == archive.EntryKindDeleted {
+			return archive.Entry{}, false
+		}
+		return ent, true
+	}
+	return archive.Entry{}, false
+}
+
+func (cfs *ContainerFS) entryModTime(filePath string) time.Time {
+	if ent, ok := cfs.entryForPath(filePath); ok {
+		return ent.ModTime
+	}
+	return time.Time{}
+}
+
 // Stat implements vfs.AbstractDir.
 func (cfs *ContainerFS) Stat() fs.FileMode {
 	return 0o755
+}
+
+// ModTime implements vfs.AbstractDir.
+func (cfs *ContainerFS) ModTime() time.Time {
+	return cfs.entryModTime(".")
 }
 
 // ReadDir implements vfs.AbstractDir.
@@ -100,6 +141,8 @@ func (cfs *ContainerFS) ReadDir() ([]vfs.AbstractDirEntry, error) {
 }
 
 func (cfs *ContainerFS) readDirPath(dirPath string) ([]vfs.AbstractDirEntry, error) {
+	dirPath = normalizePath(dirPath)
+
 	seen := make(map[string]bool)
 	deleted := make(map[string]bool)
 	var result []vfs.AbstractDirEntry
@@ -174,8 +217,7 @@ func (cfs *ContainerFS) Lookup(name string) (vfs.AbstractEntry, error) {
 }
 
 func (cfs *ContainerFS) lookupPath(filePath string) (vfs.AbstractEntry, error) {
-	filePath = strings.TrimPrefix(filePath, "/")
-	filePath = strings.TrimPrefix(filePath, "./")
+	filePath = normalizePath(filePath)
 
 	// Search layers from top to bottom
 	for i := len(cfs.layers) - 1; i >= 0; i-- {
@@ -213,8 +255,9 @@ func (cfs *ContainerFS) entryToAbstract(filePath string, ent archive.Entry, lr *
 	case archive.EntryKindDirectory:
 		return vfs.AbstractEntry{
 			Dir: &containerDir{
-				cfs:  cfs,
-				path: filePath,
+				cfs:     cfs,
+				path:    filePath,
+				modTime: ent.ModTime,
 			},
 		}, nil
 	case archive.EntryKindRegular:
@@ -240,10 +283,19 @@ func (cfs *ContainerFS) entryToAbstract(filePath string, ent archive.Entry, lr *
 type containerDir struct {
 	cfs  *ContainerFS
 	path string
+
+	modTime time.Time
 }
 
 func (d *containerDir) Stat() fs.FileMode {
 	return 0o755
+}
+
+func (d *containerDir) ModTime() time.Time {
+	if !d.modTime.IsZero() {
+		return d.modTime
+	}
+	return d.cfs.entryModTime(d.path)
 }
 
 func (d *containerDir) ReadDir() ([]vfs.AbstractDirEntry, error) {
@@ -263,6 +315,10 @@ type containerFile struct {
 
 func (f *containerFile) Stat() (uint64, fs.FileMode) {
 	return uint64(f.entry.Size), f.entry.Mode
+}
+
+func (f *containerFile) ModTime() time.Time {
+	return f.entry.ModTime
 }
 
 func (f *containerFile) ReadAt(off uint64, size uint32) ([]byte, error) {

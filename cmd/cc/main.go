@@ -2,11 +2,16 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
+	"path"
 	"runtime"
+	"runtime/pprof"
+	"strings"
+	"time"
 
 	"github.com/tinyrange/cc/internal/devices/virtio"
 	"github.com/tinyrange/cc/internal/hv"
@@ -18,10 +23,15 @@ import (
 	"github.com/tinyrange/cc/internal/linux/kernel"
 	"github.com/tinyrange/cc/internal/oci"
 	"github.com/tinyrange/cc/internal/vfs"
+	"golang.org/x/term"
 )
 
 func main() {
 	if err := run(); err != nil {
+		var exitErr *initx.ExitError
+		if errors.As(err, &exitErr) {
+			os.Exit(exitErr.Code)
+		}
 		fmt.Fprintf(os.Stderr, "cc: %v\n", err)
 		os.Exit(1)
 	}
@@ -33,6 +43,9 @@ func run() error {
 	cpus := flag.Int("cpus", 1, "Number of vCPUs")
 	memory := flag.Uint64("memory", 256, "Memory in MB")
 	debug := flag.Bool("debug", false, "Enable debug logging")
+	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
+	memprofile := flag.String("memprofile", "", "Write memory profile to file")
+	dmesg := flag.Bool("dmesg", false, "Print kernel dmesg during boot and runtime")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <image> [command] [args...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Run a command inside an OCI container image in a virtual machine.\n\n")
@@ -44,6 +57,38 @@ func run() error {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if *debug {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	}
+
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			return fmt.Errorf("create cpu profile file: %w", err)
+		}
+		defer f.Close()
+
+		if err := pprof.StartCPUProfile(f); err != nil {
+			return fmt.Errorf("start cpu profile: %w", err)
+		}
+		defer pprof.StopCPUProfile()
+	}
+
+	if *memprofile != "" {
+		defer func() {
+			f, err := os.Create(*memprofile)
+			if err != nil {
+				slog.Error("create memory profile file", "error", err)
+				return
+			}
+			defer f.Close()
+
+			if err := pprof.Lookup("heap").WriteTo(f, 0); err != nil {
+				slog.Error("write memory profile", "error", err)
+			}
+		}()
+	}
 
 	args := flag.Args()
 	if len(args) < 1 {
@@ -69,7 +114,7 @@ func run() error {
 		return fmt.Errorf("create OCI client: %w", err)
 	}
 
-	slog.Info("Pulling image", "ref", imageRef, "arch", *arch)
+	slog.Debug("Pulling image", "ref", imageRef, "arch", *arch)
 
 	// Pull image
 	img, err := client.PullForArch(imageRef, *arch)
@@ -77,7 +122,7 @@ func run() error {
 		return fmt.Errorf("pull image: %w", err)
 	}
 
-	slog.Info("Image pulled", "layers", len(img.Layers))
+	slog.Debug("Image pulled", "layers", len(img.Layers))
 
 	// Determine command to run
 	execCmd := img.Command(cmd)
@@ -85,7 +130,8 @@ func run() error {
 		return fmt.Errorf("no command specified and image has no entrypoint/cmd")
 	}
 
-	slog.Info("Running command", "cmd", execCmd)
+	pathEnv := extractInitialPath(img.Config.Env)
+	workDir := containerWorkDir(img)
 
 	// Create container filesystem
 	containerFS, err := oci.NewContainerFS(img)
@@ -93,6 +139,13 @@ func run() error {
 		return fmt.Errorf("create container filesystem: %w", err)
 	}
 	defer containerFS.Close()
+
+	execCmd, err = resolveCommandPath(containerFS, execCmd, pathEnv, workDir)
+	if err != nil {
+		return fmt.Errorf("resolve command: %w", err)
+	}
+
+	slog.Debug("Running command", "cmd", execCmd)
 
 	// Create VirtioFS backend with container filesystem as root
 	fsBackend := vfs.NewVirtioFsBackendWithAbstract()
@@ -125,6 +178,8 @@ func run() error {
 			Arch:    hvArch,
 		}),
 		initx.WithDebugLogging(*debug),
+		initx.WithDmesgLogging(*dmesg),
+		initx.WithStdin(os.Stdin),
 	)
 	if err != nil {
 		return fmt.Errorf("create VM: %w", err)
@@ -135,9 +190,44 @@ func run() error {
 	ctx := context.Background()
 	prog := buildContainerInit(img, execCmd)
 
-	slog.Info("Starting VM")
+	slog.Debug("Booting VM")
+
+	// Boot the VM first to set up devices
+	if err := func() error {
+		ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+
+		if err := vm.Run(ctx, &ir.Program{
+			Entrypoint: "main",
+			Methods: map[string]ir.Method{
+				"main": {
+					ir.Return(ir.Int64(0)),
+				},
+			},
+		}); err != nil {
+			return fmt.Errorf("boot VM: %w", err)
+		}
+
+		return nil
+	}(); err != nil {
+		return err
+	}
+
+	// Put stdin into raw mode so we don't send cooked/echoed characters into the guest.
+	// Do this after booting so that any Ctrl+C during boot still works to kill cc itself.
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+		if err != nil {
+			return fmt.Errorf("enable raw mode: %w", err)
+		}
+		defer term.Restore(int(os.Stdin.Fd()), oldState)
+	}
 
 	if err := vm.Run(ctx, prog); err != nil {
+		var exitErr *initx.ExitError
+		if errors.As(err, &exitErr) {
+			return exitErr
+		}
 		return fmt.Errorf("run VM: %w", err)
 	}
 
@@ -155,14 +245,89 @@ func parseArchitecture(arch string) (hv.CpuArchitecture, error) {
 	}
 }
 
-func buildContainerInit(img *oci.Image, cmd []string) *ir.Program {
-	errLabel := ir.Label("__cc_error")
-	errVar := ir.Var("__cc_errno")
+const defaultPathEnv = "/bin:/usr/bin"
 
-	workDir := img.Config.WorkingDir
+func extractInitialPath(env []string) string {
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "PATH=") {
+			return strings.TrimPrefix(entry, "PATH=")
+		}
+	}
+	return defaultPathEnv
+}
+
+func containerWorkDir(img *oci.Image) string {
+	if img.Config.WorkingDir == "" {
+		return "/"
+	}
+	return img.Config.WorkingDir
+}
+
+func resolveCommandPath(fs *oci.ContainerFS, cmd []string, pathEnv string, workDir string) ([]string, error) {
+	if len(cmd) == 0 {
+		return nil, fmt.Errorf("empty command")
+	}
+
+	resolved := make([]string, len(cmd))
+	copy(resolved, cmd)
+
+	if strings.Contains(resolved[0], "/") {
+		return resolved, nil
+	}
+
+	resolvedPath, err := lookPath(fs, pathEnv, workDir, resolved[0])
+	if err != nil {
+		return nil, err
+	}
+	resolved[0] = resolvedPath
+	return resolved, nil
+}
+
+func lookPath(fs *oci.ContainerFS, pathEnv string, workDir string, file string) (string, error) {
+	if file == "" {
+		return "", fmt.Errorf("executable name is empty")
+	}
+	if pathEnv == "" {
+		pathEnv = defaultPathEnv
+	}
 	if workDir == "" {
 		workDir = "/"
 	}
+
+	for _, dir := range strings.Split(pathEnv, ":") {
+		switch {
+		case dir == "":
+			dir = workDir
+		case !path.IsAbs(dir):
+			dir = path.Join(workDir, dir)
+		}
+
+		candidate := path.Join(dir, file)
+		entry, err := fs.Lookup(candidate)
+		if err != nil {
+			continue
+		}
+
+		if entry.File == nil {
+			continue
+		}
+		_, mode := entry.File.Stat()
+		if mode.IsDir() || mode&0o111 == 0 {
+			continue
+		}
+
+		return candidate, nil
+	}
+
+	return "", fmt.Errorf("executable %q not found in PATH", file)
+}
+
+func buildContainerInit(img *oci.Image, cmd []string) *ir.Program {
+	errLabel := ir.Label("__cc_error")
+	errVar := ir.Var("__cc_errno")
+	pivotResult := ir.Var("__cc_pivot_result")
+
+	workDir := containerWorkDir(img)
 
 	main := ir.Method{
 		// Create mount points
@@ -229,14 +394,34 @@ func buildContainerInit(img *oci.Image, cmd []string) *ir.Program {
 
 		// pivot_root
 		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "oldroot", ir.Int64(0o755)),
-		ir.Assign(errVar, ir.Syscall(defs.SYS_PIVOT_ROOT, ".", "oldroot")),
-		ir.If(ir.IsNegative(errVar), ir.Block{
+		ir.Assign(pivotResult, ir.Syscall(defs.SYS_PIVOT_ROOT, ".", "oldroot")),
+		ir.Assign(errVar, pivotResult),
+		ir.If(ir.IsNegative(pivotResult), ir.Block{
 			// Fall back to chroot if pivot_root fails
 			ir.Assign(errVar, ir.Syscall(defs.SYS_CHROOT, ".")),
 			ir.If(ir.IsNegative(errVar), ir.Block{
 				ir.Printf("cc: failed to chroot: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
 				ir.Goto(errLabel),
 			}),
+		}),
+		ir.If(ir.IsGreaterOrEqual(pivotResult, ir.Int64(0)), ir.Block{
+			ir.Assign(errVar, ir.Syscall(defs.SYS_CHDIR, "/")),
+			ir.If(ir.IsNegative(errVar), ir.Block{
+				ir.Printf("cc: failed to chdir to new root: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+				ir.Goto(errLabel),
+			}),
+			ir.Assign(errVar, ir.Syscall(defs.SYS_UMOUNT2, "/oldroot", ir.Int64(linux.MNT_DETACH))),
+			ir.If(ir.IsNegative(errVar), ir.Block{
+				ir.Printf("cc: failed to unmount oldroot: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+				ir.Goto(errLabel),
+			}),
+		}),
+
+		// Always cleanup oldroot
+		ir.Assign(errVar, ir.Syscall(defs.SYS_UNLINKAT, ir.Int64(linux.AT_FDCWD), "/oldroot", ir.Int64(linux.AT_REMOVEDIR))),
+		ir.If(ir.IsNegative(errVar), ir.Block{
+			ir.Printf("cc: failed to remove oldroot: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+			ir.Goto(errLabel),
 		}),
 
 		// Change to working directory
@@ -247,8 +432,8 @@ func buildContainerInit(img *oci.Image, cmd []string) *ir.Program {
 		// as it puts path at argv[0] itself
 		initx.ForkExecWait(cmd[0], cmd[1:], img.Config.Env, errLabel, errVar),
 
-		// Return success
-		ir.Return(ir.Int64(0)),
+		// Return child exit code to host
+		ir.Return(errVar),
 
 		// Error handler
 		ir.DeclareLabel(errLabel, ir.Block{

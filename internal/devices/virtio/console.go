@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
 	"sync"
 	"time"
 
@@ -166,7 +165,6 @@ type consoleSnapshot struct {
 
 // Init implements hv.MemoryMappedIODevice.
 func (vc *Console) Init(vm hv.VirtualMachine) error {
-	vc.stopInputReader()
 	if vc.device == nil {
 		if vm == nil {
 			return fmt.Errorf("virtio-console: virtual machine is nil")
@@ -256,9 +254,8 @@ func (vc *Console) QueueMaxSize(queue int) uint16 {
 }
 
 func (vc *Console) OnReset(device) {
-	vc.mu.Lock()
-	vc.pending = nil
-	vc.mu.Unlock()
+	// Don't clear pending input data on reset - this data came from the host
+	// and should be preserved for delivery when the device is re-initialized.
 }
 
 func (vc *Console) OnQueueNotify(dev device, queue int) error {
@@ -393,9 +390,6 @@ func (vc *Console) processReceiveQueue(dev device, q *queue) error {
 			return err
 		}
 
-		if written > 0 {
-			fmt.Fprintf(os.Stderr, "virtio-console: delivered %d bytes to guest (consumed %d)\n", written, consumed)
-		}
 
 		vc.pending = vc.pending[consumed:]
 
