@@ -50,6 +50,17 @@ type Memory struct {
 	hasIndex bool
 }
 
+// ControlReg identifies an x86_64 control register (e.g. CR0, CR3, CR4).
+type ControlReg uint8
+
+const (
+	CR0 ControlReg = 0
+	CR2 ControlReg = 2
+	CR3 ControlReg = 3
+	CR4 ControlReg = 4
+	CR8 ControlReg = 8
+)
+
 // Mem constructs a memory operand referencing [base].
 func Mem(base Reg) Memory {
 	return Memory{
