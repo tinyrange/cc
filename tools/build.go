@@ -52,6 +52,13 @@ var crossBuilds = []crossBuild{
 	{"windows", "arm64"},
 }
 
+type remoteTarget struct {
+	Address   string `json:"address"`
+	GOOS      string `json:"os"`
+	GOARCH    string `json:"arch"`
+	TargetDir string `json:"targetDir"`
+}
+
 type buildOptions struct {
 	Package          string
 	OutputName       string
@@ -176,6 +183,80 @@ func getOrCreateHostID() (string, error) {
 	return hostID, nil
 }
 
+func loadRemoteTarget(alias string) (remoteTarget, error) {
+	remotesPath := filepath.Join("local", "remotes.json")
+	data, err := os.ReadFile(remotesPath)
+	if err != nil {
+		return remoteTarget{}, fmt.Errorf("failed to read remotes from %s: %w", remotesPath, err)
+	}
+
+	var remotes map[string]remoteTarget
+	if err := json.Unmarshal(data, &remotes); err != nil {
+		return remoteTarget{}, fmt.Errorf("failed to parse remotes file %s: %w", remotesPath, err)
+	}
+
+	target, ok := remotes[alias]
+	if !ok {
+		return remoteTarget{}, fmt.Errorf("remote alias %q not found in %s", alias, remotesPath)
+	}
+
+	if target.Address == "" || target.GOOS == "" || target.GOARCH == "" {
+		return remoteTarget{}, fmt.Errorf("remote alias %q missing required fields (address/os/arch)", alias)
+	}
+
+	return target, nil
+}
+
+func runRemoteCommand(remote remoteTarget, output buildOutput, args []string) error {
+	cmdName := filepath.Join(remote.TargetDir, filepath.Base(output.Path))
+
+	cmdArgs := append([]string{"run", "-timeout", "30s", remote.Address, cmdName}, args...)
+	cmd := exec.Command("remotectl", cmdArgs...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("remotectl execution failed: %w", err)
+	}
+
+	return nil
+}
+
+func pushBuildOutput(remote remoteTarget, output buildOutput) error {
+	targetFile := filepath.Join(remote.TargetDir, filepath.Base(output.Path))
+
+	// push the file using remotectl push-file
+	cmd := exec.Command(
+		"remotectl", "push-file",
+		remote.Address,
+		output.Path,
+		targetFile,
+	)
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("remotectl push failed: %w", err)
+	}
+
+	// make the file executable using remotectl run chmod +x
+	cmd = exec.Command(
+		"remotectl", "run", remote.Address,
+		"chmod", "+x", targetFile,
+	)
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("remotectl chmod failed: %w", err)
+	}
+
+	return nil
+}
+
 func main() {
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
@@ -188,9 +269,28 @@ func main() {
 	oci := fs.Bool("oci", false, "build and execute the OCI image tool")
 	kernel := fs.Bool("kernel", false, "build and execute the kernel tool")
 	bringup := fs.Bool("bringup", false, "build and execute the bringup tool inside a linux VM")
+	remote := fs.String("remote", "", "run quest/bringup on remote host alias from local/remotes.json")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
+	}
+
+	var remoteTargetConfig *remoteTarget
+	if *remote != "" {
+		if !*quest && !*bringup {
+			fmt.Fprintf(os.Stderr, "-remote can only be used with -quest or -bringup\n")
+			os.Exit(1)
+		}
+		if *cross {
+			fmt.Fprintf(os.Stderr, "-remote cannot be combined with -cross\n")
+			os.Exit(1)
+		}
+		target, err := loadRemoteTarget(*remote)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to load remote alias: %v\n", err)
+			os.Exit(1)
+		}
+		remoteTargetConfig = &target
 	}
 
 	if *codesign {
@@ -248,10 +348,18 @@ func main() {
 	}
 
 	if *quest {
+		buildTarget := hostBuild
+		if remoteTargetConfig != nil {
+			buildTarget = crossBuild{
+				GOOS:   remoteTargetConfig.GOOS,
+				GOARCH: remoteTargetConfig.GOARCH,
+			}
+		}
+
 		out, err := goBuild(buildOptions{
 			Package:          "internal/cmd/quest",
 			OutputName:       "quest",
-			Build:            hostBuild,
+			Build:            buildTarget,
 			RaceEnabled:      *race,
 			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
 		})
@@ -260,19 +368,45 @@ func main() {
 			os.Exit(1)
 		}
 
-		if err := runBuildOutput(out, fs.Args()); err != nil {
-			os.Exit(1)
+		if remoteTargetConfig != nil {
+			if err := pushBuildOutput(*remoteTargetConfig, out); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to push quest to remote: %v\n", err)
+				os.Exit(1)
+			}
+
+			if err := runRemoteCommand(*remoteTargetConfig, out, fs.Args()); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to run quest remotely: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			if err := runBuildOutput(out, fs.Args()); err != nil {
+				os.Exit(1)
+			}
 		}
 
 		return
 	}
 
 	if *bringup {
+		bringupBuild := crossBuild{GOOS: "linux", GOARCH: hostBuild.GOARCH}
+		questBuild := hostBuild
+
+		if remoteTargetConfig != nil {
+			bringupBuild = crossBuild{
+				GOOS:   "linux",
+				GOARCH: remoteTargetConfig.GOARCH,
+			}
+			questBuild = crossBuild{
+				GOOS:   remoteTargetConfig.GOOS,
+				GOARCH: remoteTargetConfig.GOARCH,
+			}
+		}
+
 		bringupOut, err := goBuild(buildOptions{
 			Package:    "internal/cmd/bringup",
 			OutputName: "bringup",
 			CgoEnabled: false,
-			Build:      crossBuild{GOOS: "linux", GOARCH: hostBuild.GOARCH},
+			Build:      bringupBuild,
 			BuildTests: true,
 			Tags:       []string{"guest"},
 		})
@@ -284,7 +418,7 @@ func main() {
 		out, err := goBuild(buildOptions{
 			Package:          "internal/cmd/quest",
 			OutputName:       "quest",
-			Build:            hostBuild,
+			Build:            questBuild,
 			RaceEnabled:      *race,
 			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
 		})
@@ -293,9 +427,32 @@ func main() {
 			os.Exit(1)
 		}
 
-		args := append([]string{"-exec", bringupOut.Path}, fs.Args()...)
-		if err := runBuildOutput(out, args); err != nil {
-			os.Exit(1)
+		bringupExecPath := bringupOut.Path
+
+		if remoteTargetConfig != nil {
+			bringupExecPath = filepath.Join(remoteTargetConfig.TargetDir, filepath.Base(bringupOut.Path))
+
+			if err := pushBuildOutput(*remoteTargetConfig, bringupOut); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to push bringup to remote: %v\n", err)
+				os.Exit(1)
+			}
+
+			if err := pushBuildOutput(*remoteTargetConfig, out); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to push bringup quest to remote: %v\n", err)
+				os.Exit(1)
+			}
+		}
+
+		args := append([]string{"-exec", bringupExecPath}, fs.Args()...)
+		if remoteTargetConfig != nil {
+			if err := runRemoteCommand(*remoteTargetConfig, out, args); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to run bringup quest remotely: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			if err := runBuildOutput(out, args); err != nil {
+				os.Exit(1)
+			}
 		}
 
 		return
