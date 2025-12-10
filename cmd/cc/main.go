@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"runtime/pprof"
 
+	"golang.org/x/term"
+
 	"github.com/tinyrange/cc/internal/devices/virtio"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/factory"
@@ -172,6 +174,15 @@ func run() error {
 	// Build and run the container init program
 	ctx := context.Background()
 	prog := buildContainerInit(img, execCmd)
+
+	// Put stdin into raw mode so we don't send cooked/echoed characters into the guest.
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+		if err != nil {
+			return fmt.Errorf("enable raw mode: %w", err)
+		}
+		defer term.Restore(int(os.Stdin.Fd()), oldState)
+	}
 
 	slog.Debug("Starting VM")
 

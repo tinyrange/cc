@@ -203,6 +203,43 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 				ir.Int64(0),
 			),
 		}),
+		// create a new session to be able to own the console
+		ir.Assign(ir.Var("setsidResult"), ir.Syscall(
+			defs.SYS_SETSID,
+		)),
+		ir.If(ir.IsNegative(ir.Var("setsidResult")), ir.Block{
+			ir.Printf("initx: failed to create session (errno=0x%x)\n",
+				ir.Op(ir.OpSub, ir.Int64(0), ir.Var("setsidResult")),
+			),
+			ir.Syscall(defs.SYS_REBOOT,
+				linux.LINUX_REBOOT_MAGIC1,
+				linux.LINUX_REBOOT_MAGIC2,
+				linux.LINUX_REBOOT_CMD_RESTART,
+				ir.Int64(0),
+			),
+		}),
+		// ensure the console is our controlling terminal so interactive shells behave
+		ir.Assign(ir.Var("ttyResult"), ir.Syscall(
+			defs.SYS_IOCTL,
+			ir.Var("consoleFd"),
+			ir.Int64(linux.TIOCSCTTY),
+			ir.Int64(0),
+		)),
+		ir.If(ir.IsNegative(ir.Var("ttyResult")), ir.Block{
+			// TIOCSCTTY returns -EPERM if we already have a controlling terminal; treat
+			// that case as success to avoid rebooting when the console is already set.
+			ir.If(ir.IsNotEqual(ir.Var("ttyResult"), ir.Int64(-int64(linux.EPERM))), ir.Block{
+				ir.Printf("initx: failed to set controlling TTY (errno=0x%x)\n",
+					ir.Op(ir.OpSub, ir.Int64(0), ir.Var("ttyResult")),
+				),
+				ir.Syscall(defs.SYS_REBOOT,
+					linux.LINUX_REBOOT_MAGIC1,
+					linux.LINUX_REBOOT_MAGIC2,
+					linux.LINUX_REBOOT_CMD_RESTART,
+					ir.Int64(0),
+				),
+			}),
+		}),
 		// dup2 consoleFd to stdin (0), stdout (1) and stderr (2)
 		ir.Syscall(defs.SYS_DUP3, ir.Var("consoleFd"), ir.Int64(0), ir.Int64(0)),
 		ir.Syscall(defs.SYS_DUP3, ir.Var("consoleFd"), ir.Int64(1), ir.Int64(0)),
