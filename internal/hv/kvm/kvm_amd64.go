@@ -285,12 +285,20 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 }
 
 func (v *virtualCPU) handleIO(ioData *kvmExitIoData) error {
+	data := v.run[ioData.dataOffset : ioData.dataOffset+uint64(ioData.size)*uint64(ioData.count)]
+
+	v.trace(fmt.Sprintf("handleIO port=0x%04x size=%d count=%d direction=%d data=% x",
+		ioData.port, ioData.size, ioData.count, ioData.direction, data))
+
 	for _, dev := range v.vm.devices {
 		if kvmIoPortDevice, ok := dev.(hv.X86IOPortDevice); ok {
 			ports := kvmIoPortDevice.IOPorts()
 			for _, port := range ports {
 				if port == ioData.port {
 					data := v.run[ioData.dataOffset : ioData.dataOffset+uint64(ioData.size)*uint64(ioData.count)]
+
+					v.trace(fmt.Sprintf("  routed to device %T",
+						kvmIoPortDevice))
 
 					if ioData.direction == 0 {
 						if err := kvmIoPortDevice.ReadIOPort(ioData.port, data); err != nil {
@@ -312,6 +320,9 @@ func (v *virtualCPU) handleIO(ioData *kvmExitIoData) error {
 }
 
 func (v *virtualCPU) handleMMIO(mmioData *kvmExitMMIOData) error {
+	v.trace(fmt.Sprintf("handleMMIO physAddr=0x%016x size=%d isWrite=%d data=% x",
+		mmioData.physAddr, mmioData.len, mmioData.isWrite, mmioData.data))
+
 	for _, dev := range v.vm.devices {
 		if kvmMmioDevice, ok := dev.(hv.MemoryMappedIODevice); ok {
 			addr := mmioData.physAddr
@@ -320,6 +331,9 @@ func (v *virtualCPU) handleMMIO(mmioData *kvmExitMMIOData) error {
 			for _, region := range regions {
 				if addr >= region.Address && addr+uint64(size) <= region.Address+region.Size {
 					data := mmioData.data[:size]
+
+					v.trace(fmt.Sprintf("  routed to device %T region offset=0x%016x",
+						kvmMmioDevice, addr-region.Address))
 
 					if mmioData.isWrite == 0 {
 						if err := kvmMmioDevice.ReadMMIO(addr, data); err != nil {

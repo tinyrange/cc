@@ -53,6 +53,8 @@ type Kernel interface {
 	GetConfig() (map[string]Tristate, error)
 	GetDependMap() (map[string][]string, error)
 
+	GetSystemMap() (io.ReaderAt, error)
+
 	PlanModuleLoad(
 		configVars []string,
 		moduleMap map[string]string,
@@ -66,6 +68,16 @@ type alpineKernel struct {
 
 	dependsList  map[string][]string
 	modulePrefix string
+}
+
+// GetSystemMap implements Kernel.
+func (k *alpineKernel) GetSystemMap() (io.ReaderAt, error) {
+	f, err := k.findFileWithPrefix("boot/System.map")
+	if err != nil {
+		return nil, err
+	}
+
+	return k.pkg.Open(f)
 }
 
 func (k *alpineKernel) Open() (File, error) {

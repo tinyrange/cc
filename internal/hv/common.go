@@ -247,6 +247,13 @@ type VirtualCPU interface {
 	Run(ctx context.Context) error
 }
 
+type VirtualCPUDebug interface {
+	VirtualCPU
+
+	EnableTrace(maxEntries int) error
+	GetTraceBuffer() ([]string, error)
+}
+
 type VirtualCPUAmd64 interface {
 	VirtualCPU
 
