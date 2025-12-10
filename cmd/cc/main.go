@@ -325,6 +325,7 @@ func lookPath(fs *oci.ContainerFS, pathEnv string, workDir string, file string) 
 func buildContainerInit(img *oci.Image, cmd []string) *ir.Program {
 	errLabel := ir.Label("__cc_error")
 	errVar := ir.Var("__cc_errno")
+	pivotResult := ir.Var("__cc_pivot_result")
 
 	workDir := containerWorkDir(img)
 
@@ -393,14 +394,34 @@ func buildContainerInit(img *oci.Image, cmd []string) *ir.Program {
 
 		// pivot_root
 		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "oldroot", ir.Int64(0o755)),
-		ir.Assign(errVar, ir.Syscall(defs.SYS_PIVOT_ROOT, ".", "oldroot")),
-		ir.If(ir.IsNegative(errVar), ir.Block{
+		ir.Assign(pivotResult, ir.Syscall(defs.SYS_PIVOT_ROOT, ".", "oldroot")),
+		ir.Assign(errVar, pivotResult),
+		ir.If(ir.IsNegative(pivotResult), ir.Block{
 			// Fall back to chroot if pivot_root fails
 			ir.Assign(errVar, ir.Syscall(defs.SYS_CHROOT, ".")),
 			ir.If(ir.IsNegative(errVar), ir.Block{
 				ir.Printf("cc: failed to chroot: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
 				ir.Goto(errLabel),
 			}),
+		}),
+		ir.If(ir.IsGreaterOrEqual(pivotResult, ir.Int64(0)), ir.Block{
+			ir.Assign(errVar, ir.Syscall(defs.SYS_CHDIR, "/")),
+			ir.If(ir.IsNegative(errVar), ir.Block{
+				ir.Printf("cc: failed to chdir to new root: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+				ir.Goto(errLabel),
+			}),
+			ir.Assign(errVar, ir.Syscall(defs.SYS_UMOUNT2, "/oldroot", ir.Int64(linux.MNT_DETACH))),
+			ir.If(ir.IsNegative(errVar), ir.Block{
+				ir.Printf("cc: failed to unmount oldroot: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+				ir.Goto(errLabel),
+			}),
+		}),
+
+		// Always cleanup oldroot
+		ir.Assign(errVar, ir.Syscall(defs.SYS_UNLINKAT, ir.Int64(linux.AT_FDCWD), "/oldroot", ir.Int64(linux.AT_REMOVEDIR))),
+		ir.If(ir.IsNegative(errVar), ir.Block{
+			ir.Printf("cc: failed to remove oldroot: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+			ir.Goto(errLabel),
 		}),
 
 		// Change to working directory
