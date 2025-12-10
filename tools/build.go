@@ -200,8 +200,8 @@ func loadRemoteTarget(alias string) (remoteTarget, error) {
 		return remoteTarget{}, fmt.Errorf("remote alias %q not found in %s", alias, remotesPath)
 	}
 
-	if target.Address == "" || target.GOOS == "" || target.GOARCH == "" {
-		return remoteTarget{}, fmt.Errorf("remote alias %q missing required fields (address/os/arch)", alias)
+	if target.Address == "" || target.GOOS == "" || target.GOARCH == "" || target.TargetDir == "" {
+		return remoteTarget{}, fmt.Errorf("remote alias %q missing required fields (address/os/arch/targetDir)", alias)
 	}
 
 	return target, nil
