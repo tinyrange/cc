@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"log/slog"
 	"runtime"
 	"sync"
 	"unsafe"
@@ -375,6 +376,12 @@ func (v *virtualMachine) Arm64GICInfo() (hv.Arm64GICInfo, bool) {
 	return v.arm64GICInfo, true
 }
 
+// ARM64 KVM IRQ type encoding (bits 31-24 of irq field)
+const (
+	armIRQTypeShift = 24 // Shift for IRQ type in encoded irqLine
+	armIRQTypeSPI   = 1  // Shared Peripheral Interrupt
+)
+
 func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 	if !v.gicConfigured {
 		return fmt.Errorf("hvf: interrupt controller not configured")
@@ -384,11 +391,52 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 		return fmt.Errorf("hvf: hv_gic_set_spi unavailable")
 	}
 
-	if irqLine < v.gicSPIBase || irqLine >= v.gicSPIBase+v.gicSPICount {
-		return fmt.Errorf("hvf: SPI %d out of range (%d-%d)", irqLine, v.gicSPIBase, v.gicSPIBase+v.gicSPICount-1)
+	// Decode the KVM-style IRQ encoding used by EncodeIRQLineForArch.
+	// Bits 31-24 contain the IRQ type, bits 15-0 contain the SPI number.
+	irqType := (irqLine >> armIRQTypeShift) & 0xff
+	if irqType != 0 {
+		if irqType != armIRQTypeSPI {
+			return fmt.Errorf("hvf: unsupported IRQ type %d in irqLine %#x", irqType, irqLine)
+		}
+		// Extract the SPI number from low 16 bits.
+		irqLine = irqLine & 0xffff
 	}
 
-	return hvGicSetSpi(irqLine, level).toError("hv_gic_set_spi")
+	// hv_gic_get_spi_interrupt_range returns base=32 (first SPI INTID) and count=988 (number of SPIs).
+	// hv_gic_set_spi expects the INTID number (not zero-based).
+	// Our irqLine is the SPI offset (e.g., 40 for virtio console), so add gicSPIBase.
+	spiNum := irqLine
+	if v.gicSPIBase != 0 {
+		spiNum += v.gicSPIBase
+	}
+
+	// Range check: SPI numbers should be 0 to (spiCount-1)
+	if spiNum >= v.gicSPIBase+v.gicSPICount {
+		return fmt.Errorf("hvf: SPI %d out of range (base=%d count=%d)", spiNum, v.gicSPIBase, v.gicSPICount)
+	}
+
+	if level {
+		slog.Info("hvf: SetIRQ", "spi", spiNum, "level", level, "spiBase", v.gicSPIBase, "spiCount", v.gicSPICount)
+	}
+
+	ret := hvGicSetSpi(spiNum, level)
+	if ret != 0 {
+		slog.Error("hvf: hv_gic_set_spi failed", "spi", spiNum, "level", level, "ret", ret)
+		return ret.toError("hv_gic_set_spi")
+	}
+
+	// When asserting an interrupt, mark all vCPUs as having a pending IRQ
+	// and kick them so they can inject it.
+	if level {
+		for _, vcpu := range v.vcpus {
+			vcpu.pendingIRQ = true
+			hostID := vcpu.hostID
+			// Kick the vCPU so it exits hvVcpuRun and can inject the interrupt
+			_ = hvVcpusExit(&hostID, 1)
+		}
+	}
+
+	return nil
 }
 
 func (v *virtualMachine) Close() error {
@@ -461,6 +509,11 @@ type virtualCPU struct {
 	initErr  chan error
 
 	pendingPC *uint64
+
+	// pendingIRQ is set when an IRQ needs to be injected into the vCPU.
+	// Access should be synchronized, but since we only set from SetIRQ
+	// and check from the vCPU thread, a simple bool is sufficient.
+	pendingIRQ bool
 }
 
 func (v *virtualCPU) start() {
@@ -579,6 +632,21 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	}
 
 	for {
+		// Inject pending interrupts before running the vCPU.
+		// This must be done from the vCPU thread.
+		if v.pendingIRQ {
+			v.pendingIRQ = false
+			if hvVcpuSetPendingInterrupt != nil {
+				ret := hvVcpuSetPendingInterrupt(v.hostID, hvInterruptTypeIRQ, true)
+				// slog.Info("hvf: injecting IRQ into vCPU", "vcpu", v.index, "ret", ret)
+				if err := ret.toError("hv_vcpu_set_pending_interrupt"); err != nil {
+					slog.Error("hvf: failed to set pending IRQ", "err", err)
+				}
+			} else {
+				slog.Warn("hvf: hvVcpuSetPendingInterrupt not available")
+			}
+		}
+
 		if err := hvVcpuRun(v.hostID).toError("hv_vcpu_run"); err != nil {
 			return err
 		}
@@ -588,9 +656,14 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			return context.Canceled
+			// If context isn't canceled, this might be a kick from SetIRQ.
+			// Continue running to process the interrupt.
+			continue
 		case hvExitReasonException:
-			return v.handleException()
+			if err := v.handleException(); err != nil {
+				return err
+			}
+			// Continue running after successfully handling the exception
 		case hvExitReasonVTimerActivated, hvExitReasonVTimerDeactivated:
 			// Spurious timer exits; continue running.
 			continue
@@ -600,22 +673,22 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	}
 }
 
-func (v *virtualCPU) handleException() error {
-	const (
-		exceptionClassMask             = 0x3F
-		exceptionClassShift            = 26
-		exceptionClassHvc              = 0x16
-		exceptionClassSmc              = 0x17
-		exceptionClassMsrAccess        = 0x18
-		exceptionClassDataAbortLowerEL = 0x24
-	)
+const (
+	exceptionClassMask             = 0x3F
+	exceptionClassShift            = 26
+	exceptionClassHvc              = 0x16
+	exceptionClassSmc              = 0x17
+	exceptionClassMsrAccess        = 0x18
+	exceptionClassDataAbortLowerEL = 0x24
+)
 
+func (v *virtualCPU) handleException() error {
 	syndrome := v.exit.Exception.Syndrome
 	ec := (syndrome >> exceptionClassShift) & exceptionClassMask
 
 	switch ec {
 	case exceptionClassHvc, exceptionClassSmc:
-		return v.handleHypercall()
+		return v.handleHypercall(ec)
 	case exceptionClassMsrAccess:
 		return v.handleMsrAccess(syndrome)
 	case exceptionClassDataAbortLowerEL:
@@ -729,31 +802,84 @@ func (v *virtualCPU) handleMsrAccess(syndrome uint64) error {
 	return v.advanceProgramCounter()
 }
 
+// PSCI function IDs (SMC32 calling convention)
 const (
-	psciVersion   = 0x84000000
-	psciSystemOff = 0x84000008
+	psciVersion         = 0x84000000
+	psciCpuSuspend      = 0x84000001
+	psciCpuOff          = 0x84000002
+	psciCpuOn           = 0x84000003
+	psciAffinityInfo    = 0x84000004
+	psciMigrateInfoType = 0x84000006
+	psciSystemOff       = 0x84000008
+	psciSystemReset     = 0x84000009
+	psciFeatures        = 0x8400000A
+
+	// PSCI return values
+	psciSuccess           = 0
+	psciNotSupported      = 0xFFFFFFFF // -1 as uint32
+	psciInvalidParameters = 0xFFFFFFFE // -2 as uint32
+	psciDenied            = 0xFFFFFFFD // -3 as uint32
+	psciAlreadyOn         = 0xFFFFFFFC // -4 as uint32
+	psciOnPending         = 0xFFFFFFFB // -5 as uint32
+	psciInternalFailure   = 0xFFFFFFFA // -6 as uint32
+	psciNotPresent        = 0xFFFFFFF9 // -7 as uint32
+	psciDisabled          = 0xFFFFFFF8 // -8 as uint32
+	psciInvalidAddress    = 0xFFFFFFF7 // -9 as uint32
+	psciTosNotPresent     = 2          // For MIGRATE_INFO_TYPE: no trusted OS
 )
 
-func (v *virtualCPU) handleHypercall() error {
+func (v *virtualCPU) handleHypercall(ec uint64) error {
 	val, err := v.readRegister(hv.RegisterARM64X0)
 	if err != nil {
 		return err
 	}
 
-	if err := v.advanceProgramCounter(); err != nil {
-		return err
+	// HVC (EC 0x16) automatically advances PC in Apple's Hypervisor Framework.
+	// SMC (EC 0x17) does NOT automatically advance PC, so we must do it manually.
+	if ec == exceptionClassSmc {
+		if err := v.advanceProgramCounter(); err != nil {
+			return err
+		}
 	}
 
 	switch val {
 	case psciVersion:
-		// Reply PSCI version 1.0 (most common + acceptable default)
+		// Reply PSCI version 1.0
 		return v.writeRegister(hv.RegisterARM64X0, 0x00010000)
+
+	case psciCpuOff:
+		// Single CPU VM - CPU_OFF halts the VM
+		return hv.ErrVMHalted
+
+	case psciCpuOn:
+		// Single CPU VM - CPU_ON not supported
+		return v.writeRegister(hv.RegisterARM64X0, psciAlreadyOn)
+
+	case psciAffinityInfo:
+		// For single CPU VM, CPU 0 is always ON (return 0)
+		return v.writeRegister(hv.RegisterARM64X0, 0)
+
+	case psciMigrateInfoType:
+		// Return "Trusted OS not present" - no migration support needed
+		return v.writeRegister(hv.RegisterARM64X0, psciTosNotPresent)
 
 	case psciSystemOff:
 		return hv.ErrVMHalted
 
+	case psciSystemReset:
+		return hv.ErrGuestRequestedReboot
+
+	case psciFeatures:
+		// Return NOT_SUPPORTED for feature queries we don't implement
+		return v.writeRegister(hv.RegisterARM64X0, psciNotSupported)
+
+	case psciCpuSuspend:
+		// For simplicity, treat suspend as a no-op (return success)
+		return v.writeRegister(hv.RegisterARM64X0, psciSuccess)
+
 	default:
-		return fmt.Errorf("hvf: unhandled hypercall 0x%x", val)
+		// Unknown PSCI function - return NOT_SUPPORTED
+		return v.writeRegister(hv.RegisterARM64X0, psciNotSupported)
 	}
 }
 
@@ -867,6 +993,11 @@ func (v *virtualCPU) findMMIODevice(addr, size uint64) (hv.MemoryMappedIODevice,
 }
 
 func (v *virtualCPU) readRegister(reg hv.Register) (uint64, error) {
+	// XZR (zero register) always reads as 0
+	if reg == hv.RegisterARM64Xzr {
+		return 0, nil
+	}
+
 	if sys, ok := hvSysRegFromRegister(reg); ok {
 		var val uint64
 		if err := hvVcpuGetSys(v.hostID, sys, &val).toError("hv_vcpu_get_sys_reg"); err != nil {
@@ -888,6 +1019,11 @@ func (v *virtualCPU) readRegister(reg hv.Register) (uint64, error) {
 }
 
 func (v *virtualCPU) writeRegister(reg hv.Register, value uint64) error {
+	// XZR (zero register) writes are discarded
+	if reg == hv.RegisterARM64Xzr {
+		return nil
+	}
+
 	if sys, ok := hvSysRegFromRegister(reg); ok {
 		return hvVcpuSetSys(v.hostID, sys, value).toError("hv_vcpu_set_sys_reg")
 	}

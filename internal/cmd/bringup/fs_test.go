@@ -29,6 +29,8 @@ func testFS(t *testing.T, basePath string) {
 		t.Fatalf("basePath %q is not a directory", basePath)
 	}
 
+	t.Logf("Starting Filesystem Compliance Suite on: %s", basePath)
+
 	// Workspace Isolation
 	workspace := filepath.Join(basePath, fmt.Sprintf("fs_test_%d", time.Now().UnixNano()))
 	if err := os.MkdirAll(workspace, 0755); err != nil {

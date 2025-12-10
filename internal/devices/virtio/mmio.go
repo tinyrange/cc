@@ -91,6 +91,7 @@ type mmioDevice struct {
 	base    uint64
 	size    uint64
 	irqLine uint32
+	irqHigh bool
 
 	deviceID uint32
 	vendorID uint32

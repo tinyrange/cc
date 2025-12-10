@@ -92,7 +92,7 @@ func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 		for range p.MaxLoopIterations {
 			if err := vcpu.Run(ctx); err != nil {
 				if isSuccessfulVMExit(err) {
-					return nil
+					return err
 				}
 				return fmt.Errorf("run vCPU: %w", err)
 			}
@@ -121,7 +121,7 @@ func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 		for range p.MaxLoopIterations {
 			if err := vcpu.Run(ctx); err != nil {
 				if isSuccessfulVMExit(err) {
-					return nil
+					return err
 				}
 				return fmt.Errorf("run vCPU: %w", err)
 			}
@@ -143,7 +143,7 @@ func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 		for range p.MaxLoopIterations {
 			if err := vcpu.Run(ctx); err != nil {
 				if isSuccessfulVMExit(err) {
-					return nil
+					return err
 				}
 				return fmt.Errorf("run vCPU: %w", err)
 			}

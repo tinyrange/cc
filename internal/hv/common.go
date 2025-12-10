@@ -93,6 +93,7 @@ const (
 	RegisterARM64X28
 	RegisterARM64X29
 	RegisterARM64X30
+	RegisterARM64Xzr // Zero register (reads as 0, writes are discarded)
 	RegisterARM64Sp
 	RegisterARM64Pc
 	RegisterARM64Pstate

@@ -27,7 +27,8 @@ func arm64RegisterFromIndex(idx int) (hv.Register, bool) {
 	case idx >= 0 && idx <= 30:
 		return hv.Register(int(hv.RegisterARM64X0) + idx), true
 	case idx == 31:
-		return hv.RegisterARM64Sp, true
+		// In data abort syndrome, register 31 is XZR (zero register), not SP
+		return hv.RegisterARM64Xzr, true
 	default:
 		return hv.RegisterInvalid, false
 	}
