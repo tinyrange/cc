@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/tinyrange/cc/internal/fdt"
 	"github.com/tinyrange/cc/internal/hv"
@@ -92,10 +93,11 @@ func (t ConsoleTemplate) DeviceTreeNodes() ([]fdt.Node, error) {
 
 // GetACPIDeviceInfo implements VirtioMMIODevice.
 func (t ConsoleTemplate) GetACPIDeviceInfo() ACPIDeviceInfo {
+	irqLine := t.irqLineForArch(t.archOrDefault(nil))
 	return ACPIDeviceInfo{
 		BaseAddr: ConsoleDefaultMMIOBase,
 		Size:     ConsoleDefaultMMIOSize,
-		GSI:      t.IRQLine,
+		GSI:      irqLine,
 	}
 }
 
@@ -122,16 +124,18 @@ var (
 )
 
 type Console struct {
-	device  device
-	base    uint64
-	size    uint64
-	irqLine uint32
-	out     io.Writer
-	in      io.Reader
-	mu      sync.Mutex
-	pending []byte
-	arch    hv.CpuArchitecture
-	config  consoleConfig
+	device    device
+	base      uint64
+	size      uint64
+	irqLine   uint32
+	out       io.Writer
+	in        io.Reader
+	mu        sync.Mutex
+	pending   []byte
+	arch      hv.CpuArchitecture
+	config    consoleConfig
+	inputStop chan struct{}
+	inputWG   sync.WaitGroup
 }
 
 type consoleConfig struct {
@@ -162,14 +166,13 @@ type consoleSnapshot struct {
 
 // Init implements hv.MemoryMappedIODevice.
 func (vc *Console) Init(vm hv.VirtualMachine) error {
+	vc.stopInputReader()
 	if vc.device == nil {
 		if vm == nil {
 			return fmt.Errorf("virtio-console: virtual machine is nil")
 		}
 		vc.setupDevice(vm)
-		if vc.in != nil {
-			go vc.readInput()
-		}
+		vc.startInputReader()
 		return nil
 	}
 	if mmio, ok := vc.device.(*mmioDevice); ok && vm != nil {
@@ -240,9 +243,7 @@ func NewConsole(vm hv.VirtualMachine, base uint64, size uint64, irqLine uint32, 
 		console.arch = vm.Hypervisor().Architecture()
 	}
 	console.setupDevice(vm)
-	if in != nil {
-		go console.readInput()
-	}
+	console.startInputReader()
 	return console
 }
 
@@ -473,19 +474,68 @@ func (vc *Console) enqueueInput(data []byte) {
 }
 
 func (vc *Console) readInput() {
+	defer vc.inputWG.Done()
+
 	buf := make([]byte, 4096)
 	for {
+		select {
+		case <-vc.inputStop:
+			return
+		default:
+		}
+
+		// Set read deadline before blocking read
+		if closer, ok := vc.in.(interface{ SetReadDeadline(time.Time) error }); ok {
+			_ = closer.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		}
+
 		n, err := vc.in.Read(buf)
 		if n > 0 {
 			chunk := append([]byte(nil), buf[:n]...)
 			vc.enqueueInput(chunk)
 		}
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			select {
+			case <-vc.inputStop:
+				return
+			default:
 				slog.Warn("virtio-console: input read error", "err", err)
 			}
 			return
 		}
+	}
+}
+
+func (vc *Console) startInputReader() {
+	if vc.in == nil || vc.inputStop != nil {
+		return
+	}
+	vc.inputStop = make(chan struct{})
+	vc.inputWG.Add(1)
+	go vc.readInput()
+}
+
+func (vc *Console) stopInputReader() {
+	if vc.inputStop == nil {
+		return
+	}
+	close(vc.inputStop)
+	if closer, ok := vc.in.(io.Closer); ok {
+		_ = closer.Close()
+	}
+	done := make(chan struct{})
+	go func() {
+		vc.inputWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		vc.inputStop = nil
+	case <-time.After(time.Second):
+		slog.Warn("virtio-console: timed out stopping input reader")
 	}
 }
 
