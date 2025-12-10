@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path"
 	"runtime"
 	"runtime/pprof"
+	"strings"
 	"time"
 
 	"github.com/tinyrange/cc/internal/devices/virtio"
@@ -128,7 +130,8 @@ func run() error {
 		return fmt.Errorf("no command specified and image has no entrypoint/cmd")
 	}
 
-	slog.Debug("Running command", "cmd", execCmd)
+	pathEnv := extractInitialPath(img.Config.Env)
+	workDir := containerWorkDir(img)
 
 	// Create container filesystem
 	containerFS, err := oci.NewContainerFS(img)
@@ -136,6 +139,13 @@ func run() error {
 		return fmt.Errorf("create container filesystem: %w", err)
 	}
 	defer containerFS.Close()
+
+	execCmd, err = resolveCommandPath(containerFS, execCmd, pathEnv, workDir)
+	if err != nil {
+		return fmt.Errorf("resolve command: %w", err)
+	}
+
+	slog.Debug("Running command", "cmd", execCmd)
 
 	// Create VirtioFS backend with container filesystem as root
 	fsBackend := vfs.NewVirtioFsBackendWithAbstract()
@@ -235,14 +245,88 @@ func parseArchitecture(arch string) (hv.CpuArchitecture, error) {
 	}
 }
 
+const defaultPathEnv = "/bin:/usr/bin"
+
+func extractInitialPath(env []string) string {
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "PATH=") {
+			return strings.TrimPrefix(entry, "PATH=")
+		}
+	}
+	return defaultPathEnv
+}
+
+func containerWorkDir(img *oci.Image) string {
+	if img.Config.WorkingDir == "" {
+		return "/"
+	}
+	return img.Config.WorkingDir
+}
+
+func resolveCommandPath(fs *oci.ContainerFS, cmd []string, pathEnv string, workDir string) ([]string, error) {
+	if len(cmd) == 0 {
+		return nil, fmt.Errorf("empty command")
+	}
+
+	resolved := make([]string, len(cmd))
+	copy(resolved, cmd)
+
+	if strings.Contains(resolved[0], "/") {
+		return resolved, nil
+	}
+
+	resolvedPath, err := lookPath(fs, pathEnv, workDir, resolved[0])
+	if err != nil {
+		return nil, err
+	}
+	resolved[0] = resolvedPath
+	return resolved, nil
+}
+
+func lookPath(fs *oci.ContainerFS, pathEnv string, workDir string, file string) (string, error) {
+	if file == "" {
+		return "", fmt.Errorf("executable name is empty")
+	}
+	if pathEnv == "" {
+		pathEnv = defaultPathEnv
+	}
+	if workDir == "" {
+		workDir = "/"
+	}
+
+	for _, dir := range strings.Split(pathEnv, ":") {
+		switch {
+		case dir == "":
+			dir = workDir
+		case !path.IsAbs(dir):
+			dir = path.Join(workDir, dir)
+		}
+
+		candidate := path.Join(dir, file)
+		entry, err := fs.Lookup(candidate)
+		if err != nil {
+			continue
+		}
+
+		if entry.File == nil {
+			continue
+		}
+		_, mode := entry.File.Stat()
+		if mode.IsDir() || mode&0o111 == 0 {
+			continue
+		}
+
+		return candidate, nil
+	}
+
+	return "", fmt.Errorf("executable %q not found in PATH", file)
+}
+
 func buildContainerInit(img *oci.Image, cmd []string) *ir.Program {
 	errLabel := ir.Label("__cc_error")
 	errVar := ir.Var("__cc_errno")
 
-	workDir := img.Config.WorkingDir
-	if workDir == "" {
-		workDir = "/"
-	}
+	workDir := containerWorkDir(img)
 
 	main := ir.Method{
 		// Create mount points
