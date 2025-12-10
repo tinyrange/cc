@@ -2,14 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"os"
 	"runtime"
 	"runtime/pprof"
-
-	"golang.org/x/term"
+	"time"
 
 	"github.com/tinyrange/cc/internal/devices/virtio"
 	"github.com/tinyrange/cc/internal/hv"
@@ -21,10 +21,15 @@ import (
 	"github.com/tinyrange/cc/internal/linux/kernel"
 	"github.com/tinyrange/cc/internal/oci"
 	"github.com/tinyrange/cc/internal/vfs"
+	"golang.org/x/term"
 )
 
 func main() {
 	if err := run(); err != nil {
+		var exitErr *initx.ExitError
+		if errors.As(err, &exitErr) {
+			os.Exit(exitErr.Code)
+		}
 		fmt.Fprintf(os.Stderr, "cc: %v\n", err)
 		os.Exit(1)
 	}
@@ -175,7 +180,31 @@ func run() error {
 	ctx := context.Background()
 	prog := buildContainerInit(img, execCmd)
 
+	slog.Debug("Booting VM")
+
+	// Boot the VM first to set up devices
+	if err := func() error {
+		ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+
+		if err := vm.Run(ctx, &ir.Program{
+			Entrypoint: "main",
+			Methods: map[string]ir.Method{
+				"main": {
+					ir.Return(ir.Int64(0)),
+				},
+			},
+		}); err != nil {
+			return fmt.Errorf("boot VM: %w", err)
+		}
+
+		return nil
+	}(); err != nil {
+		return err
+	}
+
 	// Put stdin into raw mode so we don't send cooked/echoed characters into the guest.
+	// Do this after booting so that any Ctrl+C during boot still works to kill cc itself.
 	if term.IsTerminal(int(os.Stdin.Fd())) {
 		oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 		if err != nil {
@@ -184,9 +213,11 @@ func run() error {
 		defer term.Restore(int(os.Stdin.Fd()), oldState)
 	}
 
-	slog.Debug("Starting VM")
-
 	if err := vm.Run(ctx, prog); err != nil {
+		var exitErr *initx.ExitError
+		if errors.As(err, &exitErr) {
+			return exitErr
+		}
 		return fmt.Errorf("run VM: %w", err)
 	}
 
@@ -296,8 +327,8 @@ func buildContainerInit(img *oci.Image, cmd []string) *ir.Program {
 		// as it puts path at argv[0] itself
 		initx.ForkExecWait(cmd[0], cmd[1:], img.Config.Env, errLabel, errVar),
 
-		// Return success
-		ir.Return(ir.Int64(0)),
+		// Return child exit code to host
+		ir.Return(errVar),
 
 		// Error handler
 		ir.DeclareLabel(errLabel, ir.Block{

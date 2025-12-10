@@ -105,6 +105,9 @@ type programLoader struct {
 	dataRegionOffset int64
 
 	dataRegion []byte
+
+	runResultDetail uint32
+	runResultStage  uint32
 }
 
 func (p *programLoader) ReserveDataRegion(size int) {
@@ -149,12 +152,16 @@ func (p *programLoader) ReadMMIO(addr uint64, data []byte) error {
 func (p *programLoader) WriteMMIO(addr uint64, data []byte) error {
 	addr = addr - mailboxPhysAddr
 
-	// ignore stage information writes
-	if addr == 8 || addr == 12 || addr == 16 || addr == 20 {
+	switch addr {
+	case mailboxRunResultDetailOffset:
+		p.runResultDetail = binary.LittleEndian.Uint32(data)
 		return nil
-	}
-
-	if addr == 0x0 {
+	case mailboxRunResultStageOffset:
+		p.runResultStage = binary.LittleEndian.Uint32(data)
+		return nil
+	case mailboxStartResultDetailOffset, mailboxStartResultStageOffset:
+		return nil
+	case 0x0:
 		value := binary.LittleEndian.Uint32(data)
 		switch value {
 		case 0x444f4e45:
@@ -162,6 +169,8 @@ func (p *programLoader) WriteMMIO(addr uint64, data []byte) error {
 		case userYieldValue:
 			return hv.ErrUserYield
 		}
+	default:
+		// no-op
 	}
 
 	return fmt.Errorf("unimplemented write at address 0x%x", addr)
@@ -172,6 +181,8 @@ func (p *programLoader) LoadProgram(prog *ir.Program) error {
 	if err != nil {
 		return fmt.Errorf("build standalone program: %w", err)
 	}
+	p.runResultDetail = 0
+	p.runResultStage = 0
 
 	if len(p.dataRegion) < configRegionSize {
 		p.dataRegion = make([]byte, configRegionSize)
@@ -275,6 +286,9 @@ func (p *programRunner) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 				return nil
 			}
 			if errors.Is(err, hv.ErrYield) {
+				if code := p.loader.runResultDetail; code != 0 {
+					return &ExitError{Code: int(code)}
+				}
 				return nil
 			}
 			if errors.Is(err, hv.ErrUserYield) {
@@ -792,7 +806,7 @@ func (vm *VirtualMachine) Spawn(ctx context.Context, path string, args ...string
 		Methods: map[string]ir.Method{
 			"main": {
 				ForkExecWait(path, args, nil, errLabel, errVar),
-				ir.Return(ir.Int64(0)),
+				ir.Return(errVar),
 				ir.DeclareLabel(errLabel, ir.Block{
 					ir.Printf(errorFmt, ir.Op(ir.OpSub, ir.Int64(0), errVar)),
 					ir.Syscall(defs.SYS_EXIT, ir.Int64(1)),

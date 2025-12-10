@@ -358,9 +358,15 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 				logKmsg("initx: jumping to payload\n"),
 
 				// call anonMem
-				ir.Call(ir.Var("anonMem")),
+				ir.Call(ir.Var("anonMem"), ir.Var("payloadResult")),
 
 				logKmsg("initx: payload returned, yielding to host\n"),
+
+				// publish return code for host-side exit propagation
+				ir.Assign(
+					ir.Var("mailboxMem").MemWithDisp(mailboxRunResultDetailOffset).As32(),
+					ir.Var("payloadResult").As32(),
+				),
 
 				// signal completion to the host without clobbering run results
 				ir.Assign(ir.Var("tmp32"), ir.Int64(0x444f4e45)),
