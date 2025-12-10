@@ -1209,32 +1209,6 @@ func (q *bringUpQuest) RunLinux() error {
 	}
 
 	buf := &bytes.Buffer{}
-	var cmdline []string
-	switch q.dev.Architecture() {
-	case hv.ArchitectureARM64:
-		cmdline = []string{
-			"console=ttyS0,115200n8",
-			fmt.Sprintf("earlycon=uart8250,mmio,0x%x", arm64UARTMMIOBase),
-		}
-	case hv.ArchitectureX86_64:
-		cmdline = []string{
-			"console=hvc0",
-			"quiet",
-			// "console=ttyS0,115200n8",
-			// "earlycon=uart8250,io,0x3f8",
-			"reboot=k",
-			"panic=-1",
-			"tsc=reliable",
-			"tsc_early_khz=3000000",
-		}
-	case hv.ArchitectureRISCV64:
-		cmdline = []string{
-			"console=hvc0",
-			"panic=-1",
-		}
-	default:
-		return fmt.Errorf("unsupported architecture for linux boot: %s", q.dev.Architecture())
-	}
 
 	devices := []hv.DeviceTemplate{
 		virtio.ConsoleTemplate{Out: io.MultiWriter(os.Stdout, buf), In: os.Stdin, Arch: dev.Architecture()},
@@ -1246,7 +1220,31 @@ func (q *bringUpQuest) RunLinux() error {
 		MemBase: linuxMemoryBaseForArch(q.dev.Architecture()),
 
 		GetCmdline: func(arch hv.CpuArchitecture) ([]string, error) {
-			return cmdline, nil
+			switch q.dev.Architecture() {
+			case hv.ArchitectureARM64:
+				return []string{
+					"console=ttyS0,115200n8",
+					fmt.Sprintf("earlycon=uart8250,mmio,0x%x", arm64UARTMMIOBase),
+				}, nil
+			case hv.ArchitectureX86_64:
+				return []string{
+					"console=hvc0",
+					"quiet",
+					// "console=ttyS0,115200n8",
+					// "earlycon=uart8250,io,0x3f8",
+					"reboot=k",
+					"panic=-1",
+					"tsc=reliable",
+					"tsc_early_khz=3000000",
+				}, nil
+			case hv.ArchitectureRISCV64:
+				return []string{
+					"console=hvc0",
+					"panic=-1",
+				}, nil
+			default:
+				return nil, fmt.Errorf("unsupported architecture for linux boot: %s", q.dev.Architecture())
+			}
 		},
 
 		GetKernel: func() (io.ReaderAt, int64, error) {
@@ -1277,62 +1275,21 @@ func (q *bringUpQuest) RunLinux() error {
 		},
 
 		GetInit: func(arch hv.CpuArchitecture) (*ir.Program, error) {
-			switch arch {
-			case hv.ArchitectureX86_64:
-				return &ir.Program{
-					Entrypoint: "main",
-					Methods: map[string]ir.Method{
-						"main": {
-							ir.Printf("Hello, World\n"),
-							ir.Syscall(
-								defs.SYS_EXIT,
-								0,
-							),
-							// ir.Syscall(
-							// 	amd64defs.SYS_REBOOT,
-							// 	ir.Int64(amd64defs.LINUX_REBOOT_MAGIC1),
-							// 	ir.Int64(amd64defs.LINUX_REBOOT_MAGIC2),
-							// 	ir.Int64(amd64defs.LINUX_REBOOT_CMD_POWER_OFF),
-							// 	ir.Int64(0),
-							// ),
-						},
+			return &ir.Program{
+				Entrypoint: "main",
+				Methods: map[string]ir.Method{
+					"main": {
+						ir.Printf("Hello, World\n"),
+						ir.Syscall(
+							defs.SYS_REBOOT,
+							ir.Int64(amd64defs.LINUX_REBOOT_MAGIC1),
+							ir.Int64(amd64defs.LINUX_REBOOT_MAGIC2),
+							ir.Int64(amd64defs.LINUX_REBOOT_CMD_RESTART),
+							ir.Int64(0),
+						),
 					},
-				}, nil
-			case hv.ArchitectureARM64:
-				return &ir.Program{
-					Entrypoint: "main",
-					Methods: map[string]ir.Method{
-						"main": {
-							ir.Printf("Hello, World\n"),
-							ir.Syscall(
-								defs.SYS_REBOOT,
-								ir.Int64(amd64defs.LINUX_REBOOT_MAGIC1),
-								ir.Int64(amd64defs.LINUX_REBOOT_MAGIC2),
-								ir.Int64(amd64defs.LINUX_REBOOT_CMD_RESTART),
-								ir.Int64(0),
-							),
-						},
-					},
-				}, nil
-			case hv.ArchitectureRISCV64:
-				return &ir.Program{
-					Entrypoint: "main",
-					Methods: map[string]ir.Method{
-						"main": {
-							ir.Printf("Hello, World\n"),
-							ir.Syscall(
-								defs.SYS_REBOOT,
-								ir.Int64(amd64defs.LINUX_REBOOT_MAGIC1),
-								ir.Int64(amd64defs.LINUX_REBOOT_MAGIC2),
-								ir.Int64(amd64defs.LINUX_REBOOT_CMD_RESTART),
-								ir.Int64(0),
-							),
-						},
-					},
-				}, nil
-			default:
-				return nil, fmt.Errorf("unsupported architecture for init program: %s", arch)
-			}
+				},
+			}, nil
 		},
 
 		SerialStdout: os.Stdout,
@@ -1360,7 +1317,10 @@ func (q *bringUpQuest) RunLinux() error {
 	}
 
 	if err := runWithTiming("Run Linux VM", func() error {
-		return vm.Run(context.Background(), run)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		return vm.Run(ctx, run)
 	}); err != nil {
 		return fmt.Errorf("run linux boot: %w", err)
 	}
