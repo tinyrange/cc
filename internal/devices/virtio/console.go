@@ -484,6 +484,11 @@ func (vc *Console) readInput() {
 		default:
 		}
 
+		// Set read deadline before blocking read
+		if closer, ok := vc.in.(interface{ SetReadDeadline(time.Time) error }); ok {
+			_ = closer.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		}
+
 		n, err := vc.in.Read(buf)
 		if n > 0 {
 			chunk := append([]byte(nil), buf[:n]...)
