@@ -115,6 +115,11 @@ func (v *virtualMachine) Hypervisor() hv.Hypervisor { return v.hv }
 
 // AllocateMemory implements hv.VirtualMachine.
 func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.MemoryRegion, error) {
+	maxInt := uint64(^uint(0) >> 1)
+	if size > maxInt {
+		return nil, fmt.Errorf("allocate memory: size %d exceeds host address limit", size)
+	}
+
 	mem, err := unix.Mmap(
 		-1,
 		0,

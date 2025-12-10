@@ -59,6 +59,19 @@ func isSuccessfulVMExit(err error) bool {
 		errors.Is(err, hv.ErrYield)
 }
 
+func (p *ProgramLoader) runLoop(ctx context.Context, vcpu hv.VirtualCPU) error {
+	for i := uint64(0); p.MaxLoopIterations == 0 || i < p.MaxLoopIterations; i++ {
+		if err := vcpu.Run(ctx); err != nil {
+			if isSuccessfulVMExit(err) {
+				return err
+			}
+			return fmt.Errorf("run vCPU: %w", err)
+		}
+	}
+
+	return fmt.Errorf("maximum loop iterations (%d) exceeded", p.MaxLoopIterations)
+}
+
 // Run implements hv.RunConfig.
 func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 	arch := vcpu.VirtualMachine().Hypervisor().Architecture()
@@ -89,16 +102,7 @@ func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 			return fmt.Errorf("set initial registers: %w", err)
 		}
 
-		for range p.MaxLoopIterations {
-			if err := vcpu.Run(ctx); err != nil {
-				if isSuccessfulVMExit(err) {
-					return err
-				}
-				return fmt.Errorf("run vCPU: %w", err)
-			}
-		}
-
-		return fmt.Errorf("maximum loop iterations (%d) exceeded", p.MaxLoopIterations)
+		return p.runLoop(ctx, vcpu)
 	case hv.ArchitectureARM64:
 		if p.Mode != Mode64BitIdentityMapping {
 			return fmt.Errorf("unsupported load mode %v for architecture %v", p.Mode, arch)
@@ -118,16 +122,7 @@ func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 			return fmt.Errorf("set initial registers: %w", err)
 		}
 
-		for range p.MaxLoopIterations {
-			if err := vcpu.Run(ctx); err != nil {
-				if isSuccessfulVMExit(err) {
-					return err
-				}
-				return fmt.Errorf("run vCPU: %w", err)
-			}
-		}
-
-		return fmt.Errorf("maximum loop iterations (%d) exceeded", p.MaxLoopIterations)
+		return p.runLoop(ctx, vcpu)
 	case hv.ArchitectureRISCV64:
 		if p.Mode != Mode64BitIdentityMapping {
 			return fmt.Errorf("unsupported load mode %v for architecture %v", p.Mode, arch)
@@ -140,16 +135,7 @@ func (p *ProgramLoader) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 			return fmt.Errorf("set initial registers: %w", err)
 		}
 
-		for range p.MaxLoopIterations {
-			if err := vcpu.Run(ctx); err != nil {
-				if isSuccessfulVMExit(err) {
-					return err
-				}
-				return fmt.Errorf("run vCPU: %w", err)
-			}
-		}
-
-		return fmt.Errorf("maximum loop iterations (%d) exceeded", p.MaxLoopIterations)
+		return p.runLoop(ctx, vcpu)
 	default:
 		return fmt.Errorf("unsupported architecture: %v", arch)
 	}

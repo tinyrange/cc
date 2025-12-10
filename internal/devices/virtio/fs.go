@@ -107,10 +107,11 @@ func (t FSTemplate) DeviceTreeNodes() ([]fdt.Node, error) {
 
 // GetACPIDeviceInfo implements VirtioMMIODevice.
 func (t FSTemplate) GetACPIDeviceInfo() ACPIDeviceInfo {
+	irqLine := t.irqLineForArch(t.archOrDefault(nil))
 	return ACPIDeviceInfo{
 		BaseAddr: FsDefaultMMIOBase,
 		Size:     FsDefaultMMIOSize,
-		GSI:      t.IRQLine,
+		GSI:      irqLine,
 	}
 }
 
