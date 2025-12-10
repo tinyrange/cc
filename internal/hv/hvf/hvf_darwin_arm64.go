@@ -415,23 +415,19 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 		return fmt.Errorf("hvf: SPI %d out of range (base=%d count=%d)", spiNum, v.gicSPIBase, v.gicSPICount)
 	}
 
-	if level {
-		slog.Info("hvf: SetIRQ", "spi", spiNum, "level", level, "spiBase", v.gicSPIBase, "spiCount", v.gicSPICount)
-	}
-
 	ret := hvGicSetSpi(spiNum, level)
 	if ret != 0 {
 		slog.Error("hvf: hv_gic_set_spi failed", "spi", spiNum, "level", level, "ret", ret)
 		return ret.toError("hv_gic_set_spi")
 	}
 
-	// When asserting an interrupt, mark all vCPUs as having a pending IRQ
-	// and kick them so they can inject it.
+	// When asserting an interrupt, kick all vCPUs so they exit hv_vcpu_run
+	// and the GIC can deliver the pending interrupt.
+	// Note: We do NOT call hv_vcpu_set_pending_interrupt here - the GIC
+	// handles interrupt delivery automatically when SPIs are set via hv_gic_set_spi.
 	if level {
 		for _, vcpu := range v.vcpus {
-			vcpu.pendingIRQ = true
 			hostID := vcpu.hostID
-			// Kick the vCPU so it exits hvVcpuRun and can inject the interrupt
 			_ = hvVcpusExit(&hostID, 1)
 		}
 	}
@@ -509,11 +505,6 @@ type virtualCPU struct {
 	initErr  chan error
 
 	pendingPC *uint64
-
-	// pendingIRQ is set when an IRQ needs to be injected into the vCPU.
-	// Access should be synchronized, but since we only set from SetIRQ
-	// and check from the vCPU thread, a simple bool is sufficient.
-	pendingIRQ bool
 }
 
 func (v *virtualCPU) start() {
@@ -632,21 +623,6 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	}
 
 	for {
-		// Inject pending interrupts before running the vCPU.
-		// This must be done from the vCPU thread.
-		if v.pendingIRQ {
-			v.pendingIRQ = false
-			if hvVcpuSetPendingInterrupt != nil {
-				ret := hvVcpuSetPendingInterrupt(v.hostID, hvInterruptTypeIRQ, true)
-				// slog.Info("hvf: injecting IRQ into vCPU", "vcpu", v.index, "ret", ret)
-				if err := ret.toError("hv_vcpu_set_pending_interrupt"); err != nil {
-					slog.Error("hvf: failed to set pending IRQ", "err", err)
-				}
-			} else {
-				slog.Warn("hvf: hvVcpuSetPendingInterrupt not available")
-			}
-		}
-
 		if err := hvVcpuRun(v.hostID).toError("hv_vcpu_run"); err != nil {
 			return err
 		}
@@ -656,8 +632,8 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			// If context isn't canceled, this might be a kick from SetIRQ.
-			// Continue running to process the interrupt.
+			// If context isn't canceled, this is a kick from SetIRQ to allow
+			// the GIC to deliver a pending interrupt. Just continue running.
 			continue
 		case hvExitReasonException:
 			if err := v.handleException(); err != nil {

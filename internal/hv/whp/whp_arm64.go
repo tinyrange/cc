@@ -6,10 +6,62 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"log/slog"
+	"sync/atomic"
+	"unsafe"
 
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/whp/bindings"
 )
+
+// Debug counters for interrupt tracking
+var (
+	irqSetCount      atomic.Uint64
+	irqFireCount     atomic.Uint64
+	irqSkipCount     atomic.Uint64
+	irqErrorCount    atomic.Uint64
+	irqDeassertCount atomic.Uint64
+)
+
+func init() {
+	// Validate struct sizes match C header definitions at runtime
+	// WHV_ARM64_IC_GIC_V3_PARAMETERS: 56 bytes
+	// WHV_ARM64_IC_PARAMETERS: 64 bytes
+	// WHV_INTERRUPT_CONTROL (ARM64): 32 bytes
+	// WHV_INTERRUPT_CONTROL2: 8 bytes
+	const (
+		expectedGicV3ParamsSize = 56
+		expectedIcParamsSize    = 64
+		expectedInterruptCtrl   = 32
+		expectedInterruptCtrl2  = 8
+	)
+
+	gicV3Size := unsafe.Sizeof(Arm64GicV3Parameters{})
+	icParamsSize := unsafe.Sizeof(Arm64IcParameters{})
+	intCtrlSize := unsafe.Sizeof(bindings.InterruptControl{})
+	intCtrl2Size := unsafe.Sizeof(bindings.InterruptControl2{})
+
+	// Log sizes at startup for debugging
+	slog.Info("whp: ARM64 struct sizes",
+		"Arm64GicV3Parameters", fmt.Sprintf("%d (expected %d)", gicV3Size, expectedGicV3ParamsSize),
+		"Arm64IcParameters", fmt.Sprintf("%d (expected %d)", icParamsSize, expectedIcParamsSize),
+		"InterruptControl", fmt.Sprintf("%d (expected %d)", intCtrlSize, expectedInterruptCtrl),
+		"InterruptControl2", fmt.Sprintf("%d (expected %d)", intCtrl2Size, expectedInterruptCtrl2))
+
+	// Panic if sizes don't match (critical for WHP interop)
+	if gicV3Size != expectedGicV3ParamsSize {
+		panic(fmt.Sprintf("whp: Arm64GicV3Parameters size mismatch: got %d, expected %d", gicV3Size, expectedGicV3ParamsSize))
+	}
+	if icParamsSize != expectedIcParamsSize {
+		panic(fmt.Sprintf("whp: Arm64IcParameters size mismatch: got %d, expected %d", icParamsSize, expectedIcParamsSize))
+	}
+	if intCtrlSize != expectedInterruptCtrl {
+		panic(fmt.Sprintf("whp: InterruptControl size mismatch: got %d, expected %d", intCtrlSize, expectedInterruptCtrl))
+	}
+	if intCtrl2Size != expectedInterruptCtrl2 {
+		panic(fmt.Sprintf("whp: InterruptControl2 size mismatch: got %d, expected %d", intCtrl2Size, expectedInterruptCtrl2))
+	}
+}
 
 const (
 	arm64InstructionSizeBytes = 4
@@ -47,7 +99,8 @@ const (
 )
 
 type Arm64IcParameters struct {
-	EmulationMode   Arm64IcEmulationMode
+	EmulationMode Arm64IcEmulationMode
+	Reserved      uint32 // Padding to match C struct layout
 	GicV3Parameters Arm64GicV3Parameters
 }
 
@@ -249,8 +302,9 @@ func (h *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 		gicrRegionSize = whpGicRedistributorSize * uint64(numCPUs)
 	}
 
-	if err := bindings.SetPartitionPropertyUnsafe(vm.part, bindings.PartitionPropertyCodeArm64IcParameters, Arm64IcParameters{
+	icParams := Arm64IcParameters{
 		EmulationMode: Arm64IcEmulationModeGicV3,
+		Reserved:      0,
 		GicV3Parameters: Arm64GicV3Parameters{
 			GicdBaseAddress:                    whpGicDistributorBase,
 			GitsTranslatorBaseAddress:          0,
@@ -258,9 +312,22 @@ func (h *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 			GicPpiOverflowInterruptFromCntv:    0x14,
 			GicPpiPerformanceMonitorsInterrupt: 0x17,
 		},
-	}); err != nil {
+	}
+
+	slog.Info("whp: configuring ARM64 GICv3",
+		"gicdBase", fmt.Sprintf("%#x", whpGicDistributorBase),
+		"gicrBase", fmt.Sprintf("%#x", whpGicRedistributorBase),
+		"gicrSize", fmt.Sprintf("%#x", gicrRegionSize),
+		"numCPUs", numCPUs,
+		"ppiOverflow", fmt.Sprintf("%#x", icParams.GicV3Parameters.GicPpiOverflowInterruptFromCntv),
+		"ppiPerfMon", fmt.Sprintf("%#x", icParams.GicV3Parameters.GicPpiPerformanceMonitorsInterrupt))
+
+	if err := bindings.SetPartitionPropertyUnsafe(vm.part, bindings.PartitionPropertyCodeArm64IcParameters, icParams); err != nil {
+		slog.Error("whp: failed to set ARM64 IC parameters", "error", err)
 		return fmt.Errorf("failed to set ARM64 IC parameters: %w", err)
 	}
+
+	slog.Info("whp: ARM64 GICv3 configured successfully")
 
 	vm.arm64GICInfo = hv.Arm64GICInfo{
 		Version:           hv.Arm64GICVersion3,
@@ -287,11 +354,25 @@ func (h *hypervisor) archVMInitWithMemory(vm *virtualMachine, config hv.VMConfig
 
 func (h *hypervisor) archVCPUInit(vm *virtualMachine, vcpu *virtualCPU) error {
 	gicrBase := whpGicRedistributorBase + uint64(vcpu.id)*whpGicRedistributorSize
+
+	slog.Info("whp: initializing ARM64 vCPU GIC redistributor",
+		"vcpuId", vcpu.id,
+		"gicrBase", fmt.Sprintf("%#x", gicrBase))
+
 	if err := vcpu.SetRegisters(map[hv.Register]hv.RegisterValue{
 		hv.RegisterARM64GicrBase: hv.Register64(gicrBase),
 	}); err != nil {
+		slog.Error("whp: failed to set ARM64 GICR base",
+			"vcpuId", vcpu.id,
+			"gicrBase", fmt.Sprintf("%#x", gicrBase),
+			"error", err)
 		return fmt.Errorf("failed to set ARM64 GICR base: %w", err)
 	}
+
+	slog.Info("whp: ARM64 vCPU GIC redistributor configured",
+		"vcpuId", vcpu.id,
+		"gicrBase", fmt.Sprintf("%#x", gicrBase))
+
 	return nil
 }
 
@@ -310,8 +391,14 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 		armSPIBase      = 32 // GIC SPIs start at INTID 32
 	)
 
+	callNum := irqSetCount.Add(1)
+
 	irqType := (irqLine >> armIRQTypeShift) & 0xff
 	if irqType == 0 {
+		slog.Error("whp: SetIRQ missing type",
+			"call", callNum,
+			"irqLine", fmt.Sprintf("%#x", irqLine),
+			"level", level)
 		return fmt.Errorf("whp: interrupt type missing in irqLine %#x", irqLine)
 	}
 
@@ -326,22 +413,79 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 		intid = spiNum
 	}
 
-	if !v.arm64ShouldFire(intid, level) {
+	slog.Debug("whp: SetIRQ called",
+		"call", callNum,
+		"irqLine", fmt.Sprintf("%#x", irqLine),
+		"irqType", irqType,
+		"spiNum", spiNum,
+		"intid", intid,
+		"level", level)
+
+	if !level {
+		irqDeassertCount.Add(1)
+		v.arm64ShouldFire(intid, level) // Update state tracking
+		slog.Debug("whp: SetIRQ deassert (no WHP action)",
+			"call", callNum,
+			"intid", intid,
+			"totalDeasserts", irqDeassertCount.Load())
 		return nil
 	}
 
+	if !v.arm64ShouldFire(intid, level) {
+		irqSkipCount.Add(1)
+		slog.Debug("whp: SetIRQ skipped (already asserted)",
+			"call", callNum,
+			"intid", intid,
+			"totalSkips", irqSkipCount.Load())
+		return nil
+	}
+
+	// Build the interrupt control structure
+	// From WinHvPlatformDefs.h:
+	// - TargetPartition: 0 for current partition
+	// - InterruptControl: type + asserted flag
+	// - DestinationAddress: routing target (may need vCPU MPIDR?)
+	// - RequestedVector: GIC INTID
 	ctrl := bindings.InterruptControl{
 		InterruptControl: bindings.MakeInterruptControl2(
 			bindings.InterruptTypeFixed,
 			true,  // Asserted
 			false, // Retarget
 		),
-		TargetPartition: 0,
-		// WHP expects the GIC INTID in RequestedVector.
-		// For ARM64 GIC SPIs, this is the SPI number + 32.
-		RequestedVector: uint32(intid),
-		TargetVtl:       0,
+		TargetPartition:    0,
+		DestinationAddress: 0, // TODO: May need vCPU MPIDR for targeting
+		RequestedVector:    uint32(intid),
+		TargetVtl:          0,
 	}
 
-	return bindings.RequestInterrupt(v.part, &ctrl)
+	slog.Info("whp: RequestInterrupt",
+		"call", callNum,
+		"intid", intid,
+		"spiNum", spiNum,
+		"ctrl.InterruptControl", fmt.Sprintf("%#x", ctrl.InterruptControl.AsUINT64),
+		"ctrl.TargetPartition", ctrl.TargetPartition,
+		"ctrl.DestinationAddress", fmt.Sprintf("%#x", ctrl.DestinationAddress),
+		"ctrl.RequestedVector", ctrl.RequestedVector,
+		"ctrl.TargetVtl", ctrl.TargetVtl)
+
+	err := bindings.RequestInterrupt(v.part, &ctrl)
+	if err != nil {
+		irqErrorCount.Add(1)
+		slog.Error("whp: RequestInterrupt failed",
+			"call", callNum,
+			"intid", intid,
+			"error", err,
+			"totalErrors", irqErrorCount.Load())
+		return fmt.Errorf("whp: RequestInterrupt (intid=%d): %w", intid, err)
+	}
+
+	irqFireCount.Add(1)
+	slog.Info("whp: RequestInterrupt success",
+		"call", callNum,
+		"intid", intid,
+		"totalFired", irqFireCount.Load(),
+		"totalSkips", irqSkipCount.Load(),
+		"totalDeasserts", irqDeassertCount.Load())
+
+	return nil
 }
