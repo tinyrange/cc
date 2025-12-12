@@ -362,6 +362,11 @@ func (vm *VirtualMachine) DumpStackTrace(vcpu hv.VirtualCPU) (int64, error) {
 	if err != nil {
 		slog.Error("capture stack trace", "error", err)
 	}
+
+	if len(trace) == 0 {
+		return -1, errors.New("no stack trace available")
+	}
+
 	return int64(trace[0].PhysAddr), nil
 }
 
