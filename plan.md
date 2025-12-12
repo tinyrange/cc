@@ -19,32 +19,32 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
 
 ### Implementation Checklist
 
-- [ ] **Create `internal/chipset/device.go`** - Define unified device interface
-  - [ ] Add `ChipsetDevice` interface combining PIO, MMIO, Poll capabilities
-  - [ ] Add `SupportsPortIO() *PortIOIntercept` method
-  - [ ] Add `SupportsMmio() *MmioIntercept` method
-  - [ ] Add `SupportsPollDevice() *PollDevice` method
-  - [ ] Add `ChangeDeviceState` interface (Start, Stop, Reset)
+- [x] **Create `internal/chipset/device.go`** - Define unified device interface
+  - [x] Add `ChipsetDevice` interface combining PIO, MMIO, Poll capabilities
+  - [x] Add `SupportsPortIO() *PortIOIntercept` method
+  - [x] Add `SupportsMmio() *MmioIntercept` method
+  - [x] Add `SupportsPollDevice() *PollDevice` method
+  - [x] Add `ChangeDeviceState` interface (Start, Stop, Reset)
 
 - [ ] **Create `internal/chipset/builder.go`** - Chipset builder
-  - [ ] Add `ChipsetBuilder` struct with device registry
-  - [ ] Add `RegisterDevice(name string, dev ChipsetDevice)` method
-  - [ ] Add `WithPioPort(port uint16, handler PortIOHandler)` method
-  - [ ] Add `WithMmioRegion(base, size uint64, handler MmioHandler)` method
-  - [ ] Add `WithInterruptLine(line uint8, sink InterruptSink)` method
-  - [ ] Add `Build() (*Chipset, error)` to finalize registration
-  - [ ] Add port/region conflict detection
+  - [x] Add `ChipsetBuilder` struct with device registry
+  - [x] Add `RegisterDevice(name string, dev ChipsetDevice)` method
+  - [x] Add `WithPioPort(port uint16, handler PortIOHandler)` method
+  - [x] Add `WithMmioRegion(base, size uint64, handler MmioHandler)` method
+  - [x] Add `WithInterruptLine(line uint8, sink InterruptSink)` method
+  - [x] Add `Build() (*Chipset, error)` to finalize registration
+  - [x] Add port/region conflict detection
 
 - [ ] **Create `internal/chipset/chipset.go`** - Runtime chipset
-  - [ ] Add `Chipset` struct holding device map and dispatch tables
-  - [ ] Add `HandlePIO(port uint16, data []byte, isWrite bool) error`
-  - [ ] Add `HandleMMIO(addr uint64, data []byte, isWrite bool) error`
-  - [ ] Add `Poll(ctx context.Context)` for poll-based devices
-  - [ ] Add `Start()`, `Stop()`, `Reset()` lifecycle methods
+  - [x] Add `Chipset` struct holding device map and dispatch tables
+  - [x] Add `HandlePIO(port uint16, data []byte, isWrite bool) error`
+  - [x] Add `HandleMMIO(addr uint64, data []byte, isWrite bool) error`
+  - [x] Add `Poll(ctx context.Context)` for poll-based devices
+  - [x] Add `Start()`, `Stop()`, `Reset()` lifecycle methods
 
 - [ ] **Update `internal/hv/kvm/kvm_amd64.go`**
-  - [ ] Replace manual device dispatch with chipset dispatch
-  - [ ] Update `addX86Devices()` to use builder pattern
+  - [x] Replace manual device dispatch with chipset dispatch
+  - [x] Update `addX86Devices()` to use builder pattern
 
 ---
 
@@ -64,33 +64,33 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
 ### Implementation Checklist
 
 - [ ] **Enhance `internal/devices/amd64/chipset/sink.go`**
-  - [ ] Add `LineInterrupt` interface:
+  - [x] Add `LineInterrupt` interface:
     ```go
     type LineInterrupt interface {
         SetLevel(high bool)
         PulseInterrupt()  // For edge-triggered
     }
     ```
-  - [ ] Add `LineInterruptDetached()` factory for noop line
-  - [ ] Add `LineInterruptFromFunc(fn func(bool)) LineInterrupt` adapter
+  - [x] Add `LineInterruptDetached()` factory for noop line
+  - [x] Add `LineInterruptFromFunc(fn func(bool)) LineInterrupt` adapter
 
 - [ ] **Create `internal/chipset/lineset.go`** - Interrupt line set
-  - [ ] Add `LineSet` struct managing multiple interrupt lines
-  - [ ] Add `AllocateLine(irq uint8) LineInterrupt` method
-  - [ ] Add `RegisterEOICallback(line uint8, fn func())` for EOI notification
-  - [ ] Add `BroadcastEOI(vector uint8)` method called from LAPIC
-  - [ ] Wire EOI to IOAPIC's `HandleEOI(vector uint32)` method
+  - [x] Add `LineSet` struct managing multiple interrupt lines
+  - [x] Add `AllocateLine(irq uint8) LineInterrupt` method
+  - [x] Add `RegisterEOICallback(line uint8, fn func())` for EOI notification
+  - [x] Add `BroadcastEOI(vector uint8)` method called from LAPIC
+  - [x] Wire EOI to IOAPIC's `HandleEOI(vector uint32)` method
 
 - [ ] **Update IOAPIC** (`internal/devices/amd64/chipset/ioapic.go`)
-  - [ ] Expose `HandleEOI(vector uint32)` publicly (already exists)
-  - [ ] Add stats for EOI events
+  - [x] Expose `HandleEOI(vector uint32)` publicly (already exists)
+  - [x] Add stats for EOI events
 
 - [ ] **Update PIC** (`internal/devices/amd64/chipset/pic.go`)
-  - [ ] Add `LineInterrupt` output for INT pin
-  - [ ] Add `AcknowledgeHook` interface for in-kernel PIC integration
+  - [x] Add `LineInterrupt` output for INT pin
+  - [x] Add `AcknowledgeHook` interface for in-kernel PIC integration
 
 - [ ] **Update KVM integration** (`internal/hv/kvm/kvm_irq.go`)
-  - [ ] Wire LAPIC EOI to `LineSet.BroadcastEOI()`
+  - [x] Wire LAPIC EOI to `LineSet.BroadcastEOI()`
   - [ ] Add KVM IRQFD support for fast interrupt injection (optional)
 
 ---
@@ -142,7 +142,7 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
 ### Implementation Checklist
 
 - [ ] **Update `internal/devices/amd64/chipset/ioapic.go`**
-  - [ ] Add delivery mode statistics:
+  - [x] Add delivery mode statistics:
     ```go
     type ioapicStats struct {
         interrupts     uint64
@@ -155,19 +155,19 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
         extintDelivery uint64
     }
     ```
-  - [ ] Add delivery status bit (bit 12) read support
-  - [ ] Implement polarity inversion (bit 13) for active-low
-  - [ ] Add destination shorthand handling for broadcast
-  - [ ] Fix level-triggered re-assert after EOI when line still high
-  - [ ] Add `Debug()` method for inspection
-  - [ ] Verify remote-IRR clear on write (should be read-only)
+  - [x] Add delivery status bit (bit 12) read support
+  - [x] Implement polarity inversion (bit 13) for active-low
+  - [x] Add destination shorthand handling for broadcast
+  - [x] Fix level-triggered re-assert after EOI when line still high
+  - [x] Add `Debug()` method for inspection
+  - [x] Verify remote-IRR clear on write (should be read-only)
 
 - [ ] **Add unit tests** (`internal/devices/amd64/chipset/ioapic_test.go`)
-  - [ ] Test edge-triggered interrupt delivery
-  - [ ] Test level-triggered with remote-IRR
-  - [ ] Test mask/unmask behavior
-  - [ ] Test EOI clearing remote-IRR
-  - [ ] Test redirection entry programming
+  - [x] Test edge-triggered interrupt delivery
+  - [x] Test level-triggered with remote-IRR
+  - [x] Test mask/unmask behavior
+  - [x] Test EOI clearing remote-IRR
+  - [x] Test redirection entry programming
 
 ---
 
@@ -186,8 +186,8 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
 ### Implementation Checklist
 
 - [ ] **Update `internal/devices/amd64/chipset/pit.go`**
-  - [ ] Implement `PollDevice` interface for timer callbacks
-  - [ ] Add `VmTime` abstraction:
+  - [x] Implement `PollDevice` interface for timer callbacks
+  - [x] Add `VmTime` abstraction:
     ```go
     type VmTime interface {
         Now() time.Duration
@@ -195,7 +195,7 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
         CancelTimeout()
     }
     ```
-  - [ ] Implement mode 0 (interrupt on terminal count)
+  - [x] Implement mode 0 (interrupt on terminal count)
   - [ ] Implement mode 2 (rate generator) - currently present
   - [ ] Implement mode 3 (square wave generator)
   - [ ] Implement mode 4 (software triggered strobe)
@@ -204,12 +204,12 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
   - [ ] Fix counter latch for 16-bit reads
 
 - [ ] **Implement Port 0x61** (`internal/devices/amd64/chipset/port61.go`)
-  - [ ] Create `Port61` device struct
-  - [ ] Add timer 2 gate control (bit 0)
-  - [ ] Add speaker data control (bit 1)
-  - [ ] Add refresh request status (bit 4) - toggle for timing loops
-  - [ ] Add timer 2 output status (bit 5)
-  - [ ] Wire to PIT channel 2
+  - [x] Create `Port61` device struct
+  - [x] Add timer 2 gate control (bit 0)
+  - [x] Add speaker data control (bit 1)
+  - [x] Add refresh request status (bit 4) - toggle for timing loops
+  - [x] Add timer 2 output status (bit 5)
+  - [x] Wire to PIT channel 2
 
 - [ ] **Add unit tests** (`internal/devices/amd64/chipset/pit_test.go`)
   - [ ] Test mode 2 periodic timer
@@ -296,21 +296,21 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
 
 - [ ] **Update `internal/devices/amd64/chipset/cmos.go`**
   - [ ] Add Status Register A:
-    - [ ] Periodic timer rate (bits 0-3)
-    - [ ] Oscillator control (bits 4-6)
-    - [ ] Update in progress (bit 7) - pulse every second
+    - [x] Periodic timer rate (bits 0-3)
+    - [x] Oscillator control (bits 4-6)
+    - [x] Update in progress (bit 7) - pulse every second
   - [ ] Add Status Register B:
-    - [ ] DST enable (bit 0)
-    - [ ] 24-hour mode (bit 1)
-    - [ ] BCD disable (bit 2)
-    - [ ] Square wave enable (bit 3)
-    - [ ] Update IRQ enable (bit 4)
-    - [ ] Alarm IRQ enable (bit 5)
-    - [ ] Periodic IRQ enable (bit 6)
-    - [ ] Set mode (bit 7)
-  - [ ] Add Status Register C (interrupt flags, read clears)
-  - [ ] Add Status Register D (VRT bit = 1 always)
-  - [ ] Implement periodic timer using `PollDevice`:
+    - [x] DST enable (bit 0)
+    - [x] 24-hour mode (bit 1)
+    - [x] BCD disable (bit 2)
+    - [x] Square wave enable (bit 3)
+    - [x] Update IRQ enable (bit 4)
+    - [x] Alarm IRQ enable (bit 5)
+    - [x] Periodic IRQ enable (bit 6)
+    - [x] Set mode (bit 7)
+  - [x] Add Status Register C (interrupt flags, read clears)
+  - [x] Add Status Register D (VRT bit = 1 always)
+  - [x] Implement periodic timer using `PollDevice`:
     ```go
     func (r *Rtc) PollDevice(ctx context.Context) {
         // Check periodic timer
@@ -318,21 +318,21 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
         // Check update timer (1 second)
     }
     ```
-  - [ ] Implement alarm with wildcard support (0xFF = don't care)
-  - [ ] Add BCD encode/decode functions
-  - [ ] Add 12/24 hour conversion
-  - [ ] Wire IRQ8 to `LineInterrupt`
+  - [x] Implement alarm with wildcard support (0xFF = don't care)
+  - [x] Add BCD encode/decode functions
+  - [x] Add 12/24 hour conversion
+  - [x] Wire IRQ8 to `LineInterrupt`
 
 - [ ] **Create `internal/devices/amd64/chipset/pm.go`** (stub)
-  - [ ] Add ACPI PM1a control/status registers
-  - [ ] Add PM timer (port 0x408)
-  - [ ] Add sleep state handling (stub)
+  - [x] Add ACPI PM1a control/status registers
+  - [x] Add PM timer (port 0x408)
+  - [x] Add sleep state handling (stub)
 
 - [ ] **Add unit tests** (`internal/devices/amd64/chipset/cmos_test.go`)
-  - [ ] Test time register read/write
-  - [ ] Test BCD encoding
-  - [ ] Test alarm matching
-  - [ ] Test status register C clear-on-read
+  - [x] Test time register read/write
+  - [x] Test BCD encoding
+  - [x] Test alarm matching
+  - [x] Test status register C clear-on-read
 
 ---
 

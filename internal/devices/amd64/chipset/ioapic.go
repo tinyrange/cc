@@ -3,6 +3,7 @@ package chipset
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/tinyrange/cc/internal/hv"
@@ -29,6 +30,10 @@ const (
 const (
 	deliveryModeFixed          = 0x0
 	deliveryModeLowestPriority = 0x1
+	deliveryModeSmi            = 0x2
+	deliveryModeNmi            = 0x4
+	deliveryModeInit           = 0x5
+	deliveryModeExtInt         = 0x7
 )
 
 // Redirection bits that the guest is permitted to write.
@@ -119,6 +124,7 @@ func (i *IOAPIC) SetRouting(r IoApicRouting) {
 func (i *IOAPIC) HandleEOI(vector uint32) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
+	i.stats.eois++
 	for line := range i.entries {
 		entry := &i.entries[line]
 		if entry.redirection.vector() == uint8(vector) {
@@ -137,10 +143,17 @@ func (i *IOAPIC) SetIRQ(line uint32, high bool) {
 	}
 	idx := int(line)
 	entry := &i.entries[idx]
-	if high {
+	asserted := high
+	if entry.redirection.polarityActiveLow() {
+		asserted = !high
+	}
+	if asserted {
 		entry.assert(i.routing, &i.stats, uint8(line))
 	} else {
 		entry.deassert()
+		if entry.lineLevel && entry.redirection.isLevelCapable() && !entry.redirection.remoteIRR() {
+			entry.evaluate(i.routing, &i.stats, uint8(line), false)
+		}
 	}
 }
 
@@ -240,6 +253,14 @@ func (i *IOAPIC) readRedirection(index uint8) uint32 {
 		return 0
 	}
 	raw := entry.redirection.raw()
+	if index&1 == 0 {
+		// Low dword: inject delivery status bit (bit 12).
+		if entry.redirection.remoteIRR() {
+			raw |= 1 << 12
+		} else {
+			raw &^= 1 << 12
+		}
+	}
 	if index&1 == 1 {
 		return uint32(raw >> 32)
 	}
@@ -328,6 +349,10 @@ func (r *irqRedirection) evaluate(router IoApicRouting, stats *ioapicStats, line
 		return
 	}
 	isLevel := r.redirection.isLevelCapable()
+	if r.redirection.polarityActiveLow() && !isLevel {
+		edge = !edge
+	}
+	mode := r.redirection.deliveryMode()
 	switch {
 	case isLevel && (!r.lineLevel || r.redirection.remoteIRR()):
 		return
@@ -341,16 +366,36 @@ func (r *irqRedirection) evaluate(router IoApicRouting, stats *ioapicStats, line
 		stats.perIRQ[line]++
 	}
 
+	switch mode {
+	case deliveryModeFixed:
+		stats.fixedDelivery++
+	case deliveryModeLowestPriority:
+		stats.lowPriDelivery++
+	case deliveryModeSmi:
+		stats.smiDelivery++
+	case deliveryModeNmi:
+		stats.nmiDelivery++
+	case deliveryModeInit:
+		stats.initDelivery++
+	case deliveryModeExtInt:
+		stats.extintDelivery++
+	}
+
+	dest := r.redirection.destination()
 	destMode := uint8(0) // Physical
 	if r.redirection.destinationModeLogical() {
 		destMode = 1
+		// Destination shorthand: logical destination 0 broadcasts to all CPUs.
+		if dest == 0 {
+			dest = 0xFF
+		}
 	}
 
 	router.Assert(
 		r.redirection.vector(),
-		r.redirection.destination(),
+		dest,
 		destMode,
-		r.redirection.deliveryMode(),
+		mode,
 		isLevel,
 	)
 }
@@ -379,6 +424,10 @@ func (r redirectionEntry) destination() uint8 {
 	return uint8((r.value >> 56) & 0xFF)
 }
 
+func (r redirectionEntry) deliveryStatus() bool {
+	return (r.value>>12)&1 == 1
+}
+
 func (r redirectionEntry) vector() uint8 {
 	return uint8(r.value & 0xff)
 }
@@ -389,6 +438,10 @@ func (r redirectionEntry) deliveryMode() uint8 {
 
 func (r redirectionEntry) masked() bool {
 	return (r.value>>16)&1 == 1
+}
+
+func (r redirectionEntry) polarityActiveLow() bool {
+	return (r.value>>13)&1 == 1
 }
 
 func (r redirectionEntry) remoteIRR() bool {
@@ -420,8 +473,15 @@ func (r redirectionEntry) isLevelCapable() bool {
 }
 
 type ioapicStats struct {
-	interrupts uint64
-	perIRQ     []uint64
+	interrupts     uint64
+	perIRQ         []uint64
+	fixedDelivery  uint64
+	lowPriDelivery uint64
+	smiDelivery    uint64
+	nmiDelivery    uint64
+	initDelivery   uint64
+	extintDelivery uint64
+	eois           uint64
 }
 
 func encodeIoApicID(id uint8) uint32 {
@@ -497,6 +557,32 @@ func encodeIoApicVersion(maxEntry uint8) uint32 {
 	val := uint32(ioapicVersion)
 	val |= uint32(maxEntry) << 16
 	return val
+}
+
+// Debug returns a human-readable summary of IOAPIC state for diagnostics.
+func (i *IOAPIC) Debug() string {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "ioapic: id=%d entries=%d interrupts=%d eois=%d fixed=%d lowpri=%d smi=%d nmi=%d init=%d extint=%d\n",
+		i.id, len(i.entries), i.stats.interrupts, i.stats.eois,
+		i.stats.fixedDelivery, i.stats.lowPriDelivery, i.stats.smiDelivery,
+		i.stats.nmiDelivery, i.stats.initDelivery, i.stats.extintDelivery)
+	for idx, entry := range i.entries {
+		fmt.Fprintf(&sb, "  [%02d] vec=%02x dest=%02x dm=%d trig=%v mask=%v polLow=%v irr=%v remote=%v\n",
+			idx,
+			entry.redirection.vector(),
+			entry.redirection.destination(),
+			entry.redirection.deliveryMode(),
+			entry.redirection.triggerModeLevel(),
+			entry.redirection.masked(),
+			entry.redirection.polarityActiveLow(),
+			entry.lineLevel,
+			entry.redirection.remoteIRR(),
+		)
+	}
+	return sb.String()
 }
 
 // min avoids importing math for ints.

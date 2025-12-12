@@ -403,8 +403,15 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 		}
 	})
 
-	if err := vm.AddDevice(chipset.NewPIT(irqForwarder)); err != nil {
+	pit := chipset.NewPIT(irqForwarder)
+	if err := vm.AddDevice(pit); err != nil {
 		return fmt.Errorf("add PIT: %w", err)
+	}
+	if err := vm.AddDevice(chipset.NewPort61(pit)); err != nil {
+		return fmt.Errorf("add port 0x61 device: %w", err)
+	}
+	if err := vm.AddDevice(chipset.NewPM()); err != nil {
+		return fmt.Errorf("add PM device: %w", err)
 	}
 
 	if err := vm.AddDevice(chipset.NewCMOS(irqForwarder)); err != nil {

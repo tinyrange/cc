@@ -24,16 +24,18 @@ const (
 // DualPIC implements the classic pair of cascaded 8259A controllers.
 type DualPIC struct {
 	mu    sync.Mutex
-	ready readySink
+	ready LineInterrupt
 
 	vm hv.VirtualMachine
 
 	pics [2]*pic
+
+	ackHook AcknowledgeHook
 }
 
 func NewDualPIC() *DualPIC {
 	return &DualPIC{
-		ready: noopReadySink{},
+		ready: LineInterruptDetached(),
 		pics: [2]*pic{
 			newPic(true),
 			newPic(false),
@@ -45,11 +47,30 @@ func (p *DualPIC) SetReadySink(sink readySink) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if sink == nil {
-		p.ready = noopReadySink{}
+		p.ready = LineInterruptDetached()
 	} else {
-		p.ready = sink
+		p.ready = LineInterruptFromFunc(sink.SetLevel)
 	}
 	p.syncOutputsLocked()
+}
+
+// SetReadyLine sets the interrupt line used for INT output.
+func (p *DualPIC) SetReadyLine(line LineInterrupt) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if line == nil {
+		p.ready = LineInterruptDetached()
+	} else {
+		p.ready = line
+	}
+	p.syncOutputsLocked()
+}
+
+// SetAcknowledgeHook installs a hook invoked when an interrupt is acknowledged.
+func (p *DualPIC) SetAcknowledgeHook(hook AcknowledgeHook) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.ackHook = hook
 }
 
 func (p *DualPIC) Init(vm hv.VirtualMachine) error {
@@ -142,7 +163,7 @@ func (p *DualPIC) syncOutputsLocked() {
 	cascade := p.pics[1].interruptPending()
 	p.pics[0].setIRQ(picChainCommunicationIRQ, cascade)
 	if p.ready == nil {
-		p.ready = noopReadySink{}
+		p.ready = LineInterruptDetached()
 	}
 	p.ready.SetLevel(p.pics[0].interruptPending())
 }
@@ -177,6 +198,9 @@ func (p *DualPIC) Acknowledge() (bool, uint8) {
 		vec = secVec
 	}
 	p.syncOutputsLocked()
+	if requested && p.ackHook != nil {
+		p.ackHook.PICAcknowledge(vec)
+	}
 	return requested, vec
 }
 
@@ -188,6 +212,11 @@ func (p *DualPIC) String() string {
 
 var _ hv.X86IOPortDevice = (*DualPIC)(nil)
 var _ hv.Device = (*DualPIC)(nil)
+
+// AcknowledgeHook is notified when the PIC has acknowledged an interrupt.
+type AcknowledgeHook interface {
+	PICAcknowledge(vector uint8)
+}
 
 // pic models a single 8259A.
 type pic struct {

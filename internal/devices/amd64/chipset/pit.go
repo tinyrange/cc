@@ -1,6 +1,7 @@
 package chipset
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
@@ -20,6 +21,13 @@ const (
 
 var pitTickDuration = time.Second / pitInputFrequency
 
+// VmTime models a virtual time source for the PIT.
+type VmTime interface {
+	Now() time.Duration
+	SetTimeout(deadline time.Duration)
+	CancelTimeout()
+}
+
 // PIT emulates the legacy 8254 programmable interval timer used by x86 PCs.
 type PIT struct {
 	mu sync.Mutex
@@ -27,9 +35,10 @@ type PIT struct {
 	now          func() time.Time
 	tick         time.Duration
 	timers       [3]*pitChannel
-	port61       byte
 	irq          irqLine
 	timerFactory timerFactory
+
+	vmTime VmTime
 
 	debugCh2Reads int
 	debugCh0Ticks int
@@ -93,9 +102,34 @@ func (p *PIT) Init(vm hv.VirtualMachine) error {
 	return nil
 }
 
+// Poll is a placeholder hook to integrate PIT with a poll-based scheduler.
+// Future work will migrate timer delivery away from real time tickers.
+func (p *PIT) Poll(context.Context) error {
+	if p.vmTime != nil {
+		// Placeholder: hook VmTime to drive virtual deadlines.
+	}
+	return nil
+}
+
+// SetChannel2Gate sets the gate input for channel 2 (used by port 0x61).
+func (p *PIT) SetChannel2Gate(high bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.timers[2].setGate(high)
+}
+
+// Channel2OutputHigh reports the OUT state of channel 2.
+func (p *PIT) Channel2OutputHigh() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ch2 := p.timers[2]
+	_ = ch2.currentCount(p.now(), p.tick)
+	return ch2.outputHigh
+}
+
 // IOPorts implements hv.X86IOPortDevice.
 func (p *PIT) IOPorts() []uint16 {
-	return []uint16{pitChannel0Port, pitChannel1Port, pitChannel2Port, pitControlPort, pitPort61}
+	return []uint16{pitChannel0Port, pitChannel1Port, pitChannel2Port, pitControlPort}
 }
 
 // ReadIOPort implements hv.X86IOPortDevice.
@@ -131,8 +165,6 @@ func (p *PIT) ReadIOPort(port uint16, data []byte) error {
 		data[0] = value
 	case pitControlPort:
 		data[0] = 0xFF
-	case pitPort61:
-		data[0] = p.readPort61Locked()
 	default:
 		return fmt.Errorf("pit: invalid read port 0x%04x", port)
 	}
@@ -161,9 +193,6 @@ func (p *PIT) WriteIOPort(port uint16, data []byte) error {
 		}
 	case pitControlPort:
 		p.writeControlLocked(data[0])
-	case pitPort61:
-		p.port61 = data[0]
-		p.timers[2].setGate((data[0] & 1) != 0)
 	default:
 		return fmt.Errorf("pit: invalid write port 0x%04x", port)
 	}
@@ -228,6 +257,13 @@ func (p *PIT) armChannel0Locked() {
 	if period <= 0 {
 		return
 	}
+	if ch.control.mode == pitMode0 {
+		timer := time.AfterFunc(period, func() { p.handleChannel0OneShot() })
+		ch.timer = timerHandleFunc(func() {
+			timer.Stop()
+		})
+		return
+	}
 	handle := p.timerFactory(period, func() { p.handleChannel0Tick() })
 	ch.timer = handle
 }
@@ -257,25 +293,23 @@ func (p *PIT) handleChannel0Tick() {
 	p.raiseIRQLocked(0)
 }
 
+func (p *PIT) handleChannel0OneShot() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	ch := p.timers[0]
+	ch.running = false
+	ch.outputHigh = true
+	p.disarmChannel0Locked()
+	p.raiseIRQLocked(0)
+}
+
 func (p *PIT) raiseIRQLocked(line uint8) {
 	if p.irq == nil {
 		return
 	}
 	p.irq.SetIRQ(line, true)
 	p.irq.SetIRQ(line, false)
-}
-
-func (p *PIT) readPort61Locked() byte {
-	// Update channel 2 state so the speaker status reflects elapsed time.
-	ch2 := p.timers[2]
-	if ch2 != nil {
-		_ = ch2.currentCount(p.now(), p.tick)
-	}
-	// Reflect the channel 2 output on bit 5, matching legacy hardware.
-	if p.timers[2].outputHigh {
-		return p.port61 | (1 << 5)
-	}
-	return p.port61 &^ (1 << 5)
 }
 
 type pitAccessMode uint8
