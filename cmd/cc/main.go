@@ -194,7 +194,7 @@ func run() error {
 
 	// Boot the VM first to set up devices
 	if err := func() error {
-		ctx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+		ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
 		defer cancel()
 
 		vm.VirtualCPUCall(0, func(vcpu hv.VirtualCPU) error {
@@ -202,7 +202,7 @@ func run() error {
 			if !ok {
 				return nil
 			}
-			return debug.EnableTrace(128)
+			return debug.EnableTrace(64)
 		})
 
 		if err := vm.Run(ctx, &ir.Program{
@@ -257,7 +257,7 @@ func run() error {
 
 				pc, err := vm.DumpStackTrace(vcpu)
 				if err != nil {
-					slog.Error("dump stack trace after boot failure", "error", err)
+					return fmt.Errorf("dump stack trace: %w", err)
 				}
 
 				// Dump a hexdump of RIP to RIP+128 bytes

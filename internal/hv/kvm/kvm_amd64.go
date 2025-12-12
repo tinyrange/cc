@@ -371,19 +371,11 @@ func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 
 		vm.hasIRQChip = true
 
-		if err := createPIT(vm.vmFd); err != nil && err != unix.ENOENT {
-			return fmt.Errorf("creating PIT: %w", err)
-		} else if err == nil {
-			vm.hasPIT = true
-		}
-
 		vm.ioapic = chipset.NewIOAPIC(24)
 		vm.ioapic.SetRouting(chipset.IoApicRoutingFunc(func(vector, dest, destMode, deliveryMode uint8, level bool) {
 			// In split IRQ chip mode, we inject interrupts via MSI to the in-kernel LAPIC.
-			// Only inject on assert (level=true); de-assert is handled by EOI.
-			if !level {
-				return
-			}
+			// IOAPIC edge-triggered lines set level=false, but still require injection.
+			fmt.Printf("ioapic: assert vec=%02x dest=%d destMode=%d delivery=%d level=%v\n", vector, dest, destMode, deliveryMode, level)
 			if err := vm.InjectInterrupt(vector, dest, destMode, deliveryMode); err != nil {
 				// Best-effort log; avoid hard fail to keep guest progressing.
 				fmt.Printf("kvm: inject IOAPIC interrupt vec=%d dest=%d err=%v\n", vector, dest, err)
@@ -407,6 +399,20 @@ func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int) error {
 	cpuId, err := getSupportedCpuId(hv.fd)
 	if err != nil {
 		return fmt.Errorf("getting vCPU ID: %w", err)
+	}
+
+	// Normalize CPUID-reported APIC IDs to match LAPIC ID 0 in our ACPI/MADT.
+	// Hosts may return a non-zero APIC ID in leaf 0x1 EBX[31:24], which leads
+	// to kernel warnings and can break timer setup during boot.
+	entries := unsafe.Slice((*kvmCPUIDEntry2)(unsafe.Pointer(uintptr(unsafe.Pointer(cpuId))+unsafe.Sizeof(*cpuId))), cpuId.Nr)
+	for i := range entries {
+		switch entries[i].Function {
+		case 0x1:
+			entries[i].Ebx &^= 0xFF000000 // clear initial APIC ID
+		case 0xB: // extended topology (x2APIC ID in EDX)
+			entries[i].Ebx = 1 // one logical processor at this level
+			entries[i].Edx = 0 // x2APIC ID
+		}
 	}
 
 	if err := setVCPUID(vcpuFd, cpuId); err != nil {

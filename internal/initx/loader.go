@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"runtime"
 
@@ -360,7 +359,7 @@ func (vm *VirtualMachine) DumpStackTrace(vcpu hv.VirtualCPU) (int64, error) {
 	}
 
 	if err != nil {
-		slog.Error("capture stack trace", "error", err)
+		// slog.Error("capture stack trace", "error", err)
 	}
 
 	if len(trace) == 0 {

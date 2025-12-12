@@ -81,8 +81,6 @@ func (v *virtualCPU) start() {
 }
 
 func (v *virtualCPU) RequestImmediateExit(tid int) error {
-	v.trace(fmt.Sprintf("RequestImmediateExit called for tid %d", tid))
-
 	run := (*kvmRunData)(unsafe.Pointer(&v.run[0]))
 
 	// set immediate_exit to request vCPU exit

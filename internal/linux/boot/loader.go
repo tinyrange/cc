@@ -389,11 +389,17 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 		SetIRQ(uint32, bool) error
 	})
 	irqForwarder := chipset.IRQLineFunc(func(line uint8, level bool) {
+		// ACPI overrides map legacy IRQ0 (PIT) to GSI 2, so forward it
+		// accordingly. Other ISA lines keep their numeric mapping.
+		mapped := uint32(line)
+		if line == 0 {
+			mapped = 2
+		}
 		if setter == nil {
 			return
 		}
-		if err := setter.SetIRQ(uint32(line), level); err != nil {
-			slog.Warn("set IRQ line", "line", line, "level", level, "err", err)
+		if err := setter.SetIRQ(mapped, level); err != nil {
+			slog.Warn("set IRQ line", "line", line, "gsi", mapped, "level", level, "err", err)
 		}
 	})
 
