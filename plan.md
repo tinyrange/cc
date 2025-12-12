@@ -1,12 +1,15 @@
-• Made HPET actually tick and advertise capabilities, plus added targeted logging:
+OpenVMM reference base: ~/dev/org/openvmm
 
-  - HPET now maintains its counter via a background ticker, supports periodic re‑arm, preserves capability bits/route masks, and logs config/comparator/IRQ events.
-  - Corrected the ACPI HPET table ID fields (revision/comparator count/vendor, 64‑bit counter) and kept legacy capability advertised.
-
-Ran ./tools/build.go -run -- alpine whoami (and with -dmesg); the guest still times out in setup_boot_APIC_clock, PIT channel 0 is never programmed (only ch2 polls), IOAPIC entries stay masked, and no SetIRQ logs fire. Notably, the new HPET logs never appear, so the kernel still isn’t touching the HPET MMIO registers.
-
-Next steps I’d take:
-
-1. Verify the ACPI HPET table the guest sees (dump/inspect the built tables) to confirm it’s valid and reachable.
-2. Track why the HPET driver isn’t probing—e.g., ensure the kernel config enables HPET or adjust the table/flags if needed.
-3. If HPET remains unavailable, consider a fallback to supply a periodic tick (e.g., PIT ch0) so jiffies advance and APIC timer calibration can proceed.
+Checklist to bring devices toward OpenVMM parity (with reference implementations):
+[ ] Device framework: add chipset-style builder for PIO/MMIO/PCI wiring, line sets, and lifecycle akin to `vmm_core/vmotherboard/src/base_chipset.rs` and `vmm_core/vmotherboard/src/chipset/builder/mod.rs` in ~/dev/org/openvmm.
+[ ] Interrupt fabric: introduce shared line targets/EOI/poll plumbing similar to `vmm_core/vmotherboard/src/chipset/backing/arc_mutex/services.rs` and `vm/chipset_device/src/interrupt.rs`.
+[ ] PIC: align DualPIC behavior (ELCR, stats, cascade sync, acknowledge hook) with `vm/devices/chipset/src/pic.rs`.
+[ ] IOAPIC: implement MSI translation and remote-IRR/level semantics matching `vm/devices/chipset/src/ioapic.rs`.
+[ ] PIT/timers: move to virtual-time/poll model with correct port 0x61 handling as in `vm/devices/chipset/src/pit.rs`.
+[ ] i8042: replace stub with full controller (keyboard/mouse, A20 gate, reset trigger) modeled on `vm/devices/chipset/src/i8042/mod.rs`.
+[ ] CMOS/RTC/PM: flesh out CMOS/RTC plus PM/battery/watchdog/PSP wiring following `vm/devices/chipset/src/cmos_rtc.rs` and power-related devices in `vmm_core/vmotherboard/src/base_chipset.rs`.
+[ ] Serial: add 16550 MMIO/IO variants with buffered async I/O and OUT2 gating like `vm/devices/serial/serial_16550/src/lib.rs`.
+[ ] Virtio core: factor common queue/device logic, add PCI transport, doorbells, and broaden devices using `vm/devices/virtio/virtio/src/common.rs`, `.../transport/mmio.rs`, and `.../transport/pci.rs` as guides.
+[ ] Snapshot/inspect: implement uniform save/restore and inspect hooks mirroring the patterns in `vm/chipset_device/src/lib.rs` and device Inspect implementations (e.g., `vm/devices/chipset/src/pic.rs`).
+[ ] Graphics/input extras: plan VGA/framebuffer/input parity referencing `vm/devices/vga` and `vm/devices/framebuffer` directories.
+[ ] Tests/bringup: add focused device tests and a bringup quest similar in spirit to `vm/devices/virtio/virtio/src/tests.rs` and OpenVMM’s `cmd/quest` equivalent.
