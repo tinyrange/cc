@@ -46,6 +46,7 @@ func run() error {
 	memprofile := flag.String("memprofile", "", "Write memory profile to file")
 	dmesg := flag.Bool("dmesg", false, "Print kernel dmesg during boot and runtime")
 	network := flag.Bool("network", false, "Enable networking")
+	timeout := flag.Duration("timeout", 0, "Timeout for the container")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <image> [command] [args...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Run a command inside an OCI container image in a virtual machine.\n\n")
@@ -294,6 +295,15 @@ func run() error {
 		return err
 	}
 
+	var ctx2 context.Context
+	var cancel context.CancelFunc
+	if *timeout > 0 {
+		ctx2, cancel = context.WithTimeout(ctx, *timeout)
+		defer cancel()
+	} else {
+		ctx2 = ctx
+	}
+
 	// Put stdin into raw mode so we don't send cooked/echoed characters into the guest.
 	// Do this after booting so that any Ctrl+C during boot still works to kill cc itself.
 	if term.IsTerminal(int(os.Stdin.Fd())) {
@@ -304,7 +314,7 @@ func run() error {
 		defer term.Restore(int(os.Stdin.Fd()), oldState)
 	}
 
-	if err := vm.Run(ctx, prog); err != nil {
+	if err := vm.Run(ctx2, prog); err != nil {
 		var exitErr *initx.ExitError
 		if errors.As(err, &exitErr) {
 			return exitErr
