@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"math"
 
 	"github.com/tinyrange/cc/internal/devices/pci"
 	"github.com/tinyrange/cc/internal/hv"
@@ -712,6 +713,48 @@ func (d *VirtioPCIDevice) setAvailEvent(q *queue, value uint16) error {
 	}
 	offset := q.usedAddr + 4 + uint64(q.size)*8
 	return d.writeGuestUint16(offset, value)
+}
+
+func (d *VirtioPCIDevice) memSlice(addr uint64, length uint64) ([]byte, error) {
+	if length > math.MaxUint32 {
+		return nil, fmt.Errorf("memSlice: length %d exceeds uint32 max", length)
+	}
+	return d.readGuest(addr, uint32(length))
+}
+
+func (d *VirtioPCIDevice) queuePointers(q *queue) (descTable []byte, avail []byte, used []byte, err error) {
+	if err := ensureQueueReady(q); err != nil {
+		return nil, nil, nil, err
+	}
+	
+	// Read descriptor table
+	descTableSize := uint64(q.size) * 16
+	descTable, err = d.readGuest(q.descAddr, uint32(descTableSize))
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("read descriptor table: %w", err)
+	}
+	
+	// Read available ring (header + ring + event idx if enabled)
+	availSize := 4 + uint64(q.size)*2
+	if d.eventIdxEnabled() {
+		availSize += 2
+	}
+	avail, err = d.readGuest(q.availAddr, uint32(availSize))
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("read available ring: %w", err)
+	}
+	
+	// Read used ring (header + ring + event idx if enabled)
+	usedSize := 4 + uint64(q.size)*8
+	if d.eventIdxEnabled() {
+		usedSize += 2
+	}
+	used, err = d.readGuest(q.usedAddr, uint32(usedSize))
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("read used ring: %w", err)
+	}
+	
+	return descTable, avail, used, nil
 }
 
 func (d *VirtioPCIDevice) readGuestInto(addr uint64, buf []byte) error {

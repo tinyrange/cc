@@ -46,6 +46,7 @@ func run() error {
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
 	memprofile := flag.String("memprofile", "", "Write memory profile to file")
 	dmesg := flag.Bool("dmesg", false, "Print kernel dmesg during boot and runtime")
+	network := flag.Bool("network", false, "Enable networking")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <image> [command] [args...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Run a command inside an OCI container image in a virtual machine.\n\n")
@@ -167,11 +168,7 @@ func run() error {
 	}
 
 	// Create VM with VirtioFS
-	vm, err := initx.NewVirtualMachine(
-		h,
-		*cpus,
-		*memory,
-		kernelLoader,
+	opts := []initx.Option{
 		initx.WithDeviceTemplate(virtio.FSTemplate{
 			Tag:     "rootfs",
 			Backend: fsBackend,
@@ -180,6 +177,23 @@ func run() error {
 		initx.WithDebugLogging(*debug),
 		initx.WithDmesgLogging(*dmesg),
 		initx.WithStdin(os.Stdin),
+	}
+
+	// Add network device if enabled
+	if *network {
+		opts = append(opts, initx.WithDeviceTemplate(virtio.NetTemplate{
+			Backend: nil, // Use discard backend for now
+			MAC:     nil, // Auto-generate MAC
+			Arch:    hvArch,
+		}))
+	}
+
+	vm, err := initx.NewVirtualMachine(
+		h,
+		*cpus,
+		*memory,
+		kernelLoader,
+		opts...,
 	)
 	if err != nil {
 		return fmt.Errorf("create VM: %w", err)
@@ -188,7 +202,7 @@ func run() error {
 
 	// Build and run the container init program
 	ctx := context.Background()
-	prog := buildContainerInit(img, execCmd)
+	prog := buildContainerInit(img, execCmd, *network)
 
 	slog.Debug("Booting VM")
 
@@ -426,7 +440,7 @@ func lookPath(fs *oci.ContainerFS, pathEnv string, workDir string, file string) 
 	return "", fmt.Errorf("executable %q not found in PATH", file)
 }
 
-func buildContainerInit(img *oci.Image, cmd []string) *ir.Program {
+func buildContainerInit(img *oci.Image, cmd []string, enableNetwork bool) *ir.Program {
 	errLabel := ir.Label("__cc_error")
 	errVar := ir.Var("__cc_errno")
 	pivotResult := ir.Var("__cc_pivot_result")
@@ -530,8 +544,22 @@ func buildContainerInit(img *oci.Image, cmd []string) *ir.Program {
 
 		// Change to working directory
 		ir.Syscall(defs.SYS_CHDIR, workDir),
+	}
 
-		// Fork and exec using initx helper
+	// Configure network interface if networking is enabled
+	if enableNetwork {
+		// Configure eth0 with IP 10.0.2.15/24 (common QEMU default)
+		// IP: 10.0.2.15 = 0x0a00020f
+		// Mask: 255.255.255.0 = 0xffffff00
+		main = append(main,
+			initx.ConfigureInterface("eth0", 0x0a00020f, 0xffffff00, errLabel, errVar),
+			// Add default route via 10.0.2.2 (gateway)
+			initx.AddDefaultRoute(0x0a000202, errLabel, errVar),
+		)
+	}
+
+	// Fork and exec using initx helper
+	main = append(main,
 		// Note: ForkExecWait expects argv to be the arguments AFTER the path,
 		// as it puts path at argv[0] itself
 		initx.ForkExecWait(cmd[0], cmd[1:], img.Config.Env, errLabel, errVar),
@@ -548,7 +576,7 @@ func buildContainerInit(img *oci.Image, cmd []string) *ir.Program {
 				ir.Int64(0),
 			),
 		}),
-	}
+	)
 
 	return &ir.Program{
 		Methods:    map[string]ir.Method{"main": main},
