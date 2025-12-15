@@ -366,12 +366,12 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	}
 	l.plan = plan
 
-	consoleSerial := amd64serial.NewSerial16550(0x3F8, 4, &convertCRLF{l.SerialStdout})
+	consoleSerial := amd64serial.NewSerial16550WithIRQ(0x3F8, 4, &convertCRLF{l.SerialStdout})
 	if err := vm.AddDevice(consoleSerial); err != nil {
 		return fmt.Errorf("add serial device: %w", err)
 	}
 
-	auxSerial := amd64serial.NewSerial16550(0x2F8, 3, io.Discard)
+	auxSerial := amd64serial.NewSerial16550WithIRQ(0x2F8, 3, io.Discard)
 	if err := vm.AddDevice(auxSerial); err != nil {
 		return fmt.Errorf("add aux serial device: %w", err)
 	}

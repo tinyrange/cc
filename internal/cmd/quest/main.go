@@ -1114,7 +1114,7 @@ func (q *bringUpQuest) Run() error {
 	}
 
 	serialBuf := &bytes.Buffer{}
-	serialDev := amd64serial.NewSerial16550(0x3f8, 4, serialBuf)
+	serialDev := amd64serial.NewSerial16550WithIRQ(0x3f8, 4, serialBuf)
 	if err := q.runVMTask("Serial Port Test", hv.ArchitectureX86_64, ioHelloWorld, func(cpu hv.VirtualCPU) error {
 		serialOutput := serialBuf.String()
 		if serialOutput != "Hello, World!" {

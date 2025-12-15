@@ -342,26 +342,27 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
 
 ### Implementation Checklist
 
-- [ ] **Update `internal/devices/amd64/serial/serial.go`**
-  - [ ] Add FIFO trigger level support (1/4/8/14 bytes)
-  - [ ] Add modem control register (MCR):
-    - [ ] DTR (bit 0)
-    - [ ] RTS (bit 1)
-    - [ ] OUT1 (bit 2)
-    - [ ] OUT2 (bit 3) - interrupt gate
-    - [ ] Loopback (bit 4)
-  - [ ] Add modem status register (MSR):
-    - [ ] CTS change (bit 0)
-    - [ ] DSR change (bit 1)
-    - [ ] RI trailing edge (bit 2)
-    - [ ] DCD change (bit 3)
-    - [ ] CTS (bit 4)
-    - [ ] DSR (bit 5)
-    - [ ] RI (bit 6)
-    - [ ] DCD (bit 7)
-  - [ ] Implement OUT2 interrupt gating (interrupt = pending && OUT2)
-  - [ ] Add `PollDevice` interface for async TX/RX
-  - [ ] Add RX/TX statistics
+- [x] **Update `internal/devices/amd64/serial/serial.go`**
+  - [x] Add FIFO trigger level support (1/4/8/14 bytes)
+  - [x] Add modem control register (MCR):
+    - [x] DTR (bit 0)
+    - [x] RTS (bit 1)
+    - [x] OUT1 (bit 2)
+    - [x] OUT2 (bit 3) - interrupt gate
+    - [x] Loopback (bit 4)
+  - [x] Add modem status register (MSR):
+    - [x] CTS change (bit 0)
+    - [x] DSR change (bit 1)
+    - [x] RI trailing edge (bit 2)
+    - [x] DCD change (bit 3)
+    - [x] CTS (bit 4)
+    - [x] DSR (bit 5)
+    - [x] RI (bit 6)
+    - [x] DCD (bit 7)
+  - [x] Implement OUT2 interrupt gating (interrupt = pending && OUT2)
+  - [x] Add `PollDevice` interface for async TX/RX
+  - [x] Add RX/TX statistics
+  - [x] Convert to ChipsetDevice interface
 
 - [ ] **Create `internal/devices/serial/mmio.go`**
   - [ ] Add `Serial16550MMIO` wrapper
