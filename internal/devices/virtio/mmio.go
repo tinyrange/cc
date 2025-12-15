@@ -56,6 +56,10 @@ const (
 
 	virtioFeatureVersion1 = uint64(1) << 32
 
+	// Interrupt status bits
+	VIRTIO_MMIO_INT_VRING  = 0x1 // Used buffer notification
+	VIRTIO_MMIO_INT_CONFIG = 0x2 // Configuration change
+
 	virtqDescFNext               = 1
 	virtqDescFWrite              = 2
 	virtioRingFeatureEventIdxBit = 29
@@ -85,6 +89,50 @@ type deviceHandler interface {
 	WriteConfig(dev device, offset uint64, value uint32) (handled bool, err error)
 }
 
+// deviceHandlerAdapter adapts a deviceHandler to the VirtioDevice interface.
+// This allows backward compatibility with existing deviceHandler implementations.
+type deviceHandlerAdapter struct {
+	handler  deviceHandler
+	dev      device
+	deviceID uint16
+	features uint64
+}
+
+func (a *deviceHandlerAdapter) DeviceID() uint16 {
+	return a.deviceID
+}
+
+func (a *deviceHandlerAdapter) DeviceFeatures() uint64 {
+	return a.features
+}
+
+func (a *deviceHandlerAdapter) MaxQueues() uint16 {
+	return uint16(a.handler.NumQueues())
+}
+
+func (a *deviceHandlerAdapter) ReadConfig(offset uint16) uint32 {
+	value, handled, _ := a.handler.ReadConfig(a.dev, uint64(offset))
+	if handled {
+		return value
+	}
+	return 0
+}
+
+func (a *deviceHandlerAdapter) WriteConfig(offset uint16, val uint32) {
+	_, _ = a.handler.WriteConfig(a.dev, uint64(offset), val)
+}
+
+func (a *deviceHandlerAdapter) Enable(features uint64, queues []*VirtQueue) {
+	// For deviceHandler, Enable is handled through OnReset and OnQueueNotify
+	// This is a no-op adapter
+}
+
+func (a *deviceHandlerAdapter) Disable() {
+	if a.handler != nil {
+		a.handler.OnReset(a.dev)
+	}
+}
+
 type mmioDevice struct {
 	vm hv.VirtualMachine
 
@@ -97,7 +145,8 @@ type mmioDevice struct {
 	vendorID uint32
 	version  uint32
 
-	handler deviceHandler
+	handler      deviceHandler
+	virtioDevice VirtioDevice // New interface, takes precedence if set
 
 	deviceFeatureSel uint32
 	driverFeatureSel uint32
@@ -106,9 +155,10 @@ type mmioDevice struct {
 	deviceFeatures        []uint32
 	driverFeatures        []uint32
 
-	queueSel        uint32
-	deviceStatus    uint32
-	interruptStatus uint32
+	queueSel         uint32
+	deviceStatus     uint32
+	interruptStatus  uint32
+	configGeneration uint32 // Incremented on config changes
 
 	queues []queue
 }
@@ -154,6 +204,9 @@ func ensureQueueReady(q *queue) error {
 	return nil
 }
 
+// newMMIODevice creates a new MMIO virtio device.
+// It accepts either a deviceHandler (for backward compatibility) or a VirtioDevice.
+// If both are provided, VirtioDevice takes precedence.
 func newMMIODevice(vm hv.VirtualMachine, base uint64, size uint64, irqLine uint32, deviceID, vendorID, version uint32, featureBits []uint64, handler deviceHandler) *mmioDevice {
 	if handler == nil {
 		panic("virtio MMIO device requires a handler")
@@ -175,6 +228,16 @@ func newMMIODevice(vm hv.VirtualMachine, base uint64, size uint64, irqLine uint3
 		handler:  handler,
 	}
 
+	// Create adapter for backward compatibility
+	// deviceHandler and VirtioDevice have conflicting method signatures,
+	// so we always use the adapter
+	device.virtioDevice = &deviceHandlerAdapter{
+		handler:  handler,
+		dev:      device,
+		deviceID: uint16(deviceID),
+		features: 0, // Will be set from featureBits
+	}
+
 	featureWords := len(featureBits)
 	if featureWords == 0 {
 		featureWords = 1
@@ -189,6 +252,14 @@ func newMMIODevice(vm hv.VirtualMachine, base uint64, size uint64, irqLine uint3
 	if len(featureBits) == 0 {
 		device.defaultDeviceFeatures[0] = 0
 		device.defaultDeviceFeatures[1] = 0
+	}
+
+	// Set features in adapter if using one
+	if adapter, ok := device.virtioDevice.(*deviceHandlerAdapter); ok {
+		adapter.features = 0
+		for _, bitset := range featureBits {
+			adapter.features |= bitset
+		}
 	}
 
 	device.deviceFeatures = make([]uint32, len(device.defaultDeviceFeatures))
@@ -256,7 +327,13 @@ func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
 		logAccess("DRIVER_FEATURES")
 		// fmt.Fprintf(os.Stderr, "virtio-mmio: write DRIVER_FEATURES sel=%d val=%#x\n", d.driverFeatureSel, value)
 		if d.driverFeatureSel < uint32(len(d.driverFeatures)) {
+			oldValue := d.driverFeatures[d.driverFeatureSel]
 			d.driverFeatures[d.driverFeatureSel] = value
+			// Increment config generation when features change (feature negotiation)
+			if oldValue != value {
+				d.configGeneration++
+				d.raiseInterrupt(VIRTIO_MMIO_INT_CONFIG)
+			}
 		}
 	case VIRTIO_MMIO_QUEUE_SEL:
 		d.queueSel = value
@@ -285,6 +362,35 @@ func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
 			}
 			// fmt.Fprintf(os.Stderr, "virtio-mmio: queue %d ready size=%d desc=%#x avail=%#x used=%#x\n", d.queueSel, q.size, q.descAddr, q.availAddr, q.usedAddr)
 			q.ready = true
+
+			// Check if all queues are ready and device is enabled, then call Enable()
+			if d.deviceStatus&0x4 != 0 { // FEATURES_OK bit set
+				allReady := true
+				for i := range d.queues {
+					if !d.queues[i].ready {
+						allReady = false
+						break
+					}
+				}
+				if allReady && d.virtioDevice != nil {
+					// Convert negotiated features
+					negotiatedFeatures := uint64(0)
+					for i := range d.driverFeatures {
+						negotiatedFeatures |= uint64(d.driverFeatures[i]) << (32 * uint(i))
+					}
+					// Convert queues to VirtQueue format
+					virtQueues := make([]*VirtQueue, len(d.queues))
+					for i := range d.queues {
+						q := &d.queues[i]
+						vq := NewVirtQueue(d.vm, q.maxSize)
+						vq.SetAddresses(q.descAddr, q.availAddr, q.usedAddr)
+						vq.SetSize(q.size)
+						vq.SetReady(true)
+						virtQueues[i] = vq
+					}
+					d.virtioDevice.Enable(negotiatedFeatures, virtQueues)
+				}
+			}
 		}
 	case VIRTIO_MMIO_QUEUE_DESC_LOW:
 		if q := d.currentQueue(); q != nil {
@@ -318,7 +424,10 @@ func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
 		}
 	case VIRTIO_MMIO_QUEUE_NOTIFY:
 		if d.handler != nil {
-			return d.handler.OnQueueNotify(d, int(value))
+			err := d.handler.OnQueueNotify(d, int(value))
+			// Queue notification doesn't directly set interrupt status,
+			// but the handler may call raiseInterrupt
+			return err
 		}
 	case VIRTIO_MMIO_INTERRUPT_ACK:
 		prev := d.interruptStatus
@@ -338,7 +447,25 @@ func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
 		// If you see this log, your Feature Negotiation (Bit 32) is failing.
 		return nil
 	default:
-		if d.handler != nil {
+		if offset >= VIRTIO_MMIO_CONFIG {
+			// Device-specific config write
+			if d.virtioDevice != nil {
+				relOffset := uint16(offset - VIRTIO_MMIO_CONFIG)
+				d.virtioDevice.WriteConfig(relOffset, value)
+				// Increment config generation on config change
+				d.configGeneration++
+				d.raiseInterrupt(VIRTIO_MMIO_INT_CONFIG)
+			} else if d.handler != nil {
+				handled, err := d.handler.WriteConfig(d, offset, value)
+				if handled {
+					// Increment config generation on config change
+					d.configGeneration++
+					d.raiseInterrupt(VIRTIO_MMIO_INT_CONFIG)
+					return err
+				}
+			}
+			logAccess(fmt.Sprintf("CONFIG_OFFSET_%#x", offset))
+		} else if d.handler != nil {
 			handled, err := d.handler.WriteConfig(d, offset, value)
 			if handled {
 				return err
@@ -443,9 +570,21 @@ func (d *mmioDevice) readRegister(offset uint64) (uint32, error) {
 		// fmt.Fprintf(os.Stderr, "virtio-mmio: read STATUS -> %#x\n", d.deviceStatus)
 		return d.deviceStatus, nil
 	case VIRTIO_MMIO_CONFIG_GENERATION:
-		return 0, nil
+		return d.configGeneration, nil
 	default:
-		if d.handler != nil {
+		if offset >= VIRTIO_MMIO_CONFIG {
+			// Device-specific config read
+			if d.virtioDevice != nil {
+				relOffset := uint16(offset - VIRTIO_MMIO_CONFIG)
+				return d.virtioDevice.ReadConfig(relOffset), nil
+			} else if d.handler != nil {
+				value, handled, err := d.handler.ReadConfig(d, offset)
+				if handled {
+					return value, err
+				}
+			}
+			return 0, nil
+		} else if d.handler != nil {
 			value, handled, err := d.handler.ReadConfig(d, offset)
 			if handled {
 				return value, err
@@ -465,11 +604,14 @@ func (d *mmioDevice) reset() {
 	d.queueSel = 0
 	d.deviceStatus = 0
 	d.interruptStatus = 0
+	d.configGeneration = 0
 	for i := range d.queues {
 		d.queues[i].reset()
 		d.queues[i].maxSize = d.handler.QueueMaxSize(i)
 	}
-	if d.handler != nil {
+	if d.virtioDevice != nil {
+		d.virtioDevice.Disable()
+	} else if d.handler != nil {
 		d.handler.OnReset(d)
 	}
 }

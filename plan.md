@@ -412,8 +412,8 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
   - [x] Add `PutUsedBuffer(idx uint16, len uint32)`
   - [x] Add interrupt suppression (VIRTQ_USED_F_NO_NOTIFY)
 
-- [ ] **Create `internal/devices/virtio/device.go`** - Device interface
-  - [ ] Add `VirtioDevice` interface:
+- [x] **Create `internal/devices/virtio/device.go`** - Device interface
+  - [x] Add `VirtioDevice` interface:
     ```go
     type VirtioDevice interface {
         DeviceID() uint16
@@ -426,11 +426,12 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
     }
     ```
 
-- [ ] **Update `internal/devices/virtio/mmio.go`**
-  - [ ] Factor out common transport logic
-  - [ ] Use new `VirtQueue` abstraction
-  - [ ] Add config generation increment on feature negotiation
-  - [ ] Add interrupt status register (used buffer/config change)
+- [x] **Update `internal/devices/virtio/mmio.go`**
+  - [x] Add adapter to bridge `deviceHandler` to `VirtioDevice` interface
+  - [x] Add config generation increment on feature negotiation
+  - [x] Add interrupt status register (used buffer/config change)
+  - [ ] Factor out common transport logic (deferred - requires PCI implementation)
+  - [ ] Use new `VirtQueue` abstraction throughout (deferred - requires refactoring)
 
 - [ ] **Create `internal/devices/virtio/pci.go`** - PCI transport
   - [ ] Add `VirtioPciDevice` struct
