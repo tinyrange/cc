@@ -265,8 +265,8 @@ func TestUsedRingUpdates(t *testing.T) {
 	queue.SetReady(true)
 
 	// Initialize used ring header (flags + idx)
-	mem.writeUint16(usedRingAddr+0, 0)   // flags
-	mem.writeUint16(usedRingAddr+2, 0)   // idx (initial)
+	mem.writeUint16(usedRingAddr+0, 0) // flags
+	mem.writeUint16(usedRingAddr+2, 0) // idx (initial)
 
 	// Test 1: Basic used buffer write
 	t.Run("BasicUsedBufferWrite", func(t *testing.T) {
@@ -421,8 +421,8 @@ func TestGetAvailableBuffer(t *testing.T) {
 		queue.SetReady(true)
 
 		// Initialize available ring (idx = 0, no entries)
-		mem.writeUint16(availRingAddr+0, 0)   // flags
-		mem.writeUint16(availRingAddr+2, 0)   // idx
+		mem.writeUint16(availRingAddr+0, 0) // flags
+		mem.writeUint16(availRingAddr+2, 0) // idx
 
 		head, hasBuffer, err := queue.GetAvailableBuffer()
 		if err != nil {
@@ -442,9 +442,9 @@ func TestGetAvailableBuffer(t *testing.T) {
 		queue.SetReady(true)
 
 		// Set up available ring with one entry
-		mem.writeUint16(availRingAddr+0, 0)   // flags
-		mem.writeUint16(availRingAddr+2, 1)   // idx = 1 (one entry)
-		mem.writeUint16(availRingAddr+4, 2)   // ring[0] = descriptor index 2
+		mem.writeUint16(availRingAddr+0, 0) // flags
+		mem.writeUint16(availRingAddr+2, 1) // idx = 1 (one entry)
+		mem.writeUint16(availRingAddr+4, 2) // ring[0] = descriptor index 2
 
 		head, hasBuffer, err := queue.GetAvailableBuffer()
 		if err != nil {
@@ -475,11 +475,11 @@ func TestGetAvailableBuffer(t *testing.T) {
 		queue.SetReady(true)
 
 		// Set up available ring with 3 entries
-		mem.writeUint16(availRingAddr+0, 0)   // flags
-		mem.writeUint16(availRingAddr+2, 3)   // idx = 3
-		mem.writeUint16(availRingAddr+4, 0)   // ring[0] = 0
-		mem.writeUint16(availRingAddr+6, 1)   // ring[1] = 1
-		mem.writeUint16(availRingAddr+8, 2)   // ring[2] = 2
+		mem.writeUint16(availRingAddr+0, 0) // flags
+		mem.writeUint16(availRingAddr+2, 3) // idx = 3
+		mem.writeUint16(availRingAddr+4, 0) // ring[0] = 0
+		mem.writeUint16(availRingAddr+6, 1) // ring[1] = 1
+		mem.writeUint16(availRingAddr+8, 2) // ring[2] = 2
 
 		// Read all buffers
 		expectedHeads := []uint16{0, 1, 2}
@@ -515,10 +515,10 @@ func TestGetAvailableBuffer(t *testing.T) {
 
 		// Simulate: lastAvailIdx = 2, availIdx = 4 (wrapped)
 		// This means entries at ring indices 0 and 1 are available
-		mem.writeUint16(availRingAddr+0, 0)   // flags
-		mem.writeUint16(availRingAddr+2, 4)   // idx = 4
-		mem.writeUint16(availRingAddr+4, 5)   // ring[0] = 5
-		mem.writeUint16(availRingAddr+6, 6)   // ring[1] = 6
+		mem.writeUint16(availRingAddr+0, 0) // flags
+		mem.writeUint16(availRingAddr+2, 4) // idx = 4
+		mem.writeUint16(availRingAddr+4, 5) // ring[0] = 5
+		mem.writeUint16(availRingAddr+6, 6) // ring[1] = 6
 
 		// Manually set lastAvailIdx to 2
 		queue.Reset()
@@ -618,13 +618,13 @@ func TestFeatureNegotiation(t *testing.T) {
 
 // mockVirtioDevice implements VirtioDevice for testing
 type mockVirtioDevice struct {
-	deviceID       uint16
-	features       uint64
-	maxQueues      uint16
-	configSpace    map[uint16]uint32
-	enabled        bool
+	deviceID        uint16
+	features        uint64
+	maxQueues       uint16
+	configSpace     map[uint16]uint32
+	enabled         bool
 	enabledFeatures uint64
-	enabledQueues  []*VirtQueue
+	enabledQueues   []*VirtQueue
 }
 
 func (m *mockVirtioDevice) DeviceID() uint16 {
@@ -759,4 +759,3 @@ func TestQueueStateManagement(t *testing.T) {
 		t.Fatalf("expected desc table addr 0 after reset, got 0x%x", queue.DescTableAddr)
 	}
 }
-
