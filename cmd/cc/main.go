@@ -38,7 +38,6 @@ func main() {
 }
 
 func run() error {
-	arch := flag.String("arch", runtime.GOARCH, "Target architecture (amd64, arm64)")
 	cacheDir := flag.String("cache-dir", "", "Cache directory (default: ~/.config/cc/)")
 	cpus := flag.Int("cpus", 1, "Number of vCPUs")
 	memory := flag.Uint64("memory", 2048, "Memory in MB")
@@ -53,7 +52,6 @@ func run() error {
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  %s alpine:latest /bin/sh -c 'echo hello'\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s ubuntu:22.04 ls -la\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s --arch arm64 alpine:latest uname -m\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		flag.PrintDefaults()
 	}
@@ -104,7 +102,7 @@ func run() error {
 	}
 
 	// Determine target architecture
-	hvArch, err := parseArchitecture(*arch)
+	hvArch, err := parseArchitecture(runtime.GOARCH)
 	if err != nil {
 		return err
 	}
@@ -115,10 +113,10 @@ func run() error {
 		return fmt.Errorf("create OCI client: %w", err)
 	}
 
-	slog.Debug("Pulling image", "ref", imageRef, "arch", *arch)
+	slog.Debug("Pulling image", "ref", imageRef, "arch", hvArch)
 
 	// Pull image
-	img, err := client.PullForArch(imageRef, *arch)
+	img, err := client.PullForArch(imageRef, hvArch)
 	if err != nil {
 		return fmt.Errorf("pull image: %w", err)
 	}
@@ -269,41 +267,6 @@ func run() error {
 					regs[hv.RegisterAMD64Rflags],
 				)
 
-				pc, err := vm.DumpStackTrace(vcpu)
-				if err != nil {
-					return fmt.Errorf("dump stack trace: %w", err)
-				}
-
-				// Dump a hexdump of RIP to RIP+128 bytes
-				mem := make([]byte, 128)
-				if _, err := vcpu.VirtualMachine().ReadAt(mem, pc); err != nil {
-					return fmt.Errorf("read memory at RIP: %w", err)
-				}
-				func(mem []byte) {
-					const bytesPerLine = 16
-					for i := 0; i < len(mem); i += bytesPerLine {
-						lineEnd := min(i+bytesPerLine, len(mem))
-						line := mem[i:lineEnd]
-						fmt.Fprintf(os.Stderr, "  %016x: ", uint64(pc)+uint64(i))
-						for j := range bytesPerLine {
-							if j < len(line) {
-								fmt.Fprintf(os.Stderr, "%02x ", line[j])
-							} else {
-								fmt.Fprintf(os.Stderr, "   ")
-							}
-						}
-						fmt.Fprintf(os.Stderr, " ")
-						for _, b := range line {
-							if b >= 32 && b <= 126 {
-								fmt.Fprintf(os.Stderr, "%c", b)
-							} else {
-								fmt.Fprintf(os.Stderr, ".")
-							}
-						}
-						fmt.Fprintf(os.Stderr, "\n")
-					}
-				}(mem)
-
 				// Get the trace buffer
 				if debug, ok := vcpu.(hv.VirtualCPUDebug); ok {
 					trace, err := debug.GetTraceBuffer()
@@ -412,7 +375,7 @@ func lookPath(fs *oci.ContainerFS, pathEnv string, workDir string, file string) 
 		workDir = "/"
 	}
 
-	for _, dir := range strings.Split(pathEnv, ":") {
+	for dir := range strings.SplitSeq(pathEnv, ":") {
 		switch {
 		case dir == "":
 			dir = workDir

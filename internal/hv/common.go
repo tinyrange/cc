@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 )
 
 var (
@@ -24,6 +25,17 @@ const (
 	ArchitectureARM64   CpuArchitecture = "arm64"
 	ArchitectureRISCV64 CpuArchitecture = "riscv64"
 )
+
+var ArchitectureNative CpuArchitecture
+
+func init() {
+	switch runtime.GOARCH {
+	case "amd64":
+		ArchitectureNative = ArchitectureX86_64
+	case "arm64":
+		ArchitectureNative = ArchitectureARM64
+	}
+}
 
 type RegisterValue interface {
 	isRegisterValue()

@@ -87,6 +87,9 @@ func NewNet(vm hv.VirtualMachine, base uint64, size uint64, irqLine uint32, mac 
 		backend = &discardNetBackend{}
 	}
 	netdev := &Net{
+		device:  nil, // Will be set below
+		base:    base,
+		size:    size,
 		mac:     append(net.HardwareAddr(nil), mac...),
 		backend: backend,
 		linkUp:  true,
