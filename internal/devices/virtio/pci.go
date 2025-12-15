@@ -66,8 +66,8 @@ const invalidBARIndex = -1
 
 const (
 	msiControl64BitCap        = uint16(1 << 7)
-	pciStatusCapabilitiesList  = 0x10
-	pciCapIDMSIX               = 0x11
+	pciStatusCapabilitiesList = 0x10
+	pciCapIDMSIX              = 0x11
 )
 
 const (
@@ -2014,4 +2014,3 @@ func (d *VirtioPCIDevice) reset() {
 		d.handler.OnReset(d)
 	}
 }
-

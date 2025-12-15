@@ -44,4 +44,3 @@ type VirtioDevice interface {
 	// The device should clean up its state and stop processing requests.
 	Disable()
 }
-
