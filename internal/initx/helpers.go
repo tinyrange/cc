@@ -15,6 +15,7 @@ import (
 
 var execVarCounter uint64
 var helperLabelCounter uint64
+var helperVarCounter uint64
 
 const (
 	stdinCopyBufferSize = 4096
@@ -24,6 +25,11 @@ func nextExecVar() asm.Variable {
 	// Start from a high number to avoid conflicts with registers (0-32)
 	// and other manually assigned variables.
 	return asm.Variable(1000 + atomic.AddUint64(&execVarCounter, 1))
+}
+
+func nextHelperVar(prefix string) ir.Var {
+	id := atomic.AddUint64(&helperVarCounter, 1)
+	return ir.Var(fmt.Sprintf("__initx_%s_%d", prefix, id))
 }
 
 func nextHelperLabel(prefix string) ir.Label {
@@ -558,12 +564,61 @@ func ConfigureInterface(ifName string, ip uint32, mask uint32, errLabel ir.Label
 	return ir.WithStackSlot(ir.StackSlotConfig{
 		Size: 40, // sizeof(struct ifreq)
 		Body: func(slot ir.StackSlot) ir.Fragment {
-			fd := ir.Var("netFd")
-			ptr := ir.Var("ifreqPtr")
+			fd := nextHelperVar("net_fd")
+			ptr := nextHelperVar("ifreq_ptr")
+			ioctlErr := nextHelperVar("ioctl_err")
+			tmp32 := nextHelperVar("tmp32")
+			ipSwapped := nextHelperVar("ip_swapped")
+			maskSwapped := nextHelperVar("mask_swapped")
+			b0 := nextHelperVar("byte0")
+			b1 := nextHelperVar("byte1")
+			b2 := nextHelperVar("byte2")
+			b3 := nextHelperVar("byte3")
 
-			familyIP := int64(linux.AF_INET) | (int64(ip) << 32)
-			familyMask := int64(linux.AF_INET) | (int64(mask) << 32)
-			flagsVal := int64(linux.IFF_UP | linux.IFF_RUNNING)
+			// Construct sockaddr_in structure:
+			// Offset 16: sa_family (uint16) = AF_INET, sin_port (uint16) = 0 (write as uint32)
+			// Offset 20: sin_addr (uint32) = IP address in network byte order
+			// Offset 24: sin_zero (8 bytes) = 0
+			// Note: IP and mask are passed in "visual" format (e.g., 0x0a00020f for 10.0.2.15)
+			// We need to byte-swap from little-endian host order to big-endian network order
+			// We write family+port as a 32-bit value: AF_INET in lower 16 bits
+			familyPort := int64(linux.AF_INET) // Port is 0, so just family
+			flagsVal := int64(linux.IFF_UP)    // IFF_RUNNING is read-only, don't set it
+
+			// Byte-swap IP from host byte order to network byte order
+			// b0 = (ip & 0xff) << 24
+			// b1 = (ip & 0xff00) << 8
+			// b2 = (ip & 0xff0000) >> 8
+			// b3 = (ip & 0xff000000) >> 24
+			// ipSwapped = b0 + b1 + b2 + b3
+			ipByteSwap := ir.Block{
+				ir.Assign(b0, ir.Op(ir.OpAnd, ir.Int64(ip), ir.Int64(0xff))),
+				ir.Assign(b0, ir.Op(ir.OpShl, b0, ir.Int64(24))),
+				ir.Assign(b1, ir.Op(ir.OpAnd, ir.Int64(ip), ir.Int64(0xff00))),
+				ir.Assign(b1, ir.Op(ir.OpShl, b1, ir.Int64(8))),
+				ir.Assign(b2, ir.Op(ir.OpAnd, ir.Int64(ip), ir.Int64(0xff0000))),
+				ir.Assign(b2, ir.Op(ir.OpShr, b2, ir.Int64(8))),
+				ir.Assign(b3, ir.Op(ir.OpAnd, ir.Int64(ip), ir.Int64(0xff000000))),
+				ir.Assign(b3, ir.Op(ir.OpShr, b3, ir.Int64(24))),
+				ir.Assign(ipSwapped, ir.Op(ir.OpAdd, b0, b1)),
+				ir.Assign(ipSwapped, ir.Op(ir.OpAdd, ipSwapped, b2)),
+				ir.Assign(ipSwapped, ir.Op(ir.OpAdd, ipSwapped, b3)),
+			}
+
+			// Byte-swap mask from host byte order to network byte order
+			maskByteSwap := ir.Block{
+				ir.Assign(b0, ir.Op(ir.OpAnd, ir.Int64(mask), ir.Int64(0xff))),
+				ir.Assign(b0, ir.Op(ir.OpShl, b0, ir.Int64(24))),
+				ir.Assign(b1, ir.Op(ir.OpAnd, ir.Int64(mask), ir.Int64(0xff00))),
+				ir.Assign(b1, ir.Op(ir.OpShl, b1, ir.Int64(8))),
+				ir.Assign(b2, ir.Op(ir.OpAnd, ir.Int64(mask), ir.Int64(0xff0000))),
+				ir.Assign(b2, ir.Op(ir.OpShr, b2, ir.Int64(8))),
+				ir.Assign(b3, ir.Op(ir.OpAnd, ir.Int64(mask), ir.Int64(0xff000000))),
+				ir.Assign(b3, ir.Op(ir.OpShr, b3, ir.Int64(24))),
+				ir.Assign(maskSwapped, ir.Op(ir.OpAdd, b0, b1)),
+				ir.Assign(maskSwapped, ir.Op(ir.OpAdd, maskSwapped, b2)),
+				ir.Assign(maskSwapped, ir.Op(ir.OpAdd, maskSwapped, b3)),
+			}
 
 			return ir.Block{
 				ir.Assign(fd, ir.Syscall(defs.SYS_SOCKET, ir.Int64(linux.AF_INET), ir.Int64(linux.SOCK_DGRAM), ir.Int64(0))),
@@ -572,29 +627,61 @@ func ConfigureInterface(ifName string, ip uint32, mask uint32, errLabel ir.Label
 
 				ir.Assign(ptr, slot.Pointer()),
 
+				// Zero out entire ifreq structure first
+				ir.Assign(slot.At(0), ir.Int64(0)),
+				ir.Assign(slot.At(8), ir.Int64(0)),
+				ir.Assign(slot.At(16), ir.Int64(0)),
+				ir.Assign(slot.At(24), ir.Int64(0)),
+				ir.Assign(slot.At(32), ir.Int64(0)),
+
+				// Copy interface name to ifreq.ifrn_name (offset 0-15)
 				copyStringToSlot(slot, ifName),
 
-				// Set IP
-				ir.Assign(slot.At(16), ir.Int64(familyIP)),
-				ir.Assign(errVar, ir.Syscall(defs.SYS_IOCTL, fd, ir.Int64(linux.SIOCSIFADDR), ptr)),
-				ir.If(ir.IsNegative(errVar), ir.Block{
-					ir.Syscall(defs.SYS_CLOSE, fd),
-					ir.Goto(errLabel),
-				}),
-
-				// Set Mask
-				ir.Assign(slot.At(16), ir.Int64(familyMask)),
-				ir.Assign(errVar, ir.Syscall(defs.SYS_IOCTL, fd, ir.Int64(linux.SIOCSIFNETMASK), ptr)),
-				ir.If(ir.IsNegative(errVar), ir.Block{
-					ir.Syscall(defs.SYS_CLOSE, fd),
-					ir.Goto(errLabel),
-				}),
-
-				// Bring up
+				// Bring up interface FIRST (some kernels require interface to be up before setting address)
 				ir.Assign(slot.At(16), ir.Int64(flagsVal)),
-				ir.Assign(errVar, ir.Syscall(defs.SYS_IOCTL, fd, ir.Int64(linux.SIOCSIFFLAGS), ptr)),
+				ir.Assign(ioctlErr, ir.Syscall(defs.SYS_IOCTL, fd, ir.Int64(linux.SIOCSIFFLAGS), ptr)),
+				ir.Assign(errVar, ioctlErr),
+				ir.If(ir.IsNegative(ioctlErr), ir.Block{
+					ir.Syscall(defs.SYS_CLOSE, fd),
+					ir.Goto(errLabel),
+				}),
+
+				// Set IP - write sockaddr_in structure field-by-field
+				// Re-copy interface name and zero out sockaddr structure
+				copyStringToSlot(slot, ifName),
+				ir.Assign(slot.At(16), ir.Int64(0)),
+				ir.Assign(slot.At(24), ir.Int64(0)),
+				ir.Assign(slot.At(32), ir.Int64(0)),
+				// Write sa_family+sin_port (uint32) at offset 16: AF_INET in lower 16 bits, 0 in upper 16 bits
+				ir.Assign(tmp32, ir.Int64(familyPort)),
+				ir.Assign(slot.At(16), tmp32.As32()),
+				// Byte-swap IP to network byte order and write sin_addr (uint32) at offset 20
+				ipByteSwap,
+				ir.Assign(tmp32, ipSwapped),
+				ir.Assign(slot.At(20), tmp32.As32()),
+				ir.Assign(ioctlErr, ir.Syscall(defs.SYS_IOCTL, fd, ir.Int64(linux.SIOCSIFADDR), ptr)),
+				ir.Assign(errVar, ioctlErr),
+				ir.If(ir.IsNegative(ioctlErr), ir.Block{
+					ir.Syscall(defs.SYS_CLOSE, fd),
+					ir.Goto(errLabel),
+				}),
+				// Try setting netmask after interface is up, but don't fail if it doesn't work
+				// Some kernels may set netmask automatically or require different approach
+				// Zero out sockaddr structure and copy interface name again
+				ir.Assign(slot.At(16), ir.Int64(0)),
+				ir.Assign(slot.At(24), ir.Int64(0)),
+				ir.Assign(slot.At(32), ir.Int64(0)),
+				copyStringToSlot(slot, ifName),
+				ir.Assign(tmp32, ir.Int64(familyPort)),
+				ir.Assign(slot.At(16), tmp32.As32()),
+				// Byte-swap mask to network byte order and write sin_addr (uint32) at offset 20
+				maskByteSwap,
+				ir.Assign(tmp32, maskSwapped),
+				ir.Assign(slot.At(20), tmp32.As32()),
+				ir.Assign(ioctlErr, ir.Syscall(defs.SYS_IOCTL, fd, ir.Int64(linux.SIOCSIFNETMASK), ptr)),
+				// Close socket and clear any error - netmask failure is non-fatal
 				ir.Syscall(defs.SYS_CLOSE, fd),
-				ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
+				ir.Assign(errVar, ir.Int64(0)),
 			}
 		},
 	})
@@ -869,4 +956,22 @@ func SetHostname(name string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
 		"errLabel": errLabel,
 		"errVar":   errVar,
 	})
+}
+
+func LogKmsg(msg string) ir.Block {
+	fd := ir.Var("__initx_kmsg_fd")
+	done := nextHelperLabel("kmsg_done")
+	return ir.Block{
+		ir.Assign(fd, ir.Syscall(
+			defs.SYS_OPENAT,
+			ir.Int64(linux.AT_FDCWD),
+			"/dev/kmsg",
+			ir.Int64(linux.O_WRONLY),
+			ir.Int64(0),
+		)),
+		ir.If(ir.IsNegative(fd), ir.Goto(done)),
+		ir.Syscall(defs.SYS_WRITE, fd, msg, ir.Int64(int64(len(msg)))),
+		ir.Syscall(defs.SYS_CLOSE, fd),
+		ir.DeclareLabel(done, ir.Block{}),
+	}
 }

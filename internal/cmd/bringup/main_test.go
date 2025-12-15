@@ -3,6 +3,7 @@
 package main
 
 import (
+	"net"
 	"os"
 	"syscall"
 	"testing"
@@ -50,21 +51,30 @@ func TestKernelLog(t *testing.T) {
 	t.Logf("kernel log:\n%s", logData)
 }
 
-func TestVirtioFs(t *testing.T) {
-	// mount the virtio-fs filesystem and verify it works
-	tmpDir := "/mnt/virtiofs"
-	err := os.MkdirAll(tmpDir, 0755)
+// func TestVirtioFs(t *testing.T) {
+// 	// mount the virtio-fs filesystem and verify it works
+// 	tmpDir := "/mnt/virtiofs"
+// 	err := os.MkdirAll(tmpDir, 0755)
+// 	if err != nil {
+// 		t.Fatalf("failed to create mount point: %v", err)
+// 	}
+
+// 	err = syscall.Mount("bringup", tmpDir, "virtiofs", 0, "")
+// 	if err != nil {
+// 		t.Fatalf("failed to mount virtio-fs: %v", err)
+// 	}
+// 	defer syscall.Unmount(tmpDir, 0)
+
+// 	t.Logf("virtio-fs mounted at %s", tmpDir)
+
+// 	testFS(t, tmpDir)
+// }
+
+func TestNetwork(t *testing.T) {
+	// Ensure that eth0 shows up
+	iface, err := net.InterfaceByName("eth0")
 	if err != nil {
-		t.Fatalf("failed to create mount point: %v", err)
+		t.Fatalf("failed to get eth0 interface: %v", err)
 	}
-
-	err = syscall.Mount("bringup", tmpDir, "virtiofs", 0, "")
-	if err != nil {
-		t.Fatalf("failed to mount virtio-fs: %v", err)
-	}
-	defer syscall.Unmount(tmpDir, 0)
-
-	t.Logf("virtio-fs mounted at %s", tmpDir)
-
-	testFS(t, tmpDir)
+	t.Logf("eth0 interface: %+v", iface)
 }

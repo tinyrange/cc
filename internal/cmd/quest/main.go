@@ -1937,6 +1937,11 @@ func RunExecutable(path string) error {
 			Backend: vfs.NewVirtioFsBackend(),
 			Arch:    hv.Architecture(),
 		}),
+		initx.WithDeviceTemplate(virtio.NetTemplate{
+			Backend: nil, // Use discard backend for now
+			MAC:     nil, // Auto-generate MAC
+			Arch:    hv.Architecture(),
+		}),
 	)
 	if err != nil {
 		return fmt.Errorf("create initx virtual machine: %w", err)

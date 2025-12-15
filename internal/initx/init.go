@@ -80,24 +80,6 @@ func rebootOnError(val ir.Var, msg string) ir.Block {
 	}
 }
 
-func logKmsg(msg string) ir.Block {
-	fd := ir.Var("__initx_kmsg_fd")
-	done := nextHelperLabel("kmsg_done")
-	return ir.Block{
-		ir.Assign(fd, ir.Syscall(
-			defs.SYS_OPENAT,
-			ir.Int64(linux.AT_FDCWD),
-			"/dev/kmsg",
-			ir.Int64(linux.O_WRONLY),
-			ir.Int64(0),
-		)),
-		ir.If(ir.IsNegative(fd), ir.Goto(done)),
-		ir.Syscall(defs.SYS_WRITE, fd, msg, ir.Int64(int64(len(msg)))),
-		ir.Syscall(defs.SYS_CLOSE, fd),
-		ir.DeclareLabel(done, ir.Block{}),
-	}
-}
-
 func Build(cfg BuilderConfig) (*ir.Program, error) {
 	var preloads ir.Block
 	moduleParamArg := any(ir.Int64(0))
@@ -126,7 +108,7 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 				Pointer: dataPtr,
 				Length:  dataLen,
 			}),
-			logKmsg(fmt.Sprintf("initx: loading module %s\n", mod.Name)),
+			LogKmsg(fmt.Sprintf("initx: loading module %s\n", mod.Name)),
 			ir.Assign(resultVar, ir.Syscall(
 				defs.SYS_INIT_MODULE,
 				dataPtr,
@@ -134,7 +116,7 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 				moduleParamArg,
 			)),
 			rebootOnError(resultVar, fmt.Sprintf("initx: failed to load module %s (errno=0x%%x)\n", mod.Name)),
-			logKmsg(fmt.Sprintf("initx: module %s ready\n", mod.Name)),
+			LogKmsg(fmt.Sprintf("initx: module %s ready\n", mod.Name)),
 		})
 	}
 
@@ -180,7 +162,7 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 			}),
 		}),
 
-		logKmsg("initx: dev tmpfs ready\n"),
+		LogKmsg("initx: dev tmpfs ready\n"),
 
 		preloads,
 
@@ -244,12 +226,12 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 		ir.Syscall(defs.SYS_DUP3, ir.Var("consoleFd"), ir.Int64(0), ir.Int64(0)),
 		ir.Syscall(defs.SYS_DUP3, ir.Var("consoleFd"), ir.Int64(1), ir.Int64(0)),
 		ir.Syscall(defs.SYS_DUP3, ir.Var("consoleFd"), ir.Int64(2), ir.Int64(0)),
-		logKmsg("initx: console ready\n"),
+		LogKmsg("initx: console ready\n"),
 
 		// open /dev/mem
 		openFile(ir.Var("memFd"), "/dev/mem", linux.O_RDWR|linux.O_SYNC),
 		rebootOnError(ir.Var("memFd"), "initx: failed to open /dev/mem (errno=0x%x)\n"),
-		logKmsg("initx: opened /dev/mem\n"),
+		LogKmsg("initx: opened /dev/mem\n"),
 
 		// map mailbox region
 		mmapFile(
@@ -261,7 +243,7 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 			ir.Int64(0xf000_0000),
 		),
 		rebootOnError(ir.Var("mailboxMem"), "initx: failed to map mailbox region (errno=0x%x)\n"),
-		logKmsg("initx: mapped mailbox\n"),
+		LogKmsg("initx: mapped mailbox\n"),
 
 		// map config region
 		mmapFile(
@@ -273,7 +255,7 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 			ir.Int64(0xf000_3000),
 		),
 		rebootOnError(ir.Var("configMem"), "initx: failed to map config region (errno=0x%x)\n"),
-		logKmsg("initx: mapped config region\n"),
+		LogKmsg("initx: mapped config region\n"),
 
 		// map anon a 4MB region r/w/x for copying binaries into
 		mmapFile(
@@ -285,10 +267,10 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 			ir.Int64(0),
 		),
 		rebootOnError(ir.Var("anonMem"), "initx: failed to map anonymous payload region (errno=0x%x)\n"),
-		logKmsg("initx: mapped anon payload region\n"),
+		LogKmsg("initx: mapped anon payload region\n"),
 
 		ir.DeclareLabel("loop", ir.Block{
-			logKmsg("initx: entering main loop\n"),
+			LogKmsg("initx: entering main loop\n"),
 			// read uint32(configMem[0]) and compare to config header magic. If not equal print a error (magic value not found) and power off.
 			ir.If(ir.IsEqual(
 				ir.Var("configMem").Mem().As32(),
@@ -299,7 +281,7 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 				ir.Assign(ir.Var("relocBytes"), ir.Op(ir.OpShl, ir.Var("relocCount"), int64(2))),
 				ir.Assign(ir.Var("codeOffset"), ir.Op(ir.OpAdd, ir.Int64(configHeaderSize), ir.Var("relocBytes"))),
 
-				logKmsg("initx: loading payload\n"),
+				LogKmsg("initx: loading payload\n"),
 
 				// copy binary payload from configMem+codeOffset to anonMem
 				ir.Assign(ir.Var("copySrc"), ir.Op(ir.OpAdd, ir.Var("configMem"), ir.Var("codeOffset"))),
@@ -332,7 +314,7 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 				}),
 				ir.DeclareLabel("copy_done", ir.Block{}),
 
-				logKmsg("initx: applying relocations\n"),
+				LogKmsg("initx: applying relocations\n"),
 
 				// apply relocations
 				ir.Assign(ir.Var("relocPtr"), ir.Op(ir.OpAdd, ir.Var("configMem"), ir.Int64(configHeaderSize))),
@@ -355,12 +337,12 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 				}),
 				ir.DeclareLabel("reloc_done", ir.Block{}),
 
-				logKmsg("initx: jumping to payload\n"),
+				LogKmsg("initx: jumping to payload\n"),
 
 				// call anonMem
 				ir.Call(ir.Var("anonMem"), ir.Var("payloadResult")),
 
-				logKmsg("initx: payload returned, yielding to host\n"),
+				LogKmsg("initx: payload returned, yielding to host\n"),
 
 				// publish return code for host-side exit propagation
 				ir.Assign(
