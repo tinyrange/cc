@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -135,6 +136,11 @@ func (c *Client) Pull(imageRef string) (*Image, error) {
 
 // PullForArch downloads an OCI image for a specific architecture.
 func (c *Client) PullForArch(imageRef, arch string) (*Image, error) {
+	// Check if this is a local tar file
+	if IsLocalTar(imageRef) {
+		return c.LoadFromTar(imageRef, arch)
+	}
+
 	registry, imageName, tag, err := ParseImageRef(imageRef)
 	if err != nil {
 		return nil, fmt.Errorf("parse image ref %q: %w", imageRef, err)
@@ -555,4 +561,246 @@ func parseUser(value string) (string, *int, *int) {
 	}
 
 	return user, uidPtr, gidPtr
+}
+
+// dockerManifestEntry represents an entry in Docker's manifest.json
+type dockerManifestEntry struct {
+	Config       string                       `json:"Config"`
+	RepoTags     []string                     `json:"RepoTags"`
+	Layers       []string                     `json:"Layers"`
+	LayerSources map[string]dockerLayerSource `json:"LayerSources,omitempty"`
+}
+
+// dockerLayerSource contains metadata about a layer
+type dockerLayerSource struct {
+	MediaType string `json:"mediaType"`
+	Size      int64  `json:"size"`
+	Digest    string `json:"digest"`
+}
+
+// LoadFromTar loads a Docker image from a tar archive created by `docker save`.
+func (c *Client) LoadFromTar(tarPath, arch string) (*Image, error) {
+	ociArch, err := toOciArchitecture(arch)
+	if err != nil {
+		return nil, err
+	}
+
+	// Resolve the tar path
+	if strings.HasPrefix(tarPath, "./") {
+		wd, err := os.Getwd()
+		if err != nil {
+			return nil, fmt.Errorf("get working directory: %w", err)
+		}
+		tarPath = filepath.Join(wd, tarPath[2:])
+	}
+	tarPath, err = filepath.Abs(tarPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve tar path: %w", err)
+	}
+
+	// Create output directory for this image
+	imageHash := sanitizeForFilename(tarPath)
+	outputDir := filepath.Join(c.cacheDir, "images", imageHash)
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create output directory: %w", err)
+	}
+
+	// Check if already cached
+	configPath := filepath.Join(outputDir, "config.json")
+	if _, err := os.Stat(configPath); err == nil {
+		return c.loadCachedImage(outputDir)
+	}
+
+	// Open the tar file
+	tarFile, err := os.Open(tarPath)
+	if err != nil {
+		return nil, fmt.Errorf("open tar file %s: %w", tarPath, err)
+	}
+	defer tarFile.Close()
+
+	tr := tar.NewReader(tarFile)
+
+	// Read manifest.json
+	var manifestEntries []dockerManifestEntry
+	var manifestData []byte
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read tar header: %w", err)
+		}
+
+		if hdr.Name == "manifest.json" {
+			manifestData, err = io.ReadAll(tr)
+			if err != nil {
+				return nil, fmt.Errorf("read manifest.json: %w", err)
+			}
+			if err := json.Unmarshal(manifestData, &manifestEntries); err != nil {
+				return nil, fmt.Errorf("parse manifest.json: %w", err)
+			}
+			break
+		}
+	}
+
+	if len(manifestEntries) == 0 {
+		return nil, fmt.Errorf("no images found in tar archive")
+	}
+
+	// Use the first image entry
+	entry := manifestEntries[0]
+
+	// Reopen tar to read image config and layers
+	tarFile.Close()
+	tarFile, err = os.Open(tarPath)
+	if err != nil {
+		return nil, fmt.Errorf("reopen tar file: %w", err)
+	}
+	defer tarFile.Close()
+
+	tr = tar.NewReader(tarFile)
+
+	// Read image config (json file)
+	var imageCfg imageConfig
+	var configRead bool
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read tar header: %w", err)
+		}
+
+		if hdr.Name == entry.Config {
+			if err := json.NewDecoder(tr).Decode(&imageCfg); err != nil {
+				return nil, fmt.Errorf("decode image config: %w", err)
+			}
+			configRead = true
+			break
+		}
+	}
+
+	if !configRead {
+		return nil, fmt.Errorf("image config %s not found in tar", entry.Config)
+	}
+
+	// Check architecture match
+	if imageCfg.Architecture != "" && imageCfg.Architecture != ociArch {
+		return nil, fmt.Errorf("architecture mismatch: tar has %s, requested %s", imageCfg.Architecture, ociArch)
+	}
+
+	// Build runtime config
+	var cfg RuntimeConfig
+	populateRuntimeConfig(&cfg, imageCfg)
+
+	// Process layers
+	img := &Image{
+		Dir: outputDir,
+	}
+
+	// Reopen tar again to read layers
+	tarFile.Close()
+	tarFile, err = os.Open(tarPath)
+	if err != nil {
+		return nil, fmt.Errorf("reopen tar file for layers: %w", err)
+	}
+	defer tarFile.Close()
+
+	tr = tar.NewReader(tarFile)
+
+	// Map layer paths to their data
+	layerData := make(map[string][]byte)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read tar header: %w", err)
+		}
+
+		// Check if this is a layer file
+		for _, layerPath := range entry.Layers {
+			if hdr.Name == layerPath {
+				data, err := io.ReadAll(tr)
+				if err != nil {
+					return nil, fmt.Errorf("read layer %s: %w", layerPath, err)
+				}
+				layerData[layerPath] = data
+				break
+			}
+		}
+	}
+
+	// Process each layer
+	for i, layerPath := range entry.Layers {
+		data, ok := layerData[layerPath]
+		if !ok {
+			return nil, fmt.Errorf("layer %s not found in tar", layerPath)
+		}
+
+		// Determine compression from LayerSources if available
+		compression := "gzip" // default to gzip for older format
+		if entry.LayerSources != nil {
+			// Extract digest from layer path (format: blobs/sha256/<hash>)
+			layerHash := strings.TrimPrefix(layerPath, "blobs/sha256/")
+			if layerSource, ok := entry.LayerSources["sha256:"+layerHash]; ok {
+				compressionType, err := compressionFromMediaType(layerSource.MediaType)
+				if err == nil {
+					compression = compressionType
+				}
+			}
+		}
+
+		// Generate a hash for this layer
+		hash := fmt.Sprintf("sha256:%x", sha256.Sum256(data))
+		hashPrefix := strings.TrimPrefix(hash, "sha256:")
+
+		cfg.Layers = append(cfg.Layers, hash)
+
+		indexPath := filepath.Join(outputDir, hashPrefix+".idx")
+		contentsPath := filepath.Join(outputDir, hashPrefix+".contents")
+
+		// Check if layer already processed
+		if _, err := os.Stat(indexPath); err == nil {
+			img.Layers = append(img.Layers, ImageLayer{
+				Hash:         hash,
+				IndexPath:    indexPath,
+				ContentsPath: contentsPath,
+			})
+			continue
+		}
+
+		// Process layer tar
+		layerReader := bytes.NewReader(data)
+		if err := makeLayerFromTar(hashPrefix, layerReader, compression, outputDir); err != nil {
+			return nil, fmt.Errorf("process layer %d (%s): %w", i, layerPath, err)
+		}
+
+		img.Layers = append(img.Layers, ImageLayer{
+			Hash:         hash,
+			IndexPath:    indexPath,
+			ContentsPath: contentsPath,
+		})
+	}
+
+	img.Config = cfg
+
+	// Write config.json
+	f, err := os.Create(configPath)
+	if err != nil {
+		return nil, fmt.Errorf("create config file: %w", err)
+	}
+	defer f.Close()
+
+	encoder := json.NewEncoder(f)
+	encoder.SetIndent("", "  ")
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(cfg); err != nil {
+		return nil, fmt.Errorf("encode config: %w", err)
+	}
+
+	return img, nil
 }

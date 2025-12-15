@@ -279,6 +279,11 @@ func (c *Client) readJSON(ctx *registryContext, path string, accept []string, ou
 	return cachePath, nil
 }
 
+// IsLocalTar checks if the image reference is a local tar file.
+func IsLocalTar(imageRef string) bool {
+	return strings.HasPrefix(imageRef, "./") || strings.HasSuffix(imageRef, ".tar")
+}
+
 // ParseImageRef parses an OCI image reference into registry, image, and tag.
 func ParseImageRef(imageRef string) (registry string, image string, tag string, err error) {
 	image, tag, ok := strings.Cut(imageRef, ":")

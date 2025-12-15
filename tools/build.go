@@ -271,6 +271,7 @@ func main() {
 	bringup := fs.Bool("bringup", false, "build and execute the bringup tool inside a linux VM")
 	remote := fs.String("remote", "", "run quest/bringup on remote host alias from local/remotes.json")
 	run := fs.Bool("run", false, "run the built cc tool after building")
+	runtest := fs.String("runtest", "", "build a Dockerfile in tests/<name>/Dockerfile and run it using cc (Linux only)")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
@@ -482,6 +483,75 @@ func main() {
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
+			os.Exit(1)
+		}
+
+		return
+	}
+
+	if *runtest != "" {
+		if runtime.GOOS != "linux" {
+			fmt.Fprintf(os.Stderr, "-runtest is only supported on Linux hosts\n")
+			os.Exit(1)
+		}
+
+		testName := *runtest
+		dockerfilePath := filepath.Join("tests", testName, "Dockerfile")
+		if _, err := os.Stat(dockerfilePath); err != nil {
+			fmt.Fprintf(os.Stderr, "Dockerfile not found: %s\n", dockerfilePath)
+			os.Exit(1)
+		}
+
+		// Build cc first
+		ccOut, err := goBuild(buildOptions{
+			Package:    "cmd/cc",
+			OutputName: "cc",
+			Build:      hostBuild,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build cc: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Build Docker image
+		imageTag := fmt.Sprintf("cc-test-%s:latest", testName)
+		buildDir := filepath.Join("tests", testName)
+
+		fmt.Printf("Building Docker image from %s...\n", dockerfilePath)
+		buildCmd := exec.Command("docker", "build",
+			"-t", imageTag,
+			"-f", dockerfilePath,
+			buildDir,
+		)
+		buildCmd.Stdout = os.Stdout
+		buildCmd.Stderr = os.Stderr
+		if err := buildCmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build Docker image: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Save Docker image as tar archive
+		tarPath := filepath.Join("build", fmt.Sprintf("test-%s.tar", testName))
+		if err := os.MkdirAll(filepath.Dir(tarPath), 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create build directory: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("Saving Docker image to %s...\n", tarPath)
+		saveCmd := exec.Command("docker", "save", "-o", tarPath, imageTag)
+		saveCmd.Stdout = os.Stdout
+		saveCmd.Stderr = os.Stderr
+		if err := saveCmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to save Docker image: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Run cc with the tar file
+		// Use relative path so cc can load it
+		relativeTarPath := filepath.Join(".", "build", fmt.Sprintf("test-%s.tar", testName))
+		fmt.Printf("Running cc with image %s...\n", relativeTarPath)
+		ccArgs := append([]string{relativeTarPath}, fs.Args()...)
+		if err := runBuildOutput(ccOut, ccArgs); err != nil {
 			os.Exit(1)
 		}
 
