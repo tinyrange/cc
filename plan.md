@@ -364,11 +364,11 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
   - [x] Add RX/TX statistics
   - [x] Convert to ChipsetDevice interface
 
-- [ ] **Create `internal/devices/serial/mmio.go`**
-  - [ ] Add `Serial16550MMIO` wrapper
-  - [ ] Implement `MMIORegions()` for configurable base/size
-  - [ ] Add register width parameter (1/2/4 byte stride)
-  - [ ] Map MMIO offsets to register indices
+- [x] **Create `internal/devices/serial/mmio.go`**
+  - [x] Add `Serial16550MMIO` wrapper
+  - [x] Implement `MMIORegions()` for configurable base/size
+  - [x] Add register width parameter (1/2/4 byte stride)
+  - [x] Map MMIO offsets to register indices
 
 - [ ] **Add unit tests**
   - [ ] Test THR/RHR with FIFO
