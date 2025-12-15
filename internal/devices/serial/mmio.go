@@ -5,8 +5,8 @@ import (
 	"io"
 
 	"github.com/tinyrange/cc/internal/chipset"
-	"github.com/tinyrange/cc/internal/hv"
 	am64serial "github.com/tinyrange/cc/internal/devices/amd64/serial"
+	"github.com/tinyrange/cc/internal/hv"
 )
 
 const (
@@ -173,11 +173,9 @@ func (s *Serial16550MMIO) SetIRQLine(line chipset.LineInterrupt) {
 	s.serial.SetIRQLine(line)
 }
 
-
 var (
-	_ hv.Device                = (*Serial16550MMIO)(nil)
-	_ chipset.ChipsetDevice    = (*Serial16550MMIO)(nil)
-	_ chipset.MmioHandler      = (*Serial16550MMIO)(nil)
+	_ hv.Device                 = (*Serial16550MMIO)(nil)
+	_ chipset.ChipsetDevice     = (*Serial16550MMIO)(nil)
+	_ chipset.MmioHandler       = (*Serial16550MMIO)(nil)
 	_ chipset.ChangeDeviceState = (*Serial16550MMIO)(nil)
 )
-

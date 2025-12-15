@@ -23,8 +23,8 @@ type VirtQueueDescriptor struct {
 
 // VirtQueuePayload represents a single buffer in a descriptor chain.
 type VirtQueuePayload struct {
-	Addr   uint64
-	Length uint32
+	Addr    uint64
+	Length  uint32
 	IsWrite bool
 }
 
@@ -33,10 +33,10 @@ type VirtQueue struct {
 	DescTableAddr uint64
 	AvailRingAddr uint64
 	UsedRingAddr  uint64
-	Size           uint16
-	MaxSize        uint16
-	Enabled        bool
-	Ready          bool
+	Size          uint16
+	MaxSize       uint16
+	Enabled       bool
+	Ready         bool
 
 	// Internal state tracking
 	lastAvailIdx uint16
@@ -348,4 +348,3 @@ func (q *VirtQueue) writeGuestUint32(addr uint64, value uint32) error {
 	binary.LittleEndian.PutUint32(buf[:], value)
 	return q.writeGuestFrom(addr, buf[:])
 }
-

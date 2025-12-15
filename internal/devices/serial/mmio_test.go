@@ -230,4 +230,3 @@ func testMMIOStride(t *testing.T, regShift uint32, irqLine chipset.LineInterrupt
 		t.Fatalf("stride=%d: expected error for out-of-bounds read", stride)
 	}
 }
-

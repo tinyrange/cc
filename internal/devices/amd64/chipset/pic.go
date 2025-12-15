@@ -247,23 +247,23 @@ func (p *DualPIC) String() string {
 // Snapshot support ----------------------------------------------------------
 
 type picSnapshot struct {
-	InitStage initStage
-	ICW2      byte
-	IMR       byte
-	OCW2      ocw2
-	OCW3      ocw3
-	ISR       byte
-	ELCR      byte
-	Lines     byte
-	LineLow   byte
+	InitStage     initStage
+	ICW2          byte
+	IMR           byte
+	OCW2          ocw2
+	OCW3          ocw3
+	ISR           byte
+	ELCR          byte
+	Lines         byte
+	LineLow       byte
 	AutoEOIRotate bool
 	SpecialMask   bool
 }
 
 type dualPicSnapshot struct {
-	Primary picSnapshot
+	Primary   picSnapshot
 	Secondary picSnapshot
-	Stats   picStats
+	Stats     picStats
 }
 
 func (p *DualPIC) DeviceId() string { return "pic" }
@@ -614,9 +614,9 @@ type ocw2 byte
 
 type ocw3 byte
 
-func (o ocw2) Level() byte { return byte(o) & 0x07 }
-func (o ocw2) SL() bool    { return byte(o)&0x40 != 0 }
-func (o ocw2) EOI() bool   { return byte(o)&0x20 != 0 }
+func (o ocw2) Level() byte  { return byte(o) & 0x07 }
+func (o ocw2) SL() bool     { return byte(o)&0x40 != 0 }
+func (o ocw2) EOI() bool    { return byte(o)&0x20 != 0 }
 func (o ocw2) Rotate() bool { return byte(o)&0x80 != 0 }
 
 func (o ocw3) rr() bool  { return byte(o)&0x02 != 0 }

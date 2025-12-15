@@ -390,7 +390,6 @@ func (vc *Console) processReceiveQueue(dev device, q *queue) error {
 			return err
 		}
 
-
 		vc.pending = vc.pending[consumed:]
 
 		if err := dev.recordUsedElement(q, head, written); err != nil {

@@ -339,7 +339,7 @@ func TestPITCounterLatchAndReadback(t *testing.T) {
 
 	// Advance time so counter changes and channel is running
 	advance(2 * time.Millisecond)
-	
+
 	// Verify channel is running by reading counter
 	initialCounter := readPitCounter(t, pit)
 	if initialCounter == 0 || initialCounter >= 0x1234 {

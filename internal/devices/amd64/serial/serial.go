@@ -21,11 +21,11 @@ const (
 	serialLSRTEMT      = 1 << 6
 
 	// MCR bits
-	mcrDTR     = 1 << 0
-	mcrRTS     = 1 << 1
-	mcrOUT1    = 1 << 2
-	mcrOUT2    = 1 << 3 // Interrupt gate
-	mcrLoop    = 1 << 4
+	mcrDTR  = 1 << 0
+	mcrRTS  = 1 << 1
+	mcrOUT1 = 1 << 2
+	mcrOUT2 = 1 << 3 // Interrupt gate
+	mcrLoop = 1 << 4
 
 	// MSR bits (low 4 bits are change flags, high 4 bits are status)
 	msrDeltaCTS = 1 << 0
@@ -75,13 +75,13 @@ type Serial16550 struct {
 	scr       byte
 
 	// FIFO buffers
-	rxFIFO    [fifoSize]byte
-	rxFIFOHead int
-	rxFIFOTail int
+	rxFIFO      [fifoSize]byte
+	rxFIFOHead  int
+	rxFIFOTail  int
 	rxFIFOCount int
-	txFIFO    [fifoSize]byte
-	txFIFOHead int
-	txFIFOTail int
+	txFIFO      [fifoSize]byte
+	txFIFOHead  int
+	txFIFOTail  int
 	txFIFOCount int
 
 	pendingIIR  byte
@@ -159,12 +159,12 @@ func (s *Serial16550) Init(vm hv.VirtualMachine) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.vm = vm
-	
+
 	// If irqLine is a vmIRQLine, set its VM reference
 	if vmIRQ, ok := s.irqLine.(*vmIRQLine); ok {
 		vmIRQ.setVM(vm)
 	}
-	
+
 	s.updateModemStatusLocked()
 	return nil
 }
@@ -618,9 +618,9 @@ func (s *Serial16550) Stats() serialStats {
 }
 
 var (
-	_ hv.Device                = &Serial16550{}
-	_ chipset.ChipsetDevice    = &Serial16550{}
-	_ chipset.PortIOHandler    = &Serial16550{}
-	_ chipset.PollHandler      = &Serial16550{}
+	_ hv.Device                 = &Serial16550{}
+	_ chipset.ChipsetDevice     = &Serial16550{}
+	_ chipset.PortIOHandler     = &Serial16550{}
+	_ chipset.PollHandler       = &Serial16550{}
 	_ chipset.ChangeDeviceState = &Serial16550{}
 )
