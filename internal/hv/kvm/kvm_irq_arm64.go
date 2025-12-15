@@ -2,7 +2,9 @@
 
 package kvm
 
-import "fmt"
+import (
+	"fmt"
+)
 
 // ARM64 KVM IRQ type encoding (bits 31-24 of irq field)
 const (
@@ -37,7 +39,8 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 	// but this implementation currently tries the full INTID format.
 	// This is experimental and may not be correct.
 
-	// Try full INTID first (don't subtract armSPIBase)
+	// Use the full INTID. KVM_IRQ_LINE on ARM64 accepts the full INTID in the low 16 bits.
+	// The type is encoded in bits 31-24.
 	kvmIRQ := (irqType << armIRQTypeShift) | intid
 
 	if err := irqLevel(v.vmFd, kvmIRQ, level); err != nil {
