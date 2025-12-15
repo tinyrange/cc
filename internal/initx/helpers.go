@@ -763,6 +763,52 @@ func AddDefaultRoute(gateway uint32, errLabel ir.Label, errVar ir.Var) ir.Fragme
 	})
 }
 
+func SetResolvConf(dnsServer string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
+	// Format: "nameserver <dnsServer>\n"
+	content := "nameserver " + dnsServer + "\n"
+	
+	fd := nextHelperVar("resolv_fd")
+	contentPtr := nextHelperVar("resolv_content_ptr")
+	contentLen := nextHelperVar("resolv_content_len")
+	
+	return ir.Block{
+		// Load the content string and get a pointer to it
+		ir.LoadConstantBytesConfig(ir.ConstantBytesConfig{
+			Target:  nextExecVar(),
+			Data:    []byte(content),
+			Pointer: contentPtr,
+			Length:  contentLen,
+		}),
+		
+		// Open /etc/resolv.conf for writing, create if it doesn't exist, truncate if it does
+		ir.Assign(fd, ir.Syscall(
+			defs.SYS_OPENAT,
+			ir.Int64(linux.AT_FDCWD),
+			"/etc/resolv.conf",
+			ir.Int64(linux.O_WRONLY|linux.O_CREAT|linux.O_TRUNC),
+			ir.Int64(0o644),
+		)),
+		ir.Assign(errVar, fd),
+		ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
+		
+		// Write the content
+		ir.Assign(errVar, ir.Syscall(
+			defs.SYS_WRITE,
+			fd,
+			contentPtr,
+			contentLen,
+		)),
+		ir.If(ir.IsNegative(errVar), ir.Block{
+			ir.Syscall(defs.SYS_CLOSE, fd),
+			ir.Goto(errLabel),
+		}),
+		
+		// Close the file
+		ir.Assign(errVar, ir.Syscall(defs.SYS_CLOSE, fd)),
+		ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
+	}
+}
+
 // Execution
 
 func Exec(path string, argv []string, envp []string, errLabel ir.Label, errVar ir.Var) ir.Fragment {

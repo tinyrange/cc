@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path"
 	"runtime"
@@ -21,6 +22,7 @@ import (
 	"github.com/tinyrange/cc/internal/linux/defs"
 	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 	"github.com/tinyrange/cc/internal/linux/kernel"
+	"github.com/tinyrange/cc/internal/netstack"
 	"github.com/tinyrange/cc/internal/oci"
 	"github.com/tinyrange/cc/internal/vfs"
 	"golang.org/x/term"
@@ -180,9 +182,18 @@ func run() error {
 
 	// Add network device if enabled
 	if *network {
+		backend := netstack.New(slog.Default())
+
+		mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
+
+		netBackend, err := virtio.NewNetstackBackend(backend, mac)
+		if err != nil {
+			return fmt.Errorf("create netstack backend: %w", err)
+		}
+
 		opts = append(opts, initx.WithDeviceTemplate(virtio.NetTemplate{
-			Backend: nil, // Use discard backend for now
-			MAC:     nil, // Auto-generate MAC
+			Backend: netBackend,
+			MAC:     mac,
 			Arch:    hvArch,
 		}))
 	}
@@ -526,8 +537,12 @@ func buildContainerInit(img *oci.Image, cmd []string, enableNetwork bool) *ir.Pr
 		// Mask: 255.255.255.0 = 0xffffff00
 		main = append(main,
 			initx.ConfigureInterface("eth0", 0x0a00020f, 0xffffff00, errLabel, errVar),
+
 			// Add default route via 10.0.2.2 (gateway)
 			initx.AddDefaultRoute(0x0a000202, errLabel, errVar),
+
+			// Set /etc/resolv.conf to use 10.0.2.2 as DNS server
+			initx.SetResolvConf("10.0.2.2", errLabel, errVar),
 		)
 	}
 
