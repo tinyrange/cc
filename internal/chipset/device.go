@@ -46,6 +46,36 @@ type LineInterrupt interface {
 	PulseInterrupt()
 }
 
+type noopLineInterrupt struct{}
+
+func (noopLineInterrupt) SetLevel(bool)   {}
+func (noopLineInterrupt) PulseInterrupt() {}
+
+// LineInterruptDetached returns a LineInterrupt that drops all signals.
+func LineInterruptDetached() LineInterrupt {
+	return noopLineInterrupt{}
+}
+
+// LineInterruptFromFunc adapts a simple level function to LineInterrupt.
+func LineInterruptFromFunc(fn func(bool)) LineInterrupt {
+	return lineInterruptFunc(fn)
+}
+
+type lineInterruptFunc func(bool)
+
+func (f lineInterruptFunc) SetLevel(level bool) {
+	if f != nil {
+		f(level)
+	}
+}
+
+func (f lineInterruptFunc) PulseInterrupt() {
+	if f != nil {
+		f(true)
+		f(false)
+	}
+}
+
 // ChangeDeviceState exposes lifecycle hooks for chipset devices.
 type ChangeDeviceState interface {
 	Start() error

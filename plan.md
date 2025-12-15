@@ -235,40 +235,32 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
 
 ### Implementation Checklist
 
-- [ ] **Enhance `internal/devices/amd64/input/i8042.go`**
-  - [ ] Add controller state machine:
-    ```go
-    type i8042State struct {
-        commandFlag     CommandFlag
-        dataPortTarget  DataPortTarget  // keyboard/mouse/controller
-        outputBuffer    byte
-        outputBufferState OutputBufferState
-        a20Gate         bool
-        memory          [32]byte  // internal RAM
-    }
-    ```
-  - [ ] Implement controller commands (0x20-0xFF):
-    - [ ] 0x20: Read command byte
-    - [ ] 0x60: Write command byte
-    - [ ] 0xA1: Unknown (return 0)
-    - [ ] 0xA7/0xA8: Disable/enable aux interface
-    - [ ] 0xA9: Test aux interface
-    - [ ] 0xAA: Self-test (return 0x55)
-    - [ ] 0xAB: Test keyboard interface
-    - [ ] 0xAD/0xAE: Disable/enable keyboard
-    - [ ] 0xD0: Read output port
-    - [ ] 0xD1: Write output port (A20/reset)
-    - [ ] 0xD4: Write to aux device
-    - [ ] 0xFE: Pulse reset (CPU reset)
-  - [ ] Add output buffer state management (empty/controller/keyboard/mouse)
-  - [ ] Add command byte (interrupts enable, translate, disable flags)
+- [x] **Enhance `internal/devices/amd64/input/i8042.go`**
+  - [x] Add controller state machine with full state tracking
+  - [x] Implement controller commands (0x20-0xFF):
+    - [x] 0x20: Read command byte
+    - [x] 0x60: Write command byte
+    - [x] 0xA7/0xA8: Disable/enable aux interface
+    - [x] 0xA9: Test aux interface
+    - [x] 0xAA: Self-test (return 0x55)
+    - [x] 0xAB: Test keyboard interface
+    - [x] 0xAD/0xAE: Disable/enable keyboard
+    - [x] 0xC0: Read input port
+    - [x] 0xD0: Read output port
+    - [x] 0xD1: Write output port (A20/reset)
+    - [x] 0xD4: Write to aux device
+    - [x] 0xFE: Pulse reset (CPU reset)
+  - [x] Add output buffer state management (empty/controller/keyboard/mouse)
+  - [x] Add command byte (interrupts enable, translate, disable flags)
+  - [x] Implement ChipsetDevice interface
+  - [x] Wire interrupts to LineInterrupt for IRQ1/IRQ12
 
-- [ ] **Create `internal/devices/amd64/input/ps2keyboard.go`**
-  - [ ] Add PS/2 keyboard state machine
-  - [ ] Implement keyboard commands (0xFF reset, 0xED LEDs, 0xF0 scancode set)
-  - [ ] Add scancode set 2 translation
-  - [ ] Add input queue for key events
-  - [ ] Wire to `LineInterrupt` for IRQ1
+- [x] **Create `internal/devices/amd64/input/ps2keyboard.go`**
+  - [x] Add PS/2 keyboard state machine
+  - [x] Implement keyboard commands (0xFF reset, 0xED LEDs, 0xF0 scancode set, etc.)
+  - [x] Add scancode set 1 to set 2 translation
+  - [x] Add key event handling (SendKey method)
+  - [x] Wire to `LineInterrupt` for IRQ1
 
 - [ ] **Create `internal/devices/amd64/input/ps2mouse.go`** (optional)
   - [ ] Add PS/2 mouse protocol
@@ -278,6 +270,7 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
   - [ ] Test self-test command
   - [ ] Test A20 gate control
   - [ ] Test keyboard enable/disable
+  - [ ] Test scancode translation
 
 ---
 
