@@ -896,6 +896,18 @@ func (ns *NetStack) handleICMP(h ipv4Header, payload []byte) error {
 		return nil
 	}
 
+	// Validate ICMP checksum
+	receivedChecksum := binary.BigEndian.Uint16(payload[2:4])
+	binary.BigEndian.PutUint16(payload[2:4], 0) // Zero checksum for validation
+	calculatedChecksum := checksum(payload)
+	binary.BigEndian.PutUint16(payload[2:4], receivedChecksum) // Restore original
+	if receivedChecksum != calculatedChecksum {
+		ns.log.Debug("raw: drop icmp packet with invalid checksum",
+			"received", fmt.Sprintf("0x%04x", receivedChecksum),
+			"calculated", fmt.Sprintf("0x%04x", calculatedChecksum))
+		return nil
+	}
+
 	// Build Echo Reply: type=0, copy fields after checksum.
 	reply := make([]byte, len(payload))
 	reply[0] = 0

@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -34,6 +35,7 @@ import (
 	"github.com/tinyrange/cc/internal/linux/defs"
 	amd64defs "github.com/tinyrange/cc/internal/linux/defs/amd64"
 	"github.com/tinyrange/cc/internal/linux/kernel"
+	"github.com/tinyrange/cc/internal/netstack"
 	"github.com/tinyrange/cc/internal/vfs"
 )
 
@@ -1930,6 +1932,14 @@ func RunExecutable(path string) error {
 		return fmt.Errorf("read executable file: %w", err)
 	}
 
+	// Create netstack backend to handle and echo packets
+	ns := netstack.New(slog.Default())
+	guestMAC := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
+	netBackend, err := virtio.NewNetstackBackend(ns, guestMAC)
+	if err != nil {
+		return fmt.Errorf("create netstack backend: %w", err)
+	}
+
 	vm, err := initx.NewVirtualMachine(hv, 1, 256, kernel,
 		initx.WithFileFromBytes("/initx-exec", fileData, fs.FileMode(0755)),
 		initx.WithDeviceTemplate(virtio.FSTemplate{
@@ -1938,8 +1948,8 @@ func RunExecutable(path string) error {
 			Arch:    hv.Architecture(),
 		}),
 		initx.WithDeviceTemplate(virtio.NetTemplate{
-			Backend: nil, // Use discard backend for now
-			MAC:     nil, // Auto-generate MAC
+			Backend: netBackend,
+			MAC:     guestMAC,
 			Arch:    hv.Architecture(),
 		}),
 	)
