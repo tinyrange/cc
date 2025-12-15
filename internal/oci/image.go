@@ -710,8 +710,13 @@ func (c *Client) LoadFromTar(tarPath, arch string) (*Image, error) {
 
 	tr = tar.NewReader(tarFile)
 
-	// Map layer paths to their data
-	layerData := make(map[string][]byte)
+	// Create a set of layer paths for quick lookup
+	layerSet := make(map[string]bool)
+	for _, layerPath := range entry.Layers {
+		layerSet[layerPath] = false // false = not yet processed
+	}
+
+	// Process layers one at a time as we encounter them in the tar
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -721,31 +726,22 @@ func (c *Client) LoadFromTar(tarPath, arch string) (*Image, error) {
 			return nil, fmt.Errorf("read tar header: %w", err)
 		}
 
-		// Check if this is a layer file
-		for _, layerPath := range entry.Layers {
-			if hdr.Name == layerPath {
-				data, err := io.ReadAll(tr)
-				if err != nil {
-					return nil, fmt.Errorf("read layer %s: %w", layerPath, err)
-				}
-				layerData[layerPath] = data
-				break
-			}
+		// Check if this is a layer file we need to process
+		if _, isLayer := layerSet[hdr.Name]; !isLayer {
+			continue
 		}
-	}
 
-	// Process each layer
-	for i, layerPath := range entry.Layers {
-		data, ok := layerData[layerPath]
-		if !ok {
-			return nil, fmt.Errorf("layer %s not found in tar", layerPath)
+		// Read layer data (one layer at a time, not all layers)
+		data, err := io.ReadAll(tr)
+		if err != nil {
+			return nil, fmt.Errorf("read layer %s: %w", hdr.Name, err)
 		}
 
 		// Determine compression from LayerSources if available
 		compression := "gzip" // default to gzip for older format
 		if entry.LayerSources != nil {
 			// Extract digest from layer path (format: blobs/sha256/<hash>)
-			layerHash := strings.TrimPrefix(layerPath, "blobs/sha256/")
+			layerHash := strings.TrimPrefix(hdr.Name, "blobs/sha256/")
 			if layerSource, ok := entry.LayerSources["sha256:"+layerHash]; ok {
 				compressionType, err := compressionFromMediaType(layerSource.MediaType)
 				if err == nil {
@@ -770,13 +766,14 @@ func (c *Client) LoadFromTar(tarPath, arch string) (*Image, error) {
 				IndexPath:    indexPath,
 				ContentsPath: contentsPath,
 			})
+			layerSet[hdr.Name] = true // mark as processed
 			continue
 		}
 
 		// Process layer tar
 		layerReader := bytes.NewReader(data)
 		if err := makeLayerFromTar(hashPrefix, layerReader, compression, outputDir); err != nil {
-			return nil, fmt.Errorf("process layer %d (%s): %w", i, layerPath, err)
+			return nil, fmt.Errorf("process layer %s: %w", hdr.Name, err)
 		}
 
 		img.Layers = append(img.Layers, ImageLayer{
@@ -784,6 +781,14 @@ func (c *Client) LoadFromTar(tarPath, arch string) (*Image, error) {
 			IndexPath:    indexPath,
 			ContentsPath: contentsPath,
 		})
+		layerSet[hdr.Name] = true // mark as processed
+	}
+
+	// Verify all layers were found
+	for layerPath, processed := range layerSet {
+		if !processed {
+			return nil, fmt.Errorf("layer %s not found in tar", layerPath)
+		}
 	}
 
 	img.Config = cfg
