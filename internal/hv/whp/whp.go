@@ -19,8 +19,6 @@ type virtualCPU struct {
 	id       int
 	runQueue chan func()
 
-	firstTickDone bool
-
 	pendingError error
 }
 
