@@ -611,6 +611,8 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 	}
 	reqBuf := v.getBuffer(reqLen)
 	defer v.putBuffer(reqBuf)
+	// Clear request buffer to avoid garbage data from buffer pool reuse
+	clear(reqBuf[:reqLen])
 	copyOffset := 0
 	for _, d := range reqDescs {
 		segLen := int(d.length)
@@ -923,11 +925,19 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		off := binary.LittleEndian.Uint64(req[48:56])
 		size := binary.LittleEndian.Uint32(req[56:60])
-		writeHeader := fuseHdrInSize + 32
-		if len(req) < writeHeader+int(size) {
+		// Calculate where write data actually starts: header (40) + write_in structure
+		// The write_in structure is: fh (8) + off (8) + size (4) + write_flags (4) + lock_owner (8) = 32 bytes
+		// But the guest may send it with padding, so we need to find where the data actually starts
+		// by looking at the total request length: data starts at (reqLen - size)
+		writeDataStart := len(req) - int(size)
+		if writeDataStart < fuseHdrInSize+32 {
+			// Fallback to expected offset if calculation is wrong
+			writeDataStart = fuseHdrInSize + 32
+		}
+		if len(req) < writeDataStart+int(size) {
 			return 0, fmt.Errorf("FUSE_WRITE payload too short")
 		}
-		data := req[writeHeader : writeHeader+int(size)]
+		data := req[writeDataStart : writeDataStart+int(size)]
 		if be, ok := v.backend.(fsWriteBackend); ok {
 			written, e := be.Write(in.NodeID, fh, off, data)
 			errno = e
