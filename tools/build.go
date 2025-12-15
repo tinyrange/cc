@@ -601,6 +601,9 @@ func main() {
 		// Run cc with the tar file
 		// Use relative path so cc can load it
 		relativeTarPath := filepath.Join(".", "build", fmt.Sprintf("test-%s.tar", testName))
+		if !filepath.IsAbs(relativeTarPath) {
+			relativeTarPath = strings.Join([]string{".", relativeTarPath}, string(filepath.Separator))
+		}
 		fmt.Printf("Running cc with image %s...\n", relativeTarPath)
 		ccArgs := append([]string{relativeTarPath}, fs.Args()...)
 		if err := runBuildOutput(ccOut, ccArgs); err != nil {

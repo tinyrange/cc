@@ -642,6 +642,8 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 	}
 	respBuf := v.getBuffer(respCap)
 	defer v.putBuffer(respBuf)
+	// Zero the response buffer to avoid garbage data
+	clear(respBuf[:respCap])
 
 	used, err := v.dispatchFUSE(reqBuf[:reqLen], respBuf[:respCap])
 	if err != nil {
@@ -907,6 +909,9 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 				data = data[:len(resp)-fuseHdrOutSize]
 				outLen = uint32(len(resp))
 			}
+			// Zero the entire response buffer area before copying to avoid garbage data
+			// Clear from fuseHdrOutSize to the end of resp to ensure no garbage
+			clear(resp[fuseHdrOutSize:])
 			copy(resp[fuseHdrOutSize:], data)
 			return w(fuseOutHeader{Len: outLen, Error: 0, Unique: in.Unique}, nil), nil
 		}

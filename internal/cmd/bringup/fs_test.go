@@ -4,10 +4,12 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -15,6 +17,14 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/tinyrange/cc/internal/asm/amd64"
+	"github.com/tinyrange/cc/internal/asm/arm64"
+	"github.com/tinyrange/cc/internal/hv"
+	"github.com/tinyrange/cc/internal/ir"
+	_ "github.com/tinyrange/cc/internal/ir/amd64"
+	_ "github.com/tinyrange/cc/internal/ir/arm64"
+	"github.com/tinyrange/cc/internal/linux/defs"
 )
 
 // TestFS is the single entry point for the filesystem compliance suite.
@@ -50,6 +60,8 @@ func testFS(t *testing.T, basePath string) {
 	t.Run("NameLimits", func(t *testing.T) { testNameLimits(t, workspace) })
 	t.Run("Atomicity", func(t *testing.T) { testAtomicity(t, workspace) })
 	t.Run("RaceConditions", func(t *testing.T) { testRaceConditions(t, workspace) })
+	t.Run("VirtioFSWriteRead", func(t *testing.T) { testVirtioFSWriteRead(t, workspace) })
+	t.Run("VirtioFSExecutable", func(t *testing.T) { testVirtioFSExecutable(t, workspace) })
 }
 
 // --- Extended Attributes (Xattr) ---
@@ -417,4 +429,120 @@ func testRaceConditions(t *testing.T, dir string) {
 
 	close(start)
 	wg.Wait()
+}
+
+// --- VirtioFS Write/Read Test ---
+
+func testVirtioFSWriteRead(t *testing.T, dir string) {
+	filePath := filepath.Join(dir, "virtiofs_write_read_test")
+	testData := []byte("virtiofs test data: Hello, World!")
+
+	// Write data to file
+	if err := os.WriteFile(filePath, testData, 0644); err != nil {
+		t.Fatalf("Failed to write file: %v", err)
+	}
+	defer os.Remove(filePath)
+
+	// Read data back
+	readData, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("Failed to read file: %v", err)
+	}
+
+	// Validate contents
+	if !bytes.Equal(readData, testData) {
+		t.Errorf("Data corruption detected. Want %q, Got %q", testData, readData)
+	}
+
+	// Verify file size
+	info, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("Failed to stat file: %v", err)
+	}
+	if info.Size() != int64(len(testData)) {
+		t.Errorf("File size mismatch. Want %d, Got %d", len(testData), info.Size())
+	}
+}
+
+// --- VirtioFS Executable Test ---
+
+func testVirtioFSExecutable(t *testing.T, dir string) {
+	// Detect architecture
+	var arch hv.CpuArchitecture
+	switch runtime.GOARCH {
+	case "amd64":
+		arch = hv.ArchitectureX86_64
+	case "arm64":
+		arch = hv.ArchitectureARM64
+	default:
+		t.Skipf("Unsupported architecture: %s", runtime.GOARCH)
+	}
+
+	// Create a simple IR program that exits with code 42
+	prog := &ir.Program{
+		Entrypoint: "main",
+		Methods: map[string]ir.Method{
+			"main": {
+				ir.Syscall(defs.SYS_EXIT, ir.Int64(42)),
+			},
+		},
+	}
+
+	// Build the standalone program
+	asmProg, err := ir.BuildStandaloneProgramForArch(arch, prog)
+	if err != nil {
+		t.Fatalf("BuildStandaloneProgramForArch: %v", err)
+	}
+
+	// Generate ELF executable
+	var elfBytes []byte
+	switch arch {
+	case hv.ArchitectureX86_64:
+		elfBytes, err = amd64.StandaloneELF(asmProg)
+	case hv.ArchitectureARM64:
+		elfBytes, err = arm64.StandaloneELF(asmProg)
+	default:
+		t.Fatalf("Unsupported architecture: %v", arch)
+	}
+	if err != nil {
+		t.Fatalf("StandaloneELF: %v", err)
+	}
+
+	// Write executable to file
+	exePath := filepath.Join(dir, "virtiofs_executable_test")
+	if err := os.WriteFile(exePath, elfBytes, 0755); err != nil {
+		t.Fatalf("Failed to write executable: %v", err)
+	}
+	defer os.Remove(exePath)
+
+	// Verify file is executable
+	info, err := os.Stat(exePath)
+	if err != nil {
+		t.Fatalf("Failed to stat executable: %v", err)
+	}
+	if info.Mode()&0111 == 0 {
+		t.Errorf("File is not executable. Mode: %o", info.Mode())
+	}
+
+	// Execute the program
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, exePath)
+	err = cmd.Run()
+
+	// Check exit code (should be 42)
+	if exitError, ok := err.(*exec.ExitError); ok {
+		status := exitError.Sys().(syscall.WaitStatus)
+		exitCode := status.ExitStatus()
+		if exitCode != 42 {
+			t.Errorf("Executable exited with wrong code. Want 42, Got %d", exitCode)
+		}
+	} else if err != nil {
+		t.Fatalf("Failed to execute program: %v", err)
+	} else {
+		// If err is nil, the program exited successfully with code 0
+		// This shouldn't happen since we exit with 42
+		t.Error("Executable exited with code 0, but expected 42")
+	}
 }
