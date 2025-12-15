@@ -24,6 +24,7 @@ import (
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/ir"
 	_ "github.com/tinyrange/cc/internal/ir/amd64"
+	_ "github.com/tinyrange/cc/internal/ir/arm64"
 	amd64boot "github.com/tinyrange/cc/internal/linux/boot/amd64"
 	arm64boot "github.com/tinyrange/cc/internal/linux/boot/arm64"
 )

@@ -218,6 +218,9 @@ func (vc *Console) requireDevice() (device, error) {
 // EncodeIRQLineForArch returns the hypervisor-specific IRQ line encoding. On
 // arm64 we embed the SPI type in the high bits as expected by KVM/WHP; on other
 // architectures the line is returned unchanged.
+//
+// For ARM64, irqLine is the SPI offset (as used in device tree interrupts property),
+// which needs to be converted to INTID by adding the SPI base (32).
 func EncodeIRQLineForArch(arch hv.CpuArchitecture, irqLine uint32) uint32 {
 	if arch != hv.ArchitectureARM64 {
 		return irqLine
@@ -225,8 +228,11 @@ func EncodeIRQLineForArch(arch hv.CpuArchitecture, irqLine uint32) uint32 {
 	const (
 		armKVMIRQTypeShift = 24
 		armKVMIRQTypeSPI   = 1
+		armSPIBase         = 32 // GIC SPIs start at INTID 32
 	)
-	return (armKVMIRQTypeSPI << armKVMIRQTypeShift) | (irqLine & 0xFFFF)
+	// irqLine is the SPI offset (as in device tree), convert to INTID
+	intid := irqLine + armSPIBase
+	return (armKVMIRQTypeSPI << armKVMIRQTypeShift) | (intid & 0xFFFF)
 }
 
 func NewConsole(vm hv.VirtualMachine, base uint64, size uint64, irqLine uint32, out io.Writer, in io.Reader) *Console {
