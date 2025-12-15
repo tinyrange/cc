@@ -302,6 +302,12 @@ func (v *virtualCPU) handleIO(ioData *kvmExitIoData) error {
 	if err := cs.HandlePIO(ioData.port, data, isWrite); err != nil {
 		return fmt.Errorf("I/O port 0x%04x: %w", ioData.port, err)
 	}
+	
+	// Poll devices after I/O to allow serial device to read input
+	if err := cs.Poll(context.Background()); err != nil {
+		return fmt.Errorf("poll devices: %w", err)
+	}
+	
 	return nil
 }
 
@@ -324,6 +330,12 @@ func (v *virtualCPU) handleMMIO(mmioData *kvmExitMMIOData) error {
 	if err := cs.HandleMMIO(mmioData.physAddr, data, isWrite); err != nil {
 		return fmt.Errorf("MMIO at 0x%016x: %w", mmioData.physAddr, err)
 	}
+	
+	// Poll devices after MMIO to allow serial device to read input
+	if err := cs.Poll(context.Background()); err != nil {
+		return fmt.Errorf("poll devices: %w", err)
+	}
+	
 	return nil
 }
 

@@ -206,7 +206,7 @@ func run() error {
 
 	// Boot the VM first to set up devices
 	if err := func() error {
-		ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
 
 		vm.VirtualCPUCall(0, func(vcpu hv.VirtualCPU) error {

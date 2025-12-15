@@ -532,6 +532,7 @@ func NewVirtualMachine(
 		},
 
 		SerialStdout: out,
+		SerialStdin:  in,
 
 		GetCmdline: func(arch hv.CpuArchitecture) ([]string, error) {
 			var args []string
