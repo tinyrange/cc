@@ -186,8 +186,10 @@ func (c *I8042) resetLocked() {
 
 // SupportsPortIO implements chipset.ChipsetDevice.
 func (c *I8042) SupportsPortIO() *chipset.PortIOIntercept {
+	// Port 0x61 (i8042SystemControlPort) is handled by chipset.Port61 for PIT integration.
+	// We only register ports 0x60 (data) and 0x64 (command).
 	return &chipset.PortIOIntercept{
-		Ports:   []uint16{i8042DataPort, i8042SystemControlPort, i8042CommandPort},
+		Ports:   []uint16{i8042DataPort, i8042CommandPort},
 		Handler: c,
 	}
 }
@@ -204,7 +206,8 @@ func (c *I8042) SupportsPollDevice() *chipset.PollDevice {
 
 // IOPorts implements hv.X86IOPortDevice (legacy support).
 func (c *I8042) IOPorts() []uint16 {
-	return []uint16{i8042DataPort, i8042SystemControlPort, i8042CommandPort}
+	// Port 0x61 (i8042SystemControlPort) is handled by chipset.Port61 for PIT integration.
+	return []uint16{i8042DataPort, i8042CommandPort}
 }
 
 // ReadIOPort implements chipset.PortIOHandler.
