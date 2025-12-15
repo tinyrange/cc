@@ -26,7 +26,7 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
   - [x] Add `SupportsPollDevice() *PollDevice` method
   - [x] Add `ChangeDeviceState` interface (Start, Stop, Reset)
 
-- [ ] **Create `internal/chipset/builder.go`** - Chipset builder
+- [x] **Create `internal/chipset/builder.go`** - Chipset builder
   - [x] Add `ChipsetBuilder` struct with device registry
   - [x] Add `RegisterDevice(name string, dev ChipsetDevice)` method
   - [x] Add `WithPioPort(port uint16, handler PortIOHandler)` method
@@ -35,14 +35,14 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
   - [x] Add `Build() (*Chipset, error)` to finalize registration
   - [x] Add port/region conflict detection
 
-- [ ] **Create `internal/chipset/chipset.go`** - Runtime chipset
+- [x] **Create `internal/chipset/chipset.go`** - Runtime chipset
   - [x] Add `Chipset` struct holding device map and dispatch tables
   - [x] Add `HandlePIO(port uint16, data []byte, isWrite bool) error`
   - [x] Add `HandleMMIO(addr uint64, data []byte, isWrite bool) error`
   - [x] Add `Poll(ctx context.Context)` for poll-based devices
   - [x] Add `Start()`, `Stop()`, `Reset()` lifecycle methods
 
-- [ ] **Update `internal/hv/kvm/kvm_amd64.go`**
+- [x] **Update `internal/hv/kvm/kvm_amd64.go`**
   - [x] Replace manual device dispatch with chipset dispatch
   - [x] Update `addX86Devices()` to use builder pattern
 
@@ -63,7 +63,7 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
 
 ### Implementation Checklist
 
-- [ ] **Enhance `internal/devices/amd64/chipset/sink.go`**
+- [x] **Enhance `internal/devices/amd64/chipset/sink.go`**
   - [x] Add `LineInterrupt` interface:
     ```go
     type LineInterrupt interface {
@@ -74,18 +74,18 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
   - [x] Add `LineInterruptDetached()` factory for noop line
   - [x] Add `LineInterruptFromFunc(fn func(bool)) LineInterrupt` adapter
 
-- [ ] **Create `internal/chipset/lineset.go`** - Interrupt line set
+- [x] **Create `internal/chipset/lineset.go`** - Interrupt line set
   - [x] Add `LineSet` struct managing multiple interrupt lines
   - [x] Add `AllocateLine(irq uint8) LineInterrupt` method
   - [x] Add `RegisterEOICallback(line uint8, fn func())` for EOI notification
   - [x] Add `BroadcastEOI(vector uint8)` method called from LAPIC
   - [x] Wire EOI to IOAPIC's `HandleEOI(vector uint32)` method
 
-- [ ] **Update IOAPIC** (`internal/devices/amd64/chipset/ioapic.go`)
+- [x] **Update IOAPIC** (`internal/devices/amd64/chipset/ioapic.go`)
   - [x] Expose `HandleEOI(vector uint32)` publicly (already exists)
   - [x] Add stats for EOI events
 
-- [ ] **Update PIC** (`internal/devices/amd64/chipset/pic.go`)
+- [x] **Update PIC** (`internal/devices/amd64/chipset/pic.go`)
   - [x] Add `LineInterrupt` output for INT pin
   - [x] Add `AcknowledgeHook` interface for in-kernel PIC integration
 
@@ -141,7 +141,7 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
 
 ### Implementation Checklist
 
-- [ ] **Update `internal/devices/amd64/chipset/ioapic.go`**
+- [x] **Update `internal/devices/amd64/chipset/ioapic.go`**
   - [x] Add delivery mode statistics:
     ```go
     type ioapicStats struct {
@@ -162,7 +162,7 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
   - [x] Add `Debug()` method for inspection
   - [x] Verify remote-IRR clear on write (should be read-only)
 
-- [ ] **Add unit tests** (`internal/devices/amd64/chipset/ioapic_test.go`)
+- [x] **Add unit tests** (`internal/devices/amd64/chipset/ioapic_test.go`)
   - [x] Test edge-triggered interrupt delivery
   - [x] Test level-triggered with remote-IRR
   - [x] Test mask/unmask behavior
@@ -203,7 +203,7 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
   - [ ] Add status latch command
   - [ ] Fix counter latch for 16-bit reads
 
-- [ ] **Implement Port 0x61** (`internal/devices/amd64/chipset/port61.go`)
+- [x] **Implement Port 0x61** (`internal/devices/amd64/chipset/port61.go`)
   - [x] Create `Port61` device struct
   - [x] Add timer 2 gate control (bit 0)
   - [x] Add speaker data control (bit 1)
@@ -294,12 +294,12 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
 
 ### Implementation Checklist
 
-- [ ] **Update `internal/devices/amd64/chipset/cmos.go`**
-  - [ ] Add Status Register A:
+- [x] **Update `internal/devices/amd64/chipset/cmos.go`**
+  - [x] Add Status Register A:
     - [x] Periodic timer rate (bits 0-3)
     - [x] Oscillator control (bits 4-6)
     - [x] Update in progress (bit 7) - pulse every second
-  - [ ] Add Status Register B:
+  - [x] Add Status Register B:
     - [x] DST enable (bit 0)
     - [x] 24-hour mode (bit 1)
     - [x] BCD disable (bit 2)
@@ -323,12 +323,12 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
   - [x] Add 12/24 hour conversion
   - [x] Wire IRQ8 to `LineInterrupt`
 
-- [ ] **Create `internal/devices/amd64/chipset/pm.go`** (stub)
+- [x] **Create `internal/devices/amd64/chipset/pm.go`** (stub)
   - [x] Add ACPI PM1a control/status registers
   - [x] Add PM timer (port 0x408)
   - [x] Add sleep state handling (stub)
 
-- [ ] **Add unit tests** (`internal/devices/amd64/chipset/cmos_test.go`)
+- [x] **Add unit tests** (`internal/devices/amd64/chipset/cmos_test.go`)
   - [x] Test time register read/write
   - [x] Test BCD encoding
   - [x] Test alarm matching
