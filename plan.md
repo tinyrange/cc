@@ -266,11 +266,11 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
   - [ ] Add PS/2 mouse protocol
   - [ ] Wire to `LineInterrupt` for IRQ12
 
-- [ ] **Add unit tests**
-  - [ ] Test self-test command
-  - [ ] Test A20 gate control
-  - [ ] Test keyboard enable/disable
-  - [ ] Test scancode translation
+- [x] **Add unit tests**
+  - [x] Test self-test command
+  - [x] Test A20 gate control
+  - [x] Test keyboard enable/disable
+  - [x] Test scancode translation
 
 ---
 

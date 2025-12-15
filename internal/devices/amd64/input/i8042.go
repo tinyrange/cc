@@ -350,7 +350,12 @@ func (c *I8042) handleDataWriteLocked(value byte) error {
 
 	// Normal data write to keyboard (e.g. keyboard commands, LED control)
 	if c.keyboard != nil && (c.commandByte&i8042CommandByteDisableKeyboard) == 0 {
-		return c.keyboard.HandleCommand(value)
+		// Release mutex before calling keyboard to avoid deadlock.
+		// The keyboard may call QueueKeyboardData which needs the mutex.
+		c.mu.Unlock()
+		err := c.keyboard.HandleCommand(value)
+		c.mu.Lock()
+		return err
 	}
 
 	return nil
@@ -412,6 +417,11 @@ func (c *I8042) queueOutputLocked(value byte, source OutputBufferState) {
 func (c *I8042) QueueKeyboardData(data byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.queueOutputLocked(data, OutputBufferKeyboard)
+}
+
+// QueueKeyboardDataLocked queues data from the keyboard (must be called with mutex held).
+func (c *I8042) QueueKeyboardDataLocked(data byte) {
 	c.queueOutputLocked(data, OutputBufferKeyboard)
 }
 

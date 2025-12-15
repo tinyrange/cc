@@ -84,6 +84,11 @@ func (k *PS2Keyboard) SetController(ctrl *I8042) {
 func (k *PS2Keyboard) Reset() {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	k.resetLocked()
+}
+
+// resetLocked resets the keyboard state (must be called with mutex held).
+func (k *PS2Keyboard) resetLocked() {
 	k.enabled = true
 	k.scancodeSet = scancodeSet2
 	k.typematicRate = 0x20 // Default rate
@@ -130,7 +135,7 @@ func (k *PS2Keyboard) HandleCommand(cmd byte) error {
 
 	switch cmd {
 	case ps2CmdReset:
-		k.Reset()
+		k.resetLocked()
 		k.sendResponse(ps2ResponseAck)
 		k.sendResponse(ps2ResponseTestPass)
 
@@ -210,6 +215,13 @@ func (k *PS2Keyboard) SendKey(scancode byte, pressed bool) {
 
 func (k *PS2Keyboard) sendResponse(resp byte) {
 	if k.controller != nil {
+		// We're called from HandleCommand which holds k.mu, but we need to
+		// call into the controller. The controller's QueueKeyboardDataLocked
+		// expects the controller's mutex to be held, but we don't have it.
+		// So we need to use the public QueueKeyboardData which acquires the lock.
+		// However, this can cause deadlocks if called from within a locked context.
+		// The solution is to ensure the controller's methods can be called safely.
+		// For now, we'll use QueueKeyboardData which is safe for external callers.
 		k.controller.QueueKeyboardData(resp)
 	}
 }
