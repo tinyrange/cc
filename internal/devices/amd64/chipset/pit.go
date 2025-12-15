@@ -145,23 +145,6 @@ func (p *PIT) ReadIOPort(port uint16, data []byte) error {
 	case pitChannel0Port, pitChannel1Port, pitChannel2Port:
 		idx := int(port - pitChannel0Port)
 		value := p.timers[idx].read(p.now(), p.tick)
-		if idx == 2 && p.debugCh2Reads < 16 {
-			p.debugCh2Reads++
-			now := p.now()
-			ch := p.timers[idx]
-			fmt.Printf("pit: ch2 read=%02x count=%04x running=%v outHigh=%v deadline=%v now=%v\n",
-				value, ch.currentCount(now, p.tick), ch.running, ch.outputHigh, ch.deadline.Sub(now), now.Sub(time.Time{}))
-		}
-		if idx == 2 {
-			high := value
-			if p.timers[idx].readHigh {
-				high = byte(p.timers[idx].latchedReadValue >> 8)
-			}
-			if high != p.debugCh2High {
-				p.debugCh2High = high
-				fmt.Printf("pit: ch2 high byte changed to %02x\n", high)
-			}
-		}
 		data[0] = value
 	case pitControlPort:
 		data[0] = 0xFF
