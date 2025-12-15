@@ -96,7 +96,6 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 
 		// IMPORTANT: Use heap-allocated status to work around a Go runtime issue on Windows
 		// where stack-allocated variables initialized to zero don't get written by WHP APIs.
-		// See: https://github.com/tinyrange/cc/issues/XXX (Windows I/O emulation bug)
 		status := new(bindings.EmulatorStatus)
 
 		// WORKAROUND: On Windows, there's a bug where WHP emulation callbacks don't work correctly
