@@ -444,10 +444,10 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
   - [x] Add BAR0 for MMIO registers
   - [x] Add MSI-X support (optional)
 
-- [ ] **Add unit tests**
-  - [ ] Test queue descriptor chain walking
-  - [ ] Test used ring updates
-  - [ ] Test feature negotiation
+- [x] **Add unit tests**
+  - [x] Test queue descriptor chain walking
+  - [x] Test used ring updates
+  - [x] Test feature negotiation
 
 ---
 
