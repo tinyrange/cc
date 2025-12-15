@@ -297,6 +297,29 @@ func (c *CMOS) scheduleAlarmLocked() {
 		delay = 0
 	}
 
+	// Check if current time matches alarm time. If so, fire immediately.
+	h, m, s := nowTime.UTC().Clock()
+	targetHour := int(c.cmos[cmosRegHoursAlarm])
+	targetMinute := int(c.cmos[cmosRegMinutesAlarm])
+	targetSecond := int(c.cmos[cmosRegSecondsAlarm])
+	if statusB&statusBBinaryMode == 0 {
+		targetHour = int(fromBCD(c.cmos[cmosRegHoursAlarm]))
+		targetMinute = int(fromBCD(c.cmos[cmosRegMinutesAlarm]))
+		targetSecond = int(fromBCD(c.cmos[cmosRegSecondsAlarm]))
+		if statusB&statusB24HourMode == 0 {
+			targetHour = int(decode12Hour(c.cmos[cmosRegHoursAlarm]))
+		}
+	}
+	if (targetHour == 0xFF || targetHour == h) &&
+		(targetMinute == 0xFF || targetMinute == m) &&
+		(targetSecond == 0xFF || targetSecond == s) {
+		c.cmos[cmosRegStatusC] |= statusCIrqAlarm
+		c.refreshIRQLineLocked()
+		// Don't reschedule here - we've already fired for this time.
+		// The next call to scheduleAlarmLocked will find the next occurrence.
+		return
+	}
+
 	c.alarm = c.timerMaker(delay, func() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
@@ -320,6 +343,9 @@ func (c *CMOS) nextAlarmTimeLocked(now time.Time) (time.Time, bool) {
 		target.minute = fromBCD(target.minute)
 		target.hour = decode12Hour(target.hour)
 	}
+	// Search forward from next second to find the next alarm time.
+	// We don't check the current second because if it matches, we want to schedule
+	// for the next occurrence, not fire immediately (which would cause infinite recursion).
 	start := now.Add(time.Second)
 	for i := 0; i < 24*60*60; i++ {
 		candidate := start.Add(time.Duration(i) * time.Second)

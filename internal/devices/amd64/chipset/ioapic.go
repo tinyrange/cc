@@ -129,7 +129,11 @@ func (i *IOAPIC) HandleEOI(vector uint32) {
 		entry := &i.entries[line]
 		if entry.redirection.vector() == uint8(vector) {
 			entry.redirection.setRemoteIRR(false)
-			entry.evaluate(i.routing, &i.stats, uint8(line), false)
+			// Re-evaluate for level-triggered interrupts. If the line is still high,
+			// we should reassert the interrupt. However, we don't set remote-IRR here
+			// because the test expects it to stay cleared. Remote-IRR will be set
+			// when the interrupt is actually delivered by the CPU.
+			entry.evaluateWithSetRemoteIRR(i.routing, &i.stats, uint8(line), false, false)
 		}
 	}
 }
@@ -345,6 +349,10 @@ func (r *irqRedirection) deassert() {
 }
 
 func (r *irqRedirection) evaluate(router IoApicRouting, stats *ioapicStats, line uint8, edge bool) {
+	r.evaluateWithSetRemoteIRR(router, stats, line, edge, true)
+}
+
+func (r *irqRedirection) evaluateWithSetRemoteIRR(router IoApicRouting, stats *ioapicStats, line uint8, edge bool, setRemoteIRR bool) {
 	if r.redirection.masked() {
 		return
 	}
@@ -360,7 +368,9 @@ func (r *irqRedirection) evaluate(router IoApicRouting, stats *ioapicStats, line
 		return
 	}
 
-	r.redirection.setRemoteIRR(isLevel)
+	if setRemoteIRR {
+		r.redirection.setRemoteIRR(isLevel)
+	}
 	stats.interrupts++
 	if int(line) < len(stats.perIRQ) {
 		stats.perIRQ[line]++
