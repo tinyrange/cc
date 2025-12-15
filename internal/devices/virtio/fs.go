@@ -157,14 +157,15 @@ const (
 )
 
 type fuseInHeader struct {
-	Len    uint32
-	Opcode uint32
-	Unique uint64
-	NodeID uint64
-	UID    uint32
-	GID    uint32
-	PID    uint32
-	_      uint32 // padding
+	Len         uint32
+	Opcode      uint32
+	Unique      uint64
+	NodeID      uint64
+	UID         uint32
+	GID         uint32
+	PID         uint32
+	TotalExtLen uint16 // length of extensions in 8byte units (protocol 7.38+)
+	Padding     uint16
 }
 
 type fuseOutHeader struct {
@@ -203,7 +204,8 @@ const (
 	FUSE_RELEASEDIR = 29
 	FUSE_FSYNCDIR   = 30
 	FUSE_CREATE     = 35
-	FUSE_LSEEK      = 45
+	FUSE_RENAME2    = 45
+	FUSE_LSEEK      = 46
 )
 
 // Minimal structs we need on the wire (host end)
@@ -265,6 +267,8 @@ type fuseInitIn struct {
 	Minor        uint32
 	MaxReadahead uint32
 	Flags        uint32
+	Flags2       uint32 // protocol 7.36+
+	Unused       [11]uint32
 }
 
 type fuseInitOut struct {
@@ -276,7 +280,12 @@ type fuseInitOut struct {
 	CongestionThreshold uint16
 	MaxWrite            uint32
 	TimeGran            uint32
-	Unused              uint32
+	MaxPages            uint16 // protocol 7.28+
+	MapAlignment        uint16 // protocol 7.31+
+	Flags2              uint32 // protocol 7.36+
+	MaxStackDepth       uint32 // protocol 7.40+
+	RequestTimeout      uint16 // protocol 7.43+
+	Unused              [11]uint16
 }
 
 // -----------------------------
@@ -337,7 +346,7 @@ type fsRemoveBackend interface {
 }
 
 type fsSetattrBackend interface {
-	SetAttr(nodeID uint64, size *uint64) int32
+	SetAttr(nodeID uint64, size *uint64, mode *uint32) int32
 }
 
 type fsLseekBackend interface {
@@ -611,6 +620,8 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 	}
 	reqBuf := v.getBuffer(reqLen)
 	defer v.putBuffer(reqBuf)
+	// Clear request buffer to avoid garbage data from buffer pool reuse
+	clear(reqBuf[:reqLen])
 	copyOffset := 0
 	for _, d := range reqDescs {
 		segLen := int(d.length)
@@ -642,6 +653,8 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 	}
 	respBuf := v.getBuffer(respCap)
 	defer v.putBuffer(respBuf)
+	// Zero the response buffer to avoid garbage data
+	clear(respBuf[:respCap])
 
 	used, err := v.dispatchFUSE(reqBuf[:reqLen], respBuf[:respCap])
 	if err != nil {
@@ -719,6 +732,10 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 	in.UID = binary.LittleEndian.Uint32(req[24:28])
 	in.GID = binary.LittleEndian.Uint32(req[28:32])
 	in.PID = binary.LittleEndian.Uint32(req[32:36])
+	if len(req) >= 40 {
+		in.TotalExtLen = binary.LittleEndian.Uint16(req[36:38])
+		in.Padding = binary.LittleEndian.Uint16(req[38:40])
+	}
 
 	w := func(h fuseOutHeader, extra []byte) uint32 {
 		binary.LittleEndian.PutUint32(resp[0:4], h.Len)
@@ -907,6 +924,9 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 				data = data[:len(resp)-fuseHdrOutSize]
 				outLen = uint32(len(resp))
 			}
+			// Zero the entire response buffer area before copying to avoid garbage data
+			// Clear from fuseHdrOutSize to the end of resp to ensure no garbage
+			clear(resp[fuseHdrOutSize:])
 			copy(resp[fuseHdrOutSize:], data)
 			return w(fuseOutHeader{Len: outLen, Error: 0, Unique: in.Unique}, nil), nil
 		}
@@ -918,11 +938,19 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		off := binary.LittleEndian.Uint64(req[48:56])
 		size := binary.LittleEndian.Uint32(req[56:60])
-		writeHeader := fuseHdrInSize + 32
-		if len(req) < writeHeader+int(size) {
+		// Calculate where write data actually starts: header (40) + write_in structure
+		// The write_in structure is: fh (8) + off (8) + size (4) + write_flags (4) + lock_owner (8) = 32 bytes
+		// But the guest may send it with padding, so we need to find where the data actually starts
+		// by looking at the total request length: data starts at (reqLen - size)
+		writeDataStart := len(req) - int(size)
+		if writeDataStart < fuseHdrInSize+32 {
+			// Fallback to expected offset if calculation is wrong
+			writeDataStart = fuseHdrInSize + 32
+		}
+		if len(req) < writeDataStart+int(size) {
 			return 0, fmt.Errorf("FUSE_WRITE payload too short")
 		}
-		data := req[writeHeader : writeHeader+int(size)]
+		data := req[writeDataStart : writeDataStart+int(size)]
 		if be, ok := v.backend.(fsWriteBackend); ok {
 			written, e := be.Write(in.NodeID, fh, off, data)
 			errno = e
@@ -1059,13 +1087,35 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 		valid := binary.LittleEndian.Uint32(req[40:44])
 		const fattrSize = 1 << 3
+		const fattrMode = 1 << 0
 		var sizeVal *uint64
 		if valid&fattrSize != 0 {
 			val := binary.LittleEndian.Uint64(req[56:64])
 			sizeVal = &val
 		}
+		var modeVal *uint32
+		if valid&fattrMode != 0 {
+			// According to FUSE protocol, fuse_setattr_in structure:
+			// offset 40: valid (uint32)
+			// offset 44: padding (uint32)
+			// offset 48: fh (uint64)
+			// offset 56: size (uint64)
+			// offset 64: lock_owner (uint64)
+			// offset 72: atime (uint64)
+			// offset 80: mtime (uint64)
+			// offset 88: ctime (uint64)
+			// offset 96: atimensec (uint32)
+			// offset 100: mtimensec (uint32)
+			// offset 104: ctimensec (uint32)
+			// offset 108: mode (uint32)
+			// Mode is at offset 108 (4 bytes), so we need at least 112 bytes total
+			if len(req) >= 112 {
+				val := binary.LittleEndian.Uint32(req[108:112])
+				modeVal = &val
+			}
+		}
 		if be, ok := v.backend.(fsSetattrBackend); ok {
-			errno = be.SetAttr(in.NodeID, sizeVal)
+			errno = be.SetAttr(in.NodeID, sizeVal, modeVal)
 			if errno == 0 {
 				attr, e := v.backend.GetAttr(in.NodeID)
 				errno = e

@@ -322,6 +322,19 @@ func (f *containerFile) ModTime() time.Time {
 }
 
 func (f *containerFile) ReadAt(off uint64, size uint32) ([]byte, error) {
+	// Clamp size to the actual file size to avoid reading beyond the end
+	fileSize := uint64(f.entry.Size)
+	if off >= fileSize {
+		return []byte{}, nil
+	}
+	remaining := fileSize - off
+	if uint64(size) > remaining {
+		size = uint32(remaining)
+	}
+	if size == 0 {
+		return []byte{}, nil
+	}
+
 	r, err := f.entry.Open(f.contents)
 	if err != nil {
 		return nil, fmt.Errorf("open entry: %w", err)
@@ -329,12 +342,22 @@ func (f *containerFile) ReadAt(off uint64, size uint32) ([]byte, error) {
 
 	// Use ReadAt directly since Handle implements io.ReaderAt
 	buf := make([]byte, size)
+	// Zero the buffer to avoid garbage data
+	clear(buf)
 	n, err := r.ReadAt(buf, int64(off))
 	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		// Return exactly the bytes read, even if less than requested
+		if n == 0 {
+			return []byte{}, nil
+		}
 		return buf[:n], nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("read at offset %d: %w", off, err)
+	}
+	// Always return exactly the bytes read, even if less than requested
+	if n == 0 {
+		return []byte{}, nil
 	}
 	return buf[:n], nil
 }

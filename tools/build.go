@@ -297,6 +297,71 @@ func isContextOlderThanOutput(contextDir, outputPath string) (bool, error) {
 	return true, nil
 }
 
+// clearCCCache clears the cc cache for a given tar file path.
+// This ensures that when we rebuild a Docker image, cc will re-extract it.
+func clearCCCache(tarPath string) error {
+	// Resolve absolute path (same as cc does)
+	absPath, err := filepath.Abs(tarPath)
+	if err != nil {
+		return fmt.Errorf("resolve tar path: %w", err)
+	}
+
+	// Handle relative paths starting with "./" (same as cc does)
+	if strings.HasPrefix(tarPath, "./") {
+		wd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("get working directory: %w", err)
+		}
+		absPath = filepath.Join(wd, tarPath[2:])
+		absPath, err = filepath.Abs(absPath)
+		if err != nil {
+			return fmt.Errorf("resolve tar path: %w", err)
+		}
+	}
+
+	// Get cache directory (same default as cc uses)
+	cacheDir := os.Getenv("CC_CACHE_DIR")
+	if cacheDir == "" {
+		configDir, err := os.UserConfigDir()
+		if err != nil {
+			return fmt.Errorf("get user config dir: %w", err)
+		}
+		cacheDir = filepath.Join(configDir, "cc", "oci")
+	}
+
+	// Sanitize the tar path for use as a filename (same as cc does)
+	sanitized := sanitizeForFilename(absPath)
+	cachePath := filepath.Join(cacheDir, "images", sanitized)
+
+	// Remove the cache directory if it exists
+	if _, err := os.Stat(cachePath); err == nil {
+		if err := os.RemoveAll(cachePath); err != nil {
+			return fmt.Errorf("remove cache directory: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// sanitizeForFilename sanitizes a string for use as a filename.
+// This matches the implementation in internal/oci/client.go
+func sanitizeForFilename(value string) string {
+	value = strings.TrimPrefix(value, "/")
+	var b strings.Builder
+	for _, r := range value {
+		switch r {
+		case '/', '\\', ':', '?', '*', '"', '<', '>', '|', ' ':
+			b.WriteByte('_')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "root"
+	}
+	return b.String()
+}
+
 func main() {
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
@@ -571,6 +636,12 @@ func main() {
 		}
 
 		if shouldRebuild {
+			// Clear cc cache for this tar file so it will be re-extracted
+			if err := clearCCCache(tarPath); err != nil {
+				// Log but don't fail - cache clearing is best effort
+				fmt.Fprintf(os.Stderr, "warning: failed to clear cc cache: %v\n", err)
+			}
+
 			// Build Docker image
 			imageTag := fmt.Sprintf("cc-test-%s:latest", testName)
 
@@ -601,6 +672,9 @@ func main() {
 		// Run cc with the tar file
 		// Use relative path so cc can load it
 		relativeTarPath := filepath.Join(".", "build", fmt.Sprintf("test-%s.tar", testName))
+		if !filepath.IsAbs(relativeTarPath) {
+			relativeTarPath = strings.Join([]string{".", relativeTarPath}, string(filepath.Separator))
+		}
 		fmt.Printf("Running cc with image %s...\n", relativeTarPath)
 		ccArgs := append([]string{relativeTarPath}, fs.Args()...)
 		if err := runBuildOutput(ccOut, ccArgs); err != nil {

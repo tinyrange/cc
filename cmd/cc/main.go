@@ -41,7 +41,7 @@ func run() error {
 	arch := flag.String("arch", runtime.GOARCH, "Target architecture (amd64, arm64)")
 	cacheDir := flag.String("cache-dir", "", "Cache directory (default: ~/.config/cc/)")
 	cpus := flag.Int("cpus", 1, "Number of vCPUs")
-	memory := flag.Uint64("memory", 256, "Memory in MB")
+	memory := flag.Uint64("memory", 2048, "Memory in MB")
 	debug := flag.Bool("debug", false, "Enable debug logging")
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
 	memprofile := flag.String("memprofile", "", "Write memory profile to file")
