@@ -394,8 +394,8 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
 
 ### Implementation Checklist
 
-- [ ] **Create `internal/devices/virtio/queue.go`** - Common queue logic
-  - [ ] Add `VirtQueue` struct:
+- [x] **Create `internal/devices/virtio/queue.go`** - Common queue logic
+  - [x] Add `VirtQueue` struct:
     ```go
     type VirtQueue struct {
         DescTableAddr  uint64
@@ -406,11 +406,11 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
         NotifyEvent    chan struct{}
     }
     ```
-  - [ ] Add `VirtQueueDescriptor` struct (addr, len, flags, next)
-  - [ ] Add `ReadDescriptor(mem GuestMemory, idx uint16) Descriptor`
-  - [ ] Add `GetAvailableBuffer() (uint16, []VirtQueuePayload, bool)`
-  - [ ] Add `PutUsedBuffer(idx uint16, len uint32)`
-  - [ ] Add interrupt suppression (VIRTQ_USED_F_NO_NOTIFY)
+  - [x] Add `VirtQueueDescriptor` struct (addr, len, flags, next)
+  - [x] Add `ReadDescriptor(mem GuestMemory, idx uint16) Descriptor`
+  - [x] Add `GetAvailableBuffer() (uint16, []VirtQueuePayload, bool)`
+  - [x] Add `PutUsedBuffer(idx uint16, len uint32)`
+  - [x] Add interrupt suppression (VIRTQ_USED_F_NO_NOTIFY)
 
 - [ ] **Create `internal/devices/virtio/device.go`** - Device interface
   - [ ] Add `VirtioDevice` interface:
