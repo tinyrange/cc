@@ -13,11 +13,10 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 		return fmt.Errorf("kvm: virtual machine is nil")
 	}
 
-	if irqLine <= 4 {
-		if level {
-			fmt.Printf("kvm: SetIRQ line=%d level=%v\n", irqLine, level)
-		}
-	}
+	// Debug: uncomment to trace IRQ activity
+	// if irqLine <= 4 && level {
+	// 	fmt.Printf("kvm: SetIRQ line=%d level=%v\n", irqLine, level)
+	// }
 
 	if v.hv.Architecture() == hv.ArchitectureX86_64 && !v.hasIRQChip {
 		return fmt.Errorf("kvm: cannot pulse IRQ without irqchip")
