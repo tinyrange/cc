@@ -185,7 +185,7 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
 
 ### Implementation Checklist
 
-- [ ] **Update `internal/devices/amd64/chipset/pit.go`**
+- [x] **Update `internal/devices/amd64/chipset/pit.go`**
   - [x] Implement `PollDevice` interface for timer callbacks
   - [x] Add `VmTime` abstraction:
     ```go
@@ -211,11 +211,11 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
   - [x] Add timer 2 output status (bit 5)
   - [x] Wire to PIT channel 2
 
-- [ ] **Add unit tests** (`internal/devices/amd64/chipset/pit_test.go`)
-  - [ ] Test mode 2 periodic timer
-  - [ ] Test mode 0 one-shot
-  - [ ] Test counter latch and readback
-  - [ ] Test port 0x61 integration
+- [x] **Add unit tests** (`internal/devices/amd64/chipset/pit_timer_test.go`)
+  - [x] Test mode 2 periodic timer
+  - [x] Test mode 0 one-shot
+  - [x] Test counter latch and readback
+  - [x] Test port 0x61 integration
 
 ---
 
