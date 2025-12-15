@@ -62,6 +62,8 @@ func testFS(t *testing.T, basePath string) {
 	t.Run("RaceConditions", func(t *testing.T) { testRaceConditions(t, workspace) })
 	t.Run("VirtioFSWriteRead", func(t *testing.T) { testVirtioFSWriteRead(t, workspace) })
 	t.Run("VirtioFSExecutable", func(t *testing.T) { testVirtioFSExecutable(t, workspace) })
+	t.Run("Chmod", func(t *testing.T) { testChmod(t, workspace) })
+	t.Run("Chown", func(t *testing.T) { testChown(t, workspace) })
 }
 
 // --- Extended Attributes (Xattr) ---
@@ -545,4 +547,93 @@ func testVirtioFSExecutable(t *testing.T, dir string) {
 		// This shouldn't happen since we exit with 42
 		t.Error("Executable exited with code 0, but expected 42")
 	}
+}
+
+// --- Chmod Test ---
+
+func testChmod(t *testing.T, dir string) {
+	filePath := filepath.Join(dir, "chmod_test")
+	
+	// Create a file with non-executable permissions
+	if err := os.WriteFile(filePath, []byte("test data"), 0644); err != nil {
+		t.Fatalf("Failed to create file: %v", err)
+	}
+	defer os.Remove(filePath)
+
+	// Verify initial permissions (should not be executable)
+	info, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("Failed to stat file: %v", err)
+	}
+	initialMode := info.Mode()
+	if initialMode&0111 != 0 {
+		t.Logf("File already has executable bits set: %o", initialMode)
+	}
+
+	// Chmod to make it executable (0755)
+	if err := os.Chmod(filePath, 0755); err != nil {
+		t.Fatalf("Failed to chmod file: %v", err)
+	}
+
+	// Verify permissions changed
+	info, err = os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("Failed to stat file after chmod: %v", err)
+	}
+	newMode := info.Mode()
+	if newMode&0111 == 0 {
+		t.Errorf("File is not executable after chmod. Mode: %o", newMode)
+	}
+	if newMode&0755 != 0755 {
+		t.Errorf("Unexpected file mode. Want 0755, Got %o", newMode&0777)
+	}
+
+	t.Logf("Chmod successful: %o -> %o", initialMode&0777, newMode&0777)
+}
+
+// --- Chown Test ---
+
+func testChown(t *testing.T, dir string) {
+	filePath := filepath.Join(dir, "chown_test")
+	
+	// Create a file
+	if err := os.WriteFile(filePath, []byte("test data"), 0644); err != nil {
+		t.Fatalf("Failed to create file: %v", err)
+	}
+	defer os.Remove(filePath)
+
+	// Get current UID and GID
+	var st syscall.Stat_t
+	if err := syscall.Stat(filePath, &st); err != nil {
+		t.Fatalf("Failed to stat file: %v", err)
+	}
+	currentUID := int(st.Uid)
+	currentGID := int(st.Gid)
+
+	t.Logf("Current file ownership: UID=%d, GID=%d", currentUID, currentGID)
+
+	// Try to chown to current user (should succeed)
+	// This tests that chown works even when not changing ownership
+	if err := os.Chown(filePath, currentUID, currentGID); err != nil {
+		// Chown might fail on some filesystems (e.g., if not root)
+		// But chowning to the same owner should generally work
+		if err == syscall.EPERM || err == syscall.EACCES {
+			t.Skipf("Chown requires elevated privileges: %v", err)
+		}
+		t.Fatalf("Failed to chown file to current user: %v", err)
+	}
+
+	// Verify ownership (should be unchanged, but chown should have succeeded)
+	var st2 syscall.Stat_t
+	if err := syscall.Stat(filePath, &st2); err != nil {
+		t.Fatalf("Failed to stat file after chown: %v", err)
+	}
+	if int(st2.Uid) != currentUID {
+		t.Errorf("UID mismatch after chown. Want %d, Got %d", currentUID, st2.Uid)
+	}
+	if int(st2.Gid) != currentGID {
+		t.Errorf("GID mismatch after chown. Want %d, Got %d", currentGID, st2.Gid)
+	}
+
+	t.Logf("Chown successful: UID=%d, GID=%d", st2.Uid, st2.Gid)
 }

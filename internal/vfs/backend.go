@@ -970,11 +970,11 @@ func (v *virtioFsBackend) Rmdir(parent uint64, name string) int32 {
 	return 0
 }
 
-func (v *virtioFsBackend) SetAttr(nodeID uint64, size *uint64) int32 {
+func (v *virtioFsBackend) SetAttr(nodeID uint64, size *uint64, mode *uint32) int32 {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	if size == nil {
+	if size == nil && mode == nil {
 		return 0
 	}
 	v.ensureRoot()
@@ -982,8 +982,17 @@ func (v *virtioFsBackend) SetAttr(nodeID uint64, size *uint64) int32 {
 	if err != 0 {
 		return err
 	}
-	if truncErr := n.truncate(*size); truncErr != nil {
-		return -int32(linux.EIO)
+	if size != nil {
+		if truncErr := n.truncate(*size); truncErr != nil {
+			return -int32(linux.EIO)
+		}
+	}
+	if mode != nil {
+		// Preserve file type bits (directory, symlink, etc.) and only update permission bits
+		oldType := n.mode &^ 0777
+		newPerm := fs.FileMode(*mode) & 0777
+		n.mode = oldType | newPerm
+		n.modTime = time.Now()
 	}
 	return 0
 }
