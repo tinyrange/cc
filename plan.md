@@ -433,16 +433,16 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
   - [ ] Factor out common transport logic (deferred - requires PCI implementation)
   - [ ] Use new `VirtQueue` abstraction throughout (deferred - requires refactoring)
 
-- [ ] **Create `internal/devices/virtio/pci.go`** - PCI transport
-  - [ ] Add `VirtioPciDevice` struct
-  - [ ] Implement PCI config space (vendor=0x1AF4, device=0x1000+device_id)
-  - [ ] Add virtio PCI capabilities:
-    - [ ] Common config (cap type 1)
-    - [ ] Notify config (cap type 2)
-    - [ ] ISR config (cap type 3)
-    - [ ] Device config (cap type 4)
-  - [ ] Add BAR0 for MMIO registers
-  - [ ] Add MSI-X support (optional)
+- [x] **Create `internal/devices/virtio/pci.go`** - PCI transport
+  - [x] Add `VirtioPciDevice` struct
+  - [x] Implement PCI config space (vendor=0x1AF4, device=0x1000+device_id)
+  - [x] Add virtio PCI capabilities:
+    - [x] Common config (cap type 1)
+    - [x] Notify config (cap type 2)
+    - [x] ISR config (cap type 3)
+    - [x] Device config (cap type 4)
+  - [x] Add BAR0 for MMIO registers
+  - [x] Add MSI-X support (optional)
 
 - [ ] **Add unit tests**
   - [ ] Test queue descriptor chain walking
