@@ -194,7 +194,7 @@ func run() error {
 
 	// Boot the VM first to set up devices
 	if err := func() error {
-		ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
 
 		vm.VirtualCPUCall(0, func(vcpu hv.VirtualCPU) error {
@@ -213,6 +213,7 @@ func run() error {
 				},
 			},
 		}); err != nil {
+			fmt.Fprintf(os.Stderr, "cc: VM boot failed: %v\n", err)
 			if err := vm.VirtualCPUCall(0, func(vcpu hv.VirtualCPU) error {
 				// figure out the current state
 				regs := map[hv.Register]hv.RegisterValue{
