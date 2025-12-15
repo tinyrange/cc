@@ -108,8 +108,8 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
 
 ### Implementation Checklist
 
-- [ ] **Update `internal/devices/amd64/chipset/pic.go`**
-  - [ ] Add `picStats` struct:
+- [x] **Update `internal/devices/amd64/chipset/pic.go`**
+  - [x] Add `picStats` struct:
     ```go
     type picStats struct {
         spuriousInterrupts uint64
@@ -117,13 +117,13 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
         perIRQ             [8]uint64
     }
     ```
-  - [ ] Track spurious IRQ7/IRQ15 delivery
-  - [ ] Add per-line interrupt counters
-  - [ ] Implement rotate-on-auto-EOI (OCW2 R=1, SL=0, EOI=1)
-  - [ ] Implement special mask mode (OCW3 SMM/ESMM bits)
-  - [ ] Add poll command implementation (OCW3 P bit) - partially done
-  - [ ] Add `Init(vm hv.VirtualMachine) error` with reset logic
-  - [ ] Add snapshot/restore support (`DeviceSnapshotter` interface)
+  - [x] Track spurious IRQ7/IRQ15 delivery
+  - [x] Add per-line interrupt counters
+  - [x] Implement rotate-on-auto-EOI (OCW2 R=1, SL=0, EOI=1)
+  - [x] Implement special mask mode (OCW3 SMM/ESMM bits)
+  - [x] Add poll command implementation (OCW3 P bit) - partially done
+  - [x] Add `Init(vm hv.VirtualMachine) error` with reset logic
+  - [x] Add snapshot/restore support (`DeviceSnapshotter` interface)
 
 ---
 
