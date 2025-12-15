@@ -293,11 +293,11 @@ func (i *IOAPIC) writeRedirection(index uint8, value uint32) {
 		raw |= val & lowMask
 	}
 	entry.redirection.setRaw(raw)
-	if line < 4 && i.debugRedirLogs[line] < 8 {
-		i.debugRedirLogs[line]++
-		fmt.Printf("ioapic: redir[%d] write idx=%d val=%08x raw=%016x masked=%v vector=%02x dest=%02x level=%v\n",
-			line, index, value, raw, entry.redirection.masked(), entry.redirection.vector(), entry.redirection.destination(), entry.redirection.isLevelCapable())
-	}
+	// if line < 4 && i.debugRedirLogs[line] < 8 {
+	// 	i.debugRedirLogs[line]++
+	// 	// fmt.Printf("ioapic: redir[%d] write idx=%d val=%08x raw=%016x masked=%v vector=%02x dest=%02x level=%v\n",
+	// 	// line, index, value, raw, entry.redirection.masked(), entry.redirection.vector(), entry.redirection.destination(), entry.redirection.isLevelCapable())
+	// }
 
 	isMasked := entry.redirection.masked()
 

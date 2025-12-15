@@ -355,7 +355,7 @@ func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 		vm.ioapic.SetRouting(x86chipset.IoApicRoutingFunc(func(vector, dest, destMode, deliveryMode uint8, level bool) {
 			// In split IRQ chip mode, we inject interrupts via MSI to the in-kernel LAPIC.
 			// IOAPIC edge-triggered lines set level=false, but still require injection.
-			fmt.Printf("ioapic: assert vec=%02x dest=%d destMode=%d delivery=%d level=%v\n", vector, dest, destMode, deliveryMode, level)
+			// fmt.Printf("ioapic: assert vec=%02x dest=%d destMode=%d delivery=%d level=%v\n", vector, dest, destMode, deliveryMode, level)
 			if err := vm.InjectInterrupt(vector, dest, destMode, deliveryMode); err != nil {
 				// Best-effort log; avoid hard fail to keep guest progressing.
 				fmt.Printf("kvm: inject IOAPIC interrupt vec=%d dest=%d err=%v\n", vector, dest, err)

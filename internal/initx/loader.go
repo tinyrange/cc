@@ -561,15 +561,10 @@ func NewVirtualMachine(
 			args = append(args,
 				"reboot=k",
 				"panic=-1",
-				// disable kaslr for reproducible boot
-				"nokaslr",
 			)
 
 			switch h.Architecture() {
 			case hv.ArchitectureX86_64:
-				// Disable i8042 keyboard/mouse probing to avoid 1s delay
-				args = append(args, "i8042.noaux", "i8042.nokbd")
-				args = append(args, "lpj=50000000")
 				if runtime.GOOS == "windows" {
 					// hack since Windows doesn't have kvm_clock
 					args = append(args, []string{
