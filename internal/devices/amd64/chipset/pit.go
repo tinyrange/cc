@@ -264,6 +264,27 @@ func (p *PIT) armChannel0Locked() {
 		})
 		return
 	}
+	if ch.control.mode == pitMode4 {
+		// Mode 4: Software triggered strobe (one-shot pulse)
+		timer := time.AfterFunc(period, func() { p.handleChannel0Strobe() })
+		ch.timer = timerHandleFunc(func() {
+			timer.Stop()
+		})
+		return
+	}
+	if ch.control.mode == pitMode3 {
+		// Mode 3: Square wave generator - 50% duty cycle
+		// For even counts: high for n/2, low for n/2
+		// For odd counts: high for (n+1)/2, low for (n-1)/2
+		// Output toggles every half period, interrupt on falling edge
+		ch.outputHigh = true
+		ch.squareWaveHigh = true
+		// Use full period timer, toggle happens at half period internally
+		handle := p.timerFactory(period, func() { p.handleChannel0SquareWavePeriod() })
+		ch.timer = handle
+		return
+	}
+	// Mode 2: Rate generator (periodic pulse)
 	handle := p.timerFactory(period, func() { p.handleChannel0Tick() })
 	ch.timer = handle
 }
@@ -284,13 +305,63 @@ func (p *PIT) handleChannel0Tick() {
 	if !ch.running || ch.reload == 0 {
 		return
 	}
+	// Mode 2: Rate generator - output pulses low for one tick at end of period
 	ch.lastReload = p.now()
-	ch.toggleOutput()
+	ch.outputHigh = false
 	if p.debugCh0Ticks < 8 {
 		p.debugCh0Ticks++
-		fmt.Printf("pit: ch0 tick reload=%04x outputHigh=%v\n", ch.reload, ch.outputHigh)
+		fmt.Printf("pit: ch0 tick (mode2) reload=%04x outputHigh=%v\n", ch.reload, ch.outputHigh)
 	}
 	p.raiseIRQLocked(0)
+	// Output goes high again immediately (next tick will be high)
+	ch.outputHigh = true
+}
+
+func (p *PIT) handleChannel0SquareWavePeriod() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	ch := p.timers[0]
+	if !ch.running || ch.reload == 0 {
+		return
+	}
+	counts := ch.effectiveReload()
+	if counts == 0 {
+		return
+	}
+	period := time.Duration(counts) * p.tick
+	halfPeriod := period / 2
+	if counts%2 == 1 {
+		halfPeriod = time.Duration((counts+1)/2) * p.tick
+	}
+
+	// Check if we're at the half-period point (falling edge - generate interrupt)
+	elapsed := p.now().Sub(ch.lastReload)
+	if elapsed >= halfPeriod {
+		// Falling edge - output goes low, generate interrupt
+		ch.squareWaveHigh = false
+		ch.outputHigh = false
+		p.raiseIRQLocked(0)
+	} else {
+		// Rising edge - output goes high
+		ch.squareWaveHigh = true
+		ch.outputHigh = true
+	}
+	ch.lastReload = p.now()
+}
+
+func (p *PIT) handleChannel0Strobe() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	ch := p.timers[0]
+	// Mode 4: Software triggered strobe - pulse low for one tick
+	ch.outputHigh = false
+	ch.running = false
+	p.disarmChannel0Locked()
+	p.raiseIRQLocked(0)
+	// Output goes high again immediately
+	ch.outputHigh = true
 }
 
 func (p *PIT) handleChannel0OneShot() {
@@ -359,6 +430,9 @@ type pitChannel struct {
 	latchedReadValue uint16
 
 	deadline time.Time
+
+	// Mode 3 (square wave) state
+	squareWaveHigh bool
 }
 
 type pitControl struct {
@@ -386,6 +460,7 @@ func (ch *pitChannel) setControl(access pitAccessMode, mode pitMode, bcd bool) {
 	ch.running = false
 	ch.outputHigh = true
 	ch.deadline = time.Time{}
+	ch.squareWaveHigh = false
 }
 
 func (ch *pitChannel) write(now time.Time, tick time.Duration, value byte) bool {
@@ -415,14 +490,25 @@ func (ch *pitChannel) write(now time.Time, tick time.Duration, value byte) bool 
 	ch.readHigh = false
 	ch.countLatched = false
 	ch.statusLatched = false
-	ch.outputHigh = true
-	if ch.control.mode == pitMode0 {
-		// One-shot countdown to zero; record deadline for faster reads.
+	ch.deadline = time.Time{}
+	switch ch.control.mode {
+	case pitMode0:
+		// Mode 0: One-shot countdown to zero; record deadline for faster reads.
 		ch.deadline = now.Add(time.Duration(ch.effectiveReload()) * tick)
 		// OUT goes low shortly after loading the count while the timer runs.
 		ch.outputHigh = false
-	} else {
-		ch.deadline = time.Time{}
+	case pitMode2:
+		// Mode 2: Rate generator - output stays high during countdown
+		ch.outputHigh = true
+	case pitMode3:
+		// Mode 3: Square wave - output starts high
+		ch.outputHigh = true
+		ch.squareWaveHigh = true
+	case pitMode4:
+		// Mode 4: Software triggered strobe - output stays high until count expires
+		ch.outputHigh = true
+	default:
+		ch.outputHigh = true
 	}
 	_ = tick
 	return true
@@ -476,13 +562,18 @@ func (ch *pitChannel) nextReadableValue(now time.Time, tick time.Duration) (uint
 
 func (ch *pitChannel) currentCount(now time.Time, tick time.Duration) uint16 {
 	if !ch.running {
-		if ch.control.mode == pitMode0 {
+		switch ch.control.mode {
+		case pitMode0:
 			if ch.outputHigh {
 				return 0
 			}
 			return ch.reload
+		case pitMode4:
+			// Mode 4: After strobe, output is high
+			return ch.reload
+		default:
+			return ch.reload
 		}
-		return ch.reload
 	}
 	if !ch.deadline.IsZero() && ch.control.mode == pitMode0 {
 		remaining := ch.deadline.Sub(now)
@@ -508,14 +599,25 @@ func (ch *pitChannel) currentCount(now time.Time, tick time.Duration) uint16 {
 		return ch.reload
 	}
 	if ticks >= period {
-		// Mode 0 (interrupt on terminal count) drives output low when
-		// the counter reaches zero; Linux polls this on channel 2.
-		if ch.control.mode == pitMode0 {
-			ch.outputHigh = false
+		switch ch.control.mode {
+		case pitMode0:
+			ch.outputHigh = true
 			ch.running = false
 			return 0
+		case pitMode2:
+			// Mode 2: Output pulses low at end of period, then reloads
+			ticks %= period
+		case pitMode3:
+			// Mode 3: Square wave continues
+			ticks %= period
+		case pitMode4:
+			// Mode 4: One-shot strobe, output goes high after pulse
+			ch.outputHigh = true
+			ch.running = false
+			return ch.reload
+		default:
+			ticks %= period
 		}
-		ticks %= period
 	}
 	if ticks == 0 {
 		return ch.reload

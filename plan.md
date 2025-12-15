@@ -196,12 +196,12 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
     }
     ```
   - [x] Implement mode 0 (interrupt on terminal count)
-  - [ ] Implement mode 2 (rate generator) - currently present
-  - [ ] Implement mode 3 (square wave generator)
-  - [ ] Implement mode 4 (software triggered strobe)
-  - [ ] Add readback command (0xC2 on port 0x43)
-  - [ ] Add status latch command
-  - [ ] Fix counter latch for 16-bit reads
+  - [x] Implement mode 2 (rate generator) - periodic pulse
+  - [x] Implement mode 3 (square wave generator) - 50% duty cycle
+  - [x] Implement mode 4 (software triggered strobe) - one-shot pulse
+  - [x] Add readback command (0xC2 on port 0x43)
+  - [x] Add status latch command
+  - [x] Fix counter latch for 16-bit reads
 
 - [x] **Implement Port 0x61** (`internal/devices/amd64/chipset/port61.go`)
   - [x] Create `Port61` device struct
