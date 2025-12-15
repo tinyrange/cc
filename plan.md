@@ -370,11 +370,11 @@ Reference: OpenVMM codebase at `~/dev/org/openvmm`
   - [x] Add register width parameter (1/2/4 byte stride)
   - [x] Map MMIO offsets to register indices
 
-- [ ] **Add unit tests**
-  - [ ] Test THR/RHR with FIFO
-  - [ ] Test interrupt generation
-  - [ ] Test modem control loopback
-  - [ ] Test MMIO access patterns
+- [x] **Add unit tests**
+  - [x] Test THR/RHR with FIFO
+  - [x] Test interrupt generation
+  - [x] Test modem control loopback
+  - [x] Test MMIO access patterns
 
 ---
 
