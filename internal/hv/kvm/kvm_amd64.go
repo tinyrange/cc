@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"unsafe"
 
-	"github.com/tinyrange/cc/internal/devices/amd64/chipset"
+	x86chipset "github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	"github.com/tinyrange/cc/internal/hv"
 	"golang.org/x/sys/unix"
 )
@@ -269,6 +269,9 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		mmioData := (*kvmExitMMIOData)(unsafe.Pointer(&run.anon0[0]))
 
 		return v.handleMMIO(mmioData)
+	case kvmExitIoapicEoi:
+		eoiData := (*kvmExitIoapicEoiData)(unsafe.Pointer(&run.anon0[0]))
+		return v.handleIoapicEoi(eoiData)
 	case kvmExitShutdown:
 		return hv.ErrVMHalted
 	case kvmExitSystemEvent:
@@ -285,59 +288,50 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 }
 
 func (v *virtualCPU) handleIO(ioData *kvmExitIoData) error {
-	for _, dev := range v.vm.devices {
-		if kvmIoPortDevice, ok := dev.(hv.X86IOPortDevice); ok {
-			ports := kvmIoPortDevice.IOPorts()
-			for _, port := range ports {
-				if port == ioData.port {
-					data := v.run[ioData.dataOffset : ioData.dataOffset+uint64(ioData.size)*uint64(ioData.count)]
+	data := v.run[ioData.dataOffset : ioData.dataOffset+uint64(ioData.size)*uint64(ioData.count)]
 
-					if ioData.direction == 0 {
-						if err := kvmIoPortDevice.ReadIOPort(ioData.port, data); err != nil {
-							return fmt.Errorf("I/O port 0x%04x read: %w", ioData.port, err)
-						}
-					} else {
-						if err := kvmIoPortDevice.WriteIOPort(ioData.port, data); err != nil {
-							return fmt.Errorf("I/O port 0x%04x write: %w", ioData.port, err)
-						}
-					}
+	v.trace(fmt.Sprintf("handleIO port=0x%04x size=%d count=%d direction=%d data=% x",
+		ioData.port, ioData.size, ioData.count, ioData.direction, data))
 
-					return nil
-				}
-			}
-		}
+	cs, err := v.vm.ensureChipset()
+	if err != nil {
+		return fmt.Errorf("initialize chipset: %w", err)
 	}
 
-	return fmt.Errorf("no device handles I/O port 0x%04x", ioData.port)
+	isWrite := ioData.direction != 0
+	if err := cs.HandlePIO(ioData.port, data, isWrite); err != nil {
+		return fmt.Errorf("I/O port 0x%04x: %w", ioData.port, err)
+	}
+	return nil
 }
 
 func (v *virtualCPU) handleMMIO(mmioData *kvmExitMMIOData) error {
-	for _, dev := range v.vm.devices {
-		if kvmMmioDevice, ok := dev.(hv.MemoryMappedIODevice); ok {
-			addr := mmioData.physAddr
-			size := uint32(len(mmioData.data))
-			regions := kvmMmioDevice.MMIORegions()
-			for _, region := range regions {
-				if addr >= region.Address && addr+uint64(size) <= region.Address+region.Size {
-					data := mmioData.data[:size]
+	v.trace(fmt.Sprintf("handleMMIO physAddr=0x%016x size=%d isWrite=%d data=% x",
+		mmioData.physAddr, mmioData.len, mmioData.isWrite, mmioData.data))
 
-					if mmioData.isWrite == 0 {
-						if err := kvmMmioDevice.ReadMMIO(addr, data); err != nil {
-							return fmt.Errorf("MMIO read at 0x%016x: %w", addr, err)
-						}
-					} else {
-						if err := kvmMmioDevice.WriteMMIO(addr, data); err != nil {
-							return fmt.Errorf("MMIO write at 0x%016x: %w", addr, err)
-						}
-					}
-
-					return nil
-				}
-			}
-		}
+	cs, err := v.vm.ensureChipset()
+	if err != nil {
+		return fmt.Errorf("initialize chipset: %w", err)
 	}
 
-	return fmt.Errorf("no device handles MMIO at 0x%016x", mmioData.physAddr)
+	size := int(mmioData.len)
+	if size < 0 || size > len(mmioData.data) {
+		return fmt.Errorf("MMIO length %d out of bounds (data len %d)", size, len(mmioData.data))
+	}
+	data := mmioData.data[:size]
+	isWrite := mmioData.isWrite != 0
+
+	if err := cs.HandleMMIO(mmioData.physAddr, data, isWrite); err != nil {
+		return fmt.Errorf("MMIO at 0x%016x: %w", mmioData.physAddr, err)
+	}
+	return nil
+}
+
+func (v *virtualCPU) handleIoapicEoi(eoiData *kvmExitIoapicEoiData) error {
+	if v.vm.ioapic != nil {
+		v.vm.ioapic.HandleEOI(uint32(eoiData.vector))
+	}
+	return nil
 }
 
 func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
@@ -357,19 +351,11 @@ func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 
 		vm.hasIRQChip = true
 
-		if err := createPIT(vm.vmFd); err != nil && err != unix.ENOENT {
-			return fmt.Errorf("creating PIT: %w", err)
-		} else if err == nil {
-			vm.hasPIT = true
-		}
-
-		vm.ioapic = chipset.NewIOAPIC(24)
-		vm.ioapic.SetRouting(chipset.IoApicRoutingFunc(func(vector, dest, destMode, deliveryMode uint8, level bool) {
+		vm.ioapic = x86chipset.NewIOAPIC(24)
+		vm.ioapic.SetRouting(x86chipset.IoApicRoutingFunc(func(vector, dest, destMode, deliveryMode uint8, level bool) {
 			// In split IRQ chip mode, we inject interrupts via MSI to the in-kernel LAPIC.
-			// Only inject on assert (level=true); de-assert is handled by EOI.
-			if !level {
-				return
-			}
+			// IOAPIC edge-triggered lines set level=false, but still require injection.
+			// fmt.Printf("ioapic: assert vec=%02x dest=%d destMode=%d delivery=%d level=%v\n", vector, dest, destMode, deliveryMode, level)
 			if err := vm.InjectInterrupt(vector, dest, destMode, deliveryMode); err != nil {
 				// Best-effort log; avoid hard fail to keep guest progressing.
 				fmt.Printf("kvm: inject IOAPIC interrupt vec=%d dest=%d err=%v\n", vector, dest, err)
@@ -393,6 +379,20 @@ func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int) error {
 	cpuId, err := getSupportedCpuId(hv.fd)
 	if err != nil {
 		return fmt.Errorf("getting vCPU ID: %w", err)
+	}
+
+	// Normalize CPUID-reported APIC IDs to match LAPIC ID 0 in our ACPI/MADT.
+	// Hosts may return a non-zero APIC ID in leaf 0x1 EBX[31:24], which leads
+	// to kernel warnings and can break timer setup during boot.
+	entries := unsafe.Slice((*kvmCPUIDEntry2)(unsafe.Pointer(uintptr(unsafe.Pointer(cpuId))+unsafe.Sizeof(*cpuId))), cpuId.Nr)
+	for i := range entries {
+		switch entries[i].Function {
+		case 0x1:
+			entries[i].Ebx &^= 0xFF000000 // clear initial APIC ID
+		case 0xB: // extended topology (x2APIC ID in EDX)
+			entries[i].Ebx = 1 // one logical processor at this level
+			entries[i].Edx = 0 // x2APIC ID
+		}
 	}
 
 	if err := setVCPUID(vcpuFd, cpuId); err != nil {

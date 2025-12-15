@@ -21,46 +21,46 @@ const (
 	gicrPendbaser = 0x0078 // LPI Pending Table Address
 
 	// SGI_base (second 64KB of each redistributor)
-	gicrSGIOffset    = 0x10000
-	gicrIgroupr0     = gicrSGIOffset + 0x0080  // Interrupt Group Register 0
-	gicrIsenabler0   = gicrSGIOffset + 0x0100  // Interrupt Set-Enable Register 0
-	gicrIcenabler0   = gicrSGIOffset + 0x0180  // Interrupt Clear-Enable Register 0
-	gicrIspendr0     = gicrSGIOffset + 0x0200  // Interrupt Set-Pending Register 0
-	gicrIcpendr0     = gicrSGIOffset + 0x0280  // Interrupt Clear-Pending Register 0
-	gicrIsactiver0   = gicrSGIOffset + 0x0300  // Interrupt Set-Active Register 0
-	gicrIcactiver0   = gicrSGIOffset + 0x0380  // Interrupt Clear-Active Register 0
-	gicrIpriorityr   = gicrSGIOffset + 0x0400  // Interrupt Priority Registers (0-7)
-	gicrIcfgr0       = gicrSGIOffset + 0x0C00  // Interrupt Configuration Register 0
-	gicrIcfgr1       = gicrSGIOffset + 0x0C04  // Interrupt Configuration Register 1
-	gicrIgrpmodr0    = gicrSGIOffset + 0x0D00  // Interrupt Group Modifier Register 0
-	gicrNsacr        = gicrSGIOffset + 0x0E00  // Non-secure Access Control Register
+	gicrSGIOffset  = 0x10000
+	gicrIgroupr0   = gicrSGIOffset + 0x0080 // Interrupt Group Register 0
+	gicrIsenabler0 = gicrSGIOffset + 0x0100 // Interrupt Set-Enable Register 0
+	gicrIcenabler0 = gicrSGIOffset + 0x0180 // Interrupt Clear-Enable Register 0
+	gicrIspendr0   = gicrSGIOffset + 0x0200 // Interrupt Set-Pending Register 0
+	gicrIcpendr0   = gicrSGIOffset + 0x0280 // Interrupt Clear-Pending Register 0
+	gicrIsactiver0 = gicrSGIOffset + 0x0300 // Interrupt Set-Active Register 0
+	gicrIcactiver0 = gicrSGIOffset + 0x0380 // Interrupt Clear-Active Register 0
+	gicrIpriorityr = gicrSGIOffset + 0x0400 // Interrupt Priority Registers (0-7)
+	gicrIcfgr0     = gicrSGIOffset + 0x0C00 // Interrupt Configuration Register 0
+	gicrIcfgr1     = gicrSGIOffset + 0x0C04 // Interrupt Configuration Register 1
+	gicrIgrpmodr0  = gicrSGIOffset + 0x0D00 // Interrupt Group Modifier Register 0
+	gicrNsacr      = gicrSGIOffset + 0x0E00 // Non-secure Access Control Register
 
 	// Peripheral ID registers (at the end of each 64KB block)
-	gicrPidr2RDBase  = 0xFFE8 // Peripheral ID 2 (RD_base)
+	gicrPidr2RDBase  = 0xFFE8                 // Peripheral ID 2 (RD_base)
 	gicrPidr2SGIBase = gicrSGIOffset + 0xFFE8 // Peripheral ID 2 (SGI_base)
 
 	// GIC Distributor offsets
-	gicdCtlr        = 0x0000 // Distributor Control Register
-	gicdTyper       = 0x0004 // Interrupt Controller Type Register
-	gicdIidr        = 0x0008 // Distributor Implementer Identification Register
-	gicdTyper2      = 0x000C // Interrupt Controller Type Register 2
-	gicdStatusr     = 0x0010 // Error Reporting Status Register
-	gicdSetspi_nsr  = 0x0040 // Set SPI Register (Non-secure)
-	gicdClrspi_nsr  = 0x0048 // Clear SPI Register (Non-secure)
-	gicdIgroupr     = 0x0080 // Interrupt Group Registers
-	gicdIsenabler   = 0x0100 // Interrupt Set-Enable Registers
-	gicdIcenabler   = 0x0180 // Interrupt Clear-Enable Registers
-	gicdIspendr     = 0x0200 // Interrupt Set-Pending Registers
-	gicdIcpendr     = 0x0280 // Interrupt Clear-Pending Registers
-	gicdIsactiver   = 0x0300 // Interrupt Set-Active Registers
-	gicdIcactiver   = 0x0380 // Interrupt Clear-Active Registers
-	gicdIpriorityr  = 0x0400 // Interrupt Priority Registers
-	gicdItargetsr   = 0x0800 // Interrupt Processor Targets Registers (GICv2 compat)
-	gicdIcfgr       = 0x0C00 // Interrupt Configuration Registers
-	gicdIgrpmodr    = 0x0D00 // Interrupt Group Modifier Registers
-	gicdNsacr       = 0x0E00 // Non-secure Access Control Registers
-	gicdIrouter     = 0x6000 // Interrupt Routing Registers
-	gicdPidr2       = 0xFFE8 // Peripheral ID 2
+	gicdCtlr       = 0x0000 // Distributor Control Register
+	gicdTyper      = 0x0004 // Interrupt Controller Type Register
+	gicdIidr       = 0x0008 // Distributor Implementer Identification Register
+	gicdTyper2     = 0x000C // Interrupt Controller Type Register 2
+	gicdStatusr    = 0x0010 // Error Reporting Status Register
+	gicdSetspi_nsr = 0x0040 // Set SPI Register (Non-secure)
+	gicdClrspi_nsr = 0x0048 // Clear SPI Register (Non-secure)
+	gicdIgroupr    = 0x0080 // Interrupt Group Registers
+	gicdIsenabler  = 0x0100 // Interrupt Set-Enable Registers
+	gicdIcenabler  = 0x0180 // Interrupt Clear-Enable Registers
+	gicdIspendr    = 0x0200 // Interrupt Set-Pending Registers
+	gicdIcpendr    = 0x0280 // Interrupt Clear-Pending Registers
+	gicdIsactiver  = 0x0300 // Interrupt Set-Active Registers
+	gicdIcactiver  = 0x0380 // Interrupt Clear-Active Registers
+	gicdIpriorityr = 0x0400 // Interrupt Priority Registers
+	gicdItargetsr  = 0x0800 // Interrupt Processor Targets Registers (GICv2 compat)
+	gicdIcfgr      = 0x0C00 // Interrupt Configuration Registers
+	gicdIgrpmodr   = 0x0D00 // Interrupt Group Modifier Registers
+	gicdNsacr      = 0x0E00 // Non-secure Access Control Registers
+	gicdIrouter    = 0x6000 // Interrupt Routing Registers
+	gicdPidr2      = 0xFFE8 // Peripheral ID 2
 
 	// Architecture version in PIDR2
 	gicArchRevGICv1 = 0x10

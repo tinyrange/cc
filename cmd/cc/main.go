@@ -194,8 +194,16 @@ func run() error {
 
 	// Boot the VM first to set up devices
 	if err := func() error {
-		ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
 		defer cancel()
+
+		vm.VirtualCPUCall(0, func(vcpu hv.VirtualCPU) error {
+			debug, ok := vcpu.(hv.VirtualCPUDebug)
+			if !ok {
+				return nil
+			}
+			return debug.EnableTrace(64)
+		})
 
 		if err := vm.Run(ctx, &ir.Program{
 			Entrypoint: "main",
@@ -205,6 +213,102 @@ func run() error {
 				},
 			},
 		}); err != nil {
+			if err := vm.VirtualCPUCall(0, func(vcpu hv.VirtualCPU) error {
+				// figure out the current state
+				regs := map[hv.Register]hv.RegisterValue{
+					hv.RegisterAMD64Rax:    hv.Register64(0),
+					hv.RegisterAMD64Rbx:    hv.Register64(0),
+					hv.RegisterAMD64Rcx:    hv.Register64(0),
+					hv.RegisterAMD64Rdx:    hv.Register64(0),
+					hv.RegisterAMD64Rsi:    hv.Register64(0),
+					hv.RegisterAMD64Rdi:    hv.Register64(0),
+					hv.RegisterAMD64Rsp:    hv.Register64(0),
+					hv.RegisterAMD64Rbp:    hv.Register64(0),
+					hv.RegisterAMD64Rip:    hv.Register64(0),
+					hv.RegisterAMD64Rflags: hv.Register64(0),
+				}
+
+				if err := vcpu.GetRegisters(regs); err != nil {
+					return fmt.Errorf("get registers: %w", err)
+				}
+
+				fmt.Fprintf(os.Stderr, "cc: VM boot failed, vCPU state:\n"+
+					"  RAX:    0x%016x\n"+
+					"  RBX:    0x%016x\n"+
+					"  RCX:    0x%016x\n"+
+					"  RDX:    0x%016x\n"+
+					"  RSI:    0x%016x\n"+
+					"  RDI:    0x%016x\n"+
+					"  RSP:    0x%016x\n"+
+					"  RBP:    0x%016x\n"+
+					"  RIP:    0x%016x\n"+
+					"  RFLAGS: 0x%016x\n",
+					regs[hv.RegisterAMD64Rax],
+					regs[hv.RegisterAMD64Rbx],
+					regs[hv.RegisterAMD64Rcx],
+					regs[hv.RegisterAMD64Rdx],
+					regs[hv.RegisterAMD64Rsi],
+					regs[hv.RegisterAMD64Rdi],
+					regs[hv.RegisterAMD64Rsp],
+					regs[hv.RegisterAMD64Rbp],
+					regs[hv.RegisterAMD64Rip],
+					regs[hv.RegisterAMD64Rflags],
+				)
+
+				pc, err := vm.DumpStackTrace(vcpu)
+				if err != nil {
+					return fmt.Errorf("dump stack trace: %w", err)
+				}
+
+				// Dump a hexdump of RIP to RIP+128 bytes
+				mem := make([]byte, 128)
+				if _, err := vcpu.VirtualMachine().ReadAt(mem, pc); err != nil {
+					return fmt.Errorf("read memory at RIP: %w", err)
+				}
+				func(mem []byte) {
+					const bytesPerLine = 16
+					for i := 0; i < len(mem); i += bytesPerLine {
+						lineEnd := min(i+bytesPerLine, len(mem))
+						line := mem[i:lineEnd]
+						fmt.Fprintf(os.Stderr, "  %016x: ", uint64(pc)+uint64(i))
+						for j := range bytesPerLine {
+							if j < len(line) {
+								fmt.Fprintf(os.Stderr, "%02x ", line[j])
+							} else {
+								fmt.Fprintf(os.Stderr, "   ")
+							}
+						}
+						fmt.Fprintf(os.Stderr, " ")
+						for _, b := range line {
+							if b >= 32 && b <= 126 {
+								fmt.Fprintf(os.Stderr, "%c", b)
+							} else {
+								fmt.Fprintf(os.Stderr, ".")
+							}
+						}
+						fmt.Fprintf(os.Stderr, "\n")
+					}
+				}(mem)
+
+				// Get the trace buffer
+				if debug, ok := vcpu.(hv.VirtualCPUDebug); ok {
+					trace, err := debug.GetTraceBuffer()
+					if err != nil {
+						return fmt.Errorf("get trace buffer: %w", err)
+					}
+
+					fmt.Fprintf(os.Stderr, "\ntrace buffer:\n")
+
+					for _, entry := range trace {
+						fmt.Fprintf(os.Stderr, "  %s\n", entry)
+					}
+				}
+
+				return nil
+			}); err != nil {
+				return fmt.Errorf("post-boot vCPU call: %w", err)
+			}
+
 			return fmt.Errorf("boot VM: %w", err)
 		}
 
@@ -249,8 +353,8 @@ const defaultPathEnv = "/bin:/usr/bin"
 
 func extractInitialPath(env []string) string {
 	for _, entry := range env {
-		if strings.HasPrefix(entry, "PATH=") {
-			return strings.TrimPrefix(entry, "PATH=")
+		if after, ok := strings.CutPrefix(entry, "PATH="); ok {
+			return after
 		}
 	}
 	return defaultPathEnv

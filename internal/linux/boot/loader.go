@@ -366,12 +366,12 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	}
 	l.plan = plan
 
-	consoleSerial := amd64serial.NewSerial16550(0x3F8, 4, &convertCRLF{l.SerialStdout})
+	consoleSerial := amd64serial.NewSerial16550WithIRQ(0x3F8, 4, &convertCRLF{l.SerialStdout})
 	if err := vm.AddDevice(consoleSerial); err != nil {
 		return fmt.Errorf("add serial device: %w", err)
 	}
 
-	auxSerial := amd64serial.NewSerial16550(0x2F8, 3, io.Discard)
+	auxSerial := amd64serial.NewSerial16550WithIRQ(0x2F8, 3, io.Discard)
 	if err := vm.AddDevice(auxSerial); err != nil {
 		return fmt.Errorf("add aux serial device: %w", err)
 	}
@@ -389,16 +389,29 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 		SetIRQ(uint32, bool) error
 	})
 	irqForwarder := chipset.IRQLineFunc(func(line uint8, level bool) {
+		// ACPI overrides map legacy IRQ0 (PIT) to GSI 2, so forward it
+		// accordingly. Other ISA lines keep their numeric mapping.
+		mapped := uint32(line)
+		if line == 0 {
+			mapped = 2
+		}
 		if setter == nil {
 			return
 		}
-		if err := setter.SetIRQ(uint32(line), level); err != nil {
-			slog.Warn("set IRQ line", "line", line, "level", level, "err", err)
+		if err := setter.SetIRQ(mapped, level); err != nil {
+			slog.Warn("set IRQ line", "line", line, "gsi", mapped, "level", level, "err", err)
 		}
 	})
 
-	if err := vm.AddDevice(chipset.NewPIT(irqForwarder)); err != nil {
+	pit := chipset.NewPIT(irqForwarder)
+	if err := vm.AddDevice(pit); err != nil {
 		return fmt.Errorf("add PIT: %w", err)
+	}
+	if err := vm.AddDevice(chipset.NewPort61(pit)); err != nil {
+		return fmt.Errorf("add port 0x61 device: %w", err)
+	}
+	if err := vm.AddDevice(chipset.NewPM()); err != nil {
+		return fmt.Errorf("add PM device: %w", err)
 	}
 
 	if err := vm.AddDevice(chipset.NewCMOS(irqForwarder)); err != nil {

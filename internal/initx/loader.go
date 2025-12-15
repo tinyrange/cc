@@ -13,6 +13,7 @@ import (
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/ir"
 	"github.com/tinyrange/cc/internal/linux/boot"
+	"github.com/tinyrange/cc/internal/linux/boot/amd64"
 	"github.com/tinyrange/cc/internal/linux/defs"
 	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 	"github.com/tinyrange/cc/internal/linux/kernel"
@@ -334,6 +335,40 @@ func (vm *VirtualMachine) Run(ctx context.Context, prog *ir.Program) error {
 	return vm.runProgram(ctx, prog, nil)
 }
 
+func (vm *VirtualMachine) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error {
+	return vm.vm.VirtualCPUCall(id, f)
+}
+
+func (vm *VirtualMachine) DumpStackTrace(vcpu hv.VirtualCPU) (int64, error) {
+	kernel, _, err := vm.loader.GetKernel()
+	if err != nil {
+		return -1, fmt.Errorf("get kernel for stack trace: %w", err)
+	}
+
+	systemMap, err := vm.loader.GetSystemMap()
+	if err != nil {
+		return -1, fmt.Errorf("get system map for stack trace: %w", err)
+	}
+
+	trace, err := amd64.CaptureStackTrace(vcpu, kernel, func() (io.ReaderAt, error) {
+		return systemMap, nil
+	}, 16)
+
+	for i, trace := range trace {
+		fmt.Fprintf(os.Stderr, "%02d | 0x%x: %s+0x%x\n", i, trace.PC, trace.Symbol, trace.Offset)
+	}
+
+	if err != nil {
+		// slog.Error("capture stack trace", "error", err)
+	}
+
+	if len(trace) == 0 {
+		return -1, errors.New("no stack trace available")
+	}
+
+	return int64(trace[0].PhysAddr), nil
+}
+
 func (vm *VirtualMachine) runProgram(
 	ctx context.Context,
 	prog *ir.Program,
@@ -463,6 +498,10 @@ func NewVirtualMachine(
 			return kernel, size, nil
 		},
 
+		GetSystemMap: func() (io.ReaderAt, error) {
+			return kernelLoader.GetSystemMap()
+		},
+
 		GetInit: func(arch hv.CpuArchitecture) (*ir.Program, error) {
 			cfg := BuilderConfig{
 				Arch: arch,
@@ -526,8 +565,6 @@ func NewVirtualMachine(
 
 			switch h.Architecture() {
 			case hv.ArchitectureX86_64:
-				// Disable i8042 keyboard/mouse probing to avoid 1s delay
-				args = append(args, "i8042.noaux", "i8042.nokbd")
 				if runtime.GOOS == "windows" {
 					// hack since Windows doesn't have kvm_clock
 					args = append(args, []string{

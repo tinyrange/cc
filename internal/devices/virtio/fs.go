@@ -509,10 +509,12 @@ func (v *FS) OnQueueNotify(dev device, qidx int) error {
 
 // Config space
 func (v *FS) ReadConfig(_ device, off uint64) (uint32, bool, error) {
-	if off < VIRTIO_MMIO_CONFIG {
-		return 0, false, nil
+	// When called through deviceHandlerAdapter, off is already relative to VIRTIO_MMIO_CONFIG
+	// When called directly from MMIO handler, off is absolute and we need to subtract VIRTIO_MMIO_CONFIG
+	cfg := off
+	if off >= VIRTIO_MMIO_CONFIG {
+		cfg = off - VIRTIO_MMIO_CONFIG
 	}
-	cfg := off - VIRTIO_MMIO_CONFIG
 	switch {
 	case cfg < fsCfgTagSize:
 		// tag presented as little-endian 32-bit windows

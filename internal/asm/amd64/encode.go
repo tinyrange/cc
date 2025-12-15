@@ -612,6 +612,34 @@ func encodeMovMemImm8(mem Memory, value byte) ([]byte, error) {
 	return out, nil
 }
 
+func encodeMovMemImm32(mem Memory, value uint32) ([]byte, error) {
+	memEnc, err := encodeMemoryOperand(mem)
+	if err != nil {
+		return nil, err
+	}
+
+	rex := memEnc.rex
+	rex.w = false
+
+	out := make([]byte, 0, 12)
+	if rexByte := rex.prefix(); rexByte != 0 {
+		out = append(out, rexByte)
+	}
+	out = append(out, 0xC7)
+	modrm := memEnc.modrm
+	out = append(out, modrm)
+	if len(memEnc.sib) > 0 {
+		out = append(out, memEnc.sib...)
+	}
+	if len(memEnc.disp) > 0 {
+		out = append(out, memEnc.disp...)
+	}
+	var buf [4]byte
+	binary.LittleEndian.PutUint32(buf[:], value)
+	out = append(out, buf[:]...)
+	return out, nil
+}
+
 func encodeAndRegReg(dst, src Reg) ([]byte, error) {
 	return encodeALURegReg(chooseOpcode(dst.size, 0x21, 0x20), dst, src)
 }
@@ -668,6 +696,81 @@ func encodeHlt() []byte {
 	return []byte{0xF4}
 }
 
+func encodeCli() []byte {
+	return []byte{0xFA}
+}
+
+func encodeSti() []byte {
+	return []byte{0xFB}
+}
+
+func encodeLgdtLidt(mem Memory, subcode byte) ([]byte, error) {
+	memEnc, err := encodeMemoryOperand(mem)
+	if err != nil {
+		return nil, err
+	}
+
+	modrm := memEnc.modrm | (subcode << 3)
+	out := make([]byte, 0, 8+len(memEnc.sib)+len(memEnc.disp))
+	if rex := memEnc.rex.prefix(); rex != 0 {
+		out = append(out, rex)
+	}
+	out = append(out, 0x0F, 0x01, modrm)
+	out = append(out, memEnc.sib...)
+	out = append(out, memEnc.disp...)
+	return out, nil
+}
+
+func encodeMovToCR(ctrl ControlReg, src Reg) ([]byte, error) {
+	if src.size != size64 {
+		return nil, fmt.Errorf("mov to control requires 64-bit source register")
+	}
+	srcInfo, err := regEncoding(src)
+	if err != nil {
+		return nil, err
+	}
+
+	rex := rexState{
+		r:     ctrl >= 8,
+		b:     srcInfo.high,
+		force: srcInfo.needsRex,
+	}
+	regField := byte(ctrl & 7)
+	modrm := byte(0xC0 | (regField << 3) | srcInfo.code)
+
+	out := make([]byte, 0, 6)
+	if rexByte := rex.prefix(); rexByte != 0 {
+		out = append(out, rexByte)
+	}
+	out = append(out, 0x0F, 0x22, modrm)
+	return out, nil
+}
+
+func encodeMovFromCR(dst Reg, ctrl ControlReg) ([]byte, error) {
+	if dst.size != size64 {
+		return nil, fmt.Errorf("mov from control requires 64-bit destination register")
+	}
+	dstInfo, err := regEncoding(dst)
+	if err != nil {
+		return nil, err
+	}
+
+	rex := rexState{
+		r:     ctrl >= 8,
+		b:     dstInfo.high,
+		force: dstInfo.needsRex,
+	}
+	regField := byte(ctrl & 7)
+	modrm := byte(0xC0 | (regField << 3) | dstInfo.code)
+
+	out := make([]byte, 0, 6)
+	if rexByte := rex.prefix(); rexByte != 0 {
+		out = append(out, rexByte)
+	}
+	out = append(out, 0x0F, 0x20, modrm)
+	return out, nil
+}
+
 func encodeShiftRegImm(reg Reg, count uint8, subcode byte) ([]byte, error) {
 	if count == 0 {
 		return nil, fmt.Errorf("shift count must be non-zero")
@@ -713,6 +816,51 @@ func encodeShrRegImm(reg Reg, count uint8) ([]byte, error) {
 
 func encodeShlRegImm(reg Reg, count uint8) ([]byte, error) {
 	return encodeShiftRegImm(reg, count, 4)
+}
+
+func encodePushReg(reg Reg) ([]byte, error) {
+	if reg.size != size64 {
+		return nil, fmt.Errorf("push requires 64-bit register")
+	}
+	info, err := regEncoding(reg)
+	if err != nil {
+		return nil, err
+	}
+	rex := rexState{
+		b:     info.high,
+		force: info.needsRex,
+	}
+	out := make([]byte, 0, 2)
+	if rexByte := rex.prefix(); rexByte != 0 {
+		out = append(out, rexByte)
+	}
+	out = append(out, 0x50+info.code)
+	return out, nil
+}
+
+func encodePopReg(reg Reg) ([]byte, error) {
+	if reg.size != size64 {
+		return nil, fmt.Errorf("pop requires 64-bit register")
+	}
+	info, err := regEncoding(reg)
+	if err != nil {
+		return nil, err
+	}
+	rex := rexState{
+		b:     info.high,
+		force: info.needsRex,
+	}
+	out := make([]byte, 0, 2)
+	if rexByte := rex.prefix(); rexByte != 0 {
+		out = append(out, rexByte)
+	}
+	out = append(out, 0x58+info.code)
+	return out, nil
+}
+
+func encodeIret() []byte {
+	// IRETQ with REX.W prefix
+	return []byte{0x48, 0xCF}
 }
 
 func encodeLeaRegRipRelative(dst Reg, offset int32) ([]byte, error) {

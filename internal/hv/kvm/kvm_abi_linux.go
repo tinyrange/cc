@@ -93,6 +93,10 @@ type kvmExitMMIOData struct {
 	isWrite  uint8
 }
 
+type kvmExitIoapicEoiData struct {
+	vector uint8
+}
+
 type kvmSystemEvent struct {
 	typ   uint32
 	ndata uint32
