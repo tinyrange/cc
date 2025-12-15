@@ -1935,7 +1935,7 @@ func RunExecutable(path string) error {
 		initx.WithDeviceTemplate(virtio.FSTemplate{
 			Tag:     "bringup",
 			Backend: vfs.NewVirtioFsBackend(),
-			// Arch:    hv.Architecture(),
+			Arch:    hv.Architecture(),
 		}),
 	)
 	if err != nil {
