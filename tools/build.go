@@ -257,6 +257,46 @@ func pushBuildOutput(remote remoteTarget, output buildOutput) error {
 	return nil
 }
 
+// isContextOlderThanOutput checks if all files in the context directory
+// are older than the output file. Returns true if the output is newer
+// than all context files, false otherwise.
+func isContextOlderThanOutput(contextDir, outputPath string) (bool, error) {
+	outputInfo, err := os.Stat(outputPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to stat output file: %w", err)
+	}
+
+	outputModTime := outputInfo.ModTime()
+
+	err = filepath.Walk(contextDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip directories themselves, only check files
+		if info.IsDir() {
+			return nil
+		}
+
+		if info.ModTime().After(outputModTime) {
+			return fmt.Errorf("file %s is newer than output", path)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		// If we found a newer file, return false
+		return false, nil
+	}
+
+	// All files are older than the output
+	return true, nil
+}
+
 func main() {
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
@@ -271,6 +311,7 @@ func main() {
 	bringup := fs.Bool("bringup", false, "build and execute the bringup tool inside a linux VM")
 	remote := fs.String("remote", "", "run quest/bringup on remote host alias from local/remotes.json")
 	run := fs.Bool("run", false, "run the built cc tool after building")
+	runtest := fs.String("runtest", "", "build a Dockerfile in tests/<name>/Dockerfile and run it using cc (Linux only)")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
@@ -482,6 +523,87 @@ func main() {
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
+			os.Exit(1)
+		}
+
+		return
+	}
+
+	if *runtest != "" {
+		if runtime.GOOS != "linux" {
+			fmt.Fprintf(os.Stderr, "-runtest is only supported on Linux hosts\n")
+			os.Exit(1)
+		}
+
+		testName := *runtest
+		dockerfilePath := filepath.Join("tests", testName, "Dockerfile")
+		if _, err := os.Stat(dockerfilePath); err != nil {
+			fmt.Fprintf(os.Stderr, "Dockerfile not found: %s\n", dockerfilePath)
+			os.Exit(1)
+		}
+
+		// Build cc first
+		ccOut, err := goBuild(buildOptions{
+			Package:    "cmd/cc",
+			OutputName: "cc",
+			Build:      hostBuild,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build cc: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Check if we can skip building the Docker image
+		buildDir := filepath.Join("tests", testName)
+		tarPath := filepath.Join("build", fmt.Sprintf("test-%s.tar", testName))
+		if err := os.MkdirAll(filepath.Dir(tarPath), 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create build directory: %v\n", err)
+			os.Exit(1)
+		}
+
+		shouldRebuild := true
+		if isOlder, err := isContextOlderThanOutput(buildDir, tarPath); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to check cache: %v\n", err)
+			os.Exit(1)
+		} else if isOlder {
+			fmt.Printf("Context is older than output tar file, using cached build...\n")
+			shouldRebuild = false
+		}
+
+		if shouldRebuild {
+			// Build Docker image
+			imageTag := fmt.Sprintf("cc-test-%s:latest", testName)
+
+			fmt.Printf("Building Docker image from %s...\n", dockerfilePath)
+			buildCmd := exec.Command("docker", "build",
+				"-t", imageTag,
+				"-f", dockerfilePath,
+				buildDir,
+			)
+			buildCmd.Stdout = os.Stdout
+			buildCmd.Stderr = os.Stderr
+			if err := buildCmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to build Docker image: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Save Docker image as tar archive
+			fmt.Printf("Saving Docker image to %s...\n", tarPath)
+			saveCmd := exec.Command("docker", "save", "-o", tarPath, imageTag)
+			saveCmd.Stdout = os.Stdout
+			saveCmd.Stderr = os.Stderr
+			if err := saveCmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to save Docker image: %v\n", err)
+				os.Exit(1)
+			}
+		}
+
+		// Run cc with the tar file
+		// Use relative path so cc can load it
+		relativeTarPath := filepath.Join(".", "build", fmt.Sprintf("test-%s.tar", testName))
+		fmt.Printf("Running cc with image %s...\n", relativeTarPath)
+		ccArgs := append([]string{relativeTarPath}, fs.Args()...)
+		if err := runBuildOutput(ccOut, ccArgs); err != nil {
 			os.Exit(1)
 		}
 
