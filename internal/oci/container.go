@@ -345,21 +345,10 @@ func (f *containerFile) ReadAt(off uint64, size uint32) ([]byte, error) {
 	// Zero the buffer to avoid garbage data
 	clear(buf)
 	n, err := r.ReadAt(buf, int64(off))
-	// Clamp n to the actual remaining bytes to avoid reading beyond the file
-	// This is important because io.SectionReader might return n == size even
-	// when the section is shorter
-	if uint64(n) > remaining {
-		n = int(remaining)
-		err = io.EOF
-	}
 	if err == io.EOF || err == io.ErrUnexpectedEOF {
 		// Return exactly the bytes read, even if less than requested
 		if n == 0 {
 			return []byte{}, nil
-		}
-		// Ensure we don't return more bytes than actually available
-		if uint64(n) > remaining {
-			n = int(remaining)
 		}
 		return buf[:n], nil
 	}
@@ -369,10 +358,6 @@ func (f *containerFile) ReadAt(off uint64, size uint32) ([]byte, error) {
 	// Always return exactly the bytes read, even if less than requested
 	if n == 0 {
 		return []byte{}, nil
-	}
-	// Ensure we don't return more bytes than actually available
-	if uint64(n) > remaining {
-		n = int(remaining)
 	}
 	return buf[:n], nil
 }
