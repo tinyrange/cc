@@ -10,6 +10,7 @@ import (
 	"runtime"
 
 	"github.com/tinyrange/cc/internal/devices/virtio"
+	"github.com/tinyrange/cc/internal/fdt"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/ir"
 	"github.com/tinyrange/cc/internal/linux/boot"
@@ -37,6 +38,11 @@ const (
 	writeFileTransferRegion = writeFileMaxChunkLen + writeFileLengthPrefix
 
 	userYieldValue = 0x5553_4552 // "USER"
+
+	// arm64MaxMemoryMB is the maximum memory for ARM64 to avoid overlap
+	// with the mailbox/config regions at 0xf0000000.
+	// Max = (0xf0000000 - 0x80000000) / (1024*1024) = 1792 MB
+	arm64MaxMemoryMB = 1792
 )
 
 type proxyReader struct {
@@ -147,6 +153,32 @@ func (p *programLoader) ReadMMIO(addr uint64, data []byte) error {
 	}
 
 	return fmt.Errorf("unimplemented read at address 0x%x", addr)
+}
+
+// DeviceTreeNodes returns device tree nodes for the initx mailbox and config regions.
+// This allows /dev/mem access on ARM64 by declaring these as device I/O regions.
+func (p *programLoader) DeviceTreeNodes() ([]fdt.Node, error) {
+	if p.arch != hv.ArchitectureARM64 {
+		return nil, nil
+	}
+	return []fdt.Node{
+		{
+			Name: fmt.Sprintf("initx-mailbox@%x", mailboxPhysAddr),
+			Properties: map[string]fdt.Property{
+				"compatible": {Strings: []string{"tinyrange,initx-mailbox"}},
+				"reg":        {U64: []uint64{mailboxPhysAddr, mailboxRegionSize}},
+				"status":     {Strings: []string{"okay"}},
+			},
+		},
+		{
+			Name: fmt.Sprintf("initx-config@%x", configRegionPhysAddr),
+			Properties: map[string]fdt.Property{
+				"compatible": {Strings: []string{"tinyrange,initx-config"}},
+				"reg":        {U64: []uint64{configRegionPhysAddr, configRegionSize}},
+				"status":     {Strings: []string{"okay"}},
+			},
+		},
+	}, nil
 }
 
 // WriteMMIO implements hv.MemoryMappedIODevice.
@@ -278,19 +310,18 @@ func (p *programRunner) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 		return fmt.Errorf("load program into loader: %w", err)
 	}
 
+	p.loader.runResultDetail = 0xdeadbeef
+
 	for {
 		if err := vcpu.Run(ctx); err != nil {
 			if errors.Is(err, hv.ErrVMHalted) {
-				return nil
+				break
 			}
 			if errors.Is(err, hv.ErrGuestRequestedReboot) {
-				return nil
+				break
 			}
 			if errors.Is(err, hv.ErrYield) {
-				if code := p.loader.runResultDetail; code != 0 {
-					return &ExitError{Code: int(code)}
-				}
-				return nil
+				break
 			}
 			if errors.Is(err, hv.ErrUserYield) {
 				if p.onUserYield != nil {
@@ -304,6 +335,12 @@ func (p *programRunner) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 			return fmt.Errorf("run vCPU: %w", err)
 		}
 	}
+
+	if code := p.loader.runResultDetail; code != 0 {
+		return &ExitError{Code: int(code)}
+	}
+
+	return nil
 }
 
 var (
@@ -333,6 +370,10 @@ func (vm *VirtualMachine) Close() error {
 
 func (vm *VirtualMachine) Run(ctx context.Context, prog *ir.Program) error {
 	return vm.runProgram(ctx, prog, nil)
+}
+
+func (vm *VirtualMachine) Architecture() hv.CpuArchitecture {
+	return vm.vm.Hypervisor().Architecture()
 }
 
 func (vm *VirtualMachine) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error {
@@ -462,7 +503,9 @@ func NewVirtualMachine(
 	in := &proxyReader{update: make(chan io.Reader)}
 	out := &proxyWriter{w: os.Stderr} // default to stderr so we can see debugging output
 
-	programLoader := &programLoader{}
+	programLoader := &programLoader{
+		arch: h.Architecture(),
+	}
 
 	var ret VirtualMachine
 
@@ -471,10 +514,16 @@ func NewVirtualMachine(
 
 	ret.programLoader = programLoader
 
+	// Cap ARM64 memory to avoid overlap with mailbox/config regions at 0xf0000000
+	memSize := memSizeMB
+	if h.Architecture() == hv.ArchitectureARM64 && memSize > arm64MaxMemoryMB {
+		memSize = arm64MaxMemoryMB
+	}
+
 	ret.loader = &boot.LinuxLoader{
 		NumCPUs: numCPUs,
 
-		MemSize: memSizeMB << 20,
+		MemSize: memSize << 20,
 		MemBase: func() uint64 {
 			switch h.Architecture() {
 			case hv.ArchitectureARM64:
@@ -573,10 +622,7 @@ func NewVirtualMachine(
 					}...)
 				}
 			case hv.ArchitectureARM64:
-				args = append(args, []string{
-					"iomem=relaxed",
-					"memmap=0xf0003000$0x400000",
-				}...)
+				args = append(args, "iomem=relaxed")
 			default:
 				return nil, fmt.Errorf("unsupported architecture for cmdline: %v", arch)
 			}
