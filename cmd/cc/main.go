@@ -213,6 +213,10 @@ func run() error {
 				},
 			},
 		}); err != nil {
+			var exitErr *initx.ExitError
+			if errors.As(err, &exitErr) {
+				return exitErr
+			}
 			fmt.Fprintf(os.Stderr, "cc: VM boot failed: %v\n", err)
 			if err := vm.VirtualCPUCall(0, func(vcpu hv.VirtualCPU) error {
 				if vm.Architecture() == hv.ArchitectureX86_64 {

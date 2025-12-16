@@ -278,19 +278,18 @@ func (p *programRunner) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 		return fmt.Errorf("load program into loader: %w", err)
 	}
 
+	p.loader.runResultDetail = 0xdeadbeef
+
 	for {
 		if err := vcpu.Run(ctx); err != nil {
 			if errors.Is(err, hv.ErrVMHalted) {
-				return nil
+				break
 			}
 			if errors.Is(err, hv.ErrGuestRequestedReboot) {
-				return nil
+				break
 			}
 			if errors.Is(err, hv.ErrYield) {
-				if code := p.loader.runResultDetail; code != 0 {
-					return &ExitError{Code: int(code)}
-				}
-				return nil
+				break
 			}
 			if errors.Is(err, hv.ErrUserYield) {
 				if p.onUserYield != nil {
@@ -304,6 +303,12 @@ func (p *programRunner) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 			return fmt.Errorf("run vCPU: %w", err)
 		}
 	}
+
+	if code := p.loader.runResultDetail; code != 0 {
+		return &ExitError{Code: int(code)}
+	}
+
+	return nil
 }
 
 var (
