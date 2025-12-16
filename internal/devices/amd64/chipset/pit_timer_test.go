@@ -449,6 +449,112 @@ func TestPITCounterLatchAndReadback(t *testing.T) {
 	}
 }
 
+// TestPITChannel2GatedMode0 tests mode 0 (one-shot) on channel 2 with gate control.
+// This is the exact scenario Linux uses for TSC calibration:
+// 1. Configure channel 2 in mode 0
+// 2. Write count value - counter should NOT start (gate is low)
+// 3. Enable gate via port 0x61 - counter starts, output goes LOW
+// 4. Wait for count to expire - output goes HIGH
+func TestPITChannel2GatedMode0(t *testing.T) {
+	now := time.Unix(0, 0)
+	var nowMu sync.Mutex
+	nowFn := func() time.Time {
+		nowMu.Lock()
+		defer nowMu.Unlock()
+		return now
+	}
+	advance := func(d time.Duration) {
+		nowMu.Lock()
+		now = now.Add(d)
+		nowMu.Unlock()
+	}
+
+	pit := NewPIT(nil,
+		WithPITClock(nowFn),
+		WithPITTick(1*time.Millisecond),
+	)
+	port61 := NewPort61(pit)
+
+	if err := pit.Init(nil); err != nil {
+		t.Fatalf("init pit: %v", err)
+	}
+	if err := port61.Init(nil); err != nil {
+		t.Fatalf("init port61: %v", err)
+	}
+
+	// Configure channel 2 in mode 0 (one-shot)
+	// Control word 0xB0: channel 2, access low/high, mode 0, binary
+	if err := pit.WriteIOPort(pitControlPort, []byte{0xB0}); err != nil {
+		t.Fatalf("write control: %v", err)
+	}
+
+	// Write count value (10 ticks = 10ms with 1ms tick)
+	if err := pit.WriteIOPort(pitChannel2Port, []byte{0x0A}); err != nil {
+		t.Fatalf("write low byte: %v", err)
+	}
+	if err := pit.WriteIOPort(pitChannel2Port, []byte{0x00}); err != nil {
+		t.Fatalf("write high byte: %v", err)
+	}
+
+	// Gate is initially low - channel should be armed but NOT running
+	// Output should stay HIGH (not counting yet)
+	buf := []byte{0}
+	if err := port61.ReadIOPort(pitPort61, buf); err != nil {
+		t.Fatalf("read port61: %v", err)
+	}
+	if buf[0]&1 != 0 {
+		t.Fatalf("gate should be low initially")
+	}
+
+	// Check output is HIGH (bit 5 of port 0x61) - counter hasn't started
+	if err := port61.ReadIOPort(pitPort61, buf); err != nil {
+		t.Fatalf("read port61 output: %v", err)
+	}
+	if buf[0]&(1<<5) == 0 {
+		t.Fatalf("output should be HIGH before gate enabled, got 0x%02x", buf[0])
+	}
+
+	// Advance time - counter should NOT have started (still armed)
+	advance(5 * time.Millisecond)
+	if err := port61.ReadIOPort(pitPort61, buf); err != nil {
+		t.Fatalf("read port61 after delay: %v", err)
+	}
+	if buf[0]&(1<<5) == 0 {
+		t.Fatalf("output should still be HIGH (counter armed, not running), got 0x%02x", buf[0])
+	}
+
+	// Enable gate via port 0x61 bit 0 - this should trigger countdown
+	if err := port61.WriteIOPort(pitPort61, []byte{0x01}); err != nil {
+		t.Fatalf("enable gate: %v", err)
+	}
+
+	// Output should now be LOW (countdown started)
+	if err := port61.ReadIOPort(pitPort61, buf); err != nil {
+		t.Fatalf("read port61 after gate enable: %v", err)
+	}
+	if buf[0]&(1<<5) != 0 {
+		t.Fatalf("output should be LOW after gate enabled (countdown started), got 0x%02x", buf[0])
+	}
+
+	// Advance partway through countdown - output should still be LOW
+	advance(5 * time.Millisecond)
+	if err := port61.ReadIOPort(pitPort61, buf); err != nil {
+		t.Fatalf("read port61 during countdown: %v", err)
+	}
+	if buf[0]&(1<<5) != 0 {
+		t.Fatalf("output should still be LOW during countdown, got 0x%02x", buf[0])
+	}
+
+	// Advance past countdown completion - output should be HIGH
+	advance(10 * time.Millisecond)
+	if err := port61.ReadIOPort(pitPort61, buf); err != nil {
+		t.Fatalf("read port61 after countdown: %v", err)
+	}
+	if buf[0]&(1<<5) == 0 {
+		t.Fatalf("output should be HIGH after countdown complete, got 0x%02x", buf[0])
+	}
+}
+
 // TestPITPort61Integration tests port 0x61 integration with PIT channel 2.
 func TestPITPort61Integration(t *testing.T) {
 	now := time.Unix(0, 0)
