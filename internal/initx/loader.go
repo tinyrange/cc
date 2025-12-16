@@ -614,13 +614,11 @@ func NewVirtualMachine(
 
 			switch h.Architecture() {
 			case hv.ArchitectureX86_64:
-				if runtime.GOOS == "windows" {
-					// hack since Windows doesn't have kvm_clock
-					args = append(args, []string{
-						"tsc=reliable",
-						"tsc_early_khz=3000000",
-					}...)
-				}
+				// HACK: Some systems don't have kvm_clock, so we need to use tsc=reliable
+				args = append(args, []string{
+					"tsc=reliable",
+					"tsc_early_khz=3000000",
+				}...)
 			case hv.ArchitectureARM64:
 				args = append(args, "iomem=relaxed")
 			default:
