@@ -46,6 +46,7 @@ func run() error {
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
 	memprofile := flag.String("memprofile", "", "Write memory profile to file")
 	dmesg := flag.Bool("dmesg", false, "Print kernel dmesg during boot and runtime")
+	timeout := flag.Duration("timeout", 0, "Timeout for running the virtual machine")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <image> [command] [args...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Run a command inside an OCI container image in a virtual machine.\n\n")
@@ -187,14 +188,13 @@ func run() error {
 	defer vm.Close()
 
 	// Build and run the container init program
-	ctx := context.Background()
-	prog := buildContainerInit(img, execCmd)
+	prog := buildContainerInit(hvArch, img, execCmd)
 
 	slog.Debug("Booting VM")
 
 	// Boot the VM first to set up devices
 	if err := func() error {
-		ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		vm.VirtualCPUCall(0, func(vcpu hv.VirtualCPU) error {
@@ -215,81 +215,199 @@ func run() error {
 		}); err != nil {
 			fmt.Fprintf(os.Stderr, "cc: VM boot failed: %v\n", err)
 			if err := vm.VirtualCPUCall(0, func(vcpu hv.VirtualCPU) error {
-				// figure out the current state
-				regs := map[hv.Register]hv.RegisterValue{
-					hv.RegisterAMD64Rax:    hv.Register64(0),
-					hv.RegisterAMD64Rbx:    hv.Register64(0),
-					hv.RegisterAMD64Rcx:    hv.Register64(0),
-					hv.RegisterAMD64Rdx:    hv.Register64(0),
-					hv.RegisterAMD64Rsi:    hv.Register64(0),
-					hv.RegisterAMD64Rdi:    hv.Register64(0),
-					hv.RegisterAMD64Rsp:    hv.Register64(0),
-					hv.RegisterAMD64Rbp:    hv.Register64(0),
-					hv.RegisterAMD64Rip:    hv.Register64(0),
-					hv.RegisterAMD64Rflags: hv.Register64(0),
-				}
-
-				if err := vcpu.GetRegisters(regs); err != nil {
-					return fmt.Errorf("get registers: %w", err)
-				}
-
-				fmt.Fprintf(os.Stderr, "cc: VM boot failed, vCPU state:\n"+
-					"  RAX:    0x%016x\n"+
-					"  RBX:    0x%016x\n"+
-					"  RCX:    0x%016x\n"+
-					"  RDX:    0x%016x\n"+
-					"  RSI:    0x%016x\n"+
-					"  RDI:    0x%016x\n"+
-					"  RSP:    0x%016x\n"+
-					"  RBP:    0x%016x\n"+
-					"  RIP:    0x%016x\n"+
-					"  RFLAGS: 0x%016x\n",
-					regs[hv.RegisterAMD64Rax],
-					regs[hv.RegisterAMD64Rbx],
-					regs[hv.RegisterAMD64Rcx],
-					regs[hv.RegisterAMD64Rdx],
-					regs[hv.RegisterAMD64Rsi],
-					regs[hv.RegisterAMD64Rdi],
-					regs[hv.RegisterAMD64Rsp],
-					regs[hv.RegisterAMD64Rbp],
-					regs[hv.RegisterAMD64Rip],
-					regs[hv.RegisterAMD64Rflags],
-				)
-
-				pc, err := vm.DumpStackTrace(vcpu)
-				if err != nil {
-					return fmt.Errorf("dump stack trace: %w", err)
-				}
-
-				// Dump a hexdump of RIP to RIP+128 bytes
-				mem := make([]byte, 128)
-				if _, err := vcpu.VirtualMachine().ReadAt(mem, pc); err != nil {
-					return fmt.Errorf("read memory at RIP: %w", err)
-				}
-				func(mem []byte) {
-					const bytesPerLine = 16
-					for i := 0; i < len(mem); i += bytesPerLine {
-						lineEnd := min(i+bytesPerLine, len(mem))
-						line := mem[i:lineEnd]
-						fmt.Fprintf(os.Stderr, "  %016x: ", uint64(pc)+uint64(i))
-						for j := range bytesPerLine {
-							if j < len(line) {
-								fmt.Fprintf(os.Stderr, "%02x ", line[j])
-							} else {
-								fmt.Fprintf(os.Stderr, "   ")
-							}
-						}
-						fmt.Fprintf(os.Stderr, " ")
-						for _, b := range line {
-							if b >= 32 && b <= 126 {
-								fmt.Fprintf(os.Stderr, "%c", b)
-							} else {
-								fmt.Fprintf(os.Stderr, ".")
-							}
-						}
-						fmt.Fprintf(os.Stderr, "\n")
+				if vm.Architecture() == hv.ArchitectureX86_64 {
+					// figure out the current state
+					regs := map[hv.Register]hv.RegisterValue{
+						hv.RegisterAMD64Rax:    hv.Register64(0),
+						hv.RegisterAMD64Rbx:    hv.Register64(0),
+						hv.RegisterAMD64Rcx:    hv.Register64(0),
+						hv.RegisterAMD64Rdx:    hv.Register64(0),
+						hv.RegisterAMD64Rsi:    hv.Register64(0),
+						hv.RegisterAMD64Rdi:    hv.Register64(0),
+						hv.RegisterAMD64Rsp:    hv.Register64(0),
+						hv.RegisterAMD64Rbp:    hv.Register64(0),
+						hv.RegisterAMD64Rip:    hv.Register64(0),
+						hv.RegisterAMD64Rflags: hv.Register64(0),
 					}
-				}(mem)
+
+					if err := vcpu.GetRegisters(regs); err != nil {
+						return fmt.Errorf("get registers: %w", err)
+					}
+
+					fmt.Fprintf(os.Stderr, "cc: VM boot failed, vCPU state:\n"+
+						"  RAX:    0x%016x\n"+
+						"  RBX:    0x%016x\n"+
+						"  RCX:    0x%016x\n"+
+						"  RDX:    0x%016x\n"+
+						"  RSI:    0x%016x\n"+
+						"  RDI:    0x%016x\n"+
+						"  RSP:    0x%016x\n"+
+						"  RBP:    0x%016x\n"+
+						"  RIP:    0x%016x\n"+
+						"  RFLAGS: 0x%016x\n",
+						regs[hv.RegisterAMD64Rax],
+						regs[hv.RegisterAMD64Rbx],
+						regs[hv.RegisterAMD64Rcx],
+						regs[hv.RegisterAMD64Rdx],
+						regs[hv.RegisterAMD64Rsi],
+						regs[hv.RegisterAMD64Rdi],
+						regs[hv.RegisterAMD64Rsp],
+						regs[hv.RegisterAMD64Rbp],
+						regs[hv.RegisterAMD64Rip],
+						regs[hv.RegisterAMD64Rflags],
+					)
+
+					pc, err := vm.DumpStackTrace(vcpu)
+					if err != nil {
+						return fmt.Errorf("dump stack trace: %w", err)
+					}
+
+					// Dump a hexdump of RIP to RIP+128 bytes
+					mem := make([]byte, 128)
+					if _, err := vcpu.VirtualMachine().ReadAt(mem, pc); err != nil {
+						return fmt.Errorf("read memory at RIP: %w", err)
+					}
+					func(mem []byte) {
+						const bytesPerLine = 16
+						for i := 0; i < len(mem); i += bytesPerLine {
+							lineEnd := min(i+bytesPerLine, len(mem))
+							line := mem[i:lineEnd]
+							fmt.Fprintf(os.Stderr, "  %016x: ", uint64(pc)+uint64(i))
+							for j := range bytesPerLine {
+								if j < len(line) {
+									fmt.Fprintf(os.Stderr, "%02x ", line[j])
+								} else {
+									fmt.Fprintf(os.Stderr, "   ")
+								}
+							}
+							fmt.Fprintf(os.Stderr, " ")
+							for _, b := range line {
+								if b >= 32 && b <= 126 {
+									fmt.Fprintf(os.Stderr, "%c", b)
+								} else {
+									fmt.Fprintf(os.Stderr, ".")
+								}
+							}
+							fmt.Fprintf(os.Stderr, "\n")
+						}
+					}(mem)
+				} else if vm.Architecture() == hv.ArchitectureARM64 {
+					// figure out the current state
+					regs := map[hv.Register]hv.RegisterValue{
+						hv.RegisterARM64X0:     hv.Register64(0),
+						hv.RegisterARM64X1:     hv.Register64(0),
+						hv.RegisterARM64X2:     hv.Register64(0),
+						hv.RegisterARM64X3:     hv.Register64(0),
+						hv.RegisterARM64X4:     hv.Register64(0),
+						hv.RegisterARM64X5:     hv.Register64(0),
+						hv.RegisterARM64X6:     hv.Register64(0),
+						hv.RegisterARM64X7:     hv.Register64(0),
+						hv.RegisterARM64X8:     hv.Register64(0),
+						hv.RegisterARM64X9:     hv.Register64(0),
+						hv.RegisterARM64X10:    hv.Register64(0),
+						hv.RegisterARM64X11:    hv.Register64(0),
+						hv.RegisterARM64X12:    hv.Register64(0),
+						hv.RegisterARM64X13:    hv.Register64(0),
+						hv.RegisterARM64X14:    hv.Register64(0),
+						hv.RegisterARM64X15:    hv.Register64(0),
+						hv.RegisterARM64X16:    hv.Register64(0),
+						hv.RegisterARM64X17:    hv.Register64(0),
+						hv.RegisterARM64X18:    hv.Register64(0),
+						hv.RegisterARM64X19:    hv.Register64(0),
+						hv.RegisterARM64X20:    hv.Register64(0),
+						hv.RegisterARM64X21:    hv.Register64(0),
+						hv.RegisterARM64X22:    hv.Register64(0),
+						hv.RegisterARM64X23:    hv.Register64(0),
+						hv.RegisterARM64X24:    hv.Register64(0),
+						hv.RegisterARM64X25:    hv.Register64(0),
+						hv.RegisterARM64X26:    hv.Register64(0),
+						hv.RegisterARM64X27:    hv.Register64(0),
+						hv.RegisterARM64X28:    hv.Register64(0),
+						hv.RegisterARM64X29:    hv.Register64(0),
+						hv.RegisterARM64X30:    hv.Register64(0),
+						hv.RegisterARM64Sp:     hv.Register64(0),
+						hv.RegisterARM64Pc:     hv.Register64(0),
+						hv.RegisterARM64Pstate: hv.Register64(0),
+						hv.RegisterARM64Vbar:   hv.Register64(0),
+					}
+
+					if err := vcpu.GetRegisters(regs); err != nil {
+						return fmt.Errorf("get registers: %w", err)
+					}
+
+					fmt.Fprintf(os.Stderr, "cc: VM boot failed, vCPU state:\n"+
+						"  X0:    0x%016x\n"+
+						"  X1:    0x%016x\n"+
+						"  X2:    0x%016x\n"+
+						"  X3:    0x%016x\n"+
+						"  X4:    0x%016x\n"+
+						"  X5:    0x%016x\n"+
+						"  X6:    0x%016x\n"+
+						"  X7:    0x%016x\n"+
+						"  X8:    0x%016x\n"+
+						"  X9:    0x%016x\n"+
+						"  X10:    0x%016x\n"+
+						"  X11:    0x%016x\n"+
+						"  X12:    0x%016x\n"+
+						"  X13:    0x%016x\n"+
+						"  X14:    0x%016x\n"+
+						"  X15:    0x%016x\n"+
+						"  X16:    0x%016x\n"+
+						"  X17:    0x%016x\n"+
+						"  X18:    0x%016x\n"+
+						"  X19:    0x%016x\n"+
+						"  X20:    0x%016x\n"+
+						"  X21:    0x%016x\n"+
+						"  X22:    0x%016x\n"+
+						"  X23:    0x%016x\n"+
+						"  X24:    0x%016x\n"+
+						"  X25:    0x%016x\n"+
+						"  X26:    0x%016x\n"+
+						"  X27:    0x%016x\n"+
+						"  X28:    0x%016x\n"+
+						"  X29:    0x%016x\n"+
+						"  X30:    0x%016x\n"+
+						"  SP:    0x%016x\n"+
+						"  PC:    0x%016x\n"+
+						"  PSTATE:    0x%016x\n"+
+						"  VBAR:    0x%016x\n",
+						regs[hv.RegisterARM64X0],
+						regs[hv.RegisterARM64X1],
+						regs[hv.RegisterARM64X2],
+						regs[hv.RegisterARM64X3],
+						regs[hv.RegisterARM64X4],
+						regs[hv.RegisterARM64X5],
+						regs[hv.RegisterARM64X6],
+						regs[hv.RegisterARM64X7],
+						regs[hv.RegisterARM64X8],
+						regs[hv.RegisterARM64X9],
+						regs[hv.RegisterARM64X10],
+						regs[hv.RegisterARM64X11],
+						regs[hv.RegisterARM64X12],
+						regs[hv.RegisterARM64X13],
+						regs[hv.RegisterARM64X14],
+						regs[hv.RegisterARM64X15],
+						regs[hv.RegisterARM64X16],
+						regs[hv.RegisterARM64X17],
+						regs[hv.RegisterARM64X18],
+						regs[hv.RegisterARM64X19],
+						regs[hv.RegisterARM64X20],
+						regs[hv.RegisterARM64X21],
+						regs[hv.RegisterARM64X22],
+						regs[hv.RegisterARM64X23],
+						regs[hv.RegisterARM64X24],
+						regs[hv.RegisterARM64X25],
+						regs[hv.RegisterARM64X26],
+						regs[hv.RegisterARM64X27],
+						regs[hv.RegisterARM64X28],
+						regs[hv.RegisterARM64X29],
+						regs[hv.RegisterARM64X30],
+						regs[hv.RegisterARM64Sp],
+						regs[hv.RegisterARM64Pc],
+						regs[hv.RegisterARM64Pstate],
+						regs[hv.RegisterARM64Vbar],
+					)
+				}
 
 				// Get the trace buffer
 				if debug, ok := vcpu.(hv.VirtualCPUDebug); ok {
@@ -316,6 +434,17 @@ func run() error {
 		return nil
 	}(); err != nil {
 		return err
+	}
+
+	slog.Info("successfully booted VM")
+
+	var ctx context.Context
+	if *timeout > 0 {
+		newCtx, cancel := context.WithTimeout(context.Background(), *timeout)
+		defer cancel()
+		ctx = newCtx
+	} else {
+		ctx = context.Background()
 	}
 
 	// Put stdin into raw mode so we don't send cooked/echoed characters into the guest.
@@ -427,7 +556,7 @@ func lookPath(fs *oci.ContainerFS, pathEnv string, workDir string, file string) 
 	return "", fmt.Errorf("executable %q not found in PATH", file)
 }
 
-func buildContainerInit(img *oci.Image, cmd []string) *ir.Program {
+func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string) *ir.Program {
 	errLabel := ir.Label("__cc_error")
 	errVar := ir.Var("__cc_errno")
 	pivotResult := ir.Var("__cc_pivot_result")
@@ -435,6 +564,8 @@ func buildContainerInit(img *oci.Image, cmd []string) *ir.Program {
 	workDir := containerWorkDir(img)
 
 	main := ir.Method{
+		ir.Printf("cc: booting container init program\n"),
+
 		// Create mount points
 		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt", ir.Int64(0o755)),
 		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/proc", ir.Int64(0o755)),
@@ -542,12 +673,26 @@ func buildContainerInit(img *oci.Image, cmd []string) *ir.Program {
 
 		// Error handler
 		ir.DeclareLabel(errLabel, ir.Block{
-			ir.Syscall(defs.SYS_REBOOT,
-				linux.LINUX_REBOOT_MAGIC1,
-				linux.LINUX_REBOOT_MAGIC2,
-				linux.LINUX_REBOOT_CMD_RESTART,
-				ir.Int64(0),
-			),
+			func() ir.Fragment {
+				switch arch {
+				case hv.ArchitectureX86_64:
+					return ir.Syscall(defs.SYS_REBOOT,
+						linux.LINUX_REBOOT_MAGIC1,
+						linux.LINUX_REBOOT_MAGIC2,
+						linux.LINUX_REBOOT_CMD_RESTART,
+						ir.Int64(0),
+					)
+				case hv.ArchitectureARM64:
+					return ir.Syscall(defs.SYS_REBOOT,
+						linux.LINUX_REBOOT_MAGIC1,
+						linux.LINUX_REBOOT_MAGIC2,
+						linux.LINUX_REBOOT_CMD_POWER_OFF,
+						ir.Int64(0),
+					)
+				default:
+					panic(fmt.Sprintf("unsupported architecture for reboot: %s", arch))
+				}
+			}(),
 		}),
 	}
 

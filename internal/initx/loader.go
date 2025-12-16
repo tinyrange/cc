@@ -335,6 +335,10 @@ func (vm *VirtualMachine) Run(ctx context.Context, prog *ir.Program) error {
 	return vm.runProgram(ctx, prog, nil)
 }
 
+func (vm *VirtualMachine) Architecture() hv.CpuArchitecture {
+	return vm.vm.Hypervisor().Architecture()
+}
+
 func (vm *VirtualMachine) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error {
 	return vm.vm.VirtualCPUCall(id, f)
 }

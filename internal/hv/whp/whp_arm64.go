@@ -255,7 +255,7 @@ func (h *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 			GicdBaseAddress:                    whpGicDistributorBase,
 			GitsTranslatorBaseAddress:          0,
 			GicLpiIntIdBits:                    1,
-			GicPpiOverflowInterruptFromCntv:    0x14,
+			GicPpiOverflowInterruptFromCntv:    0x1B, // 27 - EL1 Virtual Timer PPI per ARM architecture
 			GicPpiPerformanceMonitorsInterrupt: 0x17,
 		},
 	}); err != nil {

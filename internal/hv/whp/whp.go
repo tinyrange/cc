@@ -124,6 +124,8 @@ var whpRegisterMap = map[hv.Register]bindings.RegisterName{
 	hv.RegisterARM64X26:      bindings.Arm64RegisterX26,
 	hv.RegisterARM64X27:      bindings.Arm64RegisterX27,
 	hv.RegisterARM64X28:      bindings.Arm64RegisterX28,
+	hv.RegisterARM64X29:      bindings.Arm64RegisterFp,
+	hv.RegisterARM64X30:      bindings.Arm64RegisterLr,
 	hv.RegisterARM64Sp:       bindings.Arm64RegisterSp,
 	hv.RegisterARM64Pc:       bindings.Arm64RegisterPc,
 	hv.RegisterARM64Pstate:   bindings.Arm64RegisterPstate,
