@@ -295,10 +295,9 @@ func (h *hypervisor) archVCPUInit(vm *virtualMachine, vcpu *virtualCPU) error {
 	return nil
 }
 
-// SetIRQ asserts an interrupt line. WHP only supports edge-triggered delivery for
-// our simple GIC setup; we emulate level semantics by tracking asserted state
-// per INTID and only issuing a WHP request on rising edges. Deassert is recorded
-// for bookkeeping even though WHP currently has no explicit deassert.
+// SetIRQ asserts or deasserts an interrupt line. WHP's GIC emulator requires
+// explicit notification of both assertion and deassertion to properly track
+// interrupt state. We track state changes to avoid redundant WHP calls.
 func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 	if v == nil {
 		return fmt.Errorf("whp: virtual machine is nil")
@@ -326,14 +325,23 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 		intid = spiNum
 	}
 
-	if !v.arm64ShouldFire(intid, level) {
-		return nil
+	// Track state - only call WHP when state changes
+	v.arm64GICMu.Lock()
+	if v.arm64GICAsserted == nil {
+		v.arm64GICAsserted = make(map[uint32]bool)
 	}
+	prev := v.arm64GICAsserted[intid]
+	if level == prev {
+		v.arm64GICMu.Unlock()
+		return nil // No state change
+	}
+	v.arm64GICAsserted[intid] = level
+	v.arm64GICMu.Unlock()
 
 	ctrl := bindings.InterruptControl{
 		InterruptControl: bindings.MakeInterruptControl2(
 			bindings.InterruptTypeFixed,
-			true,  // Asserted
+			level, // Pass actual level (true=assert, false=deassert)
 			false, // Retarget
 		),
 		TargetPartition: 0,
