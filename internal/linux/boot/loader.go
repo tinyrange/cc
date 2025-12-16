@@ -238,6 +238,11 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 		}
 	}
 
+	// DeviceTreeProvider allows any device to provide device tree nodes
+	type DeviceTreeProvider interface {
+		DeviceTreeNodes() ([]fdt.Node, error)
+	}
+
 	for _, dev := range l.Devices {
 		if vdev, ok := dev.(virtio.VirtioMMIODevice); ok {
 			params, err := vdev.GetLinuxCommandLineParam()
@@ -248,6 +253,14 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 			nodes, err := vdev.DeviceTreeNodes()
 			if err != nil {
 				return fmt.Errorf("get virtio mmio device tree nodes: %w", err)
+			}
+			virtioNodes = append(virtioNodes, nodes...)
+		}
+		// Also check for non-virtio devices that provide device tree nodes
+		if dtp, ok := dev.(DeviceTreeProvider); ok {
+			nodes, err := dtp.DeviceTreeNodes()
+			if err != nil {
+				return fmt.Errorf("get device tree nodes: %w", err)
 			}
 			virtioNodes = append(virtioNodes, nodes...)
 		}
