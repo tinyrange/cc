@@ -115,7 +115,7 @@ func (p *PIT) Poll(context.Context) error {
 func (p *PIT) SetChannel2Gate(high bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.timers[2].setGate(high)
+	p.timers[2].setGate(high, p.now(), p.tick)
 }
 
 // Channel2OutputHigh reports the OUT state of channel 2.
@@ -166,7 +166,9 @@ func (p *PIT) WriteIOPort(port uint16, data []byte) error {
 	switch port {
 	case pitChannel0Port, pitChannel1Port, pitChannel2Port:
 		idx := int(port - pitChannel0Port)
-		if p.timers[idx].write(p.now(), p.tick, data[0]) && idx == 0 {
+		// Channel 2 is gated via port 0x61; channels 0 and 1 are not gated
+		gated := idx == 2
+		if p.timers[idx].write(p.now(), p.tick, data[0], gated) && idx == 0 {
 			if p.debugCh0Arms < 4 {
 				p.debugCh0Arms++
 				ch := p.timers[0]
@@ -402,6 +404,11 @@ type pitChannel struct {
 	outputHigh bool
 	gate       bool
 
+	// armed indicates that a reload value has been written but counting hasn't
+	// started yet because the gate is low. When gate goes high, counting begins.
+	// This is essential for mode 0 on channel 2, which Linux uses for TSC calibration.
+	armed bool
+
 	timer timerHandle
 
 	countLatched     bool
@@ -429,6 +436,7 @@ func newPitChannel() *pitChannel {
 		control:    pitControl{access: pitAccessLowHigh, mode: pitMode3},
 		nullCount:  true,
 		outputHigh: true,
+		armed:      false,
 	}
 }
 
@@ -441,12 +449,13 @@ func (ch *pitChannel) setControl(access pitAccessMode, mode pitMode, bcd bool) {
 	ch.statusLatched = false
 	ch.nullCount = true
 	ch.running = false
+	ch.armed = false
 	ch.outputHigh = true
 	ch.deadline = time.Time{}
 	ch.squareWaveHigh = false
 }
 
-func (ch *pitChannel) write(now time.Time, tick time.Duration, value byte) bool {
+func (ch *pitChannel) write(now time.Time, tick time.Duration, value byte, gated bool) bool {
 	switch ch.control.access {
 	case pitAccessLow:
 		ch.pendingValue = uint16(value)
@@ -467,13 +476,28 @@ func (ch *pitChannel) write(now time.Time, tick time.Duration, value byte) bool 
 	}
 
 	ch.reload = ch.pendingValue
-	ch.lastReload = now
-	ch.running = true
 	ch.nullCount = false
 	ch.readHigh = false
 	ch.countLatched = false
 	ch.statusLatched = false
 	ch.deadline = time.Time{}
+
+	// For gated channels (channel 2) in mode 0, don't start counting until
+	// the gate goes HIGH. This is essential for Linux's TSC calibration which:
+	// 1. Writes the count value
+	// 2. Enables the gate via port 0x61
+	// 3. Polls for output to go HIGH
+	if gated && ch.control.mode == pitMode0 && !ch.gate {
+		ch.armed = true
+		ch.running = false
+		ch.outputHigh = true // Output stays HIGH until gate triggers countdown
+		return true
+	}
+
+	ch.armed = false
+	ch.lastReload = now
+	ch.running = true
+
 	switch ch.control.mode {
 	case pitMode0:
 		// Mode 0: One-shot countdown to zero; record deadline for faster reads.
@@ -652,8 +676,23 @@ func (ch *pitChannel) toggleOutput() {
 	ch.outputHigh = !ch.outputHigh
 }
 
-func (ch *pitChannel) setGate(gate bool) {
+func (ch *pitChannel) setGate(gate bool, now time.Time, tick time.Duration) {
+	wasLow := !ch.gate
 	ch.gate = gate
+
+	// Handle gate LOW->HIGH transition for gated modes.
+	// In mode 0 (one-shot), the gate going HIGH triggers the countdown.
+	if wasLow && gate && ch.armed {
+		ch.armed = false
+		ch.running = true
+		ch.lastReload = now
+		ch.outputHigh = false // Output goes LOW when counting starts
+
+		// Set deadline for mode 0 one-shot countdown
+		if ch.control.mode == pitMode0 {
+			ch.deadline = now.Add(time.Duration(ch.effectiveReload()) * tick)
+		}
+	}
 }
 
 func (ch *pitChannel) effectiveReload() uint32 {
