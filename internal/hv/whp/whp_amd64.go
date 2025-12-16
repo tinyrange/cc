@@ -5,9 +5,8 @@ package whp
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
-	"os"
-	"time"
 	"unsafe"
 
 	"github.com/tinyrange/cc/internal/devices/amd64/chipset"
@@ -26,15 +25,6 @@ func (h *hypervisor) Architecture() hv.CpuArchitecture {
 	return hv.ArchitectureX86_64
 }
 
-type w struct {
-}
-
-func (w) Write(p []byte) (n int, err error) {
-	// console escape noop
-	os.Stdout.WriteString("\x1b[0m")
-	return len(p), nil
-}
-
 // Run implements hv.VirtualCPU.
 func (v *virtualCPU) Run(ctx context.Context) error {
 	var exit bindings.RunVPExitContext
@@ -45,12 +35,6 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			_ = bindings.CancelRunVirtualProcessor(v.vm.part, uint32(v.id), 0)
 		})
 		defer stop()
-	}
-
-	// HORRIBLE HACK TO GET BRING UP WORKING
-	if !v.firstTickDone {
-		slog.NewJSONHandler(w{}, nil).Handle(context.Background(), slog.NewRecord(time.Now(), slog.LevelDebug, "", 0))
-		v.firstTickDone = true
 	}
 
 	if err := bindings.RunVirtualProcessorContext(v.vm.part, uint32(v.id), &exit); err != nil {
@@ -69,7 +53,12 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	case bindings.RunVPExitReasonMemoryAccess:
 		mem := exit.MemoryAccess()
 
-		var status bindings.EmulatorStatus
+		// IMPORTANT: Use heap-allocated status to work around a Go runtime issue on Windows
+		// where stack-allocated variables initialized to zero don't get written by WHP APIs.
+		status := new(bindings.EmulatorStatus)
+
+		// WORKAROUND: See comment in I/O emulation case below for explanation
+		fmt.Fprintf(io.Discard, "%p", status)
 
 		v.pendingError = nil
 
@@ -81,7 +70,7 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			unsafe.Pointer(v),
 			&exit.VpContext,
 			mem,
-			&status,
+			status,
 		); err != nil {
 			return fmt.Errorf("EmulatorTryMmioEmulation failed: %w", err)
 		}
@@ -98,22 +87,32 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			// We return a detailed error to help debugging, including the RIP and GPA
 			rip := exit.VpContext.Rip
 			gpa := mem.Gpa
-			return fmt.Errorf("whp: emulation failed (Status=%v) at RIP=0x%x accessing GPA=0x%x.", status, rip, gpa)
+			return fmt.Errorf("whp: emulation failed (Status=%v) at RIP=0x%x accessing GPA=0x%x.", *status, rip, gpa)
 		}
 
 		return nil
 	case bindings.RunVPExitReasonX64IoPortAccess:
-		io := exit.IoPortAccess()
+		ioCtx := exit.IoPortAccess()
 
-		var status bindings.EmulatorStatus
+		// IMPORTANT: Use heap-allocated status to work around a Go runtime issue on Windows
+		// where stack-allocated variables initialized to zero don't get written by WHP APIs.
+		status := new(bindings.EmulatorStatus)
+
+		// WORKAROUND: On Windows, there's a bug where WHP emulation callbacks don't work correctly
+		// unless fmt's pointer formatting is invoked on the status pointer before the API call.
+		// The exact root cause is unknown, but this triggers some initialization in the Go runtime
+		// or fmt package that makes the syscall callbacks work correctly. Without this, the
+		// EmulatorStatus remains 0 (None) even when the callback succeeds.
+		// This writes nothing visible to stdout (io.Discard) but is necessary for correctness.
+		fmt.Fprintf(io.Discard, "%p", status)
 
 		v.pendingError = nil
 		if err := bindings.EmulatorTryIoEmulation(
 			v.vm.emu,
 			unsafe.Pointer(v),
 			&exit.VpContext,
-			io,
-			&status,
+			ioCtx,
+			status,
 		); err != nil {
 			return fmt.Errorf("EmulatorTryIoEmulation failed: %w", err)
 		}
@@ -123,7 +122,7 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		}
 
 		if !status.EmulationSuccessful() {
-			return fmt.Errorf("whp: io emulation failed with status %v at port 0x%x", status, io.Port)
+			return fmt.Errorf("whp: io emulation failed with status %v at port 0x%x", *status, ioCtx.Port)
 		}
 
 		return nil

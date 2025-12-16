@@ -237,6 +237,7 @@ func run() error {
 				},
 			},
 		}); err != nil {
+			fmt.Fprintf(os.Stderr, "cc: VM boot failed: %v\n", err)
 			if err := vm.VirtualCPUCall(0, func(vcpu hv.VirtualCPU) error {
 				// figure out the current state
 				regs := map[hv.Register]hv.RegisterValue{

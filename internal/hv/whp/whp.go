@@ -7,8 +7,10 @@ import (
 	"encoding/binary"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 
+	corechipset "github.com/tinyrange/cc/internal/chipset"
 	"github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/whp/bindings"
@@ -18,8 +20,6 @@ type virtualCPU struct {
 	vm       *virtualMachine
 	id       int
 	runQueue chan func()
-
-	firstTickDone bool
 
 	pendingError error
 }
@@ -161,54 +161,33 @@ func (v *virtualCPU) handleIOPortAccess(access *bindings.EmulatorIOAccessInfo) e
 		return fmt.Errorf("whp: unsupported IO port access size %d", access.AccessSize)
 	}
 
-	// slog.Info(
-	// 	"vCPU I/O port access",
-	// 	"port", fmt.Sprintf("0x%04X", access.Port),
-	// 	"size", access.AccessSize,
-	// 	"direction", access.Direction,
-	// )
+	cs, err := v.vm.ensureChipset()
+	if err != nil {
+		return fmt.Errorf("initialize chipset: %w", err)
+	}
 
 	// Buffer to bridge the gap between WHP's uint32 Data and Go's []byte device interfaces.
 	// We initialize it to zero to ensure clean upper bytes when reading partial sizes.
 	var data [4]byte
 
-	for _, dev := range v.vm.devices {
-		if kvmIoPortDevice, ok := dev.(hv.X86IOPortDevice); ok {
-			ports := kvmIoPortDevice.IOPorts()
-			for _, port := range ports {
-				if port == access.Port {
-					if access.Direction == bindings.EmulatorIOAccessDirectionIn {
-						// READ: Device -> Emulator (Guest IN instruction)
-
-						// Pass a slice of the exact size requested to the device.
-						if err := kvmIoPortDevice.ReadIOPort(access.Port, data[:access.AccessSize]); err != nil {
-							return fmt.Errorf("I/O port 0x%04x read: %w", access.Port, err)
-						}
-
-						// Convert the byte slice back to uint32 for the C struct.
-						// Since 'data' was zeroed, we can safely read the whole uint32
-						// even if AccessSize < 4.
-						access.Data = binary.LittleEndian.Uint32(data[:])
-
-					} else {
-						// WRITE: Emulator -> Device (Guest OUT instruction)
-
-						// Put the C uint32 data into the byte buffer.
-						binary.LittleEndian.PutUint32(data[:], access.Data)
-
-						// Pass the relevant bytes to the device.
-						if err := kvmIoPortDevice.WriteIOPort(access.Port, data[:access.AccessSize]); err != nil {
-							return fmt.Errorf("I/O port 0x%04x write: %w", access.Port, err)
-						}
-						// For writes, we don't need to update access.Data.
-					}
-					return nil
-				}
-			}
-		}
+	if access.Direction != bindings.EmulatorIOAccessDirectionIn {
+		// WRITE: Put the C uint32 data into the byte buffer.
+		binary.LittleEndian.PutUint32(data[:], access.Data)
 	}
 
-	return fmt.Errorf("whp: unhandled IO port access at port 0x%X", access.Port)
+	isWrite := access.Direction != bindings.EmulatorIOAccessDirectionIn
+	if err := cs.HandlePIO(access.Port, data[:access.AccessSize], isWrite); err != nil {
+		return fmt.Errorf("I/O port 0x%04x: %w", access.Port, err)
+	}
+
+	if access.Direction == bindings.EmulatorIOAccessDirectionIn {
+		// READ: Convert the byte slice back to uint32 for the C struct.
+		// Since 'data' was zeroed, we can safely read the whole uint32
+		// even if AccessSize < 4.
+		access.Data = binary.LittleEndian.Uint32(data[:])
+	}
+
+	return nil
 }
 
 func (v *virtualCPU) handleMemoryAccess(access *bindings.EmulatorMemoryAccessInfo) error {
@@ -241,36 +220,17 @@ func (v *virtualCPU) handleMemoryAccess(access *bindings.EmulatorMemoryAccessInf
 		return nil
 	}
 
-	// 2. MMIO Device Access
-	for _, dev := range v.vm.devices {
-		if kvmMmioDevice, ok := dev.(hv.MemoryMappedIODevice); ok {
-			regions := kvmMmioDevice.MMIORegions()
-			for _, region := range regions {
-				if gpa >= region.Address && gpa+size <= region.Address+region.Size {
-
-					// Virtio Console debug logging
-					// if gpa >= 0xd000_0000 && gpa <= 0xd000_00ff {
-					// 	fmt.Printf("Virtio Console Config Access GPA=%x Size=%d Dir=%v\n", gpa, size, access.Direction)
-					// }
-
-					if access.Direction == bindings.EmulatorMemoryAccessDirectionRead {
-						// Read: Device -> Emulator
-						if err := kvmMmioDevice.ReadMMIO(gpa, dataSlice); err != nil {
-							return fmt.Errorf("MMIO read at 0x%016x: %w", gpa, err)
-						}
-					} else {
-						// Write: Emulator -> Device
-						if err := kvmMmioDevice.WriteMMIO(gpa, dataSlice); err != nil {
-							return fmt.Errorf("MMIO write at 0x%016x: %w", gpa, err)
-						}
-					}
-					return nil
-				}
-			}
-		}
+	// 2. MMIO Device Access via chipset
+	cs, err := v.vm.ensureChipset()
+	if err != nil {
+		return fmt.Errorf("initialize chipset: %w", err)
 	}
 
-	return fmt.Errorf("whp: unhandled memory access at guest physical address 0x%X", gpa)
+	isWrite := access.Direction != bindings.EmulatorMemoryAccessDirectionRead
+	if err := cs.HandleMMIO(gpa, dataSlice, isWrite); err != nil {
+		return fmt.Errorf("MMIO at 0x%016x: %w", gpa, err)
+	}
+	return nil
 }
 
 var (
@@ -331,7 +291,8 @@ type virtualMachine struct {
 
 	emu bindings.EmulatorHandle
 
-	ioapic *chipset.IOAPIC
+	chipset *corechipset.Chipset
+	ioapic  *chipset.IOAPIC
 	// arm64GICInfo caches the configured interrupt controller details when available.
 	arm64GICInfo hv.Arm64GICInfo
 	// arm64 interrupt bookkeeping for level-aware delivery.
@@ -476,6 +437,134 @@ func (v *virtualMachine) Arm64GICInfo() (hv.Arm64GICInfo, bool) {
 		return hv.Arm64GICInfo{}, false
 	}
 	return v.arm64GICInfo, true
+}
+
+// ensureChipset builds the chipset dispatch tables from registered devices on demand.
+func (v *virtualMachine) ensureChipset() (*corechipset.Chipset, error) {
+	if v.chipset != nil {
+		return v.chipset, nil
+	}
+
+	builder := corechipset.NewBuilder()
+	for idx, dev := range v.devices {
+		name := fmt.Sprintf("%T#%d", dev, idx)
+
+		if cdev, ok := dev.(corechipset.ChipsetDevice); ok {
+			if err := builder.RegisterDevice(name, cdev); err != nil {
+				// If registration fails due to overlap, the region is already handled by another device
+				// Skip this device rather than failing entirely
+				if strings.Contains(err.Error(), "overlaps existing region") {
+					continue
+				}
+				return nil, fmt.Errorf("register chipset device %q: %w", name, err)
+			}
+			continue
+		}
+
+		adapter := newLegacyChipsetAdapter(name, dev)
+		if adapter == nil {
+			continue
+		}
+		if err := builder.RegisterDevice(name, adapter); err != nil {
+			// If registration fails due to overlap, the region is already handled by another device
+			// Skip this device rather than failing entirely
+			if strings.Contains(err.Error(), "overlaps existing region") {
+				continue
+			}
+			return nil, fmt.Errorf("register legacy device %q: %w", name, err)
+		}
+	}
+
+	chipset, err := builder.Build()
+	if err != nil {
+		return nil, fmt.Errorf("build chipset: %w", err)
+	}
+	v.chipset = chipset
+	return chipset, nil
+}
+
+// legacyChipsetAdapter bridges existing hv.Device implementations into the chipset builder.
+type legacyChipsetAdapter struct {
+	name   string
+	device hv.Device
+	io     hv.X86IOPortDevice
+	mmio   hv.MemoryMappedIODevice
+}
+
+func newLegacyChipsetAdapter(name string, dev hv.Device) *legacyChipsetAdapter {
+	var ioDev hv.X86IOPortDevice
+	if d, ok := dev.(hv.X86IOPortDevice); ok {
+		ioDev = d
+	}
+
+	var mmioDev hv.MemoryMappedIODevice
+	if d, ok := dev.(hv.MemoryMappedIODevice); ok {
+		mmioDev = d
+	}
+
+	if ioDev == nil && mmioDev == nil {
+		return nil
+	}
+
+	return &legacyChipsetAdapter{
+		name:   name,
+		device: dev,
+		io:     ioDev,
+		mmio:   mmioDev,
+	}
+}
+
+func (a *legacyChipsetAdapter) Init(vm hv.VirtualMachine) error { return nil }
+func (a *legacyChipsetAdapter) Start() error                    { return nil }
+func (a *legacyChipsetAdapter) Stop() error                     { return nil }
+func (a *legacyChipsetAdapter) Reset() error                    { return nil }
+
+func (a *legacyChipsetAdapter) SupportsPortIO() *corechipset.PortIOIntercept {
+	if a.io == nil {
+		return nil
+	}
+	return &corechipset.PortIOIntercept{
+		Ports:   a.io.IOPorts(),
+		Handler: portIOAdapter{dev: a.io},
+	}
+}
+
+func (a *legacyChipsetAdapter) SupportsMmio() *corechipset.MmioIntercept {
+	if a.mmio == nil {
+		return nil
+	}
+	return &corechipset.MmioIntercept{
+		Regions: a.mmio.MMIORegions(),
+		Handler: mmioAdapter{dev: a.mmio},
+	}
+}
+
+func (a *legacyChipsetAdapter) SupportsPollDevice() *corechipset.PollDevice {
+	return nil
+}
+
+type portIOAdapter struct {
+	dev hv.X86IOPortDevice
+}
+
+func (p portIOAdapter) ReadIOPort(port uint16, data []byte) error {
+	return p.dev.ReadIOPort(port, data)
+}
+
+func (p portIOAdapter) WriteIOPort(port uint16, data []byte) error {
+	return p.dev.WriteIOPort(port, data)
+}
+
+type mmioAdapter struct {
+	dev hv.MemoryMappedIODevice
+}
+
+func (m mmioAdapter) ReadMMIO(addr uint64, data []byte) error {
+	return m.dev.ReadMMIO(addr, data)
+}
+
+func (m mmioAdapter) WriteMMIO(addr uint64, data []byte) error {
+	return m.dev.WriteMMIO(addr, data)
 }
 
 type hypervisor struct{}
