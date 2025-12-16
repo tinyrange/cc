@@ -52,6 +52,13 @@ var crossBuilds = []crossBuild{
 	{"windows", "arm64"},
 }
 
+type remoteTarget struct {
+	Address   string `json:"address"`
+	GOOS      string `json:"os"`
+	GOARCH    string `json:"arch"`
+	TargetDir string `json:"targetDir"`
+}
+
 type buildOptions struct {
 	Package          string
 	OutputName       string
@@ -176,6 +183,185 @@ func getOrCreateHostID() (string, error) {
 	return hostID, nil
 }
 
+func loadRemoteTarget(alias string) (remoteTarget, error) {
+	remotesPath := filepath.Join("local", "remotes.json")
+	data, err := os.ReadFile(remotesPath)
+	if err != nil {
+		return remoteTarget{}, fmt.Errorf("failed to read remotes from %s: %w", remotesPath, err)
+	}
+
+	var remotes map[string]remoteTarget
+	if err := json.Unmarshal(data, &remotes); err != nil {
+		return remoteTarget{}, fmt.Errorf("failed to parse remotes file %s: %w", remotesPath, err)
+	}
+
+	target, ok := remotes[alias]
+	if !ok {
+		return remoteTarget{}, fmt.Errorf("remote alias %q not found in %s", alias, remotesPath)
+	}
+
+	if target.Address == "" || target.GOOS == "" || target.GOARCH == "" || target.TargetDir == "" {
+		return remoteTarget{}, fmt.Errorf("remote alias %q missing required fields (address/os/arch/targetDir)", alias)
+	}
+
+	return target, nil
+}
+
+func runRemoteCommand(remote remoteTarget, output buildOutput, args []string) error {
+	cmdName := filepath.Join(remote.TargetDir, filepath.Base(output.Path))
+
+	cmdArgs := append([]string{"run", "-timeout", "30s", remote.Address, cmdName}, args...)
+	cmd := exec.Command("remotectl", cmdArgs...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("remotectl execution failed: %w", err)
+	}
+
+	return nil
+}
+
+func pushBuildOutput(remote remoteTarget, output buildOutput) error {
+	targetFile := filepath.Join(remote.TargetDir, filepath.Base(output.Path))
+
+	// push the file using remotectl push-file
+	cmd := exec.Command(
+		"remotectl", "push-file",
+		remote.Address,
+		output.Path,
+		targetFile,
+	)
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("remotectl push failed: %w", err)
+	}
+
+	// make the file executable using remotectl run chmod +x
+	cmd = exec.Command(
+		"remotectl", "run", remote.Address,
+		"chmod", "+x", targetFile,
+	)
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("remotectl chmod failed: %w", err)
+	}
+
+	return nil
+}
+
+// isContextOlderThanOutput checks if all files in the context directory
+// are older than the output file. Returns true if the output is newer
+// than all context files, false otherwise.
+func isContextOlderThanOutput(contextDir, outputPath string) (bool, error) {
+	outputInfo, err := os.Stat(outputPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to stat output file: %w", err)
+	}
+
+	outputModTime := outputInfo.ModTime()
+
+	err = filepath.Walk(contextDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip directories themselves, only check files
+		if info.IsDir() {
+			return nil
+		}
+
+		if info.ModTime().After(outputModTime) {
+			return fmt.Errorf("file %s is newer than output", path)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		// If we found a newer file, return false
+		return false, nil
+	}
+
+	// All files are older than the output
+	return true, nil
+}
+
+// clearCCCache clears the cc cache for a given tar file path.
+// This ensures that when we rebuild a Docker image, cc will re-extract it.
+func clearCCCache(tarPath string) error {
+	// Resolve absolute path (same as cc does)
+	absPath, err := filepath.Abs(tarPath)
+	if err != nil {
+		return fmt.Errorf("resolve tar path: %w", err)
+	}
+
+	// Handle relative paths starting with "./" (same as cc does)
+	if strings.HasPrefix(tarPath, "./") {
+		wd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("get working directory: %w", err)
+		}
+		absPath = filepath.Join(wd, tarPath[2:])
+		absPath, err = filepath.Abs(absPath)
+		if err != nil {
+			return fmt.Errorf("resolve tar path: %w", err)
+		}
+	}
+
+	// Get cache directory (same default as cc uses)
+	cacheDir := os.Getenv("CC_CACHE_DIR")
+	if cacheDir == "" {
+		configDir, err := os.UserConfigDir()
+		if err != nil {
+			return fmt.Errorf("get user config dir: %w", err)
+		}
+		cacheDir = filepath.Join(configDir, "cc", "oci")
+	}
+
+	// Sanitize the tar path for use as a filename (same as cc does)
+	sanitized := sanitizeForFilename(absPath)
+	cachePath := filepath.Join(cacheDir, "images", sanitized)
+
+	// Remove the cache directory if it exists
+	if _, err := os.Stat(cachePath); err == nil {
+		if err := os.RemoveAll(cachePath); err != nil {
+			return fmt.Errorf("remove cache directory: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// sanitizeForFilename sanitizes a string for use as a filename.
+// This matches the implementation in internal/oci/client.go
+func sanitizeForFilename(value string) string {
+	value = strings.TrimPrefix(value, "/")
+	var b strings.Builder
+	for _, r := range value {
+		switch r {
+		case '/', '\\', ':', '?', '*', '"', '<', '>', '|', ' ':
+			b.WriteByte('_')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "root"
+	}
+	return b.String()
+}
+
 func main() {
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
@@ -188,9 +374,30 @@ func main() {
 	oci := fs.Bool("oci", false, "build and execute the OCI image tool")
 	kernel := fs.Bool("kernel", false, "build and execute the kernel tool")
 	bringup := fs.Bool("bringup", false, "build and execute the bringup tool inside a linux VM")
+	remote := fs.String("remote", "", "run quest/bringup on remote host alias from local/remotes.json")
+	run := fs.Bool("run", false, "run the built cc tool after building")
+	runtest := fs.String("runtest", "", "build a Dockerfile in tests/<name>/Dockerfile and run it using cc (Linux only)")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
+	}
+
+	var remoteTargetConfig *remoteTarget
+	if *remote != "" {
+		if !*quest && !*bringup {
+			fmt.Fprintf(os.Stderr, "-remote can only be used with -quest or -bringup\n")
+			os.Exit(1)
+		}
+		if *cross {
+			fmt.Fprintf(os.Stderr, "-remote cannot be combined with -cross\n")
+			os.Exit(1)
+		}
+		target, err := loadRemoteTarget(*remote)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to load remote alias: %v\n", err)
+			os.Exit(1)
+		}
+		remoteTargetConfig = &target
 	}
 
 	if *codesign {
@@ -248,10 +455,18 @@ func main() {
 	}
 
 	if *quest {
+		buildTarget := hostBuild
+		if remoteTargetConfig != nil {
+			buildTarget = crossBuild{
+				GOOS:   remoteTargetConfig.GOOS,
+				GOARCH: remoteTargetConfig.GOARCH,
+			}
+		}
+
 		out, err := goBuild(buildOptions{
 			Package:          "internal/cmd/quest",
 			OutputName:       "quest",
-			Build:            hostBuild,
+			Build:            buildTarget,
 			RaceEnabled:      *race,
 			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
 		})
@@ -260,19 +475,45 @@ func main() {
 			os.Exit(1)
 		}
 
-		if err := runBuildOutput(out, fs.Args()); err != nil {
-			os.Exit(1)
+		if remoteTargetConfig != nil {
+			if err := pushBuildOutput(*remoteTargetConfig, out); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to push quest to remote: %v\n", err)
+				os.Exit(1)
+			}
+
+			if err := runRemoteCommand(*remoteTargetConfig, out, fs.Args()); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to run quest remotely: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			if err := runBuildOutput(out, fs.Args()); err != nil {
+				os.Exit(1)
+			}
 		}
 
 		return
 	}
 
 	if *bringup {
+		bringupBuild := crossBuild{GOOS: "linux", GOARCH: hostBuild.GOARCH}
+		questBuild := hostBuild
+
+		if remoteTargetConfig != nil {
+			bringupBuild = crossBuild{
+				GOOS:   "linux",
+				GOARCH: remoteTargetConfig.GOARCH,
+			}
+			questBuild = crossBuild{
+				GOOS:   remoteTargetConfig.GOOS,
+				GOARCH: remoteTargetConfig.GOARCH,
+			}
+		}
+
 		bringupOut, err := goBuild(buildOptions{
 			Package:    "internal/cmd/bringup",
 			OutputName: "bringup",
 			CgoEnabled: false,
-			Build:      crossBuild{GOOS: "linux", GOARCH: hostBuild.GOARCH},
+			Build:      bringupBuild,
 			BuildTests: true,
 			Tags:       []string{"guest"},
 		})
@@ -284,7 +525,7 @@ func main() {
 		out, err := goBuild(buildOptions{
 			Package:          "internal/cmd/quest",
 			OutputName:       "quest",
-			Build:            hostBuild,
+			Build:            questBuild,
 			RaceEnabled:      *race,
 			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
 		})
@@ -293,9 +534,32 @@ func main() {
 			os.Exit(1)
 		}
 
-		args := append([]string{"-exec", bringupOut.Path}, fs.Args()...)
-		if err := runBuildOutput(out, args); err != nil {
-			os.Exit(1)
+		bringupExecPath := bringupOut.Path
+
+		if remoteTargetConfig != nil {
+			bringupExecPath = filepath.Join(remoteTargetConfig.TargetDir, filepath.Base(bringupOut.Path))
+
+			if err := pushBuildOutput(*remoteTargetConfig, bringupOut); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to push bringup to remote: %v\n", err)
+				os.Exit(1)
+			}
+
+			if err := pushBuildOutput(*remoteTargetConfig, out); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to push bringup quest to remote: %v\n", err)
+				os.Exit(1)
+			}
+		}
+
+		args := append([]string{"-exec", bringupExecPath}, fs.Args()...)
+		if remoteTargetConfig != nil {
+			if err := runRemoteCommand(*remoteTargetConfig, out, args); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to run bringup quest remotely: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			if err := runBuildOutput(out, args); err != nil {
+				os.Exit(1)
+			}
 		}
 
 		return
@@ -324,6 +588,96 @@ func main() {
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
+			os.Exit(1)
+		}
+
+		return
+	}
+
+	if *runtest != "" {
+		if runtime.GOOS != "linux" {
+			fmt.Fprintf(os.Stderr, "-runtest is only supported on Linux hosts\n")
+			os.Exit(1)
+		}
+
+		testName := *runtest
+		dockerfilePath := filepath.Join("tests", testName, "Dockerfile")
+		if _, err := os.Stat(dockerfilePath); err != nil {
+			fmt.Fprintf(os.Stderr, "Dockerfile not found: %s\n", dockerfilePath)
+			os.Exit(1)
+		}
+
+		// Build cc first
+		ccOut, err := goBuild(buildOptions{
+			Package:    "cmd/cc",
+			OutputName: "cc",
+			Build:      hostBuild,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build cc: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Check if we can skip building the Docker image
+		buildDir := filepath.Join("tests", testName)
+		tarPath := filepath.Join("build", fmt.Sprintf("test-%s.tar", testName))
+		if err := os.MkdirAll(filepath.Dir(tarPath), 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create build directory: %v\n", err)
+			os.Exit(1)
+		}
+
+		shouldRebuild := true
+		if isOlder, err := isContextOlderThanOutput(buildDir, tarPath); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to check cache: %v\n", err)
+			os.Exit(1)
+		} else if isOlder {
+			fmt.Printf("Context is older than output tar file, using cached build...\n")
+			shouldRebuild = false
+		}
+
+		if shouldRebuild {
+			// Clear cc cache for this tar file so it will be re-extracted
+			if err := clearCCCache(tarPath); err != nil {
+				// Log but don't fail - cache clearing is best effort
+				fmt.Fprintf(os.Stderr, "warning: failed to clear cc cache: %v\n", err)
+			}
+
+			// Build Docker image
+			imageTag := fmt.Sprintf("cc-test-%s:latest", testName)
+
+			fmt.Printf("Building Docker image from %s...\n", dockerfilePath)
+			buildCmd := exec.Command("docker", "build",
+				"-t", imageTag,
+				"-f", dockerfilePath,
+				buildDir,
+			)
+			buildCmd.Stdout = os.Stdout
+			buildCmd.Stderr = os.Stderr
+			if err := buildCmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to build Docker image: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Save Docker image as tar archive
+			fmt.Printf("Saving Docker image to %s...\n", tarPath)
+			saveCmd := exec.Command("docker", "save", "-o", tarPath, imageTag)
+			saveCmd.Stdout = os.Stdout
+			saveCmd.Stderr = os.Stderr
+			if err := saveCmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to save Docker image: %v\n", err)
+				os.Exit(1)
+			}
+		}
+
+		// Run cc with the tar file
+		// Use relative path so cc can load it
+		relativeTarPath := filepath.Join(".", "build", fmt.Sprintf("test-%s.tar", testName))
+		if !filepath.IsAbs(relativeTarPath) {
+			relativeTarPath = strings.Join([]string{".", relativeTarPath}, string(filepath.Separator))
+		}
+		fmt.Printf("Running cc with image %s...\n", relativeTarPath)
+		ccArgs := append([]string{relativeTarPath}, fs.Args()...)
+		if err := runBuildOutput(ccOut, ccArgs); err != nil {
 			os.Exit(1)
 		}
 
@@ -393,6 +747,22 @@ func main() {
 		return
 	}
 
-	fmt.Fprintf(os.Stderr, "main build not implemented\n")
-	os.Exit(1)
+	// build cmd/cc by default
+	out, err := goBuild(buildOptions{
+		Package:    "cmd/cc",
+		OutputName: "cc",
+		Build:      hostBuild,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to build cc: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("built %s\n", out.Path)
+
+	if *run {
+		fmt.Printf("running %s %s\n", out.Path, strings.Join(fs.Args(), " "))
+		if err := runBuildOutput(out, fs.Args()); err != nil {
+			os.Exit(1)
+		}
+	}
 }

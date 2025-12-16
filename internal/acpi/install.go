@@ -283,7 +283,17 @@ func buildMADTBody(cfg Config) []byte {
 func buildHPETBody(cfg *HPETConfig) []byte {
 	buf := &bytes.Buffer{}
 
-	binary.Write(buf, binary.LittleEndian, uint32(0x8086A201))
+	const (
+		hpetRevision        = 1
+		hpetComparatorCount = 2 // numTimers-1 (we expose three comparators)
+		hpetVendor          = 0x8086
+	)
+	id := uint32(hpetRevision)
+	id |= uint32(hpetComparatorCount) << 8
+	id |= 1 << 13                  // 64-bit counter
+	id |= uint32(hpetVendor) << 16 // PCI vendor ID
+
+	binary.Write(buf, binary.LittleEndian, id)
 	buf.WriteByte(0)
 	buf.WriteByte(64)
 	buf.WriteByte(0)

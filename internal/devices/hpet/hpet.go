@@ -18,6 +18,27 @@ const (
 	vendorID                = 0x8086
 	numTimers               = 3 // enough for typical guests
 
+	timerConfIntType     uint64 = 1 << 1 // level vs edge
+	timerConfIntEnable   uint64 = 1 << 2 // INT_ENB_CNF
+	timerConfPeriodic    uint64 = 1 << 3 // TYPE_CNF
+	timerConfPeriodicCap uint64 = 1 << 4 // PER_INT_CAP
+	timerConfSizeCap     uint64 = 1 << 5 // SIZE_CAP
+	timerConfValSet      uint64 = 1 << 6 // VAL_SET_CNF
+	timerConf32Bit       uint64 = 1 << 8 // 32MODE_CNF
+
+	timerConfIntRouteShift uint64 = 9
+	timerConfIntRouteMask  uint64 = 0x1F << timerConfIntRouteShift
+
+	timerConfFSBEnable uint64 = 1 << 14
+	timerConfFSBCap    uint64 = 1 << 15
+
+	timerWritableMask = timerConfIntType | timerConfIntEnable | timerConfPeriodic |
+		timerConfValSet | timerConf32Bit | timerConfIntRouteMask | timerConfFSBEnable
+
+	legacyReplacementCap = uint64(1 << 15)
+
+	hpetPollInterval = 100 * time.Microsecond
+
 	regGenCap      = 0x000
 	regGenConfig   = 0x010
 	regIntStatus   = 0x020
@@ -32,7 +53,9 @@ const (
 
 type timer struct {
 	config     uint64
+	caps       uint64
 	comparator uint64
+	period     uint64
 	fsRoute    uint64
 }
 
@@ -48,6 +71,14 @@ type Device struct {
 	enabled       bool
 
 	timers [numTimers]timer
+
+	ticker *time.Ticker
+
+	debugConfigWrites int
+	debugTimerConfig  [numTimers]int
+	debugTimerCmp     [numTimers]int
+	debugTimerIRQs    [numTimers]int
+	debugReads        int
 }
 
 // New constructs an HPET device mapped at base (and optional aliases).
@@ -70,11 +101,23 @@ func New(base uint64, sink InterruptSink, aliases ...uint64) *Device {
 		add(a)
 	}
 
-	return &Device{
+	dev := &Device{
 		bases:      bases,
 		sink:       sink,
 		lastUpdate: time.Now(),
 	}
+
+	for i := range dev.timers {
+		caps := timerConfPeriodicCap | timerConfSizeCap | (uint64(0xffffffff) << 32)
+		caps &^= timerConfFSBCap
+		dev.timers[i].caps = caps
+		dev.timers[i].config = caps
+	}
+
+	dev.ticker = time.NewTicker(hpetPollInterval)
+	go dev.run()
+
+	return dev
 }
 
 func (d *Device) Init(vm hv.VirtualMachine) error { return nil }
@@ -101,17 +144,21 @@ func (d *Device) ReadMMIO(addr uint64, data []byte) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	d.updateCounterLocked()
+	d.advanceCounterLocked(time.Now())
 
 	offset, err := d.offsetFor(addr)
 	if err != nil {
 		return err
 	}
+	if d.debugReads < 12 {
+		d.debugReads++
+		fmt.Printf("hpet: read offset=%#x size=%d\n", offset, len(data))
+	}
 	val := uint64(0)
 
 	switch {
 	case offset == regGenCap:
-		val = uint64(clockPeriodFemtoseconds)<<32 | uint64(vendorID)<<16 | uint64(1)<<13 | (numTimers - 1)
+		val = uint64(clockPeriodFemtoseconds)<<32 | uint64(vendorID)<<16 | uint64(1)<<13 | (numTimers - 1) | legacyReplacementCap
 	case offset == regGenConfig:
 		val = d.generalConfig
 	case offset == regIntStatus:
@@ -148,6 +195,9 @@ func (d *Device) WriteMMIO(addr uint64, data []byte) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	now := time.Now()
+	d.advanceCounterLocked(now)
+
 	offset, err := d.offsetFor(addr)
 	if err != nil {
 		return err
@@ -159,11 +209,14 @@ func (d *Device) WriteMMIO(addr uint64, data []byte) error {
 
 	switch {
 	case offset == regGenConfig:
-		d.updateCounterLocked()
 		d.generalConfig = val & 0x3
 		enabled := (d.generalConfig & 1) == 1
+		if d.debugConfigWrites < 4 {
+			d.debugConfigWrites++
+			fmt.Printf("hpet: general config=%#x enable=%v legacy=%v\n", val, enabled, (val&2) != 0)
+		}
 		if enabled && !d.enabled {
-			d.lastUpdate = time.Now()
+			d.lastUpdate = now
 		}
 		d.enabled = enabled
 	case offset == regIntStatus:
@@ -171,7 +224,7 @@ func (d *Device) WriteMMIO(addr uint64, data []byte) error {
 	case offset == regMainCounter:
 		d.counter = val
 		if d.enabled {
-			d.lastUpdate = time.Now()
+			d.lastUpdate = now
 		}
 	case offset >= regTimerConfig:
 		idx := (offset - regTimerConfig) / timerStride
@@ -182,9 +235,28 @@ func (d *Device) WriteMMIO(addr uint64, data []byte) error {
 		t := &d.timers[idx]
 		switch reg {
 		case 0x00:
-			t.config = val
+			t.config = (val & timerWritableMask) | t.caps
+			if (t.config & timerConf32Bit) != 0 {
+				t.comparator &= 0xffffffff
+				t.period &= 0xffffffff
+			}
+			if d.debugTimerConfig[idx] < 4 {
+				d.debugTimerConfig[idx]++
+				fmt.Printf("hpet: timer%d config=%#x enable=%v periodic=%v route=%d fsb=%v\n",
+					idx, val, (val&timerConfIntEnable) != 0, (val&timerConfPeriodic) != 0,
+					(val&timerConfIntRouteMask)>>timerConfIntRouteShift, (val&timerConfFSBEnable) != 0)
+			}
 		case 0x08:
+			if (t.config & timerConf32Bit) != 0 {
+				val &= 0xffffffff
+			}
 			t.comparator = val
+			t.period = val
+			if d.debugTimerCmp[idx] < 4 {
+				d.debugTimerCmp[idx]++
+				fmt.Printf("hpet: timer%d comparator=%#x period=%#x enable=%v periodic=%v\n",
+					idx, t.comparator, t.period, (t.config&timerConfIntEnable) != 0, (t.config&timerConfPeriodic) != 0)
+			}
 		case 0x10:
 			t.fsRoute = val
 		}
@@ -192,44 +264,95 @@ func (d *Device) WriteMMIO(addr uint64, data []byte) error {
 	return nil
 }
 
-func (d *Device) updateCounterLocked() {
-	if !d.enabled {
-		return
-	}
-	now := time.Now()
+func (d *Device) advanceCounterLocked(now time.Time) {
 	if now.Before(d.lastUpdate) {
 		d.lastUpdate = now
 		return
 	}
-	elapsed := now.Sub(d.lastUpdate)
-	ticks := (uint64(elapsed.Nanoseconds()) * 1_000_000) / clockPeriodFemtoseconds
-	d.counter += ticks
+
+	prev := d.counter
+	if d.enabled {
+		elapsed := now.Sub(d.lastUpdate)
+		ticks := (uint64(elapsed.Nanoseconds()) * 1_000_000) / clockPeriodFemtoseconds
+		d.counter += ticks
+	}
 	d.lastUpdate = now
-	d.checkTimersLocked(ticks)
+
+	if d.enabled {
+		d.checkTimersLocked(prev)
+	}
 }
 
-func (d *Device) checkTimersLocked(delta uint64) {
+func (d *Device) checkTimersLocked(prev uint64) {
+	current := d.counter
 	for i := range d.timers {
 		t := &d.timers[i]
-		if (t.config & 4) == 0 {
+		if (t.config & timerConfIntEnable) == 0 {
 			continue
 		}
-		if d.counter >= t.comparator && (d.counter-delta) < t.comparator {
-			irq := int((t.config >> 9) & 0x1F)
-			if (d.generalConfig & 2) != 0 {
-				if i == 0 {
-					irq = 0
-				}
-				if i == 1 {
-					irq = 8
-				}
-			}
-			if d.sink != nil {
-				_ = d.sink.SetIRQ(uint32(irq), true)
-				_ = d.sink.SetIRQ(uint32(irq), false)
-			}
-			d.intStatus |= (1 << i)
+		// MSI/FSB delivery is not implemented.
+		if (t.config & timerConfFSBEnable) != 0 {
+			continue
 		}
+
+		period := t.period
+		if (t.config&timerConfPeriodic) != 0 && period == 0 {
+			period = t.comparator
+		}
+
+		if (t.config&timerConfPeriodic) == 0 || period == 0 {
+			if prev < t.comparator && current >= t.comparator {
+				d.raiseIRQLocked(i, t)
+			}
+			continue
+		}
+
+		fired := false
+		comp := t.comparator
+		for period > 0 && current >= comp {
+			fired = true
+			comp += period
+		}
+		t.comparator = comp
+		t.period = period
+		if fired {
+			d.raiseIRQLocked(i, t)
+		}
+	}
+}
+
+func (d *Device) raiseIRQLocked(idx int, t *timer) {
+	irq := d.routeForTimerLocked(idx, t)
+	d.intStatus |= 1 << idx
+	if d.debugTimerIRQs[idx] < 8 {
+		d.debugTimerIRQs[idx]++
+		fmt.Printf("hpet: timer%d IRQ route=%d status=%#x\n", idx, irq, d.intStatus)
+	}
+	if d.sink == nil {
+		return
+	}
+	_ = d.sink.SetIRQ(uint32(irq), true)
+	_ = d.sink.SetIRQ(uint32(irq), false)
+}
+
+func (d *Device) routeForTimerLocked(idx int, t *timer) int {
+	if (d.generalConfig & 2) != 0 {
+		if idx == 0 {
+			return 0
+		}
+		if idx == 1 {
+			return 8
+		}
+	}
+	route := (t.config & timerConfIntRouteMask) >> timerConfIntRouteShift
+	return int(route)
+}
+
+func (d *Device) run() {
+	for now := range d.ticker.C {
+		d.mu.Lock()
+		d.advanceCounterLocked(now)
+		d.mu.Unlock()
 	}
 }
 

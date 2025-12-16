@@ -53,11 +53,17 @@ type CMOS struct {
 	nmiMasked  bool
 	cmos       [256]byte
 	now        func() time.Time
-	irq        irqLine
-	irqLine    uint8
+	irqLine    LineInterrupt
 	irqAssert  bool
 	timer      timerHandle
 	timerMaker timerFactory
+
+	periodic timerHandle
+	square   timerHandle
+	update   timerHandle
+	alarm    timerHandle
+
+	uipDeadline time.Time
 }
 
 // CMOSOption customises the RTC for tests.
@@ -82,23 +88,14 @@ func WithCMOSTimerFactory(factory func(time.Duration, func()) timerHandle) CMOSO
 }
 
 // WithCMOSIRQLine overrides which IRQ line the RTC uses (defaults to 8).
-func WithCMOSIRQLine(line uint8) CMOSOption {
-	return func(c *CMOS) {
-		c.irqLine = line
-	}
-}
-
 // NewCMOS constructs an RTC device connected to the supplied IRQ sink.
 func NewCMOS(irq irqLine, opts ...CMOSOption) *CMOS {
 	c := &CMOS{
 		now:        time.Now,
-		irq:        irq,
-		irqLine:    8,
+		irqLine:    LineInterruptDetached(),
 		timerMaker: defaultTimerFactory,
 	}
-	if c.irq == nil {
-		c.irq = noopIRQLine{}
-	}
+	c.SetIRQSink(irq)
 	c.cmos[cmosRegStatusA] = 0x20
 	c.cmos[cmosRegStatusB] = statusB24HourMode
 	c.cmos[cmosRegStatusD] = 0x80
@@ -108,12 +105,38 @@ func NewCMOS(irq irqLine, opts ...CMOSOption) *CMOS {
 	return c
 }
 
+// SetIRQSink configures the IRQ line used for RTC interrupts.
+func (c *CMOS) SetIRQSink(sink irqLine) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if sink == nil {
+		c.irqLine = LineInterruptDetached()
+		return
+	}
+	c.irqLine = LineInterruptFromFunc(func(level bool) {
+		sink.SetIRQ(8, level)
+	})
+}
+
+// SetIRQLine configures the LineInterrupt used for RTC IRQ delivery.
+func (c *CMOS) SetIRQLine(line LineInterrupt) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if line == nil {
+		c.irqLine = LineInterruptDetached()
+		return
+	}
+	c.irqLine = line
+}
+
 // Init implements hv.Device.
 func (c *CMOS) Init(vm hv.VirtualMachine) error {
 	_ = vm
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.uipDeadline = c.now()
 	c.startTimerLocked()
+	c.startPeriodicLocked()
 	return nil
 }
 
@@ -165,6 +188,12 @@ func (c *CMOS) WriteIOPort(port uint16, data []byte) error {
 
 func (c *CMOS) readRegisterLocked(idx byte) byte {
 	switch idx {
+	case cmosRegStatusA:
+		statusA := c.cmos[cmosRegStatusA] &^ (1 << 7)
+		if c.now().Before(c.uipDeadline) {
+			statusA |= 1 << 7
+		}
+		return statusA
 	case cmosRegSeconds, cmosRegMinutes, cmosRegHours,
 		cmosRegWeekday, cmosRegDayOfMonth, cmosRegMonth,
 		cmosRegYear, cmosRegCentury:
@@ -191,7 +220,7 @@ func (c *CMOS) readRegisterLocked(idx byte) byte {
 		value := c.cmos[cmosRegStatusC]
 		c.cmos[cmosRegStatusC] = 0
 		if c.irqAssert {
-			c.irq.SetIRQ(c.irqLine, false)
+			c.irqLine.SetLevel(false)
 			c.irqAssert = false
 		}
 		return value
@@ -202,19 +231,137 @@ func (c *CMOS) readRegisterLocked(idx byte) byte {
 func (c *CMOS) writeRegisterLocked(idx byte, value byte) {
 	switch idx {
 	case cmosRegStatusA:
+		// Mask out UIP; emulate oscillator bits (4-6) and rate select (0-3).
 		c.cmos[idx] = value &^ (1 << 7)
+		c.applyStatusA()
 	case cmosRegStatusB:
-		c.cmos[idx] = value
+		// Only bits 0-6 writable; bit 7 (SET) is handled separately.
+		c.cmos[idx] = value & 0x7F
+		if value&statusBSet != 0 {
+			// Freeze time updates.
+			if c.timer != nil {
+				c.timer.Stop()
+				c.timer = nil
+			}
+			if c.periodic != nil {
+				c.periodic.Stop()
+				c.periodic = nil
+			}
+		} else if c.timer == nil {
+			c.timer = c.timerMaker(time.Second, func() { c.handleUpdateTick() })
+			c.applyStatusA()
+		}
+		if c.alarm != nil {
+			c.alarm.Stop()
+			c.alarm = nil
+		}
+		c.scheduleAlarmLocked()
 		c.refreshIRQLineLocked()
 	case cmosRegStatusC, cmosRegStatusD:
 		// Read-only
 	case cmosRegSeconds, cmosRegMinutes, cmosRegHours,
 		cmosRegWeekday, cmosRegDayOfMonth, cmosRegMonth,
 		cmosRegYear, cmosRegCentury:
-		c.cmos[idx] = value
+		statusB := c.cmos[cmosRegStatusB]
+		val := value
+		if statusB&statusBBinaryMode == 0 {
+			val = fromBCD(value)
+		}
+		if idx == cmosRegHours && statusB&statusB24HourMode == 0 {
+			val = decode12Hour(val)
+		}
+		c.cmos[idx] = val
+		c.scheduleAlarmLocked()
 	default:
 		c.cmos[idx] = value
 	}
+}
+
+func (c *CMOS) scheduleAlarmLocked() {
+	statusB := c.cmos[cmosRegStatusB]
+	if statusB&statusBAlarmEnable == 0 {
+		return
+	}
+	if c.alarm != nil {
+		c.alarm.Stop()
+		c.alarm = nil
+	}
+
+	nowTime := c.now().UTC()
+	next, ok := c.nextAlarmTimeLocked(nowTime)
+	if !ok {
+		return
+	}
+	delay := next.Sub(nowTime)
+	if delay < 0 {
+		delay = 0
+	}
+
+	// Check if current time matches alarm time. If so, fire immediately.
+	h, m, s := nowTime.UTC().Clock()
+	targetHour := int(c.cmos[cmosRegHoursAlarm])
+	targetMinute := int(c.cmos[cmosRegMinutesAlarm])
+	targetSecond := int(c.cmos[cmosRegSecondsAlarm])
+	if statusB&statusBBinaryMode == 0 {
+		targetHour = int(fromBCD(c.cmos[cmosRegHoursAlarm]))
+		targetMinute = int(fromBCD(c.cmos[cmosRegMinutesAlarm]))
+		targetSecond = int(fromBCD(c.cmos[cmosRegSecondsAlarm]))
+		if statusB&statusB24HourMode == 0 {
+			targetHour = int(decode12Hour(c.cmos[cmosRegHoursAlarm]))
+		}
+	}
+	if (targetHour == 0xFF || targetHour == h) &&
+		(targetMinute == 0xFF || targetMinute == m) &&
+		(targetSecond == 0xFF || targetSecond == s) {
+		c.cmos[cmosRegStatusC] |= statusCIrqAlarm
+		c.refreshIRQLineLocked()
+		// Don't reschedule here - we've already fired for this time.
+		// The next call to scheduleAlarmLocked will find the next occurrence.
+		return
+	}
+
+	c.alarm = c.timerMaker(delay, func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.cmos[cmosRegStatusC] |= statusCIrqAlarm
+		c.refreshIRQLineLocked()
+		// Reschedule the next occurrence.
+		c.scheduleAlarmLocked()
+	})
+}
+
+func (c *CMOS) nextAlarmTimeLocked(now time.Time) (time.Time, bool) {
+	statusB := c.cmos[cmosRegStatusB]
+	target := rtcFields{
+		second: c.cmos[cmosRegSecondsAlarm],
+		minute: c.cmos[cmosRegMinutesAlarm],
+		hour:   c.cmos[cmosRegHoursAlarm],
+	}
+	// Convert to binary for comparison if needed.
+	if statusB&statusBBinaryMode == 0 {
+		target.second = fromBCD(target.second)
+		target.minute = fromBCD(target.minute)
+		target.hour = decode12Hour(target.hour)
+	}
+	// Search forward from next second to find the next alarm time.
+	// We don't check the current second because if it matches, we want to schedule
+	// for the next occurrence, not fire immediately (which would cause infinite recursion).
+	start := now.Add(time.Second)
+	for i := 0; i < 24*60*60; i++ {
+		candidate := start.Add(time.Duration(i) * time.Second)
+		h, m, s := candidate.UTC().Clock()
+		if target.hour != 0xFF && int(target.hour) != h {
+			continue
+		}
+		if target.minute != 0xFF && int(target.minute) != m {
+			continue
+		}
+		if target.second != 0xFF && int(target.second) != s {
+			continue
+		}
+		return candidate, true
+	}
+	return time.Time{}, false
 }
 
 func (c *CMOS) startTimerLocked() {
@@ -227,11 +374,120 @@ func (c *CMOS) startTimerLocked() {
 	c.timer = c.timerMaker(time.Second, func() { c.handleUpdateTick() })
 }
 
+func (c *CMOS) applyStatusA() {
+	dv := (c.cmos[cmosRegStatusA] >> 4) & 0x7
+	oscillatorOn := dv != 0
+
+	if !oscillatorOn {
+		if c.timer != nil {
+			c.timer.Stop()
+			c.timer = nil
+		}
+		if c.periodic != nil {
+			c.periodic.Stop()
+			c.periodic = nil
+		}
+		if c.square != nil {
+			c.square.Stop()
+			c.square = nil
+		}
+		return
+	}
+
+	if c.timer == nil {
+		c.timer = c.timerMaker(time.Second, func() { c.handleUpdateTick() })
+	}
+
+	// Status A bits 0-3: rate select.
+	rateSelect := c.cmos[cmosRegStatusA] & 0x0F
+	period := rateToDuration(rateSelect)
+
+	if c.periodic != nil {
+		c.periodic.Stop()
+		c.periodic = nil
+	}
+	if period > 0 {
+		c.periodic = c.timerMaker(period, func() {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if c.cmos[cmosRegStatusB]&statusBPeriodicEnable != 0 {
+				c.cmos[cmosRegStatusC] |= statusCIrqPeriodic
+				c.refreshIRQLineLocked()
+			}
+		})
+	}
+
+	// Square wave output follows the same rate select when enabled.
+	if c.square != nil {
+		c.square.Stop()
+		c.square = nil
+	}
+	if c.cmos[cmosRegStatusB]&statusBSquareWave != 0 && period > 0 {
+		c.square = c.timerMaker(period, func() {
+			// Square wave toggles IRQ line independently of flags.
+			c.irqLine.PulseInterrupt()
+		})
+	}
+}
+
+func rateToDuration(rate byte) time.Duration {
+	// Follows PC AT RTC rates: rate=6 => 1024Hz, rate=15 => disabled.
+	switch rate {
+	case 3:
+		return time.Second / 8192
+	case 4:
+		return time.Second / 4096
+	case 5:
+		return time.Second / 2048
+	case 6:
+		return time.Second / 1024
+	case 7:
+		return time.Second / 512
+	case 8:
+		return time.Second / 256
+	case 9:
+		return time.Second / 128
+	case 10:
+		return time.Second / 64
+	case 11:
+		return time.Second / 32
+	case 12:
+		return time.Second / 16
+	case 13:
+		return time.Second / 8
+	case 14:
+		return time.Second / 4
+	case 15:
+		return 0
+	default:
+		return time.Second
+	}
+}
+
 func (c *CMOS) handleUpdateTick() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Toggle UIP for a short window before raising update IRQ.
+	c.uipDeadline = c.now().Add(2 * time.Millisecond)
 	c.cmos[cmosRegStatusC] |= statusCIrqUpdate
+	c.scheduleAlarmLocked()
 	c.refreshIRQLineLocked()
+}
+
+func (c *CMOS) startPeriodicLocked() {
+	if c.timerMaker == nil {
+		c.timerMaker = defaultTimerFactory
+	}
+	if c.periodic != nil {
+		c.periodic.Stop()
+	}
+	// Default periodic rate ~1Hz (Status A rate select 6 = 1024Hz in HW; keep simple).
+	c.periodic = c.timerMaker(time.Second, func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.cmos[cmosRegStatusC] |= statusCIrqPeriodic
+		c.refreshIRQLineLocked()
+	})
 }
 
 func (c *CMOS) refreshIRQLineLocked() {
@@ -256,14 +512,11 @@ func (c *CMOS) refreshIRQLineLocked() {
 	}
 	c.cmos[cmosRegStatusC] = statusC
 
-	if c.irq == nil {
-		return
-	}
 	if active && !c.irqAssert {
-		c.irq.SetIRQ(c.irqLine, true)
+		c.irqLine.SetLevel(true)
 		c.irqAssert = true
 	} else if !active && c.irqAssert {
-		c.irq.SetIRQ(c.irqLine, false)
+		c.irqLine.SetLevel(false)
 		c.irqAssert = false
 	}
 }
@@ -283,6 +536,9 @@ func (c *CMOS) currentTimeFieldsLocked() rtcFields {
 	}
 
 	t := c.now().UTC()
+	if c.cmos[cmosRegStatusB]&statusBDaylightSavings != 0 {
+		t = t.Add(time.Hour)
+	}
 	yearFull := t.Year()
 	century := yearFull / 100
 	year := yearFull % 100
@@ -348,6 +604,22 @@ func (f *rtcFields) normalize(statusB byte) {
 
 func toBCD(v byte) byte {
 	return ((v / 10) << 4) | (v % 10)
+}
+
+func fromBCD(v byte) byte {
+	return (v>>4)*10 + (v & 0x0F)
+}
+
+func decode12Hour(v byte) byte {
+	pm := v&0x80 != 0
+	hour := v & 0x7F
+	if hour == 12 {
+		hour = 0
+	}
+	if pm {
+		hour += 12
+	}
+	return hour
 }
 
 var _ hv.X86IOPortDevice = (*CMOS)(nil)

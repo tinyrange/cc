@@ -2,6 +2,7 @@ package vfs
 
 import (
 	"encoding/binary"
+	"errors"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -9,10 +10,54 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/tinyrange/cc/internal/devices/virtio"
 	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 )
+
+// AbstractFile represents a file with custom read/write operations.
+// Implement this interface to provide files backed by host files, network resources, etc.
+type AbstractFile interface {
+	// Stat returns the file size and mode.
+	Stat() (size uint64, mode fs.FileMode)
+	// ModTime returns the file's modified time.
+	ModTime() time.Time
+	// ReadAt reads up to size bytes starting at offset off.
+	ReadAt(off uint64, size uint32) ([]byte, error)
+	// WriteAt writes data at offset off. Returns error if not writable.
+	WriteAt(off uint64, data []byte) error
+	// Truncate sets the file size. Returns error if not supported.
+	Truncate(size uint64) error
+}
+
+// AbstractDir represents a directory with custom listing and lookup.
+// Implement this interface to provide directories backed by host directories, etc.
+type AbstractDir interface {
+	// Stat returns the directory mode.
+	Stat() (mode fs.FileMode)
+	// ModTime returns the directory's modified time.
+	ModTime() time.Time
+	// ReadDir returns all entries in the directory.
+	ReadDir() ([]AbstractDirEntry, error)
+	// Lookup returns the entry for the given name, or nil if not found.
+	Lookup(name string) (AbstractEntry, error)
+}
+
+// AbstractDirEntry describes an entry returned by AbstractDir.ReadDir.
+type AbstractDirEntry struct {
+	Name  string
+	IsDir bool
+	Mode  fs.FileMode
+	Size  uint64
+}
+
+// AbstractEntry is returned by AbstractDir.Lookup.
+// Exactly one of File or Dir should be non-nil.
+type AbstractEntry struct {
+	File AbstractFile
+	Dir  AbstractDir
+}
 
 type virtioFsBackend struct {
 	mu      sync.Mutex
@@ -40,6 +85,11 @@ type fsNode struct {
 	extents []fsExtent
 	entries map[string]uint64
 	xattr   map[string][]byte
+	modTime time.Time
+
+	// Abstract backing - if set, delegates to these instead of in-memory storage.
+	abstractFile AbstractFile
+	abstractDir  AbstractDir
 }
 
 func newDirNode(id uint64, name string, parent uint64, perm fs.FileMode) *fsNode {
@@ -50,22 +100,36 @@ func newDirNode(id uint64, name string, parent uint64, perm fs.FileMode) *fsNode
 		mode:    fs.ModeDir | perm,
 		entries: make(map[string]uint64),
 		xattr:   make(map[string][]byte),
+		modTime: time.Now(),
 	}
 }
 
 func newFileNode(id uint64, name string, parent uint64, perm fs.FileMode) *fsNode {
 	return &fsNode{
-		id:     id,
-		name:   name,
-		parent: parent,
-		mode:   perm,
-		xattr:  make(map[string][]byte),
+		id:      id,
+		name:    name,
+		parent:  parent,
+		mode:    perm,
+		xattr:   make(map[string][]byte),
+		modTime: time.Now(),
 	}
 }
 
-func (n *fsNode) isDir() bool { return n.mode.IsDir() }
+func (n *fsNode) isDir() bool {
+	if n.abstractDir != nil {
+		return true
+	}
+	return n.mode.IsDir()
+}
 
 func (n *fsNode) blockUsage() uint64 {
+	if n.abstractFile != nil {
+		size, _ := n.abstractFile.Stat()
+		if size == 0 {
+			return 0
+		}
+		return (size + 511) / 512
+	}
 	var used uint64
 	for _, e := range n.extents {
 		used += uint64(len(e.data))
@@ -77,7 +141,30 @@ func (n *fsNode) blockUsage() uint64 {
 }
 
 func (n *fsNode) attr() virtio.FuseAttr {
-	mode := uint32(n.mode.Perm())
+	var perm fs.FileMode
+	var size uint64
+	modTime := n.modTime
+
+	if n.abstractFile != nil {
+		size, perm = n.abstractFile.Stat()
+		if mt := n.abstractFile.ModTime(); !mt.IsZero() {
+			modTime = mt
+		}
+	} else if n.abstractDir != nil {
+		perm = n.abstractDir.Stat()
+		if mt := n.abstractDir.ModTime(); !mt.IsZero() {
+			modTime = mt
+		}
+	} else {
+		perm = n.mode.Perm()
+		size = n.size
+	}
+
+	if modTime.IsZero() {
+		modTime = time.Unix(0, 0)
+	}
+
+	mode := uint32(perm)
 	if n.isDir() {
 		mode |= linux.S_IFDIR
 	} else {
@@ -86,18 +173,33 @@ func (n *fsNode) attr() virtio.FuseAttr {
 
 	nlink := uint32(1)
 	if n.isDir() {
-		nlink = 2 + uint32(len(n.entries))
+		entryCount := len(n.entries)
+		if n.abstractDir != nil {
+			if entries, err := n.abstractDir.ReadDir(); err == nil {
+				entryCount = len(entries)
+			}
+		}
+		nlink = 2 + uint32(entryCount)
 	}
 
+	sec := uint64(modTime.Unix())
+	nsec := uint32(modTime.Nanosecond())
+
 	return virtio.FuseAttr{
-		Ino:     n.id,
-		Mode:    mode,
-		Size:    n.size,
-		NLink:   nlink,
-		UID:     0,
-		GID:     0,
-		Blocks:  n.blockUsage(),
-		BlkSize: 4096,
+		Ino:       n.id,
+		Mode:      mode,
+		Size:      size,
+		NLink:     nlink,
+		UID:       0,
+		GID:       0,
+		Blocks:    n.blockUsage(),
+		BlkSize:   4096,
+		ATimeSec:  sec,
+		ATimeNsec: nsec,
+		MTimeSec:  sec,
+		MTimeNsec: nsec,
+		CTimeSec:  sec,
+		CTimeNsec: nsec,
 	}
 }
 
@@ -152,14 +254,69 @@ func (v *virtioFsBackend) child(parent *fsNode, name string) (*fsNode, int32) {
 	if e := nameErr(name); e != 0 {
 		return nil, e
 	}
+	// First check in-memory entries
 	id, ok := parent.entries[name]
-	if !ok {
-		return nil, -int32(linux.ENOENT)
+	if ok {
+		return v.nodes[id], 0
 	}
-	return v.nodes[id], 0
+	// If parent has an abstract directory, try looking up there
+	if parent.abstractDir != nil {
+		entry, err := parent.abstractDir.Lookup(name)
+		if err != nil {
+			return nil, -int32(linux.ENOENT)
+		}
+		// Create a new node backed by the abstract entry
+		return v.createAbstractNode(parent, name, entry)
+	}
+	return nil, -int32(linux.ENOENT)
 }
 
-func (n *fsNode) read(off uint64, size uint32) []byte {
+// createAbstractNode creates an fsNode backed by an AbstractEntry.
+func (v *virtioFsBackend) createAbstractNode(parent *fsNode, name string, entry AbstractEntry) (*fsNode, int32) {
+	id := v.nextID
+	v.nextID++
+
+	modTime := time.Now()
+	node := &fsNode{
+		id:     id,
+		name:   name,
+		parent: parent.id,
+		xattr:  make(map[string][]byte),
+	}
+
+	if entry.Dir != nil {
+		node.abstractDir = entry.Dir
+		node.mode = fs.ModeDir | entry.Dir.Stat()
+		node.entries = make(map[string]uint64)
+		if mt := entry.Dir.ModTime(); !mt.IsZero() {
+			modTime = mt
+		}
+	} else if entry.File != nil {
+		node.abstractFile = entry.File
+		size, mode := entry.File.Stat()
+		node.mode = mode
+		node.size = size
+		if mt := entry.File.ModTime(); !mt.IsZero() {
+			modTime = mt
+		}
+	} else {
+		return nil, -int32(linux.ENOENT)
+	}
+
+	node.modTime = modTime
+	v.nodes[id] = node
+	// Cache in parent's entries for future lookups
+	if parent.entries == nil {
+		parent.entries = make(map[string]uint64)
+	}
+	parent.entries[name] = id
+	return node, 0
+}
+
+func (n *fsNode) read(off uint64, size uint32) ([]byte, error) {
+	if n.abstractFile != nil {
+		return n.abstractFile.ReadAt(off, size)
+	}
 	buf := make([]byte, size)
 	end := off + uint64(size)
 	for _, e := range n.extents {
@@ -171,7 +328,7 @@ func (n *fsNode) read(off uint64, size uint32) []byte {
 		stop := min64(end, eEnd)
 		copy(buf[start-off:stop-off], e.data[start-e.off:stop-e.off])
 	}
-	return buf
+	return buf, nil
 }
 
 func mergeExtents(extents []fsExtent) []fsExtent {
@@ -196,20 +353,29 @@ func mergeExtents(extents []fsExtent) []fsExtent {
 	return out
 }
 
-func (n *fsNode) write(off uint64, data []byte) {
+func (n *fsNode) write(off uint64, data []byte) error {
+	if n.abstractFile != nil {
+		return n.abstractFile.WriteAt(off, data)
+	}
 	if len(data) == 0 {
-		return
+		return nil
 	}
 	n.extents = mergeExtents(append(n.extents, fsExtent{off: off, data: append([]byte(nil), data...)}))
 	if off+uint64(len(data)) > n.size {
 		n.size = off + uint64(len(data))
 	}
+	n.modTime = time.Now()
+	return nil
 }
 
-func (n *fsNode) truncate(size uint64) {
+func (n *fsNode) truncate(size uint64) error {
+	if n.abstractFile != nil {
+		return n.abstractFile.Truncate(size)
+	}
 	if size >= n.size {
 		n.size = size
-		return
+		n.modTime = time.Now()
+		return nil
 	}
 	var kept []fsExtent
 	for _, e := range n.extents {
@@ -223,6 +389,8 @@ func (n *fsNode) truncate(size uint64) {
 	}
 	n.extents = kept
 	n.size = size
+	n.modTime = time.Now()
+	return nil
 }
 
 func errno(code int32) int32 { return -code }
@@ -299,7 +467,9 @@ func (v *virtioFsBackend) Open(nodeID uint64, flags uint32) (fh uint64, errno in
 		return 0, -int32(linux.EISDIR)
 	}
 	if flags&uint32(os.O_TRUNC) != 0 {
-		n.truncate(0)
+		if err := n.truncate(0); err != nil {
+			return 0, -int32(linux.EIO)
+		}
 	}
 	fh = v.nextFH
 	v.nextFH++
@@ -320,13 +490,22 @@ func (v *virtioFsBackend) Read(nodeID uint64, fh uint64, off uint64, size uint32
 	if err != 0 {
 		return nil, err
 	}
-	if off >= n.size {
+	// Get actual size (from abstract file or in-memory)
+	nodeSize := n.size
+	if n.abstractFile != nil {
+		nodeSize, _ = n.abstractFile.Stat()
+	}
+	if off >= nodeSize {
 		return []byte{}, 0
 	}
-	if off+uint64(size) > n.size {
-		size = uint32(n.size - off)
+	if off+uint64(size) > nodeSize {
+		size = uint32(nodeSize - off)
 	}
-	return n.read(off, size), 0
+	data, readErr := n.read(off, size)
+	if readErr != nil {
+		return nil, -int32(linux.EIO)
+	}
+	return data, 0
 }
 
 // ReadDir implements virtio.FsBackend.
@@ -342,14 +521,30 @@ func (v *virtioFsBackend) ReadDir(nodeID uint64, off uint64, maxBytes uint32) ([
 	if !dirNode.isDir() {
 		return nil, -int32(linux.ENOTDIR)
 	}
-	names := make([]string, 0, len(dirNode.entries)+2)
+
+	// Collect all entry names, avoiding duplicates
+	nameSet := make(map[string]bool)
+	for name := range dirNode.entries {
+		nameSet[name] = true
+	}
+	// Also include entries from abstract directory if present
+	if dirNode.abstractDir != nil {
+		if abstractEntries, err := dirNode.abstractDir.ReadDir(); err == nil {
+			for _, entry := range abstractEntries {
+				nameSet[entry.Name] = true
+			}
+		}
+	}
+
+	names := make([]string, 0, len(nameSet)+2)
 	if off == 0 {
 		names = append(names, ".", "..")
 	}
-	for name := range dirNode.entries {
+	for name := range nameSet {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+
 	var buf []byte
 	for idx, name := range names {
 		if uint64(idx) < off {
@@ -364,10 +559,26 @@ func (v *virtioFsBackend) ReadDir(nodeID uint64, off uint64, maxBytes uint32) ([
 				id = dirNode.parent
 			}
 		} else {
-			id = dirNode.entries[name]
-			child, _ := v.node(id)
-			if child != nil && !child.isDir() {
-				typ = linux.DT_REG
+			// Try to get from cached entries first
+			if cachedID, ok := dirNode.entries[name]; ok {
+				id = cachedID
+				child, _ := v.node(id)
+				if child != nil && !child.isDir() {
+					typ = linux.DT_REG
+				}
+			} else if dirNode.abstractDir != nil {
+				// Look up in abstract directory
+				if entry, lookupErr := dirNode.abstractDir.Lookup(name); lookupErr == nil {
+					// Determine type from abstract entry
+					if entry.File != nil {
+						typ = linux.DT_REG
+					}
+					// Create node to get an ID
+					node, _ := v.createAbstractNode(dirNode, name, entry)
+					if node != nil {
+						id = node.id
+					}
+				}
 			}
 		}
 		dirent := buildFuseDirent(id, name, uint32(typ), uint64(len(buf))+1)
@@ -430,7 +641,9 @@ func (v *virtioFsBackend) Create(parent uint64, name string, mode uint32, flags 
 	if existingID, ok := parentNode.entries[clean]; ok {
 		existing := v.nodes[existingID]
 		if flags&uint32(os.O_TRUNC) != 0 {
-			existing.truncate(0)
+			if err := existing.truncate(0); err != nil {
+				return 0, 0, virtio.FuseAttr{}, -int32(linux.EIO)
+			}
 		}
 		fh = v.nextFH
 		v.nextFH++
@@ -443,6 +656,9 @@ func (v *virtioFsBackend) Create(parent uint64, name string, mode uint32, flags 
 	perm := fs.FileMode(mode&^umask) & 0777
 	node := newFileNode(id, clean, parentNode.id, perm)
 	parentNode.entries[clean] = id
+	if parentNode.abstractDir == nil {
+		parentNode.modTime = time.Now()
+	}
 	v.nodes[id] = node
 
 	fh = v.nextFH
@@ -478,6 +694,9 @@ func (v *virtioFsBackend) Mkdir(parent uint64, name string, mode uint32, umask u
 	perm := fs.FileMode(mode&^umask) & 0777
 	node := newDirNode(id, clean, parentNode.id, perm)
 	parentNode.entries[clean] = id
+	if parentNode.abstractDir == nil {
+		parentNode.modTime = time.Now()
+	}
 	v.nodes[id] = node
 	return id, node.attr(), 0
 }
@@ -509,6 +728,9 @@ func (v *virtioFsBackend) Mknod(parent uint64, name string, mode uint32, _ uint3
 	perm := fs.FileMode(mode & 0777)
 	node := newFileNode(id, clean, parentNode.id, perm)
 	parentNode.entries[clean] = id
+	if parentNode.abstractDir == nil {
+		parentNode.modTime = time.Now()
+	}
 	v.nodes[id] = node
 	return id, node.attr(), 0
 }
@@ -528,7 +750,9 @@ func (v *virtioFsBackend) Write(nodeID uint64, fh uint64, off uint64, data []byt
 	if n.isDir() {
 		return 0, -int32(linux.EISDIR)
 	}
-	n.write(off, data)
+	if writeErr := n.write(off, data); writeErr != nil {
+		return 0, -int32(linux.EIO)
+	}
 	return uint32(len(data)), 0
 }
 
@@ -666,6 +890,16 @@ func (v *virtioFsBackend) Rename(oldParent uint64, oldName string, newParent uin
 	node := v.nodes[srcID]
 	node.parent = dstParent.id
 	node.name = dstName
+	now := time.Now()
+	if srcParent.abstractDir == nil {
+		srcParent.modTime = now
+	}
+	if dstParent.abstractDir == nil {
+		dstParent.modTime = now
+	}
+	if node.abstractFile == nil && node.abstractDir == nil {
+		node.modTime = now
+	}
 	return 0
 }
 
@@ -694,6 +928,9 @@ func (v *virtioFsBackend) Unlink(parent uint64, name string) int32 {
 		return -int32(linux.EISDIR)
 	}
 	delete(parentNode.entries, clean)
+	if parentNode.abstractDir == nil {
+		parentNode.modTime = time.Now()
+	}
 	delete(v.nodes, id)
 	return 0
 }
@@ -726,15 +963,18 @@ func (v *virtioFsBackend) Rmdir(parent uint64, name string) int32 {
 		return -errNotEmpty
 	}
 	delete(parentNode.entries, clean)
+	if parentNode.abstractDir == nil {
+		parentNode.modTime = time.Now()
+	}
 	delete(v.nodes, id)
 	return 0
 }
 
-func (v *virtioFsBackend) SetAttr(nodeID uint64, size *uint64) int32 {
+func (v *virtioFsBackend) SetAttr(nodeID uint64, size *uint64, mode *uint32) int32 {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	if size == nil {
+	if size == nil && mode == nil {
 		return 0
 	}
 	v.ensureRoot()
@@ -742,7 +982,18 @@ func (v *virtioFsBackend) SetAttr(nodeID uint64, size *uint64) int32 {
 	if err != 0 {
 		return err
 	}
-	n.truncate(*size)
+	if size != nil {
+		if truncErr := n.truncate(*size); truncErr != nil {
+			return -int32(linux.EIO)
+		}
+	}
+	if mode != nil {
+		// Preserve file type bits (directory, symlink, etc.) and only update permission bits
+		oldType := n.mode &^ 0777
+		newPerm := fs.FileMode(*mode) & 0777
+		n.mode = oldType | newPerm
+		n.modTime = time.Now()
+	}
 	return 0
 }
 
@@ -763,5 +1014,182 @@ func buildFuseDirent(ino uint64, name string, typ uint32, nextOffset uint64) []b
 }
 
 func NewVirtioFsBackend() virtio.FsBackend {
+	return &virtioFsBackend{}
+}
+
+// VirtioFsBackend provides additional methods beyond the FsBackend interface.
+type VirtioFsBackend interface {
+	virtio.FsBackend
+	AddAbstractFile(filePath string, file AbstractFile) error
+	AddAbstractDir(dirPath string, dir AbstractDir) error
+	SetAbstractRoot(dir AbstractDir) error
+}
+
+// AddAbstractFile adds an abstract file at the specified path.
+// Parent directories are created as needed.
+func (v *virtioFsBackend) AddAbstractFile(filePath string, file AbstractFile) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	v.ensureRoot()
+
+	filePath = cleanName(filePath)
+	if filePath == "" {
+		return errors.New("invalid file path")
+	}
+
+	parent, name, err := v.resolveParent(filePath)
+	if err != nil {
+		return err
+	}
+
+	if _, exists := parent.entries[name]; exists {
+		return errors.New("file already exists")
+	}
+
+	id := v.nextID
+	v.nextID++
+
+	size, mode := file.Stat()
+	modTime := file.ModTime()
+	if modTime.IsZero() {
+		modTime = time.Now()
+	}
+	node := &fsNode{
+		id:           id,
+		name:         name,
+		parent:       parent.id,
+		mode:         mode,
+		size:         size,
+		xattr:        make(map[string][]byte),
+		abstractFile: file,
+		modTime:      modTime,
+	}
+
+	parent.entries[name] = id
+	if parent.abstractDir == nil {
+		parent.modTime = time.Now()
+	}
+	v.nodes[id] = node
+	return nil
+}
+
+// AddAbstractDir adds an abstract directory at the specified path.
+// Parent directories are created as needed.
+func (v *virtioFsBackend) AddAbstractDir(dirPath string, dir AbstractDir) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	v.ensureRoot()
+
+	dirPath = cleanName(dirPath)
+	if dirPath == "" {
+		return errors.New("invalid directory path")
+	}
+
+	parent, name, err := v.resolveParent(dirPath)
+	if err != nil {
+		return err
+	}
+
+	if _, exists := parent.entries[name]; exists {
+		return errors.New("directory already exists")
+	}
+
+	id := v.nextID
+	v.nextID++
+
+	mode := dir.Stat()
+	modTime := dir.ModTime()
+	if modTime.IsZero() {
+		modTime = time.Now()
+	}
+	node := &fsNode{
+		id:          id,
+		name:        name,
+		parent:      parent.id,
+		mode:        fs.ModeDir | mode,
+		xattr:       make(map[string][]byte),
+		entries:     make(map[string]uint64),
+		abstractDir: dir,
+		modTime:     modTime,
+	}
+
+	parent.entries[name] = id
+	if parent.abstractDir == nil {
+		parent.modTime = time.Now()
+	}
+	v.nodes[id] = node
+	return nil
+}
+
+// SetAbstractRoot sets the root directory to be an abstract directory.
+// This replaces the root node with one backed by the provided AbstractDir.
+func (v *virtioFsBackend) SetAbstractRoot(dir AbstractDir) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	v.ensureRoot()
+
+	// Update the root node to be backed by the abstract directory
+	root := v.nodes[virtioFsRootNodeID]
+	root.abstractDir = dir
+	root.mode = fs.ModeDir | dir.Stat()
+	if mt := dir.ModTime(); !mt.IsZero() {
+		root.modTime = mt
+	} else {
+		root.modTime = time.Now()
+	}
+
+	return nil
+}
+
+// resolveParent walks the path and returns the parent directory and the final name.
+// Creates intermediate directories as needed.
+func (v *virtioFsBackend) resolveParent(filePath string) (*fsNode, string, error) {
+	parts := strings.Split(filePath, "/")
+	if len(parts) == 0 {
+		return nil, "", errors.New("empty path")
+	}
+
+	parent := v.nodes[virtioFsRootNodeID]
+	for i := 0; i < len(parts)-1; i++ {
+		partName := parts[i]
+		if partName == "" {
+			continue
+		}
+
+		if parent.entries == nil {
+			parent.entries = make(map[string]uint64)
+		}
+
+		childID, exists := parent.entries[partName]
+		if exists {
+			child := v.nodes[childID]
+			if !child.isDir() {
+				return nil, "", errors.New("path component is not a directory: " + partName)
+			}
+			parent = child
+		} else {
+			// Create intermediate directory
+			id := v.nextID
+			v.nextID++
+			child := newDirNode(id, partName, parent.id, 0o755)
+			parent.entries[partName] = id
+			v.nodes[id] = child
+			parent = child
+		}
+	}
+
+	name := parts[len(parts)-1]
+	if name == "" {
+		return nil, "", errors.New("empty file name")
+	}
+
+	return parent, name, nil
+}
+
+// NewVirtioFsBackendWithAbstract returns a VirtioFsBackend that supports adding abstract files/dirs.
+func NewVirtioFsBackendWithAbstract() VirtioFsBackend {
 	return &virtioFsBackend{}
 }

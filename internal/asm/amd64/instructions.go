@@ -94,6 +94,46 @@ func MovStoreImm8(mem Memory, value byte) asm.Fragment {
 	})
 }
 
+func MovStoreImm32(mem Memory, value uint32) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		bytes, err := encodeMovMemImm32(mem, value)
+		if err != nil {
+			return err
+		}
+		ctx.EmitBytes(bytes)
+		return nil
+	})
+}
+
+func PushReg(reg Reg) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		bytes, err := encodePushReg(reg)
+		if err != nil {
+			return err
+		}
+		ctx.EmitBytes(bytes)
+		return nil
+	})
+}
+
+func PopReg(reg Reg) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		bytes, err := encodePopReg(reg)
+		if err != nil {
+			return err
+		}
+		ctx.EmitBytes(bytes)
+		return nil
+	})
+}
+
+func IRet() asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		ctx.EmitBytes(encodeIret())
+		return nil
+	})
+}
+
 func AddRegImm(reg Reg, value int32) asm.Fragment {
 	return fragmentFunc(func(ctx asm.Context) error {
 		bytes, err := encodeAddRegImm(reg, value)
@@ -261,6 +301,64 @@ func ShlRegImm(reg Reg, count uint8) asm.Fragment {
 func Wrmsr() asm.Fragment {
 	return fragmentFunc(func(ctx asm.Context) error {
 		ctx.EmitBytes(encodeWrmsr())
+		return nil
+	})
+}
+
+func Cli() asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		ctx.EmitBytes(encodeCli())
+		return nil
+	})
+}
+
+func Sti() asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		ctx.EmitBytes(encodeSti())
+		return nil
+	})
+}
+
+func Lidt(mem Memory) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		bytes, err := encodeLgdtLidt(mem, 2)
+		if err != nil {
+			return err
+		}
+		ctx.EmitBytes(bytes)
+		return nil
+	})
+}
+
+func Lgdt(mem Memory) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		bytes, err := encodeLgdtLidt(mem, 0)
+		if err != nil {
+			return err
+		}
+		ctx.EmitBytes(bytes)
+		return nil
+	})
+}
+
+func MovToCR(ctrl ControlReg, src Reg) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		bytes, err := encodeMovToCR(ctrl, src)
+		if err != nil {
+			return err
+		}
+		ctx.EmitBytes(bytes)
+		return nil
+	})
+}
+
+func MovFromCR(dst Reg, ctrl ControlReg) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		bytes, err := encodeMovFromCR(dst, ctrl)
+		if err != nil {
+			return err
+		}
+		ctx.EmitBytes(bytes)
 		return nil
 	})
 }

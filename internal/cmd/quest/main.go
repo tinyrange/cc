@@ -19,6 +19,7 @@ import (
 	"github.com/tinyrange/cc/internal/asm/amd64"
 	"github.com/tinyrange/cc/internal/asm/arm64"
 	riscvasm "github.com/tinyrange/cc/internal/asm/riscv"
+	"github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	amd64serial "github.com/tinyrange/cc/internal/devices/amd64/serial"
 	"github.com/tinyrange/cc/internal/devices/virtio"
 	"github.com/tinyrange/cc/internal/hv"
@@ -43,6 +44,17 @@ const (
 	arm64UARTMMIOBase     = 0x09000000
 	arm64SnapshotMMIOAddr = 0xf0000000
 	riscvMemoryBase       = 0x80000000
+
+	irqGuestBase       = 0x200000
+	irqGuestIDTBase    = irqGuestBase + 0x3000
+	irqGuestIDTRBase   = irqGuestBase + 0x3100
+	irqGuestCounter    = irqGuestBase + 0x3200
+	irqGuestCommand    = irqGuestBase + 0x3210
+	irqGuestGDTBase    = irqGuestBase + 0x3300
+	irqGuestGDTDesc    = irqGuestBase + 0x3320
+	irqGuestStackTop   = irqGuestBase + 0x4000
+	irqGuestLapicBase  = 0xFEE00000
+	irqGuestIoapicBase = 0xFEC00000
 )
 
 const (
@@ -52,6 +64,152 @@ const (
 )
 
 var arm64VectorTableBytes = mustBuildArm64VectorTable()
+
+type irqGuestConfig struct {
+	vector       uint8
+	line         uint8
+	dest         uint8
+	destMode     uint8
+	deliveryMode uint8
+	level        bool
+	masked       bool
+}
+
+const (
+	irqCmdNone   = 0
+	irqCmdUnmask = 1
+)
+
+func buildIDTEntry(dest []byte, handler uint64, selector uint16) {
+	if len(dest) < 16 {
+		panic("idt entry buffer too small")
+	}
+	// 64-bit interrupt gate layout.
+	offsetLow := uint16(handler & 0xffff)
+	offsetMid := uint16((handler >> 16) & 0xffff)
+	offsetHigh := uint32((handler >> 32) & 0xffffffff)
+
+	binary.LittleEndian.PutUint16(dest[0:], offsetLow)
+	binary.LittleEndian.PutUint16(dest[2:], selector)
+	dest[4] = 0 // IST
+	dest[5] = 0x8e
+	binary.LittleEndian.PutUint16(dest[6:], offsetMid)
+	binary.LittleEndian.PutUint32(dest[8:], offsetHigh)
+	// bytes 12..15 reserved (zero)
+}
+
+func buildIRQGuest(cfg irqGuestConfig) (asm.Program, int, error) {
+	// IOAPIC selector indices for the chosen line.
+	selectorLow := 0x10 + cfg.line*2
+	selectorHigh := selectorLow + 1
+
+	// IOAPIC redirection low dword.
+	var redirLow uint32
+	redirLow |= uint32(cfg.vector)
+	redirLow |= uint32(cfg.deliveryMode&0x7) << 8
+	if cfg.destMode == 1 {
+		redirLow |= 1 << 11
+	}
+	redirLow |= 1 << 12 // polarity high
+	if cfg.level {
+		redirLow |= 1 << 15
+	}
+	if cfg.masked {
+		redirLow |= 1 << 16
+	}
+	redirHigh := uint32(cfg.dest) << 24
+
+	haltLabel := asm.Label("irq_halt")
+
+	mainProg, err := amd64.EmitProgram(asm.Group{
+		amd64.Cli(),
+		// Load GDT written by host.
+		amd64.MovImmediate(amd64.Reg64(amd64.RAX), int64(irqGuestGDTDesc)),
+		amd64.Lgdt(amd64.Mem(amd64.Reg64(amd64.RAX))),
+
+		// Load IDTR descriptor written by host.
+		amd64.MovImmediate(amd64.Reg64(amd64.RAX), int64(irqGuestIDTRBase)),
+		amd64.Lidt(amd64.Mem(amd64.Reg64(amd64.RAX))),
+
+		// Enable xAPIC via IA32_APIC_BASE MSR (0x1b).
+		amd64.MovImmediate(amd64.Reg32(amd64.RCX), 0x1b),
+		amd64.MovImmediate(amd64.Reg32(amd64.RAX), 0xfee00000|(1<<11)),
+		amd64.MovImmediate(amd64.Reg32(amd64.RDX), 0),
+		amd64.Wrmsr(),
+
+		// Enable LAPIC (SVR = 0x1FF)
+		amd64.MovImmediate(amd64.Reg64(amd64.RAX), int64(irqGuestLapicBase+0xF0)),
+		amd64.MovImmediate(amd64.Reg32(amd64.RBX), 0x1ff),
+		amd64.MovToMemory(amd64.Mem(amd64.Reg64(amd64.RAX)), amd64.Reg32(amd64.RBX)),
+
+		// Program IOAPIC redirection entry.
+		amd64.MovImmediate(amd64.Reg64(amd64.RAX), int64(irqGuestIoapicBase)),
+		amd64.MovStoreImm8(amd64.Mem(amd64.Reg64(amd64.RAX)).WithDisp(0x0), selectorLow),
+		amd64.MovImmediate(amd64.Reg32(amd64.RBX), int64(redirLow)),
+		amd64.MovToMemory(amd64.Mem(amd64.Reg64(amd64.RAX)).WithDisp(0x10), amd64.Reg32(amd64.RBX)),
+		amd64.MovStoreImm8(amd64.Mem(amd64.Reg64(amd64.RAX)).WithDisp(0x0), selectorHigh),
+		amd64.MovImmediate(amd64.Reg32(amd64.RBX), int64(redirHigh)),
+		amd64.MovToMemory(amd64.Mem(amd64.Reg64(amd64.RAX)).WithDisp(0x10), amd64.Reg32(amd64.RBX)),
+
+		amd64.Sti(),
+
+		asm.MarkLabel(haltLabel),
+		// Check command mailbox for unmask request.
+		amd64.MovImmediate(amd64.Reg64(amd64.RAX), int64(irqGuestCommand)),
+		amd64.MovFromMemory(amd64.Reg32(amd64.RBX), amd64.Mem(amd64.Reg64(amd64.RAX))),
+		amd64.TestZero(amd64.RBX),
+		amd64.JumpIfZero(asm.Label("halt_path")),
+		// Unmask IOAPIC if requested.
+		amd64.MovStoreImm32(amd64.Mem(amd64.Reg64(amd64.RAX)), 0),
+		amd64.MovImmediate(amd64.Reg64(amd64.RAX), int64(irqGuestIoapicBase)),
+		amd64.MovStoreImm8(amd64.Mem(amd64.Reg64(amd64.RAX)).WithDisp(0x0), selectorLow),
+		amd64.MovImmediate(amd64.Reg32(amd64.RBX), int64(redirLow&^(1<<16))),
+		amd64.MovToMemory(amd64.Mem(amd64.Reg64(amd64.RAX)).WithDisp(0x10), amd64.Reg32(amd64.RBX)),
+		asm.MarkLabel(asm.Label("halt_path")),
+		amd64.Hlt(),
+		amd64.Jump(haltLabel),
+	})
+	if err != nil {
+		return asm.Program{}, 0, err
+	}
+
+	handlerProg, err := amd64.EmitProgram(asm.Group{
+		amd64.PushReg(amd64.Reg64(amd64.RAX)),
+		amd64.PushReg(amd64.Reg64(amd64.RBX)),
+		amd64.PushReg(amd64.Reg64(amd64.RCX)),
+		amd64.PushReg(amd64.Reg64(amd64.RDX)),
+
+		// Determine APIC ID -> counter slot
+		amd64.MovImmediate(amd64.Reg64(amd64.RDX), int64(irqGuestLapicBase)),
+		amd64.MovFromMemory(amd64.Reg32(amd64.RAX), amd64.Mem(amd64.Reg64(amd64.RDX)).WithDisp(0x20)),
+		amd64.ShrRegImm(amd64.Reg32(amd64.RAX), 24),
+		amd64.MovReg(amd64.Reg64(amd64.RBX), amd64.Reg64(amd64.RAX)),
+		amd64.ShlRegImm(amd64.Reg64(amd64.RBX), 3), // *8
+		amd64.MovImmediate(amd64.Reg64(amd64.RCX), int64(irqGuestCounter)),
+		amd64.AddRegReg(amd64.Reg64(amd64.RCX), amd64.Reg64(amd64.RBX)),
+
+		amd64.MovFromMemory(amd64.Reg64(amd64.RAX), amd64.Mem(amd64.Reg64(amd64.RCX))),
+		amd64.AddRegImm(amd64.Reg64(amd64.RAX), 1),
+		amd64.MovToMemory(amd64.Mem(amd64.Reg64(amd64.RCX)), amd64.Reg64(amd64.RAX)),
+
+		// EOI
+		amd64.MovImmediate(amd64.Reg64(amd64.RDX), int64(irqGuestLapicBase+0xB0)),
+		amd64.MovStoreImm32(amd64.Mem(amd64.Reg64(amd64.RDX)), 0),
+
+		amd64.PopReg(amd64.Reg64(amd64.RDX)),
+		amd64.PopReg(amd64.Reg64(amd64.RCX)),
+		amd64.PopReg(amd64.Reg64(amd64.RBX)),
+		amd64.PopReg(amd64.Reg64(amd64.RAX)),
+		amd64.IRet(),
+	})
+	if err != nil {
+		return asm.Program{}, 0, err
+	}
+
+	handlerOffset := len(mainProg.Bytes())
+	combined := append(mainProg.Bytes(), handlerProg.Bytes()...)
+	return asm.NewProgram(combined, nil, 0), handlerOffset, nil
+}
 
 type bringUpQuest struct {
 	dev          hv.Hypervisor
@@ -96,6 +254,73 @@ func runWithTiming(name string, fn func() error) error {
 	}
 	slog.Info("Step completed", "step", name, "duration", duration)
 	return nil
+}
+
+type ioapicAssert struct {
+	vector       uint8
+	dest         uint8
+	destMode     uint8
+	deliveryMode uint8
+	level        bool
+}
+
+type ioapicHarness struct {
+	ioapic   *chipset.IOAPIC
+	captures []ioapicAssert
+}
+
+func newIoapicHarness(entries int) *ioapicHarness {
+	h := &ioapicHarness{
+		ioapic: chipset.NewIOAPIC(entries),
+	}
+	h.ioapic.SetRouting(chipset.IoApicRoutingFunc(func(vector uint8, dest uint8, destMode uint8, deliveryMode uint8, level bool) {
+		h.captures = append(h.captures, ioapicAssert{
+			vector:       vector,
+			dest:         dest,
+			destMode:     destMode,
+			deliveryMode: deliveryMode,
+			level:        level,
+		})
+	}))
+	return h
+}
+
+func (h *ioapicHarness) writeRegister(index uint8, value uint32) error {
+	// IOAPIC MMIO window offsets: 0x0 = select, 0x10 = data.
+	if err := h.ioapic.WriteMMIO(chipset.IOAPICBaseAddress+0x00, []byte{index}); err != nil {
+		return fmt.Errorf("write select: %w", err)
+	}
+	buf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(buf, value)
+	if err := h.ioapic.WriteMMIO(chipset.IOAPICBaseAddress+0x10, buf); err != nil {
+		return fmt.Errorf("write data: %w", err)
+	}
+	return nil
+}
+
+func (h *ioapicHarness) programEntry(line uint8, vector uint8, dest uint8, logical bool, delivery uint8, level bool, masked bool) error {
+	lowIndex := uint8(0x10 + line*2)
+	highIndex := lowIndex + 1
+
+	var low uint32
+	low |= uint32(vector)
+	low |= uint32(delivery) << 8
+	if logical {
+		low |= 1 << 11
+	}
+	if level {
+		low |= 1 << 15
+	}
+	if masked {
+		low |= 1 << 16
+	}
+
+	high := uint32(dest) << 24 // Destination field is bits 56-63.
+
+	if err := h.writeRegister(lowIndex, low); err != nil {
+		return err
+	}
+	return h.writeRegister(highIndex, high)
 }
 
 func linuxMemoryBaseForArch(arch hv.CpuArchitecture) uint64 {
@@ -441,6 +666,310 @@ func (q *bringUpQuest) Run() error {
 		}); err != nil {
 			return err
 		}
+
+		if q.dev.Architecture() == hv.ArchitectureX86_64 {
+			// runIRQ := func(name string, cfg irqGuestConfig, scenario func(vm hv.VirtualMachine, inject func(uint8, uint8, uint8, uint8) error, runOnce func() error, readCounter func(int) (uint64, error), readTotal func(int) (uint64, error), setCommand func(uint32) error) error) error {
+			// 	return q.runTask(name, func() error {
+			// 		vm, err := q.dev.NewVirtualMachine(hv.SimpleVMConfig{
+			// 			NumCPUs:          1,
+			// 			MemSize:          32 << 20,
+			// 			MemBase:          0,
+			// 			InterruptSupport: true,
+			// 		})
+			// 		if err != nil {
+			// 			return fmt.Errorf("create vm: %w", err)
+			// 		}
+			// 		defer vm.Close()
+
+			// 		prog, handlerOff, err := buildIRQGuest(cfg)
+			// 		if err != nil {
+			// 			return fmt.Errorf("build guest: %w", err)
+			// 		}
+			// 		if _, err := vm.WriteAt(prog.Bytes(), int64(irqGuestBase)); err != nil {
+			// 			return fmt.Errorf("write program: %w", err)
+			// 		}
+
+			// 		idtEntry := make([]byte, 16)
+			// 		buildIDTEntry(idtEntry, irqGuestBase+uint64(handlerOff), 0x08)
+			// 		if _, err := vm.WriteAt(idtEntry, int64(irqGuestIDTBase)); err != nil {
+			// 			return fmt.Errorf("write idt entry: %w", err)
+			// 		}
+			// 		slog.Info("irq guest idt", "handler", fmt.Sprintf("%#x", irqGuestBase+uint64(handlerOff)))
+			// 		idtr := make([]byte, 10)
+			// 		binary.LittleEndian.PutUint16(idtr[0:], uint16(16-1))
+			// 		binary.LittleEndian.PutUint64(idtr[2:], irqGuestIDTBase)
+			// 		if _, err := vm.WriteAt(idtr, int64(irqGuestIDTRBase)); err != nil {
+			// 			return fmt.Errorf("write idtr: %w", err)
+			// 		}
+
+			// 		zero := make([]byte, 0x40)
+			// 		if _, err := vm.WriteAt(zero, int64(irqGuestCounter)); err != nil {
+			// 			return fmt.Errorf("zero counters: %w", err)
+			// 		}
+			// 		if _, err := vm.WriteAt(zero[:4], int64(irqGuestCommand)); err != nil {
+			// 			return fmt.Errorf("zero command: %w", err)
+			// 		}
+
+			// 		// Build minimal GDT: null, 64-bit code, data.
+			// 		gdt := make([]byte, 24)
+			// 		binary.LittleEndian.PutUint64(gdt[8:], 0x00AF9B000000FFFF)  // code
+			// 		binary.LittleEndian.PutUint64(gdt[16:], 0x00AF93000000FFFF) // data
+			// 		if _, err := vm.WriteAt(gdt, int64(irqGuestGDTBase)); err != nil {
+			// 			return fmt.Errorf("write gdt: %w", err)
+			// 		}
+			// 		gdtr := make([]byte, 10)
+			// 		binary.LittleEndian.PutUint16(gdtr[0:], uint16(len(gdt)-1))
+			// 		binary.LittleEndian.PutUint64(gdtr[2:], irqGuestGDTBase)
+			// 		if _, err := vm.WriteAt(gdtr, int64(irqGuestGDTDesc)); err != nil {
+			// 			return fmt.Errorf("write gdtr: %w", err)
+			// 		}
+
+			// 		if err := vm.VirtualCPUCall(0, func(vcpu hv.VirtualCPU) error {
+			// 			if err := vcpu.(hv.VirtualCPUAmd64).SetLongModeWithSelectors(
+			// 				0x20000, // paging base
+			// 				4,       // 4 GiB
+			// 				0x08,    // code selector
+			// 				0x10,    // data selector
+			// 			); err != nil {
+			// 				return fmt.Errorf("set long mode: %w", err)
+			// 			}
+			// 			regs := map[hv.Register]hv.RegisterValue{
+			// 				hv.RegisterAMD64Rip:    hv.Register64(irqGuestBase),
+			// 				hv.RegisterAMD64Rsp:    hv.Register64(irqGuestStackTop),
+			// 				hv.RegisterAMD64Rflags: hv.Register64(0x202), // IF=1
+			// 			}
+			// 			if err := vcpu.SetRegisters(regs); err != nil {
+			// 				return fmt.Errorf("set regs: %w", err)
+			// 			}
+			// 			return nil
+			// 		}); err != nil {
+			// 			return err
+			// 		}
+
+			// 		runOnce := func() error {
+			// 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			// 			defer cancel()
+			// 			return vm.VirtualCPUCall(0, func(vcpu hv.VirtualCPU) error {
+			// 				if err := vcpu.Run(ctx); err != nil {
+			// 					if errors.Is(err, hv.ErrVMHalted) || errors.Is(err, hv.ErrGuestRequestedReboot) {
+			// 						return nil
+			// 					}
+			// 					return err
+			// 				}
+			// 				return nil
+			// 			})
+			// 		}
+
+			// 		if err := runOnce(); err != nil {
+			// 			return fmt.Errorf("initial run: %w", err)
+			// 		}
+
+			// 		injector, ok := vm.(interface {
+			// 			InjectInterrupt(uint8, uint8, uint8, uint8) error
+			// 		})
+			// 		if !ok {
+			// 			return fmt.Errorf("hypervisor does not expose InjectInterrupt")
+			// 		}
+
+			// 		readCounter := func(idx int) (uint64, error) {
+			// 			buf := make([]byte, 8)
+			// 			_, err := vm.ReadAt(buf, int64(irqGuestCounter+uint64(idx*8)))
+			// 			if err != nil {
+			// 				return 0, err
+			// 			}
+			// 			return binary.LittleEndian.Uint64(buf), nil
+			// 		}
+
+			// 		setCommand := func(val uint32) error {
+			// 			buf := make([]byte, 4)
+			// 			binary.LittleEndian.PutUint32(buf, val)
+			// 			_, err := vm.WriteAt(buf, int64(irqGuestCommand))
+			// 			return err
+			// 		}
+
+			// 		readTotal := func(count int) (uint64, error) {
+			// 			var sum uint64
+			// 			for i := 0; i < count; i++ {
+			// 				v, err := readCounter(i)
+			// 				if err != nil {
+			// 					return 0, err
+			// 				}
+			// 				sum += v
+			// 			}
+			// 			return sum, nil
+			// 		}
+
+			// 		return scenario(vm, injector.InjectInterrupt, runOnce, readCounter, readTotal, setCommand)
+			// 	})
+			// }
+
+			// if err := runIRQ("IRQ e2e edge delivery", irqGuestConfig{
+			// 	vector:       0x45,
+			// 	line:         3,
+			// 	dest:         0,
+			// 	destMode:     0,
+			// 	deliveryMode: 0,
+			// 	level:        false,
+			// 	masked:       false,
+			// }, func(vm hv.VirtualMachine, inject func(uint8, uint8, uint8, uint8) error, runOnce func() error, readCounter func(int) (uint64, error), readTotal func(int) (uint64, error), setCommand func(uint32) error) error {
+			// 	if err := inject(0x45, 0, 0, 0); err != nil {
+			// 		return err
+			// 	}
+			// 	var count uint64
+			// 	for i := 0; i < 10; i++ {
+			// 		if err := runOnce(); err != nil {
+			// 			return err
+			// 		}
+			// 		val, err := readTotal(16)
+			// 		if err != nil {
+			// 			return err
+			// 		}
+			// 		count = val
+			// 		if count > 0 {
+			// 			break
+			// 		}
+			// 	}
+			// 	if count != 1 {
+			// 		if err := inject(0x45, 0, 0, 0); err != nil {
+			// 			return err
+			// 		}
+			// 		for i := 0; i < 5; i++ {
+			// 			if err := runOnce(); err != nil {
+			// 				return err
+			// 			}
+			// 			val, err := readTotal(16)
+			// 			if err != nil {
+			// 				return err
+			// 			}
+			// 			count = val
+			// 			if count > 0 {
+			// 				break
+			// 			}
+			// 		}
+			// 		if count != 1 {
+			// 			return fmt.Errorf("edge: counter=%d want 1", count)
+			// 		}
+			// 	}
+			// 	return nil
+			// }); err != nil {
+			// 	return err
+			// }
+
+			// if err := runIRQ("IRQ e2e level + EOI gating", irqGuestConfig{
+			// 	vector:       0x52,
+			// 	line:         4,
+			// 	dest:         0,
+			// 	destMode:     0,
+			// 	deliveryMode: 0,
+			// 	level:        true,
+			// 	masked:       false,
+			// }, func(vm hv.VirtualMachine, inject func(uint8, uint8, uint8, uint8) error, runOnce func() error, readCounter func(int) (uint64, error), readTotal func(int) (uint64, error), setCommand func(uint32) error) error {
+			// 	if err := inject(0x52, 0, 0, 0); err != nil {
+			// 		return err
+			// 	}
+			// 	if err := inject(0x52, 0, 0, 0); err != nil {
+			// 		return err
+			// 	}
+			// 	var count uint64
+			// 	for i := 0; i < 10; i++ {
+			// 		if err := runOnce(); err != nil {
+			// 			return err
+			// 		}
+			// 		val, err := readTotal(16)
+			// 		if err != nil {
+			// 			return err
+			// 		}
+			// 		count = val
+			// 		if count > 0 {
+			// 			break
+			// 		}
+			// 	}
+			// 	if count != 1 {
+			// 		return fmt.Errorf("level first assert: counter=%d want 1", count)
+			// 	}
+			// 	if err := inject(0x52, 0, 0, 0); err != nil {
+			// 		return err
+			// 	}
+			// 	if err := inject(0x52, 0, 0, 0); err != nil {
+			// 		return err
+			// 	}
+			// 	for i := 0; i < 10; i++ {
+			// 		if err := runOnce(); err != nil {
+			// 			return err
+			// 		}
+			// 		val, err := readTotal(16)
+			// 		if err != nil {
+			// 			return err
+			// 		}
+			// 		count = val
+			// 		if count >= 2 {
+			// 			break
+			// 		}
+			// 	}
+			// 	if count != 2 {
+			// 		return fmt.Errorf("level second assert: counter=%d want 2", count)
+			// 	}
+			// 	return nil
+			// }); err != nil {
+			// 	return err
+			// }
+
+			// if err := runIRQ("IRQ e2e mask/unmask", irqGuestConfig{
+			// 	vector:       0x60,
+			// 	line:         5,
+			// 	dest:         0,
+			// 	destMode:     0,
+			// 	deliveryMode: 0,
+			// 	level:        false,
+			// 	masked:       true,
+			// }, func(vm hv.VirtualMachine, inject func(uint8, uint8, uint8, uint8) error, runOnce func() error, readCounter func(int) (uint64, error), readTotal func(int) (uint64, error), setCommand func(uint32) error) error {
+			// 	var count uint64
+			// 	for i := 0; i < 5; i++ {
+			// 		if err := runOnce(); err != nil {
+			// 			return err
+			// 		}
+			// 		val, err := readTotal(16)
+			// 		if err != nil {
+			// 			return err
+			// 		}
+			// 		count = val
+			// 		if count > 0 {
+			// 			break
+			// 		}
+			// 	}
+			// 	if count != 0 {
+			// 		return fmt.Errorf("mask: counter=%d want 0", count)
+			// 	}
+			// 	if err := setCommand(irqCmdUnmask); err != nil {
+			// 		return fmt.Errorf("set command: %w", err)
+			// 	}
+			// 	if err := runOnce(); err != nil {
+			// 		return err
+			// 	}
+			// 	if err := inject(0x60, 0, 0, 0); err != nil {
+			// 		return err
+			// 	}
+			// 	for i := 0; i < 10; i++ {
+			// 		if err := runOnce(); err != nil {
+			// 			return err
+			// 		}
+			// 		val, err := readTotal(16)
+			// 		if err != nil {
+			// 			return err
+			// 		}
+			// 		count = val
+			// 		if count > 0 {
+			// 			break
+			// 		}
+			// 	}
+			// 	if count != 1 {
+			// 		return fmt.Errorf("unmask: counter=%d want 1", count)
+			// 	}
+			// 	return nil
+			// }); err != nil {
+			// 	return err
+			// }
+		}
 	}
 
 	if q.architecture == hv.ArchitectureInvalid || q.architecture == hv.ArchitectureRISCV64 {
@@ -585,7 +1114,7 @@ func (q *bringUpQuest) Run() error {
 	}
 
 	serialBuf := &bytes.Buffer{}
-	serialDev := amd64serial.NewSerial16550(0x3f8, 4, serialBuf)
+	serialDev := amd64serial.NewSerial16550WithIRQ(0x3f8, 4, serialBuf)
 	if err := q.runVMTask("Serial Port Test", hv.ArchitectureX86_64, ioHelloWorld, func(cpu hv.VirtualCPU) error {
 		serialOutput := serialBuf.String()
 		if serialOutput != "Hello, World!" {
@@ -1209,32 +1738,6 @@ func (q *bringUpQuest) RunLinux() error {
 	}
 
 	buf := &bytes.Buffer{}
-	var cmdline []string
-	switch q.dev.Architecture() {
-	case hv.ArchitectureARM64:
-		cmdline = []string{
-			"console=ttyS0,115200n8",
-			fmt.Sprintf("earlycon=uart8250,mmio,0x%x", arm64UARTMMIOBase),
-		}
-	case hv.ArchitectureX86_64:
-		cmdline = []string{
-			"console=hvc0",
-			"quiet",
-			// "console=ttyS0,115200n8",
-			// "earlycon=uart8250,io,0x3f8",
-			"reboot=k",
-			"panic=-1",
-			"tsc=reliable",
-			"tsc_early_khz=3000000",
-		}
-	case hv.ArchitectureRISCV64:
-		cmdline = []string{
-			"console=hvc0",
-			"panic=-1",
-		}
-	default:
-		return fmt.Errorf("unsupported architecture for linux boot: %s", q.dev.Architecture())
-	}
 
 	devices := []hv.DeviceTemplate{
 		virtio.ConsoleTemplate{Out: io.MultiWriter(os.Stdout, buf), In: os.Stdin, Arch: dev.Architecture()},
@@ -1246,7 +1749,31 @@ func (q *bringUpQuest) RunLinux() error {
 		MemBase: linuxMemoryBaseForArch(q.dev.Architecture()),
 
 		GetCmdline: func(arch hv.CpuArchitecture) ([]string, error) {
-			return cmdline, nil
+			switch q.dev.Architecture() {
+			case hv.ArchitectureARM64:
+				return []string{
+					"console=ttyS0,115200n8",
+					fmt.Sprintf("earlycon=uart8250,mmio,0x%x", arm64UARTMMIOBase),
+				}, nil
+			case hv.ArchitectureX86_64:
+				return []string{
+					"console=hvc0",
+					"quiet",
+					// "console=ttyS0,115200n8",
+					// "earlycon=uart8250,io,0x3f8",
+					"reboot=k",
+					"panic=-1",
+					"tsc=reliable",
+					"tsc_early_khz=3000000",
+				}, nil
+			case hv.ArchitectureRISCV64:
+				return []string{
+					"console=hvc0",
+					"panic=-1",
+				}, nil
+			default:
+				return nil, fmt.Errorf("unsupported architecture for linux boot: %s", q.dev.Architecture())
+			}
 		},
 
 		GetKernel: func() (io.ReaderAt, int64, error) {
@@ -1277,62 +1804,21 @@ func (q *bringUpQuest) RunLinux() error {
 		},
 
 		GetInit: func(arch hv.CpuArchitecture) (*ir.Program, error) {
-			switch arch {
-			case hv.ArchitectureX86_64:
-				return &ir.Program{
-					Entrypoint: "main",
-					Methods: map[string]ir.Method{
-						"main": {
-							ir.Printf("Hello, World\n"),
-							ir.Syscall(
-								defs.SYS_EXIT,
-								0,
-							),
-							// ir.Syscall(
-							// 	amd64defs.SYS_REBOOT,
-							// 	ir.Int64(amd64defs.LINUX_REBOOT_MAGIC1),
-							// 	ir.Int64(amd64defs.LINUX_REBOOT_MAGIC2),
-							// 	ir.Int64(amd64defs.LINUX_REBOOT_CMD_POWER_OFF),
-							// 	ir.Int64(0),
-							// ),
-						},
+			return &ir.Program{
+				Entrypoint: "main",
+				Methods: map[string]ir.Method{
+					"main": {
+						ir.Printf("Hello, World\n"),
+						ir.Syscall(
+							defs.SYS_REBOOT,
+							ir.Int64(amd64defs.LINUX_REBOOT_MAGIC1),
+							ir.Int64(amd64defs.LINUX_REBOOT_MAGIC2),
+							ir.Int64(amd64defs.LINUX_REBOOT_CMD_RESTART),
+							ir.Int64(0),
+						),
 					},
-				}, nil
-			case hv.ArchitectureARM64:
-				return &ir.Program{
-					Entrypoint: "main",
-					Methods: map[string]ir.Method{
-						"main": {
-							ir.Printf("Hello, World\n"),
-							ir.Syscall(
-								defs.SYS_REBOOT,
-								ir.Int64(amd64defs.LINUX_REBOOT_MAGIC1),
-								ir.Int64(amd64defs.LINUX_REBOOT_MAGIC2),
-								ir.Int64(amd64defs.LINUX_REBOOT_CMD_RESTART),
-								ir.Int64(0),
-							),
-						},
-					},
-				}, nil
-			case hv.ArchitectureRISCV64:
-				return &ir.Program{
-					Entrypoint: "main",
-					Methods: map[string]ir.Method{
-						"main": {
-							ir.Printf("Hello, World\n"),
-							ir.Syscall(
-								defs.SYS_REBOOT,
-								ir.Int64(amd64defs.LINUX_REBOOT_MAGIC1),
-								ir.Int64(amd64defs.LINUX_REBOOT_MAGIC2),
-								ir.Int64(amd64defs.LINUX_REBOOT_CMD_RESTART),
-								ir.Int64(0),
-							),
-						},
-					},
-				}, nil
-			default:
-				return nil, fmt.Errorf("unsupported architecture for init program: %s", arch)
-			}
+				},
+			}, nil
 		},
 
 		SerialStdout: os.Stdout,
@@ -1360,7 +1846,10 @@ func (q *bringUpQuest) RunLinux() error {
 	}
 
 	if err := runWithTiming("Run Linux VM", func() error {
-		return vm.Run(context.Background(), run)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		return vm.Run(ctx, run)
 	}); err != nil {
 		return fmt.Errorf("run linux boot: %w", err)
 	}
@@ -1446,6 +1935,7 @@ func RunExecutable(path string) error {
 		initx.WithDeviceTemplate(virtio.FSTemplate{
 			Tag:     "bringup",
 			Backend: vfs.NewVirtioFsBackend(),
+			Arch:    hv.Architecture(),
 		}),
 	)
 	if err != nil {

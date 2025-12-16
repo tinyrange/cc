@@ -24,9 +24,8 @@ CrumbleCracker is a high performance embeddable virtualization platform designed
 - [x] Add a downloader for OCI images to pull a root filesystem for the virtual machine.
 - [x] Add support for loading and running executables.
 - [x] Add snapshotting support with support for capturing multiple snapshots tied to a MMIO control device.
+- [x] Add filesystem sharing using `virtio-fs`.
 - [ ] Add a custom optimized TCP/IP stack tied to a `virtio-net` driver to add network support without privileges.
-- [ ] Add filesystem sharing using `virtio-fs`.
-- [ ] Add support for `virtio-block` and my Ext4 driver derived from TinyRange2 to run simple binaries from the OCI image.
 
 ## Cross-Platform Status
 

@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/tinyrange/cc/internal/acpi"
-	"github.com/tinyrange/cc/internal/devices/amd64/chipset"
+	corechipset "github.com/tinyrange/cc/internal/chipset"
+	x86chipset "github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	"github.com/tinyrange/cc/internal/hv"
 	"golang.org/x/sys/unix"
 )
@@ -21,11 +23,54 @@ type virtualCPU struct {
 	id       int
 	fd       int
 	run      []byte
+
+	traceStart time.Time
+
+	// trace is a ring buffer
+	traceBuffer []string
+	traceOffset int
 }
 
 // implements hv.VirtualCPU.
 func (v *virtualCPU) ID() int                           { return v.id }
 func (v *virtualCPU) VirtualMachine() hv.VirtualMachine { return v.vm }
+
+func (v *virtualCPU) trace(s string) {
+	if v.traceBuffer == nil {
+		return
+	}
+
+	v.traceBuffer[v.traceOffset] = fmt.Sprintf("%s: %s", time.Since(v.traceStart), s)
+	v.traceOffset = (v.traceOffset + 1) % len(v.traceBuffer)
+}
+
+func (v *virtualCPU) EnableTrace(maxEntries int) error {
+	if maxEntries <= 0 {
+		return fmt.Errorf("maxEntries must be positive")
+	}
+
+	v.traceBuffer = make([]string, maxEntries)
+	v.traceOffset = 0
+	v.traceStart = time.Now()
+
+	return nil
+}
+
+func (v *virtualCPU) GetTraceBuffer() ([]string, error) {
+	if v.traceBuffer == nil {
+		return nil, fmt.Errorf("trace buffer not enabled")
+	}
+
+	var trace []string
+	for i := 0; i < len(v.traceBuffer); i++ {
+		idx := (v.traceOffset + i) % len(v.traceBuffer)
+		if v.traceBuffer[idx] != "" {
+			trace = append(trace, v.traceBuffer[idx])
+		}
+	}
+
+	return trace, nil
+}
 
 func (v *virtualCPU) start() {
 	runtime.LockOSThread()
@@ -101,7 +146,8 @@ type virtualMachine struct {
 	// amd64-specific fields
 	hasIRQChip bool
 	hasPIT     bool
-	ioapic     *chipset.IOAPIC
+	ioapic     *x86chipset.IOAPIC
+	chipset    *corechipset.Chipset
 
 	// arm64-specific fields
 	arm64GICInfo hv.Arm64GICInfo
@@ -115,6 +161,11 @@ func (v *virtualMachine) Hypervisor() hv.Hypervisor { return v.hv }
 
 // AllocateMemory implements hv.VirtualMachine.
 func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.MemoryRegion, error) {
+	maxInt := uint64(^uint(0) >> 1)
+	if size > maxInt {
+		return nil, fmt.Errorf("allocate memory: size %d exceeds host address limit", size)
+	}
+
 	mem, err := unix.Mmap(
 		-1,
 		0,
@@ -150,9 +201,10 @@ func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.Memory
 // AddDevice implements hv.VirtualMachine.
 func (v *virtualMachine) AddDevice(dev hv.Device) error {
 	v.devices = append(v.devices, dev)
+	v.chipset = nil
 
 	// Capture IOAPIC device for routing integration.
-	if ioa, ok := dev.(*chipset.IOAPIC); ok {
+	if ioa, ok := dev.(*x86chipset.IOAPIC); ok {
 		v.ioapic = ioa
 	}
 
@@ -268,6 +320,124 @@ func (v *virtualMachine) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error
 	}
 
 	return <-done
+}
+
+// ensureChipset builds the chipset dispatch tables from registered devices on demand.
+func (v *virtualMachine) ensureChipset() (*corechipset.Chipset, error) {
+	if v.chipset != nil {
+		return v.chipset, nil
+	}
+
+	builder := corechipset.NewBuilder()
+	for idx, dev := range v.devices {
+		name := fmt.Sprintf("%T#%d", dev, idx)
+
+		if cdev, ok := dev.(corechipset.ChipsetDevice); ok {
+			if err := builder.RegisterDevice(name, cdev); err != nil {
+				return nil, fmt.Errorf("register chipset device %q: %w", name, err)
+			}
+			continue
+		}
+
+		adapter := newLegacyChipsetAdapter(name, dev)
+		if adapter == nil {
+			continue
+		}
+		if err := builder.RegisterDevice(name, adapter); err != nil {
+			return nil, fmt.Errorf("register legacy device %q: %w", name, err)
+		}
+	}
+
+	chipset, err := builder.Build()
+	if err != nil {
+		return nil, fmt.Errorf("build chipset: %w", err)
+	}
+	v.chipset = chipset
+	return chipset, nil
+}
+
+// legacyChipsetAdapter bridges existing hv.Device implementations into the chipset builder.
+type legacyChipsetAdapter struct {
+	name   string
+	device hv.Device
+	io     hv.X86IOPortDevice
+	mmio   hv.MemoryMappedIODevice
+}
+
+func newLegacyChipsetAdapter(name string, dev hv.Device) *legacyChipsetAdapter {
+	var ioDev hv.X86IOPortDevice
+	if d, ok := dev.(hv.X86IOPortDevice); ok {
+		ioDev = d
+	}
+
+	var mmioDev hv.MemoryMappedIODevice
+	if d, ok := dev.(hv.MemoryMappedIODevice); ok {
+		mmioDev = d
+	}
+
+	if ioDev == nil && mmioDev == nil {
+		return nil
+	}
+
+	return &legacyChipsetAdapter{
+		name:   name,
+		device: dev,
+		io:     ioDev,
+		mmio:   mmioDev,
+	}
+}
+
+func (a *legacyChipsetAdapter) Init(vm hv.VirtualMachine) error { return nil }
+func (a *legacyChipsetAdapter) Start() error                    { return nil }
+func (a *legacyChipsetAdapter) Stop() error                     { return nil }
+func (a *legacyChipsetAdapter) Reset() error                    { return nil }
+
+func (a *legacyChipsetAdapter) SupportsPortIO() *corechipset.PortIOIntercept {
+	if a.io == nil {
+		return nil
+	}
+	return &corechipset.PortIOIntercept{
+		Ports:   a.io.IOPorts(),
+		Handler: portIOAdapter{dev: a.io},
+	}
+}
+
+func (a *legacyChipsetAdapter) SupportsMmio() *corechipset.MmioIntercept {
+	if a.mmio == nil {
+		return nil
+	}
+	return &corechipset.MmioIntercept{
+		Regions: a.mmio.MMIORegions(),
+		Handler: mmioAdapter{dev: a.mmio},
+	}
+}
+
+func (a *legacyChipsetAdapter) SupportsPollDevice() *corechipset.PollDevice {
+	return nil
+}
+
+type portIOAdapter struct {
+	dev hv.X86IOPortDevice
+}
+
+func (p portIOAdapter) ReadIOPort(port uint16, data []byte) error {
+	return p.dev.ReadIOPort(port, data)
+}
+
+func (p portIOAdapter) WriteIOPort(port uint16, data []byte) error {
+	return p.dev.WriteIOPort(port, data)
+}
+
+type mmioAdapter struct {
+	dev hv.MemoryMappedIODevice
+}
+
+func (m mmioAdapter) ReadMMIO(addr uint64, data []byte) error {
+	return m.dev.ReadMMIO(addr, data)
+}
+
+func (m mmioAdapter) WriteMMIO(addr uint64, data []byte) error {
+	return m.dev.WriteMMIO(addr, data)
 }
 
 var (

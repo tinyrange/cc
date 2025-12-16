@@ -93,6 +93,7 @@ const (
 	RegisterARM64X28
 	RegisterARM64X29
 	RegisterARM64X30
+	RegisterARM64Xzr // Zero register (reads as 0, writes are discarded)
 	RegisterARM64Sp
 	RegisterARM64Pc
 	RegisterARM64Pstate
@@ -244,6 +245,13 @@ type VirtualCPU interface {
 	GetRegisters(regs map[Register]RegisterValue) error
 
 	Run(ctx context.Context) error
+}
+
+type VirtualCPUDebug interface {
+	VirtualCPU
+
+	EnableTrace(maxEntries int) error
+	GetTraceBuffer() ([]string, error)
 }
 
 type VirtualCPUAmd64 interface {

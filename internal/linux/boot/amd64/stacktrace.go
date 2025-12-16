@@ -22,10 +22,11 @@ const (
 
 // StackFrame captures a single unwound frame from the guest kernel.
 type StackFrame struct {
-	Index  int
-	PC     uint64
-	Symbol string
-	Offset uint64
+	Index    int
+	PhysAddr uint64
+	PC       uint64
+	Symbol   string
+	Offset   uint64
 }
 
 // CaptureStackTrace walks the current guest stack and symbolises the frames using
@@ -96,21 +97,27 @@ func CaptureStackTrace(vcpu hv.VirtualCPU, vmlinux io.ReaderAt, systemMapLoader 
 	}
 
 	var frames []StackFrame
-	addFrame := func(addr uint64) {
+	addFrame := func(addr uint64, physAddr uint64) {
 		name, off, ok := symtab.lookup(addr)
 		if !ok {
 			name = "??"
 		}
 		frame := StackFrame{
-			Index:  len(frames),
-			PC:     addr,
-			Symbol: name,
-			Offset: off,
+			Index:    len(frames),
+			PhysAddr: physAddr,
+			PC:       addr,
+			Symbol:   name,
+			Offset:   off,
 		}
 		frames = append(frames, frame)
 	}
 
-	addFrame(uint64(regs[hv.RegisterAMD64Rip].(hv.Register64)))
+	phys, err := walker.translate(uint64(regs[hv.RegisterAMD64Rip].(hv.Register64)))
+	if err != nil {
+		return nil, fmt.Errorf("translate RIP %#x: %w", regs[hv.RegisterAMD64Rip], err)
+	}
+
+	addFrame(uint64(regs[hv.RegisterAMD64Rip].(hv.Register64)), phys)
 
 	currentFP := uint64(regs[hv.RegisterAMD64Rbp].(hv.Register64))
 	seen := 0
@@ -123,12 +130,12 @@ func CaptureStackTrace(vcpu hv.VirtualCPU, vmlinux io.ReaderAt, systemMapLoader 
 			break
 		}
 
-		retAddr, err := walker.readUint64(currentFP + 8)
+		retAddr, _, err := walker.readUint64(currentFP + 8)
 		if err != nil {
 			walkErr = fmt.Errorf("read return address @%#x: %w", currentFP+8, err)
 			break
 		}
-		prevFP, err := walker.readUint64(currentFP)
+		prevFP, _, err := walker.readUint64(currentFP)
 		if err != nil {
 			walkErr = fmt.Errorf("read frame pointer @%#x: %w", currentFP, err)
 			break
@@ -136,7 +143,7 @@ func CaptureStackTrace(vcpu hv.VirtualCPU, vmlinux io.ReaderAt, systemMapLoader 
 		if retAddr == 0 || !isCanonical(retAddr) {
 			break
 		}
-		addFrame(retAddr)
+		addFrame(retAddr, currentFP+8)
 		if prevFP <= currentFP {
 			break
 		}
@@ -165,7 +172,7 @@ func (w pageWalker) translate(virt uint64) (uint64, error) {
 	}
 
 	pml4Base := w.cr3 &^ 0xFFF
-	pml4Entry, err := w.readPhysUint64(pml4Base + ((virt>>39)&0x1FF)*8)
+	pml4Entry, _, err := w.readPhysUint64(pml4Base + ((virt>>39)&0x1FF)*8)
 	if err != nil {
 		return 0, fmt.Errorf("read PML4 entry: %w", err)
 	}
@@ -174,7 +181,7 @@ func (w pageWalker) translate(virt uint64) (uint64, error) {
 	}
 
 	pdptBase := pml4Entry &^ 0xFFF
-	pdptEntry, err := w.readPhysUint64(pdptBase + ((virt>>30)&0x1FF)*8)
+	pdptEntry, _, err := w.readPhysUint64(pdptBase + ((virt>>30)&0x1FF)*8)
 	if err != nil {
 		return 0, fmt.Errorf("read PDPT entry: %w", err)
 	}
@@ -187,7 +194,7 @@ func (w pageWalker) translate(virt uint64) (uint64, error) {
 	}
 
 	pdBase := pdptEntry &^ 0xFFF
-	pdEntry, err := w.readPhysUint64(pdBase + ((virt>>21)&0x1FF)*8)
+	pdEntry, _, err := w.readPhysUint64(pdBase + ((virt>>21)&0x1FF)*8)
 	if err != nil {
 		return 0, fmt.Errorf("read PD entry: %w", err)
 	}
@@ -200,7 +207,7 @@ func (w pageWalker) translate(virt uint64) (uint64, error) {
 	}
 
 	ptBase := pdEntry &^ 0xFFF
-	ptEntry, err := w.readPhysUint64(ptBase + ((virt>>12)&0x1FF)*8)
+	ptEntry, _, err := w.readPhysUint64(ptBase + ((virt>>12)&0x1FF)*8)
 	if err != nil {
 		return 0, fmt.Errorf("read PT entry: %w", err)
 	}
@@ -211,18 +218,18 @@ func (w pageWalker) translate(virt uint64) (uint64, error) {
 	return (ptEntry &^ 0xFFF) + offset, nil
 }
 
-func (w pageWalker) readPhysUint64(phys uint64) (uint64, error) {
+func (w pageWalker) readPhysUint64(phys uint64) (uint64, uint64, error) {
 	data := make([]byte, 8)
 	if _, err := w.vm.ReadAt(data, int64(phys)); err != nil {
-		return 0, fmt.Errorf("read physical address %#x: %w", phys, err)
+		return 0, 0, fmt.Errorf("read physical address %#x: %w", phys, err)
 	}
-	return binary.LittleEndian.Uint64(data), nil
+	return binary.LittleEndian.Uint64(data), phys, nil
 }
 
-func (w pageWalker) readUint64(virt uint64) (uint64, error) {
+func (w pageWalker) readUint64(virt uint64) (uint64, uint64, error) {
 	phys, err := w.translate(virt)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	return w.readPhysUint64(phys)
 }
