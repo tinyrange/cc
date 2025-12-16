@@ -41,7 +41,8 @@ const (
 	arm64UARTRegShift = 0
 	arm64UARTBaudRate = 115200
 
-	hpetBaseAddress = 0xFED00000
+	hpetBaseAddress          = 0xFED00000
+	hpetAlternateBaseAddress = 0xFED80000 // AMD alternate HPET address
 )
 
 const (
@@ -433,7 +434,7 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	}
 
 	if setter != nil {
-		if err := vm.AddDevice(hpet.New(hpetBaseAddress, setter)); err != nil {
+		if err := vm.AddDevice(hpet.New(hpetBaseAddress, setter, hpetAlternateBaseAddress)); err != nil {
 			return fmt.Errorf("add HPET device: %w", err)
 		}
 	}
