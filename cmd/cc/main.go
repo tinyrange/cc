@@ -440,8 +440,6 @@ func run() error {
 		return err
 	}
 
-	slog.Info("successfully booted VM")
-
 	var ctx context.Context
 	if *timeout > 0 {
 		newCtx, cancel := context.WithTimeout(context.Background(), *timeout)
