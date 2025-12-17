@@ -609,9 +609,10 @@ func main() {
 
 		// Build cc first
 		ccOut, err := goBuild(buildOptions{
-			Package:    "cmd/cc",
-			OutputName: "cc",
-			Build:      hostBuild,
+			Package:          "cmd/cc",
+			OutputName:       "cc",
+			Build:            hostBuild,
+			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to build cc: %v\n", err)
@@ -749,9 +750,10 @@ func main() {
 
 	// build cmd/cc by default
 	out, err := goBuild(buildOptions{
-		Package:    "cmd/cc",
-		OutputName: "cc",
-		Build:      hostBuild,
+		Package:          "cmd/cc",
+		OutputName:       "cc",
+		Build:            hostBuild,
+		EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to build cc: %v\n", err)
