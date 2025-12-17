@@ -98,8 +98,9 @@ func (h *hypervisor) configureGIC(vm *virtualMachine, config hv.VMConfig) error 
 	vm.gicSPICount = spiCount
 	vm.gicConfigured = true
 
-	// Add GIC MMIO emulator - HVF handles interrupt state via hv_gic_set_spi,
-	// but the guest needs MMIO emulation to discover and configure the GIC.
+	// Add GIC MMIO emulator - we use software GIC state tracking and inject
+	// interrupts via hv_vcpu_set_pending_interrupt (matching OpenVMM approach).
+	// The guest needs MMIO emulation to discover and configure the GIC.
 	if err := vm.addGICEmulator(); err != nil {
 		return err
 	}

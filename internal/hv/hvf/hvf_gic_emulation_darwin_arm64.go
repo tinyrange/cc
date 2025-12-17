@@ -5,6 +5,7 @@ package hvf
 import (
 	"encoding/binary"
 	"fmt"
+	"sync"
 
 	"github.com/tinyrange/cc/internal/hv"
 )
@@ -78,6 +79,19 @@ type gicEmulator struct {
 
 	// Per-redistributor state (indexed by CPU)
 	redistWaker []uint32
+
+	// Software GIC state tracking (for interrupt delivery)
+	mu sync.Mutex
+
+	// SPI state (SPIs start at INTID 32)
+	// Each bit represents one SPI (bit 0 = SPI 0 = INTID 32)
+	spiPending []uint32 // Pending SPIs
+	spiActive  []uint32 // Active SPIs
+	spiEnabled []uint32 // Enabled SPIs
+
+	// Per-CPU state for interrupt acknowledgment
+	// Maps CPU index to the currently active interrupt INTID (1023 = none)
+	cpuActiveIntid []uint32
 }
 
 func newGICEmulator(vm *virtualMachine) *gicEmulator {
@@ -85,9 +99,16 @@ func newGICEmulator(vm *virtualMachine) *gicEmulator {
 	if cpuCount == 0 {
 		cpuCount = 1
 	}
+
+	// Allocate bitmasks for SPIs (max 988 SPIs = 32 words)
+	spiWordCount := 32 // Enough for 1024 SPIs
 	return &gicEmulator{
-		vm:          vm,
-		redistWaker: make([]uint32, cpuCount),
+		vm:            vm,
+		redistWaker:   make([]uint32, cpuCount),
+		spiPending:    make([]uint32, spiWordCount),
+		spiActive:      make([]uint32, spiWordCount),
+		spiEnabled:     make([]uint32, spiWordCount),
+		cpuActiveIntid: make([]uint32, cpuCount),
 	}
 }
 
@@ -197,9 +218,25 @@ func (g *gicEmulator) readDistributor(offset uint64, data []byte) error {
 func (g *gicEmulator) writeDistributor(offset uint64, data []byte) error {
 	value := readU32LE(data)
 
-	switch offset {
-	case gicdCtlr:
+	switch {
+	case offset == gicdCtlr:
 		g.distCtlr = value
+	case offset >= gicdIsenabler && offset < gicdIsenabler+0x80:
+		// Interrupt Set-Enable Registers: enable SPIs
+		regIdx := (offset - gicdIsenabler) / 4
+		if regIdx < uint64(len(g.spiEnabled)) {
+			g.mu.Lock()
+			g.spiEnabled[regIdx] |= value
+			g.mu.Unlock()
+		}
+	case offset >= gicdIcenabler && offset < gicdIcenabler+0x80:
+		// Interrupt Clear-Enable Registers: disable SPIs
+		regIdx := (offset - gicdIcenabler) / 4
+		if regIdx < uint64(len(g.spiEnabled)) {
+			g.mu.Lock()
+			g.spiEnabled[regIdx] &^= value
+			g.mu.Unlock()
+		}
 	default:
 		// Ignore writes to unhandled registers
 	}
@@ -290,6 +327,146 @@ func writeU32LE(data []byte, value uint32) {
 	}
 }
 
+// setSPIPending sets or clears the pending state for an SPI
+// intid is the full GIC INTID (e.g., 72 for SPI 40)
+func (g *gicEmulator) setSPIPending(intid uint32, pending bool) {
+	if intid < 32 {
+		return // Not an SPI
+	}
+	spiNum := intid - 32
+	if spiNum >= uint32(len(g.spiPending)*32) {
+		return // Out of range
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	wordIdx := spiNum / 32
+	bitIdx := spiNum % 32
+	mask := uint32(1) << bitIdx
+
+	if pending {
+		g.spiPending[wordIdx] |= mask
+		// Enable the SPI by default if not already enabled
+		// This matches typical guest behavior where interrupts are enabled during setup
+		g.spiEnabled[wordIdx] |= mask
+	} else {
+		g.spiPending[wordIdx] &^= mask
+	}
+}
+
+// irqPending returns true if any enabled SPI is pending for the given CPU
+func (g *gicEmulator) irqPending(cpuIdx int) bool {
+	if cpuIdx < 0 || cpuIdx >= len(g.cpuActiveIntid) {
+		return false
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Check if any enabled SPI is pending and not active
+	for i := range g.spiPending {
+		if (g.spiPending[i] &^ g.spiActive[i] & g.spiEnabled[i]) != 0 {
+			return true
+		}
+	}
+
+	return false
+}
+
+// acknowledgeInterrupt handles ICC_IAR1_EL1 read (interrupt acknowledge)
+// Returns the INTID of the highest priority pending interrupt, or 1023 if none
+func (g *gicEmulator) acknowledgeInterrupt(cpuIdx int) uint32 {
+	if cpuIdx < 0 || cpuIdx >= len(g.cpuActiveIntid) {
+		return 1023
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	// Find the highest priority pending+enabled SPI that's not active
+	for wordIdx := range g.spiPending {
+		pending := g.spiPending[wordIdx] &^ g.spiActive[wordIdx] & g.spiEnabled[wordIdx]
+		if pending == 0 {
+			continue
+		}
+
+		// Find the lowest bit (highest priority SPI in this word)
+		bitIdx := uint32(0)
+		for (pending & (1 << bitIdx)) == 0 {
+			bitIdx++
+		}
+
+		// Calculate INTID (SPI number + 32)
+		intid := uint32(wordIdx)*32 + bitIdx + 32
+
+		// Mark as active
+		g.spiActive[wordIdx] |= (1 << bitIdx)
+		g.spiPending[wordIdx] &^= (1 << bitIdx) // Clear pending
+
+		// Track active interrupt for this CPU
+		g.cpuActiveIntid[cpuIdx] = intid
+
+		return intid
+	}
+
+	return 1023 // No interrupt pending
+}
+
+// endOfInterrupt handles ICC_EOIR1_EL1 write (end of interrupt)
+func (g *gicEmulator) endOfInterrupt(cpuIdx int, intid uint32) {
+	if cpuIdx < 0 || cpuIdx >= len(g.cpuActiveIntid) {
+		return
+	}
+
+	if intid < 32 {
+		return // Not an SPI
+	}
+	spiNum := intid - 32
+	if spiNum >= uint32(len(g.spiActive)*32) {
+		return // Out of range
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	wordIdx := spiNum / 32
+	bitIdx := spiNum % 32
+	mask := uint32(1) << bitIdx
+
+	// Clear active bit
+	g.spiActive[wordIdx] &^= mask
+
+	// Clear CPU's active interrupt if this was it
+	if g.cpuActiveIntid[cpuIdx] == intid {
+		g.cpuActiveIntid[cpuIdx] = 1023
+	}
+}
+
+// enableSPI enables or disables an SPI
+func (g *gicEmulator) enableSPI(intid uint32, enabled bool) {
+	if intid < 32 {
+		return // Not an SPI
+	}
+	spiNum := intid - 32
+	if spiNum >= uint32(len(g.spiEnabled)*32) {
+		return // Out of range
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	wordIdx := spiNum / 32
+	bitIdx := spiNum % 32
+	mask := uint32(1) << bitIdx
+
+	if enabled {
+		g.spiEnabled[wordIdx] |= mask
+	} else {
+		g.spiEnabled[wordIdx] &^= mask
+	}
+}
+
 var (
 	_ hv.MemoryMappedIODevice = (*gicEmulator)(nil)
 )
@@ -301,6 +478,7 @@ func (vm *virtualMachine) addGICEmulator() error {
 	}
 
 	emulator := newGICEmulator(vm)
+	vm.gicEmulator = emulator
 	if err := vm.AddDevice(emulator); err != nil {
 		return fmt.Errorf("add GIC emulator: %w", err)
 	}

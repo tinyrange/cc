@@ -171,6 +171,7 @@ type virtualMachine struct {
 	gicConfigured bool
 	gicSPIBase    uint32
 	gicSPICount   uint32
+	gicEmulator   *gicEmulator // Software GIC emulator
 
 	vmCreated    bool
 	memoryMapped bool
@@ -387,8 +388,8 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 		return fmt.Errorf("hvf: interrupt controller not configured")
 	}
 
-	if hvGicSetSpi == nil {
-		return fmt.Errorf("hvf: hv_gic_set_spi unavailable")
+	if v.gicEmulator == nil {
+		return fmt.Errorf("hvf: GIC emulator not initialized")
 	}
 
 	// Decode the KVM-style IRQ encoding used by EncodeIRQLineForArch.
@@ -402,36 +403,27 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 		irqLine = irqLine & 0xffff
 	}
 
-	// hv_gic_get_spi_interrupt_range returns base=32 (first SPI INTID) and count=988 (number of SPIs).
-	// hv_gic_set_spi expects the INTID number (not zero-based).
-	// Our irqLine is the SPI offset (e.g., 40 for virtio console), so add gicSPIBase.
-	spiNum := irqLine
+	// Calculate the full GIC INTID (SPI offset + base)
+	// Our irqLine is the SPI offset (e.g., 40 for virtio console)
+	spiOffset := irqLine
+	intid := spiOffset
 	if v.gicSPIBase != 0 {
-		spiNum += v.gicSPIBase
+		intid += v.gicSPIBase
 	}
 
 	// Range check: SPI numbers should be 0 to (spiCount-1)
-	if spiNum >= v.gicSPIBase+v.gicSPICount {
-		return fmt.Errorf("hvf: SPI %d out of range (base=%d count=%d)", spiNum, v.gicSPIBase, v.gicSPICount)
+	if intid >= v.gicSPIBase+v.gicSPICount {
+		return fmt.Errorf("hvf: SPI %d out of range (base=%d count=%d)", intid, v.gicSPIBase, v.gicSPICount)
 	}
 
-	if level {
-		slog.Info("hvf: SetIRQ", "spi", spiNum, "level", level, "spiBase", v.gicSPIBase, "spiCount", v.gicSPICount)
-	}
+	// Update software GIC state
+	v.gicEmulator.setSPIPending(intid, level)
 
-	ret := hvGicSetSpi(spiNum, level)
-	if ret != 0 {
-		slog.Error("hvf: hv_gic_set_spi failed", "spi", spiNum, "level", level, "ret", ret)
-		return ret.toError("hv_gic_set_spi")
-	}
-
-	// When asserting an interrupt, mark all vCPUs as having a pending IRQ
-	// and kick them so they can inject it.
+	// When asserting an interrupt, kick the vCPU so it exits hvVcpuRun
+	// and can process the interrupt (which will be injected via hv_vcpu_set_pending_interrupt).
 	if level {
 		for _, vcpu := range v.vcpus {
-			vcpu.pendingIRQ = true
 			hostID := vcpu.hostID
-			// Kick the vCPU so it exits hvVcpuRun and can inject the interrupt
 			_ = hvVcpusExit(&hostID, 1)
 		}
 	}
@@ -509,11 +501,6 @@ type virtualCPU struct {
 	initErr  chan error
 
 	pendingPC *uint64
-
-	// pendingIRQ is set when an IRQ needs to be injected into the vCPU.
-	// Access should be synchronized, but since we only set from SetIRQ
-	// and check from the vCPU thread, a simple bool is sufficient.
-	pendingIRQ bool
 }
 
 func (v *virtualCPU) start() {
@@ -632,18 +619,13 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	}
 
 	for {
-		// Inject pending interrupts before running the vCPU.
-		// This must be done from the vCPU thread.
-		if v.pendingIRQ {
-			v.pendingIRQ = false
-			if hvVcpuSetPendingInterrupt != nil {
+		// Check if any interrupt is pending and inject it before running the vCPU
+		if v.vm.gicEmulator != nil && hvVcpuSetPendingInterrupt != nil {
+			if v.vm.gicEmulator.irqPending(v.index) {
 				ret := hvVcpuSetPendingInterrupt(v.hostID, hvInterruptTypeIRQ, true)
-				// slog.Info("hvf: injecting IRQ into vCPU", "vcpu", v.index, "ret", ret)
 				if err := ret.toError("hv_vcpu_set_pending_interrupt"); err != nil {
 					slog.Error("hvf: failed to set pending IRQ", "err", err)
 				}
-			} else {
-				slog.Warn("hvf: hvVcpuSetPendingInterrupt not available")
 			}
 		}
 
@@ -768,25 +750,53 @@ func (v *virtualCPU) handleMsrAccess(syndrome uint64) error {
 		return err
 	}
 
-	// Example: recognize specific system registers by encoding if you want
-	// to emulate them specially. For now, everything is treated as:
-	//   - MSR: write-ignored
-	//   - MRS: read-as-zero
-	//
-	// Example (CNTVCT_EL0: op0=3, op1=3, CRn=14, CRm=0, op2=2) :contentReference[oaicite:1]{index=1}
-	//
-	// if info.matches(3, 3, 14, 0, 2) { // CNTVCT_EL0
-	//     if info.read {
-	//         // TODO: provide a virtual counter value
-	//         if err := v.writeRegister(info.target, someCounterValue); err != nil {
-	//             return err
-	//         }
-	//     } else {
-	//         // Writes to CNTVCT_EL0 are architecturally ignored.
-	//     }
-	// } else {
-	//     // fall through to default handling below
-	// }
+	// Handle GIC system registers
+	if v.vm.gicEmulator != nil {
+		// ICC_IAR1_EL1: Interrupt Acknowledge Register (op0=3, op1=0, CRn=12, CRm=12, op2=0)
+		if info.matches(3, 0, 12, 12, 0) {
+			if info.read {
+				// Acknowledge interrupt and return INTID
+				intid := v.vm.gicEmulator.acknowledgeInterrupt(v.index)
+				if err := v.writeRegister(info.target, uint64(intid)); err != nil {
+					return err
+				}
+				return v.advanceProgramCounter()
+			}
+		}
+
+		// ICC_EOIR1_EL1: End of Interrupt Register (op0=3, op1=0, CRn=12, CRm=12, op2=1)
+		if info.matches(3, 0, 12, 12, 1) {
+			if !info.read {
+				// Read the INTID from the target register
+				intid, err := v.readRegister(info.target)
+				if err != nil {
+					return err
+				}
+				v.vm.gicEmulator.endOfInterrupt(v.index, uint32(intid))
+				return v.advanceProgramCounter()
+			}
+		}
+
+		// ICC_PMR_EL1: Priority Mask Register (op0=3, op1=0, CRn=4, CRm=6, op2=0)
+		// ICC_BPR1_EL1: Binary Point Register (op0=3, op1=0, CRn=12, CRm=8, op2=3)
+		// ICC_CTLR_EL1: Control Register (op0=3, op1=0, CRn=12, CRm=12, op2=4)
+		// ICC_SRE_EL1: System Register Enable (op0=3, op1=0, CRn=12, CRm=12, op2=5)
+		// These are configuration registers - for now, allow reads/writes but don't track state
+		if info.matches(3, 0, 4, 6, 0) || // ICC_PMR_EL1
+			info.matches(3, 0, 12, 8, 3) || // ICC_BPR1_EL1
+			info.matches(3, 0, 12, 12, 4) || // ICC_CTLR_EL1
+			info.matches(3, 0, 12, 12, 5) { // ICC_SRE_EL1
+			// Allow reads/writes but don't track state for now
+			if info.read {
+				// Read-as-zero for configuration registers
+				if err := v.writeRegister(info.target, 0); err != nil {
+					return err
+				}
+			}
+			// Writes are ignored (no state tracking yet)
+			return v.advanceProgramCounter()
+		}
+	}
 
 	if info.read {
 		// Default: read-as-zero for unhandled sysregs.
