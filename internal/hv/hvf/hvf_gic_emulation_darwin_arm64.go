@@ -89,6 +89,13 @@ type gicEmulator struct {
 	spiActive  []uint32 // Active SPIs
 	spiEnabled []uint32 // Enabled SPIs
 
+	// PPI state (PPIs are INTID 16-31, per-CPU)
+	// Each bit represents one PPI (bit 0 = PPI 0 = INTID 16)
+	// Indexed by CPU, then by word (only need 1 word for 16 PPIs)
+	ppiPending [][]uint32 // Pending PPIs per CPU
+	ppiActive  [][]uint32 // Active PPIs per CPU
+	ppiEnabled [][]uint32 // Enabled PPIs per CPU
+
 	// Per-CPU state for interrupt acknowledgment
 	// Maps CPU index to the currently active interrupt INTID (1023 = none)
 	cpuActiveIntid []uint32
@@ -102,12 +109,28 @@ func newGICEmulator(vm *virtualMachine) *gicEmulator {
 
 	// Allocate bitmasks for SPIs (max 988 SPIs = 32 words)
 	spiWordCount := 32 // Enough for 1024 SPIs
+
+	// Allocate PPI state (1 word per CPU, enough for 16 PPIs)
+	ppiPending := make([][]uint32, cpuCount)
+	ppiActive := make([][]uint32, cpuCount)
+	ppiEnabled := make([][]uint32, cpuCount)
+	for i := range cpuCount {
+		ppiPending[i] = make([]uint32, 1)
+		ppiActive[i] = make([]uint32, 1)
+		ppiEnabled[i] = make([]uint32, 1)
+		// Enable all PPIs by default (they can be disabled via redistributor)
+		ppiEnabled[i][0] = 0xFFFFFFFF
+	}
+
 	return &gicEmulator{
-		vm:            vm,
-		redistWaker:   make([]uint32, cpuCount),
-		spiPending:    make([]uint32, spiWordCount),
+		vm:             vm,
+		redistWaker:    make([]uint32, cpuCount),
+		spiPending:     make([]uint32, spiWordCount),
 		spiActive:      make([]uint32, spiWordCount),
 		spiEnabled:     make([]uint32, spiWordCount),
+		ppiPending:     ppiPending,
+		ppiActive:      ppiActive,
+		ppiEnabled:     ppiEnabled,
 		cpuActiveIntid: make([]uint32, cpuCount),
 	}
 }
@@ -355,7 +378,7 @@ func (g *gicEmulator) setSPIPending(intid uint32, pending bool) {
 	}
 }
 
-// irqPending returns true if any enabled SPI is pending for the given CPU
+// irqPending returns true if any enabled interrupt (PPI or SPI) is pending for the given CPU
 func (g *gicEmulator) irqPending(cpuIdx int) bool {
 	if cpuIdx < 0 || cpuIdx >= len(g.cpuActiveIntid) {
 		return false
@@ -364,7 +387,16 @@ func (g *gicEmulator) irqPending(cpuIdx int) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	// Check if any enabled SPI is pending and not active
+	// Check PPIs first (they have higher priority than SPIs)
+	if cpuIdx < len(g.ppiPending) {
+		for wordIdx := range g.ppiPending[cpuIdx] {
+			if (g.ppiPending[cpuIdx][wordIdx] &^ g.ppiActive[cpuIdx][wordIdx] & g.ppiEnabled[cpuIdx][wordIdx]) != 0 {
+				return true
+			}
+		}
+	}
+
+	// Check SPIs
 	for i := range g.spiPending {
 		if (g.spiPending[i] &^ g.spiActive[i] & g.spiEnabled[i]) != 0 {
 			return true
@@ -376,6 +408,7 @@ func (g *gicEmulator) irqPending(cpuIdx int) bool {
 
 // acknowledgeInterrupt handles ICC_IAR1_EL1 read (interrupt acknowledge)
 // Returns the INTID of the highest priority pending interrupt, or 1023 if none
+// PPIs have higher priority than SPIs
 func (g *gicEmulator) acknowledgeInterrupt(cpuIdx int) uint32 {
 	if cpuIdx < 0 || cpuIdx >= len(g.cpuActiveIntid) {
 		return 1023
@@ -383,6 +416,34 @@ func (g *gicEmulator) acknowledgeInterrupt(cpuIdx int) uint32 {
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
+
+	// Check PPIs first (they have higher priority than SPIs)
+	if cpuIdx < len(g.ppiPending) {
+		for wordIdx := range g.ppiPending[cpuIdx] {
+			pending := g.ppiPending[cpuIdx][wordIdx] &^ g.ppiActive[cpuIdx][wordIdx] & g.ppiEnabled[cpuIdx][wordIdx]
+			if pending == 0 {
+				continue
+			}
+
+			// Find the lowest bit (highest priority PPI in this word)
+			bitIdx := uint32(0)
+			for (pending & (1 << bitIdx)) == 0 {
+				bitIdx++
+			}
+
+			// Calculate INTID (PPI number + 16)
+			intid := uint32(wordIdx)*32 + bitIdx + 16
+
+			// Mark as active
+			g.ppiActive[cpuIdx][wordIdx] |= (1 << bitIdx)
+			g.ppiPending[cpuIdx][wordIdx] &^= (1 << bitIdx) // Clear pending
+
+			// Track active interrupt for this CPU
+			g.cpuActiveIntid[cpuIdx] = intid
+
+			return intid
+		}
+	}
 
 	// Find the highest priority pending+enabled SPI that's not active
 	for wordIdx := range g.spiPending {
@@ -419,27 +480,69 @@ func (g *gicEmulator) endOfInterrupt(cpuIdx int, intid uint32) {
 		return
 	}
 
-	if intid < 32 {
-		return // Not an SPI
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if intid >= 16 && intid < 32 {
+		// PPI (INTID 16-31)
+		ppiNum := intid - 16
+		if cpuIdx < len(g.ppiActive) && ppiNum < 16 {
+			wordIdx := ppiNum / 32
+			bitIdx := ppiNum % 32
+			mask := uint32(1) << bitIdx
+
+			// Clear active bit
+			g.ppiActive[cpuIdx][wordIdx] &^= mask
+
+			// Clear CPU's active interrupt if this was it
+			if g.cpuActiveIntid[cpuIdx] == intid {
+				g.cpuActiveIntid[cpuIdx] = 1023
+			}
+		}
+	} else if intid >= 32 {
+		// SPI (INTID 32+)
+		spiNum := intid - 32
+		if spiNum < uint32(len(g.spiActive)*32) {
+			wordIdx := spiNum / 32
+			bitIdx := spiNum % 32
+			mask := uint32(1) << bitIdx
+
+			// Clear active bit
+			g.spiActive[wordIdx] &^= mask
+
+			// Clear CPU's active interrupt if this was it
+			if g.cpuActiveIntid[cpuIdx] == intid {
+				g.cpuActiveIntid[cpuIdx] = 1023
+			}
+		}
 	}
-	spiNum := intid - 32
-	if spiNum >= uint32(len(g.spiActive)*32) {
+}
+
+// setPPIPending sets or clears a PPI pending state for a specific CPU
+func (g *gicEmulator) setPPIPending(cpuIdx int, intid uint32, level bool) {
+	if intid < 16 || intid >= 32 {
+		return // Not a PPI
+	}
+	if cpuIdx < 0 || cpuIdx >= len(g.ppiPending) {
+		return
+	}
+
+	ppiNum := intid - 16
+	if ppiNum >= 16 {
 		return // Out of range
 	}
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	wordIdx := spiNum / 32
-	bitIdx := spiNum % 32
+	wordIdx := ppiNum / 32
+	bitIdx := ppiNum % 32
 	mask := uint32(1) << bitIdx
 
-	// Clear active bit
-	g.spiActive[wordIdx] &^= mask
-
-	// Clear CPU's active interrupt if this was it
-	if g.cpuActiveIntid[cpuIdx] == intid {
-		g.cpuActiveIntid[cpuIdx] = 1023
+	if level {
+		g.ppiPending[cpuIdx][wordIdx] |= mask
+	} else {
+		g.ppiPending[cpuIdx][wordIdx] &^= mask
 	}
 }
 

@@ -203,32 +203,124 @@ func encodeLiteralLoad(reg Reg, width literalWidth) (uint32, error) {
 	}
 }
 
-type systemRegister struct {
-	op0 uint8
-	op1 uint8
-	crn uint8
-	crm uint8
-	op2 uint8
+type SystemRegister struct {
+	Op0 uint8
+	Op1 uint8
+	Crn uint8
+	Crm uint8
+	Op2 uint8
 }
 
-var systemRegVBAR = systemRegister{
-	op0: 3,
-	op1: 0,
-	crn: 12,
-	crm: 0,
-	op2: 0,
+var SystemRegVBAR = SystemRegister{
+	Op0: 3,
+	Op1: 0,
+	Crn: 12,
+	Crm: 0,
+	Op2: 0,
 }
 
-func encodeMSR(reg systemRegister, src Reg) (uint32, error) {
+// Timer system registers
+var SystemRegCNTVCTEL0 = SystemRegister{
+	Op0: 3,
+	Op1: 3,
+	Crn: 14,
+	Crm: 0,
+	Op2: 2,
+}
+
+var SystemRegCNTVTVALEL0 = SystemRegister{
+	Op0: 3,
+	Op1: 3,
+	Crn: 14,
+	Crm: 3,
+	Op2: 0,
+}
+
+var SystemRegCNTVCTLEL0 = SystemRegister{
+	Op0: 3,
+	Op1: 3,
+	Crn: 14,
+	Crm: 3,
+	Op2: 1,
+}
+
+// GIC system registers
+var SystemRegICCIAR1EL1 = SystemRegister{
+	Op0: 3,
+	Op1: 0,
+	Crn: 12,
+	Crm: 12,
+	Op2: 0,
+}
+
+var SystemRegICCEOIR1EL1 = SystemRegister{
+	Op0: 3,
+	Op1: 0,
+	Crn: 12,
+	Crm: 12,
+	Op2: 1,
+}
+
+// ICC_PMR_EL1: Priority Mask Register - set to 0xFF to allow all priorities
+var SystemRegICCPMREL1 = SystemRegister{
+	Op0: 3,
+	Op1: 0,
+	Crn: 4,
+	Crm: 6,
+	Op2: 0,
+}
+
+// ICC_IGRPEN1_EL1: Interrupt Group 1 Enable register - set bit 0 to enable Group 1 interrupts
+var SystemRegICCIGRPEN1EL1 = SystemRegister{
+	Op0: 3,
+	Op1: 0,
+	Crn: 12,
+	Crm: 12,
+	Op2: 7,
+}
+
+// ICC_SRE_EL1: System Register Enable - set bit 0 to enable system register access
+var SystemRegICCSREEL1 = SystemRegister{
+	Op0: 3,
+	Op1: 0,
+	Crn: 12,
+	Crm: 12,
+	Op2: 5,
+}
+
+// DAIF register for interrupt masking
+var SystemRegDAIF = SystemRegister{
+	Op0: 3,
+	Op1: 3,
+	Crn: 4,
+	Crm: 2,
+	Op2: 1,
+}
+
+func encodeMSR(reg SystemRegister, src Reg) (uint32, error) {
 	if src.size != size64 {
 		return 0, fmt.Errorf("arm64 asm: MSR requires 64-bit source")
 	}
 	word := uint32(0xD5000000)
-	word |= uint32(reg.op0&0x3) << 19
-	word |= uint32(reg.op1&0x7) << 16
-	word |= uint32(reg.crn&0xF) << 12
-	word |= uint32(reg.crm&0xF) << 8
-	word |= uint32(reg.op2&0x7) << 5
+	word |= uint32(reg.Op0&0x3) << 19
+	word |= uint32(reg.Op1&0x7) << 16
+	word |= uint32(reg.Crn&0xF) << 12
+	word |= uint32(reg.Crm&0xF) << 8
+	word |= uint32(reg.Op2&0x7) << 5
 	word |= uint32(src.id & 0x1F)
+	return word, nil
+}
+
+func encodeMRS(dst Reg, reg SystemRegister) (uint32, error) {
+	if dst.size != size64 {
+		return 0, fmt.Errorf("arm64 asm: MRS requires 64-bit destination")
+	}
+	word := uint32(0xD5300000)
+	word |= uint32(reg.Op0&0x3) << 19
+	word |= uint32(reg.Op1&0x7) << 16
+	word |= uint32(reg.Crn&0xF) << 12
+	word |= uint32(reg.Crm&0xF) << 8
+	word |= uint32(reg.Op2&0x7) << 5
+	word |= uint32(dst.id & 0x1F)
 	return word, nil
 }

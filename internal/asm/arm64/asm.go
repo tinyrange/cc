@@ -496,6 +496,18 @@ func Ret() asm.Fragment {
 	})
 }
 
+// Eret returns from exception. This is used in exception handlers to return to the interrupted context.
+func Eret() asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		c.emit32(0xD69F03E0) // eret
+		return nil
+	})
+}
+
 func Syscall(number defs.Syscall, args ...asm.Value) asm.Fragment {
 	return &syscallFragment{number: number, args: args}
 }
@@ -507,6 +519,90 @@ func Hvc() asm.Fragment {
 			return err
 		}
 		c.emit32(0xD4000002) // hvc #0
+		return nil
+	})
+}
+
+// Wfi waits for interrupt. The CPU will enter a low-power state until an interrupt occurs.
+func Wfi() asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		c.emit32(0xD503207F) // wfi
+		return nil
+	})
+}
+
+// MsrReg writes a general-purpose register to a system register.
+func MsrReg(sysreg SystemRegister, src Reg) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		if err := src.validate(); err != nil {
+			return err
+		}
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		word, err := encodeMSR(sysreg, src)
+		if err != nil {
+			return err
+		}
+		c.emit32(word)
+		return nil
+	})
+}
+
+// MrsReg reads a system register into a general-purpose register.
+func MrsReg(dst Reg, sysreg SystemRegister) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		if err := dst.validate(); err != nil {
+			return err
+		}
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		word, err := encodeMRS(dst, sysreg)
+		if err != nil {
+			return err
+		}
+		c.emit32(word)
+		return nil
+	})
+}
+
+// EnableInterrupts clears the I bit in DAIF, enabling IRQ interrupts.
+func EnableInterrupts() asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		// MSR DAIFClr, #imm where imm bit 1 clears the I bit (IRQ mask)
+		// DAIF immediate CRm bits: bit 3=D, bit 2=A, bit 1=I, bit 0=F
+		// So CRm=2 (0b0010) clears just the I bit
+		// op2=7 for DAIFClr (op2=6 is DAIFSet)
+		// Encoding: 11010101 00000011 0100 0010 111 11111 = D50342FF
+		c.emit32(0xD50342FF)
+		return nil
+	})
+}
+
+// DisableInterrupts sets the I bit in DAIF, disabling IRQ interrupts.
+func DisableInterrupts() asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		// MSR DAIFSet, #imm where imm bit 1 sets the I bit (IRQ mask)
+		// DAIF immediate CRm bits: bit 3=D, bit 2=A, bit 1=I, bit 0=F
+		// So CRm=2 (0b0010) sets just the I bit
+		// op2=6 for DAIFSet
+		// Encoding: 11010101 00000011 0100 0010 110 11111 = D50342DF
+		c.emit32(0xD50342DF)
 		return nil
 	})
 }
@@ -524,7 +620,7 @@ func SetVectorBase(src Reg) asm.Fragment {
 		if err != nil {
 			return err
 		}
-		word, err := encodeMSR(systemRegVBAR, src)
+		word, err := encodeMSR(SystemRegVBAR, src)
 		if err != nil {
 			return err
 		}

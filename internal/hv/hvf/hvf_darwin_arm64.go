@@ -619,6 +619,28 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	}
 
 	for {
+		// Check timer status and inject interrupt if fired (poll-based approach for HVF)
+		// HVF doesn't always generate hvExitReasonVTimerActivated, so we poll the timer status
+		if hvVcpuGetSys != nil && hvVcpuSetPendingInterrupt != nil {
+			var cntvCtl uint64
+			cntvCtlReg := makeHvSysReg(3, 3, 14, 3, 1) // CNTV_CTL_EL0
+			hvVcpuGetSys(v.hostID, cntvCtlReg, &cntvCtl)
+
+			// CNTV_CTL: bit 0 = ENABLE, bit 1 = IMASK, bit 2 = ISTATUS
+			timerEnabled := (cntvCtl & 0x1) != 0
+			timerMasked := (cntvCtl & 0x2) != 0
+			timerFired := (cntvCtl & 0x4) != 0
+
+			if timerEnabled && !timerMasked && timerFired {
+				// Timer has fired and interrupt is not masked - inject IRQ
+				if v.vm.gicEmulator != nil {
+					const virtualTimerPPI = 27
+					v.vm.gicEmulator.setPPIPending(v.index, virtualTimerPPI, true)
+				}
+				hvVcpuSetPendingInterrupt(v.hostID, hvInterruptTypeIRQ, true)
+			}
+		}
+
 		// Check if any interrupt is pending and inject it before running the vCPU
 		if v.vm.gicEmulator != nil && hvVcpuSetPendingInterrupt != nil {
 			if v.vm.gicEmulator.irqPending(v.index) {
@@ -633,6 +655,7 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			return err
 		}
 
+
 		switch v.exit.Reason {
 		case hvExitReasonCanceled:
 			if err := ctx.Err(); err != nil {
@@ -646,8 +669,22 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 				return err
 			}
 			// Continue running after successfully handling the exception
-		case hvExitReasonVTimerActivated, hvExitReasonVTimerDeactivated:
-			// Spurious timer exits; continue running.
+		case hvExitReasonVTimerActivated:
+			// Virtual timer fired - set PPI 27 (virtual timer interrupt) pending
+			if v.vm.gicEmulator != nil {
+				const virtualTimerPPI = 27 // CNTV interrupt is PPI 27
+				v.vm.gicEmulator.setPPIPending(v.index, virtualTimerPPI, true)
+				if v.vm.gicEmulator.irqPending(v.index) && hvVcpuSetPendingInterrupt != nil {
+					hvVcpuSetPendingInterrupt(v.hostID, hvInterruptTypeIRQ, true)
+				}
+			}
+			continue
+		case hvExitReasonVTimerDeactivated:
+			// Virtual timer deactivated - clear PPI 27 pending
+			if v.vm.gicEmulator != nil {
+				const virtualTimerPPI = 27
+				v.vm.gicEmulator.setPPIPending(v.index, virtualTimerPPI, false)
+			}
 			continue
 		default:
 			return fmt.Errorf("hvf: unsupported vCPU exit reason %d", v.exit.Reason)
@@ -798,6 +835,30 @@ func (v *virtualCPU) handleMsrAccess(syndrome uint64) error {
 		}
 	}
 
+	// Handle timer registers (CNTV_CTL_EL0, CNTV_TVAL_EL0, CNTVCT_EL0)
+	// These should be handled natively by HVF, but if trapped, we allow them through
+	if info.op0 == 3 && info.op1 == 3 && info.crn == 14 {
+		if info.crm == 3 {
+			// CNTV_CTL_EL0 (op2=1) or CNTV_TVAL_EL0 (op2=0)
+			// Allow timer register accesses to pass through to HVF
+			if info.read {
+				// For reads, return 0 (timer should be handled by HVF natively)
+				if err := v.writeRegister(info.target, 0); err != nil {
+					return err
+				}
+			}
+			// For writes, just advance PC to let HVF handle it
+			return v.advanceProgramCounter()
+		} else if info.crm == 0 && info.op2 == 2 {
+			// CNTVCT_EL0 - virtual counter read
+			// Return 0 for now (should read actual counter, but HVF should handle this)
+			if err := v.writeRegister(info.target, 0); err != nil {
+				return err
+			}
+			return v.advanceProgramCounter()
+		}
+	}
+
 	if info.read {
 		// Default: read-as-zero for unhandled sysregs.
 		if err := v.writeRegister(info.target, 0); err != nil {
@@ -805,7 +866,6 @@ func (v *virtualCPU) handleMsrAccess(syndrome uint64) error {
 		}
 	} else {
 		// Default: ignore writes for unhandled sysregs.
-		// You *could* log here if you want visibility:
 		log.Printf("hvf: ignoring MSR op0=%d op1=%d CRn=%d CRm=%d op2=%d", info.op0, info.op1, info.crn, info.crm, info.op2)
 	}
 

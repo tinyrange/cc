@@ -1424,6 +1424,177 @@ func (q *bringUpQuest) Run() error {
 		return err
 	}
 
+	// Timer Interrupt Test
+	// Use an address within the ARM64 memory region (base 0x80000000)
+	const arm64TimerCounterAddr = 0x80002000
+	const arm64TimerCounter asm.Variable = 200
+
+	// Build exception vector handler for IRQ
+	// Entry 1 (offset 0x80) is IRQ from current EL with SP_EL0
+	// Entry 5 (offset 0x280) is IRQ from current EL with SP_EL1
+	// We'll handle both the same way
+	irqHandlerLabel := asm.Label("irq_handler")
+	irqHandlerDone := asm.Label("irq_handler_done")
+
+	irqHandler := asm.Group{
+		// Exception handler for IRQ - must use ERET to return
+		asm.MarkLabel(irqHandlerLabel),
+		// Load counter address
+		arm64.MovImmediate(arm64.Reg64(arm64.X0), arm64TimerCounterAddr),
+		// Increment counter
+		arm64.MovFromMemory(arm64.Reg64(arm64.X1), arm64.Mem(arm64.Reg64(arm64.X0))),
+		arm64.AddRegImm(arm64.Reg64(arm64.X1), 1),
+		arm64.MovToMemory(arm64.Mem(arm64.Reg64(arm64.X0)), arm64.Reg64(arm64.X1)),
+		// Acknowledge interrupt: MRS X0, ICC_IAR1_EL1
+		arm64.MrsReg(arm64.Reg64(arm64.X0), arm64.SystemRegICCIAR1EL1),
+		// End of interrupt: MSR ICC_EOIR1_EL1, X0
+		arm64.MsrReg(arm64.SystemRegICCEOIR1EL1, arm64.Reg64(arm64.X0)),
+		asm.MarkLabel(irqHandlerDone),
+		arm64.Eret(), // Use ERET to return from exception
+	}
+
+	irqHandlerBytes, err := arm64.EmitBytes(irqHandler)
+	if err != nil {
+		return fmt.Errorf("build IRQ handler: %w", err)
+	}
+	if len(irqHandlerBytes) > arm64VectorEntrySize {
+		return fmt.Errorf("IRQ handler too large (%d bytes)", len(irqHandlerBytes))
+	}
+
+	// Build exception vector table with IRQ handler
+	timerVectorTable := make([]byte, arm64VectorEntrySize*arm64VectorEntryCount)
+	// Fill with NOPs
+	for i := range arm64VectorEntryCount {
+		for off := 0; off < arm64VectorEntrySize; off += 4 {
+			binary.LittleEndian.PutUint32(timerVectorTable[i*arm64VectorEntrySize+off:], arm64NopEncoding)
+		}
+	}
+	// Install IRQ handler at entry 1 (IRQ from current EL with SP_EL0) and entry 5 (IRQ from current EL with SP_EL1)
+	copy(timerVectorTable[1*arm64VectorEntrySize:], irqHandlerBytes)
+	copy(timerVectorTable[5*arm64VectorEntrySize:], irqHandlerBytes)
+
+	// Calculate timer value: use a very small value
+	// ARM64 counter frequency on Apple Silicon is 24MHz, so 24000 = 1ms
+	// Use 10 ticks for very fast firing
+	const timerTicks = 10
+
+	if err := q.runArchitectureTask("Timer Interrupt Test", hv.ArchitectureARM64, func() error {
+		dev := q.hypervisorForArch(hv.ArchitectureARM64)
+		if dev == nil {
+			return fmt.Errorf("hypervisor not initialized for ARM64")
+		}
+
+		loader := helpers.ProgramLoader{
+			Program: ir.Program{
+				Entrypoint: "main",
+				Methods: map[string]ir.Method{
+					"main": {
+						asm.Group{
+							// Initialize counter to 0
+							arm64.MovImmediate(arm64.Reg64(arm64.X0), arm64TimerCounterAddr),
+							arm64.MovImmediate(arm64.Reg64(arm64.X1), 0),
+							arm64.MovToMemory(arm64.Mem(arm64.Reg64(arm64.X0)), arm64.Reg64(arm64.X1)),
+
+							// Configure GIC redistributor via MMIO
+							// GIC redistributor base: 0x080a0000
+							// 1. Wake up redistributor: write 0 to GICR_WAKER (offset 0x14)
+							arm64.MovImmediate(arm64.Reg64(arm64.X0), 0x080a0014), // GICR_WAKER
+							arm64.MovImmediate(arm64.Reg64(arm64.X1), 0),
+							arm64.MovToMemory32(arm64.Mem(arm64.Reg64(arm64.X0)), arm64.Reg32(arm64.X1)),
+
+							// 2. Enable PPI 27 (virtual timer): write bit 27 to GICR_ISENABLER0
+							// GICR_ISENABLER0 is at SGI_base + 0x100 = 0x080a0000 + 0x10000 + 0x100 = 0x080b0100
+							arm64.MovImmediate(arm64.Reg64(arm64.X0), 0x080b0100), // GICR_ISENABLER0
+							arm64.MovImmediate(arm64.Reg64(arm64.X1), 1<<27),      // PPI 27 enable bit
+							arm64.MovToMemory32(arm64.Mem(arm64.Reg64(arm64.X0)), arm64.Reg32(arm64.X1)),
+
+							// Configure GIC CPU interface via system registers
+							// 1. Enable system register access (ICC_SRE_EL1)
+							arm64.MovImmediate(arm64.Reg64(arm64.X1), 0x7), // SRE=1, DFB=1, DIB=1
+							arm64.MsrReg(arm64.SystemRegICCSREEL1, arm64.Reg64(arm64.X1)),
+							// 2. Set priority mask to allow all interrupts (ICC_PMR_EL1)
+							arm64.MovImmediate(arm64.Reg64(arm64.X1), 0xFF),
+							arm64.MsrReg(arm64.SystemRegICCPMREL1, arm64.Reg64(arm64.X1)),
+							// 3. Enable Group 1 interrupts (ICC_IGRPEN1_EL1)
+							arm64.MovImmediate(arm64.Reg64(arm64.X1), 1),
+							arm64.MsrReg(arm64.SystemRegICCIGRPEN1EL1, arm64.Reg64(arm64.X1)),
+
+							// Enable interrupts in PSTATE
+							arm64.EnableInterrupts(),
+
+							// Set timer value: MSR CNTV_TVAL_EL0, X1
+							arm64.MovImmediate(arm64.Reg64(arm64.X1), timerTicks),
+							arm64.MsrReg(arm64.SystemRegCNTVTVALEL0, arm64.Reg64(arm64.X1)),
+							// Enable timer: MSR CNTV_CTL_EL0, X1 (bit 0 = enable, bit 1 = imask)
+							arm64.MovImmediate(arm64.Reg64(arm64.X1), 1), // Enable bit
+							arm64.MsrReg(arm64.SystemRegCNTVCTLEL0, arm64.Reg64(arm64.X1)),
+						},
+						// Poll timer status - read a GIC register each iteration to force vCPU exit
+						// This allows the hypervisor to detect timer fired and inject the interrupt
+						asm.MarkLabel(asm.Label("wait_loop")),
+						asm.Group{
+							// Read GICR_WAKER to force MMIO exit (allows hypervisor to check timer)
+							arm64.MovImmediate(arm64.Reg64(arm64.X3), 0x080a0014),
+							arm64.MovFromMemory32(arm64.Reg32(arm64.X4), arm64.Mem(arm64.Reg64(arm64.X3))),
+							// Check counter - if ISR ran, counter will be 1
+							arm64.MovImmediate(arm64.Reg64(arm64.X0), arm64TimerCounterAddr),
+							arm64.MovFromMemory(arm64.Reg64(arm64.X2), arm64.Mem(arm64.Reg64(arm64.X0))),
+							// If counter == 0, loop again
+							arm64.CmpRegImm(arm64.Reg64(arm64.X2), 0),
+							arm64.JumpIfEqual(asm.Label("wait_loop")),
+							// Disable timer
+							arm64.MovImmediate(arm64.Reg64(arm64.X1), 0),
+							arm64.MsrReg(arm64.SystemRegCNTVCTLEL0, arm64.Reg64(arm64.X1)),
+							// Exit via PSCI
+							arm64.MovImmediate(arm64.Reg64(arm64.X0), psciSystemOff),
+							arm64.Hvc(),
+						},
+					},
+				},
+			},
+			BaseAddr:          linuxMemoryBaseForArch(hv.ArchitectureARM64),
+			Mode:              helpers.Mode64BitIdentityMapping,
+			MaxLoopIterations: 128,
+		}
+		loader.Arm64ExceptionVectors = &helpers.Arm64ExceptionVectorConfig{
+			Table: timerVectorTable,
+			Align: arm64VectorEntrySize * arm64VectorEntryCount,
+		}
+
+		vm, err := dev.NewVirtualMachine(hv.SimpleVMConfig{
+			NumCPUs:          1,
+			MemSize:          64 * 1024 * 1024,
+			MemBase:          linuxMemoryBaseForArch(hv.ArchitectureARM64),
+			InterruptSupport: true,
+			VMLoader:         &loader,
+		})
+		if err != nil {
+			return fmt.Errorf("create virtual machine: %w", err)
+		}
+		defer vm.Close()
+
+		err = vm.Run(context.Background(), &loader)
+		if !errors.Is(err, hv.ErrVMHalted) {
+			return fmt.Errorf("run virtual machine: %w", err)
+		}
+
+		// Read counter from memory (offset relative to memory base)
+		counterBuf := make([]byte, 8)
+		counterOffset := arm64TimerCounterAddr
+		if _, err := vm.ReadAt(counterBuf, int64(counterOffset)); err != nil {
+			return fmt.Errorf("read counter: %w", err)
+		}
+		counter := binary.LittleEndian.Uint64(counterBuf)
+
+		if counter != 1 {
+			return fmt.Errorf("timer interrupt counter: got %d, want 1", counter)
+		}
+
+		return nil
+	}); err != nil {
+		return err
+	}
+
 	if err := q.runVMTask("HLT Test", hv.ArchitectureRISCV64, ir.Program{
 		Entrypoint: "main",
 		Methods: map[string]ir.Method{
