@@ -65,17 +65,30 @@ func mmapFile(dest ir.Var, fd any, length any, prot int, flags int, offset any) 
 	}
 }
 
-func rebootOnError(val ir.Var, msg string) ir.Block {
+func rebootOnError(arch hv.CpuArchitecture, val ir.Var, msg string) ir.Block {
 	return ir.Block{
 		ir.If(ir.IsNegative(val), ir.Block{
 			ir.Printf(msg, ir.Op(ir.OpSub, ir.Int64(0), val)),
-			ir.Syscall(
-				defs.SYS_REBOOT,
-				linux.LINUX_REBOOT_MAGIC1,
-				linux.LINUX_REBOOT_MAGIC2,
-				linux.LINUX_REBOOT_CMD_RESTART,
-				ir.Int64(0),
-			),
+			func() ir.Fragment {
+				switch arch {
+				case hv.ArchitectureX86_64:
+					return ir.Syscall(defs.SYS_REBOOT,
+						linux.LINUX_REBOOT_MAGIC1,
+						linux.LINUX_REBOOT_MAGIC2,
+						linux.LINUX_REBOOT_CMD_RESTART,
+						ir.Int64(0),
+					)
+				case hv.ArchitectureARM64:
+					return ir.Syscall(defs.SYS_REBOOT,
+						linux.LINUX_REBOOT_MAGIC1,
+						linux.LINUX_REBOOT_MAGIC2,
+						linux.LINUX_REBOOT_CMD_POWER_OFF,
+						ir.Int64(0),
+					)
+				default:
+					panic(fmt.Sprintf("unsupported architecture for reboot: %s", arch))
+				}
+			}(),
 		}),
 	}
 }
@@ -115,7 +128,7 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 				dataLen,
 				moduleParamArg,
 			)),
-			rebootOnError(resultVar, fmt.Sprintf("initx: failed to load module %s (errno=0x%%x)\n", mod.Name)),
+			rebootOnError(cfg.Arch, resultVar, fmt.Sprintf("initx: failed to load module %s (errno=0x%%x)\n", mod.Name)),
 			LogKmsg(fmt.Sprintf("initx: module %s ready\n", mod.Name)),
 		})
 	}
@@ -230,7 +243,7 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 
 		// open /dev/mem
 		openFile(ir.Var("memFd"), "/dev/mem", linux.O_RDWR|linux.O_SYNC),
-		rebootOnError(ir.Var("memFd"), "initx: failed to open /dev/mem (errno=0x%x)\n"),
+		rebootOnError(cfg.Arch, ir.Var("memFd"), "initx: failed to open /dev/mem (errno=0x%x)\n"),
 		LogKmsg("initx: opened /dev/mem\n"),
 
 		// map mailbox region
@@ -242,7 +255,7 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 			linux.MAP_SHARED,
 			ir.Int64(0xf000_0000),
 		),
-		rebootOnError(ir.Var("mailboxMem"), "initx: failed to map mailbox region (errno=0x%x)\n"),
+		rebootOnError(cfg.Arch, ir.Var("mailboxMem"), "initx: failed to map mailbox region (errno=0x%x)\n"),
 		LogKmsg("initx: mapped mailbox\n"),
 
 		// map config region
@@ -254,7 +267,7 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 			linux.MAP_SHARED,
 			ir.Int64(0xf000_3000),
 		),
-		rebootOnError(ir.Var("configMem"), "initx: failed to map config region (errno=0x%x)\n"),
+		rebootOnError(cfg.Arch, ir.Var("configMem"), "initx: failed to map config region (errno=0x%x)\n"),
 		LogKmsg("initx: mapped config region\n"),
 
 		// map anon a 4MB region r/w/x for copying binaries into
@@ -266,7 +279,7 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 			linux.MAP_PRIVATE|linux.MAP_ANONYMOUS,
 			ir.Int64(0),
 		),
-		rebootOnError(ir.Var("anonMem"), "initx: failed to map anonymous payload region (errno=0x%x)\n"),
+		rebootOnError(cfg.Arch, ir.Var("anonMem"), "initx: failed to map anonymous payload region (errno=0x%x)\n"),
 		LogKmsg("initx: mapped anon payload region\n"),
 
 		ir.DeclareLabel("loop", ir.Block{

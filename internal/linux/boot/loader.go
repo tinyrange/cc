@@ -41,7 +41,8 @@ const (
 	arm64UARTRegShift = 0
 	arm64UARTBaudRate = 115200
 
-	hpetBaseAddress = 0xFED00000
+	hpetBaseAddress          = 0xFED00000
+	hpetAlternateBaseAddress = 0xFED80000 // AMD alternate HPET address
 )
 
 const (
@@ -239,6 +240,11 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 		}
 	}
 
+	// DeviceTreeProvider allows any device to provide device tree nodes
+	type DeviceTreeProvider interface {
+		DeviceTreeNodes() ([]fdt.Node, error)
+	}
+
 	for _, dev := range l.Devices {
 		if vdev, ok := dev.(virtio.VirtioMMIODevice); ok {
 			params, err := vdev.GetLinuxCommandLineParam()
@@ -249,6 +255,14 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 			nodes, err := vdev.DeviceTreeNodes()
 			if err != nil {
 				return fmt.Errorf("get virtio mmio device tree nodes: %w", err)
+			}
+			virtioNodes = append(virtioNodes, nodes...)
+		}
+		// Also check for non-virtio devices that provide device tree nodes
+		if dtp, ok := dev.(DeviceTreeProvider); ok {
+			nodes, err := dtp.DeviceTreeNodes()
+			if err != nil {
+				return fmt.Errorf("get device tree nodes: %w", err)
 			}
 			virtioNodes = append(virtioNodes, nodes...)
 		}
@@ -436,7 +450,7 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	}
 
 	if setter != nil {
-		if err := vm.AddDevice(hpet.New(hpetBaseAddress, setter)); err != nil {
+		if err := vm.AddDevice(hpet.New(hpetBaseAddress, setter, hpetAlternateBaseAddress)); err != nil {
 			return fmt.Errorf("add HPET device: %w", err)
 		}
 	}
