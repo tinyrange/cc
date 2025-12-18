@@ -545,17 +545,17 @@ func (ns *NetStack) handleEthernetFrameWithReuse(frame []byte, releaseUnsafe boo
 		!isBroadcast(dst) &&
 		!macEqualUint64(dst, hostMACVal) &&
 		!macEqualUint64(dst, guestMACVal) {
-		expected := ""
-		if mac := macFromUint64(guestMACVal); len(mac) == 6 {
-			expected = mac.String()
-		}
-		slog.Info(
-			"raw: drop frame not addressed to us",
-			"src", src.String(),
-			"dst", dst.String(),
-			"expectedDst", expected,
-			"ethertype", etherType.String(),
-		)
+		// expected := ""
+		// if mac := macFromUint64(guestMACVal); len(mac) == 6 {
+		// 	expected = mac.String()
+		// }
+		// slog.Info(
+		// 	"raw: drop frame not addressed to us",
+		// 	"src", src.String(),
+		// 	"dst", dst.String(),
+		// 	"expectedDst", expected,
+		// 	"ethertype", etherType.String(),
+		// )
 		return nil
 	}
 
@@ -567,11 +567,11 @@ func (ns *NetStack) handleEthernetFrameWithReuse(frame []byte, releaseUnsafe boo
 	case etherTypeCustom:
 		return ns.handleCustom(src, payload)
 	default:
-		ns.log.Info(
-			"raw: drop unsupported ethertype",
-			"type",
-			etherType.String(),
-		)
+		// ns.log.Info(
+		// 	"raw: drop unsupported ethertype",
+		// 	"type",
+		// 	etherType.String(),
+		// )
 		return nil
 	}
 }
@@ -677,7 +677,7 @@ func (ns *NetStack) guestMACForTransmit() macAddr {
 ////////////////////////////////////////////////////////////////////////////////
 
 func (ns *NetStack) handleCustom(srcMAC net.HardwareAddr, payload []byte) error {
-	ns.log.Info(
+	ns.log.Debug(
 		"custom: handle custom packet",
 		"src", srcMAC.String(),
 		"payload", payload,
@@ -925,7 +925,7 @@ func (ns *NetStack) handleIPv4Internal(srcMAC net.HardwareAddr, payload []byte, 
 	case tcpProtocolNumber:
 		return ns.handleTCP(hdr, hdr.payload)
 	case icmpProtocol:
-		slog.Info("raw: handling icmp packet", "srcIP", hdr.src.String(), "dstIP", hdr.dst.String())
+		// slog.Info("raw: handling icmp packet", "srcIP", hdr.src.String(), "dstIP", hdr.dst.String())
 		return ns.handleICMP(hdr, hdr.payload)
 	default:
 		slog.Error("raw: drop unsupported ipv4 protocol", "proto", hdr.protocol)

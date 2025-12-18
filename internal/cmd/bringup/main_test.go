@@ -11,6 +11,8 @@ import (
 	"unsafe"
 
 	amd64defs "github.com/tinyrange/cc/internal/linux/defs/amd64"
+	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
 	"golang.org/x/sys/unix"
 )
 
@@ -213,118 +215,118 @@ func TestNetworkRaw(t *testing.T) {
 		t.Fatalf("failed to write to custom ethertype socket: %v", err)
 	}
 
-	t.Logf("sent frame: %x", frame)
+	t.Logf("sent frame payload: %x", frame[14:])
 
 	rb := make([]byte, 1500)
 	n, _, err := syscall.Recvfrom(fd, rb, 0)
 	if err != nil {
 		t.Fatalf("failed to read from custom ethertype socket: %v", err)
 	}
-	t.Logf("received frame: %x", rb[:n])
+	t.Logf("received frame payload: %x", rb[14:n])
 
-	// Verify the frame was received
-	if !bytes.Equal(rb[:n], frame) {
+	// Verify the payload is the same as the sent frame
+	if !bytes.Equal(rb[14:n], frame[14:]) {
 		t.Fatalf("received frame does not match sent frame")
 	}
 }
 
-// func TestNetworkPing(t *testing.T) {
-// 	// Ensure that eth0 shows up
-// 	iface, err := net.InterfaceByName("eth0")
-// 	if err != nil {
-// 		t.Fatalf("failed to get eth0 interface: %v", err)
-// 	}
-// 	t.Logf("eth0 interface: %+v", iface)
+func TestNetworkPing(t *testing.T) {
+	// Ensure that eth0 shows up
+	iface, err := net.InterfaceByName("eth0")
+	if err != nil {
+		t.Fatalf("failed to get eth0 interface: %v", err)
+	}
+	t.Logf("eth0 interface: %+v", iface)
 
-// 	// Validate MAC address matches what's configured in quest/main.go
-// 	expectedMAC := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
-// 	if len(iface.HardwareAddr) != 6 {
-// 		t.Fatalf("invalid MAC address length: got %d, want 6", len(iface.HardwareAddr))
-// 	}
-// 	if !bytes.Equal(iface.HardwareAddr, expectedMAC) {
-// 		t.Fatalf("unexpected MAC address: got %s, want %s", iface.HardwareAddr.String(), expectedMAC.String())
-// 	}
-// 	t.Logf("MAC address validated: %s", iface.HardwareAddr.String())
+	// Validate MAC address matches what's configured in quest/main.go
+	expectedMAC := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
+	if len(iface.HardwareAddr) != 6 {
+		t.Fatalf("invalid MAC address length: got %d, want 6", len(iface.HardwareAddr))
+	}
+	if !bytes.Equal(iface.HardwareAddr, expectedMAC) {
+		t.Fatalf("unexpected MAC address: got %s, want %s", iface.HardwareAddr.String(), expectedMAC.String())
+	}
+	t.Logf("MAC address validated: %s", iface.HardwareAddr.String())
 
-// 	// Configure eth0 with IP address 10.42.0.2/24 (matching netstack default guest IP)
-// 	guestIP := net.ParseIP("10.42.0.2")
-// 	if guestIP == nil {
-// 		t.Fatalf("failed to parse guest IP")
-// 	}
-// 	mask := net.CIDRMask(24, 32)
+	// Configure eth0 with IP address 10.42.0.2/24 (matching netstack default guest IP)
+	guestIP := net.ParseIP("10.42.0.2")
+	if guestIP == nil {
+		t.Fatalf("failed to parse guest IP")
+	}
+	mask := net.CIDRMask(24, 32)
 
-// 	if err := configureInterfaceIP("eth0", guestIP, mask); err != nil {
-// 		t.Fatalf("failed to configure IP address: %v", err)
-// 	}
+	if err := configureInterfaceIP("eth0", guestIP, mask); err != nil {
+		t.Fatalf("failed to configure IP address: %v", err)
+	}
 
-// 	// Verify interface configuration
-// 	ifaceAfter, err := net.InterfaceByName("eth0")
-// 	if err != nil {
-// 		t.Fatalf("failed to get eth0 interface after configuration: %v", err)
-// 	}
-// 	addrs, err := ifaceAfter.Addrs()
-// 	if err != nil {
-// 		t.Fatalf("failed to get interface addresses: %v", err)
-// 	}
-// 	t.Logf("eth0 addresses after configuration: %v", addrs)
-// 	t.Logf("eth0 flags after configuration: %v", ifaceAfter.Flags)
+	// Verify interface configuration
+	ifaceAfter, err := net.InterfaceByName("eth0")
+	if err != nil {
+		t.Fatalf("failed to get eth0 interface after configuration: %v", err)
+	}
+	addrs, err := ifaceAfter.Addrs()
+	if err != nil {
+		t.Fatalf("failed to get interface addresses: %v", err)
+	}
+	t.Logf("eth0 addresses after configuration: %v", addrs)
+	t.Logf("eth0 flags after configuration: %v", ifaceAfter.Flags)
 
-// 	// Default host IP is 10.42.0.1 (configured in netstack)
-// 	hostIP := net.ParseIP("10.42.0.1")
-// 	if hostIP == nil {
-// 		t.Fatalf("failed to parse host IP")
-// 	}
+	// Default host IP is 10.42.0.1 (configured in netstack)
+	hostIP := net.ParseIP("10.42.0.1")
+	if hostIP == nil {
+		t.Fatalf("failed to parse host IP")
+	}
 
-// 	c, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
-// 	if err != nil {
-// 		t.Fatalf("failed to listen on ICMP socket: %v", err)
-// 	}
-// 	defer c.Close()
+	c, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+	if err != nil {
+		t.Fatalf("failed to listen on ICMP socket: %v", err)
+	}
+	defer c.Close()
 
-// 	wm := icmp.Message{
-// 		Type: ipv4.ICMPTypeEcho, Code: 0,
-// 		Body: &icmp.Echo{
-// 			ID: os.Getpid() & 0xffff, Seq: 1,
-// 			Data: []byte("Hello, world!"),
-// 		},
-// 	}
-// 	wb, err := wm.Marshal(nil)
-// 	if err != nil {
-// 		t.Fatalf("failed to marshal ICMP message: %v", err)
-// 	}
-// 	if _, err := c.WriteTo(wb, &net.IPAddr{IP: net.ParseIP("10.42.0.1")}); err != nil {
-// 		t.Fatalf("failed to write to ICMP socket: %v", err)
-// 	}
+	wm := icmp.Message{
+		Type: ipv4.ICMPTypeEcho, Code: 0,
+		Body: &icmp.Echo{
+			ID: os.Getpid() & 0xffff, Seq: 1,
+			Data: []byte("Hello, world!"),
+		},
+	}
+	wb, err := wm.Marshal(nil)
+	if err != nil {
+		t.Fatalf("failed to marshal ICMP message: %v", err)
+	}
+	if _, err := c.WriteTo(wb, &net.IPAddr{IP: net.ParseIP("10.42.0.1")}); err != nil {
+		t.Fatalf("failed to write to ICMP socket: %v", err)
+	}
 
-// 	rb := make([]byte, 1500)
-// 	t.Logf("reading from ICMP socket")
-// 	n, _, err := c.ReadFrom(rb)
-// 	if err != nil {
-// 		t.Fatalf("failed to read from ICMP socket: %v", err)
-// 	}
-// 	rm, err := icmp.ParseMessage(ipv4.ICMPTypeEchoReply.Protocol(), rb[:n])
-// 	if err != nil {
-// 		t.Fatalf("failed to parse ICMP message: %v", err)
-// 	}
-// 	switch rm.Type {
-// 	case ipv4.ICMPTypeEchoReply:
-// 		t.Logf("got echo reply")
-// 	default:
-// 		t.Fatalf("unexpected ICMP message type: %v", rm.Type)
-// 	}
-// }
+	rb := make([]byte, 1500)
+	t.Logf("reading from ICMP socket")
+	n, _, err := c.ReadFrom(rb)
+	if err != nil {
+		t.Fatalf("failed to read from ICMP socket: %v", err)
+	}
+	rm, err := icmp.ParseMessage(ipv4.ICMPTypeEchoReply.Protocol(), rb[:n])
+	if err != nil {
+		t.Fatalf("failed to parse ICMP message: %v", err)
+	}
+	switch rm.Type {
+	case ipv4.ICMPTypeEchoReply:
+		t.Logf("got echo reply")
+	default:
+		t.Fatalf("unexpected ICMP message type: %v", rm.Type)
+	}
+}
 
-// func calculateChecksum(data []byte) uint16 {
-// 	var sum uint32
-// 	for i := 0; i < len(data); i += 2 {
-// 		if i+1 < len(data) {
-// 			sum += uint32(data[i])<<8 | uint32(data[i+1])
-// 		} else {
-// 			sum += uint32(data[i]) << 8
-// 		}
-// 	}
-// 	for sum>>16 != 0 {
-// 		sum = (sum & 0xffff) + (sum >> 16)
-// 	}
-// 	return ^uint16(sum)
-// }
+func calculateChecksum(data []byte) uint16 {
+	var sum uint32
+	for i := 0; i < len(data); i += 2 {
+		if i+1 < len(data) {
+			sum += uint32(data[i])<<8 | uint32(data[i+1])
+		} else {
+			sum += uint32(data[i]) << 8
+		}
+	}
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}

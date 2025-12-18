@@ -267,7 +267,7 @@ func (vn *Net) EnqueueRxPacket(packet []byte) error {
 		pendingAfter := len(vn.pendingRx)
 		delivered := pendingBefore + 1 - pendingAfter
 		if delivered > 0 {
-			slog.Info("virtio-net: delivered rx packet", "packet", packet)
+			// slog.Info("virtio-net: delivered rx packet", "packet", packet)
 		} else {
 			// Packet is stuck in pendingRx - log diagnostic info
 			q := vn.device.queue(netQueueReceive)
@@ -329,7 +329,7 @@ func (vn *Net) processTransmitQueue(dev device, q *queue) error {
 			release()
 			return err
 		}
-		slog.Info("virtio-net: preparing tx packet", "hdr", hdr, "packet", packet)
+		// slog.Info("virtio-net: preparing tx packet", "hdr", hdr, "packet", packet)
 		if err := vn.prepareTxPacket(hdr, packet); err != nil {
 			release()
 			return err
@@ -799,7 +799,9 @@ func (vn *Net) fillRxDescriptorChain(dev device, descTable []byte, q *queue, hea
 		if err != nil {
 			return 0, false, err
 		}
+		var bytesWritten int
 		if i == 0 {
+			// First descriptor: zero header, write packet data, set buffersUsed
 			for j := 0; j < netHeaderSize && j < len(data); j++ {
 				data[j] = 0
 			}
@@ -808,11 +810,25 @@ func (vn *Net) fillRxDescriptorChain(dev device, descTable []byte, q *queue, hea
 			if len(data) >= 12 {
 				binary.LittleEndian.PutUint16(data[10:12], buffersUsed)
 			}
+			// Write back at least netHeaderSize bytes (to include buffersUsed field),
+			// plus any packet data we copied
+			bytesWritten = netHeaderSize + copyLen
+			if bytesWritten > len(data) {
+				bytesWritten = len(data)
+			}
 		} else {
+			// Subsequent descriptors: write packet data
 			copyLen := copy(data, bytesRemaining)
 			bytesRemaining = bytesRemaining[copyLen:]
+			bytesWritten = copyLen
 			if copyLen > 0 {
 				buffersUsed++
+			}
+		}
+		// Write the modified data back to guest memory
+		if bytesWritten > 0 {
+			if err := dev.writeGuest(desc.addr, data[:bytesWritten]); err != nil {
+				return 0, false, fmt.Errorf("write guest memory for rx descriptor %d: %w", i, err)
 			}
 		}
 		if len(bytesRemaining) == 0 {
