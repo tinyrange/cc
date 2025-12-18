@@ -1,6 +1,6 @@
 module github.com/tinyrange/cc
 
-go 1.24.2
+go 1.25.5
 
 require (
 	github.com/ebitengine/purego v0.7.1
