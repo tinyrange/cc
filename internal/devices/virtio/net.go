@@ -35,9 +35,9 @@ const (
 	etherTypeIPv4 = 0x0800
 	etherTypeIPv6 = 0x86dd
 
-	virtioNetFeatureMacBit       = 5
-	virtioNetFeatureStatusBit    = 16
-	virtioFeatureEventIdx        = uint64(1) << virtioRingFeatureEventIdxBit
+	virtioNetFeatureMacBit    = 5
+	virtioNetFeatureStatusBit = 16
+	virtioFeatureEventIdx     = uint64(1) << virtioRingFeatureEventIdxBit
 
 	virtioNetStatusLinkUp = 1
 
@@ -223,21 +223,28 @@ func (vn *Net) ReadConfig(_ device, offset uint64) (uint32, bool, error) {
 	if cfg >= VIRTIO_MMIO_CONFIG {
 		cfg -= VIRTIO_MMIO_CONFIG
 	}
-	switch cfg {
-	case 0:
-		return uint32(vn.mac[0]) |
-			uint32(vn.mac[1])<<8 |
-			uint32(vn.mac[2])<<16 |
-			uint32(vn.mac[3])<<24, true, nil
-	case 4:
-		status := uint16(0)
-		if vn.linkUp {
-			status = 1
-		}
-		return uint32(vn.mac[4]) | uint32(vn.mac[5])<<8 | uint32(status)<<16, true, nil
-	default:
+
+	// Build config space: 6 bytes MAC + 2 bytes status
+	var configSpace [8]byte
+	copy(configSpace[0:6], vn.mac)
+	if vn.linkUp {
+		configSpace[6] = 1 // status low byte
+	}
+	// configSpace[7] = 0 // status high byte (already zero)
+
+	// Return 4-byte window at requested offset
+	idx := int(cfg)
+	if idx < 0 || idx >= len(configSpace) {
 		return 0, false, nil
 	}
+
+	var w [4]byte
+	for i := 0; i < 4; i++ {
+		if idx+i < len(configSpace) {
+			w[i] = configSpace[idx+i]
+		}
+	}
+	return binary.LittleEndian.Uint32(w[:]), true, nil
 }
 
 func (vn *Net) WriteConfig(device, uint64, uint32) (bool, error) {
