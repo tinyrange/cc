@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"sync"
 
@@ -257,10 +258,39 @@ func (vn *Net) EnqueueRxPacket(packet []byte) error {
 	if vn.rxDisabled {
 		return io.EOF
 	}
+	pendingBefore := len(vn.pendingRx)
 	vn.pendingRx = append(vn.pendingRx, append([]byte(nil), packet...))
 	if vn.device != nil {
 		if err := vn.processReceiveQueueLocked(vn.device, vn.device.queue(netQueueReceive)); err != nil {
 			return err
+		}
+		pendingAfter := len(vn.pendingRx)
+		delivered := pendingBefore + 1 - pendingAfter
+		if delivered > 0 {
+			slog.Info("virtio-net: delivered rx packet", "packet", packet)
+		} else {
+			// Packet is stuck in pendingRx - log diagnostic info
+			q := vn.device.queue(netQueueReceive)
+			if q != nil && q.ready {
+				_, avail, _, err := vn.device.queuePointers(q)
+				if err == nil {
+					availIdx := binary.LittleEndian.Uint16(avail[2:4])
+					slog.Warn("virtio-net: rx packet queued (no buffers available)",
+						"pending", len(vn.pendingRx),
+						"lastAvailIdx", q.lastAvailIdx,
+						"availIdx", availIdx,
+						"queueReady", q.ready,
+						"queueSize", q.size)
+				} else {
+					slog.Warn("virtio-net: rx packet queued (no buffers available)",
+						"pending", len(vn.pendingRx),
+						"err", err)
+				}
+			} else {
+				slog.Warn("virtio-net: rx packet queued (queue not ready)",
+					"pending", len(vn.pendingRx),
+					"queueReady", q != nil && q.ready)
+			}
 		}
 	}
 	return nil
@@ -299,6 +329,7 @@ func (vn *Net) processTransmitQueue(dev device, q *queue) error {
 			release()
 			return err
 		}
+		slog.Info("virtio-net: preparing tx packet", "hdr", hdr, "packet", packet)
 		if err := vn.prepareTxPacket(hdr, packet); err != nil {
 			release()
 			return err
@@ -341,6 +372,15 @@ func (vn *Net) processReceiveQueue(dev device, q *queue) error {
 
 func (vn *Net) processReceiveQueueLocked(dev device, q *queue) error {
 	if q == nil || !q.ready || q.size == 0 {
+		if len(vn.pendingRx) > 0 {
+			queueSize := uint16(0)
+			queueReady := false
+			if q != nil {
+				queueSize = q.size
+				queueReady = q.ready
+			}
+			slog.Debug("virtio-net: rx queue not ready", "pending", len(vn.pendingRx), "ready", queueReady, "size", queueSize)
+		}
 		return nil
 	}
 	if len(vn.pendingRx) == 0 {
@@ -358,6 +398,14 @@ func (vn *Net) processReceiveQueueLocked(dev device, q *queue) error {
 
 	var packetIndex int
 	var processed uint16
+
+	// Log diagnostic info if we have pending packets but no available buffers
+	if q.lastAvailIdx == availIdx && len(vn.pendingRx) > 0 {
+		slog.Debug("virtio-net: rx queue has no available buffers",
+			"pending", len(vn.pendingRx),
+			"lastAvailIdx", q.lastAvailIdx,
+			"availIdx", availIdx)
+	}
 
 	for q.lastAvailIdx != availIdx && packetIndex < len(vn.pendingRx) {
 		packet := vn.pendingRx[packetIndex]

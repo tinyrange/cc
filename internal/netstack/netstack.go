@@ -45,18 +45,50 @@ import (
 // Debug toggle. When true, emits verbose logs from key code paths.
 const DEBUG = false
 
+type etherType uint16
+
 // EtherTypes we care about.
 const (
-	etherTypeIPv4 = 0x0800
-	etherTypeARP  = 0x0806
+	etherTypeIPv4   etherType = 0x0800
+	etherTypeIPv6   etherType = 0x86DD
+	etherTypeARP    etherType = 0x0806
+	etherTypeCustom etherType = 0x1234
 )
+
+func (e etherType) String() string {
+	switch e {
+	case etherTypeIPv4:
+		return "ipv4"
+	case etherTypeIPv6:
+		return "ipv6"
+	case etherTypeARP:
+		return "arp"
+	case etherTypeCustom:
+		return "custom"
+	}
+	return fmt.Sprintf("unknown ether type 0x%04x", uint16(e))
+}
+
+type protocolNumber uint8
 
 // Basic protocol numbers for IPv4's Protocol field.
 const (
-	tcpProtocolNumber = 6
-	udpProtocolNumber = 17
-	icmpProtocol      = 1
+	tcpProtocolNumber protocolNumber = 6
+	udpProtocolNumber protocolNumber = 17
+	icmpProtocol      protocolNumber = 1
 )
+
+func (p protocolNumber) String() string {
+	switch p {
+	case tcpProtocolNumber:
+		return "tcp"
+	case udpProtocolNumber:
+		return "udp"
+	case icmpProtocol:
+		return "icmp"
+	}
+	return fmt.Sprintf("unknown protocol 0x%02x", uint8(p))
+}
 
 // ARP constants (Ethernet + IPv4).
 const (
@@ -297,7 +329,7 @@ func (ns *NetStack) Close() error {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			if err := srv.Shutdown(ctx); err != nil &&
 				!errors.Is(err, http.ErrServerClosed) {
-				ns.log.Debug("raw: debug http shutdown", "err", err)
+				slog.Error("raw: debug http shutdown", "err", err)
 			}
 			cancel()
 		}
@@ -500,7 +532,7 @@ func (ns *NetStack) handleEthernetFrame(frame []byte) error {
 func (ns *NetStack) handleEthernetFrameWithReuse(frame []byte, releaseUnsafe bool) error {
 	dst := net.HardwareAddr(frame[:6])
 	src := net.HardwareAddr(frame[6:12])
-	etherType := binary.BigEndian.Uint16(frame[12:14])
+	etherType := etherType(binary.BigEndian.Uint16(frame[12:14]))
 	payload := frame[14:]
 
 	ns.recordGuestMAC(src)
@@ -517,12 +549,12 @@ func (ns *NetStack) handleEthernetFrameWithReuse(frame []byte, releaseUnsafe boo
 		if mac := macFromUint64(guestMACVal); len(mac) == 6 {
 			expected = mac.String()
 		}
-		slog.Debug(
+		slog.Info(
 			"raw: drop frame not addressed to us",
 			"src", src.String(),
 			"dst", dst.String(),
 			"expectedDst", expected,
-			"ethertype", fmt.Sprintf("0x%04x", etherType),
+			"ethertype", etherType.String(),
 		)
 		return nil
 	}
@@ -532,11 +564,13 @@ func (ns *NetStack) handleEthernetFrameWithReuse(frame []byte, releaseUnsafe boo
 		return ns.handleARP(src, payload)
 	case etherTypeIPv4:
 		return ns.handleIPv4Internal(src, payload, releaseUnsafe)
+	case etherTypeCustom:
+		return ns.handleCustom(src, payload)
 	default:
-		ns.log.Debug(
+		ns.log.Info(
 			"raw: drop unsupported ethertype",
 			"type",
-			fmt.Sprintf("0x%04x", etherType),
+			etherType.String(),
 		)
 		return nil
 	}
@@ -639,6 +673,26 @@ func (ns *NetStack) guestMACForTransmit() macAddr {
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// Custom: custom protocol handler
+////////////////////////////////////////////////////////////////////////////////
+
+func (ns *NetStack) handleCustom(srcMAC net.HardwareAddr, payload []byte) error {
+	ns.log.Info(
+		"custom: handle custom packet",
+		"src", srcMAC.String(),
+		"payload", payload,
+	)
+
+	// Respond with the same packet but with the destination MAC changed to the source MAC
+	frame := make([]byte, ethernetHeaderLen+len(payload))
+	copy(frame[0:6], srcMAC)
+	copy(frame[6:12], macFromUint64(macAddr(ns.hostMAC.Load())))
+	binary.BigEndian.PutUint16(frame[12:14], uint16(etherTypeCustom))
+	copy(frame[ethernetHeaderLen:], payload)
+	return ns.sendFrame(frame)
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // ARP (Address Resolution Protocol).
 ////////////////////////////////////////////////////////////////////////////////
 
@@ -689,7 +743,7 @@ func (ns *NetStack) sendARPReply(
 	copy(frame[0:6], dstMAC)
 	host := macAddr(ns.hostMAC.Load())
 	writeMAC(frame[6:12], host)
-	binary.BigEndian.PutUint16(frame[12:14], etherTypeARP)
+	binary.BigEndian.PutUint16(frame[12:14], uint16(etherTypeARP))
 
 	payload := frame[ethernetHeaderLen:]
 	binary.BigEndian.PutUint16(payload[0:2], arpHardwareEthernet)
@@ -721,7 +775,7 @@ type ipv4Header struct {
 	id       uint16
 	flags    uint16 // includes flags and fragment offset
 	ttl      uint8
-	protocol uint8
+	protocol protocolNumber
 	checksum uint16
 	src      net.IP
 	dst      net.IP
@@ -756,7 +810,7 @@ func parseIPv4Header(data []byte) (ipv4Header, error) {
 		id:       binary.BigEndian.Uint16(data[4:6]),
 		flags:    binary.BigEndian.Uint16(data[6:8]),
 		ttl:      data[8],
-		protocol: data[9],
+		protocol: protocolNumber(data[9]),
 		checksum: binary.BigEndian.Uint16(data[10:12]),
 		src:      net.IP(data[12:16]),
 		dst:      net.IP(data[16:20]),
@@ -773,7 +827,7 @@ func parseIPv4Header(data []byte) (ipv4Header, error) {
 // protocol and payload.
 func buildIPv4Packet(
 	src, dst net.IP,
-	protocol uint8,
+	protocol protocolNumber,
 	payload []byte,
 ) []byte {
 	packet := make([]byte, ipv4HeaderLen+len(payload))
@@ -785,7 +839,7 @@ func buildIPv4Packet(
 func buildIPv4PacketInto(
 	buf []byte,
 	src, dst net.IP,
-	protocol uint8,
+	protocol protocolNumber,
 	payload []byte,
 ) []byte {
 	totalLen := ipv4HeaderLen + len(payload)
@@ -800,19 +854,19 @@ func buildIPv4PacketInto(
 	return packet
 }
 
-func buildEthernetHeaderInto(buf []byte, dstMac, srcMac macAddr, etherType uint16) {
+func buildEthernetHeaderInto(buf []byte, dstMac, srcMac macAddr, etherType etherType) {
 	if len(buf) < ethernetHeaderLen {
 		panic("buildEthernetHeaderInto: buffer too small")
 	}
 	writeMAC(buf[0:6], dstMac)
 	writeMAC(buf[6:12], srcMac)
-	binary.BigEndian.PutUint16(buf[12:14], etherType)
+	binary.BigEndian.PutUint16(buf[12:14], uint16(etherType))
 }
 
 func buildIPv4HeaderInto(
 	packet []byte,
 	src, dst net.IP,
-	protocol uint8,
+	protocol protocolNumber,
 	payloadLen int,
 ) {
 	if len(packet) < ipv4HeaderLen {
@@ -826,7 +880,7 @@ func buildIPv4HeaderInto(
 	binary.BigEndian.PutUint16(packet[4:6], 0) // ID
 	binary.BigEndian.PutUint16(packet[6:8], 0) // Flags/FragOff
 	packet[8] = 64                             // TTL
-	packet[9] = protocol
+	packet[9] = byte(protocol)
 	copy(packet[12:16], src.To4())
 	copy(packet[16:20], dst.To4())
 
@@ -848,11 +902,6 @@ func ipv4Checksum(data []byte) uint16 {
 	return ^uint16(sum)
 }
 
-// handleIPv4 demuxes payload to UDP/TCP/ICMP handlers if destined to us.
-func (ns *NetStack) handleIPv4(srcMAC net.HardwareAddr, payload []byte) error {
-	return ns.handleIPv4Internal(srcMAC, payload, false)
-}
-
 func (ns *NetStack) handleIPv4Internal(srcMAC net.HardwareAddr, payload []byte, releaseUnsafe bool) error {
 	hdr, err := parseIPv4Header(payload)
 	if err != nil {
@@ -862,7 +911,7 @@ func (ns *NetStack) handleIPv4Internal(srcMAC net.HardwareAddr, payload []byte, 
 	// Only accept unicast addressed to our host or service IPs.
 	if !ipEqual(hdr.dst.To4(), ns.hostIPv4[:]) &&
 		!ipEqual(hdr.dst.To4(), ns.serviceIPv4[:]) {
-		slog.Debug(
+		slog.Error(
 			"raw: drop ipv4 packet not addressed to us",
 			"srcIP", hdr.src.String(),
 			"dstIP", hdr.dst.String(),
@@ -876,9 +925,10 @@ func (ns *NetStack) handleIPv4Internal(srcMAC net.HardwareAddr, payload []byte, 
 	case tcpProtocolNumber:
 		return ns.handleTCP(hdr, hdr.payload)
 	case icmpProtocol:
+		slog.Info("raw: handling icmp packet", "srcIP", hdr.src.String(), "dstIP", hdr.dst.String())
 		return ns.handleICMP(hdr, hdr.payload)
 	default:
-		ns.log.Debug("raw: drop unsupported ipv4 protocol", "proto", hdr.protocol)
+		slog.Error("raw: drop unsupported ipv4 protocol", "proto", hdr.protocol)
 		return nil
 	}
 }
@@ -902,7 +952,7 @@ func (ns *NetStack) handleICMP(h ipv4Header, payload []byte) error {
 	calculatedChecksum := checksum(payload)
 	binary.BigEndian.PutUint16(payload[2:4], receivedChecksum) // Restore original
 	if receivedChecksum != calculatedChecksum {
-		ns.log.Debug("raw: drop icmp packet with invalid checksum",
+		slog.Error("raw: drop icmp packet with invalid checksum",
 			"received", fmt.Sprintf("0x%04x", receivedChecksum),
 			"calculated", fmt.Sprintf("0x%04x", calculatedChecksum))
 		return nil
@@ -929,7 +979,7 @@ func (ns *NetStack) sendICMP(src, dst net.IP, payload []byte) error {
 	frame := make([]byte, ethernetHeaderLen+len(packet))
 	writeMAC(frame[0:6], dstMAC)
 	writeMAC(frame[6:12], macAddr(ns.hostMAC.Load()))
-	binary.BigEndian.PutUint16(frame[12:14], etherTypeIPv4)
+	binary.BigEndian.PutUint16(frame[12:14], uint16(etherTypeIPv4))
 	copy(frame[ethernetHeaderLen:], packet)
 	return ns.sendFrame(frame)
 }
@@ -969,7 +1019,7 @@ func (ns *NetStack) handleUDPWithReuse(h ipv4Header, payload []byte, releaseUnsa
 
 	v, ok := ns.udpSockets.Load(dstPort)
 	if !ok {
-		slog.Debug("raw: drop udp packet not addressed to us",
+		slog.Error("raw: drop udp packet not addressed to us",
 			"srcIP", h.src.String(),
 			"srcPort", srcPort,
 			"dstPort", dstPort,
@@ -1797,7 +1847,7 @@ func (ns *NetStack) sendTCPPacket(
 	}
 	writeMAC(frame[0:6], dstMAC)
 	writeMAC(frame[6:12], macAddr(ns.hostMAC.Load()))
-	binary.BigEndian.PutUint16(frame[12:14], etherTypeIPv4)
+	binary.BigEndian.PutUint16(frame[12:14], uint16(etherTypeIPv4))
 	copy(frame[ethernetHeaderLen:], ip)
 	putIPv4PacketBuffer(ip)
 
@@ -1855,7 +1905,7 @@ func (ns *NetStack) startServiceProxy(conn *tcpConn) {
 		}
 		outbound, err := net.DialTCP("tcp", nil, addr)
 		if err != nil {
-			ns.log.Warn(
+			slog.Warn(
 				"raw: service proxy dial failed",
 				"port", conn.key.dstPort,
 				"err", err,
@@ -1869,7 +1919,7 @@ func (ns *NetStack) startServiceProxy(conn *tcpConn) {
 		if err := proxyConn(outbound, conn, 64*1024); err != nil &&
 			!errors.Is(err, io.EOF) &&
 			!errors.Is(err, net.ErrClosed) {
-			ns.log.Debug("raw: service proxy", "err", err)
+			slog.Error("raw: service proxy", "err", err)
 		}
 	}()
 }
@@ -2269,7 +2319,7 @@ func checksum(data []byte) uint16 {
 // pass 4-byte addresses.
 func pseudoHeaderChecksum(
 	src, dst net.IP,
-	protocol uint8,
+	protocol protocolNumber,
 	length int,
 ) uint32 {
 	sum := uint32(0)
