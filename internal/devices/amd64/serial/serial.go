@@ -250,7 +250,6 @@ func (s *Serial16550) SupportsPollDevice() *chipset.PollDevice {
 // Poll implements chipset.PollHandler for async TX/RX.
 func (s *Serial16550) Poll(ctx context.Context) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	// Process buffered input (non-blocking)
 	if len(s.inputPending) > 0 && s.rxFIFOCount < fifoSize {
@@ -261,11 +260,48 @@ func (s *Serial16550) Poll(ctx context.Context) error {
 		}
 	}
 
+	// If no input goroutine is running and we have an input reader,
+	// try reading directly (for test scenarios where Init() hasn't been called)
+	var readBytes []byte
+	if s.inputStop == nil && s.in != nil && s.rxFIFOCount < fifoSize {
+		// Release lock before blocking I/O
+		s.mu.Unlock()
+
+		// Try to read one byte non-blocking
+		// For test readers that don't block, this will work fine
+		// For blocking readers, we set a deadline to make it non-blocking
+		if deadlineSetter, ok := s.in.(interface{ SetReadDeadline(time.Time) error }); ok {
+			_ = deadlineSetter.SetReadDeadline(time.Now())
+		}
+		buf := make([]byte, 1)
+		n, _ := s.in.Read(buf)
+		if n > 0 {
+			readBytes = buf[:n]
+		}
+		// Reset deadline if supported
+		if deadlineSetter, ok := s.in.(interface{ SetReadDeadline(time.Time) error }); ok {
+			_ = deadlineSetter.SetReadDeadline(time.Time{})
+		}
+
+		// Re-acquire lock
+		s.mu.Lock()
+	}
+
+	// Process any bytes read directly from input
+	if len(readBytes) > 0 {
+		for _, b := range readBytes {
+			if s.rxFIFOCount < fifoSize {
+				s.rxByteLocked(b)
+			}
+		}
+	}
+
 	// Process TX FIFO
 	if s.txFIFOCount > 0 {
 		s.processTXFIFOLocked()
 	}
 
+	s.mu.Unlock()
 	return nil
 }
 
