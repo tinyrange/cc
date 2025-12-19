@@ -84,7 +84,7 @@ func buildARPRequest(guestIP, targetIP net.IP) []byte {
 	frame := make([]byte, 14+28)
 	copy(frame[0:6], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
 	copy(frame[6:12], testGuestMAC)
-	binary.BigEndian.PutUint16(frame[12:14], etherTypeARP)
+	binary.BigEndian.PutUint16(frame[12:14], uint16(etherTypeARP))
 
 	payload := frame[14:]
 	binary.BigEndian.PutUint16(payload[0:2], arpHardwareEthernet)
@@ -115,7 +115,7 @@ func buildICMPEchoRequest(hostIP, guestIP net.IP) []byte {
 	frame := make([]byte, 14+len(ip))
 	copy(frame[0:6], testHostMAC)
 	copy(frame[6:12], testGuestMAC)
-	binary.BigEndian.PutUint16(frame[12:14], etherTypeIPv4)
+	binary.BigEndian.PutUint16(frame[12:14], uint16(etherTypeIPv4))
 	copy(frame[14:], ip)
 	return frame
 }
@@ -132,7 +132,7 @@ func buildUDPFrame(hostIP, guestIP net.IP, hostPort, guestPort uint16, payload [
 	frame := make([]byte, 14+len(ip))
 	copy(frame[0:6], testHostMAC)
 	copy(frame[6:12], testGuestMAC)
-	binary.BigEndian.PutUint16(frame[12:14], etherTypeIPv4)
+	binary.BigEndian.PutUint16(frame[12:14], uint16(etherTypeIPv4))
 	copy(frame[14:], ip)
 	return frame
 }
@@ -157,7 +157,7 @@ func buildTCPFrame(hostIP, guestIP net.IP, hostPort, guestPort uint16, seq, ack 
 	frame := make([]byte, 14+len(ip))
 	copy(frame[0:6], testHostMAC)
 	copy(frame[6:12], testGuestMAC)
-	binary.BigEndian.PutUint16(frame[12:14], etherTypeIPv4)
+	binary.BigEndian.PutUint16(frame[12:14], uint16(etherTypeIPv4))
 	copy(frame[14:], ip)
 	return frame
 }
@@ -192,7 +192,7 @@ func TestARPReply(t *testing.T) {
 	if !bytes.Equal(src, testHostMAC) {
 		t.Fatalf("unexpected src mac %s", src)
 	}
-	if ethType != etherTypeARP {
+	if etherType(ethType) != etherTypeARP {
 		t.Fatalf("unexpected ethertype %#04x", ethType)
 	}
 	op := binary.BigEndian.Uint16(payload[6:8])
@@ -220,7 +220,7 @@ func TestICMPEchoReply(t *testing.T) {
 	if !bytes.Equal(src, testHostMAC) {
 		t.Fatalf("unexpected src mac %s", src)
 	}
-	if ethType != etherTypeIPv4 {
+	if etherType(ethType) != etherTypeIPv4 {
 		t.Fatalf("unexpected ethertype %#04x", ethType)
 	}
 	ipHdr, err := parseIPv4Header(payload)
@@ -302,7 +302,7 @@ func TestUDPInboundAndOutbound(t *testing.T) {
 	if !bytes.Equal(dst, testGuestMAC) || !bytes.Equal(src, testHostMAC) {
 		t.Fatalf("unexpected macs dst=%s src=%s", dst, src)
 	}
-	if ethType != etherTypeIPv4 {
+	if etherType(ethType) != etherTypeIPv4 {
 		t.Fatalf("unexpected ethertype %#04x", ethType)
 	}
 
