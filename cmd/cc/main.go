@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -39,6 +42,14 @@ func main() {
 	}
 }
 
+type fixCrlf struct {
+	w io.Writer
+}
+
+func (f *fixCrlf) Write(p []byte) (n int, err error) {
+	return f.w.Write(bytes.ReplaceAll(p, []byte{'\n'}, []byte{'\r', '\n'}))
+}
+
 func run() error {
 	cacheDir := flag.String("cache-dir", "", "Cache directory (default: ~/.config/cc/)")
 	cpus := flag.Int("cpus", 1, "Number of vCPUs")
@@ -61,7 +72,15 @@ func run() error {
 	flag.Parse()
 
 	if *debug {
-		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+		slog.SetDefault(slog.New(slog.NewTextHandler(
+			&fixCrlf{w: os.Stderr},
+			&slog.HandlerOptions{Level: slog.LevelDebug},
+		)))
+	} else {
+		slog.SetDefault(slog.New(slog.NewTextHandler(
+			&fixCrlf{w: os.Stderr},
+			&slog.HandlerOptions{Level: slog.LevelInfo},
+		)))
 	}
 
 	if *cpuprofile != "" {
@@ -183,6 +202,11 @@ func run() error {
 	// Add network device if enabled
 	if *network {
 		backend := netstack.New(slog.Default())
+
+		if err := backend.StartDNSServer(); err != nil {
+			return fmt.Errorf("start DNS server: %w", err)
+		}
+		defer backend.StopDNSServer()
 
 		mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
 
@@ -581,6 +605,14 @@ func lookPath(fs *oci.ContainerFS, pathEnv string, workDir string, file string) 
 	return "", fmt.Errorf("executable %q not found in PATH", file)
 }
 
+func ipToUint32(addr string) uint32 {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return 0
+	}
+	return binary.BigEndian.Uint32(ip.To4())
+}
+
 func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, enableNetwork bool) *ir.Program {
 	errLabel := ir.Label("__cc_error")
 	errVar := ir.Var("__cc_errno")
@@ -689,17 +721,22 @@ func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, e
 
 	// Configure network interface if networking is enabled
 	if enableNetwork {
-		// Configure eth0 with IP 10.0.2.15/24 (common QEMU default)
-		// IP: 10.0.2.15 = 0x0a00020f
-		// Mask: 255.255.255.0 = 0xffffff00
+		// Configure eth0 with IP 10.42.0.2/24
+		// IP: 10.42.0.2
+		ip := ipToUint32("10.42.0.2")
+		// Gateway: 10.42.0.1
+		gatewayIp := "10.42.0.1"
+		gateway := ipToUint32(gatewayIp)
+		// Mask: 255.255.255.0
+		mask := ipToUint32("255.255.255.0")
 		main = append(main,
-			initx.ConfigureInterface("eth0", 0x0a00020f, 0xffffff00, errLabel, errVar),
+			initx.ConfigureInterface("eth0", ip, mask, errLabel, errVar),
 
-			// Add default route via 10.0.2.2 (gateway) on eth0
-			initx.AddDefaultRoute("eth0", 0x0a000202, errLabel, errVar),
+			// Add default route via gateway on eth0
+			initx.AddDefaultRoute("eth0", gateway, errLabel, errVar),
 
-			// Set /etc/resolv.conf to use 10.0.2.2 as DNS server
-			initx.SetResolvConf("10.0.2.2", errLabel, errVar),
+			// Set /etc/resolv.conf to use DNS server
+			initx.SetResolvConf(gatewayIp, errLabel, errVar),
 		)
 	}
 
