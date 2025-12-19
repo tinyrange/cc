@@ -705,38 +705,108 @@ func copyStringToSlot(slot ir.StackSlot, s string) ir.Fragment {
 	return ir.Block(frags)
 }
 
-func AddDefaultRoute(gateway uint32, errLabel ir.Label, errVar ir.Var) ir.Fragment {
-	// Build netlink message
-	nlMsg := make([]byte, 36)
+// GetInterfaceIndex gets the interface index for a given interface name using SIOCGIFINDEX.
+// Returns the ifindex in errVar on success, negative errno on failure.
+func GetInterfaceIndex(ifName string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
+	return ir.WithStackSlot(ir.StackSlotConfig{
+		Size: 40, // sizeof(struct ifreq)
+		Body: func(slot ir.StackSlot) ir.Fragment {
+			fd := nextHelperVar("ifindex_fd")
+			ptr := nextHelperVar("ifindex_ptr")
+			ioctlErr := nextHelperVar("ifindex_ioctl_err")
+
+			return ir.Block{
+				ir.Assign(fd, ir.Syscall(defs.SYS_SOCKET, ir.Int64(linux.AF_INET), ir.Int64(linux.SOCK_DGRAM), ir.Int64(0))),
+				ir.Assign(errVar, fd),
+				ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
+
+				ir.Assign(ptr, slot.Pointer()),
+
+				// Zero out entire ifreq structure
+				ir.Assign(slot.At(0), ir.Int64(0)),
+				ir.Assign(slot.At(8), ir.Int64(0)),
+				ir.Assign(slot.At(16), ir.Int64(0)),
+				ir.Assign(slot.At(24), ir.Int64(0)),
+				ir.Assign(slot.At(32), ir.Int64(0)),
+
+				// Copy interface name to ifreq.ifrn_name (offset 0-15)
+				copyStringToSlot(slot, ifName),
+
+				// Get ifindex via SIOCGIFINDEX - result is stored at offset 16 (ifr_ifindex)
+				ir.Assign(ioctlErr, ir.Syscall(defs.SYS_IOCTL, fd, ir.Int64(linux.SIOCGIFINDEX), ptr)),
+				ir.Assign(errVar, ioctlErr),
+				ir.If(ir.IsNegative(ioctlErr), ir.Block{
+					ir.Syscall(defs.SYS_CLOSE, fd),
+					ir.Goto(errLabel),
+				}),
+
+				// Read ifindex from offset 16 (ifr_ifindex is int32)
+				ir.Assign(errVar, slot.At(16)),
+				ir.Syscall(defs.SYS_CLOSE, fd),
+			}
+		},
+	})
+}
+
+func AddDefaultRoute(ifName string, gateway uint32, errLabel ir.Label, errVar ir.Var) ir.Fragment {
+	// Build netlink message with RTA_GATEWAY and RTA_OIF
+	// Message structure:
+	// - nlmsghdr (16 bytes): len, type, flags, seq, pid
+	// - rtmsg (12 bytes): family, dst_len, src_len, tos, table, protocol, scope, type, flags
+	// - RTA_OIF (8 bytes): len, type, ifindex (uint32)
+	// - RTA_GATEWAY (8 bytes): len, type, gateway (uint32, network byte order)
+	// Total: 16 + 12 + 8 + 8 = 44 bytes
+	nlMsg := make([]byte, 44)
 
 	// nlmsghdr
-	binary.LittleEndian.PutUint32(nlMsg[0:4], 36)                                                                      // len
-	binary.LittleEndian.PutUint16(nlMsg[4:6], linux.RTM_NEWROUTE)                                                      // type
-	binary.LittleEndian.PutUint16(nlMsg[6:8], linux.NLM_F_REQUEST|linux.NLM_F_CREATE|linux.NLM_F_EXCL|linux.NLM_F_ACK) // flags
-	binary.LittleEndian.PutUint32(nlMsg[8:12], 0)                                                                      // seq
-	binary.LittleEndian.PutUint32(nlMsg[12:16], 0)                                                                     // pid
+	binary.LittleEndian.PutUint32(nlMsg[0:4], 44)                                                                         // len
+	binary.LittleEndian.PutUint16(nlMsg[4:6], linux.RTM_NEWROUTE)                                                         // type
+	binary.LittleEndian.PutUint16(nlMsg[6:8], linux.NLM_F_REQUEST|linux.NLM_F_CREATE|linux.NLM_F_REPLACE|linux.NLM_F_ACK) // flags (REPLACE for idempotency)
+	binary.LittleEndian.PutUint32(nlMsg[8:12], 0)                                                                         // seq
+	binary.LittleEndian.PutUint32(nlMsg[12:16], 0)                                                                        // pid
 
 	// rtmsg
-	nlMsg[16] = linux.AF_INET           // family
-	nlMsg[17] = 0                       // dst_len
-	nlMsg[18] = 0                       // src_len
-	nlMsg[19] = 0                       // tos
-	nlMsg[20] = linux.RT_TABLE_MAIN     // table
-	nlMsg[21] = linux.RTPROT_BOOT       // protocol
-	nlMsg[22] = linux.RT_SCOPE_UNIVERSE // scope
-	nlMsg[23] = linux.RTN_UNICAST       // type
+	nlMsg[16] = linux.AF_INET                      // family
+	nlMsg[17] = 0                                  // dst_len
+	nlMsg[18] = 0                                  // src_len
+	nlMsg[19] = 0                                  // tos
+	nlMsg[20] = linux.RT_TABLE_MAIN                // table
+	nlMsg[21] = linux.RTPROT_BOOT                  // protocol
+	nlMsg[22] = linux.RT_SCOPE_UNIVERSE            // scope
+	nlMsg[23] = linux.RTN_UNICAST                  // type
+	binary.LittleEndian.PutUint32(nlMsg[24:28], 0) // flags (reserved)
 
-	// rtattr RTA_GATEWAY
-	binary.LittleEndian.PutUint16(nlMsg[28:30], 8)                 // len
-	binary.LittleEndian.PutUint16(nlMsg[30:32], linux.RTA_GATEWAY) // type
-	binary.LittleEndian.PutUint32(nlMsg[32:36], gateway)           // val
+	// rtattr RTA_OIF (starts at offset 28)
+	binary.LittleEndian.PutUint16(nlMsg[28:30], 8)             // len
+	binary.LittleEndian.PutUint16(nlMsg[30:32], linux.RTA_OIF) // type
+	// ifindex will be filled at runtime
+
+	// rtattr RTA_GATEWAY (starts at offset 36)
+	binary.LittleEndian.PutUint16(nlMsg[36:38], 8)                 // len
+	binary.LittleEndian.PutUint16(nlMsg[38:40], linux.RTA_GATEWAY) // type
+	// Gateway will be byte-swapped and filled at runtime
+
+	// Byte-swap gateway from "visual" format (e.g., 0x0a000202) to network byte order
+	// Same logic as ConfigureInterface
+	gatewaySwapped := uint32(0)
+	gatewaySwapped |= (gateway & 0xff) << 24
+	gatewaySwapped |= (gateway & 0xff00) << 8
+	gatewaySwapped |= (gateway & 0xff0000) >> 8
+	gatewaySwapped |= (gateway & 0xff000000) >> 24
+	binary.LittleEndian.PutUint32(nlMsg[40:44], gatewaySwapped)
 
 	return ir.WithStackSlot(ir.StackSlotConfig{
-		Size: 36,
+		Size: 80, // netlink message (44) + sockaddr_nl (12) + ACK buffer (20) + padding
 		Body: func(slot ir.StackSlot) ir.Fragment {
-			fd := ir.Var("nlFd")
-			tmp := ir.Var("nlTmp")
-			ptr := ir.Var("nlPtr")
+			fd := nextHelperVar("nlFd")
+			tmp := nextHelperVar("nlTmp")
+			ptr := nextHelperVar("nlPtr")
+			ifindex := nextHelperVar("ifindex")
+			ifindexVar := nextHelperVar("ifindex_var")
+			ackPtr := nextHelperVar("ackPtr")
+			ackLen := nextHelperVar("ackLen")
+			ackErrCode := nextHelperVar("ackErrCode")
+			sockaddrNlPtr := nextHelperVar("sockaddr_nl_ptr")
 
 			// Copy message to stack using 32-bit writes
 			var copyFrags []ir.Fragment
@@ -748,16 +818,64 @@ func AddDefaultRoute(gateway uint32, errLabel ir.Label, errVar ir.Var) ir.Fragme
 				)
 			}
 
+			// Layout within slot:
+			// 0-43: netlink message (44 bytes)
+			// 44-55: sockaddr_nl (12 bytes)
+			// 56-75: ACK buffer (20 bytes)
+
 			return ir.Block{
+				// Get interface index first
+				GetInterfaceIndex(ifName, errLabel, ifindexVar),
+				ir.Assign(ifindex, ifindexVar),
+
+				// Create netlink socket
 				ir.Assign(fd, ir.Syscall(defs.SYS_SOCKET, ir.Int64(linux.AF_NETLINK), ir.Int64(linux.SOCK_RAW), ir.Int64(linux.NETLINK_ROUTE))),
 				ir.Assign(errVar, fd),
 				ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
 
+				// Copy message to stack
 				ir.Assign(ptr, slot.Pointer()),
 				ir.Block(copyFrags),
-				ir.Assign(errVar, ir.Syscall(defs.SYS_SENDTO, fd, ptr, ir.Int64(36), ir.Int64(0), ir.Int64(0), ir.Int64(0))),
+
+				// Fill in ifindex in RTA_OIF attribute (offset 32 in message)
+				ir.Assign(slot.At(32), ifindex.As32()),
+
+				// Build sockaddr_nl at offset 44: Family=AF_NETLINK, Pad=0, Pid=0, Groups=0
+				ir.Assign(slot.At(44), ir.Int64(linux.AF_NETLINK)), // Family (uint16) + Pad (uint16) as uint32
+				ir.Assign(slot.At(48), ir.Int64(0)),                // Pid (uint32)
+				ir.Assign(slot.At(52), ir.Int64(0)),                // Groups (uint32)
+				ir.Assign(sockaddrNlPtr, slot.PointerWithDisp(44)),
+
+				// Send netlink message
+				ir.Assign(errVar, ir.Syscall(defs.SYS_SENDTO, fd, ptr, ir.Int64(44), ir.Int64(0), sockaddrNlPtr, ir.Int64(12))),
+				ir.If(ir.IsNegative(errVar), ir.Block{
+					ir.Syscall(defs.SYS_CLOSE, fd),
+					ir.Goto(errLabel),
+				}),
+
+				// Read ACK message (NLMSG_ERROR) into buffer at offset 56
+				ir.Assign(ackPtr, slot.PointerWithDisp(56)),
+				ir.Assign(ackLen, ir.Int64(20)),
+				ir.Assign(errVar, ir.Syscall(defs.SYS_RECVFROM, fd, ackPtr, ackLen, ir.Int64(0), ir.Int64(0), ir.Int64(0))),
+				ir.If(ir.IsNegative(errVar), ir.Block{
+					ir.Syscall(defs.SYS_CLOSE, fd),
+					ir.Goto(errLabel),
+				}),
+
+				// Parse NLMSG_ERROR structure:
+				// - nlmsghdr (16 bytes) at offset 56
+				// - nlmsgerr.error (int32) at offset 56+16 = 72
+				// Read error code from ACK buffer (offset 72, which is 16 bytes into the NLMSG_ERROR message)
+				ir.Assign(ackErrCode, slot.At(72)),
+				ir.If(ir.IsNotEqual(ackErrCode, ir.Int64(0)), ir.Block{
+					ir.Printf("cc: ackErrCode is not zero: 0x%x\n", ackErrCode),
+					ir.Syscall(defs.SYS_CLOSE, fd),
+					ir.Assign(errVar, ackErrCode),
+					ir.Goto(errLabel),
+				}),
+
 				ir.Syscall(defs.SYS_CLOSE, fd),
-				ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
+				ir.Assign(errVar, ir.Int64(0)),
 			}
 		},
 	})
@@ -766,11 +884,11 @@ func AddDefaultRoute(gateway uint32, errLabel ir.Label, errVar ir.Var) ir.Fragme
 func SetResolvConf(dnsServer string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
 	// Format: "nameserver <dnsServer>\n"
 	content := "nameserver " + dnsServer + "\n"
-	
+
 	fd := nextHelperVar("resolv_fd")
 	contentPtr := nextHelperVar("resolv_content_ptr")
 	contentLen := nextHelperVar("resolv_content_len")
-	
+
 	return ir.Block{
 		// Load the content string and get a pointer to it
 		ir.LoadConstantBytesConfig(ir.ConstantBytesConfig{
@@ -779,7 +897,7 @@ func SetResolvConf(dnsServer string, errLabel ir.Label, errVar ir.Var) ir.Fragme
 			Pointer: contentPtr,
 			Length:  contentLen,
 		}),
-		
+
 		// Open /etc/resolv.conf for writing, create if it doesn't exist, truncate if it does
 		ir.Assign(fd, ir.Syscall(
 			defs.SYS_OPENAT,
@@ -790,7 +908,7 @@ func SetResolvConf(dnsServer string, errLabel ir.Label, errVar ir.Var) ir.Fragme
 		)),
 		ir.Assign(errVar, fd),
 		ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
-		
+
 		// Write the content
 		ir.Assign(errVar, ir.Syscall(
 			defs.SYS_WRITE,
@@ -802,7 +920,7 @@ func SetResolvConf(dnsServer string, errLabel ir.Label, errVar ir.Var) ir.Fragme
 			ir.Syscall(defs.SYS_CLOSE, fd),
 			ir.Goto(errLabel),
 		}),
-		
+
 		// Close the file
 		ir.Assign(errVar, ir.Syscall(defs.SYS_CLOSE, fd)),
 		ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),

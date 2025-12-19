@@ -695,8 +695,8 @@ func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, e
 		main = append(main,
 			initx.ConfigureInterface("eth0", 0x0a00020f, 0xffffff00, errLabel, errVar),
 
-			// Add default route via 10.0.2.2 (gateway)
-			initx.AddDefaultRoute(0x0a000202, errLabel, errVar),
+			// Add default route via 10.0.2.2 (gateway) on eth0
+			initx.AddDefaultRoute("eth0", 0x0a000202, errLabel, errVar),
 
 			// Set /etc/resolv.conf to use 10.0.2.2 as DNS server
 			initx.SetResolvConf("10.0.2.2", errLabel, errVar),
@@ -714,6 +714,10 @@ func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, e
 
 		// Error handler
 		ir.DeclareLabel(errLabel, ir.Block{
+			ir.Printf(
+				"cc: failed to add default route: errno=0x%x\n",
+				errVar,
+			),
 			func() ir.Fragment {
 				switch arch {
 				case hv.ArchitectureX86_64:
