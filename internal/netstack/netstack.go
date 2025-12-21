@@ -1366,17 +1366,12 @@ func (l *tcpListener) Close() error {
 	}
 	l.closed = true
 	close(l.closeCh)
-	close(l.incoming)
 	l.mu.Unlock()
 
 	l.stack.tcpMu.Lock()
 	delete(l.stack.tcpListen, l.port)
 	l.stack.tcpMu.Unlock()
 
-	// BUG: There is a race: a connection can become established concurrently
-	// and attempt "listener.incoming <- c" which will panic if the channel
-	// is already closed. A non-blocking send or additional coordination is
-	// required to eliminate this risk.
 	return nil
 }
 
@@ -1559,9 +1554,18 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 			}
 			c.mu.Unlock()
 			if listener != nil {
-				// BUG: If listener has been concurrently closed (and channel
-				// closed), this send may panic.
-				listener.incoming <- c
+				// Listener can be closed concurrently. Avoid blocking forever
+				// or panicking by bailing out when closeCh is closed.
+				select {
+				case <-listener.closeCh:
+					c.Close()
+				default:
+					select {
+					case listener.incoming <- c:
+					case <-listener.closeCh:
+						c.Close()
+					}
+				}
 			} else if cb != nil {
 				go cb(c)
 			}
