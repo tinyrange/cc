@@ -338,28 +338,51 @@ func (ns *NetStack) Close() error {
 		ns.debugWG.Wait()
 
 		// Close TCP listeners and connections.
-		// BUG: Potential data race. The commented-out locks suggest this
-		// code may run concurrently with other operations that also mutate
-		// these maps. Use of locks around iteration would be safer.
-		for _, l := range ns.tcpListen {
-			l.Close()
+		//
+		// Note: tcpListener.Close and tcpConn.Close both take tcpMu to remove
+		// themselves from these maps, so we must not call them while holding
+		// tcpMu (deadlock). Snapshot+clear under lock, then close outside.
+		var listeners []*tcpListener
+		var conns []*tcpConn
+		ns.tcpMu.Lock()
+		if ns.tcpListen != nil {
+			listeners = make([]*tcpListener, 0, len(ns.tcpListen))
+			for _, l := range ns.tcpListen {
+				listeners = append(listeners, l)
+			}
+			// Keep non-nil maps to avoid panics if any late operations race
+			// (inserts into a nil map panic).
+			ns.tcpListen = make(map[uint16]*tcpListener)
 		}
-		ns.tcpListen = nil
-		for _, c := range ns.tcpConns {
-			c.Close()
+		if ns.tcpConns != nil {
+			conns = make([]*tcpConn, 0, len(ns.tcpConns))
+			for _, c := range ns.tcpConns {
+				conns = append(conns, c)
+			}
+			ns.tcpConns = make(map[tcpFourTuple]*tcpConn)
 		}
-		ns.tcpConns = nil
+		ns.tcpMu.Unlock()
+
+		for _, l := range listeners {
+			_ = l.Close()
+		}
+		for _, c := range conns {
+			_ = c.Close()
+		}
 
 		// Close UDP endpoints.
-		// BUG: Similar concurrency concerns as above.
 		ns.udpSockets.Range(func(key, value any) bool {
-			_ = value.(io.Closer).Close()
+			if c, ok := value.(io.Closer); ok {
+				_ = c.Close()
+			}
+			ns.udpSockets.Delete(key)
 			return true
 		})
-		ns.udpSockets = sync.Map{}
 
 		// Stop packet capture.
+		ns.mu.Lock()
 		ns.packetDump = nil
+		ns.mu.Unlock()
 	})
 	return nil
 }
