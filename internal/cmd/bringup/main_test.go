@@ -8,6 +8,7 @@ import (
 	"os"
 	"syscall"
 	"testing"
+	"time"
 	"unsafe"
 
 	amd64defs "github.com/tinyrange/cc/internal/linux/defs/amd64"
@@ -330,3 +331,78 @@ func calculateChecksum(data []byte) uint16 {
 	}
 	return ^uint16(sum)
 }
+
+func TestNetworkUDP(t *testing.T) {
+	if err := configureInterfaceIP("eth0", net.ParseIP("10.42.0.2"), net.CIDRMask(24, 32)); err != nil {
+		t.Fatalf("failed to configure IP address: %v", err)
+	}
+
+	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(10, 42, 0, 1), Port: 4243})
+	if err != nil {
+		t.Fatalf("failed to dial udp echo: %v", err)
+	}
+	defer conn.Close()
+
+	buf := make([]byte, 2048)
+	for i := 0; i < 3; i++ {
+		payload := []byte{'u', 'd', 'p', '-', byte('0' + i), '-', 'o', 'k'}
+		if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatalf("failed to set udp deadline: %v", err)
+		}
+		if _, err := conn.Write(payload); err != nil {
+			t.Fatalf("failed to write udp payload: %v", err)
+		}
+		n, err := conn.Read(buf)
+		if err != nil {
+			t.Fatalf("failed to read udp echo: %v", err)
+		}
+		if !bytes.Equal(buf[:n], payload) {
+			t.Fatalf("udp echo mismatch: got %q want %q", buf[:n], payload)
+		}
+	}
+}
+
+// func TestNetworkTCP(t *testing.T) {
+// 	if err := configureInterfaceIP("eth0", net.ParseIP("10.42.0.2"), net.CIDRMask(24, 32)); err != nil {
+// 		t.Fatalf("failed to configure IP address: %v", err)
+// 	}
+
+// 	t.Logf("dialing tcp echo at %s", "10.42.0.1:4242")
+// 	c, err := net.DialTimeout("tcp4", "10.42.0.1:4242", 2*time.Second)
+// 	if err != nil {
+// 		t.Fatalf("failed to dial tcp echo: %v", err)
+// 	}
+// 	defer c.Close()
+
+// 	for i := 0; i < 3; i++ {
+// 		payload := []byte{'t', 'c', 'p', '-', byte('0' + i), '-', 'o', 'k'}
+// 		t.Logf("tcp write iteration=%d payload=%q", i, payload)
+// 		if _, err := c.Write(payload); err != nil {
+// 			t.Fatalf("failed to write tcp payload: %v", err)
+// 		}
+
+// 		rb := make([]byte, len(payload))
+// 		readErr := make(chan error, 1)
+// 		go func() {
+// 			_, err := io.ReadFull(c, rb)
+// 			if err == nil && !bytes.Equal(rb, payload) {
+// 				err = io.ErrUnexpectedEOF
+// 			}
+// 			readErr <- err
+// 		}()
+
+// 		select {
+// 		case err := <-readErr:
+// 			if err != nil {
+// 				t.Fatalf("failed to read tcp echo (iteration=%d): %v", i, err)
+// 			}
+// 			if !bytes.Equal(rb, payload) {
+// 				t.Fatalf("tcp echo mismatch (iteration=%d): got %q want %q", i, rb, payload)
+// 			}
+// 			t.Logf("tcp read iteration=%d ok payload=%q", i, rb)
+// 		case <-time.After(2 * time.Second):
+// 			_ = c.Close()
+// 			t.Fatalf("timeout waiting for tcp echo (iteration=%d)", i)
+// 		}
+// 	}
+// }

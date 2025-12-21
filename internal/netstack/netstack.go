@@ -1603,6 +1603,10 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 					"expect", c.guestSeq,
 				)
 				c.mu.Unlock()
+				// Always ACK our current receive position so the sender can
+				// retransmit. Without this, a real TCP stack can stall waiting
+				// for an ACK that never comes.
+				c.sendAck()
 				return nil
 			}
 			c.guestSeq += uint32(len(hdr.payload))

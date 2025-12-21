@@ -1934,11 +1934,91 @@ func RunExecutable(path string) error {
 
 	// Create netstack backend to handle and echo packets
 	ns := netstack.New(slog.Default())
+	defer ns.Close()
 	guestMAC := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
 	netBackend, err := virtio.NewNetstackBackend(ns, guestMAC)
 	if err != nil {
 		return fmt.Errorf("create netstack backend: %w", err)
 	}
+
+	const (
+		bringupTCPEchoPort = 4242
+		bringupUDPEchoPort = 4243
+	)
+
+	tcpEchoListener, err := ns.ListenInternal("tcp", fmt.Sprintf(":%d", bringupTCPEchoPort))
+	if err != nil {
+		return fmt.Errorf("start tcp echo listener: %w", err)
+	}
+	defer tcpEchoListener.Close()
+
+	go func() {
+		for {
+			conn, err := tcpEchoListener.Accept()
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				slog.Warn("tcp echo accept failed", "err", err)
+				return
+			}
+
+			go func(c net.Conn) {
+				defer c.Close()
+				slog.Info("tcp echo accepted", "remote", c.RemoteAddr().String(), "local", c.LocalAddr().String())
+				buf := make([]byte, 2048)
+				for {
+					_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+					n, err := c.Read(buf)
+					if err != nil {
+						if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+							return
+						}
+						// Deadline or other transient error; just close.
+						return
+					}
+					if n == 0 {
+						continue
+					}
+					slog.Info("tcp echo read", "n", n)
+					if _, err := c.Write(buf[:n]); err != nil {
+						slog.Warn("tcp echo write failed", "err", err)
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+
+	udpEchoConn, err := ns.ListenPacketInternal("udp", fmt.Sprintf(":%d", bringupUDPEchoPort))
+	if err != nil {
+		return fmt.Errorf("start udp echo listener: %w", err)
+	}
+	defer udpEchoConn.Close()
+
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, addr, err := udpEchoConn.ReadFrom(buf)
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				slog.Warn("udp echo read failed", "err", err)
+				return
+			}
+			if n == 0 {
+				continue
+			}
+			if _, err := udpEchoConn.WriteTo(buf[:n], addr); err != nil {
+				if errors.Is(err, net.ErrClosed) {
+					return
+				}
+				slog.Warn("udp echo write failed", "err", err)
+				return
+			}
+		}
+	}()
 
 	vm, err := initx.NewVirtualMachine(hv, 1, 256, kernel,
 		initx.WithFileFromBytes("/initx-exec", fileData, fs.FileMode(0755)),
