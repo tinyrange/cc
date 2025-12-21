@@ -1353,6 +1353,8 @@ type tcpListener struct {
 	stack *NetStack
 	port  uint16
 
+	// incoming is never closed. Use closeCh to signal shutdown.
+	// This avoids panics from concurrent sends.
 	incoming chan *tcpConn
 	closeCh  chan struct{}
 
@@ -1577,17 +1579,12 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 			}
 			c.mu.Unlock()
 			if listener != nil {
-				// Listener can be closed concurrently. Avoid blocking forever
-				// or panicking by bailing out when closeCh is closed.
+				// Listener can be closed concurrently. Avoid blocking forever by
+				// bailing out when closeCh is closed.
 				select {
+				case listener.incoming <- c:
 				case <-listener.closeCh:
 					c.Close()
-				default:
-					select {
-					case listener.incoming <- c:
-					case <-listener.closeCh:
-						c.Close()
-					}
 				}
 			} else if cb != nil {
 				go cb(c)
