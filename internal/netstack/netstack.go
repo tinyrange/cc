@@ -493,10 +493,9 @@ func (nic *NetworkInterface) sendFrame(frame []byte) error {
 		return fmt.Errorf("virtio backend not attached")
 	}
 	nic.stack.writePacketCapture(frame)
-	// BUG: There is no documented ownership model for frames here. If the
-	// backend retains the slice beyond the call, and the caller recycles a
-	// pooled buffer immediately after sendFrame returns, this can cause
-	// use-after-recycle bugs.
+	// Ownership/lifetime: `frame` is only valid for the duration of this call.
+	// Backends must not retain the slice; if they need to keep it (e.g. queue
+	// asynchronously), they must make their own copy.
 	return nic.backend(frame)
 }
 
@@ -1851,14 +1850,11 @@ func (ns *NetStack) sendTCPPacket(
 	copy(frame[ethernetHeaderLen:], ip)
 	putIPv4PacketBuffer(ip)
 
-	if err := ns.sendFrame(frame); err != nil {
-		putEthernetFrameBuffer(frame)
-		return err
-	}
-	// BUG: The pooled frame is returned immediately; if the backend retains
-	// the slice beyond sendFrame, this can corrupt the payload.
+	// The Ethernet buffer is pooled and may be recycled; don't expose it to
+	// backends that might retain the slice beyond the call.
+	out := append([]byte(nil), frame...)
 	putEthernetFrameBuffer(frame)
-	return nil
+	return ns.sendFrame(out)
 }
 
 // sendRST constructs a reset segment in response to an unexpected inbound.
