@@ -1704,11 +1704,20 @@ func (c *tcpConn) sendFin() {
 // queue signals EOF.
 func (c *tcpConn) Read(b []byte) (int, error) {
 	var timeout <-chan time.Time
+	var timer *time.Timer
 	c.mu.Lock()
 	if !c.readDeadline.IsZero() {
-		// BUG: time.After leaks a timer goroutine if Read returns early.
-		// Using a time.Timer would allow cancellation.
-		timeout = time.After(time.Until(c.readDeadline))
+		timer = time.NewTimer(time.Until(c.readDeadline))
+		timeout = timer.C
+		defer func() {
+			if !timer.Stop() {
+				// Ensure the timer channel is drained to avoid leaking.
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}()
 	}
 	buf := c.recvBuf
 	c.mu.Unlock()
