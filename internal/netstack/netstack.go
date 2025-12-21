@@ -1635,9 +1635,19 @@ func (c *tcpConn) enqueueData(data []byte) {
 	if DEBUG {
 		c.stack.log.Info("raw: conn enqueue", "len", len(data))
 	}
-	// BUG: recvBuf can be closed concurrently by Close(), causing panic
-	// if data arrives late. Guarded send or status check would help.
-	c.recvBuf <- data
+	// Synchronize with Close() (which closes recvBuf) to avoid sending on a
+	// closed channel.
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	// Avoid blocking the network path if readers are slow.
+	select {
+	case c.recvBuf <- data:
+	default:
+	}
+	c.mu.Unlock()
 }
 
 func (c *tcpConn) sendSynAck() {
