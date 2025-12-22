@@ -505,3 +505,36 @@ func TestNetworkHTTPDownload100KiB(t *testing.T) {
 
 	t.Logf("downloaded %d bytes in %s", n, time.Since(start))
 }
+
+func TestNetworkHTTPDownload1MiB(t *testing.T) {
+	if err := configureInterfaceIP("eth0", net.ParseIP("10.42.0.2"), net.CIDRMask(24, 32)); err != nil {
+		t.Fatalf("failed to configure IP address: %v", err)
+	}
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://10.42.0.1:4244/download/%d", 1*1024*1024))
+	if err != nil {
+		t.Fatalf("http get: %v", err)
+	}
+	defer resp.Body.Close()
+
+	t.Logf("got response")
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status: %s", resp.Status)
+	}
+
+	t.Logf("downloading %d bytes", resp.ContentLength)
+
+	start := time.Now()
+
+	n, err := io.Copy(io.Discard, resp.Body)
+	if err != nil {
+		t.Fatalf("download body: %v", err)
+	}
+	if n != resp.ContentLength {
+		t.Fatalf("unexpected download size: got %d want %d", n, resp.ContentLength)
+	}
+
+	t.Logf("downloaded %d bytes in %s", n, time.Since(start))
+}

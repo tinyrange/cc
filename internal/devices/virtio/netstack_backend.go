@@ -58,7 +58,12 @@ func (b *NetstackBackend) BindNetDevice(netdev *Net) {
 	}
 
 	b.nic.AttachVirtioBackend(func(frame []byte) error {
-		return netdev.EnqueueRxPacket(frame)
+		// Avoid synchronous re-entry into virtio-net (netstack can emit frames
+		// while we're still processing a guest TX packet). Make this best-effort
+		// async to prevent deadlocks.
+		copied := append([]byte(nil), frame...)
+		go func() { _ = netdev.EnqueueRxPacket(copied) }()
+		return nil
 	})
 }
 

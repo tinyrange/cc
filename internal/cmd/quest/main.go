@@ -2053,13 +2053,35 @@ func RunExecutable(path string) error {
 
 		buf := make([]byte, 32*1024)
 		remaining := totalBytes
+		writtenTotal := 0
 		for remaining > 0 {
 			n := min(remaining, len(buf))
-			if _, err := w.Write(buf[:n]); err != nil {
+			start := time.Now()
+			wrote, err := w.Write(buf[:n])
+			elapsed := time.Since(start)
+			if elapsed > 100*time.Millisecond {
+				slog.Warn("bringup http download write slow",
+					"size", totalBytes,
+					"wrote", wrote,
+					"remaining", remaining,
+					"elapsed", elapsed,
+					"err", err,
+				)
+			}
+			if err != nil {
+				slog.Warn("bringup http download write failed",
+					"size", totalBytes,
+					"writtenTotal", writtenTotal,
+					"remaining", remaining,
+					"wrote", wrote,
+					"err", err,
+				)
 				return
 			}
-			remaining -= n
+			writtenTotal += wrote
+			remaining -= wrote
 		}
+		slog.Debug("bringup http download complete", "size", totalBytes, "writtenTotal", writtenTotal)
 	})
 
 	httpSrv := &http.Server{Handler: mux}
