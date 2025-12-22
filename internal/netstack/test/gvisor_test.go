@@ -248,6 +248,73 @@ func TestGvisor_TCP_Handshake(t *testing.T) {
 	}
 }
 
+func TestGvisor_TCP_TransparentOutboundProxy(t *testing.T) {
+	h := newGvisorHarness(t)
+
+	// Host-side listener that stands in for an "internet" destination.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen host tcp: %v", err)
+	}
+	defer ln.Close()
+
+	lnAddr := ln.Addr().(*net.TCPAddr)
+
+	// Force all outbound dials to hit our local listener, regardless of the
+	// guest-requested destination.
+	h.ns.SetOutboundTCPDialer(func(ctx context.Context, addr *net.TCPAddr) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "tcp", lnAddr.String())
+	})
+
+	acceptCh := make(chan net.Conn, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		acceptCh <- c
+	}()
+
+	// Dial a "remote" IP outside the 10.42.0.0/24 network so gVisor uses the
+	// default route via 10.42.0.1 (our netstack gateway).
+	remoteIP := net.IPv4(1, 1, 1, 1)
+	client := gvisorDialTCP(t, h.gs, remoteIP, 80)
+	defer client.Close()
+
+	var server net.Conn
+	select {
+	case server = <-acceptCh:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timeout waiting for host accept")
+	}
+	defer server.Close()
+
+	// Guest -> host.
+	_, _ = client.Write([]byte("ping"))
+	buf := make([]byte, 4)
+	_ = server.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(server, buf); err != nil || string(buf) != "ping" {
+		t.Fatalf("server read: %v payload=%q", err, string(buf))
+	}
+
+	// Host -> guest (large enough to require segmentation).
+	want := bytes.Repeat([]byte("x"), 10_000)
+	_ = server.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	if _, err := server.Write(want); err != nil {
+		t.Fatalf("server write: %v", err)
+	}
+
+	got := make([]byte, len(want))
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(client, got); err != nil {
+		t.Fatalf("client read: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("payload mismatch")
+	}
+}
+
 func TestGvisor_TCP_DataTransfer_GuestToHost(t *testing.T) {
 	h := newGvisorHarness(t)
 

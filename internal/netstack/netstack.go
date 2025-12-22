@@ -252,6 +252,10 @@ type NetStack struct {
 	serviceProxyEnabled bool // Forward connections destined to serviceIPv4
 	allowInternet       bool // Allow DNS fallback et al
 
+	// tcpDial is used for outbound TCP proxying (transparent gateway mode).
+	// It is injectable for tests.
+	tcpDial func(ctx context.Context, addr *net.TCPAddr) (net.Conn, error)
+
 	// Wire interface and optional packet capture.
 	mu         sync.RWMutex
 	iface      *NetworkInterface
@@ -297,10 +301,26 @@ func New(l *slog.Logger) *NetStack {
 		tcpConns:            make(map[tcpFourTuple]*tcpConn),
 		randSource:          rand.New(rand.NewSource(now)),
 	}
+	stack.tcpDial = stack.defaultOutboundTCPDial
 	stack.hostMAC.Store(uint64(macUnset))
 	stack.guestMAC.Store(uint64(macUnset))
 	stack.observedGuestMAC.Store(uint64(macUnset))
 	return stack
+}
+
+func (ns *NetStack) defaultOutboundTCPDial(ctx context.Context, addr *net.TCPAddr) (net.Conn, error) {
+	var d net.Dialer
+	return d.DialContext(ctx, "tcp", addr.String())
+}
+
+// SetOutboundTCPDialer overrides how outbound TCP connections are created for
+// transparent proxying. If dial is nil, the default dialer is restored.
+func (ns *NetStack) SetOutboundTCPDialer(dial func(ctx context.Context, addr *net.TCPAddr) (net.Conn, error)) {
+	if dial == nil {
+		ns.tcpDial = ns.defaultOutboundTCPDial
+		return
+	}
+	ns.tcpDial = dial
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -936,14 +956,13 @@ func (ns *NetStack) handleIPv4Internal(srcMAC net.HardwareAddr, payload []byte, 
 		return err
 	}
 
-	// Only accept unicast addressed to our host or service IPs.
-	if !ipEqual(hdr.dst.To4(), ns.hostIPv4[:]) &&
-		!ipEqual(hdr.dst.To4(), ns.serviceIPv4[:]) {
-		slog.Error(
-			"raw: drop ipv4 packet not addressed to us",
-			"srcIP", hdr.src.String(),
-			"dstIP", hdr.dst.String(),
-		)
+	// We act as an L3 gateway for the guest. Ethernet filtering already ensures
+	// the frame is addressed to us; accept routed IPv4 packets regardless of
+	// destination IP.
+	//
+	// We still only implement a small subset of L4 protocols; unsupported traffic
+	// will be dropped below.
+	if hdr.dst.To4() == nil {
 		return nil
 	}
 
@@ -1422,6 +1441,9 @@ type tcpConn struct {
 	state         tcpState
 	guestSeq      uint32
 	hostSeq       uint32
+	sendAcked     uint32
+	peerWnd       uint16
+	sendCond      *sync.Cond
 	recvBuf       chan []byte
 	readDeadline  time.Time
 	writeDeadline time.Time
@@ -1433,10 +1455,11 @@ func newTCPConn(
 	listener *tcpListener,
 	key tcpFourTuple,
 	guestSeq uint32,
+	peerWnd uint16,
 	localIPv4 [4]byte,
 	onEstablished func(*tcpConn),
 ) *tcpConn {
-	return &tcpConn{
+	c := &tcpConn{
 		stack:         stack,
 		listener:      listener,
 		key:           key,
@@ -1445,8 +1468,17 @@ func newTCPConn(
 		state:         tcpStateSynRcvd,
 		guestSeq:      guestSeq + 1, // Expect data after SYN
 		hostSeq:       uint32(stack.randSource.Int31()),
+		sendAcked:     uint32(stack.randSource.Int31()),
+		peerWnd:       peerWnd,
 		recvBuf:       make(chan []byte, 512),
 	}
+	// Initialize sendAcked to the initial sequence number (before we send SYN).
+	c.sendAcked = c.hostSeq
+	if c.peerWnd == 0 {
+		c.peerWnd = 0xffff
+	}
+	c.sendCond = sync.NewCond(&c.mu)
+	return c
 }
 
 // handleTCP demuxes by 4-tuple to an existing conn or establishes a new one.
@@ -1491,7 +1523,7 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 
 		// Local listener present? Create a conn and complete handshake.
 		if listener, ok := ns.tcpListen[hdr.dstPort]; ok {
-			conn = newTCPConn(ns, listener, key, hdr.seq, ns.hostIPv4, nil)
+			conn = newTCPConn(ns, listener, key, hdr.seq, hdr.window, ns.hostIPv4, nil)
 			ns.tcpConns[key] = conn
 			ns.tcpMu.Unlock()
 			conn.sendSynAck()
@@ -1523,7 +1555,7 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 			onEstablished := func(c *tcpConn) {
 				ns.startServiceProxy(c)
 			}
-			conn = newTCPConn(ns, nil, key, hdr.seq, ns.serviceIPv4, onEstablished)
+			conn = newTCPConn(ns, nil, key, hdr.seq, hdr.window, ns.serviceIPv4, onEstablished)
 			ns.tcpConns[key] = conn
 			ns.tcpMu.Unlock()
 			conn.sendSynAck()
@@ -1536,7 +1568,23 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 			return ns.sendRST(h, hdr)
 		}
 
-		// No listener and no proxy; reset.
+		// Transparent outbound TCP: for any non-local destination, establish a
+		// synthetic TCP conn to the guest and bridge it to a real host TCP socket
+		// connected to dstIP:dstPort.
+		if !ipEqual(dstIP, ns.hostIPv4[:]) && !ipEqual(dstIP, ns.serviceIPv4[:]) {
+			var localIPv4 [4]byte
+			copy(localIPv4[:], dstIP)
+			onEstablished := func(c *tcpConn) {
+				ns.startOutboundTCPProxy(c)
+			}
+			conn = newTCPConn(ns, nil, key, hdr.seq, hdr.window, localIPv4, onEstablished)
+			ns.tcpConns[key] = conn
+			ns.tcpMu.Unlock()
+			conn.sendSynAck()
+			return nil
+		}
+
+		// No listener and not proxyable; reset.
 		ns.tcpMu.Unlock()
 		return ns.sendRST(h, hdr)
 	}
@@ -1565,10 +1613,22 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 
 	// Track ack of our sent data.
 	if hdr.flags&tcpFlagACK != 0 {
-		if hdr.ack < c.hostSeq {
-			// Old ack; ignore.
-		} else {
+		// Record advertised receive window for flow control.
+		c.peerWnd = hdr.window
+		if hdr.ack > c.sendAcked {
+			c.sendAcked = hdr.ack
+			if c.sendCond != nil {
+				c.sendCond.Broadcast()
+			}
+		}
+		// If the peer ACKs beyond what we think we've sent, resync to avoid
+		// stalling due to mismatched sequence tracking.
+		if hdr.ack > c.hostSeq {
 			c.hostSeq = hdr.ack
+			c.sendAcked = hdr.ack
+			if c.sendCond != nil {
+				c.sendCond.Broadcast()
+			}
 		}
 	}
 
@@ -1756,23 +1816,70 @@ func (c *tcpConn) Read(b []byte) (int, error) {
 	}
 }
 
-// Write transmits payload to the guest as a single PSH/ACK segment.
+// Write transmits payload to the guest.
 //
 // BUG: writeDeadline is not enforced.
 func (c *tcpConn) Write(b []byte) (int, error) {
-	c.mu.Lock()
-	if c.closed {
+	// Keep payloads below a typical Ethernet MTU. We don't implement IP
+	// fragmentation, and some virtio backends will drop oversized frames.
+	const maxPayload = 1460
+
+	written := 0
+	for written < len(b) {
+		var (
+			seq   uint32
+			ack   uint32
+			flags uint16
+			chunk []byte
+		)
+
+		c.mu.Lock()
+		for {
+			if c.closed {
+				c.mu.Unlock()
+				return written, net.ErrClosed
+			}
+			// Simple send-side flow control: don't send more than the peer's
+			// advertised window without seeing ACK progress.
+			inFlight := c.hostSeq - c.sendAcked
+			wnd := uint32(c.peerWnd)
+			if wnd > 0 && inFlight < wnd {
+				avail := wnd - inFlight
+				maxChunk := maxPayload
+				if int(avail) < maxChunk {
+					maxChunk = int(avail)
+				}
+				chunk = b[written:]
+				if len(chunk) > maxChunk {
+					chunk = chunk[:maxChunk]
+				}
+				seq = c.hostSeq
+				ack = c.guestSeq
+				c.hostSeq += uint32(len(chunk))
+				flags = uint16(tcpFlagACK)
+				if written+len(chunk) == len(b) {
+					flags |= uint16(tcpFlagPSH)
+				}
+				break
+			}
+			if c.sendCond == nil {
+				c.mu.Unlock()
+				return written, errors.New("send window stalled")
+			}
+			c.sendCond.Wait()
+		}
 		c.mu.Unlock()
-		return 0, net.ErrClosed
+
+		if DEBUG {
+			c.stack.log.Info("raw: conn write", "len", len(chunk), "seq", seq, "ack", ack)
+		}
+
+		if err := c.stack.sendTCPPacket(c.localIPv4, c.key, seq, ack, flags, chunk); err != nil {
+			return written, err
+		}
+		written += len(chunk)
 	}
-	seq := c.hostSeq
-	ack := c.guestSeq
-	c.hostSeq += uint32(len(b))
-	c.mu.Unlock()
-	if DEBUG {
-		c.stack.log.Info("raw: conn write", "len", len(b), "seq", seq, "ack", ack)
-	}
-	return len(b), c.stack.sendTCPPacket(c.localIPv4, c.key, seq, ack, tcpFlagACK|tcpFlagPSH, b)
+	return len(b), nil
 }
 
 func (c *tcpConn) Close() error {
@@ -1787,6 +1894,9 @@ func (c *tcpConn) Close() error {
 	}
 	c.state = tcpStateClosed
 	c.closed = true
+	if c.sendCond != nil {
+		c.sendCond.Broadcast()
+	}
 	close(c.recvBuf)
 	c.mu.Unlock()
 
@@ -1965,10 +2075,40 @@ func (ns *NetStack) startServiceProxy(conn *tcpConn) {
 		defer outbound.Close()
 		defer conn.Close()
 
-		if err := proxyConn(outbound, conn, 64*1024); err != nil &&
+		if err := proxyConns(outbound, conn, 64*1024); err != nil &&
 			!errors.Is(err, io.EOF) &&
 			!errors.Is(err, net.ErrClosed) {
 			slog.Error("raw: service proxy", "err", err)
+		}
+	}()
+}
+
+// startOutboundTCPProxy bridges the guest-visible TCP conn to a real host TCP
+// socket connected to the conn's destination IP:port (transparent proxying).
+func (ns *NetStack) startOutboundTCPProxy(conn *tcpConn) {
+	go func() {
+		addr := &net.TCPAddr{
+			IP:   net.IP(conn.key.dstIP[:]),
+			Port: int(conn.key.dstPort),
+		}
+
+		outbound, err := ns.tcpDial(context.Background(), addr)
+		if err != nil {
+			slog.Warn(
+				"raw: outbound proxy dial failed",
+				"dst", addr.String(),
+				"err", err,
+			)
+			_ = conn.Close()
+			return
+		}
+		defer outbound.Close()
+		defer conn.Close()
+
+		if err := proxyConns(outbound, conn, 64*1024); err != nil &&
+			!errors.Is(err, io.EOF) &&
+			!errors.Is(err, net.ErrClosed) {
+			slog.Error("raw: outbound proxy", "err", err)
 		}
 	}()
 }
@@ -2406,9 +2546,26 @@ func itoa(v int) string {
 	return strconv.Itoa(v)
 }
 
-// proxyConn copies data between two connections
-func proxyConn(dst, src net.Conn, bufSize int) error {
-	buf := make([]byte, bufSize)
-	_, err := io.CopyBuffer(dst, src, buf)
+// proxyConns bridges bytes between a and b until one side closes.
+func proxyConns(a, b net.Conn, bufSize int) error {
+	copyOne := func(dst, src net.Conn) error {
+		buf := make([]byte, bufSize)
+		_, err := io.CopyBuffer(dst, src, buf)
+		return err
+	}
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- copyOne(a, b) }()
+	go func() { errCh <- copyOne(b, a) }()
+
+	// When either direction ends, close both sides to stop the other goroutine.
+	err := <-errCh
+	_ = a.Close()
+	_ = b.Close()
+
+	err2 := <-errCh
+	if err == nil {
+		err = err2
+	}
 	return err
 }

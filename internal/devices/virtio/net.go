@@ -45,6 +45,11 @@ const (
 	virtqAvailFNoInterrupt = 1
 
 	txBufferPoolMaxSize = 256 << 10
+
+	// Backpressure limit for packets awaiting guest RX buffers.
+	// Without this, a fast host-side producer (e.g. outbound TCP proxy) can queue
+	// unbounded RX packets if the guest is slow to replenish descriptors.
+	netMaxPendingRxPackets = 256
 )
 
 type virtioNetHeader struct {
@@ -73,6 +78,7 @@ type Net struct {
 	backend    NetBackend
 	pendingRx  [][]byte
 	rxMu       sync.Mutex
+	rxCond     *sync.Cond
 	rxDisabled bool
 	linkUp     bool
 	txBufPool  sync.Pool
@@ -110,6 +116,7 @@ func NewNet(vm hv.VirtualMachine, base uint64, size uint64, irqLine uint32, mac 
 			},
 		},
 	}
+	netdev.rxCond = sync.NewCond(&netdev.rxMu)
 	features := []uint64{virtioFeatureVersion1 | (uint64(1) << virtioNetFeatureMacBit) | virtioFeatureEventIdx}
 	netdev.device = newMMIODevice(vm, base, size, irqLine, netDeviceID, netVendorID, netVersion, features, netdev)
 	if binder, ok := backend.(netDeviceBinder); ok {
@@ -206,6 +213,9 @@ func (vn *Net) OnReset(device) {
 	vn.pendingRx = nil
 	vn.rxDisabled = false
 	vn.linkUp = true
+	if vn.rxCond != nil {
+		vn.rxCond.Broadcast()
+	}
 }
 
 func (vn *Net) OnQueueNotify(dev device, queue int) error {
@@ -257,6 +267,12 @@ func (vn *Net) EnqueueRxPacket(packet []byte) error {
 	defer vn.rxMu.Unlock()
 	if vn.rxDisabled {
 		return io.EOF
+	}
+	for len(vn.pendingRx) >= netMaxPendingRxPackets && !vn.rxDisabled {
+		if vn.rxCond == nil {
+			break
+		}
+		vn.rxCond.Wait()
 	}
 	pendingBefore := len(vn.pendingRx)
 	vn.pendingRx = append(vn.pendingRx, append([]byte(nil), packet...))
@@ -437,6 +453,9 @@ func (vn *Net) processReceiveQueueLocked(dev device, q *queue) error {
 			vn.pendingRx = vn.pendingRx[:0]
 		} else {
 			vn.pendingRx = vn.pendingRx[packetIndex:]
+		}
+		if vn.rxCond != nil {
+			vn.rxCond.Broadcast()
 		}
 	}
 

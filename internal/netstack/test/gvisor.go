@@ -117,6 +117,7 @@ func newGvisorHarness(tb testing.TB) *gvisorHarness {
 	h.gs.SetRouteTable([]tcpip.Route{
 		{
 			Destination: header.IPv4EmptySubnet,
+			Gateway:     mustAddrFrom4(hostIPv4),
 			NIC:         gvisorNICID,
 		},
 	})
