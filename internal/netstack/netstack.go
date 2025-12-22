@@ -906,6 +906,12 @@ func buildIPv4HeaderInto(
 	copy(packet[12:16], src.To4())
 	copy(packet[16:20], dst.To4())
 
+	// IMPORTANT: The IPv4 header checksum must be computed with the checksum
+	// field zeroed. Our callers frequently use pooled buffers; without this,
+	// stale bytes can make the checksum invalid and cause receivers (gVisor)
+	// to drop packets intermittently.
+	packet[10] = 0
+	packet[11] = 0
 	check := ipv4Checksum(packet[:ipv4HeaderLen])
 	binary.BigEndian.PutUint16(packet[10:12], check)
 }
