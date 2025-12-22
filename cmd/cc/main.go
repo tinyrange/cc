@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path"
+	"path/filepath"
 	"runtime"
 	"runtime/pprof"
 	"strings"
@@ -60,6 +61,7 @@ func run() error {
 	dmesg := flag.Bool("dmesg", false, "Print kernel dmesg during boot and runtime")
 	network := flag.Bool("network", false, "Enable networking")
 	timeout := flag.Duration("timeout", 0, "Timeout for the container")
+	packetdump := flag.String("packetdump", "", "Write packet capture (pcap) to file (requires -network)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <image> [command] [args...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Run a command inside an OCI container image in a virtual machine.\n\n")
@@ -109,6 +111,10 @@ func run() error {
 				slog.Error("write memory profile", "error", err)
 			}
 		}()
+	}
+
+	if *packetdump != "" && !*network {
+		return fmt.Errorf("-packetdump requires -network")
 	}
 
 	args := flag.Args()
@@ -202,11 +208,34 @@ func run() error {
 	// Add network device if enabled
 	if *network {
 		backend := netstack.New(slog.Default())
+		var packetDumpFile *os.File
+		defer func() {
+			_ = backend.Close()
+			if packetDumpFile != nil {
+				_ = packetDumpFile.Close()
+			}
+		}()
+
+		if *packetdump != "" {
+			dir := filepath.Dir(*packetdump)
+			if dir != "." {
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					return fmt.Errorf("create packet dump directory: %w", err)
+				}
+			}
+			f, err := os.Create(*packetdump)
+			if err != nil {
+				return fmt.Errorf("create packet dump file: %w", err)
+			}
+			packetDumpFile = f
+			if err := backend.OpenPacketCapture(packetDumpFile); err != nil {
+				return fmt.Errorf("enable packet capture: %w", err)
+			}
+		}
 
 		if err := backend.StartDNSServer(); err != nil {
 			return fmt.Errorf("start DNS server: %w", err)
 		}
-		defer backend.StopDNSServer()
 
 		mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
 

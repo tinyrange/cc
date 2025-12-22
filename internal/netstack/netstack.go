@@ -260,6 +260,7 @@ type NetStack struct {
 	mu         sync.RWMutex
 	iface      *NetworkInterface
 	packetDump *pcap.Writer
+	pcapMu     sync.Mutex
 
 	// TCP state.
 	tcpMu      sync.Mutex
@@ -357,6 +358,20 @@ func (ns *NetStack) Close() error {
 		// Wait on background goroutines bound to debugWG.
 		ns.debugWG.Wait()
 
+		// Detach the virtio backend before closing connections.
+		//
+		// Close() is used during host shutdown (timeouts, VM teardown, etc). In
+		// those cases the guest may no longer have valid RX descriptors, and the
+		// virtio device / memory mapping may be in the process of being torn down.
+		// Avoid emitting any frames during teardown to prevent the virtio path from
+		// touching guest memory.
+		ns.mu.Lock()
+		if ns.iface != nil {
+			ns.iface.backend = nil
+		}
+		ns.iface = nil
+		ns.mu.Unlock()
+
 		// Close TCP listeners and connections.
 		//
 		// Note: tcpListener.Close and tcpConn.Close both take tcpMu to remove
@@ -400,9 +415,11 @@ func (ns *NetStack) Close() error {
 		})
 
 		// Stop packet capture.
+		ns.pcapMu.Lock()
 		ns.mu.Lock()
 		ns.packetDump = nil
 		ns.mu.Unlock()
+		ns.pcapMu.Unlock()
 	})
 	return nil
 }
@@ -453,6 +470,9 @@ func (ns *NetStack) OpenPacketCapture(out io.Writer) error {
 }
 
 func (ns *NetStack) writePacketCapture(data []byte) {
+	ns.pcapMu.Lock()
+	defer ns.pcapMu.Unlock()
+
 	ns.mu.RLock()
 	writer := ns.packetDump
 	ns.mu.RUnlock()

@@ -548,16 +548,23 @@ func TestOpenPacketCaptureEmitsRecords(t *testing.T) {
 		t.Fatalf("open capture: %v", err)
 	}
 
-	frame := []byte{
+	frame1 := []byte{
 		0, 1, 2, 3, 4, 5,
 		6, 7, 8, 9, 10, 11,
 		0x08, 0x00,
 		1, 2, 3, 4,
 	}
-	stack.writePacketCapture(frame)
+	frame2 := []byte{
+		1, 1, 1, 1, 1, 1,
+		2, 2, 2, 2, 2, 2,
+		0x08, 0x06,
+		9, 8, 7, 6, 5,
+	}
+	stack.writePacketCapture(frame1)
+	stack.writePacketCapture(frame2)
 
 	raw := buf.Bytes()
-	wantLen := 24 + 16 + len(frame)
+	wantLen := 24 + (16 + len(frame1)) + (16 + len(frame2))
 	if len(raw) != wantLen {
 		t.Fatalf("expected %d bytes, got %d", wantLen, len(raw))
 	}
@@ -573,17 +580,32 @@ func TestOpenPacketCaptureEmitsRecords(t *testing.T) {
 		t.Fatalf("unexpected link type %d", link)
 	}
 
-	record := raw[24 : 24+16]
-	if capLen := binary.LittleEndian.Uint32(record[8:12]); capLen != uint32(len(frame)) {
+	off := 24
+	record := raw[off : off+16]
+	if capLen := binary.LittleEndian.Uint32(record[8:12]); capLen != uint32(len(frame1)) {
 		t.Fatalf("unexpected caplen %d", capLen)
 	}
-	if origLen := binary.LittleEndian.Uint32(record[12:16]); origLen != uint32(len(frame)) {
+	if origLen := binary.LittleEndian.Uint32(record[12:16]); origLen != uint32(len(frame1)) {
 		t.Fatalf("unexpected origlen %d", origLen)
 	}
 
-	payload := raw[24+16:]
-	if !bytes.Equal(payload, frame) {
-		t.Fatalf("frame payload mismatch")
+	payload := raw[off+16 : off+16+len(frame1)]
+	if !bytes.Equal(payload, frame1) {
+		t.Fatalf("frame1 payload mismatch")
+	}
+	off += 16 + len(frame1)
+
+	record = raw[off : off+16]
+	if capLen := binary.LittleEndian.Uint32(record[8:12]); capLen != uint32(len(frame2)) {
+		t.Fatalf("unexpected caplen %d", capLen)
+	}
+	if origLen := binary.LittleEndian.Uint32(record[12:16]); origLen != uint32(len(frame2)) {
+		t.Fatalf("unexpected origlen %d", origLen)
+	}
+
+	payload = raw[off+16 : off+16+len(frame2)]
+	if !bytes.Equal(payload, frame2) {
+		t.Fatalf("frame2 payload mismatch")
 	}
 }
 
