@@ -11,9 +11,11 @@ import (
 	"io/fs"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/tinyrange/cc/internal/asm"
@@ -1944,6 +1946,7 @@ func RunExecutable(path string) error {
 	const (
 		bringupTCPEchoPort = 4242
 		bringupUDPEchoPort = 4243
+		bringupHTTPPort    = 4244
 	)
 
 	tcpEchoListener, err := ns.ListenInternal("tcp", fmt.Sprintf(":%d", bringupTCPEchoPort))
@@ -2020,6 +2023,57 @@ func RunExecutable(path string) error {
 		}
 	}()
 
+	httpLn, err := ns.ListenInternal("tcp", fmt.Sprintf(":%d", bringupHTTPPort))
+	if err != nil {
+		return fmt.Errorf("start bringup http listener: %w", err)
+	}
+	defer httpLn.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/download/{size}", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		b := r.PathValue("size")
+		if b == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		totalBytes, err := strconv.Atoi(b)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", totalBytes))
+		w.WriteHeader(http.StatusOK)
+
+		buf := make([]byte, 32*1024)
+		remaining := totalBytes
+		for remaining > 0 {
+			n := min(remaining, len(buf))
+			if _, err := w.Write(buf[:n]); err != nil {
+				return
+			}
+			remaining -= n
+		}
+	})
+
+	httpSrv := &http.Server{Handler: mux}
+	go func() {
+		if err := httpSrv.Serve(httpLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Warn("bringup http server exited", "err", err)
+		}
+	}()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = httpSrv.Shutdown(ctx)
+		cancel()
+	}()
+
 	vm, err := initx.NewVirtualMachine(hv, 1, 256, kernel,
 		initx.WithFileFromBytes("/initx-exec", fileData, fs.FileMode(0755)),
 		initx.WithDeviceTemplate(virtio.FSTemplate{
@@ -2038,12 +2092,12 @@ func RunExecutable(path string) error {
 	}
 	defer vm.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 	defer cancel()
 
 	slog.Info("Running Executable in InitX Virtual Machine", "path", path)
 
-	if err := vm.Spawn(ctx, "/initx-exec", "-test.v", "-test.timeout=5s"); err != nil {
+	if err := vm.Spawn(ctx, "/initx-exec", "-test.v", "-test.timeout=30s"); err != nil {
 		return fmt.Errorf("run executable in initx virtual machine: %w", err)
 	}
 
