@@ -563,12 +563,14 @@ func NewVirtualMachine(
 					"CONFIG_VIRTIO_NET",
 					"CONFIG_VIRTIO_CONSOLE",
 					"CONFIG_VIRTIO_FS",
+					"CONFIG_PACKET",
 				},
 				map[string]string{
 					"CONFIG_VIRTIO_BLK":  "kernel/drivers/block/virtio_blk.ko.gz",
 					"CONFIG_VIRTIO_NET":  "kernel/drivers/net/virtio_net.ko.gz",
 					"CONFIG_VIRTIO_MMIO": "kernel/drivers/virtio/virtio_mmio.ko.gz",
 					"CONFIG_VIRTIO_FS":   "kernel/fs/fuse/virtiofs.ko.gz",
+					"CONFIG_PACKET":      "kernel/net/packet/af_packet.ko.gz",
 				},
 			)
 			if err != nil {
@@ -581,6 +583,7 @@ func NewVirtualMachine(
 		},
 
 		SerialStdout: out,
+		SerialStdin:  in,
 
 		GetCmdline: func(arch hv.CpuArchitecture) ([]string, error) {
 			var args []string

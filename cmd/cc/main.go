@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path"
 	"runtime"
@@ -21,6 +25,7 @@ import (
 	"github.com/tinyrange/cc/internal/linux/defs"
 	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 	"github.com/tinyrange/cc/internal/linux/kernel"
+	"github.com/tinyrange/cc/internal/netstack"
 	"github.com/tinyrange/cc/internal/oci"
 	"github.com/tinyrange/cc/internal/vfs"
 	"golang.org/x/term"
@@ -37,8 +42,15 @@ func main() {
 	}
 }
 
+type fixCrlf struct {
+	w io.Writer
+}
+
+func (f *fixCrlf) Write(p []byte) (n int, err error) {
+	return f.w.Write(bytes.ReplaceAll(p, []byte{'\n'}, []byte{'\r', '\n'}))
+}
+
 func run() error {
-	arch := flag.String("arch", runtime.GOARCH, "Target architecture (amd64, arm64)")
 	cacheDir := flag.String("cache-dir", "", "Cache directory (default: ~/.config/cc/)")
 	cpus := flag.Int("cpus", 1, "Number of vCPUs")
 	memory := flag.Uint64("memory", 1024, "Memory in MB")
@@ -46,21 +58,29 @@ func run() error {
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
 	memprofile := flag.String("memprofile", "", "Write memory profile to file")
 	dmesg := flag.Bool("dmesg", false, "Print kernel dmesg during boot and runtime")
-	timeout := flag.Duration("timeout", 0, "Timeout for running the virtual machine")
+	network := flag.Bool("network", false, "Enable networking")
+	timeout := flag.Duration("timeout", 0, "Timeout for the container")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <image> [command] [args...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Run a command inside an OCI container image in a virtual machine.\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  %s alpine:latest /bin/sh -c 'echo hello'\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s ubuntu:22.04 ls -la\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "  %s --arch arm64 alpine:latest uname -m\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Flags:\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 
 	if *debug {
-		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+		slog.SetDefault(slog.New(slog.NewTextHandler(
+			&fixCrlf{w: os.Stderr},
+			&slog.HandlerOptions{Level: slog.LevelDebug},
+		)))
+	} else {
+		slog.SetDefault(slog.New(slog.NewTextHandler(
+			&fixCrlf{w: os.Stderr},
+			&slog.HandlerOptions{Level: slog.LevelInfo},
+		)))
 	}
 
 	if *cpuprofile != "" {
@@ -104,7 +124,7 @@ func run() error {
 	}
 
 	// Determine target architecture
-	hvArch, err := parseArchitecture(*arch)
+	hvArch, err := parseArchitecture(runtime.GOARCH)
 	if err != nil {
 		return err
 	}
@@ -115,10 +135,10 @@ func run() error {
 		return fmt.Errorf("create OCI client: %w", err)
 	}
 
-	slog.Debug("Pulling image", "ref", imageRef, "arch", *arch)
+	slog.Debug("Pulling image", "ref", imageRef, "arch", hvArch)
 
 	// Pull image
-	img, err := client.PullForArch(imageRef, *arch)
+	img, err := client.PullForArch(imageRef, hvArch)
 	if err != nil {
 		return fmt.Errorf("pull image: %w", err)
 	}
@@ -168,11 +188,7 @@ func run() error {
 	}
 
 	// Create VM with VirtioFS
-	vm, err := initx.NewVirtualMachine(
-		h,
-		*cpus,
-		*memory,
-		kernelLoader,
+	opts := []initx.Option{
 		initx.WithDeviceTemplate(virtio.FSTemplate{
 			Tag:     "rootfs",
 			Backend: fsBackend,
@@ -181,6 +197,37 @@ func run() error {
 		initx.WithDebugLogging(*debug),
 		initx.WithDmesgLogging(*dmesg),
 		initx.WithStdin(os.Stdin),
+	}
+
+	// Add network device if enabled
+	if *network {
+		backend := netstack.New(slog.Default())
+
+		if err := backend.StartDNSServer(); err != nil {
+			return fmt.Errorf("start DNS server: %w", err)
+		}
+		defer backend.StopDNSServer()
+
+		mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
+
+		netBackend, err := virtio.NewNetstackBackend(backend, mac)
+		if err != nil {
+			return fmt.Errorf("create netstack backend: %w", err)
+		}
+
+		opts = append(opts, initx.WithDeviceTemplate(virtio.NetTemplate{
+			Backend: netBackend,
+			MAC:     mac,
+			Arch:    hvArch,
+		}))
+	}
+
+	vm, err := initx.NewVirtualMachine(
+		h,
+		*cpus,
+		*memory,
+		kernelLoader,
+		opts...,
 	)
 	if err != nil {
 		return fmt.Errorf("create VM: %w", err)
@@ -188,7 +235,7 @@ func run() error {
 	defer vm.Close()
 
 	// Build and run the container init program
-	prog := buildContainerInit(hvArch, img, execCmd)
+	prog := buildContainerInit(hvArch, img, execCmd, *network)
 
 	slog.Debug("Booting VM")
 
@@ -530,7 +577,7 @@ func lookPath(fs *oci.ContainerFS, pathEnv string, workDir string, file string) 
 		workDir = "/"
 	}
 
-	for _, dir := range strings.Split(pathEnv, ":") {
+	for dir := range strings.SplitSeq(pathEnv, ":") {
 		switch {
 		case dir == "":
 			dir = workDir
@@ -558,7 +605,15 @@ func lookPath(fs *oci.ContainerFS, pathEnv string, workDir string, file string) 
 	return "", fmt.Errorf("executable %q not found in PATH", file)
 }
 
-func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string) *ir.Program {
+func ipToUint32(addr string) uint32 {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return 0
+	}
+	return binary.BigEndian.Uint32(ip.To4())
+}
+
+func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, enableNetwork bool) *ir.Program {
 	errLabel := ir.Label("__cc_error")
 	errVar := ir.Var("__cc_errno")
 	pivotResult := ir.Var("__cc_pivot_result")
@@ -662,8 +717,31 @@ func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string) *
 
 		// Change to working directory
 		ir.Syscall(defs.SYS_CHDIR, workDir),
+	}
 
-		// Fork and exec using initx helper
+	// Configure network interface if networking is enabled
+	if enableNetwork {
+		// Configure eth0 with IP 10.42.0.2/24
+		// IP: 10.42.0.2
+		ip := ipToUint32("10.42.0.2")
+		// Gateway: 10.42.0.1
+		gatewayIp := "10.42.0.1"
+		gateway := ipToUint32(gatewayIp)
+		// Mask: 255.255.255.0
+		mask := ipToUint32("255.255.255.0")
+		main = append(main,
+			initx.ConfigureInterface("eth0", ip, mask, errLabel, errVar),
+
+			// Add default route via gateway on eth0
+			initx.AddDefaultRoute("eth0", gateway, errLabel, errVar),
+
+			// Set /etc/resolv.conf to use DNS server
+			initx.SetResolvConf(gatewayIp, errLabel, errVar),
+		)
+	}
+
+	// Fork and exec using initx helper
+	main = append(main,
 		// Note: ForkExecWait expects argv to be the arguments AFTER the path,
 		// as it puts path at argv[0] itself
 		initx.ForkExecWait(cmd[0], cmd[1:], img.Config.Env, errLabel, errVar),
@@ -673,6 +751,10 @@ func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string) *
 
 		// Error handler
 		ir.DeclareLabel(errLabel, ir.Block{
+			ir.Printf(
+				"cc: failed to add default route: errno=0x%x\n",
+				errVar,
+			),
 			func() ir.Fragment {
 				switch arch {
 				case hv.ArchitectureX86_64:
@@ -694,7 +776,7 @@ func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string) *
 				}
 			}(),
 		}),
-	}
+	)
 
 	return &ir.Program{
 		Methods:    map[string]ir.Method{"main": main},

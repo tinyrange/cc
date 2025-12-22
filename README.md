@@ -25,7 +25,7 @@ CrumbleCracker is a high performance embeddable virtualization platform designed
 - [x] Add support for loading and running executables.
 - [x] Add snapshotting support with support for capturing multiple snapshots tied to a MMIO control device.
 - [x] Add filesystem sharing using `virtio-fs`.
-- [ ] Add a custom optimized TCP/IP stack tied to a `virtio-net` driver to add network support without privileges.
+- [x] Add a custom optimized TCP/IP stack tied to a `virtio-net` driver to add network support without privileges.
 
 ## Cross-Platform Status
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/tinyrange/cc/internal/chipset"
 	"github.com/tinyrange/cc/internal/hv"
@@ -90,6 +91,11 @@ type Serial16550 struct {
 	skipLF      bool
 
 	stats serialStats
+
+	// Input buffering for non-blocking reads
+	inputPending []byte
+	inputStop    chan struct{}
+	inputWG      sync.WaitGroup
 }
 
 // NewSerial16550 creates a new 16550 UART device.
@@ -157,7 +163,6 @@ func (s *Serial16550) Init(vm hv.VirtualMachine) error {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.vm = vm
 
 	// If irqLine is a vmIRQLine, set its VM reference
@@ -166,6 +171,13 @@ func (s *Serial16550) Init(vm hv.VirtualMachine) error {
 	}
 
 	s.updateModemStatusLocked()
+	s.mu.Unlock()
+
+	// Start input reader goroutine if input is available
+	if s.in != nil {
+		s.startInputReader()
+	}
+
 	return nil
 }
 
@@ -176,6 +188,7 @@ func (s *Serial16550) Start() error {
 
 // Stop implements chipset.ChangeDeviceState.
 func (s *Serial16550) Stop() error {
+	s.stopInputReader()
 	return nil
 }
 
@@ -237,14 +250,49 @@ func (s *Serial16550) SupportsPollDevice() *chipset.PollDevice {
 // Poll implements chipset.PollHandler for async TX/RX.
 func (s *Serial16550) Poll(ctx context.Context) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	// Check for incoming data
-	if s.in != nil && s.rxFIFOCount < fifoSize {
+	// Process buffered input (non-blocking)
+	if len(s.inputPending) > 0 && s.rxFIFOCount < fifoSize {
+		// Move bytes from pending buffer to RX FIFO
+		for len(s.inputPending) > 0 && s.rxFIFOCount < fifoSize {
+			s.rxByteLocked(s.inputPending[0])
+			s.inputPending = s.inputPending[1:]
+		}
+	}
+
+	// If no input goroutine is running and we have an input reader,
+	// try reading directly (for test scenarios where Init() hasn't been called)
+	var readBytes []byte
+	if s.inputStop == nil && s.in != nil && s.rxFIFOCount < fifoSize {
+		// Release lock before blocking I/O
+		s.mu.Unlock()
+
+		// Try to read one byte non-blocking
+		// For test readers that don't block, this will work fine
+		// For blocking readers, we set a deadline to make it non-blocking
+		if deadlineSetter, ok := s.in.(interface{ SetReadDeadline(time.Time) error }); ok {
+			_ = deadlineSetter.SetReadDeadline(time.Now())
+		}
 		buf := make([]byte, 1)
-		n, err := s.in.Read(buf)
-		if n > 0 && err == nil {
-			s.rxByteLocked(buf[0])
+		n, _ := s.in.Read(buf)
+		if n > 0 {
+			readBytes = buf[:n]
+		}
+		// Reset deadline if supported
+		if deadlineSetter, ok := s.in.(interface{ SetReadDeadline(time.Time) error }); ok {
+			_ = deadlineSetter.SetReadDeadline(time.Time{})
+		}
+
+		// Re-acquire lock
+		s.mu.Lock()
+	}
+
+	// Process any bytes read directly from input
+	if len(readBytes) > 0 {
+		for _, b := range readBytes {
+			if s.rxFIFOCount < fifoSize {
+				s.rxByteLocked(b)
+			}
 		}
 	}
 
@@ -253,6 +301,7 @@ func (s *Serial16550) Poll(ctx context.Context) error {
 		s.processTXFIFOLocked()
 	}
 
+	s.mu.Unlock()
 	return nil
 }
 
@@ -615,6 +664,73 @@ func (s *Serial16550) Stats() serialStats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.stats
+}
+
+func (s *Serial16550) readInput() {
+	defer s.inputWG.Done()
+
+	buf := make([]byte, 4096)
+	for {
+		select {
+		case <-s.inputStop:
+			return
+		default:
+		}
+
+		// Set read deadline before blocking read to make it non-blocking
+		if deadlineSetter, ok := s.in.(interface{ SetReadDeadline(time.Time) error }); ok {
+			_ = deadlineSetter.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		}
+
+		n, err := s.in.Read(buf)
+		if n > 0 {
+			s.mu.Lock()
+			s.inputPending = append(s.inputPending, buf[:n]...)
+			s.mu.Unlock()
+		}
+		if err != nil {
+			if err == io.EOF {
+				return
+			}
+			select {
+			case <-s.inputStop:
+				return
+			default:
+				// Ignore timeout errors (they're expected for non-blocking reads)
+				// Continue reading on other errors
+			}
+		}
+	}
+}
+
+func (s *Serial16550) startInputReader() {
+	if s.in == nil || s.inputStop != nil {
+		return
+	}
+	s.inputStop = make(chan struct{})
+	s.inputWG.Add(1)
+	go s.readInput()
+}
+
+func (s *Serial16550) stopInputReader() {
+	if s.inputStop == nil {
+		return
+	}
+	close(s.inputStop)
+	if closer, ok := s.in.(io.Closer); ok {
+		_ = closer.Close()
+	}
+	done := make(chan struct{})
+	go func() {
+		s.inputWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		s.inputStop = nil
+	case <-time.After(time.Second):
+		// Timeout waiting for input reader to stop
+	}
 }
 
 var (

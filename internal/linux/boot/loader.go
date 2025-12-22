@@ -131,6 +131,7 @@ type LinuxLoader struct {
 	CreateVMWithMemory func(vm hv.VirtualMachine) error
 
 	SerialStdout io.Writer
+	SerialStdin  io.Reader
 
 	Devices []hv.DeviceTemplate
 
@@ -381,11 +382,6 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	}
 	l.plan = plan
 
-	consoleSerial := amd64serial.NewSerial16550WithIRQ(0x3F8, 4, &convertCRLF{l.SerialStdout})
-	if err := vm.AddDevice(consoleSerial); err != nil {
-		return fmt.Errorf("add serial device: %w", err)
-	}
-
 	auxSerial := amd64serial.NewSerial16550WithIRQ(0x2F8, 3, io.Discard)
 	if err := vm.AddDevice(auxSerial); err != nil {
 		return fmt.Errorf("add aux serial device: %w", err)
@@ -403,6 +399,26 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	setter, _ := vm.(interface {
 		SetIRQ(uint32, bool) error
 	})
+	// Create serial device with both input and output for bidirectional console support
+	var serialIn io.Reader
+	if l.SerialStdin != nil {
+		serialIn = l.SerialStdin
+	}
+	// Create IRQ line for serial device (IRQ 4) using VM's SetIRQ
+	var irqLine chipset.LineInterrupt
+	if setter != nil {
+		irqLine = chipset.LineInterruptFromFunc(func(level bool) {
+			if err := setter.SetIRQ(4, level); err != nil {
+				slog.Warn("set serial IRQ line", "level", level, "err", err)
+			}
+		})
+	} else {
+		irqLine = chipset.LineInterruptDetached()
+	}
+	consoleSerial := amd64serial.NewSerial16550(0x3F8, irqLine, &convertCRLF{l.SerialStdout}, serialIn)
+	if err := vm.AddDevice(consoleSerial); err != nil {
+		return fmt.Errorf("add serial device: %w", err)
+	}
 	irqForwarder := chipset.IRQLineFunc(func(line uint8, level bool) {
 		// ACPI overrides map legacy IRQ0 (PIT) to GSI 2, so forward it
 		// accordingly. Other ISA lines keep their numeric mapping.

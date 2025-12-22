@@ -11,12 +11,12 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/tinyrange/cc/internal/archive"
+	"github.com/tinyrange/cc/internal/hv"
 )
 
 // Manifest types for OCI/Docker registry protocol
@@ -131,11 +131,11 @@ func (s *stringSlice) UnmarshalJSON(data []byte) error {
 
 // Pull downloads an OCI image and returns it ready for use.
 func (c *Client) Pull(imageRef string) (*Image, error) {
-	return c.PullForArch(imageRef, runtime.GOARCH)
+	return c.PullForArch(imageRef, hv.ArchitectureNative)
 }
 
 // PullForArch downloads an OCI image for a specific architecture.
-func (c *Client) PullForArch(imageRef, arch string) (*Image, error) {
+func (c *Client) PullForArch(imageRef string, arch hv.CpuArchitecture) (*Image, error) {
 	// Check if this is a local tar file
 	if IsLocalTar(imageRef) {
 		return c.LoadFromTar(imageRef, arch)
@@ -208,14 +208,14 @@ func (c *Client) loadCachedImage(dir string) (*Image, error) {
 	return img, nil
 }
 
-func toOciArchitecture(goarch string) (string, error) {
-	switch goarch {
-	case "amd64":
+func toOciArchitecture(arch hv.CpuArchitecture) (string, error) {
+	switch arch {
+	case hv.ArchitectureX86_64:
 		return "amd64", nil
-	case "arm64":
+	case hv.ArchitectureARM64:
 		return "arm64", nil
 	default:
-		return "", fmt.Errorf("unsupported architecture: %s", goarch)
+		return "", fmt.Errorf("unsupported architecture: %s", arch)
 	}
 }
 
@@ -579,12 +579,7 @@ type dockerLayerSource struct {
 }
 
 // LoadFromTar loads a Docker image from a tar archive created by `docker save`.
-func (c *Client) LoadFromTar(tarPath, arch string) (*Image, error) {
-	ociArch, err := toOciArchitecture(arch)
-	if err != nil {
-		return nil, err
-	}
-
+func (c *Client) LoadFromTar(tarPath string, arch hv.CpuArchitecture) (*Image, error) {
 	// Resolve the tar path
 	if strings.HasPrefix(tarPath, "./") {
 		wd, err := os.Getwd()
@@ -593,7 +588,7 @@ func (c *Client) LoadFromTar(tarPath, arch string) (*Image, error) {
 		}
 		tarPath = filepath.Join(wd, tarPath[2:])
 	}
-	tarPath, err = filepath.Abs(tarPath)
+	tarPath, err := filepath.Abs(tarPath)
 	if err != nil {
 		return nil, fmt.Errorf("resolve tar path: %w", err)
 	}
@@ -684,11 +679,6 @@ func (c *Client) LoadFromTar(tarPath, arch string) (*Image, error) {
 
 	if !configRead {
 		return nil, fmt.Errorf("image config %s not found in tar", entry.Config)
-	}
-
-	// Check architecture match
-	if imageCfg.Architecture != "" && imageCfg.Architecture != ociArch {
-		return nil, fmt.Errorf("architecture mismatch: tar has %s, requested %s", imageCfg.Architecture, ociArch)
 	}
 
 	// Build runtime config

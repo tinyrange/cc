@@ -351,7 +351,8 @@ func (vc *Console) consumeDescriptorChain(dev device, q *queue, head uint16) (ui
 			if err != nil {
 				return total, err
 			}
-			if _, err := vc.out.Write(data); err != nil {
+			_, err = vc.out.Write(data)
+			if err != nil {
 				return total, fmt.Errorf("write console: %w", err)
 			}
 			total += desc.length
@@ -367,6 +368,15 @@ func (vc *Console) consumeDescriptorChain(dev device, q *queue, head uint16) (ui
 func (vc *Console) processReceiveQueue(dev device, q *queue) error {
 	if q == nil || !q.ready || q.size == 0 {
 		return nil
+	}
+
+	// Process transmit queue proactively when processing receive queue
+	// This handles cases where the guest OS doesn't send queue notifications for the transmit queue
+	if txQueue := dev.queue(queueTransmit); txQueue != nil && txQueue.ready && txQueue.size > 0 {
+		if err := vc.processTransmitQueue(dev, txQueue); err != nil {
+			// Log error but don't fail receive queue processing
+			slog.Warn("virtio-console: process transmit queue", "err", err)
+		}
 	}
 
 	vc.mu.Lock()
@@ -464,7 +474,8 @@ func (vc *Console) enqueueInput(data []byte) {
 	vc.mu.Unlock()
 
 	if dev := vc.device; dev != nil {
-		if err := vc.processReceiveQueue(dev, dev.queue(queueReceive)); err != nil {
+		q := dev.queue(queueReceive)
+		if err := vc.processReceiveQueue(dev, q); err != nil {
 			slog.Error("virtio-console: process receive queue", "err", err)
 		}
 	}
