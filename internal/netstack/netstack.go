@@ -35,8 +35,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/tinyrange/cc/internal/debug"
 	"github.com/tinyrange/cc/internal/pcap"
 )
+
+var nsDbg = debug.WithSource("netstack")
 
 ////////////////////////////////////////////////////////////////////////////////
 // Top-level constants and protocol numbers.
@@ -532,6 +535,7 @@ func (ns *NetStack) AttachNetworkInterface() (*NetworkInterface, error) {
 // AttachVirtioBackend sets the transmit callback to the hypervisor.
 func (nic *NetworkInterface) AttachVirtioBackend(handler func(frame []byte) error) {
 	nic.backend = handler
+	nsDbg.Writef("AttachVirtioBackend attached=%t", handler != nil)
 }
 
 // DeliverGuestPacket is called by the hypervisor when the guest transmits.
@@ -544,8 +548,17 @@ func (nic *NetworkInterface) DeliverGuestPacket(
 		defer release()
 	}
 	if len(packet) < ethernetHeaderLen {
+		nsDbg.Writef("DeliverGuestPacket drop tooShort len=%d", len(packet))
 		return fmt.Errorf("packet too short: %d", len(packet))
 	}
+	eth := etherType(binary.BigEndian.Uint16(packet[12:14]))
+	nsDbg.Writef("DeliverGuestPacket len=%d needsCopy=%t src=%s dst=%s ethertype=%s payloadLen=%d",
+		len(packet), needsCopy,
+		net.HardwareAddr(packet[6:12]).String(),
+		net.HardwareAddr(packet[:6]).String(),
+		eth.String(),
+		len(packet)-ethernetHeaderLen,
+	)
 	nic.stack.writePacketCapture(packet)
 	return nic.stack.handleEthernetFrameWithReuse(packet, needsCopy)
 }
@@ -553,7 +566,20 @@ func (nic *NetworkInterface) DeliverGuestPacket(
 // sendFrame transmits a frame back to the guest via the backend.
 func (nic *NetworkInterface) sendFrame(frame []byte) error {
 	if nic.backend == nil {
+		nsDbg.Writef("sendFrame(nic) drop backend=nil len=%d", len(frame))
 		return fmt.Errorf("virtio backend not attached")
+	}
+	if len(frame) >= ethernetHeaderLen {
+		eth := etherType(binary.BigEndian.Uint16(frame[12:14]))
+		nsDbg.Writef("sendFrame(nic) len=%d src=%s dst=%s ethertype=%s payloadLen=%d",
+			len(frame),
+			net.HardwareAddr(frame[6:12]).String(),
+			net.HardwareAddr(frame[:6]).String(),
+			eth.String(),
+			len(frame)-ethernetHeaderLen,
+		)
+	} else {
+		nsDbg.Writef("sendFrame(nic) len=%d", len(frame))
 	}
 	nic.stack.writePacketCapture(frame)
 	// Ownership/lifetime: `frame` is only valid for the duration of this call.
@@ -578,6 +604,7 @@ func (ns *NetStack) sendFrame(frame []byte) error {
 	iface := ns.iface
 	ns.mu.RUnlock()
 	if iface == nil {
+		nsDbg.Writef("sendFrame(ns) drop iface=nil len=%d", len(frame))
 		return fmt.Errorf("network interface detached")
 	}
 	return iface.sendFrame(frame)
@@ -597,6 +624,9 @@ func (ns *NetStack) handleEthernetFrameWithReuse(frame []byte, releaseUnsafe boo
 	etherType := etherType(binary.BigEndian.Uint16(frame[12:14]))
 	payload := frame[14:]
 
+	nsDbg.Writef("handleEthernetFrame src=%s dst=%s ethertype=%s payloadLen=%d releaseUnsafe=%t",
+		src.String(), dst.String(), etherType.String(), len(payload), releaseUnsafe)
+
 	ns.recordGuestMAC(src)
 
 	// Apply simple L2 filter: accept broadcast, host MAC, and configured guest
@@ -607,6 +637,7 @@ func (ns *NetStack) handleEthernetFrameWithReuse(frame []byte, releaseUnsafe boo
 		!isBroadcast(dst) &&
 		!macEqualUint64(dst, hostMACVal) &&
 		!macEqualUint64(dst, guestMACVal) {
+		nsDbg.Writef("handleEthernetFrame drop L2Filter src=%s dst=%s guestMACSet=%t", src.String(), dst.String(), macIsSet(guestMACVal))
 		// expected := ""
 		// if mac := macFromUint64(guestMACVal); len(mac) == 6 {
 		// 	expected = mac.String()
@@ -629,6 +660,7 @@ func (ns *NetStack) handleEthernetFrameWithReuse(frame []byte, releaseUnsafe boo
 	case etherTypeCustom:
 		return ns.handleCustom(src, payload)
 	default:
+		nsDbg.Writef("handleEthernetFrame drop unsupported ethertype=%s", etherType.String())
 		// ns.log.Info(
 		// 	"raw: drop unsupported ethertype",
 		// 	"type",
@@ -719,6 +751,7 @@ func (ns *NetStack) recordGuestMAC(mac net.HardwareAddr) {
 		return
 	}
 	ns.observedGuestMAC.Store(uint64(value))
+	nsDbg.Writef("recordGuestMAC observed=%s", mac.String())
 }
 
 // guestMACForTransmit returns a destination MAC usable for outbound frames.
@@ -760,6 +793,7 @@ func (ns *NetStack) handleCustom(srcMAC net.HardwareAddr, payload []byte) error 
 
 func (ns *NetStack) handleARP(srcMAC net.HardwareAddr, payload []byte) error {
 	if len(payload) < 28 {
+		nsDbg.Writef("handleARP drop tooShort len=%d", len(payload))
 		return fmt.Errorf("arp packet too short: %d", len(payload))
 	}
 
@@ -773,12 +807,14 @@ func (ns *NetStack) handleARP(srcMAC net.HardwareAddr, payload []byte) error {
 	if hwType != arpHardwareEthernet ||
 		protoType != arpProtoIPv4 ||
 		hwSize != 6 || protoSize != 4 {
+		nsDbg.Writef("handleARP drop unsupported hwType=%d protoType=0x%x hwSize=%d protoSize=%d", hwType, protoType, hwSize, protoSize)
 		return nil
 	}
 
 	senderMAC := net.HardwareAddr(payload[8:14])
 	senderIP := net.IP(payload[14:18])
 	targetIP := net.IP(payload[24:28])
+	nsDbg.Writef("handleARP op=%d srcMAC=%s senderIP=%s targetIP=%s", op, senderMAC.String(), senderIP.String(), targetIP.String())
 
 	// Only handle ARP requests (op=1).
 	if op != 1 {
@@ -787,8 +823,10 @@ func (ns *NetStack) handleARP(srcMAC net.HardwareAddr, payload []byte) error {
 
 	// Respond if the request targets host IPv4 or service IPv4.
 	if ipEqual(targetIP, ns.hostIPv4[:]) || ipEqual(targetIP, ns.serviceIPv4[:]) {
+		nsDbg.Writef("handleARP reply for targetIP=%s", targetIP.String())
 		return ns.sendARPReply(srcMAC, senderMAC, senderIP, targetIP)
 	}
+	nsDbg.Writef("handleARP ignore targetIP=%s", targetIP.String())
 	return nil
 }
 
@@ -801,6 +839,7 @@ func (ns *NetStack) sendARPReply(
 	dstMAC, senderMAC net.HardwareAddr,
 	senderIP, targetIP net.IP,
 ) error {
+	nsDbg.Writef("sendARPReply dstMAC=%s senderMAC=%s senderIP=%s targetIP=%s", dstMAC.String(), senderMAC.String(), senderIP.String(), targetIP.String())
 	frame := make([]byte, ethernetHeaderLen+28)
 	copy(frame[0:6], dstMAC)
 	host := macAddr(ns.hostMAC.Load())
@@ -973,8 +1012,11 @@ func ipv4Checksum(data []byte) uint16 {
 func (ns *NetStack) handleIPv4Internal(srcMAC net.HardwareAddr, payload []byte, releaseUnsafe bool) error {
 	hdr, err := parseIPv4Header(payload)
 	if err != nil {
+		nsDbg.Writef("handleIPv4 parse err=%v", err)
 		return err
 	}
+	nsDbg.Writef("handleIPv4 srcMAC=%s srcIP=%s dstIP=%s proto=%s payloadLen=%d releaseUnsafe=%t",
+		srcMAC.String(), hdr.src.String(), hdr.dst.String(), hdr.protocol.String(), len(hdr.payload), releaseUnsafe)
 
 	// Validate IPv4 header checksum before processing.
 	// A correct checksum will result in 0 when computed over the entire header.
@@ -982,6 +1024,7 @@ func (ns *NetStack) handleIPv4Internal(srcMAC net.HardwareAddr, payload []byte, 
 	if headerLen <= len(payload) {
 		computed := ipv4Checksum(payload[:headerLen])
 		if computed != 0 {
+			nsDbg.Writef("handleIPv4 drop invalidHeaderChecksum computed=0x%04x", computed)
 			// Invalid checksum, drop silently
 			return nil
 		}
@@ -1006,6 +1049,7 @@ func (ns *NetStack) handleIPv4Internal(srcMAC net.HardwareAddr, payload []byte, 
 		// slog.Info("raw: handling icmp packet", "srcIP", hdr.src.String(), "dstIP", hdr.dst.String())
 		return ns.handleICMP(hdr, hdr.payload)
 	default:
+		nsDbg.Writef("handleIPv4 drop unsupported proto=%s", hdr.protocol.String())
 		slog.Error("raw: drop unsupported ipv4 protocol", "proto", hdr.protocol)
 		return nil
 	}
@@ -1017,12 +1061,15 @@ func (ns *NetStack) handleIPv4Internal(srcMAC net.HardwareAddr, payload []byte, 
 
 func (ns *NetStack) handleICMP(h ipv4Header, payload []byte) error {
 	if len(payload) < 8 {
+		nsDbg.Writef("handleICMP drop tooShort len=%d", len(payload))
 		return nil
 	}
 	typ := payload[0]
 	if typ != 8 { // Echo Request
+		nsDbg.Writef("handleICMP ignore type=%d", typ)
 		return nil
 	}
+	nsDbg.Writef("handleICMP echoRequest src=%s dst=%s len=%d", h.src.String(), h.dst.String(), len(payload))
 
 	// Validate ICMP checksum
 	receivedChecksum := binary.BigEndian.Uint16(payload[2:4])
@@ -1030,6 +1077,7 @@ func (ns *NetStack) handleICMP(h ipv4Header, payload []byte) error {
 	calculatedChecksum := checksum(payload)
 	binary.BigEndian.PutUint16(payload[2:4], receivedChecksum) // Restore original
 	if receivedChecksum != calculatedChecksum {
+		nsDbg.Writef("handleICMP drop invalidChecksum received=0x%04x calculated=0x%04x", receivedChecksum, calculatedChecksum)
 		slog.Error("raw: drop icmp packet with invalid checksum",
 			"received", fmt.Sprintf("0x%04x", receivedChecksum),
 			"calculated", fmt.Sprintf("0x%04x", calculatedChecksum))
@@ -1049,6 +1097,7 @@ func (ns *NetStack) handleICMP(h ipv4Header, payload []byte) error {
 }
 
 func (ns *NetStack) sendICMP(src, dst net.IP, payload []byte) error {
+	nsDbg.Writef("sendICMP src=%s dst=%s payloadLen=%d", src.String(), dst.String(), len(payload))
 	packet := buildIPv4Packet(src, dst, icmpProtocol, payload)
 	dstMAC := ns.guestMACForTransmit()
 	if !macIsSet(dstMAC) {
@@ -1078,6 +1127,7 @@ func (ns *NetStack) handleUDP(h ipv4Header, payload []byte) error {
 
 func (ns *NetStack) handleUDPWithReuse(h ipv4Header, payload []byte, releaseUnsafe bool) error {
 	if len(payload) < 8 {
+		nsDbg.Writef("handleUDP drop tooShort len=%d", len(payload))
 		return fmt.Errorf("udp packet too short: %d", len(payload))
 	}
 
@@ -1098,15 +1148,18 @@ func (ns *NetStack) handleUDPWithReuse(h ipv4Header, payload []byte, releaseUnsa
 	if udpChksum != 0 {
 		computed := udpChecksum(h.src, h.dst, payload[:length])
 		if computed != 0 {
+			nsDbg.Writef("handleUDP drop invalidChecksum src=%s:%d dst=%s:%d computed=0x%04x", h.src.String(), srcPort, h.dst.String(), dstPort, computed)
 			// Invalid checksum, drop silently
 			return nil
 		}
 	}
 
 	data := payload[8:length]
+	nsDbg.Writef("handleUDP src=%s:%d dst=%s:%d dataLen=%d releaseUnsafe=%t", h.src.String(), srcPort, h.dst.String(), dstPort, len(data), releaseUnsafe)
 
 	v, ok := ns.udpSockets.Load(dstPort)
 	if !ok {
+		nsDbg.Writef("handleUDP drop noSocket dstPort=%d", dstPort)
 		slog.Error("raw: drop udp packet not addressed to us",
 			"srcIP", h.src.String(),
 			"srcPort", srcPort,
@@ -1134,6 +1187,7 @@ func (ns *NetStack) handleUDPWithReuse(h ipv4Header, payload []byte, releaseUnsa
 	}
 
 	if err := ep.enqueue(data, addr); err != nil {
+		nsDbg.Writef("handleUDP enqueue err=%v", err)
 		return err
 	}
 
@@ -1152,8 +1206,10 @@ func (ns *NetStack) sendUDP(
 	payloadLen int,
 ) error {
 	if len(buf) < ethernetHeaderLen+ipv4HeaderLen+udpHeaderLen+payloadLen {
+		nsDbg.Writef("sendUDP bufferTooSmall len=%d need=%d", len(buf), ethernetHeaderLen+ipv4HeaderLen+udpHeaderLen+payloadLen)
 		return fmt.Errorf("buffer too small for udp packet")
 	}
+	nsDbg.Writef("sendUDP src=%s:%d dst=%s:%d payloadLen=%d", srcIP.String(), srcPort, dstIP.String(), dstPort, payloadLen)
 
 	totalLen := 8 + payloadLen
 	packet := buf[ethernetHeaderLen+ipv4HeaderLen:]
@@ -1181,6 +1237,7 @@ func (ns *NetStack) sendUDP(
 	buildEthernetHeaderInto(buf[:ethernetHeaderLen], dstMAC, srcMAC, etherTypeIPv4)
 
 	if err := ns.sendFrame(buf); err != nil {
+		nsDbg.Writef("sendUDP sendFrame err=%v", err)
 		return err
 	}
 
@@ -1582,14 +1639,18 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 	// Validate TCP checksum with pseudo-header before parsing.
 	computed := tcpChecksum(h.src, h.dst, payload)
 	if computed != 0 {
+		nsDbg.Writef("handleTCP drop invalidChecksum src=%s dst=%s computed=0x%04x", h.src.String(), h.dst.String(), computed)
 		// Invalid checksum, drop silently
 		return nil
 	}
 
 	hdr, err := parseTCPHeader(payload)
 	if err != nil {
+		nsDbg.Writef("handleTCP parse err=%v", err)
 		return err
 	}
+	nsDbg.Writef("handleTCP seg src=%s:%d dst=%s:%d flags=0x%02x seq=%d ack=%d win=%d payloadLen=%d optLen=%d",
+		h.src.String(), hdr.srcPort, h.dst.String(), hdr.dstPort, hdr.flags, hdr.seq, hdr.ack, hdr.window, len(hdr.payload), len(hdr.options))
 	if DEBUG {
 		ns.log.Info(
 			"raw: tcp segment",
@@ -1620,6 +1681,7 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 	if !ok {
 		// Only a SYN may open a new connection.
 		if hdr.flags&tcpFlagSYN == 0 {
+			nsDbg.Writef("handleTCP noConn drop nonSYN flags=0x%02x", hdr.flags)
 			ns.tcpMu.Unlock()
 			return nil
 		}
@@ -1629,6 +1691,7 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 
 		// Local listener present? Create a conn and complete handshake.
 		if listener, ok := ns.tcpListen[hdr.dstPort]; ok {
+			nsDbg.Writef("handleTCP newConn listener dstPort=%d", hdr.dstPort)
 			conn = newTCPConn(ns, listener, key, hdr.seq, hdr.window, ns.hostIPv4, nil)
 			conn.applyPeerOptions(opts)
 			ns.tcpConns[key] = conn
@@ -1649,6 +1712,7 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 		// Proxy service connections to 127.0.0.1:dstPort if enabled.
 		if ns.shouldProxyService(dstIP) {
 			if !ns.serviceProxyEnabled {
+				nsDbg.Writef("handleTCP proxy disabled -> RST dstIP=%s dstPort=%d", h.dst.String(), hdr.dstPort)
 				ns.tcpMu.Unlock()
 				return ns.sendRST(h, hdr)
 			}
@@ -1723,7 +1787,10 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 	// Track ack of our sent data.
 	if hdr.flags&tcpFlagACK != 0 {
 		// Record advertised receive window for flow control.
+		// If window opens from zero/small, we need to wake blocked writers.
+		oldWnd := c.peerWnd
 		c.peerWnd = hdr.window
+		windowOpened := oldWnd == 0 && hdr.window > 0
 		if hdr.ack > c.sendAcked {
 			// Calculate bytes acknowledged for congestion control
 			bytesAcked := hdr.ack - c.sendAcked
@@ -1800,6 +1867,14 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 			if c.sendCond != nil {
 				c.sendCond.Broadcast()
 			}
+		}
+
+		// Wake blocked writers when window opens from zero.
+		// This handles the case where the peer was flow-controlling us (win=0)
+		// and now has buffer space available.
+		if windowOpened && c.sendCond != nil {
+			debug.Writef("netstack", "TCP window opened from zero win=%d key=%v", hdr.window, c.key)
+			c.sendCond.Broadcast()
 		}
 	}
 
@@ -2114,6 +2189,10 @@ func (c *tcpConn) Write(b []byte) (int, error) {
 			if c.congCtrl != nil {
 				wnd = c.congCtrl.effectiveWindow(peerWnd)
 			}
+			// Debug: log when blocked on window
+			if wnd == 0 || inFlight >= wnd {
+				debug.Writef("netstack", "TCP Write blocked: wnd=%d inFlight=%d peerWnd=%d key=%v", wnd, inFlight, peerWnd, c.key)
+			}
 			if wnd > 0 && inFlight < wnd {
 				avail := wnd - inFlight
 				maxChunk := maxPayload
@@ -2159,7 +2238,9 @@ func (c *tcpConn) Write(b []byte) (int, error) {
 				c.mu.Unlock()
 				return written, errors.New("send window stalled")
 			}
+			debug.Writef("netstack", "TCP Write waiting on sendCond key=%v", c.key)
 			c.sendCond.Wait()
+			debug.Writef("netstack", "TCP Write woke up: peerWnd=%d key=%v", c.peerWnd, c.key)
 		}
 		c.mu.Unlock()
 
@@ -2507,6 +2588,10 @@ func (ns *NetStack) sendTCPPacketWithOptions(
 	payload []byte,
 	options []byte,
 ) error {
+	nsDbg.Writef("sendTCP src=%v:%d dst=%v:%d seq=%d ack=%d flags=0x%02x payloadLen=%d optLen=%d",
+		net.IP(localIPv4[:]).String(), key.dstPort,
+		net.IP(key.srcIP[:]).String(), key.srcPort,
+		seq, ack, flags, len(payload), len(options))
 	if DEBUG {
 		var preview string
 		if len(payload) > 0 {

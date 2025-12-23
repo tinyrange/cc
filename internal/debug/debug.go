@@ -38,7 +38,8 @@ var (
 )
 
 func OpenFile(filename string) error {
-	f, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY, 0644)
+	// Truncate to ensure successive runs don't leave stale trailing entries.
+	f, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
