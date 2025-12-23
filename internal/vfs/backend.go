@@ -575,14 +575,14 @@ func (v *virtioFsBackend) ReadDir(nodeID uint64, off uint64, maxBytes uint32) ([
 			if cachedID, ok := dirNode.entries[name]; ok {
 				id = cachedID
 				child, _ := v.node(id)
-			if child != nil {
-				if child.isDir() {
-					typ = linux.DT_DIR
-				} else if child.isSymlink() {
-					typ = linux.DT_LNK
-				} else {
-					typ = linux.DT_REG
-				}
+				if child != nil {
+					if child.isDir() {
+						typ = linux.DT_DIR
+					} else if child.isSymlink() {
+						typ = linux.DT_LNK
+					} else {
+						typ = linux.DT_REG
+					}
 				}
 			} else if dirNode.abstractDir != nil {
 				// Look up in abstract directory

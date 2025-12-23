@@ -623,12 +623,12 @@ func isTimeout(err error) bool {
 
 func TestParseTCPOptions(t *testing.T) {
 	tests := []struct {
-		name        string
-		options     []byte
-		wantMSS     uint16
-		wantHasMSS  bool
-		wantWS      uint8
-		wantHasWS   bool
+		name       string
+		options    []byte
+		wantMSS    uint16
+		wantHasMSS bool
+		wantWS     uint8
+		wantHasWS  bool
 	}{
 		{
 			name:    "empty options",
