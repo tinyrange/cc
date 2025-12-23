@@ -846,14 +846,14 @@ func (d *mmioDevice) queuePointers(q *queue) (descTable []byte, avail []byte, us
 	if err := ensureQueueReady(q); err != nil {
 		return nil, nil, nil, err
 	}
-	
+
 	// Read descriptor table
 	descTableSize := uint64(q.size) * 16
 	descTable, err = d.readGuest(q.descAddr, uint32(descTableSize))
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("read descriptor table: %w", err)
 	}
-	
+
 	// Read available ring (header + ring + event idx if enabled)
 	availSize := 4 + uint64(q.size)*2
 	if d.eventIdxEnabled() {
@@ -863,7 +863,7 @@ func (d *mmioDevice) queuePointers(q *queue) (descTable []byte, avail []byte, us
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("read available ring: %w", err)
 	}
-	
+
 	// Read used ring (header + ring + event idx if enabled)
 	usedSize := 4 + uint64(q.size)*8
 	if d.eventIdxEnabled() {
@@ -873,7 +873,7 @@ func (d *mmioDevice) queuePointers(q *queue) (descTable []byte, avail []byte, us
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("read used ring: %w", err)
 	}
-	
+
 	return descTable, avail, used, nil
 }
 

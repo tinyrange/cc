@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tinyrange/cc/internal/debug"
 	"github.com/tinyrange/cc/internal/devices/virtio"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/factory"
@@ -55,7 +56,8 @@ func run() error {
 	cacheDir := flag.String("cache-dir", "", "Cache directory (default: ~/.config/cc/)")
 	cpus := flag.Int("cpus", 1, "Number of vCPUs")
 	memory := flag.Uint64("memory", 1024, "Memory in MB")
-	debug := flag.Bool("debug", false, "Enable debug logging")
+	dbg := flag.Bool("debug", false, "Enable debug logging")
+	debugFile := flag.String("debug-file", "", "Write debug stream to file")
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
 	memprofile := flag.String("memprofile", "", "Write memory profile to file")
 	dmesg := flag.Bool("dmesg", false, "Print kernel dmesg during boot and runtime")
@@ -73,7 +75,17 @@ func run() error {
 	}
 	flag.Parse()
 
-	if *debug {
+	if *debugFile != "" {
+		if err := debug.OpenFile(*debugFile); err != nil {
+			return fmt.Errorf("open debug file: %w", err)
+		}
+		defer debug.Close()
+
+		debug.Write("cc", "debug logging enabled")
+		debug.Writef("cc", "debug file: %s", *debugFile)
+	}
+
+	if *dbg {
 		slog.SetDefault(slog.New(slog.NewTextHandler(
 			&fixCrlf{w: os.Stderr},
 			&slog.HandlerOptions{Level: slog.LevelDebug},
@@ -142,6 +154,12 @@ func run() error {
 	}
 
 	slog.Debug("Pulling image", "ref", imageRef, "arch", hvArch)
+	debug.Writef(
+		"cc",
+		"pulling image %s for architecture %s",
+		imageRef,
+		hvArch,
+	)
 
 	// Pull image
 	img, err := client.PullForArch(imageRef, hvArch)
@@ -150,6 +168,11 @@ func run() error {
 	}
 
 	slog.Debug("Image pulled", "layers", len(img.Layers))
+	debug.Writef(
+		"cc",
+		"image pulled with %d layers",
+		len(img.Layers),
+	)
 
 	// Determine command to run
 	execCmd := img.Command(cmd)
@@ -167,12 +190,22 @@ func run() error {
 	}
 	defer containerFS.Close()
 
+	debug.Writef(
+		"cc",
+		"container filesystem created",
+	)
+
 	execCmd, err = resolveCommandPath(containerFS, execCmd, pathEnv, workDir)
 	if err != nil {
 		return fmt.Errorf("resolve command: %w", err)
 	}
 
 	slog.Debug("Running command", "cmd", execCmd)
+	debug.Writef(
+		"cc",
+		"running command %v",
+		execCmd,
+	)
 
 	// Create VirtioFS backend with container filesystem as root
 	fsBackend := vfs.NewVirtioFsBackendWithAbstract()
@@ -187,11 +220,22 @@ func run() error {
 	}
 	defer h.Close()
 
+	debug.Writef(
+		"cc",
+		"hypervisor created",
+	)
+
 	// Load kernel
 	kernelLoader, err := kernel.LoadForArchitecture(hvArch)
 	if err != nil {
 		return fmt.Errorf("load kernel: %w", err)
 	}
+
+	debug.Writef(
+		"cc",
+		"kernel loaded for architecture %s",
+		hvArch,
+	)
 
 	// Create VM with VirtioFS
 	opts := []initx.Option{
@@ -200,7 +244,7 @@ func run() error {
 			Backend: fsBackend,
 			Arch:    hvArch,
 		}),
-		initx.WithDebugLogging(*debug),
+		initx.WithDebugLogging(*dbg),
 		initx.WithDmesgLogging(*dmesg),
 		initx.WithStdin(os.Stdin),
 	}
@@ -249,6 +293,11 @@ func run() error {
 			MAC:     mac,
 			Arch:    hvArch,
 		}))
+
+		debug.Writef(
+			"cc",
+			"networking enabled",
+		)
 	}
 
 	vm, err := initx.NewVirtualMachine(
@@ -280,6 +329,11 @@ func run() error {
 			}
 			return debug.EnableTrace(64)
 		})
+
+		debug.Writef(
+			"cc",
+			"booting VM",
+		)
 
 		if err := vm.Run(ctx, &ir.Program{
 			Entrypoint: "main",
@@ -511,6 +565,11 @@ func run() error {
 			return fmt.Errorf("boot VM: %w", err)
 		}
 
+		debug.Writef(
+			"cc",
+			"VM booted successfully",
+		)
+
 		return nil
 	}(); err != nil {
 		return err
@@ -535,6 +594,12 @@ func run() error {
 		defer term.Restore(int(os.Stdin.Fd()), oldState)
 	}
 
+	debug.Writef(
+		"cc",
+		"running command %v",
+		execCmd,
+	)
+
 	if err := vm.Run(ctx, prog); err != nil {
 		var exitErr *initx.ExitError
 		if errors.As(err, &exitErr) {
@@ -542,6 +607,11 @@ func run() error {
 		}
 		return fmt.Errorf("run VM: %w", err)
 	}
+
+	debug.Writef(
+		"cc",
+		"command exited",
+	)
 
 	return nil
 }
