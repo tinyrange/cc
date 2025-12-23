@@ -221,10 +221,10 @@ func (r *reader) indexAll() error {
 			return fmt.Errorf("invalid header")
 		}
 		ts := decodeTimestamp(headerBytes)
-		if ts.Before(r.earliest) {
+		if r.earliest.IsZero() || ts.Before(r.earliest) {
 			r.earliest = ts
 		}
-		if ts.After(r.latest) {
+		if r.latest.IsZero() || ts.After(r.latest) {
 			r.latest = ts
 		}
 		// Read the source
@@ -391,10 +391,8 @@ func (r *reader) TimeRange() (time.Time, time.Time) {
 
 func NewReader(r io.ReaderAt) (Reader, error) {
 	ret := &reader{
-		r:        r,
-		index:    make(map[string][]indexEntry),
-		earliest: time.Unix(0, 0),
-		latest:   time.Unix(0, 0),
+		r:     r,
+		index: make(map[string][]indexEntry),
 	}
 
 	if err := ret.indexAll(); err != nil {
