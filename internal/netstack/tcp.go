@@ -50,7 +50,11 @@ func parseTCPOptions(options []byte) tcpOptions {
 				opts.mss = binary.BigEndian.Uint16(options[i+2 : i+4])
 				opts.hasMSS = true
 			}
-			i += int(options[i+1])
+			if i+1 < len(options) {
+				i += int(options[i+1])
+			} else {
+				return opts
+			}
 		case tcpOptWndScale:
 			if i+3 <= len(options) && options[i+1] == 3 {
 				opts.wndScale = options[i+2]
