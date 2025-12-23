@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"unsafe"
 
+	"github.com/tinyrange/cc/internal/debug"
 	x86chipset "github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	"github.com/tinyrange/cc/internal/hv"
 	"golang.org/x/sys/unix"
@@ -254,6 +255,13 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 
 	reason := kvmExitReason(run.exit_reason)
 
+	debug.Writef(
+		"kvm_amd64",
+		"vCPU %d exited with reason %s",
+		v.id,
+		reason,
+	)
+
 	switch reason {
 	case kvmExitInternalError:
 		err := (*internalError)(unsafe.Pointer(&run.anon0[0]))
@@ -273,9 +281,23 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		eoiData := (*kvmExitIoapicEoiData)(unsafe.Pointer(&run.anon0[0]))
 		return v.handleIoapicEoi(eoiData)
 	case kvmExitShutdown:
+		debug.Writef(
+			"kvm_amd64",
+			"vCPU %d exited with shutdown reason",
+			v.id,
+		)
+
 		return hv.ErrVMHalted
 	case kvmExitSystemEvent:
 		system := (*kvmSystemEvent)(unsafe.Pointer(&run.anon0[0]))
+
+		debug.Writef(
+			"kvm_amd64",
+			"vCPU %d exited with system event %d",
+			v.id,
+			system.typ,
+		)
+
 		if system.typ == uint32(kvmSystemEventShutdown) {
 			return hv.ErrVMHalted
 		} else if system.typ == uint32(kvmSystemEventReset) {
@@ -293,6 +315,12 @@ func (v *virtualCPU) handleIO(ioData *kvmExitIoData) error {
 	v.trace(fmt.Sprintf("handleIO port=0x%04x size=%d count=%d direction=%d data=% x",
 		ioData.port, ioData.size, ioData.count, ioData.direction, data))
 
+	debug.Writef(
+		fmt.Sprintf("kvm_amd64_io_0x%04x", ioData.port),
+		"handleIO port=0x%04x size=%d count=%d direction=%d data=% x",
+		ioData.port, ioData.size, ioData.count, ioData.direction, data,
+	)
+
 	cs, err := v.vm.ensureChipset()
 	if err != nil {
 		return fmt.Errorf("initialize chipset: %w", err)
@@ -302,18 +330,23 @@ func (v *virtualCPU) handleIO(ioData *kvmExitIoData) error {
 	if err := cs.HandlePIO(ioData.port, data, isWrite); err != nil {
 		return fmt.Errorf("I/O port 0x%04x: %w", ioData.port, err)
 	}
-	
+
 	// Poll devices after I/O to allow serial device to read input
 	if err := cs.Poll(context.Background()); err != nil {
 		return fmt.Errorf("poll devices: %w", err)
 	}
-	
+
 	return nil
 }
 
 func (v *virtualCPU) handleMMIO(mmioData *kvmExitMMIOData) error {
 	v.trace(fmt.Sprintf("handleMMIO physAddr=0x%016x size=%d isWrite=%d data=% x",
 		mmioData.physAddr, mmioData.len, mmioData.isWrite, mmioData.data))
+	debug.Writef(
+		fmt.Sprintf("kvm_amd64_mmio_0x%016x", mmioData.physAddr),
+		"handleMMIO physAddr=0x%016x size=%d isWrite=%d data=% x",
+		mmioData.physAddr, mmioData.len, mmioData.isWrite, mmioData.data,
+	)
 
 	cs, err := v.vm.ensureChipset()
 	if err != nil {
@@ -330,16 +363,22 @@ func (v *virtualCPU) handleMMIO(mmioData *kvmExitMMIOData) error {
 	if err := cs.HandleMMIO(mmioData.physAddr, data, isWrite); err != nil {
 		return fmt.Errorf("MMIO at 0x%016x: %w", mmioData.physAddr, err)
 	}
-	
+
 	// Poll devices after MMIO to allow serial device to read input
 	if err := cs.Poll(context.Background()); err != nil {
 		return fmt.Errorf("poll devices: %w", err)
 	}
-	
+
 	return nil
 }
 
 func (v *virtualCPU) handleIoapicEoi(eoiData *kvmExitIoapicEoiData) error {
+	debug.Writef(
+		"kvm_amd64",
+		"handleIoapicEoi vector=%d",
+		eoiData.vector,
+	)
+
 	if v.vm.ioapic != nil {
 		v.vm.ioapic.HandleEOI(uint32(eoiData.vector))
 	}
@@ -347,6 +386,11 @@ func (v *virtualCPU) handleIoapicEoi(eoiData *kvmExitIoapicEoiData) error {
 }
 
 func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
+	debug.Writef(
+		"kvm_amd64",
+		"archVMInit",
+	)
+
 	if err := setTSSAddr(vm.vmFd, 0xfffbd000); err != nil {
 		return fmt.Errorf("setting TSS addr: %w", err)
 	}
@@ -388,6 +432,11 @@ func (hv *hypervisor) archPostVCPUInit(vm *virtualMachine, config hv.VMConfig) e
 }
 
 func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int) error {
+	debug.Writef(
+		"kvm_amd64",
+		"archVCPUInit",
+	)
+
 	cpuId, err := getSupportedCpuId(hv.fd)
 	if err != nil {
 		return fmt.Errorf("getting vCPU ID: %w", err)
