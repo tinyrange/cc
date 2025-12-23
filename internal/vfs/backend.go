@@ -87,6 +87,8 @@ type fsNode struct {
 	xattr   map[string][]byte
 	modTime time.Time
 
+	symlinkTarget string
+
 	// Abstract backing - if set, delegates to these instead of in-memory storage.
 	abstractFile AbstractFile
 	abstractDir  AbstractDir
@@ -122,6 +124,10 @@ func (n *fsNode) isDir() bool {
 	return n.mode.IsDir()
 }
 
+func (n *fsNode) isSymlink() bool {
+	return n.mode&fs.ModeSymlink != 0
+}
+
 func (n *fsNode) blockUsage() uint64 {
 	if n.abstractFile != nil {
 		size, _ := n.abstractFile.Stat()
@@ -155,6 +161,9 @@ func (n *fsNode) attr() virtio.FuseAttr {
 		if mt := n.abstractDir.ModTime(); !mt.IsZero() {
 			modTime = mt
 		}
+	} else if n.isSymlink() {
+		perm = n.mode.Perm()
+		size = uint64(len(n.symlinkTarget))
 	} else {
 		perm = n.mode.Perm()
 		size = n.size
@@ -165,9 +174,12 @@ func (n *fsNode) attr() virtio.FuseAttr {
 	}
 
 	mode := uint32(perm)
-	if n.isDir() {
+	switch {
+	case n.isDir():
 		mode |= linux.S_IFDIR
-	} else {
+	case n.isSymlink():
+		mode |= linux.S_IFLNK
+	default:
 		mode |= linux.S_IFREG
 	}
 
@@ -563,8 +575,14 @@ func (v *virtioFsBackend) ReadDir(nodeID uint64, off uint64, maxBytes uint32) ([
 			if cachedID, ok := dirNode.entries[name]; ok {
 				id = cachedID
 				child, _ := v.node(id)
-				if child != nil && !child.isDir() {
-					typ = linux.DT_REG
+				if child != nil {
+					if child.isDir() {
+						typ = linux.DT_DIR
+					} else if child.isSymlink() {
+						typ = linux.DT_LNK
+					} else {
+						typ = linux.DT_REG
+					}
 				}
 			} else if dirNode.abstractDir != nil {
 				// Look up in abstract directory
@@ -995,6 +1013,64 @@ func (v *virtioFsBackend) SetAttr(nodeID uint64, size *uint64, mode *uint32) int
 		n.modTime = time.Now()
 	}
 	return 0
+}
+
+func (v *virtioFsBackend) Symlink(parent uint64, name string, target string, _ uint32) (nodeID uint64, attr virtio.FuseAttr, errno int32) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	v.ensureRoot()
+	parentNode, err := v.node(parent)
+	if err != 0 {
+		return 0, virtio.FuseAttr{}, err
+	}
+	if !parentNode.isDir() {
+		return 0, virtio.FuseAttr{}, -int32(linux.ENOTDIR)
+	}
+	clean := cleanName(name)
+	if clean == "" {
+		return 0, virtio.FuseAttr{}, -int32(linux.EINVAL)
+	}
+	if e := nameErr(clean); e != 0 {
+		return 0, virtio.FuseAttr{}, e
+	}
+	if _, exists := parentNode.entries[clean]; exists {
+		return 0, virtio.FuseAttr{}, -int32(linux.EEXIST)
+	}
+
+	id := v.nextID
+	v.nextID++
+	node := &fsNode{
+		id:            id,
+		name:          clean,
+		parent:        parentNode.id,
+		mode:          fs.ModeSymlink | 0o777,
+		size:          uint64(len(target)),
+		xattr:         make(map[string][]byte),
+		modTime:       time.Now(),
+		symlinkTarget: target,
+	}
+	parentNode.entries[clean] = id
+	if parentNode.abstractDir == nil {
+		parentNode.modTime = time.Now()
+	}
+	v.nodes[id] = node
+	return id, node.attr(), 0
+}
+
+func (v *virtioFsBackend) Readlink(nodeID uint64) (target string, errno int32) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	v.ensureRoot()
+	n, err := v.node(nodeID)
+	if err != 0 {
+		return "", err
+	}
+	if !n.isSymlink() {
+		return "", -int32(linux.EINVAL)
+	}
+	return n.symlinkTarget, 0
 }
 
 func buildFuseDirent(ino uint64, name string, typ uint32, nextOffset uint64) []byte {

@@ -339,6 +339,17 @@ type fsXattrBackend interface {
 	GetXattr(nodeID uint64, name string) ([]byte, int32)
 }
 
+type fsSymlinkBackend interface {
+	// Symlink creates a new symlink named `name` in directory `parent` which points to `target`.
+	// Returns the new nodeID and its attributes.
+	Symlink(parent uint64, name string, target string, umask uint32) (nodeID uint64, attr FuseAttr, errno int32)
+}
+
+type fsReadlinkBackend interface {
+	// Readlink returns the link target for a symlink node.
+	Readlink(nodeID uint64) (target string, errno int32)
+}
+
 type fsRenameBackend interface {
 	Rename(oldParent uint64, oldName string, newParent uint64, newName string, flags uint32) int32
 }
@@ -1150,6 +1161,52 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 				}
 				copy(resp[fuseHdrOutSize:], value)
 				return w(fuseOutHeader{Len: outLen, Error: 0, Unique: in.Unique}, nil), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_READLINK:
+		fsDbg.Writef("dispatchFUSE op=READLINK node=%d", in.NodeID)
+		if be, ok := v.backend.(fsReadlinkBackend); ok {
+			target, e := be.Readlink(in.NodeID)
+			errno = e
+			if errno == 0 {
+				data := []byte(target)
+				outLen := fuseHdrOutSize + uint32(len(data))
+				if int(outLen) > len(resp) {
+					data = data[:len(resp)-fuseHdrOutSize]
+					outLen = uint32(len(resp))
+				}
+				clear(resp[fuseHdrOutSize:])
+				copy(resp[fuseHdrOutSize:], data)
+				return w(fuseOutHeader{Len: outLen, Error: 0, Unique: in.Unique}, nil), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_SYMLINK:
+		// On-wire (Linux FUSE): `name\0target\0` (two NUL-terminated strings).
+		// Note: some protocol versions may include additional fields, but Alpine's apk uses the plain layout.
+		umask := uint32(0)
+		name, rest := readCString(req[fuseHdrInSize:])
+		target := ""
+		if rest != nil {
+			target = readName(rest)
+		}
+		fsDbg.Writef("dispatchFUSE op=SYMLINK parent=%d name=%q target=%q umask=0%o", in.NodeID, name, target, umask)
+		if be, ok := v.backend.(fsSymlinkBackend); ok {
+			nodeID, attr, e := be.Symlink(in.NodeID, name, target, umask)
+			errno = e
+			if errno == 0 {
+				// fuse_entry_out
+				extra := make([]byte, 40+88)
+				binary.LittleEndian.PutUint64(extra[0:8], nodeID)
+				binary.LittleEndian.PutUint64(extra[16:24], 1) // entry_valid
+				binary.LittleEndian.PutUint64(extra[24:32], 1) // attr_valid
+				encodeFuseAttr(extra[40:], attr)
+				return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
 			}
 		} else {
 			errno = -int32(linux.ENOSYS)
