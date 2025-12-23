@@ -1491,11 +1491,11 @@ type tcpConn struct {
 	closed        bool
 
 	// Retransmission support
-	sendBuf     *tcpSendBuffer     // segments awaiting ACK
-	rttEst      *tcpRTTEstimator   // RTT estimation for RTO
-	retxTimer   *time.Timer        // retransmission timer
-	retxTimerMu sync.Mutex         // protects retxTimer
-	retxCount   int                // total retransmissions on this conn
+	sendBuf     *tcpSendBuffer   // segments awaiting ACK
+	rttEst      *tcpRTTEstimator // RTT estimation for RTO
+	retxTimer   *time.Timer      // retransmission timer
+	retxTimerMu sync.Mutex       // protects retxTimer
+	retxCount   int              // total retransmissions on this conn
 
 	// Out-of-order receive buffering
 	oooRecvBuf *tcpRecvBuffer // out-of-order segments
@@ -1509,6 +1509,7 @@ type tcpConn struct {
 
 	// Congestion control
 	congCtrl *tcpCongestionControl
+	dupAcks  int // duplicate ACK counter for fast retransmit
 
 	// Delayed ACK
 	delayedAckTimer *time.Timer
@@ -1566,8 +1567,8 @@ func newTCPConn(
 		// Congestion control
 		congCtrl: newTCPCongestionControl(defaultMSS),
 
-		// Nagle enabled by default
-		nagleEnabled: true,
+		// Nagle disabled by default (can cause deadlock with delayed ACK)
+		nagleEnabled: false,
 	}
 	if c.peerWnd == 0 {
 		c.peerWnd = 0xffff
@@ -1623,9 +1624,13 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 			return nil
 		}
 
+		// Parse TCP options from SYN
+		opts := parseTCPOptions(hdr.options)
+
 		// Local listener present? Create a conn and complete handshake.
 		if listener, ok := ns.tcpListen[hdr.dstPort]; ok {
 			conn = newTCPConn(ns, listener, key, hdr.seq, hdr.window, ns.hostIPv4, nil)
+			conn.applyPeerOptions(opts)
 			ns.tcpConns[key] = conn
 			ns.tcpMu.Unlock()
 			conn.sendSynAck()
@@ -1658,6 +1663,7 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 				ns.startServiceProxy(c)
 			}
 			conn = newTCPConn(ns, nil, key, hdr.seq, hdr.window, ns.serviceIPv4, onEstablished)
+			conn.applyPeerOptions(opts)
 			ns.tcpConns[key] = conn
 			ns.tcpMu.Unlock()
 			conn.sendSynAck()
@@ -1680,6 +1686,7 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 				ns.startOutboundTCPProxy(c)
 			}
 			conn = newTCPConn(ns, nil, key, hdr.seq, hdr.window, localIPv4, onEstablished)
+			conn.applyPeerOptions(opts)
 			ns.tcpConns[key] = conn
 			ns.tcpMu.Unlock()
 			conn.sendSynAck()
@@ -1718,9 +1725,71 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 		// Record advertised receive window for flow control.
 		c.peerWnd = hdr.window
 		if hdr.ack > c.sendAcked {
+			// Calculate bytes acknowledged for congestion control
+			bytesAcked := hdr.ack - c.sendAcked
 			c.sendAcked = hdr.ack
+
+			// Reset duplicate ACK counter on new ACK
+			c.dupAcks = 0
+
+			// Update congestion control
+			if c.congCtrl != nil {
+				c.congCtrl.onAck(int(bytesAcked))
+			}
+
+			// Free acknowledged segments from send buffer and get RTT sample
+			if c.sendBuf != nil {
+				_, rttSample, hasRTT := c.sendBuf.ack(hdr.ack)
+				// Update RTT estimator with sample from non-retransmitted segment
+				if hasRTT && c.rttEst != nil {
+					c.rttEst.update(rttSample)
+				}
+
+				// Manage retransmit timer
+				if c.sendBuf.len() > 0 {
+					// Restart timer with updated RTO
+					c.startRetxTimer()
+				} else {
+					// All data acked, stop timer
+					c.stopRetxTimer()
+
+					// Flush Nagle buffer if all in-flight data is acknowledged
+					if len(c.nagleBuf) > 0 {
+						nagleData := c.nagleBuf
+						c.nagleBuf = nil
+						seq := c.hostSeq
+						ack := c.guestSeq
+						c.hostSeq += uint32(len(nagleData))
+						c.mu.Unlock()
+						// Send buffered Nagle data
+						c.stack.sendTCPPacket(c.localIPv4, c.key, seq, ack, tcpFlagACK|tcpFlagPSH, nagleData)
+						c.mu.Lock()
+					}
+				}
+			}
+
 			if c.sendCond != nil {
 				c.sendCond.Broadcast()
+			}
+		} else if hdr.ack == c.sendAcked && c.sendBuf != nil && c.sendBuf.len() > 0 {
+			// Duplicate ACK - same ACK value with no new data
+			c.dupAcks++
+			if c.congCtrl != nil && c.congCtrl.onDupAck() {
+				// 3 duplicate ACKs - trigger fast retransmit
+				seg, ok := c.sendBuf.oldest()
+				if ok {
+					ack := c.guestSeq
+					c.mu.Unlock()
+					if DEBUG {
+						c.stack.log.Info("raw: fast retransmit",
+							"seq", seg.seqStart,
+							"len", len(seg.payload),
+							"dupAcks", c.dupAcks,
+						)
+					}
+					c.stack.sendTCPPacket(c.localIPv4, c.key, seg.seqStart, ack, tcpFlagACK, seg.payload)
+					c.mu.Lock()
+				}
 			}
 		}
 		// If the peer ACKs beyond what we think we've sent, resync to avoid
@@ -1765,29 +1834,56 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 	case tcpStateEstablished:
 		if len(hdr.payload) > 0 {
 			if hdr.seq != c.guestSeq {
-				c.stack.log.Info(
-					"raw: conn out-of-order",
-					"seq", hdr.seq,
-					"expect", c.guestSeq,
-				)
+				// Out-of-order segment: buffer it for later reassembly
+				if seqGT(hdr.seq, c.guestSeq) && c.oooRecvBuf != nil {
+					seg := tcpOOOSegment{
+						seqStart: hdr.seq,
+						seqEnd:   hdr.seq + uint32(len(hdr.payload)),
+						payload:  append([]byte(nil), hdr.payload...),
+					}
+					c.oooRecvBuf.insert(seg)
+					if DEBUG {
+						c.stack.log.Info(
+							"raw: buffered out-of-order segment",
+							"seq", hdr.seq,
+							"expect", c.guestSeq,
+							"buffered", c.oooRecvBuf.len(),
+						)
+					}
+				}
 				c.mu.Unlock()
 				// Always ACK our current receive position so the sender can
-				// retransmit. Without this, a real TCP stack can stall waiting
-				// for an ACK that never comes.
+				// retransmit (duplicate ACK triggers fast retransmit).
 				c.sendAck()
 				return nil
 			}
+
+			// In-order segment: deliver it
 			c.guestSeq += uint32(len(hdr.payload))
 			data := append([]byte{}, hdr.payload...)
+
+			// Check OOO buffer for contiguous segments
+			var contiguous [][]byte
+			if c.oooRecvBuf != nil {
+				contiguous = c.oooRecvBuf.collectContiguous(&c.guestSeq)
+			}
+
 			if DEBUG {
 				c.stack.log.Info(
 					"raw: conn data",
 					"len", len(data),
 					"newGuestSeq", c.guestSeq,
+					"reassembled", len(contiguous),
 				)
 			}
 			c.mu.Unlock()
+
+			// Deliver all data to application
 			c.enqueueData(data)
+			for _, seg := range contiguous {
+				c.enqueueData(seg)
+			}
+			// Send ACK immediately (delayed ACK can cause deadlock with Nagle)
 			c.sendAck()
 			return nil
 		}
@@ -1796,7 +1892,8 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 			c.state = tcpStateFinWait
 			c.mu.Unlock()
 			c.enqueueData(nil) // signal EOF to readers
-			c.sendAck()
+			// Send ACK immediately for FIN
+			c.sendAckImmediate()
 			c.sendFin()
 			return nil
 		}
@@ -1862,10 +1959,14 @@ func (c *tcpConn) sendSynAck() {
 	c.mu.Lock()
 	seq := c.hostSeq
 	ack := c.guestSeq
+	wndScaleOK := c.wndScaleOK
+	ourWndScale := c.ourWndScale
 	c.hostSeq++
 	c.mu.Unlock()
 
-	c.stack.sendTCPPacket(c.localIPv4, c.key, seq, ack, tcpFlagSYN|tcpFlagACK, nil)
+	// Build TCP options for SYN-ACK (MSS and optionally Window Scale)
+	options := buildSynAckOptions(defaultMSS, ourWndScale, wndScaleOK)
+	c.stack.sendTCPPacketWithOptions(c.localIPv4, c.key, seq, ack, tcpFlagSYN|tcpFlagACK, nil, options)
 }
 
 func (c *tcpConn) sendAck() {
@@ -2001,10 +2102,18 @@ func (c *tcpConn) Write(b []byte) (int, error) {
 				c.mu.Unlock()
 				return written, net.ErrClosed
 			}
-			// Simple send-side flow control: don't send more than the peer's
-			// advertised window without seeing ACK progress.
+			// Send-side flow control: don't send more than min(cwnd, peerWnd).
+			// Apply window scaling if negotiated.
 			inFlight := c.hostSeq - c.sendAcked
-			wnd := uint32(c.peerWnd)
+			peerWnd := uint32(c.peerWnd)
+			if c.wndScaleOK {
+				peerWnd = peerWnd << c.peerWndScale
+			}
+			// Use effective window (min of congestion window and peer window)
+			wnd := peerWnd
+			if c.congCtrl != nil {
+				wnd = c.congCtrl.effectiveWindow(peerWnd)
+			}
 			if wnd > 0 && inFlight < wnd {
 				avail := wnd - inFlight
 				maxChunk := maxPayload
@@ -2015,11 +2124,33 @@ func (c *tcpConn) Write(b []byte) (int, error) {
 				if len(chunk) > maxChunk {
 					chunk = chunk[:maxChunk]
 				}
+
+				// Nagle's algorithm: buffer small writes if data is in flight
+				if c.nagleEnabled && len(chunk) < maxPayload && inFlight > 0 {
+					// Add to Nagle buffer instead of sending immediately
+					c.nagleBuf = append(c.nagleBuf, chunk...)
+					written += len(chunk)
+					c.mu.Unlock()
+					// Skip to next iteration without going through normal send path
+					goto nextChunk
+				}
+
+				// If we have buffered Nagle data, prepend it
+				if len(c.nagleBuf) > 0 {
+					chunk = append(c.nagleBuf, chunk...)
+					c.nagleBuf = nil
+					if len(chunk) > maxChunk {
+						// Send up to maxChunk, keep rest in nagleBuf
+						c.nagleBuf = append([]byte(nil), chunk[maxChunk:]...)
+						chunk = chunk[:maxChunk]
+					}
+				}
+
 				seq = c.hostSeq
 				ack = c.guestSeq
 				c.hostSeq += uint32(len(chunk))
 				flags = uint16(tcpFlagACK)
-				if written+len(chunk) == len(b) {
+				if written+len(chunk) == len(b) && len(c.nagleBuf) == 0 {
 					flags |= uint16(tcpFlagPSH)
 				}
 				break
@@ -2039,7 +2170,32 @@ func (c *tcpConn) Write(b []byte) (int, error) {
 		if err := c.stack.sendTCPPacket(c.localIPv4, c.key, seq, ack, flags, chunk); err != nil {
 			return written, err
 		}
+
+		// Add to send buffer for potential retransmission
+		if c.sendBuf != nil {
+			seg := tcpSendSegment{
+				seqStart: seq,
+				seqEnd:   seq + uint32(len(chunk)),
+				payload:  append([]byte(nil), chunk...), // copy
+				sentAt:   time.Now(),
+			}
+			// Wait for space if buffer is full
+			for !c.sendBuf.append(seg) {
+				c.mu.Lock()
+				if c.closed {
+					c.mu.Unlock()
+					return written, net.ErrClosed
+				}
+				c.sendCond.Wait()
+				c.mu.Unlock()
+			}
+
+			// Start retransmit timer if not already running
+			c.startRetxTimer()
+		}
+
 		written += len(chunk)
+	nextChunk:
 	}
 	return len(b), nil
 }
