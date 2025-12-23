@@ -56,7 +56,11 @@ func parseTCPOptions(options []byte) tcpOptions {
 				opts.wndScale = options[i+2]
 				opts.hasWndScale = true
 			}
-			i += int(options[i+1])
+			if i+1 < len(options) {
+				i += int(options[i+1])
+			} else {
+				return opts
+			}
 		default:
 			// Skip unknown option using length field
 			if i+1 >= len(options) {
