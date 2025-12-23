@@ -616,3 +616,272 @@ func isTimeout(err error) bool {
 	nErr, ok := err.(net.Error)
 	return ok && nErr.Timeout()
 }
+
+////////////////////////////////////////////////////////////////////////////////
+// TCP feature tests
+////////////////////////////////////////////////////////////////////////////////
+
+func TestParseTCPOptions(t *testing.T) {
+	tests := []struct {
+		name        string
+		options     []byte
+		wantMSS     uint16
+		wantHasMSS  bool
+		wantWS      uint8
+		wantHasWS   bool
+	}{
+		{
+			name:    "empty options",
+			options: nil,
+		},
+		{
+			name:       "MSS only",
+			options:    []byte{2, 4, 0x05, 0xb4}, // MSS = 1460
+			wantMSS:    1460,
+			wantHasMSS: true,
+		},
+		{
+			name:      "Window Scale only",
+			options:   []byte{1, 3, 3, 7}, // NOP + WS = 7
+			wantWS:    7,
+			wantHasWS: true,
+		},
+		{
+			name:       "MSS and Window Scale",
+			options:    []byte{2, 4, 0x05, 0xb4, 1, 3, 3, 7}, // MSS=1460, NOP, WS=7
+			wantMSS:    1460,
+			wantHasMSS: true,
+			wantWS:     7,
+			wantHasWS:  true,
+		},
+		{
+			name:    "End of options",
+			options: []byte{0, 2, 4, 0x05, 0xb4}, // EOL followed by MSS (should stop at EOL)
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := parseTCPOptions(tc.options)
+			if opts.hasMSS != tc.wantHasMSS {
+				t.Errorf("hasMSS: got %v, want %v", opts.hasMSS, tc.wantHasMSS)
+			}
+			if opts.hasMSS && opts.mss != tc.wantMSS {
+				t.Errorf("mss: got %d, want %d", opts.mss, tc.wantMSS)
+			}
+			if opts.hasWndScale != tc.wantHasWS {
+				t.Errorf("hasWndScale: got %v, want %v", opts.hasWndScale, tc.wantHasWS)
+			}
+			if opts.hasWndScale && opts.wndScale != tc.wantWS {
+				t.Errorf("wndScale: got %d, want %d", opts.wndScale, tc.wantWS)
+			}
+		})
+	}
+}
+
+func TestBuildSynAckOptions(t *testing.T) {
+	// Without window scale
+	opts := buildSynAckOptions(1460, 0, false)
+	if len(opts) != 4 {
+		t.Fatalf("expected 4 bytes, got %d", len(opts))
+	}
+	if opts[0] != 2 || opts[1] != 4 {
+		t.Fatalf("expected MSS option header, got %v", opts[:2])
+	}
+	mss := binary.BigEndian.Uint16(opts[2:4])
+	if mss != 1460 {
+		t.Fatalf("expected MSS 1460, got %d", mss)
+	}
+
+	// With window scale
+	opts = buildSynAckOptions(1460, 7, true)
+	if len(opts) != 8 {
+		t.Fatalf("expected 8 bytes, got %d", len(opts))
+	}
+	// Check WS option at end
+	if opts[5] != 3 || opts[6] != 3 || opts[7] != 7 {
+		t.Fatalf("expected WS option, got %v", opts[4:8])
+	}
+}
+
+func TestTCPSendBuffer(t *testing.T) {
+	sb := newTCPSendBuffer(1024)
+
+	// Test append
+	seg1 := tcpSendSegment{
+		seqStart: 100,
+		seqEnd:   200,
+		payload:  make([]byte, 100),
+		sentAt:   time.Now(),
+	}
+	if !sb.append(seg1) {
+		t.Fatal("append should succeed")
+	}
+	if sb.len() != 1 {
+		t.Fatalf("expected 1 segment, got %d", sb.len())
+	}
+	if sb.inFlight() != 100 {
+		t.Fatalf("expected 100 in flight, got %d", sb.inFlight())
+	}
+
+	// Test oldest
+	oldest, ok := sb.oldest()
+	if !ok {
+		t.Fatal("oldest should return segment")
+	}
+	if oldest.seqStart != 100 {
+		t.Fatalf("expected seqStart 100, got %d", oldest.seqStart)
+	}
+
+	// Test ack
+	bytesAcked, _, _ := sb.ack(200)
+	if bytesAcked != 100 {
+		t.Fatalf("expected 100 bytes acked, got %d", bytesAcked)
+	}
+	if sb.len() != 0 {
+		t.Fatalf("expected 0 segments after ack, got %d", sb.len())
+	}
+
+	// Test capacity limit
+	for i := 0; i < 15; i++ {
+		seg := tcpSendSegment{
+			seqStart: uint32(i * 100),
+			seqEnd:   uint32((i + 1) * 100),
+			payload:  make([]byte, 100),
+			sentAt:   time.Now(),
+		}
+		if !sb.append(seg) {
+			// Should fail around 1024/100 = 10 segments
+			if i < 10 {
+				t.Fatalf("append should succeed for segment %d", i)
+			}
+			break
+		}
+	}
+}
+
+func TestTCPRecvBuffer(t *testing.T) {
+	rb := newTCPRecvBuffer(8)
+
+	// Insert out of order segments
+	seg2 := tcpOOOSegment{seqStart: 200, seqEnd: 300, payload: []byte("seg2")}
+	seg3 := tcpOOOSegment{seqStart: 300, seqEnd: 400, payload: []byte("seg3")}
+
+	if !rb.insert(seg2) {
+		t.Fatal("insert seg2 should succeed")
+	}
+	if !rb.insert(seg3) {
+		t.Fatal("insert seg3 should succeed")
+	}
+	if rb.len() != 2 {
+		t.Fatalf("expected 2 segments, got %d", rb.len())
+	}
+
+	// Collect should return nothing yet (gap at start)
+	nextSeq := uint32(100)
+	collected := rb.collectContiguous(&nextSeq)
+	if len(collected) != 0 {
+		t.Fatalf("expected 0 collected, got %d", len(collected))
+	}
+	if nextSeq != 100 {
+		t.Fatalf("nextSeq should be unchanged")
+	}
+
+	// Now "receive" seg1 and collect
+	nextSeq = 200
+	collected = rb.collectContiguous(&nextSeq)
+	if len(collected) != 2 {
+		t.Fatalf("expected 2 collected, got %d", len(collected))
+	}
+	if nextSeq != 400 {
+		t.Fatalf("expected nextSeq 400, got %d", nextSeq)
+	}
+	if rb.len() != 0 {
+		t.Fatalf("expected 0 segments after collect, got %d", rb.len())
+	}
+}
+
+func TestTCPRTTEstimator(t *testing.T) {
+	rtt := newTCPRTTEstimator()
+
+	// Initial RTO should be 1s
+	if rtt.getRTO() != initialRTO {
+		t.Fatalf("expected initial RTO %v, got %v", initialRTO, rtt.getRTO())
+	}
+
+	// First measurement
+	rtt.update(100 * time.Millisecond)
+	if rtt.srtt != 100*time.Millisecond {
+		t.Fatalf("expected SRTT 100ms, got %v", rtt.srtt)
+	}
+
+	// RTO should be bounded by minRTO
+	if rtt.getRTO() < minRTO {
+		t.Fatalf("RTO %v should be >= minRTO %v", rtt.getRTO(), minRTO)
+	}
+
+	// Backoff should double RTO
+	prevRTO := rtt.getRTO()
+	rtt.backoff()
+	if rtt.getRTO() != prevRTO*2 {
+		t.Fatalf("expected RTO %v after backoff, got %v", prevRTO*2, rtt.getRTO())
+	}
+}
+
+func TestTCPCongestionControl(t *testing.T) {
+	cc := newTCPCongestionControl(1460)
+
+	// Initial cwnd should be 10 * MSS
+	expectedCwnd := uint32(10 * 1460)
+	if cc.getCwnd() != expectedCwnd {
+		t.Fatalf("expected initial cwnd %d, got %d", expectedCwnd, cc.getCwnd())
+	}
+
+	// Slow start: cwnd should increase by bytes acked
+	cc.onAck(1460)
+	if cc.getCwnd() != expectedCwnd+1460 {
+		t.Fatalf("expected cwnd %d after ack, got %d", expectedCwnd+1460, cc.getCwnd())
+	}
+
+	// Test duplicate ACK handling
+	cc.dupAcks = 0
+	for i := 0; i < 2; i++ {
+		if cc.onDupAck() {
+			t.Fatalf("should not trigger fast retransmit on dup ack %d", i+1)
+		}
+	}
+	// Third dup ack should trigger fast retransmit
+	if !cc.onDupAck() {
+		t.Fatal("should trigger fast retransmit on 3rd dup ack")
+	}
+
+	// Test timeout
+	cc.onTimeout()
+	if cc.getCwnd() != uint32(cc.mss) {
+		t.Fatalf("expected cwnd reset to MSS after timeout, got %d", cc.getCwnd())
+	}
+}
+
+func TestSeqNumberHelpers(t *testing.T) {
+	// Test wraparound handling
+	if !seqLT(0xFFFFFFFF, 0) {
+		t.Error("seqLT should handle wraparound: 0xFFFFFFFF < 0")
+	}
+	if !seqGT(0, 0xFFFFFFFF) {
+		t.Error("seqGT should handle wraparound: 0 > 0xFFFFFFFF")
+	}
+	if !seqLTE(100, 100) {
+		t.Error("seqLTE should return true for equal values")
+	}
+	if !seqGTE(100, 100) {
+		t.Error("seqGTE should return true for equal values")
+	}
+
+	// Test overlap detection
+	if !seqOverlap(100, 200, 150, 250) {
+		t.Error("seqOverlap should detect overlapping ranges")
+	}
+	if seqOverlap(100, 200, 200, 300) {
+		t.Error("seqOverlap should not detect adjacent ranges as overlapping")
+	}
+}

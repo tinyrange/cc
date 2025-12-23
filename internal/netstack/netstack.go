@@ -976,6 +976,17 @@ func (ns *NetStack) handleIPv4Internal(srcMAC net.HardwareAddr, payload []byte, 
 		return err
 	}
 
+	// Validate IPv4 header checksum before processing.
+	// A correct checksum will result in 0 when computed over the entire header.
+	headerLen := int(hdr.ihl) * 4
+	if headerLen <= len(payload) {
+		computed := ipv4Checksum(payload[:headerLen])
+		if computed != 0 {
+			// Invalid checksum, drop silently
+			return nil
+		}
+	}
+
 	// We act as an L3 gateway for the guest. Ethernet filtering already ensures
 	// the frame is addressed to us; accept routed IPv4 packets regardless of
 	// destination IP.
@@ -1080,6 +1091,16 @@ func (ns *NetStack) handleUDPWithReuse(h ipv4Header, payload []byte, releaseUnsa
 
 	if int(length) > len(payload) {
 		return fmt.Errorf("udp length exceeds payload: %d > %d", length, len(payload))
+	}
+
+	// Validate UDP checksum if present (checksum of 0 means not computed).
+	udpChksum := binary.BigEndian.Uint16(payload[6:8])
+	if udpChksum != 0 {
+		computed := udpChecksum(h.src, h.dst, payload[:length])
+		if computed != 0 {
+			// Invalid checksum, drop silently
+			return nil
+		}
 	}
 
 	data := payload[8:length]
@@ -1449,7 +1470,7 @@ func (l *tcpListener) Addr() net.Addr {
 	return &tcpAddr{ip: net.IP(l.stack.hostIPv4[:]), port: l.port}
 }
 
-// tcpConn is a minimal half-duplex-ish TCP connection to the guest.
+// tcpConn is a TCP connection to the guest with full reliability support.
 type tcpConn struct {
 	stack         *NetStack
 	listener      *tcpListener
@@ -1468,7 +1489,45 @@ type tcpConn struct {
 	readDeadline  time.Time
 	writeDeadline time.Time
 	closed        bool
+
+	// Retransmission support
+	sendBuf     *tcpSendBuffer     // segments awaiting ACK
+	rttEst      *tcpRTTEstimator   // RTT estimation for RTO
+	retxTimer   *time.Timer        // retransmission timer
+	retxTimerMu sync.Mutex         // protects retxTimer
+	retxCount   int                // total retransmissions on this conn
+
+	// Out-of-order receive buffering
+	oooRecvBuf *tcpRecvBuffer // out-of-order segments
+
+	// MSS and window scaling
+	mss          uint16 // our MSS (send side)
+	peerMSS      uint16 // peer's MSS
+	peerWndScale uint8  // peer's window scale shift count
+	ourWndScale  uint8  // our window scale shift count
+	wndScaleOK   bool   // whether window scaling was negotiated
+
+	// Congestion control
+	congCtrl *tcpCongestionControl
+
+	// Delayed ACK
+	delayedAckTimer *time.Timer
+	delayedAckMu    sync.Mutex
+	unackedSegs     int // segments received without ACK
+
+	// Nagle algorithm
+	nagleEnabled bool   // whether Nagle is active
+	nagleBuf     []byte // pending small write
 }
+
+// Default MSS for Ethernet (1500 MTU - 20 IP - 20 TCP).
+const defaultMSS = 1460
+
+// Send buffer capacity (256 KB should handle most transfers).
+const sendBufCapacity = 256 * 1024
+
+// Max out-of-order segments to buffer.
+const maxOOOSegments = 16
 
 func newTCPConn(
 	stack *NetStack,
@@ -1479,6 +1538,7 @@ func newTCPConn(
 	localIPv4 [4]byte,
 	onEstablished func(*tcpConn),
 ) *tcpConn {
+	initialSeq := uint32(stack.randSource.Int31())
 	c := &tcpConn{
 		stack:         stack,
 		listener:      listener,
@@ -1487,13 +1547,28 @@ func newTCPConn(
 		onEstablished: onEstablished,
 		state:         tcpStateSynRcvd,
 		guestSeq:      guestSeq + 1, // Expect data after SYN
-		hostSeq:       uint32(stack.randSource.Int31()),
-		sendAcked:     uint32(stack.randSource.Int31()),
+		hostSeq:       initialSeq,
+		sendAcked:     initialSeq,
 		peerWnd:       peerWnd,
 		recvBuf:       make(chan []byte, 512),
+
+		// Retransmission
+		sendBuf: newTCPSendBuffer(sendBufCapacity),
+		rttEst:  newTCPRTTEstimator(),
+
+		// OOO receive
+		oooRecvBuf: newTCPRecvBuffer(maxOOOSegments),
+
+		// MSS defaults (may be updated by options)
+		mss:     defaultMSS,
+		peerMSS: defaultMSS,
+
+		// Congestion control
+		congCtrl: newTCPCongestionControl(defaultMSS),
+
+		// Nagle enabled by default
+		nagleEnabled: true,
 	}
-	// Initialize sendAcked to the initial sequence number (before we send SYN).
-	c.sendAcked = c.hostSeq
 	if c.peerWnd == 0 {
 		c.peerWnd = 0xffff
 	}
@@ -1503,6 +1578,13 @@ func newTCPConn(
 
 // handleTCP demuxes by 4-tuple to an existing conn or establishes a new one.
 func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
+	// Validate TCP checksum with pseudo-header before parsing.
+	computed := tcpChecksum(h.src, h.dst, payload)
+	if computed != 0 {
+		// Invalid checksum, drop silently
+		return nil
+	}
+
 	hdr, err := parseTCPHeader(payload)
 	if err != nil {
 		return err
@@ -1760,6 +1842,22 @@ func (c *tcpConn) enqueueData(data []byte) {
 	c.mu.Unlock()
 }
 
+// applyPeerOptions stores the peer's TCP options from the SYN segment.
+func (c *tcpConn) applyPeerOptions(opts tcpOptions) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if opts.hasMSS {
+		c.peerMSS = opts.mss
+	}
+	if opts.hasWndScale {
+		c.peerWndScale = opts.wndScale
+		c.wndScaleOK = true
+		// Use a moderate window scale for ourselves (7 = 128KB windows)
+		c.ourWndScale = 7
+	}
+}
+
 func (c *tcpConn) sendSynAck() {
 	c.mu.Lock()
 	seq := c.hostSeq
@@ -1785,6 +1883,52 @@ func (c *tcpConn) sendFin() {
 	c.hostSeq++
 	c.mu.Unlock()
 	c.stack.sendTCPPacket(c.localIPv4, c.key, seq, ack, tcpFlagFIN|tcpFlagACK, nil)
+}
+
+// Delayed ACK constants.
+const delayedAckTimeout = 50 * time.Millisecond
+const delayedAckMaxSegs = 2
+
+// scheduleAck implements delayed ACK: ACK immediately on 2nd segment or after timeout.
+func (c *tcpConn) scheduleAck() {
+	c.delayedAckMu.Lock()
+	defer c.delayedAckMu.Unlock()
+
+	c.unackedSegs++
+
+	if c.unackedSegs >= delayedAckMaxSegs {
+		// Send ACK immediately for every 2nd segment
+		c.unackedSegs = 0
+		if c.delayedAckTimer != nil {
+			c.delayedAckTimer.Stop()
+			c.delayedAckTimer = nil
+		}
+		go c.sendAck()
+		return
+	}
+
+	// First segment: start delayed ACK timer
+	if c.delayedAckTimer == nil {
+		c.delayedAckTimer = time.AfterFunc(delayedAckTimeout, func() {
+			c.delayedAckMu.Lock()
+			c.unackedSegs = 0
+			c.delayedAckTimer = nil
+			c.delayedAckMu.Unlock()
+			c.sendAck()
+		})
+	}
+}
+
+// sendAckImmediate sends an ACK immediately, canceling any delayed ACK timer.
+func (c *tcpConn) sendAckImmediate() {
+	c.delayedAckMu.Lock()
+	c.unackedSegs = 0
+	if c.delayedAckTimer != nil {
+		c.delayedAckTimer.Stop()
+		c.delayedAckTimer = nil
+	}
+	c.delayedAckMu.Unlock()
+	c.sendAck()
 }
 
 // Read returns payload delivered by the guest. A nil buffer pushed into the
@@ -1837,8 +1981,6 @@ func (c *tcpConn) Read(b []byte) (int, error) {
 }
 
 // Write transmits payload to the guest.
-//
-// BUG: writeDeadline is not enforced.
 func (c *tcpConn) Write(b []byte) (int, error) {
 	// Keep payloads below a typical Ethernet MTU. We don't implement IP
 	// fragmentation, and some virtio backends will drop oversized frames.
@@ -1902,6 +2044,89 @@ func (c *tcpConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+// startRetxTimer starts or restarts the retransmission timer.
+func (c *tcpConn) startRetxTimer() {
+	c.retxTimerMu.Lock()
+	defer c.retxTimerMu.Unlock()
+
+	if c.retxTimer != nil {
+		c.retxTimer.Stop()
+	}
+
+	rto := c.rttEst.getRTO()
+	c.retxTimer = time.AfterFunc(rto, c.onRetxTimeout)
+}
+
+// stopRetxTimer stops the retransmission timer.
+func (c *tcpConn) stopRetxTimer() {
+	c.retxTimerMu.Lock()
+	defer c.retxTimerMu.Unlock()
+
+	if c.retxTimer != nil {
+		c.retxTimer.Stop()
+		c.retxTimer = nil
+	}
+}
+
+// onRetxTimeout handles retransmission timeout.
+func (c *tcpConn) onRetxTimeout() {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+
+	// Get oldest unacked segment
+	seg, ok := c.sendBuf.oldest()
+	if !ok {
+		c.mu.Unlock()
+		return
+	}
+
+	// Check max retries
+	const maxRetries = 10
+	if seg.retxCount >= maxRetries {
+		c.mu.Unlock()
+		c.logStallSnapshot("max retries exceeded")
+		c.Close()
+		return
+	}
+
+	// Log stall info every 3 retries
+	if seg.retxCount > 0 && seg.retxCount%3 == 0 {
+		c.mu.Unlock()
+		c.logStallSnapshot("repeated retransmissions")
+		c.mu.Lock()
+	}
+
+	// Notify congestion control of timeout
+	c.congCtrl.onTimeout()
+
+	// Exponential backoff
+	c.rttEst.backoff()
+
+	ack := c.guestSeq
+	c.retxCount++
+	c.mu.Unlock()
+
+	// Mark segment as retransmitted
+	c.sendBuf.markRetransmitted()
+
+	if DEBUG {
+		c.stack.log.Info("raw: retransmitting segment",
+			"seq", seg.seqStart,
+			"len", len(seg.payload),
+			"retxCount", seg.retxCount+1,
+		)
+	}
+
+	// Retransmit
+	_ = c.stack.sendTCPPacket(c.localIPv4, c.key, seg.seqStart, ack, tcpFlagACK, seg.payload)
+
+	// Restart timer
+	c.startRetxTimer()
+}
+
 func (c *tcpConn) Close() error {
 	c.mu.Lock()
 	if c.closed {
@@ -1920,6 +2145,18 @@ func (c *tcpConn) Close() error {
 	close(c.recvBuf)
 	c.mu.Unlock()
 
+	// Stop timers
+	c.stopRetxTimer()
+	c.stopDelayedAckTimer()
+
+	// Clear buffers
+	if c.sendBuf != nil {
+		c.sendBuf.clear()
+	}
+	if c.oooRecvBuf != nil {
+		c.oooRecvBuf.clear()
+	}
+
 	if needFin {
 		c.sendFin()
 	}
@@ -1928,6 +2165,17 @@ func (c *tcpConn) Close() error {
 	delete(c.stack.tcpConns, c.key)
 	c.stack.tcpMu.Unlock()
 	return nil
+}
+
+// stopDelayedAckTimer stops the delayed ACK timer.
+func (c *tcpConn) stopDelayedAckTimer() {
+	c.delayedAckMu.Lock()
+	defer c.delayedAckMu.Unlock()
+
+	if c.delayedAckTimer != nil {
+		c.delayedAckTimer.Stop()
+		c.delayedAckTimer = nil
+	}
 }
 
 func (c *tcpConn) LocalAddr() net.Addr {
@@ -1958,6 +2206,83 @@ func (c *tcpConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
+// SetNoDelay controls whether Nagle's algorithm is disabled (TCP_NODELAY).
+// When noDelay is true, small writes are sent immediately without coalescing.
+func (c *tcpConn) SetNoDelay(noDelay bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nagleEnabled = !noDelay
+	return nil
+}
+
+// Snapshot returns a debug snapshot of the connection state.
+func (c *tcpConn) Snapshot() tcpConnSnapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	stateStr := "unknown"
+	switch c.state {
+	case tcpStateSynRcvd:
+		stateStr = "SYN_RCVD"
+	case tcpStateEstablished:
+		stateStr = "ESTABLISHED"
+	case tcpStateFinWait:
+		stateStr = "FIN_WAIT"
+	case tcpStateClosed:
+		stateStr = "CLOSED"
+	}
+
+	peerWnd := uint32(c.peerWnd)
+	if c.wndScaleOK {
+		peerWnd = uint32(c.peerWnd) << c.peerWndScale
+	}
+
+	snap := tcpConnSnapshot{
+		State:        stateStr,
+		LocalAddr:    fmt.Sprintf("%s:%d", net.IP(c.localIPv4[:]).String(), c.key.dstPort),
+		RemoteAddr:   fmt.Sprintf("%s:%d", net.IP(c.key.srcIP[:]).String(), c.key.srcPort),
+		HostSeq:      c.hostSeq,
+		GuestSeq:     c.guestSeq,
+		SendAcked:    c.sendAcked,
+		InFlight:     c.sendBuf.inFlight(),
+		PeerWnd:      peerWnd,
+		PeerWndScale: c.peerWndScale,
+		RTO:          c.rttEst.getRTO().String(),
+		SRTT:         c.rttEst.srtt.String(),
+		RetxCount:    c.retxCount,
+		MSS:          c.mss,
+	}
+
+	if c.congCtrl != nil {
+		snap.Cwnd = c.congCtrl.getCwnd()
+		snap.Ssthresh = c.congCtrl.ssthresh
+		snap.DupAcks = c.congCtrl.dupAcks
+	}
+
+	if c.oooRecvBuf != nil {
+		snap.OOOSegments = c.oooRecvBuf.len()
+	}
+
+	return snap
+}
+
+// logStallSnapshot logs the connection state when a stall is detected.
+func (c *tcpConn) logStallSnapshot(reason string) {
+	snap := c.Snapshot()
+	c.stack.log.Warn("raw: tcp connection stall detected",
+		"reason", reason,
+		"state", snap.State,
+		"local", snap.LocalAddr,
+		"remote", snap.RemoteAddr,
+		"inFlight", snap.InFlight,
+		"peerWnd", snap.PeerWnd,
+		"cwnd", snap.Cwnd,
+		"rto", snap.RTO,
+		"retxCount", snap.RetxCount,
+		"oooSegs", snap.OOOSegments,
+	)
+}
+
 func (c *tcpConn) sendRST() error {
 	c.mu.Lock()
 	seq := c.hostSeq
@@ -1967,6 +2292,7 @@ func (c *tcpConn) sendRST() error {
 }
 
 // sendTCPPacket crafts and transmits a TCP segment to the guest.
+// sendTCPPacket sends a TCP segment without options.
 func (ns *NetStack) sendTCPPacket(
 	localIPv4 [4]byte,
 	key tcpFourTuple,
@@ -1974,12 +2300,21 @@ func (ns *NetStack) sendTCPPacket(
 	flags uint16,
 	payload []byte,
 ) error {
+	return ns.sendTCPPacketWithOptions(localIPv4, key, seq, ack, flags, payload, nil)
+}
+
+// sendTCPPacketWithOptions sends a TCP segment with optional TCP options.
+func (ns *NetStack) sendTCPPacketWithOptions(
+	localIPv4 [4]byte,
+	key tcpFourTuple,
+	seq, ack uint32,
+	flags uint16,
+	payload []byte,
+	options []byte,
+) error {
 	if DEBUG {
 		var preview string
 		if len(payload) > 0 {
-			// BUG: min() is not defined in this file nor in stdlib. This
-			// depends on a helper existing elsewhere in the package. If not,
-			// this won't compile.
 			max := min(len(payload), 64)
 			preview = string(payload[:max])
 		}
@@ -1991,6 +2326,7 @@ func (ns *NetStack) sendTCPPacket(
 			"ack", ack,
 			"flags", fmt.Sprintf("0x%02x", flags),
 			"len", len(payload),
+			"optLen", len(options),
 			"preview", preview,
 		)
 	}
@@ -1999,15 +2335,30 @@ func (ns *NetStack) sendTCPPacket(
 	srcPort := key.dstPort
 	dstPort := key.srcPort
 
-	packet := getTCPPacketBuffer(len(payload))
+	// Calculate header length including options (must be multiple of 4)
+	optLen := len(options)
+	if optLen%4 != 0 {
+		// Pad options to 4-byte boundary
+		padded := make([]byte, ((optLen+3)/4)*4)
+		copy(padded, options)
+		options = padded
+		optLen = len(options)
+	}
+	headerLen := tcpHeaderLen + optLen
+	totalLen := headerLen + len(payload)
+
+	packet := make([]byte, totalLen)
 	binary.BigEndian.PutUint16(packet[0:2], srcPort)
 	binary.BigEndian.PutUint16(packet[2:4], dstPort)
 	binary.BigEndian.PutUint32(packet[4:8], seq)
 	binary.BigEndian.PutUint32(packet[8:12], ack)
-	packet[12] = (uint8(tcpHeaderLen/4) << 4)
+	packet[12] = uint8(headerLen/4) << 4
 	packet[13] = uint8(flags)
 	binary.BigEndian.PutUint16(packet[14:16], 0xffff) // Window
-	copy(packet[tcpHeaderLen:], payload)
+	if optLen > 0 {
+		copy(packet[tcpHeaderLen:], options)
+	}
+	copy(packet[headerLen:], payload)
 
 	// Compute checksum over pseudo-header + TCP segment.
 	binary.BigEndian.PutUint16(packet[16:18], 0)
@@ -2017,7 +2368,6 @@ func (ns *NetStack) sendTCPPacket(
 	// IPv4 encapsulation (pooled buffer).
 	ipBuf := getIPv4PacketBuffer(len(packet))
 	ip := buildIPv4PacketInto(ipBuf, srcIP, dstIP, tcpProtocolNumber, packet)
-	putTCPPacketBuffer(packet)
 
 	// Ethernet framing (pooled buffer).
 	frame := getEthernetFrameBuffer(len(ip))

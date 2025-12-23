@@ -1942,6 +1942,22 @@ func RunExecutable(path string) error {
 	if err != nil {
 		return fmt.Errorf("create netstack backend: %w", err)
 	}
+	if dir := os.Getenv("CC_NETSTACK_PCAP_DIR"); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create pcap dir: %w", err)
+		}
+		name := fmt.Sprintf("bringup-%s-%d.pcap", time.Now().UTC().Format("20060102T150405.000000000Z"), os.Getpid())
+		path := filepath.Join(dir, name)
+		f, err := os.Create(path)
+		if err != nil {
+			return fmt.Errorf("create pcap file: %w", err)
+		}
+		defer f.Close()
+		if err := netBackend.OpenPacketCapture(f); err != nil {
+			return fmt.Errorf("enable pcap: %w", err)
+		}
+		slog.Info("netstack pcap enabled", "path", path)
+	}
 
 	const (
 		bringupTCPEchoPort = 4242
@@ -2119,7 +2135,17 @@ func RunExecutable(path string) error {
 
 	slog.Info("Running Executable in InitX Virtual Machine", "path", path)
 
-	if err := vm.Spawn(ctx, "/initx-exec", "-test.v", "-test.timeout=30s"); err != nil {
+	args := []string{"-test.v", "-test.timeout=30s"}
+	// Enable large bringup guest-side tests (e.g. 1MiB HTTP download) by passing
+	// custom test binary flags into the guest.
+	if os.Getenv("CC_BRINGUP_LARGE") != "" {
+		args = append(args, "-bringup.large")
+		if iters := os.Getenv("CC_BRINGUP_LARGE_ITERS"); iters != "" {
+			args = append(args, "-bringup.large.iters="+iters)
+		}
+	}
+
+	if err := vm.Spawn(ctx, "/initx-exec", args...); err != nil {
 		return fmt.Errorf("run executable in initx virtual machine: %w", err)
 	}
 

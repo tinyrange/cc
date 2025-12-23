@@ -2,6 +2,7 @@ package virtio
 
 import (
 	"fmt"
+	"io"
 	"net"
 
 	"github.com/tinyrange/cc/internal/netstack"
@@ -69,6 +70,13 @@ func (b *NetstackBackend) BindNetDevice(netdev *Net) {
 
 func (b *NetstackBackend) NetworkInterface() *netstack.NetworkInterface {
 	return b.nic
+}
+
+func (b *NetstackBackend) OpenPacketCapture(w io.Writer) error {
+	if b == nil || b.ns == nil {
+		return fmt.Errorf("netstack backend has no netstack")
+	}
+	return b.ns.OpenPacketCapture(w)
 }
 
 var (
