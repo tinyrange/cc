@@ -1701,12 +1701,19 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 		}
 
 		dstIP := h.dst.To4()
-		slog.Info(
-			"raw: tcp connection attempt",
-			"src",
-			fmt.Sprintf("%v:%d", h.src, hdr.srcPort),
-			"dst",
-			fmt.Sprintf("%v:%d", h.dst, hdr.dstPort),
+		if DEBUG {
+			slog.Info(
+				"raw: tcp connection attempt",
+				"src",
+				fmt.Sprintf("%v:%d", h.src, hdr.srcPort),
+				"dst",
+				fmt.Sprintf("%v:%d", h.dst, hdr.dstPort),
+			)
+		}
+		debug.Writef(
+			"netstack",
+			"tcp connection attempt src=%s dst=%s",
+			h.src.String(), h.dst.String(),
 		)
 
 		// Proxy service connections to 127.0.0.1:dstPort if enabled.
