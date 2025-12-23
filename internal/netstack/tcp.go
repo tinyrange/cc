@@ -313,6 +313,7 @@ func (rb *tcpRecvBuffer) clear() {
 
 // tcpRTTEstimator implements RTT estimation per RFC 6298.
 type tcpRTTEstimator struct {
+	mu         sync.Mutex
 	srtt       time.Duration // smoothed RTT
 	rttVar     time.Duration // RTT variance
 	rto        time.Duration // retransmission timeout
@@ -335,6 +336,9 @@ func newTCPRTTEstimator() *tcpRTTEstimator {
 
 // update processes an RTT sample and updates the RTO.
 func (r *tcpRTTEstimator) update(rtt time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	if !r.hasInitial {
 		// First measurement (RFC 6298 section 2.2)
 		r.srtt = rtt
@@ -366,6 +370,9 @@ func (r *tcpRTTEstimator) update(rtt time.Duration) {
 
 // backoff doubles the RTO (exponential backoff on timeout).
 func (r *tcpRTTEstimator) backoff() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	r.rto *= 2
 	if r.rto > maxRTO {
 		r.rto = maxRTO
@@ -374,6 +381,8 @@ func (r *tcpRTTEstimator) backoff() {
 
 // getRTO returns the current RTO.
 func (r *tcpRTTEstimator) getRTO() time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return r.rto
 }
 
@@ -383,6 +392,7 @@ func (r *tcpRTTEstimator) getRTO() time.Duration {
 
 // tcpCongestionControl implements TCP Reno congestion control.
 type tcpCongestionControl struct {
+	mu       sync.Mutex
 	cwnd     uint32 // congestion window (bytes)
 	ssthresh uint32 // slow-start threshold
 	mss      uint16 // maximum segment size
@@ -403,6 +413,9 @@ func newTCPCongestionControl(mss uint16) *tcpCongestionControl {
 
 // onAck is called when new data is acknowledged.
 func (cc *tcpCongestionControl) onAck(bytesAcked int) {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
 	cc.dupAcks = 0
 	mss := uint32(cc.mss)
 
@@ -423,6 +436,9 @@ func (cc *tcpCongestionControl) onAck(bytesAcked int) {
 // onDupAck is called when a duplicate ACK is received.
 // Returns true if fast retransmit should be triggered (3 dup acks).
 func (cc *tcpCongestionControl) onDupAck() bool {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
 	cc.dupAcks++
 	if cc.dupAcks == 3 {
 		// Fast retransmit threshold reached
@@ -442,6 +458,9 @@ func (cc *tcpCongestionControl) onDupAck() bool {
 
 // onTimeout is called when RTO expires.
 func (cc *tcpCongestionControl) onTimeout() {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
 	cc.ssthresh = cc.cwnd / 2
 	if cc.ssthresh < 2*uint32(cc.mss) {
 		cc.ssthresh = 2 * uint32(cc.mss)
@@ -452,6 +471,9 @@ func (cc *tcpCongestionControl) onTimeout() {
 
 // onNewAckAfterFastRetransmit is called when new data is acked during fast recovery.
 func (cc *tcpCongestionControl) onNewAckAfterFastRetransmit() {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
 	// Deflate cwnd to ssthresh
 	cc.cwnd = cc.ssthresh
 	cc.dupAcks = 0
@@ -459,11 +481,16 @@ func (cc *tcpCongestionControl) onNewAckAfterFastRetransmit() {
 
 // getCwnd returns the current congestion window.
 func (cc *tcpCongestionControl) getCwnd() uint32 {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
 	return cc.cwnd
 }
 
 // effectiveWindow returns the minimum of cwnd and peer's advertised window.
 func (cc *tcpCongestionControl) effectiveWindow(peerWnd uint32) uint32 {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+
 	if cc.cwnd < peerWnd {
 		return cc.cwnd
 	}
@@ -524,4 +551,3 @@ type tcpConnSnapshot struct {
 	DupAcks      int    `json:"dupAcks"`
 	MSS          uint16 `json:"mss"`
 }
-

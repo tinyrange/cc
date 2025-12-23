@@ -1747,8 +1747,8 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 
 				// Manage retransmit timer
 				if c.sendBuf.len() > 0 {
-					// Restart timer with updated RTO
-					c.startRetxTimer()
+					// Restart timer with updated RTO for remaining segments
+					c.restartRetxTimer()
 				} else {
 					// All data acked, stop timer
 					c.stopRetxTimer()
@@ -2200,8 +2200,24 @@ func (c *tcpConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-// startRetxTimer starts or restarts the retransmission timer.
+// startRetxTimer starts the retransmission timer if not already running.
+// This ensures the timer is based on the oldest unacked segment.
 func (c *tcpConn) startRetxTimer() {
+	c.retxTimerMu.Lock()
+	defer c.retxTimerMu.Unlock()
+
+	// Only start if no timer is running - timer is based on oldest segment
+	if c.retxTimer != nil {
+		return
+	}
+
+	rto := c.rttEst.getRTO()
+	c.retxTimer = time.AfterFunc(rto, c.onRetxTimeout)
+}
+
+// restartRetxTimer forces a restart of the retransmission timer with updated RTO.
+// Called when new ACKs arrive to reset the timer for remaining segments.
+func (c *tcpConn) restartRetxTimer() {
 	c.retxTimerMu.Lock()
 	defer c.retxTimerMu.Unlock()
 
@@ -2235,7 +2251,24 @@ func (c *tcpConn) onRetxTimeout() {
 	// Get oldest unacked segment
 	seg, ok := c.sendBuf.oldest()
 	if !ok {
+		// No unacked data - clear timer and return
+		c.retxTimerMu.Lock()
+		c.retxTimer = nil
+		c.retxTimerMu.Unlock()
 		c.mu.Unlock()
+		return
+	}
+
+	// Verify this is a valid timeout - the segment should have been sent
+	// at least minRTO ago to avoid spurious timeouts
+	age := time.Since(seg.sentAt)
+	rto := c.rttEst.getRTO()
+	if age < rto/2 {
+		// Spurious timeout - segment was recently (re)sent, just reschedule
+		c.mu.Unlock()
+		c.retxTimerMu.Lock()
+		c.retxTimer = time.AfterFunc(rto-age, c.onRetxTimeout)
+		c.retxTimerMu.Unlock()
 		return
 	}
 
@@ -2255,14 +2288,18 @@ func (c *tcpConn) onRetxTimeout() {
 		c.mu.Lock()
 	}
 
-	// Notify congestion control of timeout
-	c.congCtrl.onTimeout()
+	// Only notify congestion control after first retransmit
+	// This avoids penalizing for transient timing issues
+	if seg.retxCount > 0 && c.congCtrl != nil {
+		c.congCtrl.onTimeout()
+	}
 
 	// Exponential backoff
 	c.rttEst.backoff()
 
 	ack := c.guestSeq
 	c.retxCount++
+	rto = c.rttEst.getRTO() // Get updated RTO after backoff
 	c.mu.Unlock()
 
 	// Mark segment as retransmitted
@@ -2279,8 +2316,10 @@ func (c *tcpConn) onRetxTimeout() {
 	// Retransmit
 	_ = c.stack.sendTCPPacket(c.localIPv4, c.key, seg.seqStart, ack, tcpFlagACK, seg.payload)
 
-	// Restart timer
-	c.startRetxTimer()
+	// Schedule next timeout - use direct timer management to avoid races
+	c.retxTimerMu.Lock()
+	c.retxTimer = time.AfterFunc(rto, c.onRetxTimeout)
+	c.retxTimerMu.Unlock()
 }
 
 func (c *tcpConn) Close() error {
