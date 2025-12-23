@@ -60,10 +60,100 @@ func testFS(t *testing.T, basePath string) {
 	t.Run("NameLimits", func(t *testing.T) { testNameLimits(t, workspace) })
 	t.Run("Atomicity", func(t *testing.T) { testAtomicity(t, workspace) })
 	t.Run("RaceConditions", func(t *testing.T) { testRaceConditions(t, workspace) })
+	t.Run("Symlinks", func(t *testing.T) { testSymlinks(t, workspace) })
 	t.Run("VirtioFSWriteRead", func(t *testing.T) { testVirtioFSWriteRead(t, workspace) })
 	t.Run("VirtioFSExecutable", func(t *testing.T) { testVirtioFSExecutable(t, workspace) })
 	t.Run("Chmod", func(t *testing.T) { testChmod(t, workspace) })
 	t.Run("Chown", func(t *testing.T) { testChown(t, workspace) })
+}
+
+// --- Symlinks ---
+func testSymlinks(t *testing.T, dir string) {
+	// Probe support (some FS types may not support symlinks).
+	probeTarget := filepath.Join(dir, "symlink_probe_target")
+	probeLink := filepath.Join(dir, "symlink_probe_link")
+	if err := os.WriteFile(probeTarget, []byte("probe"), 0644); err != nil {
+		t.Fatalf("Failed to create probe target: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Remove(probeLink)
+		_ = os.Remove(probeTarget)
+	})
+	if err := os.Symlink(filepath.Base(probeTarget), probeLink); err != nil {
+		if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EOPNOTSUPP) || errors.Is(err, syscall.ENOTSUP) || errors.Is(err, syscall.ENOSYS) {
+			t.Skipf("Symlinks not supported: %v", err)
+		}
+		t.Fatalf("Symlink probe failed: %v", err)
+	}
+
+	// 1) Lstat sees a symlink, not a file.
+	li, err := os.Lstat(probeLink)
+	if err != nil {
+		t.Fatalf("Lstat symlink: %v", err)
+	}
+	if li.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("Expected symlink mode bit set, got mode=%v", li.Mode())
+	}
+
+	// 2) Readlink returns the raw target string.
+	gotTarget, err := os.Readlink(probeLink)
+	if err != nil {
+		t.Fatalf("Readlink: %v", err)
+	}
+	if gotTarget != filepath.Base(probeTarget) {
+		t.Fatalf("Readlink mismatch: want %q got %q", filepath.Base(probeTarget), gotTarget)
+	}
+
+	// 3) Following symlink works for reads (Stat follows; ReadFile follows).
+	data, err := os.ReadFile(probeLink)
+	if err != nil {
+		t.Fatalf("ReadFile via symlink: %v", err)
+	}
+	if string(data) != "probe" {
+		t.Fatalf("ReadFile via symlink mismatch: want %q got %q", "probe", string(data))
+	}
+	si, err := os.Stat(probeLink)
+	if err != nil {
+		t.Fatalf("Stat via symlink: %v", err)
+	}
+	if si.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("Stat should follow symlink (not report ModeSymlink), got mode=%v", si.Mode())
+	}
+
+	// 4) apk-style flow: create real file, create temp symlink, then rename into place.
+	real := filepath.Join(dir, "libfoo.so.1.2.3")
+	if err := os.WriteFile(real, []byte("ELF? nope"), 0644); err != nil {
+		t.Fatalf("Write real file: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(real) })
+
+	finalLink := filepath.Join(dir, "libfoo.so.1")
+	tmpLink := filepath.Join(dir, ".apk.tmp_symlink")
+	_ = os.Remove(finalLink)
+	_ = os.Remove(tmpLink)
+	t.Cleanup(func() {
+		_ = os.Remove(finalLink)
+		_ = os.Remove(tmpLink)
+	})
+
+	// Create symlink using relative target (as packages often do).
+	if err := os.Symlink(filepath.Base(real), tmpLink); err != nil {
+		t.Fatalf("Create temp symlink: %v", err)
+	}
+	if err := os.Rename(tmpLink, finalLink); err != nil {
+		t.Fatalf("Rename temp symlink to final: %v", err)
+	}
+	// Validate it points to the right target and resolves.
+	got, err := os.Readlink(finalLink)
+	if err != nil {
+		t.Fatalf("Readlink final: %v", err)
+	}
+	if got != filepath.Base(real) {
+		t.Fatalf("Final symlink target mismatch: want %q got %q", filepath.Base(real), got)
+	}
+	if b, err := os.ReadFile(finalLink); err != nil || string(b) != "ELF? nope" {
+		t.Fatalf("Read through final symlink failed: err=%v data=%q", err, string(b))
+	}
 }
 
 // --- Extended Attributes (Xattr) ---
