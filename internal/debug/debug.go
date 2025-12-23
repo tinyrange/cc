@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -22,6 +23,58 @@ import (
 //   - messageLength bytes message
 
 // The way thread-safety is achieved is by atomically adding to the current offset of the file.
+
+type write struct {
+	off  int64
+	data []byte
+}
+
+type logStructuredBuffer struct {
+	data    sync.Map
+	maxSize atomic.Int64
+}
+
+func (b *logStructuredBuffer) WriteAt(p []byte, off int64) (n int, err error) {
+	b.data.Store(off, write{
+		off:  off,
+		data: append([]byte{}, p...),
+	})
+	val := b.maxSize.Load()
+	if val < int64(len(p))+off {
+		for {
+			if b.maxSize.CompareAndSwap(val, int64(len(p))+off) {
+				break
+			}
+			val = b.maxSize.Load()
+		}
+	}
+	return len(p), nil
+}
+
+func (b *logStructuredBuffer) Close() error {
+	return nil
+}
+
+type compiledBuffer []byte
+
+func (b *compiledBuffer) ReadAt(p []byte, off int64) (n int, err error) {
+	if off < 0 || off >= int64(len(*b)) {
+		return 0, io.EOF
+	}
+	return copy(p, (*b)[off:]), nil
+}
+
+func (b *logStructuredBuffer) Compile() (compiledBuffer, error) {
+	data := make([]byte, b.maxSize.Load())
+	b.data.Range(func(key, value any) bool {
+		off := key.(int64)
+		write := value.(write)
+		copy(data[off:off+int64(len(write.data))], write.data)
+		return true
+	})
+
+	return compiledBuffer(data), nil
+}
 
 type Writer interface {
 	io.WriterAt
@@ -53,6 +106,34 @@ func Open(w Writer) error {
 		return fmt.Errorf("debug: already open, discarded old writer")
 	}
 	return nil
+}
+
+type WriterTo interface {
+	WriteTo(w io.WriterAt) (n int64, err error)
+}
+
+type memoryWriter struct {
+	logStructuredBuffer
+}
+
+func (m *memoryWriter) WriteTo(w io.WriterAt) (n int64, err error) {
+	m.data.Range(func(key, value any) bool {
+		off := key.(int64)
+		write := value.(write)
+		if _, err := w.WriteAt(write.data, off); err != nil {
+			return false
+		}
+		return true
+	})
+	return int64(m.maxSize.Load()), nil
+}
+
+func OpenMemory() (WriterTo, error) {
+	mem := &memoryWriter{}
+	if err := Open(mem); err != nil {
+		return nil, err
+	}
+	return mem, nil
 }
 
 func Close() error {

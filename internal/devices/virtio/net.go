@@ -139,7 +139,7 @@ func NewNet(vm hv.VirtualMachine, base uint64, size uint64, irqLine uint32, mac 
 			},
 		},
 	}
-	features := []uint64{virtioFeatureVersion1 | (uint64(1) << virtioNetFeatureMacBit) | (uint64(1) << virtioNetFeatureMrgRxBuf)}
+	features := []uint64{virtioFeatureVersion1 | virtioFeatureEventIdx | (uint64(1) << virtioNetFeatureMacBit) | (uint64(1) << virtioNetFeatureMrgRxBuf)}
 	netdev.device = newMMIODevice(vm, base, size, irqLine, netDeviceID, netVendorID, netVersion, features, netdev)
 	if binder, ok := backend.(netDeviceBinder); ok {
 		binder.BindNetDevice(netdev)
@@ -175,7 +175,7 @@ func NewNetPCI(vm hv.VirtualMachine, host *pci.HostBridge, bus, device, function
 			},
 		},
 	}
-	features := []uint64{virtioFeatureVersion1 | (uint64(1) << virtioNetFeatureMacBit) | (uint64(1) << virtioNetFeatureMrgRxBuf)}
+	features := []uint64{virtioFeatureVersion1 | virtioFeatureEventIdx | (uint64(1) << virtioNetFeatureMacBit) | (uint64(1) << virtioNetFeatureMrgRxBuf)}
 	pciDev, err := NewVirtioPCIDevice(vm, host, bus, device, function, uint16(netDeviceID), uint16(netDeviceID), features, netdev)
 	if err != nil {
 		return nil, err
@@ -370,13 +370,13 @@ func (vn *Net) WriteConfig(device, uint64, uint32) (bool, error) {
 
 func (vn *Net) EnqueueRxPacket(packet []byte) error {
 	vn.ensureWorker(vn.device)
-	netDbg.Writef("EnqueueRxPacket len=%d pending=%d", len(packet), len(vn.pendingRx))
+	netDbg.Writef("EnqueueRxPacket len=%d", len(packet))
 
 	// Backpressure: block when too many packets are queued awaiting RX buffers.
 	select {
 	case vn.rxSlots <- struct{}{}:
 	default:
-		log.Printf("virtio-net: rxSlots full (pending=%d)", len(vn.rxSlots))
+		log.Printf("virtio-net: rxSlots full (slots=%d)", len(vn.rxSlots))
 		netDbg.Writef("EnqueueRxPacket rxSlots full slots=%d cap=%d", len(vn.rxSlots), cap(vn.rxSlots))
 		vn.rxSlots <- struct{}{}
 	}

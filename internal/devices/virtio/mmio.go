@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"sync/atomic"
 
 	"github.com/tinyrange/cc/internal/fdt"
 	"github.com/tinyrange/cc/internal/hv"
@@ -159,7 +160,7 @@ type mmioDevice struct {
 
 	queueSel         uint32
 	deviceStatus     uint32
-	interruptStatus  uint32
+	interruptStatus  atomic.Uint32
 	configGeneration uint32 // Incremented on config changes
 
 	queues []queue
@@ -432,10 +433,15 @@ func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
 			return err
 		}
 	case VIRTIO_MMIO_INTERRUPT_ACK:
-		prev := d.interruptStatus
-		d.interruptStatus &^= value
-		if prev != d.interruptStatus {
-			d.updateInterruptLine()
+		for {
+			prev := d.interruptStatus.Load()
+			newVal := prev &^ value
+			if d.interruptStatus.CompareAndSwap(prev, newVal) {
+				if prev != newVal {
+					d.updateInterruptLine()
+				}
+				break
+			}
 		}
 	case VIRTIO_MMIO_STATUS:
 		// fmt.Fprintf(os.Stderr, "virtio-mmio: write STATUS -> %#x\n", value)
@@ -567,7 +573,7 @@ func (d *mmioDevice) readRegister(offset uint64) (uint32, error) {
 		}
 		return 0, nil
 	case VIRTIO_MMIO_INTERRUPT_STATUS:
-		return d.interruptStatus, nil
+		return d.interruptStatus.Load(), nil
 	case VIRTIO_MMIO_STATUS:
 		// fmt.Fprintf(os.Stderr, "virtio-mmio: read STATUS -> %#x\n", d.deviceStatus)
 		return d.deviceStatus, nil
@@ -605,7 +611,7 @@ func (d *mmioDevice) reset() {
 	}
 	d.queueSel = 0
 	d.deviceStatus = 0
-	d.interruptStatus = 0
+	d.interruptStatus.Store(0)
 	d.configGeneration = 0
 	for i := range d.queues {
 		d.queues[i].reset()
@@ -638,7 +644,7 @@ func (d *mmioDevice) queue(index int) *queue {
 }
 
 func (d *mmioDevice) raiseInterrupt(bit uint32) {
-	d.interruptStatus |= bit
+	d.interruptStatus.Or(bit)
 	d.updateInterruptLine()
 }
 
@@ -647,7 +653,7 @@ func (d *mmioDevice) updateInterruptLine() {
 		return
 	}
 	if setter, ok := d.vm.(irqSetter); ok {
-		levelAsserted := d.interruptStatus != 0
+		levelAsserted := d.interruptStatus.Load() != 0
 		if err := setter.SetIRQ(d.irqLine, levelAsserted); err != nil {
 			slog.Error("virtio: pulse irq failed", "irq", d.irqLine, "err", err)
 		}

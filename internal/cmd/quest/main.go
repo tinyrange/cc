@@ -22,6 +22,7 @@ import (
 	"github.com/tinyrange/cc/internal/asm/amd64"
 	"github.com/tinyrange/cc/internal/asm/arm64"
 	riscvasm "github.com/tinyrange/cc/internal/asm/riscv"
+	"github.com/tinyrange/cc/internal/debug"
 	"github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	amd64serial "github.com/tinyrange/cc/internal/devices/amd64/serial"
 	"github.com/tinyrange/cc/internal/devices/virtio"
@@ -1917,6 +1918,35 @@ func RunInitX(debug bool) error {
 
 func RunExecutable(path string) error {
 	slog.Info("Starting Bringup Quest: Run Executable", "path", path)
+
+	if os.Getenv("CC_DEBUG_FILE") != "" {
+		if os.Getenv("CC_DEBUG_MEMORY") != "" {
+			mem, err := debug.OpenMemory()
+			if err != nil {
+				return fmt.Errorf("open debug memory: %w", err)
+			}
+			defer func() {
+				f, err := os.Create(os.Getenv("CC_DEBUG_FILE"))
+				if err != nil {
+					slog.Warn("failed to create debug file", "error", err)
+					return
+				}
+				defer f.Close()
+				if _, err := mem.WriteTo(f); err != nil {
+					slog.Warn("failed to write debug memory to file", "error", err)
+					return
+				}
+			}()
+			debug.Writef("bringup", "debug memory enabled")
+		} else {
+			if err := debug.OpenFile(os.Getenv("CC_DEBUG_FILE")); err != nil {
+				return fmt.Errorf("open debug file: %w", err)
+			}
+			defer debug.Close()
+			debug.Writef("bringup", "debug file: %s", os.Getenv("CC_DEBUG_FILE"))
+		}
+		debug.Writef("bringup", "debug memory enabled")
+	}
 
 	hv, err := factory.Open()
 	if err != nil {
