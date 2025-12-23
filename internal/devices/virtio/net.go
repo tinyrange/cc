@@ -3,15 +3,18 @@ package virtio
 import (
 	"encoding/binary"
 	"fmt"
-	"io"
+	"log"
 	"log/slog"
 	"net"
 	"sync"
 
+	"github.com/tinyrange/cc/internal/debug"
 	"github.com/tinyrange/cc/internal/devices/pci"
 	"github.com/tinyrange/cc/internal/fdt"
 	"github.com/tinyrange/cc/internal/hv"
 )
+
+var netDbg = debug.WithSource("virtio-net")
 
 const (
 	NetDefaultMMIOBase = 0xd0002000
@@ -37,6 +40,7 @@ const (
 	etherTypeIPv6 = 0x86dd
 
 	virtioNetFeatureMacBit    = 5
+	virtioNetFeatureMrgRxBuf  = 15
 	virtioNetFeatureStatusBit = 16
 	virtioFeatureEventIdx     = uint64(1) << virtioRingFeatureEventIdxBit
 
@@ -45,6 +49,11 @@ const (
 	virtqAvailFNoInterrupt = 1
 
 	txBufferPoolMaxSize = 256 << 10
+
+	// Backpressure limit for packets awaiting guest RX buffers.
+	// Without this, a fast host-side producer (e.g. outbound TCP proxy) can queue
+	// unbounded RX packets if the guest is slow to replenish descriptors.
+	netMaxPendingRxPackets = 256
 )
 
 type virtioNetHeader struct {
@@ -65,19 +74,38 @@ type netDeviceBinder interface {
 	BindNetDevice(*Net)
 }
 
+type netWorkKind uint8
+
+const (
+	netWorkKick netWorkKind = iota
+	netWorkRxFrame
+	netWorkReset
+)
+
+type netWorkMsg struct {
+	kind  netWorkKind
+	queue int
+	frame []byte
+	dev   device
+	resp  chan error
+}
+
 type Net struct {
-	device     device
-	base       uint64
-	size       uint64
-	mac        net.HardwareAddr
-	backend    NetBackend
-	pendingRx  [][]byte
-	rxMu       sync.Mutex
-	rxDisabled bool
-	linkUp     bool
-	txBufPool  sync.Pool
-	txSegPool  sync.Pool
-	txHdrPool  sync.Pool
+	device    device
+	base      uint64
+	size      uint64
+	mac       net.HardwareAddr
+	backend   NetBackend
+	pendingRx [][]byte
+	linkUp    bool
+	txBufPool sync.Pool
+	txSegPool sync.Pool
+	txHdrPool sync.Pool
+
+	workOnce sync.Once
+	workCh   chan netWorkMsg
+	rxSlots  chan struct{}
+	workDev  device
 }
 
 func NewNet(vm hv.VirtualMachine, base uint64, size uint64, irqLine uint32, mac net.HardwareAddr, backend NetBackend) *Net {
@@ -87,6 +115,7 @@ func NewNet(vm hv.VirtualMachine, base uint64, size uint64, irqLine uint32, mac 
 	if backend == nil {
 		backend = &discardNetBackend{}
 	}
+	netDbg.Writef("NewNet base=0x%x size=0x%x irqLine=%d mac=%s backendNil=%t", base, size, irqLine, mac.String(), backend == nil)
 	netdev := &Net{
 		device:  nil, // Will be set below
 		base:    base,
@@ -110,7 +139,7 @@ func NewNet(vm hv.VirtualMachine, base uint64, size uint64, irqLine uint32, mac 
 			},
 		},
 	}
-	features := []uint64{virtioFeatureVersion1 | (uint64(1) << virtioNetFeatureMacBit) | virtioFeatureEventIdx}
+	features := []uint64{virtioFeatureVersion1 | virtioFeatureEventIdx | (uint64(1) << virtioNetFeatureMacBit) | (uint64(1) << virtioNetFeatureMrgRxBuf)}
 	netdev.device = newMMIODevice(vm, base, size, irqLine, netDeviceID, netVendorID, netVersion, features, netdev)
 	if binder, ok := backend.(netDeviceBinder); ok {
 		binder.BindNetDevice(netdev)
@@ -125,6 +154,7 @@ func NewNetPCI(vm hv.VirtualMachine, host *pci.HostBridge, bus, device, function
 	if backend == nil {
 		backend = &discardNetBackend{}
 	}
+	netDbg.Writef("NewNetPCI bus=%d device=%d function=%d mac=%s backendNil=%t", bus, device, function, mac.String(), backend == nil)
 	netdev := &Net{
 		mac:     append(net.HardwareAddr(nil), mac...),
 		backend: backend,
@@ -145,7 +175,7 @@ func NewNetPCI(vm hv.VirtualMachine, host *pci.HostBridge, bus, device, function
 			},
 		},
 	}
-	features := []uint64{virtioFeatureVersion1 | (uint64(1) << virtioNetFeatureMacBit) | virtioFeatureEventIdx}
+	features := []uint64{virtioFeatureVersion1 | virtioFeatureEventIdx | (uint64(1) << virtioNetFeatureMacBit) | (uint64(1) << virtioNetFeatureMrgRxBuf)}
 	pciDev, err := NewVirtioPCIDevice(vm, host, bus, device, function, uint16(netDeviceID), uint16(netDeviceID), features, netdev)
 	if err != nil {
 		return nil, err
@@ -157,11 +187,99 @@ func NewNetPCI(vm hv.VirtualMachine, host *pci.HostBridge, bus, device, function
 	return netdev, nil
 }
 
+func (vn *Net) ensureWorker(dev device) {
+	vn.workOnce.Do(func() {
+		if dev == nil {
+			dev = vn.device
+		}
+		vn.workDev = dev
+		vn.workCh = make(chan netWorkMsg, netMaxPendingRxPackets+128)
+		vn.rxSlots = make(chan struct{}, netMaxPendingRxPackets)
+		netDbg.Writef("ensureWorker started workChCap=%d rxSlotsCap=%d", cap(vn.workCh), cap(vn.rxSlots))
+		go vn.workerLoop()
+	})
+}
+
+func (vn *Net) workerLoop() {
+	for msg := range vn.workCh {
+		dev := msg.dev
+		if dev == nil {
+			dev = vn.workDev
+		}
+		var err error
+		switch msg.kind {
+		case netWorkKick:
+			netDbg.Writef("workerLoop kick queue=%d", msg.queue)
+			switch msg.queue {
+			case netQueueTransmit:
+				err = vn.processTransmitQueue(dev, dev.queue(msg.queue))
+			case netQueueReceive:
+				err = vn.processReceiveQueueLocked(dev, dev.queue(msg.queue))
+			default:
+				err = nil
+			}
+		case netWorkRxFrame:
+			netDbg.Writef("workerLoop rxFrame len=%d pendingBefore=%d", len(msg.frame), len(vn.pendingRx))
+			// vn.rxSlots is acquired by the sender; we release when the packet is
+			// actually removed from vn.pendingRx (after delivery or reset).
+			pendingBefore := len(vn.pendingRx)
+			vn.pendingRx = append(vn.pendingRx, msg.frame)
+			err = vn.processReceiveQueueLocked(dev, dev.queue(netQueueReceive))
+			pendingAfter := len(vn.pendingRx)
+			// If the packet wasn't consumed, emit diagnostics at key thresholds.
+			// This helps debug flaky stalls where host RX builds up waiting on
+			// guest-provided RX buffers.
+			if err == nil && pendingAfter > pendingBefore {
+				if pendingAfter == 1 || pendingAfter == 8 || pendingAfter == 32 ||
+					pendingAfter == 64 || pendingAfter == 128 || pendingAfter == netMaxPendingRxPackets {
+					q := dev.queue(netQueueReceive)
+					queueReady := q != nil && q.ready
+					queueSize := uint16(0)
+					lastAvail := uint16(0)
+					availIdx := uint16(0)
+					if q != nil {
+						queueSize = q.size
+						lastAvail = q.lastAvailIdx
+					}
+					if q != nil && q.ready {
+						_, avail, _, e := dev.queuePointers(q)
+						if e == nil && len(avail) >= 4 {
+							availIdx = binary.LittleEndian.Uint16(avail[2:4])
+						}
+					}
+					log.Printf(
+						"virtio-net: rx pending (waiting on guest buffers) pending=%d queueReady=%t queueSize=%d lastAvailIdx=%d availIdx=%d",
+						pendingAfter, queueReady, queueSize, lastAvail, availIdx,
+					)
+					netDbg.Writef("rx pending waitingOnGuestBuffers pending=%d queueReady=%t queueSize=%d lastAvailIdx=%d availIdx=%d", pendingAfter, queueReady, queueSize, lastAvail, availIdx)
+				}
+			}
+		case netWorkReset:
+			netDbg.Writef("workerLoop reset pending=%d", len(vn.pendingRx))
+			// Clear pending RX and release backpressure tokens.
+			for range vn.pendingRx {
+				select {
+				case <-vn.rxSlots:
+				default:
+				}
+			}
+			vn.pendingRx = nil
+			err = nil
+		default:
+			err = nil
+		}
+		if msg.resp != nil {
+			msg.resp <- err
+		}
+	}
+}
+
 // Init implements hv.MemoryMappedIODevice.
 func (vn *Net) Init(vm hv.VirtualMachine) error {
 	if mmio, ok := vn.device.(*mmioDevice); ok && vm != nil {
 		mmio.vm = vm
 	}
+	netDbg.Writef("Init")
 	return nil
 }
 
@@ -200,23 +318,21 @@ func (vn *Net) QueueMaxSize(int) uint16 {
 	return netQueueNumMax
 }
 
-func (vn *Net) OnReset(device) {
-	vn.rxMu.Lock()
-	defer vn.rxMu.Unlock()
-	vn.pendingRx = nil
-	vn.rxDisabled = false
+func (vn *Net) OnReset(dev device) {
+	vn.ensureWorker(dev)
+	netDbg.Writef("OnReset linkUp->true")
+	done := make(chan error, 1)
+	vn.workCh <- netWorkMsg{kind: netWorkReset, dev: dev, resp: done}
+	_ = <-done
 	vn.linkUp = true
 }
 
 func (vn *Net) OnQueueNotify(dev device, queue int) error {
-	switch queue {
-	case netQueueTransmit:
-		return vn.processTransmitQueue(dev, dev.queue(queue))
-	case netQueueReceive:
-		return vn.processReceiveQueue(dev, dev.queue(queue))
-	default:
-		return nil
-	}
+	vn.ensureWorker(dev)
+	netDbg.Writef("OnQueueNotify queue=%d", queue)
+	done := make(chan error, 1)
+	vn.workCh <- netWorkMsg{kind: netWorkKick, queue: queue, dev: dev, resp: done}
+	return <-done
 }
 
 func (vn *Net) ReadConfig(_ device, offset uint64) (uint32, bool, error) {
@@ -253,92 +369,110 @@ func (vn *Net) WriteConfig(device, uint64, uint32) (bool, error) {
 }
 
 func (vn *Net) EnqueueRxPacket(packet []byte) error {
-	vn.rxMu.Lock()
-	defer vn.rxMu.Unlock()
-	if vn.rxDisabled {
-		return io.EOF
+	vn.ensureWorker(vn.device)
+	netDbg.Writef("EnqueueRxPacket len=%d", len(packet))
+
+	// Backpressure: block when too many packets are queued awaiting RX buffers.
+	select {
+	case vn.rxSlots <- struct{}{}:
+	default:
+		log.Printf("virtio-net: rxSlots full (slots=%d)", len(vn.rxSlots))
+		netDbg.Writef("EnqueueRxPacket rxSlots full slots=%d cap=%d", len(vn.rxSlots), cap(vn.rxSlots))
+		vn.rxSlots <- struct{}{}
 	}
-	pendingBefore := len(vn.pendingRx)
-	vn.pendingRx = append(vn.pendingRx, append([]byte(nil), packet...))
-	if vn.device != nil {
-		if err := vn.processReceiveQueueLocked(vn.device, vn.device.queue(netQueueReceive)); err != nil {
-			return err
-		}
-		pendingAfter := len(vn.pendingRx)
-		delivered := pendingBefore + 1 - pendingAfter
-		if delivered > 0 {
-			// slog.Info("virtio-net: delivered rx packet", "packet", packet)
-		} else {
-			// Packet is stuck in pendingRx - log diagnostic info
-			q := vn.device.queue(netQueueReceive)
-			if q != nil && q.ready {
-				_, avail, _, err := vn.device.queuePointers(q)
-				if err == nil {
-					availIdx := binary.LittleEndian.Uint16(avail[2:4])
-					slog.Warn("virtio-net: rx packet queued (no buffers available)",
-						"pending", len(vn.pendingRx),
-						"lastAvailIdx", q.lastAvailIdx,
-						"availIdx", availIdx,
-						"queueReady", q.ready,
-						"queueSize", q.size)
-				} else {
-					slog.Warn("virtio-net: rx packet queued (no buffers available)",
-						"pending", len(vn.pendingRx),
-						"err", err)
-				}
-			} else {
-				slog.Warn("virtio-net: rx packet queued (queue not ready)",
-					"pending", len(vn.pendingRx),
-					"queueReady", q != nil && q.ready)
-			}
-		}
+
+	msg := netWorkMsg{
+		kind:  netWorkRxFrame,
+		frame: append([]byte(nil), packet...),
+		dev:   vn.device,
+		resp:  make(chan error, 1),
 	}
-	return nil
+	vn.workCh <- msg
+	err := <-msg.resp
+	return err
+}
+
+func (vn *Net) shouldTriggerInterrupt(dev device, q *queue, oldUsedIdx, newUsedIdx uint16, suppressInterrupt bool) bool {
+	// If EVENT_IDX is negotiated, the device must ignore VIRTQ_AVAIL_F_NO_INTERRUPT
+	// and instead consult the used_event field to determine whether an interrupt
+	// is needed.
+	if dev.eventIdxEnabled() {
+		usedEventOffset := q.availAddr + 4 + uint64(q.size)*2
+		raw, err := dev.readGuest(usedEventOffset, 2)
+		if err != nil || len(raw) < 2 {
+			netDbg.Writef("shouldTriggerInterrupt eventIdx readGuest off=0x%x err=%v len=%d -> true", usedEventOffset, err, len(raw))
+			// Malformed ring, best-effort wakeup.
+			return true
+		}
+		usedEvent := binary.LittleEndian.Uint16(raw[:2])
+		need := vringNeedEvent(usedEvent, newUsedIdx, oldUsedIdx)
+		netDbg.Writef("shouldTriggerInterrupt eventIdx usedEvent=%d oldUsed=%d newUsed=%d need=%t", usedEvent, oldUsedIdx, newUsedIdx, need)
+		return need
+	}
+	if suppressInterrupt {
+		netDbg.Writef("shouldTriggerInterrupt suppress oldUsed=%d newUsed=%d -> false", oldUsedIdx, newUsedIdx)
+		return false
+	}
+	netDbg.Writef("shouldTriggerInterrupt default oldUsed=%d newUsed=%d -> true", oldUsedIdx, newUsedIdx)
+	return true
 }
 
 func (vn *Net) processTransmitQueue(dev device, q *queue) error {
 	if q == nil || !q.ready || q.size == 0 {
+		if q == nil {
+			netDbg.Writef("processTransmitQueue skip q=nil")
+		} else {
+			netDbg.Writef("processTransmitQueue skip ready=%t size=%d", q.ready, q.size)
+		}
 		return nil
 	}
-	descTable, avail, _, err := dev.queuePointers(q)
+	flags, availIdx, err := dev.readAvailState(q)
 	if err != nil {
+		netDbg.Writef("processTransmitQueue readAvailState err=%v", err)
 		return err
 	}
-
-	availIdx := binary.LittleEndian.Uint16(avail[2:4])
-	suppressInterrupt := binary.LittleEndian.Uint16(avail[0:2])&virtqAvailFNoInterrupt != 0
+	suppressInterrupt := flags&virtqAvailFNoInterrupt != 0
+	netDbg.Writef("processTransmitQueue availIdx=%d lastAvailIdx=%d flags=0x%x suppressInterrupt=%t", availIdx, q.lastAvailIdx, flags, suppressInterrupt)
 
 	oldUsedIdx := q.usedIdx
 	var processed uint16
 
 	for q.lastAvailIdx != availIdx {
 		ringIndex := q.lastAvailIdx % q.size
-		ringOffset := 4 + int(ringIndex)*2
-		if ringOffset+2 > len(avail) {
-			return fmt.Errorf("net tx avail ring offset %d out of bounds", ringOffset)
-		}
-		head := binary.LittleEndian.Uint16(avail[ringOffset : ringOffset+2])
-		packet, headerBytes, err := vn.collectTxDescriptorChain(dev, descTable, q, head)
+		head, err := dev.readAvailEntry(q, ringIndex)
 		if err != nil {
+			netDbg.Writef("processTransmitQueue readAvailEntry ringIndex=%d err=%v", ringIndex, err)
+			return err
+		}
+		netDbg.Writef("processTransmitQueue head=%d ringIndex=%d", head, ringIndex)
+		packet, headerBytes, err := vn.collectTxDescriptorChain(dev, q, head)
+		if err != nil {
+			netDbg.Writef("processTransmitQueue collectTxDescriptorChain head=%d err=%v", head, err)
 			return err
 		}
 		release := vn.makeTxRelease(packet)
 		hdr, err := parseVirtioNetHeader(headerBytes)
 		vn.putTxHeaderBuffer(headerBytes)
 		if err != nil {
+			netDbg.Writef("processTransmitQueue parseVirtioNetHeader err=%v", err)
 			release()
 			return err
 		}
+		netDbg.Writef("processTransmitQueue tx hdr flags=0x%x gsoType=%d hdrLen=%d gsoSize=%d csumStart=%d csumOffset=%d numBuffers=%d pktLen=%d",
+			hdr.flags, hdr.gsoType, hdr.hdrLen, hdr.gsoSize, hdr.csumStart, hdr.csumOffset, hdr.numBuffers, len(packet))
 		// slog.Info("virtio-net: preparing tx packet", "hdr", hdr, "packet", packet)
 		if err := vn.prepareTxPacket(hdr, packet); err != nil {
+			netDbg.Writef("processTransmitQueue prepareTxPacket err=%v", err)
 			release()
 			return err
 		}
 		if err := vn.backend.HandleTx(packet, release); err != nil {
+			netDbg.Writef("processTransmitQueue backend.HandleTx err=%v", err)
 			release()
 			return err
 		}
 		if err := dev.recordUsedElement(q, head, 0); err != nil {
+			netDbg.Writef("processTransmitQueue recordUsedElement head=%d err=%v", head, err)
 			release()
 			return err
 		}
@@ -352,12 +486,14 @@ func (vn *Net) processTransmitQueue(dev device, q *queue) error {
 
 	if dev.eventIdxEnabled() {
 		if err := dev.setAvailEvent(q, q.lastAvailIdx); err != nil {
+			netDbg.Writef("processTransmitQueue setAvailEvent err=%v", err)
 			return err
 		}
 	}
 
 	newUsedIdx := q.usedIdx
-	if vn.shouldTriggerTxInterrupt(dev, q, avail, oldUsedIdx, newUsedIdx, suppressInterrupt) {
+	if vn.shouldTriggerInterrupt(dev, q, oldUsedIdx, newUsedIdx, suppressInterrupt) {
+		netDbg.Writef("processTransmitQueue raiseInterrupt bit=0x%x processed=%d", netInterruptBit, processed)
 		dev.raiseInterrupt(netInterruptBit)
 	}
 
@@ -365,8 +501,6 @@ func (vn *Net) processTransmitQueue(dev device, q *queue) error {
 }
 
 func (vn *Net) processReceiveQueue(dev device, q *queue) error {
-	vn.rxMu.Lock()
-	defer vn.rxMu.Unlock()
 	return vn.processReceiveQueueLocked(dev, q)
 }
 
@@ -380,6 +514,7 @@ func (vn *Net) processReceiveQueueLocked(dev device, q *queue) error {
 				queueReady = q.ready
 			}
 			slog.Debug("virtio-net: rx queue not ready", "pending", len(vn.pendingRx), "ready", queueReady, "size", queueSize)
+			netDbg.Writef("processReceiveQueueLocked notReady pending=%d ready=%t size=%d", len(vn.pendingRx), queueReady, queueSize)
 		}
 		return nil
 	}
@@ -387,14 +522,14 @@ func (vn *Net) processReceiveQueueLocked(dev device, q *queue) error {
 		return nil
 	}
 
-	descTable, avail, _, err := dev.queuePointers(q)
+	flags, availIdx, err := dev.readAvailState(q)
 	if err != nil {
+		netDbg.Writef("processReceiveQueueLocked readAvailState err=%v", err)
 		return err
 	}
-
-	availIdx := binary.LittleEndian.Uint16(avail[2:4])
-	suppressInterrupt := binary.LittleEndian.Uint16(avail[0:2])&virtqAvailFNoInterrupt != 0
+	suppressInterrupt := flags&virtqAvailFNoInterrupt != 0
 	oldUsedIdx := q.usedIdx
+	netDbg.Writef("processReceiveQueueLocked pending=%d availIdx=%d lastAvailIdx=%d flags=0x%x suppressInterrupt=%t", len(vn.pendingRx), availIdx, q.lastAvailIdx, flags, suppressInterrupt)
 
 	var packetIndex int
 	var processed uint16
@@ -405,26 +540,31 @@ func (vn *Net) processReceiveQueueLocked(dev device, q *queue) error {
 			"pending", len(vn.pendingRx),
 			"lastAvailIdx", q.lastAvailIdx,
 			"availIdx", availIdx)
+		netDbg.Writef("processReceiveQueueLocked noGuestBuffers pending=%d lastAvailIdx=%d availIdx=%d", len(vn.pendingRx), q.lastAvailIdx, availIdx)
 	}
 
 	for q.lastAvailIdx != availIdx && packetIndex < len(vn.pendingRx) {
 		packet := vn.pendingRx[packetIndex]
 
 		ringIndex := q.lastAvailIdx % q.size
-		ringOffset := 4 + int(ringIndex)*2
-		if ringOffset+2 > len(avail) {
-			return fmt.Errorf("net rx avail ring offset %d out of bounds", ringOffset)
-		}
-		head := binary.LittleEndian.Uint16(avail[ringOffset : ringOffset+2])
-
-		written, consumed, err := vn.fillRxDescriptorChain(dev, descTable, q, head, packet)
+		head, err := dev.readAvailEntry(q, ringIndex)
 		if err != nil {
+			netDbg.Writef("processReceiveQueueLocked readAvailEntry ringIndex=%d err=%v", ringIndex, err)
 			return err
 		}
+		netDbg.Writef("processReceiveQueueLocked fill head=%d ringIndex=%d pktLen=%d", head, ringIndex, len(packet))
+
+		written, consumed, err := vn.fillRxDescriptorChain(dev, q, head, packet)
+		if err != nil {
+			netDbg.Writef("processReceiveQueueLocked fillRxDescriptorChain head=%d err=%v", head, err)
+			return err
+		}
+		netDbg.Writef("processReceiveQueueLocked fillRxDescriptorChain head=%d written=%d consumed=%t", head, written, consumed)
 		if !consumed {
 			break
 		}
 		if err := dev.recordUsedElement(q, head, written); err != nil {
+			netDbg.Writef("processReceiveQueueLocked recordUsedElement head=%d err=%v", head, err)
 			return err
 		}
 		packetIndex++
@@ -433,6 +573,13 @@ func (vn *Net) processReceiveQueueLocked(dev device, q *queue) error {
 	}
 
 	if packetIndex > 0 {
+		// Release backpressure slots for packets removed from pendingRx.
+		for i := 0; i < packetIndex; i++ {
+			select {
+			case <-vn.rxSlots:
+			default:
+			}
+		}
 		if packetIndex >= len(vn.pendingRx) {
 			vn.pendingRx = vn.pendingRx[:0]
 		} else {
@@ -446,18 +593,20 @@ func (vn *Net) processReceiveQueueLocked(dev device, q *queue) error {
 
 	if dev.eventIdxEnabled() {
 		if err := dev.setAvailEvent(q, q.lastAvailIdx); err != nil {
+			netDbg.Writef("processReceiveQueueLocked setAvailEvent err=%v", err)
 			return err
 		}
 	}
 
 	newUsedIdx := q.usedIdx
-	if vn.shouldTriggerTxInterrupt(dev, q, avail, oldUsedIdx, newUsedIdx, suppressInterrupt) {
+	if vn.shouldTriggerInterrupt(dev, q, oldUsedIdx, newUsedIdx, suppressInterrupt) {
+		netDbg.Writef("processReceiveQueueLocked raiseInterrupt bit=0x%x processed=%d", netInterruptBit, processed)
 		dev.raiseInterrupt(netInterruptBit)
 	}
 	return nil
 }
 
-func (vn *Net) collectTxDescriptorChain(dev device, descTable []byte, q *queue, head uint16) ([]byte, []byte, error) {
+func (vn *Net) collectTxDescriptorChain(dev device, q *queue, head uint16) ([]byte, []byte, error) {
 	index := head
 	headerRemaining := netHeaderSize
 	headerBytes := vn.getTxHeaderBuffer()
@@ -471,15 +620,17 @@ func (vn *Net) collectTxDescriptorChain(dev device, descTable []byte, q *queue, 
 	totalPayload := 0
 
 	for i := uint16(0); i < q.size; i++ {
-		offset := int(index) * 16
-		if offset+16 > len(descTable) {
+		desc, err := dev.readDescriptor(q, index)
+		if err != nil {
+			netDbg.Writef("collectTxDescriptorChain head=%d idx=%d err=%v", head, index, err)
 			vn.putTxHeaderBuffer(headerBytes)
-			return nil, nil, fmt.Errorf("net tx descriptor %d out of bounds", index)
+			return nil, nil, err
 		}
-		addr := binary.LittleEndian.Uint64(descTable[offset : offset+8])
-		length := binary.LittleEndian.Uint32(descTable[offset+8 : offset+12])
-		flags := binary.LittleEndian.Uint16(descTable[offset+12 : offset+14])
-		next := binary.LittleEndian.Uint16(descTable[offset+14 : offset+16])
+		netDbg.Writef("collectTxDescriptorChain head=%d idx=%d addr=0x%x len=%d flags=0x%x next=%d", head, index, desc.addr, desc.length, desc.flags, desc.next)
+		addr := desc.addr
+		length := desc.length
+		flags := desc.flags
+		next := desc.next
 
 		if flags&virtqDescFWrite != 0 {
 			vn.putTxHeaderBuffer(headerBytes)
@@ -511,6 +662,7 @@ func (vn *Net) collectTxDescriptorChain(dev device, descTable []byte, q *queue, 
 
 		if flags&virtqDescFNext == 0 {
 			if headerRemaining > 0 {
+				netDbg.Writef("collectTxDescriptorChain head=%d truncated headerRemaining=%d", head, headerRemaining)
 				return nil, nil, fmt.Errorf("net tx header truncated in descriptor %d", index)
 			}
 			break
@@ -519,9 +671,11 @@ func (vn *Net) collectTxDescriptorChain(dev device, descTable []byte, q *queue, 
 	}
 
 	if headerRemaining > 0 {
+		netDbg.Writef("collectTxDescriptorChain head=%d chain shorter than header headerRemaining=%d", head, headerRemaining)
 		vn.putTxHeaderBuffer(headerBytes)
 		return nil, nil, fmt.Errorf("net tx descriptor chain shorter than header")
 	}
+	netDbg.Writef("collectTxDescriptorChain head=%d totalPayload=%d headerLen=%d segs=%d", head, totalPayload, len(headerBytes), len(segments))
 
 	var packet []byte
 	if totalPayload == 0 {
@@ -612,22 +766,6 @@ func (vn *Net) makeTxRelease(buf []byte) func() {
 	}
 }
 
-func (vn *Net) shouldTriggerTxInterrupt(dev device, q *queue, avail []byte, oldUsedIdx, newUsedIdx uint16, suppressInterrupt bool) bool {
-	if suppressInterrupt {
-		return false
-	}
-	if !dev.eventIdxEnabled() {
-		return true
-	}
-	usedEventOffset := 4 + int(q.size)*2
-	if usedEventOffset+2 > len(avail) {
-		// Malformed ring, best-effort wakeup.
-		return true
-	}
-	usedEvent := binary.LittleEndian.Uint16(avail[usedEventOffset : usedEventOffset+2])
-	return vringNeedEvent(usedEvent, newUsedIdx, oldUsedIdx)
-}
-
 func vringNeedEvent(eventIdx, newIdx, oldIdx uint16) bool {
 	return uint16(newIdx-eventIdx-1) < uint16(newIdx-oldIdx)
 }
@@ -655,6 +793,7 @@ func (vn *Net) prepareTxPacket(hdr virtioNetHeader, packet []byte) error {
 		return fmt.Errorf("unsupported virtio-net gso type %d", hdr.gsoType)
 	}
 	if hdr.flags&virtioNetHdrFNeedsCsum != 0 {
+		netDbg.Writef("prepareTxPacket applyChecksum csumStart=%d csumOffset=%d", hdr.csumStart, hdr.csumOffset)
 		if err := applyChecksum(hdr, packet); err != nil {
 			return err
 		}
@@ -679,6 +818,7 @@ func applyChecksum(hdr virtioNetHeader, packet []byte) error {
 		return fmt.Errorf("virtio-net packet too small for ethernet header: %d", len(packet))
 	}
 	ethType := binary.BigEndian.Uint16(packet[12:14])
+	netDbg.Writef("applyChecksum ethType=0x%04x packetLen=%d csStart=%d csOffset=%d", ethType, len(packet), csStart, csOffset)
 
 	var sum uint32
 	switch ethType {
@@ -746,19 +886,21 @@ type rxDescriptor struct {
 	length uint32
 }
 
-func (vn *Net) fillRxDescriptorChain(dev device, descTable []byte, q *queue, head uint16, packet []byte) (uint32, bool, error) {
+func (vn *Net) fillRxDescriptorChain(dev device, q *queue, head uint16, packet []byte) (uint32, bool, error) {
 	index := head
 	var descriptors []rxDescriptor
 
 	for i := uint16(0); i < q.size; i++ {
-		offset := int(index) * 16
-		if offset+16 > len(descTable) {
-			return 0, false, fmt.Errorf("net rx descriptor %d out of bounds", index)
+		desc, err := dev.readDescriptor(q, index)
+		if err != nil {
+			netDbg.Writef("fillRxDescriptorChain head=%d idx=%d err=%v", head, index, err)
+			return 0, false, err
 		}
-		addr := binary.LittleEndian.Uint64(descTable[offset : offset+8])
-		length := binary.LittleEndian.Uint32(descTable[offset+8 : offset+12])
-		flags := binary.LittleEndian.Uint16(descTable[offset+12 : offset+14])
-		next := binary.LittleEndian.Uint16(descTable[offset+14 : offset+16])
+		netDbg.Writef("fillRxDescriptorChain head=%d idx=%d addr=0x%x len=%d flags=0x%x next=%d", head, index, desc.addr, desc.length, desc.flags, desc.next)
+		addr := desc.addr
+		length := desc.length
+		flags := desc.flags
+		next := desc.next
 
 		if flags&virtqDescFWrite == 0 {
 			return 0, false, fmt.Errorf("net rx descriptor %d not writable", index)
@@ -777,6 +919,7 @@ func (vn *Net) fillRxDescriptorChain(dev device, descTable []byte, q *queue, hea
 	}
 
 	if descriptors[0].length < netHeaderSize {
+		netDbg.Writef("fillRxDescriptorChain head=%d first descriptor too small len=%d", head, descriptors[0].length)
 		return 0, false, fmt.Errorf("net rx first descriptor too small for header")
 	}
 
@@ -786,11 +929,18 @@ func (vn *Net) fillRxDescriptorChain(dev device, descTable []byte, q *queue, hea
 		available += uint64(d.length)
 	}
 	if available < uint64(required) {
+		netDbg.Writef("fillRxDescriptorChain head=%d insufficient buffers available=%d required=%d -> notConsumed", head, available, required)
 		return 0, false, nil
 	}
+	netDbg.Writef("fillRxDescriptorChain head=%d descriptors=%d available=%d required=%d", head, len(descriptors), available, required)
 
 	bytesRemaining := packet
 	buffersUsed := uint16(1)
+	var (
+		firstDescAddr     uint64
+		firstDescData     []byte
+		firstBytesWritten int
+	)
 	for i, desc := range descriptors {
 		if desc.length == 0 {
 			continue
@@ -801,21 +951,22 @@ func (vn *Net) fillRxDescriptorChain(dev device, descTable []byte, q *queue, hea
 		}
 		var bytesWritten int
 		if i == 0 {
+			firstDescAddr = desc.addr
+			firstDescData = data
+
 			// First descriptor: zero header, write packet data, set buffersUsed
 			for j := 0; j < netHeaderSize && j < len(data); j++ {
 				data[j] = 0
 			}
 			copyLen := copy(data[netHeaderSize:], bytesRemaining)
 			bytesRemaining = bytesRemaining[copyLen:]
-			if len(data) >= 12 {
-				binary.LittleEndian.PutUint16(data[10:12], buffersUsed)
-			}
 			// Write back at least netHeaderSize bytes (to include buffersUsed field),
 			// plus any packet data we copied
 			bytesWritten = netHeaderSize + copyLen
 			if bytesWritten > len(data) {
 				bytesWritten = len(data)
 			}
+			firstBytesWritten = bytesWritten
 		} else {
 			// Subsequent descriptors: write packet data
 			copyLen := copy(data, bytesRemaining)
@@ -826,7 +977,10 @@ func (vn *Net) fillRxDescriptorChain(dev device, descTable []byte, q *queue, hea
 			}
 		}
 		// Write the modified data back to guest memory
-		if bytesWritten > 0 {
+		//
+		// For the first descriptor, defer the write until we've finalized the
+		// buffersUsed count so the guest sees a consistent header.
+		if bytesWritten > 0 && i != 0 {
 			if err := dev.writeGuest(desc.addr, data[:bytesWritten]); err != nil {
 				return 0, false, fmt.Errorf("write guest memory for rx descriptor %d: %w", i, err)
 			}
@@ -837,8 +991,25 @@ func (vn *Net) fillRxDescriptorChain(dev device, descTable []byte, q *queue, hea
 	}
 
 	if len(bytesRemaining) != 0 {
+		netDbg.Writef("fillRxDescriptorChain head=%d bytesRemaining=%d", head, len(bytesRemaining))
 		return 0, false, fmt.Errorf("net rx bytes remaining after copy")
 	}
+
+	if firstDescData == nil {
+		return 0, false, fmt.Errorf("net rx missing first descriptor data")
+	}
+	// Always populate numBuffers for the 12-byte header; if the guest doesn't
+	// use it, it will be ignored, but when it does it must be accurate.
+	if len(firstDescData) >= 12 {
+		binary.LittleEndian.PutUint16(firstDescData[10:12], buffersUsed)
+	}
+	if firstBytesWritten > 0 {
+		if err := dev.writeGuest(firstDescAddr, firstDescData[:firstBytesWritten]); err != nil {
+			netDbg.Writef("fillRxDescriptorChain head=%d writeGuest first desc err=%v", head, err)
+			return 0, false, fmt.Errorf("write guest memory for rx descriptor %d: %w", 0, err)
+		}
+	}
+	netDbg.Writef("fillRxDescriptorChain head=%d done required=%d buffersUsed=%d", head, required, buffersUsed)
 
 	return required, true, nil
 }

@@ -11,15 +11,18 @@ import (
 	"io/fs"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"time"
 
 	"github.com/tinyrange/cc/internal/asm"
 	"github.com/tinyrange/cc/internal/asm/amd64"
 	"github.com/tinyrange/cc/internal/asm/arm64"
 	riscvasm "github.com/tinyrange/cc/internal/asm/riscv"
+	"github.com/tinyrange/cc/internal/debug"
 	"github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	amd64serial "github.com/tinyrange/cc/internal/devices/amd64/serial"
 	"github.com/tinyrange/cc/internal/devices/virtio"
@@ -1916,6 +1919,35 @@ func RunInitX(debug bool) error {
 func RunExecutable(path string) error {
 	slog.Info("Starting Bringup Quest: Run Executable", "path", path)
 
+	if os.Getenv("CC_DEBUG_FILE") != "" {
+		if os.Getenv("CC_DEBUG_MEMORY") != "" {
+			mem, err := debug.OpenMemory()
+			if err != nil {
+				return fmt.Errorf("open debug memory: %w", err)
+			}
+			defer func() {
+				f, err := os.Create(os.Getenv("CC_DEBUG_FILE"))
+				if err != nil {
+					slog.Warn("failed to create debug file", "error", err)
+					return
+				}
+				defer f.Close()
+				if _, err := mem.WriteTo(f); err != nil {
+					slog.Warn("failed to write debug memory to file", "error", err)
+					return
+				}
+			}()
+			debug.Writef("bringup", "debug memory enabled")
+		} else {
+			if err := debug.OpenFile(os.Getenv("CC_DEBUG_FILE")); err != nil {
+				return fmt.Errorf("open debug file: %w", err)
+			}
+			defer debug.Close()
+			debug.Writef("bringup", "debug file: %s", os.Getenv("CC_DEBUG_FILE"))
+		}
+		debug.Writef("bringup", "debug memory enabled")
+	}
+
 	hv, err := factory.Open()
 	if err != nil {
 		return fmt.Errorf("open hypervisor factory: %w", err)
@@ -1940,10 +1972,27 @@ func RunExecutable(path string) error {
 	if err != nil {
 		return fmt.Errorf("create netstack backend: %w", err)
 	}
+	if dir := os.Getenv("CC_NETSTACK_PCAP_DIR"); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create pcap dir: %w", err)
+		}
+		name := fmt.Sprintf("bringup-%s-%d.pcap", time.Now().UTC().Format("20060102T150405.000000000Z"), os.Getpid())
+		path := filepath.Join(dir, name)
+		f, err := os.Create(path)
+		if err != nil {
+			return fmt.Errorf("create pcap file: %w", err)
+		}
+		defer f.Close()
+		if err := netBackend.OpenPacketCapture(f); err != nil {
+			return fmt.Errorf("enable pcap: %w", err)
+		}
+		slog.Info("netstack pcap enabled", "path", path)
+	}
 
 	const (
 		bringupTCPEchoPort = 4242
 		bringupUDPEchoPort = 4243
+		bringupHTTPPort    = 4244
 	)
 
 	tcpEchoListener, err := ns.ListenInternal("tcp", fmt.Sprintf(":%d", bringupTCPEchoPort))
@@ -2020,6 +2069,79 @@ func RunExecutable(path string) error {
 		}
 	}()
 
+	httpLn, err := ns.ListenInternal("tcp", fmt.Sprintf(":%d", bringupHTTPPort))
+	if err != nil {
+		return fmt.Errorf("start bringup http listener: %w", err)
+	}
+	defer httpLn.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/download/{size}", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		b := r.PathValue("size")
+		if b == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		totalBytes, err := strconv.Atoi(b)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", totalBytes))
+		w.WriteHeader(http.StatusOK)
+
+		buf := make([]byte, 32*1024)
+		remaining := totalBytes
+		writtenTotal := 0
+		for remaining > 0 {
+			n := min(remaining, len(buf))
+			start := time.Now()
+			wrote, err := w.Write(buf[:n])
+			elapsed := time.Since(start)
+			if elapsed > 100*time.Millisecond {
+				slog.Warn("bringup http download write slow",
+					"size", totalBytes,
+					"wrote", wrote,
+					"remaining", remaining,
+					"elapsed", elapsed,
+					"err", err,
+				)
+			}
+			if err != nil {
+				slog.Warn("bringup http download write failed",
+					"size", totalBytes,
+					"writtenTotal", writtenTotal,
+					"remaining", remaining,
+					"wrote", wrote,
+					"err", err,
+				)
+				return
+			}
+			writtenTotal += wrote
+			remaining -= wrote
+		}
+		slog.Debug("bringup http download complete", "size", totalBytes, "writtenTotal", writtenTotal)
+	})
+
+	httpSrv := &http.Server{Handler: mux}
+	go func() {
+		if err := httpSrv.Serve(httpLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Warn("bringup http server exited", "err", err)
+		}
+	}()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = httpSrv.Shutdown(ctx)
+		cancel()
+	}()
+
 	vm, err := initx.NewVirtualMachine(hv, 1, 256, kernel,
 		initx.WithFileFromBytes("/initx-exec", fileData, fs.FileMode(0755)),
 		initx.WithDeviceTemplate(virtio.FSTemplate{
@@ -2038,12 +2160,22 @@ func RunExecutable(path string) error {
 	}
 	defer vm.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 	defer cancel()
 
 	slog.Info("Running Executable in InitX Virtual Machine", "path", path)
 
-	if err := vm.Spawn(ctx, "/initx-exec", "-test.v", "-test.timeout=5s"); err != nil {
+	args := []string{"-test.v", "-test.timeout=30s"}
+	// Enable large bringup guest-side tests (e.g. 1MiB HTTP download) by passing
+	// custom test binary flags into the guest.
+	if os.Getenv("CC_BRINGUP_LARGE") != "" {
+		args = append(args, "-bringup.large")
+		if iters := os.Getenv("CC_BRINGUP_LARGE_ITERS"); iters != "" {
+			args = append(args, "-bringup.large.iters="+iters)
+		}
+	}
+
+	if err := vm.Spawn(ctx, "/initx-exec", args...); err != nil {
 		return fmt.Errorf("run executable in initx virtual machine: %w", err)
 	}
 

@@ -138,6 +138,7 @@ type virtualMachine struct {
 	hv             *hypervisor
 	vmFd           int
 	vcpus          map[int]*virtualCPU
+	memMu          sync.RWMutex
 	memory         []byte
 	memoryBase     uint64
 	devices        []hv.Device
@@ -235,8 +236,15 @@ func (v *virtualMachine) Close() error {
 		}
 	}
 
-	if err := unix.Munmap(v.memory); err != nil {
-		return fmt.Errorf("munmap vm memory: %w", err)
+	v.memMu.Lock()
+	mem := v.memory
+	v.memory = nil
+	v.memMu.Unlock()
+
+	if mem != nil {
+		if err := unix.Munmap(mem); err != nil {
+			return fmt.Errorf("munmap vm memory: %w", err)
+		}
 	}
 
 	if err := unix.Close(v.vmFd); err != nil {
@@ -268,6 +276,11 @@ func (v *virtualMachine) Run(ctx context.Context, cfg hv.RunConfig) error {
 }
 
 func (v *virtualMachine) ReadAt(p []byte, off int64) (n int, err error) {
+	v.memMu.RLock()
+	defer v.memMu.RUnlock()
+	if v.memory == nil {
+		return 0, fmt.Errorf("kvm: ReadAt after close")
+	}
 	off = off - int64(v.memoryBase)
 
 	if off < 0 || int(off) >= len(v.memory) {
@@ -283,6 +296,11 @@ func (v *virtualMachine) ReadAt(p []byte, off int64) (n int, err error) {
 }
 
 func (v *virtualMachine) WriteAt(p []byte, off int64) (n int, err error) {
+	v.memMu.RLock()
+	defer v.memMu.RUnlock()
+	if v.memory == nil {
+		return 0, fmt.Errorf("kvm: WriteAt after close")
+	}
 	off = off - int64(v.memoryBase)
 
 	if off < 0 || int(off) >= len(v.memory) {

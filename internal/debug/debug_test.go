@@ -2,65 +2,11 @@ package debug
 
 import (
 	"fmt"
-	"io"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
-
-type write struct {
-	off  int64
-	data []byte
-}
-
-type logStructuredBuffer struct {
-	data    sync.Map
-	maxSize atomic.Int64
-}
-
-func (b *logStructuredBuffer) WriteAt(p []byte, off int64) (n int, err error) {
-	b.data.Store(off, write{
-		off:  off,
-		data: append([]byte{}, p...),
-	})
-	val := b.maxSize.Load()
-	if val < int64(len(p))+off {
-		for {
-			if b.maxSize.CompareAndSwap(val, int64(len(p))+off) {
-				break
-			}
-			val = b.maxSize.Load()
-		}
-	}
-	return len(p), nil
-}
-
-func (b *logStructuredBuffer) Close() error {
-	return nil
-}
-
-type compiledBuffer []byte
-
-func (b *compiledBuffer) ReadAt(p []byte, off int64) (n int, err error) {
-	if off < 0 || off >= int64(len(*b)) {
-		return 0, io.EOF
-	}
-	return copy(p, (*b)[off:]), nil
-}
-
-func (b *logStructuredBuffer) Compile() (compiledBuffer, error) {
-	data := make([]byte, b.maxSize.Load())
-	b.data.Range(func(key, value any) bool {
-		off := key.(int64)
-		write := value.(write)
-		copy(data[off:off+int64(len(write.data))], write.data)
-		return true
-	})
-
-	return compiledBuffer(data), nil
-}
 
 func TestDebug(t *testing.T) {
 	buf := new(logStructuredBuffer)
