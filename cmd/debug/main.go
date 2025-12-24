@@ -126,7 +126,7 @@ EXAMPLES:
 				// -tail explicitly requests last N, so truncate
 				entries = entries[len(entries)-*limit:]
 			} else {
-				return fmt.Errorf("too many entries: %d (limit is %d). Use -tail for last %d, or explictly set a limit using -limit", len(entries), *limit, *limit)
+				return fmt.Errorf("too many entries: %d (limit is %d). Use -tail for last %d, or explicitly set a limit using -limit", len(entries), *limit, *limit)
 			}
 		}
 	} else if *limit > 0 {
