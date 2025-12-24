@@ -130,8 +130,13 @@ EXAMPLES:
 			}
 		}
 	} else if *limit > 0 {
-		if *tail {
-			entries = entries[len(entries)-*limit:]
+		if len(entries) > *limit {
+			if *tail {
+				entries = entries[len(entries)-*limit:]
+			} else {
+				entries = entries[:*limit]
+			}
+		}
 		} else {
 			if len(entries) > *limit {
 				entries = entries[:*limit]
