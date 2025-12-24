@@ -136,7 +136,6 @@ EXAMPLES:
 			} else {
 				entries = entries[:*limit]
 			}
-		}
 		} else {
 			if len(entries) > *limit {
 				entries = entries[:*limit]
