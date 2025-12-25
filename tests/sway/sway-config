@@ -1,0 +1,12 @@
+set $mod Mod4
+font pango:DejaVu Sans 10
+
+# Start a terminal
+exec foot
+
+# Basic keybinds
+bindsym $mod+Return exec foot
+bindsym $mod+Shift+e exec "swaymsg exit"
+
+# Optional: keep things simple
+floating_modifier $mod normal

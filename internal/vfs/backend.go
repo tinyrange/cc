@@ -660,7 +660,7 @@ var (
 )
 
 // Create implements FUSE_CREATE semantics.
-func (v *virtioFsBackend) Create(parent uint64, name string, mode uint32, flags uint32, umask uint32) (nodeID uint64, fh uint64, attr virtio.FuseAttr, errno int32) {
+func (v *virtioFsBackend) Create(parent uint64, name string, mode uint32, flags uint32, umask uint32, uid uint32, gid uint32) (nodeID uint64, fh uint64, attr virtio.FuseAttr, errno int32) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
@@ -699,6 +699,8 @@ func (v *virtioFsBackend) Create(parent uint64, name string, mode uint32, flags 
 	v.nextID++
 	perm := fs.FileMode(mode&^umask) & 0777
 	node := newFileNode(id, clean, parentNode.id, perm)
+	node.uid = uid
+	node.gid = gid
 	parentNode.entries[clean] = id
 	if parentNode.abstractDir == nil {
 		parentNode.modTime = time.Now()
@@ -711,7 +713,7 @@ func (v *virtioFsBackend) Create(parent uint64, name string, mode uint32, flags 
 	return id, fh, node.attr(), 0
 }
 
-func (v *virtioFsBackend) Mkdir(parent uint64, name string, mode uint32, umask uint32) (nodeID uint64, attr virtio.FuseAttr, errno int32) {
+func (v *virtioFsBackend) Mkdir(parent uint64, name string, mode uint32, umask uint32, uid uint32, gid uint32) (nodeID uint64, attr virtio.FuseAttr, errno int32) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
@@ -737,6 +739,8 @@ func (v *virtioFsBackend) Mkdir(parent uint64, name string, mode uint32, umask u
 	v.nextID++
 	perm := fs.FileMode(mode&^umask) & 0777
 	node := newDirNode(id, clean, parentNode.id, perm)
+	node.uid = uid
+	node.gid = gid
 	parentNode.entries[clean] = id
 	if parentNode.abstractDir == nil {
 		parentNode.modTime = time.Now()
@@ -745,7 +749,7 @@ func (v *virtioFsBackend) Mkdir(parent uint64, name string, mode uint32, umask u
 	return id, node.attr(), 0
 }
 
-func (v *virtioFsBackend) Mknod(parent uint64, name string, mode uint32, rdev uint32, umask uint32) (nodeID uint64, attr virtio.FuseAttr, errno int32) {
+func (v *virtioFsBackend) Mknod(parent uint64, name string, mode uint32, rdev uint32, umask uint32, uid uint32, gid uint32) (nodeID uint64, attr virtio.FuseAttr, errno int32) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
@@ -775,6 +779,8 @@ func (v *virtioFsBackend) Mknod(parent uint64, name string, mode uint32, rdev ui
 	// Store the raw mode for special file types (sockets, fifos, etc.)
 	node.rawMode = mode
 	node.rdev = rdev
+	node.uid = uid
+	node.gid = gid
 	parentNode.entries[clean] = id
 	if parentNode.abstractDir == nil {
 		parentNode.modTime = time.Now()
@@ -1064,7 +1070,7 @@ func (v *virtioFsBackend) SetAttr(nodeID uint64, size *uint64, mode *uint32, uid
 	return 0
 }
 
-func (v *virtioFsBackend) Symlink(parent uint64, name string, target string, _ uint32) (nodeID uint64, attr virtio.FuseAttr, errno int32) {
+func (v *virtioFsBackend) Symlink(parent uint64, name string, target string, _ uint32, uid uint32, gid uint32) (nodeID uint64, attr virtio.FuseAttr, errno int32) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
@@ -1098,6 +1104,8 @@ func (v *virtioFsBackend) Symlink(parent uint64, name string, target string, _ u
 		xattr:         make(map[string][]byte),
 		modTime:       time.Now(),
 		symlinkTarget: target,
+		uid:           uid,
+		gid:           gid,
 	}
 	parentNode.entries[clean] = id
 	if parentNode.abstractDir == nil {
@@ -1232,6 +1240,10 @@ func (v *virtioFsBackend) AddAbstractFile(filePath string, file AbstractFile) er
 		abstractFile: file,
 		modTime:      modTime,
 	}
+	// Check if the file provides ownership info
+	if owner, ok := file.(AbstractOwner); ok {
+		node.uid, node.gid = owner.Owner()
+	}
 
 	parent.entries[name] = id
 	if parent.abstractDir == nil {
@@ -1280,6 +1292,10 @@ func (v *virtioFsBackend) AddAbstractDir(dirPath string, dir AbstractDir) error 
 		entries:     make(map[string]uint64),
 		abstractDir: dir,
 		modTime:     modTime,
+	}
+	// Check if the directory provides ownership info
+	if owner, ok := dir.(AbstractOwner); ok {
+		node.uid, node.gid = owner.Owner()
 	}
 
 	parent.entries[name] = id

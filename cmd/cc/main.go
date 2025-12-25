@@ -20,6 +20,7 @@ import (
 
 	"github.com/tinyrange/cc/internal/debug"
 	"github.com/tinyrange/cc/internal/devices/virtio"
+	"github.com/tinyrange/cc/internal/gowin/window"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/factory"
 	"github.com/tinyrange/cc/internal/initx"
@@ -572,6 +573,62 @@ func run() error {
 	}
 
 	debug.Writef("cc.run running command", "running command %v", execCmd)
+
+	// If GPU is enabled, set up the display manager and run VM in background
+	if *gpu && vm.GPU() != nil {
+		// Get display scale factor and calculate physical window dimensions
+		scale := window.GetDisplayScale()
+		physWidth := int(float32(1024) * scale)
+		physHeight := int(float32(768) * scale)
+
+		// Create window for display with scaled dimensions
+		win, err := window.New("cc", physWidth, physHeight, true)
+		if err != nil {
+			slog.Warn("failed to create window, running without display", "error", err)
+			// Fall through to run without display
+		} else {
+			defer win.Close()
+
+			// Create display manager and connect to GPU/Input devices
+			displayMgr := virtio.NewDisplayManager(vm.GPU(), vm.Keyboard(), vm.Tablet())
+			displayMgr.SetWindow(win)
+
+			// Run VM in a goroutine
+			vmDone := make(chan error, 1)
+			go func() {
+				vmDone <- vm.Run(ctx, prog)
+			}()
+
+			// Run display loop on main thread
+			ticker := time.NewTicker(16 * time.Millisecond) // ~60 FPS
+			defer ticker.Stop()
+
+		displayLoop:
+			for {
+				select {
+				case err := <-vmDone:
+					if err != nil {
+						return fmt.Errorf("run executable in initx virtual machine: %w", err)
+					}
+					break displayLoop
+				case <-ctx.Done():
+					return fmt.Errorf("context cancelled: %w", ctx.Err())
+				case <-ticker.C:
+					// Poll window events
+					if !displayMgr.Poll() {
+						// Window was closed
+						return fmt.Errorf("window closed by user")
+					}
+					// Render and swap
+					displayMgr.Render()
+					displayMgr.Swap()
+				}
+			}
+
+			slog.Info("cc: command exited")
+			return nil
+		}
+	}
 
 	if err := vm.Run(ctx, prog); err != nil {
 		var exitErr *initx.ExitError

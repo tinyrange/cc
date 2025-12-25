@@ -317,15 +317,15 @@ type FsBackend interface {
 }
 
 type fsCreateBackend interface {
-	Create(parent uint64, name string, mode uint32, flags uint32, umask uint32) (nodeID uint64, fh uint64, attr FuseAttr, errno int32)
+	Create(parent uint64, name string, mode uint32, flags uint32, umask uint32, uid uint32, gid uint32) (nodeID uint64, fh uint64, attr FuseAttr, errno int32)
 }
 
 type fsMkdirBackend interface {
-	Mkdir(parent uint64, name string, mode uint32, umask uint32) (nodeID uint64, attr FuseAttr, errno int32)
+	Mkdir(parent uint64, name string, mode uint32, umask uint32, uid uint32, gid uint32) (nodeID uint64, attr FuseAttr, errno int32)
 }
 
 type fsMknodBackend interface {
-	Mknod(parent uint64, name string, mode uint32, rdev uint32, umask uint32) (nodeID uint64, attr FuseAttr, errno int32)
+	Mknod(parent uint64, name string, mode uint32, rdev uint32, umask uint32, uid uint32, gid uint32) (nodeID uint64, attr FuseAttr, errno int32)
 }
 
 type fsWriteBackend interface {
@@ -340,7 +340,7 @@ type fsXattrBackend interface {
 type fsSymlinkBackend interface {
 	// Symlink creates a new symlink named `name` in directory `parent` which points to `target`.
 	// Returns the new nodeID and its attributes.
-	Symlink(parent uint64, name string, target string, umask uint32) (nodeID uint64, attr FuseAttr, errno int32)
+	Symlink(parent uint64, name string, target string, umask uint32, uid uint32, gid uint32) (nodeID uint64, attr FuseAttr, errno int32)
 }
 
 type fsReadlinkBackend interface {
@@ -894,7 +894,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		name := readName(req[fuseHdrInSize+16:])
 		debug.Writef("virtio-fs.dispatchFUSE op=CREATE", "name=%q mode=0%o flags=0x%x umask=0%o", name, mode, flags, umask)
 		if be, ok := v.backend.(fsCreateBackend); ok {
-			nodeID, fh, attr, e := be.Create(in.NodeID, name, mode, flags, umask)
+			nodeID, fh, attr, e := be.Create(in.NodeID, name, mode, flags, umask, in.UID, in.GID)
 			errno = e
 			if errno == 0 {
 				extra := make([]byte, 40+88+16)
@@ -920,7 +920,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		name := readName(req[fuseHdrInSize+16:])
 		debug.Writef("virtio-fs.dispatchFUSE op=MKNOD", "name=%q mode=0%o rdev=0x%x umask=0%o", name, mode, rdev, umask)
 		if be, ok := v.backend.(fsMknodBackend); ok {
-			nodeID, attr, e := be.Mknod(in.NodeID, name, mode, rdev, umask)
+			nodeID, attr, e := be.Mknod(in.NodeID, name, mode, rdev, umask, in.UID, in.GID)
 			errno = e
 			if errno == 0 {
 				extra := make([]byte, 40+88)
@@ -944,7 +944,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		name := readName(req[fuseHdrInSize+8:])
 		debug.Writef("virtio-fs.dispatchFUSE op=MKDIR", "name=%q mode=0%o umask=0%o", name, mode, umask)
 		if be, ok := v.backend.(fsMkdirBackend); ok {
-			nodeID, attr, e := be.Mkdir(in.NodeID, name, mode, umask)
+			nodeID, attr, e := be.Mkdir(in.NodeID, name, mode, umask, in.UID, in.GID)
 			errno = e
 			if errno == 0 {
 				extra := make([]byte, 40+88)
@@ -1202,7 +1202,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 		debug.Writef("virtio-fs.dispatchFUSE op=SYMLINK", "parent=%d name=%q target=%q umask=0%o", in.NodeID, name, target, umask)
 		if be, ok := v.backend.(fsSymlinkBackend); ok {
-			nodeID, attr, e := be.Symlink(in.NodeID, name, target, umask)
+			nodeID, attr, e := be.Symlink(in.NodeID, name, target, umask, in.UID, in.GID)
 			errno = e
 			if errno == 0 {
 				// fuse_entry_out
