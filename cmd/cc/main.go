@@ -542,6 +542,10 @@ func run() error {
 		return err
 	}
 
+	// Start stdin forwarding now that VM is booted and user command is about to run.
+	// This ensures stdin data goes to the user command, not the init process.
+	vm.StartStdinForwarding()
+
 	var ctx context.Context
 	if *timeout > 0 {
 		newCtx, cancel := context.WithTimeout(context.Background(), *timeout)

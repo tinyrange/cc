@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime"
 
+	"github.com/tinyrange/cc/internal/debug"
 	"github.com/tinyrange/cc/internal/devices/virtio"
 	"github.com/tinyrange/cc/internal/fdt"
 	"github.com/tinyrange/cc/internal/hv"
@@ -356,6 +357,10 @@ type VirtualMachine struct {
 	outBuffer *proxyWriter
 	inBuffer  *proxyReader
 
+	// pendingStdin holds the stdin reader until StartStdinForwarding is called.
+	// This allows delaying stdin forwarding until after VM boot completes.
+	pendingStdin io.Reader
+
 	programLoader *programLoader
 
 	configRegion hv.MemoryRegion
@@ -366,6 +371,17 @@ type VirtualMachine struct {
 
 func (vm *VirtualMachine) Close() error {
 	return vm.vm.Close()
+}
+
+// StartStdinForwarding activates stdin forwarding to the guest console.
+// This should be called after the VM has booted and before the user command runs,
+// to ensure stdin data is delivered to the user command rather than the init process.
+func (vm *VirtualMachine) StartStdinForwarding() {
+	if vm.pendingStdin != nil {
+		debug.Writef("initx.StartStdinForwarding", "activating stdin reader %T", vm.pendingStdin)
+		vm.inBuffer.SetReader(vm.pendingStdin)
+		vm.pendingStdin = nil
+	}
 }
 
 func (vm *VirtualMachine) Run(ctx context.Context, prog *ir.Program) error {
@@ -485,9 +501,13 @@ func WithDmesgLogging(enabled bool) Option {
 func WithStdin(r io.Reader) Option {
 	return funcOption(func(vm *VirtualMachine) error {
 		if r != nil {
-			// Directly set the reader field since the console's input
-			// reader goroutine hasn't started yet at this point.
-			vm.inBuffer.r = r
+			// Store the reader for later - it will be activated when StartStdinForwarding is called.
+			// This allows the stdin to be forwarded after VM boot, avoiding early data delivery
+			// to the init process instead of the user command.
+			debug.Writef("initx.WithStdin", "storing stdin reader %T for later activation", r)
+			vm.pendingStdin = r
+		} else {
+			debug.Writef("initx.WithStdin", "stdin reader is nil")
 		}
 		return nil
 	})
@@ -583,7 +603,8 @@ func NewVirtualMachine(
 		},
 
 		SerialStdout: out,
-		SerialStdin:  in,
+		// SerialStdin is intentionally not set - stdin goes to virtio-console (hvc0) instead
+		// SerialStdin:  in,
 
 		GetCmdline: func(arch hv.CpuArchitecture) ([]string, error) {
 			var args []string
