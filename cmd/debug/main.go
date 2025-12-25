@@ -85,14 +85,17 @@ EXAMPLES:
 	}
 
 	if *memprofile != "" {
-		f, err := os.Create(*memprofile)
-		if err != nil {
-			return fmt.Errorf("create memory profile file: %w", err)
-		}
-		defer f.Close()
-		if err := pprof.Lookup("heap").WriteTo(f, 0); err != nil {
-			return fmt.Errorf("write memory profile: %w", err)
-		}
+		defer func() {
+			f, err := os.Create(*memprofile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "create memory profile file: %v\n", err)
+				return
+			}
+			defer f.Close()
+			if err := pprof.Lookup("heap").WriteTo(f, 0); err != nil {
+				fmt.Fprintf(os.Stderr, "write memory profile: %v\n", err)
+			}
+		}()
 	}
 
 	if len(flag.Args()) != 1 {
