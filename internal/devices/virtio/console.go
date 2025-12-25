@@ -264,6 +264,7 @@ func (vc *Console) OnReset(device) {
 }
 
 func (vc *Console) OnQueueNotify(dev device, queue int) error {
+	debug.Writef("virtio-console.OnQueueNotify", "queue=%d", queue)
 	switch queue {
 	case queueTransmit:
 		return vc.processTransmitQueue(dev, dev.queue(queue))
@@ -369,6 +370,13 @@ func (vc *Console) consumeDescriptorChain(dev device, q *queue, head uint16) (ui
 
 func (vc *Console) processReceiveQueue(dev device, q *queue) error {
 	if q == nil || !q.ready || q.size == 0 {
+		var ready bool
+		var size uint16
+		if q != nil {
+			ready = q.ready
+			size = q.size
+		}
+		debug.Writef("virtio-console.processReceiveQueue skip", "q=%v ready=%v size=%v", q != nil, ready, size)
 		return nil
 	}
 
@@ -384,6 +392,7 @@ func (vc *Console) processReceiveQueue(dev device, q *queue) error {
 	vc.mu.Lock()
 	defer vc.mu.Unlock()
 
+	debug.Writef("virtio-console.processReceiveQueue", "pending=%d", len(vc.pending))
 	if len(vc.pending) == 0 {
 		return nil
 	}
@@ -394,6 +403,7 @@ func (vc *Console) processReceiveQueue(dev device, q *queue) error {
 	}
 	var interruptNeeded bool
 
+	debug.Writef("virtio-console.processReceiveQueue", "availIdx=%d lastAvailIdx=%d", availIdx, q.lastAvailIdx)
 	for q.lastAvailIdx != availIdx && len(vc.pending) > 0 {
 		ringIndex := q.lastAvailIdx % q.size
 		head, err := dev.readAvailEntry(q, ringIndex)
@@ -405,6 +415,7 @@ func (vc *Console) processReceiveQueue(dev device, q *queue) error {
 		if err != nil {
 			return err
 		}
+		debug.Writef("virtio-console.processReceiveQueue", "delivered written=%d consumed=%d remaining=%d", written, consumed, len(vc.pending)-consumed)
 
 		vc.pending = vc.pending[consumed:]
 
@@ -419,6 +430,7 @@ func (vc *Console) processReceiveQueue(dev device, q *queue) error {
 	}
 
 	if interruptNeeded {
+		debug.Writef("virtio-console.processReceiveQueue", "raising interrupt")
 		dev.raiseInterrupt(consoleInterruptBit)
 	}
 
@@ -489,11 +501,13 @@ func (vc *Console) enqueueInput(data []byte) {
 
 func (vc *Console) readInput() {
 	defer vc.inputWG.Done()
+	debug.Writef("virtio-console.readInput", "started in=%T", vc.in)
 
 	buf := make([]byte, 4096)
 	for {
 		select {
 		case <-vc.inputStop:
+			debug.Writef("virtio-console.readInput", "stopped via channel")
 			return
 		default:
 		}
@@ -504,12 +518,16 @@ func (vc *Console) readInput() {
 		}
 
 		n, err := vc.in.Read(buf)
+		debug.Writef("virtio-console.readInput", "read n=%d err=%v", n, err)
 		if n > 0 {
 			chunk := append([]byte(nil), buf[:n]...)
 			vc.enqueueInput(chunk)
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				debug.Writef("virtio-console.readInput", "EOF, sending Ctrl+D to guest")
+				// Send Ctrl+D (EOT) to signal EOF to the guest
+				vc.enqueueInput([]byte{0x04})
 				return
 			}
 			select {
@@ -525,11 +543,20 @@ func (vc *Console) readInput() {
 
 func (vc *Console) startInputReader() {
 	if vc.in == nil || vc.inputStop != nil {
+		debug.Writef("virtio-console.startInputReader skip", "in=%v inputStop=%v", vc.in != nil, vc.inputStop != nil)
 		return
 	}
+	debug.Writef("virtio-console.startInputReader", "starting input reader goroutine")
 	vc.inputStop = make(chan struct{})
 	vc.inputWG.Add(1)
 	go vc.readInput()
+}
+
+// StartInputForwarding begins reading from the host's stdin and forwarding to the guest.
+// This should be called after the VM has booted and the user command is about to start,
+// to avoid delivering stdin data to the init process instead of the user command.
+func (vc *Console) StartInputForwarding() {
+	vc.startInputReader()
 }
 
 func (vc *Console) stopInputReader() {
