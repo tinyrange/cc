@@ -377,6 +377,7 @@ func main() {
 	remote := fs.String("remote", "", "run quest/bringup on remote host alias from local/remotes.json")
 	run := fs.Bool("run", false, "run the built cc tool after building")
 	runtest := fs.String("runtest", "", "build a Dockerfile in tests/<name>/Dockerfile and run it using cc (Linux only)")
+	dbgTool := fs.Bool("dbg-tool", false, "build and run the debug tool")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
@@ -408,6 +409,24 @@ func main() {
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to build codesign: %v\n", err)
+			os.Exit(1)
+		}
+
+		if err := runBuildOutput(out, fs.Args()); err != nil {
+			os.Exit(1)
+		}
+
+		return
+	}
+
+	if *dbgTool {
+		out, err := goBuild(buildOptions{
+			Package:    "cmd/debug",
+			OutputName: "debug",
+			Build:      hostBuild,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build debug tool: %v\n", err)
 			os.Exit(1)
 		}
 
@@ -675,8 +694,8 @@ func main() {
 		if !filepath.IsAbs(relativeTarPath) {
 			relativeTarPath = strings.Join([]string{".", relativeTarPath}, string(filepath.Separator))
 		}
-		fmt.Printf("Running cc with image %s...\n", relativeTarPath)
-		ccArgs := append([]string{relativeTarPath}, fs.Args()...)
+		ccArgs := append(fs.Args(), relativeTarPath)
+		fmt.Printf("Running cc with image %s and args %s...\n", relativeTarPath, strings.Join(ccArgs, " "))
 		if err := runBuildOutput(ccOut, ccArgs); err != nil {
 			os.Exit(1)
 		}

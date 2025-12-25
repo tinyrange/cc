@@ -5,10 +5,19 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"runtime/pprof"
 	"time"
 
 	"github.com/tinyrange/cc/internal/debug"
 )
+
+func getModTime(filename string) (time.Time, error) {
+	fi, err := os.Stat(filename)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return fi.ModTime(), nil
+}
 
 func run() error {
 	// Flags
@@ -18,6 +27,8 @@ func run() error {
 	match := flag.String("match", "", "regex to filter messages")
 	limit := flag.Int("limit", 100, "limit the number of entries (0 for unlimited)")
 	tail := flag.Bool("tail", false, "show last N entries instead of first N")
+	cpuprofile := flag.String("cpuprofile", "", "write CPU profile to file")
+	memprofile := flag.String("memprofile", "", "write memory profile to file")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `debug - inspect binary debug logs
@@ -54,6 +65,34 @@ EXAMPLES:
 	flag.Parse()
 
 	if flag.NArg() < 1 {
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			return fmt.Errorf("create CPU profile file: %w", err)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			return fmt.Errorf("start CPU profile: %w", err)
+		}
+		defer pprof.StopCPUProfile()
+	}
+
+	if *memprofile != "" {
+		f, err := os.Create(*memprofile)
+		if err != nil {
+			return fmt.Errorf("create memory profile file: %w", err)
+		}
+		defer f.Close()
+		if err := pprof.Lookup("heap").WriteTo(f, 0); err != nil {
+			return fmt.Errorf("write memory profile: %w", err)
+		}
+	}
+
+	if len(flag.Args()) != 1 {
 		flag.Usage()
 		os.Exit(1)
 	}
