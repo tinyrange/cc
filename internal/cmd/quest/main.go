@@ -26,6 +26,7 @@ import (
 	"github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	amd64serial "github.com/tinyrange/cc/internal/devices/amd64/serial"
 	"github.com/tinyrange/cc/internal/devices/virtio"
+	"github.com/tinyrange/cc/internal/gowin/window"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/factory"
 	"github.com/tinyrange/cc/internal/hv/helpers"
@@ -2183,6 +2184,59 @@ func RunExecutable(path string, gpuEnabled bool) error {
 		}
 	}
 
+	// If GPU is enabled, set up the display manager and run VM in background
+	if gpuEnabled && vm.GPU() != nil {
+		// Create window for display
+		win, err := window.New("GPU Bringup Test", 1024, 768, true)
+		if err != nil {
+			slog.Warn("failed to create window, running without display", "error", err)
+			// Fall through to run without display
+		} else {
+			defer win.Close()
+
+			// Create display manager and connect to GPU/Input devices
+			displayMgr := virtio.NewDisplayManager(vm.GPU(), vm.Keyboard(), vm.Tablet())
+			displayMgr.SetWindow(win)
+
+			// Run VM in a goroutine
+			vmDone := make(chan error, 1)
+			go func() {
+				vmDone <- vm.Spawn(ctx, "/initx-exec", args...)
+			}()
+
+			// Run display loop on main thread
+			ticker := time.NewTicker(16 * time.Millisecond) // ~60 FPS
+			defer ticker.Stop()
+
+		displayLoop:
+			for {
+				select {
+				case err := <-vmDone:
+					if err != nil {
+						return fmt.Errorf("run executable in initx virtual machine: %w", err)
+					}
+					break displayLoop
+				case <-ctx.Done():
+					return fmt.Errorf("context cancelled: %w", ctx.Err())
+				case <-ticker.C:
+					// Poll window events
+					if !displayMgr.Poll() {
+						// Window was closed
+						cancel()
+						return fmt.Errorf("window closed by user")
+					}
+					// Render and swap
+					displayMgr.Render()
+					displayMgr.Swap()
+				}
+			}
+
+			slog.Info("Executable Run Completed Successfully")
+			return nil
+		}
+	}
+
+	// Non-GPU path (or GPU failed to create window)
 	if err := vm.Spawn(ctx, "/initx-exec", args...); err != nil {
 		return fmt.Errorf("run executable in initx virtual machine: %w", err)
 	}

@@ -12,7 +12,7 @@ import (
 
 const (
 	InputKeyboardDefaultMMIOBase = 0xd0003000
-	InputTabletDefaultMMIOBase   = 0xd0004000
+	InputTabletDefaultMMIOBase   = 0xd0006000 // Changed from 0xd0004000 to avoid conflict with FSDefaultMMIOBase
 	InputDefaultMMIOSize         = 0x200
 	InputKeyboardDefaultIRQLine  = 13
 	InputTabletDefaultIRQLine    = 14
