@@ -64,6 +64,8 @@ func run() error {
 	network := flag.Bool("network", false, "Enable networking")
 	timeout := flag.Duration("timeout", 0, "Timeout for the container")
 	packetdump := flag.String("packetdump", "", "Write packet capture (pcap) to file (requires -network)")
+	exec := flag.Bool("exec", false, "Execute the entrypoint as PID 1 taking over init")
+	gpu := flag.Bool("gpu", false, "Enable GPU and create a window")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <image> [command] [args...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Run a command inside an OCI container image in a virtual machine.\n\n")
@@ -273,6 +275,10 @@ func run() error {
 		debug.Writef("cc.run networking enabled", "networking enabled")
 	}
 
+	if *gpu {
+		opts = append(opts, initx.WithGPUEnabled(true))
+	}
+
 	vm, err := initx.NewVirtualMachine(
 		h,
 		*cpus,
@@ -286,7 +292,7 @@ func run() error {
 	defer vm.Close()
 
 	// Build and run the container init program
-	prog := buildContainerInit(hvArch, img, execCmd, *network)
+	prog := buildContainerInit(hvArch, img, execCmd, *network, *exec)
 
 	slog.Debug("Booting VM")
 
@@ -676,7 +682,7 @@ func ipToUint32(addr string) uint32 {
 	return binary.BigEndian.Uint32(ip.To4())
 }
 
-func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, enableNetwork bool) *ir.Program {
+func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, enableNetwork bool, exec bool) *ir.Program {
 	errLabel := ir.Label("__cc_error")
 	errVar := ir.Var("__cc_errno")
 	pivotResult := ir.Var("__cc_pivot_result")
@@ -803,12 +809,16 @@ func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, e
 		)
 	}
 
+	if exec {
+		main = append(main, initx.Exec(cmd[0], cmd[1:], img.Config.Env, errLabel, errVar))
+	} else {
+		main = append(main,
+			initx.ForkExecWait(cmd[0], cmd[1:], img.Config.Env, errLabel, errVar),
+		)
+	}
+
 	// Fork and exec using initx helper
 	main = append(main,
-		// Note: ForkExecWait expects argv to be the arguments AFTER the path,
-		// as it puts path at argv[0] itself
-		initx.ForkExecWait(cmd[0], cmd[1:], img.Config.Env, errLabel, errVar),
-
 		// Return child exit code to host
 		ir.Return(errVar),
 
