@@ -1729,7 +1729,7 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 		return net.ErrClosed
 	}
 	debug.Writef("netstack.tcpConn segment",
-		"state=%s flags=0x%02x seq=%d ack=%d win=%d payloadLen=%d optLen=%d expectSeq=%d",
+		"state=%d flags=0x%02x seq=%d ack=%d win=%d payloadLen=%d optLen=%d expectSeq=%d",
 		c.state, hdr.flags, hdr.seq, hdr.ack, hdr.window, len(hdr.payload), len(hdr.options), c.guestSeq,
 	)
 

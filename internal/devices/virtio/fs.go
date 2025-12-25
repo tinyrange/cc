@@ -586,7 +586,7 @@ func (v *FS) processQueue(dev device, q *queue) error {
 		ringIndex := q.lastAvailIdx % q.size
 		head, err := dev.readAvailEntry(q, ringIndex)
 		if err != nil {
-			debug.Writef("virtio-fs.processQueue readAvailEntry ringIndex=%d err", "error=%v", ringIndex, err)
+			debug.Writef("virtio-fs.processQueue readAvailEntry err", "ringIndex=%d error=%v", ringIndex, err)
 			return err
 		}
 		debug.Writef("virtio-fs.processQueue handle", "head=%d ringIndex=%d", head, ringIndex)

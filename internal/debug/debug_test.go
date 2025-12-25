@@ -1,6 +1,7 @@
 package debug
 
 import (
+	"bytes"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -22,7 +23,7 @@ func TestDebug(t *testing.T) {
 		t.Fatalf("Compile: %v", err)
 	}
 
-	reader, err := NewReader(&r)
+	reader, err := NewReader(&r, bytes.NewReader(r))
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
@@ -90,7 +91,7 @@ func TestDebugMessageOrdering(t *testing.T) {
 		t.Fatalf("Compile: %v", err)
 	}
 
-	reader, err := NewReader(&r)
+	reader, err := NewReader(&r, bytes.NewReader(r))
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
@@ -136,7 +137,7 @@ func TestDebugTimestampOrdering(t *testing.T) {
 		t.Fatalf("Compile: %v", err)
 	}
 
-	reader, err := NewReader(&r)
+	reader, err := NewReader(&r, bytes.NewReader(r))
 	if err != nil {
 		t.Fatalf("NewReader: %v", err)
 	}
@@ -186,7 +187,7 @@ func BenchmarkReadString(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Compile: %v", err)
 		}
-		reader, err := NewReader(&r)
+		reader, err := NewReader(&r, nil)
 		if err != nil {
 			b.Fatalf("NewReader: %v", err)
 		}
