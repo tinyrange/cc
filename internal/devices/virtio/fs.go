@@ -365,6 +365,11 @@ type fsLseekBackend interface {
 	Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32) (uint64, int32)
 }
 
+type fsLinkBackend interface {
+	// Link creates a hard link: a new directory entry `newName` in `newParent` pointing to `oldNodeID`.
+	Link(oldNodeID uint64, newParent uint64, newName string) (nodeID uint64, attr FuseAttr, errno int32)
+}
+
 // A trivial in-memory backend placeholder that exposes an empty root.
 // Replace with a real passthrough backend if desired.
 
@@ -1198,6 +1203,30 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		debug.Writef("virtio-fs.dispatchFUSE op=SYMLINK", "parent=%d name=%q target=%q umask=0%o", in.NodeID, name, target, umask)
 		if be, ok := v.backend.(fsSymlinkBackend); ok {
 			nodeID, attr, e := be.Symlink(in.NodeID, name, target, umask)
+			errno = e
+			if errno == 0 {
+				// fuse_entry_out
+				extra := make([]byte, 40+88)
+				binary.LittleEndian.PutUint64(extra[0:8], nodeID)
+				binary.LittleEndian.PutUint64(extra[16:24], 1) // entry_valid
+				binary.LittleEndian.PutUint64(extra[24:32], 1) // attr_valid
+				encodeFuseAttr(extra[40:], attr)
+				return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_LINK:
+		// fuse_link_in: oldnodeid (uint64) followed by NUL-terminated newname
+		if len(req) < fuseHdrInSize+8 {
+			return 0, fmt.Errorf("FUSE_LINK too short")
+		}
+		oldNodeID := binary.LittleEndian.Uint64(req[40:48])
+		newName := readName(req[fuseHdrInSize+8:])
+		debug.Writef("virtio-fs.dispatchFUSE op=LINK", "newParent=%d oldNode=%d newName=%q", in.NodeID, oldNodeID, newName)
+		if be, ok := v.backend.(fsLinkBackend); ok {
+			nodeID, attr, e := be.Link(oldNodeID, in.NodeID, newName)
 			errno = e
 			if errno == 0 {
 				// fuse_entry_out

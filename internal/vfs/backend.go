@@ -86,6 +86,7 @@ type fsNode struct {
 	entries map[string]uint64
 	xattr   map[string][]byte
 	modTime time.Time
+	nlink   uint32 // number of hard links (0 means 1 for backwards compat)
 
 	symlinkTarget string
 
@@ -184,6 +185,9 @@ func (n *fsNode) attr() virtio.FuseAttr {
 	}
 
 	nlink := uint32(1)
+	if n.nlink > 0 {
+		nlink = n.nlink
+	}
 	if n.isDir() {
 		entryCount := len(n.entries)
 		if n.abstractDir != nil {
@@ -942,6 +946,11 @@ func (v *virtioFsBackend) Unlink(parent uint64, name string) int32 {
 		return -int32(linux.ENOENT)
 	}
 	node := v.nodes[id]
+	if node == nil {
+		// Node was already deleted (shouldn't happen, but be safe)
+		delete(parentNode.entries, clean)
+		return 0
+	}
 	if node.isDir() {
 		return -int32(linux.EISDIR)
 	}
@@ -949,7 +958,13 @@ func (v *virtioFsBackend) Unlink(parent uint64, name string) int32 {
 	if parentNode.abstractDir == nil {
 		parentNode.modTime = time.Now()
 	}
-	delete(v.nodes, id)
+	// Decrement link count; only delete node when no more links remain
+	if node.nlink <= 1 {
+		// nlink==0 means 1 link (implicit), nlink==1 means 1 link (explicit)
+		delete(v.nodes, id)
+	} else {
+		node.nlink--
+	}
 	return 0
 }
 
@@ -1071,6 +1086,48 @@ func (v *virtioFsBackend) Readlink(nodeID uint64) (target string, errno int32) {
 		return "", -int32(linux.EINVAL)
 	}
 	return n.symlinkTarget, 0
+}
+
+func (v *virtioFsBackend) Link(oldNodeID uint64, newParent uint64, newName string) (nodeID uint64, attr virtio.FuseAttr, errno int32) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	v.ensureRoot()
+	oldNode, err := v.node(oldNodeID)
+	if err != 0 {
+		return 0, virtio.FuseAttr{}, err
+	}
+	if oldNode.isDir() {
+		return 0, virtio.FuseAttr{}, -int32(linux.EPERM)
+	}
+	parentNode, err := v.node(newParent)
+	if err != 0 {
+		return 0, virtio.FuseAttr{}, err
+	}
+	if !parentNode.isDir() {
+		return 0, virtio.FuseAttr{}, -int32(linux.ENOTDIR)
+	}
+	clean := cleanName(newName)
+	if clean == "" {
+		return 0, virtio.FuseAttr{}, -int32(linux.EINVAL)
+	}
+	if e := nameErr(clean); e != 0 {
+		return 0, virtio.FuseAttr{}, e
+	}
+	if _, exists := parentNode.entries[clean]; exists {
+		return 0, virtio.FuseAttr{}, -int32(linux.EEXIST)
+	}
+	// Add new entry pointing to the existing node and increment link count
+	parentNode.entries[clean] = oldNodeID
+	if oldNode.nlink == 0 {
+		oldNode.nlink = 2 // was 1 implicitly, now 2
+	} else {
+		oldNode.nlink++
+	}
+	if parentNode.abstractDir == nil {
+		parentNode.modTime = time.Now()
+	}
+	return oldNodeID, oldNode.attr(), 0
 }
 
 func buildFuseDirent(ino uint64, name string, typ uint32, nextOffset uint64) []byte {
