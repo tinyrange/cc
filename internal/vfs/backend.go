@@ -81,6 +81,8 @@ type fsNode struct {
 	name    string
 	parent  uint64
 	mode    fs.FileMode
+	rawMode uint32 // raw mode from mknod (includes S_IFSOCK, S_IFIFO, etc.)
+	rdev    uint32 // device number for device nodes
 	size    uint64
 	extents []fsExtent
 	entries map[string]uint64
@@ -180,6 +182,9 @@ func (n *fsNode) attr() virtio.FuseAttr {
 		mode |= linux.S_IFDIR
 	case n.isSymlink():
 		mode |= linux.S_IFLNK
+	case n.rawMode != 0:
+		// Use raw mode for special file types (sockets, fifos, device nodes)
+		mode = n.rawMode
 	default:
 		mode |= linux.S_IFREG
 	}
@@ -208,6 +213,7 @@ func (n *fsNode) attr() virtio.FuseAttr {
 		NLink:     nlink,
 		UID:       0,
 		GID:       0,
+		RDev:      n.rdev,
 		Blocks:    n.blockUsage(),
 		BlkSize:   4096,
 		ATimeSec:  sec,
@@ -723,7 +729,7 @@ func (v *virtioFsBackend) Mkdir(parent uint64, name string, mode uint32, umask u
 	return id, node.attr(), 0
 }
 
-func (v *virtioFsBackend) Mknod(parent uint64, name string, mode uint32, _ uint32, _ uint32) (nodeID uint64, attr virtio.FuseAttr, errno int32) {
+func (v *virtioFsBackend) Mknod(parent uint64, name string, mode uint32, rdev uint32, umask uint32) (nodeID uint64, attr virtio.FuseAttr, errno int32) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
@@ -747,8 +753,12 @@ func (v *virtioFsBackend) Mknod(parent uint64, name string, mode uint32, _ uint3
 	}
 	id := v.nextID
 	v.nextID++
-	perm := fs.FileMode(mode & 0777)
+	// Preserve full mode including file type bits (S_IFSOCK, S_IFIFO, etc.) and apply umask to permission bits
+	perm := fs.FileMode((mode &^ umask) & 0777)
 	node := newFileNode(id, clean, parentNode.id, perm)
+	// Store the raw mode for special file types (sockets, fifos, etc.)
+	node.rawMode = mode
+	node.rdev = rdev
 	parentNode.entries[clean] = id
 	if parentNode.abstractDir == nil {
 		parentNode.modTime = time.Now()

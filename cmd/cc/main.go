@@ -786,6 +786,30 @@ func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, e
 
 		// Change to working directory
 		ir.Syscall(defs.SYS_CHDIR, workDir),
+
+		// mkdir /dev/pts
+		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/dev/pts", ir.Int64(0o755)),
+		ir.If(ir.IsNegative(errVar), ir.Block{
+			ir.Printf("cc: failed to create /dev/pts: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+			ir.Goto(errLabel),
+		}),
+
+		// Mount devpts
+		ir.Syscall(
+			defs.SYS_MOUNT,
+			"devpts",
+			"/dev/pts",
+			"devpts",
+			ir.Int64(0),
+			"",
+		),
+		ir.If(ir.IsNegative(errVar), ir.Block{
+			ir.Printf("cc: failed to mount devpts: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+			ir.Goto(errLabel),
+		}),
+
+		// Set hostname to container name
+		initx.SetHostname("tinyrange", errLabel, errVar),
 	}
 
 	// Configure network interface if networking is enabled
@@ -825,7 +849,7 @@ func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, e
 		// Error handler
 		ir.DeclareLabel(errLabel, ir.Block{
 			ir.Printf(
-				"cc: failed to add default route: errno=0x%x\n",
+				"cc: fatal error during boot: errno=0x%x\n",
 				errVar,
 			),
 			func() ir.Fragment {

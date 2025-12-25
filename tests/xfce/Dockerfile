@@ -43,6 +43,8 @@ EOF
 
 # Create an unprivileged desktop user
 RUN useradd -m -s /bin/bash xfce && \
+    chown -R xfce:xfce /home/xfce && \
+    chmod -R 0755 /home/xfce && \
     echo 'xfce ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/xfce && \
     chmod 0440 /etc/sudoers.d/xfce
 
@@ -52,6 +54,8 @@ RUN cat > /usr/local/bin/start-xfce <<'EOF'
 set -euo pipefail
 
 export DISPLAY="${DISPLAY:-:0}"
+
+mount -t tmpfs -o size=1024M tmpfs /tmp
 
 mkdir -p /tmp/.X11-unix
 chmod 1777 /tmp/.X11-unix
@@ -79,6 +83,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
+echo "Waiting for X to come up"
+
 # Wait for X to come up
 for _ in {1..200}; do
   if [[ -S "/tmp/.X11-unix/X0" ]] && xdpyinfo -display "${DISPLAY}" >/dev/null 2>&1; then
@@ -86,6 +92,8 @@ for _ in {1..200}; do
   fi
   sleep 0.05
 done
+
+echo "X is up, running XFCE session"
 
 # Run XFCE session with a proper session D-Bus
 exec sudo -u xfce -H bash -lc '
