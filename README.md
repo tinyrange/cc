@@ -12,20 +12,29 @@ CrumbleCracker is a high performance embeddable virtualization platform designed
 
 ## Development Plan
 
-- [x] Setup build and testing tools including continuous benchmarking and cross-platform testing.
-- [x] Add a assembler and compiler for running small programs.
-- [x] Write a basic x86_64 KVM abstraction and a start to a **Bringup Quest** with VCPU, MMIO, and IO support.
-- [x] Add support for timing out a VM run after a period.
-- [x] Add automatic downloader for Alpine Linux kernels.
-- [x] Add a serial device and boot a Linux kernel from Alpine Linux into a minimal Init program written using the assembler.
-- [x] Add `virtio-mmio` support starting with a `virtio-console` driver.
-- [x] Write a more advanced init program supporting multiple entries into the virtual guest.
-- [x] Support loading necessary kernel modules in Alpine Linux.
-- [x] Add a downloader for OCI images to pull a root filesystem for the virtual machine.
-- [x] Add support for loading and running executables.
-- [x] Add snapshotting support with support for capturing multiple snapshots tied to a MMIO control device.
-- [x] Add filesystem sharing using `virtio-fs`.
-- [x] Add a custom optimized TCP/IP stack tied to a `virtio-net` driver to add network support without privileges.
+**Stage 1 of development on x86_64 Linux is complete**
+
+**Stage 2 is stability and speed**
+
+- [ ] Fix on macOS arm64
+- [ ] Fix on Windows amd64
+- [ ] Fix on Linux arm64
+- [ ] Fix on Windows arm64
+- [ ] Get a more advanced desktop running (like XFCE)
+- [ ] Fix Linux Compile Errors (issues with Virtio-fs)
+- [ ] Fix Ubuntu boot (issues with `/etc/resolv.conf`)
+
+- [ ] Add benchmarking (both Golang and Tests)
+- [ ] Add snapshot support for Linux boot and Benchmark and improve KVM AMD64
+- [ ] Benchmark and improve HVF arm64
+- [ ] Benchmark and improve KVM arm64
+- [ ] Benchmark and improve WHP amd64
+- [ ] Benchmark and improve WHP arm64
+- [ ] Benchmark and improve Networking
+- [ ] Benchmark and improve Filesystem
+- [ ] Benchmark and improve Console
+
+**Stage 3 is Developer Experience and Public Beta**
 
 ## Cross-Platform Status
 
@@ -34,9 +43,9 @@ Only Linux Guests and bare-metal code are currently supported.
 ### Platforms
 
 - **Linux x86_64**: Works, **primary platform**.
-- **Windows x86_64**: Works (up to current step in the plan) with Quirks
-- **Linux arm64**: Works.
-- **Windows arm64**: Works.
+- **Windows x86_64**: Mostly works (GPU is broken)
+- **Linux arm64**: Broken (interupt dispatch issues)
+- **Windows arm64**: Broken (interupt dispatch issues)
 - **macOS arm64**: Work in Progress.
 
 ## Relationship to TinyRange
@@ -57,4 +66,13 @@ For this version of CrumbleCracker I expect to primarily architect/write the pro
 
 ## Getting Start Notes
 
-To download Linux from Alpine repos `./tools/build.go -alpine -- -name linux-virt -extract-filename boot/vmlinuz-virt -extract-output local/vmlinux_<arch>` (e.g. `local/vmlinux_amd64`).
+To run Alpine in a default VM `./tools/build.go -run -- alpine`.
+
+You can run tests with...
+
+- `./tools/build.go -quest`: Basic tests, should print "Hello, World" at the end.
+- `./tools/build.go -bringup`: Advanced Linux Tests, tests FS, Networking, and others.
+- `./tools/build.go -bringup-gpu`: GPU Tests, should work on headless systems as well.
+- `./tools/build.go -runtest <test>`: Runs a test in the `tests/` dir. These are Dockerfiles meant for advanced tests.
+    - Notably...
+        - `sway`. When run with `./tools/build.go -runtest sway -- -exec -gpu` should start a window with a Sway desktop.
