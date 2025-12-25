@@ -71,6 +71,7 @@ func openLayer(layer ImageLayer) (*layerReader, error) {
 		// Normalize path
 		name := strings.TrimPrefix(ent.Name, "./")
 		name = strings.TrimPrefix(name, "/")
+		name = strings.TrimSuffix(name, "/") // Strip trailing slash from directories
 		if name == "" {
 			name = "."
 		}
@@ -258,6 +259,8 @@ func (cfs *ContainerFS) entryToAbstract(filePath string, ent archive.Entry, lr *
 				cfs:     cfs,
 				path:    filePath,
 				modTime: ent.ModTime,
+				uid:     uint32(ent.UID),
+				gid:     uint32(ent.GID),
 			},
 		}, nil
 	case archive.EntryKindRegular:
@@ -285,10 +288,16 @@ type containerDir struct {
 	path string
 
 	modTime time.Time
+	uid     uint32
+	gid     uint32
 }
 
 func (d *containerDir) Stat() fs.FileMode {
 	return 0o755
+}
+
+func (d *containerDir) Owner() (uint32, uint32) {
+	return d.uid, d.gid
 }
 
 func (d *containerDir) ModTime() time.Time {
@@ -315,6 +324,10 @@ type containerFile struct {
 
 func (f *containerFile) Stat() (uint64, fs.FileMode) {
 	return uint64(f.entry.Size), f.entry.Mode
+}
+
+func (f *containerFile) Owner() (uint32, uint32) {
+	return uint32(f.entry.UID), uint32(f.entry.GID)
 }
 
 func (f *containerFile) ModTime() time.Time {
@@ -371,7 +384,9 @@ func (f *containerFile) Truncate(size uint64) error {
 }
 
 var (
-	_ vfs.AbstractDir  = (*ContainerFS)(nil)
-	_ vfs.AbstractDir  = (*containerDir)(nil)
-	_ vfs.AbstractFile = (*containerFile)(nil)
+	_ vfs.AbstractDir   = (*ContainerFS)(nil)
+	_ vfs.AbstractDir   = (*containerDir)(nil)
+	_ vfs.AbstractOwner = (*containerDir)(nil)
+	_ vfs.AbstractFile  = (*containerFile)(nil)
+	_ vfs.AbstractOwner = (*containerFile)(nil)
 )

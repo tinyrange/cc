@@ -55,6 +55,13 @@ const (
 	VIRTIO_MMIO_CONFIG_GENERATION   = 0x0fc
 	VIRTIO_MMIO_CONFIG              = 0x100
 
+	// Shared memory region registers (virtio-mmio v2)
+	VIRTIO_MMIO_SHM_SEL       = 0x0ac
+	VIRTIO_MMIO_SHM_LEN_LOW   = 0x0b0
+	VIRTIO_MMIO_SHM_LEN_HIGH  = 0x0b4
+	VIRTIO_MMIO_SHM_BASE_LOW  = 0x0b8
+	VIRTIO_MMIO_SHM_BASE_HIGH = 0x0bc
+
 	virtioFeatureVersion1 = uint64(1) << 32
 
 	// Interrupt status bits
@@ -162,6 +169,7 @@ type mmioDevice struct {
 	deviceStatus     uint32
 	interruptStatus  atomic.Uint32
 	configGeneration uint32 // Incremented on config changes
+	shmSel           uint32 // Shared memory region selector
 
 	queues []queue
 }
@@ -340,6 +348,8 @@ func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
 		}
 	case VIRTIO_MMIO_QUEUE_SEL:
 		d.queueSel = value
+	case VIRTIO_MMIO_SHM_SEL:
+		d.shmSel = value
 	case VIRTIO_MMIO_QUEUE_NUM:
 		logAccess("QUEUE_NUM")
 		// fmt.Fprintf(os.Stderr, "virtio-mmio: queue %d size -> %d\n", d.queueSel, value)
@@ -577,6 +587,20 @@ func (d *mmioDevice) readRegister(offset uint64) (uint32, error) {
 	case VIRTIO_MMIO_STATUS:
 		// fmt.Fprintf(os.Stderr, "virtio-mmio: read STATUS -> %#x\n", d.deviceStatus)
 		return d.deviceStatus, nil
+	case VIRTIO_MMIO_SHM_SEL:
+		return d.shmSel, nil
+	case VIRTIO_MMIO_SHM_LEN_LOW:
+		// Return ~0 to indicate no shared memory region exists
+		return 0xFFFFFFFF, nil
+	case VIRTIO_MMIO_SHM_LEN_HIGH:
+		// Return ~0 to indicate no shared memory region exists
+		return 0xFFFFFFFF, nil
+	case VIRTIO_MMIO_SHM_BASE_LOW:
+		// Return ~0 to indicate no shared memory region exists
+		return 0xFFFFFFFF, nil
+	case VIRTIO_MMIO_SHM_BASE_HIGH:
+		// Return ~0 to indicate no shared memory region exists
+		return 0xFFFFFFFF, nil
 	case VIRTIO_MMIO_CONFIG_GENERATION:
 		return d.configGeneration, nil
 	default:

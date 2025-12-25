@@ -26,6 +26,7 @@ import (
 	"github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	amd64serial "github.com/tinyrange/cc/internal/devices/amd64/serial"
 	"github.com/tinyrange/cc/internal/devices/virtio"
+	"github.com/tinyrange/cc/internal/gowin/window"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/factory"
 	"github.com/tinyrange/cc/internal/hv/helpers"
@@ -1916,8 +1917,8 @@ func RunInitX(debug bool) error {
 	return nil
 }
 
-func RunExecutable(path string) error {
-	slog.Info("Starting Bringup Quest: Run Executable", "path", path)
+func RunExecutable(path string, gpuEnabled bool) error {
+	slog.Info("Starting Bringup Quest: Run Executable", "path", path, "gpu", gpuEnabled)
 
 	if os.Getenv("CC_DEBUG_FILE") != "" {
 		if os.Getenv("CC_DEBUG_MEMORY") != "" {
@@ -2142,7 +2143,8 @@ func RunExecutable(path string) error {
 		cancel()
 	}()
 
-	vm, err := initx.NewVirtualMachine(hv, 1, 256, kernel,
+	// Build VM options
+	vmOptions := []initx.Option{
 		initx.WithFileFromBytes("/initx-exec", fileData, fs.FileMode(0755)),
 		initx.WithDeviceTemplate(virtio.FSTemplate{
 			Tag:     "bringup",
@@ -2154,7 +2156,14 @@ func RunExecutable(path string) error {
 			MAC:     guestMAC,
 			Arch:    hv.Architecture(),
 		}),
-	)
+	}
+
+	// Add GPU support if enabled
+	if gpuEnabled {
+		vmOptions = append(vmOptions, initx.WithGPUEnabled(true))
+	}
+
+	vm, err := initx.NewVirtualMachine(hv, 1, 256, kernel, vmOptions...)
 	if err != nil {
 		return fmt.Errorf("create initx virtual machine: %w", err)
 	}
@@ -2175,6 +2184,64 @@ func RunExecutable(path string) error {
 		}
 	}
 
+	// If GPU is enabled, set up the display manager and run VM in background
+	if gpuEnabled && vm.GPU() != nil {
+		// Get display scale factor and calculate physical window dimensions
+		scale := window.GetDisplayScale()
+		physWidth := int(float32(1024) * scale)
+		physHeight := int(float32(768) * scale)
+
+		// Create window for display with scaled dimensions
+		win, err := window.New("GPU Bringup Test", physWidth, physHeight, true)
+		if err != nil {
+			slog.Warn("failed to create window, running without display", "error", err)
+			// Fall through to run without display
+		} else {
+			defer win.Close()
+
+			// Create display manager and connect to GPU/Input devices
+			displayMgr := virtio.NewDisplayManager(vm.GPU(), vm.Keyboard(), vm.Tablet())
+			displayMgr.SetWindow(win)
+
+			// Run VM in a goroutine
+			vmDone := make(chan error, 1)
+			go func() {
+				vmDone <- vm.Spawn(ctx, "/initx-exec", args...)
+			}()
+
+			// Run display loop on main thread
+			ticker := time.NewTicker(16 * time.Millisecond) // ~60 FPS
+			defer ticker.Stop()
+
+		displayLoop:
+			for {
+				select {
+				case err := <-vmDone:
+					if err != nil {
+						return fmt.Errorf("run executable in initx virtual machine: %w", err)
+					}
+					break displayLoop
+				case <-ctx.Done():
+					return fmt.Errorf("context cancelled: %w", ctx.Err())
+				case <-ticker.C:
+					// Poll window events
+					if !displayMgr.Poll() {
+						// Window was closed
+						cancel()
+						return fmt.Errorf("window closed by user")
+					}
+					// Render and swap
+					displayMgr.Render()
+					displayMgr.Swap()
+				}
+			}
+
+			slog.Info("Executable Run Completed Successfully")
+			return nil
+		}
+	}
+
+	// Non-GPU path (or GPU failed to create window)
 	if err := vm.Spawn(ctx, "/initx-exec", args...); err != nil {
 		return fmt.Errorf("run executable in initx virtual machine: %w", err)
 	}
@@ -2190,6 +2257,7 @@ func main() {
 	linux := fs.Bool("linux", false, "Try booting Linux")
 	initX := fs.Bool("initx", false, "Run bringup tests for initx")
 	exec := fs.String("exec", "", "Run the executable using initx")
+	gpuEnabled := fs.Bool("gpu", false, "Enable GPU support (virtio-gpu and virtio-input)")
 	debug := fs.Bool("debug", false, "Enable debug logging")
 	hostArch, err := hostArchitecture()
 	if err != nil {
@@ -2228,7 +2296,7 @@ func main() {
 	}
 
 	if *exec != "" {
-		if err := RunExecutable(*exec); err != nil {
+		if err := RunExecutable(*exec, *gpuEnabled); err != nil {
 			slog.Error("failed to run executable", "error", err)
 			os.Exit(1)
 		}

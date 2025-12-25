@@ -317,15 +317,15 @@ type FsBackend interface {
 }
 
 type fsCreateBackend interface {
-	Create(parent uint64, name string, mode uint32, flags uint32, umask uint32) (nodeID uint64, fh uint64, attr FuseAttr, errno int32)
+	Create(parent uint64, name string, mode uint32, flags uint32, umask uint32, uid uint32, gid uint32) (nodeID uint64, fh uint64, attr FuseAttr, errno int32)
 }
 
 type fsMkdirBackend interface {
-	Mkdir(parent uint64, name string, mode uint32, umask uint32) (nodeID uint64, attr FuseAttr, errno int32)
+	Mkdir(parent uint64, name string, mode uint32, umask uint32, uid uint32, gid uint32) (nodeID uint64, attr FuseAttr, errno int32)
 }
 
 type fsMknodBackend interface {
-	Mknod(parent uint64, name string, mode uint32, rdev uint32, umask uint32) (nodeID uint64, attr FuseAttr, errno int32)
+	Mknod(parent uint64, name string, mode uint32, rdev uint32, umask uint32, uid uint32, gid uint32) (nodeID uint64, attr FuseAttr, errno int32)
 }
 
 type fsWriteBackend interface {
@@ -340,7 +340,7 @@ type fsXattrBackend interface {
 type fsSymlinkBackend interface {
 	// Symlink creates a new symlink named `name` in directory `parent` which points to `target`.
 	// Returns the new nodeID and its attributes.
-	Symlink(parent uint64, name string, target string, umask uint32) (nodeID uint64, attr FuseAttr, errno int32)
+	Symlink(parent uint64, name string, target string, umask uint32, uid uint32, gid uint32) (nodeID uint64, attr FuseAttr, errno int32)
 }
 
 type fsReadlinkBackend interface {
@@ -358,11 +358,16 @@ type fsRemoveBackend interface {
 }
 
 type fsSetattrBackend interface {
-	SetAttr(nodeID uint64, size *uint64, mode *uint32) int32
+	SetAttr(nodeID uint64, size *uint64, mode *uint32, uid *uint32, gid *uint32) int32
 }
 
 type fsLseekBackend interface {
 	Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32) (uint64, int32)
+}
+
+type fsLinkBackend interface {
+	// Link creates a hard link: a new directory entry `newName` in `newParent` pointing to `oldNodeID`.
+	Link(oldNodeID uint64, newParent uint64, newName string) (nodeID uint64, attr FuseAttr, errno int32)
 }
 
 // A trivial in-memory backend placeholder that exposes an empty root.
@@ -889,7 +894,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		name := readName(req[fuseHdrInSize+16:])
 		debug.Writef("virtio-fs.dispatchFUSE op=CREATE", "name=%q mode=0%o flags=0x%x umask=0%o", name, mode, flags, umask)
 		if be, ok := v.backend.(fsCreateBackend); ok {
-			nodeID, fh, attr, e := be.Create(in.NodeID, name, mode, flags, umask)
+			nodeID, fh, attr, e := be.Create(in.NodeID, name, mode, flags, umask, in.UID, in.GID)
 			errno = e
 			if errno == 0 {
 				extra := make([]byte, 40+88+16)
@@ -915,7 +920,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		name := readName(req[fuseHdrInSize+16:])
 		debug.Writef("virtio-fs.dispatchFUSE op=MKNOD", "name=%q mode=0%o rdev=0x%x umask=0%o", name, mode, rdev, umask)
 		if be, ok := v.backend.(fsMknodBackend); ok {
-			nodeID, attr, e := be.Mknod(in.NodeID, name, mode, rdev, umask)
+			nodeID, attr, e := be.Mknod(in.NodeID, name, mode, rdev, umask, in.UID, in.GID)
 			errno = e
 			if errno == 0 {
 				extra := make([]byte, 40+88)
@@ -939,7 +944,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		name := readName(req[fuseHdrInSize+8:])
 		debug.Writef("virtio-fs.dispatchFUSE op=MKDIR", "name=%q mode=0%o umask=0%o", name, mode, umask)
 		if be, ok := v.backend.(fsMkdirBackend); ok {
-			nodeID, attr, e := be.Mkdir(in.NodeID, name, mode, umask)
+			nodeID, attr, e := be.Mkdir(in.NodeID, name, mode, umask, in.UID, in.GID)
 			errno = e
 			if errno == 0 {
 				extra := make([]byte, 40+88)
@@ -1197,7 +1202,31 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 		debug.Writef("virtio-fs.dispatchFUSE op=SYMLINK", "parent=%d name=%q target=%q umask=0%o", in.NodeID, name, target, umask)
 		if be, ok := v.backend.(fsSymlinkBackend); ok {
-			nodeID, attr, e := be.Symlink(in.NodeID, name, target, umask)
+			nodeID, attr, e := be.Symlink(in.NodeID, name, target, umask, in.UID, in.GID)
+			errno = e
+			if errno == 0 {
+				// fuse_entry_out
+				extra := make([]byte, 40+88)
+				binary.LittleEndian.PutUint64(extra[0:8], nodeID)
+				binary.LittleEndian.PutUint64(extra[16:24], 1) // entry_valid
+				binary.LittleEndian.PutUint64(extra[24:32], 1) // attr_valid
+				encodeFuseAttr(extra[40:], attr)
+				return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_LINK:
+		// fuse_link_in: oldnodeid (uint64) followed by NUL-terminated newname
+		if len(req) < fuseHdrInSize+8 {
+			return 0, fmt.Errorf("FUSE_LINK too short")
+		}
+		oldNodeID := binary.LittleEndian.Uint64(req[40:48])
+		newName := readName(req[fuseHdrInSize+8:])
+		debug.Writef("virtio-fs.dispatchFUSE op=LINK", "newParent=%d oldNode=%d newName=%q", in.NodeID, oldNodeID, newName)
+		if be, ok := v.backend.(fsLinkBackend); ok {
+			nodeID, attr, e := be.Link(oldNodeID, in.NodeID, newName)
 			errno = e
 			if errno == 0 {
 				// fuse_entry_out
@@ -1218,8 +1247,11 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			return 0, fmt.Errorf("FUSE_SETATTR too short")
 		}
 		valid := binary.LittleEndian.Uint32(req[40:44])
-		const fattrSize = 1 << 3
+		// FUSE attribute valid flags
 		const fattrMode = 1 << 0
+		const fattrUid = 1 << 1
+		const fattrGid = 1 << 2
+		const fattrSize = 1 << 3
 		var sizeVal *uint64
 		if valid&fattrSize != 0 {
 			val := binary.LittleEndian.Uint64(req[56:64])
@@ -1240,16 +1272,35 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			// offset 100: mtimensec (uint32)
 			// offset 104: ctimensec (uint32)
 			// offset 108: mode (uint32)
+			// offset 112: unused4 (uint32)
+			// offset 116: uid (uint32)
+			// offset 120: gid (uint32)
 			// Mode is at offset 108 (4 bytes), so we need at least 112 bytes total
 			if len(req) >= 112 {
 				val := binary.LittleEndian.Uint32(req[108:112])
 				modeVal = &val
 			}
 		}
+		var uidVal *uint32
+		if valid&fattrUid != 0 {
+			// uid is at offset 116
+			if len(req) >= 120 {
+				val := binary.LittleEndian.Uint32(req[116:120])
+				uidVal = &val
+			}
+		}
+		var gidVal *uint32
+		if valid&fattrGid != 0 {
+			// gid is at offset 120
+			if len(req) >= 124 {
+				val := binary.LittleEndian.Uint32(req[120:124])
+				gidVal = &val
+			}
+		}
 		if be, ok := v.backend.(fsSetattrBackend); ok {
-			errno = be.SetAttr(in.NodeID, sizeVal, modeVal)
+			errno = be.SetAttr(in.NodeID, sizeVal, modeVal, uidVal, gidVal)
 			if errno == 0 {
-				debug.Writef("virtio-fs.dispatchFUSE op=SETATTR applied", "size=%v mode=%v", sizeVal, modeVal)
+				debug.Writef("virtio-fs.dispatchFUSE op=SETATTR applied", "size=%v mode=%v uid=%v gid=%v", sizeVal, modeVal, uidVal, gidVal)
 				attr, e := v.backend.GetAttr(in.NodeID)
 				errno = e
 				if errno == 0 {

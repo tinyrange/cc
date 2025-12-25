@@ -367,10 +367,34 @@ type VirtualMachine struct {
 
 	debugLogging bool
 	dmesgLogging bool
+	gpuEnabled   bool
+
+	// kernelLoader stores the kernel for module loading
+	kernelLoader kernel.Kernel
+
+	// GPU devices - stored when gpuEnabled is true
+	gpuDevice      *virtio.GPU
+	keyboardDevice *virtio.Input
+	tabletDevice   *virtio.Input
 }
 
 func (vm *VirtualMachine) Close() error {
 	return vm.vm.Close()
+}
+
+// GPU returns the virtio-gpu device if GPU is enabled, nil otherwise.
+func (vm *VirtualMachine) GPU() *virtio.GPU {
+	return vm.gpuDevice
+}
+
+// Keyboard returns the virtio-input keyboard device if GPU is enabled, nil otherwise.
+func (vm *VirtualMachine) Keyboard() *virtio.Input {
+	return vm.keyboardDevice
+}
+
+// Tablet returns the virtio-input tablet device if GPU is enabled, nil otherwise.
+func (vm *VirtualMachine) Tablet() *virtio.Input {
+	return vm.tabletDevice
 }
 
 // StartStdinForwarding activates stdin forwarding to the guest console.
@@ -498,6 +522,13 @@ func WithDmesgLogging(enabled bool) Option {
 	})
 }
 
+func WithGPUEnabled(enabled bool) Option {
+	return funcOption(func(vm *VirtualMachine) error {
+		vm.gpuEnabled = enabled
+		return nil
+	})
+}
+
 func WithStdin(r io.Reader) Option {
 	return funcOption(func(vm *VirtualMachine) error {
 		if r != nil {
@@ -511,6 +542,64 @@ func WithStdin(r io.Reader) Option {
 		}
 		return nil
 	})
+}
+
+// gpuCapturingTemplate wraps a GPUTemplate to capture the created device reference
+type gpuCapturingTemplate struct {
+	inner  virtio.GPUTemplate
+	target **virtio.GPU
+}
+
+func (t *gpuCapturingTemplate) Create(vm hv.VirtualMachine) (hv.Device, error) {
+	dev, err := t.inner.Create(vm)
+	if err != nil {
+		return nil, err
+	}
+	if gpu, ok := dev.(*virtio.GPU); ok {
+		*t.target = gpu
+	}
+	return dev, nil
+}
+
+func (t *gpuCapturingTemplate) GetLinuxCommandLineParam() ([]string, error) {
+	return t.inner.GetLinuxCommandLineParam()
+}
+
+func (t *gpuCapturingTemplate) DeviceTreeNodes() ([]fdt.Node, error) {
+	return t.inner.DeviceTreeNodes()
+}
+
+func (t *gpuCapturingTemplate) GetACPIDeviceInfo() virtio.ACPIDeviceInfo {
+	return t.inner.GetACPIDeviceInfo()
+}
+
+// inputCapturingTemplate wraps an InputTemplate to capture the created device reference
+type inputCapturingTemplate struct {
+	inner  virtio.InputTemplate
+	target **virtio.Input
+}
+
+func (t *inputCapturingTemplate) Create(vm hv.VirtualMachine) (hv.Device, error) {
+	dev, err := t.inner.Create(vm)
+	if err != nil {
+		return nil, err
+	}
+	if input, ok := dev.(*virtio.Input); ok {
+		*t.target = input
+	}
+	return dev, nil
+}
+
+func (t *inputCapturingTemplate) GetLinuxCommandLineParam() ([]string, error) {
+	return t.inner.GetLinuxCommandLineParam()
+}
+
+func (t *inputCapturingTemplate) DeviceTreeNodes() ([]fdt.Node, error) {
+	return t.inner.DeviceTreeNodes()
+}
+
+func (t *inputCapturingTemplate) GetACPIDeviceInfo() virtio.ACPIDeviceInfo {
+	return t.inner.GetACPIDeviceInfo()
 }
 
 func NewVirtualMachine(
@@ -533,6 +622,7 @@ func NewVirtualMachine(
 	ret.inBuffer = in
 
 	ret.programLoader = programLoader
+	ret.kernelLoader = kernelLoader
 
 	// Cap ARM64 memory to avoid overlap with mailbox/config regions at 0xf0000000
 	memSize := memSizeMB
@@ -598,6 +688,18 @@ func NewVirtualMachine(
 			}
 
 			cfg.PreloadModules = append(cfg.PreloadModules, modules...)
+
+			// Load GPU modules if GPU is enabled
+			if ret.gpuEnabled {
+				gpuModules, err := kernelLoader.PlanModuleLoad(
+					kernel.GPUModuleConfigs,
+					kernel.GPUModuleMap,
+				)
+				if err != nil {
+					return nil, fmt.Errorf("plan GPU module load: %v", err)
+				}
+				cfg.PreloadModules = append(cfg.PreloadModules, gpuModules...)
+			}
 
 			return Build(cfg)
 		},
@@ -680,6 +782,24 @@ func NewVirtualMachine(
 		if err := option.apply(&ret); err != nil {
 			return nil, err
 		}
+	}
+
+	// Add GPU and Input devices if GPU is enabled
+	if ret.gpuEnabled {
+		ret.loader.Devices = append(ret.loader.Devices,
+			&gpuCapturingTemplate{
+				inner:  virtio.GPUTemplate{Arch: h.Architecture()},
+				target: &ret.gpuDevice,
+			},
+			&inputCapturingTemplate{
+				inner:  virtio.InputTemplate{Arch: h.Architecture(), Type: virtio.InputTypeKeyboard},
+				target: &ret.keyboardDevice,
+			},
+			&inputCapturingTemplate{
+				inner:  virtio.InputTemplate{Arch: h.Architecture(), Type: virtio.InputTypeTablet},
+				target: &ret.tabletDevice,
+			},
+		)
 	}
 
 	var err error

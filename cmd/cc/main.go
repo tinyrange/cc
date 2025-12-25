@@ -20,6 +20,7 @@ import (
 
 	"github.com/tinyrange/cc/internal/debug"
 	"github.com/tinyrange/cc/internal/devices/virtio"
+	"github.com/tinyrange/cc/internal/gowin/window"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/factory"
 	"github.com/tinyrange/cc/internal/initx"
@@ -64,6 +65,8 @@ func run() error {
 	network := flag.Bool("network", false, "Enable networking")
 	timeout := flag.Duration("timeout", 0, "Timeout for the container")
 	packetdump := flag.String("packetdump", "", "Write packet capture (pcap) to file (requires -network)")
+	exec := flag.Bool("exec", false, "Execute the entrypoint as PID 1 taking over init")
+	gpu := flag.Bool("gpu", false, "Enable GPU and create a window")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <image> [command] [args...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Run a command inside an OCI container image in a virtual machine.\n\n")
@@ -273,6 +276,10 @@ func run() error {
 		debug.Writef("cc.run networking enabled", "networking enabled")
 	}
 
+	if *gpu {
+		opts = append(opts, initx.WithGPUEnabled(true))
+	}
+
 	vm, err := initx.NewVirtualMachine(
 		h,
 		*cpus,
@@ -286,7 +293,7 @@ func run() error {
 	defer vm.Close()
 
 	// Build and run the container init program
-	prog := buildContainerInit(hvArch, img, execCmd, *network)
+	prog := buildContainerInit(hvArch, img, execCmd, *network, *exec)
 
 	slog.Debug("Booting VM")
 
@@ -567,6 +574,62 @@ func run() error {
 
 	debug.Writef("cc.run running command", "running command %v", execCmd)
 
+	// If GPU is enabled, set up the display manager and run VM in background
+	if *gpu && vm.GPU() != nil {
+		// Get display scale factor and calculate physical window dimensions
+		scale := window.GetDisplayScale()
+		physWidth := int(float32(1024) * scale)
+		physHeight := int(float32(768) * scale)
+
+		// Create window for display with scaled dimensions
+		win, err := window.New("cc", physWidth, physHeight, true)
+		if err != nil {
+			slog.Warn("failed to create window, running without display", "error", err)
+			// Fall through to run without display
+		} else {
+			defer win.Close()
+
+			// Create display manager and connect to GPU/Input devices
+			displayMgr := virtio.NewDisplayManager(vm.GPU(), vm.Keyboard(), vm.Tablet())
+			displayMgr.SetWindow(win)
+
+			// Run VM in a goroutine
+			vmDone := make(chan error, 1)
+			go func() {
+				vmDone <- vm.Run(ctx, prog)
+			}()
+
+			// Run display loop on main thread
+			ticker := time.NewTicker(16 * time.Millisecond) // ~60 FPS
+			defer ticker.Stop()
+
+		displayLoop:
+			for {
+				select {
+				case err := <-vmDone:
+					if err != nil {
+						return fmt.Errorf("run executable in initx virtual machine: %w", err)
+					}
+					break displayLoop
+				case <-ctx.Done():
+					return fmt.Errorf("context cancelled: %w", ctx.Err())
+				case <-ticker.C:
+					// Poll window events
+					if !displayMgr.Poll() {
+						// Window was closed
+						return fmt.Errorf("window closed by user")
+					}
+					// Render and swap
+					displayMgr.Render()
+					displayMgr.Swap()
+				}
+			}
+
+			slog.Info("cc: command exited")
+			return nil
+		}
+	}
+
 	if err := vm.Run(ctx, prog); err != nil {
 		var exitErr *initx.ExitError
 		if errors.As(err, &exitErr) {
@@ -676,7 +739,7 @@ func ipToUint32(addr string) uint32 {
 	return binary.BigEndian.Uint32(ip.To4())
 }
 
-func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, enableNetwork bool) *ir.Program {
+func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, enableNetwork bool, exec bool) *ir.Program {
 	errLabel := ir.Label("__cc_error")
 	errVar := ir.Var("__cc_errno")
 	pivotResult := ir.Var("__cc_pivot_result")
@@ -739,6 +802,17 @@ func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, e
 			"",
 		),
 
+		// Mount /dev/shm (wlroots/xkbcommon use it for shm-backed buffers like keymaps).
+		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt/dev/shm", ir.Int64(0o1777)),
+		ir.Syscall(
+			defs.SYS_MOUNT,
+			"tmpfs",
+			"/mnt/dev/shm",
+			"tmpfs",
+			ir.Int64(0),
+			"mode=1777",
+		),
+
 		// Change root to container using pivot_root
 		ir.Assign(errVar, ir.Syscall(defs.SYS_CHDIR, "/mnt")),
 		ir.If(ir.IsNegative(errVar), ir.Block{
@@ -780,6 +854,30 @@ func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, e
 
 		// Change to working directory
 		ir.Syscall(defs.SYS_CHDIR, workDir),
+
+		// mkdir /dev/pts
+		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/dev/pts", ir.Int64(0o755)),
+		ir.If(ir.IsNegative(errVar), ir.Block{
+			ir.Printf("cc: failed to create /dev/pts: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+			ir.Goto(errLabel),
+		}),
+
+		// Mount devpts
+		ir.Syscall(
+			defs.SYS_MOUNT,
+			"devpts",
+			"/dev/pts",
+			"devpts",
+			ir.Int64(0),
+			"",
+		),
+		ir.If(ir.IsNegative(errVar), ir.Block{
+			ir.Printf("cc: failed to mount devpts: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+			ir.Goto(errLabel),
+		}),
+
+		// Set hostname to container name
+		initx.SetHostname("tinyrange", errLabel, errVar),
 	}
 
 	// Configure network interface if networking is enabled
@@ -803,19 +901,23 @@ func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, e
 		)
 	}
 
+	if exec {
+		main = append(main, initx.Exec(cmd[0], cmd[1:], img.Config.Env, errLabel, errVar))
+	} else {
+		main = append(main,
+			initx.ForkExecWait(cmd[0], cmd[1:], img.Config.Env, errLabel, errVar),
+		)
+	}
+
 	// Fork and exec using initx helper
 	main = append(main,
-		// Note: ForkExecWait expects argv to be the arguments AFTER the path,
-		// as it puts path at argv[0] itself
-		initx.ForkExecWait(cmd[0], cmd[1:], img.Config.Env, errLabel, errVar),
-
 		// Return child exit code to host
 		ir.Return(errVar),
 
 		// Error handler
 		ir.DeclareLabel(errLabel, ir.Block{
 			ir.Printf(
-				"cc: failed to add default route: errno=0x%x\n",
+				"cc: fatal error during boot: errno=0x%x\n",
 				errVar,
 			),
 			func() ir.Fragment {

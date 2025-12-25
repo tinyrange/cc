@@ -59,6 +59,12 @@ type AbstractEntry struct {
 	Dir  AbstractDir
 }
 
+// AbstractOwner is an optional interface that AbstractFile and AbstractDir
+// implementations can provide to expose ownership information (uid/gid).
+type AbstractOwner interface {
+	Owner() (uid, gid uint32)
+}
+
 type virtioFsBackend struct {
 	mu      sync.Mutex
 	nodes   map[uint64]*fsNode
@@ -81,11 +87,16 @@ type fsNode struct {
 	name    string
 	parent  uint64
 	mode    fs.FileMode
+	rawMode uint32 // raw mode from mknod (includes S_IFSOCK, S_IFIFO, etc.)
+	rdev    uint32 // device number for device nodes
 	size    uint64
 	extents []fsExtent
 	entries map[string]uint64
 	xattr   map[string][]byte
 	modTime time.Time
+	nlink   uint32 // number of hard links (0 means 1 for backwards compat)
+	uid     uint32 // owner user ID
+	gid     uint32 // owner group ID
 
 	symlinkTarget string
 
@@ -179,11 +190,17 @@ func (n *fsNode) attr() virtio.FuseAttr {
 		mode |= linux.S_IFDIR
 	case n.isSymlink():
 		mode |= linux.S_IFLNK
+	case n.rawMode != 0:
+		// Use raw mode for special file types (sockets, fifos, device nodes)
+		mode = n.rawMode
 	default:
 		mode |= linux.S_IFREG
 	}
 
 	nlink := uint32(1)
+	if n.nlink > 0 {
+		nlink = n.nlink
+	}
 	if n.isDir() {
 		entryCount := len(n.entries)
 		if n.abstractDir != nil {
@@ -202,8 +219,9 @@ func (n *fsNode) attr() virtio.FuseAttr {
 		Mode:      mode,
 		Size:      size,
 		NLink:     nlink,
-		UID:       0,
-		GID:       0,
+		UID:       n.uid,
+		GID:       n.gid,
+		RDev:      n.rdev,
 		Blocks:    n.blockUsage(),
 		BlkSize:   4096,
 		ATimeSec:  sec,
@@ -303,6 +321,10 @@ func (v *virtioFsBackend) createAbstractNode(parent *fsNode, name string, entry 
 		if mt := entry.Dir.ModTime(); !mt.IsZero() {
 			modTime = mt
 		}
+		// Check if the directory provides ownership info
+		if owner, ok := entry.Dir.(AbstractOwner); ok {
+			node.uid, node.gid = owner.Owner()
+		}
 	} else if entry.File != nil {
 		node.abstractFile = entry.File
 		size, mode := entry.File.Stat()
@@ -310,6 +332,10 @@ func (v *virtioFsBackend) createAbstractNode(parent *fsNode, name string, entry 
 		node.size = size
 		if mt := entry.File.ModTime(); !mt.IsZero() {
 			modTime = mt
+		}
+		// Check if the file provides ownership info
+		if owner, ok := entry.File.(AbstractOwner); ok {
+			node.uid, node.gid = owner.Owner()
 		}
 	} else {
 		return nil, -int32(linux.ENOENT)
@@ -634,7 +660,7 @@ var (
 )
 
 // Create implements FUSE_CREATE semantics.
-func (v *virtioFsBackend) Create(parent uint64, name string, mode uint32, flags uint32, umask uint32) (nodeID uint64, fh uint64, attr virtio.FuseAttr, errno int32) {
+func (v *virtioFsBackend) Create(parent uint64, name string, mode uint32, flags uint32, umask uint32, uid uint32, gid uint32) (nodeID uint64, fh uint64, attr virtio.FuseAttr, errno int32) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
@@ -673,6 +699,8 @@ func (v *virtioFsBackend) Create(parent uint64, name string, mode uint32, flags 
 	v.nextID++
 	perm := fs.FileMode(mode&^umask) & 0777
 	node := newFileNode(id, clean, parentNode.id, perm)
+	node.uid = uid
+	node.gid = gid
 	parentNode.entries[clean] = id
 	if parentNode.abstractDir == nil {
 		parentNode.modTime = time.Now()
@@ -685,7 +713,7 @@ func (v *virtioFsBackend) Create(parent uint64, name string, mode uint32, flags 
 	return id, fh, node.attr(), 0
 }
 
-func (v *virtioFsBackend) Mkdir(parent uint64, name string, mode uint32, umask uint32) (nodeID uint64, attr virtio.FuseAttr, errno int32) {
+func (v *virtioFsBackend) Mkdir(parent uint64, name string, mode uint32, umask uint32, uid uint32, gid uint32) (nodeID uint64, attr virtio.FuseAttr, errno int32) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
@@ -711,6 +739,8 @@ func (v *virtioFsBackend) Mkdir(parent uint64, name string, mode uint32, umask u
 	v.nextID++
 	perm := fs.FileMode(mode&^umask) & 0777
 	node := newDirNode(id, clean, parentNode.id, perm)
+	node.uid = uid
+	node.gid = gid
 	parentNode.entries[clean] = id
 	if parentNode.abstractDir == nil {
 		parentNode.modTime = time.Now()
@@ -719,7 +749,7 @@ func (v *virtioFsBackend) Mkdir(parent uint64, name string, mode uint32, umask u
 	return id, node.attr(), 0
 }
 
-func (v *virtioFsBackend) Mknod(parent uint64, name string, mode uint32, _ uint32, _ uint32) (nodeID uint64, attr virtio.FuseAttr, errno int32) {
+func (v *virtioFsBackend) Mknod(parent uint64, name string, mode uint32, rdev uint32, umask uint32, uid uint32, gid uint32) (nodeID uint64, attr virtio.FuseAttr, errno int32) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
@@ -743,8 +773,14 @@ func (v *virtioFsBackend) Mknod(parent uint64, name string, mode uint32, _ uint3
 	}
 	id := v.nextID
 	v.nextID++
-	perm := fs.FileMode(mode & 0777)
+	// Preserve full mode including file type bits (S_IFSOCK, S_IFIFO, etc.) and apply umask to permission bits
+	perm := fs.FileMode((mode &^ umask) & 0777)
 	node := newFileNode(id, clean, parentNode.id, perm)
+	// Store the raw mode for special file types (sockets, fifos, etc.)
+	node.rawMode = mode
+	node.rdev = rdev
+	node.uid = uid
+	node.gid = gid
 	parentNode.entries[clean] = id
 	if parentNode.abstractDir == nil {
 		parentNode.modTime = time.Now()
@@ -942,6 +978,11 @@ func (v *virtioFsBackend) Unlink(parent uint64, name string) int32 {
 		return -int32(linux.ENOENT)
 	}
 	node := v.nodes[id]
+	if node == nil {
+		// Node was already deleted (shouldn't happen, but be safe)
+		delete(parentNode.entries, clean)
+		return 0
+	}
 	if node.isDir() {
 		return -int32(linux.EISDIR)
 	}
@@ -949,7 +990,13 @@ func (v *virtioFsBackend) Unlink(parent uint64, name string) int32 {
 	if parentNode.abstractDir == nil {
 		parentNode.modTime = time.Now()
 	}
-	delete(v.nodes, id)
+	// Decrement link count; only delete node when no more links remain
+	if node.nlink <= 1 {
+		// nlink==0 means 1 link (implicit), nlink==1 means 1 link (explicit)
+		delete(v.nodes, id)
+	} else {
+		node.nlink--
+	}
 	return 0
 }
 
@@ -988,11 +1035,11 @@ func (v *virtioFsBackend) Rmdir(parent uint64, name string) int32 {
 	return 0
 }
 
-func (v *virtioFsBackend) SetAttr(nodeID uint64, size *uint64, mode *uint32) int32 {
+func (v *virtioFsBackend) SetAttr(nodeID uint64, size *uint64, mode *uint32, uid *uint32, gid *uint32) int32 {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	if size == nil && mode == nil {
+	if size == nil && mode == nil && uid == nil && gid == nil {
 		return 0
 	}
 	v.ensureRoot()
@@ -1012,10 +1059,18 @@ func (v *virtioFsBackend) SetAttr(nodeID uint64, size *uint64, mode *uint32) int
 		n.mode = oldType | newPerm
 		n.modTime = time.Now()
 	}
+	if uid != nil {
+		n.uid = *uid
+		n.modTime = time.Now()
+	}
+	if gid != nil {
+		n.gid = *gid
+		n.modTime = time.Now()
+	}
 	return 0
 }
 
-func (v *virtioFsBackend) Symlink(parent uint64, name string, target string, _ uint32) (nodeID uint64, attr virtio.FuseAttr, errno int32) {
+func (v *virtioFsBackend) Symlink(parent uint64, name string, target string, _ uint32, uid uint32, gid uint32) (nodeID uint64, attr virtio.FuseAttr, errno int32) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
@@ -1049,6 +1104,8 @@ func (v *virtioFsBackend) Symlink(parent uint64, name string, target string, _ u
 		xattr:         make(map[string][]byte),
 		modTime:       time.Now(),
 		symlinkTarget: target,
+		uid:           uid,
+		gid:           gid,
 	}
 	parentNode.entries[clean] = id
 	if parentNode.abstractDir == nil {
@@ -1071,6 +1128,48 @@ func (v *virtioFsBackend) Readlink(nodeID uint64) (target string, errno int32) {
 		return "", -int32(linux.EINVAL)
 	}
 	return n.symlinkTarget, 0
+}
+
+func (v *virtioFsBackend) Link(oldNodeID uint64, newParent uint64, newName string) (nodeID uint64, attr virtio.FuseAttr, errno int32) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	v.ensureRoot()
+	oldNode, err := v.node(oldNodeID)
+	if err != 0 {
+		return 0, virtio.FuseAttr{}, err
+	}
+	if oldNode.isDir() {
+		return 0, virtio.FuseAttr{}, -int32(linux.EPERM)
+	}
+	parentNode, err := v.node(newParent)
+	if err != 0 {
+		return 0, virtio.FuseAttr{}, err
+	}
+	if !parentNode.isDir() {
+		return 0, virtio.FuseAttr{}, -int32(linux.ENOTDIR)
+	}
+	clean := cleanName(newName)
+	if clean == "" {
+		return 0, virtio.FuseAttr{}, -int32(linux.EINVAL)
+	}
+	if e := nameErr(clean); e != 0 {
+		return 0, virtio.FuseAttr{}, e
+	}
+	if _, exists := parentNode.entries[clean]; exists {
+		return 0, virtio.FuseAttr{}, -int32(linux.EEXIST)
+	}
+	// Add new entry pointing to the existing node and increment link count
+	parentNode.entries[clean] = oldNodeID
+	if oldNode.nlink == 0 {
+		oldNode.nlink = 2 // was 1 implicitly, now 2
+	} else {
+		oldNode.nlink++
+	}
+	if parentNode.abstractDir == nil {
+		parentNode.modTime = time.Now()
+	}
+	return oldNodeID, oldNode.attr(), 0
 }
 
 func buildFuseDirent(ino uint64, name string, typ uint32, nextOffset uint64) []byte {
@@ -1141,6 +1240,10 @@ func (v *virtioFsBackend) AddAbstractFile(filePath string, file AbstractFile) er
 		abstractFile: file,
 		modTime:      modTime,
 	}
+	// Check if the file provides ownership info
+	if owner, ok := file.(AbstractOwner); ok {
+		node.uid, node.gid = owner.Owner()
+	}
 
 	parent.entries[name] = id
 	if parent.abstractDir == nil {
@@ -1189,6 +1292,10 @@ func (v *virtioFsBackend) AddAbstractDir(dirPath string, dir AbstractDir) error 
 		entries:     make(map[string]uint64),
 		abstractDir: dir,
 		modTime:     modTime,
+	}
+	// Check if the directory provides ownership info
+	if owner, ok := dir.(AbstractOwner); ok {
+		node.uid, node.gid = owner.Owner()
 	}
 
 	parent.entries[name] = id

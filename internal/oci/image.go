@@ -700,13 +700,15 @@ func (c *Client) LoadFromTar(tarPath string, arch hv.CpuArchitecture) (*Image, e
 
 	tr = tar.NewReader(tarFile)
 
-	// Create a set of layer paths for quick lookup
+	// Create a set of layer paths for quick lookup, and a map to store processed layers
 	layerSet := make(map[string]bool)
+	processedLayers := make(map[string]ImageLayer)
 	for _, layerPath := range entry.Layers {
 		layerSet[layerPath] = false // false = not yet processed
 	}
 
 	// Process layers one at a time as we encounter them in the tar
+	// Note: We process in tar order but will reorder according to manifest later
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -744,18 +746,16 @@ func (c *Client) LoadFromTar(tarPath string, arch hv.CpuArchitecture) (*Image, e
 		hash := fmt.Sprintf("sha256:%x", sha256.Sum256(data))
 		hashPrefix := strings.TrimPrefix(hash, "sha256:")
 
-		cfg.Layers = append(cfg.Layers, hash)
-
 		indexPath := filepath.Join(outputDir, hashPrefix+".idx")
 		contentsPath := filepath.Join(outputDir, hashPrefix+".contents")
 
-		// Check if layer already processed
+		// Check if layer already processed (cached)
 		if _, err := os.Stat(indexPath); err == nil {
-			img.Layers = append(img.Layers, ImageLayer{
+			processedLayers[hdr.Name] = ImageLayer{
 				Hash:         hash,
 				IndexPath:    indexPath,
 				ContentsPath: contentsPath,
-			})
+			}
 			layerSet[hdr.Name] = true // mark as processed
 			continue
 		}
@@ -766,19 +766,22 @@ func (c *Client) LoadFromTar(tarPath string, arch hv.CpuArchitecture) (*Image, e
 			return nil, fmt.Errorf("process layer %s: %w", hdr.Name, err)
 		}
 
-		img.Layers = append(img.Layers, ImageLayer{
+		processedLayers[hdr.Name] = ImageLayer{
 			Hash:         hash,
 			IndexPath:    indexPath,
 			ContentsPath: contentsPath,
-		})
+		}
 		layerSet[hdr.Name] = true // mark as processed
 	}
 
-	// Verify all layers were found
-	for layerPath, processed := range layerSet {
-		if !processed {
+	// Verify all layers were found and build the final layer list in manifest order
+	for _, layerPath := range entry.Layers {
+		if !layerSet[layerPath] {
 			return nil, fmt.Errorf("layer %s not found in tar", layerPath)
 		}
+		layer := processedLayers[layerPath]
+		cfg.Layers = append(cfg.Layers, layer.Hash)
+		img.Layers = append(img.Layers, layer)
 	}
 
 	img.Config = cfg

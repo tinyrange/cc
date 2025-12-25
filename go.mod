@@ -3,7 +3,7 @@ module github.com/tinyrange/cc
 go 1.25.5
 
 require (
-	github.com/ebitengine/purego v0.7.1
+	github.com/ebitengine/purego v0.9.1
 	github.com/miekg/dns v1.1.69
 	github.com/schollz/progressbar/v3 v3.18.0
 	golang.org/x/net v0.47.0

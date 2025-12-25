@@ -907,7 +907,10 @@ func SetResolvConf(dnsServer string, errLabel ir.Label, errVar ir.Var) ir.Fragme
 			ir.Int64(0o644),
 		)),
 		ir.Assign(errVar, fd),
-		ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
+		ir.If(ir.IsNegative(errVar), ir.Block{
+			ir.Printf("cc: failed to open /etc/resolv.conf: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+			ir.Goto(errLabel),
+		}),
 
 		// Write the content
 		ir.Assign(errVar, ir.Syscall(
@@ -917,6 +920,7 @@ func SetResolvConf(dnsServer string, errLabel ir.Label, errVar ir.Var) ir.Fragme
 			contentLen,
 		)),
 		ir.If(ir.IsNegative(errVar), ir.Block{
+			ir.Printf("cc: failed to write /etc/resolv.conf: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
 			ir.Syscall(defs.SYS_CLOSE, fd),
 			ir.Goto(errLabel),
 		}),
