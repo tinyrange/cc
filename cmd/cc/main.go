@@ -81,8 +81,7 @@ func run() error {
 		}
 		defer debug.Close()
 
-		debug.Write("cc", "debug logging enabled")
-		debug.Writef("cc", "debug file: %s", *debugFile)
+		debug.Writef("cc debug logging enabled", "filename=%s", *debugFile)
 	}
 
 	if *dbg {
@@ -154,12 +153,7 @@ func run() error {
 	}
 
 	slog.Debug("Pulling image", "ref", imageRef, "arch", hvArch)
-	debug.Writef(
-		"cc",
-		"pulling image %s for architecture %s",
-		imageRef,
-		hvArch,
-	)
+	debug.Writef("cc.run pull image", "pulling image %s for architecture %s", imageRef, hvArch)
 
 	// Pull image
 	img, err := client.PullForArch(imageRef, hvArch)
@@ -168,11 +162,7 @@ func run() error {
 	}
 
 	slog.Debug("Image pulled", "layers", len(img.Layers))
-	debug.Writef(
-		"cc",
-		"image pulled with %d layers",
-		len(img.Layers),
-	)
+	debug.Writef("cc.run image pulled", "image pulled with %d layers", len(img.Layers))
 
 	// Determine command to run
 	execCmd := img.Command(cmd)
@@ -190,10 +180,7 @@ func run() error {
 	}
 	defer containerFS.Close()
 
-	debug.Writef(
-		"cc",
-		"container filesystem created",
-	)
+	debug.Writef("cc.run container filesystem created", "container filesystem created")
 
 	execCmd, err = resolveCommandPath(containerFS, execCmd, pathEnv, workDir)
 	if err != nil {
@@ -201,11 +188,7 @@ func run() error {
 	}
 
 	slog.Debug("Running command", "cmd", execCmd)
-	debug.Writef(
-		"cc",
-		"running command %v",
-		execCmd,
-	)
+	debug.Writef("cc.run running command", "running command %v", execCmd)
 
 	// Create VirtioFS backend with container filesystem as root
 	fsBackend := vfs.NewVirtioFsBackendWithAbstract()
@@ -220,10 +203,7 @@ func run() error {
 	}
 	defer h.Close()
 
-	debug.Writef(
-		"cc",
-		"hypervisor created",
-	)
+	debug.Writef("cc.run hypervisor created", "hypervisor created")
 
 	// Load kernel
 	kernelLoader, err := kernel.LoadForArchitecture(hvArch)
@@ -231,11 +211,7 @@ func run() error {
 		return fmt.Errorf("load kernel: %w", err)
 	}
 
-	debug.Writef(
-		"cc",
-		"kernel loaded for architecture %s",
-		hvArch,
-	)
+	debug.Writef("cc.run kernel loaded", "kernel loaded for architecture %s", hvArch)
 
 	// Create VM with VirtioFS
 	opts := []initx.Option{
@@ -294,10 +270,7 @@ func run() error {
 			Arch:    hvArch,
 		}))
 
-		debug.Writef(
-			"cc",
-			"networking enabled",
-		)
+		debug.Writef("cc.run networking enabled", "networking enabled")
 	}
 
 	vm, err := initx.NewVirtualMachine(
@@ -330,10 +303,7 @@ func run() error {
 			return debug.EnableTrace(64)
 		})
 
-		debug.Writef(
-			"cc",
-			"booting VM",
-		)
+		debug.Writef("cc.run booting VM", "booting VM")
 
 		if err := vm.Run(ctx, &ir.Program{
 			Entrypoint: "main",
@@ -565,10 +535,7 @@ func run() error {
 			return fmt.Errorf("boot VM: %w", err)
 		}
 
-		debug.Writef(
-			"cc",
-			"VM booted successfully",
-		)
+		debug.Writef("cc.run VM booted successfully", "VM booted successfully")
 
 		return nil
 	}(); err != nil {
@@ -594,11 +561,7 @@ func run() error {
 		defer term.Restore(int(os.Stdin.Fd()), oldState)
 	}
 
-	debug.Writef(
-		"cc",
-		"running command %v",
-		execCmd,
-	)
+	debug.Writef("cc.run running command", "running command %v", execCmd)
 
 	if err := vm.Run(ctx, prog); err != nil {
 		var exitErr *initx.ExitError
@@ -608,10 +571,7 @@ func run() error {
 		return fmt.Errorf("run VM: %w", err)
 	}
 
-	debug.Writef(
-		"cc",
-		"command exited",
-	)
+	debug.Writef("cc.run command exited", "command exited")
 
 	return nil
 }

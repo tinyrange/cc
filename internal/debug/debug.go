@@ -1,8 +1,11 @@
 package debug
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
+	"hash"
+	"hash/fnv"
 	"io"
 	"os"
 	"sort"
@@ -171,8 +174,8 @@ func decodeHeader(header [16]byte) (kind DebugKind, sourceLength uint16, dataLen
 	return
 }
 
-func decodeTimestamp(header [16]byte) time.Time {
-	return time.Unix(0, int64(binary.LittleEndian.Uint64(header[8:16])))
+func decodeTimestamp(header [16]byte) int64 {
+	return int64(binary.LittleEndian.Uint64(header[8:16]))
 }
 
 func writeBytes(kind DebugKind, source string, data []byte) {
@@ -196,14 +199,17 @@ func writeBytes(kind DebugKind, source string, data []byte) {
 	}
 }
 
+// source should be unique for every call site.
 func WriteBytes(source string, data []byte) {
 	writeBytes(DebugKindBytes, source, data)
 }
 
+// source should be unique for every call site.
 func Write(source string, data string) {
 	writeBytes(DebugKindString, source, []byte(data))
 }
 
+// source should be unique for every call site.
 func Writef(source string, format string, args ...any) {
 	writeBytes(DebugKindString, source, fmt.Appendf(nil, format, args...))
 }
@@ -212,26 +218,6 @@ type Debug interface {
 	WriteBytes(data []byte)
 	Write(data string)
 	Writef(format string, args ...any)
-}
-
-type debugImpl struct {
-	source string
-}
-
-func (d *debugImpl) WriteBytes(data []byte) {
-	writeBytes(DebugKindBytes, d.source, data)
-}
-
-func (d *debugImpl) Write(data string) {
-	writeBytes(DebugKindString, d.source, []byte(data))
-}
-
-func (d *debugImpl) Writef(format string, args ...any) {
-	writeBytes(DebugKindString, d.source, fmt.Appendf(nil, format, args...))
-}
-
-func WithSource(source string) Debug {
-	return &debugImpl{source: source}
 }
 
 type SearchOptions struct {
@@ -258,6 +244,8 @@ type Reader interface {
 	// Return the earliest and latest timestamps in the log.
 	TimeRange() (time.Time, time.Time)
 
+	Sample(fn func(ts time.Time, kind DebugKind, source string, data []byte) error) error
+
 	// Guaranteed to iterate over all entries in the order they were written.
 	Each(fn func(ts time.Time, kind DebugKind, source string, data []byte) error) error
 
@@ -272,55 +260,97 @@ type Reader interface {
 }
 
 type indexEntry struct {
-	offset int64
-	ts     time.Time
+	Offset   int64
+	UnixNano int64
 }
 
 type reader struct {
 	r io.ReaderAt
 
 	// maps source name to a list of index entries
-	index map[string][]indexEntry
+	index      map[uint64][]indexEntry
+	sourceList map[uint64]string
 
 	// earliest and latest timestamps
-	earliest time.Time
-	latest   time.Time
+	earliest int64
+	latest   int64
+
+	hash hash.Hash64
 }
 
-func (r *reader) indexAll() error {
-	var off int64
+func (r *reader) hashBytes(s []byte) uint64 {
+	r.hash.Reset()
+	r.hash.Write(s)
+	return r.hash.Sum64()
+}
+
+func (r *reader) hashString(s string) uint64 {
+	r.hash.Reset()
+	r.hash.Write([]byte(s))
+	return r.hash.Sum64()
+}
+
+func (r *reader) indexAll(reader io.ReadSeeker) error {
 	var headerBytes [16]byte
 
+	br := bufio.NewReaderSize(reader, 8*1024*1024)
+
+	currentOffset, err := reader.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return fmt.Errorf("failed to seek to current offset: %w", err)
+	}
+
+	var sourceBuffer [64 * 1024]byte
+
 	for {
-		if _, err := r.r.ReadAt(headerBytes[:], off); err != nil {
+		if _, err := io.ReadFull(br, headerBytes[:]); err != nil {
 			if err == io.EOF {
 				break
 			}
-			return err
+			return fmt.Errorf("failed to read header: %w", err)
 		}
 		kind, sourceLength, dataLength := decodeHeader(headerBytes)
 		if kind == DebugKindInvalid {
 			return fmt.Errorf("invalid header")
 		}
 		ts := decodeTimestamp(headerBytes)
-		if r.earliest.IsZero() || ts.Before(r.earliest) {
+		if r.earliest == 0 || ts < r.earliest {
 			r.earliest = ts
 		}
-		if r.latest.IsZero() || ts.After(r.latest) {
+		if r.latest == 0 || ts > r.latest {
 			r.latest = ts
 		}
-		// Read the source
-		source := make([]byte, sourceLength)
-		if _, err := r.r.ReadAt(source, off+16); err != nil {
+
+		// Read the source completely first
+		if int(sourceLength) > len(sourceBuffer) {
+			return fmt.Errorf("source length %d is greater than buffer size %d", sourceLength, len(sourceBuffer))
+		}
+		if _, err := io.ReadFull(br, sourceBuffer[:sourceLength]); err != nil {
 			if err == io.EOF {
 				break
 			}
-			return err
+			return fmt.Errorf("failed to read source: %w", err)
 		}
 
-		r.index[string(source)] = append(r.index[string(source)], indexEntry{offset: off, ts: ts})
+		sourceHash := r.hashBytes(sourceBuffer[:sourceLength])
+		if _, ok := r.sourceList[sourceHash]; !ok {
+			r.sourceList[sourceHash] = string(sourceBuffer[:sourceLength])
+		}
 
-		off += int64(16 + int64(sourceLength) + int64(dataLength))
+		if _, err := br.Discard(int(dataLength)); err != nil {
+			return fmt.Errorf("failed to discard data: %w", err)
+		}
+
+		if _, ok := r.index[sourceHash]; !ok {
+			r.index[sourceHash] = make([]indexEntry, 0, 1024)
+		}
+
+		r.index[sourceHash] = append(
+			r.index[sourceHash],
+			indexEntry{Offset: currentOffset, UnixNano: ts},
+		)
+
+		currentOffset += int64(16 + int64(sourceLength) + int64(dataLength))
 	}
 
 	return nil
@@ -341,9 +371,9 @@ func (r *reader) Search(opts SearchOptions, fn func(ts time.Time, kind DebugKind
 	var entries []sourceEntry
 
 	// Build source filter set if sources are specified
-	sourceFilter := make(map[string]struct{})
+	sourceFilter := make(map[uint64]struct{})
 	for _, s := range opts.Sources {
-		sourceFilter[s] = struct{}{}
+		sourceFilter[r.hashString(s)] = struct{}{}
 	}
 
 	for source, idxEntries := range r.index {
@@ -355,20 +385,22 @@ func (r *reader) Search(opts SearchOptions, fn func(ts time.Time, kind DebugKind
 		}
 
 		for _, ie := range idxEntries {
+			ts := time.Unix(0, ie.UnixNano)
+
 			// Filter by time range
-			if !opts.Start.IsZero() && ie.ts.Before(opts.Start) {
+			if !opts.Start.IsZero() && ts.Before(opts.Start) {
 				continue
 			}
-			if !opts.End.IsZero() && ie.ts.After(opts.End) {
+			if !opts.End.IsZero() && ts.After(opts.End) {
 				continue
 			}
-			entries = append(entries, sourceEntry{source: source, entry: ie})
+			entries = append(entries, sourceEntry{source: r.sourceList[source], entry: ie})
 		}
 	}
 
 	// Sort by timestamp
 	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].entry.ts.Before(entries[j].entry.ts)
+		return entries[i].entry.UnixNano < entries[j].entry.UnixNano
 	})
 
 	// Apply limits
@@ -382,7 +414,7 @@ func (r *reader) Search(opts SearchOptions, fn func(ts time.Time, kind DebugKind
 	// Iterate in sorted order
 	for _, e := range entries {
 		var headerBytes [16]byte
-		if _, err := r.r.ReadAt(headerBytes[:], e.entry.offset); err != nil {
+		if _, err := r.r.ReadAt(headerBytes[:], e.entry.Offset); err != nil {
 			return err
 		}
 
@@ -392,10 +424,10 @@ func (r *reader) Search(opts SearchOptions, fn func(ts time.Time, kind DebugKind
 		}
 
 		data := make([]byte, dataLength)
-		if _, err := r.r.ReadAt(data, e.entry.offset+16+int64(sourceLength)); err != nil {
+		if _, err := r.r.ReadAt(data, e.entry.Offset+16+int64(sourceLength)); err != nil {
 			return err
 		}
-		if err := fn(e.entry.ts, kind, e.source, data); err != nil {
+		if err := fn(time.Unix(0, e.entry.UnixNano), kind, e.source, data); err != nil {
 			return err
 		}
 	}
@@ -410,9 +442,9 @@ func (r *reader) Count(opts SearchOptions) (int, error) {
 	}
 
 	// Build source filter set if sources are specified
-	sourceFilter := make(map[string]struct{})
+	sourceFilter := make(map[uint64]struct{})
 	for _, s := range opts.Sources {
-		sourceFilter[s] = struct{}{}
+		sourceFilter[r.hashString(s)] = struct{}{}
 	}
 
 	count := 0
@@ -426,10 +458,10 @@ func (r *reader) Count(opts SearchOptions) (int, error) {
 
 		for _, ie := range idxEntries {
 			// Filter by time range
-			if !opts.Start.IsZero() && ie.ts.Before(opts.Start) {
+			if !opts.Start.IsZero() && time.Unix(0, ie.UnixNano).Before(opts.Start) {
 				continue
 			}
-			if !opts.End.IsZero() && ie.ts.After(opts.End) {
+			if !opts.End.IsZero() && time.Unix(0, ie.UnixNano).After(opts.End) {
 				continue
 			}
 			count++
@@ -459,26 +491,58 @@ func (r *reader) EachSource(source string, fn func(ts time.Time, kind DebugKind,
 	})
 }
 
+func (r *reader) Sample(fn func(ts time.Time, kind DebugKind, source string, data []byte) error) error {
+	for srcHash, sourceName := range r.sourceList {
+		// get the first index entry for this source
+		idxEntries := r.index[srcHash]
+		if len(idxEntries) == 0 {
+			continue
+		}
+		idxEntry := idxEntries[0]
+
+		var headerBytes [16]byte
+		if _, err := r.r.ReadAt(headerBytes[:], idxEntry.Offset); err != nil {
+			return err
+		}
+		kind, sourceLength, dataLength := decodeHeader(headerBytes)
+		if kind == DebugKindInvalid {
+			return fmt.Errorf("invalid header")
+		}
+
+		data := make([]byte, dataLength)
+		if _, err := r.r.ReadAt(data, idxEntry.Offset+16+int64(sourceLength)); err != nil {
+			return err
+		}
+
+		if err := fn(time.Unix(0, idxEntry.UnixNano), kind, sourceName, data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (r *reader) Sources() []string {
 	sources := make([]string, 0, len(r.index))
-	for source := range r.index {
+	for _, source := range r.sourceList {
 		sources = append(sources, source)
 	}
 	return sources
 }
 
 func (r *reader) TimeRange() (time.Time, time.Time) {
-	return r.earliest, r.latest
+	return time.Unix(0, r.earliest), time.Unix(0, r.latest)
 }
 
-func NewReader(r io.ReaderAt) (Reader, error) {
+func NewReader(r io.ReaderAt, indexReader io.ReadSeeker) (Reader, error) {
 	ret := &reader{
-		r:     r,
-		index: make(map[string][]indexEntry),
+		r:          r,
+		index:      make(map[uint64][]indexEntry),
+		sourceList: make(map[uint64]string),
+		hash:       fnv.New64a(),
 	}
 
-	if err := ret.indexAll(); err != nil {
-		return nil, err
+	if err := ret.indexAll(indexReader); err != nil {
+		return nil, fmt.Errorf("failed to index file: %w", err)
 	}
 
 	return ret, nil
@@ -487,9 +551,9 @@ func NewReader(r io.ReaderAt) (Reader, error) {
 func NewReaderFromFile(filename string) (Reader, io.Closer, error) {
 	f, err := os.Open(filename)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("failed to open file: %w", err)
 	}
-	reader, err := NewReader(f)
+	reader, err := NewReader(f, f)
 	if err != nil {
 		f.Close()
 		return nil, nil, err

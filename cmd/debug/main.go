@@ -5,19 +5,31 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"runtime/pprof"
 	"time"
 
 	"github.com/tinyrange/cc/internal/debug"
 )
 
+func getModTime(filename string) (time.Time, error) {
+	fi, err := os.Stat(filename)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return fi.ModTime(), nil
+}
+
 func run() error {
 	// Flags
 	list := flag.Bool("list", false, "list all sources in the log")
+	sample := flag.Bool("sample", false, "print one record from each matched source")
 	timeRange := flag.Bool("range", false, "print the earliest and latest timestamps")
 	source := flag.String("source", "", "regex to filter sources")
 	match := flag.String("match", "", "regex to filter messages")
 	limit := flag.Int("limit", 100, "limit the number of entries (0 for unlimited)")
 	tail := flag.Bool("tail", false, "show last N entries instead of first N")
+	cpuprofile := flag.String("cpuprofile", "", "write CPU profile to file")
+	memprofile := flag.String("memprofile", "", "write memory profile to file")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `debug - inspect binary debug logs
@@ -27,6 +39,7 @@ USAGE:
 
 FLAGS:
   -list          List all unique source names in the log, one per line
+  -sample	     Print one record from each matched source
   -range         Show earliest/latest timestamps and total duration
   -source REGEX  Only show entries where source matches regex (Go regexp syntax)
   -match REGEX   Only show entries where message matches regex (Go regexp syntax)
@@ -39,6 +52,7 @@ OUTPUT FORMAT:
 
 EXAMPLES:
   debug log.bin                          Show entries (errors if >100)
+  debug -sample log.bin                  Print one record from each matched source
   debug -tail log.bin                    Show last 100 entries
   debug -limit 0 log.bin                 Show all entries (no limit)
   debug -tail -limit 50 log.bin          Show last 50 entries
@@ -54,6 +68,37 @@ EXAMPLES:
 	flag.Parse()
 
 	if flag.NArg() < 1 {
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			return fmt.Errorf("create CPU profile file: %w", err)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			return fmt.Errorf("start CPU profile: %w", err)
+		}
+		defer pprof.StopCPUProfile()
+	}
+
+	if *memprofile != "" {
+		defer func() {
+			f, err := os.Create(*memprofile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "create memory profile file: %v\n", err)
+				return
+			}
+			defer f.Close()
+			if err := pprof.Lookup("heap").WriteTo(f, 0); err != nil {
+				fmt.Fprintf(os.Stderr, "write memory profile: %v\n", err)
+			}
+		}()
+	}
+
+	if len(flag.Args()) != 1 {
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -78,6 +123,17 @@ EXAMPLES:
 	if *timeRange {
 		earliest, latest := reader.TimeRange()
 		fmt.Printf("earliest: %s\nlatest:   %s\nduration: %s\n", earliest, latest, latest.Sub(earliest))
+		return nil
+	}
+
+	// Handle -sample
+	if *sample {
+		if err := reader.Sample(func(ts time.Time, kind debug.DebugKind, src string, data []byte) error {
+			fmt.Printf("%s [%s] %s\n", ts.Format(time.RFC3339Nano), src, string(data))
+			return nil
+		}); err != nil {
+			return fmt.Errorf("failed to sample log: %w", err)
+		}
 		return nil
 	}
 

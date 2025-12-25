@@ -13,8 +13,6 @@ import (
 	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 )
 
-var fsDbg = debug.WithSource("virtio-fs")
-
 // -----------------------------
 // Virtio-fs device constants
 // -----------------------------
@@ -442,7 +440,7 @@ func NewFS(vm hv.VirtualMachine, base, size uint64, irqLine uint32, tag string, 
 	}
 	fs.setTag(tag)
 	fs.setupDevice(vm)
-	fsDbg.Writef("NewFS base=0x%x size=0x%x irqLine=%d tag=%q backendNil=%t", base, size, irqLine, tag, backend == nil)
+	debug.Writef("virtio-fs.NewFS", "base=0x%x size=0x%x irqLine=%d tag=%q backendNil=%t", base, size, irqLine, tag, backend == nil)
 	return fs
 }
 
@@ -525,14 +523,14 @@ func (v *FS) OnReset(device)          {}
 
 func (v *FS) OnQueueNotify(dev device, qidx int) error {
 	if qidx < fsHiprioQueueIndex || qidx >= fsTotalQueueCount {
-		fsDbg.Writef("OnQueueNotify ignore qidx=%d (total=%d)", qidx, fsTotalQueueCount)
+		debug.Writef("virtio-fs.OnQueueNotify ignore", "qidx=%d (total=%d)", qidx, fsTotalQueueCount)
 		return nil
 	}
 	q := dev.queue(qidx)
 	if q == nil {
-		fsDbg.Writef("OnQueueNotify qidx=%d queue=nil", qidx)
+		debug.Writef("virtio-fs.OnQueueNotify q==nil", "qidx=%d", qidx)
 	} else {
-		fsDbg.Writef("OnQueueNotify qidx=%d ready=%t size=%d lastAvailIdx=%d usedIdx=%d", qidx, q.ready, q.size, q.lastAvailIdx, q.usedIdx)
+		debug.Writef("virtio-fs.OnQueueNotify q!=nil", "qidx=%d ready=%t size=%d lastAvailIdx=%d usedIdx=%d", qidx, q.ready, q.size, q.lastAvailIdx, q.usedIdx)
 	}
 	return v.processQueue(dev, q)
 }
@@ -569,44 +567,44 @@ func (v *FS) WriteConfig(device, uint64, uint32) (bool, error) { return false, n
 func (v *FS) processQueue(dev device, q *queue) error {
 	if q == nil || !q.ready || q.size == 0 {
 		if q == nil {
-			fsDbg.Writef("processQueue skip queue=nil")
+			debug.Writef("virtio-fs.processQueue skip", "queue=nil")
 		} else {
-			fsDbg.Writef("processQueue skip ready=%t size=%d", q.ready, q.size)
+			debug.Writef("virtio-fs.processQueue skip", "ready=%t size=%d", q.ready, q.size)
 		}
 		return nil
 	}
 
 	availFlags, availIdx, err := dev.readAvailState(q)
 	if err != nil {
-		fsDbg.Writef("processQueue readAvailState err=%v", err)
+		debug.Writef("virtio-fs.processQueue readAvailState err", "error=%v", err)
 		return err
 	}
-	fsDbg.Writef("processQueue availFlags=0x%x availIdx=%d lastAvailIdx=%d", availFlags, availIdx, q.lastAvailIdx)
+	debug.Writef("virtio-fs.processQueue availFlags", "0x%x availIdx=%d lastAvailIdx=%d", availFlags, availIdx, q.lastAvailIdx)
 	var interruptNeeded bool
 
 	for q.lastAvailIdx != availIdx {
 		ringIndex := q.lastAvailIdx % q.size
 		head, err := dev.readAvailEntry(q, ringIndex)
 		if err != nil {
-			fsDbg.Writef("processQueue readAvailEntry ringIndex=%d err=%v", ringIndex, err)
+			debug.Writef("virtio-fs.processQueue readAvailEntry err", "ringIndex=%d error=%v", ringIndex, err)
 			return err
 		}
-		fsDbg.Writef("processQueue handle head=%d ringIndex=%d", head, ringIndex)
+		debug.Writef("virtio-fs.processQueue handle", "head=%d ringIndex=%d", head, ringIndex)
 		usedLen, err := v.handleRequest(dev, q, head)
 		if err != nil {
-			fsDbg.Writef("processQueue handleRequest head=%d err=%v", head, err)
+			debug.Writef("virtio-fs.processQueue handleRequest", "head=%d error=%v", head, err)
 			return err
 		}
-		fsDbg.Writef("processQueue recordUsed head=%d usedLen=%d", head, usedLen)
+		debug.Writef("virtio-fs.processQueue recordUsed", "head=%d usedLen=%d", head, usedLen)
 		if err := dev.recordUsedElement(q, head, usedLen); err != nil {
-			fsDbg.Writef("processQueue recordUsedElement head=%d err=%v", head, err)
+			debug.Writef("virtio-fs.processQueue recordUsedElement", "head=%d error=%v", head, err)
 			return err
 		}
 		q.lastAvailIdx++
 		interruptNeeded = true
 	}
 	if interruptNeeded && (availFlags&1) == 0 {
-		fsDbg.Writef("processQueue raiseInterrupt bit=0x%x", fsInterruptBit)
+		debug.Writef("virtio-fs.processQueue raiseInterrupt", "bit=0x%x", fsInterruptBit)
 		dev.raiseInterrupt(fsInterruptBit)
 	}
 	return nil
@@ -624,14 +622,14 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 	// Expect a simple 2-descriptor chain: [in: request][out: reply]
 	descs, err := v.readDescriptorChain(dev, q, head)
 	if err != nil {
-		fsDbg.Writef("handleRequest readDescriptorChain head=%d err=%v", head, err)
+		debug.Writef("virtio-fs.handleRequest readDescriptorChain", "head=%d error=%v", head, err)
 		return 0, err
 	}
 	if len(descs) == 0 {
-		fsDbg.Writef("handleRequest head=%d no descriptors", head)
+		debug.Writef("virtio-fs.handleRequest", "head=%d no descriptors", head)
 		return 0, errors.New("virtio-fs: no descriptors in request")
 	}
-	fsDbg.Writef("handleRequest head=%d descs=%d", head, len(descs))
+	debug.Writef("virtio-fs.handleRequest", "head=%d descs=%d", head, len(descs))
 
 	var reqDescs, respDescs []fsDesc
 	for _, d := range descs {
@@ -645,7 +643,7 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 		reqDescs = append(reqDescs, d)
 	}
 	if len(reqDescs) == 0 {
-		fsDbg.Writef("handleRequest head=%d no request descriptors", head)
+		debug.Writef("virtio-fs.handleRequest no request descriptors", "head=%d", head)
 		return 0, errors.New("virtio-fs: no request descriptors")
 	}
 
@@ -654,10 +652,10 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 		reqLen += int(d.length)
 	}
 	if reqLen == 0 {
-		fsDbg.Writef("handleRequest head=%d empty request payload", head)
+		debug.Writef("virtio-fs.handleRequest empty request payload", "head=%d", head)
 		return 0, errors.New("virtio-fs: empty request payload")
 	}
-	fsDbg.Writef("handleRequest head=%d reqDesc=%d reqLen=%d respDesc=%d", head, len(reqDescs), reqLen, len(respDescs))
+	debug.Writef("virtio-fs.handleRequest", "reqDesc=%d reqLen=%d respDesc=%d", len(reqDescs), reqLen, len(respDescs))
 	reqBuf := v.getBuffer(reqLen)
 	defer v.putBuffer(reqBuf)
 	// Clear request buffer to avoid garbage data from buffer pool reuse
@@ -670,7 +668,7 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 		}
 		seg, err := dev.readGuest(d.addr, d.length)
 		if err != nil {
-			fsDbg.Writef("handleRequest head=%d readGuest addr=0x%x len=%d err=%v", head, d.addr, d.length, err)
+			debug.Writef("virtio-fs.handleRequest readGuest", "head=%d addr=0x%x len=%d error=%v", head, d.addr, d.length, err)
 			return 0, err
 		}
 		copy(reqBuf[copyOffset:], seg[:segLen])
@@ -680,10 +678,10 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 	opcode := binary.LittleEndian.Uint32(reqBuf[4:8])
 	if len(respDescs) == 0 {
 		if opcode == FUSE_FORGET {
-			fsDbg.Writef("handleRequest head=%d opcode=%s no resp (FORGET)", fuseOpcodeString(opcode))
+			debug.Writef("virtio-fs.handleRequest no resp (FORGET)", "head=%d opcode=%s", head, fuseOpcodeString(opcode))
 			return 0, nil
 		}
-		fsDbg.Writef("handleRequest head=%d opcode=%s no response descriptors", fuseOpcodeString(opcode))
+		debug.Writef("virtio-fs.handleRequest no response descriptors", "head=%d opcode=%s", head, fuseOpcodeString(opcode))
 		return 0, errors.New("virtio-fs: no response descriptors")
 	}
 
@@ -692,10 +690,10 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 		respCap += int(d.length)
 	}
 	if respCap == 0 {
-		fsDbg.Writef("handleRequest head=%d opcode=%s respCap=0", fuseOpcodeString(opcode))
+		debug.Writef("virtio-fs.handleRequest respCap=0", "head=%d opcode=%s", head, fuseOpcodeString(opcode))
 		return 0, errors.New("virtio-fs: zero-length response buffer")
 	}
-	fsDbg.Writef("handleRequest head=%d opcode=%s respCap=%d", head, fuseOpcodeString(opcode), respCap)
+	debug.Writef("virtio-fs.handleRequest", "respCap=%d head=%d opcode=%s", respCap, head, fuseOpcodeString(opcode))
 	respBuf := v.getBuffer(respCap)
 	defer v.putBuffer(respBuf)
 	// Zero the response buffer to avoid garbage data
@@ -703,17 +701,17 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 
 	used, err := v.dispatchFUSE(reqBuf[:reqLen], respBuf[:respCap])
 	if err != nil {
-		fsDbg.Writef("handleRequest head=%d opcode=%s dispatch err=%v", head, fuseOpcodeString(opcode), err)
+		debug.Writef("virtio-fs.handleRequest dispatch", "head=%d opcode=%s error=%v", head, fuseOpcodeString(opcode), err)
 		return 0, err
 	}
 	if used == 0 {
 		used = fuseHdrOutSize
 	} // ensure progress
 	if int(used) > respCap {
-		fsDbg.Writef("handleRequest head=%d opcode=%s used=%d respCap=%d too-large", head, fuseOpcodeString(opcode), used, respCap)
+		debug.Writef("virtio-fs.handleRequest too-large", "head=%d opcode=%s used=%d respCap=%d", head, fuseOpcodeString(opcode), used, respCap)
 		return 0, fmt.Errorf("virtio-fs: response too large (need %d, have %d)", used, respCap)
 	}
-	fsDbg.Writef("handleRequest head=%d opcode=%s used=%d", head, fuseOpcodeString(opcode), used)
+	debug.Writef("virtio-fs.handleRequest", "used=%d head=%d opcode=%s", used, head, fuseOpcodeString(opcode))
 
 	remaining := int(used)
 	copyOffset = 0
@@ -726,7 +724,7 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 			chunk = remaining
 		}
 		if err := dev.writeGuest(d.addr, respBuf[copyOffset:copyOffset+chunk]); err != nil {
-			fsDbg.Writef("handleRequest head=%d opcode=%s writeGuest addr=0x%x chunk=%d err=%v", head, fuseOpcodeString(opcode), d.addr, chunk, err)
+			debug.Writef("virtio-fs.handleRequest writeGuest", "head=%d opcode=%s addr=0x%x chunk=%d error=%v", head, fuseOpcodeString(opcode), d.addr, chunk, err)
 			return 0, err
 		}
 		copyOffset += chunk
@@ -736,7 +734,7 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 		}
 	}
 	if remaining != 0 {
-		fsDbg.Writef("handleRequest head=%d opcode=%s remaining=%d (descriptors exhausted)", head, fuseOpcodeString(opcode), remaining)
+		debug.Writef("virtio-fs.handleRequest descriptors exhausted", "head=%d opcode=%s remaining=%d", head, fuseOpcodeString(opcode), remaining)
 		return 0, errors.New("virtio-fs: response descriptors exhausted")
 	}
 
@@ -749,11 +747,11 @@ func (v *FS) readDescriptorChain(dev device, q *queue, head uint16) ([]fsDesc, e
 	for i := uint16(0); i < q.size; i++ {
 		desc, err := dev.readDescriptor(q, idx)
 		if err != nil {
-			fsDbg.Writef("readDescriptorChain head=%d idx=%d err=%v", head, idx, err)
+			debug.Writef("virtio-fs.readDescriptorChain failed", "head=%d idx=%d error=%v", head, idx, err)
 			return nil, err
 		}
 		// Log each descriptor in the chain; this is critical when debugging guest/host ring desync.
-		fsDbg.Writef("readDescriptorChain head=%d idx=%d addr=0x%x len=%d flags=0x%x next=%d", head, idx, desc.addr, desc.length, desc.flags, desc.next)
+		debug.Writef("virtio-fs.readDescriptorChain", "head=%d idx=%d addr=0x%x len=%d flags=0x%x next=%d", head, idx, desc.addr, desc.length, desc.flags, desc.next)
 		descs = append(descs, fsDesc{
 			addr:   desc.addr,
 			length: desc.length,
@@ -766,7 +764,7 @@ func (v *FS) readDescriptorChain(dev device, q *queue, head uint16) ([]fsDesc, e
 		}
 		idx = desc.next
 	}
-	fsDbg.Writef("readDescriptorChain head=%d total=%d", head, len(descs))
+	debug.Writef("virtio-fs.readDescriptorChain completed", "head=%d total=%d", head, len(descs))
 	return descs, nil
 }
 
@@ -776,7 +774,7 @@ func (v *FS) readDescriptorChain(dev device, q *queue, head uint16) ([]fsDesc, e
 
 func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 	if len(req) < fuseHdrInSize || len(resp) < fuseHdrOutSize {
-		fsDbg.Writef("dispatchFUSE short buffers req=%d resp=%d", len(req), len(resp))
+		debug.Writef("virtio-fs.dispatchFUSE short buffers", "req=%d resp=%d", len(req), len(resp))
 		return 0, fmt.Errorf("virtio-fs: short buffers req=%d resp=%d", len(req), len(resp))
 	}
 	var in fuseInHeader
@@ -791,7 +789,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		in.TotalExtLen = binary.LittleEndian.Uint16(req[36:38])
 		in.Padding = binary.LittleEndian.Uint16(req[38:40])
 	}
-	fsDbg.Writef("dispatchFUSE in len=%d opcode=%s unique=%d node=%d uid=%d gid=%d pid=%d extLen=%d", in.Len, fuseOpcodeString(in.Opcode), in.Unique, in.NodeID, in.UID, in.GID, in.PID, in.TotalExtLen)
+	debug.Writef("virtio-fs.dispatchFUSE in", "len=%d opcode=%s unique=%d node=%d uid=%d gid=%d pid=%d extLen=%d", in.Len, fuseOpcodeString(in.Opcode), in.Unique, in.NodeID, in.UID, in.GID, in.PID, in.TotalExtLen)
 
 	w := func(h fuseOutHeader, extra []byte) uint32 {
 		binary.LittleEndian.PutUint32(resp[0:4], h.Len)
@@ -806,9 +804,10 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 	errno := int32(0)
 	switch in.Opcode {
 	case FUSE_INIT:
-		fsDbg.Writef("dispatchFUSE op=INIT")
+		debug.Writef("virtio-fs.dispatchFUSE op=INIT", "in=%+v", in)
 		// parse init_in
 		if len(req) < fuseHdrInSize+16 {
+			debug.Writef("virtio-fs.dispatchFUSE op=INIT too short", "in=%+v", in)
 			return 0, fmt.Errorf("FUSE_INIT too short")
 		}
 		maj := binary.LittleEndian.Uint32(req[40:44])
@@ -840,7 +839,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
 
 	case FUSE_GETATTR:
-		fsDbg.Writef("dispatchFUSE op=GETATTR node=%d", in.NodeID)
+		debug.Writef("virtio-fs.dispatchFUSE op=GETATTR", "node=%d", in.NodeID)
 		attr, e := v.backend.GetAttr(in.NodeID)
 		errno = e
 		if errno == 0 {
@@ -854,7 +853,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_LOOKUP:
-		fsDbg.Writef("dispatchFUSE op=LOOKUP parent=%d", in.NodeID)
+		debug.Writef("virtio-fs.dispatchFUSE op=LOOKUP", "parent=%d", in.NodeID)
 		// payload: name (NUL-terminated)
 		name := string(req[fuseHdrInSize:])
 		if i := indexNull(name); i >= 0 {
@@ -863,7 +862,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		if name == "." {
 			name = ""
 		}
-		fsDbg.Writef("dispatchFUSE op=LOOKUP name=%q", name)
+		debug.Writef("virtio-fs.dispatchFUSE op=LOOKUP", "name=%q", name)
 		nid, attr, e := v.backend.Lookup(in.NodeID, path.Clean(name))
 		errno = e
 		if errno == 0 {
@@ -879,15 +878,16 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_CREATE:
-		fsDbg.Writef("dispatchFUSE op=CREATE parent=%d", in.NodeID)
+		debug.Writef("virtio-fs.dispatchFUSE op=CREATE", "parent=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+16 {
+			debug.Writef("virtio-fs.dispatchFUSE op=CREATE too short", "in=%+v", in)
 			return 0, fmt.Errorf("FUSE_CREATE too short")
 		}
 		flags := binary.LittleEndian.Uint32(req[40:44])
 		mode := binary.LittleEndian.Uint32(req[44:48])
 		umask := binary.LittleEndian.Uint32(req[48:52])
 		name := readName(req[fuseHdrInSize+16:])
-		fsDbg.Writef("dispatchFUSE op=CREATE name=%q mode=0%o flags=0x%x umask=0%o", name, mode, flags, umask)
+		debug.Writef("virtio-fs.dispatchFUSE op=CREATE", "name=%q mode=0%o flags=0x%x umask=0%o", name, mode, flags, umask)
 		if be, ok := v.backend.(fsCreateBackend); ok {
 			nodeID, fh, attr, e := be.Create(in.NodeID, name, mode, flags, umask)
 			errno = e
@@ -905,7 +905,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_MKNOD:
-		fsDbg.Writef("dispatchFUSE op=MKNOD parent=%d", in.NodeID)
+		debug.Writef("virtio-fs.dispatchFUSE op=MKNOD", "parent=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+16 {
 			return 0, fmt.Errorf("FUSE_MKNOD too short")
 		}
@@ -913,7 +913,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		rdev := binary.LittleEndian.Uint32(req[44:48])
 		umask := binary.LittleEndian.Uint32(req[48:52])
 		name := readName(req[fuseHdrInSize+16:])
-		fsDbg.Writef("dispatchFUSE op=MKNOD name=%q mode=0%o rdev=0x%x umask=0%o", name, mode, rdev, umask)
+		debug.Writef("virtio-fs.dispatchFUSE op=MKNOD", "name=%q mode=0%o rdev=0x%x umask=0%o", name, mode, rdev, umask)
 		if be, ok := v.backend.(fsMknodBackend); ok {
 			nodeID, attr, e := be.Mknod(in.NodeID, name, mode, rdev, umask)
 			errno = e
@@ -930,14 +930,14 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_MKDIR:
-		fsDbg.Writef("dispatchFUSE op=MKDIR parent=%d", in.NodeID)
+		debug.Writef("virtio-fs.dispatchFUSE op=MKDIR", "parent=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+8 {
 			return 0, fmt.Errorf("FUSE_MKDIR too short")
 		}
 		mode := binary.LittleEndian.Uint32(req[40:44])
 		umask := binary.LittleEndian.Uint32(req[44:48])
 		name := readName(req[fuseHdrInSize+8:])
-		fsDbg.Writef("dispatchFUSE op=MKDIR name=%q mode=0%o umask=0%o", name, mode, umask)
+		debug.Writef("virtio-fs.dispatchFUSE op=MKDIR", "name=%q mode=0%o umask=0%o", name, mode, umask)
 		if be, ok := v.backend.(fsMkdirBackend); ok {
 			nodeID, attr, e := be.Mkdir(in.NodeID, name, mode, umask)
 			errno = e
@@ -954,12 +954,12 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_OPEN:
-		fsDbg.Writef("dispatchFUSE op=OPEN node=%d", in.NodeID)
+		debug.Writef("virtio-fs.dispatchFUSE op=OPEN", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+8 {
 			return 0, fmt.Errorf("FUSE_OPEN too short")
 		}
 		flags := binary.LittleEndian.Uint32(req[40:44])
-		fsDbg.Writef("dispatchFUSE op=OPEN flags=0x%x", flags)
+		debug.Writef("virtio-fs.dispatchFUSE op=OPEN", "flags=0x%x", flags)
 		fh, e := v.backend.Open(in.NodeID, flags)
 		errno = e
 		if errno == 0 {
@@ -970,24 +970,24 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_RELEASE:
-		fsDbg.Writef("dispatchFUSE op=RELEASE node=%d", in.NodeID)
+		debug.Writef("virtio-fs.dispatchFUSE op=RELEASE", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+24 {
 			return 0, fmt.Errorf("FUSE_RELEASE too short")
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
-		fsDbg.Writef("dispatchFUSE op=RELEASE fh=%d", fh)
+		debug.Writef("virtio-fs.dispatchFUSE op=RELEASE", "fh=%d", fh)
 		v.backend.Release(in.NodeID, fh)
 		return w(fuseOutHeader{Len: fuseHdrOutSize, Error: 0, Unique: in.Unique}, nil), nil
 
 	case FUSE_READ:
-		fsDbg.Writef("dispatchFUSE op=READ node=%d", in.NodeID)
+		debug.Writef("virtio-fs.dispatchFUSE op=READ", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+24 {
 			return 0, fmt.Errorf("FUSE_READ too short")
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		off := binary.LittleEndian.Uint64(req[48:56])
 		size := binary.LittleEndian.Uint32(req[56:60])
-		fsDbg.Writef("dispatchFUSE op=READ fh=%d off=%d size=%d", fh, off, size)
+		debug.Writef("virtio-fs.dispatchFUSE op=READ", "fh=%d off=%d size=%d", fh, off, size)
 		data, e := v.backend.Read(in.NodeID, fh, off, size)
 		errno = e
 		if errno == 0 {
@@ -1004,14 +1004,14 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_WRITE:
-		fsDbg.Writef("dispatchFUSE op=WRITE node=%d", in.NodeID)
+		debug.Writef("virtio-fs.dispatchFUSE op=WRITE", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+32 {
 			return 0, fmt.Errorf("FUSE_WRITE too short")
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		off := binary.LittleEndian.Uint64(req[48:56])
 		size := binary.LittleEndian.Uint32(req[56:60])
-		fsDbg.Writef("dispatchFUSE op=WRITE fh=%d off=%d size=%d", fh, off, size)
+		debug.Writef("virtio-fs.dispatchFUSE op=WRITE", "fh=%d off=%d size=%d", fh, off, size)
 		// Calculate where write data actually starts: header (40) + write_in structure
 		// The write_in structure is: fh (8) + off (8) + size (4) + write_flags (4) + lock_owner (8) = 32 bytes
 		// But the guest may send it with padding, so we need to find where the data actually starts
@@ -1029,7 +1029,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			written, e := be.Write(in.NodeID, fh, off, data)
 			errno = e
 			if errno == 0 {
-				fsDbg.Writef("dispatchFUSE op=WRITE written=%d", written)
+				debug.Writef("virtio-fs.dispatchFUSE op=WRITE", "written=%d", written)
 				extra := make([]byte, 8)
 				binary.LittleEndian.PutUint32(extra[0:4], written)
 				return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
@@ -1039,7 +1039,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_READDIR:
-		fsDbg.Writef("dispatchFUSE op=READDIR node=%d", in.NodeID)
+		debug.Writef("virtio-fs.dispatchFUSE op=READDIR", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+24 {
 			return 0, fmt.Errorf("FUSE_READDIR too short")
 		}
@@ -1047,7 +1047,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		_ = fh // we don’t maintain dir handles in emptyBackend
 		off := binary.LittleEndian.Uint64(req[48:56])
 		size := binary.LittleEndian.Uint32(req[56:60])
-		fsDbg.Writef("dispatchFUSE op=READDIR off=%d size=%d", off, size)
+		debug.Writef("virtio-fs.dispatchFUSE op=READDIR", "off=%d size=%d", off, size)
 		payload, e := v.backend.ReadDir(in.NodeID, off, size)
 		errno = e
 		if errno == 0 {
@@ -1061,7 +1061,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_RENAME:
-		fsDbg.Writef("dispatchFUSE op=RENAME oldParent=%d", in.NodeID)
+		debug.Writef("virtio-fs.dispatchFUSE op=RENAME", "oldParent=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+8 {
 			return 0, fmt.Errorf("FUSE_RENAME too short")
 		}
@@ -1076,7 +1076,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			return 0, fmt.Errorf("FUSE_RENAME missing new name")
 		}
 		newName := readName(rest)
-		fsDbg.Writef("dispatchFUSE op=RENAME oldName=%q newParent=%d newName=%q flags=0x%x", oldName, newParent, newName, flags)
+		debug.Writef("virtio-fs.dispatchFUSE op=RENAME", "oldName=%q newParent=%d newName=%q flags=0x%x", oldName, newParent, newName, flags)
 		if be, ok := v.backend.(fsRenameBackend); ok {
 			errno = be.Rename(in.NodeID, oldName, newParent, newName, flags)
 			if errno == 0 {
@@ -1088,7 +1088,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 
 	case FUSE_UNLINK:
 		name := readName(req[fuseHdrInSize:])
-		fsDbg.Writef("dispatchFUSE op=UNLINK parent=%d name=%q", in.NodeID, name)
+		debug.Writef("virtio-fs.dispatchFUSE op=UNLINK", "parent=%d name=%q", in.NodeID, name)
 		if be, ok := v.backend.(fsRemoveBackend); ok {
 			errno = be.Unlink(in.NodeID, name)
 			if errno == 0 {
@@ -1100,7 +1100,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 
 	case FUSE_RMDIR:
 		name := readName(req[fuseHdrInSize:])
-		fsDbg.Writef("dispatchFUSE op=RMDIR parent=%d name=%q", in.NodeID, name)
+		debug.Writef("virtio-fs.dispatchFUSE op=RMDIR", "parent=%d name=%q", in.NodeID, name)
 		if be, ok := v.backend.(fsRemoveBackend); ok {
 			errno = be.Rmdir(in.NodeID, name)
 			if errno == 0 {
@@ -1111,7 +1111,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_SETXATTR:
-		fsDbg.Writef("dispatchFUSE op=SETXATTR node=%d", in.NodeID)
+		debug.Writef("virtio-fs.dispatchFUSE op=SETXATTR", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+8 {
 			return 0, fmt.Errorf("FUSE_SETXATTR too short")
 		}
@@ -1121,7 +1121,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		if value == nil {
 			return 0, fmt.Errorf("FUSE_SETXATTR missing value")
 		}
-		fsDbg.Writef("dispatchFUSE op=SETXATTR name=%q size=%d flags=0x%x", name, size, flags)
+		debug.Writef("virtio-fs.dispatchFUSE op=SETXATTR", "name=%q size=%d flags=0x%x", name, size, flags)
 		if uint32(len(value)) < size {
 			return 0, fmt.Errorf("FUSE_SETXATTR value short")
 		}
@@ -1135,13 +1135,13 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_GETXATTR:
-		fsDbg.Writef("dispatchFUSE op=GETXATTR node=%d", in.NodeID)
+		debug.Writef("virtio-fs.dispatchFUSE op=GETXATTR", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+8 {
 			return 0, fmt.Errorf("FUSE_GETXATTR too short")
 		}
 		size := binary.LittleEndian.Uint32(req[40:44])
 		name := readName(req[fuseHdrInSize+8:])
-		fsDbg.Writef("dispatchFUSE op=GETXATTR name=%q size=%d", name, size)
+		debug.Writef("virtio-fs.dispatchFUSE op=GETXATTR", "name=%q size=%d", name, size)
 		if be, ok := v.backend.(fsXattrBackend); ok {
 			value, e := be.GetXattr(in.NodeID, name)
 			errno = e
@@ -1167,7 +1167,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_READLINK:
-		fsDbg.Writef("dispatchFUSE op=READLINK node=%d", in.NodeID)
+		debug.Writef("virtio-fs.dispatchFUSE op=READLINK", "node=%d", in.NodeID)
 		if be, ok := v.backend.(fsReadlinkBackend); ok {
 			target, e := be.Readlink(in.NodeID)
 			errno = e
@@ -1195,7 +1195,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		if rest != nil {
 			target = readName(rest)
 		}
-		fsDbg.Writef("dispatchFUSE op=SYMLINK parent=%d name=%q target=%q umask=0%o", in.NodeID, name, target, umask)
+		debug.Writef("virtio-fs.dispatchFUSE op=SYMLINK", "parent=%d name=%q target=%q umask=0%o", in.NodeID, name, target, umask)
 		if be, ok := v.backend.(fsSymlinkBackend); ok {
 			nodeID, attr, e := be.Symlink(in.NodeID, name, target, umask)
 			errno = e
@@ -1213,7 +1213,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_SETATTR:
-		fsDbg.Writef("dispatchFUSE op=SETATTR node=%d", in.NodeID)
+		debug.Writef("virtio-fs.dispatchFUSE op=SETATTR", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+56 {
 			return 0, fmt.Errorf("FUSE_SETATTR too short")
 		}
@@ -1249,7 +1249,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		if be, ok := v.backend.(fsSetattrBackend); ok {
 			errno = be.SetAttr(in.NodeID, sizeVal, modeVal)
 			if errno == 0 {
-				fsDbg.Writef("dispatchFUSE op=SETATTR applied size=%v mode=%v", sizeVal, modeVal)
+				debug.Writef("virtio-fs.dispatchFUSE op=SETATTR applied", "size=%v mode=%v", sizeVal, modeVal)
 				attr, e := v.backend.GetAttr(in.NodeID)
 				errno = e
 				if errno == 0 {
@@ -1266,19 +1266,19 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_LSEEK:
-		fsDbg.Writef("dispatchFUSE op=LSEEK node=%d", in.NodeID)
+		debug.Writef("virtio-fs.dispatchFUSE op=LSEEK", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+24 {
 			return 0, fmt.Errorf("FUSE_LSEEK too short")
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		offset := binary.LittleEndian.Uint64(req[48:56])
 		whence := binary.LittleEndian.Uint32(req[56:60])
-		fsDbg.Writef("dispatchFUSE op=LSEEK fh=%d offset=%d whence=%d", fh, offset, whence)
+		debug.Writef("virtio-fs.dispatchFUSE op=LSEEK", "fh=%d offset=%d whence=%d", fh, offset, whence)
 		if be, ok := v.backend.(fsLseekBackend); ok {
 			newOff, e := be.Lseek(in.NodeID, fh, offset, whence)
 			errno = e
 			if errno == 0 {
-				fsDbg.Writef("dispatchFUSE op=LSEEK newOff=%d", newOff)
+				debug.Writef("virtio-fs.dispatchFUSE op=LSEEK", "newOff=%d", newOff)
 				extra := make([]byte, 8)
 				binary.LittleEndian.PutUint64(extra[0:8], newOff)
 				return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
@@ -1288,7 +1288,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_STATFS:
-		fsDbg.Writef("dispatchFUSE op=STATFS node=%d", in.NodeID)
+		debug.Writef("virtio-fs.dispatchFUSE op=STATFS", "node=%d", in.NodeID)
 		b, bf, ba, files, ff, bsize, fr, name, e := v.backend.StatFS(in.NodeID)
 		errno = e
 		if errno == 0 {
@@ -1307,11 +1307,11 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
 		}
 	default:
-		fsDbg.Writef("dispatchFUSE op=%s unsupported", fuseOpcodeString(in.Opcode))
+		debug.Writef("virtio-fs.dispatchFUSE unsupported", "opcode=%s", fuseOpcodeString(in.Opcode))
 		errno = -int32(linux.ENOSYS)
 	}
 
-	fsDbg.Writef("dispatchFUSE out opcode=%s unique=%d errno=%d", fuseOpcodeString(in.Opcode), in.Unique, errno)
+	debug.Writef("virtio-fs.dispatchFUSE done", "opcode=%s unique=%d errno=%d", fuseOpcodeString(in.Opcode), in.Unique, errno)
 	return w(fuseOutHeader{Len: fuseHdrOutSize, Error: errno, Unique: in.Unique}, nil), nil
 }
 
