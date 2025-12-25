@@ -377,3 +377,10 @@ func (c *Cocoa) GetButtonState(button Button) ButtonState {
 	// TODO: Implement button state tracking
 	return ButtonStateUp
 }
+
+// getDisplayScale returns the display scale factor.
+// On macOS, window sizes are in logical points and the system handles
+// Retina scaling automatically, so we return 1.0.
+func getDisplayScale() float32 {
+	return 1.0
+}

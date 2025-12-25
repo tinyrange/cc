@@ -958,3 +958,20 @@ func cString(s string) *byte {
 	b := append([]byte(s), 0)
 	return &b[0]
 }
+
+// getDisplayScale returns the display scale factor by querying X11.
+// This function can be called before creating a window.
+func getDisplayScale() float32 {
+	if err := ensureLibs(); err != nil {
+		return 1.0
+	}
+
+	dpy := xOpenDisplay(nil)
+	if dpy == 0 {
+		return 1.0
+	}
+	defer xCloseDisplay(dpy)
+
+	screen := xDefaultScreen(dpy)
+	return calculateScale(dpy, screen)
+}

@@ -74,10 +74,17 @@ func (dm *DisplayManager) onGPUFlush(resourceID uint32, x, y, w, h uint32, pixel
 func (dm *DisplayManager) SetWindow(w window.Window) {
 	dm.window = w
 
-	// Notify GPU of window size
+	// Notify GPU of logical window size (physical / scale).
+	// The guest renders at logical resolution; OpenGL scales to physical.
 	if dm.GPU != nil {
 		width, height := w.BackingSize()
-		dm.GPU.SetDisplaySize(uint32(width), uint32(height))
+		scale := w.Scale()
+		if scale < 1.0 {
+			scale = 1.0
+		}
+		logicalWidth := uint32(float32(width) / scale)
+		logicalHeight := uint32(float32(height) / scale)
+		dm.GPU.SetDisplaySize(logicalWidth, logicalHeight)
 	}
 }
 
@@ -92,10 +99,16 @@ func (dm *DisplayManager) Poll() bool {
 		return false
 	}
 
-	// Handle window resize
+	// Handle window resize - use logical dimensions for GPU
 	width, height := dm.window.BackingSize()
-	if dm.GPU != nil && (uint32(width) != dm.width || uint32(height) != dm.height) {
-		dm.GPU.SetDisplaySize(uint32(width), uint32(height))
+	scale := dm.window.Scale()
+	if scale < 1.0 {
+		scale = 1.0
+	}
+	logicalWidth := uint32(float32(width) / scale)
+	logicalHeight := uint32(float32(height) / scale)
+	if dm.GPU != nil && (logicalWidth != dm.width || logicalHeight != dm.height) {
+		dm.GPU.SetDisplaySize(logicalWidth, logicalHeight)
 	}
 
 	// Process keyboard input

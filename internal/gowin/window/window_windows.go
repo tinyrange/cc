@@ -677,3 +677,9 @@ func moduleHandle() syscall.Handle {
 	h, _, _ := procGetModuleHandle.Call(0)
 	return syscall.Handle(h)
 }
+
+// getDisplayScale returns the display scale factor.
+// TODO: Implement Windows DPI detection using GetDpiForSystem or similar.
+func getDisplayScale() float32 {
+	return 1.0
+}

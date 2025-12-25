@@ -2186,8 +2186,13 @@ func RunExecutable(path string, gpuEnabled bool) error {
 
 	// If GPU is enabled, set up the display manager and run VM in background
 	if gpuEnabled && vm.GPU() != nil {
-		// Create window for display
-		win, err := window.New("GPU Bringup Test", 1024, 768, true)
+		// Get display scale factor and calculate physical window dimensions
+		scale := window.GetDisplayScale()
+		physWidth := int(float32(1024) * scale)
+		physHeight := int(float32(768) * scale)
+
+		// Create window for display with scaled dimensions
+		win, err := window.New("GPU Bringup Test", physWidth, physHeight, true)
 		if err != nil {
 			slog.Warn("failed to create window, running without display", "error", err)
 			// Fall through to run without display
