@@ -348,6 +348,8 @@ var GPUModuleConfigs = []string{
 	"CONFIG_DRM_KMS_HELPER",
 	"CONFIG_DRM_VIRTIO_GPU",
 	"CONFIG_VIRTIO_INPUT",
+	// Needed for /dev/input/event* nodes (wlroots/libinput expects evdev devices).
+	"CONFIG_INPUT_EVDEV",
 }
 
 // GPUModuleMap maps kernel config options to module file paths
@@ -356,6 +358,7 @@ var GPUModuleMap = map[string]string{
 	"CONFIG_DRM_KMS_HELPER": "kernel/drivers/gpu/drm/drm_kms_helper.ko.gz",
 	"CONFIG_DRM_VIRTIO_GPU": "kernel/drivers/gpu/drm/virtio/virtio-gpu.ko.gz",
 	"CONFIG_VIRTIO_INPUT":   "kernel/drivers/virtio/virtio_input.ko.gz",
+	"CONFIG_INPUT_EVDEV":    "kernel/drivers/input/evdev.ko.gz",
 }
 
 var defaultCachePath = ""

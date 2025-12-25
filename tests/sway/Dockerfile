@@ -5,6 +5,7 @@ RUN apk add --no-cache \
     swaybg \
     seatd \
     libseat \
+    eudev \
     foot \
     mesa-dri-gallium \
     ttf-dejavu \

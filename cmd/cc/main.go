@@ -802,6 +802,17 @@ func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, e
 			"",
 		),
 
+		// Mount /dev/shm (wlroots/xkbcommon use it for shm-backed buffers like keymaps).
+		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt/dev/shm", ir.Int64(0o1777)),
+		ir.Syscall(
+			defs.SYS_MOUNT,
+			"tmpfs",
+			"/mnt/dev/shm",
+			"tmpfs",
+			ir.Int64(0),
+			"mode=1777",
+		),
+
 		// Change root to container using pivot_root
 		ir.Assign(errVar, ir.Syscall(defs.SYS_CHDIR, "/mnt")),
 		ir.If(ir.IsNegative(errVar), ir.Block{

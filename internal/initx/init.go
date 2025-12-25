@@ -177,6 +177,17 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 
 		LogKmsg("initx: dev tmpfs ready\n"),
 
+		// Provide /dev/shm for userland that relies on POSIX shm (e.g. wlroots/xkbcommon keymaps).
+		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/dev/shm", ir.Int64(0o1777)),
+		ir.Syscall(
+			defs.SYS_MOUNT,
+			"tmpfs",
+			"/dev/shm",
+			"tmpfs",
+			ir.Int64(0),
+			"mode=1777",
+		),
+
 		preloads,
 
 		// once the preloads are done assume we can open /dev/console and replace stdin/stdout/stderr

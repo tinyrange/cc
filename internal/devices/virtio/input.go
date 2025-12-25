@@ -190,6 +190,7 @@ type inputEvent struct {
 type inputBuffer struct {
 	addr   uint64
 	length uint32
+	head   uint16
 }
 
 func (i *Input) Init(vm hv.VirtualMachine) error {
@@ -519,6 +520,7 @@ func (i *Input) processEventQueue(dev device, q *queue) error {
 			i.availBuffers = append(i.availBuffers, inputBuffer{
 				addr:   desc.addr,
 				length: desc.length,
+				head:   head,
 			})
 		}
 
@@ -588,15 +590,24 @@ func (i *Input) deliverPendingEvents(dev device, q *queue) error {
 		binary.LittleEndian.PutUint16(eventData[2:4], ev.code)
 		binary.LittleEndian.PutUint32(eventData[4:8], uint32(ev.value))
 
+		if buf.length < uint32(len(eventData)) {
+			slog.Error("virtio-input: event buffer too small", "len", buf.length)
+			if err := dev.recordUsedElement(q, buf.head, 0); err != nil {
+				return err
+			}
+			i.availBuffers = i.availBuffers[1:]
+			interruptNeeded = true
+			continue
+		}
+
 		if err := dev.writeGuest(buf.addr, eventData); err != nil {
 			slog.Error("virtio-input: failed to write event", "err", err)
 			return err
 		}
 
-		// Record used element - need to find the head descriptor index
-		// For simplicity, we'll use a workaround: record with the buffer index
-		// Actually, we need to track the descriptor head index with the buffer
-		// For now, let's just not record and handle this properly
+		if err := dev.recordUsedElement(q, buf.head, uint32(len(eventData))); err != nil {
+			return err
+		}
 
 		i.pendingEvents = i.pendingEvents[1:]
 		i.availBuffers = i.availBuffers[1:]
