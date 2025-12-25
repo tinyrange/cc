@@ -27,6 +27,7 @@ import (
 	_ "github.com/tinyrange/cc/internal/ir/arm64"
 	amd64boot "github.com/tinyrange/cc/internal/linux/boot/amd64"
 	arm64boot "github.com/tinyrange/cc/internal/linux/boot/arm64"
+	"github.com/tinyrange/cc/internal/linux/kernel"
 )
 
 type bootPlan interface {
@@ -136,6 +137,13 @@ type LinuxLoader struct {
 	Devices []hv.DeviceTemplate
 
 	AdditionalFiles []InitFile
+
+	// GPUEnabled enables GPU support by loading virtio-gpu and virtio-input modules
+	GPUEnabled bool
+
+	// PreloadModules is a list of modules to preload when the kernel boots.
+	// This is populated automatically based on configuration (e.g. GPUEnabled).
+	PreloadModules []kernel.Module
 
 	plan         bootPlan
 	kernelReader io.ReaderAt

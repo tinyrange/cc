@@ -367,6 +367,10 @@ type VirtualMachine struct {
 
 	debugLogging bool
 	dmesgLogging bool
+	gpuEnabled   bool
+
+	// kernelLoader stores the kernel for module loading
+	kernelLoader kernel.Kernel
 }
 
 func (vm *VirtualMachine) Close() error {
@@ -498,6 +502,13 @@ func WithDmesgLogging(enabled bool) Option {
 	})
 }
 
+func WithGPUEnabled(enabled bool) Option {
+	return funcOption(func(vm *VirtualMachine) error {
+		vm.gpuEnabled = enabled
+		return nil
+	})
+}
+
 func WithStdin(r io.Reader) Option {
 	return funcOption(func(vm *VirtualMachine) error {
 		if r != nil {
@@ -533,6 +544,7 @@ func NewVirtualMachine(
 	ret.inBuffer = in
 
 	ret.programLoader = programLoader
+	ret.kernelLoader = kernelLoader
 
 	// Cap ARM64 memory to avoid overlap with mailbox/config regions at 0xf0000000
 	memSize := memSizeMB
@@ -598,6 +610,18 @@ func NewVirtualMachine(
 			}
 
 			cfg.PreloadModules = append(cfg.PreloadModules, modules...)
+
+			// Load GPU modules if GPU is enabled
+			if ret.gpuEnabled {
+				gpuModules, err := kernelLoader.PlanModuleLoad(
+					kernel.GPUModuleConfigs,
+					kernel.GPUModuleMap,
+				)
+				if err != nil {
+					return nil, fmt.Errorf("plan GPU module load: %v", err)
+				}
+				cfg.PreloadModules = append(cfg.PreloadModules, gpuModules...)
+			}
 
 			return Build(cfg)
 		},

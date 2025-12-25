@@ -374,6 +374,7 @@ func main() {
 	oci := fs.Bool("oci", false, "build and execute the OCI image tool")
 	kernel := fs.Bool("kernel", false, "build and execute the kernel tool")
 	bringup := fs.Bool("bringup", false, "build and execute the bringup tool inside a linux VM")
+	bringupGPU := fs.Bool("bringup-gpu", false, "build and execute the GPU bringup tool with graphics support")
 	remote := fs.String("remote", "", "run quest/bringup on remote host alias from local/remotes.json")
 	run := fs.Bool("run", false, "run the built cc tool after building")
 	runtest := fs.String("runtest", "", "build a Dockerfile in tests/<name>/Dockerfile and run it using cc (Linux only)")
@@ -385,8 +386,8 @@ func main() {
 
 	var remoteTargetConfig *remoteTarget
 	if *remote != "" {
-		if !*quest && !*bringup {
-			fmt.Fprintf(os.Stderr, "-remote can only be used with -quest or -bringup\n")
+		if !*quest && !*bringup && !*bringupGPU {
+			fmt.Fprintf(os.Stderr, "-remote can only be used with -quest, -bringup, or -bringup-gpu\n")
 			os.Exit(1)
 		}
 		if *cross {
@@ -573,6 +574,81 @@ func main() {
 		if remoteTargetConfig != nil {
 			if err := runRemoteCommand(*remoteTargetConfig, out, args); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to run bringup quest remotely: %v\n", err)
+				os.Exit(1)
+			}
+		} else {
+			if err := runBuildOutput(out, args); err != nil {
+				os.Exit(1)
+			}
+		}
+
+		return
+	}
+
+	if *bringupGPU {
+		// GPU bringup: builds a special guest test that uses framebuffer and input
+		bringupBuild := crossBuild{GOOS: "linux", GOARCH: hostBuild.GOARCH}
+		questBuild := hostBuild
+
+		if remoteTargetConfig != nil {
+			bringupBuild = crossBuild{
+				GOOS:   "linux",
+				GOARCH: remoteTargetConfig.GOARCH,
+			}
+			questBuild = crossBuild{
+				GOOS:   remoteTargetConfig.GOOS,
+				GOARCH: remoteTargetConfig.GOARCH,
+			}
+		}
+
+		// Build the GPU bringup test binary (runs inside guest)
+		bringupOut, err := goBuild(buildOptions{
+			Package:    "internal/cmd/bringup-gpu",
+			OutputName: "bringup-gpu",
+			CgoEnabled: false,
+			Build:      bringupBuild,
+			BuildTests: true,
+			Tags:       []string{"guest"},
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build bringup-gpu tool: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Build quest (host-side VM runner)
+		out, err := goBuild(buildOptions{
+			Package:          "internal/cmd/quest",
+			OutputName:       "quest",
+			Build:            questBuild,
+			RaceEnabled:      *race,
+			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build quest for bringup-gpu: %v\n", err)
+			os.Exit(1)
+		}
+
+		bringupExecPath := bringupOut.Path
+
+		if remoteTargetConfig != nil {
+			bringupExecPath = filepath.Join(remoteTargetConfig.TargetDir, filepath.Base(bringupOut.Path))
+
+			if err := pushBuildOutput(*remoteTargetConfig, bringupOut); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to push bringup-gpu to remote: %v\n", err)
+				os.Exit(1)
+			}
+
+			if err := pushBuildOutput(*remoteTargetConfig, out); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to push quest to remote: %v\n", err)
+				os.Exit(1)
+			}
+		}
+
+		// Run quest with -exec for the bringup-gpu binary and -gpu flag to enable GPU
+		args := append([]string{"-exec", bringupExecPath, "-gpu"}, fs.Args()...)
+		if remoteTargetConfig != nil {
+			if err := runRemoteCommand(*remoteTargetConfig, out, args); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to run bringup-gpu quest remotely: %v\n", err)
 				os.Exit(1)
 			}
 		} else {
