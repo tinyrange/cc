@@ -59,6 +59,12 @@ type AbstractEntry struct {
 	Dir  AbstractDir
 }
 
+// AbstractOwner is an optional interface that AbstractFile and AbstractDir
+// implementations can provide to expose ownership information (uid/gid).
+type AbstractOwner interface {
+	Owner() (uid, gid uint32)
+}
+
 type virtioFsBackend struct {
 	mu      sync.Mutex
 	nodes   map[uint64]*fsNode
@@ -89,6 +95,8 @@ type fsNode struct {
 	xattr   map[string][]byte
 	modTime time.Time
 	nlink   uint32 // number of hard links (0 means 1 for backwards compat)
+	uid     uint32 // owner user ID
+	gid     uint32 // owner group ID
 
 	symlinkTarget string
 
@@ -211,8 +219,8 @@ func (n *fsNode) attr() virtio.FuseAttr {
 		Mode:      mode,
 		Size:      size,
 		NLink:     nlink,
-		UID:       0,
-		GID:       0,
+		UID:       n.uid,
+		GID:       n.gid,
 		RDev:      n.rdev,
 		Blocks:    n.blockUsage(),
 		BlkSize:   4096,
@@ -313,6 +321,10 @@ func (v *virtioFsBackend) createAbstractNode(parent *fsNode, name string, entry 
 		if mt := entry.Dir.ModTime(); !mt.IsZero() {
 			modTime = mt
 		}
+		// Check if the directory provides ownership info
+		if owner, ok := entry.Dir.(AbstractOwner); ok {
+			node.uid, node.gid = owner.Owner()
+		}
 	} else if entry.File != nil {
 		node.abstractFile = entry.File
 		size, mode := entry.File.Stat()
@@ -320,6 +332,10 @@ func (v *virtioFsBackend) createAbstractNode(parent *fsNode, name string, entry 
 		node.size = size
 		if mt := entry.File.ModTime(); !mt.IsZero() {
 			modTime = mt
+		}
+		// Check if the file provides ownership info
+		if owner, ok := entry.File.(AbstractOwner); ok {
+			node.uid, node.gid = owner.Owner()
 		}
 	} else {
 		return nil, -int32(linux.ENOENT)
@@ -1013,11 +1029,11 @@ func (v *virtioFsBackend) Rmdir(parent uint64, name string) int32 {
 	return 0
 }
 
-func (v *virtioFsBackend) SetAttr(nodeID uint64, size *uint64, mode *uint32) int32 {
+func (v *virtioFsBackend) SetAttr(nodeID uint64, size *uint64, mode *uint32, uid *uint32, gid *uint32) int32 {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	if size == nil && mode == nil {
+	if size == nil && mode == nil && uid == nil && gid == nil {
 		return 0
 	}
 	v.ensureRoot()
@@ -1035,6 +1051,14 @@ func (v *virtioFsBackend) SetAttr(nodeID uint64, size *uint64, mode *uint32) int
 		oldType := n.mode &^ 0777
 		newPerm := fs.FileMode(*mode) & 0777
 		n.mode = oldType | newPerm
+		n.modTime = time.Now()
+	}
+	if uid != nil {
+		n.uid = *uid
+		n.modTime = time.Now()
+	}
+	if gid != nil {
+		n.gid = *gid
 		n.modTime = time.Now()
 	}
 	return 0

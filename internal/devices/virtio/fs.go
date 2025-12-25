@@ -358,7 +358,7 @@ type fsRemoveBackend interface {
 }
 
 type fsSetattrBackend interface {
-	SetAttr(nodeID uint64, size *uint64, mode *uint32) int32
+	SetAttr(nodeID uint64, size *uint64, mode *uint32, uid *uint32, gid *uint32) int32
 }
 
 type fsLseekBackend interface {
@@ -1247,8 +1247,11 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			return 0, fmt.Errorf("FUSE_SETATTR too short")
 		}
 		valid := binary.LittleEndian.Uint32(req[40:44])
-		const fattrSize = 1 << 3
+		// FUSE attribute valid flags
 		const fattrMode = 1 << 0
+		const fattrUid = 1 << 1
+		const fattrGid = 1 << 2
+		const fattrSize = 1 << 3
 		var sizeVal *uint64
 		if valid&fattrSize != 0 {
 			val := binary.LittleEndian.Uint64(req[56:64])
@@ -1269,16 +1272,35 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			// offset 100: mtimensec (uint32)
 			// offset 104: ctimensec (uint32)
 			// offset 108: mode (uint32)
+			// offset 112: unused4 (uint32)
+			// offset 116: uid (uint32)
+			// offset 120: gid (uint32)
 			// Mode is at offset 108 (4 bytes), so we need at least 112 bytes total
 			if len(req) >= 112 {
 				val := binary.LittleEndian.Uint32(req[108:112])
 				modeVal = &val
 			}
 		}
+		var uidVal *uint32
+		if valid&fattrUid != 0 {
+			// uid is at offset 116
+			if len(req) >= 120 {
+				val := binary.LittleEndian.Uint32(req[116:120])
+				uidVal = &val
+			}
+		}
+		var gidVal *uint32
+		if valid&fattrGid != 0 {
+			// gid is at offset 120
+			if len(req) >= 124 {
+				val := binary.LittleEndian.Uint32(req[120:124])
+				gidVal = &val
+			}
+		}
 		if be, ok := v.backend.(fsSetattrBackend); ok {
-			errno = be.SetAttr(in.NodeID, sizeVal, modeVal)
+			errno = be.SetAttr(in.NodeID, sizeVal, modeVal, uidVal, gidVal)
 			if errno == 0 {
-				debug.Writef("virtio-fs.dispatchFUSE op=SETATTR applied", "size=%v mode=%v", sizeVal, modeVal)
+				debug.Writef("virtio-fs.dispatchFUSE op=SETATTR applied", "size=%v mode=%v uid=%v gid=%v", sizeVal, modeVal, uidVal, gidVal)
 				attr, e := v.backend.GetAttr(in.NodeID)
 				errno = e
 				if errno == 0 {
