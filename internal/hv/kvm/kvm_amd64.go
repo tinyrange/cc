@@ -426,11 +426,73 @@ func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int) error {
 		}
 	}
 
+	// Inject KVM paravirt CPUID leaves for kvmclock support.
+	// This allows the guest to use the paravirt clock which doesn't drift under load.
+	cpuId = injectKvmParavirtCpuid(cpuId)
+
 	if err := setVCPUID(vcpuFd, cpuId); err != nil {
 		return fmt.Errorf("setting vCPU ID: %w", err)
 	}
 
 	return nil
+}
+
+// injectKvmParavirtCpuid adds or updates the KVM paravirt CPUID leaves (0x40000000, 0x40000001)
+// to enable kvmclock support in the guest kernel.
+func injectKvmParavirtCpuid(cpuId *kvmCPUID2) *kvmCPUID2 {
+	entries := unsafe.Slice((*kvmCPUIDEntry2)(unsafe.Pointer(uintptr(unsafe.Pointer(cpuId))+unsafe.Sizeof(*cpuId))), 255)
+
+	// Track indices of existing KVM leaves
+	leaf0Index := -1
+	leaf1Index := -1
+
+	for i := 0; i < int(cpuId.Nr); i++ {
+		switch entries[i].Function {
+		case 0x40000000:
+			leaf0Index = i
+		case 0x40000001:
+			leaf1Index = i
+		}
+	}
+
+	// KVM signature: "KVMKVMKVM\0\0\0" encoded as EBX, ECX, EDX
+	// Each 4-byte chunk is stored as a little-endian uint32:
+	// "KVMK" → K(0x4B) V(0x56) M(0x4D) K(0x4B) → 0x4B4D564B
+	// "VMKV" → V(0x56) M(0x4D) K(0x4B) V(0x56) → 0x564B4D56
+	// "M\0\0\0" → M(0x4D) 0 0 0 → 0x0000004D
+	const (
+		kvmSigEbx = 0x4b4d564b // "KVMK"
+		kvmSigEcx = 0x564b4d56 // "VMKV"
+		kvmSigEdx = 0x0000004d // "M\0\0\0"
+	)
+
+	// Add or update leaf 0x40000000 (KVM signature)
+	if leaf0Index < 0 {
+		leaf0Index = int(cpuId.Nr)
+		cpuId.Nr++
+	}
+	entries[leaf0Index] = kvmCPUIDEntry2{
+		Function: 0x40000000,
+		Eax:      0x40000001, // max supported KVM leaf
+		Ebx:      kvmSigEbx,
+		Ecx:      kvmSigEcx,
+		Edx:      kvmSigEdx,
+	}
+
+	// Add or update leaf 0x40000001 (KVM features)
+	if leaf1Index < 0 {
+		leaf1Index = int(cpuId.Nr)
+		cpuId.Nr++
+	}
+	entries[leaf1Index] = kvmCPUIDEntry2{
+		Function: 0x40000001,
+		Eax:      kvmFeatureClockSource | kvmFeatureClockSource2 | kvmFeatureClockSourceStable,
+		Ebx:      0,
+		Ecx:      0,
+		Edx:      0,
+	}
+
+	return cpuId
 }
 
 func (*hypervisor) Architecture() hv.CpuArchitecture {

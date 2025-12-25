@@ -30,6 +30,17 @@ const (
 	msrGsBase          = 0xc0000101
 	msrKernelGsBase    = 0xc0000102
 	msrTscAux          = 0xc0000103
+
+	// KVM paravirt clock MSRs
+	msrKvmWallClockNew  = 0x4b564d00
+	msrKvmSystemTimeNew = 0x4b564d01
+)
+
+// KVM paravirt CPUID feature bits (leaf 0x40000001 EAX)
+const (
+	kvmFeatureClockSource       = 1 << 0  // KVM_FEATURE_CLOCKSOURCE
+	kvmFeatureClockSource2      = 1 << 3  // KVM_FEATURE_CLOCKSOURCE2
+	kvmFeatureClockSourceStable = 1 << 24 // KVM_FEATURE_CLOCKSOURCE_STABLE_BIT
 )
 
 var snapshotMsrWhitelist = []uint32{
@@ -46,6 +57,8 @@ var snapshotMsrWhitelist = []uint32{
 	msrGsBase,
 	msrKernelGsBase,
 	msrTscAux,
+	msrKvmWallClockNew,
+	msrKvmSystemTimeNew,
 }
 
 func (h *hypervisor) snapshotMSRs() ([]uint32, error) {
