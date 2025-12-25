@@ -236,6 +236,8 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	// clear immediate_exit in case it was set
 	run.immediate_exit = 0
 
+	debug.Writef("kvm-amd64.Run run", "vCPU %d running", v.id)
+
 	// keep trying to run the vCPU until it exits or an error occurs
 	for {
 		_, err := ioctl(uintptr(v.fd), uint64(kvmRun), 0)
@@ -255,12 +257,7 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 
 	reason := kvmExitReason(run.exit_reason)
 
-	debug.Writef(
-		"kvm_amd64",
-		"vCPU %d exited with reason %s",
-		v.id,
-		reason,
-	)
+	debug.Writef("kvm-amd64.Run exit", "vCPU %d exited with reason %s", v.id, reason)
 
 	switch reason {
 	case kvmExitInternalError:
@@ -281,22 +278,13 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		eoiData := (*kvmExitIoapicEoiData)(unsafe.Pointer(&run.anon0[0]))
 		return v.handleIoapicEoi(eoiData)
 	case kvmExitShutdown:
-		debug.Writef(
-			"kvm_amd64",
-			"vCPU %d exited with shutdown reason",
-			v.id,
-		)
+		debug.Writef("kvm-amd64.Run shutdown", "vCPU %d exited with shutdown reason", v.id)
 
 		return hv.ErrVMHalted
 	case kvmExitSystemEvent:
 		system := (*kvmSystemEvent)(unsafe.Pointer(&run.anon0[0]))
 
-		debug.Writef(
-			"kvm_amd64",
-			"vCPU %d exited with system event %d",
-			v.id,
-			system.typ,
-		)
+		debug.Writef("kvm-amd64.Run system event", "vCPU %d exited with system event %d", v.id, system.typ)
 
 		if system.typ == uint32(kvmSystemEventShutdown) {
 			return hv.ErrVMHalted
@@ -315,11 +303,7 @@ func (v *virtualCPU) handleIO(ioData *kvmExitIoData) error {
 	v.trace(fmt.Sprintf("handleIO port=0x%04x size=%d count=%d direction=%d data=% x",
 		ioData.port, ioData.size, ioData.count, ioData.direction, data))
 
-	debug.Writef(
-		fmt.Sprintf("kvm_amd64_io_0x%04x", ioData.port),
-		"handleIO port=0x%04x size=%d count=%d direction=%d data=% x",
-		ioData.port, ioData.size, ioData.count, ioData.direction, data,
-	)
+	debug.Writef("kvm-amd64.handleIO", "handleIO port=0x%04x size=%d count=%d direction=%d data=% x", ioData.port, ioData.size, ioData.count, ioData.direction, data)
 
 	cs, err := v.vm.ensureChipset()
 	if err != nil {
@@ -342,11 +326,7 @@ func (v *virtualCPU) handleIO(ioData *kvmExitIoData) error {
 func (v *virtualCPU) handleMMIO(mmioData *kvmExitMMIOData) error {
 	v.trace(fmt.Sprintf("handleMMIO physAddr=0x%016x size=%d isWrite=%d data=% x",
 		mmioData.physAddr, mmioData.len, mmioData.isWrite, mmioData.data))
-	debug.Writef(
-		fmt.Sprintf("kvm_amd64_mmio_0x%016x", mmioData.physAddr),
-		"handleMMIO physAddr=0x%016x size=%d isWrite=%d data=% x",
-		mmioData.physAddr, mmioData.len, mmioData.isWrite, mmioData.data,
-	)
+	debug.Writef("kvm-amd64.handleMMIO", "handleMMIO physAddr=0x%016x size=%d isWrite=%d data=% x", mmioData.physAddr, mmioData.len, mmioData.isWrite, mmioData.data)
 
 	cs, err := v.vm.ensureChipset()
 	if err != nil {
@@ -373,11 +353,7 @@ func (v *virtualCPU) handleMMIO(mmioData *kvmExitMMIOData) error {
 }
 
 func (v *virtualCPU) handleIoapicEoi(eoiData *kvmExitIoapicEoiData) error {
-	debug.Writef(
-		"kvm_amd64",
-		"handleIoapicEoi vector=%d",
-		eoiData.vector,
-	)
+	debug.Writef("kvm-amd64.handleIoapicEoi", "handleIoapicEoi vector=%d", eoiData.vector)
 
 	if v.vm.ioapic != nil {
 		v.vm.ioapic.HandleEOI(uint32(eoiData.vector))
@@ -386,10 +362,7 @@ func (v *virtualCPU) handleIoapicEoi(eoiData *kvmExitIoapicEoiData) error {
 }
 
 func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
-	debug.Writef(
-		"kvm_amd64",
-		"archVMInit",
-	)
+	debug.Writef("kvm-amd64.archVMInit", "archVMInit")
 
 	if err := setTSSAddr(vm.vmFd, 0xfffbd000); err != nil {
 		return fmt.Errorf("setting TSS addr: %w", err)
@@ -432,10 +405,7 @@ func (hv *hypervisor) archPostVCPUInit(vm *virtualMachine, config hv.VMConfig) e
 }
 
 func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int) error {
-	debug.Writef(
-		"kvm_amd64",
-		"archVCPUInit",
-	)
+	debug.Writef("kvm-amd64.archVCPUInit", "archVCPUInit")
 
 	cpuId, err := getSupportedCpuId(hv.fd)
 	if err != nil {

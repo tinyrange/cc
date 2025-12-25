@@ -44,11 +44,7 @@ func (c *Chipset) HandlePIO(port uint16, data []byte, isWrite bool) error {
 	if !ok {
 		return fmt.Errorf("chipset: no handler for I/O port 0x%04x", port)
 	}
-	debug.Writef(
-		fmt.Sprintf("chipset_io_0x%04x", port),
-		"handlePIO handler=%T port=0x%04x data=% x isWrite=%t",
-		handler, port, data, isWrite,
-	)
+	debug.Writef("chipset.HandlePIO", "handler=%T port=0x%04x data=% x isWrite=%t", handler, port, data, isWrite)
 	if isWrite {
 		return handler.WriteIOPort(port, data)
 	}
@@ -66,11 +62,7 @@ func (c *Chipset) HandleMMIO(addr uint64, data []byte, isWrite bool) error {
 		start := binding.region.Address
 		end := start + binding.region.Size
 		if addr >= start && accessEnd <= end {
-			debug.Writef(
-				fmt.Sprintf("chipset_mmio_0x%016x", addr),
-				"handleMMIO handler=%T, addr=0x%016x data=% x isWrite=%t",
-				binding.handler, addr, data, isWrite,
-			)
+			debug.Writef("chipset.HandleMMIO", "handler=%T addr=0x%016x data=% x isWrite=%t", binding.handler, addr, data, isWrite)
 			if isWrite {
 				return binding.handler.WriteMMIO(addr, data)
 			}

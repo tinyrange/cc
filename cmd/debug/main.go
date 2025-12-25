@@ -22,6 +22,7 @@ func getModTime(filename string) (time.Time, error) {
 func run() error {
 	// Flags
 	list := flag.Bool("list", false, "list all sources in the log")
+	sample := flag.Bool("sample", false, "print one record from each matched source")
 	timeRange := flag.Bool("range", false, "print the earliest and latest timestamps")
 	source := flag.String("source", "", "regex to filter sources")
 	match := flag.String("match", "", "regex to filter messages")
@@ -38,6 +39,7 @@ USAGE:
 
 FLAGS:
   -list          List all unique source names in the log, one per line
+  -sample	     Print one record from each matched source
   -range         Show earliest/latest timestamps and total duration
   -source REGEX  Only show entries where source matches regex (Go regexp syntax)
   -match REGEX   Only show entries where message matches regex (Go regexp syntax)
@@ -50,6 +52,7 @@ OUTPUT FORMAT:
 
 EXAMPLES:
   debug log.bin                          Show entries (errors if >100)
+  debug -sample log.bin                  Print one record from each matched source
   debug -tail log.bin                    Show last 100 entries
   debug -limit 0 log.bin                 Show all entries (no limit)
   debug -tail -limit 50 log.bin          Show last 50 entries
@@ -117,6 +120,17 @@ EXAMPLES:
 	if *timeRange {
 		earliest, latest := reader.TimeRange()
 		fmt.Printf("earliest: %s\nlatest:   %s\nduration: %s\n", earliest, latest, latest.Sub(earliest))
+		return nil
+	}
+
+	// Handle -sample
+	if *sample {
+		if err := reader.Sample(func(ts time.Time, kind debug.DebugKind, src string, data []byte) error {
+			fmt.Printf("%s [%s] %s\n", ts.Format(time.RFC3339Nano), src, string(data))
+			return nil
+		}); err != nil {
+			return fmt.Errorf("failed to sample log: %w", err)
+		}
 		return nil
 	}
 

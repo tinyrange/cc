@@ -1937,15 +1937,15 @@ func RunExecutable(path string) error {
 					return
 				}
 			}()
-			debug.Writef("bringup", "debug memory enabled")
+			debug.Writef("bringup-quest.RunExecutable open debug memory", "")
 		} else {
 			if err := debug.OpenFile(os.Getenv("CC_DEBUG_FILE")); err != nil {
 				return fmt.Errorf("open debug file: %w", err)
 			}
 			defer debug.Close()
-			debug.Writef("bringup", "debug file: %s", os.Getenv("CC_DEBUG_FILE"))
+			debug.Writef("bringup-quest.RunExecutable open debug file", "filename=%s", os.Getenv("CC_DEBUG_FILE"))
 		}
-		debug.Writef("bringup", "debug memory enabled")
+		debug.Writef("bringup-quest.RunExecutable debug memory enabled", "")
 	}
 
 	hv, err := factory.Open()

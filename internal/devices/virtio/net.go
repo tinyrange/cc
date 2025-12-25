@@ -14,8 +14,6 @@ import (
 	"github.com/tinyrange/cc/internal/hv"
 )
 
-var netDbg = debug.WithSource("virtio-net")
-
 const (
 	NetDefaultMMIOBase = 0xd0002000
 	NetDefaultMMIOSize = 0x200
@@ -115,7 +113,7 @@ func NewNet(vm hv.VirtualMachine, base uint64, size uint64, irqLine uint32, mac 
 	if backend == nil {
 		backend = &discardNetBackend{}
 	}
-	netDbg.Writef("NewNet base=0x%x size=0x%x irqLine=%d mac=%s backendNil=%t", base, size, irqLine, mac.String(), backend == nil)
+	debug.Writef("virtio-net.NewNet", "base=0x%x size=0x%x irqLine=%d mac=%s backendNil=%t", base, size, irqLine, mac.String(), backend == nil)
 	netdev := &Net{
 		device:  nil, // Will be set below
 		base:    base,
@@ -154,7 +152,7 @@ func NewNetPCI(vm hv.VirtualMachine, host *pci.HostBridge, bus, device, function
 	if backend == nil {
 		backend = &discardNetBackend{}
 	}
-	netDbg.Writef("NewNetPCI bus=%d device=%d function=%d mac=%s backendNil=%t", bus, device, function, mac.String(), backend == nil)
+	debug.Writef("virtio-net.NewNetPCI", "bus=%d device=%d function=%d mac=%s backendNil=%t", bus, device, function, mac.String(), backend == nil)
 	netdev := &Net{
 		mac:     append(net.HardwareAddr(nil), mac...),
 		backend: backend,
@@ -195,7 +193,7 @@ func (vn *Net) ensureWorker(dev device) {
 		vn.workDev = dev
 		vn.workCh = make(chan netWorkMsg, netMaxPendingRxPackets+128)
 		vn.rxSlots = make(chan struct{}, netMaxPendingRxPackets)
-		netDbg.Writef("ensureWorker started workChCap=%d rxSlotsCap=%d", cap(vn.workCh), cap(vn.rxSlots))
+		debug.Writef("virtio-net.ensureWorker", "started workChCap=%d rxSlotsCap=%d", cap(vn.workCh), cap(vn.rxSlots))
 		go vn.workerLoop()
 	})
 }
@@ -209,7 +207,7 @@ func (vn *Net) workerLoop() {
 		var err error
 		switch msg.kind {
 		case netWorkKick:
-			netDbg.Writef("workerLoop kick queue=%d", msg.queue)
+			debug.Writef("virtio-net.workerLoop", "kick queue=%d", msg.queue)
 			switch msg.queue {
 			case netQueueTransmit:
 				err = vn.processTransmitQueue(dev, dev.queue(msg.queue))
@@ -219,7 +217,7 @@ func (vn *Net) workerLoop() {
 				err = nil
 			}
 		case netWorkRxFrame:
-			netDbg.Writef("workerLoop rxFrame len=%d pendingBefore=%d", len(msg.frame), len(vn.pendingRx))
+			debug.Writef("virtio-net.workerLoop", "rxFrame len=%d pendingBefore=%d", len(msg.frame), len(vn.pendingRx))
 			// vn.rxSlots is acquired by the sender; we release when the packet is
 			// actually removed from vn.pendingRx (after delivery or reset).
 			pendingBefore := len(vn.pendingRx)
@@ -251,11 +249,11 @@ func (vn *Net) workerLoop() {
 						"virtio-net: rx pending (waiting on guest buffers) pending=%d queueReady=%t queueSize=%d lastAvailIdx=%d availIdx=%d",
 						pendingAfter, queueReady, queueSize, lastAvail, availIdx,
 					)
-					netDbg.Writef("rx pending waitingOnGuestBuffers pending=%d queueReady=%t queueSize=%d lastAvailIdx=%d availIdx=%d", pendingAfter, queueReady, queueSize, lastAvail, availIdx)
+					debug.Writef("virtio-net.rx pending waitingOnGuestBuffers", "pending=%d queueReady=%t queueSize=%d lastAvailIdx=%d availIdx=%d", pendingAfter, queueReady, queueSize, lastAvail, availIdx)
 				}
 			}
 		case netWorkReset:
-			netDbg.Writef("workerLoop reset pending=%d", len(vn.pendingRx))
+			debug.Writef("virtio-net.workerLoop", "reset pending=%d", len(vn.pendingRx))
 			// Clear pending RX and release backpressure tokens.
 			for range vn.pendingRx {
 				select {
@@ -279,7 +277,7 @@ func (vn *Net) Init(vm hv.VirtualMachine) error {
 	if mmio, ok := vn.device.(*mmioDevice); ok && vm != nil {
 		mmio.vm = vm
 	}
-	netDbg.Writef("Init")
+	debug.Writef("virtio-net.Init", "done")
 	return nil
 }
 
@@ -320,7 +318,7 @@ func (vn *Net) QueueMaxSize(int) uint16 {
 
 func (vn *Net) OnReset(dev device) {
 	vn.ensureWorker(dev)
-	netDbg.Writef("OnReset linkUp->true")
+	debug.Writef("virtio-net.OnReset", "linkUp->true")
 	done := make(chan error, 1)
 	vn.workCh <- netWorkMsg{kind: netWorkReset, dev: dev, resp: done}
 	_ = <-done
@@ -329,7 +327,7 @@ func (vn *Net) OnReset(dev device) {
 
 func (vn *Net) OnQueueNotify(dev device, queue int) error {
 	vn.ensureWorker(dev)
-	netDbg.Writef("OnQueueNotify queue=%d", queue)
+	debug.Writef("virtio-net.OnQueueNotify", "queue=%d", queue)
 	done := make(chan error, 1)
 	vn.workCh <- netWorkMsg{kind: netWorkKick, queue: queue, dev: dev, resp: done}
 	return <-done
@@ -370,14 +368,14 @@ func (vn *Net) WriteConfig(device, uint64, uint32) (bool, error) {
 
 func (vn *Net) EnqueueRxPacket(packet []byte) error {
 	vn.ensureWorker(vn.device)
-	netDbg.Writef("EnqueueRxPacket len=%d", len(packet))
+	debug.Writef("virtio-net.EnqueueRxPacket", "len=%d", len(packet))
 
 	// Backpressure: block when too many packets are queued awaiting RX buffers.
 	select {
 	case vn.rxSlots <- struct{}{}:
 	default:
 		log.Printf("virtio-net: rxSlots full (slots=%d)", len(vn.rxSlots))
-		netDbg.Writef("EnqueueRxPacket rxSlots full slots=%d cap=%d", len(vn.rxSlots), cap(vn.rxSlots))
+		debug.Writef("virtio-net.EnqueueRxPacket full", "slots=%d cap=%d", len(vn.rxSlots), cap(vn.rxSlots))
 		vn.rxSlots <- struct{}{}
 	}
 
@@ -400,39 +398,39 @@ func (vn *Net) shouldTriggerInterrupt(dev device, q *queue, oldUsedIdx, newUsedI
 		usedEventOffset := q.availAddr + 4 + uint64(q.size)*2
 		raw, err := dev.readGuest(usedEventOffset, 2)
 		if err != nil || len(raw) < 2 {
-			netDbg.Writef("shouldTriggerInterrupt eventIdx readGuest off=0x%x err=%v len=%d -> true", usedEventOffset, err, len(raw))
+			debug.Writef("virtio-net.shouldTriggerInterrupt eventIdx readGuest", "off=0x%x err=%v len=%d -> true", usedEventOffset, err, len(raw))
 			// Malformed ring, best-effort wakeup.
 			return true
 		}
 		usedEvent := binary.LittleEndian.Uint16(raw[:2])
 		need := vringNeedEvent(usedEvent, newUsedIdx, oldUsedIdx)
-		netDbg.Writef("shouldTriggerInterrupt eventIdx usedEvent=%d oldUsed=%d newUsed=%d need=%t", usedEvent, oldUsedIdx, newUsedIdx, need)
+		debug.Writef("virtio-net.shouldTriggerInterrupt eventIdx", "usedEvent=%d oldUsed=%d newUsed=%d need=%t", usedEvent, oldUsedIdx, newUsedIdx, need)
 		return need
 	}
 	if suppressInterrupt {
-		netDbg.Writef("shouldTriggerInterrupt suppress oldUsed=%d newUsed=%d -> false", oldUsedIdx, newUsedIdx)
+		debug.Writef("virtio-net.shouldTriggerInterrupt suppress", "oldUsed=%d newUsed=%d -> false", oldUsedIdx, newUsedIdx)
 		return false
 	}
-	netDbg.Writef("shouldTriggerInterrupt default oldUsed=%d newUsed=%d -> true", oldUsedIdx, newUsedIdx)
+	debug.Writef("virtio-net.shouldTriggerInterrupt default", "oldUsed=%d newUsed=%d -> true", oldUsedIdx, newUsedIdx)
 	return true
 }
 
 func (vn *Net) processTransmitQueue(dev device, q *queue) error {
 	if q == nil || !q.ready || q.size == 0 {
 		if q == nil {
-			netDbg.Writef("processTransmitQueue skip q=nil")
+			debug.Writef("virtio-net.processTransmitQueue skip q=nil", "q=nil")
 		} else {
-			netDbg.Writef("processTransmitQueue skip ready=%t size=%d", q.ready, q.size)
+			debug.Writef("virtio-net.processTransmitQueue skip", "ready=%t size=%d", q.ready, q.size)
 		}
 		return nil
 	}
 	flags, availIdx, err := dev.readAvailState(q)
 	if err != nil {
-		netDbg.Writef("processTransmitQueue readAvailState err=%v", err)
+		debug.Writef("virtio-net.processTransmitQueue readAvailState", "err=%v", err)
 		return err
 	}
 	suppressInterrupt := flags&virtqAvailFNoInterrupt != 0
-	netDbg.Writef("processTransmitQueue availIdx=%d lastAvailIdx=%d flags=0x%x suppressInterrupt=%t", availIdx, q.lastAvailIdx, flags, suppressInterrupt)
+	debug.Writef("virtio-net.processTransmitQueue start", "availIdx=%d lastAvailIdx=%d flags=0x%x suppressInterrupt=%t", availIdx, q.lastAvailIdx, flags, suppressInterrupt)
 
 	oldUsedIdx := q.usedIdx
 	var processed uint16
@@ -441,38 +439,38 @@ func (vn *Net) processTransmitQueue(dev device, q *queue) error {
 		ringIndex := q.lastAvailIdx % q.size
 		head, err := dev.readAvailEntry(q, ringIndex)
 		if err != nil {
-			netDbg.Writef("processTransmitQueue readAvailEntry ringIndex=%d err=%v", ringIndex, err)
+			debug.Writef("virtio-net.processTransmitQueue readAvailEntry", "ringIndex=%d err=%v", ringIndex, err)
 			return err
 		}
-		netDbg.Writef("processTransmitQueue head=%d ringIndex=%d", head, ringIndex)
+		debug.Writef("virtio-net.processTransmitQueue", "head=%d ringIndex=%d", head, ringIndex)
 		packet, headerBytes, err := vn.collectTxDescriptorChain(dev, q, head)
 		if err != nil {
-			netDbg.Writef("processTransmitQueue collectTxDescriptorChain head=%d err=%v", head, err)
+			debug.Writef("virtio-net.processTransmitQueue collectTxDescriptorChain", "head=%d err=%v", head, err)
 			return err
 		}
 		release := vn.makeTxRelease(packet)
 		hdr, err := parseVirtioNetHeader(headerBytes)
 		vn.putTxHeaderBuffer(headerBytes)
 		if err != nil {
-			netDbg.Writef("processTransmitQueue parseVirtioNetHeader err=%v", err)
+			debug.Writef("virtio-net.processTransmitQueue parseVirtioNetHeader", "err=%v", err)
 			release()
 			return err
 		}
-		netDbg.Writef("processTransmitQueue tx hdr flags=0x%x gsoType=%d hdrLen=%d gsoSize=%d csumStart=%d csumOffset=%d numBuffers=%d pktLen=%d",
+		debug.Writef("virtio-net.processTransmitQueue", "tx hdr flags=0x%x gsoType=%d hdrLen=%d gsoSize=%d csumStart=%d csumOffset=%d numBuffers=%d pktLen=%d",
 			hdr.flags, hdr.gsoType, hdr.hdrLen, hdr.gsoSize, hdr.csumStart, hdr.csumOffset, hdr.numBuffers, len(packet))
 		// slog.Info("virtio-net: preparing tx packet", "hdr", hdr, "packet", packet)
 		if err := vn.prepareTxPacket(hdr, packet); err != nil {
-			netDbg.Writef("processTransmitQueue prepareTxPacket err=%v", err)
+			debug.Writef("virtio-net.processTransmitQueue prepareTxPacket", "err=%v", err)
 			release()
 			return err
 		}
 		if err := vn.backend.HandleTx(packet, release); err != nil {
-			netDbg.Writef("processTransmitQueue backend.HandleTx err=%v", err)
+			debug.Writef("virtio-net.processTransmitQueue backend.HandleTx", "err=%v", err)
 			release()
 			return err
 		}
 		if err := dev.recordUsedElement(q, head, 0); err != nil {
-			netDbg.Writef("processTransmitQueue recordUsedElement head=%d err=%v", head, err)
+			debug.Writef("virtio-net.processTransmitQueue recordUsedElement", "head=%d err=%v", head, err)
 			release()
 			return err
 		}
@@ -486,14 +484,14 @@ func (vn *Net) processTransmitQueue(dev device, q *queue) error {
 
 	if dev.eventIdxEnabled() {
 		if err := dev.setAvailEvent(q, q.lastAvailIdx); err != nil {
-			netDbg.Writef("processTransmitQueue setAvailEvent err=%v", err)
+			debug.Writef("virtio-net.processTransmitQueue setAvailEvent", "err=%v", err)
 			return err
 		}
 	}
 
 	newUsedIdx := q.usedIdx
 	if vn.shouldTriggerInterrupt(dev, q, oldUsedIdx, newUsedIdx, suppressInterrupt) {
-		netDbg.Writef("processTransmitQueue raiseInterrupt bit=0x%x processed=%d", netInterruptBit, processed)
+		debug.Writef("virtio-net.processTransmitQueue raiseInterrupt", "bit=0x%x processed=%d", netInterruptBit, processed)
 		dev.raiseInterrupt(netInterruptBit)
 	}
 
@@ -514,7 +512,7 @@ func (vn *Net) processReceiveQueueLocked(dev device, q *queue) error {
 				queueReady = q.ready
 			}
 			slog.Debug("virtio-net: rx queue not ready", "pending", len(vn.pendingRx), "ready", queueReady, "size", queueSize)
-			netDbg.Writef("processReceiveQueueLocked notReady pending=%d ready=%t size=%d", len(vn.pendingRx), queueReady, queueSize)
+			debug.Writef("virtio-net.processReceiveQueueLocked notReady", "pending=%d ready=%t size=%d", len(vn.pendingRx), queueReady, queueSize)
 		}
 		return nil
 	}
@@ -524,12 +522,12 @@ func (vn *Net) processReceiveQueueLocked(dev device, q *queue) error {
 
 	flags, availIdx, err := dev.readAvailState(q)
 	if err != nil {
-		netDbg.Writef("processReceiveQueueLocked readAvailState err=%v", err)
+		debug.Writef("virtio-net.processReceiveQueueLocked readAvailState", "err=%v", err)
 		return err
 	}
 	suppressInterrupt := flags&virtqAvailFNoInterrupt != 0
 	oldUsedIdx := q.usedIdx
-	netDbg.Writef("processReceiveQueueLocked pending=%d availIdx=%d lastAvailIdx=%d flags=0x%x suppressInterrupt=%t", len(vn.pendingRx), availIdx, q.lastAvailIdx, flags, suppressInterrupt)
+	debug.Writef("virtio-net.processReceiveQueueLocked", "pending=%d availIdx=%d lastAvailIdx=%d flags=0x%x suppressInterrupt=%t", len(vn.pendingRx), availIdx, q.lastAvailIdx, flags, suppressInterrupt)
 
 	var packetIndex int
 	var processed uint16
@@ -540,7 +538,7 @@ func (vn *Net) processReceiveQueueLocked(dev device, q *queue) error {
 			"pending", len(vn.pendingRx),
 			"lastAvailIdx", q.lastAvailIdx,
 			"availIdx", availIdx)
-		netDbg.Writef("processReceiveQueueLocked noGuestBuffers pending=%d lastAvailIdx=%d availIdx=%d", len(vn.pendingRx), q.lastAvailIdx, availIdx)
+		debug.Writef("virtio-net.processReceiveQueueLocked noGuestBuffers", "pending=%d lastAvailIdx=%d availIdx=%d", len(vn.pendingRx), q.lastAvailIdx, availIdx)
 	}
 
 	for q.lastAvailIdx != availIdx && packetIndex < len(vn.pendingRx) {
@@ -549,22 +547,22 @@ func (vn *Net) processReceiveQueueLocked(dev device, q *queue) error {
 		ringIndex := q.lastAvailIdx % q.size
 		head, err := dev.readAvailEntry(q, ringIndex)
 		if err != nil {
-			netDbg.Writef("processReceiveQueueLocked readAvailEntry ringIndex=%d err=%v", ringIndex, err)
+			debug.Writef("virtio-net.processReceiveQueueLocked readAvailEntry", "ringIndex=%d err=%v", ringIndex, err)
 			return err
 		}
-		netDbg.Writef("processReceiveQueueLocked fill head=%d ringIndex=%d pktLen=%d", head, ringIndex, len(packet))
+		debug.Writef("virtio-net.processReceiveQueueLocked fill", "head=%d ringIndex=%d pktLen=%d", head, ringIndex, len(packet))
 
 		written, consumed, err := vn.fillRxDescriptorChain(dev, q, head, packet)
 		if err != nil {
-			netDbg.Writef("processReceiveQueueLocked fillRxDescriptorChain head=%d err=%v", head, err)
+			debug.Writef("virtio-net.processReceiveQueueLocked fillRxDescriptorChain", "head=%d err=%v", head, err)
 			return err
 		}
-		netDbg.Writef("processReceiveQueueLocked fillRxDescriptorChain head=%d written=%d consumed=%t", head, written, consumed)
+		debug.Writef("virtio-net.processReceiveQueueLocked fillRxDescriptorChain", "head=%d written=%d consumed=%t", head, written, consumed)
 		if !consumed {
 			break
 		}
 		if err := dev.recordUsedElement(q, head, written); err != nil {
-			netDbg.Writef("processReceiveQueueLocked recordUsedElement head=%d err=%v", head, err)
+			debug.Writef("virtio-net.processReceiveQueueLocked recordUsedElement", "head=%d err=%v", head, err)
 			return err
 		}
 		packetIndex++
@@ -593,14 +591,14 @@ func (vn *Net) processReceiveQueueLocked(dev device, q *queue) error {
 
 	if dev.eventIdxEnabled() {
 		if err := dev.setAvailEvent(q, q.lastAvailIdx); err != nil {
-			netDbg.Writef("processReceiveQueueLocked setAvailEvent err=%v", err)
+			debug.Writef("virtio-net.processReceiveQueueLocked setAvailEvent", "err=%v", err)
 			return err
 		}
 	}
 
 	newUsedIdx := q.usedIdx
 	if vn.shouldTriggerInterrupt(dev, q, oldUsedIdx, newUsedIdx, suppressInterrupt) {
-		netDbg.Writef("processReceiveQueueLocked raiseInterrupt bit=0x%x processed=%d", netInterruptBit, processed)
+		debug.Writef("virtio-net.processReceiveQueueLocked raiseInterrupt", "bit=0x%x processed=%d", netInterruptBit, processed)
 		dev.raiseInterrupt(netInterruptBit)
 	}
 	return nil
@@ -622,11 +620,11 @@ func (vn *Net) collectTxDescriptorChain(dev device, q *queue, head uint16) ([]by
 	for i := uint16(0); i < q.size; i++ {
 		desc, err := dev.readDescriptor(q, index)
 		if err != nil {
-			netDbg.Writef("collectTxDescriptorChain head=%d idx=%d err=%v", head, index, err)
+			debug.Writef("virtio-net.collectTxDescriptorChain", "head=%d idx=%d err=%v", head, index, err)
 			vn.putTxHeaderBuffer(headerBytes)
 			return nil, nil, err
 		}
-		netDbg.Writef("collectTxDescriptorChain head=%d idx=%d addr=0x%x len=%d flags=0x%x next=%d", head, index, desc.addr, desc.length, desc.flags, desc.next)
+		debug.Writef("virtio-net.collectTxDescriptorChain", "head=%d idx=%d addr=0x%x len=%d flags=0x%x next=%d", head, index, desc.addr, desc.length, desc.flags, desc.next)
 		addr := desc.addr
 		length := desc.length
 		flags := desc.flags
@@ -662,7 +660,7 @@ func (vn *Net) collectTxDescriptorChain(dev device, q *queue, head uint16) ([]by
 
 		if flags&virtqDescFNext == 0 {
 			if headerRemaining > 0 {
-				netDbg.Writef("collectTxDescriptorChain head=%d truncated headerRemaining=%d", head, headerRemaining)
+				debug.Writef("virtio-net.collectTxDescriptorChain truncated", "head=%d truncated headerRemaining=%d", head, headerRemaining)
 				return nil, nil, fmt.Errorf("net tx header truncated in descriptor %d", index)
 			}
 			break
@@ -671,11 +669,11 @@ func (vn *Net) collectTxDescriptorChain(dev device, q *queue, head uint16) ([]by
 	}
 
 	if headerRemaining > 0 {
-		netDbg.Writef("collectTxDescriptorChain head=%d chain shorter than header headerRemaining=%d", head, headerRemaining)
+		debug.Writef("virtio-net.collectTxDescriptorChain shorter", "head=%d chain shorter than header headerRemaining=%d", head, headerRemaining)
 		vn.putTxHeaderBuffer(headerBytes)
 		return nil, nil, fmt.Errorf("net tx descriptor chain shorter than header")
 	}
-	netDbg.Writef("collectTxDescriptorChain head=%d totalPayload=%d headerLen=%d segs=%d", head, totalPayload, len(headerBytes), len(segments))
+	debug.Writef("virtio-net.collectTxDescriptorChain total", "head=%d totalPayload=%d headerLen=%d segs=%d", head, totalPayload, len(headerBytes), len(segments))
 
 	var packet []byte
 	if totalPayload == 0 {
@@ -793,7 +791,7 @@ func (vn *Net) prepareTxPacket(hdr virtioNetHeader, packet []byte) error {
 		return fmt.Errorf("unsupported virtio-net gso type %d", hdr.gsoType)
 	}
 	if hdr.flags&virtioNetHdrFNeedsCsum != 0 {
-		netDbg.Writef("prepareTxPacket applyChecksum csumStart=%d csumOffset=%d", hdr.csumStart, hdr.csumOffset)
+		debug.Writef("virtio-net.prepareTxPacket applyChecksum", "csumStart=%d csumOffset=%d", hdr.csumStart, hdr.csumOffset)
 		if err := applyChecksum(hdr, packet); err != nil {
 			return err
 		}
@@ -818,7 +816,7 @@ func applyChecksum(hdr virtioNetHeader, packet []byte) error {
 		return fmt.Errorf("virtio-net packet too small for ethernet header: %d", len(packet))
 	}
 	ethType := binary.BigEndian.Uint16(packet[12:14])
-	netDbg.Writef("applyChecksum ethType=0x%04x packetLen=%d csStart=%d csOffset=%d", ethType, len(packet), csStart, csOffset)
+	debug.Writef("virtio-net.applyChecksum", "ethType=0x%04x packetLen=%d csStart=%d csOffset=%d", ethType, len(packet), csStart, csOffset)
 
 	var sum uint32
 	switch ethType {
@@ -893,10 +891,10 @@ func (vn *Net) fillRxDescriptorChain(dev device, q *queue, head uint16, packet [
 	for i := uint16(0); i < q.size; i++ {
 		desc, err := dev.readDescriptor(q, index)
 		if err != nil {
-			netDbg.Writef("fillRxDescriptorChain head=%d idx=%d err=%v", head, index, err)
+			debug.Writef("virtio-net.fillRxDescriptorChain", "head=%d idx=%d err=%v", head, index, err)
 			return 0, false, err
 		}
-		netDbg.Writef("fillRxDescriptorChain head=%d idx=%d addr=0x%x len=%d flags=0x%x next=%d", head, index, desc.addr, desc.length, desc.flags, desc.next)
+		debug.Writef("virtio-net.fillRxDescriptorChain", "head=%d idx=%d addr=0x%x len=%d flags=0x%x next=%d", head, index, desc.addr, desc.length, desc.flags, desc.next)
 		addr := desc.addr
 		length := desc.length
 		flags := desc.flags
@@ -919,7 +917,7 @@ func (vn *Net) fillRxDescriptorChain(dev device, q *queue, head uint16, packet [
 	}
 
 	if descriptors[0].length < netHeaderSize {
-		netDbg.Writef("fillRxDescriptorChain head=%d first descriptor too small len=%d", head, descriptors[0].length)
+		debug.Writef("virtio-net.fillRxDescriptorChain first", "head=%d first descriptor too small len=%d", head, descriptors[0].length)
 		return 0, false, fmt.Errorf("net rx first descriptor too small for header")
 	}
 
@@ -929,10 +927,10 @@ func (vn *Net) fillRxDescriptorChain(dev device, q *queue, head uint16, packet [
 		available += uint64(d.length)
 	}
 	if available < uint64(required) {
-		netDbg.Writef("fillRxDescriptorChain head=%d insufficient buffers available=%d required=%d -> notConsumed", head, available, required)
+		debug.Writef("virtio-net.fillRxDescriptorChain insufficient", "head=%d insufficient buffers available=%d required=%d -> notConsumed", head, available, required)
 		return 0, false, nil
 	}
-	netDbg.Writef("fillRxDescriptorChain head=%d descriptors=%d available=%d required=%d", head, len(descriptors), available, required)
+	debug.Writef("virtio-net.fillRxDescriptorChain total", "head=%d descriptors=%d available=%d required=%d", head, len(descriptors), available, required)
 
 	bytesRemaining := packet
 	buffersUsed := uint16(1)
@@ -991,7 +989,7 @@ func (vn *Net) fillRxDescriptorChain(dev device, q *queue, head uint16, packet [
 	}
 
 	if len(bytesRemaining) != 0 {
-		netDbg.Writef("fillRxDescriptorChain head=%d bytesRemaining=%d", head, len(bytesRemaining))
+		debug.Writef("virtio-net.fillRxDescriptorChain bytesRemaining", "head=%d bytesRemaining=%d", head, len(bytesRemaining))
 		return 0, false, fmt.Errorf("net rx bytes remaining after copy")
 	}
 
@@ -1005,11 +1003,11 @@ func (vn *Net) fillRxDescriptorChain(dev device, q *queue, head uint16, packet [
 	}
 	if firstBytesWritten > 0 {
 		if err := dev.writeGuest(firstDescAddr, firstDescData[:firstBytesWritten]); err != nil {
-			netDbg.Writef("fillRxDescriptorChain head=%d writeGuest first desc err=%v", head, err)
+			debug.Writef("virtio-net.fillRxDescriptorChain writeGuest first", "head=%d writeGuest first desc err=%v", head, err)
 			return 0, false, fmt.Errorf("write guest memory for rx descriptor %d: %w", 0, err)
 		}
 	}
-	netDbg.Writef("fillRxDescriptorChain head=%d done required=%d buffersUsed=%d", head, required, buffersUsed)
+	debug.Writef("virtio-net.fillRxDescriptorChain done", "head=%d done required=%d buffersUsed=%d", head, required, buffersUsed)
 
 	return required, true, nil
 }

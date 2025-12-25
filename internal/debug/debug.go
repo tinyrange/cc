@@ -199,14 +199,17 @@ func writeBytes(kind DebugKind, source string, data []byte) {
 	}
 }
 
+// source should be unique for every call site.
 func WriteBytes(source string, data []byte) {
 	writeBytes(DebugKindBytes, source, data)
 }
 
+// source should be unique for every call site.
 func Write(source string, data string) {
 	writeBytes(DebugKindString, source, []byte(data))
 }
 
+// source should be unique for every call site.
 func Writef(source string, format string, args ...any) {
 	writeBytes(DebugKindString, source, fmt.Appendf(nil, format, args...))
 }
@@ -215,26 +218,6 @@ type Debug interface {
 	WriteBytes(data []byte)
 	Write(data string)
 	Writef(format string, args ...any)
-}
-
-type debugImpl struct {
-	source string
-}
-
-func (d *debugImpl) WriteBytes(data []byte) {
-	writeBytes(DebugKindBytes, d.source, data)
-}
-
-func (d *debugImpl) Write(data string) {
-	writeBytes(DebugKindString, d.source, []byte(data))
-}
-
-func (d *debugImpl) Writef(format string, args ...any) {
-	writeBytes(DebugKindString, d.source, fmt.Appendf(nil, format, args...))
-}
-
-func WithSource(source string) Debug {
-	return &debugImpl{source: source}
 }
 
 type SearchOptions struct {
@@ -260,6 +243,8 @@ type Reader interface {
 
 	// Return the earliest and latest timestamps in the log.
 	TimeRange() (time.Time, time.Time)
+
+	Sample(fn func(ts time.Time, kind DebugKind, source string, data []byte) error) error
 
 	// Guaranteed to iterate over all entries in the order they were written.
 	Each(fn func(ts time.Time, kind DebugKind, source string, data []byte) error) error
@@ -504,6 +489,36 @@ func (r *reader) EachSource(source string, fn func(ts time.Time, kind DebugKind,
 	return r.Search(SearchOptions{Sources: []string{source}}, func(ts time.Time, kind DebugKind, _ string, data []byte) error {
 		return fn(ts, kind, data)
 	})
+}
+
+func (r *reader) Sample(fn func(ts time.Time, kind DebugKind, source string, data []byte) error) error {
+	for srcHash, sourceName := range r.sourceList {
+		// get the first index entry for this source
+		idxEntries := r.index[srcHash]
+		if len(idxEntries) == 0 {
+			continue
+		}
+		idxEntry := idxEntries[0]
+
+		var headerBytes [16]byte
+		if _, err := r.r.ReadAt(headerBytes[:], idxEntry.Offset); err != nil {
+			return err
+		}
+		kind, sourceLength, dataLength := decodeHeader(headerBytes)
+		if kind == DebugKindInvalid {
+			return fmt.Errorf("invalid header")
+		}
+
+		data := make([]byte, dataLength)
+		if _, err := r.r.ReadAt(data, idxEntry.Offset+16+int64(sourceLength)); err != nil {
+			return err
+		}
+
+		if err := fn(time.Unix(0, idxEntry.UnixNano), kind, sourceName, data); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (r *reader) Sources() []string {

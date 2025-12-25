@@ -356,11 +356,7 @@ func (vc *Console) consumeDescriptorChain(dev device, q *queue, head uint16) (ui
 			if err != nil {
 				return total, fmt.Errorf("write console: %w", err)
 			}
-			debug.Writef(
-				"virtio-console",
-				"consumeDescriptorChain wrote data=% x",
-				data,
-			)
+			debug.Writef("virtio-console consumeDescriptorChain wrote", "data=% x", data)
 			total += desc.length
 		}
 		if desc.flags&virtqDescFNext == 0 {
@@ -485,18 +481,10 @@ func (vc *Console) enqueueInput(data []byte) {
 			slog.Error("virtio-console: process receive queue", "err", err)
 		}
 	} else {
-		debug.Writef(
-			"virtio-console",
-			"enqueueInput drop(no device) data=% x",
-			data,
-		)
+		debug.Writef("virtio-console.enqueueInput drop", "data=% x", data)
 	}
 
-	debug.Writef(
-		"virtio-console",
-		"enqueueInput enqueued data=% x",
-		data,
-	)
+	debug.Writef("virtio-console.enqueueInput enqueued", "data=% x", data)
 }
 
 func (vc *Console) readInput() {
