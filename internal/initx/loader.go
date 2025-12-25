@@ -706,6 +706,14 @@ func NewVirtualMachine(
 		}
 	}
 
+	// Add GPU and Input devices if GPU is enabled
+	if ret.gpuEnabled {
+		ret.loader.Devices = append(ret.loader.Devices,
+			virtio.GPUTemplate{Arch: h.Architecture()},
+			virtio.InputTemplate{Arch: h.Architecture()},
+		)
+	}
+
 	var err error
 	ret.vm, err = h.NewVirtualMachine(ret.loader)
 	if err != nil {

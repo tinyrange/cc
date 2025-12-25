@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	GPUDefaultMMIOBase = 0xd0002000
+	GPUDefaultMMIOBase = 0xd0005000
 	GPUDefaultMMIOSize = 0x200
 	GPUDefaultIRQLine  = 12
 	armGPUDefaultIRQ   = 42
@@ -236,10 +236,12 @@ func (g *GPU) OnQueueNotify(dev device, queueIdx int) error {
 
 // ReadConfig implements deviceHandler.
 func (g *GPU) ReadConfig(dev device, offset uint64) (uint32, bool, error) {
-	if offset < VIRTIO_MMIO_CONFIG {
-		return 0, false, nil
+	// The offset may be either absolute (0x100+) or relative (0-15)
+	// depending on whether we're called directly or via deviceHandlerAdapter.
+	rel := offset
+	if offset >= VIRTIO_MMIO_CONFIG {
+		rel = offset - VIRTIO_MMIO_CONFIG
 	}
-	rel := offset - VIRTIO_MMIO_CONFIG
 	cfg := g.configBytes()
 	if int(rel) >= len(cfg) {
 		return 0, true, nil

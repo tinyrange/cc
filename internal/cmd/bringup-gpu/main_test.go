@@ -318,6 +318,19 @@ func (fb *Framebuffer) DrawText(x, y int, text string, r, g, b uint8) {
 	}
 }
 
+func TestKernelLog(t *testing.T) {
+	// use syscalls to read kernel log
+	const klogSize = 1024 * 1024
+	buf := make([]byte, klogSize)
+	n, err := unix.Klogctl(unix.SYSLOG_ACTION_READ_ALL, buf)
+	if err != nil {
+		t.Fatalf("failed to read kernel log: %v", err)
+	}
+
+	logData := buf[:n]
+	t.Logf("kernel log:\n%s", logData)
+}
+
 func TestFramebufferBasic(t *testing.T) {
 	t.Logf("Testing basic framebuffer access")
 

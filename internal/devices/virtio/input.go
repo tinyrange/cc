@@ -283,10 +283,12 @@ func (i *Input) OnQueueNotify(dev device, queueIdx int) error {
 
 // ReadConfig implements deviceHandler.
 func (i *Input) ReadConfig(dev device, offset uint64) (uint32, bool, error) {
-	if offset < VIRTIO_MMIO_CONFIG {
-		return 0, false, nil
+	// The offset may be either absolute (0x100+) or relative (0-255)
+	// depending on whether we're called directly or via deviceHandlerAdapter.
+	rel := offset
+	if offset >= VIRTIO_MMIO_CONFIG {
+		rel = offset - VIRTIO_MMIO_CONFIG
 	}
-	rel := offset - VIRTIO_MMIO_CONFIG
 	cfg := i.configBytes()
 	if int(rel) >= len(cfg) {
 		return 0, true, nil
@@ -298,10 +300,12 @@ func (i *Input) ReadConfig(dev device, offset uint64) (uint32, bool, error) {
 
 // WriteConfig implements deviceHandler.
 func (i *Input) WriteConfig(dev device, offset uint64, value uint32) (bool, error) {
-	if offset < VIRTIO_MMIO_CONFIG {
-		return false, nil
+	// The offset may be either absolute (0x100+) or relative (0-255)
+	// depending on whether we're called directly or via deviceHandlerAdapter.
+	rel := offset
+	if offset >= VIRTIO_MMIO_CONFIG {
+		rel = offset - VIRTIO_MMIO_CONFIG
 	}
-	rel := offset - VIRTIO_MMIO_CONFIG
 
 	i.mu.Lock()
 	defer i.mu.Unlock()
