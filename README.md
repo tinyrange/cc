@@ -12,7 +12,7 @@ CrumbleCracker is a high performance embeddable virtualization platform designed
 
 ## Development Plan
 
-**Stage 1 of devlopment on x86_64 Linux is complete**
+**Stage 1 of development on x86_64 Linux is complete**
 
 **Stage 2 is stability and speed**
 
