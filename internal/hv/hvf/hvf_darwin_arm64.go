@@ -432,11 +432,11 @@ func (v *virtualCPU) handleDataAbort(syndrome bindings.ExceptionSyndrome, physAd
 		copy(data, tmp[:])
 
 		if err := dev.WriteMMIO(addr, data); err != nil {
-			return fmt.Errorf("hvf: failed to write MMIO: %w", err)
+			pendingError = fmt.Errorf("hvf: failed to write MMIO: %w", err)
 		}
 	} else {
 		if err := dev.ReadMMIO(addr, data); err != nil {
-			return fmt.Errorf("hvf: failed to read MMIO: %w", err)
+			pendingError = fmt.Errorf("hvf: failed to read MMIO: %w", err)
 		}
 
 		var tmp [8]byte
@@ -527,7 +527,7 @@ func (v *virtualCPU) handleMsrAccess(syndrome bindings.ExceptionSyndrome) error 
 		return err
 	}
 
-	slog.Info("ignoring MSR access", "info", info)
+	slog.Debug("ignoring MSR access", "info", info)
 
 	if info.read {
 		// write 0 to the target register

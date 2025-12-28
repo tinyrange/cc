@@ -767,7 +767,6 @@ func NewVirtualMachine(
 			return nil
 		}
 
-		// ignore this on macOS for ARM64
 		if runtime.GOOS == "darwin" && h.Architecture() == hv.ArchitectureARM64 {
 			return nil
 		}
