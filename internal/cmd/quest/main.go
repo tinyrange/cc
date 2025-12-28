@@ -310,7 +310,6 @@ func (q *bringUpQuest) runVMTask(
 		if dev == nil {
 			return fmt.Errorf("hypervisor not initialized for %s", arch)
 		}
-		defer dev.Close()
 
 		baseAddr := uint64(0)
 		if arch == hv.ArchitectureRISCV64 {
@@ -371,7 +370,6 @@ func (q *bringUpQuest) runVMTaskWithTimeout(
 		if dev == nil {
 			return fmt.Errorf("hypervisor not initialized for %s", arch)
 		}
-		defer dev.Close()
 
 		baseAddr := uint64(0)
 		if arch == hv.ArchitectureRISCV64 {
