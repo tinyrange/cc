@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"unsafe"
 
+	"github.com/tinyrange/cc/internal/debug"
 	hvpkg "github.com/tinyrange/cc/internal/hv"
 	"golang.org/x/sys/unix"
 )
@@ -29,11 +30,15 @@ var (
 
 func (hv *hypervisor) initArm64VGIC(vm *virtualMachine) error {
 	if err := hv.initArm64VGICv3(vm); err != nil {
+		debug.Writef("kvm hypervisor initArm64VGIC v3 failed", "initArm64VGICv3 failed: %v", err)
 		if errors.Is(err, errArmVGICUnsupported) {
+			debug.Writef("kvm hypervisor initArm64VGIC v2 fallback", "initArm64VGICv2 failed, falling back to v2")
 			return hv.initArm64VGICv2(vm)
 		}
 		return err
 	}
+
+	debug.Writef("kvm hypervisor initArm64VGIC v3 success", "")
 
 	return nil
 }
@@ -64,6 +69,7 @@ func (hv *hypervisor) initArm64VGICv3(vm *virtualMachine) error {
 	}
 
 	if err := createDevice(vm.vmFd, &dev); err != nil {
+		debug.Writef("kvm hypervisor initArm64VGICv3 create device failed", "create device failed: %v", err)
 		if errors.Is(err, unix.ENODEV) || errors.Is(err, unix.EOPNOTSUPP) {
 			return errArmVGICUnsupported
 		}
@@ -97,6 +103,8 @@ func (hv *hypervisor) initArm64VGICv3(vm *virtualMachine) error {
 		MaintenanceInterrupt: arm64VGICMaintenanceInterrupt,
 	}
 
+	debug.Writef("kvm hypervisor initArm64VGICv3 success", "vm.arm64GICInfo: %+v", vm.arm64GICInfo)
+
 	return nil
 }
 
@@ -107,23 +115,29 @@ func (hv *hypervisor) initArm64VGICv2(vm *virtualMachine) error {
 	}
 
 	if err := createDevice(vm.vmFd, &dev); err != nil {
+		debug.Writef("kvm hypervisor initArm64VGICv2 create device failed", "create device failed: %v", err)
 		return fmt.Errorf("kvm: create VGIC device: %w", err)
 	}
+
+	debug.Writef("kvm hypervisor initArm64VGICv2 create device success", "dev: %+v", dev)
 
 	// Store the device fd for later use (finalization)
 	vm.arm64VGICFd = int(dev.Fd)
 
 	// Set the number of IRQs
 	if err := setDeviceAttrU32(vm.arm64VGICFd, kvmDevArmVgicGrpNrIrqs, 0, arm64VGICNumIRQs); err != nil {
+		debug.Writef("kvm hypervisor initArm64VGICv2 set VGIC IRQ count failed", "set VGIC IRQ count failed: %v", err)
 		return fmt.Errorf("kvm: set VGIC IRQ count: %w", err)
 	}
 
 	// Set VGICv2 addresses via device attributes (preferred over legacy KVM_ARM_SET_DEVICE_ADDR)
 	if err := setDeviceAttrU64(vm.arm64VGICFd, kvmDevArmVgicGrpAddr, kvmVgicV2AddrTypeDist, arm64VGICDistributorBase); err != nil {
+		debug.Writef("kvm hypervisor initArm64VGICv2 set VGIC distributor address failed", "set VGIC distributor address failed: %v", err)
 		return fmt.Errorf("kvm: set VGIC distributor address: %w", err)
 	}
 
 	if err := setDeviceAttrU64(vm.arm64VGICFd, kvmDevArmVgicGrpAddr, kvmVgicV2AddrTypeCpu, arm64VGICv2CpuInterfaceBase); err != nil {
+		debug.Writef("kvm hypervisor initArm64VGICv2 set VGIC CPU interface address failed", "set VGIC CPU interface address failed: %v", err)
 		return fmt.Errorf("kvm: set VGIC CPU interface address: %w", err)
 	}
 
@@ -139,10 +153,14 @@ func (hv *hypervisor) initArm64VGICv2(vm *virtualMachine) error {
 		MaintenanceInterrupt: arm64VGICMaintenanceInterrupt,
 	}
 
+	debug.Writef("kvm hypervisor initArm64VGICv2 success", "vm.arm64GICInfo: %+v", vm.arm64GICInfo)
+
 	return nil
 }
 
 func setDeviceAttrU32(fd int, group uint32, attr uint64, value uint32) error {
+	debug.Writef("kvm hypervisor setDeviceAttrU32", "fd: %d, group: %d, attr: %d, value: %d", fd, group, attr, value)
+
 	val := value
 	devAttr := kvmDeviceAttr{
 		Group: group,
@@ -153,6 +171,8 @@ func setDeviceAttrU32(fd int, group uint32, attr uint64, value uint32) error {
 }
 
 func setDeviceAttrU64(fd int, group uint32, attr uint64, value uint64) error {
+	debug.Writef("kvm hypervisor setDeviceAttrU64", "fd: %d, group: %d, attr: %d, value: %d", fd, group, attr, value)
+
 	val := value
 	devAttr := kvmDeviceAttr{
 		Group: group,
@@ -160,12 +180,4 @@ func setDeviceAttrU64(fd int, group uint32, attr uint64, value uint64) error {
 		Addr:  uint64(uintptr(unsafe.Pointer(&val))),
 	}
 	return setDeviceAttr(fd, &devAttr)
-}
-
-func setVgicV2Addr(fd int, addrType uint64, addr uint64) error {
-	devAddr := kvmArmDeviceAddr{
-		id:   (uint64(kvmArmDeviceVgicV2) << kvmArmDeviceIdShift) | addrType,
-		addr: addr,
-	}
-	return setArmDeviceAddr(fd, &devAddr)
 }

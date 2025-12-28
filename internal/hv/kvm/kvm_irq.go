@@ -5,10 +5,13 @@ package kvm
 import (
 	"fmt"
 
+	"github.com/tinyrange/cc/internal/debug"
 	"github.com/tinyrange/cc/internal/hv"
 )
 
 func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
+	debug.Writef("kvm hypervisor SetIRQ", "irqLine: %d, level: %v", irqLine, level)
+
 	if v == nil {
 		return fmt.Errorf("kvm: virtual machine is nil")
 	}
@@ -49,6 +52,8 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 // destMode: 0 for Physical, 1 for Logical
 // deliveryMode: 0 for Fixed, 1 for LowestPriority, etc.
 func (v *virtualMachine) InjectInterrupt(vector, dest, destMode, deliveryMode uint8) error {
+	debug.Writef("kvm hypervisor InjectInterrupt", "vector: %d, dest: %d, destMode: %d, deliveryMode: %d", vector, dest, destMode, deliveryMode)
+
 	if v == nil {
 		return fmt.Errorf("kvm: virtual machine is nil")
 	}

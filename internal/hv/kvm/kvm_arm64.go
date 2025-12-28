@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"unsafe"
 
+	"github.com/tinyrange/cc/internal/debug"
 	"github.com/tinyrange/cc/internal/hv"
 	"golang.org/x/sys/unix"
 )
@@ -204,6 +205,8 @@ func (v *virtualCPU) handleMMIO(mmioData *kvmExitMMIOData) error {
 }
 
 func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
+	debug.Writef("kvm hypervisor archVMInit", "")
+
 	if !config.NeedsInterruptSupport() {
 		return nil
 	}
@@ -218,6 +221,8 @@ func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 // archPostVCPUInit is called after all vCPUs are created.
 // On ARM64, we need to finalize the vGIC after vCPUs exist.
 func (hv *hypervisor) archPostVCPUInit(vm *virtualMachine, config hv.VMConfig) error {
+	debug.Writef("kvm hypervisor archPostVCPUInit", "")
+
 	if !config.NeedsInterruptSupport() {
 		return nil
 	}
@@ -230,6 +235,8 @@ func (hv *hypervisor) archPostVCPUInit(vm *virtualMachine, config hv.VMConfig) e
 }
 
 func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int) error {
+	debug.Writef("kvm hypervisor archVCPUInit", "vcpuFd: %d", vcpuFd)
+
 	init, err := armPreferredTarget(vm.vmFd)
 	if err != nil {
 		return fmt.Errorf("getting preferred target: %w", err)
@@ -245,6 +252,8 @@ func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int) error {
 }
 
 func enableArmVcpuFeature(init *kvmVcpuInit, feature uint32) {
+	debug.Writef("kvm hypervisor enableArmVcpuFeature", "feature: %d", feature)
+
 	word := feature / 32
 	bit := feature % 32
 

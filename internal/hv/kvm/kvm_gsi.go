@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"unsafe"
 
+	"github.com/tinyrange/cc/internal/debug"
 	"golang.org/x/sys/unix"
 )
 
@@ -13,6 +14,8 @@ import (
 // This mirrors what QEMU does for in-kernel irqchip: each GSI is mapped to the
 // in-kernel IOAPIC with the same pin number.
 func initGSIRouting(vmFd int, systemFd int, numGSIs int) error {
+	debug.Writef("kvm hypervisor initGSIRouting", "vmFd: %d, systemFd: %d, numGSIs: %d", vmFd, systemFd, numGSIs)
+
 	if numGSIs <= 0 {
 		return nil
 	}
@@ -86,6 +89,8 @@ const (
 )
 
 func setIrqRouting(vmFd int, table *kvmIrqRouting) error {
+	debug.Writef("kvm hypervisor setIrqRouting", "vmFd: %d, table: %+v", vmFd, table)
+
 	// The KVM_SET_GSI_ROUTING ioctl expects the entries to be inline after the header.
 	headerSize := int(unsafe.Sizeof(kvmIrqRoutingHeader{}))
 	size := headerSize + len(table.Entries)*int(unsafe.Sizeof(kvmIrqRoutingEntry{}))
@@ -110,9 +115,14 @@ func setIrqRouting(vmFd int, table *kvmIrqRouting) error {
 }
 
 func checkExtension(systemFd int, cap int) (bool, error) {
+	debug.Writef("kvm hypervisor checkExtension", "systemFd: %d, cap: %d", systemFd, cap)
+
 	ret, _, err := unix.Syscall(unix.SYS_IOCTL, uintptr(systemFd), uintptr(kvmCheckExtension), uintptr(cap))
 	if err != 0 {
 		return false, err
 	}
+
+	debug.Writef("kvm hypervisor checkExtension", "ret: %d", ret)
+
 	return ret != 0, nil
 }
