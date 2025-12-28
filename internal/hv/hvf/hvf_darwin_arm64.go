@@ -6,696 +6,455 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"log"
 	"log/slog"
 	"runtime"
-	"sync"
+	"sync/atomic"
 	"unsafe"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/tinyrange/cc/internal/hv"
+	"github.com/tinyrange/cc/internal/hv/hvf/bindings"
+	"golang.org/x/sys/unix"
 )
 
-const (
-	arm64InstructionSizeBytes = 4
-	psciSystemOffFunctionID   = 0x84000008
-)
+var globalVM atomic.Pointer[virtualMachine]
 
-type hypervisor struct{}
-
-func (*hypervisor) Close() error { return nil }
-
-func (*hypervisor) Architecture() hv.CpuArchitecture {
-	return hv.ArchitectureARM64
+var registerMap = map[hv.Register]bindings.Reg{
+	hv.RegisterARM64X0:     bindings.HV_REG_X0,
+	hv.RegisterARM64X1:     bindings.HV_REG_X1,
+	hv.RegisterARM64X2:     bindings.HV_REG_X2,
+	hv.RegisterARM64X3:     bindings.HV_REG_X3,
+	hv.RegisterARM64X4:     bindings.HV_REG_X4,
+	hv.RegisterARM64X5:     bindings.HV_REG_X5,
+	hv.RegisterARM64X6:     bindings.HV_REG_X6,
+	hv.RegisterARM64X7:     bindings.HV_REG_X7,
+	hv.RegisterARM64X8:     bindings.HV_REG_X8,
+	hv.RegisterARM64X9:     bindings.HV_REG_X9,
+	hv.RegisterARM64X10:    bindings.HV_REG_X10,
+	hv.RegisterARM64X11:    bindings.HV_REG_X11,
+	hv.RegisterARM64X12:    bindings.HV_REG_X12,
+	hv.RegisterARM64X13:    bindings.HV_REG_X13,
+	hv.RegisterARM64X14:    bindings.HV_REG_X14,
+	hv.RegisterARM64X15:    bindings.HV_REG_X15,
+	hv.RegisterARM64X16:    bindings.HV_REG_X16,
+	hv.RegisterARM64X17:    bindings.HV_REG_X17,
+	hv.RegisterARM64X18:    bindings.HV_REG_X18,
+	hv.RegisterARM64X19:    bindings.HV_REG_X19,
+	hv.RegisterARM64X20:    bindings.HV_REG_X20,
+	hv.RegisterARM64X21:    bindings.HV_REG_X21,
+	hv.RegisterARM64X22:    bindings.HV_REG_X22,
+	hv.RegisterARM64X23:    bindings.HV_REG_X23,
+	hv.RegisterARM64X24:    bindings.HV_REG_X24,
+	hv.RegisterARM64X25:    bindings.HV_REG_X25,
+	hv.RegisterARM64X26:    bindings.HV_REG_X26,
+	hv.RegisterARM64X27:    bindings.HV_REG_X27,
+	hv.RegisterARM64X28:    bindings.HV_REG_X28,
+	hv.RegisterARM64X29:    bindings.HV_REG_X29,
+	hv.RegisterARM64X30:    bindings.HV_REG_X30,
+	hv.RegisterARM64Pc:     bindings.HV_REG_PC,
+	hv.RegisterARM64Pstate: bindings.HV_REG_CPSR,
 }
 
-func (h *hypervisor) newVirtualMachine(config hv.VMConfig) (*virtualMachine, error) {
-	if config == nil {
-		return nil, fmt.Errorf("hvf: VMConfig is nil")
-	}
-
-	if config.CPUCount() != 1 {
-		return nil, fmt.Errorf("hvf: only 1 vCPU is supported (requested %d)", config.CPUCount())
-	}
-
-	memSize := config.MemorySize()
-	if memSize == 0 {
-		return nil, fmt.Errorf("hvf: memory size must be greater than 0")
-	}
-
-	pageSize := uint64(unix.Getpagesize())
-	if memSize%pageSize != 0 {
-		return nil, fmt.Errorf("hvf: memory size (%d) must be aligned to host page size (%d)", memSize, pageSize)
-	}
-
-	if err := ensureInitialized(); err != nil {
-		return nil, err
-	}
-
-	if err := hvVmCreate(0).toError("hv_vm_create"); err != nil {
-		return nil, err
-	}
-
-	vm := &virtualMachine{
-		hv:         h,
-		vcpus:      make(map[int]*virtualCPU),
-		memoryBase: config.MemoryBase(),
-	}
-	vm.vmCreated = true
-
-	mem, err := unix.Mmap(
-		-1,
-		0,
-		int(memSize),
-		unix.PROT_READ|unix.PROT_WRITE,
-		unix.MAP_ANON|unix.MAP_PRIVATE,
-	)
-	if err != nil {
-		vm.closeInternal()
-		return nil, fmt.Errorf("hvf: mmap guest memory: %w", err)
-	}
-	vm.memory = mem
-
-	if err := hvVmMap(unsafe.Pointer(&mem[0]), vm.memoryBase, memSize, hvMemoryRead|hvMemoryWrite|hvMemoryExec).toError("hv_vm_map"); err != nil {
-		vm.closeInternal()
-		return nil, err
-	}
-	vm.memoryMapped = true
-
-	if err := h.configureGIC(vm, config); err != nil {
-		vm.closeInternal()
-		return nil, err
-	}
-
-	if err := config.Callbacks().OnCreateVM(vm); err != nil {
-		vm.closeInternal()
-		return nil, fmt.Errorf("hvf: VM callback OnCreateVM: %w", err)
-	}
-
-	for i := 0; i < config.CPUCount(); i++ {
-		vcpu, err := vm.createVCPU(i)
-		if err != nil {
-			vm.closeInternal()
-			return nil, err
-		}
-		vm.vcpus[i] = vcpu
-
-		if err := config.Callbacks().OnCreateVCPU(vcpu); err != nil {
-			vm.closeInternal()
-			return nil, fmt.Errorf("hvf: VM callback OnCreateVCPU %d: %w", i, err)
-		}
-	}
-
-	if loader := config.Loader(); loader != nil {
-		if err := loader.Load(vm); err != nil {
-			vm.closeInternal()
-			return nil, fmt.Errorf("hvf: load VM: %w", err)
-		}
-	}
-
-	return vm, nil
-}
-
-func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, error) {
-	return h.newVirtualMachine(config)
-}
-
-type memoryRegion struct {
-	memory []byte
-}
-
-func (m *memoryRegion) ReadAt(p []byte, off int64) (int, error) {
-	if off < 0 || int(off) >= len(m.memory) {
-		return 0, fmt.Errorf("hvf: MemoryRegion ReadAt offset 0x%x out of bounds", off)
-	}
-
-	n := copy(p, m.memory[off:])
-	if n < len(p) {
-		return n, fmt.Errorf("hvf: MemoryRegion ReadAt short read")
-	}
-
-	return n, nil
-}
-
-func (m *memoryRegion) WriteAt(p []byte, off int64) (int, error) {
-	if off < 0 || int(off) >= len(m.memory) {
-		return 0, fmt.Errorf("hvf: MemoryRegion WriteAt offset 0x%x out of bounds", off)
-	}
-
-	n := copy(m.memory[off:], p)
-	if n < len(p) {
-		return n, fmt.Errorf("hvf: MemoryRegion WriteAt short write")
-	}
-
-	return n, nil
-}
-
-func (m *memoryRegion) Size() uint64 {
-	return uint64(len(m.memory))
-}
-
-var (
-	_ hv.MemoryRegion = &memoryRegion{}
-)
-
-type virtualMachine struct {
-	hv         hv.Hypervisor
-	vcpus      map[int]*virtualCPU
-	memory     []byte
-	memoryBase uint64
-	devices    []hv.Device
-
-	arm64GICInfo hv.Arm64GICInfo
-
-	gicConfigured bool
-	gicSPIBase    uint32
-	gicSPICount   uint32
-
-	vmCreated    bool
-	memoryMapped bool
-
-	closeOnce sync.Once
-}
-
-// implements hv.VirtualMachine.
-func (v *virtualMachine) MemoryBase() uint64        { return v.memoryBase }
-func (v *virtualMachine) MemorySize() uint64        { return uint64(len(v.memory)) }
-func (v *virtualMachine) Hypervisor() hv.Hypervisor { return v.hv }
-
-// AllocateMemory implements hv.VirtualMachine.
-func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.MemoryRegion, error) {
-	mem, err := unix.Mmap(
-		-1,
-		0,
-		int(size),
-		unix.PROT_READ|unix.PROT_WRITE,
-		unix.MAP_ANON|unix.MAP_PRIVATE,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("hvf: mmap guest memory: %w", err)
-	}
-
-	if err := hvVmMap(
-		unsafe.Pointer(&mem[0]),
-		physAddr,
-		size,
-		hvMemoryRead|hvMemoryWrite|hvMemoryExec,
-	).toError("hv_vm_map"); err != nil {
-		return nil, err
-	}
-
-	return &memoryRegion{
-		memory: mem,
-	}, nil
-}
-
-// CaptureSnapshot implements hv.VirtualMachine.
-func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
-	ret := &arm64Snapshot{
-		cpuStates:       make(map[int]arm64VcpuSnapshot),
-		deviceSnapshots: make(map[string]interface{}),
-	}
-
-	for i := range v.vcpus {
-		if err := v.VirtualCPUCall(i, func(vcpu hv.VirtualCPU) error {
-			state, err := vcpu.(*virtualCPU).captureSnapshot()
-			if err != nil {
-				return err
-			}
-			ret.cpuStates[i] = state
-			return nil
-		}); err != nil {
-			return nil, fmt.Errorf("hvf: capture vCPU %d snapshot: %w", i, err)
-		}
-	}
-
-	for _, dev := range v.devices {
-		if snapshotter, ok := dev.(hv.DeviceSnapshotter); ok {
-			id := snapshotter.DeviceId()
-			snap, err := snapshotter.CaptureSnapshot()
-			if err != nil {
-				return nil, fmt.Errorf("hvf: capture device %s snapshot: %w", id, err)
-			}
-			ret.deviceSnapshots[id] = snap
-		}
-	}
-
-	if len(v.memory) > 0 {
-		ret.memory = make([]byte, len(v.memory))
-		copy(ret.memory, v.memory)
-	}
-
-	return ret, nil
-}
-
-// RestoreSnapshot implements hv.VirtualMachine.
-func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
-	snapshotData, ok := snap.(*arm64Snapshot)
-	if !ok {
-		return fmt.Errorf("hvf: invalid snapshot type")
-	}
-
-	if len(v.memory) != len(snapshotData.memory) {
-		return fmt.Errorf("hvf: snapshot memory size mismatch: got %d bytes, want %d bytes", len(snapshotData.memory), len(v.memory))
-	}
-	if len(v.memory) > 0 {
-		copy(v.memory, snapshotData.memory)
-	}
-
-	for i := range v.vcpus {
-		state, ok := snapshotData.cpuStates[i]
-		if !ok {
-			return fmt.Errorf("hvf: missing vCPU %d state in snapshot", i)
-		}
-
-		if err := v.VirtualCPUCall(i, func(vcpu hv.VirtualCPU) error {
-			return vcpu.(*virtualCPU).restoreSnapshot(state)
-		}); err != nil {
-			return fmt.Errorf("hvf: restore vCPU %d snapshot: %w", i, err)
-		}
-	}
-
-	for _, dev := range v.devices {
-		if snapshotter, ok := dev.(hv.DeviceSnapshotter); ok {
-			id := snapshotter.DeviceId()
-			snapData, ok := snapshotData.deviceSnapshots[id]
-			if !ok {
-				return fmt.Errorf("hvf: missing device %s snapshot", id)
-			}
-			if err := snapshotter.RestoreSnapshot(snapData); err != nil {
-				return fmt.Errorf("hvf: restore device %s snapshot: %w", id, err)
-			}
-		}
-	}
-
-	return nil
-}
-
-func (v *virtualMachine) AddDevice(dev hv.Device) error {
-	v.devices = append(v.devices, dev)
-	return dev.Init(v)
-}
-
-// AddDeviceFromTemplate implements hv.VirtualMachine.
-func (v *virtualMachine) AddDeviceFromTemplate(template hv.DeviceTemplate) error {
-	dev, err := template.Create(v)
-	if err != nil {
-		return fmt.Errorf("create device from template: %w", err)
-	}
-
-	return v.AddDevice(dev)
-}
-
-func (v *virtualMachine) Run(ctx context.Context, cfg hv.RunConfig) error {
-	if cfg == nil {
-		return fmt.Errorf("hvf: RunConfig is nil")
-	}
-
-	vcpu, ok := v.vcpus[0]
-	if !ok {
-		return fmt.Errorf("hvf: vCPU 0 not found")
-	}
-
-	done := make(chan error, 1)
-	vcpu.runQueue <- func() {
-		done <- cfg.Run(ctx, vcpu)
-	}
-
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (v *virtualMachine) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error {
-	vcpu, ok := v.vcpus[id]
-	if !ok {
-		return fmt.Errorf("hvf: vCPU %d not found", id)
-	}
-
-	done := make(chan error, 1)
-	vcpu.runQueue <- func() {
-		done <- f(vcpu)
-	}
-	return <-done
-}
-
-func (v *virtualMachine) ReadAt(p []byte, off int64) (int, error) {
-	offset := off - int64(v.memoryBase)
-	if offset < 0 || int(offset) >= len(v.memory) {
-		return 0, fmt.Errorf("hvf: ReadAt offset 0x%x out of bounds", off)
-	}
-
-	n := copy(p, v.memory[offset:])
-	if n < len(p) {
-		return n, fmt.Errorf("hvf: ReadAt short read")
-	}
-	return n, nil
-}
-
-func (v *virtualMachine) WriteAt(p []byte, off int64) (int, error) {
-	offset := off - int64(v.memoryBase)
-	if offset < 0 || int(offset) >= len(v.memory) {
-		return 0, fmt.Errorf("hvf: WriteAt offset 0x%x out of bounds", off)
-	}
-
-	n := copy(v.memory[offset:], p)
-	if n < len(p) {
-		return n, fmt.Errorf("hvf: WriteAt short write")
-	}
-	return n, nil
-}
-
-func (v *virtualMachine) Arm64GICInfo() (hv.Arm64GICInfo, bool) {
-	if v == nil || !v.gicConfigured || v.arm64GICInfo.Version == hv.Arm64GICVersionUnknown {
-		return hv.Arm64GICInfo{}, false
-	}
-	return v.arm64GICInfo, true
-}
-
-// ARM64 KVM IRQ type encoding (bits 31-24 of irq field)
-const (
-	armIRQTypeShift = 24 // Shift for IRQ type in encoded irqLine
-	armIRQTypeSPI   = 1  // Shared Peripheral Interrupt
-)
-
-func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
-	if !v.gicConfigured {
-		return fmt.Errorf("hvf: interrupt controller not configured")
-	}
-
-	if hvGicSetSpi == nil {
-		return fmt.Errorf("hvf: hv_gic_set_spi unavailable")
-	}
-
-	// Decode the KVM-style IRQ encoding used by EncodeIRQLineForArch.
-	// Bits 31-24 contain the IRQ type, bits 15-0 contain the SPI number.
-	irqType := (irqLine >> armIRQTypeShift) & 0xff
-	if irqType != 0 {
-		if irqType != armIRQTypeSPI {
-			return fmt.Errorf("hvf: unsupported IRQ type %d in irqLine %#x", irqType, irqLine)
-		}
-		// Extract the SPI number from low 16 bits.
-		irqLine = irqLine & 0xffff
-	}
-
-	// hv_gic_get_spi_interrupt_range returns base=32 (first SPI INTID) and count=988 (number of SPIs).
-	// hv_gic_set_spi expects the INTID number (not zero-based).
-	// Our irqLine is the SPI offset (e.g., 40 for virtio console), so add gicSPIBase.
-	spiNum := irqLine
-	if v.gicSPIBase != 0 {
-		spiNum += v.gicSPIBase
-	}
-
-	// Range check: SPI numbers should be 0 to (spiCount-1)
-	if spiNum >= v.gicSPIBase+v.gicSPICount {
-		return fmt.Errorf("hvf: SPI %d out of range (base=%d count=%d)", spiNum, v.gicSPIBase, v.gicSPICount)
-	}
-
-	if level {
-		slog.Info("hvf: SetIRQ", "spi", spiNum, "level", level, "spiBase", v.gicSPIBase, "spiCount", v.gicSPICount)
-	}
-
-	ret := hvGicSetSpi(spiNum, level)
-	if ret != 0 {
-		slog.Error("hvf: hv_gic_set_spi failed", "spi", spiNum, "level", level, "ret", ret)
-		return ret.toError("hv_gic_set_spi")
-	}
-
-	// When asserting an interrupt, mark all vCPUs as having a pending IRQ
-	// and kick them so they can inject it.
-	if level {
-		for _, vcpu := range v.vcpus {
-			vcpu.pendingIRQ = true
-			hostID := vcpu.hostID
-			// Kick the vCPU so it exits hvVcpuRun and can inject the interrupt
-			_ = hvVcpusExit(&hostID, 1)
-		}
-	}
-
-	return nil
-}
-
-func (v *virtualMachine) Close() error {
-	var closeErr error
-
-	v.closeOnce.Do(func() {
-		closeErr = v.closeInternal()
-	})
-
-	return closeErr
-}
-
-func (v *virtualMachine) closeInternal() error {
-	var firstErr error
-
-	for _, vcpu := range v.vcpus {
-		if err := vcpu.shutdown(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	v.vcpus = nil
-
-	if v.memoryMapped {
-		if err := hvVmUnmap(v.memoryBase, uint64(len(v.memory))).toError("hv_vm_unmap"); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		v.memoryMapped = false
-	}
-
-	if v.memory != nil {
-		if err := unix.Munmap(v.memory); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("hvf: munmap memory: %w", err)
-		}
-		v.memory = nil
-	}
-
-	if v.vmCreated {
-		if err := hvVmDestroy().toError("hv_vm_destroy"); err != nil && firstErr == nil {
-			firstErr = err
-		}
-		v.vmCreated = false
-	}
-
-	return firstErr
-}
-
-func (v *virtualMachine) createVCPU(id int) (*virtualCPU, error) {
-	vcpu := &virtualCPU{
-		vm:       v,
-		index:    id,
-		runQueue: make(chan func(), 16),
-		initErr:  make(chan error, 1),
-	}
-
-	go vcpu.start()
-
-	if err := <-vcpu.initErr; err != nil {
-		return nil, err
-	}
-
-	return vcpu, nil
+var sysRegisterMap = map[hv.Register]bindings.SysReg{
+	hv.RegisterARM64Vbar: bindings.HV_SYS_REG_VBAR_EL1,
+	hv.RegisterARM64Sp:   bindings.HV_SYS_REG_SP_EL1,
 }
 
 type virtualCPU struct {
-	vm       *virtualMachine
-	hostID   uint64
-	index    int
-	exit     *hvVcpuExit
+	vm *virtualMachine
+
+	id   bindings.VCPU
+	exit *bindings.VcpuExit
+
+	closed bool
+
 	runQueue chan func()
-	initErr  chan error
 
-	pendingPC *uint64
-
-	// pendingIRQ is set when an IRQ needs to be injected into the vCPU.
-	// Access should be synchronized, but since we only set from SetIRQ
-	// and check from the vCPU thread, a simple bool is sufficient.
-	pendingIRQ bool
+	initError chan error
 }
 
-func (v *virtualCPU) start() {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+// implements [hv.VirtualCPU].
+func (v *virtualCPU) ID() int                           { return int(v.id) }
+func (v *virtualCPU) VirtualMachine() hv.VirtualMachine { return v.vm }
 
-	var exitPtr *hvVcpuExit
-	var hostID uint64
-	ret := hvVcpuCreate(&hostID, &exitPtr, 0)
-	if err := ret.toError("hv_vcpu_create"); err != nil {
-		v.initErr <- err
-		close(v.initErr)
-		close(v.runQueue)
-		return
-	}
-	v.hostID = hostID
-	v.exit = exitPtr
-	v.initErr <- nil
-	close(v.initErr)
-
-	for fn := range v.runQueue {
-		fn()
-	}
-}
-
-func (v *virtualCPU) shutdown() error {
-	if v.runQueue == nil {
+func (v *virtualCPU) Close() error {
+	if v.closed {
 		return nil
 	}
 
-	done := make(chan error, 1)
+	v.closed = true
+
+	errChan := make(chan error, 1)
+	// submit to the run queue a function that will destroy the vCPU
 	v.runQueue <- func() {
-		done <- hvVcpuDestroy(v.hostID).toError("hv_vcpu_destroy")
+		if err := bindings.HvVcpuDestroy(v.id); err != bindings.HV_SUCCESS {
+			slog.Error("failed to destroy vCPU", "error", err)
+			errChan <- fmt.Errorf("failed to destroy vCPU: %w", err)
+			return
+		}
+		errChan <- nil
 	}
-	close(v.runQueue)
-	return <-done
+
+	val := <-errChan
+	close(errChan)
+	return val
 }
 
-func (v *virtualCPU) VirtualMachine() hv.VirtualMachine { return v.vm }
-func (v *virtualCPU) ID() int                           { return v.index }
-
-func (v *virtualCPU) SetRegisters(regs map[hv.Register]hv.RegisterValue) error {
-	for reg, value := range regs {
-		if reg == hv.RegisterARM64GicrBase {
-			return fmt.Errorf("hvf: register %v is read-only", reg)
-		}
-
-		raw, ok := value.(hv.Register64)
-		if !ok {
-			return fmt.Errorf("hvf: unsupported register value type %T for %v", value, reg)
-		}
-
-		if sys, ok := hvSysRegFromRegister(reg); ok {
-			if err := hvVcpuSetSys(v.hostID, sys, uint64(raw)).toError("hv_vcpu_set_sys_reg"); err != nil {
-				return err
-			}
-			continue
-		}
-
-		hreg, ok := hvRegFromRegister(reg)
-		if !ok {
-			return fmt.Errorf("hvf: unsupported register %v", reg)
-		}
-		if err := hvVcpuSetReg(v.hostID, hreg, uint64(raw)).toError("hv_vcpu_set_reg"); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
+// GetRegisters implements [hv.VirtualCPU].
 func (v *virtualCPU) GetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 	for reg := range regs {
-		if reg == hv.RegisterARM64GicrBase {
-			info := v.vm.arm64GICInfo
-			if info.Version != hv.Arm64GICVersion3 || info.RedistributorBase == 0 || info.RedistributorSize == 0 {
-				return fmt.Errorf("hvf: register %v not available", reg)
-			}
-			base := info.RedistributorBase + uint64(v.index)*info.RedistributorSize
-			regs[reg] = hv.Register64(base)
+		if reg == hv.RegisterARM64Xzr {
+			regs[reg] = hv.Register64(0)
 			continue
-		}
-
-		if sys, ok := hvSysRegFromRegister(reg); ok {
-			var val uint64
-			if err := hvVcpuGetSys(v.hostID, sys, &val).toError("hv_vcpu_get_sys_reg"); err != nil {
-				return err
+		} else if hvReg, ok := registerMap[reg]; ok {
+			var value uint64
+			if err := bindings.HvVcpuGetReg(v.id, hvReg, &value); err != bindings.HV_SUCCESS {
+				return fmt.Errorf("hvf: failed to get register %v: %w", reg, err)
 			}
-			regs[reg] = hv.Register64(val)
-			continue
-		}
-
-		hreg, ok := hvRegFromRegister(reg)
-		if !ok {
+			regs[reg] = hv.Register64(value)
+		} else if hvReg, ok := sysRegisterMap[reg]; ok {
+			var value uint64
+			if err := bindings.HvVcpuGetSysReg(v.id, hvReg, &value); err != bindings.HV_SUCCESS {
+				return fmt.Errorf("hvf: failed to get register %v: %w", reg, err)
+			}
+			regs[reg] = hv.Register64(value)
+		} else {
 			return fmt.Errorf("hvf: unsupported register %v", reg)
 		}
-
-		var val uint64
-		if err := hvVcpuGetReg(v.hostID, hreg, &val).toError("hv_vcpu_get_reg"); err != nil {
-			return err
-		}
-		regs[reg] = hv.Register64(val)
 	}
+
 	return nil
 }
 
+// SetRegisters implements [hv.VirtualCPU].
+func (v *virtualCPU) SetRegisters(regs map[hv.Register]hv.RegisterValue) error {
+	for reg, value := range regs {
+		if hvReg, ok := registerMap[reg]; ok {
+			if err := bindings.HvVcpuSetReg(v.id, hvReg, uint64(value.(hv.Register64))); err != bindings.HV_SUCCESS {
+				return fmt.Errorf("hvf: failed to set register %v: %w", reg, err)
+			}
+		} else if hvReg, ok := sysRegisterMap[reg]; ok {
+			if err := bindings.HvVcpuSetSysReg(v.id, hvReg, uint64(value.(hv.Register64))); err != bindings.HV_SUCCESS {
+				return fmt.Errorf("hvf: failed to set register %v: %w", reg, err)
+			}
+		} else {
+			return fmt.Errorf("hvf: unsupported register %v", reg)
+		}
+	}
+
+	return nil
+}
+
+// Run implements [hv.VirtualCPU].
 func (v *virtualCPU) Run(ctx context.Context) error {
 	var stopExit func() bool
 	if ctx.Done() != nil {
 		stopExit = context.AfterFunc(ctx, func() {
-			hostID := v.hostID
-			_ = hvVcpusExit(&hostID, 1).toError("hv_vcpus_exit")
+			exitList := []bindings.VCPU{v.id}
+			_ = bindings.HvVcpusExit(&exitList[0], uint32(len(exitList)))
 		})
 	}
 	if stopExit != nil {
 		defer stopExit()
 	}
 
-	for {
-		// Inject pending interrupts before running the vCPU.
-		// This must be done from the vCPU thread.
-		if v.pendingIRQ {
-			v.pendingIRQ = false
-			if hvVcpuSetPendingInterrupt != nil {
-				ret := hvVcpuSetPendingInterrupt(v.hostID, hvInterruptTypeIRQ, true)
-				// slog.Info("hvf: injecting IRQ into vCPU", "vcpu", v.index, "ret", ret)
-				if err := ret.toError("hv_vcpu_set_pending_interrupt"); err != nil {
-					slog.Error("hvf: failed to set pending IRQ", "err", err)
-				}
-			} else {
-				slog.Warn("hvf: hvVcpuSetPendingInterrupt not available")
-			}
-		}
+	if err := bindings.HvVcpuRun(v.id); err != bindings.HV_SUCCESS {
+		return fmt.Errorf("hvf: failed to run vCPU %d: %w", v.id, err)
+	}
 
-		if err := hvVcpuRun(v.hostID).toError("hv_vcpu_run"); err != nil {
-			return err
-		}
+	switch v.exit.Reason {
+	case bindings.HV_EXIT_REASON_EXCEPTION:
+		return v.handleException()
+	case bindings.HV_EXIT_REASON_CANCELED:
+		return ctx.Err()
+	default:
+		return fmt.Errorf("hvf: unknown exit reason %s", v.exit.Reason)
+	}
+}
 
-		switch v.exit.Reason {
-		case hvExitReasonCanceled:
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			// If context isn't canceled, this might be a kick from SetIRQ.
-			// Continue running to process the interrupt.
-			continue
-		case hvExitReasonException:
-			if err := v.handleException(); err != nil {
-				return err
-			}
-			// Continue running after successfully handling the exception
-		case hvExitReasonVTimerActivated, hvExitReasonVTimerDeactivated:
-			// Spurious timer exits; continue running.
-			continue
-		default:
-			return fmt.Errorf("hvf: unsupported vCPU exit reason %d", v.exit.Reason)
-		}
+type exceptionClass uint64
+
+const (
+	exceptionClassHvc              exceptionClass = 0x16
+	exceptionClassSmc              exceptionClass = 0x17
+	exceptionClassMsrAccess        exceptionClass = 0x18
+	exceptionClassDataAbortLowerEL exceptionClass = 0x24
+)
+
+func (ec exceptionClass) String() string {
+	switch ec {
+	case exceptionClassHvc:
+		return "HVC"
+	case exceptionClassSmc:
+		return "SMC"
+	case exceptionClassMsrAccess:
+		return "MSR access"
+	case exceptionClassDataAbortLowerEL:
+		return "Data abort lower EL"
+	default:
+		return fmt.Sprintf("unknown exception class %d", ec)
 	}
 }
 
 const (
-	exceptionClassMask             = 0x3F
-	exceptionClassShift            = 26
-	exceptionClassHvc              = 0x16
-	exceptionClassSmc              = 0x17
-	exceptionClassMsrAccess        = 0x18
-	exceptionClassDataAbortLowerEL = 0x24
+	exceptionClassMask  = 0x3F
+	exceptionClassShift = 26
 )
 
 func (v *virtualCPU) handleException() error {
 	syndrome := v.exit.Exception.Syndrome
-	ec := (syndrome >> exceptionClassShift) & exceptionClassMask
+	ec := exceptionClass((syndrome >> exceptionClassShift) & exceptionClassMask)
 
 	switch ec {
-	case exceptionClassHvc, exceptionClassSmc:
-		return v.handleHypercall(ec)
+	case exceptionClassHvc:
+		return v.handleHvc()
+	case exceptionClassDataAbortLowerEL:
+		return v.handleDataAbort(syndrome, v.exit.Exception.PhysicalAddress)
 	case exceptionClassMsrAccess:
 		return v.handleMsrAccess(syndrome)
-	case exceptionClassDataAbortLowerEL:
-		return v.handleDataAbort(syndrome, v.exit.Exception.PhysicalAddress, v.exit.Exception.VirtualAddress)
 	default:
-		return fmt.Errorf("hvf: unsupported exception class 0x%x (syndrome=0x%x)", ec, syndrome)
+		return fmt.Errorf("hvf: unsupported exception class %s (syndrome=0x%x)", ec, syndrome)
 	}
+}
+
+type psciFunctionID uint32
+
+// PSCI function IDs (SMC32 calling convention)
+const (
+	psciVersion         psciFunctionID = 0x84000000
+	psciCpuSuspend      psciFunctionID = 0x84000001
+	psciCpuOff          psciFunctionID = 0x84000002
+	psciCpuOn           psciFunctionID = 0x84000003
+	psciAffinityInfo    psciFunctionID = 0x84000004
+	psciMigrateInfoType psciFunctionID = 0x84000006
+	psciSystemOff       psciFunctionID = 0x84000008
+	psciSystemReset     psciFunctionID = 0x84000009
+	psciFeatures        psciFunctionID = 0x8400000A
+
+	// PSCI return values
+	psciSuccess           psciFunctionID = 0
+	psciNotSupported      psciFunctionID = 0xFFFFFFFF // -1 as uint32
+	psciInvalidParameters psciFunctionID = 0xFFFFFFFE // -2 as uint32
+	psciDenied            psciFunctionID = 0xFFFFFFFD // -3 as uint32
+	psciAlreadyOn         psciFunctionID = 0xFFFFFFFC // -4 as uint32
+	psciOnPending         psciFunctionID = 0xFFFFFFFB // -5 as uint32
+	psciInternalFailure   psciFunctionID = 0xFFFFFFFA // -6 as uint32
+	psciNotPresent        psciFunctionID = 0xFFFFFFF9 // -7 as uint32
+	psciDisabled          psciFunctionID = 0xFFFFFFF8 // -8 as uint32
+	psciInvalidAddress    psciFunctionID = 0xFFFFFFF7 // -9 as uint32
+	psciTosNotPresent     psciFunctionID = 2          // For MIGRATE_INFO_TYPE: no trusted OS
+)
+
+func (fid psciFunctionID) String() string {
+	switch fid {
+	case psciVersion:
+		return "PSCI_VERSION"
+	case psciCpuSuspend:
+		return "PSCI_CPU_SUSPEND"
+	case psciCpuOff:
+		return "PSCI_CPU_OFF"
+	case psciCpuOn:
+		return "PSCI_CPU_ON"
+	case psciAffinityInfo:
+		return "PSCI_AFFINITY_INFO"
+	case psciMigrateInfoType:
+		return "PSCI_MIGRATE_INFO_TYPE"
+	case psciSystemOff:
+		return "PSCI_SYSTEM_OFF"
+	case psciSystemReset:
+		return "PSCI_SYSTEM_RESET"
+	case psciFeatures:
+		return "PSCI_FEATURES"
+	case psciSuccess:
+		return "PSCI_SUCCESS"
+	case psciNotSupported:
+		return "PSCI_NOT_SUPPORTED"
+	case psciInvalidParameters:
+		return "PSCI_INVALID_PARAMETERS"
+	case psciDenied:
+		return "PSCI_DENIED"
+	case psciAlreadyOn:
+		return "PSCI_ALREADY_ON"
+	case psciOnPending:
+		return "PSCI_ON_PENDING"
+	case psciInternalFailure:
+		return "PSCI_INTERNAL_FAILURE"
+	case psciNotPresent:
+		return "PSCI_NOT_PRESENT"
+	case psciDisabled:
+		return "PSCI_DISABLED"
+	case psciInvalidAddress:
+		return "PSCI_INVALID_ADDRESS"
+	case psciTosNotPresent:
+		return "PSCI_TOS_NOT_PRESENT"
+	default:
+		return fmt.Sprintf("PSCI_FUNCTION_ID_%d", fid)
+	}
+}
+
+func (v *virtualCPU) handleHvc() error {
+	// get the value of x0
+	var x0 uint64
+	if err := bindings.HvVcpuGetReg(v.id, bindings.HV_REG_X0, &x0); err != bindings.HV_SUCCESS {
+		return fmt.Errorf("hvf: failed to get x0: %w", err)
+	}
+
+	fid := psciFunctionID(x0)
+
+	switch fid {
+	case psciSystemOff:
+		return hv.ErrVMHalted
+	case psciSystemReset:
+		return hv.ErrGuestRequestedReboot
+	case psciVersion:
+		if err := bindings.HvVcpuSetReg(v.id, bindings.HV_REG_X0, 0x00010000); err != bindings.HV_SUCCESS {
+			return fmt.Errorf("hvf: failed to get x0: %w", err)
+		}
+
+		return nil
+	case psciMigrateInfoType:
+		// report no trusted OS
+		if err := bindings.HvVcpuSetReg(v.id, bindings.HV_REG_X0, 2); err != bindings.HV_SUCCESS {
+			return fmt.Errorf("hvf: failed to get x0: %w", err)
+		}
+
+		return nil
+	case psciFeatures:
+		// report not supported
+		if err := bindings.HvVcpuSetReg(v.id, bindings.HV_REG_X0, 0xffff_ffff); err != bindings.HV_SUCCESS {
+			return fmt.Errorf("hvf: failed to get x0: %w", err)
+		}
+
+		return nil
+	default:
+		return fmt.Errorf("hvf: HVC %s not implemented", fid)
+	}
+}
+
+type dataAbortInfo struct {
+	sizeBytes int
+	write     bool
+	target    hv.Register
+}
+
+func arm64RegisterFromIndex(idx int) (hv.Register, bool) {
+	switch {
+	case idx >= 0 && idx <= 30:
+		return hv.Register(int(hv.RegisterARM64X0) + idx), true
+	case idx == 31:
+		// In data abort syndrome, register 31 is XZR (zero register), not SP
+		return hv.RegisterARM64Xzr, true
+	default:
+		return hv.RegisterInvalid, false
+	}
+}
+
+func decodeDataAbort(syndrome bindings.ExceptionSyndrome) (dataAbortInfo, error) {
+	const (
+		dataAbortISSMask uint64 = (1 << 25) - 1
+		isvBit                  = 24
+		sasShift                = 22
+		sasMask          uint64 = 0x3
+		srtShift                = 16
+		srtMask          uint64 = 0x1F
+		wnrBit                  = 6
+	)
+
+	iss := uint64(syndrome) & dataAbortISSMask
+	if ((iss >> isvBit) & 0x1) == 0 {
+		return dataAbortInfo{}, fmt.Errorf("hvf: data abort without ISV set (syndrome=0x%x)", syndrome)
+	}
+
+	sas := (iss >> sasShift) & sasMask
+	size := 1 << sas
+	if sas > 3 {
+		return dataAbortInfo{}, fmt.Errorf("hvf: invalid SAS value %d", sas)
+	}
+
+	srt := int((iss >> srtShift) & srtMask)
+	reg, ok := arm64RegisterFromIndex(srt)
+	if !ok {
+		return dataAbortInfo{}, fmt.Errorf("hvf: unsupported data abort target register index %d", srt)
+	}
+
+	write := ((iss >> wnrBit) & 0x1) == 1
+
+	return dataAbortInfo{
+		sizeBytes: int(size),
+		write:     write,
+		target:    reg,
+	}, nil
+}
+
+func (v *virtualCPU) findMMIODevice(addr, size uint64) (hv.MemoryMappedIODevice, error) {
+	for _, dev := range v.vm.devices {
+		mmio, ok := dev.(hv.MemoryMappedIODevice)
+		if !ok {
+			continue
+		}
+		for _, region := range mmio.MMIORegions() {
+			if addr >= region.Address && addr+size <= region.Address+region.Size {
+				return mmio, nil
+			}
+		}
+	}
+	return nil, fmt.Errorf("hvf: no MMIO device handles address 0x%x (size=%d)", addr, size)
+}
+
+func (v *virtualCPU) handleDataAbort(syndrome bindings.ExceptionSyndrome, physAddr bindings.IPA) error {
+	decoded, err := decodeDataAbort(syndrome)
+	if err != nil {
+		return fmt.Errorf("hvf: failed to decode data abort syndrome 0x%X: %w", syndrome, err)
+	}
+
+	var addr uint64 = uint64(physAddr)
+
+	dev, err := v.findMMIODevice(addr, uint64(decoded.sizeBytes))
+	if err != nil {
+		return err
+	}
+
+	var pendingError error
+
+	// TODO(joshua): Remove allocation here
+	data := make([]byte, decoded.sizeBytes)
+	if decoded.write {
+		reg := map[hv.Register]hv.RegisterValue{
+			decoded.target: hv.Register64(0),
+		}
+		if err := v.GetRegisters(reg); err != nil {
+			return fmt.Errorf("hvf: failed to get register: %w", err)
+		}
+		value := uint64(reg[decoded.target].(hv.Register64))
+
+		// convert the value to a byte slice
+		var tmp [8]byte
+		binary.LittleEndian.PutUint64(tmp[:], value)
+		copy(data, tmp[:])
+
+		if err := dev.WriteMMIO(addr, data); err != nil {
+			return fmt.Errorf("hvf: failed to write MMIO: %w", err)
+		}
+	} else {
+		if err := dev.ReadMMIO(addr, data); err != nil {
+			return fmt.Errorf("hvf: failed to read MMIO: %w", err)
+		}
+
+		var tmp [8]byte
+		copy(tmp[:], data)
+		value := binary.LittleEndian.Uint64(tmp[:])
+		reg := map[hv.Register]hv.RegisterValue{
+			decoded.target: hv.Register64(value),
+		}
+		if err := v.SetRegisters(reg); err != nil {
+			return fmt.Errorf("hvf: failed to set register: %w", err)
+		}
+	}
+
+	if err := v.advanceProgramCounter(); err != nil {
+		return fmt.Errorf("hvf: advance PC after MMIO access: %w", err)
+	}
+
+	return pendingError
 }
 
 type msrAccessInfo struct {
@@ -705,7 +464,7 @@ type msrAccessInfo struct {
 	target        hv.Register
 }
 
-func decodeMsrAccess(syndrome uint64) (msrAccessInfo, error) {
+func decodeMsrAccess(syndrome bindings.ExceptionSyndrome) (msrAccessInfo, error) {
 	const (
 		issMask uint64 = (1 << 25) - 1 // bits [24:0]
 
@@ -730,7 +489,7 @@ func decodeMsrAccess(syndrome uint64) (msrAccessInfo, error) {
 		op0Mask  = 0x3
 	)
 
-	iss := syndrome & issMask
+	iss := uint64(syndrome) & issMask
 
 	read := ((iss >> directionBit) & 0x1) == 1
 
@@ -762,349 +521,486 @@ func (m msrAccessInfo) matches(op0, op1, crn, crm, op2 uint8) bool {
 	return m.op0 == op0 && m.op1 == op1 && m.crn == crn && m.crm == crm && m.op2 == op2
 }
 
-func (v *virtualCPU) handleMsrAccess(syndrome uint64) error {
+func (v *virtualCPU) handleMsrAccess(syndrome bindings.ExceptionSyndrome) error {
 	info, err := decodeMsrAccess(syndrome)
 	if err != nil {
 		return err
 	}
 
-	// Example: recognize specific system registers by encoding if you want
-	// to emulate them specially. For now, everything is treated as:
-	//   - MSR: write-ignored
-	//   - MRS: read-as-zero
-	//
-	// Example (CNTVCT_EL0: op0=3, op1=3, CRn=14, CRm=0, op2=2) :contentReference[oaicite:1]{index=1}
-	//
-	// if info.matches(3, 3, 14, 0, 2) { // CNTVCT_EL0
-	//     if info.read {
-	//         // TODO: provide a virtual counter value
-	//         if err := v.writeRegister(info.target, someCounterValue); err != nil {
-	//             return err
-	//         }
-	//     } else {
-	//         // Writes to CNTVCT_EL0 are architecturally ignored.
-	//     }
-	// } else {
-	//     // fall through to default handling below
-	// }
+	slog.Info("ignoring MSR access", "info", info)
 
 	if info.read {
-		// Default: read-as-zero for unhandled sysregs.
-		if err := v.writeRegister(info.target, 0); err != nil {
-			return err
+		// write 0 to the target register
+		if err := v.SetRegisters(map[hv.Register]hv.RegisterValue{
+			info.target: hv.Register64(0),
+		}); err != nil {
+			return fmt.Errorf("hvf: failed to set register: %w", err)
 		}
 	} else {
-		// Default: ignore writes for unhandled sysregs.
-		// You *could* log here if you want visibility:
-		log.Printf("hvf: ignoring MSR op0=%d op1=%d CRn=%d CRm=%d op2=%d", info.op0, info.op1, info.crn, info.crm, info.op2)
+
 	}
 
 	return v.advanceProgramCounter()
 }
 
-// PSCI function IDs (SMC32 calling convention)
-const (
-	psciVersion         = 0x84000000
-	psciCpuSuspend      = 0x84000001
-	psciCpuOff          = 0x84000002
-	psciCpuOn           = 0x84000003
-	psciAffinityInfo    = 0x84000004
-	psciMigrateInfoType = 0x84000006
-	psciSystemOff       = 0x84000008
-	psciSystemReset     = 0x84000009
-	psciFeatures        = 0x8400000A
-
-	// PSCI return values
-	psciSuccess           = 0
-	psciNotSupported      = 0xFFFFFFFF // -1 as uint32
-	psciInvalidParameters = 0xFFFFFFFE // -2 as uint32
-	psciDenied            = 0xFFFFFFFD // -3 as uint32
-	psciAlreadyOn         = 0xFFFFFFFC // -4 as uint32
-	psciOnPending         = 0xFFFFFFFB // -5 as uint32
-	psciInternalFailure   = 0xFFFFFFFA // -6 as uint32
-	psciNotPresent        = 0xFFFFFFF9 // -7 as uint32
-	psciDisabled          = 0xFFFFFFF8 // -8 as uint32
-	psciInvalidAddress    = 0xFFFFFFF7 // -9 as uint32
-	psciTosNotPresent     = 2          // For MIGRATE_INFO_TYPE: no trusted OS
-)
-
-func (v *virtualCPU) handleHypercall(ec uint64) error {
-	val, err := v.readRegister(hv.RegisterARM64X0)
-	if err != nil {
-		return err
-	}
-
-	// HVC (EC 0x16) automatically advances PC in Apple's Hypervisor Framework.
-	// SMC (EC 0x17) does NOT automatically advance PC, so we must do it manually.
-	if ec == exceptionClassSmc {
-		if err := v.advanceProgramCounter(); err != nil {
-			return err
-		}
-	}
-
-	switch val {
-	case psciVersion:
-		// Reply PSCI version 1.0
-		return v.writeRegister(hv.RegisterARM64X0, 0x00010000)
-
-	case psciCpuOff:
-		// Single CPU VM - CPU_OFF halts the VM
-		return hv.ErrVMHalted
-
-	case psciCpuOn:
-		// Single CPU VM - CPU_ON not supported
-		return v.writeRegister(hv.RegisterARM64X0, psciAlreadyOn)
-
-	case psciAffinityInfo:
-		// For single CPU VM, CPU 0 is always ON (return 0)
-		return v.writeRegister(hv.RegisterARM64X0, 0)
-
-	case psciMigrateInfoType:
-		// Return "Trusted OS not present" - no migration support needed
-		return v.writeRegister(hv.RegisterARM64X0, psciTosNotPresent)
-
-	case psciSystemOff:
-		return hv.ErrVMHalted
-
-	case psciSystemReset:
-		return hv.ErrGuestRequestedReboot
-
-	case psciFeatures:
-		// Return NOT_SUPPORTED for feature queries we don't implement
-		return v.writeRegister(hv.RegisterARM64X0, psciNotSupported)
-
-	case psciCpuSuspend:
-		// For simplicity, treat suspend as a no-op (return success)
-		return v.writeRegister(hv.RegisterARM64X0, psciSuccess)
-
-	default:
-		// Unknown PSCI function - return NOT_SUPPORTED
-		return v.writeRegister(hv.RegisterARM64X0, psciNotSupported)
-	}
-}
-
-type dataAbortInfo struct {
-	sizeBytes int
-	write     bool
-	target    hv.Register
-}
-
-func decodeDataAbort(syndrome uint64) (dataAbortInfo, error) {
-	const (
-		dataAbortISSMask uint64 = (1 << 25) - 1
-		isvBit                  = 24
-		sasShift                = 22
-		sasMask          uint64 = 0x3
-		srtShift                = 16
-		srtMask          uint64 = 0x1F
-		wnrBit                  = 6
-	)
-
-	iss := syndrome & dataAbortISSMask
-	if ((iss >> isvBit) & 0x1) == 0 {
-		return dataAbortInfo{}, fmt.Errorf("hvf: data abort without ISV set (syndrome=0x%x)", syndrome)
-	}
-
-	sas := (iss >> sasShift) & sasMask
-	size := 1 << sas
-	if sas > 3 {
-		return dataAbortInfo{}, fmt.Errorf("hvf: invalid SAS value %d", sas)
-	}
-
-	srt := int((iss >> srtShift) & srtMask)
-	reg, ok := arm64RegisterFromIndex(srt)
-	if !ok {
-		return dataAbortInfo{}, fmt.Errorf("hvf: unsupported data abort target register index %d", srt)
-	}
-
-	write := ((iss >> wnrBit) & 0x1) == 1
-
-	return dataAbortInfo{
-		sizeBytes: int(size),
-		write:     write,
-		target:    reg,
-	}, nil
-}
-
-func (v *virtualCPU) handleDataAbort(syndrome, physAddr, virtAddr uint64) error {
-	access, err := decodeDataAbort(syndrome)
-	if err != nil {
-		return err
-	}
-
-	addr := physAddr
-	if addr == 0 {
-		addr = virtAddr
-	}
-
-	dev, err := v.findMMIODevice(addr, uint64(access.sizeBytes))
-	if err != nil {
-		return err
-	}
-
-	var pendingError error
-
-	data := make([]byte, access.sizeBytes)
-	if access.write {
-		value, err := v.readRegister(access.target)
-		if err != nil {
-			return err
-		}
-		for i := 0; i < access.sizeBytes; i++ {
-			data[i] = byte(value >> (8 * i))
-		}
-
-		if err := dev.WriteMMIO(addr, data); err != nil {
-			pendingError = fmt.Errorf("hvf: MMIO write 0x%x (%d bytes): %w", addr, access.sizeBytes, err)
-		}
-	} else {
-		if err := dev.ReadMMIO(addr, data); err != nil {
-			pendingError = fmt.Errorf("hvf: MMIO read 0x%x (%d bytes): %w", addr, access.sizeBytes, err)
-		}
-
-		var tmp [8]byte
-		copy(tmp[:], data)
-		value := binary.LittleEndian.Uint64(tmp[:])
-		if err := v.writeRegister(access.target, value); err != nil {
-			return err
-		}
-	}
-
-	if err := v.advanceProgramCounter(); err != nil {
-		return err
-	}
-
-	return pendingError
-}
-
-func (v *virtualCPU) findMMIODevice(addr, size uint64) (hv.MemoryMappedIODevice, error) {
-	for _, dev := range v.vm.devices {
-		mmio, ok := dev.(hv.MemoryMappedIODevice)
-		if !ok {
-			continue
-		}
-		for _, region := range mmio.MMIORegions() {
-			if addr >= region.Address && addr+size <= region.Address+region.Size {
-				return mmio, nil
-			}
-		}
-	}
-	return nil, fmt.Errorf("hvf: no MMIO device handles address 0x%x (size=%d)", addr, size)
-}
-
-func (v *virtualCPU) readRegister(reg hv.Register) (uint64, error) {
-	// XZR (zero register) always reads as 0
-	if reg == hv.RegisterARM64Xzr {
-		return 0, nil
-	}
-
-	if sys, ok := hvSysRegFromRegister(reg); ok {
-		var val uint64
-		if err := hvVcpuGetSys(v.hostID, sys, &val).toError("hv_vcpu_get_sys_reg"); err != nil {
-			return 0, err
-		}
-		return val, nil
-	}
-
-	hreg, ok := hvRegFromRegister(reg)
-	if !ok {
-		return 0, fmt.Errorf("hvf: unsupported register %v", reg)
-	}
-
-	var val uint64
-	if err := hvVcpuGetReg(v.hostID, hreg, &val).toError("hv_vcpu_get_reg"); err != nil {
-		return 0, err
-	}
-	return val, nil
-}
-
-func (v *virtualCPU) writeRegister(reg hv.Register, value uint64) error {
-	// XZR (zero register) writes are discarded
-	if reg == hv.RegisterARM64Xzr {
-		return nil
-	}
-
-	if sys, ok := hvSysRegFromRegister(reg); ok {
-		return hvVcpuSetSys(v.hostID, sys, value).toError("hv_vcpu_set_sys_reg")
-	}
-
-	hreg, ok := hvRegFromRegister(reg)
-	if !ok {
-		return fmt.Errorf("hvf: unsupported register %v", reg)
-	}
-	return hvVcpuSetReg(v.hostID, hreg, value).toError("hv_vcpu_set_reg")
-}
+const arm64InstructionSizeBytes = 4
 
 func (v *virtualCPU) advanceProgramCounter() error {
-	pc, err := v.readRegister(hv.RegisterARM64Pc)
-	if err != nil {
-		return fmt.Errorf("hvf: read PC: %w", err)
+	var pc uint64
+	if err := bindings.HvVcpuGetReg(v.id, bindings.HV_REG_PC, &pc); err != bindings.HV_SUCCESS {
+		return fmt.Errorf("hvf: failed to get PC: %w", err)
 	}
-	newPC := pc + arm64InstructionSizeBytes
-	if err := v.writeRegister(hv.RegisterARM64Pc, newPC); err != nil {
-		return err
+	if err := bindings.HvVcpuSetReg(v.id, bindings.HV_REG_PC, pc+arm64InstructionSizeBytes); err != bindings.HV_SUCCESS {
+		return fmt.Errorf("hvf: failed to set PC: %w", err)
 	}
 	return nil
 }
 
-// Snapshot helpers
+func (v *virtualCPU) start() {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
-type arm64VcpuSnapshot struct {
-	Registers map[hv.Register]uint64
-}
+	cfg := bindings.HvVcpuConfigCreate()
 
-type arm64Snapshot struct {
-	cpuStates       map[int]arm64VcpuSnapshot
-	deviceSnapshots map[string]interface{}
-	memory          []byte
-}
+	var id bindings.VCPU
+	var exit *bindings.VcpuExit = new(bindings.VcpuExit)
 
-func (v *virtualCPU) captureSnapshot() (arm64VcpuSnapshot, error) {
-	regs := make(map[hv.Register]hv.RegisterValue, len(arm64GeneralRegisterMap)+len(arm64SysRegisterMap))
-	for reg := range arm64GeneralRegisterMap {
-		regs[reg] = hv.Register64(0)
-	}
-	for reg := range arm64SysRegisterMap {
-		regs[reg] = hv.Register64(0)
+	if err := bindings.HvVcpuCreate(&id, &exit, cfg); err != bindings.HV_SUCCESS {
+		v.initError <- err
+		return
 	}
 
-	if err := v.GetRegisters(regs); err != nil {
-		return arm64VcpuSnapshot{}, fmt.Errorf("hvf: capture registers: %w", err)
+	// Set the MPIDR_EL1 to the vCPU ID.
+	// Okay setting this is required to get the GICv3 to work properly.
+	if err := bindings.HvVcpuSetSysReg(id, bindings.HV_SYS_REG_MPIDR_EL1, uint64(id)); err != bindings.HV_SUCCESS {
+		v.initError <- fmt.Errorf("failed to set MPIDR_EL1: %w", err)
+		return
 	}
 
-	out := arm64VcpuSnapshot{
-		Registers: make(map[hv.Register]uint64, len(regs)),
-	}
-	for reg, val := range regs {
-		out.Registers[reg] = uint64(val.(hv.Register64))
-	}
+	v.id = id
+	v.exit = exit
 
-	return out, nil
-}
+	v.initError <- nil
 
-func (v *virtualCPU) restoreSnapshot(snap arm64VcpuSnapshot) error {
-	regs := make(map[hv.Register]hv.RegisterValue, len(snap.Registers))
-	for reg, val := range snap.Registers {
-		regs[reg] = hv.Register64(val)
+	for fn := range v.runQueue {
+		fn()
 	}
-
-	if err := v.SetRegisters(regs); err != nil {
-		return fmt.Errorf("hvf: restore registers: %w", err)
-	}
-
-	return nil
 }
 
 var (
-	_ hv.Hypervisor       = (*hypervisor)(nil)
-	_ hv.VirtualCPU       = (*virtualCPU)(nil)
-	_ hv.VirtualMachine   = (*virtualMachine)(nil)
-	_ hv.Arm64GICProvider = (*virtualMachine)(nil)
+	_ hv.VirtualCPU = &virtualCPU{}
+)
+
+type memoryRegion struct {
+	memory []byte
+}
+
+func (m *memoryRegion) Size() uint64 {
+	return uint64(len(m.memory))
+}
+
+func (m *memoryRegion) ReadAt(p []byte, off int64) (n int, err error) {
+	if off < 0 || int(off) >= len(m.memory) {
+		return 0, fmt.Errorf("hvf: ReadAt offset out of bounds")
+	}
+
+	n = copy(p, m.memory[off:])
+	if n < len(p) {
+		err = fmt.Errorf("hvf: ReadAt short read")
+	}
+	return n, err
+}
+
+func (m *memoryRegion) WriteAt(p []byte, off int64) (n int, err error) {
+	if off < 0 || int(off) >= len(m.memory) {
+		return 0, fmt.Errorf("hvf: memoryRegion WriteAt offset out of bounds: %d, %d", off, len(m.memory))
+	}
+
+	n = copy(m.memory[off:], p)
+	if n < len(p) {
+		err = fmt.Errorf("hvf: WriteAt short write")
+	}
+	return n, err
+}
+
+var (
+	_ hv.MemoryRegion = &memoryRegion{}
+)
+
+type virtualMachine struct {
+	hv         *hypervisor
+	memory     []byte
+	memoryBase uint64
+
+	runQueue chan func()
+
+	cpus map[int]*virtualCPU
+
+	devices []hv.Device
+
+	closed bool
+
+	gicInfo hv.Arm64GICInfo
+}
+
+// implements hv.VirtualMachine
+func (v *virtualMachine) Hypervisor() hv.Hypervisor { return v.hv }
+func (v *virtualMachine) MemoryBase() uint64        { return v.memoryBase }
+func (v *virtualMachine) MemorySize() uint64        { return uint64(len(v.memory)) }
+
+// CaptureSnapshot implements [hv.VirtualMachine].
+func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
+	return nil, fmt.Errorf("hvf: snapshot not implemented")
+}
+
+// RestoreSnapshot implements [hv.VirtualMachine].
+func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
+	return fmt.Errorf("hvf: snapshot not implemented")
+}
+
+// AddDevice implements [hv.VirtualMachine].
+func (v *virtualMachine) AddDevice(dev hv.Device) error {
+	v.devices = append(v.devices, dev)
+
+	return dev.Init(v)
+}
+
+// Close implements [hv.VirtualMachine].
+func (v *virtualMachine) Close() error {
+	if v.closed {
+		return nil
+	}
+
+	v.closed = true
+
+	if v.memory != nil {
+		// unmap the memory from the VM
+		if err := bindings.HvVmUnmap(bindings.IPA(v.memoryBase), uintptr(len(v.memory))); err != bindings.HV_SUCCESS {
+			slog.Error("failed to unmap memory from VM", "error", err)
+			return fmt.Errorf("failed to unmap memory from VM: %w", err)
+		}
+
+		// unmap the memory
+		if err := unix.Munmap(v.memory); err != nil {
+			return fmt.Errorf("failed to unmap memory: %w", err)
+		}
+		v.memory = nil
+	}
+
+	for _, cpu := range v.cpus {
+		if err := cpu.Close(); err != nil {
+			slog.Error("failed to close vCPU", "error", err)
+			return fmt.Errorf("failed to close vCPU: %w", err)
+		}
+	}
+
+	// destroy the VM
+	if err := bindings.HvVmDestroy(); err != bindings.HV_SUCCESS {
+		slog.Error("failed to destroy VM", "error", err)
+		return fmt.Errorf("failed to destroy VM: %w", err)
+	}
+
+	// reset the global VM pointer
+	globalVM.Store(nil)
+
+	return nil
+}
+
+// AddDeviceFromTemplate implements [hv.VirtualMachine].
+func (v *virtualMachine) AddDeviceFromTemplate(template hv.DeviceTemplate) error {
+	dev, err := template.Create(v)
+	if err != nil {
+		return fmt.Errorf("failed to create device from template: %w", err)
+	}
+
+	return v.AddDevice(dev)
+}
+
+// AllocateMemory implements [hv.VirtualMachine].
+func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.MemoryRegion, error) {
+	mem, err := unix.Mmap(
+		-1,
+		0,
+		int(size),
+		unix.PROT_READ|unix.PROT_WRITE,
+		unix.MAP_ANONYMOUS|unix.MAP_PRIVATE,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to allocate memory for VM: %w", err)
+	}
+
+	if err := bindings.HvVmMap(
+		unsafe.Pointer(&mem[0]),
+		bindings.IPA(physAddr),
+		uintptr(size),
+		bindings.HV_MEMORY_READ|bindings.HV_MEMORY_WRITE|bindings.HV_MEMORY_EXEC,
+	); err != bindings.HV_SUCCESS {
+		return nil, fmt.Errorf("failed to map memory for VM at 0x%X,0x%X: %w", physAddr, size, err)
+	}
+
+	return &memoryRegion{
+		memory: mem,
+	}, nil
+}
+
+// ReadAt implements [hv.VirtualMachine].
+func (v *virtualMachine) ReadAt(p []byte, off int64) (n int, err error) {
+	offset := off - int64(v.memoryBase)
+	if offset < 0 || uint64(offset) >= uint64(len(v.memory)) {
+		return 0, fmt.Errorf("hvf: ReadAt offset out of bounds")
+	}
+
+	n = copy(p, v.memory[offset:])
+	if n < len(p) {
+		err = fmt.Errorf("hvf: ReadAt short read")
+	}
+	return n, err
+}
+
+// WriteAt implements [hv.VirtualMachine].
+func (v *virtualMachine) WriteAt(p []byte, off int64) (n int, err error) {
+	offset := off - int64(v.memoryBase)
+	if offset < 0 || uint64(offset) >= uint64(len(v.memory)) {
+		return 0, fmt.Errorf("hvf: virtualMachine WriteAt offset out of bounds: 0x%x, 0x%x", off, len(v.memory))
+	}
+
+	n = copy(v.memory[offset:], p)
+	if n < len(p) {
+		err = fmt.Errorf("hvf: WriteAt short write")
+	}
+	return n, err
+}
+
+// Run implements [hv.VirtualMachine].
+func (v *virtualMachine) Run(ctx context.Context, cfg hv.RunConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("hvf: RunConfig cannot be nil")
+	}
+
+	return v.VirtualCPUCall(0, func(vcpu hv.VirtualCPU) error {
+		return cfg.Run(ctx, vcpu)
+	})
+}
+
+// VirtualCPUCall implements [hv.VirtualMachine].
+func (v *virtualMachine) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error {
+	vcpu, ok := v.cpus[id]
+	if !ok {
+		return fmt.Errorf("hvf: no vCPU %d found", id)
+	}
+
+	done := make(chan error, 1)
+
+	vcpu.runQueue <- func() {
+		done <- f(vcpu)
+	}
+
+	for {
+		select {
+		case err := <-done:
+			return err
+		case f := <-v.runQueue:
+			f()
+		}
+	}
+}
+
+func (v *virtualMachine) callMainThread(f func() error) error {
+	done := make(chan error, 1)
+
+	v.runQueue <- func() {
+		done <- f()
+	}
+	return <-done
+}
+
+// Arm64GICInfo implements [hv.Arm64GICProvider].
+func (v *virtualMachine) Arm64GICInfo() (hv.Arm64GICInfo, bool) {
+	return v.gicInfo, v.gicInfo.Version != hv.Arm64GICVersionUnknown
+}
+
+var (
+	_ hv.VirtualMachine   = &virtualMachine{}
+	_ hv.Arm64GICProvider = &virtualMachine{}
+)
+
+type hypervisor struct {
+}
+
+// Architecture implements [hv.Hypervisor].
+func (h *hypervisor) Architecture() hv.CpuArchitecture {
+	return hv.ArchitectureARM64
+}
+
+// Close implements [hv.Hypervisor].
+func (h *hypervisor) Close() error {
+	if vm := globalVM.Load(); vm != nil {
+		if err := vm.Close(); err != nil {
+			return fmt.Errorf("failed to close VM: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// NewVirtualMachine implements [hv.Hypervisor].
+func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, error) {
+	if vm := globalVM.Load(); vm != nil {
+		return nil, fmt.Errorf("VM already exists, hvf is limited to a single VM per process")
+	}
+
+	ret := &virtualMachine{
+		hv:       h,
+		cpus:     make(map[int]*virtualCPU),
+		runQueue: make(chan func(), 16),
+	}
+
+	vmConfig := bindings.HvVmConfigCreate()
+
+	vm := bindings.HvVmCreate(vmConfig)
+	if vm != bindings.HV_SUCCESS {
+		return nil, fmt.Errorf("failed to create VM: %d", vm)
+	}
+
+	// Only one VM can be created at a time for a single process.
+	if swapped := globalVM.CompareAndSwap(nil, ret); !swapped {
+		return nil, fmt.Errorf("global VM already exists")
+	}
+
+	// The VM is now created without memory.
+	if err := config.Callbacks().OnCreateVM(ret); err != nil {
+		return nil, fmt.Errorf("failed to create VM: %w", err)
+	}
+
+	// allocate memory for the VM
+	mem, err := ret.AllocateMemory(config.MemoryBase(), config.MemorySize())
+	if err != nil {
+		return nil, fmt.Errorf("failed to allocate memory for VM: %w", err)
+	}
+
+	ret.memory = mem.(*memoryRegion).memory
+	ret.memoryBase = config.MemoryBase()
+
+	// create GICv3 device if needed
+	if config.NeedsInterruptSupport() {
+		var (
+			distributorSize            uintptr
+			distributorBaseAlignment   uintptr
+			redistributorRegionSize    uintptr
+			redistributorSize          uintptr
+			redistributorBaseAlignment uintptr
+			msiRegionSize              uintptr
+			msiRegionBaseAlignment     uintptr
+			spiIntidBase               uint32
+			spiIntidCount              uint32
+		)
+
+		if err := bindings.HvGicGetDistributorSize(&distributorSize); err != bindings.HV_SUCCESS {
+			return nil, fmt.Errorf("failed to get GIC distributor size: %s", err)
+		}
+		if err := bindings.HvGicGetDistributorBaseAlignment(&distributorBaseAlignment); err != bindings.HV_SUCCESS {
+			return nil, fmt.Errorf("failed to get GIC distributor base alignment: %s", err)
+		}
+		if err := bindings.HvGicGetRedistributorRegionSize(&redistributorRegionSize); err != bindings.HV_SUCCESS {
+			return nil, fmt.Errorf("failed to get GIC redistributor region size: %s", err)
+		}
+		if err := bindings.HvGicGetRedistributorSize(&redistributorSize); err != bindings.HV_SUCCESS {
+			return nil, fmt.Errorf("failed to get GIC redistributor size: %s", err)
+		}
+		if err := bindings.HvGicGetRedistributorBaseAlignment(&redistributorBaseAlignment); err != bindings.HV_SUCCESS {
+			return nil, fmt.Errorf("failed to get GIC redistributor base alignment: %s", err)
+		}
+		if err := bindings.HvGicGetMsiRegionSize(&msiRegionSize); err != bindings.HV_SUCCESS {
+			return nil, fmt.Errorf("failed to get GIC msi region size: %s", err)
+		}
+		if err := bindings.HvGicGetMsiRegionBaseAlignment(&msiRegionBaseAlignment); err != bindings.HV_SUCCESS {
+			return nil, fmt.Errorf("failed to get GIC msi region base alignment: %s", err)
+		}
+		if err := bindings.HvGicGetSpiInterruptRange(&spiIntidBase, &spiIntidCount); err != bindings.HV_SUCCESS {
+			return nil, fmt.Errorf("failed to get GIC spi interrupt range: %s", err)
+		}
+
+		cfg := bindings.HvGicConfigCreate()
+
+		var distributorBase bindings.IPA = 0x08000000
+		var redistributorBase bindings.IPA = 0x080a0000
+
+		// check alignment
+		if uintptr(distributorBase)%uintptr(distributorBaseAlignment) != 0 {
+			return nil, fmt.Errorf("failed to set GIC distributor base: %#x is not aligned to %#x", distributorBase, distributorBaseAlignment)
+		}
+		if uintptr(redistributorBase)%uintptr(redistributorBaseAlignment) != 0 {
+			return nil, fmt.Errorf("failed to set GIC redistributor base: %#x is not aligned to %#x", redistributorBase, redistributorBaseAlignment)
+		}
+
+		if err := bindings.HvGicConfigSetDistributorBase(cfg, distributorBase); err != bindings.HV_SUCCESS {
+			return nil, fmt.Errorf("failed to set GIC distributor base: %s", err)
+		}
+		if err := bindings.HvGicConfigSetRedistributorBase(cfg, redistributorBase); err != bindings.HV_SUCCESS {
+			return nil, fmt.Errorf("failed to set GIC redistributor base: %s", err)
+		}
+
+		ret.gicInfo = hv.Arm64GICInfo{
+			Version:              hv.Arm64GICVersion3,
+			DistributorBase:      uint64(distributorBase),
+			DistributorSize:      uint64(distributorSize),
+			RedistributorBase:    uint64(redistributorBase),
+			RedistributorSize:    uint64(redistributorSize),
+			MaintenanceInterrupt: hv.Arm64Interrupt{Type: 1, Num: 9, Flags: 0xF04},
+		}
+
+		if err := bindings.HvGicCreate(cfg); err != bindings.HV_SUCCESS {
+			return nil, fmt.Errorf("failed to create GICv3: %s", err)
+		}
+	}
+
+	// Call the callback to allow the user to perform any additional initialization.
+	if err := config.Callbacks().OnCreateVMWithMemory(ret); err != nil {
+		return nil, fmt.Errorf("failed to create VM with memory: %w", err)
+	}
+
+	// create vCPUs
+	if config.CPUCount() != 1 {
+		return nil, fmt.Errorf("hvf: only 1 vCPU supported, got %d", config.CPUCount())
+	}
+
+	for i := 0; i < config.CPUCount(); i++ {
+		vcpu := &virtualCPU{
+			vm:        ret,
+			runQueue:  make(chan func(), 16),
+			initError: make(chan error, 1),
+		}
+
+		ret.cpus[i] = vcpu
+
+		go vcpu.start()
+
+		err := <-vcpu.initError
+		close(vcpu.initError)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create vCPU %d: %w", i, err)
+		}
+
+		if err := config.Callbacks().OnCreateVCPU(vcpu); err != nil {
+			return nil, fmt.Errorf("failed to create vCPU %d: %w", i, err)
+		}
+	}
+
+	if err := config.Loader().Load(ret); err != nil {
+		return nil, fmt.Errorf("failed to load VM: %w", err)
+	}
+
+	return ret, nil
+}
+
+var (
+	_ hv.Hypervisor = &hypervisor{}
 )
 
 func Open() (hv.Hypervisor, error) {
-	if err := ensureInitialized(); err != nil {
-		return nil, err
+	if err := bindings.Load(); err != nil {
+		return nil, fmt.Errorf("failed to load Hypervisor.framework: %w", err)
 	}
+
 	return &hypervisor{}, nil
 }
