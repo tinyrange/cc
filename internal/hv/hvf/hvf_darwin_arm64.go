@@ -665,6 +665,20 @@ func (v *virtualMachine) AddDevice(dev hv.Device) error {
 	return dev.Init(v)
 }
 
+// SetIRQ implements [hv.VirtualMachine].
+func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
+	// Extract SPI number from irqLine encoding and convert to GIC intid
+	// SPIs start at intid 32 in GICv3
+	spiOffset := irqLine & 0xFFFF
+	intid := spiOffset + 32
+
+	if err := bindings.HvGicSetSpi(intid, level); err != bindings.HV_SUCCESS {
+		return fmt.Errorf("hvf: failed to set SPI (intid=%d): %w", intid, err)
+	}
+
+	return nil
+}
+
 // Close implements [hv.VirtualMachine].
 func (v *virtualMachine) Close() error {
 	if v.closed {

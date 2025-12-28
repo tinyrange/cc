@@ -652,26 +652,28 @@ func (d *VirtioPCIDevice) recordUsedElement(q *queue, head uint16, length uint32
 	return d.writeGuestUint16(q.usedAddr+2, q.usedIdx)
 }
 
-func (d *VirtioPCIDevice) raiseInterrupt(bit uint32) {
+func (d *VirtioPCIDevice) raiseInterrupt(bit uint32) error {
 	d.interruptStatus |= uint8(bit)
 	if d.vm == nil {
-		return
+		return fmt.Errorf("virtio-pci: virtual machine is nil")
 	}
 	if d.msixEnabled() {
 		vector := d.msixConfigVector
 		if delivered, blocked := d.trySignalMSIX(vector); delivered || blocked {
-			return
+			return nil
 		}
 	}
 	if d.msiEnabled() {
 		if vm, ok := d.vm.(msiCapableVM); ok {
 			if err := vm.SignalMSI(d.msiAddress, uint32(d.msiData), 0); err != nil {
 				slog.Error("virtio-pci: signal MSI failed", "err", err)
+				return err
 			}
-			return
+			return nil
 		}
 	}
 	// Fall back to legacy INTx (not implemented yet)
+	return fmt.Errorf("virtio-pci: legacy INTx not implemented")
 }
 
 func (d *VirtioPCIDevice) readGuest(addr uint64, length uint32) ([]byte, error) {

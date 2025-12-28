@@ -400,6 +400,8 @@ type VirtualMachine interface {
 
 	Run(ctx context.Context, cfg RunConfig) error
 
+	SetIRQ(irqLine uint32, level bool) error
+
 	VirtualCPUCall(id int, f func(vcpu VirtualCPU) error) error
 
 	AddDevice(dev Device) error
