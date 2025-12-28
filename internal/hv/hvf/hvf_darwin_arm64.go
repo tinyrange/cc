@@ -89,6 +89,7 @@ func (v *virtualCPU) Close() error {
 		if err := bindings.HvVcpuDestroy(v.id); err != bindings.HV_SUCCESS {
 			slog.Error("failed to destroy vCPU", "error", err)
 			errChan <- fmt.Errorf("failed to destroy vCPU: %w", err)
+			return
 		}
 		errChan <- nil
 	}
