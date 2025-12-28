@@ -13,35 +13,46 @@ const (
 	armSPIBase       = 32 // GIC SPIs start at INTID 32
 )
 
+func arm64KVMIRQFromEncodedIRQLine(irqLine uint32) (kvmIRQ uint32, irqType uint32, intid uint32, err error) {
+	// Extract the IRQ type from the encoded irqLine.
+	irqType = (irqLine >> armIRQTypeShift) & 0xff
+	if irqType == 0 {
+		return 0, 0, 0, fmt.Errorf("kvm: interrupt type missing in irqLine %#x", irqLine)
+	}
+
+	// The low 16 bits carry the IRQ number. For SPI this is an SPI *offset*
+	// (as used by the device tree "interrupts" property). KVM expects a GIC INTID.
+	irqNum := irqLine & 0xffff
+
+	switch irqType {
+	case kvmArmIRQTypeSPI:
+		intid = armSPIBase + irqNum
+	default:
+		return 0, irqType, irqNum, fmt.Errorf("kvm: unsupported ARM64 IRQ type %d in irqLine %#x", irqType, irqLine)
+	}
+
+	if intid > 0xffff {
+		return 0, irqType, intid, fmt.Errorf("kvm: INTID %d out of range in irqLine %#x", intid, irqLine)
+	}
+
+	kvmIRQ = (irqType << armIRQTypeShift) | (intid & 0xffff)
+	return kvmIRQ, irqType, intid, nil
+}
+
 // SetIRQ asserts or deasserts an interrupt line on arm64.
 // The irqLine is expected to be in the encoded format produced by
 // EncodeIRQLineForArch:
 //   - bits 31-24: IRQ type (1 = SPI)
-//   - bits 15-0:  GIC INTID
-//
-// For KVM, we need to convert the GIC INTID to an SPI offset (INTID - 32).
+//   - bits 15-0:  SPI offset (INTID - 32)
 func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 	if v == nil {
 		return fmt.Errorf("kvm: virtual machine is nil")
 	}
 
-	// Extract the IRQ type from the encoded irqLine.
-	irqType := (irqLine >> armIRQTypeShift) & 0xff
-	if irqType == 0 {
-		return fmt.Errorf("kvm: interrupt type missing in irqLine %#x", irqLine)
+	kvmIRQ, irqType, intid, err := arm64KVMIRQFromEncodedIRQLine(irqLine)
+	if err != nil {
+		return err
 	}
-
-	// Extract the GIC INTID from the low 16 bits.
-	intid := irqLine & 0xffff
-
-	// TODO: Determine definitively whether kernel expects full INTID or SPI offset.
-	// According to kernel source, it expects SPI offset (INTID - 32),
-	// but this implementation currently tries the full INTID format.
-	// This is experimental and may not be correct.
-
-	// Use the full INTID. KVM_IRQ_LINE on ARM64 accepts the full INTID in the low 16 bits.
-	// The type is encoded in bits 31-24.
-	kvmIRQ := (irqType << armIRQTypeShift) | intid
 
 	if err := irqLevel(v.vmFd, kvmIRQ, level); err != nil {
 		return fmt.Errorf("kvm: setting IRQ line (input=%#x, kvmIRQ=%#x, type=%d, intid=%d): %w",
