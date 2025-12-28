@@ -767,6 +767,11 @@ func NewVirtualMachine(
 			return nil
 		}
 
+		// ignore this on macOS for ARM64
+		if runtime.GOOS == "darwin" && h.Architecture() == hv.ArchitectureARM64 {
+			return nil
+		}
+
 		mem, err := vm.AllocateMemory(configRegionPhysAddr, configRegionSize)
 		if err != nil {
 			return fmt.Errorf("allocate initx config region: %v", err)

@@ -265,9 +265,7 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 				return fmt.Errorf("get virtio mmio device tree nodes: %w", err)
 			}
 			virtioNodes = append(virtioNodes, nodes...)
-		}
-		// Also check for non-virtio devices that provide device tree nodes
-		if dtp, ok := dev.(DeviceTreeProvider); ok {
+		} else if dtp, ok := dev.(DeviceTreeProvider); ok {
 			nodes, err := dtp.DeviceTreeNodes()
 			if err != nil {
 				return fmt.Errorf("get device tree nodes: %w", err)

@@ -101,7 +101,10 @@ func (v *virtualCPU) Close() error {
 // GetRegisters implements [hv.VirtualCPU].
 func (v *virtualCPU) GetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 	for reg := range regs {
-		if hvReg, ok := registerMap[reg]; ok {
+		if reg == hv.RegisterARM64Xzr {
+			regs[reg] = hv.Register64(0)
+			continue
+		} else if hvReg, ok := registerMap[reg]; ok {
 			var value uint64
 			if err := bindings.HvVcpuGetReg(v.id, hvReg, &value); err != bindings.HV_SUCCESS {
 				return fmt.Errorf("hvf: failed to get register %v: %w", reg, err)
@@ -731,7 +734,7 @@ func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.Memory
 		uintptr(size),
 		bindings.HV_MEMORY_READ|bindings.HV_MEMORY_WRITE|bindings.HV_MEMORY_EXEC,
 	); err != bindings.HV_SUCCESS {
-		return nil, fmt.Errorf("failed to map memory for VM: %w", err)
+		return nil, fmt.Errorf("failed to map memory for VM at 0x%X,0x%X: %w", physAddr, size, err)
 	}
 
 	return &memoryRegion{
