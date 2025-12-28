@@ -32,7 +32,7 @@ func (hv *hypervisor) initArm64VGIC(vm *virtualMachine) error {
 	if err := hv.initArm64VGICv3(vm); err != nil {
 		debug.Writef("kvm hypervisor initArm64VGIC v3 failed", "initArm64VGICv3 failed: %v", err)
 		if errors.Is(err, errArmVGICUnsupported) {
-			debug.Writef("kvm hypervisor initArm64VGIC v2 fallback", "initArm64VGICv2 failed, falling back to v2")
+			debug.Writef("kvm hypervisor initArm64VGIC v2 fallback", "initArm64VGICv3 unsupported, falling back to v2")
 			return hv.initArm64VGICv2(vm)
 		}
 		return err
