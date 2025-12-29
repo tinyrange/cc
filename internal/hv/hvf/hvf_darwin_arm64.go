@@ -693,11 +693,6 @@ func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
 
 	return nil
 }
-		return fmt.Errorf("hvf: failed to set SPI (intid=%d): %w", intid, err)
-	}
-
-	return nil
-}
 
 // Close implements [hv.VirtualMachine].
 func (v *virtualMachine) Close() error {
