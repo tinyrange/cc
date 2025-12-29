@@ -64,6 +64,10 @@ type Cocoa struct {
 	ctx     objc.ID
 	pool    objc.ID
 	running bool
+
+	// Input state tracking (frame-based).
+	keyStates    map[Key]KeyState
+	buttonStates map[Button]ButtonState
 }
 
 var (
@@ -102,6 +106,36 @@ var (
 	selInitWithAttributes    objc.SEL
 	selInitWithFormat        objc.SEL
 	selSetValuesForParameter objc.SEL
+
+	// NSEvent selectors (input).
+	selEventType      objc.SEL
+	selEventKeyCode   objc.SEL
+	selEventIsARepeat objc.SEL
+	selEventFlags     objc.SEL
+	selEventButtonNum objc.SEL
+)
+
+// Subset of NSEventType values we care about.
+// https://developer.apple.com/documentation/appkit/nsevent/eventtype
+const (
+	nsEventTypeLeftMouseDown  = 1
+	nsEventTypeLeftMouseUp    = 2
+	nsEventTypeRightMouseDown = 3
+	nsEventTypeRightMouseUp   = 4
+	nsEventTypeKeyDown        = 10
+	nsEventTypeKeyUp          = 11
+	nsEventTypeFlagsChanged   = 12
+	nsEventTypeOtherMouseDown = 25
+	nsEventTypeOtherMouseUp   = 26
+)
+
+// Subset of NSEventModifierFlags values we care about.
+// https://developer.apple.com/documentation/appkit/nseventmodifierflags
+const (
+	nsEventModifierFlagShift   = 1 << 17
+	nsEventModifierFlagControl = 1 << 18
+	nsEventModifierFlagOption  = 1 << 19
+	nsEventModifierFlagCommand = 1 << 20
 )
 
 // Init boots Cocoa and OpenGL, keeping control of the run loop in Go.
@@ -111,7 +145,11 @@ func New(title string, width, height int, useCoreProfile bool) (Window, error) {
 		return nil, err
 	}
 
-	c := &Cocoa{running: true}
+	c := &Cocoa{
+		running:      true,
+		keyStates:    make(map[Key]KeyState),
+		buttonStates: make(map[Button]ButtonState),
+	}
 	if err := c.bootstrapApp(); err != nil {
 		return nil, err
 	}
@@ -134,6 +172,22 @@ func (c *Cocoa) Poll() bool {
 		return false
 	}
 
+	// Transition states: Pressed -> Down, Released -> Up (once per Poll()).
+	for key, state := range c.keyStates {
+		if state == KeyStatePressed {
+			c.keyStates[key] = KeyStateDown
+		} else if state == KeyStateReleased {
+			c.keyStates[key] = KeyStateUp
+		}
+	}
+	for button, state := range c.buttonStates {
+		if state == ButtonStatePressed {
+			c.buttonStates[button] = ButtonStateDown
+		} else if state == ButtonStateReleased {
+			c.buttonStates[button] = ButtonStateUp
+		}
+	}
+
 	// Drain one slice of the run loop without blocking and pump pending NSEvents.
 	cfRunLoopRunInMode(cfDefaultMode, 0, true)
 	for {
@@ -141,6 +195,8 @@ func (c *Cocoa) Poll() bool {
 		if ev == 0 {
 			break
 		}
+
+		c.processEvent(ev)
 		c.app.Send(selSendEvent, ev)
 	}
 
@@ -344,6 +400,13 @@ func loadSelectors() {
 	selInitWithAttributes = objc.RegisterName("initWithAttributes:")
 	selInitWithFormat = objc.RegisterName("initWithFormat:shareContext:")
 	selSetValuesForParameter = objc.RegisterName("setValues:forParameter:")
+
+	// NSEvent (input).
+	selEventType = objc.RegisterName("type")
+	selEventKeyCode = objc.RegisterName("keyCode")
+	selEventIsARepeat = objc.RegisterName("isARepeat")
+	selEventFlags = objc.RegisterName("modifierFlags")
+	selEventButtonNum = objc.RegisterName("buttonNumber")
 }
 
 func nsString(v string) objc.ID {
@@ -369,13 +432,352 @@ func (c *Cocoa) Scale() float32 {
 }
 
 func (c *Cocoa) GetKeyState(key Key) KeyState {
-	// TODO: Implement key state tracking
+	if c.keyStates == nil {
+		return KeyStateUp
+	}
+	if state, ok := c.keyStates[key]; ok {
+		return state
+	}
 	return KeyStateUp
 }
 
 func (c *Cocoa) GetButtonState(button Button) ButtonState {
-	// TODO: Implement button state tracking
+	if c.buttonStates == nil {
+		return ButtonStateUp
+	}
+	if state, ok := c.buttonStates[button]; ok {
+		return state
+	}
 	return ButtonStateUp
+}
+
+func (c *Cocoa) processEvent(ev objc.ID) {
+	etype := int64(objc.Send[uint64](ev, selEventType))
+	switch etype {
+	case nsEventTypeKeyDown:
+		keyCode := uint16(objc.Send[uint64](ev, selEventKeyCode))
+		key := cocoaKeyCodeToKey(keyCode)
+		if key == KeyUnknown {
+			return
+		}
+		isRepeat := objc.Send[bool](ev, selEventIsARepeat)
+
+		prev := c.GetKeyState(key)
+		if isRepeat || prev.IsDown() {
+			c.keyStates[key] = KeyStateRepeated
+		} else {
+			c.keyStates[key] = KeyStatePressed
+		}
+
+	case nsEventTypeKeyUp:
+		keyCode := uint16(objc.Send[uint64](ev, selEventKeyCode))
+		key := cocoaKeyCodeToKey(keyCode)
+		if key == KeyUnknown {
+			return
+		}
+		c.keyStates[key] = KeyStateReleased
+
+	case nsEventTypeFlagsChanged:
+		// Modifiers typically come through as flagsChanged rather than keyDown/keyUp.
+		keyCode := uint16(objc.Send[uint64](ev, selEventKeyCode))
+		key := cocoaKeyCodeToKey(keyCode)
+		if key == KeyUnknown {
+			return
+		}
+		flags := objc.Send[uint64](ev, selEventFlags)
+		isDown := cocoaModifierKeyIsDown(key, flags)
+		c.setKeyDown(key, isDown)
+
+	case nsEventTypeLeftMouseDown, nsEventTypeRightMouseDown, nsEventTypeOtherMouseDown:
+		buttonNum := int64(objc.Send[uint64](ev, selEventButtonNum))
+		if button, ok := cocoaButtonNumberToButton(buttonNum); ok {
+			c.buttonStates[button] = ButtonStatePressed
+		}
+
+	case nsEventTypeLeftMouseUp, nsEventTypeRightMouseUp, nsEventTypeOtherMouseUp:
+		buttonNum := int64(objc.Send[uint64](ev, selEventButtonNum))
+		if button, ok := cocoaButtonNumberToButton(buttonNum); ok {
+			c.buttonStates[button] = ButtonStateReleased
+		}
+	}
+}
+
+func (c *Cocoa) setKeyDown(key Key, down bool) {
+	prev := c.GetKeyState(key)
+	if down {
+		if prev == KeyStateUp || prev == KeyStateReleased {
+			c.keyStates[key] = KeyStatePressed
+		} else {
+			c.keyStates[key] = KeyStateDown
+		}
+		return
+	}
+
+	if prev.IsDown() {
+		c.keyStates[key] = KeyStateReleased
+	} else {
+		c.keyStates[key] = KeyStateUp
+	}
+}
+
+func cocoaButtonNumberToButton(n int64) (Button, bool) {
+	switch n {
+	case 0:
+		return ButtonLeft, true
+	case 1:
+		return ButtonRight, true
+	case 2:
+		return ButtonMiddle, true
+	case 3:
+		return Button4, true
+	case 4:
+		return Button5, true
+	default:
+		return ButtonLeft, false
+	}
+}
+
+func cocoaModifierKeyIsDown(key Key, flags uint64) bool {
+	switch key {
+	case KeyLeftShift, KeyRightShift:
+		return (flags & nsEventModifierFlagShift) != 0
+	case KeyLeftControl, KeyRightControl:
+		return (flags & nsEventModifierFlagControl) != 0
+	case KeyLeftAlt, KeyRightAlt:
+		return (flags & nsEventModifierFlagOption) != 0
+	case KeyLeftSuper, KeyRightSuper:
+		return (flags & nsEventModifierFlagCommand) != 0
+	default:
+		return false
+	}
+}
+
+// cocoaKeyCodeToKey maps macOS virtual keycodes (hardware-dependent, but stable on Apple keyboards)
+// to our cross-platform Key enum.
+//
+// Keycode reference (commonly cited):
+// https://developer.apple.com/library/archive/technotes/tn2450/_index.html
+func cocoaKeyCodeToKey(code uint16) Key {
+	switch code {
+	// Letters.
+	case 0:
+		return KeyA
+	case 1:
+		return KeyS
+	case 2:
+		return KeyD
+	case 3:
+		return KeyF
+	case 4:
+		return KeyH
+	case 5:
+		return KeyG
+	case 6:
+		return KeyZ
+	case 7:
+		return KeyX
+	case 8:
+		return KeyC
+	case 9:
+		return KeyV
+	case 11:
+		return KeyB
+	case 12:
+		return KeyQ
+	case 13:
+		return KeyW
+	case 14:
+		return KeyE
+	case 15:
+		return KeyR
+	case 16:
+		return KeyY
+	case 17:
+		return KeyT
+	case 31:
+		return KeyO
+	case 32:
+		return KeyU
+	case 34:
+		return KeyI
+	case 35:
+		return KeyP
+	case 37:
+		return KeyL
+	case 38:
+		return KeyJ
+	case 40:
+		return KeyK
+	case 45:
+		return KeyN
+	case 46:
+		return KeyM
+
+	// Numbers (top row).
+	case 18:
+		return Key1
+	case 19:
+		return Key2
+	case 20:
+		return Key3
+	case 21:
+		return Key4
+	case 23:
+		return Key5
+	case 22:
+		return Key6
+	case 26:
+		return Key7
+	case 28:
+		return Key8
+	case 25:
+		return Key9
+	case 29:
+		return Key0
+
+	// Function keys.
+	case 122:
+		return KeyF1
+	case 120:
+		return KeyF2
+	case 99:
+		return KeyF3
+	case 118:
+		return KeyF4
+	case 96:
+		return KeyF5
+	case 97:
+		return KeyF6
+	case 98:
+		return KeyF7
+	case 100:
+		return KeyF8
+	case 101:
+		return KeyF9
+	case 109:
+		return KeyF10
+	case 103:
+		return KeyF11
+	case 111:
+		return KeyF12
+
+	// Modifiers.
+	case 56:
+		return KeyLeftShift
+	case 60:
+		return KeyRightShift
+	case 59:
+		return KeyLeftControl
+	case 62:
+		return KeyRightControl
+	case 58:
+		return KeyLeftAlt
+	case 61:
+		return KeyRightAlt
+	case 55:
+		return KeyLeftSuper
+	case 54:
+		return KeyRightSuper
+
+	// Special keys.
+	case 49:
+		return KeySpace
+	case 36:
+		return KeyEnter
+	case 53:
+		return KeyEscape
+	case 51:
+		return KeyBackspace
+	case 117:
+		return KeyDelete
+	case 48:
+		return KeyTab
+	case 57:
+		return KeyCapsLock
+
+	// Arrow keys.
+	case 126:
+		return KeyUp
+	case 125:
+		return KeyDown
+	case 123:
+		return KeyLeft
+	case 124:
+		return KeyRight
+
+	// Navigation keys.
+	case 115:
+		return KeyHome
+	case 119:
+		return KeyEnd
+	case 116:
+		return KeyPageUp
+	case 121:
+		return KeyPageDown
+	case 114: // Help key (often mapped as Insert on extended keyboards)
+		return KeyInsert
+
+	// Punctuation and symbols.
+	case 50:
+		return KeyGraveAccent
+	case 27:
+		return KeyMinus
+	case 24:
+		return KeyEqual
+	case 33:
+		return KeyLeftBracket
+	case 30:
+		return KeyRightBracket
+	case 42:
+		return KeyBackslash
+	case 41:
+		return KeySemicolon
+	case 39:
+		return KeyApostrophe
+	case 43:
+		return KeyComma
+	case 47:
+		return KeyPeriod
+	case 44:
+		return KeySlash
+
+	// Numpad keys.
+	case 82:
+		return KeyNumpad0
+	case 83:
+		return KeyNumpad1
+	case 84:
+		return KeyNumpad2
+	case 85:
+		return KeyNumpad3
+	case 86:
+		return KeyNumpad4
+	case 87:
+		return KeyNumpad5
+	case 88:
+		return KeyNumpad6
+	case 89:
+		return KeyNumpad7
+	case 91:
+		return KeyNumpad8
+	case 92:
+		return KeyNumpad9
+	case 65:
+		return KeyNumpadDecimal
+	case 75:
+		return KeyNumpadDivide
+	case 67:
+		return KeyNumpadMultiply
+	case 78:
+		return KeyNumpadSubtract
+	case 69:
+		return KeyNumpadAdd
+	case 76:
+		return KeyNumpadEnter
+	case 81:
+		return KeyNumpadEqual
+	}
+	return KeyUnknown
 }
 
 // getDisplayScale returns the display scale factor.

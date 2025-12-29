@@ -690,11 +690,6 @@ func main() {
 	}
 
 	if *runtest != "" {
-		if runtime.GOOS != "linux" {
-			fmt.Fprintf(os.Stderr, "-runtest is only supported on Linux hosts\n")
-			os.Exit(1)
-		}
-
 		testName := *runtest
 		dockerfilePath := filepath.Join("tests", testName, "Dockerfile")
 		if _, err := os.Stat(dockerfilePath); err != nil {
@@ -722,16 +717,25 @@ func main() {
 			os.Exit(1)
 		}
 
+		hasDocker := false
+		if _, err := exec.LookPath("docker"); err == nil {
+			hasDocker = true
+		}
+
 		shouldRebuild := true
 		if isOlder, err := isContextOlderThanOutput(buildDir, tarPath); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to check cache: %v\n", err)
 			os.Exit(1)
-		} else if isOlder {
+		} else if isOlder || !hasDocker {
 			fmt.Printf("Context is older than output tar file, using cached build...\n")
 			shouldRebuild = false
 		}
 
 		if shouldRebuild {
+			if !hasDocker {
+				fmt.Fprintf(os.Stderr, "docker is not installed, cannot build Docker image\n")
+				os.Exit(1)
+			}
 			// Clear cc cache for this tar file so it will be re-extracted
 			if err := clearCCCache(tarPath); err != nil {
 				// Log but don't fail - cache clearing is best effort

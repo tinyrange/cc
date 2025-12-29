@@ -843,8 +843,8 @@ func AddDefaultRoute(ifName string, gateway uint32, errLabel ir.Label, errVar ir
 
 				// Build sockaddr_nl at offset 44: Family=AF_NETLINK, Pad=0, Pid=0, Groups=0
 				ir.Assign(slot.At(44), ir.Int32(int32(linux.AF_NETLINK))), // Family (uint16) + Pad (uint16) as uint32
-				ir.Assign(slot.At(48), ir.Int32(0)),                        // Pid (uint32)
-				ir.Assign(slot.At(52), ir.Int32(0)),                        // Groups (uint32)
+				ir.Assign(slot.At(48), ir.Int32(0)),                       // Pid (uint32)
+				ir.Assign(slot.At(52), ir.Int32(0)),                       // Groups (uint32)
 				ir.Assign(sockaddrNlPtr, slot.PointerWithDisp(44)),
 
 				// Send netlink message
@@ -1000,7 +1000,10 @@ func Exec(path string, argv []string, envp []string, errLabel ir.Label, errVar i
 					argvPtr,
 					envpPtr,
 				)),
-				ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
+				ir.If(ir.IsNegative(errVar), ir.Block{
+					ir.Printf("cc: execve failed: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+					ir.Goto(errLabel),
+				}),
 			)
 
 			return ir.Block(frags)
