@@ -170,12 +170,12 @@ func (gl *openGL) BindVertexArray(array uint32) {
 	gl.bindVertexArray.Call(uintptr(array))
 }
 
-func (gl *openGL) VertexAttribPointer(index uint32, size int32, xtype uint32, normalized bool, stride int32, offset unsafe.Pointer) {
+func (gl *openGL) VertexAttribPointer(index uint32, size int32, xtype uint32, normalized bool, stride int32, offset uintptr) {
 	var norm uintptr
 	if normalized {
 		norm = 1
 	}
-	gl.vertexAttribPointer.Call(uintptr(index), uintptr(size), uintptr(xtype), norm, uintptr(stride), uintptr(offset))
+	gl.vertexAttribPointer.Call(uintptr(index), uintptr(size), uintptr(xtype), norm, uintptr(stride), offset)
 }
 
 func (gl *openGL) EnableVertexAttribArray(index uint32) {

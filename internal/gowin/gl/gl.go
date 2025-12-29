@@ -165,7 +165,7 @@ type OpenGL interface {
 	GenVertexArrays(n int32, arrays *uint32)
 	DeleteVertexArrays(n int32, arrays *uint32)
 	BindVertexArray(array uint32)
-	VertexAttribPointer(index uint32, size int32, xtype uint32, normalized bool, stride int32, offset unsafe.Pointer)
+	VertexAttribPointer(index uint32, size int32, xtype uint32, normalized bool, stride int32, offset uintptr)
 	EnableVertexAttribArray(index uint32)
 
 	// Shader operations

@@ -186,11 +186,11 @@ func New(gl glpkg.OpenGL, cachew, cacheh int) *Stash {
 	posLoc := gl.GetAttribLocation(program, "a_position")
 	texLoc := gl.GetAttribLocation(program, "a_texCoord")
 	colLoc := gl.GetAttribLocation(program, "a_color")
-	gl.VertexAttribPointer(uint32(posLoc), 2, glpkg.Float, false, 8*4, unsafe.Pointer(uintptr(0)))
+	gl.VertexAttribPointer(uint32(posLoc), 2, glpkg.Float, false, 8*4, 0)
 	gl.EnableVertexAttribArray(uint32(posLoc))
-	gl.VertexAttribPointer(uint32(texLoc), 2, glpkg.Float, false, 8*4, unsafe.Pointer(uintptr(8)))
+	gl.VertexAttribPointer(uint32(texLoc), 2, glpkg.Float, false, 8*4, 8)
 	gl.EnableVertexAttribArray(uint32(texLoc))
-	gl.VertexAttribPointer(uint32(colLoc), 4, glpkg.Float, false, 8*4, unsafe.Pointer(uintptr(16)))
+	gl.VertexAttribPointer(uint32(colLoc), 4, glpkg.Float, false, 8*4, 16)
 	gl.EnableVertexAttribArray(uint32(colLoc))
 
 	return stash

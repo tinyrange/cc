@@ -179,7 +179,7 @@ func (dm *DisplayManager) processTabletInput() {
 	}
 }
 
-const vertexShaderSource = `#version 130
+const vertexShaderSource = `#version 150
 in vec2 position;
 in vec2 texCoord;
 out vec2 fragTexCoord;
@@ -189,7 +189,7 @@ void main() {
 }
 ` + "\x00"
 
-const fragmentShaderSource = `#version 130
+const fragmentShaderSource = `#version 150
 in vec2 fragTexCoord;
 out vec4 fragColor;
 uniform sampler2D tex;
@@ -268,15 +268,13 @@ func (dm *DisplayManager) initGL(gl gll.OpenGL) error {
 
 	if positionLoc >= 0 {
 		gl.EnableVertexAttribArray(uint32(positionLoc))
-		gl.VertexAttribPointer(uint32(positionLoc), 2, gll.Float, false, 4*4, nil)
+		gl.VertexAttribPointer(uint32(positionLoc), 2, gll.Float, false, 4*4, 0)
 	}
 
 	if texCoordLoc >= 0 {
 		gl.EnableVertexAttribArray(uint32(texCoordLoc))
 		// Offset for texture coordinates (skip 2 floats = 8 bytes)
-		// #nosec G103 - this is a standard OpenGL vertex attribute offset pattern
-		texCoordOffset := unsafe.Pointer(uintptr(2 * 4)) //nolint:staticcheck
-		gl.VertexAttribPointer(uint32(texCoordLoc), 2, gll.Float, false, 4*4, texCoordOffset)
+		gl.VertexAttribPointer(uint32(texCoordLoc), 2, gll.Float, false, 4*4, uintptr(2*4))
 	}
 
 	gl.BindVertexArray(0)
@@ -336,6 +334,11 @@ func (dm *DisplayManager) Render() {
 		// Convert BGRA to RGBA if needed
 		rgbaPixels := convertBGRAtoRGBA(pixels, width, height)
 
+		var pixelPtr unsafe.Pointer
+		if len(rgbaPixels) > 0 {
+			pixelPtr = unsafe.Pointer(&rgbaPixels[0])
+		}
+
 		gl.BindTexture(gll.Texture2D, dm.textureID)
 		gl.TexImage2D(
 			gll.Texture2D,
@@ -346,7 +349,7 @@ func (dm *DisplayManager) Render() {
 			0,
 			gll.RGBA,
 			gll.UnsignedByte,
-			unsafe.Pointer(&rgbaPixels[0]),
+			pixelPtr,
 		)
 	}
 
