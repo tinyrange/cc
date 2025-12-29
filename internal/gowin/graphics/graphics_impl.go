@@ -147,13 +147,13 @@ func newWithProfile(title string, width, height int, useCoreProfile bool) (Windo
 	posLoc := gl.GetAttribLocation(program, "a_position")
 	texLoc := gl.GetAttribLocation(program, "a_texCoord")
 	colLoc := gl.GetAttribLocation(program, "a_color")
-	gl.VertexAttribPointer(uint32(posLoc), 2, glpkg.Float, false, 8*4, unsafe.Pointer(uintptr(0)))
+	gl.VertexAttribPointer(uint32(posLoc), 2, glpkg.Float, false, 8*4, 0)
 	gl.EnableVertexAttribArray(uint32(posLoc))
 	// TexCoord: 2 floats at offset 2*4 = 8
-	gl.VertexAttribPointer(uint32(texLoc), 2, glpkg.Float, false, 8*4, unsafe.Pointer(uintptr(8)))
+	gl.VertexAttribPointer(uint32(texLoc), 2, glpkg.Float, false, 8*4, 8)
 	gl.EnableVertexAttribArray(uint32(texLoc))
 	// Color: 4 floats at offset 4*4 = 16
-	gl.VertexAttribPointer(uint32(colLoc), 4, glpkg.Float, false, 8*4, unsafe.Pointer(uintptr(16)))
+	gl.VertexAttribPointer(uint32(colLoc), 4, glpkg.Float, false, 8*4, 16)
 	gl.EnableVertexAttribArray(uint32(colLoc))
 
 	return w, nil

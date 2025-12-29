@@ -37,7 +37,7 @@ type openGL struct {
 	genVertexArrays         func(int32, *uint32)
 	deleteVertexArrays      func(int32, *uint32)
 	bindVertexArray         func(uint32)
-	vertexAttribPointer     func(uint32, int32, uint32, bool, int32, unsafe.Pointer)
+	vertexAttribPointer     func(uint32, int32, uint32, bool, int32, uintptr)
 	enableVertexAttribArray func(uint32)
 
 	// Shader operations
@@ -164,7 +164,7 @@ func (gl *openGL) BindVertexArray(array uint32) {
 	gl.bindVertexArray(array)
 }
 
-func (gl *openGL) VertexAttribPointer(index uint32, size int32, xtype uint32, normalized bool, stride int32, offset unsafe.Pointer) {
+func (gl *openGL) VertexAttribPointer(index uint32, size int32, xtype uint32, normalized bool, stride int32, offset uintptr) {
 	gl.vertexAttribPointer(index, size, xtype, normalized, stride, offset)
 }
 

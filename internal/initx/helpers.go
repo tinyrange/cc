@@ -805,6 +805,7 @@ func AddDefaultRoute(ifName string, gateway uint32, errLabel ir.Label, errVar ir
 			ifindexVar := nextHelperVar("ifindex_var")
 			ackPtr := nextHelperVar("ackPtr")
 			ackLen := nextHelperVar("ackLen")
+			ackErrPtr := nextHelperVar("ackErrPtr")
 			ackErrCode := nextHelperVar("ackErrCode")
 			sockaddrNlPtr := nextHelperVar("sockaddr_nl_ptr")
 
@@ -841,9 +842,9 @@ func AddDefaultRoute(ifName string, gateway uint32, errLabel ir.Label, errVar ir
 				ir.Assign(slot.At(32), ifindex.As32()),
 
 				// Build sockaddr_nl at offset 44: Family=AF_NETLINK, Pad=0, Pid=0, Groups=0
-				ir.Assign(slot.At(44), ir.Int64(linux.AF_NETLINK)), // Family (uint16) + Pad (uint16) as uint32
-				ir.Assign(slot.At(48), ir.Int64(0)),                // Pid (uint32)
-				ir.Assign(slot.At(52), ir.Int64(0)),                // Groups (uint32)
+				ir.Assign(slot.At(44), ir.Int32(int32(linux.AF_NETLINK))), // Family (uint16) + Pad (uint16) as uint32
+				ir.Assign(slot.At(48), ir.Int32(0)),                       // Pid (uint32)
+				ir.Assign(slot.At(52), ir.Int32(0)),                       // Groups (uint32)
 				ir.Assign(sockaddrNlPtr, slot.PointerWithDisp(44)),
 
 				// Send netlink message
@@ -866,7 +867,10 @@ func AddDefaultRoute(ifName string, gateway uint32, errLabel ir.Label, errVar ir
 				// - nlmsghdr (16 bytes) at offset 56
 				// - nlmsgerr.error (int32) at offset 56+16 = 72
 				// Read error code from ACK buffer (offset 72, which is 16 bytes into the NLMSG_ERROR message)
-				ir.Assign(ackErrCode, slot.At(72)),
+				// Note: nlmsgerr.error is int32; load 32-bit then sign-extend to 64-bit.
+				ir.Assign(ackErrPtr, slot.PointerWithDisp(72)),
+				ir.Assign(ackErrCode, ackErrPtr.Mem().As32()),
+				ir.If(ir.IsGreaterThan(ackErrCode, ir.Int64(0x7fffffff)), ir.Assign(ackErrCode, ir.Op(ir.OpSub, ackErrCode, ir.Int64(0x100000000)))),
 				ir.If(ir.IsNotEqual(ackErrCode, ir.Int64(0)), ir.Block{
 					ir.Printf("cc: ackErrCode is not zero: 0x%x\n", ackErrCode),
 					ir.Syscall(defs.SYS_CLOSE, fd),
@@ -996,7 +1000,10 @@ func Exec(path string, argv []string, envp []string, errLabel ir.Label, errVar i
 					argvPtr,
 					envpPtr,
 				)),
-				ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
+				ir.If(ir.IsNegative(errVar), ir.Block{
+					ir.Printf("cc: execve failed: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+					ir.Goto(errLabel),
+				}),
 			)
 
 			return ir.Block(frags)

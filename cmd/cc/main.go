@@ -35,6 +35,14 @@ import (
 )
 
 func main() {
+	// Cocoa requires UI objects (e.g. NSWindow) to be created on the process main
+	// thread. The Go scheduler can migrate the main goroutine across OS threads,
+	// so we pin it early on darwin to keep later window creation safe.
+	if runtime.GOOS == "darwin" {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+	}
+
 	if err := run(); err != nil {
 		var exitErr *initx.ExitError
 		if errors.As(err, &exitErr) {
@@ -747,6 +755,8 @@ func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, e
 	workDir := containerWorkDir(img)
 
 	main := ir.Method{
+		initx.LogKmsg("cc: running container init program\n"),
+
 		// Create mount points
 		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt", ir.Int64(0o755)),
 		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/proc", ir.Int64(0o755)),
@@ -813,6 +823,8 @@ func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, e
 			"mode=1777",
 		),
 
+		initx.LogKmsg("cc: mounted filesystems\n"),
+
 		// Change root to container using pivot_root
 		ir.Assign(errVar, ir.Syscall(defs.SYS_CHDIR, "/mnt")),
 		ir.If(ir.IsNegative(errVar), ir.Block{
@@ -845,6 +857,8 @@ func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, e
 			}),
 		}),
 
+		initx.LogKmsg("cc: changed root to container\n"),
+
 		// Always cleanup oldroot
 		ir.Assign(errVar, ir.Syscall(defs.SYS_UNLINKAT, ir.Int64(linux.AT_FDCWD), "/oldroot", ir.Int64(linux.AT_REMOVEDIR))),
 		ir.If(ir.IsNegative(errVar), ir.Block{
@@ -876,8 +890,12 @@ func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, e
 			ir.Goto(errLabel),
 		}),
 
+		initx.LogKmsg("cc: mounted devpts\n"),
+
 		// Set hostname to container name
 		initx.SetHostname("tinyrange", errLabel, errVar),
+
+		initx.LogKmsg("cc: set hostname to container name\n"),
 	}
 
 	// Configure network interface if networking is enabled
@@ -898,11 +916,16 @@ func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, e
 
 			// Set /etc/resolv.conf to use DNS server
 			initx.SetResolvConf(gatewayIp, errLabel, errVar),
+
+			initx.LogKmsg("cc: configured network interface\n"),
 		)
 	}
 
 	if exec {
-		main = append(main, initx.Exec(cmd[0], cmd[1:], img.Config.Env, errLabel, errVar))
+		main = append(main, ir.Block{
+			initx.LogKmsg(fmt.Sprintf("cc: executing command %s\n", cmd[0])),
+			initx.Exec(cmd[0], cmd[1:], img.Config.Env, errLabel, errVar),
+		})
 	} else {
 		main = append(main,
 			initx.ForkExecWait(cmd[0], cmd[1:], img.Config.Env, errLabel, errVar),

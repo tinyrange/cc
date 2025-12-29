@@ -16,27 +16,27 @@ type openGL struct {
 	disable       func(uint32)
 	genTextures   func(int32, *uint32)
 	bindTexture   func(uint32, uint32)
-	texImage2D    func(uint32, int32, int32, int32, int32, int32, uint32, uint32, unsafe.Pointer)
-	texSubImage2D func(uint32, int32, int32, int32, int32, int32, uint32, uint32, unsafe.Pointer)
+	texImage2D    func(uint32, int32, int32, int32, int32, int32, uint32, uint32, uintptr)
+	texSubImage2D func(uint32, int32, int32, int32, int32, int32, uint32, uint32, uintptr)
 	texParameteri func(uint32, uint32, int32)
 	pixelStorei   func(uint32, int32)
 	activeTexture func(uint32)
 	blendFunc     func(uint32, uint32)
-	readPixels    func(int32, int32, int32, int32, uint32, uint32, unsafe.Pointer)
+	readPixels    func(int32, int32, int32, int32, uint32, uint32, uintptr)
 	getString     func(uint32) *byte
 
 	// Buffer operations
 	genBuffers    func(int32, *uint32)
 	deleteBuffers func(int32, *uint32)
 	bindBuffer    func(uint32, uint32)
-	bufferData    func(uint32, int, unsafe.Pointer, uint32)
-	bufferSubData func(uint32, int, int, unsafe.Pointer)
+	bufferData    func(uint32, int, uintptr, uint32)
+	bufferSubData func(uint32, int, int, uintptr)
 
 	// VAO operations
 	genVertexArrays         func(int32, *uint32)
 	deleteVertexArrays      func(int32, *uint32)
 	bindVertexArray         func(uint32)
-	vertexAttribPointer     func(uint32, int32, uint32, bool, int32, unsafe.Pointer)
+	vertexAttribPointer     func(uint32, int32, uint32, bool, int32, uintptr)
 	enableVertexAttribArray func(uint32)
 
 	// Shader operations
@@ -96,11 +96,11 @@ func (gl *openGL) BindTexture(target, texture uint32) {
 }
 
 func (gl *openGL) TexImage2D(target uint32, level, internalFormat, width, height, border int32, format, xtype uint32, pixels unsafe.Pointer) {
-	gl.texImage2D(target, level, internalFormat, width, height, border, format, xtype, pixels)
+	gl.texImage2D(target, level, internalFormat, width, height, border, format, xtype, uintptr(pixels))
 }
 
 func (gl *openGL) TexSubImage2D(target uint32, level, xoffset, yoffset, width, height int32, format, xtype uint32, pixels unsafe.Pointer) {
-	gl.texSubImage2D(target, level, xoffset, yoffset, width, height, format, xtype, pixels)
+	gl.texSubImage2D(target, level, xoffset, yoffset, width, height, format, xtype, uintptr(pixels))
 }
 
 func (gl *openGL) TexParameteri(target, pname uint32, param int32) {
@@ -122,7 +122,7 @@ func (gl *openGL) BlendFunc(sfactor, dfactor uint32) {
 func (gl *openGL) ReadPixels(x, y, width, height int32, format, xtype uint32, pixels unsafe.Pointer) {
 	// Note: On macOS, glReadPixels reads from the lower-left corner,
 	// so we need to adjust the y coordinate accordingly.
-	gl.readPixels(x, y, width, height, format, xtype, pixels)
+	gl.readPixels(x, y, width, height, format, xtype, uintptr(pixels))
 }
 
 func (gl *openGL) GetString(name uint32) string {
@@ -143,11 +143,11 @@ func (gl *openGL) BindBuffer(target uint32, buffer uint32) {
 }
 
 func (gl *openGL) BufferData(target uint32, size int, data unsafe.Pointer, usage uint32) {
-	gl.bufferData(target, size, data, usage)
+	gl.bufferData(target, size, uintptr(data), usage)
 }
 
 func (gl *openGL) BufferSubData(target uint32, offset int, size int, data unsafe.Pointer) {
-	gl.bufferSubData(target, offset, size, data)
+	gl.bufferSubData(target, offset, size, uintptr(data))
 }
 
 func (gl *openGL) GenVertexArrays(n int32, arrays *uint32) {
@@ -162,7 +162,7 @@ func (gl *openGL) BindVertexArray(array uint32) {
 	gl.bindVertexArray(array)
 }
 
-func (gl *openGL) VertexAttribPointer(index uint32, size int32, xtype uint32, normalized bool, stride int32, offset unsafe.Pointer) {
+func (gl *openGL) VertexAttribPointer(index uint32, size int32, xtype uint32, normalized bool, stride int32, offset uintptr) {
 	gl.vertexAttribPointer(index, size, xtype, normalized, stride, offset)
 }
 

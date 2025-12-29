@@ -1768,6 +1768,13 @@ func RunExecutable(path string, gpuEnabled bool) error {
 }
 
 func main() {
+	// Cocoa requires UI objects (e.g. NSWindow) to be created on the process main
+	// thread. The Go scheduler can migrate the main goroutine across OS threads,
+	// so we pin it early on darwin to keep later window creation safe.
+	if runtime.GOOS == "darwin" {
+		runtime.LockOSThread()
+	}
+
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
 	linux := fs.Bool("linux", false, "Try booting Linux")
