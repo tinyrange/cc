@@ -16,10 +16,10 @@ CrumbleCracker is a high performance embeddable virtualization platform designed
 
 **Stage 2 is stability and speed**
 
-- [ ] Fix on macOS arm64
-- [ ] Fix on Windows amd64
-- [ ] Fix on Linux arm64
-- [ ] Fix on Windows arm64
+- [x] Fix macOS arm64
+- [ ] Fix Windows amd64
+- [ ] Fix Linux arm64
+- [ ] Fix Windows arm64
 - [ ] Get a more advanced desktop running (like XFCE)
 - [ ] Fix Linux Compile Errors (issues with Virtio-fs)
 - [ ] Fix Ubuntu boot (issues with `/etc/resolv.conf`)
@@ -46,7 +46,7 @@ Only Linux Guests and bare-metal code are currently supported.
 - **Windows x86_64**: Mostly works (GPU is broken)
 - **Linux arm64**: Mostly works (GPU is broken)
 - **Windows arm64**: Broken (interupt dispatch issues)
-- **macOS arm64**: Mostly works (Besides GPU and Networking)
+- **macOS arm64**: Works
 
 ## Relationship to TinyRange
 
