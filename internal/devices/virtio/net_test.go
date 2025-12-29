@@ -1,5 +1,3 @@
-//go:build linux
-
 package virtio
 
 import (
@@ -33,6 +31,11 @@ func (n *netBackendStub) HandleTx(packet []byte, release func()) error {
 type mockVM struct {
 	mem  []byte
 	base uint64
+}
+
+// SetIRQ implements [hv.VirtualMachine].
+func (m *mockVM) SetIRQ(irqLine uint32, level bool) error {
+	panic("unimplemented")
 }
 
 func newMockVM() *mockVM {
