@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"math"
 	"sort"
+	"strings"
 
 	"github.com/tinyrange/cc/internal/asm"
 	"github.com/tinyrange/cc/internal/asm/amd64"
@@ -1079,6 +1080,85 @@ func collectVariables(f ir.Fragment, vars map[string]struct{}) {
 	}
 }
 
+func collectGlobals(f ir.Fragment, globals map[string]struct{}) {
+	switch v := f.(type) {
+	case nil:
+	case ir.Block:
+		for _, inner := range v {
+			collectGlobals(inner, globals)
+		}
+	case ir.Method:
+		collectGlobals(ir.Block(v), globals)
+	case ir.AssignFragment:
+		collectGlobals(v.Dst, globals)
+		collectGlobals(v.Src, globals)
+	case ir.SyscallFragment:
+		for _, arg := range v.Args {
+			collectGlobals(arg, globals)
+		}
+	case ir.IfFragment:
+		collectConditionGlobals(v.Cond, globals)
+		collectGlobals(v.Then, globals)
+		if v.Otherwise != nil {
+			collectGlobals(v.Otherwise, globals)
+		}
+	case ir.LabelFragment:
+		collectGlobals(v.Block, globals)
+	case ir.ReturnFragment:
+		collectGlobals(v.Value, globals)
+	case ir.PrintfFragment:
+		for _, arg := range v.Args {
+			collectGlobals(arg, globals)
+		}
+	case ir.CallFragment:
+		collectGlobals(v.Target, globals)
+	case ir.OpFragment:
+		collectGlobals(v.Left, globals)
+		collectGlobals(v.Right, globals)
+	case ir.MemVar:
+		if v.Disp != nil {
+			collectGlobals(v.Disp, globals)
+		}
+	case ir.GlobalMem:
+		if v.Name != "" {
+			globals[v.Name] = struct{}{}
+		}
+		if v.Disp != nil {
+			collectGlobals(v.Disp, globals)
+		}
+	case ir.GlobalPointerFragment:
+		if v.Name != "" {
+			globals[v.Name] = struct{}{}
+		}
+	case ir.StackSlotFragment:
+		if v.Body != nil {
+			collectGlobals(v.Body, globals)
+		}
+	case ir.StackSlotMemFragment:
+		if v.Disp != nil {
+			collectGlobals(v.Disp, globals)
+		}
+	case ir.StackSlotPtrFragment:
+		if v.Disp != nil {
+			collectGlobals(v.Disp, globals)
+		}
+	default:
+	}
+}
+
+func collectConditionGlobals(cond ir.Condition, globals map[string]struct{}) {
+	switch cv := cond.(type) {
+	case ir.IsNegativeCondition:
+		collectGlobals(cv.Value, globals)
+	case ir.IsZeroCondition:
+		collectGlobals(cv.Value, globals)
+	case ir.CompareCondition:
+		collectGlobals(cv.Left, globals)
+		collectGlobals(cv.Right, globals)
+	default:
+	}
+}
+
 func collectConditionVars(cond ir.Condition, vars map[string]struct{}) {
 	switch cv := cond.(type) {
 	case ir.IsNegativeCondition:
@@ -1149,6 +1229,29 @@ func BuildStandaloneProgram(p *ir.Program) (asm.Program, error) {
 	entry, ok := p.Methods[p.Entrypoint]
 	if !ok {
 		return asm.Program{}, fmt.Errorf("entrypoint method %q not found", p.Entrypoint)
+	}
+
+	// Validate that any referenced globals are declared. Relying on scanning the
+	// emitted machine code for global-token prefixes can false-positive.
+	usedGlobals := make(map[string]struct{})
+	for _, method := range p.Methods {
+		collectGlobals(ir.Block(method), usedGlobals)
+	}
+	if len(usedGlobals) > 0 {
+		missing := make([]string, 0)
+		for name := range usedGlobals {
+			if p.Globals == nil {
+				missing = append(missing, name)
+				continue
+			}
+			if _, ok := p.Globals[name]; !ok {
+				missing = append(missing, name)
+			}
+		}
+		if len(missing) > 0 {
+			sort.Strings(missing)
+			return asm.Program{}, fmt.Errorf("ir: referenced globals are not declared in Program.Globals: %s", strings.Join(missing, ", "))
+		}
 	}
 
 	globalNames := make([]string, 0, len(p.Globals))
@@ -1327,9 +1430,6 @@ func BuildStandaloneProgram(p *ir.Program) (asm.Program, error) {
 			globalPointerRelocs = append(globalPointerRelocs, idx)
 			idx += 7
 			continue
-		}
-		if isGlobalPointerToken(value) {
-			return asm.Program{}, fmt.Errorf("reference to undefined global token %#x", value)
 		}
 	}
 	finalRelocs = append(finalRelocs, globalPointerRelocs...)
