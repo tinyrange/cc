@@ -25,10 +25,6 @@ type VirtioMMIODevice interface {
 	GetACPIDeviceInfo() ACPIDeviceInfo
 }
 
-type irqSetter interface {
-	SetIRQ(irqLine uint32, level bool) error
-}
-
 const (
 	VIRTIO_MMIO_MAGIC_VALUE         = 0x000
 	VIRTIO_MMIO_VERSION             = 0x004
@@ -79,7 +75,7 @@ type device interface {
 	readAvailEntry(*queue, uint16) (uint16, error)
 	readDescriptor(*queue, uint16) (virtqDescriptor, error)
 	recordUsedElement(*queue, uint16, uint32) error
-	raiseInterrupt(uint32)
+	raiseInterrupt(uint32) error
 	readGuest(addr uint64, length uint32) ([]byte, error)
 	writeGuest(addr uint64, data []byte) error
 	eventIdxEnabled() bool
@@ -667,21 +663,21 @@ func (d *mmioDevice) queue(index int) *queue {
 	return &d.queues[index]
 }
 
-func (d *mmioDevice) raiseInterrupt(bit uint32) {
+func (d *mmioDevice) raiseInterrupt(bit uint32) error {
 	d.interruptStatus.Or(bit)
-	d.updateInterruptLine()
+	return d.updateInterruptLine()
 }
 
-func (d *mmioDevice) updateInterruptLine() {
+func (d *mmioDevice) updateInterruptLine() error {
 	if d.vm == nil || d.irqLine == 0 {
-		return
+		return fmt.Errorf("virtio: virtual machine or irq line is nil")
 	}
-	if setter, ok := d.vm.(irqSetter); ok {
-		levelAsserted := d.interruptStatus.Load() != 0
-		if err := setter.SetIRQ(d.irqLine, levelAsserted); err != nil {
-			slog.Error("virtio: pulse irq failed", "irq", d.irqLine, "err", err)
-		}
+	levelAsserted := d.interruptStatus.Load() != 0
+	if err := d.vm.SetIRQ(d.irqLine, levelAsserted); err != nil {
+		slog.Error("virtio: pulse irq failed", "irq", fmt.Sprintf("0x%X", d.irqLine), "err", err)
+		return err
 	}
+	return nil
 }
 
 func (d *mmioDevice) readAvailState(q *queue) (uint16, uint16, error) {

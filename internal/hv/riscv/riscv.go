@@ -18,6 +18,11 @@ type virtualMachine struct {
 	memoryBase uint64
 }
 
+// SetIRQ implements [hv.VirtualMachine].
+func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
+	panic("unimplemented")
+}
+
 type virtualCPU struct {
 	vm *virtualMachine
 	id int

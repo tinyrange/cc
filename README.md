@@ -44,9 +44,9 @@ Only Linux Guests and bare-metal code are currently supported.
 
 - **Linux x86_64**: Works, **primary platform**.
 - **Windows x86_64**: Mostly works (GPU is broken)
-- **Linux arm64**: Broken (interupt dispatch issues)
+- **Linux arm64**: Mostly works (GPU is broken)
 - **Windows arm64**: Broken (interupt dispatch issues)
-- **macOS arm64**: Work in Progress.
+- **macOS arm64**: Mostly works (Besides GPU and Networking)
 
 ## Relationship to TinyRange
 

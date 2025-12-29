@@ -432,11 +432,11 @@ func (v *virtualCPU) handleDataAbort(syndrome bindings.ExceptionSyndrome, physAd
 		copy(data, tmp[:])
 
 		if err := dev.WriteMMIO(addr, data); err != nil {
-			return fmt.Errorf("hvf: failed to write MMIO: %w", err)
+			pendingError = fmt.Errorf("hvf: failed to write MMIO: %w", err)
 		}
 	} else {
 		if err := dev.ReadMMIO(addr, data); err != nil {
-			return fmt.Errorf("hvf: failed to read MMIO: %w", err)
+			pendingError = fmt.Errorf("hvf: failed to read MMIO: %w", err)
 		}
 
 		var tmp [8]byte
@@ -527,7 +527,7 @@ func (v *virtualCPU) handleMsrAccess(syndrome bindings.ExceptionSyndrome) error 
 		return err
 	}
 
-	slog.Info("ignoring MSR access", "info", info)
+	slog.Debug("ignoring MSR access", "info", info)
 
 	if info.read {
 		// write 0 to the target register
@@ -663,6 +663,35 @@ func (v *virtualMachine) AddDevice(dev hv.Device) error {
 	v.devices = append(v.devices, dev)
 
 	return dev.Init(v)
+}
+
+// SetIRQ implements [hv.VirtualMachine].
+func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
+	const (
+		armIRQTypeShift = 24
+		armIRQTypeSPI   = 1
+		armSPIBase      = 32 // GIC SPIs start at INTID 32
+	)
+
+	// Validate IRQ type encoding
+	irqType := (irqLine >> armIRQTypeShift) & 0xff
+	if irqType == 0 {
+		return fmt.Errorf("hvf: interrupt type missing in irqLine %#x", irqLine)
+	}
+	if irqType != armIRQTypeSPI {
+		return fmt.Errorf("hvf: unsupported IRQ type %d in irqLine %#x", irqType, irqLine)
+	}
+
+	// Extract SPI number from irqLine encoding and convert to GIC intid
+	// SPIs start at intid 32 in GICv3
+	spiOffset := irqLine & 0xFFFF
+	intid := spiOffset + armSPIBase
+
+	if err := bindings.HvGicSetSpi(intid, level); err != bindings.HV_SUCCESS {
+		return fmt.Errorf("hvf: failed to set SPI (intid=%d): %w", intid, err)
+	}
+
+	return nil
 }
 
 // Close implements [hv.VirtualMachine].
