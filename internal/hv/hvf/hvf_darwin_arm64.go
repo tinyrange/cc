@@ -667,12 +667,32 @@ func (v *virtualMachine) AddDevice(dev hv.Device) error {
 
 // SetIRQ implements [hv.VirtualMachine].
 func (v *virtualMachine) SetIRQ(irqLine uint32, level bool) error {
+	const (
+		armIRQTypeShift = 24
+		armIRQTypeSPI   = 1
+		armSPIBase      = 32 // GIC SPIs start at INTID 32
+	)
+
+	// Validate IRQ type encoding
+	irqType := (irqLine >> armIRQTypeShift) & 0xff
+	if irqType == 0 {
+		return fmt.Errorf("hvf: interrupt type missing in irqLine %#x", irqLine)
+	}
+	if irqType != armIRQTypeSPI {
+		return fmt.Errorf("hvf: unsupported IRQ type %d in irqLine %#x", irqType, irqLine)
+	}
+
 	// Extract SPI number from irqLine encoding and convert to GIC intid
 	// SPIs start at intid 32 in GICv3
 	spiOffset := irqLine & 0xFFFF
-	intid := spiOffset + 32
+	intid := spiOffset + armSPIBase
 
 	if err := bindings.HvGicSetSpi(intid, level); err != bindings.HV_SUCCESS {
+		return fmt.Errorf("hvf: failed to set SPI (intid=%d): %w", intid, err)
+	}
+
+	return nil
+}
 		return fmt.Errorf("hvf: failed to set SPI (intid=%d): %w", intid, err)
 	}
 
