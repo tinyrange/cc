@@ -146,6 +146,11 @@ type fakeVM struct {
 	base uint64
 }
 
+// SetIRQ implements [hv.VirtualMachine].
+func (f *fakeVM) SetIRQ(irqLine uint32, level bool) error {
+	panic("unimplemented")
+}
+
 // CaptureSnapshot implements hv.VirtualMachine.
 func (f *fakeVM) CaptureSnapshot() (hv.Snapshot, error) {
 	panic("unimplemented")

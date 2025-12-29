@@ -15,6 +15,8 @@ type stubVM struct {
 	memoryBase uint64
 }
 
+// SetIRQ implements [hv.VirtualMachine].
+func (s *stubVM) SetIRQ(irqLine uint32, level bool) error                { panic("unimplemented") }
 func (s *stubVM) CaptureSnapshot() (hv.Snapshot, error)                  { panic("unimplemented") }
 func (s *stubVM) RestoreSnapshot(snap hv.Snapshot) error                 { panic("unimplemented") }
 func (s *stubVM) AddDevice(dev hv.Device) error                          { panic("unimplemented") }
