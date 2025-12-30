@@ -376,10 +376,28 @@ type VirtualMachine struct {
 	gpuDevice      *virtio.GPU
 	keyboardDevice *virtio.Input
 	tabletDevice   *virtio.Input
+
+	// consoleDevice is the virtio-console device for interactive console I/O.
+	consoleDevice *virtio.Console
 }
 
 func (vm *VirtualMachine) Close() error {
 	return vm.vm.Close()
+}
+
+// SetConsoleSize updates the virtio-console configuration so the guest can see
+// the correct terminal size. This is best-effort (no-op if console is unavailable).
+func (vm *VirtualMachine) SetConsoleSize(cols, rows int) {
+	if vm == nil || vm.consoleDevice == nil {
+		return
+	}
+	if cols < 1 {
+		cols = 1
+	}
+	if rows < 1 {
+		rows = 1
+	}
+	vm.consoleDevice.SetSize(uint16(cols), uint16(rows))
 }
 
 // GPU returns the virtio-gpu device if GPU is enabled, nil otherwise.
@@ -542,6 +560,46 @@ func WithStdin(r io.Reader) Option {
 		}
 		return nil
 	})
+}
+
+// WithConsoleOutput redirects the VM console output (virtio-console) to w.
+// If nil, the default (stderr) is used.
+func WithConsoleOutput(w io.Writer) Option {
+	return funcOption(func(vm *VirtualMachine) error {
+		if w != nil {
+			vm.outBuffer.w = w
+		}
+		return nil
+	})
+}
+
+// consoleCapturingTemplate wraps a ConsoleTemplate to capture the created device reference.
+type consoleCapturingTemplate struct {
+	inner  virtio.ConsoleTemplate
+	target **virtio.Console
+}
+
+func (t *consoleCapturingTemplate) Create(vm hv.VirtualMachine) (hv.Device, error) {
+	dev, err := t.inner.Create(vm)
+	if err != nil {
+		return nil, err
+	}
+	if c, ok := dev.(*virtio.Console); ok {
+		*t.target = c
+	}
+	return dev, nil
+}
+
+func (t *consoleCapturingTemplate) GetLinuxCommandLineParam() ([]string, error) {
+	return t.inner.GetLinuxCommandLineParam()
+}
+
+func (t *consoleCapturingTemplate) DeviceTreeNodes() ([]fdt.Node, error) {
+	return t.inner.DeviceTreeNodes()
+}
+
+func (t *consoleCapturingTemplate) GetACPIDeviceInfo() virtio.ACPIDeviceInfo {
+	return t.inner.GetACPIDeviceInfo()
 }
 
 // gpuCapturingTemplate wraps a GPUTemplate to capture the created device reference
@@ -758,7 +816,10 @@ func NewVirtualMachine(
 	}
 
 	ret.loader.Devices = append(ret.loader.Devices,
-		virtio.ConsoleTemplate{Out: out, In: in, Arch: h.Architecture()},
+		&consoleCapturingTemplate{
+			inner:  virtio.ConsoleTemplate{Out: out, In: in, Arch: h.Architecture()},
+			target: &ret.consoleDevice,
+		},
 		programLoader,
 	)
 

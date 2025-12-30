@@ -12,6 +12,9 @@ type Window interface {
 	Scale() float32
 	GetKeyState(key Key) KeyState
 	GetButtonState(button Button) ButtonState
+	// DrainInputEvents returns queued raw input events since the last call and
+	// clears the internal queue.
+	DrainInputEvents() []InputEvent
 	// TextInput returns the UTF-8 text entered since the last call to TextInput.
 	// Implementations should buffer text during Poll() and clear the buffer when
 	// TextInput is called.

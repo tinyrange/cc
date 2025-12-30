@@ -41,6 +41,12 @@ const (
 	keyRelease    = 3
 	buttonPress   = 4
 	buttonRelease = 5
+
+	// X11 modifier masks.
+	x11ShiftMask   = 1 << 0
+	x11ControlMask = 1 << 2
+	x11Mod1Mask    = 1 << 3 // typically Alt
+	x11Mod4Mask    = 1 << 6 // typically Super/Win
 )
 
 type XVisualInfo struct {
@@ -160,6 +166,7 @@ type x11Window struct {
 	scale        float32
 	keyStates    map[Key]KeyState
 	buttonStates map[Button]ButtonState
+	inputEvents  []InputEvent
 }
 
 func New(title string, width, height int, _ bool) (Window, error) {
@@ -310,6 +317,7 @@ func New(title string, width, height int, _ bool) (Window, error) {
 		scale:        scale,
 		keyStates:    make(map[Key]KeyState),
 		buttonStates: make(map[Button]ButtonState),
+		inputEvents:  make([]InputEvent, 0, 256),
 	}
 	return w, nil
 }
@@ -345,6 +353,11 @@ func (w *x11Window) Poll() bool {
 	for key, state := range w.keyStates {
 		if state == KeyStatePressed {
 			w.keyStates[key] = KeyStateDown
+		} else if state == KeyStateRepeated {
+			// Repeated is a one-frame pulse indicating an OS key-repeat event.
+			// If we don't transition it, downstream consumers may treat it as a
+			// per-frame trigger and spam input.
+			w.keyStates[key] = KeyStateDown
 		} else if state == KeyStateReleased {
 			w.keyStates[key] = KeyStateUp
 		}
@@ -375,6 +388,32 @@ func (w *x11Window) Poll() bool {
 			if key != KeyUnknown {
 				// Treat missing entries as Up (map default is 0 which equals Pressed).
 				prev := w.GetKeyState(key)
+				mods := x11StateToMods(kev.State)
+				isRepeat := !(prev == KeyStateUp || prev == KeyStateReleased)
+				w.inputEvents = append(w.inputEvents, InputEvent{
+					Type:   InputEventKeyDown,
+					Key:    key,
+					Repeat: isRepeat,
+					Mods:   mods,
+				})
+
+				// Best-effort text generation for printable ASCII keys.
+				// This enables terminals on linux without requiring XLookupString.
+				if xLookupKeysym != nil && (mods&ModCtrl) == 0 {
+					idx := int32(0)
+					if (kev.State & x11ShiftMask) != 0 {
+						idx = 1
+					}
+					ks := xLookupKeysym(kev, idx)
+					if ks >= 0x20 && ks < 0x7f {
+						w.inputEvents = append(w.inputEvents, InputEvent{
+							Type: InputEventText,
+							Text: string(rune(ks)),
+							Mods: mods,
+						})
+					}
+				}
+
 				if prev == KeyStateUp || prev == KeyStateReleased {
 					w.keyStates[key] = KeyStatePressed
 				} else {
@@ -385,17 +424,32 @@ func (w *x11Window) Poll() bool {
 			kev := (*xKeyEvent)(unsafe.Pointer(&ev[0]))
 			key := w.keycodeToKey(kev)
 			if key != KeyUnknown {
+				w.inputEvents = append(w.inputEvents, InputEvent{
+					Type: InputEventKeyUp,
+					Key:  key,
+					Mods: x11StateToMods(kev.State),
+				})
 				w.keyStates[key] = KeyStateReleased
 			}
 		case buttonPress:
 			bev := (*xButtonEvent)(unsafe.Pointer(&ev[0]))
 			if button := w.buttonToButton(bev.Button); button >= ButtonLeft && button <= Button5 {
 				w.buttonStates[button] = ButtonStatePressed
+				w.inputEvents = append(w.inputEvents, InputEvent{
+					Type:   InputEventMouseDown,
+					Button: button,
+					Mods:   x11StateToMods(bev.State),
+				})
 			}
 		case buttonRelease:
 			bev := (*xButtonEvent)(unsafe.Pointer(&ev[0]))
 			if button := w.buttonToButton(bev.Button); button >= ButtonLeft && button <= Button5 {
 				w.buttonStates[button] = ButtonStateReleased
+				w.inputEvents = append(w.inputEvents, InputEvent{
+					Type:   InputEventMouseUp,
+					Button: button,
+					Mods:   x11StateToMods(bev.State),
+				})
 			}
 		}
 	}
@@ -447,8 +501,35 @@ func (w *x11Window) GetButtonState(button Button) ButtonState {
 	return ButtonStateUp
 }
 
+func (w *x11Window) DrainInputEvents() []InputEvent {
+	if w == nil || len(w.inputEvents) == 0 {
+		return nil
+	}
+	out := make([]InputEvent, len(w.inputEvents))
+	copy(out, w.inputEvents)
+	w.inputEvents = w.inputEvents[:0]
+	return out
+}
+
 func (w *x11Window) TextInput() string {
 	return ""
+}
+
+func x11StateToMods(state uint32) KeyMods {
+	var m KeyMods
+	if (state & x11ShiftMask) != 0 {
+		m |= ModShift
+	}
+	if (state & x11ControlMask) != 0 {
+		m |= ModCtrl
+	}
+	if (state & x11Mod1Mask) != 0 {
+		m |= ModAlt
+	}
+	if (state & x11Mod4Mask) != 0 {
+		m |= ModSuper
+	}
+	return m
 }
 
 // keycodeToKey converts an X11 keycode to our Key enum

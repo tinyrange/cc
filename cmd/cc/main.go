@@ -30,6 +30,7 @@ import (
 	"github.com/tinyrange/cc/internal/linux/kernel"
 	"github.com/tinyrange/cc/internal/netstack"
 	"github.com/tinyrange/cc/internal/oci"
+	termwin "github.com/tinyrange/cc/internal/term"
 	"github.com/tinyrange/cc/internal/vfs"
 	"golang.org/x/term"
 )
@@ -75,6 +76,7 @@ func run() error {
 	packetdump := flag.String("packetdump", "", "Write packet capture (pcap) to file (requires -network)")
 	exec := flag.Bool("exec", false, "Execute the entrypoint as PID 1 taking over init")
 	gpu := flag.Bool("gpu", false, "Enable GPU and create a window")
+	termWin := flag.Bool("term", false, "Open a terminal window and connect it to the VM console")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <image> [command] [args...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Run a command inside an OCI container image in a virtual machine.\n\n")
@@ -137,6 +139,12 @@ func run() error {
 
 	if *packetdump != "" && !*network {
 		return fmt.Errorf("-packetdump requires -network")
+	}
+	if *termWin && *gpu {
+		return fmt.Errorf("-term and -gpu are mutually exclusive")
+	}
+	if *termWin && *dbg {
+		return fmt.Errorf("-term and -debug are mutually exclusive")
 	}
 
 	args := flag.Args()
@@ -233,7 +241,27 @@ func run() error {
 		}),
 		initx.WithDebugLogging(*dbg),
 		initx.WithDmesgLogging(*dmesg),
-		initx.WithStdin(os.Stdin),
+	}
+
+	var termWindow *termwin.Terminal
+	if *termWin {
+		scale := window.GetDisplayScale()
+		physWidth := int(float32(1024) * scale)
+		physHeight := int(float32(768) * scale)
+
+		tw, err := termwin.New("cc", physWidth, physHeight)
+		if err != nil {
+			return fmt.Errorf("create terminal window: %w", err)
+		}
+		termWindow = tw
+		defer termWindow.Close()
+
+		opts = append(opts,
+			initx.WithStdin(termWindow),
+			initx.WithConsoleOutput(termWindow),
+		)
+	} else {
+		opts = append(opts, initx.WithStdin(os.Stdin))
 	}
 
 	// Add network device if enabled
@@ -572,13 +600,6 @@ func run() error {
 
 	// Put stdin into raw mode so we don't send cooked/echoed characters into the guest.
 	// Do this after booting so that any Ctrl+C during boot still works to kill cc itself.
-	if term.IsTerminal(int(os.Stdin.Fd())) {
-		oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
-		if err != nil {
-			return fmt.Errorf("enable raw mode: %w", err)
-		}
-		defer term.Restore(int(os.Stdin.Fd()), oldState)
-	}
 
 	debug.Writef("cc.run running command", "running command %v", execCmd)
 
@@ -592,8 +613,7 @@ func run() error {
 		// Create window for display with scaled dimensions
 		win, err := window.New("cc", physWidth, physHeight, true)
 		if err != nil {
-			slog.Warn("failed to create window, running without display", "error", err)
-			// Fall through to run without display
+			return fmt.Errorf("failed to create window: %w", err)
 		} else {
 			defer win.Close()
 
@@ -636,19 +656,92 @@ func run() error {
 			slog.Info("cc: command exited")
 			return nil
 		}
-	}
+	} else if *termWin && termWindow != nil {
+		// If terminal window is enabled, run VM in background and drive the window loop
+		// on the main thread.
 
-	if err := vm.Run(ctx, prog); err != nil {
-		var exitErr *initx.ExitError
-		if errors.As(err, &exitErr) {
-			return exitErr
+		termCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		vmDone := make(chan error, 1)
+		go func() {
+			vmDone <- vm.Run(termCtx, prog)
+		}()
+
+		var lastResize struct {
+			cols int
+			rows int
 		}
-		return fmt.Errorf("run VM: %w", err)
+
+		err := termWindow.Run(termCtx, termwin.Hooks{
+			OnResize: func(cols, rows int) {
+				if cols == lastResize.cols && rows == lastResize.rows {
+					return
+				}
+				lastResize.cols, lastResize.rows = cols, rows
+				vm.SetConsoleSize(cols, rows)
+			},
+			OnFrame: func() error {
+				select {
+				case err := <-vmDone:
+					if err != nil {
+						var exitErr *initx.ExitError
+						if errors.As(err, &exitErr) {
+							return exitErr
+						}
+						return fmt.Errorf("run VM: %w", err)
+					}
+					return io.EOF // stop loop cleanly
+				default:
+					return nil
+				}
+			},
+		})
+		if err != nil {
+			if errors.Is(err, termwin.ErrWindowClosed) {
+				// Best-effort: stop the VM when the user closes the window.
+				cancel()
+				select {
+				case <-vmDone:
+				case <-time.After(2 * time.Second):
+				}
+				return fmt.Errorf("window closed by user")
+			}
+			if errors.Is(err, io.EOF) {
+				// VM finished successfully and asked us to stop the loop.
+				slog.Info("cc: command exited")
+				return nil
+			}
+			var exitErr *initx.ExitError
+			if errors.As(err, &exitErr) {
+				return exitErr
+			}
+			return err
+		}
+
+		// If the loop returned nil, treat it as window closed.
+		return fmt.Errorf("window closed by user")
+	} else {
+		if term.IsTerminal(int(os.Stdin.Fd())) {
+			oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+			if err != nil {
+				return fmt.Errorf("enable raw mode: %w", err)
+			}
+			defer term.Restore(int(os.Stdin.Fd()), oldState)
+		}
+
+		if err := vm.Run(ctx, prog); err != nil {
+			var exitErr *initx.ExitError
+			if errors.As(err, &exitErr) {
+				return exitErr
+			}
+			return fmt.Errorf("run VM: %w", err)
+		}
+
+		debug.Writef("cc.run command exited", "command exited")
+
+		return nil
 	}
-
-	debug.Writef("cc.run command exited", "command exited")
-
-	return nil
 }
 
 func parseArchitecture(arch string) (hv.CpuArchitecture, error) {
