@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/vt"
 
 	"github.com/tinyrange/cc/internal/gowin/graphics"
@@ -69,6 +70,7 @@ func New(title string, width, height int) (*Terminal, error) {
 	}
 
 	emu := vt.NewSafeEmulator(80, 40)
+	disableVTQueriesThatBreakGuests(emu)
 
 	inR, inW := io.Pipe()
 
@@ -90,6 +92,65 @@ func New(title string, width, height int) (*Terminal, error) {
 	go t.drainQueueToPipe()
 
 	return t, nil
+}
+
+// disableVTQueriesThatBreakGuests prevents the VT emulator from writing certain
+// automatic "terminal replies" (like cursor position reports) into the input
+// stream. Some guest userspace (notably minimal shells/prompts) can end up
+// echoing these bytes, which appears as a constant stream of stuck input and
+// breaks interactive sessions.
+//
+// We still allow normal user input (SendKey/SendText) and special keys.
+func disableVTQueriesThatBreakGuests(emu *vt.SafeEmulator) {
+	if emu == nil {
+		return
+	}
+
+	// Device Status Report (DSR): CSI n
+	// We swallow CPR (n=6) and Operating Status (n=5) to avoid unsolicited replies.
+	emu.RegisterCsiHandler('n', func(params ansi.Params) bool {
+		n, _, ok := params.Param(0, 1)
+		if !ok || n == 0 {
+			return false
+		}
+		switch n {
+		case 5, 6:
+			return true
+		default:
+			return false
+		}
+	})
+
+	// DEC private DSR: CSI ? n
+	// We swallow Extended Cursor Position Report (n=6).
+	emu.RegisterCsiHandler(ansi.Command('?', 0, 'n'), func(params ansi.Params) bool {
+		n, _, ok := params.Param(0, 1)
+		if !ok || n == 0 {
+			return false
+		}
+		if n == 6 {
+			return true
+		}
+		return false
+	})
+
+	// Device Attributes: CSI c and CSI > c
+	// Some programs probe terminal type and then (mis)use the replies as input.
+	emu.RegisterCsiHandler('c', func(params ansi.Params) bool {
+		n, _, _ := params.Param(0, 0)
+		// Only swallow the standard query form (CSI 0 c).
+		if n == 0 {
+			return true
+		}
+		return false
+	})
+	emu.RegisterCsiHandler(ansi.Command('>', 0, 'c'), func(params ansi.Params) bool {
+		n, _, _ := params.Param(0, 0)
+		if n == 0 {
+			return true
+		}
+		return false
+	})
 }
 
 // Read implements io.Reader. It exposes the VT-generated input stream.
@@ -308,6 +369,14 @@ func (t *Terminal) Run(ctx context.Context, hooks Hooks) error {
 					t.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyInsert, Mod: mod})
 				}
 			}
+		}
+
+		// IMPORTANT: some backends (notably Cocoa) both queue InputEventText events
+		// and also buffer the same characters for Frame.TextInput(). If we consume
+		// the raw events but don't drain TextInput, the buffered text will be
+		// returned on a later frame and cause duplicate keystrokes.
+		if sawRawText {
+			_ = f.TextInput()
 		}
 
 		// Fallback: platform text buffer (for backends that don't emit Text events yet).
