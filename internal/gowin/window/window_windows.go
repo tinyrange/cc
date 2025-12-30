@@ -370,6 +370,10 @@ func (w *winWindow) GetButtonState(button Button) ButtonState {
 	return ButtonStateUp
 }
 
+func (w *winWindow) TextInput() string {
+	return ""
+}
+
 func registerWindowClass() error {
 	cb := syscall.NewCallback(wndProc)
 	wc := wndClassEx{

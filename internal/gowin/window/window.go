@@ -12,6 +12,10 @@ type Window interface {
 	Scale() float32
 	GetKeyState(key Key) KeyState
 	GetButtonState(button Button) ButtonState
+	// TextInput returns the UTF-8 text entered since the last call to TextInput.
+	// Implementations should buffer text during Poll() and clear the buffer when
+	// TextInput is called.
+	TextInput() string
 }
 
 // GetDisplayScale returns the display scale factor before creating a window.

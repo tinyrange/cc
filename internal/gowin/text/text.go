@@ -52,11 +52,26 @@ func (r *Renderer) RenderText(s string, x, y float32, size float64, c color.Colo
 
 func (r *Renderer) SetViewport(width, height int32) {
 	if r != nil && r.stash != nil {
-		// Apply scale factor to match the graphics system's coordinate system
-		scaledWidth := float32(width) / r.scale
-		scaledHeight := float32(height) / r.scale
-		r.stash.SetViewport(int32(scaledWidth), int32(scaledHeight))
+		// The graphics coordinate system is already logical units.
+		r.stash.SetViewport(width, height)
 		r.stash.SetScale(r.scale)
 		r.stash.SetGraphicsShader(r.graphicsShader)
 	}
+}
+
+// Advance returns the x-advance (in logical pixels) for rendering s at the given size.
+func (r *Renderer) Advance(size float64, s string) float32 {
+	if r == nil || r.stash == nil {
+		return 0
+	}
+	return float32(r.stash.GetAdvance(r.font, size, s))
+}
+
+// LineHeight returns the line height (in logical pixels) at the given size.
+func (r *Renderer) LineHeight(size float64) float32 {
+	if r == nil || r.stash == nil {
+		return 0
+	}
+	_, _, lineHeight := r.stash.VMetrics(r.font, size)
+	return float32(lineHeight)
 }

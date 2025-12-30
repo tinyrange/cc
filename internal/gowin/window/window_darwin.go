@@ -68,6 +68,9 @@ type Cocoa struct {
 	// Input state tracking (frame-based).
 	keyStates    map[Key]KeyState
 	buttonStates map[Button]ButtonState
+
+	// Text input buffered from keyDown events.
+	textInput string
 }
 
 var (
@@ -108,11 +111,17 @@ var (
 	selSetValuesForParameter objc.SEL
 
 	// NSEvent selectors (input).
-	selEventType      objc.SEL
-	selEventKeyCode   objc.SEL
-	selEventIsARepeat objc.SEL
-	selEventFlags     objc.SEL
-	selEventButtonNum objc.SEL
+	selEventType       objc.SEL
+	selEventKeyCode    objc.SEL
+	selEventIsARepeat  objc.SEL
+	selEventFlags      objc.SEL
+	selEventButtonNum  objc.SEL
+	selEventCharacters objc.SEL
+	selUTF8String      objc.SEL
+
+	// NSScreen selectors (display scale).
+	selMainScreen         objc.SEL
+	selBackingScaleFactor objc.SEL
 )
 
 // Subset of NSEventType values we care about.
@@ -196,8 +205,18 @@ func (c *Cocoa) Poll() bool {
 			break
 		}
 
+		etype := int64(objc.Send[uint64](ev, selEventType))
 		c.processEvent(ev)
-		c.app.Send(selSendEvent, ev)
+
+		// We consume keyboard input ourselves. Forwarding key events into the
+		// normal Cocoa responder chain (with no first responder text view) causes
+		// the system beep on every key press.
+		switch etype {
+		case nsEventTypeKeyDown, nsEventTypeKeyUp, nsEventTypeFlagsChanged:
+			// Do not forward.
+		default:
+			c.app.Send(selSendEvent, ev)
+		}
 	}
 
 	if !objc.Send[bool](c.window, selIsVisible) {
@@ -259,6 +278,12 @@ func (c *Cocoa) bootstrapApp() error {
 
 	pool := objc.ID(objc.GetClass("NSAutoreleasePool")).Send(selAlloc)
 	pool = pool.Send(selInit)
+
+	// Set the default run loop mode. This is toll-free bridged between CFString
+	// and NSString, and avoids unsafe symbol dereferencing.
+	if cfDefaultMode == 0 {
+		cfDefaultMode = uintptr(nsString("kCFRunLoopDefaultMode"))
+	}
 
 	c.app = app
 	c.pool = pool
@@ -362,12 +387,6 @@ func loadObjc() error {
 	}
 
 	purego.RegisterLibFunc(&cfRunLoopRunInMode, cf, "CFRunLoopRunInMode")
-	ptr, err := purego.Dlsym(cf, "kCFRunLoopDefaultMode")
-	if err != nil {
-		return err
-	}
-	// Dlsym returns the address of the CFStringRef variable; read its value.
-	cfDefaultMode = *(*uintptr)(unsafe.Pointer(ptr))
 
 	return nil
 }
@@ -407,10 +426,38 @@ func loadSelectors() {
 	selEventIsARepeat = objc.RegisterName("isARepeat")
 	selEventFlags = objc.RegisterName("modifierFlags")
 	selEventButtonNum = objc.RegisterName("buttonNumber")
+	selEventCharacters = objc.RegisterName("characters")
+	selUTF8String = objc.RegisterName("UTF8String")
+
+	// NSScreen (display scale).
+	selMainScreen = objc.RegisterName("mainScreen")
+	selBackingScaleFactor = objc.RegisterName("backingScaleFactor")
 }
 
 func nsString(v string) objc.ID {
 	return objc.ID(objc.GetClass("NSString")).Send(selStringWithUTF8String, v+"\x00")
+}
+
+func nsStringToGo(v objc.ID) string {
+	if v == 0 {
+		return ""
+	}
+	ptr := objc.Send[unsafe.Pointer](v, selUTF8String)
+	if ptr == nil {
+		return ""
+	}
+	// Find NUL terminator.
+	n := 0
+	for {
+		if *(*byte)(unsafe.Add(ptr, n)) == 0 {
+			break
+		}
+		n++
+	}
+	if n == 0 {
+		return ""
+	}
+	return unsafe.String((*byte)(ptr), n)
 }
 
 // cursorBackingPos returns the mouse in backing (pixel) coordinates.
@@ -425,10 +472,30 @@ func (c *Cocoa) cursorBackingPos() (float32, float32) {
 }
 
 func (c *Cocoa) Scale() float32 {
-	// macOS handles scaling automatically through BackingSize()
-	// which already accounts for Retina scaling, so we return 1.0
-	// as the coordinate system is already scaled appropriately.
-	return 1.0
+	// Return the backing (pixel) to logical (point) scale factor. This is
+	// typically 2.0 on Retina displays.
+	if c.view == 0 {
+		return 1.0
+	}
+
+	bounds := objc.Send[NSRect](c.view, selBounds)
+	if bounds.Size.W == 0 || bounds.Size.H == 0 {
+		return 1.0
+	}
+	backing := objc.Send[NSRect](c.view, selConvertRectToBacking, bounds)
+
+	sx := float32(backing.Size.W / bounds.Size.W)
+	sy := float32(backing.Size.H / bounds.Size.H)
+	if sx <= 0 {
+		sx = 1.0
+	}
+	if sy <= 0 {
+		sy = 1.0
+	}
+	if sx > sy {
+		return sx
+	}
+	return sy
 }
 
 func (c *Cocoa) GetKeyState(key Key) KeyState {
@@ -451,6 +518,12 @@ func (c *Cocoa) GetButtonState(button Button) ButtonState {
 	return ButtonStateUp
 }
 
+func (c *Cocoa) TextInput() string {
+	s := c.textInput
+	c.textInput = ""
+	return s
+}
+
 func (c *Cocoa) processEvent(ev objc.ID) {
 	etype := int64(objc.Send[uint64](ev, selEventType))
 	switch etype {
@@ -459,6 +532,10 @@ func (c *Cocoa) processEvent(ev objc.ID) {
 		key := cocoaKeyCodeToKey(keyCode)
 		if key == KeyUnknown {
 			return
+		}
+		chars := objc.Send[objc.ID](ev, selEventCharacters)
+		if s := nsStringToGo(chars); s != "" {
+			c.textInput += s
 		}
 		isRepeat := objc.Send[bool](ev, selEventIsARepeat)
 
@@ -781,8 +858,36 @@ func cocoaKeyCodeToKey(code uint16) Key {
 }
 
 // getDisplayScale returns the display scale factor.
-// On macOS, window sizes are in logical points and the system handles
-// Retina scaling automatically, so we return 1.0.
+// On macOS, this is typically 2.0 on Retina displays. This is used before
+// creating a window to pick a sensible physical size for a desired logical size.
 func getDisplayScale() float32 {
-	return 1.0
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	if err := ensureRuntime(); err != nil {
+		return 1.0
+	}
+
+	// Create a small autorelease pool for this query since it can be called
+	// before we bootstrap the NSApplication/pool.
+	pool := objc.ID(objc.GetClass("NSAutoreleasePool")).Send(selAlloc)
+	pool = pool.Send(selInit)
+	if pool != 0 {
+		defer pool.Send(selRelease)
+	}
+
+	screenClass := objc.GetClass("NSScreen")
+	if screenClass == 0 {
+		return 1.0
+	}
+	main := objc.ID(screenClass).Send(selMainScreen)
+	if main == 0 {
+		return 1.0
+	}
+
+	scale := float32(objc.Send[float64](main, selBackingScaleFactor))
+	if scale <= 0 {
+		return 1.0
+	}
+	return scale
 }

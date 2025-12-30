@@ -40,6 +40,8 @@ type Frame interface {
 
 	GetKeyState(key window.Key) window.KeyState
 	GetButtonState(button window.Button) window.ButtonState
+	// TextInput returns the UTF-8 text entered since the last call to TextInput.
+	TextInput() string
 
 	RenderQuad(x, y, width, height float32, tex Texture, color color.Color)
 

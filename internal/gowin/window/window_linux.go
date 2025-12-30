@@ -447,6 +447,10 @@ func (w *x11Window) GetButtonState(button Button) ButtonState {
 	return ButtonStateUp
 }
 
+func (w *x11Window) TextInput() string {
+	return ""
+}
+
 // keycodeToKey converts an X11 keycode to our Key enum
 func (w *x11Window) keycodeToKey(kev *xKeyEvent) Key {
 	if xLookupKeysym == nil {

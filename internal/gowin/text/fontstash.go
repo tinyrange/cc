@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	textVertexShaderSource = `#version 130
+	textVertexShaderSource = `#version 150
 in vec2 a_position;
 in vec2 a_texCoord;
 in vec4 a_color;
@@ -28,7 +28,7 @@ void main() {
 	v_color = a_color;
 }`
 
-	textFragmentShaderSource = `#version 130
+	textFragmentShaderSource = `#version 150
 in vec2 v_texCoord;
 in vec4 v_color;
 
@@ -476,6 +476,13 @@ func (s *Stash) GetQuad(fnt *Font, glyph *Glyph, isize int16, x, y float64) (flo
 
 func (s *Stash) FlushDraw() {
 	if s.shaderProgram == 0 {
+		// Shader not initialized; avoid unbounded vertex accumulation.
+		for _, t := range s.ttTextures {
+			t.nverts = 0
+		}
+		for _, t := range s.bmTextures {
+			t.nverts = 0
+		}
 		return // Shader not initialized
 	}
 
@@ -686,7 +693,8 @@ func (stash *Stash) DrawText(idx int, size, x, y float64, s string, color [4]flo
 		}
 		texture := glyph.texture
 		texture.color = color
-		if texture.nverts*4 >= VERT_COUNT {
+		// We emit 4 vertices per glyph quad into texture.verts.
+		if texture.nverts+4 > VERT_COUNT {
 			stash.FlushDraw()
 		}
 
