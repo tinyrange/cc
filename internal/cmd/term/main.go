@@ -3,7 +3,6 @@ package main
 import (
 	"image"
 	"image/draw"
-	"io"
 	"runtime"
 	"strings"
 
@@ -59,9 +58,42 @@ func main() {
 		}
 	}()
 
-	// VT -> PTY (input generated via SendText/SendKey)
+	// VT -> PTY (input generated via SendText/SendKey).
+	// We intentionally decouple reading from the VT input pipe from writing to the
+	// PTY. PTY writes can block under heavy output, which would otherwise
+	// backpressure into SendText/SendKey and make keystrokes appear to “drop”.
+	inputQ := make(chan []byte, 1024)
 	go func() {
-		_, _ = io.Copy(pty, term)
+		buf := make([]byte, 4096)
+		for {
+			n, err := term.Read(buf)
+			if n > 0 {
+				b := make([]byte, n)
+				copy(b, buf[:n])
+				inputQ <- b
+			}
+			if err != nil {
+				close(inputQ)
+				return
+			}
+		}
+	}()
+	go func() {
+		for b := range inputQ {
+			for len(b) > 0 {
+				n, err := pty.Write(b)
+				if n > 0 {
+					b = b[n:]
+				}
+				if err != nil {
+					return
+				}
+				if n == 0 {
+					// Avoid busy looping on pathological 0-byte writes.
+					return
+				}
+			}
+		}
 	}()
 
 	if err := win.Loop(func(f graphics.Frame) error {
