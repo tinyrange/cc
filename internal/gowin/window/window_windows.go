@@ -370,6 +370,15 @@ func (w *winWindow) GetButtonState(button Button) ButtonState {
 	return ButtonStateUp
 }
 
+func (w *winWindow) DrainInputEvents() []InputEvent {
+	// TODO: Implement raw event queue on Windows.
+	return nil
+}
+
+func (w *winWindow) TextInput() string {
+	return ""
+}
+
 func registerWindowClass() error {
 	cb := syscall.NewCallback(wndProc)
 	wc := wndClassEx{

@@ -1,5 +1,7 @@
 package window
 
+import "fmt"
+
 // Key represents a keyboard key.
 type Key int
 
@@ -178,4 +180,61 @@ func (ks KeyState) IsDown() bool {
 // IsDown returns true if the button state indicates the button is currently down.
 func (bs ButtonState) IsDown() bool {
 	return bs == ButtonStatePressed || bs == ButtonStateDown
+}
+
+// KeyMods represents currently active keyboard modifiers.
+type KeyMods uint8
+
+const (
+	ModShift KeyMods = 1 << iota
+	ModCtrl
+	ModAlt
+	ModSuper
+)
+
+// InputEventType describes the kind of input event.
+type InputEventType uint8
+
+const (
+	InputEventKeyDown InputEventType = iota
+	InputEventKeyUp
+	InputEventFlagsChanged
+	InputEventText
+	InputEventMouseDown
+	InputEventMouseUp
+)
+
+func (t InputEventType) String() string {
+	switch t {
+	case InputEventKeyDown:
+		return "KeyDown"
+	case InputEventKeyUp:
+		return "KeyUp"
+	case InputEventFlagsChanged:
+		return "FlagsChanged"
+	case InputEventText:
+		return "Text"
+	case InputEventMouseDown:
+		return "MouseDown"
+	case InputEventMouseUp:
+		return "MouseUp"
+	default:
+		return fmt.Sprintf("InputEventType(%d)", uint8(t))
+	}
+}
+
+// InputEvent is a raw input event emitted by a platform window backend.
+//
+// Contract:
+// - Events are queued during Poll() and returned by DrainInputEvents().
+// - DrainInputEvents() clears the internal queue.
+type InputEvent struct {
+	Type   InputEventType
+	Key    Key
+	Text   string
+	Mods   KeyMods
+	Repeat bool
+
+	// Button is meaningful for MouseDown/MouseUp.
+	Button Button
 }

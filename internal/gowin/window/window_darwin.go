@@ -68,6 +68,12 @@ type Cocoa struct {
 	// Input state tracking (frame-based).
 	keyStates    map[Key]KeyState
 	buttonStates map[Button]ButtonState
+
+	// Text input buffered from keyDown events.
+	textInput string
+
+	// Raw input events queued during Poll().
+	inputEvents []InputEvent
 }
 
 var (
@@ -79,40 +85,49 @@ var (
 	cfDefaultMode      uintptr
 
 	// Cached selectors.
-	selAlloc                 objc.SEL
-	selInit                  objc.SEL
-	selRelease               objc.SEL
-	selSharedApplication     objc.SEL
-	selNextEventMatchingMask objc.SEL
-	selSetActivationPolicy   objc.SEL
-	selFinishLaunching       objc.SEL
-	selStringWithUTF8String  objc.SEL
-	selInitWithContentRect   objc.SEL
-	selMakeKeyAndOrderFront  objc.SEL
-	selSetTitle              objc.SEL
-	selSetAcceptsMouseMoved  objc.SEL
-	selSetReleasedWhenClosed objc.SEL
-	selCenter                objc.SEL
-	selContentView           objc.SEL
-	selBounds                objc.SEL
-	selMouseLocationOutside  objc.SEL
-	selConvertRectToBacking  objc.SEL
-	selIsVisible             objc.SEL
-	selSendEvent             objc.SEL
-	selFlushBuffer           objc.SEL
-	selSetView               objc.SEL
-	selMakeCurrentContext    objc.SEL
-	selClearCurrentContext   objc.SEL
-	selInitWithAttributes    objc.SEL
-	selInitWithFormat        objc.SEL
-	selSetValuesForParameter objc.SEL
+	selAlloc                     objc.SEL
+	selInit                      objc.SEL
+	selRelease                   objc.SEL
+	selSharedApplication         objc.SEL
+	selNextEventMatchingMask     objc.SEL
+	selSetActivationPolicy       objc.SEL
+	selActivateIgnoringOtherApps objc.SEL
+	selIsActive                  objc.SEL
+	selFinishLaunching           objc.SEL
+	selDistantPast               objc.SEL
+	selStringWithUTF8String      objc.SEL
+	selInitWithContentRect       objc.SEL
+	selMakeKeyAndOrderFront      objc.SEL
+	selSetTitle                  objc.SEL
+	selSetAcceptsMouseMoved      objc.SEL
+	selSetReleasedWhenClosed     objc.SEL
+	selCenter                    objc.SEL
+	selContentView               objc.SEL
+	selBounds                    objc.SEL
+	selMouseLocationOutside      objc.SEL
+	selConvertRectToBacking      objc.SEL
+	selIsVisible                 objc.SEL
+	selSendEvent                 objc.SEL
+	selFlushBuffer               objc.SEL
+	selSetView                   objc.SEL
+	selMakeCurrentContext        objc.SEL
+	selClearCurrentContext       objc.SEL
+	selInitWithAttributes        objc.SEL
+	selInitWithFormat            objc.SEL
+	selSetValuesForParameter     objc.SEL
 
 	// NSEvent selectors (input).
-	selEventType      objc.SEL
-	selEventKeyCode   objc.SEL
-	selEventIsARepeat objc.SEL
-	selEventFlags     objc.SEL
-	selEventButtonNum objc.SEL
+	selEventType       objc.SEL
+	selEventKeyCode    objc.SEL
+	selEventIsARepeat  objc.SEL
+	selEventFlags      objc.SEL
+	selEventButtonNum  objc.SEL
+	selEventCharacters objc.SEL
+	selUTF8String      objc.SEL
+
+	// NSScreen selectors (display scale).
+	selMainScreen         objc.SEL
+	selBackingScaleFactor objc.SEL
 )
 
 // Subset of NSEventType values we care about.
@@ -149,6 +164,7 @@ func New(title string, width, height int, useCoreProfile bool) (Window, error) {
 		running:      true,
 		keyStates:    make(map[Key]KeyState),
 		buttonStates: make(map[Button]ButtonState),
+		inputEvents:  make([]InputEvent, 0, 256),
 	}
 	if err := c.bootstrapApp(); err != nil {
 		return nil, err
@@ -172,9 +188,28 @@ func (c *Cocoa) Poll() bool {
 		return false
 	}
 
+	// If the app isn't active, it won't receive key up / flagsChanged events.
+	// That can leave modifiers "stuck" and make input feel broken when the
+	// window comes up in the background. When inactive, clear transient input
+	// state and rely on a fresh flagsChanged/keyDown once we regain focus.
+	if c.app != 0 && objc.Send[bool](c.app, selIsActive) == false {
+		for k := range c.keyStates {
+			c.keyStates[k] = KeyStateUp
+		}
+		for b := range c.buttonStates {
+			c.buttonStates[b] = ButtonStateUp
+		}
+		c.textInput = ""
+	}
+
 	// Transition states: Pressed -> Down, Released -> Up (once per Poll()).
 	for key, state := range c.keyStates {
 		if state == KeyStatePressed {
+			c.keyStates[key] = KeyStateDown
+		} else if state == KeyStateRepeated {
+			// Repeated is a one-frame pulse indicating an OS key-repeat event.
+			// If we don't transition it, downstream consumers may treat it as a
+			// per-frame trigger and spam input.
 			c.keyStates[key] = KeyStateDown
 		} else if state == KeyStateReleased {
 			c.keyStates[key] = KeyStateUp
@@ -191,13 +226,27 @@ func (c *Cocoa) Poll() bool {
 	// Drain one slice of the run loop without blocking and pump pending NSEvents.
 	cfRunLoopRunInMode(cfDefaultMode, 0, true)
 	for {
-		ev := objc.Send[objc.ID](c.app, selNextEventMatchingMask, nsEventMaskAny, objc.ID(0), objc.ID(cfDefaultMode), true)
+		// Use NSDate.distantPast to ensure this call is non-blocking. Passing nil
+		// can block waiting for an event, which will stall the render loop and
+		// make the window appear hung/blank.
+		untilDate := objc.ID(objc.GetClass("NSDate")).Send(selDistantPast)
+		ev := objc.Send[objc.ID](c.app, selNextEventMatchingMask, nsEventMaskAny, untilDate, objc.ID(cfDefaultMode), true)
 		if ev == 0 {
 			break
 		}
 
+		etype := int64(objc.Send[uint64](ev, selEventType))
 		c.processEvent(ev)
-		c.app.Send(selSendEvent, ev)
+
+		// We consume keyboard input ourselves. Forwarding key events into the
+		// normal Cocoa responder chain (with no first responder text view) causes
+		// the system beep on every key press.
+		switch etype {
+		case nsEventTypeKeyDown, nsEventTypeKeyUp, nsEventTypeFlagsChanged:
+			// Do not forward.
+		default:
+			c.app.Send(selSendEvent, ev)
+		}
 	}
 
 	if !objc.Send[bool](c.window, selIsVisible) {
@@ -256,9 +305,19 @@ func (c *Cocoa) bootstrapApp() error {
 	}
 	app.Send(selSetActivationPolicy, nsApplicationActivationPolicyRegular)
 	app.Send(selFinishLaunching)
+	// When launched from a terminal (no .app bundle), Cocoa often won't make
+	// the process frontmost automatically. Without activation, the window may
+	// appear behind other apps and keyboard input can behave inconsistently.
+	app.Send(selActivateIgnoringOtherApps, true)
 
 	pool := objc.ID(objc.GetClass("NSAutoreleasePool")).Send(selAlloc)
 	pool = pool.Send(selInit)
+
+	// Set the default run loop mode. This is toll-free bridged between CFString
+	// and NSString, and avoids unsafe symbol dereferencing.
+	if cfDefaultMode == 0 {
+		cfDefaultMode = uintptr(nsString("kCFRunLoopDefaultMode"))
+	}
 
 	c.app = app
 	c.pool = pool
@@ -287,6 +346,10 @@ func (c *Cocoa) makeWindow(title string, width, height int) error {
 	titleStr := nsString(title)
 	win.Send(selSetTitle, titleStr)
 	win.Send(selMakeKeyAndOrderFront, objc.ID(0))
+	// Best-effort: ensure the window becomes frontmost + key.
+	if c.app != 0 {
+		c.app.Send(selActivateIgnoringOtherApps, true)
+	}
 
 	c.window = win
 	c.view = win.Send(selContentView)
@@ -362,12 +425,6 @@ func loadObjc() error {
 	}
 
 	purego.RegisterLibFunc(&cfRunLoopRunInMode, cf, "CFRunLoopRunInMode")
-	ptr, err := purego.Dlsym(cf, "kCFRunLoopDefaultMode")
-	if err != nil {
-		return err
-	}
-	// Dlsym returns the address of the CFStringRef variable; read its value.
-	cfDefaultMode = *(*uintptr)(unsafe.Pointer(ptr))
 
 	return nil
 }
@@ -379,7 +436,10 @@ func loadSelectors() {
 	selSharedApplication = objc.RegisterName("sharedApplication")
 	selNextEventMatchingMask = objc.RegisterName("nextEventMatchingMask:untilDate:inMode:dequeue:")
 	selSetActivationPolicy = objc.RegisterName("setActivationPolicy:")
+	selActivateIgnoringOtherApps = objc.RegisterName("activateIgnoringOtherApps:")
+	selIsActive = objc.RegisterName("isActive")
 	selFinishLaunching = objc.RegisterName("finishLaunching")
+	selDistantPast = objc.RegisterName("distantPast")
 	selStringWithUTF8String = objc.RegisterName("stringWithUTF8String:")
 	selInitWithContentRect = objc.RegisterName("initWithContentRect:styleMask:backing:defer:")
 	selMakeKeyAndOrderFront = objc.RegisterName("makeKeyAndOrderFront:")
@@ -407,10 +467,38 @@ func loadSelectors() {
 	selEventIsARepeat = objc.RegisterName("isARepeat")
 	selEventFlags = objc.RegisterName("modifierFlags")
 	selEventButtonNum = objc.RegisterName("buttonNumber")
+	selEventCharacters = objc.RegisterName("characters")
+	selUTF8String = objc.RegisterName("UTF8String")
+
+	// NSScreen (display scale).
+	selMainScreen = objc.RegisterName("mainScreen")
+	selBackingScaleFactor = objc.RegisterName("backingScaleFactor")
 }
 
 func nsString(v string) objc.ID {
 	return objc.ID(objc.GetClass("NSString")).Send(selStringWithUTF8String, v+"\x00")
+}
+
+func nsStringToGo(v objc.ID) string {
+	if v == 0 {
+		return ""
+	}
+	ptr := objc.Send[unsafe.Pointer](v, selUTF8String)
+	if ptr == nil {
+		return ""
+	}
+	// Find NUL terminator.
+	n := 0
+	for {
+		if *(*byte)(unsafe.Add(ptr, n)) == 0 {
+			break
+		}
+		n++
+	}
+	if n == 0 {
+		return ""
+	}
+	return unsafe.String((*byte)(ptr), n)
 }
 
 // cursorBackingPos returns the mouse in backing (pixel) coordinates.
@@ -425,10 +513,30 @@ func (c *Cocoa) cursorBackingPos() (float32, float32) {
 }
 
 func (c *Cocoa) Scale() float32 {
-	// macOS handles scaling automatically through BackingSize()
-	// which already accounts for Retina scaling, so we return 1.0
-	// as the coordinate system is already scaled appropriately.
-	return 1.0
+	// Return the backing (pixel) to logical (point) scale factor. This is
+	// typically 2.0 on Retina displays.
+	if c.view == 0 {
+		return 1.0
+	}
+
+	bounds := objc.Send[NSRect](c.view, selBounds)
+	if bounds.Size.W == 0 || bounds.Size.H == 0 {
+		return 1.0
+	}
+	backing := objc.Send[NSRect](c.view, selConvertRectToBacking, bounds)
+
+	sx := float32(backing.Size.W / bounds.Size.W)
+	sy := float32(backing.Size.H / bounds.Size.H)
+	if sx <= 0 {
+		sx = 1.0
+	}
+	if sy <= 0 {
+		sy = 1.0
+	}
+	if sx > sy {
+		return sx
+	}
+	return sy
 }
 
 func (c *Cocoa) GetKeyState(key Key) KeyState {
@@ -451,6 +559,54 @@ func (c *Cocoa) GetButtonState(button Button) ButtonState {
 	return ButtonStateUp
 }
 
+func (c *Cocoa) DrainInputEvents() []InputEvent {
+	if c == nil || len(c.inputEvents) == 0 {
+		return nil
+	}
+	out := make([]InputEvent, len(c.inputEvents))
+	copy(out, c.inputEvents)
+	c.inputEvents = c.inputEvents[:0]
+	return out
+}
+
+func (c *Cocoa) TextInput() string {
+	s := c.textInput
+	c.textInput = ""
+	return s
+}
+
+func cocoaFlagsToMods(flags uint64) KeyMods {
+	var m KeyMods
+	if (flags & nsEventModifierFlagShift) != 0 {
+		m |= ModShift
+	}
+	if (flags & nsEventModifierFlagControl) != 0 {
+		m |= ModCtrl
+	}
+	if (flags & nsEventModifierFlagOption) != 0 {
+		m |= ModAlt
+	}
+	if (flags & nsEventModifierFlagCommand) != 0 {
+		m |= ModSuper
+	}
+	return m
+}
+
+func cocoaKeyEmitsText(key Key) bool {
+	switch key {
+	case KeyUnknown,
+		KeyEnter, KeyTab, KeyBackspace, KeyEscape, KeyDelete,
+		KeyUp, KeyDown, KeyLeft, KeyRight,
+		KeyHome, KeyEnd, KeyPageUp, KeyPageDown, KeyInsert,
+		KeyCapsLock, KeyScrollLock, KeyNumLock,
+		KeyPrintScreen, KeyPause,
+		KeyF1, KeyF2, KeyF3, KeyF4, KeyF5, KeyF6, KeyF7, KeyF8, KeyF9, KeyF10, KeyF11, KeyF12:
+		return false
+	default:
+		return true
+	}
+}
+
 func (c *Cocoa) processEvent(ev objc.ID) {
 	etype := int64(objc.Send[uint64](ev, selEventType))
 	switch etype {
@@ -460,7 +616,27 @@ func (c *Cocoa) processEvent(ev objc.ID) {
 		if key == KeyUnknown {
 			return
 		}
+		flags := objc.Send[uint64](ev, selEventFlags)
+		mods := cocoaFlagsToMods(flags)
+		chars := objc.Send[objc.ID](ev, selEventCharacters)
+		if s := nsStringToGo(chars); s != "" {
+			c.textInput += s
+			if cocoaKeyEmitsText(key) {
+				c.inputEvents = append(c.inputEvents, InputEvent{
+					Type: InputEventText,
+					Text: s,
+					Mods: mods,
+				})
+			}
+		}
 		isRepeat := objc.Send[bool](ev, selEventIsARepeat)
+
+		c.inputEvents = append(c.inputEvents, InputEvent{
+			Type:   InputEventKeyDown,
+			Key:    key,
+			Repeat: isRepeat,
+			Mods:   mods,
+		})
 
 		prev := c.GetKeyState(key)
 		if isRepeat || prev.IsDown() {
@@ -475,6 +651,12 @@ func (c *Cocoa) processEvent(ev objc.ID) {
 		if key == KeyUnknown {
 			return
 		}
+		flags := objc.Send[uint64](ev, selEventFlags)
+		c.inputEvents = append(c.inputEvents, InputEvent{
+			Type: InputEventKeyUp,
+			Key:  key,
+			Mods: cocoaFlagsToMods(flags),
+		})
 		c.keyStates[key] = KeyStateReleased
 
 	case nsEventTypeFlagsChanged:
@@ -485,6 +667,11 @@ func (c *Cocoa) processEvent(ev objc.ID) {
 			return
 		}
 		flags := objc.Send[uint64](ev, selEventFlags)
+		c.inputEvents = append(c.inputEvents, InputEvent{
+			Type: InputEventFlagsChanged,
+			Key:  key,
+			Mods: cocoaFlagsToMods(flags),
+		})
 		isDown := cocoaModifierKeyIsDown(key, flags)
 		c.setKeyDown(key, isDown)
 
@@ -492,12 +679,24 @@ func (c *Cocoa) processEvent(ev objc.ID) {
 		buttonNum := int64(objc.Send[uint64](ev, selEventButtonNum))
 		if button, ok := cocoaButtonNumberToButton(buttonNum); ok {
 			c.buttonStates[button] = ButtonStatePressed
+			flags := objc.Send[uint64](ev, selEventFlags)
+			c.inputEvents = append(c.inputEvents, InputEvent{
+				Type:   InputEventMouseDown,
+				Button: button,
+				Mods:   cocoaFlagsToMods(flags),
+			})
 		}
 
 	case nsEventTypeLeftMouseUp, nsEventTypeRightMouseUp, nsEventTypeOtherMouseUp:
 		buttonNum := int64(objc.Send[uint64](ev, selEventButtonNum))
 		if button, ok := cocoaButtonNumberToButton(buttonNum); ok {
 			c.buttonStates[button] = ButtonStateReleased
+			flags := objc.Send[uint64](ev, selEventFlags)
+			c.inputEvents = append(c.inputEvents, InputEvent{
+				Type:   InputEventMouseUp,
+				Button: button,
+				Mods:   cocoaFlagsToMods(flags),
+			})
 		}
 	}
 }
@@ -781,8 +980,36 @@ func cocoaKeyCodeToKey(code uint16) Key {
 }
 
 // getDisplayScale returns the display scale factor.
-// On macOS, window sizes are in logical points and the system handles
-// Retina scaling automatically, so we return 1.0.
+// On macOS, this is typically 2.0 on Retina displays. This is used before
+// creating a window to pick a sensible physical size for a desired logical size.
 func getDisplayScale() float32 {
-	return 1.0
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	if err := ensureRuntime(); err != nil {
+		return 1.0
+	}
+
+	// Create a small autorelease pool for this query since it can be called
+	// before we bootstrap the NSApplication/pool.
+	pool := objc.ID(objc.GetClass("NSAutoreleasePool")).Send(selAlloc)
+	pool = pool.Send(selInit)
+	if pool != 0 {
+		defer pool.Send(selRelease)
+	}
+
+	screenClass := objc.GetClass("NSScreen")
+	if screenClass == 0 {
+		return 1.0
+	}
+	main := objc.ID(screenClass).Send(selMainScreen)
+	if main == 0 {
+		return 1.0
+	}
+
+	scale := float32(objc.Send[float64](main, selBackingScaleFactor))
+	if scale <= 0 {
+		return 1.0
+	}
+	return scale
 }

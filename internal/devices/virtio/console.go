@@ -641,11 +641,43 @@ func (vc *Console) setDefaultConfig() {
 }
 
 func (vc *Console) configBytes() []byte {
+	vc.mu.Lock()
 	cfg := vc.config
+	vc.mu.Unlock()
 	var buf [12]byte
 	binary.LittleEndian.PutUint16(buf[0:2], cfg.cols)
 	binary.LittleEndian.PutUint16(buf[2:4], cfg.rows)
 	binary.LittleEndian.PutUint32(buf[4:8], cfg.maxNrPorts)
 	binary.LittleEndian.PutUint32(buf[8:12], cfg.emergWrite)
 	return buf[:]
+}
+
+// SetSize updates the terminal grid size reported to the guest. This triggers a
+// virtio configuration change interrupt so Linux will re-read the console size.
+// Best-effort: if the device isn't initialized yet, it updates cached config only.
+func (vc *Console) SetSize(cols, rows uint16) {
+	if cols == 0 {
+		cols = 1
+	}
+	if rows == 0 {
+		rows = 1
+	}
+
+	vc.mu.Lock()
+	changed := vc.config.cols != cols || vc.config.rows != rows
+	vc.config.cols = cols
+	vc.config.rows = rows
+	dev := vc.device
+	vc.mu.Unlock()
+
+	if !changed || dev == nil {
+		return
+	}
+
+	// Bump config generation if we're on virtio-mmio.
+	if mmio, ok := dev.(*mmioDevice); ok {
+		mmio.configGeneration++
+	}
+
+	_ = dev.raiseInterrupt(VIRTIO_MMIO_INT_CONFIG)
 }

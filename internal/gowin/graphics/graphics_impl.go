@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	vertexShaderSource = `#version 130
+	vertexShaderSource = `#version 150
 in vec2 a_position;
 in vec2 a_texCoord;
 in vec4 a_color;
@@ -29,7 +29,7 @@ void main() {
 	v_color = a_color;
 }`
 
-	fragmentShaderSource = `#version 130
+	fragmentShaderSource = `#version 150
 in vec2 v_texCoord;
 in vec4 v_color;
 
@@ -310,7 +310,9 @@ func orthoMatrix(left, right, bottom, top, near, far float32) [16]float32 {
 }
 
 func (f glFrame) WindowSize() (int, int) {
-	return f.w.platform.BackingSize()
+	bw, bh := f.w.platform.BackingSize()
+	// The graphics coordinate system is logical units (backing/scale).
+	return int(float32(bw) / f.w.scale), int(float32(bh) / f.w.scale)
 }
 
 func (f glFrame) CursorPos() (float32, float32) {
@@ -326,6 +328,10 @@ func (f glFrame) GetKeyState(key window.Key) window.KeyState {
 
 func (f glFrame) GetButtonState(button window.Button) window.ButtonState {
 	return f.w.platform.GetButtonState(button)
+}
+
+func (f glFrame) TextInput() string {
+	return f.w.platform.TextInput()
 }
 
 func (f glFrame) RenderQuad(x, y, width, height float32, tex Texture, c color.Color) {
