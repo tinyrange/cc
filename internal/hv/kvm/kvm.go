@@ -490,9 +490,19 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		vcpus: make(map[int]*virtualCPU),
 	}
 
-	vmFd, err := createVm(h.fd)
+	// On M1 this fails unless an atgument is passed to set the IPA size.
+	var ipaSize uint32 = 0
+	if runtime.GOARCH == "arm64" {
+		cap, err := checkExtension(h.fd, kvmCapArmVmIpaSize)
+		if err != nil {
+			return nil, fmt.Errorf("kvm: get cap: %w", err)
+		}
+		ipaSize = uint32(cap)
+	}
+
+	vmFd, err := createVm(h.fd, ipaSize)
 	if err != nil {
-		return nil, fmt.Errorf("create VM: %w", err)
+		return nil, fmt.Errorf("kvm: create VM: %w", err)
 	}
 
 	vm.vmFd = vmFd

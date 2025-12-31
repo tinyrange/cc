@@ -5,6 +5,7 @@ package kvm
 import (
 	"unsafe"
 
+	"github.com/tinyrange/cc/internal/debug"
 	"golang.org/x/sys/unix"
 )
 
@@ -38,9 +39,16 @@ func ioctlInt(ioctl int) func(fd int) (int, error) {
 
 var (
 	getApiVersion   = ioctlInt(kvmGetApiVersion)
-	createVm        = ioctlInt(kvmCreateVm)
 	getVcpuMmapSize = ioctlInt(kvmGetVcpuMmapSize)
 )
+
+func createVm(fd int, ipaSize uint32) (int, error) {
+	v1, err := ioctlWithRetry(uintptr(fd), uint64(kvmCreateVm), uintptr(ipaSize))
+	if err != nil {
+		return 0, err
+	}
+	return int(v1), nil
+}
 
 func createVCPU(fd int, id int) (int, error) {
 	v1, err := ioctlWithRetry(uintptr(fd), uint64(kvmCreateVcpu), uintptr(id))
@@ -49,6 +57,19 @@ func createVCPU(fd int, id int) (int, error) {
 	}
 
 	return int(v1), nil
+}
+
+func checkExtension(systemFd int, cap int) (uint64, error) {
+	debug.Writef("kvm hypervisor checkExtension", "systemFd: %d, cap: %d", systemFd, cap)
+
+	ret, _, err := unix.Syscall(unix.SYS_IOCTL, uintptr(systemFd), uintptr(kvmCheckExtension), uintptr(cap))
+	if err != 0 {
+		return 0, err
+	}
+
+	debug.Writef("kvm hypervisor checkExtension", "ret: %d", ret)
+
+	return uint64(ret), nil
 }
 
 func setUserMemoryRegion(fd int, region *kvmUserspaceMemoryRegion) error {

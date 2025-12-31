@@ -9,6 +9,7 @@ const (
 
 	kvmGetApiVersion          = 0xae00
 	kvmCreateVm               = 0xae01
+	kvmGetCap                 = 0xae02
 	kvmGetMsrIndexList        = 0xc004ae02
 	kvmCheckExtension         = 0xae03
 	kvmGetVcpuMmapSize        = 0xae04
@@ -63,6 +64,8 @@ const (
 	kvmDevTypeArmVgicV3 = 7
 
 	kvmCapSplitIrqchip = 121
+
+	kvmCapArmVmIpaSize = 165
 )
 
 type kvmEnableCapArgs struct {

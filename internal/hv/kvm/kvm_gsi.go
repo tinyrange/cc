@@ -22,7 +22,7 @@ func initGSIRouting(vmFd int, systemFd int, numGSIs int) error {
 
 	if ok, err := checkExtension(systemFd, kvmCapIrqRouting); err != nil {
 		return fmt.Errorf("check KVM_CAP_IRQ_ROUTING: %w", err)
-	} else if !ok {
+	} else if ok == 0 {
 		return nil
 	}
 
@@ -112,17 +112,4 @@ func setIrqRouting(vmFd int, table *kvmIrqRouting) error {
 		return e
 	}
 	return nil
-}
-
-func checkExtension(systemFd int, cap int) (bool, error) {
-	debug.Writef("kvm hypervisor checkExtension", "systemFd: %d, cap: %d", systemFd, cap)
-
-	ret, _, err := unix.Syscall(unix.SYS_IOCTL, uintptr(systemFd), uintptr(kvmCheckExtension), uintptr(cap))
-	if err != 0 {
-		return false, err
-	}
-
-	debug.Writef("kvm hypervisor checkExtension", "ret: %d", ret)
-
-	return ret != 0, nil
 }
