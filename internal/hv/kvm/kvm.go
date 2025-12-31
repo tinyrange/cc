@@ -490,7 +490,7 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		vcpus: make(map[int]*virtualCPU),
 	}
 
-	// On M1 this fails unless an atgument is passed to set the IPA size.
+	// On M1 this fails unless an argument is passed to set the IPA size.
 	var ipaSize uint32 = 0
 	if runtime.GOARCH == "arm64" {
 		cap, err := checkExtension(h.fd, kvmCapArmVmIpaSize)
