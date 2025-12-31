@@ -41,7 +41,12 @@ const (
 	wglContextMajorVersionArb   = 0x2091
 	wglContextMinorVersionArb   = 0x2092
 	wglContextFlagsArb          = 0x2094
-	wglContextCoreProfileBitArb = 0x00000001
+	// WGL_ARB_create_context_profile constants (when requesting OpenGL 3.2+)
+	wglContextProfileMaskArb                 = 0x9126
+	wglContextCoreProfileBitArb              = 0x00000001
+	wglContextCompatibilityProfileBitArb     = 0x00000002
+	wglContextForwardCompatibleBitArb        = 0x00000002
+	wglContextDebugBitArb                    = 0x00000001
 )
 
 type (
@@ -224,7 +229,7 @@ type winWindow struct {
 	running bool
 }
 
-func New(title string, width, height int, _ bool) (Window, error) {
+func New(title string, width, height int, useCoreProfile bool) (Window, error) {
 	runtime.LockOSThread()
 
 	if unsafe.Sizeof(pixelFormatDescriptor{}) != 40 {
@@ -267,7 +272,7 @@ func New(title string, width, height int, _ bool) (Window, error) {
 		return nil, err
 	}
 
-	ctx, err := createGLContext(hdc)
+	ctx, err := createGLContext(hdc, useCoreProfile)
 	if err != nil {
 		procReleaseDC.Call(uintptr(hwd), uintptr(hdc))
 		procDestroyWindow.Call(uintptr(hwd))
@@ -596,7 +601,7 @@ func enumAndSetPixelFormat(
 	return int32(chosenFormat), chosenPFD, nil
 }
 
-func createGLContext(hdc hdc) (hglrc, error) {
+func createGLContext(hdc hdc, useCoreProfile bool) (hglrc, error) {
 	// First create a temporary legacy context to bootstrap
 	clearLastError()
 	tempCtx, _, _ := procWglCreateContext.Call(uintptr(hdc))
@@ -615,19 +620,59 @@ func createGLContext(hdc hdc) (hglrc, error) {
 	var finalCtx hglrc
 	procName := syscall.StringBytePtr("wglCreateContextAttribsARB")
 	procAddr, _, _ := procWglGetProcAddress.Call(uintptr(unsafe.Pointer(procName)))
-	if procAddr != 0 {
-		// We have WGL_ARB_create_context support
-		createContextAttribsARB := *(*func(uintptr, uintptr, uintptr, *int32) uintptr)(unsafe.Pointer(&procAddr))
-
-		attribs := []int32{
-			wglContextMajorVersionArb, 3,
-			wglContextMinorVersionArb, 0,
-			wglContextFlagsArb, wglContextCoreProfileBitArb,
-			0,
+	if procAddr != 0 && useCoreProfile {
+		// wglCreateContextAttribsARB signature:
+		//   HGLRC wglCreateContextAttribsARB(HDC hDC, HGLRC hShareContext, const int *attribList);
+		//
+		// IMPORTANT: do not try to convert the proc address to a Go func. Call it via SyscallN.
+		tryCreate := func(attribs []int32) uintptr {
+			if len(attribs) == 0 {
+				return 0
+			}
+			clearLastError()
+			r1, _, _ := syscall.SyscallN(
+				procAddr,
+				uintptr(hdc),
+				0, // share context
+				uintptr(unsafe.Pointer(&attribs[0])),
+			)
+			return r1
 		}
 
-		clearLastError()
-		newCtx := createContextAttribsARB(uintptr(hdc), 0, uintptr(unsafe.Pointer(&attribs[0])), nil)
+		// Prefer a GL 3.2+ context (required for GLSL 1.50 / `#version 150`).
+		// First try core profile; if that fails, fall back to compatibility, and then
+		// to a plain 3.0 context without profile attributes (older drivers).
+		candidates := [][]int32{
+			{
+				wglContextMajorVersionArb, 3,
+				wglContextMinorVersionArb, 2,
+				wglContextProfileMaskArb, wglContextCoreProfileBitArb,
+				wglContextFlagsArb, 0,
+				0,
+			},
+			{
+				wglContextMajorVersionArb, 3,
+				wglContextMinorVersionArb, 2,
+				wglContextProfileMaskArb, wglContextCompatibilityProfileBitArb,
+				wglContextFlagsArb, 0,
+				0,
+			},
+			{
+				wglContextMajorVersionArb, 3,
+				wglContextMinorVersionArb, 0,
+				wglContextFlagsArb, 0,
+				0,
+			},
+		}
+
+		var newCtx uintptr
+		for _, attribs := range candidates {
+			newCtx = tryCreate(attribs)
+			if newCtx != 0 {
+				break
+			}
+		}
+
 		if newCtx != 0 {
 			// Make the new context current
 			clearLastError()
@@ -642,11 +687,11 @@ func createGLContext(hdc hdc) (hglrc, error) {
 				finalCtx = hglrc(tempCtx)
 			}
 		} else {
-			// Failed to create GL 3.0 context, use temp context
+			// Failed to create modern context, use temp context
 			finalCtx = hglrc(tempCtx)
 		}
 	} else {
-		// No WGL_ARB_create_context support, use legacy context
+		// No WGL_ARB_create_context support or legacy requested: use legacy context.
 		finalCtx = hglrc(tempCtx)
 	}
 
