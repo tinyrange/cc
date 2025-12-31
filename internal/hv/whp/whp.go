@@ -20,6 +20,7 @@ type virtualCPU struct {
 	vm       *virtualMachine
 	id       int
 	runQueue chan func()
+	done     chan struct{} // closed when the vCPU goroutine exits
 
 	pendingError error
 }
@@ -27,6 +28,7 @@ type virtualCPU struct {
 func (v *virtualCPU) start() {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	defer close(v.done)
 
 	for fn := range v.runQueue {
 		fn()
@@ -353,9 +355,31 @@ func (v *virtualMachine) AddDeviceFromTemplate(template hv.DeviceTemplate) error
 
 // Close implements hv.VirtualMachine.
 func (v *virtualMachine) Close() error {
+	// Step 1: Cancel all running vCPUs to break them out of WHvRunVirtualProcessor.
+	for id := range v.vcpus {
+		_ = bindings.CancelRunVirtualProcessor(v.part, uint32(id), 0)
+	}
+
+	// Step 2: Close all runQueue channels to stop the vCPU goroutines.
+	for _, vcpu := range v.vcpus {
+		close(vcpu.runQueue)
+	}
+
+	// Step 3: Wait for all vCPU goroutines to exit.
+	for _, vcpu := range v.vcpus {
+		<-vcpu.done
+	}
+
+	// Step 4: Delete all vCPUs before deleting the partition.
+	for id := range v.vcpus {
+		_ = bindings.DeleteVirtualProcessor(v.part, uint32(id))
+	}
+
 	if v.memory != nil {
 		v.memory = nil
 	}
+
+	// Step 5: Delete the partition.
 	return bindings.DeletePartition(v.part)
 }
 
@@ -672,6 +696,7 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 			vm:       vm,
 			id:       i,
 			runQueue: make(chan func(), 16),
+			done:     make(chan struct{}),
 		}
 
 		vm.vcpus[i] = vcpu
