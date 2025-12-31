@@ -185,6 +185,8 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			return err
 		}
 		return fmt.Errorf("whp: virtual processor canceled without context error")
+	case bindings.WHvRunVpExitReasonNone:
+		return nil
 	default:
 		return fmt.Errorf("whp: unsupported vCPU exit reason %s", exit.ExitReason)
 	}
@@ -249,14 +251,22 @@ func (h *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 		gicrRegionSize = whpGicRedistributorSize * uint64(numCPUs)
 	}
 
+	// Configure GICv3 parameters for WHP.
+	// GicPpiOverflowInterruptFromCntv: PPI number for the virtual timer (CNTV).
+	// The ARM64 standard uses PPI 27 (INTID 27) for the virtual timer.
+	// This must match what the kernel expects (arch_timer uses IRQ 27).
+	const (
+		ppiVirtualTimer       = 27 // CNTV - virtual timer, standard ARM64 PPI
+		ppiPerformanceMonitor = 23 // PMU interrupt
+	)
 	if err := bindings.SetPartitionPropertyUnsafe(vm.part, bindings.PartitionPropertyCodeArm64IcParameters, Arm64IcParameters{
 		EmulationMode: Arm64IcEmulationModeGicV3,
 		GicV3Parameters: Arm64GicV3Parameters{
 			GicdBaseAddress:                    whpGicDistributorBase,
 			GitsTranslatorBaseAddress:          0,
 			GicLpiIntIdBits:                    1,
-			GicPpiOverflowInterruptFromCntv:    0x14,
-			GicPpiPerformanceMonitorsInterrupt: 0x17,
+			GicPpiOverflowInterruptFromCntv:    ppiVirtualTimer,
+			GicPpiPerformanceMonitorsInterrupt: ppiPerformanceMonitor,
 		},
 	}); err != nil {
 		return fmt.Errorf("failed to set ARM64 IC parameters: %w", err)
