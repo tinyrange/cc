@@ -51,63 +51,68 @@ func wrapStdinForVT(r io.Reader) io.Reader {
 }
 
 func (f *cprFilterReader) Read(p []byte) (int, error) {
-	// Read into a temporary buffer so we can filter.
-	tmp := make([]byte, len(p))
-	n, err := f.r.Read(tmp)
-	if n == 0 {
-		return 0, err
-	}
+	// Retry loop to handle cases where all data is filtered out.
+	for {
+		// Read into a temporary buffer so we can filter.
+		tmp := make([]byte, len(p))
+		n, err := f.r.Read(tmp)
+		if n == 0 {
+			return 0, err
+		}
 
-	// Prepend any buffered partial sequence.
-	data := append(f.buf, tmp[:n]...)
-	f.buf = nil
+		// Prepend any buffered partial sequence.
+		data := append(f.buf, tmp[:n]...)
+		f.buf = nil
 
-	// Filter out CPR responses: ESC [ <digits> ; <digits> R
-	out := make([]byte, 0, len(data))
-	i := 0
-	for i < len(data) {
-		if data[i] == 0x1b { // ESC
-			// Look for CPR pattern: ESC [ <digits> ; <digits> R
-			j := i + 1
-			if j < len(data) && data[j] == '[' {
-				j++
-				// Parse first number (row).
-				for j < len(data) && data[j] >= '0' && data[j] <= '9' {
+		// Filter out CPR responses: ESC [ <digits> ; <digits> R
+		out := make([]byte, 0, len(data))
+		i := 0
+		for i < len(data) {
+			if data[i] == 0x1b { // ESC
+				// Look for CPR pattern: ESC [ <digits> ; <digits> R
+				j := i + 1
+				if j < len(data) && data[j] == '[' {
 					j++
-				}
-				if j < len(data) && data[j] == ';' {
-					j++
-					// Parse second number (col).
+					// Parse first number (row).
 					for j < len(data) && data[j] >= '0' && data[j] <= '9' {
 						j++
 					}
-					if j < len(data) && data[j] == 'R' {
-						// Found a complete CPR response - skip it.
-						i = j + 1
-						continue
+					if j < len(data) && data[j] == ';' {
+						j++
+						// Parse second number (col).
+						for j < len(data) && data[j] >= '0' && data[j] <= '9' {
+							j++
+						}
+						if j < len(data) && data[j] == 'R' {
+							// Found a complete CPR response - skip it.
+							i = j + 1
+							continue
+						}
 					}
-				}
-				// Check if we might have a partial CPR at end of buffer.
-				if j >= len(data) {
-					// Buffer the partial sequence for next read.
+					// Check if we might have a partial CPR at end of buffer.
+					if j >= len(data) {
+						// Buffer the partial sequence for next read.
+						f.buf = append(f.buf, data[i:]...)
+						break
+					}
+				} else if j >= len(data) {
+					// ESC at end of buffer - might be start of CPR.
 					f.buf = append(f.buf, data[i:]...)
 					break
 				}
-			} else if j >= len(data) {
-				// ESC at end of buffer - might be start of CPR.
-				f.buf = append(f.buf, data[i:]...)
-				break
 			}
+			out = append(out, data[i])
+			i++
 		}
-		out = append(out, data[i])
-		i++
-	}
 
-	if len(out) == 0 {
-		// All data was filtered out or buffered. Try another read.
-		return f.Read(p)
+		if len(out) > 0 {
+			copy(p, out)
+			return len(out), err
+		}
+		// All data was filtered out. If there's an error, return it.
+		// Otherwise, loop to try another read.
+		if err != nil {
+			return 0, err
+		}
 	}
-
-	copy(p, out)
-	return len(out), err
 }
