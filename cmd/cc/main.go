@@ -261,7 +261,8 @@ func run() error {
 			initx.WithConsoleOutput(termWindow),
 		)
 	} else {
-		opts = append(opts, initx.WithStdin(os.Stdin))
+		// Wrap stdin with a filter to strip CPR responses on Windows.
+		opts = append(opts, initx.WithStdin(wrapStdinForVT(os.Stdin)))
 	}
 
 	// Add network device if enabled
@@ -723,6 +724,13 @@ func run() error {
 		return fmt.Errorf("window closed by user")
 	} else {
 		if term.IsTerminal(int(os.Stdin.Fd())) {
+			// On Windows, enable VT processing on stdout so ANSI sequences are interpreted.
+			restoreVT, err := enableVTProcessing()
+			if err != nil {
+				return fmt.Errorf("enable VT processing: %w", err)
+			}
+			defer restoreVT()
+
 			oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 			if err != nil {
 				return fmt.Errorf("enable raw mode: %w", err)
