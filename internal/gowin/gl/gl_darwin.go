@@ -64,7 +64,8 @@ type openGL struct {
 	uniformMatrix4fv   func(int32, int32, bool, *float32)
 
 	// Drawing
-	drawArrays func(uint32, int32, int32)
+	drawArrays   func(uint32, int32, int32)
+	drawElements func(uint32, int32, uint32, uintptr)
 }
 
 func (gl *openGL) ClearColor(r, g, b, a float32) {
@@ -267,6 +268,10 @@ func (gl *openGL) DrawArrays(mode uint32, first int32, count int32) {
 	gl.drawArrays(mode, first, count)
 }
 
+func (gl *openGL) DrawElements(mode uint32, count int32, xtype uint32, indices uintptr) {
+	gl.drawElements(mode, count, xtype, indices)
+}
+
 func Load() (OpenGL, error) {
 	handle, err := purego.Dlopen("/System/Library/Frameworks/OpenGL.framework/OpenGL", purego.RTLD_GLOBAL|purego.RTLD_LAZY)
 	if err != nil {
@@ -323,6 +328,7 @@ func Load() (OpenGL, error) {
 	register(&gl.uniform4f, "glUniform4f")
 	register(&gl.uniformMatrix4fv, "glUniformMatrix4fv")
 	register(&gl.drawArrays, "glDrawArrays")
+	register(&gl.drawElements, "glDrawElements")
 
 	return gl, nil
 }

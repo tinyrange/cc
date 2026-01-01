@@ -6,6 +6,7 @@ import (
 	"os"
 	"runtime"
 
+	"github.com/tinyrange/cc/internal/assets"
 	"github.com/tinyrange/cc/internal/gowin/graphics"
 	"github.com/tinyrange/cc/internal/gowin/text"
 )
@@ -13,6 +14,7 @@ import (
 type Application struct {
 	window graphics.Window
 	text   *text.Renderer
+	logo   *graphics.SVG
 }
 
 func (app *Application) Run() error {
@@ -28,6 +30,11 @@ func (app *Application) Run() error {
 		return fmt.Errorf("failed to create text renderer: %w", err)
 	}
 
+	app.logo, err = graphics.LoadSVG(app.window, assets.LogoWhite)
+	if err != nil {
+		return fmt.Errorf("failed to load logo svg: %w", err)
+	}
+
 	app.window.SetClear(true)
 	app.window.SetClearColor(color.RGBA{R: 10, G: 10, B: 10, A: 255})
 
@@ -37,7 +44,18 @@ func (app *Application) Run() error {
 
 		app.text.RenderText("Hello, World!", 50, 50, 16, graphics.ColorWhite)
 
-		f.RenderQuad(100, 100, 50, 50, nil, graphics.ColorWhite)
+		if app.logo != nil {
+			side := float32(w)
+			if h < w {
+				side = float32(h)
+			}
+			if side > 100 {
+				side -= 100
+			}
+			x := (float32(w) - side) * 0.5
+			y := (float32(h) - side) * 0.5
+			app.logo.Draw(f, x, y, side, side)
+		}
 
 		return nil
 	})

@@ -22,9 +22,10 @@ out vec2 v_texCoord;
 out vec4 v_color;
 
 uniform mat4 u_proj;
+uniform mat4 u_model;
 
 void main() {
-	gl_Position = u_proj * vec4(a_position, 0.0, 1.0);
+	gl_Position = u_proj * u_model * vec4(a_position, 0.0, 1.0);
 	v_texCoord = a_texCoord;
 	v_color = a_color;
 }`
@@ -55,9 +56,13 @@ type glWindow struct {
 	vao           uint32
 	vbo           uint32
 	projUniform   int32
+	modelUniform  int32
 
 	// Lazily-created 1x1 white texture for callers that pass nil.
 	whiteTex *glTexture
+
+	// Meshes created via NewMesh, for cleanup when the window loop exits.
+	meshes []*glMesh
 }
 
 type glTexture struct {
@@ -65,6 +70,18 @@ type glTexture struct {
 	w  int
 	h  int
 }
+
+type glMesh struct {
+	vao uint32
+	vbo uint32
+	ebo uint32
+
+	indexCount int32
+
+	tex *glTexture
+}
+
+func (*glMesh) isMesh() {}
 
 type glFrame struct {
 	w *glWindow
@@ -132,6 +149,7 @@ func newWithProfile(title string, width, height int, useCoreProfile bool) (Windo
 	}
 	w.shaderProgram = program
 	w.projUniform = gl.GetUniformLocation(program, "u_proj")
+	w.modelUniform = gl.GetUniformLocation(program, "u_model")
 
 	// Create VAO and VBO
 	var vao, vbo uint32
@@ -259,6 +277,23 @@ func (w *glWindow) Loop(step func(f Frame) error) error {
 	defer w.platform.Close()
 	defer func() {
 		var vao, vbo uint32 = w.vao, w.vbo
+		for _, m := range w.meshes {
+			if m == nil {
+				continue
+			}
+			if m.vao != 0 {
+				va := m.vao
+				w.gl.DeleteVertexArrays(1, &va)
+			}
+			if m.vbo != 0 {
+				buf := m.vbo
+				w.gl.DeleteBuffers(1, &buf)
+			}
+			if m.ebo != 0 {
+				buf := m.ebo
+				w.gl.DeleteBuffers(1, &buf)
+			}
+		}
 		w.gl.DeleteVertexArrays(1, &vao)
 		w.gl.DeleteBuffers(1, &vbo)
 		w.gl.DeleteProgram(w.shaderProgram)
@@ -293,6 +328,8 @@ func (w *glWindow) prepareFrame() {
 	w.gl.UseProgram(w.shaderProgram)
 	w.gl.BindVertexArray(w.vao)
 	w.gl.UniformMatrix4fv(w.projUniform, 1, false, &proj[0])
+	model := IdentityMat4()
+	w.gl.UniformMatrix4fv(w.modelUniform, 1, false, &model[0])
 
 	if w.clearEnabled {
 		rgba := ColorToFloat32(w.clearColor)
@@ -358,6 +395,11 @@ func (f glFrame) RenderQuad(x, y, width, height float32, tex Texture, c color.Co
 	// Convert color to float32 RGBA
 	rgba := ColorToFloat32(c)
 
+	// Ensure quads render with identity model matrix.
+	model := IdentityMat4()
+	f.w.gl.UseProgram(f.w.shaderProgram)
+	f.w.gl.UniformMatrix4fv(f.w.modelUniform, 1, false, &model[0])
+
 	// Update vertex buffer with quad data (2 triangles)
 	vertices := [6 * 8]float32{
 		// Triangle 1
@@ -376,6 +418,101 @@ func (f glFrame) RenderQuad(x, y, width, height float32, tex Texture, c color.Co
 	// Draw
 	f.w.gl.BindVertexArray(f.w.vao)
 	f.w.gl.DrawArrays(glpkg.Triangles, 0, 6)
+}
+
+func (w *glWindow) NewMesh(vertices []Vertex, indices []uint32, tex Texture) (Mesh, error) {
+	if len(vertices) == 0 || len(indices) == 0 {
+		return &glMesh{}, nil
+	}
+
+	var t *glTexture
+	if tex == nil {
+		t = w.getWhiteTexture()
+	} else {
+		var ok bool
+		t, ok = tex.(*glTexture)
+		if !ok {
+			return nil, fmt.Errorf("unsupported texture implementation")
+		}
+	}
+
+	// Create VAO/VBO/EBO for this mesh.
+	var vao, vbo, ebo uint32
+	w.gl.GenVertexArrays(1, &vao)
+	w.gl.GenBuffers(1, &vbo)
+	w.gl.GenBuffers(1, &ebo)
+
+	w.gl.BindVertexArray(vao)
+
+	// Vertex buffer.
+	w.gl.BindBuffer(glpkg.ArrayBuffer, vbo)
+	w.gl.BufferData(
+		glpkg.ArrayBuffer,
+		len(vertices)*8*4,
+		unsafe.Pointer(&vertices[0]),
+		glpkg.StaticDraw,
+	)
+
+	// Index buffer.
+	w.gl.BindBuffer(glpkg.ElementArrayBuffer, ebo)
+	w.gl.BufferData(
+		glpkg.ElementArrayBuffer,
+		len(indices)*4,
+		unsafe.Pointer(&indices[0]),
+		glpkg.StaticDraw,
+	)
+
+	// Set up vertex attributes for this VAO.
+	posLoc := w.gl.GetAttribLocation(w.shaderProgram, "a_position")
+	texLoc := w.gl.GetAttribLocation(w.shaderProgram, "a_texCoord")
+	colLoc := w.gl.GetAttribLocation(w.shaderProgram, "a_color")
+	w.gl.VertexAttribPointer(uint32(posLoc), 2, glpkg.Float, false, 8*4, 0)
+	w.gl.EnableVertexAttribArray(uint32(posLoc))
+	w.gl.VertexAttribPointer(uint32(texLoc), 2, glpkg.Float, false, 8*4, 8)
+	w.gl.EnableVertexAttribArray(uint32(texLoc))
+	w.gl.VertexAttribPointer(uint32(colLoc), 4, glpkg.Float, false, 8*4, 16)
+	w.gl.EnableVertexAttribArray(uint32(colLoc))
+
+	m := &glMesh{
+		vao:        vao,
+		vbo:        vbo,
+		ebo:        ebo,
+		indexCount: int32(len(indices)),
+		tex:        t,
+	}
+	w.meshes = append(w.meshes, m)
+	return m, nil
+}
+
+func (f glFrame) RenderMesh(mesh Mesh, opts DrawOptions) {
+	m, ok := mesh.(*glMesh)
+	if !ok || m == nil || m.vao == 0 || m.indexCount == 0 {
+		return
+	}
+
+	f.w.gl.UseProgram(f.w.shaderProgram)
+
+	// Projection is set in prepareFrame(); just set model.
+	model := opts.Model
+	if model == (Mat4{}) {
+		model = IdentityMat4()
+	}
+	f.w.gl.UniformMatrix4fv(f.w.modelUniform, 1, false, &model[0])
+
+	// Bind texture.
+	f.w.gl.ActiveTexture(glpkg.Texture0)
+	if m.tex != nil {
+		f.w.gl.BindTexture(glpkg.Texture2D, m.tex.id)
+	} else {
+		t := f.w.getWhiteTexture()
+		f.w.gl.BindTexture(glpkg.Texture2D, t.id)
+	}
+	texUniform := f.w.gl.GetUniformLocation(f.w.shaderProgram, "u_texture")
+	f.w.gl.Uniform1i(texUniform, 0)
+
+	// Draw.
+	f.w.gl.BindVertexArray(m.vao)
+	f.w.gl.DrawElements(glpkg.Triangles, m.indexCount, glpkg.UnsignedInt, 0)
 }
 
 func (t *glTexture) Size() (int, int) {

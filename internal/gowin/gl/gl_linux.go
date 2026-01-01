@@ -65,7 +65,8 @@ type openGL struct {
 	uniformMatrix4fv   func(int32, int32, bool, *float32)
 
 	// Drawing
-	drawArrays func(uint32, int32, int32)
+	drawArrays   func(uint32, int32, int32)
+	drawElements func(uint32, int32, uint32, uintptr)
 
 	// Proc address function
 	getProcAddress func(*byte) unsafe.Pointer
@@ -269,6 +270,10 @@ func (gl *openGL) DrawArrays(mode uint32, first int32, count int32) {
 	gl.drawArrays(mode, first, count)
 }
 
+func (gl *openGL) DrawElements(mode uint32, count int32, xtype uint32, indices uintptr) {
+	gl.drawElements(mode, count, xtype, indices)
+}
+
 func Load() (OpenGL, error) {
 	handle, err := purego.Dlopen("libGL.so.1", purego.RTLD_LAZY|purego.RTLD_GLOBAL)
 	if err != nil {
@@ -358,6 +363,7 @@ func Load() (OpenGL, error) {
 	purego.RegisterFunc(&gl.uniform4f, uintptr(loadFunc("glUniform4f")))
 	purego.RegisterFunc(&gl.uniformMatrix4fv, uintptr(loadFunc("glUniformMatrix4fv")))
 	purego.RegisterFunc(&gl.drawArrays, uintptr(loadFunc("glDrawArrays")))
+	purego.RegisterFunc(&gl.drawElements, uintptr(loadFunc("glDrawElements")))
 
 	return gl, nil
 }

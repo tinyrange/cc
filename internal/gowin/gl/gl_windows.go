@@ -74,7 +74,8 @@ type openGL struct {
 	uniformMatrix4fv   Proc
 
 	// Drawing
-	drawArrays Proc
+	drawArrays   Proc
+	drawElements Proc
 }
 
 func (gl *openGL) ClearColor(r, g, b, a float32) {
@@ -289,6 +290,10 @@ func (gl *openGL) DrawArrays(mode uint32, first int32, count int32) {
 	gl.drawArrays.Call(uintptr(mode), uintptr(first), uintptr(count))
 }
 
+func (gl *openGL) DrawElements(mode uint32, count int32, xtype uint32, indices uintptr) {
+	gl.drawElements.Call(uintptr(mode), uintptr(count), uintptr(xtype), indices)
+}
+
 func Load() (OpenGL, error) {
 	opengl32 := syscall.NewLazyDLL("opengl32.dll")
 	wglGetProcAddress := opengl32.NewProc("wglGetProcAddress")
@@ -354,6 +359,7 @@ func Load() (OpenGL, error) {
 		uniform4f:               loadProc("glUniform4f"),
 		uniformMatrix4fv:        loadProc("glUniformMatrix4fv"),
 		drawArrays:              loadProc("glDrawArrays"),
+		drawElements:            loadProc("glDrawElements"),
 	}
 	return gl, nil
 }

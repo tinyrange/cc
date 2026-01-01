@@ -44,6 +44,7 @@ type Frame interface {
 	TextInput() string
 
 	RenderQuad(x, y, width, height float32, tex Texture, color color.Color)
+	RenderMesh(mesh Mesh, opts DrawOptions)
 
 	Screenshot() (image.Image, error)
 }
@@ -58,6 +59,8 @@ type Window interface {
 
 	// Create a new texture from an image.
 	NewTexture(image.Image) (Texture, error)
+	// NewMesh uploads a set of vertices/indices to the GPU for repeated rendering.
+	NewMesh(vertices []Vertex, indices []uint32, tex Texture) (Mesh, error)
 
 	SetClear(enabled bool)
 	SetClearColor(color color.Color)
