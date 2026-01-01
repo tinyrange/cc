@@ -75,6 +75,8 @@ type buildOptions struct {
 	Tags             []string
 	// Build a bundle on macOS, build as a windows executable on windows, and build as a normal executable on linux
 	BuildApp bool
+	// LogoPath is the path to a PNG image to use as the application icon (macOS only)
+	LogoPath string
 }
 
 type buildOutput struct {
@@ -209,9 +211,10 @@ func encodePlist(v any) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func writeMacOSAppBundle(bundlePath, executablePath, appName string) error {
+func writeMacOSAppBundle(bundlePath, executablePath, appName, logoPath string) error {
 	contentsDir := filepath.Join(bundlePath, "Contents")
 	macosDir := filepath.Join(contentsDir, "MacOS")
+	resourcesDir := filepath.Join(contentsDir, "Resources")
 
 	if err := os.RemoveAll(bundlePath); err != nil {
 		return fmt.Errorf("remove existing bundle: %w", err)
@@ -219,11 +222,24 @@ func writeMacOSAppBundle(bundlePath, executablePath, appName string) error {
 	if err := os.MkdirAll(macosDir, 0755); err != nil {
 		return fmt.Errorf("create bundle dirs: %w", err)
 	}
+	if err := os.MkdirAll(resourcesDir, 0755); err != nil {
+		return fmt.Errorf("create resources dir: %w", err)
+	}
 
 	exeName := filepath.Base(executablePath)
 	exeDst := filepath.Join(macosDir, exeName)
 	if err := copyFile(exeDst, executablePath, 0755); err != nil {
 		return fmt.Errorf("copy app executable: %w", err)
+	}
+
+	// Copy the logo to Resources if provided
+	var iconFileName string
+	if logoPath != "" {
+		iconFileName = filepath.Base(logoPath)
+		iconDst := filepath.Join(resourcesDir, iconFileName)
+		if err := copyFile(iconDst, logoPath, 0644); err != nil {
+			return fmt.Errorf("copy app icon: %w", err)
+		}
 	}
 
 	// Minimal Info.plist required for a runnable app bundle.
@@ -240,6 +256,7 @@ func writeMacOSAppBundle(bundlePath, executablePath, appName string) error {
 		CFBundleShortVersionString    string `plist:"CFBundleShortVersionString"`
 		CFBundleVersion               string `plist:"CFBundleVersion"`
 		NSHighResolutionCapable       bool   `plist:"NSHighResolutionCapable"`
+		CFBundleIconFile              string `plist:"CFBundleIconFile"`
 	}
 
 	plistData, err := encodePlist(infoPlist{
@@ -252,6 +269,7 @@ func writeMacOSAppBundle(bundlePath, executablePath, appName string) error {
 		CFBundleShortVersionString:    "0.0.0",
 		CFBundleVersion:               "0",
 		NSHighResolutionCapable:       true,
+		CFBundleIconFile:              iconFileName,
 	})
 	if err != nil {
 		return fmt.Errorf("encode Info.plist: %w", err)
@@ -343,7 +361,7 @@ func goBuild(opts buildOptions) (buildOutput, error) {
 
 	if opts.BuildApp && opts.Build.GOOS == "darwin" {
 		// Turn the output binary into a macOS .app bundle.
-		if err := writeMacOSAppBundle(macosBundlePath, output, opts.OutputName); err != nil {
+		if err := writeMacOSAppBundle(macosBundlePath, output, opts.OutputName, opts.LogoPath); err != nil {
 			return buildOutput{}, fmt.Errorf("failed to create macOS app bundle: %w", err)
 		}
 		return buildOutput{Path: macosBundlePath}, nil
@@ -1092,6 +1110,7 @@ func main() {
 		Build:            hostBuild,
 		EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
 		BuildApp:         true,
+		LogoPath:         filepath.Join("internal", "assets", "logo-color-black.png"),
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to build ccapp: %v\n", err)
