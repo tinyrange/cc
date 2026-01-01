@@ -36,6 +36,7 @@ const (
 	wmRButtonUp   = 0x0205
 	wmMButtonDown = 0x0207
 	wmMButtonUp   = 0x0208
+	wmMouseWheel  = 0x020A
 	wmXButtonDown = 0x020B
 	wmXButtonUp   = 0x020C
 	pmRemove      = 0x0001
@@ -955,6 +956,17 @@ func (w *winWindow) processMessage(m *msg) {
 			Button: button,
 			Mods:   getCurrentMods(),
 		})
+
+	case wmMouseWheel:
+		// High word of wParam is a signed delta (typically 120 per notch).
+		delta := int16((m.wParam >> 16) & 0xFFFF)
+		if delta != 0 {
+			w.inputEvents = append(w.inputEvents, InputEvent{
+				Type:    InputEventScroll,
+				ScrollY: float32(delta) / 120.0,
+				Mods:    getCurrentMods(),
+			})
+		}
 	}
 }
 

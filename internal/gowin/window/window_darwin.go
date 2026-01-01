@@ -123,6 +123,10 @@ var (
 	selEventFlags      objc.SEL
 	selEventButtonNum  objc.SEL
 	selEventCharacters objc.SEL
+	selEventDeltaY     objc.SEL
+	selEventDeltaX     objc.SEL
+	selEventScrollDY   objc.SEL
+	selEventScrollDX   objc.SEL
 	selUTF8String      objc.SEL
 
 	// NSScreen selectors (display scale).
@@ -140,6 +144,7 @@ const (
 	nsEventTypeKeyDown        = 10
 	nsEventTypeKeyUp          = 11
 	nsEventTypeFlagsChanged   = 12
+	nsEventTypeScrollWheel    = 22
 	nsEventTypeOtherMouseDown = 25
 	nsEventTypeOtherMouseUp   = 26
 )
@@ -468,6 +473,10 @@ func loadSelectors() {
 	selEventFlags = objc.RegisterName("modifierFlags")
 	selEventButtonNum = objc.RegisterName("buttonNumber")
 	selEventCharacters = objc.RegisterName("characters")
+	selEventDeltaY = objc.RegisterName("deltaY")
+	selEventDeltaX = objc.RegisterName("deltaX")
+	selEventScrollDY = objc.RegisterName("scrollingDeltaY")
+	selEventScrollDX = objc.RegisterName("scrollingDeltaX")
 	selUTF8String = objc.RegisterName("UTF8String")
 
 	// NSScreen (display scale).
@@ -696,6 +705,28 @@ func (c *Cocoa) processEvent(ev objc.ID) {
 				Type:   InputEventMouseUp,
 				Button: button,
 				Mods:   cocoaFlagsToMods(flags),
+			})
+		}
+
+	case nsEventTypeScrollWheel:
+		flags := objc.Send[uint64](ev, selEventFlags)
+		// Prefer "scrollingDeltaY/X" (trackpad + mouse), fall back to "deltaY/X".
+		dy := objc.Send[float64](ev, selEventScrollDY)
+		dx := objc.Send[float64](ev, selEventScrollDX)
+		if dy == 0 {
+			dy = objc.Send[float64](ev, selEventDeltaY)
+		}
+		if dx == 0 {
+			dx = objc.Send[float64](ev, selEventDeltaX)
+		}
+		if dy != 0 || dx != 0 {
+			// Convert to rough "wheel ticks". For precise devices, deltas can be small.
+			const tick = 10.0
+			c.inputEvents = append(c.inputEvents, InputEvent{
+				Type:    InputEventScroll,
+				ScrollX: float32(dx / tick),
+				ScrollY: float32(dy / tick),
+				Mods:    cocoaFlagsToMods(flags),
 			})
 		}
 	}
