@@ -65,6 +65,11 @@ type Cocoa struct {
 	pool    objc.ID
 	running bool
 
+	// Cached drawable metrics to detect resizes and keep the NSOpenGLContext
+	// backing store in sync with the view size.
+	lastBackingW int
+	lastBackingH int
+
 	// Input state tracking (frame-based).
 	keyStates    map[Key]KeyState
 	buttonStates map[Button]ButtonState
@@ -112,6 +117,7 @@ var (
 	selSetView                   objc.SEL
 	selMakeCurrentContext        objc.SEL
 	selClearCurrentContext       objc.SEL
+	selUpdate                    objc.SEL
 	selInitWithAttributes        objc.SEL
 	selInitWithFormat            objc.SEL
 	selSetValuesForParameter     objc.SEL
@@ -257,6 +263,10 @@ func (c *Cocoa) Poll() bool {
 	if !objc.Send[bool](c.window, selIsVisible) {
 		c.running = false
 	}
+
+	// Keep the OpenGL drawable sized correctly across resizes/maximize/fullscreen.
+	c.updateDrawableIfNeeded()
+
 	return c.running
 }
 
@@ -462,6 +472,7 @@ func loadSelectors() {
 	selSetView = objc.RegisterName("setView:")
 	selMakeCurrentContext = objc.RegisterName("makeCurrentContext")
 	selClearCurrentContext = objc.RegisterName("clearCurrentContext")
+	selUpdate = objc.RegisterName("update")
 	selInitWithAttributes = objc.RegisterName("initWithAttributes:")
 	selInitWithFormat = objc.RegisterName("initWithFormat:shareContext:")
 	selSetValuesForParameter = objc.RegisterName("setValues:forParameter:")
@@ -546,6 +557,28 @@ func (c *Cocoa) Scale() float32 {
 		return sx
 	}
 	return sy
+}
+
+func (c *Cocoa) updateDrawableIfNeeded() {
+	if c.ctx == 0 || c.view == 0 || selUpdate == 0 {
+		return
+	}
+
+	// Detect backing size changes and call -[NSOpenGLContext update] to ensure
+	// the drawable matches the view. Without this, macOS can keep the old
+	// backing store size after window zoom/maximize, causing incorrect scaling.
+	bw, bh := c.BackingSize()
+	if bw <= 0 || bh <= 0 {
+		return
+	}
+	if bw == c.lastBackingW && bh == c.lastBackingH {
+		return
+	}
+	c.lastBackingW, c.lastBackingH = bw, bh
+
+	// Ensure we're updating the correct context.
+	c.ctx.Send(selMakeCurrentContext)
+	c.ctx.Send(selUpdate)
 }
 
 func (c *Cocoa) GetKeyState(key Key) KeyState {

@@ -315,6 +315,11 @@ func (w *glWindow) Loop(step func(f Frame) error) error {
 }
 
 func (w *glWindow) prepareFrame() {
+	// Refresh scale every frame. Some platforms can change DPI/scale at runtime
+	// (e.g. moving between monitors), and macOS can report updated backing metrics
+	// after maximize/fullscreen transitions.
+	w.scale = w.platform.Scale()
+
 	bw, bh := w.platform.BackingSize()
 
 	w.gl.Viewport(0, 0, int32(bw), int32(bh))

@@ -106,44 +106,23 @@ func (app *Application) Run() error {
 		// Top bar.
 		topBarH := float32(32)
 		f.RenderQuad(0, 0, winW, topBarH, nil, color.RGBA{R: 22, G: 22, B: 22, A: 255})
-		app.text.RenderText("File", padding, 22, 16, graphics.ColorWhite)
-
-		// Title below top bar.
-		titleY := topBarH + 50
-		app.text.RenderText("CrumbleCracker", padding, titleY, 48, graphics.ColorWhite)
-		app.text.RenderText("Please select a environment to boot", padding, titleY+30, 20, graphics.ColorWhite)
 
 		// Back button (only in detail view).
-		backRect := rect{x: 80, y: 6, w: 70, h: topBarH - 12}
+		backRect := rect{x: 20, y: 6, w: 70, h: topBarH - 12}
 		if app.selectedIndex >= 0 {
-			f.RenderQuad(backRect.x, backRect.y, backRect.w, backRect.h, nil, color.RGBA{R: 40, G: 40, B: 40, A: 255})
-			app.text.RenderText("Back", backRect.x+14, 22, 14, graphics.ColorWhite)
+			backHover := backRect.contains(mx, my)
+			backColor := color.RGBA{R: 40, G: 40, B: 40, A: 255}
+			if backHover {
+				backColor = color.RGBA{R: 56, G: 56, B: 56, A: 255}
+			}
+			if backHover && leftDown {
+				backColor = color.RGBA{R: 72, G: 72, B: 72, A: 255}
+			}
+			f.RenderQuad(backRect.x, backRect.y, backRect.w, backRect.h, nil, backColor)
+			app.text.RenderText("Exit", backRect.x+14, 22, 14, graphics.ColorWhite)
 			if justPressed && backRect.contains(mx, my) {
 				app.selectedIndex = -1
 			}
-		}
-
-		// Logo in bottom-right corner, overlapping content area.
-		// Position it so it extends to the window edges.
-		if app.logo != nil {
-			// Logo diameter - proportional to window size.
-			logoSize := winH * 0.75
-			if logoSize > winW*0.75 {
-				logoSize = winW * 0.75
-			}
-			if logoSize < 280 {
-				logoSize = 280
-			}
-
-			// Position: bottom-right corner, partially extending beyond window edges.
-			logoX := winW - logoSize + logoSize*0.35
-			logoY := winH - logoSize + logoSize*0.35
-
-			t := float32(time.Since(app.start).Seconds())
-			// Slower in the center, faster at the edges: split by SVG groups.
-			app.logo.DrawGroupRotated(f, "inner-circle", logoX, logoY, logoSize, logoSize, t*0.4)
-			app.logo.DrawGroupRotated(f, "morse-circle", logoX, logoY, logoSize, logoSize, -t*0.9)
-			app.logo.DrawGroupRotated(f, "outer-circle", logoX, logoY, logoSize, logoSize, t*1.6)
 		}
 
 		// Center/left content - cards area.
@@ -166,6 +145,34 @@ func (app *Application) Run() error {
 			app.text.RenderText(name, cx-textW*0.5, cy, size, graphics.ColorWhite)
 			return nil
 		} else {
+			// Title below top bar.
+			titleY := topBarH + 50
+			app.text.RenderText("CrumbleCracker", padding, titleY, 48, graphics.ColorWhite)
+			app.text.RenderText("Please select a environment to boot", padding, titleY+30, 20, graphics.ColorWhite)
+
+			// Logo in bottom-right corner, overlapping content area.
+			// Position it so it extends to the window edges.
+			if app.logo != nil {
+				// Logo diameter - proportional to window size.
+				logoSize := winH * 0.75
+				if logoSize > winW*0.75 {
+					logoSize = winW * 0.75
+				}
+				if logoSize < 280 {
+					logoSize = 280
+				}
+
+				// Position: bottom-right corner, partially extending beyond window edges.
+				logoX := winW - logoSize + logoSize*0.35
+				logoY := winH - logoSize + logoSize*0.35
+
+				t := float32(time.Since(app.start).Seconds())
+				// Slower in the center, faster at the edges: split by SVG groups.
+				app.logo.DrawGroupRotated(f, "inner-circle", logoX, logoY, logoSize, logoSize, t*0.4)
+				app.logo.DrawGroupRotated(f, "morse-circle", logoX, logoY, logoSize, logoSize, -t*0.9)
+				app.logo.DrawGroupRotated(f, "outer-circle", logoX, logoY, logoSize, logoSize, t*1.6)
+			}
+
 			// List view - cards below title.
 			listX := padding
 			listY := titleY + 120
@@ -177,7 +184,7 @@ func (app *Application) Run() error {
 			viewport := rect{x: listX, y: listY, w: viewW, h: cardH + 80}
 
 			// draw a rectangle overlaying the viewport
-			f.RenderQuad(0, listY-20, winW, cardH+160, nil, color.RGBA{R: 255, G: 255, B: 255, A: 10})
+			f.RenderQuad(0, listY-20, winW, cardH+160, nil, color.RGBA{R: 10, G: 10, B: 10, A: 200})
 
 			contentWidth := float32(len(items))*(cardW+gap) - gap
 			maxScroll := float32(0)
@@ -242,16 +249,32 @@ func (app *Application) Run() error {
 					continue
 				}
 
-				// Card border (like the sketch).
+				hovered := viewport.contains(mx, my) && card.contains(mx, my)
+
+				// Card background + border (hover state).
+				bgColor := color.RGBA{R: 0, G: 0, B: 0, A: 0}
 				borderColor := color.RGBA{R: 80, G: 80, B: 80, A: 255}
+				if hovered {
+					bgColor = color.RGBA{R: 20, G: 20, B: 20, A: 220}
+					borderColor = color.RGBA{R: 140, G: 140, B: 140, A: 255}
+				}
+				if hovered && leftDown {
+					bgColor = color.RGBA{R: 30, G: 30, B: 30, A: 235}
+					borderColor = color.RGBA{R: 180, G: 180, B: 180, A: 255}
+				}
+				if bgColor.A != 0 {
+					f.RenderQuad(card.x, card.y, card.w, card.h, nil, bgColor)
+				}
+
+				// Border (like the sketch).
 				f.RenderQuad(card.x, card.y, card.w, 1, nil, borderColor)         // top
 				f.RenderQuad(card.x, card.y+cardH, card.w, 1, nil, borderColor)   // bottom of image area
 				f.RenderQuad(card.x, card.y, 1, cardH, nil, borderColor)          // left
 				f.RenderQuad(card.x+card.w-1, card.y, 1, cardH, nil, borderColor) // right
 
 				// Title + description below card.
-				app.text.RenderText(it.Name, card.x, card.y+cardH+24, 16, graphics.ColorWhite)
-				app.text.RenderText(it.Description, card.x, card.y+cardH+44, 12, graphics.ColorGray)
+				app.text.RenderText(it.Name, card.x, card.y+cardH+24, 18, graphics.ColorWhite)
+				app.text.RenderText(it.Description, card.x, card.y+cardH+44, 14, graphics.ColorWhite)
 
 				if justPressed && viewport.contains(mx, my) && card.contains(mx, my) {
 					app.selectedIndex = i
