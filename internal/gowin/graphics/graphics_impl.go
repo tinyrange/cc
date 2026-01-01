@@ -55,6 +55,9 @@ type glWindow struct {
 	vao           uint32
 	vbo           uint32
 	projUniform   int32
+
+	// Lazily-created 1x1 white texture for callers that pass nil.
+	whiteTex *glTexture
 }
 
 type glTexture struct {
@@ -335,9 +338,15 @@ func (f glFrame) TextInput() string {
 }
 
 func (f glFrame) RenderQuad(x, y, width, height float32, tex Texture, c color.Color) {
-	t, ok := tex.(*glTexture)
-	if !ok {
-		return
+	var t *glTexture
+	if tex == nil {
+		t = f.w.getWhiteTexture()
+	} else {
+		var ok bool
+		t, ok = tex.(*glTexture)
+		if !ok {
+			return
+		}
 	}
 
 	// Bind texture
@@ -371,4 +380,33 @@ func (f glFrame) RenderQuad(x, y, width, height float32, tex Texture, c color.Co
 
 func (t *glTexture) Size() (int, int) {
 	return t.w, t.h
+}
+
+func (w *glWindow) getWhiteTexture() *glTexture {
+	if w.whiteTex != nil {
+		return w.whiteTex
+	}
+
+	var texID uint32
+	w.gl.GenTextures(1, &texID)
+	w.gl.BindTexture(glpkg.Texture2D, texID)
+	w.gl.TexParameteri(glpkg.Texture2D, glpkg.TextureMinFilter, glpkg.Nearest)
+	w.gl.TexParameteri(glpkg.Texture2D, glpkg.TextureMagFilter, glpkg.Nearest)
+
+	// 1x1 RGBA pixel (white).
+	pix := [4]byte{0xff, 0xff, 0xff, 0xff}
+	w.gl.TexImage2D(
+		glpkg.Texture2D,
+		0,
+		int32(glpkg.RGBA),
+		1,
+		1,
+		0,
+		glpkg.RGBA,
+		glpkg.UnsignedByte,
+		unsafe.Pointer(&pix[0]),
+	)
+
+	w.whiteTex = &glTexture{id: texID, w: 1, h: 1}
+	return w.whiteTex
 }
