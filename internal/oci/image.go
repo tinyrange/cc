@@ -179,33 +179,7 @@ func (c *Client) PullForArch(imageRef string, arch hv.CpuArchitecture) (*Image, 
 }
 
 func (c *Client) loadCachedImage(dir string) (*Image, error) {
-	configPath := filepath.Join(dir, "config.json")
-	f, err := os.Open(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("open config: %w", err)
-	}
-	defer f.Close()
-
-	var cfg RuntimeConfig
-	if err := json.NewDecoder(f).Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("decode config: %w", err)
-	}
-
-	img := &Image{
-		Config: cfg,
-		Dir:    dir,
-	}
-
-	for _, layerHash := range cfg.Layers {
-		hash := strings.TrimPrefix(layerHash, "sha256:")
-		img.Layers = append(img.Layers, ImageLayer{
-			Hash:         layerHash,
-			IndexPath:    filepath.Join(dir, hash+".idx"),
-			ContentsPath: filepath.Join(dir, hash+".contents"),
-		})
-	}
-
-	return img, nil
+	return LoadFromDir(dir)
 }
 
 func toOciArchitecture(arch hv.CpuArchitecture) (string, error) {

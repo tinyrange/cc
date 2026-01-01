@@ -15,9 +15,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/tinyrange/cc/internal/bundle"
 	"github.com/tinyrange/cc/internal/debug"
 	"github.com/tinyrange/cc/internal/devices/virtio"
 	"github.com/tinyrange/cc/internal/gowin/window"
@@ -62,19 +64,85 @@ func (f *fixCrlf) Write(p []byte) (n int, err error) {
 	return f.w.Write(bytes.ReplaceAll(p, []byte{'\n'}, []byte{'\r', '\n'}))
 }
 
+type intFlag struct {
+	v   int
+	set bool
+}
+
+func (f *intFlag) String() string { return strconv.Itoa(f.v) }
+
+func (f *intFlag) Set(s string) error {
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return err
+	}
+	f.v = v
+	f.set = true
+	return nil
+}
+
+type uint64Flag struct {
+	v   uint64
+	set bool
+}
+
+func (f *uint64Flag) String() string { return strconv.FormatUint(f.v, 10) }
+
+func (f *uint64Flag) Set(s string) error {
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return err
+	}
+	f.v = v
+	f.set = true
+	return nil
+}
+
+type boolFlag struct {
+	v   bool
+	set bool
+}
+
+func (f *boolFlag) String() string {
+	if f.v {
+		return "true"
+	}
+	return "false"
+}
+
+func (f *boolFlag) Set(s string) error {
+	v, err := strconv.ParseBool(s)
+	if err != nil {
+		return err
+	}
+	f.v = v
+	f.set = true
+	return nil
+}
+
+func (f *boolFlag) IsBoolFlag() bool { return true }
+
 func run() error {
 	cacheDir := flag.String("cache-dir", "", "Cache directory (default: ~/.config/cc/)")
-	cpus := flag.Int("cpus", 1, "Number of vCPUs")
-	memory := flag.Uint64("memory", 1024, "Memory in MB")
+	buildOut := flag.String("build", "", "Build a prebaked bundle folder at this path, then exit")
+	var cpusFlag intFlag
+	cpusFlag.v = 1
+	flag.Var(&cpusFlag, "cpus", "Number of vCPUs")
+	var memoryFlag uint64Flag
+	memoryFlag.v = 1024
+	flag.Var(&memoryFlag, "memory", "Memory in MB")
 	dbg := flag.Bool("debug", false, "Enable debug logging")
 	debugFile := flag.String("debug-file", "", "Write debug stream to file")
 	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
 	memprofile := flag.String("memprofile", "", "Write memory profile to file")
-	dmesg := flag.Bool("dmesg", false, "Print kernel dmesg during boot and runtime")
-	network := flag.Bool("network", false, "Enable networking")
+	var dmesgFlag boolFlag
+	flag.Var(&dmesgFlag, "dmesg", "Print kernel dmesg during boot and runtime")
+	var networkFlag boolFlag
+	flag.Var(&networkFlag, "network", "Enable networking")
 	timeout := flag.Duration("timeout", 0, "Timeout for the container")
 	packetdump := flag.String("packetdump", "", "Write packet capture (pcap) to file (requires -network)")
-	exec := flag.Bool("exec", false, "Execute the entrypoint as PID 1 taking over init")
+	var execFlag boolFlag
+	flag.Var(&execFlag, "exec", "Execute the entrypoint as PID 1 taking over init")
 	gpu := flag.Bool("gpu", false, "Enable GPU and create a window")
 	termWin := flag.Bool("term", false, "Open a terminal window and connect it to the VM console")
 	flag.Usage = func() {
@@ -137,7 +205,7 @@ func run() error {
 		}()
 	}
 
-	if *packetdump != "" && !*network {
+	if *packetdump != "" && !networkFlag.v {
 		return fmt.Errorf("-packetdump requires -network")
 	}
 	if *termWin && *gpu {
@@ -171,20 +239,98 @@ func run() error {
 		return fmt.Errorf("create OCI client: %w", err)
 	}
 
-	slog.Debug("Pulling image", "ref", imageRef, "arch", hvArch)
-	debug.Writef("cc.run pull image", "pulling image %s for architecture %s", imageRef, hvArch)
+	if *buildOut != "" {
+		img, err := client.PullForArch(imageRef, hvArch)
+		if err != nil {
+			return fmt.Errorf("pull image: %w", err)
+		}
 
-	// Pull image
-	img, err := client.PullForArch(imageRef, hvArch)
-	if err != nil {
-		return fmt.Errorf("pull image: %w", err)
+		imageDir := filepath.Join(*buildOut, bundle.DefaultImageDir)
+		if err := oci.ExportToDir(img, imageDir); err != nil {
+			return fmt.Errorf("export prebaked image: %w", err)
+		}
+
+		meta := bundle.Metadata{
+			Version:     1,
+			Name:        "{{name}}",
+			Description: "{{description}}",
+			Boot: bundle.BootConfig{
+				ImageDir: bundle.DefaultImageDir,
+				Command:  img.Command(cmd),
+				CPUs:     cpusFlag.v,
+				MemoryMB: memoryFlag.v,
+				Network:  networkFlag.v,
+				Exec:     execFlag.v,
+				Dmesg:    dmesgFlag.v,
+			},
+		}
+		if err := bundle.WriteTemplate(*buildOut, meta); err != nil {
+			return fmt.Errorf("write bundle metadata: %w", err)
+		}
+
+		slog.Info("bundle built", "dir", *buildOut)
+		return nil
+	}
+
+	slog.Debug("Loading image", "ref", imageRef, "arch", hvArch)
+	debug.Writef("cc.run load image", "loading image %s for architecture %s", imageRef, hvArch)
+
+	var meta bundle.Metadata
+	var img *oci.Image
+
+	switch {
+	case bundle.IsBundleDir(imageRef):
+		m, loaded, err := bundle.Load(imageRef)
+		if err != nil {
+			return err
+		}
+		meta, img = m, loaded
+
+		// Apply bundle boot defaults iff the user did not override via flags.
+		if !cpusFlag.set && meta.Boot.CPUs != 0 {
+			cpusFlag.v = meta.Boot.CPUs
+		}
+		if !memoryFlag.set && meta.Boot.MemoryMB != 0 {
+			memoryFlag.v = meta.Boot.MemoryMB
+		}
+		if !networkFlag.set {
+			networkFlag.v = meta.Boot.Network
+		}
+		if !execFlag.set {
+			execFlag.v = meta.Boot.Exec
+		}
+		if !dmesgFlag.set {
+			dmesgFlag.v = meta.Boot.Dmesg
+		}
+	case func() bool {
+		_, err := os.Stat(filepath.Join(imageRef, "config.json"))
+		return err == nil
+	}():
+		loaded, err := oci.LoadFromDir(imageRef)
+		if err != nil {
+			return fmt.Errorf("load prebaked image: %w", err)
+		}
+		img = loaded
+	default:
+		loaded, err := client.PullForArch(imageRef, hvArch)
+		if err != nil {
+			return fmt.Errorf("pull image: %w", err)
+		}
+		img = loaded
 	}
 
 	slog.Debug("Image pulled", "layers", len(img.Layers))
 	debug.Writef("cc.run image pulled", "image pulled with %d layers", len(img.Layers))
 
 	// Determine command to run
-	execCmd := img.Command(cmd)
+	var execCmd []string
+	if len(cmd) > 0 {
+		execCmd = img.Command(cmd)
+	} else if meta.Version != 0 && len(meta.Boot.Command) > 0 {
+		execCmd = meta.Boot.Command
+	} else {
+		execCmd = img.Command(nil)
+	}
 	if len(execCmd) == 0 {
 		return fmt.Errorf("no command specified and image has no entrypoint/cmd")
 	}
@@ -240,7 +386,7 @@ func run() error {
 			Arch:    hvArch,
 		}),
 		initx.WithDebugLogging(*dbg),
-		initx.WithDmesgLogging(*dmesg),
+		initx.WithDmesgLogging(dmesgFlag.v),
 	}
 
 	var termWindow *termwin.Terminal
@@ -266,7 +412,7 @@ func run() error {
 	}
 
 	// Add network device if enabled
-	if *network {
+	if networkFlag.v {
 		backend := netstack.New(slog.Default())
 		var packetDumpFile *os.File
 		defer func() {
@@ -319,8 +465,8 @@ func run() error {
 
 	vm, err := initx.NewVirtualMachine(
 		h,
-		*cpus,
-		*memory,
+		cpusFlag.v,
+		memoryFlag.v,
 		kernelLoader,
 		opts...,
 	)
@@ -330,7 +476,7 @@ func run() error {
 	defer vm.Close()
 
 	// Build and run the container init program
-	prog := buildContainerInit(hvArch, img, execCmd, *network, *exec)
+	prog := buildContainerInit(hvArch, img, execCmd, networkFlag.v, execFlag.v)
 
 	slog.Debug("Booting VM")
 
