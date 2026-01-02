@@ -428,7 +428,7 @@ func (f glFrame) RenderQuad(x, y, width, height float32, tex Texture, c color.Co
 
 func (w *glWindow) NewMesh(vertices []Vertex, indices []uint32, tex Texture) (Mesh, error) {
 	if len(vertices) == 0 || len(indices) == 0 {
-		return &glMesh{}, nil
+		return nil, fmt.Errorf("empty mesh (vertices=%d indices=%d)", len(vertices), len(indices))
 	}
 
 	var t *glTexture

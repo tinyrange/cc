@@ -82,9 +82,9 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return fmt.Errorf("create %s: %w", dst, err)
 	}
-	defer func() { _ = out.Close() }()
 
 	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
 		return fmt.Errorf("copy %s -> %s: %w", src, dst, err)
 	}
 	if err := out.Close(); err != nil {
@@ -92,5 +92,3 @@ func copyFile(src, dst string) error {
 	}
 	return nil
 }
-
-

@@ -102,7 +102,6 @@ func WriteTemplate(dir string, meta Metadata) error {
 	enc := yaml.NewEncoder(f)
 	enc.SetIndent(2)
 	if err := enc.Encode(&meta); err != nil {
-		_ = enc.Close()
 		return fmt.Errorf("encode %s: %w", MetadataFilename, err)
 	}
 	if err := enc.Close(); err != nil {
@@ -110,5 +109,3 @@ func WriteTemplate(dir string, meta Metadata) error {
 	}
 	return nil
 }
-
-

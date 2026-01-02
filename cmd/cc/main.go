@@ -302,10 +302,7 @@ func run() error {
 		if !dmesgFlag.set {
 			dmesgFlag.v = meta.Boot.Dmesg
 		}
-	case func() bool {
-		_, err := os.Stat(filepath.Join(imageRef, "config.json"))
-		return err == nil
-	}():
+	case hasConfigJSON(imageRef):
 		loaded, err := oci.LoadFromDir(imageRef)
 		if err != nil {
 			return fmt.Errorf("load prebaked image: %w", err)
@@ -918,6 +915,11 @@ func extractInitialPath(env []string) string {
 		}
 	}
 	return defaultPathEnv
+}
+
+func hasConfigJSON(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, "config.json"))
+	return err == nil
 }
 
 func containerWorkDir(img *oci.Image) string {
