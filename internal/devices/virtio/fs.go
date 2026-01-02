@@ -54,10 +54,18 @@ const (
 )
 
 type FSTemplate struct {
-	Tag     string
-	Backend FsBackend
-	Arch    hv.CpuArchitecture
-	IRQLine uint32
+	Tag      string
+	Backend  FsBackend
+	Arch     hv.CpuArchitecture
+	MMIOBase uint64
+	IRQLine  uint32
+}
+
+func (t FSTemplate) mmioBaseOrDefault() uint64 {
+	if t.MMIOBase != 0 {
+		return t.MMIOBase
+	}
+	return FsDefaultMMIOBase
 }
 
 func (t FSTemplate) archOrDefault(vm hv.VirtualMachine) hv.CpuArchitecture {
@@ -85,7 +93,7 @@ func (t FSTemplate) GetLinuxCommandLineParam() ([]string, error) {
 	irqLine := t.irqLineForArch(t.Arch)
 	param := fmt.Sprintf(
 		"virtio_mmio.device=4k@0x%x:%d",
-		FsDefaultMMIOBase,
+		t.mmioBaseOrDefault(),
 		irqLine,
 	)
 	return []string{param}, nil
@@ -95,10 +103,10 @@ func (t FSTemplate) GetLinuxCommandLineParam() ([]string, error) {
 func (t FSTemplate) DeviceTreeNodes() ([]fdt.Node, error) {
 	irqLine := t.irqLineForArch(t.Arch)
 	node := fdt.Node{
-		Name: fmt.Sprintf("virtio@%x", FsDefaultMMIOBase),
+		Name: fmt.Sprintf("virtio@%x", t.mmioBaseOrDefault()),
 		Properties: map[string]fdt.Property{
 			"compatible": {Strings: []string{"virtio,mmio"}},
-			"reg":        {U64: []uint64{FsDefaultMMIOBase, FsDefaultMMIOSize}},
+			"reg":        {U64: []uint64{t.mmioBaseOrDefault(), FsDefaultMMIOSize}},
 			"interrupts": {U32: []uint32{0, irqLine, 4}},
 			"status":     {Strings: []string{"okay"}},
 		},
@@ -110,7 +118,7 @@ func (t FSTemplate) DeviceTreeNodes() ([]fdt.Node, error) {
 func (t FSTemplate) GetACPIDeviceInfo() ACPIDeviceInfo {
 	irqLine := t.irqLineForArch(t.archOrDefault(nil))
 	return ACPIDeviceInfo{
-		BaseAddr: FsDefaultMMIOBase,
+		BaseAddr: t.mmioBaseOrDefault(),
 		Size:     FsDefaultMMIOSize,
 		GSI:      irqLine,
 	}
@@ -119,7 +127,7 @@ func (t FSTemplate) GetACPIDeviceInfo() ACPIDeviceInfo {
 func (t FSTemplate) Create(vm hv.VirtualMachine) (hv.Device, error) {
 	arch := t.archOrDefault(vm)
 	irqLine := t.irqLineForArch(arch)
-	fs := NewFS(vm, FsDefaultMMIOBase, FsDefaultMMIOSize, EncodeIRQLineForArch(arch, irqLine), t.Tag, t.Backend)
+	fs := NewFS(vm, t.mmioBaseOrDefault(), FsDefaultMMIOSize, EncodeIRQLineForArch(arch, irqLine), t.Tag, t.Backend)
 	if err := fs.Init(vm); err != nil {
 		return nil, fmt.Errorf("virtio-fs: initialize device: %w", err)
 	}
