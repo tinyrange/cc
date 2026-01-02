@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"image/color"
 	"io"
+	"log"
 	"log/slog"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"time"
@@ -57,6 +59,10 @@ type Application struct {
 	logo   *graphics.SVG
 
 	start time.Time
+
+	// Logging
+	logDir  string
+	logFile string
 
 	// UI state
 	scrollX       float32
@@ -127,6 +133,71 @@ func discoverBundles(bundlesDir string) ([]discoveredBundle, error) {
 	return result, nil
 }
 
+func setupLogging() (logDir string, logFile string, closeFn func() error) {
+	closeFn = func() error { return nil }
+
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		// Fallback: keep default stderr logging.
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo, AddSource: true})))
+		slog.Warn("failed to determine user cache dir; logging to stderr only", "error", err)
+		return "", "", closeFn
+	}
+
+	logDir = filepath.Join(cacheDir, "ccapp")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo, AddSource: true})))
+		slog.Warn("failed to create log dir; logging to stderr only", "dir", logDir, "error", err)
+		return "", "", closeFn
+	}
+
+	ts := time.Now().Format("20060102-150405")
+	logFile = filepath.Join(logDir, fmt.Sprintf("ccapp-%s.log", ts))
+
+	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo, AddSource: true})))
+		slog.Warn("failed to open log file; logging to stderr only", "file", logFile, "error", err)
+		return logDir, "", closeFn
+	}
+	closeFn = f.Close
+
+	// Best-effort: redirect process stdout/stderr to the log file so non-slog output
+	// (including native libs) lands in the same place.
+	dupOK := redirectStdoutStderrToFile(f)
+
+	var w io.Writer = f
+	if dupOK {
+		// stderr now points at the log, keep slog output consistent.
+		w = os.Stderr
+	} else {
+		// If redirection failed, at least tee the slog + standard log package.
+		w = io.MultiWriter(os.Stderr, f)
+	}
+	log.SetOutput(w)
+	slog.SetDefault(slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{
+		Level:     slog.LevelDebug,
+		AddSource: true,
+	})))
+	slog.Info("ccapp logging initialized", "log_dir", logDir, "log_file", logFile, "stdout_stderr_redirected", dupOK)
+
+	return logDir, logFile, closeFn
+}
+
+func openDirectory(path string) error {
+	if path == "" {
+		return fmt.Errorf("empty path")
+	}
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.Command("open", path).Start()
+	case "windows":
+		return exec.Command("explorer.exe", path).Start()
+	default:
+		return exec.Command("xdg-open", path).Start()
+	}
+}
+
 // getBundlesDir returns the path to the bundles directory next to the app.
 func getBundlesDir() string {
 	exe, err := os.Executable()
@@ -163,16 +234,19 @@ func getBundlesDir() string {
 func (app *Application) Run() error {
 	var err error
 
+	slog.Info("creating window")
 	app.window, err = graphics.New("CrumbleCracker", 1024, 768)
 	if err != nil {
 		return fmt.Errorf("failed to create window: %w", err)
 	}
 
+	slog.Info("loading text renderer")
 	app.text, err = text.Load(app.window)
 	if err != nil {
 		return fmt.Errorf("failed to create text renderer: %w", err)
 	}
 
+	slog.Info("loading logo")
 	app.logo, err = graphics.LoadSVG(app.window, assets.LogoWhite)
 	if err != nil {
 		return fmt.Errorf("failed to load logo svg: %w", err)
@@ -192,6 +266,7 @@ func (app *Application) Run() error {
 	if err != nil {
 		slog.Warn("failed to discover bundles", "error", err)
 	}
+	slog.Info("bundle discovery complete", "bundles_dir", bundlesDir, "bundle_count", len(app.bundles))
 
 	return app.window.Loop(func(f graphics.Frame) error {
 		switch app.mode {
@@ -232,6 +307,25 @@ func (app *Application) renderLauncher(f graphics.Frame) error {
 	// Top bar.
 	topBarH := float32(32)
 	f.RenderQuad(0, 0, winW, topBarH, nil, color.RGBA{R: 22, G: 22, B: 22, A: 255})
+
+	// Logs button (top-right).
+	logRect := rect{x: winW - 150, y: 6, w: 120, h: topBarH - 12}
+	logHover := logRect.contains(mx, my)
+	logColor := color.RGBA{R: 40, G: 40, B: 40, A: 255}
+	if logHover {
+		logColor = color.RGBA{R: 56, G: 56, B: 56, A: 255}
+	}
+	if logHover && leftDown {
+		logColor = color.RGBA{R: 72, G: 72, B: 72, A: 255}
+	}
+	f.RenderQuad(logRect.x, logRect.y, logRect.w, logRect.h, nil, logColor)
+	app.text.RenderText("Debug Logs", logRect.x+26, 20, 14, graphics.ColorWhite)
+	if justPressed && logHover {
+		slog.Info("open logs requested", "log_dir", app.logDir)
+		if err := openDirectory(app.logDir); err != nil {
+			slog.Error("failed to open logs directory", "log_dir", app.logDir, "error", err)
+		}
+	}
 
 	// Title below top bar.
 	titleY := topBarH + 50
@@ -420,8 +514,28 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 	app.text.RenderText("Exit", backRect.x+14, 22, 14, graphics.ColorWhite)
 
 	if justPressed && backRect.contains(mx, my) {
+		slog.Info("exit requested; stopping VM")
 		app.stopVM()
 		return nil
+	}
+
+	// Logs button (top-right).
+	logRect := rect{x: winW - 150, y: 6, w: 120, h: topBarH - 12}
+	logHover := logRect.contains(mx, my)
+	logColor := color.RGBA{R: 40, G: 40, B: 40, A: 255}
+	if logHover {
+		logColor = color.RGBA{R: 56, G: 56, B: 56, A: 255}
+	}
+	if logHover && leftDown {
+		logColor = color.RGBA{R: 72, G: 72, B: 72, A: 255}
+	}
+	f.RenderQuad(logRect.x, logRect.y, logRect.w, logRect.h, nil, logColor)
+	app.text.RenderText("Debug Logs", logRect.x+26, 22, 14, graphics.ColorWhite)
+	if justPressed && logHover {
+		slog.Info("open logs requested", "log_dir", app.logDir)
+		if err := openDirectory(app.logDir); err != nil {
+			slog.Error("failed to open logs directory", "log_dir", app.logDir, "error", err)
+		}
 	}
 
 	// Check if VM has exited.
@@ -430,6 +544,7 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 		if err != nil && err != io.EOF {
 			slog.Error("VM exited with error", "error", err)
 		}
+		slog.Info("VM session ended; cleaning up")
 		app.stopVM()
 		return nil
 	default:
@@ -451,18 +566,21 @@ func (app *Application) bootBundle(index int) error {
 	}
 
 	b := app.bundles[index]
+	slog.Info("boot bundle requested", "index", index, "bundle_dir", b.Dir, "bundle_name", b.Meta.Name)
 
 	// Determine architecture
 	hvArch, err := parseArchitecture(runtime.GOARCH)
 	if err != nil {
 		return err
 	}
+	slog.Info("determined architecture", "goarch", runtime.GOARCH, "arch", hvArch)
 
 	// Load image from bundle
 	imageDir := filepath.Join(b.Dir, b.Meta.Boot.ImageDir)
 	if b.Meta.Boot.ImageDir == "" {
 		imageDir = filepath.Join(b.Dir, "image")
 	}
+	slog.Info("loading image from bundle", "image_dir", imageDir)
 
 	img, err := oci.LoadFromDir(imageDir)
 	if err != nil {
@@ -475,6 +593,7 @@ func (app *Application) bootBundle(index int) error {
 	if len(execCmd) == 0 {
 		return fmt.Errorf("no command specified and image has no entrypoint/cmd")
 	}
+	slog.Info("resolved container command", "cmd", execCmd)
 
 	// Create container filesystem
 	containerFS, err := oci.NewContainerFS(img)
@@ -490,6 +609,7 @@ func (app *Application) bootBundle(index int) error {
 		containerFS.Close()
 		return fmt.Errorf("resolve command: %w", err)
 	}
+	slog.Info("resolved command path", "exec", execCmd, "work_dir", workDir)
 
 	// Create VirtioFS backend
 	fsBackend := vfs.NewVirtioFsBackendWithAbstract()
@@ -512,6 +632,7 @@ func (app *Application) bootBundle(index int) error {
 		containerFS.Close()
 		return fmt.Errorf("load kernel: %w", err)
 	}
+	slog.Info("kernel loader ready")
 
 	// Create terminal view
 	termView, err := termwin.NewView(app.window)
@@ -530,6 +651,7 @@ func (app *Application) bootBundle(index int) error {
 	if memoryMB == 0 {
 		memoryMB = 1024
 	}
+	slog.Info("vm config", "cpus", cpus, "memory_mb", memoryMB, "network", b.Meta.Boot.Network, "dmesg", b.Meta.Boot.Dmesg, "exec", b.Meta.Boot.Exec)
 
 	opts := []initx.Option{
 		initx.WithDeviceTemplate(virtio.FSTemplate{
@@ -544,6 +666,7 @@ func (app *Application) bootBundle(index int) error {
 
 	var netBackend *netstack.NetStack
 	if b.Meta.Boot.Network {
+		slog.Info("network enabled; starting netstack DNS server")
 		netBackend = netstack.New(slog.Default())
 		if err := netBackend.StartDNSServer(); err != nil {
 			termView.Close()
@@ -601,6 +724,7 @@ func (app *Application) bootBundle(index int) error {
 	}
 
 	session := initx.StartSession(context.Background(), vm, prog, initx.SessionConfig{})
+	slog.Info("VM session started")
 
 	app.running = &runningVM{
 		vm:          vm,
@@ -620,9 +744,12 @@ func (app *Application) stopVM() {
 		return
 	}
 
+	slog.Info("stopping VM")
 	// Wait briefly for VM to exit
 	if app.running.session != nil {
-		_ = app.running.session.Stop(2 * time.Second)
+		if err := app.running.session.Stop(2 * time.Second); err != nil {
+			slog.Warn("session stop returned error", "error", err)
+		}
 	}
 
 	if app.running.termView != nil {
@@ -641,6 +768,7 @@ func (app *Application) stopVM() {
 	app.running = nil
 	app.mode = modeLauncher
 	app.selectedIndex = -1
+	slog.Info("VM stopped; returned to launcher")
 }
 
 func parseArchitecture(arch string) (hv.CpuArchitecture, error) {
@@ -753,9 +881,32 @@ func main() {
 		runtime.LockOSThread()
 	}
 
+	logDir, logFile, closeLog := setupLogging()
+	defer func() {
+		if err := closeLog(); err != nil {
+			// Best-effort; at this point logging may already be torn down.
+			fmt.Fprintf(os.Stderr, "ccapp: failed to close log file: %v\n", err)
+		}
+	}()
+
+	exe, _ := os.Executable()
+	wd, _ := os.Getwd()
+	slog.Info("ccapp starting",
+		"exe", exe,
+		"cwd", wd,
+		"goos", runtime.GOOS,
+		"goarch", runtime.GOARCH,
+		"pid", os.Getpid(),
+		"log_dir", logDir,
+		"log_file", logFile,
+	)
+
 	app := Application{}
+	app.logDir = logDir
+	app.logFile = logFile
 
 	if err := app.Run(); err != nil {
+		slog.Error("ccapp exited with error", "error", err)
 		fmt.Fprintf(os.Stderr, "ccapp: %v\n", err)
 		os.Exit(1)
 	}
