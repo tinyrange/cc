@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/tinyrange/cc/internal/assets"
@@ -36,6 +37,7 @@ type appMode int
 const (
 	modeLauncher appMode = iota
 	modeLoading
+	modeError
 	modeTerminal
 )
 
@@ -106,6 +108,9 @@ type Application struct {
 	bootCh      chan bootResult
 	bootStarted time.Time
 	bootName    string
+
+	// Error state (full-screen)
+	errMsg string
 
 	// Discovered bundles
 	bundlesDir string
@@ -311,12 +316,22 @@ func (app *Application) Run() error {
 			return app.renderLauncher(f)
 		case modeLoading:
 			return app.renderLoading(f)
+		case modeError:
+			return app.renderError(f)
 		case modeTerminal:
 			return app.renderTerminal(f)
 		default:
 			return nil
 		}
 	})
+}
+
+func (app *Application) showError(err error) {
+	if err == nil {
+		err = fmt.Errorf("unknown error")
+	}
+	app.errMsg = err.Error()
+	app.mode = modeError
 }
 
 func (app *Application) renderLauncher(f graphics.Frame) error {
@@ -530,13 +545,13 @@ func (app *Application) renderLoading(f graphics.Frame) error {
 			if res.err != nil {
 				slog.Error("failed to prepare VM boot", "error", res.err)
 				app.selectedIndex = -1
-				app.mode = modeLauncher
+				app.showError(res.err)
 				return nil
 			}
 			if err := app.finalizeBoot(res.prep); err != nil {
 				slog.Error("failed to finalize VM boot", "error", err)
 				app.selectedIndex = -1
-				app.mode = modeLauncher
+				app.showError(err)
 				return nil
 			}
 			app.mode = modeTerminal
@@ -578,6 +593,98 @@ func (app *Application) renderLoading(f graphics.Frame) error {
 		msg = "Booting " + app.bootName + "…"
 	}
 	app.text.RenderText(msg, 20, 40, 20, graphics.ColorWhite)
+
+	return nil
+}
+
+func (app *Application) renderError(f graphics.Frame) error {
+	w, h := f.WindowSize()
+	app.text.SetViewport(int32(w), int32(h))
+
+	// Pull raw input events (wheel deltas live here).
+	app.window.PlatformWindow().DrainInputEvents()
+
+	mx, my := f.CursorPos()
+	leftDown := f.GetButtonState(window.ButtonLeft).IsDown()
+	justPressed := leftDown && !app.prevLeftDown
+	app.prevLeftDown = leftDown
+
+	winW := float32(w)
+	winH := float32(h)
+
+	// Dark background.
+	f.RenderQuad(0, 0, winW, winH, nil, color.RGBA{R: 10, G: 10, B: 10, A: 255})
+
+	// Header.
+	app.text.RenderText("Error", 30, 70, 56, graphics.ColorWhite)
+
+	// Error message (simple multi-line).
+	msg := app.errMsg
+	if msg == "" {
+		msg = "unknown error"
+	}
+	lines := strings.Split(msg, "\n")
+	y := float32(120)
+	for i := 0; i < len(lines) && i < 12; i++ {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		app.text.RenderText(line, 30, y, 18, graphics.ColorWhite)
+		y += 22
+	}
+
+	// Centered rotating logo as subtle backdrop.
+	if app.logo != nil {
+		logoSize := winH * 0.35
+		if logoSize > winW*0.35 {
+			logoSize = winW * 0.35
+		}
+		if logoSize < 200 {
+			logoSize = 200
+		}
+		logoX := (winW - logoSize) * 0.5
+		logoY := (winH - logoSize) * 0.5
+		t := float32(time.Since(app.start).Seconds())
+		app.logo.DrawGroupRotated(f, "outer-circle", logoX, logoY, logoSize, logoSize, t*0.4)
+	}
+
+	// Buttons under the message area.
+	btnW := float32(320)
+	btnH := float32(44)
+	btnX := (winW - btnW) * 0.5
+	btnY := clamp(y+40, 220, winH-160)
+
+	backRect := rect{x: btnX, y: btnY, w: btnW, h: btnH}
+	logRect := rect{x: btnX, y: btnY + btnH + 14, w: btnW, h: btnH}
+
+	drawBtn := func(r rect, label string) bool {
+		hover := r.contains(mx, my)
+		c := color.RGBA{R: 40, G: 40, B: 40, A: 255}
+		if hover {
+			c = color.RGBA{R: 56, G: 56, B: 56, A: 255}
+		}
+		if hover && leftDown {
+			c = color.RGBA{R: 72, G: 72, B: 72, A: 255}
+		}
+		f.RenderQuad(r.x, r.y, r.w, r.h, nil, c)
+		// crude centering
+		app.text.RenderText(label, r.x+22, r.y+28, 16, graphics.ColorWhite)
+		return hover && justPressed
+	}
+
+	if drawBtn(backRect, "Back to carousel") {
+		app.errMsg = ""
+		app.selectedIndex = -1
+		app.mode = modeLauncher
+		return nil
+	}
+	if drawBtn(logRect, "Open logs directory") {
+		slog.Info("open logs requested (error screen)", "log_dir", app.logDir)
+		if err := openDirectory(app.logDir); err != nil {
+			slog.Error("failed to open logs directory", "log_dir", app.logDir, "error", err)
+		}
+	}
 
 	return nil
 }
@@ -678,7 +785,7 @@ func (app *Application) startBootBundle(index int) {
 	if err != nil {
 		slog.Error("failed to determine architecture", "goarch", runtime.GOARCH, "error", err)
 		app.selectedIndex = -1
-		app.mode = modeLauncher
+		app.showError(err)
 		return
 	}
 
