@@ -52,7 +52,11 @@ func ipToUint32(addr string) uint32 {
 	if ip == nil {
 		return 0
 	}
-	return binary.BigEndian.Uint32(ip.To4())
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return 0
+	}
+	return binary.BigEndian.Uint32(ip4)
 }
 
 // BuildContainerInitProgram builds an init program that mounts the virtiofs root,
