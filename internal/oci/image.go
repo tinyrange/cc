@@ -427,10 +427,17 @@ func makeLayerFromTar(hash string, r io.Reader, compression string, outputDir st
 
 		deleted := false
 
-		// Handle OCI whiteout files
+		// Handle OCI/overlayfs whiteout files.
+		//
+		// - ".wh.<name>" means <name> is deleted in this layer.
+		// - ".wh..wh..opq" marks the containing directory as "opaque" (i.e. do not
+		//   inherit lower-layer children). This does NOT delete the directory itself.
+		//
+		// We preserve the ".wh..wh..opq" marker as a metadata entry so the layered
+		// filesystem view can apply opaque semantics during directory traversal.
 		if path.Base(hdr.Name) == ".wh..wh..opq" {
-			deleted = true
-			hdr.Name = path.Dir(hdr.Name)
+			// Keep hdr.Name as-is; treat as metadata (no contents).
+			deleted = false
 		} else if strings.HasPrefix(path.Base(hdr.Name), ".wh.") {
 			deleted = true
 			hdr.Name = path.Join(path.Dir(hdr.Name), path.Base(hdr.Name)[4:])
@@ -461,6 +468,10 @@ func makeLayerFromTar(hash string, r io.Reader, compression string, outputDir st
 
 		if deleted {
 			typeFlag = archive.EntryKindDeleted
+		} else if path.Base(hdr.Name) == ".wh..wh..opq" {
+			// Record opaque directory marker as metadata.
+			typeFlag = archive.EntryKindExtended
+			hdr.Size = 0
 		}
 
 		var fact archive.EntryFactory

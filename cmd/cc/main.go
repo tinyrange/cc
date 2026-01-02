@@ -345,6 +345,15 @@ func run() error {
 		return fmt.Errorf("resolve command: %w", err)
 	}
 
+	// If we're executing the entrypoint as PID 1, prefer exec'ing the resolved
+	// target rather than a symlink path. This matters for binaries that rely on
+	// $ORIGIN-based RUNPATH (e.g. Debian's systemd via /sbin/init symlink).
+	if execFlag.v && strings.HasPrefix(execCmd[0], "/") {
+		if resolved, err := containerFS.ResolvePath(execCmd[0]); err == nil {
+			execCmd[0] = resolved
+		}
+	}
+
 	slog.Debug("Running command", "cmd", execCmd)
 	debug.Writef("cc.run running command", "running command %v", execCmd)
 

@@ -20,6 +20,25 @@ type ContainerFS struct {
 	layers []*layerReader
 }
 
+// ResolvePath resolves a path within the container filesystem, following symlinks
+// (including in intermediate components). The returned path is absolute (starts with "/").
+//
+// This is useful for exec'ing symlink entrypoints as their real targets so the dynamic
+// loader sees the correct executable location (e.g. for $ORIGIN-based RUNPATH).
+func (cfs *ContainerFS) ResolvePath(p string) (string, error) {
+	resolved, _, _, isImplicitDir, err := cfs.resolvePath(p, 40)
+	if err != nil {
+		return "", err
+	}
+	if isImplicitDir {
+		return "", fmt.Errorf("path resolves to directory: %s", p)
+	}
+	if resolved == "." {
+		return "/", nil
+	}
+	return "/" + resolved, nil
+}
+
 type layerReader struct {
 	entries  map[string]archive.Entry
 	contents *os.File
@@ -100,6 +119,158 @@ func normalizePath(filePath string) string {
 	return filePath
 }
 
+func isOpaqueMarker(p string) bool {
+	return path.Base(p) == ".wh..wh..opq"
+}
+
+func opaqueMarkerPath(dirPath string) string {
+	dirPath = normalizePath(dirPath)
+	if dirPath == "" {
+		return ".wh..wh..opq"
+	}
+	return dirPath + "/.wh..wh..opq"
+}
+
+func (cfs *ContainerFS) layerHasOpaqueDir(lr *layerReader, dirPath string) bool {
+	marker := opaqueMarkerPath(dirPath)
+	ent, ok := lr.entries[marker]
+	if !ok {
+		return false
+	}
+	// If the marker itself was deleted, treat it as absent.
+	return ent.Kind != archive.EntryKindDeleted
+}
+
+// findPath returns an entry if there is an exact match, otherwise it may return
+// a synthetic directory if any layer contains entries with the given path as a
+// prefix (e.g. "etc" exists because "etc/passwd" exists).
+//
+// The returned *layerReader is only valid when implicitDir == false.
+func (cfs *ContainerFS) findPath(filePath string) (ent archive.Entry, lr *layerReader, implicitDir bool, err error) {
+	filePath = normalizePath(filePath)
+	if filePath == "" {
+		filePath = "."
+	}
+
+	for i := len(cfs.layers) - 1; i >= 0; i-- {
+		layer := cfs.layers[i]
+
+		// Exact match first.
+		if e, ok := layer.entries[filePath]; ok {
+			if e.Kind == archive.EntryKindDeleted {
+				return archive.Entry{}, nil, false, fmt.Errorf("file not found: %s", filePath)
+			}
+			return e, layer, false, nil
+		}
+
+		// Synthetic directory (implicit) if any entry has this as a prefix.
+		prefix := filePath + "/"
+		for name, e := range layer.entries {
+			if e.Kind == archive.EntryKindDeleted {
+				continue
+			}
+			if strings.HasPrefix(name, prefix) {
+				return archive.Entry{}, nil, true, nil
+			}
+		}
+	}
+
+	return archive.Entry{}, nil, false, fmt.Errorf("file not found: %s", filePath)
+}
+
+// resolvePath resolves a possibly-symlinked path by walking it component-by-component,
+// following symlinks and hardlinks along the way (including when symlinks appear in
+// intermediate components like /lib on merged-/usr systems).
+//
+// It returns the resolved path (normalized, no leading "/") and the final entry.
+// If the final target is an implicit directory (no explicit archive entry), implicitDir is true.
+func (cfs *ContainerFS) resolvePath(filePath string, maxLinks int) (resolved string, ent archive.Entry, lr *layerReader, implicitDir bool, err error) {
+	filePath = normalizePath(filePath)
+	if filePath == "" {
+		// Root
+		return ".", archive.Entry{}, nil, true, nil
+	}
+
+	linksFollowed := 0
+	p := path.Clean(filePath)
+
+	for {
+		parts := strings.Split(p, "/")
+		cur := ""
+		lastImplicitDir := false
+
+		for i := 0; i < len(parts); i++ {
+			comp := parts[i]
+			if comp == "" || comp == "." {
+				continue
+			}
+
+			cand := comp
+			if cur != "" {
+				cand = cur + "/" + comp
+			}
+
+			e, layer, isImplicitDir, findErr := cfs.findPath(cand)
+			if findErr != nil {
+				return "", archive.Entry{}, nil, false, findErr
+			}
+
+			// Directory synthesized from child entries; continue walking.
+			if isImplicitDir {
+				cur = cand
+				ent = archive.Entry{}
+				lr = nil
+				lastImplicitDir = true
+				continue
+			}
+
+			// Follow links if present. This is critical for cases like:
+			//   /sbin/init -> /lib/systemd/systemd
+			// where /lib itself is a symlink (merged-/usr), meaning the literal
+			// path "lib/systemd/systemd" may not exist in the layer index.
+			if e.Kind == archive.EntryKindSymlink || e.Kind == archive.EntryKindHardlink {
+				if linksFollowed >= maxLinks {
+					return "", archive.Entry{}, nil, false, fmt.Errorf("too many symlink/hardlink traversals resolving %q", filePath)
+				}
+				linksFollowed++
+
+				target := e.Linkname
+				if !path.IsAbs(target) {
+					target = path.Join(path.Dir(cand), target)
+				}
+				target = normalizePath(target)
+
+				rest := strings.Join(parts[i+1:], "/")
+				if rest != "" {
+					p = path.Join(target, rest)
+				} else {
+					p = target
+				}
+
+				// Restart the walk with the new path.
+				goto restart
+			}
+
+			// Regular file/dir; continue walking.
+			cur = cand
+			ent = e
+			lr = layer
+			implicitDir = false
+			lastImplicitDir = false
+		}
+
+		// If we ended on a synthesized directory, return it.
+		if lastImplicitDir {
+			return cur, archive.Entry{}, nil, true, nil
+		}
+
+		return cur, ent, lr, false, nil
+
+	restart:
+		continue
+	}
+}
+
 func (cfs *ContainerFS) entryForPath(filePath string) (archive.Entry, bool) {
 	normalized := normalizePath(filePath)
 	if normalized == "" {
@@ -151,7 +322,13 @@ func (cfs *ContainerFS) readDirPath(dirPath string) ([]vfs.AbstractDirEntry, err
 	// Iterate layers from top to bottom (later layers override earlier)
 	for i := len(cfs.layers) - 1; i >= 0; i-- {
 		lr := cfs.layers[i]
+		opaqueHere := cfs.layerHasOpaqueDir(lr, dirPath)
 		for name, ent := range lr.entries {
+			// Do not expose overlayfs whiteout markers themselves.
+			if isOpaqueMarker(name) {
+				continue
+			}
+
 			// Check if this entry is in the target directory
 			var entryName string
 			if dirPath == "" {
@@ -207,6 +384,10 @@ func (cfs *ContainerFS) readDirPath(dirPath string) ([]vfs.AbstractDirEntry, err
 				Size:  uint64(ent.Size),
 			})
 		}
+		// Opaque directory: do not inherit entries from lower layers.
+		if opaqueHere {
+			break
+		}
 	}
 
 	return result, nil
@@ -219,15 +400,27 @@ func (cfs *ContainerFS) Lookup(name string) (vfs.AbstractEntry, error) {
 
 func (cfs *ContainerFS) lookupPath(filePath string) (vfs.AbstractEntry, error) {
 	filePath = normalizePath(filePath)
+	if isOpaqueMarker(filePath) {
+		return vfs.AbstractEntry{}, fmt.Errorf("file not found: %s", filePath)
+	}
+	parentDir := path.Dir(filePath)
+	if parentDir == "." {
+		parentDir = ""
+	}
 
 	// Search layers from top to bottom
 	for i := len(cfs.layers) - 1; i >= 0; i-- {
 		lr := cfs.layers[i]
+		opaqueParentHere := parentDir != "" && cfs.layerHasOpaqueDir(lr, parentDir)
 
 		// Check for exact match
 		if ent, ok := lr.entries[filePath]; ok {
 			if ent.Kind == archive.EntryKindDeleted {
 				// Deleted by this layer
+				return vfs.AbstractEntry{}, fmt.Errorf("file not found: %s", filePath)
+			}
+			// Never surface the marker file itself as a real entry.
+			if isOpaqueMarker(ent.Name) {
 				return vfs.AbstractEntry{}, fmt.Errorf("file not found: %s", filePath)
 			}
 			return cfs.entryToAbstract(filePath, ent, lr)
@@ -245,6 +438,12 @@ func (cfs *ContainerFS) lookupPath(filePath string) (vfs.AbstractEntry, error) {
 					},
 				}, nil
 			}
+		}
+
+		// If the parent directory is opaque in this layer, we must not consult lower layers
+		// for children under it (including this filePath).
+		if opaqueParentHere {
+			break
 		}
 	}
 
@@ -271,12 +470,22 @@ func (cfs *ContainerFS) entryToAbstract(filePath string, ent archive.Entry, lr *
 			},
 		}, nil
 	case archive.EntryKindSymlink, archive.EntryKindHardlink:
-		// For symlinks and hardlinks, resolve to the target
-		target := ent.Linkname
-		if !path.IsAbs(target) {
-			target = path.Join(path.Dir(filePath), target)
+		// For symlinks and hardlinks, resolve to the final target by walking the
+		// target path component-by-component and following intermediate symlinks.
+		// This matters on merged-/usr images where /lib (etc) are symlinks.
+		resolvedPath, resolvedEnt, resolvedLayer, isImplicitDir, err := cfs.resolvePath(filePath, 40)
+		if err != nil {
+			return vfs.AbstractEntry{}, err
 		}
-		return cfs.lookupPath(target)
+		if isImplicitDir {
+			return vfs.AbstractEntry{
+				Dir: &containerDir{
+					cfs:  cfs,
+					path: resolvedPath,
+				},
+			}, nil
+		}
+		return cfs.entryToAbstract(resolvedPath, resolvedEnt, resolvedLayer)
 	default:
 		return vfs.AbstractEntry{}, fmt.Errorf("unsupported entry kind: %v", ent.Kind)
 	}
