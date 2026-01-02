@@ -53,10 +53,22 @@ type AbstractDirEntry struct {
 }
 
 // AbstractEntry is returned by AbstractDir.Lookup.
-// Exactly one of File or Dir should be non-nil.
+// Exactly one of File, Dir, or Symlink should be non-nil.
 type AbstractEntry struct {
-	File AbstractFile
-	Dir  AbstractDir
+	File    AbstractFile
+	Dir     AbstractDir
+	Symlink AbstractSymlink
+}
+
+// AbstractSymlink represents a symlink (read-only) with a target string.
+// Ownership information can be exposed by also implementing AbstractOwner.
+type AbstractSymlink interface {
+	// Stat returns the symlink's mode (permission bits are used; file type is ignored).
+	Stat() fs.FileMode
+	// ModTime returns the modified time for the symlink.
+	ModTime() time.Time
+	// Target returns the symlink target.
+	Target() string
 }
 
 // AbstractOwner is an optional interface that AbstractFile and AbstractDir
@@ -337,6 +349,21 @@ func (v *virtioFsBackend) createAbstractNode(parent *fsNode, name string, entry 
 		if owner, ok := entry.File.(AbstractOwner); ok {
 			node.uid, node.gid = owner.Owner()
 		}
+	} else if entry.Symlink != nil {
+		target := entry.Symlink.Target()
+		perm := entry.Symlink.Stat().Perm()
+		if perm == 0 {
+			perm = 0o777
+		}
+		node.mode = fs.ModeSymlink | perm
+		node.symlinkTarget = target
+		node.size = uint64(len(target))
+		if mt := entry.Symlink.ModTime(); !mt.IsZero() {
+			modTime = mt
+		}
+		if owner, ok := entry.Symlink.(AbstractOwner); ok {
+			node.uid, node.gid = owner.Owner()
+		}
 	} else {
 		return nil, -int32(linux.ENOENT)
 	}
@@ -614,7 +641,11 @@ func (v *virtioFsBackend) ReadDir(nodeID uint64, off uint64, maxBytes uint32) ([
 				// Look up in abstract directory
 				if entry, lookupErr := dirNode.abstractDir.Lookup(name); lookupErr == nil {
 					// Determine type from abstract entry
-					if entry.File != nil {
+					if entry.Dir != nil {
+						typ = linux.DT_DIR
+					} else if entry.Symlink != nil {
+						typ = linux.DT_LNK
+					} else if entry.File != nil {
 						typ = linux.DT_REG
 					}
 					// Create node to get an ID
