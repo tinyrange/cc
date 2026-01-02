@@ -83,6 +83,8 @@ type Application struct {
 	running *runningVM
 }
 
+const terminalTopBarH = float32(32)
+
 type rect struct {
 	x float32
 	y float32
@@ -493,15 +495,14 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 	winW := float32(w)
 
 	// Top bar with Exit button.
-	topBarH := float32(32)
-	f.RenderQuad(0, 0, winW, topBarH, nil, color.RGBA{R: 22, G: 22, B: 22, A: 255})
+	f.RenderQuad(0, 0, winW, terminalTopBarH, nil, color.RGBA{R: 22, G: 22, B: 22, A: 255})
 
 	mx, my := f.CursorPos()
 	leftDown := f.GetButtonState(window.ButtonLeft).IsDown()
 	justPressed := leftDown && !app.prevLeftDown
 	app.prevLeftDown = leftDown
 
-	backRect := rect{x: 20, y: 6, w: 70, h: topBarH - 12}
+	backRect := rect{x: 20, y: 6, w: 70, h: terminalTopBarH - 12}
 	backHover := backRect.contains(mx, my)
 	backColor := color.RGBA{R: 40, G: 40, B: 40, A: 255}
 	if backHover {
@@ -520,7 +521,7 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 	}
 
 	// Logs button (top-right).
-	logRect := rect{x: winW - 150, y: 6, w: 120, h: topBarH - 12}
+	logRect := rect{x: winW - 150, y: 6, w: 120, h: terminalTopBarH - 12}
 	logHover := logRect.contains(mx, my)
 	logColor := color.RGBA{R: 40, G: 40, B: 40, A: 255}
 	if logHover {
@@ -641,6 +642,8 @@ func (app *Application) bootBundle(index int) error {
 		containerFS.Close()
 		return fmt.Errorf("create terminal view: %w", err)
 	}
+	// Reserve space for CCApp's top bar so terminal output doesn't overlap it.
+	termView.SetInsets(0, terminalTopBarH, 0, 0)
 
 	// VM options
 	cpus := b.Meta.Boot.CPUs

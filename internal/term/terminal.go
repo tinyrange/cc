@@ -36,6 +36,13 @@ type View struct {
 
 	emu *vt.SafeEmulator
 
+	// Insets reserve window space that the terminal renderer should not draw into
+	// (e.g. an app-level top bar).
+	insetLeft   float32
+	insetTop    float32
+	insetRight  float32
+	insetBottom float32
+
 	// Pipe used to expose VT-generated input as an io.Reader (for virtio-console).
 	inR *io.PipeReader
 	inW *io.PipeWriter
@@ -110,6 +117,31 @@ func NewView(win graphics.Window) (*View, error) {
 	go v.drainQueueToPipe()
 
 	return v, nil
+}
+
+// SetInsets configures pixel insets for rendering and sizing the terminal grid.
+// The terminal will render within the content rect:
+// [left, top] → [windowWidth-right, windowHeight-bottom].
+func (v *View) SetInsets(left, top, right, bottom float32) {
+	if v == nil {
+		return
+	}
+	if left < 0 {
+		left = 0
+	}
+	if top < 0 {
+		top = 0
+	}
+	if right < 0 {
+		right = 0
+	}
+	if bottom < 0 {
+		bottom = 0
+	}
+	v.insetLeft = left
+	v.insetTop = top
+	v.insetRight = right
+	v.insetBottom = bottom
 }
 
 // disableVTQueriesThatBreakGuests prevents the VT emulator from writing certain
@@ -300,8 +332,22 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 		cellH = 16
 	}
 
-	cols := int((float32(width) - 2*padX) / cellW)
-	rows := int((float32(height) - 2*padY) / cellH)
+	insetL := v.insetLeft
+	insetT := v.insetTop
+	insetR := v.insetRight
+	insetB := v.insetBottom
+
+	usableW := float32(width) - insetL - insetR
+	usableH := float32(height) - insetT - insetB
+	if usableW < 1 {
+		usableW = 1
+	}
+	if usableH < 1 {
+		usableH = 1
+	}
+
+	cols := int((usableW - 2*padX) / cellW)
+	rows := int((usableH - 2*padY) / cellH)
 	if cols < 1 {
 		cols = 1
 	}
@@ -445,6 +491,8 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 	fgDefault := v.emu.ForegroundColor()
 
 	// Render cells.
+	originX := insetL
+	originY := insetT
 	for y := 0; y < v.emu.Height(); y++ {
 		for x := 0; x < v.emu.Width(); {
 			cell := v.emu.CellAt(x, y)
@@ -474,8 +522,8 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 				fg, bg = bg, fg
 			}
 
-			x0 := padX + float32(x)*cellW
-			y0 := padY + float32(y)*cellH
+			x0 := originX + padX + float32(x)*cellW
+			y0 := originY + padY + float32(y)*cellH
 
 			if bg != nil && bg != bgDefault {
 				f.RenderQuad(x0, y0, float32(w)*cellW, cellH, v.tex, bg)
@@ -493,8 +541,8 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 	// Cursor.
 	cur := v.emu.CursorPosition()
 	if cur.X >= 0 && cur.Y >= 0 && cur.X < v.emu.Width() && cur.Y < v.emu.Height() {
-		x0 := padX + float32(cur.X)*cellW
-		y0 := padY + float32(cur.Y)*cellH
+		x0 := originX + padX + float32(cur.X)*cellW
+		y0 := originY + padY + float32(cur.Y)*cellH
 		f.RenderQuad(x0, y0, cellW, cellH, v.tex, v.emu.CursorColor())
 	}
 
