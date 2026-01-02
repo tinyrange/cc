@@ -3,14 +3,19 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
+	"encoding/xml"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -68,14 +73,221 @@ type buildOptions struct {
 	EntitlementsPath string
 	BuildTests       bool
 	Tags             []string
+	// Build a bundle on macOS, build as a windows executable on windows, and build as a normal executable on linux
+	BuildApp bool
+	// LogoPath is the path to a PNG image to use as the application icon (macOS only)
+	LogoPath string
 }
 
 type buildOutput struct {
 	Path string
 }
 
+func copyFile(dstPath, srcPath string, perm os.FileMode) error {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return fmt.Errorf("open src: %w", err)
+	}
+	defer src.Close()
+
+	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
+		return fmt.Errorf("mkdir dst dir: %w", err)
+	}
+
+	dst, err := os.OpenFile(dstPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
+	if err != nil {
+		return fmt.Errorf("open dst: %w", err)
+	}
+	defer dst.Close()
+
+	if _, err := io.Copy(dst, src); err != nil {
+		return fmt.Errorf("copy: %w", err)
+	}
+
+	return nil
+}
+
+// encodePlist marshals a struct into a minimal XML property list.
+//
+// Supported field kinds:
+// - string => <string>
+// - bool   => <true/> / <false/>
+// - int/uint and sized variants => <integer>
+//
+// Fields are encoded in declaration order. Use struct tags: `plist:"CFBundleName"`.
+func encodePlist(v any) ([]byte, error) {
+	rv := reflect.ValueOf(v)
+	if rv.Kind() == reflect.Pointer {
+		rv = rv.Elem()
+	}
+	if rv.Kind() != reflect.Struct {
+		return nil, fmt.Errorf("plist: expected struct, got %T", v)
+	}
+	rt := rv.Type()
+
+	var buf bytes.Buffer
+	buf.WriteString(xml.Header)
+	buf.WriteString(`<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">` + "\n")
+
+	enc := xml.NewEncoder(&buf)
+	enc.Indent("", "\t")
+
+	plistStart := xml.StartElement{
+		Name: xml.Name{Local: "plist"},
+		Attr: []xml.Attr{{Name: xml.Name{Local: "version"}, Value: "1.0"}},
+	}
+	if err := enc.EncodeToken(plistStart); err != nil {
+		return nil, fmt.Errorf("plist: encode <plist>: %w", err)
+	}
+	dictStart := xml.StartElement{Name: xml.Name{Local: "dict"}}
+	if err := enc.EncodeToken(dictStart); err != nil {
+		return nil, fmt.Errorf("plist: encode <dict>: %w", err)
+	}
+
+	for i := 0; i < rt.NumField(); i++ {
+		f := rt.Field(i)
+		if f.PkgPath != "" { // unexported
+			continue
+		}
+		key := f.Tag.Get("plist")
+		if key == "" || key == "-" {
+			continue
+		}
+
+		fv := rv.Field(i)
+		if fv.Kind() == reflect.Pointer {
+			if fv.IsNil() {
+				continue
+			}
+			fv = fv.Elem()
+		}
+
+		if err := enc.EncodeElement(key, xml.StartElement{Name: xml.Name{Local: "key"}}); err != nil {
+			return nil, fmt.Errorf("plist: encode key %q: %w", key, err)
+		}
+
+		switch fv.Kind() {
+		case reflect.String:
+			if err := enc.EncodeElement(fv.String(), xml.StartElement{Name: xml.Name{Local: "string"}}); err != nil {
+				return nil, fmt.Errorf("plist: encode string %q: %w", key, err)
+			}
+		case reflect.Bool:
+			elem := "false"
+			if fv.Bool() {
+				elem = "true"
+			}
+			start := xml.StartElement{Name: xml.Name{Local: elem}}
+			if err := enc.EncodeToken(start); err != nil {
+				return nil, fmt.Errorf("plist: encode <%s/> for %q: %w", elem, key, err)
+			}
+			if err := enc.EncodeToken(start.End()); err != nil {
+				return nil, fmt.Errorf("plist: encode </%s> for %q: %w", elem, key, err)
+			}
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			s := strconv.FormatInt(fv.Int(), 10)
+			if err := enc.EncodeElement(s, xml.StartElement{Name: xml.Name{Local: "integer"}}); err != nil {
+				return nil, fmt.Errorf("plist: encode integer %q: %w", key, err)
+			}
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+			s := strconv.FormatUint(fv.Uint(), 10)
+			if err := enc.EncodeElement(s, xml.StartElement{Name: xml.Name{Local: "integer"}}); err != nil {
+				return nil, fmt.Errorf("plist: encode integer %q: %w", key, err)
+			}
+		default:
+			return nil, fmt.Errorf("plist: unsupported kind %s for key %q (field %s)", fv.Kind(), key, f.Name)
+		}
+	}
+
+	if err := enc.EncodeToken(dictStart.End()); err != nil {
+		return nil, fmt.Errorf("plist: encode </dict>: %w", err)
+	}
+	if err := enc.EncodeToken(plistStart.End()); err != nil {
+		return nil, fmt.Errorf("plist: encode </plist>: %w", err)
+	}
+	if err := enc.Flush(); err != nil {
+		return nil, fmt.Errorf("plist: flush: %w", err)
+	}
+
+	return buf.Bytes(), nil
+}
+
+func writeMacOSAppBundle(bundlePath, executablePath, appName, logoPath string) error {
+	contentsDir := filepath.Join(bundlePath, "Contents")
+	macosDir := filepath.Join(contentsDir, "MacOS")
+	resourcesDir := filepath.Join(contentsDir, "Resources")
+
+	if err := os.RemoveAll(bundlePath); err != nil {
+		return fmt.Errorf("remove existing bundle: %w", err)
+	}
+	if err := os.MkdirAll(macosDir, 0755); err != nil {
+		return fmt.Errorf("create bundle dirs: %w", err)
+	}
+	if err := os.MkdirAll(resourcesDir, 0755); err != nil {
+		return fmt.Errorf("create resources dir: %w", err)
+	}
+
+	exeName := filepath.Base(executablePath)
+	exeDst := filepath.Join(macosDir, exeName)
+	if err := copyFile(exeDst, executablePath, 0755); err != nil {
+		return fmt.Errorf("copy app executable: %w", err)
+	}
+
+	// Copy the logo to Resources if provided
+	var iconFileName string
+	if logoPath != "" {
+		iconFileName = filepath.Base(logoPath)
+		iconDst := filepath.Join(resourcesDir, iconFileName)
+		if err := copyFile(iconDst, logoPath, 0644); err != nil {
+			return fmt.Errorf("copy app icon: %w", err)
+		}
+	}
+
+	// Minimal Info.plist required for a runnable app bundle.
+	// Keep it simple: this is primarily for local development workflows.
+	bundleID := "com.tinyrange." + strings.ToLower(appName)
+
+	type infoPlist struct {
+		CFBundleDevelopmentRegion     string `plist:"CFBundleDevelopmentRegion"`
+		CFBundleExecutable            string `plist:"CFBundleExecutable"`
+		CFBundleIdentifier            string `plist:"CFBundleIdentifier"`
+		CFBundleInfoDictionaryVersion string `plist:"CFBundleInfoDictionaryVersion"`
+		CFBundleName                  string `plist:"CFBundleName"`
+		CFBundlePackageType           string `plist:"CFBundlePackageType"`
+		CFBundleShortVersionString    string `plist:"CFBundleShortVersionString"`
+		CFBundleVersion               string `plist:"CFBundleVersion"`
+		NSHighResolutionCapable       bool   `plist:"NSHighResolutionCapable"`
+		CFBundleIconFile              string `plist:"CFBundleIconFile"`
+	}
+
+	plistData, err := encodePlist(infoPlist{
+		CFBundleDevelopmentRegion:     "en",
+		CFBundleExecutable:            exeName,
+		CFBundleIdentifier:            bundleID,
+		CFBundleInfoDictionaryVersion: "6.0",
+		CFBundleName:                  appName,
+		CFBundlePackageType:           "APPL",
+		CFBundleShortVersionString:    "0.0.0",
+		CFBundleVersion:               "0",
+		NSHighResolutionCapable:       true,
+		CFBundleIconFile:              iconFileName,
+	})
+	if err != nil {
+		return fmt.Errorf("encode Info.plist: %w", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(contentsDir, "Info.plist"), plistData, 0644); err != nil {
+		return fmt.Errorf("write Info.plist: %w", err)
+	}
+
+	return nil
+}
+
 func goBuild(opts buildOptions) (buildOutput, error) {
 	output := filepath.Join("build", opts.Build.OutputName(opts.OutputName))
+	macosBundlePath := ""
+	if opts.BuildApp && opts.Build.GOOS == "darwin" {
+		macosBundlePath = output + ".app"
+	}
 
 	if err := os.MkdirAll(filepath.Dir(output), 0755); err != nil {
 		return buildOutput{}, fmt.Errorf("failed to create build directory: %w", err)
@@ -105,6 +317,11 @@ func goBuild(opts buildOptions) (buildOutput, error) {
 
 	if len(opts.Tags) > 0 {
 		args = append(args, "-tags", strings.Join(opts.Tags, " "))
+	}
+
+	// if the target is windows and BuildApp is true use the windows subsystem rather than the default console subsystem
+	if opts.Build.GOOS == "windows" && opts.BuildApp {
+		args = append(args, "-ldflags=-H windowsgui")
 	}
 
 	args = append(args, pkg)
@@ -142,10 +359,35 @@ func goBuild(opts buildOptions) (buildOutput, error) {
 		}
 	}
 
+	if opts.BuildApp && opts.Build.GOOS == "darwin" {
+		// Turn the output binary into a macOS .app bundle.
+		if err := writeMacOSAppBundle(macosBundlePath, output, opts.OutputName, opts.LogoPath); err != nil {
+			return buildOutput{}, fmt.Errorf("failed to create macOS app bundle: %w", err)
+		}
+		return buildOutput{Path: macosBundlePath}, nil
+	}
+
 	return buildOutput{Path: output}, nil
 }
 
 func runBuildOutput(output buildOutput, args []string) error {
+	// If this is a macOS app bundle, run via `open`.
+	if runtime.GOOS == "darwin" && strings.HasSuffix(output.Path, ".app") {
+		openArgs := []string{"-n", output.Path}
+		if len(args) > 0 {
+			openArgs = append(openArgs, "--args")
+			openArgs = append(openArgs, args...)
+		}
+		cmd := exec.Command("open", openArgs...)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = os.Stdin
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("failed to run app bundle: %w", err)
+		}
+		return nil
+	}
+
 	cmd := exec.Command(output.Path, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -379,6 +621,7 @@ func main() {
 	run := fs.Bool("run", false, "run the built cc tool after building")
 	runtest := fs.String("runtest", "", "build a Dockerfile in tests/<name>/Dockerfile and run it using cc (Linux only)")
 	dbgTool := fs.Bool("dbg-tool", false, "build and run the debug tool")
+	app := fs.Bool("app", false, "build and run ccapp")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
@@ -860,9 +1103,43 @@ func main() {
 	}
 	fmt.Printf("built %s\n", out.Path)
 
+	// also build cmd/ccapp
+	ccappOut, err := goBuild(buildOptions{
+		Package:          "cmd/ccapp",
+		OutputName:       "ccapp",
+		Build:            hostBuild,
+		EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
+		BuildApp:         true,
+		LogoPath:         filepath.Join("internal", "assets", "logo-color-black.png"),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to build ccapp: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("built %s\n", ccappOut.Path)
+
 	if *run {
 		fmt.Printf("running %s %s\n", out.Path, strings.Join(fs.Args(), " "))
 		if err := runBuildOutput(out, fs.Args()); err != nil {
+			os.Exit(1)
+		}
+	} else if *app {
+		switch runtime.GOOS {
+		case "darwin":
+			if err := runBuildOutput(ccappOut, fs.Args()); err != nil {
+				os.Exit(1)
+			}
+		case "windows":
+			// On Windows, ccapp is built as a GUI app when BuildApp is true.
+			if err := runBuildOutput(ccappOut, fs.Args()); err != nil {
+				os.Exit(1)
+			}
+		case "linux":
+			if err := runBuildOutput(ccappOut, fs.Args()); err != nil {
+				os.Exit(1)
+			}
+		default:
+			fmt.Fprintf(os.Stderr, "unsupported OS: %s\n", runtime.GOOS)
 			os.Exit(1)
 		}
 	}

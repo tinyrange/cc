@@ -65,6 +65,11 @@ type Cocoa struct {
 	pool    objc.ID
 	running bool
 
+	// Cached drawable metrics to detect resizes and keep the NSOpenGLContext
+	// backing store in sync with the view size.
+	lastBackingW int
+	lastBackingH int
+
 	// Input state tracking (frame-based).
 	keyStates    map[Key]KeyState
 	buttonStates map[Button]ButtonState
@@ -112,6 +117,7 @@ var (
 	selSetView                   objc.SEL
 	selMakeCurrentContext        objc.SEL
 	selClearCurrentContext       objc.SEL
+	selUpdate                    objc.SEL
 	selInitWithAttributes        objc.SEL
 	selInitWithFormat            objc.SEL
 	selSetValuesForParameter     objc.SEL
@@ -123,6 +129,10 @@ var (
 	selEventFlags      objc.SEL
 	selEventButtonNum  objc.SEL
 	selEventCharacters objc.SEL
+	selEventDeltaY     objc.SEL
+	selEventDeltaX     objc.SEL
+	selEventScrollDY   objc.SEL
+	selEventScrollDX   objc.SEL
 	selUTF8String      objc.SEL
 
 	// NSScreen selectors (display scale).
@@ -140,6 +150,7 @@ const (
 	nsEventTypeKeyDown        = 10
 	nsEventTypeKeyUp          = 11
 	nsEventTypeFlagsChanged   = 12
+	nsEventTypeScrollWheel    = 22
 	nsEventTypeOtherMouseDown = 25
 	nsEventTypeOtherMouseUp   = 26
 )
@@ -252,6 +263,10 @@ func (c *Cocoa) Poll() bool {
 	if !objc.Send[bool](c.window, selIsVisible) {
 		c.running = false
 	}
+
+	// Keep the OpenGL drawable sized correctly across resizes/maximize/fullscreen.
+	c.updateDrawableIfNeeded()
+
 	return c.running
 }
 
@@ -457,6 +472,7 @@ func loadSelectors() {
 	selSetView = objc.RegisterName("setView:")
 	selMakeCurrentContext = objc.RegisterName("makeCurrentContext")
 	selClearCurrentContext = objc.RegisterName("clearCurrentContext")
+	selUpdate = objc.RegisterName("update")
 	selInitWithAttributes = objc.RegisterName("initWithAttributes:")
 	selInitWithFormat = objc.RegisterName("initWithFormat:shareContext:")
 	selSetValuesForParameter = objc.RegisterName("setValues:forParameter:")
@@ -468,6 +484,10 @@ func loadSelectors() {
 	selEventFlags = objc.RegisterName("modifierFlags")
 	selEventButtonNum = objc.RegisterName("buttonNumber")
 	selEventCharacters = objc.RegisterName("characters")
+	selEventDeltaY = objc.RegisterName("deltaY")
+	selEventDeltaX = objc.RegisterName("deltaX")
+	selEventScrollDY = objc.RegisterName("scrollingDeltaY")
+	selEventScrollDX = objc.RegisterName("scrollingDeltaX")
 	selUTF8String = objc.RegisterName("UTF8String")
 
 	// NSScreen (display scale).
@@ -537,6 +557,28 @@ func (c *Cocoa) Scale() float32 {
 		return sx
 	}
 	return sy
+}
+
+func (c *Cocoa) updateDrawableIfNeeded() {
+	if c.ctx == 0 || c.view == 0 || selUpdate == 0 {
+		return
+	}
+
+	// Detect backing size changes and call -[NSOpenGLContext update] to ensure
+	// the drawable matches the view. Without this, macOS can keep the old
+	// backing store size after window zoom/maximize, causing incorrect scaling.
+	bw, bh := c.BackingSize()
+	if bw <= 0 || bh <= 0 {
+		return
+	}
+	if bw == c.lastBackingW && bh == c.lastBackingH {
+		return
+	}
+	c.lastBackingW, c.lastBackingH = bw, bh
+
+	// Ensure we're updating the correct context.
+	c.ctx.Send(selMakeCurrentContext)
+	c.ctx.Send(selUpdate)
 }
 
 func (c *Cocoa) GetKeyState(key Key) KeyState {
@@ -696,6 +738,28 @@ func (c *Cocoa) processEvent(ev objc.ID) {
 				Type:   InputEventMouseUp,
 				Button: button,
 				Mods:   cocoaFlagsToMods(flags),
+			})
+		}
+
+	case nsEventTypeScrollWheel:
+		flags := objc.Send[uint64](ev, selEventFlags)
+		// Prefer "scrollingDeltaY/X" (trackpad + mouse), fall back to "deltaY/X".
+		dy := objc.Send[float64](ev, selEventScrollDY)
+		dx := objc.Send[float64](ev, selEventScrollDX)
+		if dy == 0 {
+			dy = objc.Send[float64](ev, selEventDeltaY)
+		}
+		if dx == 0 {
+			dx = objc.Send[float64](ev, selEventDeltaX)
+		}
+		if dy != 0 || dx != 0 {
+			// Convert to rough "wheel ticks". For precise devices, deltas can be small.
+			const tick = 10.0
+			c.inputEvents = append(c.inputEvents, InputEvent{
+				Type:    InputEventScroll,
+				ScrollX: float32(dx / tick),
+				ScrollY: float32(dy / tick),
+				Mods:    cocoaFlagsToMods(flags),
 			})
 		}
 	}

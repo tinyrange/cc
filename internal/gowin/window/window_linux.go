@@ -433,6 +433,20 @@ func (w *x11Window) Poll() bool {
 			}
 		case buttonPress:
 			bev := (*xButtonEvent)(unsafe.Pointer(&ev[0]))
+			// X11 uses buttons 4/5 for scroll wheel up/down.
+			// Emit a scroll event rather than treating these as mouse buttons.
+			if bev.Button == 4 || bev.Button == 5 {
+				dy := float32(-1)
+				if bev.Button == 4 {
+					dy = 1
+				}
+				w.inputEvents = append(w.inputEvents, InputEvent{
+					Type:    InputEventScroll,
+					ScrollY: dy,
+					Mods:    x11StateToMods(bev.State),
+				})
+				break
+			}
 			if button := w.buttonToButton(bev.Button); button >= ButtonLeft && button <= Button5 {
 				w.buttonStates[button] = ButtonStatePressed
 				w.inputEvents = append(w.inputEvents, InputEvent{
@@ -443,6 +457,10 @@ func (w *x11Window) Poll() bool {
 			}
 		case buttonRelease:
 			bev := (*xButtonEvent)(unsafe.Pointer(&ev[0]))
+			// Ignore button 4/5 releases (scroll wheel).
+			if bev.Button == 4 || bev.Button == 5 {
+				break
+			}
 			if button := w.buttonToButton(bev.Button); button >= ButtonLeft && button <= Button5 {
 				w.buttonStates[button] = ButtonStateReleased
 				w.inputEvents = append(w.inputEvents, InputEvent{

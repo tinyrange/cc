@@ -202,6 +202,7 @@ const (
 	InputEventText
 	InputEventMouseDown
 	InputEventMouseUp
+	InputEventScroll
 )
 
 func (t InputEventType) String() string {
@@ -218,6 +219,8 @@ func (t InputEventType) String() string {
 		return "MouseDown"
 	case InputEventMouseUp:
 		return "MouseUp"
+	case InputEventScroll:
+		return "Scroll"
 	default:
 		return fmt.Sprintf("InputEventType(%d)", uint8(t))
 	}
@@ -237,4 +240,9 @@ type InputEvent struct {
 
 	// Button is meaningful for MouseDown/MouseUp.
 	Button Button
+
+	// ScrollX/ScrollY are meaningful for Scroll events. Values are in "wheel ticks"
+	// where 1.0 corresponds to a standard mouse wheel notch (platform-dependent).
+	ScrollX float32
+	ScrollY float32
 }

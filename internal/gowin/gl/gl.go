@@ -45,6 +45,8 @@ const (
 
 	// UnsignedByte is a pixel data type indicating 8-bit unsigned values.
 	UnsignedByte = 0x1401
+	// UnsignedInt is a data type indicating 32-bit unsigned integer values.
+	UnsignedInt = 0x1405
 	// Float is a data type indicating 32-bit floating point values.
 	Float = 0x1406
 
@@ -55,6 +57,8 @@ const (
 
 	// ArrayBuffer is the target for vertex buffer objects.
 	ArrayBuffer = 0x8892
+	// ElementArrayBuffer is the target for index (element) buffer objects.
+	ElementArrayBuffer = 0x8893
 	// StaticDraw indicates that buffer data will be modified once and used many times.
 	StaticDraw = 0x88E4
 	// DynamicDraw indicates that buffer data will be modified repeatedly and used many times.
@@ -195,6 +199,7 @@ type OpenGL interface {
 
 	// Drawing
 	DrawArrays(mode uint32, first int32, count int32)
+	DrawElements(mode uint32, count int32, xtype uint32, indices uintptr)
 
 	// ReadPixels reads a block of pixels from the framebuffer into client memory.
 	ReadPixels(
