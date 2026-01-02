@@ -469,11 +469,26 @@ func (cfs *ContainerFS) entryToAbstract(filePath string, ent archive.Entry, lr *
 				contents: lr.contents,
 			},
 		}, nil
-	case archive.EntryKindSymlink, archive.EntryKindHardlink:
-		// For symlinks and hardlinks, resolve to the final target by walking the
-		// target path component-by-component and following intermediate symlinks.
-		// This matters on merged-/usr images where /lib (etc) are symlinks.
-		resolvedPath, resolvedEnt, resolvedLayer, isImplicitDir, err := cfs.resolvePath(filePath, 40)
+	case archive.EntryKindSymlink:
+		// Preserve symlinks as symlinks. Many userspace components (notably systemd)
+		// expect enablement links under *.wants/ to be actual symlinks.
+		return vfs.AbstractEntry{
+			Symlink: &containerSymlink{
+				target:  ent.Linkname,
+				mode:    ent.Mode,
+				modTime: ent.ModTime,
+				uid:     uint32(ent.UID),
+				gid:     uint32(ent.GID),
+			},
+		}, nil
+	case archive.EntryKindHardlink:
+		// Hardlinks are presented as their target contents (regular file or dir).
+		// This is a read-only filesystem view, so inode identity isn't observable.
+		target := ent.Linkname
+		if !path.IsAbs(target) {
+			target = path.Join(path.Dir(filePath), target)
+		}
+		resolvedPath, resolvedEnt, resolvedLayer, isImplicitDir, err := cfs.resolvePath(target, 40)
 		if err != nil {
 			return vfs.AbstractEntry{}, err
 		}
@@ -598,4 +613,30 @@ var (
 	_ vfs.AbstractOwner = (*containerDir)(nil)
 	_ vfs.AbstractFile  = (*containerFile)(nil)
 	_ vfs.AbstractOwner = (*containerFile)(nil)
+)
+
+// containerSymlink implements vfs.AbstractSymlink for a symlink entry in the container.
+type containerSymlink struct {
+	target  string
+	mode    fs.FileMode
+	modTime time.Time
+	uid     uint32
+	gid     uint32
+}
+
+func (s *containerSymlink) Stat() fs.FileMode { return s.mode }
+func (s *containerSymlink) ModTime() time.Time {
+	if !s.modTime.IsZero() {
+		return s.modTime
+	}
+	return time.Unix(0, 0)
+}
+func (s *containerSymlink) Target() string { return s.target }
+func (s *containerSymlink) Owner() (uint32, uint32) {
+	return s.uid, s.gid
+}
+
+var (
+	_ vfs.AbstractSymlink = (*containerSymlink)(nil)
+	_ vfs.AbstractOwner   = (*containerSymlink)(nil)
 )
