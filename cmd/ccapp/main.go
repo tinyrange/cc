@@ -35,6 +35,7 @@ type appMode int
 
 const (
 	modeLauncher appMode = iota
+	modeLoading
 	modeTerminal
 )
 
@@ -42,6 +43,35 @@ const (
 type discoveredBundle struct {
 	Dir  string
 	Meta bundle.Metadata
+}
+
+type bootPrep struct {
+	hvArch hv.CpuArchitecture
+
+	// bundle-derived config (with defaults applied)
+	cpus     int
+	memoryMB uint64
+	network  bool
+	dmesg    bool
+	exec     bool
+
+	// container execution config
+	execCmd []string
+	env     []string
+	workDir string
+
+	// resources created during prep (must be cleaned up on error)
+	containerFS  *oci.ContainerFS
+	fsBackend    vfs.VirtioFsBackend
+	hypervisor   hv.Hypervisor
+	kernelLoader kernel.Kernel
+	netBackend   *netstack.NetStack
+	virtioNet    *virtio.NetstackBackend
+}
+
+type bootResult struct {
+	prep *bootPrep
+	err  error
 }
 
 // runningVM holds state for a booted VM.
@@ -71,6 +101,11 @@ type Application struct {
 	prevLeftDown  bool
 	draggingThumb bool
 	thumbDragDX   float32
+
+	// Boot loading state
+	bootCh      chan bootResult
+	bootStarted time.Time
+	bootName    string
 
 	// Discovered bundles
 	bundlesDir string
@@ -274,6 +309,8 @@ func (app *Application) Run() error {
 		switch app.mode {
 		case modeLauncher:
 			return app.renderLauncher(f)
+		case modeLoading:
+			return app.renderLoading(f)
 		case modeTerminal:
 			return app.renderTerminal(f)
 		default:
@@ -474,12 +511,73 @@ func (app *Application) renderLauncher(f graphics.Frame) error {
 
 		if justPressed && viewport.contains(mx, my) && card.contains(mx, my) {
 			app.selectedIndex = i
-			if err := app.bootBundle(i); err != nil {
-				slog.Error("failed to boot bundle", "error", err)
-				app.selectedIndex = -1
-			}
+			app.startBootBundle(i)
 		}
 	}
+
+	return nil
+}
+
+func (app *Application) renderLoading(f graphics.Frame) error {
+	// Drain input events so they don't pile up while loading.
+	app.window.PlatformWindow().DrainInputEvents()
+
+	// Check for background prep completion.
+	if app.bootCh != nil {
+		select {
+		case res := <-app.bootCh:
+			app.bootCh = nil
+			if res.err != nil {
+				slog.Error("failed to prepare VM boot", "error", res.err)
+				app.selectedIndex = -1
+				app.mode = modeLauncher
+				return nil
+			}
+			if err := app.finalizeBoot(res.prep); err != nil {
+				slog.Error("failed to finalize VM boot", "error", err)
+				app.selectedIndex = -1
+				app.mode = modeLauncher
+				return nil
+			}
+			app.mode = modeTerminal
+			return nil
+		default:
+		}
+	}
+
+	w, h := f.WindowSize()
+	app.text.SetViewport(int32(w), int32(h))
+	winW := float32(w)
+	winH := float32(h)
+
+	// Dark background.
+	f.RenderQuad(0, 0, winW, winH, nil, color.RGBA{R: 10, G: 10, B: 10, A: 255})
+
+	// Centered spinning logo.
+	if app.logo != nil {
+		logoSize := winH * 0.45
+		if logoSize > winW*0.45 {
+			logoSize = winW * 0.45
+		}
+		if logoSize < 220 {
+			logoSize = 220
+		}
+
+		logoX := (winW - logoSize) * 0.5
+		logoY := (winH - logoSize) * 0.5
+
+		t := float32(time.Since(app.bootStarted).Seconds())
+		app.logo.DrawGroupRotated(f, "inner-circle", logoX, logoY, logoSize, logoSize, t*0.9)
+		app.logo.DrawGroupRotated(f, "morse-circle", logoX, logoY, logoSize, logoSize, -t*1.4)
+		app.logo.DrawGroupRotated(f, "outer-circle", logoX, logoY, logoSize, logoSize, t*2.2)
+	}
+
+	// Loading text.
+	msg := "Booting VM…"
+	if app.bootName != "" {
+		msg = "Booting " + app.bootName + "…"
+	}
+	app.text.RenderText(msg, 20, 40, 20, graphics.ColorWhite)
 
 	return nil
 }
@@ -561,20 +659,64 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 	})
 }
 
-func (app *Application) bootBundle(index int) error {
+func (app *Application) startBootBundle(index int) {
 	if index < 0 || index >= len(app.bundles) {
-		return fmt.Errorf("invalid bundle index")
+		return
+	}
+	// Prevent overlapping boot attempts.
+	if app.bootCh != nil {
+		return
 	}
 
 	b := app.bundles[index]
-	slog.Info("boot bundle requested", "index", index, "bundle_dir", b.Dir, "bundle_name", b.Meta.Name)
+	name := b.Meta.Name
+	if name == "" || name == "{{name}}" {
+		name = filepath.Base(b.Dir)
+	}
 
-	// Determine architecture
 	hvArch, err := parseArchitecture(runtime.GOARCH)
 	if err != nil {
-		return err
+		slog.Error("failed to determine architecture", "goarch", runtime.GOARCH, "error", err)
+		app.selectedIndex = -1
+		app.mode = modeLauncher
+		return
 	}
-	slog.Info("determined architecture", "goarch", runtime.GOARCH, "arch", hvArch)
+
+	app.bootStarted = time.Now()
+	app.bootName = name
+	app.mode = modeLoading
+
+	ch := make(chan bootResult, 1)
+	app.bootCh = ch
+
+	// Background prep: do anything slow/off-GPU here (disk IO, kernel fetch, etc).
+	go func(b discoveredBundle, arch hv.CpuArchitecture, out chan<- bootResult) {
+		prep, err := prepareBootBundle(b, arch)
+		out <- bootResult{prep: prep, err: err}
+	}(b, hvArch, ch)
+}
+
+func prepareBootBundle(b discoveredBundle, hvArch hv.CpuArchitecture) (_ *bootPrep, retErr error) {
+	if b.Dir == "" {
+		return nil, fmt.Errorf("invalid bundle: empty dir")
+	}
+	slog.Info("boot bundle prep started", "bundle_dir", b.Dir, "bundle_name", b.Meta.Name, "arch", hvArch)
+
+	prep := &bootPrep{hvArch: hvArch}
+	defer func() {
+		if retErr != nil {
+			// Best-effort cleanup on failure.
+			if prep.hypervisor != nil {
+				_ = prep.hypervisor.Close()
+			}
+			if prep.netBackend != nil {
+				prep.netBackend.Close()
+			}
+			if prep.containerFS != nil {
+				prep.containerFS.Close()
+			}
+		}
+	}()
 
 	// Load image from bundle
 	imageDir := filepath.Join(b.Dir, b.Meta.Boot.ImageDir)
@@ -585,144 +727,170 @@ func (app *Application) bootBundle(index int) error {
 
 	img, err := oci.LoadFromDir(imageDir)
 	if err != nil {
-		return fmt.Errorf("load image: %w", err)
+		return nil, fmt.Errorf("load image: %w", err)
 	}
 
 	// Determine command
 	cmd := b.Meta.Boot.Command
 	execCmd := img.Command(cmd)
 	if len(execCmd) == 0 {
-		return fmt.Errorf("no command specified and image has no entrypoint/cmd")
+		return nil, fmt.Errorf("no command specified and image has no entrypoint/cmd")
 	}
 	slog.Info("resolved container command", "cmd", execCmd)
 
 	// Create container filesystem
 	containerFS, err := oci.NewContainerFS(img)
 	if err != nil {
-		return fmt.Errorf("create container filesystem: %w", err)
+		return nil, fmt.Errorf("create container filesystem: %w", err)
 	}
+	prep.containerFS = containerFS
 
 	// Resolve command path
 	pathEnv := extractInitialPath(img.Config.Env)
 	workDir := containerWorkDir(img)
 	execCmd, err = resolveCommandPath(containerFS, execCmd, pathEnv, workDir)
 	if err != nil {
-		containerFS.Close()
-		return fmt.Errorf("resolve command: %w", err)
+		return nil, fmt.Errorf("resolve command: %w", err)
 	}
 	slog.Info("resolved command path", "exec", execCmd, "work_dir", workDir)
+	prep.execCmd = execCmd
+	prep.env = img.Config.Env
+	prep.workDir = workDir
 
 	// Create VirtioFS backend
 	fsBackend := vfs.NewVirtioFsBackendWithAbstract()
 	if err := fsBackend.SetAbstractRoot(containerFS); err != nil {
-		containerFS.Close()
-		return fmt.Errorf("set container filesystem as root: %w", err)
+		return nil, fmt.Errorf("set container filesystem as root: %w", err)
 	}
+	prep.fsBackend = fsBackend
 
 	// Create hypervisor
 	h, err := factory.OpenWithArchitecture(hvArch)
 	if err != nil {
-		containerFS.Close()
-		return fmt.Errorf("create hypervisor: %w", err)
+		return nil, fmt.Errorf("create hypervisor: %w", err)
 	}
+	prep.hypervisor = h
 
 	// Load kernel
 	kernelLoader, err := kernel.LoadForArchitecture(hvArch)
 	if err != nil {
-		h.Close()
-		containerFS.Close()
-		return fmt.Errorf("load kernel: %w", err)
+		return nil, fmt.Errorf("load kernel: %w", err)
 	}
 	slog.Info("kernel loader ready")
+	prep.kernelLoader = kernelLoader
 
-	// Create terminal view
+	// VM options
+	prep.cpus = b.Meta.Boot.CPUs
+	if prep.cpus == 0 {
+		prep.cpus = 1
+	}
+	prep.memoryMB = uint64(b.Meta.Boot.MemoryMB)
+	if prep.memoryMB == 0 {
+		prep.memoryMB = 1024
+	}
+	prep.network = b.Meta.Boot.Network
+	prep.dmesg = b.Meta.Boot.Dmesg
+	prep.exec = b.Meta.Boot.Exec
+	slog.Info("vm config (prep)", "cpus", prep.cpus, "memory_mb", prep.memoryMB, "network", prep.network, "dmesg", prep.dmesg, "exec", prep.exec)
+
+	var netBackend *netstack.NetStack
+	if prep.network {
+		slog.Info("network enabled; starting netstack DNS server")
+		netBackend = netstack.New(slog.Default())
+		if err := netBackend.StartDNSServer(); err != nil {
+			return nil, fmt.Errorf("start DNS server: %w", err)
+		}
+		prep.netBackend = netBackend
+
+		mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
+		virtioNet, err := virtio.NewNetstackBackend(netBackend, mac)
+		if err != nil {
+			return nil, fmt.Errorf("create netstack backend: %w", err)
+		}
+		prep.virtioNet = virtioNet
+	}
+
+	slog.Info("boot bundle prep complete", "bundle_dir", b.Dir, "bundle_name", b.Meta.Name)
+	return prep, nil
+}
+
+func (app *Application) finalizeBoot(prep *bootPrep) (retErr error) {
+	if prep == nil {
+		return fmt.Errorf("nil boot prep")
+	}
+	if prep.hypervisor == nil || prep.kernelLoader == nil || prep.containerFS == nil || prep.fsBackend == nil {
+		return fmt.Errorf("incomplete boot prep")
+	}
+
+	// If we fail after this point, ensure cleanup.
+	defer func() {
+		if retErr != nil {
+			if app.running != nil {
+				app.stopVM()
+			} else {
+				if prep.netBackend != nil {
+					prep.netBackend.Close()
+				}
+				if prep.containerFS != nil {
+					prep.containerFS.Close()
+				}
+				if prep.hypervisor != nil {
+					_ = prep.hypervisor.Close()
+				}
+			}
+		}
+	}()
+
+	// Create terminal view (must be on the main thread for GPU resources).
 	termView, err := termwin.NewView(app.window)
 	if err != nil {
-		h.Close()
-		containerFS.Close()
 		return fmt.Errorf("create terminal view: %w", err)
 	}
 	// Reserve space for CCApp's top bar so terminal output doesn't overlap it.
 	termView.SetInsets(0, terminalTopBarH, 0, 0)
 
-	// VM options
-	cpus := b.Meta.Boot.CPUs
-	if cpus == 0 {
-		cpus = 1
-	}
-	memoryMB := b.Meta.Boot.MemoryMB
-	if memoryMB == 0 {
-		memoryMB = 1024
-	}
-	slog.Info("vm config", "cpus", cpus, "memory_mb", memoryMB, "network", b.Meta.Boot.Network, "dmesg", b.Meta.Boot.Dmesg, "exec", b.Meta.Boot.Exec)
-
 	opts := []initx.Option{
 		initx.WithDeviceTemplate(virtio.FSTemplate{
 			Tag:     "rootfs",
-			Backend: fsBackend,
-			Arch:    hvArch,
+			Backend: prep.fsBackend,
+			Arch:    prep.hvArch,
 		}),
 		initx.WithStdin(termView),
 		initx.WithConsoleOutput(termView),
-		initx.WithDmesgLogging(b.Meta.Boot.Dmesg),
+		initx.WithDmesgLogging(prep.dmesg),
 	}
 
-	var netBackend *netstack.NetStack
-	if b.Meta.Boot.Network {
-		slog.Info("network enabled; starting netstack DNS server")
-		netBackend = netstack.New(slog.Default())
-		if err := netBackend.StartDNSServer(); err != nil {
+	if prep.network {
+		if prep.netBackend == nil || prep.virtioNet == nil {
 			termView.Close()
-			h.Close()
-			containerFS.Close()
-			return fmt.Errorf("start DNS server: %w", err)
+			return fmt.Errorf("network enabled but netstack was not prepared")
 		}
-
 		mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
-		virtioNet, err := virtio.NewNetstackBackend(netBackend, mac)
-		if err != nil {
-			netBackend.Close()
-			termView.Close()
-			h.Close()
-			containerFS.Close()
-			return fmt.Errorf("create netstack backend: %w", err)
-		}
-
 		opts = append(opts, initx.WithDeviceTemplate(virtio.NetTemplate{
-			Backend: virtioNet,
+			Backend: prep.virtioNet,
 			MAC:     mac,
-			Arch:    hvArch,
+			Arch:    prep.hvArch,
 		}))
 	}
 
-	vm, err := initx.NewVirtualMachine(h, cpus, uint64(memoryMB), kernelLoader, opts...)
+	vm, err := initx.NewVirtualMachine(prep.hypervisor, prep.cpus, prep.memoryMB, prep.kernelLoader, opts...)
 	if err != nil {
-		if netBackend != nil {
-			netBackend.Close()
-		}
 		termView.Close()
-		h.Close()
-		containerFS.Close()
 		return fmt.Errorf("create VM: %w", err)
 	}
 
 	// Build init program
 	prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
-		Arch:          hvArch,
-		Cmd:           execCmd,
-		Env:           img.Config.Env,
-		WorkDir:       workDir,
-		EnableNetwork: b.Meta.Boot.Network,
-		Exec:          b.Meta.Boot.Exec,
+		Arch:          prep.hvArch,
+		Cmd:           prep.execCmd,
+		Env:           prep.env,
+		WorkDir:       prep.workDir,
+		EnableNetwork: prep.network,
+		Exec:          prep.exec,
 	})
 	if err != nil {
 		vm.Close()
-		if netBackend != nil {
-			netBackend.Close()
-		}
 		termView.Close()
-		h.Close()
-		containerFS.Close()
 		return err
 	}
 
@@ -733,11 +901,9 @@ func (app *Application) bootBundle(index int) error {
 		vm:          vm,
 		session:     session,
 		termView:    termView,
-		containerFS: containerFS,
-		netBackend:  netBackend,
+		containerFS: prep.containerFS,
+		netBackend:  prep.netBackend,
 	}
-	app.mode = modeTerminal
-
 	return nil
 }
 
