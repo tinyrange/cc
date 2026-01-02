@@ -21,9 +21,6 @@ import (
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/factory"
 	"github.com/tinyrange/cc/internal/initx"
-	"github.com/tinyrange/cc/internal/ir"
-	"github.com/tinyrange/cc/internal/linux/defs"
-	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 	"github.com/tinyrange/cc/internal/linux/kernel"
 	"github.com/tinyrange/cc/internal/netstack"
 	"github.com/tinyrange/cc/internal/oci"
@@ -48,8 +45,7 @@ type discoveredBundle struct {
 // runningVM holds state for a booted VM.
 type runningVM struct {
 	vm          *initx.VirtualMachine
-	cancel      context.CancelFunc
-	done        chan error
+	session     *initx.Session
 	termView    *termwin.View
 	containerFS *oci.ContainerFS
 	netBackend  *netstack.NetStack
@@ -430,7 +426,7 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 
 	// Check if VM has exited.
 	select {
-	case err := <-app.running.done:
+	case err := <-app.running.session.Done:
 		if err != nil && err != io.EOF {
 			slog.Error("VM exited with error", "error", err)
 		}
@@ -585,37 +581,30 @@ func (app *Application) bootBundle(index int) error {
 	}
 
 	// Build init program
-	prog := buildContainerInit(hvArch, img, execCmd, b.Meta.Boot.Network, b.Meta.Boot.Exec)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-
-	// Boot VM in background
-	go func() {
-		// First boot the VM
-		bootCtx, bootCancel := context.WithTimeout(ctx, 10*time.Second)
-		defer bootCancel()
-
-		if err := vm.Run(bootCtx, &ir.Program{
-			Entrypoint: "main",
-			Methods: map[string]ir.Method{
-				"main": {ir.Return(ir.Int64(0))},
-			},
-		}); err != nil {
-			done <- err
-			return
+	prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
+		Arch:          hvArch,
+		Cmd:           execCmd,
+		Env:           img.Config.Env,
+		WorkDir:       workDir,
+		EnableNetwork: b.Meta.Boot.Network,
+		Exec:          b.Meta.Boot.Exec,
+	})
+	if err != nil {
+		vm.Close()
+		if netBackend != nil {
+			netBackend.Close()
 		}
+		termView.Close()
+		h.Close()
+		containerFS.Close()
+		return err
+	}
 
-		vm.StartStdinForwarding()
-
-		// Run the actual program
-		done <- vm.Run(ctx, prog)
-	}()
+	session := initx.StartSession(context.Background(), vm, prog, initx.SessionConfig{})
 
 	app.running = &runningVM{
 		vm:          vm,
-		cancel:      cancel,
-		done:        done,
+		session:     session,
 		termView:    termView,
 		containerFS: containerFS,
 		netBackend:  netBackend,
@@ -631,12 +620,9 @@ func (app *Application) stopVM() {
 		return
 	}
 
-	app.running.cancel()
-
 	// Wait briefly for VM to exit
-	select {
-	case <-app.running.done:
-	case <-time.After(2 * time.Second):
+	if app.running.session != nil {
+		_ = app.running.session.Stop(2 * time.Second)
 	}
 
 	if app.running.termView != nil {
@@ -760,182 +746,6 @@ func splitPath(pathEnv string) []string {
 		}
 	}
 	return result
-}
-
-func ipToUint32(ip net.IP) uint32 {
-	ip = ip.To4()
-	if ip == nil {
-		return 0
-	}
-	return uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3])
-}
-
-func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, enableNetwork bool, exec bool) *ir.Program {
-	errLabel := ir.Label("__cc_error")
-	errVar := ir.Var("__cc_errno")
-	pivotResult := ir.Var("__cc_pivot_result")
-
-	workDir := containerWorkDir(img)
-
-	main := ir.Method{
-		initx.LogKmsg("cc: running container init program\n"),
-
-		// Create mount points
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt", ir.Int64(0o755)),
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/proc", ir.Int64(0o755)),
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/sys", ir.Int64(0o755)),
-
-		// Mount virtiofs
-		ir.Assign(errVar, ir.Syscall(
-			defs.SYS_MOUNT,
-			"rootfs",
-			"/mnt",
-			"virtiofs",
-			ir.Int64(0),
-			"",
-		)),
-		ir.If(ir.IsNegative(errVar), ir.Block{
-			ir.Printf("cc: failed to mount virtiofs: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-			ir.Goto(errLabel),
-		}),
-
-		// Create necessary directories in container
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt/proc", ir.Int64(0o755)),
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt/sys", ir.Int64(0o755)),
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt/dev", ir.Int64(0o755)),
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt/tmp", ir.Int64(0o1777)),
-
-		// Mount proc
-		ir.Syscall(defs.SYS_MOUNT, "proc", "/mnt/proc", "proc", ir.Int64(0), ""),
-
-		// Mount sysfs
-		ir.Syscall(defs.SYS_MOUNT, "sysfs", "/mnt/sys", "sysfs", ir.Int64(0), ""),
-
-		// Mount devtmpfs
-		ir.Syscall(defs.SYS_MOUNT, "devtmpfs", "/mnt/dev", "devtmpfs", ir.Int64(0), ""),
-
-		// Mount /dev/shm
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt/dev/shm", ir.Int64(0o1777)),
-		ir.Syscall(defs.SYS_MOUNT, "tmpfs", "/mnt/dev/shm", "tmpfs", ir.Int64(0), "mode=1777"),
-
-		initx.LogKmsg("cc: mounted filesystems\n"),
-
-		// Change root to container using pivot_root
-		ir.Assign(errVar, ir.Syscall(defs.SYS_CHDIR, "/mnt")),
-		ir.If(ir.IsNegative(errVar), ir.Block{
-			ir.Printf("cc: failed to chdir to /mnt: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-			ir.Goto(errLabel),
-		}),
-
-		// pivot_root
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "oldroot", ir.Int64(0o755)),
-		ir.Assign(pivotResult, ir.Syscall(defs.SYS_PIVOT_ROOT, ".", "oldroot")),
-		ir.Assign(errVar, pivotResult),
-		ir.If(ir.IsNegative(pivotResult), ir.Block{
-			// Fall back to chroot if pivot_root fails
-			ir.Assign(errVar, ir.Syscall(defs.SYS_CHROOT, ".")),
-			ir.If(ir.IsNegative(errVar), ir.Block{
-				ir.Printf("cc: failed to chroot: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-				ir.Goto(errLabel),
-			}),
-		}),
-		ir.If(ir.IsGreaterOrEqual(pivotResult, ir.Int64(0)), ir.Block{
-			ir.Assign(errVar, ir.Syscall(defs.SYS_CHDIR, "/")),
-			ir.If(ir.IsNegative(errVar), ir.Block{
-				ir.Printf("cc: failed to chdir to new root: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-				ir.Goto(errLabel),
-			}),
-			ir.Assign(errVar, ir.Syscall(defs.SYS_UMOUNT2, "/oldroot", ir.Int64(linux.MNT_DETACH))),
-			ir.If(ir.IsNegative(errVar), ir.Block{
-				ir.Printf("cc: failed to unmount oldroot: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-				ir.Goto(errLabel),
-			}),
-		}),
-
-		initx.LogKmsg("cc: changed root to container\n"),
-
-		// Always cleanup oldroot
-		ir.Assign(errVar, ir.Syscall(defs.SYS_UNLINKAT, ir.Int64(linux.AT_FDCWD), "/oldroot", ir.Int64(linux.AT_REMOVEDIR))),
-		ir.If(ir.IsNegative(errVar), ir.Block{
-			ir.Printf("cc: failed to remove oldroot: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-			ir.Goto(errLabel),
-		}),
-
-		// Change to working directory
-		ir.Syscall(defs.SYS_CHDIR, workDir),
-
-		// mkdir /dev/pts
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/dev/pts", ir.Int64(0o755)),
-
-		// Mount devpts
-		ir.Syscall(defs.SYS_MOUNT, "devpts", "/dev/pts", "devpts", ir.Int64(0), ""),
-
-		initx.LogKmsg("cc: mounted devpts\n"),
-
-		// Set hostname
-		initx.SetHostname("tinyrange", errLabel, errVar),
-
-		initx.LogKmsg("cc: set hostname to container name\n"),
-	}
-
-	// Configure network interface if networking is enabled
-	if enableNetwork {
-		ip := ipToUint32(net.ParseIP("10.42.0.2"))
-		gateway := ipToUint32(net.ParseIP("10.42.0.1"))
-		mask := ipToUint32(net.ParseIP("255.255.255.0"))
-		main = append(main,
-			initx.ConfigureInterface("eth0", ip, mask, errLabel, errVar),
-			initx.AddDefaultRoute("eth0", gateway, errLabel, errVar),
-			initx.SetResolvConf("10.42.0.1", errLabel, errVar),
-			initx.LogKmsg("cc: configured network interface\n"),
-		)
-	}
-
-	if exec {
-		main = append(main, ir.Block{
-			initx.LogKmsg(fmt.Sprintf("cc: executing command %s\n", cmd[0])),
-			initx.Exec(cmd[0], cmd[1:], img.Config.Env, errLabel, errVar),
-		})
-	} else {
-		main = append(main,
-			initx.ForkExecWait(cmd[0], cmd[1:], img.Config.Env, errLabel, errVar),
-		)
-	}
-
-	// Return child exit code to host
-	main = append(main,
-		ir.Return(errVar),
-
-		// Error handler
-		ir.DeclareLabel(errLabel, ir.Block{
-			ir.Printf("cc: fatal error during boot: errno=0x%x\n", errVar),
-			func() ir.Fragment {
-				switch arch {
-				case hv.ArchitectureX86_64:
-					return ir.Syscall(defs.SYS_REBOOT,
-						linux.LINUX_REBOOT_MAGIC1,
-						linux.LINUX_REBOOT_MAGIC2,
-						linux.LINUX_REBOOT_CMD_RESTART,
-						ir.Int64(0),
-					)
-				case hv.ArchitectureARM64:
-					return ir.Syscall(defs.SYS_REBOOT,
-						linux.LINUX_REBOOT_MAGIC1,
-						linux.LINUX_REBOOT_MAGIC2,
-						linux.LINUX_REBOOT_CMD_POWER_OFF,
-						ir.Int64(0),
-					)
-				default:
-					panic(fmt.Sprintf("unsupported architecture for reboot: %s", arch))
-				}
-			}(),
-		}),
-	)
-
-	return &ir.Program{
-		Methods:    map[string]ir.Method{"main": main},
-		Entrypoint: "main",
-	}
 }
 
 func main() {

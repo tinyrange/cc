@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -26,9 +25,6 @@ import (
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/factory"
 	"github.com/tinyrange/cc/internal/initx"
-	"github.com/tinyrange/cc/internal/ir"
-	"github.com/tinyrange/cc/internal/linux/defs"
-	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 	"github.com/tinyrange/cc/internal/linux/kernel"
 	"github.com/tinyrange/cc/internal/netstack"
 	"github.com/tinyrange/cc/internal/oci"
@@ -473,265 +469,19 @@ func run() error {
 	defer vm.Close()
 
 	// Build and run the container init program
-	prog := buildContainerInit(hvArch, img, execCmd, networkFlag.v, execFlag.v)
-
-	slog.Debug("Booting VM")
-
-	// Boot the VM first to set up devices
-	if err := func() error {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		vm.VirtualCPUCall(0, func(vcpu hv.VirtualCPU) error {
-			debug, ok := vcpu.(hv.VirtualCPUDebug)
-			if !ok {
-				return nil
-			}
-			return debug.EnableTrace(64)
-		})
-
-		debug.Writef("cc.run booting VM", "booting VM")
-
-		if err := vm.Run(ctx, &ir.Program{
-			Entrypoint: "main",
-			Methods: map[string]ir.Method{
-				"main": {
-					ir.Return(ir.Int64(0)),
-				},
-			},
-		}); err != nil {
-			var exitErr *initx.ExitError
-			if errors.As(err, &exitErr) {
-				return exitErr
-			}
-			fmt.Fprintf(os.Stderr, "cc: VM boot failed: %v\n", err)
-			if err := vm.VirtualCPUCall(0, func(vcpu hv.VirtualCPU) error {
-				if vm.Architecture() == hv.ArchitectureX86_64 {
-					// figure out the current state
-					regs := map[hv.Register]hv.RegisterValue{
-						hv.RegisterAMD64Rax:    hv.Register64(0),
-						hv.RegisterAMD64Rbx:    hv.Register64(0),
-						hv.RegisterAMD64Rcx:    hv.Register64(0),
-						hv.RegisterAMD64Rdx:    hv.Register64(0),
-						hv.RegisterAMD64Rsi:    hv.Register64(0),
-						hv.RegisterAMD64Rdi:    hv.Register64(0),
-						hv.RegisterAMD64Rsp:    hv.Register64(0),
-						hv.RegisterAMD64Rbp:    hv.Register64(0),
-						hv.RegisterAMD64Rip:    hv.Register64(0),
-						hv.RegisterAMD64Rflags: hv.Register64(0),
-					}
-
-					if err := vcpu.GetRegisters(regs); err != nil {
-						return fmt.Errorf("get registers: %w", err)
-					}
-
-					fmt.Fprintf(os.Stderr, "cc: VM boot failed, vCPU state:\n"+
-						"  RAX:    0x%016x\n"+
-						"  RBX:    0x%016x\n"+
-						"  RCX:    0x%016x\n"+
-						"  RDX:    0x%016x\n"+
-						"  RSI:    0x%016x\n"+
-						"  RDI:    0x%016x\n"+
-						"  RSP:    0x%016x\n"+
-						"  RBP:    0x%016x\n"+
-						"  RIP:    0x%016x\n"+
-						"  RFLAGS: 0x%016x\n",
-						regs[hv.RegisterAMD64Rax],
-						regs[hv.RegisterAMD64Rbx],
-						regs[hv.RegisterAMD64Rcx],
-						regs[hv.RegisterAMD64Rdx],
-						regs[hv.RegisterAMD64Rsi],
-						regs[hv.RegisterAMD64Rdi],
-						regs[hv.RegisterAMD64Rsp],
-						regs[hv.RegisterAMD64Rbp],
-						regs[hv.RegisterAMD64Rip],
-						regs[hv.RegisterAMD64Rflags],
-					)
-
-					pc, err := vm.DumpStackTrace(vcpu)
-					if err != nil {
-						return fmt.Errorf("dump stack trace: %w", err)
-					}
-
-					// Dump a hexdump of RIP to RIP+128 bytes
-					mem := make([]byte, 128)
-					if _, err := vcpu.VirtualMachine().ReadAt(mem, pc); err != nil {
-						return fmt.Errorf("read memory at RIP: %w", err)
-					}
-					func(mem []byte) {
-						const bytesPerLine = 16
-						for i := 0; i < len(mem); i += bytesPerLine {
-							lineEnd := min(i+bytesPerLine, len(mem))
-							line := mem[i:lineEnd]
-							fmt.Fprintf(os.Stderr, "  %016x: ", uint64(pc)+uint64(i))
-							for j := range bytesPerLine {
-								if j < len(line) {
-									fmt.Fprintf(os.Stderr, "%02x ", line[j])
-								} else {
-									fmt.Fprintf(os.Stderr, "   ")
-								}
-							}
-							fmt.Fprintf(os.Stderr, " ")
-							for _, b := range line {
-								if b >= 32 && b <= 126 {
-									fmt.Fprintf(os.Stderr, "%c", b)
-								} else {
-									fmt.Fprintf(os.Stderr, ".")
-								}
-							}
-							fmt.Fprintf(os.Stderr, "\n")
-						}
-					}(mem)
-				} else if vm.Architecture() == hv.ArchitectureARM64 {
-					// figure out the current state
-					regs := map[hv.Register]hv.RegisterValue{
-						hv.RegisterARM64X0:     hv.Register64(0),
-						hv.RegisterARM64X1:     hv.Register64(0),
-						hv.RegisterARM64X2:     hv.Register64(0),
-						hv.RegisterARM64X3:     hv.Register64(0),
-						hv.RegisterARM64X4:     hv.Register64(0),
-						hv.RegisterARM64X5:     hv.Register64(0),
-						hv.RegisterARM64X6:     hv.Register64(0),
-						hv.RegisterARM64X7:     hv.Register64(0),
-						hv.RegisterARM64X8:     hv.Register64(0),
-						hv.RegisterARM64X9:     hv.Register64(0),
-						hv.RegisterARM64X10:    hv.Register64(0),
-						hv.RegisterARM64X11:    hv.Register64(0),
-						hv.RegisterARM64X12:    hv.Register64(0),
-						hv.RegisterARM64X13:    hv.Register64(0),
-						hv.RegisterARM64X14:    hv.Register64(0),
-						hv.RegisterARM64X15:    hv.Register64(0),
-						hv.RegisterARM64X16:    hv.Register64(0),
-						hv.RegisterARM64X17:    hv.Register64(0),
-						hv.RegisterARM64X18:    hv.Register64(0),
-						hv.RegisterARM64X19:    hv.Register64(0),
-						hv.RegisterARM64X20:    hv.Register64(0),
-						hv.RegisterARM64X21:    hv.Register64(0),
-						hv.RegisterARM64X22:    hv.Register64(0),
-						hv.RegisterARM64X23:    hv.Register64(0),
-						hv.RegisterARM64X24:    hv.Register64(0),
-						hv.RegisterARM64X25:    hv.Register64(0),
-						hv.RegisterARM64X26:    hv.Register64(0),
-						hv.RegisterARM64X27:    hv.Register64(0),
-						hv.RegisterARM64X28:    hv.Register64(0),
-						hv.RegisterARM64X29:    hv.Register64(0),
-						hv.RegisterARM64X30:    hv.Register64(0),
-						hv.RegisterARM64Sp:     hv.Register64(0),
-						hv.RegisterARM64Pc:     hv.Register64(0),
-						hv.RegisterARM64Pstate: hv.Register64(0),
-						hv.RegisterARM64Vbar:   hv.Register64(0),
-					}
-
-					if err := vcpu.GetRegisters(regs); err != nil {
-						return fmt.Errorf("get registers: %w", err)
-					}
-
-					fmt.Fprintf(os.Stderr, "cc: VM boot failed, vCPU state:\n"+
-						"  X0:    0x%016x\n"+
-						"  X1:    0x%016x\n"+
-						"  X2:    0x%016x\n"+
-						"  X3:    0x%016x\n"+
-						"  X4:    0x%016x\n"+
-						"  X5:    0x%016x\n"+
-						"  X6:    0x%016x\n"+
-						"  X7:    0x%016x\n"+
-						"  X8:    0x%016x\n"+
-						"  X9:    0x%016x\n"+
-						"  X10:    0x%016x\n"+
-						"  X11:    0x%016x\n"+
-						"  X12:    0x%016x\n"+
-						"  X13:    0x%016x\n"+
-						"  X14:    0x%016x\n"+
-						"  X15:    0x%016x\n"+
-						"  X16:    0x%016x\n"+
-						"  X17:    0x%016x\n"+
-						"  X18:    0x%016x\n"+
-						"  X19:    0x%016x\n"+
-						"  X20:    0x%016x\n"+
-						"  X21:    0x%016x\n"+
-						"  X22:    0x%016x\n"+
-						"  X23:    0x%016x\n"+
-						"  X24:    0x%016x\n"+
-						"  X25:    0x%016x\n"+
-						"  X26:    0x%016x\n"+
-						"  X27:    0x%016x\n"+
-						"  X28:    0x%016x\n"+
-						"  X29:    0x%016x\n"+
-						"  X30:    0x%016x\n"+
-						"  SP:    0x%016x\n"+
-						"  PC:    0x%016x\n"+
-						"  PSTATE:    0x%016x\n"+
-						"  VBAR:    0x%016x\n",
-						regs[hv.RegisterARM64X0],
-						regs[hv.RegisterARM64X1],
-						regs[hv.RegisterARM64X2],
-						regs[hv.RegisterARM64X3],
-						regs[hv.RegisterARM64X4],
-						regs[hv.RegisterARM64X5],
-						regs[hv.RegisterARM64X6],
-						regs[hv.RegisterARM64X7],
-						regs[hv.RegisterARM64X8],
-						regs[hv.RegisterARM64X9],
-						regs[hv.RegisterARM64X10],
-						regs[hv.RegisterARM64X11],
-						regs[hv.RegisterARM64X12],
-						regs[hv.RegisterARM64X13],
-						regs[hv.RegisterARM64X14],
-						regs[hv.RegisterARM64X15],
-						regs[hv.RegisterARM64X16],
-						regs[hv.RegisterARM64X17],
-						regs[hv.RegisterARM64X18],
-						regs[hv.RegisterARM64X19],
-						regs[hv.RegisterARM64X20],
-						regs[hv.RegisterARM64X21],
-						regs[hv.RegisterARM64X22],
-						regs[hv.RegisterARM64X23],
-						regs[hv.RegisterARM64X24],
-						regs[hv.RegisterARM64X25],
-						regs[hv.RegisterARM64X26],
-						regs[hv.RegisterARM64X27],
-						regs[hv.RegisterARM64X28],
-						regs[hv.RegisterARM64X29],
-						regs[hv.RegisterARM64X30],
-						regs[hv.RegisterARM64Sp],
-						regs[hv.RegisterARM64Pc],
-						regs[hv.RegisterARM64Pstate],
-						regs[hv.RegisterARM64Vbar],
-					)
-				}
-
-				// Get the trace buffer
-				if debug, ok := vcpu.(hv.VirtualCPUDebug); ok {
-					trace, err := debug.GetTraceBuffer()
-					if err != nil {
-						return fmt.Errorf("get trace buffer: %w", err)
-					}
-
-					fmt.Fprintf(os.Stderr, "\ntrace buffer:\n")
-
-					for _, entry := range trace {
-						fmt.Fprintf(os.Stderr, "  %s\n", entry)
-					}
-				}
-
-				return nil
-			}); err != nil {
-				return fmt.Errorf("post-boot vCPU call: %w", err)
-			}
-
-			return fmt.Errorf("boot VM: %w", err)
-		}
-
-		debug.Writef("cc.run VM booted successfully", "VM booted successfully")
-
-		return nil
-	}(); err != nil {
+	prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
+		Arch:          hvArch,
+		Cmd:           execCmd,
+		Env:           img.Config.Env,
+		WorkDir:       workDir,
+		EnableNetwork: networkFlag.v,
+		Exec:          execFlag.v,
+	})
+	if err != nil {
 		return err
 	}
 
-	// Start stdin forwarding now that VM is booted and user command is about to run.
-	// This ensures stdin data goes to the user command, not the init process.
-	vm.StartStdinForwarding()
+	slog.Debug("Booting VM")
 
 	var ctx context.Context
 	if *timeout > 0 {
@@ -747,7 +497,12 @@ func run() error {
 
 	debug.Writef("cc.run running command", "running command %v", execCmd)
 
-	// If GPU is enabled, set up the display manager and run VM in background
+	// Start the VM session now that we have the final execution context.
+	// This handles boot → stdin forwarding → payload run.
+	session := initx.StartSession(ctx, vm, prog, initx.SessionConfig{})
+
+	// If GPU is enabled, set up the display manager and drive the window loop
+	// on the main thread while the VM runs in the background.
 	if *gpu && vm.GPU() != nil {
 		// Get display scale factor and calculate physical window dimensions
 		scale := window.GetDisplayScale()
@@ -765,12 +520,6 @@ func run() error {
 			displayMgr := virtio.NewDisplayManager(vm.GPU(), vm.Keyboard(), vm.Tablet())
 			displayMgr.SetWindow(win)
 
-			// Run VM in a goroutine
-			vmDone := make(chan error, 1)
-			go func() {
-				vmDone <- vm.Run(ctx, prog)
-			}()
-
 			// Run display loop on main thread
 			ticker := time.NewTicker(16 * time.Millisecond) // ~60 FPS
 			defer ticker.Stop()
@@ -778,7 +527,7 @@ func run() error {
 		displayLoop:
 			for {
 				select {
-				case err := <-vmDone:
+				case err := <-session.Done:
 					if err != nil {
 						return fmt.Errorf("run executable in initx virtual machine: %w", err)
 					}
@@ -804,20 +553,12 @@ func run() error {
 		// If terminal window is enabled, run VM in background and drive the window loop
 		// on the main thread.
 
-		termCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
-
-		vmDone := make(chan error, 1)
-		go func() {
-			vmDone <- vm.Run(termCtx, prog)
-		}()
-
 		var lastResize struct {
 			cols int
 			rows int
 		}
 
-		err := termWindow.Run(termCtx, termwin.Hooks{
+		err := termWindow.Run(ctx, termwin.Hooks{
 			OnResize: func(cols, rows int) {
 				if cols == lastResize.cols && rows == lastResize.rows {
 					return
@@ -827,7 +568,7 @@ func run() error {
 			},
 			OnFrame: func() error {
 				select {
-				case err := <-vmDone:
+				case err := <-session.Done:
 					if err != nil {
 						var exitErr *initx.ExitError
 						if errors.As(err, &exitErr) {
@@ -844,11 +585,7 @@ func run() error {
 		if err != nil {
 			if errors.Is(err, termwin.ErrWindowClosed) {
 				// Best-effort: stop the VM when the user closes the window.
-				cancel()
-				select {
-				case <-vmDone:
-				case <-time.After(2 * time.Second):
-				}
+				_ = session.Stop(2 * time.Second)
 				return fmt.Errorf("window closed by user")
 			}
 			if errors.Is(err, io.EOF) {
@@ -881,7 +618,7 @@ func run() error {
 			defer term.Restore(int(os.Stdin.Fd()), oldState)
 		}
 
-		if err := vm.Run(ctx, prog); err != nil {
+		if err := session.Wait(); err != nil {
 			var exitErr *initx.ExitError
 			if errors.As(err, &exitErr) {
 				return exitErr
@@ -986,237 +723,4 @@ func lookPath(fs *oci.ContainerFS, pathEnv string, workDir string, file string) 
 	}
 
 	return "", fmt.Errorf("executable %q not found in PATH", file)
-}
-
-func ipToUint32(addr string) uint32 {
-	ip := net.ParseIP(addr)
-	if ip == nil {
-		return 0
-	}
-	return binary.BigEndian.Uint32(ip.To4())
-}
-
-func buildContainerInit(arch hv.CpuArchitecture, img *oci.Image, cmd []string, enableNetwork bool, exec bool) *ir.Program {
-	errLabel := ir.Label("__cc_error")
-	errVar := ir.Var("__cc_errno")
-	pivotResult := ir.Var("__cc_pivot_result")
-
-	workDir := containerWorkDir(img)
-
-	main := ir.Method{
-		initx.LogKmsg("cc: running container init program\n"),
-
-		// Create mount points
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt", ir.Int64(0o755)),
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/proc", ir.Int64(0o755)),
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/sys", ir.Int64(0o755)),
-
-		// Mount virtiofs
-		ir.Assign(errVar, ir.Syscall(
-			defs.SYS_MOUNT,
-			"rootfs",
-			"/mnt",
-			"virtiofs",
-			ir.Int64(0),
-			"",
-		)),
-		ir.If(ir.IsNegative(errVar), ir.Block{
-			ir.Printf("cc: failed to mount virtiofs: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-			ir.Goto(errLabel),
-		}),
-
-		// Create necessary directories in container
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt/proc", ir.Int64(0o755)),
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt/sys", ir.Int64(0o755)),
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt/dev", ir.Int64(0o755)),
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt/tmp", ir.Int64(0o1777)),
-
-		// Mount proc
-		ir.Syscall(
-			defs.SYS_MOUNT,
-			"proc",
-			"/mnt/proc",
-			"proc",
-			ir.Int64(0),
-			"",
-		),
-
-		// Mount sysfs
-		ir.Syscall(
-			defs.SYS_MOUNT,
-			"sysfs",
-			"/mnt/sys",
-			"sysfs",
-			ir.Int64(0),
-			"",
-		),
-
-		// Mount devtmpfs
-		ir.Syscall(
-			defs.SYS_MOUNT,
-			"devtmpfs",
-			"/mnt/dev",
-			"devtmpfs",
-			ir.Int64(0),
-			"",
-		),
-
-		// Mount /dev/shm (wlroots/xkbcommon use it for shm-backed buffers like keymaps).
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt/dev/shm", ir.Int64(0o1777)),
-		ir.Syscall(
-			defs.SYS_MOUNT,
-			"tmpfs",
-			"/mnt/dev/shm",
-			"tmpfs",
-			ir.Int64(0),
-			"mode=1777",
-		),
-
-		initx.LogKmsg("cc: mounted filesystems\n"),
-
-		// Change root to container using pivot_root
-		ir.Assign(errVar, ir.Syscall(defs.SYS_CHDIR, "/mnt")),
-		ir.If(ir.IsNegative(errVar), ir.Block{
-			ir.Printf("cc: failed to chdir to /mnt: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-			ir.Goto(errLabel),
-		}),
-
-		// pivot_root
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "oldroot", ir.Int64(0o755)),
-		ir.Assign(pivotResult, ir.Syscall(defs.SYS_PIVOT_ROOT, ".", "oldroot")),
-		ir.Assign(errVar, pivotResult),
-		ir.If(ir.IsNegative(pivotResult), ir.Block{
-			// Fall back to chroot if pivot_root fails
-			ir.Assign(errVar, ir.Syscall(defs.SYS_CHROOT, ".")),
-			ir.If(ir.IsNegative(errVar), ir.Block{
-				ir.Printf("cc: failed to chroot: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-				ir.Goto(errLabel),
-			}),
-		}),
-		ir.If(ir.IsGreaterOrEqual(pivotResult, ir.Int64(0)), ir.Block{
-			ir.Assign(errVar, ir.Syscall(defs.SYS_CHDIR, "/")),
-			ir.If(ir.IsNegative(errVar), ir.Block{
-				ir.Printf("cc: failed to chdir to new root: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-				ir.Goto(errLabel),
-			}),
-			ir.Assign(errVar, ir.Syscall(defs.SYS_UMOUNT2, "/oldroot", ir.Int64(linux.MNT_DETACH))),
-			ir.If(ir.IsNegative(errVar), ir.Block{
-				ir.Printf("cc: failed to unmount oldroot: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-				ir.Goto(errLabel),
-			}),
-		}),
-
-		initx.LogKmsg("cc: changed root to container\n"),
-
-		// Always cleanup oldroot
-		ir.Assign(errVar, ir.Syscall(defs.SYS_UNLINKAT, ir.Int64(linux.AT_FDCWD), "/oldroot", ir.Int64(linux.AT_REMOVEDIR))),
-		ir.If(ir.IsNegative(errVar), ir.Block{
-			ir.Printf("cc: failed to remove oldroot: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-			ir.Goto(errLabel),
-		}),
-
-		// Change to working directory
-		ir.Syscall(defs.SYS_CHDIR, workDir),
-
-		// mkdir /dev/pts
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/dev/pts", ir.Int64(0o755)),
-		ir.If(ir.IsNegative(errVar), ir.Block{
-			ir.Printf("cc: failed to create /dev/pts: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-			ir.Goto(errLabel),
-		}),
-
-		// Mount devpts
-		ir.Syscall(
-			defs.SYS_MOUNT,
-			"devpts",
-			"/dev/pts",
-			"devpts",
-			ir.Int64(0),
-			"",
-		),
-		ir.If(ir.IsNegative(errVar), ir.Block{
-			ir.Printf("cc: failed to mount devpts: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-			ir.Goto(errLabel),
-		}),
-
-		initx.LogKmsg("cc: mounted devpts\n"),
-
-		// Set hostname to container name
-		initx.SetHostname("tinyrange", errLabel, errVar),
-
-		initx.LogKmsg("cc: set hostname to container name\n"),
-	}
-
-	// Configure network interface if networking is enabled
-	if enableNetwork {
-		// Configure eth0 with IP 10.42.0.2/24
-		// IP: 10.42.0.2
-		ip := ipToUint32("10.42.0.2")
-		// Gateway: 10.42.0.1
-		gatewayIp := "10.42.0.1"
-		gateway := ipToUint32(gatewayIp)
-		// Mask: 255.255.255.0
-		mask := ipToUint32("255.255.255.0")
-		main = append(main,
-			initx.ConfigureInterface("eth0", ip, mask, errLabel, errVar),
-
-			// Add default route via gateway on eth0
-			initx.AddDefaultRoute("eth0", gateway, errLabel, errVar),
-
-			// Set /etc/resolv.conf to use DNS server
-			initx.SetResolvConf(gatewayIp, errLabel, errVar),
-
-			initx.LogKmsg("cc: configured network interface\n"),
-		)
-	}
-
-	if exec {
-		main = append(main, ir.Block{
-			initx.LogKmsg(fmt.Sprintf("cc: executing command %s\n", cmd[0])),
-			initx.Exec(cmd[0], cmd[1:], img.Config.Env, errLabel, errVar),
-		})
-	} else {
-		main = append(main,
-			initx.ForkExecWait(cmd[0], cmd[1:], img.Config.Env, errLabel, errVar),
-		)
-	}
-
-	// Fork and exec using initx helper
-	main = append(main,
-		// Return child exit code to host
-		ir.Return(errVar),
-
-		// Error handler
-		ir.DeclareLabel(errLabel, ir.Block{
-			ir.Printf(
-				"cc: fatal error during boot: errno=0x%x\n",
-				errVar,
-			),
-			func() ir.Fragment {
-				switch arch {
-				case hv.ArchitectureX86_64:
-					return ir.Syscall(defs.SYS_REBOOT,
-						linux.LINUX_REBOOT_MAGIC1,
-						linux.LINUX_REBOOT_MAGIC2,
-						linux.LINUX_REBOOT_CMD_RESTART,
-						ir.Int64(0),
-					)
-				case hv.ArchitectureARM64:
-					return ir.Syscall(defs.SYS_REBOOT,
-						linux.LINUX_REBOOT_MAGIC1,
-						linux.LINUX_REBOOT_MAGIC2,
-						linux.LINUX_REBOOT_CMD_POWER_OFF,
-						ir.Int64(0),
-					)
-				default:
-					panic(fmt.Sprintf("unsupported architecture for reboot: %s", arch))
-				}
-			}(),
-		}),
-	)
-
-	return &ir.Program{
-		Methods:    map[string]ir.Method{"main": main},
-		Entrypoint: "main",
-	}
 }
