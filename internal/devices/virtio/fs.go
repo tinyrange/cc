@@ -325,6 +325,23 @@ type FsBackend interface {
 	StatFS(nodeID uint64) (blocks, bfree, bavail, files, ffree, bsize, frsize, namelen uint64, errno int32)
 }
 
+// Optional directory-handle interfaces.
+//
+// These provide a place to implement fully correct getdents64 / d_off semantics:
+// - Stable offsets (cookies) across pagination.
+// - Deterministic inode/name pairs within a directory stream.
+// - No "empty page == EOF" behavior when the kernel asks for a small buffer.
+//
+// If not implemented, the device falls back to FsBackend.ReadDir(nodeID, off, size).
+type fsOpenDirBackend interface {
+	OpenDir(nodeID uint64, flags uint32) (fh uint64, errno int32)
+	ReleaseDir(nodeID uint64, fh uint64)
+}
+
+type fsReadDirHandleBackend interface {
+	ReadDirHandle(nodeID uint64, fh uint64, off uint64, maxBytes uint32) ([]byte, int32)
+}
+
 type fsCreateBackend interface {
 	Create(parent uint64, name string, mode uint32, flags uint32, umask uint32, uid uint32, gid uint32) (nodeID uint64, fh uint64, attr FuseAttr, errno int32)
 }
@@ -983,6 +1000,26 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
 		}
 
+	case FUSE_OPENDIR:
+		debug.Writef("virtio-fs.dispatchFUSE op=OPENDIR", "node=%d", in.NodeID)
+		if len(req) < fuseHdrInSize+8 {
+			return 0, fmt.Errorf("FUSE_OPENDIR too short")
+		}
+		flags := binary.LittleEndian.Uint32(req[40:44])
+		debug.Writef("virtio-fs.dispatchFUSE op=OPENDIR", "flags=0x%x", flags)
+		if be, ok := v.backend.(fsOpenDirBackend); ok {
+			fh, e := be.OpenDir(in.NodeID, flags)
+			errno = e
+			if errno == 0 {
+				// fuse_open_out (same layout as OPEN).
+				extra := make([]byte, 16)
+				binary.LittleEndian.PutUint64(extra[0:8], fh)
+				return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
 	case FUSE_RELEASE:
 		debug.Writef("virtio-fs.dispatchFUSE op=RELEASE", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+24 {
@@ -992,6 +1029,19 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		debug.Writef("virtio-fs.dispatchFUSE op=RELEASE", "fh=%d", fh)
 		v.backend.Release(in.NodeID, fh)
 		return w(fuseOutHeader{Len: fuseHdrOutSize, Error: 0, Unique: in.Unique}, nil), nil
+
+	case FUSE_RELEASEDIR:
+		debug.Writef("virtio-fs.dispatchFUSE op=RELEASEDIR", "node=%d", in.NodeID)
+		if len(req) < fuseHdrInSize+24 {
+			return 0, fmt.Errorf("FUSE_RELEASEDIR too short")
+		}
+		fh := binary.LittleEndian.Uint64(req[40:48])
+		debug.Writef("virtio-fs.dispatchFUSE op=RELEASEDIR", "fh=%d", fh)
+		if be, ok := v.backend.(fsOpenDirBackend); ok {
+			be.ReleaseDir(in.NodeID, fh)
+			return w(fuseOutHeader{Len: fuseHdrOutSize, Error: 0, Unique: in.Unique}, nil), nil
+		}
+		errno = -int32(linux.ENOSYS)
 
 	case FUSE_READ:
 		debug.Writef("virtio-fs.dispatchFUSE op=READ", "node=%d", in.NodeID)
@@ -1058,11 +1108,16 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			return 0, fmt.Errorf("FUSE_READDIR too short")
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
-		_ = fh // we don’t maintain dir handles in emptyBackend
 		off := binary.LittleEndian.Uint64(req[48:56])
 		size := binary.LittleEndian.Uint32(req[56:60])
-		debug.Writef("virtio-fs.dispatchFUSE op=READDIR", "off=%d size=%d", off, size)
-		payload, e := v.backend.ReadDir(in.NodeID, off, size)
+		debug.Writef("virtio-fs.dispatchFUSE op=READDIR", "fh=%d off=%d size=%d", fh, off, size)
+		var payload []byte
+		var e int32
+		if be, ok := v.backend.(fsReadDirHandleBackend); ok && fh != 0 {
+			payload, e = be.ReadDirHandle(in.NodeID, fh, off, size)
+		} else {
+			payload, e = v.backend.ReadDir(in.NodeID, off, size)
+		}
 		errno = e
 		if errno == 0 {
 			outLen := fuseHdrOutSize + uint32(len(payload))

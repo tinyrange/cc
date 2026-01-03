@@ -78,11 +78,12 @@ type AbstractOwner interface {
 }
 
 type virtioFsBackend struct {
-	mu      sync.Mutex
-	nodes   map[uint64]*fsNode
-	handles map[uint64]uint64
-	nextID  uint64
-	nextFH  uint64
+	mu         sync.Mutex
+	nodes      map[uint64]*fsNode
+	handles    map[uint64]uint64
+	dirHandles map[uint64]*dirHandle
+	nextID     uint64
+	nextFH     uint64
 }
 
 const (
@@ -253,8 +254,20 @@ func (v *virtioFsBackend) ensureRoot() {
 	root := newDirNode(virtioFsRootNodeID, "", 0, 0o755)
 	v.nodes[root.id] = root
 	v.handles = make(map[uint64]uint64)
+	v.dirHandles = make(map[uint64]*dirHandle)
 	v.nextID = virtioFsRootNodeID + 1
 	v.nextFH = 1
+}
+
+type dirHandle struct {
+	nodeID uint64
+	ents   []dirHandleEnt // stable snapshot for the lifetime of the handle
+}
+
+type dirHandleEnt struct {
+	name string
+	ino  uint64
+	typ  uint32
 }
 
 func (v *virtioFsBackend) node(id uint64) (*fsNode, int32) {
@@ -679,6 +692,141 @@ func (v *virtioFsBackend) ReadDir(nodeID uint64, off uint64, maxBytes uint32) ([
 		buf = append(buf, dirent...)
 	}
 
+	return buf, 0
+}
+
+// OpenDir implements virtio's optional directory-handle backend.
+// It captures a stable snapshot of directory entry names (and ensures inode/name mapping
+// for abstract directories is deterministic regardless of pagination boundaries).
+func (v *virtioFsBackend) OpenDir(nodeID uint64, _ uint32) (fh uint64, errno int32) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	v.ensureRoot()
+	dirNode, err := v.node(nodeID)
+	if err != 0 {
+		return 0, err
+	}
+	if !dirNode.isDir() {
+		return 0, -int32(linux.ENOTDIR)
+	}
+
+	// Build deterministic name set excluding "." and "..".
+	nameSet := make(map[string]struct{})
+	for name := range dirNode.entries {
+		if name == "." || name == ".." {
+			continue
+		}
+		nameSet[name] = struct{}{}
+	}
+	var abstractEntries []AbstractDirEntry
+	if dirNode.abstractDir != nil {
+		if ents, e := dirNode.abstractDir.ReadDir(); e == nil {
+			abstractEntries = ents
+			for _, ent := range ents {
+				if ent.Name == "." || ent.Name == ".." {
+					continue
+				}
+				nameSet[ent.Name] = struct{}{}
+			}
+		}
+	}
+
+	rest := make([]string, 0, len(nameSet))
+	for name := range nameSet {
+		rest = append(rest, name)
+	}
+	sort.Strings(rest)
+
+	// For abstract directories, pre-create nodes in sorted order so inode assignment
+	// is deterministic and does not depend on READDIR pagination.
+	if dirNode.abstractDir != nil {
+		for _, name := range rest {
+			if _, ok := dirNode.entries[name]; ok {
+				continue
+			}
+			// If we already have a list from ReadDir(), prefer that to avoid repeated lookups
+			// when possible, but we still need the AbstractEntry to create the node.
+			_ = abstractEntries
+			if entry, lookupErr := dirNode.abstractDir.Lookup(name); lookupErr == nil {
+				_, _ = v.createAbstractNode(dirNode, name, entry)
+			}
+		}
+	}
+
+	// Build a stable snapshot of (name, ino, type). We do this once so getdents64
+	// d_ino values remain consistent even if the directory is modified mid-iteration.
+	ents := make([]dirHandleEnt, 0, len(rest)+2)
+	ents = append(ents, dirHandleEnt{name: ".", ino: dirNode.id, typ: uint32(linux.DT_DIR)})
+	parentIno := dirNode.id
+	if dirNode.parent != 0 {
+		parentIno = dirNode.parent
+	}
+	ents = append(ents, dirHandleEnt{name: "..", ino: parentIno, typ: uint32(linux.DT_DIR)})
+	for _, name := range rest {
+		id, ok := dirNode.entries[name]
+		if !ok {
+			// Directory changed between ReadDir() and now. Skip entries we can't resolve.
+			continue
+		}
+		child := v.nodes[id]
+		typ := uint32(linux.DT_REG)
+		if child != nil {
+			switch {
+			case child.isDir():
+				typ = uint32(linux.DT_DIR)
+			case child.isSymlink():
+				typ = uint32(linux.DT_LNK)
+			default:
+				typ = uint32(linux.DT_REG)
+			}
+		}
+		ents = append(ents, dirHandleEnt{name: name, ino: id, typ: typ})
+	}
+
+	fh = v.nextFH
+	v.nextFH++
+	v.dirHandles[fh] = &dirHandle{nodeID: nodeID, ents: ents}
+	return fh, 0
+}
+
+// ReleaseDir implements virtio's optional directory-handle backend.
+func (v *virtioFsBackend) ReleaseDir(_ uint64, fh uint64) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	delete(v.dirHandles, fh)
+}
+
+// ReadDirHandle implements virtio's optional directory-handle backend.
+func (v *virtioFsBackend) ReadDirHandle(nodeID uint64, fh uint64, off uint64, maxBytes uint32) ([]byte, int32) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	v.ensureRoot()
+	h, ok := v.dirHandles[fh]
+	if !ok || h.nodeID != nodeID {
+		return nil, -int32(linux.EBADF)
+	}
+
+	if off >= uint64(len(h.ents)) {
+		return []byte{}, 0
+	}
+
+	var buf []byte
+	for idx := int(off); idx < len(h.ents); idx++ {
+		ent := h.ents[idx]
+		// Cookie is the next entry index.
+		dirent := buildFuseDirent(ent.ino, ent.name, ent.typ, uint64(idx+1))
+		if maxBytes > 0 && len(buf)+len(dirent) > int(maxBytes) {
+			// If we can't fit even a single entry, do not return an empty buffer (which
+			// the kernel treats as EOF). Report an error instead.
+			if len(buf) == 0 {
+				return nil, -int32(linux.EINVAL)
+			}
+			break
+		}
+		buf = append(buf, dirent...)
+	}
 	return buf, 0
 }
 
