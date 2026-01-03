@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -806,6 +807,73 @@ func (n *fsNode) read(off uint64, size uint32) ([]byte, error) {
 	return buf, nil
 }
 
+// materializeAbstractFile copies an abstract-backed regular file into in-memory
+// blocks so subsequent write/truncate operations can succeed even when the
+// backing store is read-only or does not support mutation.
+//
+// NOTE: this does not try to preserve sparse extents; it materializes a dense
+// view of the file contents.
+func (n *fsNode) materializeAbstractFile() error {
+	if n.abstractFile == nil {
+		return nil
+	}
+	af := n.abstractFile
+	size, _ := af.Stat()
+
+	// Reset to an in-memory file representation.
+	n.abstractFile = nil
+	n.blocks = nil
+	n.size = size
+
+	if size == 0 {
+		return nil
+	}
+
+	const fileBlockSize = uint64(4096)
+	const chunkSize = uint32(128 * 1024)
+
+	n.blocks = make(map[uint64][]byte)
+
+	var off uint64
+	for off < size {
+		want := chunkSize
+		if remain := size - off; uint64(want) > remain {
+			want = uint32(remain)
+		}
+		b, err := af.ReadAt(off, want)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		if len(b) == 0 {
+			// Defensive: avoid an infinite loop if the backing returns empty reads.
+			break
+		}
+		// Copy into block map.
+		pos := off
+		i := 0
+		for i < len(b) {
+			bi := pos / fileBlockSize
+			inBlock := pos % fileBlockSize
+			nAvail := int(fileBlockSize - inBlock)
+			toCopy := len(b) - i
+			if toCopy > nAvail {
+				toCopy = nAvail
+			}
+			blk, ok := n.blocks[bi]
+			if !ok {
+				blk = make([]byte, fileBlockSize)
+				n.blocks[bi] = blk
+			}
+			start := int(inBlock)
+			copy(blk[start:start+toCopy], b[i:i+toCopy])
+			pos += uint64(toCopy)
+			i += toCopy
+		}
+		off += uint64(len(b))
+	}
+	return nil
+}
+
 func mergeExtents(extents []fsExtent) []fsExtent {
 	if len(extents) == 0 {
 		return extents
@@ -830,7 +898,11 @@ func mergeExtents(extents []fsExtent) []fsExtent {
 
 func (n *fsNode) write(off uint64, data []byte) error {
 	if n.abstractFile != nil {
-		return n.abstractFile.WriteAt(off, data)
+		// Copy-up on first write to avoid failing writes on read-only backings
+		// (e.g. container image layers).
+		if err := n.materializeAbstractFile(); err != nil {
+			return err
+		}
 	}
 	if len(data) == 0 {
 		return nil
@@ -882,7 +954,11 @@ func (n *fsNode) write(off uint64, data []byte) error {
 
 func (n *fsNode) truncate(size uint64) error {
 	if n.abstractFile != nil {
-		return n.abstractFile.Truncate(size)
+		// Copy-up on first truncate so open(O_TRUNC)/shell redirections work on
+		// abstract-backed files like /etc/hosts.
+		if err := n.materializeAbstractFile(); err != nil {
+			return err
+		}
 	}
 	const fileBlockSize = uint64(4096)
 	// Truncation clears setuid; it clears setgid only when the file is
