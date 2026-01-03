@@ -181,6 +181,14 @@ func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
 		// Set hostname.
 		SetHostname(cfg.Hostname, errLabel, errVar),
 		LogKmsg("cc: set hostname to container name\n"),
+
+		// Always configure loopback interface for localhost networking.
+		ConfigureLoopback(errLabel, errVar),
+		LogKmsg("cc: configured loopback interface\n"),
+
+		// Set up /etc/hosts for localhost resolution (optional, don't fail if it doesn't work).
+		SetHostsOptional(cfg.Hostname),
+		LogKmsg("cc: configured /etc/hosts\n"),
 	}
 
 	// Configure network interface if networking is enabled.
