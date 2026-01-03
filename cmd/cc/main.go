@@ -153,10 +153,14 @@ func run() error {
 	}
 	flag.Parse()
 
-	addVirtioFsTags := strings.Split(*addVirtioFs, ",")
-	for _, tag := range addVirtioFsTags {
-		if tag == "" {
-			return fmt.Errorf("empty virtio-fs tag")
+	var virtioFsTags []string
+
+	if *addVirtioFs != "" {
+		virtioFsTags = strings.Split(*addVirtioFs, ",")
+		for _, tag := range virtioFsTags {
+			if tag == "" {
+				return fmt.Errorf("empty virtio-fs tag")
+			}
 		}
 	}
 
@@ -401,7 +405,7 @@ func run() error {
 
 	base := uint64(0xd0006000)
 
-	for _, tag := range addVirtioFsTags {
+	for _, tag := range virtioFsTags {
 		opts = append(opts, initx.WithDeviceTemplate(virtio.FSTemplate{
 			Tag:      tag,
 			Backend:  vfs.NewVirtioFsBackendWithAbstract(),
