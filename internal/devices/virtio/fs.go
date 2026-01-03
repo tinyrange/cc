@@ -186,36 +186,37 @@ type fuseOutHeader struct {
 
 // FUSE opcodes (subset)
 const (
-	FUSE_LOOKUP     = 1
-	FUSE_FORGET     = 2
-	FUSE_GETATTR    = 3
-	FUSE_SETATTR    = 4
-	FUSE_READLINK   = 5
-	FUSE_SYMLINK    = 6
-	FUSE_MKNOD      = 8
-	FUSE_MKDIR      = 9
-	FUSE_UNLINK     = 10
-	FUSE_RMDIR      = 11
-	FUSE_RENAME     = 12
-	FUSE_LINK       = 13
-	FUSE_OPEN       = 14
-	FUSE_READ       = 15
-	FUSE_WRITE      = 16
-	FUSE_STATFS     = 17
-	FUSE_RELEASE    = 18
-	FUSE_FSYNC      = 20
-	FUSE_SETXATTR   = 21 // (not implemented)
-	FUSE_GETXATTR   = 22 // (not implemented)
-	FUSE_LISTXATTR  = 23 // (not implemented)
-	FUSE_FLUSH      = 25
-	FUSE_INIT       = 26
-	FUSE_OPENDIR    = 27
-	FUSE_READDIR    = 28
-	FUSE_RELEASEDIR = 29
-	FUSE_FSYNCDIR   = 30
-	FUSE_CREATE     = 35
-	FUSE_RENAME2    = 45
-	FUSE_LSEEK      = 46
+	FUSE_LOOKUP      = 1
+	FUSE_FORGET      = 2
+	FUSE_GETATTR     = 3
+	FUSE_SETATTR     = 4
+	FUSE_READLINK    = 5
+	FUSE_SYMLINK     = 6
+	FUSE_MKNOD       = 8
+	FUSE_MKDIR       = 9
+	FUSE_UNLINK      = 10
+	FUSE_RMDIR       = 11
+	FUSE_RENAME      = 12
+	FUSE_LINK        = 13
+	FUSE_OPEN        = 14
+	FUSE_READ        = 15
+	FUSE_WRITE       = 16
+	FUSE_STATFS      = 17
+	FUSE_RELEASE     = 18
+	FUSE_FSYNC       = 20
+	FUSE_SETXATTR    = 21
+	FUSE_GETXATTR    = 22
+	FUSE_LISTXATTR   = 23
+	FUSE_REMOVEXATTR = 24
+	FUSE_FLUSH       = 25
+	FUSE_INIT        = 26
+	FUSE_OPENDIR     = 27
+	FUSE_READDIR     = 28
+	FUSE_RELEASEDIR  = 29
+	FUSE_FSYNCDIR    = 30
+	FUSE_CREATE      = 35
+	FUSE_RENAME2     = 45
+	FUSE_LSEEK       = 46
 )
 
 // Minimal structs we need on the wire (host end)
@@ -361,6 +362,8 @@ type fsWriteBackend interface {
 type fsXattrBackend interface {
 	SetXattr(nodeID uint64, name string, value []byte, flags uint32) int32
 	GetXattr(nodeID uint64, name string) ([]byte, int32)
+	ListXattr(nodeID uint64) ([]byte, int32)
+	RemoveXattr(nodeID uint64, name string) int32
 }
 
 type fsSymlinkBackend interface {
@@ -1221,7 +1224,9 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 					return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
 				}
 				if uint32(len(value)) > size {
-					value = value[:size]
+					// Correct semantics: buffer too small -> ERANGE (do not truncate).
+					errno = -int32(linux.ERANGE)
+					break
 				}
 				outLen := fuseHdrOutSize + uint32(len(value))
 				if int(outLen) > len(resp) {
@@ -1230,6 +1235,53 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 				}
 				copy(resp[fuseHdrOutSize:], value)
 				return w(fuseOutHeader{Len: outLen, Error: 0, Unique: in.Unique}, nil), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_LISTXATTR:
+		debug.Writef("virtio-fs.dispatchFUSE op=LISTXATTR", "node=%d", in.NodeID)
+		if len(req) < fuseHdrInSize+8 {
+			return 0, fmt.Errorf("FUSE_LISTXATTR too short")
+		}
+		// fuse_getxattr_in: size (u32) + padding (u32)
+		size := binary.LittleEndian.Uint32(req[40:44])
+		debug.Writef("virtio-fs.dispatchFUSE op=LISTXATTR", "size=%d", size)
+		if be, ok := v.backend.(fsXattrBackend); ok {
+			list, e := be.ListXattr(in.NodeID)
+			errno = e
+			if errno == 0 {
+				if size == 0 {
+					extra := make([]byte, 8)
+					binary.LittleEndian.PutUint32(extra[0:4], uint32(len(list)))
+					return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
+				}
+				if uint32(len(list)) > size {
+					// Correct semantics: buffer too small -> ERANGE (do not truncate).
+					errno = -int32(linux.ERANGE)
+					break
+				}
+				outLen := fuseHdrOutSize + uint32(len(list))
+				if int(outLen) > len(resp) {
+					list = list[:len(resp)-fuseHdrOutSize]
+					outLen = uint32(len(resp))
+				}
+				copy(resp[fuseHdrOutSize:], list)
+				return w(fuseOutHeader{Len: outLen, Error: 0, Unique: in.Unique}, nil), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_REMOVEXATTR:
+		debug.Writef("virtio-fs.dispatchFUSE op=REMOVEXATTR", "node=%d", in.NodeID)
+		name := readName(req[fuseHdrInSize:])
+		debug.Writef("virtio-fs.dispatchFUSE op=REMOVEXATTR", "name=%q", name)
+		if be, ok := v.backend.(fsXattrBackend); ok {
+			errno = be.RemoveXattr(in.NodeID, name)
+			if errno == 0 {
+				return w(fuseOutHeader{Len: fuseHdrOutSize, Error: 0, Unique: in.Unique}, nil), nil
 			}
 		} else {
 			errno = -int32(linux.ENOSYS)
