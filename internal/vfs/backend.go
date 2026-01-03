@@ -260,14 +260,95 @@ func (v *virtioFsBackend) ensureRoot() {
 }
 
 type dirHandle struct {
-	nodeID uint64
-	ents   []dirHandleEnt // stable snapshot for the lifetime of the handle
+	nodeID  uint64
+	ents    []dirHandleEnt // stable snapshot for the lifetime of the handle
+	started bool
 }
 
 type dirHandleEnt struct {
 	name string
 	ino  uint64
 	typ  uint32
+}
+
+// snapshotDirEnts builds a deterministic snapshot of directory entries and
+// materializes abstract entries in sorted order so inode assignment is stable
+// (independent of pagination boundaries).
+//
+// NOTE: caller must hold v.mu.
+func (v *virtioFsBackend) snapshotDirEnts(dirNode *fsNode) []dirHandleEnt {
+	// Build deterministic name set excluding "." and "..".
+	nameSet := make(map[string]struct{})
+	for name := range dirNode.entries {
+		if name == "." || name == ".." {
+			continue
+		}
+		nameSet[name] = struct{}{}
+	}
+
+	var abstractEntries []AbstractDirEntry
+	if dirNode.abstractDir != nil {
+		if ents, e := dirNode.abstractDir.ReadDir(); e == nil {
+			abstractEntries = ents
+			for _, ent := range ents {
+				if ent.Name == "." || ent.Name == ".." {
+					continue
+				}
+				nameSet[ent.Name] = struct{}{}
+			}
+		}
+	}
+
+	rest := make([]string, 0, len(nameSet))
+	for name := range nameSet {
+		rest = append(rest, name)
+	}
+	sort.Strings(rest)
+
+	// For abstract directories, pre-create nodes in sorted order so inode assignment
+	// is deterministic and does not depend on READDIR pagination.
+	if dirNode.abstractDir != nil {
+		_ = abstractEntries
+		for _, name := range rest {
+			if _, ok := dirNode.entries[name]; ok {
+				continue
+			}
+			if entry, lookupErr := dirNode.abstractDir.Lookup(name); lookupErr == nil {
+				_, _ = v.createAbstractNode(dirNode, name, entry)
+			}
+		}
+	}
+
+	// Build a stable snapshot of (name, ino, type).
+	ents := make([]dirHandleEnt, 0, len(rest)+2)
+	ents = append(ents, dirHandleEnt{name: ".", ino: dirNode.id, typ: uint32(linux.DT_DIR)})
+	parentIno := dirNode.id
+	if dirNode.parent != 0 {
+		parentIno = dirNode.parent
+	}
+	ents = append(ents, dirHandleEnt{name: "..", ino: parentIno, typ: uint32(linux.DT_DIR)})
+
+	for _, name := range rest {
+		id, ok := dirNode.entries[name]
+		if !ok {
+			// Directory changed between enumeration and now. Skip entries we can't resolve.
+			continue
+		}
+		child := v.nodes[id]
+		typ := uint32(linux.DT_REG)
+		if child != nil {
+			switch {
+			case child.isDir():
+				typ = uint32(linux.DT_DIR)
+			case child.isSymlink():
+				typ = uint32(linux.DT_LNK)
+			default:
+				typ = uint32(linux.DT_REG)
+			}
+		}
+		ents = append(ents, dirHandleEnt{name: name, ino: id, typ: typ})
+	}
+	return ents
 }
 
 func (v *virtioFsBackend) node(id uint64) (*fsNode, int32) {
@@ -711,82 +792,12 @@ func (v *virtioFsBackend) OpenDir(nodeID uint64, _ uint32) (fh uint64, errno int
 		return 0, -int32(linux.ENOTDIR)
 	}
 
-	// Build deterministic name set excluding "." and "..".
-	nameSet := make(map[string]struct{})
-	for name := range dirNode.entries {
-		if name == "." || name == ".." {
-			continue
-		}
-		nameSet[name] = struct{}{}
-	}
-	var abstractEntries []AbstractDirEntry
-	if dirNode.abstractDir != nil {
-		if ents, e := dirNode.abstractDir.ReadDir(); e == nil {
-			abstractEntries = ents
-			for _, ent := range ents {
-				if ent.Name == "." || ent.Name == ".." {
-					continue
-				}
-				nameSet[ent.Name] = struct{}{}
-			}
-		}
-	}
-
-	rest := make([]string, 0, len(nameSet))
-	for name := range nameSet {
-		rest = append(rest, name)
-	}
-	sort.Strings(rest)
-
-	// For abstract directories, pre-create nodes in sorted order so inode assignment
-	// is deterministic and does not depend on READDIR pagination.
-	if dirNode.abstractDir != nil {
-		for _, name := range rest {
-			if _, ok := dirNode.entries[name]; ok {
-				continue
-			}
-			// If we already have a list from ReadDir(), prefer that to avoid repeated lookups
-			// when possible, but we still need the AbstractEntry to create the node.
-			_ = abstractEntries
-			if entry, lookupErr := dirNode.abstractDir.Lookup(name); lookupErr == nil {
-				_, _ = v.createAbstractNode(dirNode, name, entry)
-			}
-		}
-	}
-
-	// Build a stable snapshot of (name, ino, type). We do this once so getdents64
-	// d_ino values remain consistent even if the directory is modified mid-iteration.
-	ents := make([]dirHandleEnt, 0, len(rest)+2)
-	ents = append(ents, dirHandleEnt{name: ".", ino: dirNode.id, typ: uint32(linux.DT_DIR)})
-	parentIno := dirNode.id
-	if dirNode.parent != 0 {
-		parentIno = dirNode.parent
-	}
-	ents = append(ents, dirHandleEnt{name: "..", ino: parentIno, typ: uint32(linux.DT_DIR)})
-	for _, name := range rest {
-		id, ok := dirNode.entries[name]
-		if !ok {
-			// Directory changed between ReadDir() and now. Skip entries we can't resolve.
-			continue
-		}
-		child := v.nodes[id]
-		typ := uint32(linux.DT_REG)
-		if child != nil {
-			switch {
-			case child.isDir():
-				typ = uint32(linux.DT_DIR)
-			case child.isSymlink():
-				typ = uint32(linux.DT_LNK)
-			default:
-				typ = uint32(linux.DT_REG)
-			}
-		}
-		ents = append(ents, dirHandleEnt{name: name, ino: id, typ: typ})
-	}
-
 	fh = v.nextFH
 	v.nextFH++
-	v.dirHandles[fh] = &dirHandle{nodeID: nodeID, ents: ents}
+	// Do NOT snapshot here. Names may be created after OPENDIR but before the first
+	// READDIR, and they must be observable (see xfstests generic/471).
+	// Snapshotting is deferred until the first READDIR(off=0) on this handle.
+	v.dirHandles[fh] = &dirHandle{nodeID: nodeID}
 	return fh, 0
 }
 
@@ -807,6 +818,27 @@ func (v *virtioFsBackend) ReadDirHandle(nodeID uint64, fh uint64, off uint64, ma
 	if !ok || h.nodeID != nodeID {
 		return nil, -int32(linux.EBADF)
 	}
+
+	dirNode, err := v.node(nodeID)
+	if err != 0 {
+		return nil, err
+	}
+	if !dirNode.isDir() {
+		return nil, -int32(linux.ENOTDIR)
+	}
+
+	// First enumeration on this handle: snapshot at the start, not at OPENDIR time.
+	if !h.started && len(h.ents) == 0 {
+		h.ents = v.snapshotDirEnts(dirNode)
+	}
+
+	// POSIX: rewinddir(3) must observe new names created after the opendir(3).
+	// On Linux, rewinddir typically results in a READDIR call with off=0 after the
+	// stream has already been read. We treat that as a rewind and refresh the snapshot.
+	if off == 0 && h.started {
+		h.ents = v.snapshotDirEnts(dirNode)
+	}
+	h.started = true
 
 	if off >= uint64(len(h.ents)) {
 		return []byte{}, 0
