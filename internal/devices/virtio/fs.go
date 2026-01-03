@@ -219,6 +219,12 @@ const (
 	FUSE_FALLOCATE   = 43
 	FUSE_RENAME2     = 45
 	FUSE_LSEEK       = 46
+	FUSE_GETLK       = 31
+	FUSE_SETLK       = 32
+	FUSE_SETLKW      = 33
+	FUSE_DESTROY     = 38
+	FUSE_IOCTL       = 39
+	FUSE_POLL        = 40
 )
 
 // FUSE_INIT capability flags (subset; values match Linux uapi `include/uapi/linux/fuse.h`).
@@ -227,6 +233,10 @@ const (
 	// FuseCapPosixACL indicates the server supports POSIX ACLs (e.g. via
 	// `system.posix_acl_access` and `system.posix_acl_default` xattrs).
 	FuseCapPosixACL uint32 = 1 << 20
+	// FuseCapPosixLocks indicates the server supports POSIX advisory locks.
+	FuseCapPosixLocks uint32 = 1 << 1
+	// FuseCapFlockLocks indicates the server supports BSD flock locks.
+	FuseCapFlockLocks uint32 = 1 << 10
 )
 
 // Minimal structs we need on the wire (host end)
@@ -412,6 +422,23 @@ type fsFallocateBackend interface {
 type fsLinkBackend interface {
 	// Link creates a hard link: a new directory entry `newName` in `newParent` pointing to `oldNodeID`.
 	Link(oldNodeID uint64, newParent uint64, newName string) (nodeID uint64, attr FuseAttr, errno int32)
+}
+
+// FuseLock represents a POSIX advisory lock (from struct fuse_file_lock).
+type FuseLock struct {
+	Start uint64 // byte offset
+	End   uint64 // byte offset (inclusive), or UINT64_MAX for EOF
+	Type  uint32 // F_RDLCK, F_WRLCK, F_UNLCK
+	PID   uint32 // process ID (tgid)
+}
+
+type fsLockBackend interface {
+	// GetLk tests whether a lock could be placed; returns the conflicting lock or an unlocked lock if OK.
+	GetLk(nodeID uint64, fh uint64, owner uint64, lk FuseLock) (FuseLock, int32)
+	// SetLk sets or clears a POSIX advisory lock (non-blocking).
+	SetLk(nodeID uint64, fh uint64, owner uint64, lk FuseLock, flags uint32) int32
+	// SetLkW sets or clears a POSIX advisory lock (blocking). For simplicity we can treat same as SetLk.
+	SetLkW(nodeID uint64, fh uint64, owner uint64, lk FuseLock, flags uint32) int32
 }
 
 // A trivial in-memory backend placeholder that exposes an empty root.
@@ -860,8 +887,12 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			return 0, fmt.Errorf("FUSE_INIT too short")
 		}
 		maj := binary.LittleEndian.Uint32(req[40:44])
+		min := binary.LittleEndian.Uint32(req[44:48])
+		reqFlags := binary.LittleEndian.Uint32(req[52:56])
 		_ = maj // we accept any >= 7
+		debug.Writef("virtio-fs.dispatchFUSE op=INIT req", "major=%d minor=%d reqFlags=0x%x", maj, min, reqFlags)
 		maxWrite, flags := v.backend.Init()
+		debug.Writef("virtio-fs.dispatchFUSE op=INIT resp", "flags=0x%x maxWrite=%d", flags, maxWrite)
 		var out fuseInitOut
 		out.Major = 7
 		out.Minor = 31
@@ -1534,6 +1565,64 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			errno = -int32(linux.ENOSYS)
 		}
 
+	case FUSE_GETLK:
+		debug.Writef("virtio-fs.dispatchFUSE op=GETLK", "node=%d", in.NodeID)
+		// fuse_lk_in: fh (u64), owner (u64), fuse_file_lock (start u64, end u64, type u32, pid u32), lk_flags (u32), padding (u32)
+		if len(req) < fuseHdrInSize+40 {
+			return 0, fmt.Errorf("FUSE_GETLK too short")
+		}
+		fh := binary.LittleEndian.Uint64(req[40:48])
+		owner := binary.LittleEndian.Uint64(req[48:56])
+		lkStart := binary.LittleEndian.Uint64(req[56:64])
+		lkEnd := binary.LittleEndian.Uint64(req[64:72])
+		lkType := binary.LittleEndian.Uint32(req[72:76])
+		lkPID := binary.LittleEndian.Uint32(req[76:80])
+		lk := FuseLock{Start: lkStart, End: lkEnd, Type: lkType, PID: lkPID}
+		debug.Writef("virtio-fs.dispatchFUSE op=GETLK", "fh=%d owner=%d lk=%+v", fh, owner, lk)
+		if be, ok := v.backend.(fsLockBackend); ok {
+			outLk, e := be.GetLk(in.NodeID, fh, owner, lk)
+			errno = e
+			if errno == 0 {
+				// fuse_lk_out: fuse_file_lock
+				extra := make([]byte, 24)
+				binary.LittleEndian.PutUint64(extra[0:8], outLk.Start)
+				binary.LittleEndian.PutUint64(extra[8:16], outLk.End)
+				binary.LittleEndian.PutUint32(extra[16:20], outLk.Type)
+				binary.LittleEndian.PutUint32(extra[20:24], outLk.PID)
+				return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_SETLK, FUSE_SETLKW:
+		opName := "SETLK"
+		if in.Opcode == FUSE_SETLKW {
+			opName = "SETLKW"
+		}
+		debug.Writef("virtio-fs.dispatchFUSE op="+opName, "node=%d", in.NodeID)
+		if len(req) < fuseHdrInSize+40 {
+			return 0, fmt.Errorf("FUSE_%s too short", opName)
+		}
+		fh := binary.LittleEndian.Uint64(req[40:48])
+		owner := binary.LittleEndian.Uint64(req[48:56])
+		lkStart := binary.LittleEndian.Uint64(req[56:64])
+		lkEnd := binary.LittleEndian.Uint64(req[64:72])
+		lkType := binary.LittleEndian.Uint32(req[72:76])
+		lkPID := binary.LittleEndian.Uint32(req[76:80])
+		lkFlags := binary.LittleEndian.Uint32(req[80:84])
+		lk := FuseLock{Start: lkStart, End: lkEnd, Type: lkType, PID: lkPID}
+		debug.Writef("virtio-fs.dispatchFUSE op="+opName, "fh=%d owner=%d lk=%+v flags=%d", fh, owner, lk, lkFlags)
+		if be, ok := v.backend.(fsLockBackend); ok {
+			if in.Opcode == FUSE_SETLKW {
+				errno = be.SetLkW(in.NodeID, fh, owner, lk, lkFlags)
+			} else {
+				errno = be.SetLk(in.NodeID, fh, owner, lk, lkFlags)
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
 	case FUSE_STATFS:
 		debug.Writef("virtio-fs.dispatchFUSE op=STATFS", "node=%d", in.NodeID)
 		b, bf, ba, files, ff, bsize, fr, name, e := v.backend.StatFS(in.NodeID)
@@ -1553,6 +1642,20 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			putU32(48, uint32(fr))
 			return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
 		}
+	case FUSE_DESTROY:
+		// Nothing to do; the guest is indicating unmount.
+		debug.Writef("virtio-fs.dispatchFUSE op=DESTROY", "node=%d", in.NodeID)
+
+	case FUSE_FLUSH:
+		// Flush pending writes before close. For an in-memory filesystem, this is a no-op.
+		debug.Writef("virtio-fs.dispatchFUSE op=FLUSH", "node=%d", in.NodeID)
+		// Return success - nothing to flush.
+
+	case FUSE_IOCTL, FUSE_POLL:
+		// Unsupported but expected; return ENOSYS quietly.
+		debug.Writef("virtio-fs.dispatchFUSE op unsupported", "opcode=%s node=%d", fuseOpcodeString(in.Opcode), in.NodeID)
+		errno = -int32(linux.ENOSYS)
+
 	default:
 		slog.Debug("virtio-fs.dispatchFUSE unsupported", "opcode", fuseOpcodeString(in.Opcode))
 		debug.Writef("virtio-fs.dispatchFUSE unsupported", "opcode=%s", fuseOpcodeString(in.Opcode))
@@ -1619,6 +1722,18 @@ func fuseOpcodeString(op uint32) string {
 		return "RENAME2"
 	case FUSE_LSEEK:
 		return "LSEEK"
+	case FUSE_GETLK:
+		return "GETLK"
+	case FUSE_SETLK:
+		return "SETLK"
+	case FUSE_SETLKW:
+		return "SETLKW"
+	case FUSE_DESTROY:
+		return "DESTROY"
+	case FUSE_IOCTL:
+		return "IOCTL"
+	case FUSE_POLL:
+		return "POLL"
 	default:
 		return fmt.Sprintf("OP(%d)", op)
 	}
