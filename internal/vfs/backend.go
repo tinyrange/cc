@@ -286,15 +286,29 @@ type virtioFsBackend struct {
 	nodes      map[uint64]*fsNode
 	handles    map[uint64]uint64
 	dirHandles map[uint64]*dirHandle
+	// fhOwners tracks the last observed fcntl lock "owner" cookie for a given open
+	// file handle (fh). This lets us reliably drop any remaining locks on RELEASE,
+	// even when the close path provides a different lock_owner cookie (e.g. OFD
+	// locks vs POSIX locks).
+	fhOwners   map[uint64]uint64
 	nextID     uint64
 	nextFH     uint64
 	// POSIX advisory locks keyed by (nodeID, owner). Each entry is a list of held locks.
-	locks map[lockKey][]lockRange
+	posixLocks map[lockKey][]lockRange
+	// OFD locks keyed by (nodeID, fh). OFD locks are associated with an open file
+	// description and should not be released until the file handle is fully closed.
+	ofdLocks map[ofdLockKey][]lockRange
+	lockCond *sync.Cond
 }
 
 type lockKey struct {
 	nodeID uint64
 	owner  uint64
+}
+
+type ofdLockKey struct {
+	nodeID uint64
+	fh     uint64
 }
 
 type lockRange struct {
@@ -535,8 +549,12 @@ func (v *virtioFsBackend) ensureRoot() {
 	v.nodes[root.id] = root
 	v.handles = make(map[uint64]uint64)
 	v.dirHandles = make(map[uint64]*dirHandle)
+	v.fhOwners = make(map[uint64]uint64)
 	v.nextID = virtioFsRootNodeID + 1
 	v.nextFH = 1
+	v.posixLocks = make(map[lockKey][]lockRange)
+	v.ofdLocks = make(map[ofdLockKey][]lockRange)
+	v.lockCond = sync.NewCond(&v.mu)
 }
 
 type dirHandle struct {
@@ -1325,6 +1343,27 @@ func (v *virtioFsBackend) ReadDirHandle(nodeID uint64, fh uint64, off uint64, ma
 func (v *virtioFsBackend) Release(nodeID uint64, fh uint64) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	v.ensureRoot()
+
+	// Release OFD locks associated with this file handle on final close.
+	// (Kernel should only issue RELEASE when the file handle is truly closed.)
+	for k := range v.ofdLocks {
+		if k.nodeID == nodeID && k.fh == fh {
+			delete(v.ofdLocks, k)
+		}
+	}
+	// Also drop any remaining locks associated with the lock owner cookie that was
+	// used for this file handle. This is important for OFD lock tests (generic/478)
+	// where the lock owner in the lk_in request may not match the lock_owner cookie
+	// provided via FLUSH, so relying on FLUSH alone can leak locks indefinitely.
+	if owner, ok := v.fhOwners[fh]; ok {
+		delete(v.posixLocks, lockKey{nodeID: nodeID, owner: owner})
+		delete(v.fhOwners, fh)
+	}
+	if v.lockCond != nil {
+		v.lockCond.Broadcast()
+	}
+
 	if nid, ok := v.handles[fh]; ok {
 		if n := v.nodes[nid]; n != nil && n.openRefs > 0 {
 			n.openRefs--
@@ -1334,6 +1373,27 @@ func (v *virtioFsBackend) Release(nodeID uint64, fh uint64) {
 		return
 	}
 	_ = nodeID
+}
+
+// Flush implements a best-effort close hook. Linux sends FUSE_FLUSH with a
+// lock_owner so a FUSE filesystem can release POSIX locks on close.
+//
+// POSIX fcntl locks are per-process and are released when *any* fd referring to
+// the file is closed by that process; this aligns with locktest expectations.
+func (v *virtioFsBackend) Flush(nodeID uint64, fh uint64, lockOwner uint64) int32 {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.ensureRoot()
+
+	_ = fh
+	if lockOwner == 0 {
+		return 0
+	}
+	delete(v.posixLocks, lockKey{nodeID: nodeID, owner: lockOwner})
+	if v.lockCond != nil {
+		v.lockCond.Broadcast()
+	}
+	return 0
 }
 
 // StatFS implements virtio.FsBackend.
@@ -1767,71 +1827,76 @@ func rangesOverlap(a1, a2, b1, b2 uint64) bool {
 }
 
 // GetLk tests whether a lock could be placed and returns the conflicting lock, or an unlocked lock.
-func (v *virtioFsBackend) GetLk(nodeID uint64, fh uint64, owner uint64, lk virtio.FuseLock) (virtio.FuseLock, int32) {
+func (v *virtioFsBackend) GetLk(nodeID uint64, fh uint64, owner uint64, lk virtio.FuseLock, flags uint32) (virtio.FuseLock, int32) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	v.ensureRoot()
 
 	if lk.Type == fLockUnlck {
 		// Querying an unlock: return unlocked.
 		return virtio.FuseLock{Type: fLockUnlck}, 0
 	}
-	// Check for conflicting locks from other owners.
-	for key, ranges := range v.locks {
-		if key.nodeID != nodeID || key.owner == owner {
+
+	ofd := (flags & virtio.FuseLkOFD) != 0
+	_ = ofd
+
+	// Check for conflicts against POSIX locks (other owners).
+	for key, ranges := range v.posixLocks {
+		if key.nodeID != nodeID {
+			continue
+		}
+		// For OFD GETLK we still need to report conflicts with POSIX locks.
+		if !ofd && key.owner == owner {
 			continue
 		}
 		for _, r := range ranges {
 			if !rangesOverlap(lk.Start, lk.End, r.start, r.end) {
 				continue
 			}
-			// Conflict if either is a write lock.
 			if lk.Type == fLockWrlck || r.typ == fLockWrlck {
-				return virtio.FuseLock{Start: r.start, End: r.end, Type: r.typ, PID: r.pid}, 0
+				// For OFD GETLK, Linux reports l_pid = 0.
+				pid := r.pid
+				if ofd {
+					pid = 0
+				}
+				return virtio.FuseLock{Start: r.start, End: r.end, Type: r.typ, PID: pid}, 0
 			}
 		}
 	}
+
+	// Check for conflicts against OFD locks (other file handles).
+	for key, ranges := range v.ofdLocks {
+		if key.nodeID != nodeID {
+			continue
+		}
+		// For OFD locks, same fh means same open-file-description.
+		if key.fh == fh {
+			continue
+		}
+		for _, r := range ranges {
+			if !rangesOverlap(lk.Start, lk.End, r.start, r.end) {
+				continue
+			}
+			if lk.Type == fLockWrlck || r.typ == fLockWrlck {
+				// OFD GETLK reports pid 0.
+				return virtio.FuseLock{Start: r.start, End: r.end, Type: r.typ, PID: 0}, 0
+			}
+		}
+	}
+
 	// No conflict.
 	return virtio.FuseLock{Type: fLockUnlck}, 0
 }
 
-// SetLk sets or clears a POSIX advisory lock (non-blocking).
-func (v *virtioFsBackend) SetLk(nodeID uint64, fh uint64, owner uint64, lk virtio.FuseLock, flags uint32) int32 {
-	v.mu.Lock()
-	defer v.mu.Unlock()
+func (v *virtioFsBackend) canPlaceLock(nodeID uint64, fh uint64, owner uint64, lk virtio.FuseLock, flags uint32) bool {
+	ofd := (flags & virtio.FuseLkOFD) != 0
 
-	if v.locks == nil {
-		v.locks = make(map[lockKey][]lockRange)
-	}
-	key := lockKey{nodeID: nodeID, owner: owner}
-
-	if lk.Type == fLockUnlck {
-		// Remove locks in the given range for this owner.
-		ranges := v.locks[key]
-		var kept []lockRange
-		for _, r := range ranges {
-			if !rangesOverlap(lk.Start, lk.End, r.start, r.end) {
-				kept = append(kept, r)
-				continue
-			}
-			// Partial overlap: split.
-			if r.start < lk.Start {
-				kept = append(kept, lockRange{start: r.start, end: lk.Start - 1, typ: r.typ, pid: r.pid})
-			}
-			if r.end > lk.End {
-				kept = append(kept, lockRange{start: lk.End + 1, end: r.end, typ: r.typ, pid: r.pid})
-			}
+	// Conflicts with POSIX locks.
+	for k, ranges := range v.posixLocks {
+		if k.nodeID != nodeID {
+			continue
 		}
-		if len(kept) == 0 {
-			delete(v.locks, key)
-		} else {
-			v.locks[key] = kept
-		}
-		return 0
-	}
-
-	// Check for conflicts with other owners.
-	for k, ranges := range v.locks {
-		if k.nodeID != nodeID || k.owner == owner {
+		if !ofd && k.owner == owner {
 			continue
 		}
 		for _, r := range ranges {
@@ -1839,15 +1904,32 @@ func (v *virtioFsBackend) SetLk(nodeID uint64, fh uint64, owner uint64, lk virti
 				continue
 			}
 			if lk.Type == fLockWrlck || r.typ == fLockWrlck {
-				return -int32(linux.EAGAIN)
+				return false
 			}
 		}
 	}
+	// Conflicts with OFD locks.
+	for k, ranges := range v.ofdLocks {
+		if k.nodeID != nodeID {
+			continue
+		}
+		if k.fh == fh {
+			continue
+		}
+		for _, r := range ranges {
+			if !rangesOverlap(lk.Start, lk.End, r.start, r.end) {
+				continue
+			}
+			if lk.Type == fLockWrlck || r.typ == fLockWrlck {
+				return false
+			}
+		}
+	}
+	return true
+}
 
-	// Merge/replace lock for this owner.
-	ranges := v.locks[key]
+func mergeOrReplace(ranges []lockRange, lk virtio.FuseLock) []lockRange {
 	newR := lockRange{start: lk.Start, end: lk.End, typ: lk.Type, pid: lk.PID}
-	// Simple implementation: remove overlapping and add new.
 	var kept []lockRange
 	for _, r := range ranges {
 		if rangesOverlap(lk.Start, lk.End, r.start, r.end) {
@@ -1862,14 +1944,98 @@ func (v *virtioFsBackend) SetLk(nodeID uint64, fh uint64, owner uint64, lk virti
 			kept = append(kept, r)
 		}
 	}
-	kept = append(kept, newR)
-	v.locks[key] = kept
+	return append(kept, newR)
+}
+
+func removeRange(ranges []lockRange, lk virtio.FuseLock) []lockRange {
+	var kept []lockRange
+	for _, r := range ranges {
+		if !rangesOverlap(lk.Start, lk.End, r.start, r.end) {
+			kept = append(kept, r)
+			continue
+		}
+		// Partial overlap: split.
+		if r.start < lk.Start {
+			kept = append(kept, lockRange{start: r.start, end: lk.Start - 1, typ: r.typ, pid: r.pid})
+		}
+		if r.end > lk.End {
+			kept = append(kept, lockRange{start: lk.End + 1, end: r.end, typ: r.typ, pid: r.pid})
+		}
+	}
+	return kept
+}
+
+func (v *virtioFsBackend) setLockInternal(nodeID uint64, fh uint64, owner uint64, lk virtio.FuseLock, flags uint32, blocking bool) int32 {
+	v.ensureRoot()
+	if v.lockCond == nil {
+		v.lockCond = sync.NewCond(&v.mu)
+	}
+
+	// Track the owner cookie used for locks on this handle so we can clean up on RELEASE.
+	if v.fhOwners == nil {
+		v.fhOwners = make(map[uint64]uint64)
+	}
+	v.fhOwners[fh] = owner
+
+	ofd := (flags & virtio.FuseLkOFD) != 0
+
+	// Unlock: always succeeds and wakes waiters.
+	if lk.Type == fLockUnlck {
+		if ofd {
+			key := ofdLockKey{nodeID: nodeID, fh: fh}
+			ranges := v.ofdLocks[key]
+			kept := removeRange(ranges, lk)
+			if len(kept) == 0 {
+				delete(v.ofdLocks, key)
+			} else {
+				v.ofdLocks[key] = kept
+			}
+		} else {
+			key := lockKey{nodeID: nodeID, owner: owner}
+			ranges := v.posixLocks[key]
+			kept := removeRange(ranges, lk)
+			if len(kept) == 0 {
+				delete(v.posixLocks, key)
+			} else {
+				v.posixLocks[key] = kept
+			}
+		}
+		v.lockCond.Broadcast()
+		return 0
+	}
+
+	// Wait for conflicts to clear if blocking.
+	for !v.canPlaceLock(nodeID, fh, owner, lk, flags) {
+		if !blocking {
+			return -int32(linux.EAGAIN)
+		}
+		v.lockCond.Wait()
+	}
+
+	// Merge/replace in the correct lock table.
+	if ofd {
+		key := ofdLockKey{nodeID: nodeID, fh: fh}
+		v.ofdLocks[key] = mergeOrReplace(v.ofdLocks[key], lk)
+	} else {
+		key := lockKey{nodeID: nodeID, owner: owner}
+		v.posixLocks[key] = mergeOrReplace(v.posixLocks[key], lk)
+	}
+	v.lockCond.Broadcast()
 	return 0
 }
 
-// SetLkW is the blocking variant; for simplicity we just call SetLk (non-blocking).
+// SetLk sets or clears a POSIX advisory lock (non-blocking).
+func (v *virtioFsBackend) SetLk(nodeID uint64, fh uint64, owner uint64, lk virtio.FuseLock, flags uint32) int32 {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.setLockInternal(nodeID, fh, owner, lk, flags, false)
+}
+
+// SetLkW is the blocking variant (SETLKW / F_OFD_SETLKW).
 func (v *virtioFsBackend) SetLkW(nodeID uint64, fh uint64, owner uint64, lk virtio.FuseLock, flags uint32) int32 {
-	return v.SetLk(nodeID, fh, owner, lk, flags)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.setLockInternal(nodeID, fh, owner, lk, flags, true)
 }
 
 func (v *virtioFsBackend) SetXattr(nodeID uint64, name string, value []byte, flags uint32, reqUID uint32, reqGID uint32) int32 {

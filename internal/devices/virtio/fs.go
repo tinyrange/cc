@@ -346,6 +346,15 @@ type FsBackend interface {
 	StatFS(nodeID uint64) (blocks, bfree, bavail, files, ffree, bsize, frsize, namelen uint64, errno int32)
 }
 
+// FUSE lock flags (lk_flags in struct fuse_lk_in).
+// Values are defined in Linux uapi `include/uapi/linux/fuse.h`.
+const (
+	FuseLkFlock uint32 = 1 << 0
+	// FuseLkOFD indicates OFD lock semantics (file-description locks).
+	// Some userspace headers don't define this yet; Linux kernels do use it.
+	FuseLkOFD uint32 = 1 << 1
+)
+
 // Optional directory-handle interfaces.
 //
 // These provide a place to implement fully correct getdents64 / d_off semantics:
@@ -434,11 +443,18 @@ type FuseLock struct {
 
 type fsLockBackend interface {
 	// GetLk tests whether a lock could be placed; returns the conflicting lock or an unlocked lock if OK.
-	GetLk(nodeID uint64, fh uint64, owner uint64, lk FuseLock) (FuseLock, int32)
+	GetLk(nodeID uint64, fh uint64, owner uint64, lk FuseLock, flags uint32) (FuseLock, int32)
 	// SetLk sets or clears a POSIX advisory lock (non-blocking).
 	SetLk(nodeID uint64, fh uint64, owner uint64, lk FuseLock, flags uint32) int32
 	// SetLkW sets or clears a POSIX advisory lock (blocking). For simplicity we can treat same as SetLk.
 	SetLkW(nodeID uint64, fh uint64, owner uint64, lk FuseLock, flags uint32) int32
+}
+
+// fsFlushBackend is an optional hook for FUSE_FLUSH.
+// Linux may use FUSE_FLUSH.lock_owner to indicate which POSIX locks should be
+// released when the caller closes an fd (POSIX fcntl locks are per-process).
+type fsFlushBackend interface {
+	Flush(nodeID uint64, fh uint64, lockOwner uint64) int32
 }
 
 // A trivial in-memory backend placeholder that exposes an empty root.
@@ -500,9 +516,24 @@ type FS struct {
 	bufPool sync.Pool
 	backend FsBackend
 
+	// pending holds request contexts that are waiting for a "blocking" lock
+	// acquisition (SETLKW) to become available. We defer replying until the lock
+	// can be acquired, so the guest thread blocks in-kernel as expected without
+	// stalling the entire virtio-fs device.
+	pending []pendingReq
+
 	// config
 	tag       [fsCfgTagSize]byte
 	numQueues uint32
+}
+
+type pendingReq struct {
+	qidx      int
+	head      uint16
+	opcode    uint32
+	req       []byte
+	respDescs []fsDesc
+	respCap   int
 }
 
 func NewFS(vm hv.VirtualMachine, base, size uint64, irqLine uint32, tag string, backend FsBackend) *FS {
@@ -608,7 +639,7 @@ func (v *FS) OnQueueNotify(dev device, qidx int) error {
 	} else {
 		debug.Writef("virtio-fs.OnQueueNotify q!=nil", "qidx=%d ready=%t size=%d lastAvailIdx=%d usedIdx=%d", qidx, q.ready, q.size, q.lastAvailIdx, q.usedIdx)
 	}
-	return v.processQueue(dev, q)
+	return v.processQueue(dev, qidx, q)
 }
 
 // Config space
@@ -640,7 +671,7 @@ func (v *FS) WriteConfig(device, uint64, uint32) (bool, error) { return false, n
 
 // ------------- queue processing -------------
 
-func (v *FS) processQueue(dev device, q *queue) error {
+func (v *FS) processQueue(dev device, qidx int, q *queue) error {
 	if q == nil || !q.ready || q.size == 0 {
 		if q == nil {
 			debug.Writef("virtio-fs.processQueue skip", "queue=nil")
@@ -656,6 +687,14 @@ func (v *FS) processQueue(dev device, q *queue) error {
 		return err
 	}
 	debug.Writef("virtio-fs.processQueue availFlags", "0x%x availIdx=%d lastAvailIdx=%d", availFlags, availIdx, q.lastAvailIdx)
+
+	// First, attempt to complete any deferred SETLKW requests. This is safe because
+	// the underlying virtio queue elements remain in-flight until we write them to
+	// the used ring.
+	if err := v.tryCompletePending(dev); err != nil {
+		return err
+	}
+
 	var interruptNeeded bool
 
 	for q.lastAvailIdx != availIdx {
@@ -666,18 +705,30 @@ func (v *FS) processQueue(dev device, q *queue) error {
 			return err
 		}
 		debug.Writef("virtio-fs.processQueue handle", "head=%d ringIndex=%d", head, ringIndex)
-		usedLen, err := v.handleRequest(dev, q, head)
+		usedLen, deferred, err := v.handleRequest(dev, qidx, q, head)
 		if err != nil {
 			debug.Writef("virtio-fs.processQueue handleRequest", "head=%d error=%v", head, err)
 			return err
 		}
+		q.lastAvailIdx++
+
+		// Deferred (SETLKW would block): do not write used entry yet.
+		if deferred {
+			continue
+		}
+
 		debug.Writef("virtio-fs.processQueue recordUsed", "head=%d usedLen=%d", head, usedLen)
 		if err := dev.recordUsedElement(q, head, usedLen); err != nil {
 			debug.Writef("virtio-fs.processQueue recordUsedElement", "head=%d error=%v", head, err)
 			return err
 		}
-		q.lastAvailIdx++
 		interruptNeeded = true
+
+		// A request may have changed lock state (unlock/close), so opportunistically
+		// drain pending SETLKW requests now.
+		if err := v.tryCompletePending(dev); err != nil {
+			return err
+		}
 	}
 	if interruptNeeded && (availFlags&1) == 0 {
 		debug.Writef("virtio-fs.processQueue raiseInterrupt", "bit=0x%x", fsInterruptBit)
@@ -694,16 +745,93 @@ type fsDesc struct {
 	nextID uint16
 }
 
-func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
+var errDeferReply = errors.New("virtio-fs: defer reply")
+
+func (v *FS) tryCompletePending(dev device) error {
+	if len(v.pending) == 0 {
+		return nil
+	}
+	dst := v.pending[:0]
+	for _, p := range v.pending {
+		q := dev.queue(p.qidx)
+		if q == nil || !q.ready || q.size == 0 {
+			// Can't complete right now; keep it pending.
+			dst = append(dst, p)
+			continue
+		}
+		availFlags, _, err := dev.readAvailState(q)
+		if err != nil {
+			dst = append(dst, p)
+			continue
+		}
+
+		// Attempt to dispatch again; if still blocked, keep pending.
+		respBuf := v.getBuffer(p.respCap)
+		clear(respBuf[:p.respCap])
+		used, err := v.dispatchFUSE(p.req, respBuf[:p.respCap])
+		if errors.Is(err, errDeferReply) {
+			v.putBuffer(respBuf)
+			dst = append(dst, p)
+			continue
+		}
+		if err != nil {
+			v.putBuffer(respBuf)
+			dst = append(dst, p)
+			continue
+		}
+		if used == 0 {
+			used = fuseHdrOutSize
+		}
+		if int(used) > p.respCap {
+			v.putBuffer(respBuf)
+			dst = append(dst, p)
+			continue
+		}
+
+		remaining := int(used)
+		copyOffset := 0
+		for _, d := range p.respDescs {
+			chunk := int(d.length)
+			if chunk == 0 {
+				continue
+			}
+			if chunk > remaining {
+				chunk = remaining
+			}
+			if chunk <= 0 {
+				break
+			}
+			_ = dev.writeGuest(d.addr, respBuf[copyOffset:copyOffset+chunk])
+			copyOffset += chunk
+			remaining -= chunk
+			if remaining == 0 {
+				break
+			}
+		}
+		v.putBuffer(respBuf)
+
+		if err := dev.recordUsedElement(q, p.head, used); err != nil {
+			dst = append(dst, p)
+			continue
+		}
+		if (availFlags & 1) == 0 {
+			dev.raiseInterrupt(fsInterruptBit)
+		}
+	}
+	v.pending = dst
+	return nil
+}
+
+func (v *FS) handleRequest(dev device, qidx int, q *queue, head uint16) (usedLen uint32, deferred bool, err error) {
 	// Expect a simple 2-descriptor chain: [in: request][out: reply]
 	descs, err := v.readDescriptorChain(dev, q, head)
 	if err != nil {
 		debug.Writef("virtio-fs.handleRequest readDescriptorChain", "head=%d error=%v", head, err)
-		return 0, err
+		return 0, false, err
 	}
 	if len(descs) == 0 {
 		debug.Writef("virtio-fs.handleRequest", "head=%d no descriptors", head)
-		return 0, errors.New("virtio-fs: no descriptors in request")
+		return 0, false, errors.New("virtio-fs: no descriptors in request")
 	}
 	debug.Writef("virtio-fs.handleRequest", "head=%d descs=%d", head, len(descs))
 
@@ -714,13 +842,13 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 			continue
 		}
 		if len(respDescs) != 0 {
-			return 0, errors.New("virtio-fs: read descriptor after write descriptor")
+			return 0, false, errors.New("virtio-fs: read descriptor after write descriptor")
 		}
 		reqDescs = append(reqDescs, d)
 	}
 	if len(reqDescs) == 0 {
 		debug.Writef("virtio-fs.handleRequest no request descriptors", "head=%d", head)
-		return 0, errors.New("virtio-fs: no request descriptors")
+		return 0, false, errors.New("virtio-fs: no request descriptors")
 	}
 
 	var reqLen int
@@ -729,7 +857,7 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 	}
 	if reqLen == 0 {
 		debug.Writef("virtio-fs.handleRequest empty request payload", "head=%d", head)
-		return 0, errors.New("virtio-fs: empty request payload")
+		return 0, false, errors.New("virtio-fs: empty request payload")
 	}
 	debug.Writef("virtio-fs.handleRequest", "reqDesc=%d reqLen=%d respDesc=%d", len(reqDescs), reqLen, len(respDescs))
 	reqBuf := v.getBuffer(reqLen)
@@ -745,7 +873,7 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 		seg, err := dev.readGuest(d.addr, d.length)
 		if err != nil {
 			debug.Writef("virtio-fs.handleRequest readGuest", "head=%d addr=0x%x len=%d error=%v", head, d.addr, d.length, err)
-			return 0, err
+			return 0, false, err
 		}
 		copy(reqBuf[copyOffset:], seg[:segLen])
 		copyOffset += segLen
@@ -755,10 +883,10 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 	if len(respDescs) == 0 {
 		if opcode == FUSE_FORGET {
 			debug.Writef("virtio-fs.handleRequest no resp (FORGET)", "head=%d opcode=%s", head, fuseOpcodeString(opcode))
-			return 0, nil
+			return 0, false, nil
 		}
 		debug.Writef("virtio-fs.handleRequest no response descriptors", "head=%d opcode=%s", head, fuseOpcodeString(opcode))
-		return 0, errors.New("virtio-fs: no response descriptors")
+		return 0, false, errors.New("virtio-fs: no response descriptors")
 	}
 
 	var respCap int
@@ -767,7 +895,7 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 	}
 	if respCap == 0 {
 		debug.Writef("virtio-fs.handleRequest respCap=0", "head=%d opcode=%s", head, fuseOpcodeString(opcode))
-		return 0, errors.New("virtio-fs: zero-length response buffer")
+		return 0, false, errors.New("virtio-fs: zero-length response buffer")
 	}
 	debug.Writef("virtio-fs.handleRequest", "respCap=%d head=%d opcode=%s", respCap, head, fuseOpcodeString(opcode))
 	respBuf := v.getBuffer(respCap)
@@ -777,15 +905,31 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 
 	used, err := v.dispatchFUSE(reqBuf[:reqLen], respBuf[:respCap])
 	if err != nil {
+		if errors.Is(err, errDeferReply) {
+			// Save a copy of the request and response descriptor list so we can complete later.
+			reqCopy := make([]byte, reqLen)
+			copy(reqCopy, reqBuf[:reqLen])
+			respCopy := make([]fsDesc, len(respDescs))
+			copy(respCopy, respDescs)
+			v.pending = append(v.pending, pendingReq{
+				qidx:      qidx,
+				head:      head,
+				opcode:    opcode,
+				req:       reqCopy,
+				respDescs: respCopy,
+				respCap:   respCap,
+			})
+			return 0, true, nil
+		}
 		debug.Writef("virtio-fs.handleRequest dispatch", "head=%d opcode=%s error=%v", head, fuseOpcodeString(opcode), err)
-		return 0, err
+		return 0, false, err
 	}
 	if used == 0 {
 		used = fuseHdrOutSize
 	} // ensure progress
 	if int(used) > respCap {
 		debug.Writef("virtio-fs.handleRequest too-large", "head=%d opcode=%s used=%d respCap=%d", head, fuseOpcodeString(opcode), used, respCap)
-		return 0, fmt.Errorf("virtio-fs: response too large (need %d, have %d)", used, respCap)
+		return 0, false, fmt.Errorf("virtio-fs: response too large (need %d, have %d)", used, respCap)
 	}
 	debug.Writef("virtio-fs.handleRequest", "used=%d head=%d opcode=%s", used, head, fuseOpcodeString(opcode))
 
@@ -801,7 +945,7 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 		}
 		if err := dev.writeGuest(d.addr, respBuf[copyOffset:copyOffset+chunk]); err != nil {
 			debug.Writef("virtio-fs.handleRequest writeGuest", "head=%d opcode=%s addr=0x%x chunk=%d error=%v", head, fuseOpcodeString(opcode), d.addr, chunk, err)
-			return 0, err
+			return 0, false, err
 		}
 		copyOffset += chunk
 		remaining -= chunk
@@ -811,10 +955,10 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 	}
 	if remaining != 0 {
 		debug.Writef("virtio-fs.handleRequest descriptors exhausted", "head=%d opcode=%s remaining=%d", head, fuseOpcodeString(opcode), remaining)
-		return 0, errors.New("virtio-fs: response descriptors exhausted")
+		return 0, false, errors.New("virtio-fs: response descriptors exhausted")
 	}
 
-	return used, nil
+	return used, false, nil
 }
 
 func (v *FS) readDescriptorChain(dev device, q *queue, head uint16) ([]fsDesc, error) {
@@ -1568,7 +1712,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 	case FUSE_GETLK:
 		debug.Writef("virtio-fs.dispatchFUSE op=GETLK", "node=%d", in.NodeID)
 		// fuse_lk_in: fh (u64), owner (u64), fuse_file_lock (start u64, end u64, type u32, pid u32), lk_flags (u32), padding (u32)
-		if len(req) < fuseHdrInSize+40 {
+		if len(req) < fuseHdrInSize+48 {
 			return 0, fmt.Errorf("FUSE_GETLK too short")
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
@@ -1577,10 +1721,11 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		lkEnd := binary.LittleEndian.Uint64(req[64:72])
 		lkType := binary.LittleEndian.Uint32(req[72:76])
 		lkPID := binary.LittleEndian.Uint32(req[76:80])
+		lkFlags := binary.LittleEndian.Uint32(req[80:84])
 		lk := FuseLock{Start: lkStart, End: lkEnd, Type: lkType, PID: lkPID}
-		debug.Writef("virtio-fs.dispatchFUSE op=GETLK", "fh=%d owner=%d lk=%+v", fh, owner, lk)
+		debug.Writef("virtio-fs.dispatchFUSE op=GETLK", "fh=%d owner=%d lk=%+v flags=%d", fh, owner, lk, lkFlags)
 		if be, ok := v.backend.(fsLockBackend); ok {
-			outLk, e := be.GetLk(in.NodeID, fh, owner, lk)
+			outLk, e := be.GetLk(in.NodeID, fh, owner, lk, lkFlags)
 			errno = e
 			if errno == 0 {
 				// fuse_lk_out: fuse_file_lock
@@ -1601,7 +1746,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			opName = "SETLKW"
 		}
 		debug.Writef("virtio-fs.dispatchFUSE op="+opName, "node=%d", in.NodeID)
-		if len(req) < fuseHdrInSize+40 {
+		if len(req) < fuseHdrInSize+48 {
 			return 0, fmt.Errorf("FUSE_%s too short", opName)
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
@@ -1614,10 +1759,12 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		lk := FuseLock{Start: lkStart, End: lkEnd, Type: lkType, PID: lkPID}
 		debug.Writef("virtio-fs.dispatchFUSE op="+opName, "fh=%d owner=%d lk=%+v flags=%d", fh, owner, lk, lkFlags)
 		if be, ok := v.backend.(fsLockBackend); ok {
-			if in.Opcode == FUSE_SETLKW {
-				errno = be.SetLkW(in.NodeID, fh, owner, lk, lkFlags)
-			} else {
-				errno = be.SetLk(in.NodeID, fh, owner, lk, lkFlags)
+			// IMPORTANT: Do NOT block inside dispatch. This runs on the VM/device thread.
+			// For SETLKW, we attempt a non-blocking acquisition and if it would block we
+			// defer replying (see errDeferReply handling in handleRequest/processQueue).
+			errno = be.SetLk(in.NodeID, fh, owner, lk, lkFlags)
+			if in.Opcode == FUSE_SETLKW && errno == -int32(linux.EAGAIN) {
+				return 0, errDeferReply
 			}
 		} else {
 			errno = -int32(linux.ENOSYS)
@@ -1647,9 +1794,20 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		debug.Writef("virtio-fs.dispatchFUSE op=DESTROY", "node=%d", in.NodeID)
 
 	case FUSE_FLUSH:
-		// Flush pending writes before close. For an in-memory filesystem, this is a no-op.
+		// fuse_flush_in: fh (u64), unused (u32), padding (u32), lock_owner (u64)
+		// Linux uses lock_owner for POSIX lock cleanup on close.
 		debug.Writef("virtio-fs.dispatchFUSE op=FLUSH", "node=%d", in.NodeID)
-		// Return success - nothing to flush.
+		if len(req) < fuseHdrInSize+24 {
+			return 0, fmt.Errorf("FUSE_FLUSH too short")
+		}
+		fh := binary.LittleEndian.Uint64(req[40:48])
+		lockOwner := binary.LittleEndian.Uint64(req[56:64])
+		debug.Writef("virtio-fs.dispatchFUSE op=FLUSH", "fh=%d lockOwner=%d", fh, lockOwner)
+		if be, ok := v.backend.(fsFlushBackend); ok {
+			errno = be.Flush(in.NodeID, fh, lockOwner)
+		} else {
+			errno = 0
+		}
 
 	case FUSE_IOCTL, FUSE_POLL:
 		// Unsupported but expected; return ENOSYS quietly.
