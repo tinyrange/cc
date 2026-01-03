@@ -306,7 +306,10 @@ type fsNode struct {
 	rawMode uint32 // raw mode from mknod (includes S_IFSOCK, S_IFIFO, etc.)
 	rdev    uint32 // device number for device nodes
 	size    uint64
-	extents []fsExtent
+	// Sparse file storage. We model allocation at a fixed block granularity to
+	// provide realistic SEEK_DATA/SEEK_HOLE behavior (xfstests seek_sanity_test).
+	// Key is block index (offset / fileBlockSize), value is a full block.
+	blocks  map[uint64][]byte
 	entries map[string]uint64
 	xattr   map[string][]byte
 	modTime time.Time // best-effort mtime
@@ -345,6 +348,7 @@ func newFileNode(id uint64, name string, parent uint64, perm fs.FileMode) *fsNod
 		name:    name,
 		parent:  parent,
 		mode:    perm,
+		blocks:  make(map[uint64][]byte),
 		xattr:   make(map[string][]byte),
 		modTime: now,
 		aTime:   now,
@@ -385,14 +389,16 @@ func (n *fsNode) blockUsage() uint64 {
 		}
 		return (size + 511) / 512
 	}
-	var used uint64
-	for _, e := range n.extents {
-		used += uint64(len(e.data))
+	const fileBlockSize = uint64(4096)
+	if len(n.blocks) == 0 {
+		if n.size > 0 {
+			// Conservative: sparse file with size but no allocated blocks.
+			return 0
+		}
+		return 0
 	}
-	if used == 0 && n.size > 0 {
-		return 1
-	}
-	return (used + 511) / 512
+	// Each allocated 4KiB block counts as 8×512B sectors.
+	return uint64(len(n.blocks)) * (fileBlockSize / 512)
 }
 
 func (n *fsNode) attr() virtio.FuseAttr {
@@ -723,16 +729,23 @@ func (n *fsNode) read(off uint64, size uint32) ([]byte, error) {
 	if n.abstractFile != nil {
 		return n.abstractFile.ReadAt(off, size)
 	}
+	const fileBlockSize = uint64(4096)
 	buf := make([]byte, size)
 	end := off + uint64(size)
-	for _, e := range n.extents {
-		eEnd := e.off + uint64(len(e.data))
-		if eEnd <= off || e.off >= end {
+
+	// Iterate blocks overlapping [off, end).
+	first := off / fileBlockSize
+	last := (end - 1) / fileBlockSize
+	for bi := first; bi <= last; bi++ {
+		b, ok := n.blocks[bi]
+		if !ok {
 			continue
 		}
-		start := max64(off, e.off)
-		stop := min64(end, eEnd)
-		copy(buf[start-off:stop-off], e.data[start-e.off:stop-e.off])
+		bStart := bi * fileBlockSize
+		bEnd := bStart + fileBlockSize
+		start := max64(off, bStart)
+		stop := min64(end, bEnd)
+		copy(buf[start-off:stop-off], b[int(start-bStart):int(stop-bStart)])
 	}
 	return buf, nil
 }
@@ -766,6 +779,10 @@ func (n *fsNode) write(off uint64, data []byte) error {
 	if len(data) == 0 {
 		return nil
 	}
+	if n.blocks == nil {
+		n.blocks = make(map[uint64][]byte)
+	}
+	const fileBlockSize = uint64(4096)
 	// Linux clears setuid on write by unprivileged writers. It clears setgid on
 	// write only when the file is group-executable (i.e. setgid in the "s" form),
 	// but preserves setgid when group-exec is not set (the "S" form, used for
@@ -776,9 +793,30 @@ func (n *fsNode) write(off uint64, data []byte) error {
 	if n.mode&modeSetgid != 0 && (n.mode&0o010) != 0 {
 		n.mode &^= modeSetgid
 	}
-	n.extents = mergeExtents(append(n.extents, fsExtent{off: off, data: append([]byte(nil), data...)}))
-	if off+uint64(len(data)) > n.size {
-		n.size = off + uint64(len(data))
+
+	// Block-based write with correct overwrite semantics.
+	pos := off
+	i := 0
+	for i < len(data) {
+		bi := pos / fileBlockSize
+		inBlock := pos % fileBlockSize
+		nAvail := int(fileBlockSize - inBlock)
+		toCopy := len(data) - i
+		if toCopy > nAvail {
+			toCopy = nAvail
+		}
+		blk, ok := n.blocks[bi]
+		if !ok {
+			blk = make([]byte, fileBlockSize)
+			n.blocks[bi] = blk
+		}
+		start := int(inBlock)
+		copy(blk[start:start+toCopy], data[i:i+toCopy])
+		pos += uint64(toCopy)
+		i += toCopy
+	}
+	if end := off + uint64(len(data)); end > n.size {
+		n.size = end
 	}
 	now := time.Now()
 	n.modTime = bumpTime(n.modTime, now)
@@ -790,6 +828,7 @@ func (n *fsNode) truncate(size uint64) error {
 	if n.abstractFile != nil {
 		return n.abstractFile.Truncate(size)
 	}
+	const fileBlockSize = uint64(4096)
 	// Truncation clears setuid; it clears setgid only when the file is
 	// group-executable (mirrors Linux behavior and xfstests expectations).
 	if n.mode&modeSetuid != 0 {
@@ -805,17 +844,28 @@ func (n *fsNode) truncate(size uint64) error {
 		n.ctime = bumpTime(n.ctime, now)
 		return nil
 	}
-	var kept []fsExtent
-	for _, e := range n.extents {
-		if e.off >= size {
-			continue
+	// Drop blocks beyond EOF.
+	if n.blocks != nil {
+		if size == 0 {
+			for k := range n.blocks {
+				delete(n.blocks, k)
+			}
+		} else {
+			lastKeep := (size - 1) / fileBlockSize
+			for bi := range n.blocks {
+				if bi > lastKeep {
+					delete(n.blocks, bi)
+				}
+			}
+			// Zero bytes beyond new EOF within the last block to avoid resurrecting
+			// stale data if the file is later extended.
+			if rem := size % fileBlockSize; rem != 0 {
+				if blk, ok := n.blocks[lastKeep]; ok {
+					clear(blk[int(rem):])
+				}
+			}
 		}
-		if e.off+uint64(len(e.data)) > size {
-			e.data = e.data[:size-e.off]
-		}
-		kept = append(kept, e)
 	}
-	n.extents = kept
 	n.size = size
 	now := time.Now()
 	n.modTime = bumpTime(n.modTime, now)
@@ -1403,39 +1453,160 @@ func (v *virtioFsBackend) Lseek(nodeID uint64, fh uint64, offset uint64, whence 
 	if n.isDir() {
 		return 0, -int32(linux.EISDIR)
 	}
-	ext := n.extents
+	// SEEK_HOLE/DATA use signed offsets; negative offsets are rejected with ENXIO
+	// (xfstests seek_sanity_test expects ENXIO).
+	if int64(offset) < 0 {
+		return 0, -int32(linux.ENXIO)
+	}
+	const fileBlockSize = uint64(4096)
 	switch whence {
 	case uint32(linux.SEEK_DATA):
-		if offset >= n.size || len(ext) == 0 {
+		if offset >= n.size || len(n.blocks) == 0 {
 			return 0, -int32(linux.ENXIO)
 		}
-		for _, e := range ext {
-			eEnd := e.off + uint64(len(e.data))
-			if offset < e.off {
-				return e.off, 0
-			}
-			if offset >= e.off && offset < eEnd {
-				return offset, 0
-			}
+		bi := offset / fileBlockSize
+		if _, ok := n.blocks[bi]; ok {
+			return offset, 0
 		}
-		return 0, -int32(linux.ENXIO)
+		// Find next allocated block.
+		next := bi + 1
+		for {
+			if _, ok := n.blocks[next]; ok {
+				off := next * fileBlockSize
+				if off >= n.size {
+					return 0, -int32(linux.ENXIO)
+				}
+				return off, 0
+			}
+			// Stop if we would definitely be past EOF.
+			if next*fileBlockSize >= n.size {
+				return 0, -int32(linux.ENXIO)
+			}
+			next++
+		}
 	case uint32(linux.SEEK_HOLE):
 		if offset >= n.size {
 			return offset, 0
 		}
-		for _, e := range ext {
-			eEnd := e.off + uint64(len(e.data))
-			if offset < e.off {
-				return offset, 0
-			}
-			if offset >= e.off && offset < eEnd {
-				return eEnd, 0
-			}
+		if len(n.blocks) == 0 {
+			return offset, 0
 		}
-		return n.size, 0
+		bi := offset / fileBlockSize
+		if _, ok := n.blocks[bi]; !ok {
+			return offset, 0
+		}
+		// Find end of contiguous allocated run.
+		next := bi + 1
+		for {
+			if _, ok := n.blocks[next]; !ok {
+				off := next * fileBlockSize
+				if off > n.size {
+					return n.size, 0
+				}
+				return off, 0
+			}
+			next++
+		}
 	default:
 		return 0, -int32(linux.EINVAL)
 	}
+}
+
+func (v *virtioFsBackend) Fallocate(nodeID uint64, fh uint64, offset uint64, length uint64, mode uint32) int32 {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	nid, ok := v.handles[fh]
+	if !ok || nid != nodeID {
+		return -int32(linux.EBADF)
+	}
+	n, err := v.node(nid)
+	if err != 0 {
+		return err
+	}
+	if n.isDir() {
+		return -int32(linux.EISDIR)
+	}
+	if length == 0 {
+		return 0
+	}
+	const errOpNotSupp = int32(95) // EOPNOTSUPP/ENOTSUP
+	const fileBlockSize = uint64(4096)
+	// Only support the modes needed by xfstests/fsx/xfs_io:
+	// - mode 0
+	// - FALLOC_FL_KEEP_SIZE
+	// Optionally support PUNCH_HOLE|KEEP_SIZE as a convenience.
+	allowed := uint32(linux.FALLOC_FL_KEEP_SIZE | linux.FALLOC_FL_PUNCH_HOLE)
+	if mode&^allowed != 0 {
+		return -errOpNotSupp
+	}
+	if (mode&uint32(linux.FALLOC_FL_PUNCH_HOLE)) != 0 && (mode&uint32(linux.FALLOC_FL_KEEP_SIZE)) == 0 {
+		// Linux requires KEEP_SIZE with PUNCH_HOLE.
+		return -int32(linux.EINVAL)
+	}
+	if n.abstractFile != nil {
+		// Abstract backing doesn't expose allocation semantics.
+		return -errOpNotSupp
+	}
+	if n.blocks == nil {
+		n.blocks = make(map[uint64][]byte)
+	}
+
+	end := offset + length
+	sizeBefore := n.size
+	if (mode & uint32(linux.FALLOC_FL_PUNCH_HOLE)) != 0 {
+		// Convert the range to a hole by deleting/zeroing blocks in range.
+		start := offset
+		stop := end
+		first := start / fileBlockSize
+		last := (stop - 1) / fileBlockSize
+		for bi := first; bi <= last; bi++ {
+			bStart := bi * fileBlockSize
+			bEnd := bStart + fileBlockSize
+			hStart := max64(start, bStart)
+			hEnd := min64(stop, bEnd)
+			if hStart == bStart && hEnd == bEnd {
+				delete(n.blocks, bi)
+				continue
+			}
+			blk, ok := n.blocks[bi]
+			if !ok {
+				continue
+			}
+			clear(blk[int(hStart-bStart):int(hEnd-bStart)])
+		}
+		// KEEP_SIZE enforced above; size unchanged.
+	} else if (mode & uint32(linux.FALLOC_FL_KEEP_SIZE)) == 0 {
+		// Default fallocate extends file size.
+		if end > n.size {
+			n.size = end
+		}
+		// Allocate blocks for the newly reserved range.
+		first := offset / fileBlockSize
+		last := (end - 1) / fileBlockSize
+		for bi := first; bi <= last; bi++ {
+			if _, ok := n.blocks[bi]; !ok {
+				n.blocks[bi] = make([]byte, fileBlockSize)
+			}
+		}
+	} else {
+		// KEEP_SIZE: allocate blocks but do not extend size.
+		first := offset / fileBlockSize
+		last := (end - 1) / fileBlockSize
+		for bi := first; bi <= last; bi++ {
+			if _, ok := n.blocks[bi]; !ok {
+				n.blocks[bi] = make([]byte, fileBlockSize)
+			}
+		}
+	}
+
+	now := time.Now()
+	n.ctime = bumpTime(n.ctime, now)
+	if n.size != sizeBefore {
+		// Size change updates mtime as well.
+		n.modTime = bumpTime(n.modTime, now)
+	}
+	return 0
 }
 
 func (v *virtioFsBackend) SetXattr(nodeID uint64, name string, value []byte, flags uint32, reqUID uint32, reqGID uint32) int32 {

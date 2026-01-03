@@ -216,6 +216,7 @@ const (
 	FUSE_RELEASEDIR  = 29
 	FUSE_FSYNCDIR    = 30
 	FUSE_CREATE      = 35
+	FUSE_FALLOCATE   = 43
 	FUSE_RENAME2     = 45
 	FUSE_LSEEK       = 46
 )
@@ -401,6 +402,11 @@ type fsSetattrBackend interface {
 
 type fsLseekBackend interface {
 	Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32) (uint64, int32)
+}
+
+type fsFallocateBackend interface {
+	// Fallocate implements fallocate(2) on an open file handle.
+	Fallocate(nodeID uint64, fh uint64, offset uint64, length uint64, mode uint32) int32
 }
 
 type fsLinkBackend interface {
@@ -1486,6 +1492,12 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		offset := binary.LittleEndian.Uint64(req[48:56])
 		whence := binary.LittleEndian.Uint32(req[56:60])
+		// lseek offsets are signed; negative offsets are encoded in two's complement.
+		// xfstests expects ENXIO for negative SEEK_HOLE/SEEK_DATA offsets.
+		if int64(offset) < 0 {
+			errno = -int32(linux.ENXIO)
+			break
+		}
 		debug.Writef("virtio-fs.dispatchFUSE op=LSEEK", "fh=%d offset=%d whence=%d", fh, offset, whence)
 		if be, ok := v.backend.(fsLseekBackend); ok {
 			newOff, e := be.Lseek(in.NodeID, fh, offset, whence)
@@ -1496,6 +1508,28 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 				binary.LittleEndian.PutUint64(extra[0:8], newOff)
 				return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
 			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_FALLOCATE:
+		// fuse_fallocate_in: fh (u64), offset (u64), length (u64), mode (u32), padding (u32)
+		debug.Writef("virtio-fs.dispatchFUSE op=FALLOCATE", "node=%d", in.NodeID)
+		if len(req) < fuseHdrInSize+32 {
+			return 0, fmt.Errorf("FUSE_FALLOCATE too short")
+		}
+		fh := binary.LittleEndian.Uint64(req[40:48])
+		off := binary.LittleEndian.Uint64(req[48:56])
+		length := binary.LittleEndian.Uint64(req[56:64])
+		mode := binary.LittleEndian.Uint32(req[64:68])
+		// Negative offsets/lengths are encoded in two's complement; treat as invalid.
+		if int64(off) < 0 || int64(length) < 0 {
+			errno = -int32(linux.EINVAL)
+			break
+		}
+		debug.Writef("virtio-fs.dispatchFUSE op=FALLOCATE", "fh=%d off=%d len=%d mode=0x%x", fh, off, length, mode)
+		if be, ok := v.backend.(fsFallocateBackend); ok {
+			errno = be.Fallocate(in.NodeID, fh, off, length, mode)
 		} else {
 			errno = -int32(linux.ENOSYS)
 		}
