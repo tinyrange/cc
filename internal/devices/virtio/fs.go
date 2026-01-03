@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"path"
 	"sync"
+	"time"
 
 	"github.com/tinyrange/cc/internal/debug"
 	"github.com/tinyrange/cc/internal/fdt"
@@ -395,7 +396,7 @@ type fsRemoveBackend interface {
 }
 
 type fsSetattrBackend interface {
-	SetAttr(nodeID uint64, size *uint64, mode *uint32, uid *uint32, gid *uint32, reqUID uint32, reqGID uint32) int32
+	SetAttr(nodeID uint64, size *uint64, mode *uint32, uid *uint32, gid *uint32, atime *time.Time, mtime *time.Time, reqUID uint32, reqGID uint32) int32
 }
 
 type fsLseekBackend interface {
@@ -1376,6 +1377,10 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		const fattrUid = 1 << 1
 		const fattrGid = 1 << 2
 		const fattrSize = 1 << 3
+		const fattrAtime = 1 << 4
+		const fattrMtime = 1 << 5
+		const fattrAtimeNow = 1 << 7
+		const fattrMtimeNow = 1 << 8
 		var sizeVal *uint64
 		if valid&fattrSize != 0 {
 			val := binary.LittleEndian.Uint64(req[56:64])
@@ -1421,10 +1426,43 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 				gidVal = &val
 			}
 		}
+		var atimeVal *time.Time
+		var mtimeVal *time.Time
+		// atime/mtime are at offsets 72/80 with nsec at 96/100 (see comment above).
+		// FUSE uses u64 seconds/u32 nsec; seconds may represent negative values in
+		// two's complement (pre-epoch).
+		if (valid&(fattrAtime|fattrAtimeNow)) != 0 && len(req) >= 104 {
+			sec := int64(binary.LittleEndian.Uint64(req[72:80]))
+			nsec := binary.LittleEndian.Uint32(req[96:100])
+			switch {
+			case valid&fattrAtimeNow != 0 || nsec == uint32(linux.UTIME_NOW):
+				t := time.Now()
+				atimeVal = &t
+			case nsec == uint32(linux.UTIME_OMIT):
+				// omit
+			default:
+				t := time.Unix(sec, int64(nsec))
+				atimeVal = &t
+			}
+		}
+		if (valid&(fattrMtime|fattrMtimeNow)) != 0 && len(req) >= 104 {
+			sec := int64(binary.LittleEndian.Uint64(req[80:88]))
+			nsec := binary.LittleEndian.Uint32(req[100:104])
+			switch {
+			case valid&fattrMtimeNow != 0 || nsec == uint32(linux.UTIME_NOW):
+				t := time.Now()
+				mtimeVal = &t
+			case nsec == uint32(linux.UTIME_OMIT):
+				// omit
+			default:
+				t := time.Unix(sec, int64(nsec))
+				mtimeVal = &t
+			}
+		}
 		if be, ok := v.backend.(fsSetattrBackend); ok {
-			errno = be.SetAttr(in.NodeID, sizeVal, modeVal, uidVal, gidVal, in.UID, in.GID)
+			errno = be.SetAttr(in.NodeID, sizeVal, modeVal, uidVal, gidVal, atimeVal, mtimeVal, in.UID, in.GID)
 			if errno == 0 {
-				debug.Writef("virtio-fs.dispatchFUSE op=SETATTR applied", "size=%v mode=%v uid=%v gid=%v", sizeVal, modeVal, uidVal, gidVal)
+				debug.Writef("virtio-fs.dispatchFUSE op=SETATTR applied", "size=%v mode=%v uid=%v gid=%v atime=%v mtime=%v", sizeVal, modeVal, uidVal, gidVal, atimeVal, mtimeVal)
 				attr, e := v.backend.GetAttr(in.NodeID)
 				errno = e
 				if errno == 0 {

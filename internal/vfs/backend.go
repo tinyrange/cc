@@ -309,7 +309,8 @@ type fsNode struct {
 	extents []fsExtent
 	entries map[string]uint64
 	xattr   map[string][]byte
-	modTime time.Time // best-effort mtime/atime
+	modTime time.Time // best-effort mtime
+	aTime   time.Time // best-effort atime
 	ctime   time.Time // change time (metadata changes like chmod/chown/xattr)
 	nlink   uint32    // number of hard links (0 means 1 for backwards compat)
 	uid     uint32    // owner user ID
@@ -332,6 +333,7 @@ func newDirNode(id uint64, name string, parent uint64, perm fs.FileMode) *fsNode
 		entries: make(map[string]uint64),
 		xattr:   make(map[string][]byte),
 		modTime: now,
+		aTime:   now,
 		ctime:   now,
 	}
 }
@@ -345,8 +347,23 @@ func newFileNode(id uint64, name string, parent uint64, perm fs.FileMode) *fsNod
 		mode:    perm,
 		xattr:   make(map[string][]byte),
 		modTime: now,
+		aTime:   now,
 		ctime:   now,
 	}
+}
+
+func bumpTime(prev time.Time, next time.Time) time.Time {
+	if prev.IsZero() {
+		return next
+	}
+	if next.IsZero() {
+		return prev
+	}
+	// Compare on wall-clock only; UnixNano works for pre-epoch values too.
+	if next.UnixNano() <= prev.UnixNano() {
+		return time.Unix(0, prev.UnixNano()+1)
+	}
+	return next
 }
 
 func (n *fsNode) isDir() bool {
@@ -382,17 +399,20 @@ func (n *fsNode) attr() virtio.FuseAttr {
 	var perm fs.FileMode
 	var size uint64
 	modTime := n.modTime
+	aTime := n.aTime
 	chgTime := n.ctime
 
 	if n.abstractFile != nil {
 		size, perm = n.abstractFile.Stat()
 		if mt := n.abstractFile.ModTime(); !mt.IsZero() {
 			modTime = mt
+			aTime = mt
 		}
 	} else if n.abstractDir != nil {
 		perm = n.abstractDir.Stat()
 		if mt := n.abstractDir.ModTime(); !mt.IsZero() {
 			modTime = mt
+			aTime = mt
 		}
 	} else if n.isSymlink() {
 		perm = n.mode & modePermMask
@@ -407,6 +427,9 @@ func (n *fsNode) attr() virtio.FuseAttr {
 
 	if modTime.IsZero() {
 		modTime = time.Unix(0, 0)
+	}
+	if aTime.IsZero() {
+		aTime = modTime
 	}
 	if chgTime.IsZero() {
 		// Preserve legacy behavior: if we haven't tracked ctime, mirror modTime.
@@ -442,11 +465,10 @@ func (n *fsNode) attr() virtio.FuseAttr {
 		nlink = 2 + uint32(entryCount)
 	}
 
-	asec := uint64(modTime.Unix())
-	ansec := uint32(modTime.Nanosecond())
-	// We don't currently track atime separately, so mirror mtime.
-	msec := asec
-	mnsec := ansec
+	asec := uint64(int64(aTime.Unix()))
+	ansec := uint32(aTime.Nanosecond())
+	msec := uint64(int64(modTime.Unix()))
+	mnsec := uint32(modTime.Nanosecond())
 	csec := uint64(chgTime.Unix())
 	cnsec := uint32(chgTime.Nanosecond())
 
@@ -686,6 +708,7 @@ func (v *virtioFsBackend) createAbstractNode(parent *fsNode, name string, entry 
 	}
 
 	node.modTime = modTime
+	node.aTime = modTime
 	node.ctime = modTime
 	v.nodes[id] = node
 	// Cache in parent's entries for future lookups
@@ -758,8 +781,8 @@ func (n *fsNode) write(off uint64, data []byte) error {
 		n.size = off + uint64(len(data))
 	}
 	now := time.Now()
-	n.modTime = now
-	n.ctime = now
+	n.modTime = bumpTime(n.modTime, now)
+	n.ctime = bumpTime(n.ctime, now)
 	return nil
 }
 
@@ -778,8 +801,8 @@ func (n *fsNode) truncate(size uint64) error {
 	if size >= n.size {
 		n.size = size
 		now := time.Now()
-		n.modTime = now
-		n.ctime = now
+		n.modTime = bumpTime(n.modTime, now)
+		n.ctime = bumpTime(n.ctime, now)
 		return nil
 	}
 	var kept []fsExtent
@@ -795,8 +818,8 @@ func (n *fsNode) truncate(size uint64) error {
 	n.extents = kept
 	n.size = size
 	now := time.Now()
-	n.modTime = now
-	n.ctime = now
+	n.modTime = bumpTime(n.modTime, now)
+	n.ctime = bumpTime(n.ctime, now)
 	return nil
 }
 
@@ -912,6 +935,9 @@ func (v *virtioFsBackend) Read(nodeID uint64, fh uint64, off uint64, size uint32
 	if readErr != nil {
 		return nil, -int32(linux.EIO)
 	}
+	// Best-effort atime tracking.
+	now := time.Now()
+	n.aTime = bumpTime(n.aTime, now)
 	return data, 0
 }
 
@@ -1201,8 +1227,9 @@ func (v *virtioFsBackend) Create(parent uint64, name string, mode uint32, flags 
 	parentNode.entries[clean] = id
 	if parentNode.abstractDir == nil {
 		now := time.Now()
-		parentNode.modTime = now
-		parentNode.ctime = now
+		parentNode.modTime = bumpTime(parentNode.modTime, now)
+		parentNode.aTime = bumpTime(parentNode.aTime, now)
+		parentNode.ctime = bumpTime(parentNode.ctime, now)
 	}
 	v.nodes[id] = node
 
@@ -1271,8 +1298,9 @@ func (v *virtioFsBackend) Mkdir(parent uint64, name string, mode uint32, umask u
 	parentNode.entries[clean] = id
 	if parentNode.abstractDir == nil {
 		now := time.Now()
-		parentNode.modTime = now
-		parentNode.ctime = now
+		parentNode.modTime = bumpTime(parentNode.modTime, now)
+		parentNode.aTime = bumpTime(parentNode.aTime, now)
+		parentNode.ctime = bumpTime(parentNode.ctime, now)
 	}
 	v.nodes[id] = node
 	return id, node.attr(), 0
@@ -1331,8 +1359,9 @@ func (v *virtioFsBackend) Mknod(parent uint64, name string, mode uint32, rdev ui
 	parentNode.entries[clean] = id
 	if parentNode.abstractDir == nil {
 		now := time.Now()
-		parentNode.modTime = now
-		parentNode.ctime = now
+		parentNode.modTime = bumpTime(parentNode.modTime, now)
+		parentNode.aTime = bumpTime(parentNode.aTime, now)
+		parentNode.ctime = bumpTime(parentNode.ctime, now)
 	}
 	v.nodes[id] = node
 	return id, node.attr(), 0
@@ -1461,7 +1490,7 @@ func (v *virtioFsBackend) SetXattr(nodeID uint64, name string, value []byte, fla
 			n.rawMode &^= uint32(modeSetgid)
 		}
 	}
-	n.ctime = time.Now()
+	n.ctime = bumpTime(n.ctime, time.Now())
 	return 0
 }
 
@@ -1525,7 +1554,7 @@ func (v *virtioFsBackend) RemoveXattr(nodeID uint64, name string) int32 {
 		return -errNoData
 	}
 	delete(n.xattr, name)
-	n.ctime = time.Now()
+	n.ctime = bumpTime(n.ctime, time.Now())
 	return 0
 }
 
@@ -1569,16 +1598,19 @@ func (v *virtioFsBackend) Rename(oldParent uint64, oldName string, newParent uin
 	node.name = dstName
 	now := time.Now()
 	if srcParent.abstractDir == nil {
-		srcParent.modTime = now
-		srcParent.ctime = now
+		srcParent.modTime = bumpTime(srcParent.modTime, now)
+		srcParent.aTime = bumpTime(srcParent.aTime, now)
+		srcParent.ctime = bumpTime(srcParent.ctime, now)
 	}
 	if dstParent.abstractDir == nil {
-		dstParent.modTime = now
-		dstParent.ctime = now
+		dstParent.modTime = bumpTime(dstParent.modTime, now)
+		dstParent.aTime = bumpTime(dstParent.aTime, now)
+		dstParent.ctime = bumpTime(dstParent.ctime, now)
 	}
 	if node.abstractFile == nil && node.abstractDir == nil {
-		node.modTime = now
-		node.ctime = now
+		node.modTime = bumpTime(node.modTime, now)
+		node.aTime = bumpTime(node.aTime, now)
+		node.ctime = bumpTime(node.ctime, now)
 	}
 	return 0
 }
@@ -1615,9 +1647,12 @@ func (v *virtioFsBackend) Unlink(parent uint64, name string) int32 {
 	delete(parentNode.entries, clean)
 	if parentNode.abstractDir == nil {
 		now := time.Now()
-		parentNode.modTime = now
-		parentNode.ctime = now
+		parentNode.modTime = bumpTime(parentNode.modTime, now)
+		parentNode.aTime = bumpTime(parentNode.aTime, now)
+		parentNode.ctime = bumpTime(parentNode.ctime, now)
 	}
+	// POSIX: unlink changes target inode metadata (nlink), so ctime must update.
+	node.ctime = bumpTime(node.ctime, time.Now())
 	// Decrement link count; only delete node when no more links remain
 	if node.nlink <= 1 {
 		// nlink==0 means 1 link (implicit), nlink==1 means 1 link (explicit)
@@ -1658,24 +1693,38 @@ func (v *virtioFsBackend) Rmdir(parent uint64, name string) int32 {
 	delete(parentNode.entries, clean)
 	if parentNode.abstractDir == nil {
 		now := time.Now()
-		parentNode.modTime = now
-		parentNode.ctime = now
+		parentNode.modTime = bumpTime(parentNode.modTime, now)
+		parentNode.aTime = bumpTime(parentNode.aTime, now)
+		parentNode.ctime = bumpTime(parentNode.ctime, now)
 	}
 	delete(v.nodes, id)
 	return 0
 }
 
-func (v *virtioFsBackend) SetAttr(nodeID uint64, size *uint64, mode *uint32, uid *uint32, gid *uint32, reqUID uint32, reqGID uint32) int32 {
+func (v *virtioFsBackend) SetAttr(nodeID uint64, size *uint64, mode *uint32, uid *uint32, gid *uint32, atime *time.Time, mtime *time.Time, reqUID uint32, reqGID uint32) int32 {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
-	if size == nil && mode == nil && uid == nil && gid == nil {
+	if size == nil && mode == nil && uid == nil && gid == nil && atime == nil && mtime == nil {
 		return 0
 	}
 	v.ensureRoot()
 	n, err := v.node(nodeID)
 	if err != 0 {
 		return err
+	}
+	timeTouched := false
+	if atime != nil {
+		n.aTime = *atime
+		timeTouched = true
+	}
+	if mtime != nil {
+		n.modTime = *mtime
+		timeTouched = true
+	}
+	if timeTouched {
+		// Updating timestamps is a metadata change; bump ctime to now.
+		n.ctime = bumpTime(n.ctime, time.Now())
 	}
 	if size != nil {
 		if truncErr := n.truncate(*size); truncErr != nil {
@@ -1708,9 +1757,7 @@ func (v *virtioFsBackend) SetAttr(nodeID uint64, size *uint64, mode *uint32, uid
 			// permission + special bits.
 			n.rawMode = (n.rawMode &^ uint32(modePermMask)) | uint32(newBits&modePermMask)
 		}
-		now := time.Now()
-		n.modTime = now
-		n.ctime = now
+		n.ctime = bumpTime(n.ctime, time.Now())
 	}
 	if uid != nil || gid != nil {
 		if uid != nil {
@@ -1726,9 +1773,7 @@ func (v *virtioFsBackend) SetAttr(nodeID uint64, size *uint64, mode *uint32, uid
 		if n.mode&modeSetgid != 0 && (n.mode&0o010) != 0 {
 			n.mode &^= modeSetgid
 		}
-		now := time.Now()
-		n.modTime = now
-		n.ctime = now
+		n.ctime = bumpTime(n.ctime, time.Now())
 	}
 	return 0
 }
@@ -1774,8 +1819,9 @@ func (v *virtioFsBackend) Symlink(parent uint64, name string, target string, _ u
 	}
 	parentNode.entries[clean] = id
 	if parentNode.abstractDir == nil {
-		parentNode.modTime = now
-		parentNode.ctime = now
+		parentNode.modTime = bumpTime(parentNode.modTime, now)
+		parentNode.aTime = bumpTime(parentNode.aTime, now)
+		parentNode.ctime = bumpTime(parentNode.ctime, now)
 	}
 	v.nodes[id] = node
 	return id, node.attr(), 0
@@ -1832,10 +1878,13 @@ func (v *virtioFsBackend) Link(oldNodeID uint64, newParent uint64, newName strin
 	} else {
 		oldNode.nlink++
 	}
+	// POSIX: link changes target inode metadata (nlink), so ctime must update.
+	oldNode.ctime = bumpTime(oldNode.ctime, time.Now())
 	if parentNode.abstractDir == nil {
 		now := time.Now()
-		parentNode.modTime = now
-		parentNode.ctime = now
+		parentNode.modTime = bumpTime(parentNode.modTime, now)
+		parentNode.aTime = bumpTime(parentNode.aTime, now)
+		parentNode.ctime = bumpTime(parentNode.ctime, now)
 	}
 	return oldNodeID, oldNode.attr(), 0
 }
@@ -1907,6 +1956,7 @@ func (v *virtioFsBackend) AddAbstractFile(filePath string, file AbstractFile) er
 		xattr:        make(map[string][]byte),
 		abstractFile: file,
 		modTime:      modTime,
+		aTime:        modTime,
 		ctime:        modTime,
 	}
 	// Check if the file provides ownership info
@@ -1917,8 +1967,9 @@ func (v *virtioFsBackend) AddAbstractFile(filePath string, file AbstractFile) er
 	parent.entries[name] = id
 	if parent.abstractDir == nil {
 		now := time.Now()
-		parent.modTime = now
-		parent.ctime = now
+		parent.modTime = bumpTime(parent.modTime, now)
+		parent.aTime = bumpTime(parent.aTime, now)
+		parent.ctime = bumpTime(parent.ctime, now)
 	}
 	v.nodes[id] = node
 	return nil
