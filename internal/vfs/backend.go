@@ -590,31 +590,46 @@ func (v *virtioFsBackend) ReadDir(nodeID uint64, off uint64, maxBytes uint32) ([
 	// Collect all entry names, avoiding duplicates
 	nameSet := make(map[string]bool)
 	for name := range dirNode.entries {
+		// Never allow "." or ".." to come from the backing store.
+		if name == "." || name == ".." {
+			continue
+		}
 		nameSet[name] = true
 	}
 	// Also include entries from abstract directory if present
 	if dirNode.abstractDir != nil {
 		if abstractEntries, err := dirNode.abstractDir.ReadDir(); err == nil {
 			for _, entry := range abstractEntries {
+				if entry.Name == "." || entry.Name == ".." {
+					continue
+				}
 				nameSet[entry.Name] = true
 			}
 		}
 	}
 
+	// FUSE "off" is an opaque cookie provided by the filesystem (us) to the kernel.
+	// The kernel passes it back to continue enumeration. It is *not* a byte offset.
+	//
+	// We implement it as a stable, 0-based entry index into a deterministic name list
+	// that always starts with "." and "..". Each returned dirent's "off" field is the
+	// next index (i+1), so subsequent READDIR calls resume correctly.
 	names := make([]string, 0, len(nameSet)+2)
-	if off == 0 {
-		names = append(names, ".", "..")
-	}
+	names = append(names, ".", "..")
+	rest := make([]string, 0, len(nameSet))
 	for name := range nameSet {
-		names = append(names, name)
+		rest = append(rest, name)
 	}
-	sort.Strings(names)
+	sort.Strings(rest)
+	names = append(names, rest...)
+
+	if off >= uint64(len(names)) {
+		return []byte{}, 0
+	}
 
 	var buf []byte
-	for idx, name := range names {
-		if uint64(idx) < off {
-			continue
-		}
+	for idx := int(off); idx < len(names); idx++ {
+		name := names[idx]
 		typ := linux.DT_DIR
 		id := dirNode.id
 		if name == "." {
@@ -656,11 +671,12 @@ func (v *virtioFsBackend) ReadDir(nodeID uint64, off uint64, maxBytes uint32) ([
 				}
 			}
 		}
-		dirent := buildFuseDirent(id, name, uint32(typ), uint64(len(buf))+1)
-		buf = append(buf, dirent...)
-		if uint32(len(buf)) >= maxBytes {
+		// Cookie is the next entry index.
+		dirent := buildFuseDirent(id, name, uint32(typ), uint64(idx+1))
+		if maxBytes > 0 && len(buf)+len(dirent) > int(maxBytes) {
 			break
 		}
+		buf = append(buf, dirent...)
 	}
 
 	return buf, 0
