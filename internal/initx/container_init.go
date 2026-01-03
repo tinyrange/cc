@@ -169,6 +169,13 @@ func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
 			ir.Goto(errLabel),
 		}),
 
+		// /dev/fd symlink to /proc/self/fd
+		ir.Assign(errVar, ir.Syscall(defs.SYS_SYMLINKAT, "/proc/self/fd", ir.Int64(linux.AT_FDCWD), "/dev/fd")),
+		ir.If(ir.IsNegative(errVar), ir.Block{
+			ir.Printf("cc: failed to symlink /proc/self/fd to /dev/fd: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+			ir.Goto(errLabel),
+		}),
+
 		LogKmsg("cc: mounted devpts\n"),
 
 		// Set hostname.
