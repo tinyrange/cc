@@ -1,50 +1,28 @@
-Context is older than output tar file, using cached build...
-Running cc with image ./build/test-xfstests.tar and args ./build/test-xfstests.tar...
+Running cc with image ./build/test-xfstests.tar and args -add-virtiofs testfs,scratchfs ./build/test-xfstests.tar...
 FSTYP         -- virtiofs
 PLATFORM      -- Linux/x86_64 tinyrange 6.18.2-0-virt #1-Alpine SMP PREEMPT_DYNAMIC 2025-12-29 10:24:58
 MKFS_OPTIONS  -- scratchfs
 MOUNT_OPTIONS -- scratchfs /scratch
 
-generic/001        tac: /tmp/cutmp43C48J: write error: No such file or directory
- 24s
-generic/002        tac: /tmp/cutmpaXR6uz: write error: No such file or directory
- 2s
+generic/001         24s
+generic/002         2s
 generic/003        [not run] atime related mount options have no effect on virtiofs
 generic/004        [not run] O_TMPFILE is not supported
-generic/005        tac: /tmp/cutmpReToBk: write error: No such file or directory
- 2s
-generic/006        tac: /tmp/cutmpfJOOXn: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/006.out.bad)
-    --- tests/generic/006.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/006.out.bad	2026-01-02 07:10:59.439021998 +0000
-    @@ -3,9 +3,11 @@
-     single thread permname
-     ----------------------
-     alpha size = 4, name length = 6, total files = 4096, nproc=1
-    -4097 files created
-    +1023 files created
-     
-     multi thread permname
-    ...
-    (Run 'diff -u /opt/xfstests/tests/generic/006.out /opt/xfstests/results//generic/006.out.bad'  to see the entire diff)
-generic/007        tac: /tmp/cutmpjdUCKr: write error: No such file or directory
- 14s
+generic/005         1s
+generic/006         6s
+generic/007         14s
 generic/008        [not run] xfs_io fzero  failed (old kernel/wrong fs?)
 generic/009        [not run] xfs_io fzero  failed (old kernel/wrong fs?)
-generic/011        tac: /tmp/cutmpeI3H2k: write error: No such file or directory
- 15s
+generic/011         10s
 generic/012        [not run] xfs_io fpunch  failed (old kernel/wrong fs?)
-generic/013        tac: /tmp/cutmpMhPSY2: write error: No such file or directory
- 20s
-generic/014        tac: /tmp/cutmpDApKPe: write error: No such file or directory
- 4s
+generic/013         21s
+generic/014         4s
 generic/015        [not run] Filesystem virtiofs not supported in _scratch_mkfs_sized
 generic/016        [not run] xfs_io fpunch  failed (old kernel/wrong fs?)
 generic/018        [not run] defragmentation not supported for fstype "virtiofs"
-generic/020        tac: /tmp/cutmpDfXlEO: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/020.out.bad)
+generic/020        - output mismatch (see /opt/xfstests/results//generic/020.out.bad)
     --- tests/generic/020.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/020.out.bad	2026-01-02 07:12:02.887327506 +0000
+    +++ /opt/xfstests/results//generic/020.out.bad	2026-01-03 08:37:38.188586029 +0000
     @@ -5,6 +5,8 @@
            !!! error return
      *** list empty file
@@ -57,17 +35,14 @@ generic/020        tac: /tmp/cutmpDfXlEO: write error: No such file or directory
     (Run 'diff -u /opt/xfstests/tests/generic/020.out /opt/xfstests/results//generic/020.out.bad'  to see the entire diff)
 generic/021        [not run] xfs_io fpunch  failed (old kernel/wrong fs?)
 generic/022        [not run] xfs_io fpunch  failed (old kernel/wrong fs?)
-generic/023        tac: /tmp/cutmpsCs72y: write error: No such file or directory
- 3s
+generic/023         3s
 generic/024        [not run] kernel doesn't support renameat2 syscall
 generic/025        [not run] kernel doesn't support renameat2 syscall
 generic/026        [not run] virtiofs does not define maximum ACL count
-generic/028        tac: /tmp/cutmpb25OMZ: write error: No such file or directory
- 6s
-generic/029        tac: /tmp/cutmpuIDX3s: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/029.out.bad)
+generic/028         6s
+generic/029        - output mismatch (see /opt/xfstests/results//generic/029.out.bad)
     --- tests/generic/029.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/029.out.bad	2026-01-02 07:12:18.864145215 +0000
+    +++ /opt/xfstests/results//generic/029.out.bad	2026-01-03 08:37:54.128746061 +0000
     @@ -18,17 +18,17 @@
      ==== Pre-Remount ===
      000000 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58  >XXXXXXXXXXXXXXXX<
@@ -78,10 +53,9 @@ generic/029        tac: /tmp/cutmpuIDX3s: write error: No such file or directory
     -000800 59 59 59 59 59 59 59 59 59 59 59 59 59 59 59 59  >YYYYYYYYYYYYYYYY<
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/029.out /opt/xfstests/results//generic/029.out.bad'  to see the entire diff)
-generic/030        tac: /tmp/cutmp2KkMyn: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/030.out.bad)
+generic/030        - output mismatch (see /opt/xfstests/results//generic/030.out.bad)
     --- tests/generic/030.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/030.out.bad	2026-01-02 07:12:21.160365833 +0000
+    +++ /opt/xfstests/results//generic/030.out.bad	2026-01-03 08:37:56.373867262 +0000
     @@ -18,17 +18,13 @@
      ==== Pre-Remount ===
      000000 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58 58  >XXXXXXXXXXXXXXXX<
@@ -96,10 +70,9 @@ generic/031        [not run] xfs_io fcollapse  failed (old kernel/wrong fs?)
 generic/032        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
 generic/033        [not run] xfs_io fzero  failed (old kernel/wrong fs?)
 generic/034        [not run] require scratchfs to be valid block disk
-generic/035        tac: /tmp/cutmpXSaSA7: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/035.out.bad)
+generic/035        - output mismatch (see /opt/xfstests/results//generic/035.out.bad)
     --- tests/generic/035.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/035.out.bad	2026-01-02 07:12:27.210365370 +0000
+    +++ /opt/xfstests/results//generic/035.out.bad	2026-01-03 08:38:02.335324957 +0000
     @@ -1,3 +1,5 @@
      QA output created by 035
      overwriting regular file:
@@ -108,26 +81,23 @@ generic/035        tac: /tmp/cutmpXSaSA7: write error: No such file or directory
     +nlink is 2, should be 0
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/035.out /opt/xfstests/results//generic/035.out.bad'  to see the entire diff)
-generic/037        tac: /tmp/cutmpF9BEJC: write error: No such file or directory
- 61s
+generic/037         60s
 generic/039        [not run] require scratchfs to be valid block disk
 generic/040        [not run] require scratchfs to be valid block disk
 generic/041        [not run] require scratchfs to be valid block disk
 generic/042        [not run] virtiofs does not support shutdown
 generic/050        [not run] virtiofs does not support shutdown
 generic/052        [not run] virtiofs does not support shutdown
-generic/053        tac: /tmp/cutmpmC94nm: write error: No such file or directory
- 2s
+generic/053         2s
 generic/056        [not run] require scratchfs to be valid block disk
 generic/057        [not run] require scratchfs to be valid block disk
 generic/058        [not run] xfs_io fpunch  failed (old kernel/wrong fs?)
 generic/059        [not run] require scratchfs to be valid block disk
 generic/060        [not run] xfs_io fpunch  failed (old kernel/wrong fs?)
 generic/061        [not run] xfs_io fpunch  failed (old kernel/wrong fs?)
-generic/062        tac: /tmp/cutmpoouAMC: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/062.out.bad)
+generic/062        - output mismatch (see /opt/xfstests/results//generic/062.out.bad)
     --- tests/generic/062.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/062.out.bad	2026-01-02 07:13:57.621210847 +0000
+    +++ /opt/xfstests/results//generic/062.out.bad	2026-01-03 08:39:32.059747519 +0000
     @@ -12,34 +12,16 @@
      === TYPE reg; NAMESPACE user
      
@@ -143,17 +113,14 @@ generic/064        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
 generic/065        [not run] require scratchfs to be valid block disk
 generic/066        [not run] require scratchfs to be valid block disk
 generic/067        [not run] This test requires loopback device support
-generic/069        tac: /tmp/cutmptLIW85: write error: No such file or directory
- 444s
-generic/070        tac: /tmp/cutmpb1Zufh: write error: No such file or directory
- 3s
+generic/069         447s
+generic/070         4s
 generic/071        [not run] xfs_io falloc -k failed (old kernel/wrong fs?)
 generic/073        [not run] require scratchfs to be valid block disk
-generic/075        time=2026-01-02T17:21:49.562+10:00 level=INFO msg="virtiofs lseek" node=39945 offset=0 whence=3
-[failed, exit status 1]tac: /tmp/cutmpvDyTvh: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/075.out.bad)
+generic/075        time=2026-01-03T18:47:27.155+10:00 level=INFO msg="virtiofs lseek" node=39339 offset=0 whence=3
+[failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/075.out.bad)
     --- tests/generic/075.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/075.out.bad	2026-01-02 07:21:49.996450012 +0000
+    +++ /opt/xfstests/results//generic/075.out.bad	2026-01-03 08:47:27.524825323 +0000
     @@ -4,15 +4,5 @@
      -----------------------------------------------
      fsx.0 : -d -N numops -S 0
@@ -167,22 +134,17 @@ generic/075        time=2026-01-02T17:21:49.562+10:00 level=INFO msg="virtiofs l
 generic/076        [not run] require scratchfs to be local device
 generic/078        [not run] kernel doesn't support renameat2 syscall
 generic/079        [not run] file system doesn't support chattr +ia
-generic/080        tac: /tmp/cutmp0QVWud: write error: No such file or directory
- 3s
+generic/080         3s
 generic/081        [not run] require scratchfs to be valid block disk
 generic/082        [not run] disk quotas not supported by this filesystem type: virtiofs
-generic/084        tac: /tmp/cutmpuCS66W: write error: No such file or directory
- 6s
+generic/084         6s
 generic/086        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
-generic/087        tac: /tmp/cutmpXX6fkr: write error: No such file or directory
- 2s
-generic/088        tac: /tmp/cutmp1QBKUa: write error: No such file or directory
- 1s
+generic/087         1s
+generic/088         1s
 generic/090        [not run] require scratchfs to be valid block disk
-generic/091        [failed, exit status 1]tac: /tmp/cutmpahWT9x: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/091.out.bad)
+generic/091        [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/091.out.bad)
     --- tests/generic/091.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/091.out.bad	2026-01-02 07:22:10.927465138 +0000
+    +++ /opt/xfstests/results//generic/091.out.bad	2026-01-03 08:47:48.280306505 +0000
     @@ -1,7 +1,230 @@
      QA output created by 091
      fsx -N 10000 -l 500000 -r PSIZE -t BSIZE -w BSIZE -Z -R -W
@@ -195,12 +157,11 @@ generic/091        [failed, exit status 1]tac: /tmp/cutmpahWT9x: write error: No
     (Run 'diff -u /opt/xfstests/tests/generic/091.out /opt/xfstests/results//generic/091.out.bad'  to see the entire diff)
 generic/092        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
 generic/094        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
-generic/095        [not run] fio engine libaio not available
+generic/095         3s
 generic/096        [not run] xfs_io fzero  failed (old kernel/wrong fs?)
-generic/097        tac: /tmp/cutmp246MYP: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/097.out.bad)
+generic/097        - output mismatch (see /opt/xfstests/results//generic/097.out.bad)
     --- tests/generic/097.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/097.out.bad	2026-01-02 07:22:16.705952324 +0000
+    +++ /opt/xfstests/results//generic/097.out.bad	2026-01-03 08:47:56.944592932 +0000
     @@ -13,16 +13,10 @@
      set EA <trusted:noise,whack>:
      
@@ -211,12 +172,10 @@ generic/097        tac: /tmp/cutmp246MYP: write error: No such file or directory
     -
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/097.out /opt/xfstests/results//generic/097.out.bad'  to see the entire diff)
-generic/098        tac: /tmp/cutmpYTuKeQ: write error: No such file or directory
- 1s
-generic/099        tac: /tmp/cutmpCqWygr: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/099.out.bad)
+generic/098         1s
+generic/099        - output mismatch (see /opt/xfstests/results//generic/099.out.bad)
     --- tests/generic/099.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/099.out.bad	2026-01-02 07:22:21.101276936 +0000
+    +++ /opt/xfstests/results//generic/099.out.bad	2026-01-03 08:48:01.331163833 +0000
     @@ -10,41 +10,41 @@
      Try using single colon separator
      Note: Old interface FAILed because of single colon - new one allows it
@@ -230,17 +189,15 @@ generic/099        tac: /tmp/cutmpCqWygr: write error: No such file or directory
 generic/101        [not run] require scratchfs to be valid block disk
 generic/103        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
 generic/104        [not run] require scratchfs to be valid block disk
-generic/105        tac: /tmp/cutmpv6SYjs: write error: No such file or directory
- 1s
+generic/105         1s
 generic/106        [not run] require scratchfs to be valid block disk
 generic/107        [not run] require scratchfs to be valid block disk
 generic/108        [not run] require scratchfs to be valid block disk
 generic/110        [not run] Reflink not supported by test filesystem type: virtiofs
 generic/111        [not run] Reflink not supported by test filesystem type: virtiofs
-generic/112        [failed, exit status 1]tac: /tmp/cutmpptpzK4: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/112.out.bad)
+generic/112        [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/112.out.bad)
     --- tests/generic/112.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/112.out.bad	2026-01-02 07:22:37.288273856 +0000
+    +++ /opt/xfstests/results//generic/112.out.bad	2026-01-03 08:48:17.391248898 +0000
     @@ -4,15 +4,4 @@
      -----------------------------------------------
      fsx.0 : -A -d -N numops -S 0
@@ -251,32 +208,24 @@ generic/112        [failed, exit status 1]tac: /tmp/cutmpptpzK4: write error: No
     ------------------------------------------------
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/112.out /opt/xfstests/results//generic/112.out.bad'  to see the entire diff)
-generic/113        tac: /tmp/cutmpFa7zxf: write error: No such file or directory
- 19s
+generic/113         19s
 generic/114        [not run] device block size: 4096 greater than 512
 generic/115        [not run] Reflink not supported by test filesystem type: virtiofs
 generic/116        [not run] Reflink not supported by test filesystem type: virtiofs
-generic/117        tac: /tmp/cutmpkhWIPk: write error: No such file or directory
- 2s
+generic/117         2s
 generic/118        [not run] Reflink not supported by test filesystem type: virtiofs
 generic/119        [not run] Reflink not supported by test filesystem type: virtiofs
 generic/120        [not run] atime related mount options have no effect on virtiofs
 generic/121        [not run] Dedupe not supported by test filesystem type: virtiofs
 generic/122        [not run] Dedupe not supported by test filesystem type: virtiofs
-generic/123        tac: /tmp/cutmpR2JeEx: write error: No such file or directory
- 2s
-generic/124        tac: /tmp/cutmpxjygXs: write error: No such file or directory
- 10s
-generic/126        tac: /tmp/cutmppow9Uh: write error: No such file or directory
- 2s
-generic/128        tac: /tmp/cutmpDl6C1o: write error: No such file or directory
- 1s
-generic/129        tac: /tmp/cutmpxpUMfY: write error: No such file or directory
- 55s
-generic/130        tac: /tmp/cutmpqez9w8: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/130.out.bad)
+generic/123         2s
+generic/124         10s
+generic/126         2s
+generic/128         1s
+generic/129         55s
+generic/130        - output mismatch (see /opt/xfstests/results//generic/130.out.bad)
     --- tests/generic/130.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/130.out.bad	2026-01-02 07:24:23.680860460 +0000
+    +++ /opt/xfstests/results//generic/130.out.bad	2026-01-03 08:50:04.354192527 +0000
     @@ -32,7 +32,8 @@
      *
      00000fa0:  57 57 57 57 57 57 57 57 57 57 57 57 57 57 57 57  WWWWWWWWWWWWWWWW
@@ -287,10 +236,9 @@ generic/130        tac: /tmp/cutmpqez9w8: write error: No such file or directory
      *
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/130.out /opt/xfstests/results//generic/130.out.bad'  to see the entire diff)
-generic/131        [failed, exit status 1]tac: /tmp/cutmpsXMl9B: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/131.out.bad)
+generic/131        [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/131.out.bad)
     --- tests/generic/131.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/131.out.bad	2026-01-02 07:24:26.065859352 +0000
+    +++ /opt/xfstests/results//generic/131.out.bad	2026-01-03 08:50:06.699908651 +0000
     @@ -1,2 +1,3 @@
      QA output created by 131
     -success!
@@ -299,14 +247,12 @@ generic/131        [failed, exit status 1]tac: /tmp/cutmpsXMl9B: write error: No
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/131.out /opt/xfstests/results//generic/131.out.bad'  to see the entire diff)
 generic/134        [not run] Reflink not supported by test filesystem type: virtiofs
-generic/135        tac: /tmp/cutmpK9MxGu: write error: No such file or directory
- 1s
+generic/135         1s
 generic/136        [not run] Dedupe not supported by test filesystem type: virtiofs
 generic/138        [not run] Reflink not supported by test filesystem type: virtiofs
 generic/139        [not run] Reflink not supported by test filesystem type: virtiofs
 generic/140        [not run] Reflink not supported by test filesystem type: virtiofs
-generic/141        tac: /tmp/cutmpvXtsw4: write error: No such file or directory
- 1s
+generic/141         1s
 generic/142        [not run] Reflink not supported by test filesystem type: virtiofs
 generic/143        [not run] Reflink not supported by test filesystem type: virtiofs
 generic/144        [not run] Reflink not supported by test filesystem type: virtiofs
@@ -329,8 +275,7 @@ generic/160        [not run] file system doesn't support chattr +i
 generic/161        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/162        [not run] Dedupe not supported by scratch filesystem type: virtiofs
 generic/163        [not run] Dedupe not supported by scratch filesystem type: virtiofs
-generic/169        tac: /tmp/cutmpuqDhpF: write error: No such file or directory
- 1s
+generic/169         1s
 generic/171        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/172        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/173        [not run] Reflink not supported by scratch filesystem type: virtiofs
@@ -342,17 +287,15 @@ generic/180        [not run] Reflink not supported by test filesystem type: virt
 generic/181        [not run] Reflink not supported by test filesystem type: virtiofs
 generic/182        [not run] Dedupe not supported by test filesystem type: virtiofs
 generic/183        [not run] Reflink not supported by scratch filesystem type: virtiofs
-generic/184        tac: /tmp/cutmpptgaEz: write error: No such file or directory
- 0s
+generic/184         1s
 generic/185        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/188        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/189        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/190        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/191        [not run] Reflink not supported by scratch filesystem type: virtiofs
-generic/193        tac: /tmp/cutmpN0faLP: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/193.out.bad)
+generic/193        - output mismatch (see /opt/xfstests/results//generic/193.out.bad)
     --- tests/generic/193.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/193.out.bad	2026-01-02 07:25:21.876801583 +0000
+    +++ /opt/xfstests/results//generic/193.out.bad	2026-01-03 08:51:02.304067471 +0000
     @@ -28,32 +28,32 @@
      check that the sgid bit is cleared
      -rw-rw-rw-
@@ -367,8 +310,7 @@ generic/194        [not run] Reflink not supported by scratch filesystem type: v
 generic/195        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/196        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/197        [not run] Reflink not supported by scratch filesystem type: virtiofs
-generic/198        tac: /tmp/cutmpXvKU0a: write error: No such file or directory
- 4s
+generic/198         2s
 generic/199        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/200        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/201        [not run] Reflink not supported by scratch filesystem type: virtiofs
@@ -376,26 +318,21 @@ generic/202        [not run] Reflink not supported by scratch filesystem type: v
 generic/203        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/205        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/206        [not run] Reflink not supported by scratch filesystem type: virtiofs
-generic/207        tac: /tmp/cutmpy13kW9: write error: No such file or directory
- 1s
-generic/210        tac: /tmp/cutmpi2cPbR: write error: No such file or directory
- 0s
+generic/207         2s
+generic/210         1s
 generic/211        [not run] Filesystem virtiofs not supported in _scratch_mkfs_sized
-generic/212        tac: /tmp/cutmpSGE0sG: write error: No such file or directory
- 1s
+generic/212         1s
 generic/213        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
 generic/214        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
-generic/215        tac: /tmp/cutmpdAvSa5: write error: No such file or directory
- 4s
+generic/215         4s
 generic/216        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/217        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/218        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/219        [not run] disk quotas not supported by this filesystem type: virtiofs
 generic/220        [not run] Reflink not supported by scratch filesystem type: virtiofs
-generic/221        tac: /tmp/cutmpmV6OBk: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/221.out.bad)
+generic/221        - output mismatch (see /opt/xfstests/results//generic/221.out.bad)
     --- tests/generic/221.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/221.out.bad	2026-01-02 07:25:56.538451594 +0000
+    +++ /opt/xfstests/results//generic/221.out.bad	2026-01-03 08:51:36.085965527 +0000
     @@ -1,2 +1,3 @@
      QA output created by 221
      Silence is golden.
@@ -410,90 +347,52 @@ generic/228        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
 generic/229        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/230        [not run] disk quotas not supported by this filesystem type: virtiofs
 generic/235        [not run] disk quotas not supported by this filesystem type: virtiofs
-generic/236        [failed, exit status 1]tac: /tmp/cutmpncXA3I: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/236.out.bad)
+generic/236        [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/236.out.bad)
     --- tests/generic/236.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/236.out.bad	2026-01-02 07:26:06.871427562 +0000
+    +++ /opt/xfstests/results//generic/236.out.bad	2026-01-03 08:51:46.297050846 +0000
     @@ -1,2 +1,3 @@
      QA output created by 236
     -Test over.
-    +ctime: 1767338765 -> 1767338765 
+    +ctime: 1767430304 -> 1767430304 
     +Fatal error: ctime not updated after link
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/236.out /opt/xfstests/results//generic/236.out.bad'  to see the entire diff)
-generic/237        tac: /tmp/cutmpYno7YM: write error: No such file or directory
- 1s
+generic/237         1s
 generic/238        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/240        [not run] fs block size must be larger than the device block size.  fs block size: 4096, device block size: 4096
 generic/244        [not run] disk quotas not supported by this filesystem type: virtiofs
-generic/245        tac: /tmp/cutmpO3dFyC: write error: No such file or directory
- 1s
-generic/246        tac: /tmp/cutmph5UXAI: write error: No such file or directory
- 1s
-generic/247        - output mismatch (see /opt/xfstests/results//generic/247.out.bad)
-    --- tests/generic/247.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/247.out.bad	2026-01-02 07:26:44.551778471 +0000
-    @@ -1,2 +1,3 @@
-     QA output created by 247
-     Silence is golden.
-    +tac: /tmp/cutmpGqUXFO: write error: No such file or directory
-    ...
-    (Run 'diff -u /opt/xfstests/tests/generic/247.out /opt/xfstests/results//generic/247.out.bad'  to see the entire diff)
-generic/248        tac: /tmp/cutmpq9zoi9: write error: No such file or directory
- 1s
-generic/249        tac: /tmp/cutmpIr7bJh: write error: No such file or directory
- 3s
+generic/245         1s
+generic/246         1s
+generic/247         31s
+generic/248         1s
+generic/249         3s
 generic/250        [not run] require scratchfs to be valid block disk
 generic/252        [not run] require scratchfs to be valid block disk
 generic/253        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/254        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/255        [not run] xfs_io fpunch  failed (old kernel/wrong fs?)
 generic/256        [not run] xfs_io fpunch  failed (old kernel/wrong fs?)
-generic/257        tac: /tmp/cutmpckSYtJ: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/257.out.bad)
-    --- tests/generic/257.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/257.out.bad	2026-01-02 07:26:59.343934187 +0000
-    @@ -1,2 +1,3 @@
-     QA output created by 257
-     *** done
-    +rm: cannot remove '/mnt/ttt': Directory not empty
-    ...
-    (Run 'diff -u /opt/xfstests/tests/generic/257.out /opt/xfstests/results//generic/257.out.bad'  to see the entire diff)
-generic/258        [failed, exit status 1]tac: /tmp/cutmpYAACP9: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/258.out.bad)
+generic/257         2s
+generic/258        [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/258.out.bad)
     --- tests/generic/258.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/258.out.bad	2026-01-02 07:27:00.516580341 +0000
+    +++ /opt/xfstests/results//generic/258.out.bad	2026-01-03 08:52:40.206393395 +0000
     @@ -1,5 +1,6 @@
      QA output created by 258
      Creating file with timestamp of Jan 1, 1960
      Testing for negative seconds since epoch
     -Remounting to flush cache
     -Testing for negative seconds since epoch
-    +Timestamp wrapped: 1767338820
+    +Timestamp wrapped: 1767430359
     +Timestamp wrapped
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/258.out /opt/xfstests/results//generic/258.out.bad'  to see the entire diff)
 generic/259        [not run] Reflink not supported by scratch filesystem type: virtiofs
-generic/260        [failed, exit status 1]tac: /tmp/cutmpJyIw8Y: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/260.out.bad)
-    --- tests/generic/260.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/260.out.bad	2026-01-02 07:27:03.624435352 +0000
-    @@ -1,14 +1,24 @@
-     QA output created by 260
-    +grep: /dev/fd/63: No such file or directory
-     [+] Start beyond the end of fs (should fail)
-    -fstrim: SCRATCH_MNT: FITRIM ioctl failed: Invalid argument
-    +fstrim: SCRATCH_MNT: the discard operation is not supported
-     [+] Start beyond the end of fs with len set (should fail)
-    -fstrim: SCRATCH_MNT: FITRIM ioctl failed: Invalid argument
-    ...
-    (Run 'diff -u /opt/xfstests/tests/generic/260.out /opt/xfstests/results//generic/260.out.bad'  to see the entire diff)
+generic/260        [not run] FITRIM not supported on /scratch
 generic/261        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/262        [not run] Reflink not supported by scratch filesystem type: virtiofs
-generic/263        [failed, exit status 1]tac: /tmp/cutmplxTw7e: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/263.out.bad)
+generic/263        [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/263.out.bad)
     --- tests/generic/263.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/263.out.bad	2026-01-02 07:27:07.122093946 +0000
+    +++ /opt/xfstests/results//generic/263.out.bad	2026-01-03 08:52:45.742686333 +0000
     @@ -1,3 +1,346 @@
      QA output created by 263
      fsx -N 10000 -o 8192 -l 500000 -r PSIZE -t BSIZE -w BSIZE -Z
@@ -521,27 +420,13 @@ generic/283        [not run] Reflink not supported by scratch filesystem type: v
 generic/284        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/286        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
 generic/287        [not run] Reflink not supported by scratch filesystem type: virtiofs
-generic/288        tac: /tmp/cutmpzLVLc4: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/288.out.bad)
-    --- tests/generic/288.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/288.out.bad	2026-01-02 07:27:40.849272648 +0000
-    @@ -1,6 +1,7 @@
-     QA output created by 288
-    +grep: /dev/fd/63: No such file or directory
-     [+] Length is zero (should fail)
-    -fstrim: SCRATCH_MNT: FITRIM ioctl failed: Invalid argument
-    +fstrim: SCRATCH_MNT: the discard operation is not supported
-     [+] Length is smaller than block size (should fail)
-    -fstrim: SCRATCH_MNT: FITRIM ioctl failed: Invalid argument
-    ...
-    (Run 'diff -u /opt/xfstests/tests/generic/288.out /opt/xfstests/results//generic/288.out.bad'  to see the entire diff)
+generic/288        [not run] FITRIM not supported on /scratch
 generic/289        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/290        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/291        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/292        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/293        [not run] Reflink not supported by scratch filesystem type: virtiofs
-generic/294        tac: /tmp/cutmp0WcglE: write error: No such file or directory
- 1s
+generic/294         1s
 generic/295        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/296        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/301        [not run] Reflink not supported by scratch filesystem type: virtiofs
@@ -549,29 +434,23 @@ generic/302        [not run] Reflink not supported by scratch filesystem type: v
 generic/303        [not run] Reflink not supported by test filesystem type: virtiofs
 generic/304        [not run] Dedupe not supported by test filesystem type: virtiofs
 generic/305        [not run] Reflink not supported by scratch filesystem type: virtiofs
-generic/306        tac: /tmp/cutmpIm8V98: write error: No such file or directory
- 2s
-generic/307        [failed, exit status 1]tac: /tmp/cutmp3dxTny: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/307.out.bad)
+generic/306         2s
+generic/307        [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/307.out.bad)
     --- tests/generic/307.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/307.out.bad	2026-01-02 07:27:59.612865955 +0000
+    +++ /opt/xfstests/results//generic/307.out.bad	2026-01-03 08:53:37.471413558 +0000
     @@ -1,2 +1,3 @@
      QA output created by 307
      Silence is golden
     +error: ctime not updated after setfacl
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/307.out /opt/xfstests/results//generic/307.out.bad'  to see the entire diff)
-generic/308        tac: /tmp/cutmpATM6yl: write error: No such file or directory
- 1s
-generic/309        tac: /tmp/cutmpft2EJi: write error: No such file or directory
- 2s
+generic/308         1s
+generic/309         2s
 generic/312        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
-generic/313        tac: /tmp/cutmpNbS6Kg: write error: No such file or directory
- 5s
-generic/314        tac: /tmp/cutmpIW1x0Q: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/314.out.bad)
+generic/313         5s
+generic/314        - output mismatch (see /opt/xfstests/results//generic/314.out.bad)
     --- tests/generic/314.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/314.out.bad	2026-01-02 07:28:10.149177057 +0000
+    +++ /opt/xfstests/results//generic/314.out.bad	2026-01-03 08:53:48.089328815 +0000
     @@ -1,2 +1,2 @@
      QA output created by 314
     -drwxr-sr-x subdir
@@ -582,10 +461,9 @@ generic/315        [not run] xfs_io falloc -k failed (old kernel/wrong fs?)
 generic/316        [not run] xfs_io fpunch  failed (old kernel/wrong fs?)
 generic/317        [not run] userns not supported by this kernel
 generic/318        [not run] userns not supported by this kernel
-generic/319        tac: /tmp/cutmpH4Nlo0: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/319.out.bad)
+generic/319        - output mismatch (see /opt/xfstests/results//generic/319.out.bad)
     --- tests/generic/319.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/319.out.bad	2026-01-02 07:28:15.398271263 +0000
+    +++ /opt/xfstests/results//generic/319.out.bad	2026-01-03 08:53:53.319322145 +0000
     @@ -13,9 +13,6 @@
      # owner: 0
      # group: 0
@@ -609,10 +487,9 @@ generic/331        [not run] Reflink not supported by scratch filesystem type: v
 generic/332        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/335        [not run] require scratchfs to be valid block disk
 generic/336        [not run] require scratchfs to be valid block disk
-generic/337        tac: /tmp/cutmpaqlbE2: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/337.out.bad)
+generic/337        - output mismatch (see /opt/xfstests/results//generic/337.out.bad)
     --- tests/generic/337.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/337.out.bad	2026-01-02 07:28:37.754252918 +0000
+    +++ /opt/xfstests/results//generic/337.out.bad	2026-01-03 08:54:15.505678875 +0000
     @@ -1,8 +1,2 @@
      QA output created by 337
     -# file: SCRATCH_MNT/testfile
@@ -627,15 +504,13 @@ generic/338        [not run] require scratchfs to be valid block disk
 generic/341        [not run] require scratchfs to be valid block disk
 generic/342        [not run] require scratchfs to be valid block disk
 generic/343        [not run] require scratchfs to be valid block disk
-generic/346        tac: /tmp/cutmpd79tP7: write error: No such file or directory
- 104s
+generic/346         105s
 generic/347        [not run] require scratchfs to be valid block disk
 generic/348        [not run] require scratchfs to be valid block disk
 generic/353        [not run] Reflink not supported by scratch filesystem type: virtiofs
-generic/355        tac: /tmp/cutmpqWgTUw: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/355.out.bad)
+generic/355        - output mismatch (see /opt/xfstests/results//generic/355.out.bad)
     --- tests/generic/355.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/355.out.bad	2026-01-02 07:30:42.648187947 +0000
+    +++ /opt/xfstests/results//generic/355.out.bad	2026-01-03 08:56:21.067837914 +0000
     @@ -1,14 +1,14 @@
      QA output created by 355
      Check that suid/sgid bits are cleared after direct write
@@ -650,14 +525,11 @@ generic/356        [not run] swapfiles are not supported
 generic/357        [not run] swapfiles are not supported
 generic/358        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/359        [not run] Reflink not supported by scratch filesystem type: virtiofs
-generic/360        tac: /tmp/cutmpzjnNDU: write error: No such file or directory
- 1s
+generic/360         1s
 generic/361        [not run] require scratchfs to be valid block disk
-generic/362        tac: /tmp/cutmpuPPoeq: write error: No such file or directory
- 1s
-generic/364        tac: /tmp/cutmpOL2n60: write error: No such file or directory
- 11s
-generic/366        [not run] fio engine libaio not available
+generic/362         0s
+generic/364         10s
+generic/366         22s
 generic/367        [not run] this test requires extsize support on the filesystem
 generic/368        [not run] filesystem doesn't support -o inlinecrypt
 generic/369        [not run] filesystem doesn't support -o inlinecrypt
@@ -666,10 +538,9 @@ generic/371        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
 generic/372        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/373        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/374        [not run] Dedupe not supported by scratch filesystem type: virtiofs
-generic/375        tac: /tmp/cutmp86UKmo: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/375.out.bad)
+generic/375        - output mismatch (see /opt/xfstests/results//generic/375.out.bad)
     --- tests/generic/375.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/375.out.bad	2026-01-02 07:31:12.448323432 +0000
+    +++ /opt/xfstests/results//generic/375.out.bad	2026-01-03 08:57:12.450403274 +0000
     @@ -1,17 +1,17 @@
      QA output created by 375
      *** SGID should remain set (twice)
@@ -681,10 +552,9 @@ generic/375        tac: /tmp/cutmp86UKmo: write error: No such file or directory
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/375.out /opt/xfstests/results//generic/375.out.bad'  to see the entire diff)
 generic/376        [not run] require scratchfs to be valid block disk
-generic/377        tac: /tmp/cutmpuBLt77: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/377.out.bad)
+generic/377        - output mismatch (see /opt/xfstests/results//generic/377.out.bad)
     --- tests/generic/377.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/377.out.bad	2026-01-02 07:31:15.725983266 +0000
+    +++ /opt/xfstests/results//generic/377.out.bad	2026-01-03 08:57:15.718824351 +0000
     @@ -1,11 +1,7 @@
      QA output created by 377
     -xattr: user.foo
@@ -695,8 +565,7 @@ generic/377        tac: /tmp/cutmpuBLt77: write error: No such file or directory
     -listxattr: Numerical result out of range
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/377.out /opt/xfstests/results//generic/377.out.bad'  to see the entire diff)
-generic/378        tac: /tmp/cutmpbmAVVD: write error: No such file or directory
- 1s
+generic/378         1s
 generic/379        [not run] disk quotas not supported by this filesystem type: virtiofs
 generic/380        [not run] disk quotas not supported by this filesystem type: virtiofs
 generic/381        [not run] disk quotas not supported by this filesystem type: virtiofs
@@ -708,19 +577,16 @@ generic/386        [not run] disk quotas not supported by this filesystem type: 
 generic/389        [not run] O_TMPFILE is not supported
 generic/391        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
 generic/392        [not run] virtiofs does not support shutdown
-generic/393        tac: /tmp/cutmpadzcvB: write error: No such file or directory
- 1s
-generic/394        tac: /tmp/cutmpOlzLpS: write error: No such file or directory
- 1s
+generic/393         2s
+generic/394         1s
 generic/395        [not run] No encryption support for virtiofs
 generic/396        [not run] No encryption support for virtiofs
 generic/397        [not run] No encryption support for virtiofs
 generic/398        [not run] No encryption support for virtiofs
 generic/400        [not run] disk quotas not supported by this filesystem type: virtiofs
-generic/401        tac: /tmp/cutmpBmR2r3: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/401.out.bad)
+generic/401        - output mismatch (see /opt/xfstests/results//generic/401.out.bad)
     --- tests/generic/401.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/401.out.bad	2026-01-02 07:31:35.756960643 +0000
+    +++ /opt/xfstests/results//generic/401.out.bad	2026-01-03 08:57:35.744556217 +0000
     @@ -1,9 +1,9 @@
      QA output created by 401
      . d
@@ -732,10 +598,9 @@ generic/401        tac: /tmp/cutmpBmR2r3: write error: No such file or directory
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/401.out /opt/xfstests/results//generic/401.out.bad'  to see the entire diff)
 generic/402        [not run] filesystem virtiofs timestamp bounds are unknown
-generic/403        tac: /tmp/cutmpaY1VAp: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/403.out.bad)
+generic/403        - output mismatch (see /opt/xfstests/results//generic/403.out.bad)
     --- tests/generic/403.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/403.out.bad	2026-01-02 07:31:40.759570890 +0000
+    +++ /opt/xfstests/results//generic/403.out.bad	2026-01-03 08:57:40.691433587 +0000
     @@ -1,2 +1,102 @@
      QA output created by 403
     +setfattr: /scratch/file: Operation not supported
@@ -753,8 +618,7 @@ generic/408        [not run] Dedupe not supported by test filesystem type: virti
 generic/409        [not run] require scratchfs to be local device
 generic/410        [not run] require scratchfs to be local device
 generic/411        [not run] require scratchfs to be local device
-generic/412        tac: /tmp/cutmpfsqi99: write error: No such file or directory
- 1s
+generic/412         1s
 generic/413        [not run] mount scratchfs with dax failed
 generic/414        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/417        [not run] virtiofs does not support shutdown
@@ -762,15 +626,14 @@ generic/419        [not run] No encryption support for virtiofs
 generic/420        [not run] xfs_io fpunch  failed (old kernel/wrong fs?)
 generic/421        [not run] No encryption support for virtiofs
 generic/422        [not run] xfs_io falloc -k failed (old kernel/wrong fs?)
-generic/423        tac: /tmp/cutmp8lbpLJ: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/423.out.bad)
+generic/423        - output mismatch (see /opt/xfstests/results//generic/423.out.bad)
     --- tests/generic/423.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/423.out.bad	2026-01-02 07:31:57.369824066 +0000
+    +++ /opt/xfstests/results//generic/423.out.bad	2026-01-03 08:57:57.368220323 +0000
     @@ -9,3 +9,6 @@
      Test statx on a symlink
      Test statx on an AF_UNIX socket
      Test a hard link to a file
-    +[!] ctime.nsec is before ref_c.nsec (107294335 < 134397359)
+    +[!] ctime.nsec is before ref_c.nsec (137104641 < 165145847)
     +Failed
     +stat_test failed
     ...
@@ -779,16 +642,12 @@ generic/424        [not run] file system doesn't support any of /usr/bin/chattr 
 generic/425        [not run] xfs_io fiemap -a failed (old kernel/wrong fs?)
 generic/426        [not run] virtiofs doesn't support open_by_handle_at(2)
 generic/427        [not run] Filesystem virtiofs not supported in _scratch_mkfs_sized
-generic/428        tac: /tmp/cutmpVOhCRm: write error: No such file or directory
- 1s
-generic/430        tac: /tmp/cutmpS65gZ3: write error: No such file or directory
- 2s
-generic/431        tac: /tmp/cutmpfdjueH: write error: No such file or directory
- 1s
-generic/432        tac: /tmp/cutmpNGLFDw: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/432.out.bad)
+generic/428         1s
+generic/430         1s
+generic/431         2s
+generic/432        - output mismatch (see /opt/xfstests/results//generic/432.out.bad)
     --- tests/generic/432.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/432.out.bad	2026-01-02 07:32:06.729655528 +0000
+    +++ /opt/xfstests/results//generic/432.out.bad	2026-01-03 08:58:06.777527802 +0000
     @@ -4,14 +4,23 @@
      e11fbace556cba26bf0076e74cab90a3  TEST_DIR/test-432/file
      e11fbace556cba26bf0076e74cab90a3  TEST_DIR/test-432/copy
@@ -799,10 +658,9 @@ generic/432        tac: /tmp/cutmpNGLFDw: write error: No such file or directory
      e11fbace556cba26bf0076e74cab90a3  TEST_DIR/test-432/file
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/432.out /opt/xfstests/results//generic/432.out.bad'  to see the entire diff)
-generic/433        tac: /tmp/cutmpwizBe6: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/433.out.bad)
+generic/433        - output mismatch (see /opt/xfstests/results//generic/433.out.bad)
     --- tests/generic/433.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/433.out.bad	2026-01-02 07:32:08.157275361 +0000
+    +++ /opt/xfstests/results//generic/433.out.bad	2026-01-03 08:58:08.208151066 +0000
     @@ -4,14 +4,17 @@
      ab56b4d92b40713acc5af89985d4b786  TEST_DIR/test-433/file
      ab56b4d92b40713acc5af89985d4b786  TEST_DIR/test-433/copy
@@ -813,20 +671,16 @@ generic/433        tac: /tmp/cutmpwizBe6: write error: No such file or directory
     -32db1f6d06d15f7e38e1ab1c69da498a  TEST_DIR/test-433/copy
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/433.out /opt/xfstests/results//generic/433.out.bad'  to see the entire diff)
-generic/434        tac: /tmp/cutmpLEMeBn: write error: No such file or directory
- 1s
+generic/434         1s
 generic/436        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
-generic/437        tac: /tmp/cutmplo6IdI: write error: No such file or directory
- 2s
+generic/437         1s
 generic/439        [not run] xfs_io fpunch  failed (old kernel/wrong fs?)
 generic/440        [not run] No encryption support for virtiofs
 generic/441        [not run] require scratchfs to be valid block disk
-generic/443        tac: /tmp/cutmpTmT4bQ: write error: No such file or directory
- 1s
-generic/444        tac: /tmp/cutmpXPNo6Q: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/444.out.bad)
+generic/443         1s
+generic/444        - output mismatch (see /opt/xfstests/results//generic/444.out.bad)
     --- tests/generic/444.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/444.out.bad	2026-01-02 07:32:18.347099577 +0000
+    +++ /opt/xfstests/results//generic/444.out.bad	2026-01-03 08:58:18.382976142 +0000
     @@ -1,3 +1,3 @@
      QA output created by 444
     -drwxrwsr-x
@@ -837,10 +691,9 @@ generic/444        tac: /tmp/cutmpXPNo6Q: write error: No such file or directory
     (Run 'diff -u /opt/xfstests/tests/generic/444.out /opt/xfstests/results//generic/444.out.bad'  to see the entire diff)
 generic/445        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
 generic/446        [not run] xfs_io fpunch  failed (old kernel/wrong fs?)
-generic/448        [failed, exit status 1]tac: /tmp/cutmpS5Cgkc: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/448.out.bad)
+generic/448        [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/448.out.bad)
     --- tests/generic/448.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/448.out.bad	2026-01-02 07:32:21.481280580 +0000
+    +++ /opt/xfstests/results//generic/448.out.bad	2026-01-03 08:58:21.568815090 +0000
     @@ -1,2 +1,3 @@
      QA output created by 448
     -Silence is golden
@@ -850,10 +703,9 @@ generic/448        [failed, exit status 1]tac: /tmp/cutmpS5Cgkc: write error: No
     (Run 'diff -u /opt/xfstests/tests/generic/448.out /opt/xfstests/results//generic/448.out.bad'  to see the entire diff)
 generic/449        [not run] Filesystem virtiofs not supported in _scratch_mkfs_sized
 generic/450        [not run] Only test on sector size < half of block size
-generic/451        tac: /tmp/cutmpvJkrML: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/451.out.bad)
+generic/451        - output mismatch (see /opt/xfstests/results//generic/451.out.bad)
     --- tests/generic/451.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/451.out.bad	2026-01-02 07:32:24.728344882 +0000
+    +++ /opt/xfstests/results//generic/451.out.bad	2026-01-03 08:58:24.781770630 +0000
     @@ -1,2 +1,8 @@
      QA output created by 451
     +get stale data from buffer read
@@ -864,8 +716,7 @@ generic/451        tac: /tmp/cutmpvJkrML: write error: No such file or directory
     +000a0000
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/451.out /opt/xfstests/results//generic/451.out.bad'  to see the entire diff)
-generic/452        tac: /tmp/cutmpTf8j0M: write error: No such file or directory
- 1s
+generic/452         1s
 generic/453        [not run] virtiofs does not allow unrestricted byte streams for names
 generic/454        [not run] virtiofs does not allow unrestricted byte streams for names
 generic/456        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
@@ -873,42 +724,26 @@ generic/458        [not run] Reflink not supported by scratch filesystem type: v
 generic/460        [not run] This test requires at least 1GB free on /scratch to run
 generic/462        [not run] mount scratchfs with dax failed
 generic/463        [not run] Reflink not supported by test filesystem type: virtiofs
-generic/465        tac: /tmp/cutmpzt4IB0: write error: No such file or directory
- 3s
+generic/465         2s
 generic/466        [not run] require scratchfs to be valid block disk
 generic/467        [not run] virtiofs doesn't support open_by_handle_at(2)
 generic/468        [not run] virtiofs does not support shutdown
 generic/469        [not run] xfs_io falloc -k failed (old kernel/wrong fs?)
 generic/470        [not run] This test requires a valid $LOGWRITES_DEV
-generic/471        tac: /tmp/cutmpDnAuOk: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/471.out.bad)
-    --- tests/generic/471.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/471.out.bad	2026-01-02 07:32:47.123946585 +0000
-    @@ -1,2 +1,8981 @@
-     QA output created by 471
-    +File name 2 appeared 0 times
-    +File name 3 appeared 0 times
-    +File name 4 appeared 0 times
-    +File name 5 appeared 0 times
-    +File name 6 appeared 0 times
-    +File name 7 appeared 0 times
-    ...
-    (Run 'diff -u /opt/xfstests/tests/generic/471.out /opt/xfstests/results//generic/471.out.bad'  to see the entire diff)
+generic/471         7s
 generic/472        [not run] swapfiles are not supported
 generic/474        [not run] virtiofs does not support shutdown
 generic/477        [not run] virtiofs doesn't support open_by_handle_at(2)
-generic/478        tac: /tmp/cutmpPza6dt: write error: No such file or directory
- 19s
+generic/478         20s
 generic/479        [not run] require scratchfs to be valid block disk
 generic/480        [not run] require scratchfs to be valid block disk
 generic/481        [not run] require scratchfs to be valid block disk
 generic/483        [not run] require scratchfs to be valid block disk
 generic/484        [not run] require scratchfs to be valid block disk
 generic/485        [not run] xfs_io falloc -k failed (old kernel/wrong fs?)
-generic/486        tac: /tmp/cutmpL3na2d: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/486.out.bad)
+generic/486        - output mismatch (see /opt/xfstests/results//generic/486.out.bad)
     --- tests/generic/486.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/486.out.bad	2026-01-02 07:33:22.358584175 +0000
+    +++ /opt/xfstests/results//generic/486.out.bad	2026-01-03 08:59:23.743619110 +0000
     @@ -1,2 +1,3 @@
      QA output created by 486
     -Attribute "world" has a NNNN byte value for SCRATCH_MNT/hello
@@ -919,10 +754,9 @@ generic/486        tac: /tmp/cutmpL3na2d: write error: No such file or directory
 generic/487        [not run] This test requires a valid $SCRATCH_LOGDEV
 generic/488        [not run] Filesystem virtiofs not supported in _scratch_mkfs_sized
 generic/489        [not run] require scratchfs to be valid block disk
-generic/490        [failed, exit status 1]tac: /tmp/cutmpfKVgzA: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/490.out.bad)
+generic/490        [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/490.out.bad)
     --- tests/generic/490.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/490.out.bad	2026-01-02 07:33:28.478809074 +0000
+    +++ /opt/xfstests/results//generic/490.out.bad	2026-01-03 08:59:29.790604484 +0000
     @@ -1 +1,3 @@
      QA output created by 490
     +seek sanity check failed!
@@ -941,8 +775,7 @@ generic/499        [not run] xfs_io falloc -k failed (old kernel/wrong fs?)
 generic/501        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/502        [not run] require scratchfs to be valid block disk
 generic/503        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
-generic/504        tac: /tmp/cutmpt75VOZ: write error: No such file or directory
- 1s
+generic/504         1s
 generic/505        [not run] virtiofs does not support shutdown
 generic/506        [not run] disk quotas not supported by this filesystem type: virtiofs
 generic/507        [not run] file system doesn't support chattr +ASai
@@ -957,13 +790,11 @@ generic/515        [not run] Reflink not supported by scratch filesystem type: v
 generic/516        [not run] Dedupe not supported by test filesystem type: virtiofs
 generic/517        [not run] Dedupe not supported by scratch filesystem type: virtiofs
 generic/518        [not run] Reflink not supported by scratch filesystem type: virtiofs
-generic/519        tac: /tmp/cutmpH8cq24: write error: No such file or directory
- 2s
+generic/519         1s
 generic/520        [not run] require scratchfs to be valid block disk
-generic/523        tac: /tmp/cutmpgXPRSA: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/523.out.bad)
+generic/523        - output mismatch (see /opt/xfstests/results//generic/523.out.bad)
     --- tests/generic/523.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/523.out.bad	2026-01-02 07:34:07.301996393 +0000
+    +++ /opt/xfstests/results//generic/523.out.bad	2026-01-03 09:00:08.393526972 +0000
     @@ -1,6 +1,4 @@
      QA output created by 523
      set attr
@@ -974,17 +805,14 @@ generic/523        tac: /tmp/cutmpgXPRSA: write error: No such file or directory
     +getfattr: /scratch/moofile: Operation not supported
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/523.out /opt/xfstests/results//generic/523.out.bad'  to see the entire diff)
-generic/524        tac: /tmp/cutmp64pHQ0: write error: No such file or directory
- 24s
-generic/525        tac: /tmp/cutmpOTsTBc: write error: No such file or directory
- 1s
+generic/524         23s
+generic/525         1s
 generic/526        [not run] require scratchfs to be valid block disk
 generic/527        [not run] require scratchfs to be valid block disk
 generic/528        [not run] inode creation time not supported by this filesystem
-generic/529        tac: /tmp/cutmpLPrc2L: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/529.out.bad)
+generic/529        - output mismatch (see /opt/xfstests/results//generic/529.out.bad)
     --- tests/generic/529.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/529.out.bad	2026-01-02 07:34:39.496842005 +0000
+    +++ /opt/xfstests/results//generic/529.out.bad	2026-01-03 09:00:40.746434319 +0000
     @@ -1,2 +1,2 @@
      QA output created by 529
     -list attr: Numerical result out of range
@@ -993,12 +821,10 @@ generic/529        tac: /tmp/cutmpLPrc2L: write error: No such file or directory
     (Run 'diff -u /opt/xfstests/tests/generic/529.out /opt/xfstests/results//generic/529.out.bad'  to see the entire diff)
 generic/530        [not run] virtiofs does not support shutdown
 generic/531        [not run] O_TMPFILE is not supported
-generic/532        tac: /tmp/cutmp2Ii5HE: write error: No such file or directory
- 1s
-generic/533        tac: /tmp/cutmpbP9syC: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/533.out.bad)
+generic/532         1s
+generic/533        - output mismatch (see /opt/xfstests/results//generic/533.out.bad)
     --- tests/generic/533.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/533.out.bad	2026-01-02 07:34:44.263887903 +0000
+    +++ /opt/xfstests/results//generic/533.out.bad	2026-01-03 09:00:45.438809040 +0000
     @@ -3,6 +3,7 @@
      create file foo.533
      
@@ -1034,17 +860,15 @@ generic/556        [not run] virtiofs does not support casefold feature
 generic/557        [not run] require scratchfs to be valid block disk
 generic/563        [not run] Test requires cgroup2 enabled
 generic/564        [not run] This test requires loopback device support
-generic/565        tac: /tmp/cutmpoMNzft: write error: No such file or directory
- 1s
+generic/565         1s
 generic/566        [not run] disk quotas not supported by this filesystem type: virtiofs
 generic/567        [not run] xfs_io fpunch  failed (old kernel/wrong fs?)
 generic/568        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
 generic/569        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
 generic/570        [not run] require scratchfs to be valid block disk
-generic/571        [failed, exit status 1]tac: /tmp/cutmpHNdnZ2: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/571.out.bad)
+generic/571        [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/571.out.bad)
     --- tests/generic/571.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/571.out.bad	2026-01-02 07:35:24.234383062 +0000
+    +++ /opt/xfstests/results//generic/571.out.bad	2026-01-03 09:01:25.460287489 +0000
     @@ -1,2 +1,3 @@
      QA output created by 571
     -success!
@@ -1067,17 +891,15 @@ generic/584        [not run] No encryption support for virtiofs
 generic/586        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
 generic/587        [not run] disk quotas not supported by this filesystem type: virtiofs
 generic/588        [not run] Reflink not supported by scratch filesystem type: virtiofs
-generic/591        tac: /tmp/cutmpAEUEpp: write error: No such file or directory
- 1s
+generic/591         1s
 generic/592        [not run] No encryption support for virtiofs
 generic/593        [not run] No encryption support for virtiofs
 generic/594        [not run] disk quotas not supported by this filesystem type: virtiofs
 generic/595        [not run] No encryption support for virtiofs
 generic/596        [not run] accton utility required, skipped this test
-generic/597        tac: /tmp/cutmpw572xE: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/597.out.bad)
+generic/597        - output mismatch (see /opt/xfstests/results//generic/597.out.bad)
     --- tests/generic/597.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/597.out.bad	2026-01-02 07:35:47.646370700 +0000
+    +++ /opt/xfstests/results//generic/597.out.bad	2026-01-03 09:01:49.168846369 +0000
     @@ -4,7 +4,7 @@
      fs.protected_symlinks = 0
      successfully followed symlink
@@ -1088,10 +910,9 @@ generic/597        tac: /tmp/cutmpw572xE: write error: No such file or directory
      == Test hardlink create protection when
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/597.out /opt/xfstests/results//generic/597.out.bad'  to see the entire diff)
-generic/598        tac: /tmp/cutmpgMveMO: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/598.out.bad)
+generic/598        - output mismatch (see /opt/xfstests/results//generic/598.out.bad)
     --- tests/generic/598.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/598.out.bad	2026-01-02 07:35:50.335195051 +0000
+    +++ /opt/xfstests/results//generic/598.out.bad	2026-01-03 09:01:51.956289141 +0000
     @@ -5,22 +5,22 @@
      = only group writable dir
      fs.protected_regular = 1
@@ -1107,26 +928,21 @@ generic/600        [not run] disk quotas not supported by this filesystem type: 
 generic/601        [not run] disk quotas not supported by this filesystem type: virtiofs
 generic/602        [not run] No encryption support for virtiofs
 generic/603        [not run] disk quotas not supported by this filesystem type: virtiofs
-generic/604        tac: /tmp/cutmpkQIAy3: write error: No such file or directory
- 11s
+generic/604         12s
 generic/605        [not run] mount scratchfs with dax=always failed
 generic/606        [not run] mount scratchfs with dax=always failed
 generic/607        [not run] xfs_io chattr +x failed (old kernel/wrong fs?)
 generic/608        [not run] mount scratchfs with dax=always failed
-generic/609        tac: /tmp/cutmpLa9NUn: write error: No such file or directory
- 2s
+generic/609         1s
 generic/610        [not run] xfs_io fzero  failed (old kernel/wrong fs?)
-generic/611        tac: /tmp/cutmpuylfmc: write error: No such file or directory
- 1s
+generic/611         1s
 generic/612        [not run] Reflink not supported by test filesystem type: virtiofs
 generic/613        [not run] No encryption support for virtiofs
 generic/614        [not run] test requires delayed allocation buffered writes
-generic/615        tac: /tmp/cutmplkVUuF: write error: No such file or directory
- 161s
-generic/618        tac: /tmp/cutmpQWo11y: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/618.out.bad)
+generic/615         170s
+generic/618        - output mismatch (see /opt/xfstests/results//generic/618.out.bad)
     --- tests/generic/618.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/618.out.bad	2026-01-02 07:39:04.730901671 +0000
+    +++ /opt/xfstests/results//generic/618.out.bad	2026-01-03 09:05:15.360013426 +0000
     @@ -1,4 +1,2 @@
      QA output created by 618
     -
@@ -1144,12 +960,10 @@ generic/626        [not run] kernel doesn't support renameat2 syscall
 generic/628        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/629        [not run] require scratchfs to be valid block disk
 generic/630        [not run] Dedupe not supported by scratch filesystem type: virtiofs
-generic/632        tac: /tmp/cutmpJiLHgv: write error: No such file or directory
- 1s
-generic/633        [failed, exit status 1]tac: /tmp/cutmp6O3rOM: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/633.out.bad)
+generic/632         1s
+generic/633        [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/633.out.bad)
     --- tests/generic/633.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/633.out.bad	2026-01-02 07:39:20.201390280 +0000
+    +++ /opt/xfstests/results//generic/633.out.bad	2026-01-03 09:05:30.809812667 +0000
     @@ -1,2 +1,4 @@
      QA output created by 633
      Silence is golden
@@ -1157,35 +971,18 @@ generic/633        [failed, exit status 1]tac: /tmp/cutmp6O3rOM: write error: No
     +vfstest.c: 2418: run_test - Success - failure: create operations in directories with setgid bit set
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/633.out /opt/xfstests/results//generic/633.out.bad'  to see the entire diff)
-generic/634        tac: /tmp/cutmp0Oez0e: write error: No such file or directory
- 2s
+generic/634         2s
 generic/635        [not run] virtiofs does not support shutdown
 generic/636        [not run] swapfiles are not supported
-generic/637        tac: /tmp/cutmpwM5922: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/637.out.bad)
-    --- tests/generic/637.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/637.out.bad	2026-01-02 07:39:26.273457375 +0000
-    @@ -1,2 +1,119 @@
-     QA output created by 637
-    +getdents returned 0 on entry 7
-    +entry 7 has inode 50803, expected 50817
-    +getdents returned 0 on entry 6
-    +entry 6 has inode 50803, expected 50816
-    +getdents returned 0 on entry 5
-    +entry 5 has inode 50803, expected 50815
-    ...
-    (Run 'diff -u /opt/xfstests/tests/generic/637.out /opt/xfstests/results//generic/637.out.bad'  to see the entire diff)
-generic/638        tac: /tmp/cutmp28eqg1: write error: No such file or directory
- 1s
-generic/639        tac: /tmp/cutmpkjbdcN: write error: No such file or directory
- 1s
+generic/637         2s
+generic/638         1s
+generic/639         1s
 generic/640        [not run] require scratchfs to be valid block disk
 generic/641        [not run] swapfiles are not supported
 generic/644        [not run] idmapped mounts not support by virtiofs
 generic/645        [not run] idmapped mounts not support by virtiofs
 generic/646        [not run] virtiofs does not support shutdown
-generic/647        tac: /tmp/cutmpkFPpcN: write error: No such file or directory
- 1s
+generic/647         1s
 generic/651        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/652        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/653        [not run] Reflink not supported by scratch filesystem type: virtiofs
@@ -1207,22 +1004,11 @@ generic/669        [not run] Reflink not supported by scratch filesystem type: v
 generic/673        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/674        [not run] Dedupe not supported by scratch filesystem type: virtiofs
 generic/675        [not run] getcap utility required, skipped this test
-generic/676        tac: /tmp/cutmpaoRtJI: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/676.out.bad)
-    --- tests/generic/676.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/676.out.bad	2026-01-02 07:40:28.179977397 +0000
-    @@ -1,2 +1,3 @@
-     QA output created by 676
-     All tests passed
-    +rm: cannot remove '/mnt/676-dir': Directory not empty
-    ...
-    (Run 'diff -u /opt/xfstests/tests/generic/676.out /opt/xfstests/results//generic/676.out.bad'  to see the entire diff)
+generic/676         6s
 generic/677        [not run] require scratchfs to be valid block disk
-generic/678        tac: /tmp/cutmpC1dZJX: write error: No such file or directory
- 1s
+generic/678         1s
 generic/679        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
-generic/680        tac: /tmp/cutmpkGDizj: write error: No such file or directory
- 2s
+generic/680         1s
 generic/681        [not run] disk quotas not supported by this filesystem type: virtiofs
 generic/682        [not run] disk quotas not supported by this filesystem type: virtiofs
 generic/683        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
@@ -1236,10 +1022,9 @@ generic/690        [not run] require scratchfs to be valid block disk
 generic/692        [not run] fsverity utility required, skipped this test
 generic/693        [not run] No encryption support for virtiofs
 generic/695        [not run] require scratchfs to be valid block disk
-generic/696        tac: /tmp/cutmpAI2b72: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/696.out.bad)
+generic/696        - output mismatch (see /opt/xfstests/results//generic/696.out.bad)
     --- tests/generic/696.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/696.out.bad	2026-01-02 07:40:49.713848259 +0000
+    +++ /opt/xfstests/results//generic/696.out.bad	2026-01-03 09:06:36.716056929 +0000
     @@ -1,2 +1,4 @@
      QA output created by 696
     +vfstest.c: 1781: setgid_create_umask - Success - failure: is_setgid
@@ -1251,10 +1036,9 @@ generic/696        tac: /tmp/cutmpAI2b72: write error: No such file or directory
 HINT: You _MAY_ be missing kernel fix:
       ac6800e279a2 fs: Add missing umask strip in vfs_tmpfile 1639a49ccdce fs: move S_ISGID stripping into the vfs_*() helpers
 
-generic/697        tac: /tmp/cutmpUIZXHX: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/697.out.bad)
+generic/697        - output mismatch (see /opt/xfstests/results//generic/697.out.bad)
     --- tests/generic/697.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/697.out.bad	2026-01-02 07:40:50.858917331 +0000
+    +++ /opt/xfstests/results//generic/697.out.bad	2026-01-03 09:06:37.867461038 +0000
     @@ -1,2 +1,4 @@
      QA output created by 697
     +vfstest.c: 1960: setgid_create_acl - Success - failure: is_setgid
@@ -1272,10 +1056,8 @@ generic/700        [not run] kernel doesn't support renameat2 syscall
 generic/702        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/703        [not run] require scratchfs to be valid block disk
 generic/704        [not run] scsi_debug module not found
-generic/706        tac: /tmp/cutmpzVF5wA: write error: No such file or directory
- 1s
-generic/708        tac: /tmp/cutmptlEbBp: write error: No such file or directory
- 1s
+generic/706         1s
+generic/708         1s
 generic/709        [not run] xfs_io exchangerange  support is missing
 generic/710        [not run] xfs_io exchangerange  support is missing
 generic/711        [not run] xfs_io swapext  not supported on virtiofs
@@ -1295,10 +1077,9 @@ generic/724        [not run] xfs_io exchangerange  support is missing
 generic/725        [not run] xfs_io exchangerange  support is missing
 generic/726        [not run] xfs_io exchangerange  support is missing
 generic/727        [not run] getcap utility required, skipped this test
-generic/728        tac: /tmp/cutmpVzmWmh: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/728.out.bad)
+generic/728        - output mismatch (see /opt/xfstests/results//generic/728.out.bad)
     --- tests/generic/728.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/728.out.bad	2026-01-02 07:41:23.516289014 +0000
+    +++ /opt/xfstests/results//generic/728.out.bad	2026-01-03 09:07:10.674236516 +0000
     @@ -1,2 +1,5 @@
      QA output created by 728
     +Expected ctime to change after setxattr.
@@ -1307,25 +1088,13 @@ generic/728        tac: /tmp/cutmpVzmWmh: write error: No such file or directory
      Silence is golden
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/728.out /opt/xfstests/results//generic/728.out.bad'  to see the entire diff)
-generic/729        tac: /tmp/cutmp1wMjWS: write error: No such file or directory
- 1s
+generic/729         1s
 generic/730        [not run] require testfs to be valid block disk
 generic/731        [not run] require testfs to be valid block disk
-generic/732        tac: /tmp/cutmpcadh74: write error: No such file or directory
- 1s
+generic/732         1s
 generic/734        [not run] Reflink not supported by test filesystem type: virtiofs
 generic/735        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
-generic/736        tac: /tmp/cutmpAhjgio: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/736.out.bad)
-    --- tests/generic/736.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/736.out.bad	2026-01-02 07:41:33.227757583 +0000
-    @@ -1,2 +1,4 @@
-     QA output created by 736
-    +Found less directory entries than expected (1024 but expected 5002)
-     Silence is golden
-    +rm: cannot remove '/mnt/test-736/testdir': Directory not empty
-    ...
-    (Run 'diff -u /opt/xfstests/tests/generic/736.out /opt/xfstests/results//generic/736.out.bad'  to see the entire diff)
+generic/736         7s
 generic/737        [not run] virtiofs does not support shutdown
 generic/738        [not run] virtiofs does not support freezing
 generic/739        [not run] No encryption support for virtiofs
@@ -1336,10 +1105,9 @@ generic/745        [not run] require scratchfs to be valid block disk
 generic/748        [not run] xfs_io falloc -k failed (old kernel/wrong fs?)
 generic/749        [not run] xfs_io falloc  failed (old kernel/wrong fs?)
 generic/752        [not run] xfs_io exchangerange  support is missing
-generic/755        tac: /tmp/cutmpxbEtIM: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/755.out.bad)
+generic/755        - output mismatch (see /opt/xfstests/results//generic/755.out.bad)
     --- tests/generic/755.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/755.out.bad	2026-01-02 07:41:48.619462831 +0000
+    +++ /opt/xfstests/results//generic/755.out.bad	2026-01-03 09:07:39.056456951 +0000
     @@ -1,2 +1,3 @@
      QA output created by 755
     +Target's ctime did not change after unlink!
@@ -1349,10 +1117,9 @@ generic/755        tac: /tmp/cutmpxbEtIM: write error: No such file or directory
 generic/756        [not run] virtiofs doesn't support open_by_handle_at(2)
 generic/757        [not run] This test requires a valid $LOGWRITES_DEV
 generic/758        [not run] xfs_io fzero  failed (old kernel/wrong fs?)
-generic/759        [failed, exit status 1]tac: /tmp/cutmpOgZrTO: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/759.out.bad)
+generic/759        [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/759.out.bad)
     --- tests/generic/759.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/759.out.bad	2026-01-02 07:41:57.022168589 +0000
+    +++ /opt/xfstests/results//generic/759.out.bad	2026-01-03 09:07:47.473723263 +0000
     @@ -1,4 +1,147 @@
      QA output created by 759
      fsx -N 10000 -l 500000 -h
@@ -1363,10 +1130,9 @@ generic/759        [failed, exit status 1]tac: /tmp/cutmpOgZrTO: write error: No
     +main: filesystem does not support fallocate mode FALLOC_FL_KEEP_SIZE, disabling!
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/759.out /opt/xfstests/results//generic/759.out.bad'  to see the entire diff)
-generic/760        [failed, exit status 1]tac: /tmp/cutmpdP49RD: write error: No such file or directory
-- output mismatch (see /opt/xfstests/results//generic/760.out.bad)
+generic/760        [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/760.out.bad)
     --- tests/generic/760.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/760.out.bad	2026-01-02 07:41:58.337851697 +0000
+    +++ /opt/xfstests/results//generic/760.out.bad	2026-01-03 09:07:48.758643030 +0000
     @@ -1,4 +1,230 @@
      QA output created by 760
      fsx -N 10000 -l 500000 -r PSIZE -t BSIZE -w BSIZE -Z -R -W -h
@@ -1377,10 +1143,8 @@ generic/760        [failed, exit status 1]tac: /tmp/cutmpdP49RD: write error: No
     +main: filesystem does not support fallocate mode 0, disabling!
     ...
     (Run 'diff -u /opt/xfstests/tests/generic/760.out /opt/xfstests/results//generic/760.out.bad'  to see the entire diff)
-generic/761        tac: /tmp/cutmpJDv8GV: write error: No such file or directory
- 4s
-generic/763        tac: /tmp/cutmp23CUTv: write error: No such file or directory
- 1s
+generic/761         4s
+generic/763         1s
 generic/764        [not run] require scratchfs to be valid block disk
 generic/765        [not run] write atomic not supported by this block device
 generic/766        [not run] virtiofs does not support shutdown
@@ -1398,8 +1162,8 @@ generic/781        [not run] require scratchfs to be valid block disk
 generic/782        [not run] require scratchfs to be valid block disk
 generic/783        [not run] this test requires overlay support
 Ran: generic/001 generic/002 generic/003 generic/004 generic/005 generic/006 generic/007 generic/008 generic/009 generic/011 generic/012 generic/013 generic/014 generic/015 generic/016 generic/018 generic/020 generic/021 generic/022 generic/023 generic/024 generic/025 generic/026 generic/028 generic/029 generic/030 generic/031 generic/032 generic/033 generic/034 generic/035 generic/037 generic/039 generic/040 generic/041 generic/042 generic/050 generic/052 generic/053 generic/056 generic/057 generic/058 generic/059 generic/060 generic/061 generic/062 generic/063 generic/064 generic/065 generic/066 generic/067 generic/069 generic/070 generic/071 generic/073 generic/075 generic/076 generic/078 generic/079 generic/080 generic/081 generic/082 generic/084 generic/086 generic/087 generic/088 generic/090 generic/091 generic/092 generic/094 generic/095 generic/096 generic/097 generic/098 generic/099 generic/101 generic/103 generic/104 generic/105 generic/106 generic/107 generic/108 generic/110 generic/111 generic/112 generic/113 generic/114 generic/115 generic/116 generic/117 generic/118 generic/119 generic/120 generic/121 generic/122 generic/123 generic/124 generic/126 generic/128 generic/129 generic/130 generic/131 generic/134 generic/135 generic/136 generic/138 generic/139 generic/140 generic/141 generic/142 generic/143 generic/144 generic/145 generic/146 generic/147 generic/148 generic/149 generic/150 generic/151 generic/152 generic/153 generic/154 generic/155 generic/156 generic/157 generic/158 generic/159 generic/160 generic/161 generic/162 generic/163 generic/169 generic/171 generic/172 generic/173 generic/174 generic/177 generic/178 generic/179 generic/180 generic/181 generic/182 generic/183 generic/184 generic/185 generic/188 generic/189 generic/190 generic/191 generic/193 generic/194 generic/195 generic/196 generic/197 generic/198 generic/199 generic/200 generic/201 generic/202 generic/203 generic/205 generic/206 generic/207 generic/210 generic/211 generic/212 generic/213 generic/214 generic/215 generic/216 generic/217 generic/218 generic/219 generic/220 generic/221 generic/222 generic/223 generic/225 generic/227 generic/228 generic/229 generic/230 generic/235 generic/236 generic/237 generic/238 generic/240 generic/244 generic/245 generic/246 generic/247 generic/248 generic/249 generic/250 generic/252 generic/253 generic/254 generic/255 generic/256 generic/257 generic/258 generic/259 generic/260 generic/261 generic/262 generic/263 generic/264 generic/265 generic/266 generic/267 generic/268 generic/271 generic/272 generic/276 generic/277 generic/278 generic/279 generic/281 generic/282 generic/283 generic/284 generic/286 generic/287 generic/288 generic/289 generic/290 generic/291 generic/292 generic/293 generic/294 generic/295 generic/296 generic/301 generic/302 generic/303 generic/304 generic/305 generic/306 generic/307 generic/308 generic/309 generic/312 generic/313 generic/314 generic/315 generic/316 generic/317 generic/318 generic/319 generic/321 generic/322 generic/324 generic/325 generic/326 generic/327 generic/328 generic/329 generic/330 generic/331 generic/332 generic/335 generic/336 generic/337 generic/338 generic/341 generic/342 generic/343 generic/346 generic/347 generic/348 generic/353 generic/355 generic/356 generic/357 generic/358 generic/359 generic/360 generic/361 generic/362 generic/364 generic/366 generic/367 generic/368 generic/369 generic/370 generic/371 generic/372 generic/373 generic/374 generic/375 generic/376 generic/377 generic/378 generic/379 generic/380 generic/381 generic/382 generic/383 generic/384 generic/385 generic/386 generic/389 generic/391 generic/392 generic/393 generic/394 generic/395 generic/396 generic/397 generic/398 generic/400 generic/401 generic/402 generic/403 generic/404 generic/406 generic/407 generic/408 generic/409 generic/410 generic/411 generic/412 generic/413 generic/414 generic/417 generic/419 generic/420 generic/421 generic/422 generic/423 generic/424 generic/425 generic/426 generic/427 generic/428 generic/430 generic/431 generic/432 generic/433 generic/434 generic/436 generic/437 generic/439 generic/440 generic/441 generic/443 generic/444 generic/445 generic/446 generic/448 generic/449 generic/450 generic/451 generic/452 generic/453 generic/454 generic/456 generic/458 generic/460 generic/462 generic/463 generic/465 generic/466 generic/467 generic/468 generic/469 generic/470 generic/471 generic/472 generic/474 generic/477 generic/478 generic/479 generic/480 generic/481 generic/483 generic/484 generic/485 generic/486 generic/487 generic/488 generic/489 generic/490 generic/491 generic/492 generic/493 generic/494 generic/495 generic/496 generic/497 generic/498 generic/499 generic/501 generic/502 generic/503 generic/504 generic/505 generic/506 generic/507 generic/508 generic/509 generic/510 generic/511 generic/512 generic/513 generic/514 generic/515 generic/516 generic/517 generic/518 generic/519 generic/520 generic/523 generic/524 generic/525 generic/526 generic/527 generic/528 generic/529 generic/530 generic/531 generic/532 generic/533 generic/534 generic/535 generic/536 generic/537 generic/538 generic/539 generic/540 generic/541 generic/542 generic/543 generic/544 generic/545 generic/546 generic/547 generic/548 generic/549 generic/550 generic/552 generic/553 generic/554 generic/555 generic/556 generic/557 generic/563 generic/564 generic/565 generic/566 generic/567 generic/568 generic/569 generic/570 generic/571 generic/572 generic/573 generic/574 generic/575 generic/576 generic/577 generic/578 generic/580 generic/581 generic/582 generic/583 generic/584 generic/586 generic/587 generic/588 generic/591 generic/592 generic/593 generic/594 generic/595 generic/596 generic/597 generic/598 generic/599 generic/600 generic/601 generic/602 generic/603 generic/604 generic/605 generic/606 generic/607 generic/608 generic/609 generic/610 generic/611 generic/612 generic/613 generic/614 generic/615 generic/618 generic/620 generic/621 generic/623 generic/624 generic/625 generic/626 generic/628 generic/629 generic/630 generic/632 generic/633 generic/634 generic/635 generic/636 generic/637 generic/638 generic/639 generic/640 generic/641 generic/644 generic/645 generic/646 generic/647 generic/651 generic/652 generic/653 generic/654 generic/655 generic/657 generic/658 generic/659 generic/660 generic/661 generic/662 generic/663 generic/664 generic/665 generic/666 generic/667 generic/668 generic/669 generic/673 generic/674 generic/675 generic/676 generic/677 generic/678 generic/679 generic/680 generic/681 generic/682 generic/683 generic/684 generic/685 generic/686 generic/687 generic/688 generic/689 generic/690 generic/692 generic/693 generic/695 generic/696 generic/697 generic/698 generic/699 generic/700 generic/702 generic/703 generic/704 generic/706 generic/708 generic/709 generic/710 generic/711 generic/712 generic/713 generic/714 generic/715 generic/716 generic/717 generic/718 generic/719 generic/720 generic/721 generic/722 generic/723 generic/724 generic/725 generic/726 generic/727 generic/728 generic/729 generic/730 generic/731 generic/732 generic/734 generic/735 generic/736 generic/737 generic/738 generic/739 generic/740 generic/741 generic/742 generic/745 generic/748 generic/749 generic/752 generic/755 generic/756 generic/757 generic/758 generic/759 generic/760 generic/761 generic/763 generic/764 generic/765 generic/766 generic/767 generic/768 generic/769 generic/770 generic/771 generic/775 generic/776 generic/777 generic/779 generic/780 generic/781 generic/782 generic/783
-Not run: generic/003 generic/004 generic/008 generic/009 generic/012 generic/015 generic/016 generic/018 generic/021 generic/022 generic/024 generic/025 generic/026 generic/031 generic/032 generic/033 generic/034 generic/039 generic/040 generic/041 generic/042 generic/050 generic/052 generic/056 generic/057 generic/058 generic/059 generic/060 generic/061 generic/063 generic/064 generic/065 generic/066 generic/067 generic/071 generic/073 generic/076 generic/078 generic/079 generic/081 generic/082 generic/086 generic/090 generic/092 generic/094 generic/095 generic/096 generic/101 generic/103 generic/104 generic/106 generic/107 generic/108 generic/110 generic/111 generic/114 generic/115 generic/116 generic/118 generic/119 generic/120 generic/121 generic/122 generic/134 generic/136 generic/138 generic/139 generic/140 generic/142 generic/143 generic/144 generic/145 generic/146 generic/147 generic/148 generic/149 generic/150 generic/151 generic/152 generic/153 generic/154 generic/155 generic/156 generic/157 generic/158 generic/159 generic/160 generic/161 generic/162 generic/163 generic/171 generic/172 generic/173 generic/174 generic/177 generic/178 generic/179 generic/180 generic/181 generic/182 generic/183 generic/185 generic/188 generic/189 generic/190 generic/191 generic/194 generic/195 generic/196 generic/197 generic/199 generic/200 generic/201 generic/202 generic/203 generic/205 generic/206 generic/211 generic/213 generic/214 generic/216 generic/217 generic/218 generic/219 generic/220 generic/222 generic/223 generic/225 generic/227 generic/228 generic/229 generic/230 generic/235 generic/238 generic/240 generic/244 generic/250 generic/252 generic/253 generic/254 generic/255 generic/256 generic/259 generic/261 generic/262 generic/264 generic/265 generic/266 generic/267 generic/268 generic/271 generic/272 generic/276 generic/277 generic/278 generic/279 generic/281 generic/282 generic/283 generic/284 generic/286 generic/287 generic/289 generic/290 generic/291 generic/292 generic/293 generic/295 generic/296 generic/301 generic/302 generic/303 generic/304 generic/305 generic/312 generic/315 generic/316 generic/317 generic/318 generic/321 generic/322 generic/324 generic/325 generic/326 generic/327 generic/328 generic/329 generic/330 generic/331 generic/332 generic/335 generic/336 generic/338 generic/341 generic/342 generic/343 generic/347 generic/348 generic/353 generic/356 generic/357 generic/358 generic/359 generic/361 generic/366 generic/367 generic/368 generic/369 generic/370 generic/371 generic/372 generic/373 generic/374 generic/376 generic/379 generic/380 generic/381 generic/382 generic/383 generic/384 generic/385 generic/386 generic/389 generic/391 generic/392 generic/395 generic/396 generic/397 generic/398 generic/400 generic/402 generic/404 generic/406 generic/407 generic/408 generic/409 generic/410 generic/411 generic/413 generic/414 generic/417 generic/419 generic/420 generic/421 generic/422 generic/424 generic/425 generic/426 generic/427 generic/436 generic/439 generic/440 generic/441 generic/445 generic/446 generic/449 generic/450 generic/453 generic/454 generic/456 generic/458 generic/460 generic/462 generic/463 generic/466 generic/467 generic/468 generic/469 generic/470 generic/472 generic/474 generic/477 generic/479 generic/480 generic/481 generic/483 generic/484 generic/485 generic/487 generic/488 generic/489 generic/491 generic/492 generic/493 generic/494 generic/495 generic/496 generic/497 generic/498 generic/499 generic/501 generic/502 generic/503 generic/505 generic/506 generic/507 generic/508 generic/509 generic/510 generic/511 generic/512 generic/513 generic/514 generic/515 generic/516 generic/517 generic/518 generic/520 generic/526 generic/527 generic/528 generic/530 generic/531 generic/534 generic/535 generic/536 generic/537 generic/538 generic/539 generic/540 generic/541 generic/542 generic/543 generic/544 generic/545 generic/546 generic/547 generic/548 generic/549 generic/550 generic/552 generic/553 generic/554 generic/555 generic/556 generic/557 generic/563 generic/564 generic/566 generic/567 generic/568 generic/569 generic/570 generic/572 generic/573 generic/574 generic/575 generic/576 generic/577 generic/578 generic/580 generic/581 generic/582 generic/583 generic/584 generic/586 generic/587 generic/588 generic/592 generic/593 generic/594 generic/595 generic/596 generic/599 generic/600 generic/601 generic/602 generic/603 generic/605 generic/606 generic/607 generic/608 generic/610 generic/612 generic/613 generic/614 generic/620 generic/621 generic/623 generic/624 generic/625 generic/626 generic/628 generic/629 generic/630 generic/635 generic/636 generic/640 generic/641 generic/644 generic/645 generic/646 generic/651 generic/652 generic/653 generic/654 generic/655 generic/657 generic/658 generic/659 generic/660 generic/661 generic/662 generic/663 generic/664 generic/665 generic/666 generic/667 generic/668 generic/669 generic/673 generic/674 generic/675 generic/677 generic/679 generic/681 generic/682 generic/683 generic/684 generic/685 generic/686 generic/687 generic/688 generic/689 generic/690 generic/692 generic/693 generic/695 generic/698 generic/699 generic/700 generic/702 generic/703 generic/704 generic/709 generic/710 generic/711 generic/712 generic/713 generic/714 generic/715 generic/716 generic/717 generic/718 generic/719 generic/720 generic/721 generic/722 generic/723 generic/724 generic/725 generic/726 generic/727 generic/730 generic/731 generic/734 generic/735 generic/737 generic/738 generic/739 generic/740 generic/741 generic/742 generic/745 generic/748 generic/749 generic/752 generic/756 generic/757 generic/758 generic/764 generic/765 generic/766 generic/767 generic/768 generic/769 generic/770 generic/771 generic/775 generic/776 generic/777 generic/779 generic/780 generic/781 generic/782 generic/783
-Failures: generic/006 generic/020 generic/029 generic/030 generic/035 generic/062 generic/075 generic/091 generic/097 generic/099 generic/112 generic/130 generic/131 generic/193 generic/221 generic/236 generic/247 generic/257 generic/258 generic/260 generic/263 generic/288 generic/307 generic/314 generic/319 generic/337 generic/355 generic/375 generic/377 generic/401 generic/403 generic/423 generic/432 generic/433 generic/444 generic/448 generic/451 generic/471 generic/486 generic/490 generic/523 generic/529 generic/533 generic/571 generic/597 generic/598 generic/618 generic/633 generic/637 generic/676 generic/696 generic/697 generic/728 generic/736 generic/755 generic/759 generic/760
-Failed 57 of 629 tests
+Not run: generic/003 generic/004 generic/008 generic/009 generic/012 generic/015 generic/016 generic/018 generic/021 generic/022 generic/024 generic/025 generic/026 generic/031 generic/032 generic/033 generic/034 generic/039 generic/040 generic/041 generic/042 generic/050 generic/052 generic/056 generic/057 generic/058 generic/059 generic/060 generic/061 generic/063 generic/064 generic/065 generic/066 generic/067 generic/071 generic/073 generic/076 generic/078 generic/079 generic/081 generic/082 generic/086 generic/090 generic/092 generic/094 generic/096 generic/101 generic/103 generic/104 generic/106 generic/107 generic/108 generic/110 generic/111 generic/114 generic/115 generic/116 generic/118 generic/119 generic/120 generic/121 generic/122 generic/134 generic/136 generic/138 generic/139 generic/140 generic/142 generic/143 generic/144 generic/145 generic/146 generic/147 generic/148 generic/149 generic/150 generic/151 generic/152 generic/153 generic/154 generic/155 generic/156 generic/157 generic/158 generic/159 generic/160 generic/161 generic/162 generic/163 generic/171 generic/172 generic/173 generic/174 generic/177 generic/178 generic/179 generic/180 generic/181 generic/182 generic/183 generic/185 generic/188 generic/189 generic/190 generic/191 generic/194 generic/195 generic/196 generic/197 generic/199 generic/200 generic/201 generic/202 generic/203 generic/205 generic/206 generic/211 generic/213 generic/214 generic/216 generic/217 generic/218 generic/219 generic/220 generic/222 generic/223 generic/225 generic/227 generic/228 generic/229 generic/230 generic/235 generic/238 generic/240 generic/244 generic/250 generic/252 generic/253 generic/254 generic/255 generic/256 generic/259 generic/260 generic/261 generic/262 generic/264 generic/265 generic/266 generic/267 generic/268 generic/271 generic/272 generic/276 generic/277 generic/278 generic/279 generic/281 generic/282 generic/283 generic/284 generic/286 generic/287 generic/288 generic/289 generic/290 generic/291 generic/292 generic/293 generic/295 generic/296 generic/301 generic/302 generic/303 generic/304 generic/305 generic/312 generic/315 generic/316 generic/317 generic/318 generic/321 generic/322 generic/324 generic/325 generic/326 generic/327 generic/328 generic/329 generic/330 generic/331 generic/332 generic/335 generic/336 generic/338 generic/341 generic/342 generic/343 generic/347 generic/348 generic/353 generic/356 generic/357 generic/358 generic/359 generic/361 generic/367 generic/368 generic/369 generic/370 generic/371 generic/372 generic/373 generic/374 generic/376 generic/379 generic/380 generic/381 generic/382 generic/383 generic/384 generic/385 generic/386 generic/389 generic/391 generic/392 generic/395 generic/396 generic/397 generic/398 generic/400 generic/402 generic/404 generic/406 generic/407 generic/408 generic/409 generic/410 generic/411 generic/413 generic/414 generic/417 generic/419 generic/420 generic/421 generic/422 generic/424 generic/425 generic/426 generic/427 generic/436 generic/439 generic/440 generic/441 generic/445 generic/446 generic/449 generic/450 generic/453 generic/454 generic/456 generic/458 generic/460 generic/462 generic/463 generic/466 generic/467 generic/468 generic/469 generic/470 generic/472 generic/474 generic/477 generic/479 generic/480 generic/481 generic/483 generic/484 generic/485 generic/487 generic/488 generic/489 generic/491 generic/492 generic/493 generic/494 generic/495 generic/496 generic/497 generic/498 generic/499 generic/501 generic/502 generic/503 generic/505 generic/506 generic/507 generic/508 generic/509 generic/510 generic/511 generic/512 generic/513 generic/514 generic/515 generic/516 generic/517 generic/518 generic/520 generic/526 generic/527 generic/528 generic/530 generic/531 generic/534 generic/535 generic/536 generic/537 generic/538 generic/539 generic/540 generic/541 generic/542 generic/543 generic/544 generic/545 generic/546 generic/547 generic/548 generic/549 generic/550 generic/552 generic/553 generic/554 generic/555 generic/556 generic/557 generic/563 generic/564 generic/566 generic/567 generic/568 generic/569 generic/570 generic/572 generic/573 generic/574 generic/575 generic/576 generic/577 generic/578 generic/580 generic/581 generic/582 generic/583 generic/584 generic/586 generic/587 generic/588 generic/592 generic/593 generic/594 generic/595 generic/596 generic/599 generic/600 generic/601 generic/602 generic/603 generic/605 generic/606 generic/607 generic/608 generic/610 generic/612 generic/613 generic/614 generic/620 generic/621 generic/623 generic/624 generic/625 generic/626 generic/628 generic/629 generic/630 generic/635 generic/636 generic/640 generic/641 generic/644 generic/645 generic/646 generic/651 generic/652 generic/653 generic/654 generic/655 generic/657 generic/658 generic/659 generic/660 generic/661 generic/662 generic/663 generic/664 generic/665 generic/666 generic/667 generic/668 generic/669 generic/673 generic/674 generic/675 generic/677 generic/679 generic/681 generic/682 generic/683 generic/684 generic/685 generic/686 generic/687 generic/688 generic/689 generic/690 generic/692 generic/693 generic/695 generic/698 generic/699 generic/700 generic/702 generic/703 generic/704 generic/709 generic/710 generic/711 generic/712 generic/713 generic/714 generic/715 generic/716 generic/717 generic/718 generic/719 generic/720 generic/721 generic/722 generic/723 generic/724 generic/725 generic/726 generic/727 generic/730 generic/731 generic/734 generic/735 generic/737 generic/738 generic/739 generic/740 generic/741 generic/742 generic/745 generic/748 generic/749 generic/752 generic/756 generic/757 generic/758 generic/764 generic/765 generic/766 generic/767 generic/768 generic/769 generic/770 generic/771 generic/775 generic/776 generic/777 generic/779 generic/780 generic/781 generic/782 generic/783
+Failures: generic/020 generic/029 generic/030 generic/035 generic/062 generic/075 generic/091 generic/097 generic/099 generic/112 generic/130 generic/131 generic/193 generic/221 generic/236 generic/258 generic/263 generic/307 generic/314 generic/319 generic/337 generic/355 generic/375 generic/377 generic/401 generic/403 generic/423 generic/432 generic/433 generic/444 generic/448 generic/451 generic/486 generic/490 generic/523 generic/529 generic/533 generic/571 generic/597 generic/598 generic/618 generic/633 generic/696 generic/697 generic/728 generic/755 generic/759 generic/760
+Failed 48 of 629 tests
 
 exit status 1
