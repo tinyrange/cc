@@ -574,8 +574,6 @@ const (
 	errNotEmpty    = int32(39)
 )
 
-var loggedLseek bool
-
 // GetAttr implements virtio.FsBackend.
 func (v *virtioFsBackend) GetAttr(nodeID uint64) (attr virtio.FuseAttr, errno int32) {
 	v.mu.Lock()
@@ -1051,10 +1049,6 @@ func (v *virtioFsBackend) Lseek(nodeID uint64, fh uint64, offset uint64, whence 
 	}
 	if n.isDir() {
 		return 0, -int32(linux.EISDIR)
-	}
-	if !loggedLseek {
-		slog.Info("virtiofs lseek", "node", nid, "offset", offset, "whence", whence)
-		loggedLseek = true
 	}
 	ext := n.extents
 	switch whence {
