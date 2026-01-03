@@ -109,6 +109,9 @@ func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
 		ir.Syscall(defs.SYS_MOUNT, "sysfs", "/mnt/sys", "sysfs", ir.Int64(0), ""),
 		ir.Syscall(defs.SYS_MOUNT, "devtmpfs", "/mnt/dev", "devtmpfs", ir.Int64(0), ""),
 
+		// Mount tmp
+		ir.Syscall(defs.SYS_MOUNT, "tmpfs", "/mnt/tmp", "tmpfs", ir.Int64(0), "mode=1777"),
+
 		// Mount /dev/shm (wlroots/xkbcommon use it for shm-backed buffers like keymaps).
 		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt/dev/shm", ir.Int64(0o1777)),
 		ir.Syscall(defs.SYS_MOUNT, "tmpfs", "/mnt/dev/shm", "tmpfs", ir.Int64(0), "mode=1777"),
