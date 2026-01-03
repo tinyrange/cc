@@ -219,6 +219,14 @@ const (
 	FUSE_LSEEK       = 46
 )
 
+// FUSE_INIT capability flags (subset; values match Linux uapi `include/uapi/linux/fuse.h`).
+// These are returned in `fuse_init_out.flags`.
+const (
+	// FuseCapPosixACL indicates the server supports POSIX ACLs (e.g. via
+	// `system.posix_acl_access` and `system.posix_acl_default` xattrs).
+	FuseCapPosixACL uint32 = 1 << 20
+)
+
 // Minimal structs we need on the wire (host end)
 // Note: All little-endian.
 
@@ -360,7 +368,7 @@ type fsWriteBackend interface {
 }
 
 type fsXattrBackend interface {
-	SetXattr(nodeID uint64, name string, value []byte, flags uint32) int32
+	SetXattr(nodeID uint64, name string, value []byte, flags uint32, uid uint32, gid uint32) int32
 	GetXattr(nodeID uint64, name string) ([]byte, int32)
 	ListXattr(nodeID uint64) ([]byte, int32)
 	RemoveXattr(nodeID uint64, name string) int32
@@ -387,7 +395,7 @@ type fsRemoveBackend interface {
 }
 
 type fsSetattrBackend interface {
-	SetAttr(nodeID uint64, size *uint64, mode *uint32, uid *uint32, gid *uint32) int32
+	SetAttr(nodeID uint64, size *uint64, mode *uint32, uid *uint32, gid *uint32, reqUID uint32, reqGID uint32) int32
 }
 
 type fsLseekBackend interface {
@@ -1198,7 +1206,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			return 0, fmt.Errorf("FUSE_SETXATTR value short")
 		}
 		if be, ok := v.backend.(fsXattrBackend); ok {
-			errno = be.SetXattr(in.NodeID, name, value[:size], flags)
+			errno = be.SetXattr(in.NodeID, name, value[:size], flags, in.UID, in.GID)
 			if errno == 0 {
 				return w(fuseOutHeader{Len: fuseHdrOutSize, Error: 0, Unique: in.Unique}, nil), nil
 			}
@@ -1414,7 +1422,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			}
 		}
 		if be, ok := v.backend.(fsSetattrBackend); ok {
-			errno = be.SetAttr(in.NodeID, sizeVal, modeVal, uidVal, gidVal)
+			errno = be.SetAttr(in.NodeID, sizeVal, modeVal, uidVal, gidVal, in.UID, in.GID)
 			if errno == 0 {
 				debug.Writef("virtio-fs.dispatchFUSE op=SETATTR applied", "size=%v mode=%v uid=%v gid=%v", sizeVal, modeVal, uidVal, gidVal)
 				attr, e := v.backend.GetAttr(in.NodeID)
