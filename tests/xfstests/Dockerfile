@@ -69,22 +69,7 @@ export SCRATCH_MNT=/scratch
 EOF
 
 # Entry point script
-RUN cat > /opt/xfstests/run-tests.sh <<EOF
-#!/bin/bash
-set -e
-
-cd /opt/xfstests
-
-# Run tests - pass any arguments to check
-if [ $# -eq 0 ]; then
-    # Default: run generic quick tests suitable for virtiofs
-    exec ./check -g quick
-else
-    exec ./check "$@"
-fi
-EOF
-
-RUN chmod +x /opt/xfstests/run-tests.sh
+COPY run-tests.sh /opt/xfstests/run-tests.sh
 
 ENTRYPOINT ["/opt/xfstests/run-tests.sh"]
 CMD []
