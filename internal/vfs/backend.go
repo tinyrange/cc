@@ -323,15 +323,17 @@ type fsNode struct {
 	// Sparse file storage. We model allocation at a fixed block granularity to
 	// provide realistic SEEK_DATA/SEEK_HOLE behavior (xfstests seek_sanity_test).
 	// Key is block index (offset / fileBlockSize), value is a full block.
-	blocks  map[uint64][]byte
-	entries map[string]uint64
-	xattr   map[string][]byte
-	modTime time.Time // best-effort mtime
-	aTime   time.Time // best-effort atime
-	ctime   time.Time // change time (metadata changes like chmod/chown/xattr)
-	nlink   uint32    // number of hard links (0 means 1 for backwards compat)
-	uid     uint32    // owner user ID
-	gid     uint32    // owner group ID
+	blocks   map[uint64][]byte
+	entries  map[string]uint64
+	xattr    map[string][]byte
+	modTime  time.Time // best-effort mtime
+	aTime    time.Time // best-effort atime
+	ctime    time.Time // change time (metadata changes like chmod/chown/xattr)
+	nlink    uint32    // number of hard links (POSIX st_nlink); may be 0 when unlinked but still open
+	openRefs uint32    // open handle refcount (file handles + directory handles)
+	unlinked bool      // true once link count reaches 0 (or directory removed); inode may still be open
+	uid      uint32    // owner user ID
+	gid      uint32    // owner group ID
 
 	symlinkTarget string
 
@@ -347,6 +349,7 @@ func newDirNode(id uint64, name string, parent uint64, perm fs.FileMode) *fsNode
 		name:    name,
 		parent:  parent,
 		mode:    fs.ModeDir | perm,
+		nlink:   1,
 		entries: make(map[string]uint64),
 		xattr:   make(map[string][]byte),
 		modTime: now,
@@ -362,6 +365,7 @@ func newFileNode(id uint64, name string, parent uint64, perm fs.FileMode) *fsNod
 		name:    name,
 		parent:  parent,
 		mode:    perm,
+		nlink:   1,
 		blocks:  make(map[uint64][]byte),
 		xattr:   make(map[string][]byte),
 		modTime: now,
@@ -471,11 +475,13 @@ func (n *fsNode) attr() virtio.FuseAttr {
 		mode |= linux.S_IFREG
 	}
 
-	nlink := uint32(1)
-	if n.nlink > 0 {
-		nlink = n.nlink
-	}
-	if n.isDir() {
+	var nlink uint32
+	switch {
+	case n.unlinked:
+		// Unlinked-but-open inodes must report st_nlink==0 (xfstests generic/035).
+		nlink = 0
+	case n.isDir():
+		// Best-effort directory link count.
 		entryCount := len(n.entries)
 		if n.abstractDir != nil {
 			if entries, err := n.abstractDir.ReadDir(); err == nil {
@@ -483,6 +489,14 @@ func (n *fsNode) attr() virtio.FuseAttr {
 			}
 		}
 		nlink = 2 + uint32(entryCount)
+	default:
+		// Regular file / symlink / special node.
+		if n.nlink == 0 {
+			// Defensive: most nodes are created with nlink=1.
+			nlink = 1
+		} else {
+			nlink = n.nlink
+		}
 	}
 
 	asec := uint64(int64(aTime.Unix()))
@@ -600,17 +614,7 @@ func (v *virtioFsBackend) snapshotDirEnts(dirNode *fsNode) []dirHandleEnt {
 			continue
 		}
 		child := v.nodes[id]
-		typ := uint32(linux.DT_REG)
-		if child != nil {
-			switch {
-			case child.isDir():
-				typ = uint32(linux.DT_DIR)
-			case child.isSymlink():
-				typ = uint32(linux.DT_LNK)
-			default:
-				typ = uint32(linux.DT_REG)
-			}
-		}
+		typ := uint32(direntTypeForNode(child))
 		ents = append(ents, dirHandleEnt{name: name, ino: id, typ: typ})
 	}
 	return ents
@@ -622,6 +626,43 @@ func (v *virtioFsBackend) node(id uint64) (*fsNode, int32) {
 		return nil, -int32(linux.ENOENT)
 	}
 	return n, 0
+}
+
+// maybeReapNode deletes an inode once it has no links and no remaining open handles.
+// Caller must hold v.mu.
+func (v *virtioFsBackend) maybeReapNode(n *fsNode) {
+	if n == nil {
+		return
+	}
+	if n.unlinked && n.openRefs == 0 {
+		delete(v.nodes, n.id)
+	}
+}
+
+// direntTypeForNode maps an inode to a Linux DT_* value for directory enumeration.
+func direntTypeForNode(n *fsNode) uint32 {
+	if n == nil {
+		return linux.DT_UNKNOWN
+	}
+	if n.isDir() {
+		return linux.DT_DIR
+	}
+	if n.isSymlink() {
+		return linux.DT_LNK
+	}
+	if n.rawMode != 0 {
+		switch n.rawMode & linux.S_IFMT {
+		case linux.S_IFCHR:
+			return linux.DT_CHR
+		case linux.S_IFBLK:
+			return linux.DT_BLK
+		case linux.S_IFIFO:
+			return linux.DT_FIFO
+		case linux.S_IFSOCK:
+			return linux.DT_SOCK
+		}
+	}
+	return linux.DT_REG
 }
 
 func cleanName(name string) string {
@@ -682,6 +723,7 @@ func (v *virtioFsBackend) createAbstractNode(parent *fsNode, name string, entry 
 		id:     id,
 		name:   name,
 		parent: parent.id,
+		nlink:  1,
 		xattr:  make(map[string][]byte),
 	}
 
@@ -969,6 +1011,7 @@ func (v *virtioFsBackend) Open(nodeID uint64, flags uint32) (fh uint64, errno in
 	fh = v.nextFH
 	v.nextFH++
 	v.handles[fh] = n.id
+	n.openRefs++
 	return fh, 0
 }
 
@@ -1063,7 +1106,7 @@ func (v *virtioFsBackend) ReadDir(nodeID uint64, off uint64, maxBytes uint32) ([
 	var buf []byte
 	for idx := int(off); idx < len(names); idx++ {
 		name := names[idx]
-		typ := linux.DT_DIR
+		typ := uint32(linux.DT_DIR)
 		id := dirNode.id
 		if name == "." {
 			id = dirNode.id
@@ -1077,24 +1120,18 @@ func (v *virtioFsBackend) ReadDir(nodeID uint64, off uint64, maxBytes uint32) ([
 				id = cachedID
 				child, _ := v.node(id)
 				if child != nil {
-					if child.isDir() {
-						typ = linux.DT_DIR
-					} else if child.isSymlink() {
-						typ = linux.DT_LNK
-					} else {
-						typ = linux.DT_REG
-					}
+					typ = direntTypeForNode(child)
 				}
 			} else if dirNode.abstractDir != nil {
 				// Look up in abstract directory
 				if entry, lookupErr := dirNode.abstractDir.Lookup(name); lookupErr == nil {
 					// Determine type from abstract entry
 					if entry.Dir != nil {
-						typ = linux.DT_DIR
+						typ = uint32(linux.DT_DIR)
 					} else if entry.Symlink != nil {
-						typ = linux.DT_LNK
+						typ = uint32(linux.DT_LNK)
 					} else if entry.File != nil {
-						typ = linux.DT_REG
+						typ = uint32(linux.DT_REG)
 					}
 					// Create node to get an ID
 					node, _ := v.createAbstractNode(dirNode, name, entry)
@@ -1105,7 +1142,7 @@ func (v *virtioFsBackend) ReadDir(nodeID uint64, off uint64, maxBytes uint32) ([
 			}
 		}
 		// Cookie is the next entry index.
-		dirent := buildFuseDirent(id, name, uint32(typ), uint64(idx+1))
+		dirent := buildFuseDirent(id, name, typ, uint64(idx+1))
 		if maxBytes > 0 && len(buf)+len(dirent) > int(maxBytes) {
 			break
 		}
@@ -1137,6 +1174,7 @@ func (v *virtioFsBackend) OpenDir(nodeID uint64, _ uint32) (fh uint64, errno int
 	// READDIR, and they must be observable (see xfstests generic/471).
 	// Snapshotting is deferred until the first READDIR(off=0) on this handle.
 	v.dirHandles[fh] = &dirHandle{nodeID: nodeID}
+	dirNode.openRefs++
 	return fh, 0
 }
 
@@ -1144,7 +1182,13 @@ func (v *virtioFsBackend) OpenDir(nodeID uint64, _ uint32) (fh uint64, errno int
 func (v *virtioFsBackend) ReleaseDir(_ uint64, fh uint64) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	delete(v.dirHandles, fh)
+	if h, ok := v.dirHandles[fh]; ok {
+		if n := v.nodes[h.nodeID]; n != nil && n.openRefs > 0 {
+			n.openRefs--
+			v.maybeReapNode(n)
+		}
+		delete(v.dirHandles, fh)
+	}
 }
 
 // ReadDirHandle implements virtio's optional directory-handle backend.
@@ -1205,8 +1249,15 @@ func (v *virtioFsBackend) ReadDirHandle(nodeID uint64, fh uint64, off uint64, ma
 func (v *virtioFsBackend) Release(nodeID uint64, fh uint64) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-
-	delete(v.handles, fh)
+	if nid, ok := v.handles[fh]; ok {
+		if n := v.nodes[nid]; n != nil && n.openRefs > 0 {
+			n.openRefs--
+			v.maybeReapNode(n)
+		}
+		delete(v.handles, fh)
+		return
+	}
+	_ = nodeID
 }
 
 // StatFS implements virtio.FsBackend.
@@ -1258,6 +1309,7 @@ func (v *virtioFsBackend) Create(parent uint64, name string, mode uint32, flags 
 		fh = v.nextFH
 		v.nextFH++
 		v.handles[fh] = existing.id
+		existing.openRefs++
 		return existing.id, fh, existing.attr(), 0
 	}
 
@@ -1301,6 +1353,7 @@ func (v *virtioFsBackend) Create(parent uint64, name string, mode uint32, flags 
 	fh = v.nextFH
 	v.nextFH++
 	v.handles[fh] = id
+	node.openRefs++
 	return id, fh, node.attr(), 0
 }
 
@@ -1881,6 +1934,10 @@ func (v *virtioFsBackend) Rename(oldParent uint64, oldName string, newParent uin
 	if e := nameErr(dstName); e != 0 {
 		return e
 	}
+	// Trivial no-op.
+	if oldParent == newParent && srcName == dstName {
+		return 0
+	}
 	if !srcParent.isDir() || !dstParent.isDir() {
 		return -int32(linux.ENOTDIR)
 	}
@@ -1889,11 +1946,53 @@ func (v *virtioFsBackend) Rename(oldParent uint64, oldName string, newParent uin
 		slog.Warn("virtiofs rename missing source", "parent", oldParent, "name", srcName)
 		return -int32(linux.ENOENT)
 	}
-	// Prevent overwriting non-empty dir
+	srcNode := v.nodes[srcID]
+	if srcNode == nil {
+		return -int32(linux.ENOENT)
+	}
+
+	// Handle overwrite semantics (rename-overwrite should unlink the replaced inode).
 	if dstID, exists := dstParent.entries[dstName]; exists {
-		dstNode := v.nodes[dstID]
-		if dstNode.isDir() && len(dstNode.entries) > 0 {
-			return -errNotEmpty
+		if flags&linux.RENAME_NOREPLACE != 0 {
+			return -int32(linux.EEXIST)
+		}
+		// If destination is a different inode, unlink/rmdir it (but keep it alive if open).
+		if dstID != srcID {
+			dstNode := v.nodes[dstID]
+			if dstNode != nil {
+				// Basic type checks: file<->dir mismatches.
+				if dstNode.isDir() && !srcNode.isDir() {
+					return -int32(linux.EISDIR)
+				}
+				if !dstNode.isDir() && srcNode.isDir() {
+					return -int32(linux.ENOTDIR)
+				}
+				// Prevent overwriting non-empty dir.
+				if dstNode.isDir() && len(dstNode.entries) > 0 {
+					return -errNotEmpty
+				}
+
+				// Remove destination entry (like unlink/rmdir).
+				delete(dstParent.entries, dstName)
+
+				// POSIX: replacing changes target inode metadata (nlink), so ctime must update.
+				now := time.Now()
+				dstNode.ctime = bumpTime(dstNode.ctime, now)
+				if dstNode.isDir() {
+					dstNode.unlinked = true
+				} else {
+					if dstNode.nlink > 0 {
+						dstNode.nlink--
+					}
+					if dstNode.nlink == 0 {
+						dstNode.unlinked = true
+					}
+				}
+				v.maybeReapNode(dstNode)
+			} else {
+				// Stale entry; drop it.
+				delete(dstParent.entries, dstName)
+			}
 		}
 	}
 	dstParent.entries[dstName] = srcID
@@ -1958,13 +2057,15 @@ func (v *virtioFsBackend) Unlink(parent uint64, name string) int32 {
 	}
 	// POSIX: unlink changes target inode metadata (nlink), so ctime must update.
 	node.ctime = bumpTime(node.ctime, time.Now())
-	// Decrement link count; only delete node when no more links remain
-	if node.nlink <= 1 {
-		// nlink==0 means 1 link (implicit), nlink==1 means 1 link (explicit)
-		delete(v.nodes, id)
-	} else {
+	// Decrement link count; if it hits 0, keep the inode around while open but
+	// report st_nlink==0 (xfstests generic/035).
+	if node.nlink > 0 {
 		node.nlink--
 	}
+	if node.nlink == 0 {
+		node.unlinked = true
+	}
+	v.maybeReapNode(node)
 	return 0
 }
 
@@ -2002,7 +2103,9 @@ func (v *virtioFsBackend) Rmdir(parent uint64, name string) int32 {
 		parentNode.aTime = bumpTime(parentNode.aTime, now)
 		parentNode.ctime = bumpTime(parentNode.ctime, now)
 	}
-	delete(v.nodes, id)
+	// Directory is now unlinked. If it is still open (opendir), keep it alive.
+	node.unlinked = true
+	v.maybeReapNode(node)
 	return 0
 }
 
@@ -2115,6 +2218,7 @@ func (v *virtioFsBackend) Symlink(parent uint64, name string, target string, _ u
 		parent:        parentNode.id,
 		mode:          fs.ModeSymlink | 0o777,
 		size:          uint64(len(target)),
+		nlink:         1,
 		xattr:         make(map[string][]byte),
 		modTime:       now,
 		ctime:         now,
@@ -2178,11 +2282,8 @@ func (v *virtioFsBackend) Link(oldNodeID uint64, newParent uint64, newName strin
 	}
 	// Add new entry pointing to the existing node and increment link count
 	parentNode.entries[clean] = oldNodeID
-	if oldNode.nlink == 0 {
-		oldNode.nlink = 2 // was 1 implicitly, now 2
-	} else {
-		oldNode.nlink++
-	}
+	oldNode.nlink++
+	oldNode.unlinked = false
 	// POSIX: link changes target inode metadata (nlink), so ctime must update.
 	oldNode.ctime = bumpTime(oldNode.ctime, time.Now())
 	if parentNode.abstractDir == nil {
@@ -2258,6 +2359,7 @@ func (v *virtioFsBackend) AddAbstractFile(filePath string, file AbstractFile) er
 		parent:       parent.id,
 		mode:         mode,
 		size:         size,
+		nlink:        1,
 		xattr:        make(map[string][]byte),
 		abstractFile: file,
 		modTime:      modTime,
