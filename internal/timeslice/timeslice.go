@@ -53,6 +53,7 @@ const (
 
 var timeslices = make(map[TimesliceID]SliceInfo)
 
+// not designed to be thread safe
 func RegisterKind(name string, flags SliceFlags) TimesliceID {
 	id := TimesliceID(len(timeslices) + 1)
 	timeslices[id] = SliceInfo{
@@ -126,7 +127,24 @@ func (w *writer) Close() error {
 
 var currentWriter atomic.Pointer[writer]
 
-func Record(id TimesliceID, duration time.Duration) {
+var lastTime atomic.Uint64
+
+func init() {
+	lastTime.Store(uint64(time.Now().UnixNano()))
+}
+
+func Record(id TimesliceID) {
+	if w := currentWriter.Load(); w != nil {
+		last := lastTime.Swap(uint64(time.Now().UnixNano()))
+
+		w.writerChan <- record{
+			ID:       id,
+			Duration: int64(time.Now().UnixNano() - int64(last)),
+		}
+	}
+}
+
+func RecordRaw(id TimesliceID, duration time.Duration) {
 	if w := currentWriter.Load(); w != nil {
 		w.writerChan <- record{
 			ID:       id,

@@ -19,7 +19,7 @@ type timesliceRecord struct {
 }
 
 func (r *timesliceRecord) String() string {
-	return fmt.Sprintf("% 20s flags=% 10s count=% 8d sum=% 16s min=% 16s max=% 16s avg=% 16s",
+	return fmt.Sprintf("% 40s flags=% 10s count=% 8d sum=% 16s min=% 16s max=% 16s avg=% 16s",
 		r.ID, r.Flags, r.Count,
 		r.Sum,
 		r.Min,
@@ -63,9 +63,11 @@ func main() {
 
 	if *sums {
 		records := map[string]*timesliceRecord{}
+		displayOrder := []string{}
 		if err := timeslice.ReadAllRecords(f, func(id string, flags timeslice.SliceFlags, duration time.Duration) error {
 			record, ok := records[id]
 			if !ok {
+				displayOrder = append(displayOrder, id)
 				record = &timesliceRecord{ID: id, Flags: flags}
 				records[id] = record
 			}
@@ -75,7 +77,8 @@ func main() {
 			fmt.Fprintf(os.Stderr, "failed to read timeslice file: %v\n", err)
 			os.Exit(1)
 		}
-		for _, record := range records {
+		for _, id := range displayOrder {
+			record := records[id]
 			fmt.Printf("%s\n", record.String())
 		}
 	} else {

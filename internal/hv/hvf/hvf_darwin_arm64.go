@@ -21,6 +21,7 @@ import (
 var (
 	tsHvfGuestTime       = timeslice.RegisterKind("hvf_guest_time", timeslice.SliceFlagGuestTime)
 	tsHvfUnknownHostTime = timeslice.RegisterKind("hvf_host_time", 0)
+	tsHvfFirstRunStart   = timeslice.RegisterKind("hvf_first_run_start", 0)
 
 	tsHvfStartTime = time.Now()
 )
@@ -171,19 +172,19 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 
 	var kind timeslice.TimesliceID
 	if v.lastTime.IsZero() {
-		kind = timeslice.TimesliceInit
+		kind = tsHvfFirstRunStart
 		v.lastTime = tsHvfStartTime
 	} else if v.regionKind == timeslice.InvalidTimesliceID {
 		kind = tsHvfUnknownHostTime
 	}
-	timeslice.Record(kind, time.Since(v.lastTime))
+	timeslice.Record(kind)
 	v.lastTime = time.Now()
 
 	if err := bindings.HvVcpuRun(v.id); err != bindings.HV_SUCCESS {
 		return fmt.Errorf("hvf: failed to run vCPU %d: %w", v.id, err)
 	}
 
-	timeslice.Record(tsHvfGuestTime, time.Since(v.lastTime))
+	timeslice.Record(tsHvfGuestTime)
 	v.lastTime = time.Now()
 
 	switch v.exit.Reason {
@@ -897,6 +898,17 @@ func (h *hypervisor) Close() error {
 	return nil
 }
 
+var (
+	tsHvfPreInit              = timeslice.RegisterKind("hvf_pre_init", 0)
+	tsHvfVmCreate             = timeslice.RegisterKind("hvf_vm_create", 0)
+	tsHvfOnCreateVM           = timeslice.RegisterKind("hvf_on_create_vm", 0)
+	tsHvfAllocateMemory       = timeslice.RegisterKind("hvf_allocate_memory", 0)
+	tsHvfGicCreate            = timeslice.RegisterKind("hvf_gic_create", 0)
+	tsHvfOnCreateVMWithMemory = timeslice.RegisterKind("hvf_on_create_vm_with_memory", 0)
+	tsHvfOnCreateVCPU         = timeslice.RegisterKind("hvf_on_create_vcpu", 0)
+	tsHvfLoaded               = timeslice.RegisterKind("hvf_loaded", 0)
+)
+
 // NewVirtualMachine implements [hv.Hypervisor].
 func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, error) {
 	if vm := globalVM.Load(); vm != nil {
@@ -911,10 +923,14 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 	vmConfig := bindings.HvVmConfigCreate()
 
+	timeslice.Record(tsHvfPreInit)
+
 	vm := bindings.HvVmCreate(vmConfig)
 	if vm != bindings.HV_SUCCESS {
 		return nil, fmt.Errorf("failed to create VM: %d", vm)
 	}
+
+	timeslice.Record(tsHvfVmCreate)
 
 	// Only one VM can be created at a time for a single process.
 	if swapped := globalVM.CompareAndSwap(nil, ret); !swapped {
@@ -926,11 +942,15 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
+	timeslice.Record(tsHvfOnCreateVM)
+
 	// allocate memory for the VM
 	mem, err := ret.AllocateMemory(config.MemoryBase(), config.MemorySize())
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate memory for VM: %w", err)
 	}
+
+	timeslice.Record(tsHvfAllocateMemory)
 
 	ret.memory = mem.(*memoryRegion).memory
 	ret.memoryBase = config.MemoryBase()
@@ -1006,12 +1026,16 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		if err := bindings.HvGicCreate(cfg); err != bindings.HV_SUCCESS {
 			return nil, fmt.Errorf("failed to create GICv3: %s", err)
 		}
+
+		timeslice.Record(tsHvfGicCreate)
 	}
 
 	// Call the callback to allow the user to perform any additional initialization.
 	if err := config.Callbacks().OnCreateVMWithMemory(ret); err != nil {
 		return nil, fmt.Errorf("failed to create VM with memory: %w", err)
 	}
+
+	timeslice.Record(tsHvfOnCreateVMWithMemory)
 
 	// create vCPUs
 	if config.CPUCount() != 1 {
@@ -1040,9 +1064,13 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		}
 	}
 
+	timeslice.Record(tsHvfOnCreateVCPU)
+
 	if err := config.Loader().Load(ret); err != nil {
 		return nil, fmt.Errorf("failed to load VM: %w", err)
 	}
+
+	timeslice.Record(tsHvfLoaded)
 
 	return ret, nil
 }

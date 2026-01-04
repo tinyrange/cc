@@ -28,6 +28,7 @@ import (
 	amd64boot "github.com/tinyrange/cc/internal/linux/boot/amd64"
 	arm64boot "github.com/tinyrange/cc/internal/linux/boot/arm64"
 	"github.com/tinyrange/cc/internal/linux/kernel"
+	"github.com/tinyrange/cc/internal/timeslice"
 )
 
 type bootPlan interface {
@@ -187,6 +188,13 @@ func (l *LinuxLoader) MemoryBase() uint64          { return l.MemBase }
 func (l *LinuxLoader) MemorySize() uint64          { return l.MemSize }
 func (l *LinuxLoader) NeedsInterruptSupport() bool { return true }
 
+var (
+	tsLinuxLoaderGotKernel          = timeslice.RegisterKind("linux_loader_got_kernel", 0)
+	tsLinuxLoaderBuiltInitPayload   = timeslice.RegisterKind("linux_loader_built_init_payload", 0)
+	tsLinuxLoaderBuiltInitramfs     = timeslice.RegisterKind("linux_loader_built_initramfs", 0)
+	tsLinuxLoaderGotDeviceTreeNodes = timeslice.RegisterKind("linux_loader_got_device_tree_nodes", 0)
+)
+
 // Load implements hv.VMLoader.
 func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 	if l.GetKernel == nil {
@@ -200,12 +208,16 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 
 	l.kernelReader = kernelReader
 
+	timeslice.Record(tsLinuxLoaderGotKernel)
+
 	arch := vm.Hypervisor().Architecture()
 
 	initPayload, err := l.buildInitPayload(arch)
 	if err != nil {
 		return err
 	}
+
+	timeslice.Record(tsLinuxLoaderBuiltInitPayload)
 
 	files := []InitFile{
 		{Path: "/init", Data: initPayload, Mode: os.FileMode(0o755)},
@@ -217,6 +229,8 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 	if err != nil {
 		return fmt.Errorf("build initramfs: %w", err)
 	}
+
+	timeslice.Record(tsLinuxLoaderBuiltInitramfs)
 
 	cmdline, err := l.GetCmdline(arch)
 	if err != nil {
@@ -273,6 +287,8 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 			virtioNodes = append(virtioNodes, nodes...)
 		}
 	}
+
+	timeslice.Record(tsLinuxLoaderGotDeviceTreeNodes)
 
 	switch arch {
 	case hv.ArchitectureX86_64:
@@ -622,11 +638,20 @@ func alignDown(value, align uint64) uint64 {
 	return value &^ (align - 1)
 }
 
+var (
+	tsLinuxLoaderLoadKernel     = timeslice.RegisterKind("linux_loader_load_kernel", 0)
+	tsLinuxLoaderPreparedKernel = timeslice.RegisterKind("linux_loader_prepared_kernel", 0)
+	tsLinuxLoaderAddedUART      = timeslice.RegisterKind("linux_loader_added_uart", 0)
+	tsLinuxLoaderAddedDevices   = timeslice.RegisterKind("linux_loader_added_devices", 0)
+)
+
 func (l *LinuxLoader) loadARM64(vm hv.VirtualMachine, kernelReader io.ReaderAt, kernelSize int64, cmdline string, initrd []byte, deviceTree []fdt.Node) error {
 	kernelImage, err := arm64boot.LoadKernel(kernelReader, kernelSize)
 	if err != nil {
 		return fmt.Errorf("load kernel: %w", err)
 	}
+
+	timeslice.Record(tsLinuxLoaderLoadKernel)
 
 	numCPUs := l.NumCPUs
 	if numCPUs <= 0 {
@@ -658,17 +683,23 @@ func (l *LinuxLoader) loadARM64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	}
 	l.plan = plan
 
+	timeslice.Record(tsLinuxLoaderPreparedKernel)
+
 	// Connect UART to the same output as the console - SerialStdout typically goes to both stdout and test buffer
 	uartDev := serial.NewUART8250MMIO(arm64UARTMMIOBase, arm64UARTRegShift, arm64UARTIRQLine, l.SerialStdout)
 	if err := vm.AddDevice(uartDev); err != nil {
 		return fmt.Errorf("add arm64 uart device: %w", err)
 	}
 
+	timeslice.Record(tsLinuxLoaderAddedUART)
+
 	for _, dev := range l.Devices {
 		if err := vm.AddDeviceFromTemplate(dev); err != nil {
 			return fmt.Errorf("add device from template: %w", err)
 		}
 	}
+
+	timeslice.Record(tsLinuxLoaderAddedDevices)
 
 	return nil
 }

@@ -23,8 +23,8 @@ func TestTimeslice(t *testing.T) {
 		}
 		defer writer.Close()
 
-		Record(timesliceA, 100*time.Millisecond)
-		Record(timesliceB, 200*time.Millisecond)
+		RecordRaw(timesliceA, 100*time.Millisecond)
+		RecordRaw(timesliceB, 200*time.Millisecond)
 	}()
 
 	r := bytes.NewReader(buf.Bytes())
@@ -54,8 +54,8 @@ func BenchmarkTimeslice(b *testing.B) {
 		b.ResetTimer()
 
 		for b.Loop() {
-			Record(timesliceA, 100*time.Millisecond)
-			Record(timesliceB, 200*time.Millisecond)
+			RecordRaw(timesliceA, 100*time.Millisecond)
+			RecordRaw(timesliceB, 200*time.Millisecond)
 			atomic.AddUint64(&count, 2)
 		}
 	}()
@@ -99,8 +99,8 @@ func BenchmarkTimesliceTempFile(b *testing.B) {
 		b.ResetTimer()
 
 		for b.Loop() {
-			Record(timesliceA, 100*time.Millisecond)
-			Record(timesliceB, 200*time.Millisecond)
+			RecordRaw(timesliceA, 100*time.Millisecond)
+			RecordRaw(timesliceB, 200*time.Millisecond)
 			atomic.AddUint64(&count, 2)
 		}
 	}()
