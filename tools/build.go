@@ -621,6 +621,7 @@ func main() {
 	run := fs.Bool("run", false, "run the built cc tool after building")
 	runtest := fs.String("runtest", "", "build a Dockerfile in tests/<name>/Dockerfile and run it using cc (Linux only)")
 	dbgTool := fs.Bool("dbg-tool", false, "build and run the debug tool")
+	tsTool := fs.Bool("ts-tool", false, "build and run the timeslice tool")
 	app := fs.Bool("app", false, "build and run ccapp")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
@@ -678,6 +679,22 @@ func main() {
 			os.Exit(1)
 		}
 
+		return
+	}
+
+	if *tsTool {
+		out, err := goBuild(buildOptions{
+			Package:    "cmd/timeslice",
+			OutputName: "timeslice",
+			Build:      hostBuild,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build timeslice tool: %v\n", err)
+			os.Exit(1)
+		}
+		if err := runBuildOutput(out, fs.Args()); err != nil {
+			os.Exit(1)
+		}
 		return
 	}
 

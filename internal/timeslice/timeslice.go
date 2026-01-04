@@ -6,13 +6,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"sync/atomic"
 	"time"
 )
 
 const (
 	Magic   uint32 = 0x54534c46 // "TSLF"
-	Version uint32 = 1
+	Version uint32 = 2
 )
 
 type header struct {
@@ -23,11 +24,37 @@ type header struct {
 
 type TimesliceID uint64
 
-var timeslices = make(map[TimesliceID]string)
+const InvalidTimesliceID = TimesliceID(0)
 
-func RegisterKind(name string) TimesliceID {
-	id := TimesliceID(len(timeslices))
-	timeslices[id] = name
+var TimesliceInit = RegisterKind("init", 0)
+
+type SliceInfo struct {
+	Name  string
+	Flags SliceFlags
+}
+
+type SliceFlags uint32
+
+func (f SliceFlags) String() string {
+	flags := []string{}
+	if f&SliceFlagGuestTime != 0 {
+		flags = append(flags, "guest")
+	}
+	return strings.Join(flags, ",")
+}
+
+const (
+	SliceFlagGuestTime SliceFlags = 1 << iota
+)
+
+var timeslices = make(map[TimesliceID]SliceInfo)
+
+func RegisterKind(name string, flags SliceFlags) TimesliceID {
+	id := TimesliceID(len(timeslices) + 1)
+	timeslices[id] = SliceInfo{
+		Name:  name,
+		Flags: flags,
+	}
 	return id
 }
 
@@ -153,8 +180,8 @@ func Open(w io.Writer) (io.Closer, error) {
 	return writer, nil
 }
 
-func ReadAllRecords(r io.Reader, fn func(id string, duration time.Duration) error) error {
-	var timeslices map[TimesliceID]string
+func ReadAllRecords(r io.Reader, fn func(id string, flags SliceFlags, duration time.Duration) error) error {
+	var timeslices map[TimesliceID]SliceInfo
 
 	buf := bufio.NewReaderSize(r, 4096)
 
@@ -194,7 +221,7 @@ func ReadAllRecords(r io.Reader, fn func(id string, duration time.Duration) erro
 		if !ok {
 			return fmt.Errorf("timeslice: unknown kind: %d", record.ID)
 		}
-		if err := fn(kind, time.Duration(record.Duration)); err != nil {
+		if err := fn(kind.Name, kind.Flags, time.Duration(record.Duration)); err != nil {
 			return err
 		}
 	}

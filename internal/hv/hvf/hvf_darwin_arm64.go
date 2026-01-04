@@ -9,11 +9,20 @@ import (
 	"log/slog"
 	"runtime"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/hvf/bindings"
+	"github.com/tinyrange/cc/internal/timeslice"
 	"golang.org/x/sys/unix"
+)
+
+var (
+	tsHvfGuestTime       = timeslice.RegisterKind("hvf_guest_time", timeslice.SliceFlagGuestTime)
+	tsHvfUnknownHostTime = timeslice.RegisterKind("hvf_host_time", 0)
+
+	tsHvfStartTime = time.Now()
 )
 
 var globalVM atomic.Pointer[virtualMachine]
@@ -70,6 +79,9 @@ type virtualCPU struct {
 	runQueue chan func()
 
 	initError chan error
+
+	lastTime   time.Time
+	regionKind timeslice.TimesliceID
 }
 
 // implements [hv.VirtualCPU].
@@ -157,9 +169,22 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		defer stopExit()
 	}
 
+	var kind timeslice.TimesliceID
+	if v.lastTime.IsZero() {
+		kind = timeslice.TimesliceInit
+		v.lastTime = tsHvfStartTime
+	} else if v.regionKind == timeslice.InvalidTimesliceID {
+		kind = tsHvfUnknownHostTime
+	}
+	timeslice.Record(kind, time.Since(v.lastTime))
+	v.lastTime = time.Now()
+
 	if err := bindings.HvVcpuRun(v.id); err != bindings.HV_SUCCESS {
 		return fmt.Errorf("hvf: failed to run vCPU %d: %w", v.id, err)
 	}
+
+	timeslice.Record(tsHvfGuestTime, time.Since(v.lastTime))
+	v.lastTime = time.Now()
 
 	switch v.exit.Reason {
 	case bindings.HV_EXIT_REASON_EXCEPTION:

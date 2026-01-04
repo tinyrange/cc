@@ -10,8 +10,8 @@ import (
 )
 
 var (
-	timesliceA = RegisterKind("a")
-	timesliceB = RegisterKind("b")
+	timesliceA = RegisterKind("a", 0)
+	timesliceB = RegisterKind("b", 0)
 )
 
 func TestTimeslice(t *testing.T) {
@@ -30,7 +30,7 @@ func TestTimeslice(t *testing.T) {
 	r := bytes.NewReader(buf.Bytes())
 
 	var seen []string
-	if err := ReadAllRecords(r, func(id string, duration time.Duration) error {
+	if err := ReadAllRecords(r, func(id string, flags SliceFlags, duration time.Duration) error {
 		seen = append(seen, id)
 		return nil
 	}); err != nil {
@@ -66,7 +66,7 @@ func BenchmarkTimeslice(b *testing.B) {
 	r := bytes.NewReader(buf.Bytes())
 
 	var seen uint64
-	if err := ReadAllRecords(r, func(id string, duration time.Duration) error {
+	if err := ReadAllRecords(r, func(id string, flags SliceFlags, duration time.Duration) error {
 		atomic.AddUint64(&seen, 1)
 		return nil
 	}); err != nil {
@@ -115,7 +115,7 @@ func BenchmarkTimesliceTempFile(b *testing.B) {
 	defer r.Close()
 
 	var seen uint64
-	if err := ReadAllRecords(r, func(id string, duration time.Duration) error {
+	if err := ReadAllRecords(r, func(id string, flags SliceFlags, duration time.Duration) error {
 		atomic.AddUint64(&seen, 1)
 		return nil
 	}); err != nil {
