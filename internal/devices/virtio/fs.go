@@ -1330,15 +1330,36 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		newParent := binary.LittleEndian.Uint64(req[40:48])
 		nameStart := fuseHdrInSize + 8
 		flags := uint32(0)
-		if len(req) >= fuseHdrInSize+16 {
-			flags = binary.LittleEndian.Uint32(req[48:52])
-		}
 		oldName, rest := readCString(req[nameStart:])
 		if rest == nil {
 			return 0, fmt.Errorf("FUSE_RENAME missing new name")
 		}
 		newName := readName(rest)
 		debug.Writef("virtio-fs.dispatchFUSE op=RENAME", "oldName=%q newParent=%d newName=%q flags=0x%x", oldName, newParent, newName, flags)
+		if be, ok := v.backend.(fsRenameBackend); ok {
+			errno = be.Rename(in.NodeID, oldName, newParent, newName, flags)
+			if errno == 0 {
+				return w(fuseOutHeader{Len: fuseHdrOutSize, Error: 0, Unique: in.Unique}, nil), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_RENAME2:
+		debug.Writef("virtio-fs.dispatchFUSE op=RENAME2", "oldParent=%d", in.NodeID)
+		// fuse_rename2_in: newdir (u64), flags (u32), padding (u32)
+		if len(req) < fuseHdrInSize+16 {
+			return 0, fmt.Errorf("FUSE_RENAME2 too short")
+		}
+		newParent := binary.LittleEndian.Uint64(req[40:48])
+		flags := binary.LittleEndian.Uint32(req[48:52])
+		nameStart := fuseHdrInSize + 16
+		oldName, rest := readCString(req[nameStart:])
+		if rest == nil {
+			return 0, fmt.Errorf("FUSE_RENAME2 missing new name")
+		}
+		newName := readName(rest)
+		debug.Writef("virtio-fs.dispatchFUSE op=RENAME2", "oldName=%q newParent=%d newName=%q flags=0x%x", oldName, newParent, newName, flags)
 		if be, ok := v.backend.(fsRenameBackend); ok {
 			errno = be.Rename(in.NodeID, oldName, newParent, newName, flags)
 			if errno == 0 {

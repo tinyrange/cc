@@ -290,9 +290,9 @@ type virtioFsBackend struct {
 	// file handle (fh). This lets us reliably drop any remaining locks on RELEASE,
 	// even when the close path provides a different lock_owner cookie (e.g. OFD
 	// locks vs POSIX locks).
-	fhOwners   map[uint64]uint64
-	nextID     uint64
-	nextFH     uint64
+	fhOwners map[uint64]uint64
+	nextID   uint64
+	nextFH   uint64
 	// POSIX advisory locks keyed by (nodeID, owner). Each entry is a list of held locks.
 	posixLocks map[lockKey][]lockRange
 	// OFD locks keyed by (nodeID, fh). OFD locks are associated with an open file
@@ -2163,6 +2163,11 @@ func (v *virtioFsBackend) Rename(oldParent uint64, oldName string, newParent uin
 	defer v.mu.Unlock()
 
 	v.ensureRoot()
+	// We only support the plain rename(2) behavior and RENAME_NOREPLACE.
+	// Unknown renameat2(2) flags should fail with EINVAL.
+	if flags&^linux.RENAME_NOREPLACE != 0 {
+		return -int32(linux.EINVAL)
+	}
 	srcParent, err := v.node(oldParent)
 	if err != 0 {
 		return err
@@ -2173,6 +2178,9 @@ func (v *virtioFsBackend) Rename(oldParent uint64, oldName string, newParent uin
 	}
 	srcName := cleanName(oldName)
 	dstName := cleanName(newName)
+	if srcName == "" || dstName == "" {
+		return -int32(linux.EINVAL)
+	}
 	if e := nameErr(dstName); e != 0 {
 		return e
 	}
