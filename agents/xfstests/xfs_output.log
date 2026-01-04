@@ -5,55 +5,31 @@ PLATFORM      -- Linux/x86_64 tinyrange 6.18.2-0-virt #1-Alpine SMP PREEMPT_DYNA
 MKFS_OPTIONS  -- scratchfs
 MOUNT_OPTIONS -- scratchfs /scratch
 
-generic/001        - output mismatch (see /opt/xfstests/results//generic/001.out.bad)
-    --- tests/generic/001.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/001.out.bad	2026-01-03 16:29:47.181113028 +0000
-    @@ -2,8 +2,30 @@
-     cleanup
-     setup ....................................
-     iter 1 chain ... check ....................................
-    -iter 2 chain ... check ....................................
-    -iter 3 chain ... check ....................................
-    -iter 4 chain ... check ....................................
-    -iter 5 chain ... check ....................................
-    ...
-    (Run 'diff -u /opt/xfstests/tests/generic/001.out /opt/xfstests/results//generic/001.out.bad'  to see the entire diff)
+generic/001         25s
 generic/002         2s
 generic/003        [not run] atime related mount options have no effect on virtiofs
 generic/004        [not run] O_TMPFILE is not supported
 generic/005         1s
 generic/006         7s
-generic/007         16s
+generic/007         15s
 generic/008        [not run] xfs_io fzero  failed (old kernel/wrong fs?)
 generic/009        [not run] xfs_io fzero  failed (old kernel/wrong fs?)
-generic/011         10s
+generic/011         11s
 generic/012        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
-generic/013         23s
+generic/013         24s
 generic/014         4s
 generic/015        [not run] Filesystem virtiofs not supported in _scratch_mkfs_sized
 generic/016        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
 generic/018        [not run] defragmentation not supported for fstype "virtiofs"
-generic/020         3s
+generic/020         4s
 generic/021        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
 generic/022        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
-generic/023        - output mismatch (see /opt/xfstests/results//generic/023.out.bad)
-    --- tests/generic/023.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/023.out.bad	2026-01-03 16:31:08.640175018 +0000
-    @@ -5,24 +5,24 @@
-     samedir  none/dire -> No such file or directory
-     samedir  none/tree -> No such file or directory
-     samedir  regu/none -> none/regu.
-    -samedir  regu/regu -> none/regu.
-    -samedir  regu/symb -> none/regu.
-    +samedir  regu/regu -> Directory not empty
-    +samedir  regu/symb -> Directory not empty
-    ...
-    (Run 'diff -u /opt/xfstests/tests/generic/023.out /opt/xfstests/results//generic/023.out.bad'  to see the entire diff)
-generic/024        [not run] kernel doesn't support renameat2 syscall
+generic/023         4s
+generic/024         3s
 generic/025        [not run] kernel doesn't support renameat2 syscall
 generic/026        [not run] virtiofs does not define maximum ACL count
 generic/028         6s
-generic/029         2s
+generic/029         1s
 generic/030         2s
 generic/031        [not run] xfs_io fcollapse  failed (old kernel/wrong fs?)
 generic/032        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
@@ -80,7 +56,7 @@ generic/064        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
 generic/065        [not run] require scratchfs to be valid block disk
 generic/066        [not run] require scratchfs to be valid block disk
 generic/067        [not run] This test requires loopback device support
-generic/069         445s
+generic/069         448s
 generic/070         5s
 generic/071         1s
 generic/073        [not run] require scratchfs to be valid block disk
@@ -92,11 +68,11 @@ generic/080         3s
 generic/081        [not run] require scratchfs to be valid block disk
 generic/082        [not run] disk quotas not supported by this filesystem type: virtiofs
 generic/084         6s
-generic/086         2s
+generic/086         1s
 generic/087         1s
 generic/088         1s
 generic/090        [not run] require scratchfs to be valid block disk
-generic/091         8s
+generic/091         7s
 generic/092        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
 generic/094        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
 generic/095         4s
@@ -105,7 +81,7 @@ generic/097         1s
 generic/098         2s
 generic/099         3s
 generic/101        [not run] require scratchfs to be valid block disk
-generic/103         2s
+generic/103         3s
 generic/104        [not run] require scratchfs to be valid block disk
 generic/105         1s
 generic/106        [not run] require scratchfs to be valid block disk
@@ -113,7 +89,7 @@ generic/107        [not run] require scratchfs to be valid block disk
 generic/108        [not run] require scratchfs to be valid block disk
 generic/110        [not run] Reflink not supported by test filesystem type: virtiofs
 generic/111        [not run] Reflink not supported by test filesystem type: virtiofs
-generic/112         8s
+generic/112         7s
 generic/113         19s
 generic/114        [not run] device block size: 4096 greater than 512
 generic/115        [not run] Reflink not supported by test filesystem type: virtiofs
@@ -125,21 +101,12 @@ generic/120        [not run] atime related mount options have no effect on virti
 generic/121        [not run] Dedupe not supported by test filesystem type: virtiofs
 generic/122        [not run] Dedupe not supported by test filesystem type: virtiofs
 generic/123         1s
-generic/124         10s
+generic/124         11s
 generic/126         2s
-generic/128         2s
-generic/129         53s
-generic/130         5s
-generic/131        [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/131.out.bad)
-    --- tests/generic/131.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/131.out.bad	2026-01-03 16:43:39.553451213 +0000
-    @@ -1,2 +1,3 @@
-     QA output created by 131
-    -success!
-    +Client reported failure (1)
-    +(see /opt/xfstests/results//generic/131.full for details)
-    ...
-    (Run 'diff -u /opt/xfstests/tests/generic/131.out /opt/xfstests/results//generic/131.out.bad'  to see the entire diff)
+generic/128         1s
+generic/129         54s
+generic/130         4s
+generic/131         2s
 generic/134        [not run] Reflink not supported by test filesystem type: virtiofs
 generic/135         1s
 generic/136        [not run] Dedupe not supported by test filesystem type: virtiofs
@@ -169,7 +136,7 @@ generic/160        [not run] file system doesn't support chattr +i
 generic/161        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/162        [not run] Dedupe not supported by scratch filesystem type: virtiofs
 generic/163        [not run] Dedupe not supported by scratch filesystem type: virtiofs
-generic/169         1s
+generic/169         2s
 generic/171        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/172        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/173        [not run] Reflink not supported by scratch filesystem type: virtiofs
@@ -205,7 +172,7 @@ generic/210         1s
 generic/211        [not run] Filesystem virtiofs not supported in _scratch_mkfs_sized
 generic/212         1s
 generic/213        [not run] Test device is too small (3600 KiB)
-generic/214         1s
+generic/214         2s
 generic/215         3s
 generic/216        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/217        [not run] Reflink not supported by scratch filesystem type: virtiofs
@@ -228,7 +195,7 @@ generic/240        [not run] fs block size must be larger than the device block 
 generic/244        [not run] disk quotas not supported by this filesystem type: virtiofs
 generic/245         1s
 generic/246         1s
-generic/247         30s
+generic/247         31s
 generic/248         1s
 generic/249         3s
 generic/250        [not run] require scratchfs to be valid block disk
@@ -259,7 +226,7 @@ generic/281        [not run] Reflink not supported by scratch filesystem type: v
 generic/282        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/283        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/284        [not run] Reflink not supported by scratch filesystem type: virtiofs
-generic/286         17s
+generic/286         18s
 generic/287        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/288        [not run] FITRIM not supported on /scratch
 generic/289        [not run] Reflink not supported by scratch filesystem type: virtiofs
@@ -267,7 +234,7 @@ generic/290        [not run] Reflink not supported by scratch filesystem type: v
 generic/291        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/292        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/293        [not run] Reflink not supported by scratch filesystem type: virtiofs
-generic/294         2s
+generic/294         1s
 generic/295        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/296        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/301        [not run] Reflink not supported by scratch filesystem type: virtiofs
@@ -280,13 +247,13 @@ generic/307         2s
 generic/308         1s
 generic/309         2s
 generic/312        [not run] Filesystem virtiofs not supported in _scratch_mkfs_sized
-generic/313         4s
+generic/313         5s
 generic/314         1s
 generic/315         1s
 generic/316        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
 generic/317        [not run] userns not supported by this kernel
 generic/318        [not run] userns not supported by this kernel
-generic/319         2s
+generic/319         1s
 generic/321        [not run] require scratchfs to be valid block disk
 generic/322        [not run] require scratchfs to be valid block disk
 generic/324        [not run] defragmentation not supported for fstype "virtiofs"
@@ -300,12 +267,12 @@ generic/331        [not run] Reflink not supported by scratch filesystem type: v
 generic/332        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/335        [not run] require scratchfs to be valid block disk
 generic/336        [not run] require scratchfs to be valid block disk
-generic/337         2s
+generic/337         1s
 generic/338        [not run] require scratchfs to be valid block disk
 generic/341        [not run] require scratchfs to be valid block disk
 generic/342        [not run] require scratchfs to be valid block disk
 generic/343        [not run] require scratchfs to be valid block disk
-generic/346         34s
+generic/346         35s
 generic/347        [not run] require scratchfs to be valid block disk
 generic/348        [not run] require scratchfs to be valid block disk
 generic/353        [not run] Reflink not supported by scratch filesystem type: virtiofs
@@ -318,7 +285,7 @@ generic/360         1s
 generic/361        [not run] require scratchfs to be valid block disk
 generic/362         1s
 generic/364         11s
-generic/366         22s
+generic/366         23s
 generic/367        [not run] this test requires extsize support on the filesystem
 generic/368        [not run] filesystem doesn't support -o inlinecrypt
 generic/369        [not run] filesystem doesn't support -o inlinecrypt
@@ -327,7 +294,7 @@ generic/371        [not run] Filesystem virtiofs not supported in _scratch_mkfs_
 generic/372        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/373        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/374        [not run] Dedupe not supported by scratch filesystem type: virtiofs
-generic/375         1s
+generic/375         2s
 generic/376        [not run] require scratchfs to be valid block disk
 generic/377         1s
 generic/378         1s
@@ -340,9 +307,9 @@ generic/384        [not run] disk quotas not supported by this filesystem type: 
 generic/385        [not run] disk quotas not supported by this filesystem type: virtiofs
 generic/386        [not run] disk quotas not supported by this filesystem type: virtiofs
 generic/389        [not run] O_TMPFILE is not supported
-generic/391         25s
+generic/391         24s
 generic/392        [not run] virtiofs does not support shutdown
-generic/393         1s
+generic/393         2s
 generic/394         1s
 generic/395        [not run] No encryption support for virtiofs
 generic/396        [not run] No encryption support for virtiofs
@@ -351,7 +318,7 @@ generic/398        [not run] No encryption support for virtiofs
 generic/400        [not run] disk quotas not supported by this filesystem type: virtiofs
 generic/401         1s
 generic/402        [not run] filesystem virtiofs timestamp bounds are unknown
-generic/403         4s
+generic/403         3s
 generic/404        [not run] xfs_io finsert  failed (old kernel/wrong fs?)
 generic/406        [not run] This test requires at least 0GB free on /scratch to run
 generic/407        [not run] Reflink not supported by test filesystem type: virtiofs
@@ -373,10 +340,10 @@ generic/425        [not run] xfs_io fiemap -a failed (old kernel/wrong fs?)
 generic/426        [not run] virtiofs doesn't support open_by_handle_at(2)
 generic/427        [not run] Filesystem virtiofs not supported in _scratch_mkfs_sized
 generic/428         1s
-generic/430         1s
-generic/431         2s
+generic/430         2s
+generic/431         1s
 generic/432         1s
-generic/433         2s
+generic/433         1s
 generic/434         1s
 generic/436         1s
 generic/437         2s
@@ -409,19 +376,7 @@ generic/471         7s
 generic/472        [not run] swapfiles are not supported
 generic/474        [not run] virtiofs does not support shutdown
 generic/477        [not run] virtiofs doesn't support open_by_handle_at(2)
-generic/478        - output mismatch (see /opt/xfstests/results//generic/478.out.bad)
-    --- tests/generic/478.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/478.out.bad	2026-01-03 16:55:54.527572449 +0000
-    @@ -1,52 +1,81 @@
-     QA output created by 478
-     get wrlck
-    -lock could be placed
-    -get wrlck
-    -get wrlck
-    -lock could be placed
-    -get wrlck
-    ...
-    (Run 'diff -u /opt/xfstests/tests/generic/478.out /opt/xfstests/results//generic/478.out.bad'  to see the entire diff)
+generic/478         18s
 generic/479        [not run] require scratchfs to be valid block disk
 generic/480        [not run] require scratchfs to be valid block disk
 generic/481        [not run] require scratchfs to be valid block disk
@@ -460,7 +415,7 @@ generic/515        [not run] Reflink not supported by scratch filesystem type: v
 generic/516        [not run] Dedupe not supported by test filesystem type: virtiofs
 generic/517        [not run] Dedupe not supported by scratch filesystem type: virtiofs
 generic/518        [not run] Reflink not supported by scratch filesystem type: virtiofs
-generic/519         1s
+generic/519         2s
 generic/520        [not run] require scratchfs to be valid block disk
 generic/523         1s
 generic/524         24s
@@ -472,7 +427,7 @@ generic/529         1s
 generic/530        [not run] virtiofs does not support shutdown
 generic/531        [not run] O_TMPFILE is not supported
 generic/532         1s
-generic/533         1s
+generic/533         2s
 generic/534        [not run] require scratchfs to be valid block disk
 generic/535        [not run] require scratchfs to be valid block disk
 generic/536        [not run] virtiofs does not support shutdown
@@ -504,16 +459,7 @@ generic/567         1s
 generic/568         1s
 generic/569        [not run] swapfiles are not supported
 generic/570        [not run] require scratchfs to be valid block disk
-generic/571        [failed, exit status 1]- output mismatch (see /opt/xfstests/results//generic/571.out.bad)
-    --- tests/generic/571.out	2026-01-02 06:20:12.000000000 +0000
-    +++ /opt/xfstests/results//generic/571.out.bad	2026-01-03 16:58:09.326403909 +0000
-    @@ -1,2 +1,3 @@
-     QA output created by 571
-    -success!
-    +Client reported failure (1)
-    +(see /opt/xfstests/results//generic/571.full for details)
-    ...
-    (Run 'diff -u /opt/xfstests/tests/generic/571.out /opt/xfstests/results//generic/571.out.bad'  to see the entire diff)
+generic/571         8s
 generic/572        [not run] fsverity utility required, skipped this test
 generic/573        [not run] fsverity utility required, skipped this test
 generic/574        [not run] fsverity utility required, skipped this test
@@ -535,8 +481,8 @@ generic/593        [not run] No encryption support for virtiofs
 generic/594        [not run] disk quotas not supported by this filesystem type: virtiofs
 generic/595        [not run] No encryption support for virtiofs
 generic/596        [not run] accton utility required, skipped this test
-generic/597         2s
-generic/598         2s
+generic/597         1s
+generic/598         3s
 generic/599        [not run] virtiofs does not support shutdown
 generic/600        [not run] disk quotas not supported by this filesystem type: virtiofs
 generic/601        [not run] disk quotas not supported by this filesystem type: virtiofs
@@ -565,7 +511,7 @@ generic/628        [not run] Reflink not supported by scratch filesystem type: v
 generic/629        [not run] require scratchfs to be valid block disk
 generic/630        [not run] Dedupe not supported by scratch filesystem type: virtiofs
 generic/632         1s
-generic/633         1s
+generic/633         2s
 generic/634         2s
 generic/635        [not run] virtiofs does not support shutdown
 generic/636        [not run] swapfiles are not supported
@@ -625,7 +571,7 @@ generic/700        [not run] kernel doesn't support renameat2 syscall
 generic/702        [not run] Reflink not supported by scratch filesystem type: virtiofs
 generic/703        [not run] require scratchfs to be valid block disk
 generic/704        [not run] scsi_debug module not found
-generic/706         1s
+generic/706         0s
 generic/708         1s
 generic/709        [not run] xfs_io exchangerange  support is missing
 generic/710        [not run] xfs_io exchangerange  support is missing
@@ -647,7 +593,7 @@ generic/725        [not run] xfs_io exchangerange  support is missing
 generic/726        [not run] xfs_io exchangerange  support is missing
 generic/727        [not run] getcap utility required, skipped this test
 generic/728         5s
-generic/729         1s
+generic/729         0s
 generic/730        [not run] require testfs to be valid block disk
 generic/731        [not run] require testfs to be valid block disk
 generic/732         1s
@@ -661,16 +607,16 @@ generic/740        [not run] require scratchfs to be valid block disk
 generic/741        [not run] require scratchfs to be valid block disk
 generic/742        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
 generic/745        [not run] require scratchfs to be valid block disk
-generic/748         270s
-generic/749         7s
+generic/748         272s
+generic/749         6s
 generic/752        [not run] xfs_io exchangerange  support is missing
 generic/755         3s
 generic/756        [not run] virtiofs doesn't support open_by_handle_at(2)
 generic/757        [not run] This test requires a valid $LOGWRITES_DEV
 generic/758        [not run] xfs_io fzero  failed (old kernel/wrong fs?)
-generic/759         8s
-generic/760         5s
-generic/761         4s
+generic/759         9s
+generic/760         4s
+generic/761         3s
 generic/763         1s
 generic/764        [not run] require scratchfs to be valid block disk
 generic/765        [not run] write atomic not supported by this block device
@@ -689,8 +635,6 @@ generic/781        [not run] require scratchfs to be valid block disk
 generic/782        [not run] require scratchfs to be valid block disk
 generic/783        [not run] this test requires overlay support
 Ran: generic/001 generic/002 generic/003 generic/004 generic/005 generic/006 generic/007 generic/008 generic/009 generic/011 generic/012 generic/013 generic/014 generic/015 generic/016 generic/018 generic/020 generic/021 generic/022 generic/023 generic/024 generic/025 generic/026 generic/028 generic/029 generic/030 generic/031 generic/032 generic/033 generic/034 generic/035 generic/037 generic/039 generic/040 generic/041 generic/042 generic/050 generic/052 generic/053 generic/056 generic/057 generic/058 generic/059 generic/060 generic/061 generic/062 generic/063 generic/064 generic/065 generic/066 generic/067 generic/069 generic/070 generic/071 generic/073 generic/075 generic/076 generic/078 generic/079 generic/080 generic/081 generic/082 generic/084 generic/086 generic/087 generic/088 generic/090 generic/091 generic/092 generic/094 generic/095 generic/096 generic/097 generic/098 generic/099 generic/101 generic/103 generic/104 generic/105 generic/106 generic/107 generic/108 generic/110 generic/111 generic/112 generic/113 generic/114 generic/115 generic/116 generic/117 generic/118 generic/119 generic/120 generic/121 generic/122 generic/123 generic/124 generic/126 generic/128 generic/129 generic/130 generic/131 generic/134 generic/135 generic/136 generic/138 generic/139 generic/140 generic/141 generic/142 generic/143 generic/144 generic/145 generic/146 generic/147 generic/148 generic/149 generic/150 generic/151 generic/152 generic/153 generic/154 generic/155 generic/156 generic/157 generic/158 generic/159 generic/160 generic/161 generic/162 generic/163 generic/169 generic/171 generic/172 generic/173 generic/174 generic/177 generic/178 generic/179 generic/180 generic/181 generic/182 generic/183 generic/184 generic/185 generic/188 generic/189 generic/190 generic/191 generic/193 generic/194 generic/195 generic/196 generic/197 generic/198 generic/199 generic/200 generic/201 generic/202 generic/203 generic/205 generic/206 generic/207 generic/210 generic/211 generic/212 generic/213 generic/214 generic/215 generic/216 generic/217 generic/218 generic/219 generic/220 generic/221 generic/222 generic/223 generic/225 generic/227 generic/228 generic/229 generic/230 generic/235 generic/236 generic/237 generic/238 generic/240 generic/244 generic/245 generic/246 generic/247 generic/248 generic/249 generic/250 generic/252 generic/253 generic/254 generic/255 generic/256 generic/257 generic/258 generic/259 generic/260 generic/261 generic/262 generic/263 generic/264 generic/265 generic/266 generic/267 generic/268 generic/271 generic/272 generic/276 generic/277 generic/278 generic/279 generic/281 generic/282 generic/283 generic/284 generic/286 generic/287 generic/288 generic/289 generic/290 generic/291 generic/292 generic/293 generic/294 generic/295 generic/296 generic/301 generic/302 generic/303 generic/304 generic/305 generic/306 generic/307 generic/308 generic/309 generic/312 generic/313 generic/314 generic/315 generic/316 generic/317 generic/318 generic/319 generic/321 generic/322 generic/324 generic/325 generic/326 generic/327 generic/328 generic/329 generic/330 generic/331 generic/332 generic/335 generic/336 generic/337 generic/338 generic/341 generic/342 generic/343 generic/346 generic/347 generic/348 generic/353 generic/355 generic/356 generic/357 generic/358 generic/359 generic/360 generic/361 generic/362 generic/364 generic/366 generic/367 generic/368 generic/369 generic/370 generic/371 generic/372 generic/373 generic/374 generic/375 generic/376 generic/377 generic/378 generic/379 generic/380 generic/381 generic/382 generic/383 generic/384 generic/385 generic/386 generic/389 generic/391 generic/392 generic/393 generic/394 generic/395 generic/396 generic/397 generic/398 generic/400 generic/401 generic/402 generic/403 generic/404 generic/406 generic/407 generic/408 generic/409 generic/410 generic/411 generic/412 generic/413 generic/414 generic/417 generic/419 generic/420 generic/421 generic/422 generic/423 generic/424 generic/425 generic/426 generic/427 generic/428 generic/430 generic/431 generic/432 generic/433 generic/434 generic/436 generic/437 generic/439 generic/440 generic/441 generic/443 generic/444 generic/445 generic/446 generic/448 generic/449 generic/450 generic/451 generic/452 generic/453 generic/454 generic/456 generic/458 generic/460 generic/462 generic/463 generic/465 generic/466 generic/467 generic/468 generic/469 generic/470 generic/471 generic/472 generic/474 generic/477 generic/478 generic/479 generic/480 generic/481 generic/483 generic/484 generic/485 generic/486 generic/487 generic/488 generic/489 generic/490 generic/491 generic/492 generic/493 generic/494 generic/495 generic/496 generic/497 generic/498 generic/499 generic/501 generic/502 generic/503 generic/504 generic/505 generic/506 generic/507 generic/508 generic/509 generic/510 generic/511 generic/512 generic/513 generic/514 generic/515 generic/516 generic/517 generic/518 generic/519 generic/520 generic/523 generic/524 generic/525 generic/526 generic/527 generic/528 generic/529 generic/530 generic/531 generic/532 generic/533 generic/534 generic/535 generic/536 generic/537 generic/538 generic/539 generic/540 generic/541 generic/542 generic/543 generic/544 generic/545 generic/546 generic/547 generic/548 generic/549 generic/550 generic/552 generic/553 generic/554 generic/555 generic/556 generic/557 generic/563 generic/564 generic/565 generic/566 generic/567 generic/568 generic/569 generic/570 generic/571 generic/572 generic/573 generic/574 generic/575 generic/576 generic/577 generic/578 generic/580 generic/581 generic/582 generic/583 generic/584 generic/586 generic/587 generic/588 generic/591 generic/592 generic/593 generic/594 generic/595 generic/596 generic/597 generic/598 generic/599 generic/600 generic/601 generic/602 generic/603 generic/604 generic/605 generic/606 generic/607 generic/608 generic/609 generic/610 generic/611 generic/612 generic/613 generic/614 generic/615 generic/618 generic/620 generic/621 generic/623 generic/624 generic/625 generic/626 generic/628 generic/629 generic/630 generic/632 generic/633 generic/634 generic/635 generic/636 generic/637 generic/638 generic/639 generic/640 generic/641 generic/644 generic/645 generic/646 generic/647 generic/651 generic/652 generic/653 generic/654 generic/655 generic/657 generic/658 generic/659 generic/660 generic/661 generic/662 generic/663 generic/664 generic/665 generic/666 generic/667 generic/668 generic/669 generic/673 generic/674 generic/675 generic/676 generic/677 generic/678 generic/679 generic/680 generic/681 generic/682 generic/683 generic/684 generic/685 generic/686 generic/687 generic/688 generic/689 generic/690 generic/692 generic/693 generic/695 generic/696 generic/697 generic/698 generic/699 generic/700 generic/702 generic/703 generic/704 generic/706 generic/708 generic/709 generic/710 generic/711 generic/712 generic/713 generic/714 generic/715 generic/716 generic/717 generic/718 generic/719 generic/720 generic/721 generic/722 generic/723 generic/724 generic/725 generic/726 generic/727 generic/728 generic/729 generic/730 generic/731 generic/732 generic/734 generic/735 generic/736 generic/737 generic/738 generic/739 generic/740 generic/741 generic/742 generic/745 generic/748 generic/749 generic/752 generic/755 generic/756 generic/757 generic/758 generic/759 generic/760 generic/761 generic/763 generic/764 generic/765 generic/766 generic/767 generic/768 generic/769 generic/770 generic/771 generic/775 generic/776 generic/777 generic/779 generic/780 generic/781 generic/782 generic/783
-Not run: generic/003 generic/004 generic/008 generic/009 generic/012 generic/015 generic/016 generic/018 generic/021 generic/022 generic/024 generic/025 generic/026 generic/031 generic/032 generic/033 generic/034 generic/039 generic/040 generic/041 generic/042 generic/050 generic/052 generic/056 generic/057 generic/058 generic/059 generic/060 generic/061 generic/063 generic/064 generic/065 generic/066 generic/067 generic/073 generic/076 generic/078 generic/079 generic/081 generic/082 generic/090 generic/092 generic/094 generic/096 generic/101 generic/104 generic/106 generic/107 generic/108 generic/110 generic/111 generic/114 generic/115 generic/116 generic/118 generic/119 generic/120 generic/121 generic/122 generic/134 generic/136 generic/138 generic/139 generic/140 generic/142 generic/143 generic/144 generic/145 generic/146 generic/147 generic/148 generic/149 generic/150 generic/151 generic/152 generic/153 generic/154 generic/155 generic/156 generic/157 generic/158 generic/159 generic/160 generic/161 generic/162 generic/163 generic/171 generic/172 generic/173 generic/174 generic/177 generic/178 generic/179 generic/180 generic/181 generic/182 generic/183 generic/185 generic/188 generic/189 generic/190 generic/191 generic/194 generic/195 generic/196 generic/197 generic/199 generic/200 generic/201 generic/202 generic/203 generic/205 generic/206 generic/211 generic/213 generic/216 generic/217 generic/218 generic/219 generic/220 generic/222 generic/223 generic/225 generic/227 generic/228 generic/229 generic/230 generic/235 generic/238 generic/240 generic/244 generic/250 generic/252 generic/253 generic/254 generic/255 generic/256 generic/259 generic/260 generic/261 generic/262 generic/264 generic/265 generic/266 generic/267 generic/268 generic/271 generic/272 generic/276 generic/277 generic/278 generic/279 generic/281 generic/282 generic/283 generic/284 generic/287 generic/288 generic/289 generic/290 generic/291 generic/292 generic/293 generic/295 generic/296 generic/301 generic/302 generic/303 generic/304 generic/305 generic/312 generic/316 generic/317 generic/318 generic/321 generic/322 generic/324 generic/325 generic/326 generic/327 generic/328 generic/329 generic/330 generic/331 generic/332 generic/335 generic/336 generic/338 generic/341 generic/342 generic/343 generic/347 generic/348 generic/353 generic/356 generic/357 generic/358 generic/359 generic/361 generic/367 generic/368 generic/369 generic/370 generic/371 generic/372 generic/373 generic/374 generic/376 generic/379 generic/380 generic/381 generic/382 generic/383 generic/384 generic/385 generic/386 generic/389 generic/392 generic/395 generic/396 generic/397 generic/398 generic/400 generic/402 generic/404 generic/406 generic/407 generic/408 generic/409 generic/410 generic/411 generic/413 generic/414 generic/417 generic/419 generic/421 generic/424 generic/425 generic/426 generic/427 generic/440 generic/441 generic/449 generic/450 generic/453 generic/454 generic/456 generic/458 generic/460 generic/462 generic/463 generic/466 generic/467 generic/468 generic/469 generic/470 generic/472 generic/474 generic/477 generic/479 generic/480 generic/481 generic/483 generic/484 generic/485 generic/487 generic/488 generic/489 generic/491 generic/492 generic/493 generic/494 generic/495 generic/496 generic/497 generic/498 generic/499 generic/501 generic/502 generic/503 generic/505 generic/506 generic/507 generic/508 generic/509 generic/510 generic/511 generic/512 generic/513 generic/514 generic/515 generic/516 generic/517 generic/518 generic/520 generic/526 generic/527 generic/528 generic/530 generic/531 generic/534 generic/535 generic/536 generic/537 generic/538 generic/540 generic/541 generic/542 generic/543 generic/544 generic/545 generic/546 generic/547 generic/548 generic/549 generic/550 generic/552 generic/553 generic/554 generic/555 generic/556 generic/557 generic/563 generic/564 generic/566 generic/569 generic/570 generic/572 generic/573 generic/574 generic/575 generic/576 generic/577 generic/578 generic/580 generic/581 generic/582 generic/583 generic/584 generic/587 generic/588 generic/592 generic/593 generic/594 generic/595 generic/596 generic/599 generic/600 generic/601 generic/602 generic/603 generic/605 generic/606 generic/607 generic/608 generic/610 generic/612 generic/613 generic/614 generic/620 generic/621 generic/623 generic/624 generic/625 generic/626 generic/628 generic/629 generic/630 generic/635 generic/636 generic/640 generic/641 generic/644 generic/645 generic/646 generic/651 generic/652 generic/653 generic/654 generic/655 generic/657 generic/658 generic/659 generic/660 generic/661 generic/662 generic/663 generic/664 generic/665 generic/666 generic/667 generic/668 generic/669 generic/673 generic/674 generic/675 generic/677 generic/679 generic/681 generic/682 generic/685 generic/686 generic/687 generic/688 generic/689 generic/690 generic/692 generic/693 generic/695 generic/698 generic/699 generic/700 generic/702 generic/703 generic/704 generic/709 generic/710 generic/711 generic/712 generic/713 generic/714 generic/715 generic/716 generic/717 generic/718 generic/719 generic/720 generic/721 generic/722 generic/723 generic/724 generic/725 generic/726 generic/727 generic/730 generic/731 generic/734 generic/735 generic/737 generic/738 generic/739 generic/740 generic/741 generic/742 generic/745 generic/752 generic/756 generic/757 generic/758 generic/764 generic/765 generic/766 generic/767 generic/768 generic/769 generic/770 generic/771 generic/775 generic/776 generic/777 generic/779 generic/780 generic/781 generic/782 generic/783
-Failures: generic/001 generic/023 generic/131 generic/478 generic/571
-Failed 5 of 629 tests
+Not run: generic/003 generic/004 generic/008 generic/009 generic/012 generic/015 generic/016 generic/018 generic/021 generic/022 generic/025 generic/026 generic/031 generic/032 generic/033 generic/034 generic/039 generic/040 generic/041 generic/042 generic/050 generic/052 generic/056 generic/057 generic/058 generic/059 generic/060 generic/061 generic/063 generic/064 generic/065 generic/066 generic/067 generic/073 generic/076 generic/078 generic/079 generic/081 generic/082 generic/090 generic/092 generic/094 generic/096 generic/101 generic/104 generic/106 generic/107 generic/108 generic/110 generic/111 generic/114 generic/115 generic/116 generic/118 generic/119 generic/120 generic/121 generic/122 generic/134 generic/136 generic/138 generic/139 generic/140 generic/142 generic/143 generic/144 generic/145 generic/146 generic/147 generic/148 generic/149 generic/150 generic/151 generic/152 generic/153 generic/154 generic/155 generic/156 generic/157 generic/158 generic/159 generic/160 generic/161 generic/162 generic/163 generic/171 generic/172 generic/173 generic/174 generic/177 generic/178 generic/179 generic/180 generic/181 generic/182 generic/183 generic/185 generic/188 generic/189 generic/190 generic/191 generic/194 generic/195 generic/196 generic/197 generic/199 generic/200 generic/201 generic/202 generic/203 generic/205 generic/206 generic/211 generic/213 generic/216 generic/217 generic/218 generic/219 generic/220 generic/222 generic/223 generic/225 generic/227 generic/228 generic/229 generic/230 generic/235 generic/238 generic/240 generic/244 generic/250 generic/252 generic/253 generic/254 generic/255 generic/256 generic/259 generic/260 generic/261 generic/262 generic/264 generic/265 generic/266 generic/267 generic/268 generic/271 generic/272 generic/276 generic/277 generic/278 generic/279 generic/281 generic/282 generic/283 generic/284 generic/287 generic/288 generic/289 generic/290 generic/291 generic/292 generic/293 generic/295 generic/296 generic/301 generic/302 generic/303 generic/304 generic/305 generic/312 generic/316 generic/317 generic/318 generic/321 generic/322 generic/324 generic/325 generic/326 generic/327 generic/328 generic/329 generic/330 generic/331 generic/332 generic/335 generic/336 generic/338 generic/341 generic/342 generic/343 generic/347 generic/348 generic/353 generic/356 generic/357 generic/358 generic/359 generic/361 generic/367 generic/368 generic/369 generic/370 generic/371 generic/372 generic/373 generic/374 generic/376 generic/379 generic/380 generic/381 generic/382 generic/383 generic/384 generic/385 generic/386 generic/389 generic/392 generic/395 generic/396 generic/397 generic/398 generic/400 generic/402 generic/404 generic/406 generic/407 generic/408 generic/409 generic/410 generic/411 generic/413 generic/414 generic/417 generic/419 generic/421 generic/424 generic/425 generic/426 generic/427 generic/440 generic/441 generic/449 generic/450 generic/453 generic/454 generic/456 generic/458 generic/460 generic/462 generic/463 generic/466 generic/467 generic/468 generic/469 generic/470 generic/472 generic/474 generic/477 generic/479 generic/480 generic/481 generic/483 generic/484 generic/485 generic/487 generic/488 generic/489 generic/491 generic/492 generic/493 generic/494 generic/495 generic/496 generic/497 generic/498 generic/499 generic/501 generic/502 generic/503 generic/505 generic/506 generic/507 generic/508 generic/509 generic/510 generic/511 generic/512 generic/513 generic/514 generic/515 generic/516 generic/517 generic/518 generic/520 generic/526 generic/527 generic/528 generic/530 generic/531 generic/534 generic/535 generic/536 generic/537 generic/538 generic/540 generic/541 generic/542 generic/543 generic/544 generic/545 generic/546 generic/547 generic/548 generic/549 generic/550 generic/552 generic/553 generic/554 generic/555 generic/556 generic/557 generic/563 generic/564 generic/566 generic/569 generic/570 generic/572 generic/573 generic/574 generic/575 generic/576 generic/577 generic/578 generic/580 generic/581 generic/582 generic/583 generic/584 generic/587 generic/588 generic/592 generic/593 generic/594 generic/595 generic/596 generic/599 generic/600 generic/601 generic/602 generic/603 generic/605 generic/606 generic/607 generic/608 generic/610 generic/612 generic/613 generic/614 generic/620 generic/621 generic/623 generic/624 generic/625 generic/626 generic/628 generic/629 generic/630 generic/635 generic/636 generic/640 generic/641 generic/644 generic/645 generic/646 generic/651 generic/652 generic/653 generic/654 generic/655 generic/657 generic/658 generic/659 generic/660 generic/661 generic/662 generic/663 generic/664 generic/665 generic/666 generic/667 generic/668 generic/669 generic/673 generic/674 generic/675 generic/677 generic/679 generic/681 generic/682 generic/685 generic/686 generic/687 generic/688 generic/689 generic/690 generic/692 generic/693 generic/695 generic/698 generic/699 generic/700 generic/702 generic/703 generic/704 generic/709 generic/710 generic/711 generic/712 generic/713 generic/714 generic/715 generic/716 generic/717 generic/718 generic/719 generic/720 generic/721 generic/722 generic/723 generic/724 generic/725 generic/726 generic/727 generic/730 generic/731 generic/734 generic/735 generic/737 generic/738 generic/739 generic/740 generic/741 generic/742 generic/745 generic/752 generic/756 generic/757 generic/758 generic/764 generic/765 generic/766 generic/767 generic/768 generic/769 generic/770 generic/771 generic/775 generic/776 generic/777 generic/779 generic/780 generic/781 generic/782 generic/783
+Passed all 629 tests
 
-exit status 1
