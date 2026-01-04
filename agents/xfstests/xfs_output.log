@@ -1,0 +1,640 @@
+Context is older than output tar file, using cached build...
+Running cc with image ./build/test-xfstests.tar and args -add-virtiofs testfs,scratchfs ./build/test-xfstests.tar...
+FSTYP         -- virtiofs
+PLATFORM      -- Linux/x86_64 tinyrange 6.18.2-0-virt #1-Alpine SMP PREEMPT_DYNAMIC 2025-12-29 10:24:58
+MKFS_OPTIONS  -- scratchfs
+MOUNT_OPTIONS -- scratchfs /scratch
+
+generic/001         25s
+generic/002         2s
+generic/003        [not run] atime related mount options have no effect on virtiofs
+generic/004        [not run] O_TMPFILE is not supported
+generic/005         1s
+generic/006         7s
+generic/007         15s
+generic/008        [not run] xfs_io fzero  failed (old kernel/wrong fs?)
+generic/009        [not run] xfs_io fzero  failed (old kernel/wrong fs?)
+generic/011         11s
+generic/012        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/013         24s
+generic/014         4s
+generic/015        [not run] Filesystem virtiofs not supported in _scratch_mkfs_sized
+generic/016        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/018        [not run] defragmentation not supported for fstype "virtiofs"
+generic/020         4s
+generic/021        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/022        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/023         4s
+generic/024         3s
+generic/025        [not run] kernel doesn't support renameat2 syscall
+generic/026        [not run] virtiofs does not define maximum ACL count
+generic/028         6s
+generic/029         1s
+generic/030         2s
+generic/031        [not run] xfs_io fcollapse  failed (old kernel/wrong fs?)
+generic/032        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/033        [not run] xfs_io fzero  failed (old kernel/wrong fs?)
+generic/034        [not run] require scratchfs to be valid block disk
+generic/035         1s
+generic/037         63s
+generic/039        [not run] require scratchfs to be valid block disk
+generic/040        [not run] require scratchfs to be valid block disk
+generic/041        [not run] require scratchfs to be valid block disk
+generic/042        [not run] virtiofs does not support shutdown
+generic/050        [not run] virtiofs does not support shutdown
+generic/052        [not run] virtiofs does not support shutdown
+generic/053         2s
+generic/056        [not run] require scratchfs to be valid block disk
+generic/057        [not run] require scratchfs to be valid block disk
+generic/058        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/059        [not run] require scratchfs to be valid block disk
+generic/060        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/061        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/062         8s
+generic/063        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/064        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/065        [not run] require scratchfs to be valid block disk
+generic/066        [not run] require scratchfs to be valid block disk
+generic/067        [not run] This test requires loopback device support
+generic/069         448s
+generic/070         5s
+generic/071         1s
+generic/073        [not run] require scratchfs to be valid block disk
+generic/075         7s
+generic/076        [not run] require scratchfs to be local device
+generic/078        [not run] kernel doesn't support renameat2 syscall
+generic/079        [not run] file system doesn't support chattr +ia
+generic/080         3s
+generic/081        [not run] require scratchfs to be valid block disk
+generic/082        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/084         6s
+generic/086         1s
+generic/087         1s
+generic/088         1s
+generic/090        [not run] require scratchfs to be valid block disk
+generic/091         7s
+generic/092        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/094        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/095         4s
+generic/096        [not run] xfs_io fzero  failed (old kernel/wrong fs?)
+generic/097         1s
+generic/098         2s
+generic/099         3s
+generic/101        [not run] require scratchfs to be valid block disk
+generic/103         3s
+generic/104        [not run] require scratchfs to be valid block disk
+generic/105         1s
+generic/106        [not run] require scratchfs to be valid block disk
+generic/107        [not run] require scratchfs to be valid block disk
+generic/108        [not run] require scratchfs to be valid block disk
+generic/110        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/111        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/112         7s
+generic/113         19s
+generic/114        [not run] device block size: 4096 greater than 512
+generic/115        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/116        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/117         3s
+generic/118        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/119        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/120        [not run] atime related mount options have no effect on virtiofs
+generic/121        [not run] Dedupe not supported by test filesystem type: virtiofs
+generic/122        [not run] Dedupe not supported by test filesystem type: virtiofs
+generic/123         1s
+generic/124         11s
+generic/126         2s
+generic/128         1s
+generic/129         54s
+generic/130         4s
+generic/131         2s
+generic/134        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/135         1s
+generic/136        [not run] Dedupe not supported by test filesystem type: virtiofs
+generic/138        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/139        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/140        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/141         1s
+generic/142        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/143        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/144        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/145        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/146        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/147        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/148        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/149        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/150        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/151        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/152        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/153        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/154        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/155        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/156        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/157        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/158        [not run] Dedupe not supported by test filesystem type: virtiofs
+generic/159        [not run] file system doesn't support chattr +i
+generic/160        [not run] file system doesn't support chattr +i
+generic/161        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/162        [not run] Dedupe not supported by scratch filesystem type: virtiofs
+generic/163        [not run] Dedupe not supported by scratch filesystem type: virtiofs
+generic/169         2s
+generic/171        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/172        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/173        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/174        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/177        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/178        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/179        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/180        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/181        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/182        [not run] Dedupe not supported by test filesystem type: virtiofs
+generic/183        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/184         1s
+generic/185        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/188        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/189        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/190        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/191        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/193         3s
+generic/194        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/195        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/196        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/197        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/198         2s
+generic/199        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/200        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/201        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/202        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/203        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/205        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/206        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/207         2s
+generic/210         1s
+generic/211        [not run] Filesystem virtiofs not supported in _scratch_mkfs_sized
+generic/212         1s
+generic/213        [not run] Test device is too small (3600 KiB)
+generic/214         2s
+generic/215         3s
+generic/216        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/217        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/218        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/219        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/220        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/221         2s
+generic/222        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/223        [not run] can't mkfs virtiofs with geometry
+generic/225        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/227        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/228        [not run] Test device is too small (3600 KiB)
+generic/229        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/230        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/235        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/236         2s
+generic/237         1s
+generic/238        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/240        [not run] fs block size must be larger than the device block size.  fs block size: 4096, device block size: 4096
+generic/244        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/245         1s
+generic/246         1s
+generic/247         31s
+generic/248         1s
+generic/249         3s
+generic/250        [not run] require scratchfs to be valid block disk
+generic/252        [not run] require scratchfs to be valid block disk
+generic/253        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/254        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/255        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/256        [not run] Filesystem virtiofs not supported in _scratch_mkfs_sized
+generic/257         2s
+generic/258         1s
+generic/259        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/260        [not run] FITRIM not supported on /scratch
+generic/261        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/262        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/263         4s
+generic/264        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/265        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/266        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/267        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/268        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/271        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/272        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/276        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/277        [not run] file system doesn't support chattr +A
+generic/278        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/279        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/281        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/282        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/283        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/284        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/286         18s
+generic/287        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/288        [not run] FITRIM not supported on /scratch
+generic/289        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/290        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/291        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/292        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/293        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/294         1s
+generic/295        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/296        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/301        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/302        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/303        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/304        [not run] Dedupe not supported by test filesystem type: virtiofs
+generic/305        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/306         2s
+generic/307         2s
+generic/308         1s
+generic/309         2s
+generic/312        [not run] Filesystem virtiofs not supported in _scratch_mkfs_sized
+generic/313         5s
+generic/314         1s
+generic/315         1s
+generic/316        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/317        [not run] userns not supported by this kernel
+generic/318        [not run] userns not supported by this kernel
+generic/319         1s
+generic/321        [not run] require scratchfs to be valid block disk
+generic/322        [not run] require scratchfs to be valid block disk
+generic/324        [not run] defragmentation not supported for fstype "virtiofs"
+generic/325        [not run] require scratchfs to be valid block disk
+generic/326        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/327        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/328        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/329        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/330        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/331        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/332        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/335        [not run] require scratchfs to be valid block disk
+generic/336        [not run] require scratchfs to be valid block disk
+generic/337         1s
+generic/338        [not run] require scratchfs to be valid block disk
+generic/341        [not run] require scratchfs to be valid block disk
+generic/342        [not run] require scratchfs to be valid block disk
+generic/343        [not run] require scratchfs to be valid block disk
+generic/346         35s
+generic/347        [not run] require scratchfs to be valid block disk
+generic/348        [not run] require scratchfs to be valid block disk
+generic/353        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/355         1s
+generic/356        [not run] swapfiles are not supported
+generic/357        [not run] swapfiles are not supported
+generic/358        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/359        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/360         1s
+generic/361        [not run] require scratchfs to be valid block disk
+generic/362         1s
+generic/364         11s
+generic/366         23s
+generic/367        [not run] this test requires extsize support on the filesystem
+generic/368        [not run] filesystem doesn't support -o inlinecrypt
+generic/369        [not run] filesystem doesn't support -o inlinecrypt
+generic/370        [not run] swapfiles are not supported
+generic/371        [not run] Filesystem virtiofs not supported in _scratch_mkfs_sized
+generic/372        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/373        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/374        [not run] Dedupe not supported by scratch filesystem type: virtiofs
+generic/375         2s
+generic/376        [not run] require scratchfs to be valid block disk
+generic/377         1s
+generic/378         1s
+generic/379        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/380        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/381        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/382        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/383        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/384        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/385        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/386        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/389        [not run] O_TMPFILE is not supported
+generic/391         24s
+generic/392        [not run] virtiofs does not support shutdown
+generic/393         2s
+generic/394         1s
+generic/395        [not run] No encryption support for virtiofs
+generic/396        [not run] No encryption support for virtiofs
+generic/397        [not run] No encryption support for virtiofs
+generic/398        [not run] No encryption support for virtiofs
+generic/400        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/401         1s
+generic/402        [not run] filesystem virtiofs timestamp bounds are unknown
+generic/403         3s
+generic/404        [not run] xfs_io finsert  failed (old kernel/wrong fs?)
+generic/406        [not run] This test requires at least 0GB free on /scratch to run
+generic/407        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/408        [not run] Dedupe not supported by test filesystem type: virtiofs
+generic/409        [not run] require scratchfs to be local device
+generic/410        [not run] require scratchfs to be local device
+generic/411        [not run] require scratchfs to be local device
+generic/412         1s
+generic/413        [not run] mount scratchfs with dax failed
+generic/414        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/417        [not run] virtiofs does not support shutdown
+generic/419        [not run] No encryption support for virtiofs
+generic/420         1s
+generic/421        [not run] No encryption support for virtiofs
+generic/422         2s
+generic/423         1s
+generic/424        [not run] file system doesn't support any of /usr/bin/chattr +a/+c/+d/+i
+generic/425        [not run] xfs_io fiemap -a failed (old kernel/wrong fs?)
+generic/426        [not run] virtiofs doesn't support open_by_handle_at(2)
+generic/427        [not run] Filesystem virtiofs not supported in _scratch_mkfs_sized
+generic/428         1s
+generic/430         2s
+generic/431         1s
+generic/432         1s
+generic/433         1s
+generic/434         1s
+generic/436         1s
+generic/437         2s
+generic/439         1s
+generic/440        [not run] No encryption support for virtiofs
+generic/441        [not run] require scratchfs to be valid block disk
+generic/443         1s
+generic/444         1s
+generic/445         1s
+generic/446         44s
+generic/448         1s
+generic/449        [not run] Filesystem virtiofs not supported in _scratch_mkfs_sized
+generic/450        [not run] Only test on sector size < half of block size
+generic/451         31s
+generic/452         1s
+generic/453        [not run] virtiofs does not allow unrestricted byte streams for names
+generic/454        [not run] virtiofs does not allow unrestricted byte streams for names
+generic/456        [not run] require scratchfs to be valid block disk
+generic/458        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/460        [not run] This test requires at least 1GB free on /scratch to run
+generic/462        [not run] mount scratchfs with dax failed
+generic/463        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/465         2s
+generic/466        [not run] require scratchfs to be valid block disk
+generic/467        [not run] virtiofs doesn't support open_by_handle_at(2)
+generic/468        [not run] virtiofs does not support shutdown
+generic/469        [not run] xfs_io fzero  failed (old kernel/wrong fs?)
+generic/470        [not run] This test requires a valid $LOGWRITES_DEV
+generic/471         7s
+generic/472        [not run] swapfiles are not supported
+generic/474        [not run] virtiofs does not support shutdown
+generic/477        [not run] virtiofs doesn't support open_by_handle_at(2)
+generic/478         18s
+generic/479        [not run] require scratchfs to be valid block disk
+generic/480        [not run] require scratchfs to be valid block disk
+generic/481        [not run] require scratchfs to be valid block disk
+generic/483        [not run] require scratchfs to be valid block disk
+generic/484        [not run] require scratchfs to be valid block disk
+generic/485        [not run] xfs_io finsert  failed (old kernel/wrong fs?)
+generic/486         1s
+generic/487        [not run] This test requires a valid $SCRATCH_LOGDEV
+generic/488        [not run] Filesystem virtiofs not supported in _scratch_mkfs_sized
+generic/489        [not run] require scratchfs to be valid block disk
+generic/490         1s
+generic/491        [not run] virtiofs does not support freezing
+generic/492        [not run] xfs_io label  failed (old kernel/wrong fs?)
+generic/493        [not run] swapfiles are not supported
+generic/494        [not run] swapfiles are not supported
+generic/495        [not run] swapfiles are not supported
+generic/496        [not run] swapfiles are not supported
+generic/497        [not run] swapfiles are not supported
+generic/498        [not run] require scratchfs to be valid block disk
+generic/499        [not run] xfs_io fcollapse  failed (old kernel/wrong fs?)
+generic/501        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/502        [not run] require scratchfs to be valid block disk
+generic/503        [not run] xfs_io fcollapse  failed (old kernel/wrong fs?)
+generic/504         1s
+generic/505        [not run] virtiofs does not support shutdown
+generic/506        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/507        [not run] file system doesn't support chattr +ASai
+generic/508        [not run] lsattr not supported by test filesystem type: virtiofs
+generic/509        [not run] O_TMPFILE is not supported
+generic/510        [not run] require scratchfs to be valid block disk
+generic/511        [not run] xfs_io fzero  failed (old kernel/wrong fs?)
+generic/512        [not run] require scratchfs to be valid block disk
+generic/513        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/514        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/515        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/516        [not run] Dedupe not supported by test filesystem type: virtiofs
+generic/517        [not run] Dedupe not supported by scratch filesystem type: virtiofs
+generic/518        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/519         2s
+generic/520        [not run] require scratchfs to be valid block disk
+generic/523         1s
+generic/524         24s
+generic/525         1s
+generic/526        [not run] require scratchfs to be valid block disk
+generic/527        [not run] require scratchfs to be valid block disk
+generic/528        [not run] inode creation time not supported by this filesystem
+generic/529         1s
+generic/530        [not run] virtiofs does not support shutdown
+generic/531        [not run] O_TMPFILE is not supported
+generic/532         1s
+generic/533         2s
+generic/534        [not run] require scratchfs to be valid block disk
+generic/535        [not run] require scratchfs to be valid block disk
+generic/536        [not run] virtiofs does not support shutdown
+generic/537        [not run] FSTRIM not supported
+generic/538        [not run] Need device logical block size(4096) < fs block size(4096)
+generic/539         1s
+generic/540        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/541        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/542        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/543        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/544        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/545        [not run] file system doesn't support chattr +i
+generic/546        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/547        [not run] require scratchfs to be valid block disk
+generic/548        [not run] No encryption support for virtiofs
+generic/549        [not run] No encryption support for virtiofs
+generic/550        [not run] No encryption support for virtiofs
+generic/552        [not run] require scratchfs to be valid block disk
+generic/553        [not run] xfs_io chattr +i failed (old kernel/wrong fs?)
+generic/554        [not run] swapfiles are not supported
+generic/555        [not run] xfs_io chattr +ia failed (old kernel/wrong fs?)
+generic/556        [not run] virtiofs does not support casefold feature
+generic/557        [not run] require scratchfs to be valid block disk
+generic/563        [not run] Test requires cgroup2 enabled
+generic/564        [not run] This test requires loopback device support
+generic/565         1s
+generic/566        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/567         1s
+generic/568         1s
+generic/569        [not run] swapfiles are not supported
+generic/570        [not run] require scratchfs to be valid block disk
+generic/571         8s
+generic/572        [not run] fsverity utility required, skipped this test
+generic/573        [not run] fsverity utility required, skipped this test
+generic/574        [not run] fsverity utility required, skipped this test
+generic/575        [not run] fsverity utility required, skipped this test
+generic/576        [not run] fsverity utility required, skipped this test
+generic/577        [not run] fsverity utility required, skipped this test
+generic/578        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/580        [not run] No encryption support for virtiofs
+generic/581        [not run] No encryption support for virtiofs
+generic/582        [not run] No encryption support for virtiofs
+generic/583        [not run] No encryption support for virtiofs
+generic/584        [not run] No encryption support for virtiofs
+generic/586         1s
+generic/587        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/588        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/591         1s
+generic/592        [not run] No encryption support for virtiofs
+generic/593        [not run] No encryption support for virtiofs
+generic/594        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/595        [not run] No encryption support for virtiofs
+generic/596        [not run] accton utility required, skipped this test
+generic/597         1s
+generic/598         3s
+generic/599        [not run] virtiofs does not support shutdown
+generic/600        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/601        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/602        [not run] No encryption support for virtiofs
+generic/603        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/604         13s
+generic/605        [not run] mount scratchfs with dax=always failed
+generic/606        [not run] mount scratchfs with dax=always failed
+generic/607        [not run] xfs_io chattr +x failed (old kernel/wrong fs?)
+generic/608        [not run] mount scratchfs with dax=always failed
+generic/609         1s
+generic/610        [not run] xfs_io fzero  failed (old kernel/wrong fs?)
+generic/611         1s
+generic/612        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/613        [not run] No encryption support for virtiofs
+generic/614        [not run] test requires delayed allocation buffered writes
+generic/615         178s
+generic/618         1s
+generic/620        [not run] require scratchfs to be valid block disk
+generic/621        [not run] No encryption support for virtiofs
+generic/623        [not run] xfs_io shutdown  failed (old kernel/wrong fs?)
+generic/624        [not run] fsverity utility required, skipped this test
+generic/625        [not run] fsverity utility required, skipped this test
+generic/626        [not run] kernel doesn't support renameat2 syscall
+generic/628        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/629        [not run] require scratchfs to be valid block disk
+generic/630        [not run] Dedupe not supported by scratch filesystem type: virtiofs
+generic/632         1s
+generic/633         2s
+generic/634         2s
+generic/635        [not run] virtiofs does not support shutdown
+generic/636        [not run] swapfiles are not supported
+generic/637         2s
+generic/638         1s
+generic/639         1s
+generic/640        [not run] require scratchfs to be valid block disk
+generic/641        [not run] swapfiles are not supported
+generic/644        [not run] idmapped mounts not support by virtiofs
+generic/645        [not run] idmapped mounts not support by virtiofs
+generic/646        [not run] virtiofs does not support shutdown
+generic/647         1s
+generic/651        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/652        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/653        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/654        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/655        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/657        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/658        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/659        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/660        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/661        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/662        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/663        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/664        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/665        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/666        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/667        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/668        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/669        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/673        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/674        [not run] Dedupe not supported by scratch filesystem type: virtiofs
+generic/675        [not run] getcap utility required, skipped this test
+generic/676         7s
+generic/677        [not run] require scratchfs to be valid block disk
+generic/678         1s
+generic/679        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/680         1s
+generic/681        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/682        [not run] disk quotas not supported by this filesystem type: virtiofs
+generic/683         3s
+generic/684         4s
+generic/685        [not run] xfs_io fzero  failed (old kernel/wrong fs?)
+generic/686        [not run] xfs_io finsert  failed (old kernel/wrong fs?)
+generic/687        [not run] xfs_io fcollapse  failed (old kernel/wrong fs?)
+generic/688        [not run] getcap utility required, skipped this test
+generic/689        [not run] idmapped mounts not support by virtiofs
+generic/690        [not run] require scratchfs to be valid block disk
+generic/692        [not run] fsverity utility required, skipped this test
+generic/693        [not run] No encryption support for virtiofs
+generic/695        [not run] require scratchfs to be valid block disk
+generic/696         1s
+generic/697         1s
+generic/698        [not run] idmapped mounts not support by virtiofs
+generic/699        [not run] this test requires overlay support
+generic/700        [not run] kernel doesn't support renameat2 syscall
+generic/702        [not run] Reflink not supported by scratch filesystem type: virtiofs
+generic/703        [not run] require scratchfs to be valid block disk
+generic/704        [not run] scsi_debug module not found
+generic/706         0s
+generic/708         1s
+generic/709        [not run] xfs_io exchangerange  support is missing
+generic/710        [not run] xfs_io exchangerange  support is missing
+generic/711        [not run] xfs_io swapext  not supported on virtiofs
+generic/712        [not run] xfs_io exchangerange  support is missing
+generic/713        [not run] xfs_io exchangerange  -s 64k -l 64k support is missing
+generic/714        [not run] xfs_io exchangerange  support is missing
+generic/715        [not run] xfs_io exchangerange  -s 64k -l 64k support is missing
+generic/716        [not run] xfs_io exchangerange  support is missing
+generic/717        [not run] xfs_io exchangerange  support is missing
+generic/718        [not run] xfs_io exchangerange  support is missing
+generic/719        [not run] xfs_io exchangerange  support is missing
+generic/720        [not run] xfs_io exchangerange  support is missing
+generic/721        [not run] xfs_io startupdate  support is missing
+generic/722        [not run] xfs_io exchangerange  support is missing
+generic/723        [not run] xfs_io exchangerange  support is missing
+generic/724        [not run] xfs_io exchangerange  support is missing
+generic/725        [not run] xfs_io exchangerange  support is missing
+generic/726        [not run] xfs_io exchangerange  support is missing
+generic/727        [not run] getcap utility required, skipped this test
+generic/728         5s
+generic/729         0s
+generic/730        [not run] require testfs to be valid block disk
+generic/731        [not run] require testfs to be valid block disk
+generic/732         1s
+generic/734        [not run] Reflink not supported by test filesystem type: virtiofs
+generic/735        [not run] xfs_io finsert  failed (old kernel/wrong fs?)
+generic/736         7s
+generic/737        [not run] virtiofs does not support shutdown
+generic/738        [not run] virtiofs does not support freezing
+generic/739        [not run] No encryption support for virtiofs
+generic/740        [not run] require scratchfs to be valid block disk
+generic/741        [not run] require scratchfs to be valid block disk
+generic/742        [not run] xfs_io fiemap  failed (old kernel/wrong fs?)
+generic/745        [not run] require scratchfs to be valid block disk
+generic/748         272s
+generic/749         6s
+generic/752        [not run] xfs_io exchangerange  support is missing
+generic/755         3s
+generic/756        [not run] virtiofs doesn't support open_by_handle_at(2)
+generic/757        [not run] This test requires a valid $LOGWRITES_DEV
+generic/758        [not run] xfs_io fzero  failed (old kernel/wrong fs?)
+generic/759         9s
+generic/760         4s
+generic/761         3s
+generic/763         1s
+generic/764        [not run] require scratchfs to be valid block disk
+generic/765        [not run] write atomic not supported by this block device
+generic/766        [not run] virtiofs does not support shutdown
+generic/767        [not run] scsi_debug module not found
+generic/768        [not run] require scratchfs to be valid block disk
+generic/769        [not run] require scratchfs to be valid block disk
+generic/770        [not run] require scratchfs to be valid block disk
+generic/771        [not run] require scratchfs to be valid block disk
+generic/775        [not run] xfs_io pwrite doesn't support -A
+generic/776        [not run] write atomic not supported by this block device
+generic/777        [not run] virtiofs doesn't support open_by_handle_at(2)
+generic/779        [not run] require scratchfs to be valid block disk
+generic/780        [not run] /opt/xfstests/src/file_attr not built
+generic/781        [not run] require scratchfs to be valid block disk
+generic/782        [not run] require scratchfs to be valid block disk
+generic/783        [not run] this test requires overlay support
+Ran: generic/001 generic/002 generic/003 generic/004 generic/005 generic/006 generic/007 generic/008 generic/009 generic/011 generic/012 generic/013 generic/014 generic/015 generic/016 generic/018 generic/020 generic/021 generic/022 generic/023 generic/024 generic/025 generic/026 generic/028 generic/029 generic/030 generic/031 generic/032 generic/033 generic/034 generic/035 generic/037 generic/039 generic/040 generic/041 generic/042 generic/050 generic/052 generic/053 generic/056 generic/057 generic/058 generic/059 generic/060 generic/061 generic/062 generic/063 generic/064 generic/065 generic/066 generic/067 generic/069 generic/070 generic/071 generic/073 generic/075 generic/076 generic/078 generic/079 generic/080 generic/081 generic/082 generic/084 generic/086 generic/087 generic/088 generic/090 generic/091 generic/092 generic/094 generic/095 generic/096 generic/097 generic/098 generic/099 generic/101 generic/103 generic/104 generic/105 generic/106 generic/107 generic/108 generic/110 generic/111 generic/112 generic/113 generic/114 generic/115 generic/116 generic/117 generic/118 generic/119 generic/120 generic/121 generic/122 generic/123 generic/124 generic/126 generic/128 generic/129 generic/130 generic/131 generic/134 generic/135 generic/136 generic/138 generic/139 generic/140 generic/141 generic/142 generic/143 generic/144 generic/145 generic/146 generic/147 generic/148 generic/149 generic/150 generic/151 generic/152 generic/153 generic/154 generic/155 generic/156 generic/157 generic/158 generic/159 generic/160 generic/161 generic/162 generic/163 generic/169 generic/171 generic/172 generic/173 generic/174 generic/177 generic/178 generic/179 generic/180 generic/181 generic/182 generic/183 generic/184 generic/185 generic/188 generic/189 generic/190 generic/191 generic/193 generic/194 generic/195 generic/196 generic/197 generic/198 generic/199 generic/200 generic/201 generic/202 generic/203 generic/205 generic/206 generic/207 generic/210 generic/211 generic/212 generic/213 generic/214 generic/215 generic/216 generic/217 generic/218 generic/219 generic/220 generic/221 generic/222 generic/223 generic/225 generic/227 generic/228 generic/229 generic/230 generic/235 generic/236 generic/237 generic/238 generic/240 generic/244 generic/245 generic/246 generic/247 generic/248 generic/249 generic/250 generic/252 generic/253 generic/254 generic/255 generic/256 generic/257 generic/258 generic/259 generic/260 generic/261 generic/262 generic/263 generic/264 generic/265 generic/266 generic/267 generic/268 generic/271 generic/272 generic/276 generic/277 generic/278 generic/279 generic/281 generic/282 generic/283 generic/284 generic/286 generic/287 generic/288 generic/289 generic/290 generic/291 generic/292 generic/293 generic/294 generic/295 generic/296 generic/301 generic/302 generic/303 generic/304 generic/305 generic/306 generic/307 generic/308 generic/309 generic/312 generic/313 generic/314 generic/315 generic/316 generic/317 generic/318 generic/319 generic/321 generic/322 generic/324 generic/325 generic/326 generic/327 generic/328 generic/329 generic/330 generic/331 generic/332 generic/335 generic/336 generic/337 generic/338 generic/341 generic/342 generic/343 generic/346 generic/347 generic/348 generic/353 generic/355 generic/356 generic/357 generic/358 generic/359 generic/360 generic/361 generic/362 generic/364 generic/366 generic/367 generic/368 generic/369 generic/370 generic/371 generic/372 generic/373 generic/374 generic/375 generic/376 generic/377 generic/378 generic/379 generic/380 generic/381 generic/382 generic/383 generic/384 generic/385 generic/386 generic/389 generic/391 generic/392 generic/393 generic/394 generic/395 generic/396 generic/397 generic/398 generic/400 generic/401 generic/402 generic/403 generic/404 generic/406 generic/407 generic/408 generic/409 generic/410 generic/411 generic/412 generic/413 generic/414 generic/417 generic/419 generic/420 generic/421 generic/422 generic/423 generic/424 generic/425 generic/426 generic/427 generic/428 generic/430 generic/431 generic/432 generic/433 generic/434 generic/436 generic/437 generic/439 generic/440 generic/441 generic/443 generic/444 generic/445 generic/446 generic/448 generic/449 generic/450 generic/451 generic/452 generic/453 generic/454 generic/456 generic/458 generic/460 generic/462 generic/463 generic/465 generic/466 generic/467 generic/468 generic/469 generic/470 generic/471 generic/472 generic/474 generic/477 generic/478 generic/479 generic/480 generic/481 generic/483 generic/484 generic/485 generic/486 generic/487 generic/488 generic/489 generic/490 generic/491 generic/492 generic/493 generic/494 generic/495 generic/496 generic/497 generic/498 generic/499 generic/501 generic/502 generic/503 generic/504 generic/505 generic/506 generic/507 generic/508 generic/509 generic/510 generic/511 generic/512 generic/513 generic/514 generic/515 generic/516 generic/517 generic/518 generic/519 generic/520 generic/523 generic/524 generic/525 generic/526 generic/527 generic/528 generic/529 generic/530 generic/531 generic/532 generic/533 generic/534 generic/535 generic/536 generic/537 generic/538 generic/539 generic/540 generic/541 generic/542 generic/543 generic/544 generic/545 generic/546 generic/547 generic/548 generic/549 generic/550 generic/552 generic/553 generic/554 generic/555 generic/556 generic/557 generic/563 generic/564 generic/565 generic/566 generic/567 generic/568 generic/569 generic/570 generic/571 generic/572 generic/573 generic/574 generic/575 generic/576 generic/577 generic/578 generic/580 generic/581 generic/582 generic/583 generic/584 generic/586 generic/587 generic/588 generic/591 generic/592 generic/593 generic/594 generic/595 generic/596 generic/597 generic/598 generic/599 generic/600 generic/601 generic/602 generic/603 generic/604 generic/605 generic/606 generic/607 generic/608 generic/609 generic/610 generic/611 generic/612 generic/613 generic/614 generic/615 generic/618 generic/620 generic/621 generic/623 generic/624 generic/625 generic/626 generic/628 generic/629 generic/630 generic/632 generic/633 generic/634 generic/635 generic/636 generic/637 generic/638 generic/639 generic/640 generic/641 generic/644 generic/645 generic/646 generic/647 generic/651 generic/652 generic/653 generic/654 generic/655 generic/657 generic/658 generic/659 generic/660 generic/661 generic/662 generic/663 generic/664 generic/665 generic/666 generic/667 generic/668 generic/669 generic/673 generic/674 generic/675 generic/676 generic/677 generic/678 generic/679 generic/680 generic/681 generic/682 generic/683 generic/684 generic/685 generic/686 generic/687 generic/688 generic/689 generic/690 generic/692 generic/693 generic/695 generic/696 generic/697 generic/698 generic/699 generic/700 generic/702 generic/703 generic/704 generic/706 generic/708 generic/709 generic/710 generic/711 generic/712 generic/713 generic/714 generic/715 generic/716 generic/717 generic/718 generic/719 generic/720 generic/721 generic/722 generic/723 generic/724 generic/725 generic/726 generic/727 generic/728 generic/729 generic/730 generic/731 generic/732 generic/734 generic/735 generic/736 generic/737 generic/738 generic/739 generic/740 generic/741 generic/742 generic/745 generic/748 generic/749 generic/752 generic/755 generic/756 generic/757 generic/758 generic/759 generic/760 generic/761 generic/763 generic/764 generic/765 generic/766 generic/767 generic/768 generic/769 generic/770 generic/771 generic/775 generic/776 generic/777 generic/779 generic/780 generic/781 generic/782 generic/783
+Not run: generic/003 generic/004 generic/008 generic/009 generic/012 generic/015 generic/016 generic/018 generic/021 generic/022 generic/025 generic/026 generic/031 generic/032 generic/033 generic/034 generic/039 generic/040 generic/041 generic/042 generic/050 generic/052 generic/056 generic/057 generic/058 generic/059 generic/060 generic/061 generic/063 generic/064 generic/065 generic/066 generic/067 generic/073 generic/076 generic/078 generic/079 generic/081 generic/082 generic/090 generic/092 generic/094 generic/096 generic/101 generic/104 generic/106 generic/107 generic/108 generic/110 generic/111 generic/114 generic/115 generic/116 generic/118 generic/119 generic/120 generic/121 generic/122 generic/134 generic/136 generic/138 generic/139 generic/140 generic/142 generic/143 generic/144 generic/145 generic/146 generic/147 generic/148 generic/149 generic/150 generic/151 generic/152 generic/153 generic/154 generic/155 generic/156 generic/157 generic/158 generic/159 generic/160 generic/161 generic/162 generic/163 generic/171 generic/172 generic/173 generic/174 generic/177 generic/178 generic/179 generic/180 generic/181 generic/182 generic/183 generic/185 generic/188 generic/189 generic/190 generic/191 generic/194 generic/195 generic/196 generic/197 generic/199 generic/200 generic/201 generic/202 generic/203 generic/205 generic/206 generic/211 generic/213 generic/216 generic/217 generic/218 generic/219 generic/220 generic/222 generic/223 generic/225 generic/227 generic/228 generic/229 generic/230 generic/235 generic/238 generic/240 generic/244 generic/250 generic/252 generic/253 generic/254 generic/255 generic/256 generic/259 generic/260 generic/261 generic/262 generic/264 generic/265 generic/266 generic/267 generic/268 generic/271 generic/272 generic/276 generic/277 generic/278 generic/279 generic/281 generic/282 generic/283 generic/284 generic/287 generic/288 generic/289 generic/290 generic/291 generic/292 generic/293 generic/295 generic/296 generic/301 generic/302 generic/303 generic/304 generic/305 generic/312 generic/316 generic/317 generic/318 generic/321 generic/322 generic/324 generic/325 generic/326 generic/327 generic/328 generic/329 generic/330 generic/331 generic/332 generic/335 generic/336 generic/338 generic/341 generic/342 generic/343 generic/347 generic/348 generic/353 generic/356 generic/357 generic/358 generic/359 generic/361 generic/367 generic/368 generic/369 generic/370 generic/371 generic/372 generic/373 generic/374 generic/376 generic/379 generic/380 generic/381 generic/382 generic/383 generic/384 generic/385 generic/386 generic/389 generic/392 generic/395 generic/396 generic/397 generic/398 generic/400 generic/402 generic/404 generic/406 generic/407 generic/408 generic/409 generic/410 generic/411 generic/413 generic/414 generic/417 generic/419 generic/421 generic/424 generic/425 generic/426 generic/427 generic/440 generic/441 generic/449 generic/450 generic/453 generic/454 generic/456 generic/458 generic/460 generic/462 generic/463 generic/466 generic/467 generic/468 generic/469 generic/470 generic/472 generic/474 generic/477 generic/479 generic/480 generic/481 generic/483 generic/484 generic/485 generic/487 generic/488 generic/489 generic/491 generic/492 generic/493 generic/494 generic/495 generic/496 generic/497 generic/498 generic/499 generic/501 generic/502 generic/503 generic/505 generic/506 generic/507 generic/508 generic/509 generic/510 generic/511 generic/512 generic/513 generic/514 generic/515 generic/516 generic/517 generic/518 generic/520 generic/526 generic/527 generic/528 generic/530 generic/531 generic/534 generic/535 generic/536 generic/537 generic/538 generic/540 generic/541 generic/542 generic/543 generic/544 generic/545 generic/546 generic/547 generic/548 generic/549 generic/550 generic/552 generic/553 generic/554 generic/555 generic/556 generic/557 generic/563 generic/564 generic/566 generic/569 generic/570 generic/572 generic/573 generic/574 generic/575 generic/576 generic/577 generic/578 generic/580 generic/581 generic/582 generic/583 generic/584 generic/587 generic/588 generic/592 generic/593 generic/594 generic/595 generic/596 generic/599 generic/600 generic/601 generic/602 generic/603 generic/605 generic/606 generic/607 generic/608 generic/610 generic/612 generic/613 generic/614 generic/620 generic/621 generic/623 generic/624 generic/625 generic/626 generic/628 generic/629 generic/630 generic/635 generic/636 generic/640 generic/641 generic/644 generic/645 generic/646 generic/651 generic/652 generic/653 generic/654 generic/655 generic/657 generic/658 generic/659 generic/660 generic/661 generic/662 generic/663 generic/664 generic/665 generic/666 generic/667 generic/668 generic/669 generic/673 generic/674 generic/675 generic/677 generic/679 generic/681 generic/682 generic/685 generic/686 generic/687 generic/688 generic/689 generic/690 generic/692 generic/693 generic/695 generic/698 generic/699 generic/700 generic/702 generic/703 generic/704 generic/709 generic/710 generic/711 generic/712 generic/713 generic/714 generic/715 generic/716 generic/717 generic/718 generic/719 generic/720 generic/721 generic/722 generic/723 generic/724 generic/725 generic/726 generic/727 generic/730 generic/731 generic/734 generic/735 generic/737 generic/738 generic/739 generic/740 generic/741 generic/742 generic/745 generic/752 generic/756 generic/757 generic/758 generic/764 generic/765 generic/766 generic/767 generic/768 generic/769 generic/770 generic/771 generic/775 generic/776 generic/777 generic/779 generic/780 generic/781 generic/782 generic/783
+Passed all 629 tests
+

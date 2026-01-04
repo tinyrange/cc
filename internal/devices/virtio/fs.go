@@ -4,8 +4,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"path"
 	"sync"
+	"time"
 
 	"github.com/tinyrange/cc/internal/debug"
 	"github.com/tinyrange/cc/internal/fdt"
@@ -54,10 +56,18 @@ const (
 )
 
 type FSTemplate struct {
-	Tag     string
-	Backend FsBackend
-	Arch    hv.CpuArchitecture
-	IRQLine uint32
+	Tag      string
+	Backend  FsBackend
+	Arch     hv.CpuArchitecture
+	MMIOBase uint64
+	IRQLine  uint32
+}
+
+func (t FSTemplate) mmioBaseOrDefault() uint64 {
+	if t.MMIOBase != 0 {
+		return t.MMIOBase
+	}
+	return FsDefaultMMIOBase
 }
 
 func (t FSTemplate) archOrDefault(vm hv.VirtualMachine) hv.CpuArchitecture {
@@ -85,7 +95,7 @@ func (t FSTemplate) GetLinuxCommandLineParam() ([]string, error) {
 	irqLine := t.irqLineForArch(t.Arch)
 	param := fmt.Sprintf(
 		"virtio_mmio.device=4k@0x%x:%d",
-		FsDefaultMMIOBase,
+		t.mmioBaseOrDefault(),
 		irqLine,
 	)
 	return []string{param}, nil
@@ -95,10 +105,10 @@ func (t FSTemplate) GetLinuxCommandLineParam() ([]string, error) {
 func (t FSTemplate) DeviceTreeNodes() ([]fdt.Node, error) {
 	irqLine := t.irqLineForArch(t.Arch)
 	node := fdt.Node{
-		Name: fmt.Sprintf("virtio@%x", FsDefaultMMIOBase),
+		Name: fmt.Sprintf("virtio@%x", t.mmioBaseOrDefault()),
 		Properties: map[string]fdt.Property{
 			"compatible": {Strings: []string{"virtio,mmio"}},
-			"reg":        {U64: []uint64{FsDefaultMMIOBase, FsDefaultMMIOSize}},
+			"reg":        {U64: []uint64{t.mmioBaseOrDefault(), FsDefaultMMIOSize}},
 			"interrupts": {U32: []uint32{0, irqLine, 4}},
 			"status":     {Strings: []string{"okay"}},
 		},
@@ -110,7 +120,7 @@ func (t FSTemplate) DeviceTreeNodes() ([]fdt.Node, error) {
 func (t FSTemplate) GetACPIDeviceInfo() ACPIDeviceInfo {
 	irqLine := t.irqLineForArch(t.archOrDefault(nil))
 	return ACPIDeviceInfo{
-		BaseAddr: FsDefaultMMIOBase,
+		BaseAddr: t.mmioBaseOrDefault(),
 		Size:     FsDefaultMMIOSize,
 		GSI:      irqLine,
 	}
@@ -119,7 +129,7 @@ func (t FSTemplate) GetACPIDeviceInfo() ACPIDeviceInfo {
 func (t FSTemplate) Create(vm hv.VirtualMachine) (hv.Device, error) {
 	arch := t.archOrDefault(vm)
 	irqLine := t.irqLineForArch(arch)
-	fs := NewFS(vm, FsDefaultMMIOBase, FsDefaultMMIOSize, EncodeIRQLineForArch(arch, irqLine), t.Tag, t.Backend)
+	fs := NewFS(vm, t.mmioBaseOrDefault(), FsDefaultMMIOSize, EncodeIRQLineForArch(arch, irqLine), t.Tag, t.Backend)
 	if err := fs.Init(vm); err != nil {
 		return nil, fmt.Errorf("virtio-fs: initialize device: %w", err)
 	}
@@ -177,36 +187,56 @@ type fuseOutHeader struct {
 
 // FUSE opcodes (subset)
 const (
-	FUSE_LOOKUP     = 1
-	FUSE_FORGET     = 2
-	FUSE_GETATTR    = 3
-	FUSE_SETATTR    = 4
-	FUSE_READLINK   = 5
-	FUSE_SYMLINK    = 6
-	FUSE_MKNOD      = 8
-	FUSE_MKDIR      = 9
-	FUSE_UNLINK     = 10
-	FUSE_RMDIR      = 11
-	FUSE_RENAME     = 12
-	FUSE_LINK       = 13
-	FUSE_OPEN       = 14
-	FUSE_READ       = 15
-	FUSE_WRITE      = 16
-	FUSE_STATFS     = 17
-	FUSE_RELEASE    = 18
-	FUSE_FSYNC      = 20
-	FUSE_SETXATTR   = 21 // (not implemented)
-	FUSE_GETXATTR   = 22 // (not implemented)
-	FUSE_LISTXATTR  = 23 // (not implemented)
-	FUSE_FLUSH      = 25
-	FUSE_INIT       = 26
-	FUSE_OPENDIR    = 27
-	FUSE_READDIR    = 28
-	FUSE_RELEASEDIR = 29
-	FUSE_FSYNCDIR   = 30
-	FUSE_CREATE     = 35
-	FUSE_RENAME2    = 45
-	FUSE_LSEEK      = 46
+	FUSE_LOOKUP      = 1
+	FUSE_FORGET      = 2
+	FUSE_GETATTR     = 3
+	FUSE_SETATTR     = 4
+	FUSE_READLINK    = 5
+	FUSE_SYMLINK     = 6
+	FUSE_MKNOD       = 8
+	FUSE_MKDIR       = 9
+	FUSE_UNLINK      = 10
+	FUSE_RMDIR       = 11
+	FUSE_RENAME      = 12
+	FUSE_LINK        = 13
+	FUSE_OPEN        = 14
+	FUSE_READ        = 15
+	FUSE_WRITE       = 16
+	FUSE_STATFS      = 17
+	FUSE_RELEASE     = 18
+	FUSE_FSYNC       = 20
+	FUSE_SETXATTR    = 21
+	FUSE_GETXATTR    = 22
+	FUSE_LISTXATTR   = 23
+	FUSE_REMOVEXATTR = 24
+	FUSE_FLUSH       = 25
+	FUSE_INIT        = 26
+	FUSE_OPENDIR     = 27
+	FUSE_READDIR     = 28
+	FUSE_RELEASEDIR  = 29
+	FUSE_FSYNCDIR    = 30
+	FUSE_CREATE      = 35
+	FUSE_FALLOCATE   = 43
+	FUSE_RENAME2     = 45
+	FUSE_LSEEK       = 46
+	FUSE_GETLK       = 31
+	FUSE_SETLK       = 32
+	FUSE_SETLKW      = 33
+	FUSE_DESTROY     = 38
+	FUSE_IOCTL       = 39
+	FUSE_POLL        = 40
+)
+
+// FUSE_INIT capability flags (subset; values match Linux uapi `include/uapi/linux/fuse.h`).
+// These are returned in `fuse_init_out.flags`.
+const (
+	// FuseCapPosixACL indicates the server supports POSIX ACLs (e.g. via
+	// `system.posix_acl_access` and `system.posix_acl_default` xattrs).
+	FuseCapPosixACL uint32 = 1 << 20
+	// FuseCapPosixLocks indicates the server supports POSIX advisory locks.
+	FuseCapPosixLocks uint32 = 1 << 1
+	// FuseCapFlockLocks indicates the server supports BSD flock locks.
+	FuseCapFlockLocks uint32 = 1 << 10
 )
 
 // Minimal structs we need on the wire (host end)
@@ -316,6 +346,32 @@ type FsBackend interface {
 	StatFS(nodeID uint64) (blocks, bfree, bavail, files, ffree, bsize, frsize, namelen uint64, errno int32)
 }
 
+// FUSE lock flags (lk_flags in struct fuse_lk_in).
+// Values are defined in Linux uapi `include/uapi/linux/fuse.h`.
+const (
+	FuseLkFlock uint32 = 1 << 0
+	// FuseLkOFD indicates OFD lock semantics (file-description locks).
+	// Some userspace headers don't define this yet; Linux kernels do use it.
+	FuseLkOFD uint32 = 1 << 1
+)
+
+// Optional directory-handle interfaces.
+//
+// These provide a place to implement fully correct getdents64 / d_off semantics:
+// - Stable offsets (cookies) across pagination.
+// - Deterministic inode/name pairs within a directory stream.
+// - No "empty page == EOF" behavior when the kernel asks for a small buffer.
+//
+// If not implemented, the device falls back to FsBackend.ReadDir(nodeID, off, size).
+type fsOpenDirBackend interface {
+	OpenDir(nodeID uint64, flags uint32) (fh uint64, errno int32)
+	ReleaseDir(nodeID uint64, fh uint64)
+}
+
+type fsReadDirHandleBackend interface {
+	ReadDirHandle(nodeID uint64, fh uint64, off uint64, maxBytes uint32) ([]byte, int32)
+}
+
 type fsCreateBackend interface {
 	Create(parent uint64, name string, mode uint32, flags uint32, umask uint32, uid uint32, gid uint32) (nodeID uint64, fh uint64, attr FuseAttr, errno int32)
 }
@@ -333,8 +389,10 @@ type fsWriteBackend interface {
 }
 
 type fsXattrBackend interface {
-	SetXattr(nodeID uint64, name string, value []byte, flags uint32) int32
+	SetXattr(nodeID uint64, name string, value []byte, flags uint32, uid uint32, gid uint32) int32
 	GetXattr(nodeID uint64, name string) ([]byte, int32)
+	ListXattr(nodeID uint64) ([]byte, int32)
+	RemoveXattr(nodeID uint64, name string) int32
 }
 
 type fsSymlinkBackend interface {
@@ -358,16 +416,45 @@ type fsRemoveBackend interface {
 }
 
 type fsSetattrBackend interface {
-	SetAttr(nodeID uint64, size *uint64, mode *uint32, uid *uint32, gid *uint32) int32
+	SetAttr(nodeID uint64, size *uint64, mode *uint32, uid *uint32, gid *uint32, atime *time.Time, mtime *time.Time, reqUID uint32, reqGID uint32) int32
 }
 
 type fsLseekBackend interface {
 	Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32) (uint64, int32)
 }
 
+type fsFallocateBackend interface {
+	// Fallocate implements fallocate(2) on an open file handle.
+	Fallocate(nodeID uint64, fh uint64, offset uint64, length uint64, mode uint32) int32
+}
+
 type fsLinkBackend interface {
 	// Link creates a hard link: a new directory entry `newName` in `newParent` pointing to `oldNodeID`.
 	Link(oldNodeID uint64, newParent uint64, newName string) (nodeID uint64, attr FuseAttr, errno int32)
+}
+
+// FuseLock represents a POSIX advisory lock (from struct fuse_file_lock).
+type FuseLock struct {
+	Start uint64 // byte offset
+	End   uint64 // byte offset (inclusive), or UINT64_MAX for EOF
+	Type  uint32 // F_RDLCK, F_WRLCK, F_UNLCK
+	PID   uint32 // process ID (tgid)
+}
+
+type fsLockBackend interface {
+	// GetLk tests whether a lock could be placed; returns the conflicting lock or an unlocked lock if OK.
+	GetLk(nodeID uint64, fh uint64, owner uint64, lk FuseLock, flags uint32) (FuseLock, int32)
+	// SetLk sets or clears a POSIX advisory lock (non-blocking).
+	SetLk(nodeID uint64, fh uint64, owner uint64, lk FuseLock, flags uint32) int32
+	// SetLkW sets or clears a POSIX advisory lock (blocking). For simplicity we can treat same as SetLk.
+	SetLkW(nodeID uint64, fh uint64, owner uint64, lk FuseLock, flags uint32) int32
+}
+
+// fsFlushBackend is an optional hook for FUSE_FLUSH.
+// Linux may use FUSE_FLUSH.lock_owner to indicate which POSIX locks should be
+// released when the caller closes an fd (POSIX fcntl locks are per-process).
+type fsFlushBackend interface {
+	Flush(nodeID uint64, fh uint64, lockOwner uint64) int32
 }
 
 // A trivial in-memory backend placeholder that exposes an empty root.
@@ -429,9 +516,24 @@ type FS struct {
 	bufPool sync.Pool
 	backend FsBackend
 
+	// pending holds request contexts that are waiting for a "blocking" lock
+	// acquisition (SETLKW) to become available. We defer replying until the lock
+	// can be acquired, so the guest thread blocks in-kernel as expected without
+	// stalling the entire virtio-fs device.
+	pending []pendingReq
+
 	// config
 	tag       [fsCfgTagSize]byte
 	numQueues uint32
+}
+
+type pendingReq struct {
+	qidx      int
+	head      uint16
+	opcode    uint32
+	req       []byte
+	respDescs []fsDesc
+	respCap   int
 }
 
 func NewFS(vm hv.VirtualMachine, base, size uint64, irqLine uint32, tag string, backend FsBackend) *FS {
@@ -537,7 +639,7 @@ func (v *FS) OnQueueNotify(dev device, qidx int) error {
 	} else {
 		debug.Writef("virtio-fs.OnQueueNotify q!=nil", "qidx=%d ready=%t size=%d lastAvailIdx=%d usedIdx=%d", qidx, q.ready, q.size, q.lastAvailIdx, q.usedIdx)
 	}
-	return v.processQueue(dev, q)
+	return v.processQueue(dev, qidx, q)
 }
 
 // Config space
@@ -569,7 +671,7 @@ func (v *FS) WriteConfig(device, uint64, uint32) (bool, error) { return false, n
 
 // ------------- queue processing -------------
 
-func (v *FS) processQueue(dev device, q *queue) error {
+func (v *FS) processQueue(dev device, qidx int, q *queue) error {
 	if q == nil || !q.ready || q.size == 0 {
 		if q == nil {
 			debug.Writef("virtio-fs.processQueue skip", "queue=nil")
@@ -585,6 +687,14 @@ func (v *FS) processQueue(dev device, q *queue) error {
 		return err
 	}
 	debug.Writef("virtio-fs.processQueue availFlags", "0x%x availIdx=%d lastAvailIdx=%d", availFlags, availIdx, q.lastAvailIdx)
+
+	// First, attempt to complete any deferred SETLKW requests. This is safe because
+	// the underlying virtio queue elements remain in-flight until we write them to
+	// the used ring.
+	if err := v.tryCompletePending(dev); err != nil {
+		return err
+	}
+
 	var interruptNeeded bool
 
 	for q.lastAvailIdx != availIdx {
@@ -595,18 +705,30 @@ func (v *FS) processQueue(dev device, q *queue) error {
 			return err
 		}
 		debug.Writef("virtio-fs.processQueue handle", "head=%d ringIndex=%d", head, ringIndex)
-		usedLen, err := v.handleRequest(dev, q, head)
+		usedLen, deferred, err := v.handleRequest(dev, qidx, q, head)
 		if err != nil {
 			debug.Writef("virtio-fs.processQueue handleRequest", "head=%d error=%v", head, err)
 			return err
 		}
+		q.lastAvailIdx++
+
+		// Deferred (SETLKW would block): do not write used entry yet.
+		if deferred {
+			continue
+		}
+
 		debug.Writef("virtio-fs.processQueue recordUsed", "head=%d usedLen=%d", head, usedLen)
 		if err := dev.recordUsedElement(q, head, usedLen); err != nil {
 			debug.Writef("virtio-fs.processQueue recordUsedElement", "head=%d error=%v", head, err)
 			return err
 		}
-		q.lastAvailIdx++
 		interruptNeeded = true
+
+		// A request may have changed lock state (unlock/close), so opportunistically
+		// drain pending SETLKW requests now.
+		if err := v.tryCompletePending(dev); err != nil {
+			return err
+		}
 	}
 	if interruptNeeded && (availFlags&1) == 0 {
 		debug.Writef("virtio-fs.processQueue raiseInterrupt", "bit=0x%x", fsInterruptBit)
@@ -623,16 +745,93 @@ type fsDesc struct {
 	nextID uint16
 }
 
-func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
+var errDeferReply = errors.New("virtio-fs: defer reply")
+
+func (v *FS) tryCompletePending(dev device) error {
+	if len(v.pending) == 0 {
+		return nil
+	}
+	dst := v.pending[:0]
+	for _, p := range v.pending {
+		q := dev.queue(p.qidx)
+		if q == nil || !q.ready || q.size == 0 {
+			// Can't complete right now; keep it pending.
+			dst = append(dst, p)
+			continue
+		}
+		availFlags, _, err := dev.readAvailState(q)
+		if err != nil {
+			dst = append(dst, p)
+			continue
+		}
+
+		// Attempt to dispatch again; if still blocked, keep pending.
+		respBuf := v.getBuffer(p.respCap)
+		clear(respBuf[:p.respCap])
+		used, err := v.dispatchFUSE(p.req, respBuf[:p.respCap])
+		if errors.Is(err, errDeferReply) {
+			v.putBuffer(respBuf)
+			dst = append(dst, p)
+			continue
+		}
+		if err != nil {
+			v.putBuffer(respBuf)
+			dst = append(dst, p)
+			continue
+		}
+		if used == 0 {
+			used = fuseHdrOutSize
+		}
+		if int(used) > p.respCap {
+			v.putBuffer(respBuf)
+			dst = append(dst, p)
+			continue
+		}
+
+		remaining := int(used)
+		copyOffset := 0
+		for _, d := range p.respDescs {
+			chunk := int(d.length)
+			if chunk == 0 {
+				continue
+			}
+			if chunk > remaining {
+				chunk = remaining
+			}
+			if chunk <= 0 {
+				break
+			}
+			_ = dev.writeGuest(d.addr, respBuf[copyOffset:copyOffset+chunk])
+			copyOffset += chunk
+			remaining -= chunk
+			if remaining == 0 {
+				break
+			}
+		}
+		v.putBuffer(respBuf)
+
+		if err := dev.recordUsedElement(q, p.head, used); err != nil {
+			dst = append(dst, p)
+			continue
+		}
+		if (availFlags & 1) == 0 {
+			dev.raiseInterrupt(fsInterruptBit)
+		}
+	}
+	v.pending = dst
+	return nil
+}
+
+func (v *FS) handleRequest(dev device, qidx int, q *queue, head uint16) (usedLen uint32, deferred bool, err error) {
 	// Expect a simple 2-descriptor chain: [in: request][out: reply]
 	descs, err := v.readDescriptorChain(dev, q, head)
 	if err != nil {
 		debug.Writef("virtio-fs.handleRequest readDescriptorChain", "head=%d error=%v", head, err)
-		return 0, err
+		return 0, false, err
 	}
 	if len(descs) == 0 {
 		debug.Writef("virtio-fs.handleRequest", "head=%d no descriptors", head)
-		return 0, errors.New("virtio-fs: no descriptors in request")
+		return 0, false, errors.New("virtio-fs: no descriptors in request")
 	}
 	debug.Writef("virtio-fs.handleRequest", "head=%d descs=%d", head, len(descs))
 
@@ -643,13 +842,13 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 			continue
 		}
 		if len(respDescs) != 0 {
-			return 0, errors.New("virtio-fs: read descriptor after write descriptor")
+			return 0, false, errors.New("virtio-fs: read descriptor after write descriptor")
 		}
 		reqDescs = append(reqDescs, d)
 	}
 	if len(reqDescs) == 0 {
 		debug.Writef("virtio-fs.handleRequest no request descriptors", "head=%d", head)
-		return 0, errors.New("virtio-fs: no request descriptors")
+		return 0, false, errors.New("virtio-fs: no request descriptors")
 	}
 
 	var reqLen int
@@ -658,7 +857,7 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 	}
 	if reqLen == 0 {
 		debug.Writef("virtio-fs.handleRequest empty request payload", "head=%d", head)
-		return 0, errors.New("virtio-fs: empty request payload")
+		return 0, false, errors.New("virtio-fs: empty request payload")
 	}
 	debug.Writef("virtio-fs.handleRequest", "reqDesc=%d reqLen=%d respDesc=%d", len(reqDescs), reqLen, len(respDescs))
 	reqBuf := v.getBuffer(reqLen)
@@ -674,7 +873,7 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 		seg, err := dev.readGuest(d.addr, d.length)
 		if err != nil {
 			debug.Writef("virtio-fs.handleRequest readGuest", "head=%d addr=0x%x len=%d error=%v", head, d.addr, d.length, err)
-			return 0, err
+			return 0, false, err
 		}
 		copy(reqBuf[copyOffset:], seg[:segLen])
 		copyOffset += segLen
@@ -684,10 +883,10 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 	if len(respDescs) == 0 {
 		if opcode == FUSE_FORGET {
 			debug.Writef("virtio-fs.handleRequest no resp (FORGET)", "head=%d opcode=%s", head, fuseOpcodeString(opcode))
-			return 0, nil
+			return 0, false, nil
 		}
 		debug.Writef("virtio-fs.handleRequest no response descriptors", "head=%d opcode=%s", head, fuseOpcodeString(opcode))
-		return 0, errors.New("virtio-fs: no response descriptors")
+		return 0, false, errors.New("virtio-fs: no response descriptors")
 	}
 
 	var respCap int
@@ -696,7 +895,7 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 	}
 	if respCap == 0 {
 		debug.Writef("virtio-fs.handleRequest respCap=0", "head=%d opcode=%s", head, fuseOpcodeString(opcode))
-		return 0, errors.New("virtio-fs: zero-length response buffer")
+		return 0, false, errors.New("virtio-fs: zero-length response buffer")
 	}
 	debug.Writef("virtio-fs.handleRequest", "respCap=%d head=%d opcode=%s", respCap, head, fuseOpcodeString(opcode))
 	respBuf := v.getBuffer(respCap)
@@ -706,15 +905,31 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 
 	used, err := v.dispatchFUSE(reqBuf[:reqLen], respBuf[:respCap])
 	if err != nil {
+		if errors.Is(err, errDeferReply) {
+			// Save a copy of the request and response descriptor list so we can complete later.
+			reqCopy := make([]byte, reqLen)
+			copy(reqCopy, reqBuf[:reqLen])
+			respCopy := make([]fsDesc, len(respDescs))
+			copy(respCopy, respDescs)
+			v.pending = append(v.pending, pendingReq{
+				qidx:      qidx,
+				head:      head,
+				opcode:    opcode,
+				req:       reqCopy,
+				respDescs: respCopy,
+				respCap:   respCap,
+			})
+			return 0, true, nil
+		}
 		debug.Writef("virtio-fs.handleRequest dispatch", "head=%d opcode=%s error=%v", head, fuseOpcodeString(opcode), err)
-		return 0, err
+		return 0, false, err
 	}
 	if used == 0 {
 		used = fuseHdrOutSize
 	} // ensure progress
 	if int(used) > respCap {
 		debug.Writef("virtio-fs.handleRequest too-large", "head=%d opcode=%s used=%d respCap=%d", head, fuseOpcodeString(opcode), used, respCap)
-		return 0, fmt.Errorf("virtio-fs: response too large (need %d, have %d)", used, respCap)
+		return 0, false, fmt.Errorf("virtio-fs: response too large (need %d, have %d)", used, respCap)
 	}
 	debug.Writef("virtio-fs.handleRequest", "used=%d head=%d opcode=%s", used, head, fuseOpcodeString(opcode))
 
@@ -730,7 +945,7 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 		}
 		if err := dev.writeGuest(d.addr, respBuf[copyOffset:copyOffset+chunk]); err != nil {
 			debug.Writef("virtio-fs.handleRequest writeGuest", "head=%d opcode=%s addr=0x%x chunk=%d error=%v", head, fuseOpcodeString(opcode), d.addr, chunk, err)
-			return 0, err
+			return 0, false, err
 		}
 		copyOffset += chunk
 		remaining -= chunk
@@ -740,10 +955,10 @@ func (v *FS) handleRequest(dev device, q *queue, head uint16) (uint32, error) {
 	}
 	if remaining != 0 {
 		debug.Writef("virtio-fs.handleRequest descriptors exhausted", "head=%d opcode=%s remaining=%d", head, fuseOpcodeString(opcode), remaining)
-		return 0, errors.New("virtio-fs: response descriptors exhausted")
+		return 0, false, errors.New("virtio-fs: response descriptors exhausted")
 	}
 
-	return used, nil
+	return used, false, nil
 }
 
 func (v *FS) readDescriptorChain(dev device, q *queue, head uint16) ([]fsDesc, error) {
@@ -816,8 +1031,12 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			return 0, fmt.Errorf("FUSE_INIT too short")
 		}
 		maj := binary.LittleEndian.Uint32(req[40:44])
+		min := binary.LittleEndian.Uint32(req[44:48])
+		reqFlags := binary.LittleEndian.Uint32(req[52:56])
 		_ = maj // we accept any >= 7
+		debug.Writef("virtio-fs.dispatchFUSE op=INIT req", "major=%d minor=%d reqFlags=0x%x", maj, min, reqFlags)
 		maxWrite, flags := v.backend.Init()
+		debug.Writef("virtio-fs.dispatchFUSE op=INIT resp", "flags=0x%x maxWrite=%d", flags, maxWrite)
 		var out fuseInitOut
 		out.Major = 7
 		out.Minor = 31
@@ -974,6 +1193,26 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
 		}
 
+	case FUSE_OPENDIR:
+		debug.Writef("virtio-fs.dispatchFUSE op=OPENDIR", "node=%d", in.NodeID)
+		if len(req) < fuseHdrInSize+8 {
+			return 0, fmt.Errorf("FUSE_OPENDIR too short")
+		}
+		flags := binary.LittleEndian.Uint32(req[40:44])
+		debug.Writef("virtio-fs.dispatchFUSE op=OPENDIR", "flags=0x%x", flags)
+		if be, ok := v.backend.(fsOpenDirBackend); ok {
+			fh, e := be.OpenDir(in.NodeID, flags)
+			errno = e
+			if errno == 0 {
+				// fuse_open_out (same layout as OPEN).
+				extra := make([]byte, 16)
+				binary.LittleEndian.PutUint64(extra[0:8], fh)
+				return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
 	case FUSE_RELEASE:
 		debug.Writef("virtio-fs.dispatchFUSE op=RELEASE", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+24 {
@@ -983,6 +1222,19 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		debug.Writef("virtio-fs.dispatchFUSE op=RELEASE", "fh=%d", fh)
 		v.backend.Release(in.NodeID, fh)
 		return w(fuseOutHeader{Len: fuseHdrOutSize, Error: 0, Unique: in.Unique}, nil), nil
+
+	case FUSE_RELEASEDIR:
+		debug.Writef("virtio-fs.dispatchFUSE op=RELEASEDIR", "node=%d", in.NodeID)
+		if len(req) < fuseHdrInSize+24 {
+			return 0, fmt.Errorf("FUSE_RELEASEDIR too short")
+		}
+		fh := binary.LittleEndian.Uint64(req[40:48])
+		debug.Writef("virtio-fs.dispatchFUSE op=RELEASEDIR", "fh=%d", fh)
+		if be, ok := v.backend.(fsOpenDirBackend); ok {
+			be.ReleaseDir(in.NodeID, fh)
+			return w(fuseOutHeader{Len: fuseHdrOutSize, Error: 0, Unique: in.Unique}, nil), nil
+		}
+		errno = -int32(linux.ENOSYS)
 
 	case FUSE_READ:
 		debug.Writef("virtio-fs.dispatchFUSE op=READ", "node=%d", in.NodeID)
@@ -1049,11 +1301,16 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			return 0, fmt.Errorf("FUSE_READDIR too short")
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
-		_ = fh // we don’t maintain dir handles in emptyBackend
 		off := binary.LittleEndian.Uint64(req[48:56])
 		size := binary.LittleEndian.Uint32(req[56:60])
-		debug.Writef("virtio-fs.dispatchFUSE op=READDIR", "off=%d size=%d", off, size)
-		payload, e := v.backend.ReadDir(in.NodeID, off, size)
+		debug.Writef("virtio-fs.dispatchFUSE op=READDIR", "fh=%d off=%d size=%d", fh, off, size)
+		var payload []byte
+		var e int32
+		if be, ok := v.backend.(fsReadDirHandleBackend); ok && fh != 0 {
+			payload, e = be.ReadDirHandle(in.NodeID, fh, off, size)
+		} else {
+			payload, e = v.backend.ReadDir(in.NodeID, off, size)
+		}
 		errno = e
 		if errno == 0 {
 			outLen := fuseHdrOutSize + uint32(len(payload))
@@ -1073,15 +1330,36 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		newParent := binary.LittleEndian.Uint64(req[40:48])
 		nameStart := fuseHdrInSize + 8
 		flags := uint32(0)
-		if len(req) >= fuseHdrInSize+16 {
-			flags = binary.LittleEndian.Uint32(req[48:52])
-		}
 		oldName, rest := readCString(req[nameStart:])
 		if rest == nil {
 			return 0, fmt.Errorf("FUSE_RENAME missing new name")
 		}
 		newName := readName(rest)
 		debug.Writef("virtio-fs.dispatchFUSE op=RENAME", "oldName=%q newParent=%d newName=%q flags=0x%x", oldName, newParent, newName, flags)
+		if be, ok := v.backend.(fsRenameBackend); ok {
+			errno = be.Rename(in.NodeID, oldName, newParent, newName, flags)
+			if errno == 0 {
+				return w(fuseOutHeader{Len: fuseHdrOutSize, Error: 0, Unique: in.Unique}, nil), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_RENAME2:
+		debug.Writef("virtio-fs.dispatchFUSE op=RENAME2", "oldParent=%d", in.NodeID)
+		// fuse_rename2_in: newdir (u64), flags (u32), padding (u32)
+		if len(req) < fuseHdrInSize+16 {
+			return 0, fmt.Errorf("FUSE_RENAME2 too short")
+		}
+		newParent := binary.LittleEndian.Uint64(req[40:48])
+		flags := binary.LittleEndian.Uint32(req[48:52])
+		nameStart := fuseHdrInSize + 16
+		oldName, rest := readCString(req[nameStart:])
+		if rest == nil {
+			return 0, fmt.Errorf("FUSE_RENAME2 missing new name")
+		}
+		newName := readName(rest)
+		debug.Writef("virtio-fs.dispatchFUSE op=RENAME2", "oldName=%q newParent=%d newName=%q flags=0x%x", oldName, newParent, newName, flags)
 		if be, ok := v.backend.(fsRenameBackend); ok {
 			errno = be.Rename(in.NodeID, oldName, newParent, newName, flags)
 			if errno == 0 {
@@ -1131,7 +1409,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			return 0, fmt.Errorf("FUSE_SETXATTR value short")
 		}
 		if be, ok := v.backend.(fsXattrBackend); ok {
-			errno = be.SetXattr(in.NodeID, name, value[:size], flags)
+			errno = be.SetXattr(in.NodeID, name, value[:size], flags, in.UID, in.GID)
 			if errno == 0 {
 				return w(fuseOutHeader{Len: fuseHdrOutSize, Error: 0, Unique: in.Unique}, nil), nil
 			}
@@ -1157,7 +1435,9 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 					return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
 				}
 				if uint32(len(value)) > size {
-					value = value[:size]
+					// Correct semantics: buffer too small -> ERANGE (do not truncate).
+					errno = -int32(linux.ERANGE)
+					break
 				}
 				outLen := fuseHdrOutSize + uint32(len(value))
 				if int(outLen) > len(resp) {
@@ -1166,6 +1446,53 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 				}
 				copy(resp[fuseHdrOutSize:], value)
 				return w(fuseOutHeader{Len: outLen, Error: 0, Unique: in.Unique}, nil), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_LISTXATTR:
+		debug.Writef("virtio-fs.dispatchFUSE op=LISTXATTR", "node=%d", in.NodeID)
+		if len(req) < fuseHdrInSize+8 {
+			return 0, fmt.Errorf("FUSE_LISTXATTR too short")
+		}
+		// fuse_getxattr_in: size (u32) + padding (u32)
+		size := binary.LittleEndian.Uint32(req[40:44])
+		debug.Writef("virtio-fs.dispatchFUSE op=LISTXATTR", "size=%d", size)
+		if be, ok := v.backend.(fsXattrBackend); ok {
+			list, e := be.ListXattr(in.NodeID)
+			errno = e
+			if errno == 0 {
+				if size == 0 {
+					extra := make([]byte, 8)
+					binary.LittleEndian.PutUint32(extra[0:4], uint32(len(list)))
+					return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
+				}
+				if uint32(len(list)) > size {
+					// Correct semantics: buffer too small -> ERANGE (do not truncate).
+					errno = -int32(linux.ERANGE)
+					break
+				}
+				outLen := fuseHdrOutSize + uint32(len(list))
+				if int(outLen) > len(resp) {
+					list = list[:len(resp)-fuseHdrOutSize]
+					outLen = uint32(len(resp))
+				}
+				copy(resp[fuseHdrOutSize:], list)
+				return w(fuseOutHeader{Len: outLen, Error: 0, Unique: in.Unique}, nil), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_REMOVEXATTR:
+		debug.Writef("virtio-fs.dispatchFUSE op=REMOVEXATTR", "node=%d", in.NodeID)
+		name := readName(req[fuseHdrInSize:])
+		debug.Writef("virtio-fs.dispatchFUSE op=REMOVEXATTR", "name=%q", name)
+		if be, ok := v.backend.(fsXattrBackend); ok {
+			errno = be.RemoveXattr(in.NodeID, name)
+			if errno == 0 {
+				return w(fuseOutHeader{Len: fuseHdrOutSize, Error: 0, Unique: in.Unique}, nil), nil
 			}
 		} else {
 			errno = -int32(linux.ENOSYS)
@@ -1252,6 +1579,10 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		const fattrUid = 1 << 1
 		const fattrGid = 1 << 2
 		const fattrSize = 1 << 3
+		const fattrAtime = 1 << 4
+		const fattrMtime = 1 << 5
+		const fattrAtimeNow = 1 << 7
+		const fattrMtimeNow = 1 << 8
 		var sizeVal *uint64
 		if valid&fattrSize != 0 {
 			val := binary.LittleEndian.Uint64(req[56:64])
@@ -1297,10 +1628,43 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 				gidVal = &val
 			}
 		}
+		var atimeVal *time.Time
+		var mtimeVal *time.Time
+		// atime/mtime are at offsets 72/80 with nsec at 96/100 (see comment above).
+		// FUSE uses u64 seconds/u32 nsec; seconds may represent negative values in
+		// two's complement (pre-epoch).
+		if (valid&(fattrAtime|fattrAtimeNow)) != 0 && len(req) >= 104 {
+			sec := int64(binary.LittleEndian.Uint64(req[72:80]))
+			nsec := binary.LittleEndian.Uint32(req[96:100])
+			switch {
+			case valid&fattrAtimeNow != 0 || nsec == uint32(linux.UTIME_NOW):
+				t := time.Now()
+				atimeVal = &t
+			case nsec == uint32(linux.UTIME_OMIT):
+				// omit
+			default:
+				t := time.Unix(sec, int64(nsec))
+				atimeVal = &t
+			}
+		}
+		if (valid&(fattrMtime|fattrMtimeNow)) != 0 && len(req) >= 104 {
+			sec := int64(binary.LittleEndian.Uint64(req[80:88]))
+			nsec := binary.LittleEndian.Uint32(req[100:104])
+			switch {
+			case valid&fattrMtimeNow != 0 || nsec == uint32(linux.UTIME_NOW):
+				t := time.Now()
+				mtimeVal = &t
+			case nsec == uint32(linux.UTIME_OMIT):
+				// omit
+			default:
+				t := time.Unix(sec, int64(nsec))
+				mtimeVal = &t
+			}
+		}
 		if be, ok := v.backend.(fsSetattrBackend); ok {
-			errno = be.SetAttr(in.NodeID, sizeVal, modeVal, uidVal, gidVal)
+			errno = be.SetAttr(in.NodeID, sizeVal, modeVal, uidVal, gidVal, atimeVal, mtimeVal, in.UID, in.GID)
 			if errno == 0 {
-				debug.Writef("virtio-fs.dispatchFUSE op=SETATTR applied", "size=%v mode=%v uid=%v gid=%v", sizeVal, modeVal, uidVal, gidVal)
+				debug.Writef("virtio-fs.dispatchFUSE op=SETATTR applied", "size=%v mode=%v uid=%v gid=%v atime=%v mtime=%v", sizeVal, modeVal, uidVal, gidVal, atimeVal, mtimeVal)
 				attr, e := v.backend.GetAttr(in.NodeID)
 				errno = e
 				if errno == 0 {
@@ -1324,6 +1688,12 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		offset := binary.LittleEndian.Uint64(req[48:56])
 		whence := binary.LittleEndian.Uint32(req[56:60])
+		// lseek offsets are signed; negative offsets are encoded in two's complement.
+		// xfstests expects ENXIO for negative SEEK_HOLE/SEEK_DATA offsets.
+		if int64(offset) < 0 {
+			errno = -int32(linux.ENXIO)
+			break
+		}
 		debug.Writef("virtio-fs.dispatchFUSE op=LSEEK", "fh=%d offset=%d whence=%d", fh, offset, whence)
 		if be, ok := v.backend.(fsLseekBackend); ok {
 			newOff, e := be.Lseek(in.NodeID, fh, offset, whence)
@@ -1333,6 +1703,89 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 				extra := make([]byte, 8)
 				binary.LittleEndian.PutUint64(extra[0:8], newOff)
 				return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_FALLOCATE:
+		// fuse_fallocate_in: fh (u64), offset (u64), length (u64), mode (u32), padding (u32)
+		debug.Writef("virtio-fs.dispatchFUSE op=FALLOCATE", "node=%d", in.NodeID)
+		if len(req) < fuseHdrInSize+32 {
+			return 0, fmt.Errorf("FUSE_FALLOCATE too short")
+		}
+		fh := binary.LittleEndian.Uint64(req[40:48])
+		off := binary.LittleEndian.Uint64(req[48:56])
+		length := binary.LittleEndian.Uint64(req[56:64])
+		mode := binary.LittleEndian.Uint32(req[64:68])
+		// Negative offsets/lengths are encoded in two's complement; treat as invalid.
+		if int64(off) < 0 || int64(length) < 0 {
+			errno = -int32(linux.EINVAL)
+			break
+		}
+		debug.Writef("virtio-fs.dispatchFUSE op=FALLOCATE", "fh=%d off=%d len=%d mode=0x%x", fh, off, length, mode)
+		if be, ok := v.backend.(fsFallocateBackend); ok {
+			errno = be.Fallocate(in.NodeID, fh, off, length, mode)
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_GETLK:
+		debug.Writef("virtio-fs.dispatchFUSE op=GETLK", "node=%d", in.NodeID)
+		// fuse_lk_in: fh (u64), owner (u64), fuse_file_lock (start u64, end u64, type u32, pid u32), lk_flags (u32), padding (u32)
+		if len(req) < fuseHdrInSize+48 {
+			return 0, fmt.Errorf("FUSE_GETLK too short")
+		}
+		fh := binary.LittleEndian.Uint64(req[40:48])
+		owner := binary.LittleEndian.Uint64(req[48:56])
+		lkStart := binary.LittleEndian.Uint64(req[56:64])
+		lkEnd := binary.LittleEndian.Uint64(req[64:72])
+		lkType := binary.LittleEndian.Uint32(req[72:76])
+		lkPID := binary.LittleEndian.Uint32(req[76:80])
+		lkFlags := binary.LittleEndian.Uint32(req[80:84])
+		lk := FuseLock{Start: lkStart, End: lkEnd, Type: lkType, PID: lkPID}
+		debug.Writef("virtio-fs.dispatchFUSE op=GETLK", "fh=%d owner=%d lk=%+v flags=%d", fh, owner, lk, lkFlags)
+		if be, ok := v.backend.(fsLockBackend); ok {
+			outLk, e := be.GetLk(in.NodeID, fh, owner, lk, lkFlags)
+			errno = e
+			if errno == 0 {
+				// fuse_lk_out: fuse_file_lock
+				extra := make([]byte, 24)
+				binary.LittleEndian.PutUint64(extra[0:8], outLk.Start)
+				binary.LittleEndian.PutUint64(extra[8:16], outLk.End)
+				binary.LittleEndian.PutUint32(extra[16:20], outLk.Type)
+				binary.LittleEndian.PutUint32(extra[20:24], outLk.PID)
+				return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
+			}
+		} else {
+			errno = -int32(linux.ENOSYS)
+		}
+
+	case FUSE_SETLK, FUSE_SETLKW:
+		opName := "SETLK"
+		if in.Opcode == FUSE_SETLKW {
+			opName = "SETLKW"
+		}
+		debug.Writef("virtio-fs.dispatchFUSE op="+opName, "node=%d", in.NodeID)
+		if len(req) < fuseHdrInSize+48 {
+			return 0, fmt.Errorf("FUSE_%s too short", opName)
+		}
+		fh := binary.LittleEndian.Uint64(req[40:48])
+		owner := binary.LittleEndian.Uint64(req[48:56])
+		lkStart := binary.LittleEndian.Uint64(req[56:64])
+		lkEnd := binary.LittleEndian.Uint64(req[64:72])
+		lkType := binary.LittleEndian.Uint32(req[72:76])
+		lkPID := binary.LittleEndian.Uint32(req[76:80])
+		lkFlags := binary.LittleEndian.Uint32(req[80:84])
+		lk := FuseLock{Start: lkStart, End: lkEnd, Type: lkType, PID: lkPID}
+		debug.Writef("virtio-fs.dispatchFUSE op="+opName, "fh=%d owner=%d lk=%+v flags=%d", fh, owner, lk, lkFlags)
+		if be, ok := v.backend.(fsLockBackend); ok {
+			// IMPORTANT: Do NOT block inside dispatch. This runs on the VM/device thread.
+			// For SETLKW, we attempt a non-blocking acquisition and if it would block we
+			// defer replying (see errDeferReply handling in handleRequest/processQueue).
+			errno = be.SetLk(in.NodeID, fh, owner, lk, lkFlags)
+			if in.Opcode == FUSE_SETLKW && errno == -int32(linux.EAGAIN) {
+				return 0, errDeferReply
 			}
 		} else {
 			errno = -int32(linux.ENOSYS)
@@ -1357,7 +1810,33 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 			putU32(48, uint32(fr))
 			return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
 		}
+	case FUSE_DESTROY:
+		// Nothing to do; the guest is indicating unmount.
+		debug.Writef("virtio-fs.dispatchFUSE op=DESTROY", "node=%d", in.NodeID)
+
+	case FUSE_FLUSH:
+		// fuse_flush_in: fh (u64), unused (u32), padding (u32), lock_owner (u64)
+		// Linux uses lock_owner for POSIX lock cleanup on close.
+		debug.Writef("virtio-fs.dispatchFUSE op=FLUSH", "node=%d", in.NodeID)
+		if len(req) < fuseHdrInSize+24 {
+			return 0, fmt.Errorf("FUSE_FLUSH too short")
+		}
+		fh := binary.LittleEndian.Uint64(req[40:48])
+		lockOwner := binary.LittleEndian.Uint64(req[56:64])
+		debug.Writef("virtio-fs.dispatchFUSE op=FLUSH", "fh=%d lockOwner=%d", fh, lockOwner)
+		if be, ok := v.backend.(fsFlushBackend); ok {
+			errno = be.Flush(in.NodeID, fh, lockOwner)
+		} else {
+			errno = 0
+		}
+
+	case FUSE_IOCTL, FUSE_POLL:
+		// Unsupported but expected; return ENOSYS quietly.
+		debug.Writef("virtio-fs.dispatchFUSE op unsupported", "opcode=%s node=%d", fuseOpcodeString(in.Opcode), in.NodeID)
+		errno = -int32(linux.ENOSYS)
+
 	default:
+		slog.Debug("virtio-fs.dispatchFUSE unsupported", "opcode", fuseOpcodeString(in.Opcode))
 		debug.Writef("virtio-fs.dispatchFUSE unsupported", "opcode=%s", fuseOpcodeString(in.Opcode))
 		errno = -int32(linux.ENOSYS)
 	}
@@ -1422,6 +1901,18 @@ func fuseOpcodeString(op uint32) string {
 		return "RENAME2"
 	case FUSE_LSEEK:
 		return "LSEEK"
+	case FUSE_GETLK:
+		return "GETLK"
+	case FUSE_SETLK:
+		return "SETLK"
+	case FUSE_SETLKW:
+		return "SETLKW"
+	case FUSE_DESTROY:
+		return "DESTROY"
+	case FUSE_IOCTL:
+		return "IOCTL"
+	case FUSE_POLL:
+		return "POLL"
 	default:
 		return fmt.Sprintf("OP(%d)", op)
 	}

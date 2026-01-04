@@ -109,6 +109,9 @@ func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
 		ir.Syscall(defs.SYS_MOUNT, "sysfs", "/mnt/sys", "sysfs", ir.Int64(0), ""),
 		ir.Syscall(defs.SYS_MOUNT, "devtmpfs", "/mnt/dev", "devtmpfs", ir.Int64(0), ""),
 
+		// Mount tmp
+		ir.Syscall(defs.SYS_MOUNT, "tmpfs", "/mnt/tmp", "tmpfs", ir.Int64(0), "mode=1777"),
+
 		// Mount /dev/shm (wlroots/xkbcommon use it for shm-backed buffers like keymaps).
 		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt/dev/shm", ir.Int64(0o1777)),
 		ir.Syscall(defs.SYS_MOUNT, "tmpfs", "/mnt/dev/shm", "tmpfs", ir.Int64(0), "mode=1777"),
@@ -166,11 +169,26 @@ func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
 			ir.Goto(errLabel),
 		}),
 
+		// /dev/fd symlink to /proc/self/fd
+		ir.Assign(errVar, ir.Syscall(defs.SYS_SYMLINKAT, "/proc/self/fd", ir.Int64(linux.AT_FDCWD), "/dev/fd")),
+		ir.If(ir.IsNegative(errVar), ir.Block{
+			ir.Printf("cc: failed to symlink /proc/self/fd to /dev/fd: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+			ir.Goto(errLabel),
+		}),
+
 		LogKmsg("cc: mounted devpts\n"),
 
 		// Set hostname.
 		SetHostname(cfg.Hostname, errLabel, errVar),
 		LogKmsg("cc: set hostname to container name\n"),
+
+		// Always configure loopback interface for localhost networking.
+		ConfigureLoopback(errLabel, errVar),
+		LogKmsg("cc: configured loopback interface\n"),
+
+		// Set up /etc/hosts for localhost resolution (optional, don't fail if it doesn't work).
+		SetHostsOptional(cfg.Hostname),
+		LogKmsg("cc: configured /etc/hosts\n"),
 	}
 
 	// Configure network interface if networking is enabled.

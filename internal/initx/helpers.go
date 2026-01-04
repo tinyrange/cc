@@ -705,6 +705,80 @@ func copyStringToSlot(slot ir.StackSlot, s string) ir.Fragment {
 	return ir.Block(frags)
 }
 
+// ConfigureLoopback brings up the loopback interface (lo) with IP 127.0.0.1.
+// This is needed for localhost networking (e.g., tests that use TCP on localhost).
+func ConfigureLoopback(errLabel ir.Label, errVar ir.Var) ir.Fragment {
+	return ir.WithStackSlot(ir.StackSlotConfig{
+		Size: 40, // sizeof(struct ifreq)
+		Body: func(slot ir.StackSlot) ir.Fragment {
+			fd := nextHelperVar("lo_fd")
+			ptr := nextHelperVar("lo_ptr")
+			ioctlErr := nextHelperVar("lo_ioctl_err")
+			tmp32 := nextHelperVar("lo_tmp32")
+
+			// lo is 127.0.0.1 / 255.0.0.0
+			// IP in "visual" format: 0x7F000001
+			// Mask in "visual" format: 0xFF000000
+			// We need to byte-swap to network byte order.
+			// 127.0.0.1 in network order = 0x0100007F
+			// 255.0.0.0 in network order = 0x000000FF
+			loIP := int64(0x0100007F)   // 127.0.0.1 in network byte order (little-endian host)
+			loMask := int64(0x000000FF) // 255.0.0.0 in network byte order (little-endian host)
+			familyPort := int64(linux.AF_INET)
+			flagsVal := int64(linux.IFF_UP)
+
+			return ir.Block{
+				ir.Assign(fd, ir.Syscall(defs.SYS_SOCKET, ir.Int64(linux.AF_INET), ir.Int64(linux.SOCK_DGRAM), ir.Int64(0))),
+				ir.Assign(errVar, fd),
+				ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
+
+				ir.Assign(ptr, slot.Pointer()),
+
+				// Zero out entire ifreq structure first
+				ir.Assign(slot.At(0), ir.Int64(0)),
+				ir.Assign(slot.At(8), ir.Int64(0)),
+				ir.Assign(slot.At(16), ir.Int64(0)),
+				ir.Assign(slot.At(24), ir.Int64(0)),
+				ir.Assign(slot.At(32), ir.Int64(0)),
+
+				// Copy interface name to ifreq.ifrn_name (offset 0-15): "lo"
+				copyStringToSlot(slot, "lo"),
+
+				// Set IP address first
+				ir.Assign(tmp32, ir.Int64(familyPort)),
+				ir.Assign(slot.At(16), tmp32.As32()),
+				ir.Assign(tmp32, ir.Int64(loIP)),
+				ir.Assign(slot.At(20), tmp32.As32()),
+				ir.Assign(ioctlErr, ir.Syscall(defs.SYS_IOCTL, fd, ir.Int64(linux.SIOCSIFADDR), ptr)),
+
+				// Set netmask
+				copyStringToSlot(slot, "lo"),
+				ir.Assign(slot.At(16), ir.Int64(0)),
+				ir.Assign(slot.At(24), ir.Int64(0)),
+				ir.Assign(slot.At(32), ir.Int64(0)),
+				ir.Assign(tmp32, ir.Int64(familyPort)),
+				ir.Assign(slot.At(16), tmp32.As32()),
+				ir.Assign(tmp32, ir.Int64(loMask)),
+				ir.Assign(slot.At(20), tmp32.As32()),
+				ir.Assign(ioctlErr, ir.Syscall(defs.SYS_IOCTL, fd, ir.Int64(linux.SIOCSIFNETMASK), ptr)),
+
+				// Bring up interface
+				copyStringToSlot(slot, "lo"),
+				ir.Assign(slot.At(16), ir.Int64(flagsVal)),
+				ir.Assign(ioctlErr, ir.Syscall(defs.SYS_IOCTL, fd, ir.Int64(linux.SIOCSIFFLAGS), ptr)),
+				ir.Assign(errVar, ioctlErr),
+				ir.If(ir.IsNegative(ioctlErr), ir.Block{
+					ir.Syscall(defs.SYS_CLOSE, fd),
+					ir.Goto(errLabel),
+				}),
+
+				ir.Syscall(defs.SYS_CLOSE, fd),
+				ir.Assign(errVar, ir.Int64(0)),
+			}
+		},
+	})
+}
+
 // GetInterfaceIndex gets the interface index for a given interface name using SIOCGIFINDEX.
 // Returns the ifindex in errVar on success, negative errno on failure.
 func GetInterfaceIndex(ifName string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
@@ -932,6 +1006,105 @@ func SetResolvConf(dnsServer string, errLabel ir.Label, errVar ir.Var) ir.Fragme
 		// Close the file
 		ir.Assign(errVar, ir.Syscall(defs.SYS_CLOSE, fd)),
 		ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
+	}
+}
+
+// SetHosts sets up /etc/hosts with localhost entries.
+func SetHosts(hostname string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
+	// Standard /etc/hosts content
+	content := "127.0.0.1\tlocalhost\n::1\t\tlocalhost ip6-localhost ip6-loopback\n"
+	if hostname != "" && hostname != "localhost" {
+		content += "127.0.0.1\t" + hostname + "\n"
+	}
+
+	fd := nextHelperVar("hosts_fd")
+	contentPtr := nextHelperVar("hosts_content_ptr")
+	contentLen := nextHelperVar("hosts_content_len")
+
+	return ir.Block{
+		// Load the content string and get a pointer to it
+		ir.LoadConstantBytesConfig(ir.ConstantBytesConfig{
+			Target:  nextExecVar(),
+			Data:    []byte(content),
+			Pointer: contentPtr,
+			Length:  contentLen,
+		}),
+
+		// Open /etc/hosts for writing, create if it doesn't exist, truncate if it does
+		ir.Assign(fd, ir.Syscall(
+			defs.SYS_OPENAT,
+			ir.Int64(linux.AT_FDCWD),
+			"/etc/hosts",
+			ir.Int64(linux.O_WRONLY|linux.O_CREAT|linux.O_TRUNC),
+			ir.Int64(0o644),
+		)),
+		ir.Assign(errVar, fd),
+		ir.If(ir.IsNegative(errVar), ir.Block{
+			ir.Printf("cc: failed to open /etc/hosts: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+			ir.Goto(errLabel),
+		}),
+
+		// Write the content
+		ir.Assign(errVar, ir.Syscall(
+			defs.SYS_WRITE,
+			fd,
+			contentPtr,
+			contentLen,
+		)),
+		ir.If(ir.IsNegative(errVar), ir.Block{
+			ir.Printf("cc: failed to write /etc/hosts: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+			ir.Syscall(defs.SYS_CLOSE, fd),
+			ir.Goto(errLabel),
+		}),
+
+		// Close the file
+		ir.Assign(errVar, ir.Syscall(defs.SYS_CLOSE, fd)),
+		ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
+	}
+}
+
+// SetHostsOptional is like SetHosts but doesn't fail if the file can't be written.
+func SetHostsOptional(hostname string) ir.Fragment {
+	// Standard /etc/hosts content
+	content := "127.0.0.1\tlocalhost\n::1\t\tlocalhost ip6-localhost ip6-loopback\n"
+	if hostname != "" && hostname != "localhost" {
+		content += "127.0.0.1\t" + hostname + "\n"
+	}
+
+	fd := nextHelperVar("hostsopt_fd")
+	contentPtr := nextHelperVar("hostsopt_content_ptr")
+	contentLen := nextHelperVar("hostsopt_content_len")
+	errVar := nextHelperVar("hostsopt_err")
+
+	return ir.Block{
+		// Load the content string and get a pointer to it
+		ir.LoadConstantBytesConfig(ir.ConstantBytesConfig{
+			Target:  nextExecVar(),
+			Data:    []byte(content),
+			Pointer: contentPtr,
+			Length:  contentLen,
+		}),
+
+		// Open /etc/hosts for writing, create if it doesn't exist, truncate if it does
+		ir.Assign(fd, ir.Syscall(
+			defs.SYS_OPENAT,
+			ir.Int64(linux.AT_FDCWD),
+			"/etc/hosts",
+			ir.Int64(linux.O_WRONLY|linux.O_CREAT|linux.O_TRUNC),
+			ir.Int64(0o644),
+		)),
+		ir.Assign(errVar, fd),
+		ir.If(ir.IsGreaterOrEqual(fd, ir.Int64(0)), ir.Block{
+			// Write the content (ignore errors)
+			ir.Syscall(
+				defs.SYS_WRITE,
+				fd,
+				contentPtr,
+				contentLen,
+			),
+			// Close the file
+			ir.Syscall(defs.SYS_CLOSE, fd),
+		}),
 	}
 }
 

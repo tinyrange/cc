@@ -141,6 +141,7 @@ func run() error {
 	flag.Var(&execFlag, "exec", "Execute the entrypoint as PID 1 taking over init")
 	gpu := flag.Bool("gpu", false, "Enable GPU and create a window")
 	termWin := flag.Bool("term", false, "Open a terminal window and connect it to the VM console")
+	addVirtioFs := flag.String("add-virtiofs", "", "Specify a comma-separated list of blank virtio-fs tags to create")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <image> [command] [args...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Run a command inside an OCI container image in a virtual machine.\n\n")
@@ -151,6 +152,17 @@ func run() error {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	var virtioFsTags []string
+
+	if *addVirtioFs != "" {
+		virtioFsTags = strings.Split(*addVirtioFs, ",")
+		for _, tag := range virtioFsTags {
+			if tag == "" {
+				return fmt.Errorf("empty virtio-fs tag")
+			}
+		}
+	}
 
 	if *debugFile != "" {
 		if err := debug.OpenFile(*debugFile); err != nil {
@@ -389,6 +401,18 @@ func run() error {
 		}),
 		initx.WithDebugLogging(*dbg),
 		initx.WithDmesgLogging(dmesgFlag.v),
+	}
+
+	base := uint64(0xd0006000)
+
+	for _, tag := range virtioFsTags {
+		opts = append(opts, initx.WithDeviceTemplate(virtio.FSTemplate{
+			Tag:      tag,
+			Backend:  vfs.NewVirtioFsBackendWithAbstract(),
+			MMIOBase: base,
+			Arch:     hvArch,
+		}))
+		base += 0x2000
 	}
 
 	var termWindow *termwin.Terminal
