@@ -26,7 +26,7 @@ type TimesliceID uint64
 
 const InvalidTimesliceID = TimesliceID(0)
 
-var TimesliceInit = RegisterKind("init", 0)
+var TimesliceInit = RegisterKind("init", SliceFlagInitTime)
 
 type SliceInfo struct {
 	Name  string
@@ -40,11 +40,15 @@ func (f SliceFlags) String() string {
 	if f&SliceFlagGuestTime != 0 {
 		flags = append(flags, "guest")
 	}
+	if f&SliceFlagInitTime != 0 {
+		flags = append(flags, "init")
+	}
 	return strings.Join(flags, ",")
 }
 
 const (
 	SliceFlagGuestTime SliceFlags = 1 << iota
+	SliceFlagInitTime
 )
 
 var timeslices = make(map[TimesliceID]SliceInfo)

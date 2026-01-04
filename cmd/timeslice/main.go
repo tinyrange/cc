@@ -9,6 +9,36 @@ import (
 	"github.com/tinyrange/cc/internal/timeslice"
 )
 
+type timesliceRecord struct {
+	ID    string
+	Flags timeslice.SliceFlags
+	Count int
+	Sum   time.Duration
+	Min   time.Duration
+	Max   time.Duration
+}
+
+func (r *timesliceRecord) String() string {
+	return fmt.Sprintf("% 20s flags=% 10s count=% 8d sum=% 16s min=% 16s max=% 16s avg=% 16s",
+		r.ID, r.Flags, r.Count,
+		r.Sum,
+		r.Min,
+		r.Max,
+		r.Sum/time.Duration(r.Count),
+	)
+}
+
+func (r *timesliceRecord) Add(duration time.Duration) {
+	r.Count++
+	r.Sum += duration
+	if r.Min == 0 || duration < r.Min {
+		r.Min = duration
+	}
+	if r.Max == 0 || duration > r.Max {
+		r.Max = duration
+	}
+}
+
 func main() {
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
@@ -32,16 +62,21 @@ func main() {
 	defer f.Close()
 
 	if *sums {
-		sums := map[string]time.Duration{}
+		records := map[string]*timesliceRecord{}
 		if err := timeslice.ReadAllRecords(f, func(id string, flags timeslice.SliceFlags, duration time.Duration) error {
-			sums[id] += duration
+			record, ok := records[id]
+			if !ok {
+				record = &timesliceRecord{ID: id, Flags: flags}
+				records[id] = record
+			}
+			record.Add(duration)
 			return nil
 		}); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to read timeslice file: %v\n", err)
 			os.Exit(1)
 		}
-		for id, sum := range sums {
-			fmt.Printf("%s %s\n", id, sum)
+		for _, record := range records {
+			fmt.Printf("%s\n", record.String())
 		}
 	} else {
 		if err := timeslice.ReadAllRecords(f, func(id string, flags timeslice.SliceFlags, duration time.Duration) error {

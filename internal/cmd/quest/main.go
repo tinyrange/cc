@@ -40,6 +40,7 @@ import (
 	amd64defs "github.com/tinyrange/cc/internal/linux/defs/amd64"
 	"github.com/tinyrange/cc/internal/linux/kernel"
 	"github.com/tinyrange/cc/internal/netstack"
+	"github.com/tinyrange/cc/internal/timeslice"
 	"github.com/tinyrange/cc/internal/vfs"
 )
 
@@ -1463,6 +1464,19 @@ func RunExecutable(path string, gpuEnabled bool) error {
 			debug.Writef("bringup-quest.RunExecutable open debug file", "filename=%s", os.Getenv("CC_DEBUG_FILE"))
 		}
 		debug.Writef("bringup-quest.RunExecutable debug memory enabled", "")
+	}
+
+	if os.Getenv("CC_TIMESLICE_FILE") != "" {
+		f, err := os.Create(os.Getenv("CC_TIMESLICE_FILE"))
+		if err != nil {
+			return fmt.Errorf("create timeslice file: %w", err)
+		}
+		defer f.Close()
+		w, err := timeslice.Open(f)
+		if err != nil {
+			return fmt.Errorf("open timeslice file: %w", err)
+		}
+		defer w.Close()
 	}
 
 	hv, err := factory.Open()
