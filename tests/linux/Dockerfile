@@ -13,7 +13,8 @@ RUN apk add --no-cache \
     flex \
     perl \
     openssl-dev \
-    ncurses-dev
+    ncurses-dev \
+    linux-headers
 
 # Download and extract the Linux kernel archive
 WORKDIR /build

@@ -16,13 +16,16 @@ CrumbleCracker is a high performance embeddable virtualization platform designed
 
 **Stage 2 is stability and speed**
 
+_Part 1_
+
 - [x] Fix macOS arm64
 - [x] Fix Windows amd64
 - [x] Fix Linux arm64
 - [x] Fix Windows arm64
-- [ ] Get a more advanced desktop running (like XFCE)
-- [ ] Fix Linux Compile Errors (issues with Virtio-fs)
-- [ ] Fix Ubuntu boot (issues with `/etc/resolv.conf`)
+- [x] Fix Linux Compile Errors (issues with Virtio-fs)
+- [x] Fix Ubuntu boot (issues with `/etc/resolv.conf`)
+
+_Part 2_
 
 - [ ] Add benchmarking (both Golang and Tests)
 - [ ] Add snapshot support for Linux boot and Benchmark and improve KVM AMD64
@@ -33,6 +36,8 @@ CrumbleCracker is a high performance embeddable virtualization platform designed
 - [ ] Benchmark and improve Networking
 - [ ] Benchmark and improve Filesystem
 - [ ] Benchmark and improve Console
+
+- [ ] Get a more advanced desktop running (like XFCE)
 
 **Stage 3 is Developer Experience and Public Beta**
 
