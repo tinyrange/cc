@@ -135,6 +135,10 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	// clear immediate_exit in case it was set
 	run.immediate_exit = 0
 
+	debug.Writef("kvm-arm64.Run run", "vCPU %d running", v.id)
+
+	timeslice.Record(tsKvmHostTime)
+
 	// keep trying to run the vCPU until it exits or an error occurs
 	for {
 		_, err := ioctl(uintptr(v.fd), uint64(kvmRun), 0)
@@ -166,7 +170,9 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	case kvmExitMmio:
 		mmioData := (*kvmExitMMIOData)(unsafe.Pointer(&run.anon0[0]))
 
-		return v.handleMMIO(exitCtx, mmioData)
+		if err := v.handleMMIO(exitCtx, mmioData); err != nil {
+			return fmt.Errorf("handle MMIO: %w", err)
+		}
 	case kvmExitSystemEvent:
 		system := (*kvmSystemEvent)(unsafe.Pointer(&run.anon0[0]))
 		if system.typ == uint32(kvmSystemEventShutdown) {
@@ -178,6 +184,12 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	default:
 		return fmt.Errorf("kvm: vCPU %d exited with reason %s", v.id, reason)
 	}
+
+	if exitCtx.timeslice != timeslice.InvalidTimesliceID {
+		timeslice.Record(exitCtx.timeslice)
+	}
+
+	return nil
 }
 
 func (v *virtualCPU) handleMMIO(exitCtx *exitContext, mmioData *kvmExitMMIOData) error {

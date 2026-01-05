@@ -18,6 +18,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+var (
+	tsKvmHostTime  = timeslice.RegisterKind("kvm_host_time", 0)
+	tsKvmGuestTime = timeslice.RegisterKind("kvm_guest_time", timeslice.SliceFlagGuestTime)
+)
+
 type exitContext struct {
 	timeslice timeslice.TimesliceID
 }
@@ -598,9 +603,9 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 			unix.Munmap(mem)
 			return nil, fmt.Errorf("madvise memory: %w", err)
 		}
-	}
 
-	timeslice.Record(tsKvmMadviseGuestMemory)
+		timeslice.Record(tsKvmMadviseGuestMemory)
+	}
 
 	vm.memory = mem
 	vm.memoryBase = config.MemoryBase()

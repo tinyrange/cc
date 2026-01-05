@@ -218,11 +218,6 @@ func (v *virtualCPU) GetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 	return nil
 }
 
-var (
-	tsKvmHostTime  = timeslice.RegisterKind("kvm_host_time", 0)
-	tsKvmGuestTime = timeslice.RegisterKind("kvm_guest_time", timeslice.SliceFlagGuestTime)
-)
-
 func (v *virtualCPU) Run(ctx context.Context) error {
 	usingContext := false
 	var stopNotify func() bool
