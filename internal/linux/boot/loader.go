@@ -201,7 +201,7 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 		return errors.New("linux loader missing kernel provider")
 	}
 
-	rec := timeslice.NewRecorder()
+	rec := timeslice.NewState()
 
 	kernelReader, kernelSize, err := l.GetKernel()
 	if err != nil {

@@ -677,7 +677,7 @@ func (v *FS) ReadConfig(ctx hv.ExitContext, dev device, off uint64) (uint32, boo
 		return 0, false, nil
 	}
 }
-func (v *FS) WriteConfig(ctx hv.ExitContext, dev device, offset uint64, value uint32) (bool, error) {
+func (v *FS) WriteConfig(_ hv.ExitContext, _ device, _ uint64, _ uint32) (bool, error) {
 	return false, nil
 }
 

@@ -145,7 +145,7 @@ func (r *Recorder) Record(id TimesliceID) {
 	Record(id, duration)
 }
 
-func NewRecorder() *Recorder {
+func NewState() *Recorder {
 	return &Recorder{
 		last: time.Now(),
 	}
@@ -160,7 +160,7 @@ func Record(id TimesliceID, duration time.Duration) {
 	}
 }
 
-func Open(w io.Writer) (io.Closer, error) {
+func StartRecording(w io.Writer) (io.Closer, error) {
 	// check if we already have a writer
 	if w := currentWriter.Load(); w != nil {
 		return nil, fmt.Errorf("timeslice: already open")

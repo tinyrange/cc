@@ -21,7 +21,7 @@ var (
 // LoadKernel parses the supplied ARM64 Image (optionally compressed) and
 // returns an in-memory representation ready for placement into guest RAM.
 func LoadKernel(reader io.ReaderAt, size int64) (*KernelImage, error) {
-	rec := timeslice.NewRecorder()
+	rec := timeslice.NewState()
 
 	probe, err := ProbeKernelImage(reader, size)
 	if err != nil {

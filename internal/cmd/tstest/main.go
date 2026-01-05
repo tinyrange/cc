@@ -29,7 +29,7 @@ func main() {
 	}
 	defer f.Close()
 
-	w, err := timeslice.Open(f)
+	w, err := timeslice.StartRecording(f)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to open timeslice file %q: %v\n", *filename, err)
 		os.Exit(1)
@@ -42,7 +42,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 
-			rec := timeslice.NewRecorder()
+			rec := timeslice.NewState()
 
 			for i := 0; i < *count; i++ {
 				rec.Record(tsKind)

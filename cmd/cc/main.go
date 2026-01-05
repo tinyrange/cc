@@ -182,7 +182,7 @@ func run() error {
 		}
 		defer f.Close()
 
-		w, err := timeslice.Open(f)
+		w, err := timeslice.StartRecording(f)
 		if err != nil {
 			return fmt.Errorf("open timeslice file: %w", err)
 		}

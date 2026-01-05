@@ -19,9 +19,9 @@ import (
 )
 
 var (
-	tsHvfGuestTime       = timeslice.RegisterKind("hvf_guest_time", timeslice.SliceFlagGuestTime)
-	tsHvfUnknownHostTime = timeslice.RegisterKind("hvf_host_time", 0)
-	tsHvfFirstRunStart   = timeslice.RegisterKind("hvf_first_run_start", 0)
+	tsHvfGuestTime     = timeslice.RegisterKind("hvf_guest_time", timeslice.SliceFlagGuestTime)
+	tsHvfHostTime      = timeslice.RegisterKind("hvf_host_time", 0)
+	tsHvfFirstRunStart = timeslice.RegisterKind("hvf_first_run_start", 0)
 
 	tsHvfStartTime = time.Now()
 )
@@ -90,8 +90,6 @@ type virtualCPU struct {
 	runQueue chan func()
 
 	initError chan error
-
-	regionKind timeslice.TimesliceID
 }
 
 // implements [hv.VirtualCPU].
@@ -179,13 +177,7 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		defer stopExit()
 	}
 
-	var kind timeslice.TimesliceID
-	if v.regionKind == timeslice.InvalidTimesliceID {
-		kind = tsHvfUnknownHostTime
-	} else {
-		kind = v.regionKind
-	}
-	v.rec.Record(kind)
+	v.rec.Record(tsHvfHostTime)
 
 	if err := bindings.HvVcpuRun(v.id); err != bindings.HV_SUCCESS {
 		return fmt.Errorf("hvf: failed to run vCPU %d: %w", v.id, err)
@@ -955,7 +947,7 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 	ret := &virtualMachine{
 		hv:       h,
-		rec:      timeslice.NewRecorder(),
+		rec:      timeslice.NewState(),
 		cpus:     make(map[int]*virtualCPU),
 		runQueue: make(chan func(), 16),
 	}
@@ -1086,7 +1078,7 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 			vm:        ret,
 			runQueue:  make(chan func(), 16),
 			initError: make(chan error, 1),
-			rec:       timeslice.NewRecorder(),
+			rec:       timeslice.NewState(),
 		}
 
 		ret.cpus[i] = vcpu

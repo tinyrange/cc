@@ -645,7 +645,7 @@ var (
 // NewVirtualMachine implements hv.Hypervisor.
 func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, error) {
 	vm := &virtualMachine{
-		rec:   timeslice.NewRecorder(),
+		rec:   timeslice.NewState(),
 		hv:    h,
 		vcpus: make(map[int]*virtualCPU),
 	}
@@ -758,7 +758,7 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		vm.rec.Record(tsWhpCreateVCPU)
 
 		vcpu := &virtualCPU{
-			rec:      timeslice.NewRecorder(),
+			rec:      timeslice.NewState(),
 			vm:       vm,
 			id:       i,
 			runQueue: make(chan func(), 16),
