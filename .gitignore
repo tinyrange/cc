@@ -37,3 +37,6 @@ go.work.sum
 !/local/go.mod
 
 /.cursor
+
+# macOS
+.DS_Store
