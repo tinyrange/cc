@@ -21,7 +21,7 @@ const (
 	psciSystemOff = 0x84000008
 )
 
-func BenchmarkMMIOExit(b *testing.B) {
+func BenchmarkVMExit(b *testing.B) {
 	hyper, err := factory.Open()
 	if err != nil {
 		b.Skipf("Open hypervisor: %v", err)
