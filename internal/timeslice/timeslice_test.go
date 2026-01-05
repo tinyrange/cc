@@ -17,7 +17,7 @@ var (
 func TestTimeslice(t *testing.T) {
 	var buf bytes.Buffer
 	func() {
-		writer, err := Open(&buf)
+		writer, err := StartRecording(&buf)
 		if err != nil {
 			t.Fatalf("Open: %v", err)
 		}
@@ -45,7 +45,7 @@ func BenchmarkTimeslice(b *testing.B) {
 	var buf bytes.Buffer
 	var count uint64
 	func() {
-		writer, err := Open(&buf)
+		writer, err := StartRecording(&buf)
 		if err != nil {
 			b.Fatalf("Open: %v", err)
 		}
@@ -90,7 +90,7 @@ func BenchmarkTimesliceTempFile(b *testing.B) {
 		}
 		defer f.Close()
 
-		writer, err := Open(f)
+		writer, err := StartRecording(f)
 		if err != nil {
 			b.Fatalf("Open: %v", err)
 		}
