@@ -116,9 +116,13 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		defer stop()
 	}
 
+	v.rec.Record(tsWhpHostTime)
+
 	if err := bindings.RunVirtualProcessorContext(v.vm.part, uint32(v.id), &exit); err != nil {
 		return fmt.Errorf("whp: RunVirtualProcessorContext failed: %w", err)
 	}
+
+	v.rec.Record(tsWhpGuestTime)
 
 	v.exitCtx = &exitContext{
 		timeslice: timeslice.InvalidTimesliceID,
@@ -184,7 +188,14 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			return fmt.Errorf("whp: advance PC after MMIO access: %w", err)
 		}
 
-		return pendingError
+		if pendingError != nil {
+			if v.exitCtx.timeslice != timeslice.InvalidTimesliceID {
+				v.rec.Record(v.exitCtx.timeslice)
+			} else {
+				v.rec.Record(tsWhpUnknownExit)
+			}
+			return pendingError
+		}
 	case bindings.WHvRunVpExitReasonCanceled:
 		if err := ctx.Err(); err != nil {
 			return err
@@ -195,6 +206,14 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	default:
 		return fmt.Errorf("whp: unsupported vCPU exit reason %s", exit.ExitReason)
 	}
+
+	if v.exitCtx.timeslice != timeslice.InvalidTimesliceID {
+		v.rec.Record(v.exitCtx.timeslice)
+	} else {
+		v.rec.Record(tsWhpUnknownExit)
+	}
+
+	return nil
 }
 
 func (v *virtualCPU) advanceProgramCounter() error {
@@ -276,6 +295,8 @@ func (h *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 	}); err != nil {
 		return fmt.Errorf("failed to set ARM64 IC parameters: %w", err)
 	}
+
+	vm.rec.Record(tsWhpSetPartitionProperty)
 
 	vm.arm64GICInfo = hv.Arm64GICInfo{
 		Version:           hv.Arm64GICVersion3,
