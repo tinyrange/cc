@@ -709,7 +709,7 @@ func (v *FS) processQueue(ctx hv.ExitContext, dev device, qidx int, q *queue) er
 	// First, attempt to complete any deferred SETLKW requests. This is safe because
 	// the underlying virtio queue elements remain in-flight until we write them to
 	// the used ring.
-	if err := v.tryCompletePending(dev); err != nil {
+	if err := v.tryCompletePending(ctx, dev); err != nil {
 		return err
 	}
 
@@ -723,7 +723,7 @@ func (v *FS) processQueue(ctx hv.ExitContext, dev device, qidx int, q *queue) er
 			return err
 		}
 		debug.Writef("virtio-fs.processQueue handle", "head=%d ringIndex=%d", head, ringIndex)
-		usedLen, deferred, err := v.handleRequest(dev, qidx, q, head)
+		usedLen, deferred, err := v.handleRequest(ctx, dev, qidx, q, head)
 		if err != nil {
 			debug.Writef("virtio-fs.processQueue handleRequest", "head=%d error=%v", head, err)
 			return err
@@ -744,7 +744,7 @@ func (v *FS) processQueue(ctx hv.ExitContext, dev device, qidx int, q *queue) er
 
 		// A request may have changed lock state (unlock/close), so opportunistically
 		// drain pending SETLKW requests now.
-		if err := v.tryCompletePending(dev); err != nil {
+		if err := v.tryCompletePending(ctx, dev); err != nil {
 			return err
 		}
 	}
@@ -765,7 +765,7 @@ type fsDesc struct {
 
 var errDeferReply = errors.New("virtio-fs: defer reply")
 
-func (v *FS) tryCompletePending(dev device) error {
+func (v *FS) tryCompletePending(ctx hv.ExitContext, dev device) error {
 	if len(v.pending) == 0 {
 		return nil
 	}
@@ -786,7 +786,7 @@ func (v *FS) tryCompletePending(dev device) error {
 		// Attempt to dispatch again; if still blocked, keep pending.
 		respBuf := v.getBuffer(p.respCap)
 		clear(respBuf[:p.respCap])
-		used, err := v.dispatchFUSE(p.req, respBuf[:p.respCap])
+		used, err := v.dispatchFUSE(ctx, p.req, respBuf[:p.respCap])
 		if errors.Is(err, errDeferReply) {
 			v.putBuffer(respBuf)
 			dst = append(dst, p)
@@ -840,7 +840,7 @@ func (v *FS) tryCompletePending(dev device) error {
 	return nil
 }
 
-func (v *FS) handleRequest(dev device, qidx int, q *queue, head uint16) (usedLen uint32, deferred bool, err error) {
+func (v *FS) handleRequest(ctx hv.ExitContext, dev device, qidx int, q *queue, head uint16) (usedLen uint32, deferred bool, err error) {
 	// Expect a simple 2-descriptor chain: [in: request][out: reply]
 	descs, err := v.readDescriptorChain(dev, q, head)
 	if err != nil {
@@ -921,7 +921,7 @@ func (v *FS) handleRequest(dev device, qidx int, q *queue, head uint16) (usedLen
 	// Zero the response buffer to avoid garbage data
 	clear(respBuf[:respCap])
 
-	used, err := v.dispatchFUSE(reqBuf[:reqLen], respBuf[:respCap])
+	used, err := v.dispatchFUSE(ctx, reqBuf[:reqLen], respBuf[:respCap])
 	if err != nil {
 		if errors.Is(err, errDeferReply) {
 			// Save a copy of the request and response descriptor list so we can complete later.
@@ -1007,10 +1007,50 @@ func (v *FS) readDescriptorChain(dev device, q *queue, head uint16) ([]fsDesc, e
 }
 
 // -----------------------------
-// FUSE dispatcher (very small subset)
+// FUSE dispatcher
 // -----------------------------
 
-func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
+var (
+	tsFsDispatchFUSE            = timeslice.RegisterKind("virtio_fs_dispatch_fuse", 0)
+	tsFsDispatchFUSEInit        = timeslice.RegisterKind("virtio_fs_dispatch_fuse_init", 0)
+	tsFsDispatchFUSEGetAttr     = timeslice.RegisterKind("virtio_fs_dispatch_fuse_getattr", 0)
+	tsFsDispatchFUSELookup      = timeslice.RegisterKind("virtio_fs_dispatch_fuse_lookup", 0)
+	tsFsDispatchFUSECreate      = timeslice.RegisterKind("virtio_fs_dispatch_fuse_create", 0)
+	tsFsDispatchFUSEMknod       = timeslice.RegisterKind("virtio_fs_dispatch_fuse_mknod", 0)
+	tsFsDispatchFUSEMkdir       = timeslice.RegisterKind("virtio_fs_dispatch_fuse_mkdir", 0)
+	tsFsDispatchFUSEOpen        = timeslice.RegisterKind("virtio_fs_dispatch_fuse_open", 0)
+	tsFsDispatchFUSEOpenDir     = timeslice.RegisterKind("virtio_fs_dispatch_fuse_opendir", 0)
+	tsFsDispatchFUSERelease     = timeslice.RegisterKind("virtio_fs_dispatch_fuse_release", 0)
+	tsFsDispatchFUSEReleaseDir  = timeslice.RegisterKind("virtio_fs_dispatch_fuse_releasedir", 0)
+	tsFsDispatchFUSERead        = timeslice.RegisterKind("virtio_fs_dispatch_fuse_read", 0)
+	tsFsDispatchFUSEWrite       = timeslice.RegisterKind("virtio_fs_dispatch_fuse_write", 0)
+	tsFsDispatchFUSEReadDir     = timeslice.RegisterKind("virtio_fs_dispatch_fuse_readdir", 0)
+	tsFsDispatchFUSERename      = timeslice.RegisterKind("virtio_fs_dispatch_fuse_rename", 0)
+	tsFsDispatchFUSERename2     = timeslice.RegisterKind("virtio_fs_dispatch_fuse_rename2", 0)
+	tsFsDispatchFUSEUnlink      = timeslice.RegisterKind("virtio_fs_dispatch_fuse_unlink", 0)
+	tsFsDispatchFUSERmdir       = timeslice.RegisterKind("virtio_fs_dispatch_fuse_rmdir", 0)
+	tsFsDispatchFUSESetXattr    = timeslice.RegisterKind("virtio_fs_dispatch_fuse_setxattr", 0)
+	tsFsDispatchFUSEGetXattr    = timeslice.RegisterKind("virtio_fs_dispatch_fuse_getxattr", 0)
+	tsFsDispatchFUSEListXattr   = timeslice.RegisterKind("virtio_fs_dispatch_fuse_listxattr", 0)
+	tsFsDispatchFUSERemoveXattr = timeslice.RegisterKind("virtio_fs_dispatch_fuse_removexattr", 0)
+	tsFsDispatchFUSEFlush       = timeslice.RegisterKind("virtio_fs_dispatch_fuse_flush", 0)
+	tsFsDispatchFUSEIoctl       = timeslice.RegisterKind("virtio_fs_dispatch_fuse_ioctl", 0)
+	tsFsDispatchFUSEUnsupported = timeslice.RegisterKind("virtio_fs_dispatch_fuse_unsupported", 0)
+	tsFsDispatchFUSEDestroy     = timeslice.RegisterKind("virtio_fs_dispatch_fuse_destroy", 0)
+	tsFsDispatchFUSEReadlink    = timeslice.RegisterKind("virtio_fs_dispatch_fuse_readlink", 0)
+	tsFsDispatchFUSESymlink     = timeslice.RegisterKind("virtio_fs_dispatch_fuse_symlink", 0)
+	tsFsDispatchFUSELink        = timeslice.RegisterKind("virtio_fs_dispatch_fuse_link", 0)
+	tsFsDispatchFUSESetattr     = timeslice.RegisterKind("virtio_fs_dispatch_fuse_setattr", 0)
+	tsFsDispatchFUSEFallocate   = timeslice.RegisterKind("virtio_fs_dispatch_fuse_fallocate", 0)
+	tsFsDispatchFUSEGetLK       = timeslice.RegisterKind("virtio_fs_dispatch_fuse_getlk", 0)
+	tsFsDispatchFUSESetLK       = timeslice.RegisterKind("virtio_fs_dispatch_fuse_setlk", 0)
+	tsFsDispatchFUSEStatFS      = timeslice.RegisterKind("virtio_fs_dispatch_fuse_statfs", 0)
+	tsFsDispatchFUSELseek       = timeslice.RegisterKind("virtio_fs_dispatch_fuse_lseek", 0)
+)
+
+func (v *FS) dispatchFUSE(ctx hv.ExitContext, req []byte, resp []byte) (uint32, error) {
+	ctx.SetExitTimeslice(tsFsDispatchFUSE)
+
 	if len(req) < fuseHdrInSize || len(resp) < fuseHdrOutSize {
 		debug.Writef("virtio-fs.dispatchFUSE short buffers", "req=%d resp=%d", len(req), len(resp))
 		return 0, fmt.Errorf("virtio-fs: short buffers req=%d resp=%d", len(req), len(resp))
@@ -1042,6 +1082,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 	errno := int32(0)
 	switch in.Opcode {
 	case FUSE_INIT:
+		ctx.SetExitTimeslice(tsFsDispatchFUSEInit)
 		debug.Writef("virtio-fs.dispatchFUSE op=INIT", "in=%+v", in)
 		// parse init_in
 		if len(req) < fuseHdrInSize+16 {
@@ -1081,6 +1122,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		return w(fuseOutHeader{Len: fuseHdrOutSize + uint32(len(extra)), Error: 0, Unique: in.Unique}, extra), nil
 
 	case FUSE_GETATTR:
+		ctx.SetExitTimeslice(tsFsDispatchFUSEGetAttr)
 		debug.Writef("virtio-fs.dispatchFUSE op=GETATTR", "node=%d", in.NodeID)
 		attr, e := v.backend.GetAttr(in.NodeID)
 		errno = e
@@ -1095,6 +1137,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_LOOKUP:
+		ctx.SetExitTimeslice(tsFsDispatchFUSELookup)
 		debug.Writef("virtio-fs.dispatchFUSE op=LOOKUP", "parent=%d", in.NodeID)
 		// payload: name (NUL-terminated)
 		name := string(req[fuseHdrInSize:])
@@ -1120,6 +1163,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_CREATE:
+		ctx.SetExitTimeslice(tsFsDispatchFUSECreate)
 		debug.Writef("virtio-fs.dispatchFUSE op=CREATE", "parent=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+16 {
 			debug.Writef("virtio-fs.dispatchFUSE op=CREATE too short", "in=%+v", in)
@@ -1147,6 +1191,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_MKNOD:
+		ctx.SetExitTimeslice(tsFsDispatchFUSEMknod)
 		debug.Writef("virtio-fs.dispatchFUSE op=MKNOD", "parent=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+16 {
 			return 0, fmt.Errorf("FUSE_MKNOD too short")
@@ -1172,6 +1217,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_MKDIR:
+		ctx.SetExitTimeslice(tsFsDispatchFUSEMkdir)
 		debug.Writef("virtio-fs.dispatchFUSE op=MKDIR", "parent=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+8 {
 			return 0, fmt.Errorf("FUSE_MKDIR too short")
@@ -1196,6 +1242,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_OPEN:
+		ctx.SetExitTimeslice(tsFsDispatchFUSEOpen)
 		debug.Writef("virtio-fs.dispatchFUSE op=OPEN", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+8 {
 			return 0, fmt.Errorf("FUSE_OPEN too short")
@@ -1212,6 +1259,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_OPENDIR:
+		ctx.SetExitTimeslice(tsFsDispatchFUSEOpenDir)
 		debug.Writef("virtio-fs.dispatchFUSE op=OPENDIR", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+8 {
 			return 0, fmt.Errorf("FUSE_OPENDIR too short")
@@ -1232,6 +1280,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_RELEASE:
+		ctx.SetExitTimeslice(tsFsDispatchFUSERelease)
 		debug.Writef("virtio-fs.dispatchFUSE op=RELEASE", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+24 {
 			return 0, fmt.Errorf("FUSE_RELEASE too short")
@@ -1242,6 +1291,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		return w(fuseOutHeader{Len: fuseHdrOutSize, Error: 0, Unique: in.Unique}, nil), nil
 
 	case FUSE_RELEASEDIR:
+		ctx.SetExitTimeslice(tsFsDispatchFUSEReleaseDir)
 		debug.Writef("virtio-fs.dispatchFUSE op=RELEASEDIR", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+24 {
 			return 0, fmt.Errorf("FUSE_RELEASEDIR too short")
@@ -1255,6 +1305,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		errno = -int32(linux.ENOSYS)
 
 	case FUSE_READ:
+		ctx.SetExitTimeslice(tsFsDispatchFUSERead)
 		debug.Writef("virtio-fs.dispatchFUSE op=READ", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+24 {
 			return 0, fmt.Errorf("FUSE_READ too short")
@@ -1279,6 +1330,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_WRITE:
+		ctx.SetExitTimeslice(tsFsDispatchFUSEWrite)
 		debug.Writef("virtio-fs.dispatchFUSE op=WRITE", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+32 {
 			return 0, fmt.Errorf("FUSE_WRITE too short")
@@ -1314,6 +1366,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_READDIR:
+		ctx.SetExitTimeslice(tsFsDispatchFUSEReadDir)
 		debug.Writef("virtio-fs.dispatchFUSE op=READDIR", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+24 {
 			return 0, fmt.Errorf("FUSE_READDIR too short")
@@ -1341,6 +1394,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_RENAME:
+		ctx.SetExitTimeslice(tsFsDispatchFUSERename)
 		debug.Writef("virtio-fs.dispatchFUSE op=RENAME", "oldParent=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+8 {
 			return 0, fmt.Errorf("FUSE_RENAME too short")
@@ -1364,6 +1418,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_RENAME2:
+		ctx.SetExitTimeslice(tsFsDispatchFUSERename2)
 		debug.Writef("virtio-fs.dispatchFUSE op=RENAME2", "oldParent=%d", in.NodeID)
 		// fuse_rename2_in: newdir (u64), flags (u32), padding (u32)
 		if len(req) < fuseHdrInSize+16 {
@@ -1388,6 +1443,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_UNLINK:
+		ctx.SetExitTimeslice(tsFsDispatchFUSEUnlink)
 		name := readName(req[fuseHdrInSize:])
 		debug.Writef("virtio-fs.dispatchFUSE op=UNLINK", "parent=%d name=%q", in.NodeID, name)
 		if be, ok := v.backend.(fsRemoveBackend); ok {
@@ -1400,6 +1456,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_RMDIR:
+		ctx.SetExitTimeslice(tsFsDispatchFUSERmdir)
 		name := readName(req[fuseHdrInSize:])
 		debug.Writef("virtio-fs.dispatchFUSE op=RMDIR", "parent=%d name=%q", in.NodeID, name)
 		if be, ok := v.backend.(fsRemoveBackend); ok {
@@ -1412,6 +1469,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_SETXATTR:
+		ctx.SetExitTimeslice(tsFsDispatchFUSESetXattr)
 		debug.Writef("virtio-fs.dispatchFUSE op=SETXATTR", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+8 {
 			return 0, fmt.Errorf("FUSE_SETXATTR too short")
@@ -1436,6 +1494,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_GETXATTR:
+		ctx.SetExitTimeslice(tsFsDispatchFUSEGetXattr)
 		debug.Writef("virtio-fs.dispatchFUSE op=GETXATTR", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+8 {
 			return 0, fmt.Errorf("FUSE_GETXATTR too short")
@@ -1470,6 +1529,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_LISTXATTR:
+		ctx.SetExitTimeslice(tsFsDispatchFUSEListXattr)
 		debug.Writef("virtio-fs.dispatchFUSE op=LISTXATTR", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+8 {
 			return 0, fmt.Errorf("FUSE_LISTXATTR too short")
@@ -1504,6 +1564,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_REMOVEXATTR:
+		ctx.SetExitTimeslice(tsFsDispatchFUSERemoveXattr)
 		debug.Writef("virtio-fs.dispatchFUSE op=REMOVEXATTR", "node=%d", in.NodeID)
 		name := readName(req[fuseHdrInSize:])
 		debug.Writef("virtio-fs.dispatchFUSE op=REMOVEXATTR", "name=%q", name)
@@ -1517,6 +1578,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_READLINK:
+		ctx.SetExitTimeslice(tsFsDispatchFUSEReadlink)
 		debug.Writef("virtio-fs.dispatchFUSE op=READLINK", "node=%d", in.NodeID)
 		if be, ok := v.backend.(fsReadlinkBackend); ok {
 			target, e := be.Readlink(in.NodeID)
@@ -1537,6 +1599,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_SYMLINK:
+		ctx.SetExitTimeslice(tsFsDispatchFUSESymlink)
 		// On-wire (Linux FUSE): `name\0target\0` (two NUL-terminated strings).
 		// Note: some protocol versions may include additional fields, but Alpine's apk uses the plain layout.
 		umask := uint32(0)
@@ -1563,6 +1626,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_LINK:
+		ctx.SetExitTimeslice(tsFsDispatchFUSELink)
 		// fuse_link_in: oldnodeid (uint64) followed by NUL-terminated newname
 		if len(req) < fuseHdrInSize+8 {
 			return 0, fmt.Errorf("FUSE_LINK too short")
@@ -1587,6 +1651,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_SETATTR:
+		ctx.SetExitTimeslice(tsFsDispatchFUSESetattr)
 		debug.Writef("virtio-fs.dispatchFUSE op=SETATTR", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+56 {
 			return 0, fmt.Errorf("FUSE_SETATTR too short")
@@ -1699,6 +1764,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_LSEEK:
+		ctx.SetExitTimeslice(tsFsDispatchFUSELseek)
 		debug.Writef("virtio-fs.dispatchFUSE op=LSEEK", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+24 {
 			return 0, fmt.Errorf("FUSE_LSEEK too short")
@@ -1727,6 +1793,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_FALLOCATE:
+		ctx.SetExitTimeslice(tsFsDispatchFUSEFallocate)
 		// fuse_fallocate_in: fh (u64), offset (u64), length (u64), mode (u32), padding (u32)
 		debug.Writef("virtio-fs.dispatchFUSE op=FALLOCATE", "node=%d", in.NodeID)
 		if len(req) < fuseHdrInSize+32 {
@@ -1749,6 +1816,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_GETLK:
+		ctx.SetExitTimeslice(tsFsDispatchFUSEGetLK)
 		debug.Writef("virtio-fs.dispatchFUSE op=GETLK", "node=%d", in.NodeID)
 		// fuse_lk_in: fh (u64), owner (u64), fuse_file_lock (start u64, end u64, type u32, pid u32), lk_flags (u32), padding (u32)
 		if len(req) < fuseHdrInSize+48 {
@@ -1780,6 +1848,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_SETLK, FUSE_SETLKW:
+		ctx.SetExitTimeslice(tsFsDispatchFUSESetLK)
 		opName := "SETLK"
 		if in.Opcode == FUSE_SETLKW {
 			opName = "SETLKW"
@@ -1810,6 +1879,7 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_STATFS:
+		ctx.SetExitTimeslice(tsFsDispatchFUSEStatFS)
 		debug.Writef("virtio-fs.dispatchFUSE op=STATFS", "node=%d", in.NodeID)
 		b, bf, ba, files, ff, bsize, fr, name, e := v.backend.StatFS(in.NodeID)
 		errno = e
@@ -1830,9 +1900,11 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 	case FUSE_DESTROY:
 		// Nothing to do; the guest is indicating unmount.
+		ctx.SetExitTimeslice(tsFsDispatchFUSEDestroy)
 		debug.Writef("virtio-fs.dispatchFUSE op=DESTROY", "node=%d", in.NodeID)
 
 	case FUSE_FLUSH:
+		ctx.SetExitTimeslice(tsFsDispatchFUSEFlush)
 		// fuse_flush_in: fh (u64), unused (u32), padding (u32), lock_owner (u64)
 		// Linux uses lock_owner for POSIX lock cleanup on close.
 		debug.Writef("virtio-fs.dispatchFUSE op=FLUSH", "node=%d", in.NodeID)
@@ -1849,11 +1921,13 @@ func (v *FS) dispatchFUSE(req []byte, resp []byte) (uint32, error) {
 		}
 
 	case FUSE_IOCTL, FUSE_POLL:
+		ctx.SetExitTimeslice(tsFsDispatchFUSEIoctl)
 		// Unsupported but expected; return ENOSYS quietly.
 		debug.Writef("virtio-fs.dispatchFUSE op unsupported", "opcode=%s node=%d", fuseOpcodeString(in.Opcode), in.NodeID)
 		errno = -int32(linux.ENOSYS)
 
 	default:
+		ctx.SetExitTimeslice(tsFsDispatchFUSEUnsupported)
 		slog.Debug("virtio-fs.dispatchFUSE unsupported", "opcode", fuseOpcodeString(in.Opcode))
 		debug.Writef("virtio-fs.dispatchFUSE unsupported", "opcode=%s", fuseOpcodeString(in.Opcode))
 		errno = -int32(linux.ENOSYS)
