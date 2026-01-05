@@ -9,6 +9,7 @@ import (
 
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/whp/bindings"
+	"github.com/tinyrange/cc/internal/timeslice"
 )
 
 const (
@@ -119,6 +120,10 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		return fmt.Errorf("whp: RunVirtualProcessorContext failed: %w", err)
 	}
 
+	v.exitCtx = &exitContext{
+		timeslice: timeslice.InvalidTimesliceID,
+	}
+
 	switch exit.ExitReason {
 	case bindings.WHvRunVpExitReasonArm64Reset:
 		resetCtx := exit.Arm64Reset()
@@ -159,11 +164,11 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 				data[i] = byte(value >> (8 * i))
 			}
 
-			if err := dev.WriteMMIO(physAddr, data); err != nil {
+			if err := dev.WriteMMIO(v.exitCtx, physAddr, data); err != nil {
 				pendingError = fmt.Errorf("whp: MMIO write 0x%x (%d bytes): %w", physAddr, decoded.sizeBytes, err)
 			}
 		} else {
-			if err := dev.ReadMMIO(physAddr, data); err != nil {
+			if err := dev.ReadMMIO(v.exitCtx, physAddr, data); err != nil {
 				pendingError = fmt.Errorf("whp: MMIO read 0x%x (%d bytes): %w", physAddr, decoded.sizeBytes, err)
 			}
 

@@ -306,7 +306,7 @@ func (s *Serial16550) Poll(ctx context.Context) error {
 }
 
 // ReadIOPort implements chipset.PortIOHandler.
-func (s *Serial16550) ReadIOPort(port uint16, data []byte) error {
+func (s *Serial16550) ReadIOPort(ctx hv.ExitContext, port uint16, data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -317,7 +317,7 @@ func (s *Serial16550) ReadIOPort(port uint16, data []byte) error {
 }
 
 // WriteIOPort implements chipset.PortIOHandler.
-func (s *Serial16550) WriteIOPort(port uint16, data []byte) error {
+func (s *Serial16550) WriteIOPort(ctx hv.ExitContext, port uint16, data []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

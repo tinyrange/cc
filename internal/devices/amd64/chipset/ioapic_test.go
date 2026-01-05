@@ -46,12 +46,12 @@ func programRedirection(t *testing.T, io *IOAPIC, line uint8, vector uint8, dest
 	high := uint32(dest) << 24
 
 	writeRegister := func(index uint8, value uint32) {
-		if err := io.WriteMMIO(IOAPICBaseAddress+0x00, []byte{index}); err != nil {
+		if err := io.WriteMMIO(nil, IOAPICBaseAddress+0x00, []byte{index}); err != nil {
 			t.Fatalf("write select %d: %v", index, err)
 		}
 		buf := make([]byte, 4)
 		binary.LittleEndian.PutUint32(buf, value)
-		if err := io.WriteMMIO(IOAPICBaseAddress+0x10, buf); err != nil {
+		if err := io.WriteMMIO(nil, IOAPICBaseAddress+0x10, buf); err != nil {
 			t.Fatalf("write data idx=%d: %v", index, err)
 		}
 	}
@@ -63,11 +63,11 @@ func programRedirection(t *testing.T, io *IOAPIC, line uint8, vector uint8, dest
 func readRedirectionLow(t *testing.T, io *IOAPIC, line uint8) uint32 {
 	t.Helper()
 	index := uint8(0x10 + line*2)
-	if err := io.WriteMMIO(IOAPICBaseAddress+0x00, []byte{index}); err != nil {
+	if err := io.WriteMMIO(nil, IOAPICBaseAddress+0x00, []byte{index}); err != nil {
 		t.Fatalf("write select %d: %v", index, err)
 	}
 	buf := make([]byte, 4)
-	if err := io.ReadMMIO(IOAPICBaseAddress+0x10, buf); err != nil {
+	if err := io.ReadMMIO(nil, IOAPICBaseAddress+0x10, buf); err != nil {
 		t.Fatalf("read data idx=%d: %v", index, err)
 	}
 	return binary.LittleEndian.Uint32(buf)

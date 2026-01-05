@@ -69,6 +69,14 @@ var sysRegisterMap = map[hv.Register]bindings.SysReg{
 	hv.RegisterARM64Sp:   bindings.HV_SYS_REG_SP_EL1,
 }
 
+type exitContext struct {
+	kind timeslice.TimesliceID
+}
+
+func (ctx *exitContext) SetExitTimeslice(id timeslice.TimesliceID) {
+	ctx.kind = id
+}
+
 type virtualCPU struct {
 	vm *virtualMachine
 
@@ -187,14 +195,26 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	timeslice.Record(tsHvfGuestTime)
 	v.lastTime = time.Now()
 
+	exitCtx := &exitContext{
+		kind: timeslice.InvalidTimesliceID,
+	}
+
 	switch v.exit.Reason {
 	case bindings.HV_EXIT_REASON_EXCEPTION:
-		return v.handleException()
+		if err := v.handleException(exitCtx); err != nil {
+			return err
+		}
 	case bindings.HV_EXIT_REASON_CANCELED:
 		return ctx.Err()
 	default:
 		return fmt.Errorf("hvf: unknown exit reason %s", v.exit.Reason)
 	}
+
+	if exitCtx.kind != timeslice.InvalidTimesliceID {
+		timeslice.Record(exitCtx.kind)
+	}
+
+	return nil
 }
 
 type exceptionClass uint64
@@ -226,17 +246,17 @@ const (
 	exceptionClassShift = 26
 )
 
-func (v *virtualCPU) handleException() error {
+func (v *virtualCPU) handleException(exitCtx *exitContext) error {
 	syndrome := v.exit.Exception.Syndrome
 	ec := exceptionClass((syndrome >> exceptionClassShift) & exceptionClassMask)
 
 	switch ec {
 	case exceptionClassHvc:
-		return v.handleHvc()
+		return v.handleHvc(exitCtx)
 	case exceptionClassDataAbortLowerEL:
-		return v.handleDataAbort(syndrome, v.exit.Exception.PhysicalAddress)
+		return v.handleDataAbort(exitCtx, syndrome, v.exit.Exception.PhysicalAddress)
 	case exceptionClassMsrAccess:
-		return v.handleMsrAccess(syndrome)
+		return v.handleMsrAccess(exitCtx, syndrome)
 	default:
 		return fmt.Errorf("hvf: unsupported exception class %s (syndrome=0x%x)", ec, syndrome)
 	}
@@ -317,7 +337,13 @@ func (fid psciFunctionID) String() string {
 	}
 }
 
-func (v *virtualCPU) handleHvc() error {
+var (
+	tsHvc = timeslice.RegisterKind("hvf_hvc", 0)
+)
+
+func (v *virtualCPU) handleHvc(exitCtx *exitContext) error {
+	exitCtx.SetExitTimeslice(tsHvc)
+
 	// get the value of x0
 	var x0 uint64
 	if err := bindings.HvVcpuGetReg(v.id, bindings.HV_REG_X0, &x0); err != bindings.HV_SUCCESS {
@@ -426,7 +452,13 @@ func (v *virtualCPU) findMMIODevice(addr, size uint64) (hv.MemoryMappedIODevice,
 	return nil, fmt.Errorf("hvf: no MMIO device handles address 0x%x (size=%d)", addr, size)
 }
 
-func (v *virtualCPU) handleDataAbort(syndrome bindings.ExceptionSyndrome, physAddr bindings.IPA) error {
+var (
+	tsDataAbort = timeslice.RegisterKind("hvf_data_abort", 0)
+)
+
+func (v *virtualCPU) handleDataAbort(exitCtx *exitContext, syndrome bindings.ExceptionSyndrome, physAddr bindings.IPA) error {
+	exitCtx.SetExitTimeslice(tsDataAbort)
+
 	decoded, err := decodeDataAbort(syndrome)
 	if err != nil {
 		return fmt.Errorf("hvf: failed to decode data abort syndrome 0x%X: %w", syndrome, err)
@@ -457,11 +489,11 @@ func (v *virtualCPU) handleDataAbort(syndrome bindings.ExceptionSyndrome, physAd
 		binary.LittleEndian.PutUint64(tmp[:], value)
 		copy(data, tmp[:])
 
-		if err := dev.WriteMMIO(addr, data); err != nil {
+		if err := dev.WriteMMIO(exitCtx, addr, data); err != nil {
 			pendingError = fmt.Errorf("hvf: failed to write MMIO: %w", err)
 		}
 	} else {
-		if err := dev.ReadMMIO(addr, data); err != nil {
+		if err := dev.ReadMMIO(exitCtx, addr, data); err != nil {
 			pendingError = fmt.Errorf("hvf: failed to read MMIO: %w", err)
 		}
 
@@ -547,7 +579,13 @@ func (m msrAccessInfo) matches(op0, op1, crn, crm, op2 uint8) bool {
 	return m.op0 == op0 && m.op1 == op1 && m.crn == crn && m.crm == crm && m.op2 == op2
 }
 
-func (v *virtualCPU) handleMsrAccess(syndrome bindings.ExceptionSyndrome) error {
+var (
+	tsMsrAccess = timeslice.RegisterKind("hvf_msr_access", 0)
+)
+
+func (v *virtualCPU) handleMsrAccess(exitCtx *exitContext, syndrome bindings.ExceptionSyndrome) error {
+	exitCtx.SetExitTimeslice(tsMsrAccess)
+
 	info, err := decodeMsrAccess(syndrome)
 	if err != nil {
 		return err

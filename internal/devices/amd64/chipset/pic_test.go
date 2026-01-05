@@ -92,7 +92,7 @@ func programPIC(t *testing.T, pic *DualPIC) {
 		{secondaryPicDataPort, 0x01},
 	}
 	for _, w := range writes {
-		if err := pic.WriteIOPort(w.port, []byte{w.data}); err != nil {
+		if err := pic.WriteIOPort(nil, w.port, []byte{w.data}); err != nil {
 			t.Fatalf("write to 0x%x failed: %v", w.port, err)
 		}
 	}
@@ -127,7 +127,7 @@ func sendEOI(t *testing.T, pic *DualPIC, irq uint8) {
 		}
 	}
 	for _, w := range seq {
-		if err := pic.WriteIOPort(w.port, []byte{w.value}); err != nil {
+		if err := pic.WriteIOPort(nil, w.port, []byte{w.value}); err != nil {
 			t.Fatalf("EOI write to 0x%x failed: %v", w.port, err)
 		}
 	}

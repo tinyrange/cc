@@ -16,11 +16,11 @@ func TestCMOSStatusCClearsOnRead(t *testing.T) {
 	c.mu.Unlock()
 
 	// Select status C register then read.
-	if err := c.WriteIOPort(cmosAddrPort, []byte{cmosRegStatusC}); err != nil {
+	if err := c.WriteIOPort(nil, cmosAddrPort, []byte{cmosRegStatusC}); err != nil {
 		t.Fatalf("write addr: %v", err)
 	}
 	buf := []byte{0}
-	if err := c.ReadIOPort(cmosDataPort, buf); err != nil {
+	if err := c.ReadIOPort(nil, cmosDataPort, buf); err != nil {
 		t.Fatalf("read status C: %v", err)
 	}
 	if buf[0]&statusCIrqUpdate == 0 {
@@ -42,11 +42,11 @@ func TestCMOSTimeRegistersBCDEncoding(t *testing.T) {
 	c := NewCMOS(nil, WithCMOSClock(func() time.Time { return now }), WithCMOSTimerFactory(dummyTimerFactory))
 
 	readReg := func(idx byte) byte {
-		if err := c.WriteIOPort(cmosAddrPort, []byte{idx}); err != nil {
+		if err := c.WriteIOPort(nil, cmosAddrPort, []byte{idx}); err != nil {
 			t.Fatalf("write addr: %v", err)
 		}
 		buf := []byte{0}
-		if err := c.ReadIOPort(cmosDataPort, buf); err != nil {
+		if err := c.ReadIOPort(nil, cmosDataPort, buf); err != nil {
 			t.Fatalf("read data: %v", err)
 		}
 		return buf[0]
@@ -83,10 +83,10 @@ func TestCMOSAlarmMatch(t *testing.T) {
 		{cmosRegMinutesAlarm, 4},
 		{cmosRegSecondsAlarm, 5},
 	} {
-		if err := c.WriteIOPort(cmosAddrPort, []byte{reg.addr}); err != nil {
+		if err := c.WriteIOPort(nil, cmosAddrPort, []byte{reg.addr}); err != nil {
 			t.Fatalf("write addr: %v", err)
 		}
-		if err := c.WriteIOPort(cmosDataPort, []byte{reg.val}); err != nil {
+		if err := c.WriteIOPort(nil, cmosDataPort, []byte{reg.val}); err != nil {
 			t.Fatalf("write data: %v", err)
 		}
 	}
@@ -97,11 +97,11 @@ func TestCMOSAlarmMatch(t *testing.T) {
 	c.mu.Unlock()
 	c.scheduleAlarmLocked()
 
-	if err := c.WriteIOPort(cmosAddrPort, []byte{cmosRegStatusC}); err != nil {
+	if err := c.WriteIOPort(nil, cmosAddrPort, []byte{cmosRegStatusC}); err != nil {
 		t.Fatalf("select status C: %v", err)
 	}
 	buf := []byte{0}
-	if err := c.ReadIOPort(cmosDataPort, buf); err != nil {
+	if err := c.ReadIOPort(nil, cmosDataPort, buf); err != nil {
 		t.Fatalf("read status C: %v", err)
 	}
 	if buf[0]&statusCIrqAlarm == 0 {

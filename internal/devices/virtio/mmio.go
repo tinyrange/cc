@@ -80,8 +80,8 @@ type device interface {
 	writeGuest(addr uint64, data []byte) error
 	eventIdxEnabled() bool
 	setAvailEvent(*queue, uint16) error
-	readMMIO(addr uint64, data []byte) error
-	writeMMIO(addr uint64, data []byte) error
+	readMMIO(ctx hv.ExitContext, addr uint64, data []byte) error
+	writeMMIO(ctx hv.ExitContext, addr uint64, data []byte) error
 	memSlice(addr uint64, length uint64) ([]byte, error)
 	queuePointers(q *queue) (descTable []byte, avail []byte, used []byte, err error)
 }
@@ -90,9 +90,9 @@ type deviceHandler interface {
 	NumQueues() int
 	QueueMaxSize(queue int) uint16
 	OnReset(dev device)
-	OnQueueNotify(dev device, queue int) error
-	ReadConfig(dev device, offset uint64) (value uint32, handled bool, err error)
-	WriteConfig(dev device, offset uint64, value uint32) (handled bool, err error)
+	OnQueueNotify(ctx hv.ExitContext, dev device, queue int) error
+	ReadConfig(ctx hv.ExitContext, dev device, offset uint64) (value uint32, handled bool, err error)
+	WriteConfig(ctx hv.ExitContext, dev device, offset uint64, value uint32) (handled bool, err error)
 }
 
 // deviceHandlerAdapter adapts a deviceHandler to the VirtioDevice interface.
@@ -116,16 +116,16 @@ func (a *deviceHandlerAdapter) MaxQueues() uint16 {
 	return uint16(a.handler.NumQueues())
 }
 
-func (a *deviceHandlerAdapter) ReadConfig(offset uint16) uint32 {
-	value, handled, _ := a.handler.ReadConfig(a.dev, uint64(offset))
+func (a *deviceHandlerAdapter) ReadConfig(ctx hv.ExitContext, offset uint16) uint32 {
+	value, handled, _ := a.handler.ReadConfig(ctx, a.dev, uint64(offset))
 	if handled {
 		return value
 	}
 	return 0
 }
 
-func (a *deviceHandlerAdapter) WriteConfig(offset uint16, val uint32) {
-	_, _ = a.handler.WriteConfig(a.dev, uint64(offset), val)
+func (a *deviceHandlerAdapter) WriteConfig(ctx hv.ExitContext, offset uint16, val uint32) {
+	_, _ = a.handler.WriteConfig(ctx, a.dev, uint64(offset), val)
 }
 
 func (a *deviceHandlerAdapter) Enable(features uint64, queues []*VirtQueue) {
@@ -284,7 +284,7 @@ func newMMIODevice(vm hv.VirtualMachine, base uint64, size uint64, irqLine uint3
 	return device
 }
 
-func (d *mmioDevice) writeMMIO(addr uint64, data []byte) error {
+func (d *mmioDevice) writeMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	if err := d.checkMMIOBounds(addr, uint64(len(data))); err != nil {
 		return err
 	}
@@ -292,17 +292,17 @@ func (d *mmioDevice) writeMMIO(addr uint64, data []byte) error {
 		return fmt.Errorf("unsupported MMIO write length %d", len(data))
 	}
 	value := littleEndianValue(data, uint32(len(data)))
-	return d.writeRegister(addr-d.base, value)
+	return d.writeRegister(ctx, addr-d.base, value)
 }
 
-func (d *mmioDevice) readMMIO(addr uint64, data []byte) error {
+func (d *mmioDevice) readMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	if err := d.checkMMIOBounds(addr, uint64(len(data))); err != nil {
 		return err
 	}
 	if len(data) == 0 || len(data) > 8 {
 		return fmt.Errorf("unsupported MMIO read length %d", len(data))
 	}
-	value, err := d.readRegister(addr - d.base)
+	value, err := d.readRegister(ctx, addr-d.base)
 	if err != nil {
 		return err
 	}
@@ -317,7 +317,7 @@ func (d *mmioDevice) checkMMIOBounds(addr, length uint64) error {
 	return nil
 }
 
-func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
+func (d *mmioDevice) writeRegister(ctx hv.ExitContext, offset uint64, value uint32) error {
 	// Helper logger
 	logAccess := func(name string) {
 		// slog.Info("virtio-mmio: write", "reg", name, "val", fmt.Sprintf("%#x", value), "queue_sel", d.queueSel)
@@ -433,7 +433,7 @@ func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
 		}
 	case VIRTIO_MMIO_QUEUE_NOTIFY:
 		if d.handler != nil {
-			err := d.handler.OnQueueNotify(d, int(value))
+			err := d.handler.OnQueueNotify(ctx, d, int(value))
 			// Queue notification doesn't directly set interrupt status,
 			// but the handler may call raiseInterrupt
 			return err
@@ -465,12 +465,12 @@ func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
 			// Device-specific config write
 			if d.virtioDevice != nil {
 				relOffset := uint16(offset - VIRTIO_MMIO_CONFIG)
-				d.virtioDevice.WriteConfig(relOffset, value)
+				d.virtioDevice.WriteConfig(ctx, relOffset, value)
 				// Increment config generation on config change
 				d.configGeneration++
 				d.raiseInterrupt(VIRTIO_MMIO_INT_CONFIG)
 			} else if d.handler != nil {
-				handled, err := d.handler.WriteConfig(d, offset, value)
+				handled, err := d.handler.WriteConfig(ctx, d, offset, value)
 				if handled {
 					// Increment config generation on config change
 					d.configGeneration++
@@ -480,7 +480,7 @@ func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
 			}
 			logAccess(fmt.Sprintf("CONFIG_OFFSET_%#x", offset))
 		} else if d.handler != nil {
-			handled, err := d.handler.WriteConfig(d, offset, value)
+			handled, err := d.handler.WriteConfig(ctx, d, offset, value)
 			if handled {
 				return err
 			} else {
@@ -491,7 +491,7 @@ func (d *mmioDevice) writeRegister(offset uint64, value uint32) error {
 	return nil
 }
 
-func (d *mmioDevice) readRegister(offset uint64) (uint32, error) {
+func (d *mmioDevice) readRegister(ctx hv.ExitContext, offset uint64) (uint32, error) {
 	switch offset {
 	case VIRTIO_MMIO_MAGIC_VALUE:
 		// fmt.Fprintf(os.Stderr, "virtio-mmio: read MAGIC -> %#x\n", 0x74726976)
@@ -604,16 +604,16 @@ func (d *mmioDevice) readRegister(offset uint64) (uint32, error) {
 			// Device-specific config read
 			if d.virtioDevice != nil {
 				relOffset := uint16(offset - VIRTIO_MMIO_CONFIG)
-				return d.virtioDevice.ReadConfig(relOffset), nil
+				return d.virtioDevice.ReadConfig(ctx, relOffset), nil
 			} else if d.handler != nil {
-				value, handled, err := d.handler.ReadConfig(d, offset)
+				value, handled, err := d.handler.ReadConfig(ctx, d, offset)
 				if handled {
 					return value, err
 				}
 			}
 			return 0, nil
 		} else if d.handler != nil {
-			value, handled, err := d.handler.ReadConfig(d, offset)
+			value, handled, err := d.handler.ReadConfig(ctx, d, offset)
 			if handled {
 				return value, err
 			}

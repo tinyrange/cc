@@ -45,13 +45,13 @@ func TestPITChannel0GeneratesInterrupts(t *testing.T) {
 		t.Fatalf("init pit: %v", err)
 	}
 
-	if err := pit.WriteIOPort(pitControlPort, []byte{0x36}); err != nil {
+	if err := pit.WriteIOPort(nil, pitControlPort, []byte{0x36}); err != nil {
 		t.Fatalf("write control: %v", err)
 	}
-	if err := pit.WriteIOPort(pitChannel0Port, []byte{0x04}); err != nil {
+	if err := pit.WriteIOPort(nil, pitChannel0Port, []byte{0x04}); err != nil {
 		t.Fatalf("write low byte: %v", err)
 	}
-	if err := pit.WriteIOPort(pitChannel0Port, []byte{0x00}); err != nil {
+	if err := pit.WriteIOPort(nil, pitChannel0Port, []byte{0x00}); err != nil {
 		t.Fatalf("write high byte: %v", err)
 	}
 
@@ -89,11 +89,11 @@ func TestPITChannel0GeneratesInterrupts(t *testing.T) {
 func readPitCounter(t *testing.T, pit *PIT) uint16 {
 	t.Helper()
 	buf := []byte{0}
-	if err := pit.ReadIOPort(pitChannel0Port, buf); err != nil {
+	if err := pit.ReadIOPort(nil, pitChannel0Port, buf); err != nil {
 		t.Fatalf("read low: %v", err)
 	}
 	low := buf[0]
-	if err := pit.ReadIOPort(pitChannel0Port, buf); err != nil {
+	if err := pit.ReadIOPort(nil, pitChannel0Port, buf); err != nil {
 		t.Fatalf("read high: %v", err)
 	}
 	high := buf[0]
@@ -169,14 +169,14 @@ func TestPITMode2PeriodicTimer(t *testing.T) {
 
 	// Mode 2: Rate generator (periodic pulse)
 	// Control word: channel 0, access low/high, mode 2, binary
-	if err := pit.WriteIOPort(pitControlPort, []byte{0x34}); err != nil {
+	if err := pit.WriteIOPort(nil, pitControlPort, []byte{0x34}); err != nil {
 		t.Fatalf("write control: %v", err)
 	}
 	// Set reload value to 5 (period = 5ms)
-	if err := pit.WriteIOPort(pitChannel0Port, []byte{0x05}); err != nil {
+	if err := pit.WriteIOPort(nil, pitChannel0Port, []byte{0x05}); err != nil {
 		t.Fatalf("write low byte: %v", err)
 	}
-	if err := pit.WriteIOPort(pitChannel0Port, []byte{0x00}); err != nil {
+	if err := pit.WriteIOPort(nil, pitChannel0Port, []byte{0x00}); err != nil {
 		t.Fatalf("write high byte: %v", err)
 	}
 
@@ -260,14 +260,14 @@ func TestPITMode0OneShot(t *testing.T) {
 
 	// Mode 0: Interrupt on terminal count (one-shot)
 	// Control word: channel 0, access low/high, mode 0, binary
-	if err := pit.WriteIOPort(pitControlPort, []byte{0x30}); err != nil {
+	if err := pit.WriteIOPort(nil, pitControlPort, []byte{0x30}); err != nil {
 		t.Fatalf("write control: %v", err)
 	}
 	// Set reload value to 3 (should fire after 3ms)
-	if err := pit.WriteIOPort(pitChannel0Port, []byte{0x03}); err != nil {
+	if err := pit.WriteIOPort(nil, pitChannel0Port, []byte{0x03}); err != nil {
 		t.Fatalf("write low byte: %v", err)
 	}
-	if err := pit.WriteIOPort(pitChannel0Port, []byte{0x00}); err != nil {
+	if err := pit.WriteIOPort(nil, pitChannel0Port, []byte{0x00}); err != nil {
 		t.Fatalf("write high byte: %v", err)
 	}
 
@@ -326,14 +326,14 @@ func TestPITCounterLatchAndReadback(t *testing.T) {
 
 	// Configure channel 0 in mode 2 with reload value 0x1234
 	// Control word 0x34: channel 0, access low/high, mode 2, binary
-	if err := pit.WriteIOPort(pitControlPort, []byte{0x34}); err != nil {
+	if err := pit.WriteIOPort(nil, pitControlPort, []byte{0x34}); err != nil {
 		t.Fatalf("write control: %v", err)
 	}
 	// Write reload value to start the channel
-	if err := pit.WriteIOPort(pitChannel0Port, []byte{0x34}); err != nil {
+	if err := pit.WriteIOPort(nil, pitChannel0Port, []byte{0x34}); err != nil {
 		t.Fatalf("write low byte: %v", err)
 	}
-	if err := pit.WriteIOPort(pitChannel0Port, []byte{0x12}); err != nil {
+	if err := pit.WriteIOPort(nil, pitChannel0Port, []byte{0x12}); err != nil {
 		t.Fatalf("write high byte: %v", err)
 	}
 
@@ -348,18 +348,18 @@ func TestPITCounterLatchAndReadback(t *testing.T) {
 
 	// Latch count using control port command
 	// Latch command: channel 0, latch count
-	if err := pit.WriteIOPort(pitControlPort, []byte{0x00}); err != nil {
+	if err := pit.WriteIOPort(nil, pitControlPort, []byte{0x00}); err != nil {
 		t.Fatalf("latch count: %v", err)
 	}
 
 	// Read latched value (should be stable even as time advances)
 	advance(5 * time.Millisecond)
 	buf := []byte{0}
-	if err := pit.ReadIOPort(pitChannel0Port, buf); err != nil {
+	if err := pit.ReadIOPort(nil, pitChannel0Port, buf); err != nil {
 		t.Fatalf("read low byte: %v", err)
 	}
 	low := buf[0]
-	if err := pit.ReadIOPort(pitChannel0Port, buf); err != nil {
+	if err := pit.ReadIOPort(nil, pitChannel0Port, buf); err != nil {
 		t.Fatalf("read high byte: %v", err)
 	}
 	high := buf[0]
@@ -373,14 +373,14 @@ func TestPITCounterLatchAndReadback(t *testing.T) {
 	}
 
 	// Latch again and verify we get a new latched value
-	if err := pit.WriteIOPort(pitControlPort, []byte{0x00}); err != nil {
+	if err := pit.WriteIOPort(nil, pitControlPort, []byte{0x00}); err != nil {
 		t.Fatalf("latch count again: %v", err)
 	}
-	if err := pit.ReadIOPort(pitChannel0Port, buf); err != nil {
+	if err := pit.ReadIOPort(nil, pitChannel0Port, buf); err != nil {
 		t.Fatalf("read latched low byte: %v", err)
 	}
 	latchedLow := buf[0]
-	if err := pit.ReadIOPort(pitChannel0Port, buf); err != nil {
+	if err := pit.ReadIOPort(nil, pitChannel0Port, buf); err != nil {
 		t.Fatalf("read latched high byte: %v", err)
 	}
 	latchedHigh := buf[0]
@@ -394,13 +394,13 @@ func TestPITCounterLatchAndReadback(t *testing.T) {
 	// Test readback command (0xC2 = readback all counters, status and count)
 	// Readback command format: 11 (readback) | 0 (reserved) | 111 (all counters) | 11 (status+count)
 	// This latches status and count for all channels
-	if err := pit.WriteIOPort(pitControlPort, []byte{0xC2}); err != nil {
+	if err := pit.WriteIOPort(nil, pitControlPort, []byte{0xC2}); err != nil {
 		t.Fatalf("readback command: %v", err)
 	}
 
 	// After readback, we should be able to read status and count for channel 0
 	// Channel 0 status (read first if latched)
-	if err := pit.ReadIOPort(pitChannel0Port, buf); err != nil {
+	if err := pit.ReadIOPort(nil, pitChannel0Port, buf); err != nil {
 		t.Fatalf("read status: %v", err)
 	}
 	status := buf[0]
@@ -421,11 +421,11 @@ func TestPITCounterLatchAndReadback(t *testing.T) {
 	}
 
 	// Channel 0 count (latched by readback command)
-	if err := pit.ReadIOPort(pitChannel0Port, buf); err != nil {
+	if err := pit.ReadIOPort(nil, pitChannel0Port, buf); err != nil {
 		t.Fatalf("read count low: %v", err)
 	}
 	readbackLow := buf[0]
-	if err := pit.ReadIOPort(pitChannel0Port, buf); err != nil {
+	if err := pit.ReadIOPort(nil, pitChannel0Port, buf); err != nil {
 		t.Fatalf("read count high: %v", err)
 	}
 	readbackHigh := buf[0]
@@ -484,22 +484,22 @@ func TestPITChannel2GatedMode0(t *testing.T) {
 
 	// Configure channel 2 in mode 0 (one-shot)
 	// Control word 0xB0: channel 2, access low/high, mode 0, binary
-	if err := pit.WriteIOPort(pitControlPort, []byte{0xB0}); err != nil {
+	if err := pit.WriteIOPort(nil, pitControlPort, []byte{0xB0}); err != nil {
 		t.Fatalf("write control: %v", err)
 	}
 
 	// Write count value (10 ticks = 10ms with 1ms tick)
-	if err := pit.WriteIOPort(pitChannel2Port, []byte{0x0A}); err != nil {
+	if err := pit.WriteIOPort(nil, pitChannel2Port, []byte{0x0A}); err != nil {
 		t.Fatalf("write low byte: %v", err)
 	}
-	if err := pit.WriteIOPort(pitChannel2Port, []byte{0x00}); err != nil {
+	if err := pit.WriteIOPort(nil, pitChannel2Port, []byte{0x00}); err != nil {
 		t.Fatalf("write high byte: %v", err)
 	}
 
 	// Gate is initially low - channel should be armed but NOT running
 	// Output should stay HIGH (not counting yet)
 	buf := []byte{0}
-	if err := port61.ReadIOPort(pitPort61, buf); err != nil {
+	if err := port61.ReadIOPort(nil, pitPort61, buf); err != nil {
 		t.Fatalf("read port61: %v", err)
 	}
 	if buf[0]&1 != 0 {
@@ -507,7 +507,7 @@ func TestPITChannel2GatedMode0(t *testing.T) {
 	}
 
 	// Check output is HIGH (bit 5 of port 0x61) - counter hasn't started
-	if err := port61.ReadIOPort(pitPort61, buf); err != nil {
+	if err := port61.ReadIOPort(nil, pitPort61, buf); err != nil {
 		t.Fatalf("read port61 output: %v", err)
 	}
 	if buf[0]&(1<<5) == 0 {
@@ -516,7 +516,7 @@ func TestPITChannel2GatedMode0(t *testing.T) {
 
 	// Advance time - counter should NOT have started (still armed)
 	advance(5 * time.Millisecond)
-	if err := port61.ReadIOPort(pitPort61, buf); err != nil {
+	if err := port61.ReadIOPort(nil, pitPort61, buf); err != nil {
 		t.Fatalf("read port61 after delay: %v", err)
 	}
 	if buf[0]&(1<<5) == 0 {
@@ -524,12 +524,12 @@ func TestPITChannel2GatedMode0(t *testing.T) {
 	}
 
 	// Enable gate via port 0x61 bit 0 - this should trigger countdown
-	if err := port61.WriteIOPort(pitPort61, []byte{0x01}); err != nil {
+	if err := port61.WriteIOPort(nil, pitPort61, []byte{0x01}); err != nil {
 		t.Fatalf("enable gate: %v", err)
 	}
 
 	// Output should now be LOW (countdown started)
-	if err := port61.ReadIOPort(pitPort61, buf); err != nil {
+	if err := port61.ReadIOPort(nil, pitPort61, buf); err != nil {
 		t.Fatalf("read port61 after gate enable: %v", err)
 	}
 	if buf[0]&(1<<5) != 0 {
@@ -538,7 +538,7 @@ func TestPITChannel2GatedMode0(t *testing.T) {
 
 	// Advance partway through countdown - output should still be LOW
 	advance(5 * time.Millisecond)
-	if err := port61.ReadIOPort(pitPort61, buf); err != nil {
+	if err := port61.ReadIOPort(nil, pitPort61, buf); err != nil {
 		t.Fatalf("read port61 during countdown: %v", err)
 	}
 	if buf[0]&(1<<5) != 0 {
@@ -547,7 +547,7 @@ func TestPITChannel2GatedMode0(t *testing.T) {
 
 	// Advance past countdown completion - output should be HIGH
 	advance(10 * time.Millisecond)
-	if err := port61.ReadIOPort(pitPort61, buf); err != nil {
+	if err := port61.ReadIOPort(nil, pitPort61, buf); err != nil {
 		t.Fatalf("read port61 after countdown: %v", err)
 	}
 	if buf[0]&(1<<5) == 0 {
@@ -587,19 +587,19 @@ func TestPITPort61Integration(t *testing.T) {
 	}
 
 	// Configure channel 2 in mode 3 (square wave) with reload value 0x10
-	if err := pit.WriteIOPort(pitControlPort, []byte{0xB6}); err != nil {
+	if err := pit.WriteIOPort(nil, pitControlPort, []byte{0xB6}); err != nil {
 		t.Fatalf("write control: %v", err)
 	}
-	if err := pit.WriteIOPort(pitChannel2Port, []byte{0x10}); err != nil {
+	if err := pit.WriteIOPort(nil, pitChannel2Port, []byte{0x10}); err != nil {
 		t.Fatalf("write low byte: %v", err)
 	}
-	if err := pit.WriteIOPort(pitChannel2Port, []byte{0x00}); err != nil {
+	if err := pit.WriteIOPort(nil, pitChannel2Port, []byte{0x00}); err != nil {
 		t.Fatalf("write high byte: %v", err)
 	}
 
 	// Initially gate should be low (disabled)
 	buf := []byte{0}
-	if err := port61.ReadIOPort(pitPort61, buf); err != nil {
+	if err := port61.ReadIOPort(nil, pitPort61, buf); err != nil {
 		t.Fatalf("read port61: %v", err)
 	}
 	initialVal := buf[0]
@@ -608,12 +608,12 @@ func TestPITPort61Integration(t *testing.T) {
 	}
 
 	// Enable gate via port 0x61 bit 0
-	if err := port61.WriteIOPort(pitPort61, []byte{0x01}); err != nil {
+	if err := port61.WriteIOPort(nil, pitPort61, []byte{0x01}); err != nil {
 		t.Fatalf("write port61 gate: %v", err)
 	}
 
 	// Verify gate bit is set
-	if err := port61.ReadIOPort(pitPort61, buf); err != nil {
+	if err := port61.ReadIOPort(nil, pitPort61, buf); err != nil {
 		t.Fatalf("read port61 after write: %v", err)
 	}
 	val := buf[0]
@@ -623,7 +623,7 @@ func TestPITPort61Integration(t *testing.T) {
 
 	// Advance time and check channel 2 output status (bit 5)
 	advance(5 * time.Millisecond)
-	if err := port61.ReadIOPort(pitPort61, buf); err != nil {
+	if err := port61.ReadIOPort(nil, pitPort61, buf); err != nil {
 		t.Fatalf("read port61 output: %v", err)
 	}
 	outputVal := buf[0]
@@ -635,10 +635,10 @@ func TestPITPort61Integration(t *testing.T) {
 	}
 
 	// Test speaker data bit (bit 1)
-	if err := port61.WriteIOPort(pitPort61, []byte{0x03}); err != nil {
+	if err := port61.WriteIOPort(nil, pitPort61, []byte{0x03}); err != nil {
 		t.Fatalf("write port61 speaker: %v", err)
 	}
-	if err := port61.ReadIOPort(pitPort61, buf); err != nil {
+	if err := port61.ReadIOPort(nil, pitPort61, buf); err != nil {
 		t.Fatalf("read port61 speaker: %v", err)
 	}
 	speakerVal := buf[0]
@@ -648,7 +648,7 @@ func TestPITPort61Integration(t *testing.T) {
 
 	// Test refresh bit (bit 4) - should toggle on each read
 	refresh1 := (speakerVal & (1 << 4)) != 0
-	if err := port61.ReadIOPort(pitPort61, buf); err != nil {
+	if err := port61.ReadIOPort(nil, pitPort61, buf); err != nil {
 		t.Fatalf("read port61 refresh: %v", err)
 	}
 	refresh2 := (buf[0] & (1 << 4)) != 0
@@ -657,11 +657,11 @@ func TestPITPort61Integration(t *testing.T) {
 	}
 
 	// Disable gate and verify channel 2 stops
-	if err := port61.WriteIOPort(pitPort61, []byte{0x02}); err != nil {
+	if err := port61.WriteIOPort(nil, pitPort61, []byte{0x02}); err != nil {
 		t.Fatalf("write port61 disable gate: %v", err)
 	}
 	advance(10 * time.Millisecond)
-	if err := port61.ReadIOPort(pitPort61, buf); err != nil {
+	if err := port61.ReadIOPort(nil, pitPort61, buf); err != nil {
 		t.Fatalf("read port61 after disable: %v", err)
 	}
 	gateDisabled := buf[0]

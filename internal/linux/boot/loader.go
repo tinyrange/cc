@@ -501,7 +501,7 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 
 	legacy := hv.SimpleX86IOPortDevice{
 		Ports: legacyPorts,
-		ReadFunc: func(port uint16, data []byte) error {
+		ReadFunc: func(ctx hv.ExitContext, port uint16, data []byte) error {
 			if port == 0x12 {
 				return hv.ErrGuestRequestedReboot
 			}
@@ -511,7 +511,7 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 			}
 			return nil
 		},
-		WriteFunc: func(port uint16, data []byte) error {
+		WriteFunc: func(ctx hv.ExitContext, port uint16, data []byte) error {
 			// slog.Info("legacy port write", "port", fmt.Sprintf("0x%04x", port), "size", len(data), "data", data)
 			return nil
 		},

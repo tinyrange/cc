@@ -10,6 +10,7 @@ import (
 
 	"github.com/tinyrange/cc/internal/debug"
 	"github.com/tinyrange/cc/internal/hv"
+	"github.com/tinyrange/cc/internal/timeslice"
 	"golang.org/x/sys/unix"
 )
 
@@ -154,6 +155,10 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 
 	reason := kvmExitReason(run.exit_reason)
 
+	exitCtx := &exitContext{
+		timeslice: timeslice.InvalidTimesliceID,
+	}
+
 	switch reason {
 	case kvmExitInternalError:
 		err := (*internalError)(unsafe.Pointer(&run.anon0[0]))
@@ -161,7 +166,7 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	case kvmExitMmio:
 		mmioData := (*kvmExitMMIOData)(unsafe.Pointer(&run.anon0[0]))
 
-		return v.handleMMIO(mmioData)
+		return v.handleMMIO(exitCtx, mmioData)
 	case kvmExitSystemEvent:
 		system := (*kvmSystemEvent)(unsafe.Pointer(&run.anon0[0]))
 		if system.typ == uint32(kvmSystemEventShutdown) {
@@ -175,7 +180,7 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	}
 }
 
-func (v *virtualCPU) handleMMIO(mmioData *kvmExitMMIOData) error {
+func (v *virtualCPU) handleMMIO(exitCtx *exitContext, mmioData *kvmExitMMIOData) error {
 	for _, dev := range v.vm.devices {
 		if kvmMmioDevice, ok := dev.(hv.MemoryMappedIODevice); ok {
 			addr := mmioData.physAddr
@@ -186,11 +191,11 @@ func (v *virtualCPU) handleMMIO(mmioData *kvmExitMMIOData) error {
 					data := mmioData.data[:size]
 
 					if mmioData.isWrite == 0 {
-						if err := kvmMmioDevice.ReadMMIO(addr, data); err != nil {
+						if err := kvmMmioDevice.ReadMMIO(exitCtx, addr, data); err != nil {
 							return fmt.Errorf("MMIO read at 0x%016x: %w", addr, err)
 						}
 					} else {
-						if err := kvmMmioDevice.WriteMMIO(addr, data); err != nil {
+						if err := kvmMmioDevice.WriteMMIO(exitCtx, addr, data); err != nil {
 							return fmt.Errorf("MMIO write at 0x%016x: %w", addr, err)
 						}
 					}

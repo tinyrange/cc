@@ -13,6 +13,7 @@ import (
 	"github.com/tinyrange/cc/internal/fdt"
 	"github.com/tinyrange/cc/internal/hv"
 	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
+	"github.com/tinyrange/cc/internal/timeslice"
 )
 
 // -----------------------------
@@ -598,22 +599,31 @@ func (v *FS) MMIORegions() []hv.MMIORegion {
 	}}
 }
 
+var (
+	tsFsRead  = timeslice.RegisterKind("virtio_fs_read", 0)
+	tsFsWrite = timeslice.RegisterKind("virtio_fs_write", 0)
+)
+
 // ReadMMIO implements hv.MemoryMappedIODevice.
-func (v *FS) ReadMMIO(addr uint64, data []byte) error {
+func (v *FS) ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
+	ctx.SetExitTimeslice(tsFsRead)
+
 	dev, err := v.requireDevice()
 	if err != nil {
 		return err
 	}
-	return dev.readMMIO(addr, data)
+	return dev.readMMIO(ctx, addr, data)
 }
 
 // WriteMMIO implements hv.MemoryMappedIODevice.
-func (v *FS) WriteMMIO(addr uint64, data []byte) error {
+func (v *FS) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
+	ctx.SetExitTimeslice(tsFsWrite)
+
 	dev, err := v.requireDevice()
 	if err != nil {
 		return err
 	}
-	return dev.writeMMIO(addr, data)
+	return dev.writeMMIO(ctx, addr, data)
 }
 
 func (v *FS) requireDevice() (device, error) {
@@ -628,7 +638,7 @@ func (v *FS) NumQueues() int          { return fsTotalQueueCount }
 func (v *FS) QueueMaxSize(int) uint16 { return fsQueueNumMax }
 func (v *FS) OnReset(device)          {}
 
-func (v *FS) OnQueueNotify(dev device, qidx int) error {
+func (v *FS) OnQueueNotify(ctx hv.ExitContext, dev device, qidx int) error {
 	if qidx < fsHiprioQueueIndex || qidx >= fsTotalQueueCount {
 		debug.Writef("virtio-fs.OnQueueNotify ignore", "qidx=%d (total=%d)", qidx, fsTotalQueueCount)
 		return nil
@@ -639,11 +649,11 @@ func (v *FS) OnQueueNotify(dev device, qidx int) error {
 	} else {
 		debug.Writef("virtio-fs.OnQueueNotify q!=nil", "qidx=%d ready=%t size=%d lastAvailIdx=%d usedIdx=%d", qidx, q.ready, q.size, q.lastAvailIdx, q.usedIdx)
 	}
-	return v.processQueue(dev, qidx, q)
+	return v.processQueue(ctx, dev, qidx, q)
 }
 
 // Config space
-func (v *FS) ReadConfig(_ device, off uint64) (uint32, bool, error) {
+func (v *FS) ReadConfig(ctx hv.ExitContext, dev device, off uint64) (uint32, bool, error) {
 	// When called through deviceHandlerAdapter, off is already relative to VIRTIO_MMIO_CONFIG
 	// When called directly from MMIO handler, off is absolute and we need to subtract VIRTIO_MMIO_CONFIG
 	cfg := off
@@ -667,11 +677,19 @@ func (v *FS) ReadConfig(_ device, off uint64) (uint32, bool, error) {
 		return 0, false, nil
 	}
 }
-func (v *FS) WriteConfig(device, uint64, uint32) (bool, error) { return false, nil }
+func (v *FS) WriteConfig(ctx hv.ExitContext, dev device, offset uint64, value uint32) (bool, error) {
+	return false, nil
+}
 
 // ------------- queue processing -------------
 
-func (v *FS) processQueue(dev device, qidx int, q *queue) error {
+var (
+	tsFsProcessQueue = timeslice.RegisterKind("virtio_fs_process_queue", 0)
+)
+
+func (v *FS) processQueue(ctx hv.ExitContext, dev device, qidx int, q *queue) error {
+	ctx.SetExitTimeslice(tsFsProcessQueue)
+
 	if q == nil || !q.ready || q.size == 0 {
 		if q == nil {
 			debug.Writef("virtio-fs.processQueue skip", "queue=nil")

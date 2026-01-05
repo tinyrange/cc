@@ -12,6 +12,7 @@ import (
 	"github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/whp/bindings"
+	"github.com/tinyrange/cc/internal/timeslice"
 )
 
 const (
@@ -46,6 +47,10 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	// 	"reason", exit.ExitReason.String(),
 	// 	"rip", fmt.Sprintf("0x%x", exit.VpContext.Rip),
 	// )
+
+	v.exitCtx = &exitContext{
+		timeslice: timeslice.InvalidTimesliceID,
+	}
 
 	switch exit.ExitReason {
 	case bindings.RunVPExitReasonX64Halt:
@@ -216,7 +221,7 @@ func createEmulator() (bindings.EmulatorHandle, error) {
 	ioFn := func(ctx unsafe.Pointer, access *bindings.EmulatorIOAccessInfo) bindings.HRESULT {
 		vcpu := (*virtualCPU)(ctx)
 
-		if err := vcpu.handleIOPortAccess(access); err != nil {
+		if err := vcpu.handleIOPortAccess(vcpu.exitCtx, access); err != nil {
 			vcpu.pendingError = err
 			return bindings.HRESULTFail
 		}
@@ -230,7 +235,7 @@ func createEmulator() (bindings.EmulatorHandle, error) {
 	) bindings.HRESULT {
 		vcpu := (*virtualCPU)(ctx)
 
-		if err := vcpu.handleMemoryAccess(access); err != nil {
+		if err := vcpu.handleMemoryAccess(vcpu.exitCtx, access); err != nil {
 			vcpu.pendingError = err
 		}
 

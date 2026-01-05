@@ -14,7 +14,16 @@ import (
 	"github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/whp/bindings"
+	"github.com/tinyrange/cc/internal/timeslice"
 )
+
+type exitContext struct {
+	timeslice timeslice.TimesliceID
+}
+
+func (c *exitContext) SetExitTimeslice(id timeslice.TimesliceID) {
+	c.timeslice = id
+}
 
 type virtualCPU struct {
 	vm       *virtualMachine
@@ -23,6 +32,8 @@ type virtualCPU struct {
 	done     chan struct{} // closed when the vCPU goroutine exits
 
 	pendingError error
+
+	exitCtx *exitContext
 }
 
 func (v *virtualCPU) start() {
@@ -160,7 +171,7 @@ func (v *virtualCPU) SetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 	return bindings.SetVirtualProcessorRegisters(v.vm.part, uint32(v.id), names, values)
 }
 
-func (v *virtualCPU) handleIOPortAccess(access *bindings.EmulatorIOAccessInfo) error {
+func (v *virtualCPU) handleIOPortAccess(exitCtx *exitContext, access *bindings.EmulatorIOAccessInfo) error {
 	if access.AccessSize != 1 && access.AccessSize != 2 && access.AccessSize != 4 {
 		return fmt.Errorf("whp: unsupported IO port access size %d", access.AccessSize)
 	}
@@ -180,7 +191,7 @@ func (v *virtualCPU) handleIOPortAccess(access *bindings.EmulatorIOAccessInfo) e
 	}
 
 	isWrite := access.Direction != bindings.EmulatorIOAccessDirectionIn
-	if err := cs.HandlePIO(access.Port, data[:access.AccessSize], isWrite); err != nil {
+	if err := cs.HandlePIO(exitCtx, access.Port, data[:access.AccessSize], isWrite); err != nil {
 		return fmt.Errorf("I/O port 0x%04x: %w", access.Port, err)
 	}
 
@@ -194,7 +205,7 @@ func (v *virtualCPU) handleIOPortAccess(access *bindings.EmulatorIOAccessInfo) e
 	return nil
 }
 
-func (v *virtualCPU) handleMemoryAccess(access *bindings.EmulatorMemoryAccessInfo) error {
+func (v *virtualCPU) handleMemoryAccess(exitCtx *exitContext, access *bindings.EmulatorMemoryAccessInfo) error {
 	gpa := access.GpaAddress
 	size := uint64(access.AccessSize)
 
@@ -231,7 +242,7 @@ func (v *virtualCPU) handleMemoryAccess(access *bindings.EmulatorMemoryAccessInf
 	}
 
 	isWrite := access.Direction != bindings.EmulatorMemoryAccessDirectionRead
-	if err := cs.HandleMMIO(gpa, dataSlice, isWrite); err != nil {
+	if err := cs.HandleMMIO(exitCtx, gpa, dataSlice, isWrite); err != nil {
 		return fmt.Errorf("MMIO at 0x%016x: %w", gpa, err)
 	}
 	return nil
@@ -573,24 +584,24 @@ type portIOAdapter struct {
 	dev hv.X86IOPortDevice
 }
 
-func (p portIOAdapter) ReadIOPort(port uint16, data []byte) error {
-	return p.dev.ReadIOPort(port, data)
+func (p portIOAdapter) ReadIOPort(exitCtx hv.ExitContext, port uint16, data []byte) error {
+	return p.dev.ReadIOPort(exitCtx, port, data)
 }
 
-func (p portIOAdapter) WriteIOPort(port uint16, data []byte) error {
-	return p.dev.WriteIOPort(port, data)
+func (p portIOAdapter) WriteIOPort(exitCtx hv.ExitContext, port uint16, data []byte) error {
+	return p.dev.WriteIOPort(exitCtx, port, data)
 }
 
 type mmioAdapter struct {
 	dev hv.MemoryMappedIODevice
 }
 
-func (m mmioAdapter) ReadMMIO(addr uint64, data []byte) error {
-	return m.dev.ReadMMIO(addr, data)
+func (m mmioAdapter) ReadMMIO(exitCtx hv.ExitContext, addr uint64, data []byte) error {
+	return m.dev.ReadMMIO(exitCtx, addr, data)
 }
 
-func (m mmioAdapter) WriteMMIO(addr uint64, data []byte) error {
-	return m.dev.WriteMMIO(addr, data)
+func (m mmioAdapter) WriteMMIO(exitCtx hv.ExitContext, addr uint64, data []byte) error {
+	return m.dev.WriteMMIO(exitCtx, addr, data)
 }
 
 type hypervisor struct{}

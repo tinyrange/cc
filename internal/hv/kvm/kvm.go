@@ -14,8 +14,17 @@ import (
 	corechipset "github.com/tinyrange/cc/internal/chipset"
 	x86chipset "github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	"github.com/tinyrange/cc/internal/hv"
+	"github.com/tinyrange/cc/internal/timeslice"
 	"golang.org/x/sys/unix"
 )
+
+type exitContext struct {
+	timeslice timeslice.TimesliceID
+}
+
+func (c *exitContext) SetExitTimeslice(id timeslice.TimesliceID) {
+	c.timeslice = id
+}
 
 type virtualCPU struct {
 	vm       *virtualMachine
@@ -438,24 +447,24 @@ type portIOAdapter struct {
 	dev hv.X86IOPortDevice
 }
 
-func (p portIOAdapter) ReadIOPort(port uint16, data []byte) error {
-	return p.dev.ReadIOPort(port, data)
+func (p portIOAdapter) ReadIOPort(ctx hv.ExitContext, port uint16, data []byte) error {
+	return p.dev.ReadIOPort(ctx, port, data)
 }
 
-func (p portIOAdapter) WriteIOPort(port uint16, data []byte) error {
-	return p.dev.WriteIOPort(port, data)
+func (p portIOAdapter) WriteIOPort(ctx hv.ExitContext, port uint16, data []byte) error {
+	return p.dev.WriteIOPort(ctx, port, data)
 }
 
 type mmioAdapter struct {
 	dev hv.MemoryMappedIODevice
 }
 
-func (m mmioAdapter) ReadMMIO(addr uint64, data []byte) error {
-	return m.dev.ReadMMIO(addr, data)
+func (m mmioAdapter) ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
+	return m.dev.ReadMMIO(ctx, addr, data)
 }
 
-func (m mmioAdapter) WriteMMIO(addr uint64, data []byte) error {
-	return m.dev.WriteMMIO(addr, data)
+func (m mmioAdapter) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
+	return m.dev.WriteMMIO(ctx, addr, data)
 }
 
 var (

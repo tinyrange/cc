@@ -93,9 +93,9 @@ func (s *Serial16550MMIO) SupportsPollDevice() *chipset.PollDevice {
 }
 
 // ReadMMIO implements chipset.MmioHandler.
-func (s *Serial16550MMIO) ReadMMIO(addr uint64, data []byte) error {
+func (s *Serial16550MMIO) ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	for i := range data {
-		val, err := s.readByte(addr + uint64(i))
+		val, err := s.readByte(ctx, addr+uint64(i))
 		if err != nil {
 			return err
 		}
@@ -105,9 +105,9 @@ func (s *Serial16550MMIO) ReadMMIO(addr uint64, data []byte) error {
 }
 
 // WriteMMIO implements chipset.MmioHandler.
-func (s *Serial16550MMIO) WriteMMIO(addr uint64, data []byte) error {
+func (s *Serial16550MMIO) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	for i := range data {
-		if err := s.writeByte(addr+uint64(i), data[i]); err != nil {
+		if err := s.writeByte(ctx, addr+uint64(i), data[i]); err != nil {
 			return err
 		}
 	}
@@ -115,7 +115,7 @@ func (s *Serial16550MMIO) WriteMMIO(addr uint64, data []byte) error {
 }
 
 // readByte reads a single byte from the MMIO address, mapping it to a register offset.
-func (s *Serial16550MMIO) readByte(addr uint64) (byte, error) {
+func (s *Serial16550MMIO) readByte(ctx hv.ExitContext, addr uint64) (byte, error) {
 	if addr < s.base || addr >= s.base+s.size {
 		return 0, fmt.Errorf("serial16550-mmio: address 0x%x out of bounds", addr)
 	}
@@ -137,14 +137,14 @@ func (s *Serial16550MMIO) readByte(addr uint64) (byte, error) {
 	// Read from underlying Serial16550 using register index as port offset
 	port := uint16(regIndex)
 	var result [1]byte
-	if err := s.serial.ReadIOPort(port, result[:]); err != nil {
+	if err := s.serial.ReadIOPort(ctx, port, result[:]); err != nil {
 		return 0, err
 	}
 	return result[0], nil
 }
 
 // writeByte writes a single byte to the MMIO address, mapping it to a register offset.
-func (s *Serial16550MMIO) writeByte(addr uint64, value byte) error {
+func (s *Serial16550MMIO) writeByte(ctx hv.ExitContext, addr uint64, value byte) error {
 	if addr < s.base || addr >= s.base+s.size {
 		return fmt.Errorf("serial16550-mmio: address 0x%x out of bounds", addr)
 	}
@@ -165,7 +165,7 @@ func (s *Serial16550MMIO) writeByte(addr uint64, value byte) error {
 
 	// Write to underlying Serial16550 using register index as port offset
 	port := uint16(regIndex)
-	return s.serial.WriteIOPort(port, []byte{value})
+	return s.serial.WriteIOPort(ctx, port, []byte{value})
 }
 
 // SetIRQLine configures the LineInterrupt used for IRQ delivery.

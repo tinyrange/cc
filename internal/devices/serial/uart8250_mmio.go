@@ -85,23 +85,23 @@ func (s *UART8250MMIO) MMIORegions() []hv.MMIORegion {
 }
 
 // ReadMMIO implements hv.MemoryMappedIODevice.
-func (s *UART8250MMIO) ReadMMIO(addr uint64, data []byte) error {
+func (s *UART8250MMIO) ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	for i := range data {
-		val, _ := s.readByte(addr + uint64(i))
+		val, _ := s.readByte(ctx, addr+uint64(i))
 		data[i] = val
 	}
 	return nil
 }
 
 // WriteMMIO implements hv.MemoryMappedIODevice.
-func (s *UART8250MMIO) WriteMMIO(addr uint64, data []byte) error {
+func (s *UART8250MMIO) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	for i := range data {
-		s.writeByte(addr+uint64(i), data[i])
+		s.writeByte(ctx, addr+uint64(i), data[i])
 	}
 	return nil
 }
 
-func (s *UART8250MMIO) readByte(addr uint64) (byte, bool) {
+func (s *UART8250MMIO) readByte(ctx hv.ExitContext, addr uint64) (byte, bool) {
 	if addr < s.base || addr >= s.base+UART8250MMIOSize {
 		return 0, false
 	}
@@ -116,7 +116,7 @@ func (s *UART8250MMIO) readByte(addr uint64) (byte, bool) {
 	return s.readRegister(uint16(reg)), true
 }
 
-func (s *UART8250MMIO) writeByte(addr uint64, value byte) {
+func (s *UART8250MMIO) writeByte(ctx hv.ExitContext, addr uint64, value byte) {
 	if addr < s.base || addr >= s.base+UART8250MMIOSize {
 		return
 	}

@@ -255,6 +255,8 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		break
 	}
 
+	exitCtx := &exitContext{}
+
 	reason := kvmExitReason(run.exit_reason)
 
 	debug.Writef("kvm-amd64.Run exit", "vCPU %d exited with reason %s", v.id, reason)
@@ -269,11 +271,11 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	case kvmExitIo:
 		ioData := (*kvmExitIoData)(unsafe.Pointer(&run.anon0[0]))
 
-		return v.handleIO(ioData)
+		return v.handleIO(exitCtx, ioData)
 	case kvmExitMmio:
 		mmioData := (*kvmExitMMIOData)(unsafe.Pointer(&run.anon0[0]))
 
-		return v.handleMMIO(mmioData)
+		return v.handleMMIO(exitCtx, mmioData)
 	case kvmExitIoapicEoi:
 		eoiData := (*kvmExitIoapicEoiData)(unsafe.Pointer(&run.anon0[0]))
 		return v.handleIoapicEoi(eoiData)
@@ -297,7 +299,7 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	}
 }
 
-func (v *virtualCPU) handleIO(ioData *kvmExitIoData) error {
+func (v *virtualCPU) handleIO(exitCtx *exitContext, ioData *kvmExitIoData) error {
 	data := v.run[ioData.dataOffset : ioData.dataOffset+uint64(ioData.size)*uint64(ioData.count)]
 
 	v.trace(fmt.Sprintf("handleIO port=0x%04x size=%d count=%d direction=%d data=% x",
@@ -311,7 +313,7 @@ func (v *virtualCPU) handleIO(ioData *kvmExitIoData) error {
 	}
 
 	isWrite := ioData.direction != 0
-	if err := cs.HandlePIO(ioData.port, data, isWrite); err != nil {
+	if err := cs.HandlePIO(exitCtx, ioData.port, data, isWrite); err != nil {
 		return fmt.Errorf("I/O port 0x%04x: %w", ioData.port, err)
 	}
 
@@ -323,7 +325,7 @@ func (v *virtualCPU) handleIO(ioData *kvmExitIoData) error {
 	return nil
 }
 
-func (v *virtualCPU) handleMMIO(mmioData *kvmExitMMIOData) error {
+func (v *virtualCPU) handleMMIO(exitCtx *exitContext, mmioData *kvmExitMMIOData) error {
 	v.trace(fmt.Sprintf("handleMMIO physAddr=0x%016x size=%d isWrite=%d data=% x",
 		mmioData.physAddr, mmioData.len, mmioData.isWrite, mmioData.data))
 	debug.Writef("kvm-amd64.handleMMIO", "handleMMIO physAddr=0x%016x size=%d isWrite=%d data=% x", mmioData.physAddr, mmioData.len, mmioData.isWrite, mmioData.data)
@@ -340,7 +342,7 @@ func (v *virtualCPU) handleMMIO(mmioData *kvmExitMMIOData) error {
 	data := mmioData.data[:size]
 	isWrite := mmioData.isWrite != 0
 
-	if err := cs.HandleMMIO(mmioData.physAddr, data, isWrite); err != nil {
+	if err := cs.HandleMMIO(exitCtx, mmioData.physAddr, data, isWrite); err != nil {
 		return fmt.Errorf("MMIO at 0x%016x: %w", mmioData.physAddr, err)
 	}
 

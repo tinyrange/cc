@@ -24,7 +24,7 @@ func (p *Port61) Init(vm hv.VirtualMachine) error {
 
 func (p *Port61) IOPorts() []uint16 { return []uint16{pitPort61} }
 
-func (p *Port61) ReadIOPort(port uint16, data []byte) error {
+func (p *Port61) ReadIOPort(ctx hv.ExitContext, port uint16, data []byte) error {
 	if len(data) != 1 {
 		return hv.ErrInterrupted
 	}
@@ -54,7 +54,7 @@ func (p *Port61) ReadIOPort(port uint16, data []byte) error {
 	return nil
 }
 
-func (p *Port61) WriteIOPort(port uint16, data []byte) error {
+func (p *Port61) WriteIOPort(ctx hv.ExitContext, port uint16, data []byte) error {
 	if len(data) != 1 {
 		return hv.ErrInterrupted
 	}

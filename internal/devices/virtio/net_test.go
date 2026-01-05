@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/tinyrange/cc/internal/hv"
+	"github.com/tinyrange/cc/internal/timeslice"
 )
 
 const (
@@ -114,10 +115,15 @@ func (m *mockVM) RestoreSnapshot(snap hv.Snapshot) error {
 	return nil
 }
 
+type mockExitContext struct {
+}
+
+func (m *mockExitContext) SetExitTimeslice(timeslice timeslice.TimesliceID) {}
+
 // Helper function to read 32-bit value from MMIO
 func mmioRead32(t *testing.T, dev *Net, base uint64, offset uint64) uint32 {
 	var data [4]byte
-	err := dev.ReadMMIO(base+offset, data[:])
+	err := dev.ReadMMIO(&mockExitContext{}, base+offset, data[:])
 	if err != nil {
 		t.Fatalf("MMIO read failed: %v", err)
 	}
@@ -128,7 +134,7 @@ func mmioRead32(t *testing.T, dev *Net, base uint64, offset uint64) uint32 {
 func mmioWrite32(t *testing.T, dev *Net, base uint64, offset uint64, value uint32) {
 	var data [4]byte
 	binary.LittleEndian.PutUint32(data[:], value)
-	err := dev.WriteMMIO(base+offset, data[:])
+	err := dev.WriteMMIO(&mockExitContext{}, base+offset, data[:])
 	if err != nil {
 		t.Fatalf("MMIO write failed: %v", err)
 	}

@@ -140,7 +140,7 @@ func (d *Device) offsetFor(addr uint64) (uint64, error) {
 }
 
 // ReadMMIO handles HPET register reads.
-func (d *Device) ReadMMIO(addr uint64, data []byte) error {
+func (d *Device) ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -191,7 +191,7 @@ func (d *Device) ReadMMIO(addr uint64, data []byte) error {
 	return nil
 }
 
-func (d *Device) WriteMMIO(addr uint64, data []byte) error {
+func (d *Device) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
