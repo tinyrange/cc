@@ -42,8 +42,10 @@ func main() {
 		go func() {
 			defer wg.Done()
 
+			rec := timeslice.NewRecorder()
+
 			for i := 0; i < *count; i++ {
-				timeslice.Record(tsKind)
+				rec.Record(tsKind)
 			}
 		}()
 	}
