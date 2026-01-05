@@ -190,7 +190,7 @@ func Open(w io.Writer) (io.Closer, error) {
 	}
 
 	writer := &writer{w: w,
-		writerChan:          make(chan record, 4096/16),
+		writerChan:          make(chan record, 4096),
 		writeThreadComplete: make(chan error),
 	}
 	go writer.run()
@@ -226,14 +226,17 @@ func ReadAllRecords(r io.Reader, fn func(id string, flags SliceFlags, duration t
 	}
 
 	// skip the padding
-	if _, err := buf.Discard((int(header.RecordKindsLength) + binary.Size(header)) % 4096); err != nil {
-		return err
+	off := int(header.RecordKindsLength) + binary.Size(header)
+	if off%4096 != 0 {
+		if _, err := buf.Discard(4096 - off%4096); err != nil {
+			return err
+		}
 	}
 
 	// read the records
 	for {
 		var record record
-		if err := binary.Read(r, binary.LittleEndian, &record); err != nil {
+		if err := binary.Read(buf, binary.LittleEndian, &record); err != nil {
 			if err == io.EOF {
 				break
 			}
