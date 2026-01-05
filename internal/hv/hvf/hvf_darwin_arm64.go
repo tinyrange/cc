@@ -9,11 +9,21 @@ import (
 	"log/slog"
 	"runtime"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/hvf/bindings"
+	"github.com/tinyrange/cc/internal/timeslice"
 	"golang.org/x/sys/unix"
+)
+
+var (
+	tsHvfGuestTime     = timeslice.RegisterKind("hvf_guest_time", timeslice.SliceFlagGuestTime)
+	tsHvfHostTime      = timeslice.RegisterKind("hvf_host_time", 0)
+	tsHvfFirstRunStart = timeslice.RegisterKind("hvf_first_run_start", 0)
+
+	tsHvfStartTime = time.Now()
 )
 
 var globalVM atomic.Pointer[virtualMachine]
@@ -59,8 +69,18 @@ var sysRegisterMap = map[hv.Register]bindings.SysReg{
 	hv.RegisterARM64Sp:   bindings.HV_SYS_REG_SP_EL1,
 }
 
+type exitContext struct {
+	kind timeslice.TimesliceID
+}
+
+func (ctx *exitContext) SetExitTimeslice(id timeslice.TimesliceID) {
+	ctx.kind = id
+}
+
 type virtualCPU struct {
 	vm *virtualMachine
+
+	rec *timeslice.Recorder
 
 	id   bindings.VCPU
 	exit *bindings.VcpuExit
@@ -157,18 +177,34 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		defer stopExit()
 	}
 
+	v.rec.Record(tsHvfHostTime)
+
 	if err := bindings.HvVcpuRun(v.id); err != bindings.HV_SUCCESS {
 		return fmt.Errorf("hvf: failed to run vCPU %d: %w", v.id, err)
 	}
 
+	v.rec.Record(tsHvfGuestTime)
+
+	exitCtx := &exitContext{
+		kind: timeslice.InvalidTimesliceID,
+	}
+
 	switch v.exit.Reason {
 	case bindings.HV_EXIT_REASON_EXCEPTION:
-		return v.handleException()
+		if err := v.handleException(exitCtx); err != nil {
+			return err
+		}
 	case bindings.HV_EXIT_REASON_CANCELED:
 		return ctx.Err()
 	default:
 		return fmt.Errorf("hvf: unknown exit reason %s", v.exit.Reason)
 	}
+
+	if exitCtx.kind != timeslice.InvalidTimesliceID {
+		v.rec.Record(exitCtx.kind)
+	}
+
+	return nil
 }
 
 type exceptionClass uint64
@@ -200,17 +236,17 @@ const (
 	exceptionClassShift = 26
 )
 
-func (v *virtualCPU) handleException() error {
+func (v *virtualCPU) handleException(exitCtx *exitContext) error {
 	syndrome := v.exit.Exception.Syndrome
 	ec := exceptionClass((syndrome >> exceptionClassShift) & exceptionClassMask)
 
 	switch ec {
 	case exceptionClassHvc:
-		return v.handleHvc()
+		return v.handleHvc(exitCtx)
 	case exceptionClassDataAbortLowerEL:
-		return v.handleDataAbort(syndrome, v.exit.Exception.PhysicalAddress)
+		return v.handleDataAbort(exitCtx, syndrome, v.exit.Exception.PhysicalAddress)
 	case exceptionClassMsrAccess:
-		return v.handleMsrAccess(syndrome)
+		return v.handleMsrAccess(exitCtx, syndrome)
 	default:
 		return fmt.Errorf("hvf: unsupported exception class %s (syndrome=0x%x)", ec, syndrome)
 	}
@@ -291,7 +327,13 @@ func (fid psciFunctionID) String() string {
 	}
 }
 
-func (v *virtualCPU) handleHvc() error {
+var (
+	tsHvc = timeslice.RegisterKind("hvf_hvc", 0)
+)
+
+func (v *virtualCPU) handleHvc(exitCtx *exitContext) error {
+	exitCtx.SetExitTimeslice(tsHvc)
+
 	// get the value of x0
 	var x0 uint64
 	if err := bindings.HvVcpuGetReg(v.id, bindings.HV_REG_X0, &x0); err != bindings.HV_SUCCESS {
@@ -400,7 +442,13 @@ func (v *virtualCPU) findMMIODevice(addr, size uint64) (hv.MemoryMappedIODevice,
 	return nil, fmt.Errorf("hvf: no MMIO device handles address 0x%x (size=%d)", addr, size)
 }
 
-func (v *virtualCPU) handleDataAbort(syndrome bindings.ExceptionSyndrome, physAddr bindings.IPA) error {
+var (
+	tsDataAbort = timeslice.RegisterKind("hvf_data_abort", 0)
+)
+
+func (v *virtualCPU) handleDataAbort(exitCtx *exitContext, syndrome bindings.ExceptionSyndrome, physAddr bindings.IPA) error {
+	exitCtx.SetExitTimeslice(tsDataAbort)
+
 	decoded, err := decodeDataAbort(syndrome)
 	if err != nil {
 		return fmt.Errorf("hvf: failed to decode data abort syndrome 0x%X: %w", syndrome, err)
@@ -431,11 +479,11 @@ func (v *virtualCPU) handleDataAbort(syndrome bindings.ExceptionSyndrome, physAd
 		binary.LittleEndian.PutUint64(tmp[:], value)
 		copy(data, tmp[:])
 
-		if err := dev.WriteMMIO(addr, data); err != nil {
+		if err := dev.WriteMMIO(exitCtx, addr, data); err != nil {
 			pendingError = fmt.Errorf("hvf: failed to write MMIO: %w", err)
 		}
 	} else {
-		if err := dev.ReadMMIO(addr, data); err != nil {
+		if err := dev.ReadMMIO(exitCtx, addr, data); err != nil {
 			pendingError = fmt.Errorf("hvf: failed to read MMIO: %w", err)
 		}
 
@@ -521,7 +569,13 @@ func (m msrAccessInfo) matches(op0, op1, crn, crm, op2 uint8) bool {
 	return m.op0 == op0 && m.op1 == op1 && m.crn == crn && m.crm == crm && m.op2 == op2
 }
 
-func (v *virtualCPU) handleMsrAccess(syndrome bindings.ExceptionSyndrome) error {
+var (
+	tsMsrAccess = timeslice.RegisterKind("hvf_msr_access", 0)
+)
+
+func (v *virtualCPU) handleMsrAccess(exitCtx *exitContext, syndrome bindings.ExceptionSyndrome) error {
+	exitCtx.SetExitTimeslice(tsMsrAccess)
+
 	info, err := decodeMsrAccess(syndrome)
 	if err != nil {
 		return err
@@ -628,6 +682,8 @@ var (
 )
 
 type virtualMachine struct {
+	rec *timeslice.Recorder
+
 	hv         *hypervisor
 	memory     []byte
 	memoryBase uint64
@@ -872,6 +928,17 @@ func (h *hypervisor) Close() error {
 	return nil
 }
 
+var (
+	tsHvfPreInit              = timeslice.RegisterKind("hvf_pre_init", 0)
+	tsHvfVmCreate             = timeslice.RegisterKind("hvf_vm_create", 0)
+	tsHvfOnCreateVM           = timeslice.RegisterKind("hvf_on_create_vm", 0)
+	tsHvfAllocateMemory       = timeslice.RegisterKind("hvf_allocate_memory", 0)
+	tsHvfGicCreate            = timeslice.RegisterKind("hvf_gic_create", 0)
+	tsHvfOnCreateVMWithMemory = timeslice.RegisterKind("hvf_on_create_vm_with_memory", 0)
+	tsHvfOnCreateVCPU         = timeslice.RegisterKind("hvf_on_create_vcpu", 0)
+	tsHvfLoaded               = timeslice.RegisterKind("hvf_loaded", 0)
+)
+
 // NewVirtualMachine implements [hv.Hypervisor].
 func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, error) {
 	if vm := globalVM.Load(); vm != nil {
@@ -880,16 +947,21 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 	ret := &virtualMachine{
 		hv:       h,
+		rec:      timeslice.NewState(),
 		cpus:     make(map[int]*virtualCPU),
 		runQueue: make(chan func(), 16),
 	}
 
 	vmConfig := bindings.HvVmConfigCreate()
 
+	timeslice.Record(tsHvfPreInit, time.Since(tsHvfStartTime))
+
 	vm := bindings.HvVmCreate(vmConfig)
 	if vm != bindings.HV_SUCCESS {
 		return nil, fmt.Errorf("failed to create VM: %d", vm)
 	}
+
+	ret.rec.Record(tsHvfVmCreate)
 
 	// Only one VM can be created at a time for a single process.
 	if swapped := globalVM.CompareAndSwap(nil, ret); !swapped {
@@ -901,11 +973,15 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
+	ret.rec.Record(tsHvfOnCreateVM)
+
 	// allocate memory for the VM
 	mem, err := ret.AllocateMemory(config.MemoryBase(), config.MemorySize())
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate memory for VM: %w", err)
 	}
+
+	ret.rec.Record(tsHvfAllocateMemory)
 
 	ret.memory = mem.(*memoryRegion).memory
 	ret.memoryBase = config.MemoryBase()
@@ -981,12 +1057,16 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		if err := bindings.HvGicCreate(cfg); err != bindings.HV_SUCCESS {
 			return nil, fmt.Errorf("failed to create GICv3: %s", err)
 		}
+
+		ret.rec.Record(tsHvfGicCreate)
 	}
 
 	// Call the callback to allow the user to perform any additional initialization.
 	if err := config.Callbacks().OnCreateVMWithMemory(ret); err != nil {
 		return nil, fmt.Errorf("failed to create VM with memory: %w", err)
 	}
+
+	ret.rec.Record(tsHvfOnCreateVMWithMemory)
 
 	// create vCPUs
 	if config.CPUCount() != 1 {
@@ -998,6 +1078,7 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 			vm:        ret,
 			runQueue:  make(chan func(), 16),
 			initError: make(chan error, 1),
+			rec:       timeslice.NewState(),
 		}
 
 		ret.cpus[i] = vcpu
@@ -1015,9 +1096,13 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		}
 	}
 
+	ret.rec.Record(tsHvfOnCreateVCPU)
+
 	if err := config.Loader().Load(ret); err != nil {
 		return nil, fmt.Errorf("failed to load VM: %w", err)
 	}
+
+	ret.rec.Record(tsHvfLoaded)
 
 	return ret, nil
 }

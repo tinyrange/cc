@@ -12,6 +12,7 @@ import (
 	"github.com/tinyrange/cc/internal/debug"
 	"github.com/tinyrange/cc/internal/fdt"
 	"github.com/tinyrange/cc/internal/hv"
+	"github.com/tinyrange/cc/internal/timeslice"
 )
 
 const (
@@ -191,22 +192,31 @@ func (vc *Console) MMIORegions() []hv.MMIORegion {
 	}}
 }
 
+var (
+	tsConsoleRead  = timeslice.RegisterKind("virtio_console_read", 0)
+	tsConsoleWrite = timeslice.RegisterKind("virtio_console_write", 0)
+)
+
 // ReadMMIO implements hv.MemoryMappedIODevice.
-func (vc *Console) ReadMMIO(addr uint64, data []byte) error {
+func (vc *Console) ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
+	ctx.SetExitTimeslice(tsConsoleRead)
+
 	dev, err := vc.requireDevice()
 	if err != nil {
 		return err
 	}
-	return dev.readMMIO(addr, data)
+	return dev.readMMIO(ctx, addr, data)
 }
 
 // WriteMMIO implements hv.MemoryMappedIODevice.
-func (vc *Console) WriteMMIO(addr uint64, data []byte) error {
+func (vc *Console) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
+	ctx.SetExitTimeslice(tsConsoleWrite)
+
 	dev, err := vc.requireDevice()
 	if err != nil {
 		return err
 	}
-	return dev.writeMMIO(addr, data)
+	return dev.writeMMIO(ctx, addr, data)
 }
 
 func (vc *Console) requireDevice() (device, error) {
@@ -263,7 +273,7 @@ func (vc *Console) OnReset(device) {
 	// and should be preserved for delivery when the device is re-initialized.
 }
 
-func (vc *Console) OnQueueNotify(dev device, queue int) error {
+func (vc *Console) OnQueueNotify(ctx hv.ExitContext, dev device, queue int) error {
 	debug.Writef("virtio-console.OnQueueNotify", "queue=%d", queue)
 	switch queue {
 	case queueTransmit:
@@ -274,7 +284,7 @@ func (vc *Console) OnQueueNotify(dev device, queue int) error {
 	return nil
 }
 
-func (vc *Console) ReadConfig(device device, offset uint64) (uint32, bool, error) {
+func (vc *Console) ReadConfig(ctx hv.ExitContext, dev device, offset uint64) (uint32, bool, error) {
 	if offset < VIRTIO_MMIO_CONFIG {
 		return 0, false, nil
 	}
@@ -290,7 +300,7 @@ func (vc *Console) ReadConfig(device device, offset uint64) (uint32, bool, error
 	return binary.LittleEndian.Uint32(buf[:]), true, nil
 }
 
-func (vc *Console) WriteConfig(device device, offset uint64, value uint32) (bool, error) {
+func (vc *Console) WriteConfig(ctx hv.ExitContext, dev device, offset uint64, value uint32) (bool, error) {
 	if offset < VIRTIO_MMIO_CONFIG {
 		return false, nil
 	}

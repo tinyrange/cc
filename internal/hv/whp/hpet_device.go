@@ -98,7 +98,7 @@ func (d *hpetDevice) offsetFor(addr uint64) (uint64, error) {
 }
 
 // ReadMMIO handles standard reads. Windows relies heavily on the Main Counter read.
-func (d *hpetDevice) ReadMMIO(addr uint64, data []byte) error {
+func (d *hpetDevice) ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -150,7 +150,7 @@ func (d *hpetDevice) ReadMMIO(addr uint64, data []byte) error {
 	return nil
 }
 
-func (d *hpetDevice) WriteMMIO(addr uint64, data []byte) error {
+func (d *hpetDevice) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 

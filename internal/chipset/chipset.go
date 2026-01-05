@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"github.com/tinyrange/cc/internal/debug"
+	"github.com/tinyrange/cc/internal/hv"
 )
 
 // Start activates all registered devices.
@@ -39,20 +40,20 @@ func (c *Chipset) Reset() error {
 }
 
 // HandlePIO dispatches an I/O port access to the registered device.
-func (c *Chipset) HandlePIO(port uint16, data []byte, isWrite bool) error {
+func (c *Chipset) HandlePIO(ctx hv.ExitContext, port uint16, data []byte, isWrite bool) error {
 	handler, ok := c.pio[port]
 	if !ok {
 		return fmt.Errorf("chipset: no handler for I/O port 0x%04x", port)
 	}
 	debug.Writef("chipset.HandlePIO", "handler=%T port=0x%04x data=% x isWrite=%t", handler, port, data, isWrite)
 	if isWrite {
-		return handler.WriteIOPort(port, data)
+		return handler.WriteIOPort(ctx, port, data)
 	}
-	return handler.ReadIOPort(port, data)
+	return handler.ReadIOPort(ctx, port, data)
 }
 
 // HandleMMIO dispatches an MMIO access to the registered device.
-func (c *Chipset) HandleMMIO(addr uint64, data []byte, isWrite bool) error {
+func (c *Chipset) HandleMMIO(ctx hv.ExitContext, addr uint64, data []byte, isWrite bool) error {
 	accessEnd := addr + uint64(len(data))
 	if accessEnd < addr {
 		return fmt.Errorf("chipset: MMIO access overflow at 0x%016x", addr)
@@ -64,9 +65,9 @@ func (c *Chipset) HandleMMIO(addr uint64, data []byte, isWrite bool) error {
 		if addr >= start && accessEnd <= end {
 			debug.Writef("chipset.HandleMMIO", "handler=%T addr=0x%016x data=% x isWrite=%t", binding.handler, addr, data, isWrite)
 			if isWrite {
-				return binding.handler.WriteMMIO(addr, data)
+				return binding.handler.WriteMMIO(ctx, addr, data)
 			}
-			return binding.handler.ReadMMIO(addr, data)
+			return binding.handler.ReadMMIO(ctx, addr, data)
 		}
 	}
 

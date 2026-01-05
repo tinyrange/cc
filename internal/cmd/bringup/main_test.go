@@ -15,11 +15,10 @@ import (
 	"time"
 	"unsafe"
 
+	amd64defs "github.com/tinyrange/cc/internal/linux/defs/amd64"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/sys/unix"
-
-	amd64defs "github.com/tinyrange/cc/internal/linux/defs/amd64"
 )
 
 var (
@@ -556,7 +555,7 @@ func TestNetworkHTTPDownload1MiB(t *testing.T) {
 				t.Fatalf("unexpected download size: got %d want %d", n, resp.ContentLength)
 			}
 
-			t.Logf("downloaded %d bytes in %s", n, time.Since(start))
+			t.Logf("downloaded %d bytes in %s (%.2f MB/s)", n, time.Since(start), float64(n)/time.Since(start).Seconds()/1024/1024)
 		})
 	}
 }

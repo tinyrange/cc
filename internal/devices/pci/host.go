@@ -216,7 +216,7 @@ func (h *HostBridge) MMIORegions() []hv.MMIORegion {
 }
 
 // ReadMMIO implements hv.MemoryMappedIODevice.
-func (h *HostBridge) ReadMMIO(addr uint64, data []byte) error {
+func (h *HostBridge) ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	if len(data) == 0 {
 		return nil
 	}
@@ -252,7 +252,7 @@ func (h *HostBridge) ReadMMIO(addr uint64, data []byte) error {
 }
 
 // WriteMMIO implements hv.MemoryMappedIODevice.
-func (h *HostBridge) WriteMMIO(addr uint64, data []byte) error {
+func (h *HostBridge) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	if len(data) == 0 {
 		return nil
 	}

@@ -28,6 +28,7 @@ import (
 	amd64boot "github.com/tinyrange/cc/internal/linux/boot/amd64"
 	arm64boot "github.com/tinyrange/cc/internal/linux/boot/arm64"
 	"github.com/tinyrange/cc/internal/linux/kernel"
+	"github.com/tinyrange/cc/internal/timeslice"
 )
 
 type bootPlan interface {
@@ -187,11 +188,20 @@ func (l *LinuxLoader) MemoryBase() uint64          { return l.MemBase }
 func (l *LinuxLoader) MemorySize() uint64          { return l.MemSize }
 func (l *LinuxLoader) NeedsInterruptSupport() bool { return true }
 
+var (
+	tsLinuxLoaderGotKernel          = timeslice.RegisterKind("linux_loader_got_kernel", 0)
+	tsLinuxLoaderBuiltInitPayload   = timeslice.RegisterKind("linux_loader_built_init_payload", 0)
+	tsLinuxLoaderBuiltInitramfs     = timeslice.RegisterKind("linux_loader_built_initramfs", 0)
+	tsLinuxLoaderGotDeviceTreeNodes = timeslice.RegisterKind("linux_loader_got_device_tree_nodes", 0)
+)
+
 // Load implements hv.VMLoader.
 func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 	if l.GetKernel == nil {
 		return errors.New("linux loader missing kernel provider")
 	}
+
+	rec := timeslice.NewState()
 
 	kernelReader, kernelSize, err := l.GetKernel()
 	if err != nil {
@@ -200,12 +210,16 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 
 	l.kernelReader = kernelReader
 
+	rec.Record(tsLinuxLoaderGotKernel)
+
 	arch := vm.Hypervisor().Architecture()
 
 	initPayload, err := l.buildInitPayload(arch)
 	if err != nil {
 		return err
 	}
+
+	rec.Record(tsLinuxLoaderBuiltInitPayload)
 
 	files := []InitFile{
 		{Path: "/init", Data: initPayload, Mode: os.FileMode(0o755)},
@@ -217,6 +231,8 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 	if err != nil {
 		return fmt.Errorf("build initramfs: %w", err)
 	}
+
+	rec.Record(tsLinuxLoaderBuiltInitramfs)
 
 	cmdline, err := l.GetCmdline(arch)
 	if err != nil {
@@ -274,15 +290,17 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 		}
 	}
 
+	rec.Record(tsLinuxLoaderGotDeviceTreeNodes)
+
 	switch arch {
 	case hv.ArchitectureX86_64:
 		// For x86_64 with ACPI, don't add virtio_mmio command line params
 		// because the devices will be discovered via ACPI DSDT.
 		cmdlineStr := strings.Join(cmdlineBase, " ")
-		return l.loadAMD64(vm, kernelReader, kernelSize, cmdlineStr, initrd)
+		return l.loadAMD64(rec, vm, kernelReader, kernelSize, cmdlineStr, initrd)
 	case hv.ArchitectureARM64:
 		cmdlineStr := strings.Join(cmdlineBase, " ")
-		return l.loadARM64(vm, kernelReader, kernelSize, cmdlineStr, initrd, virtioNodes)
+		return l.loadARM64(rec, vm, kernelReader, kernelSize, cmdlineStr, initrd, virtioNodes)
 	case hv.ArchitectureRISCV64:
 		return fmt.Errorf("linux loader for riscv64 is not implemented yet (pending kernel/initrd support)")
 	default:
@@ -329,11 +347,20 @@ func (l *LinuxLoader) buildInitPayload(arch hv.CpuArchitecture) ([]byte, error) 
 	}
 }
 
-func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, kernelSize int64, cmdline string, initrd []byte) error {
+var (
+	tsLinuxLoaderReservedE820      = timeslice.RegisterKind("linux_loader_reserved_e820", 0)
+	tsLinuxLoaderAddedPCHostBridge = timeslice.RegisterKind("linux_loader_added_pc_host_bridge", 0)
+	tsLinuxLoaderAddedDualPIC      = timeslice.RegisterKind("linux_loader_added_dual_pic", 0)
+	tsLinuxLoaderInstalledACPI     = timeslice.RegisterKind("linux_loader_installed_acpi", 0)
+)
+
+func (l *LinuxLoader) loadAMD64(rec *timeslice.Recorder, vm hv.VirtualMachine, kernelReader io.ReaderAt, kernelSize int64, cmdline string, initrd []byte) error {
 	kernelImage, err := amd64boot.LoadKernel(kernelReader, kernelSize)
 	if err != nil {
 		return fmt.Errorf("load kernel: %w", err)
 	}
+
+	rec.Record(tsLinuxLoaderLoadKernel)
 
 	numCPUs := l.NumCPUs
 	if numCPUs <= 0 {
@@ -352,6 +379,8 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	if err != nil {
 		return fmt.Errorf("reserve ACPI tables in e820 map: %w", err)
 	}
+
+	rec.Record(tsLinuxLoaderReservedE820)
 
 	opts := amd64boot.BootOptions{
 		Cmdline: cmdline,
@@ -388,19 +417,27 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	}
 	l.plan = plan
 
+	rec.Record(tsLinuxLoaderPreparedKernel)
+
 	auxSerial := amd64serial.NewSerial16550WithIRQ(0x2F8, 3, io.Discard)
 	if err := vm.AddDevice(auxSerial); err != nil {
 		return fmt.Errorf("add aux serial device: %w", err)
 	}
 
+	rec.Record(tsLinuxLoaderAddedUART)
+
 	if err := vm.AddDevice(pci.NewHostBridge()); err != nil {
 		return fmt.Errorf("add pci host bridge: %w", err)
 	}
+
+	rec.Record(tsLinuxLoaderAddedPCHostBridge)
 
 	pic := chipset.NewDualPIC()
 	if err := vm.AddDevice(pic); err != nil {
 		return fmt.Errorf("add dual PIC: %w", err)
 	}
+
+	rec.Record(tsLinuxLoaderAddedDualPIC)
 
 	setter, _ := vm.(interface {
 		SetIRQ(uint32, bool) error
@@ -485,7 +522,7 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 
 	legacy := hv.SimpleX86IOPortDevice{
 		Ports: legacyPorts,
-		ReadFunc: func(port uint16, data []byte) error {
+		ReadFunc: func(ctx hv.ExitContext, port uint16, data []byte) error {
 			if port == 0x12 {
 				return hv.ErrGuestRequestedReboot
 			}
@@ -495,7 +532,7 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 			}
 			return nil
 		},
-		WriteFunc: func(port uint16, data []byte) error {
+		WriteFunc: func(ctx hv.ExitContext, port uint16, data []byte) error {
 			// slog.Info("legacy port write", "port", fmt.Sprintf("0x%04x", port), "size", len(data), "data", data)
 			return nil
 		},
@@ -513,6 +550,8 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 			return fmt.Errorf("add device from template: %w", err)
 		}
 	}
+
+	rec.Record(tsLinuxLoaderAddedDevices)
 
 	// Collect virtio-mmio device info for ACPI DSDT
 	var virtioACPIDevices []acpi.VirtioMMIODevice
@@ -553,6 +592,8 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	}); err != nil {
 		return fmt.Errorf("install ACPI tables: %w", err)
 	}
+
+	rec.Record(tsLinuxLoaderInstalledACPI)
 
 	return nil
 }
@@ -622,11 +663,20 @@ func alignDown(value, align uint64) uint64 {
 	return value &^ (align - 1)
 }
 
-func (l *LinuxLoader) loadARM64(vm hv.VirtualMachine, kernelReader io.ReaderAt, kernelSize int64, cmdline string, initrd []byte, deviceTree []fdt.Node) error {
+var (
+	tsLinuxLoaderLoadKernel     = timeslice.RegisterKind("linux_loader_load_kernel", 0)
+	tsLinuxLoaderPreparedKernel = timeslice.RegisterKind("linux_loader_prepared_kernel", 0)
+	tsLinuxLoaderAddedUART      = timeslice.RegisterKind("linux_loader_added_uart", 0)
+	tsLinuxLoaderAddedDevices   = timeslice.RegisterKind("linux_loader_added_devices", 0)
+)
+
+func (l *LinuxLoader) loadARM64(rec *timeslice.Recorder, vm hv.VirtualMachine, kernelReader io.ReaderAt, kernelSize int64, cmdline string, initrd []byte, deviceTree []fdt.Node) error {
 	kernelImage, err := arm64boot.LoadKernel(kernelReader, kernelSize)
 	if err != nil {
 		return fmt.Errorf("load kernel: %w", err)
 	}
+
+	rec.Record(tsLinuxLoaderLoadKernel)
 
 	numCPUs := l.NumCPUs
 	if numCPUs <= 0 {
@@ -658,17 +708,23 @@ func (l *LinuxLoader) loadARM64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	}
 	l.plan = plan
 
+	rec.Record(tsLinuxLoaderPreparedKernel)
+
 	// Connect UART to the same output as the console - SerialStdout typically goes to both stdout and test buffer
 	uartDev := serial.NewUART8250MMIO(arm64UARTMMIOBase, arm64UARTRegShift, arm64UARTIRQLine, l.SerialStdout)
 	if err := vm.AddDevice(uartDev); err != nil {
 		return fmt.Errorf("add arm64 uart device: %w", err)
 	}
 
+	rec.Record(tsLinuxLoaderAddedUART)
+
 	for _, dev := range l.Devices {
 		if err := vm.AddDeviceFromTemplate(dev); err != nil {
 			return fmt.Errorf("add device from template: %w", err)
 		}
 	}
+
+	rec.Record(tsLinuxLoaderAddedDevices)
 
 	return nil
 }

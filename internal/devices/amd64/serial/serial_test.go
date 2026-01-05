@@ -5,6 +5,8 @@ import (
 	"context"
 	"sync"
 	"testing"
+
+	"github.com/tinyrange/cc/internal/timeslice"
 )
 
 // testIRQLine captures interrupt line state changes
@@ -105,6 +107,11 @@ func (t *testWriter) reset() {
 	t.data = t.data[:0]
 }
 
+type mockExitContext struct {
+}
+
+func (m *mockExitContext) SetExitTimeslice(timeslice timeslice.TimesliceID) {}
+
 // TestSerialTHRRHRFIFO tests transmit/receive FIFO functionality
 func TestSerialTHRRHRFIFO(t *testing.T) {
 	irqLine := &testIRQLine{}
@@ -114,12 +121,12 @@ func TestSerialTHRRHRFIFO(t *testing.T) {
 
 	// Enable FIFO mode
 	// FCR: enable FIFO (bit 0), clear RX FIFO (bit 1), clear TX FIFO (bit 2)
-	if err := serial.WriteIOPort(0x3F8+2, []byte{0x07}); err != nil {
+	if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8+2, []byte{0x07}); err != nil {
 		t.Fatalf("write FCR: %v", err)
 	}
 
 	// Enable RX interrupt (IER bit 0)
-	if err := serial.WriteIOPort(0x3F8+1, []byte{0x01}); err != nil {
+	if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8+1, []byte{0x01}); err != nil {
 		t.Fatalf("write IER: %v", err)
 	}
 
@@ -139,7 +146,7 @@ func TestSerialTHRRHRFIFO(t *testing.T) {
 	readBuf := make([]byte, len(testData))
 	for i := range readBuf {
 		buf := []byte{0}
-		if err := serial.ReadIOPort(0x3F8, buf); err != nil {
+		if err := serial.ReadIOPort(&mockExitContext{}, 0x3F8, buf); err != nil {
 			t.Fatalf("read RHR[%d]: %v", i, err)
 		}
 		readBuf[i] = buf[0]
@@ -153,7 +160,7 @@ func TestSerialTHRRHRFIFO(t *testing.T) {
 	// Test TX FIFO: write data to THR
 	txData := []byte{'X', 'Y', 'Z'}
 	for _, b := range txData {
-		if err := serial.WriteIOPort(0x3F8, []byte{b}); err != nil {
+		if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8, []byte{b}); err != nil {
 			t.Fatalf("write THR: %v", err)
 		}
 	}
@@ -177,17 +184,17 @@ func TestSerialFIFOTriggerLevel(t *testing.T) {
 	serial := NewSerial16550(0x3F8, irqLine, nil, reader)
 
 	// Enable FIFO with trigger level 4 (FCR bits 6-7 = 0x40)
-	if err := serial.WriteIOPort(0x3F8+2, []byte{0x41}); err != nil {
+	if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8+2, []byte{0x41}); err != nil {
 		t.Fatalf("write FCR: %v", err)
 	}
 
 	// Enable OUT2 for interrupts
-	if err := serial.WriteIOPort(0x3F8+4, []byte{0x08}); err != nil {
+	if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8+4, []byte{0x08}); err != nil {
 		t.Fatalf("write MCR: %v", err)
 	}
 
 	// Enable RX interrupt
-	if err := serial.WriteIOPort(0x3F8+1, []byte{0x01}); err != nil {
+	if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8+1, []byte{0x01}); err != nil {
 		t.Fatalf("write IER: %v", err)
 	}
 
@@ -243,13 +250,13 @@ func TestSerialInterruptGeneration(t *testing.T) {
 	serial := NewSerial16550(0x3F8, irqLine, writer, reader)
 
 	// Enable OUT2 (MCR bit 3) - required for interrupts
-	if err := serial.WriteIOPort(0x3F8+4, []byte{0x08}); err != nil {
+	if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8+4, []byte{0x08}); err != nil {
 		t.Fatalf("write MCR: %v", err)
 	}
 
 	// Test RX data available interrupt (IER bit 0)
 	irqLine.reset()
-	if err := serial.WriteIOPort(0x3F8+1, []byte{0x01}); err != nil {
+	if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8+1, []byte{0x01}); err != nil {
 		t.Fatalf("write IER: %v", err)
 	}
 
@@ -265,7 +272,7 @@ func TestSerialInterruptGeneration(t *testing.T) {
 
 	// Read IIR to verify interrupt type
 	buf := []byte{0}
-	if err := serial.ReadIOPort(0x3F8+2, buf); err != nil {
+	if err := serial.ReadIOPort(&mockExitContext{}, 0x3F8+2, buf); err != nil {
 		t.Fatalf("read IIR: %v", err)
 	}
 	iir := buf[0]
@@ -276,12 +283,12 @@ func TestSerialInterruptGeneration(t *testing.T) {
 
 	// Test TX holding register empty interrupt (IER bit 1)
 	irqLine.reset()
-	if err := serial.WriteIOPort(0x3F8+1, []byte{0x02}); err != nil {
+	if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8+1, []byte{0x02}); err != nil {
 		t.Fatalf("write IER: %v", err)
 	}
 
 	// Clear RX data by reading
-	if err := serial.ReadIOPort(0x3F8, buf); err != nil {
+	if err := serial.ReadIOPort(&mockExitContext{}, 0x3F8, buf); err != nil {
 		t.Fatalf("read RHR: %v", err)
 	}
 
@@ -292,7 +299,7 @@ func TestSerialInterruptGeneration(t *testing.T) {
 	}
 
 	// Read IIR to verify interrupt type
-	if err := serial.ReadIOPort(0x3F8+2, buf); err != nil {
+	if err := serial.ReadIOPort(&mockExitContext{}, 0x3F8+2, buf); err != nil {
 		t.Fatalf("read IIR: %v", err)
 	}
 	iir = buf[0]
@@ -309,29 +316,29 @@ func TestSerialModemControlLoopback(t *testing.T) {
 	serial := NewSerial16550(0x3F8, irqLine, writer, nil)
 
 	// Enable OUT2 for interrupts
-	if err := serial.WriteIOPort(0x3F8+4, []byte{0x08}); err != nil {
+	if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8+4, []byte{0x08}); err != nil {
 		t.Fatalf("write MCR: %v", err)
 	}
 
 	// Enable FIFO mode for proper loopback behavior
-	if err := serial.WriteIOPort(0x3F8+2, []byte{0x01}); err != nil {
+	if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8+2, []byte{0x01}); err != nil {
 		t.Fatalf("write FCR: %v", err)
 	}
 
 	// Enable loopback mode (MCR bit 4) and OUT2
-	if err := serial.WriteIOPort(0x3F8+4, []byte{0x18}); err != nil {
+	if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8+4, []byte{0x18}); err != nil {
 		t.Fatalf("write MCR loopback: %v", err)
 	}
 
 	// Enable RX interrupt
-	if err := serial.WriteIOPort(0x3F8+1, []byte{0x01}); err != nil {
+	if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8+1, []byte{0x01}); err != nil {
 		t.Fatalf("write IER: %v", err)
 	}
 
 	// Write to THR - should loop back to RX
 	txData := []byte{'L', 'O', 'O', 'P'}
 	for _, b := range txData {
-		if err := serial.WriteIOPort(0x3F8, []byte{b}); err != nil {
+		if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8, []byte{b}); err != nil {
 			t.Fatalf("write THR: %v", err)
 		}
 	}
@@ -353,7 +360,7 @@ func TestSerialModemControlLoopback(t *testing.T) {
 	readBuf := make([]byte, len(txData))
 	for i := range readBuf {
 		buf := []byte{0}
-		if err := serial.ReadIOPort(0x3F8, buf); err != nil {
+		if err := serial.ReadIOPort(&mockExitContext{}, 0x3F8, buf); err != nil {
 			t.Fatalf("read RHR: %v", err)
 		}
 		readBuf[i] = buf[0]
@@ -365,13 +372,13 @@ func TestSerialModemControlLoopback(t *testing.T) {
 
 	// Test MSR reflects MCR in loopback mode
 	// Set DTR (MCR bit 0) and RTS (MCR bit 1)
-	if err := serial.WriteIOPort(0x3F8+4, []byte{0x1B}); err != nil {
+	if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8+4, []byte{0x1B}); err != nil {
 		t.Fatalf("write MCR with DTR/RTS: %v", err)
 	}
 
 	// Read MSR
 	buf := []byte{0}
-	if err := serial.ReadIOPort(0x3F8+6, buf); err != nil {
+	if err := serial.ReadIOPort(&mockExitContext{}, 0x3F8+6, buf); err != nil {
 		t.Fatalf("read MSR: %v", err)
 	}
 	msr := buf[0]
@@ -389,13 +396,13 @@ func TestSerialOUT2InterruptGate(t *testing.T) {
 	serial := NewSerial16550(0x3F8, irqLine, nil, reader)
 
 	// Enable RX interrupt
-	if err := serial.WriteIOPort(0x3F8+1, []byte{0x01}); err != nil {
+	if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8+1, []byte{0x01}); err != nil {
 		t.Fatalf("write IER: %v", err)
 	}
 
 	// OUT2 disabled (MCR bit 3 = 0) - interrupts should be gated
 	// First ensure MCR is 0 (OUT2 disabled)
-	if err := serial.WriteIOPort(0x3F8+4, []byte{0x00}); err != nil {
+	if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8+4, []byte{0x00}); err != nil {
 		t.Fatalf("write MCR disable OUT2: %v", err)
 	}
 	irqLine.reset()
@@ -418,7 +425,7 @@ func TestSerialOUT2InterruptGate(t *testing.T) {
 	}
 
 	// Enable OUT2
-	if err := serial.WriteIOPort(0x3F8+4, []byte{0x08}); err != nil {
+	if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8+4, []byte{0x08}); err != nil {
 		t.Fatalf("write MCR with OUT2: %v", err)
 	}
 
@@ -437,7 +444,7 @@ func TestSerialLSRStatus(t *testing.T) {
 
 	// Initially THRE and TEMT should be set
 	buf := []byte{0}
-	if err := serial.ReadIOPort(0x3F8+5, buf); err != nil {
+	if err := serial.ReadIOPort(&mockExitContext{}, 0x3F8+5, buf); err != nil {
 		t.Fatalf("read LSR: %v", err)
 	}
 	lsr := buf[0]
@@ -446,19 +453,19 @@ func TestSerialLSRStatus(t *testing.T) {
 	}
 
 	// Enable FIFO mode to test FIFO behavior
-	if err := serial.WriteIOPort(0x3F8+2, []byte{0x01}); err != nil {
+	if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8+2, []byte{0x01}); err != nil {
 		t.Fatalf("write FCR: %v", err)
 	}
 
 	// Write data - THRE should clear when FIFO is full
 	// Fill FIFO (size 16)
 	for i := 0; i < 16; i++ {
-		if err := serial.WriteIOPort(0x3F8, []byte{'X'}); err != nil {
+		if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8, []byte{'X'}); err != nil {
 			t.Fatalf("write THR[%d]: %v", i, err)
 		}
 	}
 
-	if err := serial.ReadIOPort(0x3F8+5, buf); err != nil {
+	if err := serial.ReadIOPort(&mockExitContext{}, 0x3F8+5, buf); err != nil {
 		t.Fatalf("read LSR: %v", err)
 	}
 	lsr = buf[0]
@@ -474,7 +481,7 @@ func TestSerialLSRStatus(t *testing.T) {
 	}
 
 	// Data ready bit should be set
-	if err := serial.ReadIOPort(0x3F8+5, buf); err != nil {
+	if err := serial.ReadIOPort(&mockExitContext{}, 0x3F8+5, buf); err != nil {
 		t.Fatalf("read LSR: %v", err)
 	}
 	lsr = buf[0]
@@ -490,7 +497,7 @@ func TestSerialFIFOClear(t *testing.T) {
 	serial := NewSerial16550(0x3F8, irqLine, nil, reader)
 
 	// Enable FIFO
-	if err := serial.WriteIOPort(0x3F8+2, []byte{0x01}); err != nil {
+	if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8+2, []byte{0x01}); err != nil {
 		t.Fatalf("write FCR: %v", err)
 	}
 
@@ -501,13 +508,13 @@ func TestSerialFIFOClear(t *testing.T) {
 	}
 
 	// Clear RX FIFO (FCR bit 1)
-	if err := serial.WriteIOPort(0x3F8+2, []byte{0x03}); err != nil {
+	if err := serial.WriteIOPort(&mockExitContext{}, 0x3F8+2, []byte{0x03}); err != nil {
 		t.Fatalf("write FCR clear RX: %v", err)
 	}
 
 	// Try to read - should get nothing
 	buf := []byte{0}
-	if err := serial.ReadIOPort(0x3F8, buf); err != nil {
+	if err := serial.ReadIOPort(&mockExitContext{}, 0x3F8, buf); err != nil {
 		t.Fatalf("read RHR: %v", err)
 	}
 	if buf[0] != 0 {
@@ -516,7 +523,7 @@ func TestSerialFIFOClear(t *testing.T) {
 
 	// LSR data ready should be clear
 	lsrBuf := []byte{0}
-	if err := serial.ReadIOPort(0x3F8+5, lsrBuf); err != nil {
+	if err := serial.ReadIOPort(&mockExitContext{}, 0x3F8+5, lsrBuf); err != nil {
 		t.Fatalf("read LSR: %v", err)
 	}
 	if lsrBuf[0]&0x01 != 0 {

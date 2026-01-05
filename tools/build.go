@@ -621,7 +621,9 @@ func main() {
 	run := fs.Bool("run", false, "run the built cc tool after building")
 	runtest := fs.String("runtest", "", "build a Dockerfile in tests/<name>/Dockerfile and run it using cc (Linux only)")
 	dbgTool := fs.Bool("dbg-tool", false, "build and run the debug tool")
+	tsTool := fs.Bool("ts-tool", false, "build and run the timeslice tool")
 	app := fs.Bool("app", false, "build and run ccapp")
+	benchTests := fs.Bool("bench-tests", false, "build and run the benchmark tests")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
@@ -678,6 +680,22 @@ func main() {
 			os.Exit(1)
 		}
 
+		return
+	}
+
+	if *tsTool {
+		out, err := goBuild(buildOptions{
+			Package:    "cmd/timeslice",
+			OutputName: "timeslice",
+			Build:      hostBuild,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build timeslice tool: %v\n", err)
+			os.Exit(1)
+		}
+		if err := runBuildOutput(out, fs.Args()); err != nil {
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -1088,6 +1106,63 @@ func main() {
 
 		fmt.Printf("benchmarks written to %s\n", benchFile)
 		return
+	}
+
+	if *benchTests {
+		outPath := filepath.Join("build", "benchTests")
+		if runtime.GOOS == "windows" {
+			outPath += ".exe"
+		}
+
+		// generate from ./internal/bench
+		cmd := exec.Command("go", "test", "-o", outPath, "-c", "./internal/bench")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build benchmark tests: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("benchmarks written to %s\n", outPath)
+
+		// then codesign the binary if on macOS
+		if runtime.GOOS == "darwin" {
+			// build internal/cmd/codesign first
+			codesignOut, err := goBuild(buildOptions{
+				Package:    "internal/cmd/codesign",
+				OutputName: "codesign",
+				Build:      hostBuild,
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to build codesign tool: %v\n", err)
+				os.Exit(1)
+			}
+
+			cmd := exec.Command(codesignOut.Path,
+				"-entitlements", filepath.Join("tools", "entitlements.xml"),
+				"-bin", outPath,
+			)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+
+			if err := cmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to codesign output: %v\n", err)
+				os.Exit(1)
+			}
+		}
+
+		fmt.Printf("running %s\n", outPath)
+
+		// then run the binary
+		cmd = exec.Command(outPath, "-test.bench=.", "-test.run=none", "-test.benchmem", "-test.v")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to run benchmark tests: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("benchmark tests run successfully\n")
+
+		os.Exit(0)
 	}
 
 	// build cmd/cc by default

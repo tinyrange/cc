@@ -169,7 +169,7 @@ func (i *IOAPIC) MMIORegions() []hv.MMIORegion {
 }
 
 // ReadMMIO implements hv.MemoryMappedIODevice.
-func (i *IOAPIC) ReadMMIO(addr uint64, data []byte) error {
+func (i *IOAPIC) ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	// fmt.Fprintf(os.Stderr, "ioapic: read addr=%#x size=%d\n", addr, len(data))
 	if !i.inRange(addr, uint64(len(data))) {
 		return fmt.Errorf("ioapic: read outside MMIO window: 0x%x", addr)
@@ -197,7 +197,7 @@ func (i *IOAPIC) ReadMMIO(addr uint64, data []byte) error {
 }
 
 // WriteMMIO implements hv.MemoryMappedIODevice.
-func (i *IOAPIC) WriteMMIO(addr uint64, data []byte) error {
+func (i *IOAPIC) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	if !i.inRange(addr, uint64(len(data))) {
 		return fmt.Errorf("ioapic: write outside MMIO window: 0x%x", addr)
 	}

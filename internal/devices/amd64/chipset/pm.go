@@ -55,7 +55,7 @@ func (p *PM) IOPorts() []uint16 {
 	return ports
 }
 
-func (p *PM) ReadIOPort(port uint16, data []byte) error {
+func (p *PM) ReadIOPort(ctx hv.ExitContext, port uint16, data []byte) error {
 	switch {
 	case port >= pm1aEvtBase && port < pm1aEvtBase+pm1aEvtSize:
 		return readUint16(port-pm1aEvtBase, p.pm1aStatus, data)
@@ -68,7 +68,7 @@ func (p *PM) ReadIOPort(port uint16, data []byte) error {
 	}
 }
 
-func (p *PM) WriteIOPort(port uint16, data []byte) error {
+func (p *PM) WriteIOPort(ctx hv.ExitContext, port uint16, data []byte) error {
 	switch {
 	case port >= pm1aEvtBase && port < pm1aEvtBase+pm1aEvtSize:
 		return writeUint16(&p.pm1aStatus, port-pm1aEvtBase, data)

@@ -227,20 +227,20 @@ func (i *Input) MMIORegions() []hv.MMIORegion {
 	}}
 }
 
-func (i *Input) ReadMMIO(addr uint64, data []byte) error {
+func (i *Input) ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	dev, err := i.requireDevice()
 	if err != nil {
 		return err
 	}
-	return dev.readMMIO(addr, data)
+	return dev.readMMIO(ctx, addr, data)
 }
 
-func (i *Input) WriteMMIO(addr uint64, data []byte) error {
+func (i *Input) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	dev, err := i.requireDevice()
 	if err != nil {
 		return err
 	}
-	return dev.writeMMIO(addr, data)
+	return dev.writeMMIO(ctx, addr, data)
 }
 
 func (i *Input) requireDevice() (device, error) {
@@ -271,7 +271,7 @@ func (i *Input) OnReset(dev device) {
 }
 
 // OnQueueNotify implements deviceHandler.
-func (i *Input) OnQueueNotify(dev device, queueIdx int) error {
+func (i *Input) OnQueueNotify(ctx hv.ExitContext, dev device, queueIdx int) error {
 	switch queueIdx {
 	case inputQueueEvent:
 		return i.processEventQueue(dev, dev.queue(queueIdx))
@@ -283,7 +283,7 @@ func (i *Input) OnQueueNotify(dev device, queueIdx int) error {
 }
 
 // ReadConfig implements deviceHandler.
-func (i *Input) ReadConfig(dev device, offset uint64) (uint32, bool, error) {
+func (i *Input) ReadConfig(ctx hv.ExitContext, dev device, offset uint64) (uint32, bool, error) {
 	// The offset may be either absolute (0x100+) or relative (0-255)
 	// depending on whether we're called directly or via deviceHandlerAdapter.
 	rel := offset
@@ -300,7 +300,7 @@ func (i *Input) ReadConfig(dev device, offset uint64) (uint32, bool, error) {
 }
 
 // WriteConfig implements deviceHandler.
-func (i *Input) WriteConfig(dev device, offset uint64, value uint32) (bool, error) {
+func (i *Input) WriteConfig(ctx hv.ExitContext, dev device, offset uint64, value uint32) (bool, error) {
 	// The offset may be either absolute (0x100+) or relative (0-255)
 	// depending on whether we're called directly or via deviceHandlerAdapter.
 	rel := offset

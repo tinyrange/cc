@@ -146,7 +146,7 @@ func (p *programLoader) MMIORegions() []hv.MMIORegion {
 }
 
 // ReadMMIO implements hv.MemoryMappedIODevice.
-func (p *programLoader) ReadMMIO(addr uint64, data []byte) error {
+func (p *programLoader) ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	if addr >= configRegionPhysAddr && addr < configRegionPhysAddr+configRegionSize {
 		offset := addr - configRegionPhysAddr
 		copy(data, p.dataRegion[offset:])
@@ -183,7 +183,7 @@ func (p *programLoader) DeviceTreeNodes() ([]fdt.Node, error) {
 }
 
 // WriteMMIO implements hv.MemoryMappedIODevice.
-func (p *programLoader) WriteMMIO(addr uint64, data []byte) error {
+func (p *programLoader) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	addr = addr - mailboxPhysAddr
 
 	switch addr {
