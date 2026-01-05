@@ -133,18 +133,25 @@ func init() {
 	lastTime.Store(uint64(time.Now().UnixNano()))
 }
 
-func Record(id TimesliceID) {
-	if w := currentWriter.Load(); w != nil {
-		last := lastTime.Swap(uint64(time.Now().UnixNano()))
+// Recorder is a helper to record timeslices.
+// It is not thread safe, and should not be used concurrently.
+type Recorder struct {
+	last time.Time
+}
 
-		w.writerChan <- record{
-			ID:       id,
-			Duration: int64(time.Now().UnixNano() - int64(last)),
-		}
+func (r *Recorder) Record(id TimesliceID) {
+	duration := time.Since(r.last)
+	r.last = time.Now()
+	Record(id, duration)
+}
+
+func NewRecorder() *Recorder {
+	return &Recorder{
+		last: time.Now(),
 	}
 }
 
-func RecordRaw(id TimesliceID, duration time.Duration) {
+func Record(id TimesliceID, duration time.Duration) {
 	if w := currentWriter.Load(); w != nil {
 		w.writerChan <- record{
 			ID:       id,

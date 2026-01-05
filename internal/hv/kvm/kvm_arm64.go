@@ -137,7 +137,7 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 
 	debug.Writef("kvm-arm64.Run run", "vCPU %d running", v.id)
 
-	timeslice.Record(tsKvmHostTime)
+	v.rec.Record(tsKvmHostTime)
 
 	// keep trying to run the vCPU until it exits or an error occurs
 	for {
@@ -186,7 +186,7 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	}
 
 	if exitCtx.timeslice != timeslice.InvalidTimesliceID {
-		timeslice.Record(exitCtx.timeslice)
+		v.rec.Record(exitCtx.timeslice)
 	}
 
 	return nil

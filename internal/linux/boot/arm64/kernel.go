@@ -21,12 +21,14 @@ var (
 // LoadKernel parses the supplied ARM64 Image (optionally compressed) and
 // returns an in-memory representation ready for placement into guest RAM.
 func LoadKernel(reader io.ReaderAt, size int64) (*KernelImage, error) {
+	rec := timeslice.NewRecorder()
+
 	probe, err := ProbeKernelImage(reader, size)
 	if err != nil {
 		return nil, fmt.Errorf("probe arm64 kernel: %w", err)
 	}
 
-	timeslice.Record(tsLinuxLoaderArm64ProbeKernel)
+	rec.Record(tsLinuxLoaderArm64ProbeKernel)
 
 	payload, err := probe.ExtractImage(reader, size)
 	if err != nil {
@@ -36,7 +38,7 @@ func LoadKernel(reader io.ReaderAt, size int64) (*KernelImage, error) {
 		return nil, fmt.Errorf("arm64 kernel image too small (%d bytes)", len(payload))
 	}
 
-	timeslice.Record(tsLinuxLoaderArm64ExtractKernel)
+	rec.Record(tsLinuxLoaderArm64ExtractKernel)
 
 	return &KernelImage{
 		Header:  probe.Header,

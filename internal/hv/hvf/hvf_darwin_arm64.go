@@ -80,6 +80,8 @@ func (ctx *exitContext) SetExitTimeslice(id timeslice.TimesliceID) {
 type virtualCPU struct {
 	vm *virtualMachine
 
+	rec *timeslice.Recorder
+
 	id   bindings.VCPU
 	exit *bindings.VcpuExit
 
@@ -89,7 +91,6 @@ type virtualCPU struct {
 
 	initError chan error
 
-	lastTime   time.Time
 	regionKind timeslice.TimesliceID
 }
 
@@ -179,21 +180,18 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	}
 
 	var kind timeslice.TimesliceID
-	if v.lastTime.IsZero() {
-		kind = tsHvfFirstRunStart
-		v.lastTime = tsHvfStartTime
-	} else if v.regionKind == timeslice.InvalidTimesliceID {
+	if v.regionKind == timeslice.InvalidTimesliceID {
 		kind = tsHvfUnknownHostTime
+	} else {
+		kind = v.regionKind
 	}
-	timeslice.Record(kind)
-	v.lastTime = time.Now()
+	v.rec.Record(kind)
 
 	if err := bindings.HvVcpuRun(v.id); err != bindings.HV_SUCCESS {
 		return fmt.Errorf("hvf: failed to run vCPU %d: %w", v.id, err)
 	}
 
-	timeslice.Record(tsHvfGuestTime)
-	v.lastTime = time.Now()
+	v.rec.Record(tsHvfGuestTime)
 
 	exitCtx := &exitContext{
 		kind: timeslice.InvalidTimesliceID,
@@ -211,7 +209,7 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	}
 
 	if exitCtx.kind != timeslice.InvalidTimesliceID {
-		timeslice.Record(exitCtx.kind)
+		v.rec.Record(exitCtx.kind)
 	}
 
 	return nil
@@ -692,6 +690,8 @@ var (
 )
 
 type virtualMachine struct {
+	rec *timeslice.Recorder
+
 	hv         *hypervisor
 	memory     []byte
 	memoryBase uint64
@@ -955,20 +955,21 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 	ret := &virtualMachine{
 		hv:       h,
+		rec:      timeslice.NewRecorder(),
 		cpus:     make(map[int]*virtualCPU),
 		runQueue: make(chan func(), 16),
 	}
 
 	vmConfig := bindings.HvVmConfigCreate()
 
-	timeslice.Record(tsHvfPreInit)
+	timeslice.Record(tsHvfPreInit, time.Since(tsHvfStartTime))
 
 	vm := bindings.HvVmCreate(vmConfig)
 	if vm != bindings.HV_SUCCESS {
 		return nil, fmt.Errorf("failed to create VM: %d", vm)
 	}
 
-	timeslice.Record(tsHvfVmCreate)
+	ret.rec.Record(tsHvfVmCreate)
 
 	// Only one VM can be created at a time for a single process.
 	if swapped := globalVM.CompareAndSwap(nil, ret); !swapped {
@@ -980,7 +981,7 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		return nil, fmt.Errorf("failed to create VM: %w", err)
 	}
 
-	timeslice.Record(tsHvfOnCreateVM)
+	ret.rec.Record(tsHvfOnCreateVM)
 
 	// allocate memory for the VM
 	mem, err := ret.AllocateMemory(config.MemoryBase(), config.MemorySize())
@@ -988,7 +989,7 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		return nil, fmt.Errorf("failed to allocate memory for VM: %w", err)
 	}
 
-	timeslice.Record(tsHvfAllocateMemory)
+	ret.rec.Record(tsHvfAllocateMemory)
 
 	ret.memory = mem.(*memoryRegion).memory
 	ret.memoryBase = config.MemoryBase()
@@ -1065,7 +1066,7 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 			return nil, fmt.Errorf("failed to create GICv3: %s", err)
 		}
 
-		timeslice.Record(tsHvfGicCreate)
+		ret.rec.Record(tsHvfGicCreate)
 	}
 
 	// Call the callback to allow the user to perform any additional initialization.
@@ -1073,7 +1074,7 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		return nil, fmt.Errorf("failed to create VM with memory: %w", err)
 	}
 
-	timeslice.Record(tsHvfOnCreateVMWithMemory)
+	ret.rec.Record(tsHvfOnCreateVMWithMemory)
 
 	// create vCPUs
 	if config.CPUCount() != 1 {
@@ -1085,6 +1086,7 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 			vm:        ret,
 			runQueue:  make(chan func(), 16),
 			initError: make(chan error, 1),
+			rec:       timeslice.NewRecorder(),
 		}
 
 		ret.cpus[i] = vcpu
@@ -1102,13 +1104,13 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		}
 	}
 
-	timeslice.Record(tsHvfOnCreateVCPU)
+	ret.rec.Record(tsHvfOnCreateVCPU)
 
 	if err := config.Loader().Load(ret); err != nil {
 		return nil, fmt.Errorf("failed to load VM: %w", err)
 	}
 
-	timeslice.Record(tsHvfLoaded)
+	ret.rec.Record(tsHvfLoaded)
 
 	return ret, nil
 }

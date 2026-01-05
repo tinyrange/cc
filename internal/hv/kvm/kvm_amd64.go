@@ -239,7 +239,7 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 
 	debug.Writef("kvm-amd64.Run run", "vCPU %d running", v.id)
 
-	timeslice.Record(tsKvmHostTime)
+	v.rec.Record(tsKvmHostTime)
 
 	// keep trying to run the vCPU until it exits or an error occurs
 	for {
@@ -258,7 +258,7 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		break
 	}
 
-	timeslice.Record(tsKvmGuestTime)
+	v.rec.Record(tsKvmGuestTime)
 
 	exitCtx := &exitContext{
 		timeslice: timeslice.InvalidTimesliceID,
@@ -313,7 +313,7 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	}
 
 	if exitCtx.timeslice != timeslice.InvalidTimesliceID {
-		timeslice.Record(exitCtx.timeslice)
+		v.rec.Record(exitCtx.timeslice)
 	}
 
 	return nil
@@ -397,7 +397,7 @@ func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 		return fmt.Errorf("setting TSS addr: %w", err)
 	}
 
-	timeslice.Record(tsKvmSetTSSAddr)
+	vm.rec.Record(tsKvmSetTSSAddr)
 
 	if config.NeedsInterruptSupport() {
 		// Enable split IRQ chip so IOAPIC is handled in userspace and PIC remains in-kernel.
@@ -405,13 +405,13 @@ func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 			return fmt.Errorf("enable split irqchip: %w", err)
 		}
 
-		timeslice.Record(tsKvmEnabledSplitIRQChip)
+		vm.rec.Record(tsKvmEnabledSplitIRQChip)
 
 		if err := createIRQChip(vm.vmFd); err != nil && err != unix.EEXIST {
 			return fmt.Errorf("creating IRQ chip: %w", err)
 		}
 
-		timeslice.Record(tsKvmCreatedIRQChip)
+		vm.rec.Record(tsKvmCreatedIRQChip)
 
 		vm.hasIRQChip = true
 
@@ -429,7 +429,7 @@ func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 			return fmt.Errorf("add IOAPIC device: %w", err)
 		}
 
-		timeslice.Record(tsKvmCreatedIOAPIC)
+		vm.rec.Record(tsKvmCreatedIOAPIC)
 	}
 
 	return nil
@@ -454,7 +454,7 @@ func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int) error {
 		return fmt.Errorf("getting vCPU ID: %w", err)
 	}
 
-	timeslice.Record(tsKvmGetSupportedCpuId)
+	vm.rec.Record(tsKvmGetSupportedCpuId)
 
 	// Normalize CPUID-reported APIC IDs to match LAPIC ID 0 in our ACPI/MADT.
 	// Hosts may return a non-zero APIC ID in leaf 0x1 EBX[31:24], which leads
@@ -478,7 +478,7 @@ func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int) error {
 		return fmt.Errorf("setting vCPU ID: %w", err)
 	}
 
-	timeslice.Record(tsKvmSetVCPUID)
+	vm.rec.Record(tsKvmSetVCPUID)
 
 	return nil
 }
