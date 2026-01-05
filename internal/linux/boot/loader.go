@@ -345,11 +345,20 @@ func (l *LinuxLoader) buildInitPayload(arch hv.CpuArchitecture) ([]byte, error) 
 	}
 }
 
+var (
+	tsLinuxLoaderReservedE820      = timeslice.RegisterKind("linux_loader_reserved_e820", 0)
+	tsLinuxLoaderAddedPCHostBridge = timeslice.RegisterKind("linux_loader_added_pc_host_bridge", 0)
+	tsLinuxLoaderAddedDualPIC      = timeslice.RegisterKind("linux_loader_added_dual_pic", 0)
+	tsLinuxLoaderInstalledACPI     = timeslice.RegisterKind("linux_loader_installed_acpi", 0)
+)
+
 func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, kernelSize int64, cmdline string, initrd []byte) error {
 	kernelImage, err := amd64boot.LoadKernel(kernelReader, kernelSize)
 	if err != nil {
 		return fmt.Errorf("load kernel: %w", err)
 	}
+
+	timeslice.Record(tsLinuxLoaderLoadKernel)
 
 	numCPUs := l.NumCPUs
 	if numCPUs <= 0 {
@@ -368,6 +377,8 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	if err != nil {
 		return fmt.Errorf("reserve ACPI tables in e820 map: %w", err)
 	}
+
+	timeslice.Record(tsLinuxLoaderReservedE820)
 
 	opts := amd64boot.BootOptions{
 		Cmdline: cmdline,
@@ -404,19 +415,27 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	}
 	l.plan = plan
 
+	timeslice.Record(tsLinuxLoaderPreparedKernel)
+
 	auxSerial := amd64serial.NewSerial16550WithIRQ(0x2F8, 3, io.Discard)
 	if err := vm.AddDevice(auxSerial); err != nil {
 		return fmt.Errorf("add aux serial device: %w", err)
 	}
 
+	timeslice.Record(tsLinuxLoaderAddedUART)
+
 	if err := vm.AddDevice(pci.NewHostBridge()); err != nil {
 		return fmt.Errorf("add pci host bridge: %w", err)
 	}
+
+	timeslice.Record(tsLinuxLoaderAddedPCHostBridge)
 
 	pic := chipset.NewDualPIC()
 	if err := vm.AddDevice(pic); err != nil {
 		return fmt.Errorf("add dual PIC: %w", err)
 	}
+
+	timeslice.Record(tsLinuxLoaderAddedDualPIC)
 
 	setter, _ := vm.(interface {
 		SetIRQ(uint32, bool) error
@@ -530,6 +549,8 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 		}
 	}
 
+	timeslice.Record(tsLinuxLoaderAddedDevices)
+
 	// Collect virtio-mmio device info for ACPI DSDT
 	var virtioACPIDevices []acpi.VirtioMMIODevice
 	for i, dev := range l.Devices {
@@ -569,6 +590,8 @@ func (l *LinuxLoader) loadAMD64(vm hv.VirtualMachine, kernelReader io.ReaderAt, 
 	}); err != nil {
 		return fmt.Errorf("install ACPI tables: %w", err)
 	}
+
+	timeslice.Record(tsLinuxLoaderInstalledACPI)
 
 	return nil
 }

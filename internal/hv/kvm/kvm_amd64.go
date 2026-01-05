@@ -11,6 +11,7 @@ import (
 	"github.com/tinyrange/cc/internal/debug"
 	x86chipset "github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	"github.com/tinyrange/cc/internal/hv"
+	"github.com/tinyrange/cc/internal/timeslice"
 	"golang.org/x/sys/unix"
 )
 
@@ -217,6 +218,11 @@ func (v *virtualCPU) GetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 	return nil
 }
 
+var (
+	tsKvmHostTime  = timeslice.RegisterKind("kvm_host_time", 0)
+	tsKvmGuestTime = timeslice.RegisterKind("kvm_guest_time", timeslice.SliceFlagGuestTime)
+)
+
 func (v *virtualCPU) Run(ctx context.Context) error {
 	usingContext := false
 	var stopNotify func() bool
@@ -238,6 +244,8 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 
 	debug.Writef("kvm-amd64.Run run", "vCPU %d running", v.id)
 
+	timeslice.Record(tsKvmHostTime)
+
 	// keep trying to run the vCPU until it exits or an error occurs
 	for {
 		_, err := ioctl(uintptr(v.fd), uint64(kvmRun), 0)
@@ -255,7 +263,11 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		break
 	}
 
-	exitCtx := &exitContext{}
+	timeslice.Record(tsKvmGuestTime)
+
+	exitCtx := &exitContext{
+		timeslice: timeslice.InvalidTimesliceID,
+	}
 
 	reason := kvmExitReason(run.exit_reason)
 
@@ -271,14 +283,21 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	case kvmExitIo:
 		ioData := (*kvmExitIoData)(unsafe.Pointer(&run.anon0[0]))
 
-		return v.handleIO(exitCtx, ioData)
+		if err := v.handleIO(exitCtx, ioData); err != nil {
+			return fmt.Errorf("handle I/O: %w", err)
+		}
 	case kvmExitMmio:
 		mmioData := (*kvmExitMMIOData)(unsafe.Pointer(&run.anon0[0]))
 
-		return v.handleMMIO(exitCtx, mmioData)
+		if err := v.handleMMIO(exitCtx, mmioData); err != nil {
+			return fmt.Errorf("handle MMIO: %w", err)
+		}
 	case kvmExitIoapicEoi:
 		eoiData := (*kvmExitIoapicEoiData)(unsafe.Pointer(&run.anon0[0]))
-		return v.handleIoapicEoi(eoiData)
+
+		if err := v.handleIoapicEoi(eoiData); err != nil {
+			return fmt.Errorf("handle IOAPIC EOI: %w", err)
+		}
 	case kvmExitShutdown:
 		debug.Writef("kvm-amd64.Run shutdown", "vCPU %d exited with shutdown reason", v.id)
 
@@ -297,6 +316,12 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	default:
 		return fmt.Errorf("kvm: vCPU %d exited with unknown reason %s", v.id, reason)
 	}
+
+	if exitCtx.timeslice != timeslice.InvalidTimesliceID {
+		timeslice.Record(exitCtx.timeslice)
+	}
+
+	return nil
 }
 
 func (v *virtualCPU) handleIO(exitCtx *exitContext, ioData *kvmExitIoData) error {
@@ -363,6 +388,13 @@ func (v *virtualCPU) handleIoapicEoi(eoiData *kvmExitIoapicEoiData) error {
 	return nil
 }
 
+var (
+	tsKvmSetTSSAddr          = timeslice.RegisterKind("kvm_set_tss_addr", 0)
+	tsKvmEnabledSplitIRQChip = timeslice.RegisterKind("kvm_enabled_split_irqchip", 0)
+	tsKvmCreatedIRQChip      = timeslice.RegisterKind("kvm_created_irqchip", 0)
+	tsKvmCreatedIOAPIC       = timeslice.RegisterKind("kvm_created_ioapic", 0)
+)
+
 func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 	debug.Writef("kvm-amd64.archVMInit", "archVMInit")
 
@@ -370,15 +402,21 @@ func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 		return fmt.Errorf("setting TSS addr: %w", err)
 	}
 
+	timeslice.Record(tsKvmSetTSSAddr)
+
 	if config.NeedsInterruptSupport() {
 		// Enable split IRQ chip so IOAPIC is handled in userspace and PIC remains in-kernel.
 		if err := enableSplitIRQChip(vm.vmFd, 24); err != nil && err != unix.EINVAL && err != unix.ENOTTY {
 			return fmt.Errorf("enable split irqchip: %w", err)
 		}
 
+		timeslice.Record(tsKvmEnabledSplitIRQChip)
+
 		if err := createIRQChip(vm.vmFd); err != nil && err != unix.EEXIST {
 			return fmt.Errorf("creating IRQ chip: %w", err)
 		}
+
+		timeslice.Record(tsKvmCreatedIRQChip)
 
 		vm.hasIRQChip = true
 
@@ -395,6 +433,8 @@ func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 		if err := vm.AddDevice(vm.ioapic); err != nil {
 			return fmt.Errorf("add IOAPIC device: %w", err)
 		}
+
+		timeslice.Record(tsKvmCreatedIOAPIC)
 	}
 
 	return nil
@@ -406,6 +446,11 @@ func (hv *hypervisor) archPostVCPUInit(vm *virtualMachine, config hv.VMConfig) e
 	return nil
 }
 
+var (
+	tsKvmGetSupportedCpuId = timeslice.RegisterKind("kvm_get_supported_cpu_id", 0)
+	tsKvmSetVCPUID         = timeslice.RegisterKind("kvm_set_vcpu_id", 0)
+)
+
 func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int) error {
 	debug.Writef("kvm-amd64.archVCPUInit", "archVCPUInit")
 
@@ -413,6 +458,8 @@ func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int) error {
 	if err != nil {
 		return fmt.Errorf("getting vCPU ID: %w", err)
 	}
+
+	timeslice.Record(tsKvmGetSupportedCpuId)
 
 	// Normalize CPUID-reported APIC IDs to match LAPIC ID 0 in our ACPI/MADT.
 	// Hosts may return a non-zero APIC ID in leaf 0x1 EBX[31:24], which leads
@@ -435,6 +482,8 @@ func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int) error {
 	if err := setVCPUID(vcpuFd, cpuId); err != nil {
 		return fmt.Errorf("setting vCPU ID: %w", err)
 	}
+
+	timeslice.Record(tsKvmSetVCPUID)
 
 	return nil
 }

@@ -169,6 +169,12 @@ func (v *virtualMachine) MemoryBase() uint64        { return v.memoryBase }
 func (v *virtualMachine) MemorySize() uint64        { return uint64(len(v.memory)) }
 func (v *virtualMachine) Hypervisor() hv.Hypervisor { return v.hv }
 
+var (
+	tsKvmAllocateMemory      = timeslice.RegisterKind("kvm_allocate_memory", 0)
+	tsKvmMadviseMemory       = timeslice.RegisterKind("kvm_madvise_memory", 0)
+	tsKvmSetUserMemoryRegion = timeslice.RegisterKind("kvm_set_user_memory_region", 0)
+)
+
 // AllocateMemory implements hv.VirtualMachine.
 func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.MemoryRegion, error) {
 	maxInt := uint64(^uint(0) >> 1)
@@ -187,11 +193,15 @@ func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.Memory
 		return nil, fmt.Errorf("allocate memory: %w", err)
 	}
 
+	timeslice.Record(tsKvmAllocateMemory)
+
 	if v.hv.Architecture() == hv.ArchitectureX86_64 {
 		if err := unix.Madvise(mem, unix.MADV_MERGEABLE); err != nil {
 			unix.Munmap(mem)
 			return nil, fmt.Errorf("madvise memory: %w", err)
 		}
+
+		timeslice.Record(tsKvmMadviseMemory)
 	}
 
 	v.lastMemorySlot++
@@ -204,6 +214,8 @@ func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.Memory
 	}); err != nil {
 		return nil, fmt.Errorf("set user memory region: %w", err)
 	}
+
+	timeslice.Record(tsKvmSetUserMemoryRegion)
 
 	return &memoryRegion{mem: mem}, nil
 }
@@ -349,11 +361,18 @@ func (v *virtualMachine) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error
 	return <-done
 }
 
+var (
+	tsKvmEnsureChipset = timeslice.RegisterKind("kvm_ensure_chipset", 0)
+	tsKvmBuiltChipset  = timeslice.RegisterKind("kvm_built_chipset", 0)
+)
+
 // ensureChipset builds the chipset dispatch tables from registered devices on demand.
 func (v *virtualMachine) ensureChipset() (*corechipset.Chipset, error) {
 	if v.chipset != nil {
 		return v.chipset, nil
 	}
+
+	timeslice.Record(tsKvmEnsureChipset)
 
 	builder := corechipset.NewBuilder()
 	for idx, dev := range v.devices {
@@ -380,6 +399,9 @@ func (v *virtualMachine) ensureChipset() (*corechipset.Chipset, error) {
 		return nil, fmt.Errorf("build chipset: %w", err)
 	}
 	v.chipset = chipset
+
+	timeslice.Record(tsKvmBuiltChipset)
+
 	return chipset, nil
 }
 
@@ -492,12 +514,31 @@ func (h *hypervisor) Close() error {
 	return nil
 }
 
+var (
+	tsKvmPreInit              = timeslice.RegisterKind("kvm_pre_init", 0)
+	tsKvmCreateVm             = timeslice.RegisterKind("kvm_create_vm", 0)
+	tsKvmArchVMInit           = timeslice.RegisterKind("kvm_arch_vm_init", 0)
+	tsKvmOnCreateVM           = timeslice.RegisterKind("kvm_on_create_vm", 0)
+	tsKvmMmapGuestMemory      = timeslice.RegisterKind("kvm_mmap_guest_memory", 0)
+	tsKvmMadviseGuestMemory   = timeslice.RegisterKind("kvm_madvise_guest_memory", 0)
+	tsKvmInstallACPI          = timeslice.RegisterKind("kvm_install_acpi", 0)
+	tsKvmOnCreateVMWithMemory = timeslice.RegisterKind("kvm_on_create_vm_with_memory", 0)
+	tsKvmCreateVCPU           = timeslice.RegisterKind("kvm_create_vcpu", 0)
+	tsKvmMmapVCPU             = timeslice.RegisterKind("kvm_mmap_vcpu", 0)
+	tsKvmArchVCPUInit         = timeslice.RegisterKind("kvm_arch_vcpu_init", 0)
+	tsKvmOnCreateVCPU         = timeslice.RegisterKind("kvm_on_create_vcpu", 0)
+	tsKvmArchPostVCPUInit     = timeslice.RegisterKind("kvm_arch_post_vcpu_init", 0)
+	tsKvmLoaded               = timeslice.RegisterKind("kvm_loaded", 0)
+)
+
 // NewVirtualMachine implements hv.Hypervisor.
 func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, error) {
 	vm := &virtualMachine{
 		hv:    h,
 		vcpus: make(map[int]*virtualCPU),
 	}
+
+	timeslice.Record(tsKvmPreInit)
 
 	// On M1 this fails unless an argument is passed to set the IPA size.
 	var ipaSize uint32 = 0
@@ -514,6 +555,8 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		return nil, fmt.Errorf("kvm: create VM: %w", err)
 	}
 
+	timeslice.Record(tsKvmCreateVm)
+
 	vm.vmFd = vmFd
 
 	if err := h.archVMInit(vm, config); err != nil {
@@ -521,10 +564,14 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		return nil, fmt.Errorf("initialize VM: %w", err)
 	}
 
+	timeslice.Record(tsKvmArchVMInit)
+
 	if err := config.Callbacks().OnCreateVM(vm); err != nil {
 		unix.Close(vmFd)
 		return nil, fmt.Errorf("VM callback OnCreateVM: %w", err)
 	}
+
+	timeslice.Record(tsKvmOnCreateVM)
 
 	// Allocate guest memory
 	if config.MemorySize() == 0 {
@@ -544,12 +591,16 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		return nil, fmt.Errorf("mmap guest memory: %w", err)
 	}
 
+	timeslice.Record(tsKvmMmapGuestMemory)
+
 	if h.Architecture() == hv.ArchitectureX86_64 {
 		if err := unix.Madvise(mem, unix.MADV_MERGEABLE); err != nil {
 			unix.Munmap(mem)
 			return nil, fmt.Errorf("madvise memory: %w", err)
 		}
 	}
+
+	timeslice.Record(tsKvmMadviseGuestMemory)
 
 	vm.memory = mem
 	vm.memoryBase = config.MemoryBase()
@@ -565,6 +616,8 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		return nil, fmt.Errorf("set user memory region: %w", err)
 	}
 
+	timeslice.Record(tsKvmSetUserMemoryRegion)
+
 	if h.Architecture() == hv.ArchitectureX86_64 && config.NeedsInterruptSupport() {
 		if err := acpi.Install(vm, acpi.Config{
 			MemoryBase: config.MemoryBase(),
@@ -573,12 +626,16 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 			unix.Close(vmFd)
 			return nil, fmt.Errorf("install ACPI tables: %w", err)
 		}
+
+		timeslice.Record(tsKvmInstallACPI)
 	}
 
 	if err := config.Callbacks().OnCreateVMWithMemory(vm); err != nil {
 		unix.Close(vmFd)
 		return nil, fmt.Errorf("VM callback OnCreateVMWithMemory: %w", err)
 	}
+
+	timeslice.Record(tsKvmOnCreateVMWithMemory)
 
 	// Create vCPUs
 	if config.CPUCount() != 1 {
@@ -599,6 +656,8 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 			return nil, fmt.Errorf("create vCPU %d: %w", i, err)
 		}
 
+		timeslice.Record(tsKvmCreateVCPU)
+
 		run, err := unix.Mmap(
 			vcpuFd,
 			0,
@@ -611,6 +670,8 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 			unix.Close(vmFd)
 			return nil, fmt.Errorf("mmap vCPU %d kvm_run: %w", i, err)
 		}
+
+		timeslice.Record(tsKvmMmapVCPU)
 
 		vcpu := &virtualCPU{
 			vm:       vm,
@@ -627,6 +688,8 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 			return nil, fmt.Errorf("initialize VM: %w", err)
 		}
 
+		timeslice.Record(tsKvmArchVCPUInit)
+
 		go vcpu.start()
 
 		if err := config.Callbacks().OnCreateVCPU(vcpu); err != nil {
@@ -634,6 +697,8 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 			unix.Close(vmFd)
 			return nil, fmt.Errorf("VM callback OnCreateVCPU %d: %w", i, err)
 		}
+
+		timeslice.Record(tsKvmOnCreateVCPU)
 	}
 
 	// Post-vCPU architecture-specific initialization (e.g., vGIC finalization on ARM64)
@@ -641,6 +706,8 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		unix.Close(vmFd)
 		return nil, fmt.Errorf("post-vCPU initialization: %w", err)
 	}
+
+	timeslice.Record(tsKvmArchPostVCPUInit)
 
 	// Run Loader
 	loader := config.Loader()
@@ -650,6 +717,8 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 			unix.Close(vmFd)
 			return nil, fmt.Errorf("load VM: %w", err)
 		}
+
+		timeslice.Record(tsKvmLoaded)
 	}
 
 	return vm, nil
