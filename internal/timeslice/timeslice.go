@@ -203,7 +203,7 @@ func Open(w io.Writer) (io.Closer, error) {
 	go writer.run()
 
 	if !currentWriter.CompareAndSwap(nil, writer) {
-		return nil, fmt.Errorf("timeslice: already open, discarded old writer")
+		return nil, fmt.Errorf("timeslice: already open")
 	}
 
 	return writer, nil
