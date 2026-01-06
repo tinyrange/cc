@@ -760,6 +760,18 @@ func lookPath(fs *oci.ContainerFS, pathEnv string, workDir string, file string) 
 			continue
 		}
 
+		// If it's a symlink, resolve it and check the target
+		if entry.Symlink != nil {
+			resolved, err := fs.ResolvePath(candidate)
+			if err != nil {
+				continue
+			}
+			entry, err = fs.Lookup(resolved)
+			if err != nil {
+				continue
+			}
+		}
+
 		if entry.File == nil {
 			continue
 		}
