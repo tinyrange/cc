@@ -370,7 +370,12 @@ func goBuild(opts buildOptions) (buildOutput, error) {
 	return buildOutput{Path: output}, nil
 }
 
-func runBuildOutput(output buildOutput, args []string) error {
+type runOptions struct {
+	CpuProfilePath string
+	MemProfilePath string
+}
+
+func runBuildOutput(output buildOutput, args []string, opts runOptions) error {
 	// If this is a macOS app bundle, run via `open`.
 	if runtime.GOOS == "darwin" && strings.HasSuffix(output.Path, ".app") {
 		openArgs := []string{"-n", output.Path}
@@ -386,6 +391,16 @@ func runBuildOutput(output buildOutput, args []string) error {
 			return fmt.Errorf("failed to run app bundle: %w", err)
 		}
 		return nil
+	}
+
+	// if cpu profile path is set then add -cpuprofile to the start of the args
+	if opts.CpuProfilePath != "" {
+		args = append([]string{"-cpuprofile", opts.CpuProfilePath}, args...)
+	}
+
+	// if mem profile path is set then add -memprofile to the start of the args
+	if opts.MemProfilePath != "" {
+		args = append([]string{"-memprofile", opts.MemProfilePath}, args...)
 	}
 
 	cmd := exec.Command(output.Path, args...)
@@ -622,9 +637,16 @@ func main() {
 	runtest := fs.String("runtest", "", "build a Dockerfile in tests/<name>/Dockerfile and run it using cc (Linux only)")
 	dbgTool := fs.Bool("dbg-tool", false, "build and run the debug tool")
 	app := fs.Bool("app", false, "build and run ccapp")
+	cpuprofile := fs.String("cpuprofile", "", "write CPU profile of built binary to file")
+	memprofile := fs.String("memprofile", "", "write memory profile of built binary to file")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
+	}
+
+	runOpts := runOptions{
+		CpuProfilePath: *cpuprofile,
+		MemProfilePath: *memprofile,
 	}
 
 	var remoteTargetConfig *remoteTarget
@@ -656,7 +678,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		if err := runBuildOutput(out, fs.Args()); err != nil {
+		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
 			os.Exit(1)
 		}
 
@@ -674,7 +696,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		if err := runBuildOutput(out, fs.Args()); err != nil {
+		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
 			os.Exit(1)
 		}
 
@@ -692,7 +714,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		if err := runBuildOutput(out, fs.Args()); err != nil {
+		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
 			os.Exit(1)
 		}
 
@@ -710,7 +732,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		if err := runBuildOutput(out, fs.Args()); err != nil {
+		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
 			os.Exit(1)
 		}
 
@@ -749,7 +771,7 @@ func main() {
 				os.Exit(1)
 			}
 		} else {
-			if err := runBuildOutput(out, fs.Args()); err != nil {
+			if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
 				os.Exit(1)
 			}
 		}
@@ -820,7 +842,7 @@ func main() {
 				os.Exit(1)
 			}
 		} else {
-			if err := runBuildOutput(out, args); err != nil {
+			if err := runBuildOutput(out, args, runOpts); err != nil {
 				os.Exit(1)
 			}
 		}
@@ -895,7 +917,7 @@ func main() {
 				os.Exit(1)
 			}
 		} else {
-			if err := runBuildOutput(out, args); err != nil {
+			if err := runBuildOutput(out, args, runOpts); err != nil {
 				os.Exit(1)
 			}
 		}
@@ -1020,7 +1042,7 @@ func main() {
 		}
 		ccArgs := append(fs.Args(), relativeTarPath)
 		fmt.Printf("Running cc with image %s and args %s...\n", relativeTarPath, strings.Join(ccArgs, " "))
-		if err := runBuildOutput(ccOut, ccArgs); err != nil {
+		if err := runBuildOutput(ccOut, ccArgs, runOpts); err != nil {
 			os.Exit(1)
 		}
 
@@ -1120,26 +1142,11 @@ func main() {
 
 	if *run {
 		fmt.Printf("running %s %s\n", out.Path, strings.Join(fs.Args(), " "))
-		if err := runBuildOutput(out, fs.Args()); err != nil {
+		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
 			os.Exit(1)
 		}
 	} else if *app {
-		switch runtime.GOOS {
-		case "darwin":
-			if err := runBuildOutput(ccappOut, fs.Args()); err != nil {
-				os.Exit(1)
-			}
-		case "windows":
-			// On Windows, ccapp is built as a GUI app when BuildApp is true.
-			if err := runBuildOutput(ccappOut, fs.Args()); err != nil {
-				os.Exit(1)
-			}
-		case "linux":
-			if err := runBuildOutput(ccappOut, fs.Args()); err != nil {
-				os.Exit(1)
-			}
-		default:
-			fmt.Fprintf(os.Stderr, "unsupported OS: %s\n", runtime.GOOS)
+		if err := runBuildOutput(ccappOut, fs.Args(), runOpts); err != nil {
 			os.Exit(1)
 		}
 	}

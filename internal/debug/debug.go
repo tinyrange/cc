@@ -178,12 +178,7 @@ func decodeTimestamp(header [16]byte) int64 {
 	return int64(binary.LittleEndian.Uint64(header[8:16]))
 }
 
-func writeBytes(kind DebugKind, source string, data []byte) {
-	fh := fh.Load()
-	if fh == nil {
-		return
-	}
-
+func writeBytes(fh *writer, kind DebugKind, source string, data []byte) {
 	header, size := encodeHeader(kind, source, data)
 	off := offset.Add(uint64(size)) - uint64(size)
 	if _, err := fh.w.WriteAt(header, int64(off)); err != nil {
@@ -201,17 +196,32 @@ func writeBytes(kind DebugKind, source string, data []byte) {
 
 // source should be unique for every call site.
 func WriteBytes(source string, data []byte) {
-	writeBytes(DebugKindBytes, source, data)
+	fh := fh.Load()
+	if fh == nil {
+		return
+	}
+
+	writeBytes(fh, DebugKindBytes, source, data)
 }
 
 // source should be unique for every call site.
 func Write(source string, data string) {
-	writeBytes(DebugKindString, source, []byte(data))
+	fh := fh.Load()
+	if fh == nil {
+		return
+	}
+
+	writeBytes(fh, DebugKindString, source, []byte(data))
 }
 
 // source should be unique for every call site.
 func Writef(source string, format string, args ...any) {
-	writeBytes(DebugKindString, source, fmt.Appendf(nil, format, args...))
+	fh := fh.Load()
+	if fh == nil {
+		return
+	}
+
+	writeBytes(fh, DebugKindString, source, fmt.Appendf(nil, format, args...))
 }
 
 type Debug interface {
