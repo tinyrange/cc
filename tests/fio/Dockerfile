@@ -31,7 +31,7 @@ fio --name=rand-write --directory="$TEST_DIR" --size="$SIZE" --bs=1M \
     --rw=randwrite --ioengine=libaio --direct=1 --numjobs="$NUMJOBS" \
     --runtime="$RUNTIME" --group_reporting --time_based
 
-echo "=== Random Read Test (4K) ==="
+echo "=== Random Read Test (1M) ==="
 fio --name=rand-read --directory="$TEST_DIR" --size="$SIZE" --bs=1M \
     --rw=randread --ioengine=libaio --direct=1 --numjobs="$NUMJOBS" \
     --runtime="$RUNTIME" --group_reporting --time_based
