@@ -37,10 +37,15 @@ func (s *Spacer) Layout(ctx *LayoutContext, constraints Constraints) Size {
 	w := s.fixedWidth
 	h := s.fixedHeight
 
-	if w == 0 {
+	// Only expand to fill available space if constraints are bounded.
+	// Unbounded constraints (1e9) indicate the parent is measuring intrinsic size,
+	// so we should return 0 to not artificially inflate the layout.
+	const unboundedThreshold = 1e8
+
+	if w == 0 && constraints.MaxW < unboundedThreshold {
 		w = constraints.MaxW
 	}
-	if h == 0 {
+	if h == 0 && constraints.MaxH < unboundedThreshold {
 		h = constraints.MaxH
 	}
 
@@ -90,10 +95,13 @@ func (b *Box) Layout(ctx *LayoutContext, constraints Constraints) Size {
 	w := b.fixedWidth
 	h := b.fixedHeight
 
-	if w == 0 {
+	// Only expand to fill available space if constraints are bounded.
+	const unboundedThreshold = 1e8
+
+	if w == 0 && constraints.MaxW < unboundedThreshold {
 		w = constraints.MaxW
 	}
-	if h == 0 {
+	if h == 0 && constraints.MaxH < unboundedThreshold {
 		h = constraints.MaxH
 	}
 
