@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"image"
+	"image/color"
 	"image/draw"
 	"io"
 	"strings"
@@ -36,6 +37,9 @@ type View struct {
 
 	emu *vt.SafeEmulator
 
+	// Grid caches cell state for incremental rendering.
+	grid *Grid
+
 	// Insets reserve window space that the terminal renderer should not draw into
 	// (e.g. an app-level top bar).
 	insetLeft   float32
@@ -48,7 +52,7 @@ type View struct {
 	inW *io.PipeWriter
 
 	// inputQ decouples VT input generation (term.Read) from the downstream pipe
-	// write to avoid backpressure making keystrokes appear to “drop”.
+	// write to avoid backpressure making keystrokes appear to "drop".
 	inputQ chan []byte
 
 	closeOnce sync.Once
@@ -56,6 +60,10 @@ type View struct {
 
 	lastCols int
 	lastRows int
+
+	// Rendering layout cached from last frame.
+	cellW, cellH float32
+	originX, originY float32
 }
 
 // Terminal is a convenience wrapper that owns its own window and renders a View
@@ -104,6 +112,7 @@ func NewView(win graphics.Window) (*View, error) {
 		tex:      tex,
 		txt:      txt,
 		emu:      emu,
+		grid:     NewGrid(80, 40),
 		inR:      inR,
 		inW:      inW,
 		inputQ:   make(chan []byte, 1024),
@@ -117,6 +126,14 @@ func NewView(win graphics.Window) (*View, error) {
 	go v.drainQueueToPipe()
 
 	return v, nil
+}
+
+// Grid returns the internal grid for testing and introspection.
+func (v *View) Grid() *Grid {
+	if v == nil {
+		return nil
+	}
+	return v.grid
 }
 
 // SetInsets configures pixel insets for rendering and sizing the terminal grid.
@@ -332,6 +349,10 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 		cellH = 16
 	}
 
+	// Cache layout parameters.
+	v.cellW = cellW
+	v.cellH = cellH
+
 	insetL := v.insetLeft
 	insetT := v.insetTop
 	insetR := v.insetRight
@@ -355,13 +376,21 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 		rows = 1
 	}
 
+	// Handle resize.
+	resized := false
 	if cols != v.emu.Width() || rows != v.emu.Height() {
 		v.emu.Resize(cols, rows)
+		v.grid.Resize(cols, rows)
 		v.lastCols, v.lastRows = cols, rows
+		resized = true
 		if hooks.OnResize != nil {
 			hooks.OnResize(cols, rows)
 		}
 	}
+
+	// Cache origin.
+	v.originX = insetL
+	v.originY = insetT
 
 	toVTMods := func(m window.KeyMods) vt.KeyMod {
 		var mod vt.KeyMod
@@ -490,11 +519,34 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 	bgDefault := v.emu.BackgroundColor()
 	fgDefault := v.emu.ForegroundColor()
 
-	// Render cells.
-	originX := insetL
-	originY := insetT
-	for y := 0; y < v.emu.Height(); y++ {
-		for x := 0; x < v.emu.Width(); {
+	// Sync grid from VT emulator and track changes.
+	v.syncGridFromEmulator(bgDefault, fgDefault, resized)
+
+	// Update cursor position in grid (marks old/new positions dirty).
+	cur := v.emu.CursorPosition()
+	v.grid.UpdateCursor(cur.X, cur.Y)
+
+	// Render cells using the grid.
+	v.renderGrid(f, bgDefault, fgDefault, padX, padY, fontSize)
+
+	// Clear dirty flags after rendering.
+	v.grid.ClearDirty()
+
+	return nil
+}
+
+// syncGridFromEmulator copies cell state from VT emulator to grid,
+// marking changed cells as dirty.
+func (v *View) syncGridFromEmulator(bgDefault, fgDefault color.Color, forceFullSync bool) {
+	cols, rows := v.grid.Size()
+
+	// If forced (e.g., after resize), mark all dirty.
+	if forceFullSync {
+		v.grid.MarkAllDirty()
+	}
+
+	for y := 0; y < rows; y++ {
+		for x := 0; x < cols; {
 			cell := v.emu.CellAt(x, y)
 			w := 1
 
@@ -518,35 +570,65 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 			}
 
 			// Reverse video.
-			if attrs&uint8(1<<5) != 0 { // uv.AttrReverse
+			if attrs&uint8(1<<5) != 0 {
 				fg, bg = bg, fg
+			}
+
+			// Update grid cell (this marks dirty if changed).
+			v.grid.SetCell(x, y, content, w, fg, bg, attrs)
+
+			x += w
+		}
+	}
+}
+
+// renderGrid renders all cells from the grid.
+// For now, renders all cells; future optimization can render only dirty cells
+// once we have proper background mesh batching.
+func (v *View) renderGrid(f graphics.Frame, bgDefault, fgDefault color.Color, padX, padY, fontSize float32) {
+	cols, rows := v.grid.Size()
+	originX := v.originX
+	originY := v.originY
+	cellW := v.cellW
+	cellH := v.cellH
+
+	for y := 0; y < rows; y++ {
+		for x := 0; x < cols; {
+			cell := v.grid.CellAt(x, y)
+			if cell == nil {
+				x++
+				continue
+			}
+
+			w := cell.Width
+			if w < 1 {
+				w = 1
 			}
 
 			x0 := originX + padX + float32(x)*cellW
 			y0 := originY + padY + float32(y)*cellH
 
-			if bg != nil && bg != bgDefault {
-				f.RenderQuad(x0, y0, float32(w)*cellW, cellH, v.tex, bg)
+			// Render background if not default.
+			if cell.Bg != nil && !colorEquals(cell.Bg, bgDefault) {
+				f.RenderQuad(x0, y0, float32(w)*cellW, cellH, v.tex, cell.Bg)
 			}
 
-			// Avoid drawing blank spaces.
-			if content != "" && content != " " && fg != nil {
-				// Heuristic baseline: place text near the bottom of the cell.
-				v.txt.RenderText(content, x0, y0+cellH-2, fontSize, fg)
+			// Render text if not blank.
+			if cell.Content != "" && cell.Content != " " && cell.Fg != nil {
+				v.txt.RenderText(cell.Content, x0, y0+cellH-2, fontSize, cell.Fg)
 			}
+
 			x += w
 		}
 	}
 
-	// Cursor.
-	cur := v.emu.CursorPosition()
-	if cur.X >= 0 && cur.Y >= 0 && cur.X < v.emu.Width() && cur.Y < v.emu.Height() {
-		x0 := originX + padX + float32(cur.X)*cellW
-		y0 := originY + padY + float32(cur.Y)*cellH
+	// Render cursor.
+	curX, curY := v.grid.CursorPosition()
+	if curX >= 0 && curY >= 0 && curX < cols && curY < rows {
+		x0 := originX + padX + float32(curX)*cellW
+		y0 := originY + padY + float32(curY)*cellH
 		f.RenderQuad(x0, y0, cellW, cellH, v.tex, v.emu.CursorColor())
 	}
-
-	return nil
 }
 
 func (t *Terminal) Run(ctx context.Context, hooks Hooks) error {
