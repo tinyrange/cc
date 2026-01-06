@@ -144,7 +144,7 @@ func (c *CMOS) Init(vm hv.VirtualMachine) error {
 func (c *CMOS) IOPorts() []uint16 { return []uint16{cmosAddrPort, cmosDataPort} }
 
 // ReadIOPort implements hv.X86IOPortDevice.
-func (c *CMOS) ReadIOPort(port uint16, data []byte) error {
+func (c *CMOS) ReadIOPort(ctx hv.ExitContext, port uint16, data []byte) error {
 	if len(data) != 1 {
 		return fmt.Errorf("cmos: invalid read size %d", len(data))
 	}
@@ -165,7 +165,7 @@ func (c *CMOS) ReadIOPort(port uint16, data []byte) error {
 }
 
 // WriteIOPort implements hv.X86IOPortDevice.
-func (c *CMOS) WriteIOPort(port uint16, data []byte) error {
+func (c *CMOS) WriteIOPort(ctx hv.ExitContext, port uint16, data []byte) error {
 	if len(data) != 1 {
 		return fmt.Errorf("cmos: invalid write size %d", len(data))
 	}

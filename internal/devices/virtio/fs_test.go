@@ -58,7 +58,7 @@ func TestDispatchFUSERename2ParsesNamesAndFlags(t *testing.T) {
 
 	req := makeFuseReq(FUSE_RENAME2, oldParent, payload)
 	resp := make([]byte, 256)
-	outLen, err := fs.dispatchFUSE(req, resp)
+	outLen, err := fs.dispatchFUSE(&mockExitContext{}, req, resp)
 	if err != nil {
 		t.Fatalf("dispatchFUSE: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestDispatchFUSERenameDoesNotConsumeFlagsBytes(t *testing.T) {
 
 	req := makeFuseReq(FUSE_RENAME, oldParent, payload)
 	resp := make([]byte, 256)
-	outLen, err := fs.dispatchFUSE(req, resp)
+	outLen, err := fs.dispatchFUSE(&mockExitContext{}, req, resp)
 	if err != nil {
 		t.Fatalf("dispatchFUSE: %v", err)
 	}

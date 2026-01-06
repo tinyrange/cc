@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+
+	"github.com/tinyrange/cc/internal/timeslice"
 )
 
 var (
@@ -301,6 +303,10 @@ type DeviceTemplate interface {
 	Create(vm VirtualMachine) (Device, error)
 }
 
+type ExitContext interface {
+	SetExitTimeslice(id timeslice.TimesliceID)
+}
+
 type MMIORegion struct {
 	Address uint64
 	Size    uint64
@@ -311,27 +317,27 @@ type MemoryMappedIODevice interface {
 
 	MMIORegions() []MMIORegion
 
-	ReadMMIO(addr uint64, data []byte) error
-	WriteMMIO(addr uint64, data []byte) error
+	ReadMMIO(ctx ExitContext, addr uint64, data []byte) error
+	WriteMMIO(ctx ExitContext, addr uint64, data []byte) error
 }
 
 type SimpleMMIODevice struct {
 	Regions []MMIORegion
 
-	ReadFunc  func(addr uint64, data []byte) error
-	WriteFunc func(addr uint64, data []byte) error
+	ReadFunc  func(ctx ExitContext, addr uint64, data []byte) error
+	WriteFunc func(ctx ExitContext, addr uint64, data []byte) error
 }
 
 func (d SimpleMMIODevice) MMIORegions() []MMIORegion { return d.Regions }
-func (d SimpleMMIODevice) ReadMMIO(addr uint64, data []byte) error {
+func (d SimpleMMIODevice) ReadMMIO(ctx ExitContext, addr uint64, data []byte) error {
 	if d.ReadFunc != nil {
-		return d.ReadFunc(addr, data)
+		return d.ReadFunc(ctx, addr, data)
 	}
 	return fmt.Errorf("unhandled read from MMIO address 0x%X", addr)
 }
-func (d SimpleMMIODevice) WriteMMIO(addr uint64, data []byte) error {
+func (d SimpleMMIODevice) WriteMMIO(ctx ExitContext, addr uint64, data []byte) error {
 	if d.WriteFunc != nil {
-		return d.WriteFunc(addr, data)
+		return d.WriteFunc(ctx, addr, data)
 	}
 	return fmt.Errorf("unhandled write to MMIO address 0x%X", addr)
 }
@@ -344,27 +350,27 @@ type X86IOPortDevice interface {
 
 	IOPorts() []uint16
 
-	ReadIOPort(port uint16, data []byte) error
-	WriteIOPort(port uint16, data []byte) error
+	ReadIOPort(ctx ExitContext, port uint16, data []byte) error
+	WriteIOPort(ctx ExitContext, port uint16, data []byte) error
 }
 
 type SimpleX86IOPortDevice struct {
 	Ports []uint16
 
-	ReadFunc  func(port uint16, data []byte) error
-	WriteFunc func(port uint16, data []byte) error
+	ReadFunc  func(ctx ExitContext, port uint16, data []byte) error
+	WriteFunc func(ctx ExitContext, port uint16, data []byte) error
 }
 
 func (d SimpleX86IOPortDevice) IOPorts() []uint16 { return d.Ports }
-func (d SimpleX86IOPortDevice) ReadIOPort(port uint16, data []byte) error {
+func (d SimpleX86IOPortDevice) ReadIOPort(ctx ExitContext, port uint16, data []byte) error {
 	if d.ReadFunc != nil {
-		return d.ReadFunc(port, data)
+		return d.ReadFunc(ctx, port, data)
 	}
 	return fmt.Errorf("unhandled read from I/O port 0x%X", port)
 }
-func (d SimpleX86IOPortDevice) WriteIOPort(port uint16, data []byte) error {
+func (d SimpleX86IOPortDevice) WriteIOPort(ctx ExitContext, port uint16, data []byte) error {
 	if d.WriteFunc != nil {
-		return d.WriteFunc(port, data)
+		return d.WriteFunc(ctx, port, data)
 	}
 	return fmt.Errorf("unhandled write to I/O port 0x%X", port)
 }

@@ -133,7 +133,7 @@ func (p *PIT) IOPorts() []uint16 {
 }
 
 // ReadIOPort implements hv.X86IOPortDevice.
-func (p *PIT) ReadIOPort(port uint16, data []byte) error {
+func (p *PIT) ReadIOPort(ctx hv.ExitContext, port uint16, data []byte) error {
 	if len(data) != 1 {
 		return fmt.Errorf("pit: invalid read size %d", len(data))
 	}
@@ -155,7 +155,7 @@ func (p *PIT) ReadIOPort(port uint16, data []byte) error {
 }
 
 // WriteIOPort implements hv.X86IOPortDevice.
-func (p *PIT) WriteIOPort(port uint16, data []byte) error {
+func (p *PIT) WriteIOPort(ctx hv.ExitContext, port uint16, data []byte) error {
 	if len(data) != 1 {
 		return fmt.Errorf("pit: invalid write size %d", len(data))
 	}

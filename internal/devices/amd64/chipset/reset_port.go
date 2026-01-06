@@ -28,7 +28,7 @@ func (p *ResetControlPort) IOPorts() []uint16 {
 	return []uint16{resetControlPort}
 }
 
-func (p *ResetControlPort) ReadIOPort(port uint16, data []byte) error {
+func (p *ResetControlPort) ReadIOPort(ctx hv.ExitContext, port uint16, data []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for i := range data {
@@ -37,7 +37,7 @@ func (p *ResetControlPort) ReadIOPort(port uint16, data []byte) error {
 	return nil
 }
 
-func (p *ResetControlPort) WriteIOPort(port uint16, data []byte) error {
+func (p *ResetControlPort) WriteIOPort(ctx hv.ExitContext, port uint16, data []byte) error {
 	if len(data) == 0 {
 		return fmt.Errorf("reset control: empty write")
 	}

@@ -12,6 +12,7 @@ import (
 	"github.com/tinyrange/cc/internal/devices/pci"
 	"github.com/tinyrange/cc/internal/fdt"
 	"github.com/tinyrange/cc/internal/hv"
+	"github.com/tinyrange/cc/internal/timeslice"
 )
 
 const (
@@ -198,21 +199,26 @@ func (vn *Net) ensureWorker(dev device) {
 	})
 }
 
+type dummyExitContext struct{}
+
+func (d *dummyExitContext) SetExitTimeslice(id timeslice.TimesliceID) {}
+
 func (vn *Net) workerLoop() {
 	for msg := range vn.workCh {
 		dev := msg.dev
 		if dev == nil {
 			dev = vn.workDev
 		}
+		ctx := &dummyExitContext{}
 		var err error
 		switch msg.kind {
 		case netWorkKick:
 			debug.Writef("virtio-net.workerLoop", "kick queue=%d", msg.queue)
 			switch msg.queue {
 			case netQueueTransmit:
-				err = vn.processTransmitQueue(dev, dev.queue(msg.queue))
+				err = vn.processTransmitQueue(ctx, dev, dev.queue(msg.queue))
 			case netQueueReceive:
-				err = vn.processReceiveQueueLocked(dev, dev.queue(msg.queue))
+				err = vn.processReceiveQueueLocked(ctx, dev, dev.queue(msg.queue))
 			default:
 				err = nil
 			}
@@ -222,7 +228,7 @@ func (vn *Net) workerLoop() {
 			// actually removed from vn.pendingRx (after delivery or reset).
 			pendingBefore := len(vn.pendingRx)
 			vn.pendingRx = append(vn.pendingRx, msg.frame)
-			err = vn.processReceiveQueueLocked(dev, dev.queue(netQueueReceive))
+			err = vn.processReceiveQueueLocked(ctx, dev, dev.queue(netQueueReceive))
 			pendingAfter := len(vn.pendingRx)
 			// If the packet wasn't consumed, emit diagnostics at key thresholds.
 			// This helps debug flaky stalls where host RX builds up waiting on
@@ -292,20 +298,29 @@ func (vn *Net) MMIORegions() []hv.MMIORegion {
 	}}
 }
 
+var (
+	tsNetRead  = timeslice.RegisterKind("virtio_net_read", 0)
+	tsNetWrite = timeslice.RegisterKind("virtio_net_write", 0)
+)
+
 // ReadMMIO implements hv.MemoryMappedIODevice.
-func (vn *Net) ReadMMIO(addr uint64, data []byte) error {
+func (vn *Net) ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
+	ctx.SetExitTimeslice(tsNetRead)
+
 	if vn.device == nil {
 		return fmt.Errorf("virtio-net: device not initialized")
 	}
-	return vn.device.readMMIO(addr, data)
+	return vn.device.readMMIO(ctx, addr, data)
 }
 
 // WriteMMIO implements hv.MemoryMappedIODevice.
-func (vn *Net) WriteMMIO(addr uint64, data []byte) error {
+func (vn *Net) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
+	ctx.SetExitTimeslice(tsNetWrite)
+
 	if vn.device == nil {
 		return fmt.Errorf("virtio-net: device not initialized")
 	}
-	return vn.device.writeMMIO(addr, data)
+	return vn.device.writeMMIO(ctx, addr, data)
 }
 
 func (vn *Net) NumQueues() int {
@@ -325,7 +340,12 @@ func (vn *Net) OnReset(dev device) {
 	vn.linkUp = true
 }
 
-func (vn *Net) OnQueueNotify(dev device, queue int) error {
+var (
+	tsNetOnQueueNotify = timeslice.RegisterKind("virtio_net_on_queue_notify", 0)
+)
+
+func (vn *Net) OnQueueNotify(ctx hv.ExitContext, dev device, queue int) error {
+	ctx.SetExitTimeslice(tsNetOnQueueNotify)
 	vn.ensureWorker(dev)
 	debug.Writef("virtio-net.OnQueueNotify", "queue=%d", queue)
 	done := make(chan error, 1)
@@ -333,7 +353,7 @@ func (vn *Net) OnQueueNotify(dev device, queue int) error {
 	return <-done
 }
 
-func (vn *Net) ReadConfig(_ device, offset uint64) (uint32, bool, error) {
+func (vn *Net) ReadConfig(ctx hv.ExitContext, _ device, offset uint64) (uint32, bool, error) {
 	cfg := offset
 	if cfg >= VIRTIO_MMIO_CONFIG {
 		cfg -= VIRTIO_MMIO_CONFIG
@@ -362,7 +382,7 @@ func (vn *Net) ReadConfig(_ device, offset uint64) (uint32, bool, error) {
 	return binary.LittleEndian.Uint32(w[:]), true, nil
 }
 
-func (vn *Net) WriteConfig(device, uint64, uint32) (bool, error) {
+func (vn *Net) WriteConfig(hv.ExitContext, device, uint64, uint32) (bool, error) {
 	return false, nil
 }
 
@@ -415,7 +435,14 @@ func (vn *Net) shouldTriggerInterrupt(dev device, q *queue, oldUsedIdx, newUsedI
 	return true
 }
 
-func (vn *Net) processTransmitQueue(dev device, q *queue) error {
+var (
+	tsNetProcessTransmitQueue = timeslice.RegisterKind("virtio_net_process_transmit_queue", 0)
+	tsNetProcessReceiveQueue  = timeslice.RegisterKind("virtio_net_process_receive_queue", 0)
+)
+
+func (vn *Net) processTransmitQueue(ctx hv.ExitContext, dev device, q *queue) error {
+	ctx.SetExitTimeslice(tsNetProcessTransmitQueue)
+
 	if q == nil || !q.ready || q.size == 0 {
 		if q == nil {
 			debug.Writef("virtio-net.processTransmitQueue skip q=nil", "q=nil")
@@ -498,11 +525,13 @@ func (vn *Net) processTransmitQueue(dev device, q *queue) error {
 	return nil
 }
 
-func (vn *Net) processReceiveQueue(dev device, q *queue) error {
-	return vn.processReceiveQueueLocked(dev, q)
+func (vn *Net) processReceiveQueue(ctx hv.ExitContext, dev device, q *queue) error {
+	return vn.processReceiveQueueLocked(ctx, dev, q)
 }
 
-func (vn *Net) processReceiveQueueLocked(dev device, q *queue) error {
+func (vn *Net) processReceiveQueueLocked(ctx hv.ExitContext, dev device, q *queue) error {
+	ctx.SetExitTimeslice(tsNetProcessReceiveQueue)
+
 	if q == nil || !q.ready || q.size == 0 {
 		if len(vn.pendingRx) > 0 {
 			queueSize := uint16(0)

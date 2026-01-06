@@ -29,6 +29,7 @@ import (
 	"github.com/tinyrange/cc/internal/netstack"
 	"github.com/tinyrange/cc/internal/oci"
 	termwin "github.com/tinyrange/cc/internal/term"
+	"github.com/tinyrange/cc/internal/timeslice"
 	"github.com/tinyrange/cc/internal/vfs"
 	"golang.org/x/term"
 )
@@ -142,6 +143,7 @@ func run() error {
 	gpu := flag.Bool("gpu", false, "Enable GPU and create a window")
 	termWin := flag.Bool("term", false, "Open a terminal window and connect it to the VM console")
 	addVirtioFs := flag.String("add-virtiofs", "", "Specify a comma-separated list of blank virtio-fs tags to create")
+	timesliceFile := flag.String("timeslice-file", "", "Write timeslice data to file")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <image> [command] [args...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Run a command inside an OCI container image in a virtual machine.\n\n")
@@ -171,6 +173,20 @@ func run() error {
 		defer debug.Close()
 
 		debug.Writef("cc debug logging enabled", "filename=%s", *debugFile)
+	}
+
+	if *timesliceFile != "" {
+		f, err := os.Create(*timesliceFile)
+		if err != nil {
+			return fmt.Errorf("create timeslice file: %w", err)
+		}
+		defer f.Close()
+
+		w, err := timeslice.StartRecording(f)
+		if err != nil {
+			return fmt.Errorf("open timeslice file: %w", err)
+		}
+		defer w.Close()
 	}
 
 	if *dbg {

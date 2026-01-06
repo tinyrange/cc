@@ -1,4 +1,4 @@
-//go:build experimental
+//go:build !experimental
 
 package factory
 
@@ -6,7 +6,6 @@ import (
 	"fmt"
 
 	"github.com/tinyrange/cc/internal/hv"
-	"github.com/tinyrange/cc/internal/hv/riscv"
 )
 
 // NewWithArchitecture selects a hypervisor backend for the requested guest
@@ -14,8 +13,6 @@ import (
 // while the RISC-V path uses the built-in ccvm interpreter.
 func NewWithArchitecture(arch hv.CpuArchitecture) (hv.Hypervisor, error) {
 	switch arch {
-	case hv.ArchitectureRISCV64:
-		return riscv.Open()
 	case hv.ArchitectureX86_64, hv.ArchitectureARM64:
 		return Open()
 	default:

@@ -12,6 +12,7 @@ import (
 	"github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/whp/bindings"
+	"github.com/tinyrange/cc/internal/timeslice"
 )
 
 const (
@@ -37,15 +38,23 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		defer stop()
 	}
 
+	v.rec.Record(tsWhpHostTime)
+
 	if err := bindings.RunVirtualProcessorContext(v.vm.part, uint32(v.id), &exit); err != nil {
 		return fmt.Errorf("whp: RunVirtualProcessorContext failed: %w", err)
 	}
+
+	v.rec.Record(tsWhpGuestTime)
 
 	// slog.Info(
 	// 	"vCPU exited",
 	// 	"reason", exit.ExitReason.String(),
 	// 	"rip", fmt.Sprintf("0x%x", exit.VpContext.Rip),
 	// )
+
+	v.exitCtx = &exitContext{
+		timeslice: timeslice.InvalidTimesliceID,
+	}
 
 	switch exit.ExitReason {
 	case bindings.RunVPExitReasonX64Halt:
@@ -89,8 +98,6 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			gpa := mem.Gpa
 			return fmt.Errorf("whp: emulation failed (Status=%v) at RIP=0x%x accessing GPA=0x%x.", *status, rip, gpa)
 		}
-
-		return nil
 	case bindings.RunVPExitReasonX64IoPortAccess:
 		ioCtx := exit.IoPortAccess()
 
@@ -124,23 +131,24 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		if !status.EmulationSuccessful() {
 			return fmt.Errorf("whp: io emulation failed with status %v at port 0x%x", *status, ioCtx.Port)
 		}
-
-		return nil
 	case bindings.RunVPExitReasonX64Cpuid:
 		info := exit.CpuidAccess()
 
-		return v.handleCpuid(exit.VpContext, info)
+		if err := v.handleCpuid(exit.VpContext, info); err != nil {
+			return fmt.Errorf("handle Cpuid: %w", err)
+		}
 	case bindings.RunVPExitReasonX64MsrAccess:
 		info := exit.MsrAccess()
 
-		return v.handleMsr(exit.VpContext, info)
+		if err := v.handleMsr(exit.VpContext, info); err != nil {
+			return fmt.Errorf("handle Msr: %w", err)
+		}
 	case bindings.RunVPExitReasonX64ApicEoi:
 		if v.vm != nil && v.vm.ioapic != nil {
 			if ctx := exit.ApicEoi(); ctx != nil {
 				v.vm.ioapic.HandleEOI(ctx.InterruptVector)
 			}
 		}
-		return nil
 	case bindings.RunVPExitReasonCanceled:
 		if err := ctx.Err(); err != nil {
 			return err
@@ -151,6 +159,14 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	default:
 		return fmt.Errorf("whp: unsupported vCPU exit reason %s", exit.ExitReason)
 	}
+
+	if v.exitCtx.timeslice != timeslice.InvalidTimesliceID {
+		v.rec.Record(v.exitCtx.timeslice)
+	} else {
+		v.rec.Record(tsWhpUnknownExit)
+	}
+
+	return nil
 }
 
 func (vm *virtualCPU) handleCpuid(ctx bindings.VPExitContext, info *bindings.X64CpuidAccessContext) error {
@@ -216,7 +232,7 @@ func createEmulator() (bindings.EmulatorHandle, error) {
 	ioFn := func(ctx unsafe.Pointer, access *bindings.EmulatorIOAccessInfo) bindings.HRESULT {
 		vcpu := (*virtualCPU)(ctx)
 
-		if err := vcpu.handleIOPortAccess(access); err != nil {
+		if err := vcpu.handleIOPortAccess(vcpu.exitCtx, access); err != nil {
 			vcpu.pendingError = err
 			return bindings.HRESULTFail
 		}
@@ -230,7 +246,7 @@ func createEmulator() (bindings.EmulatorHandle, error) {
 	) bindings.HRESULT {
 		vcpu := (*virtualCPU)(ctx)
 
-		if err := vcpu.handleMemoryAccess(access); err != nil {
+		if err := vcpu.handleMemoryAccess(vcpu.exitCtx, access); err != nil {
 			vcpu.pendingError = err
 		}
 

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/tinyrange/cc/internal/chipset"
+	"github.com/tinyrange/cc/internal/timeslice"
 )
 
 // testLineInterrupt is a test implementation of LineInterrupt that tracks level changes
@@ -29,17 +30,22 @@ func (t *testLineInterrupt) PulseInterrupt() {
 	// Pulse goes high then low
 }
 
+type mockExitContext struct {
+}
+
+func (m *mockExitContext) SetExitTimeslice(timeslice timeslice.TimesliceID) {}
+
 func TestI8042SelfTest(t *testing.T) {
 	ctrl := NewI8042()
 
 	// Send self-test command (0xAA)
-	if err := ctrl.WriteIOPort(i8042CommandPort, []byte{i8042CommandControllerTest}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042CommandPort, []byte{i8042CommandControllerTest}); err != nil {
 		t.Fatalf("write self-test command failed: %v", err)
 	}
 
 	// Read status to check output buffer full
 	status := make([]byte, 1)
-	if err := ctrl.ReadIOPort(i8042CommandPort, status); err != nil {
+	if err := ctrl.ReadIOPort(&mockExitContext{}, i8042CommandPort, status); err != nil {
 		t.Fatalf("read status failed: %v", err)
 	}
 	if status[0]&i8042StatusOutputFull == 0 {
@@ -48,7 +54,7 @@ func TestI8042SelfTest(t *testing.T) {
 
 	// Read data port to get response
 	data := make([]byte, 1)
-	if err := ctrl.ReadIOPort(i8042DataPort, data); err != nil {
+	if err := ctrl.ReadIOPort(&mockExitContext{}, i8042DataPort, data); err != nil {
 		t.Fatalf("read data failed: %v", err)
 	}
 	if data[0] != i8042ResponseSelfTestOK {
@@ -56,7 +62,7 @@ func TestI8042SelfTest(t *testing.T) {
 	}
 
 	// Status should now show output buffer empty
-	if err := ctrl.ReadIOPort(i8042CommandPort, status); err != nil {
+	if err := ctrl.ReadIOPort(&mockExitContext{}, i8042CommandPort, status); err != nil {
 		t.Fatalf("read status failed: %v", err)
 	}
 	if status[0]&i8042StatusOutputFull != 0 {
@@ -68,24 +74,24 @@ func TestI8042A20GateControl(t *testing.T) {
 	ctrl := NewI8042()
 
 	// Write output port command (0xD1)
-	if err := ctrl.WriteIOPort(i8042CommandPort, []byte{i8042CommandWriteOutputPort}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042CommandPort, []byte{i8042CommandWriteOutputPort}); err != nil {
 		t.Fatalf("write output port command failed: %v", err)
 	}
 
 	// Write output port value with A20 enabled (bit 1 = 1)
 	a20Enabled := byte(0x02)
-	if err := ctrl.WriteIOPort(i8042DataPort, []byte{a20Enabled}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042DataPort, []byte{a20Enabled}); err != nil {
 		t.Fatalf("write output port value failed: %v", err)
 	}
 
 	// Read output port back (0xD0)
-	if err := ctrl.WriteIOPort(i8042CommandPort, []byte{i8042CommandReadOutputPort}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042CommandPort, []byte{i8042CommandReadOutputPort}); err != nil {
 		t.Fatalf("write read output port command failed: %v", err)
 	}
 
 	// Read the value
 	data := make([]byte, 1)
-	if err := ctrl.ReadIOPort(i8042DataPort, data); err != nil {
+	if err := ctrl.ReadIOPort(&mockExitContext{}, i8042DataPort, data); err != nil {
 		t.Fatalf("read output port failed: %v", err)
 	}
 	if data[0]&0x02 == 0 {
@@ -93,19 +99,19 @@ func TestI8042A20GateControl(t *testing.T) {
 	}
 
 	// Disable A20 (bit 1 = 0)
-	if err := ctrl.WriteIOPort(i8042CommandPort, []byte{i8042CommandWriteOutputPort}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042CommandPort, []byte{i8042CommandWriteOutputPort}); err != nil {
 		t.Fatalf("write output port command failed: %v", err)
 	}
 	a20Disabled := byte(0x00)
-	if err := ctrl.WriteIOPort(i8042DataPort, []byte{a20Disabled}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042DataPort, []byte{a20Disabled}); err != nil {
 		t.Fatalf("write output port value failed: %v", err)
 	}
 
 	// Verify A20 is disabled
-	if err := ctrl.WriteIOPort(i8042CommandPort, []byte{i8042CommandReadOutputPort}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042CommandPort, []byte{i8042CommandReadOutputPort}); err != nil {
 		t.Fatalf("write read output port command failed: %v", err)
 	}
-	if err := ctrl.ReadIOPort(i8042DataPort, data); err != nil {
+	if err := ctrl.ReadIOPort(&mockExitContext{}, i8042DataPort, data); err != nil {
 		t.Fatalf("read output port failed: %v", err)
 	}
 	if data[0]&0x02 != 0 {
@@ -119,11 +125,11 @@ func TestI8042KeyboardEnableDisable(t *testing.T) {
 	ctrl.SetKeyboardIRQ(chipset.LineInterruptFromFunc(func(high bool) { irq.SetLevel(high) }))
 
 	// Read command byte to verify initial state
-	if err := ctrl.WriteIOPort(i8042CommandPort, []byte{i8042CommandReadCommandByte}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042CommandPort, []byte{i8042CommandReadCommandByte}); err != nil {
 		t.Fatalf("read command byte command failed: %v", err)
 	}
 	data := make([]byte, 1)
-	if err := ctrl.ReadIOPort(i8042DataPort, data); err != nil {
+	if err := ctrl.ReadIOPort(&mockExitContext{}, i8042DataPort, data); err != nil {
 		t.Fatalf("read command byte failed: %v", err)
 	}
 	initialCmdByte := data[0]
@@ -137,15 +143,15 @@ func TestI8042KeyboardEnableDisable(t *testing.T) {
 	}
 
 	// Disable keyboard (0xAD)
-	if err := ctrl.WriteIOPort(i8042CommandPort, []byte{i8042CommandDisableKeyboard}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042CommandPort, []byte{i8042CommandDisableKeyboard}); err != nil {
 		t.Fatalf("disable keyboard command failed: %v", err)
 	}
 
 	// Read command byte again
-	if err := ctrl.WriteIOPort(i8042CommandPort, []byte{i8042CommandReadCommandByte}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042CommandPort, []byte{i8042CommandReadCommandByte}); err != nil {
 		t.Fatalf("read command byte command failed: %v", err)
 	}
-	if err := ctrl.ReadIOPort(i8042DataPort, data); err != nil {
+	if err := ctrl.ReadIOPort(&mockExitContext{}, i8042DataPort, data); err != nil {
 		t.Fatalf("read command byte failed: %v", err)
 	}
 	if data[0]&i8042CommandByteDisableKeyboard == 0 {
@@ -153,15 +159,15 @@ func TestI8042KeyboardEnableDisable(t *testing.T) {
 	}
 
 	// Enable keyboard (0xAE)
-	if err := ctrl.WriteIOPort(i8042CommandPort, []byte{i8042CommandEnableKeyboard}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042CommandPort, []byte{i8042CommandEnableKeyboard}); err != nil {
 		t.Fatalf("enable keyboard command failed: %v", err)
 	}
 
 	// Verify keyboard is enabled again
-	if err := ctrl.WriteIOPort(i8042CommandPort, []byte{i8042CommandReadCommandByte}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042CommandPort, []byte{i8042CommandReadCommandByte}); err != nil {
 		t.Fatalf("read command byte command failed: %v", err)
 	}
-	if err := ctrl.ReadIOPort(i8042DataPort, data); err != nil {
+	if err := ctrl.ReadIOPort(&mockExitContext{}, i8042DataPort, data); err != nil {
 		t.Fatalf("read command byte failed: %v", err)
 	}
 	if data[0]&i8042CommandByteDisableKeyboard != 0 {
@@ -175,7 +181,7 @@ func TestI8042KeyboardCommands(t *testing.T) {
 	ctrl.SetKeyboardIRQ(chipset.LineInterruptFromFunc(func(high bool) { irq.SetLevel(high) }))
 
 	// Test keyboard reset command (0xFF)
-	if err := ctrl.WriteIOPort(i8042DataPort, []byte{ps2CmdReset}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042DataPort, []byte{ps2CmdReset}); err != nil {
 		t.Fatalf("keyboard reset command failed: %v", err)
 	}
 
@@ -185,7 +191,7 @@ func TestI8042KeyboardCommands(t *testing.T) {
 	// would read between sends. For this test, we verify that at least one
 	// valid response is received.
 	data := make([]byte, 1)
-	if err := ctrl.ReadIOPort(i8042DataPort, data); err != nil {
+	if err := ctrl.ReadIOPort(&mockExitContext{}, i8042DataPort, data); err != nil {
 		t.Fatalf("read response failed: %v", err)
 	}
 
@@ -196,10 +202,10 @@ func TestI8042KeyboardCommands(t *testing.T) {
 	}
 
 	// Test enable command (0xF4)
-	if err := ctrl.WriteIOPort(i8042DataPort, []byte{ps2CmdEnable}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042DataPort, []byte{ps2CmdEnable}); err != nil {
 		t.Fatalf("keyboard enable command failed: %v", err)
 	}
-	if err := ctrl.ReadIOPort(i8042DataPort, data); err != nil {
+	if err := ctrl.ReadIOPort(&mockExitContext{}, i8042DataPort, data); err != nil {
 		t.Fatalf("read ACK failed: %v", err)
 	}
 	if data[0] != ps2ResponseAck {
@@ -207,10 +213,10 @@ func TestI8042KeyboardCommands(t *testing.T) {
 	}
 
 	// Test disable command (0xF5)
-	if err := ctrl.WriteIOPort(i8042DataPort, []byte{ps2CmdDisable}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042DataPort, []byte{ps2CmdDisable}); err != nil {
 		t.Fatalf("keyboard disable command failed: %v", err)
 	}
-	if err := ctrl.ReadIOPort(i8042DataPort, data); err != nil {
+	if err := ctrl.ReadIOPort(&mockExitContext{}, i8042DataPort, data); err != nil {
 		t.Fatalf("read ACK failed: %v", err)
 	}
 	if data[0] != ps2ResponseAck {
@@ -262,7 +268,7 @@ func TestI8042KeyboardScancodeSet2(t *testing.T) {
 
 	// Should receive translated scancode (set 2: 0x2e = 'A')
 	data := make([]byte, 1)
-	if err := ctrl.ReadIOPort(i8042DataPort, data); err != nil {
+	if err := ctrl.ReadIOPort(&mockExitContext{}, i8042DataPort, data); err != nil {
 		t.Fatalf("read scancode failed: %v", err)
 	}
 	if data[0] != 0x2e {
@@ -278,7 +284,7 @@ func TestI8042KeyboardScancodeSet2(t *testing.T) {
 	// would read between sends. For this test, we verify that at least the
 	// scancode is received (the 0xF0 prefix may be overwritten).
 	data = make([]byte, 1)
-	if err := ctrl.ReadIOPort(i8042DataPort, data); err != nil {
+	if err := ctrl.ReadIOPort(&mockExitContext{}, i8042DataPort, data); err != nil {
 		t.Fatalf("read break scancode failed: %v", err)
 	}
 
@@ -294,7 +300,7 @@ func TestI8042StatusRegister(t *testing.T) {
 
 	// Read status register
 	status := make([]byte, 1)
-	if err := ctrl.ReadIOPort(i8042CommandPort, status); err != nil {
+	if err := ctrl.ReadIOPort(&mockExitContext{}, i8042CommandPort, status); err != nil {
 		t.Fatalf("read status failed: %v", err)
 	}
 
@@ -318,13 +324,13 @@ func TestI8042TestKeyboardPort(t *testing.T) {
 	ctrl := NewI8042()
 
 	// Test keyboard port (0xAB)
-	if err := ctrl.WriteIOPort(i8042CommandPort, []byte{i8042CommandTestKeyboard}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042CommandPort, []byte{i8042CommandTestKeyboard}); err != nil {
 		t.Fatalf("test keyboard command failed: %v", err)
 	}
 
 	// Should receive port OK (0x00)
 	data := make([]byte, 1)
-	if err := ctrl.ReadIOPort(i8042DataPort, data); err != nil {
+	if err := ctrl.ReadIOPort(&mockExitContext{}, i8042DataPort, data); err != nil {
 		t.Fatalf("read test result failed: %v", err)
 	}
 	if data[0] != i8042ResponsePortOK {
@@ -336,29 +342,29 @@ func TestI8042CommandByteReadWrite(t *testing.T) {
 	ctrl := NewI8042()
 
 	// Read initial command byte
-	if err := ctrl.WriteIOPort(i8042CommandPort, []byte{i8042CommandReadCommandByte}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042CommandPort, []byte{i8042CommandReadCommandByte}); err != nil {
 		t.Fatalf("read command byte command failed: %v", err)
 	}
 	data := make([]byte, 1)
-	if err := ctrl.ReadIOPort(i8042DataPort, data); err != nil {
+	if err := ctrl.ReadIOPort(&mockExitContext{}, i8042DataPort, data); err != nil {
 		t.Fatalf("read command byte failed: %v", err)
 	}
 	initialValue := data[0]
 
 	// Write new command byte (0x60)
 	newCmdByte := byte(0x7F) // All bits set except reserved
-	if err := ctrl.WriteIOPort(i8042CommandPort, []byte{i8042CommandWriteCommandByte}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042CommandPort, []byte{i8042CommandWriteCommandByte}); err != nil {
 		t.Fatalf("write command byte command failed: %v", err)
 	}
-	if err := ctrl.WriteIOPort(i8042DataPort, []byte{newCmdByte}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042DataPort, []byte{newCmdByte}); err != nil {
 		t.Fatalf("write command byte value failed: %v", err)
 	}
 
 	// Read back command byte
-	if err := ctrl.WriteIOPort(i8042CommandPort, []byte{i8042CommandReadCommandByte}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042CommandPort, []byte{i8042CommandReadCommandByte}); err != nil {
 		t.Fatalf("read command byte command failed: %v", err)
 	}
-	if err := ctrl.ReadIOPort(i8042DataPort, data); err != nil {
+	if err := ctrl.ReadIOPort(&mockExitContext{}, i8042DataPort, data); err != nil {
 		t.Fatalf("read command byte failed: %v", err)
 	}
 	if data[0] != newCmdByte {
@@ -366,10 +372,10 @@ func TestI8042CommandByteReadWrite(t *testing.T) {
 	}
 
 	// Restore initial value
-	if err := ctrl.WriteIOPort(i8042CommandPort, []byte{i8042CommandWriteCommandByte}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042CommandPort, []byte{i8042CommandWriteCommandByte}); err != nil {
 		t.Fatalf("write command byte command failed: %v", err)
 	}
-	if err := ctrl.WriteIOPort(i8042DataPort, []byte{initialValue}); err != nil {
+	if err := ctrl.WriteIOPort(&mockExitContext{}, i8042DataPort, []byte{initialValue}); err != nil {
 		t.Fatalf("write command byte value failed: %v", err)
 	}
 }
@@ -395,7 +401,7 @@ func TestI8042InterruptGeneration(t *testing.T) {
 
 	// Read the scancode to clear output buffer
 	data := make([]byte, 1)
-	if err := ctrl.ReadIOPort(i8042DataPort, data); err != nil {
+	if err := ctrl.ReadIOPort(&mockExitContext{}, i8042DataPort, data); err != nil {
 		t.Fatalf("read scancode failed: %v", err)
 	}
 }

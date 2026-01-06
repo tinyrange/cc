@@ -8,8 +8,8 @@ import (
 
 // PortIOHandler handles reads and writes to individual I/O ports.
 type PortIOHandler interface {
-	ReadIOPort(port uint16, data []byte) error
-	WriteIOPort(port uint16, data []byte) error
+	ReadIOPort(ctx hv.ExitContext, port uint16, data []byte) error
+	WriteIOPort(ctx hv.ExitContext, port uint16, data []byte) error
 }
 
 // PortIOIntercept describes the ports a device wants to serve and the handler for them.
@@ -20,8 +20,8 @@ type PortIOIntercept struct {
 
 // MmioHandler handles reads and writes to memory-mapped regions.
 type MmioHandler interface {
-	ReadMMIO(addr uint64, data []byte) error
-	WriteMMIO(addr uint64, data []byte) error
+	ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error
+	WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error
 }
 
 // MmioIntercept describes the MMIO regions a device serves and the handler for them.

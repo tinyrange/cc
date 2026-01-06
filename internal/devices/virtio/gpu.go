@@ -180,20 +180,20 @@ func (g *GPU) MMIORegions() []hv.MMIORegion {
 	}}
 }
 
-func (g *GPU) ReadMMIO(addr uint64, data []byte) error {
+func (g *GPU) ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	dev, err := g.requireDevice()
 	if err != nil {
 		return err
 	}
-	return dev.readMMIO(addr, data)
+	return dev.readMMIO(ctx, addr, data)
 }
 
-func (g *GPU) WriteMMIO(addr uint64, data []byte) error {
+func (g *GPU) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	dev, err := g.requireDevice()
 	if err != nil {
 		return err
 	}
-	return dev.writeMMIO(addr, data)
+	return dev.writeMMIO(ctx, addr, data)
 }
 
 func (g *GPU) requireDevice() (device, error) {
@@ -224,7 +224,7 @@ func (g *GPU) OnReset(dev device) {
 }
 
 // OnQueueNotify implements deviceHandler.
-func (g *GPU) OnQueueNotify(dev device, queueIdx int) error {
+func (g *GPU) OnQueueNotify(ctx hv.ExitContext, dev device, queueIdx int) error {
 	switch queueIdx {
 	case gpuQueueControl:
 		return g.processControlQueue(dev, dev.queue(queueIdx))
@@ -235,7 +235,7 @@ func (g *GPU) OnQueueNotify(dev device, queueIdx int) error {
 }
 
 // ReadConfig implements deviceHandler.
-func (g *GPU) ReadConfig(dev device, offset uint64) (uint32, bool, error) {
+func (g *GPU) ReadConfig(ctx hv.ExitContext, dev device, offset uint64) (uint32, bool, error) {
 	// The offset may be either absolute (0x100+) or relative (0-15)
 	// depending on whether we're called directly or via deviceHandlerAdapter.
 	rel := offset
@@ -252,7 +252,7 @@ func (g *GPU) ReadConfig(dev device, offset uint64) (uint32, bool, error) {
 }
 
 // WriteConfig implements deviceHandler.
-func (g *GPU) WriteConfig(dev device, offset uint64, value uint32) (bool, error) {
+func (g *GPU) WriteConfig(ctx hv.ExitContext, dev device, offset uint64, value uint32) (bool, error) {
 	if offset < VIRTIO_MMIO_CONFIG {
 		return false, nil
 	}

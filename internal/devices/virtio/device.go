@@ -1,5 +1,7 @@
 package virtio
 
+import "github.com/tinyrange/cc/internal/hv"
+
 // VirtioDevice is the core interface for virtio devices, abstracting device-specific
 // operations that are independent of the transport (MMIO or PCI).
 //
@@ -27,12 +29,12 @@ type VirtioDevice interface {
 	// ReadConfig reads a 32-bit value from the device-specific configuration space.
 	// offset is the byte offset into the device config space.
 	// Returns the 32-bit value at that offset.
-	ReadConfig(offset uint16) uint32
+	ReadConfig(ctx hv.ExitContext, offset uint16) uint32
 
 	// WriteConfig writes a 32-bit value to the device-specific configuration space.
 	// offset is the byte offset into the device config space.
 	// val is the 32-bit value to write.
-	WriteConfig(offset uint16, val uint32)
+	WriteConfig(ctx hv.ExitContext, offset uint16, val uint32)
 
 	// Enable is called when the device is enabled after feature negotiation.
 	// features is the negotiated feature set (intersection of device and driver features).

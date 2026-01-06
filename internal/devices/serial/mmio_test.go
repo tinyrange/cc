@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/tinyrange/cc/internal/chipset"
+	"github.com/tinyrange/cc/internal/timeslice"
 )
 
 // testIRQLineMMIO captures interrupt line state changes for MMIO tests
@@ -107,6 +108,11 @@ func TestSerialMMIOAccessPatterns(t *testing.T) {
 	testMMIOStride(t, 2, irqLine, writer, reader)
 }
 
+type mockExitContext struct {
+}
+
+func (m *mockExitContext) SetExitTimeslice(timeslice timeslice.TimesliceID) {}
+
 func testMMIOStride(t *testing.T, regShift uint32, irqLine chipset.LineInterrupt, writer *testWriterMMIO, reader *testReaderMMIO) {
 	t.Helper()
 
@@ -126,7 +132,7 @@ func testMMIOStride(t *testing.T, regShift uint32, irqLine chipset.LineInterrupt
 	// Enable FIFO mode for proper operation
 	// FCR: enable FIFO (bit 0)
 	fcrAddr := uint64(0x1000) + 2*stride
-	if err := mmioSerial.WriteMMIO(fcrAddr, []byte{0x01}); err != nil {
+	if err := mmioSerial.WriteMMIO(&mockExitContext{}, fcrAddr, []byte{0x01}); err != nil {
 		t.Fatalf("write FCR stride=%d: %v", stride, err)
 	}
 
@@ -141,7 +147,7 @@ func testMMIOStride(t *testing.T, regShift uint32, irqLine chipset.LineInterrupt
 	thrAddr := uint64(0x1000)
 	txData := []byte{'M', 'M', 'I', 'O'}
 	for _, b := range txData {
-		if err := mmioSerial.WriteMMIO(thrAddr, []byte{b}); err != nil {
+		if err := mmioSerial.WriteMMIO(&mockExitContext{}, thrAddr, []byte{b}); err != nil {
 			t.Fatalf("write MMIO THR stride=%d: %v", stride, err)
 		}
 		// Poll after each write to process TX FIFO
@@ -174,7 +180,7 @@ func testMMIOStride(t *testing.T, regShift uint32, irqLine chipset.LineInterrupt
 	readBuf := make([]byte, len(rxData))
 	for i := range readBuf {
 		buf := []byte{0}
-		if err := mmioSerial.ReadMMIO(rhrAddr, buf); err != nil {
+		if err := mmioSerial.ReadMMIO(&mockExitContext{}, rhrAddr, buf); err != nil {
 			t.Fatalf("read MMIO RHR stride=%d [%d]: %v", stride, i, err)
 		}
 		readBuf[i] = buf[0]
@@ -187,13 +193,13 @@ func testMMIOStride(t *testing.T, regShift uint32, irqLine chipset.LineInterrupt
 	// Test register access with stride
 	// Write to IER (register 1)
 	ierAddr := uint64(0x1000) + stride
-	if err := mmioSerial.WriteMMIO(ierAddr, []byte{0x03}); err != nil {
+	if err := mmioSerial.WriteMMIO(&mockExitContext{}, ierAddr, []byte{0x03}); err != nil {
 		t.Fatalf("write MMIO IER stride=%d: %v", stride, err)
 	}
 
 	// Read back IER
 	ierBuf := []byte{0}
-	if err := mmioSerial.ReadMMIO(ierAddr, ierBuf); err != nil {
+	if err := mmioSerial.ReadMMIO(&mockExitContext{}, ierAddr, ierBuf); err != nil {
 		t.Fatalf("read MMIO IER stride=%d: %v", stride, err)
 	}
 	if ierBuf[0] != 0x03 {
@@ -204,13 +210,13 @@ func testMMIOStride(t *testing.T, regShift uint32, irqLine chipset.LineInterrupt
 	if stride > 1 {
 		unalignedAddr := uint64(0x1000) + 1
 		unalignedBuf := []byte{0xFF}
-		if err := mmioSerial.WriteMMIO(unalignedAddr, unalignedBuf); err != nil {
+		if err := mmioSerial.WriteMMIO(&mockExitContext{}, unalignedAddr, unalignedBuf); err != nil {
 			t.Fatalf("write unaligned stride=%d: %v", stride, err)
 		}
 
 		// Verify unaligned read returns 0
 		readUnaligned := []byte{0xFF}
-		if err := mmioSerial.ReadMMIO(unalignedAddr, readUnaligned); err != nil {
+		if err := mmioSerial.ReadMMIO(&mockExitContext{}, unalignedAddr, readUnaligned); err != nil {
 			t.Fatalf("read unaligned stride=%d: %v", stride, err)
 		}
 		if readUnaligned[0] != 0 {
@@ -221,12 +227,12 @@ func testMMIOStride(t *testing.T, regShift uint32, irqLine chipset.LineInterrupt
 	// Test out-of-bounds access
 	outOfBoundsAddr := uint64(0x1000) + 0x2000
 	outBuf := []byte{0xFF}
-	if err := mmioSerial.WriteMMIO(outOfBoundsAddr, outBuf); err == nil {
+	if err := mmioSerial.WriteMMIO(&mockExitContext{}, outOfBoundsAddr, outBuf); err == nil {
 		t.Fatalf("stride=%d: expected error for out-of-bounds write", stride)
 	}
 
 	readOutBuf := []byte{0xFF}
-	if err := mmioSerial.ReadMMIO(outOfBoundsAddr, readOutBuf); err == nil {
+	if err := mmioSerial.ReadMMIO(&mockExitContext{}, outOfBoundsAddr, readOutBuf); err == nil {
 		t.Fatalf("stride=%d: expected error for out-of-bounds read", stride)
 	}
 }

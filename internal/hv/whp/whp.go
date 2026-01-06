@@ -9,20 +9,43 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	corechipset "github.com/tinyrange/cc/internal/chipset"
 	"github.com/tinyrange/cc/internal/devices/amd64/chipset"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/whp/bindings"
+	"github.com/tinyrange/cc/internal/timeslice"
 )
 
+var (
+	tsWhpStartTime = time.Now()
+)
+
+var (
+	tsWhpHostTime    = timeslice.RegisterKind("whp_host_time", 0)
+	tsWhpGuestTime   = timeslice.RegisterKind("whp_guest_time", 0)
+	tsWhpUnknownExit = timeslice.RegisterKind("whp_unknown_exit", 0)
+)
+
+type exitContext struct {
+	timeslice timeslice.TimesliceID
+}
+
+func (c *exitContext) SetExitTimeslice(id timeslice.TimesliceID) {
+	c.timeslice = id
+}
+
 type virtualCPU struct {
+	rec      *timeslice.Recorder
 	vm       *virtualMachine
 	id       int
 	runQueue chan func()
 	done     chan struct{} // closed when the vCPU goroutine exits
 
 	pendingError error
+
+	exitCtx *exitContext
 }
 
 func (v *virtualCPU) start() {
@@ -160,7 +183,7 @@ func (v *virtualCPU) SetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 	return bindings.SetVirtualProcessorRegisters(v.vm.part, uint32(v.id), names, values)
 }
 
-func (v *virtualCPU) handleIOPortAccess(access *bindings.EmulatorIOAccessInfo) error {
+func (v *virtualCPU) handleIOPortAccess(exitCtx *exitContext, access *bindings.EmulatorIOAccessInfo) error {
 	if access.AccessSize != 1 && access.AccessSize != 2 && access.AccessSize != 4 {
 		return fmt.Errorf("whp: unsupported IO port access size %d", access.AccessSize)
 	}
@@ -180,7 +203,7 @@ func (v *virtualCPU) handleIOPortAccess(access *bindings.EmulatorIOAccessInfo) e
 	}
 
 	isWrite := access.Direction != bindings.EmulatorIOAccessDirectionIn
-	if err := cs.HandlePIO(access.Port, data[:access.AccessSize], isWrite); err != nil {
+	if err := cs.HandlePIO(exitCtx, access.Port, data[:access.AccessSize], isWrite); err != nil {
 		return fmt.Errorf("I/O port 0x%04x: %w", access.Port, err)
 	}
 
@@ -194,7 +217,7 @@ func (v *virtualCPU) handleIOPortAccess(access *bindings.EmulatorIOAccessInfo) e
 	return nil
 }
 
-func (v *virtualCPU) handleMemoryAccess(access *bindings.EmulatorMemoryAccessInfo) error {
+func (v *virtualCPU) handleMemoryAccess(exitCtx *exitContext, access *bindings.EmulatorMemoryAccessInfo) error {
 	gpa := access.GpaAddress
 	size := uint64(access.AccessSize)
 
@@ -231,7 +254,7 @@ func (v *virtualCPU) handleMemoryAccess(access *bindings.EmulatorMemoryAccessInf
 	}
 
 	isWrite := access.Direction != bindings.EmulatorMemoryAccessDirectionRead
-	if err := cs.HandleMMIO(gpa, dataSlice, isWrite); err != nil {
+	if err := cs.HandleMMIO(exitCtx, gpa, dataSlice, isWrite); err != nil {
 		return fmt.Errorf("MMIO at 0x%016x: %w", gpa, err)
 	}
 	return nil
@@ -283,6 +306,8 @@ var (
 )
 
 type virtualMachine struct {
+	rec *timeslice.Recorder
+
 	hv   *hypervisor
 	part bindings.PartitionHandle
 
@@ -573,24 +598,24 @@ type portIOAdapter struct {
 	dev hv.X86IOPortDevice
 }
 
-func (p portIOAdapter) ReadIOPort(port uint16, data []byte) error {
-	return p.dev.ReadIOPort(port, data)
+func (p portIOAdapter) ReadIOPort(exitCtx hv.ExitContext, port uint16, data []byte) error {
+	return p.dev.ReadIOPort(exitCtx, port, data)
 }
 
-func (p portIOAdapter) WriteIOPort(port uint16, data []byte) error {
-	return p.dev.WriteIOPort(port, data)
+func (p portIOAdapter) WriteIOPort(exitCtx hv.ExitContext, port uint16, data []byte) error {
+	return p.dev.WriteIOPort(exitCtx, port, data)
 }
 
 type mmioAdapter struct {
 	dev hv.MemoryMappedIODevice
 }
 
-func (m mmioAdapter) ReadMMIO(addr uint64, data []byte) error {
-	return m.dev.ReadMMIO(addr, data)
+func (m mmioAdapter) ReadMMIO(exitCtx hv.ExitContext, addr uint64, data []byte) error {
+	return m.dev.ReadMMIO(exitCtx, addr, data)
 }
 
-func (m mmioAdapter) WriteMMIO(addr uint64, data []byte) error {
-	return m.dev.WriteMMIO(addr, data)
+func (m mmioAdapter) WriteMMIO(exitCtx hv.ExitContext, addr uint64, data []byte) error {
+	return m.dev.WriteMMIO(exitCtx, addr, data)
 }
 
 type hypervisor struct{}
@@ -600,18 +625,40 @@ func (h *hypervisor) Close() error {
 	return nil
 }
 
+var (
+	tsWhpPreInit              = timeslice.RegisterKind("whp_pre_init", 0)
+	tsWhpCreatePartition      = timeslice.RegisterKind("whp_create_partition", 0)
+	tsWhpSetPartitionProperty = timeslice.RegisterKind("whp_set_partition_property", 0)
+	tsWhpArchVMInit           = timeslice.RegisterKind("whp_arch_vm_init", 0)
+	tsWhpOnCreateVM           = timeslice.RegisterKind("whp_on_create_vm", 0)
+	tsWhpSetupPartition       = timeslice.RegisterKind("whp_setup_partition", 0)
+	tsWhpAllocateMemory       = timeslice.RegisterKind("whp_allocate_memory", 0)
+	tsWhpMapGPARange          = timeslice.RegisterKind("whp_map_gpa_range", 0)
+	tsWhpArchVMInitWithMemory = timeslice.RegisterKind("whp_arch_vm_init_with_memory", 0)
+	tsWhpOnCreateVMWithMemory = timeslice.RegisterKind("whp_on_create_vm_with_memory", 0)
+	tsWhpCreateVCPU           = timeslice.RegisterKind("whp_create_vcpu", 0)
+	tsWhpArchVCPUInit         = timeslice.RegisterKind("whp_arch_vcpu_init", 0)
+	tsWhpOnCreateVCPU         = timeslice.RegisterKind("whp_on_create_vcpu", 0)
+	tsWhpLoaded               = timeslice.RegisterKind("whp_loaded", 0)
+)
+
 // NewVirtualMachine implements hv.Hypervisor.
 func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, error) {
 	vm := &virtualMachine{
+		rec:   timeslice.NewState(),
 		hv:    h,
 		vcpus: make(map[int]*virtualCPU),
 	}
+
+	timeslice.Record(tsWhpPreInit, time.Since(tsWhpStartTime))
 
 	part, err := bindings.CreatePartition()
 	if err != nil {
 		return nil, fmt.Errorf("whp: CreatePartition failed: %w", err)
 	}
 	vm.part = part
+
+	vm.rec.Record(tsWhpCreatePartition)
 
 	if err := bindings.SetPartitionPropertyUnsafe(
 		vm.part,
@@ -622,19 +669,27 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		return nil, fmt.Errorf("whp: SetPartitionPropertyUnsafe failed: %w", err)
 	}
 
+	vm.rec.Record(tsWhpSetPartitionProperty)
+
 	if err := h.archVMInit(vm, config); err != nil {
 		return nil, fmt.Errorf("whp: archVMInit failed: %w", err)
 	}
+
+	vm.rec.Record(tsWhpArchVMInit)
 
 	if err := config.Callbacks().OnCreateVM(vm); err != nil {
 		bindings.DeletePartition(vm.part)
 		return nil, fmt.Errorf("VM callback OnCreateVM: %w", err)
 	}
 
+	vm.rec.Record(tsWhpOnCreateVM)
+
 	if err := bindings.SetupPartition(vm.part); err != nil {
 		bindings.DeletePartition(vm.part)
 		return nil, fmt.Errorf("whp: SetupPartition failed: %w", err)
 	}
+
+	vm.rec.Record(tsWhpSetupPartition)
 
 	// Allocate guest memory
 	if config.MemorySize() == 0 {
@@ -653,6 +708,8 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		return nil, fmt.Errorf("whp: VirtualAlloc failed: %w", err)
 	}
 
+	vm.rec.Record(tsWhpAllocateMemory)
+
 	vm.memory = mem
 	vm.memoryBase = config.MemoryBase()
 
@@ -667,14 +724,20 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		return nil, fmt.Errorf("whp: MapGPARange failed: %w", err)
 	}
 
+	vm.rec.Record(tsWhpMapGPARange)
+
 	if err := h.archVMInitWithMemory(vm, config); err != nil {
 		return nil, fmt.Errorf("whp: archVMInit failed: %w", err)
 	}
+
+	vm.rec.Record(tsWhpArchVMInitWithMemory)
 
 	if err := config.Callbacks().OnCreateVMWithMemory(vm); err != nil {
 		bindings.DeletePartition(vm.part)
 		return nil, fmt.Errorf("VM callback OnCreateVM: %w", err)
 	}
+
+	vm.rec.Record(tsWhpOnCreateVMWithMemory)
 
 	// Create vCPUs
 	if config.CPUCount() != 1 {
@@ -692,7 +755,10 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 			return nil, fmt.Errorf("whp: CreateVirtualProcessor failed: %w", err)
 		}
 
+		vm.rec.Record(tsWhpCreateVCPU)
+
 		vcpu := &virtualCPU{
+			rec:      timeslice.NewState(),
 			vm:       vm,
 			id:       i,
 			runQueue: make(chan func(), 16),
@@ -706,12 +772,16 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 			return nil, fmt.Errorf("initialize VM: %w", err)
 		}
 
+		vm.rec.Record(tsWhpArchVCPUInit)
+
 		go vcpu.start()
 
 		if err := config.Callbacks().OnCreateVCPU(vcpu); err != nil {
 			bindings.DeletePartition(vm.part)
 			return nil, fmt.Errorf("VM callback OnCreateVCPU %d: %w", i, err)
 		}
+
+		vm.rec.Record(tsWhpOnCreateVCPU)
 	}
 
 	// Run Loader
@@ -722,6 +792,8 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 			bindings.DeletePartition(vm.part)
 			return nil, fmt.Errorf("load VM: %w", err)
 		}
+
+		vm.rec.Record(tsWhpLoaded)
 	}
 
 	return vm, nil

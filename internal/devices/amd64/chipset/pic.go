@@ -104,7 +104,7 @@ func (p *DualPIC) IOPorts() []uint16 {
 	}
 }
 
-func (p *DualPIC) ReadIOPort(port uint16, data []byte) error {
+func (p *DualPIC) ReadIOPort(ctx hv.ExitContext, port uint16, data []byte) error {
 	if len(data) != 1 {
 		return fmt.Errorf("pic: invalid read size %d", len(data))
 	}
@@ -130,7 +130,7 @@ func (p *DualPIC) ReadIOPort(port uint16, data []byte) error {
 	return nil
 }
 
-func (p *DualPIC) WriteIOPort(port uint16, data []byte) error {
+func (p *DualPIC) WriteIOPort(ctx hv.ExitContext, port uint16, data []byte) error {
 	if len(data) == 2 && (port == primaryPicCommandPort || port == secondaryPicCommandPort) {
 		var prim, sec byte = data[0], data[1]
 		if port == secondaryPicCommandPort {

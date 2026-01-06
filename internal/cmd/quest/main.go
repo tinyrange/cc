@@ -40,6 +40,7 @@ import (
 	amd64defs "github.com/tinyrange/cc/internal/linux/defs/amd64"
 	"github.com/tinyrange/cc/internal/linux/kernel"
 	"github.com/tinyrange/cc/internal/netstack"
+	"github.com/tinyrange/cc/internal/timeslice"
 	"github.com/tinyrange/cc/internal/vfs"
 )
 
@@ -145,20 +146,23 @@ func newIoapicHarness(entries int) *ioapicHarness {
 	return h
 }
 
-func (h *ioapicHarness) writeRegister(index uint8, value uint32) error {
+func (h *ioapicHarness) writeRegister(ctx hv.ExitContext, index uint8, value uint32) error {
 	// IOAPIC MMIO window offsets: 0x0 = select, 0x10 = data.
-	if err := h.ioapic.WriteMMIO(chipset.IOAPICBaseAddress+0x00, []byte{index}); err != nil {
+	if err := h.ioapic.WriteMMIO(ctx, chipset.IOAPICBaseAddress+0x00, []byte{index}); err != nil {
 		return fmt.Errorf("write select: %w", err)
 	}
 	buf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(buf, value)
-	if err := h.ioapic.WriteMMIO(chipset.IOAPICBaseAddress+0x10, buf); err != nil {
+	if err := h.ioapic.WriteMMIO(ctx, chipset.IOAPICBaseAddress+0x10, buf); err != nil {
 		return fmt.Errorf("write data: %w", err)
 	}
 	return nil
 }
 
-func (h *ioapicHarness) programEntry(line uint8, vector uint8, dest uint8, logical bool, delivery uint8, level bool, masked bool) error {
+func (h *ioapicHarness) programEntry(
+	ctx hv.ExitContext,
+	line uint8, vector uint8, dest uint8, logical bool, delivery uint8, level bool, masked bool,
+) error {
 	lowIndex := uint8(0x10 + line*2)
 	highIndex := lowIndex + 1
 
@@ -177,10 +181,10 @@ func (h *ioapicHarness) programEntry(line uint8, vector uint8, dest uint8, logic
 
 	high := uint32(dest) << 24 // Destination field is bits 56-63.
 
-	if err := h.writeRegister(lowIndex, low); err != nil {
+	if err := h.writeRegister(ctx, lowIndex, low); err != nil {
 		return err
 	}
-	return h.writeRegister(highIndex, high)
+	return h.writeRegister(ctx, highIndex, high)
 }
 
 func linuxMemoryBaseForArch(arch hv.CpuArchitecture) uint64 {
@@ -627,7 +631,7 @@ func (q *bringUpQuest) Run() error {
 		return nil
 	}, hv.SimpleX86IOPortDevice{
 		Ports: []uint16{0x3f8},
-		WriteFunc: func(port uint16, data []byte) error {
+		WriteFunc: func(ctx hv.ExitContext, port uint16, data []byte) error {
 			result = append(result, data...)
 			return nil
 		},
@@ -681,7 +685,7 @@ func (q *bringUpQuest) Run() error {
 		Regions: []hv.MMIORegion{
 			{Address: 0xdead0000, Size: 0x1000},
 		},
-		WriteFunc: func(addr uint64, data []byte) error {
+		WriteFunc: func(ctx hv.ExitContext, addr uint64, data []byte) error {
 			// Collect the MMIO writes to verify the output
 			if addr == 0xdead0000 {
 				result = append(result, data[0])
@@ -757,7 +761,7 @@ func (q *bringUpQuest) Run() error {
 			Regions: []hv.MMIORegion{
 				{Address: 0xf000_0000, Size: 4096},
 			},
-			WriteFunc: func(addr uint64, data []byte) error {
+			WriteFunc: func(ctx hv.ExitContext, addr uint64, data []byte) error {
 				if addr != 0xf000_0000 {
 					return fmt.Errorf("unexpected MMIO write to address 0x%08x", addr)
 				}
@@ -1069,7 +1073,7 @@ func (q *bringUpQuest) Run() error {
 		Regions: []hv.MMIORegion{
 			{Address: arm64MMIOAddr, Size: 0x1000},
 		},
-		WriteFunc: func(addr uint64, data []byte) error {
+		WriteFunc: func(ctx hv.ExitContext, addr uint64, data []byte) error {
 			if addr == arm64MMIOAddr {
 				arm64Result = append(arm64Result, data[0])
 				return nil
@@ -1139,7 +1143,7 @@ func (q *bringUpQuest) Run() error {
 	// 		Regions: []hv.MMIORegion{
 	// 			{Address: arm64SnapshotMMIOAddr, Size: 4096},
 	// 		},
-	// 		WriteFunc: func(addr uint64, data []byte) error {
+	// 		WriteFunc: func(ctx hv.ExitContext, addr uint64, data []byte) error {
 	// 			if addr != arm64SnapshotMMIOAddr {
 	// 				return fmt.Errorf("unexpected MMIO write to address 0x%08x", addr)
 	// 			}
@@ -1463,6 +1467,19 @@ func RunExecutable(path string, gpuEnabled bool) error {
 			debug.Writef("bringup-quest.RunExecutable open debug file", "filename=%s", os.Getenv("CC_DEBUG_FILE"))
 		}
 		debug.Writef("bringup-quest.RunExecutable debug memory enabled", "")
+	}
+
+	if os.Getenv("CC_TIMESLICE_FILE") != "" {
+		f, err := os.Create(os.Getenv("CC_TIMESLICE_FILE"))
+		if err != nil {
+			return fmt.Errorf("create timeslice file: %w", err)
+		}
+		defer f.Close()
+		w, err := timeslice.StartRecording(f)
+		if err != nil {
+			return fmt.Errorf("open timeslice file: %w", err)
+		}
+		defer w.Close()
 	}
 
 	hv, err := factory.Open()

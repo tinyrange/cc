@@ -211,7 +211,7 @@ func (c *I8042) IOPorts() []uint16 {
 }
 
 // ReadIOPort implements chipset.PortIOHandler.
-func (c *I8042) ReadIOPort(port uint16, data []byte) error {
+func (c *I8042) ReadIOPort(ctx hv.ExitContext, port uint16, data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -235,7 +235,7 @@ func (c *I8042) ReadIOPort(port uint16, data []byte) error {
 }
 
 // WriteIOPort implements chipset.PortIOHandler.
-func (c *I8042) WriteIOPort(port uint16, data []byte) error {
+func (c *I8042) WriteIOPort(ctx hv.ExitContext, port uint16, data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

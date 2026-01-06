@@ -68,7 +68,7 @@ func (p *pl011Device) MMIORegions() []hv.MMIORegion {
 	}
 }
 
-func (p *pl011Device) ReadMMIO(addr uint64, data []byte) error {
+func (p *pl011Device) ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	if err := p.checkBounds(addr, len(data)); err != nil {
 		return err
 	}
@@ -88,7 +88,7 @@ func (p *pl011Device) ReadMMIO(addr uint64, data []byte) error {
 	return nil
 }
 
-func (p *pl011Device) WriteMMIO(addr uint64, data []byte) error {
+func (p *pl011Device) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 	if err := p.checkBounds(addr, len(data)); err != nil {
 		return err
 	}

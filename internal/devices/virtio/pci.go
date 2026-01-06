@@ -478,16 +478,16 @@ func (d *VirtioPCIDevice) WriteConfig(offset uint16, size uint8, value uint32) e
 }
 
 // ReadMMIO implements hv.MemoryMappedIODevice.
-func (d *VirtioPCIDevice) ReadMMIO(addr uint64, data []byte) error {
-	return d.mmioAccess(addr, data, false)
+func (d *VirtioPCIDevice) ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
+	return d.mmioAccess(ctx, addr, data, false)
 }
 
 // WriteMMIO implements hv.MemoryMappedIODevice.
-func (d *VirtioPCIDevice) WriteMMIO(addr uint64, data []byte) error {
-	return d.mmioAccess(addr, data, true)
+func (d *VirtioPCIDevice) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
+	return d.mmioAccess(ctx, addr, data, true)
 }
 
-func (d *VirtioPCIDevice) mmioAccess(addr uint64, data []byte, write bool) error {
+func (d *VirtioPCIDevice) mmioAccess(ctx hv.ExitContext, addr uint64, data []byte, write bool) error {
 	width := uint32(len(data))
 	if width == 0 {
 		return nil
@@ -510,7 +510,7 @@ func (d *VirtioPCIDevice) mmioAccess(addr uint64, data []byte, write bool) error
 			if value != 0 && virtioPCIDebug {
 				slog.Info("virtio-pci: notify write", "offset", offset, "value", value)
 			}
-			if err := d.handleNotifyWrite(offset, uint16(value)); err != nil {
+			if err := d.handleNotifyWrite(ctx, offset, uint16(value)); err != nil {
 				return err
 			}
 		} else {
@@ -532,11 +532,11 @@ func (d *VirtioPCIDevice) mmioAccess(addr uint64, data []byte, write bool) error
 		offset := uint32(addr - d.deviceCfgAddr)
 		if write {
 			value := littleEndianValue(data, width)
-			if err := d.writeDeviceConfig(offset, value, width); err != nil {
+			if err := d.writeDeviceConfig(ctx, offset, value, width); err != nil {
 				return err
 			}
 		} else {
-			value, err := d.readDeviceConfig(offset, width)
+			value, err := d.readDeviceConfig(ctx, offset, width)
 			if err != nil {
 				return err
 			}
@@ -694,12 +694,12 @@ func (d *VirtioPCIDevice) writeGuest(addr uint64, data []byte) error {
 	return d.writeGuestFrom(addr, data)
 }
 
-func (d *VirtioPCIDevice) readMMIO(addr uint64, data []byte) error {
-	return d.mmioAccess(addr, data, false)
+func (d *VirtioPCIDevice) readMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
+	return d.mmioAccess(ctx, addr, data, false)
 }
 
-func (d *VirtioPCIDevice) writeMMIO(addr uint64, data []byte) error {
-	return d.mmioAccess(addr, data, true)
+func (d *VirtioPCIDevice) writeMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
+	return d.mmioAccess(ctx, addr, data, true)
 }
 
 func (d *VirtioPCIDevice) eventIdxEnabled() bool {
@@ -1744,13 +1744,13 @@ func (d *VirtioPCIDevice) currentQueue() *queue {
 	return &d.queues[idx]
 }
 
-func (d *VirtioPCIDevice) handleNotifyWrite(offset uint32, value uint16) error {
+func (d *VirtioPCIDevice) handleNotifyWrite(ctx hv.ExitContext, offset uint32, value uint16) error {
 	queueIdx := int(value)
 	if queueIdx < 0 || queueIdx >= len(d.queues) {
 		queueIdx = int(offset / d.notifyOffMultiplier)
 	}
 	if d.handler != nil {
-		return d.handler.OnQueueNotify(d, queueIdx)
+		return d.handler.OnQueueNotify(ctx, d, queueIdx)
 	}
 	return nil
 }
@@ -1761,8 +1761,8 @@ func (d *VirtioPCIDevice) handleISRRead() uint8 {
 	return value
 }
 
-func (d *VirtioPCIDevice) readDeviceConfig(offset uint32, width uint32) (uint32, error) {
-	value, err := d.handleDeviceCfgRead(offset &^ 0x3)
+func (d *VirtioPCIDevice) readDeviceConfig(ctx hv.ExitContext, offset uint32, width uint32) (uint32, error) {
+	value, err := d.handleDeviceCfgRead(ctx, offset&^0x3)
 	if err != nil {
 		return 0, err
 	}
@@ -1771,27 +1771,27 @@ func (d *VirtioPCIDevice) readDeviceConfig(offset uint32, width uint32) (uint32,
 	return (value >> shift) & mask, nil
 }
 
-func (d *VirtioPCIDevice) writeDeviceConfig(offset uint32, value uint32, width uint32) error {
+func (d *VirtioPCIDevice) writeDeviceConfig(ctx hv.ExitContext, offset uint32, value uint32, width uint32) error {
 	aligned := offset &^ 0x3
 	if width == 4 && offset == aligned {
-		return d.handleDeviceCfgWrite(aligned, value)
+		return d.handleDeviceCfgWrite(ctx, aligned, value)
 	}
-	current, err := d.handleDeviceCfgRead(aligned)
+	current, err := d.handleDeviceCfgRead(ctx, aligned)
 	if err != nil {
 		return err
 	}
 	shift := (offset - aligned) * 8
 	mask := uint32((uint64(1) << (width * 8)) - 1)
 	newValue := (current & ^(mask << shift)) | ((value & mask) << shift)
-	return d.handleDeviceCfgWrite(aligned, newValue)
+	return d.handleDeviceCfgWrite(ctx, aligned, newValue)
 }
 
-func (d *VirtioPCIDevice) handleDeviceCfgRead(offset uint32) (uint32, error) {
+func (d *VirtioPCIDevice) handleDeviceCfgRead(ctx hv.ExitContext, offset uint32) (uint32, error) {
 	if d.virtioDevice != nil {
 		relOffset := uint16(offset)
-		return d.virtioDevice.ReadConfig(relOffset), nil
+		return d.virtioDevice.ReadConfig(ctx, relOffset), nil
 	} else if d.handler != nil {
-		value, handled, err := d.handler.ReadConfig(d, uint64(offset))
+		value, handled, err := d.handler.ReadConfig(ctx, d, uint64(offset))
 		if handled {
 			return value, err
 		}
@@ -1799,14 +1799,14 @@ func (d *VirtioPCIDevice) handleDeviceCfgRead(offset uint32) (uint32, error) {
 	return 0, nil
 }
 
-func (d *VirtioPCIDevice) handleDeviceCfgWrite(offset uint32, value uint32) error {
+func (d *VirtioPCIDevice) handleDeviceCfgWrite(ctx hv.ExitContext, offset uint32, value uint32) error {
 	if d.virtioDevice != nil {
 		relOffset := uint16(offset)
-		d.virtioDevice.WriteConfig(relOffset, value)
+		d.virtioDevice.WriteConfig(ctx, relOffset, value)
 		d.cfgGeneration++
 		return nil
 	} else if d.handler != nil {
-		handled, err := d.handler.WriteConfig(d, uint64(offset), value)
+		handled, err := d.handler.WriteConfig(ctx, d, uint64(offset), value)
 		if handled {
 			d.cfgGeneration++
 			return err
