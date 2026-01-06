@@ -1,3 +1,5 @@
+//go:build experimental
+
 package ccvm
 
 func div(a int64, b int64) int64 {
