@@ -27,7 +27,7 @@ _Part 1_
 
 _Part 2_
 
-- [ ] Add benchmarking (both Golang and Tests)
+- [x] Add benchmarking (both Golang and Tests)
 - [ ] Add snapshot support for Linux boot and Benchmark and improve KVM AMD64
 - [ ] Benchmark and improve HVF arm64
 - [ ] Benchmark and improve KVM arm64

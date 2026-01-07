@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
-	"time"
 	"unsafe"
 
 	"github.com/tinyrange/cc/internal/acpi"
@@ -39,54 +38,11 @@ type virtualCPU struct {
 	id       int
 	fd       int
 	run      []byte
-
-	traceStart time.Time
-
-	// trace is a ring buffer
-	traceBuffer []string
-	traceOffset int
 }
 
 // implements hv.VirtualCPU.
 func (v *virtualCPU) ID() int                           { return v.id }
 func (v *virtualCPU) VirtualMachine() hv.VirtualMachine { return v.vm }
-
-func (v *virtualCPU) trace(s string) {
-	if v.traceBuffer == nil {
-		return
-	}
-
-	v.traceBuffer[v.traceOffset] = fmt.Sprintf("%s: %s", time.Since(v.traceStart), s)
-	v.traceOffset = (v.traceOffset + 1) % len(v.traceBuffer)
-}
-
-func (v *virtualCPU) EnableTrace(maxEntries int) error {
-	if maxEntries <= 0 {
-		return fmt.Errorf("maxEntries must be positive")
-	}
-
-	v.traceBuffer = make([]string, maxEntries)
-	v.traceOffset = 0
-	v.traceStart = time.Now()
-
-	return nil
-}
-
-func (v *virtualCPU) GetTraceBuffer() ([]string, error) {
-	if v.traceBuffer == nil {
-		return nil, fmt.Errorf("trace buffer not enabled")
-	}
-
-	var trace []string
-	for i := 0; i < len(v.traceBuffer); i++ {
-		idx := (v.traceOffset + i) % len(v.traceBuffer)
-		if v.traceBuffer[idx] != "" {
-			trace = append(trace, v.traceBuffer[idx])
-		}
-	}
-
-	return trace, nil
-}
 
 func (v *virtualCPU) start() {
 	runtime.LockOSThread()

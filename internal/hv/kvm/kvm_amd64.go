@@ -322,9 +322,6 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 func (v *virtualCPU) handleIO(exitCtx *exitContext, ioData *kvmExitIoData) error {
 	data := v.run[ioData.dataOffset : ioData.dataOffset+uint64(ioData.size)*uint64(ioData.count)]
 
-	v.trace(fmt.Sprintf("handleIO port=0x%04x size=%d count=%d direction=%d data=% x",
-		ioData.port, ioData.size, ioData.count, ioData.direction, data))
-
 	debug.Writef("kvm-amd64.handleIO", "handleIO port=0x%04x size=%d count=%d direction=%d data=% x", ioData.port, ioData.size, ioData.count, ioData.direction, data)
 
 	cs, err := v.vm.ensureChipset()
@@ -346,8 +343,6 @@ func (v *virtualCPU) handleIO(exitCtx *exitContext, ioData *kvmExitIoData) error
 }
 
 func (v *virtualCPU) handleMMIO(exitCtx *exitContext, mmioData *kvmExitMMIOData) error {
-	v.trace(fmt.Sprintf("handleMMIO physAddr=0x%016x size=%d isWrite=%d data=% x",
-		mmioData.physAddr, mmioData.len, mmioData.isWrite, mmioData.data))
 	debug.Writef("kvm-amd64.handleMMIO", "handleMMIO physAddr=0x%016x size=%d isWrite=%d data=% x", mmioData.physAddr, mmioData.len, mmioData.isWrite, mmioData.data)
 
 	cs, err := v.vm.ensureChipset()
