@@ -62,7 +62,7 @@ type View struct {
 	lastRows int
 
 	// Rendering layout cached from last frame.
-	cellW, cellH float32
+	cellW, cellH     float32
 	originX, originY float32
 }
 
@@ -615,7 +615,7 @@ func (v *View) renderGrid(f graphics.Frame, bgDefault, fgDefault color.Color, pa
 
 			// Render text if not blank.
 			if cell.Content != "" && cell.Content != " " && cell.Fg != nil {
-				v.txt.RenderText(cell.Content, x0, y0+cellH-2, fontSize, cell.Fg)
+				v.txt.RenderText(cell.Content, x0, y0+cellH-2, float64(fontSize), cell.Fg)
 			}
 
 			x += w

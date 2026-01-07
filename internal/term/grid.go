@@ -51,10 +51,10 @@ type Grid struct {
 
 // GridStats tracks grid update statistics.
 type GridStats struct {
-	TotalCells   int
-	DirtyCells   int
-	SyncCalls    int
-	FullRedraws  int
+	TotalCells  int
+	DirtyCells  int
+	SyncCalls   int
+	FullRedraws int
 }
 
 // NewGrid creates a new grid with the given dimensions.
@@ -330,8 +330,8 @@ type VTCell struct {
 	}
 }
 
-func (c *VTCell) GetContent() string   { return c.Content }
-func (c *VTCell) GetWidth() int        { return c.Width }
-func (c *VTCell) GetFg() color.Color   { return c.Style.Fg }
-func (c *VTCell) GetBg() color.Color   { return c.Style.Bg }
-func (c *VTCell) GetAttrs() uint8      { return uint8(c.Style.Attrs) }
+func (c *VTCell) GetContent() string { return c.Content }
+func (c *VTCell) GetWidth() int      { return c.Width }
+func (c *VTCell) GetFg() color.Color { return c.Style.Fg }
+func (c *VTCell) GetBg() color.Color { return c.Style.Bg }
+func (c *VTCell) GetAttrs() uint8    { return uint8(c.Style.Attrs) }

@@ -242,8 +242,8 @@ func BenchmarkIterateDirty(b *testing.B) {
 // BenchmarkGetDirtyRegions measures dirty region detection.
 func BenchmarkGetDirtyRegions(b *testing.B) {
 	dirtyPatterns := []struct {
-		name    string
-		setup   func(g *Grid, cols, rows int)
+		name  string
+		setup func(g *Grid, cols, rows int)
 	}{
 		{"sparse_random", func(g *Grid, cols, rows int) {
 			rng := rand.New(rand.NewSource(42))
@@ -292,11 +292,11 @@ func BenchmarkGetDirtyRegions(b *testing.B) {
 // BenchmarkResize measures grid resize time.
 func BenchmarkResize(b *testing.B) {
 	resizeOps := []struct {
-		name           string
-		fromCols       int
-		fromRows       int
-		toCols         int
-		toRows         int
+		name     string
+		fromCols int
+		fromRows int
+		toCols   int
+		toRows   int
 	}{
 		{"grow_small", 40, 20, 80, 40},
 		{"grow_medium", 80, 40, 120, 60},
