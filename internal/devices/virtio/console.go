@@ -285,11 +285,12 @@ func (vc *Console) OnQueueNotify(ctx hv.ExitContext, dev device, queue int) erro
 }
 
 func (vc *Console) ReadConfig(ctx hv.ExitContext, dev device, offset uint64) (uint32, bool, error) {
-	if offset < VIRTIO_MMIO_CONFIG {
-		return 0, false, nil
+	// Handle both direct calls (with raw MMIO offset) and adapter calls (with relative offset)
+	rel := offset
+	if offset >= VIRTIO_MMIO_CONFIG {
+		rel = offset - VIRTIO_MMIO_CONFIG
 	}
 
-	rel := offset - VIRTIO_MMIO_CONFIG
 	cfg := vc.configBytes()
 	if int(rel) >= len(cfg) {
 		return 0, true, nil
@@ -301,10 +302,9 @@ func (vc *Console) ReadConfig(ctx hv.ExitContext, dev device, offset uint64) (ui
 }
 
 func (vc *Console) WriteConfig(ctx hv.ExitContext, dev device, offset uint64, value uint32) (bool, error) {
-	if offset < VIRTIO_MMIO_CONFIG {
-		return false, nil
-	}
+	// Handle both direct calls (with raw MMIO offset) and adapter calls (with relative offset)
 	// The current console device exposes read-only config.
+	_ = offset
 	_ = value
 	return true, nil
 }
