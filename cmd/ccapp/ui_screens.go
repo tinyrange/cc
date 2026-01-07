@@ -129,7 +129,7 @@ func (s *LauncherScreen) buildTitleSection() *ui.FlexContainer {
 	} else {
 		col.AddChild(
 			ui.NewLabel("Please select an environment to boot").WithSize(20),
-			ui.FlexParamsWithMargin(0, ui.Only(0, 10, 0, 0)),
+			ui.FlexParamsWithMargin(0, ui.Only(0, 10, 0, 10)),
 		)
 	}
 
@@ -183,11 +183,16 @@ func (s *LauncherScreen) buildBundleCard(index int, b discoveredBundle) *bundleC
 		desc = "VM Bundle"
 	}
 
+	// Card dimensions and padding
+	const cardWidth = 180
+	const cardHeight = 230
+	const contentWidth = cardWidth - 10
+
 	// Card content: vertical layout with image area and text
 	content := ui.Column().WithGap(8)
 
-	// Placeholder image area (the card itself provides the visual)
-	content.AddChild(ui.NewSpacer().WithSize(180, 180), ui.DefaultFlexParams())
+	// Placeholder image area (sized to fit within padded content area)
+	content.AddChild(ui.NewSpacer().WithSize(contentWidth, contentWidth), ui.DefaultFlexParams())
 
 	// Name and description
 	content.AddChild(ui.NewLabel(name).WithSize(18), ui.DefaultFlexParams())
@@ -197,20 +202,20 @@ func (s *LauncherScreen) buildBundleCard(index int, b discoveredBundle) *bundleC
 		BackgroundColor: color.RGBA{A: 0}, // Transparent by default
 		BorderColor:     colorBorderNormal,
 		BorderWidth:     1,
-		Padding:         ui.All(0),
+		Padding:         ui.Only(5, 0, 5, 0),
 	}
 
 	hoverStyle := ui.CardStyle{
 		BackgroundColor: colorCardBg,
 		BorderColor:     colorBorderHover,
 		BorderWidth:     1,
-		Padding:         ui.All(0),
+		Padding:         ui.Only(5, 0, 5, 0),
 	}
 
 	card := ui.NewCard(content).
 		WithStyle(cardStyle).
 		WithHoverStyle(hoverStyle).
-		WithFixedSize(180, 240).
+		WithFixedSize(cardWidth, cardHeight).
 		OnClick(func() {
 			s.app.selectedIndex = index
 			s.app.startBootBundle(index)

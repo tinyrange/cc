@@ -63,7 +63,15 @@ func (s *Stack) Draw(ctx *DrawContext) {
 }
 
 func (s *Stack) HandleEvent(ctx *EventContext, event Event) bool {
-	// Handle events in reverse order (top-most first)
+	// For MouseMoveEvent, dispatch to ALL children so they can update hover state
+	if _, isMove := event.(*MouseMoveEvent); isMove {
+		for i := len(s.children) - 1; i >= 0; i-- {
+			s.children[i].HandleEvent(ctx, event)
+		}
+		return false
+	}
+
+	// For other events, dispatch in reverse order (top-most first) and stop when handled
 	for i := len(s.children) - 1; i >= 0; i-- {
 		if s.children[i].HandleEvent(ctx, event) {
 			return true
@@ -79,6 +87,9 @@ type Align struct {
 	content    Widget
 	horizontal float32 // 0 = left, 0.5 = center, 1 = right
 	vertical   float32 // 0 = top, 0.5 = center, 1 = bottom
+
+	// Cached content size from Layout
+	contentSize Size
 }
 
 // NewAlign creates an alignment wrapper.
@@ -138,7 +149,7 @@ func BottomRight(content Widget) *Align {
 
 func (a *Align) Layout(ctx *LayoutContext, constraints Constraints) Size {
 	if a.content != nil {
-		a.content.Layout(ctx, Unconstrained())
+		a.contentSize = a.content.Layout(ctx, Unconstrained())
 	}
 	return Size{W: constraints.MaxW, H: constraints.MaxH}
 }
@@ -146,10 +157,10 @@ func (a *Align) Layout(ctx *LayoutContext, constraints Constraints) Size {
 func (a *Align) SetBounds(bounds Rect) {
 	a.BaseWidget.SetBounds(bounds)
 	if a.content != nil {
-		contentBounds := a.content.Bounds()
-		x := bounds.X + (bounds.W-contentBounds.W)*a.horizontal
-		y := bounds.Y + (bounds.H-contentBounds.H)*a.vertical
-		a.content.SetBounds(Rect{X: x, Y: y, W: contentBounds.W, H: contentBounds.H})
+		// Use cached size from Layout, not Bounds (which may not be set yet)
+		x := bounds.X + (bounds.W-a.contentSize.W)*a.horizontal
+		y := bounds.Y + (bounds.H-a.contentSize.H)*a.vertical
+		a.content.SetBounds(Rect{X: x, Y: y, W: a.contentSize.W, H: a.contentSize.H})
 	}
 }
 

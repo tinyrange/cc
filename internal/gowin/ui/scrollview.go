@@ -295,8 +295,16 @@ func (s *ScrollView) HandleEvent(ctx *EventContext, event Event) bool {
 	}
 
 	// Dispatch to content
-	if s.content != nil && bounds.Contains(s.getMousePos(event)) {
-		return s.content.HandleEvent(ctx, event)
+	if s.content != nil {
+		// Always dispatch MouseMoveEvent so children can update hover state
+		// even when mouse moves outside the viewport
+		if _, isMove := event.(*MouseMoveEvent); isMove {
+			return s.content.HandleEvent(ctx, event)
+		}
+		// For other events, only dispatch if mouse is within bounds
+		if bounds.Contains(s.getMousePos(event)) {
+			return s.content.HandleEvent(ctx, event)
+		}
 	}
 	return false
 }

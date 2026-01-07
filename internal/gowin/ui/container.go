@@ -335,7 +335,15 @@ func (c *FlexContainer) Draw(ctx *DrawContext) {
 }
 
 func (c *FlexContainer) HandleEvent(ctx *EventContext, event Event) bool {
-	// Dispatch to children in reverse order (top-most first)
+	// For MouseMoveEvent, dispatch to ALL children so they can update hover state
+	if _, isMove := event.(*MouseMoveEvent); isMove {
+		for i := len(c.children) - 1; i >= 0; i-- {
+			c.children[i].HandleEvent(ctx, event)
+		}
+		return false
+	}
+
+	// For other events, dispatch in reverse order (top-most first) and stop when handled
 	for i := len(c.children) - 1; i >= 0; i-- {
 		if c.children[i].HandleEvent(ctx, event) {
 			return true

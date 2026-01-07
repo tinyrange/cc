@@ -194,6 +194,9 @@ type Center struct {
 	BaseWidget
 
 	content Widget
+
+	// Cached content size from Layout
+	contentSize Size
 }
 
 // NewCenter creates a centering wrapper.
@@ -206,7 +209,7 @@ func NewCenter(content Widget) *Center {
 
 func (c *Center) Layout(ctx *LayoutContext, constraints Constraints) Size {
 	if c.content != nil {
-		c.content.Layout(ctx, Unconstrained())
+		c.contentSize = c.content.Layout(ctx, Unconstrained())
 	}
 	return Size{W: constraints.MaxW, H: constraints.MaxH}
 }
@@ -214,10 +217,10 @@ func (c *Center) Layout(ctx *LayoutContext, constraints Constraints) Size {
 func (c *Center) SetBounds(bounds Rect) {
 	c.BaseWidget.SetBounds(bounds)
 	if c.content != nil {
-		contentBounds := c.content.Bounds()
-		x := bounds.X + (bounds.W-contentBounds.W)/2
-		y := bounds.Y + (bounds.H-contentBounds.H)/2
-		c.content.SetBounds(Rect{X: x, Y: y, W: contentBounds.W, H: contentBounds.H})
+		// Use cached size from Layout, not Bounds (which may not be set yet)
+		x := bounds.X + (bounds.W-c.contentSize.W)/2
+		y := bounds.Y + (bounds.H-c.contentSize.H)/2
+		c.content.SetBounds(Rect{X: x, Y: y, W: c.contentSize.W, H: c.contentSize.H})
 	}
 }
 
