@@ -89,7 +89,7 @@ func extractInsets(v starlark.Value) ui.EdgeInsets {
 	if tuple, ok := v.(starlark.Tuple); ok {
 		switch len(tuple) {
 		case 1:
-			if n, err := starlark.AsFloat(tuple[0]); err == nil {
+			if n, ok := starlark.AsFloat(tuple[0]); ok {
 				return ui.All(float32(n))
 			}
 		case 2:
@@ -105,7 +105,7 @@ func extractInsets(v starlark.Value) ui.EdgeInsets {
 		}
 	}
 	// Support single number for uniform padding
-	if n, err := starlark.AsFloat(v); err == nil {
+	if n, ok := starlark.AsFloat(v); ok {
 		return ui.All(float32(n))
 	}
 	return ui.EdgeInsets{}
@@ -156,7 +156,7 @@ func extractFloat(v starlark.Value, def float32) float32 {
 	if v == nil || v == starlark.None {
 		return def
 	}
-	if f, err := starlark.AsFloat(v); err == nil {
+	if f, ok := starlark.AsFloat(v); ok {
 		return float32(f)
 	}
 	return def
@@ -166,7 +166,7 @@ func extractInt(v starlark.Value, def int) int {
 	if v == nil || v == starlark.None {
 		return def
 	}
-	if i, ok := starlark.AsInt32(v); ok {
+	if i, err := starlark.AsInt32(v); err == nil {
 		return int(i)
 	}
 	return def

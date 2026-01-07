@@ -166,7 +166,7 @@ func colorFromPalette(palette map[int]color.Color, shade int) color.Color {
 func builtinColorGray(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var shade int = 500
 	if len(args) > 0 {
-		if s, ok := starlark.AsInt32(args[0]); ok {
+		if s, err := starlark.AsInt32(args[0]); err == nil {
 			shade = int(s)
 		}
 	}
@@ -176,7 +176,7 @@ func builtinColorGray(thread *starlark.Thread, fn *starlark.Builtin, args starla
 func builtinColorRed(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var shade int = 500
 	if len(args) > 0 {
-		if s, ok := starlark.AsInt32(args[0]); ok {
+		if s, err := starlark.AsInt32(args[0]); err == nil {
 			shade = int(s)
 		}
 	}
@@ -186,7 +186,7 @@ func builtinColorRed(thread *starlark.Thread, fn *starlark.Builtin, args starlar
 func builtinColorOrange(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var shade int = 500
 	if len(args) > 0 {
-		if s, ok := starlark.AsInt32(args[0]); ok {
+		if s, err := starlark.AsInt32(args[0]); err == nil {
 			shade = int(s)
 		}
 	}
@@ -196,7 +196,7 @@ func builtinColorOrange(thread *starlark.Thread, fn *starlark.Builtin, args star
 func builtinColorYellow(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var shade int = 500
 	if len(args) > 0 {
-		if s, ok := starlark.AsInt32(args[0]); ok {
+		if s, err := starlark.AsInt32(args[0]); err == nil {
 			shade = int(s)
 		}
 	}
@@ -206,7 +206,7 @@ func builtinColorYellow(thread *starlark.Thread, fn *starlark.Builtin, args star
 func builtinColorGreen(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var shade int = 500
 	if len(args) > 0 {
-		if s, ok := starlark.AsInt32(args[0]); ok {
+		if s, err := starlark.AsInt32(args[0]); err == nil {
 			shade = int(s)
 		}
 	}
@@ -216,7 +216,7 @@ func builtinColorGreen(thread *starlark.Thread, fn *starlark.Builtin, args starl
 func builtinColorBlue(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var shade int = 500
 	if len(args) > 0 {
-		if s, ok := starlark.AsInt32(args[0]); ok {
+		if s, err := starlark.AsInt32(args[0]); err == nil {
 			shade = int(s)
 		}
 	}
@@ -226,7 +226,7 @@ func builtinColorBlue(thread *starlark.Thread, fn *starlark.Builtin, args starla
 func builtinColorIndigo(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var shade int = 500
 	if len(args) > 0 {
-		if s, ok := starlark.AsInt32(args[0]); ok {
+		if s, err := starlark.AsInt32(args[0]); err == nil {
 			shade = int(s)
 		}
 	}
@@ -236,7 +236,7 @@ func builtinColorIndigo(thread *starlark.Thread, fn *starlark.Builtin, args star
 func builtinColorPurple(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var shade int = 500
 	if len(args) > 0 {
-		if s, ok := starlark.AsInt32(args[0]); ok {
+		if s, err := starlark.AsInt32(args[0]); err == nil {
 			shade = int(s)
 		}
 	}
@@ -246,7 +246,7 @@ func builtinColorPurple(thread *starlark.Thread, fn *starlark.Builtin, args star
 func builtinColorPink(thread *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
 	var shade int = 500
 	if len(args) > 0 {
-		if s, ok := starlark.AsInt32(args[0]); ok {
+		if s, err := starlark.AsInt32(args[0]); err == nil {
 			shade = int(s)
 		}
 	}
@@ -271,19 +271,19 @@ func builtinInsets(thread *starlark.Thread, fn *starlark.Builtin, args starlark.
 	switch len(args) {
 	case 1:
 		// All sides equal
-		v, err := starlark.AsFloat(args[0])
-		if err != nil {
+		v, ok := starlark.AsFloat(args[0])
+		if !ok {
 			return nil, fmt.Errorf("insets: expected number, got %s", args[0].Type())
 		}
 		return &InsetsValue{Insets: ui.All(float32(v))}, nil
 	case 2:
 		// Horizontal, Vertical
-		h, err := starlark.AsFloat(args[0])
-		if err != nil {
+		h, ok := starlark.AsFloat(args[0])
+		if !ok {
 			return nil, fmt.Errorf("insets: expected number, got %s", args[0].Type())
 		}
-		v, err := starlark.AsFloat(args[1])
-		if err != nil {
+		v, ok := starlark.AsFloat(args[1])
+		if !ok {
 			return nil, fmt.Errorf("insets: expected number, got %s", args[1].Type())
 		}
 		return &InsetsValue{Insets: ui.Symmetric(float32(h), float32(v))}, nil
