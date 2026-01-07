@@ -211,116 +211,49 @@ func (vc *Console) OnQueueNotify(ctx hv.ExitContext, dev device, queue int) erro
 }
 
 func (vc *Console) ReadConfig(ctx hv.ExitContext, dev device, offset uint64) (uint32, bool, error) {
-	if offset < VIRTIO_MMIO_CONFIG {
-		return 0, false, nil
-	}
-
-	rel := offset - VIRTIO_MMIO_CONFIG
-	cfg := vc.configBytes()
-	if int(rel) >= len(cfg) {
-		return 0, true, nil
-	}
-
-	var buf [4]byte
-	copy(buf[:], cfg[rel:])
-	return binary.LittleEndian.Uint32(buf[:]), true, nil
+	return ReadConfigWindow(offset, vc.configBytes())
 }
 
 func (vc *Console) WriteConfig(ctx hv.ExitContext, dev device, offset uint64, value uint32) (bool, error) {
-	if offset < VIRTIO_MMIO_CONFIG {
-		return false, nil
-	}
-	// The current console device exposes read-only config.
-	_ = value
-	return true, nil
+	return WriteConfigNoop(offset)
 }
 
 func (vc *Console) processTransmitQueue(dev device, q *queue) error {
-	if q == nil || !q.ready || q.size == 0 {
-		return nil
-	}
-
-	availFlags, availIdx, err := dev.readAvailState(q)
+	processed, err := ProcessQueueNotifications(dev, q, vc.consumeDescriptorChain)
 	if err != nil {
 		return err
 	}
-
-	var interruptNeeded bool
-
-	for q.lastAvailIdx != availIdx {
-		ringIndex := q.lastAvailIdx % q.size
-		head, err := dev.readAvailEntry(q, ringIndex)
-		if err != nil {
-			return err
-		}
-		written, err := vc.consumeDescriptorChain(dev, q, head)
-		if err != nil {
-			return err
-		}
-		if err := dev.recordUsedElement(q, head, written); err != nil {
-			return err
-		}
-		q.lastAvailIdx++
-		interruptNeeded = true
-	}
-
-	if interruptNeeded && (availFlags&1) == 0 {
+	if ShouldRaiseInterrupt(dev, q, processed) {
 		dev.raiseInterrupt(consoleInterruptBit)
 	}
-
 	return nil
 }
 
 func (vc *Console) consumeDescriptorChain(dev device, q *queue, head uint16) (uint32, error) {
-	index := head
-	total := uint32(0)
-	for i := uint16(0); i < q.size; i++ {
-		desc, err := dev.readDescriptor(q, index)
-		if err != nil {
-			return total, err
-		}
-
-		if desc.flags&virtqDescFWrite != 0 {
-			return total, fmt.Errorf("unexpected writable descriptor in transmit queue")
-		}
-
-		if desc.length > 0 {
-			data, err := dev.readGuest(desc.addr, desc.length)
-			if err != nil {
-				return total, err
-			}
-			_, err = vc.out.Write(data)
-			if err != nil {
-				return total, fmt.Errorf("write console: %w", err)
-			}
-			debug.Writef("virtio-console consumeDescriptorChain wrote", "data=% x", data)
-			total += desc.length
-		}
-		if desc.flags&virtqDescFNext == 0 {
-			break
-		}
-		index = desc.next
+	data, err := ReadDescriptorChain(dev, q, head)
+	if err != nil {
+		return 0, err
 	}
-	return total, nil
+	if len(data) > 0 {
+		if _, err := vc.out.Write(data); err != nil {
+			return 0, fmt.Errorf("write console: %w", err)
+		}
+		debug.Writef("virtio-console consumeDescriptorChain wrote", "data=% x", data)
+	}
+	return uint32(len(data)), nil
 }
 
 func (vc *Console) processReceiveQueue(dev device, q *queue) error {
-	if q == nil || !q.ready || q.size == 0 {
-		var ready bool
-		var size uint16
-		if q != nil {
-			ready = q.ready
-			size = q.size
-		}
-		debug.Writef("virtio-console.processReceiveQueue skip", "q=%v ready=%v size=%v", q != nil, ready, size)
+	if !QueueReady(q) {
+		debug.Writef("virtio-console.processReceiveQueue skip", "q=%v ready=%v size=%v",
+			q != nil, q != nil && q.ready, func() uint16 { if q != nil { return q.size }; return 0 }())
 		return nil
 	}
 
-	// Process transmit queue proactively when processing receive queue
-	// This handles cases where the guest OS doesn't send queue notifications for the transmit queue
-	if txQueue := dev.queue(queueTransmit); txQueue != nil && txQueue.ready && txQueue.size > 0 {
+	// Console quirk: process transmit queue proactively when processing receive queue.
+	// This handles cases where the guest OS doesn't send queue notifications for the transmit queue.
+	if txQueue := dev.queue(queueTransmit); QueueReady(txQueue) {
 		if err := vc.processTransmitQueue(dev, txQueue); err != nil {
-			// Log error but don't fail receive queue processing
 			slog.Warn("virtio-console: process transmit queue", "err", err)
 		}
 	}
@@ -333,86 +266,19 @@ func (vc *Console) processReceiveQueue(dev device, q *queue) error {
 		return nil
 	}
 
-	_, availIdx, err := dev.readAvailState(q)
+	processed, consumed, err := ProcessQueueWithPending(dev, q, vc.pending, FillDescriptorChain)
 	if err != nil {
 		return err
 	}
-	var interruptNeeded bool
 
-	debug.Writef("virtio-console.processReceiveQueue", "availIdx=%d lastAvailIdx=%d", availIdx, q.lastAvailIdx)
-	for q.lastAvailIdx != availIdx && len(vc.pending) > 0 {
-		ringIndex := q.lastAvailIdx % q.size
-		head, err := dev.readAvailEntry(q, ringIndex)
-		if err != nil {
-			return err
-		}
+	vc.pending = vc.pending[consumed:]
 
-		written, consumed, err := vc.fillReceiveDescriptorChain(dev, q, head, vc.pending)
-		if err != nil {
-			return err
-		}
-		debug.Writef("virtio-console.processReceiveQueue", "delivered written=%d consumed=%d remaining=%d", written, consumed, len(vc.pending)-consumed)
-
-		vc.pending = vc.pending[consumed:]
-
-		if err := dev.recordUsedElement(q, head, written); err != nil {
-			return err
-		}
-
-		q.lastAvailIdx++
-		if written > 0 {
-			interruptNeeded = true
-		}
-	}
-
-	if interruptNeeded {
+	if processed {
 		debug.Writef("virtio-console.processReceiveQueue", "raising interrupt")
 		dev.raiseInterrupt(consoleInterruptBit)
 	}
 
 	return nil
-}
-
-func (vc *Console) fillReceiveDescriptorChain(dev device, q *queue, head uint16, data []byte) (uint32, int, error) {
-	index := head
-	totalWritten := uint32(0)
-	consumed := 0
-
-	for i := uint16(0); i < q.size && consumed < len(data); i++ {
-		desc, err := dev.readDescriptor(q, index)
-		if err != nil {
-			return totalWritten, consumed, err
-		}
-
-		if desc.flags&virtqDescFWrite == 0 {
-			return totalWritten, consumed, fmt.Errorf("unexpected read-only descriptor in receive queue")
-		}
-
-		if desc.length > 0 {
-			toCopy := int(desc.length)
-			remaining := len(data) - consumed
-			if toCopy > remaining {
-				toCopy = remaining
-			}
-			if toCopy > 0 {
-				if err := dev.writeGuest(desc.addr, data[consumed:consumed+toCopy]); err != nil {
-					return totalWritten, consumed, err
-				}
-				totalWritten += uint32(toCopy)
-				consumed += toCopy
-			}
-			if uint32(toCopy) < desc.length {
-				break
-			}
-		}
-
-		if desc.flags&virtqDescFNext == 0 {
-			break
-		}
-		index = desc.next
-	}
-
-	return totalWritten, consumed, nil
 }
 
 func (vc *Console) enqueueInput(data []byte) {
