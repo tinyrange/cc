@@ -321,6 +321,48 @@ func AndRegReg(dst, src Reg) asm.Fragment {
 	})
 }
 
+func OrRegReg(dst, src Reg) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		if err := dst.validate(); err != nil {
+			return err
+		}
+		if err := src.validate(); err != nil {
+			return err
+		}
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		word, err := encodeOrrReg(dst, dst, src)
+		if err != nil {
+			return err
+		}
+		c.emit32(word)
+		return nil
+	})
+}
+
+func XorRegReg(dst, src Reg) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		if err := dst.validate(); err != nil {
+			return err
+		}
+		if err := src.validate(); err != nil {
+			return err
+		}
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		word, err := encodeEorReg(dst, dst, src)
+		if err != nil {
+			return err
+		}
+		c.emit32(word)
+		return nil
+	})
+}
+
 func MovToMemory64(mem Memory, src Reg) asm.Fragment {
 	return storeHelper(mem, src, literal64)
 }

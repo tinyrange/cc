@@ -10,6 +10,7 @@ import (
 
 	"github.com/tinyrange/cc/internal/ir"
 	"github.com/tinyrange/cc/internal/linux/defs"
+	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 )
 
 // TypeKind enumerates the minimal scalar types supported by the rtg front-end.
@@ -330,14 +331,27 @@ func (c *Compiler) lowerAssign(assign *ast.AssignStmt) ([]ir.Fragment, error) {
 	if len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
 		return nil, fmt.Errorf("rtg: only single-value assignments are supported")
 	}
-	ident, ok := assign.Lhs[0].(*ast.Ident)
-	if !ok {
-		return nil, fmt.Errorf("rtg: left-hand side must be identifier")
-	}
 
 	value, valType, err := c.lowerExpr(assign.Rhs[0])
 	if err != nil {
 		return nil, err
+	}
+
+	// Handle index expression on left side: ptr[offset] = value
+	if indexExpr, ok := assign.Lhs[0].(*ast.IndexExpr); ok {
+		if assign.Tok != token.ASSIGN {
+			return nil, fmt.Errorf("rtg: index assignment only supports = operator")
+		}
+		dst, _, err := c.lowerIndex(indexExpr)
+		if err != nil {
+			return nil, err
+		}
+		return []ir.Fragment{ir.Assign(dst, value)}, nil
+	}
+
+	ident, ok := assign.Lhs[0].(*ast.Ident)
+	if !ok {
+		return nil, fmt.Errorf("rtg: left-hand side must be identifier or index expression")
 	}
 
 	switch assign.Tok {
@@ -487,8 +501,26 @@ func (c *Compiler) lowerCallStmt(call *ast.CallExpr) ([]ir.Fragment, error) {
 			return nil, err
 		}
 		return []ir.Fragment{frag}, nil
+	case "store8":
+		frag, err := c.lowerStore(call, 8)
+		if err != nil {
+			return nil, err
+		}
+		return []ir.Fragment{frag}, nil
+	case "store16":
+		frag, err := c.lowerStore(call, 16)
+		if err != nil {
+			return nil, err
+		}
+		return []ir.Fragment{frag}, nil
 	case "store32":
 		frag, err := c.lowerStore(call, 32)
+		if err != nil {
+			return nil, err
+		}
+		return []ir.Fragment{frag}, nil
+	case "store64":
+		frag, err := c.lowerStore(call, 64)
 		if err != nil {
 			return nil, err
 		}
@@ -500,7 +532,11 @@ func (c *Compiler) lowerCallStmt(call *ast.CallExpr) ([]ir.Fragment, error) {
 		}
 		return []ir.Fragment{frag}, nil
 	default:
-		return nil, fmt.Errorf("rtg: unsupported call %q", target.Name)
+		// Allow calling user-defined functions as statements (void calls)
+		if len(call.Args) == 0 {
+			return []ir.Fragment{ir.CallMethod(target.Name)}, nil
+		}
+		return nil, fmt.Errorf("rtg: unsupported call %q (user function calls with arguments not yet supported)", target.Name)
 	}
 }
 
@@ -518,6 +554,8 @@ func (c *Compiler) lowerExpr(expr ast.Expr) (ir.Fragment, Type, error) {
 		return c.lowerExpr(v.X)
 	case *ast.UnaryExpr:
 		return c.lowerUnary(v)
+	case *ast.IndexExpr:
+		return c.lowerIndex(v)
 	default:
 		return nil, Type{}, fmt.Errorf("rtg: unsupported expression %T", expr)
 	}
@@ -555,6 +593,10 @@ func (c *Compiler) lowerIdent(id *ast.Ident) (ir.Fragment, Type, error) {
 	case "false":
 		return ir.Int64(0), Type{Kind: TypeBool}, nil
 	default:
+		// Check for known constants
+		if val, ok := constantValues[id.Name]; ok {
+			return ir.Int64(val), Type{Kind: TypeI64}, nil
+		}
 		return nil, Type{}, fmt.Errorf("rtg: unknown identifier %q", id.Name)
 	}
 }
@@ -573,6 +615,35 @@ func (c *Compiler) lowerUnary(expr *ast.UnaryExpr) (ir.Fragment, Type, error) {
 	default:
 		return nil, Type{}, fmt.Errorf("rtg: unsupported unary operator %s", expr.Op)
 	}
+}
+
+func (c *Compiler) lowerIndex(expr *ast.IndexExpr) (ir.Fragment, Type, error) {
+	// Get pointer base
+	base, ok := expr.X.(*ast.Ident)
+	if !ok {
+		return nil, Type{}, fmt.Errorf("rtg: index expression base must be an identifier")
+	}
+
+	typ, ok := c.scope.lookup(base.Name)
+	if !ok {
+		return nil, Type{}, fmt.Errorf("rtg: unknown identifier %q", base.Name)
+	}
+	if typ.Kind != TypeUintptr && typ.Kind != TypeI64 {
+		return nil, Type{}, fmt.Errorf("rtg: %s is not a pointer", base.Name)
+	}
+
+	// Get index/offset
+	offset, err := c.evalInt(expr.Index)
+	if err != nil {
+		return nil, Type{}, fmt.Errorf("rtg: index must be a constant integer: %w", err)
+	}
+
+	mem := ir.Var(base.Name).Mem()
+	if offset != 0 {
+		mem = mem.WithDisp(ir.Int64(offset)).(ir.MemVar)
+	}
+
+	return mem, Type{Kind: TypeI64}, nil
 }
 
 func (c *Compiler) lowerBinary(expr *ast.BinaryExpr) (ir.Fragment, Type, error) {
@@ -637,8 +708,23 @@ func (c *Compiler) lowerExprCall(call *ast.CallExpr) (ir.Fragment, Type, error) 
 	switch target.Name {
 	case "syscall":
 		return c.lowerSyscall(call)
+	case "load8":
+		return c.lowerLoad(call, 8)
+	case "load16":
+		return c.lowerLoad(call, 16)
+	case "load32":
+		return c.lowerLoad(call, 32)
+	case "load64":
+		return c.lowerLoad(call, 64)
+	case "call":
+		return c.lowerIndirectCall(call)
 	default:
-		return nil, Type{}, fmt.Errorf("rtg: unsupported call %q", target.Name)
+		// Check if it's a call to a user-defined function
+		// User-defined functions are called via ir.CallMethod and return int64
+		if len(call.Args) == 0 {
+			return ir.CallMethod(target.Name), Type{Kind: TypeI64}, nil
+		}
+		return nil, Type{}, fmt.Errorf("rtg: unsupported call %q (user function calls with arguments not yet supported)", target.Name)
 	}
 }
 
@@ -694,6 +780,32 @@ func (c *Compiler) lowerStore(call *ast.CallExpr, width int) (ir.Fragment, error
 	return ir.Assign(mem, value), nil
 }
 
+func (c *Compiler) lowerLoad(call *ast.CallExpr, width int) (ir.Fragment, Type, error) {
+	if len(call.Args) != 2 {
+		return nil, Type{}, fmt.Errorf("rtg: load%d expects (ptr, offset)", width)
+	}
+
+	mem, err := c.lowerMemRef(call.Args[0], call.Args[1], width)
+	if err != nil {
+		return nil, Type{}, err
+	}
+
+	return mem, Type{Kind: TypeI64}, nil
+}
+
+func (c *Compiler) lowerIndirectCall(call *ast.CallExpr) (ir.Fragment, Type, error) {
+	if len(call.Args) != 1 {
+		return nil, Type{}, fmt.Errorf("rtg: call expects (target)")
+	}
+
+	target, _, err := c.lowerExpr(call.Args[0])
+	if err != nil {
+		return nil, Type{}, err
+	}
+
+	return ir.CallFragment{Target: target}, Type{Kind: TypeI64}, nil
+}
+
 func (c *Compiler) lowerMemRef(ptr ast.Expr, offset ast.Expr, width int) (ir.Fragment, error) {
 	base, disp, err := c.extractPointer(ptr, offset)
 	if err != nil {
@@ -706,10 +818,16 @@ func (c *Compiler) lowerMemRef(ptr ast.Expr, offset ast.Expr, width int) (ir.Fra
 	}
 
 	switch width {
+	case 8:
+		return mem.As8(), nil
+	case 16:
+		return mem.As16(), nil
 	case 32:
 		return mem.As32(), nil
+	case 64:
+		return mem, nil
 	default:
-		return nil, fmt.Errorf("rtg: unsupported store width %d", width)
+		return nil, fmt.Errorf("rtg: unsupported memory width %d", width)
 	}
 }
 
@@ -845,6 +963,8 @@ var binaryOps = map[token.Token]ir.OpKind{
 	token.SHL: ir.OpShl,
 	token.SHR: ir.OpShr,
 	token.AND: ir.OpAnd,
+	token.OR:  ir.OpOr,
+	token.XOR: ir.OpXor,
 }
 
 var comparisonOps = map[token.Token]ir.CompareKind{
@@ -857,19 +977,85 @@ var comparisonOps = map[token.Token]ir.CompareKind{
 }
 
 var syscallNames = map[string]defs.Syscall{
-	"SYS_EXIT":        defs.SYS_EXIT,
-	"SYS_EXIT_GROUP":  defs.SYS_EXIT_GROUP,
-	"SYS_WRITE":       defs.SYS_WRITE,
-	"SYS_READ":        defs.SYS_READ,
-	"SYS_OPENAT":      defs.SYS_OPENAT,
-	"SYS_CLOSE":       defs.SYS_CLOSE,
-	"SYS_MMAP":        defs.SYS_MMAP,
-	"SYS_MUNMAP":      defs.SYS_MUNMAP,
-	"SYS_MOUNT":       defs.SYS_MOUNT,
-	"SYS_MKDIRAT":     defs.SYS_MKDIRAT,
-	"SYS_CHROOT":      defs.SYS_CHROOT,
-	"SYS_CHDIR":       defs.SYS_CHDIR,
-	"SYS_SETHOSTNAME": defs.SYS_SETHOSTNAME,
+	"SYS_EXIT":           defs.SYS_EXIT,
+	"SYS_EXIT_GROUP":     defs.SYS_EXIT_GROUP,
+	"SYS_WRITE":          defs.SYS_WRITE,
+	"SYS_READ":           defs.SYS_READ,
+	"SYS_OPENAT":         defs.SYS_OPENAT,
+	"SYS_CLOSE":          defs.SYS_CLOSE,
+	"SYS_MMAP":           defs.SYS_MMAP,
+	"SYS_MUNMAP":         defs.SYS_MUNMAP,
+	"SYS_MOUNT":          defs.SYS_MOUNT,
+	"SYS_MKDIRAT":        defs.SYS_MKDIRAT,
+	"SYS_MKNODAT":        defs.SYS_MKNODAT,
+	"SYS_CHROOT":         defs.SYS_CHROOT,
+	"SYS_CHDIR":          defs.SYS_CHDIR,
+	"SYS_SETHOSTNAME":    defs.SYS_SETHOSTNAME,
+	"SYS_IOCTL":          defs.SYS_IOCTL,
+	"SYS_DUP3":           defs.SYS_DUP3,
+	"SYS_SETSID":         defs.SYS_SETSID,
+	"SYS_REBOOT":         defs.SYS_REBOOT,
+	"SYS_INIT_MODULE":    defs.SYS_INIT_MODULE,
+	"SYS_CLOCK_SETTIME":  defs.SYS_CLOCK_SETTIME,
+	"SYS_CLOCK_GETTIME":  defs.SYS_CLOCK_GETTIME,
+	"SYS_SOCKET":         defs.SYS_SOCKET,
+	"SYS_SENDTO":         defs.SYS_SENDTO,
+	"SYS_RECVFROM":       defs.SYS_RECVFROM,
+	"SYS_EXECVE":         defs.SYS_EXECVE,
+	"SYS_CLONE":          defs.SYS_CLONE,
+	"SYS_WAIT4":          defs.SYS_WAIT4,
+	"SYS_MPROTECT":       defs.SYS_MPROTECT,
+}
+
+var constantValues = map[string]int64{
+	// File descriptor constants
+	"AT_FDCWD": int64(linux.AT_FDCWD),
+
+	// File mode constants
+	"S_IFCHR": int64(linux.S_IFCHR),
+
+	// File open flags
+	"O_RDONLY": int64(linux.O_RDONLY),
+	"O_WRONLY": int64(linux.O_WRONLY),
+	"O_RDWR":   int64(linux.O_RDWR),
+	"O_CREAT":  int64(linux.O_CREAT),
+	"O_TRUNC":  int64(linux.O_TRUNC),
+	"O_SYNC":   int64(linux.O_SYNC),
+
+	// Memory protection flags
+	"PROT_READ":  int64(linux.PROT_READ),
+	"PROT_WRITE": int64(linux.PROT_WRITE),
+	"PROT_EXEC":  int64(linux.PROT_EXEC),
+
+	// Memory map flags
+	"MAP_SHARED":    int64(linux.MAP_SHARED),
+	"MAP_PRIVATE":   int64(linux.MAP_PRIVATE),
+	"MAP_ANONYMOUS": int64(linux.MAP_ANONYMOUS),
+
+	// Error numbers (as negative values for syscall returns)
+	"EBUSY":  -int64(linux.EBUSY),
+	"EPERM":  -int64(linux.EPERM),
+	"EEXIST": -int64(linux.EEXIST),
+	"EPIPE":  -int64(linux.EPIPE),
+
+	// Reboot magic numbers
+	"LINUX_REBOOT_MAGIC1":        int64(linux.LINUX_REBOOT_MAGIC1),
+	"LINUX_REBOOT_MAGIC2":        int64(linux.LINUX_REBOOT_MAGIC2),
+	"LINUX_REBOOT_CMD_RESTART":   int64(linux.LINUX_REBOOT_CMD_RESTART),
+	"LINUX_REBOOT_CMD_POWER_OFF": int64(linux.LINUX_REBOOT_CMD_POWER_OFF),
+
+	// TTY ioctl
+	"TIOCSCTTY": int64(linux.TIOCSCTTY),
+
+	// Clock constants
+	"CLOCK_REALTIME": int64(linux.CLOCK_REALTIME),
+
+	// Network constants
+	"AF_INET":      int64(linux.AF_INET),
+	"AF_NETLINK":   int64(linux.AF_NETLINK),
+	"SOCK_DGRAM":   int64(linux.SOCK_DGRAM),
+	"SOCK_RAW":     int64(linux.SOCK_RAW),
+	"NETLINK_ROUTE": int64(linux.NETLINK_ROUTE),
 }
 
 // FormatErrors joins multiple errors when tests want deterministic output.

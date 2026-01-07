@@ -335,6 +335,8 @@ const (
 	OpShr
 	OpShl
 	OpAnd
+	OpOr
+	OpXor
 )
 
 type OpFragment struct {

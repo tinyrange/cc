@@ -895,6 +895,54 @@ func (c *compiler) evalOp(op ir.OpFragment) (asm.Variable, ir.ValueWidth, error)
 		c.emit(arm64asm.AndRegReg(arm64asm.Reg64(leftReg), arm64asm.Reg64(rightReg)))
 		c.freeReg(rightReg)
 		return leftReg, ir.Width64, nil
+	case ir.OpOr:
+		leftReg, _, err := c.evalValue(op.Left)
+		if err != nil {
+			return 0, 0, err
+		}
+		if imm, ok := toInt64(op.Right); ok {
+			tmp, err := c.allocRegPrefer(arm64asm.X0)
+			if err != nil {
+				c.freeReg(leftReg)
+				return 0, 0, err
+			}
+			c.emit(arm64asm.MovImmediate(arm64asm.Reg64(tmp), imm))
+			c.emit(arm64asm.OrRegReg(arm64asm.Reg64(leftReg), arm64asm.Reg64(tmp)))
+			c.freeReg(tmp)
+			return leftReg, ir.Width64, nil
+		}
+		rightReg, _, err := c.evalValue(op.Right)
+		if err != nil {
+			c.freeReg(leftReg)
+			return 0, 0, err
+		}
+		c.emit(arm64asm.OrRegReg(arm64asm.Reg64(leftReg), arm64asm.Reg64(rightReg)))
+		c.freeReg(rightReg)
+		return leftReg, ir.Width64, nil
+	case ir.OpXor:
+		leftReg, _, err := c.evalValue(op.Left)
+		if err != nil {
+			return 0, 0, err
+		}
+		if imm, ok := toInt64(op.Right); ok {
+			tmp, err := c.allocRegPrefer(arm64asm.X0)
+			if err != nil {
+				c.freeReg(leftReg)
+				return 0, 0, err
+			}
+			c.emit(arm64asm.MovImmediate(arm64asm.Reg64(tmp), imm))
+			c.emit(arm64asm.XorRegReg(arm64asm.Reg64(leftReg), arm64asm.Reg64(tmp)))
+			c.freeReg(tmp)
+			return leftReg, ir.Width64, nil
+		}
+		rightReg, _, err := c.evalValue(op.Right)
+		if err != nil {
+			c.freeReg(leftReg)
+			return 0, 0, err
+		}
+		c.emit(arm64asm.XorRegReg(arm64asm.Reg64(leftReg), arm64asm.Reg64(rightReg)))
+		c.freeReg(rightReg)
+		return leftReg, ir.Width64, nil
 	default:
 		return 0, 0, fmt.Errorf("ir: unsupported op kind %d", op.Kind)
 	}
