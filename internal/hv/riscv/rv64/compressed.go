@@ -158,12 +158,14 @@ func (cpu *CPU) expandQ1(insn uint16, funct3 uint16) (uint32, error) {
 		if rd == 2 {
 			// C.ADDI16SP
 			// nzimm[9|4|6|8:7|5] = insn[12|6|5|4:3|2]
-			imm := ((uint32(insn) >> 2) & 0x1) << 5
-			imm |= ((uint32(insn) >> 3) & 0x3) << 7
-			imm |= ((uint32(insn) >> 5) & 0x1) << 6
-			imm |= ((uint32(insn) >> 6) & 0x1) << 4
+			// The immediate is a 10-bit signed value with bits 3:0 implicitly 0
+			imm := ((uint32(insn) >> 2) & 0x1) << 5  // nzimm[5]
+			imm |= ((uint32(insn) >> 3) & 0x3) << 7  // nzimm[8:7]
+			imm |= ((uint32(insn) >> 5) & 0x1) << 6  // nzimm[6]
+			imm |= ((uint32(insn) >> 6) & 0x1) << 4  // nzimm[4]
 			if (insn>>12)&1 != 0 {
-				imm |= 0xfffffc00 // Sign extend from bit 9
+				imm |= (1 << 9)     // nzimm[9] - the sign bit itself
+				imm |= 0xfffffc00  // Sign extend from bit 9
 			}
 			if imm == 0 {
 				return 0, Exception(CauseIllegalInsn, uint64(insn))

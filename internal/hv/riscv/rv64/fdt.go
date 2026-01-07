@@ -139,8 +139,19 @@ func (f *FDTBuilder) AddPropertyBytes(name string, data []byte) {
 	}
 }
 
+// MemoryReservation represents a reserved memory region
+type MemoryReservation struct {
+	Address uint64
+	Size    uint64
+}
+
 // Build finalizes and returns the FDT blob
 func (f *FDTBuilder) Build() []byte {
+	return f.BuildWithReservations(nil)
+}
+
+// BuildWithReservations finalizes and returns the FDT blob with memory reservations
+func (f *FDTBuilder) BuildWithReservations(reservations []MemoryReservation) []byte {
 	f.putU32(FDTEnd)
 
 	// Align strings
@@ -148,10 +159,14 @@ func (f *FDTBuilder) Build() []byte {
 		f.strings.WriteByte(0)
 	}
 
+	// Calculate memory reservation map size (each entry is 16 bytes: 8 for addr, 8 for size)
+	// Plus one empty terminating entry
+	numReservations := len(reservations)
+	memRsvmapSize := uint32((numReservations + 1) * 16)
+
 	// Calculate offsets
 	headerSize := uint32(40)
 	memRsvmapOff := headerSize
-	memRsvmapSize := uint32(16) // One empty entry
 	structOff := memRsvmapOff + memRsvmapSize
 	structSize := uint32(f.structure.Len())
 	stringsOff := structOff + structSize
@@ -177,13 +192,22 @@ func (f *FDTBuilder) Build() []byte {
 	hdr(stringsSize)
 	hdr(structSize)
 
-	// Build memory reservation map (empty)
-	var memRsvmap [16]byte
+	// Build memory reservation map
+	var memRsvmap bytes.Buffer
+	for _, rsv := range reservations {
+		// Address (big-endian 64-bit)
+		binary.Write(&memRsvmap, binary.BigEndian, rsv.Address)
+		// Size (big-endian 64-bit)
+		binary.Write(&memRsvmap, binary.BigEndian, rsv.Size)
+	}
+	// Terminating empty entry
+	binary.Write(&memRsvmap, binary.BigEndian, uint64(0))
+	binary.Write(&memRsvmap, binary.BigEndian, uint64(0))
 
 	// Combine all parts
 	result := make([]byte, totalSize)
 	copy(result[0:], header.Bytes())
-	copy(result[memRsvmapOff:], memRsvmap[:])
+	copy(result[memRsvmapOff:], memRsvmap.Bytes())
 	copy(result[structOff:], f.structure.Bytes())
 	copy(result[stringsOff:], f.strings.Bytes())
 
@@ -192,6 +216,11 @@ func (f *FDTBuilder) Build() []byte {
 
 // GenerateFDT generates an FDT for the machine
 func GenerateFDT(m *Machine, cmdline string) []byte {
+	return GenerateFDTWithReservations(m, cmdline, nil)
+}
+
+// GenerateFDTWithReservations generates an FDT with explicit memory reservations
+func GenerateFDTWithReservations(m *Machine, cmdline string, reservations []MemoryReservation) []byte {
 	ramSize := m.MemorySize()
 
 	f := NewFDTBuilder()
@@ -221,7 +250,7 @@ func GenerateFDT(m *Machine, cmdline string) []byte {
 	f.AddPropertyU32("reg", 0)
 	f.AddPropertyString("status", "okay")
 	f.AddPropertyString("compatible", "riscv")
-	f.AddPropertyString("riscv,isa", "rv64imafdc")
+	f.AddPropertyString("riscv,isa", "rv64imafdc_zicsr_zifencei")
 	f.AddPropertyString("mmu-type", "riscv,sv39")
 
 	// Interrupt controller
@@ -290,5 +319,5 @@ func GenerateFDT(m *Machine, cmdline string) []byte {
 	f.EndNode() // soc
 	f.EndNode() // root
 
-	return f.Build()
+	return f.BuildWithReservations(reservations)
 }
