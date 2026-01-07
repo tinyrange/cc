@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"image"
+	"image/color"
 	"image/draw"
 	"io"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/tinyrange/cc/internal/gowin/graphics"
 	"github.com/tinyrange/cc/internal/gowin/text"
 	"github.com/tinyrange/cc/internal/gowin/window"
+	"github.com/tinyrange/cc/internal/timeslice"
 )
 
 var ErrWindowClosed = errors.New("window closed by user")
@@ -36,6 +38,12 @@ type View struct {
 
 	emu *vt.SafeEmulator
 
+	// Grid caches cell state for incremental rendering.
+	grid *Grid
+
+	// bgBuffer manages batched background rendering.
+	bgBuffer *BackgroundBuffer
+
 	// Insets reserve window space that the terminal renderer should not draw into
 	// (e.g. an app-level top bar).
 	insetLeft   float32
@@ -48,7 +56,7 @@ type View struct {
 	inW *io.PipeWriter
 
 	// inputQ decouples VT input generation (term.Read) from the downstream pipe
-	// write to avoid backpressure making keystrokes appear to “drop”.
+	// write to avoid backpressure making keystrokes appear to "drop".
 	inputQ chan []byte
 
 	closeOnce sync.Once
@@ -56,6 +64,15 @@ type View struct {
 
 	lastCols int
 	lastRows int
+
+	// Rendering layout cached from last frame.
+	cellW, cellH     float32
+	originX, originY float32
+
+	// Track layout changes for buffer rebuilding.
+	lastCellW, lastCellH     float32
+	lastOriginX, lastOriginY float32
+	lastPadX, lastPadY       float32
 }
 
 // Terminal is a convenience wrapper that owns its own window and renders a View
@@ -94,6 +111,12 @@ func NewView(win graphics.Window) (*View, error) {
 		return nil, err
 	}
 
+	// Create background buffer for batched rendering.
+	bgBuffer, err := NewBackgroundBuffer(win, tex, 80, 40)
+	if err != nil {
+		return nil, err
+	}
+
 	emu := vt.NewSafeEmulator(80, 40)
 	disableVTQueriesThatBreakGuests(emu)
 
@@ -104,6 +127,8 @@ func NewView(win graphics.Window) (*View, error) {
 		tex:      tex,
 		txt:      txt,
 		emu:      emu,
+		grid:     NewGrid(80, 40),
+		bgBuffer: bgBuffer,
 		inR:      inR,
 		inW:      inW,
 		inputQ:   make(chan []byte, 1024),
@@ -117,6 +142,14 @@ func NewView(win graphics.Window) (*View, error) {
 	go v.drainQueueToPipe()
 
 	return v, nil
+}
+
+// Grid returns the internal grid for testing and introspection.
+func (v *View) Grid() *Grid {
+	if v == nil {
+		return nil
+	}
+	return v.grid
 }
 
 // SetInsets configures pixel insets for rendering and sizing the terminal grid.
@@ -310,12 +343,27 @@ func (v *View) drainQueueToPipe() {
 	}
 }
 
+var (
+	tsViewStepBegin        = timeslice.RegisterKind("view_step_begin", 0)
+	tsViewStepResize       = timeslice.RegisterKind("view_step_resize", 0)
+	tsViewStepSendText     = timeslice.RegisterKind("view_step_send_text", 0)
+	tsViewStepSendKey      = timeslice.RegisterKind("view_step_send_key", 0)
+	tsViewStepTextInput    = timeslice.RegisterKind("view_step_text_input", 0)
+	tsViewStepOnFrame      = timeslice.RegisterKind("view_step_on_frame", 0)
+	tsViewStepSyncGrid     = timeslice.RegisterKind("view_step_sync_grid", 0)
+	tsViewStepUpdateCursor = timeslice.RegisterKind("view_step_update_cursor", 0)
+	tsViewStepRenderGrid   = timeslice.RegisterKind("view_step_render_grid", 0)
+	tsViewStepClearDirty   = timeslice.RegisterKind("view_step_clear_dirty", 0)
+)
+
 // Step processes one frame of input and renders the terminal cells into the
 // provided graphics.Frame. This allows embedding the terminal view inside
 // an existing window loop (e.g. CCApp).
 func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 	width, height := f.WindowSize()
 	v.txt.SetViewport(int32(width), int32(height))
+
+	stats := timeslice.NewState()
 
 	const (
 		padX     = float32(10)
@@ -331,6 +379,10 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 	if cellH <= 0 {
 		cellH = 16
 	}
+
+	// Cache layout parameters.
+	v.cellW = cellW
+	v.cellH = cellH
 
 	insetL := v.insetLeft
 	insetT := v.insetTop
@@ -355,13 +407,26 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 		rows = 1
 	}
 
+	stats.Record(tsViewStepBegin)
+
+	// Handle resize.
+	resized := false
 	if cols != v.emu.Width() || rows != v.emu.Height() {
 		v.emu.Resize(cols, rows)
+		v.grid.Resize(cols, rows)
+		v.bgBuffer.Resize(cols, rows)
 		v.lastCols, v.lastRows = cols, rows
+		resized = true
 		if hooks.OnResize != nil {
 			hooks.OnResize(cols, rows)
 		}
+
+		stats.Record(tsViewStepResize)
 	}
+
+	// Cache origin.
+	v.originX = insetL
+	v.originY = insetT
 
 	toVTMods := func(m window.KeyMods) vt.KeyMod {
 		var mod vt.KeyMod
@@ -401,6 +466,8 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 				sawRawText = true
 				v.emu.SendText(txt)
 			}
+
+			stats.Record(tsViewStepSendText)
 
 		case window.InputEventKeyDown:
 			mod := toVTMods(ev.Mods)
@@ -451,6 +518,8 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 			case window.KeyInsert:
 				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyInsert, Mod: mod})
 			}
+
+			stats.Record(tsViewStepSendKey)
 		}
 	}
 
@@ -475,6 +544,8 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 			if txt != "" {
 				v.emu.SendText(txt)
 			}
+
+			stats.Record(tsViewStepTextInput)
 		}
 	}
 
@@ -482,6 +553,8 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 		if err := hooks.OnFrame(); err != nil {
 			return err
 		}
+
+		stats.Record(tsViewStepOnFrame)
 	}
 
 	// Clear window to terminal background.
@@ -490,11 +563,42 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 	bgDefault := v.emu.BackgroundColor()
 	fgDefault := v.emu.ForegroundColor()
 
-	// Render cells.
-	originX := insetL
-	originY := insetT
-	for y := 0; y < v.emu.Height(); y++ {
-		for x := 0; x < v.emu.Width(); {
+	// Sync grid from VT emulator and track changes.
+	v.syncGridFromEmulator(bgDefault, fgDefault, resized)
+
+	stats.Record(tsViewStepSyncGrid)
+
+	// Update cursor position in grid (marks old/new positions dirty).
+	cur := v.emu.CursorPosition()
+	v.grid.UpdateCursor(cur.X, cur.Y)
+
+	stats.Record(tsViewStepUpdateCursor)
+
+	// Render cells using the grid.
+	v.renderGrid(stats, f, bgDefault, fgDefault, padX, padY, fontSize)
+
+	stats.Record(tsViewStepRenderGrid)
+
+	// Clear dirty flags after rendering.
+	v.grid.ClearDirty()
+
+	stats.Record(tsViewStepClearDirty)
+
+	return nil
+}
+
+// syncGridFromEmulator copies cell state from VT emulator to grid,
+// marking changed cells as dirty.
+func (v *View) syncGridFromEmulator(bgDefault, fgDefault color.Color, forceFullSync bool) {
+	cols, rows := v.grid.Size()
+
+	// If forced (e.g., after resize), mark all dirty.
+	if forceFullSync {
+		v.grid.MarkAllDirty()
+	}
+
+	for y := 0; y < rows; y++ {
+		for x := 0; x < cols; {
 			cell := v.emu.CellAt(x, y)
 			w := 1
 
@@ -518,35 +622,104 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 			}
 
 			// Reverse video.
-			if attrs&uint8(1<<5) != 0 { // uv.AttrReverse
+			if attrs&uint8(1<<5) != 0 {
 				fg, bg = bg, fg
 			}
 
-			x0 := originX + padX + float32(x)*cellW
-			y0 := originY + padY + float32(y)*cellH
+			// Update grid cell (this marks dirty if changed).
+			v.grid.SetCell(x, y, content, w, fg, bg, attrs)
 
-			if bg != nil && bg != bgDefault {
-				f.RenderQuad(x0, y0, float32(w)*cellW, cellH, v.tex, bg)
-			}
-
-			// Avoid drawing blank spaces.
-			if content != "" && content != " " && fg != nil {
-				// Heuristic baseline: place text near the bottom of the cell.
-				v.txt.RenderText(content, x0, y0+cellH-2, fontSize, fg)
-			}
 			x += w
 		}
 	}
+}
 
-	// Cursor.
-	cur := v.emu.CursorPosition()
-	if cur.X >= 0 && cur.Y >= 0 && cur.X < v.emu.Width() && cur.Y < v.emu.Height() {
-		x0 := originX + padX + float32(cur.X)*cellW
-		y0 := originY + padY + float32(cur.Y)*cellH
+var (
+	tsViewStepRenderGridBgUpdate = timeslice.RegisterKind("view_step_render_grid_bg_update", 0)
+	tsViewStepRenderGridBgRender = timeslice.RegisterKind("view_step_render_grid_bg_render", 0)
+	tsViewStepRenderGridText     = timeslice.RegisterKind("view_step_render_grid_text", 0)
+	tsViewStepRenderGridCursor   = timeslice.RegisterKind("view_step_render_grid_cursor", 0)
+)
+
+// renderGrid renders all cells using batched rendering.
+// Backgrounds are rendered in 1 draw call, text in 1 draw call, cursor in 1 draw call.
+func (v *View) renderGrid(stats *timeslice.Recorder, f graphics.Frame, bgDefault, fgDefault color.Color, padX, padY, fontSize float32) {
+	cols, rows := v.grid.Size()
+	originX := v.originX
+	originY := v.originY
+	cellW := v.cellW
+	cellH := v.cellH
+
+	// Check if layout changed - requires full buffer rebuild.
+	layoutChanged := cellW != v.lastCellW || cellH != v.lastCellH ||
+		originX != v.lastOriginX || originY != v.lastOriginY ||
+		padX != v.lastPadX || padY != v.lastPadY
+
+	// Check if full rebuild is needed (resize, first frame, or layout change).
+	needsFullRebuild := v.bgBuffer.NeedsFullRebuild() || layoutChanged
+
+	if layoutChanged {
+		v.bgBuffer.SetLayout(originX, originY, padX, padY, cellW, cellH)
+		v.lastCellW, v.lastCellH = cellW, cellH
+		v.lastOriginX, v.lastOriginY = originX, originY
+		v.lastPadX, v.lastPadY = padX, padY
+	}
+
+	if needsFullRebuild {
+		// Full rebuild when layout changes, after resize, or on first frame.
+		v.bgBuffer.UpdateAll(v.grid, bgDefault)
+		v.bgBuffer.ClearFullRebuild()
+	} else {
+		// Incremental update for dirty cells only.
+		v.bgBuffer.UpdateDirty(v.grid, bgDefault)
+	}
+
+	stats.Record(tsViewStepRenderGridBgUpdate)
+
+	// Render all backgrounds in one draw call.
+	v.bgBuffer.Render(f)
+
+	stats.Record(tsViewStepRenderGridBgRender)
+
+	// Render all text in one batched draw call.
+	v.txt.BeginBatch()
+	for y := range rows {
+		for x := 0; x < cols; {
+			cell := v.grid.CellAt(x, y)
+			if cell == nil {
+				x++
+				continue
+			}
+
+			w := max(cell.Width, 1)
+
+			// Render text if not blank.
+			if cell.Content != "" && cell.Content != " " {
+				x0 := originX + padX + float32(x)*cellW
+				y0 := originY + padY + float32(y)*cellH
+				fg := cell.Fg
+				if fg == nil {
+					fg = fgDefault
+				}
+				v.txt.AddText(cell.Content, x0, y0+cellH-2, float64(fontSize), fg)
+			}
+
+			x += w
+		}
+	}
+	v.txt.EndBatch()
+
+	stats.Record(tsViewStepRenderGridText)
+
+	// Render cursor (1 draw call).
+	curX, curY := v.grid.CursorPosition()
+	if curX >= 0 && curY >= 0 && curX < cols && curY < rows {
+		x0 := originX + padX + float32(curX)*cellW
+		y0 := originY + padY + float32(curY)*cellH
 		f.RenderQuad(x0, y0, cellW, cellH, v.tex, v.emu.CursorColor())
 	}
 
-	return nil
+	stats.Record(tsViewStepRenderGridCursor)
 }
 
 func (t *Terminal) Run(ctx context.Context, hooks Hooks) error {

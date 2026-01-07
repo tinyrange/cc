@@ -61,6 +61,8 @@ type Window interface {
 	NewTexture(image.Image) (Texture, error)
 	// NewMesh uploads a set of vertices/indices to the GPU for repeated rendering.
 	NewMesh(vertices []Vertex, indices []uint32, tex Texture) (Mesh, error)
+	// NewDynamicMesh creates a mesh that supports efficient partial vertex updates.
+	NewDynamicMesh(maxVertices, maxIndices int, tex Texture) (DynamicMesh, error)
 
 	SetClear(enabled bool)
 	SetClearColor(color color.Color)
@@ -73,6 +75,21 @@ type Window interface {
 
 	// GetShaderProgram returns the graphics shader program ID for state restoration.
 	GetShaderProgram() uint32
+}
+
+// DynamicMesh supports efficient partial vertex updates via BufferSubData.
+type DynamicMesh interface {
+	Mesh
+	// UpdateVertices updates a range of vertices starting at the given offset.
+	UpdateVertices(offset int, vertices []Vertex)
+	// UpdateAllVertices updates the entire vertex buffer.
+	UpdateAllVertices(vertices []Vertex)
+	// UpdateIndices updates the index buffer.
+	UpdateIndices(indices []uint32)
+	// Resize changes the buffer capacity (recreates GPU buffers).
+	Resize(vertexCount, indexCount int)
+	// VertexCount returns the current vertex capacity.
+	VertexCount() int
 }
 
 // Each platform implements a New() method to return a Window.
