@@ -16,6 +16,7 @@ import (
 	"github.com/tinyrange/cc/internal/gowin/graphics"
 	"github.com/tinyrange/cc/internal/gowin/text"
 	"github.com/tinyrange/cc/internal/gowin/window"
+	"github.com/tinyrange/cc/internal/timeslice"
 )
 
 var ErrWindowClosed = errors.New("window closed by user")
@@ -327,12 +328,27 @@ func (v *View) drainQueueToPipe() {
 	}
 }
 
+var (
+	tsViewStepBegin        = timeslice.RegisterKind("view_step_begin", 0)
+	tsViewStepResize       = timeslice.RegisterKind("view_step_resize", 0)
+	tsViewStepSendText     = timeslice.RegisterKind("view_step_send_text", 0)
+	tsViewStepSendKey      = timeslice.RegisterKind("view_step_send_key", 0)
+	tsViewStepTextInput    = timeslice.RegisterKind("view_step_text_input", 0)
+	tsViewStepOnFrame      = timeslice.RegisterKind("view_step_on_frame", 0)
+	tsViewStepSyncGrid     = timeslice.RegisterKind("view_step_sync_grid", 0)
+	tsViewStepUpdateCursor = timeslice.RegisterKind("view_step_update_cursor", 0)
+	tsViewStepRenderGrid   = timeslice.RegisterKind("view_step_render_grid", 0)
+	tsViewStepClearDirty   = timeslice.RegisterKind("view_step_clear_dirty", 0)
+)
+
 // Step processes one frame of input and renders the terminal cells into the
 // provided graphics.Frame. This allows embedding the terminal view inside
 // an existing window loop (e.g. CCApp).
 func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 	width, height := f.WindowSize()
 	v.txt.SetViewport(int32(width), int32(height))
+
+	stats := timeslice.NewState()
 
 	const (
 		padX     = float32(10)
@@ -376,6 +392,8 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 		rows = 1
 	}
 
+	stats.Record(tsViewStepBegin)
+
 	// Handle resize.
 	resized := false
 	if cols != v.emu.Width() || rows != v.emu.Height() {
@@ -386,6 +404,8 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 		if hooks.OnResize != nil {
 			hooks.OnResize(cols, rows)
 		}
+
+		stats.Record(tsViewStepResize)
 	}
 
 	// Cache origin.
@@ -430,6 +450,8 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 				sawRawText = true
 				v.emu.SendText(txt)
 			}
+
+			stats.Record(tsViewStepSendText)
 
 		case window.InputEventKeyDown:
 			mod := toVTMods(ev.Mods)
@@ -480,6 +502,8 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 			case window.KeyInsert:
 				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyInsert, Mod: mod})
 			}
+
+			stats.Record(tsViewStepSendKey)
 		}
 	}
 
@@ -504,6 +528,8 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 			if txt != "" {
 				v.emu.SendText(txt)
 			}
+
+			stats.Record(tsViewStepTextInput)
 		}
 	}
 
@@ -511,6 +537,8 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 		if err := hooks.OnFrame(); err != nil {
 			return err
 		}
+
+		stats.Record(tsViewStepOnFrame)
 	}
 
 	// Clear window to terminal background.
@@ -522,15 +550,23 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 	// Sync grid from VT emulator and track changes.
 	v.syncGridFromEmulator(bgDefault, fgDefault, resized)
 
+	stats.Record(tsViewStepSyncGrid)
+
 	// Update cursor position in grid (marks old/new positions dirty).
 	cur := v.emu.CursorPosition()
 	v.grid.UpdateCursor(cur.X, cur.Y)
 
+	stats.Record(tsViewStepUpdateCursor)
+
 	// Render cells using the grid.
-	v.renderGrid(f, bgDefault, fgDefault, padX, padY, fontSize)
+	v.renderGrid(stats, f, bgDefault, fgDefault, padX, padY, fontSize)
+
+	stats.Record(tsViewStepRenderGrid)
 
 	// Clear dirty flags after rendering.
 	v.grid.ClearDirty()
+
+	stats.Record(tsViewStepClearDirty)
 
 	return nil
 }
@@ -582,28 +618,32 @@ func (v *View) syncGridFromEmulator(bgDefault, fgDefault color.Color, forceFullS
 	}
 }
 
+var (
+	tsViewStepRenderGridCellBegin = timeslice.RegisterKind("view_step_render_grid_cell_begin", 0)
+	tsViewStepRenderGridCellEnd   = timeslice.RegisterKind("view_step_render_grid_cell_end", 0)
+)
+
 // renderGrid renders all cells from the grid.
 // For now, renders all cells; future optimization can render only dirty cells
 // once we have proper background mesh batching.
-func (v *View) renderGrid(f graphics.Frame, bgDefault, fgDefault color.Color, padX, padY, fontSize float32) {
+func (v *View) renderGrid(stats *timeslice.Recorder, f graphics.Frame, bgDefault, fgDefault color.Color, padX, padY, fontSize float32) {
 	cols, rows := v.grid.Size()
 	originX := v.originX
 	originY := v.originY
 	cellW := v.cellW
 	cellH := v.cellH
 
-	for y := 0; y < rows; y++ {
+	for y := range rows {
 		for x := 0; x < cols; {
+			stats.Record(tsViewStepRenderGridCellBegin)
+
 			cell := v.grid.CellAt(x, y)
 			if cell == nil {
 				x++
 				continue
 			}
 
-			w := cell.Width
-			if w < 1 {
-				w = 1
-			}
+			w := max(cell.Width, 1)
 
 			x0 := originX + padX + float32(x)*cellW
 			y0 := originY + padY + float32(y)*cellH
@@ -619,6 +659,8 @@ func (v *View) renderGrid(f graphics.Frame, bgDefault, fgDefault color.Color, pa
 			}
 
 			x += w
+
+			stats.Record(tsViewStepRenderGridCellEnd)
 		}
 	}
 
