@@ -207,7 +207,9 @@ func extractCallback(thread *starlark.Thread, v starlark.Value) func() {
 			if ctx := thread.Local("ctx"); ctx != nil {
 				newThread.SetLocal("ctx", ctx)
 			}
-			starlark.Call(newThread, fn, nil, nil)
+			if _, err := starlark.Call(newThread, fn, nil, nil); err != nil {
+				fmt.Println("[starui callback error]", err)
+			}
 		}
 	}
 	return nil
