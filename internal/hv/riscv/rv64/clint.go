@@ -105,4 +105,21 @@ func (c *CLINT) Tick() {
 	}
 }
 
+// SetTimecmp sets the timer compare value for a hart
+func (c *CLINT) SetTimecmp(hart uint64, value uint64) {
+	if hart != 0 {
+		return // Only hart 0 supported
+	}
+	c.mtimecmp = value
+	// Clear timer interrupt if new compare > current time
+	if c.mtimecmp > c.getMtime() {
+		c.cpu.Mip &^= MipMTIP
+	}
+}
+
+// GetMtime returns the current timer value
+func (c *CLINT) GetMtime() uint64 {
+	return c.getMtime()
+}
+
 var _ Device = (*CLINT)(nil)

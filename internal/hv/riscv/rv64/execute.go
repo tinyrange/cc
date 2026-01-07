@@ -599,6 +599,10 @@ func (cpu *CPU) execSystem(insn uint32) error {
 		// ECALL, EBREAK, etc.
 		switch insn {
 		case 0x00000073: // ECALL
+			// Debug: ecall being executed
+			if cpu.DebugLog != nil {
+				fmt.Fprintf(cpu.DebugLog, "ECALL at PC=0x%x, Priv=%d, a7=0x%x\n", cpu.PC, cpu.Priv, cpu.X[17])
+			}
 			return cpu.handleEcall()
 		case 0x00100073: // EBREAK
 			return Exception(CauseBreakpoint, cpu.PC)

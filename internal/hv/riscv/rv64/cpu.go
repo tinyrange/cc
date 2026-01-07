@@ -4,6 +4,7 @@ package rv64
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 )
 
 // Memory layout constants
@@ -200,6 +201,9 @@ type CPU struct {
 
 	// WFI flag - set when waiting for interrupt
 	WFI bool
+
+	// Debug log writer
+	DebugLog io.Writer
 }
 
 // NewCPU creates a new CPU with default state

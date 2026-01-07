@@ -221,8 +221,8 @@ func GenerateFDT(m *Machine, cmdline string) []byte {
 	f.AddPropertyU32("reg", 0)
 	f.AddPropertyString("status", "okay")
 	f.AddPropertyString("compatible", "riscv")
-	f.AddPropertyString("riscv,isa", "rv64imafdc_zicsr_zifencei")
-	f.AddPropertyString("mmu-type", "riscv,sv48")
+	f.AddPropertyString("riscv,isa", "rv64imafdc")
+	f.AddPropertyString("mmu-type", "riscv,sv39")
 
 	// Interrupt controller
 	f.BeginNode("interrupt-controller")

@@ -216,6 +216,43 @@ func TestMultiplyDivide(t *testing.T) {
 	}
 }
 
+func TestSBICall(t *testing.T) {
+	output := &bytes.Buffer{}
+	m := NewMachine(4*1024, output, nil)
+	m.SetupForLinux(0, 0, RAMBase)
+
+	// Write a small program that makes an SBI putchar call
+	// a7 = 1 (legacy putchar), a0 = 'H' (72)
+	code := []uint32{
+		0x04800513, // li a0, 72 ('H')
+		0x00100893, // li a7, 1  (SBI_LEGACY_PUTCHAR)
+		0x00000073, // ecall
+		0x04900513, // li a0, 73 ('I')
+		0x00000073, // ecall
+		0x10500073, // wfi
+	}
+
+	for i, insn := range code {
+		m.Bus.Write32(RAMBase+uint64(i*4), insn)
+	}
+
+	// Run a few steps
+	for i := 0; i < 20; i++ {
+		if err := m.Step(); err != nil {
+			if err == ErrHalt {
+				break
+			}
+			t.Logf("Step %d error: %v", i, err)
+		}
+		t.Logf("Step %d: PC=0x%x, a0=0x%x, a7=0x%x", i, m.CPU.PC, m.CPU.X[10], m.CPU.X[17])
+	}
+
+	t.Logf("Output: %q", output.String())
+	if output.String() != "HI" {
+		t.Errorf("Expected 'HI', got %q", output.String())
+	}
+}
+
 func TestCompressedInstructions(t *testing.T) {
 	output := &bytes.Buffer{}
 	m := NewMachine(1024*1024, output, nil)

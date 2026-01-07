@@ -153,6 +153,17 @@ func (m *Machine) Step() error {
 	if err != nil {
 		if exc, ok := err.(ExceptionError); ok {
 			m.CPU.PC = oldPC
+
+			// Check for ecall from S-mode - handle as SBI call
+			if exc.Cause == CauseEcallFromS {
+				if err := m.HandleSBI(); err != nil {
+					return err
+				}
+				// Advance PC past ecall instruction
+				m.CPU.PC += 4
+				return nil
+			}
+
 			m.CPU.HandleTrap(exc.Cause, exc.Tval)
 			return nil
 		}
@@ -260,7 +271,6 @@ func (m *Machine) execLoadMMU(insn uint32) error {
 	}
 
 	m.CPU.WriteReg(rd(insn), val)
-	m.CPU.PC += 4
 	return nil
 }
 
@@ -303,7 +313,6 @@ func (m *Machine) execStoreMMU(insn uint32) error {
 		return Exception(CauseStoreAccessFault, vaddr)
 	}
 
-	m.CPU.PC += 4
 	return nil
 }
 
@@ -395,7 +404,6 @@ func (m *Machine) execLoadFPMMU(insn uint32) error {
 		return Exception(CauseIllegalInsn, uint64(insn))
 	}
 
-	m.CPU.PC += 4
 	return nil
 }
 
@@ -430,7 +438,6 @@ func (m *Machine) execStoreFPMMU(insn uint32) error {
 		return Exception(CauseIllegalInsn, uint64(insn))
 	}
 
-	m.CPU.PC += 4
 	return nil
 }
 
