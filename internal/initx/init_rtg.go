@@ -211,6 +211,10 @@ loop:
 		goto reloc_loop
 
 	reloc_done:
+		// Instruction synchronization barrier - required on ARM64 after modifying
+		// code in memory before executing it. Without this, the instruction cache
+		// may contain stale data and cause SIGILL.
+		isb()
 
 		// call the payload
 		payloadResult := call(anonMem)
@@ -253,23 +257,23 @@ func BuildFromRTG(cfg BuilderConfig) (*ir.Program, error) {
 
 	// Format the RTG source with constants
 	source := fmt.Sprintf(rtgInitSource,
-		devMemMode,                      // devMemMode
-		int64(devMemDeviceID),           // devMemDeviceID
-		rebootCmd,                       // reboot after devtmpfs failure
-		rebootCmd,                       // reboot after console failure
-		rebootCmd,                       // reboot after setsid failure
-		rebootCmd,                       // reboot after tty failure
-		rebootCmd,                       // reboot after /dev/mem failure
-		rebootCmd,                       // reboot after mailbox map failure
-		rebootCmd,                       // reboot after config map failure
-		rebootCmd,                       // reboot after anon map failure
-		configTimeSecField,              // time sec offset in config
-		configTimeNsecField,             // time nsec offset in config
-		configHeaderMagicValue,          // expected magic value
-		configHeaderSize,                // config header size
-		configHeaderSize,                // reloc ptr base offset
-		mailboxRunResultDetailOffset,    // mailbox result offset
-		rebootCmd,                       // reboot on bad magic
+		devMemMode,                   // devMemMode
+		int64(devMemDeviceID),        // devMemDeviceID
+		rebootCmd,                    // reboot after devtmpfs failure
+		rebootCmd,                    // reboot after console failure
+		rebootCmd,                    // reboot after setsid failure
+		rebootCmd,                    // reboot after tty failure
+		rebootCmd,                    // reboot after /dev/mem failure
+		rebootCmd,                    // reboot after mailbox map failure
+		rebootCmd,                    // reboot after config map failure
+		rebootCmd,                    // reboot after anon map failure
+		configTimeSecField,           // time sec offset in config
+		configTimeNsecField,          // time nsec offset in config
+		configHeaderMagicValue,       // expected magic value
+		configHeaderSize,             // config header size
+		configHeaderSize,             // reloc ptr base offset
+		mailboxRunResultDetailOffset, // mailbox result offset
+		rebootCmd,                    // reboot on bad magic
 	)
 
 	// Compile the RTG source

@@ -193,6 +193,9 @@ func (c *compiler) compileFragment(f ir.Fragment) error {
 		return c.compilePrintf(frag)
 	case ir.CallFragment:
 		return c.compileCall(frag)
+	case ir.ISBFragment:
+		// x86-64 has coherent instruction caches, no barrier needed
+		return nil
 	case ir.ConstantBytesFragment:
 		c.emit(amd64.LoadConstantBytes(frag.Target, frag.Data))
 		return nil

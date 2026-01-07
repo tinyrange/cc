@@ -567,6 +567,12 @@ func (c *Compiler) lowerCallStmt(call *ast.CallExpr) ([]ir.Fragment, error) {
 			return nil, err
 		}
 		return []ir.Fragment{frag}, nil
+	case "isb":
+		// Instruction Synchronization Barrier - required on ARM64 after modifying code
+		if len(call.Args) != 0 {
+			return nil, fmt.Errorf("rtg: isb() takes no arguments")
+		}
+		return []ir.Fragment{ir.ISB()}, nil
 	default:
 		// Allow calling user-defined functions as statements (void calls)
 		if len(call.Args) == 0 {
@@ -1087,6 +1093,7 @@ var syscallNames = map[string]defs.Syscall{
 	"SYS_CLONE":          defs.SYS_CLONE,
 	"SYS_WAIT4":          defs.SYS_WAIT4,
 	"SYS_MPROTECT":       defs.SYS_MPROTECT,
+	"SYS_GETPID":         defs.SYS_GETPID,
 }
 
 var constantValues = map[string]int64{

@@ -324,6 +324,16 @@ func DeclareLabel(label Label, block Block) Fragment {
 	return LabelFragment{Label: label, Block: block}
 }
 
+// ISBFragment represents an Instruction Synchronization Barrier.
+// On ARM64, this is required after modifying code in memory before executing it.
+// On x86-64, this is a no-op since x86 has coherent instruction caches.
+type ISBFragment struct{}
+
+// ISB returns an instruction synchronization barrier fragment.
+func ISB() Fragment {
+	return ISBFragment{}
+}
+
 type OpKind int
 
 const (

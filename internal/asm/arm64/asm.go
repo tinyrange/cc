@@ -538,6 +538,34 @@ func Ret() asm.Fragment {
 	})
 }
 
+// ISB emits an Instruction Synchronization Barrier.
+// This is required after modifying code in memory before executing it.
+func ISB() asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		// ISB SY: 0xD5033FDF
+		c.emit32(0xD5033FDF)
+		return nil
+	})
+}
+
+// DSB emits a Data Synchronization Barrier (full system).
+// This ensures all memory operations complete before continuing.
+func DSB() asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		// DSB SY: 0xD5033F9F
+		c.emit32(0xD5033F9F)
+		return nil
+	})
+}
+
 func Syscall(number defs.Syscall, args ...asm.Value) asm.Fragment {
 	return &syscallFragment{number: number, args: args}
 }

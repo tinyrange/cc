@@ -211,6 +211,10 @@ func (c *compiler) compileFragment(f ir.Fragment) error {
 		return c.compilePrintf(frag)
 	case ir.CallFragment:
 		return c.compileCall(frag)
+	case ir.ISBFragment:
+		c.emit(arm64asm.DSB())
+		c.emit(arm64asm.ISB())
+		return nil
 	case ir.ConstantBytesFragment:
 		c.emit(arm64asm.LoadConstantBytes(frag.Target, frag.Data))
 		return nil
@@ -523,13 +527,11 @@ func (c *compiler) emitConditionJump(cond ir.Condition, trueLabel, falseLabel as
 		case ir.CompareLess:
 			c.emit(arm64asm.JumpIfLess(trueLabel))
 		case ir.CompareLessOrEqual:
-			c.emit(arm64asm.JumpIfLess(trueLabel))
-			c.emit(arm64asm.JumpIfEqual(trueLabel))
+			c.emit(arm64asm.JumpIfLessOrEqual(trueLabel))
 		case ir.CompareGreater:
 			c.emit(arm64asm.JumpIfGreater(trueLabel))
 		case ir.CompareGreaterOrEqual:
-			c.emit(arm64asm.JumpIfGreater(trueLabel))
-			c.emit(arm64asm.JumpIfEqual(trueLabel))
+			c.emit(arm64asm.JumpIfGreaterOrEqual(trueLabel))
 		default:
 			return fmt.Errorf("ir: unsupported comparison kind %d", cv.Kind)
 		}
