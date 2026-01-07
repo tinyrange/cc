@@ -102,8 +102,7 @@ type Row struct {
 type Texture struct {
 	id     uint32
 	rows   []*Row
-	verts  [VERT_COUNT * 4]float32
-	color  [4]float32
+	verts  [VERT_COUNT * 8]float32 // 8 floats per vertex: x, y, s, t, r, g, b, a
 	nverts int
 }
 
@@ -531,14 +530,15 @@ func (s *Stash) FlushDraw() {
 				v3 := base + 3
 
 				emit := func(v int) {
-					vertices[vidx+0] = texture.verts[v*4+0] // x
-					vertices[vidx+1] = texture.verts[v*4+1] // y
-					vertices[vidx+2] = texture.verts[v*4+2] // s
-					vertices[vidx+3] = texture.verts[v*4+3] // t
-					vertices[vidx+4] = texture.color[0]
-					vertices[vidx+5] = texture.color[1]
-					vertices[vidx+6] = texture.color[2]
-					vertices[vidx+7] = texture.color[3]
+					base := v * 8
+					vertices[vidx+0] = texture.verts[base+0] // x
+					vertices[vidx+1] = texture.verts[base+1] // y
+					vertices[vidx+2] = texture.verts[base+2] // s
+					vertices[vidx+3] = texture.verts[base+3] // t
+					vertices[vidx+4] = texture.verts[base+4] // r
+					vertices[vidx+5] = texture.verts[base+5] // g
+					vertices[vidx+6] = texture.verts[base+6] // b
+					vertices[vidx+7] = texture.verts[base+7] // a
 					vidx += 8
 				}
 
@@ -692,33 +692,63 @@ func (stash *Stash) DrawText(idx int, size, x, y float64, s string, color [4]flo
 			continue
 		}
 		texture := glyph.texture
-		texture.color = color
-		// We emit 4 vertices per glyph quad into texture.verts.
-		if texture.nverts+4 > VERT_COUNT {
+		// We emit 4 vertices per glyph quad into texture.verts (8 floats each).
+		// When rendering, each quad expands to 6 vertices (2 triangles).
+		// VBO capacity is VERT_COUNT*8 floats = VERT_COUNT vertices.
+		// Max stored vertices = VERT_COUNT * 4 / 6 to fit after expansion.
+		maxStoredVerts := (VERT_COUNT * 4) / 6
+		if texture.nverts+4 > maxStoredVerts {
 			stash.FlushDraw()
 		}
 
 		x, y, q = stash.GetQuad(fnt, glyph, isize, x, y)
 
-		texture.verts[texture.nverts*4+0] = q.x0
-		texture.verts[texture.nverts*4+1] = q.y0
-		texture.verts[texture.nverts*4+2] = q.s0
-		texture.verts[texture.nverts*4+3] = q.t0
+		// Vertex 0: top-left
+		base := texture.nverts * 8
+		texture.verts[base+0] = q.x0
+		texture.verts[base+1] = q.y0
+		texture.verts[base+2] = q.s0
+		texture.verts[base+3] = q.t0
+		texture.verts[base+4] = color[0]
+		texture.verts[base+5] = color[1]
+		texture.verts[base+6] = color[2]
+		texture.verts[base+7] = color[3]
 		texture.nverts++
-		texture.verts[texture.nverts*4+0] = q.x1
-		texture.verts[texture.nverts*4+1] = q.y0
-		texture.verts[texture.nverts*4+2] = q.s1
-		texture.verts[texture.nverts*4+3] = q.t0
+
+		// Vertex 1: top-right
+		base = texture.nverts * 8
+		texture.verts[base+0] = q.x1
+		texture.verts[base+1] = q.y0
+		texture.verts[base+2] = q.s1
+		texture.verts[base+3] = q.t0
+		texture.verts[base+4] = color[0]
+		texture.verts[base+5] = color[1]
+		texture.verts[base+6] = color[2]
+		texture.verts[base+7] = color[3]
 		texture.nverts++
-		texture.verts[texture.nverts*4+0] = q.x1
-		texture.verts[texture.nverts*4+1] = q.y1
-		texture.verts[texture.nverts*4+2] = q.s1
-		texture.verts[texture.nverts*4+3] = q.t1
+
+		// Vertex 2: bottom-right
+		base = texture.nverts * 8
+		texture.verts[base+0] = q.x1
+		texture.verts[base+1] = q.y1
+		texture.verts[base+2] = q.s1
+		texture.verts[base+3] = q.t1
+		texture.verts[base+4] = color[0]
+		texture.verts[base+5] = color[1]
+		texture.verts[base+6] = color[2]
+		texture.verts[base+7] = color[3]
 		texture.nverts++
-		texture.verts[texture.nverts*4+0] = q.x0
-		texture.verts[texture.nverts*4+1] = q.y1
-		texture.verts[texture.nverts*4+2] = q.s0
-		texture.verts[texture.nverts*4+3] = q.t1
+
+		// Vertex 3: bottom-left
+		base = texture.nverts * 8
+		texture.verts[base+0] = q.x0
+		texture.verts[base+1] = q.y1
+		texture.verts[base+2] = q.s0
+		texture.verts[base+3] = q.t1
+		texture.verts[base+4] = color[0]
+		texture.verts[base+5] = color[1]
+		texture.verts[base+6] = color[2]
+		texture.verts[base+7] = color[3]
 		texture.nverts++
 		b = b[runeSize:]
 	}

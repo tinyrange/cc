@@ -84,6 +84,20 @@ type glMesh struct {
 
 func (*glMesh) isMesh() {}
 
+type glDynamicMesh struct {
+	vao uint32
+	vbo uint32
+	ebo uint32
+
+	vertexCap  int
+	indexCount int32
+
+	tex *glTexture
+	w   *glWindow
+}
+
+func (*glDynamicMesh) isMesh() {}
+
 type glFrame struct {
 	w *glWindow
 }
@@ -490,9 +504,158 @@ func (w *glWindow) NewMesh(vertices []Vertex, indices []uint32, tex Texture) (Me
 	return m, nil
 }
 
+func (w *glWindow) NewDynamicMesh(maxVertices, maxIndices int, tex Texture) (DynamicMesh, error) {
+	if maxVertices == 0 || maxIndices == 0 {
+		return nil, fmt.Errorf("empty dynamic mesh (maxVertices=%d maxIndices=%d)", maxVertices, maxIndices)
+	}
+
+	var t *glTexture
+	if tex == nil {
+		t = w.getWhiteTexture()
+	} else {
+		var ok bool
+		t, ok = tex.(*glTexture)
+		if !ok {
+			return nil, fmt.Errorf("unsupported texture implementation")
+		}
+	}
+
+	// Create VAO/VBO/EBO for this mesh.
+	var vao, vbo, ebo uint32
+	w.gl.GenVertexArrays(1, &vao)
+	w.gl.GenBuffers(1, &vbo)
+	w.gl.GenBuffers(1, &ebo)
+
+	w.gl.BindVertexArray(vao)
+
+	// Vertex buffer with DynamicDraw for frequent updates.
+	w.gl.BindBuffer(glpkg.ArrayBuffer, vbo)
+	w.gl.BufferData(
+		glpkg.ArrayBuffer,
+		maxVertices*8*4, // 8 floats per vertex * 4 bytes
+		nil,
+		glpkg.DynamicDraw,
+	)
+
+	// Index buffer.
+	w.gl.BindBuffer(glpkg.ElementArrayBuffer, ebo)
+	w.gl.BufferData(
+		glpkg.ElementArrayBuffer,
+		maxIndices*4,
+		nil,
+		glpkg.DynamicDraw,
+	)
+
+	// Set up vertex attributes for this VAO.
+	posLoc := w.gl.GetAttribLocation(w.shaderProgram, "a_position")
+	texLoc := w.gl.GetAttribLocation(w.shaderProgram, "a_texCoord")
+	colLoc := w.gl.GetAttribLocation(w.shaderProgram, "a_color")
+	w.gl.VertexAttribPointer(uint32(posLoc), 2, glpkg.Float, false, 8*4, 0)
+	w.gl.EnableVertexAttribArray(uint32(posLoc))
+	w.gl.VertexAttribPointer(uint32(texLoc), 2, glpkg.Float, false, 8*4, 8)
+	w.gl.EnableVertexAttribArray(uint32(texLoc))
+	w.gl.VertexAttribPointer(uint32(colLoc), 4, glpkg.Float, false, 8*4, 16)
+	w.gl.EnableVertexAttribArray(uint32(colLoc))
+
+	m := &glDynamicMesh{
+		vao:        vao,
+		vbo:        vbo,
+		ebo:        ebo,
+		vertexCap:  maxVertices,
+		indexCount: int32(maxIndices),
+		tex:        t,
+		w:          w,
+	}
+	return m, nil
+}
+
+func (m *glDynamicMesh) UpdateVertices(offset int, vertices []Vertex) {
+	if len(vertices) == 0 {
+		return
+	}
+	m.w.gl.BindBuffer(glpkg.ArrayBuffer, m.vbo)
+	m.w.gl.BufferSubData(
+		glpkg.ArrayBuffer,
+		offset*8*4, // offset in bytes
+		len(vertices)*8*4,
+		unsafe.Pointer(&vertices[0]),
+	)
+}
+
+func (m *glDynamicMesh) UpdateAllVertices(vertices []Vertex) {
+	if len(vertices) == 0 {
+		return
+	}
+	m.w.gl.BindBuffer(glpkg.ArrayBuffer, m.vbo)
+	m.w.gl.BufferSubData(
+		glpkg.ArrayBuffer,
+		0,
+		len(vertices)*8*4,
+		unsafe.Pointer(&vertices[0]),
+	)
+}
+
+func (m *glDynamicMesh) UpdateIndices(indices []uint32) {
+	if len(indices) == 0 {
+		return
+	}
+	m.w.gl.BindBuffer(glpkg.ElementArrayBuffer, m.ebo)
+	m.w.gl.BufferSubData(
+		glpkg.ElementArrayBuffer,
+		0,
+		len(indices)*4,
+		unsafe.Pointer(&indices[0]),
+	)
+	m.indexCount = int32(len(indices))
+}
+
+func (m *glDynamicMesh) Resize(vertexCount, indexCount int) {
+	// Recreate buffers with new capacity
+	m.w.gl.BindBuffer(glpkg.ArrayBuffer, m.vbo)
+	m.w.gl.BufferData(
+		glpkg.ArrayBuffer,
+		vertexCount*8*4,
+		nil,
+		glpkg.DynamicDraw,
+	)
+
+	m.w.gl.BindBuffer(glpkg.ElementArrayBuffer, m.ebo)
+	m.w.gl.BufferData(
+		glpkg.ElementArrayBuffer,
+		indexCount*4,
+		nil,
+		glpkg.DynamicDraw,
+	)
+
+	m.vertexCap = vertexCount
+	m.indexCount = int32(indexCount)
+}
+
+func (m *glDynamicMesh) VertexCount() int {
+	return m.vertexCap
+}
+
 func (f glFrame) RenderMesh(mesh Mesh, opts DrawOptions) {
-	m, ok := mesh.(*glMesh)
-	if !ok || m == nil || m.vao == 0 || m.indexCount == 0 {
+	var vao uint32
+	var indexCount int32
+	var tex *glTexture
+
+	switch m := mesh.(type) {
+	case *glMesh:
+		if m == nil || m.vao == 0 || m.indexCount == 0 {
+			return
+		}
+		vao = m.vao
+		indexCount = m.indexCount
+		tex = m.tex
+	case *glDynamicMesh:
+		if m == nil || m.vao == 0 || m.indexCount == 0 {
+			return
+		}
+		vao = m.vao
+		indexCount = m.indexCount
+		tex = m.tex
+	default:
 		return
 	}
 
@@ -507,8 +670,8 @@ func (f glFrame) RenderMesh(mesh Mesh, opts DrawOptions) {
 
 	// Bind texture.
 	f.w.gl.ActiveTexture(glpkg.Texture0)
-	if m.tex != nil {
-		f.w.gl.BindTexture(glpkg.Texture2D, m.tex.id)
+	if tex != nil {
+		f.w.gl.BindTexture(glpkg.Texture2D, tex.id)
 	} else {
 		t := f.w.getWhiteTexture()
 		f.w.gl.BindTexture(glpkg.Texture2D, t.id)
@@ -517,8 +680,8 @@ func (f glFrame) RenderMesh(mesh Mesh, opts DrawOptions) {
 	f.w.gl.Uniform1i(texUniform, 0)
 
 	// Draw.
-	f.w.gl.BindVertexArray(m.vao)
-	f.w.gl.DrawElements(glpkg.Triangles, m.indexCount, glpkg.UnsignedInt, 0)
+	f.w.gl.BindVertexArray(vao)
+	f.w.gl.DrawElements(glpkg.Triangles, indexCount, glpkg.UnsignedInt, 0)
 }
 
 func (t *glTexture) Size() (int, int) {
