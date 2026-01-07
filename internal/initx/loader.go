@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"time"
 
 	"github.com/tinyrange/cc/internal/debug"
 	"github.com/tinyrange/cc/internal/devices/virtio"
@@ -29,10 +30,12 @@ const (
 	configRegionPageOffset = configRegionPhysAddr - mailboxPhysAddr
 
 	configHeaderMagicValue = 0xcafebabe
-	configHeaderSize       = 24
+	configHeaderSize       = 40
 	configHeaderRelocOff   = configHeaderSize
 	configDataOffsetField  = 12
 	configDataLengthField  = 16
+	configTimeSecField     = 24
+	configTimeNsecField    = 32
 
 	writeFileLengthPrefix   = 2
 	writeFileMaxChunkLen    = (1 << 16) - 1
@@ -275,6 +278,11 @@ func (p *programLoader) LoadProgram(prog *ir.Program) error {
 			0,
 		)
 	}
+
+	// current time for guest clock initialization
+	now := time.Now()
+	binary.LittleEndian.PutUint64(p.dataRegion[configTimeSecField:], uint64(now.Unix()))
+	binary.LittleEndian.PutUint64(p.dataRegion[configTimeNsecField:], uint64(now.Nanosecond()))
 
 	if p.region != nil {
 		if _, err := p.region.WriteAt(p.dataRegion, 0); err != nil {
