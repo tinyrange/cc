@@ -817,7 +817,14 @@ func NewVirtualMachine(
 
 	ret.loader.Devices = append(ret.loader.Devices,
 		&consoleCapturingTemplate{
-			inner:  virtio.ConsoleTemplate{Out: out, In: in, Arch: h.Architecture()},
+			inner: virtio.ConsoleTemplate{
+				MMIODeviceTemplateBase: virtio.MMIODeviceTemplateBase{
+					Arch:   h.Architecture(),
+					Config: virtio.ConsoleDeviceConfig(),
+				},
+				Out: out,
+				In:  in,
+			},
 			target: &ret.consoleDevice,
 		},
 		programLoader,
