@@ -4,8 +4,10 @@ package starui
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/tinyrange/cc/internal/gowin/graphics"
 	"github.com/tinyrange/cc/internal/gowin/text"
@@ -59,6 +61,12 @@ type Engine struct {
 	globals   starlark.StringDict
 	appScript *starlark.Program
 	ctx       *AppContext
+
+	// Hot reload support
+	scriptPath   string
+	lastModTime  time.Time
+	reloadCount  int
+	onReload     func() // Callback when script is reloaded
 }
 
 // NewEngine creates a new Starlark UI engine.
@@ -72,6 +80,15 @@ func (e *Engine) LoadScript(path string) error {
 	if err != nil {
 		return fmt.Errorf("read script: %w", err)
 	}
+
+	// Get file modification time for hot reload
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat script: %w", err)
+	}
+
+	e.scriptPath = path
+	e.lastModTime = info.ModTime()
 
 	return e.LoadScriptFromString(filepath.Base(path), string(data))
 }
@@ -292,6 +309,60 @@ func (e *Engine) HasScreen(screenName string) bool {
 	fnName := screenName + "_screen"
 	_, ok := globals[fnName]
 	return ok
+}
+
+// SetOnReload sets a callback that's called when the script is reloaded.
+func (e *Engine) SetOnReload(fn func()) {
+	e.onReload = fn
+}
+
+// ReloadCount returns how many times the script has been reloaded.
+func (e *Engine) ReloadCount() int {
+	return e.reloadCount
+}
+
+// CheckReload checks if the script file has been modified and reloads if needed.
+// Returns true if a reload occurred.
+func (e *Engine) CheckReload() bool {
+	if e.scriptPath == "" {
+		return false
+	}
+
+	info, err := os.Stat(e.scriptPath)
+	if err != nil {
+		// File may have been deleted, don't reload
+		return false
+	}
+
+	if !info.ModTime().After(e.lastModTime) {
+		return false
+	}
+
+	// File has been modified, reload it
+	slog.Info("app.star modified, reloading", "path", e.scriptPath)
+
+	data, err := os.ReadFile(e.scriptPath)
+	if err != nil {
+		slog.Error("failed to read script for reload", "error", err)
+		return false
+	}
+
+	err = e.LoadScriptFromString(filepath.Base(e.scriptPath), string(data))
+	if err != nil {
+		slog.Error("failed to compile script on reload", "error", err)
+		return false
+	}
+
+	e.lastModTime = info.ModTime()
+	e.reloadCount++
+
+	slog.Info("app.star reloaded successfully", "reload_count", e.reloadCount)
+
+	if e.onReload != nil {
+		e.onReload()
+	}
+
+	return true
 }
 
 // FindAppStar looks for app.star in the bundles directory.

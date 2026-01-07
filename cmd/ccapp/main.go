@@ -362,8 +362,24 @@ func (app *Application) updateStarlarkContext() {
 	app.starEngine.SetContext(ctx)
 }
 
+// checkStarlarkReload checks if the Starlark script has been modified and reloads if needed.
+func (app *Application) checkStarlarkReload() {
+	if app.starEngine == nil {
+		return
+	}
+
+	if app.starEngine.CheckReload() {
+		// Script was reloaded, clear all cached screens so they get rebuilt
+		app.starLauncherScreen = nil
+		app.starLoadingScreen = nil
+		app.starErrorScreen = nil
+		app.starTerminalScreen = nil
+	}
+}
+
 // renderStarlarkLauncher renders the launcher screen using Starlark.
 func (app *Application) renderStarlarkLauncher(f graphics.Frame) error {
+	app.checkStarlarkReload()
 	app.updateStarlarkContext()
 
 	// Create or rebuild the screen
@@ -382,6 +398,7 @@ func (app *Application) renderStarlarkLauncher(f graphics.Frame) error {
 
 // renderStarlarkLoading renders the loading screen using Starlark.
 func (app *Application) renderStarlarkLoading(f graphics.Frame) error {
+	app.checkStarlarkReload()
 	app.updateStarlarkContext()
 
 	// Create or rebuild the screen
@@ -403,6 +420,7 @@ func (app *Application) renderStarlarkLoading(f graphics.Frame) error {
 
 // renderStarlarkError renders the error screen using Starlark.
 func (app *Application) renderStarlarkError(f graphics.Frame) error {
+	app.checkStarlarkReload()
 	app.updateStarlarkContext()
 
 	// Always rebuild error screen since error message may have changed
