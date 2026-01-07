@@ -27,6 +27,7 @@ import (
 	_ "github.com/tinyrange/cc/internal/ir/arm64"
 	amd64boot "github.com/tinyrange/cc/internal/linux/boot/amd64"
 	arm64boot "github.com/tinyrange/cc/internal/linux/boot/arm64"
+	riscv64boot "github.com/tinyrange/cc/internal/linux/boot/riscv64"
 	"github.com/tinyrange/cc/internal/linux/kernel"
 	"github.com/tinyrange/cc/internal/timeslice"
 )
@@ -302,7 +303,8 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 		cmdlineStr := strings.Join(cmdlineBase, " ")
 		return l.loadARM64(rec, vm, kernelReader, kernelSize, cmdlineStr, initrd, virtioNodes)
 	case hv.ArchitectureRISCV64:
-		return fmt.Errorf("linux loader for riscv64 is not implemented yet (pending kernel/initrd support)")
+		cmdlineStr := strings.Join(cmdlineBase, " ")
+		return l.loadRISCV64(rec, vm, kernelReader, kernelSize, cmdlineStr, initrd, virtioNodes)
 	default:
 		return fmt.Errorf("unsupported architecture: %v", arch)
 	}
@@ -717,6 +719,46 @@ func (l *LinuxLoader) loadARM64(rec *timeslice.Recorder, vm hv.VirtualMachine, k
 	}
 
 	rec.Record(tsLinuxLoaderAddedUART)
+
+	for _, dev := range l.Devices {
+		if err := vm.AddDeviceFromTemplate(dev); err != nil {
+			return fmt.Errorf("add device from template: %w", err)
+		}
+	}
+
+	rec.Record(tsLinuxLoaderAddedDevices)
+
+	return nil
+}
+
+func (l *LinuxLoader) loadRISCV64(rec *timeslice.Recorder, vm hv.VirtualMachine, kernelReader io.ReaderAt, kernelSize int64, cmdline string, initrd []byte, deviceTree []fdt.Node) error {
+	kernelImage, err := riscv64boot.LoadKernel(kernelReader, kernelSize)
+	if err != nil {
+		return fmt.Errorf("load kernel: %w", err)
+	}
+
+	rec.Record(tsLinuxLoaderLoadKernel)
+
+	numCPUs := l.NumCPUs
+	if numCPUs <= 0 {
+		numCPUs = 1
+	}
+
+	plan, err := kernelImage.Prepare(vm, riscv64boot.BootOptions{
+		Cmdline:         cmdline,
+		Initrd:          initrd,
+		NumCPUs:         numCPUs,
+		DeviceTreeNodes: deviceTree,
+	})
+	if err != nil {
+		return fmt.Errorf("prepare kernel: %w", err)
+	}
+	l.plan = plan
+
+	rec.Record(tsLinuxLoaderPreparedKernel)
+
+	// Note: UART and other devices are created by the hypervisor's machine setup
+	// For now, we skip adding devices here as they're part of the RV64 machine
 
 	for _, dev := range l.Devices {
 		if err := vm.AddDeviceFromTemplate(dev); err != nil {

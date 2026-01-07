@@ -1,6 +1,6 @@
 module github.com/tinyrange/cc
 
-go 1.25.5
+go 1.24.7
 
 require (
 	github.com/charmbracelet/x/ansi v0.11.3

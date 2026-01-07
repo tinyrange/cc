@@ -2846,10 +2846,6 @@ func (ns *NetStack) StartDNSServer() error {
 ////////////////////////////////////////////////////////////////////////////////
 
 // EnableDebugHTTP starts a small debug server exposing internal state at /status.
-//
-// BUG: The code uses sync.WaitGroup but calls debugWG.Go(...). WaitGroup
-// does not have a Go method; this will not compile unless debugWG is some
-// wrapper type elsewhere. Either change to Add/Done or use errgroup.Group.
 func (ns *NetStack) EnableDebugHTTP(addr string) error {
 	if addr == "" {
 		return nil
@@ -2879,13 +2875,15 @@ func (ns *NetStack) EnableDebugHTTP(addr string) error {
 	ns.debugListener = ln
 	ns.debugAddr = ln.Addr().String()
 
-	ns.debugWG.Go(func() {
+	ns.debugWG.Add(1)
+	go func() {
+		defer ns.debugWG.Done()
 		if err := srv.Serve(ln); err != nil &&
 			!errors.Is(err, http.ErrServerClosed) &&
 			!errors.Is(err, net.ErrClosed) {
 			ns.log.Warn("raw: debug http serve", "err", err)
 		}
-	})
+	}()
 
 	debug.Writef("netstack.EnableDebugHTTP", "addr=%s", addr)
 	return nil
