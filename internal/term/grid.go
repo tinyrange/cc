@@ -13,7 +13,7 @@ type Cell struct {
 	Attrs   uint8
 }
 
-// cellKey returns a comparable key for detecting cell changes.
+// equals compares two cells for equality to detect changes.
 // We compare content, width, attrs, and color values.
 func (c *Cell) equals(other *Cell) bool {
 	if c.Content != other.Content || c.Width != other.Width || c.Attrs != other.Attrs {
