@@ -304,8 +304,7 @@ func (g *Grid) GetDirtyRegions() []DirtyRegion {
 	return regions
 }
 
-// SyncFromEmulator copies cell data from a VT emulator interface.
-// Returns the number of cells that were actually changed.
+// EmulatorReader provides read access to VT emulator cell data.
 type EmulatorReader interface {
 	Width() int
 	Height() int

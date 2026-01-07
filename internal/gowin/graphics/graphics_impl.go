@@ -562,7 +562,7 @@ func (w *glWindow) NewDynamicMesh(maxVertices, maxIndices int, tex Texture) (Dyn
 		vbo:        vbo,
 		ebo:        ebo,
 		vertexCap:  maxVertices,
-		indexCount: int32(maxIndices),
+		indexCount: 0, // Set by UpdateIndices when indices are uploaded
 		tex:        t,
 		w:          w,
 	}
@@ -628,7 +628,7 @@ func (m *glDynamicMesh) Resize(vertexCount, indexCount int) {
 	)
 
 	m.vertexCap = vertexCount
-	m.indexCount = int32(indexCount)
+	m.indexCount = 0 // Reset; set by UpdateIndices when indices are uploaded
 }
 
 func (m *glDynamicMesh) VertexCount() int {

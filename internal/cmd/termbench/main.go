@@ -171,7 +171,7 @@ func main() {
 	}
 
 	if *frames > 0 {
-		events = events[:*frames]
+		events = events[:min(*frames, len(events))]
 	}
 
 	// Get total duration from last event time.
