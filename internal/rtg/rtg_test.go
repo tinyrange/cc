@@ -42,11 +42,12 @@ func main() int64 {
 		t.Fatalf("CompileProgram returned error: %v", err)
 	}
 
+	// Constant expressions are folded at compile time: 1 + 2 = 3
 	want := &ir.Program{
 		Entrypoint: "main",
 		Methods: map[string]ir.Method{
 			"main": {
-				ir.Return(ir.Op(ir.OpAdd, ir.Int64(1), ir.Int64(2))),
+				ir.Return(ir.Int64(3)),
 			},
 		},
 	}

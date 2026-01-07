@@ -332,15 +332,14 @@ func (c *Compiler) lowerAssign(assign *ast.AssignStmt) ([]ir.Fragment, error) {
 		return nil, fmt.Errorf("rtg: only single-value assignments are supported")
 	}
 
-	value, valType, err := c.lowerExpr(assign.Rhs[0])
-	if err != nil {
-		return nil, err
-	}
-
 	// Handle index expression on left side: ptr[offset] = value
 	if indexExpr, ok := assign.Lhs[0].(*ast.IndexExpr); ok {
 		if assign.Tok != token.ASSIGN {
 			return nil, fmt.Errorf("rtg: index assignment only supports = operator")
+		}
+		value, _, err := c.lowerExpr(assign.Rhs[0])
+		if err != nil {
+			return nil, err
 		}
 		dst, _, err := c.lowerIndex(indexExpr)
 		if err != nil {
@@ -352,6 +351,43 @@ func (c *Compiler) lowerAssign(assign *ast.AssignStmt) ([]ir.Fragment, error) {
 	ident, ok := assign.Lhs[0].(*ast.Ident)
 	if !ok {
 		return nil, fmt.Errorf("rtg: left-hand side must be identifier or index expression")
+	}
+
+	// Handle indirect call(target) specially - generate ir.Call with result variable
+	if callExpr, ok := assign.Rhs[0].(*ast.CallExpr); ok {
+		if target, ok := callExpr.Fun.(*ast.Ident); ok && target.Name == "call" {
+			if len(callExpr.Args) != 1 {
+				return nil, fmt.Errorf("rtg: call expects (target)")
+			}
+			callTarget, _, err := c.lowerExpr(callExpr.Args[0])
+			if err != nil {
+				return nil, err
+			}
+			// Register the result variable
+			valType := Type{Kind: TypeI64}
+			switch assign.Tok {
+			case token.DEFINE:
+				if err := c.scope.define(ident.Name, valType); err != nil {
+					return nil, err
+				}
+			case token.ASSIGN:
+				existing, ok := c.scope.lookup(ident.Name)
+				if !ok {
+					return nil, fmt.Errorf("rtg: assignment to undefined identifier %q", ident.Name)
+				}
+				if !typesCompatible(existing, valType) {
+					return nil, fmt.Errorf("rtg: cannot assign %s to %s", valType, existing)
+				}
+			default:
+				return nil, fmt.Errorf("rtg: unsupported assignment operator %s", assign.Tok)
+			}
+			return []ir.Fragment{ir.Call(callTarget, ir.Var(ident.Name))}, nil
+		}
+	}
+
+	value, valType, err := c.lowerExpr(assign.Rhs[0])
+	if err != nil {
+		return nil, err
 	}
 
 	switch assign.Tok {
@@ -647,6 +683,11 @@ func (c *Compiler) lowerIndex(expr *ast.IndexExpr) (ir.Fragment, Type, error) {
 }
 
 func (c *Compiler) lowerBinary(expr *ast.BinaryExpr) (ir.Fragment, Type, error) {
+	// Try constant folding first - if both operands are constants, evaluate at compile time
+	if val, err := c.evalInt(expr); err == nil {
+		return ir.Int64(val), Type{Kind: TypeI64}, nil
+	}
+
 	left, lType, err := c.lowerExpr(expr.X)
 	if err != nil {
 		return nil, Type{}, err
@@ -924,6 +965,47 @@ func (c *Compiler) evalInt(expr ast.Expr) (int64, error) {
 			return -val, nil
 		}
 		return val, nil
+	case *ast.Ident:
+		// Check if identifier is a known constant
+		if val, ok := constantValues[v.Name]; ok {
+			return val, nil
+		}
+		return 0, fmt.Errorf("unknown constant %q", v.Name)
+	case *ast.BinaryExpr:
+		// Try to evaluate binary expression of constants
+		left, err := c.evalInt(v.X)
+		if err != nil {
+			return 0, err
+		}
+		right, err := c.evalInt(v.Y)
+		if err != nil {
+			return 0, err
+		}
+		switch v.Op {
+		case token.ADD:
+			return left + right, nil
+		case token.SUB:
+			return left - right, nil
+		case token.MUL:
+			return left * right, nil
+		case token.QUO:
+			if right == 0 {
+				return 0, fmt.Errorf("division by zero")
+			}
+			return left / right, nil
+		case token.AND:
+			return left & right, nil
+		case token.OR:
+			return left | right, nil
+		case token.XOR:
+			return left ^ right, nil
+		case token.SHL:
+			return left << uint(right), nil
+		case token.SHR:
+			return left >> uint(right), nil
+		default:
+			return 0, fmt.Errorf("unsupported binary operator %s in constant expression", v.Op)
+		}
 	default:
 		return 0, fmt.Errorf("expected int literal")
 	}
