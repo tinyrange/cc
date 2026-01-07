@@ -296,14 +296,18 @@ func (s *ScrollView) HandleEvent(ctx *EventContext, event Event) bool {
 
 	// Dispatch to content
 	if s.content != nil {
-		// Always dispatch MouseMoveEvent so children can update hover state
-		// even when mouse moves outside the viewport
-		if _, isMove := event.(*MouseMoveEvent); isMove {
+		switch event.(type) {
+		case *MouseMoveEvent:
+			// Always dispatch so children can update hover state
 			return s.content.HandleEvent(ctx, event)
-		}
-		// For other events, only dispatch if mouse is within bounds
-		if bounds.Contains(s.getMousePos(event)) {
+		case *KeyEvent, *TextEvent:
+			// Always dispatch keyboard events (no position info)
 			return s.content.HandleEvent(ctx, event)
+		default:
+			// For mouse events, only dispatch if within bounds
+			if bounds.Contains(s.getMousePos(event)) {
+				return s.content.HandleEvent(ctx, event)
+			}
 		}
 	}
 	return false

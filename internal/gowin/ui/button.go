@@ -188,10 +188,13 @@ func (b *Button) HandleEvent(ctx *EventContext, event Event) bool {
 			return true
 		} else if !e.Pressed && b.state == ButtonStatePressed {
 			b.state = ButtonStateNormal
-			if isInside && b.onClick != nil {
-				b.onClick()
+			if isInside {
+				if b.onClick != nil {
+					b.onClick()
+				}
+				return true
 			}
-			return true
+			return false
 		}
 	}
 
