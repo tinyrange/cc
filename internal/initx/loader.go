@@ -34,8 +34,6 @@ const (
 	configHeaderRelocOff   = configHeaderSize
 	configDataOffsetField  = 12
 	configDataLengthField  = 16
-	configTimeSecField     = 24
-	configTimeNsecField    = 32
 
 	writeFileLengthPrefix   = 2
 	writeFileMaxChunkLen    = (1 << 16) - 1
