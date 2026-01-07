@@ -246,7 +246,12 @@ func (vc *Console) consumeDescriptorChain(dev device, q *queue, head uint16) (ui
 func (vc *Console) processReceiveQueue(dev device, q *queue) error {
 	if !QueueReady(q) {
 		debug.Writef("virtio-console.processReceiveQueue skip", "q=%v ready=%v size=%v",
-			q != nil, q != nil && q.ready, func() uint16 { if q != nil { return q.size }; return 0 }())
+			q != nil, q != nil && q.ready, func() uint16 {
+				if q != nil {
+					return q.size
+				}
+				return 0
+			}())
 		return nil
 	}
 

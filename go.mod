@@ -3,21 +3,21 @@ module github.com/tinyrange/cc
 go 1.25.5
 
 require (
+	github.com/charmbracelet/x/ansi v0.11.3
 	github.com/charmbracelet/x/vt v0.0.0-20251215102626-e0db08df7383
 	github.com/ebitengine/purego v0.9.1
 	github.com/miekg/dns v1.1.69
 	github.com/schollz/progressbar/v3 v3.18.0
-	gopkg.in/yaml.v3 v3.0.1
 	golang.org/x/net v0.47.0
 	golang.org/x/sys v0.38.0
 	golang.org/x/term v0.37.0
+	gopkg.in/yaml.v3 v3.0.1
 	gvisor.dev/gvisor v0.0.0-20251220000015-517913d17844
 )
 
 require (
 	github.com/charmbracelet/colorprofile v0.3.3 // indirect
 	github.com/charmbracelet/ultraviolet v0.0.0-20251106193841-7889546fc720 // indirect
-	github.com/charmbracelet/x/ansi v0.11.3 // indirect
 	github.com/charmbracelet/x/exp/ordered v0.1.0 // indirect
 	github.com/charmbracelet/x/term v0.2.2 // indirect
 	github.com/charmbracelet/x/termios v0.1.1 // indirect

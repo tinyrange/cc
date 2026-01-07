@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"time"
 
 	"github.com/tinyrange/cc/internal/assets"
@@ -96,7 +95,13 @@ type Application struct {
 	logDir  string
 	logFile string
 
-	// UI state
+	// UI screens (widget-based)
+	launcherScreen *LauncherScreen
+	loadingScreen  *LoadingScreen
+	errorScreen    *ErrorScreen
+	terminalScreen *TerminalScreen
+
+	// Legacy UI state (for terminal screen which uses termview directly)
 	scrollX       float32
 	selectedIndex int // -1 means list view
 
@@ -240,6 +245,14 @@ func openDirectory(path string) error {
 	}
 }
 
+// openLogs opens the log directory in the system file manager.
+func (app *Application) openLogs() {
+	slog.Info("open logs requested", "log_dir", app.logDir)
+	if err := openDirectory(app.logDir); err != nil {
+		slog.Error("failed to open logs directory", "log_dir", app.logDir, "error", err)
+	}
+}
+
 // getBundlesDir returns the path to the bundles directory next to the app.
 func getBundlesDir() string {
 	exe, err := os.Executable()
@@ -310,6 +323,10 @@ func (app *Application) Run() error {
 	}
 	slog.Info("bundle discovery complete", "bundles_dir", bundlesDir, "bundle_count", len(app.bundles))
 
+	// Initialize UI screens
+	app.launcherScreen = NewLauncherScreen(app)
+	app.terminalScreen = NewTerminalScreen(app)
+
 	return app.window.Loop(func(f graphics.Frame) error {
 		switch app.mode {
 		case modeLauncher:
@@ -335,208 +352,10 @@ func (app *Application) showError(err error) {
 }
 
 func (app *Application) renderLauncher(f graphics.Frame) error {
-	w, h := f.WindowSize()
-	app.text.SetViewport(int32(w), int32(h))
-
-	// Pull raw input events (wheel deltas live here).
-	var wheelX, wheelY float32
-	for _, ev := range app.window.PlatformWindow().DrainInputEvents() {
-		if ev.Type == window.InputEventScroll {
-			wheelX += ev.ScrollX
-			wheelY += ev.ScrollY
-		}
-	}
-
-	mx, my := f.CursorPos()
-	leftDown := f.GetButtonState(window.ButtonLeft).IsDown()
-	justPressed := leftDown && !app.prevLeftDown
-	justReleased := !leftDown && app.prevLeftDown
-	app.prevLeftDown = leftDown
-
-	// Layout uses the actual window bounds directly.
-	winW := float32(w)
-	winH := float32(h)
-	padding := float32(20)
-
-	// Top bar.
-	topBarH := float32(32)
-	f.RenderQuad(0, 0, winW, topBarH, nil, color.RGBA{R: 22, G: 22, B: 22, A: 255})
-
-	// Logs button (top-right).
-	logRect := rect{x: winW - 150, y: 6, w: 120, h: topBarH - 12}
-	logHover := logRect.contains(mx, my)
-	logColor := color.RGBA{R: 40, G: 40, B: 40, A: 255}
-	if logHover {
-		logColor = color.RGBA{R: 56, G: 56, B: 56, A: 255}
-	}
-	if logHover && leftDown {
-		logColor = color.RGBA{R: 72, G: 72, B: 72, A: 255}
-	}
-	f.RenderQuad(logRect.x, logRect.y, logRect.w, logRect.h, nil, logColor)
-	app.text.RenderText("Debug Logs", logRect.x+26, 20, 14, graphics.ColorWhite)
-	if justPressed && logHover {
-		slog.Info("open logs requested", "log_dir", app.logDir)
-		if err := openDirectory(app.logDir); err != nil {
-			slog.Error("failed to open logs directory", "log_dir", app.logDir, "error", err)
-		}
-	}
-
-	// Title below top bar.
-	titleY := topBarH + 50
-	app.text.RenderText("CrumbleCracker", padding, titleY, 48, graphics.ColorWhite)
-
-	if len(app.bundles) == 0 {
-		app.text.RenderText("No bundles found. Create bundles with: cc -build <outDir> <image>", padding, titleY+30, 20, graphics.ColorWhite)
-		app.text.RenderText("Searched for bundles in: "+app.bundlesDir, padding, titleY+50, 20, graphics.ColorWhite)
-	} else {
-		app.text.RenderText("Please select an environment to boot", padding, titleY+30, 20, graphics.ColorWhite)
-	}
-
-	// Logo in bottom-right corner, overlapping content area.
-	if app.logo != nil {
-		logoSize := winH * 0.75
-		if logoSize > winW*0.75 {
-			logoSize = winW * 0.75
-		}
-		if logoSize < 280 {
-			logoSize = 280
-		}
-
-		logoX := winW - logoSize + logoSize*0.35
-		logoY := winH - logoSize + logoSize*0.35
-
-		t := float32(time.Since(app.start).Seconds())
-		app.logo.DrawGroupRotated(f, "inner-circle", logoX, logoY, logoSize, logoSize, t*0.4)
-		app.logo.DrawGroupRotated(f, "morse-circle", logoX, logoY, logoSize, logoSize, -t*0.9)
-		app.logo.DrawGroupRotated(f, "outer-circle", logoX, logoY, logoSize, logoSize, t*1.6)
-	}
-
-	if len(app.bundles) == 0 {
-		return nil
-	}
-
-	// List view - cards below title.
-	listX := padding
-	listY := titleY + 120
-	viewW := winW - padding*2
-	cardW := float32(180)
-	cardH := float32(180)
-	gap := float32(24)
-	viewport := rect{x: listX, y: listY, w: viewW, h: cardH + 80}
-
-	// draw a rectangle overlaying the viewport
-	f.RenderQuad(0, listY-20, winW, cardH+160, nil, color.RGBA{R: 10, G: 10, B: 10, A: 200})
-
-	contentWidth := float32(len(app.bundles))*(cardW+gap) - gap
-	maxScroll := float32(0)
-	if contentWidth > viewport.w {
-		maxScroll = contentWidth - viewport.w
-	}
-
-	// Wheel scroll when hovering the list area.
-	if (wheelX != 0 || wheelY != 0) && viewport.contains(mx, my) {
-		app.scrollX -= wheelY * 40
-		app.scrollX -= wheelX * 40
-	}
-	app.scrollX = clamp(app.scrollX, 0, maxScroll)
-
-	// Scrollbar (bottom).
-	barH := float32(8)
-	barY := viewport.y + viewport.h + 16
-	bar := rect{x: viewport.x, y: barY, w: viewport.w, h: barH}
-	f.RenderQuad(bar.x, bar.y, bar.w, bar.h, nil, color.RGBA{R: 48, G: 48, B: 48, A: 255})
-
-	thumbW := bar.w
-	if contentWidth > 0 {
-		thumbW = bar.w * (bar.w / contentWidth)
-	}
-	if thumbW < 30 {
-		thumbW = 30
-	}
-	if thumbW > bar.w {
-		thumbW = bar.w
-	}
-	thumbX := bar.x
-	if maxScroll > 0 {
-		thumbX = bar.x + (bar.w-thumbW)*(app.scrollX/maxScroll)
-	}
-	thumb := rect{x: thumbX, y: bar.y, w: thumbW, h: bar.h}
-	f.RenderQuad(thumb.x, thumb.y, thumb.w, thumb.h, nil, color.RGBA{R: 100, G: 100, B: 100, A: 255})
-
-	if justPressed && thumb.contains(mx, my) {
-		app.draggingThumb = true
-		app.thumbDragDX = mx - thumb.x
-	}
-	if app.draggingThumb && leftDown {
-		newThumbX := clamp(mx-app.thumbDragDX, bar.x, bar.x+bar.w-thumbW)
-		if bar.w-thumbW > 0 {
-			app.scrollX = (newThumbX - bar.x) / (bar.w - thumbW) * maxScroll
-		} else {
-			app.scrollX = 0
-		}
-	}
-	if justReleased {
-		app.draggingThumb = false
-	}
-
-	// Draw cards.
-	for i, b := range app.bundles {
-		x := viewport.x + float32(i)*(cardW+gap) - app.scrollX
-		card := rect{x: x, y: viewport.y, w: cardW, h: cardH + 60}
-
-		// Simple clipping by skipping offscreen cards.
-		if card.x+card.w < viewport.x-50 || card.x > viewport.x+viewport.w+50 {
-			continue
-		}
-
-		hovered := viewport.contains(mx, my) && card.contains(mx, my)
-
-		// Card background + border (hover state).
-		bgColor := color.RGBA{R: 0, G: 0, B: 0, A: 0}
-		borderColor := color.RGBA{R: 80, G: 80, B: 80, A: 255}
-		if hovered {
-			bgColor = color.RGBA{R: 20, G: 20, B: 20, A: 220}
-			borderColor = color.RGBA{R: 140, G: 140, B: 140, A: 255}
-		}
-		if hovered && leftDown {
-			bgColor = color.RGBA{R: 30, G: 30, B: 30, A: 235}
-			borderColor = color.RGBA{R: 180, G: 180, B: 180, A: 255}
-		}
-		if bgColor.A != 0 {
-			f.RenderQuad(card.x, card.y, card.w, card.h, nil, bgColor)
-		}
-
-		// Border.
-		f.RenderQuad(card.x, card.y, card.w, 1, nil, borderColor)         // top
-		f.RenderQuad(card.x, card.y+cardH, card.w, 1, nil, borderColor)   // bottom of image area
-		f.RenderQuad(card.x, card.y, 1, cardH, nil, borderColor)          // left
-		f.RenderQuad(card.x+card.w-1, card.y, 1, cardH, nil, borderColor) // right
-
-		// Title + description below card.
-		name := b.Meta.Name
-		if name == "" || name == "{{name}}" {
-			name = filepath.Base(b.Dir)
-		}
-		desc := b.Meta.Description
-		if desc == "" || desc == "{{description}}" {
-			desc = "VM Bundle"
-		}
-		app.text.RenderText(name, card.x, card.y+cardH+24, 18, graphics.ColorWhite)
-		app.text.RenderText(desc, card.x, card.y+cardH+44, 14, graphics.ColorWhite)
-
-		if justPressed && viewport.contains(mx, my) && card.contains(mx, my) {
-			app.selectedIndex = i
-			app.startBootBundle(i)
-		}
-	}
-
-	return nil
+	return app.launcherScreen.Render(f)
 }
 
 func (app *Application) renderLoading(f graphics.Frame) error {
-	// Drain input events so they don't pile up while loading.
-	app.window.PlatformWindow().DrainInputEvents()
-
 	// Check for background prep completion.
 	if app.bootCh != nil {
 		select {
@@ -560,133 +379,19 @@ func (app *Application) renderLoading(f graphics.Frame) error {
 		}
 	}
 
-	w, h := f.WindowSize()
-	app.text.SetViewport(int32(w), int32(h))
-	winW := float32(w)
-	winH := float32(h)
-
-	// Dark background.
-	f.RenderQuad(0, 0, winW, winH, nil, color.RGBA{R: 10, G: 10, B: 10, A: 255})
-
-	// Centered spinning logo.
-	if app.logo != nil {
-		logoSize := winH * 0.45
-		if logoSize > winW*0.45 {
-			logoSize = winW * 0.45
-		}
-		if logoSize < 220 {
-			logoSize = 220
-		}
-
-		logoX := (winW - logoSize) * 0.5
-		logoY := (winH - logoSize) * 0.5
-
-		t := float32(time.Since(app.bootStarted).Seconds())
-		app.logo.DrawGroupRotated(f, "inner-circle", logoX, logoY, logoSize, logoSize, t*0.9)
-		app.logo.DrawGroupRotated(f, "morse-circle", logoX, logoY, logoSize, logoSize, -t*1.4)
-		app.logo.DrawGroupRotated(f, "outer-circle", logoX, logoY, logoSize, logoSize, t*2.2)
+	// Create or use cached loading screen
+	if app.loadingScreen == nil {
+		app.loadingScreen = NewLoadingScreen(app)
 	}
-
-	// Loading text.
-	msg := "Booting VM…"
-	if app.bootName != "" {
-		msg = "Booting " + app.bootName + "…"
-	}
-	app.text.RenderText(msg, 20, 40, 20, graphics.ColorWhite)
-
-	return nil
+	return app.loadingScreen.Render(f)
 }
 
 func (app *Application) renderError(f graphics.Frame) error {
-	w, h := f.WindowSize()
-	app.text.SetViewport(int32(w), int32(h))
-
-	// Pull raw input events (wheel deltas live here).
-	app.window.PlatformWindow().DrainInputEvents()
-
-	mx, my := f.CursorPos()
-	leftDown := f.GetButtonState(window.ButtonLeft).IsDown()
-	justPressed := leftDown && !app.prevLeftDown
-	app.prevLeftDown = leftDown
-
-	winW := float32(w)
-	winH := float32(h)
-
-	// Dark background.
-	f.RenderQuad(0, 0, winW, winH, nil, color.RGBA{R: 10, G: 10, B: 10, A: 255})
-
-	// Header.
-	app.text.RenderText("Error", 30, 70, 56, graphics.ColorWhite)
-
-	// Error message (simple multi-line).
-	msg := app.errMsg
-	if msg == "" {
-		msg = "unknown error"
+	// Create or use cached error screen (rebuild if error message changed)
+	if app.errorScreen == nil {
+		app.errorScreen = NewErrorScreen(app)
 	}
-	lines := strings.Split(msg, "\n")
-	y := float32(120)
-	for i := 0; i < len(lines) && i < 12; i++ {
-		line := strings.TrimSpace(lines[i])
-		if line == "" {
-			continue
-		}
-		app.text.RenderText(line, 30, y, 18, graphics.ColorWhite)
-		y += 22
-	}
-
-	// Centered rotating logo as subtle backdrop.
-	if app.logo != nil {
-		logoSize := winH * 0.35
-		if logoSize > winW*0.35 {
-			logoSize = winW * 0.35
-		}
-		if logoSize < 200 {
-			logoSize = 200
-		}
-		logoX := (winW - logoSize) * 0.5
-		logoY := (winH - logoSize) * 0.5
-		t := float32(time.Since(app.start).Seconds())
-		app.logo.DrawGroupRotated(f, "outer-circle", logoX, logoY, logoSize, logoSize, t*0.4)
-	}
-
-	// Buttons under the message area.
-	btnW := float32(320)
-	btnH := float32(44)
-	btnX := (winW - btnW) * 0.5
-	btnY := clamp(y+40, 220, winH-160)
-
-	backRect := rect{x: btnX, y: btnY, w: btnW, h: btnH}
-	logRect := rect{x: btnX, y: btnY + btnH + 14, w: btnW, h: btnH}
-
-	drawBtn := func(r rect, label string) bool {
-		hover := r.contains(mx, my)
-		c := color.RGBA{R: 40, G: 40, B: 40, A: 255}
-		if hover {
-			c = color.RGBA{R: 56, G: 56, B: 56, A: 255}
-		}
-		if hover && leftDown {
-			c = color.RGBA{R: 72, G: 72, B: 72, A: 255}
-		}
-		f.RenderQuad(r.x, r.y, r.w, r.h, nil, c)
-		// crude centering
-		app.text.RenderText(label, r.x+22, r.y+28, 16, graphics.ColorWhite)
-		return hover && justPressed
-	}
-
-	if drawBtn(backRect, "Back to carousel") {
-		app.errMsg = ""
-		app.selectedIndex = -1
-		app.mode = modeLauncher
-		return nil
-	}
-	if drawBtn(logRect, "Open logs directory") {
-		slog.Info("open logs requested (error screen)", "log_dir", app.logDir)
-		if err := openDirectory(app.logDir); err != nil {
-			slog.Error("failed to open logs directory", "log_dir", app.logDir, "error", err)
-		}
-	}
-
-	return nil
+	return app.errorScreen.Render(f)
 }
 
 func (app *Application) renderTerminal(f graphics.Frame) error {

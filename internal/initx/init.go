@@ -33,6 +33,10 @@ const (
 	mailboxRunResultStageOffset    = 12
 	mailboxStartResultDetailOffset = 16
 	mailboxStartResultStageOffset  = 20
+
+	// Config region time fields (set by host for guest clock initialization)
+	configTimeSecField  = 24
+	configTimeNsecField = 32
 )
 
 var (
@@ -292,6 +296,42 @@ func Build(cfg BuilderConfig) (*ir.Program, error) {
 		),
 		rebootOnError(cfg.Arch, ir.Var("anonMem"), "initx: failed to map anonymous payload region (errno=0x%x)\n"),
 		LogKmsg("initx: mapped anon payload region\n"),
+
+		// Set system time from host-provided timestamp in config region.
+		// Allocate a small anonymous region for the timespec struct.
+		mmapFile(
+			ir.Var("timespecMem"),
+			ir.Int64(-1),
+			ir.Int64(16), // sizeof(struct timespec) = 16 bytes
+			linux.PROT_READ|linux.PROT_WRITE,
+			linux.MAP_PRIVATE|linux.MAP_ANONYMOUS,
+			ir.Int64(0),
+		),
+		ir.If(ir.IsNegative(ir.Var("timespecMem")), ir.Block{
+			LogKmsg("initx: failed to allocate timespec buffer, skipping time set\n"),
+			ir.Goto(ir.Label("skip_time_set")),
+		}),
+		// Read time from config region and store in timespec struct
+		ir.Assign(ir.Var("timeSec"), ir.Var("configMem").MemWithDisp(configTimeSecField)),
+		ir.Assign(ir.Var("timeNsec"), ir.Var("configMem").MemWithDisp(configTimeNsecField)),
+		ir.Assign(ir.Var("timespecMem").Mem(), ir.Var("timeSec")),                  // tv_sec at offset 0
+		ir.Assign(ir.Var("timespecMem").MemWithDisp(8), ir.Var("timeNsec")),        // tv_nsec at offset 8
+		// Call clock_settime(CLOCK_REALTIME, &timespec)
+		ir.Assign(ir.Var("clockSetResult"), ir.Syscall(
+			defs.SYS_CLOCK_SETTIME,
+			ir.Int64(linux.CLOCK_REALTIME),
+			ir.Var("timespecMem"),
+		)),
+		ir.If(ir.IsNegative(ir.Var("clockSetResult")), ir.Block{
+			ir.Printf("initx: clock_settime failed (errno=0x%x), continuing anyway\n",
+				ir.Op(ir.OpSub, ir.Int64(0), ir.Var("clockSetResult")),
+			),
+		}, ir.Block{
+			LogKmsg("initx: system time set from host\n"),
+		}),
+		// Free the timespec buffer
+		ir.Syscall(defs.SYS_MUNMAP, ir.Var("timespecMem"), ir.Int64(16)),
+		ir.DeclareLabel("skip_time_set", ir.Block{}),
 
 		ir.DeclareLabel("loop", ir.Block{
 			LogKmsg("initx: entering main loop\n"),
