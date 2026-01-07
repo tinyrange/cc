@@ -8,6 +8,7 @@ require (
 	github.com/ebitengine/purego v0.9.1
 	github.com/miekg/dns v1.1.69
 	github.com/schollz/progressbar/v3 v3.18.0
+	go.starlark.net v0.0.0-20260102030733-3fee463870c9
 	golang.org/x/net v0.47.0
 	golang.org/x/sys v0.38.0
 	golang.org/x/term v0.37.0

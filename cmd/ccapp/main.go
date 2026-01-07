@@ -26,6 +26,7 @@ import (
 	"github.com/tinyrange/cc/internal/linux/kernel"
 	"github.com/tinyrange/cc/internal/netstack"
 	"github.com/tinyrange/cc/internal/oci"
+	"github.com/tinyrange/cc/internal/starui"
 	termwin "github.com/tinyrange/cc/internal/term"
 	"github.com/tinyrange/cc/internal/vfs"
 )
@@ -100,6 +101,13 @@ type Application struct {
 	loadingScreen  *LoadingScreen
 	errorScreen    *ErrorScreen
 	terminalScreen *TerminalScreen
+
+	// Starlark UI (optional override)
+	starEngine         *starui.Engine
+	starLauncherScreen *starui.StarlarkScreen
+	starLoadingScreen  *starui.StarlarkScreen
+	starErrorScreen    *starui.StarlarkScreen
+	starTerminalScreen *starui.StarlarkScreen
 
 	// Legacy UI state (for terminal screen which uses termview directly)
 	scrollX       float32
@@ -286,6 +294,150 @@ func getBundlesDir() string {
 	return filepath.Join(dir, "bundles")
 }
 
+// loadStarlarkUI attempts to load custom UI from app.star in the bundles directory.
+func (app *Application) loadStarlarkUI() error {
+	appStarPath := starui.FindAppStar(app.bundlesDir)
+	if appStarPath == "" {
+		return fmt.Errorf("app.star not found in %s", app.bundlesDir)
+	}
+
+	engine := starui.NewEngine()
+	if err := engine.LoadScript(appStarPath); err != nil {
+		return fmt.Errorf("failed to load app.star: %w", err)
+	}
+
+	app.starEngine = engine
+	return nil
+}
+
+// updateStarlarkContext updates the Starlark context with current app state.
+func (app *Application) updateStarlarkContext() {
+	if app.starEngine == nil {
+		return
+	}
+
+	bundles := make([]starui.BundleInfo, len(app.bundles))
+	for i, b := range app.bundles {
+		name := b.Meta.Name
+		if name == "" || name == "{{name}}" {
+			name = filepath.Base(b.Dir)
+		}
+		desc := b.Meta.Description
+		if desc == "" || desc == "{{description}}" {
+			desc = "VM Bundle"
+		}
+		bundles[i] = starui.BundleInfo{
+			Index:       i,
+			Name:        name,
+			Description: desc,
+			Dir:         b.Dir,
+		}
+	}
+
+	ctx := &starui.AppContext{
+		AppTitle:   "CrumbleCracker",
+		BundlesDir: app.bundlesDir,
+		Bundles:    bundles,
+		Logo:       app.logo,
+		Text:       app.text,
+		ErrorMessage: app.errMsg,
+		BootName:     app.bootName,
+		OnOpenLogs: func() {
+			app.openLogs()
+		},
+		OnSelectBundle: func(index int) {
+			app.selectedIndex = index
+			app.startBootBundle(index)
+		},
+		OnStopVM: func() {
+			app.stopVM()
+		},
+		OnBack: func() {
+			app.errMsg = ""
+			app.selectedIndex = -1
+			app.mode = modeLauncher
+		},
+	}
+
+	app.starEngine.SetContext(ctx)
+}
+
+// checkStarlarkReload checks if the Starlark script has been modified and reloads if needed.
+func (app *Application) checkStarlarkReload() {
+	if app.starEngine == nil {
+		return
+	}
+
+	if app.starEngine.CheckReload() {
+		// Script was reloaded, clear all cached screens so they get rebuilt
+		app.starLauncherScreen = nil
+		app.starLoadingScreen = nil
+		app.starErrorScreen = nil
+		app.starTerminalScreen = nil
+	}
+}
+
+// renderStarlarkLauncher renders the launcher screen using Starlark.
+func (app *Application) renderStarlarkLauncher(f graphics.Frame) error {
+	app.checkStarlarkReload()
+	app.updateStarlarkContext()
+
+	// Create or rebuild the screen
+	if app.starLauncherScreen == nil {
+		screen, err := starui.NewStarlarkScreen(app.starEngine, "launcher", app.text)
+		if err != nil {
+			slog.Warn("failed to render Starlark launcher screen, falling back to built-in", "error", err)
+			return app.launcherScreen.Render(f)
+		}
+		screen.SetStartTime(app.start)
+		app.starLauncherScreen = screen
+	}
+
+	return app.starLauncherScreen.Render(f, app.window.PlatformWindow())
+}
+
+// renderStarlarkLoading renders the loading screen using Starlark.
+func (app *Application) renderStarlarkLoading(f graphics.Frame) error {
+	app.checkStarlarkReload()
+	app.updateStarlarkContext()
+
+	// Create or rebuild the screen
+	if app.starLoadingScreen == nil {
+		screen, err := starui.NewStarlarkScreen(app.starEngine, "loading", app.text)
+		if err != nil {
+			slog.Warn("failed to render Starlark loading screen, falling back to built-in", "error", err)
+			if app.loadingScreen == nil {
+				app.loadingScreen = NewLoadingScreen(app)
+			}
+			return app.loadingScreen.Render(f)
+		}
+		screen.SetStartTime(app.bootStarted)
+		app.starLoadingScreen = screen
+	}
+
+	return app.starLoadingScreen.Render(f, app.window.PlatformWindow())
+}
+
+// renderStarlarkError renders the error screen using Starlark.
+func (app *Application) renderStarlarkError(f graphics.Frame) error {
+	app.checkStarlarkReload()
+	app.updateStarlarkContext()
+
+	// Always rebuild error screen since error message may have changed
+	screen, err := starui.NewStarlarkScreen(app.starEngine, "error", app.text)
+	if err != nil {
+		slog.Warn("failed to render Starlark error screen, falling back to built-in", "error", err)
+		if app.errorScreen == nil {
+			app.errorScreen = NewErrorScreen(app)
+		}
+		return app.errorScreen.Render(f)
+	}
+	screen.SetStartTime(app.start)
+	app.starErrorScreen = screen
+
+	return app.starErrorScreen.Render(f, app.window.PlatformWindow())
+}
+
 func (app *Application) Run() error {
 	var err error
 
@@ -323,7 +475,14 @@ func (app *Application) Run() error {
 	}
 	slog.Info("bundle discovery complete", "bundles_dir", bundlesDir, "bundle_count", len(app.bundles))
 
-	// Initialize UI screens
+	// Try to load app.star for custom UI
+	if err := app.loadStarlarkUI(); err != nil {
+		slog.Info("using built-in UI", "reason", err)
+	} else {
+		slog.Info("loaded custom Starlark UI from app.star")
+	}
+
+	// Initialize built-in UI screens (used as fallback or if no Starlark UI)
 	app.launcherScreen = NewLauncherScreen(app)
 	app.terminalScreen = NewTerminalScreen(app)
 
@@ -352,6 +511,10 @@ func (app *Application) showError(err error) {
 }
 
 func (app *Application) renderLauncher(f graphics.Frame) error {
+	// Use Starlark UI if available
+	if app.starEngine != nil && app.starEngine.HasScreen("launcher") {
+		return app.renderStarlarkLauncher(f)
+	}
 	return app.launcherScreen.Render(f)
 }
 
@@ -379,6 +542,11 @@ func (app *Application) renderLoading(f graphics.Frame) error {
 		}
 	}
 
+	// Use Starlark UI if available
+	if app.starEngine != nil && app.starEngine.HasScreen("loading") {
+		return app.renderStarlarkLoading(f)
+	}
+
 	// Create or use cached loading screen
 	if app.loadingScreen == nil {
 		app.loadingScreen = NewLoadingScreen(app)
@@ -387,6 +555,11 @@ func (app *Application) renderLoading(f graphics.Frame) error {
 }
 
 func (app *Application) renderError(f graphics.Frame) error {
+	// Use Starlark UI if available
+	if app.starEngine != nil && app.starEngine.HasScreen("error") {
+		return app.renderStarlarkError(f)
+	}
+
 	// Create or use cached error screen (rebuild if error message changed)
 	if app.errorScreen == nil {
 		app.errorScreen = NewErrorScreen(app)
