@@ -2879,13 +2879,15 @@ func (ns *NetStack) EnableDebugHTTP(addr string) error {
 	ns.debugListener = ln
 	ns.debugAddr = ln.Addr().String()
 
-	ns.debugWG.Go(func() {
+	ns.debugWG.Add(1)
+	go func() {
+		defer ns.debugWG.Done()
 		if err := srv.Serve(ln); err != nil &&
 			!errors.Is(err, http.ErrServerClosed) &&
 			!errors.Is(err, net.ErrClosed) {
 			ns.log.Warn("raw: debug http serve", "err", err)
 		}
-	})
+	}()
 
 	debug.Writef("netstack.EnableDebugHTTP", "addr=%s", addr)
 	return nil

@@ -211,6 +211,10 @@ func (c *compiler) compileFragment(f ir.Fragment) error {
 		return c.compilePrintf(frag)
 	case ir.CallFragment:
 		return c.compileCall(frag)
+	case ir.ISBFragment:
+		c.emit(arm64asm.DSB())
+		c.emit(arm64asm.ISB())
+		return nil
 	case ir.ConstantBytesFragment:
 		c.emit(arm64asm.LoadConstantBytes(frag.Target, frag.Data))
 		return nil
@@ -523,13 +527,11 @@ func (c *compiler) emitConditionJump(cond ir.Condition, trueLabel, falseLabel as
 		case ir.CompareLess:
 			c.emit(arm64asm.JumpIfLess(trueLabel))
 		case ir.CompareLessOrEqual:
-			c.emit(arm64asm.JumpIfLess(trueLabel))
-			c.emit(arm64asm.JumpIfEqual(trueLabel))
+			c.emit(arm64asm.JumpIfLessOrEqual(trueLabel))
 		case ir.CompareGreater:
 			c.emit(arm64asm.JumpIfGreater(trueLabel))
 		case ir.CompareGreaterOrEqual:
-			c.emit(arm64asm.JumpIfGreater(trueLabel))
-			c.emit(arm64asm.JumpIfEqual(trueLabel))
+			c.emit(arm64asm.JumpIfGreaterOrEqual(trueLabel))
 		default:
 			return fmt.Errorf("ir: unsupported comparison kind %d", cv.Kind)
 		}
@@ -893,6 +895,54 @@ func (c *compiler) evalOp(op ir.OpFragment) (asm.Variable, ir.ValueWidth, error)
 			return 0, 0, err
 		}
 		c.emit(arm64asm.AndRegReg(arm64asm.Reg64(leftReg), arm64asm.Reg64(rightReg)))
+		c.freeReg(rightReg)
+		return leftReg, ir.Width64, nil
+	case ir.OpOr:
+		leftReg, _, err := c.evalValue(op.Left)
+		if err != nil {
+			return 0, 0, err
+		}
+		if imm, ok := toInt64(op.Right); ok {
+			tmp, err := c.allocRegPrefer(arm64asm.X0)
+			if err != nil {
+				c.freeReg(leftReg)
+				return 0, 0, err
+			}
+			c.emit(arm64asm.MovImmediate(arm64asm.Reg64(tmp), imm))
+			c.emit(arm64asm.OrRegReg(arm64asm.Reg64(leftReg), arm64asm.Reg64(tmp)))
+			c.freeReg(tmp)
+			return leftReg, ir.Width64, nil
+		}
+		rightReg, _, err := c.evalValue(op.Right)
+		if err != nil {
+			c.freeReg(leftReg)
+			return 0, 0, err
+		}
+		c.emit(arm64asm.OrRegReg(arm64asm.Reg64(leftReg), arm64asm.Reg64(rightReg)))
+		c.freeReg(rightReg)
+		return leftReg, ir.Width64, nil
+	case ir.OpXor:
+		leftReg, _, err := c.evalValue(op.Left)
+		if err != nil {
+			return 0, 0, err
+		}
+		if imm, ok := toInt64(op.Right); ok {
+			tmp, err := c.allocRegPrefer(arm64asm.X0)
+			if err != nil {
+				c.freeReg(leftReg)
+				return 0, 0, err
+			}
+			c.emit(arm64asm.MovImmediate(arm64asm.Reg64(tmp), imm))
+			c.emit(arm64asm.XorRegReg(arm64asm.Reg64(leftReg), arm64asm.Reg64(tmp)))
+			c.freeReg(tmp)
+			return leftReg, ir.Width64, nil
+		}
+		rightReg, _, err := c.evalValue(op.Right)
+		if err != nil {
+			c.freeReg(leftReg)
+			return 0, 0, err
+		}
+		c.emit(arm64asm.XorRegReg(arm64asm.Reg64(leftReg), arm64asm.Reg64(rightReg)))
 		c.freeReg(rightReg)
 		return leftReg, ir.Width64, nil
 	default:

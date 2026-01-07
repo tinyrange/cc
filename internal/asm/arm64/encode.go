@@ -122,6 +122,20 @@ func encodeAndReg(dst, left, right Reg) (uint32, error) {
 	return 0x8A000000 | (uint32(right.id) << 16) | (uint32(left.id) << 5) | uint32(dst.id), nil
 }
 
+func encodeOrrReg(dst, left, right Reg) (uint32, error) {
+	if dst.size != size64 || left.size != size64 || right.size != size64 {
+		return 0, fmt.Errorf("arm64 asm: ORR register requires 64-bit operands")
+	}
+	return 0xAA000000 | (uint32(right.id) << 16) | (uint32(left.id) << 5) | uint32(dst.id), nil
+}
+
+func encodeEorReg(dst, left, right Reg) (uint32, error) {
+	if dst.size != size64 || left.size != size64 || right.size != size64 {
+		return 0, fmt.Errorf("arm64 asm: EOR register requires 64-bit operands")
+	}
+	return 0xCA000000 | (uint32(right.id) << 16) | (uint32(left.id) << 5) | uint32(dst.id), nil
+}
+
 func encodeOrrRegZero(dst, src Reg) (uint32, error) {
 	if dst.size != size64 || src.size != size64 {
 		return 0, fmt.Errorf("arm64 asm: ORR requires 64-bit operands")

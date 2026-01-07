@@ -321,6 +321,48 @@ func AndRegReg(dst, src Reg) asm.Fragment {
 	})
 }
 
+func OrRegReg(dst, src Reg) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		if err := dst.validate(); err != nil {
+			return err
+		}
+		if err := src.validate(); err != nil {
+			return err
+		}
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		word, err := encodeOrrReg(dst, dst, src)
+		if err != nil {
+			return err
+		}
+		c.emit32(word)
+		return nil
+	})
+}
+
+func XorRegReg(dst, src Reg) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		if err := dst.validate(); err != nil {
+			return err
+		}
+		if err := src.validate(); err != nil {
+			return err
+		}
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		word, err := encodeEorReg(dst, dst, src)
+		if err != nil {
+			return err
+		}
+		c.emit32(word)
+		return nil
+	})
+}
+
 func MovToMemory64(mem Memory, src Reg) asm.Fragment {
 	return storeHelper(mem, src, literal64)
 }
@@ -492,6 +534,34 @@ func Ret() asm.Fragment {
 			return err
 		}
 		c.emit32(0xD65F03C0)
+		return nil
+	})
+}
+
+// ISB emits an Instruction Synchronization Barrier.
+// This is required after modifying code in memory before executing it.
+func ISB() asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		// ISB SY: 0xD5033FDF
+		c.emit32(0xD5033FDF)
+		return nil
+	})
+}
+
+// DSB emits a Data Synchronization Barrier (full system).
+// This ensures all memory operations complete before continuing.
+func DSB() asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		// DSB SY: 0xD5033F9F
+		c.emit32(0xD5033F9F)
 		return nil
 	})
 }

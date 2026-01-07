@@ -193,6 +193,9 @@ func (c *compiler) compileFragment(f ir.Fragment) error {
 		return c.compilePrintf(frag)
 	case ir.CallFragment:
 		return c.compileCall(frag)
+	case ir.ISBFragment:
+		// x86-64 has coherent instruction caches, no barrier needed
+		return nil
 	case ir.ConstantBytesFragment:
 		c.emit(amd64.LoadConstantBytes(frag.Target, frag.Data))
 		return nil
@@ -870,6 +873,38 @@ func (c *compiler) evalOp(op ir.OpFragment) (asm.Variable, ir.ValueWidth, error)
 			return 0, 0, err
 		}
 		c.emit(amd64.AndRegReg(amd64.Reg64(leftReg), amd64.Reg64(rightReg)))
+		c.freeReg(rightReg)
+		return leftReg, ir.Width64, nil
+	case ir.OpOr:
+		leftReg, _, err := c.evalValue(op.Left)
+		if err != nil {
+			return 0, 0, err
+		}
+		if imm, ok := toInt64(op.Right); ok {
+			if imm >= math.MinInt32 && imm <= math.MaxInt32 {
+				c.emit(amd64.OrRegImm(amd64.Reg64(leftReg), int32(imm)))
+				return leftReg, ir.Width64, nil
+			}
+		}
+		rightReg, _, err := c.evalValue(op.Right)
+		if err != nil {
+			c.freeReg(leftReg)
+			return 0, 0, err
+		}
+		c.emit(amd64.OrRegReg(amd64.Reg64(leftReg), amd64.Reg64(rightReg)))
+		c.freeReg(rightReg)
+		return leftReg, ir.Width64, nil
+	case ir.OpXor:
+		leftReg, _, err := c.evalValue(op.Left)
+		if err != nil {
+			return 0, 0, err
+		}
+		rightReg, _, err := c.evalValue(op.Right)
+		if err != nil {
+			c.freeReg(leftReg)
+			return 0, 0, err
+		}
+		c.emit(amd64.XorRegReg(amd64.Reg64(leftReg), amd64.Reg64(rightReg)))
 		c.freeReg(rightReg)
 		return leftReg, ir.Width64, nil
 	default:

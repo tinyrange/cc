@@ -10,6 +10,7 @@ import (
 
 	"github.com/tinyrange/cc/internal/ir"
 	"github.com/tinyrange/cc/internal/linux/defs"
+	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 )
 
 // TypeKind enumerates the minimal scalar types supported by the rtg front-end.
@@ -86,18 +87,34 @@ func (s *scope) define(name string, typ Type) error {
 	return nil
 }
 
+// CompileOptions specifies options for RTG compilation.
+type CompileOptions struct {
+	// GOARCH is the target architecture ("amd64" or "arm64").
+	// Used to resolve runtime.GOARCH comparisons at compile time.
+	GOARCH string
+}
+
 // Compiler holds the state for a single source-to-IR lowering.
 type Compiler struct {
 	fset       *token.FileSet
 	file       *ast.File
 	scope      *scope
 	returnType Type
+	opts       CompileOptions
+	constants  map[string]int64 // package-level constants
+	labelCount int              // counter for generating unique labels
 }
 
 // CompileProgram parses src and lowers it into an ir.Program. The accepted
 // language is intentionally small; unsupported constructs return friendly
 // errors rather than attempting partial lowering.
 func CompileProgram(src string) (*ir.Program, error) {
+	return CompileProgramWithOptions(src, CompileOptions{})
+}
+
+// CompileProgramWithOptions parses src and lowers it into an ir.Program
+// with the specified compilation options.
+func CompileProgramWithOptions(src string, opts CompileOptions) (*ir.Program, error) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "input.go", src, parser.AllErrors)
 	if err != nil {
@@ -105,9 +122,11 @@ func CompileProgram(src string) (*ir.Program, error) {
 	}
 
 	c := &Compiler{
-		fset:  fset,
-		file:  file,
-		scope: newScope(nil),
+		fset:      fset,
+		file:      file,
+		scope:     newScope(nil),
+		opts:      opts,
+		constants: make(map[string]int64),
 	}
 	return c.compile()
 }
@@ -121,13 +140,23 @@ func (c *Compiler) compile() (*ir.Program, error) {
 		return nil, fmt.Errorf("rtg: only package main is supported (got %q)", pkgName)
 	}
 
+	// First pass: collect imports and constants
+	for _, decl := range c.file.Decls {
+		if genDecl, ok := decl.(*ast.GenDecl); ok {
+			if err := c.processGenDecl(genDecl); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	// Second pass: compile functions
 	methods := make(map[string]ir.Method)
 	var entrypoint string
 
 	for _, decl := range c.file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok {
-			return nil, fmt.Errorf("rtg: only func declarations are supported")
+			continue // skip GenDecl, already processed
 		}
 		name := fn.Name.Name
 		if _, exists := methods[name]; exists {
@@ -152,6 +181,62 @@ func (c *Compiler) compile() (*ir.Program, error) {
 		Entrypoint: entrypoint,
 		Methods:    methods,
 	}, nil
+}
+
+// processGenDecl handles import and const declarations.
+func (c *Compiler) processGenDecl(decl *ast.GenDecl) error {
+	switch decl.Tok {
+	case token.IMPORT:
+		// Allow imports but only for the runtime package (which we handle specially)
+		for _, spec := range decl.Specs {
+			importSpec, ok := spec.(*ast.ImportSpec)
+			if !ok {
+				continue
+			}
+			path, err := strconv.Unquote(importSpec.Path.Value)
+			if err != nil {
+				return fmt.Errorf("rtg: invalid import path: %w", err)
+			}
+			// Only allow the RTG runtime package
+			if path != "github.com/tinyrange/cc/internal/rtg/runtime" {
+				return fmt.Errorf("rtg: unsupported import %q (only github.com/tinyrange/cc/internal/rtg/runtime is allowed)", path)
+			}
+			// Import is allowed but we handle runtime.* specially
+		}
+		return nil
+
+	case token.CONST:
+		// Process constant declarations
+		for _, spec := range decl.Specs {
+			valueSpec, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			for i, name := range valueSpec.Names {
+				if i >= len(valueSpec.Values) {
+					// No value provided, skip
+					continue
+				}
+				val, err := c.evalInt(valueSpec.Values[i])
+				if err != nil {
+					return fmt.Errorf("rtg: const %s: %w", name.Name, err)
+				}
+				c.constants[name.Name] = val
+			}
+		}
+		return nil
+
+	case token.VAR:
+		// Disallow var declarations at package level
+		return fmt.Errorf("rtg: package-level var declarations are not supported")
+
+	case token.TYPE:
+		// Disallow type declarations
+		return fmt.Errorf("rtg: type declarations are not supported")
+
+	default:
+		return fmt.Errorf("rtg: unsupported declaration %v", decl.Tok)
+	}
 }
 
 func (c *Compiler) lowerFunc(fn *ast.FuncDecl) (ir.Method, error) {
@@ -269,6 +354,8 @@ func (c *Compiler) lowerStmt(stmt ast.Stmt) ([]ir.Fragment, error) {
 		return c.lowerDecl(s)
 	case *ast.IfStmt:
 		return c.lowerIf(s)
+	case *ast.ForStmt:
+		return c.lowerFor(s)
 	case *ast.LabeledStmt:
 		return c.lowerLabeled(s)
 	case *ast.BranchStmt:
@@ -330,9 +417,59 @@ func (c *Compiler) lowerAssign(assign *ast.AssignStmt) ([]ir.Fragment, error) {
 	if len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
 		return nil, fmt.Errorf("rtg: only single-value assignments are supported")
 	}
+
+	// Handle index expression on left side: ptr[offset] = value
+	if indexExpr, ok := assign.Lhs[0].(*ast.IndexExpr); ok {
+		if assign.Tok != token.ASSIGN {
+			return nil, fmt.Errorf("rtg: index assignment only supports = operator")
+		}
+		value, _, err := c.lowerExpr(assign.Rhs[0])
+		if err != nil {
+			return nil, err
+		}
+		dst, _, err := c.lowerIndex(indexExpr)
+		if err != nil {
+			return nil, err
+		}
+		return []ir.Fragment{ir.Assign(dst, value)}, nil
+	}
+
 	ident, ok := assign.Lhs[0].(*ast.Ident)
 	if !ok {
-		return nil, fmt.Errorf("rtg: left-hand side must be identifier")
+		return nil, fmt.Errorf("rtg: left-hand side must be identifier or index expression")
+	}
+
+	// Handle indirect call(target) or runtime.Call(target) specially - generate ir.Call with result variable
+	if callExpr, ok := assign.Rhs[0].(*ast.CallExpr); ok {
+		funcName, err := c.resolveFuncName(callExpr.Fun)
+		if err == nil && (funcName == "call" || funcName == "Call") {
+			if len(callExpr.Args) != 1 {
+				return nil, fmt.Errorf("rtg: call expects (target)")
+			}
+			callTarget, _, err := c.lowerExpr(callExpr.Args[0])
+			if err != nil {
+				return nil, err
+			}
+			// Register the result variable
+			valType := Type{Kind: TypeI64}
+			switch assign.Tok {
+			case token.DEFINE:
+				if err := c.scope.define(ident.Name, valType); err != nil {
+					return nil, err
+				}
+			case token.ASSIGN:
+				existing, ok := c.scope.lookup(ident.Name)
+				if !ok {
+					return nil, fmt.Errorf("rtg: assignment to undefined identifier %q", ident.Name)
+				}
+				if !typesCompatible(existing, valType) {
+					return nil, fmt.Errorf("rtg: cannot assign %s to %s", valType, existing)
+				}
+			default:
+				return nil, fmt.Errorf("rtg: unsupported assignment operator %s", assign.Tok)
+			}
+			return []ir.Fragment{ir.Call(callTarget, ir.Var(ident.Name))}, nil
+		}
 	}
 
 	value, valType, err := c.lowerExpr(assign.Rhs[0])
@@ -388,6 +525,85 @@ func (c *Compiler) lowerIf(stmt *ast.IfStmt) ([]ir.Fragment, error) {
 	}
 
 	return []ir.Fragment{ir.If(cond, thenBlock, elseBlock)}, nil
+}
+
+func (c *Compiler) lowerFor(stmt *ast.ForStmt) ([]ir.Fragment, error) {
+	if stmt.Init != nil {
+		return nil, fmt.Errorf("rtg: for init statements are not supported")
+	}
+	if stmt.Post != nil {
+		return nil, fmt.Errorf("rtg: for post statements are not supported")
+	}
+
+	// Generate unique labels for this loop
+	c.labelCount++
+	loopID := c.labelCount
+	startLabel := ir.Label(fmt.Sprintf("__for_start_%d", loopID))
+	endLabel := ir.Label(fmt.Sprintf("__for_end_%d", loopID))
+
+	// Lower the loop body
+	body, err := c.lowerBlock(stmt.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var frags []ir.Fragment
+
+	if stmt.Cond == nil {
+		// Infinite loop: for { ... }
+		// start:
+		//   body
+		//   goto start
+		loopBody := append(body, ir.Goto(startLabel))
+		frags = append(frags, ir.DeclareLabel(startLabel, ir.Block(loopBody)))
+	} else {
+		// Conditional loop: for cond { ... }
+		// start:
+		//   if !cond { goto end }
+		//   body
+		//   goto start
+		// end:
+		cond, err := c.lowerCondition(stmt.Cond)
+		if err != nil {
+			return nil, err
+		}
+
+		// Invert the condition for the exit check
+		exitCond := invertCondition(cond)
+
+		loopBody := ir.Block{
+			ir.If(exitCond, ir.Block{ir.Goto(endLabel)}),
+		}
+		loopBody = append(loopBody, body...)
+		loopBody = append(loopBody, ir.Goto(startLabel))
+
+		frags = append(frags, ir.DeclareLabel(startLabel, loopBody))
+		frags = append(frags, ir.DeclareLabel(endLabel, ir.Block{}))
+	}
+
+	return frags, nil
+}
+
+// invertCondition inverts a comparison condition for loop exit checks.
+func invertCondition(cond ir.Condition) ir.Condition {
+	if cc, ok := cond.(ir.CompareCondition); ok {
+		switch cc.Kind {
+		case ir.CompareEqual:
+			return ir.CompareCondition{Kind: ir.CompareNotEqual, Left: cc.Left, Right: cc.Right}
+		case ir.CompareNotEqual:
+			return ir.CompareCondition{Kind: ir.CompareEqual, Left: cc.Left, Right: cc.Right}
+		case ir.CompareLess:
+			return ir.CompareCondition{Kind: ir.CompareGreaterOrEqual, Left: cc.Left, Right: cc.Right}
+		case ir.CompareLessOrEqual:
+			return ir.CompareCondition{Kind: ir.CompareGreater, Left: cc.Left, Right: cc.Right}
+		case ir.CompareGreater:
+			return ir.CompareCondition{Kind: ir.CompareLessOrEqual, Left: cc.Left, Right: cc.Right}
+		case ir.CompareGreaterOrEqual:
+			return ir.CompareCondition{Kind: ir.CompareLess, Left: cc.Left, Right: cc.Right}
+		}
+	}
+	// Fallback: compare with 0 (treat as false)
+	return ir.CompareCondition{Kind: ir.CompareEqual, Left: cond, Right: ir.Int64(0)}
 }
 
 func (c *Compiler) lowerElse(stmt ast.Stmt) (ir.Fragment, error) {
@@ -474,33 +690,83 @@ func (c *Compiler) lowerExprStmt(stmt *ast.ExprStmt) ([]ir.Fragment, error) {
 }
 
 func (c *Compiler) lowerCallStmt(call *ast.CallExpr) ([]ir.Fragment, error) {
-	target, ok := call.Fun.(*ast.Ident)
-	if !ok {
-		return nil, fmt.Errorf("rtg: unsupported call target %T", call.Fun)
+	// Get the function name, handling both plain identifiers and runtime.X selectors
+	funcName, err := c.resolveFuncName(call.Fun)
+	if err != nil {
+		return nil, err
 	}
-	switch target.Name {
-	case "printf":
+
+	switch funcName {
+	case "printf", "Printf":
 		return c.lowerPrintf(call)
-	case "syscall":
+	case "syscall", "Syscall":
 		frag, _, err := c.lowerSyscall(call)
 		if err != nil {
 			return nil, err
 		}
 		return []ir.Fragment{frag}, nil
-	case "store32":
+	case "store8", "Store8":
+		frag, err := c.lowerStore(call, 8)
+		if err != nil {
+			return nil, err
+		}
+		return []ir.Fragment{frag}, nil
+	case "store16", "Store16":
+		frag, err := c.lowerStore(call, 16)
+		if err != nil {
+			return nil, err
+		}
+		return []ir.Fragment{frag}, nil
+	case "store32", "Store32":
 		frag, err := c.lowerStore(call, 32)
 		if err != nil {
 			return nil, err
 		}
 		return []ir.Fragment{frag}, nil
-	case "gotoLabel":
+	case "store64", "Store64":
+		frag, err := c.lowerStore(call, 64)
+		if err != nil {
+			return nil, err
+		}
+		return []ir.Fragment{frag}, nil
+	case "gotoLabel", "GotoLabel":
 		frag, err := c.lowerGotoCall(call)
 		if err != nil {
 			return nil, err
 		}
 		return []ir.Fragment{frag}, nil
+	case "isb", "ISB":
+		// Instruction Synchronization Barrier - required on ARM64 after modifying code
+		if len(call.Args) != 0 {
+			return nil, fmt.Errorf("rtg: isb() takes no arguments")
+		}
+		return []ir.Fragment{ir.ISB()}, nil
 	default:
-		return nil, fmt.Errorf("rtg: unsupported call %q", target.Name)
+		// Allow calling user-defined functions as statements (void calls)
+		if len(call.Args) == 0 {
+			return []ir.Fragment{ir.CallMethod(funcName)}, nil
+		}
+		return nil, fmt.Errorf("rtg: unsupported call %q (user function calls with arguments not yet supported)", funcName)
+	}
+}
+
+// resolveFuncName extracts the function name from a call expression,
+// handling both plain identifiers (syscall) and selector expressions (runtime.Syscall).
+func (c *Compiler) resolveFuncName(fun ast.Expr) (string, error) {
+	switch f := fun.(type) {
+	case *ast.Ident:
+		return f.Name, nil
+	case *ast.SelectorExpr:
+		pkg, ok := f.X.(*ast.Ident)
+		if !ok {
+			return "", fmt.Errorf("rtg: unsupported call target")
+		}
+		if pkg.Name != "runtime" {
+			return "", fmt.Errorf("rtg: unsupported package %q in call", pkg.Name)
+		}
+		return f.Sel.Name, nil
+	default:
+		return "", fmt.Errorf("rtg: unsupported call target %T", fun)
 	}
 }
 
@@ -518,6 +784,10 @@ func (c *Compiler) lowerExpr(expr ast.Expr) (ir.Fragment, Type, error) {
 		return c.lowerExpr(v.X)
 	case *ast.UnaryExpr:
 		return c.lowerUnary(v)
+	case *ast.IndexExpr:
+		return c.lowerIndex(v)
+	case *ast.SelectorExpr:
+		return c.lowerSelector(v)
 	default:
 		return nil, Type{}, fmt.Errorf("rtg: unsupported expression %T", expr)
 	}
@@ -555,8 +825,52 @@ func (c *Compiler) lowerIdent(id *ast.Ident) (ir.Fragment, Type, error) {
 	case "false":
 		return ir.Int64(0), Type{Kind: TypeBool}, nil
 	default:
+		// Check for user-defined constants first
+		if val, ok := c.constants[id.Name]; ok {
+			return ir.Int64(val), Type{Kind: TypeI64}, nil
+		}
+		// Check for builtin constants
+		if val, ok := constantValues[id.Name]; ok {
+			return ir.Int64(val), Type{Kind: TypeI64}, nil
+		}
 		return nil, Type{}, fmt.Errorf("rtg: unknown identifier %q", id.Name)
 	}
+}
+
+// lowerSelector handles selector expressions like runtime.X
+func (c *Compiler) lowerSelector(sel *ast.SelectorExpr) (ir.Fragment, Type, error) {
+	// Only handle runtime.X selectors
+	pkg, ok := sel.X.(*ast.Ident)
+	if !ok {
+		return nil, Type{}, fmt.Errorf("rtg: unsupported selector expression")
+	}
+	if pkg.Name != "runtime" {
+		return nil, Type{}, fmt.Errorf("rtg: unsupported package %q in selector", pkg.Name)
+	}
+
+	name := sel.Sel.Name
+
+	// Handle runtime.GOARCH specially
+	if name == "GOARCH" {
+		if c.opts.GOARCH == "" {
+			return nil, Type{}, fmt.Errorf("rtg: runtime.GOARCH used but GOARCH not specified in CompileOptions")
+		}
+		return c.opts.GOARCH, Type{Kind: TypeString}, nil
+	}
+
+	// Handle runtime constants (SYS_*, AT_FDCWD, etc.)
+	if val, ok := constantValues[name]; ok {
+		return ir.Int64(val), Type{Kind: TypeI64}, nil
+	}
+
+	// Handle syscall names (for runtime.SYS_* that maps to defs.Syscall)
+	if strings.HasPrefix(name, "SYS_") {
+		if num, ok := syscallNames[name]; ok {
+			return ir.Int64(int64(num)), Type{Kind: TypeI64}, nil
+		}
+	}
+
+	return nil, Type{}, fmt.Errorf("rtg: unknown runtime member %q", name)
 }
 
 func (c *Compiler) lowerUnary(expr *ast.UnaryExpr) (ir.Fragment, Type, error) {
@@ -575,7 +889,41 @@ func (c *Compiler) lowerUnary(expr *ast.UnaryExpr) (ir.Fragment, Type, error) {
 	}
 }
 
+func (c *Compiler) lowerIndex(expr *ast.IndexExpr) (ir.Fragment, Type, error) {
+	// Get pointer base
+	base, ok := expr.X.(*ast.Ident)
+	if !ok {
+		return nil, Type{}, fmt.Errorf("rtg: index expression base must be an identifier")
+	}
+
+	typ, ok := c.scope.lookup(base.Name)
+	if !ok {
+		return nil, Type{}, fmt.Errorf("rtg: unknown identifier %q", base.Name)
+	}
+	if typ.Kind != TypeUintptr && typ.Kind != TypeI64 {
+		return nil, Type{}, fmt.Errorf("rtg: %s is not a pointer", base.Name)
+	}
+
+	// Get index/offset
+	offset, err := c.evalInt(expr.Index)
+	if err != nil {
+		return nil, Type{}, fmt.Errorf("rtg: index must be a constant integer: %w", err)
+	}
+
+	mem := ir.Var(base.Name).Mem()
+	if offset != 0 {
+		mem = mem.WithDisp(ir.Int64(offset)).(ir.MemVar)
+	}
+
+	return mem, Type{Kind: TypeI64}, nil
+}
+
 func (c *Compiler) lowerBinary(expr *ast.BinaryExpr) (ir.Fragment, Type, error) {
+	// Try constant folding first - if both operands are constants, evaluate at compile time
+	if val, err := c.evalInt(expr); err == nil {
+		return ir.Int64(val), Type{Kind: TypeI64}, nil
+	}
+
 	left, lType, err := c.lowerExpr(expr.X)
 	if err != nil {
 		return nil, Type{}, err
@@ -603,6 +951,26 @@ func (c *Compiler) lowerCondition(expr ast.Expr) (ir.Condition, error) {
 		if !ok {
 			return nil, fmt.Errorf("rtg: unsupported comparison %s", v.Op)
 		}
+
+		// Try to evaluate string comparisons at compile time (e.g., runtime.GOARCH == "amd64")
+		if v.Op == token.EQL || v.Op == token.NEQ {
+			leftStr, leftIsStr := c.evalString(v.X)
+			rightStr, rightIsStr := c.evalString(v.Y)
+			if leftIsStr && rightIsStr {
+				// Both sides are compile-time known strings
+				equal := leftStr == rightStr
+				if v.Op == token.NEQ {
+					equal = !equal
+				}
+				if equal {
+					// Always true: compare 1 == 1
+					return ir.CompareCondition{Kind: ir.CompareEqual, Left: ir.Int64(1), Right: ir.Int64(1)}, nil
+				}
+				// Always false: compare 1 == 0
+				return ir.CompareCondition{Kind: ir.CompareEqual, Left: ir.Int64(1), Right: ir.Int64(0)}, nil
+			}
+		}
+
 		left, lType, err := c.lowerExpr(v.X)
 		if err != nil {
 			return nil, err
@@ -629,16 +997,58 @@ func (c *Compiler) lowerCondition(expr ast.Expr) (ir.Condition, error) {
 	}
 }
 
-func (c *Compiler) lowerExprCall(call *ast.CallExpr) (ir.Fragment, Type, error) {
-	target, ok := call.Fun.(*ast.Ident)
-	if !ok {
-		return nil, Type{}, fmt.Errorf("rtg: unsupported call target %T", call.Fun)
+// evalString attempts to evaluate an expression as a compile-time known string.
+// Returns the string value and true if successful, or ("", false) otherwise.
+func (c *Compiler) evalString(expr ast.Expr) (string, bool) {
+	switch v := expr.(type) {
+	case *ast.BasicLit:
+		if v.Kind == token.STRING {
+			val, err := strconv.Unquote(v.Value)
+			if err != nil {
+				return "", false
+			}
+			return val, true
+		}
+	case *ast.SelectorExpr:
+		// Handle runtime.GOARCH
+		pkg, ok := v.X.(*ast.Ident)
+		if !ok || pkg.Name != "runtime" {
+			return "", false
+		}
+		if v.Sel.Name == "GOARCH" && c.opts.GOARCH != "" {
+			return c.opts.GOARCH, true
+		}
 	}
-	switch target.Name {
-	case "syscall":
+	return "", false
+}
+
+func (c *Compiler) lowerExprCall(call *ast.CallExpr) (ir.Fragment, Type, error) {
+	// Get the function name, handling both plain identifiers and runtime.X selectors
+	funcName, err := c.resolveFuncName(call.Fun)
+	if err != nil {
+		return nil, Type{}, err
+	}
+
+	switch funcName {
+	case "syscall", "Syscall":
 		return c.lowerSyscall(call)
+	case "load8", "Load8":
+		return c.lowerLoad(call, 8)
+	case "load16", "Load16":
+		return c.lowerLoad(call, 16)
+	case "load32", "Load32":
+		return c.lowerLoad(call, 32)
+	case "load64", "Load64":
+		return c.lowerLoad(call, 64)
+	case "call", "Call":
+		return c.lowerIndirectCall(call)
 	default:
-		return nil, Type{}, fmt.Errorf("rtg: unsupported call %q", target.Name)
+		// Check if it's a call to a user-defined function
+		// User-defined functions are called via ir.CallMethod and return int64
+		if len(call.Args) == 0 {
+			return ir.CallMethod(funcName), Type{Kind: TypeI64}, nil
+		}
+		return nil, Type{}, fmt.Errorf("rtg: unsupported call %q (user function calls with arguments not yet supported)", funcName)
 	}
 }
 
@@ -694,6 +1104,32 @@ func (c *Compiler) lowerStore(call *ast.CallExpr, width int) (ir.Fragment, error
 	return ir.Assign(mem, value), nil
 }
 
+func (c *Compiler) lowerLoad(call *ast.CallExpr, width int) (ir.Fragment, Type, error) {
+	if len(call.Args) != 2 {
+		return nil, Type{}, fmt.Errorf("rtg: load%d expects (ptr, offset)", width)
+	}
+
+	mem, err := c.lowerMemRef(call.Args[0], call.Args[1], width)
+	if err != nil {
+		return nil, Type{}, err
+	}
+
+	return mem, Type{Kind: TypeI64}, nil
+}
+
+func (c *Compiler) lowerIndirectCall(call *ast.CallExpr) (ir.Fragment, Type, error) {
+	if len(call.Args) != 1 {
+		return nil, Type{}, fmt.Errorf("rtg: call expects (target)")
+	}
+
+	target, _, err := c.lowerExpr(call.Args[0])
+	if err != nil {
+		return nil, Type{}, err
+	}
+
+	return ir.CallFragment{Target: target}, Type{Kind: TypeI64}, nil
+}
+
 func (c *Compiler) lowerMemRef(ptr ast.Expr, offset ast.Expr, width int) (ir.Fragment, error) {
 	base, disp, err := c.extractPointer(ptr, offset)
 	if err != nil {
@@ -706,10 +1142,16 @@ func (c *Compiler) lowerMemRef(ptr ast.Expr, offset ast.Expr, width int) (ir.Fra
 	}
 
 	switch width {
+	case 8:
+		return mem.As8(), nil
+	case 16:
+		return mem.As16(), nil
 	case 32:
 		return mem.As32(), nil
+	case 64:
+		return mem, nil
 	default:
-		return nil, fmt.Errorf("rtg: unsupported store width %d", width)
+		return nil, fmt.Errorf("rtg: unsupported memory width %d", width)
 	}
 }
 
@@ -806,6 +1248,69 @@ func (c *Compiler) evalInt(expr ast.Expr) (int64, error) {
 			return -val, nil
 		}
 		return val, nil
+	case *ast.Ident:
+		// Check for user-defined constants first
+		if val, ok := c.constants[v.Name]; ok {
+			return val, nil
+		}
+		// Check for builtin constants
+		if val, ok := constantValues[v.Name]; ok {
+			return val, nil
+		}
+		return 0, fmt.Errorf("unknown constant %q", v.Name)
+	case *ast.SelectorExpr:
+		// Handle runtime.X constants
+		pkg, ok := v.X.(*ast.Ident)
+		if !ok || pkg.Name != "runtime" {
+			return 0, fmt.Errorf("unsupported selector in constant expression")
+		}
+		name := v.Sel.Name
+		// Check builtin constants
+		if val, ok := constantValues[name]; ok {
+			return val, nil
+		}
+		// Check syscall names
+		if strings.HasPrefix(name, "SYS_") {
+			if num, ok := syscallNames[name]; ok {
+				return int64(num), nil
+			}
+		}
+		return 0, fmt.Errorf("unknown runtime constant %q", name)
+	case *ast.BinaryExpr:
+		// Try to evaluate binary expression of constants
+		left, err := c.evalInt(v.X)
+		if err != nil {
+			return 0, err
+		}
+		right, err := c.evalInt(v.Y)
+		if err != nil {
+			return 0, err
+		}
+		switch v.Op {
+		case token.ADD:
+			return left + right, nil
+		case token.SUB:
+			return left - right, nil
+		case token.MUL:
+			return left * right, nil
+		case token.QUO:
+			if right == 0 {
+				return 0, fmt.Errorf("division by zero")
+			}
+			return left / right, nil
+		case token.AND:
+			return left & right, nil
+		case token.OR:
+			return left | right, nil
+		case token.XOR:
+			return left ^ right, nil
+		case token.SHL:
+			return left << uint(right), nil
+		case token.SHR:
+			return left >> uint(right), nil
+		default:
+			return 0, fmt.Errorf("unsupported binary operator %s in constant expression", v.Op)
+		}
 	default:
 		return 0, fmt.Errorf("expected int literal")
 	}
@@ -818,6 +1323,16 @@ func (c *Compiler) evalSyscallNumber(expr ast.Expr) (defs.Syscall, error) {
 			return num, nil
 		}
 		return 0, fmt.Errorf("unknown syscall constant %q", v.Name)
+	case *ast.SelectorExpr:
+		// Handle runtime.SYS_* selectors
+		pkg, ok := v.X.(*ast.Ident)
+		if !ok || pkg.Name != "runtime" {
+			return 0, fmt.Errorf("unsupported selector in syscall number")
+		}
+		if num, ok := syscallNames[v.Sel.Name]; ok {
+			return num, nil
+		}
+		return 0, fmt.Errorf("unknown syscall constant %q", v.Sel.Name)
 	default:
 		val, err := c.evalInt(expr)
 		if err != nil {
@@ -845,6 +1360,8 @@ var binaryOps = map[token.Token]ir.OpKind{
 	token.SHL: ir.OpShl,
 	token.SHR: ir.OpShr,
 	token.AND: ir.OpAnd,
+	token.OR:  ir.OpOr,
+	token.XOR: ir.OpXor,
 }
 
 var comparisonOps = map[token.Token]ir.CompareKind{
@@ -857,19 +1374,86 @@ var comparisonOps = map[token.Token]ir.CompareKind{
 }
 
 var syscallNames = map[string]defs.Syscall{
-	"SYS_EXIT":        defs.SYS_EXIT,
-	"SYS_EXIT_GROUP":  defs.SYS_EXIT_GROUP,
-	"SYS_WRITE":       defs.SYS_WRITE,
-	"SYS_READ":        defs.SYS_READ,
-	"SYS_OPENAT":      defs.SYS_OPENAT,
-	"SYS_CLOSE":       defs.SYS_CLOSE,
-	"SYS_MMAP":        defs.SYS_MMAP,
-	"SYS_MUNMAP":      defs.SYS_MUNMAP,
-	"SYS_MOUNT":       defs.SYS_MOUNT,
-	"SYS_MKDIRAT":     defs.SYS_MKDIRAT,
-	"SYS_CHROOT":      defs.SYS_CHROOT,
-	"SYS_CHDIR":       defs.SYS_CHDIR,
-	"SYS_SETHOSTNAME": defs.SYS_SETHOSTNAME,
+	"SYS_EXIT":           defs.SYS_EXIT,
+	"SYS_EXIT_GROUP":     defs.SYS_EXIT_GROUP,
+	"SYS_WRITE":          defs.SYS_WRITE,
+	"SYS_READ":           defs.SYS_READ,
+	"SYS_OPENAT":         defs.SYS_OPENAT,
+	"SYS_CLOSE":          defs.SYS_CLOSE,
+	"SYS_MMAP":           defs.SYS_MMAP,
+	"SYS_MUNMAP":         defs.SYS_MUNMAP,
+	"SYS_MOUNT":          defs.SYS_MOUNT,
+	"SYS_MKDIRAT":        defs.SYS_MKDIRAT,
+	"SYS_MKNODAT":        defs.SYS_MKNODAT,
+	"SYS_CHROOT":         defs.SYS_CHROOT,
+	"SYS_CHDIR":          defs.SYS_CHDIR,
+	"SYS_SETHOSTNAME":    defs.SYS_SETHOSTNAME,
+	"SYS_IOCTL":          defs.SYS_IOCTL,
+	"SYS_DUP3":           defs.SYS_DUP3,
+	"SYS_SETSID":         defs.SYS_SETSID,
+	"SYS_REBOOT":         defs.SYS_REBOOT,
+	"SYS_INIT_MODULE":    defs.SYS_INIT_MODULE,
+	"SYS_CLOCK_SETTIME":  defs.SYS_CLOCK_SETTIME,
+	"SYS_CLOCK_GETTIME":  defs.SYS_CLOCK_GETTIME,
+	"SYS_SOCKET":         defs.SYS_SOCKET,
+	"SYS_SENDTO":         defs.SYS_SENDTO,
+	"SYS_RECVFROM":       defs.SYS_RECVFROM,
+	"SYS_EXECVE":         defs.SYS_EXECVE,
+	"SYS_CLONE":          defs.SYS_CLONE,
+	"SYS_WAIT4":          defs.SYS_WAIT4,
+	"SYS_MPROTECT":       defs.SYS_MPROTECT,
+	"SYS_GETPID":         defs.SYS_GETPID,
+}
+
+var constantValues = map[string]int64{
+	// File descriptor constants
+	"AT_FDCWD": int64(linux.AT_FDCWD),
+
+	// File mode constants
+	"S_IFCHR": int64(linux.S_IFCHR),
+
+	// File open flags
+	"O_RDONLY": int64(linux.O_RDONLY),
+	"O_WRONLY": int64(linux.O_WRONLY),
+	"O_RDWR":   int64(linux.O_RDWR),
+	"O_CREAT":  int64(linux.O_CREAT),
+	"O_TRUNC":  int64(linux.O_TRUNC),
+	"O_SYNC":   int64(linux.O_SYNC),
+
+	// Memory protection flags
+	"PROT_READ":  int64(linux.PROT_READ),
+	"PROT_WRITE": int64(linux.PROT_WRITE),
+	"PROT_EXEC":  int64(linux.PROT_EXEC),
+
+	// Memory map flags
+	"MAP_SHARED":    int64(linux.MAP_SHARED),
+	"MAP_PRIVATE":   int64(linux.MAP_PRIVATE),
+	"MAP_ANONYMOUS": int64(linux.MAP_ANONYMOUS),
+
+	// Error numbers (as negative values for syscall returns)
+	"EBUSY":  -int64(linux.EBUSY),
+	"EPERM":  -int64(linux.EPERM),
+	"EEXIST": -int64(linux.EEXIST),
+	"EPIPE":  -int64(linux.EPIPE),
+
+	// Reboot magic numbers
+	"LINUX_REBOOT_MAGIC1":        int64(linux.LINUX_REBOOT_MAGIC1),
+	"LINUX_REBOOT_MAGIC2":        int64(linux.LINUX_REBOOT_MAGIC2),
+	"LINUX_REBOOT_CMD_RESTART":   int64(linux.LINUX_REBOOT_CMD_RESTART),
+	"LINUX_REBOOT_CMD_POWER_OFF": int64(linux.LINUX_REBOOT_CMD_POWER_OFF),
+
+	// TTY ioctl
+	"TIOCSCTTY": int64(linux.TIOCSCTTY),
+
+	// Clock constants
+	"CLOCK_REALTIME": int64(linux.CLOCK_REALTIME),
+
+	// Network constants
+	"AF_INET":      int64(linux.AF_INET),
+	"AF_NETLINK":   int64(linux.AF_NETLINK),
+	"SOCK_DGRAM":   int64(linux.SOCK_DGRAM),
+	"SOCK_RAW":     int64(linux.SOCK_RAW),
+	"NETLINK_ROUTE": int64(linux.NETLINK_ROUTE),
 }
 
 // FormatErrors joins multiple errors when tests want deterministic output.
