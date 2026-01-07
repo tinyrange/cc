@@ -124,135 +124,116 @@ func main() int64 {
 
 	// allocate timespec buffer
 	timespecMem := runtime.Syscall(runtime.SYS_MMAP, 0, 16, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
-	if timespecMem < 0 {
-		goto skip_time_set
+	if timespecMem >= 0 {
+		// read time from config region and store in timespec struct
+		var timeSec int64 = 0
+		var timeNsec int64 = 0
+		timeSec = runtime.Load64(configMem, configTimeSecField)
+		timeNsec = runtime.Load64(configMem, configTimeNsecField)
+		runtime.Store64(timespecMem, 0, timeSec)
+		runtime.Store64(timespecMem, 8, timeNsec)
+
+		// call clock_settime
+		clockSetResult := runtime.Syscall(runtime.SYS_CLOCK_SETTIME, runtime.CLOCK_REALTIME, timespecMem)
+		if clockSetResult < 0 {
+			runtime.Printf("initx: clock_settime failed (errno=0x%x), continuing anyway\n", 0-clockSetResult)
+		}
+
+		// free timespec buffer
+		runtime.Syscall(runtime.SYS_MUNMAP, timespecMem, 16)
 	}
-
-	// read time from config region and store in timespec struct
-	var timeSec int64 = 0
-	var timeNsec int64 = 0
-	timeSec = runtime.Load64(configMem, configTimeSecField)
-	timeNsec = runtime.Load64(configMem, configTimeNsecField)
-	runtime.Store64(timespecMem, 0, timeSec)
-	runtime.Store64(timespecMem, 8, timeNsec)
-
-	// call clock_settime
-	clockSetResult := runtime.Syscall(runtime.SYS_CLOCK_SETTIME, runtime.CLOCK_REALTIME, timespecMem)
-	if clockSetResult < 0 {
-		runtime.Printf("initx: clock_settime failed (errno=0x%x), continuing anyway\n", 0-clockSetResult)
-	}
-
-	// free timespec buffer
-	runtime.Syscall(runtime.SYS_MUNMAP, timespecMem, 16)
-
-skip_time_set:
 
 	// === Phase 7: Main loop ===
 
-loop:
-	// check for magic value
-	var configMagic int64 = 0
-	configMagic = runtime.Load32(configMem, 0)
-	if configMagic == configHeaderMagicValue {
-		// load payload header
-		var codeLen int64 = 0
-		var relocCount int64 = 0
-		var relocBytes int64 = 0
-		var codeOffset int64 = 0
+	for {
+		// check for magic value
+		var configMagic int64 = 0
+		configMagic = runtime.Load32(configMem, 0)
+		if configMagic == configHeaderMagicValue {
+			// load payload header
+			var codeLen int64 = 0
+			var relocCount int64 = 0
+			var relocBytes int64 = 0
+			var codeOffset int64 = 0
 
-		codeLen = runtime.Load32(configMem, 4)
-		relocCount = runtime.Load32(configMem, 8)
-		relocBytes = relocCount << 2
-		codeOffset = configHeaderSize + relocBytes
+			codeLen = runtime.Load32(configMem, 4)
+			relocCount = runtime.Load32(configMem, 8)
+			relocBytes = relocCount << 2
+			codeOffset = configHeaderSize + relocBytes
 
-		// copy binary payload
-		var copySrc int64 = 0
-		var copyDst int64 = 0
-		var remaining int64 = 0
+			// copy binary payload
+			var copySrc int64 = 0
+			var copyDst int64 = 0
+			var remaining int64 = 0
 
-		copySrc = configMem + codeOffset
-		copyDst = anonMem
-		remaining = codeLen
+			copySrc = configMem + codeOffset
+			copyDst = anonMem
+			remaining = codeLen
 
-	copy_qword_loop:
-		if remaining < 4 {
-			goto copy_qword_done
+			// copy 4 bytes at a time
+			for remaining >= 4 {
+				var copyVal32 int64 = 0
+				copyVal32 = runtime.Load32(copySrc, 0)
+				runtime.Store32(copyDst, 0, copyVal32)
+				copyDst = copyDst + 4
+				copySrc = copySrc + 4
+				remaining = remaining - 4
+			}
+
+			// copy remaining bytes
+			for remaining > 0 {
+				var copyVal8 int64 = 0
+				copyVal8 = runtime.Load8(copySrc, 0)
+				runtime.Store8(copyDst, 0, copyVal8)
+				copyDst = copyDst + 1
+				copySrc = copySrc + 1
+				remaining = remaining - 1
+			}
+
+			// apply relocations
+			var relocPtr int64 = 0
+			var relocIndex int64 = 0
+
+			relocPtr = configMem + configHeaderSize
+			relocIndex = 0
+
+			for relocIndex < relocCount {
+				var relocEntryPtr int64 = 0
+				var relocOffset int64 = 0
+				var patchPtr int64 = 0
+				var patchValue int64 = 0
+
+				relocEntryPtr = relocPtr + (relocIndex << 2)
+				relocOffset = runtime.Load32(relocEntryPtr, 0)
+				patchPtr = anonMem + relocOffset
+				patchValue = runtime.Load64(patchPtr, 0)
+				patchValue = patchValue + anonMem
+				runtime.Store64(patchPtr, 0, patchValue)
+				relocIndex = relocIndex + 1
+			}
+
+			// Instruction synchronization barrier - required on ARM64 after modifying
+			// code in memory before executing it. Without this, the instruction cache
+			// may contain stale data and cause SIGILL.
+			runtime.ISB()
+
+			// call the payload
+			payloadResult := runtime.Call(anonMem)
+
+			// publish return code for host-side exit propagation
+			runtime.Store32(mailboxMem, mailboxRunResultDetailOffset, payloadResult)
+
+			// signal completion to host
+			var doneSignal int64 = 0x444f4e45
+			runtime.Store32(mailboxMem, 0, doneSignal)
+		} else {
+			// magic value not found
+			var actualMagic int64 = 0
+			actualMagic = runtime.Load32(configMem, 0)
+			runtime.Printf("Magic value not found in config region: %x\n", actualMagic)
+			reboot()
 		}
-		var copyVal32 int64 = 0
-		copyVal32 = runtime.Load32(copySrc, 0)
-		runtime.Store32(copyDst, 0, copyVal32)
-		copyDst = copyDst + 4
-		copySrc = copySrc + 4
-		remaining = remaining - 4
-		goto copy_qword_loop
-
-	copy_qword_done:
-
-	copy_tail_loop:
-		if remaining == 0 {
-			goto copy_done
-		}
-		var copyVal8 int64 = 0
-		copyVal8 = runtime.Load8(copySrc, 0)
-		runtime.Store8(copyDst, 0, copyVal8)
-		copyDst = copyDst + 1
-		copySrc = copySrc + 1
-		remaining = remaining - 1
-		goto copy_tail_loop
-
-	copy_done:
-
-		// apply relocations
-		var relocPtr int64 = 0
-		var relocIndex int64 = 0
-
-		relocPtr = configMem + configHeaderSize
-		relocIndex = 0
-
-	reloc_loop:
-		if relocIndex >= relocCount {
-			goto reloc_done
-		}
-		var relocEntryPtr int64 = 0
-		var relocOffset int64 = 0
-		var patchPtr int64 = 0
-		var patchValue int64 = 0
-
-		relocEntryPtr = relocPtr + (relocIndex << 2)
-		relocOffset = runtime.Load32(relocEntryPtr, 0)
-		patchPtr = anonMem + relocOffset
-		patchValue = runtime.Load64(patchPtr, 0)
-		patchValue = patchValue + anonMem
-		runtime.Store64(patchPtr, 0, patchValue)
-		relocIndex = relocIndex + 1
-		goto reloc_loop
-
-	reloc_done:
-		// Instruction synchronization barrier - required on ARM64 after modifying
-		// code in memory before executing it. Without this, the instruction cache
-		// may contain stale data and cause SIGILL.
-		runtime.ISB()
-
-		// call the payload
-		payloadResult := runtime.Call(anonMem)
-
-		// publish return code for host-side exit propagation
-		runtime.Store32(mailboxMem, mailboxRunResultDetailOffset, payloadResult)
-
-		// signal completion to host
-		var doneSignal int64 = 0x444f4e45
-		runtime.Store32(mailboxMem, 0, doneSignal)
-
-		goto loop
-	} else {
-		// magic value not found
-		var actualMagic int64 = 0
-		actualMagic = runtime.Load32(configMem, 0)
-		runtime.Printf("Magic value not found in config region: %x\n", actualMagic)
-		reboot()
 	}
-
-	goto loop
 
 	return 0
 }

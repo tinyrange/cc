@@ -102,6 +102,7 @@ type Compiler struct {
 	returnType Type
 	opts       CompileOptions
 	constants  map[string]int64 // package-level constants
+	labelCount int              // counter for generating unique labels
 }
 
 // CompileProgram parses src and lowers it into an ir.Program. The accepted
@@ -353,6 +354,8 @@ func (c *Compiler) lowerStmt(stmt ast.Stmt) ([]ir.Fragment, error) {
 		return c.lowerDecl(s)
 	case *ast.IfStmt:
 		return c.lowerIf(s)
+	case *ast.ForStmt:
+		return c.lowerFor(s)
 	case *ast.LabeledStmt:
 		return c.lowerLabeled(s)
 	case *ast.BranchStmt:
@@ -522,6 +525,85 @@ func (c *Compiler) lowerIf(stmt *ast.IfStmt) ([]ir.Fragment, error) {
 	}
 
 	return []ir.Fragment{ir.If(cond, thenBlock, elseBlock)}, nil
+}
+
+func (c *Compiler) lowerFor(stmt *ast.ForStmt) ([]ir.Fragment, error) {
+	if stmt.Init != nil {
+		return nil, fmt.Errorf("rtg: for init statements are not supported")
+	}
+	if stmt.Post != nil {
+		return nil, fmt.Errorf("rtg: for post statements are not supported")
+	}
+
+	// Generate unique labels for this loop
+	c.labelCount++
+	loopID := c.labelCount
+	startLabel := ir.Label(fmt.Sprintf("__for_start_%d", loopID))
+	endLabel := ir.Label(fmt.Sprintf("__for_end_%d", loopID))
+
+	// Lower the loop body
+	body, err := c.lowerBlock(stmt.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var frags []ir.Fragment
+
+	if stmt.Cond == nil {
+		// Infinite loop: for { ... }
+		// start:
+		//   body
+		//   goto start
+		loopBody := append(body, ir.Goto(startLabel))
+		frags = append(frags, ir.DeclareLabel(startLabel, ir.Block(loopBody)))
+	} else {
+		// Conditional loop: for cond { ... }
+		// start:
+		//   if !cond { goto end }
+		//   body
+		//   goto start
+		// end:
+		cond, err := c.lowerCondition(stmt.Cond)
+		if err != nil {
+			return nil, err
+		}
+
+		// Invert the condition for the exit check
+		exitCond := invertCondition(cond)
+
+		loopBody := ir.Block{
+			ir.If(exitCond, ir.Block{ir.Goto(endLabel)}),
+		}
+		loopBody = append(loopBody, body...)
+		loopBody = append(loopBody, ir.Goto(startLabel))
+
+		frags = append(frags, ir.DeclareLabel(startLabel, loopBody))
+		frags = append(frags, ir.DeclareLabel(endLabel, ir.Block{}))
+	}
+
+	return frags, nil
+}
+
+// invertCondition inverts a comparison condition for loop exit checks.
+func invertCondition(cond ir.Condition) ir.Condition {
+	if cc, ok := cond.(ir.CompareCondition); ok {
+		switch cc.Kind {
+		case ir.CompareEqual:
+			return ir.CompareCondition{Kind: ir.CompareNotEqual, Left: cc.Left, Right: cc.Right}
+		case ir.CompareNotEqual:
+			return ir.CompareCondition{Kind: ir.CompareEqual, Left: cc.Left, Right: cc.Right}
+		case ir.CompareLess:
+			return ir.CompareCondition{Kind: ir.CompareGreaterOrEqual, Left: cc.Left, Right: cc.Right}
+		case ir.CompareLessOrEqual:
+			return ir.CompareCondition{Kind: ir.CompareGreater, Left: cc.Left, Right: cc.Right}
+		case ir.CompareGreater:
+			return ir.CompareCondition{Kind: ir.CompareLessOrEqual, Left: cc.Left, Right: cc.Right}
+		case ir.CompareGreaterOrEqual:
+			return ir.CompareCondition{Kind: ir.CompareLess, Left: cc.Left, Right: cc.Right}
+		}
+	}
+	// Fallback: compare with 0 (treat as false)
+	return ir.CompareCondition{Kind: ir.CompareEqual, Left: cond, Right: ir.Int64(0)}
 }
 
 func (c *Compiler) lowerElse(stmt ast.Stmt) (ir.Fragment, error) {
