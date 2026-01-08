@@ -85,3 +85,92 @@ func BenchmarkVMExit(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkCaptureSnapshot(b *testing.B) {
+	hyper, err := factory.Open()
+	if err != nil {
+		b.Skipf("Open hypervisor: %v", err)
+	}
+	defer hyper.Close()
+
+	vm, err := hyper.NewVirtualMachine(hv.SimpleVMConfig{
+		NumCPUs:          1,
+		MemSize:          64 * 1024 * 1024, // 64 MiB
+		MemBase:          0x80000000,
+		InterruptSupport: true,
+	})
+	if err != nil {
+		b.Skipf("Create VM: %v", err)
+	}
+	defer vm.Close()
+
+	b.ResetTimer()
+	for b.Loop() {
+		snap, err := vm.CaptureSnapshot()
+		if err != nil {
+			b.Fatalf("CaptureSnapshot: %v", err)
+		}
+		_ = snap
+	}
+}
+
+func BenchmarkRestoreSnapshot(b *testing.B) {
+	hyper, err := factory.Open()
+	if err != nil {
+		b.Skipf("Open hypervisor: %v", err)
+	}
+	defer hyper.Close()
+
+	vm, err := hyper.NewVirtualMachine(hv.SimpleVMConfig{
+		NumCPUs:          1,
+		MemSize:          64 * 1024 * 1024, // 64 MiB
+		MemBase:          0x80000000,
+		InterruptSupport: true,
+	})
+	if err != nil {
+		b.Skipf("Create VM: %v", err)
+	}
+	defer vm.Close()
+
+	snap, err := vm.CaptureSnapshot()
+	if err != nil {
+		b.Fatalf("CaptureSnapshot: %v", err)
+	}
+
+	b.ResetTimer()
+	for b.Loop() {
+		if err := vm.RestoreSnapshot(snap); err != nil {
+			b.Fatalf("RestoreSnapshot: %v", err)
+		}
+	}
+}
+
+func BenchmarkSnapshotRoundtrip(b *testing.B) {
+	hyper, err := factory.Open()
+	if err != nil {
+		b.Skipf("Open hypervisor: %v", err)
+	}
+	defer hyper.Close()
+
+	vm, err := hyper.NewVirtualMachine(hv.SimpleVMConfig{
+		NumCPUs:          1,
+		MemSize:          64 * 1024 * 1024, // 64 MiB
+		MemBase:          0x80000000,
+		InterruptSupport: true,
+	})
+	if err != nil {
+		b.Skipf("Create VM: %v", err)
+	}
+	defer vm.Close()
+
+	b.ResetTimer()
+	for b.Loop() {
+		snap, err := vm.CaptureSnapshot()
+		if err != nil {
+			b.Fatalf("CaptureSnapshot: %v", err)
+		}
+		if err := vm.RestoreSnapshot(snap); err != nil {
+			b.Fatalf("RestoreSnapshot: %v", err)
+		}
+	}
+}
