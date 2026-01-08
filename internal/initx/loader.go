@@ -185,9 +185,9 @@ func (p *programLoader) DeviceTreeNodes() ([]fdt.Node, error) {
 
 // WriteMMIO implements hv.MemoryMappedIODevice.
 func (p *programLoader) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
-	addr = addr - mailboxPhysAddr
+	offset := addr - mailboxPhysAddr
 
-	switch addr {
+	switch offset {
 	case mailboxRunResultDetailOffset:
 		p.runResultDetail = binary.LittleEndian.Uint32(data)
 		return nil
@@ -208,7 +208,7 @@ func (p *programLoader) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) 
 		// no-op
 	}
 
-	return fmt.Errorf("unimplemented write at address 0x%x", addr)
+	return fmt.Errorf("unimplemented write at address 0x%x", offset)
 }
 
 func (p *programLoader) LoadProgram(prog *ir.Program) error {

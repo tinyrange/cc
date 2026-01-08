@@ -3,7 +3,7 @@ package hv
 // Snapshot file format constants
 const (
 	SnapshotMagic   uint32 = 0x534e4150 // "SNAP"
-	SnapshotVersion uint32 = 1
+	SnapshotVersion uint32 = 2          // v2 adds ICC register support
 )
 
 // Architecture encoding for snapshot files

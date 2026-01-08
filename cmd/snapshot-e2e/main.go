@@ -11,6 +11,7 @@ import (
 	"runtime/pprof"
 	"time"
 
+	"github.com/tinyrange/cc/internal/debug"
 	"github.com/tinyrange/cc/internal/devices/virtio"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/factory"
@@ -92,6 +93,15 @@ func run() error {
 			return fmt.Errorf("open timeslice file: %w", err)
 		}
 		defer w.Close()
+	}
+
+	// Setup debug file from environment variable
+	if debugFile := os.Getenv("CC_DEBUG_FILE"); debugFile != "" {
+		if err := debug.OpenFile(debugFile); err != nil {
+			return fmt.Errorf("open debug file: %w", err)
+		}
+		defer debug.Close()
+		debug.Writef("snapshot-e2e", "debug file opened: %s", debugFile)
 	}
 
 	// Get snapshot cache directory

@@ -115,10 +115,25 @@ var hvfSysRegsToCapture = []bindings.SysReg{
 	bindings.HV_SYS_REG_AMAIR_EL1,
 }
 
+// GIC ICC (CPU interface) registers to capture for snapshots.
+// These control interrupt processing at the CPU level and are per-vCPU.
+var hvfICCRegsToCapture = []bindings.GICICCReg{
+	bindings.HV_GIC_ICC_REG_PMR_EL1,     // Priority Mask Register
+	bindings.HV_GIC_ICC_REG_BPR0_EL1,    // Binary Point Register 0
+	bindings.HV_GIC_ICC_REG_AP0R0_EL1,   // Active Priority Register 0
+	bindings.HV_GIC_ICC_REG_AP1R0_EL1,   // Active Priority Register 1
+	bindings.HV_GIC_ICC_REG_BPR1_EL1,    // Binary Point Register 1
+	bindings.HV_GIC_ICC_REG_CTLR_EL1,    // Control Register
+	bindings.HV_GIC_ICC_REG_SRE_EL1,     // System Register Enable
+	bindings.HV_GIC_ICC_REG_IGRPEN0_EL1, // Interrupt Group Enable 0
+	bindings.HV_GIC_ICC_REG_IGRPEN1_EL1, // Interrupt Group Enable 1
+}
+
 // arm64HvfVcpuSnapshot holds the vCPU state for ARM64 on HVF
 type arm64HvfVcpuSnapshot struct {
 	GPRegisters     map[bindings.Reg]uint64
 	SysRegisters    map[bindings.SysReg]uint64
+	ICCRegisters    map[bindings.GICICCReg]uint64 // GIC CPU interface registers
 	SimdFPRegisters map[bindings.SIMDReg]bindings.SimdFP
 	VTimerOffset    uint64
 }
@@ -232,6 +247,7 @@ func (v *virtualCPU) captureSnapshot() (arm64HvfVcpuSnapshot, error) {
 	ret := arm64HvfVcpuSnapshot{
 		GPRegisters:     make(map[bindings.Reg]uint64, len(hvfGPRegsToCapture)),
 		SysRegisters:    make(map[bindings.SysReg]uint64, len(hvfSysRegsToCapture)),
+		ICCRegisters:    make(map[bindings.GICICCReg]uint64, len(hvfICCRegsToCapture)),
 		SimdFPRegisters: make(map[bindings.SIMDReg]bindings.SimdFP, 32),
 	}
 
@@ -251,6 +267,17 @@ func (v *virtualCPU) captureSnapshot() (arm64HvfVcpuSnapshot, error) {
 			return ret, fmt.Errorf("hvf: capture sys reg 0x%x: %w", reg, err)
 		}
 		ret.SysRegisters[reg] = value
+	}
+
+	// Capture GIC ICC (CPU interface) registers if GIC is configured
+	if v.vm.gicInfo.Version != hv.Arm64GICVersionUnknown {
+		for _, reg := range hvfICCRegsToCapture {
+			var value uint64
+			if err := bindings.HvGicGetIccReg(v.id, reg, &value); err != bindings.HV_SUCCESS {
+				return ret, fmt.Errorf("hvf: capture ICC reg 0x%x: %w", reg, err)
+			}
+			ret.ICCRegisters[reg] = value
+		}
 	}
 
 	// Capture SIMD/FP registers (Q0-Q31)
@@ -289,6 +316,15 @@ func (v *virtualCPU) restoreSnapshot(snap arm64HvfVcpuSnapshot) error {
 	for reg, value := range snap.SysRegisters {
 		if err := bindings.HvVcpuSetSysReg(v.id, reg, value); err != bindings.HV_SUCCESS {
 			return fmt.Errorf("hvf: restore sys reg 0x%x: %w", reg, err)
+		}
+	}
+
+	// Restore GIC ICC (CPU interface) registers if GIC is configured
+	if v.vm.gicInfo.Version != hv.Arm64GICVersionUnknown && len(snap.ICCRegisters) > 0 {
+		for reg, value := range snap.ICCRegisters {
+			if err := bindings.HvGicSetIccReg(v.id, reg, value); err != bindings.HV_SUCCESS {
+				return fmt.Errorf("hvf: restore ICC reg 0x%x: %w", reg, err)
+			}
 		}
 	}
 

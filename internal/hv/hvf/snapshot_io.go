@@ -284,6 +284,24 @@ func writeVcpuSnapshot(w io.Writer, cpuID int, snap arm64HvfVcpuSnapshot) error 
 		}
 	}
 
+	// Write ICC (GIC CPU interface) registers
+	if err := binary.Write(w, binary.LittleEndian, uint32(len(snap.ICCRegisters))); err != nil {
+		return fmt.Errorf("write icc count: %w", err)
+	}
+	iccKeys := make([]bindings.GICICCReg, 0, len(snap.ICCRegisters))
+	for k := range snap.ICCRegisters {
+		iccKeys = append(iccKeys, k)
+	}
+	sort.Slice(iccKeys, func(i, j int) bool { return iccKeys[i] < iccKeys[j] })
+	for _, k := range iccKeys {
+		if err := binary.Write(w, binary.LittleEndian, uint16(k)); err != nil {
+			return fmt.Errorf("write icc key: %w", err)
+		}
+		if err := binary.Write(w, binary.LittleEndian, snap.ICCRegisters[k]); err != nil {
+			return fmt.Errorf("write icc value: %w", err)
+		}
+	}
+
 	// Write SIMD/FP registers
 	if err := binary.Write(w, binary.LittleEndian, uint32(len(snap.SimdFPRegisters))); err != nil {
 		return fmt.Errorf("write simd count: %w", err)
@@ -357,6 +375,24 @@ func readVcpuSnapshot(r io.Reader) (int, arm64HvfVcpuSnapshot, error) {
 			return 0, snap, fmt.Errorf("read sys value: %w", err)
 		}
 		snap.SysRegisters[bindings.SysReg(k)] = v
+	}
+
+	// Read ICC (GIC CPU interface) registers
+	var iccCount uint32
+	if err := binary.Read(r, binary.LittleEndian, &iccCount); err != nil {
+		return 0, snap, fmt.Errorf("read icc count: %w", err)
+	}
+	snap.ICCRegisters = make(map[bindings.GICICCReg]uint64, iccCount)
+	for i := uint32(0); i < iccCount; i++ {
+		var k uint16
+		var v uint64
+		if err := binary.Read(r, binary.LittleEndian, &k); err != nil {
+			return 0, snap, fmt.Errorf("read icc key: %w", err)
+		}
+		if err := binary.Read(r, binary.LittleEndian, &v); err != nil {
+			return 0, snap, fmt.Errorf("read icc value: %w", err)
+		}
+		snap.ICCRegisters[bindings.GICICCReg(k)] = v
 	}
 
 	// Read SIMD/FP registers
