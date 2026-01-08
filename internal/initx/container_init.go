@@ -1,6 +1,7 @@
 package initx
 
 import (
+	_ "embed"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -9,7 +10,20 @@ import (
 	"github.com/tinyrange/cc/internal/ir"
 	"github.com/tinyrange/cc/internal/linux/defs"
 	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
+	"github.com/tinyrange/cc/internal/rtg"
 )
+
+//go:embed container_init_source.go
+var rtgContainerInitSource string
+
+// NOTE: There are two implementations of BuildContainerInitProgram:
+//
+// 1. BuildContainerInitProgram - Direct IR construction
+//    This is the original implementation that constructs IR fragments directly.
+//
+// 2. BuildContainerInitProgramRTG - RTG-based implementation
+//    This compiles container_init_source.go using the RTG compiler and injects
+//    dynamic configuration at IR level.
 
 type ContainerInitConfig struct {
 	Arch          hv.CpuArchitecture
@@ -249,4 +263,152 @@ func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
 		Methods:    map[string]ir.Method{"main": main},
 		Entrypoint: "main",
 	}, nil
+}
+
+// BuildContainerInitProgramRTG builds the container init program from RTG source code.
+// The source code is embedded from container_init_source.go which is a valid Go file
+// for IDE completion support.
+func BuildContainerInitProgramRTG(cfg ContainerInitConfig) (*ir.Program, error) {
+	cfg.applyDefaults()
+
+	if cfg.Arch == "" || cfg.Arch == hv.ArchitectureInvalid {
+		return nil, fmt.Errorf("initx: container init requires valid architecture")
+	}
+	if len(cfg.Cmd) == 0 || cfg.Cmd[0] == "" {
+		return nil, fmt.Errorf("initx: container init requires non-empty command")
+	}
+
+	// Determine target architecture for runtime.GOARCH
+	var goarch string
+	switch cfg.Arch {
+	case hv.ArchitectureX86_64:
+		goarch = "amd64"
+	case hv.ArchitectureARM64:
+		goarch = "arm64"
+	default:
+		return nil, fmt.Errorf("unsupported architecture for RTG container init: %s", cfg.Arch)
+	}
+
+	// Build compile-time flags for Ifdef
+	flags := map[string]bool{
+		"network": cfg.EnableNetwork,
+		"exec":    cfg.Exec,
+	}
+
+	// Compile the RTG source with architecture and flags
+	prog, err := rtg.CompileProgramWithOptions(rtgContainerInitSource, rtg.CompileOptions{
+		GOARCH: goarch,
+		Flags:  flags,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to compile RTG container init source: %w", err)
+	}
+
+	// Replace placeholder method bodies with actual implementations
+	if err := injectContainerInitHelpers(prog, cfg); err != nil {
+		return nil, fmt.Errorf("failed to inject container init helpers: %w", err)
+	}
+
+	return prog, nil
+}
+
+// injectContainerInitHelpers replaces placeholder method bodies with actual implementations.
+// The RTG source defines placeholder functions (setHostname, configureLoopback, etc.)
+// that are compiled as methods. This function replaces their bodies with the real
+// helper implementations that include dynamic configuration values.
+func injectContainerInitHelpers(prog *ir.Program, cfg ContainerInitConfig) error {
+	errLabel := ir.Label("__cc_container_error")
+	errVar := ir.Var("__cc_container_errno")
+
+	// Replace placeholder method bodies
+	prog.Methods["setHostname"] = ir.Method{
+		SetHostname(cfg.Hostname, errLabel, errVar),
+		ir.Return(ir.Int64(0)),
+	}
+
+	prog.Methods["configureLoopback"] = ir.Method{
+		ConfigureLoopback(errLabel, errVar),
+		ir.Return(ir.Int64(0)),
+	}
+
+	prog.Methods["setHostsFile"] = ir.Method{
+		SetHostsOptional(cfg.Hostname),
+		ir.Return(ir.Int64(0)),
+	}
+
+	// Network helpers (only called if "network" flag is true, due to Ifdef)
+	ip := ipToUint32(cfg.GuestIP)
+	gateway := ipToUint32(cfg.DNS)
+	mask := ipToUint32(cfg.GuestMask)
+
+	prog.Methods["configureInterface"] = ir.Method{
+		ConfigureInterface(cfg.GuestIFName, ip, mask, errLabel, errVar),
+		ir.Return(ir.Int64(0)),
+	}
+
+	prog.Methods["addDefaultRoute"] = ir.Method{
+		AddDefaultRoute(cfg.GuestIFName, gateway, errLabel, errVar),
+		ir.Return(ir.Int64(0)),
+	}
+
+	prog.Methods["setResolvConf"] = ir.Method{
+		SetResolvConf(cfg.DNS, errLabel, errVar),
+		ir.Return(ir.Int64(0)),
+	}
+
+	// Working directory
+	prog.Methods["changeWorkDir"] = ir.Method{
+		ir.Syscall(defs.SYS_CHDIR, cfg.WorkDir),
+		ir.Return(ir.Int64(0)),
+	}
+
+	// Command execution (one of these will be called based on "exec" flag)
+	prog.Methods["execCommand"] = ir.Method{
+		Exec(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, errLabel, errVar),
+		ir.Return(ir.Int64(0)),
+	}
+
+	prog.Methods["forkExecWait"] = ir.Method{
+		ForkExecWait(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, errLabel, errVar),
+		ir.Return(errVar),
+	}
+
+	// Add error handler to main method
+	main, ok := prog.Methods["main"]
+	if !ok {
+		return fmt.Errorf("main method not found")
+	}
+
+	// Append error handler label to main
+	main = append(main,
+		ir.DeclareLabel(errLabel, ir.Block{
+			ir.Printf("cc: fatal error during boot: errno=0x%x\n", errVar),
+			rebootFragment(cfg.Arch),
+		}),
+	)
+	prog.Methods["main"] = main
+
+	return nil
+}
+
+// rebootFragment returns the architecture-appropriate reboot syscall fragment.
+func rebootFragment(arch hv.CpuArchitecture) ir.Fragment {
+	switch arch {
+	case hv.ArchitectureX86_64:
+		return ir.Syscall(defs.SYS_REBOOT,
+			linux.LINUX_REBOOT_MAGIC1,
+			linux.LINUX_REBOOT_MAGIC2,
+			linux.LINUX_REBOOT_CMD_RESTART,
+			ir.Int64(0),
+		)
+	case hv.ArchitectureARM64:
+		return ir.Syscall(defs.SYS_REBOOT,
+			linux.LINUX_REBOOT_MAGIC1,
+			linux.LINUX_REBOOT_MAGIC2,
+			linux.LINUX_REBOOT_CMD_POWER_OFF,
+			ir.Int64(0),
+		)
+	default:
+		panic(fmt.Sprintf("unsupported architecture for reboot: %s", arch))
+	}
 }

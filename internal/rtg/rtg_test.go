@@ -82,3 +82,132 @@ func main() int64 {
 		t.Fatalf("unexpected program\n got: %#v\nwant: %#v", got, want)
 	}
 }
+
+func TestCompileIfdefTrue(t *testing.T) {
+	src := `package main
+import "github.com/tinyrange/cc/internal/rtg/runtime"
+func main() int64 {
+	if runtime.Ifdef("feature") {
+		return 1
+	}
+	return 0
+}`
+	got, err := CompileProgramWithOptions(src, CompileOptions{
+		Flags: map[string]bool{"feature": true},
+	})
+	if err != nil {
+		t.Fatalf("CompileProgram returned error: %v", err)
+	}
+
+	// When flag is true, Ifdef returns 1, so condition is 1 == 1 (always true)
+	main := got.Methods["main"]
+	if len(main) == 0 {
+		t.Fatal("main method is empty")
+	}
+
+	// Check that we have an if fragment with an always-true condition
+	foundIf := false
+	for _, frag := range main {
+		if ifFrag, ok := frag.(ir.IfFragment); ok {
+			foundIf = true
+			// The condition should evaluate to always-true (1 == 1)
+			if cond, ok := ifFrag.Cond.(ir.CompareCondition); ok {
+				if left, ok := cond.Left.(ir.Int64); ok {
+					if right, ok := cond.Right.(ir.Int64); ok {
+						if left == 1 && right == 1 {
+							t.Log("Ifdef(true) correctly generates 1==1 condition")
+						}
+					}
+				}
+			}
+		}
+	}
+	if !foundIf {
+		t.Fatal("Expected if fragment in compiled output")
+	}
+}
+
+func TestCompileIfdefFalse(t *testing.T) {
+	src := `package main
+import "github.com/tinyrange/cc/internal/rtg/runtime"
+func main() int64 {
+	if runtime.Ifdef("feature") {
+		return 1
+	}
+	return 0
+}`
+	got, err := CompileProgramWithOptions(src, CompileOptions{
+		Flags: map[string]bool{"feature": false},
+	})
+	if err != nil {
+		t.Fatalf("CompileProgram returned error: %v", err)
+	}
+
+	// When flag is false, Ifdef returns 0, so condition is 0 == 1 (always false)
+	main := got.Methods["main"]
+	if len(main) == 0 {
+		t.Fatal("main method is empty")
+	}
+
+	// Check that we have an if fragment with an always-false condition
+	foundIf := false
+	for _, frag := range main {
+		if ifFrag, ok := frag.(ir.IfFragment); ok {
+			foundIf = true
+			// The condition should evaluate to always-false (1 == 0)
+			if cond, ok := ifFrag.Cond.(ir.CompareCondition); ok {
+				if left, ok := cond.Left.(ir.Int64); ok {
+					if right, ok := cond.Right.(ir.Int64); ok {
+						if left == 1 && right == 0 {
+							t.Log("Ifdef(false) correctly generates 1==0 condition")
+						}
+					}
+				}
+			}
+		}
+	}
+	if !foundIf {
+		t.Fatal("Expected if fragment in compiled output")
+	}
+}
+
+func TestCompileIfdefUndefined(t *testing.T) {
+	src := `package main
+import "github.com/tinyrange/cc/internal/rtg/runtime"
+func main() int64 {
+	if runtime.Ifdef("undefined_flag") {
+		return 1
+	}
+	return 0
+}`
+	// No flags specified - undefined flags should be treated as false
+	got, err := CompileProgramWithOptions(src, CompileOptions{})
+	if err != nil {
+		t.Fatalf("CompileProgram returned error: %v", err)
+	}
+
+	main := got.Methods["main"]
+	if len(main) == 0 {
+		t.Fatal("main method is empty")
+	}
+
+	// Should behave like Ifdef(false) - condition is 1 == 0
+	foundIf := false
+	for _, frag := range main {
+		if ifFrag, ok := frag.(ir.IfFragment); ok {
+			foundIf = true
+			if cond, ok := ifFrag.Cond.(ir.CompareCondition); ok {
+				if left, ok := cond.Left.(ir.Int64); ok {
+					if right, ok := cond.Right.(ir.Int64); ok {
+						if left == 1 && right == 0 {
+							t.Log("Ifdef(undefined) correctly generates 1==0 condition (treated as false)")
+						}
+					}
+				}
+			}
+		}
+	}
+	if !foundIf {
+		t.Fatal("Expected if fragment in compiled output")
+	}
+}

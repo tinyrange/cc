@@ -92,6 +92,11 @@ type CompileOptions struct {
 	// GOARCH is the target architecture ("amd64" or "arm64").
 	// Used to resolve runtime.GOARCH comparisons at compile time.
 	GOARCH string
+
+	// Flags holds compile-time flags for conditional compilation.
+	// Used with runtime.Ifdef("flag") to include/exclude code at compile time.
+	// Undefined flags are treated as false.
+	Flags map[string]bool
 }
 
 // Compiler holds the state for a single source-to-IR lowering.
@@ -1042,6 +1047,8 @@ func (c *Compiler) lowerExprCall(call *ast.CallExpr) (ir.Fragment, Type, error) 
 		return c.lowerLoad(call, 64)
 	case "call", "Call":
 		return c.lowerIndirectCall(call)
+	case "ifdef", "Ifdef":
+		return c.lowerIfdef(call)
 	default:
 		// Check if it's a call to a user-defined function
 		// User-defined functions are called via ir.CallMethod and return int64
@@ -1128,6 +1135,39 @@ func (c *Compiler) lowerIndirectCall(call *ast.CallExpr) (ir.Fragment, Type, err
 	}
 
 	return ir.CallFragment{Target: target}, Type{Kind: TypeI64}, nil
+}
+
+// lowerIfdef handles runtime.Ifdef("flag") calls.
+// It evaluates the flag at compile time and returns a boolean constant.
+// Undefined flags are treated as false.
+func (c *Compiler) lowerIfdef(call *ast.CallExpr) (ir.Fragment, Type, error) {
+	if len(call.Args) != 1 {
+		return nil, Type{}, fmt.Errorf("rtg: Ifdef expects exactly one string argument")
+	}
+
+	// Extract the flag name - must be a string literal
+	lit, ok := call.Args[0].(*ast.BasicLit)
+	if !ok || lit.Kind != token.STRING {
+		return nil, Type{}, fmt.Errorf("rtg: Ifdef argument must be a string literal")
+	}
+
+	// Unquote the string
+	flagName, err := strconv.Unquote(lit.Value)
+	if err != nil {
+		return nil, Type{}, fmt.Errorf("rtg: Ifdef: invalid string literal: %w", err)
+	}
+
+	// Look up the flag in compile options
+	flagValue := false
+	if c.opts.Flags != nil {
+		flagValue = c.opts.Flags[flagName]
+	}
+
+	// Return compile-time constant
+	if flagValue {
+		return ir.Int64(1), Type{Kind: TypeBool}, nil
+	}
+	return ir.Int64(0), Type{Kind: TypeBool}, nil
 }
 
 func (c *Compiler) lowerMemRef(ptr ast.Expr, offset ast.Expr, width int) (ir.Fragment, error) {
@@ -1403,6 +1443,10 @@ var syscallNames = map[string]defs.Syscall{
 	"SYS_WAIT4":          defs.SYS_WAIT4,
 	"SYS_MPROTECT":       defs.SYS_MPROTECT,
 	"SYS_GETPID":         defs.SYS_GETPID,
+	"SYS_PIVOT_ROOT":     defs.SYS_PIVOT_ROOT,
+	"SYS_UMOUNT2":        defs.SYS_UMOUNT2,
+	"SYS_UNLINKAT":       defs.SYS_UNLINKAT,
+	"SYS_SYMLINKAT":      defs.SYS_SYMLINKAT,
 }
 
 var constantValues = map[string]int64{
@@ -1449,11 +1493,38 @@ var constantValues = map[string]int64{
 	"CLOCK_REALTIME": int64(linux.CLOCK_REALTIME),
 
 	// Network constants
-	"AF_INET":      int64(linux.AF_INET),
-	"AF_NETLINK":   int64(linux.AF_NETLINK),
-	"SOCK_DGRAM":   int64(linux.SOCK_DGRAM),
-	"SOCK_RAW":     int64(linux.SOCK_RAW),
+	"AF_INET":       int64(linux.AF_INET),
+	"AF_NETLINK":    int64(linux.AF_NETLINK),
+	"SOCK_DGRAM":    int64(linux.SOCK_DGRAM),
+	"SOCK_RAW":      int64(linux.SOCK_RAW),
 	"NETLINK_ROUTE": int64(linux.NETLINK_ROUTE),
+
+	// Mount/unmount flags
+	"MNT_DETACH": int64(linux.MNT_DETACH),
+
+	// Unlink flags
+	"AT_REMOVEDIR": int64(linux.AT_REMOVEDIR),
+
+	// SIGCHLD for clone
+	"SIGCHLD": int64(defs.SIGCHLD),
+
+	// Network interface flags
+	"IFF_UP":          int64(linux.IFF_UP),
+	"SIOCSIFFLAGS":    int64(linux.SIOCSIFFLAGS),
+	"SIOCSIFADDR":     int64(linux.SIOCSIFADDR),
+	"SIOCSIFNETMASK":  int64(linux.SIOCSIFNETMASK),
+	"SIOCGIFINDEX":    int64(linux.SIOCGIFINDEX),
+	"RTM_NEWROUTE":    int64(linux.RTM_NEWROUTE),
+	"NLM_F_REQUEST":   int64(linux.NLM_F_REQUEST),
+	"NLM_F_CREATE":    int64(linux.NLM_F_CREATE),
+	"NLM_F_REPLACE":   int64(linux.NLM_F_REPLACE),
+	"NLM_F_ACK":       int64(linux.NLM_F_ACK),
+	"RT_TABLE_MAIN":   int64(linux.RT_TABLE_MAIN),
+	"RTPROT_BOOT":     int64(linux.RTPROT_BOOT),
+	"RT_SCOPE_UNIVERSE": int64(linux.RT_SCOPE_UNIVERSE),
+	"RTN_UNICAST":     int64(linux.RTN_UNICAST),
+	"RTA_OIF":         int64(linux.RTA_OIF),
+	"RTA_GATEWAY":     int64(linux.RTA_GATEWAY),
 }
 
 // FormatErrors joins multiple errors when tests want deterministic output.

@@ -51,6 +51,12 @@ func GotoLabel(label int64) {}
 // Required after modifying code in memory before executing it.
 func ISB() {}
 
+// Ifdef returns true if the named compile-time flag is set.
+// This is evaluated at RTG compile time, not at runtime.
+// The flag name must be a string literal.
+// Undefined flags are treated as false.
+func Ifdef(flag string) bool { return false }
+
 // Syscall numbers (architecture-independent definitions for type checking)
 const (
 	SYS_EXIT          int64 = 0
@@ -82,6 +88,10 @@ const (
 	SYS_WAIT4         int64 = 26
 	SYS_MPROTECT      int64 = 27
 	SYS_GETPID        int64 = 28
+	SYS_PIVOT_ROOT    int64 = 29
+	SYS_UMOUNT2       int64 = 30
+	SYS_UNLINKAT      int64 = 31
+	SYS_SYMLINKAT     int64 = 32
 )
 
 // File descriptor constants
@@ -151,4 +161,39 @@ const (
 	SOCK_DGRAM    int64 = 2
 	SOCK_RAW      int64 = 3
 	NETLINK_ROUTE int64 = 0
+)
+
+// Mount/unmount flags
+const (
+	MNT_DETACH int64 = 0x2
+)
+
+// Unlink flags
+const (
+	AT_REMOVEDIR int64 = 0x200
+)
+
+// Clone flags
+const (
+	SIGCHLD int64 = 17
+)
+
+// Network interface ioctl constants
+const (
+	IFF_UP           int64 = 0x1
+	SIOCSIFFLAGS     int64 = 0x8914
+	SIOCSIFADDR      int64 = 0x8916
+	SIOCSIFNETMASK   int64 = 0x891c
+	SIOCGIFINDEX     int64 = 0x8933
+	RTM_NEWROUTE     int64 = 24
+	NLM_F_REQUEST    int64 = 0x1
+	NLM_F_CREATE     int64 = 0x400
+	NLM_F_REPLACE    int64 = 0x100
+	NLM_F_ACK        int64 = 0x4
+	RT_TABLE_MAIN    int64 = 254
+	RTPROT_BOOT      int64 = 3
+	RT_SCOPE_UNIVERSE int64 = 0
+	RTN_UNICAST      int64 = 1
+	RTA_OIF          int64 = 4
+	RTA_GATEWAY      int64 = 5
 )
