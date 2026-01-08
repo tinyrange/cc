@@ -447,7 +447,12 @@ func (vm *VirtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 
 // RestoreSnapshot restores a VM from a snapshot.
 func (vm *VirtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
-	return vm.vm.RestoreSnapshot(snap)
+	if err := vm.vm.RestoreSnapshot(snap); err != nil {
+		return err
+	}
+	// Mark first run as complete since the vCPU state is already configured from the snapshot
+	vm.firstRunComplete = true
+	return nil
 }
 
 // HVVirtualMachine returns the underlying hv.VirtualMachine for low-level operations.

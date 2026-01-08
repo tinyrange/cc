@@ -641,6 +641,7 @@ func main() {
 	cpuprofile := fs.String("cpuprofile", "", "write CPU profile of built binary to file")
 	memprofile := fs.String("memprofile", "", "write memory profile of built binary to file")
 	benchTests := fs.Bool("bench-tests", false, "build and run the benchmark tests")
+	snapshotE2E := fs.Bool("snapshot-e2e", false, "build and run snapshot e2e benchmark")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
@@ -1185,6 +1186,24 @@ func main() {
 		fmt.Printf("benchmark tests run successfully\n")
 
 		os.Exit(0)
+	}
+
+	if *snapshotE2E {
+		out, err := goBuild(buildOptions{
+			Package:          "cmd/snapshot-e2e",
+			OutputName:       "snapshot-e2e",
+			Build:            hostBuild,
+			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build snapshot-e2e: %v\n", err)
+			os.Exit(1)
+		}
+
+		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
+			os.Exit(1)
+		}
+		return
 	}
 
 	// build cmd/cc by default

@@ -145,8 +145,8 @@ func run() error {
 	addVirtioFs := flag.String("add-virtiofs", "", "Specify a comma-separated list of blank virtio-fs tags to create")
 	timesliceFile := flag.String("timeslice-file", "", "Write timeslice data to file")
 	var snapshotCacheFlag boolFlag
-	snapshotCacheFlag.v = true // Enable by default
-	flag.Var(&snapshotCacheFlag, "snapshot-cache", "Enable boot snapshot caching (default: true)")
+	snapshotCacheFlag.v = false // Disable by default
+	flag.Var(&snapshotCacheFlag, "snapshot-cache", "Enable boot snapshot caching (default: false)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <image> [command] [args...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Run a command inside an OCI container image in a virtual machine.\n\n")
