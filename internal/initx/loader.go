@@ -199,7 +199,7 @@ func (p *programLoader) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) 
 	case 0x0:
 		value := binary.LittleEndian.Uint32(data)
 		switch value {
-		case 0x444f4e45:
+		case 0x444f4e45, snapshotRequestValue:
 			return hv.ErrYield
 		case userYieldValue:
 			return hv.ErrUserYield
@@ -438,6 +438,21 @@ func (vm *VirtualMachine) Run(ctx context.Context, prog *ir.Program) error {
 
 func (vm *VirtualMachine) Architecture() hv.CpuArchitecture {
 	return vm.vm.Hypervisor().Architecture()
+}
+
+// CaptureSnapshot captures a snapshot of the VM state.
+func (vm *VirtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
+	return vm.vm.CaptureSnapshot()
+}
+
+// RestoreSnapshot restores a VM from a snapshot.
+func (vm *VirtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
+	return vm.vm.RestoreSnapshot(snap)
+}
+
+// HVVirtualMachine returns the underlying hv.VirtualMachine for low-level operations.
+func (vm *VirtualMachine) HVVirtualMachine() hv.VirtualMachine {
+	return vm.vm
 }
 
 func (vm *VirtualMachine) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error {

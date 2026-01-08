@@ -121,11 +121,12 @@ type consoleConfig struct {
 }
 
 type consoleSnapshot struct {
-	Arch    hv.CpuArchitecture
-	Base    uint64
-	Size    uint64
-	IRQLine uint32
-	Pending []byte
+	Arch       hv.CpuArchitecture
+	Base       uint64
+	Size       uint64
+	IRQLine    uint32
+	Pending    []byte
+	MMIODevice MMIODeviceSnapshot
 }
 
 // Init implements hv.MemoryMappedIODevice.
@@ -412,6 +413,13 @@ func (vc *Console) CaptureSnapshot() (hv.DeviceSnapshot, error) {
 		snap.Pending = append([]byte(nil), vc.pending...)
 	}
 
+	// Capture MMIO device state (queue indices, features, etc.)
+	if dev := vc.Device(); dev != nil {
+		if mmio, ok := dev.(*mmioDevice); ok {
+			snap.MMIODevice = mmio.CaptureMMIOSnapshot()
+		}
+	}
+
 	return snap, nil
 }
 
@@ -428,6 +436,15 @@ func (vc *Console) RestoreSnapshot(snap hv.DeviceSnapshot) error {
 	vc.pending = append(vc.pending[:0], data.Pending...)
 	vc.setDefaultConfig()
 	vc.SyncToTransport()
+
+	// Restore MMIO device state (queue indices, features, etc.)
+	if dev := vc.Device(); dev != nil {
+		if mmio, ok := dev.(*mmioDevice); ok {
+			if err := mmio.RestoreMMIOSnapshot(data.MMIODevice); err != nil {
+				return fmt.Errorf("virtio-console: restore MMIO state: %w", err)
+			}
+		}
+	}
 
 	return nil
 }

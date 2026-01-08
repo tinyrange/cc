@@ -144,6 +144,9 @@ func run() error {
 	termWin := flag.Bool("term", false, "Open a terminal window and connect it to the VM console")
 	addVirtioFs := flag.String("add-virtiofs", "", "Specify a comma-separated list of blank virtio-fs tags to create")
 	timesliceFile := flag.String("timeslice-file", "", "Write timeslice data to file")
+	var snapshotCacheFlag boolFlag
+	snapshotCacheFlag.v = true // Enable by default
+	flag.Var(&snapshotCacheFlag, "snapshot-cache", "Enable boot snapshot caching (default: true)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <image> [command] [args...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Run a command inside an OCI container image in a virtual machine.\n\n")
@@ -546,9 +549,63 @@ func run() error {
 
 	debug.Writef("cc.run running command", "running command %v", execCmd)
 
+	// Snapshot caching setup
+	var sessionCfg initx.SessionConfig
+	if snapshotCacheFlag.v && getSnapshotIO() != nil {
+		// Get cache directory for snapshots
+		snapshotCacheDir, err := getSnapshotCacheDir(*cacheDir)
+		if err == nil {
+			snapshotCache := initx.NewSnapshotCache(snapshotCacheDir, getSnapshotIO())
+
+			// Compute config hash based on VM configuration
+			configHash := hv.ComputeConfigHash(
+				hvArch,
+				memoryFlag.v<<20, // Convert MB to bytes
+				vm.HVVirtualMachine().MemoryBase(),
+				cpusFlag.v,
+				nil, // Device configs - simplified for now
+			)
+
+			// Use a very old time as reference - snapshots are valid unless explicitly invalidated
+			var referenceTime time.Time
+
+			if snapshotCache.HasValidSnapshot(configHash, referenceTime) {
+				// Try to load and restore cached snapshot
+				snap, loadErr := snapshotCache.LoadSnapshot(configHash)
+				if loadErr == nil {
+					if restoreErr := vm.RestoreSnapshot(snap); restoreErr == nil {
+						debug.Writef("cc.run snapshot", "restored from cache")
+						sessionCfg.SkipBoot = true
+					} else {
+						slog.Debug("Failed to restore snapshot, falling back to boot", "error", restoreErr)
+					}
+				} else {
+					slog.Debug("Failed to load snapshot, falling back to boot", "error", loadErr)
+				}
+			}
+
+			if !sessionCfg.SkipBoot {
+				// Set up callback to capture snapshot after boot
+				sessionCfg.OnBootComplete = func() error {
+					snap, captureErr := vm.CaptureSnapshot()
+					if captureErr != nil {
+						slog.Debug("Failed to capture boot snapshot", "error", captureErr)
+						return nil // Don't fail the session
+					}
+					if saveErr := snapshotCache.SaveSnapshot(configHash, snap); saveErr != nil {
+						slog.Debug("Failed to save boot snapshot", "error", saveErr)
+					} else {
+						debug.Writef("cc.run snapshot", "saved to cache")
+					}
+					return nil
+				}
+			}
+		}
+	}
+
 	// Start the VM session now that we have the final execution context.
 	// This handles boot → stdin forwarding → payload run.
-	session := initx.StartSession(ctx, vm, prog, initx.SessionConfig{})
+	session := initx.StartSession(ctx, vm, prog, sessionCfg)
 
 	// If GPU is enabled, set up the display manager and drive the window loop
 	// on the main thread while the VM runs in the background.
@@ -784,4 +841,15 @@ func lookPath(fs *oci.ContainerFS, pathEnv string, workDir string, file string) 
 	}
 
 	return "", fmt.Errorf("executable %q not found in PATH", file)
+}
+
+func getSnapshotCacheDir(cacheDir string) (string, error) {
+	if cacheDir == "" {
+		cfg, err := os.UserConfigDir()
+		if err != nil {
+			return "", err
+		}
+		cacheDir = filepath.Join(cfg, "cc")
+	}
+	return filepath.Join(cacheDir, "snapshots"), nil
 }
