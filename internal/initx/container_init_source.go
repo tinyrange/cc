@@ -144,16 +144,129 @@ func main() int64 {
 	return 0
 }
 
-// Placeholder helper functions - bodies are replaced at IR level with actual implementations.
-// These functions exist to provide call sites that the injection mechanism can replace.
+// Helper function implementations using pure RTG.
 
-func setHostname() int64         { return 0 }
-func configureLoopback() int64   { return 0 }
-func setHostsFile() int64        { return 0 }
-func configureInterface() int64  { return 0 }
+// setHostname sets the system hostname from the config value.
+func setHostname() int64 {
+	ptr, length := runtime.EmbedConfigCString("hostname")
+	err := runtime.Syscall(runtime.SYS_SETHOSTNAME, ptr, length)
+	if err < 0 {
+		runtime.Printf("cc: failed to set hostname: errno=0x%x\n", 0-err)
+		reboot()
+	}
+	return 0
+}
+// configureLoopback brings up the loopback interface (lo) with IP 127.0.0.1.
+func configureLoopback() int64 {
+	var ifreq [40]byte
+
+	// Create socket
+	fd := runtime.Syscall(runtime.SYS_SOCKET, runtime.AF_INET, runtime.SOCK_DGRAM, 0)
+	if fd < 0 {
+		runtime.Printf("cc: failed to create socket for loopback: errno=0x%x\n", 0-fd)
+		reboot()
+	}
+
+	// Zero out entire structure
+	runtime.Store64(&ifreq[0], 0, 0)
+	runtime.Store64(&ifreq[0], 8, 0)
+	runtime.Store64(&ifreq[0], 16, 0)
+	runtime.Store64(&ifreq[0], 24, 0)
+	runtime.Store64(&ifreq[0], 32, 0)
+
+	// Copy "lo" to interface name (offset 0)
+	runtime.Store8(&ifreq[0], 0, 0x6c)
+	runtime.Store8(&ifreq[0], 1, 0x6f)
+	runtime.Store8(&ifreq[0], 2, 0)
+
+	// Set IP address: 127.0.0.1 in network byte order = 0x0100007F
+	// sockaddr_in: family (AF_INET) at offset 16, sin_addr at offset 20
+	runtime.Store32(&ifreq[0], 16, runtime.AF_INET) // sa_family + sin_port as uint32
+	runtime.Store32(&ifreq[0], 20, 0x0100007F)      // 127.0.0.1 in network byte order
+	runtime.Syscall(runtime.SYS_IOCTL, fd, runtime.SIOCSIFADDR, &ifreq[0])
+
+	// Set netmask: 255.0.0.0 in network byte order = 0x000000FF
+	// Re-copy interface name
+	runtime.Store8(&ifreq[0], 0, 0x6c)
+	runtime.Store8(&ifreq[0], 1, 0x6f)
+	runtime.Store8(&ifreq[0], 2, 0)
+	runtime.Store64(&ifreq[0], 16, 0) // Zero out sockaddr
+	runtime.Store64(&ifreq[0], 24, 0)
+	runtime.Store64(&ifreq[0], 32, 0)
+	runtime.Store32(&ifreq[0], 16, runtime.AF_INET)
+	runtime.Store32(&ifreq[0], 20, 0x000000FF) // 255.0.0.0 in network byte order
+	runtime.Syscall(runtime.SYS_IOCTL, fd, runtime.SIOCSIFNETMASK, &ifreq[0])
+
+	// Bring up interface (IFF_UP = 0x1)
+	runtime.Store8(&ifreq[0], 0, 0x6c)
+	runtime.Store8(&ifreq[0], 1, 0x6f)
+	runtime.Store8(&ifreq[0], 2, 0)
+	runtime.Store64(&ifreq[0], 16, 0)
+	runtime.Store64(&ifreq[0], 24, 0)
+	runtime.Store64(&ifreq[0], 32, 0)
+	runtime.Store32(&ifreq[0], 16, runtime.IFF_UP)
+	err := runtime.Syscall(runtime.SYS_IOCTL, fd, runtime.SIOCSIFFLAGS, &ifreq[0])
+	if err < 0 {
+		runtime.Syscall(runtime.SYS_CLOSE, fd)
+		runtime.Printf("cc: failed to bring up loopback: errno=0x%x\n", 0-err)
+		reboot()
+	}
+
+	runtime.Syscall(runtime.SYS_CLOSE, fd)
+	return 0
+}
+// setHostsFile writes /etc/hosts with localhost entries.
+// The hosts content is provided via the "hosts_content" config value.
+func setHostsFile() int64 {
+	ptr, length := runtime.EmbedConfigString("hosts_content")
+
+	// Open /etc/hosts for writing
+	fd := runtime.Syscall(runtime.SYS_OPENAT, runtime.AT_FDCWD, "/etc/hosts",
+		runtime.O_WRONLY|runtime.O_CREAT|runtime.O_TRUNC, 0o644)
+	if fd < 0 {
+		// Non-fatal - just skip if we can't write
+		return 0
+	}
+
+	// Write content
+	runtime.Syscall(runtime.SYS_WRITE, fd, ptr, length)
+	runtime.Syscall(runtime.SYS_CLOSE, fd)
+	return 0
+}
+// configureInterface configures the network interface.
+// This is a placeholder - body is replaced at IR level with actual implementation.
+func configureInterface() int64 { return 0 }
 func addDefaultRoute() int64     { return 0 }
-func setResolvConf() int64       { return 0 }
-func changeWorkDir() int64       { return 0 }
+// setResolvConf writes /etc/resolv.conf with the DNS server.
+// The resolv.conf content is provided via the "resolv_content" config value.
+func setResolvConf() int64 {
+	ptr, length := runtime.EmbedConfigString("resolv_content")
+
+	// Open /etc/resolv.conf for writing
+	fd := runtime.Syscall(runtime.SYS_OPENAT, runtime.AT_FDCWD, "/etc/resolv.conf",
+		runtime.O_WRONLY|runtime.O_CREAT|runtime.O_TRUNC, 0o644)
+	if fd < 0 {
+		runtime.Printf("cc: failed to open /etc/resolv.conf: errno=0x%x\n", 0-fd)
+		reboot()
+	}
+
+	// Write content
+	err := runtime.Syscall(runtime.SYS_WRITE, fd, ptr, length)
+	if err < 0 {
+		runtime.Printf("cc: failed to write /etc/resolv.conf: errno=0x%x\n", 0-err)
+		runtime.Syscall(runtime.SYS_CLOSE, fd)
+		reboot()
+	}
+
+	runtime.Syscall(runtime.SYS_CLOSE, fd)
+	return 0
+}
+// changeWorkDir changes to the working directory from config.
+func changeWorkDir() int64 {
+	ptr, _ := runtime.EmbedConfigCString("workdir")
+	runtime.Syscall(runtime.SYS_CHDIR, ptr)
+	return 0
+}
 func execCommand() int64         { return 0 }
 func forkExecWait() int64        { return 0 }
 

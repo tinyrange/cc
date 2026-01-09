@@ -16,14 +16,10 @@ import (
 //go:embed container_init_source.go
 var rtgContainerInitSource string
 
-// NOTE: There are two implementations of BuildContainerInitProgram:
-//
-// 1. BuildContainerInitProgram - Direct IR construction
-//    This is the original implementation that constructs IR fragments directly.
-//
-// 2. BuildContainerInitProgramRTG - RTG-based implementation
-//    This compiles container_init_source.go using the RTG compiler and injects
-//    dynamic configuration at IR level.
+// BuildContainerInitProgram builds the container init program using the RTG compiler.
+// The source code is embedded from container_init_source.go with most helpers
+// implemented as pure RTG code. Complex helpers (addDefaultRoute, execCommand,
+// forkExecWait) are injected at IR level.
 
 type ContainerInitConfig struct {
 	Arch          hv.CpuArchitecture
@@ -73,202 +69,10 @@ func ipToUint32(addr string) uint32 {
 	return binary.BigEndian.Uint32(ip4)
 }
 
-// BuildContainerInitProgram builds an init program that mounts the virtiofs root,
-// switches root into it (pivot_root with chroot fallback), optionally configures
-// networking, and finally execs or fork/exec/waits a target command.
-func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
-	cfg.applyDefaults()
-
-	if cfg.Arch == "" || cfg.Arch == hv.ArchitectureInvalid {
-		return nil, fmt.Errorf("initx: container init requires valid architecture")
-	}
-	if len(cfg.Cmd) == 0 || cfg.Cmd[0] == "" {
-		return nil, fmt.Errorf("initx: container init requires non-empty command")
-	}
-
-	errLabel := ir.Label("__cc_error")
-	errVar := ir.Var("__cc_errno")
-	pivotResult := ir.Var("__cc_pivot_result")
-
-	main := ir.Method{
-		LogKmsg("cc: running container init program\n"),
-
-		// Create mount points
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt", ir.Int64(0o755)),
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/proc", ir.Int64(0o755)),
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/sys", ir.Int64(0o755)),
-
-		// Mount virtiofs
-		ir.Assign(errVar, ir.Syscall(
-			defs.SYS_MOUNT,
-			"rootfs",
-			"/mnt",
-			"virtiofs",
-			ir.Int64(0),
-			"",
-		)),
-		ir.If(ir.IsNegative(errVar), ir.Block{
-			ir.Printf("cc: failed to mount virtiofs: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-			ir.Goto(errLabel),
-		}),
-
-		// Create necessary directories in container
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt/proc", ir.Int64(0o755)),
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt/sys", ir.Int64(0o755)),
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt/dev", ir.Int64(0o755)),
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt/tmp", ir.Int64(0o1777)),
-
-		// Mount proc/sysfs/devtmpfs
-		ir.Syscall(defs.SYS_MOUNT, "proc", "/mnt/proc", "proc", ir.Int64(0), ""),
-		ir.Syscall(defs.SYS_MOUNT, "sysfs", "/mnt/sys", "sysfs", ir.Int64(0), ""),
-		ir.Syscall(defs.SYS_MOUNT, "devtmpfs", "/mnt/dev", "devtmpfs", ir.Int64(0), ""),
-
-		// Mount tmp
-		ir.Syscall(defs.SYS_MOUNT, "tmpfs", "/mnt/tmp", "tmpfs", ir.Int64(0), "mode=1777"),
-
-		// Mount /dev/shm (wlroots/xkbcommon use it for shm-backed buffers like keymaps).
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/mnt/dev/shm", ir.Int64(0o1777)),
-		ir.Syscall(defs.SYS_MOUNT, "tmpfs", "/mnt/dev/shm", "tmpfs", ir.Int64(0), "mode=1777"),
-
-		LogKmsg("cc: mounted filesystems\n"),
-
-		// Change root to container using pivot_root (fallback to chroot).
-		ir.Assign(errVar, ir.Syscall(defs.SYS_CHDIR, "/mnt")),
-		ir.If(ir.IsNegative(errVar), ir.Block{
-			ir.Printf("cc: failed to chdir to /mnt: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-			ir.Goto(errLabel),
-		}),
-
-		// pivot_root(".", "oldroot")
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "oldroot", ir.Int64(0o755)),
-		ir.Assign(pivotResult, ir.Syscall(defs.SYS_PIVOT_ROOT, ".", "oldroot")),
-		ir.Assign(errVar, pivotResult),
-		ir.If(ir.IsNegative(pivotResult), ir.Block{
-			ir.Assign(errVar, ir.Syscall(defs.SYS_CHROOT, ".")),
-			ir.If(ir.IsNegative(errVar), ir.Block{
-				ir.Printf("cc: failed to chroot: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-				ir.Goto(errLabel),
-			}),
-		}),
-		ir.If(ir.IsGreaterOrEqual(pivotResult, ir.Int64(0)), ir.Block{
-			ir.Assign(errVar, ir.Syscall(defs.SYS_CHDIR, "/")),
-			ir.If(ir.IsNegative(errVar), ir.Block{
-				ir.Printf("cc: failed to chdir to new root: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-				ir.Goto(errLabel),
-			}),
-			ir.Assign(errVar, ir.Syscall(defs.SYS_UMOUNT2, "/oldroot", ir.Int64(linux.MNT_DETACH))),
-			ir.If(ir.IsNegative(errVar), ir.Block{
-				ir.Printf("cc: failed to unmount oldroot: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-				ir.Goto(errLabel),
-			}),
-		}),
-
-		LogKmsg("cc: changed root to container\n"),
-
-		// Always cleanup oldroot (it exists on both pivot_root and chroot fallback).
-		ir.Assign(errVar, ir.Syscall(defs.SYS_UNLINKAT, ir.Int64(linux.AT_FDCWD), "/oldroot", ir.Int64(linux.AT_REMOVEDIR))),
-		ir.If(ir.IsNegative(errVar), ir.Block{
-			ir.Printf("cc: failed to remove oldroot: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-			ir.Goto(errLabel),
-		}),
-
-		// Change to working directory.
-		ir.Syscall(defs.SYS_CHDIR, cfg.WorkDir),
-
-		// /dev/pts + devpts mount.
-		ir.Syscall(defs.SYS_MKDIRAT, ir.Int64(linux.AT_FDCWD), "/dev/pts", ir.Int64(0o755)),
-		ir.Assign(errVar, ir.Syscall(defs.SYS_MOUNT, "devpts", "/dev/pts", "devpts", ir.Int64(0), "")),
-		ir.If(ir.IsNegative(errVar), ir.Block{
-			ir.Printf("cc: failed to mount devpts: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-			ir.Goto(errLabel),
-		}),
-
-		// /dev/fd symlink to /proc/self/fd
-		ir.Assign(errVar, ir.Syscall(defs.SYS_SYMLINKAT, "/proc/self/fd", ir.Int64(linux.AT_FDCWD), "/dev/fd")),
-		ir.If(ir.IsNegative(errVar), ir.Block{
-			ir.Printf("cc: failed to symlink /proc/self/fd to /dev/fd: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-			ir.Goto(errLabel),
-		}),
-
-		LogKmsg("cc: mounted devpts\n"),
-
-		// Set hostname.
-		SetHostname(cfg.Hostname, errLabel, errVar),
-		LogKmsg("cc: set hostname to container name\n"),
-
-		// Always configure loopback interface for localhost networking.
-		ConfigureLoopback(errLabel, errVar),
-		LogKmsg("cc: configured loopback interface\n"),
-
-		// Set up /etc/hosts for localhost resolution (optional, don't fail if it doesn't work).
-		SetHostsOptional(cfg.Hostname),
-		LogKmsg("cc: configured /etc/hosts\n"),
-	}
-
-	// Configure network interface if networking is enabled.
-	if cfg.EnableNetwork {
-		ip := ipToUint32(cfg.GuestIP)
-		gateway := ipToUint32(cfg.DNS)
-		mask := ipToUint32(cfg.GuestMask)
-		main = append(main,
-			ConfigureInterface(cfg.GuestIFName, ip, mask, errLabel, errVar),
-			AddDefaultRoute(cfg.GuestIFName, gateway, errLabel, errVar),
-			SetResolvConf(cfg.DNS, errLabel, errVar),
-			LogKmsg("cc: configured network interface\n"),
-		)
-	}
-
-	if cfg.Exec {
-		main = append(main, ir.Block{
-			LogKmsg(fmt.Sprintf("cc: executing command %s\n", cfg.Cmd[0])),
-			Exec(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, errLabel, errVar),
-		})
-	} else {
-		main = append(main,
-			ForkExecWait(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, errLabel, errVar),
-		)
-	}
-
-	main = append(main,
-		// Return child exit code to host.
-		ir.Return(errVar),
-
-		// Error handler.
-		ir.DeclareLabel(errLabel, ir.Block{
-			ir.Printf("cc: fatal error during boot: errno=0x%x\n", errVar),
-			func() ir.Fragment {
-				switch cfg.Arch {
-				case hv.ArchitectureX86_64:
-					return ir.Syscall(defs.SYS_REBOOT,
-						linux.LINUX_REBOOT_MAGIC1,
-						linux.LINUX_REBOOT_MAGIC2,
-						linux.LINUX_REBOOT_CMD_RESTART,
-						ir.Int64(0),
-					)
-				case hv.ArchitectureARM64:
-					return ir.Syscall(defs.SYS_REBOOT,
-						linux.LINUX_REBOOT_MAGIC1,
-						linux.LINUX_REBOOT_MAGIC2,
-						linux.LINUX_REBOOT_CMD_POWER_OFF,
-						ir.Int64(0),
-					)
-				default:
-					panic(fmt.Sprintf("unsupported architecture for reboot: %s", cfg.Arch))
-				}
-			}(),
-		}),
-	)
-
-	return &ir.Program{
-		Methods:    map[string]ir.Method{"main": main},
-		Entrypoint: "main",
-	}, nil
-}
-
-// BuildContainerInitProgramRTG builds the container init program from RTG source code.
+// BuildContainerInitProgram builds the container init program using RTG source code.
 // The source code is embedded from container_init_source.go which is a valid Go file
-// for IDE completion support.
-func BuildContainerInitProgramRTG(cfg ContainerInitConfig) (*ir.Program, error) {
+// for IDE completion support. Most helpers are pure RTG, with complex ones injected at IR level.
+func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
 	cfg.applyDefaults()
 
 	if cfg.Arch == "" || cfg.Arch == hv.ArchitectureInvalid {
@@ -295,16 +99,45 @@ func BuildContainerInitProgramRTG(cfg ContainerInitConfig) (*ir.Program, error) 
 		"exec":    cfg.Exec,
 	}
 
-	// Compile the RTG source with architecture and flags
+	// Build config values for pure RTG helpers
+	config := map[string]any{
+		"hostname": cfg.Hostname,
+		"workdir":  cfg.WorkDir,
+	}
+
+	// Build hosts content
+	hostsContent := "127.0.0.1\tlocalhost\n::1\t\tlocalhost ip6-localhost ip6-loopback\n"
+	if cfg.Hostname != "" && cfg.Hostname != "localhost" {
+		hostsContent += "127.0.0.1\t" + cfg.Hostname + "\n"
+	}
+	config["hosts_content"] = hostsContent
+
+	// Network config (if enabled)
+	// Note: resolv_content must always be set because the setResolvConf function
+	// is compiled unconditionally (even if only called via Ifdef). The RTG compiler
+	// resolves EmbedConfigString at compile time for all functions.
+	if cfg.EnableNetwork {
+		config["interface_name"] = cfg.GuestIFName
+		config["interface_ip_nbo"] = int64(ipToNetworkByteOrder(cfg.GuestIP))
+		config["interface_mask_nbo"] = int64(ipToNetworkByteOrder(cfg.GuestMask))
+		config["gateway_nbo"] = int64(ipToNetworkByteOrder(cfg.DNS))
+		config["resolv_content"] = "nameserver " + cfg.DNS + "\n"
+	} else {
+		// Provide empty default for resolv_content to allow compilation
+		config["resolv_content"] = ""
+	}
+
+	// Compile the RTG source with architecture, flags, and config
 	prog, err := rtg.CompileProgramWithOptions(rtgContainerInitSource, rtg.CompileOptions{
 		GOARCH: goarch,
 		Flags:  flags,
+		Config: config,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to compile RTG container init source: %w", err)
 	}
 
-	// Replace placeholder method bodies with actual implementations
+	// Replace placeholder method bodies for complex helpers that aren't pure RTG yet
 	if err := injectContainerInitHelpers(prog, cfg); err != nil {
 		return nil, fmt.Errorf("failed to inject container init helpers: %w", err)
 	}
@@ -312,65 +145,77 @@ func BuildContainerInitProgramRTG(cfg ContainerInitConfig) (*ir.Program, error) 
 	return prog, nil
 }
 
+// ipToNetworkByteOrder converts an IP address string to network byte order uint32.
+func ipToNetworkByteOrder(addr string) uint32 {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return 0
+	}
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return 0
+	}
+	// Network byte order (big-endian) stored in little-endian memory
+	// For 10.42.0.2: 0x0a2a0002 big-endian -> 0x02002a0a when read as little-endian
+	return uint32(ip4[3])<<24 | uint32(ip4[2])<<16 | uint32(ip4[1])<<8 | uint32(ip4[0])
+}
+
 // injectContainerInitHelpers replaces placeholder method bodies with actual implementations.
-// The RTG source defines placeholder functions (setHostname, configureLoopback, etc.)
-// that are compiled as methods. This function replaces their bodies with the real
-// helper implementations that include dynamic configuration values.
+// Most helpers are now pure RTG and compiled directly. This function only injects
+// the complex helpers that aren't pure RTG yet (addDefaultRoute, execCommand, forkExecWait).
 func injectContainerInitHelpers(prog *ir.Program, cfg ContainerInitConfig) error {
 	errLabel := ir.Label("__cc_container_error")
 	errVar := ir.Var("__cc_container_errno")
 
-	// Replace placeholder method bodies
-	prog.Methods["setHostname"] = ir.Method{
-		SetHostname(cfg.Hostname, errLabel, errVar),
-		ir.Return(ir.Int64(0)),
+	// Complex network helpers (require dynamic data structures)
+	if cfg.EnableNetwork {
+		ip := ipToUint32(cfg.GuestIP)
+		gateway := ipToUint32(cfg.DNS)
+		mask := ipToUint32(cfg.GuestMask)
+
+		// Each helper needs its own error label since methods are compiled separately
+		configIfErrLabel := ir.Label("__cc_configif_error")
+		addRouteErrLabel := ir.Label("__cc_addroute_error")
+
+		prog.Methods["configureInterface"] = ir.Method{
+			ConfigureInterface(cfg.GuestIFName, ip, mask, configIfErrLabel, errVar),
+			ir.Return(ir.Int64(0)),
+			ir.DeclareLabel(configIfErrLabel, ir.Block{
+				ir.Printf("cc: configureInterface error: errno=0x%x\n", errVar),
+				rebootFragment(cfg.Arch),
+			}),
+		}
+
+		prog.Methods["addDefaultRoute"] = ir.Method{
+			AddDefaultRoute(cfg.GuestIFName, gateway, addRouteErrLabel, errVar),
+			ir.Return(ir.Int64(0)),
+			ir.DeclareLabel(addRouteErrLabel, ir.Block{
+				ir.Printf("cc: addDefaultRoute error: errno=0x%x\n", errVar),
+				rebootFragment(cfg.Arch),
+			}),
+		}
 	}
 
-	prog.Methods["configureLoopback"] = ir.Method{
-		ConfigureLoopback(errLabel, errVar),
-		ir.Return(ir.Int64(0)),
-	}
+	// Command execution helpers (require dynamic argv/envp construction)
+	execErrLabel := ir.Label("__cc_exec_error")
+	forkErrLabel := ir.Label("__cc_fork_error")
 
-	prog.Methods["setHostsFile"] = ir.Method{
-		SetHostsOptional(cfg.Hostname),
-		ir.Return(ir.Int64(0)),
-	}
-
-	// Network helpers (only called if "network" flag is true, due to Ifdef)
-	ip := ipToUint32(cfg.GuestIP)
-	gateway := ipToUint32(cfg.DNS)
-	mask := ipToUint32(cfg.GuestMask)
-
-	prog.Methods["configureInterface"] = ir.Method{
-		ConfigureInterface(cfg.GuestIFName, ip, mask, errLabel, errVar),
-		ir.Return(ir.Int64(0)),
-	}
-
-	prog.Methods["addDefaultRoute"] = ir.Method{
-		AddDefaultRoute(cfg.GuestIFName, gateway, errLabel, errVar),
-		ir.Return(ir.Int64(0)),
-	}
-
-	prog.Methods["setResolvConf"] = ir.Method{
-		SetResolvConf(cfg.DNS, errLabel, errVar),
-		ir.Return(ir.Int64(0)),
-	}
-
-	// Working directory
-	prog.Methods["changeWorkDir"] = ir.Method{
-		ir.Syscall(defs.SYS_CHDIR, cfg.WorkDir),
-		ir.Return(ir.Int64(0)),
-	}
-
-	// Command execution (one of these will be called based on "exec" flag)
 	prog.Methods["execCommand"] = ir.Method{
-		Exec(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, errLabel, errVar),
+		Exec(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, execErrLabel, errVar),
 		ir.Return(ir.Int64(0)),
+		ir.DeclareLabel(execErrLabel, ir.Block{
+			ir.Printf("cc: execCommand error: errno=0x%x\n", errVar),
+			rebootFragment(cfg.Arch),
+		}),
 	}
 
 	prog.Methods["forkExecWait"] = ir.Method{
-		ForkExecWait(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, errLabel, errVar),
+		ForkExecWait(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, forkErrLabel, errVar),
 		ir.Return(errVar),
+		ir.DeclareLabel(forkErrLabel, ir.Block{
+			ir.Printf("cc: forkExecWait error: errno=0x%x\n", errVar),
+			rebootFragment(cfg.Arch),
+		}),
 	}
 
 	// Add error handler to main method

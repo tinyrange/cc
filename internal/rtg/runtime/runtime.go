@@ -57,6 +57,39 @@ func ISB() {}
 // Undefined flags are treated as false.
 func Ifdef(flag string) bool { return false }
 
+// Config retrieves a compile-time configuration value by key.
+// This is evaluated at RTG compile time, not at runtime.
+// The key must be a string literal.
+// Supported value types: string, int64
+// Returns error at compile time if key is not found.
+func Config(key string) any { return nil }
+
+// EmbedString embeds a string constant in the binary and returns a pointer and length.
+// The string does NOT have a null terminator.
+// Usage: ptr, len := runtime.EmbedString("hello")
+func EmbedString(s string) (int64, int64) { return 0, 0 }
+
+// EmbedCString embeds a C-style string constant (with null terminator) and returns a pointer and length.
+// The length returned is the original string length WITHOUT the null terminator.
+// Usage: ptr, len := runtime.EmbedCString("hello")
+func EmbedCString(s string) (int64, int64) { return 0, 0 }
+
+// EmbedBytes embeds raw bytes in the binary and returns a pointer and length.
+// Usage: ptr, len := runtime.EmbedBytes(0x01, 0x02, 0x03)
+func EmbedBytes(bytes ...byte) (int64, int64) { return 0, 0 }
+
+// EmbedConfigString embeds a config string value in the binary and returns a pointer and length.
+// The key is looked up in CompileOptions.Config at compile time.
+// The string does NOT have a null terminator.
+// Usage: ptr, len := runtime.EmbedConfigString("hostname")
+func EmbedConfigString(key string) (int64, int64) { return 0, 0 }
+
+// EmbedConfigCString embeds a config string value as a C-style string (with null terminator).
+// The key is looked up in CompileOptions.Config at compile time.
+// The length returned is the original string length WITHOUT the null terminator.
+// Usage: ptr, len := runtime.EmbedConfigCString("hostname")
+func EmbedConfigCString(key string) (int64, int64) { return 0, 0 }
+
 // Syscall numbers (architecture-independent definitions for type checking)
 const (
 	SYS_EXIT          int64 = 0

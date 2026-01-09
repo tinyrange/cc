@@ -2,6 +2,7 @@ package rtg
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/tinyrange/cc/internal/ir"
@@ -209,5 +210,363 @@ func main() int64 {
 	}
 	if !foundIf {
 		t.Fatal("Expected if fragment in compiled output")
+	}
+}
+
+func TestCompileStackBuffer(t *testing.T) {
+	src := `package main
+import "github.com/tinyrange/cc/internal/rtg/runtime"
+func main() int64 {
+	var buf [40]byte
+	runtime.Store8(buf, 0, 65)
+	runtime.Store32(buf, 16, 0x12345678)
+	return 0
+}`
+	got, err := CompileProgram(src)
+	if err != nil {
+		t.Fatalf("CompileProgram returned error: %v", err)
+	}
+
+	main := got.Methods["main"]
+	if len(main) == 0 {
+		t.Fatal("main method is empty")
+	}
+
+	// The result should have a WithStackSlot wrapping the body
+	foundStackSlot := false
+	var checkFragment func(frag ir.Fragment) bool
+	checkFragment = func(frag ir.Fragment) bool {
+		switch v := frag.(type) {
+		case ir.Block:
+			for _, inner := range v {
+				if checkFragment(inner) {
+					return true
+				}
+			}
+		case ir.StackSlotFragment:
+			foundStackSlot = true
+			// Check that the stack slot has size 40
+			if v.Size != 40 {
+				t.Errorf("Expected stack slot size 40, got %d", v.Size)
+			}
+			return true
+		}
+		return false
+	}
+
+	for _, frag := range main {
+		checkFragment(frag)
+	}
+
+	if !foundStackSlot {
+		t.Fatal("Expected WithStackSlot fragment for buffer")
+	}
+}
+
+func TestCompileStackBufferAddressOf(t *testing.T) {
+	src := `package main
+import "github.com/tinyrange/cc/internal/rtg/runtime"
+func main() int64 {
+	var buf [40]byte
+	runtime.Store8(&buf[0], 8, 65)
+	return 0
+}`
+	got, err := CompileProgram(src)
+	if err != nil {
+		t.Fatalf("CompileProgram returned error: %v", err)
+	}
+
+	main := got.Methods["main"]
+	if len(main) == 0 {
+		t.Fatal("main method is empty")
+	}
+
+	// Verify the program compiles without error
+	// The &buf[0] + 8 should result in a memory access at offset 8
+	foundStackSlot := false
+	var checkFragment func(frag ir.Fragment) bool
+	checkFragment = func(frag ir.Fragment) bool {
+		switch v := frag.(type) {
+		case ir.Block:
+			for _, inner := range v {
+				if checkFragment(inner) {
+					return true
+				}
+			}
+		case ir.StackSlotFragment:
+			foundStackSlot = true
+			return true
+		}
+		return false
+	}
+
+	for _, frag := range main {
+		checkFragment(frag)
+	}
+
+	if !foundStackSlot {
+		t.Fatal("Expected WithStackSlot fragment for buffer")
+	}
+}
+
+func TestCompileEmbedString(t *testing.T) {
+	src := `package main
+import "github.com/tinyrange/cc/internal/rtg/runtime"
+func main() int64 {
+	ptr, length := runtime.EmbedString("hello world")
+	runtime.Syscall(runtime.SYS_WRITE, 1, ptr, length)
+	return 0
+}`
+	got, err := CompileProgram(src)
+	if err != nil {
+		t.Fatalf("CompileProgram returned error: %v", err)
+	}
+
+	main := got.Methods["main"]
+	if len(main) == 0 {
+		t.Fatal("main method is empty")
+	}
+
+	// Check for ConstantBytesFragment in the output
+	foundEmbed := false
+	var checkFragment func(frag ir.Fragment) bool
+	checkFragment = func(frag ir.Fragment) bool {
+		switch v := frag.(type) {
+		case ir.Block:
+			for _, inner := range v {
+				if checkFragment(inner) {
+					return true
+				}
+			}
+		case ir.ConstantBytesFragment:
+			foundEmbed = true
+			return true
+		}
+		return false
+	}
+
+	for _, frag := range main {
+		checkFragment(frag)
+	}
+
+	if !foundEmbed {
+		t.Fatal("Expected ConstantBytesFragment for EmbedString")
+	}
+}
+
+func TestCompileEmbedCString(t *testing.T) {
+	src := `package main
+import "github.com/tinyrange/cc/internal/rtg/runtime"
+func main() int64 {
+	ptr, length := runtime.EmbedCString("hostname")
+	runtime.Syscall(runtime.SYS_SETHOSTNAME, ptr, length)
+	return 0
+}`
+	got, err := CompileProgram(src)
+	if err != nil {
+		t.Fatalf("CompileProgram returned error: %v", err)
+	}
+
+	main := got.Methods["main"]
+	if len(main) == 0 {
+		t.Fatal("main method is empty")
+	}
+
+	// Check for ConstantBytesFragment with zero terminator
+	foundEmbed := false
+	var checkFragment func(frag ir.Fragment) bool
+	checkFragment = func(frag ir.Fragment) bool {
+		switch v := frag.(type) {
+		case ir.Block:
+			for _, inner := range v {
+				if checkFragment(inner) {
+					return true
+				}
+			}
+		case ir.ConstantBytesFragment:
+			foundEmbed = true
+			// EmbedCString should have data ending with null terminator
+			if len(v.Data) == 0 || v.Data[len(v.Data)-1] != 0 {
+				t.Error("Expected data to be null-terminated for EmbedCString")
+			}
+			return true
+		}
+		return false
+	}
+
+	for _, frag := range main {
+		checkFragment(frag)
+	}
+
+	if !foundEmbed {
+		t.Fatal("Expected ConstantBytesFragment for EmbedCString")
+	}
+}
+
+func TestCompileEmbedBytes(t *testing.T) {
+	src := `package main
+import "github.com/tinyrange/cc/internal/rtg/runtime"
+func main() int64 {
+	ptr, length := runtime.EmbedBytes(0x01, 0x02, 0x03)
+	runtime.Syscall(runtime.SYS_WRITE, 1, ptr, length)
+	return 0
+}`
+	got, err := CompileProgram(src)
+	if err != nil {
+		t.Fatalf("CompileProgram returned error: %v", err)
+	}
+
+	main := got.Methods["main"]
+	if len(main) == 0 {
+		t.Fatal("main method is empty")
+	}
+
+	// Check for ConstantBytesFragment with correct data
+	foundEmbed := false
+	var checkFragment func(frag ir.Fragment) bool
+	checkFragment = func(frag ir.Fragment) bool {
+		switch v := frag.(type) {
+		case ir.Block:
+			for _, inner := range v {
+				if checkFragment(inner) {
+					return true
+				}
+			}
+		case ir.ConstantBytesFragment:
+			foundEmbed = true
+			if len(v.Data) != 3 {
+				t.Errorf("Expected 3 bytes, got %d", len(v.Data))
+			}
+			if v.Data[0] != 0x01 || v.Data[1] != 0x02 || v.Data[2] != 0x03 {
+				t.Errorf("Unexpected data: %v", v.Data)
+			}
+			return true
+		}
+		return false
+	}
+
+	for _, frag := range main {
+		checkFragment(frag)
+	}
+
+	if !foundEmbed {
+		t.Fatal("Expected ConstantBytesFragment for EmbedBytes")
+	}
+}
+
+func TestCompileConfigInt64(t *testing.T) {
+	src := `package main
+import "github.com/tinyrange/cc/internal/rtg/runtime"
+func main() int64 {
+	return runtime.Config("myvalue")
+}`
+	got, err := CompileProgramWithOptions(src, CompileOptions{
+		Config: map[string]any{"myvalue": int64(42)},
+	})
+	if err != nil {
+		t.Fatalf("CompileProgram returned error: %v", err)
+	}
+
+	main := got.Methods["main"]
+	if len(main) == 0 {
+		t.Fatal("main method is empty")
+	}
+
+	// The result should be: return 42
+	want := &ir.Program{
+		Entrypoint: "main",
+		Methods: map[string]ir.Method{
+			"main": {
+				ir.Return(ir.Int64(42)),
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected program\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestCompileConfigMissing(t *testing.T) {
+	src := `package main
+import "github.com/tinyrange/cc/internal/rtg/runtime"
+func main() int64 {
+	return runtime.Config("missing")
+}`
+	_, err := CompileProgramWithOptions(src, CompileOptions{
+		Config: map[string]any{"other": int64(1)},
+	})
+	if err == nil {
+		t.Fatal("Expected error for missing config key")
+	}
+	if !strings.Contains(err.Error(), "key not found") {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+}
+
+func TestCompileConfigNoConfig(t *testing.T) {
+	src := `package main
+import "github.com/tinyrange/cc/internal/rtg/runtime"
+func main() int64 {
+	return runtime.Config("anything")
+}`
+	_, err := CompileProgramWithOptions(src, CompileOptions{})
+	if err == nil {
+		t.Fatal("Expected error when no config values provided")
+	}
+	if !strings.Contains(err.Error(), "no config values provided") {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+}
+
+func TestCompileEmbedConfigCString(t *testing.T) {
+	src := `package main
+import "github.com/tinyrange/cc/internal/rtg/runtime"
+func main() int64 {
+	ptr, length := runtime.EmbedConfigCString("hostname")
+	runtime.Syscall(runtime.SYS_SETHOSTNAME, ptr, length)
+	return 0
+}`
+	got, err := CompileProgramWithOptions(src, CompileOptions{
+		Config: map[string]any{"hostname": "tinyrange"},
+	})
+	if err != nil {
+		t.Fatalf("CompileProgram returned error: %v", err)
+	}
+
+	main := got.Methods["main"]
+	if len(main) == 0 {
+		t.Fatal("main method is empty")
+	}
+
+	// Check for ConstantBytesFragment with null-terminated data
+	foundEmbed := false
+	var checkFragment func(frag ir.Fragment) bool
+	checkFragment = func(frag ir.Fragment) bool {
+		switch v := frag.(type) {
+		case ir.Block:
+			for _, inner := range v {
+				if checkFragment(inner) {
+					return true
+				}
+			}
+		case ir.ConstantBytesFragment:
+			foundEmbed = true
+			// EmbedConfigCString should have data "tinyrange\0"
+			expected := append([]byte("tinyrange"), 0)
+			if string(v.Data) != string(expected) {
+				t.Errorf("Expected data %q, got %q", expected, v.Data)
+			}
+			return true
+		}
+		return false
+	}
+
+	for _, frag := range main {
+		checkFragment(frag)
+	}
+
+	if !foundEmbed {
+		t.Fatal("Expected ConstantBytesFragment for EmbedConfigCString")
 	}
 }

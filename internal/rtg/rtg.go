@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/tinyrange/cc/internal/asm"
 	"github.com/tinyrange/cc/internal/ir"
 	"github.com/tinyrange/cc/internal/linux/defs"
 	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
@@ -26,10 +27,12 @@ const (
 	TypeUintptr
 	TypeString
 	TypeLabel
+	TypeBuffer // Stack-allocated byte buffer
 )
 
 type Type struct {
-	Kind TypeKind
+	Kind       TypeKind
+	BufferSize int64 // Size in bytes for TypeBuffer
 }
 
 func (t Type) String() string {
@@ -50,6 +53,8 @@ func (t Type) String() string {
 		return "string"
 	case TypeLabel:
 		return "label"
+	case TypeBuffer:
+		return fmt.Sprintf("[%d]byte", t.BufferSize)
 	default:
 		return "invalid"
 	}
@@ -97,17 +102,32 @@ type CompileOptions struct {
 	// Used with runtime.Ifdef("flag") to include/exclude code at compile time.
 	// Undefined flags are treated as false.
 	Flags map[string]bool
+
+	// Config holds compile-time configuration values.
+	// Used with runtime.Config("key") to inject values at compile time.
+	// Supported types: string, int64, []string
+	Config map[string]any
+}
+
+// bufferInfo tracks a stack-allocated buffer for code generation.
+type bufferInfo struct {
+	name   string
+	size   int64
+	slotID int
 }
 
 // Compiler holds the state for a single source-to-IR lowering.
 type Compiler struct {
-	fset       *token.FileSet
-	file       *ast.File
-	scope      *scope
-	returnType Type
-	opts       CompileOptions
-	constants  map[string]int64 // package-level constants
-	labelCount int              // counter for generating unique labels
+	fset        *token.FileSet
+	file        *ast.File
+	scope       *scope
+	returnType  Type
+	opts        CompileOptions
+	constants   map[string]int64 // package-level constants
+	labelCount  int              // counter for generating unique labels
+	buffers     []bufferInfo     // stack buffers declared in current function
+	nextSlotID  int              // counter for unique slot IDs
+	embedVarCtr int              // counter for unique embed variable names
 }
 
 // CompileProgram parses src and lowers it into an ir.Program. The accepted
@@ -272,9 +292,12 @@ func (c *Compiler) lowerFunc(fn *ast.FuncDecl) (ir.Method, error) {
 	c.scope = newScope(prevScope)
 	prevRet := c.returnType
 	c.returnType = retType
+	prevBuffers := c.buffers
+	c.buffers = nil // Reset buffers for this function
 	defer func() {
 		c.scope = prevScope
 		c.returnType = prevRet
+		c.buffers = prevBuffers
 	}()
 
 	if fn.Body == nil {
@@ -317,33 +340,224 @@ func (c *Compiler) lowerFunc(fn *ast.FuncDecl) (ir.Method, error) {
 		return nil, fmt.Errorf("rtg: function %q missing return statement", fn.Name.Name)
 	}
 
+	// Wrap method body with stack slots for any declared buffers
+	// We need to wrap from innermost to outermost (reverse order)
+	if len(c.buffers) > 0 {
+		method = c.wrapWithStackSlots(method)
+	}
+
 	return method, nil
 }
 
-func resolveType(expr ast.Expr) (Type, error) {
-	id, ok := expr.(*ast.Ident)
-	if !ok {
-		return Type{}, fmt.Errorf("unsupported type %T", expr)
+// wrapWithStackSlots wraps the method body with ir.WithStackSlot for each buffer.
+// Buffers are wrapped from innermost (last declared) to outermost (first declared).
+func (c *Compiler) wrapWithStackSlots(body ir.Method) ir.Method {
+	// The body should be wrapped in nested WithStackSlot calls
+	// For each buffer, create a WithStackSlot that wraps the current body
+	result := ir.Block(body)
+
+	// Wrap in reverse order so first buffer is outermost
+	for i := len(c.buffers) - 1; i >= 0; i-- {
+		buf := c.buffers[i]
+		slotID := buf.slotID
+		size := buf.size
+		innerBody := result
+
+		result = ir.Block{
+			ir.WithStackSlot(ir.StackSlotConfig{
+				Size: size,
+				Body: func(slot ir.StackSlot) ir.Fragment {
+					// Replace slot references in the body with the actual slot
+					return replaceSlotRefs(innerBody, slotID, slot)
+				},
+			}),
+		}
 	}
-	switch id.Name {
-	case "int64":
-		return Type{Kind: TypeI64}, nil
-	case "int32":
-		return Type{Kind: TypeI32}, nil
-	case "int16":
-		return Type{Kind: TypeI16}, nil
-	case "int8":
-		return Type{Kind: TypeI8}, nil
-	case "bool":
-		return Type{Kind: TypeBool}, nil
-	case "uintptr":
-		return Type{Kind: TypeUintptr}, nil
-	case "string":
-		return Type{Kind: TypeString}, nil
-	case "label":
-		return Type{Kind: TypeLabel}, nil
+
+	return ir.Method{result}
+}
+
+// replaceSlotRefs replaces placeholder slot references with actual slot references.
+func replaceSlotRefs(frag ir.Fragment, slotID int, slot ir.StackSlot) ir.Fragment {
+	switch f := frag.(type) {
+	case ir.Block:
+		result := make(ir.Block, len(f))
+		for i, inner := range f {
+			result[i] = replaceSlotRefs(inner, slotID, slot)
+		}
+		return result
+	case ir.Method:
+		result := make(ir.Method, len(f))
+		for i, inner := range f {
+			result[i] = replaceSlotRefs(inner, slotID, slot)
+		}
+		return result
+	case ir.AssignFragment:
+		return ir.Assign(
+			replaceSlotRefs(f.Dst, slotID, slot),
+			replaceSlotRefs(f.Src, slotID, slot),
+		)
+	case ir.IfFragment:
+		then := replaceSlotRefs(f.Then, slotID, slot)
+		var otherwise ir.Fragment
+		if f.Otherwise != nil {
+			otherwise = replaceSlotRefs(f.Otherwise, slotID, slot)
+		}
+		return ir.IfFragment{
+			Cond:      replaceSlotRefsInCondition(f.Cond, slotID, slot),
+			Then:      then,
+			Otherwise: otherwise,
+		}
+	case ir.LabelFragment:
+		return ir.LabelFragment{
+			Label: f.Label,
+			Block: replaceSlotRefs(f.Block, slotID, slot).(ir.Block),
+		}
+	case ir.SyscallFragment:
+		args := make([]ir.Fragment, len(f.Args))
+		for i, arg := range f.Args {
+			args[i] = replaceSlotRefs(arg, slotID, slot).(ir.Fragment)
+		}
+		return ir.SyscallFragment{Num: f.Num, Args: args}
+	case ir.PrintfFragment:
+		args := make([]ir.Fragment, len(f.Args))
+		for i, arg := range f.Args {
+			args[i] = replaceSlotRefs(arg, slotID, slot).(ir.Fragment)
+		}
+		return ir.PrintfFragment{Format: f.Format, Args: args}
+	case ir.ReturnFragment:
+		return ir.ReturnFragment{Value: replaceSlotRefs(f.Value, slotID, slot)}
+	case ir.GotoFragment:
+		return f
+	case ir.OpFragment:
+		return ir.OpFragment{
+			Kind:  f.Kind,
+			Left:  replaceSlotRefs(f.Left, slotID, slot),
+			Right: replaceSlotRefs(f.Right, slotID, slot),
+		}
+	case ir.CallFragment:
+		return ir.CallFragment{
+			Target: replaceSlotRefs(f.Target, slotID, slot),
+			Result: f.Result,
+		}
+	case bufferMemPlaceholder:
+		if f.slotID == slotID {
+			// Get the base StackSlotMemFragment from slot.At()
+			mem := slot.At(f.disp).(ir.StackSlotMemFragment)
+			switch f.width {
+			case 8:
+				return mem.As8()
+			case 16:
+				return mem.As16()
+			case 32:
+				return mem.As32()
+			default:
+				return mem // 64-bit (default)
+			}
+		}
+		return f
+	case bufferPtrPlaceholder:
+		if f.slotID == slotID {
+			if f.disp == 0 {
+				return slot.Pointer()
+			}
+			return slot.PointerWithDisp(ir.Int64(f.disp))
+		}
+		return f
 	default:
-		return Type{}, fmt.Errorf("unsupported type %q", id.Name)
+		return frag
+	}
+}
+
+// replaceSlotRefsInCondition handles conditions in if statements.
+func replaceSlotRefsInCondition(cond ir.Condition, slotID int, slot ir.StackSlot) ir.Condition {
+	switch c := cond.(type) {
+	case ir.CompareCondition:
+		return ir.CompareCondition{
+			Kind:  c.Kind,
+			Left:  replaceSlotRefs(c.Left, slotID, slot),
+			Right: replaceSlotRefs(c.Right, slotID, slot),
+		}
+	case ir.IsNegativeCondition:
+		return ir.IsNegativeCondition{Value: replaceSlotRefs(c.Value, slotID, slot)}
+	case ir.IsZeroCondition:
+		return ir.IsZeroCondition{Value: replaceSlotRefs(c.Value, slotID, slot)}
+	default:
+		return cond
+	}
+}
+
+// bufferPtrPlaceholder is a placeholder for buffer pointer references.
+// It is used during lowering and replaced with actual StackSlotPtrFragment
+// when the function body is wrapped with WithStackSlot.
+type bufferPtrPlaceholder struct {
+	slotID int
+	disp   int64
+}
+
+// bufferMemPlaceholder is a placeholder for buffer memory references.
+// It is used during lowering and replaced with actual StackSlotMemFragment
+// when the function body is wrapped with WithStackSlot.
+type bufferMemPlaceholder struct {
+	slotID int
+	disp   int64
+	width  int // 8, 16, 32, or 64 (0 means 64)
+}
+
+// findBuffer looks up a buffer by name in the current function.
+func (c *Compiler) findBuffer(name string) *bufferInfo {
+	for i := range c.buffers {
+		if c.buffers[i].name == name {
+			return &c.buffers[i]
+		}
+	}
+	return nil
+}
+
+func resolveType(expr ast.Expr) (Type, error) {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		switch t.Name {
+		case "int64":
+			return Type{Kind: TypeI64}, nil
+		case "int32":
+			return Type{Kind: TypeI32}, nil
+		case "int16":
+			return Type{Kind: TypeI16}, nil
+		case "int8":
+			return Type{Kind: TypeI8}, nil
+		case "bool":
+			return Type{Kind: TypeBool}, nil
+		case "uintptr":
+			return Type{Kind: TypeUintptr}, nil
+		case "string":
+			return Type{Kind: TypeString}, nil
+		case "label":
+			return Type{Kind: TypeLabel}, nil
+		default:
+			return Type{}, fmt.Errorf("unsupported type %q", t.Name)
+		}
+	case *ast.ArrayType:
+		// Handle [N]byte array type for stack buffers
+		elemType, ok := t.Elt.(*ast.Ident)
+		if !ok || elemType.Name != "byte" {
+			return Type{}, fmt.Errorf("only [N]byte arrays are supported")
+		}
+		// Get the array length
+		lenExpr, ok := t.Len.(*ast.BasicLit)
+		if !ok || lenExpr.Kind != token.INT {
+			return Type{}, fmt.Errorf("array length must be a constant integer")
+		}
+		size, err := strconv.ParseInt(lenExpr.Value, 0, 64)
+		if err != nil {
+			return Type{}, fmt.Errorf("invalid array length: %w", err)
+		}
+		if size <= 0 {
+			return Type{}, fmt.Errorf("array length must be positive")
+		}
+		return Type{Kind: TypeBuffer, BufferSize: size}, nil
+	default:
+		return Type{}, fmt.Errorf("unsupported type %T", expr)
 	}
 }
 
@@ -396,6 +610,28 @@ func (c *Compiler) lowerDecl(stmt *ast.DeclStmt) ([]ir.Fragment, error) {
 		return nil, err
 	}
 	name := spec.Names[0].Name
+
+	// Handle buffer declarations specially
+	if typ.Kind == TypeBuffer {
+		if len(spec.Values) != 0 {
+			return nil, fmt.Errorf("rtg: buffer declarations cannot have initializers")
+		}
+		// Register the buffer
+		slotID := c.nextSlotID
+		c.nextSlotID++
+		c.buffers = append(c.buffers, bufferInfo{
+			name:   name,
+			size:   typ.BufferSize,
+			slotID: slotID,
+		})
+		// Define the buffer variable in scope (it will resolve to a pointer placeholder)
+		if err := c.scope.define(name, typ); err != nil {
+			return nil, err
+		}
+		// No IR fragments generated here - the buffer is created by WithStackSlot
+		return nil, nil
+	}
+
 	if err := c.scope.define(name, typ); err != nil {
 		return nil, err
 	}
@@ -419,6 +655,19 @@ func (c *Compiler) lowerDecl(stmt *ast.DeclStmt) ([]ir.Fragment, error) {
 }
 
 func (c *Compiler) lowerAssign(assign *ast.AssignStmt) ([]ir.Fragment, error) {
+	// Handle multi-value assignment for embed functions: ptr, len := runtime.EmbedString("...")
+	if len(assign.Lhs) == 2 && len(assign.Rhs) == 1 {
+		if callExpr, ok := assign.Rhs[0].(*ast.CallExpr); ok {
+			funcName, err := c.resolveFuncName(callExpr.Fun)
+			if err == nil {
+				switch funcName {
+				case "EmbedString", "EmbedCString", "EmbedBytes", "EmbedConfigString", "EmbedConfigCString":
+					return c.lowerEmbedAssign(assign, callExpr, funcName)
+				}
+			}
+		}
+	}
+
 	if len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
 		return nil, fmt.Errorf("rtg: only single-value assignments are supported")
 	}
@@ -822,6 +1071,14 @@ func (c *Compiler) lowerIdent(id *ast.Ident) (ir.Fragment, Type, error) {
 		if typ.Kind == TypeLabel {
 			return ir.Label(id.Name), typ, nil
 		}
+		if typ.Kind == TypeBuffer {
+			// Buffer name used directly - return pointer to base
+			buf := c.findBuffer(id.Name)
+			if buf == nil {
+				return nil, Type{}, fmt.Errorf("rtg: internal error: buffer %q not found", id.Name)
+			}
+			return bufferPtrPlaceholder{slotID: buf.slotID, disp: 0}, Type{Kind: TypeUintptr}, nil
+		}
 		return ir.Var(id.Name), typ, nil
 	}
 	switch id.Name {
@@ -880,6 +1137,26 @@ func (c *Compiler) lowerSelector(sel *ast.SelectorExpr) (ir.Fragment, Type, erro
 
 func (c *Compiler) lowerUnary(expr *ast.UnaryExpr) (ir.Fragment, Type, error) {
 	switch expr.Op {
+	case token.AND:
+		// Handle &buf[offset] for buffer pointers
+		if indexExpr, ok := expr.X.(*ast.IndexExpr); ok {
+			base, ok := indexExpr.X.(*ast.Ident)
+			if ok {
+				typ, ok := c.scope.lookup(base.Name)
+				if ok && typ.Kind == TypeBuffer {
+					buf := c.findBuffer(base.Name)
+					if buf == nil {
+						return nil, Type{}, fmt.Errorf("rtg: internal error: buffer %q not found", base.Name)
+					}
+					offset, err := c.evalInt(indexExpr.Index)
+					if err != nil {
+						return nil, Type{}, fmt.Errorf("rtg: buffer index must be a constant: %w", err)
+					}
+					return bufferPtrPlaceholder{slotID: buf.slotID, disp: offset}, Type{Kind: TypeUintptr}, nil
+				}
+			}
+		}
+		return nil, Type{}, fmt.Errorf("rtg: unsupported address-of expression")
 	case token.SUB:
 		if val, err := c.evalInt(expr.X); err == nil {
 			return ir.Int64(-val), Type{Kind: TypeI64}, nil
@@ -905,14 +1182,25 @@ func (c *Compiler) lowerIndex(expr *ast.IndexExpr) (ir.Fragment, Type, error) {
 	if !ok {
 		return nil, Type{}, fmt.Errorf("rtg: unknown identifier %q", base.Name)
 	}
-	if typ.Kind != TypeUintptr && typ.Kind != TypeI64 {
-		return nil, Type{}, fmt.Errorf("rtg: %s is not a pointer", base.Name)
-	}
 
 	// Get index/offset
 	offset, err := c.evalInt(expr.Index)
 	if err != nil {
 		return nil, Type{}, fmt.Errorf("rtg: index must be a constant integer: %w", err)
+	}
+
+	// Handle buffer indexing: buf[offset] returns a memory reference
+	if typ.Kind == TypeBuffer {
+		buf := c.findBuffer(base.Name)
+		if buf == nil {
+			return nil, Type{}, fmt.Errorf("rtg: internal error: buffer %q not found", base.Name)
+		}
+		return bufferMemPlaceholder{slotID: buf.slotID, disp: offset, width: 64}, Type{Kind: TypeI64}, nil
+	}
+
+	// Handle pointer indexing
+	if typ.Kind != TypeUintptr && typ.Kind != TypeI64 {
+		return nil, Type{}, fmt.Errorf("rtg: %s is not a pointer or buffer", base.Name)
 	}
 
 	mem := ir.Var(base.Name).Mem()
@@ -1049,6 +1337,8 @@ func (c *Compiler) lowerExprCall(call *ast.CallExpr) (ir.Fragment, Type, error) 
 		return c.lowerIndirectCall(call)
 	case "ifdef", "Ifdef":
 		return c.lowerIfdef(call)
+	case "config", "Config":
+		return c.lowerConfig(call)
 	default:
 		// Check if it's a call to a user-defined function
 		// User-defined functions are called via ir.CallMethod and return int64
@@ -1170,7 +1460,187 @@ func (c *Compiler) lowerIfdef(call *ast.CallExpr) (ir.Fragment, Type, error) {
 	return ir.Int64(0), Type{Kind: TypeBool}, nil
 }
 
+// lowerConfig handles runtime.Config("key") calls.
+// It looks up the key in compile-time Config options and returns the value.
+// Supported types: string -> TypeString, int64 -> TypeI64
+func (c *Compiler) lowerConfig(call *ast.CallExpr) (ir.Fragment, Type, error) {
+	if len(call.Args) != 1 {
+		return nil, Type{}, fmt.Errorf("rtg: Config expects exactly one string argument")
+	}
+
+	// Extract the key - must be a string literal
+	lit, ok := call.Args[0].(*ast.BasicLit)
+	if !ok || lit.Kind != token.STRING {
+		return nil, Type{}, fmt.Errorf("rtg: Config argument must be a string literal")
+	}
+
+	// Unquote the string
+	keyName, err := strconv.Unquote(lit.Value)
+	if err != nil {
+		return nil, Type{}, fmt.Errorf("rtg: Config: invalid string literal: %w", err)
+	}
+
+	// Look up the value in compile options
+	if c.opts.Config == nil {
+		return nil, Type{}, fmt.Errorf("rtg: Config(%q): no config values provided", keyName)
+	}
+
+	value, ok := c.opts.Config[keyName]
+	if !ok {
+		return nil, Type{}, fmt.Errorf("rtg: Config(%q): key not found", keyName)
+	}
+
+	// Return appropriate type based on value
+	switch v := value.(type) {
+	case string:
+		return stringConstant(v), Type{Kind: TypeString}, nil
+	case int64:
+		return ir.Int64(v), Type{Kind: TypeI64}, nil
+	case int:
+		return ir.Int64(int64(v)), Type{Kind: TypeI64}, nil
+	default:
+		return nil, Type{}, fmt.Errorf("rtg: Config(%q): unsupported value type %T", keyName, value)
+	}
+}
+
+// stringConstant wraps a string value for use in RTG.
+// This is a placeholder that gets resolved during code generation.
+type stringConstant string
+
+func (s stringConstant) Fragment() {}
+func (s stringConstant) String() string {
+	return string(s)
+}
+
+// lowerEmbedAssign handles multi-value assignment from embed functions:
+// ptr, len := runtime.EmbedString("...")
+// ptr, len := runtime.EmbedCString("...")
+// ptr, len := runtime.EmbedBytes(0x01, 0x02, ...)
+func (c *Compiler) lowerEmbedAssign(assign *ast.AssignStmt, call *ast.CallExpr, funcName string) ([]ir.Fragment, error) {
+	// Get the two target identifiers
+	ptrIdent, ok := assign.Lhs[0].(*ast.Ident)
+	if !ok {
+		return nil, fmt.Errorf("rtg: embed assignment left-hand side must be identifiers")
+	}
+	lenIdent, ok := assign.Lhs[1].(*ast.Ident)
+	if !ok {
+		return nil, fmt.Errorf("rtg: embed assignment left-hand side must be identifiers")
+	}
+
+	// Extract the data to embed
+	var data []byte
+	zeroTerminate := false
+
+	switch funcName {
+	case "EmbedString", "EmbedCString":
+		if len(call.Args) != 1 {
+			return nil, fmt.Errorf("rtg: %s expects exactly one string argument", funcName)
+		}
+		lit, ok := call.Args[0].(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return nil, fmt.Errorf("rtg: %s argument must be a string literal", funcName)
+		}
+		str, err := strconv.Unquote(lit.Value)
+		if err != nil {
+			return nil, fmt.Errorf("rtg: %s: invalid string literal: %w", funcName, err)
+		}
+		data = []byte(str)
+		zeroTerminate = (funcName == "EmbedCString")
+
+	case "EmbedBytes":
+		if len(call.Args) == 0 {
+			return nil, fmt.Errorf("rtg: EmbedBytes requires at least one byte argument")
+		}
+		for i, arg := range call.Args {
+			val, err := c.evalInt(arg)
+			if err != nil {
+				return nil, fmt.Errorf("rtg: EmbedBytes argument %d: %w", i, err)
+			}
+			if val < 0 || val > 255 {
+				return nil, fmt.Errorf("rtg: EmbedBytes argument %d out of byte range: %d", i, val)
+			}
+			data = append(data, byte(val))
+		}
+
+	case "EmbedConfigString", "EmbedConfigCString":
+		if len(call.Args) != 1 {
+			return nil, fmt.Errorf("rtg: %s expects exactly one string argument", funcName)
+		}
+		lit, ok := call.Args[0].(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return nil, fmt.Errorf("rtg: %s argument must be a string literal", funcName)
+		}
+		key, err := strconv.Unquote(lit.Value)
+		if err != nil {
+			return nil, fmt.Errorf("rtg: %s: invalid string literal: %w", funcName, err)
+		}
+		// Look up the config value
+		if c.opts.Config == nil {
+			return nil, fmt.Errorf("rtg: %s(%q): no config values provided", funcName, key)
+		}
+		value, ok := c.opts.Config[key]
+		if !ok {
+			return nil, fmt.Errorf("rtg: %s(%q): key not found", funcName, key)
+		}
+		str, ok := value.(string)
+		if !ok {
+			return nil, fmt.Errorf("rtg: %s(%q): value must be a string, got %T", funcName, key, value)
+		}
+		data = []byte(str)
+		zeroTerminate = (funcName == "EmbedConfigCString")
+
+	default:
+		return nil, fmt.Errorf("rtg: unknown embed function %q", funcName)
+	}
+
+	// Generate unique target variable for the asm code
+	c.embedVarCtr++
+	target := asm.Variable(2000 + c.embedVarCtr) // Start from 2000 to avoid conflicts
+
+	// Create ir variable names
+	ptrVar := ir.Var(ptrIdent.Name)
+	lenVar := ir.Var(lenIdent.Name)
+
+	// Define the variables in scope
+	switch assign.Tok {
+	case token.DEFINE:
+		if err := c.scope.define(ptrIdent.Name, Type{Kind: TypeUintptr}); err != nil {
+			return nil, err
+		}
+		if err := c.scope.define(lenIdent.Name, Type{Kind: TypeI64}); err != nil {
+			return nil, err
+		}
+	case token.ASSIGN:
+		// Variables should already exist
+		if _, ok := c.scope.lookup(ptrIdent.Name); !ok {
+			return nil, fmt.Errorf("rtg: assignment to undefined identifier %q", ptrIdent.Name)
+		}
+		if _, ok := c.scope.lookup(lenIdent.Name); !ok {
+			return nil, fmt.Errorf("rtg: assignment to undefined identifier %q", lenIdent.Name)
+		}
+	default:
+		return nil, fmt.Errorf("rtg: unsupported assignment operator %s", assign.Tok)
+	}
+
+	// Return the LoadConstantBytesConfig fragment
+	return []ir.Fragment{
+		ir.LoadConstantBytesConfig(ir.ConstantBytesConfig{
+			Target:        target,
+			Data:          data,
+			ZeroTerminate: zeroTerminate,
+			Pointer:       ptrVar,
+			Length:        lenVar,
+		}),
+	}, nil
+}
+
 func (c *Compiler) lowerMemRef(ptr ast.Expr, offset ast.Expr, width int) (ir.Fragment, error) {
+	// First, check if ptr is a buffer-related expression
+	if bufMem, ok := c.tryLowerBufferMemRef(ptr, offset, width); ok {
+		return bufMem, nil
+	}
+
+	// Fall back to variable-based memory reference
 	base, disp, err := c.extractPointer(ptr, offset)
 	if err != nil {
 		return nil, err
@@ -1193,6 +1663,51 @@ func (c *Compiler) lowerMemRef(ptr ast.Expr, offset ast.Expr, width int) (ir.Fra
 	default:
 		return nil, fmt.Errorf("rtg: unsupported memory width %d", width)
 	}
+}
+
+// tryLowerBufferMemRef tries to lower ptr+offset to a buffer memory reference.
+// Returns (fragment, true) if successful, or (nil, false) if ptr is not a buffer expression.
+func (c *Compiler) tryLowerBufferMemRef(ptr ast.Expr, offset ast.Expr, width int) (ir.Fragment, bool) {
+	// Get the offset value
+	offVal, err := c.evalInt(offset)
+	if err != nil {
+		return nil, false
+	}
+
+	// Case 1: &buf[index] - unary address-of on buffer index
+	if unary, ok := ptr.(*ast.UnaryExpr); ok && unary.Op == token.AND {
+		if indexExpr, ok := unary.X.(*ast.IndexExpr); ok {
+			if base, ok := indexExpr.X.(*ast.Ident); ok {
+				typ, ok := c.scope.lookup(base.Name)
+				if ok && typ.Kind == TypeBuffer {
+					buf := c.findBuffer(base.Name)
+					if buf == nil {
+						return nil, false
+					}
+					indexVal, err := c.evalInt(indexExpr.Index)
+					if err != nil {
+						return nil, false
+					}
+					totalDisp := indexVal + offVal
+					return bufferMemPlaceholder{slotID: buf.slotID, disp: totalDisp, width: width}, true
+				}
+			}
+		}
+	}
+
+	// Case 2: buf - buffer variable used directly as pointer
+	if ident, ok := ptr.(*ast.Ident); ok {
+		typ, ok := c.scope.lookup(ident.Name)
+		if ok && typ.Kind == TypeBuffer {
+			buf := c.findBuffer(ident.Name)
+			if buf == nil {
+				return nil, false
+			}
+			return bufferMemPlaceholder{slotID: buf.slotID, disp: offVal, width: width}, true
+		}
+	}
+
+	return nil, false
 }
 
 func (c *Compiler) extractPointer(ptr ast.Expr, offset ast.Expr) (string, ir.Fragment, error) {
