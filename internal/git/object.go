@@ -105,9 +105,15 @@ func DecodeObject(data []byte) (*Object, error) {
 	}
 	defer r.Close()
 
-	decompressed, err := io.ReadAll(r)
+	// Limit decompressed size to prevent decompression bombs (e.g., 100MB)
+	const maxDecompressedSize = 100 * 1024 * 1024
+	lr := io.LimitReader(r, maxDecompressedSize+1)
+	decompressed, err := io.ReadAll(lr)
 	if err != nil {
 		return nil, fmt.Errorf("read decompressed data: %w", err)
+	}
+	if len(decompressed) > maxDecompressedSize {
+		return nil, fmt.Errorf("decompressed object too large")
 	}
 
 	// Find the null byte separating header from content
