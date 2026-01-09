@@ -119,10 +119,11 @@ type virtualMachine struct {
 	lastMemorySlot uint32
 
 	// amd64-specific fields
-	hasIRQChip bool
-	hasPIT     bool
-	ioapic     *x86chipset.IOAPIC
-	chipset    *corechipset.Chipset
+	hasIRQChip   bool
+	splitIRQChip bool // true if using split IRQ chip mode (LAPIC in kernel, PIC/IOAPIC in userspace)
+	hasPIT       bool
+	ioapic       *x86chipset.IOAPIC
+	chipset      *corechipset.Chipset
 
 	// arm64-specific fields
 	arm64GICInfo hv.Arm64GICInfo
