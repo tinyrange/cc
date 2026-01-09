@@ -141,6 +141,9 @@ func (r *Repository) WriteTree(tree *Tree) (Hash, error) {
 
 // WriteCommit writes a commit to the repository.
 func (r *Repository) WriteCommit(commit *Commit) (Hash, error) {
+	if commit.TreeHash.IsZero() {
+		return ZeroHash, fmt.Errorf("commit missing required tree hash")
+	}
 	return r.WriteObject(commit.ToObject())
 }
 
@@ -200,8 +203,8 @@ func (r *Repository) ResolveRef(ref string) (Hash, error) {
 	}
 
 	// Maybe it's already a hash
-	if len(ref) == 40 {
-		return ParseHash(ref)
+	if hash, err := ParseHash(ref); err == nil {
+		return hash, nil
 	}
 
 	return ZeroHash, ErrInvalidRef
@@ -274,8 +277,11 @@ func (r *Repository) ReadFileAtTree(treeHash Hash, path string) ([]byte, error) 
 	currentHash := treeHash
 	depth := 0
 	for i, part := range parts {
-		if part == "" {
+		if part == "" || part == "." {
 			continue
+		}
+		if part == ".." {
+			return nil, fmt.Errorf("invalid path: contains '..'")
 		}
 
 		depth++

@@ -9,6 +9,13 @@ import (
 	"time"
 )
 
+func must(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 // testRepo creates a temporary git repository for testing.
 // It returns the repository and a cleanup function.
 func testRepo(t *testing.T) (*Repository, func()) {
@@ -151,7 +158,7 @@ func TestWriteAndReadTree(t *testing.T) {
 
 	// Create a tree with the blob
 	builder := NewTreeBuilder()
-	builder.AddBlob("file.txt", blobHash, false)
+	must(t, builder.AddBlob("file.txt", blobHash, false))
 	tree := builder.Build()
 
 	treeHash, err := repo.WriteTree(tree)
@@ -189,7 +196,7 @@ func TestWriteAndReadCommit(t *testing.T) {
 	// Create a tree
 	blobHash, _ := repo.WriteBlob([]byte("test content\n"))
 	builder := NewTreeBuilder()
-	builder.AddBlob("test.txt", blobHash, false)
+	must(t, builder.AddBlob("test.txt", blobHash, false))
 	treeHash, _ := repo.WriteTree(builder.Build())
 
 	// Create a commit
@@ -246,7 +253,7 @@ func TestCommitWithParent(t *testing.T) {
 	// Create first commit
 	blob1Hash, _ := repo.WriteBlob([]byte("first\n"))
 	builder1 := NewTreeBuilder()
-	builder1.AddBlob("file.txt", blob1Hash, false)
+	must(t, builder1.AddBlob("file.txt", blob1Hash, false))
 	tree1Hash, _ := repo.WriteTree(builder1.Build())
 
 	when := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
@@ -263,7 +270,7 @@ func TestCommitWithParent(t *testing.T) {
 	// Create second commit with parent
 	blob2Hash, _ := repo.WriteBlob([]byte("second\n"))
 	builder2 := NewTreeBuilder()
-	builder2.AddBlob("file.txt", blob2Hash, false)
+	must(t, builder2.AddBlob("file.txt", blob2Hash, false))
 	tree2Hash, _ := repo.WriteTree(builder2.Build())
 
 	commit2 := &Commit{
@@ -361,7 +368,7 @@ func TestResolveRef(t *testing.T) {
 	// Create a commit and update HEAD
 	blobHash, _ := repo.WriteBlob([]byte("test\n"))
 	builder := NewTreeBuilder()
-	builder.AddBlob("test.txt", blobHash, false)
+	must(t, builder.AddBlob("test.txt", blobHash, false))
 	treeHash, _ := repo.WriteTree(builder.Build())
 
 	when := time.Date(2024, 1, 15, 12, 0, 0, 0, time.UTC)
@@ -513,9 +520,9 @@ func TestTreeEntryModes(t *testing.T) {
 
 	// Build tree with different modes
 	builder := NewTreeBuilder()
-	builder.AddBlob("normal.txt", normalBlob, false)
-	builder.AddBlob("script.sh", execBlob, true)
-	builder.AddSymlink("link.txt", linkBlob)
+	must(t, builder.AddBlob("normal.txt", normalBlob, false))
+	must(t, builder.AddBlob("script.sh", execBlob, true))
+	must(t, builder.AddSymlink("link.txt", linkBlob))
 
 	tree := builder.Build()
 	treeHash, _ := repo.WriteTree(tree)
@@ -558,21 +565,21 @@ func TestNestedTree(t *testing.T) {
 
 	// Build inner tree
 	innerBuilder := NewTreeBuilder()
-	innerBuilder.AddBlob("inner.txt", file3, false)
+	must(t, innerBuilder.AddBlob("inner.txt", file3, false))
 	innerTree := innerBuilder.Build()
 	innerHash, _ := repo.WriteTree(innerTree)
 
 	// Build outer tree
 	outerBuilder := NewTreeBuilder()
-	outerBuilder.AddBlob("root.txt", file1, false)
-	outerBuilder.AddTree("dir", innerHash)
+	must(t, outerBuilder.AddBlob("root.txt", file1, false))
+	must(t, outerBuilder.AddTree("dir", innerHash))
 	outerTree := outerBuilder.Build()
 	outerHash, _ := repo.WriteTree(outerTree)
 
 	// Now build top level
 	topBuilder := NewTreeBuilder()
-	topBuilder.AddBlob("top.txt", file2, false)
-	topBuilder.AddTree("sub", outerHash)
+	must(t, topBuilder.AddBlob("top.txt", file2, false))
+	must(t, topBuilder.AddTree("sub", outerHash))
 	topTree := topBuilder.Build()
 	topHash, _ := repo.WriteTree(topTree)
 
@@ -674,10 +681,10 @@ func TestEmptyTreeSorting(t *testing.T) {
 	hash3, _ := ParseHash("0000000000000000000000000000000000000003")
 	hash4, _ := ParseHash("0000000000000000000000000000000000000004")
 
-	builder.AddBlob("zebra.txt", hash1, false)
-	builder.AddTree("adir", hash2)
-	builder.AddBlob("apple.txt", hash3, false)
-	builder.AddTree("zdir", hash4)
+	must(t, builder.AddBlob("zebra.txt", hash1, false))
+	must(t, builder.AddTree("adir", hash2))
+	must(t, builder.AddBlob("apple.txt", hash3, false))
+	must(t, builder.AddTree("zdir", hash4))
 
 	tree := builder.Build()
 
@@ -701,7 +708,7 @@ func TestMergeCommit(t *testing.T) {
 	// Create two parent commits
 	blob1, _ := repo.WriteBlob([]byte("branch1\n"))
 	builder1 := NewTreeBuilder()
-	builder1.AddBlob("file.txt", blob1, false)
+	must(t, builder1.AddBlob("file.txt", blob1, false))
 	tree1, _ := repo.WriteTree(builder1.Build())
 	parent1, _ := repo.WriteCommit(&Commit{
 		TreeHash:  tree1,
@@ -712,7 +719,7 @@ func TestMergeCommit(t *testing.T) {
 
 	blob2, _ := repo.WriteBlob([]byte("branch2\n"))
 	builder2 := NewTreeBuilder()
-	builder2.AddBlob("file.txt", blob2, false)
+	must(t, builder2.AddBlob("file.txt", blob2, false))
 	tree2, _ := repo.WriteTree(builder2.Build())
 	parent2, _ := repo.WriteCommit(&Commit{
 		TreeHash:  tree2,
@@ -724,7 +731,7 @@ func TestMergeCommit(t *testing.T) {
 	// Create merge commit
 	mergeBlob, _ := repo.WriteBlob([]byte("merged\n"))
 	mergeBuilder := NewTreeBuilder()
-	mergeBuilder.AddBlob("file.txt", mergeBlob, false)
+	must(t, mergeBuilder.AddBlob("file.txt", mergeBlob, false))
 	mergeTree, _ := repo.WriteTree(mergeBuilder.Build())
 
 	mergeCommit := &Commit{

@@ -173,6 +173,14 @@ type TreeEntry struct {
 	Hash Hash
 }
 
+func isValidMode(mode uint32) bool {
+	switch mode {
+	case 0o100644, 0o100755, 0o40000, 0o120000, 0o160000:
+		return true
+	}
+	return false
+}
+
 // IsDir returns true if the entry is a directory (tree).
 func (e *TreeEntry) IsDir() bool {
 	return e.Mode == 0o40000
@@ -219,6 +227,9 @@ func ParseTree(obj *Object) (*Tree, error) {
 		mode, err := strconv.ParseUint(modeStr, 8, 32)
 		if err != nil {
 			return nil, fmt.Errorf("invalid mode %q: %w", modeStr, err)
+		}
+		if !isValidMode(uint32(mode)) {
+			return nil, fmt.Errorf("unknown git mode: %o", mode)
 		}
 		data = data[spaceIdx+1:]
 
@@ -366,9 +377,6 @@ func ParseCommit(obj *Object) (*Commit, error) {
 	}
 	headers := parts[0]
 
-	headers := parts[0]
-	commit.Message = parts[1]
-
 	for _, line := range strings.Split(headers, "\n") {
 		if line == "" {
 			continue
@@ -418,15 +426,27 @@ func ParseCommit(obj *Object) (*Commit, error) {
 // TreeBuilder helps construct tree objects.
 type TreeBuilder struct {
 	entries []TreeEntry
+	names   map[string]struct{}
 }
 
 // NewTreeBuilder creates a new TreeBuilder.
 func NewTreeBuilder() *TreeBuilder {
-	return &TreeBuilder{}
+	return &TreeBuilder{names: make(map[string]struct{})}
+}
+
+func (tb *TreeBuilder) checkDuplicate(name string) error {
+	if _, exists := tb.names[name]; exists {
+		return fmt.Errorf("duplicate entry: %q", name)
+	}
+	tb.names[name] = struct{}{}
+	return nil
 }
 
 // AddBlob adds a blob entry to the tree.
-func (tb *TreeBuilder) AddBlob(name string, hash Hash, executable bool) {
+func (tb *TreeBuilder) AddBlob(name string, hash Hash, executable bool) error {
+	if err := tb.checkDuplicate(name); err != nil {
+		return err
+	}
 	mode := uint32(0o100644)
 	if executable {
 		mode = 0o100755
@@ -436,24 +456,33 @@ func (tb *TreeBuilder) AddBlob(name string, hash Hash, executable bool) {
 		Name: name,
 		Hash: hash,
 	})
+	return nil
 }
 
 // AddTree adds a subtree entry.
-func (tb *TreeBuilder) AddTree(name string, hash Hash) {
+func (tb *TreeBuilder) AddTree(name string, hash Hash) error {
+	if err := tb.checkDuplicate(name); err != nil {
+		return err
+	}
 	tb.entries = append(tb.entries, TreeEntry{
 		Mode: 0o40000,
 		Name: name,
 		Hash: hash,
 	})
+	return nil
 }
 
 // AddSymlink adds a symbolic link entry.
-func (tb *TreeBuilder) AddSymlink(name string, hash Hash) {
+func (tb *TreeBuilder) AddSymlink(name string, hash Hash) error {
+	if err := tb.checkDuplicate(name); err != nil {
+		return err
+	}
 	tb.entries = append(tb.entries, TreeEntry{
 		Mode: 0o120000,
 		Name: name,
 		Hash: hash,
 	})
+	return nil
 }
 
 // Build creates the Tree, sorting entries as git does.

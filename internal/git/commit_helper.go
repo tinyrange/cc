@@ -47,6 +47,7 @@ func (r *Repository) CommitOnBranch(treeHash Hash, branch string, opts CommitOpt
 
 // TreeFromMap creates a tree from a map of path to file content.
 // This is a convenience function for creating simple trees.
+// Paths must use forward slashes (/) as separators.
 // All files are created with mode 0o100644 (non-executable).
 func (r *Repository) TreeFromMap(files map[string][]byte) (Hash, error) {
 	// Build a nested structure
@@ -67,7 +68,10 @@ func (r *Repository) TreeFromMap(files map[string][]byte) (Hash, error) {
 			return ZeroHash, fmt.Errorf("write blob for %s: %w", path, err)
 		}
 
-		parts := splitPath(path)
+		parts, err := splitPath(path)
+		if err != nil {
+			return ZeroHash, fmt.Errorf("invalid path %q: %w", path, err)
+		}
 		current := root
 		for i := 0; i < len(parts)-1; i++ {
 			dir := parts[i]
@@ -88,7 +92,9 @@ func (r *Repository) TreeFromMap(files map[string][]byte) (Hash, error) {
 		builder := NewTreeBuilder()
 
 		for name, hash := range entry.files {
-			builder.AddBlob(name, hash, false)
+			if err := builder.AddBlob(name, hash, false); err != nil {
+				return ZeroHash, err
+			}
 		}
 
 		for name, subdir := range entry.subdirs {
@@ -96,7 +102,9 @@ func (r *Repository) TreeFromMap(files map[string][]byte) (Hash, error) {
 			if err != nil {
 				return ZeroHash, err
 			}
-			builder.AddTree(name, subdirHash)
+			if err := builder.AddTree(name, subdirHash); err != nil {
+				return ZeroHash, err
+			}
 		}
 
 		tree := builder.Build()
@@ -106,23 +114,24 @@ func (r *Repository) TreeFromMap(files map[string][]byte) (Hash, error) {
 	return buildTree(root)
 }
 
-func splitPath(path string) []string {
+func splitPath(path string) ([]string, error) {
+	if strings.ContainsRune(path, 0) {
+		return nil, fmt.Errorf("path contains null byte")
+	}
 	var parts []string
-	var current strings.Builder
-	for _, c := range path {
-		if c == '/' || c == '\\' {
-			if current.Len() > 0 {
-				parts = append(parts, current.String())
-				current.Reset()
-			}
-		} else {
-			current.WriteRune(c)
+	for _, part := range strings.Split(path, "/") {
+		if part == "" {
+			continue
 		}
+		if part == ".." || part == "." {
+			return nil, fmt.Errorf("invalid path component: %q", part)
+		}
+		parts = append(parts, part)
 	}
-	if current.Len() > 0 {
-		parts = append(parts, current.String())
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("empty path")
 	}
-	return parts
+	return parts, nil
 }
 
 // DefaultSignature creates a signature with a default name and email.
