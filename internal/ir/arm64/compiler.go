@@ -65,6 +65,7 @@ type compiler struct {
 	labels       map[string]asm.Label
 	labelCounter int
 	slotStack    []ir.StackSlotContext
+	epilogueLabel asm.Label // label for epilogue code (used by return statements)
 }
 
 func Compile(method ir.Method) (asm.Fragment, error) {
@@ -72,14 +73,35 @@ func Compile(method ir.Method) (asm.Fragment, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Check if this method makes calls to other methods.
+	// If so, we need to save/restore X30 (link register) since BLR overwrites it.
+	makesCalls := methodMakesCalls(method)
+
+	// Create epilogue label for return statements to jump to
+	c.epilogueLabel = asm.Label(".ir_epilogue")
+
+	// Prologue: save X29/X30 if method makes calls, then allocate frame
+	if makesCalls {
+		// STP X29, X30, [SP, #-16]! - save frame pointer and link register
+		c.emit(arm64asm.StpPreIndex(arm64asm.X29, arm64asm.X30, arm64asm.SP, -16))
+	}
 	if c.frameSize > 0 {
 		c.emit(arm64asm.AddRegImm(arm64asm.Reg64(arm64asm.SP), -c.frameSize))
 	}
+
 	if err := c.compileBlock(ir.Block(method)); err != nil {
 		return nil, err
 	}
+
+	// Epilogue: label for return statements, deallocate frame, restore X29/X30, ret
+	c.emit(asm.MarkLabel(c.epilogueLabel))
 	if c.frameSize > 0 {
 		c.emit(arm64asm.AddRegImm(arm64asm.Reg64(arm64asm.SP), c.frameSize))
+	}
+	if makesCalls {
+		// LDP X29, X30, [SP], #16 - restore frame pointer and link register
+		c.emit(arm64asm.LdpPostIndex(arm64asm.X29, arm64asm.X30, arm64asm.SP, 16))
 	}
 	c.emit(arm64asm.Ret())
 	return c.fragments, nil
@@ -348,10 +370,9 @@ func (c *compiler) compileReturn(ret ir.ReturnFragment) error {
 		c.emit(arm64asm.MovReg(arm64asm.Reg64(arm64asm.X0), arm64asm.Reg64(reg)))
 		c.freeReg(reg)
 	}
-	if c.frameSize > 0 {
-		c.emit(arm64asm.AddRegImm(arm64asm.Reg64(arm64asm.SP), c.frameSize))
-	}
-	c.emit(arm64asm.Ret())
+	// Jump to epilogue label which handles SP restoration, X30 restoration, and ret.
+	// This ensures proper stack cleanup and link register handling for all return paths.
+	c.emit(arm64asm.Jump(c.epilogueLabel))
 	c.freeReg(arm64asm.X0)
 	return nil
 }
@@ -409,9 +430,16 @@ func (c *compiler) storeValue(dst ir.Fragment, reg asm.Variable, width ir.ValueW
 			return err
 		}
 		mem := arm64asm.Mem(arm64asm.Reg64(arm64asm.SP)).WithDisp(offset)
-		switch width {
+		// Use the destination's width if specified, otherwise fall back to source width
+		dstWidth := dest.Width
+		if dstWidth == 0 {
+			dstWidth = width
+		}
+		switch dstWidth {
 		case ir.Width8:
 			c.emit(arm64asm.MovToMemory(mem, arm64asm.Reg8(reg)))
+		case ir.Width16:
+			c.emit(arm64asm.MovToMemory(mem, arm64asm.Reg16(reg)))
 		case ir.Width32:
 			c.emit(arm64asm.MovToMemory(mem, arm64asm.Reg32(reg)))
 		default:
@@ -572,6 +600,28 @@ func (c *compiler) compileSyscall(sc ir.SyscallFragment, needResult bool) (asm.V
 			c.emit(arm64asm.LoadAddress(arm64asm.Reg64(reg), a.Target))
 			args[idx] = asm.Variable(reg)
 			regs = append(regs, reg)
+		case ir.StackSlotPtrFragment:
+			offset, err := c.stackSlotOffset(a.SlotID, a.Disp)
+			if err != nil {
+				for _, r := range regs {
+					c.freeReg(r)
+				}
+				return 0, err
+			}
+			preferred := syscallPreferredRegisters(idx, argRegs)
+			reg, err := c.allocRegPrefer(preferred...)
+			if err != nil {
+				for _, r := range regs {
+					c.freeReg(r)
+				}
+				return 0, err
+			}
+			c.emit(arm64asm.MovRegFromSP(arm64asm.Reg64(reg)))
+			if offset != 0 {
+				c.emit(arm64asm.AddRegImm(arm64asm.Reg64(reg), offset))
+			}
+			args[idx] = asm.Variable(reg)
+			regs = append(regs, reg)
 		case string:
 			val := asm.String(a)
 			args[idx] = val
@@ -727,8 +777,21 @@ func (c *compiler) evalValue(expr ir.Fragment) (asm.Variable, ir.ValueWidth, err
 			return 0, 0, err
 		}
 		mem := arm64asm.Mem(arm64asm.Reg64(arm64asm.SP)).WithDisp(offset)
-		c.emit(arm64asm.MovFromMemory(arm64asm.Reg64(reg), mem))
-		return reg, ir.Width64, nil
+		width := v.Width
+		if width == 0 {
+			width = ir.Width64
+		}
+		switch width {
+		case ir.Width8:
+			c.emit(arm64asm.MovZX8(arm64asm.Reg64(reg), mem))
+		case ir.Width16:
+			c.emit(arm64asm.MovZX16(arm64asm.Reg64(reg), mem))
+		case ir.Width32:
+			c.emit(arm64asm.MovFromMemory(arm64asm.Reg32(reg), mem))
+		default:
+			c.emit(arm64asm.MovFromMemory(arm64asm.Reg64(reg), mem))
+		}
+		return reg, width, nil
 	case ir.StackSlotPtrFragment:
 		offset, err := c.stackSlotOffset(v.SlotID, v.Disp)
 		if err != nil {
@@ -791,14 +854,18 @@ func (c *compiler) evalValue(expr ir.Fragment) (asm.Variable, ir.ValueWidth, err
 		if err != nil {
 			return 0, 0, err
 		}
-		c.emit(arm64asm.MovImmediate(arm64asm.Reg64(reg), int64(methodPointerPlaceholder(v.Name))))
+		// Use LoadImmediate64FromLiteral to store the placeholder in the literal pool
+		// as raw bytes, allowing BuildStandaloneProgram to scan and replace it.
+		c.emit(arm64asm.LoadImmediate64FromLiteral(arm64asm.Reg64(reg), methodPointerPlaceholder(v.Name)))
 		return reg, ir.Width64, nil
 	case ir.GlobalPointerFragment:
 		reg, err := c.allocRegPrefer(arm64asm.X0)
 		if err != nil {
 			return 0, 0, err
 		}
-		c.emit(arm64asm.MovImmediate(arm64asm.Reg64(reg), int64(globalPointerPlaceholder(v.Name))))
+		// Use LoadImmediate64FromLiteral to store the placeholder in the literal pool
+		// as raw bytes, allowing BuildStandaloneProgram to scan and replace it.
+		c.emit(arm64asm.LoadImmediate64FromLiteral(arm64asm.Reg64(reg), globalPointerPlaceholder(v.Name)))
 		return reg, ir.Width64, nil
 	default:
 		if imm, ok := toInt64(v); ok {
@@ -1079,6 +1146,44 @@ func (c *compiler) namedLabel(name string) asm.Label {
 func (c *compiler) newInternalLabel(prefix string) asm.Label {
 	c.labelCounter++
 	return asm.Label(fmt.Sprintf(".ir_%s_%d", prefix, c.labelCounter))
+}
+
+// methodMakesCalls returns true if the method contains any ir.CallFragment,
+// indicating that it makes calls to other methods. Used to determine if X30
+// (link register) needs to be saved/restored.
+func methodMakesCalls(f ir.Fragment) bool {
+	switch v := f.(type) {
+	case nil:
+		return false
+	case ir.Block:
+		for _, inner := range v {
+			if methodMakesCalls(inner) {
+				return true
+			}
+		}
+		return false
+	case ir.Method:
+		return methodMakesCalls(ir.Block(v))
+	case ir.IfFragment:
+		if methodMakesCalls(v.Then) {
+			return true
+		}
+		if v.Otherwise != nil && methodMakesCalls(v.Otherwise) {
+			return true
+		}
+		return false
+	case ir.LabelFragment:
+		return methodMakesCalls(v.Block)
+	case ir.StackSlotFragment:
+		if v.Body != nil {
+			return methodMakesCalls(v.Body)
+		}
+		return false
+	case ir.CallFragment:
+		return true
+	default:
+		return false
+	}
 }
 
 func collectVariables(f ir.Fragment, vars map[string]struct{}) {

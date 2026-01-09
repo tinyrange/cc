@@ -187,6 +187,24 @@ func (c *Context) addPointerLiteral(target constantLocation) int {
 	return offset
 }
 
+// addImmediateLiteral stores a raw 64-bit value in the literal pool and returns
+// its offset. Unlike addPointerLiteral, this stores the value directly without
+// registering a patch, making it suitable for placeholder values that will be
+// scanned and replaced later (e.g., method pointers).
+func (c *Context) addImmediateLiteral(value uint64) int {
+	const literalAlign = 8
+	aligned := alignTo(len(c.literalData), literalAlign)
+	if aligned > len(c.literalData) {
+		padding := aligned - len(c.literalData)
+		c.literalData = append(c.literalData, make([]byte, padding)...)
+	}
+	offset := aligned
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], value)
+	c.literalData = append(c.literalData, buf[:]...)
+	return offset
+}
+
 func (c *Context) addLiteralLoad(pos int, literalOffset int, width literalWidth) {
 	c.literalLoads = append(c.literalLoads, literalLoadPatch{
 		pos:           pos,

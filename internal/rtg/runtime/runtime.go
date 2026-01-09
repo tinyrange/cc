@@ -17,6 +17,10 @@ func Syscall(num int64, args ...any) int64 { return 0 }
 // Printf prints a formatted message to the console.
 func Printf(format string, args ...any) {}
 
+// LogKmsg writes a message to /dev/kmsg (kernel message buffer).
+// The message is visible via dmesg. This is non-fatal if /dev/kmsg is unavailable.
+func LogKmsg(msg string) {}
+
 // Load8 loads an 8-bit value from memory at ptr+offset.
 func Load8(ptr, offset int64) int64 { return 0 }
 
@@ -51,6 +55,45 @@ func GotoLabel(label int64) {}
 // Required after modifying code in memory before executing it.
 func ISB() {}
 
+// Ifdef returns true if the named compile-time flag is set.
+// This is evaluated at RTG compile time, not at runtime.
+// The flag name must be a string literal.
+// Undefined flags are treated as false.
+func Ifdef(flag string) bool { return false }
+
+// Config retrieves a compile-time configuration value by key.
+// This is evaluated at RTG compile time, not at runtime.
+// The key must be a string literal.
+// Supported value types: string, int64
+// Returns error at compile time if key is not found.
+func Config(key string) any { return nil }
+
+// EmbedString embeds a string constant in the binary and returns a pointer and length.
+// The string does NOT have a null terminator.
+// Usage: ptr, len := runtime.EmbedString("hello")
+func EmbedString(s string) (int64, int64) { return 0, 0 }
+
+// EmbedCString embeds a C-style string constant (with null terminator) and returns a pointer and length.
+// The length returned is the original string length WITHOUT the null terminator.
+// Usage: ptr, len := runtime.EmbedCString("hello")
+func EmbedCString(s string) (int64, int64) { return 0, 0 }
+
+// EmbedBytes embeds raw bytes in the binary and returns a pointer and length.
+// Usage: ptr, len := runtime.EmbedBytes(0x01, 0x02, 0x03)
+func EmbedBytes(bytes ...byte) (int64, int64) { return 0, 0 }
+
+// EmbedConfigString embeds a config string value in the binary and returns a pointer and length.
+// The key is looked up in CompileOptions.Config at compile time.
+// The string does NOT have a null terminator.
+// Usage: ptr, len := runtime.EmbedConfigString("hostname")
+func EmbedConfigString(key string) (int64, int64) { return 0, 0 }
+
+// EmbedConfigCString embeds a config string value as a C-style string (with null terminator).
+// The key is looked up in CompileOptions.Config at compile time.
+// The length returned is the original string length WITHOUT the null terminator.
+// Usage: ptr, len := runtime.EmbedConfigCString("hostname")
+func EmbedConfigCString(key string) (int64, int64) { return 0, 0 }
+
 // Syscall numbers (architecture-independent definitions for type checking)
 const (
 	SYS_EXIT          int64 = 0
@@ -82,6 +125,10 @@ const (
 	SYS_WAIT4         int64 = 26
 	SYS_MPROTECT      int64 = 27
 	SYS_GETPID        int64 = 28
+	SYS_PIVOT_ROOT    int64 = 29
+	SYS_UMOUNT2       int64 = 30
+	SYS_UNLINKAT      int64 = 31
+	SYS_SYMLINKAT     int64 = 32
 )
 
 // File descriptor constants
@@ -151,4 +198,39 @@ const (
 	SOCK_DGRAM    int64 = 2
 	SOCK_RAW      int64 = 3
 	NETLINK_ROUTE int64 = 0
+)
+
+// Mount/unmount flags
+const (
+	MNT_DETACH int64 = 0x2
+)
+
+// Unlink flags
+const (
+	AT_REMOVEDIR int64 = 0x200
+)
+
+// Clone flags
+const (
+	SIGCHLD int64 = 17
+)
+
+// Network interface ioctl constants
+const (
+	IFF_UP           int64 = 0x1
+	SIOCSIFFLAGS     int64 = 0x8914
+	SIOCSIFADDR      int64 = 0x8916
+	SIOCSIFNETMASK   int64 = 0x891c
+	SIOCGIFINDEX     int64 = 0x8933
+	RTM_NEWROUTE     int64 = 24
+	NLM_F_REQUEST    int64 = 0x1
+	NLM_F_CREATE     int64 = 0x400
+	NLM_F_REPLACE    int64 = 0x100
+	NLM_F_ACK        int64 = 0x4
+	RT_TABLE_MAIN    int64 = 254
+	RTPROT_BOOT      int64 = 3
+	RT_SCOPE_UNIVERSE int64 = 0
+	RTN_UNICAST      int64 = 1
+	RTA_OIF          int64 = 4
+	RTA_GATEWAY      int64 = 5
 )

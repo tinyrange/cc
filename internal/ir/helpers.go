@@ -315,10 +315,26 @@ func WithStackSlot(cfg StackSlotConfig) Fragment {
 type StackSlotMemFragment struct {
 	SlotID uint64
 	Disp   Fragment
+	Width  ValueWidth // Width of memory access (0 means 64-bit/default)
 }
 
 func (m StackSlotMemFragment) WithDisp(disp any) Fragment {
-	return StackSlotMemFragment{SlotID: m.SlotID, Disp: asFragment(disp)}
+	return StackSlotMemFragment{SlotID: m.SlotID, Disp: asFragment(disp), Width: m.Width}
+}
+
+// As8 returns a copy with 8-bit width.
+func (m StackSlotMemFragment) As8() StackSlotMemFragment {
+	return StackSlotMemFragment{SlotID: m.SlotID, Disp: m.Disp, Width: Width8}
+}
+
+// As16 returns a copy with 16-bit width.
+func (m StackSlotMemFragment) As16() StackSlotMemFragment {
+	return StackSlotMemFragment{SlotID: m.SlotID, Disp: m.Disp, Width: Width16}
+}
+
+// As32 returns a copy with 32-bit width.
+func (m StackSlotMemFragment) As32() StackSlotMemFragment {
+	return StackSlotMemFragment{SlotID: m.SlotID, Disp: m.Disp, Width: Width32}
 }
 
 type StackSlotPtrFragment struct {
