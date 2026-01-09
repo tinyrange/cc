@@ -155,8 +155,7 @@ func ipToNetworkByteOrder(addr string) uint32 {
 	if ip4 == nil {
 		return 0
 	}
-	// Network byte order (big-endian) stored in little-endian memory
-	// For 10.42.0.2: 0x0a2a0002 big-endian -> 0x02002a0a when read as little-endian
+	// Convert to little-endian uint32 (byte-swap from network order)
 	return uint32(ip4[3])<<24 | uint32(ip4[2])<<16 | uint32(ip4[1])<<8 | uint32(ip4[0])
 }
 
