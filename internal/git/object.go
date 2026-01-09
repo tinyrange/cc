@@ -255,10 +255,16 @@ type Signature struct {
 	When  time.Time
 }
 
+// sanitizeSignatureField removes characters that would corrupt the git signature format.
+func sanitizeSignatureField(s string) string {
+	return strings.NewReplacer("\n", "", "\r", "", "<", "", ">", "").Replace(s)
+}
+
 // String returns the signature in git format.
 func (s *Signature) String() string {
 	return fmt.Sprintf("%s <%s> %d %s",
-		s.Name, s.Email,
+		sanitizeSignatureField(s.Name),
+		sanitizeSignatureField(s.Email),
 		s.When.Unix(),
 		s.When.Format("-0700"))
 }
@@ -400,6 +406,10 @@ func ParseCommit(obj *Object) (*Commit, error) {
 			}
 			commit.Committer = *sig
 		}
+	}
+
+	if commit.TreeHash.IsZero() {
+		return nil, fmt.Errorf("commit missing required tree hash")
 	}
 
 	return commit, nil
