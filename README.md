@@ -28,14 +28,17 @@ _Part 1_
 _Part 2_
 
 - [x] Add benchmarking (both Golang and Tests)
-- [ ] Add snapshot support for Linux boot and Benchmark and improve KVM AMD64
-- [ ] Benchmark and improve HVF arm64
-- [ ] Benchmark and improve KVM arm64
-- [ ] Benchmark and improve WHP amd64
-- [ ] Benchmark and improve WHP arm64
-- [ ] Benchmark and improve Networking
-- [ ] Benchmark and improve Filesystem
-- [ ] Benchmark and improve Console
+- [x] Add snapshot support
+- [ ] Improve KVM AMD64
+- [ ] Improve HVF arm64
+- [ ] Improve WHP amd64
+- [ ] Improve KVM arm64
+- [ ] Improve WHP arm64
+- [ ] Improve VirtIO
+- [ ] Improve Networking
+- [ ] Improve Filesystem
+
+_Final Part_
 
 - [ ] Get a more advanced desktop running (like XFCE)
 
@@ -45,13 +48,7 @@ _Part 2_
 
 Only Linux Guests and bare-metal code are currently supported.
 
-### Platforms
-
-- **Linux x86_64**: Works, **primary platform**.
-- **Windows x86_64**: Mostly works (GPU is broken)
-- **Linux arm64**: Mostly works (GPU is broken)
-- **Windows arm64**: Broken (interupt dispatch issues)
-- **macOS arm64**: Works
+Windows, macOS, and Linux are fully supported as host operating systems.
 
 ## Relationship to TinyRange
 
@@ -76,14 +73,6 @@ I'll leave the accomplishments of the project as a testament to the success of s
 A take away and future direction is with the evolution of AI models the quality of tooling becomes essential. The issues I experienced with debugging forced me to invest time into better debug tooling designed to capture dense logging. Also the adoption of Greptile has been surprisingly effective. Besides issues with outdated training data (it likes hating on new methods in Golang and ranking my PRs 1/5 when it sees them) it spots hard to find bugs on a regular basis and the reports are a very helpful read to improve overall code quality. It also encouraged me (indirectly) to protect the main branch so I was forced to make and polish pull requests.
 
 As someone who spends most of their time writing tooling I see a bright future adopting AI models in areas that speed up development but I worry the immaturity of current tooling holds back adoption. That is one of the use cases I see for CrumbleCracker in the future once it's more stable though.
-
-### Original Text
-
-**Note: This is for me. I am not accepting external code contributions at this stage**
-
-The private version of CrumbleCracker has been written mostly with AI models mostly GPT-5.1. This is a extraordinarily capbile model that produces working production ready code but architecture I feel it has been lacking. Over the short span of weeks with the current version of CrumbleCracker it has generated code that is generally difficult to read and maintain. The parts performing well have mostly been hand architecture with AI assistance.
-
-For this version of CrumbleCracker I expect to primarily architect/write the production code myself using AI written code as a foundation.
 
 ## Getting Start Notes
 
