@@ -2,6 +2,7 @@ package git
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -107,19 +108,19 @@ func (r *Repository) TreeFromMap(files map[string][]byte) (Hash, error) {
 
 func splitPath(path string) []string {
 	var parts []string
-	current := ""
+	var current strings.Builder
 	for _, c := range path {
-		if c == '/' {
-			if current != "" {
-				parts = append(parts, current)
-				current = ""
+		if c == '/' || c == '\\' {
+			if current.Len() > 0 {
+				parts = append(parts, current.String())
+				current.Reset()
 			}
 		} else {
-			current += string(c)
+			current.WriteRune(c)
 		}
 	}
-	if current != "" {
-		parts = append(parts, current)
+	if current.Len() > 0 {
+		parts = append(parts, current.String())
 	}
 	return parts
 }

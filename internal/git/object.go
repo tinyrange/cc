@@ -296,6 +296,9 @@ func ParseSignature(line string) (*Signature, error) {
 	}, nil
 }
 
+// parseTimezone parses a git timezone string (e.g., "+0530", "-0800") to seconds offset.
+// Returns 0 (UTC) for malformed input - this is intentional to match git's lenient
+// parsing behavior and allow reading commits with unusual or corrupted timezone data.
 func parseTimezone(tz string) int {
 	if len(tz) != 5 {
 		return 0

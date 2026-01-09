@@ -121,7 +121,7 @@ func (r *Repository) WriteObject(obj *Object) (Hash, error) {
 		return ZeroHash, fmt.Errorf("write object file: %w", err)
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath) // Best effort cleanup
 		return ZeroHash, fmt.Errorf("rename object file: %w", err)
 	}
 
@@ -271,9 +271,15 @@ func (r *Repository) ReadFileAtTree(treeHash Hash, path string) ([]byte, error) 
 	parts := strings.Split(filepath.ToSlash(path), "/")
 
 	currentHash := treeHash
+	depth := 0
 	for i, part := range parts {
 		if part == "" {
 			continue
+		}
+
+		depth++
+		if depth > maxTreeDepth {
+			return nil, fmt.Errorf("maximum tree depth exceeded")
 		}
 
 		tree, err := r.ReadTree(currentHash)
@@ -311,6 +317,16 @@ func (r *Repository) ReadFileAtTree(treeHash Hash, path string) ([]byte, error) 
 
 // ListFilesAtTree lists all files in a tree recursively.
 func (r *Repository) ListFilesAtTree(treeHash Hash, prefix string) ([]string, error) {
+	return r.listFilesAtTreeDepth(treeHash, prefix, 0)
+}
+
+const maxTreeDepth = 100
+
+func (r *Repository) listFilesAtTreeDepth(treeHash Hash, prefix string, depth int) ([]string, error) {
+	if depth > maxTreeDepth {
+		return nil, fmt.Errorf("maximum tree depth exceeded")
+	}
+
 	tree, err := r.ReadTree(treeHash)
 	if err != nil {
 		return nil, fmt.Errorf("read tree: %w", err)
@@ -324,7 +340,7 @@ func (r *Repository) ListFilesAtTree(treeHash Hash, prefix string) ([]string, er
 		}
 
 		if entry.IsDir() {
-			subFiles, err := r.ListFilesAtTree(entry.Hash, path)
+			subFiles, err := r.listFilesAtTreeDepth(entry.Hash, path, depth+1)
 			if err != nil {
 				return nil, err
 			}
