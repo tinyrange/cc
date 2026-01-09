@@ -335,6 +335,7 @@ type virtualMachine struct {
 
 	vcpus map[int]*virtualCPU
 
+	memMu      sync.RWMutex // protects memory during snapshot
 	memory     *bindings.Allocation
 	memoryBase uint64
 
@@ -472,8 +473,10 @@ func (v *virtualMachine) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error
 }
 
 // WriteAt implements hv.VirtualMachine.
-
 func (v *virtualMachine) WriteAt(p []byte, off int64) (n int, err error) {
+	v.memMu.RLock()
+	defer v.memMu.RUnlock()
+
 	offset := off - int64(v.memoryBase)
 	if offset < 0 || uint64(offset) >= v.memory.Size() {
 		return 0, fmt.Errorf("whp: WriteAt offset out of bounds")
@@ -488,6 +491,9 @@ func (v *virtualMachine) WriteAt(p []byte, off int64) (n int, err error) {
 
 // ReadAt implements hv.VirtualMachine.
 func (v *virtualMachine) ReadAt(p []byte, off int64) (n int, err error) {
+	v.memMu.RLock()
+	defer v.memMu.RUnlock()
+
 	offset := off - int64(v.memoryBase)
 	if offset < 0 || uint64(offset) >= v.memory.Size() {
 		return 0, fmt.Errorf("whp: ReadAt offset out of bounds")

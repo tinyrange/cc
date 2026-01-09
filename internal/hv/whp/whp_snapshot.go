@@ -179,11 +179,13 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 		}
 	}
 
+	v.memMu.Lock()
 	if v.memory != nil {
 		mem := v.memory.Slice()
 		ret.Memory = make([]byte, len(mem))
 		copy(ret.Memory, mem)
 	}
+	v.memMu.Unlock()
 
 	// Capture architecture-specific state
 	if err := v.captureArchSnapshot(ret); err != nil {
@@ -205,11 +207,14 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 			snapshotData.Arch, v.hv.Architecture())
 	}
 
+	v.memMu.Lock()
 	if len(snapshotData.Memory) != len(v.memory.Slice()) {
+		v.memMu.Unlock()
 		return fmt.Errorf("whp: snapshot memory size mismatch: got %d bytes, want %d bytes",
 			len(snapshotData.Memory), len(v.memory.Slice()))
 	}
 	copy(v.memory.Slice(), snapshotData.Memory)
+	v.memMu.Unlock()
 
 	for id := range v.vcpus {
 		state, ok := snapshotData.CpuStates[id]
