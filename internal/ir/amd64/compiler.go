@@ -390,9 +390,16 @@ func (c *compiler) storeValue(dst ir.Fragment, reg asm.Variable, width ir.ValueW
 			return err
 		}
 		mem := amd64.Mem(amd64.Reg64(amd64.RSP)).WithDisp(offset)
-		switch width {
+		// Use the destination's width if specified, otherwise fall back to source width
+		dstWidth := dest.Width
+		if dstWidth == 0 {
+			dstWidth = width
+		}
+		switch dstWidth {
 		case ir.Width8:
 			c.emit(amd64.MovToMemory(mem, amd64.Reg8(reg)))
+		case ir.Width16:
+			c.emit(amd64.MovToMemory(mem, amd64.Reg16(reg)))
 		case ir.Width32:
 			c.emit(amd64.MovToMemory(mem, amd64.Reg32(reg)))
 		default:
@@ -555,6 +562,28 @@ func (c *compiler) compileSyscall(sc ir.SyscallFragment, needResult bool) (asm.V
 			c.emit(amd64.LoadAddress(amd64.Reg64(reg), a.Target))
 			args[idx] = asm.Variable(reg)
 			regs = append(regs, reg)
+		case ir.StackSlotPtrFragment:
+			offset, err := c.stackSlotOffset(a.SlotID, a.Disp)
+			if err != nil {
+				for _, r := range regs {
+					c.freeReg(r)
+				}
+				return 0, err
+			}
+			preferred := syscallPreferredRegisters(idx, argRegs)
+			reg, err := c.allocRegPrefer(preferred...)
+			if err != nil {
+				for _, r := range regs {
+					c.freeReg(r)
+				}
+				return 0, err
+			}
+			c.emit(amd64.MovReg(amd64.Reg64(reg), amd64.Reg64(amd64.RSP)))
+			if offset != 0 {
+				c.emit(amd64.AddRegImm(amd64.Reg64(reg), offset))
+			}
+			args[idx] = asm.Variable(reg)
+			regs = append(regs, reg)
 		case string:
 			val := asm.String(a)
 			args[idx] = val
@@ -710,8 +739,21 @@ func (c *compiler) evalValue(expr ir.Fragment) (asm.Variable, ir.ValueWidth, err
 			return 0, 0, err
 		}
 		mem := amd64.Mem(amd64.Reg64(amd64.RSP)).WithDisp(offset)
-		c.emit(amd64.MovFromMemory(amd64.Reg64(reg), mem))
-		return reg, ir.Width64, nil
+		width := v.Width
+		if width == 0 {
+			width = ir.Width64
+		}
+		switch width {
+		case ir.Width8:
+			c.emit(amd64.MovZX8(amd64.Reg64(reg), mem))
+		case ir.Width16:
+			c.emit(amd64.MovZX16(amd64.Reg64(reg), mem))
+		case ir.Width32:
+			c.emit(amd64.MovFromMemory(amd64.Reg32(reg), mem))
+		default:
+			c.emit(amd64.MovFromMemory(amd64.Reg64(reg), mem))
+		}
+		return reg, width, nil
 	case ir.StackSlotPtrFragment:
 		offset, err := c.stackSlotOffset(v.SlotID, v.Disp)
 		if err != nil {

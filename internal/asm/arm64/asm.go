@@ -58,6 +58,30 @@ func LoadAddress(dst Reg, constant asm.Variable) asm.Fragment {
 	})
 }
 
+// LoadImmediate64FromLiteral stores a 64-bit value in the literal pool and emits
+// an LDR instruction to load it into the destination register. This is useful for
+// placeholder values that need to appear as raw 8-byte sequences in the binary
+// (e.g., method pointers that will be scanned and patched later).
+func LoadImmediate64FromLiteral(dst Reg, value uint64) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		if err := dst.validate(); err != nil {
+			return err
+		}
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		literalOffset := c.addImmediateLiteral(value)
+		word, err := encodeLiteralLoad(dst, literal64)
+		if err != nil {
+			return err
+		}
+		pos := c.emit32(word)
+		c.addLiteralLoad(pos, literalOffset, literal64)
+		return nil
+	})
+}
+
 func MovImmediate(dst Reg, value int64) asm.Fragment {
 	return fragmentFunc(func(ctx asm.Context) error {
 		if err := dst.validate(); err != nil {
@@ -562,6 +586,48 @@ func DSB() asm.Fragment {
 		}
 		// DSB SY: 0xD5033F9F
 		c.emit32(0xD5033F9F)
+		return nil
+	})
+}
+
+// StpPreIndex stores a pair of 64-bit registers to memory with pre-indexed addressing.
+// STP Rt, Rt2, [Rn, #imm]! where imm is the byte offset (must be multiple of 8).
+func StpPreIndex(rt, rt2, rn asm.Variable, imm int) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		// imm must be in range [-512, 504] and multiple of 8
+		if imm < -512 || imm > 504 || imm%8 != 0 {
+			return fmt.Errorf("arm64 asm: STP pre-index immediate %d out of range", imm)
+		}
+		imm7 := (imm / 8) & 0x7F
+		// STP (64-bit, pre-index): 1010 1001 1|0 iiiiiii Rt2 Rn Rt
+		// opc=10, V=0, L=0 (store)
+		word := uint32(0xA9800000) | (uint32(imm7) << 15) | (uint32(rt2) << 10) | (uint32(rn) << 5) | uint32(rt)
+		c.emit32(word)
+		return nil
+	})
+}
+
+// LdpPostIndex loads a pair of 64-bit registers from memory with post-indexed addressing.
+// LDP Rt, Rt2, [Rn], #imm where imm is the byte offset (must be multiple of 8).
+func LdpPostIndex(rt, rt2, rn asm.Variable, imm int) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		// imm must be in range [-512, 504] and multiple of 8
+		if imm < -512 || imm > 504 || imm%8 != 0 {
+			return fmt.Errorf("arm64 asm: LDP post-index immediate %d out of range", imm)
+		}
+		imm7 := (imm / 8) & 0x7F
+		// LDP (64-bit, post-index): 1010 1000 1|1 iiiiiii Rt2 Rn Rt
+		// opc=10, V=0, L=1 (load)
+		word := uint32(0xA8C00000) | (uint32(imm7) << 15) | (uint32(rt2) << 10) | (uint32(rn) << 5) | uint32(rt)
+		c.emit32(word)
 		return nil
 	})
 }

@@ -234,8 +234,6 @@ func main() int64 {
 			reboot()
 		}
 	}
-
-	return 0
 }
 
 // reboot issues a reboot syscall with the architecture-appropriate command.
