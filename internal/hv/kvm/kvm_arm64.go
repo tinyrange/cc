@@ -423,10 +423,12 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 		}
 	}
 
+	v.memMu.Lock()
 	if len(v.memory) > 0 {
 		ret.memory = make([]byte, len(v.memory))
 		copy(ret.memory, v.memory)
 	}
+	v.memMu.Unlock()
 
 	return ret, nil
 }
@@ -438,13 +440,16 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 		return fmt.Errorf("invalid snapshot type")
 	}
 
+	v.memMu.Lock()
 	if len(v.memory) != len(snapshotData.memory) {
+		v.memMu.Unlock()
 		return fmt.Errorf("snapshot memory size mismatch: got %d bytes, want %d bytes",
 			len(snapshotData.memory), len(v.memory))
 	}
 	if len(v.memory) > 0 {
 		copy(v.memory, snapshotData.memory)
 	}
+	v.memMu.Unlock()
 
 	for i := range v.vcpus {
 		state, ok := snapshotData.cpuStates[i]

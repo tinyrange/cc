@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -859,6 +860,7 @@ type virtualMachine struct {
 	rec *timeslice.Recorder
 
 	hv         *hypervisor
+	memMu      sync.RWMutex // protects memory during snapshot
 	memory     []byte
 	memoryBase uint64
 
@@ -964,10 +966,12 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 	}
 
 	// Capture memory (full copy of main guest RAM)
+	v.memMu.Lock()
 	if len(v.memory) > 0 {
 		ret.memory = make([]byte, len(v.memory))
 		copy(ret.memory, v.memory)
 	}
+	v.memMu.Unlock()
 
 	return ret, nil
 }
@@ -980,13 +984,16 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 	}
 
 	// Restore memory first
+	v.memMu.Lock()
 	if len(v.memory) != len(snapshotData.memory) {
+		v.memMu.Unlock()
 		return fmt.Errorf("hvf: snapshot memory size mismatch: got %d, want %d",
 			len(snapshotData.memory), len(v.memory))
 	}
 	if len(v.memory) > 0 {
 		copy(v.memory, snapshotData.memory)
 	}
+	v.memMu.Unlock()
 
 	// Restore GIC state (before vCPUs to ensure interrupts are configured)
 	if err := v.restoreGICState(snapshotData.gicState); err != nil {
@@ -1143,6 +1150,9 @@ func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.Memory
 
 // ReadAt implements [hv.VirtualMachine].
 func (v *virtualMachine) ReadAt(p []byte, off int64) (n int, err error) {
+	v.memMu.RLock()
+	defer v.memMu.RUnlock()
+
 	offset := off - int64(v.memoryBase)
 	if offset < 0 || uint64(offset) >= uint64(len(v.memory)) {
 		return 0, fmt.Errorf("hvf: ReadAt offset out of bounds")
@@ -1157,6 +1167,9 @@ func (v *virtualMachine) ReadAt(p []byte, off int64) (n int, err error) {
 
 // WriteAt implements [hv.VirtualMachine].
 func (v *virtualMachine) WriteAt(p []byte, off int64) (n int, err error) {
+	v.memMu.RLock()
+	defer v.memMu.RUnlock()
+
 	offset := off - int64(v.memoryBase)
 	if offset < 0 || uint64(offset) >= uint64(len(v.memory)) {
 		return 0, fmt.Errorf("hvf: virtualMachine WriteAt offset out of bounds: 0x%x, 0x%x", off, len(v.memory))
