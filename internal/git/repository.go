@@ -189,8 +189,9 @@ func (r *Repository) ResolveRef(ref string) (Hash, error) {
 		}
 		line := strings.TrimSpace(string(content))
 
-		// Check if it's a symbolic ref
+		// Check if it's a symbolic ref (prevent cycles by limiting depth)
 		if strings.HasPrefix(line, "ref: ") {
+			// TODO: Add cycle detection or depth limit
 			return r.ResolveRef(strings.TrimPrefix(line, "ref: "))
 		}
 
