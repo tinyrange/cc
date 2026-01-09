@@ -353,11 +353,12 @@ func ParseCommit(obj *Object) (*Commit, error) {
 	commit := &Commit{}
 	data := string(obj.Data)
 
-	// Split header and message
+	// Split header and message (message may be empty)
 	parts := strings.SplitN(data, "\n\n", 2)
-	if len(parts) != 2 {
-		return nil, ErrInvalidObject
+	if len(parts) == 2 {
+		commit.Message = parts[1]
 	}
+	headers := parts[0]
 
 	headers := parts[0]
 	commit.Message = parts[1]
