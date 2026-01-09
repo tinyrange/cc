@@ -113,6 +113,30 @@ const (
 	RegisterARM64Pstate
 	RegisterARM64Vbar
 	RegisterARM64GicrBase
+	// ARM64 System Registers for snapshots
+	RegisterARM64SctlrEl1
+	RegisterARM64TcrEl1
+	RegisterARM64Ttbr0El1
+	RegisterARM64Ttbr1El1
+	RegisterARM64MairEl1
+	RegisterARM64ElrEl1
+	RegisterARM64SpsrEl1
+	RegisterARM64EsrEl1
+	RegisterARM64FarEl1
+	RegisterARM64SpEl0
+	RegisterARM64SpEl1
+	RegisterARM64CntkctlEl1
+	RegisterARM64CntvCtlEl0
+	RegisterARM64CntvCvalEl0
+	RegisterARM64CpacrEl1
+	RegisterARM64ContextidrEl1
+	RegisterARM64TpidrEl0
+	RegisterARM64TpidrEl1
+	RegisterARM64TpidrroEl0
+	RegisterARM64ParEl1
+	RegisterARM64Afsr0El1
+	RegisterARM64Afsr1El1
+	RegisterARM64AmairEl1
 
 	// RISC-V General-Purpose Registers
 	RegisterRISCVX0
@@ -206,8 +230,31 @@ var registerNames = map[Register]string{
 	RegisterARM64Sp:       "SP",
 	RegisterARM64Pc:       "PC",
 	RegisterARM64Pstate:   "PSTATE",
-	RegisterARM64Vbar:     "VBAR",
-	RegisterARM64GicrBase: "GICR_BASE",
+	RegisterARM64Vbar:          "VBAR",
+	RegisterARM64GicrBase:      "GICR_BASE",
+	RegisterARM64SctlrEl1:      "SCTLR_EL1",
+	RegisterARM64TcrEl1:        "TCR_EL1",
+	RegisterARM64Ttbr0El1:      "TTBR0_EL1",
+	RegisterARM64Ttbr1El1:      "TTBR1_EL1",
+	RegisterARM64MairEl1:       "MAIR_EL1",
+	RegisterARM64ElrEl1:        "ELR_EL1",
+	RegisterARM64SpsrEl1:       "SPSR_EL1",
+	RegisterARM64EsrEl1:        "ESR_EL1",
+	RegisterARM64FarEl1:        "FAR_EL1",
+	RegisterARM64SpEl0:         "SP_EL0",
+	RegisterARM64SpEl1:         "SP_EL1",
+	RegisterARM64CntkctlEl1:    "CNTKCTL_EL1",
+	RegisterARM64CntvCtlEl0:    "CNTV_CTL_EL0",
+	RegisterARM64CntvCvalEl0:   "CNTV_CVAL_EL0",
+	RegisterARM64CpacrEl1:      "CPACR_EL1",
+	RegisterARM64ContextidrEl1: "CONTEXTIDR_EL1",
+	RegisterARM64TpidrEl0:      "TPIDR_EL0",
+	RegisterARM64TpidrEl1:      "TPIDR_EL1",
+	RegisterARM64TpidrroEl0:    "TPIDRRO_EL0",
+	RegisterARM64ParEl1:        "PAR_EL1",
+	RegisterARM64Afsr0El1:      "AFSR0_EL1",
+	RegisterARM64Afsr1El1:      "AFSR1_EL1",
+	RegisterARM64AmairEl1:      "AMAIR_EL1",
 
 	RegisterRISCVX0:  "X0",
 	RegisterRISCVX1:  "X1",

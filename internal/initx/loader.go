@@ -185,9 +185,9 @@ func (p *programLoader) DeviceTreeNodes() ([]fdt.Node, error) {
 
 // WriteMMIO implements hv.MemoryMappedIODevice.
 func (p *programLoader) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
-	addr = addr - mailboxPhysAddr
+	offset := addr - mailboxPhysAddr
 
-	switch addr {
+	switch offset {
 	case mailboxRunResultDetailOffset:
 		p.runResultDetail = binary.LittleEndian.Uint32(data)
 		return nil
@@ -199,7 +199,7 @@ func (p *programLoader) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) 
 	case 0x0:
 		value := binary.LittleEndian.Uint32(data)
 		switch value {
-		case 0x444f4e45:
+		case 0x444f4e45, snapshotRequestValue:
 			return hv.ErrYield
 		case userYieldValue:
 			return hv.ErrUserYield
@@ -208,7 +208,7 @@ func (p *programLoader) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) 
 		// no-op
 	}
 
-	return fmt.Errorf("unimplemented write at address 0x%x", addr)
+	return fmt.Errorf("unimplemented write at address 0x%x", offset)
 }
 
 func (p *programLoader) LoadProgram(prog *ir.Program) error {
@@ -438,6 +438,26 @@ func (vm *VirtualMachine) Run(ctx context.Context, prog *ir.Program) error {
 
 func (vm *VirtualMachine) Architecture() hv.CpuArchitecture {
 	return vm.vm.Hypervisor().Architecture()
+}
+
+// CaptureSnapshot captures a snapshot of the VM state.
+func (vm *VirtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
+	return vm.vm.CaptureSnapshot()
+}
+
+// RestoreSnapshot restores a VM from a snapshot.
+func (vm *VirtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
+	if err := vm.vm.RestoreSnapshot(snap); err != nil {
+		return err
+	}
+	// Mark first run as complete since the vCPU state is already configured from the snapshot
+	vm.firstRunComplete = true
+	return nil
+}
+
+// HVVirtualMachine returns the underlying hv.VirtualMachine for low-level operations.
+func (vm *VirtualMachine) HVVirtualMachine() hv.VirtualMachine {
+	return vm.vm
 }
 
 func (vm *VirtualMachine) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error {

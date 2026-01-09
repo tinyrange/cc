@@ -395,10 +395,12 @@ func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 	vm.rec.Record(tsKvmSetTSSAddr)
 
 	if config.NeedsInterruptSupport() {
-		// Enable split IRQ chip so IOAPIC is handled in userspace and PIC remains in-kernel.
+		// Enable split IRQ chip so IOAPIC is handled in userspace and LAPIC remains in-kernel.
+		// In split mode, PIC and IOAPIC are NOT created in kernel - only LAPIC is.
 		if err := enableSplitIRQChip(vm.vmFd, 24); err != nil && err != unix.EINVAL && err != unix.ENOTTY {
 			return fmt.Errorf("enable split irqchip: %w", err)
 		}
+		vm.splitIRQChip = true
 
 		vm.rec.Record(tsKvmEnabledSplitIRQChip)
 
@@ -896,7 +898,9 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 		ret.clockData = &clock
 	}
 
-	if v.hasIRQChip {
+	// In split IRQ chip mode, only LAPIC is in kernel - PIC/IOAPIC are in userspace.
+	// The userspace IOAPIC device saves its state via the device snapshot mechanism.
+	if v.hasIRQChip && !v.splitIRQChip {
 		var chips []kvmIRQChip
 		for _, chipID := range []uint32{irqChipPICMaster, irqChipPICSlave, irqChipIOAPIC} {
 			chip, err := getIRQChip(v.vmFd, chipID)
@@ -936,10 +940,12 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 		}
 	}
 
+	v.memMu.Lock()
 	if len(v.memory) > 0 {
 		ret.memory = make([]byte, len(v.memory))
 		copy(ret.memory, v.memory)
 	}
+	v.memMu.Unlock()
 
 	return ret, nil
 }
@@ -952,13 +958,16 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 		return fmt.Errorf("invalid snapshot type")
 	}
 
+	v.memMu.Lock()
 	if len(v.memory) != len(snapshotData.memory) {
+		v.memMu.Unlock()
 		return fmt.Errorf("snapshot memory size mismatch: got %d bytes, want %d bytes",
 			len(snapshotData.memory), len(v.memory))
 	}
 	if len(v.memory) > 0 {
 		copy(v.memory, snapshotData.memory)
 	}
+	v.memMu.Unlock()
 
 	// Restore state to each vCPU
 	for i := range v.vcpus {
@@ -984,9 +993,14 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 		}
 	}
 
+	// In split IRQ chip mode, PIC/IOAPIC are in userspace and restored via device snapshots.
+	// Only restore kernel IRQ chip state if not in split mode.
 	if len(snapshotData.irqChips) > 0 {
 		if !v.hasIRQChip {
 			return fmt.Errorf("snapshot contains IRQ chip state but VM lacks irqchip")
+		}
+		if v.splitIRQChip {
+			return fmt.Errorf("snapshot contains IRQ chip state but VM uses split irqchip mode")
 		}
 		for _, chip := range snapshotData.irqChips {
 			chipCopy := chip
@@ -994,7 +1008,7 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 				return fmt.Errorf("restore IRQ chip %d: %w", chipCopy.ChipID, err)
 			}
 		}
-	} else if v.hasIRQChip {
+	} else if v.hasIRQChip && !v.splitIRQChip {
 		return fmt.Errorf("snapshot missing IRQ chip state")
 	}
 

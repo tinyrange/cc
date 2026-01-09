@@ -117,6 +117,17 @@ type SimdFP struct {
 	high uint64
 }
 
+// NewSimdFP creates a new SimdFP value from low and high parts.
+func NewSimdFP(low, high uint64) SimdFP {
+	return SimdFP{low: low, high: high}
+}
+
+// Low returns the low 64 bits of the SIMD register.
+func (s SimdFP) Low() uint64 { return s.low }
+
+// High returns the high 64 bits of the SIMD register.
+func (s SimdFP) High() uint64 { return s.high }
+
 // SysReg is an ARM system register selector (hv_sys_reg_t).
 type SysReg uint16
 
