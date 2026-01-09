@@ -177,6 +177,16 @@ func (r *Repository) ReadCommit(hash Hash) (*Commit, error) {
 // ResolveRef resolves a reference to a hash.
 // Supports both full refs (refs/heads/main) and short refs (HEAD, main).
 func (r *Repository) ResolveRef(ref string) (Hash, error) {
+	return r.resolveRefDepth(ref, 0)
+}
+
+const maxRefDepth = 10
+
+func (r *Repository) resolveRefDepth(ref string, depth int) (Hash, error) {
+	if depth > maxRefDepth {
+		return ZeroHash, fmt.Errorf("max ref depth exceeded (possible cycle)")
+	}
+
 	// Try as a direct ref file first
 	refPaths := []string{
 		filepath.Join(r.GitDir, ref),
@@ -192,10 +202,9 @@ func (r *Repository) ResolveRef(ref string) (Hash, error) {
 		}
 		line := strings.TrimSpace(string(content))
 
-		// Check if it's a symbolic ref (prevent cycles by limiting depth)
+		// Check if it's a symbolic ref
 		if strings.HasPrefix(line, "ref: ") {
-			// TODO: Add cycle detection or depth limit
-			return r.ResolveRef(strings.TrimPrefix(line, "ref: "))
+			return r.resolveRefDepth(strings.TrimPrefix(line, "ref: "), depth+1)
 		}
 
 		// Try to parse as a hash
@@ -227,7 +236,17 @@ func (r *Repository) UpdateRef(ref string, hash Hash) error {
 	}
 
 	content := hash.String() + "\n"
-	return os.WriteFile(refPath, []byte(content), 0o644)
+
+	// Use atomic write: temp file + rename
+	tmpPath := refPath + ".lock"
+	if err := os.WriteFile(tmpPath, []byte(content), 0o644); err != nil {
+		return fmt.Errorf("write ref file: %w", err)
+	}
+	if err := os.Rename(tmpPath, refPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("rename ref file: %w", err)
+	}
+	return nil
 }
 
 // Head returns the hash of HEAD.

@@ -50,6 +50,10 @@ func (r *Repository) CommitOnBranch(treeHash Hash, branch string, opts CommitOpt
 // Paths must use forward slashes (/) as separators.
 // All files are created with mode 0o100644 (non-executable).
 func (r *Repository) TreeFromMap(files map[string][]byte) (Hash, error) {
+	if len(files) == 0 {
+		return ZeroHash, fmt.Errorf("cannot create tree from empty file map")
+	}
+
 	// Build a nested structure
 	type dirEntry struct {
 		files   map[string]Hash // leaf files
@@ -75,6 +79,9 @@ func (r *Repository) TreeFromMap(files map[string][]byte) (Hash, error) {
 		current := root
 		for i := 0; i < len(parts)-1; i++ {
 			dir := parts[i]
+			if _, isFile := current.files[dir]; isFile {
+				return ZeroHash, fmt.Errorf("path conflict: %q is both a file and directory", dir)
+			}
 			if current.subdirs[dir] == nil {
 				current.subdirs[dir] = &dirEntry{
 					files:   make(map[string]Hash),
@@ -83,7 +90,11 @@ func (r *Repository) TreeFromMap(files map[string][]byte) (Hash, error) {
 			}
 			current = current.subdirs[dir]
 		}
-		current.files[parts[len(parts)-1]] = blobHash
+		filename := parts[len(parts)-1]
+		if _, isDir := current.subdirs[filename]; isDir {
+			return ZeroHash, fmt.Errorf("path conflict: %q is both a file and directory", filename)
+		}
+		current.files[filename] = blobHash
 	}
 
 	// Now recursively build trees
