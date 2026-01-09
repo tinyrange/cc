@@ -17,6 +17,9 @@ type whpSnapshot struct {
 	CpuStates       map[int]whpVcpuSnapshot
 	DeviceSnapshots map[string]interface{}
 	Memory          []byte
+
+	// ARM64-specific: GIC state (nil for x86_64)
+	Arm64GICState *arm64GICSnapshot
 }
 
 var whpSnapshotRegisters = map[hv.CpuArchitecture][]hv.Register{
@@ -182,6 +185,11 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 		copy(ret.Memory, mem)
 	}
 
+	// Capture architecture-specific state
+	if err := v.captureArchSnapshot(ret); err != nil {
+		return nil, err
+	}
+
 	return ret, nil
 }
 
@@ -226,6 +234,11 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 				return fmt.Errorf("restore device %s snapshot: %w", id, err)
 			}
 		}
+	}
+
+	// Restore architecture-specific state
+	if err := v.restoreArchSnapshot(snapshotData); err != nil {
+		return err
 	}
 
 	return nil

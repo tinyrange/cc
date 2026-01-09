@@ -95,6 +95,11 @@ func writeSnapshot(w io.Writer, snap *whpSnapshot) error {
 		return fmt.Errorf("write devices: %w", err)
 	}
 
+	// Write ARM64 GIC state (if present)
+	if err := writeArm64GICState(w, snap.Arm64GICState); err != nil {
+		return fmt.Errorf("write arm64 gic state: %w", err)
+	}
+
 	return nil
 }
 
@@ -159,6 +164,13 @@ func readSnapshot(r io.Reader) (*whpSnapshot, error) {
 		return nil, fmt.Errorf("read devices: %w", err)
 	}
 	snap.DeviceSnapshots = devices
+
+	// Read ARM64 GIC state (if present)
+	gicState, err := readArm64GICState(r)
+	if err != nil {
+		return nil, fmt.Errorf("read arm64 gic state: %w", err)
+	}
+	snap.Arm64GICState = gicState
 
 	return snap, nil
 }
@@ -360,3 +372,6 @@ func readDeviceSnapshots(r io.Reader) (map[string]interface{}, error) {
 
 	return devices, nil
 }
+
+// writeArm64GICState and readArm64GICState are implemented in
+// snapshot_io_arm64.go and snapshot_io_amd64.go
