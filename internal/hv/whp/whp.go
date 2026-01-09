@@ -156,6 +156,28 @@ var whpRegisterMap = map[hv.Register]bindings.RegisterName{
 	hv.RegisterARM64Pstate:   bindings.Arm64RegisterPstate,
 	hv.RegisterARM64Vbar:     bindings.Arm64RegisterVbarEl1,
 	hv.RegisterARM64GicrBase: bindings.Arm64RegisterGicrBaseGpa,
+
+	// ARM64 system registers for snapshots
+	hv.RegisterARM64SctlrEl1:      bindings.Arm64RegisterSctlrEl1,
+	hv.RegisterARM64TcrEl1:        bindings.Arm64RegisterTcrEl1,
+	hv.RegisterARM64Ttbr0El1:      bindings.Arm64RegisterTtbr0El1,
+	hv.RegisterARM64Ttbr1El1:      bindings.Arm64RegisterTtbr1El1,
+	hv.RegisterARM64MairEl1:       bindings.Arm64RegisterMairEl1,
+	hv.RegisterARM64ElrEl1:        bindings.Arm64RegisterElrEl1,
+	hv.RegisterARM64SpsrEl1:       bindings.Arm64RegisterSpsrEl1,
+	hv.RegisterARM64EsrEl1:        bindings.Arm64RegisterEsrEl1,
+	hv.RegisterARM64FarEl1:        bindings.Arm64RegisterFarEl1,
+	hv.RegisterARM64SpEl0:         bindings.Arm64RegisterSpEl0,
+	hv.RegisterARM64SpEl1:         bindings.Arm64RegisterSpEl1,
+	hv.RegisterARM64CntkctlEl1:    bindings.Arm64RegisterCntkctlEl1,
+	hv.RegisterARM64CntvCtlEl0:    bindings.Arm64RegisterCntvCtlEl0,
+	hv.RegisterARM64CntvCvalEl0:   bindings.Arm64RegisterCntvCvalEl0,
+	hv.RegisterARM64CpacrEl1:      bindings.Arm64RegisterCpacrEl1,
+	hv.RegisterARM64ContextidrEl1: bindings.Arm64RegisterContextidrEl1,
+	hv.RegisterARM64TpidrEl0:      bindings.Arm64RegisterTpidrEl0,
+	hv.RegisterARM64TpidrEl1:      bindings.Arm64RegisterTpidrEl1,
+	hv.RegisterARM64TpidrroEl0:    bindings.Arm64RegisterTpidrroEl0,
+	hv.RegisterARM64ParEl1:        bindings.Arm64RegisterParEl1,
 }
 
 // SetRegisters implements hv.VirtualCPU.

@@ -41,6 +41,7 @@ var whpSnapshotRegisters = map[hv.CpuArchitecture][]hv.Register{
 		hv.RegisterAMD64Rflags,
 	},
 	hv.ArchitectureARM64: {
+		// General purpose registers
 		hv.RegisterARM64X0,
 		hv.RegisterARM64X1,
 		hv.RegisterARM64X2,
@@ -70,10 +71,36 @@ var whpSnapshotRegisters = map[hv.CpuArchitecture][]hv.Register{
 		hv.RegisterARM64X26,
 		hv.RegisterARM64X27,
 		hv.RegisterARM64X28,
+		hv.RegisterARM64X29, // FP
+		hv.RegisterARM64X30, // LR
+
+		// Special registers
 		hv.RegisterARM64Sp,
 		hv.RegisterARM64Pc,
 		hv.RegisterARM64Pstate,
+
+		// System registers
 		hv.RegisterARM64Vbar,
+		hv.RegisterARM64SctlrEl1,
+		hv.RegisterARM64TcrEl1,
+		hv.RegisterARM64Ttbr0El1,
+		hv.RegisterARM64Ttbr1El1,
+		hv.RegisterARM64MairEl1,
+		hv.RegisterARM64ElrEl1,
+		hv.RegisterARM64SpsrEl1,
+		hv.RegisterARM64EsrEl1,
+		hv.RegisterARM64FarEl1,
+		hv.RegisterARM64SpEl0,
+		hv.RegisterARM64SpEl1,
+		hv.RegisterARM64CntkctlEl1,
+		hv.RegisterARM64CntvCtlEl0,
+		hv.RegisterARM64CntvCvalEl0,
+		hv.RegisterARM64CpacrEl1,
+		hv.RegisterARM64ContextidrEl1,
+		hv.RegisterARM64TpidrEl0,
+		hv.RegisterARM64TpidrEl1,
+		hv.RegisterARM64TpidrroEl0,
+		hv.RegisterARM64ParEl1,
 	},
 }
 
