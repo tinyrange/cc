@@ -14,7 +14,7 @@ import "github.com/tinyrange/cc/internal/rtg/runtime"
 //   - "network": include network configuration (ConfigureInterface, AddDefaultRoute, SetResolvConf)
 //   - "exec": use exec instead of fork/exec/wait
 func main() int64 {
-	runtime.Printf("cc: running container init program\n")
+	runtime.LogKmsg("cc: running container init program\n")
 
 	// === Phase 1: Create mount points ===
 	runtime.Syscall(runtime.SYS_MKDIRAT, runtime.AT_FDCWD, "/mnt", 0o755)
@@ -44,7 +44,7 @@ func main() int64 {
 	runtime.Syscall(runtime.SYS_MKDIRAT, runtime.AT_FDCWD, "/mnt/dev/shm", 0o1777)
 	runtime.Syscall(runtime.SYS_MOUNT, "tmpfs", "/mnt/dev/shm", "tmpfs", 0, "mode=1777")
 
-	runtime.Printf("cc: mounted filesystems\n")
+	runtime.LogKmsg("cc: mounted filesystems\n")
 
 	// === Phase 5: Change root to container ===
 	chdirErr := runtime.Syscall(runtime.SYS_CHDIR, "/mnt")
@@ -82,7 +82,7 @@ func main() int64 {
 		}
 	}
 
-	runtime.Printf("cc: changed root to container\n")
+	runtime.LogKmsg("cc: changed root to container\n")
 
 	// Remove oldroot directory
 	unlinkErr := runtime.Syscall(runtime.SYS_UNLINKAT, runtime.AT_FDCWD, "/oldroot", runtime.AT_REMOVEDIR)
@@ -108,26 +108,26 @@ func main() int64 {
 		reboot()
 	}
 
-	runtime.Printf("cc: mounted devpts\n")
+	runtime.LogKmsg("cc: mounted devpts\n")
 
 	// === Phase 7: System configuration ===
 	// These helper functions are placeholders - their bodies are replaced at IR level
 
 	setHostname()
-	runtime.Printf("cc: set hostname\n")
+	runtime.LogKmsg("cc: set hostname\n")
 
 	configureLoopback()
-	runtime.Printf("cc: configured loopback interface\n")
+	runtime.LogKmsg("cc: configured loopback interface\n")
 
 	setHostsFile()
-	runtime.Printf("cc: configured /etc/hosts\n")
+	runtime.LogKmsg("cc: configured /etc/hosts\n")
 
 	// === Phase 8: Network configuration (conditional) ===
 	if runtime.Ifdef("network") {
 		configureInterface()
 		addDefaultRoute()
 		setResolvConf()
-		runtime.Printf("cc: configured network interface\n")
+		runtime.LogKmsg("cc: configured network interface\n")
 	}
 
 	// === Phase 9: Change to working directory ===
@@ -135,7 +135,7 @@ func main() int64 {
 
 	// === Phase 10: Execute command ===
 	if runtime.Ifdef("exec") {
-		runtime.Printf("cc: executing command\n")
+		runtime.LogKmsg("cc: executing command\n")
 		execCommand()
 	} else {
 		forkExecWait()
@@ -156,6 +156,7 @@ func setHostname() int64 {
 	}
 	return 0
 }
+
 // configureLoopback brings up the loopback interface (lo) with IP 127.0.0.1.
 func configureLoopback() int64 {
 	var ifreq [40]byte
@@ -215,6 +216,7 @@ func configureLoopback() int64 {
 	runtime.Syscall(runtime.SYS_CLOSE, fd)
 	return 0
 }
+
 // setHostsFile writes /etc/hosts with localhost entries.
 // The hosts content is provided via the "hosts_content" config value.
 func setHostsFile() int64 {
@@ -233,10 +235,12 @@ func setHostsFile() int64 {
 	runtime.Syscall(runtime.SYS_CLOSE, fd)
 	return 0
 }
+
 // configureInterface configures the network interface.
 // This is a placeholder - body is replaced at IR level with actual implementation.
 func configureInterface() int64 { return 0 }
 func addDefaultRoute() int64     { return 0 }
+
 // setResolvConf writes /etc/resolv.conf with the DNS server.
 // The resolv.conf content is provided via the "resolv_content" config value.
 func setResolvConf() int64 {
@@ -261,14 +265,15 @@ func setResolvConf() int64 {
 	runtime.Syscall(runtime.SYS_CLOSE, fd)
 	return 0
 }
+
 // changeWorkDir changes to the working directory from config.
 func changeWorkDir() int64 {
 	ptr, _ := runtime.EmbedConfigCString("workdir")
 	runtime.Syscall(runtime.SYS_CHDIR, ptr)
 	return 0
 }
-func execCommand() int64         { return 0 }
-func forkExecWait() int64        { return 0 }
+func execCommand() int64  { return 0 }
+func forkExecWait() int64 { return 0 }
 
 // reboot issues a reboot syscall with the architecture-appropriate command.
 // On x86_64, it uses RESTART; on ARM64, it uses POWER_OFF.

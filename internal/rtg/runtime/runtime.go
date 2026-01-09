@@ -17,6 +17,10 @@ func Syscall(num int64, args ...any) int64 { return 0 }
 // Printf prints a formatted message to the console.
 func Printf(format string, args ...any) {}
 
+// LogKmsg writes a message to /dev/kmsg (kernel message buffer).
+// The message is visible via dmesg. This is non-fatal if /dev/kmsg is unavailable.
+func LogKmsg(msg string) {}
+
 // Load8 loads an 8-bit value from memory at ptr+offset.
 func Load8(ptr, offset int64) int64 { return 0 }
 

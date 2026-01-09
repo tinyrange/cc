@@ -337,7 +337,8 @@ func (c *Compiler) lowerFunc(fn *ast.FuncDecl) (ir.Method, error) {
 	}
 
 	if retType.Kind != TypeInvalid && !sawReturn {
-		return nil, fmt.Errorf("rtg: function %q missing return statement", fn.Name.Name)
+		// Auto-insert return with zero value
+		method = append(method, ir.Return(ir.Int64(0)))
 	}
 
 	// Wrap method body with stack slots for any declared buffers
@@ -995,6 +996,8 @@ func (c *Compiler) lowerCallStmt(call *ast.CallExpr) ([]ir.Fragment, error) {
 			return nil, fmt.Errorf("rtg: isb() takes no arguments")
 		}
 		return []ir.Fragment{ir.ISB()}, nil
+	case "logKmsg", "LogKmsg":
+		return c.lowerLogKmsg(call)
 	default:
 		// Allow calling user-defined functions as statements (void calls)
 		if len(call.Args) == 0 {
@@ -1780,6 +1783,43 @@ func (c *Compiler) lowerPrintf(call *ast.CallExpr) ([]ir.Fragment, error) {
 	}
 
 	return []ir.Fragment{ir.Printf(format, anyArgs...)}, nil
+}
+
+func (c *Compiler) lowerLogKmsg(call *ast.CallExpr) ([]ir.Fragment, error) {
+	if len(call.Args) != 1 {
+		return nil, fmt.Errorf("rtg: LogKmsg requires exactly one string argument")
+	}
+
+	msgLit, ok := call.Args[0].(*ast.BasicLit)
+	if !ok || msgLit.Kind != token.STRING {
+		return nil, fmt.Errorf("rtg: LogKmsg argument must be a string literal")
+	}
+	msg, err := strconv.Unquote(msgLit.Value)
+	if err != nil {
+		return nil, fmt.Errorf("rtg: LogKmsg message: %w", err)
+	}
+
+	// Generate unique variable and label names
+	c.labelCount++
+	id := c.labelCount
+	fd := ir.Var(fmt.Sprintf("__kmsg_fd_%d", id))
+	doneLabel := ir.Label(fmt.Sprintf("__kmsg_done_%d", id))
+
+	// Generate IR to write to /dev/kmsg
+	// This is non-fatal: if /dev/kmsg can't be opened, we just skip the write
+	return []ir.Fragment{
+		ir.Assign(fd, ir.Syscall(
+			defs.SYS_OPENAT,
+			ir.Int64(int64(linux.AT_FDCWD)),
+			"/dev/kmsg",
+			ir.Int64(int64(linux.O_WRONLY)),
+			ir.Int64(0),
+		)),
+		ir.If(ir.IsNegative(fd), ir.Goto(doneLabel)),
+		ir.Syscall(defs.SYS_WRITE, fd, msg, ir.Int64(int64(len(msg)))),
+		ir.Syscall(defs.SYS_CLOSE, fd),
+		ir.DeclareLabel(doneLabel, ir.Block{}),
+	}, nil
 }
 
 func (c *Compiler) evalInt(expr ast.Expr) (int64, error) {
