@@ -10,3 +10,6 @@ var LogoWhite []byte
 
 //go:embed icon-plus.svg
 var IconPlus []byte
+
+//go:embed icon-logs.svg
+var IconLogs []byte

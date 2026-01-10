@@ -17,16 +17,92 @@ var (
 	colorTopBar        = color.RGBA{R: 22, G: 22, B: 22, A: 255}
 	colorBtnNormal     = color.RGBA{R: 40, G: 40, B: 40, A: 255}
 	colorBtnHover      = color.RGBA{R: 56, G: 56, B: 56, A: 255}
-	colorBtnPressed    = color.RGBA{R: 72, G: 72, B: 72, A: 255}
-	colorBorderNormal  = color.RGBA{R: 80, G: 80, B: 80, A: 255}
-	colorBorderHover   = color.RGBA{R: 140, G: 140, B: 140, A: 255}
-	colorBorderPressed = color.RGBA{R: 180, G: 180, B: 180, A: 255}
-	colorCardBg        = color.RGBA{R: 20, G: 20, B: 20, A: 220}
-	colorCardBgHover   = color.RGBA{R: 30, G: 30, B: 30, A: 235}
+	colorCardBg        = color.RGBA{R: 28, G: 28, B: 30, A: 255}
+	colorCardBgHover   = color.RGBA{R: 44, G: 44, B: 46, A: 255}
 	colorOverlay       = color.RGBA{R: 10, G: 10, B: 10, A: 200}
-	colorScrollTrack   = color.RGBA{R: 48, G: 48, B: 48, A: 255}
-	colorScrollThumb   = color.RGBA{R: 100, G: 100, B: 100, A: 255}
+	colorAccent        = color.RGBA{R: 52, G: 120, B: 246, A: 255}   // Blue accent
+	colorAccentHover   = color.RGBA{R: 72, G: 140, B: 255, A: 255}   // Blue accent hover
+	colorAccentPressed = color.RGBA{R: 42, G: 100, B: 220, A: 255}   // Blue accent pressed
+	colorTextSecondary = color.RGBA{R: 160, G: 160, B: 160, A: 255}  // Secondary text
 )
+
+// UI constants
+const (
+	cornerRadiusSmall  float32 = 6
+	cornerRadiusMedium float32 = 10
+	topBarButtonHeight float32 = 26
+	topBarIconSize     float32 = 14
+)
+
+// topBarButtonStyle returns the standard style for top bar buttons (text only)
+func topBarButtonStyle() ui.ButtonStyle {
+	return ui.ButtonStyle{
+		BackgroundNormal:   colorBtnNormal,
+		BackgroundHovered:  colorBtnHover,
+		BackgroundPressed:  color.RGBA{R: 72, G: 72, B: 72, A: 255},
+		BackgroundDisabled: color.RGBA{R: 30, G: 30, B: 30, A: 255},
+		TextColor:          graphics.ColorWhite,
+		TextSize:           13,
+		Padding:            ui.Symmetric(10, 6),
+		MinWidth:           60,
+		MinHeight:          topBarButtonHeight,
+		CornerRadius:       cornerRadiusSmall,
+	}
+}
+
+// iconButtonCardStyle returns a CardStyle matching the top bar button style
+func iconButtonCardStyle() ui.CardStyle {
+	return ui.CardStyle{
+		BackgroundColor: colorBtnNormal,
+		BorderColor:     color.Transparent,
+		BorderWidth:     0,
+		Padding:         ui.Symmetric(10, 6),
+		CornerRadius:    cornerRadiusSmall,
+	}
+}
+
+// iconButtonCardHoverStyle returns a hover CardStyle for icon buttons
+func iconButtonCardHoverStyle() ui.CardStyle {
+	return ui.CardStyle{
+		BackgroundColor: colorBtnHover,
+		BorderColor:     color.Transparent,
+		BorderWidth:     0,
+		Padding:         ui.Symmetric(10, 6),
+		CornerRadius:    cornerRadiusSmall,
+	}
+}
+
+// primaryButtonStyle returns the style for primary action buttons (blue accent)
+func primaryButtonStyle() ui.ButtonStyle {
+	return ui.ButtonStyle{
+		BackgroundNormal:   colorAccent,
+		BackgroundHovered:  colorAccentHover,
+		BackgroundPressed:  colorAccentPressed,
+		BackgroundDisabled: color.RGBA{R: 80, G: 80, B: 80, A: 255},
+		TextColor:          graphics.ColorWhite,
+		TextSize:           15,
+		Padding:            ui.Symmetric(20, 12),
+		MinWidth:           120,
+		MinHeight:          44,
+		CornerRadius:       cornerRadiusSmall,
+	}
+}
+
+// secondaryButtonStyle returns the style for secondary action buttons
+func secondaryButtonStyle() ui.ButtonStyle {
+	return ui.ButtonStyle{
+		BackgroundNormal:   colorBtnNormal,
+		BackgroundHovered:  colorBtnHover,
+		BackgroundPressed:  color.RGBA{R: 72, G: 72, B: 72, A: 255},
+		BackgroundDisabled: color.RGBA{R: 30, G: 30, B: 30, A: 255},
+		TextColor:          graphics.ColorWhite,
+		TextSize:           15,
+		Padding:            ui.Symmetric(20, 12),
+		MinWidth:           120,
+		MinHeight:          44,
+		CornerRadius:       cornerRadiusSmall,
+	}
+}
 
 // LauncherScreen manages the launcher UI state and widgets
 type LauncherScreen struct {
@@ -37,7 +113,10 @@ type LauncherScreen struct {
 	bundleCards []*bundleCardWidget
 	scrollView  *ui.ScrollView
 	logo        *ui.AnimatedLogo
-	plusIcon    *graphics.SVG
+
+	// Icons
+	iconPlus *graphics.SVG
+	iconLogs *graphics.SVG
 
 	// State
 	scrollX float32
@@ -56,12 +135,16 @@ func NewLauncherScreen(app *Application) *LauncherScreen {
 		app:  app,
 	}
 
-	// Load plus icon
-	plusIcon, err := graphics.LoadSVG(app.window, assets.IconPlus)
-	if err != nil {
+	// Load icons
+	if icon, err := graphics.LoadSVG(app.window, assets.IconPlus); err != nil {
 		slog.Warn("failed to load plus icon", "error", err)
 	} else {
-		screen.plusIcon = plusIcon
+		screen.iconPlus = icon
+	}
+	if icon, err := graphics.LoadSVG(app.window, assets.IconLogs); err != nil {
+		slog.Warn("failed to load logs icon", "error", err)
+	} else {
+		screen.iconLogs = icon
 	}
 
 	screen.buildUI()
@@ -111,57 +194,52 @@ func (s *LauncherScreen) buildUI() {
 func (s *LauncherScreen) buildTopBar() *ui.FlexContainer {
 	row := ui.Row().
 		WithBackground(colorTopBar).
-		WithPadding(ui.Symmetric(20, 6))
+		WithPadding(ui.Symmetric(16, 6)).
+		WithCrossAlignment(ui.CrossAxisCenter)
 
 	row.AddChild(ui.NewSpacer(), ui.FlexParams(1))
 
-	// Custom VM button with plus icon
-	customVMBtn := s.buildCustomVMButton()
-	row.AddChild(customVMBtn, ui.FlexParamsWithMargin(0, ui.Only(0, 0, 12, 0)))
-
-	// Debug Logs button
+	// New VM button with icon
 	row.AddChild(
-		ui.NewButton("Debug Logs").
-			WithMinSize(120, 20).
-			OnClick(func() {
-				s.app.openLogs()
-			}),
+		s.buildIconButton("New VM", s.iconPlus, func() {
+			s.app.customVMScreen = NewCustomVMScreen(s.app)
+			s.app.mode = modeCustomVM
+		}),
+		ui.FlexParamsWithMargin(0, ui.Only(0, 0, 8, 0)),
+	)
+
+	// Debug Logs button with icon
+	row.AddChild(
+		s.buildIconButton("Logs", s.iconLogs, func() {
+			s.app.openLogs()
+		}),
 		ui.DefaultFlexParams(),
 	)
 
 	return row
 }
 
-func (s *LauncherScreen) buildCustomVMButton() ui.Widget {
-	row := ui.Row().WithGap(6)
+// buildIconButton creates a compact button with an icon and label
+func (s *LauncherScreen) buildIconButton(label string, icon *graphics.SVG, onClick func()) ui.Widget {
+	content := ui.Row().
+		WithGap(5).
+		WithCrossAlignment(ui.CrossAxisCenter)
 
-	// Add plus icon if available
-	if s.plusIcon != nil {
-		icon := ui.NewSVGImage(s.plusIcon).WithSize(16, 16)
-		row.AddChild(icon, ui.DefaultFlexParams())
+	// Add icon if available
+	if icon != nil {
+		iconWidget := ui.NewSVGImage(icon).WithSize(topBarIconSize, topBarIconSize)
+		content.AddChild(iconWidget, ui.DefaultFlexParams())
 	}
 
-	// Button text
-	row.AddChild(ui.NewLabel("Custom VM").WithSize(14), ui.DefaultFlexParams())
+	// Add label
+	content.AddChild(ui.NewLabel(label).WithSize(13), ui.DefaultFlexParams())
 
-	// Wrap in a clickable card
-	card := ui.NewCard(row).
-		WithStyle(ui.CardStyle{
-			BackgroundColor: colorBtnNormal,
-			BorderColor:     color.Transparent,
-			BorderWidth:     0,
-			Padding:         ui.Symmetric(12, 6),
-		}).
-		WithHoverStyle(ui.CardStyle{
-			BackgroundColor: colorBtnHover,
-			BorderColor:     color.Transparent,
-			BorderWidth:     0,
-			Padding:         ui.Symmetric(12, 6),
-		}).
-		OnClick(func() {
-			s.app.customVMScreen = NewCustomVMScreen(s.app)
-			s.app.mode = modeCustomVM
-		})
+	// Create card button with fixed height for alignment
+	card := ui.NewCard(content).
+		WithStyle(iconButtonCardStyle()).
+		WithHoverStyle(iconButtonCardHoverStyle()).
+		WithGraphicsWindow(s.app.window).
+		OnClick(onClick)
 
 	return card
 }
@@ -239,37 +317,49 @@ func (s *LauncherScreen) buildBundleCard(index int, b discoveredBundle) *bundleC
 	}
 
 	// Card dimensions and padding
-	const cardWidth = 180
-	const cardHeight = 230
-	const contentWidth = cardWidth - 10
+	const cardWidth float32 = 180
+	const cardHeight float32 = 240
+	const cardPadding float32 = 12
+	const contentWidth = cardWidth - (cardPadding * 2)
+	const imageHeight float32 = 120
 
 	// Card content: vertical layout with image area and text
-	content := ui.Column().WithGap(8)
+	content := ui.Column().WithGap(12)
 
-	// Placeholder image area (sized to fit within padded content area)
-	content.AddChild(ui.NewSpacer().WithSize(contentWidth, contentWidth), ui.DefaultFlexParams())
+	// Image placeholder area with subtle background
+	imagePlaceholder := ui.NewCard(nil).
+		WithStyle(ui.CardStyle{
+			BackgroundColor: color.RGBA{R: 38, G: 38, B: 40, A: 255},
+			CornerRadius:    cornerRadiusSmall,
+		}).
+		WithGraphicsWindow(s.app.window).
+		WithFixedSize(contentWidth, imageHeight)
+	content.AddChild(imagePlaceholder, ui.DefaultFlexParams())
 
-	// Name and description
-	content.AddChild(ui.NewLabel(name).WithSize(18), ui.DefaultFlexParams())
-	content.AddChild(ui.NewLabel(desc).WithSize(14).WithColor(graphics.ColorLightGray), ui.DefaultFlexParams())
+	// Name and description with better spacing
+	content.AddChild(ui.NewLabel(name).WithSize(16), ui.DefaultFlexParams())
+	content.AddChild(ui.NewLabel(desc).WithSize(13).WithColor(colorTextSecondary), ui.DefaultFlexParams())
 
 	cardStyle := ui.CardStyle{
-		BackgroundColor: color.RGBA{A: 0}, // Transparent by default
-		BorderColor:     colorBorderNormal,
-		BorderWidth:     1,
-		Padding:         ui.Only(5, 0, 5, 0),
+		BackgroundColor: colorCardBg,
+		BorderColor:     color.Transparent,
+		BorderWidth:     0,
+		Padding:         ui.All(cardPadding),
+		CornerRadius:    cornerRadiusMedium,
 	}
 
 	hoverStyle := ui.CardStyle{
-		BackgroundColor: colorCardBg,
-		BorderColor:     colorBorderHover,
-		BorderWidth:     1,
-		Padding:         ui.Only(5, 0, 5, 0),
+		BackgroundColor: colorCardBgHover,
+		BorderColor:     colorAccent,
+		BorderWidth:     0, // Border not rendered with rounded corners, but color signals hover
+		Padding:         ui.All(cardPadding),
+		CornerRadius:    cornerRadiusMedium,
 	}
 
 	card := ui.NewCard(content).
 		WithStyle(cardStyle).
 		WithHoverStyle(hoverStyle).
+		WithGraphicsWindow(s.app.window).
 		WithFixedSize(cardWidth, cardHeight).
 		OnClick(func() {
 			s.app.selectedIndex = index
@@ -321,21 +411,31 @@ func (s *LoadingScreen) buildUI() {
 	// Background
 	stack.AddChild(ui.NewBox(colorBackground))
 
-	// Centered logo
+	// Centered logo with larger size
 	if s.app.logo != nil {
 		s.logo = ui.NewAnimatedLogo(s.app.logo).
-			WithSize(300, 300).
+			WithSize(320, 320).
 			WithSpeeds(0.9, -1.4, 2.2)
 		stack.AddChild(ui.CenterCenter(s.logo))
 	}
 
-	// Loading text at top-left
+	// Loading status in a rounded card at top-left
 	msg := "Booting VM…"
 	if s.app.bootName != "" {
 		msg = "Booting " + s.app.bootName + "…"
 	}
-	loadingLabel := ui.NewLabel(msg).WithSize(20)
-	stack.AddChild(ui.TopLeft(ui.NewPadding(loadingLabel, ui.All(20))))
+	loadingCard := ui.NewCard(
+		ui.NewPadding(
+			ui.NewLabel(msg).WithSize(16).WithColor(graphics.ColorWhite),
+			ui.Symmetric(16, 10),
+		),
+	).
+		WithStyle(ui.CardStyle{
+			BackgroundColor: color.RGBA{R: 30, G: 30, B: 32, A: 230},
+			CornerRadius:    cornerRadiusSmall,
+		}).
+		WithGraphicsWindow(s.app.window)
+	stack.AddChild(ui.TopLeft(ui.NewPadding(loadingCard, ui.All(24))))
 
 	s.root.SetChild(stack)
 }
@@ -377,7 +477,7 @@ func (s *ErrorScreen) buildUI() {
 	// Background
 	stack.AddChild(ui.NewBox(colorBackground))
 
-	// Subtle rotating logo in center
+	// Subtle rotating logo in center (behind content)
 	if s.app.logo != nil {
 		s.logo = ui.NewAnimatedLogo(s.app.logo).
 			WithSize(250, 250).
@@ -385,28 +485,40 @@ func (s *ErrorScreen) buildUI() {
 		stack.AddChild(ui.CenterCenter(s.logo))
 	}
 
-	// Content column
-	content := ui.Column().WithPadding(ui.All(30))
+	// Content column with better spacing
+	content := ui.Column().WithPadding(ui.All(40))
 
-	// Error header
-	content.AddChild(ui.NewLabel("Error").WithSize(56), ui.DefaultFlexParams())
+	// Error header with color accent
+	content.AddChild(ui.NewLabel("Error").WithSize(48).WithColor(graphics.ColorWhite), ui.DefaultFlexParams())
 
-	// Error message
+	// Error message in a rounded card
 	msg := s.app.errMsg
 	if msg == "" {
 		msg = "unknown error"
 	}
-	content.AddChild(
-		ui.NewLabel(msg).WithSize(18),
-		ui.FlexParamsWithMargin(0, ui.Only(0, 30, 0, 0)),
-	)
+	errorCard := ui.NewCard(
+		ui.NewPadding(
+			ui.NewLabel(msg).WithSize(16).WithColor(colorTextSecondary),
+			ui.All(16),
+		),
+	).
+		WithStyle(ui.CardStyle{
+			BackgroundColor: color.RGBA{R: 40, G: 20, B: 20, A: 255}, // Subtle red tint
+			CornerRadius:    cornerRadiusSmall,
+		}).
+		WithGraphicsWindow(s.app.window)
+	content.AddChild(errorCard, ui.FlexParamsWithMargin(0, ui.Only(0, 24, 0, 0)))
 
-	// Buttons
-	buttonCol := ui.Column().WithGap(14)
+	// Buttons with consistent styles
+	buttonCol := ui.Column().WithGap(12)
 
+	// Primary action button (blue accent)
+	primaryStyle := primaryButtonStyle()
+	primaryStyle.MinWidth = 280
 	buttonCol.AddChild(
-		ui.NewButton("Back to carousel").
-			WithMinSize(320, 44).
+		ui.NewButton("Back to Launcher").
+			WithStyle(primaryStyle).
+			WithGraphicsWindow(s.app.window).
 			OnClick(func() {
 				s.app.errMsg = ""
 				s.app.selectedIndex = -1
@@ -415,16 +527,20 @@ func (s *ErrorScreen) buildUI() {
 		ui.DefaultFlexParams(),
 	)
 
+	// Secondary action button (muted)
+	secondaryStyle := secondaryButtonStyle()
+	secondaryStyle.MinWidth = 280
 	buttonCol.AddChild(
-		ui.NewButton("Open logs directory").
-			WithMinSize(320, 44).
+		ui.NewButton("Open Logs Directory").
+			WithStyle(secondaryStyle).
+			WithGraphicsWindow(s.app.window).
 			OnClick(func() {
 				s.app.openLogs()
 			}),
 		ui.DefaultFlexParams(),
 	)
 
-	content.AddChild(buttonCol, ui.FlexParamsWithMargin(0, ui.Only(0, 40, 0, 0)))
+	content.AddChild(buttonCol, ui.FlexParamsWithMargin(0, ui.Only(0, 32, 0, 0)))
 
 	stack.AddChild(content)
 
@@ -465,10 +581,12 @@ func (s *TerminalScreen) buildUI() {
 	// Just the top bar - terminal view is handled separately
 	topBar := ui.Row().
 		WithBackground(colorTopBar).
-		WithPadding(ui.Symmetric(20, 6)).
+		WithPadding(ui.Symmetric(16, 6)).
+		WithCrossAlignment(ui.CrossAxisCenter).
 		AddChild(
 			ui.NewButton("Exit").
-				WithMinSize(70, 20).
+				WithStyle(topBarButtonStyle()).
+				WithGraphicsWindow(s.app.window).
 				OnClick(func() {
 					s.app.stopVM()
 				}),
@@ -476,8 +594,9 @@ func (s *TerminalScreen) buildUI() {
 		).
 		AddChild(ui.NewSpacer(), ui.FlexParams(1)).
 		AddChild(
-			ui.NewButton("Debug Logs").
-				WithMinSize(120, 20).
+			ui.NewButton("Logs").
+				WithStyle(topBarButtonStyle()).
+				WithGraphicsWindow(s.app.window).
 				OnClick(func() {
 					s.app.openLogs()
 				}),

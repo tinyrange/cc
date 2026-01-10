@@ -113,8 +113,8 @@ func (s *CustomVMScreen) buildUI() {
 		inputRow := ui.Row().WithGap(8)
 		s.pathInput = ui.NewTextInput().
 			WithPlaceholder("").
-			WithMinWidth(contentWidth - 80 - 8).
-			WithGraphicsWindow(s.app.window) // Enable rounded corners
+			WithMinWidth(contentWidth - 90 - 8).
+			WithGraphicsWindow(s.app.window)
 		if s.selectedPath != "" {
 			s.pathInput.SetText(s.selectedPath)
 		}
@@ -122,9 +122,13 @@ func (s *CustomVMScreen) buildUI() {
 			s.selectedPath = text
 		})
 		inputRow.AddChild(s.pathInput, ui.DefaultFlexParams())
+		browseStyle := secondaryButtonStyle()
+		browseStyle.MinWidth = 90
+		browseStyle.MinHeight = 32
+		browseStyle.TextSize = 14
 		s.browseButton = ui.NewButton("Browse...").
-			WithMinSize(80, 32).
-			WithGraphicsWindow(s.app.window). // Enable rounded corners
+			WithStyle(browseStyle).
+			WithGraphicsWindow(s.app.window).
 			OnClick(func() {
 				s.browseDirectory()
 			})
@@ -136,8 +140,8 @@ func (s *CustomVMScreen) buildUI() {
 		inputRow := ui.Row().WithGap(8)
 		s.pathInput = ui.NewTextInput().
 			WithPlaceholder("").
-			WithMinWidth(contentWidth - 80 - 8).
-			WithGraphicsWindow(s.app.window) // Enable rounded corners
+			WithMinWidth(contentWidth - 90 - 8).
+			WithGraphicsWindow(s.app.window)
 		if s.selectedPath != "" {
 			s.pathInput.SetText(s.selectedPath)
 		}
@@ -145,9 +149,13 @@ func (s *CustomVMScreen) buildUI() {
 			s.selectedPath = text
 		})
 		inputRow.AddChild(s.pathInput, ui.DefaultFlexParams())
+		browseStyle := secondaryButtonStyle()
+		browseStyle.MinWidth = 90
+		browseStyle.MinHeight = 32
+		browseStyle.TextSize = 14
 		s.browseButton = ui.NewButton("Browse...").
-			WithMinSize(80, 32).
-			WithGraphicsWindow(s.app.window). // Enable rounded corners
+			WithStyle(browseStyle).
+			WithGraphicsWindow(s.app.window).
 			OnClick(func() {
 				s.browseTarball()
 			})
@@ -195,34 +203,32 @@ func (s *CustomVMScreen) buildUI() {
 	// Spacer to push buttons to bottom
 	content.AddChild(ui.NewSpacer(), ui.FlexParams(1))
 
-	// Button row
+	// Button row with consistent dialog button styles
 	buttonRow := ui.Row().WithGap(12)
 	buttonRow.AddChild(ui.NewSpacer(), ui.FlexParams(1))
+
+	// Cancel button (secondary style, sized for dialog)
+	cancelStyle := secondaryButtonStyle()
+	cancelStyle.MinWidth = 90
+	cancelStyle.MinHeight = 36
+	cancelStyle.TextSize = 14
 	cancelBtn := ui.NewButton("Cancel").
-		WithMinSize(80, 32).
-		WithGraphicsWindow(s.app.window). // Enable rounded corners
+		WithStyle(cancelStyle).
+		WithGraphicsWindow(s.app.window).
 		OnClick(func() {
 			s.app.clearBlurCapture()
 			s.app.mode = modeLauncher
 		})
 	buttonRow.AddChild(cancelBtn, ui.DefaultFlexParams())
 
-	// Launch button with blue primary style
+	// Launch button (primary style, sized for dialog)
+	launchStyle := primaryButtonStyle()
+	launchStyle.MinWidth = 90
+	launchStyle.MinHeight = 36
+	launchStyle.TextSize = 14
 	s.launchButton = ui.NewButton("Launch").
-		WithMinSize(80, 32).
-		WithGraphicsWindow(s.app.window). // Enable rounded corners
-		WithStyle(ui.ButtonStyle{
-			BackgroundNormal:   color.RGBA{R: 52, G: 120, B: 246, A: 255},
-			BackgroundHovered:  color.RGBA{R: 72, G: 140, B: 255, A: 255},
-			BackgroundPressed:  color.RGBA{R: 42, G: 100, B: 220, A: 255},
-			BackgroundDisabled: color.RGBA{R: 80, G: 80, B: 80, A: 255},
-			TextColor:          graphics.ColorWhite,
-			TextSize:           14,
-			Padding:            ui.Symmetric(16, 8),
-			MinWidth:           80,
-			MinHeight:          32,
-			CornerRadius:       6,
-		}).
+		WithStyle(launchStyle).
+		WithGraphicsWindow(s.app.window).
 		OnClick(s.onLaunch)
 	buttonRow.AddChild(s.launchButton, ui.DefaultFlexParams())
 	content.AddChild(buttonRow, ui.DefaultFlexParams())

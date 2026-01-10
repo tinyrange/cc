@@ -45,7 +45,8 @@ type Card struct {
 	// Rounded corner rendering
 	gfxWindow    graphics.Window
 	shapeBuilder *graphics.ShapeBuilder
-	lastBounds   Rect // Track bounds changes for mesh updates
+	lastBounds   Rect        // Track bounds changes for mesh updates
+	lastBgColor  color.Color // Track color changes for hover updates
 }
 
 // NewCard creates a new card.
@@ -222,8 +223,8 @@ func (c *Card) drawRoundedBackground(ctx *DrawContext, bounds Rect, style CardSt
 		}
 	}
 
-	// Update geometry if bounds changed
-	if bounds != c.lastBounds {
+	// Update geometry if bounds or color changed (color changes for hover)
+	if bounds != c.lastBounds || style.BackgroundColor != c.lastBgColor {
 		shapeStyle := graphics.ShapeStyle{
 			FillColor: style.BackgroundColor,
 		}
@@ -233,6 +234,7 @@ func (c *Card) drawRoundedBackground(ctx *DrawContext, bounds Rect, style CardSt
 			shapeStyle,
 		)
 		c.lastBounds = bounds
+		c.lastBgColor = style.BackgroundColor
 	}
 
 	// Render the mesh
