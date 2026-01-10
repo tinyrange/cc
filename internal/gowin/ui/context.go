@@ -24,6 +24,15 @@ func NewLayoutContext(txt *text.Renderer, scale float32) *LayoutContext {
 type DrawContext struct {
 	Frame graphics.Frame
 	Text  *text.Renderer
+
+	// BlurEffect provides optional blur support.
+	// May be nil if blur is not initialized.
+	BlurEffect *graphics.BlurEffect
+
+	// BlurredBackground is a cached blurred texture of the background.
+	// Widgets can use this for glassmorphism effects.
+	// May be nil if no blur has been applied.
+	BlurredBackground graphics.Texture
 }
 
 // EventContext provides context during event handling.

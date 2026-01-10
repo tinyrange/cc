@@ -89,6 +89,18 @@ const (
 	Vendor = 0x1F00
 	// Version returns the GL version string of the current context.
 	Version = 0x1F02
+
+	// Framebuffer constants (OpenGL 3.0+)
+	Framebuffer         = 0x8D40
+	ReadFramebuffer     = 0x8CA8
+	DrawFramebuffer     = 0x8CA9
+	FramebufferComplete = 0x8CD5
+	ColorAttachment0    = 0x8CE0
+	DepthAttachment     = 0x8D00
+
+	// Renderbuffer constants
+	Renderbuffer     = 0x8D41
+	DepthComponent24 = 0x81A6
 )
 
 // OpenGL describes the subset of OpenGL entry points used by this package.
@@ -218,6 +230,27 @@ type OpenGL interface {
 	// If the name is not recognized or no context is current, implementations may
 	// return the empty string.
 	GetString(name uint32) string
+
+	// Framebuffer operations (OpenGL 3.0+)
+	GenFramebuffers(n int32, framebuffers *uint32)
+	DeleteFramebuffers(n int32, framebuffers *uint32)
+	BindFramebuffer(target uint32, framebuffer uint32)
+	FramebufferTexture2D(target, attachment, textarget, texture uint32, level int32)
+	CheckFramebufferStatus(target uint32) uint32
+
+	// Renderbuffer operations
+	GenRenderbuffers(n int32, renderbuffers *uint32)
+	DeleteRenderbuffers(n int32, renderbuffers *uint32)
+	BindRenderbuffer(target uint32, renderbuffer uint32)
+	RenderbufferStorage(target, internalformat uint32, width, height int32)
+	FramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer uint32)
+
+	// Additional uniform operations for shaders
+	Uniform1f(location int32, v0 float32)
+	Uniform2f(location int32, v0, v1 float32)
+
+	// Texture cleanup
+	DeleteTextures(n int32, textures *uint32)
 }
 
 func gostring(ptr *byte) string {

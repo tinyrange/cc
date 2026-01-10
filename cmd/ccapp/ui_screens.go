@@ -2,9 +2,11 @@ package main
 
 import (
 	"image/color"
+	"log/slog"
 	"path/filepath"
 	"time"
 
+	"github.com/tinyrange/cc/internal/assets"
 	"github.com/tinyrange/cc/internal/gowin/graphics"
 	"github.com/tinyrange/cc/internal/gowin/ui"
 )
@@ -35,6 +37,7 @@ type LauncherScreen struct {
 	bundleCards []*bundleCardWidget
 	scrollView  *ui.ScrollView
 	logo        *ui.AnimatedLogo
+	plusIcon    *graphics.SVG
 
 	// State
 	scrollX float32
@@ -52,6 +55,15 @@ func NewLauncherScreen(app *Application) *LauncherScreen {
 		root: ui.NewRoot(app.text),
 		app:  app,
 	}
+
+	// Load plus icon
+	plusIcon, err := graphics.LoadSVG(app.window, assets.IconPlus)
+	if err != nil {
+		slog.Warn("failed to load plus icon", "error", err)
+	} else {
+		screen.plusIcon = plusIcon
+	}
+
 	screen.buildUI()
 	return screen
 }
@@ -97,18 +109,61 @@ func (s *LauncherScreen) buildUI() {
 }
 
 func (s *LauncherScreen) buildTopBar() *ui.FlexContainer {
-	return ui.Row().
+	row := ui.Row().
 		WithBackground(colorTopBar).
-		WithPadding(ui.Symmetric(20, 6)).
-		AddChild(ui.NewSpacer(), ui.FlexParams(1)).
-		AddChild(
-			ui.NewButton("Debug Logs").
-				WithMinSize(120, 20).
-				OnClick(func() {
-					s.app.openLogs()
-				}),
-			ui.DefaultFlexParams(),
-		)
+		WithPadding(ui.Symmetric(20, 6))
+
+	row.AddChild(ui.NewSpacer(), ui.FlexParams(1))
+
+	// Custom VM button with plus icon
+	customVMBtn := s.buildCustomVMButton()
+	row.AddChild(customVMBtn, ui.FlexParamsWithMargin(0, ui.Only(0, 0, 12, 0)))
+
+	// Debug Logs button
+	row.AddChild(
+		ui.NewButton("Debug Logs").
+			WithMinSize(120, 20).
+			OnClick(func() {
+				s.app.openLogs()
+			}),
+		ui.DefaultFlexParams(),
+	)
+
+	return row
+}
+
+func (s *LauncherScreen) buildCustomVMButton() ui.Widget {
+	row := ui.Row().WithGap(6)
+
+	// Add plus icon if available
+	if s.plusIcon != nil {
+		icon := ui.NewSVGImage(s.plusIcon).WithSize(16, 16)
+		row.AddChild(icon, ui.DefaultFlexParams())
+	}
+
+	// Button text
+	row.AddChild(ui.NewLabel("Custom VM").WithSize(14), ui.DefaultFlexParams())
+
+	// Wrap in a clickable card
+	card := ui.NewCard(row).
+		WithStyle(ui.CardStyle{
+			BackgroundColor: colorBtnNormal,
+			BorderColor:     color.Transparent,
+			BorderWidth:     0,
+			Padding:         ui.Symmetric(12, 6),
+		}).
+		WithHoverStyle(ui.CardStyle{
+			BackgroundColor: colorBtnHover,
+			BorderColor:     color.Transparent,
+			BorderWidth:     0,
+			Padding:         ui.Symmetric(12, 6),
+		}).
+		OnClick(func() {
+			s.app.customVMScreen = NewCustomVMScreen(s.app)
+			s.app.mode = modeCustomVM
+		})
+
+	return card
 }
 
 func (s *LauncherScreen) buildTitleSection() *ui.FlexContainer {

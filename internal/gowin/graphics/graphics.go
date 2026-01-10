@@ -75,6 +75,12 @@ type Window interface {
 
 	// GetShaderProgram returns the graphics shader program ID for state restoration.
 	GetShaderProgram() uint32
+
+	// NewRenderTarget creates an off-screen render target for render-to-texture.
+	NewRenderTarget(width, height int) (RenderTarget, error)
+
+	// NewBlurEffect creates a reusable blur effect processor.
+	NewBlurEffect() (*BlurEffect, error)
 }
 
 // DynamicMesh supports efficient partial vertex updates via BufferSubData.

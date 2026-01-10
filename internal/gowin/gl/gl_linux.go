@@ -68,6 +68,27 @@ type openGL struct {
 	drawArrays   func(uint32, int32, int32)
 	drawElements func(uint32, int32, uint32, uintptr)
 
+	// Framebuffer operations
+	genFramebuffers        func(int32, *uint32)
+	deleteFramebuffers     func(int32, *uint32)
+	bindFramebuffer        func(uint32, uint32)
+	framebufferTexture2D   func(uint32, uint32, uint32, uint32, int32)
+	checkFramebufferStatus func(uint32) uint32
+
+	// Renderbuffer operations
+	genRenderbuffers        func(int32, *uint32)
+	deleteRenderbuffers     func(int32, *uint32)
+	bindRenderbuffer        func(uint32, uint32)
+	renderbufferStorage     func(uint32, uint32, int32, int32)
+	framebufferRenderbuffer func(uint32, uint32, uint32, uint32)
+
+	// Additional uniform operations
+	uniform1f func(int32, float32)
+	uniform2f func(int32, float32, float32)
+
+	// Texture cleanup
+	deleteTextures func(int32, *uint32)
+
 	// Proc address function
 	getProcAddress func(*byte) unsafe.Pointer
 }
@@ -274,6 +295,66 @@ func (gl *openGL) DrawElements(mode uint32, count int32, xtype uint32, indices u
 	gl.drawElements(mode, count, xtype, indices)
 }
 
+// Framebuffer operations
+
+func (gl *openGL) GenFramebuffers(n int32, framebuffers *uint32) {
+	gl.genFramebuffers(n, framebuffers)
+}
+
+func (gl *openGL) DeleteFramebuffers(n int32, framebuffers *uint32) {
+	gl.deleteFramebuffers(n, framebuffers)
+}
+
+func (gl *openGL) BindFramebuffer(target uint32, framebuffer uint32) {
+	gl.bindFramebuffer(target, framebuffer)
+}
+
+func (gl *openGL) FramebufferTexture2D(target, attachment, textarget, texture uint32, level int32) {
+	gl.framebufferTexture2D(target, attachment, textarget, texture, level)
+}
+
+func (gl *openGL) CheckFramebufferStatus(target uint32) uint32 {
+	return gl.checkFramebufferStatus(target)
+}
+
+// Renderbuffer operations
+
+func (gl *openGL) GenRenderbuffers(n int32, renderbuffers *uint32) {
+	gl.genRenderbuffers(n, renderbuffers)
+}
+
+func (gl *openGL) DeleteRenderbuffers(n int32, renderbuffers *uint32) {
+	gl.deleteRenderbuffers(n, renderbuffers)
+}
+
+func (gl *openGL) BindRenderbuffer(target uint32, renderbuffer uint32) {
+	gl.bindRenderbuffer(target, renderbuffer)
+}
+
+func (gl *openGL) RenderbufferStorage(target, internalformat uint32, width, height int32) {
+	gl.renderbufferStorage(target, internalformat, width, height)
+}
+
+func (gl *openGL) FramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer uint32) {
+	gl.framebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer)
+}
+
+// Additional uniform operations
+
+func (gl *openGL) Uniform1f(location int32, v0 float32) {
+	gl.uniform1f(location, v0)
+}
+
+func (gl *openGL) Uniform2f(location int32, v0, v1 float32) {
+	gl.uniform2f(location, v0, v1)
+}
+
+// Texture cleanup
+
+func (gl *openGL) DeleteTextures(n int32, textures *uint32) {
+	gl.deleteTextures(n, textures)
+}
+
 func Load() (OpenGL, error) {
 	handle, err := purego.Dlopen("libGL.so.1", purego.RTLD_LAZY|purego.RTLD_GLOBAL)
 	if err != nil {
@@ -364,6 +445,27 @@ func Load() (OpenGL, error) {
 	purego.RegisterFunc(&gl.uniformMatrix4fv, uintptr(loadFunc("glUniformMatrix4fv")))
 	purego.RegisterFunc(&gl.drawArrays, uintptr(loadFunc("glDrawArrays")))
 	purego.RegisterFunc(&gl.drawElements, uintptr(loadFunc("glDrawElements")))
+
+	// Framebuffer operations
+	purego.RegisterFunc(&gl.genFramebuffers, uintptr(loadFunc("glGenFramebuffers")))
+	purego.RegisterFunc(&gl.deleteFramebuffers, uintptr(loadFunc("glDeleteFramebuffers")))
+	purego.RegisterFunc(&gl.bindFramebuffer, uintptr(loadFunc("glBindFramebuffer")))
+	purego.RegisterFunc(&gl.framebufferTexture2D, uintptr(loadFunc("glFramebufferTexture2D")))
+	purego.RegisterFunc(&gl.checkFramebufferStatus, uintptr(loadFunc("glCheckFramebufferStatus")))
+
+	// Renderbuffer operations
+	purego.RegisterFunc(&gl.genRenderbuffers, uintptr(loadFunc("glGenRenderbuffers")))
+	purego.RegisterFunc(&gl.deleteRenderbuffers, uintptr(loadFunc("glDeleteRenderbuffers")))
+	purego.RegisterFunc(&gl.bindRenderbuffer, uintptr(loadFunc("glBindRenderbuffer")))
+	purego.RegisterFunc(&gl.renderbufferStorage, uintptr(loadFunc("glRenderbufferStorage")))
+	purego.RegisterFunc(&gl.framebufferRenderbuffer, uintptr(loadFunc("glFramebufferRenderbuffer")))
+
+	// Additional uniform operations
+	purego.RegisterFunc(&gl.uniform1f, uintptr(loadFunc("glUniform1f")))
+	purego.RegisterFunc(&gl.uniform2f, uintptr(loadFunc("glUniform2f")))
+
+	// Texture cleanup
+	purego.RegisterFunc(&gl.deleteTextures, uintptr(loadFunc("glDeleteTextures")))
 
 	return gl, nil
 }

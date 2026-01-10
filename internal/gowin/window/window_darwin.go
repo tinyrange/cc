@@ -79,6 +79,11 @@ type Cocoa struct {
 
 	// Raw input events queued during Poll().
 	inputEvents []InputEvent
+
+	// Dock menu support.
+	dockMenu         objc.ID
+	dockMenuItems    []DockMenuItem
+	dockMenuCallback DockMenuCallback
 }
 
 var (
@@ -138,6 +143,31 @@ var (
 	// NSScreen selectors (display scale).
 	selMainScreen         objc.SEL
 	selBackingScaleFactor objc.SEL
+
+	// NSMenu selectors (dock menu).
+	selInitWithTitle  objc.SEL
+	selAddItem        objc.SEL
+	selRemoveAllItems objc.SEL
+	selSeparatorItem  objc.SEL
+
+	// NSMenuItem selectors.
+	selInitWithTitleAction objc.SEL
+	selSetTag              objc.SEL
+	selGetTag              objc.SEL
+	selSetEnabled          objc.SEL
+	selSetTarget           objc.SEL
+
+	// NSOpenPanel selectors (file dialogs).
+	selOpenPanel               objc.SEL
+	selSetCanChooseFiles       objc.SEL
+	selSetCanChooseDirectories objc.SEL
+	selSetAllowsMultiple       objc.SEL
+	selSetAllowedFileTypes     objc.SEL
+	selRunModal                objc.SEL
+	selURLs                    objc.SEL
+	selPath                    objc.SEL
+	selCount                   objc.SEL
+	selObjectAtIndex           objc.SEL
 )
 
 // Subset of NSEventType values we care about.
@@ -493,6 +523,31 @@ func loadSelectors() {
 	// NSScreen (display scale).
 	selMainScreen = objc.RegisterName("mainScreen")
 	selBackingScaleFactor = objc.RegisterName("backingScaleFactor")
+
+	// NSMenu (dock menu).
+	selInitWithTitle = objc.RegisterName("initWithTitle:")
+	selAddItem = objc.RegisterName("addItem:")
+	selRemoveAllItems = objc.RegisterName("removeAllItems")
+	selSeparatorItem = objc.RegisterName("separatorItem")
+
+	// NSMenuItem.
+	selInitWithTitleAction = objc.RegisterName("initWithTitle:action:keyEquivalent:")
+	selSetTag = objc.RegisterName("setTag:")
+	selGetTag = objc.RegisterName("tag")
+	selSetEnabled = objc.RegisterName("setEnabled:")
+	selSetTarget = objc.RegisterName("setTarget:")
+
+	// NSOpenPanel (file dialogs).
+	selOpenPanel = objc.RegisterName("openPanel")
+	selSetCanChooseFiles = objc.RegisterName("setCanChooseFiles:")
+	selSetCanChooseDirectories = objc.RegisterName("setCanChooseDirectories:")
+	selSetAllowsMultiple = objc.RegisterName("setAllowsMultipleSelection:")
+	selSetAllowedFileTypes = objc.RegisterName("setAllowedFileTypes:")
+	selRunModal = objc.RegisterName("runModal")
+	selURLs = objc.RegisterName("URLs")
+	selPath = objc.RegisterName("path")
+	selCount = objc.RegisterName("count")
+	selObjectAtIndex = objc.RegisterName("objectAtIndex:")
 }
 
 func nsString(v string) objc.ID {
@@ -1076,4 +1131,117 @@ func getDisplayScale() float32 {
 		return 1.0
 	}
 	return scale
+}
+
+// Global reference to the active Cocoa instance for dock menu callbacks.
+// This is needed because Objective-C callbacks cannot capture Go closures.
+var activeCocoa *Cocoa
+
+// SetDockMenu implements DockMenuSupport interface.
+// It sets up the dock menu with the given items and callback.
+func (c *Cocoa) SetDockMenu(items []DockMenuItem, callback DockMenuCallback) {
+	c.dockMenuItems = items
+	c.dockMenuCallback = callback
+	activeCocoa = c
+
+	// Create or update the dock menu
+	c.rebuildDockMenu()
+}
+
+func (c *Cocoa) rebuildDockMenu() {
+	if c.dockMenu == 0 {
+		// Create the dock menu
+		menu := objc.ID(objc.GetClass("NSMenu")).Send(selAlloc)
+		menu = menu.Send(selInitWithTitle, nsString(""))
+		c.dockMenu = menu
+	} else {
+		// Clear existing items
+		c.dockMenu.Send(selRemoveAllItems)
+	}
+
+	// Add items
+	for _, item := range c.dockMenuItems {
+		if item.Separator {
+			sep := objc.ID(objc.GetClass("NSMenuItem")).Send(selSeparatorItem)
+			c.dockMenu.Send(selAddItem, sep)
+			continue
+		}
+
+		// Create menu item with no action - we'll poll for clicks
+		menuItem := objc.ID(objc.GetClass("NSMenuItem")).Send(selAlloc)
+		menuItem = menuItem.Send(selInitWithTitleAction, nsString(item.Title), objc.SEL(0), nsString(""))
+		menuItem.Send(selSetTag, int64(item.Tag))
+		menuItem.Send(selSetEnabled, item.Enabled)
+		c.dockMenu.Send(selAddItem, menuItem)
+	}
+}
+
+// GetDockMenu returns the NSMenu for the dock. This should be called from
+// the application delegate's applicationDockMenu: method.
+func (c *Cocoa) GetDockMenu() objc.ID {
+	return c.dockMenu
+}
+
+// HandleDockMenuAction is called when a dock menu item is clicked.
+// The tag identifies which item was clicked.
+func (c *Cocoa) HandleDockMenuAction(tag int) {
+	if c.dockMenuCallback != nil {
+		c.dockMenuCallback(tag)
+	}
+}
+
+// ShowOpenPanel implements FileDialogSupport interface.
+// It shows a native file/directory open dialog and returns the selected path.
+func (c *Cocoa) ShowOpenPanel(dialogType FileDialogType, allowedExtensions []string) string {
+	// NSOpenPanel must be shown on the main thread
+	panel := objc.ID(objc.GetClass("NSOpenPanel")).Send(selOpenPanel)
+	if panel == 0 {
+		return ""
+	}
+
+	switch dialogType {
+	case FileDialogTypeDirectory:
+		panel.Send(selSetCanChooseFiles, false)
+		panel.Send(selSetCanChooseDirectories, true)
+	case FileDialogTypeFile:
+		panel.Send(selSetCanChooseFiles, true)
+		panel.Send(selSetCanChooseDirectories, false)
+		if len(allowedExtensions) > 0 {
+			// Build NSArray of allowed file types
+			arrayClass := objc.GetClass("NSMutableArray")
+			arr := objc.ID(arrayClass).Send(selAlloc)
+			arr = arr.Send(selInit)
+			selAddObject := objc.RegisterName("addObject:")
+			for _, ext := range allowedExtensions {
+				arr.Send(selAddObject, nsString(ext))
+			}
+			panel.Send(selSetAllowedFileTypes, arr)
+		}
+	}
+
+	panel.Send(selSetAllowsMultiple, false)
+
+	// NSModalResponseOK = 1
+	result := objc.Send[int64](panel, selRunModal)
+	if result != 1 {
+		return ""
+	}
+
+	urls := panel.Send(selURLs)
+	if urls == 0 {
+		return ""
+	}
+
+	count := objc.Send[uint64](urls, selCount)
+	if count == 0 {
+		return ""
+	}
+
+	firstURL := objc.Send[objc.ID](urls, selObjectAtIndex, uint64(0))
+	if firstURL == 0 {
+		return ""
+	}
+
+	pathStr := firstURL.Send(selPath)
+	return nsStringToGo(pathStr)
 }
