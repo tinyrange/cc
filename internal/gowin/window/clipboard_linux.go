@@ -5,6 +5,7 @@ package window
 import (
 	"runtime"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -123,7 +124,7 @@ func (c *linuxClipboard) GetText() string {
 	const selectionNotify = 31
 	var ev [24]uint64 // xEvent buffer
 
-	// Simple polling loop - wait for the selection event.
+	// Polling loop - wait for the selection event.
 	for i := 0; i < 100; i++ { // ~100ms timeout
 		if xPendingClip(clipboardDpy) > 0 {
 			xNextEventClip(clipboardDpy, unsafe.Pointer(&ev[0]))
@@ -132,7 +133,7 @@ func (c *linuxClipboard) GetText() string {
 				break
 			}
 		}
-		// Small sleep would be ideal but we'll just spin briefly.
+		time.Sleep(time.Millisecond)
 	}
 
 	// Read the property.

@@ -245,6 +245,8 @@ func (c *Client) fetchToCache(ctx *registryContext, path string, accept []string
 		var bar *progressbar.ProgressBar
 
 		// Use progress callback if set, otherwise use terminal progress bar.
+		// These are mutually exclusive: callers that set a callback (e.g., GUI apps)
+		// handle progress display themselves and don't want terminal output.
 		if c.progressCallback != nil {
 			pw := &progressWriter{
 				w:        tmpFile,

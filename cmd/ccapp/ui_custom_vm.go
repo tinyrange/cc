@@ -99,8 +99,15 @@ func (s *CustomVMScreen) buildUI() {
 			Height:             36,
 		}).
 		OnSelect(func(index int) {
+			// Commit current input text before rebuilding
+			if s.pathInput != nil {
+				s.selectedPath = s.pathInput.Text()
+			}
+			if s.imageInput != nil {
+				s.imageName = s.imageInput.Text()
+			}
 			s.mode = CustomVMMode(index)
-			s.buildUI() // Rebuild to reflect mode change
+			s.buildUI()
 		})
 	s.tabBar.SetSelectedIndex(int(s.mode))
 	content.AddChild(s.tabBar, ui.DefaultFlexParams())

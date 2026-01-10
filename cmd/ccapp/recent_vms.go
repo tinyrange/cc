@@ -70,7 +70,9 @@ func (s *RecentVMsStore) save() error {
 	return os.WriteFile(s.path, data, 0o644)
 }
 
-// AddOrUpdate adds a new entry or updates an existing one
+// AddOrUpdate adds a new entry or updates an existing one.
+// Note: in-memory state is updated before save. If save fails, memory and disk
+// will diverge until the next successful save. This is acceptable for an MRU cache.
 func (s *RecentVMsStore) AddOrUpdate(vm RecentVM) error {
 	vm.LastUsed = time.Now()
 

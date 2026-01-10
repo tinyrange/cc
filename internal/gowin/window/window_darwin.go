@@ -1135,16 +1135,13 @@ func getDisplayScale() float32 {
 	return scale
 }
 
-// Global reference to the active Cocoa instance for dock menu callbacks.
-// This is needed because Objective-C callbacks cannot capture Go closures.
-var activeCocoa *Cocoa
-
 // SetDockMenu implements DockMenuSupport interface.
 // It sets up the dock menu with the given items and callback.
+// Note: macOS has one dock menu per application, not per window.
+// The last window to call SetDockMenu owns the dock menu.
 func (c *Cocoa) SetDockMenu(items []DockMenuItem, callback DockMenuCallback) {
 	c.dockMenuItems = items
 	c.dockMenuCallback = callback
-	activeCocoa = c
 
 	// Create or update the dock menu
 	c.rebuildDockMenu()
