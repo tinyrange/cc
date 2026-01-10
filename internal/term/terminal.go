@@ -15,6 +15,7 @@ import (
 
 	"github.com/tinyrange/cc/internal/gowin/graphics"
 	"github.com/tinyrange/cc/internal/gowin/text"
+	"github.com/tinyrange/cc/internal/gowin/ui"
 	"github.com/tinyrange/cc/internal/gowin/window"
 	"github.com/tinyrange/cc/internal/timeslice"
 )
@@ -82,6 +83,9 @@ type View struct {
 
 	// Cached layout values for mouse position calculations.
 	lastPadX2, lastPadY2 float32
+
+	// Context menu overlay.
+	contextMenu *ui.ContextMenu
 }
 
 // Point represents a cell position in the terminal grid.
@@ -464,6 +468,46 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 
 	// Raw input events from the platform window (preferred).
 	events := v.win.PlatformWindow().DrainInputEvents()
+
+	// Handle context menu events first (if menu is visible).
+	if v.contextMenu != nil && v.contextMenu.IsVisible() {
+		// Adjust menu position if it would go off-screen
+		v.contextMenu.PositionInWindow(float32(width), float32(height))
+
+		// Process events for context menu
+		evtCtx := &ui.EventContext{}
+		mx, my := f.CursorPos()
+		v.contextMenu.HandleEvent(evtCtx, &ui.MouseMoveEvent{X: mx, Y: my})
+
+		for _, ev := range events {
+			var consumed bool
+			switch ev.Type {
+			case window.InputEventMouseDown:
+				consumed = v.contextMenu.HandleEvent(evtCtx, &ui.MouseButtonEvent{
+					X: mx, Y: my, Button: ev.Button, Pressed: true,
+				})
+			case window.InputEventMouseUp:
+				consumed = v.contextMenu.HandleEvent(evtCtx, &ui.MouseButtonEvent{
+					X: mx, Y: my, Button: ev.Button, Pressed: false,
+				})
+			case window.InputEventKeyDown:
+				consumed = v.contextMenu.HandleEvent(evtCtx, &ui.KeyEvent{
+					Key: ev.Key, Pressed: true, Repeat: ev.Repeat, Mods: ev.Mods,
+				})
+			case window.InputEventKeyUp:
+				consumed = v.contextMenu.HandleEvent(evtCtx, &ui.KeyEvent{
+					Key: ev.Key, Pressed: false, Mods: ev.Mods,
+				})
+			}
+			_ = consumed
+		}
+
+		// If context menu is still visible, skip normal terminal event processing
+		if v.contextMenu != nil && v.contextMenu.IsVisible() {
+			events = nil // Clear events so terminal doesn't process them
+		}
+	}
+
 	sawRawText := false
 	for _, ev := range events {
 		switch ev.Type {
@@ -505,12 +549,17 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 					v.hasSelection = true
 				}
 			}
+			if ev.Button == window.ButtonRight {
+				// Show context menu on right-click
+				v.showContextMenu()
+			}
 
 		case window.InputEventKeyDown:
 			mod := toVTMods(ev.Mods)
 
-			// Handle Ctrl+C for copy (when there's a selection).
-			if (ev.Mods&window.ModCtrl) != 0 || (ev.Mods&window.ModSuper) != 0 {
+			// Handle Cmd+C/Cmd+V for copy/paste (macOS style).
+			// Ctrl+C must pass through to send SIGINT.
+			if (ev.Mods & window.ModSuper) != 0 {
 				if ev.Key == window.KeyC && v.hasSelection {
 					v.copySelection()
 					continue
@@ -635,6 +684,12 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 	v.renderGrid(stats, f, bgDefault, fgDefault, padX, padY, fontSize)
 
 	stats.Record(tsViewStepRenderGrid)
+
+	// Render context menu overlay (if visible).
+	if v.contextMenu != nil && v.contextMenu.IsVisible() {
+		drawCtx := &ui.DrawContext{Frame: f, Text: v.txt}
+		v.contextMenu.Draw(drawCtx)
+	}
 
 	// Clear dirty flags after rendering.
 	v.grid.ClearDirty()
@@ -1056,6 +1111,45 @@ func (v *View) pasteFromClipboard() {
 
 	// Send to terminal.
 	v.emu.SendText(text)
+}
+
+// showContextMenu displays a right-click context menu with Copy and Paste options.
+func (v *View) showContextMenu() {
+	const (
+		tagCopy  = 1
+		tagPaste = 2
+	)
+
+	// Check if clipboard has text for paste enablement
+	clipboard := window.GetClipboard()
+	hasPasteText := clipboard != nil && clipboard.GetText() != ""
+
+	items := []ui.ContextMenuItem{
+		{Label: "Copy", Tag: tagCopy, Enabled: v.hasSelection},
+		{Label: "Paste", Tag: tagPaste, Enabled: hasPasteText},
+	}
+
+	// Get cursor position in backing (pixel) coordinates and convert to logical
+	px, py := v.win.PlatformWindow().Cursor()
+	scale := v.win.PlatformWindow().Scale()
+	x, y := px/scale, py/scale
+
+	v.contextMenu = ui.NewContextMenu(items).
+		WithGraphicsWindow(v.win).
+		WithTextRenderer(v.txt).
+		OnSelect(func(tag int) {
+			switch tag {
+			case tagCopy:
+				v.copySelection()
+			case tagPaste:
+				v.pasteFromClipboard()
+			}
+			v.contextMenu = nil
+		}).
+		OnDismiss(func() {
+			v.contextMenu = nil
+		})
+	v.contextMenu.Show(x, y)
 }
 
 // ClearSelection clears the current selection.

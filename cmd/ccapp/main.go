@@ -323,7 +323,7 @@ func (app *Application) handleDockMenuClick(tag int) {
 		// Recent VM
 		index := tag - 100
 		recent := app.recentVMs.GetRecent()
-		if index < len(recent) {
+		if index >= 0 && index < len(recent) {
 			vm := recent[index]
 			app.startCustomVM(vm.SourceType, vm.SourcePath, vm.NetworkEnabled)
 		}

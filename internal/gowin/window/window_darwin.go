@@ -168,6 +168,7 @@ var (
 	selPath                    objc.SEL
 	selCount                   objc.SEL
 	selObjectAtIndex           objc.SEL
+
 )
 
 // Subset of NSEventType values we care about.
@@ -548,6 +549,7 @@ func loadSelectors() {
 	selPath = objc.RegisterName("path")
 	selCount = objc.RegisterName("count")
 	selObjectAtIndex = objc.RegisterName("objectAtIndex:")
+
 }
 
 func nsString(v string) objc.ID {
@@ -1245,3 +1247,4 @@ func (c *Cocoa) ShowOpenPanel(dialogType FileDialogType, allowedExtensions []str
 	pathStr := firstURL.Send(selPath)
 	return nsStringToGo(pathStr)
 }
+
