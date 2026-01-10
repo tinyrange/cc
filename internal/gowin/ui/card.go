@@ -3,6 +3,7 @@ package ui
 import (
 	"image/color"
 
+	"github.com/tinyrange/cc/internal/gowin/graphics"
 	"github.com/tinyrange/cc/internal/gowin/window"
 )
 
@@ -12,6 +13,7 @@ type CardStyle struct {
 	BorderColor     color.Color
 	BorderWidth     float32
 	Padding         EdgeInsets
+	CornerRadius    float32 // 0 = square corners
 }
 
 // DefaultCardStyle returns default card styling.
@@ -39,6 +41,12 @@ type Card struct {
 	// Fixed size (0 = auto)
 	fixedWidth  float32
 	fixedHeight float32
+
+	// Rounded corner rendering
+	gfxWindow    graphics.Window
+	shapeBuilder *graphics.ShapeBuilder
+	lastBounds   Rect        // Track bounds changes for mesh updates
+	lastBgColor  color.Color // Track color changes for hover updates
 }
 
 // NewCard creates a new card.
@@ -79,6 +87,16 @@ func (c *Card) WithBackground(col color.Color) *Card {
 func (c *Card) WithBorder(col color.Color, width float32) *Card {
 	c.style.BorderColor = col
 	c.style.BorderWidth = width
+	return c
+}
+
+func (c *Card) WithCornerRadius(radius float32) *Card {
+	c.style.CornerRadius = radius
+	return c
+}
+
+func (c *Card) WithGraphicsWindow(w graphics.Window) *Card {
+	c.gfxWindow = w
 	return c
 }
 
@@ -163,11 +181,17 @@ func (c *Card) Draw(ctx *DrawContext) {
 
 	// Background
 	if style.BackgroundColor != nil {
-		ctx.Frame.RenderQuad(bounds.X, bounds.Y, bounds.W, bounds.H, nil, style.BackgroundColor)
+		if style.CornerRadius > 0 && c.gfxWindow != nil {
+			// Use rounded rectangle rendering
+			c.drawRoundedBackground(ctx, bounds, style)
+		} else {
+			// Fallback to simple quad
+			ctx.Frame.RenderQuad(bounds.X, bounds.Y, bounds.W, bounds.H, nil, style.BackgroundColor)
+		}
 	}
 
-	// Border
-	if style.BorderWidth > 0 && style.BorderColor != nil {
+	// Border (only for non-rounded cards)
+	if style.CornerRadius == 0 && style.BorderWidth > 0 && style.BorderColor != nil {
 		bw := style.BorderWidth
 		bc := style.BorderColor
 		// Top
@@ -184,6 +208,37 @@ func (c *Card) Draw(ctx *DrawContext) {
 	if c.content != nil {
 		c.content.Draw(ctx)
 	}
+}
+
+func (c *Card) drawRoundedBackground(ctx *DrawContext, bounds Rect, style CardStyle) {
+	// Create shape builder if needed
+	if c.shapeBuilder == nil {
+		segments := graphics.SegmentsForRadius(style.CornerRadius)
+		var err error
+		c.shapeBuilder, err = graphics.NewShapeBuilder(c.gfxWindow, segments)
+		if err != nil {
+			// Fallback to quad
+			ctx.Frame.RenderQuad(bounds.X, bounds.Y, bounds.W, bounds.H, nil, style.BackgroundColor)
+			return
+		}
+	}
+
+	// Update geometry if bounds or color changed (color changes for hover)
+	if bounds != c.lastBounds || style.BackgroundColor != c.lastBgColor {
+		shapeStyle := graphics.ShapeStyle{
+			FillColor: style.BackgroundColor,
+		}
+		c.shapeBuilder.UpdateRoundedRect(
+			bounds.X, bounds.Y, bounds.W, bounds.H,
+			graphics.UniformRadius(style.CornerRadius),
+			shapeStyle,
+		)
+		c.lastBounds = bounds
+		c.lastBgColor = style.BackgroundColor
+	}
+
+	// Render the mesh
+	ctx.Frame.RenderMesh(c.shapeBuilder.Mesh(), graphics.DrawOptions{})
 }
 
 func (c *Card) HandleEvent(ctx *EventContext, event Event) bool {

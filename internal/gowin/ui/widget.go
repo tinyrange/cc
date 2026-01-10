@@ -146,3 +146,24 @@ func ColorWithAlpha(c color.Color, alpha uint8) color.Color {
 		A: alpha,
 	}
 }
+
+// LerpColor linearly interpolates between two colors.
+// t should be in the range [0, 1], where 0 returns a and 1 returns b.
+func LerpColor(a, b color.Color, t float32) color.Color {
+	if t <= 0 {
+		return a
+	}
+	if t >= 1 {
+		return b
+	}
+
+	ar, ag, ab, aa := a.RGBA()
+	br, bg, bb, ba := b.RGBA()
+
+	return color.RGBA{
+		R: uint8((float32(ar>>8)*(1-t) + float32(br>>8)*t)),
+		G: uint8((float32(ag>>8)*(1-t) + float32(bg>>8)*t)),
+		B: uint8((float32(ab>>8)*(1-t) + float32(bb>>8)*t)),
+		A: uint8((float32(aa>>8)*(1-t) + float32(ba>>8)*t)),
+	}
+}

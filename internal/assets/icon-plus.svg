@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- Horizontal bar -->
+  <polygon points="5,10.5 19,10.5 19,13.5 5,13.5" fill="white"/>
+  <!-- Vertical bar -->
+  <polygon points="10.5,5 13.5,5 13.5,19 10.5,19" fill="white"/>
+</svg>

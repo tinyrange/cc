@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/tinyrange/cc/internal/assets"
@@ -39,6 +40,7 @@ const (
 	modeLoading
 	modeError
 	modeTerminal
+	modeCustomVM
 )
 
 // discoveredBundle holds metadata and path for a discovered bundle.
@@ -90,6 +92,11 @@ type Application struct {
 	text   *text.Renderer
 	logo   *graphics.SVG
 
+	// Blur effect for dialog backgrounds
+	blurEffect        *graphics.BlurEffect
+	blurredBackground graphics.Texture
+	blurCaptured      bool
+
 	start time.Time
 
 	// Logging
@@ -101,6 +108,7 @@ type Application struct {
 	loadingScreen  *LoadingScreen
 	errorScreen    *ErrorScreen
 	terminalScreen *TerminalScreen
+	customVMScreen *CustomVMScreen
 
 	// Starlark UI (optional override)
 	starEngine         *starui.Engine
@@ -118,9 +126,11 @@ type Application struct {
 	thumbDragDX   float32
 
 	// Boot loading state
-	bootCh      chan bootResult
-	bootStarted time.Time
-	bootName    string
+	bootCh       chan bootResult
+	bootStarted  time.Time
+	bootName     string
+	bootProgress oci.DownloadProgress // Current download progress
+	bootProgressMu sync.Mutex          // Protects bootProgress
 
 	// Error state (full-screen)
 	errMsg string
@@ -134,6 +144,9 @@ type Application struct {
 
 	// Running VM (when in terminal mode)
 	running *runningVM
+
+	// Recent VMs storage
+	recentVMs *RecentVMsStore
 }
 
 const terminalTopBarH = float32(32)
@@ -147,16 +160,6 @@ type rect struct {
 
 func (r rect) contains(px, py float32) bool {
 	return px >= r.x && px <= r.x+r.w && py >= r.y && py <= r.y+r.h
-}
-
-func clamp(v, lo, hi float32) float32 {
-	if v < lo {
-		return lo
-	}
-	if v > hi {
-		return hi
-	}
-	return v
 }
 
 // discoverBundles finds all bundle directories in the given path.
@@ -254,10 +257,76 @@ func openDirectory(path string) error {
 }
 
 // openLogs opens the log directory in the system file manager.
+func (app *Application) clearBlurCapture() {
+	app.blurCaptured = false
+	app.blurredBackground = nil
+}
+
 func (app *Application) openLogs() {
 	slog.Info("open logs requested", "log_dir", app.logDir)
 	if err := openDirectory(app.logDir); err != nil {
 		slog.Error("failed to open logs directory", "log_dir", app.logDir, "error", err)
+	}
+}
+
+// updateDockMenu updates the dock menu with recent VMs
+func (app *Application) updateDockMenu() {
+	if app.window == nil {
+		return
+	}
+
+	dm, ok := app.window.PlatformWindow().(window.DockMenuSupport)
+	if !ok {
+		return
+	}
+
+	var items []window.DockMenuItem
+
+	// Add recent VMs
+	if app.recentVMs != nil {
+		for i, vm := range app.recentVMs.GetRecent() {
+			items = append(items, window.DockMenuItem{
+				Title:   vm.Name,
+				Tag:     100 + i, // Tags 100-104 for recent VMs
+				Enabled: true,
+			})
+		}
+	}
+
+	// Separator
+	if len(items) > 0 {
+		items = append(items, window.DockMenuItem{Separator: true})
+	}
+
+	// New Custom VM option
+	items = append(items, window.DockMenuItem{
+		Title:   "New Custom VM...",
+		Tag:     1,
+		Enabled: true,
+	})
+
+	dm.SetDockMenu(items, app.handleDockMenuClick)
+}
+
+// handleDockMenuClick handles dock menu item clicks
+func (app *Application) handleDockMenuClick(tag int) {
+	slog.Info("dock menu click", "tag", tag)
+
+	if tag == 1 {
+		// New Custom VM
+		app.customVMScreen = NewCustomVMScreen(app)
+		app.mode = modeCustomVM
+		return
+	}
+
+	if tag >= 100 && tag < 105 && app.recentVMs != nil {
+		// Recent VM
+		index := tag - 100
+		recent := app.recentVMs.GetRecent()
+		if index >= 0 && index < len(recent) {
+			vm := recent[index]
+			app.startCustomVM(vm.SourceType, vm.SourcePath, vm.NetworkEnabled)
+		}
 	}
 }
 
@@ -460,7 +529,15 @@ func (app *Application) Run() error {
 	}
 
 	app.window.SetClear(true)
-	app.window.SetClearColor(color.RGBA{R: 10, G: 10, B: 10, A: 255})
+	app.window.SetClearColor(color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 255}) // Tokyo Night background
+
+	// Initialize blur effect for dialog overlays
+	blurEffect, err := app.window.NewBlurEffect()
+	if err != nil {
+		slog.Warn("failed to create blur effect", "error", err)
+	} else {
+		app.blurEffect = blurEffect
+	}
 
 	app.start = time.Now()
 	app.selectedIndex = -1
@@ -474,6 +551,18 @@ func (app *Application) Run() error {
 		slog.Warn("failed to discover bundles", "error", err)
 	}
 	slog.Info("bundle discovery complete", "bundles_dir", bundlesDir, "bundle_count", len(app.bundles))
+
+	// Initialize recent VMs store
+	recentStore, err := NewRecentVMsStore()
+	if err != nil {
+		slog.Warn("failed to initialize recent VMs store", "error", err)
+	} else {
+		app.recentVMs = recentStore
+		slog.Info("loaded recent VMs store", "count", len(recentStore.GetRecent()))
+	}
+
+	// Set up dock menu (macOS only)
+	app.updateDockMenu()
 
 	// Try to load app.star for custom UI
 	if err := app.loadStarlarkUI(); err != nil {
@@ -496,6 +585,8 @@ func (app *Application) Run() error {
 			return app.renderError(f)
 		case modeTerminal:
 			return app.renderTerminal(f)
+		case modeCustomVM:
+			return app.renderCustomVM(f)
 		default:
 			return nil
 		}
@@ -567,6 +658,19 @@ func (app *Application) renderError(f graphics.Frame) error {
 	return app.errorScreen.Render(f)
 }
 
+func (app *Application) renderCustomVM(f graphics.Frame) error {
+	if app.customVMScreen == nil {
+		app.customVMScreen = NewCustomVMScreen(app)
+	}
+
+	// Render launcher as background without processing events
+	// (events should go to the custom VM dialog instead)
+	app.launcherScreen.RenderBackground(f)
+
+	// Render the custom VM dialog on top
+	return app.customVMScreen.Render(f)
+}
+
 func (app *Application) renderTerminal(f graphics.Frame) error {
 	if app.running == nil || app.running.termView == nil {
 		app.mode = modeLauncher
@@ -577,8 +681,15 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 	app.text.SetViewport(int32(w), int32(h))
 	winW := float32(w)
 
+	// Tokyo Night theme colors
+	topBarColor := color.RGBA{R: 0x16, G: 0x16, B: 0x1e, A: 255}    // #16161e
+	btnNormal := color.RGBA{R: 0x24, G: 0x28, B: 0x3b, A: 255}      // #24283b
+	btnHover := color.RGBA{R: 0x3d, G: 0x59, B: 0xa1, A: 255}       // #3d59a1
+	btnPressed := color.RGBA{R: 0x28, G: 0x34, B: 0x4a, A: 255}     // #28344a
+	textColor := color.RGBA{R: 0xa9, G: 0xb1, B: 0xd6, A: 255}      // #a9b1d6
+
 	// Top bar with Exit button.
-	f.RenderQuad(0, 0, winW, terminalTopBarH, nil, color.RGBA{R: 22, G: 22, B: 22, A: 255})
+	f.RenderQuad(0, 0, winW, terminalTopBarH, nil, topBarColor)
 
 	mx, my := f.CursorPos()
 	leftDown := f.GetButtonState(window.ButtonLeft).IsDown()
@@ -587,15 +698,15 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 
 	backRect := rect{x: 20, y: 6, w: 70, h: terminalTopBarH - 12}
 	backHover := backRect.contains(mx, my)
-	backColor := color.RGBA{R: 40, G: 40, B: 40, A: 255}
+	backColor := btnNormal
 	if backHover {
-		backColor = color.RGBA{R: 56, G: 56, B: 56, A: 255}
+		backColor = btnHover
 	}
 	if backHover && leftDown {
-		backColor = color.RGBA{R: 72, G: 72, B: 72, A: 255}
+		backColor = btnPressed
 	}
 	f.RenderQuad(backRect.x, backRect.y, backRect.w, backRect.h, nil, backColor)
-	app.text.RenderText("Exit", backRect.x+14, 22, 14, graphics.ColorWhite)
+	app.text.RenderText("Exit", backRect.x+14, 22, 14, textColor)
 
 	if justPressed && backRect.contains(mx, my) {
 		slog.Info("exit requested; stopping VM")
@@ -606,15 +717,15 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 	// Logs button (top-right).
 	logRect := rect{x: winW - 150, y: 6, w: 120, h: terminalTopBarH - 12}
 	logHover := logRect.contains(mx, my)
-	logColor := color.RGBA{R: 40, G: 40, B: 40, A: 255}
+	logColor := btnNormal
 	if logHover {
-		logColor = color.RGBA{R: 56, G: 56, B: 56, A: 255}
+		logColor = btnHover
 	}
 	if logHover && leftDown {
-		logColor = color.RGBA{R: 72, G: 72, B: 72, A: 255}
+		logColor = btnPressed
 	}
 	f.RenderQuad(logRect.x, logRect.y, logRect.w, logRect.h, nil, logColor)
-	app.text.RenderText("Debug Logs", logRect.x+26, 22, 14, graphics.ColorWhite)
+	app.text.RenderText("Debug Logs", logRect.x+26, 22, 14, textColor)
 	if justPressed && logHover {
 		slog.Info("open logs requested", "log_dir", app.logDir)
 		if err := openDirectory(app.logDir); err != nil {
@@ -657,6 +768,17 @@ func (app *Application) startBootBundle(index int) {
 	name := b.Meta.Name
 	if name == "" || name == "{{name}}" {
 		name = filepath.Base(b.Dir)
+	}
+
+	// Record to recent VMs
+	if app.recentVMs != nil {
+		app.recentVMs.AddOrUpdate(RecentVM{
+			Name:           name,
+			SourceType:     VMSourceBundle,
+			SourcePath:     b.Dir,
+			NetworkEnabled: b.Meta.Boot.Network,
+		})
+		app.updateDockMenu()
 	}
 
 	hvArch, err := parseArchitecture(runtime.GOARCH)
@@ -923,6 +1045,200 @@ func (app *Application) stopVM() {
 	app.mode = modeLauncher
 	app.selectedIndex = -1
 	slog.Info("VM stopped; returned to launcher")
+}
+
+// startCustomVM starts a VM from a custom source (tarball, image name, or bundle directory)
+func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string, network bool) {
+	if app.bootCh != nil {
+		return // Already booting
+	}
+
+	hvArch, err := parseArchitecture(runtime.GOARCH)
+	if err != nil {
+		slog.Error("failed to determine architecture", "goarch", runtime.GOARCH, "error", err)
+		app.showError(err)
+		return
+	}
+
+	displayName := filepath.Base(sourcePath)
+	if sourceType == VMSourceImageName {
+		displayName = sourcePath
+	}
+
+	app.bootStarted = time.Now()
+	app.bootName = displayName
+	app.mode = modeLoading
+
+	ch := make(chan bootResult, 1)
+	app.bootCh = ch
+
+	// Create progress callback for image downloads
+	progressCallback := func(progress oci.DownloadProgress) {
+		app.bootProgressMu.Lock()
+		app.bootProgress = progress
+		app.bootProgressMu.Unlock()
+	}
+
+	go func(srcType VMSourceType, srcPath string, net bool, arch hv.CpuArchitecture, out chan<- bootResult, progressCb oci.ProgressCallback) {
+		var prep *bootPrep
+		var err error
+
+		switch srcType {
+		case VMSourceBundle:
+			// Load bundle and use existing logic
+			meta, metaErr := bundle.LoadMetadata(srcPath)
+			if metaErr != nil {
+				out <- bootResult{err: metaErr}
+				return
+			}
+			// Override network setting
+			meta.Boot.Network = net
+			prep, err = prepareBootBundle(discoveredBundle{Dir: srcPath, Meta: meta}, arch)
+
+		case VMSourceTarball:
+			prep, err = prepareFromTarball(srcPath, net, arch)
+
+		case VMSourceImageName:
+			prep, err = prepareFromImageName(srcPath, net, arch, progressCb)
+
+		default:
+			err = fmt.Errorf("unknown source type: %s", srcType)
+		}
+
+		out <- bootResult{prep: prep, err: err}
+	}(sourceType, sourcePath, network, hvArch, ch, progressCallback)
+}
+
+// prepareFromTarball loads a VM from an OCI tarball
+func prepareFromTarball(tarPath string, network bool, hvArch hv.CpuArchitecture) (*bootPrep, error) {
+	slog.Info("loading VM from tarball", "path", tarPath, "arch", hvArch)
+
+	client, err := oci.NewClient("")
+	if err != nil {
+		return nil, fmt.Errorf("create OCI client: %w", err)
+	}
+
+	img, err := client.LoadFromTar(tarPath, hvArch)
+	if err != nil {
+		return nil, fmt.Errorf("load tarball: %w", err)
+	}
+
+	return prepareFromImage(img, network, hvArch)
+}
+
+// prepareFromImageName pulls a container image and prepares it for boot
+func prepareFromImageName(imageName string, network bool, hvArch hv.CpuArchitecture, progressCallback oci.ProgressCallback) (*bootPrep, error) {
+	slog.Info("pulling container image", "image", imageName, "arch", hvArch)
+
+	client, err := oci.NewClient("")
+	if err != nil {
+		return nil, fmt.Errorf("create OCI client: %w", err)
+	}
+
+	// Set progress callback if provided
+	if progressCallback != nil {
+		client.SetProgressCallback(progressCallback)
+	}
+
+	img, err := client.PullForArch(imageName, hvArch)
+	if err != nil {
+		return nil, fmt.Errorf("pull image: %w", err)
+	}
+
+	return prepareFromImage(img, network, hvArch)
+}
+
+// prepareFromImage prepares a VM from an already-loaded OCI image
+func prepareFromImage(img *oci.Image, network bool, hvArch hv.CpuArchitecture) (_ *bootPrep, retErr error) {
+	prep := &bootPrep{hvArch: hvArch}
+	defer func() {
+		if retErr != nil {
+			if prep.hypervisor != nil {
+				_ = prep.hypervisor.Close()
+			}
+			if prep.netBackend != nil {
+				prep.netBackend.Close()
+			}
+			if prep.containerFS != nil {
+				prep.containerFS.Close()
+			}
+		}
+	}()
+
+	// Determine command from image
+	execCmd := img.Command(nil)
+	if len(execCmd) == 0 {
+		return nil, fmt.Errorf("image has no entrypoint/cmd")
+	}
+	slog.Info("container command", "cmd", execCmd)
+
+	// Create container filesystem
+	containerFS, err := oci.NewContainerFS(img)
+	if err != nil {
+		return nil, fmt.Errorf("create container filesystem: %w", err)
+	}
+	prep.containerFS = containerFS
+
+	// Resolve command path
+	pathEnv := extractInitialPath(img.Config.Env)
+	workDir := containerWorkDir(img)
+	execCmd, err = resolveCommandPath(containerFS, execCmd, pathEnv, workDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve command: %w", err)
+	}
+	slog.Info("resolved command path", "exec", execCmd, "work_dir", workDir)
+	prep.execCmd = execCmd
+	prep.env = img.Config.Env
+	prep.workDir = workDir
+
+	// Create VirtioFS backend
+	fsBackend := vfs.NewVirtioFsBackendWithAbstract()
+	if err := fsBackend.SetAbstractRoot(containerFS); err != nil {
+		return nil, fmt.Errorf("set container filesystem as root: %w", err)
+	}
+	prep.fsBackend = fsBackend
+
+	// Create hypervisor
+	h, err := factory.OpenWithArchitecture(hvArch)
+	if err != nil {
+		return nil, fmt.Errorf("create hypervisor: %w", err)
+	}
+	prep.hypervisor = h
+
+	// Load kernel
+	kernelLoader, err := kernel.LoadForArchitecture(hvArch)
+	if err != nil {
+		return nil, fmt.Errorf("load kernel: %w", err)
+	}
+	slog.Info("kernel loader ready")
+	prep.kernelLoader = kernelLoader
+
+	// VM options - use defaults
+	prep.cpus = 1
+	prep.memoryMB = 1024
+	prep.network = network
+	prep.dmesg = false
+	prep.exec = true
+	slog.Info("vm config", "cpus", prep.cpus, "memory_mb", prep.memoryMB, "network", prep.network)
+
+	if prep.network {
+		slog.Info("network enabled; starting netstack DNS server")
+		netBackend := netstack.New(slog.Default())
+		if err := netBackend.StartDNSServer(); err != nil {
+			return nil, fmt.Errorf("start DNS server: %w", err)
+		}
+		prep.netBackend = netBackend
+
+		mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
+		virtioNet, err := virtio.NewNetstackBackend(netBackend, mac)
+		if err != nil {
+			return nil, fmt.Errorf("create netstack backend: %w", err)
+		}
+		prep.virtioNet = virtioNet
+	}
+
+	slog.Info("VM prep from image complete")
+	return prep, nil
 }
 
 func parseArchitecture(arch string) (hv.CpuArchitecture, error) {

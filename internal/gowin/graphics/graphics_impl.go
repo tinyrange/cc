@@ -395,6 +395,15 @@ func (f glFrame) TextInput() string {
 }
 
 func (f glFrame) RenderQuad(x, y, width, height float32, tex Texture, c color.Color) {
+	f.renderQuadWithUV(x, y, width, height, tex, c, false)
+}
+
+// RenderFBOTexture renders an FBO texture with flipped V coordinates.
+func (f glFrame) RenderFBOTexture(x, y, width, height float32, tex Texture, c color.Color) {
+	f.renderQuadWithUV(x, y, width, height, tex, c, true)
+}
+
+func (f glFrame) renderQuadWithUV(x, y, width, height float32, tex Texture, c color.Color, flipV bool) {
 	var t *glTexture
 	if tex == nil {
 		t = f.w.getWhiteTexture()
@@ -420,16 +429,31 @@ func (f glFrame) RenderQuad(x, y, width, height float32, tex Texture, c color.Co
 	f.w.gl.UseProgram(f.w.shaderProgram)
 	f.w.gl.UniformMatrix4fv(f.w.modelUniform, 1, false, &model[0])
 
-	// Update vertex buffer with quad data (2 triangles)
-	vertices := [6 * 8]float32{
-		// Triangle 1
-		x, y, 0, 0, rgba[0], rgba[1], rgba[2], rgba[3], // top-left
-		x + width, y, 1, 0, rgba[0], rgba[1], rgba[2], rgba[3], // top-right
-		x, y + height, 0, 1, rgba[0], rgba[1], rgba[2], rgba[3], // bottom-left
-		// Triangle 2
-		x + width, y, 1, 0, rgba[0], rgba[1], rgba[2], rgba[3], // top-right
-		x + width, y + height, 1, 1, rgba[0], rgba[1], rgba[2], rgba[3], // bottom-right
-		x, y + height, 0, 1, rgba[0], rgba[1], rgba[2], rgba[3], // bottom-left
+	var vertices [6 * 8]float32
+	if flipV {
+		// Flipped V for FBO textures: read from (0,1) at top, (0,0) at bottom
+		vertices = [6 * 8]float32{
+			// Triangle 1
+			x, y, 0, 1, rgba[0], rgba[1], rgba[2], rgba[3],                         // top-left
+			x + width, y, 1, 1, rgba[0], rgba[1], rgba[2], rgba[3],                 // top-right
+			x, y + height, 0, 0, rgba[0], rgba[1], rgba[2], rgba[3],                // bottom-left
+			// Triangle 2
+			x + width, y, 1, 1, rgba[0], rgba[1], rgba[2], rgba[3],                 // top-right
+			x + width, y + height, 1, 0, rgba[0], rgba[1], rgba[2], rgba[3],        // bottom-right
+			x, y + height, 0, 0, rgba[0], rgba[1], rgba[2], rgba[3],                // bottom-left
+		}
+	} else {
+		// Standard UV for normal textures: (0,0) at top-left
+		vertices = [6 * 8]float32{
+			// Triangle 1
+			x, y, 0, 0, rgba[0], rgba[1], rgba[2], rgba[3],                         // top-left
+			x + width, y, 1, 0, rgba[0], rgba[1], rgba[2], rgba[3],                 // top-right
+			x, y + height, 0, 1, rgba[0], rgba[1], rgba[2], rgba[3],                // bottom-left
+			// Triangle 2
+			x + width, y, 1, 0, rgba[0], rgba[1], rgba[2], rgba[3],                 // top-right
+			x + width, y + height, 1, 1, rgba[0], rgba[1], rgba[2], rgba[3],        // bottom-right
+			x, y + height, 0, 1, rgba[0], rgba[1], rgba[2], rgba[3],                // bottom-left
+		}
 	}
 
 	f.w.gl.BindBuffer(glpkg.ArrayBuffer, f.w.vbo)
