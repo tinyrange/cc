@@ -97,3 +97,11 @@ You can run tests with...
 - `./tools/build.go -runtest <test>`: Runs a test in the `tests/` dir. These are Dockerfiles meant for advanced tests.
   - Notably...
     - `sway`. When run with `./tools/build.go -runtest sway -- -exec -gpu` should start a window with a Sway desktop.
+
+## Special Thanks
+
+- https://github.com/microsoft/openvmm for some devices and as a basis for the Windows support.
+- https://github.com/tokyo-night/tokyo-night-vscode-theme for the color theme used by ccapp.
+- https://gvisor.dev/ as the inspiration for the networking stack (and testing code).
+- https://pkg.go.dev/github.com/charmbracelet/x/vt for the terminal implementation.
+- https://github.com/TheOnly92/fontstash.go for the basic font rendering code.
