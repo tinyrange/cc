@@ -58,7 +58,7 @@ func (s *CustomVMScreen) buildUI() {
 	stack := ui.NewStack()
 
 	// Semi-transparent overlay to darken the blurred background slightly
-	stack.AddChild(ui.NewBox(color.RGBA{R: 0, G: 0, B: 0, A: 100}))
+	stack.AddChild(ui.NewBox(color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 180})) // Tokyo Night with alpha
 
 	// Dialog constants
 	const dialogWidth float32 = 500
@@ -66,10 +66,10 @@ func (s *CustomVMScreen) buildUI() {
 	const contentWidth float32 = dialogWidth - 48 // minus padding
 	const cornerRadius float32 = 12
 
-	// Dialog colors (dark theme matching screenshot)
-	dialogBg := color.RGBA{R: 50, G: 50, B: 52, A: 255}
-	textColorPrimary := graphics.ColorWhite
-	textColorSecondary := color.RGBA{R: 180, G: 180, B: 180, A: 255}
+	// Dialog colors (Tokyo Night theme)
+	dialogBg := colorCardBg
+	textColorPrimary := colorTextPrimary
+	textColorSecondary := colorTextSecondary
 
 	// Create content first
 	content := ui.Column().WithPadding(ui.All(24)).WithGap(20)
@@ -89,11 +89,11 @@ func (s *CustomVMScreen) buildUI() {
 			BackgroundColor:    color.RGBA{R: 0, G: 0, B: 0, A: 0}, // Transparent
 			TextColor:          textColorSecondary,
 			TextColorSelected:  textColorPrimary,
-			TextColorHovered:   color.RGBA{R: 220, G: 220, B: 220, A: 255},
+			TextColorHovered:   colorTextPrimary,
 			TextSize:           14,
 			TabPadding:         ui.Symmetric(20, 10),
 			TabGap:             0,
-			UnderlineColor:     color.RGBA{R: 100, G: 140, B: 200, A: 255},
+			UnderlineColor:     colorAccent, // Tokyo Night blue
 			UnderlineThickness: 2,
 			UnderlineInset:     0,
 			Height:             36,
@@ -184,10 +184,10 @@ func (s *CustomVMScreen) buildUI() {
 		WithStyle(ui.ToggleStyle{
 			TrackWidth:        44,
 			TrackHeight:       24,
-			TrackColorOn:      color.RGBA{R: 52, G: 120, B: 246, A: 255}, // Blue
-			TrackColorOff:     color.RGBA{R: 80, G: 80, B: 80, A: 255},   // Gray
+			TrackColorOn:      colorAccent,   // Tokyo Night blue
+			TrackColorOff:     colorBtnNormal, // Tokyo Night storm
 			ThumbSize:         20,
-			ThumbColor:        graphics.ColorWhite,
+			ThumbColor:        colorTextPrimary,
 			ThumbPadding:      2,
 			AnimationDuration: 200 * time.Millisecond,
 		}).

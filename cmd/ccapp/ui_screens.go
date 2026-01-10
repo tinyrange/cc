@@ -11,19 +11,24 @@ import (
 	"github.com/tinyrange/cc/internal/gowin/ui"
 )
 
-// UI color constants matching the original design
+// Tokyo Night color theme
+// Based on https://github.com/enkia/tokyo-night-vscode-theme
 var (
-	colorBackground    = color.RGBA{R: 10, G: 10, B: 10, A: 255}
-	colorTopBar        = color.RGBA{R: 22, G: 22, B: 22, A: 255}
-	colorBtnNormal     = color.RGBA{R: 40, G: 40, B: 40, A: 255}
-	colorBtnHover      = color.RGBA{R: 56, G: 56, B: 56, A: 255}
-	colorCardBg        = color.RGBA{R: 28, G: 28, B: 30, A: 255}
-	colorCardBgHover   = color.RGBA{R: 44, G: 44, B: 46, A: 255}
-	colorOverlay       = color.RGBA{R: 10, G: 10, B: 10, A: 200}
-	colorAccent        = color.RGBA{R: 52, G: 120, B: 246, A: 255}   // Blue accent
-	colorAccentHover   = color.RGBA{R: 72, G: 140, B: 255, A: 255}   // Blue accent hover
-	colorAccentPressed = color.RGBA{R: 42, G: 100, B: 220, A: 255}   // Blue accent pressed
-	colorTextSecondary = color.RGBA{R: 160, G: 160, B: 160, A: 255}  // Secondary text
+	colorBackground    = color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 255} // #1a1b26
+	colorTopBar        = color.RGBA{R: 0x16, G: 0x16, B: 0x1e, A: 255} // #16161e
+	colorBtnNormal     = color.RGBA{R: 0x24, G: 0x28, B: 0x3b, A: 255} // #24283b (storm)
+	colorBtnHover      = color.RGBA{R: 0x3d, G: 0x59, B: 0xa1, A: 255} // #3d59a1 (active border)
+	colorCardBg        = color.RGBA{R: 0x1f, G: 0x23, B: 0x35, A: 255} // #1f2335
+	colorCardBgHover   = color.RGBA{R: 0x28, G: 0x34, B: 0x4a, A: 255} // #28344a (selection)
+	colorOverlay       = color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 220} // #1a1b26 with alpha
+	colorAccent        = color.RGBA{R: 0x7a, G: 0xa2, B: 0xf7, A: 255} // #7aa2f7 (blue)
+	colorAccentHover   = color.RGBA{R: 0x7d, G: 0xcf, B: 0xff, A: 255} // #7dcfff (cyan)
+	colorAccentPressed = color.RGBA{R: 0x3d, G: 0x59, B: 0xa1, A: 255} // #3d59a1
+	colorTextPrimary   = color.RGBA{R: 0xa9, G: 0xb1, B: 0xd6, A: 255} // #a9b1d6 (foreground)
+	colorTextSecondary = color.RGBA{R: 0x78, G: 0x7c, B: 0x99, A: 255} // #787c99
+	colorGreen         = color.RGBA{R: 0x9e, G: 0xce, B: 0x6a, A: 255} // #9ece6a
+	colorRed           = color.RGBA{R: 0xf7, G: 0x76, B: 0x8e, A: 255} // #f7768e
+	colorYellow        = color.RGBA{R: 0xe0, G: 0xaf, B: 0x68, A: 255} // #e0af68
 )
 
 // UI constants
@@ -39,9 +44,9 @@ func topBarButtonStyle() ui.ButtonStyle {
 	return ui.ButtonStyle{
 		BackgroundNormal:   colorBtnNormal,
 		BackgroundHovered:  colorBtnHover,
-		BackgroundPressed:  color.RGBA{R: 72, G: 72, B: 72, A: 255},
-		BackgroundDisabled: color.RGBA{R: 30, G: 30, B: 30, A: 255},
-		TextColor:          graphics.ColorWhite,
+		BackgroundPressed:  colorAccentPressed,
+		BackgroundDisabled: color.RGBA{R: 0x16, G: 0x16, B: 0x1e, A: 255},
+		TextColor:          colorTextPrimary,
 		TextSize:           13,
 		Padding:            ui.Symmetric(10, 6),
 		MinWidth:           60,
@@ -78,8 +83,8 @@ func primaryButtonStyle() ui.ButtonStyle {
 		BackgroundNormal:   colorAccent,
 		BackgroundHovered:  colorAccentHover,
 		BackgroundPressed:  colorAccentPressed,
-		BackgroundDisabled: color.RGBA{R: 80, G: 80, B: 80, A: 255},
-		TextColor:          graphics.ColorWhite,
+		BackgroundDisabled: color.RGBA{R: 0x41, G: 0x48, B: 0x68, A: 255}, // #414868
+		TextColor:          color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 255}, // Dark text on light bg
 		TextSize:           15,
 		Padding:            ui.Symmetric(20, 12),
 		MinWidth:           120,
@@ -93,9 +98,9 @@ func secondaryButtonStyle() ui.ButtonStyle {
 	return ui.ButtonStyle{
 		BackgroundNormal:   colorBtnNormal,
 		BackgroundHovered:  colorBtnHover,
-		BackgroundPressed:  color.RGBA{R: 72, G: 72, B: 72, A: 255},
-		BackgroundDisabled: color.RGBA{R: 30, G: 30, B: 30, A: 255},
-		TextColor:          graphics.ColorWhite,
+		BackgroundPressed:  colorAccentPressed,
+		BackgroundDisabled: color.RGBA{R: 0x16, G: 0x16, B: 0x1e, A: 255},
+		TextColor:          colorTextPrimary,
 		TextSize:           15,
 		Padding:            ui.Symmetric(20, 12),
 		MinWidth:           120,
@@ -329,7 +334,7 @@ func (s *LauncherScreen) buildBundleCard(index int, b discoveredBundle) *bundleC
 	// Image placeholder area with subtle background
 	imagePlaceholder := ui.NewCard(nil).
 		WithStyle(ui.CardStyle{
-			BackgroundColor: color.RGBA{R: 38, G: 38, B: 40, A: 255},
+			BackgroundColor: colorTopBar,
 			CornerRadius:    cornerRadiusSmall,
 		}).
 		WithGraphicsWindow(s.app.window).
@@ -426,12 +431,12 @@ func (s *LoadingScreen) buildUI() {
 	}
 	loadingCard := ui.NewCard(
 		ui.NewPadding(
-			ui.NewLabel(msg).WithSize(16).WithColor(graphics.ColorWhite),
+			ui.NewLabel(msg).WithSize(16).WithColor(colorTextPrimary),
 			ui.Symmetric(16, 10),
 		),
 	).
 		WithStyle(ui.CardStyle{
-			BackgroundColor: color.RGBA{R: 30, G: 30, B: 32, A: 230},
+			BackgroundColor: colorTopBar,
 			CornerRadius:    cornerRadiusSmall,
 		}).
 		WithGraphicsWindow(s.app.window)
@@ -489,7 +494,7 @@ func (s *ErrorScreen) buildUI() {
 	content := ui.Column().WithPadding(ui.All(40))
 
 	// Error header with color accent
-	content.AddChild(ui.NewLabel("Error").WithSize(48).WithColor(graphics.ColorWhite), ui.DefaultFlexParams())
+	content.AddChild(ui.NewLabel("Error").WithSize(48).WithColor(colorRed), ui.DefaultFlexParams())
 
 	// Error message in a rounded card
 	msg := s.app.errMsg
@@ -498,12 +503,12 @@ func (s *ErrorScreen) buildUI() {
 	}
 	errorCard := ui.NewCard(
 		ui.NewPadding(
-			ui.NewLabel(msg).WithSize(16).WithColor(colorTextSecondary),
+			ui.NewLabel(msg).WithSize(16).WithColor(colorTextPrimary),
 			ui.All(16),
 		),
 	).
 		WithStyle(ui.CardStyle{
-			BackgroundColor: color.RGBA{R: 40, G: 20, B: 20, A: 255}, // Subtle red tint
+			BackgroundColor: color.RGBA{R: 0x29, G: 0x1b, B: 0x23, A: 255}, // Tokyo Night red tint
 			CornerRadius:    cornerRadiusSmall,
 		}).
 		WithGraphicsWindow(s.app.window)

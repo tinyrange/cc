@@ -526,7 +526,7 @@ func (app *Application) Run() error {
 	}
 
 	app.window.SetClear(true)
-	app.window.SetClearColor(color.RGBA{R: 30, G: 30, B: 32, A: 255}) // Darker background
+	app.window.SetClearColor(color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 255}) // Tokyo Night background
 
 	// Initialize blur effect for dialog overlays
 	blurEffect, err := app.window.NewBlurEffect()
@@ -677,8 +677,15 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 	app.text.SetViewport(int32(w), int32(h))
 	winW := float32(w)
 
+	// Tokyo Night theme colors
+	topBarColor := color.RGBA{R: 0x16, G: 0x16, B: 0x1e, A: 255}    // #16161e
+	btnNormal := color.RGBA{R: 0x24, G: 0x28, B: 0x3b, A: 255}      // #24283b
+	btnHover := color.RGBA{R: 0x3d, G: 0x59, B: 0xa1, A: 255}       // #3d59a1
+	btnPressed := color.RGBA{R: 0x28, G: 0x34, B: 0x4a, A: 255}     // #28344a
+	textColor := color.RGBA{R: 0xa9, G: 0xb1, B: 0xd6, A: 255}      // #a9b1d6
+
 	// Top bar with Exit button.
-	f.RenderQuad(0, 0, winW, terminalTopBarH, nil, color.RGBA{R: 22, G: 22, B: 22, A: 255})
+	f.RenderQuad(0, 0, winW, terminalTopBarH, nil, topBarColor)
 
 	mx, my := f.CursorPos()
 	leftDown := f.GetButtonState(window.ButtonLeft).IsDown()
@@ -687,15 +694,15 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 
 	backRect := rect{x: 20, y: 6, w: 70, h: terminalTopBarH - 12}
 	backHover := backRect.contains(mx, my)
-	backColor := color.RGBA{R: 40, G: 40, B: 40, A: 255}
+	backColor := btnNormal
 	if backHover {
-		backColor = color.RGBA{R: 56, G: 56, B: 56, A: 255}
+		backColor = btnHover
 	}
 	if backHover && leftDown {
-		backColor = color.RGBA{R: 72, G: 72, B: 72, A: 255}
+		backColor = btnPressed
 	}
 	f.RenderQuad(backRect.x, backRect.y, backRect.w, backRect.h, nil, backColor)
-	app.text.RenderText("Exit", backRect.x+14, 22, 14, graphics.ColorWhite)
+	app.text.RenderText("Exit", backRect.x+14, 22, 14, textColor)
 
 	if justPressed && backRect.contains(mx, my) {
 		slog.Info("exit requested; stopping VM")
@@ -706,15 +713,15 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 	// Logs button (top-right).
 	logRect := rect{x: winW - 150, y: 6, w: 120, h: terminalTopBarH - 12}
 	logHover := logRect.contains(mx, my)
-	logColor := color.RGBA{R: 40, G: 40, B: 40, A: 255}
+	logColor := btnNormal
 	if logHover {
-		logColor = color.RGBA{R: 56, G: 56, B: 56, A: 255}
+		logColor = btnHover
 	}
 	if logHover && leftDown {
-		logColor = color.RGBA{R: 72, G: 72, B: 72, A: 255}
+		logColor = btnPressed
 	}
 	f.RenderQuad(logRect.x, logRect.y, logRect.w, logRect.h, nil, logColor)
-	app.text.RenderText("Debug Logs", logRect.x+26, 22, 14, graphics.ColorWhite)
+	app.text.RenderText("Debug Logs", logRect.x+26, 22, 14, textColor)
 	if justPressed && logHover {
 		slog.Info("open logs requested", "log_dir", app.logDir)
 		if err := openDirectory(app.logDir); err != nil {

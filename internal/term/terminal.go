@@ -119,6 +119,7 @@ func NewView(win graphics.Window) (*View, error) {
 
 	emu := vt.NewSafeEmulator(80, 40)
 	disableVTQueriesThatBreakGuests(emu)
+	applyTokyoNightTheme(emu)
 
 	inR, inW := io.Pipe()
 
@@ -613,10 +614,10 @@ func (v *View) syncGridFromEmulator(bgDefault, fgDefault color.Color, forceFullS
 					w = cell.Width
 				}
 				if cell.Style.Fg != nil {
-					fg = cell.Style.Fg
+					fg = translateANSIColor(cell.Style.Fg)
 				}
 				if cell.Style.Bg != nil {
-					bg = cell.Style.Bg
+					bg = translateANSIColor(cell.Style.Bg)
 				}
 				attrs = uint8(cell.Style.Attrs)
 			}
@@ -744,4 +745,113 @@ func (t *Terminal) Run(ctx context.Context, hooks Hooks) error {
 		return ErrWindowClosed
 	}
 	return err
+}
+
+// Tokyo Night color palette for ANSI colors.
+// https://github.com/enkia/tokyo-night-vscode-theme
+var tokyoNightPalette = []color.RGBA{
+	// Normal colors (0-7)
+	{R: 0x15, G: 0x16, B: 0x1e, A: 255}, // 0: black
+	{R: 0xf7, G: 0x76, B: 0x8e, A: 255}, // 1: red
+	{R: 0x9e, G: 0xce, B: 0x6a, A: 255}, // 2: green
+	{R: 0xe0, G: 0xaf, B: 0x68, A: 255}, // 3: yellow
+	{R: 0x7a, G: 0xa2, B: 0xf7, A: 255}, // 4: blue
+	{R: 0xbb, G: 0x9a, B: 0xf7, A: 255}, // 5: magenta
+	{R: 0x7d, G: 0xcf, B: 0xff, A: 255}, // 6: cyan
+	{R: 0xa9, G: 0xb1, B: 0xd6, A: 255}, // 7: white
+
+	// Bright colors (8-15)
+	{R: 0x41, G: 0x48, B: 0x68, A: 255}, // 8: bright black
+	{R: 0xf7, G: 0x76, B: 0x8e, A: 255}, // 9: bright red
+	{R: 0x9e, G: 0xce, B: 0x6a, A: 255}, // 10: bright green
+	{R: 0xe0, G: 0xaf, B: 0x68, A: 255}, // 11: bright yellow
+	{R: 0x7a, G: 0xa2, B: 0xf7, A: 255}, // 12: bright blue
+	{R: 0xbb, G: 0x9a, B: 0xf7, A: 255}, // 13: bright magenta
+	{R: 0x7d, G: 0xcf, B: 0xff, A: 255}, // 14: bright cyan
+	{R: 0xc0, G: 0xca, B: 0xf5, A: 255}, // 15: bright white
+}
+
+// Default ANSI 16-color palette (standard VGA colors).
+// Used as keys for color translation.
+var defaultANSIPalette = []color.RGBA{
+	// Normal colors (0-7)
+	{R: 0x00, G: 0x00, B: 0x00, A: 255}, // 0: black
+	{R: 0x80, G: 0x00, B: 0x00, A: 255}, // 1: red (maroon)
+	{R: 0x00, G: 0x80, B: 0x00, A: 255}, // 2: green
+	{R: 0x80, G: 0x80, B: 0x00, A: 255}, // 3: yellow (olive)
+	{R: 0x00, G: 0x00, B: 0x80, A: 255}, // 4: blue (navy)
+	{R: 0x80, G: 0x00, B: 0x80, A: 255}, // 5: magenta (purple)
+	{R: 0x00, G: 0x80, B: 0x80, A: 255}, // 6: cyan (teal)
+	{R: 0xc0, G: 0xc0, B: 0xc0, A: 255}, // 7: white (silver)
+
+	// Bright colors (8-15)
+	{R: 0x80, G: 0x80, B: 0x80, A: 255}, // 8: bright black (gray)
+	{R: 0xff, G: 0x00, B: 0x00, A: 255}, // 9: bright red
+	{R: 0x00, G: 0xff, B: 0x00, A: 255}, // 10: bright green (lime)
+	{R: 0xff, G: 0xff, B: 0x00, A: 255}, // 11: bright yellow
+	{R: 0x00, G: 0x00, B: 0xff, A: 255}, // 12: bright blue
+	{R: 0xff, G: 0x00, B: 0xff, A: 255}, // 13: bright magenta (fuchsia)
+	{R: 0x00, G: 0xff, B: 0xff, A: 255}, // 14: bright cyan (aqua)
+	{R: 0xff, G: 0xff, B: 0xff, A: 255}, // 15: bright white
+}
+
+// ansiColorMap maps default ANSI colors to Tokyo Night colors.
+// Built once at init time for fast lookups.
+var ansiColorMap map[uint32]color.RGBA
+
+func init() {
+	ansiColorMap = make(map[uint32]color.RGBA, len(defaultANSIPalette))
+	for i, def := range defaultANSIPalette {
+		key := colorKey(def)
+		ansiColorMap[key] = tokyoNightPalette[i]
+	}
+}
+
+// colorKey creates a unique key from RGBA values.
+func colorKey(c color.RGBA) uint32 {
+	return uint32(c.R)<<24 | uint32(c.G)<<16 | uint32(c.B)<<8 | uint32(c.A)
+}
+
+// translateANSIColor converts default ANSI palette colors to Tokyo Night colors.
+// Non-ANSI colors (true color, etc.) are passed through unchanged.
+func translateANSIColor(c color.Color) color.Color {
+	if c == nil {
+		return c
+	}
+
+	// Convert to RGBA for comparison
+	r, g, b, a := c.RGBA()
+	rgba := color.RGBA{
+		R: uint8(r >> 8),
+		G: uint8(g >> 8),
+		B: uint8(b >> 8),
+		A: uint8(a >> 8),
+	}
+
+	// Look up in the translation map
+	key := colorKey(rgba)
+	if translated, ok := ansiColorMap[key]; ok {
+		return translated
+	}
+
+	// Not a default ANSI color, return as-is
+	return c
+}
+
+// applyTokyoNightTheme sets the Tokyo Night color scheme on the VT emulator.
+// This provides a consistent look with the rest of the application UI.
+func applyTokyoNightTheme(emu *vt.SafeEmulator) {
+	// Default colors
+	fg := color.RGBA{R: 0xa9, G: 0xb1, B: 0xd6, A: 255}     // #a9b1d6
+	bg := color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 255}     // #1a1b26
+	cursor := color.RGBA{R: 0xc0, G: 0xca, B: 0xf5, A: 255} // #c0caf5
+
+	emu.Emulator.SetDefaultForegroundColor(fg)
+	emu.Emulator.SetDefaultBackgroundColor(bg)
+	emu.Emulator.SetDefaultCursorColor(cursor)
+
+	// Set indexed colors (used when programs query indexed colors)
+	for i, c := range tokyoNightPalette {
+		emu.SetIndexedColor(i, c)
+	}
 }
