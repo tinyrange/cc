@@ -44,6 +44,9 @@ type Frame interface {
 	TextInput() string
 
 	RenderQuad(x, y, width, height float32, tex Texture, color color.Color)
+	// RenderFBOTexture renders an FBO texture with flipped V coordinates.
+	// Use this for textures created by render-to-texture operations (like blur).
+	RenderFBOTexture(x, y, width, height float32, tex Texture, color color.Color)
 	RenderMesh(mesh Mesh, opts DrawOptions)
 
 	Screenshot() (image.Image, error)

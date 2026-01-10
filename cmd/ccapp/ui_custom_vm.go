@@ -53,11 +53,12 @@ func NewCustomVMScreen(app *Application) *CustomVMScreen {
 }
 
 func (s *CustomVMScreen) buildUI() {
-	// Main layout: Stack with overlay background and centered dialog
+	// Main layout: Stack with centered dialog
+	// Background blur is handled by the parent renderer
 	stack := ui.NewStack()
 
-	// Dark overlay background
-	stack.AddChild(ui.NewBox(color.RGBA{R: 0, G: 0, B: 0, A: 200}))
+	// Semi-transparent overlay to darken the blurred background slightly
+	stack.AddChild(ui.NewBox(color.RGBA{R: 0, G: 0, B: 0, A: 100}))
 
 	// Dialog constants
 	const dialogWidth float32 = 500
@@ -201,6 +202,7 @@ func (s *CustomVMScreen) buildUI() {
 		WithMinSize(80, 32).
 		WithGraphicsWindow(s.app.window). // Enable rounded corners
 		OnClick(func() {
+			s.app.clearBlurCapture()
 			s.app.mode = modeLauncher
 		})
 	buttonRow.AddChild(cancelBtn, ui.DefaultFlexParams())
@@ -298,6 +300,9 @@ func (s *CustomVMScreen) onLaunch() {
 		// Update dock menu
 		s.app.updateDockMenu()
 	}
+
+	// Clear blur capture before changing mode
+	s.app.clearBlurCapture()
 
 	// Start boot process
 	s.app.startCustomVM(sourceType, sourcePath, s.networkEnabled)

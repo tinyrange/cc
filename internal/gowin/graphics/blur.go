@@ -35,13 +35,22 @@ uniform sampler2D u_texture;
 uniform vec2 u_direction;    // (1/width, 0) for horizontal, (0, 1/height) for vertical
 uniform float u_radius;      // Blur radius multiplier
 
-// 9-tap Gaussian weights (sigma ~= 2.0)
-const float weights[5] = float[](0.2270270270, 0.1945945946, 0.1216216216, 0.0540540541, 0.0162162162);
+// 13-tap Gaussian weights (sigma ~= 4.0 for smoother, more visible blur)
+// Weights computed for offsets 0, 1, 2, 3, 4, 5, 6
+const float weights[7] = float[](
+	0.1061154, // center
+	0.1028506, // 1
+	0.0936552, // 2
+	0.0801001, // 3
+	0.0643218, // 4
+	0.0485090, // 5
+	0.0343425  // 6
+);
 
 void main() {
 	vec4 result = texture(u_texture, v_texCoord) * weights[0];
 
-	for (int i = 1; i < 5; i++) {
+	for (int i = 1; i < 7; i++) {
 		vec2 offset = u_direction * float(i) * u_radius;
 		result += texture(u_texture, v_texCoord + offset) * weights[i];
 		result += texture(u_texture, v_texCoord - offset) * weights[i];
@@ -167,12 +176,13 @@ func (be *BlurEffect) Apply(source Texture, radius float32, passes int) Texture 
 	gl.Uniform1f(be.radiusUniform, radius)
 
 	// Initial blit: source -> rtA (no blur, just copy)
+	// Source is a normal texture (screenshot), so use non-flipped UV
 	be.rtA.Bind()
 	gl.ClearColor(0, 0, 0, 0)
 	gl.Clear(glpkg.ColorBufferBit)
 	gl.Uniform2f(be.dirUniform, 0, 0)
 	gl.Uniform1f(be.radiusUniform, 0) // No blur for initial copy
-	be.drawFullscreenQuad(source)
+	be.drawFullscreenQuadFromTexture(source)
 	be.rtA.Unbind()
 
 	// Reset radius for blur passes
@@ -182,22 +192,22 @@ func (be *BlurEffect) Apply(source Texture, radius float32, passes int) Texture 
 	dst := be.rtB
 
 	for i := 0; i < passes; i++ {
-		// Horizontal pass
+		// Horizontal pass - reading from FBO, so use flipped UV
 		dst.Bind()
 		gl.ClearColor(0, 0, 0, 0)
 		gl.Clear(glpkg.ColorBufferBit)
 		gl.Uniform2f(be.dirUniform, 1.0/float32(be.width), 0)
-		be.drawFullscreenQuad(src.Texture())
+		be.drawFullscreenQuadFromFBO(src.Texture())
 		dst.Unbind()
 
 		src, dst = dst, src
 
-		// Vertical pass
+		// Vertical pass - reading from FBO, so use flipped UV
 		dst.Bind()
 		gl.ClearColor(0, 0, 0, 0)
 		gl.Clear(glpkg.ColorBufferBit)
 		gl.Uniform2f(be.dirUniform, 0, 1.0/float32(be.height))
-		be.drawFullscreenQuad(src.Texture())
+		be.drawFullscreenQuadFromFBO(src.Texture())
 		dst.Unbind()
 
 		src, dst = dst, src
@@ -206,10 +216,26 @@ func (be *BlurEffect) Apply(source Texture, radius float32, passes int) Texture 
 	// Restore original shader program
 	gl.UseProgram(oldProgram)
 
+	// Restore viewport to window size
+	bw, bh := be.window.platform.BackingSize()
+	gl.Viewport(0, 0, int32(bw), int32(bh))
+
 	return src.Texture()
 }
 
-func (be *BlurEffect) drawFullscreenQuad(tex Texture) {
+// drawFullscreenQuadFromFBO draws a fullscreen quad reading from an FBO texture.
+// FBO textures have inverted Y, so we flip the V coordinate to compensate.
+func (be *BlurEffect) drawFullscreenQuadFromFBO(tex Texture) {
+	be.drawQuadWithUV(tex, true)
+}
+
+// drawFullscreenQuadFromTexture draws a fullscreen quad reading from a normal texture.
+// Normal textures have (0,0) at top-left, so we use standard UV mapping.
+func (be *BlurEffect) drawFullscreenQuadFromTexture(tex Texture) {
+	be.drawQuadWithUV(tex, false)
+}
+
+func (be *BlurEffect) drawQuadWithUV(tex Texture, flipV bool) {
 	gl := be.window.gl
 	t, ok := tex.(*glTexture)
 	if !ok {
@@ -221,19 +247,34 @@ func (be *BlurEffect) drawFullscreenQuad(tex Texture) {
 	texUniform := gl.GetUniformLocation(be.program, "u_texture")
 	gl.Uniform1i(texUniform, 0)
 
-	// Fullscreen quad vertices (covers entire viewport)
-	// Note: v is flipped for FBO rendering
 	w := float32(be.width)
 	h := float32(be.height)
-	vertices := [6 * 8]float32{
-		// Triangle 1
-		0, 0, 0, 1, 1, 1, 1, 1, // top-left
-		w, 0, 1, 1, 1, 1, 1, 1, // top-right
-		0, h, 0, 0, 1, 1, 1, 1, // bottom-left
-		// Triangle 2
-		w, 0, 1, 1, 1, 1, 1, 1, // top-right
-		w, h, 1, 0, 1, 1, 1, 1, // bottom-right
-		0, h, 0, 0, 1, 1, 1, 1, // bottom-left
+
+	var vertices [6 * 8]float32
+	if flipV {
+		// Flipped V for FBO textures: FBO (0,0) is bottom-left, but we want top-left
+		vertices = [6 * 8]float32{
+			// Triangle 1
+			0, 0, 0, 1, 1, 1, 1, 1, // position top-left, read tex bottom-left
+			w, 0, 1, 1, 1, 1, 1, 1, // position top-right, read tex bottom-right
+			0, h, 0, 0, 1, 1, 1, 1, // position bottom-left, read tex top-left
+			// Triangle 2
+			w, 0, 1, 1, 1, 1, 1, 1, // position top-right, read tex bottom-right
+			w, h, 1, 0, 1, 1, 1, 1, // position bottom-right, read tex top-right
+			0, h, 0, 0, 1, 1, 1, 1, // position bottom-left, read tex top-left
+		}
+	} else {
+		// Standard UV for normal textures: (0,0) is top-left
+		vertices = [6 * 8]float32{
+			// Triangle 1
+			0, 0, 0, 0, 1, 1, 1, 1, // position top-left, read tex top-left
+			w, 0, 1, 0, 1, 1, 1, 1, // position top-right, read tex top-right
+			0, h, 0, 1, 1, 1, 1, 1, // position bottom-left, read tex bottom-left
+			// Triangle 2
+			w, 0, 1, 0, 1, 1, 1, 1, // position top-right, read tex top-right
+			w, h, 1, 1, 1, 1, 1, 1, // position bottom-right, read tex bottom-right
+			0, h, 0, 1, 1, 1, 1, 1, // position bottom-left, read tex bottom-left
+		}
 	}
 
 	gl.BindVertexArray(be.vao)

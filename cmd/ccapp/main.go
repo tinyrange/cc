@@ -91,6 +91,11 @@ type Application struct {
 	text   *text.Renderer
 	logo   *graphics.SVG
 
+	// Blur effect for dialog backgrounds
+	blurEffect        *graphics.BlurEffect
+	blurredBackground graphics.Texture
+	blurCaptured      bool
+
 	start time.Time
 
 	// Logging
@@ -249,6 +254,11 @@ func openDirectory(path string) error {
 }
 
 // openLogs opens the log directory in the system file manager.
+func (app *Application) clearBlurCapture() {
+	app.blurCaptured = false
+	app.blurredBackground = nil
+}
+
 func (app *Application) openLogs() {
 	slog.Info("open logs requested", "log_dir", app.logDir)
 	if err := openDirectory(app.logDir); err != nil {
@@ -516,7 +526,15 @@ func (app *Application) Run() error {
 	}
 
 	app.window.SetClear(true)
-	app.window.SetClearColor(color.RGBA{R: 10, G: 10, B: 10, A: 255})
+	app.window.SetClearColor(color.RGBA{R: 30, G: 30, B: 32, A: 255}) // Darker background
+
+	// Initialize blur effect for dialog overlays
+	blurEffect, err := app.window.NewBlurEffect()
+	if err != nil {
+		slog.Warn("failed to create blur effect", "error", err)
+	} else {
+		app.blurEffect = blurEffect
+	}
 
 	app.start = time.Now()
 	app.selectedIndex = -1
@@ -641,6 +659,11 @@ func (app *Application) renderCustomVM(f graphics.Frame) error {
 	if app.customVMScreen == nil {
 		app.customVMScreen = NewCustomVMScreen(app)
 	}
+
+	// Render launcher as background
+	app.launcherScreen.Render(f)
+
+	// Render the custom VM dialog on top
 	return app.customVMScreen.Render(f)
 }
 
