@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/tinyrange/cc/internal/assets"
@@ -125,9 +126,11 @@ type Application struct {
 	thumbDragDX   float32
 
 	// Boot loading state
-	bootCh      chan bootResult
-	bootStarted time.Time
-	bootName    string
+	bootCh       chan bootResult
+	bootStarted  time.Time
+	bootName     string
+	bootProgress oci.DownloadProgress // Current download progress
+	bootProgressMu sync.Mutex          // Protects bootProgress
 
 	// Error state (full-screen)
 	errMsg string
@@ -660,8 +663,9 @@ func (app *Application) renderCustomVM(f graphics.Frame) error {
 		app.customVMScreen = NewCustomVMScreen(app)
 	}
 
-	// Render launcher as background
-	app.launcherScreen.Render(f)
+	// Render launcher as background without processing events
+	// (events should go to the custom VM dialog instead)
+	app.launcherScreen.RenderBackground(f)
 
 	// Render the custom VM dialog on top
 	return app.customVMScreen.Render(f)
@@ -1068,7 +1072,14 @@ func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string
 	ch := make(chan bootResult, 1)
 	app.bootCh = ch
 
-	go func(srcType VMSourceType, srcPath string, net bool, arch hv.CpuArchitecture, out chan<- bootResult) {
+	// Create progress callback for image downloads
+	progressCallback := func(progress oci.DownloadProgress) {
+		app.bootProgressMu.Lock()
+		app.bootProgress = progress
+		app.bootProgressMu.Unlock()
+	}
+
+	go func(srcType VMSourceType, srcPath string, net bool, arch hv.CpuArchitecture, out chan<- bootResult, progressCb oci.ProgressCallback) {
 		var prep *bootPrep
 		var err error
 
@@ -1088,14 +1099,14 @@ func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string
 			prep, err = prepareFromTarball(srcPath, net, arch)
 
 		case VMSourceImageName:
-			prep, err = prepareFromImageName(srcPath, net, arch)
+			prep, err = prepareFromImageName(srcPath, net, arch, progressCb)
 
 		default:
 			err = fmt.Errorf("unknown source type: %s", srcType)
 		}
 
 		out <- bootResult{prep: prep, err: err}
-	}(sourceType, sourcePath, network, hvArch, ch)
+	}(sourceType, sourcePath, network, hvArch, ch, progressCallback)
 }
 
 // prepareFromTarball loads a VM from an OCI tarball
@@ -1116,12 +1127,17 @@ func prepareFromTarball(tarPath string, network bool, hvArch hv.CpuArchitecture)
 }
 
 // prepareFromImageName pulls a container image and prepares it for boot
-func prepareFromImageName(imageName string, network bool, hvArch hv.CpuArchitecture) (*bootPrep, error) {
+func prepareFromImageName(imageName string, network bool, hvArch hv.CpuArchitecture, progressCallback oci.ProgressCallback) (*bootPrep, error) {
 	slog.Info("pulling container image", "image", imageName, "arch", hvArch)
 
 	client, err := oci.NewClient("")
 	if err != nil {
 		return nil, fmt.Errorf("create OCI client: %w", err)
+	}
+
+	// Set progress callback if provided
+	if progressCallback != nil {
+		client.SetProgressCallback(progressCallback)
 	}
 
 	img, err := client.PullForArch(imageName, hvArch)

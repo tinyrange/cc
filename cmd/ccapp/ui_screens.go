@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"image/color"
 	"log/slog"
 	"path/filepath"
@@ -10,6 +11,25 @@ import (
 	"github.com/tinyrange/cc/internal/gowin/graphics"
 	"github.com/tinyrange/cc/internal/gowin/ui"
 )
+
+// formatBytes formats a byte count as a human-readable string.
+func formatBytes(bytes int64) string {
+	const (
+		KB = 1024
+		MB = KB * 1024
+		GB = MB * 1024
+	)
+	switch {
+	case bytes >= GB:
+		return fmt.Sprintf("%.1f GB", float64(bytes)/float64(GB))
+	case bytes >= MB:
+		return fmt.Sprintf("%.1f MB", float64(bytes)/float64(MB))
+	case bytes >= KB:
+		return fmt.Sprintf("%.1f KB", float64(bytes)/float64(KB))
+	default:
+		return fmt.Sprintf("%d B", bytes)
+	}
+}
 
 // Tokyo Night color theme
 // Based on https://github.com/enkia/tokyo-night-vscode-theme
@@ -392,11 +412,21 @@ func (s *LauncherScreen) Render(f graphics.Frame) error {
 	return nil
 }
 
+// RenderBackground renders the launcher without processing input events.
+// Used when rendering the launcher as a background behind a dialog.
+func (s *LauncherScreen) RenderBackground(f graphics.Frame) error {
+	s.Update(f)
+	s.root.DrawOnly(f)
+	return nil
+}
+
 // LoadingScreen manages the loading UI state
 type LoadingScreen struct {
-	root *ui.Root
-	app  *Application
-	logo *ui.AnimatedLogo
+	root        *ui.Root
+	app         *Application
+	logo        *ui.AnimatedLogo
+	progressBar *ui.ProgressBar
+	progressLabel *ui.Label
 }
 
 // NewLoadingScreen creates the loading screen UI
@@ -429,11 +459,31 @@ func (s *LoadingScreen) buildUI() {
 	if s.app.bootName != "" {
 		msg = "Booting " + s.app.bootName + "…"
 	}
+
+	// Create a column for the status card content
+	cardContent := ui.Column().WithGap(8)
+	cardContent.AddChild(ui.NewLabel(msg).WithSize(16).WithColor(colorTextPrimary), ui.DefaultFlexParams())
+
+	// Add progress label and bar (initially hidden until download starts)
+	s.progressLabel = ui.NewLabel("").WithSize(12).WithColor(colorTextSecondary)
+	cardContent.AddChild(s.progressLabel, ui.DefaultFlexParams())
+
+	s.progressBar = ui.NewProgressBar().
+		WithMinWidth(280).
+		WithStyle(ui.ProgressBarStyle{
+			BackgroundColor: color.RGBA{R: 0x24, G: 0x28, B: 0x3b, A: 255},
+			FillColor:       colorAccent,
+			TextColor:       colorTextPrimary,
+			Height:          6,
+			CornerRadius:    3,
+			ShowPercentage:  false,
+			TextSize:        12,
+		}).
+		WithGraphicsWindow(s.app.window)
+	cardContent.AddChild(s.progressBar, ui.DefaultFlexParams())
+
 	loadingCard := ui.NewCard(
-		ui.NewPadding(
-			ui.NewLabel(msg).WithSize(16).WithColor(colorTextPrimary),
-			ui.Symmetric(16, 10),
-		),
+		ui.NewPadding(cardContent, ui.Symmetric(16, 12)),
 	).
 		WithStyle(ui.CardStyle{
 			BackgroundColor: colorTopBar,
@@ -450,6 +500,26 @@ func (s *LoadingScreen) Update(f graphics.Frame) {
 		t := float32(time.Since(s.app.bootStarted).Seconds())
 		s.logo.SetTime(t)
 	}
+
+	// Update progress bar from app state
+	s.app.bootProgressMu.Lock()
+	progress := s.app.bootProgress
+	s.app.bootProgressMu.Unlock()
+
+	if progress.Total > 0 {
+		// Calculate progress percentage
+		percent := float64(progress.Current) / float64(progress.Total)
+		s.progressBar.SetValue(percent)
+
+		// Format the label to show download status
+		label := formatBytes(progress.Current) + " / " + formatBytes(progress.Total)
+		s.progressLabel.SetText(label)
+	} else if progress.Current > 0 {
+		// Unknown total, show bytes downloaded
+		s.progressBar.SetValue(0) // Indeterminate
+		s.progressLabel.SetText("Downloading: " + formatBytes(progress.Current))
+	}
+
 	s.root.InvalidateLayout()
 }
 

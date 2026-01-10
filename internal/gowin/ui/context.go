@@ -143,3 +143,10 @@ func (r *Root) Step(f graphics.Frame, pw window.Window) {
 	r.Layout(f)
 	r.Draw(f)
 }
+
+// DrawOnly performs layout and draw without processing input events.
+// Use this when rendering a screen as a background behind another screen.
+func (r *Root) DrawOnly(f graphics.Frame) {
+	r.Layout(f)
+	r.Draw(f)
+}

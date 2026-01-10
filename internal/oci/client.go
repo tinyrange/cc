@@ -21,11 +21,22 @@ const (
 	defaultRegistry = "https://registry-1.docker.io/v2"
 )
 
+// DownloadProgress represents the current state of a download.
+type DownloadProgress struct {
+	Current  int64  // Bytes downloaded so far
+	Total    int64  // Total bytes to download (-1 if unknown)
+	Filename string // Name/path being downloaded
+}
+
+// ProgressCallback is called periodically during downloads.
+type ProgressCallback func(progress DownloadProgress)
+
 // Client is an OCI registry client that handles image pulling and caching.
 type Client struct {
-	cacheDir string
-	logger   *slog.Logger
-	client   *http.Client
+	cacheDir         string
+	logger           *slog.Logger
+	client           *http.Client
+	progressCallback ProgressCallback
 }
 
 // NewClient creates a new OCI client with the specified cache directory.
@@ -49,6 +60,13 @@ func NewClient(cacheDir string) (*Client, error) {
 			Timeout: 60 * time.Second,
 		},
 	}, nil
+}
+
+// SetProgressCallback sets a callback function that will be called during downloads.
+// The callback receives progress updates with current/total bytes and filename.
+// Set to nil to disable progress reporting.
+func (c *Client) SetProgressCallback(callback ProgressCallback) {
+	c.progressCallback = callback
 }
 
 // registryContext holds state for communicating with a single registry.
@@ -226,15 +244,26 @@ func (c *Client) fetchToCache(ctx *registryContext, path string, accept []string
 		var writer io.Writer = tmpFile
 		var bar *progressbar.ProgressBar
 
-		if resp.ContentLength > 0 {
-			bar = progressbar.DefaultBytes(resp.ContentLength, title)
+		// Use progress callback if set, otherwise use terminal progress bar.
+		if c.progressCallback != nil {
+			pw := &progressWriter{
+				w:        tmpFile,
+				total:    resp.ContentLength,
+				filename: path,
+				callback: c.progressCallback,
+			}
+			writer = pw
 		} else {
-			bar = progressbar.DefaultBytes(-1, title)
-		}
+			if resp.ContentLength > 0 {
+				bar = progressbar.DefaultBytes(resp.ContentLength, title)
+			} else {
+				bar = progressbar.DefaultBytes(-1, title)
+			}
 
-		if bar != nil {
-			defer bar.Close()
-			writer = io.MultiWriter(tmpFile, bar)
+			if bar != nil {
+				defer bar.Close()
+				writer = io.MultiWriter(tmpFile, bar)
+			}
 		}
 
 		if _, err := io.Copy(writer, resp.Body); err != nil {
@@ -277,6 +306,28 @@ func (c *Client) readJSON(ctx *registryContext, path string, accept []string, ou
 	}
 
 	return cachePath, nil
+}
+
+// progressWriter wraps an io.Writer and reports progress via a callback.
+type progressWriter struct {
+	w        io.Writer
+	current  int64
+	total    int64
+	filename string
+	callback ProgressCallback
+}
+
+func (pw *progressWriter) Write(p []byte) (int, error) {
+	n, err := pw.w.Write(p)
+	pw.current += int64(n)
+	if pw.callback != nil {
+		pw.callback(DownloadProgress{
+			Current:  pw.current,
+			Total:    pw.total,
+			Filename: pw.filename,
+		})
+	}
+	return n, err
 }
 
 // IsLocalTar checks if the image reference is a local tar file.

@@ -238,6 +238,18 @@ func (s *CustomVMScreen) buildUI() {
 	stack.AddChild(ui.CenterCenter(dialogCard))
 
 	s.root.SetChild(stack)
+
+	// Set focus on the appropriate input field based on mode
+	switch s.mode {
+	case CustomVMModeBundleDir, CustomVMModeTarball:
+		if s.pathInput != nil {
+			s.pathInput.SetFocused(true)
+		}
+	case CustomVMModeImageName:
+		if s.imageInput != nil {
+			s.imageInput.SetFocused(true)
+		}
+	}
 }
 
 func (s *CustomVMScreen) browseDirectory() {

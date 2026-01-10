@@ -73,6 +73,20 @@ type View struct {
 	lastCellW, lastCellH     float32
 	lastOriginX, lastOriginY float32
 	lastPadX, lastPadY       float32
+
+	// Selection state for copy/paste.
+	selecting      bool
+	selectionStart Point
+	selectionEnd   Point
+	hasSelection   bool
+
+	// Cached layout values for mouse position calculations.
+	lastPadX2, lastPadY2 float32
+}
+
+// Point represents a cell position in the terminal grid.
+type Point struct {
+	X, Y int
 }
 
 // Terminal is a convenience wrapper that owns its own window and renders a View
@@ -425,9 +439,11 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 		stats.Record(tsViewStepResize)
 	}
 
-	// Cache origin.
+	// Cache origin and layout for mouse calculations.
 	v.originX = insetL
 	v.originY = insetT
+	v.lastPadX2 = padX
+	v.lastPadY2 = padY
 
 	toVTMods := func(m window.KeyMods) vt.KeyMod {
 		var mod vt.KeyMod
@@ -470,8 +486,40 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 
 			stats.Record(tsViewStepSendText)
 
+		case window.InputEventMouseDown:
+			if ev.Button == window.ButtonLeft {
+				// Start selection
+				pos := v.pixelToCell(f, padX, padY)
+				v.selecting = true
+				v.selectionStart = pos
+				v.selectionEnd = pos
+				v.hasSelection = false
+			}
+
+		case window.InputEventMouseUp:
+			if ev.Button == window.ButtonLeft && v.selecting {
+				// End selection
+				v.selecting = false
+				// Selection is valid if start != end
+				if v.selectionStart != v.selectionEnd {
+					v.hasSelection = true
+				}
+			}
+
 		case window.InputEventKeyDown:
 			mod := toVTMods(ev.Mods)
+
+			// Handle Ctrl+C for copy (when there's a selection).
+			if (ev.Mods&window.ModCtrl) != 0 || (ev.Mods&window.ModSuper) != 0 {
+				if ev.Key == window.KeyC && v.hasSelection {
+					v.copySelection()
+					continue
+				}
+				if ev.Key == window.KeyV {
+					v.pasteFromClipboard()
+					continue
+				}
+			}
 
 			// Ctrl+[A-Z] keys.
 			if (mod & vt.ModCtrl) != 0 {
@@ -521,6 +569,14 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 			}
 
 			stats.Record(tsViewStepSendKey)
+		}
+
+		// Update drag selection on any event while selecting.
+		if v.selecting {
+			pos := v.pixelToCell(f, padX, padY)
+			if pos != v.selectionEnd {
+				v.selectionEnd = pos
+			}
 		}
 	}
 
@@ -681,6 +737,19 @@ func (v *View) renderGrid(stats *timeslice.Recorder, f graphics.Frame, bgDefault
 	v.bgBuffer.Render(f)
 
 	stats.Record(tsViewStepRenderGridBgRender)
+
+	// Render selection highlight (if any).
+	if v.hasSelection || v.selecting {
+		for y := range rows {
+			for x := 0; x < cols; x++ {
+				if v.isCellSelected(x, y) {
+					x0 := originX + padX + float32(x)*cellW
+					y0 := originY + padY + float32(y)*cellH
+					f.RenderQuad(x0, y0, cellW, cellH, v.tex, selectionColor)
+				}
+			}
+		}
+	}
 
 	// Render all text in one batched draw call.
 	v.txt.BeginBatch()
@@ -854,4 +923,143 @@ func applyTokyoNightTheme(emu *vt.SafeEmulator) {
 	for i, c := range tokyoNightPalette {
 		emu.SetIndexedColor(i, c)
 	}
+}
+
+// Selection color (Tokyo Night selection blue).
+var selectionColor = color.RGBA{R: 0x41, G: 0x59, B: 0x8b, A: 255}
+
+// pixelToCell converts mouse pixel coordinates to terminal cell coordinates.
+func (v *View) pixelToCell(f graphics.Frame, padX, padY float32) Point {
+	cursorX, cursorY := v.win.PlatformWindow().Cursor()
+
+	// Convert to cell coordinates.
+	cellX := int((cursorX - v.originX - padX) / v.cellW)
+	cellY := int((cursorY - v.originY - padY) / v.cellH)
+
+	// Clamp to grid bounds.
+	cols, rows := v.grid.Size()
+	if cellX < 0 {
+		cellX = 0
+	}
+	if cellX >= cols {
+		cellX = cols - 1
+	}
+	if cellY < 0 {
+		cellY = 0
+	}
+	if cellY >= rows {
+		cellY = rows - 1
+	}
+
+	return Point{X: cellX, Y: cellY}
+}
+
+// normalizedSelection returns selection bounds with start before end.
+func (v *View) normalizedSelection() (start, end Point) {
+	s, e := v.selectionStart, v.selectionEnd
+
+	// Normalize so start is before end (top-left to bottom-right).
+	if s.Y > e.Y || (s.Y == e.Y && s.X > e.X) {
+		s, e = e, s
+	}
+	return s, e
+}
+
+// isCellSelected returns true if the cell at (x, y) is within the selection.
+func (v *View) isCellSelected(x, y int) bool {
+	if !v.hasSelection && !v.selecting {
+		return false
+	}
+
+	start, end := v.normalizedSelection()
+
+	// Simple rectangular selection.
+	if y < start.Y || y > end.Y {
+		return false
+	}
+	if y == start.Y && y == end.Y {
+		// Single line selection.
+		return x >= start.X && x < end.X
+	}
+	if y == start.Y {
+		return x >= start.X
+	}
+	if y == end.Y {
+		return x < end.X
+	}
+	return true
+}
+
+// copySelection copies the selected text to the clipboard.
+func (v *View) copySelection() {
+	if !v.hasSelection {
+		return
+	}
+
+	start, end := v.normalizedSelection()
+	cols, _ := v.grid.Size()
+
+	var sb strings.Builder
+
+	for y := start.Y; y <= end.Y; y++ {
+		lineStart := 0
+		lineEnd := cols
+
+		if y == start.Y {
+			lineStart = start.X
+		}
+		if y == end.Y {
+			lineEnd = end.X
+		}
+
+		for x := lineStart; x < lineEnd; x++ {
+			cell := v.grid.CellAt(x, y)
+			if cell != nil && cell.Content != "" {
+				sb.WriteString(cell.Content)
+			} else {
+				sb.WriteRune(' ')
+			}
+		}
+
+		// Add newline between rows (but not after last row).
+		if y < end.Y {
+			sb.WriteRune('\n')
+		}
+	}
+
+	text := sb.String()
+	if text == "" {
+		return
+	}
+
+	clipboard := window.GetClipboard()
+	if clipboard != nil {
+		clipboard.SetText(text)
+	}
+}
+
+// pasteFromClipboard pastes text from the clipboard into the terminal.
+func (v *View) pasteFromClipboard() {
+	clipboard := window.GetClipboard()
+	if clipboard == nil {
+		return
+	}
+
+	text := clipboard.GetText()
+	if text == "" {
+		return
+	}
+
+	// Convert newlines to carriage returns for terminal.
+	text = strings.ReplaceAll(text, "\r\n", "\r")
+	text = strings.ReplaceAll(text, "\n", "\r")
+
+	// Send to terminal.
+	v.emu.SendText(text)
+}
+
+// ClearSelection clears the current selection.
+func (v *View) ClearSelection() {
+	v.hasSelection = false
+	v.selecting = false
 }
