@@ -66,6 +66,7 @@ type remoteTarget struct {
 
 type buildOptions struct {
 	Package          string
+	ApplicationName  string
 	OutputName       string
 	CgoEnabled       bool
 	Build            crossBuild
@@ -77,6 +78,8 @@ type buildOptions struct {
 	BuildApp bool
 	// LogoPath is the path to a PNG image to use as the application icon (macOS only)
 	LogoPath string
+	// IconPath is the path to a .ico file to use as the application icon (Windows only)
+	IconPath string
 }
 
 type buildOutput struct {
@@ -282,6 +285,78 @@ func writeMacOSAppBundle(bundlePath, executablePath, appName, logoPath string) e
 	return nil
 }
 
+// generateWindowsResources creates a .syso file with embedded Windows resources (icon).
+// It returns the path to the generated .syso file for cleanup after the build.
+// If the icon file doesn't exist, it silently returns without generating resources.
+func generateWindowsResources(pkgPath, iconPath, arch string) (string, error) {
+	if iconPath == "" {
+		return "", nil
+	}
+
+	// Check if the icon file exists
+	if _, err := os.Stat(iconPath); os.IsNotExist(err) {
+		return "", nil
+	}
+
+	// Resolve absolute path for the icon
+	absIconPath, err := filepath.Abs(iconPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve icon path: %w", err)
+	}
+
+	// Resolve absolute path for the package directory
+	absPkgPath, err := filepath.Abs(pkgPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve package path: %w", err)
+	}
+
+	// Calculate relative path from package directory to icon
+	// (go-winres resolves paths relative to the config file location)
+	relIconPath, err := filepath.Rel(absPkgPath, absIconPath)
+	if err != nil {
+		return "", fmt.Errorf("calculate relative icon path: %w", err)
+	}
+
+	// Create a temporary winres.json config
+	// The format requires a language code (0000 = language neutral)
+	winresConfig := map[string]any{
+		"RT_GROUP_ICON": map[string]any{
+			"APP": map[string]any{
+				"0000": relIconPath,
+			},
+		},
+	}
+
+	configBytes, err := json.MarshalIndent(winresConfig, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshal winres config: %w", err)
+	}
+
+	// Write config to the package directory
+	configPath := filepath.Join(absPkgPath, "winres.json")
+	if err := os.WriteFile(configPath, configBytes, 0644); err != nil {
+		return "", fmt.Errorf("write winres config: %w", err)
+	}
+	defer os.Remove(configPath)
+
+	// Run go-winres to generate the .syso file
+	cmd := exec.Command("go", "run", "github.com/tc-hib/go-winres@latest", "make",
+		"--in", configPath,
+		"--out", filepath.Join(absPkgPath, "rsrc"),
+		"--arch", arch,
+	)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("run go-winres: %w", err)
+	}
+
+	// go-winres generates files named rsrc_windows_<arch>.syso
+	sysoPath := filepath.Join(absPkgPath, fmt.Sprintf("rsrc_windows_%s.syso", arch))
+	return sysoPath, nil
+}
+
 func goBuild(opts buildOptions) (buildOutput, error) {
 	output := filepath.Join("build", opts.Build.OutputName(opts.OutputName))
 	macosBundlePath := ""
@@ -324,6 +399,19 @@ func goBuild(opts buildOptions) (buildOutput, error) {
 		args = append(args, "-ldflags=-H windowsgui")
 	}
 
+	// Generate Windows resources (.syso file with icon) if building for Windows with an icon
+	var sysoPath string
+	if opts.Build.GOOS == "windows" && opts.BuildApp && opts.IconPath != "" {
+		var err error
+		sysoPath, err = generateWindowsResources(opts.Package, opts.IconPath, opts.Build.GOARCH)
+		if err != nil {
+			return buildOutput{}, fmt.Errorf("failed to generate Windows resources: %w", err)
+		}
+		if sysoPath != "" {
+			defer os.Remove(sysoPath)
+		}
+	}
+
 	args = append(args, pkg)
 
 	cmd := exec.Command(args[0], args[1:]...)
@@ -361,7 +449,7 @@ func goBuild(opts buildOptions) (buildOutput, error) {
 
 	if opts.BuildApp && opts.Build.GOOS == "darwin" {
 		// Turn the output binary into a macOS .app bundle.
-		if err := writeMacOSAppBundle(macosBundlePath, output, opts.OutputName, opts.LogoPath); err != nil {
+		if err := writeMacOSAppBundle(macosBundlePath, output, opts.ApplicationName, opts.LogoPath); err != nil {
 			return buildOutput{}, fmt.Errorf("failed to create macOS app bundle: %w", err)
 		}
 		return buildOutput{Path: macosBundlePath}, nil
@@ -625,6 +713,8 @@ func main() {
 	race := fs.Bool("race", false, "build with race detector enabled")
 	quest := fs.Bool("quest", false, "build and execute the bringup quest")
 	cross := fs.Bool("cross", false, "attempt to cross compile the quest for all supported platforms")
+	buildOs := fs.String("os", "", "build for the specified OS (windows, linux, darwin)")
+	buildArch := fs.String("arch", "", "build for the specified architecture (amd64, arm64)")
 	test := fs.String("test", "", "run go tests in the specified package")
 	bench := fs.Bool("bench", false, "run all benchmarks and output results to benchmarks/<hostid>/<date>.json")
 	codesign := fs.Bool("codesign", false, "build the macos codesign tool")
@@ -644,6 +734,23 @@ func main() {
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
+	}
+
+	var buildTarget crossBuild = hostBuild
+
+	if *buildOs != "" || *buildArch != "" {
+		if *buildOs == "" {
+			*buildOs = hostBuild.GOOS
+		}
+
+		if *buildArch == "" {
+			*buildArch = hostBuild.GOARCH
+		}
+
+		buildTarget = crossBuild{
+			GOOS:   *buildOs,
+			GOARCH: *buildArch,
+		}
 	}
 
 	runOpts := runOptions{
@@ -1191,7 +1298,7 @@ func main() {
 	out, err := goBuild(buildOptions{
 		Package:          "internal/cmd/cc",
 		OutputName:       "cc",
-		Build:            hostBuild,
+		Build:            buildTarget,
 		EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
 	})
 	if err != nil {
@@ -1203,11 +1310,13 @@ func main() {
 	// also build cmd/ccapp
 	ccappOut, err := goBuild(buildOptions{
 		Package:          "cmd/ccapp",
-		OutputName:       "ccapp",
-		Build:            hostBuild,
+		ApplicationName:  "CrumbleCracker",
+		OutputName:       "CrumbleCracker",
+		Build:            buildTarget,
 		EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
 		BuildApp:         true,
 		LogoPath:         filepath.Join("internal", "assets", "logo-color-black.png"),
+		IconPath:         filepath.Join("internal", "assets", "logo.ico"),
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to build ccapp: %v\n", err)
@@ -1216,6 +1325,11 @@ func main() {
 	fmt.Printf("built %s\n", ccappOut.Path)
 
 	if *run {
+		if !buildTarget.IsNative() {
+			fmt.Fprintf(os.Stderr, "cannot run cross-compiled binary\n")
+			os.Exit(1)
+		}
+
 		fmt.Printf("running %s %s\n", out.Path, strings.Join(fs.Args(), " "))
 		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
 			os.Exit(1)
