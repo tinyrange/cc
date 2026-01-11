@@ -1610,6 +1610,21 @@ func main() {
 					fmt.Fprintf(os.Stderr, "failed to build for %s/%s: %v\n", platform.GOOS, platform.GOARCH, err)
 					os.Exit(1)
 				}
+
+				// For release builds, always use platform suffix (rename if native)
+				if platform.IsNative() {
+					suffix := ""
+					if platform.GOOS == "windows" {
+						suffix = ".exe"
+					}
+					newPath := filepath.Join("build", fmt.Sprintf("CrumbleCracker_%s_%s%s", platform.GOOS, platform.GOARCH, suffix))
+					if err := os.Rename(out.Path, newPath); err != nil {
+						fmt.Fprintf(os.Stderr, "failed to rename %s to %s: %v\n", out.Path, newPath, err)
+						os.Exit(1)
+					}
+					out.Path = newPath
+				}
+
 				fmt.Printf("built %s\n", out.Path)
 			}
 
