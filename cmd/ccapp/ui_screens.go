@@ -732,11 +732,23 @@ func (s *ErrorScreen) Render(f graphics.Frame) error {
 
 // TerminalScreen manages the terminal UI state
 type TerminalScreen struct {
-	root *ui.Root
-	app  *Application
+	root           *ui.Root
+	app            *Application
+	expandedCard   *ui.Card
+	collapsedCard  *ui.Card
+	exitBtn        *ui.Button
+	netBtn         *ui.Button
+	expanded       bool
+	expandProgress float32
+	lastUpdate     time.Time
 }
 
-// NewTerminalScreen creates the terminal screen UI (top bar only)
+// Notch animation constants
+const (
+	notchAnimSpeed = float32(10.0) // speed of expand/collapse
+)
+
+// NewTerminalScreen creates the terminal screen UI (notch bar)
 func NewTerminalScreen(app *Application) *TerminalScreen {
 	screen := &TerminalScreen{
 		root: ui.NewRoot(app.text),
@@ -746,40 +758,164 @@ func NewTerminalScreen(app *Application) *TerminalScreen {
 	return screen
 }
 
-func (s *TerminalScreen) buildUI() {
-	// Just the top bar - terminal view is handled separately
-	topBar := ui.Row().
-		WithBackground(colorTopBar).
-		WithPadding(ui.Symmetric(16, 6)).
-		WithCrossAlignment(ui.CrossAxisCenter).
-		AddChild(
-			ui.NewButton("Exit").
-				WithStyle(topBarButtonStyle()).
-				WithGraphicsWindow(s.app.window).
-				OnClick(func() {
-					s.app.stopVM()
-				}),
-			ui.DefaultFlexParams(),
-		).
-		AddChild(ui.NewSpacer(), ui.FlexParams(1)).
-		AddChild(
-			ui.NewButton("Logs").
-				WithStyle(topBarButtonStyle()).
-				WithGraphicsWindow(s.app.window).
-				OnClick(func() {
-					s.app.openLogs()
-				}),
-			ui.DefaultFlexParams(),
-		)
+// notchButtonStyle returns style for notch buttons
+func notchButtonStyle() ui.ButtonStyle {
+	return ui.ButtonStyle{
+		BackgroundNormal:   colorBtnNormal,
+		BackgroundHovered:  colorBtnHover,
+		BackgroundPressed:  colorAccentPressed,
+		BackgroundDisabled: colorBtnNormal,
+		TextColor:          color.RGBA{R: 0xff, G: 0xff, B: 0xff, A: 255}, // white text
+		TextSize:           12,
+		Padding:            ui.Symmetric(10, 5),
+		MinWidth:           50,
+		MinHeight:          24,
+		CornerRadius:       6,
+	}
+}
 
-	// Wrap in column to set height
+// notchExitButtonStyle returns style for the exit button (red on hover)
+func notchExitButtonStyle() ui.ButtonStyle {
+	style := notchButtonStyle()
+	style.BackgroundHovered = colorRed
+	return style
+}
+
+// notchNetButtonStyle returns style for the network button
+func notchNetButtonStyle(connected bool) ui.ButtonStyle {
+	style := notchButtonStyle()
+	if connected {
+		style.BackgroundNormal = colorGreen
+		style.BackgroundHovered = color.RGBA{R: 0x73, G: 0xda, B: 0xca, A: 255} // teal hover
+	} else {
+		style.BackgroundNormal = color.RGBA{R: 0x56, G: 0x5f, B: 0x89, A: 255} // gray
+		style.BackgroundHovered = colorBtnHover
+	}
+	return style
+}
+
+func (s *TerminalScreen) buildUI() {
+	// Create buttons for expanded state
+	s.exitBtn = ui.NewButton("Exit").
+		WithStyle(notchExitButtonStyle()).
+		WithGraphicsWindow(s.app.window).
+		OnClick(func() {
+			s.app.showExitConfirm = true
+		})
+
+	s.netBtn = ui.NewButton("Net").
+		WithStyle(notchNetButtonStyle(true)).
+		WithGraphicsWindow(s.app.window).
+		OnClick(func() {
+			s.app.networkDisabled = !s.app.networkDisabled
+			if s.app.running != nil && s.app.running.netBackend != nil {
+				s.app.running.netBackend.SetInternetAccessEnabled(!s.app.networkDisabled)
+			}
+			// Update button style
+			if s.app.networkDisabled {
+				s.netBtn.WithStyle(notchNetButtonStyle(false))
+				s.netBtn.SetText("Off")
+			} else {
+				s.netBtn.WithStyle(notchNetButtonStyle(true))
+				s.netBtn.SetText("Net")
+			}
+			slog.Info("internet access toggled", "disabled", s.app.networkDisabled)
+		})
+
+	// Button row inside the expanded notch
+	buttonRow := ui.Row().
+		WithCrossAlignment(ui.CrossAxisCenter).
+		WithGap(8).
+		AddChild(s.exitBtn, ui.DefaultFlexParams()).
+		AddChild(s.netBtn, ui.DefaultFlexParams())
+
+	// Expanded notch card with buttons
+	expandedStyle := ui.CardStyle{
+		BackgroundColor: color.RGBA{R: 0x2a, G: 0x2e, B: 0x45, A: 255}, // slightly lighter when expanded
+		Padding:         ui.Symmetric(10, 8),
+		CornerRadius:    20, // pill-like rounded corners
+	}
+
+	s.expandedCard = ui.NewCard(buttonRow).
+		WithStyle(expandedStyle).
+		WithGraphicsWindow(s.app.window)
+
+	// Collapsed notch card (small indicator bar)
+	collapsedStyle := ui.CardStyle{
+		BackgroundColor: color.RGBA{R: 0x41, G: 0x48, B: 0x68, A: 255}, // visible purple-gray
+		Padding:         ui.All(0),
+		CornerRadius:    0, // square corners
+	}
+
+	s.collapsedCard = ui.NewCard(nil).
+		WithStyle(collapsedStyle).
+		WithGraphicsWindow(s.app.window).
+		WithFixedSize(60, 10) // small pill
+
+	s.rebuildLayout()
+}
+
+func (s *TerminalScreen) rebuildLayout() {
+	// Choose which card to show based on expanded state
+	var notchWidget ui.Widget
+	if s.expanded {
+		notchWidget = s.expandedCard
+	} else {
+		notchWidget = s.collapsedCard
+	}
+
+	// Center the notch at the top
+	topRow := ui.Row().
+		WithCrossAlignment(ui.CrossAxisCenter).
+		AddChild(ui.NewSpacer(), ui.FlexParams(1)).
+		AddChild(notchWidget, ui.DefaultFlexParams()).
+		AddChild(ui.NewSpacer(), ui.FlexParams(1))
+
+	// Wrap in column
 	col := ui.Column()
-	col.AddChild(topBar, ui.DefaultFlexParams())
+	col.AddChild(topRow, ui.DefaultFlexParams())
 	col.AddChild(ui.NewSpacer(), ui.FlexParams(1)) // Rest of space for terminal
 
 	s.root.SetChild(col)
 }
 
-func (s *TerminalScreen) RenderTopBar(f graphics.Frame) {
+func (s *TerminalScreen) RenderNotch(f graphics.Frame) {
+	// Get mouse position and window size
+	mx, my := f.CursorPos()
+	w, _ := f.WindowSize()
+	winW := float32(w)
+
+	// Define hover zone (expanded notch area at top center)
+	hoverW := float32(180)
+	hoverH := float32(50)
+	hoverX := (winW - hoverW) / 2
+	hoverRect := rect{x: hoverX, y: 0, w: hoverW, h: hoverH}
+	isHovered := hoverRect.contains(mx, my)
+
+	// Animate expand/collapse
+	now := time.Now()
+	if !s.lastUpdate.IsZero() {
+		dt := float32(now.Sub(s.lastUpdate).Seconds())
+		if isHovered {
+			s.expandProgress += notchAnimSpeed * dt
+			if s.expandProgress > 1.0 {
+				s.expandProgress = 1.0
+			}
+		} else {
+			s.expandProgress -= notchAnimSpeed * dt
+			if s.expandProgress < 0.0 {
+				s.expandProgress = 0.0
+			}
+		}
+	}
+	s.lastUpdate = now
+
+	// Update expanded state and rebuild if changed
+	newExpanded := s.expandProgress > 0.5
+	if newExpanded != s.expanded {
+		s.expanded = newExpanded
+		s.rebuildLayout()
+	}
+
 	s.root.Step(f, s.app.window.PlatformWindow())
 }

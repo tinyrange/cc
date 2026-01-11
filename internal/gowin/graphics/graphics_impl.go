@@ -590,6 +590,12 @@ func (w *glWindow) NewDynamicMesh(maxVertices, maxIndices int, tex Texture) (Dyn
 		tex:        t,
 		w:          w,
 	}
+
+	// Unbind VAO to prevent accidental state pollution.
+	// EBO binding is stored in VAO, so leaving a VAO bound can cause
+	// subsequent BindBuffer(ElementArrayBuffer) calls to corrupt it.
+	w.gl.BindVertexArray(0)
+
 	return m, nil
 }
 
@@ -623,6 +629,10 @@ func (m *glDynamicMesh) UpdateIndices(indices []uint32) {
 	if len(indices) == 0 {
 		return
 	}
+	// Bind our VAO before EBO operations. In OpenGL, the ElementArrayBuffer
+	// binding is stored in the VAO, so we must bind our VAO first to ensure
+	// the EBO is associated with the correct VAO.
+	m.w.gl.BindVertexArray(m.vao)
 	m.w.gl.BindBuffer(glpkg.ElementArrayBuffer, m.ebo)
 	m.w.gl.BufferSubData(
 		glpkg.ElementArrayBuffer,

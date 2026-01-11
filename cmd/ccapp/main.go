@@ -152,9 +152,17 @@ type Application struct {
 
 	// Recent VMs storage
 	recentVMs *RecentVMsStore
-}
 
-const terminalTopBarH = float32(32)
+	// Notch UI state (for VM header)
+	networkDisabled bool // is internet access cut
+	showExitConfirm bool // show shutdown confirmation dialog
+
+	// Exit confirmation dialog shape builders (for rounded corners)
+	dialogBgShape   *graphics.ShapeBuilder
+	confirmBtnShape *graphics.ShapeBuilder
+	cancelBtnShape  *graphics.ShapeBuilder
+	dialogLastBgR   rect // track last dialog background rect for geometry updates
+}
 
 type rect struct {
 	x float32
@@ -548,55 +556,107 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 	app.text.SetViewport(int32(w), int32(h))
 	winW := float32(w)
 
-	// Tokyo Night theme colors
-	topBarColor := color.RGBA{R: 0x16, G: 0x16, B: 0x1e, A: 255} // #16161e
-	btnNormal := color.RGBA{R: 0x24, G: 0x28, B: 0x3b, A: 255}   // #24283b
-	btnHover := color.RGBA{R: 0x3d, G: 0x59, B: 0xa1, A: 255}    // #3d59a1
-	btnPressed := color.RGBA{R: 0x28, G: 0x34, B: 0x4a, A: 255}  // #28344a
-	textColor := color.RGBA{R: 0xa9, G: 0xb1, B: 0xd6, A: 255}   // #a9b1d6
+	// Render the widget-based notch bar
+	app.terminalScreen.RenderNotch(f)
 
-	// Top bar with Exit button.
-	f.RenderQuad(0, 0, winW, terminalTopBarH, nil, topBarColor)
-
+	// Track mouse state for confirmation dialog
 	mx, my := f.CursorPos()
 	leftDown := f.GetButtonState(window.ButtonLeft).IsDown()
 	justPressed := leftDown && !app.prevLeftDown
 	app.prevLeftDown = leftDown
 
-	backRect := rect{x: 20, y: 6, w: 70, h: terminalTopBarH - 12}
-	backHover := backRect.contains(mx, my)
-	backColor := btnNormal
-	if backHover {
-		backColor = btnHover
-	}
-	if backHover && leftDown {
-		backColor = btnPressed
-	}
-	f.RenderQuad(backRect.x, backRect.y, backRect.w, backRect.h, nil, backColor)
-	app.text.RenderText("Exit", backRect.x+14, 22, 14, textColor)
+	// Colors for confirmation dialog
+	btnNormal := color.RGBA{R: 0x36, G: 0x3e, B: 0x5a, A: 255}    // #363e5a
+	btnHover := color.RGBA{R: 0x3d, G: 0x59, B: 0xa1, A: 255}     // #3d59a1
+	btnPressed := color.RGBA{R: 0x28, G: 0x34, B: 0x4a, A: 255}   // #28344a
+	exitBtnHover := color.RGBA{R: 0xf7, G: 0x76, B: 0x8e, A: 255} // #f7768e red
+	textColorDark := color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 255} // dark like background
+	textColorLight := color.RGBA{R: 0xa9, G: 0xb1, B: 0xd6, A: 255} // lighter for cancel button
 
-	if justPressed && backRect.contains(mx, my) {
-		slog.Info("exit requested; stopping VM")
-		app.stopVM()
-		return nil
-	}
+	// Render exit confirmation dialog
+	if app.showExitConfirm {
+		// Darken background
+		overlay := color.RGBA{R: 0, G: 0, B: 0, A: 180}
+		f.RenderQuad(0, 0, winW, float32(h), nil, overlay)
 
-	// Logs button (top-right).
-	logRect := rect{x: winW - 150, y: 6, w: 120, h: terminalTopBarH - 12}
-	logHover := logRect.contains(mx, my)
-	logColor := btnNormal
-	if logHover {
-		logColor = btnHover
-	}
-	if logHover && leftDown {
-		logColor = btnPressed
-	}
-	f.RenderQuad(logRect.x, logRect.y, logRect.w, logRect.h, nil, logColor)
-	app.text.RenderText("Debug Logs", logRect.x+26, 22, 14, textColor)
-	if justPressed && logHover {
-		slog.Info("open logs requested", "log_dir", app.logDir)
-		if err := openDirectory(app.logDir); err != nil {
-			slog.Error("failed to open logs directory", "log_dir", app.logDir, "error", err)
+		// Dialog box dimensions
+		dialogW := float32(280)
+		dialogH := float32(120)
+		dialogX := (winW - dialogW) / 2
+		dialogY := (float32(h) - dialogH) / 2
+		dialogBg := color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 255}
+		dialogCornerRadius := float32(12)
+		btnCornerRadius := float32(6)
+
+		// Initialize or update dialog background shape
+		dialogBgRect := rect{x: dialogX, y: dialogY, w: dialogW, h: dialogH}
+		if app.dialogBgShape == nil {
+			segments := graphics.SegmentsForRadius(dialogCornerRadius)
+			app.dialogBgShape, _ = graphics.NewShapeBuilder(app.window, segments)
+		}
+		if dialogBgRect != app.dialogLastBgR {
+			app.dialogBgShape.UpdateRoundedRect(dialogX, dialogY, dialogW, dialogH,
+				graphics.UniformRadius(dialogCornerRadius),
+				graphics.ShapeStyle{FillColor: dialogBg})
+			app.dialogLastBgR = dialogBgRect
+		}
+		f.RenderMesh(app.dialogBgShape.Mesh(), graphics.DrawOptions{})
+
+		// Title (dark text on dark background - use lighter text for title)
+		titleColor := color.RGBA{R: 0xa9, G: 0xb1, B: 0xd6, A: 255} // #a9b1d6
+		app.text.RenderText("Shut down VM?", dialogX+70, dialogY+35, 16, titleColor)
+
+		// Confirm button
+		confirmRect := rect{x: dialogX + 30, y: dialogY + 60, w: 100, h: 30}
+		confirmHover := confirmRect.contains(mx, my)
+		confirmColor := exitBtnHover
+		if confirmHover && leftDown {
+			confirmColor = btnPressed
+		}
+
+		// Initialize or update confirm button shape (always update for hover color changes)
+		if app.confirmBtnShape == nil {
+			segments := graphics.SegmentsForRadius(btnCornerRadius)
+			app.confirmBtnShape, _ = graphics.NewShapeBuilder(app.window, segments)
+		}
+		app.confirmBtnShape.UpdateRoundedRect(confirmRect.x, confirmRect.y, confirmRect.w, confirmRect.h,
+			graphics.UniformRadius(btnCornerRadius),
+			graphics.ShapeStyle{FillColor: confirmColor})
+		f.RenderMesh(app.confirmBtnShape.Mesh(), graphics.DrawOptions{})
+		app.text.RenderText("Shut Down", confirmRect.x+12, confirmRect.y+20, 14, textColorDark)
+
+		// Cancel button
+		cancelRect := rect{x: dialogX + 150, y: dialogY + 60, w: 100, h: 30}
+		cancelHover := cancelRect.contains(mx, my)
+		cancelColor := btnNormal
+		if cancelHover {
+			cancelColor = btnHover
+		}
+		if cancelHover && leftDown {
+			cancelColor = btnPressed
+		}
+
+		// Initialize or update cancel button shape (always update for hover color changes)
+		if app.cancelBtnShape == nil {
+			segments := graphics.SegmentsForRadius(btnCornerRadius)
+			app.cancelBtnShape, _ = graphics.NewShapeBuilder(app.window, segments)
+		}
+		app.cancelBtnShape.UpdateRoundedRect(cancelRect.x, cancelRect.y, cancelRect.w, cancelRect.h,
+			graphics.UniformRadius(btnCornerRadius),
+			graphics.ShapeStyle{FillColor: cancelColor})
+		f.RenderMesh(app.cancelBtnShape.Mesh(), graphics.DrawOptions{})
+		app.text.RenderText("Cancel", cancelRect.x+28, cancelRect.y+20, 14, textColorLight)
+
+		// Handle dialog button clicks
+		if justPressed && confirmRect.contains(mx, my) {
+			slog.Info("shutdown confirmed; stopping VM")
+			app.showExitConfirm = false
+			app.stopVM()
+			return nil
+		}
+		if justPressed && cancelRect.contains(mx, my) {
+			slog.Info("shutdown cancelled")
+			app.showExitConfirm = false
 		}
 	}
 
@@ -824,8 +884,8 @@ func (app *Application) finalizeBoot(prep *bootPrep) (retErr error) {
 	// (e.g., image name). Otherwise, the terminal view would receive this text
 	// as keyboard input when it starts processing.
 	_ = app.window.PlatformWindow().TextInput()
-	// Reserve space for CCApp's top bar so terminal output doesn't overlap it.
-	termView.SetInsets(0, terminalTopBarH, 0, 0)
+	// Terminal fills the full window - the notch overlays on top
+	termView.SetInsets(0, 0, 0, 0)
 
 	opts := []initx.Option{
 		initx.WithDeviceTemplate(virtio.FSTemplate{
@@ -914,6 +974,11 @@ func (app *Application) stopVM() {
 	app.running = nil
 	app.mode = modeLauncher
 	app.selectedIndex = -1
+
+	// Reset notch UI state for next VM
+	app.networkDisabled = false
+	app.showExitConfirm = false
+
 	slog.Info("VM stopped; returned to launcher")
 }
 
