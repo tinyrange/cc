@@ -982,7 +982,7 @@ func main() {
 
 		// Build cc first
 		ccOut, err := goBuild(buildOptions{
-			Package:          "cmd/cc",
+			Package:          "internal/cmd/cc",
 			OutputName:       "cc",
 			Build:            hostBuild,
 			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
@@ -1189,7 +1189,7 @@ func main() {
 
 	// build cmd/cc by default
 	out, err := goBuild(buildOptions{
-		Package:          "cmd/cc",
+		Package:          "internal/cmd/cc",
 		OutputName:       "cc",
 		Build:            hostBuild,
 		EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
