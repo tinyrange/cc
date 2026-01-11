@@ -296,7 +296,16 @@ func compressionFromMediaType(mediaType string) (string, error) {
 func (c *Client) processManifest(ctx *registryContext, outputDir string, image string, manifest imageManifest) (*Image, error) {
 	var cfg RuntimeConfig
 
+	// Calculate total blob count for progress tracking
+	blobCount := len(manifest.Layers)
 	if manifest.Config.Digest != "" {
+		blobCount++
+	}
+	blobIndex := 0
+
+	if manifest.Config.Digest != "" {
+		c.SetBlobContext(blobIndex, blobCount)
+		blobIndex++
 		configPath, err := c.fetchToCache(ctx, fmt.Sprintf("/%s/blobs/%s", image, manifest.Config.Digest), nil)
 		if err != nil {
 			return nil, fmt.Errorf("fetch image config %s: %w", manifest.Config.Digest, err)
@@ -322,6 +331,8 @@ func (c *Client) processManifest(ctx *registryContext, outputDir string, image s
 	}
 
 	for _, layer := range manifest.Layers {
+		c.SetBlobContext(blobIndex, blobCount)
+		blobIndex++
 		layerPath, err := c.fetchToCache(ctx, fmt.Sprintf("/%s/blobs/%s", image, layer.Digest), nil)
 		if err != nil {
 			return nil, fmt.Errorf("fetch layer %s: %w", layer.Digest, err)

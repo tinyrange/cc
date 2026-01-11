@@ -27,6 +27,10 @@ type DownloadProgress struct {
 	Current  int64  // Bytes downloaded so far
 	Total    int64  // Total bytes to download (-1 if unknown)
 	Filename string // Name/path being downloaded
+
+	// Blob count tracking
+	BlobIndex int // Index of current blob (0-based)
+	BlobCount int // Total number of blobs to download
 }
 
 // ProgressCallback is called periodically during downloads.
@@ -38,6 +42,10 @@ type Client struct {
 	logger           *slog.Logger
 	client           *http.Client
 	progressCallback ProgressCallback
+
+	// Blob context for progress tracking
+	blobIndex int
+	blobCount int
 }
 
 // NewClient creates a new OCI client with the specified cache directory.
@@ -68,6 +76,13 @@ func NewClient(cacheDir string) (*Client, error) {
 // Set to nil to disable progress reporting.
 func (c *Client) SetProgressCallback(callback ProgressCallback) {
 	c.progressCallback = callback
+}
+
+// SetBlobContext sets the current blob index and total count for progress reporting.
+// This should be called before each blob download to track overall progress.
+func (c *Client) SetBlobContext(index, count int) {
+	c.blobIndex = index
+	c.blobCount = count
 }
 
 // registryContext holds state for communicating with a single registry.
@@ -250,10 +265,12 @@ func (c *Client) fetchToCache(ctx *registryContext, path string, accept []string
 		// handle progress display themselves and don't want terminal output.
 		if c.progressCallback != nil {
 			pw := &progressWriter{
-				w:        tmpFile,
-				total:    resp.ContentLength,
-				filename: path,
-				callback: c.progressCallback,
+				w:         tmpFile,
+				total:     resp.ContentLength,
+				filename:  path,
+				callback:  c.progressCallback,
+				blobIndex: c.blobIndex,
+				blobCount: c.blobCount,
 			}
 			writer = pw
 		} else {
@@ -313,11 +330,13 @@ func (c *Client) readJSON(ctx *registryContext, path string, accept []string, ou
 
 // progressWriter wraps an io.Writer and reports progress via a callback.
 type progressWriter struct {
-	w        io.Writer
-	current  int64
-	total    int64
-	filename string
-	callback ProgressCallback
+	w         io.Writer
+	current   int64
+	total     int64
+	filename  string
+	callback  ProgressCallback
+	blobIndex int
+	blobCount int
 }
 
 func (pw *progressWriter) Write(p []byte) (int, error) {
@@ -325,9 +344,11 @@ func (pw *progressWriter) Write(p []byte) (int, error) {
 	pw.current += int64(n)
 	if pw.callback != nil {
 		pw.callback(DownloadProgress{
-			Current:  pw.current,
-			Total:    pw.total,
-			Filename: pw.filename,
+			Current:   pw.current,
+			Total:     pw.total,
+			Filename:  pw.filename,
+			BlobIndex: pw.blobIndex,
+			BlobCount: pw.blobCount,
 		})
 	}
 	return n, err

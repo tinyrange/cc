@@ -472,6 +472,10 @@ type LoadingScreen struct {
 	logo          *ui.AnimatedLogo
 	progressBar   *ui.ProgressBar
 	progressLabel *ui.Label
+
+	// Blob count progress
+	blobProgressBar   *ui.ProgressBar
+	blobProgressLabel *ui.Label
 }
 
 // NewLoadingScreen creates the loading screen UI
@@ -517,7 +521,25 @@ func (s *LoadingScreen) buildUI() {
 	cardContent := ui.Column().WithGap(8)
 	cardContent.AddChild(ui.NewLabel(msg).WithSize(16).WithColor(colorTextPrimary), ui.DefaultFlexParams())
 
-	// Add progress label and bar (initially hidden until download starts)
+	// Blob count progress (overall progress)
+	s.blobProgressLabel = ui.NewLabel("").WithSize(12).WithColor(colorTextSecondary)
+	cardContent.AddChild(s.blobProgressLabel, ui.DefaultFlexParams())
+
+	s.blobProgressBar = ui.NewProgressBar().
+		WithMinWidth(280).
+		WithStyle(ui.ProgressBarStyle{
+			BackgroundColor: color.RGBA{R: 0x24, G: 0x28, B: 0x3b, A: 255},
+			FillColor:       colorGreen,
+			TextColor:       colorTextPrimary,
+			Height:          6,
+			CornerRadius:    3,
+			ShowPercentage:  false,
+			TextSize:        12,
+		}).
+		WithGraphicsWindow(s.app.window)
+	cardContent.AddChild(s.blobProgressBar, ui.DefaultFlexParams())
+
+	// Current blob progress (bytes downloaded)
 	s.progressLabel = ui.NewLabel("").WithSize(12).WithColor(colorTextSecondary)
 	cardContent.AddChild(s.progressLabel, ui.DefaultFlexParams())
 
@@ -570,6 +592,14 @@ func (s *LoadingScreen) Update(f graphics.Frame) {
 		s.logo.SetTime(t)
 	}
 
+	// Update blob count progress (overall progress)
+	if progress.BlobCount > 0 {
+		blobPercent := float64(progress.BlobIndex) / float64(progress.BlobCount)
+		s.blobProgressBar.SetValue(blobPercent)
+		s.blobProgressLabel.SetText(fmt.Sprintf("Downloading blob %d of %d", progress.BlobIndex+1, progress.BlobCount))
+	}
+
+	// Update current blob progress (bytes downloaded)
 	if progress.Total > 0 {
 		// Calculate progress percentage
 		percent := float64(progress.Current) / float64(progress.Total)
