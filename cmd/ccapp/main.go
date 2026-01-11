@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -862,6 +863,10 @@ func prepareBootBundle(b discoveredBundle, hvArch hv.CpuArchitecture) (_ *bootPr
 	slog.Info("resolved command path", "exec", execCmd, "work_dir", workDir)
 	prep.execCmd = execCmd
 	prep.env = img.Config.Env
+	// Ensure TERM is set for the container so terminal apps work correctly.
+	if !hasEnvVar(prep.env, "TERM") {
+		prep.env = append(prep.env, "TERM=xterm-256color")
+	}
 	prep.workDir = workDir
 
 	// Create VirtioFS backend
@@ -953,6 +958,10 @@ func (app *Application) finalizeBoot(prep *bootPrep) (retErr error) {
 	if err != nil {
 		return fmt.Errorf("create terminal view: %w", err)
 	}
+	// Drain any text input that accumulated while user was typing in UI fields
+	// (e.g., image name). Otherwise, the terminal view would receive this text
+	// as keyboard input when it starts processing.
+	_ = app.window.PlatformWindow().TextInput()
 	// Reserve space for CCApp's top bar so terminal output doesn't overlap it.
 	termView.SetInsets(0, terminalTopBarH, 0, 0)
 
@@ -1189,6 +1198,10 @@ func prepareFromImage(img *oci.Image, network bool, hvArch hv.CpuArchitecture) (
 	slog.Info("resolved command path", "exec", execCmd, "work_dir", workDir)
 	prep.execCmd = execCmd
 	prep.env = img.Config.Env
+	// Ensure TERM is set for the container so terminal apps work correctly.
+	if !hasEnvVar(prep.env, "TERM") {
+		prep.env = append(prep.env, "TERM=xterm-256color")
+	}
 	prep.workDir = workDir
 
 	// Create VirtioFS backend
@@ -1261,6 +1274,16 @@ func extractInitialPath(env []string) string {
 		}
 	}
 	return defaultPathEnv
+}
+
+func hasEnvVar(env []string, name string) bool {
+	prefix := name + "="
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func containerWorkDir(img *oci.Image) string {

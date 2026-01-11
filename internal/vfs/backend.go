@@ -1403,8 +1403,8 @@ func (v *virtioFsBackend) StatFS(nodeID uint64) (blocks uint64, bfree uint64, ba
 
 	v.ensureRoot()
 	_ = nodeID
-	total := uint64(1024)
-	free := uint64(900)
+	total := uint64(25 * 1024 * 1024) // 100GB in 4KB blocks
+	free := uint64(24 * 1024 * 1024)  // ~96GB free
 	return total, free, free, total, free, 4096, 4096, 255, 0
 }
 
