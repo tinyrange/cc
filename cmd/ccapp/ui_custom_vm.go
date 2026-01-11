@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/tinyrange/cc/internal/bundle"
 	"github.com/tinyrange/cc/internal/gowin/graphics"
@@ -29,17 +28,15 @@ type CustomVMScreen struct {
 	app  *Application
 
 	// State
-	mode           CustomVMMode
-	selectedPath   string
-	imageName      string
-	networkEnabled bool
+	mode         CustomVMMode
+	selectedPath string
+	imageName    string
 
 	// Widgets that need updating
 	tabBar         *ui.TabBar
 	pathInput      *ui.TextInput
 	browseButton   *ui.Button
 	imageInput     *ui.TextInput
-	networkToggle  *ui.Toggle
 	launchButton   *ui.Button
 	inputContainer *ui.FlexContainer
 }
@@ -47,10 +44,9 @@ type CustomVMScreen struct {
 // NewCustomVMScreen creates the custom VM selection screen
 func NewCustomVMScreen(app *Application) *CustomVMScreen {
 	screen := &CustomVMScreen{
-		root:           ui.NewRoot(app.text),
-		app:            app,
-		mode:           CustomVMModeBundleDir,
-		networkEnabled: false,
+		root: ui.NewRoot(app.text),
+		app:  app,
+		mode: CustomVMModeBundleDir,
 	}
 	screen.buildUI()
 	return screen
@@ -189,28 +185,6 @@ func (s *CustomVMScreen) buildUI() {
 	}
 	content.AddChild(inputCol, ui.DefaultFlexParams())
 
-	// Toggle for network access with mesh rendering for smooth shapes
-	networkRow := ui.Row().WithGap(12)
-	s.networkToggle = ui.NewToggle().
-		WithStyle(ui.ToggleStyle{
-			TrackWidth:        44,
-			TrackHeight:       24,
-			TrackColorOn:      colorAccent,   // Tokyo Night blue
-			TrackColorOff:     colorBtnNormal, // Tokyo Night storm
-			ThumbSize:         20,
-			ThumbColor:        colorTextPrimary,
-			ThumbPadding:      2,
-			AnimationDuration: 200 * time.Millisecond,
-		}).
-		WithGraphicsWindow(s.app.window). // Enable mesh rendering for smooth pill/circle shapes
-		OnChange(func(on bool) {
-			s.networkEnabled = on
-		})
-	s.networkToggle.SetOn(s.networkEnabled)
-	networkRow.AddChild(s.networkToggle, ui.DefaultFlexParams())
-	networkRow.AddChild(ui.NewLabel("Enable Internet Access").WithSize(14).WithColor(textColorPrimary), ui.DefaultFlexParams())
-	content.AddChild(networkRow, ui.DefaultFlexParams())
-
 	// Spacer to push buttons to bottom
 	content.AddChild(ui.NewSpacer(), ui.FlexParams(1))
 
@@ -338,19 +312,18 @@ func (s *CustomVMScreen) onLaunch() {
 		// Record to recent VMs
 		if s.app.recentVMs != nil {
 			s.app.recentVMs.AddOrUpdate(RecentVM{
-				Name:           bundleName,
-				SourceType:     sourceType,
-				SourcePath:     sourcePath,
-				NetworkEnabled: s.networkEnabled,
+				Name:       bundleName,
+				SourceType: sourceType,
+				SourcePath: sourcePath,
 			})
 			s.app.updateDockMenu()
 		}
-		s.app.startCustomVM(sourceType, sourcePath, s.networkEnabled)
+		s.app.startCustomVM(sourceType, sourcePath)
 		return
 	}
 
 	// For image/tarball, install as bundle
-	s.app.installBundle(sourceType, sourcePath, bundleName, s.networkEnabled)
+	s.app.installBundle(sourceType, sourcePath, bundleName)
 }
 
 // sanitizeImageName converts an image name to a valid directory name

@@ -286,7 +286,6 @@ func run() error {
 				Command:  img.Command(cmd),
 				CPUs:     cpusFlag.v,
 				MemoryMB: memoryFlag.v,
-				Network:  networkFlag.v,
 				Exec:     execFlag.v,
 				Dmesg:    dmesgFlag.v,
 			},
@@ -319,9 +318,6 @@ func run() error {
 		}
 		if !memoryFlag.set && meta.Boot.MemoryMB != 0 {
 			memoryFlag.v = meta.Boot.MemoryMB
-		}
-		if !networkFlag.set {
-			networkFlag.v = meta.Boot.Network
 		}
 		if !execFlag.set {
 			execFlag.v = meta.Boot.Exec

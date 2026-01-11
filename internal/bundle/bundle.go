@@ -30,7 +30,6 @@ type BootConfig struct {
 
 	CPUs     int    `yaml:"cpus,omitempty"`
 	MemoryMB uint64 `yaml:"memoryMB,omitempty"`
-	Network  bool   `yaml:"network,omitempty"`
 	Exec     bool   `yaml:"exec,omitempty"`
 	Dmesg    bool   `yaml:"dmesg,omitempty"`
 }

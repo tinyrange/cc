@@ -56,7 +56,6 @@ type bootPrep struct {
 	// bundle-derived config (with defaults applied)
 	cpus     int
 	memoryMB uint64
-	network  bool
 	dmesg    bool
 	exec     bool
 
@@ -338,7 +337,7 @@ func (app *Application) handleDockMenuClick(tag int) {
 		recent := app.recentVMs.GetRecent()
 		if index >= 0 && index < len(recent) {
 			vm := recent[index]
-			app.startCustomVM(vm.SourceType, vm.SourcePath, vm.NetworkEnabled)
+			app.startCustomVM(vm.SourceType, vm.SourcePath)
 		}
 	}
 }
@@ -641,10 +640,9 @@ func (app *Application) startBootBundle(index int) {
 	// Record to recent VMs
 	if app.recentVMs != nil {
 		app.recentVMs.AddOrUpdate(RecentVM{
-			Name:           name,
-			SourceType:     VMSourceBundle,
-			SourcePath:     b.Dir,
-			NetworkEnabled: b.Meta.Boot.Network,
+			Name:       name,
+			SourceType: VMSourceBundle,
+			SourcePath: b.Dir,
 		})
 		app.updateDockMenu()
 	}
@@ -767,27 +765,24 @@ func prepareBootBundle(b discoveredBundle, hvArch hv.CpuArchitecture) (_ *bootPr
 	if prep.memoryMB == 0 {
 		prep.memoryMB = 1024
 	}
-	prep.network = b.Meta.Boot.Network
 	prep.dmesg = b.Meta.Boot.Dmesg
 	prep.exec = b.Meta.Boot.Exec
-	slog.Info("vm config (prep)", "cpus", prep.cpus, "memory_mb", prep.memoryMB, "network", prep.network, "dmesg", prep.dmesg, "exec", prep.exec)
+	slog.Info("vm config (prep)", "cpus", prep.cpus, "memory_mb", prep.memoryMB, "dmesg", prep.dmesg, "exec", prep.exec)
 
-	var netBackend *netstack.NetStack
-	if prep.network {
-		slog.Info("network enabled; starting netstack DNS server")
-		netBackend = netstack.New(slog.Default())
-		if err := netBackend.StartDNSServer(); err != nil {
-			return nil, fmt.Errorf("start DNS server: %w", err)
-		}
-		prep.netBackend = netBackend
-
-		mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
-		virtioNet, err := virtio.NewNetstackBackend(netBackend, mac)
-		if err != nil {
-			return nil, fmt.Errorf("create netstack backend: %w", err)
-		}
-		prep.virtioNet = virtioNet
+	// Always create netstack and attach network device with internet enabled.
+	slog.Info("starting netstack DNS server")
+	netBackend := netstack.New(slog.Default())
+	if err := netBackend.StartDNSServer(); err != nil {
+		return nil, fmt.Errorf("start DNS server: %w", err)
 	}
+	prep.netBackend = netBackend
+
+	mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
+	virtioNet, err := virtio.NewNetstackBackend(netBackend, mac)
+	if err != nil {
+		return nil, fmt.Errorf("create netstack backend: %w", err)
+	}
+	prep.virtioNet = virtioNet
 
 	slog.Info("boot bundle prep complete", "bundle_dir", b.Dir, "bundle_name", b.Meta.Name)
 	return prep, nil
@@ -843,18 +838,17 @@ func (app *Application) finalizeBoot(prep *bootPrep) (retErr error) {
 		initx.WithDmesgLogging(prep.dmesg),
 	}
 
-	if prep.network {
-		if prep.netBackend == nil || prep.virtioNet == nil {
-			termView.Close()
-			return fmt.Errorf("network enabled but netstack was not prepared")
-		}
-		mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
-		opts = append(opts, initx.WithDeviceTemplate(virtio.NetTemplate{
-			Backend: prep.virtioNet,
-			MAC:     mac,
-			Arch:    prep.hvArch,
-		}))
+	// Always attach network device with internet access enabled.
+	if prep.netBackend == nil || prep.virtioNet == nil {
+		termView.Close()
+		return fmt.Errorf("netstack was not prepared")
 	}
+	mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
+	opts = append(opts, initx.WithDeviceTemplate(virtio.NetTemplate{
+		Backend: prep.virtioNet,
+		MAC:     mac,
+		Arch:    prep.hvArch,
+	}))
 
 	vm, err := initx.NewVirtualMachine(prep.hypervisor, prep.cpus, prep.memoryMB, prep.kernelLoader, opts...)
 	if err != nil {
@@ -862,13 +856,13 @@ func (app *Application) finalizeBoot(prep *bootPrep) (retErr error) {
 		return fmt.Errorf("create VM: %w", err)
 	}
 
-	// Build init program
+	// Build init program with network always enabled.
 	prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
 		Arch:          prep.hvArch,
 		Cmd:           prep.execCmd,
 		Env:           prep.env,
 		WorkDir:       prep.workDir,
-		EnableNetwork: prep.network,
+		EnableNetwork: true,
 		Exec:          prep.exec,
 	})
 	if err != nil {
@@ -924,7 +918,7 @@ func (app *Application) stopVM() {
 }
 
 // startCustomVM starts a VM from a custom source (tarball, image name, or bundle directory)
-func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string, network bool) {
+func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string) {
 	if app.bootCh != nil {
 		return // Already booting
 	}
@@ -956,7 +950,7 @@ func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string
 		app.bootProgressMu.Unlock()
 	}
 
-	go func(srcType VMSourceType, srcPath string, net bool, arch hv.CpuArchitecture, out chan<- bootResult, progressCb oci.ProgressCallback) {
+	go func(srcType VMSourceType, srcPath string, arch hv.CpuArchitecture, out chan<- bootResult, progressCb oci.ProgressCallback) {
 		var prep *bootPrep
 		var err error
 
@@ -968,27 +962,25 @@ func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string
 				out <- bootResult{err: metaErr}
 				return
 			}
-			// Override network setting
-			meta.Boot.Network = net
 			prep, err = prepareBootBundle(discoveredBundle{Dir: srcPath, Meta: meta}, arch)
 
 		case VMSourceTarball:
-			prep, err = prepareFromTarball(srcPath, net, arch)
+			prep, err = prepareFromTarball(srcPath, arch)
 
 		case VMSourceImageName:
-			prep, err = prepareFromImageName(srcPath, net, arch, progressCb)
+			prep, err = prepareFromImageName(srcPath, arch, progressCb)
 
 		default:
 			err = fmt.Errorf("unknown source type: %s", srcType)
 		}
 
 		out <- bootResult{prep: prep, err: err}
-	}(sourceType, sourcePath, network, hvArch, ch, progressCallback)
+	}(sourceType, sourcePath, hvArch, ch, progressCallback)
 }
 
 // installBundle installs a VM source as a bundle in the bundles directory.
 // For image names and tarballs, it creates a new bundle. For bundle dirs, it validates only.
-func (app *Application) installBundle(sourceType VMSourceType, sourcePath string, bundleName string, network bool) {
+func (app *Application) installBundle(sourceType VMSourceType, sourcePath string, bundleName string) {
 	if app.installCh != nil {
 		return // Already installing
 	}
@@ -1020,9 +1012,9 @@ func (app *Application) installBundle(sourceType VMSourceType, sourcePath string
 
 		switch sourceType {
 		case VMSourceImageName:
-			err = app.doInstallFromImageName(sourcePath, bundlePath, bundleName, network, hvArch, progressCallback)
+			err = app.doInstallFromImageName(sourcePath, bundlePath, bundleName, hvArch, progressCallback)
 		case VMSourceTarball:
-			err = app.doInstallFromTarball(sourcePath, bundlePath, bundleName, network, hvArch)
+			err = app.doInstallFromTarball(sourcePath, bundlePath, bundleName, hvArch)
 		case VMSourceBundle:
 			// For bundle dirs, just validate - don't copy
 			err = bundle.ValidateBundleDir(sourcePath)
@@ -1035,7 +1027,7 @@ func (app *Application) installBundle(sourceType VMSourceType, sourcePath string
 	}()
 }
 
-func (app *Application) doInstallFromImageName(imageName, bundlePath, name string, network bool, hvArch hv.CpuArchitecture, progress oci.ProgressCallback) error {
+func (app *Application) doInstallFromImageName(imageName, bundlePath, name string, hvArch hv.CpuArchitecture, progress oci.ProgressCallback) error {
 	slog.Info("installing image as bundle", "image", imageName, "dest", bundlePath)
 
 	client, err := oci.NewClient("")
@@ -1049,10 +1041,10 @@ func (app *Application) doInstallFromImageName(imageName, bundlePath, name strin
 		return fmt.Errorf("pull image: %w", err)
 	}
 
-	return installImageAsBundle(img, bundlePath, name, imageName, network)
+	return installImageAsBundle(img, bundlePath, name, imageName)
 }
 
-func (app *Application) doInstallFromTarball(tarPath, bundlePath, name string, network bool, hvArch hv.CpuArchitecture) error {
+func (app *Application) doInstallFromTarball(tarPath, bundlePath, name string, hvArch hv.CpuArchitecture) error {
 	slog.Info("installing tarball as bundle", "path", tarPath, "dest", bundlePath)
 
 	client, err := oci.NewClient("")
@@ -1065,10 +1057,10 @@ func (app *Application) doInstallFromTarball(tarPath, bundlePath, name string, n
 		return fmt.Errorf("load tar: %w", err)
 	}
 
-	return installImageAsBundle(img, bundlePath, name, tarPath, network)
+	return installImageAsBundle(img, bundlePath, name, tarPath)
 }
 
-func installImageAsBundle(img *oci.Image, bundlePath, name, source string, network bool) error {
+func installImageAsBundle(img *oci.Image, bundlePath, name, source string) error {
 	// Create image directory
 	imageDir := filepath.Join(bundlePath, "image")
 	if err := oci.ExportToDir(img, imageDir); err != nil {
@@ -1082,7 +1074,6 @@ func installImageAsBundle(img *oci.Image, bundlePath, name, source string, netwo
 		Description: fmt.Sprintf("Installed from %s", filepath.Base(source)),
 		Boot: bundle.BootConfig{
 			ImageDir: "image",
-			Network:  network,
 			Exec:     true,
 		},
 	}
@@ -1096,7 +1087,7 @@ func installImageAsBundle(img *oci.Image, bundlePath, name, source string, netwo
 }
 
 // prepareFromTarball loads a VM from an OCI tarball
-func prepareFromTarball(tarPath string, network bool, hvArch hv.CpuArchitecture) (*bootPrep, error) {
+func prepareFromTarball(tarPath string, hvArch hv.CpuArchitecture) (*bootPrep, error) {
 	slog.Info("loading VM from tarball", "path", tarPath, "arch", hvArch)
 
 	client, err := oci.NewClient("")
@@ -1109,11 +1100,11 @@ func prepareFromTarball(tarPath string, network bool, hvArch hv.CpuArchitecture)
 		return nil, fmt.Errorf("load tarball: %w", err)
 	}
 
-	return prepareFromImage(img, network, hvArch)
+	return prepareFromImage(img, hvArch)
 }
 
 // prepareFromImageName pulls a container image and prepares it for boot
-func prepareFromImageName(imageName string, network bool, hvArch hv.CpuArchitecture, progressCallback oci.ProgressCallback) (*bootPrep, error) {
+func prepareFromImageName(imageName string, hvArch hv.CpuArchitecture, progressCallback oci.ProgressCallback) (*bootPrep, error) {
 	slog.Info("pulling container image", "image", imageName, "arch", hvArch)
 
 	client, err := oci.NewClient("")
@@ -1131,11 +1122,11 @@ func prepareFromImageName(imageName string, network bool, hvArch hv.CpuArchitect
 		return nil, fmt.Errorf("pull image: %w", err)
 	}
 
-	return prepareFromImage(img, network, hvArch)
+	return prepareFromImage(img, hvArch)
 }
 
 // prepareFromImage prepares a VM from an already-loaded OCI image
-func prepareFromImage(img *oci.Image, network bool, hvArch hv.CpuArchitecture) (_ *bootPrep, retErr error) {
+func prepareFromImage(img *oci.Image, hvArch hv.CpuArchitecture) (_ *bootPrep, retErr error) {
 	prep := &bootPrep{hvArch: hvArch}
 	defer func() {
 		if retErr != nil {
@@ -1206,26 +1197,24 @@ func prepareFromImage(img *oci.Image, network bool, hvArch hv.CpuArchitecture) (
 	// VM options - use defaults
 	prep.cpus = 1
 	prep.memoryMB = 1024
-	prep.network = network
 	prep.dmesg = false
 	prep.exec = true
-	slog.Info("vm config", "cpus", prep.cpus, "memory_mb", prep.memoryMB, "network", prep.network)
+	slog.Info("vm config", "cpus", prep.cpus, "memory_mb", prep.memoryMB)
 
-	if prep.network {
-		slog.Info("network enabled; starting netstack DNS server")
-		netBackend := netstack.New(slog.Default())
-		if err := netBackend.StartDNSServer(); err != nil {
-			return nil, fmt.Errorf("start DNS server: %w", err)
-		}
-		prep.netBackend = netBackend
-
-		mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
-		virtioNet, err := virtio.NewNetstackBackend(netBackend, mac)
-		if err != nil {
-			return nil, fmt.Errorf("create netstack backend: %w", err)
-		}
-		prep.virtioNet = virtioNet
+	// Always create netstack and attach network device with internet enabled.
+	slog.Info("starting netstack DNS server")
+	netBackend := netstack.New(slog.Default())
+	if err := netBackend.StartDNSServer(); err != nil {
+		return nil, fmt.Errorf("start DNS server: %w", err)
 	}
+	prep.netBackend = netBackend
+
+	mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
+	virtioNet, err := virtio.NewNetstackBackend(netBackend, mac)
+	if err != nil {
+		return nil, fmt.Errorf("create netstack backend: %w", err)
+	}
+	prep.virtioNet = virtioNet
 
 	slog.Info("VM prep from image complete")
 	return prep, nil
