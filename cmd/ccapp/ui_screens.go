@@ -406,8 +406,12 @@ func (s *LauncherScreen) buildBundleCard(index int, b discoveredBundle) *bundleC
 	// Card content: vertical layout with image area and text
 	content := ui.Column().WithGap(8)
 
-	// Image placeholder area - clickable to start VM
-	imagePlaceholder := ui.NewCard(nil).
+	// Procedural icon area - clickable to start VM
+	iconWidget := ui.NewProceduralIconWidget(name).
+		WithSize(contentWidth, imageHeight).
+		WithGraphicsWindow(s.app.window)
+
+	imageCard := ui.NewCard(iconWidget).
 		WithStyle(ui.CardStyle{
 			BackgroundColor: colorTopBar,
 			CornerRadius:    cornerRadiusSmall,
@@ -422,7 +426,7 @@ func (s *LauncherScreen) buildBundleCard(index int, b discoveredBundle) *bundleC
 			s.app.selectedIndex = index
 			s.app.startBootBundle(index)
 		})
-	content.AddChild(imagePlaceholder, ui.DefaultFlexParams())
+	content.AddChild(imageCard, ui.DefaultFlexParams())
 
 	// Name and description with better spacing
 	content.AddChild(ui.NewWrapLabel(name).WithSize(16), ui.DefaultFlexParams())
@@ -1001,16 +1005,13 @@ func (s *TerminalScreen) RenderNotch(f graphics.Frame) {
 		justClicked := leftDown && !s.prevLeftDown
 		s.prevLeftDown = leftDown
 
-		if justClicked && isHovered {
-			// Check if click is on Exit button (left side of notch)
-			exitBtnRect := rect{x: hoverX + 10, y: 10, w: 50, h: 28}
-			if exitBtnRect.contains(mx, my) {
+		if justClicked {
+			// Use actual button bounds from the UI layout
+			if s.exitBtn.Bounds().Contains(mx, my) {
 				s.app.showExitConfirm = true
 			}
 
-			// Check if click is on Net button (right side of notch)
-			netBtnRect := rect{x: hoverX + hoverW - 60, y: 10, w: 50, h: 28}
-			if netBtnRect.contains(mx, my) {
+			if s.netBtn.Bounds().Contains(mx, my) {
 				s.app.networkDisabled = !s.app.networkDisabled
 				if s.app.running != nil && s.app.running.netBackend != nil {
 					s.app.running.netBackend.SetInternetAccessEnabled(!s.app.networkDisabled)
