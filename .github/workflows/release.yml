@@ -25,6 +25,7 @@ jobs:
           MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
         run: |
           echo $MACOS_CERTIFICATE | base64 --decode > certificate.p12
+          trap "rm -f certificate.p12" EXIT
           security create-keychain -p actions build.keychain
           security default-keychain -s build.keychain
           security unlock-keychain -p actions build.keychain
