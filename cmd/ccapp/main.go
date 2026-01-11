@@ -138,7 +138,8 @@ type Application struct {
 	installProgressMu sync.Mutex
 
 	// Error state (full-screen)
-	errMsg string
+	errMsg     string
+	fatalError bool // true if error is unrecoverable (e.g., no hypervisor)
 
 	// Discovered bundles
 	bundlesDir string
@@ -146,6 +147,9 @@ type Application struct {
 
 	// Current mode
 	mode appMode
+
+	// Pre-opened hypervisor (opened at startup, transferred to VM on boot)
+	hypervisor hv.Hypervisor
 
 	// Running VM (when in terminal mode)
 	running *runningVM
@@ -428,6 +432,27 @@ func (app *Application) Run() error {
 	app.launcherScreen = NewLauncherScreen(app)
 	app.terminalScreen = NewTerminalScreen(app)
 
+	// Open hypervisor at startup to check availability
+	slog.Info("opening hypervisor")
+	h, hvErr := factory.Open()
+	if hvErr != nil {
+		slog.Error("hypervisor unavailable at startup", "error", hvErr)
+		app.errMsg = formatHypervisorError(hvErr)
+		app.fatalError = true
+		app.mode = modeError
+	} else {
+		app.hypervisor = h
+		slog.Info("hypervisor opened successfully")
+	}
+
+	// Close hypervisor on exit if it wasn't transferred to a VM
+	defer func() {
+		if app.hypervisor != nil {
+			app.hypervisor.Close()
+			app.hypervisor = nil
+		}
+	}()
+
 	return app.window.Loop(func(f graphics.Frame) error {
 		switch app.mode {
 		case modeLauncher:
@@ -454,6 +479,55 @@ func (app *Application) showError(err error) {
 	}
 	app.errMsg = err.Error()
 	app.mode = modeError
+}
+
+// formatHypervisorError returns a user-friendly error message for hypervisor failures.
+func formatHypervisorError(err error) string {
+	errStr := err.Error()
+
+	// Linux KVM errors
+	if strings.Contains(errStr, "/dev/kvm") {
+		if strings.Contains(errStr, "permission denied") {
+			return "Cannot access /dev/kvm: permission denied.\n\n" +
+				"Add your user to the 'kvm' group:\n" +
+				"  sudo usermod -aG kvm $USER\n\n" +
+				"Then log out and log back in."
+		}
+		if strings.Contains(errStr, "no such file or directory") {
+			return "KVM is not available (/dev/kvm not found).\n\n" +
+				"Possible solutions:\n" +
+				"  1. Enable virtualization (VT-x/AMD-V) in your BIOS/UEFI settings\n" +
+				"  2. Install KVM: sudo apt install qemu-kvm (Debian/Ubuntu)\n" +
+				"  3. Load the KVM module: sudo modprobe kvm"
+		}
+	}
+
+	// macOS HVF errors
+	if strings.Contains(errStr, "Hypervisor.framework") {
+		return "Cannot load macOS Hypervisor.framework.\n\n" +
+			"This may happen if:\n" +
+			"  1. Virtualization is disabled in your Mac's security settings\n" +
+			"  2. The app is not properly signed\n" +
+			"  3. Your Mac doesn't support the Hypervisor framework"
+	}
+
+	// Windows WHP errors
+	if strings.Contains(errStr, "hypervisor not present") || strings.Contains(errStr, "whp:") {
+		return "Windows Hypervisor Platform is not available.\n\n" +
+			"To enable it:\n" +
+			"  1. Open 'Turn Windows features on or off'\n" +
+			"  2. Enable 'Windows Hypervisor Platform'\n" +
+			"  3. Restart your computer"
+	}
+
+	// Unsupported platform
+	if strings.Contains(errStr, "unsupported") {
+		return "Hypervisor is not supported on this platform.\n\n" +
+			"Virtualization may not be available on your hardware or operating system."
+	}
+
+	// Generic fallback
+	return fmt.Sprintf("Failed to initialize hypervisor: %s\n\nVMs cannot be started.", errStr)
 }
 
 func (app *Application) renderLauncher(f graphics.Frame) error {
@@ -722,14 +796,18 @@ func (app *Application) startBootBundle(index int) {
 	ch := make(chan bootResult, 1)
 	app.bootCh = ch
 
+	// Transfer ownership of pre-opened hypervisor to the boot prep
+	preOpenedHV := app.hypervisor
+	app.hypervisor = nil
+
 	// Background prep: do anything slow/off-GPU here (disk IO, kernel fetch, etc).
-	go func(b discoveredBundle, arch hv.CpuArchitecture, out chan<- bootResult) {
-		prep, err := prepareBootBundle(b, arch)
+	go func(b discoveredBundle, arch hv.CpuArchitecture, hvArg hv.Hypervisor, out chan<- bootResult) {
+		prep, err := prepareBootBundle(b, arch, hvArg)
 		out <- bootResult{prep: prep, err: err}
-	}(b, hvArch, ch)
+	}(b, hvArch, preOpenedHV, ch)
 }
 
-func prepareBootBundle(b discoveredBundle, hvArch hv.CpuArchitecture) (_ *bootPrep, retErr error) {
+func prepareBootBundle(b discoveredBundle, hvArch hv.CpuArchitecture, preOpenedHV hv.Hypervisor) (_ *bootPrep, retErr error) {
 	if b.Dir == "" {
 		return nil, fmt.Errorf("invalid bundle: empty dir")
 	}
@@ -801,12 +879,18 @@ func prepareBootBundle(b discoveredBundle, hvArch hv.CpuArchitecture) (_ *bootPr
 	}
 	prep.fsBackend = fsBackend
 
-	// Create hypervisor
-	h, err := factory.OpenWithArchitecture(hvArch)
-	if err != nil {
-		return nil, fmt.Errorf("create hypervisor: %w", err)
+	// Use pre-opened hypervisor or create a new one
+	if preOpenedHV != nil {
+		slog.Info("using pre-opened hypervisor")
+		prep.hypervisor = preOpenedHV
+	} else {
+		slog.Info("opening new hypervisor")
+		h, err := factory.OpenWithArchitecture(hvArch)
+		if err != nil {
+			return nil, fmt.Errorf("create hypervisor: %w", err)
+		}
+		prep.hypervisor = h
 	}
-	prep.hypervisor = h
 
 	// Load kernel
 	kernelLoader, err := kernel.LoadForArchitecture(hvArch)
@@ -1008,6 +1092,10 @@ func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string
 	ch := make(chan bootResult, 1)
 	app.bootCh = ch
 
+	// Transfer ownership of pre-opened hypervisor to the boot prep
+	preOpenedHV := app.hypervisor
+	app.hypervisor = nil
+
 	// Create progress callback for image downloads
 	progressCallback := func(progress oci.DownloadProgress) {
 		app.bootProgressMu.Lock()
@@ -1015,7 +1103,7 @@ func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string
 		app.bootProgressMu.Unlock()
 	}
 
-	go func(srcType VMSourceType, srcPath string, arch hv.CpuArchitecture, out chan<- bootResult, progressCb oci.ProgressCallback) {
+	go func(srcType VMSourceType, srcPath string, arch hv.CpuArchitecture, hvArg hv.Hypervisor, out chan<- bootResult, progressCb oci.ProgressCallback) {
 		var prep *bootPrep
 		var err error
 
@@ -1027,20 +1115,20 @@ func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string
 				out <- bootResult{err: metaErr}
 				return
 			}
-			prep, err = prepareBootBundle(discoveredBundle{Dir: srcPath, Meta: meta}, arch)
+			prep, err = prepareBootBundle(discoveredBundle{Dir: srcPath, Meta: meta}, arch, hvArg)
 
 		case VMSourceTarball:
-			prep, err = prepareFromTarball(srcPath, arch)
+			prep, err = prepareFromTarball(srcPath, arch, hvArg)
 
 		case VMSourceImageName:
-			prep, err = prepareFromImageName(srcPath, arch, progressCb)
+			prep, err = prepareFromImageName(srcPath, arch, hvArg, progressCb)
 
 		default:
 			err = fmt.Errorf("unknown source type: %s", srcType)
 		}
 
 		out <- bootResult{prep: prep, err: err}
-	}(sourceType, sourcePath, hvArch, ch, progressCallback)
+	}(sourceType, sourcePath, hvArch, preOpenedHV, ch, progressCallback)
 }
 
 // installBundle installs a VM source as a bundle in the bundles directory.
@@ -1152,7 +1240,7 @@ func installImageAsBundle(img *oci.Image, bundlePath, name, source string) error
 }
 
 // prepareFromTarball loads a VM from an OCI tarball
-func prepareFromTarball(tarPath string, hvArch hv.CpuArchitecture) (*bootPrep, error) {
+func prepareFromTarball(tarPath string, hvArch hv.CpuArchitecture, preOpenedHV hv.Hypervisor) (*bootPrep, error) {
 	slog.Info("loading VM from tarball", "path", tarPath, "arch", hvArch)
 
 	client, err := oci.NewClient("")
@@ -1165,11 +1253,11 @@ func prepareFromTarball(tarPath string, hvArch hv.CpuArchitecture) (*bootPrep, e
 		return nil, fmt.Errorf("load tarball: %w", err)
 	}
 
-	return prepareFromImage(img, hvArch)
+	return prepareFromImage(img, hvArch, preOpenedHV)
 }
 
 // prepareFromImageName pulls a container image and prepares it for boot
-func prepareFromImageName(imageName string, hvArch hv.CpuArchitecture, progressCallback oci.ProgressCallback) (*bootPrep, error) {
+func prepareFromImageName(imageName string, hvArch hv.CpuArchitecture, preOpenedHV hv.Hypervisor, progressCallback oci.ProgressCallback) (*bootPrep, error) {
 	slog.Info("pulling container image", "image", imageName, "arch", hvArch)
 
 	client, err := oci.NewClient("")
@@ -1187,11 +1275,11 @@ func prepareFromImageName(imageName string, hvArch hv.CpuArchitecture, progressC
 		return nil, fmt.Errorf("pull image: %w", err)
 	}
 
-	return prepareFromImage(img, hvArch)
+	return prepareFromImage(img, hvArch, preOpenedHV)
 }
 
 // prepareFromImage prepares a VM from an already-loaded OCI image
-func prepareFromImage(img *oci.Image, hvArch hv.CpuArchitecture) (_ *bootPrep, retErr error) {
+func prepareFromImage(img *oci.Image, hvArch hv.CpuArchitecture, preOpenedHV hv.Hypervisor) (_ *bootPrep, retErr error) {
 	prep := &bootPrep{hvArch: hvArch}
 	defer func() {
 		if retErr != nil {
@@ -1244,12 +1332,18 @@ func prepareFromImage(img *oci.Image, hvArch hv.CpuArchitecture) (_ *bootPrep, r
 	}
 	prep.fsBackend = fsBackend
 
-	// Create hypervisor
-	h, err := factory.OpenWithArchitecture(hvArch)
-	if err != nil {
-		return nil, fmt.Errorf("create hypervisor: %w", err)
+	// Use pre-opened hypervisor or create a new one
+	if preOpenedHV != nil {
+		slog.Info("using pre-opened hypervisor")
+		prep.hypervisor = preOpenedHV
+	} else {
+		slog.Info("opening new hypervisor")
+		h, err := factory.OpenWithArchitecture(hvArch)
+		if err != nil {
+			return nil, fmt.Errorf("create hypervisor: %w", err)
+		}
+		prep.hypervisor = h
 	}
-	prep.hypervisor = h
 
 	// Load kernel
 	kernelLoader, err := kernel.LoadForArchitecture(hvArch)

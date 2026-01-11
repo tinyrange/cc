@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image/color"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"time"
 
@@ -684,17 +685,32 @@ func (s *ErrorScreen) buildUI() {
 	// Primary action button (blue accent)
 	primaryStyle := primaryButtonStyle()
 	primaryStyle.MinWidth = 280
-	buttonCol.AddChild(
-		ui.NewButton("Back to Launcher").
-			WithStyle(primaryStyle).
-			WithGraphicsWindow(s.app.window).
-			OnClick(func() {
-				s.app.errMsg = ""
-				s.app.selectedIndex = -1
-				s.app.mode = modeLauncher
-			}),
-		ui.DefaultFlexParams(),
-	)
+
+	if s.app.fatalError {
+		// Fatal error - show Quit button
+		buttonCol.AddChild(
+			ui.NewButton("Quit").
+				WithStyle(primaryStyle).
+				WithGraphicsWindow(s.app.window).
+				OnClick(func() {
+					os.Exit(1)
+				}),
+			ui.DefaultFlexParams(),
+		)
+	} else {
+		// Recoverable error - show Back to Launcher button
+		buttonCol.AddChild(
+			ui.NewButton("Back to Launcher").
+				WithStyle(primaryStyle).
+				WithGraphicsWindow(s.app.window).
+				OnClick(func() {
+					s.app.errMsg = ""
+					s.app.selectedIndex = -1
+					s.app.mode = modeLauncher
+				}),
+			ui.DefaultFlexParams(),
+		)
+	}
 
 	// Secondary action button (muted)
 	secondaryStyle := secondaryButtonStyle()
