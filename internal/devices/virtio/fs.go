@@ -2074,6 +2074,10 @@ func (v *FS) CaptureSnapshot() (hv.DeviceSnapshot, error) {
 		IRQLine: v.irqLine,
 		Tag:     v.tag,
 	}
+	// Capture MMIO device state (queue indices, features, etc.)
+	if mmio, ok := v.device.(*mmioDevice); ok {
+		snap.MMIODevice = mmio.CaptureMMIOSnapshot()
+	}
 	return snap, nil
 }
 
@@ -2090,16 +2094,21 @@ func (v *FS) RestoreSnapshot(snap hv.DeviceSnapshot) error {
 	if mmio, ok := v.device.(*mmioDevice); ok {
 		mmio.base = v.base
 		mmio.size = v.size
+		// Restore MMIO device state (queue indices, features, etc.)
+		if err := mmio.RestoreMMIOSnapshot(data.MMIODevice); err != nil {
+			return fmt.Errorf("virtio-fs: restore MMIO state: %w", err)
+		}
 	}
 	return nil
 }
 
 type fsSnapshot struct {
-	Arch    hv.CpuArchitecture
-	Base    uint64
-	Size    uint64
-	IRQLine uint32
-	Tag     [fsCfgTagSize]byte
+	Arch       hv.CpuArchitecture
+	Base       uint64
+	Size       uint64
+	IRQLine    uint32
+	Tag        [fsCfgTagSize]byte
+	MMIODevice MMIODeviceSnapshot
 }
 
 var (

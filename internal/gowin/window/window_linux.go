@@ -1078,3 +1078,4 @@ func getDisplayScale() float32 {
 	screen := xDefaultScreen(dpy)
 	return calculateScale(dpy, screen)
 }
+

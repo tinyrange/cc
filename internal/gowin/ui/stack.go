@@ -36,12 +36,33 @@ func (s *Stack) Children() []Widget {
 }
 
 func (s *Stack) Layout(ctx *LayoutContext, constraints Constraints) Size {
-	// Stack takes all available space
+	// Track maximum child size
+	var maxW, maxH float32
+
 	// Layout each child with the same constraints
 	for _, child := range s.children {
-		child.Layout(ctx, constraints)
+		childSize := child.Layout(ctx, constraints)
+		if childSize.W > maxW {
+			maxW = childSize.W
+		}
+		if childSize.H > maxH {
+			maxH = childSize.H
+		}
 	}
-	return Size{W: constraints.MaxW, H: constraints.MaxH}
+
+	// If constraints are bounded, fill available space
+	// Otherwise, use the maximum child size
+	const unboundedThreshold = 1e8
+	w := maxW
+	h := maxH
+	if constraints.MaxW < unboundedThreshold {
+		w = constraints.MaxW
+	}
+	if constraints.MaxH < unboundedThreshold {
+		h = constraints.MaxH
+	}
+
+	return Size{W: w, H: h}
 }
 
 func (s *Stack) SetBounds(bounds Rect) {

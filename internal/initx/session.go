@@ -24,6 +24,13 @@ type SessionConfig struct {
 	// BootTimeout controls how long we wait for the initial boot program to run.
 	// If zero, a default of 10 seconds is used.
 	BootTimeout time.Duration
+
+	// SkipBoot skips the boot phase. Use this when restoring from a snapshot.
+	SkipBoot bool
+
+	// OnBootComplete is called after boot completes successfully but before
+	// the payload runs. Use this to capture a snapshot after boot.
+	OnBootComplete func() error
 }
 
 type sessionRunner interface {
@@ -46,12 +53,21 @@ func startSession(parent context.Context, vmPtr *VirtualMachine, runner sessionR
 	doneCh := make(chan error, 1)
 
 	go func() {
-		bootCtx, bootCancel := context.WithTimeout(ctx, bootTimeout)
-		defer bootCancel()
+		if !cfg.SkipBoot {
+			bootCtx, bootCancel := context.WithTimeout(ctx, bootTimeout)
+			defer bootCancel()
 
-		if err := runner.Boot(bootCtx); err != nil {
-			doneCh <- err
-			return
+			if err := runner.Boot(bootCtx); err != nil {
+				doneCh <- err
+				return
+			}
+
+			if cfg.OnBootComplete != nil {
+				if err := cfg.OnBootComplete(); err != nil {
+					doneCh <- err
+					return
+				}
+			}
 		}
 
 		runner.StartStdinForwarding()

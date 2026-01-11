@@ -23,9 +23,9 @@ const (
 
 // picStats tracks statistics for a PIC.
 type picStats struct {
-	spuriousInterrupts uint64
-	acknowledges       uint64
-	perIRQ             [8]uint64
+	SpuriousInterrupts uint64
+	Acknowledges       uint64
+	PerIRQ             [8]uint64
 }
 
 // DualPIC implements the classic pair of cascaded 8259A controllers.
@@ -207,29 +207,29 @@ func (p *DualPIC) Acknowledge() (bool, uint8) {
 		secRequested, secVec := p.pics[1].acknowledgeInterrupt(&p.stats)
 		if !secRequested {
 			// Spurious interrupt from secondary PIC (IRQ15 = secondary's IRQ7)
-			p.stats.spuriousInterrupts++
+			p.stats.SpuriousInterrupts++
 			vec = secVec // Return secondary's spurious vector (IRQ15)
 			p.syncOutputsLocked()
 			return false, vec
 		}
 		vec = secVec
 		// Track acknowledge for secondary PIC
-		p.stats.acknowledges++
+		p.stats.Acknowledges++
 		irq := vec & picIRQMask
 		if irq < 8 {
 			// Track per-IRQ within PIC (0-7 for each PIC)
-			p.stats.perIRQ[irq]++
+			p.stats.PerIRQ[irq]++
 		}
 	} else if requested {
 		// Track acknowledge for primary PIC
-		p.stats.acknowledges++
+		p.stats.Acknowledges++
 		irq := vec & picIRQMask
 		if irq < 8 {
-			p.stats.perIRQ[irq]++
+			p.stats.PerIRQ[irq]++
 		}
 	} else {
 		// Spurious interrupt from primary PIC (IRQ7)
-		p.stats.spuriousInterrupts++
+		p.stats.SpuriousInterrupts++
 	}
 	p.syncOutputsLocked()
 	if requested && p.ackHook != nil {

@@ -46,10 +46,36 @@ func arm64CoreRegister(offsetBytes uintptr) uint64 {
 	return kvmRegArm64 | kvmRegSizeU64 | kvmRegArmCore | uint64(offsetBytes/4)
 }
 
-var arm64SysRegVbarEl1 = arm64SysReg(3, 0, 12, 0, 0)
+// ARM64 system register encodings: arm64SysReg(op0, op1, crn, crm, op2)
+var (
+	arm64SysRegVbarEl1       = arm64SysReg(3, 0, 12, 0, 0)
+	arm64SysRegSctlrEl1      = arm64SysReg(3, 0, 1, 0, 0)
+	arm64SysRegTcrEl1        = arm64SysReg(3, 0, 2, 0, 2)
+	arm64SysRegTtbr0El1      = arm64SysReg(3, 0, 2, 0, 0)
+	arm64SysRegTtbr1El1      = arm64SysReg(3, 0, 2, 0, 1)
+	arm64SysRegMairEl1       = arm64SysReg(3, 0, 10, 2, 0)
+	arm64SysRegElrEl1        = arm64SysReg(3, 0, 4, 0, 1)
+	arm64SysRegSpsrEl1       = arm64SysReg(3, 0, 4, 0, 0)
+	arm64SysRegEsrEl1        = arm64SysReg(3, 0, 5, 2, 0)
+	arm64SysRegFarEl1        = arm64SysReg(3, 0, 6, 0, 0)
+	arm64SysRegSpEl0         = arm64SysReg(3, 0, 4, 1, 0)
+	arm64SysRegSpEl1         = arm64SysReg(3, 4, 4, 1, 0)
+	arm64SysRegCntkctlEl1    = arm64SysReg(3, 0, 14, 1, 0)
+	arm64SysRegCntvCtlEl0    = arm64SysReg(3, 3, 14, 3, 1)
+	arm64SysRegCntvCvalEl0   = arm64SysReg(3, 3, 14, 3, 2)
+	arm64SysRegCpacrEl1      = arm64SysReg(3, 0, 1, 0, 2)
+	arm64SysRegContextidrEl1 = arm64SysReg(3, 0, 13, 0, 1)
+	arm64SysRegTpidrEl0      = arm64SysReg(3, 3, 13, 0, 2)
+	arm64SysRegTpidrEl1      = arm64SysReg(3, 0, 13, 0, 4)
+	arm64SysRegTpidrroEl0    = arm64SysReg(3, 3, 13, 0, 3)
+	arm64SysRegParEl1        = arm64SysReg(3, 0, 7, 4, 0)
+	arm64SysRegAfsr0El1      = arm64SysReg(3, 0, 5, 1, 0)
+	arm64SysRegAfsr1El1      = arm64SysReg(3, 0, 5, 1, 1)
+	arm64SysRegAmairEl1      = arm64SysReg(3, 0, 10, 3, 0)
+)
 
 var arm64RegisterIDs = func() map[hv.Register]uint64 {
-	regs := make(map[hv.Register]uint64, 36)
+	regs := make(map[hv.Register]uint64, 60)
 
 	for i := 0; i <= 30; i++ {
 		reg := hv.Register(int(hv.RegisterARM64X0) + i)
@@ -60,6 +86,31 @@ var arm64RegisterIDs = func() map[hv.Register]uint64 {
 	regs[hv.RegisterARM64Pc] = arm64CoreRegister(uintptr(32 * 8))
 	regs[hv.RegisterARM64Pstate] = arm64CoreRegister(uintptr(33 * 8))
 	regs[hv.RegisterARM64Vbar] = arm64SysRegVbarEl1
+
+	// System registers for snapshots
+	regs[hv.RegisterARM64SctlrEl1] = arm64SysRegSctlrEl1
+	regs[hv.RegisterARM64TcrEl1] = arm64SysRegTcrEl1
+	regs[hv.RegisterARM64Ttbr0El1] = arm64SysRegTtbr0El1
+	regs[hv.RegisterARM64Ttbr1El1] = arm64SysRegTtbr1El1
+	regs[hv.RegisterARM64MairEl1] = arm64SysRegMairEl1
+	regs[hv.RegisterARM64ElrEl1] = arm64SysRegElrEl1
+	regs[hv.RegisterARM64SpsrEl1] = arm64SysRegSpsrEl1
+	regs[hv.RegisterARM64EsrEl1] = arm64SysRegEsrEl1
+	regs[hv.RegisterARM64FarEl1] = arm64SysRegFarEl1
+	regs[hv.RegisterARM64SpEl0] = arm64SysRegSpEl0
+	regs[hv.RegisterARM64SpEl1] = arm64SysRegSpEl1
+	regs[hv.RegisterARM64CntkctlEl1] = arm64SysRegCntkctlEl1
+	regs[hv.RegisterARM64CntvCtlEl0] = arm64SysRegCntvCtlEl0
+	regs[hv.RegisterARM64CntvCvalEl0] = arm64SysRegCntvCvalEl0
+	regs[hv.RegisterARM64CpacrEl1] = arm64SysRegCpacrEl1
+	regs[hv.RegisterARM64ContextidrEl1] = arm64SysRegContextidrEl1
+	regs[hv.RegisterARM64TpidrEl0] = arm64SysRegTpidrEl0
+	regs[hv.RegisterARM64TpidrEl1] = arm64SysRegTpidrEl1
+	regs[hv.RegisterARM64TpidrroEl0] = arm64SysRegTpidrroEl0
+	regs[hv.RegisterARM64ParEl1] = arm64SysRegParEl1
+	regs[hv.RegisterARM64Afsr0El1] = arm64SysRegAfsr0El1
+	regs[hv.RegisterARM64Afsr1El1] = arm64SysRegAfsr1El1
+	regs[hv.RegisterARM64AmairEl1] = arm64SysRegAmairEl1
 
 	return regs
 }()
@@ -372,10 +423,12 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 		}
 	}
 
+	v.memMu.Lock()
 	if len(v.memory) > 0 {
 		ret.memory = make([]byte, len(v.memory))
 		copy(ret.memory, v.memory)
 	}
+	v.memMu.Unlock()
 
 	return ret, nil
 }
@@ -387,13 +440,16 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 		return fmt.Errorf("invalid snapshot type")
 	}
 
+	v.memMu.Lock()
 	if len(v.memory) != len(snapshotData.memory) {
+		v.memMu.Unlock()
 		return fmt.Errorf("snapshot memory size mismatch: got %d bytes, want %d bytes",
 			len(snapshotData.memory), len(v.memory))
 	}
 	if len(v.memory) > 0 {
 		copy(v.memory, snapshotData.memory)
 	}
+	v.memMu.Unlock()
 
 	for i := range v.vcpus {
 		state, ok := snapshotData.cpuStates[i]

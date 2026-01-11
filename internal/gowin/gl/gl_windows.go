@@ -76,6 +76,27 @@ type openGL struct {
 	// Drawing
 	drawArrays   Proc
 	drawElements Proc
+
+	// Framebuffer operations
+	genFramebuffers        Proc
+	deleteFramebuffers     Proc
+	bindFramebuffer        Proc
+	framebufferTexture2D   Proc
+	checkFramebufferStatus Proc
+
+	// Renderbuffer operations
+	genRenderbuffers        Proc
+	deleteRenderbuffers     Proc
+	bindRenderbuffer        Proc
+	renderbufferStorage     Proc
+	framebufferRenderbuffer Proc
+
+	// Additional uniform operations
+	uniform1f Proc
+	uniform2f Proc
+
+	// Texture cleanup
+	deleteTextures Proc
 }
 
 func (gl *openGL) ClearColor(r, g, b, a float32) {
@@ -294,6 +315,67 @@ func (gl *openGL) DrawElements(mode uint32, count int32, xtype uint32, indices u
 	gl.drawElements.Call(uintptr(mode), uintptr(count), uintptr(xtype), indices)
 }
 
+// Framebuffer operations
+
+func (gl *openGL) GenFramebuffers(n int32, framebuffers *uint32) {
+	gl.genFramebuffers.Call(uintptr(n), uintptr(unsafe.Pointer(framebuffers)))
+}
+
+func (gl *openGL) DeleteFramebuffers(n int32, framebuffers *uint32) {
+	gl.deleteFramebuffers.Call(uintptr(n), uintptr(unsafe.Pointer(framebuffers)))
+}
+
+func (gl *openGL) BindFramebuffer(target uint32, framebuffer uint32) {
+	gl.bindFramebuffer.Call(uintptr(target), uintptr(framebuffer))
+}
+
+func (gl *openGL) FramebufferTexture2D(target, attachment, textarget, texture uint32, level int32) {
+	gl.framebufferTexture2D.Call(uintptr(target), uintptr(attachment), uintptr(textarget), uintptr(texture), uintptr(level))
+}
+
+func (gl *openGL) CheckFramebufferStatus(target uint32) uint32 {
+	ret, _, _ := gl.checkFramebufferStatus.Call(uintptr(target))
+	return uint32(ret)
+}
+
+// Renderbuffer operations
+
+func (gl *openGL) GenRenderbuffers(n int32, renderbuffers *uint32) {
+	gl.genRenderbuffers.Call(uintptr(n), uintptr(unsafe.Pointer(renderbuffers)))
+}
+
+func (gl *openGL) DeleteRenderbuffers(n int32, renderbuffers *uint32) {
+	gl.deleteRenderbuffers.Call(uintptr(n), uintptr(unsafe.Pointer(renderbuffers)))
+}
+
+func (gl *openGL) BindRenderbuffer(target uint32, renderbuffer uint32) {
+	gl.bindRenderbuffer.Call(uintptr(target), uintptr(renderbuffer))
+}
+
+func (gl *openGL) RenderbufferStorage(target, internalformat uint32, width, height int32) {
+	gl.renderbufferStorage.Call(uintptr(target), uintptr(internalformat), uintptr(width), uintptr(height))
+}
+
+func (gl *openGL) FramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer uint32) {
+	gl.framebufferRenderbuffer.Call(uintptr(target), uintptr(attachment), uintptr(renderbuffertarget), uintptr(renderbuffer))
+}
+
+// Additional uniform operations
+
+func (gl *openGL) Uniform1f(location int32, v0 float32) {
+	gl.uniform1f.Call(uintptr(location), f32(v0))
+}
+
+func (gl *openGL) Uniform2f(location int32, v0, v1 float32) {
+	gl.uniform2f.Call(uintptr(location), f32(v0), f32(v1))
+}
+
+// Texture cleanup
+
+func (gl *openGL) DeleteTextures(n int32, textures *uint32) {
+	gl.deleteTextures.Call(uintptr(n), uintptr(unsafe.Pointer(textures)))
+}
+
 func Load() (OpenGL, error) {
 	opengl32 := syscall.NewLazyDLL("opengl32.dll")
 	wglGetProcAddress := opengl32.NewProc("wglGetProcAddress")
@@ -360,6 +442,27 @@ func Load() (OpenGL, error) {
 		uniformMatrix4fv:        loadProc("glUniformMatrix4fv"),
 		drawArrays:              loadProc("glDrawArrays"),
 		drawElements:            loadProc("glDrawElements"),
+
+		// Framebuffer operations
+		genFramebuffers:        loadProc("glGenFramebuffers"),
+		deleteFramebuffers:     loadProc("glDeleteFramebuffers"),
+		bindFramebuffer:        loadProc("glBindFramebuffer"),
+		framebufferTexture2D:   loadProc("glFramebufferTexture2D"),
+		checkFramebufferStatus: loadProc("glCheckFramebufferStatus"),
+
+		// Renderbuffer operations
+		genRenderbuffers:        loadProc("glGenRenderbuffers"),
+		deleteRenderbuffers:     loadProc("glDeleteRenderbuffers"),
+		bindRenderbuffer:        loadProc("glBindRenderbuffer"),
+		renderbufferStorage:    loadProc("glRenderbufferStorage"),
+		framebufferRenderbuffer: loadProc("glFramebufferRenderbuffer"),
+
+		// Additional uniform operations
+		uniform1f: loadProc("glUniform1f"),
+		uniform2f: loadProc("glUniform2f"),
+
+		// Texture cleanup
+		deleteTextures: opengl32.NewProc("glDeleteTextures"),
 	}
 	return gl, nil
 }

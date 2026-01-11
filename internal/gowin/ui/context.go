@@ -24,6 +24,15 @@ func NewLayoutContext(txt *text.Renderer, scale float32) *LayoutContext {
 type DrawContext struct {
 	Frame graphics.Frame
 	Text  *text.Renderer
+
+	// BlurEffect provides optional blur support.
+	// May be nil if blur is not initialized.
+	BlurEffect *graphics.BlurEffect
+
+	// BlurredBackground is a cached blurred texture of the background.
+	// Widgets can use this for glassmorphism effects.
+	// May be nil if no blur has been applied.
+	BlurredBackground graphics.Texture
 }
 
 // EventContext provides context during event handling.
@@ -131,6 +140,13 @@ func (r *Root) Draw(f graphics.Frame) {
 // Step is a convenience method that performs update, layout, and draw.
 func (r *Root) Step(f graphics.Frame, pw window.Window) {
 	r.Update(f, pw)
+	r.Layout(f)
+	r.Draw(f)
+}
+
+// DrawOnly performs layout and draw without processing input events.
+// Use this when rendering a screen as a background behind another screen.
+func (r *Root) DrawOnly(f graphics.Frame) {
 	r.Layout(f)
 	r.Draw(f)
 }

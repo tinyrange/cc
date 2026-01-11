@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -67,6 +68,83 @@ var registerMap = map[hv.Register]bindings.Reg{
 var sysRegisterMap = map[hv.Register]bindings.SysReg{
 	hv.RegisterARM64Vbar: bindings.HV_SYS_REG_VBAR_EL1,
 	hv.RegisterARM64Sp:   bindings.HV_SYS_REG_SP_EL1,
+}
+
+// GP registers to capture for snapshots (X0-X30, PC, CPSR, FPCR, FPSR)
+var hvfGPRegsToCapture = []bindings.Reg{
+	bindings.HV_REG_X0, bindings.HV_REG_X1, bindings.HV_REG_X2, bindings.HV_REG_X3,
+	bindings.HV_REG_X4, bindings.HV_REG_X5, bindings.HV_REG_X6, bindings.HV_REG_X7,
+	bindings.HV_REG_X8, bindings.HV_REG_X9, bindings.HV_REG_X10, bindings.HV_REG_X11,
+	bindings.HV_REG_X12, bindings.HV_REG_X13, bindings.HV_REG_X14, bindings.HV_REG_X15,
+	bindings.HV_REG_X16, bindings.HV_REG_X17, bindings.HV_REG_X18, bindings.HV_REG_X19,
+	bindings.HV_REG_X20, bindings.HV_REG_X21, bindings.HV_REG_X22, bindings.HV_REG_X23,
+	bindings.HV_REG_X24, bindings.HV_REG_X25, bindings.HV_REG_X26, bindings.HV_REG_X27,
+	bindings.HV_REG_X28, bindings.HV_REG_X29, bindings.HV_REG_X30,
+	bindings.HV_REG_PC, bindings.HV_REG_CPSR, bindings.HV_REG_FPCR, bindings.HV_REG_FPSR,
+}
+
+// System registers to capture for snapshots
+var hvfSysRegsToCapture = []bindings.SysReg{
+	// Memory management
+	bindings.HV_SYS_REG_SCTLR_EL1,
+	bindings.HV_SYS_REG_TCR_EL1,
+	bindings.HV_SYS_REG_TTBR0_EL1,
+	bindings.HV_SYS_REG_TTBR1_EL1,
+	bindings.HV_SYS_REG_MAIR_EL1,
+	// Exception handling
+	bindings.HV_SYS_REG_VBAR_EL1,
+	bindings.HV_SYS_REG_ELR_EL1,
+	bindings.HV_SYS_REG_SPSR_EL1,
+	bindings.HV_SYS_REG_ESR_EL1,
+	bindings.HV_SYS_REG_FAR_EL1,
+	// Stack pointers
+	bindings.HV_SYS_REG_SP_EL0,
+	bindings.HV_SYS_REG_SP_EL1,
+	// Timers (virtual timer only - physical timer is not accessible via HVF)
+	bindings.HV_SYS_REG_CNTKCTL_EL1,
+	bindings.HV_SYS_REG_CNTV_CTL_EL0,
+	bindings.HV_SYS_REG_CNTV_CVAL_EL0,
+	// Misc
+	bindings.HV_SYS_REG_CPACR_EL1,
+	bindings.HV_SYS_REG_CONTEXTIDR_EL1,
+	bindings.HV_SYS_REG_TPIDR_EL0,
+	bindings.HV_SYS_REG_TPIDR_EL1,
+	bindings.HV_SYS_REG_TPIDRRO_EL0,
+	bindings.HV_SYS_REG_PAR_EL1,
+	bindings.HV_SYS_REG_AFSR0_EL1,
+	bindings.HV_SYS_REG_AFSR1_EL1,
+	bindings.HV_SYS_REG_AMAIR_EL1,
+}
+
+// GIC ICC (CPU interface) registers to capture for snapshots.
+// These control interrupt processing at the CPU level and are per-vCPU.
+var hvfICCRegsToCapture = []bindings.GICICCReg{
+	bindings.HV_GIC_ICC_REG_PMR_EL1,     // Priority Mask Register
+	bindings.HV_GIC_ICC_REG_BPR0_EL1,    // Binary Point Register 0
+	bindings.HV_GIC_ICC_REG_AP0R0_EL1,   // Active Priority Register 0
+	bindings.HV_GIC_ICC_REG_AP1R0_EL1,   // Active Priority Register 1
+	bindings.HV_GIC_ICC_REG_BPR1_EL1,    // Binary Point Register 1
+	bindings.HV_GIC_ICC_REG_CTLR_EL1,    // Control Register
+	bindings.HV_GIC_ICC_REG_SRE_EL1,     // System Register Enable
+	bindings.HV_GIC_ICC_REG_IGRPEN0_EL1, // Interrupt Group Enable 0
+	bindings.HV_GIC_ICC_REG_IGRPEN1_EL1, // Interrupt Group Enable 1
+}
+
+// arm64HvfVcpuSnapshot holds the vCPU state for ARM64 on HVF
+type arm64HvfVcpuSnapshot struct {
+	GPRegisters     map[bindings.Reg]uint64
+	SysRegisters    map[bindings.SysReg]uint64
+	ICCRegisters    map[bindings.GICICCReg]uint64 // GIC CPU interface registers
+	SimdFPRegisters map[bindings.SIMDReg]bindings.SimdFP
+	VTimerOffset    uint64
+}
+
+// arm64HvfSnapshot holds the complete VM snapshot for HVF ARM64
+type arm64HvfSnapshot struct {
+	cpuStates       map[int]arm64HvfVcpuSnapshot
+	deviceSnapshots map[string]interface{}
+	memory          []byte
+	gicState        []byte
 }
 
 type exitContext struct {
@@ -158,6 +236,103 @@ func (v *virtualCPU) SetRegisters(regs map[hv.Register]hv.RegisterValue) error {
 			}
 		} else {
 			return fmt.Errorf("hvf: unsupported register %v", reg)
+		}
+	}
+
+	return nil
+}
+
+// captureSnapshot captures the vCPU state for a snapshot.
+// Must be called from the vCPU's thread (via runQueue).
+func (v *virtualCPU) captureSnapshot() (arm64HvfVcpuSnapshot, error) {
+	ret := arm64HvfVcpuSnapshot{
+		GPRegisters:     make(map[bindings.Reg]uint64, len(hvfGPRegsToCapture)),
+		SysRegisters:    make(map[bindings.SysReg]uint64, len(hvfSysRegsToCapture)),
+		ICCRegisters:    make(map[bindings.GICICCReg]uint64, len(hvfICCRegsToCapture)),
+		SimdFPRegisters: make(map[bindings.SIMDReg]bindings.SimdFP, 32),
+	}
+
+	// Capture GP registers (X0-X30, PC, CPSR, FPCR, FPSR)
+	for _, reg := range hvfGPRegsToCapture {
+		var value uint64
+		if err := bindings.HvVcpuGetReg(v.id, reg, &value); err != bindings.HV_SUCCESS {
+			return ret, fmt.Errorf("hvf: capture GP reg %d: %w", reg, err)
+		}
+		ret.GPRegisters[reg] = value
+	}
+
+	// Capture system registers
+	for _, reg := range hvfSysRegsToCapture {
+		var value uint64
+		if err := bindings.HvVcpuGetSysReg(v.id, reg, &value); err != bindings.HV_SUCCESS {
+			return ret, fmt.Errorf("hvf: capture sys reg 0x%x: %w", reg, err)
+		}
+		ret.SysRegisters[reg] = value
+	}
+
+	// Capture GIC ICC (CPU interface) registers if GIC is configured
+	if v.vm.gicInfo.Version != hv.Arm64GICVersionUnknown {
+		for _, reg := range hvfICCRegsToCapture {
+			var value uint64
+			if err := bindings.HvGicGetIccReg(v.id, reg, &value); err != bindings.HV_SUCCESS {
+				return ret, fmt.Errorf("hvf: capture ICC reg 0x%x: %w", reg, err)
+			}
+			ret.ICCRegisters[reg] = value
+		}
+	}
+
+	// Capture SIMD/FP registers (Q0-Q31)
+	for i := bindings.SIMDReg(0); i < 32; i++ {
+		var value bindings.SimdFP
+		if err := bindings.HvVcpuGetSimdFpReg(v.id, i, &value); err != bindings.HV_SUCCESS {
+			return ret, fmt.Errorf("hvf: capture SIMD reg Q%d: %w", i, err)
+		}
+		ret.SimdFPRegisters[i] = value
+	}
+
+	// Capture virtual timer offset
+	if err := bindings.HvVcpuGetVtimerOffset(v.id, &ret.VTimerOffset); err != bindings.HV_SUCCESS {
+		return ret, fmt.Errorf("hvf: capture vtimer offset: %w", err)
+	}
+
+	return ret, nil
+}
+
+// restoreSnapshot restores the vCPU state from a snapshot.
+// Must be called from the vCPU's thread (via runQueue).
+func (v *virtualCPU) restoreSnapshot(snap arm64HvfVcpuSnapshot) error {
+	// Restore virtual timer offset first
+	if err := bindings.HvVcpuSetVtimerOffset(v.id, snap.VTimerOffset); err != bindings.HV_SUCCESS {
+		return fmt.Errorf("hvf: restore vtimer offset: %w", err)
+	}
+
+	// Restore SIMD/FP registers (Q0-Q31)
+	for reg, value := range snap.SimdFPRegisters {
+		if err := bindings.HvVcpuSetSimdFpReg(v.id, reg, value); err != bindings.HV_SUCCESS {
+			return fmt.Errorf("hvf: restore SIMD reg Q%d: %w", reg, err)
+		}
+	}
+
+	// Restore system registers
+	for reg, value := range snap.SysRegisters {
+		if err := bindings.HvVcpuSetSysReg(v.id, reg, value); err != bindings.HV_SUCCESS {
+			return fmt.Errorf("hvf: restore sys reg 0x%x: %w", reg, err)
+		}
+	}
+
+	// Restore GIC ICC (CPU interface) registers if GIC is configured
+	if v.vm.gicInfo.Version != hv.Arm64GICVersionUnknown && len(snap.ICCRegisters) > 0 {
+		for reg, value := range snap.ICCRegisters {
+			if err := bindings.HvGicSetIccReg(v.id, reg, value); err != bindings.HV_SUCCESS {
+				return fmt.Errorf("hvf: restore ICC reg 0x%x: %w", reg, err)
+			}
+		}
+	}
+
+	// Restore GP registers last
+	for reg, value := range snap.GPRegisters {
+		if err := bindings.HvVcpuSetReg(v.id, reg, value); err != bindings.HV_SUCCESS {
+			return fmt.Errorf("hvf: restore GP reg %d: %w", reg, err)
 		}
 	}
 
@@ -685,6 +860,7 @@ type virtualMachine struct {
 	rec *timeslice.Recorder
 
 	hv         *hypervisor
+	memMu      sync.RWMutex // protects memory during snapshot
 	memory     []byte
 	memoryBase uint64
 
@@ -704,14 +880,158 @@ func (v *virtualMachine) Hypervisor() hv.Hypervisor { return v.hv }
 func (v *virtualMachine) MemoryBase() uint64        { return v.memoryBase }
 func (v *virtualMachine) MemorySize() uint64        { return uint64(len(v.memory)) }
 
+// captureGICState captures the GIC state if configured.
+func (v *virtualMachine) captureGICState() ([]byte, error) {
+	if v.gicInfo.Version == hv.Arm64GICVersionUnknown {
+		return nil, nil // No GIC configured
+	}
+
+	state := bindings.HvGicStateCreate()
+	if state == 0 {
+		return nil, fmt.Errorf("hvf: failed to create GIC state object")
+	}
+	// Note: state is an os_object that should be released, but we don't have os_release binding
+
+	var size uintptr
+	if err := bindings.HvGicStateGetSize(state, &size); err != bindings.HV_SUCCESS {
+		return nil, fmt.Errorf("hvf: get GIC state size: %w", err)
+	}
+
+	if size == 0 {
+		return nil, nil
+	}
+
+	data := make([]byte, size)
+	if err := bindings.HvGicStateGetData(state, unsafe.Pointer(&data[0])); err != bindings.HV_SUCCESS {
+		return nil, fmt.Errorf("hvf: get GIC state data: %w", err)
+	}
+
+	return data, nil
+}
+
+// restoreGICState restores the GIC state from snapshot data.
+func (v *virtualMachine) restoreGICState(data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+
+	if err := bindings.HvGicSetState(unsafe.Pointer(&data[0]), uintptr(len(data))); err != bindings.HV_SUCCESS {
+		return fmt.Errorf("hvf: restore GIC state: %w", err)
+	}
+
+	return nil
+}
+
 // CaptureSnapshot implements [hv.VirtualMachine].
 func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
-	return nil, fmt.Errorf("hvf: snapshot not implemented")
+	ret := &arm64HvfSnapshot{
+		cpuStates:       make(map[int]arm64HvfVcpuSnapshot),
+		deviceSnapshots: make(map[string]any),
+	}
+
+	// Capture each vCPU state
+	for id, cpu := range v.cpus {
+		errChan := make(chan error, 1)
+		var state arm64HvfVcpuSnapshot
+
+		cpu.runQueue <- func() {
+			var err error
+			state, err = cpu.captureSnapshot()
+			errChan <- err
+		}
+
+		if err := <-errChan; err != nil {
+			return nil, fmt.Errorf("hvf: capture vCPU %d snapshot: %w", id, err)
+		}
+		ret.cpuStates[id] = state
+	}
+
+	// Capture GIC state
+	gicData, err := v.captureGICState()
+	if err != nil {
+		return nil, fmt.Errorf("hvf: capture GIC state: %w", err)
+	}
+	ret.gicState = gicData
+
+	// Capture device snapshots
+	for _, dev := range v.devices {
+		if snapshotter, ok := dev.(hv.DeviceSnapshotter); ok {
+			id := snapshotter.DeviceId()
+			snap, err := snapshotter.CaptureSnapshot()
+			if err != nil {
+				return nil, fmt.Errorf("hvf: capture device %s snapshot: %w", id, err)
+			}
+			ret.deviceSnapshots[id] = snap
+		}
+	}
+
+	// Capture memory (full copy of main guest RAM)
+	v.memMu.Lock()
+	if len(v.memory) > 0 {
+		ret.memory = make([]byte, len(v.memory))
+		copy(ret.memory, v.memory)
+	}
+	v.memMu.Unlock()
+
+	return ret, nil
 }
 
 // RestoreSnapshot implements [hv.VirtualMachine].
 func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
-	return fmt.Errorf("hvf: snapshot not implemented")
+	snapshotData, ok := snap.(*arm64HvfSnapshot)
+	if !ok {
+		return fmt.Errorf("hvf: invalid snapshot type")
+	}
+
+	// Restore memory first
+	v.memMu.Lock()
+	if len(v.memory) != len(snapshotData.memory) {
+		v.memMu.Unlock()
+		return fmt.Errorf("hvf: snapshot memory size mismatch: got %d, want %d",
+			len(snapshotData.memory), len(v.memory))
+	}
+	if len(v.memory) > 0 {
+		copy(v.memory, snapshotData.memory)
+	}
+	v.memMu.Unlock()
+
+	// Restore GIC state (before vCPUs to ensure interrupts are configured)
+	if err := v.restoreGICState(snapshotData.gicState); err != nil {
+		return fmt.Errorf("hvf: restore GIC state: %w", err)
+	}
+
+	// Restore each vCPU state
+	for id, cpu := range v.cpus {
+		state, ok := snapshotData.cpuStates[id]
+		if !ok {
+			return fmt.Errorf("hvf: missing vCPU %d state in snapshot", id)
+		}
+
+		errChan := make(chan error, 1)
+		cpu.runQueue <- func() {
+			errChan <- cpu.restoreSnapshot(state)
+		}
+
+		if err := <-errChan; err != nil {
+			return fmt.Errorf("hvf: restore vCPU %d snapshot: %w", id, err)
+		}
+	}
+
+	// Restore device snapshots
+	for _, dev := range v.devices {
+		if snapshotter, ok := dev.(hv.DeviceSnapshotter); ok {
+			id := snapshotter.DeviceId()
+			snapData, ok := snapshotData.deviceSnapshots[id]
+			if !ok {
+				return fmt.Errorf("hvf: missing device %s snapshot", id)
+			}
+			if err := snapshotter.RestoreSnapshot(snapData); err != nil {
+				return fmt.Errorf("hvf: restore device %s snapshot: %w", id, err)
+			}
+		}
+	}
+
+	return nil
 }
 
 // AddDevice implements [hv.VirtualMachine].
@@ -830,6 +1150,9 @@ func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.Memory
 
 // ReadAt implements [hv.VirtualMachine].
 func (v *virtualMachine) ReadAt(p []byte, off int64) (n int, err error) {
+	v.memMu.RLock()
+	defer v.memMu.RUnlock()
+
 	offset := off - int64(v.memoryBase)
 	if offset < 0 || uint64(offset) >= uint64(len(v.memory)) {
 		return 0, fmt.Errorf("hvf: ReadAt offset out of bounds")
@@ -844,6 +1167,9 @@ func (v *virtualMachine) ReadAt(p []byte, off int64) (n int, err error) {
 
 // WriteAt implements [hv.VirtualMachine].
 func (v *virtualMachine) WriteAt(p []byte, off int64) (n int, err error) {
+	v.memMu.RLock()
+	defer v.memMu.RUnlock()
+
 	offset := off - int64(v.memoryBase)
 	if offset < 0 || uint64(offset) >= uint64(len(v.memory)) {
 		return 0, fmt.Errorf("hvf: virtualMachine WriteAt offset out of bounds: 0x%x, 0x%x", off, len(v.memory))
@@ -1098,8 +1424,10 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 	ret.rec.Record(tsHvfOnCreateVCPU)
 
-	if err := config.Loader().Load(ret); err != nil {
-		return nil, fmt.Errorf("failed to load VM: %w", err)
+	if loader := config.Loader(); loader != nil {
+		if err := loader.Load(ret); err != nil {
+			return nil, fmt.Errorf("failed to load VM: %w", err)
+		}
 	}
 
 	ret.rec.Record(tsHvfLoaded)

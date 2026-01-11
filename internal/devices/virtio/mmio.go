@@ -903,6 +903,109 @@ func (d *mmioDevice) queuePointers(q *queue) (descTable []byte, avail []byte, us
 	return descTable, avail, used, nil
 }
 
+// QueueSnapshot holds the state of a virtio queue for snapshotting
+type QueueSnapshot struct {
+	Size         uint16
+	MaxSize      uint16
+	Ready        bool
+	DescAddr     uint64
+	AvailAddr    uint64
+	UsedAddr     uint64
+	LastAvailIdx uint16
+	UsedIdx      uint16
+	Enable       bool
+}
+
+// MMIODeviceSnapshot holds the base MMIO device state for snapshotting
+type MMIODeviceSnapshot struct {
+	DeviceFeatureSel uint32
+	DriverFeatureSel uint32
+	DeviceFeatures   []uint32
+	DriverFeatures   []uint32
+	QueueSel         uint32
+	DeviceStatus     uint32
+	InterruptStatus  uint32
+	ConfigGeneration uint32
+	Queues           []QueueSnapshot
+}
+
+// captureQueueSnapshot captures the state of a single queue
+func (q *queue) captureSnapshot() QueueSnapshot {
+	return QueueSnapshot{
+		Size:         q.size,
+		MaxSize:      q.maxSize,
+		Ready:        q.ready,
+		DescAddr:     q.descAddr,
+		AvailAddr:    q.availAddr,
+		UsedAddr:     q.usedAddr,
+		LastAvailIdx: q.lastAvailIdx,
+		UsedIdx:      q.usedIdx,
+		Enable:       q.enable,
+	}
+}
+
+// restoreSnapshot restores a queue from a snapshot
+func (q *queue) restoreSnapshot(snap QueueSnapshot) {
+	q.size = snap.Size
+	q.maxSize = snap.MaxSize
+	q.ready = snap.Ready
+	q.descAddr = snap.DescAddr
+	q.availAddr = snap.AvailAddr
+	q.usedAddr = snap.UsedAddr
+	q.lastAvailIdx = snap.LastAvailIdx
+	q.usedIdx = snap.UsedIdx
+	q.enable = snap.Enable
+}
+
+// CaptureMMIOSnapshot captures the base MMIO device state
+func (d *mmioDevice) CaptureMMIOSnapshot() MMIODeviceSnapshot {
+	snap := MMIODeviceSnapshot{
+		DeviceFeatureSel: d.deviceFeatureSel,
+		DriverFeatureSel: d.driverFeatureSel,
+		DeviceFeatures:   make([]uint32, len(d.deviceFeatures)),
+		DriverFeatures:   make([]uint32, len(d.driverFeatures)),
+		QueueSel:         d.queueSel,
+		DeviceStatus:     d.deviceStatus,
+		InterruptStatus:  d.interruptStatus.Load(),
+		ConfigGeneration: d.configGeneration,
+		Queues:           make([]QueueSnapshot, len(d.queues)),
+	}
+	copy(snap.DeviceFeatures, d.deviceFeatures)
+	copy(snap.DriverFeatures, d.driverFeatures)
+	for i := range d.queues {
+		snap.Queues[i] = d.queues[i].captureSnapshot()
+	}
+	return snap
+}
+
+// RestoreMMIOSnapshot restores the base MMIO device state from a snapshot
+func (d *mmioDevice) RestoreMMIOSnapshot(snap MMIODeviceSnapshot) error {
+	if len(snap.Queues) != len(d.queues) {
+		return fmt.Errorf("queue count mismatch: snapshot has %d, device has %d", len(snap.Queues), len(d.queues))
+	}
+	if len(snap.DeviceFeatures) != len(d.deviceFeatures) {
+		return fmt.Errorf("device features length mismatch: snapshot has %d, device has %d", len(snap.DeviceFeatures), len(d.deviceFeatures))
+	}
+	if len(snap.DriverFeatures) != len(d.driverFeatures) {
+		return fmt.Errorf("driver features length mismatch: snapshot has %d, device has %d", len(snap.DriverFeatures), len(d.driverFeatures))
+	}
+
+	d.deviceFeatureSel = snap.DeviceFeatureSel
+	d.driverFeatureSel = snap.DriverFeatureSel
+	copy(d.deviceFeatures, snap.DeviceFeatures)
+	copy(d.driverFeatures, snap.DriverFeatures)
+	d.queueSel = snap.QueueSel
+	d.deviceStatus = snap.DeviceStatus
+	d.interruptStatus.Store(snap.InterruptStatus)
+	d.configGeneration = snap.ConfigGeneration
+
+	for i := range d.queues {
+		d.queues[i].restoreSnapshot(snap.Queues[i])
+	}
+
+	return nil
+}
+
 func littleEndianValue(buf []byte, length uint32) uint32 {
 	switch length {
 	case 1:

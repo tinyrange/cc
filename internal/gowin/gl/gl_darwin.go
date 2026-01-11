@@ -66,6 +66,27 @@ type openGL struct {
 	// Drawing
 	drawArrays   func(uint32, int32, int32)
 	drawElements func(uint32, int32, uint32, uintptr)
+
+	// Framebuffer operations
+	genFramebuffers        func(int32, *uint32)
+	deleteFramebuffers     func(int32, *uint32)
+	bindFramebuffer        func(uint32, uint32)
+	framebufferTexture2D   func(uint32, uint32, uint32, uint32, int32)
+	checkFramebufferStatus func(uint32) uint32
+
+	// Renderbuffer operations
+	genRenderbuffers        func(int32, *uint32)
+	deleteRenderbuffers     func(int32, *uint32)
+	bindRenderbuffer        func(uint32, uint32)
+	renderbufferStorage     func(uint32, uint32, int32, int32)
+	framebufferRenderbuffer func(uint32, uint32, uint32, uint32)
+
+	// Additional uniform operations
+	uniform1f func(int32, float32)
+	uniform2f func(int32, float32, float32)
+
+	// Texture cleanup
+	deleteTextures func(int32, *uint32)
 }
 
 func (gl *openGL) ClearColor(r, g, b, a float32) {
@@ -272,6 +293,66 @@ func (gl *openGL) DrawElements(mode uint32, count int32, xtype uint32, indices u
 	gl.drawElements(mode, count, xtype, indices)
 }
 
+// Framebuffer operations
+
+func (gl *openGL) GenFramebuffers(n int32, framebuffers *uint32) {
+	gl.genFramebuffers(n, framebuffers)
+}
+
+func (gl *openGL) DeleteFramebuffers(n int32, framebuffers *uint32) {
+	gl.deleteFramebuffers(n, framebuffers)
+}
+
+func (gl *openGL) BindFramebuffer(target uint32, framebuffer uint32) {
+	gl.bindFramebuffer(target, framebuffer)
+}
+
+func (gl *openGL) FramebufferTexture2D(target, attachment, textarget, texture uint32, level int32) {
+	gl.framebufferTexture2D(target, attachment, textarget, texture, level)
+}
+
+func (gl *openGL) CheckFramebufferStatus(target uint32) uint32 {
+	return gl.checkFramebufferStatus(target)
+}
+
+// Renderbuffer operations
+
+func (gl *openGL) GenRenderbuffers(n int32, renderbuffers *uint32) {
+	gl.genRenderbuffers(n, renderbuffers)
+}
+
+func (gl *openGL) DeleteRenderbuffers(n int32, renderbuffers *uint32) {
+	gl.deleteRenderbuffers(n, renderbuffers)
+}
+
+func (gl *openGL) BindRenderbuffer(target uint32, renderbuffer uint32) {
+	gl.bindRenderbuffer(target, renderbuffer)
+}
+
+func (gl *openGL) RenderbufferStorage(target, internalformat uint32, width, height int32) {
+	gl.renderbufferStorage(target, internalformat, width, height)
+}
+
+func (gl *openGL) FramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer uint32) {
+	gl.framebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer)
+}
+
+// Additional uniform operations
+
+func (gl *openGL) Uniform1f(location int32, v0 float32) {
+	gl.uniform1f(location, v0)
+}
+
+func (gl *openGL) Uniform2f(location int32, v0, v1 float32) {
+	gl.uniform2f(location, v0, v1)
+}
+
+// Texture cleanup
+
+func (gl *openGL) DeleteTextures(n int32, textures *uint32) {
+	gl.deleteTextures(n, textures)
+}
+
 func Load() (OpenGL, error) {
 	handle, err := purego.Dlopen("/System/Library/Frameworks/OpenGL.framework/OpenGL", purego.RTLD_GLOBAL|purego.RTLD_LAZY)
 	if err != nil {
@@ -329,6 +410,27 @@ func Load() (OpenGL, error) {
 	register(&gl.uniformMatrix4fv, "glUniformMatrix4fv")
 	register(&gl.drawArrays, "glDrawArrays")
 	register(&gl.drawElements, "glDrawElements")
+
+	// Framebuffer operations
+	register(&gl.genFramebuffers, "glGenFramebuffers")
+	register(&gl.deleteFramebuffers, "glDeleteFramebuffers")
+	register(&gl.bindFramebuffer, "glBindFramebuffer")
+	register(&gl.framebufferTexture2D, "glFramebufferTexture2D")
+	register(&gl.checkFramebufferStatus, "glCheckFramebufferStatus")
+
+	// Renderbuffer operations
+	register(&gl.genRenderbuffers, "glGenRenderbuffers")
+	register(&gl.deleteRenderbuffers, "glDeleteRenderbuffers")
+	register(&gl.bindRenderbuffer, "glBindRenderbuffer")
+	register(&gl.renderbufferStorage, "glRenderbufferStorage")
+	register(&gl.framebufferRenderbuffer, "glFramebufferRenderbuffer")
+
+	// Additional uniform operations
+	register(&gl.uniform1f, "glUniform1f")
+	register(&gl.uniform2f, "glUniform2f")
+
+	// Texture cleanup
+	register(&gl.deleteTextures, "glDeleteTextures")
 
 	return gl, nil
 }

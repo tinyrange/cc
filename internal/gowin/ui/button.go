@@ -28,6 +28,7 @@ type ButtonStyle struct {
 	Padding            EdgeInsets
 	MinWidth           float32
 	MinHeight          float32
+	CornerRadius       float32 // 0 = square corners
 }
 
 // DefaultButtonStyle returns the default button styling.
@@ -42,6 +43,7 @@ func DefaultButtonStyle() ButtonStyle {
 		Padding:            Symmetric(16, 8),
 		MinWidth:           60,
 		MinHeight:          32,
+		CornerRadius:       6, // Subtle rounded corners by default
 	}
 }
 
@@ -56,6 +58,12 @@ type Button struct {
 
 	// Cached layout
 	textWidth float32
+
+	// Rounded corner rendering
+	gfxWindow    graphics.Window
+	shapeBuilder *graphics.ShapeBuilder
+	lastBounds   Rect
+	lastBgColor  color.Color
 }
 
 // NewButton creates a new button.
@@ -88,6 +96,16 @@ func (b *Button) WithPadding(p EdgeInsets) *Button {
 
 func (b *Button) OnClick(handler func()) *Button {
 	b.onClick = handler
+	return b
+}
+
+func (b *Button) WithGraphicsWindow(w graphics.Window) *Button {
+	b.gfxWindow = w
+	return b
+}
+
+func (b *Button) WithCornerRadius(radius float32) *Button {
+	b.style.CornerRadius = radius
 	return b
 }
 
@@ -149,7 +167,11 @@ func (b *Button) Draw(ctx *DrawContext) {
 	}
 
 	// Draw background
-	ctx.Frame.RenderQuad(bounds.X, bounds.Y, bounds.W, bounds.H, nil, bg)
+	if b.style.CornerRadius > 0 && b.gfxWindow != nil {
+		b.drawRoundedBackground(ctx, bounds, bg)
+	} else {
+		ctx.Frame.RenderQuad(bounds.X, bounds.Y, bounds.W, bounds.H, nil, bg)
+	}
 
 	// Draw text centered
 	if ctx.Text != nil {
@@ -157,6 +179,33 @@ func (b *Button) Draw(ctx *DrawContext) {
 		textY := bounds.Y + bounds.H/2 + float32(b.style.TextSize)/3
 		ctx.Text.RenderText(b.text, textX, textY, b.style.TextSize, b.style.TextColor)
 	}
+}
+
+func (b *Button) drawRoundedBackground(ctx *DrawContext, bounds Rect, bg color.Color) {
+	// Create shape builder if needed
+	if b.shapeBuilder == nil {
+		segments := graphics.SegmentsForRadius(b.style.CornerRadius)
+		var err error
+		b.shapeBuilder, err = graphics.NewShapeBuilder(b.gfxWindow, segments)
+		if err != nil {
+			ctx.Frame.RenderQuad(bounds.X, bounds.Y, bounds.W, bounds.H, nil, bg)
+			return
+		}
+	}
+
+	// Update geometry if bounds or color changed
+	if bounds != b.lastBounds || bg != b.lastBgColor {
+		style := graphics.ShapeStyle{FillColor: bg}
+		b.shapeBuilder.UpdateRoundedRect(
+			bounds.X, bounds.Y, bounds.W, bounds.H,
+			graphics.UniformRadius(b.style.CornerRadius),
+			style,
+		)
+		b.lastBounds = bounds
+		b.lastBgColor = bg
+	}
+
+	ctx.Frame.RenderMesh(b.shapeBuilder.Mesh(), graphics.DrawOptions{})
 }
 
 func (b *Button) HandleEvent(ctx *EventContext, event Event) bool {

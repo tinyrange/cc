@@ -15,6 +15,7 @@ import (
 
 	"github.com/tinyrange/cc/internal/gowin/graphics"
 	"github.com/tinyrange/cc/internal/gowin/text"
+	"github.com/tinyrange/cc/internal/gowin/ui"
 	"github.com/tinyrange/cc/internal/gowin/window"
 	"github.com/tinyrange/cc/internal/timeslice"
 )
@@ -73,6 +74,23 @@ type View struct {
 	lastCellW, lastCellH     float32
 	lastOriginX, lastOriginY float32
 	lastPadX, lastPadY       float32
+
+	// Selection state for copy/paste.
+	selecting      bool
+	selectionStart Point
+	selectionEnd   Point
+	hasSelection   bool
+
+	// Cached layout values for mouse position calculations.
+	lastPadX2, lastPadY2 float32
+
+	// Context menu overlay.
+	contextMenu *ui.ContextMenu
+}
+
+// Point represents a cell position in the terminal grid.
+type Point struct {
+	X, Y int
 }
 
 // Terminal is a convenience wrapper that owns its own window and renders a View
@@ -119,6 +137,7 @@ func NewView(win graphics.Window) (*View, error) {
 
 	emu := vt.NewSafeEmulator(80, 40)
 	disableVTQueriesThatBreakGuests(emu)
+	applyTokyoNightTheme(emu)
 
 	inR, inW := io.Pipe()
 
@@ -424,9 +443,11 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 		stats.Record(tsViewStepResize)
 	}
 
-	// Cache origin.
+	// Cache origin and layout for mouse calculations.
 	v.originX = insetL
 	v.originY = insetT
+	v.lastPadX2 = padX
+	v.lastPadY2 = padY
 
 	toVTMods := func(m window.KeyMods) vt.KeyMod {
 		var mod vt.KeyMod
@@ -447,6 +468,46 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 
 	// Raw input events from the platform window (preferred).
 	events := v.win.PlatformWindow().DrainInputEvents()
+
+	// Handle context menu events first (if menu is visible).
+	if v.contextMenu != nil && v.contextMenu.IsVisible() {
+		// Adjust menu position if it would go off-screen
+		v.contextMenu.PositionInWindow(float32(width), float32(height))
+
+		// Process events for context menu
+		evtCtx := &ui.EventContext{}
+		mx, my := f.CursorPos()
+		v.contextMenu.HandleEvent(evtCtx, &ui.MouseMoveEvent{X: mx, Y: my})
+
+		for _, ev := range events {
+			var consumed bool
+			switch ev.Type {
+			case window.InputEventMouseDown:
+				consumed = v.contextMenu.HandleEvent(evtCtx, &ui.MouseButtonEvent{
+					X: mx, Y: my, Button: ev.Button, Pressed: true,
+				})
+			case window.InputEventMouseUp:
+				consumed = v.contextMenu.HandleEvent(evtCtx, &ui.MouseButtonEvent{
+					X: mx, Y: my, Button: ev.Button, Pressed: false,
+				})
+			case window.InputEventKeyDown:
+				consumed = v.contextMenu.HandleEvent(evtCtx, &ui.KeyEvent{
+					Key: ev.Key, Pressed: true, Repeat: ev.Repeat, Mods: ev.Mods,
+				})
+			case window.InputEventKeyUp:
+				consumed = v.contextMenu.HandleEvent(evtCtx, &ui.KeyEvent{
+					Key: ev.Key, Pressed: false, Mods: ev.Mods,
+				})
+			}
+			_ = consumed
+		}
+
+		// If context menu is still visible, skip normal terminal event processing
+		if v.contextMenu != nil && v.contextMenu.IsVisible() {
+			events = nil // Clear events so terminal doesn't process them
+		}
+	}
+
 	sawRawText := false
 	for _, ev := range events {
 		switch ev.Type {
@@ -469,8 +530,45 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 
 			stats.Record(tsViewStepSendText)
 
+		case window.InputEventMouseDown:
+			if ev.Button == window.ButtonLeft {
+				// Start selection
+				pos := v.pixelToCell(f, padX, padY)
+				v.selecting = true
+				v.selectionStart = pos
+				v.selectionEnd = pos
+				v.hasSelection = false
+			}
+
+		case window.InputEventMouseUp:
+			if ev.Button == window.ButtonLeft && v.selecting {
+				// End selection
+				v.selecting = false
+				// Selection is valid if start != end
+				if v.selectionStart != v.selectionEnd {
+					v.hasSelection = true
+				}
+			}
+			if ev.Button == window.ButtonRight {
+				// Show context menu on right-click
+				v.showContextMenu()
+			}
+
 		case window.InputEventKeyDown:
 			mod := toVTMods(ev.Mods)
+
+			// Handle Cmd+C/Cmd+V for copy/paste (macOS style).
+			// Ctrl+C must pass through to send SIGINT.
+			if (ev.Mods & window.ModSuper) != 0 {
+				if ev.Key == window.KeyC && v.hasSelection {
+					v.copySelection()
+					continue
+				}
+				if ev.Key == window.KeyV {
+					v.pasteFromClipboard()
+					continue
+				}
+			}
 
 			// Ctrl+[A-Z] keys.
 			if (mod & vt.ModCtrl) != 0 {
@@ -520,6 +618,14 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 			}
 
 			stats.Record(tsViewStepSendKey)
+		}
+
+		// Update drag selection on any event while selecting.
+		if v.selecting {
+			pos := v.pixelToCell(f, padX, padY)
+			if pos != v.selectionEnd {
+				v.selectionEnd = pos
+			}
 		}
 	}
 
@@ -579,6 +685,12 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 
 	stats.Record(tsViewStepRenderGrid)
 
+	// Render context menu overlay (if visible).
+	if v.contextMenu != nil && v.contextMenu.IsVisible() {
+		drawCtx := &ui.DrawContext{Frame: f, Text: v.txt}
+		v.contextMenu.Draw(drawCtx)
+	}
+
 	// Clear dirty flags after rendering.
 	v.grid.ClearDirty()
 
@@ -613,10 +725,10 @@ func (v *View) syncGridFromEmulator(bgDefault, fgDefault color.Color, forceFullS
 					w = cell.Width
 				}
 				if cell.Style.Fg != nil {
-					fg = cell.Style.Fg
+					fg = translateANSIColor(cell.Style.Fg)
 				}
 				if cell.Style.Bg != nil {
-					bg = cell.Style.Bg
+					bg = translateANSIColor(cell.Style.Bg)
 				}
 				attrs = uint8(cell.Style.Attrs)
 			}
@@ -681,6 +793,19 @@ func (v *View) renderGrid(stats *timeslice.Recorder, f graphics.Frame, bgDefault
 
 	stats.Record(tsViewStepRenderGridBgRender)
 
+	// Render selection highlight (if any).
+	if v.hasSelection || v.selecting {
+		for y := range rows {
+			for x := 0; x < cols; x++ {
+				if v.isCellSelected(x, y) {
+					x0 := originX + padX + float32(x)*cellW
+					y0 := originY + padY + float32(y)*cellH
+					f.RenderQuad(x0, y0, cellW, cellH, v.tex, selectionColor)
+				}
+			}
+		}
+	}
+
 	// Render all text in one batched draw call.
 	v.txt.BeginBatch()
 	for y := range rows {
@@ -744,4 +869,291 @@ func (t *Terminal) Run(ctx context.Context, hooks Hooks) error {
 		return ErrWindowClosed
 	}
 	return err
+}
+
+// Tokyo Night color palette for ANSI colors.
+// https://github.com/enkia/tokyo-night-vscode-theme
+var tokyoNightPalette = []color.RGBA{
+	// Normal colors (0-7)
+	{R: 0x15, G: 0x16, B: 0x1e, A: 255}, // 0: black
+	{R: 0xf7, G: 0x76, B: 0x8e, A: 255}, // 1: red
+	{R: 0x9e, G: 0xce, B: 0x6a, A: 255}, // 2: green
+	{R: 0xe0, G: 0xaf, B: 0x68, A: 255}, // 3: yellow
+	{R: 0x7a, G: 0xa2, B: 0xf7, A: 255}, // 4: blue
+	{R: 0xbb, G: 0x9a, B: 0xf7, A: 255}, // 5: magenta
+	{R: 0x7d, G: 0xcf, B: 0xff, A: 255}, // 6: cyan
+	{R: 0xa9, G: 0xb1, B: 0xd6, A: 255}, // 7: white
+
+	// Bright colors (8-15)
+	{R: 0x41, G: 0x48, B: 0x68, A: 255}, // 8: bright black
+	{R: 0xf7, G: 0x76, B: 0x8e, A: 255}, // 9: bright red
+	{R: 0x9e, G: 0xce, B: 0x6a, A: 255}, // 10: bright green
+	{R: 0xe0, G: 0xaf, B: 0x68, A: 255}, // 11: bright yellow
+	{R: 0x7a, G: 0xa2, B: 0xf7, A: 255}, // 12: bright blue
+	{R: 0xbb, G: 0x9a, B: 0xf7, A: 255}, // 13: bright magenta
+	{R: 0x7d, G: 0xcf, B: 0xff, A: 255}, // 14: bright cyan
+	{R: 0xc0, G: 0xca, B: 0xf5, A: 255}, // 15: bright white
+}
+
+// Default ANSI 16-color palette (standard VGA colors).
+// Used as keys for color translation.
+var defaultANSIPalette = []color.RGBA{
+	// Normal colors (0-7)
+	{R: 0x00, G: 0x00, B: 0x00, A: 255}, // 0: black
+	{R: 0x80, G: 0x00, B: 0x00, A: 255}, // 1: red (maroon)
+	{R: 0x00, G: 0x80, B: 0x00, A: 255}, // 2: green
+	{R: 0x80, G: 0x80, B: 0x00, A: 255}, // 3: yellow (olive)
+	{R: 0x00, G: 0x00, B: 0x80, A: 255}, // 4: blue (navy)
+	{R: 0x80, G: 0x00, B: 0x80, A: 255}, // 5: magenta (purple)
+	{R: 0x00, G: 0x80, B: 0x80, A: 255}, // 6: cyan (teal)
+	{R: 0xc0, G: 0xc0, B: 0xc0, A: 255}, // 7: white (silver)
+
+	// Bright colors (8-15)
+	{R: 0x80, G: 0x80, B: 0x80, A: 255}, // 8: bright black (gray)
+	{R: 0xff, G: 0x00, B: 0x00, A: 255}, // 9: bright red
+	{R: 0x00, G: 0xff, B: 0x00, A: 255}, // 10: bright green (lime)
+	{R: 0xff, G: 0xff, B: 0x00, A: 255}, // 11: bright yellow
+	{R: 0x00, G: 0x00, B: 0xff, A: 255}, // 12: bright blue
+	{R: 0xff, G: 0x00, B: 0xff, A: 255}, // 13: bright magenta (fuchsia)
+	{R: 0x00, G: 0xff, B: 0xff, A: 255}, // 14: bright cyan (aqua)
+	{R: 0xff, G: 0xff, B: 0xff, A: 255}, // 15: bright white
+}
+
+// ansiColorMap maps default ANSI colors to Tokyo Night colors.
+// Built once at init time for fast lookups.
+var ansiColorMap map[uint32]color.RGBA
+
+func init() {
+	ansiColorMap = make(map[uint32]color.RGBA, len(defaultANSIPalette))
+	for i, def := range defaultANSIPalette {
+		key := colorKey(def)
+		ansiColorMap[key] = tokyoNightPalette[i]
+	}
+}
+
+// colorKey creates a unique key from RGBA values.
+func colorKey(c color.RGBA) uint32 {
+	return uint32(c.R)<<24 | uint32(c.G)<<16 | uint32(c.B)<<8 | uint32(c.A)
+}
+
+// translateANSIColor converts default ANSI palette colors to Tokyo Night colors.
+// Non-ANSI colors (true color, etc.) are passed through unchanged.
+func translateANSIColor(c color.Color) color.Color {
+	if c == nil {
+		return c
+	}
+
+	// Convert to RGBA for comparison
+	r, g, b, a := c.RGBA()
+	rgba := color.RGBA{
+		R: uint8(r >> 8),
+		G: uint8(g >> 8),
+		B: uint8(b >> 8),
+		A: uint8(a >> 8),
+	}
+
+	// Look up in the translation map
+	key := colorKey(rgba)
+	if translated, ok := ansiColorMap[key]; ok {
+		return translated
+	}
+
+	// Not a default ANSI color, return as-is
+	return c
+}
+
+// applyTokyoNightTheme sets the Tokyo Night color scheme on the VT emulator.
+// This provides a consistent look with the rest of the application UI.
+func applyTokyoNightTheme(emu *vt.SafeEmulator) {
+	// Default colors
+	fg := color.RGBA{R: 0xa9, G: 0xb1, B: 0xd6, A: 255}     // #a9b1d6
+	bg := color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 255}     // #1a1b26
+	cursor := color.RGBA{R: 0xc0, G: 0xca, B: 0xf5, A: 255} // #c0caf5
+
+	emu.Emulator.SetDefaultForegroundColor(fg)
+	emu.Emulator.SetDefaultBackgroundColor(bg)
+	emu.Emulator.SetDefaultCursorColor(cursor)
+
+	// Set indexed colors (used when programs query indexed colors)
+	for i, c := range tokyoNightPalette {
+		emu.SetIndexedColor(i, c)
+	}
+}
+
+// Selection color (Tokyo Night selection blue).
+var selectionColor = color.RGBA{R: 0x41, G: 0x59, B: 0x8b, A: 255}
+
+// pixelToCell converts mouse pixel coordinates to terminal cell coordinates.
+func (v *View) pixelToCell(f graphics.Frame, padX, padY float32) Point {
+	cursorX, cursorY := v.win.PlatformWindow().Cursor()
+
+	// Convert to cell coordinates.
+	cellX := int((cursorX - v.originX - padX) / v.cellW)
+	cellY := int((cursorY - v.originY - padY) / v.cellH)
+
+	// Clamp to grid bounds.
+	cols, rows := v.grid.Size()
+	if cellX < 0 {
+		cellX = 0
+	}
+	if cellX >= cols {
+		cellX = cols - 1
+	}
+	if cellY < 0 {
+		cellY = 0
+	}
+	if cellY >= rows {
+		cellY = rows - 1
+	}
+
+	return Point{X: cellX, Y: cellY}
+}
+
+// normalizedSelection returns selection bounds with start before end.
+func (v *View) normalizedSelection() (start, end Point) {
+	s, e := v.selectionStart, v.selectionEnd
+
+	// Normalize so start is before end (top-left to bottom-right).
+	if s.Y > e.Y || (s.Y == e.Y && s.X > e.X) {
+		s, e = e, s
+	}
+	return s, e
+}
+
+// isCellSelected returns true if the cell at (x, y) is within the selection.
+func (v *View) isCellSelected(x, y int) bool {
+	if !v.hasSelection && !v.selecting {
+		return false
+	}
+
+	start, end := v.normalizedSelection()
+
+	// Simple rectangular selection.
+	if y < start.Y || y > end.Y {
+		return false
+	}
+	if y == start.Y && y == end.Y {
+		// Single line selection.
+		return x >= start.X && x < end.X
+	}
+	if y == start.Y {
+		return x >= start.X
+	}
+	if y == end.Y {
+		return x < end.X
+	}
+	return true
+}
+
+// copySelection copies the selected text to the clipboard.
+func (v *View) copySelection() {
+	if !v.hasSelection {
+		return
+	}
+
+	start, end := v.normalizedSelection()
+	cols, _ := v.grid.Size()
+
+	var sb strings.Builder
+
+	for y := start.Y; y <= end.Y; y++ {
+		lineStart := 0
+		lineEnd := cols
+
+		if y == start.Y {
+			lineStart = start.X
+		}
+		if y == end.Y {
+			lineEnd = end.X
+		}
+
+		for x := lineStart; x < lineEnd; x++ {
+			cell := v.grid.CellAt(x, y)
+			if cell != nil && cell.Content != "" {
+				sb.WriteString(cell.Content)
+			} else {
+				sb.WriteRune(' ')
+			}
+		}
+
+		// Add newline between rows (but not after last row).
+		if y < end.Y {
+			sb.WriteRune('\n')
+		}
+	}
+
+	text := sb.String()
+	if text == "" {
+		return
+	}
+
+	clipboard := window.GetClipboard()
+	if clipboard != nil {
+		clipboard.SetText(text)
+	}
+}
+
+// pasteFromClipboard pastes text from the clipboard into the terminal.
+func (v *View) pasteFromClipboard() {
+	clipboard := window.GetClipboard()
+	if clipboard == nil {
+		return
+	}
+
+	text := clipboard.GetText()
+	if text == "" {
+		return
+	}
+
+	// Convert newlines to carriage returns for terminal.
+	text = strings.ReplaceAll(text, "\r\n", "\r")
+	text = strings.ReplaceAll(text, "\n", "\r")
+
+	// Send to terminal.
+	v.emu.SendText(text)
+}
+
+// showContextMenu displays a right-click context menu with Copy and Paste options.
+func (v *View) showContextMenu() {
+	const (
+		tagCopy  = 1
+		tagPaste = 2
+	)
+
+	// Check if clipboard has text for paste enablement
+	clipboard := window.GetClipboard()
+	hasPasteText := clipboard != nil && clipboard.GetText() != ""
+
+	items := []ui.ContextMenuItem{
+		{Label: "Copy", Tag: tagCopy, Enabled: v.hasSelection},
+		{Label: "Paste", Tag: tagPaste, Enabled: hasPasteText},
+	}
+
+	// Get cursor position in backing (pixel) coordinates and convert to logical
+	px, py := v.win.PlatformWindow().Cursor()
+	scale := v.win.PlatformWindow().Scale()
+	x, y := px/scale, py/scale
+
+	v.contextMenu = ui.NewContextMenu(items).
+		WithGraphicsWindow(v.win).
+		WithTextRenderer(v.txt).
+		OnSelect(func(tag int) {
+			switch tag {
+			case tagCopy:
+				v.copySelection()
+			case tagPaste:
+				v.pasteFromClipboard()
+			}
+			v.contextMenu = nil
+		}).
+		OnDismiss(func() {
+			v.contextMenu = nil
+		})
+	v.contextMenu.Show(x, y)
+}
+
+// ClearSelection clears the current selection.
+func (v *View) ClearSelection() {
+	v.hasSelection = false
+	v.selecting = false
 }

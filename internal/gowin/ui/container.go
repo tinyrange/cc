@@ -148,8 +148,14 @@ func (c *FlexContainer) Layout(ctx *LayoutContext, constraints Constraints) Size
 	}
 
 	// Distribute remaining space to flex children
+	// But only if constraints are bounded - for unbounded constraints (measuring intrinsic size),
+	// flex children should get 0 space to avoid inflating the layout
+	const unboundedThreshold = 1e8
+	mainConstraint := c.mainSize(constraints.MaxW, constraints.MaxH)
+	isUnbounded := mainConstraint >= unboundedThreshold
+
 	remainingMain := availableMain - totalFixed
-	if remainingMain < 0 {
+	if remainingMain < 0 || isUnbounded {
 		remainingMain = 0
 	}
 
@@ -157,7 +163,10 @@ func (c *FlexContainer) Layout(ctx *LayoutContext, constraints Constraints) Size
 		params := c.childParams[child.ID()]
 		if params.Flex > 0 {
 			margin := params.Margin
-			flexMain := remainingMain * (params.Flex / totalFlex)
+			flexMain := float32(0)
+			if totalFlex > 0 && !isUnbounded {
+				flexMain = remainingMain * (params.Flex / totalFlex)
+			}
 
 			var childConstraints Constraints
 			if c.axis == AxisHorizontal {

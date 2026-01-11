@@ -28,14 +28,17 @@ _Part 1_
 _Part 2_
 
 - [x] Add benchmarking (both Golang and Tests)
-- [ ] Add snapshot support for Linux boot and Benchmark and improve KVM AMD64
-- [ ] Benchmark and improve HVF arm64
-- [ ] Benchmark and improve KVM arm64
-- [ ] Benchmark and improve WHP amd64
-- [ ] Benchmark and improve WHP arm64
-- [ ] Benchmark and improve Networking
-- [ ] Benchmark and improve Filesystem
-- [ ] Benchmark and improve Console
+- [x] Add snapshot support
+- [ ] Improve KVM AMD64
+- [ ] Improve HVF arm64
+- [ ] Improve WHP amd64
+- [ ] Improve KVM arm64
+- [ ] Improve WHP arm64
+- [ ] Improve VirtIO
+- [ ] Improve Networking
+- [ ] Improve Filesystem
+
+_Final Part_
 
 - [ ] Get a more advanced desktop running (like XFCE)
 
@@ -45,13 +48,7 @@ _Part 2_
 
 Only Linux Guests and bare-metal code are currently supported.
 
-### Platforms
-
-- **Linux x86_64**: Works, **primary platform**.
-- **Windows x86_64**: Mostly works (GPU is broken)
-- **Linux arm64**: Mostly works (GPU is broken)
-- **Windows arm64**: Broken (interupt dispatch issues)
-- **macOS arm64**: Works
+Windows, macOS, and Linux are fully supported as host operating systems.
 
 ## Relationship to TinyRange
 
@@ -77,14 +74,6 @@ A take away and future direction is with the evolution of AI models the quality 
 
 As someone who spends most of their time writing tooling I see a bright future adopting AI models in areas that speed up development but I worry the immaturity of current tooling holds back adoption. That is one of the use cases I see for CrumbleCracker in the future once it's more stable though.
 
-### Original Text
-
-**Note: This is for me. I am not accepting external code contributions at this stage**
-
-The private version of CrumbleCracker has been written mostly with AI models mostly GPT-5.1. This is a extraordinarily capbile model that produces working production ready code but architecture I feel it has been lacking. Over the short span of weeks with the current version of CrumbleCracker it has generated code that is generally difficult to read and maintain. The parts performing well have mostly been hand architecture with AI assistance.
-
-For this version of CrumbleCracker I expect to primarily architect/write the production code myself using AI written code as a foundation.
-
 ## Getting Start Notes
 
 To run Alpine in a default VM `./tools/build.go -run -- alpine`.
@@ -97,3 +86,11 @@ You can run tests with...
 - `./tools/build.go -runtest <test>`: Runs a test in the `tests/` dir. These are Dockerfiles meant for advanced tests.
   - Notably...
     - `sway`. When run with `./tools/build.go -runtest sway -- -exec -gpu` should start a window with a Sway desktop.
+
+## Special Thanks
+
+- https://github.com/microsoft/openvmm for some devices and as a basis for the Windows support.
+- https://github.com/tokyo-night/tokyo-night-vscode-theme for the color theme used by ccapp.
+- https://gvisor.dev/ as the inspiration for the networking stack (and testing code).
+- https://pkg.go.dev/github.com/charmbracelet/x/vt for the terminal implementation.
+- https://github.com/TheOnly92/fontstash.go for the basic font rendering code.
