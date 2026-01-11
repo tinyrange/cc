@@ -277,12 +277,23 @@ func (s *LauncherScreen) buildTitleSection() *ui.FlexContainer {
 
 	if len(s.app.bundles) == 0 {
 		col.AddChild(
-			ui.NewLabel("No bundles found. Create bundles with: cc -build <outDir> <image>").WithSize(20),
+			ui.NewLabel("No bundles found. Use the New VM button to add one.").WithSize(20),
 			ui.FlexParamsWithMargin(0, ui.Only(0, 10, 0, 0)),
 		)
 		col.AddChild(
-			ui.NewLabel("Searched for bundles in: "+s.app.bundlesDir).WithSize(20),
+			ui.NewLabel("Place bundles in the CrumbleCracker bundles directory to use them here.").WithSize(16),
 			ui.FlexParamsWithMargin(0, ui.Only(0, 10, 0, 0)),
+		)
+		openBundlesStyle := secondaryButtonStyle()
+		openBundlesStyle.MinWidth = 200
+		col.AddChild(
+			ui.NewButton("Open Bundles Folder").
+				WithStyle(openBundlesStyle).
+				WithGraphicsWindow(s.app.window).
+				OnClick(func() {
+					s.app.openBundlesDir()
+				}),
+			ui.FlexParamsWithMargin(0, ui.Only(0, 16, 0, 0)),
 		)
 	} else {
 		col.AddChild(
@@ -422,10 +433,10 @@ func (s *LauncherScreen) RenderBackground(f graphics.Frame) error {
 
 // LoadingScreen manages the loading UI state
 type LoadingScreen struct {
-	root        *ui.Root
-	app         *Application
-	logo        *ui.AnimatedLogo
-	progressBar *ui.ProgressBar
+	root          *ui.Root
+	app           *Application
+	logo          *ui.AnimatedLogo
+	progressBar   *ui.ProgressBar
 	progressLabel *ui.Label
 }
 

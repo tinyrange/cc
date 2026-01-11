@@ -270,6 +270,13 @@ func (app *Application) openLogs() {
 	}
 }
 
+func (app *Application) openBundlesDir() {
+	slog.Info("open bundles directory requested", "bundles_dir", app.bundlesDir)
+	if err := openDirectory(app.bundlesDir); err != nil {
+		slog.Error("failed to open bundles directory", "bundles_dir", app.bundlesDir, "error", err)
+	}
+}
+
 // updateDockMenu updates the dock menu with recent VMs
 func (app *Application) updateDockMenu() {
 	if app.window == nil {
@@ -331,37 +338,13 @@ func (app *Application) handleDockMenuClick(tag int) {
 	}
 }
 
-// getBundlesDir returns the path to the bundles directory next to the app.
+// getBundlesDir returns the path to the bundles directory in the user's config directory.
 func getBundlesDir() string {
-	exe, err := os.Executable()
+	configDir, err := os.UserConfigDir()
 	if err != nil {
 		return ""
 	}
-	exe, err = filepath.EvalSymlinks(exe)
-	if err != nil {
-		return ""
-	}
-	dir := filepath.Dir(exe)
-
-	// On macOS, if we're inside a .app bundle, go up to the bundle's parent.
-	if runtime.GOOS == "darwin" {
-		// e.g. /path/to/Foo.app/Contents/MacOS/ccapp → /path/to/bundles
-		for range 3 {
-			parent := filepath.Dir(dir)
-			if filepath.Ext(parent) == ".app" || filepath.Base(parent) == "Contents" || filepath.Base(parent) == "MacOS" {
-				dir = filepath.Dir(parent)
-			} else {
-				break
-			}
-		}
-
-		// if we're still in a .app bundle, go up to the parent
-		if filepath.Ext(dir) == ".app" {
-			dir = filepath.Dir(dir)
-		}
-	}
-
-	return filepath.Join(dir, "bundles")
+	return filepath.Join(configDir, "ccapp", "bundles")
 }
 
 // loadStarlarkUI attempts to load custom UI from app.star in the bundles directory.
@@ -547,6 +530,14 @@ func (app *Application) Run() error {
 	// Discover bundles
 	bundlesDir := getBundlesDir()
 	app.bundlesDir = bundlesDir
+
+	// Ensure bundles directory exists
+	if bundlesDir != "" {
+		if err := os.MkdirAll(bundlesDir, 0o755); err != nil {
+			slog.Warn("failed to create bundles directory", "dir", bundlesDir, "error", err)
+		}
+	}
+
 	app.bundles, err = discoverBundles(bundlesDir)
 	if err != nil {
 		slog.Warn("failed to discover bundles", "error", err)
