@@ -274,11 +274,11 @@ func (s *LauncherScreen) buildTitleSection() *ui.FlexContainer {
 
 	if len(s.app.bundles) == 0 {
 		col.AddChild(
-			ui.NewLabel("No bundles found. Use the New VM button to add one.").WithSize(20),
+			ui.NewWrapLabel("No bundles found. Use the New VM button to add one.").WithSize(20),
 			ui.FlexParamsWithMargin(0, ui.Only(0, 10, 0, 0)),
 		)
 		col.AddChild(
-			ui.NewLabel("Place bundles in the CrumbleCracker bundles directory to use them here.").WithSize(16),
+			ui.NewWrapLabel("Place bundles in the CrumbleCracker bundles directory to use them here.").WithSize(16),
 			ui.FlexParamsWithMargin(0, ui.Only(0, 10, 0, 0)),
 		)
 		openBundlesStyle := secondaryButtonStyle()
@@ -408,8 +408,8 @@ func (s *LauncherScreen) buildBundleCard(index int, b discoveredBundle) *bundleC
 	content.AddChild(imagePlaceholder, ui.DefaultFlexParams())
 
 	// Name and description with better spacing
-	content.AddChild(ui.NewLabel(name).WithSize(16), ui.DefaultFlexParams())
-	content.AddChild(ui.NewLabel(desc).WithSize(13).WithColor(colorTextSecondary), ui.DefaultFlexParams())
+	content.AddChild(ui.NewWrapLabel(name).WithSize(16), ui.DefaultFlexParams())
+	content.AddChild(ui.NewWrapLabel(desc).WithSize(13).WithColor(colorTextSecondary), ui.DefaultFlexParams())
 
 	cardStyle := ui.CardStyle{
 		BackgroundColor: colorCardBg,
@@ -668,7 +668,7 @@ func (s *ErrorScreen) buildUI() {
 	}
 	errorCard := ui.NewCard(
 		ui.NewPadding(
-			ui.NewLabel(msg).WithSize(16).WithColor(colorTextPrimary),
+			ui.NewWrapLabel(msg).WithSize(16).WithColor(colorTextPrimary),
 			ui.All(16),
 		),
 	).
