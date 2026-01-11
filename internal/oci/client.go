@@ -1,6 +1,7 @@
 package oci
 
 import (
+	"archive/tar"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -335,6 +336,41 @@ func (pw *progressWriter) Write(p []byte) (int, error) {
 // IsLocalTar checks if the image reference is a local tar file.
 func IsLocalTar(imageRef string) bool {
 	return (strings.HasPrefix(imageRef, "./") || strings.HasPrefix(imageRef, "../") || strings.HasPrefix(imageRef, "/")) && strings.HasSuffix(imageRef, ".tar")
+}
+
+// ValidateTar checks if a file is a valid Docker/OCI tar archive.
+// It opens the tar and verifies it contains a valid manifest.json.
+func ValidateTar(tarPath string) error {
+	f, err := os.Open(tarPath)
+	if err != nil {
+		return fmt.Errorf("open tar: %w", err)
+	}
+	defer f.Close()
+
+	tr := tar.NewReader(f)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return fmt.Errorf("manifest.json not found in tar archive")
+		}
+		if err != nil {
+			return fmt.Errorf("read tar: %w", err)
+		}
+		if hdr.Name == "manifest.json" {
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				return fmt.Errorf("read manifest.json: %w", err)
+			}
+			var entries []json.RawMessage
+			if err := json.Unmarshal(data, &entries); err != nil {
+				return fmt.Errorf("parse manifest.json: %w", err)
+			}
+			if len(entries) == 0 {
+				return fmt.Errorf("no images in tar archive")
+			}
+			return nil
+		}
+	}
 }
 
 // ParseImageRef parses an OCI image reference into registry, image, and tag.

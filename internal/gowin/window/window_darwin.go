@@ -720,7 +720,9 @@ func (c *Cocoa) processEvent(ev objc.ID) {
 		chars := objc.Send[objc.ID](ev, selEventCharacters)
 		if s := nsStringToGo(chars); s != "" {
 			c.textInput += s
-			if cocoaKeyEmitsText(key) {
+			// Don't emit TextEvent for keyboard shortcuts (Cmd+key or Ctrl+key)
+			isShortcut := (mods & (ModSuper | ModCtrl)) != 0
+			if cocoaKeyEmitsText(key) && !isShortcut {
 				c.inputEvents = append(c.inputEvents, InputEvent{
 					Type: InputEventText,
 					Text: s,

@@ -10,6 +10,7 @@ import (
 	"github.com/tinyrange/cc/internal/assets"
 	"github.com/tinyrange/cc/internal/gowin/graphics"
 	"github.com/tinyrange/cc/internal/gowin/ui"
+	"github.com/tinyrange/cc/internal/oci"
 )
 
 // formatBytes formats a byte count as a human-readable string.
@@ -466,9 +467,17 @@ func (s *LoadingScreen) buildUI() {
 	}
 
 	// Loading status in a rounded card at top-left
-	msg := "Booting VM…"
-	if s.app.bootName != "" {
-		msg = "Booting " + s.app.bootName + "…"
+	var msg string
+	if s.app.mode == modeInstalling {
+		msg = "Installing…"
+		if s.app.installName != "" {
+			msg = "Installing " + s.app.installName + "…"
+		}
+	} else {
+		msg = "Booting VM…"
+		if s.app.bootName != "" {
+			msg = "Booting " + s.app.bootName + "…"
+		}
 	}
 
 	// Create a column for the status card content
@@ -507,15 +516,26 @@ func (s *LoadingScreen) buildUI() {
 }
 
 func (s *LoadingScreen) Update(f graphics.Frame) {
-	if s.logo != nil {
-		t := float32(time.Since(s.app.bootStarted).Seconds())
-		s.logo.SetTime(t)
+	// Get the appropriate start time and progress based on mode
+	var startTime time.Time
+	var progress oci.DownloadProgress
+
+	if s.app.mode == modeInstalling {
+		startTime = s.app.installStarted
+		s.app.installProgressMu.Lock()
+		progress = s.app.installProgress
+		s.app.installProgressMu.Unlock()
+	} else {
+		startTime = s.app.bootStarted
+		s.app.bootProgressMu.Lock()
+		progress = s.app.bootProgress
+		s.app.bootProgressMu.Unlock()
 	}
 
-	// Update progress bar from app state
-	s.app.bootProgressMu.Lock()
-	progress := s.app.bootProgress
-	s.app.bootProgressMu.Unlock()
+	if s.logo != nil {
+		t := float32(time.Since(startTime).Seconds())
+		s.logo.SetTime(t)
+	}
 
 	if progress.Total > 0 {
 		// Calculate progress percentage

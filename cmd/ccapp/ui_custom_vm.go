@@ -2,12 +2,16 @@ package main
 
 import (
 	"image/color"
+	"log/slog"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/tinyrange/cc/internal/bundle"
 	"github.com/tinyrange/cc/internal/gowin/graphics"
 	"github.com/tinyrange/cc/internal/gowin/ui"
 	"github.com/tinyrange/cc/internal/gowin/window"
+	"github.com/tinyrange/cc/internal/oci"
 )
 
 // CustomVMMode represents the input mode for custom VM
@@ -233,7 +237,7 @@ func (s *CustomVMScreen) buildUI() {
 	launchStyle.MinWidth = 90
 	launchStyle.MinHeight = 36
 	launchStyle.TextSize = 14
-	s.launchButton = ui.NewButton("Launch").
+	s.launchButton = ui.NewButton("Add").
 		WithStyle(launchStyle).
 		WithGraphicsWindow(s.app.window).
 		OnClick(s.onLaunch)
@@ -286,24 +290,36 @@ func (s *CustomVMScreen) browseTarball() {
 func (s *CustomVMScreen) onLaunch() {
 	var sourceType VMSourceType
 	var sourcePath string
-	var displayName string
+	var bundleName string
 
 	switch s.mode {
 	case CustomVMModeBundleDir:
 		if s.selectedPath == "" {
 			return // No path selected
 		}
+		// Validate bundle directory
+		if err := bundle.ValidateBundleDir(s.selectedPath); err != nil {
+			slog.Error("invalid bundle directory", "path", s.selectedPath, "error", err)
+			s.app.showError(err)
+			return
+		}
 		sourceType = VMSourceBundle
 		sourcePath = s.selectedPath
-		displayName = filepath.Base(sourcePath)
+		bundleName = filepath.Base(sourcePath)
 
 	case CustomVMModeTarball:
 		if s.selectedPath == "" {
 			return // No path selected
 		}
+		// Validate tarball
+		if err := oci.ValidateTar(s.selectedPath); err != nil {
+			slog.Error("invalid tarball", "path", s.selectedPath, "error", err)
+			s.app.showError(err)
+			return
+		}
 		sourceType = VMSourceTarball
 		sourcePath = s.selectedPath
-		displayName = filepath.Base(sourcePath)
+		bundleName = strings.TrimSuffix(filepath.Base(sourcePath), ".tar")
 
 	case CustomVMModeImageName:
 		if s.imageName == "" {
@@ -311,26 +327,54 @@ func (s *CustomVMScreen) onLaunch() {
 		}
 		sourceType = VMSourceImageName
 		sourcePath = s.imageName
-		displayName = s.imageName
-	}
-
-	// Record to recent VMs
-	if s.app.recentVMs != nil {
-		s.app.recentVMs.AddOrUpdate(RecentVM{
-			Name:           displayName,
-			SourceType:     sourceType,
-			SourcePath:     sourcePath,
-			NetworkEnabled: s.networkEnabled,
-		})
-		// Update dock menu
-		s.app.updateDockMenu()
+		bundleName = sanitizeImageName(s.imageName)
 	}
 
 	// Clear blur capture before changing mode
 	s.app.clearBlurCapture()
 
-	// Start boot process
-	s.app.startCustomVM(sourceType, sourcePath, s.networkEnabled)
+	// For bundle dir, validate and launch directly (don't copy)
+	if sourceType == VMSourceBundle {
+		// Record to recent VMs
+		if s.app.recentVMs != nil {
+			s.app.recentVMs.AddOrUpdate(RecentVM{
+				Name:           bundleName,
+				SourceType:     sourceType,
+				SourcePath:     sourcePath,
+				NetworkEnabled: s.networkEnabled,
+			})
+			s.app.updateDockMenu()
+		}
+		s.app.startCustomVM(sourceType, sourcePath, s.networkEnabled)
+		return
+	}
+
+	// For image/tarball, install as bundle
+	s.app.installBundle(sourceType, sourcePath, bundleName, s.networkEnabled)
+}
+
+// sanitizeImageName converts an image name to a valid directory name
+func sanitizeImageName(imageName string) string {
+	// Remove registry prefix if present
+	if idx := strings.LastIndex(imageName, "/"); idx != -1 {
+		imageName = imageName[idx+1:]
+	}
+	// Replace : with _
+	imageName = strings.ReplaceAll(imageName, ":", "_")
+	// Replace other invalid chars
+	var b strings.Builder
+	for _, r := range imageName {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	result := b.String()
+	if result == "" {
+		result = "bundle"
+	}
+	return result
 }
 
 // Render renders the custom VM screen

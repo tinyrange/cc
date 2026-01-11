@@ -42,6 +42,7 @@ const (
 	modeError
 	modeTerminal
 	modeCustomVM
+	modeInstalling
 )
 
 // discoveredBundle holds metadata and path for a discovered bundle.
@@ -77,6 +78,11 @@ type bootPrep struct {
 type bootResult struct {
 	prep *bootPrep
 	err  error
+}
+
+type installResult struct {
+	bundlePath string
+	err        error
 }
 
 // runningVM holds state for a booted VM.
@@ -127,11 +133,18 @@ type Application struct {
 	thumbDragDX   float32
 
 	// Boot loading state
-	bootCh       chan bootResult
-	bootStarted  time.Time
-	bootName     string
-	bootProgress oci.DownloadProgress // Current download progress
-	bootProgressMu sync.Mutex          // Protects bootProgress
+	bootCh         chan bootResult
+	bootStarted    time.Time
+	bootName       string
+	bootProgress   oci.DownloadProgress // Current download progress
+	bootProgressMu sync.Mutex           // Protects bootProgress
+
+	// Install state (for installing bundles from images/tarballs)
+	installCh         chan installResult
+	installStarted    time.Time
+	installName       string
+	installProgress   oci.DownloadProgress
+	installProgressMu sync.Mutex
 
 	// Error state (full-screen)
 	errMsg string
@@ -579,6 +592,8 @@ func (app *Application) Run() error {
 			return app.renderTerminal(f)
 		case modeCustomVM:
 			return app.renderCustomVM(f)
+		case modeInstalling:
+			return app.renderInstalling(f)
 		default:
 			return nil
 		}
@@ -661,6 +676,40 @@ func (app *Application) renderCustomVM(f graphics.Frame) error {
 
 	// Render the custom VM dialog on top
 	return app.customVMScreen.Render(f)
+}
+
+func (app *Application) renderInstalling(f graphics.Frame) error {
+	// Check for installation completion
+	if app.installCh != nil {
+		select {
+		case res := <-app.installCh:
+			app.installCh = nil
+			if res.err != nil {
+				slog.Error("failed to install bundle", "error", res.err)
+				app.showError(res.err)
+				return nil
+			}
+			// Refresh bundles list
+			bundles, err := discoverBundles(app.bundlesDir)
+			if err != nil {
+				slog.Warn("failed to refresh bundles", "error", err)
+			} else {
+				app.bundles = bundles
+			}
+			// Rebuild launcher screen to show new bundle
+			app.launcherScreen = NewLauncherScreen(app)
+			app.mode = modeLauncher
+			slog.Info("bundle installed successfully", "path", res.bundlePath)
+			return nil
+		default:
+		}
+	}
+
+	// Reuse loading screen UI for installation progress
+	if app.loadingScreen == nil {
+		app.loadingScreen = NewLoadingScreen(app)
+	}
+	return app.loadingScreen.Render(f)
 }
 
 func (app *Application) renderTerminal(f graphics.Frame) error {
@@ -1068,6 +1117,7 @@ func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string
 	app.bootStarted = time.Now()
 	app.bootName = displayName
 	app.mode = modeLoading
+	app.loadingScreen = nil // Force rebuild to show correct name
 
 	ch := make(chan bootResult, 1)
 	app.bootCh = ch
@@ -1107,6 +1157,115 @@ func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string
 
 		out <- bootResult{prep: prep, err: err}
 	}(sourceType, sourcePath, network, hvArch, ch, progressCallback)
+}
+
+// installBundle installs a VM source as a bundle in the bundles directory.
+// For image names and tarballs, it creates a new bundle. For bundle dirs, it validates only.
+func (app *Application) installBundle(sourceType VMSourceType, sourcePath string, bundleName string, network bool) {
+	if app.installCh != nil {
+		return // Already installing
+	}
+
+	hvArch, err := parseArchitecture(runtime.GOARCH)
+	if err != nil {
+		slog.Error("failed to determine architecture", "goarch", runtime.GOARCH, "error", err)
+		app.showError(err)
+		return
+	}
+
+	app.installStarted = time.Now()
+	app.installName = bundleName
+	app.mode = modeInstalling
+	app.loadingScreen = nil // Force rebuild to show correct name
+
+	ch := make(chan installResult, 1)
+	app.installCh = ch
+
+	progressCallback := func(progress oci.DownloadProgress) {
+		app.installProgressMu.Lock()
+		app.installProgress = progress
+		app.installProgressMu.Unlock()
+	}
+
+	go func() {
+		var err error
+		bundlePath := filepath.Join(app.bundlesDir, bundleName)
+
+		switch sourceType {
+		case VMSourceImageName:
+			err = app.doInstallFromImageName(sourcePath, bundlePath, bundleName, network, hvArch, progressCallback)
+		case VMSourceTarball:
+			err = app.doInstallFromTarball(sourcePath, bundlePath, bundleName, network, hvArch)
+		case VMSourceBundle:
+			// For bundle dirs, just validate - don't copy
+			err = bundle.ValidateBundleDir(sourcePath)
+			if err == nil {
+				bundlePath = sourcePath // Use original path
+			}
+		}
+
+		ch <- installResult{bundlePath: bundlePath, err: err}
+	}()
+}
+
+func (app *Application) doInstallFromImageName(imageName, bundlePath, name string, network bool, hvArch hv.CpuArchitecture, progress oci.ProgressCallback) error {
+	slog.Info("installing image as bundle", "image", imageName, "dest", bundlePath)
+
+	client, err := oci.NewClient("")
+	if err != nil {
+		return fmt.Errorf("create OCI client: %w", err)
+	}
+	client.SetProgressCallback(progress)
+
+	img, err := client.PullForArch(imageName, hvArch)
+	if err != nil {
+		return fmt.Errorf("pull image: %w", err)
+	}
+
+	return installImageAsBundle(img, bundlePath, name, imageName, network)
+}
+
+func (app *Application) doInstallFromTarball(tarPath, bundlePath, name string, network bool, hvArch hv.CpuArchitecture) error {
+	slog.Info("installing tarball as bundle", "path", tarPath, "dest", bundlePath)
+
+	client, err := oci.NewClient("")
+	if err != nil {
+		return fmt.Errorf("create OCI client: %w", err)
+	}
+
+	img, err := client.LoadFromTar(tarPath, hvArch)
+	if err != nil {
+		return fmt.Errorf("load tar: %w", err)
+	}
+
+	return installImageAsBundle(img, bundlePath, name, tarPath, network)
+}
+
+func installImageAsBundle(img *oci.Image, bundlePath, name, source string, network bool) error {
+	// Create image directory
+	imageDir := filepath.Join(bundlePath, "image")
+	if err := oci.ExportToDir(img, imageDir); err != nil {
+		return fmt.Errorf("export image: %w", err)
+	}
+
+	// Create bundle metadata
+	meta := bundle.Metadata{
+		Version:     1,
+		Name:        name,
+		Description: fmt.Sprintf("Installed from %s", filepath.Base(source)),
+		Boot: bundle.BootConfig{
+			ImageDir: "image",
+			Network:  network,
+			Exec:     true,
+		},
+	}
+
+	if err := bundle.WriteTemplate(bundlePath, meta); err != nil {
+		return fmt.Errorf("write bundle metadata: %w", err)
+	}
+
+	slog.Info("bundle installed successfully", "path", bundlePath)
+	return nil
 }
 
 // prepareFromTarball loads a VM from an OCI tarball

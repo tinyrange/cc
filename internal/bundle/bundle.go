@@ -55,6 +55,25 @@ func IsBundleDir(dir string) bool {
 	return err == nil
 }
 
+// ValidateBundleDir validates that a directory is a valid bundle with valid metadata.
+func ValidateBundleDir(dir string) error {
+	if !IsBundleDir(dir) {
+		return fmt.Errorf("missing %s", MetadataFilename)
+	}
+
+	meta, err := LoadMetadata(dir)
+	if err != nil {
+		return fmt.Errorf("invalid metadata: %w", err)
+	}
+
+	imageDir := filepath.Join(dir, meta.Boot.ImageDir)
+	if _, err := os.Stat(imageDir); os.IsNotExist(err) {
+		return fmt.Errorf("image directory not found: %s", imageDir)
+	}
+
+	return nil
+}
+
 func LoadMetadata(dir string) (Metadata, error) {
 	data, err := os.ReadFile(filepath.Join(dir, MetadataFilename))
 	if err != nil {
