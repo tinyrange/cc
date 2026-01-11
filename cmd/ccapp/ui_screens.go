@@ -339,7 +339,7 @@ func (s *LauncherScreen) buildAddVMSection() *ui.FlexContainer {
 		iconWidget := ui.NewSVGImage(s.iconPlus).WithSize(20, 20)
 		content.AddChild(iconWidget, ui.DefaultFlexParams())
 	}
-	content.AddChild(ui.NewLabel("Add VM").WithSize(16), ui.DefaultFlexParams())
+	content.AddChild(ui.NewLabel("Add VM").WithSize(16).WithColor(colorBackground), ui.DefaultFlexParams())
 
 	// Use Card for clickable content with icon - prominent green style
 	card := ui.NewCard(content).
