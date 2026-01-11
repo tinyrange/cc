@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- Settings gear icon using polygons only -->
+  <!-- Central body -->
+  <polygon points="7,7 17,7 17,17 7,17" fill="white"/>
+  <!-- Top tooth -->
+  <polygon points="9.5,3 14.5,3 14.5,7 9.5,7" fill="white"/>
+  <!-- Bottom tooth -->
+  <polygon points="9.5,17 14.5,17 14.5,21 9.5,21" fill="white"/>
+  <!-- Left tooth -->
+  <polygon points="3,9.5 7,9.5 7,14.5 3,14.5" fill="white"/>
+  <!-- Right tooth -->
+  <polygon points="17,9.5 21,9.5 21,14.5 17,14.5" fill="white"/>
+  <!-- Top-left diagonal tooth -->
+  <polygon points="4,5 6,3 9,6 7,8" fill="white"/>
+  <!-- Top-right diagonal tooth -->
+  <polygon points="18,3 20,5 17,8 15,6" fill="white"/>
+  <!-- Bottom-left diagonal tooth -->
+  <polygon points="3,18 5,20 8,17 6,15" fill="white"/>
+  <!-- Bottom-right diagonal tooth -->
+  <polygon points="18,17 20,19 17,22 15,20" fill="white"/>
+  <!-- Center hole -->
+  <polygon points="9.5,9.5 14.5,9.5 14.5,14.5 9.5,14.5" fill="hsl(230, 15%, 13%)"/>
+</svg>

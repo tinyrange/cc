@@ -28,10 +28,11 @@ type BootConfig struct {
 	ImageDir string   `yaml:"imageDir"`
 	Command  []string `yaml:"command,omitempty"`
 
-	CPUs     int    `yaml:"cpus,omitempty"`
-	MemoryMB uint64 `yaml:"memoryMB,omitempty"`
-	Exec     bool   `yaml:"exec,omitempty"`
-	Dmesg    bool   `yaml:"dmesg,omitempty"`
+	CPUs     int      `yaml:"cpus,omitempty"`
+	MemoryMB uint64   `yaml:"memoryMB,omitempty"`
+	Exec     bool     `yaml:"exec,omitempty"`
+	Dmesg    bool     `yaml:"dmesg,omitempty"`
+	Env      []string `yaml:"env,omitempty"` // Custom environment variables (KEY=value format)
 }
 
 func (m *Metadata) normalize() {

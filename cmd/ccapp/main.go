@@ -42,6 +42,8 @@ const (
 	modeTerminal
 	modeCustomVM
 	modeInstalling
+	modeSettings
+	modeDeleteConfirm
 )
 
 // discoveredBundle holds metadata and path for a discovered bundle.
@@ -109,11 +111,16 @@ type Application struct {
 	logFile string
 
 	// UI screens (widget-based)
-	launcherScreen *LauncherScreen
-	loadingScreen  *LoadingScreen
-	errorScreen    *ErrorScreen
-	terminalScreen *TerminalScreen
-	customVMScreen *CustomVMScreen
+	launcherScreen      *LauncherScreen
+	loadingScreen       *LoadingScreen
+	errorScreen         *ErrorScreen
+	terminalScreen      *TerminalScreen
+	customVMScreen      *CustomVMScreen
+	settingsScreen      *SettingsScreen
+	deleteConfirmScreen *DeleteConfirmScreen
+
+	// Settings dialog state
+	selectedSettingsIndex int
 
 	// Legacy UI state (for terminal screen which uses termview directly)
 	scrollX       float32
@@ -467,6 +474,10 @@ func (app *Application) Run() error {
 			return app.renderCustomVM(f)
 		case modeInstalling:
 			return app.renderInstalling(f)
+		case modeSettings:
+			return app.renderSettings(f)
+		case modeDeleteConfirm:
+			return app.renderDeleteConfirm(f)
 		default:
 			return nil
 		}
@@ -584,6 +595,53 @@ func (app *Application) renderCustomVM(f graphics.Frame) error {
 
 	// Render the custom VM dialog on top
 	return app.customVMScreen.Render(f)
+}
+
+func (app *Application) renderSettings(f graphics.Frame) error {
+	if app.settingsScreen == nil {
+		app.settingsScreen = NewSettingsScreen(app, app.selectedSettingsIndex)
+	}
+
+	// Render launcher as background
+	app.launcherScreen.RenderBackground(f)
+
+	// Render the settings dialog on top
+	return app.settingsScreen.Render(f)
+}
+
+func (app *Application) renderDeleteConfirm(f graphics.Frame) error {
+	if app.deleteConfirmScreen == nil {
+		app.deleteConfirmScreen = NewDeleteConfirmScreen(app, app.selectedSettingsIndex)
+	}
+
+	// Render launcher as background
+	app.launcherScreen.RenderBackground(f)
+
+	// Render the delete confirmation dialog on top
+	return app.deleteConfirmScreen.Render(f)
+}
+
+func (app *Application) showSettings(bundleIndex int) {
+	app.selectedSettingsIndex = bundleIndex
+	app.settingsScreen = nil // Force rebuild with new bundle
+	app.mode = modeSettings
+}
+
+func (app *Application) showDeleteConfirm(bundleIndex int) {
+	app.selectedSettingsIndex = bundleIndex
+	app.deleteConfirmScreen = nil // Force rebuild
+	app.mode = modeDeleteConfirm
+}
+
+func (app *Application) refreshBundles() {
+	bundles, err := discoverBundles(app.bundlesDir)
+	if err != nil {
+		slog.Warn("failed to refresh bundles", "error", err)
+	} else {
+		app.bundles = bundles
+	}
+	// Rebuild launcher screen to show updated bundles
+	app.launcherScreen = NewLauncherScreen(app)
 }
 
 func (app *Application) renderInstalling(f graphics.Frame) error {
@@ -866,6 +924,11 @@ func prepareBootBundle(b discoveredBundle, hvArch hv.CpuArchitecture, preOpenedH
 	slog.Info("resolved command path", "exec", execCmd, "work_dir", workDir)
 	prep.execCmd = execCmd
 	prep.env = img.Config.Env
+	// Append custom environment variables from bundle metadata
+	if len(b.Meta.Boot.Env) > 0 {
+		prep.env = append(prep.env, b.Meta.Boot.Env...)
+		slog.Info("added custom env vars from bundle", "count", len(b.Meta.Boot.Env))
+	}
 	// Ensure TERM is set for the container so terminal apps work correctly.
 	if !hasEnvVar(prep.env, "TERM") {
 		prep.env = append(prep.env, "TERM=xterm-256color")

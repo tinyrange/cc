@@ -11,6 +11,7 @@ import (
 	"github.com/tinyrange/cc/internal/assets"
 	"github.com/tinyrange/cc/internal/gowin/graphics"
 	"github.com/tinyrange/cc/internal/gowin/ui"
+	"github.com/tinyrange/cc/internal/gowin/window"
 	"github.com/tinyrange/cc/internal/oci"
 )
 
@@ -48,6 +49,7 @@ var (
 	colorAccentPressed = color.RGBA{R: 0x3d, G: 0x59, B: 0xa1, A: 255} // #3d59a1
 	colorTextPrimary   = color.RGBA{R: 0xa9, G: 0xb1, B: 0xd6, A: 255} // #a9b1d6 (foreground)
 	colorTextSecondary = color.RGBA{R: 0x78, G: 0x7c, B: 0x99, A: 255} // #787c99
+	colorTextMuted     = color.RGBA{R: 0x56, G: 0x5f, B: 0x89, A: 255} // #565f89 (dimmer)
 	colorGreen         = color.RGBA{R: 0x9e, G: 0xce, B: 0x6a, A: 255} // #9ece6a
 	colorRed           = color.RGBA{R: 0xf7, G: 0x76, B: 0x8e, A: 255} // #f7768e
 	colorYellow        = color.RGBA{R: 0xe0, G: 0xaf, B: 0x68, A: 255} // #e0af68
@@ -144,6 +146,7 @@ type LauncherScreen struct {
 	// Icons
 	iconPlus *graphics.SVG
 	iconLogs *graphics.SVG
+	iconCog  *graphics.SVG
 
 	// State
 	scrollX float32
@@ -172,6 +175,11 @@ func NewLauncherScreen(app *Application) *LauncherScreen {
 		slog.Warn("failed to load logs icon", "error", err)
 	} else {
 		screen.iconLogs = icon
+	}
+	if icon, err := graphics.LoadSVG(app.window, assets.IconCog); err != nil {
+		slog.Warn("failed to load cog icon", "error", err)
+	} else {
+		screen.iconCog = icon
 	}
 
 	screen.buildUI()
@@ -389,28 +397,90 @@ func (s *LauncherScreen) buildBundleCard(index int, b discoveredBundle) *bundleC
 
 	// Card dimensions and padding
 	const cardWidth float32 = 180
-	const cardHeight float32 = 240
+	const cardHeight float32 = 270
 	const cardPadding float32 = 12
 	const contentWidth = cardWidth - (cardPadding * 2)
 	const imageHeight float32 = 120
+	const buttonSize float32 = 26
 
 	// Card content: vertical layout with image area and text
-	content := ui.Column().WithGap(12)
+	content := ui.Column().WithGap(8)
 
-	// Image placeholder area with subtle background
+	// Image placeholder area - clickable to start VM
 	imagePlaceholder := ui.NewCard(nil).
 		WithStyle(ui.CardStyle{
 			BackgroundColor: colorTopBar,
 			CornerRadius:    cornerRadiusSmall,
 		}).
+		WithHoverStyle(ui.CardStyle{
+			BackgroundColor: colorBtnHover,
+			CornerRadius:    cornerRadiusSmall,
+		}).
 		WithGraphicsWindow(s.app.window).
-		WithFixedSize(contentWidth, imageHeight)
+		WithFixedSize(contentWidth, imageHeight).
+		OnClick(func() {
+			s.app.selectedIndex = index
+			s.app.startBootBundle(index)
+		})
 	content.AddChild(imagePlaceholder, ui.DefaultFlexParams())
 
 	// Name and description with better spacing
 	content.AddChild(ui.NewWrapLabel(name).WithSize(16), ui.DefaultFlexParams())
 	content.AddChild(ui.NewWrapLabel(desc).WithSize(13).WithColor(colorTextSecondary), ui.DefaultFlexParams())
 
+	// Spacer to push buttons to bottom
+	content.AddChild(ui.NewSpacer(), ui.FlexParams(1))
+
+	// Bottom row with Start button on left, Settings button on right
+	bottomRow := ui.Row().WithGap(8)
+
+	// Start button (green)
+	startBtn := ui.NewButton("Start").
+		WithStyle(ui.ButtonStyle{
+			BackgroundNormal:  colorGreen,
+			BackgroundHovered: color.RGBA{R: 0xb9, G: 0xe0, B: 0x8c, A: 255},
+			BackgroundPressed: color.RGBA{R: 0x70, G: 0xa0, B: 0x50, A: 255},
+			TextColor:         colorBackground,
+			TextSize:          12,
+			Padding:           ui.Symmetric(12, 4),
+			MinWidth:          60,
+			MinHeight:         buttonSize,
+			CornerRadius:      cornerRadiusSmall,
+		}).
+		WithGraphicsWindow(s.app.window).
+		OnClick(func() {
+			s.app.selectedIndex = index
+			s.app.startBootBundle(index)
+		})
+	bottomRow.AddChild(startBtn, ui.DefaultFlexParams())
+
+	// Spacer between buttons
+	bottomRow.AddChild(ui.NewSpacer(), ui.FlexParams(1))
+
+	// Settings cog button (icon only, fixed size)
+	if s.iconCog != nil {
+		cogContent := ui.NewSVGImage(s.iconCog).WithSize(14, 14)
+		cogButton := ui.NewCard(cogContent).
+			WithStyle(ui.CardStyle{
+				BackgroundColor: colorBtnNormal,
+				Padding:         ui.All(6),
+				CornerRadius:    cornerRadiusSmall,
+			}).
+			WithHoverStyle(ui.CardStyle{
+				BackgroundColor: colorBtnHover,
+				Padding:         ui.All(6),
+				CornerRadius:    cornerRadiusSmall,
+			}).
+			WithGraphicsWindow(s.app.window).
+			WithFixedSize(buttonSize, buttonSize).
+			OnClick(func() {
+				s.app.showSettings(index)
+			})
+		bottomRow.AddChild(cogButton, ui.DefaultFlexParams())
+	}
+	content.AddChild(bottomRow, ui.DefaultFlexParams())
+
+	// Outer card is just a visual container (NOT clickable)
 	cardStyle := ui.CardStyle{
 		BackgroundColor: colorCardBg,
 		BorderColor:     color.Transparent,
@@ -419,23 +489,10 @@ func (s *LauncherScreen) buildBundleCard(index int, b discoveredBundle) *bundleC
 		CornerRadius:    cornerRadiusMedium,
 	}
 
-	hoverStyle := ui.CardStyle{
-		BackgroundColor: colorCardBgHover,
-		BorderColor:     colorAccent,
-		BorderWidth:     0, // Border not rendered with rounded corners, but color signals hover
-		Padding:         ui.All(cardPadding),
-		CornerRadius:    cornerRadiusMedium,
-	}
-
 	card := ui.NewCard(content).
 		WithStyle(cardStyle).
-		WithHoverStyle(hoverStyle).
 		WithGraphicsWindow(s.app.window).
-		WithFixedSize(cardWidth, cardHeight).
-		OnClick(func() {
-			s.app.selectedIndex = index
-			s.app.startBootBundle(index)
-		})
+		WithFixedSize(cardWidth, cardHeight)
 
 	return &bundleCardWidget{
 		card:  card,
@@ -757,6 +814,7 @@ type TerminalScreen struct {
 	expanded       bool
 	expandProgress float32
 	lastUpdate     time.Time
+	prevLeftDown   bool // For manual click detection
 }
 
 // Notch animation constants
@@ -933,5 +991,41 @@ func (s *TerminalScreen) RenderNotch(f graphics.Frame) {
 		s.rebuildLayout()
 	}
 
-	s.root.Step(f, s.app.window.PlatformWindow())
+	// Use DrawOnly to avoid consuming keyboard events that the terminal needs.
+	// Handle button clicks manually below.
+	s.root.DrawOnly(f)
+
+	// Manual button click handling when expanded
+	if s.expanded {
+		leftDown := f.GetButtonState(window.ButtonLeft).IsDown()
+		justClicked := leftDown && !s.prevLeftDown
+		s.prevLeftDown = leftDown
+
+		if justClicked && isHovered {
+			// Check if click is on Exit button (left side of notch)
+			exitBtnRect := rect{x: hoverX + 10, y: 10, w: 50, h: 28}
+			if exitBtnRect.contains(mx, my) {
+				s.app.showExitConfirm = true
+			}
+
+			// Check if click is on Net button (right side of notch)
+			netBtnRect := rect{x: hoverX + hoverW - 60, y: 10, w: 50, h: 28}
+			if netBtnRect.contains(mx, my) {
+				s.app.networkDisabled = !s.app.networkDisabled
+				if s.app.running != nil && s.app.running.netBackend != nil {
+					s.app.running.netBackend.SetInternetAccessEnabled(!s.app.networkDisabled)
+				}
+				if s.app.networkDisabled {
+					s.netBtn.WithStyle(notchNetButtonStyle(false))
+					s.netBtn.SetText("Off")
+				} else {
+					s.netBtn.WithStyle(notchNetButtonStyle(true))
+					s.netBtn.SetText("Net")
+				}
+				slog.Info("internet access toggled", "disabled", s.app.networkDisabled)
+			}
+		}
+	} else {
+		s.prevLeftDown = f.GetButtonState(window.ButtonLeft).IsDown()
+	}
 }
