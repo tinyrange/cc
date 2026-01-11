@@ -213,6 +213,10 @@ func (s *LauncherScreen) buildUI() {
 		contentCol.AddChild(bundleSection, ui.FlexParams(1))
 	}
 
+	// Add VM button section - prominent and centered below bundles
+	addVMSection := s.buildAddVMSection()
+	contentCol.AddChild(addVMSection, ui.DefaultFlexParams())
+
 	stack.AddChild(contentCol)
 	s.root.SetChild(stack)
 }
@@ -224,15 +228,6 @@ func (s *LauncherScreen) buildTopBar() *ui.FlexContainer {
 		WithCrossAlignment(ui.CrossAxisCenter)
 
 	row.AddChild(ui.NewSpacer(), ui.FlexParams(1))
-
-	// New VM button with icon
-	row.AddChild(
-		s.buildIconButton("New VM", s.iconPlus, func() {
-			s.app.customVMScreen = NewCustomVMScreen(s.app)
-			s.app.mode = modeCustomVM
-		}),
-		ui.FlexParamsWithMargin(0, ui.Only(0, 0, 8, 0)),
-	)
 
 	// Debug Logs button with icon
 	row.AddChild(
@@ -328,6 +323,44 @@ func (s *LauncherScreen) buildBundleSection() ui.Widget {
 	stack.AddChild(bundleCol)
 
 	return stack
+}
+
+func (s *LauncherScreen) buildAddVMSection() *ui.FlexContainer {
+	row := ui.Row().
+		WithPadding(ui.Only(20, 20, 20, 30)).
+		WithMainAlignment(ui.MainAxisCenter)
+
+	// Button content with icon and text
+	content := ui.Row().
+		WithGap(10).
+		WithCrossAlignment(ui.CrossAxisCenter)
+
+	if s.iconPlus != nil {
+		iconWidget := ui.NewSVGImage(s.iconPlus).WithSize(20, 20)
+		content.AddChild(iconWidget, ui.DefaultFlexParams())
+	}
+	content.AddChild(ui.NewLabel("Add VM").WithSize(16), ui.DefaultFlexParams())
+
+	// Use Card for clickable content with icon - prominent green style
+	card := ui.NewCard(content).
+		WithStyle(ui.CardStyle{
+			BackgroundColor: colorGreen,
+			Padding:         ui.Symmetric(24, 14),
+			CornerRadius:    cornerRadiusMedium,
+		}).
+		WithHoverStyle(ui.CardStyle{
+			BackgroundColor: color.RGBA{R: 0xb9, G: 0xe0, B: 0x8c, A: 255}, // Lighter green on hover
+			Padding:         ui.Symmetric(24, 14),
+			CornerRadius:    cornerRadiusMedium,
+		}).
+		WithGraphicsWindow(s.app.window).
+		OnClick(func() {
+			s.app.customVMScreen = NewCustomVMScreen(s.app)
+			s.app.mode = modeCustomVM
+		})
+
+	row.AddChild(card, ui.DefaultFlexParams())
+	return row
 }
 
 func (s *LauncherScreen) buildCardContainer() *ui.FlexContainer {
