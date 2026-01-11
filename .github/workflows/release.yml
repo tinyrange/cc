@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Import certificate
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          echo $MACOS_CERTIFICATE | base64 --decode > certificate.p12
+          security create-keychain -p actions build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p actions build.keychain
+          security import certificate.p12 -k build.keychain -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions build.keychain
+
+      - name: Build, sign, and notarize
+        env:
+          CC_DEVELOPER_ID: ${{ secrets.DEVELOPER_ID }}
+          CC_APPLE_ID: ${{ secrets.APPLE_ID }}
+          CC_APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          CC_TEAM_ID: ${{ secrets.TEAM_ID }}
+          CC_KEYCHAIN_PATH: build.keychain
+        run: ./tools/build.go -release
+
+      - name: Create zip for release
+        run: |
+          cd build
+          zip -r CrumbleCracker_darwin_arm64.zip CrumbleCracker.app
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: build/CrumbleCracker_darwin_arm64.zip
+
+  build-other:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build for Windows and Linux
+        run: ./tools/build.go -release
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: other-platforms
+          path: |
+            build/CrumbleCracker_windows_amd64.exe
+            build/CrumbleCracker_windows_arm64.exe
+            build/CrumbleCracker_linux_amd64
+            build/CrumbleCracker_linux_arm64
+
+  release:
+    needs: [build-macos, build-other]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          prerelease: true
+          files: |
+            artifacts/macos-arm64/CrumbleCracker_darwin_arm64.zip
+            artifacts/other-platforms/CrumbleCracker_windows_amd64.exe
+            artifacts/other-platforms/CrumbleCracker_windows_arm64.exe
+            artifacts/other-platforms/CrumbleCracker_linux_amd64
+            artifacts/other-platforms/CrumbleCracker_linux_arm64
