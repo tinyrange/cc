@@ -66,6 +66,7 @@ type remoteTarget struct {
 
 type buildOptions struct {
 	Package          string
+	ApplicationName  string
 	OutputName       string
 	CgoEnabled       bool
 	Build            crossBuild
@@ -77,6 +78,8 @@ type buildOptions struct {
 	BuildApp bool
 	// LogoPath is the path to a PNG image to use as the application icon (macOS only)
 	LogoPath string
+	// IconPath is the path to a .ico file to use as the application icon (Windows only)
+	IconPath string
 }
 
 type buildOutput struct {
@@ -282,6 +285,78 @@ func writeMacOSAppBundle(bundlePath, executablePath, appName, logoPath string) e
 	return nil
 }
 
+// generateWindowsResources creates a .syso file with embedded Windows resources (icon).
+// It returns the path to the generated .syso file for cleanup after the build.
+// If the icon file doesn't exist, it silently returns without generating resources.
+func generateWindowsResources(pkgPath, iconPath, arch string) (string, error) {
+	if iconPath == "" {
+		return "", nil
+	}
+
+	// Check if the icon file exists
+	if _, err := os.Stat(iconPath); os.IsNotExist(err) {
+		return "", nil
+	}
+
+	// Resolve absolute path for the icon
+	absIconPath, err := filepath.Abs(iconPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve icon path: %w", err)
+	}
+
+	// Resolve absolute path for the package directory
+	absPkgPath, err := filepath.Abs(pkgPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve package path: %w", err)
+	}
+
+	// Calculate relative path from package directory to icon
+	// (go-winres resolves paths relative to the config file location)
+	relIconPath, err := filepath.Rel(absPkgPath, absIconPath)
+	if err != nil {
+		return "", fmt.Errorf("calculate relative icon path: %w", err)
+	}
+
+	// Create a temporary winres.json config
+	// The format requires a language code (0000 = language neutral)
+	winresConfig := map[string]any{
+		"RT_GROUP_ICON": map[string]any{
+			"APP": map[string]any{
+				"0000": relIconPath,
+			},
+		},
+	}
+
+	configBytes, err := json.MarshalIndent(winresConfig, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshal winres config: %w", err)
+	}
+
+	// Write config to the package directory
+	configPath := filepath.Join(absPkgPath, "winres.json")
+	if err := os.WriteFile(configPath, configBytes, 0644); err != nil {
+		return "", fmt.Errorf("write winres config: %w", err)
+	}
+	defer os.Remove(configPath)
+
+	// Run go-winres to generate the .syso file
+	cmd := exec.Command("go", "run", "github.com/tc-hib/go-winres@latest", "make",
+		"--in", configPath,
+		"--out", filepath.Join(absPkgPath, "rsrc"),
+		"--arch", arch,
+	)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("run go-winres: %w", err)
+	}
+
+	// go-winres generates files named rsrc_windows_<arch>.syso
+	sysoPath := filepath.Join(absPkgPath, fmt.Sprintf("rsrc_windows_%s.syso", arch))
+	return sysoPath, nil
+}
+
 func goBuild(opts buildOptions) (buildOutput, error) {
 	output := filepath.Join("build", opts.Build.OutputName(opts.OutputName))
 	macosBundlePath := ""
@@ -324,6 +399,19 @@ func goBuild(opts buildOptions) (buildOutput, error) {
 		args = append(args, "-ldflags=-H windowsgui")
 	}
 
+	// Generate Windows resources (.syso file with icon) if building for Windows with an icon
+	var sysoPath string
+	if opts.Build.GOOS == "windows" && opts.BuildApp && opts.IconPath != "" {
+		var err error
+		sysoPath, err = generateWindowsResources(opts.Package, opts.IconPath, opts.Build.GOARCH)
+		if err != nil {
+			return buildOutput{}, fmt.Errorf("failed to generate Windows resources: %w", err)
+		}
+		if sysoPath != "" {
+			defer os.Remove(sysoPath)
+		}
+	}
+
 	args = append(args, pkg)
 
 	cmd := exec.Command(args[0], args[1:]...)
@@ -361,7 +449,7 @@ func goBuild(opts buildOptions) (buildOutput, error) {
 
 	if opts.BuildApp && opts.Build.GOOS == "darwin" {
 		// Turn the output binary into a macOS .app bundle.
-		if err := writeMacOSAppBundle(macosBundlePath, output, opts.OutputName, opts.LogoPath); err != nil {
+		if err := writeMacOSAppBundle(macosBundlePath, output, opts.ApplicationName, opts.LogoPath); err != nil {
 			return buildOutput{}, fmt.Errorf("failed to create macOS app bundle: %w", err)
 		}
 		return buildOutput{Path: macosBundlePath}, nil
@@ -619,12 +707,234 @@ func sanitizeForFilename(value string) string {
 	return b.String()
 }
 
+// releaseConfig holds the configuration for macOS code signing and notarization.
+type releaseConfig struct {
+	DeveloperID      string `json:"developer_id"`
+	AppleID          string `json:"apple_id"`
+	AppleIDPassword  string `json:"apple_id_password"`
+	TeamID           string `json:"team_id"`
+	KeychainPath     string `json:"keychain_path"`
+	EntitlementsPath string `json:"-"`
+}
+
+// loadReleaseConfig loads the signing configuration from local/release.json,
+// falling back to environment variables for any missing values.
+func loadReleaseConfig() (*releaseConfig, error) {
+	cfg := &releaseConfig{
+		EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
+	}
+
+	// Try to load from local/release.json first
+	configPath := filepath.Join("local", "release.json")
+	if data, err := os.ReadFile(configPath); err == nil {
+		if err := json.Unmarshal(data, cfg); err != nil {
+			return nil, fmt.Errorf("failed to parse %s: %w", configPath, err)
+		}
+	}
+
+	// Override with environment variables if set
+	if env := os.Getenv("CC_DEVELOPER_ID"); env != "" {
+		cfg.DeveloperID = env
+	}
+	if env := os.Getenv("CC_APPLE_ID"); env != "" {
+		cfg.AppleID = env
+	}
+	if env := os.Getenv("CC_APPLE_ID_PASSWORD"); env != "" {
+		cfg.AppleIDPassword = env
+	}
+	if env := os.Getenv("CC_TEAM_ID"); env != "" {
+		cfg.TeamID = env
+	}
+	if env := os.Getenv("CC_KEYCHAIN_PATH"); env != "" {
+		cfg.KeychainPath = env
+	}
+
+	// Validate required fields
+	if cfg.DeveloperID == "" {
+		return nil, fmt.Errorf("developer_id is required (set in local/release.json or CC_DEVELOPER_ID env var)")
+	}
+	if cfg.AppleID == "" {
+		return nil, fmt.Errorf("apple_id is required (set in local/release.json or CC_APPLE_ID env var)")
+	}
+	if cfg.AppleIDPassword == "" {
+		return nil, fmt.Errorf("apple_id_password is required (set in local/release.json or CC_APPLE_ID_PASSWORD env var)")
+	}
+	if cfg.TeamID == "" {
+		return nil, fmt.Errorf("team_id is required (set in local/release.json or CC_TEAM_ID env var)")
+	}
+
+	return cfg, nil
+}
+
+// signAppBundle signs a macOS .app bundle with Developer ID certificate.
+func signAppBundle(appPath string, cfg *releaseConfig) error {
+	// First, sign the main executable inside the bundle
+	macosDir := filepath.Join(appPath, "Contents", "MacOS")
+	entries, err := os.ReadDir(macosDir)
+	if err != nil {
+		return fmt.Errorf("failed to read MacOS directory: %w", err)
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		execPath := filepath.Join(macosDir, entry.Name())
+		if err := signBinaryForRelease(execPath, cfg); err != nil {
+			return fmt.Errorf("failed to sign executable %s: %w", entry.Name(), err)
+		}
+	}
+
+	// Then sign the entire bundle
+	args := []string{
+		"-s", cfg.DeveloperID,
+		"-f",
+		"-v",
+		"--timestamp",
+		"--options", "runtime",
+		"--entitlements", cfg.EntitlementsPath,
+	}
+
+	if cfg.KeychainPath != "" {
+		args = append(args, "--keychain", cfg.KeychainPath)
+	}
+
+	args = append(args, appPath)
+
+	cmd := exec.Command("codesign", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("codesign failed: %w", err)
+	}
+
+	return nil
+}
+
+// signBinaryForRelease signs a standalone binary with Developer ID certificate.
+func signBinaryForRelease(binPath string, cfg *releaseConfig) error {
+	args := []string{
+		"-s", cfg.DeveloperID,
+		"-f",
+		"-v",
+		"--timestamp",
+		"--options", "runtime",
+		"--entitlements", cfg.EntitlementsPath,
+	}
+
+	if cfg.KeychainPath != "" {
+		args = append(args, "--keychain", cfg.KeychainPath)
+	}
+
+	args = append(args, binPath)
+
+	cmd := exec.Command("codesign", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("codesign failed: %w", err)
+	}
+
+	return nil
+}
+
+// notarize submits the app to Apple's notary service and waits for completion.
+func notarize(appPath string, cfg *releaseConfig) error {
+	// Create a temporary zip file for notarization
+	zipPath := appPath + ".zip"
+	defer os.Remove(zipPath)
+
+	// Use ditto to create the zip (preserves extended attributes and symlinks)
+	dittoCmd := exec.Command("ditto", "-c", "-k", "--keepParent", appPath, zipPath)
+	dittoCmd.Stdout = os.Stdout
+	dittoCmd.Stderr = os.Stderr
+	if err := dittoCmd.Run(); err != nil {
+		return fmt.Errorf("failed to create zip for notarization: %w", err)
+	}
+
+	// Submit to notary service
+	args := []string{"notarytool", "submit", zipPath}
+
+	// Check if using keychain profile (e.g., "@keychain:CC_NOTARY")
+	if strings.HasPrefix(cfg.AppleIDPassword, "@keychain:") {
+		profileName := strings.TrimPrefix(cfg.AppleIDPassword, "@keychain:")
+		args = append(args, "--keychain-profile", profileName)
+	} else {
+		args = append(args,
+			"--apple-id", cfg.AppleID,
+			"--password", cfg.AppleIDPassword,
+			"--team-id", cfg.TeamID,
+		)
+	}
+
+	args = append(args, "--wait", "--timeout", "30m")
+
+	cmd := exec.Command("xcrun", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("notarization failed: %w", err)
+	}
+
+	return nil
+}
+
+// staple attaches the notarization ticket to the app bundle.
+func staple(appPath string) error {
+	cmd := exec.Command("xcrun", "stapler", "staple", appPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("stapling failed: %w", err)
+	}
+
+	return nil
+}
+
+// verifyRelease checks that the app is properly signed and notarized.
+func verifyRelease(appPath string) error {
+	// Check Gatekeeper acceptance (most important for distribution)
+	spctlCmd := exec.Command("spctl", "--assess", "--type", "exec", "-v", appPath)
+	spctlCmd.Stdout = os.Stdout
+	spctlCmd.Stderr = os.Stderr
+	if err := spctlCmd.Run(); err != nil {
+		return fmt.Errorf("Gatekeeper assessment failed: %w", err)
+	}
+
+	// Check hardened runtime is enabled
+	displayCmd := exec.Command("codesign", "-d", "--verbose=4", appPath)
+	output, err := displayCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to display signature info: %w", err)
+	}
+	if !strings.Contains(string(output), "runtime") {
+		return fmt.Errorf("hardened runtime is not enabled")
+	}
+
+	// Validate stapled ticket
+	staplerCmd := exec.Command("xcrun", "stapler", "validate", appPath)
+	staplerCmd.Stdout = os.Stdout
+	staplerCmd.Stderr = os.Stderr
+	if err := staplerCmd.Run(); err != nil {
+		return fmt.Errorf("notarization ticket validation failed: %w", err)
+	}
+
+	fmt.Printf("verification successful for %s\n", appPath)
+	return nil
+}
+
 func main() {
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
 	race := fs.Bool("race", false, "build with race detector enabled")
 	quest := fs.Bool("quest", false, "build and execute the bringup quest")
 	cross := fs.Bool("cross", false, "attempt to cross compile the quest for all supported platforms")
+	buildOs := fs.String("os", "", "build for the specified OS (windows, linux, darwin)")
+	buildArch := fs.String("arch", "", "build for the specified architecture (amd64, arm64)")
 	test := fs.String("test", "", "run go tests in the specified package")
 	bench := fs.Bool("bench", false, "run all benchmarks and output results to benchmarks/<hostid>/<date>.json")
 	codesign := fs.Bool("codesign", false, "build the macos codesign tool")
@@ -642,9 +952,27 @@ func main() {
 	memprofile := fs.String("memprofile", "", "write memory profile of built binary to file")
 	benchTests := fs.Bool("bench-tests", false, "build and run the benchmark tests")
 	snapshotE2E := fs.Bool("snapshot-e2e", false, "build and run snapshot e2e benchmark")
+	release := fs.Bool("release", false, "build a release binary")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
+	}
+
+	var buildTarget crossBuild = hostBuild
+
+	if *buildOs != "" || *buildArch != "" {
+		if *buildOs == "" {
+			*buildOs = hostBuild.GOOS
+		}
+
+		if *buildArch == "" {
+			*buildArch = hostBuild.GOARCH
+		}
+
+		buildTarget = crossBuild{
+			GOOS:   *buildOs,
+			GOARCH: *buildArch,
+		}
 	}
 
 	runOpts := runOptions{
@@ -983,7 +1311,7 @@ func main() {
 
 		// Build cc first
 		ccOut, err := goBuild(buildOptions{
-			Package:          "cmd/cc",
+			Package:          "internal/cmd/cc",
 			OutputName:       "cc",
 			Build:            hostBuild,
 			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
@@ -1206,11 +1534,110 @@ func main() {
 		return
 	}
 
+	if *release {
+		if runtime.GOOS == "darwin" {
+			// macOS: Build, sign, notarize, staple, and verify
+			cfg, err := loadReleaseConfig()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "release config: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Build CrumbleCracker.app (only release artifact, cc is internal)
+			appOut, err := goBuild(buildOptions{
+				Package:          "cmd/ccapp",
+				ApplicationName:  "CrumbleCracker",
+				OutputName:       "CrumbleCracker",
+				Build:            crossBuild{GOOS: "darwin", GOARCH: "arm64"},
+				EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
+				BuildApp:         true,
+				LogoPath:         filepath.Join("internal", "assets", "logo-color-black.png"),
+			})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to build CrumbleCracker.app: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("built %s\n", appOut.Path)
+
+			// Sign with Developer ID
+			fmt.Println("signing with Developer ID...")
+			if err := signAppBundle(appOut.Path, cfg); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to sign: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Notarize
+			fmt.Println("notarizing with Apple...")
+			if err := notarize(appOut.Path, cfg); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to notarize: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Staple
+			fmt.Println("stapling notarization ticket...")
+			if err := staple(appOut.Path); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to staple: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Verify
+			fmt.Println("verifying signature and notarization...")
+			if err := verifyRelease(appOut.Path); err != nil {
+				fmt.Fprintf(os.Stderr, "verification failed: %v\n", err)
+				os.Exit(1)
+			}
+
+			fmt.Println("release build completed successfully!")
+		} else {
+			// Non-macOS: Cross-compile for Windows and Linux
+			platforms := []crossBuild{
+				{GOOS: "windows", GOARCH: "amd64"},
+				{GOOS: "windows", GOARCH: "arm64"},
+				{GOOS: "linux", GOARCH: "amd64"},
+				{GOOS: "linux", GOARCH: "arm64"},
+			}
+
+			for _, platform := range platforms {
+				out, err := goBuild(buildOptions{
+					Package:         "cmd/ccapp",
+					ApplicationName: "CrumbleCracker",
+					OutputName:      "CrumbleCracker",
+					Build:           platform,
+					BuildApp:        true,
+					IconPath:        filepath.Join("internal", "assets", "logo.ico"),
+				})
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "failed to build for %s/%s: %v\n", platform.GOOS, platform.GOARCH, err)
+					os.Exit(1)
+				}
+
+				// For release builds, always use platform suffix (rename if native)
+				if platform.IsNative() {
+					suffix := ""
+					if platform.GOOS == "windows" {
+						suffix = ".exe"
+					}
+					newPath := filepath.Join("build", fmt.Sprintf("CrumbleCracker_%s_%s%s", platform.GOOS, platform.GOARCH, suffix))
+					if err := os.Rename(out.Path, newPath); err != nil {
+						fmt.Fprintf(os.Stderr, "failed to rename %s to %s: %v\n", out.Path, newPath, err)
+						os.Exit(1)
+					}
+					out.Path = newPath
+				}
+
+				fmt.Printf("built %s\n", out.Path)
+			}
+
+			fmt.Println("cross-platform release build completed!")
+		}
+		return
+	}
+
 	// build cmd/cc by default
 	out, err := goBuild(buildOptions{
-		Package:          "cmd/cc",
+		Package:          "internal/cmd/cc",
 		OutputName:       "cc",
-		Build:            hostBuild,
+		Build:            buildTarget,
 		EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
 	})
 	if err != nil {
@@ -1222,11 +1649,13 @@ func main() {
 	// also build cmd/ccapp
 	ccappOut, err := goBuild(buildOptions{
 		Package:          "cmd/ccapp",
-		OutputName:       "ccapp",
-		Build:            hostBuild,
+		ApplicationName:  "CrumbleCracker",
+		OutputName:       "CrumbleCracker",
+		Build:            buildTarget,
 		EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
 		BuildApp:         true,
 		LogoPath:         filepath.Join("internal", "assets", "logo-color-black.png"),
+		IconPath:         filepath.Join("internal", "assets", "logo.ico"),
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to build ccapp: %v\n", err)
@@ -1235,6 +1664,11 @@ func main() {
 	fmt.Printf("built %s\n", ccappOut.Path)
 
 	if *run {
+		if !buildTarget.IsNative() {
+			fmt.Fprintf(os.Stderr, "cannot run cross-compiled binary\n")
+			os.Exit(1)
+		}
+
 		fmt.Printf("running %s %s\n", out.Path, strings.Join(fs.Args(), " "))
 		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
 			os.Exit(1)
