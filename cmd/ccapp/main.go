@@ -1145,6 +1145,8 @@ func (app *Application) finalizeBoot(prep *bootPrep) (retErr error) {
 	_ = app.window.PlatformWindow().TextInput()
 	// Terminal fills the full window - the notch overlays on top
 	termView.SetInsets(0, 0, 0, 0)
+	// Apply the app's color scheme to the terminal.
+	termView.SetColorScheme(terminalColorScheme())
 
 	opts := []initx.Option{
 		initx.WithDeviceTemplate(virtio.FSTemplate{

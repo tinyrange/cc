@@ -22,6 +22,31 @@ import (
 
 var ErrWindowClosed = errors.New("window closed by user")
 
+// ColorScheme defines the color palette for the terminal.
+type ColorScheme struct {
+	// Foreground is the default text color.
+	Foreground color.RGBA
+	// Background is the default background color.
+	Background color.RGBA
+	// Cursor is the cursor color.
+	Cursor color.RGBA
+	// Selection is the selection highlight color.
+	Selection color.RGBA
+	// Palette is the 16-color ANSI palette (0-7 normal, 8-15 bright).
+	Palette []color.RGBA
+}
+
+// DefaultColorScheme returns the default Tokyo Night color scheme.
+func DefaultColorScheme() ColorScheme {
+	return ColorScheme{
+		Foreground: color.RGBA{R: 0xa9, G: 0xb1, B: 0xd6, A: 255}, // #a9b1d6
+		Background: color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 255}, // #1a1b26
+		Cursor:     color.RGBA{R: 0xc0, G: 0xca, B: 0xf5, A: 255}, // #c0caf5
+		Selection:  color.RGBA{R: 0x41, G: 0x59, B: 0x8b, A: 255}, // #41598b
+		Palette:    tokyoNightPalette,
+	}
+}
+
 type Hooks struct {
 	// OnResize is called when the terminal grid size changes.
 	OnResize func(cols, rows int)
@@ -86,6 +111,9 @@ type View struct {
 
 	// Context menu overlay.
 	contextMenu *ui.ContextMenu
+
+	// Color scheme for theming.
+	colorScheme ColorScheme
 }
 
 // Point represents a cell position in the terminal grid.
@@ -137,30 +165,57 @@ func NewView(win graphics.Window) (*View, error) {
 
 	emu := vt.NewSafeEmulator(80, 40)
 	disableVTQueriesThatBreakGuests(emu)
-	applyTokyoNightTheme(emu)
 
 	inR, inW := io.Pipe()
 
 	v := &View{
-		win:      win,
-		tex:      tex,
-		txt:      txt,
-		emu:      emu,
-		grid:     NewGrid(80, 40),
-		bgBuffer: bgBuffer,
-		inR:      inR,
-		inW:      inW,
-		inputQ:   make(chan []byte, 1024),
-		closeCh:  make(chan struct{}),
-		lastCols: 80,
-		lastRows: 40,
+		win:         win,
+		tex:         tex,
+		txt:         txt,
+		emu:         emu,
+		grid:        NewGrid(80, 40),
+		bgBuffer:    bgBuffer,
+		inR:         inR,
+		inW:         inW,
+		inputQ:      make(chan []byte, 1024),
+		closeCh:     make(chan struct{}),
+		lastCols:    80,
+		lastRows:    40,
+		colorScheme: DefaultColorScheme(),
 	}
+
+	// Apply the default color scheme to the emulator.
+	v.applyColorScheme()
 
 	// VT -> pipe (input).
 	go v.readVTIntoQueue()
 	go v.drainQueueToPipe()
 
 	return v, nil
+}
+
+// SetColorScheme sets the terminal color scheme.
+func (v *View) SetColorScheme(scheme ColorScheme) {
+	if v == nil {
+		return
+	}
+	v.colorScheme = scheme
+	v.applyColorScheme()
+}
+
+// applyColorScheme applies the current color scheme to the VT emulator.
+func (v *View) applyColorScheme() {
+	if v == nil || v.emu == nil {
+		return
+	}
+	v.emu.Emulator.SetDefaultForegroundColor(v.colorScheme.Foreground)
+	v.emu.Emulator.SetDefaultBackgroundColor(v.colorScheme.Background)
+	v.emu.Emulator.SetDefaultCursorColor(v.colorScheme.Cursor)
+
+	// Set indexed colors (used when programs query indexed colors).
+	for i, c := range v.colorScheme.Palette {
+		v.emu.SetIndexedColor(i, c)
+	}
 }
 
 // Grid returns the internal grid for testing and introspection.
@@ -800,7 +855,7 @@ func (v *View) renderGrid(stats *timeslice.Recorder, f graphics.Frame, bgDefault
 				if v.isCellSelected(x, y) {
 					x0 := originX + padX + float32(x)*cellW
 					y0 := originY + padY + float32(y)*cellH
-					f.RenderQuad(x0, y0, cellW, cellH, v.tex, selectionColor)
+					f.RenderQuad(x0, y0, cellW, cellH, v.tex, v.colorScheme.Selection)
 				}
 			}
 		}
@@ -961,27 +1016,6 @@ func translateANSIColor(c color.Color) color.Color {
 	// Not a default ANSI color, return as-is
 	return c
 }
-
-// applyTokyoNightTheme sets the Tokyo Night color scheme on the VT emulator.
-// This provides a consistent look with the rest of the application UI.
-func applyTokyoNightTheme(emu *vt.SafeEmulator) {
-	// Default colors
-	fg := color.RGBA{R: 0xa9, G: 0xb1, B: 0xd6, A: 255}     // #a9b1d6
-	bg := color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 255}     // #1a1b26
-	cursor := color.RGBA{R: 0xc0, G: 0xca, B: 0xf5, A: 255} // #c0caf5
-
-	emu.Emulator.SetDefaultForegroundColor(fg)
-	emu.Emulator.SetDefaultBackgroundColor(bg)
-	emu.Emulator.SetDefaultCursorColor(cursor)
-
-	// Set indexed colors (used when programs query indexed colors)
-	for i, c := range tokyoNightPalette {
-		emu.SetIndexedColor(i, c)
-	}
-}
-
-// Selection color (Tokyo Night selection blue).
-var selectionColor = color.RGBA{R: 0x41, G: 0x59, B: 0x8b, A: 255}
 
 // pixelToCell converts mouse pixel coordinates to terminal cell coordinates.
 func (v *View) pixelToCell(f graphics.Frame, padX, padY float32) Point {

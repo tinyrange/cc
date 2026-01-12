@@ -4,6 +4,7 @@ import (
 	"image/color"
 
 	"github.com/tinyrange/cc/internal/gowin/ui"
+	"github.com/tinyrange/cc/internal/term"
 )
 
 // =============================================================================
@@ -516,5 +517,44 @@ func tabBarStyle() ui.TabBarStyle {
 		UnderlineThickness: 2,
 		UnderlineInset:     0,
 		Height:             36,
+	}
+}
+
+// =============================================================================
+// TERMINAL COLOR SCHEME
+// =============================================================================
+
+// tokyoNightTerminalPalette is the 16-color ANSI palette for the terminal.
+// Colors 0-7 are normal, 8-15 are bright variants.
+var tokyoNightTerminalPalette = []color.RGBA{
+	// Normal colors (0-7)
+	{R: 0x15, G: 0x16, B: 0x1e, A: 255}, // 0: black
+	{R: 0xf7, G: 0x76, B: 0x8e, A: 255}, // 1: red
+	{R: 0x9e, G: 0xce, B: 0x6a, A: 255}, // 2: green
+	{R: 0xe0, G: 0xaf, B: 0x68, A: 255}, // 3: yellow
+	{R: 0x7a, G: 0xa2, B: 0xf7, A: 255}, // 4: blue
+	{R: 0xbb, G: 0x9a, B: 0xf7, A: 255}, // 5: magenta
+	{R: 0x7d, G: 0xcf, B: 0xff, A: 255}, // 6: cyan
+	{R: 0xa9, G: 0xb1, B: 0xd6, A: 255}, // 7: white
+
+	// Bright colors (8-15)
+	{R: 0x41, G: 0x48, B: 0x68, A: 255}, // 8: bright black
+	{R: 0xf7, G: 0x76, B: 0x8e, A: 255}, // 9: bright red
+	{R: 0x9e, G: 0xce, B: 0x6a, A: 255}, // 10: bright green
+	{R: 0xe0, G: 0xaf, B: 0x68, A: 255}, // 11: bright yellow
+	{R: 0x7a, G: 0xa2, B: 0xf7, A: 255}, // 12: bright blue
+	{R: 0xbb, G: 0x9a, B: 0xf7, A: 255}, // 13: bright magenta
+	{R: 0x7d, G: 0xcf, B: 0xff, A: 255}, // 14: bright cyan
+	{R: 0xc0, G: 0xca, B: 0xf5, A: 255}, // 15: bright white
+}
+
+// terminalColorScheme returns the Tokyo Night color scheme for the terminal.
+func terminalColorScheme() term.ColorScheme {
+	return term.ColorScheme{
+		Foreground: hex("#a9b1d6"), // Default foreground
+		Background: hex("#1a1b26"), // Default background
+		Cursor:     hex("#c0caf5"), // Cursor color
+		Selection:  hex("#41598b"), // Selection highlight
+		Palette:    tokyoNightTerminalPalette,
 	}
 }
