@@ -17,9 +17,9 @@ import (
 type CustomVMMode int
 
 const (
-	CustomVMModeBundleDir CustomVMMode = iota
+	CustomVMModeImageName CustomVMMode = iota
 	CustomVMModeTarball
-	CustomVMModeImageName
+	CustomVMModeBundleDir
 )
 
 // CustomVMScreen is the dialog for selecting a custom VM
@@ -46,7 +46,7 @@ func NewCustomVMScreen(app *Application) *CustomVMScreen {
 	screen := &CustomVMScreen{
 		root: ui.NewRoot(app.text),
 		app:  app,
-		mode: CustomVMModeBundleDir,
+		mode: CustomVMModeImageName,
 	}
 	screen.buildUI()
 	return screen
@@ -73,7 +73,7 @@ func (s *CustomVMScreen) buildUI() {
 
 	// Create content first
 	content := ui.Column().WithPadding(ui.All(24)).WithGap(20)
-	content.AddChild(ui.NewLabel("New Custom VM").WithSize(24).WithColor(textColorPrimary), ui.DefaultFlexParams())
+	content.AddChild(ui.NewLabel("Create VM").WithSize(24).WithColor(textColorPrimary), ui.DefaultFlexParams())
 
 	// Use Card with rounded corners for dialog background
 	dialogCard := ui.NewCard(nil).
@@ -84,7 +84,7 @@ func (s *CustomVMScreen) buildUI() {
 		WithPadding(ui.All(0))
 
 	// Tab bar for mode selection
-	s.tabBar = ui.NewTabBar([]string{"Bundle Dir", "Tarball", "Image Name"}).
+	s.tabBar = ui.NewTabBar([]string{"Docker Image", "OCI Tarball", "Bundle Directory"}).
 		WithStyle(ui.TabBarStyle{
 			BackgroundColor:    color.RGBA{R: 0, G: 0, B: 0, A: 0}, // Transparent
 			TextColor:          textColorSecondary,
@@ -115,34 +115,25 @@ func (s *CustomVMScreen) buildUI() {
 	// Input area (changes based on mode)
 	inputCol := ui.Column().WithGap(8)
 	switch s.mode {
-	case CustomVMModeBundleDir:
-		inputCol.AddChild(ui.NewLabel("Select a bundle directory:").WithSize(14).WithColor(textColorSecondary), ui.DefaultFlexParams())
-		inputRow := ui.Row().WithGap(8)
-		s.pathInput = ui.NewTextInput().
-			WithPlaceholder("").
-			WithMinWidth(contentWidth - 90 - 8).
-			WithGraphicsWindow(s.app.window)
-		if s.selectedPath != "" {
-			s.pathInput.SetText(s.selectedPath)
-		}
-		s.pathInput.OnChange(func(text string) {
-			s.selectedPath = text
-		})
-		inputRow.AddChild(s.pathInput, ui.DefaultFlexParams())
-		browseStyle := secondaryButtonStyle()
-		browseStyle.MinWidth = 90
-		browseStyle.MinHeight = 32
-		browseStyle.TextSize = 14
-		s.browseButton = ui.NewButton("Browse...").
-			WithStyle(browseStyle).
+	case CustomVMModeImageName:
+		// Help text explaining the Docker image option
+		inputCol.AddChild(ui.NewLabel("Pull a container image from Docker Hub or another registry.").WithSize(12).WithColor(textColorSecondary), ui.DefaultFlexParams())
+		inputCol.AddChild(ui.NewLabel("Image name (e.g., alpine, ubuntu:22.04, ghcr.io/user/image):").WithSize(14).WithColor(textColorSecondary), ui.DefaultFlexParams())
+		s.imageInput = ui.NewTextInput().
+			WithPlaceholder("alpine:latest").
+			WithMinWidth(contentWidth).
 			WithGraphicsWindow(s.app.window).
-			OnClick(func() {
-				s.browseDirectory()
+			OnChange(func(text string) {
+				s.imageName = text
 			})
-		inputRow.AddChild(s.browseButton, ui.DefaultFlexParams())
-		inputCol.AddChild(inputRow, ui.DefaultFlexParams())
+		if s.imageName != "" {
+			s.imageInput.SetText(s.imageName)
+		}
+		inputCol.AddChild(s.imageInput, ui.DefaultFlexParams())
 
 	case CustomVMModeTarball:
+		// Help text explaining the OCI tarball option
+		inputCol.AddChild(ui.NewLabel("Load a VM from an OCI-format tarball exported from Docker or other tools.").WithSize(12).WithColor(textColorSecondary), ui.DefaultFlexParams())
 		inputCol.AddChild(ui.NewLabel("Select an OCI tarball (.tar):").WithSize(14).WithColor(textColorSecondary), ui.DefaultFlexParams())
 		inputRow := ui.Row().WithGap(8)
 		s.pathInput = ui.NewTextInput().
@@ -169,19 +160,34 @@ func (s *CustomVMScreen) buildUI() {
 		inputRow.AddChild(s.browseButton, ui.DefaultFlexParams())
 		inputCol.AddChild(inputRow, ui.DefaultFlexParams())
 
-	case CustomVMModeImageName:
-		inputCol.AddChild(ui.NewLabel("Enter container image name:").WithSize(14).WithColor(textColorSecondary), ui.DefaultFlexParams())
-		s.imageInput = ui.NewTextInput().
-			WithPlaceholder("e.g., alpine:latest").
-			WithMinWidth(contentWidth).
-			WithGraphicsWindow(s.app.window). // Enable rounded corners
-			OnChange(func(text string) {
-				s.imageName = text
-			})
-		if s.imageName != "" {
-			s.imageInput.SetText(s.imageName)
+	case CustomVMModeBundleDir:
+		// Help text explaining the bundle directory option
+		inputCol.AddChild(ui.NewLabel("Open an existing VM bundle directory containing ccbundle.yaml.").WithSize(12).WithColor(textColorSecondary), ui.DefaultFlexParams())
+		inputCol.AddChild(ui.NewLabel("Select a bundle directory:").WithSize(14).WithColor(textColorSecondary), ui.DefaultFlexParams())
+		inputRow := ui.Row().WithGap(8)
+		s.pathInput = ui.NewTextInput().
+			WithPlaceholder("").
+			WithMinWidth(contentWidth - 90 - 8).
+			WithGraphicsWindow(s.app.window)
+		if s.selectedPath != "" {
+			s.pathInput.SetText(s.selectedPath)
 		}
-		inputCol.AddChild(s.imageInput, ui.DefaultFlexParams())
+		s.pathInput.OnChange(func(text string) {
+			s.selectedPath = text
+		})
+		inputRow.AddChild(s.pathInput, ui.DefaultFlexParams())
+		browseStyle := secondaryButtonStyle()
+		browseStyle.MinWidth = 90
+		browseStyle.MinHeight = 32
+		browseStyle.TextSize = 14
+		s.browseButton = ui.NewButton("Browse...").
+			WithStyle(browseStyle).
+			WithGraphicsWindow(s.app.window).
+			OnClick(func() {
+				s.browseDirectory()
+			})
+		inputRow.AddChild(s.browseButton, ui.DefaultFlexParams())
+		inputCol.AddChild(inputRow, ui.DefaultFlexParams())
 	}
 	content.AddChild(inputCol, ui.DefaultFlexParams())
 
@@ -298,6 +304,12 @@ func (s *CustomVMScreen) onLaunch() {
 	case CustomVMModeImageName:
 		if s.imageName == "" {
 			return // No image name entered
+		}
+		// Validate image name format and check registry
+		if err := oci.ValidateImageName(s.imageName, true); err != nil {
+			slog.Error("invalid image name", "image", s.imageName, "error", err)
+			s.app.showError(err)
+			return
 		}
 		sourceType = VMSourceImageName
 		sourcePath = s.imageName

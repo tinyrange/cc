@@ -480,3 +480,69 @@ func ParseImageRef(imageRef string) (registry string, image string, tag string, 
 
 	return registry, image, tag, nil
 }
+
+// ValidateImageName validates an OCI image name format and optionally checks if it exists in the registry.
+// If checkRegistry is true, it will make a HEAD request to verify the image exists.
+func ValidateImageName(imageRef string, checkRegistry bool) error {
+	// Check for empty input
+	if strings.TrimSpace(imageRef) == "" {
+		return fmt.Errorf("image name cannot be empty")
+	}
+
+	// Validate format using ParseImageRef
+	registry, imageName, tag, err := ParseImageRef(imageRef)
+	if err != nil {
+		return fmt.Errorf("invalid image format: %w", err)
+	}
+
+	// Optionally check if the image exists in the registry
+	if checkRegistry {
+		httpClient := &http.Client{Timeout: 30 * time.Second}
+		ctx := &registryContext{
+			logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+			client:   httpClient,
+			registry: registry,
+		}
+
+		// Build manifest URL for HEAD request
+		manifestURL := fmt.Sprintf("%s/%s/manifests/%s", registry, imageName, tag)
+		acceptTypes := []string{
+			"application/vnd.oci.image.manifest.v1+json",
+			"application/vnd.docker.distribution.manifest.v2+json",
+			"application/vnd.docker.distribution.manifest.list.v2+json",
+			"application/vnd.oci.image.index.v1+json",
+		}
+
+		// Try up to 2 times (initial + retry after auth)
+		for attempt := 0; attempt < 2; attempt++ {
+			req, err := ctx.makeRequest(http.MethodHead, manifestURL, acceptTypes)
+			if err != nil {
+				return fmt.Errorf("failed to create request: %w", err)
+			}
+
+			resp, err := httpClient.Do(req)
+			if err != nil {
+				return fmt.Errorf("failed to check image existence: %w", err)
+			}
+
+			if resp.StatusCode == http.StatusNotFound {
+				resp.Body.Close()
+				return fmt.Errorf("image %q not found in registry", imageRef)
+			}
+
+			ok, authErr := ctx.handleResponse(resp)
+			if ok {
+				resp.Body.Close()
+				return nil // Image exists
+			}
+			if authErr != nil {
+				return fmt.Errorf("registry error: %w", authErr)
+			}
+			// handleResponse returned false, nil means we should retry with new token
+		}
+
+		return fmt.Errorf("failed to authenticate with registry after retries")
+	}
+
+	return nil
+}
