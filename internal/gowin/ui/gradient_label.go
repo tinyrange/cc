@@ -38,6 +38,11 @@ func (l *GradientLabel) WithGradient(stops []graphics.ColorStop) *GradientLabel 
 	return l
 }
 
+// SetGradient updates the gradient stops at runtime.
+func (l *GradientLabel) SetGradient(stops []graphics.ColorStop) {
+	l.stops = stops
+}
+
 // SetText updates the text content.
 func (l *GradientLabel) SetText(text string) {
 	l.text = text

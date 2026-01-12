@@ -18,6 +18,7 @@ in vec4 a_color;
 
 out vec2 v_texCoord;
 out vec4 v_color;
+out vec2 v_position;
 
 uniform mat4 u_proj;
 
@@ -25,20 +26,63 @@ void main() {
 	gl_Position = u_proj * vec4(a_position, 0.0, 1.0);
 	v_texCoord = a_texCoord;
 	v_color = a_color;
+	v_position = a_position;
 }`
 
 	textFragmentShaderSource = `#version 150
 in vec2 v_texCoord;
 in vec4 v_color;
+in vec2 v_position;
 
 out vec4 fragColor;
 
 uniform sampler2D u_texture;
+uniform int u_useGradient;
+uniform float u_gradientStart;
+uniform float u_gradientEnd;
+uniform int u_gradientStopCount;
+uniform vec4 u_gradientStops[8];  // rgb + position in w
+
+vec3 interpolateGradientStops(float t) {
+	if (u_gradientStopCount < 2) {
+		return v_color.rgb;
+	}
+
+	// Find surrounding stops
+	vec4 lower = u_gradientStops[0];
+	vec4 upper = u_gradientStops[u_gradientStopCount - 1];
+
+	for (int i = 0; i < u_gradientStopCount - 1; i++) {
+		if (t >= u_gradientStops[i].w && t <= u_gradientStops[i + 1].w) {
+			lower = u_gradientStops[i];
+			upper = u_gradientStops[i + 1];
+			break;
+		}
+	}
+
+	// Interpolate between lower and upper
+	float range = upper.w - lower.w;
+	float localT = 0.0;
+	if (range > 0.0) {
+		localT = (t - lower.w) / range;
+	}
+
+	return mix(lower.rgb, upper.rgb, localT);
+}
 
 void main() {
 	// Sample red channel as alpha (GL_R8 texture)
 	float alpha = texture(u_texture, v_texCoord).r;
-	fragColor = vec4(v_color.rgb, v_color.a * alpha);
+
+	vec3 rgb;
+	if (u_useGradient == 1 && u_gradientEnd > u_gradientStart) {
+		float t = clamp((v_position.x - u_gradientStart) / (u_gradientEnd - u_gradientStart), 0.0, 1.0);
+		rgb = interpolateGradientStops(t);
+	} else {
+		rgb = v_color.rgb;
+	}
+
+	fragColor = vec4(rgb, v_color.a * alpha);
 }`
 )
 
@@ -80,6 +124,20 @@ type Stash struct {
 	viewportH      int32
 	scale          float32
 	graphicsShader uint32
+
+	// Gradient uniforms
+	gradientUseUniform       int32
+	gradientStartUniform     int32
+	gradientEndUniform       int32
+	gradientStopCountUniform int32
+	gradientStopsUniforms    [8]int32 // one for each stop
+
+	// Current gradient state (for FlushDraw)
+	gradientEnabled   bool
+	gradientStart     float32
+	gradientEnd       float32
+	gradientStopCount int
+	gradientStops     [8][4]float32 // rgb + position
 }
 
 type Font struct {
@@ -167,6 +225,15 @@ func New(gl glpkg.OpenGL, cachew, cacheh int) *Stash {
 	}
 	stash.shaderProgram = program
 	stash.projUniform = gl.GetUniformLocation(program, "u_proj")
+
+	// Get gradient uniform locations
+	stash.gradientUseUniform = gl.GetUniformLocation(program, "u_useGradient")
+	stash.gradientStartUniform = gl.GetUniformLocation(program, "u_gradientStart")
+	stash.gradientEndUniform = gl.GetUniformLocation(program, "u_gradientEnd")
+	stash.gradientStopCountUniform = gl.GetUniformLocation(program, "u_gradientStopCount")
+	for i := 0; i < 8; i++ {
+		stash.gradientStopsUniforms[i] = gl.GetUniformLocation(program, fmt.Sprintf("u_gradientStops[%d]", i))
+	}
 
 	// Create VAO and VBO
 	var vao, vbo uint32
@@ -507,6 +574,22 @@ func (s *Stash) FlushDraw() {
 	s.gl.UniformMatrix4fv(s.projUniform, 1, false, &proj[0])
 	s.gl.BindVertexArray(s.vao)
 
+	// Set gradient uniforms
+	if s.gradientEnabled {
+		s.gl.Uniform1i(s.gradientUseUniform, 1)
+		s.gl.Uniform1f(s.gradientStartUniform, s.gradientStart)
+		s.gl.Uniform1f(s.gradientEndUniform, s.gradientEnd)
+		s.gl.Uniform1i(s.gradientStopCountUniform, int32(s.gradientStopCount))
+		// Upload each gradient stop individually
+		for i := 0; i < s.gradientStopCount; i++ {
+			s.gl.Uniform4f(s.gradientStopsUniforms[i],
+				s.gradientStops[i][0], s.gradientStops[i][1],
+				s.gradientStops[i][2], s.gradientStops[i][3])
+		}
+	} else {
+		s.gl.Uniform1i(s.gradientUseUniform, 0)
+	}
+
 	i := 0
 	texture := s.ttTextures[i]
 	tt := true
@@ -583,6 +666,9 @@ func (s *Stash) FlushDraw() {
 			}
 		}
 	}
+
+	// Reset gradient state after flush
+	s.gradientEnabled = false
 
 	// Restore graphics shader program after all text rendering is complete
 	if s.graphicsShader != 0 {
@@ -793,12 +879,27 @@ type GradientStop struct {
 	R, G, B, A float32
 }
 
-// DrawTextGradient draws text with a horizontal gradient applied.
-// The gradient colors are interpolated across the text based on character position.
+// DrawTextGradient draws text with a horizontal gradient applied per-pixel.
+// The gradient colors are interpolated smoothly across all pixels using the shader.
 func (stash *Stash) DrawTextGradient(idx int, size, x, y float64, s string, stops []GradientStop, textWidth float64) (nextX float64) {
 	if len(stops) < 2 {
 		// Need at least 2 stops for a gradient
 		return stash.DrawText(idx, size, x, y, s, [4]float32{1, 1, 1, 1})
+	}
+
+	// Flush any pending non-gradient text first
+	stash.FlushDraw()
+
+	// Set up gradient state for the shader
+	stash.gradientEnabled = true
+	stash.gradientStart = float32(x)
+	stash.gradientEnd = float32(x + textWidth)
+	stash.gradientStopCount = len(stops)
+	if stash.gradientStopCount > 8 {
+		stash.gradientStopCount = 8
+	}
+	for i := 0; i < stash.gradientStopCount; i++ {
+		stash.gradientStops[i] = [4]float32{stops[i].R, stops[i].G, stops[i].B, stops[i].Position}
 	}
 
 	isize := int16(size * 10)
@@ -824,6 +925,9 @@ func (stash *Stash) DrawTextGradient(idx int, size, x, y float64, s string, stop
 	// Get scale for kerning calculations
 	scale := fnt.font.ScaleForPixelHeight(size)
 	prevGlyph := -1
+
+	// Use white color - the shader will compute the actual gradient color per-pixel
+	color := [4]float32{1, 1, 1, 1}
 
 	var q *Quad
 
@@ -865,19 +969,9 @@ func (stash *Stash) DrawTextGradient(idx int, size, x, y float64, s string, stop
 		maxStoredVerts := (VERT_COUNT * 4) / 6
 		if texture.nverts+4 > maxStoredVerts {
 			stash.FlushDraw()
+			// Re-enable gradient mode after flush (flush resets it)
+			stash.gradientEnabled = true
 		}
-
-		// Calculate position along gradient (0.0 to 1.0)
-		t := float32(0)
-		if textWidth > 0 {
-			t = float32((x - startX) / textWidth)
-			if t > 1 {
-				t = 1
-			}
-		}
-
-		// Interpolate color from gradient stops
-		color := interpolateGradient(stops, t)
 
 		x, y, q = stash.GetQuad(fnt, glyph, isize, x, y)
 
@@ -932,41 +1026,10 @@ func (stash *Stash) DrawTextGradient(idx int, size, x, y float64, s string, stop
 		b = b[runeSize:]
 	}
 
+	// Flush immediately to render with gradient mode
+	stash.FlushDraw()
+
 	return x
-}
-
-// interpolateGradient returns the color at position t (0.0-1.0) in the gradient.
-func interpolateGradient(stops []GradientStop, t float32) [4]float32 {
-	if t <= stops[0].Position {
-		return [4]float32{stops[0].R, stops[0].G, stops[0].B, stops[0].A}
-	}
-	if t >= stops[len(stops)-1].Position {
-		s := stops[len(stops)-1]
-		return [4]float32{s.R, s.G, s.B, s.A}
-	}
-
-	// Find surrounding stops
-	var lower, upper GradientStop
-	for i := 0; i < len(stops)-1; i++ {
-		if t >= stops[i].Position && t <= stops[i+1].Position {
-			lower = stops[i]
-			upper = stops[i+1]
-			break
-		}
-	}
-
-	// Interpolate between stops
-	if upper.Position == lower.Position {
-		return [4]float32{lower.R, lower.G, lower.B, lower.A}
-	}
-
-	factor := (t - lower.Position) / (upper.Position - lower.Position)
-	return [4]float32{
-		lower.R + (upper.R-lower.R)*factor,
-		lower.G + (upper.G-lower.G)*factor,
-		lower.B + (upper.B-lower.B)*factor,
-		lower.A + (upper.A-lower.A)*factor,
-	}
 }
 
 func (s *Stash) VMetrics(idx int, size float64) (float64, float64, float64) {

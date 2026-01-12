@@ -90,6 +90,7 @@ type LauncherScreen struct {
 	bundleCards []*bundleCardWidget
 	scrollView  *ui.ScrollView
 	logo        *ui.AnimatedLogo
+	titleLabel  *ui.GradientLabel
 
 	// Icons
 	iconPlus *graphics.SVG
@@ -271,7 +272,9 @@ func (s *LauncherScreen) buildTitleSection() *ui.FlexContainer {
 	col := ui.Column().
 		WithPadding(ui.Only(20, 50, 20, 0))
 
-	col.AddChild(ui.NewLabel("CrumbleCracker").WithSize(48), ui.DefaultFlexParams())
+	// Rainbow gradient for the title (initial state - will be animated)
+	s.titleLabel = ui.NewGradientLabel("CrumbleCracker").WithSize(48)
+	col.AddChild(s.titleLabel, ui.DefaultFlexParams())
 
 	if len(s.app.bundles) == 0 {
 		col.AddChild(
@@ -453,11 +456,60 @@ func (s *LauncherScreen) buildBundleCard(index int, b discoveredBundle) *bundleC
 }
 
 func (s *LauncherScreen) Update(f graphics.Frame) {
+	t := float32(time.Since(s.app.start).Seconds())
+
 	// Update logo animation
 	if s.logo != nil {
-		t := float32(time.Since(s.app.start).Seconds())
 		s.logo.SetTime(t)
 	}
+
+	// Animate rainbow gradient on title
+	if s.titleLabel != nil {
+		// TokyoNight accent colors (desaturated rainbow)
+		rainbowColors := []color.RGBA{
+			hex("#f7768e"), // Red
+			hex("#e0af68"), // Yellow
+			hex("#9ece6a"), // Green
+			hex("#7dcfff"), // Cyan
+			hex("#7aa2f7"), // Blue
+			hex("#bb9af7"), // Magenta
+		}
+
+		// Calculate phase offset (0.0 to 1.0, cycles every 12 seconds)
+		phase := float32(t) / 12.0
+		phase = phase - float32(int(phase)) // Keep in 0-1 range
+
+		// Create stops with colors rotated by phase
+		// We need n+1 stops to create a seamless gradient (first color repeated at end)
+		n := len(rainbowColors)
+		stops := make([]graphics.ColorStop, n+1)
+
+		for i := 0; i <= n; i++ {
+			// Position is fixed and evenly spaced
+			pos := float32(i) / float32(n)
+
+			// Color index is offset by phase and wraps around
+			colorPhase := phase * float32(n)
+			colorIdx := (i + int(colorPhase)) % n
+
+			// Interpolate between two colors based on fractional phase
+			frac := colorPhase - float32(int(colorPhase))
+			nextColorIdx := (colorIdx + 1) % n
+
+			c1 := rainbowColors[colorIdx]
+			c2 := rainbowColors[nextColorIdx]
+
+			// Lerp between colors
+			r := uint8(float32(c1.R)*(1-frac) + float32(c2.R)*frac)
+			g := uint8(float32(c1.G)*(1-frac) + float32(c2.G)*frac)
+			b := uint8(float32(c1.B)*(1-frac) + float32(c2.B)*frac)
+
+			stops[i] = graphics.ColorStop{Position: pos, Color: color.RGBA{r, g, b, 255}}
+		}
+
+		s.titleLabel.SetGradient(stops)
+	}
+
 	s.root.InvalidateLayout()
 }
 
