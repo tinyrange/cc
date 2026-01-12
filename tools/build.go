@@ -1737,6 +1737,7 @@ func main() {
 		LogoPath:         filepath.Join("internal", "assets", "logo-color-black.png"),
 		IconPath:         filepath.Join("internal", "assets", "logo.ico"),
 		Version:          version,
+		Tags:             []string{"embed_installer"},
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to build ccapp: %v\n", err)

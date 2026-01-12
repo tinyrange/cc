@@ -1,4 +1,4 @@
-//go:build linux && amd64
+//go:build linux && amd64 && embed_installer
 
 package update
 

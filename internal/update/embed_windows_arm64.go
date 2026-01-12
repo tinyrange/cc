@@ -1,4 +1,4 @@
-//go:build windows && arm64
+//go:build windows && arm64 && embed_installer
 
 package update
 
