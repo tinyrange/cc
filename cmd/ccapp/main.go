@@ -29,8 +29,12 @@ import (
 	"github.com/tinyrange/cc/internal/netstack"
 	"github.com/tinyrange/cc/internal/oci"
 	termwin "github.com/tinyrange/cc/internal/term"
+	"github.com/tinyrange/cc/internal/update"
 	"github.com/tinyrange/cc/internal/vfs"
 )
+
+// Version is the application version, injected at build time via -ldflags.
+var Version = "dev"
 
 // appMode tracks what the app is currently displaying.
 type appMode int
@@ -44,6 +48,7 @@ const (
 	modeInstalling
 	modeSettings
 	modeDeleteConfirm
+	modeUpdating
 )
 
 // discoveredBundle holds metadata and path for a discovered bundle.
@@ -163,6 +168,10 @@ type Application struct {
 
 	// Recent VMs storage
 	recentVMs *RecentVMsStore
+
+	// Update checker
+	updateChecker *update.Checker
+	updateStatus  *update.UpdateStatus
 
 	// Notch UI state (for VM header)
 	networkDisabled bool // is internet access cut
@@ -300,6 +309,87 @@ func (app *Application) openBundlesDir() {
 	}
 }
 
+// forceUpdate triggers a forced update check and install (for testing)
+func (app *Application) forceUpdate() {
+	slog.Info("force update requested")
+
+	// Force fetch latest release info
+	status := app.updateChecker.ForceUpdate()
+	if status.Error != nil {
+		slog.Error("force update check failed", "error", status.Error)
+		app.showError(fmt.Errorf("update check failed: %w", status.Error))
+		return
+	}
+
+	// Check if we have a download URL
+	if status.DownloadURL == "" {
+		slog.Error("no download URL found for this platform")
+		app.showError(fmt.Errorf("no update available for %s/%s", runtime.GOOS, runtime.GOARCH))
+		return
+	}
+
+	app.updateStatus = &status
+	slog.Info("force update: got release", "version", status.LatestVersion, "url", status.DownloadURL)
+
+	// Start the update process
+	app.startUpdate()
+}
+
+// startUpdate initiates the update process
+func (app *Application) startUpdate() {
+	if app.updateStatus == nil {
+		slog.Warn("startUpdate called but no update status")
+		return
+	}
+
+	slog.Info("starting update", "version", app.updateStatus.LatestVersion)
+
+	// Show updating screen
+	app.bootName = app.updateStatus.LatestVersion
+	app.bootStarted = time.Now()
+	app.loadingScreen = nil // Force rebuild
+	app.mode = modeUpdating
+
+	// Download and install in background
+	go func() {
+		downloader := update.NewDownloader()
+		downloader.SetProgressCallback(func(p update.DownloadProgress) {
+			slog.Debug("update download progress", "current", p.Current, "total", p.Total, "status", p.Status)
+			// Update progress for loading screen
+			app.bootProgressMu.Lock()
+			app.bootProgress = oci.DownloadProgress{
+				Current: p.Current,
+				Total:   p.Total,
+			}
+			app.bootProgressMu.Unlock()
+		})
+
+		stagingDir, err := downloader.DownloadToStaging(app.updateStatus.DownloadURL, runtime.GOOS)
+		if err != nil {
+			slog.Error("failed to download update", "error", err)
+			app.showError(fmt.Errorf("failed to download update: %w", err))
+			return
+		}
+
+		targetPath, err := update.GetTargetPath()
+		if err != nil {
+			slog.Error("failed to get target path", "error", err)
+			os.RemoveAll(stagingDir)
+			app.showError(fmt.Errorf("failed to get target path: %w", err))
+			return
+		}
+
+		slog.Info("launching installer", "staging", stagingDir, "target", targetPath)
+		if err := update.LaunchInstaller(stagingDir, targetPath); err != nil {
+			slog.Error("failed to launch installer", "error", err)
+			os.RemoveAll(stagingDir)
+			app.showError(fmt.Errorf("failed to launch installer: %w", err))
+			return
+		}
+		// Note: LaunchInstaller calls os.Exit(0) on success, so we won't reach here
+	}()
+}
+
 // updateDockMenu updates the dock menu with recent VMs
 func (app *Application) updateDockMenu() {
 	if app.window == nil {
@@ -432,6 +522,27 @@ func (app *Application) Run() error {
 		slog.Info("loaded recent VMs store", "count", len(recentStore.GetRecent()))
 	}
 
+	// Initialize update checker
+	cacheDir, _ := os.UserCacheDir()
+	app.updateChecker = update.NewChecker(Version, filepath.Join(cacheDir, "ccapp"))
+	app.updateChecker.SetLogger(slog.Default())
+	slog.Info("initialized update checker", "version", Version)
+
+	// Check for updates in background
+	go func() {
+		status := app.updateChecker.Check()
+		if status.Error != nil {
+			slog.Warn("update check failed", "error", status.Error)
+			return
+		}
+		app.updateStatus = &status
+		if status.Available {
+			slog.Info("update available", "current", status.CurrentVersion, "latest", status.LatestVersion)
+		} else {
+			slog.Debug("no update available", "current", status.CurrentVersion)
+		}
+	}()
+
 	// Set up dock menu (macOS only)
 	app.updateDockMenu()
 
@@ -478,6 +589,8 @@ func (app *Application) Run() error {
 			return app.renderSettings(f)
 		case modeDeleteConfirm:
 			return app.renderDeleteConfirm(f)
+		case modeUpdating:
+			return app.renderLoading(f)
 		default:
 			return nil
 		}

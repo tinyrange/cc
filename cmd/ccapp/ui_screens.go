@@ -236,7 +236,29 @@ func (s *LauncherScreen) buildTopBar() *ui.FlexContainer {
 		WithPadding(ui.Symmetric(16, 6)).
 		WithCrossAlignment(ui.CrossAxisCenter)
 
+	// Version label on the left
+	row.AddChild(
+		ui.NewLabel(fmt.Sprintf("v%s", Version)).WithSize(11).WithColor(colorTextMuted),
+		ui.DefaultFlexParams(),
+	)
+
 	row.AddChild(ui.NewSpacer(), ui.FlexParams(1))
+
+	// Update available notification
+	if s.app.updateStatus != nil && s.app.updateStatus.Available {
+		row.AddChild(
+			s.buildUpdateButton(),
+			ui.FlexParamsWithMargin(0, ui.Only(0, 0, 10, 0)),
+		)
+	}
+
+	// Force Update button (for testing)
+	row.AddChild(
+		s.buildIconButton("Force Update", nil, func() {
+			s.app.forceUpdate()
+		}),
+		ui.FlexParamsWithMargin(0, ui.Only(0, 0, 10, 0)),
+	)
 
 	// Debug Logs button with icon
 	row.AddChild(
@@ -247,6 +269,37 @@ func (s *LauncherScreen) buildTopBar() *ui.FlexContainer {
 	)
 
 	return row
+}
+
+// buildUpdateButton creates a button to show when an update is available
+func (s *LauncherScreen) buildUpdateButton() ui.Widget {
+	status := s.app.updateStatus
+	label := fmt.Sprintf("Update: %s", status.LatestVersion)
+
+	content := ui.Row().
+		WithGap(5).
+		WithCrossAlignment(ui.CrossAxisCenter)
+
+	content.AddChild(ui.NewLabel(label).WithSize(13).WithColor(colorGreen), ui.DefaultFlexParams())
+
+	// Create card button with green accent
+	card := ui.NewCard(content).
+		WithStyle(ui.CardStyle{
+			BackgroundColor: color.RGBA{R: 0x1e, G: 0x36, B: 0x2a, A: 255}, // Dark green
+			CornerRadius:    6,
+			Padding:         ui.Symmetric(10, 6),
+		}).
+		WithHoverStyle(ui.CardStyle{
+			BackgroundColor: color.RGBA{R: 0x26, G: 0x46, B: 0x34, A: 255}, // Lighter green
+			CornerRadius:    6,
+			Padding:         ui.Symmetric(10, 6),
+		}).
+		WithGraphicsWindow(s.app.window).
+		OnClick(func() {
+			s.app.startUpdate()
+		})
+
+	return card
 }
 
 // buildIconButton creates a compact button with an icon and label
@@ -557,44 +610,73 @@ func (s *LoadingScreen) buildUI() {
 	// Background
 	stack.AddChild(ui.NewBox(colorBackground))
 
-	// Centered logo with larger size
+	// Determine title, subtitle, and accent color based on mode
+	var title, subtitle string
+	var accentColor = colorAccent
+
+	switch s.app.mode {
+	case modeUpdating:
+		title = "Downloading Update"
+		subtitle = s.app.bootName // Version string
+		accentColor = colorGreen
+	case modeInstalling:
+		title = "Installing"
+		subtitle = s.app.installName
+		accentColor = colorAccent
+	default: // modeLoading
+		title = "Starting VM"
+		subtitle = s.app.bootName
+		accentColor = colorAccent
+	}
+
+	// Centered content column
+	centerContent := ui.Column().
+		WithCrossAlignment(ui.CrossAxisCenter).
+		WithGap(0)
+
+	// Smaller logo above the content
 	if s.app.logo != nil {
 		s.logo = ui.NewAnimatedLogo(s.app.logo).
-			WithSize(320, 320).
+			WithSize(180, 180).
 			WithSpeeds(0.9, -1.4, 2.2)
-		stack.AddChild(ui.CenterCenter(s.logo))
+		centerContent.AddChild(s.logo, ui.DefaultFlexParams())
 	}
 
-	// Loading status in a rounded card at top-left
-	var msg string
-	if s.app.mode == modeInstalling {
-		msg = "Installing…"
-		if s.app.installName != "" {
-			msg = "Installing " + s.app.installName + "…"
-		}
-	} else {
-		msg = "Booting VM…"
-		if s.app.bootName != "" {
-			msg = "Booting " + s.app.bootName + "…"
-		}
+	// Spacer
+	centerContent.AddChild(ui.NewBox(color.Transparent).WithSize(0, 24), ui.DefaultFlexParams())
+
+	// Title (large)
+	centerContent.AddChild(
+		ui.NewLabel(title).WithSize(28).WithColor(colorTextPrimary),
+		ui.DefaultFlexParams(),
+	)
+
+	// Subtitle (version/name)
+	if subtitle != "" {
+		centerContent.AddChild(
+			ui.NewLabel(subtitle).WithSize(16).WithColor(colorTextSecondary),
+			ui.FlexParamsWithMargin(0, ui.Only(0, 8, 0, 0)),
+		)
 	}
 
-	// Create a column for the status card content
-	cardContent := ui.Column().WithGap(8)
-	cardContent.AddChild(ui.NewLabel(msg).WithSize(16).WithColor(colorTextPrimary), ui.DefaultFlexParams())
+	// Spacer
+	centerContent.AddChild(ui.NewBox(color.Transparent).WithSize(0, 32), ui.DefaultFlexParams())
+
+	// Progress card
+	cardContent := ui.Column().WithGap(12)
 
 	// Blob count progress (overall progress)
-	s.blobProgressLabel = ui.NewLabel("").WithSize(12).WithColor(colorTextSecondary)
+	s.blobProgressLabel = ui.NewLabel("Preparing...").WithSize(13).WithColor(colorTextSecondary)
 	cardContent.AddChild(s.blobProgressLabel, ui.DefaultFlexParams())
 
 	s.blobProgressBar = ui.NewProgressBar().
-		WithMinWidth(280).
+		WithMinWidth(380).
 		WithStyle(ui.ProgressBarStyle{
 			BackgroundColor: color.RGBA{R: 0x24, G: 0x28, B: 0x3b, A: 255},
-			FillColor:       colorGreen,
+			FillColor:       accentColor,
 			TextColor:       colorTextPrimary,
-			Height:          6,
-			CornerRadius:    3,
+			Height:          8,
+			CornerRadius:    4,
 			ShowPercentage:  false,
 			TextSize:        12,
 		}).
@@ -602,11 +684,11 @@ func (s *LoadingScreen) buildUI() {
 	cardContent.AddChild(s.blobProgressBar, ui.DefaultFlexParams())
 
 	// Current blob progress (bytes downloaded)
-	s.progressLabel = ui.NewLabel("").WithSize(12).WithColor(colorTextSecondary)
+	s.progressLabel = ui.NewLabel("").WithSize(12).WithColor(colorTextMuted)
 	cardContent.AddChild(s.progressLabel, ui.DefaultFlexParams())
 
 	s.progressBar = ui.NewProgressBar().
-		WithMinWidth(280).
+		WithMinWidth(380).
 		WithStyle(ui.ProgressBarStyle{
 			BackgroundColor: color.RGBA{R: 0x24, G: 0x28, B: 0x3b, A: 255},
 			FillColor:       colorAccent,
@@ -620,14 +702,16 @@ func (s *LoadingScreen) buildUI() {
 	cardContent.AddChild(s.progressBar, ui.DefaultFlexParams())
 
 	loadingCard := ui.NewCard(
-		ui.NewPadding(cardContent, ui.Symmetric(16, 12)),
+		ui.NewPadding(cardContent, ui.Symmetric(24, 20)),
 	).
 		WithStyle(ui.CardStyle{
-			BackgroundColor: colorTopBar,
-			CornerRadius:    cornerRadiusSmall,
+			BackgroundColor: colorCardBg,
+			CornerRadius:    cornerRadiusMedium,
 		}).
 		WithGraphicsWindow(s.app.window)
-	stack.AddChild(ui.TopLeft(ui.NewPadding(loadingCard, ui.All(24))))
+	centerContent.AddChild(loadingCard, ui.DefaultFlexParams())
+
+	stack.AddChild(ui.CenterCenter(centerContent))
 
 	s.root.SetChild(stack)
 }
@@ -643,6 +727,7 @@ func (s *LoadingScreen) Update(f graphics.Frame) {
 		progress = s.app.installProgress
 		s.app.installProgressMu.Unlock()
 	} else {
+		// modeLoading and modeUpdating both use bootProgress
 		startTime = s.app.bootStarted
 		s.app.bootProgressMu.Lock()
 		progress = s.app.bootProgress
