@@ -31,6 +31,10 @@ type DownloadProgress struct {
 	// Blob count tracking
 	BlobIndex int // Index of current blob (0-based)
 	BlobCount int // Total number of blobs to download
+
+	// Speed and ETA tracking
+	BytesPerSecond float64       // Current download speed in bytes per second
+	ETA            time.Duration // Estimated time remaining (-1 if unknown)
 }
 
 // ProgressCallback is called periodically during downloads.
@@ -66,7 +70,7 @@ func NewClient(cacheDir string) (*Client, error) {
 		cacheDir: cacheDir,
 		logger:   slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})),
 		client: &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout: 0, // No timeout for large image downloads
 		},
 	}, nil
 }
@@ -337,18 +341,64 @@ type progressWriter struct {
 	callback  ProgressCallback
 	blobIndex int
 	blobCount int
+
+	// Timing for speed/ETA calculation
+	startTime  time.Time
+	lastUpdate time.Time
+	lastBytes  int64
+	speed      float64 // smoothed bytes per second
 }
 
 func (pw *progressWriter) Write(p []byte) (int, error) {
 	n, err := pw.w.Write(p)
 	pw.current += int64(n)
+
 	if pw.callback != nil {
+		now := time.Now()
+
+		// Initialize timing on first write
+		if pw.startTime.IsZero() {
+			pw.startTime = now
+			pw.lastUpdate = now
+			pw.lastBytes = 0
+		}
+
+		// Calculate speed using exponential moving average
+		elapsed := now.Sub(pw.lastUpdate).Seconds()
+		if elapsed >= 0.1 { // Update speed every 100ms minimum
+			bytesThisInterval := pw.current - pw.lastBytes
+			instantSpeed := float64(bytesThisInterval) / elapsed
+
+			// Smooth the speed with exponential moving average (alpha = 0.3)
+			if pw.speed == 0 {
+				pw.speed = instantSpeed
+			} else {
+				pw.speed = 0.3*instantSpeed + 0.7*pw.speed
+			}
+
+			pw.lastUpdate = now
+			pw.lastBytes = pw.current
+		}
+
+		// Calculate ETA
+		var eta time.Duration = -1
+		if pw.speed > 0 && pw.total > 0 {
+			remaining := pw.total - pw.current
+			if remaining > 0 {
+				eta = time.Duration(float64(remaining)/pw.speed) * time.Second
+			} else {
+				eta = 0
+			}
+		}
+
 		pw.callback(DownloadProgress{
-			Current:   pw.current,
-			Total:     pw.total,
-			Filename:  pw.filename,
-			BlobIndex: pw.blobIndex,
-			BlobCount: pw.blobCount,
+			Current:        pw.current,
+			Total:          pw.total,
+			Filename:       pw.filename,
+			BlobIndex:      pw.blobIndex,
+			BlobCount:      pw.blobCount,
+			BytesPerSecond: pw.speed,
+			ETA:            eta,
 		})
 	}
 	return n, err

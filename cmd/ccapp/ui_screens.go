@@ -34,6 +34,51 @@ func formatBytes(bytes int64) string {
 	}
 }
 
+// formatSpeed formats bytes per second as a human-readable string.
+func formatSpeed(bytesPerSecond float64) string {
+	const (
+		KB = 1024.0
+		MB = KB * 1024
+		GB = MB * 1024
+	)
+	switch {
+	case bytesPerSecond >= GB:
+		return fmt.Sprintf("%.1f GB/s", bytesPerSecond/GB)
+	case bytesPerSecond >= MB:
+		return fmt.Sprintf("%.1f MB/s", bytesPerSecond/MB)
+	case bytesPerSecond >= KB:
+		return fmt.Sprintf("%.1f KB/s", bytesPerSecond/KB)
+	default:
+		return fmt.Sprintf("%.0f B/s", bytesPerSecond)
+	}
+}
+
+// formatETA formats a duration as a human-readable ETA string.
+func formatETA(d time.Duration) string {
+	if d < 0 {
+		return ""
+	}
+	if d == 0 {
+		return "Done"
+	}
+	// Round to nearest second
+	d = d.Round(time.Second)
+	if d < time.Minute {
+		return fmt.Sprintf("%ds remaining", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		mins := int(d.Minutes())
+		secs := int(d.Seconds()) % 60
+		if secs > 0 {
+			return fmt.Sprintf("%dm %ds remaining", mins, secs)
+		}
+		return fmt.Sprintf("%dm remaining", mins)
+	}
+	hours := int(d.Hours())
+	mins := int(d.Minutes()) % 60
+	return fmt.Sprintf("%dh %dm remaining", hours, mins)
+}
+
 // Tokyo Night color theme
 // Based on https://github.com/enkia/tokyo-night-vscode-theme
 var (
@@ -620,7 +665,7 @@ func (s *LoadingScreen) buildUI() {
 		subtitle = s.app.bootName // Version string
 		accentColor = colorGreen
 	case modeInstalling:
-		title = "Installing"
+		title = "Downloading"
 		subtitle = s.app.installName
 		accentColor = colorAccent
 	default: // modeLoading
@@ -752,13 +797,26 @@ func (s *LoadingScreen) Update(f graphics.Frame) {
 		percent := float64(progress.Current) / float64(progress.Total)
 		s.progressBar.SetValue(percent)
 
-		// Format the label to show download status
+		// Format the label to show download status with speed and ETA
 		label := formatBytes(progress.Current) + " / " + formatBytes(progress.Total)
+		if progress.BytesPerSecond > 0 {
+			label += " - " + formatSpeed(progress.BytesPerSecond)
+		}
+		if progress.ETA >= 0 {
+			etaStr := formatETA(progress.ETA)
+			if etaStr != "" {
+				label += " - " + etaStr
+			}
+		}
 		s.progressLabel.SetText(label)
 	} else if progress.Current > 0 {
-		// Unknown total, show bytes downloaded
+		// Unknown total, show bytes downloaded with speed
 		s.progressBar.SetValue(0) // Indeterminate
-		s.progressLabel.SetText("Downloading: " + formatBytes(progress.Current))
+		label := "Downloading: " + formatBytes(progress.Current)
+		if progress.BytesPerSecond > 0 {
+			label += " - " + formatSpeed(progress.BytesPerSecond)
+		}
+		s.progressLabel.SetText(label)
 	}
 
 	s.root.InvalidateLayout()

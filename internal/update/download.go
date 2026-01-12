@@ -15,9 +15,11 @@ import (
 
 // DownloadProgress represents the current download progress.
 type DownloadProgress struct {
-	Current int64
-	Total   int64
-	Status  string
+	Current        int64
+	Total          int64
+	Status         string
+	BytesPerSecond float64       // Current download speed in bytes per second
+	ETA            time.Duration // Estimated time remaining (-1 if unknown)
 }
 
 // ProgressCallback is called during download with progress updates.
@@ -161,6 +163,12 @@ type progressReader struct {
 	total    int64
 	current  int64
 	callback ProgressCallback
+
+	// Timing for speed/ETA calculation
+	startTime  time.Time
+	lastUpdate time.Time
+	lastBytes  int64
+	speed      float64 // smoothed bytes per second
 }
 
 func (r *progressReader) Read(p []byte) (int, error) {
@@ -168,10 +176,49 @@ func (r *progressReader) Read(p []byte) (int, error) {
 	r.current += int64(n)
 
 	if r.callback != nil {
+		now := time.Now()
+
+		// Initialize timing on first read
+		if r.startTime.IsZero() {
+			r.startTime = now
+			r.lastUpdate = now
+			r.lastBytes = 0
+		}
+
+		// Calculate speed using exponential moving average
+		elapsed := now.Sub(r.lastUpdate).Seconds()
+		if elapsed >= 0.1 { // Update speed every 100ms minimum
+			bytesThisInterval := r.current - r.lastBytes
+			instantSpeed := float64(bytesThisInterval) / elapsed
+
+			// Smooth the speed with exponential moving average (alpha = 0.3)
+			if r.speed == 0 {
+				r.speed = instantSpeed
+			} else {
+				r.speed = 0.3*instantSpeed + 0.7*r.speed
+			}
+
+			r.lastUpdate = now
+			r.lastBytes = r.current
+		}
+
+		// Calculate ETA
+		var eta time.Duration = -1
+		if r.speed > 0 && r.total > 0 {
+			remaining := r.total - r.current
+			if remaining > 0 {
+				eta = time.Duration(float64(remaining)/r.speed) * time.Second
+			} else {
+				eta = 0
+			}
+		}
+
 		r.callback(DownloadProgress{
-			Current: r.current,
-			Total:   r.total,
-			Status:  "Downloading...",
+			Current:        r.current,
+			Total:          r.total,
+			Status:         "Downloading...",
+			BytesPerSecond: r.speed,
+			ETA:            eta,
 		})
 	}
 
