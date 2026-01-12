@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"image/color"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -89,14 +88,13 @@ func (s *SettingsScreen) buildUI() {
 	stack := ui.NewStack()
 
 	// Semi-transparent overlay
-	stack.AddChild(ui.NewBox(color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 180}))
+	stack.AddChild(ui.NewBox(dialogOverlayColor(overlayAlphaLight)))
 
-	// Dialog constants
-	const dialogWidth float32 = 600
-	const dialogHeight float32 = 620
-	const contentWidth float32 = dialogWidth - 48
-	const cornerRadius float32 = 12
-	const labelWidth float32 = 100
+	// Dialog dimensions (from design.go)
+	const dialogWidth = settingsDialogWidth
+	const dialogHeight = settingsDialogHeight
+	const contentWidth = dialogWidth - 48
+	const labelWidth = settingsLabelWidth
 
 	// Create content
 	content := ui.Column().WithPadding(ui.All(24)).WithGap(12)
@@ -265,7 +263,7 @@ func (s *SettingsScreen) buildUI() {
 
 	// Delete button (red/danger style)
 	deleteStyle := secondaryButtonStyle()
-	deleteStyle.BackgroundNormal = color.RGBA{R: 0x40, G: 0x20, B: 0x25, A: 255}
+	deleteStyle.BackgroundNormal = colorRedDark
 	deleteStyle.BackgroundHovered = colorRed
 	deleteStyle.TextColor = colorRed
 	deleteStyle.MinWidth = 80
@@ -312,7 +310,7 @@ func (s *SettingsScreen) buildUI() {
 	// Create dialog card
 	dialogCard := ui.NewCard(nil).
 		WithBackground(colorCardBg).
-		WithCornerRadius(cornerRadius).
+		WithCornerRadius(cornerRadiusLarge).
 		WithGraphicsWindow(s.app.window).
 		WithFixedSize(dialogWidth, dialogHeight).
 		WithPadding(ui.All(0))

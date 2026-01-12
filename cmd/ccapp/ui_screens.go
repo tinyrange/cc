@@ -79,104 +79,7 @@ func formatETA(d time.Duration) string {
 	return fmt.Sprintf("%dh %dm remaining", hours, mins)
 }
 
-// Tokyo Night color theme
-// Based on https://github.com/enkia/tokyo-night-vscode-theme
-var (
-	colorBackground    = color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 255} // #1a1b26
-	colorTopBar        = color.RGBA{R: 0x16, G: 0x16, B: 0x1e, A: 255} // #16161e
-	colorBtnNormal     = color.RGBA{R: 0x24, G: 0x28, B: 0x3b, A: 255} // #24283b (storm)
-	colorBtnHover      = color.RGBA{R: 0x3d, G: 0x59, B: 0xa1, A: 255} // #3d59a1 (active border)
-	colorCardBg        = color.RGBA{R: 0x1f, G: 0x23, B: 0x35, A: 255} // #1f2335
-	colorCardBgHover   = color.RGBA{R: 0x28, G: 0x34, B: 0x4a, A: 255} // #28344a (selection)
-	colorOverlay       = color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 220} // #1a1b26 with alpha
-	colorAccent        = color.RGBA{R: 0x7a, G: 0xa2, B: 0xf7, A: 255} // #7aa2f7 (blue)
-	colorAccentHover   = color.RGBA{R: 0x7d, G: 0xcf, B: 0xff, A: 255} // #7dcfff (cyan)
-	colorAccentPressed = color.RGBA{R: 0x3d, G: 0x59, B: 0xa1, A: 255} // #3d59a1
-	colorTextPrimary   = color.RGBA{R: 0xa9, G: 0xb1, B: 0xd6, A: 255} // #a9b1d6 (foreground)
-	colorTextSecondary = color.RGBA{R: 0x78, G: 0x7c, B: 0x99, A: 255} // #787c99
-	colorTextMuted     = color.RGBA{R: 0x56, G: 0x5f, B: 0x89, A: 255} // #565f89 (dimmer)
-	colorGreen         = color.RGBA{R: 0x9e, G: 0xce, B: 0x6a, A: 255} // #9ece6a
-	colorRed           = color.RGBA{R: 0xf7, G: 0x76, B: 0x8e, A: 255} // #f7768e
-	colorYellow        = color.RGBA{R: 0xe0, G: 0xaf, B: 0x68, A: 255} // #e0af68
-)
-
-// UI constants
-const (
-	cornerRadiusSmall  float32 = 6
-	cornerRadiusMedium float32 = 10
-	topBarButtonHeight float32 = 26
-	topBarIconSize     float32 = 14
-)
-
-// topBarButtonStyle returns the standard style for top bar buttons (text only)
-func topBarButtonStyle() ui.ButtonStyle {
-	return ui.ButtonStyle{
-		BackgroundNormal:   colorBtnNormal,
-		BackgroundHovered:  colorBtnHover,
-		BackgroundPressed:  colorAccentPressed,
-		BackgroundDisabled: color.RGBA{R: 0x16, G: 0x16, B: 0x1e, A: 255},
-		TextColor:          colorTextPrimary,
-		TextSize:           13,
-		Padding:            ui.Symmetric(10, 6),
-		MinWidth:           60,
-		MinHeight:          topBarButtonHeight,
-		CornerRadius:       cornerRadiusSmall,
-	}
-}
-
-// iconButtonCardStyle returns a CardStyle matching the top bar button style
-func iconButtonCardStyle() ui.CardStyle {
-	return ui.CardStyle{
-		BackgroundColor: colorBtnNormal,
-		BorderColor:     color.Transparent,
-		BorderWidth:     0,
-		Padding:         ui.Symmetric(10, 6),
-		CornerRadius:    cornerRadiusSmall,
-	}
-}
-
-// iconButtonCardHoverStyle returns a hover CardStyle for icon buttons
-func iconButtonCardHoverStyle() ui.CardStyle {
-	return ui.CardStyle{
-		BackgroundColor: colorBtnHover,
-		BorderColor:     color.Transparent,
-		BorderWidth:     0,
-		Padding:         ui.Symmetric(10, 6),
-		CornerRadius:    cornerRadiusSmall,
-	}
-}
-
-// primaryButtonStyle returns the style for primary action buttons (blue accent)
-func primaryButtonStyle() ui.ButtonStyle {
-	return ui.ButtonStyle{
-		BackgroundNormal:   colorAccent,
-		BackgroundHovered:  colorAccentHover,
-		BackgroundPressed:  colorAccentPressed,
-		BackgroundDisabled: color.RGBA{R: 0x41, G: 0x48, B: 0x68, A: 255}, // #414868
-		TextColor:          color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 255}, // Dark text on light bg
-		TextSize:           15,
-		Padding:            ui.Symmetric(20, 12),
-		MinWidth:           120,
-		MinHeight:          44,
-		CornerRadius:       cornerRadiusSmall,
-	}
-}
-
-// secondaryButtonStyle returns the style for secondary action buttons
-func secondaryButtonStyle() ui.ButtonStyle {
-	return ui.ButtonStyle{
-		BackgroundNormal:   colorBtnNormal,
-		BackgroundHovered:  colorBtnHover,
-		BackgroundPressed:  colorAccentPressed,
-		BackgroundDisabled: color.RGBA{R: 0x16, G: 0x16, B: 0x1e, A: 255},
-		TextColor:          colorTextPrimary,
-		TextSize:           15,
-		Padding:            ui.Symmetric(20, 12),
-		MinWidth:           120,
-		MinHeight:          44,
-		CornerRadius:       cornerRadiusSmall,
-	}
-}
+// Colors, UI constants, and common styles are defined in design.go
 
 // LauncherScreen manages the launcher UI state and widgets
 type LauncherScreen struct {
@@ -329,16 +232,8 @@ func (s *LauncherScreen) buildUpdateButton() ui.Widget {
 
 	// Create card button with green accent
 	card := ui.NewCard(content).
-		WithStyle(ui.CardStyle{
-			BackgroundColor: color.RGBA{R: 0x1e, G: 0x36, B: 0x2a, A: 255}, // Dark green
-			CornerRadius:    6,
-			Padding:         ui.Symmetric(10, 6),
-		}).
-		WithHoverStyle(ui.CardStyle{
-			BackgroundColor: color.RGBA{R: 0x26, G: 0x46, B: 0x34, A: 255}, // Lighter green
-			CornerRadius:    6,
-			Padding:         ui.Symmetric(10, 6),
-		}).
+		WithStyle(updateButtonCardStyle()).
+		WithHoverStyle(updateButtonCardHoverStyle()).
 		WithGraphicsWindow(s.app.window).
 		OnClick(func() {
 			s.app.startUpdate()
@@ -450,16 +345,8 @@ func (s *LauncherScreen) buildAddVMSection() *ui.FlexContainer {
 
 	// Use Card for clickable content with icon - prominent green style
 	card := ui.NewCard(content).
-		WithStyle(ui.CardStyle{
-			BackgroundColor: colorGreen,
-			Padding:         ui.Symmetric(24, 14),
-			CornerRadius:    cornerRadiusMedium,
-		}).
-		WithHoverStyle(ui.CardStyle{
-			BackgroundColor: color.RGBA{R: 0xb9, G: 0xe0, B: 0x8c, A: 255}, // Lighter green on hover
-			Padding:         ui.Symmetric(24, 14),
-			CornerRadius:    cornerRadiusMedium,
-		}).
+		WithStyle(addVMCardStyle()).
+		WithHoverStyle(addVMCardHoverStyle()).
 		WithGraphicsWindow(s.app.window).
 		OnClick(func() {
 			s.app.customVMScreen = NewCustomVMScreen(s.app)
@@ -493,13 +380,8 @@ func (s *LauncherScreen) buildBundleCard(index int, b discoveredBundle) *bundleC
 		desc = "VM Bundle"
 	}
 
-	// Card dimensions and padding
-	const cardWidth float32 = 180
-	const cardHeight float32 = 270
-	const cardPadding float32 = 12
+	// Card dimensions and padding (from design.go)
 	const contentWidth = cardWidth - (cardPadding * 2)
-	const imageHeight float32 = 120
-	const buttonSize float32 = 26
 
 	// Card content: vertical layout with image area and text
 	content := ui.Column().WithGap(8)
@@ -510,14 +392,8 @@ func (s *LauncherScreen) buildBundleCard(index int, b discoveredBundle) *bundleC
 		WithGraphicsWindow(s.app.window)
 
 	imageCard := ui.NewCard(iconWidget).
-		WithStyle(ui.CardStyle{
-			BackgroundColor: colorTopBar,
-			CornerRadius:    cornerRadiusSmall,
-		}).
-		WithHoverStyle(ui.CardStyle{
-			BackgroundColor: colorBtnHover,
-			CornerRadius:    cornerRadiusSmall,
-		}).
+		WithStyle(bundleImageCardStyle()).
+		WithHoverStyle(bundleImageCardHoverStyle()).
 		WithGraphicsWindow(s.app.window).
 		WithFixedSize(contentWidth, imageHeight).
 		OnClick(func() {
@@ -538,17 +414,7 @@ func (s *LauncherScreen) buildBundleCard(index int, b discoveredBundle) *bundleC
 
 	// Start button (green)
 	startBtn := ui.NewButton("Start").
-		WithStyle(ui.ButtonStyle{
-			BackgroundNormal:  colorGreen,
-			BackgroundHovered: color.RGBA{R: 0xb9, G: 0xe0, B: 0x8c, A: 255},
-			BackgroundPressed: color.RGBA{R: 0x70, G: 0xa0, B: 0x50, A: 255},
-			TextColor:         colorBackground,
-			TextSize:          12,
-			Padding:           ui.Symmetric(12, 4),
-			MinWidth:          60,
-			MinHeight:         buttonSize,
-			CornerRadius:      cornerRadiusSmall,
-		}).
+		WithStyle(startButtonStyle()).
 		WithGraphicsWindow(s.app.window).
 		OnClick(func() {
 			s.app.selectedIndex = index
@@ -563,16 +429,8 @@ func (s *LauncherScreen) buildBundleCard(index int, b discoveredBundle) *bundleC
 	if s.iconCog != nil {
 		cogContent := ui.NewSVGImage(s.iconCog).WithSize(14, 14)
 		cogButton := ui.NewCard(cogContent).
-			WithStyle(ui.CardStyle{
-				BackgroundColor: colorBtnNormal,
-				Padding:         ui.All(6),
-				CornerRadius:    cornerRadiusSmall,
-			}).
-			WithHoverStyle(ui.CardStyle{
-				BackgroundColor: colorBtnHover,
-				Padding:         ui.All(6),
-				CornerRadius:    cornerRadiusSmall,
-			}).
+			WithStyle(cogButtonStyle()).
+			WithHoverStyle(cogButtonHoverStyle()).
 			WithGraphicsWindow(s.app.window).
 			WithFixedSize(buttonSize, buttonSize).
 			OnClick(func() {
@@ -583,16 +441,8 @@ func (s *LauncherScreen) buildBundleCard(index int, b discoveredBundle) *bundleC
 	content.AddChild(bottomRow, ui.DefaultFlexParams())
 
 	// Outer card is just a visual container (NOT clickable)
-	cardStyle := ui.CardStyle{
-		BackgroundColor: colorCardBg,
-		BorderColor:     color.Transparent,
-		BorderWidth:     0,
-		Padding:         ui.All(cardPadding),
-		CornerRadius:    cornerRadiusMedium,
-	}
-
 	card := ui.NewCard(content).
-		WithStyle(cardStyle).
+		WithStyle(bundleCardStyle()).
 		WithGraphicsWindow(s.app.window).
 		WithFixedSize(cardWidth, cardHeight)
 
@@ -716,15 +566,7 @@ func (s *LoadingScreen) buildUI() {
 
 	s.blobProgressBar = ui.NewProgressBar().
 		WithMinWidth(380).
-		WithStyle(ui.ProgressBarStyle{
-			BackgroundColor: color.RGBA{R: 0x24, G: 0x28, B: 0x3b, A: 255},
-			FillColor:       accentColor,
-			TextColor:       colorTextPrimary,
-			Height:          8,
-			CornerRadius:    4,
-			ShowPercentage:  false,
-			TextSize:        12,
-		}).
+		WithStyle(progressBarStyle(accentColor)).
 		WithGraphicsWindow(s.app.window)
 	cardContent.AddChild(s.blobProgressBar, ui.DefaultFlexParams())
 
@@ -734,15 +576,7 @@ func (s *LoadingScreen) buildUI() {
 
 	s.progressBar = ui.NewProgressBar().
 		WithMinWidth(380).
-		WithStyle(ui.ProgressBarStyle{
-			BackgroundColor: color.RGBA{R: 0x24, G: 0x28, B: 0x3b, A: 255},
-			FillColor:       colorAccent,
-			TextColor:       colorTextPrimary,
-			Height:          6,
-			CornerRadius:    3,
-			ShowPercentage:  false,
-			TextSize:        12,
-		}).
+		WithStyle(progressBarSmallStyle()).
 		WithGraphicsWindow(s.app.window)
 	cardContent.AddChild(s.progressBar, ui.DefaultFlexParams())
 
@@ -877,7 +711,7 @@ func (s *ErrorScreen) buildUI() {
 		),
 	).
 		WithStyle(ui.CardStyle{
-			BackgroundColor: color.RGBA{R: 0x29, G: 0x1b, B: 0x23, A: 255}, // Tokyo Night red tint
+			BackgroundColor: colorRedTint,
 			CornerRadius:    cornerRadiusSmall,
 		}).
 		WithGraphicsWindow(s.app.window)
@@ -964,11 +798,6 @@ type TerminalScreen struct {
 	prevLeftDown   bool // For manual click detection
 }
 
-// Notch animation constants
-const (
-	notchAnimSpeed = float32(10.0) // speed of expand/collapse
-)
-
 // NewTerminalScreen creates the terminal screen UI (notch bar)
 func NewTerminalScreen(app *Application) *TerminalScreen {
 	screen := &TerminalScreen{
@@ -977,42 +806,6 @@ func NewTerminalScreen(app *Application) *TerminalScreen {
 	}
 	screen.buildUI()
 	return screen
-}
-
-// notchButtonStyle returns style for notch buttons
-func notchButtonStyle() ui.ButtonStyle {
-	return ui.ButtonStyle{
-		BackgroundNormal:   colorBtnNormal,
-		BackgroundHovered:  colorBtnHover,
-		BackgroundPressed:  colorAccentPressed,
-		BackgroundDisabled: colorBtnNormal,
-		TextColor:          color.RGBA{R: 0xff, G: 0xff, B: 0xff, A: 255}, // white text
-		TextSize:           12,
-		Padding:            ui.Symmetric(10, 5),
-		MinWidth:           50,
-		MinHeight:          24,
-		CornerRadius:       6,
-	}
-}
-
-// notchExitButtonStyle returns style for the exit button (red on hover)
-func notchExitButtonStyle() ui.ButtonStyle {
-	style := notchButtonStyle()
-	style.BackgroundHovered = colorRed
-	return style
-}
-
-// notchNetButtonStyle returns style for the network button
-func notchNetButtonStyle(connected bool) ui.ButtonStyle {
-	style := notchButtonStyle()
-	if connected {
-		style.BackgroundNormal = colorGreen
-		style.BackgroundHovered = color.RGBA{R: 0x73, G: 0xda, B: 0xca, A: 255} // teal hover
-	} else {
-		style.BackgroundNormal = color.RGBA{R: 0x56, G: 0x5f, B: 0x89, A: 255} // gray
-		style.BackgroundHovered = colorBtnHover
-	}
-	return style
 }
 
 func (s *TerminalScreen) buildUI() {
@@ -1051,25 +844,13 @@ func (s *TerminalScreen) buildUI() {
 		AddChild(s.netBtn, ui.DefaultFlexParams())
 
 	// Expanded notch card with buttons
-	expandedStyle := ui.CardStyle{
-		BackgroundColor: color.RGBA{R: 0x2a, G: 0x2e, B: 0x45, A: 255}, // slightly lighter when expanded
-		Padding:         ui.Symmetric(10, 8),
-		CornerRadius:    20, // pill-like rounded corners
-	}
-
 	s.expandedCard = ui.NewCard(buttonRow).
-		WithStyle(expandedStyle).
+		WithStyle(notchExpandedCardStyle()).
 		WithGraphicsWindow(s.app.window)
 
 	// Collapsed notch card (small indicator bar)
-	collapsedStyle := ui.CardStyle{
-		BackgroundColor: color.RGBA{R: 0x41, G: 0x48, B: 0x68, A: 255}, // visible purple-gray
-		Padding:         ui.All(0),
-		CornerRadius:    0, // square corners
-	}
-
 	s.collapsedCard = ui.NewCard(nil).
-		WithStyle(collapsedStyle).
+		WithStyle(notchCollapsedCardStyle()).
 		WithGraphicsWindow(s.app.window).
 		WithFixedSize(60, 10) // small pill
 
@@ -1107,8 +888,8 @@ func (s *TerminalScreen) RenderNotch(f graphics.Frame) {
 	winW := float32(w)
 
 	// Define hover zone (expanded notch area at top center)
-	hoverW := float32(180)
-	hoverH := float32(50)
+	hoverW := notchHoverW
+	hoverH := notchHoverH
 	hoverX := (winW - hoverW) / 2
 	hoverRect := rect{x: hoverX, y: 0, w: hoverW, h: hoverH}
 	isHovered := hoverRect.contains(mx, my)

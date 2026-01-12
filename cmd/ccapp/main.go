@@ -482,7 +482,7 @@ func (app *Application) Run() error {
 	}
 
 	app.window.SetClear(true)
-	app.window.SetClearColor(color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 255}) // Tokyo Night background
+	app.window.SetClearColor(colorBackground) // Tokyo Night background
 
 	// Initialize blur effect for dialog overlays
 	blurEffect, err := app.window.NewBlurEffect()
@@ -810,28 +810,28 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 	justPressed := leftDown && !app.prevLeftDown
 	app.prevLeftDown = leftDown
 
-	// Colors for confirmation dialog
-	btnNormal := color.RGBA{R: 0x36, G: 0x3e, B: 0x5a, A: 255}    // #363e5a
-	btnHover := color.RGBA{R: 0x3d, G: 0x59, B: 0xa1, A: 255}     // #3d59a1
-	btnPressed := color.RGBA{R: 0x28, G: 0x34, B: 0x4a, A: 255}   // #28344a
-	exitBtnHover := color.RGBA{R: 0xf7, G: 0x76, B: 0x8e, A: 255} // #f7768e red
-	textColorDark := color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 255} // dark like background
-	textColorLight := color.RGBA{R: 0xa9, G: 0xb1, B: 0xd6, A: 255} // lighter for cancel button
+	// Colors for confirmation dialog (from design.go)
+	btnNormal := colorBtnAlt
+	btnHover := colorBtnHover
+	btnPressed := colorBtnAltPressed
+	exitBtnHover := colorRed
+	textColorDialogDark := colorTextDark
+	textColorDialogLight := colorTextPrimary
 
 	// Render exit confirmation dialog
 	if app.showExitConfirm {
 		// Darken background
-		overlay := color.RGBA{R: 0, G: 0, B: 0, A: 180}
+		overlay := color.RGBA{R: 0, G: 0, B: 0, A: overlayAlphaLight}
 		f.RenderQuad(0, 0, winW, float32(h), nil, overlay)
 
-		// Dialog box dimensions
-		dialogW := float32(280)
-		dialogH := float32(120)
+		// Dialog box dimensions (from design.go)
+		dialogW := exitDialogWidth
+		dialogH := exitDialogHeight
 		dialogX := (winW - dialogW) / 2
 		dialogY := (float32(h) - dialogH) / 2
-		dialogBg := color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 255}
-		dialogCornerRadius := float32(12)
-		btnCornerRadius := float32(6)
+		dialogBg := colorBackground
+		dialogCornerRadius := cornerRadiusLarge
+		btnCornerRadius := cornerRadiusSmall
 
 		// Initialize or update dialog background shape
 		dialogBgRect := rect{x: dialogX, y: dialogY, w: dialogW, h: dialogH}
@@ -847,9 +847,8 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 		}
 		f.RenderMesh(app.dialogBgShape.Mesh(), graphics.DrawOptions{})
 
-		// Title (dark text on dark background - use lighter text for title)
-		titleColor := color.RGBA{R: 0xa9, G: 0xb1, B: 0xd6, A: 255} // #a9b1d6
-		app.text.RenderText("Shut down VM?", dialogX+70, dialogY+35, 16, titleColor)
+		// Title (use lighter text for title on dark background)
+		app.text.RenderText("Shut down VM?", dialogX+70, dialogY+35, 16, colorTextPrimary)
 
 		// Confirm button
 		confirmRect := rect{x: dialogX + 30, y: dialogY + 60, w: 100, h: 30}
@@ -868,7 +867,7 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 			graphics.UniformRadius(btnCornerRadius),
 			graphics.ShapeStyle{FillColor: confirmColor})
 		f.RenderMesh(app.confirmBtnShape.Mesh(), graphics.DrawOptions{})
-		app.text.RenderText("Shut Down", confirmRect.x+12, confirmRect.y+20, 14, textColorDark)
+		app.text.RenderText("Shut Down", confirmRect.x+12, confirmRect.y+20, 14, textColorDialogDark)
 
 		// Cancel button
 		cancelRect := rect{x: dialogX + 150, y: dialogY + 60, w: 100, h: 30}
@@ -890,7 +889,7 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 			graphics.UniformRadius(btnCornerRadius),
 			graphics.ShapeStyle{FillColor: cancelColor})
 		f.RenderMesh(app.cancelBtnShape.Mesh(), graphics.DrawOptions{})
-		app.text.RenderText("Cancel", cancelRect.x+28, cancelRect.y+20, 14, textColorLight)
+		app.text.RenderText("Cancel", cancelRect.x+28, cancelRect.y+20, 14, textColorDialogLight)
 
 		// Handle dialog button clicks
 		if justPressed && confirmRect.contains(mx, my) {

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"image/color"
 	"log/slog"
 	"os"
 
@@ -43,12 +42,11 @@ func (s *DeleteConfirmScreen) buildUI() {
 	stack := ui.NewStack()
 
 	// Semi-transparent overlay
-	stack.AddChild(ui.NewBox(color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 200}))
+	stack.AddChild(ui.NewBox(dialogOverlayColor(overlayAlphaMedium)))
 
-	// Dialog constants
-	const dialogWidth float32 = 400
-	const dialogHeight float32 = 180
-	const cornerRadius float32 = 12
+	// Dialog dimensions (from design.go)
+	const dialogWidth = deleteDialogWidth
+	const dialogHeight = deleteDialogHeight
 
 	// Create content
 	content := ui.Column().WithPadding(ui.All(24)).WithGap(20)
@@ -89,10 +87,7 @@ func (s *DeleteConfirmScreen) buildUI() {
 	buttonRow.AddChild(cancelBtn, ui.DefaultFlexParams())
 
 	// Delete button (danger style)
-	deleteStyle := primaryButtonStyle()
-	deleteStyle.BackgroundNormal = colorRed
-	deleteStyle.BackgroundHovered = color.RGBA{R: 0xff, G: 0x90, B: 0xa0, A: 255}
-	deleteStyle.BackgroundPressed = color.RGBA{R: 0xc0, G: 0x50, B: 0x60, A: 255}
+	deleteStyle := dangerButtonStyle()
 	deleteStyle.MinWidth = 90
 	deleteStyle.MinHeight = 36
 	deleteStyle.TextSize = 14
@@ -107,7 +102,7 @@ func (s *DeleteConfirmScreen) buildUI() {
 	// Create dialog card
 	dialogCard := ui.NewCard(nil).
 		WithBackground(colorCardBg).
-		WithCornerRadius(cornerRadius).
+		WithCornerRadius(cornerRadiusLarge).
 		WithGraphicsWindow(s.app.window).
 		WithFixedSize(dialogWidth, dialogHeight).
 		WithPadding(ui.All(0))

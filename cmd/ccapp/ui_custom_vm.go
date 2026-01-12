@@ -1,7 +1,6 @@
 package main
 
 import (
-	"image/color"
 	"log/slog"
 	"path/filepath"
 	"strings"
@@ -58,15 +57,14 @@ func (s *CustomVMScreen) buildUI() {
 	stack := ui.NewStack()
 
 	// Semi-transparent overlay to darken the blurred background slightly
-	stack.AddChild(ui.NewBox(color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 180})) // Tokyo Night with alpha
+	stack.AddChild(ui.NewBox(dialogOverlayColor(overlayAlphaLight)))
 
-	// Dialog constants
-	const dialogWidth float32 = 500
-	const dialogHeight float32 = 380
-	const contentWidth float32 = dialogWidth - 48 // minus padding
-	const cornerRadius float32 = 12
+	// Dialog dimensions (from design.go)
+	const dialogWidth = customVMDialogWidth
+	const dialogHeight = customVMDialogHeight
+	const contentWidth = dialogWidth - 48 // minus padding
 
-	// Dialog colors (Tokyo Night theme)
+	// Dialog colors (from design.go)
 	dialogBg := colorCardBg
 	textColorPrimary := colorTextPrimary
 	textColorSecondary := colorTextSecondary
@@ -78,26 +76,14 @@ func (s *CustomVMScreen) buildUI() {
 	// Use Card with rounded corners for dialog background
 	dialogCard := ui.NewCard(nil).
 		WithBackground(dialogBg).
-		WithCornerRadius(cornerRadius).
+		WithCornerRadius(cornerRadiusLarge).
 		WithGraphicsWindow(s.app.window).
 		WithFixedSize(dialogWidth, dialogHeight).
 		WithPadding(ui.All(0))
 
 	// Tab bar for mode selection
 	s.tabBar = ui.NewTabBar([]string{"Docker Image", "OCI Tarball", "Bundle Directory"}).
-		WithStyle(ui.TabBarStyle{
-			BackgroundColor:    color.RGBA{R: 0, G: 0, B: 0, A: 0}, // Transparent
-			TextColor:          textColorSecondary,
-			TextColorSelected:  textColorPrimary,
-			TextColorHovered:   colorTextPrimary,
-			TextSize:           14,
-			TabPadding:         ui.Symmetric(20, 10),
-			TabGap:             0,
-			UnderlineColor:     colorAccent, // Tokyo Night blue
-			UnderlineThickness: 2,
-			UnderlineInset:     0,
-			Height:             36,
-		}).
+		WithStyle(tabBarStyle()).
 		OnSelect(func(index int) {
 			// Commit current input text before rebuilding
 			if s.pathInput != nil {
