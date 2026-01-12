@@ -3,7 +3,6 @@ package text
 import (
 	"fmt"
 	"io/ioutil"
-	"math"
 	"unicode/utf8"
 	"unsafe"
 
@@ -155,8 +154,8 @@ func New(gl glpkg.OpenGL, cachew, cacheh int) *Stash {
 	// Use GL_R8 for single-channel alpha texture (OpenGL 3.0+)
 	gl.TexImage2D(glpkg.Texture2D, 0, int32(glpkg.R8), int32(cachew), int32(cacheh),
 		0, glpkg.Red, glpkg.UnsignedByte, unsafe.Pointer(&stash.emptyData[0]))
-	gl.TexParameteri(glpkg.Texture2D, glpkg.TextureMinFilter, glpkg.Nearest)
-	gl.TexParameteri(glpkg.Texture2D, glpkg.TextureMagFilter, glpkg.Nearest)
+	gl.TexParameteri(glpkg.Texture2D, glpkg.TextureMinFilter, glpkg.Linear)
+	gl.TexParameteri(glpkg.Texture2D, glpkg.TextureMagFilter, glpkg.Linear)
 	gl.TexParameteri(glpkg.Texture2D, glpkg.TextureWrapS, glpkg.ClampToEdge)
 	gl.TexParameteri(glpkg.Texture2D, glpkg.TextureWrapT, glpkg.ClampToEdge)
 
@@ -337,10 +336,12 @@ func (s *Stash) GetGlyph(fnt *Font, codepoint int, isize int16) *Glyph {
 	rh := (int16(gh) + 7) & ^7
 	var tt int
 	texture := s.ttTextures[tt]
+	const glyphPadding = 3 // Padding between glyphs to prevent texture bleeding
+
 	var br *Row
 	for br == nil {
 		for i := range texture.rows {
-			if texture.rows[i].h == rh && int(texture.rows[i].x)+gw+1 <= s.tw {
+			if texture.rows[i].h == rh && int(texture.rows[i].x)+gw+glyphPadding <= s.tw {
 				br = texture.rows[i]
 			}
 		}
@@ -353,7 +354,7 @@ func (s *Stash) GetGlyph(fnt *Font, codepoint int, isize int16) *Glyph {
 			var py int16
 			// Check that there is enough space.
 			if len(texture.rows) > 0 {
-				py = texture.rows[len(texture.rows)-1].y + texture.rows[len(texture.rows)-1].h + 1
+				py = texture.rows[len(texture.rows)-1].y + texture.rows[len(texture.rows)-1].h + int16(glyphPadding)
 				if int(py+rh) > s.th {
 					if tt < len(s.ttTextures)-1 {
 						tt++
@@ -367,8 +368,8 @@ func (s *Stash) GetGlyph(fnt *Font, codepoint int, isize int16) *Glyph {
 							int32(s.tw), int32(s.th), 0,
 							glpkg.Red, glpkg.UnsignedByte,
 							unsafe.Pointer(&s.emptyData[0]))
-						s.gl.TexParameteri(glpkg.Texture2D, glpkg.TextureMinFilter, glpkg.Nearest)
-						s.gl.TexParameteri(glpkg.Texture2D, glpkg.TextureMagFilter, glpkg.Nearest)
+						s.gl.TexParameteri(glpkg.Texture2D, glpkg.TextureMinFilter, glpkg.Linear)
+						s.gl.TexParameteri(glpkg.Texture2D, glpkg.TextureMagFilter, glpkg.Linear)
 						s.gl.TexParameteri(glpkg.Texture2D, glpkg.TextureWrapS, glpkg.ClampToEdge)
 						s.gl.TexParameteri(glpkg.Texture2D, glpkg.TextureWrapT, glpkg.ClampToEdge)
 						s.ttTextures = append(s.ttTextures, texture)
@@ -403,7 +404,7 @@ func (s *Stash) GetGlyph(fnt *Font, codepoint int, isize int16) *Glyph {
 	fnt.glyphs = append(fnt.glyphs, glyph)
 
 	// Advance row location.
-	br.x += int16(gw) + 1
+	br.x += int16(gw) + int16(glyphPadding)
 
 	// Insert char to hash lookup.
 	glyph.next = fnt.lut[h]
@@ -449,8 +450,9 @@ func (s *Stash) GetQuad(fnt *Font, glyph *Glyph, isize int16, x, y float64) (flo
 		scale = float64(isize) / float64(glyph.size*10)
 	}
 
-	rx := math.Floor(x + scale*glyph.xoff)
-	ry := math.Floor(y - scale*glyph.yoff)
+	// Use subpixel positioning for smoother text with GL_LINEAR filtering
+	rx := x + scale*glyph.xoff
+	ry := y - scale*glyph.yoff
 
 	q.x0 = float32(rx)
 	q.y0 = float32(ry)
@@ -630,17 +632,31 @@ func (stash *Stash) GetAdvance(idx int, size float64, s string) float64 {
 	}
 
 	x := float64(0)
+	scale := fnt.font.ScaleForPixelHeight(size)
+	prevGlyph := -1 // Track previous glyph for kerning
 
 	b := []byte(s)
 	for len(b) > 0 {
-		r, size := utf8.DecodeRune(b)
+		r, runeSize := utf8.DecodeRune(b)
 		glyph := stash.GetGlyph(fnt, int(r), isize)
 		if glyph == nil {
-			b = b[size:]
+			b = b[runeSize:]
+			prevGlyph = -1
 			continue
 		}
+
+		// Apply kerning if we have a previous glyph
+		if prevGlyph >= 0 && fnt.fType != BMFONT {
+			currGlyph := fnt.font.FindGlyphIndex(int(r))
+			kern := fnt.font.GetGlyphKernAdvance(prevGlyph, currGlyph)
+			x += float64(kern) * scale
+			prevGlyph = currGlyph
+		} else {
+			prevGlyph = fnt.font.FindGlyphIndex(int(r))
+		}
+
 		x, _, _ = stash.GetQuad(fnt, glyph, isize, x, 0)
-		b = b[size:]
+		b = b[runeSize:]
 	}
 
 	return x
@@ -667,6 +683,9 @@ func (stash *Stash) DrawText(idx int, size, x, y float64, s string, color [4]flo
 	startX := x
 	// Get line height for newline handling
 	_, _, lineHeight := stash.VMetrics(idx, size)
+	// Get scale for kerning calculations
+	scale := fnt.font.ScaleForPixelHeight(size)
+	prevGlyph := -1 // Track previous glyph for kerning
 
 	var q *Quad
 
@@ -683,13 +702,25 @@ func (stash *Stash) DrawText(idx int, size, x, y float64, s string, color [4]flo
 				y -= lineHeight
 			}
 			b = b[runeSize:]
+			prevGlyph = -1 // Reset kerning on newline
 			continue
 		}
 
 		glyph := stash.GetGlyph(fnt, int(r), isize)
 		if glyph == nil {
 			b = b[runeSize:]
+			prevGlyph = -1
 			continue
+		}
+
+		// Apply kerning if we have a previous glyph
+		if prevGlyph >= 0 && fnt.fType != BMFONT {
+			currGlyph := fnt.font.FindGlyphIndex(int(r))
+			kern := fnt.font.GetGlyphKernAdvance(prevGlyph, currGlyph)
+			x += float64(kern) * scale
+			prevGlyph = currGlyph
+		} else {
+			prevGlyph = fnt.font.FindGlyphIndex(int(r))
 		}
 		texture := glyph.texture
 		// We emit 4 vertices per glyph quad into texture.verts (8 floats each).
@@ -754,6 +785,188 @@ func (stash *Stash) DrawText(idx int, size, x, y float64, s string, color [4]flo
 	}
 
 	return x
+}
+
+// GradientStop represents a color stop in a gradient.
+type GradientStop struct {
+	Position float32     // 0.0 to 1.0
+	R, G, B, A float32
+}
+
+// DrawTextGradient draws text with a horizontal gradient applied.
+// The gradient colors are interpolated across the text based on character position.
+func (stash *Stash) DrawTextGradient(idx int, size, x, y float64, s string, stops []GradientStop, textWidth float64) (nextX float64) {
+	if len(stops) < 2 {
+		// Need at least 2 stops for a gradient
+		return stash.DrawText(idx, size, x, y, s, [4]float32{1, 1, 1, 1})
+	}
+
+	isize := int16(size * 10)
+
+	var fnt *Font
+	for _, f := range stash.fonts {
+		if f.idx == idx {
+			fnt = f
+			break
+		}
+	}
+	if fnt == nil {
+		return 0
+	}
+	if fnt.fType != BMFONT && len(fnt.data) == 0 {
+		return 0
+	}
+
+	// Store the initial x position
+	startX := x
+	// Get line height for newline handling
+	_, _, lineHeight := stash.VMetrics(idx, size)
+	// Get scale for kerning calculations
+	scale := fnt.font.ScaleForPixelHeight(size)
+	prevGlyph := -1
+
+	var q *Quad
+
+	b := []byte(s)
+	for len(b) > 0 {
+		r, runeSize := utf8.DecodeRune(b)
+
+		// Handle newline character
+		if r == '\n' {
+			x = startX
+			if stash.yInverted {
+				y += lineHeight
+			} else {
+				y -= lineHeight
+			}
+			b = b[runeSize:]
+			prevGlyph = -1
+			continue
+		}
+
+		glyph := stash.GetGlyph(fnt, int(r), isize)
+		if glyph == nil {
+			b = b[runeSize:]
+			prevGlyph = -1
+			continue
+		}
+
+		// Apply kerning if we have a previous glyph
+		if prevGlyph >= 0 && fnt.fType != BMFONT {
+			currGlyph := fnt.font.FindGlyphIndex(int(r))
+			kern := fnt.font.GetGlyphKernAdvance(prevGlyph, currGlyph)
+			x += float64(kern) * scale
+			prevGlyph = currGlyph
+		} else {
+			prevGlyph = fnt.font.FindGlyphIndex(int(r))
+		}
+
+		texture := glyph.texture
+		maxStoredVerts := (VERT_COUNT * 4) / 6
+		if texture.nverts+4 > maxStoredVerts {
+			stash.FlushDraw()
+		}
+
+		// Calculate position along gradient (0.0 to 1.0)
+		t := float32(0)
+		if textWidth > 0 {
+			t = float32((x - startX) / textWidth)
+			if t > 1 {
+				t = 1
+			}
+		}
+
+		// Interpolate color from gradient stops
+		color := interpolateGradient(stops, t)
+
+		x, y, q = stash.GetQuad(fnt, glyph, isize, x, y)
+
+		// Vertex 0: top-left
+		base := texture.nverts * 8
+		texture.verts[base+0] = q.x0
+		texture.verts[base+1] = q.y0
+		texture.verts[base+2] = q.s0
+		texture.verts[base+3] = q.t0
+		texture.verts[base+4] = color[0]
+		texture.verts[base+5] = color[1]
+		texture.verts[base+6] = color[2]
+		texture.verts[base+7] = color[3]
+		texture.nverts++
+
+		// Vertex 1: top-right
+		base = texture.nverts * 8
+		texture.verts[base+0] = q.x1
+		texture.verts[base+1] = q.y0
+		texture.verts[base+2] = q.s1
+		texture.verts[base+3] = q.t0
+		texture.verts[base+4] = color[0]
+		texture.verts[base+5] = color[1]
+		texture.verts[base+6] = color[2]
+		texture.verts[base+7] = color[3]
+		texture.nverts++
+
+		// Vertex 2: bottom-right
+		base = texture.nverts * 8
+		texture.verts[base+0] = q.x1
+		texture.verts[base+1] = q.y1
+		texture.verts[base+2] = q.s1
+		texture.verts[base+3] = q.t1
+		texture.verts[base+4] = color[0]
+		texture.verts[base+5] = color[1]
+		texture.verts[base+6] = color[2]
+		texture.verts[base+7] = color[3]
+		texture.nverts++
+
+		// Vertex 3: bottom-left
+		base = texture.nverts * 8
+		texture.verts[base+0] = q.x0
+		texture.verts[base+1] = q.y1
+		texture.verts[base+2] = q.s0
+		texture.verts[base+3] = q.t1
+		texture.verts[base+4] = color[0]
+		texture.verts[base+5] = color[1]
+		texture.verts[base+6] = color[2]
+		texture.verts[base+7] = color[3]
+		texture.nverts++
+
+		b = b[runeSize:]
+	}
+
+	return x
+}
+
+// interpolateGradient returns the color at position t (0.0-1.0) in the gradient.
+func interpolateGradient(stops []GradientStop, t float32) [4]float32 {
+	if t <= stops[0].Position {
+		return [4]float32{stops[0].R, stops[0].G, stops[0].B, stops[0].A}
+	}
+	if t >= stops[len(stops)-1].Position {
+		s := stops[len(stops)-1]
+		return [4]float32{s.R, s.G, s.B, s.A}
+	}
+
+	// Find surrounding stops
+	var lower, upper GradientStop
+	for i := 0; i < len(stops)-1; i++ {
+		if t >= stops[i].Position && t <= stops[i+1].Position {
+			lower = stops[i]
+			upper = stops[i+1]
+			break
+		}
+	}
+
+	// Interpolate between stops
+	if upper.Position == lower.Position {
+		return [4]float32{lower.R, lower.G, lower.B, lower.A}
+	}
+
+	factor := (t - lower.Position) / (upper.Position - lower.Position)
+	return [4]float32{
+		lower.R + (upper.R-lower.R)*factor,
+		lower.G + (upper.G-lower.G)*factor,
+		lower.B + (upper.B-lower.B)*factor,
+		lower.A + (upper.A-lower.A)*factor,
+	}
 }
 
 func (s *Stash) VMetrics(idx int, size float64) (float64, float64, float64) {

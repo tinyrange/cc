@@ -193,52 +193,78 @@ func LoadSVG(win Window, data []byte) (*SVG, error) {
 				}
 
 				fill := resolveFill(fillAttr, groupStack, groupFill, groupPolygonFill)
-				rgba := ColorToFloat32(fill)
+				addPolygon(&vertices, &indices, groupBuilders, groupStack, pts, fill)
 
-				base := uint32(len(vertices))
-				// Determine nearest group id.
-				gid := ""
-				for i := len(groupStack) - 1; i >= 0; i-- {
-					if groupStack[i] != "" {
-						gid = groupStack[i]
-						break
+			case "circle":
+				var cx, cy, r float32
+				var fillAttr string
+				for _, a := range t.Attr {
+					switch a.Name.Local {
+					case "cx":
+						cx = parseFloat32(a.Value)
+					case "cy":
+						cy = parseFloat32(a.Value)
+					case "r":
+						r = parseFloat32(a.Value)
+					case "fill":
+						fillAttr = a.Value
 					}
 				}
-				gb := groupBuilders[gid]
-				if gb == nil {
-					gb = &groupBuilder{}
-					groupBuilders[gid] = gb
-				}
-				gbase := uint32(len(gb.verts))
-				for _, p := range pts {
-					gb.bounds.addPoint(p.x, p.y)
-					vertices = append(vertices, Vertex{
-						X: p.x, Y: p.y,
-						U: 0, V: 0,
-						R: rgba[0], G: rgba[1], B: rgba[2], A: rgba[3],
-					})
-					gb.verts = append(gb.verts, Vertex{
-						X: p.x, Y: p.y,
-						U: 0, V: 0,
-						R: rgba[0], G: rgba[1], B: rgba[2], A: rgba[3],
-					})
-				}
-
-				tris, ok := triangulate(pts)
-				if !ok {
-					// Best effort: fan triangulation (works for convex polygons).
-					for i := 1; i+1 < len(pts); i++ {
-						indices = append(indices, base+0, base+uint32(i), base+uint32(i+1))
-						gb.indices = append(gb.indices, gbase+0, gbase+uint32(i), gbase+uint32(i+1))
-						gb.addTri(pts[0], pts[i], pts[i+1])
-					}
+				if r <= 0 {
 					continue
 				}
-				for i := 0; i+2 < len(tris); i += 3 {
-					i0, i1, i2 := tris[i], tris[i+1], tris[i+2]
-					indices = append(indices, base+i0, base+i1, base+i2)
-					gb.indices = append(gb.indices, gbase+i0, gbase+i1, gbase+i2)
-					gb.addTri(pts[i0], pts[i1], pts[i2])
+				pts := circleToPolygon(cx, cy, r, 24)
+				fill := resolveFill(fillAttr, groupStack, groupFill, groupPolygonFill)
+				addPolygon(&vertices, &indices, groupBuilders, groupStack, pts, fill)
+
+			case "rect":
+				var x, y, w, h, rx, ry float32
+				var fillAttr string
+				for _, a := range t.Attr {
+					switch a.Name.Local {
+					case "x":
+						x = parseFloat32(a.Value)
+					case "y":
+						y = parseFloat32(a.Value)
+					case "width":
+						w = parseFloat32(a.Value)
+					case "height":
+						h = parseFloat32(a.Value)
+					case "rx":
+						rx = parseFloat32(a.Value)
+					case "ry":
+						ry = parseFloat32(a.Value)
+					case "fill":
+						fillAttr = a.Value
+					}
+				}
+				if w <= 0 || h <= 0 {
+					continue
+				}
+				pts := rectToPolygon(x, y, w, h, rx, ry)
+				fill := resolveFill(fillAttr, groupStack, groupFill, groupPolygonFill)
+				addPolygon(&vertices, &indices, groupBuilders, groupStack, pts, fill)
+
+			case "path":
+				var dAttr string
+				var fillAttr string
+				for _, a := range t.Attr {
+					switch a.Name.Local {
+					case "d":
+						dAttr = a.Value
+					case "fill":
+						fillAttr = a.Value
+					}
+				}
+				if dAttr == "" {
+					continue
+				}
+				paths := parsePath(dAttr)
+				fill := resolveFill(fillAttr, groupStack, groupFill, groupPolygonFill)
+				for _, pts := range paths {
+					if len(pts) >= 3 {
+						addPolygon(&vertices, &indices, groupBuilders, groupStack, pts, fill)
+					}
 				}
 			}
 
@@ -535,6 +561,12 @@ func parseFillColor(s string) (color.Color, bool) {
 		return ColorWhite, true
 	case "black":
 		return ColorBlack, true
+	case "none":
+		// Return transparent (no fill)
+		return color.RGBA{0, 0, 0, 0}, true
+	case "currentcolor":
+		// Default to white for currentColor (no inheritance context)
+		return ColorWhite, true
 	}
 
 	// hsl(H, S%, L%)
@@ -552,7 +584,38 @@ func parseFillColor(s string) (color.Color, bool) {
 		return color.RGBA{R: r, G: g, B: b, A: 255}, true
 	}
 
+	// Hex colors: #RGB, #RRGGBB
+	if strings.HasPrefix(s, "#") {
+		hex := s[1:]
+		if len(hex) == 3 {
+			// #RGB -> #RRGGBB
+			r := hexDigit(hex[0])
+			g := hexDigit(hex[1])
+			b := hexDigit(hex[2])
+			return color.RGBA{R: r | (r << 4), G: g | (g << 4), B: b | (b << 4), A: 255}, true
+		}
+		if len(hex) == 6 {
+			r := hexDigit(hex[0])<<4 | hexDigit(hex[1])
+			g := hexDigit(hex[2])<<4 | hexDigit(hex[3])
+			b := hexDigit(hex[4])<<4 | hexDigit(hex[5])
+			return color.RGBA{R: r, G: g, B: b, A: 255}, true
+		}
+	}
+
 	return nil, false
+}
+
+func hexDigit(c byte) uint8 {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0'
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10
+	default:
+		return 0
+	}
 }
 
 func hslToRGB(h, s, l float64) (r, g, b uint8) {
@@ -683,4 +746,586 @@ func pointInTri(p, a, b, c pt) bool {
 	hasNeg := (d1 < 0) || (d2 < 0) || (d3 < 0)
 	hasPos := (d1 > 0) || (d2 > 0) || (d3 > 0)
 	return !(hasNeg && hasPos)
+}
+
+// addPolygon adds a filled polygon to the vertex/index buffers.
+func addPolygon(vertices *[]Vertex, indices *[]uint32, groupBuilders map[string]*groupBuilder, groupStack []string, pts []pt, fill color.Color) {
+	if len(pts) < 3 {
+		return
+	}
+
+	rgba := ColorToFloat32(fill)
+	base := uint32(len(*vertices))
+
+	// Determine nearest group id.
+	gid := ""
+	for i := len(groupStack) - 1; i >= 0; i-- {
+		if groupStack[i] != "" {
+			gid = groupStack[i]
+			break
+		}
+	}
+	gb := groupBuilders[gid]
+	if gb == nil {
+		gb = &groupBuilder{}
+		groupBuilders[gid] = gb
+	}
+	gbase := uint32(len(gb.verts))
+
+	for _, p := range pts {
+		gb.bounds.addPoint(p.x, p.y)
+		*vertices = append(*vertices, Vertex{
+			X: p.x, Y: p.y,
+			U: 0, V: 0,
+			R: rgba[0], G: rgba[1], B: rgba[2], A: rgba[3],
+		})
+		gb.verts = append(gb.verts, Vertex{
+			X: p.x, Y: p.y,
+			U: 0, V: 0,
+			R: rgba[0], G: rgba[1], B: rgba[2], A: rgba[3],
+		})
+	}
+
+	tris, ok := triangulate(pts)
+	if !ok {
+		// Best effort: fan triangulation (works for convex polygons).
+		for i := 1; i+1 < len(pts); i++ {
+			*indices = append(*indices, base+0, base+uint32(i), base+uint32(i+1))
+			gb.indices = append(gb.indices, gbase+0, gbase+uint32(i), gbase+uint32(i+1))
+			gb.addTri(pts[0], pts[i], pts[i+1])
+		}
+		return
+	}
+	for i := 0; i+2 < len(tris); i += 3 {
+		i0, i1, i2 := tris[i], tris[i+1], tris[i+2]
+		*indices = append(*indices, base+i0, base+i1, base+i2)
+		gb.indices = append(gb.indices, gbase+i0, gbase+i1, gbase+i2)
+		gb.addTri(pts[i0], pts[i1], pts[i2])
+	}
+}
+
+// parseFloat32 parses a string as float32.
+func parseFloat32(s string) float32 {
+	v, err := strconv.ParseFloat(strings.TrimSpace(s), 32)
+	if err != nil {
+		return 0
+	}
+	return float32(v)
+}
+
+// circleToPolygon approximates a circle as a polygon.
+func circleToPolygon(cx, cy, r float32, segments int) []pt {
+	pts := make([]pt, segments)
+	for i := 0; i < segments; i++ {
+		angle := 2 * math.Pi * float64(i) / float64(segments)
+		pts[i] = pt{
+			x: cx + r*float32(math.Cos(angle)),
+			y: cy + r*float32(math.Sin(angle)),
+		}
+	}
+	return pts
+}
+
+// rectToPolygon converts a rect to a polygon, with optional rounded corners.
+func rectToPolygon(x, y, w, h, rx, ry float32) []pt {
+	if rx <= 0 && ry <= 0 {
+		// Simple rectangle
+		return []pt{
+			{x, y},
+			{x + w, y},
+			{x + w, y + h},
+			{x, y + h},
+		}
+	}
+
+	// Rounded rectangle
+	if rx <= 0 {
+		rx = ry
+	}
+	if ry <= 0 {
+		ry = rx
+	}
+	// Clamp radii
+	maxRx := w / 2
+	maxRy := h / 2
+	if rx > maxRx {
+		rx = maxRx
+	}
+	if ry > maxRy {
+		ry = maxRy
+	}
+
+	var pts []pt
+	segments := 8 // Segments per corner
+
+	// Top-left corner
+	for i := 0; i <= segments; i++ {
+		angle := math.Pi + float64(i)*math.Pi/2/float64(segments)
+		pts = append(pts, pt{
+			x: x + rx + rx*float32(math.Cos(angle)),
+			y: y + ry + ry*float32(math.Sin(angle)),
+		})
+	}
+
+	// Top-right corner
+	for i := 0; i <= segments; i++ {
+		angle := 1.5*math.Pi + float64(i)*math.Pi/2/float64(segments)
+		pts = append(pts, pt{
+			x: x + w - rx + rx*float32(math.Cos(angle)),
+			y: y + ry + ry*float32(math.Sin(angle)),
+		})
+	}
+
+	// Bottom-right corner
+	for i := 0; i <= segments; i++ {
+		angle := float64(i) * math.Pi / 2 / float64(segments)
+		pts = append(pts, pt{
+			x: x + w - rx + rx*float32(math.Cos(angle)),
+			y: y + h - ry + ry*float32(math.Sin(angle)),
+		})
+	}
+
+	// Bottom-left corner
+	for i := 0; i <= segments; i++ {
+		angle := math.Pi/2 + float64(i)*math.Pi/2/float64(segments)
+		pts = append(pts, pt{
+			x: x + rx + rx*float32(math.Cos(angle)),
+			y: y + h - ry + ry*float32(math.Sin(angle)),
+		})
+	}
+
+	return pts
+}
+
+// parsePath parses an SVG path "d" attribute and returns a list of subpaths as point lists.
+// Supports: M, L, H, V, C, S, Q, T, A, Z (both absolute and relative)
+func parsePath(d string) [][]pt {
+	var paths [][]pt
+	var current []pt
+	var curX, curY float32
+	var startX, startY float32 // Start of current subpath for Z command
+	var lastCtrlX, lastCtrlY float32
+	var lastCmd byte
+
+	tokens := tokenizePath(d)
+	i := 0
+
+	for i < len(tokens) {
+		tok := tokens[i]
+		i++
+
+		if len(tok) == 0 {
+			continue
+		}
+
+		cmd := tok[0]
+		if (cmd >= 'A' && cmd <= 'Z') || (cmd >= 'a' && cmd <= 'z') {
+			// It's a command
+		} else {
+			// No command, repeat the last command
+			i-- // Unread this token
+			cmd = lastCmd
+			// For M, subsequent coordinates are treated as L
+			if cmd == 'M' {
+				cmd = 'L'
+			} else if cmd == 'm' {
+				cmd = 'l'
+			}
+		}
+
+		relative := cmd >= 'a' && cmd <= 'z'
+		cmdUpper := cmd
+		if relative {
+			cmdUpper = cmd - 32
+		}
+
+		switch cmdUpper {
+		case 'M': // moveto
+			if i >= len(tokens) {
+				break
+			}
+			x, y := parseCoordPair(tokens, &i)
+			if relative {
+				x += curX
+				y += curY
+			}
+			// Start new subpath
+			if len(current) > 0 {
+				paths = append(paths, current)
+			}
+			current = []pt{{x, y}}
+			curX, curY = x, y
+			startX, startY = x, y
+			lastCmd = cmd
+
+		case 'L': // lineto
+			for i < len(tokens) && isNumber(tokens[i]) {
+				x, y := parseCoordPair(tokens, &i)
+				if relative {
+					x += curX
+					y += curY
+				}
+				current = append(current, pt{x, y})
+				curX, curY = x, y
+			}
+			lastCmd = cmd
+
+		case 'H': // horizontal lineto
+			for i < len(tokens) && isNumber(tokens[i]) {
+				x := parseFloat32(tokens[i])
+				i++
+				if relative {
+					x += curX
+				}
+				current = append(current, pt{x, curY})
+				curX = x
+			}
+			lastCmd = cmd
+
+		case 'V': // vertical lineto
+			for i < len(tokens) && isNumber(tokens[i]) {
+				y := parseFloat32(tokens[i])
+				i++
+				if relative {
+					y += curY
+				}
+				current = append(current, pt{curX, y})
+				curY = y
+			}
+			lastCmd = cmd
+
+		case 'C': // cubic bezier
+			for i+5 < len(tokens) && isNumber(tokens[i]) {
+				x1, y1 := parseCoordPair(tokens, &i)
+				x2, y2 := parseCoordPair(tokens, &i)
+				x, y := parseCoordPair(tokens, &i)
+				if relative {
+					x1 += curX
+					y1 += curY
+					x2 += curX
+					y2 += curY
+					x += curX
+					y += curY
+				}
+				pts := cubicBezier(curX, curY, x1, y1, x2, y2, x, y, 10)
+				current = append(current, pts[1:]...)
+				curX, curY = x, y
+				lastCtrlX, lastCtrlY = x2, y2
+			}
+			lastCmd = cmd
+
+		case 'S': // smooth cubic bezier
+			for i+3 < len(tokens) && isNumber(tokens[i]) {
+				// First control point is reflection of last control point
+				x1 := 2*curX - lastCtrlX
+				y1 := 2*curY - lastCtrlY
+				x2, y2 := parseCoordPair(tokens, &i)
+				x, y := parseCoordPair(tokens, &i)
+				if relative {
+					x2 += curX
+					y2 += curY
+					x += curX
+					y += curY
+				}
+				pts := cubicBezier(curX, curY, x1, y1, x2, y2, x, y, 10)
+				current = append(current, pts[1:]...)
+				curX, curY = x, y
+				lastCtrlX, lastCtrlY = x2, y2
+			}
+			lastCmd = cmd
+
+		case 'Q': // quadratic bezier
+			for i+3 < len(tokens) && isNumber(tokens[i]) {
+				x1, y1 := parseCoordPair(tokens, &i)
+				x, y := parseCoordPair(tokens, &i)
+				if relative {
+					x1 += curX
+					y1 += curY
+					x += curX
+					y += curY
+				}
+				pts := quadBezier(curX, curY, x1, y1, x, y, 10)
+				current = append(current, pts[1:]...)
+				curX, curY = x, y
+				lastCtrlX, lastCtrlY = x1, y1
+			}
+			lastCmd = cmd
+
+		case 'T': // smooth quadratic bezier
+			for i+1 < len(tokens) && isNumber(tokens[i]) {
+				// Control point is reflection of last control point
+				x1 := 2*curX - lastCtrlX
+				y1 := 2*curY - lastCtrlY
+				x, y := parseCoordPair(tokens, &i)
+				if relative {
+					x += curX
+					y += curY
+				}
+				pts := quadBezier(curX, curY, x1, y1, x, y, 10)
+				current = append(current, pts[1:]...)
+				curX, curY = x, y
+				lastCtrlX, lastCtrlY = x1, y1
+			}
+			lastCmd = cmd
+
+		case 'A': // arc
+			for i+6 < len(tokens) && isNumber(tokens[i]) {
+				rx := parseFloat32(tokens[i])
+				i++
+				ry := parseFloat32(tokens[i])
+				i++
+				xRot := parseFloat32(tokens[i])
+				i++
+				largeArc := parseFloat32(tokens[i]) != 0
+				i++
+				sweep := parseFloat32(tokens[i]) != 0
+				i++
+				x, y := parseCoordPair(tokens, &i)
+				if relative {
+					x += curX
+					y += curY
+				}
+				pts := arcToBezier(curX, curY, rx, ry, xRot, largeArc, sweep, x, y)
+				current = append(current, pts...)
+				curX, curY = x, y
+			}
+			lastCmd = cmd
+
+		case 'Z': // closepath
+			if len(current) > 0 {
+				// Close to the start of the subpath
+				if curX != startX || curY != startY {
+					current = append(current, pt{startX, startY})
+				}
+				paths = append(paths, current)
+				current = nil
+			}
+			curX, curY = startX, startY
+			lastCmd = cmd
+		}
+	}
+
+	if len(current) > 0 {
+		paths = append(paths, current)
+	}
+
+	return paths
+}
+
+// tokenizePath splits a path "d" attribute into tokens.
+func tokenizePath(d string) []string {
+	var tokens []string
+	var current strings.Builder
+
+	flush := func() {
+		if current.Len() > 0 {
+			tokens = append(tokens, current.String())
+			current.Reset()
+		}
+	}
+
+	for i := 0; i < len(d); i++ {
+		c := d[i]
+		switch {
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ',':
+			flush()
+		case (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'):
+			flush()
+			tokens = append(tokens, string(c))
+		case c == '-':
+			// Minus can start a new number or be part of exponent
+			if current.Len() > 0 {
+				lastC := current.String()[current.Len()-1]
+				if lastC != 'e' && lastC != 'E' {
+					flush()
+				}
+			}
+			current.WriteByte(c)
+		case c == '.':
+			// Check if we already have a dot
+			if strings.Contains(current.String(), ".") {
+				flush()
+			}
+			current.WriteByte(c)
+		default:
+			current.WriteByte(c)
+		}
+	}
+	flush()
+
+	return tokens
+}
+
+func isNumber(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	c := s[0]
+	return (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '+'
+}
+
+func parseCoordPair(tokens []string, i *int) (float32, float32) {
+	if *i >= len(tokens) {
+		return 0, 0
+	}
+	x := parseFloat32(tokens[*i])
+	*i++
+	if *i >= len(tokens) {
+		return x, 0
+	}
+	y := parseFloat32(tokens[*i])
+	*i++
+	return x, y
+}
+
+// cubicBezier generates points along a cubic Bezier curve.
+func cubicBezier(x0, y0, x1, y1, x2, y2, x3, y3 float32, segments int) []pt {
+	pts := make([]pt, segments+1)
+	for i := 0; i <= segments; i++ {
+		t := float32(i) / float32(segments)
+		t2 := t * t
+		t3 := t2 * t
+		mt := 1 - t
+		mt2 := mt * mt
+		mt3 := mt2 * mt
+
+		pts[i] = pt{
+			x: mt3*x0 + 3*mt2*t*x1 + 3*mt*t2*x2 + t3*x3,
+			y: mt3*y0 + 3*mt2*t*y1 + 3*mt*t2*y2 + t3*y3,
+		}
+	}
+	return pts
+}
+
+// quadBezier generates points along a quadratic Bezier curve.
+func quadBezier(x0, y0, x1, y1, x2, y2 float32, segments int) []pt {
+	pts := make([]pt, segments+1)
+	for i := 0; i <= segments; i++ {
+		t := float32(i) / float32(segments)
+		mt := 1 - t
+
+		pts[i] = pt{
+			x: mt*mt*x0 + 2*mt*t*x1 + t*t*x2,
+			y: mt*mt*y0 + 2*mt*t*y1 + t*t*y2,
+		}
+	}
+	return pts
+}
+
+// arcToBezier converts an SVG arc to a series of points.
+func arcToBezier(x1, y1, rx, ry, xRot float32, largeArc, sweep bool, x2, y2 float32) []pt {
+	// Handle degenerate cases
+	if rx == 0 || ry == 0 {
+		return []pt{{x2, y2}}
+	}
+	if x1 == x2 && y1 == y2 {
+		return nil
+	}
+
+	// Ensure radii are positive
+	if rx < 0 {
+		rx = -rx
+	}
+	if ry < 0 {
+		ry = -ry
+	}
+
+	// Convert rotation to radians
+	phi := float64(xRot) * math.Pi / 180.0
+	cosPhi := float32(math.Cos(phi))
+	sinPhi := float32(math.Sin(phi))
+
+	// Step 1: Compute (x1', y1')
+	dx := (x1 - x2) / 2
+	dy := (y1 - y2) / 2
+	x1p := cosPhi*dx + sinPhi*dy
+	y1p := -sinPhi*dx + cosPhi*dy
+
+	// Correct radii if needed
+	lambda := (x1p*x1p)/(rx*rx) + (y1p*y1p)/(ry*ry)
+	if lambda > 1 {
+		sqrtLambda := float32(math.Sqrt(float64(lambda)))
+		rx *= sqrtLambda
+		ry *= sqrtLambda
+	}
+
+	// Step 2: Compute (cx', cy')
+	rxSq := rx * rx
+	rySq := ry * ry
+	x1pSq := x1p * x1p
+	y1pSq := y1p * y1p
+
+	denom := rxSq*y1pSq + rySq*x1pSq
+	if denom == 0 {
+		return []pt{{x2, y2}}
+	}
+
+	num := rxSq*rySq - denom
+	if num < 0 {
+		num = 0
+	}
+	sq := float32(math.Sqrt(float64(num / denom)))
+	if largeArc == sweep {
+		sq = -sq
+	}
+
+	cxp := sq * rx * y1p / ry
+	cyp := -sq * ry * x1p / rx
+
+	// Step 3: Compute (cx, cy)
+	cx := cosPhi*cxp - sinPhi*cyp + (x1+x2)/2
+	cy := sinPhi*cxp + cosPhi*cyp + (y1+y2)/2
+
+	// Step 4: Compute angles
+	ux := (x1p - cxp) / rx
+	uy := (y1p - cyp) / ry
+	vx := (-x1p - cxp) / rx
+	vy := (-y1p - cyp) / ry
+
+	theta1 := vectorAngle(1, 0, ux, uy)
+	dTheta := vectorAngle(ux, uy, vx, vy)
+
+	if !sweep && dTheta > 0 {
+		dTheta -= 2 * math.Pi
+	} else if sweep && dTheta < 0 {
+		dTheta += 2 * math.Pi
+	}
+
+	// Generate points along the arc
+	segments := int(math.Ceil(math.Abs(float64(dTheta)) / (math.Pi / 4)))
+	if segments < 1 {
+		segments = 1
+	}
+
+	pts := make([]pt, 0, segments)
+	for i := 1; i <= segments; i++ {
+		t := float64(i) / float64(segments)
+		angle := float64(theta1) + t*float64(dTheta)
+		x := float32(math.Cos(angle))*rx*cosPhi - float32(math.Sin(angle))*ry*sinPhi + cx
+		y := float32(math.Cos(angle))*rx*sinPhi + float32(math.Sin(angle))*ry*cosPhi + cy
+		pts = append(pts, pt{x, y})
+	}
+
+	return pts
+}
+
+func vectorAngle(ux, uy, vx, vy float32) float32 {
+	dot := ux*vx + uy*vy
+	lenU := float32(math.Sqrt(float64(ux*ux + uy*uy)))
+	lenV := float32(math.Sqrt(float64(vx*vx + vy*vy)))
+	if lenU == 0 || lenV == 0 {
+		return 0
+	}
+	cos := dot / (lenU * lenV)
+	if cos < -1 {
+		cos = -1
+	}
+	if cos > 1 {
+		cos = 1
+	}
+	angle := float32(math.Acos(float64(cos)))
+	if ux*vy-uy*vx < 0 {
+		angle = -angle
+	}
+	return angle
 }

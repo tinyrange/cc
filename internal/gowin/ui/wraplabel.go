@@ -184,11 +184,12 @@ func (l *WrapLabel) Draw(ctx *DrawContext) {
 
 	bounds := l.Bounds()
 	y := bounds.Y
+	// Position text using proper font metrics: baseline is at Y + ascender
+	ascender := ctx.Text.Ascender(l.style.TextSize)
 
 	ctx.Text.BeginBatch()
 	for _, line := range l.lines {
-		// Text baseline is at Y + lineHeight * 0.85 (same as Label)
-		ctx.Text.AddText(line, bounds.X, y+l.lineHeight*0.85, l.style.TextSize, l.style.TextColor)
+		ctx.Text.AddText(line, bounds.X, y+ascender, l.style.TextSize, l.style.TextColor)
 		y += l.lineHeight
 	}
 	ctx.Text.EndBatch()

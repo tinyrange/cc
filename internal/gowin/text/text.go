@@ -102,3 +102,42 @@ func (r *Renderer) LineHeight(size float64) float32 {
 	_, _, lineHeight := r.stash.VMetrics(r.font, size)
 	return float32(lineHeight)
 }
+
+// Ascender returns the ascender height (in logical pixels) at the given size.
+// The ascender is the distance from the baseline to the top of the tallest glyph.
+func (r *Renderer) Ascender(size float64) float32 {
+	if r == nil || r.stash == nil {
+		return 0
+	}
+	ascender, _, _ := r.stash.VMetrics(r.font, size)
+	return float32(ascender)
+}
+
+// RenderGradientText renders text with a horizontal color gradient.
+// The stops slice defines color positions along the text (0.0-1.0).
+func (r *Renderer) RenderGradientText(s string, x, y float32, size float64, stops []graphics.ColorStop) float32 {
+	if r == nil || r.stash == nil || len(stops) < 2 {
+		return x
+	}
+
+	// Convert graphics.ColorStop to text.GradientStop
+	textStops := make([]GradientStop, len(stops))
+	for i, stop := range stops {
+		rgba := graphics.ColorToFloat32(stop.Color)
+		textStops[i] = GradientStop{
+			Position: stop.Position,
+			R:        rgba[0],
+			G:        rgba[1],
+			B:        rgba[2],
+			A:        rgba[3],
+		}
+	}
+
+	// Calculate text width for gradient interpolation
+	textWidth := r.stash.GetAdvance(r.font, size, s)
+
+	r.stash.BeginDraw()
+	next := r.stash.DrawTextGradient(r.font, size, float64(x), float64(y), s, textStops, textWidth)
+	r.stash.EndDraw()
+	return float32(next)
+}

@@ -105,7 +105,7 @@ func TestParseComment(t *testing.T) {
 	}
 }
 
-func TestTailwindSpacing(t *testing.T) {
+func TestClassSpacing(t *testing.T) {
 	tests := []struct {
 		class   string
 		padding ui.EdgeInsets
@@ -124,7 +124,7 @@ func TestTailwindSpacing(t *testing.T) {
 	}
 }
 
-func TestTailwindFlex(t *testing.T) {
+func TestClassFlex(t *testing.T) {
 	styles := ParseClasses([]string{"flex", "flex-row", "gap-4", "justify-between", "items-center"})
 
 	if styles.Axis != ui.AxisHorizontal {
@@ -141,7 +141,7 @@ func TestTailwindFlex(t *testing.T) {
 	}
 }
 
-func TestTailwindColors(t *testing.T) {
+func TestClassColors(t *testing.T) {
 	styles := ParseClasses([]string{"bg-accent", "text-primary"})
 
 	if styles.BackgroundColor == nil {
@@ -157,7 +157,7 @@ func TestTailwindColors(t *testing.T) {
 	}
 }
 
-func TestTailwindTextSize(t *testing.T) {
+func TestClassTextSize(t *testing.T) {
 	tests := []struct {
 		class string
 		size  float64
@@ -180,7 +180,7 @@ func TestTailwindTextSize(t *testing.T) {
 	}
 }
 
-func TestTailwindRounded(t *testing.T) {
+func TestClassRounded(t *testing.T) {
 	tests := []struct {
 		class  string
 		radius float32
@@ -200,6 +200,30 @@ func TestTailwindRounded(t *testing.T) {
 		} else if *styles.CornerRadius != tt.radius {
 			t.Errorf("%s: expected radius %v, got %v", tt.class, tt.radius, *styles.CornerRadius)
 		}
+	}
+}
+
+func TestGradientParsing(t *testing.T) {
+	classes := []string{"w-12", "h-12", "rounded-xl", "bg-gradient-to-br", "from-mango-400", "to-mango-600"}
+	styles := ParseClasses(classes)
+
+	if styles.GradientDir != GradientToBottomRight {
+		t.Errorf("expected GradientToBottomRight, got %v", styles.GradientDir)
+	}
+	if styles.GradientFrom == nil {
+		t.Error("GradientFrom is nil")
+	} else {
+		t.Logf("GradientFrom: R=%d G=%d B=%d", styles.GradientFrom.R, styles.GradientFrom.G, styles.GradientFrom.B)
+	}
+	if styles.GradientTo == nil {
+		t.Error("GradientTo is nil")
+	} else {
+		t.Logf("GradientTo: R=%d G=%d B=%d", styles.GradientTo.R, styles.GradientTo.G, styles.GradientTo.B)
+	}
+	if styles.CornerRadius == nil {
+		t.Error("CornerRadius is nil")
+	} else {
+		t.Logf("CornerRadius: %v", *styles.CornerRadius)
 	}
 }
 

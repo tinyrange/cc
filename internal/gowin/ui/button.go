@@ -29,6 +29,10 @@ type ButtonStyle struct {
 	MinWidth           float32
 	MinHeight          float32
 	CornerRadius       float32 // 0 = square corners
+
+	// Gradient background (optional - overrides solid colors when set)
+	GradientStops     []graphics.ColorStop
+	GradientDirection graphics.GradientDirection
 }
 
 // DefaultButtonStyle returns the default button styling.
@@ -60,10 +64,11 @@ type Button struct {
 	textWidth float32
 
 	// Rounded corner rendering
-	gfxWindow    graphics.Window
-	shapeBuilder *graphics.ShapeBuilder
-	lastBounds   Rect
-	lastBgColor  color.Color
+	gfxWindow      graphics.Window
+	shapeBuilder   *graphics.ShapeBuilder
+	lastBounds     Rect
+	lastBgColor    color.Color
+	lastUseGradient bool
 }
 
 // NewButton creates a new button.
@@ -151,7 +156,10 @@ func (b *Button) Draw(ctx *DrawContext) {
 
 	bounds := b.Bounds()
 
-	// Determine background color
+	// Check if using gradient background
+	useGradient := len(b.style.GradientStops) >= 2 && b.enabled && b.state == ButtonStateNormal
+
+	// Determine background color (fallback or for hover/pressed states)
 	var bg color.Color
 	if !b.enabled {
 		bg = b.style.BackgroundDisabled
@@ -167,35 +175,60 @@ func (b *Button) Draw(ctx *DrawContext) {
 	}
 
 	// Draw background
-	if b.style.CornerRadius > 0 && b.gfxWindow != nil {
-		b.drawRoundedBackground(ctx, bounds, bg)
+	// Note: gradient rendering requires the ShapeBuilder, so we use rounded background even
+	// with zero corner radius for gradients. Without gfxWindow we fall back to solid color.
+	if b.gfxWindow != nil && (b.style.CornerRadius > 0 || useGradient) {
+		b.drawRoundedBackground(ctx, bounds, bg, useGradient)
 	} else {
 		ctx.Frame.RenderQuad(bounds.X, bounds.Y, bounds.W, bounds.H, nil, bg)
 	}
 
-	// Draw text centered
+	// Draw text centered using proper font metrics
 	if ctx.Text != nil {
 		textX := bounds.X + (bounds.W-b.textWidth)/2
-		textY := bounds.Y + bounds.H/2 + float32(b.style.TextSize)/3
+		// Vertical centering: (bounds.H - lineHeight)/2 + ascender
+		lineHeight := ctx.Text.LineHeight(b.style.TextSize)
+		ascender := ctx.Text.Ascender(b.style.TextSize)
+		textY := bounds.Y + (bounds.H-lineHeight)/2 + ascender
 		ctx.Text.RenderText(b.text, textX, textY, b.style.TextSize, b.style.TextColor)
 	}
 }
 
-func (b *Button) drawRoundedBackground(ctx *DrawContext, bounds Rect, bg color.Color) {
+func (b *Button) drawRoundedBackground(ctx *DrawContext, bounds Rect, bg color.Color, useGradient bool) {
 	// Create shape builder if needed
 	if b.shapeBuilder == nil {
-		segments := graphics.SegmentsForRadius(b.style.CornerRadius)
+		// Use appropriate segments for corner radius (minimum 8 for smooth corners)
+		radius := b.style.CornerRadius
+		if radius < 1 {
+			radius = 1 // Minimum radius for shape builder
+		}
+		segments := graphics.SegmentsForRadius(radius)
 		var err error
 		b.shapeBuilder, err = graphics.NewShapeBuilder(b.gfxWindow, segments)
 		if err != nil {
+			// Fallback to solid quad (gradient not supported without shape builder)
 			ctx.Frame.RenderQuad(bounds.X, bounds.Y, bounds.W, bounds.H, nil, bg)
 			return
 		}
 	}
 
-	// Update geometry if bounds or color changed
-	if bounds != b.lastBounds || bg != b.lastBgColor {
-		style := graphics.ShapeStyle{FillColor: bg}
+	// Update geometry if bounds, color, or gradient state changed
+	if bounds != b.lastBounds || bg != b.lastBgColor || useGradient != b.lastUseGradient {
+		var style graphics.ShapeStyle
+		if useGradient {
+			// For gradient-only buttons, use first gradient stop as fallback fill
+			fillColor := bg
+			if len(b.style.GradientStops) > 0 {
+				fillColor = b.style.GradientStops[0].Color
+			}
+			style = graphics.ShapeStyle{
+				FillColor:         fillColor,
+				GradientStops:     b.style.GradientStops,
+				GradientDirection: b.style.GradientDirection,
+			}
+		} else {
+			style = graphics.ShapeStyle{FillColor: bg}
+		}
 		b.shapeBuilder.UpdateRoundedRect(
 			bounds.X, bounds.Y, bounds.W, bounds.H,
 			graphics.UniformRadius(b.style.CornerRadius),
@@ -203,6 +236,7 @@ func (b *Button) drawRoundedBackground(ctx *DrawContext, bounds Rect, bg color.C
 		)
 		b.lastBounds = bounds
 		b.lastBgColor = bg
+		b.lastUseGradient = useGradient
 	}
 
 	ctx.Frame.RenderMesh(b.shapeBuilder.Mesh(), graphics.DrawOptions{})

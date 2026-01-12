@@ -167,11 +167,14 @@ func (tb *TabBar) Draw(ctx *DrawContext) {
 			textColor = tb.style.TextColor
 		}
 
-		// Draw tab text (centered in tab area)
+		// Draw tab text (centered in tab area) using proper font metrics
 		if ctx.Text != nil {
 			textWidth := ctx.Text.Advance(tb.style.TextSize, tab)
 			textX := tabX + (tabW-textWidth)/2
-			textY := bounds.Y + bounds.H/2 + float32(tb.style.TextSize)/3
+			// Vertical centering: (bounds.H - lineHeight)/2 + ascender
+			lineHeight := ctx.Text.LineHeight(tb.style.TextSize)
+			ascender := ctx.Text.Ascender(tb.style.TextSize)
+			textY := bounds.Y + (bounds.H-lineHeight)/2 + ascender
 			ctx.Text.RenderText(tab, textX, textY, tb.style.TextSize, textColor)
 		}
 
