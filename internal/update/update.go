@@ -267,6 +267,7 @@ func (c *Checker) doFetchRelease(ctx context.Context) (*ReleaseInfo, error) {
 		if valid {
 			req.Header.Set("Authorization", "Bearer "+token)
 		} else {
+			// Don't log the token value
 			slog.Warn("GITHUB_TOKEN has unrecognized format, not using for authentication")
 		}
 	}

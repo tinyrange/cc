@@ -229,7 +229,13 @@ func (s *OnboardingScreen) onInstall() {
 				return
 			}
 			if launchErr != nil {
-				s.app.showError(fmt.Errorf("failed to launch installed app: %w", launchErr))
+				// Launch failed - clear the cleanup pending so we don't delete working app
+				settings.CleanupPending = ""
+				if err := s.app.settings.Set(settings); err != nil {
+					slog.Warn("failed to clear cleanup pending after launch failure", "error", err)
+				}
+				s.app.showError(fmt.Errorf("installed successfully to %s, but failed to launch\n\nPlease launch manually from the new location", newPath))
+				return
 			}
 			return
 		}

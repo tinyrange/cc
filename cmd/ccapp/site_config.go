@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/tinyrange/cc/internal/update"
 	"gopkg.in/yaml.v3"
@@ -53,11 +54,14 @@ func LoadSiteConfig() SiteConfig {
 		return SiteConfig{}
 	}
 
-	// Security: refuse to load world-writable config files (Unix-only; always 0 on Windows)
-	if info.Mode().Perm()&0002 != 0 {
+	// Security: refuse to load world-writable config files
+	// On Unix: check permission bits
+	// On Windows: this check is insufficient (requires ACL inspection)
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0002 != 0 {
 		slog.Error("site config is world-writable, refusing to load", "path", configPath, "mode", info.Mode())
 		return SiteConfig{}
 	}
+	// TODO: Add Windows ACL check for proper security on Windows
 
 	// Prevent DoS from excessively large config files
 	const maxConfigSize = 1024 * 1024 // 1MB

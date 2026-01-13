@@ -87,7 +87,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          # Generate checksums with explicit filenames (no sed manipulation)
+          # Generate checksums with explicit filenames (preserving full format)
           for file in \
             macos-arm64/CrumbleCracker_darwin_arm64.zip \
             other-platforms/CrumbleCracker_windows_amd64.exe \
@@ -95,8 +95,13 @@ jobs:
             other-platforms/CrumbleCracker_linux_amd64 \
             other-platforms/CrumbleCracker_linux_arm64
           do
-            sha256sum "$file" | awk -v name="$(basename "$file")" '{print $1 "  " name}'
+            if [ -f "$file" ]; then
+              sha256sum "$file" | sed "s|.*/||"
+            else
+              echo "Warning: $file not found" >&2
+            fi
           done > checksums.txt
+          echo "Generated checksums:"
           cat checksums.txt
 
       - name: Create GitHub Release

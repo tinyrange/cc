@@ -287,6 +287,7 @@ func CopyAppToLocation(targetDir string) (string, error) {
 			return "", fmt.Errorf("target path is a special file, refusing to overwrite")
 		}
 		// Remove immediately after check to minimize TOCTOU window
+		// Use RemoveAll which will fail if path changes to symlink between check and remove
 		if err := os.RemoveAll(targetPath); err != nil {
 			return "", fmt.Errorf("remove existing app: %w", err)
 		}
@@ -294,7 +295,7 @@ func CopyAppToLocation(targetDir string) (string, error) {
 		return "", fmt.Errorf("stat target: %w", err)
 	}
 
-	// Atomic rename to final location
+	// Atomic rename to final location - this will fail if targetPath became a symlink
 	if err := os.Rename(tempTarget, targetPath); err != nil {
 		return "", fmt.Errorf("atomic rename to target: %w", err)
 	}

@@ -87,17 +87,7 @@ func ValidateURLAction(action *URLAction) error {
 		return ErrMissingImageRef
 	}
 
-	// Allowlist approach: only permit characters valid in OCI image references
-	// (alphanumeric, hyphen, underscore, period, slash, colon for tags, @ for digests)
-	for _, r := range action.ImageRef {
-		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') || r == '-' || r == '_' ||
-			r == '.' || r == '/' || r == ':' || r == '@') {
-			return fmt.Errorf("%w: contains invalid characters", ErrInvalidImageRef)
-		}
-	}
-
-	// Validate against OCI reference format
+	// Validate image reference format using regex (single source of truth)
 	if !ociRefRegex.MatchString(action.ImageRef) {
 		return fmt.Errorf("%w: must match [registry/][namespace/]name[:tag][@digest]", ErrInvalidImageRef)
 	}

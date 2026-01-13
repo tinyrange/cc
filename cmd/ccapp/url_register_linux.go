@@ -40,19 +40,25 @@ func RegisterURLScheme() error {
 		return fmt.Errorf("create applications directory: %w", err)
 	}
 
-	// Validate executable path to prevent shell injection and broken Exec lines
-	// Desktop file Exec values may be passed through a shell in some implementations
-	// Also reject spaces since we don't quote the path (quoting causes issues with field code expansion)
-	if strings.ContainsAny(exePath, "\"'`$\\ ") {
-		return fmt.Errorf("executable path contains unsafe characters: %s", exePath)
+	// Validate executable path exists and is absolute
+	if !filepath.IsAbs(exePath) {
+		return fmt.Errorf("executable path must be absolute: %s", exePath)
+	}
+	if _, err := os.Stat(exePath); err != nil {
+		return fmt.Errorf("executable not found: %w", err)
+	}
+	// Check for characters that could break the .desktop file format
+	// Reject control characters, null bytes, and double quotes (used for quoting in Exec)
+	if strings.ContainsAny(exePath, "\x00\n\r\"") {
+		return fmt.Errorf("executable path contains invalid characters")
 	}
 
 	// Create .desktop file content
-	// Avoid quoting to prevent issues with field code expansion in some DEs
+	// Quote the path per desktop entry spec to handle spaces
 	content := fmt.Sprintf(`[Desktop Entry]
 Name=CrumbleCracker URL Handler
 Comment=Handle crumblecracker:// URLs
-Exec=%s %%u
+Exec="%s" %%u
 Type=Application
 MimeType=x-scheme-handler/crumblecracker;
 NoDisplay=true

@@ -86,26 +86,25 @@ func install(staging, target string, ui *InstallerUI) error {
 
 func waitForFileDeletable(path string, timeout time.Duration) error {
 	start := time.Now()
-	tempPath := path + ".delete-test"
 	for {
-		// Try to rename the file - this is a reliable test for deletability on Windows
-		if err := os.Rename(path, tempPath); err == nil {
-			// Rename succeeded, move it back (retry a few times if needed)
-			for i := 0; i < 3; i++ {
-				if err := os.Rename(tempPath, path); err == nil {
-					return nil
-				}
-				time.Sleep(100 * time.Millisecond)
-			}
-			// Final attempt with error capture
-			if err := os.Rename(tempPath, path); err != nil {
-				return fmt.Errorf("failed to restore file after deletability test (file is now at %s): %w", tempPath, err)
-			}
+		// Try to open the file with delete access - this is a reliable test for deletability
+		// without actually modifying the file
+		handle, err := syscall.CreateFile(
+			syscall.StringToUTF16Ptr(path),
+			syscall.DELETE,
+			0, // No sharing - ensures exclusive access
+			nil,
+			syscall.OPEN_EXISTING,
+			syscall.FILE_ATTRIBUTE_NORMAL,
+			0,
+		)
+		if err == nil {
+			syscall.CloseHandle(handle)
 			return nil
 		}
 
 		if time.Since(start) > timeout {
-			return fmt.Errorf("timeout waiting for file to become deletable")
+			return fmt.Errorf("timeout waiting for file to become deletable: %w", err)
 		}
 
 		time.Sleep(500 * time.Millisecond)

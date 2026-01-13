@@ -180,7 +180,13 @@ func (d *Downloader) VerifyChecksum(filePath, expectedHash string) error {
 
 	actualHash := strings.ToLower(hex.EncodeToString(h.Sum(nil)))
 	expectedHash = strings.ToLower(expectedHash)
-	if len(actualHash) != len(expectedHash) || subtle.ConstantTimeCompare([]byte(actualHash), []byte(expectedHash)) != 1 {
+
+	// Constant-time comparison to prevent timing attacks
+	// Validate both hashes are exactly 64 chars (SHA256 hex) before comparing
+	if len(actualHash) != 64 || len(expectedHash) != 64 {
+		return fmt.Errorf("invalid checksum format")
+	}
+	if subtle.ConstantTimeCompare([]byte(actualHash), []byte(expectedHash)) != 1 {
 		return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedHash, actualHash)
 	}
 
@@ -295,7 +301,8 @@ func extractZip(zipPath, destDir string) error {
 		fpath = filepath.Clean(fpath)
 
 		// Security check: ensure the path is within destDir after normalization
-		if !strings.HasPrefix(fpath, absDestDir+string(filepath.Separator)) {
+		// This check is kept as defense-in-depth
+		if !strings.HasPrefix(fpath, absDestDir+string(filepath.Separator)) && fpath != absDestDir {
 			return fmt.Errorf("invalid file path (directory traversal attempt): %s", f.Name)
 		}
 

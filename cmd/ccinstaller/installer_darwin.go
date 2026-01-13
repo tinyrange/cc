@@ -55,6 +55,15 @@ func install(staging, target string, ui *InstallerUI) error {
 	ui.setStatus("Removing old version...")
 	ui.setProgress(0.7)
 
+	// TOCTOU mitigation: Use Lstat to detect symlinks before removal
+	if info, err := os.Lstat(target); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			os.RemoveAll(tempTarget)
+			os.RemoveAll(backupPath)
+			return fmt.Errorf("target is a symlink, refusing to remove")
+		}
+	}
+
 	// Atomic swap: remove old, rename new
 	if err := os.RemoveAll(target); err != nil {
 		os.Rename(tempTarget, appBundle) // restore

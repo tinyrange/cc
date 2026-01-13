@@ -393,11 +393,11 @@ func (app *Application) startUpdate() {
 
 		// Fatal error if checksum is not available
 		if app.updateStatus.Checksum == "" {
-			slog.Error("update checksum not available, cannot download")
-			app.showError(fmt.Errorf("update checksum not available, cannot download"))
+			slog.Error("update checksum not available, refusing to download without verification")
+			app.showError(fmt.Errorf("update checksum not available\n\nFor security, updates require checksum verification.\nPlease download manually from: %s", app.updateStatus.ReleaseURL))
 			return
 		}
-		slog.Info("update checksum available, will verify after download", "checksum", app.updateStatus.Checksum[:16]+"...")
+		slog.Info("update checksum available, will verify after download", "checksum", app.updateStatus.Checksum[:min(16, len(app.updateStatus.Checksum))]+"...")
 
 		stagingDir, err := downloader.DownloadToStaging(app.updateStatus.DownloadURL, runtime.GOOS, app.updateStatus.Checksum)
 		if err != nil {
@@ -598,7 +598,7 @@ func (app *Application) Run() error {
 					}
 				} else {
 					slog.Info("cleaned up old app", "path", cleanup)
-					settingsStore.ClearCleanupPending()
+					settingsStore.ClearCleanupPending() // This resets retry count
 				}
 			}
 		}
@@ -665,7 +665,8 @@ func (app *Application) Run() error {
 			// If we're in a state that can handle URLs, process it
 			// Note: mode is only modified on main thread, safe to read here
 			if app.mode == modeLauncher || app.mode == modeOnboarding {
-				app.handlePendingURL()
+				// URL will be handled in main loop
+				slog.Debug("URL will be handled on main thread")
 			}
 		})
 		slog.Info("URL event handler registered")
