@@ -179,6 +179,12 @@ const (
 	exitDialogHeight float32 = 120
 )
 
+// Dialog dimensions - Onboarding
+const (
+	onboardingDialogWidth  float32 = 550
+	onboardingDialogHeight float32 = 480
+)
+
 // Notch dimensions
 const (
 	notchAnimSpeed float32 = 10.0

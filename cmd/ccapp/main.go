@@ -41,6 +41,7 @@ type appMode int
 
 const (
 	modeLauncher appMode = iota
+	modeOnboarding
 	modeLoading
 	modeError
 	modeTerminal
@@ -168,6 +169,12 @@ type Application struct {
 
 	// Recent VMs storage
 	recentVMs *RecentVMsStore
+
+	// Settings storage
+	settings *SettingsStore
+
+	// Onboarding screen
+	onboardingScreen *OnboardingScreen
 
 	// Update checker
 	updateChecker *update.Checker
@@ -522,26 +529,58 @@ func (app *Application) Run() error {
 		slog.Info("loaded recent VMs store", "count", len(recentStore.GetRecent()))
 	}
 
+	// Initialize settings store
+	settingsStore, err := NewSettingsStore()
+	if err != nil {
+		slog.Warn("failed to initialize settings store", "error", err)
+	} else {
+		app.settings = settingsStore
+		slog.Info("loaded settings store", "onboarding_completed", settingsStore.Get().OnboardingCompleted)
+
+		// Handle pending cleanup from previous installation
+		if cleanup := settingsStore.Get().CleanupPending; cleanup != "" {
+			slog.Info("performing pending cleanup", "path", cleanup)
+			if err := update.DeleteApp(cleanup); err != nil {
+				slog.Warn("failed to clean up old app", "path", cleanup, "error", err)
+			} else {
+				slog.Info("cleaned up old app", "path", cleanup)
+			}
+			settingsStore.ClearCleanupPending()
+		}
+	}
+
+	// Load site config (deployment-wide settings from file next to app)
+	siteConfig := LoadSiteConfig()
+
 	// Initialize update checker
 	cacheDir, _ := os.UserCacheDir()
 	app.updateChecker = update.NewChecker(Version, filepath.Join(cacheDir, "ccapp"))
 	app.updateChecker.SetLogger(slog.Default())
 	slog.Info("initialized update checker", "version", Version)
 
-	// Check for updates in background
-	go func() {
-		status := app.updateChecker.Check()
-		if status.Error != nil {
-			slog.Warn("update check failed", "error", status.Error)
-			return
-		}
-		app.updateStatus = &status
-		if status.Available {
-			slog.Info("update available", "current", status.CurrentVersion, "latest", status.LatestVersion)
-		} else {
-			slog.Debug("no update available", "current", status.CurrentVersion)
-		}
-	}()
+	// Check for updates in background (site config overrides user settings)
+	autoUpdateEnabled := app.settings == nil || app.settings.Get().AutoUpdateEnabled
+	if siteConfig.AutoUpdateEnabled != nil {
+		autoUpdateEnabled = *siteConfig.AutoUpdateEnabled
+		slog.Info("site config: auto-update override", "enabled", autoUpdateEnabled)
+	}
+	if autoUpdateEnabled {
+		go func() {
+			status := app.updateChecker.Check()
+			if status.Error != nil {
+				slog.Warn("update check failed", "error", status.Error)
+				return
+			}
+			app.updateStatus = &status
+			if status.Available {
+				slog.Info("update available", "current", status.CurrentVersion, "latest", status.LatestVersion)
+			} else {
+				slog.Debug("no update available", "current", status.CurrentVersion)
+			}
+		}()
+	} else {
+		slog.Info("auto-update check disabled")
+	}
 
 	// Set up dock menu (macOS only)
 	app.updateDockMenu()
@@ -563,6 +602,38 @@ func (app *Application) Run() error {
 		slog.Info("hypervisor opened successfully")
 	}
 
+	// Determine if onboarding should be shown (only if not in error state)
+	if app.mode != modeError {
+		showOnboarding := false
+
+		// Site config can skip onboarding entirely
+		if siteConfig.SkipOnboarding {
+			slog.Info("site config: skipping onboarding")
+			showOnboarding = false
+		} else if app.settings != nil {
+			settings := app.settings.Get()
+			// Show if onboarding not completed
+			if !settings.OnboardingCompleted {
+				showOnboarding = true
+			}
+			// Also show if not in standard location (even if previously completed elsewhere)
+			if !update.IsInStandardLocation() {
+				currentPath, _ := update.GetTargetPath()
+				if settings.InstallPath == "" || settings.InstallPath != currentPath {
+					showOnboarding = true
+				}
+			}
+		} else {
+			// No settings file exists - first run
+			showOnboarding = true
+		}
+
+		if showOnboarding {
+			app.mode = modeOnboarding
+			slog.Info("showing onboarding screen")
+		}
+	}
+
 	// Close hypervisor on exit if it wasn't transferred to a VM
 	defer func() {
 		if app.hypervisor != nil {
@@ -575,6 +646,8 @@ func (app *Application) Run() error {
 		switch app.mode {
 		case modeLauncher:
 			return app.renderLauncher(f)
+		case modeOnboarding:
+			return app.renderOnboarding(f)
 		case modeLoading:
 			return app.renderLoading(f)
 		case modeError:
@@ -656,6 +729,13 @@ func formatHypervisorError(err error) string {
 
 func (app *Application) renderLauncher(f graphics.Frame) error {
 	return app.launcherScreen.Render(f)
+}
+
+func (app *Application) renderOnboarding(f graphics.Frame) error {
+	if app.onboardingScreen == nil {
+		app.onboardingScreen = NewOnboardingScreen(app)
+	}
+	return app.onboardingScreen.Render(f)
 }
 
 func (app *Application) renderLoading(f graphics.Frame) error {
