@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // ErrInstallerLaunched is returned when the installer has been successfully launched.
@@ -400,7 +401,20 @@ func DeleteApp(appPath string) error {
 		return fmt.Errorf("refusing to delete: doesn't look like CrumbleCracker: %s", appPath)
 	}
 
-	return os.RemoveAll(realPath)
+	// Retry deletion a few times in case files are still locked
+	// (e.g., original app still closing file handles)
+	var lastErr error
+	for i := 0; i < 5; i++ {
+		lastErr = os.RemoveAll(realPath)
+		if lastErr == nil {
+			return nil
+		}
+		// Wait before retrying (except on last attempt)
+		if i < 4 {
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+	return lastErr
 }
 
 // isValidAppLocation checks if the path is within an expected app location.

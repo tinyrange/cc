@@ -143,10 +143,10 @@ type Application struct {
 
 	// Boot loading state
 	bootCh         chan bootResult
-	bootStarted    time.Time
-	bootName       string
-	bootProgress   oci.DownloadProgress // Current download progress
-	bootProgressMu sync.Mutex           // Protects bootProgress
+	bootStarted    time.Time            // Protected by bootProgressMu
+	bootName       string               // Protected by bootProgressMu
+	bootProgress   oci.DownloadProgress // Protected by bootProgressMu
+	bootProgressMu sync.Mutex           // Protects bootStarted, bootName, bootProgress
 
 	// Install state (for installing bundles from images/tarballs)
 	installCh         chan installResult
@@ -197,6 +197,7 @@ type Application struct {
 
 	// URL handler state
 	pendingURL       string
+	pendingURLMu     sync.Mutex // Protects pendingURL
 	urlConfirmScreen *URLConfirmScreen
 
 	// Shutdown state
@@ -357,6 +358,10 @@ func (app *Application) forceUpdate() {
 
 // startUpdate initiates the update process
 func (app *Application) startUpdate() {
+	if app.mode == modeUpdating {
+		slog.Warn("update already in progress")
+		return
+	}
 	if app.updateStatus == nil {
 		slog.Warn("startUpdate called but no update status")
 		return
@@ -618,9 +623,19 @@ func (app *Application) Run() error {
 	// Set up URL handler for Apple Events (macOS only)
 	if urlSupport, ok := app.window.PlatformWindow().(window.URLEventSupport); ok {
 		urlSupport.SetURLHandler(func(url string) {
-			slog.Info("received URL via Apple Event", "url", url)
+			// Validate length before storing (handler may be called from another thread)
+			if len(url) > 1024 {
+				slog.Warn("received URL via Apple Event exceeds max length, ignoring")
+				return
+			}
+			slog.Info("received URL via Apple Event")
+
+			app.pendingURLMu.Lock()
 			app.pendingURL = url
+			app.pendingURLMu.Unlock()
+
 			// If we're in a state that can handle URLs, process it
+			// Note: mode is only modified on main thread, safe to read here
 			if app.mode == modeLauncher || app.mode == modeOnboarding {
 				app.handlePendingURL()
 			}
@@ -678,7 +693,10 @@ func (app *Application) Run() error {
 	}
 
 	// Handle pending URL if present (from command line argument)
-	if app.pendingURL != "" && app.mode != modeError {
+	app.pendingURLMu.Lock()
+	hasPendingURL := app.pendingURL != ""
+	app.pendingURLMu.Unlock()
+	if hasPendingURL && app.mode != modeError {
 		app.handlePendingURL()
 	}
 
@@ -957,22 +975,26 @@ func (app *Application) renderURLConfirm(f graphics.Frame) error {
 }
 
 func (app *Application) handlePendingURL() {
-	if app.pendingURL == "" {
+	// Take URL under lock and clear it
+	app.pendingURLMu.Lock()
+	url := app.pendingURL
+	app.pendingURL = ""
+	app.pendingURLMu.Unlock()
+
+	if url == "" {
 		return
 	}
 
-	action, err := ParseCrumbleCrackerURL(app.pendingURL)
+	action, err := ParseCrumbleCrackerURL(url)
 	if err != nil {
-		slog.Error("invalid URL", "url", app.pendingURL, "error", err)
+		slog.Error("invalid URL", "url", url, "error", err)
 		app.showError(fmt.Errorf("invalid URL: %w", err))
-		app.pendingURL = ""
 		return
 	}
 
 	if err := ValidateURLAction(action); err != nil {
-		slog.Error("invalid URL action", "url", app.pendingURL, "error", err)
+		slog.Error("invalid URL action", "url", url, "error", err)
 		app.showError(err)
-		app.pendingURL = ""
 		return
 	}
 
@@ -985,7 +1007,6 @@ func (app *Application) handlePendingURL() {
 		app.mode = modeURLConfirm
 	default:
 		app.showError(fmt.Errorf("unknown action: %s", action.Action))
-		app.pendingURL = ""
 	}
 }
 
@@ -1949,8 +1970,14 @@ func main() {
 
 	// Check for URL argument (passed by OS when handling crumblecracker:// URLs)
 	if len(os.Args) > 1 && strings.HasPrefix(os.Args[1], "crumblecracker://") {
-		app.pendingURL = os.Args[1]
-		slog.Info("pending URL from command line", "url", app.pendingURL)
+		rawURL := os.Args[1]
+		if len(rawURL) > 1024 {
+			slog.Warn("URL from command line exceeds maximum length, ignoring")
+		} else {
+			app.pendingURL = rawURL
+			// Don't log full URL as it may contain sensitive data
+			slog.Info("pending URL from command line received")
+		}
 	}
 
 	if err := app.Run(); err != nil {

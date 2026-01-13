@@ -204,8 +204,35 @@ func (c *Checker) fetchAndCache() UpdateStatus {
 	return status
 }
 
-// fetchLatestRelease fetches the latest release from GitHub.
+// fetchLatestRelease fetches the latest release from GitHub with retry logic.
 func (c *Checker) fetchLatestRelease() (*ReleaseInfo, error) {
+	var lastErr error
+	backoff := 500 * time.Millisecond
+
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(backoff)
+			backoff *= 2 // Exponential backoff
+		}
+
+		release, err := c.doFetchRelease()
+		if err == nil {
+			return release, nil
+		}
+		lastErr = err
+
+		// Don't retry on permanent errors
+		if strings.Contains(err.Error(), "no releases found") {
+			return nil, err
+		}
+		c.logger.Debug("fetch release attempt failed, retrying", "attempt", attempt+1, "error", err)
+	}
+
+	return nil, lastErr
+}
+
+// doFetchRelease performs a single fetch attempt.
+func (c *Checker) doFetchRelease() (*ReleaseInfo, error) {
 	req, err := http.NewRequest("GET", GitHubReleasesAPI, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
@@ -215,12 +242,21 @@ func (c *Checker) fetchLatestRelease() (*ReleaseInfo, error) {
 	req.Header.Set("User-Agent", "CCApp/"+c.currentVersion)
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
+	// Support optional GitHub token for higher rate limits
+	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch release: %w", err)
 	}
 	defer resp.Body.Close()
 
+	// Handle rate limiting gracefully
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == 429 {
+		return nil, fmt.Errorf("rate limited by GitHub API (try again later)")
+	}
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, fmt.Errorf("no releases found (repository may not exist or has no releases)")
 	}

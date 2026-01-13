@@ -71,12 +71,19 @@ func install(staging, target string, ui *InstallerUI) error {
 	ui.setStatus("Verifying signature...")
 	ui.setProgress(0.9)
 
-	// Verify code signature
+	// Verify code signature of the newly installed app
 	if err := verifyCodeSign(target); err != nil {
-		// Restore backup
-		os.RemoveAll(target)
-		os.Rename(backupPath, target)
-		return fmt.Errorf("signature verification failed: %w", err)
+		ui.setStatus("Signature verification failed, rolling back...")
+
+		// Try to restore backup
+		if removeErr := os.RemoveAll(target); removeErr != nil {
+			return fmt.Errorf("signature verification failed (%w) and failed to remove broken install: %v", err, removeErr)
+		}
+		if renameErr := os.Rename(backupPath, target); renameErr != nil {
+			return fmt.Errorf("signature verification failed (%w) and failed to restore backup: %v", err, renameErr)
+		}
+
+		return fmt.Errorf("signature verification failed (restored backup): %w", err)
 	}
 
 	// Remove backup on success

@@ -35,7 +35,7 @@ func RegisterURLScheme() error {
 
 	// Ensure directory exists
 	dir := filepath.Dir(desktopPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create applications directory: %w", err)
 	}
 
@@ -52,7 +52,7 @@ Categories=Utility;
 `, exePath)
 
 	// Write .desktop file
-	if err := os.WriteFile(desktopPath, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(desktopPath, []byte(content), 0o644); err != nil {
 		return fmt.Errorf("write desktop file: %w", err)
 	}
 

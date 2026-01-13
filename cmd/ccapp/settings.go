@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -34,8 +35,15 @@ func NewSettingsStore() (*SettingsStore, error) {
 	store := &SettingsStore{path: storePath}
 
 	if err := store.load(); err != nil && !os.IsNotExist(err) {
-		// If file exists but is corrupted, treat as first run
-		// Log warning but don't fail
+		// File exists but is corrupted - backup and start fresh
+		slog.Warn("settings file corrupted, resetting to defaults", "error", err, "path", storePath)
+
+		// Create backup of corrupted file for investigation
+		backupPath := storePath + ".corrupted." + time.Now().Format("20060102-150405")
+		if copyErr := os.Rename(storePath, backupPath); copyErr == nil {
+			slog.Info("backed up corrupted settings", "backup", backupPath)
+		}
+
 		store.settings = AppSettings{}
 	}
 

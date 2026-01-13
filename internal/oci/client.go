@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -70,7 +71,16 @@ func NewClient(cacheDir string) (*Client, error) {
 		cacheDir: cacheDir,
 		logger:   slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})),
 		client: &http.Client{
-			Timeout: 0, // No timeout for large image downloads
+			Timeout: 0, // No overall timeout for large downloads
+			Transport: &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout:   30 * time.Second, // Connection timeout
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
+				// No IdleConnTimeout - allow large downloads
+			},
 		},
 	}, nil
 }
