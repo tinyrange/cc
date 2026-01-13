@@ -84,7 +84,16 @@ type Cocoa struct {
 	dockMenu         objc.ID
 	dockMenuItems    []DockMenuItem
 	dockMenuCallback DockMenuCallback
+
+	// URL handler for custom URL scheme events (e.g., crumblecracker://)
+	urlHandler func(url string)
 }
+
+// Global URL queue for Apple Events callbacks (accessed from Objective-C runtime)
+var (
+	pendingURLs   []string
+	pendingURLsMu sync.Mutex
+)
 
 var (
 	initOnce sync.Once
@@ -169,6 +178,13 @@ var (
 	selCount                   objc.SEL
 	selObjectAtIndex           objc.SEL
 
+	// NSAppleEventManager selectors (URL handling).
+	selSharedAppleEventManager objc.SEL
+	selSetEventHandler         objc.SEL
+
+	// NSAppleEventDescriptor selectors (URL extraction).
+	selParamDescriptorForKeyword objc.SEL
+	selStringValue               objc.SEL
 )
 
 // Subset of NSEventType values we care about.
@@ -298,6 +314,9 @@ func (c *Cocoa) Poll() bool {
 	// Keep the OpenGL drawable sized correctly across resizes/maximize/fullscreen.
 	c.updateDrawableIfNeeded()
 
+	// Process any pending URL events from Apple Events
+	c.drainPendingURLs()
+
 	return c.running
 }
 
@@ -367,6 +386,10 @@ func (c *Cocoa) bootstrapApp() error {
 
 	c.app = app
 	c.pool = pool
+
+	// Register for URL open events (Apple Events)
+	c.registerURLEventHandler()
+
 	return nil
 }
 
@@ -550,6 +573,13 @@ func loadSelectors() {
 	selCount = objc.RegisterName("count")
 	selObjectAtIndex = objc.RegisterName("objectAtIndex:")
 
+	// NSAppleEventManager (URL handling).
+	selSharedAppleEventManager = objc.RegisterName("sharedAppleEventManager")
+	selSetEventHandler = objc.RegisterName("setEventHandler:andSelector:forEventClass:andEventID:")
+
+	// NSAppleEventDescriptor (URL extraction).
+	selParamDescriptorForKeyword = objc.RegisterName("paramDescriptorForKeyword:")
+	selStringValue = objc.RegisterName("stringValue")
 }
 
 func nsString(v string) objc.ID {
@@ -575,7 +605,13 @@ func nsStringToGo(v objc.ID) string {
 	if n == 0 {
 		return ""
 	}
-	return unsafe.String((*byte)(ptr), n)
+	// Make a copy of the string data since the NSString buffer may be released.
+	// unsafe.String just points to the original memory which can become invalid.
+	b := make([]byte, n)
+	for i := 0; i < n; i++ {
+		b[i] = *(*byte)(unsafe.Add(ptr, i))
+	}
+	return string(b)
 }
 
 // cursorBackingPos returns the mouse in backing (pixel) coordinates.
@@ -720,7 +756,9 @@ func (c *Cocoa) processEvent(ev objc.ID) {
 		chars := objc.Send[objc.ID](ev, selEventCharacters)
 		if s := nsStringToGo(chars); s != "" {
 			c.textInput += s
-			if cocoaKeyEmitsText(key) {
+			// Don't emit TextEvent for keyboard shortcuts (Cmd+key or Ctrl+key)
+			isShortcut := (mods & (ModSuper | ModCtrl)) != 0
+			if cocoaKeyEmitsText(key) && !isShortcut {
 				c.inputEvents = append(c.inputEvents, InputEvent{
 					Type: InputEventText,
 					Text: s,
@@ -1243,5 +1281,148 @@ func (c *Cocoa) ShowOpenPanel(dialogType FileDialogType, allowedExtensions []str
 
 	pathStr := firstURL.Send(selPath)
 	return nsStringToGo(pathStr)
+}
+
+// SetURLHandler implements URLEventSupport interface.
+// It sets a callback to receive URLs opened via custom URL schemes.
+func (c *Cocoa) SetURLHandler(handler func(url string)) {
+	c.urlHandler = handler
+}
+
+// drainPendingURLs processes any URLs queued from Apple Events.
+func (c *Cocoa) drainPendingURLs() {
+	pendingURLsMu.Lock()
+	urls := pendingURLs
+	pendingURLs = nil
+	pendingURLsMu.Unlock()
+
+	for _, url := range urls {
+		if c.urlHandler != nil {
+			c.urlHandler(url)
+		}
+	}
+}
+
+// queuePendingURL adds a URL to the pending queue (called from Apple Event handler).
+func queuePendingURL(url string) {
+	pendingURLsMu.Lock()
+	pendingURLs = append(pendingURLs, url)
+	pendingURLsMu.Unlock()
+}
+
+// Apple Event constants for URL handling.
+const (
+	// kInternetEventClass = 'GURL' = 0x4755524C
+	kInternetEventClass uint32 = 0x4755524C
+	// kAEGetURL = 'GURL' = 0x4755524C
+	kAEGetURL uint32 = 0x4755524C
+	// keyDirectObject = '----' = 0x2D2D2D2D
+	keyDirectObject uint32 = 0x2D2D2D2D
+)
+
+// URL handler class name
+const urlHandlerClassName = "CCURLHandler"
+
+// Global reference to the URL handler class (created once)
+var urlHandlerClass objc.Class
+
+// Global selector for the URL handler method
+var selHandleGetURL objc.SEL
+
+// registerURLEventHandler sets up Apple Event handling for URLs.
+// This creates a custom Objective-C class to receive kAEGetURL events.
+func (c *Cocoa) registerURLEventHandler() {
+	// Only register once
+	if urlHandlerClass != 0 {
+		return
+	}
+
+	// Register the selector for our handler method
+	selHandleGetURL = objc.RegisterName("handleGetURL:withReplyEvent:")
+
+	// Create the handler class using objc.RegisterClass
+	// This is a minimal class that can receive Apple Events
+	var regErr error
+	urlHandlerClass, regErr = objc.RegisterClass(
+		urlHandlerClassName,
+		objc.GetClass("NSObject"),
+		nil, // No ivars
+		nil, // No protocols
+		[]objc.MethodDef{
+			{
+				Cmd: selHandleGetURL,
+				Fn:  handleGetURLEvent,
+			},
+		},
+	)
+
+	if urlHandlerClass == 0 || regErr != nil {
+		if regErr != nil {
+			println("window_darwin: failed to register URL handler class:", regErr.Error())
+		} else {
+			println("window_darwin: failed to register URL handler class: unknown error")
+		}
+		return
+	}
+	println("window_darwin: registered URL handler class")
+
+	// Create an instance of our handler class
+	handler := objc.ID(urlHandlerClass).Send(selAlloc)
+	handler = handler.Send(selInit)
+	if handler == 0 {
+		println("window_darwin: failed to create URL handler instance")
+		return
+	}
+	println("window_darwin: created URL handler instance")
+
+	// Get the shared Apple Event manager
+	aem := objc.ID(objc.GetClass("NSAppleEventManager")).Send(selSharedAppleEventManager)
+	if aem == 0 {
+		println("window_darwin: failed to get NSAppleEventManager")
+		return
+	}
+
+	// Register for kAEGetURL events
+	// setEventHandler:andSelector:forEventClass:andEventID:
+	aem.Send(selSetEventHandler,
+		handler,
+		selHandleGetURL,
+		kInternetEventClass,
+		kAEGetURL,
+	)
+	println("window_darwin: registered for kAEGetURL events")
+}
+
+// handleGetURLEvent is the Objective-C method called when a URL event is received.
+// Signature: - (void)handleGetURL:(NSAppleEventDescriptor *)event withReplyEvent:(NSAppleEventDescriptor *)replyEvent
+// Note: purego requires _cmd (selector) as the second parameter after self
+func handleGetURLEvent(self objc.ID, _cmd objc.SEL, event objc.ID, replyEvent objc.ID) {
+	println("window_darwin: handleGetURLEvent called!")
+	if event == 0 {
+		println("window_darwin: event is nil")
+		return
+	}
+
+	// Get the direct parameter which contains the URL
+	// paramDescriptorForKeyword: takes a keyword (uint32)
+	urlDesc := objc.Send[objc.ID](event, selParamDescriptorForKeyword, keyDirectObject)
+	if urlDesc == 0 {
+		println("window_darwin: urlDesc is nil")
+		return
+	}
+
+	// Get the string value of the URL
+	urlNSString := urlDesc.Send(selStringValue)
+	if urlNSString == 0 {
+		println("window_darwin: urlNSString is nil")
+		return
+	}
+
+	// Convert to Go string and queue it
+	url := nsStringToGo(urlNSString)
+	println("window_darwin: received URL:", url)
+	if url != "" {
+		queuePendingURL(url)
+	}
 }
 

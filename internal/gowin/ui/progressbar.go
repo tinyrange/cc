@@ -128,9 +128,10 @@ func (p *ProgressBar) Draw(ctx *DrawContext) {
 	barY := bounds.Y
 	barH := p.style.Height
 
-	// Draw label if present
+	// Draw label if present using proper font metrics
 	if p.label != "" && ctx.Text != nil {
-		textY := bounds.Y + float32(p.style.TextSize)
+		ascender := ctx.Text.Ascender(p.style.TextSize)
+		textY := bounds.Y + ascender
 		ctx.Text.RenderText(p.label, bounds.X, textY, p.style.TextSize, p.style.TextColor)
 		barY += float32(p.style.TextSize) + 4
 	}
@@ -148,9 +149,10 @@ func (p *ProgressBar) Draw(ctx *DrawContext) {
 		}
 	}
 
-	// Draw percentage if enabled
+	// Draw percentage if enabled using proper font metrics
 	if p.style.ShowPercentage && ctx.Text != nil {
-		percentY := barY + barH + float32(p.style.TextSize) + 4
+		ascender := ctx.Text.Ascender(p.style.TextSize)
+		percentY := barY + barH + 4 + ascender
 		percentText := formatPercent(p.value)
 		ctx.Text.RenderText(percentText, bounds.X, percentY, p.style.TextSize, p.style.TextColor)
 	}

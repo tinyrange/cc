@@ -286,7 +286,6 @@ func run() error {
 				Command:  img.Command(cmd),
 				CPUs:     cpusFlag.v,
 				MemoryMB: memoryFlag.v,
-				Network:  networkFlag.v,
 				Exec:     execFlag.v,
 				Dmesg:    dmesgFlag.v,
 			},
@@ -319,9 +318,6 @@ func run() error {
 		}
 		if !memoryFlag.set && meta.Boot.MemoryMB != 0 {
 			memoryFlag.v = meta.Boot.MemoryMB
-		}
-		if !networkFlag.set {
-			networkFlag.v = meta.Boot.Network
 		}
 		if !execFlag.set {
 			execFlag.v = meta.Boot.Exec
@@ -520,11 +516,17 @@ func run() error {
 	}
 	defer vm.Close()
 
+	// Ensure TERM is set for the container so terminal apps work correctly.
+	env := img.Config.Env
+	if !hasEnvVar(env, "TERM") {
+		env = append(env, "TERM=xterm-256color")
+	}
+
 	// Build and run the container init program
 	prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
 		Arch:          hvArch,
 		Cmd:           execCmd,
-		Env:           img.Config.Env,
+		Env:           env,
 		WorkDir:       workDir,
 		EnableNetwork: networkFlag.v,
 		Exec:          execFlag.v,
@@ -758,6 +760,16 @@ func extractInitialPath(env []string) string {
 		}
 	}
 	return defaultPathEnv
+}
+
+func hasEnvVar(env []string, name string) bool {
+	prefix := name + "="
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasConfigJSON(dir string) bool {

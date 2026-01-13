@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,20 +28,31 @@ import (
 	"github.com/tinyrange/cc/internal/linux/kernel"
 	"github.com/tinyrange/cc/internal/netstack"
 	"github.com/tinyrange/cc/internal/oci"
-	"github.com/tinyrange/cc/internal/starui"
 	termwin "github.com/tinyrange/cc/internal/term"
+	"github.com/tinyrange/cc/internal/update"
 	"github.com/tinyrange/cc/internal/vfs"
 )
+
+// Version is the application version, injected at build time via -ldflags.
+var Version = "dev"
 
 // appMode tracks what the app is currently displaying.
 type appMode int
 
 const (
 	modeLauncher appMode = iota
+	modeOnboarding
 	modeLoading
 	modeError
 	modeTerminal
 	modeCustomVM
+	modeInstalling
+	modeSettings
+	modeDeleteConfirm
+	modeUpdating
+	modeAppSettings
+	modeUpdateConfirm
+	modeURLConfirm
 )
 
 // discoveredBundle holds metadata and path for a discovered bundle.
@@ -55,7 +67,6 @@ type bootPrep struct {
 	// bundle-derived config (with defaults applied)
 	cpus     int
 	memoryMB uint64
-	network  bool
 	dmesg    bool
 	exec     bool
 
@@ -76,6 +87,11 @@ type bootPrep struct {
 type bootResult struct {
 	prep *bootPrep
 	err  error
+}
+
+type installResult struct {
+	bundlePath string
+	err        error
 }
 
 // runningVM holds state for a booted VM.
@@ -104,18 +120,18 @@ type Application struct {
 	logFile string
 
 	// UI screens (widget-based)
-	launcherScreen *LauncherScreen
-	loadingScreen  *LoadingScreen
-	errorScreen    *ErrorScreen
-	terminalScreen *TerminalScreen
-	customVMScreen *CustomVMScreen
+	launcherScreen      *LauncherScreen
+	loadingScreen       *LoadingScreen
+	errorScreen         *ErrorScreen
+	terminalScreen      *TerminalScreen
+	customVMScreen      *CustomVMScreen
+	settingsScreen      *SettingsScreen
+	deleteConfirmScreen *DeleteConfirmScreen
+	appSettingsScreen   *AppSettingsScreen
+	updateConfirmScreen *UpdateConfirmScreen
 
-	// Starlark UI (optional override)
-	starEngine         *starui.Engine
-	starLauncherScreen *starui.StarlarkScreen
-	starLoadingScreen  *starui.StarlarkScreen
-	starErrorScreen    *starui.StarlarkScreen
-	starTerminalScreen *starui.StarlarkScreen
+	// Settings dialog state
+	selectedSettingsIndex int
 
 	// Legacy UI state (for terminal screen which uses termview directly)
 	scrollX       float32
@@ -126,14 +142,22 @@ type Application struct {
 	thumbDragDX   float32
 
 	// Boot loading state
-	bootCh       chan bootResult
-	bootStarted  time.Time
-	bootName     string
-	bootProgress oci.DownloadProgress // Current download progress
-	bootProgressMu sync.Mutex          // Protects bootProgress
+	bootCh         chan bootResult
+	bootStarted    time.Time            // Protected by bootProgressMu
+	bootName       string               // Protected by bootProgressMu
+	bootProgress   oci.DownloadProgress // Protected by bootProgressMu
+	bootProgressMu sync.Mutex           // Protects bootStarted, bootName, bootProgress
+
+	// Install state (for installing bundles from images/tarballs)
+	installCh         chan installResult
+	installStarted    time.Time
+	installName       string
+	installProgress   oci.DownloadProgress
+	installProgressMu sync.Mutex
 
 	// Error state (full-screen)
-	errMsg string
+	errMsg     string
+	fatalError bool // true if error is unrecoverable (e.g., no hypervisor)
 
 	// Discovered bundles
 	bundlesDir string
@@ -142,14 +166,44 @@ type Application struct {
 	// Current mode
 	mode appMode
 
+	// Pre-opened hypervisor (opened at startup, transferred to VM on boot)
+	hypervisor hv.Hypervisor
+
 	// Running VM (when in terminal mode)
 	running *runningVM
 
 	// Recent VMs storage
 	recentVMs *RecentVMsStore
-}
 
-const terminalTopBarH = float32(32)
+	// Settings storage
+	settings *SettingsStore
+
+	// Onboarding screen
+	onboardingScreen *OnboardingScreen
+
+	// Update checker
+	updateChecker *update.Checker
+	updateStatus  *update.UpdateStatus
+
+	// Notch UI state (for VM header)
+	networkDisabled bool // is internet access cut
+	showExitConfirm bool // show shutdown confirmation dialog
+
+	// Exit confirmation dialog shape builders (for rounded corners)
+	dialogBgShape   *graphics.ShapeBuilder
+	confirmBtnShape *graphics.ShapeBuilder
+	cancelBtnShape  *graphics.ShapeBuilder
+	dialogLastBgR   rect // track last dialog background rect for geometry updates
+
+	// URL handler state
+	pendingURL       string
+	pendingURLMu     sync.Mutex // Protects pendingURL
+	urlConfirmScreen *URLConfirmScreen
+
+	// Shutdown state
+	shutdownRequested bool
+	shutdownCode      int
+}
 
 type rect struct {
 	x float32
@@ -269,6 +323,114 @@ func (app *Application) openLogs() {
 	}
 }
 
+func (app *Application) openBundlesDir() {
+	slog.Info("open bundles directory requested", "bundles_dir", app.bundlesDir)
+	if err := openDirectory(app.bundlesDir); err != nil {
+		slog.Error("failed to open bundles directory", "bundles_dir", app.bundlesDir, "error", err)
+	}
+}
+
+// forceUpdate triggers a forced update check and install (for testing)
+func (app *Application) forceUpdate() {
+	slog.Info("force update requested")
+
+	// Force fetch latest release info
+	status := app.updateChecker.ForceUpdate()
+	if status.Error != nil {
+		slog.Error("force update check failed", "error", status.Error)
+		app.showError(fmt.Errorf("update check failed: %w", status.Error))
+		return
+	}
+
+	// Check if we have a download URL
+	if status.DownloadURL == "" {
+		slog.Error("no download URL found for this platform")
+		app.showError(fmt.Errorf("no update available for %s/%s", runtime.GOOS, runtime.GOARCH))
+		return
+	}
+
+	app.updateStatus = &status
+	slog.Info("force update: got release", "version", status.LatestVersion, "url", status.DownloadURL)
+
+	// Start the update process
+	app.startUpdate()
+}
+
+// startUpdate initiates the update process
+func (app *Application) startUpdate() {
+	if app.mode == modeUpdating {
+		slog.Warn("update already in progress")
+		return
+	}
+	if app.updateStatus == nil {
+		slog.Warn("startUpdate called but no update status")
+		return
+	}
+
+	slog.Info("starting update", "version", app.updateStatus.LatestVersion)
+
+	// Show updating screen
+	app.bootProgressMu.Lock()
+	app.bootName = app.updateStatus.LatestVersion
+	app.bootStarted = time.Now()
+	app.bootProgressMu.Unlock()
+	app.loadingScreen = nil // Force rebuild
+	app.mode = modeUpdating
+
+	// Download and install in background
+	go func() {
+		downloader := update.NewDownloader()
+		downloader.SetProgressCallback(func(p update.DownloadProgress) {
+			slog.Debug("update download progress", "current", p.Current, "total", p.Total, "status", p.Status)
+			// Update progress for loading screen
+			app.bootProgressMu.Lock()
+			app.bootProgress = oci.DownloadProgress{
+				Current: p.Current,
+				Total:   p.Total,
+			}
+			app.bootProgressMu.Unlock()
+		})
+
+		// Fatal error if checksum is not available
+		if app.updateStatus.Checksum == "" {
+			slog.Error("update checksum not available, refusing to download without verification")
+			app.showError(fmt.Errorf("update checksum not available\n\nFor security, updates require checksum verification.\nPlease download manually from: %s", app.updateStatus.ReleaseURL))
+			return
+		}
+		slog.Info("update checksum available, will verify after download", "checksum", app.updateStatus.Checksum[:min(16, len(app.updateStatus.Checksum))]+"...")
+
+		stagingDir, err := downloader.DownloadToStaging(app.updateStatus.DownloadURL, runtime.GOOS, app.updateStatus.Checksum)
+		if err != nil {
+			slog.Error("failed to download update", "error", err)
+			app.showError(fmt.Errorf("failed to download update: %w", err))
+			return
+		}
+
+		targetPath, err := update.GetTargetPath()
+		if err != nil {
+			slog.Error("failed to get target path", "error", err)
+			os.RemoveAll(stagingDir)
+			app.showError(fmt.Errorf("failed to get target path: %w", err))
+			return
+		}
+
+		slog.Info("launching installer", "staging", stagingDir, "target", targetPath)
+		err = update.LaunchInstaller(stagingDir, targetPath)
+		if err == update.ErrInstallerLaunched {
+			// Installer launched successfully - request graceful shutdown
+			slog.Info("installer launched, requesting shutdown")
+			app.requestShutdown(0)
+			return
+		}
+		if err != nil {
+			slog.Error("failed to launch installer", "error", err)
+			os.RemoveAll(stagingDir)
+			app.showError(fmt.Errorf("failed to launch installer: %w", err))
+			return
+		}
+	}()
+}
+
 // updateDockMenu updates the dock menu with recent VMs
 func (app *Application) updateDockMenu() {
 	if app.window == nil {
@@ -325,186 +487,18 @@ func (app *Application) handleDockMenuClick(tag int) {
 		recent := app.recentVMs.GetRecent()
 		if index >= 0 && index < len(recent) {
 			vm := recent[index]
-			app.startCustomVM(vm.SourceType, vm.SourcePath, vm.NetworkEnabled)
+			app.startCustomVM(vm.SourceType, vm.SourcePath)
 		}
 	}
 }
 
-// getBundlesDir returns the path to the bundles directory next to the app.
+// getBundlesDir returns the path to the bundles directory in the user's config directory.
 func getBundlesDir() string {
-	exe, err := os.Executable()
+	configDir, err := os.UserConfigDir()
 	if err != nil {
 		return ""
 	}
-	exe, err = filepath.EvalSymlinks(exe)
-	if err != nil {
-		return ""
-	}
-	dir := filepath.Dir(exe)
-
-	// On macOS, if we're inside a .app bundle, go up to the bundle's parent.
-	if runtime.GOOS == "darwin" {
-		// e.g. /path/to/Foo.app/Contents/MacOS/ccapp → /path/to/bundles
-		for range 3 {
-			parent := filepath.Dir(dir)
-			if filepath.Ext(parent) == ".app" || filepath.Base(parent) == "Contents" || filepath.Base(parent) == "MacOS" {
-				dir = filepath.Dir(parent)
-			} else {
-				break
-			}
-		}
-
-		// if we're still in a .app bundle, go up to the parent
-		if filepath.Ext(dir) == ".app" {
-			dir = filepath.Dir(dir)
-		}
-	}
-
-	return filepath.Join(dir, "bundles")
-}
-
-// loadStarlarkUI attempts to load custom UI from app.star in the bundles directory.
-func (app *Application) loadStarlarkUI() error {
-	appStarPath := starui.FindAppStar(app.bundlesDir)
-	if appStarPath == "" {
-		return fmt.Errorf("app.star not found in %s", app.bundlesDir)
-	}
-
-	engine := starui.NewEngine()
-	if err := engine.LoadScript(appStarPath); err != nil {
-		return fmt.Errorf("failed to load app.star: %w", err)
-	}
-
-	app.starEngine = engine
-	return nil
-}
-
-// updateStarlarkContext updates the Starlark context with current app state.
-func (app *Application) updateStarlarkContext() {
-	if app.starEngine == nil {
-		return
-	}
-
-	bundles := make([]starui.BundleInfo, len(app.bundles))
-	for i, b := range app.bundles {
-		name := b.Meta.Name
-		if name == "" || name == "{{name}}" {
-			name = filepath.Base(b.Dir)
-		}
-		desc := b.Meta.Description
-		if desc == "" || desc == "{{description}}" {
-			desc = "VM Bundle"
-		}
-		bundles[i] = starui.BundleInfo{
-			Index:       i,
-			Name:        name,
-			Description: desc,
-			Dir:         b.Dir,
-		}
-	}
-
-	ctx := &starui.AppContext{
-		AppTitle:   "CrumbleCracker",
-		BundlesDir: app.bundlesDir,
-		Bundles:    bundles,
-		Logo:       app.logo,
-		Text:       app.text,
-		ErrorMessage: app.errMsg,
-		BootName:     app.bootName,
-		OnOpenLogs: func() {
-			app.openLogs()
-		},
-		OnSelectBundle: func(index int) {
-			app.selectedIndex = index
-			app.startBootBundle(index)
-		},
-		OnStopVM: func() {
-			app.stopVM()
-		},
-		OnBack: func() {
-			app.errMsg = ""
-			app.selectedIndex = -1
-			app.mode = modeLauncher
-		},
-	}
-
-	app.starEngine.SetContext(ctx)
-}
-
-// checkStarlarkReload checks if the Starlark script has been modified and reloads if needed.
-func (app *Application) checkStarlarkReload() {
-	if app.starEngine == nil {
-		return
-	}
-
-	if app.starEngine.CheckReload() {
-		// Script was reloaded, clear all cached screens so they get rebuilt
-		app.starLauncherScreen = nil
-		app.starLoadingScreen = nil
-		app.starErrorScreen = nil
-		app.starTerminalScreen = nil
-	}
-}
-
-// renderStarlarkLauncher renders the launcher screen using Starlark.
-func (app *Application) renderStarlarkLauncher(f graphics.Frame) error {
-	app.checkStarlarkReload()
-	app.updateStarlarkContext()
-
-	// Create or rebuild the screen
-	if app.starLauncherScreen == nil {
-		screen, err := starui.NewStarlarkScreen(app.starEngine, "launcher", app.text)
-		if err != nil {
-			slog.Warn("failed to render Starlark launcher screen, falling back to built-in", "error", err)
-			return app.launcherScreen.Render(f)
-		}
-		screen.SetStartTime(app.start)
-		app.starLauncherScreen = screen
-	}
-
-	return app.starLauncherScreen.Render(f, app.window.PlatformWindow())
-}
-
-// renderStarlarkLoading renders the loading screen using Starlark.
-func (app *Application) renderStarlarkLoading(f graphics.Frame) error {
-	app.checkStarlarkReload()
-	app.updateStarlarkContext()
-
-	// Create or rebuild the screen
-	if app.starLoadingScreen == nil {
-		screen, err := starui.NewStarlarkScreen(app.starEngine, "loading", app.text)
-		if err != nil {
-			slog.Warn("failed to render Starlark loading screen, falling back to built-in", "error", err)
-			if app.loadingScreen == nil {
-				app.loadingScreen = NewLoadingScreen(app)
-			}
-			return app.loadingScreen.Render(f)
-		}
-		screen.SetStartTime(app.bootStarted)
-		app.starLoadingScreen = screen
-	}
-
-	return app.starLoadingScreen.Render(f, app.window.PlatformWindow())
-}
-
-// renderStarlarkError renders the error screen using Starlark.
-func (app *Application) renderStarlarkError(f graphics.Frame) error {
-	app.checkStarlarkReload()
-	app.updateStarlarkContext()
-
-	// Always rebuild error screen since error message may have changed
-	screen, err := starui.NewStarlarkScreen(app.starEngine, "error", app.text)
-	if err != nil {
-		slog.Warn("failed to render Starlark error screen, falling back to built-in", "error", err)
-		if app.errorScreen == nil {
-			app.errorScreen = NewErrorScreen(app)
-		}
-		return app.errorScreen.Render(f)
-	}
-	screen.SetStartTime(app.start)
-	app.starErrorScreen = screen
-
-	return app.starErrorScreen.Render(f, app.window.PlatformWindow())
+	return filepath.Join(configDir, "ccapp", "bundles")
 }
 
 func (app *Application) Run() error {
@@ -529,7 +523,7 @@ func (app *Application) Run() error {
 	}
 
 	app.window.SetClear(true)
-	app.window.SetClearColor(color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 255}) // Tokyo Night background
+	app.window.SetClearColor(colorBackground) // Tokyo Night background
 
 	// Initialize blur effect for dialog overlays
 	blurEffect, err := app.window.NewBlurEffect()
@@ -546,6 +540,14 @@ func (app *Application) Run() error {
 	// Discover bundles
 	bundlesDir := getBundlesDir()
 	app.bundlesDir = bundlesDir
+
+	// Ensure bundles directory exists
+	if bundlesDir != "" {
+		if err := os.MkdirAll(bundlesDir, 0o755); err != nil {
+			slog.Warn("failed to create bundles directory", "dir", bundlesDir, "error", err)
+		}
+	}
+
 	app.bundles, err = discoverBundles(bundlesDir)
 	if err != nil {
 		slog.Warn("failed to discover bundles", "error", err)
@@ -561,24 +563,200 @@ func (app *Application) Run() error {
 		slog.Info("loaded recent VMs store", "count", len(recentStore.GetRecent()))
 	}
 
+	// Initialize settings store
+	settingsStore, err := NewSettingsStore()
+	if err != nil {
+		slog.Warn("failed to initialize settings store", "error", err)
+	} else {
+		app.settings = settingsStore
+		slog.Info("loaded settings store", "onboarding_completed", settingsStore.Get().OnboardingCompleted)
+
+		// Handle pending cleanup from previous installation
+		if cleanup := settingsStore.Get().CleanupPending; cleanup != "" {
+			const maxCleanupRetries = 5
+
+			// Validate cleanup path before deletion to prevent TOCTOU attacks
+			if err := update.ValidateCleanupPath(cleanup); err != nil {
+				slog.Warn("cleanup path validation failed, skipping cleanup", "path", cleanup, "error", err)
+				settingsStore.ClearCleanupPending()
+			} else {
+				slog.Info("performing pending cleanup", "path", cleanup)
+				if err := update.DeleteApp(cleanup); err != nil {
+					// Only clear pending on permanent errors; retry transient failures next launch
+					if os.IsPermission(err) || os.IsNotExist(err) {
+						slog.Warn("cleanup failed with permanent error, giving up", "path", cleanup, "error", err)
+						settingsStore.ClearCleanupPending()
+					} else {
+						// Increment retry count; give up after max retries
+						retryCount, _ := settingsStore.IncrementCleanupRetryCount()
+						if retryCount >= maxCleanupRetries {
+							slog.Warn("cleanup failed after max retries, giving up", "path", cleanup, "retries", retryCount, "error", err)
+							settingsStore.ClearCleanupPending()
+						} else {
+							slog.Warn("cleanup failed, will retry next launch", "path", cleanup, "retry", retryCount, "error", err)
+						}
+					}
+				} else {
+					slog.Info("cleaned up old app", "path", cleanup)
+					settingsStore.ClearCleanupPending() // This resets retry count
+				}
+			}
+		}
+	}
+
+	// Load site config (deployment-wide settings from file next to app)
+	siteConfig := LoadSiteConfig()
+
+	// Initialize update checker
+	cacheDir, _ := os.UserCacheDir()
+	app.updateChecker = update.NewChecker(Version, filepath.Join(cacheDir, "ccapp"))
+	app.updateChecker.SetLogger(slog.Default())
+	slog.Info("initialized update checker", "version", Version)
+
+	// Check for updates in background (site config overrides user settings)
+	autoUpdateEnabled := app.settings == nil || app.settings.Get().AutoUpdateEnabled
+	if siteConfig.AutoUpdateEnabled != nil {
+		autoUpdateEnabled = *siteConfig.AutoUpdateEnabled
+		slog.Info("site config: auto-update override", "enabled", autoUpdateEnabled)
+	}
+	if autoUpdateEnabled {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			status := app.updateChecker.CheckWithContext(ctx)
+			if status.Error != nil {
+				slog.Warn("update check failed", "error", status.Error)
+				return
+			}
+			app.updateStatus = &status
+			if status.Available {
+				slog.Info("update available", "current", status.CurrentVersion, "latest", status.LatestVersion)
+			} else {
+				slog.Debug("no update available", "current", status.CurrentVersion)
+			}
+		}()
+	} else {
+		slog.Info("auto-update check disabled")
+	}
+
 	// Set up dock menu (macOS only)
 	app.updateDockMenu()
 
-	// Try to load app.star for custom UI
-	if err := app.loadStarlarkUI(); err != nil {
-		slog.Info("using built-in UI", "reason", err)
-	} else {
-		slog.Info("loaded custom Starlark UI from app.star")
+	// Set up URL handler for Apple Events (macOS only)
+	if urlSupport, ok := app.window.PlatformWindow().(window.URLEventSupport); ok {
+		urlSupport.SetURLHandler(func(url string) {
+			// Validate length before storing (handler may be called from another thread)
+			if len(url) > 1024 {
+				slog.Warn("received URL via Apple Event exceeds max length, ignoring", "length", len(url))
+				return
+			}
+			// Validate URL format before storing to avoid keeping malformed URLs in memory
+			if _, err := ParseCrumbleCrackerURL(url); err != nil {
+				slog.Warn("received invalid URL via Apple Event, ignoring", "error", err)
+				return
+			}
+			slog.Info("received valid URL via Apple Event")
+
+			app.pendingURLMu.Lock()
+			app.pendingURL = url
+			app.pendingURLMu.Unlock()
+
+			// If we're in a state that can handle URLs, process it
+			// Note: mode is only modified on main thread, safe to read here
+			if app.mode == modeLauncher || app.mode == modeOnboarding {
+				// URL will be handled in main loop
+				slog.Debug("URL will be handled on main thread")
+			}
+		})
+		slog.Info("URL event handler registered")
 	}
 
-	// Initialize built-in UI screens (used as fallback or if no Starlark UI)
+	// Initialize built-in UI screens
 	app.launcherScreen = NewLauncherScreen(app)
 	app.terminalScreen = NewTerminalScreen(app)
 
-	return app.window.Loop(func(f graphics.Frame) error {
+	// Open hypervisor at startup to check availability
+	slog.Info("opening hypervisor")
+	h, hvErr := factory.Open()
+	if hvErr != nil {
+		slog.Error("hypervisor unavailable at startup", "error", hvErr)
+		app.errMsg = formatHypervisorError(hvErr)
+		app.fatalError = true
+		app.mode = modeError
+	} else {
+		app.hypervisor = h
+		slog.Info("hypervisor opened successfully")
+	}
+
+	// Determine if onboarding should be shown (only if not in error state)
+	if app.mode != modeError {
+		showOnboarding := false
+
+		// Site config can skip onboarding entirely
+		if siteConfig.SkipOnboarding {
+			slog.Info("site config: skipping onboarding")
+			showOnboarding = false
+		} else if app.settings != nil {
+			settings := app.settings.Get()
+			// Show if onboarding not completed
+			if !settings.OnboardingCompleted {
+				showOnboarding = true
+			}
+			// Also show if not in standard location (even if previously completed elsewhere)
+			if !update.IsInStandardLocation() {
+				currentPath, _ := update.GetTargetPath()
+				if settings.InstallPath == "" || settings.InstallPath != currentPath {
+					showOnboarding = true
+				}
+			}
+		} else {
+			// No settings file exists - first run
+			showOnboarding = true
+		}
+
+		if showOnboarding {
+			app.mode = modeOnboarding
+			slog.Info("showing onboarding screen")
+		}
+	}
+
+	// Handle pending URL if present (from command line argument)
+	app.pendingURLMu.Lock()
+	hasPendingURL := app.pendingURL != ""
+	app.pendingURLMu.Unlock()
+	if hasPendingURL && app.mode != modeError {
+		app.handlePendingURL()
+	}
+
+	// Close hypervisor on exit if it wasn't transferred to a VM
+	defer func() {
+		if app.hypervisor != nil {
+			app.hypervisor.Close()
+			app.hypervisor = nil
+		}
+	}()
+
+	// Stop running VM on exit
+	defer func() {
+		if app.running != nil {
+			slog.Info("stopping VM on shutdown")
+			app.stopVM()
+		}
+	}()
+
+	err = app.window.Loop(func(f graphics.Frame) error {
+		// Check for shutdown request
+		if app.shutdownRequested {
+			slog.Info("shutdown requested, exiting main loop", "code", app.shutdownCode)
+			return fmt.Errorf("shutdown requested")
+		}
+
 		switch app.mode {
 		case modeLauncher:
 			return app.renderLauncher(f)
+		case modeOnboarding:
+			return app.renderOnboarding(f)
 		case modeLoading:
 			return app.renderLoading(f)
 		case modeError:
@@ -587,10 +765,32 @@ func (app *Application) Run() error {
 			return app.renderTerminal(f)
 		case modeCustomVM:
 			return app.renderCustomVM(f)
+		case modeInstalling:
+			return app.renderInstalling(f)
+		case modeSettings:
+			return app.renderSettings(f)
+		case modeDeleteConfirm:
+			return app.renderDeleteConfirm(f)
+		case modeUpdating:
+			return app.renderLoading(f)
+		case modeAppSettings:
+			return app.renderAppSettings(f)
+		case modeUpdateConfirm:
+			return app.renderUpdateConfirm(f)
+		case modeURLConfirm:
+			return app.renderURLConfirm(f)
 		default:
 			return nil
 		}
 	})
+
+	// If shutdown was requested, exit with the requested code (after defers run)
+	if app.shutdownRequested {
+		slog.Info("exiting after shutdown cleanup", "code", app.shutdownCode)
+		os.Exit(app.shutdownCode)
+	}
+
+	return err
 }
 
 func (app *Application) showError(err error) {
@@ -601,12 +801,71 @@ func (app *Application) showError(err error) {
 	app.mode = modeError
 }
 
-func (app *Application) renderLauncher(f graphics.Frame) error {
-	// Use Starlark UI if available
-	if app.starEngine != nil && app.starEngine.HasScreen("launcher") {
-		return app.renderStarlarkLauncher(f)
+// requestShutdown requests a graceful shutdown of the application.
+// The main loop will check this and perform cleanup before exiting.
+func (app *Application) requestShutdown(code int) {
+	app.shutdownRequested = true
+	app.shutdownCode = code
+}
+
+// formatHypervisorError returns a user-friendly error message for hypervisor failures.
+func formatHypervisorError(err error) string {
+	errStr := err.Error()
+
+	// Linux KVM errors
+	if strings.Contains(errStr, "/dev/kvm") {
+		if strings.Contains(errStr, "permission denied") {
+			return "Cannot access /dev/kvm: permission denied.\n\n" +
+				"Add your user to the 'kvm' group:\n" +
+				"  sudo usermod -aG kvm $USER\n\n" +
+				"Then log out and log back in."
+		}
+		if strings.Contains(errStr, "no such file or directory") {
+			return "KVM is not available (/dev/kvm not found).\n\n" +
+				"Possible solutions:\n" +
+				"  1. Enable virtualization (VT-x/AMD-V) in your BIOS/UEFI settings\n" +
+				"  2. Install KVM: sudo apt install qemu-kvm (Debian/Ubuntu)\n" +
+				"  3. Load the KVM module: sudo modprobe kvm"
+		}
 	}
+
+	// macOS HVF errors
+	if strings.Contains(errStr, "Hypervisor.framework") {
+		return "Cannot load macOS Hypervisor.framework.\n\n" +
+			"This may happen if:\n" +
+			"  1. Virtualization is disabled in your Mac's security settings\n" +
+			"  2. The app is not properly signed\n" +
+			"  3. Your Mac doesn't support the Hypervisor framework"
+	}
+
+	// Windows WHP errors
+	if strings.Contains(errStr, "hypervisor not present") || strings.Contains(errStr, "whp:") {
+		return "Windows Hypervisor Platform is not available.\n\n" +
+			"To enable it:\n" +
+			"  1. Open 'Turn Windows features on or off'\n" +
+			"  2. Enable 'Windows Hypervisor Platform'\n" +
+			"  3. Restart your computer"
+	}
+
+	// Unsupported platform
+	if strings.Contains(errStr, "unsupported") {
+		return "Hypervisor is not supported on this platform.\n\n" +
+			"Virtualization may not be available on your hardware or operating system."
+	}
+
+	// Generic fallback
+	return fmt.Sprintf("Failed to initialize hypervisor: %s\n\nVMs cannot be started.", errStr)
+}
+
+func (app *Application) renderLauncher(f graphics.Frame) error {
 	return app.launcherScreen.Render(f)
+}
+
+func (app *Application) renderOnboarding(f graphics.Frame) error {
+	if app.onboardingScreen == nil {
+		app.onboardingScreen = NewOnboardingScreen(app)
+	}
+	return app.onboardingScreen.Render(f)
 }
 
 func (app *Application) renderLoading(f graphics.Frame) error {
@@ -633,11 +892,6 @@ func (app *Application) renderLoading(f graphics.Frame) error {
 		}
 	}
 
-	// Use Starlark UI if available
-	if app.starEngine != nil && app.starEngine.HasScreen("loading") {
-		return app.renderStarlarkLoading(f)
-	}
-
 	// Create or use cached loading screen
 	if app.loadingScreen == nil {
 		app.loadingScreen = NewLoadingScreen(app)
@@ -646,11 +900,6 @@ func (app *Application) renderLoading(f graphics.Frame) error {
 }
 
 func (app *Application) renderError(f graphics.Frame) error {
-	// Use Starlark UI if available
-	if app.starEngine != nil && app.starEngine.HasScreen("error") {
-		return app.renderStarlarkError(f)
-	}
-
 	// Create or use cached error screen (rebuild if error message changed)
 	if app.errorScreen == nil {
 		app.errorScreen = NewErrorScreen(app)
@@ -671,6 +920,170 @@ func (app *Application) renderCustomVM(f graphics.Frame) error {
 	return app.customVMScreen.Render(f)
 }
 
+func (app *Application) renderSettings(f graphics.Frame) error {
+	if app.settingsScreen == nil {
+		app.settingsScreen = NewSettingsScreen(app, app.selectedSettingsIndex)
+	}
+
+	// Render launcher as background
+	app.launcherScreen.RenderBackground(f)
+
+	// Render the settings dialog on top
+	return app.settingsScreen.Render(f)
+}
+
+func (app *Application) renderAppSettings(f graphics.Frame) error {
+	if app.appSettingsScreen == nil {
+		app.appSettingsScreen = NewAppSettingsScreen(app)
+	}
+
+	// Render launcher as background
+	app.launcherScreen.RenderBackground(f)
+
+	// Render the app settings dialog on top
+	return app.appSettingsScreen.Render(f)
+}
+
+func (app *Application) showAppSettings() {
+	app.appSettingsScreen = nil // Force rebuild to get fresh settings
+	app.mode = modeAppSettings
+}
+
+func (app *Application) renderDeleteConfirm(f graphics.Frame) error {
+	if app.deleteConfirmScreen == nil {
+		app.deleteConfirmScreen = NewDeleteConfirmScreen(app, app.selectedSettingsIndex)
+	}
+
+	// Render launcher as background
+	app.launcherScreen.RenderBackground(f)
+
+	// Render the delete confirmation dialog on top
+	return app.deleteConfirmScreen.Render(f)
+}
+
+func (app *Application) renderUpdateConfirm(f graphics.Frame) error {
+	if app.updateConfirmScreen == nil {
+		// Should not happen - screen must be created with status
+		return nil
+	}
+
+	// Render launcher as background
+	app.launcherScreen.RenderBackground(f)
+
+	// Render the update confirmation dialog on top
+	return app.updateConfirmScreen.Render(f)
+}
+
+func (app *Application) showUpdateConfirm(status *update.UpdateStatus) {
+	app.updateConfirmScreen = NewUpdateConfirmScreen(app, status)
+	app.mode = modeUpdateConfirm
+}
+
+func (app *Application) showSettings(bundleIndex int) {
+	app.selectedSettingsIndex = bundleIndex
+	app.settingsScreen = nil // Force rebuild with new bundle
+	app.mode = modeSettings
+}
+
+func (app *Application) showDeleteConfirm(bundleIndex int) {
+	app.selectedSettingsIndex = bundleIndex
+	app.deleteConfirmScreen = nil // Force rebuild
+	app.mode = modeDeleteConfirm
+}
+
+func (app *Application) renderURLConfirm(f graphics.Frame) error {
+	if app.urlConfirmScreen == nil {
+		return nil
+	}
+
+	// Render launcher as background
+	app.launcherScreen.RenderBackground(f)
+
+	// Render the URL confirmation dialog on top
+	return app.urlConfirmScreen.Render(f)
+}
+
+func (app *Application) handlePendingURL() {
+	// Take URL under lock and clear it
+	app.pendingURLMu.Lock()
+	url := app.pendingURL
+	app.pendingURL = ""
+	app.pendingURLMu.Unlock()
+
+	if url == "" {
+		return
+	}
+
+	action, err := ParseCrumbleCrackerURL(url)
+	if err != nil {
+		slog.Error("invalid URL", "url", url, "error", err)
+		app.showError(fmt.Errorf("invalid URL: %w", err))
+		return
+	}
+
+	if err := ValidateURLAction(action); err != nil {
+		slog.Error("invalid URL action", "url", url, "error", err)
+		app.showError(err)
+		return
+	}
+
+	slog.Info("handling URL", "action", action.Action, "image", action.ImageRef)
+
+	switch action.Action {
+	case "run":
+		// Show confirmation dialog
+		app.urlConfirmScreen = NewURLConfirmScreen(app, action.ImageRef)
+		app.mode = modeURLConfirm
+	default:
+		app.showError(fmt.Errorf("unknown action: %s", action.Action))
+	}
+}
+
+func (app *Application) refreshBundles() {
+	bundles, err := discoverBundles(app.bundlesDir)
+	if err != nil {
+		slog.Warn("failed to refresh bundles", "error", err)
+	} else {
+		app.bundles = bundles
+	}
+	// Rebuild launcher screen to show updated bundles
+	app.launcherScreen = NewLauncherScreen(app)
+}
+
+func (app *Application) renderInstalling(f graphics.Frame) error {
+	// Check for installation completion
+	if app.installCh != nil {
+		select {
+		case res := <-app.installCh:
+			app.installCh = nil
+			if res.err != nil {
+				slog.Error("failed to install bundle", "error", res.err)
+				app.showError(res.err)
+				return nil
+			}
+			// Refresh bundles list
+			bundles, err := discoverBundles(app.bundlesDir)
+			if err != nil {
+				slog.Warn("failed to refresh bundles", "error", err)
+			} else {
+				app.bundles = bundles
+			}
+			// Rebuild launcher screen to show new bundle
+			app.launcherScreen = NewLauncherScreen(app)
+			app.mode = modeLauncher
+			slog.Info("bundle installed successfully", "path", res.bundlePath)
+			return nil
+		default:
+		}
+	}
+
+	// Reuse loading screen UI for installation progress
+	if app.loadingScreen == nil {
+		app.loadingScreen = NewLoadingScreen(app)
+	}
+	return app.loadingScreen.Render(f)
+}
+
 func (app *Application) renderTerminal(f graphics.Frame) error {
 	if app.running == nil || app.running.termView == nil {
 		app.mode = modeLauncher
@@ -681,55 +1094,106 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 	app.text.SetViewport(int32(w), int32(h))
 	winW := float32(w)
 
-	// Tokyo Night theme colors
-	topBarColor := color.RGBA{R: 0x16, G: 0x16, B: 0x1e, A: 255}    // #16161e
-	btnNormal := color.RGBA{R: 0x24, G: 0x28, B: 0x3b, A: 255}      // #24283b
-	btnHover := color.RGBA{R: 0x3d, G: 0x59, B: 0xa1, A: 255}       // #3d59a1
-	btnPressed := color.RGBA{R: 0x28, G: 0x34, B: 0x4a, A: 255}     // #28344a
-	textColor := color.RGBA{R: 0xa9, G: 0xb1, B: 0xd6, A: 255}      // #a9b1d6
+	// Render the widget-based notch bar
+	app.terminalScreen.RenderNotch(f)
 
-	// Top bar with Exit button.
-	f.RenderQuad(0, 0, winW, terminalTopBarH, nil, topBarColor)
-
+	// Track mouse state for confirmation dialog
 	mx, my := f.CursorPos()
 	leftDown := f.GetButtonState(window.ButtonLeft).IsDown()
 	justPressed := leftDown && !app.prevLeftDown
 	app.prevLeftDown = leftDown
 
-	backRect := rect{x: 20, y: 6, w: 70, h: terminalTopBarH - 12}
-	backHover := backRect.contains(mx, my)
-	backColor := btnNormal
-	if backHover {
-		backColor = btnHover
-	}
-	if backHover && leftDown {
-		backColor = btnPressed
-	}
-	f.RenderQuad(backRect.x, backRect.y, backRect.w, backRect.h, nil, backColor)
-	app.text.RenderText("Exit", backRect.x+14, 22, 14, textColor)
+	// Colors for confirmation dialog (from design.go)
+	btnNormal := colorBtnAlt
+	btnHover := colorBtnHover
+	btnPressed := colorBtnAltPressed
+	exitBtnHover := colorRed
+	textColorDialogDark := colorTextDark
+	textColorDialogLight := colorTextPrimary
 
-	if justPressed && backRect.contains(mx, my) {
-		slog.Info("exit requested; stopping VM")
-		app.stopVM()
-		return nil
-	}
+	// Render exit confirmation dialog
+	if app.showExitConfirm {
+		// Darken background
+		overlay := color.RGBA{R: 0, G: 0, B: 0, A: overlayAlphaLight}
+		f.RenderQuad(0, 0, winW, float32(h), nil, overlay)
 
-	// Logs button (top-right).
-	logRect := rect{x: winW - 150, y: 6, w: 120, h: terminalTopBarH - 12}
-	logHover := logRect.contains(mx, my)
-	logColor := btnNormal
-	if logHover {
-		logColor = btnHover
-	}
-	if logHover && leftDown {
-		logColor = btnPressed
-	}
-	f.RenderQuad(logRect.x, logRect.y, logRect.w, logRect.h, nil, logColor)
-	app.text.RenderText("Debug Logs", logRect.x+26, 22, 14, textColor)
-	if justPressed && logHover {
-		slog.Info("open logs requested", "log_dir", app.logDir)
-		if err := openDirectory(app.logDir); err != nil {
-			slog.Error("failed to open logs directory", "log_dir", app.logDir, "error", err)
+		// Dialog box dimensions (from design.go)
+		dialogW := exitDialogWidth
+		dialogH := exitDialogHeight
+		dialogX := (winW - dialogW) / 2
+		dialogY := (float32(h) - dialogH) / 2
+		dialogBg := colorBackground
+		dialogCornerRadius := cornerRadiusLarge
+		btnCornerRadius := cornerRadiusSmall
+
+		// Initialize or update dialog background shape
+		dialogBgRect := rect{x: dialogX, y: dialogY, w: dialogW, h: dialogH}
+		if app.dialogBgShape == nil {
+			segments := graphics.SegmentsForRadius(dialogCornerRadius)
+			app.dialogBgShape, _ = graphics.NewShapeBuilder(app.window, segments)
+		}
+		if dialogBgRect != app.dialogLastBgR {
+			app.dialogBgShape.UpdateRoundedRect(dialogX, dialogY, dialogW, dialogH,
+				graphics.UniformRadius(dialogCornerRadius),
+				graphics.ShapeStyle{FillColor: dialogBg})
+			app.dialogLastBgR = dialogBgRect
+		}
+		f.RenderMesh(app.dialogBgShape.Mesh(), graphics.DrawOptions{})
+
+		// Title (use lighter text for title on dark background)
+		app.text.RenderText("Shut down VM?", dialogX+70, dialogY+35, 16, colorTextPrimary)
+
+		// Confirm button
+		confirmRect := rect{x: dialogX + 30, y: dialogY + 60, w: 100, h: 30}
+		confirmHover := confirmRect.contains(mx, my)
+		confirmColor := exitBtnHover
+		if confirmHover && leftDown {
+			confirmColor = btnPressed
+		}
+
+		// Initialize or update confirm button shape (always update for hover color changes)
+		if app.confirmBtnShape == nil {
+			segments := graphics.SegmentsForRadius(btnCornerRadius)
+			app.confirmBtnShape, _ = graphics.NewShapeBuilder(app.window, segments)
+		}
+		app.confirmBtnShape.UpdateRoundedRect(confirmRect.x, confirmRect.y, confirmRect.w, confirmRect.h,
+			graphics.UniformRadius(btnCornerRadius),
+			graphics.ShapeStyle{FillColor: confirmColor})
+		f.RenderMesh(app.confirmBtnShape.Mesh(), graphics.DrawOptions{})
+		app.text.RenderText("Shut Down", confirmRect.x+12, confirmRect.y+20, 14, textColorDialogDark)
+
+		// Cancel button
+		cancelRect := rect{x: dialogX + 150, y: dialogY + 60, w: 100, h: 30}
+		cancelHover := cancelRect.contains(mx, my)
+		cancelColor := btnNormal
+		if cancelHover {
+			cancelColor = btnHover
+		}
+		if cancelHover && leftDown {
+			cancelColor = btnPressed
+		}
+
+		// Initialize or update cancel button shape (always update for hover color changes)
+		if app.cancelBtnShape == nil {
+			segments := graphics.SegmentsForRadius(btnCornerRadius)
+			app.cancelBtnShape, _ = graphics.NewShapeBuilder(app.window, segments)
+		}
+		app.cancelBtnShape.UpdateRoundedRect(cancelRect.x, cancelRect.y, cancelRect.w, cancelRect.h,
+			graphics.UniformRadius(btnCornerRadius),
+			graphics.ShapeStyle{FillColor: cancelColor})
+		f.RenderMesh(app.cancelBtnShape.Mesh(), graphics.DrawOptions{})
+		app.text.RenderText("Cancel", cancelRect.x+28, cancelRect.y+20, 14, textColorDialogLight)
+
+		// Handle dialog button clicks
+		if justPressed && confirmRect.contains(mx, my) {
+			slog.Info("shutdown confirmed; stopping VM")
+			app.showExitConfirm = false
+			app.stopVM()
+			return nil
+		}
+		if justPressed && cancelRect.contains(mx, my) {
+			slog.Info("shutdown cancelled")
+			app.showExitConfirm = false
 		}
 	}
 
@@ -773,10 +1237,9 @@ func (app *Application) startBootBundle(index int) {
 	// Record to recent VMs
 	if app.recentVMs != nil {
 		app.recentVMs.AddOrUpdate(RecentVM{
-			Name:           name,
-			SourceType:     VMSourceBundle,
-			SourcePath:     b.Dir,
-			NetworkEnabled: b.Meta.Boot.Network,
+			Name:       name,
+			SourceType: VMSourceBundle,
+			SourcePath: b.Dir,
 		})
 		app.updateDockMenu()
 	}
@@ -789,21 +1252,27 @@ func (app *Application) startBootBundle(index int) {
 		return
 	}
 
+	app.bootProgressMu.Lock()
 	app.bootStarted = time.Now()
 	app.bootName = name
+	app.bootProgressMu.Unlock()
 	app.mode = modeLoading
 
 	ch := make(chan bootResult, 1)
 	app.bootCh = ch
 
+	// Transfer ownership of pre-opened hypervisor to the boot prep
+	preOpenedHV := app.hypervisor
+	app.hypervisor = nil
+
 	// Background prep: do anything slow/off-GPU here (disk IO, kernel fetch, etc).
-	go func(b discoveredBundle, arch hv.CpuArchitecture, out chan<- bootResult) {
-		prep, err := prepareBootBundle(b, arch)
+	go func(b discoveredBundle, arch hv.CpuArchitecture, hvArg hv.Hypervisor, out chan<- bootResult) {
+		prep, err := prepareBootBundle(b, arch, hvArg)
 		out <- bootResult{prep: prep, err: err}
-	}(b, hvArch, ch)
+	}(b, hvArch, preOpenedHV, ch)
 }
 
-func prepareBootBundle(b discoveredBundle, hvArch hv.CpuArchitecture) (_ *bootPrep, retErr error) {
+func prepareBootBundle(b discoveredBundle, hvArch hv.CpuArchitecture, preOpenedHV hv.Hypervisor) (_ *bootPrep, retErr error) {
 	if b.Dir == "" {
 		return nil, fmt.Errorf("invalid bundle: empty dir")
 	}
@@ -862,6 +1331,15 @@ func prepareBootBundle(b discoveredBundle, hvArch hv.CpuArchitecture) (_ *bootPr
 	slog.Info("resolved command path", "exec", execCmd, "work_dir", workDir)
 	prep.execCmd = execCmd
 	prep.env = img.Config.Env
+	// Append custom environment variables from bundle metadata
+	if len(b.Meta.Boot.Env) > 0 {
+		prep.env = append(prep.env, b.Meta.Boot.Env...)
+		slog.Info("added custom env vars from bundle", "count", len(b.Meta.Boot.Env))
+	}
+	// Ensure TERM is set for the container so terminal apps work correctly.
+	if !hasEnvVar(prep.env, "TERM") {
+		prep.env = append(prep.env, "TERM=xterm-256color")
+	}
 	prep.workDir = workDir
 
 	// Create VirtioFS backend
@@ -871,12 +1349,18 @@ func prepareBootBundle(b discoveredBundle, hvArch hv.CpuArchitecture) (_ *bootPr
 	}
 	prep.fsBackend = fsBackend
 
-	// Create hypervisor
-	h, err := factory.OpenWithArchitecture(hvArch)
-	if err != nil {
-		return nil, fmt.Errorf("create hypervisor: %w", err)
+	// Use pre-opened hypervisor or create a new one
+	if preOpenedHV != nil {
+		slog.Info("using pre-opened hypervisor")
+		prep.hypervisor = preOpenedHV
+	} else {
+		slog.Info("opening new hypervisor")
+		h, err := factory.OpenWithArchitecture(hvArch)
+		if err != nil {
+			return nil, fmt.Errorf("create hypervisor: %w", err)
+		}
+		prep.hypervisor = h
 	}
-	prep.hypervisor = h
 
 	// Load kernel
 	kernelLoader, err := kernel.LoadForArchitecture(hvArch)
@@ -895,27 +1379,24 @@ func prepareBootBundle(b discoveredBundle, hvArch hv.CpuArchitecture) (_ *bootPr
 	if prep.memoryMB == 0 {
 		prep.memoryMB = 1024
 	}
-	prep.network = b.Meta.Boot.Network
 	prep.dmesg = b.Meta.Boot.Dmesg
 	prep.exec = b.Meta.Boot.Exec
-	slog.Info("vm config (prep)", "cpus", prep.cpus, "memory_mb", prep.memoryMB, "network", prep.network, "dmesg", prep.dmesg, "exec", prep.exec)
+	slog.Info("vm config (prep)", "cpus", prep.cpus, "memory_mb", prep.memoryMB, "dmesg", prep.dmesg, "exec", prep.exec)
 
-	var netBackend *netstack.NetStack
-	if prep.network {
-		slog.Info("network enabled; starting netstack DNS server")
-		netBackend = netstack.New(slog.Default())
-		if err := netBackend.StartDNSServer(); err != nil {
-			return nil, fmt.Errorf("start DNS server: %w", err)
-		}
-		prep.netBackend = netBackend
-
-		mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
-		virtioNet, err := virtio.NewNetstackBackend(netBackend, mac)
-		if err != nil {
-			return nil, fmt.Errorf("create netstack backend: %w", err)
-		}
-		prep.virtioNet = virtioNet
+	// Always create netstack and attach network device with internet enabled.
+	slog.Info("starting netstack DNS server")
+	netBackend := netstack.New(slog.Default())
+	if err := netBackend.StartDNSServer(); err != nil {
+		return nil, fmt.Errorf("start DNS server: %w", err)
 	}
+	prep.netBackend = netBackend
+
+	mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
+	virtioNet, err := virtio.NewNetstackBackend(netBackend, mac)
+	if err != nil {
+		return nil, fmt.Errorf("create netstack backend: %w", err)
+	}
+	prep.virtioNet = virtioNet
 
 	slog.Info("boot bundle prep complete", "bundle_dir", b.Dir, "bundle_name", b.Meta.Name)
 	return prep, nil
@@ -953,8 +1434,14 @@ func (app *Application) finalizeBoot(prep *bootPrep) (retErr error) {
 	if err != nil {
 		return fmt.Errorf("create terminal view: %w", err)
 	}
-	// Reserve space for CCApp's top bar so terminal output doesn't overlap it.
-	termView.SetInsets(0, terminalTopBarH, 0, 0)
+	// Drain any text input that accumulated while user was typing in UI fields
+	// (e.g., image name). Otherwise, the terminal view would receive this text
+	// as keyboard input when it starts processing.
+	_ = app.window.PlatformWindow().TextInput()
+	// Terminal fills the full window - the notch overlays on top
+	termView.SetInsets(0, 0, 0, 0)
+	// Apply the app's color scheme to the terminal.
+	termView.SetColorScheme(terminalColorScheme())
 
 	opts := []initx.Option{
 		initx.WithDeviceTemplate(virtio.FSTemplate{
@@ -967,18 +1454,17 @@ func (app *Application) finalizeBoot(prep *bootPrep) (retErr error) {
 		initx.WithDmesgLogging(prep.dmesg),
 	}
 
-	if prep.network {
-		if prep.netBackend == nil || prep.virtioNet == nil {
-			termView.Close()
-			return fmt.Errorf("network enabled but netstack was not prepared")
-		}
-		mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
-		opts = append(opts, initx.WithDeviceTemplate(virtio.NetTemplate{
-			Backend: prep.virtioNet,
-			MAC:     mac,
-			Arch:    prep.hvArch,
-		}))
+	// Always attach network device with internet access enabled.
+	if prep.netBackend == nil || prep.virtioNet == nil {
+		termView.Close()
+		return fmt.Errorf("netstack was not prepared")
 	}
+	mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
+	opts = append(opts, initx.WithDeviceTemplate(virtio.NetTemplate{
+		Backend: prep.virtioNet,
+		MAC:     mac,
+		Arch:    prep.hvArch,
+	}))
 
 	vm, err := initx.NewVirtualMachine(prep.hypervisor, prep.cpus, prep.memoryMB, prep.kernelLoader, opts...)
 	if err != nil {
@@ -986,13 +1472,13 @@ func (app *Application) finalizeBoot(prep *bootPrep) (retErr error) {
 		return fmt.Errorf("create VM: %w", err)
 	}
 
-	// Build init program
+	// Build init program with network always enabled.
 	prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
 		Arch:          prep.hvArch,
 		Cmd:           prep.execCmd,
 		Env:           prep.env,
 		WorkDir:       prep.workDir,
-		EnableNetwork: prep.network,
+		EnableNetwork: true,
 		Exec:          prep.exec,
 	})
 	if err != nil {
@@ -1044,11 +1530,16 @@ func (app *Application) stopVM() {
 	app.running = nil
 	app.mode = modeLauncher
 	app.selectedIndex = -1
+
+	// Reset notch UI state for next VM
+	app.networkDisabled = false
+	app.showExitConfirm = false
+
 	slog.Info("VM stopped; returned to launcher")
 }
 
 // startCustomVM starts a VM from a custom source (tarball, image name, or bundle directory)
-func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string, network bool) {
+func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string) {
 	if app.bootCh != nil {
 		return // Already booting
 	}
@@ -1065,12 +1556,19 @@ func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string
 		displayName = sourcePath
 	}
 
+	app.bootProgressMu.Lock()
 	app.bootStarted = time.Now()
 	app.bootName = displayName
+	app.bootProgressMu.Unlock()
 	app.mode = modeLoading
+	app.loadingScreen = nil // Force rebuild to show correct name
 
 	ch := make(chan bootResult, 1)
 	app.bootCh = ch
+
+	// Transfer ownership of pre-opened hypervisor to the boot prep
+	preOpenedHV := app.hypervisor
+	app.hypervisor = nil
 
 	// Create progress callback for image downloads
 	progressCallback := func(progress oci.DownloadProgress) {
@@ -1079,7 +1577,7 @@ func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string
 		app.bootProgressMu.Unlock()
 	}
 
-	go func(srcType VMSourceType, srcPath string, net bool, arch hv.CpuArchitecture, out chan<- bootResult, progressCb oci.ProgressCallback) {
+	go func(srcType VMSourceType, srcPath string, arch hv.CpuArchitecture, hvArg hv.Hypervisor, out chan<- bootResult, progressCb oci.ProgressCallback) {
 		var prep *bootPrep
 		var err error
 
@@ -1091,26 +1589,132 @@ func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string
 				out <- bootResult{err: metaErr}
 				return
 			}
-			// Override network setting
-			meta.Boot.Network = net
-			prep, err = prepareBootBundle(discoveredBundle{Dir: srcPath, Meta: meta}, arch)
+			prep, err = prepareBootBundle(discoveredBundle{Dir: srcPath, Meta: meta}, arch, hvArg)
 
 		case VMSourceTarball:
-			prep, err = prepareFromTarball(srcPath, net, arch)
+			prep, err = prepareFromTarball(srcPath, arch, hvArg)
 
 		case VMSourceImageName:
-			prep, err = prepareFromImageName(srcPath, net, arch, progressCb)
+			prep, err = prepareFromImageName(srcPath, arch, hvArg, progressCb)
 
 		default:
 			err = fmt.Errorf("unknown source type: %s", srcType)
 		}
 
 		out <- bootResult{prep: prep, err: err}
-	}(sourceType, sourcePath, network, hvArch, ch, progressCallback)
+	}(sourceType, sourcePath, hvArch, preOpenedHV, ch, progressCallback)
+}
+
+// installBundle installs a VM source as a bundle in the bundles directory.
+// For image names and tarballs, it creates a new bundle. For bundle dirs, it validates only.
+func (app *Application) installBundle(sourceType VMSourceType, sourcePath string, bundleName string) {
+	if app.installCh != nil {
+		return // Already installing
+	}
+
+	hvArch, err := parseArchitecture(runtime.GOARCH)
+	if err != nil {
+		slog.Error("failed to determine architecture", "goarch", runtime.GOARCH, "error", err)
+		app.showError(err)
+		return
+	}
+
+	app.installStarted = time.Now()
+	app.installName = bundleName
+	app.mode = modeInstalling
+	app.loadingScreen = nil // Force rebuild to show correct name
+
+	ch := make(chan installResult, 1)
+	app.installCh = ch
+
+	progressCallback := func(progress oci.DownloadProgress) {
+		app.installProgressMu.Lock()
+		app.installProgress = progress
+		app.installProgressMu.Unlock()
+	}
+
+	go func() {
+		var err error
+		bundlePath := filepath.Join(app.bundlesDir, bundleName)
+
+		switch sourceType {
+		case VMSourceImageName:
+			err = app.doInstallFromImageName(sourcePath, bundlePath, bundleName, hvArch, progressCallback)
+		case VMSourceTarball:
+			err = app.doInstallFromTarball(sourcePath, bundlePath, bundleName, hvArch)
+		case VMSourceBundle:
+			// For bundle dirs, just validate - don't copy
+			err = bundle.ValidateBundleDir(sourcePath)
+			if err == nil {
+				bundlePath = sourcePath // Use original path
+			}
+		}
+
+		ch <- installResult{bundlePath: bundlePath, err: err}
+	}()
+}
+
+func (app *Application) doInstallFromImageName(imageName, bundlePath, name string, hvArch hv.CpuArchitecture, progress oci.ProgressCallback) error {
+	slog.Info("installing image as bundle", "image", imageName, "dest", bundlePath)
+
+	client, err := oci.NewClient("")
+	if err != nil {
+		return fmt.Errorf("create OCI client: %w", err)
+	}
+	client.SetProgressCallback(progress)
+
+	img, err := client.PullForArch(imageName, hvArch)
+	if err != nil {
+		return fmt.Errorf("pull image: %w", err)
+	}
+
+	return installImageAsBundle(img, bundlePath, name, imageName)
+}
+
+func (app *Application) doInstallFromTarball(tarPath, bundlePath, name string, hvArch hv.CpuArchitecture) error {
+	slog.Info("installing tarball as bundle", "path", tarPath, "dest", bundlePath)
+
+	client, err := oci.NewClient("")
+	if err != nil {
+		return fmt.Errorf("create OCI client: %w", err)
+	}
+
+	img, err := client.LoadFromTar(tarPath, hvArch)
+	if err != nil {
+		return fmt.Errorf("load tar: %w", err)
+	}
+
+	return installImageAsBundle(img, bundlePath, name, tarPath)
+}
+
+func installImageAsBundle(img *oci.Image, bundlePath, name, source string) error {
+	// Create image directory
+	imageDir := filepath.Join(bundlePath, "image")
+	if err := oci.ExportToDir(img, imageDir); err != nil {
+		return fmt.Errorf("export image: %w", err)
+	}
+
+	// Create bundle metadata
+	meta := bundle.Metadata{
+		Version:     1,
+		Name:        name,
+		Description: fmt.Sprintf("Installed from %s", filepath.Base(source)),
+		Boot: bundle.BootConfig{
+			ImageDir: "image",
+			Exec:     true,
+		},
+	}
+
+	if err := bundle.WriteTemplate(bundlePath, meta); err != nil {
+		return fmt.Errorf("write bundle metadata: %w", err)
+	}
+
+	slog.Info("bundle installed successfully", "path", bundlePath)
+	return nil
 }
 
 // prepareFromTarball loads a VM from an OCI tarball
-func prepareFromTarball(tarPath string, network bool, hvArch hv.CpuArchitecture) (*bootPrep, error) {
+func prepareFromTarball(tarPath string, hvArch hv.CpuArchitecture, preOpenedHV hv.Hypervisor) (*bootPrep, error) {
 	slog.Info("loading VM from tarball", "path", tarPath, "arch", hvArch)
 
 	client, err := oci.NewClient("")
@@ -1123,11 +1727,11 @@ func prepareFromTarball(tarPath string, network bool, hvArch hv.CpuArchitecture)
 		return nil, fmt.Errorf("load tarball: %w", err)
 	}
 
-	return prepareFromImage(img, network, hvArch)
+	return prepareFromImage(img, hvArch, preOpenedHV)
 }
 
 // prepareFromImageName pulls a container image and prepares it for boot
-func prepareFromImageName(imageName string, network bool, hvArch hv.CpuArchitecture, progressCallback oci.ProgressCallback) (*bootPrep, error) {
+func prepareFromImageName(imageName string, hvArch hv.CpuArchitecture, preOpenedHV hv.Hypervisor, progressCallback oci.ProgressCallback) (*bootPrep, error) {
 	slog.Info("pulling container image", "image", imageName, "arch", hvArch)
 
 	client, err := oci.NewClient("")
@@ -1145,11 +1749,11 @@ func prepareFromImageName(imageName string, network bool, hvArch hv.CpuArchitect
 		return nil, fmt.Errorf("pull image: %w", err)
 	}
 
-	return prepareFromImage(img, network, hvArch)
+	return prepareFromImage(img, hvArch, preOpenedHV)
 }
 
 // prepareFromImage prepares a VM from an already-loaded OCI image
-func prepareFromImage(img *oci.Image, network bool, hvArch hv.CpuArchitecture) (_ *bootPrep, retErr error) {
+func prepareFromImage(img *oci.Image, hvArch hv.CpuArchitecture, preOpenedHV hv.Hypervisor) (_ *bootPrep, retErr error) {
 	prep := &bootPrep{hvArch: hvArch}
 	defer func() {
 		if retErr != nil {
@@ -1189,6 +1793,10 @@ func prepareFromImage(img *oci.Image, network bool, hvArch hv.CpuArchitecture) (
 	slog.Info("resolved command path", "exec", execCmd, "work_dir", workDir)
 	prep.execCmd = execCmd
 	prep.env = img.Config.Env
+	// Ensure TERM is set for the container so terminal apps work correctly.
+	if !hasEnvVar(prep.env, "TERM") {
+		prep.env = append(prep.env, "TERM=xterm-256color")
+	}
 	prep.workDir = workDir
 
 	// Create VirtioFS backend
@@ -1198,12 +1806,18 @@ func prepareFromImage(img *oci.Image, network bool, hvArch hv.CpuArchitecture) (
 	}
 	prep.fsBackend = fsBackend
 
-	// Create hypervisor
-	h, err := factory.OpenWithArchitecture(hvArch)
-	if err != nil {
-		return nil, fmt.Errorf("create hypervisor: %w", err)
+	// Use pre-opened hypervisor or create a new one
+	if preOpenedHV != nil {
+		slog.Info("using pre-opened hypervisor")
+		prep.hypervisor = preOpenedHV
+	} else {
+		slog.Info("opening new hypervisor")
+		h, err := factory.OpenWithArchitecture(hvArch)
+		if err != nil {
+			return nil, fmt.Errorf("create hypervisor: %w", err)
+		}
+		prep.hypervisor = h
 	}
-	prep.hypervisor = h
 
 	// Load kernel
 	kernelLoader, err := kernel.LoadForArchitecture(hvArch)
@@ -1216,26 +1830,24 @@ func prepareFromImage(img *oci.Image, network bool, hvArch hv.CpuArchitecture) (
 	// VM options - use defaults
 	prep.cpus = 1
 	prep.memoryMB = 1024
-	prep.network = network
 	prep.dmesg = false
 	prep.exec = true
-	slog.Info("vm config", "cpus", prep.cpus, "memory_mb", prep.memoryMB, "network", prep.network)
+	slog.Info("vm config", "cpus", prep.cpus, "memory_mb", prep.memoryMB)
 
-	if prep.network {
-		slog.Info("network enabled; starting netstack DNS server")
-		netBackend := netstack.New(slog.Default())
-		if err := netBackend.StartDNSServer(); err != nil {
-			return nil, fmt.Errorf("start DNS server: %w", err)
-		}
-		prep.netBackend = netBackend
-
-		mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
-		virtioNet, err := virtio.NewNetstackBackend(netBackend, mac)
-		if err != nil {
-			return nil, fmt.Errorf("create netstack backend: %w", err)
-		}
-		prep.virtioNet = virtioNet
+	// Always create netstack and attach network device with internet enabled.
+	slog.Info("starting netstack DNS server")
+	netBackend := netstack.New(slog.Default())
+	if err := netBackend.StartDNSServer(); err != nil {
+		return nil, fmt.Errorf("start DNS server: %w", err)
 	}
+	prep.netBackend = netBackend
+
+	mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
+	virtioNet, err := virtio.NewNetstackBackend(netBackend, mac)
+	if err != nil {
+		return nil, fmt.Errorf("create netstack backend: %w", err)
+	}
+	prep.virtioNet = virtioNet
 
 	slog.Info("VM prep from image complete")
 	return prep, nil
@@ -1261,6 +1873,16 @@ func extractInitialPath(env []string) string {
 		}
 	}
 	return defaultPathEnv
+}
+
+func hasEnvVar(env []string, name string) bool {
+	prefix := name + "="
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func containerWorkDir(img *oci.Image) string {
@@ -1374,6 +1996,18 @@ func main() {
 	app := Application{}
 	app.logDir = logDir
 	app.logFile = logFile
+
+	// Check for URL argument (passed by OS when handling crumblecracker:// URLs)
+	if len(os.Args) > 1 && strings.HasPrefix(os.Args[1], "crumblecracker://") {
+		rawURL := os.Args[1]
+		if len(rawURL) > 1024 {
+			slog.Warn("URL from command line exceeds maximum length, ignoring")
+		} else {
+			app.pendingURL = rawURL
+			// Don't log full URL as it may contain sensitive data
+			slog.Info("pending URL from command line received")
+		}
+	}
 
 	if err := app.Run(); err != nil {
 		slog.Error("ccapp exited with error", "error", err)

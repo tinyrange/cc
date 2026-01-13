@@ -254,14 +254,17 @@ func (m *ContextMenu) Draw(ctx *DrawContext) {
 				)
 			}
 
-			// Draw text
+			// Draw text using proper font metrics
 			if ctx.Text != nil {
 				textColor := m.style.TextNormal
 				if !item.Enabled {
 					textColor = m.style.TextDisabled
 				}
 				textX := bounds.X + m.style.PaddingX
-				textY := y + m.style.ItemHeight/2 + float32(m.style.TextSize)/3
+				// Vertical centering: (ItemHeight - lineHeight)/2 + ascender
+				lineHeight := ctx.Text.LineHeight(m.style.TextSize)
+				ascender := ctx.Text.Ascender(m.style.TextSize)
+				textY := y + (m.style.ItemHeight-lineHeight)/2 + ascender
 				ctx.Text.RenderText(item.Label, textX, textY, m.style.TextSize, textColor)
 			}
 

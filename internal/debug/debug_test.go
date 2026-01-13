@@ -123,12 +123,14 @@ func TestDebugTimestampOrdering(t *testing.T) {
 	// create 4 goroutines that write to the buffer
 	var wg sync.WaitGroup
 	for i := range 4 {
-		wg.Go(func() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			for range 10 {
 				time.Sleep(time.Millisecond * time.Duration(i))
 				Write("test", fmt.Sprintf("hello, world %d", i))
 			}
-		})
+		}()
 	}
 	wg.Wait()
 

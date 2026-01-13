@@ -81,9 +81,6 @@ boot:
 	if meta.Boot.MemoryMB != 2048 {
 		t.Errorf("Boot.MemoryMB = %d, want 2048", meta.Boot.MemoryMB)
 	}
-	if !meta.Boot.Network {
-		t.Error("Boot.Network should be true")
-	}
 	if meta.Boot.Exec {
 		t.Error("Boot.Exec should be false")
 	}
@@ -131,4 +128,3 @@ func TestWriteTemplate(t *testing.T) {
 		t.Errorf("loaded.Boot.CPUs = %d, want 1", loaded.Boot.CPUs)
 	}
 }
-

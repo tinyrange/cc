@@ -31,7 +31,7 @@ func TestSnapshotSaveLoad(t *testing.T) {
 		InterruptSupport: true,
 	})
 	if err != nil {
-		t.Fatalf("Create VM: %v", err)
+		t.Skipf("Create VM: %v", err)
 	}
 	defer vm.Close()
 

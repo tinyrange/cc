@@ -172,7 +172,21 @@ func (a *Align) Layout(ctx *LayoutContext, constraints Constraints) Size {
 	if a.content != nil {
 		a.contentSize = a.content.Layout(ctx, Unconstrained())
 	}
-	return Size{W: constraints.MaxW, H: constraints.MaxH}
+
+	const unboundedThreshold = 1e8
+
+	w := constraints.MaxW
+	h := constraints.MaxH
+
+	// For unbounded constraints, use content size (intrinsic measurement)
+	if constraints.MaxW >= unboundedThreshold {
+		w = a.contentSize.W
+	}
+	if constraints.MaxH >= unboundedThreshold {
+		h = a.contentSize.H
+	}
+
+	return Size{W: w, H: h}
 }
 
 func (a *Align) SetBounds(bounds Rect) {

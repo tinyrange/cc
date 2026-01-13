@@ -247,11 +247,15 @@ func tt_rasterize(result *Bitmap, pts []point, wcount []int, windings int, scale
 	} else {
 		yScaleInv = scaleY
 	}
+	// Determine vertical subsampling for antialiasing quality.
+	// Higher vsubsample = better AA but slower. Values must divide 255 evenly.
+	// Use 15 for small glyphs where AA is most critical, 5 for larger glyphs.
+	// Threshold at 6px (instead of 8) for smoother quality transition.
 	var vsubsample int
-	if result.H < 8 {
-		vsubsample = 15
+	if result.H < 6 {
+		vsubsample = 15 // High quality for tiny glyphs
 	} else {
-		vsubsample = 5
+		vsubsample = 5 // Standard quality for larger glyphs
 	}
 	// vsubsample should divide 255 evenly; otherwise we won't reach full opacity
 

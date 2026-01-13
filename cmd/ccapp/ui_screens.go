@@ -10,6 +10,8 @@ import (
 	"github.com/tinyrange/cc/internal/assets"
 	"github.com/tinyrange/cc/internal/gowin/graphics"
 	"github.com/tinyrange/cc/internal/gowin/ui"
+	"github.com/tinyrange/cc/internal/gowin/window"
+	"github.com/tinyrange/cc/internal/oci"
 )
 
 // formatBytes formats a byte count as a human-readable string.
@@ -31,103 +33,52 @@ func formatBytes(bytes int64) string {
 	}
 }
 
-// Tokyo Night color theme
-// Based on https://github.com/enkia/tokyo-night-vscode-theme
-var (
-	colorBackground    = color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 255} // #1a1b26
-	colorTopBar        = color.RGBA{R: 0x16, G: 0x16, B: 0x1e, A: 255} // #16161e
-	colorBtnNormal     = color.RGBA{R: 0x24, G: 0x28, B: 0x3b, A: 255} // #24283b (storm)
-	colorBtnHover      = color.RGBA{R: 0x3d, G: 0x59, B: 0xa1, A: 255} // #3d59a1 (active border)
-	colorCardBg        = color.RGBA{R: 0x1f, G: 0x23, B: 0x35, A: 255} // #1f2335
-	colorCardBgHover   = color.RGBA{R: 0x28, G: 0x34, B: 0x4a, A: 255} // #28344a (selection)
-	colorOverlay       = color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 220} // #1a1b26 with alpha
-	colorAccent        = color.RGBA{R: 0x7a, G: 0xa2, B: 0xf7, A: 255} // #7aa2f7 (blue)
-	colorAccentHover   = color.RGBA{R: 0x7d, G: 0xcf, B: 0xff, A: 255} // #7dcfff (cyan)
-	colorAccentPressed = color.RGBA{R: 0x3d, G: 0x59, B: 0xa1, A: 255} // #3d59a1
-	colorTextPrimary   = color.RGBA{R: 0xa9, G: 0xb1, B: 0xd6, A: 255} // #a9b1d6 (foreground)
-	colorTextSecondary = color.RGBA{R: 0x78, G: 0x7c, B: 0x99, A: 255} // #787c99
-	colorGreen         = color.RGBA{R: 0x9e, G: 0xce, B: 0x6a, A: 255} // #9ece6a
-	colorRed           = color.RGBA{R: 0xf7, G: 0x76, B: 0x8e, A: 255} // #f7768e
-	colorYellow        = color.RGBA{R: 0xe0, G: 0xaf, B: 0x68, A: 255} // #e0af68
-)
-
-// UI constants
-const (
-	cornerRadiusSmall  float32 = 6
-	cornerRadiusMedium float32 = 10
-	topBarButtonHeight float32 = 26
-	topBarIconSize     float32 = 14
-)
-
-// topBarButtonStyle returns the standard style for top bar buttons (text only)
-func topBarButtonStyle() ui.ButtonStyle {
-	return ui.ButtonStyle{
-		BackgroundNormal:   colorBtnNormal,
-		BackgroundHovered:  colorBtnHover,
-		BackgroundPressed:  colorAccentPressed,
-		BackgroundDisabled: color.RGBA{R: 0x16, G: 0x16, B: 0x1e, A: 255},
-		TextColor:          colorTextPrimary,
-		TextSize:           13,
-		Padding:            ui.Symmetric(10, 6),
-		MinWidth:           60,
-		MinHeight:          topBarButtonHeight,
-		CornerRadius:       cornerRadiusSmall,
+// formatSpeed formats bytes per second as a human-readable string.
+func formatSpeed(bytesPerSecond float64) string {
+	const (
+		KB = 1024.0
+		MB = KB * 1024
+		GB = MB * 1024
+	)
+	switch {
+	case bytesPerSecond >= GB:
+		return fmt.Sprintf("%.1f GB/s", bytesPerSecond/GB)
+	case bytesPerSecond >= MB:
+		return fmt.Sprintf("%.1f MB/s", bytesPerSecond/MB)
+	case bytesPerSecond >= KB:
+		return fmt.Sprintf("%.1f KB/s", bytesPerSecond/KB)
+	default:
+		return fmt.Sprintf("%.0f B/s", bytesPerSecond)
 	}
 }
 
-// iconButtonCardStyle returns a CardStyle matching the top bar button style
-func iconButtonCardStyle() ui.CardStyle {
-	return ui.CardStyle{
-		BackgroundColor: colorBtnNormal,
-		BorderColor:     color.Transparent,
-		BorderWidth:     0,
-		Padding:         ui.Symmetric(10, 6),
-		CornerRadius:    cornerRadiusSmall,
+// formatETA formats a duration as a human-readable ETA string.
+func formatETA(d time.Duration) string {
+	if d < 0 {
+		return ""
 	}
+	if d == 0 {
+		return "Done"
+	}
+	// Round to nearest second
+	d = d.Round(time.Second)
+	if d < time.Minute {
+		return fmt.Sprintf("%ds remaining", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		mins := int(d.Minutes())
+		secs := int(d.Seconds()) % 60
+		if secs > 0 {
+			return fmt.Sprintf("%dm %ds remaining", mins, secs)
+		}
+		return fmt.Sprintf("%dm remaining", mins)
+	}
+	hours := int(d.Hours())
+	mins := int(d.Minutes()) % 60
+	return fmt.Sprintf("%dh %dm remaining", hours, mins)
 }
 
-// iconButtonCardHoverStyle returns a hover CardStyle for icon buttons
-func iconButtonCardHoverStyle() ui.CardStyle {
-	return ui.CardStyle{
-		BackgroundColor: colorBtnHover,
-		BorderColor:     color.Transparent,
-		BorderWidth:     0,
-		Padding:         ui.Symmetric(10, 6),
-		CornerRadius:    cornerRadiusSmall,
-	}
-}
-
-// primaryButtonStyle returns the style for primary action buttons (blue accent)
-func primaryButtonStyle() ui.ButtonStyle {
-	return ui.ButtonStyle{
-		BackgroundNormal:   colorAccent,
-		BackgroundHovered:  colorAccentHover,
-		BackgroundPressed:  colorAccentPressed,
-		BackgroundDisabled: color.RGBA{R: 0x41, G: 0x48, B: 0x68, A: 255}, // #414868
-		TextColor:          color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 255}, // Dark text on light bg
-		TextSize:           15,
-		Padding:            ui.Symmetric(20, 12),
-		MinWidth:           120,
-		MinHeight:          44,
-		CornerRadius:       cornerRadiusSmall,
-	}
-}
-
-// secondaryButtonStyle returns the style for secondary action buttons
-func secondaryButtonStyle() ui.ButtonStyle {
-	return ui.ButtonStyle{
-		BackgroundNormal:   colorBtnNormal,
-		BackgroundHovered:  colorBtnHover,
-		BackgroundPressed:  colorAccentPressed,
-		BackgroundDisabled: color.RGBA{R: 0x16, G: 0x16, B: 0x1e, A: 255},
-		TextColor:          colorTextPrimary,
-		TextSize:           15,
-		Padding:            ui.Symmetric(20, 12),
-		MinWidth:           120,
-		MinHeight:          44,
-		CornerRadius:       cornerRadiusSmall,
-	}
-}
+// Colors, UI constants, and common styles are defined in design.go
 
 // LauncherScreen manages the launcher UI state and widgets
 type LauncherScreen struct {
@@ -138,10 +89,12 @@ type LauncherScreen struct {
 	bundleCards []*bundleCardWidget
 	scrollView  *ui.ScrollView
 	logo        *ui.AnimatedLogo
+	titleLabel  *ui.GradientLabel
 
 	// Icons
 	iconPlus *graphics.SVG
 	iconLogs *graphics.SVG
+	iconCog  *graphics.SVG
 
 	// State
 	scrollX float32
@@ -170,6 +123,11 @@ func NewLauncherScreen(app *Application) *LauncherScreen {
 		slog.Warn("failed to load logs icon", "error", err)
 	} else {
 		screen.iconLogs = icon
+	}
+	if icon, err := graphics.LoadSVG(app.window, assets.IconCog); err != nil {
+		slog.Warn("failed to load cog icon", "error", err)
+	} else {
+		screen.iconCog = icon
 	}
 
 	screen.buildUI()
@@ -212,6 +170,10 @@ func (s *LauncherScreen) buildUI() {
 		contentCol.AddChild(bundleSection, ui.FlexParams(1))
 	}
 
+	// Add VM button section - prominent and centered below bundles
+	addVMSection := s.buildAddVMSection()
+	contentCol.AddChild(addVMSection, ui.DefaultFlexParams())
+
 	stack.AddChild(contentCol)
 	s.root.SetChild(stack)
 }
@@ -222,15 +184,28 @@ func (s *LauncherScreen) buildTopBar() *ui.FlexContainer {
 		WithPadding(ui.Symmetric(16, 6)).
 		WithCrossAlignment(ui.CrossAxisCenter)
 
+	// Version label on the left
+	row.AddChild(
+		ui.NewLabel(fmt.Sprintf("v%s", Version)).WithSize(11).WithColor(colorTextMuted),
+		ui.DefaultFlexParams(),
+	)
+
 	row.AddChild(ui.NewSpacer(), ui.FlexParams(1))
 
-	// New VM button with icon
+	// Update available notification
+	if s.app.updateStatus != nil && s.app.updateStatus.Available {
+		row.AddChild(
+			s.buildUpdateButton(),
+			ui.FlexParamsWithMargin(0, ui.Only(0, 0, 10, 0)),
+		)
+	}
+
+	// Settings button
 	row.AddChild(
-		s.buildIconButton("New VM", s.iconPlus, func() {
-			s.app.customVMScreen = NewCustomVMScreen(s.app)
-			s.app.mode = modeCustomVM
+		s.buildIconButton("Settings", s.iconCog, func() {
+			s.app.showAppSettings()
 		}),
-		ui.FlexParamsWithMargin(0, ui.Only(0, 0, 8, 0)),
+		ui.FlexParamsWithMargin(0, ui.Only(0, 0, 10, 0)),
 	)
 
 	// Debug Logs button with icon
@@ -242,6 +217,29 @@ func (s *LauncherScreen) buildTopBar() *ui.FlexContainer {
 	)
 
 	return row
+}
+
+// buildUpdateButton creates a button to show when an update is available
+func (s *LauncherScreen) buildUpdateButton() ui.Widget {
+	status := s.app.updateStatus
+	label := fmt.Sprintf("Update: %s", status.LatestVersion)
+
+	content := ui.Row().
+		WithGap(5).
+		WithCrossAlignment(ui.CrossAxisCenter)
+
+	content.AddChild(ui.NewLabel(label).WithSize(13).WithColor(colorGreen), ui.DefaultFlexParams())
+
+	// Create card button with green accent
+	card := ui.NewCard(content).
+		WithStyle(updateButtonCardStyle()).
+		WithHoverStyle(updateButtonCardHoverStyle()).
+		WithGraphicsWindow(s.app.window).
+		OnClick(func() {
+			s.app.startUpdate()
+		})
+
+	return card
 }
 
 // buildIconButton creates a compact button with an icon and label
@@ -273,16 +271,29 @@ func (s *LauncherScreen) buildTitleSection() *ui.FlexContainer {
 	col := ui.Column().
 		WithPadding(ui.Only(20, 50, 20, 0))
 
-	col.AddChild(ui.NewLabel("CrumbleCracker").WithSize(48), ui.DefaultFlexParams())
+	// Rainbow gradient for the title (initial state - will be animated)
+	s.titleLabel = ui.NewGradientLabel("CrumbleCracker").WithSize(48)
+	col.AddChild(s.titleLabel, ui.DefaultFlexParams())
 
 	if len(s.app.bundles) == 0 {
 		col.AddChild(
-			ui.NewLabel("No bundles found. Create bundles with: cc -build <outDir> <image>").WithSize(20),
+			ui.NewWrapLabel("No bundles found. Use the New VM button to add one.").WithSize(20),
 			ui.FlexParamsWithMargin(0, ui.Only(0, 10, 0, 0)),
 		)
 		col.AddChild(
-			ui.NewLabel("Searched for bundles in: "+s.app.bundlesDir).WithSize(20),
+			ui.NewWrapLabel("Place bundles in the CrumbleCracker bundles directory to use them here.").WithSize(16),
 			ui.FlexParamsWithMargin(0, ui.Only(0, 10, 0, 0)),
+		)
+		openBundlesStyle := secondaryButtonStyle()
+		openBundlesStyle.MinWidth = 200
+		col.AddChild(
+			ui.NewButton("Open Bundles Folder").
+				WithStyle(openBundlesStyle).
+				WithGraphicsWindow(s.app.window).
+				OnClick(func() {
+					s.app.openBundlesDir()
+				}),
+			ui.FlexParamsWithMargin(0, ui.Only(0, 16, 0, 0)),
 		)
 	} else {
 		col.AddChild(
@@ -318,6 +329,36 @@ func (s *LauncherScreen) buildBundleSection() ui.Widget {
 	return stack
 }
 
+func (s *LauncherScreen) buildAddVMSection() *ui.FlexContainer {
+	row := ui.Row().
+		WithPadding(ui.Only(20, 20, 20, 30)).
+		WithMainAlignment(ui.MainAxisCenter)
+
+	// Button content with icon and text
+	content := ui.Row().
+		WithGap(10).
+		WithCrossAlignment(ui.CrossAxisCenter)
+
+	if s.iconPlus != nil {
+		iconWidget := ui.NewSVGImage(s.iconPlus).WithSize(20, 20)
+		content.AddChild(iconWidget, ui.DefaultFlexParams())
+	}
+	content.AddChild(ui.NewLabel("Add VM").WithSize(16).WithColor(colorBackground), ui.DefaultFlexParams())
+
+	// Use Card for clickable content with icon - prominent green style
+	card := ui.NewCard(content).
+		WithStyle(addVMCardStyle()).
+		WithHoverStyle(addVMCardHoverStyle()).
+		WithGraphicsWindow(s.app.window).
+		OnClick(func() {
+			s.app.customVMScreen = NewCustomVMScreen(s.app)
+			s.app.mode = modeCustomVM
+		})
+
+	row.AddChild(card, ui.DefaultFlexParams())
+	return row
+}
+
 func (s *LauncherScreen) buildCardContainer() *ui.FlexContainer {
 	row := ui.Row().WithGap(24)
 
@@ -341,55 +382,71 @@ func (s *LauncherScreen) buildBundleCard(index int, b discoveredBundle) *bundleC
 		desc = "VM Bundle"
 	}
 
-	// Card dimensions and padding
-	const cardWidth float32 = 180
-	const cardHeight float32 = 240
-	const cardPadding float32 = 12
+	// Card dimensions and padding (from design.go)
 	const contentWidth = cardWidth - (cardPadding * 2)
-	const imageHeight float32 = 120
 
 	// Card content: vertical layout with image area and text
-	content := ui.Column().WithGap(12)
+	content := ui.Column().WithGap(8)
 
-	// Image placeholder area with subtle background
-	imagePlaceholder := ui.NewCard(nil).
-		WithStyle(ui.CardStyle{
-			BackgroundColor: colorTopBar,
-			CornerRadius:    cornerRadiusSmall,
-		}).
+	// Procedural icon area - clickable to start VM
+	iconWidget := ui.NewProceduralIconWidget(name).
+		WithSize(contentWidth, imageHeight).
+		WithGraphicsWindow(s.app.window)
+
+	imageCard := ui.NewCard(iconWidget).
+		WithStyle(bundleImageCardStyle()).
+		WithHoverStyle(bundleImageCardHoverStyle()).
 		WithGraphicsWindow(s.app.window).
-		WithFixedSize(contentWidth, imageHeight)
-	content.AddChild(imagePlaceholder, ui.DefaultFlexParams())
-
-	// Name and description with better spacing
-	content.AddChild(ui.NewLabel(name).WithSize(16), ui.DefaultFlexParams())
-	content.AddChild(ui.NewLabel(desc).WithSize(13).WithColor(colorTextSecondary), ui.DefaultFlexParams())
-
-	cardStyle := ui.CardStyle{
-		BackgroundColor: colorCardBg,
-		BorderColor:     color.Transparent,
-		BorderWidth:     0,
-		Padding:         ui.All(cardPadding),
-		CornerRadius:    cornerRadiusMedium,
-	}
-
-	hoverStyle := ui.CardStyle{
-		BackgroundColor: colorCardBgHover,
-		BorderColor:     colorAccent,
-		BorderWidth:     0, // Border not rendered with rounded corners, but color signals hover
-		Padding:         ui.All(cardPadding),
-		CornerRadius:    cornerRadiusMedium,
-	}
-
-	card := ui.NewCard(content).
-		WithStyle(cardStyle).
-		WithHoverStyle(hoverStyle).
-		WithGraphicsWindow(s.app.window).
-		WithFixedSize(cardWidth, cardHeight).
+		WithFixedSize(contentWidth, imageHeight).
 		OnClick(func() {
 			s.app.selectedIndex = index
 			s.app.startBootBundle(index)
 		})
+	content.AddChild(imageCard, ui.DefaultFlexParams())
+
+	// Name and description with better spacing
+	content.AddChild(ui.NewWrapLabel(name).WithSize(16), ui.DefaultFlexParams())
+	content.AddChild(ui.NewWrapLabel(desc).WithSize(13).WithColor(colorTextSecondary), ui.DefaultFlexParams())
+
+	// Spacer to push buttons to bottom
+	content.AddChild(ui.NewSpacer(), ui.FlexParams(1))
+
+	// Bottom row with Start button on left, Settings button on right
+	bottomRow := ui.Row().WithGap(8)
+
+	// Start button (green)
+	startBtn := ui.NewButton("Start").
+		WithStyle(startButtonStyle()).
+		WithGraphicsWindow(s.app.window).
+		OnClick(func() {
+			s.app.selectedIndex = index
+			s.app.startBootBundle(index)
+		})
+	bottomRow.AddChild(startBtn, ui.DefaultFlexParams())
+
+	// Spacer between buttons
+	bottomRow.AddChild(ui.NewSpacer(), ui.FlexParams(1))
+
+	// Settings cog button (icon only, fixed size)
+	if s.iconCog != nil {
+		cogContent := ui.NewSVGImage(s.iconCog).WithSize(14, 14)
+		cogButton := ui.NewCard(cogContent).
+			WithStyle(cogButtonStyle()).
+			WithHoverStyle(cogButtonHoverStyle()).
+			WithGraphicsWindow(s.app.window).
+			WithFixedSize(buttonSize, buttonSize).
+			OnClick(func() {
+				s.app.showSettings(index)
+			})
+		bottomRow.AddChild(cogButton, ui.DefaultFlexParams())
+	}
+	content.AddChild(bottomRow, ui.DefaultFlexParams())
+
+	// Outer card is just a visual container (NOT clickable)
+	card := ui.NewCard(content).
+		WithStyle(bundleCardStyle()).
+		WithGraphicsWindow(s.app.window).
+		WithFixedSize(cardWidth, cardHeight)
 
 	return &bundleCardWidget{
 		card:  card,
@@ -398,11 +455,60 @@ func (s *LauncherScreen) buildBundleCard(index int, b discoveredBundle) *bundleC
 }
 
 func (s *LauncherScreen) Update(f graphics.Frame) {
+	t := float32(time.Since(s.app.start).Seconds())
+
 	// Update logo animation
 	if s.logo != nil {
-		t := float32(time.Since(s.app.start).Seconds())
 		s.logo.SetTime(t)
 	}
+
+	// Animate rainbow gradient on title
+	if s.titleLabel != nil {
+		// TokyoNight accent colors (desaturated rainbow)
+		rainbowColors := []color.RGBA{
+			hex("#f7768e"), // Red
+			hex("#e0af68"), // Yellow
+			hex("#9ece6a"), // Green
+			hex("#7dcfff"), // Cyan
+			hex("#7aa2f7"), // Blue
+			hex("#bb9af7"), // Magenta
+		}
+
+		// Calculate phase offset (0.0 to 1.0, cycles every 12 seconds)
+		phase := float32(t) / 12.0
+		phase = phase - float32(int(phase)) // Keep in 0-1 range
+
+		// Create stops with colors rotated by phase
+		// We need n+1 stops to create a seamless gradient (first color repeated at end)
+		n := len(rainbowColors)
+		stops := make([]graphics.ColorStop, n+1)
+
+		for i := 0; i <= n; i++ {
+			// Position is fixed and evenly spaced
+			pos := float32(i) / float32(n)
+
+			// Color index is offset by phase and wraps around
+			colorPhase := phase * float32(n)
+			colorIdx := (i + int(colorPhase)) % n
+
+			// Interpolate between two colors based on fractional phase
+			frac := colorPhase - float32(int(colorPhase))
+			nextColorIdx := (colorIdx + 1) % n
+
+			c1 := rainbowColors[colorIdx]
+			c2 := rainbowColors[nextColorIdx]
+
+			// Lerp between colors
+			r := uint8(float32(c1.R)*(1-frac) + float32(c2.R)*frac)
+			g := uint8(float32(c1.G)*(1-frac) + float32(c2.G)*frac)
+			b := uint8(float32(c1.B)*(1-frac) + float32(c2.B)*frac)
+
+			stops[i] = graphics.ColorStop{Position: pos, Color: color.RGBA{r, g, b, 255}}
+		}
+
+		s.titleLabel.SetGradient(stops)
+	}
+
 	s.root.InvalidateLayout()
 }
 
@@ -422,11 +528,15 @@ func (s *LauncherScreen) RenderBackground(f graphics.Frame) error {
 
 // LoadingScreen manages the loading UI state
 type LoadingScreen struct {
-	root        *ui.Root
-	app         *Application
-	logo        *ui.AnimatedLogo
-	progressBar *ui.ProgressBar
+	root          *ui.Root
+	app           *Application
+	logo          *ui.AnimatedLogo
+	progressBar   *ui.ProgressBar
 	progressLabel *ui.Label
+
+	// Blob count progress
+	blobProgressBar   *ui.ProgressBar
+	blobProgressLabel *ui.Label
 }
 
 // NewLoadingScreen creates the loading screen UI
@@ -446,78 +556,158 @@ func (s *LoadingScreen) buildUI() {
 	// Background
 	stack.AddChild(ui.NewBox(colorBackground))
 
-	// Centered logo with larger size
+	// Determine title, subtitle, and accent color based on mode
+	var title, subtitle string
+	var accentColor = colorAccent
+
+	// Read boot state under lock
+	s.app.bootProgressMu.Lock()
+	bootName := s.app.bootName
+	s.app.bootProgressMu.Unlock()
+
+	switch s.app.mode {
+	case modeUpdating:
+		title = "Downloading Update"
+		subtitle = bootName // Version string
+		accentColor = colorGreen
+	case modeInstalling:
+		title = "Downloading"
+		subtitle = s.app.installName
+		accentColor = colorAccent
+	default: // modeLoading
+		title = "Starting VM"
+		subtitle = bootName
+		accentColor = colorAccent
+	}
+
+	// Centered content column
+	centerContent := ui.Column().
+		WithCrossAlignment(ui.CrossAxisCenter).
+		WithGap(0)
+
+	// Smaller logo above the content
 	if s.app.logo != nil {
 		s.logo = ui.NewAnimatedLogo(s.app.logo).
-			WithSize(320, 320).
+			WithSize(180, 180).
 			WithSpeeds(0.9, -1.4, 2.2)
-		stack.AddChild(ui.CenterCenter(s.logo))
+		centerContent.AddChild(s.logo, ui.DefaultFlexParams())
 	}
 
-	// Loading status in a rounded card at top-left
-	msg := "Booting VM…"
-	if s.app.bootName != "" {
-		msg = "Booting " + s.app.bootName + "…"
+	// Spacer
+	centerContent.AddChild(ui.NewBox(color.Transparent).WithSize(0, 24), ui.DefaultFlexParams())
+
+	// Title (large)
+	centerContent.AddChild(
+		ui.NewLabel(title).WithSize(28).WithColor(colorTextPrimary),
+		ui.DefaultFlexParams(),
+	)
+
+	// Subtitle (version/name)
+	if subtitle != "" {
+		centerContent.AddChild(
+			ui.NewLabel(subtitle).WithSize(16).WithColor(colorTextSecondary),
+			ui.FlexParamsWithMargin(0, ui.Only(0, 8, 0, 0)),
+		)
 	}
 
-	// Create a column for the status card content
-	cardContent := ui.Column().WithGap(8)
-	cardContent.AddChild(ui.NewLabel(msg).WithSize(16).WithColor(colorTextPrimary), ui.DefaultFlexParams())
+	// Spacer
+	centerContent.AddChild(ui.NewBox(color.Transparent).WithSize(0, 32), ui.DefaultFlexParams())
 
-	// Add progress label and bar (initially hidden until download starts)
-	s.progressLabel = ui.NewLabel("").WithSize(12).WithColor(colorTextSecondary)
+	// Progress card
+	cardContent := ui.Column().WithGap(12)
+
+	// Blob count progress (overall progress)
+	s.blobProgressLabel = ui.NewLabel("Preparing...").WithSize(13).WithColor(colorTextSecondary)
+	cardContent.AddChild(s.blobProgressLabel, ui.DefaultFlexParams())
+
+	s.blobProgressBar = ui.NewProgressBar().
+		WithMinWidth(380).
+		WithStyle(progressBarStyle(accentColor)).
+		WithGraphicsWindow(s.app.window)
+	cardContent.AddChild(s.blobProgressBar, ui.DefaultFlexParams())
+
+	// Current blob progress (bytes downloaded)
+	s.progressLabel = ui.NewLabel("").WithSize(12).WithColor(colorTextMuted)
 	cardContent.AddChild(s.progressLabel, ui.DefaultFlexParams())
 
 	s.progressBar = ui.NewProgressBar().
-		WithMinWidth(280).
-		WithStyle(ui.ProgressBarStyle{
-			BackgroundColor: color.RGBA{R: 0x24, G: 0x28, B: 0x3b, A: 255},
-			FillColor:       colorAccent,
-			TextColor:       colorTextPrimary,
-			Height:          6,
-			CornerRadius:    3,
-			ShowPercentage:  false,
-			TextSize:        12,
-		}).
+		WithMinWidth(380).
+		WithStyle(progressBarSmallStyle()).
 		WithGraphicsWindow(s.app.window)
 	cardContent.AddChild(s.progressBar, ui.DefaultFlexParams())
 
 	loadingCard := ui.NewCard(
-		ui.NewPadding(cardContent, ui.Symmetric(16, 12)),
+		ui.NewPadding(cardContent, ui.Symmetric(24, 20)),
 	).
 		WithStyle(ui.CardStyle{
-			BackgroundColor: colorTopBar,
-			CornerRadius:    cornerRadiusSmall,
+			BackgroundColor: colorCardBg,
+			CornerRadius:    cornerRadiusMedium,
 		}).
 		WithGraphicsWindow(s.app.window)
-	stack.AddChild(ui.TopLeft(ui.NewPadding(loadingCard, ui.All(24))))
+	centerContent.AddChild(loadingCard, ui.DefaultFlexParams())
+
+	stack.AddChild(ui.CenterCenter(centerContent))
 
 	s.root.SetChild(stack)
 }
 
 func (s *LoadingScreen) Update(f graphics.Frame) {
+	// Get the appropriate start time and progress based on mode
+	var startTime time.Time
+	var progress oci.DownloadProgress
+
+	if s.app.mode == modeInstalling {
+		startTime = s.app.installStarted
+		s.app.installProgressMu.Lock()
+		progress = s.app.installProgress
+		s.app.installProgressMu.Unlock()
+	} else {
+		// modeLoading and modeUpdating both use bootProgress
+		// Read all boot state under the same lock
+		s.app.bootProgressMu.Lock()
+		startTime = s.app.bootStarted
+		progress = s.app.bootProgress
+		s.app.bootProgressMu.Unlock()
+	}
+
 	if s.logo != nil {
-		t := float32(time.Since(s.app.bootStarted).Seconds())
+		t := float32(time.Since(startTime).Seconds())
 		s.logo.SetTime(t)
 	}
 
-	// Update progress bar from app state
-	s.app.bootProgressMu.Lock()
-	progress := s.app.bootProgress
-	s.app.bootProgressMu.Unlock()
+	// Update blob count progress (overall progress)
+	if progress.BlobCount > 0 {
+		blobPercent := float64(progress.BlobIndex) / float64(progress.BlobCount)
+		s.blobProgressBar.SetValue(blobPercent)
+		s.blobProgressLabel.SetText(fmt.Sprintf("Downloading blob %d of %d", progress.BlobIndex+1, progress.BlobCount))
+	}
 
+	// Update current blob progress (bytes downloaded)
 	if progress.Total > 0 {
 		// Calculate progress percentage
 		percent := float64(progress.Current) / float64(progress.Total)
 		s.progressBar.SetValue(percent)
 
-		// Format the label to show download status
+		// Format the label to show download status with speed and ETA
 		label := formatBytes(progress.Current) + " / " + formatBytes(progress.Total)
+		if progress.BytesPerSecond > 0 {
+			label += " - " + formatSpeed(progress.BytesPerSecond)
+		}
+		if progress.ETA >= 0 {
+			etaStr := formatETA(progress.ETA)
+			if etaStr != "" {
+				label += " - " + etaStr
+			}
+		}
 		s.progressLabel.SetText(label)
 	} else if progress.Current > 0 {
-		// Unknown total, show bytes downloaded
+		// Unknown total, show bytes downloaded with speed
 		s.progressBar.SetValue(0) // Indeterminate
-		s.progressLabel.SetText("Downloading: " + formatBytes(progress.Current))
+		label := "Downloading: " + formatBytes(progress.Current)
+		if progress.BytesPerSecond > 0 {
+			label += " - " + formatSpeed(progress.BytesPerSecond)
+		}
+		s.progressLabel.SetText(label)
 	}
 
 	s.root.InvalidateLayout()
@@ -573,12 +763,12 @@ func (s *ErrorScreen) buildUI() {
 	}
 	errorCard := ui.NewCard(
 		ui.NewPadding(
-			ui.NewLabel(msg).WithSize(16).WithColor(colorTextPrimary),
+			ui.NewWrapLabel(msg).WithSize(16).WithColor(colorTextPrimary),
 			ui.All(16),
 		),
 	).
 		WithStyle(ui.CardStyle{
-			BackgroundColor: color.RGBA{R: 0x29, G: 0x1b, B: 0x23, A: 255}, // Tokyo Night red tint
+			BackgroundColor: colorRedTint,
 			CornerRadius:    cornerRadiusSmall,
 		}).
 		WithGraphicsWindow(s.app.window)
@@ -590,17 +780,32 @@ func (s *ErrorScreen) buildUI() {
 	// Primary action button (blue accent)
 	primaryStyle := primaryButtonStyle()
 	primaryStyle.MinWidth = 280
-	buttonCol.AddChild(
-		ui.NewButton("Back to Launcher").
-			WithStyle(primaryStyle).
-			WithGraphicsWindow(s.app.window).
-			OnClick(func() {
-				s.app.errMsg = ""
-				s.app.selectedIndex = -1
-				s.app.mode = modeLauncher
-			}),
-		ui.DefaultFlexParams(),
-	)
+
+	if s.app.fatalError {
+		// Fatal error - show Quit button
+		buttonCol.AddChild(
+			ui.NewButton("Quit").
+				WithStyle(primaryStyle).
+				WithGraphicsWindow(s.app.window).
+				OnClick(func() {
+					s.app.requestShutdown(1)
+				}),
+			ui.DefaultFlexParams(),
+		)
+	} else {
+		// Recoverable error - show Back to Launcher button
+		buttonCol.AddChild(
+			ui.NewButton("Back to Launcher").
+				WithStyle(primaryStyle).
+				WithGraphicsWindow(s.app.window).
+				OnClick(func() {
+					s.app.errMsg = ""
+					s.app.selectedIndex = -1
+					s.app.mode = modeLauncher
+				}),
+			ui.DefaultFlexParams(),
+		)
+	}
 
 	// Secondary action button (muted)
 	secondaryStyle := secondaryButtonStyle()
@@ -638,11 +843,19 @@ func (s *ErrorScreen) Render(f graphics.Frame) error {
 
 // TerminalScreen manages the terminal UI state
 type TerminalScreen struct {
-	root *ui.Root
-	app  *Application
+	root           *ui.Root
+	app            *Application
+	expandedCard   *ui.Card
+	collapsedCard  *ui.Card
+	exitBtn        *ui.Button
+	netBtn         *ui.Button
+	expanded       bool
+	expandProgress float32
+	lastUpdate     time.Time
+	prevLeftDown   bool // For manual click detection
 }
 
-// NewTerminalScreen creates the terminal screen UI (top bar only)
+// NewTerminalScreen creates the terminal screen UI (notch bar)
 func NewTerminalScreen(app *Application) *TerminalScreen {
 	screen := &TerminalScreen{
 		root: ui.NewRoot(app.text),
@@ -653,39 +866,148 @@ func NewTerminalScreen(app *Application) *TerminalScreen {
 }
 
 func (s *TerminalScreen) buildUI() {
-	// Just the top bar - terminal view is handled separately
-	topBar := ui.Row().
-		WithBackground(colorTopBar).
-		WithPadding(ui.Symmetric(16, 6)).
-		WithCrossAlignment(ui.CrossAxisCenter).
-		AddChild(
-			ui.NewButton("Exit").
-				WithStyle(topBarButtonStyle()).
-				WithGraphicsWindow(s.app.window).
-				OnClick(func() {
-					s.app.stopVM()
-				}),
-			ui.DefaultFlexParams(),
-		).
-		AddChild(ui.NewSpacer(), ui.FlexParams(1)).
-		AddChild(
-			ui.NewButton("Logs").
-				WithStyle(topBarButtonStyle()).
-				WithGraphicsWindow(s.app.window).
-				OnClick(func() {
-					s.app.openLogs()
-				}),
-			ui.DefaultFlexParams(),
-		)
+	// Create buttons for expanded state
+	s.exitBtn = ui.NewButton("Exit").
+		WithStyle(notchExitButtonStyle()).
+		WithGraphicsWindow(s.app.window).
+		OnClick(func() {
+			s.app.showExitConfirm = true
+		})
 
-	// Wrap in column to set height
+	s.netBtn = ui.NewButton("Net").
+		WithStyle(notchNetButtonStyle(true)).
+		WithGraphicsWindow(s.app.window).
+		OnClick(func() {
+			s.app.networkDisabled = !s.app.networkDisabled
+			if s.app.running != nil && s.app.running.netBackend != nil {
+				s.app.running.netBackend.SetInternetAccessEnabled(!s.app.networkDisabled)
+			}
+			// Update button style
+			if s.app.networkDisabled {
+				s.netBtn.WithStyle(notchNetButtonStyle(false))
+				s.netBtn.SetText("Off")
+			} else {
+				s.netBtn.WithStyle(notchNetButtonStyle(true))
+				s.netBtn.SetText("Net")
+			}
+			slog.Info("internet access toggled", "disabled", s.app.networkDisabled)
+		})
+
+	// Button row inside the expanded notch
+	buttonRow := ui.Row().
+		WithCrossAlignment(ui.CrossAxisCenter).
+		WithGap(8).
+		AddChild(s.exitBtn, ui.DefaultFlexParams()).
+		AddChild(s.netBtn, ui.DefaultFlexParams())
+
+	// Expanded notch card with buttons
+	s.expandedCard = ui.NewCard(buttonRow).
+		WithStyle(notchExpandedCardStyle()).
+		WithGraphicsWindow(s.app.window)
+
+	// Collapsed notch card (small indicator bar)
+	s.collapsedCard = ui.NewCard(nil).
+		WithStyle(notchCollapsedCardStyle()).
+		WithGraphicsWindow(s.app.window).
+		WithFixedSize(60, 10) // small pill
+
+	s.rebuildLayout()
+}
+
+func (s *TerminalScreen) rebuildLayout() {
+	// Choose which card to show based on expanded state
+	var notchWidget ui.Widget
+	if s.expanded {
+		notchWidget = s.expandedCard
+	} else {
+		notchWidget = s.collapsedCard
+	}
+
+	// Center the notch at the top
+	topRow := ui.Row().
+		WithCrossAlignment(ui.CrossAxisCenter).
+		AddChild(ui.NewSpacer(), ui.FlexParams(1)).
+		AddChild(notchWidget, ui.DefaultFlexParams()).
+		AddChild(ui.NewSpacer(), ui.FlexParams(1))
+
+	// Wrap in column
 	col := ui.Column()
-	col.AddChild(topBar, ui.DefaultFlexParams())
+	col.AddChild(topRow, ui.DefaultFlexParams())
 	col.AddChild(ui.NewSpacer(), ui.FlexParams(1)) // Rest of space for terminal
 
 	s.root.SetChild(col)
 }
 
-func (s *TerminalScreen) RenderTopBar(f graphics.Frame) {
-	s.root.Step(f, s.app.window.PlatformWindow())
+func (s *TerminalScreen) RenderNotch(f graphics.Frame) {
+	// Get mouse position and window size
+	mx, my := f.CursorPos()
+	w, _ := f.WindowSize()
+	winW := float32(w)
+
+	// Define hover zone (expanded notch area at top center)
+	hoverW := notchHoverW
+	hoverH := notchHoverH
+	hoverX := (winW - hoverW) / 2
+	hoverRect := rect{x: hoverX, y: 0, w: hoverW, h: hoverH}
+	isHovered := hoverRect.contains(mx, my)
+
+	// Animate expand/collapse
+	now := time.Now()
+	if !s.lastUpdate.IsZero() {
+		dt := float32(now.Sub(s.lastUpdate).Seconds())
+		if isHovered {
+			s.expandProgress += notchAnimSpeed * dt
+			if s.expandProgress > 1.0 {
+				s.expandProgress = 1.0
+			}
+		} else {
+			s.expandProgress -= notchAnimSpeed * dt
+			if s.expandProgress < 0.0 {
+				s.expandProgress = 0.0
+			}
+		}
+	}
+	s.lastUpdate = now
+
+	// Update expanded state and rebuild if changed
+	newExpanded := s.expandProgress > 0.5
+	if newExpanded != s.expanded {
+		s.expanded = newExpanded
+		s.rebuildLayout()
+	}
+
+	// Use DrawOnly to avoid consuming keyboard events that the terminal needs.
+	// Handle button clicks manually below.
+	s.root.DrawOnly(f)
+
+	// Manual button click handling when expanded
+	if s.expanded {
+		leftDown := f.GetButtonState(window.ButtonLeft).IsDown()
+		justClicked := leftDown && !s.prevLeftDown
+		s.prevLeftDown = leftDown
+
+		if justClicked {
+			// Use actual button bounds from the UI layout
+			if s.exitBtn.Bounds().Contains(mx, my) {
+				s.app.showExitConfirm = true
+			}
+
+			if s.netBtn.Bounds().Contains(mx, my) {
+				s.app.networkDisabled = !s.app.networkDisabled
+				if s.app.running != nil && s.app.running.netBackend != nil {
+					s.app.running.netBackend.SetInternetAccessEnabled(!s.app.networkDisabled)
+				}
+				if s.app.networkDisabled {
+					s.netBtn.WithStyle(notchNetButtonStyle(false))
+					s.netBtn.SetText("Off")
+				} else {
+					s.netBtn.WithStyle(notchNetButtonStyle(true))
+					s.netBtn.SetText("Net")
+				}
+				slog.Info("internet access toggled", "disabled", s.app.networkDisabled)
+			}
+		}
+	} else {
+		s.prevLeftDown = f.GetButtonState(window.ButtonLeft).IsDown()
+	}
 }

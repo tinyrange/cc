@@ -126,10 +126,13 @@ func (c *Checkbox) Draw(ctx *DrawContext) {
 		)
 	}
 
-	// Draw label
+	// Draw label using proper font metrics
 	if ctx.Text != nil && c.label != "" {
 		labelX := bounds.X + c.style.BoxSize + c.style.Gap
-		labelY := bounds.Y + bounds.H/2 + float32(c.style.LabelSize)/3
+		// Vertical centering: (bounds.H - lineHeight)/2 + ascender
+		lineHeight := ctx.Text.LineHeight(c.style.LabelSize)
+		ascender := ctx.Text.Ascender(c.style.LabelSize)
+		labelY := bounds.Y + (bounds.H-lineHeight)/2 + ascender
 		ctx.Text.RenderText(c.label, labelX, labelY, c.style.LabelSize, c.style.LabelColor)
 	}
 }

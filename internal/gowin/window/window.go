@@ -55,6 +55,14 @@ type FileDialogSupport interface {
 	ShowOpenPanel(dialogType FileDialogType, allowedExtensions []string) string
 }
 
+// URLEventSupport is an optional interface that windows can implement
+// to receive URL open events (e.g., custom URL schemes on macOS)
+type URLEventSupport interface {
+	// SetURLHandler sets a callback to receive URLs opened via custom schemes.
+	// On macOS, this handles Apple Events when the app is already running.
+	SetURLHandler(handler func(url string))
+}
+
 // GetDisplayScale returns the display scale factor before creating a window.
 // This can be used to calculate the physical window size needed to achieve
 // a desired logical size on HiDPI displays.

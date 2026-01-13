@@ -1,6 +1,7 @@
 package oci
 
 import (
+	"archive/tar"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -26,6 +28,14 @@ type DownloadProgress struct {
 	Current  int64  // Bytes downloaded so far
 	Total    int64  // Total bytes to download (-1 if unknown)
 	Filename string // Name/path being downloaded
+
+	// Blob count tracking
+	BlobIndex int // Index of current blob (0-based)
+	BlobCount int // Total number of blobs to download
+
+	// Speed and ETA tracking
+	BytesPerSecond float64       // Current download speed in bytes per second
+	ETA            time.Duration // Estimated time remaining (-1 if unknown)
 }
 
 // ProgressCallback is called periodically during downloads.
@@ -37,6 +47,10 @@ type Client struct {
 	logger           *slog.Logger
 	client           *http.Client
 	progressCallback ProgressCallback
+
+	// Blob context for progress tracking
+	blobIndex int
+	blobCount int
 }
 
 // NewClient creates a new OCI client with the specified cache directory.
@@ -57,7 +71,16 @@ func NewClient(cacheDir string) (*Client, error) {
 		cacheDir: cacheDir,
 		logger:   slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})),
 		client: &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout: 0, // No overall timeout for large downloads
+			Transport: &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout:   30 * time.Second, // Connection timeout
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
+				// No IdleConnTimeout - allow large downloads
+			},
 		},
 	}, nil
 }
@@ -67,6 +90,13 @@ func NewClient(cacheDir string) (*Client, error) {
 // Set to nil to disable progress reporting.
 func (c *Client) SetProgressCallback(callback ProgressCallback) {
 	c.progressCallback = callback
+}
+
+// SetBlobContext sets the current blob index and total count for progress reporting.
+// This should be called before each blob download to track overall progress.
+func (c *Client) SetBlobContext(index, count int) {
+	c.blobIndex = index
+	c.blobCount = count
 }
 
 // registryContext holds state for communicating with a single registry.
@@ -249,10 +279,12 @@ func (c *Client) fetchToCache(ctx *registryContext, path string, accept []string
 		// handle progress display themselves and don't want terminal output.
 		if c.progressCallback != nil {
 			pw := &progressWriter{
-				w:        tmpFile,
-				total:    resp.ContentLength,
-				filename: path,
-				callback: c.progressCallback,
+				w:         tmpFile,
+				total:     resp.ContentLength,
+				filename:  path,
+				callback:  c.progressCallback,
+				blobIndex: c.blobIndex,
+				blobCount: c.blobCount,
 			}
 			writer = pw
 		} else {
@@ -312,21 +344,71 @@ func (c *Client) readJSON(ctx *registryContext, path string, accept []string, ou
 
 // progressWriter wraps an io.Writer and reports progress via a callback.
 type progressWriter struct {
-	w        io.Writer
-	current  int64
-	total    int64
-	filename string
-	callback ProgressCallback
+	w         io.Writer
+	current   int64
+	total     int64
+	filename  string
+	callback  ProgressCallback
+	blobIndex int
+	blobCount int
+
+	// Timing for speed/ETA calculation
+	startTime  time.Time
+	lastUpdate time.Time
+	lastBytes  int64
+	speed      float64 // smoothed bytes per second
 }
 
 func (pw *progressWriter) Write(p []byte) (int, error) {
 	n, err := pw.w.Write(p)
 	pw.current += int64(n)
+
 	if pw.callback != nil {
+		now := time.Now()
+
+		// Initialize timing on first write
+		if pw.startTime.IsZero() {
+			pw.startTime = now
+			pw.lastUpdate = now
+			pw.lastBytes = 0
+		}
+
+		// Calculate speed using exponential moving average
+		elapsed := now.Sub(pw.lastUpdate).Seconds()
+		if elapsed >= 0.1 { // Update speed every 100ms minimum
+			bytesThisInterval := pw.current - pw.lastBytes
+			instantSpeed := float64(bytesThisInterval) / elapsed
+
+			// Smooth the speed with exponential moving average (alpha = 0.3)
+			if pw.speed == 0 {
+				pw.speed = instantSpeed
+			} else {
+				pw.speed = 0.3*instantSpeed + 0.7*pw.speed
+			}
+
+			pw.lastUpdate = now
+			pw.lastBytes = pw.current
+		}
+
+		// Calculate ETA
+		var eta time.Duration = -1
+		if pw.speed > 0 && pw.total > 0 {
+			remaining := pw.total - pw.current
+			if remaining > 0 {
+				eta = time.Duration(float64(remaining)/pw.speed) * time.Second
+			} else {
+				eta = 0
+			}
+		}
+
 		pw.callback(DownloadProgress{
-			Current:  pw.current,
-			Total:    pw.total,
-			Filename: pw.filename,
+			Current:        pw.current,
+			Total:          pw.total,
+			Filename:       pw.filename,
+			BlobIndex:      pw.blobIndex,
+			BlobCount:      pw.blobCount,
+			BytesPerSecond: pw.speed,
+			ETA:            eta,
 		})
 	}
 	return n, err
@@ -335,6 +417,41 @@ func (pw *progressWriter) Write(p []byte) (int, error) {
 // IsLocalTar checks if the image reference is a local tar file.
 func IsLocalTar(imageRef string) bool {
 	return (strings.HasPrefix(imageRef, "./") || strings.HasPrefix(imageRef, "../") || strings.HasPrefix(imageRef, "/")) && strings.HasSuffix(imageRef, ".tar")
+}
+
+// ValidateTar checks if a file is a valid Docker/OCI tar archive.
+// It opens the tar and verifies it contains a valid manifest.json.
+func ValidateTar(tarPath string) error {
+	f, err := os.Open(tarPath)
+	if err != nil {
+		return fmt.Errorf("open tar: %w", err)
+	}
+	defer f.Close()
+
+	tr := tar.NewReader(f)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return fmt.Errorf("manifest.json not found in tar archive")
+		}
+		if err != nil {
+			return fmt.Errorf("read tar: %w", err)
+		}
+		if hdr.Name == "manifest.json" {
+			data, err := io.ReadAll(tr)
+			if err != nil {
+				return fmt.Errorf("read manifest.json: %w", err)
+			}
+			var entries []json.RawMessage
+			if err := json.Unmarshal(data, &entries); err != nil {
+				return fmt.Errorf("parse manifest.json: %w", err)
+			}
+			if len(entries) == 0 {
+				return fmt.Errorf("no images in tar archive")
+			}
+			return nil
+		}
+	}
 }
 
 // ParseImageRef parses an OCI image reference into registry, image, and tag.
@@ -372,4 +489,70 @@ func ParseImageRef(imageRef string) (registry string, image string, tag string, 
 	}
 
 	return registry, image, tag, nil
+}
+
+// ValidateImageName validates an OCI image name format and optionally checks if it exists in the registry.
+// If checkRegistry is true, it will make a HEAD request to verify the image exists.
+func ValidateImageName(imageRef string, checkRegistry bool) error {
+	// Check for empty input
+	if strings.TrimSpace(imageRef) == "" {
+		return fmt.Errorf("image name cannot be empty")
+	}
+
+	// Validate format using ParseImageRef
+	registry, imageName, tag, err := ParseImageRef(imageRef)
+	if err != nil {
+		return fmt.Errorf("invalid image format: %w", err)
+	}
+
+	// Optionally check if the image exists in the registry
+	if checkRegistry {
+		httpClient := &http.Client{Timeout: 30 * time.Second}
+		ctx := &registryContext{
+			logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+			client:   httpClient,
+			registry: registry,
+		}
+
+		// Build manifest URL for HEAD request
+		manifestURL := fmt.Sprintf("%s/%s/manifests/%s", registry, imageName, tag)
+		acceptTypes := []string{
+			"application/vnd.oci.image.manifest.v1+json",
+			"application/vnd.docker.distribution.manifest.v2+json",
+			"application/vnd.docker.distribution.manifest.list.v2+json",
+			"application/vnd.oci.image.index.v1+json",
+		}
+
+		// Try up to 2 times (initial + retry after auth)
+		for attempt := 0; attempt < 2; attempt++ {
+			req, err := ctx.makeRequest(http.MethodHead, manifestURL, acceptTypes)
+			if err != nil {
+				return fmt.Errorf("failed to create request: %w", err)
+			}
+
+			resp, err := httpClient.Do(req)
+			if err != nil {
+				return fmt.Errorf("failed to check image existence: %w", err)
+			}
+
+			if resp.StatusCode == http.StatusNotFound {
+				resp.Body.Close()
+				return fmt.Errorf("image %q not found in registry", imageRef)
+			}
+
+			ok, authErr := ctx.handleResponse(resp)
+			if ok {
+				resp.Body.Close()
+				return nil // Image exists
+			}
+			if authErr != nil {
+				return fmt.Errorf("registry error: %w", authErr)
+			}
+			// handleResponse returned false, nil means we should retry with new token
+		}
+
+		return fmt.Errorf("failed to authenticate with registry after retries")
+	}
+
+	return nil
 }

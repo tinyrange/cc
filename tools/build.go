@@ -80,6 +80,8 @@ type buildOptions struct {
 	LogoPath string
 	// IconPath is the path to a .ico file to use as the application icon (Windows only)
 	IconPath string
+	// Version is injected into the binary via ldflags (for ccapp auto-update)
+	Version string
 }
 
 type buildOutput struct {
@@ -116,6 +118,8 @@ func copyFile(dstPath, srcPath string, perm os.FileMode) error {
 // - string => <string>
 // - bool   => <true/> / <false/>
 // - int/uint and sized variants => <integer>
+// - slice of strings => <array> of <string>
+// - slice of structs => <array> of <dict>
 //
 // Fields are encoded in declaration order. Use struct tags: `plist:"CFBundleName"`.
 func encodePlist(v any) ([]byte, error) {
@@ -196,6 +200,34 @@ func encodePlist(v any) ([]byte, error) {
 			if err := enc.EncodeElement(s, xml.StartElement{Name: xml.Name{Local: "integer"}}); err != nil {
 				return nil, fmt.Errorf("plist: encode integer %q: %w", key, err)
 			}
+		case reflect.Slice:
+			if fv.Len() == 0 {
+				continue // Skip empty slices
+			}
+			arrayStart := xml.StartElement{Name: xml.Name{Local: "array"}}
+			if err := enc.EncodeToken(arrayStart); err != nil {
+				return nil, fmt.Errorf("plist: encode <array> for %q: %w", key, err)
+			}
+			elemKind := fv.Type().Elem().Kind()
+			for j := 0; j < fv.Len(); j++ {
+				elem := fv.Index(j)
+				switch elemKind {
+				case reflect.String:
+					if err := enc.EncodeElement(elem.String(), xml.StartElement{Name: xml.Name{Local: "string"}}); err != nil {
+						return nil, fmt.Errorf("plist: encode string in array %q: %w", key, err)
+					}
+				case reflect.Struct:
+					// Encode struct as dict
+					if err := encodePlistDict(enc, elem); err != nil {
+						return nil, fmt.Errorf("plist: encode dict in array %q: %w", key, err)
+					}
+				default:
+					return nil, fmt.Errorf("plist: unsupported slice element kind %s for key %q", elemKind, key)
+				}
+			}
+			if err := enc.EncodeToken(arrayStart.End()); err != nil {
+				return nil, fmt.Errorf("plist: encode </array> for %q: %w", key, err)
+			}
 		default:
 			return nil, fmt.Errorf("plist: unsupported kind %s for key %q (field %s)", fv.Kind(), key, f.Name)
 		}
@@ -212,6 +244,90 @@ func encodePlist(v any) ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
+}
+
+// encodePlistDict encodes a struct value as a plist dict element.
+func encodePlistDict(enc *xml.Encoder, rv reflect.Value) error {
+	if rv.Kind() == reflect.Pointer {
+		rv = rv.Elem()
+	}
+	if rv.Kind() != reflect.Struct {
+		return fmt.Errorf("expected struct, got %s", rv.Kind())
+	}
+	rt := rv.Type()
+
+	dictStart := xml.StartElement{Name: xml.Name{Local: "dict"}}
+	if err := enc.EncodeToken(dictStart); err != nil {
+		return fmt.Errorf("encode <dict>: %w", err)
+	}
+
+	for i := 0; i < rt.NumField(); i++ {
+		f := rt.Field(i)
+		if f.PkgPath != "" { // unexported
+			continue
+		}
+		key := f.Tag.Get("plist")
+		if key == "" || key == "-" {
+			continue
+		}
+
+		fv := rv.Field(i)
+		if fv.Kind() == reflect.Pointer {
+			if fv.IsNil() {
+				continue
+			}
+			fv = fv.Elem()
+		}
+
+		if err := enc.EncodeElement(key, xml.StartElement{Name: xml.Name{Local: "key"}}); err != nil {
+			return fmt.Errorf("encode key %q: %w", key, err)
+		}
+
+		switch fv.Kind() {
+		case reflect.String:
+			if err := enc.EncodeElement(fv.String(), xml.StartElement{Name: xml.Name{Local: "string"}}); err != nil {
+				return fmt.Errorf("encode string %q: %w", key, err)
+			}
+		case reflect.Bool:
+			elem := "false"
+			if fv.Bool() {
+				elem = "true"
+			}
+			start := xml.StartElement{Name: xml.Name{Local: elem}}
+			if err := enc.EncodeToken(start); err != nil {
+				return fmt.Errorf("encode <%s/> for %q: %w", elem, key, err)
+			}
+			if err := enc.EncodeToken(start.End()); err != nil {
+				return fmt.Errorf("encode </%s> for %q: %w", elem, key, err)
+			}
+		case reflect.Slice:
+			if fv.Len() == 0 {
+				continue
+			}
+			arrayStart := xml.StartElement{Name: xml.Name{Local: "array"}}
+			if err := enc.EncodeToken(arrayStart); err != nil {
+				return fmt.Errorf("encode <array> for %q: %w", key, err)
+			}
+			for j := 0; j < fv.Len(); j++ {
+				elem := fv.Index(j)
+				if elem.Kind() == reflect.String {
+					if err := enc.EncodeElement(elem.String(), xml.StartElement{Name: xml.Name{Local: "string"}}); err != nil {
+						return fmt.Errorf("encode string in array %q: %w", key, err)
+					}
+				}
+			}
+			if err := enc.EncodeToken(arrayStart.End()); err != nil {
+				return fmt.Errorf("encode </array> for %q: %w", key, err)
+			}
+		default:
+			return fmt.Errorf("unsupported kind %s for key %q", fv.Kind(), key)
+		}
+	}
+
+	if err := enc.EncodeToken(dictStart.End()); err != nil {
+		return fmt.Errorf("encode </dict>: %w", err)
+	}
+	return nil
 }
 
 func writeMacOSAppBundle(bundlePath, executablePath, appName, logoPath string) error {
@@ -249,17 +365,24 @@ func writeMacOSAppBundle(bundlePath, executablePath, appName, logoPath string) e
 	// Keep it simple: this is primarily for local development workflows.
 	bundleID := "com.tinyrange." + strings.ToLower(appName)
 
+	// URL scheme type for custom URL handlers
+	type urlSchemeType struct {
+		CFBundleURLName    string   `plist:"CFBundleURLName"`
+		CFBundleURLSchemes []string `plist:"CFBundleURLSchemes"`
+	}
+
 	type infoPlist struct {
-		CFBundleDevelopmentRegion     string `plist:"CFBundleDevelopmentRegion"`
-		CFBundleExecutable            string `plist:"CFBundleExecutable"`
-		CFBundleIdentifier            string `plist:"CFBundleIdentifier"`
-		CFBundleInfoDictionaryVersion string `plist:"CFBundleInfoDictionaryVersion"`
-		CFBundleName                  string `plist:"CFBundleName"`
-		CFBundlePackageType           string `plist:"CFBundlePackageType"`
-		CFBundleShortVersionString    string `plist:"CFBundleShortVersionString"`
-		CFBundleVersion               string `plist:"CFBundleVersion"`
-		NSHighResolutionCapable       bool   `plist:"NSHighResolutionCapable"`
-		CFBundleIconFile              string `plist:"CFBundleIconFile"`
+		CFBundleDevelopmentRegion     string          `plist:"CFBundleDevelopmentRegion"`
+		CFBundleExecutable            string          `plist:"CFBundleExecutable"`
+		CFBundleIdentifier            string          `plist:"CFBundleIdentifier"`
+		CFBundleInfoDictionaryVersion string          `plist:"CFBundleInfoDictionaryVersion"`
+		CFBundleName                  string          `plist:"CFBundleName"`
+		CFBundlePackageType           string          `plist:"CFBundlePackageType"`
+		CFBundleShortVersionString    string          `plist:"CFBundleShortVersionString"`
+		CFBundleVersion               string          `plist:"CFBundleVersion"`
+		NSHighResolutionCapable       bool            `plist:"NSHighResolutionCapable"`
+		CFBundleIconFile              string          `plist:"CFBundleIconFile"`
+		CFBundleURLTypes              []urlSchemeType `plist:"CFBundleURLTypes"`
 	}
 
 	plistData, err := encodePlist(infoPlist{
@@ -273,6 +396,10 @@ func writeMacOSAppBundle(bundlePath, executablePath, appName, logoPath string) e
 		CFBundleVersion:               "0",
 		NSHighResolutionCapable:       true,
 		CFBundleIconFile:              iconFileName,
+		CFBundleURLTypes: []urlSchemeType{{
+			CFBundleURLName:    "CrumbleCracker URL",
+			CFBundleURLSchemes: []string{"crumblecracker"},
+		}},
 	})
 	if err != nil {
 		return fmt.Errorf("encode Info.plist: %w", err)
@@ -394,9 +521,21 @@ func goBuild(opts buildOptions) (buildOutput, error) {
 		args = append(args, "-tags", strings.Join(opts.Tags, " "))
 	}
 
+	// Build ldflags
+	var ldflags []string
+
+	// Inject version if specified
+	if opts.Version != "" {
+		ldflags = append(ldflags, fmt.Sprintf("-X %s/cmd/ccapp.Version=%s", PACKAGE_NAME, opts.Version))
+	}
+
 	// if the target is windows and BuildApp is true use the windows subsystem rather than the default console subsystem
 	if opts.Build.GOOS == "windows" && opts.BuildApp {
-		args = append(args, "-ldflags=-H windowsgui")
+		ldflags = append(ldflags, "-H windowsgui")
+	}
+
+	if len(ldflags) > 0 {
+		args = append(args, "-ldflags="+strings.Join(ldflags, " "))
 	}
 
 	// Generate Windows resources (.syso file with icon) if building for Windows with an icon
@@ -924,6 +1063,62 @@ func verifyRelease(appPath string) error {
 	}
 
 	fmt.Printf("verification successful for %s\n", appPath)
+	return nil
+}
+
+// getVersionFromGit returns the version from GITHUB_REF_NAME (for CI) or git describe --tags.
+func getVersionFromGit() string {
+	// Check for GitHub Actions ref name (e.g., "v1.0.0" for tags)
+	if ref := os.Getenv("GITHUB_REF_NAME"); ref != "" && strings.HasPrefix(ref, "v") {
+		return ref
+	}
+
+	// Fall back to git describe
+	cmd := exec.Command("git", "describe", "--tags", "--always")
+	out, err := cmd.Output()
+	if err == nil {
+		version := strings.TrimSpace(string(out))
+		if version != "" {
+			return version
+		}
+	}
+
+	return "dev"
+}
+
+// buildInstaller builds the ccinstaller binary for the specified platform and copies it
+// to internal/update/installers/ for embedding.
+func buildInstaller(platform crossBuild) error {
+	installersDir := filepath.Join("internal", "update", "installers")
+	if err := os.MkdirAll(installersDir, 0755); err != nil {
+		return fmt.Errorf("create installers dir: %w", err)
+	}
+
+	fmt.Printf("building ccinstaller for %s/%s...\n", platform.GOOS, platform.GOARCH)
+
+	suffix := ""
+	if platform.GOOS == "windows" {
+		suffix = ".exe"
+	}
+
+	out, err := goBuild(buildOptions{
+		Package:    "cmd/ccinstaller",
+		OutputName: "ccinstaller",
+		Build:      platform,
+	})
+	if err != nil {
+		return fmt.Errorf("build installer for %s/%s: %w", platform.GOOS, platform.GOARCH, err)
+	}
+
+	// Copy to installers directory with platform-specific name
+	destName := fmt.Sprintf("ccinstaller_%s_%s%s", platform.GOOS, platform.GOARCH, suffix)
+	destPath := filepath.Join(installersDir, destName)
+
+	if err := copyFile(destPath, out.Path, 0755); err != nil {
+		return fmt.Errorf("copy installer to %s: %w", destPath, err)
+	}
+
+	fmt.Printf("  -> %s\n", destPath)
 	return nil
 }
 
@@ -1646,7 +1841,17 @@ func main() {
 	}
 	fmt.Printf("built %s\n", out.Path)
 
-	// also build cmd/ccapp
+	// Build installer for target platform (for embedding into ccapp)
+	if err := buildInstaller(buildTarget); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to build installer: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Get version for ccapp
+	version := getVersionFromGit()
+	fmt.Printf("ccapp version: %s\n", version)
+
+	// also build cmd/ccapp (with embedded installers and version)
 	ccappOut, err := goBuild(buildOptions{
 		Package:          "cmd/ccapp",
 		ApplicationName:  "CrumbleCracker",
@@ -1656,6 +1861,8 @@ func main() {
 		BuildApp:         true,
 		LogoPath:         filepath.Join("internal", "assets", "logo-color-black.png"),
 		IconPath:         filepath.Join("internal", "assets", "logo.ico"),
+		Version:          version,
+		Tags:             []string{"embed_installer"},
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to build ccapp: %v\n", err)

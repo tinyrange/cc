@@ -28,11 +28,11 @@ type BootConfig struct {
 	ImageDir string   `yaml:"imageDir"`
 	Command  []string `yaml:"command,omitempty"`
 
-	CPUs     int    `yaml:"cpus,omitempty"`
-	MemoryMB uint64 `yaml:"memoryMB,omitempty"`
-	Network  bool   `yaml:"network,omitempty"`
-	Exec     bool   `yaml:"exec,omitempty"`
-	Dmesg    bool   `yaml:"dmesg,omitempty"`
+	CPUs     int      `yaml:"cpus,omitempty"`
+	MemoryMB uint64   `yaml:"memoryMB,omitempty"`
+	Exec     bool     `yaml:"exec,omitempty"`
+	Dmesg    bool     `yaml:"dmesg,omitempty"`
+	Env      []string `yaml:"env,omitempty"` // Custom environment variables (KEY=value format)
 }
 
 func (m *Metadata) normalize() {
@@ -53,6 +53,25 @@ func (m *Metadata) normalize() {
 func IsBundleDir(dir string) bool {
 	_, err := os.Stat(filepath.Join(dir, MetadataFilename))
 	return err == nil
+}
+
+// ValidateBundleDir validates that a directory is a valid bundle with valid metadata.
+func ValidateBundleDir(dir string) error {
+	if !IsBundleDir(dir) {
+		return fmt.Errorf("missing %s", MetadataFilename)
+	}
+
+	meta, err := LoadMetadata(dir)
+	if err != nil {
+		return fmt.Errorf("invalid metadata: %w", err)
+	}
+
+	imageDir := filepath.Join(dir, meta.Boot.ImageDir)
+	if _, err := os.Stat(imageDir); os.IsNotExist(err) {
+		return fmt.Errorf("image directory not found: %s", imageDir)
+	}
+
+	return nil
 }
 
 func LoadMetadata(dir string) (Metadata, error) {

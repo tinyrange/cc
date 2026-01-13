@@ -91,8 +91,9 @@ func (l *Label) Draw(ctx *DrawContext) {
 		return
 	}
 	bounds := l.Bounds()
-	// Text baseline is at Y + height (approximately)
-	ctx.Text.RenderText(l.text, bounds.X, bounds.Y+l.textHeight*0.85, l.style.TextSize, l.style.TextColor)
+	// Position text using proper font metrics: baseline is at Y + ascender
+	ascender := ctx.Text.Ascender(l.style.TextSize)
+	ctx.Text.RenderText(l.text, bounds.X, bounds.Y+ascender, l.style.TextSize, l.style.TextColor)
 }
 
 func (l *Label) HandleEvent(ctx *EventContext, event Event) bool {

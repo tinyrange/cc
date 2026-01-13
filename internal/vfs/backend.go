@@ -338,9 +338,10 @@ type fsNode struct {
 	// Sparse file storage. We model allocation at a fixed block granularity to
 	// provide realistic SEEK_DATA/SEEK_HOLE behavior (xfstests seek_sanity_test).
 	// Key is block index (offset / fileBlockSize), value is a full block.
-	blocks   map[uint64][]byte
-	entries  map[string]uint64
-	xattr    map[string][]byte
+	blocks         map[uint64][]byte
+	entries        map[string]uint64
+	deletedEntries map[string]struct{} // tracks entries deleted from abstractDir to prevent re-creation
+	xattr          map[string][]byte
 	modTime  time.Time // best-effort mtime
 	aTime    time.Time // best-effort atime
 	ctime    time.Time // change time (metadata changes like chmod/chown/xattr)
@@ -592,6 +593,12 @@ func (v *virtioFsBackend) snapshotDirEnts(dirNode *fsNode) []dirHandleEnt {
 				if ent.Name == "." || ent.Name == ".." {
 					continue
 				}
+				// Skip entries that were explicitly deleted
+				if dirNode.deletedEntries != nil {
+					if _, deleted := dirNode.deletedEntries[ent.Name]; deleted {
+						continue
+					}
+				}
 				nameSet[ent.Name] = struct{}{}
 			}
 		}
@@ -719,6 +726,12 @@ func (v *virtioFsBackend) child(parent *fsNode, name string) (*fsNode, int32) {
 	id, ok := parent.entries[name]
 	if ok {
 		return v.nodes[id], 0
+	}
+	// Check if this entry was explicitly deleted (prevents re-creation from abstractDir)
+	if parent.deletedEntries != nil {
+		if _, deleted := parent.deletedEntries[name]; deleted {
+			return nil, -int32(linux.ENOENT)
+		}
 	}
 	// If parent has an abstract directory, try looking up there
 	if parent.abstractDir != nil {
@@ -1166,12 +1179,18 @@ func (v *virtioFsBackend) ReadDir(nodeID uint64, off uint64, maxBytes uint32) ([
 		}
 		nameSet[name] = true
 	}
-	// Also include entries from abstract directory if present
+	// Also include entries from abstract directory if present (but not deleted ones)
 	if dirNode.abstractDir != nil {
 		if abstractEntries, err := dirNode.abstractDir.ReadDir(); err == nil {
 			for _, entry := range abstractEntries {
 				if entry.Name == "." || entry.Name == ".." {
 					continue
+				}
+				// Skip entries that were explicitly deleted
+				if dirNode.deletedEntries != nil {
+					if _, deleted := dirNode.deletedEntries[entry.Name]; deleted {
+						continue
+					}
 				}
 				nameSet[entry.Name] = true
 			}
@@ -1403,8 +1422,8 @@ func (v *virtioFsBackend) StatFS(nodeID uint64) (blocks uint64, bfree uint64, ba
 
 	v.ensureRoot()
 	_ = nodeID
-	total := uint64(1024)
-	free := uint64(900)
+	total := uint64(25 * 1024 * 1024) // 100GB in 4KB blocks
+	free := uint64(24 * 1024 * 1024)  // ~96GB free
 	return total, free, free, total, free, 4096, 4096, 255, 0
 }
 
@@ -2246,7 +2265,18 @@ func (v *virtioFsBackend) Rename(oldParent uint64, oldName string, newParent uin
 		}
 	}
 	dstParent.entries[dstName] = srcID
+	// Clear any deleted marker for the destination name
+	if dstParent.deletedEntries != nil {
+		delete(dstParent.deletedEntries, dstName)
+	}
 	delete(srcParent.entries, srcName)
+	// Track deleted entries for the source to prevent re-creation from abstractDir
+	if srcParent.abstractDir != nil {
+		if srcParent.deletedEntries == nil {
+			srcParent.deletedEntries = make(map[string]struct{})
+		}
+		srcParent.deletedEntries[srcName] = struct{}{}
+	}
 	node := v.nodes[srcID]
 	node.parent = dstParent.id
 	node.name = dstName
@@ -2299,7 +2329,13 @@ func (v *virtioFsBackend) Unlink(parent uint64, name string) int32 {
 		return -int32(linux.EISDIR)
 	}
 	delete(parentNode.entries, clean)
-	if parentNode.abstractDir == nil {
+	// Track deleted entries to prevent re-creation from abstractDir
+	if parentNode.abstractDir != nil {
+		if parentNode.deletedEntries == nil {
+			parentNode.deletedEntries = make(map[string]struct{})
+		}
+		parentNode.deletedEntries[clean] = struct{}{}
+	} else {
 		now := time.Now()
 		parentNode.modTime = bumpTime(parentNode.modTime, now)
 		parentNode.aTime = bumpTime(parentNode.aTime, now)
@@ -2347,7 +2383,13 @@ func (v *virtioFsBackend) Rmdir(parent uint64, name string) int32 {
 		return -errNotEmpty
 	}
 	delete(parentNode.entries, clean)
-	if parentNode.abstractDir == nil {
+	// Track deleted entries to prevent re-creation from abstractDir
+	if parentNode.abstractDir != nil {
+		if parentNode.deletedEntries == nil {
+			parentNode.deletedEntries = make(map[string]struct{})
+		}
+		parentNode.deletedEntries[clean] = struct{}{}
+	} else {
 		now := time.Now()
 		parentNode.modTime = bumpTime(parentNode.modTime, now)
 		parentNode.aTime = bumpTime(parentNode.aTime, now)

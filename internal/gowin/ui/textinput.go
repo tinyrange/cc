@@ -172,9 +172,16 @@ func (t *TextInput) Draw(ctx *DrawContext) {
 		ctx.Frame.RenderQuad(bounds.X+1, bounds.Y+1, bounds.W-2, bounds.H-2, nil, bgColor)
 	}
 
-	// Text area
+	// Text area - use proper font metrics for vertical centering
 	textX := bounds.X + t.style.Padding.Left
-	textY := bounds.Y + bounds.H/2 + float32(t.style.TextSize)/3
+	var textY float32
+	if ctx.Text != nil {
+		lineHeight := ctx.Text.LineHeight(t.style.TextSize)
+		ascender := ctx.Text.Ascender(t.style.TextSize)
+		textY = bounds.Y + (bounds.H-lineHeight)/2 + ascender
+	} else {
+		textY = bounds.Y + bounds.H/2 + float32(t.style.TextSize)/3
+	}
 
 	// Cache text renderer for click positioning
 	t.textRenderer = ctx.Text

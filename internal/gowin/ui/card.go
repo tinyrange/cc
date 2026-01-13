@@ -14,6 +14,10 @@ type CardStyle struct {
 	BorderWidth     float32
 	Padding         EdgeInsets
 	CornerRadius    float32 // 0 = square corners
+
+	// Gradient support (overrides BackgroundColor when set)
+	GradientDirection graphics.GradientDirection
+	GradientStops     []graphics.ColorStop
 }
 
 // DefaultCardStyle returns default card styling.
@@ -179,13 +183,17 @@ func (c *Card) Draw(ctx *DrawContext) {
 		style = *c.hoverStyle
 	}
 
-	// Background
-	if style.BackgroundColor != nil {
+	// Check if we have something to draw
+	hasBackground := style.BackgroundColor != nil
+	hasGradient := style.GradientDirection != graphics.GradientNone && len(style.GradientStops) >= 2
+
+	// Background (or gradient)
+	if hasBackground || hasGradient {
 		if style.CornerRadius > 0 && c.gfxWindow != nil {
 			// Use rounded rectangle rendering
 			c.drawRoundedBackground(ctx, bounds, style)
-		} else {
-			// Fallback to simple quad
+		} else if hasBackground {
+			// Fallback to simple quad (only for solid backgrounds)
 			ctx.Frame.RenderQuad(bounds.X, bounds.Y, bounds.W, bounds.H, nil, style.BackgroundColor)
 		}
 	}
@@ -217,17 +225,37 @@ func (c *Card) drawRoundedBackground(ctx *DrawContext, bounds Rect, style CardSt
 		var err error
 		c.shapeBuilder, err = graphics.NewShapeBuilder(c.gfxWindow, segments)
 		if err != nil {
-			// Fallback to quad
-			ctx.Frame.RenderQuad(bounds.X, bounds.Y, bounds.W, bounds.H, nil, style.BackgroundColor)
+			// Fallback to quad if we have a background color
+			if style.BackgroundColor != nil {
+				ctx.Frame.RenderQuad(bounds.X, bounds.Y, bounds.W, bounds.H, nil, style.BackgroundColor)
+			}
 			return
 		}
 	}
 
-	// Update geometry if bounds or color changed (color changes for hover)
-	if bounds != c.lastBounds || style.BackgroundColor != c.lastBgColor {
-		shapeStyle := graphics.ShapeStyle{
-			FillColor: style.BackgroundColor,
+	// Check if we have a gradient
+	hasGradient := style.GradientDirection != graphics.GradientNone && len(style.GradientStops) >= 2
+
+	// Check if we need to update (bounds or style changed)
+	needsUpdate := bounds != c.lastBounds || style.BackgroundColor != c.lastBgColor
+
+	if needsUpdate {
+		// For gradient-only cards, use first gradient stop as fallback fill color
+		fillColor := style.BackgroundColor
+		if fillColor == nil && hasGradient {
+			fillColor = style.GradientStops[0].Color
 		}
+
+		shapeStyle := graphics.ShapeStyle{
+			FillColor: fillColor,
+		}
+
+		// Apply gradient if present
+		if hasGradient {
+			shapeStyle.GradientDirection = style.GradientDirection
+			shapeStyle.GradientStops = style.GradientStops
+		}
+
 		c.shapeBuilder.UpdateRoundedRect(
 			bounds.X, bounds.Y, bounds.W, bounds.H,
 			graphics.UniformRadius(style.CornerRadius),

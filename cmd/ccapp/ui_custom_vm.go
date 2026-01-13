@@ -1,22 +1,24 @@
 package main
 
 import (
-	"image/color"
+	"log/slog"
 	"path/filepath"
-	"time"
+	"strings"
 
+	"github.com/tinyrange/cc/internal/bundle"
 	"github.com/tinyrange/cc/internal/gowin/graphics"
 	"github.com/tinyrange/cc/internal/gowin/ui"
 	"github.com/tinyrange/cc/internal/gowin/window"
+	"github.com/tinyrange/cc/internal/oci"
 )
 
 // CustomVMMode represents the input mode for custom VM
 type CustomVMMode int
 
 const (
-	CustomVMModeBundleDir CustomVMMode = iota
+	CustomVMModeImageName CustomVMMode = iota
 	CustomVMModeTarball
-	CustomVMModeImageName
+	CustomVMModeBundleDir
 )
 
 // CustomVMScreen is the dialog for selecting a custom VM
@@ -25,17 +27,15 @@ type CustomVMScreen struct {
 	app  *Application
 
 	// State
-	mode           CustomVMMode
-	selectedPath   string
-	imageName      string
-	networkEnabled bool
+	mode         CustomVMMode
+	selectedPath string
+	imageName    string
 
 	// Widgets that need updating
 	tabBar         *ui.TabBar
 	pathInput      *ui.TextInput
 	browseButton   *ui.Button
 	imageInput     *ui.TextInput
-	networkToggle  *ui.Toggle
 	launchButton   *ui.Button
 	inputContainer *ui.FlexContainer
 }
@@ -43,10 +43,9 @@ type CustomVMScreen struct {
 // NewCustomVMScreen creates the custom VM selection screen
 func NewCustomVMScreen(app *Application) *CustomVMScreen {
 	screen := &CustomVMScreen{
-		root:           ui.NewRoot(app.text),
-		app:            app,
-		mode:           CustomVMModeBundleDir,
-		networkEnabled: false,
+		root: ui.NewRoot(app.text),
+		app:  app,
+		mode: CustomVMModeImageName,
 	}
 	screen.buildUI()
 	return screen
@@ -58,46 +57,33 @@ func (s *CustomVMScreen) buildUI() {
 	stack := ui.NewStack()
 
 	// Semi-transparent overlay to darken the blurred background slightly
-	stack.AddChild(ui.NewBox(color.RGBA{R: 0x1a, G: 0x1b, B: 0x26, A: 180})) // Tokyo Night with alpha
+	stack.AddChild(ui.NewBox(dialogOverlayColor(overlayAlphaLight)))
 
-	// Dialog constants
-	const dialogWidth float32 = 500
-	const dialogHeight float32 = 380
-	const contentWidth float32 = dialogWidth - 48 // minus padding
-	const cornerRadius float32 = 12
+	// Dialog dimensions (from design.go)
+	const dialogWidth = customVMDialogWidth
+	const dialogHeight = customVMDialogHeight
+	const contentWidth = dialogWidth - 48 // minus padding
 
-	// Dialog colors (Tokyo Night theme)
+	// Dialog colors (from design.go)
 	dialogBg := colorCardBg
 	textColorPrimary := colorTextPrimary
 	textColorSecondary := colorTextSecondary
 
 	// Create content first
 	content := ui.Column().WithPadding(ui.All(24)).WithGap(20)
-	content.AddChild(ui.NewLabel("New Custom VM").WithSize(24).WithColor(textColorPrimary), ui.DefaultFlexParams())
+	content.AddChild(ui.NewLabel("Create VM").WithSize(24).WithColor(textColorPrimary), ui.DefaultFlexParams())
 
 	// Use Card with rounded corners for dialog background
 	dialogCard := ui.NewCard(nil).
 		WithBackground(dialogBg).
-		WithCornerRadius(cornerRadius).
+		WithCornerRadius(cornerRadiusLarge).
 		WithGraphicsWindow(s.app.window).
 		WithFixedSize(dialogWidth, dialogHeight).
 		WithPadding(ui.All(0))
 
 	// Tab bar for mode selection
-	s.tabBar = ui.NewTabBar([]string{"Bundle Dir", "Tarball", "Image Name"}).
-		WithStyle(ui.TabBarStyle{
-			BackgroundColor:    color.RGBA{R: 0, G: 0, B: 0, A: 0}, // Transparent
-			TextColor:          textColorSecondary,
-			TextColorSelected:  textColorPrimary,
-			TextColorHovered:   colorTextPrimary,
-			TextSize:           14,
-			TabPadding:         ui.Symmetric(20, 10),
-			TabGap:             0,
-			UnderlineColor:     colorAccent, // Tokyo Night blue
-			UnderlineThickness: 2,
-			UnderlineInset:     0,
-			Height:             36,
-		}).
+	s.tabBar = ui.NewTabBar([]string{"Docker Image", "OCI Tarball", "Bundle Directory"}).
+		WithStyle(tabBarStyle()).
 		OnSelect(func(index int) {
 			// Commit current input text before rebuilding
 			if s.pathInput != nil {
@@ -115,34 +101,25 @@ func (s *CustomVMScreen) buildUI() {
 	// Input area (changes based on mode)
 	inputCol := ui.Column().WithGap(8)
 	switch s.mode {
-	case CustomVMModeBundleDir:
-		inputCol.AddChild(ui.NewLabel("Select a bundle directory:").WithSize(14).WithColor(textColorSecondary), ui.DefaultFlexParams())
-		inputRow := ui.Row().WithGap(8)
-		s.pathInput = ui.NewTextInput().
-			WithPlaceholder("").
-			WithMinWidth(contentWidth - 90 - 8).
-			WithGraphicsWindow(s.app.window)
-		if s.selectedPath != "" {
-			s.pathInput.SetText(s.selectedPath)
-		}
-		s.pathInput.OnChange(func(text string) {
-			s.selectedPath = text
-		})
-		inputRow.AddChild(s.pathInput, ui.DefaultFlexParams())
-		browseStyle := secondaryButtonStyle()
-		browseStyle.MinWidth = 90
-		browseStyle.MinHeight = 32
-		browseStyle.TextSize = 14
-		s.browseButton = ui.NewButton("Browse...").
-			WithStyle(browseStyle).
+	case CustomVMModeImageName:
+		// Help text explaining the Docker image option
+		inputCol.AddChild(ui.NewLabel("Pull a container image from Docker Hub or another registry.").WithSize(12).WithColor(textColorSecondary), ui.DefaultFlexParams())
+		inputCol.AddChild(ui.NewLabel("Image name (e.g., alpine, ubuntu:22.04, ghcr.io/user/image):").WithSize(14).WithColor(textColorSecondary), ui.DefaultFlexParams())
+		s.imageInput = ui.NewTextInput().
+			WithPlaceholder("alpine:latest").
+			WithMinWidth(contentWidth).
 			WithGraphicsWindow(s.app.window).
-			OnClick(func() {
-				s.browseDirectory()
+			OnChange(func(text string) {
+				s.imageName = text
 			})
-		inputRow.AddChild(s.browseButton, ui.DefaultFlexParams())
-		inputCol.AddChild(inputRow, ui.DefaultFlexParams())
+		if s.imageName != "" {
+			s.imageInput.SetText(s.imageName)
+		}
+		inputCol.AddChild(s.imageInput, ui.DefaultFlexParams())
 
 	case CustomVMModeTarball:
+		// Help text explaining the OCI tarball option
+		inputCol.AddChild(ui.NewLabel("Load a VM from an OCI-format tarball exported from Docker or other tools.").WithSize(12).WithColor(textColorSecondary), ui.DefaultFlexParams())
 		inputCol.AddChild(ui.NewLabel("Select an OCI tarball (.tar):").WithSize(14).WithColor(textColorSecondary), ui.DefaultFlexParams())
 		inputRow := ui.Row().WithGap(8)
 		s.pathInput = ui.NewTextInput().
@@ -169,43 +146,36 @@ func (s *CustomVMScreen) buildUI() {
 		inputRow.AddChild(s.browseButton, ui.DefaultFlexParams())
 		inputCol.AddChild(inputRow, ui.DefaultFlexParams())
 
-	case CustomVMModeImageName:
-		inputCol.AddChild(ui.NewLabel("Enter container image name:").WithSize(14).WithColor(textColorSecondary), ui.DefaultFlexParams())
-		s.imageInput = ui.NewTextInput().
-			WithPlaceholder("e.g., alpine:latest").
-			WithMinWidth(contentWidth).
-			WithGraphicsWindow(s.app.window). // Enable rounded corners
-			OnChange(func(text string) {
-				s.imageName = text
-			})
-		if s.imageName != "" {
-			s.imageInput.SetText(s.imageName)
+	case CustomVMModeBundleDir:
+		// Help text explaining the bundle directory option
+		inputCol.AddChild(ui.NewLabel("Open an existing VM bundle directory containing ccbundle.yaml.").WithSize(12).WithColor(textColorSecondary), ui.DefaultFlexParams())
+		inputCol.AddChild(ui.NewLabel("Select a bundle directory:").WithSize(14).WithColor(textColorSecondary), ui.DefaultFlexParams())
+		inputRow := ui.Row().WithGap(8)
+		s.pathInput = ui.NewTextInput().
+			WithPlaceholder("").
+			WithMinWidth(contentWidth - 90 - 8).
+			WithGraphicsWindow(s.app.window)
+		if s.selectedPath != "" {
+			s.pathInput.SetText(s.selectedPath)
 		}
-		inputCol.AddChild(s.imageInput, ui.DefaultFlexParams())
+		s.pathInput.OnChange(func(text string) {
+			s.selectedPath = text
+		})
+		inputRow.AddChild(s.pathInput, ui.DefaultFlexParams())
+		browseStyle := secondaryButtonStyle()
+		browseStyle.MinWidth = 90
+		browseStyle.MinHeight = 32
+		browseStyle.TextSize = 14
+		s.browseButton = ui.NewButton("Browse...").
+			WithStyle(browseStyle).
+			WithGraphicsWindow(s.app.window).
+			OnClick(func() {
+				s.browseDirectory()
+			})
+		inputRow.AddChild(s.browseButton, ui.DefaultFlexParams())
+		inputCol.AddChild(inputRow, ui.DefaultFlexParams())
 	}
 	content.AddChild(inputCol, ui.DefaultFlexParams())
-
-	// Toggle for network access with mesh rendering for smooth shapes
-	networkRow := ui.Row().WithGap(12)
-	s.networkToggle = ui.NewToggle().
-		WithStyle(ui.ToggleStyle{
-			TrackWidth:        44,
-			TrackHeight:       24,
-			TrackColorOn:      colorAccent,   // Tokyo Night blue
-			TrackColorOff:     colorBtnNormal, // Tokyo Night storm
-			ThumbSize:         20,
-			ThumbColor:        colorTextPrimary,
-			ThumbPadding:      2,
-			AnimationDuration: 200 * time.Millisecond,
-		}).
-		WithGraphicsWindow(s.app.window). // Enable mesh rendering for smooth pill/circle shapes
-		OnChange(func(on bool) {
-			s.networkEnabled = on
-		})
-	s.networkToggle.SetOn(s.networkEnabled)
-	networkRow.AddChild(s.networkToggle, ui.DefaultFlexParams())
-	networkRow.AddChild(ui.NewLabel("Enable Internet Access").WithSize(14).WithColor(textColorPrimary), ui.DefaultFlexParams())
-	content.AddChild(networkRow, ui.DefaultFlexParams())
 
 	// Spacer to push buttons to bottom
 	content.AddChild(ui.NewSpacer(), ui.FlexParams(1))
@@ -233,7 +203,7 @@ func (s *CustomVMScreen) buildUI() {
 	launchStyle.MinWidth = 90
 	launchStyle.MinHeight = 36
 	launchStyle.TextSize = 14
-	s.launchButton = ui.NewButton("Launch").
+	s.launchButton = ui.NewButton("Add").
 		WithStyle(launchStyle).
 		WithGraphicsWindow(s.app.window).
 		OnClick(s.onLaunch)
@@ -286,51 +256,96 @@ func (s *CustomVMScreen) browseTarball() {
 func (s *CustomVMScreen) onLaunch() {
 	var sourceType VMSourceType
 	var sourcePath string
-	var displayName string
+	var bundleName string
 
 	switch s.mode {
 	case CustomVMModeBundleDir:
 		if s.selectedPath == "" {
 			return // No path selected
 		}
+		// Validate bundle directory
+		if err := bundle.ValidateBundleDir(s.selectedPath); err != nil {
+			slog.Error("invalid bundle directory", "path", s.selectedPath, "error", err)
+			s.app.showError(err)
+			return
+		}
 		sourceType = VMSourceBundle
 		sourcePath = s.selectedPath
-		displayName = filepath.Base(sourcePath)
+		bundleName = filepath.Base(sourcePath)
 
 	case CustomVMModeTarball:
 		if s.selectedPath == "" {
 			return // No path selected
 		}
+		// Validate tarball
+		if err := oci.ValidateTar(s.selectedPath); err != nil {
+			slog.Error("invalid tarball", "path", s.selectedPath, "error", err)
+			s.app.showError(err)
+			return
+		}
 		sourceType = VMSourceTarball
 		sourcePath = s.selectedPath
-		displayName = filepath.Base(sourcePath)
+		bundleName = strings.TrimSuffix(filepath.Base(sourcePath), ".tar")
 
 	case CustomVMModeImageName:
 		if s.imageName == "" {
 			return // No image name entered
 		}
+		// Validate image name format and check registry
+		if err := oci.ValidateImageName(s.imageName, true); err != nil {
+			slog.Error("invalid image name", "image", s.imageName, "error", err)
+			s.app.showError(err)
+			return
+		}
 		sourceType = VMSourceImageName
 		sourcePath = s.imageName
-		displayName = s.imageName
-	}
-
-	// Record to recent VMs
-	if s.app.recentVMs != nil {
-		s.app.recentVMs.AddOrUpdate(RecentVM{
-			Name:           displayName,
-			SourceType:     sourceType,
-			SourcePath:     sourcePath,
-			NetworkEnabled: s.networkEnabled,
-		})
-		// Update dock menu
-		s.app.updateDockMenu()
+		bundleName = sanitizeImageName(s.imageName)
 	}
 
 	// Clear blur capture before changing mode
 	s.app.clearBlurCapture()
 
-	// Start boot process
-	s.app.startCustomVM(sourceType, sourcePath, s.networkEnabled)
+	// For bundle dir, validate and launch directly (don't copy)
+	if sourceType == VMSourceBundle {
+		// Record to recent VMs
+		if s.app.recentVMs != nil {
+			s.app.recentVMs.AddOrUpdate(RecentVM{
+				Name:       bundleName,
+				SourceType: sourceType,
+				SourcePath: sourcePath,
+			})
+			s.app.updateDockMenu()
+		}
+		s.app.startCustomVM(sourceType, sourcePath)
+		return
+	}
+
+	// For image/tarball, install as bundle
+	s.app.installBundle(sourceType, sourcePath, bundleName)
+}
+
+// sanitizeImageName converts an image name to a valid directory name
+func sanitizeImageName(imageName string) string {
+	// Remove registry prefix if present
+	if idx := strings.LastIndex(imageName, "/"); idx != -1 {
+		imageName = imageName[idx+1:]
+	}
+	// Replace : with _
+	imageName = strings.ReplaceAll(imageName, ":", "_")
+	// Replace other invalid chars
+	var b strings.Builder
+	for _, r := range imageName {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('_')
+		}
+	}
+	result := b.String()
+	if result == "" {
+		result = "bundle"
+	}
+	return result
 }
 
 // Render renders the custom VM screen

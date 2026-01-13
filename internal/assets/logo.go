@@ -13,3 +13,6 @@ var IconPlus []byte
 
 //go:embed icon-logs.svg
 var IconLogs []byte
+
+//go:embed icon-cog.svg
+var IconCog []byte

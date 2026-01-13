@@ -211,7 +211,21 @@ func (c *Center) Layout(ctx *LayoutContext, constraints Constraints) Size {
 	if c.content != nil {
 		c.contentSize = c.content.Layout(ctx, Unconstrained())
 	}
-	return Size{W: constraints.MaxW, H: constraints.MaxH}
+
+	const unboundedThreshold = 1e8
+
+	w := constraints.MaxW
+	h := constraints.MaxH
+
+	// For unbounded constraints, use content size (intrinsic measurement)
+	if constraints.MaxW >= unboundedThreshold {
+		w = c.contentSize.W
+	}
+	if constraints.MaxH >= unboundedThreshold {
+		h = c.contentSize.H
+	}
+
+	return Size{W: w, H: h}
 }
 
 func (c *Center) SetBounds(bounds Rect) {

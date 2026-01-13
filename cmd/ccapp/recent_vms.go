@@ -19,11 +19,10 @@ const (
 
 // RecentVM stores metadata about a recently launched VM
 type RecentVM struct {
-	Name           string       `json:"name"`
-	SourceType     VMSourceType `json:"source_type"`
-	SourcePath     string       `json:"source_path"`
-	NetworkEnabled bool         `json:"network_enabled"`
-	LastUsed       time.Time    `json:"last_used"`
+	Name       string       `json:"name"`
+	SourceType VMSourceType `json:"source_type"`
+	SourcePath string       `json:"source_path"`
+	LastUsed   time.Time    `json:"last_used"`
 }
 
 // RecentVMsStore manages persistent storage of recent VMs
