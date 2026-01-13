@@ -100,7 +100,8 @@ func (d *Downloader) Download(url, destPath string) error {
 // DownloadToStaging downloads the update to a staging directory and returns the path.
 // For macOS, it extracts the .app bundle from the zip.
 // For other platforms, it downloads the binary directly.
-func (d *Downloader) DownloadToStaging(url string, goos string) (string, error) {
+// If expectedChecksum is provided (non-empty), the download is verified against it.
+func (d *Downloader) DownloadToStaging(url string, goos string, expectedChecksum string) (string, error) {
 	// Create staging directory
 	stagingDir := filepath.Join(os.TempDir(), fmt.Sprintf("ccapp-update-%d", time.Now().Unix()))
 	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
@@ -112,6 +113,16 @@ func (d *Downloader) DownloadToStaging(url string, goos string) (string, error) 
 	if err := d.Download(url, downloadPath); err != nil {
 		os.RemoveAll(stagingDir)
 		return "", err
+	}
+
+	// Verify checksum if provided
+	if expectedChecksum != "" {
+		d.reportProgress(DownloadProgress{Status: "Verifying checksum..."})
+
+		if err := d.VerifyChecksum(downloadPath, expectedChecksum); err != nil {
+			os.RemoveAll(stagingDir)
+			return "", fmt.Errorf("checksum verification failed: %w", err)
+		}
 	}
 
 	// For macOS, we need to extract the zip
@@ -227,6 +238,13 @@ func (r *progressReader) Read(p []byte) (int, error) {
 
 // extractZip extracts a zip file to the destination directory.
 func extractZip(zipPath, destDir string) error {
+	// Get absolute path of destination to ensure consistent comparison
+	absDestDir, err := filepath.Abs(destDir)
+	if err != nil {
+		return fmt.Errorf("get absolute path: %w", err)
+	}
+	absDestDir = filepath.Clean(absDestDir)
+
 	r, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return err
@@ -234,12 +252,27 @@ func extractZip(zipPath, destDir string) error {
 	defer r.Close()
 
 	for _, f := range r.File {
-		fpath := filepath.Join(destDir, f.Name)
+		// Clean the file name from the archive
+		name := filepath.Clean(f.Name)
 
-		// Security check: prevent zip slip
-		relPath, err := filepath.Rel(destDir, fpath)
-		if err != nil || strings.HasPrefix(relPath, "..") {
-			return fmt.Errorf("invalid file path: %s", f.Name)
+		// Reject entries that start with .. after cleaning
+		if strings.HasPrefix(name, "..") {
+			return fmt.Errorf("invalid file path in archive: %s", f.Name)
+		}
+
+		// Reject symlinks in archive to prevent symlink attacks
+		if f.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("symlinks not allowed in update archive: %s", f.Name)
+		}
+
+		// Build the target path
+		fpath := filepath.Join(absDestDir, name)
+		fpath = filepath.Clean(fpath)
+
+		// Security check: ensure the path is within destDir
+		// The path must start with destDir followed by a separator (or be exactly destDir)
+		if !strings.HasPrefix(fpath, absDestDir+string(filepath.Separator)) && fpath != absDestDir {
+			return fmt.Errorf("invalid file path (directory traversal attempt): %s", f.Name)
 		}
 
 		if f.FileInfo().IsDir() {

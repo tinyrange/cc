@@ -1,6 +1,7 @@
 package update
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,8 +10,16 @@ import (
 	"strings"
 )
 
+// ErrInstallerLaunched is returned when the installer has been successfully launched.
+// The caller should perform cleanup and exit with code 0.
+var ErrInstallerLaunched = errors.New("installer launched successfully, caller should exit")
+
+// ErrAppLaunched is returned when the app has been successfully launched after an update.
+// The caller should exit with code 0.
+var ErrAppLaunched = errors.New("app launched successfully, caller should exit")
+
 // LaunchInstaller extracts the embedded installer and launches it to perform the update.
-// This function does not return on success - it launches the installer and exits the current process.
+// Returns ErrInstallerLaunched on success - the caller should perform cleanup and exit.
 func LaunchInstaller(stagingDir, targetPath string) error {
 	// Get the embedded installer binary
 	installerData, err := GetInstaller()
@@ -63,10 +72,8 @@ func LaunchInstaller(stagingDir, targetPath string) error {
 		return fmt.Errorf("start installer: %w", err)
 	}
 
-	// Exit this process so the installer can replace us
-	os.Exit(0)
-
-	return nil // Unreachable
+	// Return sentinel error - caller should perform cleanup and exit
+	return ErrInstallerLaunched
 }
 
 // GetTargetPath returns the path to the current application that should be replaced.
@@ -337,7 +344,8 @@ func copyFileWithMode(src, dst string, mode os.FileMode) error {
 	return os.WriteFile(dst, data, mode)
 }
 
-// LaunchAppAndExit launches the app at the given path and exits the current process.
+// LaunchAppAndExit launches the app at the given path.
+// Returns ErrAppLaunched on success - the caller should exit with code 0.
 func LaunchAppAndExit(appPath string) error {
 	var cmd *exec.Cmd
 
@@ -359,24 +367,108 @@ func LaunchAppAndExit(appPath string) error {
 		return fmt.Errorf("launch app: %w", err)
 	}
 
-	// Exit this process
-	os.Exit(0)
-
-	return nil // Unreachable
+	// Return sentinel error - caller should exit
+	return ErrAppLaunched
 }
 
-// DeleteApp removes the app at the specified path.
+// DeleteApp removes the app at the specified path with safety checks.
 func DeleteApp(appPath string) error {
 	if appPath == "" {
 		return nil
 	}
 
-	// Safety check: don't delete system directories
-	if appPath == "/" || appPath == "/Applications" || appPath == "/usr" {
-		return fmt.Errorf("refusing to delete system path: %s", appPath)
+	// Resolve symlinks to get the real path
+	realPath, err := filepath.EvalSymlinks(appPath)
+	if err != nil {
+		// If we can't resolve the path, it might not exist anymore
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("resolve path: %w", err)
 	}
 
-	return os.RemoveAll(appPath)
+	// Clean the path to normalize it
+	realPath = filepath.Clean(realPath)
+
+	// Verify it's in an expected location
+	if !isValidAppLocation(realPath) {
+		return fmt.Errorf("refusing to delete: path not in expected location: %s", appPath)
+	}
+
+	// Verify it looks like our app (name contains crumblecracker or ccapp)
+	if !isOurApp(realPath) {
+		return fmt.Errorf("refusing to delete: doesn't look like CrumbleCracker: %s", appPath)
+	}
+
+	return os.RemoveAll(realPath)
+}
+
+// isValidAppLocation checks if the path is within an expected app location.
+func isValidAppLocation(path string) bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+
+	// Platform-specific valid locations
+	switch runtime.GOOS {
+	case "darwin":
+		// Valid: ~/Applications, /Applications, /Users/*/Applications
+		// Also allow temporary locations for cleanup
+		return strings.HasPrefix(path, filepath.Join(home, "Applications")) ||
+			strings.HasPrefix(path, "/Applications/") ||
+			strings.HasPrefix(path, os.TempDir())
+	case "linux":
+		// Valid: ~/.local/bin, /usr/local/bin, /opt, /tmp
+		localBin := filepath.Join(home, ".local", "bin")
+		return strings.HasPrefix(path, localBin) ||
+			strings.HasPrefix(path, "/usr/local/bin/") ||
+			strings.HasPrefix(path, "/opt/") ||
+			strings.HasPrefix(path, os.TempDir())
+	case "windows":
+		// Valid: Program Files, AppData, user profile
+		programFiles := os.Getenv("ProgramFiles")
+		programFilesX86 := os.Getenv("ProgramFiles(x86)")
+		appData := os.Getenv("LOCALAPPDATA")
+		return strings.HasPrefix(strings.ToLower(path), strings.ToLower(programFiles)) ||
+			strings.HasPrefix(strings.ToLower(path), strings.ToLower(programFilesX86)) ||
+			strings.HasPrefix(strings.ToLower(path), strings.ToLower(appData)) ||
+			strings.HasPrefix(strings.ToLower(path), strings.ToLower(os.TempDir()))
+	}
+	return false
+}
+
+// isOurApp checks if the path looks like a CrumbleCracker installation.
+func isOurApp(path string) bool {
+	name := strings.ToLower(filepath.Base(path))
+
+	// Check for expected app names
+	validNames := []string{
+		"crumblecracker",
+		"ccapp",
+	}
+
+	for _, valid := range validNames {
+		if strings.Contains(name, valid) {
+			return true
+		}
+	}
+
+	// Check for expected extensions
+	switch runtime.GOOS {
+	case "darwin":
+		// Accept .app bundles
+		if strings.HasSuffix(name, ".app") {
+			return true
+		}
+	case "windows":
+		// Accept .exe files
+		if strings.HasSuffix(name, ".exe") {
+			return true
+		}
+	}
+
+	return false
 }
 
 // CreateDesktopShortcut creates a desktop shortcut/entry for the app.
@@ -411,8 +503,37 @@ func RemoveDesktopShortcut() error {
 	}
 }
 
+// escapePowershellString escapes a string for safe use in PowerShell single-quoted strings.
+// Single quotes are escaped by doubling them.
+func escapePowershellString(s string) string {
+	return strings.ReplaceAll(s, "'", "''")
+}
+
+// validatePathForScript validates that a path is safe to use in shell scripts.
+// Returns an error if the path contains dangerous characters.
+func validatePathForScript(path string) error {
+	// Check for null bytes
+	if strings.ContainsRune(path, 0) {
+		return fmt.Errorf("path contains null byte")
+	}
+
+	// Check for control characters (ASCII 0-31 except tab which is sometimes valid)
+	for _, r := range path {
+		if r < 32 && r != '\t' {
+			return fmt.Errorf("path contains control character: %U", r)
+		}
+	}
+
+	return nil
+}
+
 // createWindowsShortcut creates a .lnk shortcut in the Start Menu.
 func createWindowsShortcut(appPath string) error {
+	// Validate path before using in PowerShell
+	if err := validatePathForScript(appPath); err != nil {
+		return fmt.Errorf("invalid app path: %w", err)
+	}
+
 	// Get the Start Menu Programs directory
 	appData := os.Getenv("APPDATA")
 	if appData == "" {
@@ -422,6 +543,11 @@ func createWindowsShortcut(appPath string) error {
 	startMenuDir := filepath.Join(appData, "Microsoft", "Windows", "Start Menu", "Programs")
 	shortcutPath := filepath.Join(startMenuDir, "CrumbleCracker.lnk")
 
+	// Escape paths for safe use in PowerShell single-quoted strings
+	escapedShortcutPath := escapePowershellString(shortcutPath)
+	escapedAppPath := escapePowershellString(appPath)
+	escapedWorkDir := escapePowershellString(filepath.Dir(appPath))
+
 	// Use PowerShell to create the shortcut
 	script := fmt.Sprintf(`
 $WshShell = New-Object -ComObject WScript.Shell
@@ -430,7 +556,7 @@ $Shortcut.TargetPath = '%s'
 $Shortcut.WorkingDirectory = '%s'
 $Shortcut.Description = 'CrumbleCracker - Run Linux containers'
 $Shortcut.Save()
-`, shortcutPath, appPath, filepath.Dir(appPath))
+`, escapedShortcutPath, escapedAppPath, escapedWorkDir)
 
 	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
 	output, err := cmd.CombinedOutput()

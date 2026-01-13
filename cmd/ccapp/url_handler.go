@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 )
 
@@ -19,7 +20,13 @@ var (
 	ErrInvalidURLAction  = errors.New("invalid URL action")
 	ErrMissingImageRef   = errors.New("missing image reference")
 	ErrUnsupportedAction = errors.New("unsupported action")
+	ErrInvalidImageRef   = errors.New("invalid image reference format")
 )
+
+// ociRefRegex validates OCI image reference format.
+// Format: [registry/][namespace/]name[:tag][@sha256:digest]
+// Examples: alpine, alpine:latest, docker.io/library/alpine:3.18, ghcr.io/user/image@sha256:abc123...
+var ociRefRegex = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9._/-]*[a-zA-Z0-9])?(:[a-zA-Z0-9][a-zA-Z0-9._-]*)?(@sha256:[a-fA-F0-9]{64})?$`)
 
 // ParseCrumbleCrackerURL parses a crumblecracker:// URL into a URLAction.
 //
@@ -76,12 +83,37 @@ func ValidateURLAction(action *URLAction) error {
 	}
 
 	// Validate image reference format.
-	// Basic validation: must not be empty and must not contain spaces.
 	if action.ImageRef == "" {
 		return ErrMissingImageRef
 	}
+
+	// Check for null bytes and control characters
+	for _, r := range action.ImageRef {
+		if r < 32 || r == 127 {
+			return fmt.Errorf("%w: contains control character", ErrInvalidImageRef)
+		}
+	}
+
+	// Check for shell metacharacters and other dangerous characters
+	// These could potentially be used in injection attacks if the image name
+	// is ever passed to a shell command (even though it shouldn't be)
+	if strings.ContainsAny(action.ImageRef, "$;|&`(){}[]<>'\"\\") {
+		return fmt.Errorf("%w: contains invalid characters", ErrInvalidImageRef)
+	}
+
+	// Check for whitespace
 	if strings.ContainsAny(action.ImageRef, " \t\n\r") {
-		return fmt.Errorf("invalid image reference: contains whitespace")
+		return fmt.Errorf("%w: contains whitespace", ErrInvalidImageRef)
+	}
+
+	// Validate against OCI reference format
+	if !ociRefRegex.MatchString(action.ImageRef) {
+		return fmt.Errorf("%w: must match [registry/][namespace/]name[:tag][@digest]", ErrInvalidImageRef)
+	}
+
+	// Additional length check (OCI spec allows up to 128 chars for name, but we're more lenient for full refs)
+	if len(action.ImageRef) > 256 {
+		return fmt.Errorf("%w: too long (max 256 characters)", ErrInvalidImageRef)
 	}
 
 	return nil

@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"image/color"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -561,10 +560,15 @@ func (s *LoadingScreen) buildUI() {
 	var title, subtitle string
 	var accentColor = colorAccent
 
+	// Read boot state under lock
+	s.app.bootProgressMu.Lock()
+	bootName := s.app.bootName
+	s.app.bootProgressMu.Unlock()
+
 	switch s.app.mode {
 	case modeUpdating:
 		title = "Downloading Update"
-		subtitle = s.app.bootName // Version string
+		subtitle = bootName // Version string
 		accentColor = colorGreen
 	case modeInstalling:
 		title = "Downloading"
@@ -572,7 +576,7 @@ func (s *LoadingScreen) buildUI() {
 		accentColor = colorAccent
 	default: // modeLoading
 		title = "Starting VM"
-		subtitle = s.app.bootName
+		subtitle = bootName
 		accentColor = colorAccent
 	}
 
@@ -659,8 +663,9 @@ func (s *LoadingScreen) Update(f graphics.Frame) {
 		s.app.installProgressMu.Unlock()
 	} else {
 		// modeLoading and modeUpdating both use bootProgress
-		startTime = s.app.bootStarted
+		// Read all boot state under the same lock
 		s.app.bootProgressMu.Lock()
+		startTime = s.app.bootStarted
 		progress = s.app.bootProgress
 		s.app.bootProgressMu.Unlock()
 	}
@@ -783,7 +788,7 @@ func (s *ErrorScreen) buildUI() {
 				WithStyle(primaryStyle).
 				WithGraphicsWindow(s.app.window).
 				OnClick(func() {
-					os.Exit(1)
+					s.app.requestShutdown(1)
 				}),
 			ui.DefaultFlexParams(),
 		)

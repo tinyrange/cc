@@ -4,6 +4,7 @@ package update
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -60,6 +61,8 @@ type UpdateStatus struct {
 	ReleaseNotes   string
 	DownloadURL    string
 	DownloadSize   int64
+	Checksum       string // SHA256 checksum (empty if not available)
+	ChecksumURL    string // URL to checksums file (for fetching)
 	CheckedAt      time.Time
 	Error          error
 }
@@ -71,6 +74,8 @@ type cachedStatus struct {
 	ReleaseNotes  string    `json:"release_notes"`
 	DownloadURL   string    `json:"download_url"`
 	DownloadSize  int64     `json:"download_size"`
+	Checksum      string    `json:"checksum,omitempty"`     // SHA256 checksum (empty if not available)
+	ChecksumURL   string    `json:"checksum_url,omitempty"` // URL to checksums file
 	CheckedAt     time.Time `json:"checked_at"`
 }
 
@@ -164,7 +169,20 @@ func (c *Checker) fetchAndCache() UpdateStatus {
 	}
 
 	// Find the appropriate download asset for this platform
-	downloadURL, downloadSize := c.findAsset(release.Assets)
+	downloadURL, downloadSize, assetName := c.findAsset(release.Assets)
+
+	// Find the checksums file URL
+	checksumURL := c.findChecksumsAsset(release.Assets)
+
+	// Fetch and parse checksum if available
+	var checksum string
+	if checksumURL != "" && assetName != "" {
+		var err error
+		checksum, err = c.fetchChecksum(checksumURL, assetName)
+		if err != nil {
+			c.logger.Warn("failed to fetch checksum", "error", err, "url", checksumURL)
+		}
+	}
 
 	cached := cachedStatus{
 		LatestVersion: release.TagName,
@@ -172,6 +190,8 @@ func (c *Checker) fetchAndCache() UpdateStatus {
 		ReleaseNotes:  release.Body,
 		DownloadURL:   downloadURL,
 		DownloadSize:  downloadSize,
+		Checksum:      checksum,
+		ChecksumURL:   checksumURL,
 		CheckedAt:     time.Now(),
 	}
 
@@ -222,7 +242,8 @@ func (c *Checker) fetchLatestRelease() (*ReleaseInfo, error) {
 }
 
 // findAsset finds the download URL for the current platform.
-func (c *Checker) findAsset(assets []ReleaseAsset) (string, int64) {
+// Returns the download URL, size, and asset name (for checksum lookup).
+func (c *Checker) findAsset(assets []ReleaseAsset) (string, int64, string) {
 	// Build expected asset name based on platform
 	goos := runtime.GOOS
 	goarch := runtime.GOARCH
@@ -253,13 +274,110 @@ func (c *Checker) findAsset(assets []ReleaseAsset) (string, int64) {
 	for _, pattern := range patterns {
 		for _, asset := range assets {
 			if strings.EqualFold(asset.Name, pattern) {
-				return asset.BrowserDownloadURL, asset.Size
+				return asset.BrowserDownloadURL, asset.Size, asset.Name
 			}
 		}
 	}
 
 	// Fallback: return empty, caller should handle gracefully
-	return "", 0
+	return "", 0, ""
+}
+
+// findChecksumsAsset finds the URL for the checksums file in release assets.
+func (c *Checker) findChecksumsAsset(assets []ReleaseAsset) string {
+	// Look for common checksum file names
+	checksumNames := []string{
+		"checksums.txt",
+		"SHA256SUMS",
+		"SHA256SUMS.txt",
+		"CHECKSUMS",
+		"CHECKSUMS.txt",
+	}
+
+	for _, name := range checksumNames {
+		for _, asset := range assets {
+			if strings.EqualFold(asset.Name, name) {
+				return asset.BrowserDownloadURL
+			}
+		}
+	}
+
+	return ""
+}
+
+// fetchChecksum fetches the checksums file and extracts the checksum for the given asset.
+func (c *Checker) fetchChecksum(checksumURL, assetName string) (string, error) {
+	req, err := http.NewRequest("GET", checksumURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+
+	req.Header.Set("User-Agent", "CCApp/"+c.currentVersion)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch checksums: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("unexpected status: %s", resp.Status)
+	}
+
+	// Limit read size to prevent abuse
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024)) // 1MB max
+	if err != nil {
+		return "", fmt.Errorf("read body: %w", err)
+	}
+
+	// Parse the checksums file (format: "checksum  filename" or "checksum *filename")
+	return parseChecksumsFile(string(body), assetName)
+}
+
+// parseChecksumsFile parses a SHA256SUMS-style file and returns the checksum for the given filename.
+// Supports formats:
+//   - "abc123  filename" (GNU coreutils style, two spaces)
+//   - "abc123 *filename" (binary mode indicator)
+//   - "abc123 filename" (single space)
+func parseChecksumsFile(content, filename string) (string, error) {
+	lines := strings.Split(content, "\n")
+	filenameLower := strings.ToLower(filename)
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Split on whitespace - checksum is always first
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+
+		checksum := parts[0]
+		// The filename might have a leading * for binary mode
+		fname := strings.TrimPrefix(parts[len(parts)-1], "*")
+
+		if strings.EqualFold(fname, filename) || strings.EqualFold(fname, filenameLower) {
+			// Validate checksum looks like SHA256 (64 hex chars)
+			if len(checksum) == 64 && isHex(checksum) {
+				return strings.ToLower(checksum), nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("checksum not found for %s", filename)
+}
+
+// isHex returns true if the string contains only hexadecimal characters.
+func isHex(s string) bool {
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 // buildStatus creates an UpdateStatus from cached data.
@@ -274,6 +392,8 @@ func (c *Checker) buildStatus(cached cachedStatus) UpdateStatus {
 		ReleaseNotes:   cached.ReleaseNotes,
 		DownloadURL:    cached.DownloadURL,
 		DownloadSize:   cached.DownloadSize,
+		Checksum:       cached.Checksum,
+		ChecksumURL:    cached.ChecksumURL,
 		CheckedAt:      cached.CheckedAt,
 	}
 }

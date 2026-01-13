@@ -10,7 +10,6 @@ import (
 	"os"
 	"runtime"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/tinyrange/cc/internal/gowin/graphics"
@@ -247,22 +246,6 @@ func main() {
 	os.Exit(exitCode)
 }
 
-// waitForProcessExit waits for a process to exit.
-func waitForProcessExit(pid int) {
-	for range 60 { // Max 30 seconds
-		p, err := os.FindProcess(pid)
-		if err != nil {
-			return
-		}
-
-		// On Unix, FindProcess always succeeds, need to check if process exists
-		// by sending signal 0
-		if runtime.GOOS != "windows" {
-			if err := p.Signal(syscall.Signal(0)); err != nil {
-				return
-			}
-		}
-
-		time.Sleep(500 * time.Millisecond)
-	}
-}
+// waitForProcessExit is defined in platform-specific files:
+// - wait_unix.go for Unix systems (uses signal 0 to check process existence)
+// - wait_windows.go for Windows (uses WaitForSingleObject)

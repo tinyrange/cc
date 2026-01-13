@@ -84,6 +84,18 @@ jobs:
         with:
           path: artifacts
 
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum \
+            macos-arm64/CrumbleCracker_darwin_arm64.zip \
+            other-platforms/CrumbleCracker_windows_amd64.exe \
+            other-platforms/CrumbleCracker_windows_arm64.exe \
+            other-platforms/CrumbleCracker_linux_amd64 \
+            other-platforms/CrumbleCracker_linux_arm64 \
+            | sed 's|macos-arm64/||; s|other-platforms/||' > checksums.txt
+          cat checksums.txt
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -95,3 +107,4 @@ jobs:
             artifacts/other-platforms/CrumbleCracker_windows_arm64.exe
             artifacts/other-platforms/CrumbleCracker_linux_amd64
             artifacts/other-platforms/CrumbleCracker_linux_arm64
+            artifacts/checksums.txt

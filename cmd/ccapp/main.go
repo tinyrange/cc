@@ -126,9 +126,9 @@ type Application struct {
 	terminalScreen      *TerminalScreen
 	customVMScreen      *CustomVMScreen
 	settingsScreen      *SettingsScreen
-	deleteConfirmScreen   *DeleteConfirmScreen
-	appSettingsScreen     *AppSettingsScreen
-	updateConfirmScreen   *UpdateConfirmScreen
+	deleteConfirmScreen *DeleteConfirmScreen
+	appSettingsScreen   *AppSettingsScreen
+	updateConfirmScreen *UpdateConfirmScreen
 
 	// Settings dialog state
 	selectedSettingsIndex int
@@ -198,6 +198,10 @@ type Application struct {
 	// URL handler state
 	pendingURL       string
 	urlConfirmScreen *URLConfirmScreen
+
+	// Shutdown state
+	shutdownRequested bool
+	shutdownCode      int
 }
 
 type rect struct {
@@ -361,8 +365,10 @@ func (app *Application) startUpdate() {
 	slog.Info("starting update", "version", app.updateStatus.LatestVersion)
 
 	// Show updating screen
+	app.bootProgressMu.Lock()
 	app.bootName = app.updateStatus.LatestVersion
 	app.bootStarted = time.Now()
+	app.bootProgressMu.Unlock()
 	app.loadingScreen = nil // Force rebuild
 	app.mode = modeUpdating
 
@@ -380,7 +386,16 @@ func (app *Application) startUpdate() {
 			app.bootProgressMu.Unlock()
 		})
 
-		stagingDir, err := downloader.DownloadToStaging(app.updateStatus.DownloadURL, runtime.GOOS)
+		// Fatal error if checksum is not available
+		if app.updateStatus.Checksum == "" {
+			slog.Error("update checksum not available, cannot download")
+			app.showError(fmt.Errorf("update checksum not available, cannot download"))
+			return
+		} else {
+			slog.Info("update checksum available, will verify after download", "checksum", app.updateStatus.Checksum[:16]+"...")
+		}
+
+		stagingDir, err := downloader.DownloadToStaging(app.updateStatus.DownloadURL, runtime.GOOS, app.updateStatus.Checksum)
 		if err != nil {
 			slog.Error("failed to download update", "error", err)
 			app.showError(fmt.Errorf("failed to download update: %w", err))
@@ -396,13 +411,19 @@ func (app *Application) startUpdate() {
 		}
 
 		slog.Info("launching installer", "staging", stagingDir, "target", targetPath)
-		if err := update.LaunchInstaller(stagingDir, targetPath); err != nil {
+		err = update.LaunchInstaller(stagingDir, targetPath)
+		if err == update.ErrInstallerLaunched {
+			// Installer launched successfully - request graceful shutdown
+			slog.Info("installer launched, requesting shutdown")
+			app.requestShutdown(0)
+			return
+		}
+		if err != nil {
 			slog.Error("failed to launch installer", "error", err)
 			os.RemoveAll(stagingDir)
 			app.showError(fmt.Errorf("failed to launch installer: %w", err))
 			return
 		}
-		// Note: LaunchInstaller calls os.Exit(0) on success, so we won't reach here
 	}()
 }
 
@@ -669,7 +690,21 @@ func (app *Application) Run() error {
 		}
 	}()
 
-	return app.window.Loop(func(f graphics.Frame) error {
+	// Stop running VM on exit
+	defer func() {
+		if app.running != nil {
+			slog.Info("stopping VM on shutdown")
+			app.stopVM()
+		}
+	}()
+
+	err = app.window.Loop(func(f graphics.Frame) error {
+		// Check for shutdown request
+		if app.shutdownRequested {
+			slog.Info("shutdown requested, exiting main loop", "code", app.shutdownCode)
+			return fmt.Errorf("shutdown requested")
+		}
+
 		switch app.mode {
 		case modeLauncher:
 			return app.renderLauncher(f)
@@ -701,6 +736,14 @@ func (app *Application) Run() error {
 			return nil
 		}
 	})
+
+	// If shutdown was requested, exit with the requested code (after defers run)
+	if app.shutdownRequested {
+		slog.Info("exiting after shutdown cleanup", "code", app.shutdownCode)
+		os.Exit(app.shutdownCode)
+	}
+
+	return err
 }
 
 func (app *Application) showError(err error) {
@@ -709,6 +752,13 @@ func (app *Application) showError(err error) {
 	}
 	app.errMsg = err.Error()
 	app.mode = modeError
+}
+
+// requestShutdown requests a graceful shutdown of the application.
+// The main loop will check this and perform cleanup before exiting.
+func (app *Application) requestShutdown(code int) {
+	app.shutdownRequested = true
+	app.shutdownCode = code
 }
 
 // formatHypervisorError returns a user-friendly error message for hypervisor failures.
@@ -1152,8 +1202,10 @@ func (app *Application) startBootBundle(index int) {
 		return
 	}
 
+	app.bootProgressMu.Lock()
 	app.bootStarted = time.Now()
 	app.bootName = name
+	app.bootProgressMu.Unlock()
 	app.mode = modeLoading
 
 	ch := make(chan bootResult, 1)
@@ -1454,8 +1506,10 @@ func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string
 		displayName = sourcePath
 	}
 
+	app.bootProgressMu.Lock()
 	app.bootStarted = time.Now()
 	app.bootName = displayName
+	app.bootProgressMu.Unlock()
 	app.mode = modeLoading
 	app.loadingScreen = nil // Force rebuild to show correct name
 

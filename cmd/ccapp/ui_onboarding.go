@@ -222,8 +222,14 @@ func (s *OnboardingScreen) onInstall() {
 			}
 
 			// Launch new instance and exit
-			if err := update.LaunchAppAndExit(newPath); err != nil {
-				s.app.showError(fmt.Errorf("failed to launch installed app: %w", err))
+			launchErr := update.LaunchAppAndExit(newPath)
+			if launchErr == update.ErrAppLaunched {
+				// App launched successfully - request graceful shutdown
+				s.app.requestShutdown(0)
+				return
+			}
+			if launchErr != nil {
+				s.app.showError(fmt.Errorf("failed to launch installed app: %w", launchErr))
 			}
 			return
 		}
