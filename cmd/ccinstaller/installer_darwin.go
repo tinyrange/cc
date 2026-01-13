@@ -42,21 +42,27 @@ func install(staging, target string, ui *InstallerUI) error {
 		return fmt.Errorf("create backup: %w", err)
 	}
 
-	ui.setStatus("Removing old version...")
-	ui.setProgress(0.5)
+	ui.setStatus("Installing new version...")
+	ui.setProgress(0.6)
 
-	// Remove old version
+	// Move new version to temporary location first
+	tempTarget := target + ".new"
+	if err := os.Rename(appBundle, tempTarget); err != nil {
+		os.RemoveAll(backupPath)
+		return fmt.Errorf("move new version: %w", err)
+	}
+
+	ui.setStatus("Removing old version...")
+	ui.setProgress(0.7)
+
+	// Atomic swap: remove old, rename new
 	if err := os.RemoveAll(target); err != nil {
-		// Try to restore backup
-		os.Rename(backupPath, target)
+		os.Rename(tempTarget, appBundle) // restore
+		os.RemoveAll(backupPath)
 		return fmt.Errorf("remove old version: %w", err)
 	}
 
-	ui.setStatus("Installing new version...")
-	ui.setProgress(0.7)
-
-	// Move new version into place
-	if err := os.Rename(appBundle, target); err != nil {
+	if err := os.Rename(tempTarget, target); err != nil {
 		// Restore backup
 		os.Rename(backupPath, target)
 		return fmt.Errorf("install new version: %w", err)
@@ -75,19 +81,21 @@ func install(staging, target string, ui *InstallerUI) error {
 	if err := verifyCodeSign(target); err != nil {
 		ui.setStatus("Signature verification failed, rolling back...")
 
-		// Try to restore backup
-		if removeErr := os.RemoveAll(target); removeErr != nil {
-			return fmt.Errorf("signature verification failed (%w) and failed to remove broken install: %v", err, removeErr)
-		}
-		if renameErr := os.Rename(backupPath, target); renameErr != nil {
-			return fmt.Errorf("signature verification failed (%w) and failed to restore backup: %v", err, renameErr)
+		// Best-effort rollback: try to restore even if remove fails
+		removeErr := os.RemoveAll(target)
+		renameErr := os.Rename(backupPath, target)
+
+		if renameErr != nil {
+			return fmt.Errorf("signature verification failed (%w), and failed to restore backup (remove err: %v, rename err: %v)", err, removeErr, renameErr)
 		}
 
-		return fmt.Errorf("signature verification failed (restored backup): %w", err)
+		return fmt.Errorf("signature verification failed (backup restored): %w", err)
 	}
 
-	// Remove backup on success
-	os.RemoveAll(backupPath)
+	// Remove backup on success (best effort)
+	if err := os.RemoveAll(backupPath); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to remove backup after successful install: %v\n", err)
+	}
 
 	return nil
 }

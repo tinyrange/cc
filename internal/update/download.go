@@ -3,6 +3,7 @@ package update
 import (
 	"archive/zip"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -129,13 +130,36 @@ func (d *Downloader) DownloadToStaging(url string, goos string, expectedChecksum
 	if goos == "darwin" && strings.HasSuffix(url, ".zip") {
 		d.reportProgress(DownloadProgress{Status: "Extracting..."})
 
-		if err := extractZip(downloadPath, stagingDir); err != nil {
+		// Extract to a temporary subdirectory first for atomicity
+		extractDir := filepath.Join(stagingDir, "extract")
+		if err := os.MkdirAll(extractDir, 0o755); err != nil {
+			os.RemoveAll(stagingDir)
+			return "", fmt.Errorf("create extract dir: %w", err)
+		}
+
+		if err := extractZip(downloadPath, extractDir); err != nil {
 			os.RemoveAll(stagingDir)
 			return "", fmt.Errorf("extract zip: %w", err)
 		}
 
-		// Remove the zip file
+		// Remove the zip file after successful extraction
 		os.Remove(downloadPath)
+
+		// Move extracted contents to staging root
+		entries, err := os.ReadDir(extractDir)
+		if err != nil {
+			os.RemoveAll(stagingDir)
+			return "", fmt.Errorf("read extract dir: %w", err)
+		}
+		for _, entry := range entries {
+			src := filepath.Join(extractDir, entry.Name())
+			dst := filepath.Join(stagingDir, entry.Name())
+			if err := os.Rename(src, dst); err != nil {
+				os.RemoveAll(stagingDir)
+				return "", fmt.Errorf("move extracted file: %w", err)
+			}
+		}
+		os.Remove(extractDir)
 	}
 
 	return stagingDir, nil
@@ -154,8 +178,9 @@ func (d *Downloader) VerifyChecksum(filePath, expectedHash string) error {
 		return err
 	}
 
-	actualHash := hex.EncodeToString(h.Sum(nil))
-	if !strings.EqualFold(actualHash, expectedHash) {
+	actualHash := strings.ToLower(hex.EncodeToString(h.Sum(nil)))
+	expectedHash = strings.ToLower(expectedHash)
+	if len(actualHash) != len(expectedHash) || subtle.ConstantTimeCompare([]byte(actualHash), []byte(expectedHash)) != 1 {
 		return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedHash, actualHash)
 	}
 

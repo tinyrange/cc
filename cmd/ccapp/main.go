@@ -396,9 +396,8 @@ func (app *Application) startUpdate() {
 			slog.Error("update checksum not available, cannot download")
 			app.showError(fmt.Errorf("update checksum not available, cannot download"))
 			return
-		} else {
-			slog.Info("update checksum available, will verify after download", "checksum", app.updateStatus.Checksum[:16]+"...")
 		}
+		slog.Info("update checksum available, will verify after download", "checksum", app.updateStatus.Checksum[:16]+"...")
 
 		stagingDir, err := downloader.DownloadToStaging(app.updateStatus.DownloadURL, runtime.GOOS, app.updateStatus.Checksum)
 		if err != nil {
@@ -574,13 +573,19 @@ func (app *Application) Run() error {
 
 		// Handle pending cleanup from previous installation
 		if cleanup := settingsStore.Get().CleanupPending; cleanup != "" {
-			slog.Info("performing pending cleanup", "path", cleanup)
-			if err := update.DeleteApp(cleanup); err != nil {
-				slog.Warn("failed to clean up old app", "path", cleanup, "error", err)
+			// Validate cleanup path before deletion to prevent TOCTOU attacks
+			if err := update.ValidateCleanupPath(cleanup); err != nil {
+				slog.Warn("cleanup path validation failed, skipping cleanup", "path", cleanup, "error", err)
+				settingsStore.ClearCleanupPending()
 			} else {
-				slog.Info("cleaned up old app", "path", cleanup)
+				slog.Info("performing pending cleanup", "path", cleanup)
+				if err := update.DeleteApp(cleanup); err != nil {
+					slog.Warn("failed to clean up old app", "path", cleanup, "error", err)
+				} else {
+					slog.Info("cleaned up old app", "path", cleanup)
+				}
+				settingsStore.ClearCleanupPending()
 			}
-			settingsStore.ClearCleanupPending()
 		}
 	}
 
@@ -601,7 +606,10 @@ func (app *Application) Run() error {
 	}
 	if autoUpdateEnabled {
 		go func() {
-			status := app.updateChecker.Check()
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			status := app.updateChecker.CheckWithContext(ctx)
 			if status.Error != nil {
 				slog.Warn("update check failed", "error", status.Error)
 				return

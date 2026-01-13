@@ -47,11 +47,11 @@ func install(staging, target string, ui *InstallerUI) error {
 		return fmt.Errorf("create backup: %w", err)
 	}
 
-	ui.setStatus("Waiting for file lock...")
+	ui.setStatus("Waiting for application to close...")
 	ui.setProgress(0.5)
 
-	// Wait for the file to be unlocked
-	if err := waitForFileLock(target, 30*time.Second); err != nil {
+	// Wait for the file to be unlocked (app may take time for cleanup/VM shutdown)
+	if err := waitForFileLock(target, 60*time.Second); err != nil {
 		os.Remove(backupPath)
 		return fmt.Errorf("wait for file lock: %w", err)
 	}

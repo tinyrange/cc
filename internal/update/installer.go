@@ -245,35 +245,54 @@ func CopyAppToLocation(targetDir string) (string, error) {
 	appName := filepath.Base(sourcePath)
 	targetPath := filepath.Join(targetDir, appName)
 
-	// Remove existing app at target if it exists
+	// Use atomic copy to prevent TOCTOU: copy to temp location, then rename atomically
+	tempTarget := targetPath + ".tmp"
+	cleanupTemp := true
+	defer func() {
+		if cleanupTemp {
+			os.RemoveAll(tempTarget)
+		}
+	}()
+
+	// Copy the app to temporary location
+	if runtime.GOOS == "darwin" && strings.HasSuffix(sourcePath, ".app") {
+		// On macOS, copy the entire .app bundle directory
+		if err := copyDir(sourcePath, tempTarget); err != nil {
+			return "", fmt.Errorf("copy app bundle: %w", err)
+		}
+
+		// Re-sign the copied app with hypervisor entitlements
+		if err := signWithEntitlements(tempTarget); err != nil {
+			// Log prominently - signing failure may prevent app from working
+			fmt.Fprintf(os.Stderr, "ERROR: failed to sign copied app (app may not work): %v\n", err)
+		}
+	} else {
+		// On other platforms, copy the binary
+		if err := copyFile(sourcePath, tempTarget); err != nil {
+			return "", fmt.Errorf("copy binary: %w", err)
+		}
+		// Make executable
+		if err := os.Chmod(tempTarget, 0o755); err != nil {
+			return "", fmt.Errorf("chmod: %w", err)
+		}
+	}
+
+	// Remove existing app at target if it exists (check immediately before atomic rename)
 	if _, err := os.Stat(targetPath); err == nil {
+		// Verify it's not a symlink to prevent overwriting system files
+		if info, err := os.Lstat(targetPath); err == nil && info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("target path is a symlink, refusing to overwrite")
+		}
 		if err := os.RemoveAll(targetPath); err != nil {
 			return "", fmt.Errorf("remove existing app: %w", err)
 		}
 	}
 
-	// Copy the app
-	if runtime.GOOS == "darwin" && strings.HasSuffix(sourcePath, ".app") {
-		// On macOS, copy the entire .app bundle directory
-		if err := copyDir(sourcePath, targetPath); err != nil {
-			return "", fmt.Errorf("copy app bundle: %w", err)
-		}
-
-		// Re-sign the copied app with hypervisor entitlements
-		if err := signWithEntitlements(targetPath); err != nil {
-			// Log but don't fail - might work without signing
-			fmt.Fprintf(os.Stderr, "warning: failed to sign copied app: %v\n", err)
-		}
-	} else {
-		// On other platforms, copy the binary
-		if err := copyFile(sourcePath, targetPath); err != nil {
-			return "", fmt.Errorf("copy binary: %w", err)
-		}
-		// Make executable
-		if err := os.Chmod(targetPath, 0o755); err != nil {
-			return "", fmt.Errorf("chmod: %w", err)
-		}
+	// Atomic rename to final location
+	if err := os.Rename(tempTarget, targetPath); err != nil {
+		return "", fmt.Errorf("atomic rename to target: %w", err)
 	}
+	cleanupTemp = false // Rename succeeded, don't clean up
 
 	return targetPath, nil
 }
@@ -370,6 +389,38 @@ func LaunchAppAndExit(appPath string) error {
 
 	// Return sentinel error - caller should exit
 	return ErrAppLaunched
+}
+
+// ValidateCleanupPath validates that a cleanup path is safe to delete.
+// This provides defense-in-depth by validating before DeleteApp is called.
+func ValidateCleanupPath(appPath string) error {
+	if appPath == "" {
+		return fmt.Errorf("cleanup path is empty")
+	}
+
+	// Resolve symlinks to get the real path
+	realPath, err := filepath.EvalSymlinks(appPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // Path doesn't exist, nothing to validate
+		}
+		return fmt.Errorf("resolve path: %w", err)
+	}
+
+	// Clean the path to normalize it
+	realPath = filepath.Clean(realPath)
+
+	// Verify it's in an expected location
+	if !isValidAppLocation(realPath) {
+		return fmt.Errorf("refusing to delete: path not in expected location: %s", appPath)
+	}
+
+	// Verify it looks like our app
+	if !isOurApp(realPath) {
+		return fmt.Errorf("refusing to delete: doesn't look like CrumbleCracker: %s", appPath)
+	}
+
+	return nil
 }
 
 // DeleteApp removes the app at the specified path with safety checks.
@@ -517,12 +568,6 @@ func RemoveDesktopShortcut() error {
 	}
 }
 
-// escapePowershellString escapes a string for safe use in PowerShell single-quoted strings.
-// Single quotes are escaped by doubling them.
-func escapePowershellString(s string) string {
-	return strings.ReplaceAll(s, "'", "''")
-}
-
 // validatePathForScript validates that a path is safe to use in shell scripts.
 // Returns an error if the path contains dangerous characters.
 func validatePathForScript(path string) error {
@@ -541,45 +586,6 @@ func validatePathForScript(path string) error {
 	return nil
 }
 
-// createWindowsShortcut creates a .lnk shortcut in the Start Menu.
-func createWindowsShortcut(appPath string) error {
-	// Validate path before using in PowerShell
-	if err := validatePathForScript(appPath); err != nil {
-		return fmt.Errorf("invalid app path: %w", err)
-	}
-
-	// Get the Start Menu Programs directory
-	appData := os.Getenv("APPDATA")
-	if appData == "" {
-		return fmt.Errorf("APPDATA environment variable not set")
-	}
-
-	startMenuDir := filepath.Join(appData, "Microsoft", "Windows", "Start Menu", "Programs")
-	shortcutPath := filepath.Join(startMenuDir, "CrumbleCracker.lnk")
-
-	// Escape paths for safe use in PowerShell single-quoted strings
-	escapedShortcutPath := escapePowershellString(shortcutPath)
-	escapedAppPath := escapePowershellString(appPath)
-	escapedWorkDir := escapePowershellString(filepath.Dir(appPath))
-
-	// Use PowerShell to create the shortcut
-	script := fmt.Sprintf(`
-$WshShell = New-Object -ComObject WScript.Shell
-$Shortcut = $WshShell.CreateShortcut('%s')
-$Shortcut.TargetPath = '%s'
-$Shortcut.WorkingDirectory = '%s'
-$Shortcut.Description = 'CrumbleCracker - Run Linux containers'
-$Shortcut.Save()
-`, escapedShortcutPath, escapedAppPath, escapedWorkDir)
-
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("powershell shortcut creation failed: %w\noutput: %s", err, string(output))
-	}
-
-	return nil
-}
 
 // removeWindowsShortcut removes the Start Menu shortcut.
 func removeWindowsShortcut() error {

@@ -2,6 +2,7 @@
 package update
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -108,6 +109,11 @@ func (c *Checker) SetLogger(logger *slog.Logger) {
 
 // Check checks for updates, using cache if available and fresh.
 func (c *Checker) Check() UpdateStatus {
+	return c.CheckWithContext(context.Background())
+}
+
+// CheckWithContext checks for updates with context for cancellation/timeout.
+func (c *Checker) CheckWithContext(ctx context.Context) UpdateStatus {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -121,14 +127,14 @@ func (c *Checker) Check() UpdateStatus {
 	}
 
 	// Cache miss or expired, fetch from API
-	return c.fetchAndCache()
+	return c.fetchAndCache(ctx)
 }
 
 // ForceCheck bypasses the cache and always fetches from the API.
 func (c *Checker) ForceCheck() UpdateStatus {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.fetchAndCache()
+	return c.fetchAndCache(context.Background())
 }
 
 // ForceUpdate returns an UpdateStatus that will trigger an update regardless of version.
@@ -137,7 +143,7 @@ func (c *Checker) ForceUpdate() UpdateStatus {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	status := c.fetchAndCache()
+	status := c.fetchAndCache(context.Background())
 	if status.Error != nil {
 		return status
 	}
@@ -161,8 +167,8 @@ func (c *Checker) CurrentVersion() string {
 }
 
 // fetchAndCache fetches the latest release info and caches it.
-func (c *Checker) fetchAndCache() UpdateStatus {
-	release, err := c.fetchLatestRelease()
+func (c *Checker) fetchAndCache(ctx context.Context) UpdateStatus {
+	release, err := c.fetchLatestRelease(ctx)
 	if err != nil {
 		c.logger.Warn("failed to fetch latest release", "error", err)
 		return UpdateStatus{Error: err}
@@ -205,24 +211,28 @@ func (c *Checker) fetchAndCache() UpdateStatus {
 }
 
 // fetchLatestRelease fetches the latest release from GitHub with retry logic.
-func (c *Checker) fetchLatestRelease() (*ReleaseInfo, error) {
+func (c *Checker) fetchLatestRelease(ctx context.Context) (*ReleaseInfo, error) {
 	var lastErr error
 	backoff := 500 * time.Millisecond
 
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			time.Sleep(backoff)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
 			backoff *= 2 // Exponential backoff
 		}
 
-		release, err := c.doFetchRelease()
+		release, err := c.doFetchRelease(ctx)
 		if err == nil {
 			return release, nil
 		}
 		lastErr = err
 
-		// Don't retry on permanent errors
-		if strings.Contains(err.Error(), "no releases found") {
+		// Don't retry on permanent errors or context cancellation
+		if strings.Contains(err.Error(), "no releases found") || ctx.Err() != nil {
 			return nil, err
 		}
 		c.logger.Debug("fetch release attempt failed, retrying", "attempt", attempt+1, "error", err)
@@ -232,8 +242,8 @@ func (c *Checker) fetchLatestRelease() (*ReleaseInfo, error) {
 }
 
 // doFetchRelease performs a single fetch attempt.
-func (c *Checker) doFetchRelease() (*ReleaseInfo, error) {
-	req, err := http.NewRequest("GET", GitHubReleasesAPI, nil)
+func (c *Checker) doFetchRelease(ctx context.Context) (*ReleaseInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", GitHubReleasesAPI, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -244,7 +254,10 @@ func (c *Checker) doFetchRelease() (*ReleaseInfo, error) {
 
 	// Support optional GitHub token for higher rate limits
 	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+		// Basic validation - GitHub tokens have known prefixes
+		if strings.HasPrefix(token, "ghp_") || strings.HasPrefix(token, "github_pat_") {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
 	}
 
 	resp, err := c.client.Do(req)

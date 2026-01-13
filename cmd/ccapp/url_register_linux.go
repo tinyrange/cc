@@ -40,10 +40,12 @@ func RegisterURLScheme() error {
 	}
 
 	// Create .desktop file content
+	// Quote executable and %u for defense-in-depth against paths with spaces
+	// and non-compliant desktop environments that don't escape %u properly
 	content := fmt.Sprintf(`[Desktop Entry]
 Name=CrumbleCracker URL Handler
 Comment=Handle crumblecracker:// URLs
-Exec=%s %%u
+Exec="%s" "%%u"
 Type=Application
 MimeType=x-scheme-handler/crumblecracker;
 NoDisplay=true

@@ -33,6 +33,11 @@ func GetSiteConfigPath() (string, error) {
 
 // LoadSiteConfig reads and parses the site config file.
 // Returns an empty config if the file doesn't exist.
+//
+// Security note: This file is loaded from the application directory without signature
+// verification. This is intentional - if an attacker has write access to the app
+// directory, they could replace the binary itself. The site config only controls
+// low-impact settings (onboarding, auto-update preference).
 func LoadSiteConfig() SiteConfig {
 	configPath, err := GetSiteConfigPath()
 	if err != nil {
@@ -40,11 +45,17 @@ func LoadSiteConfig() SiteConfig {
 		return SiteConfig{}
 	}
 
-	data, err := os.ReadFile(configPath)
+	info, err := os.Stat(configPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			slog.Warn("failed to read site config", "path", configPath, "error", err)
+			slog.Warn("failed to stat site config", "path", configPath, "error", err)
 		}
+		return SiteConfig{}
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		slog.Warn("failed to read site config", "path", configPath, "error", err)
 		return SiteConfig{}
 	}
 
@@ -54,6 +65,6 @@ func LoadSiteConfig() SiteConfig {
 		return SiteConfig{}
 	}
 
-	slog.Info("loaded site config", "path", configPath)
+	slog.Info("loaded site config", "path", configPath, "size", info.Size(), "mode", info.Mode().String())
 	return config
 }
