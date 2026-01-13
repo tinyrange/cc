@@ -52,6 +52,7 @@ const (
 	modeUpdating
 	modeAppSettings
 	modeUpdateConfirm
+	modeURLConfirm
 )
 
 // discoveredBundle holds metadata and path for a discovered bundle.
@@ -193,6 +194,10 @@ type Application struct {
 	confirmBtnShape *graphics.ShapeBuilder
 	cancelBtnShape  *graphics.ShapeBuilder
 	dialogLastBgR   rect // track last dialog background rect for geometry updates
+
+	// URL handler state
+	pendingURL       string
+	urlConfirmScreen *URLConfirmScreen
 }
 
 type rect struct {
@@ -589,6 +594,19 @@ func (app *Application) Run() error {
 	// Set up dock menu (macOS only)
 	app.updateDockMenu()
 
+	// Set up URL handler for Apple Events (macOS only)
+	if urlSupport, ok := app.window.PlatformWindow().(window.URLEventSupport); ok {
+		urlSupport.SetURLHandler(func(url string) {
+			slog.Info("received URL via Apple Event", "url", url)
+			app.pendingURL = url
+			// If we're in a state that can handle URLs, process it
+			if app.mode == modeLauncher || app.mode == modeOnboarding {
+				app.handlePendingURL()
+			}
+		})
+		slog.Info("URL event handler registered")
+	}
+
 	// Initialize built-in UI screens
 	app.launcherScreen = NewLauncherScreen(app)
 	app.terminalScreen = NewTerminalScreen(app)
@@ -638,6 +656,11 @@ func (app *Application) Run() error {
 		}
 	}
 
+	// Handle pending URL if present (from command line argument)
+	if app.pendingURL != "" && app.mode != modeError {
+		app.handlePendingURL()
+	}
+
 	// Close hypervisor on exit if it wasn't transferred to a VM
 	defer func() {
 		if app.hypervisor != nil {
@@ -672,6 +695,8 @@ func (app *Application) Run() error {
 			return app.renderAppSettings(f)
 		case modeUpdateConfirm:
 			return app.renderUpdateConfirm(f)
+		case modeURLConfirm:
+			return app.renderURLConfirm(f)
 		default:
 			return nil
 		}
@@ -867,6 +892,51 @@ func (app *Application) showDeleteConfirm(bundleIndex int) {
 	app.selectedSettingsIndex = bundleIndex
 	app.deleteConfirmScreen = nil // Force rebuild
 	app.mode = modeDeleteConfirm
+}
+
+func (app *Application) renderURLConfirm(f graphics.Frame) error {
+	if app.urlConfirmScreen == nil {
+		return nil
+	}
+
+	// Render launcher as background
+	app.launcherScreen.RenderBackground(f)
+
+	// Render the URL confirmation dialog on top
+	return app.urlConfirmScreen.Render(f)
+}
+
+func (app *Application) handlePendingURL() {
+	if app.pendingURL == "" {
+		return
+	}
+
+	action, err := ParseCrumbleCrackerURL(app.pendingURL)
+	if err != nil {
+		slog.Error("invalid URL", "url", app.pendingURL, "error", err)
+		app.showError(fmt.Errorf("invalid URL: %w", err))
+		app.pendingURL = ""
+		return
+	}
+
+	if err := ValidateURLAction(action); err != nil {
+		slog.Error("invalid URL action", "url", app.pendingURL, "error", err)
+		app.showError(err)
+		app.pendingURL = ""
+		return
+	}
+
+	slog.Info("handling URL", "action", action.Action, "image", action.ImageRef)
+
+	switch action.Action {
+	case "run":
+		// Show confirmation dialog
+		app.urlConfirmScreen = NewURLConfirmScreen(app, action.ImageRef)
+		app.mode = modeURLConfirm
+	default:
+		app.showError(fmt.Errorf("unknown action: %s", action.Action))
+		app.pendingURL = ""
+	}
 }
 
 func (app *Application) refreshBundles() {
@@ -1822,6 +1892,12 @@ func main() {
 	app := Application{}
 	app.logDir = logDir
 	app.logFile = logFile
+
+	// Check for URL argument (passed by OS when handling crumblecracker:// URLs)
+	if len(os.Args) > 1 && strings.HasPrefix(os.Args[1], "crumblecracker://") {
+		app.pendingURL = os.Args[1]
+		slog.Info("pending URL from command line", "url", app.pendingURL)
+	}
 
 	if err := app.Run(); err != nil {
 		slog.Error("ccapp exited with error", "error", err)

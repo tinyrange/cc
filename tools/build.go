@@ -118,6 +118,8 @@ func copyFile(dstPath, srcPath string, perm os.FileMode) error {
 // - string => <string>
 // - bool   => <true/> / <false/>
 // - int/uint and sized variants => <integer>
+// - slice of strings => <array> of <string>
+// - slice of structs => <array> of <dict>
 //
 // Fields are encoded in declaration order. Use struct tags: `plist:"CFBundleName"`.
 func encodePlist(v any) ([]byte, error) {
@@ -198,6 +200,34 @@ func encodePlist(v any) ([]byte, error) {
 			if err := enc.EncodeElement(s, xml.StartElement{Name: xml.Name{Local: "integer"}}); err != nil {
 				return nil, fmt.Errorf("plist: encode integer %q: %w", key, err)
 			}
+		case reflect.Slice:
+			if fv.Len() == 0 {
+				continue // Skip empty slices
+			}
+			arrayStart := xml.StartElement{Name: xml.Name{Local: "array"}}
+			if err := enc.EncodeToken(arrayStart); err != nil {
+				return nil, fmt.Errorf("plist: encode <array> for %q: %w", key, err)
+			}
+			elemKind := fv.Type().Elem().Kind()
+			for j := 0; j < fv.Len(); j++ {
+				elem := fv.Index(j)
+				switch elemKind {
+				case reflect.String:
+					if err := enc.EncodeElement(elem.String(), xml.StartElement{Name: xml.Name{Local: "string"}}); err != nil {
+						return nil, fmt.Errorf("plist: encode string in array %q: %w", key, err)
+					}
+				case reflect.Struct:
+					// Encode struct as dict
+					if err := encodePlistDict(enc, elem); err != nil {
+						return nil, fmt.Errorf("plist: encode dict in array %q: %w", key, err)
+					}
+				default:
+					return nil, fmt.Errorf("plist: unsupported slice element kind %s for key %q", elemKind, key)
+				}
+			}
+			if err := enc.EncodeToken(arrayStart.End()); err != nil {
+				return nil, fmt.Errorf("plist: encode </array> for %q: %w", key, err)
+			}
 		default:
 			return nil, fmt.Errorf("plist: unsupported kind %s for key %q (field %s)", fv.Kind(), key, f.Name)
 		}
@@ -214,6 +244,90 @@ func encodePlist(v any) ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
+}
+
+// encodePlistDict encodes a struct value as a plist dict element.
+func encodePlistDict(enc *xml.Encoder, rv reflect.Value) error {
+	if rv.Kind() == reflect.Pointer {
+		rv = rv.Elem()
+	}
+	if rv.Kind() != reflect.Struct {
+		return fmt.Errorf("expected struct, got %s", rv.Kind())
+	}
+	rt := rv.Type()
+
+	dictStart := xml.StartElement{Name: xml.Name{Local: "dict"}}
+	if err := enc.EncodeToken(dictStart); err != nil {
+		return fmt.Errorf("encode <dict>: %w", err)
+	}
+
+	for i := 0; i < rt.NumField(); i++ {
+		f := rt.Field(i)
+		if f.PkgPath != "" { // unexported
+			continue
+		}
+		key := f.Tag.Get("plist")
+		if key == "" || key == "-" {
+			continue
+		}
+
+		fv := rv.Field(i)
+		if fv.Kind() == reflect.Pointer {
+			if fv.IsNil() {
+				continue
+			}
+			fv = fv.Elem()
+		}
+
+		if err := enc.EncodeElement(key, xml.StartElement{Name: xml.Name{Local: "key"}}); err != nil {
+			return fmt.Errorf("encode key %q: %w", key, err)
+		}
+
+		switch fv.Kind() {
+		case reflect.String:
+			if err := enc.EncodeElement(fv.String(), xml.StartElement{Name: xml.Name{Local: "string"}}); err != nil {
+				return fmt.Errorf("encode string %q: %w", key, err)
+			}
+		case reflect.Bool:
+			elem := "false"
+			if fv.Bool() {
+				elem = "true"
+			}
+			start := xml.StartElement{Name: xml.Name{Local: elem}}
+			if err := enc.EncodeToken(start); err != nil {
+				return fmt.Errorf("encode <%s/> for %q: %w", elem, key, err)
+			}
+			if err := enc.EncodeToken(start.End()); err != nil {
+				return fmt.Errorf("encode </%s> for %q: %w", elem, key, err)
+			}
+		case reflect.Slice:
+			if fv.Len() == 0 {
+				continue
+			}
+			arrayStart := xml.StartElement{Name: xml.Name{Local: "array"}}
+			if err := enc.EncodeToken(arrayStart); err != nil {
+				return fmt.Errorf("encode <array> for %q: %w", key, err)
+			}
+			for j := 0; j < fv.Len(); j++ {
+				elem := fv.Index(j)
+				if elem.Kind() == reflect.String {
+					if err := enc.EncodeElement(elem.String(), xml.StartElement{Name: xml.Name{Local: "string"}}); err != nil {
+						return fmt.Errorf("encode string in array %q: %w", key, err)
+					}
+				}
+			}
+			if err := enc.EncodeToken(arrayStart.End()); err != nil {
+				return fmt.Errorf("encode </array> for %q: %w", key, err)
+			}
+		default:
+			return fmt.Errorf("unsupported kind %s for key %q", fv.Kind(), key)
+		}
+	}
+
+	if err := enc.EncodeToken(dictStart.End()); err != nil {
+		return fmt.Errorf("encode </dict>: %w", err)
+	}
+	return nil
 }
 
 func writeMacOSAppBundle(bundlePath, executablePath, appName, logoPath string) error {
@@ -251,17 +365,24 @@ func writeMacOSAppBundle(bundlePath, executablePath, appName, logoPath string) e
 	// Keep it simple: this is primarily for local development workflows.
 	bundleID := "com.tinyrange." + strings.ToLower(appName)
 
+	// URL scheme type for custom URL handlers
+	type urlSchemeType struct {
+		CFBundleURLName    string   `plist:"CFBundleURLName"`
+		CFBundleURLSchemes []string `plist:"CFBundleURLSchemes"`
+	}
+
 	type infoPlist struct {
-		CFBundleDevelopmentRegion     string `plist:"CFBundleDevelopmentRegion"`
-		CFBundleExecutable            string `plist:"CFBundleExecutable"`
-		CFBundleIdentifier            string `plist:"CFBundleIdentifier"`
-		CFBundleInfoDictionaryVersion string `plist:"CFBundleInfoDictionaryVersion"`
-		CFBundleName                  string `plist:"CFBundleName"`
-		CFBundlePackageType           string `plist:"CFBundlePackageType"`
-		CFBundleShortVersionString    string `plist:"CFBundleShortVersionString"`
-		CFBundleVersion               string `plist:"CFBundleVersion"`
-		NSHighResolutionCapable       bool   `plist:"NSHighResolutionCapable"`
-		CFBundleIconFile              string `plist:"CFBundleIconFile"`
+		CFBundleDevelopmentRegion     string          `plist:"CFBundleDevelopmentRegion"`
+		CFBundleExecutable            string          `plist:"CFBundleExecutable"`
+		CFBundleIdentifier            string          `plist:"CFBundleIdentifier"`
+		CFBundleInfoDictionaryVersion string          `plist:"CFBundleInfoDictionaryVersion"`
+		CFBundleName                  string          `plist:"CFBundleName"`
+		CFBundlePackageType           string          `plist:"CFBundlePackageType"`
+		CFBundleShortVersionString    string          `plist:"CFBundleShortVersionString"`
+		CFBundleVersion               string          `plist:"CFBundleVersion"`
+		NSHighResolutionCapable       bool            `plist:"NSHighResolutionCapable"`
+		CFBundleIconFile              string          `plist:"CFBundleIconFile"`
+		CFBundleURLTypes              []urlSchemeType `plist:"CFBundleURLTypes"`
 	}
 
 	plistData, err := encodePlist(infoPlist{
@@ -275,6 +396,10 @@ func writeMacOSAppBundle(bundlePath, executablePath, appName, logoPath string) e
 		CFBundleVersion:               "0",
 		NSHighResolutionCapable:       true,
 		CFBundleIconFile:              iconFileName,
+		CFBundleURLTypes: []urlSchemeType{{
+			CFBundleURLName:    "CrumbleCracker URL",
+			CFBundleURLSchemes: []string{"crumblecracker"},
+		}},
 	})
 	if err != nil {
 		return fmt.Errorf("encode Info.plist: %w", err)
