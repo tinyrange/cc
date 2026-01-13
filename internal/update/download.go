@@ -237,7 +237,8 @@ func extractZip(zipPath, destDir string) error {
 		fpath := filepath.Join(destDir, f.Name)
 
 		// Security check: prevent zip slip
-		if !strings.HasPrefix(fpath, filepath.Clean(destDir)+string(os.PathSeparator)) {
+		relPath, err := filepath.Rel(destDir, fpath)
+		if err != nil || strings.HasPrefix(relPath, "..") {
 			return fmt.Errorf("invalid file path: %s", f.Name)
 		}
 

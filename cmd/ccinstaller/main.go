@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/tinyrange/cc/internal/gowin/graphics"
@@ -257,7 +258,7 @@ func waitForProcessExit(pid int) {
 		// On Unix, FindProcess always succeeds, need to check if process exists
 		// by sending signal 0
 		if runtime.GOOS != "windows" {
-			if err := p.Signal(os.Signal(nil)); err != nil {
+			if err := p.Signal(syscall.Signal(0)); err != nil {
 				return
 			}
 		}
