@@ -277,15 +277,21 @@ func CopyAppToLocation(targetDir string) (string, error) {
 		}
 	}
 
-	// Remove existing app at target if it exists (check immediately before atomic rename)
-	if _, err := os.Stat(targetPath); err == nil {
-		// Verify it's not a symlink to prevent overwriting system files
-		if info, err := os.Lstat(targetPath); err == nil && info.Mode()&os.ModeSymlink != 0 {
+	// Remove existing app at target if it exists (TOCTOU-safe: single Lstat, then immediate remove)
+	if info, err := os.Lstat(targetPath); err == nil {
+		// Reject symlinks and special files to prevent attacks
+		if info.Mode()&os.ModeSymlink != 0 {
 			return "", fmt.Errorf("target path is a symlink, refusing to overwrite")
 		}
+		if info.Mode()&os.ModeType != 0 && !info.IsDir() {
+			return "", fmt.Errorf("target path is a special file, refusing to overwrite")
+		}
+		// Remove immediately after check to minimize TOCTOU window
 		if err := os.RemoveAll(targetPath); err != nil {
 			return "", fmt.Errorf("remove existing app: %w", err)
 		}
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("stat target: %w", err)
 	}
 
 	// Atomic rename to final location
@@ -481,13 +487,14 @@ func isValidAppLocation(path string) bool {
 		// Valid: ~/Applications, /Applications, /Users/*/Applications
 		// Also allow temporary locations for cleanup
 		return strings.HasPrefix(path, filepath.Join(home, "Applications")) ||
-			strings.HasPrefix(path, "/Applications/") ||
+			strings.HasPrefix(path, "/Applications") ||
+			(strings.HasPrefix(path, "/Users/") && strings.Contains(path, "/Applications/")) ||
 			strings.HasPrefix(path, os.TempDir())
 	case "linux":
 		// Valid: ~/.local/bin, /usr/local/bin, /opt, /tmp
 		localBin := filepath.Join(home, ".local", "bin")
 		return strings.HasPrefix(path, localBin) ||
-			strings.HasPrefix(path, "/usr/local/bin/") ||
+			strings.HasPrefix(path, "/usr/local/bin") ||
 			strings.HasPrefix(path, "/opt/") ||
 			strings.HasPrefix(path, os.TempDir())
 	case "windows":

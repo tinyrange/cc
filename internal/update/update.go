@@ -254,9 +254,20 @@ func (c *Checker) doFetchRelease(ctx context.Context) (*ReleaseInfo, error) {
 
 	// Support optional GitHub token for higher rate limits
 	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
-		// Basic validation - GitHub tokens have known prefixes
-		if strings.HasPrefix(token, "ghp_") || strings.HasPrefix(token, "github_pat_") {
+		// GitHub tokens have known prefixes
+		// See: https://github.blog/2021-04-05-behind-githubs-new-authentication-token-formats/
+		validPrefixes := []string{"ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"}
+		valid := false
+		for _, prefix := range validPrefixes {
+			if strings.HasPrefix(token, prefix) {
+				valid = true
+				break
+			}
+		}
+		if valid {
 			req.Header.Set("Authorization", "Bearer "+token)
+		} else {
+			slog.Warn("GITHUB_TOKEN has unrecognized format, not using for authentication")
 		}
 	}
 

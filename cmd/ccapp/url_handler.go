@@ -87,23 +87,14 @@ func ValidateURLAction(action *URLAction) error {
 		return ErrMissingImageRef
 	}
 
-	// Check for null bytes and control characters
+	// Allowlist approach: only permit characters valid in OCI image references
+	// (alphanumeric, hyphen, underscore, period, slash, colon for tags, @ for digests)
 	for _, r := range action.ImageRef {
-		if r < 32 || r == 127 {
-			return fmt.Errorf("%w: contains control character", ErrInvalidImageRef)
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '-' || r == '_' ||
+			r == '.' || r == '/' || r == ':' || r == '@') {
+			return fmt.Errorf("%w: contains invalid characters", ErrInvalidImageRef)
 		}
-	}
-
-	// Check for shell metacharacters and other dangerous characters
-	// These could potentially be used in injection attacks if the image name
-	// is ever passed to a shell command (even though it shouldn't be)
-	if strings.ContainsAny(action.ImageRef, "$;|&`(){}[]<>'\"\\") {
-		return fmt.Errorf("%w: contains invalid characters", ErrInvalidImageRef)
-	}
-
-	// Check for whitespace
-	if strings.ContainsAny(action.ImageRef, " \t\n\r") {
-		return fmt.Errorf("%w: contains whitespace", ErrInvalidImageRef)
 	}
 
 	// Validate against OCI reference format

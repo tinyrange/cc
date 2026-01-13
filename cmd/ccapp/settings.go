@@ -14,8 +14,9 @@ type AppSettings struct {
 	AutoUpdateEnabled     bool      `json:"auto_update_enabled"`
 	InstallPath           string    `json:"install_path,omitempty"`
 	InstalledAt           time.Time `json:"installed_at,omitempty"`
-	CleanupPending        string    `json:"cleanup_pending,omitempty"` // Path to delete on next startup
-	CreateDesktopShortcut bool      `json:"create_desktop_shortcut"`   // Create desktop/start menu shortcut (Windows/Linux)
+	CleanupPending        string    `json:"cleanup_pending,omitempty"`    // Path to delete on next startup
+	CleanupRetryCount     int       `json:"cleanup_retry_count,omitempty"` // Number of cleanup retry attempts
+	CreateDesktopShortcut bool      `json:"create_desktop_shortcut"`      // Create desktop/start menu shortcut (Windows/Linux)
 }
 
 // SettingsStore manages persistent storage of application settings
@@ -102,11 +103,19 @@ func (s *SettingsStore) SetInstallInfo(path string) error {
 // SetCleanupPending schedules a path for deletion on next startup
 func (s *SettingsStore) SetCleanupPending(path string) error {
 	s.settings.CleanupPending = path
+	s.settings.CleanupRetryCount = 0
 	return s.save()
 }
 
-// ClearCleanupPending clears the pending cleanup path
+// IncrementCleanupRetryCount increments the retry count and returns the new value
+func (s *SettingsStore) IncrementCleanupRetryCount() (int, error) {
+	s.settings.CleanupRetryCount++
+	return s.settings.CleanupRetryCount, s.save()
+}
+
+// ClearCleanupPending clears the pending cleanup path and retry count
 func (s *SettingsStore) ClearCleanupPending() error {
 	s.settings.CleanupPending = ""
+	s.settings.CleanupRetryCount = 0
 	return s.save()
 }

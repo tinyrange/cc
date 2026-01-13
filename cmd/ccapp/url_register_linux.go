@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
 const desktopFileName = "crumblecracker-url.desktop"
@@ -39,13 +40,19 @@ func RegisterURLScheme() error {
 		return fmt.Errorf("create applications directory: %w", err)
 	}
 
+	// Validate executable path to prevent shell injection and broken Exec lines
+	// Desktop file Exec values may be passed through a shell in some implementations
+	// Also reject spaces since we don't quote the path (quoting causes issues with field code expansion)
+	if strings.ContainsAny(exePath, "\"'`$\\ ") {
+		return fmt.Errorf("executable path contains unsafe characters: %s", exePath)
+	}
+
 	// Create .desktop file content
-	// Quote executable and %u for defense-in-depth against paths with spaces
-	// and non-compliant desktop environments that don't escape %u properly
+	// Avoid quoting to prevent issues with field code expansion in some DEs
 	content := fmt.Sprintf(`[Desktop Entry]
 Name=CrumbleCracker URL Handler
 Comment=Handle crumblecracker:// URLs
-Exec="%s" "%%u"
+Exec=%s %%u
 Type=Application
 MimeType=x-scheme-handler/crumblecracker;
 NoDisplay=true

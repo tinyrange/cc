@@ -53,6 +53,19 @@ func LoadSiteConfig() SiteConfig {
 		return SiteConfig{}
 	}
 
+	// Security: refuse to load world-writable config files (Unix-only; always 0 on Windows)
+	if info.Mode().Perm()&0002 != 0 {
+		slog.Error("site config is world-writable, refusing to load", "path", configPath, "mode", info.Mode())
+		return SiteConfig{}
+	}
+
+	// Prevent DoS from excessively large config files
+	const maxConfigSize = 1024 * 1024 // 1MB
+	if info.Size() > maxConfigSize {
+		slog.Warn("site config file too large", "path", configPath, "size", info.Size())
+		return SiteConfig{}
+	}
+
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		slog.Warn("failed to read site config", "path", configPath, "error", err)

@@ -81,14 +81,16 @@ func install(staging, target string, ui *InstallerUI) error {
 	if err := verifyCodeSign(target); err != nil {
 		ui.setStatus("Signature verification failed, rolling back...")
 
-		// Best-effort rollback: try to restore even if remove fails
+		// Rollback: remove failed install, then restore backup
 		removeErr := os.RemoveAll(target)
-		renameErr := os.Rename(backupPath, target)
-
-		if renameErr != nil {
-			return fmt.Errorf("signature verification failed (%w), and failed to restore backup (remove err: %v, rename err: %v)", err, removeErr, renameErr)
+		restoreErr := os.Rename(backupPath, target)
+		if restoreErr != nil {
+			return fmt.Errorf("signature verification failed (%w), rollback failed (remove: %v, restore: %v)", err, removeErr, restoreErr)
 		}
-
+		if removeErr != nil {
+			// Restore succeeded despite remove failing (target may have been partially removed)
+			return fmt.Errorf("signature verification failed (backup restored with warnings): %w", err)
+		}
 		return fmt.Errorf("signature verification failed (backup restored): %w", err)
 	}
 

@@ -280,8 +280,8 @@ func extractZip(zipPath, destDir string) error {
 		// Clean the file name from the archive
 		name := filepath.Clean(f.Name)
 
-		// Reject entries that start with .. after cleaning
-		if strings.HasPrefix(name, "..") {
+		// Security: validate cleaned name BEFORE joining to prevent traversal
+		if strings.Contains(name, "..") || filepath.IsAbs(name) {
 			return fmt.Errorf("invalid file path in archive: %s", f.Name)
 		}
 
@@ -294,9 +294,8 @@ func extractZip(zipPath, destDir string) error {
 		fpath := filepath.Join(absDestDir, name)
 		fpath = filepath.Clean(fpath)
 
-		// Security check: ensure the path is within destDir
-		// The path must start with destDir followed by a separator (or be exactly destDir)
-		if !strings.HasPrefix(fpath, absDestDir+string(filepath.Separator)) && fpath != absDestDir {
+		// Security check: ensure the path is within destDir after normalization
+		if !strings.HasPrefix(fpath, absDestDir+string(filepath.Separator)) {
 			return fmt.Errorf("invalid file path (directory traversal attempt): %s", f.Name)
 		}
 

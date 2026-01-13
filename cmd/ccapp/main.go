@@ -573,6 +573,8 @@ func (app *Application) Run() error {
 
 		// Handle pending cleanup from previous installation
 		if cleanup := settingsStore.Get().CleanupPending; cleanup != "" {
+			const maxCleanupRetries = 5
+
 			// Validate cleanup path before deletion to prevent TOCTOU attacks
 			if err := update.ValidateCleanupPath(cleanup); err != nil {
 				slog.Warn("cleanup path validation failed, skipping cleanup", "path", cleanup, "error", err)
@@ -580,11 +582,24 @@ func (app *Application) Run() error {
 			} else {
 				slog.Info("performing pending cleanup", "path", cleanup)
 				if err := update.DeleteApp(cleanup); err != nil {
-					slog.Warn("failed to clean up old app", "path", cleanup, "error", err)
+					// Only clear pending on permanent errors; retry transient failures next launch
+					if os.IsPermission(err) || os.IsNotExist(err) {
+						slog.Warn("cleanup failed with permanent error, giving up", "path", cleanup, "error", err)
+						settingsStore.ClearCleanupPending()
+					} else {
+						// Increment retry count; give up after max retries
+						retryCount, _ := settingsStore.IncrementCleanupRetryCount()
+						if retryCount >= maxCleanupRetries {
+							slog.Warn("cleanup failed after max retries, giving up", "path", cleanup, "retries", retryCount, "error", err)
+							settingsStore.ClearCleanupPending()
+						} else {
+							slog.Warn("cleanup failed, will retry next launch", "path", cleanup, "retry", retryCount, "error", err)
+						}
+					}
 				} else {
 					slog.Info("cleaned up old app", "path", cleanup)
+					settingsStore.ClearCleanupPending()
 				}
-				settingsStore.ClearCleanupPending()
 			}
 		}
 	}
@@ -633,10 +648,15 @@ func (app *Application) Run() error {
 		urlSupport.SetURLHandler(func(url string) {
 			// Validate length before storing (handler may be called from another thread)
 			if len(url) > 1024 {
-				slog.Warn("received URL via Apple Event exceeds max length, ignoring")
+				slog.Warn("received URL via Apple Event exceeds max length, ignoring", "length", len(url))
 				return
 			}
-			slog.Info("received URL via Apple Event")
+			// Validate URL format before storing to avoid keeping malformed URLs in memory
+			if _, err := ParseCrumbleCrackerURL(url); err != nil {
+				slog.Warn("received invalid URL via Apple Event, ignoring", "error", err)
+				return
+			}
+			slog.Info("received valid URL via Apple Event")
 
 			app.pendingURLMu.Lock()
 			app.pendingURL = url

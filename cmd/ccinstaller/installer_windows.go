@@ -50,10 +50,10 @@ func install(staging, target string, ui *InstallerUI) error {
 	ui.setStatus("Waiting for application to close...")
 	ui.setProgress(0.5)
 
-	// Wait for the file to be unlocked (app may take time for cleanup/VM shutdown)
-	if err := waitForFileLock(target, 60*time.Second); err != nil {
+	// Wait for the file to be unlocked and deletable (app may take time for cleanup/VM shutdown)
+	if err := waitForFileDeletable(target, 60*time.Second); err != nil {
 		os.Remove(backupPath)
-		return fmt.Errorf("wait for file lock: %w", err)
+		return fmt.Errorf("wait for file to become deletable: %w", err)
 	}
 
 	ui.setStatus("Removing old version...")
@@ -84,18 +84,28 @@ func install(staging, target string, ui *InstallerUI) error {
 	return nil
 }
 
-func waitForFileLock(path string, timeout time.Duration) error {
+func waitForFileDeletable(path string, timeout time.Duration) error {
 	start := time.Now()
+	tempPath := path + ".delete-test"
 	for {
-		// Try to open the file for writing
-		f, err := os.OpenFile(path, os.O_RDWR, 0)
-		if err == nil {
-			f.Close()
+		// Try to rename the file - this is a reliable test for deletability on Windows
+		if err := os.Rename(path, tempPath); err == nil {
+			// Rename succeeded, move it back (retry a few times if needed)
+			for i := 0; i < 3; i++ {
+				if err := os.Rename(tempPath, path); err == nil {
+					return nil
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			// Final attempt with error capture
+			if err := os.Rename(tempPath, path); err != nil {
+				return fmt.Errorf("failed to restore file after deletability test (file is now at %s): %w", tempPath, err)
+			}
 			return nil
 		}
 
 		if time.Since(start) > timeout {
-			return fmt.Errorf("timeout waiting for file unlock")
+			return fmt.Errorf("timeout waiting for file to become deletable")
 		}
 
 		time.Sleep(500 * time.Millisecond)
