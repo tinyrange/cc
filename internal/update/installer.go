@@ -378,3 +378,135 @@ func DeleteApp(appPath string) error {
 
 	return os.RemoveAll(appPath)
 }
+
+// CreateDesktopShortcut creates a desktop shortcut/entry for the app.
+// On Windows: Creates a .lnk file in the Start Menu Programs folder.
+// On Linux: Creates a .desktop file in ~/.local/share/applications/.
+// On macOS: No-op (apps in ~/Applications are already discoverable via Spotlight/Launchpad).
+func CreateDesktopShortcut(appPath string) error {
+	switch runtime.GOOS {
+	case "darwin":
+		// macOS apps in ~/Applications are already discoverable
+		return nil
+	case "windows":
+		return createWindowsShortcut(appPath)
+	case "linux":
+		return createLinuxDesktopEntry(appPath)
+	default:
+		return fmt.Errorf("unsupported platform: %s", runtime.GOOS)
+	}
+}
+
+// RemoveDesktopShortcut removes the desktop shortcut/entry for the app.
+func RemoveDesktopShortcut() error {
+	switch runtime.GOOS {
+	case "darwin":
+		return nil
+	case "windows":
+		return removeWindowsShortcut()
+	case "linux":
+		return removeLinuxDesktopEntry()
+	default:
+		return nil
+	}
+}
+
+// createWindowsShortcut creates a .lnk shortcut in the Start Menu.
+func createWindowsShortcut(appPath string) error {
+	// Get the Start Menu Programs directory
+	appData := os.Getenv("APPDATA")
+	if appData == "" {
+		return fmt.Errorf("APPDATA environment variable not set")
+	}
+
+	startMenuDir := filepath.Join(appData, "Microsoft", "Windows", "Start Menu", "Programs")
+	shortcutPath := filepath.Join(startMenuDir, "CrumbleCracker.lnk")
+
+	// Use PowerShell to create the shortcut
+	script := fmt.Sprintf(`
+$WshShell = New-Object -ComObject WScript.Shell
+$Shortcut = $WshShell.CreateShortcut('%s')
+$Shortcut.TargetPath = '%s'
+$Shortcut.WorkingDirectory = '%s'
+$Shortcut.Description = 'CrumbleCracker - Run Linux containers'
+$Shortcut.Save()
+`, shortcutPath, appPath, filepath.Dir(appPath))
+
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("powershell shortcut creation failed: %w\noutput: %s", err, string(output))
+	}
+
+	return nil
+}
+
+// removeWindowsShortcut removes the Start Menu shortcut.
+func removeWindowsShortcut() error {
+	appData := os.Getenv("APPDATA")
+	if appData == "" {
+		return nil
+	}
+
+	shortcutPath := filepath.Join(appData, "Microsoft", "Windows", "Start Menu", "Programs", "CrumbleCracker.lnk")
+	if err := os.Remove(shortcutPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// linuxDesktopEntry is the content of the .desktop file for Linux.
+const linuxDesktopEntryTemplate = `[Desktop Entry]
+Name=CrumbleCracker
+Comment=Run Linux containers with native performance
+Exec=%s
+Icon=%s
+Type=Application
+Categories=Development;Emulator;System;
+Terminal=false
+StartupNotify=true
+`
+
+// createLinuxDesktopEntry creates a .desktop file in ~/.local/share/applications/.
+func createLinuxDesktopEntry(appPath string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("get home dir: %w", err)
+	}
+
+	// Create the applications directory if it doesn't exist
+	appsDir := filepath.Join(home, ".local", "share", "applications")
+	if err := os.MkdirAll(appsDir, 0o755); err != nil {
+		return fmt.Errorf("create applications dir: %w", err)
+	}
+
+	desktopPath := filepath.Join(appsDir, "crumblecracker.desktop")
+
+	// For the icon, we'll use the app path for now (apps can provide icons separately)
+	// In a real deployment, you'd want to install an icon to ~/.local/share/icons/
+	iconPath := appPath // Placeholder - ideally would be a proper icon path
+
+	content := fmt.Sprintf(linuxDesktopEntryTemplate, appPath, iconPath)
+	if err := os.WriteFile(desktopPath, []byte(content), 0o755); err != nil {
+		return fmt.Errorf("write desktop file: %w", err)
+	}
+
+	// Update the desktop database (best effort)
+	_ = exec.Command("update-desktop-database", appsDir).Run()
+
+	return nil
+}
+
+// removeLinuxDesktopEntry removes the .desktop file.
+func removeLinuxDesktopEntry() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+
+	desktopPath := filepath.Join(home, ".local", "share", "applications", "crumblecracker.desktop")
+	if err := os.Remove(desktopPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}

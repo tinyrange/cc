@@ -201,10 +201,10 @@ func (s *LauncherScreen) buildTopBar() *ui.FlexContainer {
 		)
 	}
 
-	// Force Update button (for testing)
+	// Settings button
 	row.AddChild(
-		s.buildIconButton("Force Update", nil, func() {
-			s.app.forceUpdate()
+		s.buildIconButton("Settings", s.iconCog, func() {
+			s.app.showAppSettings()
 		}),
 		ui.FlexParamsWithMargin(0, ui.Only(0, 0, 10, 0)),
 	)

@@ -9,11 +9,12 @@ import (
 
 // AppSettings stores application-level settings
 type AppSettings struct {
-	OnboardingCompleted bool      `json:"onboarding_completed"`
-	AutoUpdateEnabled   bool      `json:"auto_update_enabled"`
-	InstallPath         string    `json:"install_path,omitempty"`
-	InstalledAt         time.Time `json:"installed_at,omitempty"`
-	CleanupPending      string    `json:"cleanup_pending,omitempty"` // Path to delete on next startup
+	OnboardingCompleted   bool      `json:"onboarding_completed"`
+	AutoUpdateEnabled     bool      `json:"auto_update_enabled"`
+	InstallPath           string    `json:"install_path,omitempty"`
+	InstalledAt           time.Time `json:"installed_at,omitempty"`
+	CleanupPending        string    `json:"cleanup_pending,omitempty"` // Path to delete on next startup
+	CreateDesktopShortcut bool      `json:"create_desktop_shortcut"`   // Create desktop/start menu shortcut (Windows/Linux)
 }
 
 // SettingsStore manages persistent storage of application settings

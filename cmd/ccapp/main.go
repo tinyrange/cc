@@ -50,6 +50,8 @@ const (
 	modeSettings
 	modeDeleteConfirm
 	modeUpdating
+	modeAppSettings
+	modeUpdateConfirm
 )
 
 // discoveredBundle holds metadata and path for a discovered bundle.
@@ -123,7 +125,9 @@ type Application struct {
 	terminalScreen      *TerminalScreen
 	customVMScreen      *CustomVMScreen
 	settingsScreen      *SettingsScreen
-	deleteConfirmScreen *DeleteConfirmScreen
+	deleteConfirmScreen   *DeleteConfirmScreen
+	appSettingsScreen     *AppSettingsScreen
+	updateConfirmScreen   *UpdateConfirmScreen
 
 	// Settings dialog state
 	selectedSettingsIndex int
@@ -664,6 +668,10 @@ func (app *Application) Run() error {
 			return app.renderDeleteConfirm(f)
 		case modeUpdating:
 			return app.renderLoading(f)
+		case modeAppSettings:
+			return app.renderAppSettings(f)
+		case modeUpdateConfirm:
+			return app.renderUpdateConfirm(f)
 		default:
 			return nil
 		}
@@ -802,6 +810,23 @@ func (app *Application) renderSettings(f graphics.Frame) error {
 	return app.settingsScreen.Render(f)
 }
 
+func (app *Application) renderAppSettings(f graphics.Frame) error {
+	if app.appSettingsScreen == nil {
+		app.appSettingsScreen = NewAppSettingsScreen(app)
+	}
+
+	// Render launcher as background
+	app.launcherScreen.RenderBackground(f)
+
+	// Render the app settings dialog on top
+	return app.appSettingsScreen.Render(f)
+}
+
+func (app *Application) showAppSettings() {
+	app.appSettingsScreen = nil // Force rebuild to get fresh settings
+	app.mode = modeAppSettings
+}
+
 func (app *Application) renderDeleteConfirm(f graphics.Frame) error {
 	if app.deleteConfirmScreen == nil {
 		app.deleteConfirmScreen = NewDeleteConfirmScreen(app, app.selectedSettingsIndex)
@@ -812,6 +837,24 @@ func (app *Application) renderDeleteConfirm(f graphics.Frame) error {
 
 	// Render the delete confirmation dialog on top
 	return app.deleteConfirmScreen.Render(f)
+}
+
+func (app *Application) renderUpdateConfirm(f graphics.Frame) error {
+	if app.updateConfirmScreen == nil {
+		// Should not happen - screen must be created with status
+		return nil
+	}
+
+	// Render launcher as background
+	app.launcherScreen.RenderBackground(f)
+
+	// Render the update confirmation dialog on top
+	return app.updateConfirmScreen.Render(f)
+}
+
+func (app *Application) showUpdateConfirm(status *update.UpdateStatus) {
+	app.updateConfirmScreen = NewUpdateConfirmScreen(app, status)
+	app.mode = modeUpdateConfirm
 }
 
 func (app *Application) showSettings(bundleIndex int) {
