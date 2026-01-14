@@ -1489,10 +1489,13 @@ func main() {
 		for _, cb := range crossBuilds {
 			fmt.Printf("Building for %s/%s...\n", cb.GOOS, cb.GOARCH)
 			_, err := goBuild(buildOptions{
-				Package:          "internal/cmd/quest",
-				OutputName:       "quest",
+				Package:          "cmd/ccapp",
+				OutputName:       "ccapp",
 				Build:            cb,
 				EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
+				BuildApp:         true,
+				LogoPath:         filepath.Join("internal", "assets", "logo-color-black.png"),
+				ApplicationName:  "CrumbleCracker",
 			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "failed to build for %s/%s: %v\n", cb.GOOS, cb.GOARCH, err)
