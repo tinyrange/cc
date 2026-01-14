@@ -87,11 +87,11 @@ func install(staging, target string, ui *InstallerUI) error {
 func waitForFileDeletable(path string, timeout time.Duration) error {
 	start := time.Now()
 	for {
-		// Try to open the file with delete access - this is a reliable test for deletability
+		// Try to open the file with read/write access - this is a reliable test for deletability
 		// without actually modifying the file
 		handle, err := syscall.CreateFile(
 			syscall.StringToUTF16Ptr(path),
-			syscall.DELETE,
+			syscall.GENERIC_READ|syscall.GENERIC_WRITE,
 			0, // No sharing - ensures exclusive access
 			nil,
 			syscall.OPEN_EXISTING,

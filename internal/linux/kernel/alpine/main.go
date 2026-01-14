@@ -66,6 +66,13 @@ func (p *AlpinePackage) Size(filename string) (int64, error) {
 
 var ErrPackageExpired = errors.New("package has expired")
 
+// OpenLocalPackage opens an already-downloaded Alpine package from disk.
+// Used for offline distribution where packages are bundled with the executable.
+// The base path should not include the .idx/.bin extension.
+func OpenLocalPackage(base string) (*AlpinePackage, error) {
+	return openPackage(base, 0) // No expiration check for local packages
+}
+
 func openPackage(base string, maxAge time.Duration) (*AlpinePackage, error) {
 	idx, err := os.Open(base + ".idx")
 	if err != nil {
@@ -319,44 +326,56 @@ func (d *AlpineDownloader) SetForArchitecture(arch hv.CpuArchitecture, cacheDir 
 }
 
 func (d *AlpineDownloader) Download(name string) (*AlpinePackage, error) {
+	_, pkg, err := d.downloadWithPath(name)
+	return pkg, err
+}
+
+// DownloadAndGetPath downloads a package and returns both the package and its cache base path.
+// The cache base path can be used to copy the .idx and .bin files for offline distribution.
+func (d *AlpineDownloader) DownloadAndGetPath(name string) (cachePath string, pkg *AlpinePackage, err error) {
+	return d.downloadWithPath(name)
+}
+
+func (d *AlpineDownloader) downloadWithPath(name string) (string, *AlpinePackage, error) {
 	indexUrl := fmt.Sprintf("%s/%s/%s/%s/APKINDEX.tar.gz", d.Mirror, d.Version, d.Repo, d.Arch)
 
 	indexCachePath := []string{d.Version, d.Repo, d.Arch, "APKINDEX.pkg"}
 
 	indexPkg, err := d.downloadAndConvert(indexUrl, "tar.gz", indexCachePath)
 	if err != nil {
-		return nil, fmt.Errorf("parse APKINDEX: %v", err)
+		return "", nil, fmt.Errorf("parse APKINDEX: %v", err)
 	}
 
 	indexFile, err := indexPkg.Open("APKINDEX")
 	if err != nil {
-		return nil, fmt.Errorf("open APKINDEX tar.gz in package: %v", err)
+		return "", nil, fmt.Errorf("open APKINDEX tar.gz in package: %v", err)
 	}
 
 	idx, err := d.parseIndex(indexFile)
 	if err != nil {
-		return nil, fmt.Errorf("parse APKINDEX: %v", err)
+		return "", nil, fmt.Errorf("parse APKINDEX: %v", err)
 	}
 
 	pkg, ok := idx[name]
 	if !ok {
-		return nil, fmt.Errorf("package %q not found in index", name)
+		return "", nil, fmt.Errorf("package %q not found in index", name)
 	}
 
 	version := pkg["V"]
 	arch := pkg["A"]
 
 	if arch != d.Arch {
-		return nil, fmt.Errorf("package %q architecture %q does not match requested architecture %q", name, arch, d.Arch)
+		return "", nil, fmt.Errorf("package %q architecture %q does not match requested architecture %q", name, arch, d.Arch)
 	}
 
 	pkgFilename := fmt.Sprintf("%s-%s.apk", name, version)
 	pkgUrl := fmt.Sprintf("%s/%s/%s/%s/%s", d.Mirror, d.Version, d.Repo, d.Arch, pkgFilename)
 
-	apkPkg, err := d.downloadAndConvert(pkgUrl, "tar.gz", []string{d.Version, d.Repo, d.Arch, "packages", name + "-" + version + ".pkg"})
+	pkgCachePath := []string{d.Version, d.Repo, d.Arch, "packages", name + "-" + version + ".pkg"}
+	apkPkg, err := d.downloadAndConvert(pkgUrl, "tar.gz", pkgCachePath)
 	if err != nil {
-		return nil, fmt.Errorf("convert package %q to internal format: %v", name, err)
+		return "", nil, fmt.Errorf("convert package %q to internal format: %v", name, err)
 	}
 
-	return apkPkg, nil
+	return d.cacheFilePath(pkgCachePath), apkPkg, nil
 }

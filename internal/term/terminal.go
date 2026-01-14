@@ -3,10 +3,12 @@ package term
 import (
 	"context"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
 	"io"
+	"os"
 	"strings"
 	"sync"
 
@@ -44,6 +46,17 @@ func DefaultColorScheme() ColorScheme {
 		Cursor:     color.RGBA{R: 0xc0, G: 0xca, B: 0xf5, A: 255}, // #c0caf5
 		Selection:  color.RGBA{R: 0x41, G: 0x59, B: 0x8b, A: 255}, // #41598b
 		Palette:    tokyoNightPalette,
+	}
+}
+
+// LightColorScheme returns a light color scheme with purple accents.
+func LightColorScheme() ColorScheme {
+	return ColorScheme{
+		Foreground: color.RGBA{R: 0x44, G: 0x40, B: 0x3c, A: 255}, // #44403C (ink-700)
+		Background: color.RGBA{R: 0xff, G: 0xfb, B: 0xf7, A: 255}, // #FFFBF7 (warm cream)
+		Cursor:     color.RGBA{R: 0x8b, G: 0x5c, B: 0xf6, A: 255}, // #8B5CF6 (grape-500 purple)
+		Selection:  color.RGBA{R: 0xe9, G: 0xd5, B: 0xff, A: 255}, // #E9D5FF (grape-200 light purple)
+		Palette:    lightPalette,
 	}
 }
 
@@ -114,6 +127,11 @@ type View struct {
 
 	// Color scheme for theming.
 	colorScheme ColorScheme
+
+	// pendingEvents holds events to process instead of draining.
+	// If non-nil, Step uses these events and clears the slice.
+	pendingEvents []window.InputEvent
+
 }
 
 // Point represents a cell position in the terminal grid.
@@ -164,7 +182,6 @@ func NewView(win graphics.Window) (*View, error) {
 	}
 
 	emu := vt.NewSafeEmulator(80, 40)
-	disableVTQueriesThatBreakGuests(emu)
 
 	inR, inW := io.Pipe()
 
@@ -183,6 +200,9 @@ func NewView(win graphics.Window) (*View, error) {
 		lastRows:    40,
 		colorScheme: DefaultColorScheme(),
 	}
+
+	// Disable query responses to prevent feedback loops with VM guests.
+	v.disableQueryResponses(emu)
 
 	// Apply the default color scheme to the emulator.
 	v.applyColorScheme()
@@ -226,6 +246,16 @@ func (v *View) Grid() *Grid {
 	return v.grid
 }
 
+// SetPendingEvents sets events to process in the next Step() call.
+// When set, Step() uses these events instead of calling DrainInputEvents().
+// The events are cleared after being processed.
+func (v *View) SetPendingEvents(events []window.InputEvent) {
+	if v == nil {
+		return
+	}
+	v.pendingEvents = events
+}
+
 // SetInsets configures pixel insets for rendering and sizing the terminal grid.
 // The terminal will render within the content rect:
 // [left, top] → [windowWidth-right, windowHeight-bottom].
@@ -251,20 +281,28 @@ func (v *View) SetInsets(left, top, right, bottom float32) {
 	v.insetBottom = bottom
 }
 
-// disableVTQueriesThatBreakGuests prevents the VT emulator from writing certain
-// automatic "terminal replies" (like cursor position reports) into the input
-// stream. Some guest userspace (notably minimal shells/prompts) can end up
-// echoing these bytes, which appears as a constant stream of stuck input and
-// breaks interactive sessions.
+// debugTermHandlers enables debug logging for terminal escape sequence handlers.
+const debugTermHandlers = false
+
+// disableQueryResponses configures the VT emulator to suppress all terminal
+// query responses that can cause feedback loops with VM guests.
 //
-// We still allow normal user input (SendKey/SendText) and special keys.
-func disableVTQueriesThatBreakGuests(emu *vt.SafeEmulator) {
+// The problem: When the terminal emulator responds to queries (cursor position,
+// device attributes, colors, etc.), the response is sent to the VM's stdin.
+// If the VM's shell or application echoes input, the response bytes come back
+// as output, potentially triggering more queries and creating an infinite loop.
+// Additionally, writing responses can block the emulator's Write() path while
+// holding a mutex, causing deadlocks with the rendering thread.
+//
+// The solution: Suppress all query responses unconditionally. Most applications
+// (including vim) have fallback behavior when queries aren't answered.
+func (v *View) disableQueryResponses(emu *vt.SafeEmulator) {
 	if emu == nil {
 		return
 	}
 
 	// Device Status Report (DSR): CSI n
-	// We swallow CPR (n=6) and Operating Status (n=5) to avoid unsolicited replies.
+	// Suppress CPR (n=6) and Operating Status (n=5).
 	emu.RegisterCsiHandler('n', func(params ansi.Params) bool {
 		n, _, ok := params.Param(0, 1)
 		if !ok || n == 0 {
@@ -272,42 +310,75 @@ func disableVTQueriesThatBreakGuests(emu *vt.SafeEmulator) {
 		}
 		switch n {
 		case 5, 6:
-			return true
+			if debugTermHandlers {
+				fmt.Fprintf(os.Stderr, "[term] suppressing CSI %d n response\n", n)
+			}
+			return true // Suppress response
 		default:
 			return false
 		}
 	})
 
 	// DEC private DSR: CSI ? n
-	// We swallow Extended Cursor Position Report (n=6).
+	// Suppress Extended Cursor Position Report (n=6).
 	emu.RegisterCsiHandler(ansi.Command('?', 0, 'n'), func(params ansi.Params) bool {
 		n, _, ok := params.Param(0, 1)
 		if !ok || n == 0 {
 			return false
 		}
 		if n == 6 {
-			return true
+			if debugTermHandlers {
+				fmt.Fprintf(os.Stderr, "[term] suppressing CSI ? %d n response\n", n)
+			}
+			return true // Suppress response
 		}
 		return false
 	})
 
-	// Device Attributes: CSI c and CSI > c
-	// Some programs probe terminal type and then (mis)use the replies as input.
+	// Device Attributes: CSI c (DA1) and CSI > c (DA2)
+	// Suppress to prevent feedback loops.
 	emu.RegisterCsiHandler('c', func(params ansi.Params) bool {
 		n, _, _ := params.Param(0, 0)
-		// Only swallow the standard query form (CSI 0 c).
 		if n == 0 {
-			return true
+			if debugTermHandlers {
+				fmt.Fprintf(os.Stderr, "[term] suppressing CSI c (DA1) response\n")
+			}
+			return true // Suppress response
 		}
 		return false
 	})
 	emu.RegisterCsiHandler(ansi.Command('>', 0, 'c'), func(params ansi.Params) bool {
 		n, _, _ := params.Param(0, 0)
 		if n == 0 {
-			return true
+			if debugTermHandlers {
+				fmt.Fprintf(os.Stderr, "[term] suppressing CSI > c (DA2) response\n")
+			}
+			return true // Suppress response
 		}
 		return false
 	})
+
+	// OSC color queries: OSC 10, 11, 12 (foreground, background, cursor color)
+	// When these contain a "?" query, the emulator writes a response to the pipe,
+	// which can block while holding the Write mutex, causing deadlocks.
+	// Suppress all OSC 10/11/12 sequences that look like queries.
+	suppressColorQuery := func(data []byte) bool {
+		// Color queries contain "?" - suppress those
+		// Color sets contain a color spec - let those through
+		for _, b := range data {
+			if b == '?' {
+				if debugTermHandlers {
+					fmt.Fprintf(os.Stderr, "[term] suppressing OSC color query\n")
+				}
+				return true // Suppress query response
+			}
+		}
+		return false // Let color sets through
+	}
+
+	emu.RegisterOscHandler(10, suppressColorQuery) // Foreground color
+	emu.RegisterOscHandler(11, suppressColorQuery) // Background color
+	emu.RegisterOscHandler(12, suppressColorQuery) // Cursor color
 }
 
 // Read implements io.Reader. It exposes the VT-generated input stream.
@@ -522,7 +593,14 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 	}
 
 	// Raw input events from the platform window (preferred).
-	events := v.win.PlatformWindow().DrainInputEvents()
+	// If pending events were set via SetPendingEvents, use those instead.
+	var events []window.InputEvent
+	if v.pendingEvents != nil {
+		events = v.pendingEvents
+		v.pendingEvents = nil
+	} else {
+		events = v.win.PlatformWindow().DrainInputEvents()
+	}
 
 	// Handle context menu events first (if menu is visible).
 	if v.contextMenu != nil && v.contextMenu.IsVisible() {
@@ -670,6 +748,31 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyPgDown, Mod: mod})
 			case window.KeyInsert:
 				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyInsert, Mod: mod})
+			// Function keys
+			case window.KeyF1:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF1, Mod: mod})
+			case window.KeyF2:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF2, Mod: mod})
+			case window.KeyF3:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF3, Mod: mod})
+			case window.KeyF4:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF4, Mod: mod})
+			case window.KeyF5:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF5, Mod: mod})
+			case window.KeyF6:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF6, Mod: mod})
+			case window.KeyF7:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF7, Mod: mod})
+			case window.KeyF8:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF8, Mod: mod})
+			case window.KeyF9:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF9, Mod: mod})
+			case window.KeyF10:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF10, Mod: mod})
+			case window.KeyF11:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF11, Mod: mod})
+			case window.KeyF12:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF12, Mod: mod})
 			}
 
 			stats.Record(tsViewStepSendKey)
@@ -948,6 +1051,29 @@ var tokyoNightPalette = []color.RGBA{
 	{R: 0xbb, G: 0x9a, B: 0xf7, A: 255}, // 13: bright magenta
 	{R: 0x7d, G: 0xcf, B: 0xff, A: 255}, // 14: bright cyan
 	{R: 0xc0, G: 0xca, B: 0xf5, A: 255}, // 15: bright white
+}
+
+// Light color palette for ANSI colors (optimized for light backgrounds).
+var lightPalette = []color.RGBA{
+	// Normal colors (0-7) - optimized for visibility on light cream background
+	{R: 0x1c, G: 0x1c, B: 0x1c, A: 255}, // 0: black (very dark)
+	{R: 0xc4, G: 0x1a, B: 0x16, A: 255}, // 1: red (dark red)
+	{R: 0x18, G: 0x80, B: 0x18, A: 255}, // 2: green (forest green)
+	{R: 0x9c, G: 0x6b, B: 0x00, A: 255}, // 3: yellow (dark amber/brown)
+	{R: 0x1a, G: 0x4f, B: 0xba, A: 255}, // 4: blue (medium blue)
+	{R: 0x7c, G: 0x3a, B: 0xed, A: 255}, // 5: magenta (violet-600)
+	{R: 0x05, G: 0x6e, B: 0x8c, A: 255}, // 6: cyan (dark teal)
+	{R: 0x58, G: 0x54, B: 0x4f, A: 255}, // 7: white (medium gray for contrast)
+
+	// Bright colors (8-15)
+	{R: 0x58, G: 0x54, B: 0x4f, A: 255}, // 8: bright black (medium gray)
+	{R: 0xdc, G: 0x26, B: 0x26, A: 255}, // 9: bright red
+	{R: 0x16, G: 0xa3, B: 0x4a, A: 255}, // 10: bright green
+	{R: 0xb4, G: 0x83, B: 0x00, A: 255}, // 11: bright yellow (golden)
+	{R: 0x25, G: 0x63, B: 0xeb, A: 255}, // 12: bright blue
+	{R: 0x8b, G: 0x5c, B: 0xf6, A: 255}, // 13: bright magenta (grape-500)
+	{R: 0x06, G: 0x91, B: 0xb4, A: 255}, // 14: bright cyan (teal)
+	{R: 0x1c, G: 0x1c, B: 0x1c, A: 255}, // 15: bright white (very dark for contrast)
 }
 
 // Default ANSI 16-color palette (standard VGA colors).

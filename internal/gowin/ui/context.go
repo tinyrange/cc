@@ -54,6 +54,14 @@ type Root struct {
 	needsLayout bool
 	lastWidth   int
 	lastHeight  int
+
+	// maxW and maxH constrain the layout size. 0 means use window size.
+	maxW float32
+	maxH float32
+
+	// offsetX and offsetY shift where the child is positioned.
+	offsetX float32
+	offsetY float32
 }
 
 // NewRoot creates a new root container.
@@ -76,6 +84,26 @@ func (r *Root) SetChild(child Widget) {
 // InvalidateLayout marks the layout as needing recalculation.
 func (r *Root) InvalidateLayout() {
 	r.needsLayout = true
+}
+
+// SetMaxSize constrains the root layout to a maximum size.
+// Pass 0 to use window size for that dimension.
+func (r *Root) SetMaxSize(maxW, maxH float32) {
+	if r.maxW != maxW || r.maxH != maxH {
+		r.maxW = maxW
+		r.maxH = maxH
+		r.needsLayout = true
+	}
+}
+
+// SetOffset sets the position offset for the root layout.
+// The child will be positioned at (offsetX, offsetY) instead of (0, 0).
+func (r *Root) SetOffset(offsetX, offsetY float32) {
+	if r.offsetX != offsetX || r.offsetY != offsetY {
+		r.offsetX = offsetX
+		r.offsetY = offsetY
+		r.needsLayout = true
+	}
 }
 
 // Update processes input and updates widget state.
@@ -107,13 +135,29 @@ func (r *Root) Layout(f graphics.Frame) {
 	}
 
 	w, h := f.WindowSize()
+
+	// Use maxW/maxH if set, otherwise use window size
+	layoutW := float32(w)
+	layoutH := float32(h)
+	if r.maxW > 0 {
+		layoutW = r.maxW
+	}
+	if r.maxH > 0 {
+		layoutH = r.maxH
+	}
+
+	// Subtract offset from available height if using window size
+	if r.maxH == 0 && r.offsetY > 0 {
+		layoutH -= r.offsetY
+	}
+
 	constraints := Constraints{
-		MinW: float32(w), MaxW: float32(w),
-		MinH: float32(h), MaxH: float32(h),
+		MinW: layoutW, MaxW: layoutW,
+		MinH: layoutH, MaxH: layoutH,
 	}
 
 	size := r.child.Layout(r.layoutCtx, constraints)
-	r.child.SetBounds(Rect{X: 0, Y: 0, W: size.W, H: size.H})
+	r.child.SetBounds(Rect{X: r.offsetX, Y: r.offsetY, W: size.W, H: size.H})
 
 	r.needsLayout = false
 }
@@ -149,4 +193,12 @@ func (r *Root) Step(f graphics.Frame, pw window.Window) {
 func (r *Root) DrawOnly(f graphics.Frame) {
 	r.Layout(f)
 	r.Draw(f)
+}
+
+// DispatchEvent dispatches a single event to the widget tree.
+// Use this to manually inject events without draining from the platform window.
+func (r *Root) DispatchEvent(event Event) {
+	if r.child != nil {
+		r.child.HandleEvent(r.eventCtx, event)
+	}
 }

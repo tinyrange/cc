@@ -513,6 +513,7 @@ func populateRuntimeConfig(cfg *RuntimeConfig, imageCfg imageConfig) {
 		cfg.Entrypoint = append(cfg.Entrypoint, imageCfg.Config.Entrypoint...)
 	}
 	cfg.WorkingDir = imageCfg.Config.WorkingDir
+	cfg.Architecture = imageCfg.Architecture
 
 	if len(imageCfg.Config.Labels) > 0 {
 		cfg.Labels = make(map[string]string, len(imageCfg.Config.Labels))

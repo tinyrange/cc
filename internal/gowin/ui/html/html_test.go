@@ -278,3 +278,98 @@ func TestDeleteDialogHTML(t *testing.T) {
 	_ = cancelCalled
 	_ = deleteCalled
 }
+
+func TestParseMarkdown(t *testing.T) {
+	md := `# Test Heading
+
+This is a paragraph.
+
+## Code Example
+
+` + "```" + `python
+print("hello")
+` + "```" + `
+
+- Item 1
+- Item 2
+
+| Header | Value |
+|--------|-------|
+| A      | 1     |
+`
+	doc, err := ParseMarkdown(md)
+	if err != nil {
+		t.Fatalf("ParseMarkdown failed: %v", err)
+	}
+	if doc == nil {
+		t.Fatal("doc is nil")
+	}
+	if doc.root == nil {
+		t.Fatal("root is nil")
+	}
+
+	// Verify the root is a div wrapper
+	if doc.root.tag != "div" {
+		t.Errorf("expected root tag 'div', got '%s'", doc.root.tag)
+	}
+
+	// The parsed content should have children (h1, p, h2, pre, ul, table)
+	if len(doc.root.children) < 4 {
+		t.Errorf("expected at least 4 children, got %d", len(doc.root.children))
+	}
+
+	// Render to verify no panics
+	widget := doc.Render(nil)
+	if widget == nil {
+		t.Fatal("rendered widget is nil")
+	}
+}
+
+func TestParseMarkdownTable(t *testing.T) {
+	md := `| Command | Description |
+|---------|-------------|
+| ls      | List files  |
+| cd      | Change dir  |
+`
+	doc, err := ParseMarkdown(md)
+	if err != nil {
+		t.Fatalf("ParseMarkdown failed: %v", err)
+	}
+
+	// Render to verify table parsing works
+	widget := doc.Render(nil)
+	if widget == nil {
+		t.Fatal("rendered widget is nil")
+	}
+}
+
+func TestParseMarkdownCodeBlock(t *testing.T) {
+	md := "```bash\necho hello\n```"
+	doc, err := ParseMarkdown(md)
+	if err != nil {
+		t.Fatalf("ParseMarkdown failed: %v", err)
+	}
+
+	widget := doc.Render(nil)
+	if widget == nil {
+		t.Fatal("rendered widget is nil")
+	}
+}
+
+func TestParseMarkdownLists(t *testing.T) {
+	md := `- Item 1
+- Item 2
+
+1. First
+2. Second
+`
+	doc, err := ParseMarkdown(md)
+	if err != nil {
+		t.Fatalf("ParseMarkdown failed: %v", err)
+	}
+
+	widget := doc.Render(nil)
+	if widget == nil {
+		t.Fatal("rendered widget is nil")
+	}
+}

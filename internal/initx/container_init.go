@@ -34,6 +34,10 @@ type ContainerInitConfig struct {
 	GuestIP     string // default: 10.42.0.2
 	GuestMask   string // default: 255.255.255.0
 	GuestIFName string // default: eth0
+
+	// UID and GID for privilege dropping (nil = stay as root)
+	UID *int
+	GID *int
 }
 
 func (c *ContainerInitConfig) applyDefaults() {
@@ -95,8 +99,9 @@ func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
 
 	// Build compile-time flags for Ifdef
 	flags := map[string]bool{
-		"network": cfg.EnableNetwork,
-		"exec":    cfg.Exec,
+		"network":         cfg.EnableNetwork,
+		"exec":            cfg.Exec,
+		"drop_privileges": cfg.UID != nil,
 	}
 
 	// Build config values for pure RTG helpers
@@ -215,6 +220,35 @@ func injectContainerInitHelpers(prog *ir.Program, cfg ContainerInitConfig) error
 			ir.Printf("cc: forkExecWait error: errno=0x%x\n", errVar),
 			rebootFragment(cfg.Arch),
 		}),
+	}
+
+	// Privilege dropping helper (setgid must be called before setuid)
+	if cfg.UID != nil {
+		dropPrivErrLabel := ir.Label("__cc_drop_priv_error")
+
+		var dropPrivBlock ir.Block
+		// If GID is set, call setgid first
+		gid := *cfg.UID // Default to UID if GID not specified
+		if cfg.GID != nil {
+			gid = *cfg.GID
+		}
+		dropPrivBlock = append(dropPrivBlock,
+			ir.Assign(errVar, ir.Syscall(defs.SYS_SETGID, ir.Int64(int64(gid)))),
+			ir.If(ir.IsLessThan(errVar, ir.Int64(0)), ir.Block{ir.Goto(dropPrivErrLabel)}),
+		)
+		// Then call setuid
+		dropPrivBlock = append(dropPrivBlock,
+			ir.Assign(errVar, ir.Syscall(defs.SYS_SETUID, ir.Int64(int64(*cfg.UID)))),
+			ir.If(ir.IsLessThan(errVar, ir.Int64(0)), ir.Block{ir.Goto(dropPrivErrLabel)}),
+		)
+		dropPrivBlock = append(dropPrivBlock,
+			ir.Return(ir.Int64(0)),
+			ir.DeclareLabel(dropPrivErrLabel, ir.Block{
+				ir.Printf("cc: dropPrivileges error: errno=0x%x\n", errVar),
+				rebootFragment(cfg.Arch),
+			}),
+		)
+		prog.Methods["dropPrivileges"] = ir.Method(dropPrivBlock)
 	}
 
 	// Add error handler to main method

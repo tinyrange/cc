@@ -31,10 +31,11 @@ go.work.sum
 # .idea/
 # .vscode/
 
-# /build
-
 /local/*
 !/local/go.mod
+
+/build/*
+!/build/site-config.yml
 
 /.cursor
 

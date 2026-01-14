@@ -30,61 +30,6 @@ func drainAllWithTimeout(t *testing.T, r io.Reader, timeout time.Duration) ([]by
 	}
 }
 
-func TestDisableVTQueriesThatBreakGuests_SwallowsQueries(t *testing.T) {
-	t.Run("DSR_CPR", func(t *testing.T) {
-		emu := vt.NewSafeEmulator(80, 40)
-		disableVTQueriesThatBreakGuests(emu)
-
-		// Drain the emulator's input stream concurrently. The emulator writes reply
-		// bytes to an io.Pipe, and writes will block until a reader is present.
-		var got []byte
-		var gotErr error
-		done := make(chan struct{})
-		go func() {
-			got, gotErr = drainAllWithTimeout(t, emu, 2*time.Second)
-			close(done)
-		}()
-
-		// DSR 6 = Cursor Position Report request (CSI 6 n)
-		_, _ = emu.Write([]byte("\x1b[6n"))
-		_ = emu.Close()
-
-		<-done
-		if gotErr != nil {
-			t.Fatalf("read emulator input: %v", gotErr)
-		}
-		if len(got) != 0 {
-			t.Fatalf("expected no reply bytes, got %q", got)
-		}
-	})
-
-	t.Run("DA1_DA2", func(t *testing.T) {
-		emu := vt.NewSafeEmulator(80, 40)
-		disableVTQueriesThatBreakGuests(emu)
-
-		var got []byte
-		var gotErr error
-		done := make(chan struct{})
-		go func() {
-			got, gotErr = drainAllWithTimeout(t, emu, 2*time.Second)
-			close(done)
-		}()
-
-		// Device Attributes queries (CSI c and CSI > c)
-		_, _ = emu.Write([]byte("\x1b[c"))
-		_, _ = emu.Write([]byte("\x1b[>c"))
-		_ = emu.Close()
-
-		<-done
-		if gotErr != nil {
-			t.Fatalf("read emulator input: %v", gotErr)
-		}
-		if len(got) != 0 {
-			t.Fatalf("expected no reply bytes, got %q", got)
-		}
-	})
-}
-
 func TestDisableVTQueriesThatBreakGuests_ChangesBehavior(t *testing.T) {
 	// Sanity-check: the upstream emulator *does* emit reply bytes by default,
 	// otherwise the "swallow" test above would be vacuous.
