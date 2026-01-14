@@ -3,10 +3,12 @@ package term
 import (
 	"context"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
 	"io"
+	"os"
 	"strings"
 	"sync"
 
@@ -129,6 +131,7 @@ type View struct {
 	// pendingEvents holds events to process instead of draining.
 	// If non-nil, Step uses these events and clears the slice.
 	pendingEvents []window.InputEvent
+
 }
 
 // Point represents a cell position in the terminal grid.
@@ -179,7 +182,6 @@ func NewView(win graphics.Window) (*View, error) {
 	}
 
 	emu := vt.NewSafeEmulator(80, 40)
-	disableVTQueriesThatBreakGuests(emu)
 
 	inR, inW := io.Pipe()
 
@@ -198,6 +200,9 @@ func NewView(win graphics.Window) (*View, error) {
 		lastRows:    40,
 		colorScheme: DefaultColorScheme(),
 	}
+
+	// Disable query responses to prevent feedback loops with VM guests.
+	v.disableQueryResponses(emu)
 
 	// Apply the default color scheme to the emulator.
 	v.applyColorScheme()
@@ -276,20 +281,28 @@ func (v *View) SetInsets(left, top, right, bottom float32) {
 	v.insetBottom = bottom
 }
 
-// disableVTQueriesThatBreakGuests prevents the VT emulator from writing certain
-// automatic "terminal replies" (like cursor position reports) into the input
-// stream. Some guest userspace (notably minimal shells/prompts) can end up
-// echoing these bytes, which appears as a constant stream of stuck input and
-// breaks interactive sessions.
+// debugTermHandlers enables debug logging for terminal escape sequence handlers.
+const debugTermHandlers = false
+
+// disableQueryResponses configures the VT emulator to suppress all terminal
+// query responses that can cause feedback loops with VM guests.
 //
-// We still allow normal user input (SendKey/SendText) and special keys.
-func disableVTQueriesThatBreakGuests(emu *vt.SafeEmulator) {
+// The problem: When the terminal emulator responds to queries (cursor position,
+// device attributes, colors, etc.), the response is sent to the VM's stdin.
+// If the VM's shell or application echoes input, the response bytes come back
+// as output, potentially triggering more queries and creating an infinite loop.
+// Additionally, writing responses can block the emulator's Write() path while
+// holding a mutex, causing deadlocks with the rendering thread.
+//
+// The solution: Suppress all query responses unconditionally. Most applications
+// (including vim) have fallback behavior when queries aren't answered.
+func (v *View) disableQueryResponses(emu *vt.SafeEmulator) {
 	if emu == nil {
 		return
 	}
 
 	// Device Status Report (DSR): CSI n
-	// We swallow CPR (n=6) and Operating Status (n=5) to avoid unsolicited replies.
+	// Suppress CPR (n=6) and Operating Status (n=5).
 	emu.RegisterCsiHandler('n', func(params ansi.Params) bool {
 		n, _, ok := params.Param(0, 1)
 		if !ok || n == 0 {
@@ -297,42 +310,75 @@ func disableVTQueriesThatBreakGuests(emu *vt.SafeEmulator) {
 		}
 		switch n {
 		case 5, 6:
-			return true
+			if debugTermHandlers {
+				fmt.Fprintf(os.Stderr, "[term] suppressing CSI %d n response\n", n)
+			}
+			return true // Suppress response
 		default:
 			return false
 		}
 	})
 
 	// DEC private DSR: CSI ? n
-	// We swallow Extended Cursor Position Report (n=6).
+	// Suppress Extended Cursor Position Report (n=6).
 	emu.RegisterCsiHandler(ansi.Command('?', 0, 'n'), func(params ansi.Params) bool {
 		n, _, ok := params.Param(0, 1)
 		if !ok || n == 0 {
 			return false
 		}
 		if n == 6 {
-			return true
+			if debugTermHandlers {
+				fmt.Fprintf(os.Stderr, "[term] suppressing CSI ? %d n response\n", n)
+			}
+			return true // Suppress response
 		}
 		return false
 	})
 
-	// Device Attributes: CSI c and CSI > c
-	// Some programs probe terminal type and then (mis)use the replies as input.
+	// Device Attributes: CSI c (DA1) and CSI > c (DA2)
+	// Suppress to prevent feedback loops.
 	emu.RegisterCsiHandler('c', func(params ansi.Params) bool {
 		n, _, _ := params.Param(0, 0)
-		// Only swallow the standard query form (CSI 0 c).
 		if n == 0 {
-			return true
+			if debugTermHandlers {
+				fmt.Fprintf(os.Stderr, "[term] suppressing CSI c (DA1) response\n")
+			}
+			return true // Suppress response
 		}
 		return false
 	})
 	emu.RegisterCsiHandler(ansi.Command('>', 0, 'c'), func(params ansi.Params) bool {
 		n, _, _ := params.Param(0, 0)
 		if n == 0 {
-			return true
+			if debugTermHandlers {
+				fmt.Fprintf(os.Stderr, "[term] suppressing CSI > c (DA2) response\n")
+			}
+			return true // Suppress response
 		}
 		return false
 	})
+
+	// OSC color queries: OSC 10, 11, 12 (foreground, background, cursor color)
+	// When these contain a "?" query, the emulator writes a response to the pipe,
+	// which can block while holding the Write mutex, causing deadlocks.
+	// Suppress all OSC 10/11/12 sequences that look like queries.
+	suppressColorQuery := func(data []byte) bool {
+		// Color queries contain "?" - suppress those
+		// Color sets contain a color spec - let those through
+		for _, b := range data {
+			if b == '?' {
+				if debugTermHandlers {
+					fmt.Fprintf(os.Stderr, "[term] suppressing OSC color query\n")
+				}
+				return true // Suppress query response
+			}
+		}
+		return false // Let color sets through
+	}
+
+	emu.RegisterOscHandler(10, suppressColorQuery) // Foreground color
+	emu.RegisterOscHandler(11, suppressColorQuery) // Background color
+	emu.RegisterOscHandler(12, suppressColorQuery) // Cursor color
 }
 
 // Read implements io.Reader. It exposes the VT-generated input stream.
@@ -702,6 +748,31 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyPgDown, Mod: mod})
 			case window.KeyInsert:
 				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyInsert, Mod: mod})
+			// Function keys
+			case window.KeyF1:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF1, Mod: mod})
+			case window.KeyF2:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF2, Mod: mod})
+			case window.KeyF3:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF3, Mod: mod})
+			case window.KeyF4:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF4, Mod: mod})
+			case window.KeyF5:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF5, Mod: mod})
+			case window.KeyF6:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF6, Mod: mod})
+			case window.KeyF7:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF7, Mod: mod})
+			case window.KeyF8:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF8, Mod: mod})
+			case window.KeyF9:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF9, Mod: mod})
+			case window.KeyF10:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF10, Mod: mod})
+			case window.KeyF11:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF11, Mod: mod})
+			case window.KeyF12:
+				v.emu.SendKey(vt.KeyPressEvent{Code: vt.KeyF12, Mod: mod})
 			}
 
 			stats.Record(tsViewStepSendKey)
