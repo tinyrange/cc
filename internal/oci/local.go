@@ -27,13 +27,6 @@ func LoadFromDir(dir string) (*Image, error) {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
 
-	// Parse User field to UID/GID if not already set
-	if cfg.User != "" && cfg.UID == nil {
-		uid, gid := parseUserString(cfg.User)
-		cfg.UID = uid
-		cfg.GID = gid
-	}
-
 	img := &Image{
 		Config: cfg,
 		Dir:    dir,
@@ -48,17 +41,27 @@ func LoadFromDir(dir string) (*Image, error) {
 		})
 	}
 
+	// Resolve User field to UID/GID if not already set
+	if cfg.User != "" && cfg.UID == nil {
+		uid, gid, err := img.resolveUser(cfg.User)
+		if err != nil {
+			return nil, fmt.Errorf("resolve user %q: %w", cfg.User, err)
+		}
+		img.Config.UID = uid
+		img.Config.GID = gid
+	}
+
 	return img, nil
 }
 
 // parseUserString parses a Docker-style user string to UID/GID.
-// Supports formats: "uid", "uid:gid", "username" (username returns nil).
+// Supports formats: "uid", "uid:gid". Returns nil for non-numeric usernames.
 func parseUserString(user string) (*int, *int) {
 	// Try "uid:gid" format
 	if parts := strings.SplitN(user, ":", 2); len(parts) == 2 {
 		uid, err := strconv.Atoi(parts[0])
 		if err != nil {
-			return nil, nil // Not numeric
+			return nil, nil // Not numeric - needs /etc/passwd resolution
 		}
 		uidPtr := &uid
 		gid, err := strconv.Atoi(parts[1])
@@ -72,10 +75,69 @@ func parseUserString(user string) (*int, *int) {
 	// Try numeric UID only
 	uid, err := strconv.Atoi(user)
 	if err != nil {
-		return nil, nil // Username string - can't resolve without /etc/passwd
+		return nil, nil // Username string - needs /etc/passwd resolution
 	}
 	uidPtr := &uid
 	return uidPtr, uidPtr
+}
+
+// resolveUser resolves a user string to UID/GID, looking up usernames in /etc/passwd
+// from the container filesystem if needed.
+func (img *Image) resolveUser(user string) (*int, *int, error) {
+	// First try numeric parsing
+	uid, gid := parseUserString(user)
+	if uid != nil {
+		return uid, gid, nil
+	}
+
+	// Need to look up username in /etc/passwd from the container filesystem
+	cfs, err := NewContainerFS(img)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open container filesystem: %w", err)
+	}
+	defer cfs.Close()
+
+	// Read /etc/passwd
+	passwdEntry, err := cfs.lookupPath("etc/passwd")
+	if err != nil {
+		return nil, nil, fmt.Errorf("cannot find /etc/passwd in image: %w", err)
+	}
+	if passwdEntry.File == nil {
+		return nil, nil, fmt.Errorf("/etc/passwd is not a regular file")
+	}
+
+	size, _ := passwdEntry.File.Stat()
+	data, err := passwdEntry.File.ReadAt(0, uint32(size))
+	if err != nil {
+		return nil, nil, fmt.Errorf("read /etc/passwd: %w", err)
+	}
+
+	// Parse /etc/passwd to find the user
+	// Format: username:password:uid:gid:gecos:home:shell
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Split(line, ":")
+		if len(fields) < 4 {
+			continue
+		}
+		if fields[0] == user {
+			parsedUID, err := strconv.Atoi(fields[2])
+			if err != nil {
+				return nil, nil, fmt.Errorf("invalid UID for user %q in /etc/passwd: %s", user, fields[2])
+			}
+			parsedGID, err := strconv.Atoi(fields[3])
+			if err != nil {
+				return nil, nil, fmt.Errorf("invalid GID for user %q in /etc/passwd: %s", user, fields[3])
+			}
+			return &parsedUID, &parsedGID, nil
+		}
+	}
+
+	return nil, nil, fmt.Errorf("user %q not found in /etc/passwd", user)
 }
 
 // LoadFromDirForArch loads an image from a prebaked directory and validates

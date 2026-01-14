@@ -530,6 +530,8 @@ func run() error {
 		WorkDir:       workDir,
 		EnableNetwork: networkFlag.v,
 		Exec:          execFlag.v,
+		UID:           img.Config.UID,
+		GID:           img.Config.GID,
 	})
 	if err != nil {
 		return err

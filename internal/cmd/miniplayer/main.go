@@ -175,7 +175,7 @@ func run(mdPath, bundleDir string, width, height int, takeScreenshot bool, outpu
 	scrollView := ui.NewScrollView(widget)
 
 	// Create header label (will be rendered separately for full-width)
-	headerLabel := ui.NewGradientLabel("UQ Cyber").WithSize(32)
+	headerLabel := ui.NewGradientLabel("CrumbleCracker").WithSize(32)
 	headerRoot := ui.NewRoot(textRenderer)
 	headerRoot.SetChild(ui.Row().
 		WithPadding(ui.Symmetric(16, 12)).
