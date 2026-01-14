@@ -169,13 +169,18 @@ func run() error {
 		}
 	}
 
-	if *debugFile != "" {
-		if err := debug.OpenFile(*debugFile); err != nil {
+	// Check for debug file from flag or environment variable
+	debugFilePath := *debugFile
+	if debugFilePath == "" {
+		debugFilePath = os.Getenv("CC_DEBUG_FILE")
+	}
+	if debugFilePath != "" {
+		if err := debug.OpenFile(debugFilePath); err != nil {
 			return fmt.Errorf("open debug file: %w", err)
 		}
 		defer debug.Close()
 
-		debug.Writef("cc debug logging enabled", "filename=%s", *debugFile)
+		debug.Writef("cc debug logging enabled", "filename=%s", debugFilePath)
 	}
 
 	if *timesliceFile != "" {

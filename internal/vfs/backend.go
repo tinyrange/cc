@@ -30,6 +30,23 @@ const (
 	modeSticky   fs.FileMode = 0o1000
 )
 
+// goModeToLinux converts Go's fs.FileMode to Linux permission bits.
+// Go uses high bits for setuid/setgid/sticky (fs.ModeSetuid, etc.),
+// while Linux uses the low 12 bits (0o4000, 0o2000, 0o1000).
+func goModeToLinux(m fs.FileMode) fs.FileMode {
+	perm := m.Perm() // low 9 bits (rwxrwxrwx)
+	if m&fs.ModeSetuid != 0 {
+		perm |= modeSetuid
+	}
+	if m&fs.ModeSetgid != 0 {
+		perm |= modeSetgid
+	}
+	if m&fs.ModeSticky != 0 {
+		perm |= modeSticky
+	}
+	return perm
+}
+
 const xattrPosixACLDefault = "system.posix_acl_default"
 const xattrPosixACLAccess = "system.posix_acl_access"
 
@@ -443,13 +460,15 @@ func (n *fsNode) attr() virtio.FuseAttr {
 	chgTime := n.ctime
 
 	if n.abstractFile != nil {
-		size, perm = n.abstractFile.Stat()
+		var rawPerm fs.FileMode
+		size, rawPerm = n.abstractFile.Stat()
+		perm = goModeToLinux(rawPerm)
 		if mt := n.abstractFile.ModTime(); !mt.IsZero() {
 			modTime = mt
 			aTime = mt
 		}
 	} else if n.abstractDir != nil {
-		perm = n.abstractDir.Stat()
+		perm = goModeToLinux(n.abstractDir.Stat())
 		if mt := n.abstractDir.ModTime(); !mt.IsZero() {
 			modTime = mt
 			aTime = mt
