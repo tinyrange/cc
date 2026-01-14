@@ -732,12 +732,12 @@ var textSizeScale = map[string]float64{
 
 // Heading sizes (used by builder)
 var headingSizes = map[string]float64{
-	"h1": 48,
-	"h2": 36,
-	"h3": 30,
-	"h4": 24,
-	"h5": 20,
-	"h6": 18,
+	"h1": 32,
+	"h2": 24,
+	"h3": 20,
+	"h4": 18,
+	"h5": 16,
+	"h6": 14,
 }
 
 // Border radius scale

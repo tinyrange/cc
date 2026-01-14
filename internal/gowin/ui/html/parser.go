@@ -81,9 +81,12 @@ func convertElement(n *html.Node) *node {
 
 // convertText converts an html.TextNode to our internal node type.
 func convertText(n *html.Node) *node {
-	text := strings.TrimSpace(n.Data)
-	if text == "" {
+	// Skip nodes that are purely whitespace (newlines, indentation)
+	if strings.TrimSpace(n.Data) == "" {
 		return nil
 	}
+	// Preserve the text as-is to maintain newlines for code blocks
+	// Just trim leading/trailing pure whitespace lines but keep internal structure
+	text := n.Data
 	return newText(text)
 }

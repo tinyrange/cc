@@ -406,3 +406,131 @@ func LoadForArchitecture(arch hv.CpuArchitecture) (Kernel, error) {
 		pkg:  pkg,
 	}, nil
 }
+
+// LoadFromDirectory loads a kernel from a pre-cached local directory.
+// This is used for offline/bundled distribution where packages are stored
+// next to the executable. The directory should contain files like:
+// linux-virt-aarch64.idx, linux-virt-aarch64.bin for ARM64
+// linux-virt-x86_64.idx, linux-virt-x86_64.bin for x86_64
+func LoadFromDirectory(arch hv.CpuArchitecture, dir string) (Kernel, error) {
+	pkgName := "linux-virt"
+	if arch == hv.ArchitectureRISCV64 {
+		pkgName = "linux-lts"
+	}
+
+	var archName string
+	switch arch {
+	case hv.ArchitectureX86_64:
+		archName = "x86_64"
+	case hv.ArchitectureARM64:
+		archName = "aarch64"
+	case hv.ArchitectureRISCV64:
+		archName = "riscv64"
+	default:
+		return nil, fmt.Errorf("unsupported architecture: %v", arch)
+	}
+
+	// Look for package files: linux-virt-aarch64.idx/.bin
+	basePath := filepath.Join(dir, fmt.Sprintf("%s-%s", pkgName, archName))
+
+	pkg, err := alpine.OpenLocalPackage(basePath)
+	if err != nil {
+		return nil, fmt.Errorf("open local kernel package: %w", err)
+	}
+
+	return &alpineKernel{
+		arch: arch,
+		pkg:  pkg,
+	}, nil
+}
+
+// LoadForArchitectureWithFallback tries to load a kernel from a local resources
+// directory first, then falls back to downloading from the network.
+// If localResourceDir is empty, it behaves the same as LoadForArchitecture.
+func LoadForArchitectureWithFallback(arch hv.CpuArchitecture, localResourceDir string) (Kernel, error) {
+	// Try local resources directory first
+	if localResourceDir != "" {
+		if k, err := LoadFromDirectory(arch, localResourceDir); err == nil {
+			return k, nil
+		}
+		// Local not found, fall through to download
+	}
+
+	// Fall back to normal behavior (cache + download)
+	return LoadForArchitecture(arch)
+}
+
+// ExportResources downloads the kernel for the given architecture and copies
+// the cached files to destDir with standardized names for offline distribution.
+// Files are named: linux-virt-<arch>.idx and linux-virt-<arch>.bin
+func ExportResources(arch hv.CpuArchitecture, destDir string) error {
+	dl := alpine.AlpineDownloader{}
+
+	cachePath, err := GetDefaultCachePath()
+	if err != nil {
+		return err
+	}
+
+	if err := dl.SetForArchitecture(arch, cachePath); err != nil {
+		return err
+	}
+
+	pkgName := "linux-virt"
+	if arch == hv.ArchitectureRISCV64 {
+		pkgName = "linux-lts"
+	}
+
+	var archName string
+	switch arch {
+	case hv.ArchitectureX86_64:
+		archName = "x86_64"
+	case hv.ArchitectureARM64:
+		archName = "aarch64"
+	case hv.ArchitectureRISCV64:
+		archName = "riscv64"
+	default:
+		return fmt.Errorf("unsupported architecture: %v", arch)
+	}
+
+	// Download and get the cache path
+	cacheBasePath, _, err := dl.DownloadAndGetPath(pkgName)
+	if err != nil {
+		return fmt.Errorf("download kernel: %w", err)
+	}
+
+	// Create destination directory
+	if err := os.MkdirAll(destDir, 0755); err != nil {
+		return fmt.Errorf("create dest dir: %w", err)
+	}
+
+	// Copy .idx and .bin files with standardized names
+	destBasePath := filepath.Join(destDir, fmt.Sprintf("%s-%s", pkgName, archName))
+
+	if err := copyFile(cacheBasePath+".idx", destBasePath+".idx"); err != nil {
+		return fmt.Errorf("copy idx: %w", err)
+	}
+	if err := copyFile(cacheBasePath+".bin", destBasePath+".bin"); err != nil {
+		return fmt.Errorf("copy bin: %w", err)
+	}
+
+	return nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Close()
+}

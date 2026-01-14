@@ -2,15 +2,16 @@ package oci
 
 // RuntimeConfig holds the runtime configuration extracted from an OCI image.
 type RuntimeConfig struct {
-	Layers     []string          `json:"layers"`
-	Env        []string          `json:"env,omitempty"`
-	Entrypoint []string          `json:"entrypoint,omitempty"`
-	Cmd        []string          `json:"cmd,omitempty"`
-	WorkingDir string            `json:"workingDir,omitempty"`
-	User       string            `json:"user,omitempty"`
-	UID        *int              `json:"uid,omitempty"`
-	GID        *int              `json:"gid,omitempty"`
-	Labels     map[string]string `json:"labels,omitempty"`
+	Layers       []string          `json:"layers"`
+	Env          []string          `json:"env,omitempty"`
+	Entrypoint   []string          `json:"entrypoint,omitempty"`
+	Cmd          []string          `json:"cmd,omitempty"`
+	WorkingDir   string            `json:"workingDir,omitempty"`
+	User         string            `json:"user,omitempty"`
+	UID          *int              `json:"uid,omitempty"`
+	GID          *int              `json:"gid,omitempty"`
+	Labels       map[string]string `json:"labels,omitempty"`
+	Architecture string            `json:"architecture,omitempty"`
 }
 
 // ImageLayer represents a single layer in an OCI image.

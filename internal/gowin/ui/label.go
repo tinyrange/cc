@@ -2,8 +2,6 @@ package ui
 
 import (
 	"image/color"
-
-	"github.com/tinyrange/cc/internal/gowin/graphics"
 )
 
 // LabelStyle defines label appearance.
@@ -15,8 +13,8 @@ type LabelStyle struct {
 // DefaultLabelStyle returns default label styling.
 func DefaultLabelStyle() LabelStyle {
 	return LabelStyle{
-		TextColor: graphics.ColorWhite,
-		TextSize:  16,
+		TextColor: color.RGBA{R: 0x44, G: 0x40, B: 0x3c, A: 255}, // ink-700 dark text
+		TextSize:  14,
 	}
 }
 

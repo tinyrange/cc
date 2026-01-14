@@ -6,7 +6,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+
+	"github.com/tinyrange/cc/internal/hv"
 )
 
 // LoadFromDir loads an image from a prebaked directory containing config.json and
@@ -24,6 +27,13 @@ func LoadFromDir(dir string) (*Image, error) {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
 
+	// Parse User field to UID/GID if not already set
+	if cfg.User != "" && cfg.UID == nil {
+		uid, gid := parseUserString(cfg.User)
+		cfg.UID = uid
+		cfg.GID = gid
+	}
+
 	img := &Image{
 		Config: cfg,
 		Dir:    dir,
@@ -39,6 +49,82 @@ func LoadFromDir(dir string) (*Image, error) {
 	}
 
 	return img, nil
+}
+
+// parseUserString parses a Docker-style user string to UID/GID.
+// Supports formats: "uid", "uid:gid", "username" (username returns nil).
+func parseUserString(user string) (*int, *int) {
+	// Try "uid:gid" format
+	if parts := strings.SplitN(user, ":", 2); len(parts) == 2 {
+		uid, err := strconv.Atoi(parts[0])
+		if err != nil {
+			return nil, nil // Not numeric
+		}
+		uidPtr := &uid
+		gid, err := strconv.Atoi(parts[1])
+		if err != nil {
+			return uidPtr, uidPtr // GID defaults to UID
+		}
+		gidPtr := &gid
+		return uidPtr, gidPtr
+	}
+
+	// Try numeric UID only
+	uid, err := strconv.Atoi(user)
+	if err != nil {
+		return nil, nil // Username string - can't resolve without /etc/passwd
+	}
+	uidPtr := &uid
+	return uidPtr, uidPtr
+}
+
+// LoadFromDirForArch loads an image from a prebaked directory and validates
+// that the image architecture matches the expected architecture.
+func LoadFromDirForArch(dir string, expectedArch hv.CpuArchitecture) (*Image, error) {
+	img, err := LoadFromDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	// Validate architecture if image has one specified
+	if img.Config.Architecture != "" {
+		expectedOCI, err := toOciArchFromHV(expectedArch)
+		if err != nil {
+			return nil, err
+		}
+
+		if img.Config.Architecture != expectedOCI {
+			return nil, &ArchitectureMismatchError{
+				Expected: expectedOCI,
+				Actual:   img.Config.Architecture,
+			}
+		}
+	}
+
+	return img, nil
+}
+
+// ArchitectureMismatchError is returned when an image's architecture doesn't
+// match the expected architecture.
+type ArchitectureMismatchError struct {
+	Expected string
+	Actual   string
+}
+
+func (e *ArchitectureMismatchError) Error() string {
+	return fmt.Sprintf("image architecture mismatch: image is for %s but expected %s", e.Actual, e.Expected)
+}
+
+// toOciArchFromHV converts a hypervisor architecture to OCI architecture string.
+func toOciArchFromHV(arch hv.CpuArchitecture) (string, error) {
+	switch arch {
+	case hv.ArchitectureX86_64:
+		return "amd64", nil
+	case hv.ArchitectureARM64:
+		return "arm64", nil
+	default:
+		return "", fmt.Errorf("unsupported architecture: %s", arch)
+	}
 }
 
 // ExportToDir copies the prebaked runtime artifacts for img into dstDir.

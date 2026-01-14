@@ -274,6 +274,25 @@ func (b *builder) buildElement(n *node) ui.Widget {
 		return b.buildInput(n)
 	case "svg":
 		return b.buildSVG(n)
+	case "hr":
+		return b.buildHorizontalRule(n)
+	case "strong", "b":
+		return b.buildStrong(n)
+	case "em", "i":
+		return b.buildEmphasis(n)
+	case "code":
+		return b.buildInlineCode(n)
+	case "pre":
+		return b.buildCodeBlock(n)
+	case "ul":
+		return b.buildUnorderedList(n)
+	case "ol":
+		return b.buildOrderedList(n)
+	case "table":
+		return b.buildTable(n)
+	case "thead", "tbody":
+		// These are just structural, pass through children
+		return b.buildTableSection(n)
 	default:
 		// Treat unknown elements as divs
 		return b.buildDiv(n)
@@ -543,7 +562,7 @@ func (b *builder) buildParagraph(n *node) ui.Widget {
 	return label
 }
 
-// buildHeading builds a styled Label from h1-h6 elements.
+// buildHeading builds a styled WrapLabel from h1-h6 elements.
 func (b *builder) buildHeading(n *node) ui.Widget {
 	text := n.textContent()
 	styles := ParseClasses(n.classes)
@@ -563,7 +582,8 @@ func (b *builder) buildHeading(n *node) ui.Widget {
 		return b.buildGradientLabel(text, textSize)
 	}
 
-	label := ui.NewLabel(text)
+	// Use WrapLabel so long headings wrap instead of overflow
+	label := ui.NewWrapLabel(text)
 	label.WithSize(textSize)
 
 	if styles.TextColor != nil {
@@ -1000,4 +1020,413 @@ func escapeXML(s string) string {
 	s = strings.ReplaceAll(s, ">", "&gt;")
 	s = strings.ReplaceAll(s, "\"", "&quot;")
 	return s
+}
+
+// buildHorizontalRule builds a horizontal line separator.
+func (b *builder) buildHorizontalRule(n *node) ui.Widget {
+	// Create a thin line using a Card with minimal height
+	hrColor := color.RGBA{R: 0xe8, G: 0xe2, B: 0xdc, A: 255} // light border
+
+	hr := ui.NewCard(nil).WithStyle(ui.CardStyle{
+		BackgroundColor: hrColor,
+		CornerRadius:    0,
+	}).WithFixedSize(0, 1) // 1px height, full width
+
+	if b.ctx != nil && b.ctx.Window != nil {
+		hr.WithGraphicsWindow(b.ctx.Window)
+	}
+
+	return newFullWidthSizer(hr)
+}
+
+// buildStrong builds bold/strong text.
+func (b *builder) buildStrong(n *node) ui.Widget {
+	text := n.textContent()
+	styles := ParseClasses(n.classes)
+
+	// Use a slightly brighter color to simulate bold (since we may not have font weight support)
+	label := ui.NewLabel(text)
+
+	textColor := color.RGBA{R: 0x44, G: 0x40, B: 0x3c, A: 255} // ink-700 dark text
+	if styles.TextColor != nil {
+		textColor = *styles.TextColor
+	}
+	label.WithColor(textColor)
+
+	if styles.TextSize != nil {
+		label.WithSize(*styles.TextSize)
+	}
+
+	return label
+}
+
+// buildEmphasis builds italic/emphasized text.
+func (b *builder) buildEmphasis(n *node) ui.Widget {
+	text := n.textContent()
+	styles := ParseClasses(n.classes)
+
+	// Use a slightly different color to indicate emphasis
+	label := ui.NewLabel(text)
+
+	textColor := color.RGBA{R: 0x78, G: 0x71, B: 0x6c, A: 255} // ink-500 for subtle emphasis
+	if styles.TextColor != nil {
+		textColor = *styles.TextColor
+	}
+	label.WithColor(textColor)
+
+	if styles.TextSize != nil {
+		label.WithSize(*styles.TextSize)
+	}
+
+	return label
+}
+
+// buildInlineCode builds inline code with background styling.
+func (b *builder) buildInlineCode(n *node) ui.Widget {
+	text := n.textContent()
+
+	// Style: light purple background, dark text
+	bgColor := color.RGBA{R: 0xf5, G: 0xf3, B: 0xff, A: 255}   // grape-50
+	textColor := color.RGBA{R: 0x44, G: 0x40, B: 0x3c, A: 255} // ink-700
+
+	// Use WrapLabel so it respects width constraints
+	label := ui.NewWrapLabel(text).WithColor(textColor).WithSize(12)
+
+	// Wrap in a Card for background
+	card := ui.NewCard(label).WithStyle(ui.CardStyle{
+		BackgroundColor: bgColor,
+		CornerRadius:    4,
+		Padding:         ui.EdgeInsets{Left: 4, Right: 4, Top: 2, Bottom: 2},
+	})
+
+	if b.ctx != nil && b.ctx.Window != nil {
+		card.WithGraphicsWindow(b.ctx.Window)
+	}
+
+	return card
+}
+
+// buildCodeBlock builds a fenced code block.
+// Uses Label (not WrapLabel) to preserve exact formatting including indentation.
+func (b *builder) buildCodeBlock(n *node) ui.Widget {
+	// Get the code content - goldmark wraps code in <pre><code>
+	var codeText string
+	for _, child := range n.children {
+		if child.tag == "code" {
+			codeText = child.textContent()
+			break
+		}
+	}
+	if codeText == "" {
+		codeText = n.textContent()
+	}
+
+	// Style: light purple background, dark text, padding
+	bgColor := color.RGBA{R: 0xf5, G: 0xf3, B: 0xff, A: 255}   // grape-50
+	textColor := color.RGBA{R: 0x44, G: 0x40, B: 0x3c, A: 255} // ink-700
+
+	// Split into lines and create a column of Labels
+	// Use Label (not WrapLabel) to preserve exact whitespace/indentation
+	lines := strings.Split(strings.TrimSuffix(codeText, "\n"), "\n")
+	container := ui.Column().WithGap(0)
+
+	for _, line := range lines {
+		if line == "" {
+			line = " " // Preserve empty lines
+		}
+		// Use Label to preserve exact formatting (indentation, etc.)
+		label := ui.NewLabel(line).WithColor(textColor).WithSize(12)
+		container.AddChild(label, ui.DefaultFlexParams())
+	}
+
+	// Wrap in Card with padding and background
+	card := ui.NewCard(container).WithStyle(ui.CardStyle{
+		BackgroundColor: bgColor,
+		CornerRadius:    6,
+		Padding:         ui.EdgeInsets{Left: 16, Right: 16, Top: 12, Bottom: 12},
+	})
+
+	if b.ctx != nil && b.ctx.Window != nil {
+		card.WithGraphicsWindow(b.ctx.Window)
+	}
+
+	return newFullWidthSizer(card)
+}
+
+// buildUnorderedList builds a bullet list.
+func (b *builder) buildUnorderedList(n *node) ui.Widget {
+	container := ui.Column().WithGap(4)
+
+	for _, child := range n.children {
+		if child.tag == "li" {
+			row := ui.Row().WithGap(8)
+
+			// Bullet
+			bullet := ui.NewLabel("\u2022").WithColor(color.RGBA{R: 0x78, G: 0x71, B: 0x6c, A: 255}) // ink-500
+
+			// Content - can contain inline elements
+			content := b.buildListItemContent(child)
+
+			row.AddChild(bullet, ui.DefaultFlexParams())
+			row.AddChild(content, ui.FlexParams(1))
+			container.AddChild(row, ui.DefaultFlexParams())
+		}
+	}
+
+	return container
+}
+
+// buildOrderedList builds a numbered list.
+func (b *builder) buildOrderedList(n *node) ui.Widget {
+	container := ui.Column().WithGap(4)
+
+	num := 1
+	for _, child := range n.children {
+		if child.tag == "li" {
+			row := ui.Row().WithGap(8)
+
+			// Number
+			numLabel := ui.NewLabel(strconv.Itoa(num) + ".").WithColor(color.RGBA{R: 0x78, G: 0x71, B: 0x6c, A: 255}) // ink-500
+
+			// Content
+			content := b.buildListItemContent(child)
+
+			row.AddChild(numLabel, ui.DefaultFlexParams())
+			row.AddChild(content, ui.FlexParams(1))
+			container.AddChild(row, ui.DefaultFlexParams())
+			num++
+		}
+	}
+
+	return container
+}
+
+// buildListItemContent builds the content of a list item, handling inline elements.
+func (b *builder) buildListItemContent(n *node) ui.Widget {
+	textColor := color.RGBA{R: 0x44, G: 0x40, B: 0x3c, A: 255} // ink-700
+
+	// If only text content, use WrapLabel
+	if len(n.children) == 1 && n.children[0].isText() {
+		return ui.NewWrapLabel(n.textContent()).WithColor(textColor)
+	}
+
+	// For mixed content, use a wrapping flow container
+	return b.buildInlineFlow(n.children, textColor)
+}
+
+// buildInlineFlow builds inline content with proper styling for code elements.
+// Uses FlowContainer for proper wrapping with styled inline code.
+func (b *builder) buildInlineFlow(children []*node, textColor color.RGBA) ui.Widget {
+	flow := ui.Flow().WithGap(4).WithLineGap(2)
+
+	for _, child := range children {
+		if child.isText() {
+			text := strings.TrimSpace(child.text)
+			if text != "" {
+				label := ui.NewWrapLabel(text).WithColor(textColor)
+				flow.AddChild(label)
+			}
+		} else if child.tag == "code" {
+			// Render code with background
+			w := b.buildInlineCode(child)
+			flow.AddChild(w)
+		} else {
+			// Other inline elements
+			if w := b.build(child); w != nil {
+				flow.AddChild(w)
+			}
+		}
+	}
+
+	return flow
+}
+
+// isSimpleInlineContent checks if a node contains only text and simple inline elements.
+func (b *builder) isSimpleInlineContent(n *node) bool {
+	for _, child := range n.children {
+		if child.isText() {
+			continue
+		}
+		// Allow simple inline elements
+		switch child.tag {
+		case "code", "strong", "b", "em", "i", "span":
+			continue
+		default:
+			// Has block-level or complex element
+			return false
+		}
+	}
+	return true
+}
+
+// buildTable builds a table widget.
+func (b *builder) buildTable(n *node) ui.Widget {
+	// Collect all rows from thead and tbody
+	var headerRows []*node
+	var bodyRows []*node
+
+	for _, child := range n.children {
+		switch child.tag {
+		case "thead":
+			for _, row := range child.children {
+				if row.tag == "tr" {
+					headerRows = append(headerRows, row)
+				}
+			}
+		case "tbody":
+			for _, row := range child.children {
+				if row.tag == "tr" {
+					bodyRows = append(bodyRows, row)
+				}
+			}
+		case "tr":
+			// Direct tr children (no thead/tbody)
+			// Check if it contains th (header) or td (body)
+			hasHeader := false
+			for _, cell := range child.children {
+				if cell.tag == "th" {
+					hasHeader = true
+					break
+				}
+			}
+			if hasHeader {
+				headerRows = append(headerRows, child)
+			} else {
+				bodyRows = append(bodyRows, child)
+			}
+		}
+	}
+
+	// Calculate column flex ratios based on header content length
+	var colRatios []float32
+	if len(headerRows) > 0 {
+		for _, cell := range headerRows[0].children {
+			if cell.tag == "th" {
+				text := cell.textContent()
+				// Use text length as rough estimate, with minimum of 1
+				ratio := float32(len(text))
+				if ratio < 5 {
+					ratio = 5
+				}
+				colRatios = append(colRatios, ratio)
+			}
+		}
+	}
+
+	// Colors for light theme
+	headerBg := color.RGBA{R: 0xe9, G: 0xd5, B: 0xff, A: 255}   // grape-200 (light purple)
+	headerText := color.RGBA{R: 0x44, G: 0x40, B: 0x3c, A: 255} // ink-700 (dark text)
+	cellText := color.RGBA{R: 0x44, G: 0x40, B: 0x3c, A: 255}   // ink-700
+	borderColor := color.RGBA{R: 0xe8, G: 0xe2, B: 0xdc, A: 255} // light border
+
+	container := ui.Column().WithGap(0)
+
+	// Build header rows
+	for _, row := range headerRows {
+		rowWidget := b.buildTableRowWithRatios(row, &headerBg, headerText, borderColor, true, colRatios)
+		container.AddChild(rowWidget, ui.DefaultFlexParams())
+	}
+
+	// Build body rows
+	for _, row := range bodyRows {
+		rowWidget := b.buildTableRowWithRatios(row, nil, cellText, borderColor, false, colRatios)
+		container.AddChild(rowWidget, ui.DefaultFlexParams())
+	}
+
+	return newFullWidthSizer(container)
+}
+
+// buildTableRow builds a single table row with equal column widths.
+func (b *builder) buildTableRow(n *node, bgColor *color.RGBA, textColor, borderColor color.RGBA, isHeader bool) ui.Widget {
+	return b.buildTableRowWithRatios(n, bgColor, textColor, borderColor, isHeader, nil)
+}
+
+// buildTableRowWithRatios builds a single table row with specified column width ratios.
+func (b *builder) buildTableRowWithRatios(n *node, bgColor *color.RGBA, textColor, borderColor color.RGBA, isHeader bool, colRatios []float32) ui.Widget {
+	row := ui.Row().WithGap(0)
+
+	colIdx := 0
+	for _, cell := range n.children {
+		if cell.tag == "td" || cell.tag == "th" {
+			cellWidget := b.buildTableCell(cell, textColor, isHeader)
+
+			// Use ratio from colRatios if available, otherwise default to 1
+			var flex float32 = 1
+			if colIdx < len(colRatios) {
+				flex = colRatios[colIdx]
+			}
+			row.AddChild(cellWidget, ui.FlexParams(flex))
+			colIdx++
+		}
+	}
+
+	// Wrap with background if provided
+	if bgColor != nil {
+		card := ui.NewCard(row).WithStyle(ui.CardStyle{
+			BackgroundColor: *bgColor,
+			CornerRadius:    0,
+		})
+		if b.ctx != nil && b.ctx.Window != nil {
+			card.WithGraphicsWindow(b.ctx.Window)
+		}
+		return card
+	}
+
+	// Add bottom border for body rows
+	wrapper := ui.Column().WithGap(0)
+	wrapper.AddChild(row, ui.DefaultFlexParams())
+
+	// Border line
+	borderLine := ui.NewCard(nil).WithStyle(ui.CardStyle{
+		BackgroundColor: borderColor,
+		CornerRadius:    0,
+	}).WithFixedSize(0, 1)
+	if b.ctx != nil && b.ctx.Window != nil {
+		borderLine.WithGraphicsWindow(b.ctx.Window)
+	}
+	wrapper.AddChild(newFullWidthSizer(borderLine), ui.DefaultFlexParams())
+
+	return wrapper
+}
+
+// buildTableCell builds a table cell.
+func (b *builder) buildTableCell(n *node, textColor color.RGBA, isHeader bool) ui.Widget {
+	// Build cell content - may contain inline elements like code
+	var content ui.Widget
+
+	// Simple text only - use WrapLabel
+	if len(n.children) == 1 && n.children[0].isText() {
+		content = ui.NewWrapLabel(n.textContent()).WithColor(textColor)
+	} else if b.isSimpleInlineContent(n) {
+		// Mixed inline content (text + code) - use flow with styled code
+		content = b.buildInlineFlow(n.children, textColor)
+	} else {
+		// Complex content with block elements - use column
+		col := ui.Column().WithGap(2)
+		for _, child := range n.children {
+			if w := b.build(child); w != nil {
+				col.AddChild(w, ui.DefaultFlexParams())
+			}
+		}
+		content = col
+	}
+
+	// Wrap with padding
+	wrapper := ui.Column().WithPadding(ui.EdgeInsets{Left: 8, Right: 8, Top: 6, Bottom: 6})
+	wrapper.AddChild(content, ui.DefaultFlexParams())
+
+	return wrapper
+}
+
+// buildTableSection handles thead/tbody elements by building their row children.
+func (b *builder) buildTableSection(n *node) ui.Widget {
+	// This shouldn't normally be called directly since table handles thead/tbody
+	// But provide fallback behavior
+	container := ui.Column().WithGap(0)
+	for _, child := range n.children {
+		if w := b.build(child); w != nil {
+			container.AddChild(w, ui.DefaultFlexParams())
+		}
+	}
+	return container
 }

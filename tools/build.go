@@ -1143,6 +1143,7 @@ func main() {
 	dbgTool := fs.Bool("dbg-tool", false, "build and run the debug tool")
 	tsTool := fs.Bool("ts-tool", false, "build and run the timeslice tool")
 	app := fs.Bool("app", false, "build and run ccapp")
+	miniplayer := fs.Bool("miniplayer", false, "build and run miniplayer")
 	cpuprofile := fs.String("cpuprofile", "", "write CPU profile of built binary to file")
 	memprofile := fs.String("memprofile", "", "write memory profile of built binary to file")
 	benchTests := fs.Bool("bench-tests", false, "build and run the benchmark tests")
@@ -1237,6 +1238,23 @@ func main() {
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to build timeslice tool: %v\n", err)
+			os.Exit(1)
+		}
+		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *miniplayer {
+		out, err := goBuild(buildOptions{
+			Package:          "internal/cmd/miniplayer",
+			OutputName:       "miniplayer",
+			Build:            hostBuild,
+			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build miniplayer: %v\n", err)
 			os.Exit(1)
 		}
 		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {

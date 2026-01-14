@@ -47,6 +47,17 @@ func DefaultColorScheme() ColorScheme {
 	}
 }
 
+// LightColorScheme returns a light color scheme with purple accents.
+func LightColorScheme() ColorScheme {
+	return ColorScheme{
+		Foreground: color.RGBA{R: 0x44, G: 0x40, B: 0x3c, A: 255}, // #44403C (ink-700)
+		Background: color.RGBA{R: 0xff, G: 0xfb, B: 0xf7, A: 255}, // #FFFBF7 (warm cream)
+		Cursor:     color.RGBA{R: 0x8b, G: 0x5c, B: 0xf6, A: 255}, // #8B5CF6 (grape-500 purple)
+		Selection:  color.RGBA{R: 0xe9, G: 0xd5, B: 0xff, A: 255}, // #E9D5FF (grape-200 light purple)
+		Palette:    lightPalette,
+	}
+}
+
 type Hooks struct {
 	// OnResize is called when the terminal grid size changes.
 	OnResize func(cols, rows int)
@@ -114,6 +125,10 @@ type View struct {
 
 	// Color scheme for theming.
 	colorScheme ColorScheme
+
+	// pendingEvents holds events to process instead of draining.
+	// If non-nil, Step uses these events and clears the slice.
+	pendingEvents []window.InputEvent
 }
 
 // Point represents a cell position in the terminal grid.
@@ -224,6 +239,16 @@ func (v *View) Grid() *Grid {
 		return nil
 	}
 	return v.grid
+}
+
+// SetPendingEvents sets events to process in the next Step() call.
+// When set, Step() uses these events instead of calling DrainInputEvents().
+// The events are cleared after being processed.
+func (v *View) SetPendingEvents(events []window.InputEvent) {
+	if v == nil {
+		return
+	}
+	v.pendingEvents = events
 }
 
 // SetInsets configures pixel insets for rendering and sizing the terminal grid.
@@ -522,7 +547,14 @@ func (v *View) Step(f graphics.Frame, hooks Hooks) error {
 	}
 
 	// Raw input events from the platform window (preferred).
-	events := v.win.PlatformWindow().DrainInputEvents()
+	// If pending events were set via SetPendingEvents, use those instead.
+	var events []window.InputEvent
+	if v.pendingEvents != nil {
+		events = v.pendingEvents
+		v.pendingEvents = nil
+	} else {
+		events = v.win.PlatformWindow().DrainInputEvents()
+	}
 
 	// Handle context menu events first (if menu is visible).
 	if v.contextMenu != nil && v.contextMenu.IsVisible() {
@@ -948,6 +980,29 @@ var tokyoNightPalette = []color.RGBA{
 	{R: 0xbb, G: 0x9a, B: 0xf7, A: 255}, // 13: bright magenta
 	{R: 0x7d, G: 0xcf, B: 0xff, A: 255}, // 14: bright cyan
 	{R: 0xc0, G: 0xca, B: 0xf5, A: 255}, // 15: bright white
+}
+
+// Light color palette for ANSI colors (optimized for light backgrounds).
+var lightPalette = []color.RGBA{
+	// Normal colors (0-7) - optimized for visibility on light cream background
+	{R: 0x1c, G: 0x1c, B: 0x1c, A: 255}, // 0: black (very dark)
+	{R: 0xc4, G: 0x1a, B: 0x16, A: 255}, // 1: red (dark red)
+	{R: 0x18, G: 0x80, B: 0x18, A: 255}, // 2: green (forest green)
+	{R: 0x9c, G: 0x6b, B: 0x00, A: 255}, // 3: yellow (dark amber/brown)
+	{R: 0x1a, G: 0x4f, B: 0xba, A: 255}, // 4: blue (medium blue)
+	{R: 0x7c, G: 0x3a, B: 0xed, A: 255}, // 5: magenta (violet-600)
+	{R: 0x05, G: 0x6e, B: 0x8c, A: 255}, // 6: cyan (dark teal)
+	{R: 0x58, G: 0x54, B: 0x4f, A: 255}, // 7: white (medium gray for contrast)
+
+	// Bright colors (8-15)
+	{R: 0x58, G: 0x54, B: 0x4f, A: 255}, // 8: bright black (medium gray)
+	{R: 0xdc, G: 0x26, B: 0x26, A: 255}, // 9: bright red
+	{R: 0x16, G: 0xa3, B: 0x4a, A: 255}, // 10: bright green
+	{R: 0xb4, G: 0x83, B: 0x00, A: 255}, // 11: bright yellow (golden)
+	{R: 0x25, G: 0x63, B: 0xeb, A: 255}, // 12: bright blue
+	{R: 0x8b, G: 0x5c, B: 0xf6, A: 255}, // 13: bright magenta (grape-500)
+	{R: 0x06, G: 0x91, B: 0xb4, A: 255}, // 14: bright cyan (teal)
+	{R: 0x1c, G: 0x1c, B: 0x1c, A: 255}, // 15: bright white (very dark for contrast)
 }
 
 // Default ANSI 16-color palette (standard VGA colors).
