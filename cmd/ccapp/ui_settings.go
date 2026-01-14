@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"log/slog"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/tinyrange/cc/internal/bundle"
 	"github.com/tinyrange/cc/internal/gowin/graphics"
 	"github.com/tinyrange/cc/internal/gowin/ui"
+	"github.com/tinyrange/cc/internal/initx"
 	"github.com/tinyrange/cc/internal/oci"
 )
 
@@ -34,6 +36,8 @@ type SettingsScreen struct {
 	imageEntrypoint []string
 	imageCmd        []string
 	imageEnv        []string
+	imageArch       string // OCI architecture string (e.g., "amd64", "arm64")
+	needsQEMU       bool   // true if image arch differs from host
 
 	// Form fields
 	nameInput    *ui.TextInput
@@ -66,7 +70,7 @@ func NewSettingsScreen(app *Application, bundleIndex int) *SettingsScreen {
 		metadata:    b.Meta,
 	}
 
-	// Load OCI image to get entrypoint, cmd, and env
+	// Load OCI image to get entrypoint, cmd, env, and architecture
 	imageDir := filepath.Join(b.Dir, b.Meta.Boot.ImageDir)
 	if b.Meta.Boot.ImageDir == "" {
 		imageDir = filepath.Join(b.Dir, "image")
@@ -75,6 +79,16 @@ func NewSettingsScreen(app *Application, bundleIndex int) *SettingsScreen {
 		screen.imageEntrypoint = img.Config.Entrypoint
 		screen.imageCmd = img.Config.Cmd
 		screen.imageEnv = img.Config.Env
+		screen.imageArch = img.Config.Architecture
+
+		// Check if QEMU emulation would be needed
+		if screen.imageArch != "" {
+			hostArch, hostErr := parseArchitecture(runtime.GOARCH)
+			imageArch, imageErr := parseArchitecture(screen.imageArch)
+			if hostErr == nil && imageErr == nil {
+				screen.needsQEMU = initx.NeedsQEMUEmulation(hostArch, imageArch)
+			}
+		}
 	} else {
 		slog.Warn("failed to load image config for settings", "error", err)
 	}
@@ -191,6 +205,27 @@ func (s *SettingsScreen) buildUI() {
 			ui.FlexParams(1),
 		)
 		content.AddChild(envInfoRow, ui.DefaultFlexParams())
+	}
+
+	// Architecture (read-only) with warning if cross-architecture
+	if s.imageArch != "" {
+		archRow := ui.Row().WithGap(12).WithCrossAlignment(ui.CrossAxisCenter)
+		archRow.AddChild(
+			ui.NewLabel("Architecture:").WithSize(13).WithColor(colorTextSecondary),
+			ui.DefaultFlexParams(),
+		)
+
+		archDisplay := s.imageArch
+		archColor := colorTextMuted
+		if s.needsQEMU {
+			archDisplay = s.imageArch + " (requires QEMU emulation)"
+			archColor = colorYellow
+		}
+		archRow.AddChild(
+			ui.NewLabel(archDisplay).WithSize(13).WithColor(archColor),
+			ui.FlexParams(1),
+		)
+		content.AddChild(archRow, ui.DefaultFlexParams())
 	}
 
 	// === Override Section ===

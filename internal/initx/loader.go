@@ -371,9 +371,10 @@ type VirtualMachine struct {
 
 	configRegion hv.MemoryRegion
 
-	debugLogging bool
-	dmesgLogging bool
-	gpuEnabled   bool
+	debugLogging         bool
+	dmesgLogging         bool
+	gpuEnabled           bool
+	qemuEmulationEnabled bool
 
 	// kernelLoader stores the kernel for module loading
 	kernelLoader kernel.Kernel
@@ -569,6 +570,13 @@ func WithDmesgLogging(enabled bool) Option {
 func WithGPUEnabled(enabled bool) Option {
 	return funcOption(func(vm *VirtualMachine) error {
 		vm.gpuEnabled = enabled
+		return nil
+	})
+}
+
+func WithQEMUEmulationEnabled(enabled bool) Option {
+	return funcOption(func(vm *VirtualMachine) error {
+		vm.qemuEmulationEnabled = enabled
 		return nil
 	})
 }
@@ -783,6 +791,18 @@ func NewVirtualMachine(
 					return nil, fmt.Errorf("plan GPU module load: %v", err)
 				}
 				cfg.PreloadModules = append(cfg.PreloadModules, gpuModules...)
+			}
+
+			// Load binfmt_misc module if QEMU emulation is enabled
+			if ret.qemuEmulationEnabled {
+				binfmtModules, err := kernelLoader.PlanModuleLoad(
+					kernel.BinfmtMiscModuleConfigs,
+					kernel.BinfmtMiscModuleMap,
+				)
+				if err != nil {
+					return nil, fmt.Errorf("plan binfmt_misc module load: %v", err)
+				}
+				cfg.PreloadModules = append(cfg.PreloadModules, binfmtModules...)
 			}
 
 			return Build(cfg)

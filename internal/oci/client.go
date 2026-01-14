@@ -85,6 +85,11 @@ func NewClient(cacheDir string) (*Client, error) {
 	}, nil
 }
 
+// CacheDir returns the cache directory used by this client.
+func (c *Client) CacheDir() string {
+	return c.cacheDir
+}
+
 // SetProgressCallback sets a callback function that will be called during downloads.
 // The callback receives progress updates with current/total bytes and filename.
 // Set to nil to disable progress reporting.

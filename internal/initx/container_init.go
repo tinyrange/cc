@@ -21,6 +21,21 @@ var rtgContainerInitSource string
 // implemented as pure RTG code. Complex helpers (addDefaultRoute, execCommand,
 // forkExecWait) are injected at IR level.
 
+// QEMUEmulationConfig configures QEMU user emulation for cross-architecture support.
+type QEMUEmulationConfig struct {
+	// TargetArch is the architecture we're emulating (the container's architecture).
+	TargetArch hv.CpuArchitecture
+
+	// Binary is the QEMU static binary data.
+	Binary []byte
+
+	// BinaryPath is where to install the binary in the guest.
+	BinaryPath string
+
+	// BinfmtRegistration is the string to write to /proc/sys/fs/binfmt_misc/register.
+	BinfmtRegistration string
+}
+
 type ContainerInitConfig struct {
 	Arch          hv.CpuArchitecture
 	Cmd           []string
@@ -38,6 +53,10 @@ type ContainerInitConfig struct {
 	// UID and GID for privilege dropping (nil = stay as root)
 	UID *int
 	GID *int
+
+	// QEMUEmulation enables cross-architecture binary emulation.
+	// If set, QEMU static binaries will be installed and binfmt-misc configured.
+	QEMUEmulation *QEMUEmulationConfig
 }
 
 func (c *ContainerInitConfig) applyDefaults() {
@@ -102,6 +121,7 @@ func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
 		"network":         cfg.EnableNetwork,
 		"exec":            cfg.Exec,
 		"drop_privileges": cfg.UID != nil,
+		"qemu_emulation":  cfg.QEMUEmulation != nil,
 	}
 
 	// Build config values for pure RTG helpers
@@ -249,6 +269,35 @@ func injectContainerInitHelpers(prog *ir.Program, cfg ContainerInitConfig) error
 			}),
 		)
 		prog.Methods["dropPrivileges"] = ir.Method(dropPrivBlock)
+	}
+
+	// QEMU emulation setup helper
+	if cfg.QEMUEmulation != nil {
+		qemuErrLabel := ir.Label("__cc_qemu_error")
+
+		var qemuBlock ir.Block
+
+		// Mount binfmt_misc
+		qemuBlock = append(qemuBlock, MountBinfmtMisc(qemuErrLabel, errVar))
+
+		// Write the QEMU binary to the guest filesystem
+		qemuBlock = append(qemuBlock,
+			WriteBinaryFile(cfg.QEMUEmulation.BinaryPath, cfg.QEMUEmulation.Binary, 0755, qemuErrLabel, errVar),
+		)
+
+		// Register with binfmt_misc
+		qemuBlock = append(qemuBlock,
+			RegisterBinfmt(cfg.QEMUEmulation.BinfmtRegistration, qemuErrLabel, errVar),
+		)
+
+		qemuBlock = append(qemuBlock,
+			ir.Return(ir.Int64(0)),
+			ir.DeclareLabel(qemuErrLabel, ir.Block{
+				ir.Printf("cc: setupQEMUEmulation error: errno=0x%x\n", errVar),
+				rebootFragment(cfg.Arch),
+			}),
+		)
+		prog.Methods["setupQEMUEmulation"] = ir.Method(qemuBlock)
 	}
 
 	// Add error handler to main method

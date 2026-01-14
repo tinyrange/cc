@@ -75,6 +75,9 @@ type bootPrep struct {
 	env     []string
 	workDir string
 
+	// QEMU emulation config (for cross-architecture images)
+	qemuConfig *initx.QEMUEmulationConfig
+
 	// resources created during prep (must be cleaned up on error)
 	containerFS  *oci.ContainerFS
 	fsBackend    vfs.VirtioFsBackend
@@ -1202,6 +1205,9 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 	case err := <-app.running.session.Done:
 		if err != nil && err != io.EOF {
 			slog.Error("VM exited with error", "error", err)
+			app.stopVM()
+			app.showError(fmt.Errorf("VM exited with error: %w", err))
+			return nil
 		}
 		slog.Info("VM session ended; cleaning up")
 		app.stopVM()
@@ -1342,6 +1348,27 @@ func prepareBootBundle(b discoveredBundle, hvArch hv.CpuArchitecture, preOpenedH
 	}
 	prep.workDir = workDir
 
+	// Check if we need QEMU emulation for cross-architecture images
+	if img.Config.Architecture != "" {
+		imageArch, err := parseArchitecture(img.Config.Architecture)
+		if err == nil && initx.NeedsQEMUEmulation(hvArch, imageArch) {
+			slog.Info("Cross-architecture bundle detected, enabling QEMU emulation",
+				"host", hvArch, "image", imageArch)
+
+			// Create a client to get the cache directory for QEMU binary download
+			client, err := oci.NewClient("")
+			if err != nil {
+				return nil, fmt.Errorf("create OCI client for QEMU download: %w", err)
+			}
+
+			qemuCfg, err := initx.PrepareQEMUEmulation(hvArch, imageArch, client.CacheDir())
+			if err != nil {
+				return nil, fmt.Errorf("prepare QEMU emulation: %w", err)
+			}
+			prep.qemuConfig = qemuCfg
+		}
+	}
+
 	// Create VirtioFS backend
 	fsBackend := vfs.NewVirtioFsBackendWithAbstract()
 	if err := fsBackend.SetAbstractRoot(containerFS); err != nil {
@@ -1466,6 +1493,11 @@ func (app *Application) finalizeBoot(prep *bootPrep) (retErr error) {
 		Arch:    prep.hvArch,
 	}))
 
+	// Enable QEMU emulation module loading if cross-architecture is needed
+	if prep.qemuConfig != nil {
+		opts = append(opts, initx.WithQEMUEmulationEnabled(true))
+	}
+
 	vm, err := initx.NewVirtualMachine(prep.hypervisor, prep.cpus, prep.memoryMB, prep.kernelLoader, opts...)
 	if err != nil {
 		termView.Close()
@@ -1480,6 +1512,7 @@ func (app *Application) finalizeBoot(prep *bootPrep) (retErr error) {
 		WorkDir:       prep.workDir,
 		EnableNetwork: true,
 		Exec:          prep.exec,
+		QEMUEmulation: prep.qemuConfig,
 	})
 	if err != nil {
 		vm.Close()
@@ -1798,6 +1831,27 @@ func prepareFromImage(img *oci.Image, hvArch hv.CpuArchitecture, preOpenedHV hv.
 		prep.env = append(prep.env, "TERM=xterm-256color")
 	}
 	prep.workDir = workDir
+
+	// Check if we need QEMU emulation for cross-architecture images
+	if img.Config.Architecture != "" {
+		imageArch, err := parseArchitecture(img.Config.Architecture)
+		if err == nil && initx.NeedsQEMUEmulation(hvArch, imageArch) {
+			slog.Info("Cross-architecture image detected, enabling QEMU emulation",
+				"host", hvArch, "image", imageArch)
+
+			// Create a client to get the cache directory for QEMU binary download
+			client, err := oci.NewClient("")
+			if err != nil {
+				return nil, fmt.Errorf("create OCI client for QEMU download: %w", err)
+			}
+
+			qemuCfg, err := initx.PrepareQEMUEmulation(hvArch, imageArch, client.CacheDir())
+			if err != nil {
+				return nil, fmt.Errorf("prepare QEMU emulation: %w", err)
+			}
+			prep.qemuConfig = qemuCfg
+		}
+	}
 
 	// Create VirtioFS backend
 	fsBackend := vfs.NewVirtioFsBackendWithAbstract()

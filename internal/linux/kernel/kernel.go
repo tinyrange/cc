@@ -361,6 +361,17 @@ var GPUModuleMap = map[string]string{
 	"CONFIG_INPUT_EVDEV":    "kernel/drivers/input/evdev.ko.gz",
 }
 
+// BinfmtMiscModuleConfigs lists the kernel config options needed for binfmt_misc support
+// (used for QEMU user-mode emulation of cross-architecture binaries)
+var BinfmtMiscModuleConfigs = []string{
+	"CONFIG_BINFMT_MISC",
+}
+
+// BinfmtMiscModuleMap maps kernel config options to module file paths
+var BinfmtMiscModuleMap = map[string]string{
+	"CONFIG_BINFMT_MISC": "kernel/fs/binfmt_misc.ko.gz",
+}
+
 var defaultCachePath = ""
 
 func GetDefaultCachePath() (string, error) {
