@@ -64,6 +64,21 @@ func (p *AlpinePackage) Size(filename string) (int64, error) {
 	return ent.Size, nil
 }
 
+// IsRegularFile returns true if the file exists and is a regular file (not a directory or symlink).
+func (p *AlpinePackage) IsRegularFile(filename string) bool {
+	ent, ok := p.files[filename]
+	if !ok {
+		return false
+	}
+	return ent.Kind == archive.EntryKindRegular
+}
+
+// GetEntry returns the archive entry for a file, if it exists.
+func (p *AlpinePackage) GetEntry(filename string) (archive.Entry, bool) {
+	ent, ok := p.files[filename]
+	return ent, ok
+}
+
 var ErrPackageExpired = errors.New("package has expired")
 
 // OpenLocalPackage opens an already-downloaded Alpine package from disk.

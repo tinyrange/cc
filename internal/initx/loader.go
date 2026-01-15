@@ -20,6 +20,7 @@ import (
 	"github.com/tinyrange/cc/internal/linux/defs"
 	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 	"github.com/tinyrange/cc/internal/linux/kernel"
+	"github.com/tinyrange/cc/internal/vfs"
 )
 
 const (
@@ -1159,4 +1160,34 @@ func (vm *VirtualMachine) Spawn(ctx context.Context, path string, args ...string
 	}
 
 	return vm.Run(ctx, prog)
+}
+
+// AddKernelModulesToVFS adds kernel module files to the VFS backend for modprobe support.
+// This function should be called after creating the VFS backend and loading the kernel,
+// before creating the VirtualMachine.
+func AddKernelModulesToVFS(fsBackend vfs.VirtioFsBackend, kernelLoader kernel.Kernel) error {
+	kernelVersion, err := kernelLoader.GetKernelVersion()
+	if err != nil {
+		return fmt.Errorf("get kernel version: %w", err)
+	}
+	moduleFiles, err := kernelLoader.GetModulesDirectory()
+	if err != nil {
+		return fmt.Errorf("get kernel modules: %w", err)
+	}
+
+	// Convert kernel.ModuleFile to vfs.ModuleFile
+	vfsModuleFiles := make([]vfs.ModuleFile, len(moduleFiles))
+	for i, mf := range moduleFiles {
+		vfsModuleFiles[i] = vfs.ModuleFile{
+			Path: mf.Path,
+			Data: mf.Data,
+			Mode: mf.Mode,
+		}
+	}
+
+	if err := fsBackend.AddKernelModules(kernelVersion, vfsModuleFiles); err != nil {
+		return fmt.Errorf("add kernel modules: %w", err)
+	}
+
+	return nil
 }

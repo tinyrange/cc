@@ -1,6 +1,7 @@
 package kernel
 
 import (
+	"bytes"
 	"compress/gzip"
 	"fmt"
 	"io"
@@ -43,6 +44,15 @@ type Module struct {
 	Data []byte
 }
 
+// ModuleFile represents a file from the kernel modules directory.
+// Used for exposing modules via virtiofs for modprobe support.
+type ModuleFile struct {
+	Path string      // relative path within lib/modules/<version>/
+	Data []byte      // file content (raw, not decompressed)
+	Mode os.FileMode // file mode
+	Size int64       // file size
+}
+
 type Kernel interface {
 	Open() (File, error)
 	Size() (int64, error)
@@ -59,6 +69,15 @@ type Kernel interface {
 		configVars []string,
 		moduleMap map[string]string,
 	) ([]Module, error)
+
+	// GetKernelVersion returns the kernel version string (e.g., "6.6.63-0-virt").
+	// This is needed to construct the correct /lib/modules/<version>/ path.
+	GetKernelVersion() (string, error)
+
+	// GetModulesDirectory returns all files in the lib/modules/<version>/ directory.
+	// Files are returned with their relative paths and raw content (compressed files
+	// remain compressed). This is used to expose modules via virtiofs for modprobe.
+	GetModulesDirectory() ([]ModuleFile, error)
 }
 
 type alpineKernel struct {
@@ -340,6 +359,135 @@ func (k *alpineKernel) PlanModuleLoad(configs []string, moduleMap map[string]str
 	}
 
 	return ret, nil
+}
+
+// GetKernelVersion implements Kernel.
+func (k *alpineKernel) GetKernelVersion() (string, error) {
+	// Find the modules.dep file to get the version directory
+	depends, err := k.findFileWithSuffix("modules.dep")
+	if err != nil {
+		return "", fmt.Errorf("find modules.dep: %w", err)
+	}
+
+	// Path is like: lib/modules/6.6.63-0-virt/modules.dep
+	// Extract the version from the path
+	parts := strings.Split(depends, "/")
+	if len(parts) < 3 {
+		return "", fmt.Errorf("unexpected modules.dep path: %s", depends)
+	}
+	// parts should be: ["lib", "modules", "6.6.63-0-virt", "modules.dep"]
+	version := parts[len(parts)-2]
+	return version, nil
+}
+
+// isModuleMetadataFile returns true if the filename is a module metadata file
+// that may contain references to .ko.gz paths that need rewriting.
+func isModuleMetadataFile(name string) bool {
+	// Text-based metadata files that reference module paths
+	switch name {
+	case "modules.dep", "modules.alias", "modules.symbols",
+		"modules.softdep", "modules.devname", "modules.order",
+		"modules.builtin", "modules.builtin.modinfo":
+		return true
+	}
+	return false
+}
+
+// GetModulesDirectory implements Kernel.
+func (k *alpineKernel) GetModulesDirectory() ([]ModuleFile, error) {
+	// Ensure modulePrefix is loaded
+	if k.modulePrefix == "" {
+		if k.dependsList == nil {
+			k.dependsList = make(map[string][]string)
+		}
+		if err := k.loadModuleDepends(); err != nil {
+			return nil, fmt.Errorf("load module depends: %w", err)
+		}
+	}
+
+	// modulePrefix is like "lib/modules/6.6.63-0-virt/"
+	// List all files under this prefix
+	var files []ModuleFile
+
+	for _, filename := range k.pkg.ListFiles() {
+		if !strings.HasPrefix(filename, k.modulePrefix) {
+			continue
+		}
+
+		// Skip non-regular files (directories, symlinks, etc.)
+		if !k.pkg.IsRegularFile(filename) {
+			continue
+		}
+
+		// Skip binary index files (.bin) - we generate these ourselves
+		if strings.HasSuffix(filename, ".bin") {
+			continue
+		}
+
+		// Get relative path within the modules directory
+		relPath := strings.TrimPrefix(filename, k.modulePrefix)
+		if relPath == "" {
+			continue
+		}
+
+		// Get file size
+		size, err := k.pkg.Size(filename)
+		if err != nil {
+			return nil, fmt.Errorf("get size of %s: %w", filename, err)
+		}
+
+		// Read file content
+		f, err := k.pkg.Open(filename)
+		if err != nil {
+			return nil, fmt.Errorf("open %s: %w", filename, err)
+		}
+
+		data, err := io.ReadAll(f)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", filename, err)
+		}
+
+		// Decompress gzip-compressed modules for compatibility with distros
+		// that don't support compressed modules (e.g., Ubuntu)
+		if strings.HasSuffix(relPath, ".ko.gz") {
+			gzReader, err := gzip.NewReader(bytes.NewReader(data))
+			if err != nil {
+				return nil, fmt.Errorf("create gzip reader for %s: %w", filename, err)
+			}
+			decompressed, err := io.ReadAll(gzReader)
+			gzReader.Close()
+			if err != nil {
+				return nil, fmt.Errorf("decompress %s: %w", filename, err)
+			}
+			data = decompressed
+			relPath = strings.TrimSuffix(relPath, ".gz")
+			size = int64(len(decompressed))
+		}
+
+		// Rewrite module metadata files (modules.dep, modules.alias, etc.) to
+		// reference .ko instead of .ko.gz for compatibility with Ubuntu's modprobe
+		baseName := filepath.Base(relPath)
+		if isModuleMetadataFile(baseName) {
+			data = bytes.ReplaceAll(data, []byte(".ko.gz"), []byte(".ko"))
+			size = int64(len(data))
+		}
+
+		// Determine file mode (regular file with read permissions)
+		mode := os.FileMode(0644)
+
+		files = append(files, ModuleFile{
+			Path: relPath,
+			Data: data,
+			Mode: mode,
+			Size: size,
+		})
+	}
+
+	// Generate binary index files (.bin) for modprobe
+	binFiles := generateBinaryIndexes(files)
+	files = append(files, binFiles...)
+
+	return files, nil
 }
 
 // GPUModuleConfigs lists the kernel config options needed for GPU support
