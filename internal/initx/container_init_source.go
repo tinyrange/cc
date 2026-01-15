@@ -110,6 +110,12 @@ func main() int64 {
 
 	runtime.LogKmsg("cc: mounted devpts\n")
 
+	// === Phase 6.5: QEMU Emulation Setup (conditional) ===
+	if runtime.Ifdef("qemu_emulation") {
+		setupQEMUEmulation()
+		runtime.LogKmsg("cc: configured QEMU user emulation\n")
+	}
+
 	// === Phase 7: System configuration ===
 	// These helper functions are placeholders - their bodies are replaced at IR level
 
@@ -278,9 +284,10 @@ func changeWorkDir() int64 {
 	runtime.Syscall(runtime.SYS_CHDIR, ptr)
 	return 0
 }
-func execCommand() int64   { return 0 }
-func forkExecWait() int64  { return 0 }
-func dropPrivileges() int64 { return 0 }
+func execCommand() int64      { return 0 }
+func forkExecWait() int64     { return 0 }
+func dropPrivileges() int64   { return 0 }
+func setupQEMUEmulation() int64 { return 0 }
 
 // reboot issues a reboot syscall with the architecture-appropriate command.
 // On x86_64, it uses RESTART; on ARM64, it uses POWER_OFF.

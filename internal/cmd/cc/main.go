@@ -147,6 +147,7 @@ func run() error {
 	var snapshotCacheFlag boolFlag
 	snapshotCacheFlag.v = false // Disable by default
 	flag.Var(&snapshotCacheFlag, "snapshot-cache", "Enable boot snapshot caching (default: false)")
+	archFlag := flag.String("arch", "", "Target architecture (amd64, arm64). If different from host, enables QEMU emulation")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <image> [command] [args...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Run a command inside an OCI container image in a virtual machine.\n\n")
@@ -259,10 +260,19 @@ func run() error {
 		cmd = args[1:]
 	}
 
-	// Determine target architecture
+	// Determine host architecture (for hypervisor)
 	hvArch, err := parseArchitecture(runtime.GOARCH)
 	if err != nil {
 		return err
+	}
+
+	// Determine target architecture for image
+	imageArch := hvArch
+	if *archFlag != "" {
+		imageArch, err = parseArchitecture(*archFlag)
+		if err != nil {
+			return fmt.Errorf("invalid -arch value: %w", err)
+		}
 	}
 
 	// Create OCI client
@@ -303,8 +313,8 @@ func run() error {
 		return nil
 	}
 
-	slog.Debug("Loading image", "ref", imageRef, "arch", hvArch)
-	debug.Writef("cc.run load image", "loading image %s for architecture %s", imageRef, hvArch)
+	slog.Debug("Loading image", "ref", imageRef, "arch", imageArch)
+	debug.Writef("cc.run load image", "loading image %s for architecture %s", imageRef, imageArch)
 
 	var meta bundle.Metadata
 	var img *oci.Image
@@ -337,15 +347,24 @@ func run() error {
 		}
 		img = loaded
 	default:
-		loaded, err := client.PullForArch(imageRef, hvArch)
+		loaded, err := client.PullForArch(imageRef, imageArch)
 		if err != nil {
 			return fmt.Errorf("pull image: %w", err)
 		}
 		img = loaded
 	}
 
-	slog.Debug("Image pulled", "layers", len(img.Layers))
-	debug.Writef("cc.run image pulled", "image pulled with %d layers", len(img.Layers))
+	slog.Debug("Image pulled", "layers", len(img.Layers), "arch", img.Config.Architecture)
+	debug.Writef("cc.run image pulled", "image pulled with %d layers, arch=%s", len(img.Layers), img.Config.Architecture)
+
+	// Update imageArch based on actual pulled image architecture (may differ from requested)
+	if img.Config.Architecture != "" {
+		actualArch, err := parseArchitecture(img.Config.Architecture)
+		if err == nil && actualArch != imageArch {
+			slog.Info("Image architecture differs from requested", "requested", imageArch, "actual", actualArch)
+			imageArch = actualArch
+		}
+	}
 
 	// Determine command to run
 	var execCmd []string
@@ -509,6 +528,13 @@ func run() error {
 		opts = append(opts, initx.WithGPUEnabled(true))
 	}
 
+	// Check if we need QEMU emulation for cross-architecture support
+	// We need to detect this before creating the VM so binfmt_misc module is loaded
+	needsQEMU := initx.NeedsQEMUEmulation(hvArch, imageArch)
+	if needsQEMU {
+		opts = append(opts, initx.WithQEMUEmulationEnabled(true))
+	}
+
 	vm, err := initx.NewVirtualMachine(
 		h,
 		cpusFlag.v,
@@ -527,6 +553,20 @@ func run() error {
 		env = append(env, "TERM=xterm-256color")
 	}
 
+	// Prepare QEMU emulation config if needed (detection was done above before VM creation)
+	var qemuConfig *initx.QEMUEmulationConfig
+	if needsQEMU {
+		slog.Info("Cross-architecture image detected, enabling QEMU emulation",
+			"host", hvArch, "image", imageArch)
+		debug.Writef("cc.run qemu", "enabling QEMU emulation for %s on %s host", imageArch, hvArch)
+
+		cfg, err := initx.PrepareQEMUEmulation(hvArch, imageArch, client.CacheDir())
+		if err != nil {
+			return fmt.Errorf("prepare QEMU emulation: %w", err)
+		}
+		qemuConfig = cfg
+	}
+
 	// Build and run the container init program
 	prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
 		Arch:          hvArch,
@@ -537,6 +577,7 @@ func run() error {
 		Exec:          execFlag.v,
 		UID:           img.Config.UID,
 		GID:           img.Config.GID,
+		QEMUEmulation: qemuConfig,
 	})
 	if err != nil {
 		return err

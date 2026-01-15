@@ -1323,3 +1323,133 @@ func LogKmsg(msg string) ir.Block {
 		ir.DeclareLabel(done, ir.Block{}),
 	}
 }
+
+// QEMU/binfmt-misc Helpers
+
+// MountBinfmtMisc mounts the binfmt_misc filesystem at /proc/sys/fs/binfmt_misc.
+func MountBinfmtMisc(errLabel ir.Label, errVar ir.Var) ir.Fragment {
+	return ir.Block{
+		ir.Assign(errVar, ir.Syscall(
+			defs.SYS_MOUNT,
+			"binfmt_misc",
+			"/proc/sys/fs/binfmt_misc",
+			"binfmt_misc",
+			ir.Int64(0),
+			"",
+		)),
+		ir.If(ir.IsNegative(errVar), ir.Block{
+			ir.Printf("cc: failed to mount binfmt_misc: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+			ir.Goto(errLabel),
+		}),
+	}
+}
+
+// WriteBinaryFile writes binary data to a file in the guest filesystem.
+// This is used to install QEMU static binaries.
+func WriteBinaryFile(path string, data []byte, mode int64, errLabel ir.Label, errVar ir.Var) ir.Fragment {
+	fd := nextHelperVar("binfile_fd")
+	dataPtr := nextHelperVar("binfile_data_ptr")
+	dataLen := nextHelperVar("binfile_data_len")
+	written := nextHelperVar("binfile_written")
+	remaining := nextHelperVar("binfile_remaining")
+	writePtr := nextHelperVar("binfile_write_ptr")
+	writeLoop := nextHelperLabel("binfile_write_loop")
+	writeDone := nextHelperLabel("binfile_write_done")
+
+	return ir.Block{
+		// Load the binary data
+		ir.LoadConstantBytesConfig(ir.ConstantBytesConfig{
+			Target:  nextExecVar(),
+			Data:    data,
+			Pointer: dataPtr,
+			Length:  dataLen,
+		}),
+
+		// Open the file for writing
+		ir.Assign(fd, ir.Syscall(
+			defs.SYS_OPENAT,
+			ir.Int64(linux.AT_FDCWD),
+			path,
+			ir.Int64(linux.O_WRONLY|linux.O_CREAT|linux.O_TRUNC),
+			ir.Int64(mode),
+		)),
+		ir.Assign(errVar, fd),
+		ir.If(ir.IsNegative(errVar), ir.Block{
+			ir.Printf("cc: failed to open file for writing: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+			ir.Goto(errLabel),
+		}),
+
+		// Write the data in a loop (in case write() returns short)
+		ir.Assign(writePtr, dataPtr),
+		ir.Assign(remaining, dataLen),
+		ir.Goto(writeLoop),
+
+		ir.DeclareLabel(writeLoop, ir.Block{
+			ir.If(ir.IsZero(remaining), ir.Goto(writeDone)),
+			ir.Assign(written, ir.Syscall(
+				defs.SYS_WRITE,
+				fd,
+				writePtr,
+				remaining,
+			)),
+			ir.If(ir.IsNegative(written), ir.Block{
+				ir.Assign(errVar, written),
+				ir.Printf("cc: failed to write file: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+				ir.Syscall(defs.SYS_CLOSE, fd),
+				ir.Goto(errLabel),
+			}),
+			ir.Assign(writePtr, ir.Op(ir.OpAdd, writePtr, written)),
+			ir.Assign(remaining, ir.Op(ir.OpSub, remaining, written)),
+			ir.Goto(writeLoop),
+		}),
+
+		ir.DeclareLabel(writeDone, ir.Block{
+			ir.Syscall(defs.SYS_CLOSE, fd),
+		}),
+	}
+}
+
+// RegisterBinfmt writes a binfmt-misc registration string to /proc/sys/fs/binfmt_misc/register.
+func RegisterBinfmt(registrationString string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
+	fd := nextHelperVar("binfmt_fd")
+	regPtr := nextHelperVar("binfmt_reg_ptr")
+	regLen := nextHelperVar("binfmt_reg_len")
+
+	return ir.Block{
+		// Load the registration string
+		ir.LoadConstantBytesConfig(ir.ConstantBytesConfig{
+			Target:  nextExecVar(),
+			Data:    []byte(registrationString),
+			Pointer: regPtr,
+			Length:  regLen,
+		}),
+
+		// Open /proc/sys/fs/binfmt_misc/register for writing
+		ir.Assign(fd, ir.Syscall(
+			defs.SYS_OPENAT,
+			ir.Int64(linux.AT_FDCWD),
+			"/proc/sys/fs/binfmt_misc/register",
+			ir.Int64(linux.O_WRONLY),
+			ir.Int64(0),
+		)),
+		ir.Assign(errVar, fd),
+		ir.If(ir.IsNegative(errVar), ir.Block{
+			ir.Printf("cc: failed to open binfmt_misc/register: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+			ir.Goto(errLabel),
+		}),
+
+		// Write the registration string
+		ir.Assign(errVar, ir.Syscall(
+			defs.SYS_WRITE,
+			fd,
+			regPtr,
+			regLen,
+		)),
+		ir.Syscall(defs.SYS_CLOSE, fd),
+
+		ir.If(ir.IsNegative(errVar), ir.Block{
+			ir.Printf("cc: failed to register binfmt: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+			ir.Goto(errLabel),
+		}),
+	}
+}

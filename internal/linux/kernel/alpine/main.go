@@ -260,6 +260,9 @@ func (d *AlpineDownloader) parseIndex(r io.Reader) (map[string]map[string]string
 	entries := make(map[string]map[string]string)
 
 	scan := bufio.NewScanner(r)
+	// Increase buffer size to handle long dependency lines in community repo
+	// Default is 64KB, some packages have very long dependency lists
+	scan.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB buffer
 
 	ent := make(map[string]string)
 

@@ -157,8 +157,8 @@ func (c *Client) PullForArch(imageRef string, arch hv.CpuArchitecture) (*Image, 
 		registry: registry,
 	}
 
-	// Create output directory for this image
-	imageHash := sanitizeForFilename(imageRef)
+	// Create output directory for this image (include architecture in cache key)
+	imageHash := sanitizeForFilename(imageRef + "-" + ociArch)
 	outputDir := filepath.Join(c.cacheDir, "images", imageHash)
 	if err := os.MkdirAll(outputDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create output directory: %w", err)
