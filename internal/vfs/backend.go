@@ -2804,9 +2804,16 @@ func (v *virtioFsBackend) resolveParent(filePath string) (*fsNode, string, error
 				remaining := parts[i+1:]
 				var newPath string
 				if strings.HasPrefix(target, "/") {
+					// Absolute symlink
 					newPath = target
 				} else {
-					newPath = target
+					// Relative symlink - resolve relative to parent directory
+					parentPath := strings.Join(parts[:i], "/")
+					if parentPath == "" {
+						newPath = target
+					} else {
+						newPath = parentPath + "/" + target
+					}
 				}
 				if len(remaining) > 0 {
 					newPath = newPath + "/" + strings.Join(remaining, "/")
@@ -2837,9 +2844,13 @@ func (v *virtioFsBackend) resolveParent(filePath string) (*fsNode, string, error
 								// Absolute symlink
 								newPath = target
 							} else {
-								// Relative symlink - resolve relative to current parent
-								// For root, this just means using the target as-is
-								newPath = target
+								// Relative symlink - resolve relative to parent directory
+								parentPath := strings.Join(parts[:i], "/")
+								if parentPath == "" {
+									newPath = target
+								} else {
+									newPath = parentPath + "/" + target
+								}
 							}
 							if len(remaining) > 0 {
 								newPath = newPath + "/" + strings.Join(remaining, "/")
