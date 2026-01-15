@@ -744,7 +744,7 @@ func (app *Application) Run() error {
 	defer func() {
 		if app.running != nil {
 			slog.Info("stopping VM on shutdown")
-			app.stopVM()
+			app.stopVM(false)
 		}
 	}()
 
@@ -1191,7 +1191,7 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 		if justPressed && confirmRect.contains(mx, my) {
 			slog.Info("shutdown confirmed; stopping VM")
 			app.showExitConfirm = false
-			app.stopVM()
+			app.stopVM(false)
 			return nil
 		}
 		if justPressed && cancelRect.contains(mx, my) {
@@ -1205,12 +1205,12 @@ func (app *Application) renderTerminal(f graphics.Frame) error {
 	case err := <-app.running.session.Done:
 		if err != nil && err != io.EOF {
 			slog.Error("VM exited with error", "error", err)
-			app.stopVM()
+			app.stopVM(true)
 			app.showError(fmt.Errorf("VM exited with error: %w", err))
 			return nil
 		}
 		slog.Info("VM session ended; cleaning up")
-		app.stopVM()
+		app.stopVM(true)
 		return nil
 	default:
 	}
@@ -1441,7 +1441,7 @@ func (app *Application) finalizeBoot(prep *bootPrep) (retErr error) {
 	defer func() {
 		if retErr != nil {
 			if app.running != nil {
-				app.stopVM()
+				app.stopVM(false)
 			} else {
 				if prep.netBackend != nil {
 					prep.netBackend.Close()
@@ -1533,15 +1533,19 @@ func (app *Application) finalizeBoot(prep *bootPrep) (retErr error) {
 	return nil
 }
 
-func (app *Application) stopVM() {
+// stopVM stops the running VM and cleans up resources.
+// If sessionAlreadyDone is true, the session has already completed (e.g., from
+// receiving on session.Done) and we skip calling session.Stop() to avoid
+// trying to read from the Done channel twice.
+func (app *Application) stopVM(sessionAlreadyDone bool) {
 	if app.running == nil {
 		app.mode = modeLauncher
 		return
 	}
 
-	slog.Info("stopping VM")
-	// Wait briefly for VM to exit
-	if app.running.session != nil {
+	slog.Info("stopping VM", "session_already_done", sessionAlreadyDone)
+	// Wait briefly for VM to exit (only if session hasn't already completed)
+	if app.running.session != nil && !sessionAlreadyDone {
 		if err := app.running.session.Stop(2 * time.Second); err != nil {
 			slog.Warn("session stop returned error", "error", err)
 		}
@@ -1734,7 +1738,7 @@ func installImageAsBundle(img *oci.Image, bundlePath, name, source string) error
 		Description: fmt.Sprintf("Installed from %s", filepath.Base(source)),
 		Boot: bundle.BootConfig{
 			ImageDir: "image",
-			Exec:     true,
+			Exec:     false,
 		},
 	}
 
@@ -1885,7 +1889,7 @@ func prepareFromImage(img *oci.Image, hvArch hv.CpuArchitecture, preOpenedHV hv.
 	prep.cpus = 1
 	prep.memoryMB = 1024
 	prep.dmesg = false
-	prep.exec = true
+	prep.exec = false
 	slog.Info("vm config", "cpus", prep.cpus, "memory_mb", prep.memoryMB)
 
 	// Always create netstack and attach network device with internet enabled.
