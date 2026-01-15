@@ -21,6 +21,18 @@ import (
 type File interface {
 	io.Reader
 	io.ReaderAt
+	io.Closer
+}
+
+// packageFile wraps an archive handle to implement File with a no-op Close.
+// Individual files don't need closing because they are section readers into
+// the package's underlying file, which is closed via AlpinePackage.Close().
+type packageFile struct {
+	archive.Handle
+}
+
+func (f packageFile) Close() error {
+	return nil // No-op: underlying package file handles cleanup
 }
 
 type AlpinePackage struct {
@@ -44,7 +56,7 @@ func (p *AlpinePackage) Open(filename string) (File, error) {
 		return nil, fmt.Errorf("open file %q in package: %v", filename, err)
 	}
 
-	return r, nil
+	return packageFile{r}, nil
 }
 
 func (p *AlpinePackage) ListFiles() []string {
@@ -62,6 +74,21 @@ func (p *AlpinePackage) Size(filename string) (int64, error) {
 	}
 
 	return ent.Size, nil
+}
+
+// IsRegularFile returns true if the file exists and is a regular file (not a directory or symlink).
+func (p *AlpinePackage) IsRegularFile(filename string) bool {
+	ent, ok := p.files[filename]
+	if !ok {
+		return false
+	}
+	return ent.Kind == archive.EntryKindRegular
+}
+
+// GetEntry returns the archive entry for a file, if it exists.
+func (p *AlpinePackage) GetEntry(filename string) (archive.Entry, bool) {
+	ent, ok := p.files[filename]
+	return ent, ok
 }
 
 var ErrPackageExpired = errors.New("package has expired")

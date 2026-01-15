@@ -431,6 +431,12 @@ func run() error {
 
 	debug.Writef("cc.run kernel loaded", "kernel loaded for architecture %s", hvArch)
 
+	// Add kernel modules to VFS for modprobe support
+	if err := initx.AddKernelModulesToVFS(fsBackend, kernelLoader); err != nil {
+		return fmt.Errorf("add kernel modules: %w", err)
+	}
+	debug.Writef("cc.run modules added", "added kernel modules to VFS")
+
 	// Create VM with VirtioFS
 	opts := []initx.Option{
 		initx.WithDeviceTemplate(virtio.FSTemplate{

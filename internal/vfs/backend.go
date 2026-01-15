@@ -2632,6 +2632,8 @@ type VirtioFsBackend interface {
 	AddAbstractFile(filePath string, file AbstractFile) error
 	AddAbstractDir(dirPath string, dir AbstractDir) error
 	SetAbstractRoot(dir AbstractDir) error
+	// AddKernelModules adds kernel module files at /lib/modules/<version>/.
+	AddKernelModules(version string, files []ModuleFile) error
 }
 
 // AddAbstractFile adds an abstract file at the specified path.
@@ -2774,7 +2776,8 @@ func (v *virtioFsBackend) SetAbstractRoot(dir AbstractDir) error {
 }
 
 // resolveParent walks the path and returns the parent directory and the final name.
-// Creates intermediate directories as needed.
+// Creates intermediate directories as needed. If the parent has an abstractDir,
+// it will materialize existing directories from it rather than creating new empty ones.
 func (v *virtioFsBackend) resolveParent(filePath string) (*fsNode, string, error) {
 	parts := strings.Split(filePath, "/")
 	if len(parts) == 0 {
@@ -2795,17 +2798,80 @@ func (v *virtioFsBackend) resolveParent(filePath string) (*fsNode, string, error
 		childID, exists := parent.entries[partName]
 		if exists {
 			child := v.nodes[childID]
+			if child.symlinkTarget != "" {
+				// Follow the already-materialized symlink
+				target := child.symlinkTarget
+				remaining := parts[i+1:]
+				var newPath string
+				if strings.HasPrefix(target, "/") {
+					// Absolute symlink
+					newPath = target
+				} else {
+					// Relative symlink - resolve relative to parent directory
+					parentPath := strings.Join(parts[:i], "/")
+					if parentPath == "" {
+						newPath = target
+					} else {
+						newPath = parentPath + "/" + target
+					}
+				}
+				if len(remaining) > 0 {
+					newPath = newPath + "/" + strings.Join(remaining, "/")
+				}
+				return v.resolveParent(newPath)
+			}
 			if !child.isDir() {
 				return nil, "", errors.New("path component is not a directory: " + partName)
 			}
 			parent = child
 		} else {
-			// Create intermediate directory
-			id := v.nextID
-			v.nextID++
-			child := newDirNode(id, partName, parent.id, 0o755)
-			parent.entries[partName] = id
-			v.nodes[id] = child
+			// Before creating a new directory, check if parent has an abstractDir
+			// that already contains this entry - if so, materialize it to avoid shadowing.
+			var child *fsNode
+			if parent.abstractDir != nil {
+				if entry, err := parent.abstractDir.Lookup(partName); err == nil {
+					// Materialize whatever exists (dir, symlink, or file)
+					materializedNode, errno := v.createAbstractNode(parent, partName, entry)
+					if errno == 0 && materializedNode != nil {
+						// For symlinks, we need to follow them to continue path resolution
+						if materializedNode.symlinkTarget != "" {
+							// Follow the symlink
+							target := materializedNode.symlinkTarget
+							// Build the new path: symlink target + remaining path components
+							remaining := parts[i+1:]
+							var newPath string
+							if strings.HasPrefix(target, "/") {
+								// Absolute symlink
+								newPath = target
+							} else {
+								// Relative symlink - resolve relative to parent directory
+								parentPath := strings.Join(parts[:i], "/")
+								if parentPath == "" {
+									newPath = target
+								} else {
+									newPath = parentPath + "/" + target
+								}
+							}
+							if len(remaining) > 0 {
+								newPath = newPath + "/" + strings.Join(remaining, "/")
+							}
+							return v.resolveParent(newPath)
+						} else if materializedNode.isDir() {
+							child = materializedNode
+						}
+						// If it's a file, child remains nil and we'll create a dir (error case)
+					}
+				}
+			}
+
+			if child == nil {
+				// Create intermediate directory
+				id := v.nextID
+				v.nextID++
+				child = newDirNode(id, partName, parent.id, 0o755)
+				parent.entries[partName] = id
+				v.nodes[id] = child
+			}
 			parent = child
 		}
 	}
@@ -2821,4 +2887,75 @@ func (v *virtioFsBackend) resolveParent(filePath string) (*fsNode, string, error
 // NewVirtioFsBackendWithAbstract returns a VirtioFsBackend that supports adding abstract files/dirs.
 func NewVirtioFsBackendWithAbstract() VirtioFsBackend {
 	return &virtioFsBackend{}
+}
+
+// BytesFile implements AbstractFile for read-only in-memory file content.
+// This is useful for exposing static content like kernel modules.
+type BytesFile struct {
+	data    []byte
+	mode    fs.FileMode
+	modTime time.Time
+}
+
+// NewBytesFile creates a new BytesFile with the given content and mode.
+func NewBytesFile(data []byte, mode fs.FileMode) *BytesFile {
+	return &BytesFile{
+		data:    data,
+		mode:    mode,
+		modTime: time.Now(),
+	}
+}
+
+func (f *BytesFile) Stat() (uint64, fs.FileMode) {
+	return uint64(len(f.data)), f.mode
+}
+
+func (f *BytesFile) ModTime() time.Time {
+	return f.modTime
+}
+
+func (f *BytesFile) ReadAt(off uint64, size uint32) ([]byte, error) {
+	if off >= uint64(len(f.data)) {
+		return nil, nil
+	}
+	end := off + uint64(size)
+	if end > uint64(len(f.data)) {
+		end = uint64(len(f.data))
+	}
+	return f.data[off:end], nil
+}
+
+func (f *BytesFile) WriteAt(off uint64, data []byte) error {
+	return errors.New("read-only file")
+}
+
+func (f *BytesFile) Truncate(size uint64) error {
+	return errors.New("read-only file")
+}
+
+var _ AbstractFile = (*BytesFile)(nil)
+
+// ModuleFile represents a kernel module file to be added to the VFS.
+type ModuleFile struct {
+	Path string      // relative path within lib/modules/<version>/
+	Data []byte      // file content
+	Mode fs.FileMode // file mode
+}
+
+// AddKernelModules adds kernel module files to the VFS at /lib/modules/<version>/.
+// This enables modprobe support by exposing the kernel modules directory.
+func (v *virtioFsBackend) AddKernelModules(version string, files []ModuleFile) error {
+	basePath := "lib/modules/" + version
+
+	for _, f := range files {
+		filePath := basePath + "/" + f.Path
+		mode := f.Mode
+		if mode == 0 {
+			mode = 0644
+		}
+		if err := v.AddAbstractFile(filePath, NewBytesFile(f.Data, mode)); err != nil {
+			return err
+		}
+	}
+	return nil
 }

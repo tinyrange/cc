@@ -1397,6 +1397,12 @@ func prepareBootBundle(b discoveredBundle, hvArch hv.CpuArchitecture, preOpenedH
 	slog.Info("kernel loader ready")
 	prep.kernelLoader = kernelLoader
 
+	// Add kernel modules to VFS for modprobe support
+	if err := initx.AddKernelModulesToVFS(fsBackend, kernelLoader); err != nil {
+		return nil, fmt.Errorf("add kernel modules: %w", err)
+	}
+	slog.Info("kernel modules added to VFS")
+
 	// VM options
 	prep.cpus = b.Meta.Boot.CPUs
 	if prep.cpus == 0 {
@@ -1884,6 +1890,12 @@ func prepareFromImage(img *oci.Image, hvArch hv.CpuArchitecture, preOpenedHV hv.
 	}
 	slog.Info("kernel loader ready")
 	prep.kernelLoader = kernelLoader
+
+	// Add kernel modules to VFS for modprobe support
+	if err := initx.AddKernelModulesToVFS(fsBackend, kernelLoader); err != nil {
+		return nil, fmt.Errorf("add kernel modules: %w", err)
+	}
+	slog.Info("kernel modules added to VFS")
 
 	// VM options - use defaults
 	prep.cpus = 1
