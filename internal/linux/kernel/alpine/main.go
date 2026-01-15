@@ -21,6 +21,18 @@ import (
 type File interface {
 	io.Reader
 	io.ReaderAt
+	io.Closer
+}
+
+// packageFile wraps an archive handle to implement File with a no-op Close.
+// Individual files don't need closing because they are section readers into
+// the package's underlying file, which is closed via AlpinePackage.Close().
+type packageFile struct {
+	archive.Handle
+}
+
+func (f packageFile) Close() error {
+	return nil // No-op: underlying package file handles cleanup
 }
 
 type AlpinePackage struct {
@@ -44,7 +56,7 @@ func (p *AlpinePackage) Open(filename string) (File, error) {
 		return nil, fmt.Errorf("open file %q in package: %v", filename, err)
 	}
 
-	return r, nil
+	return packageFile{r}, nil
 }
 
 func (p *AlpinePackage) ListFiles() []string {

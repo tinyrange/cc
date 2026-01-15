@@ -148,7 +148,7 @@ func (b *indexBuilder) serializeNode(buf *bytes.Buffer, node *indexNode) uint32 
 	var childOffsets [256]uint32
 	var firstChild, lastChild int = -1, -1
 
-	for i := 32; i < 128; i++ {
+	for i := 0; i < 256; i++ {
 		if node.children[i] != nil {
 			childOffsets[i] = b.serializeNode(buf, node.children[i])
 			if firstChild < 0 {

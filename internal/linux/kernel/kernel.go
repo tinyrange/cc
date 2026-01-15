@@ -443,6 +443,7 @@ func (k *alpineKernel) GetModulesDirectory() ([]ModuleFile, error) {
 		}
 
 		data, err := io.ReadAll(f)
+		f.Close()
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", filename, err)
 		}
