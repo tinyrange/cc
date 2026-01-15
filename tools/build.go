@@ -1149,6 +1149,7 @@ func main() {
 	benchTests := fs.Bool("bench-tests", false, "build and run the benchmark tests")
 	snapshotE2E := fs.Bool("snapshot-e2e", false, "build and run snapshot e2e benchmark")
 	release := fs.Bool("release", false, "build a release binary")
+	runSpecial := fs.String("runs", "", "run a given package")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
@@ -1846,6 +1847,26 @@ func main() {
 
 			fmt.Println("cross-platform release build completed!")
 		}
+		return
+	}
+
+	if *runSpecial != "" {
+		out, err := goBuild(buildOptions{
+			Package:          *runSpecial,
+			OutputName:       filepath.Base(*runSpecial),
+			Build:            buildTarget,
+			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build special: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("running %s %+v\n", out.Path, flag.Args())
+		if err := runBuildOutput(out, flag.Args(), runOpts); err != nil {
+			os.Exit(1)
+		}
+
 		return
 	}
 
