@@ -529,6 +529,7 @@ type FS struct {
 	irqLine uint32
 	arch    hv.CpuArchitecture
 
+	mu      sync.Mutex // protects concurrent vCPU access
 	bufPool sync.Pool
 	backend FsBackend
 
@@ -621,6 +622,9 @@ var (
 
 // ReadMMIO implements hv.MemoryMappedIODevice.
 func (v *FS) ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
 	ctx.SetExitTimeslice(tsFsRead)
 
 	dev, err := v.requireDevice()
@@ -632,6 +636,9 @@ func (v *FS) ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
 
 // WriteMMIO implements hv.MemoryMappedIODevice.
 func (v *FS) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
 	ctx.SetExitTimeslice(tsFsWrite)
 
 	dev, err := v.requireDevice()
@@ -654,6 +661,8 @@ func (v *FS) QueueMaxSize(int) uint16 { return fsQueueNumMax }
 func (v *FS) OnReset(device)          {}
 
 func (v *FS) OnQueueNotify(ctx hv.ExitContext, dev device, qidx int) error {
+	// Note: Locking is done at the ReadMMIO/WriteMMIO level to prevent deadlock,
+	// since OnQueueNotify is called as a callback from within writeMMIO.
 	if qidx < fsHiprioQueueIndex || qidx >= fsTotalQueueCount {
 		debug.Writef("virtio-fs.OnQueueNotify ignore", "qidx=%d (total=%d)", qidx, fsTotalQueueCount)
 		return nil

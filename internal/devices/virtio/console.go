@@ -514,3 +514,21 @@ func (vc *Console) SetSize(cols, rows uint16) {
 
 	_ = dev.raiseInterrupt(VIRTIO_MMIO_INT_CONFIG)
 }
+
+// Flush processes any pending data in the transmit queue.
+// This should be called after the vCPU run loop exits to ensure
+// all guest output has been captured.
+func (vc *Console) Flush() error {
+	dev := vc.Device()
+	if dev == nil {
+		slog.Info("virtio-console Flush: device is nil")
+		return nil
+	}
+	txQueue := dev.queue(queueTransmit)
+	if !QueueReady(txQueue) {
+		slog.Info("virtio-console Flush: queue not ready")
+		return nil
+	}
+	slog.Info("virtio-console Flush: processing transmit queue")
+	return vc.processTransmitQueue(dev, txQueue)
+}

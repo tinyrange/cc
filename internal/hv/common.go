@@ -330,6 +330,14 @@ type RunConfig interface {
 	Run(ctx context.Context, vcpu VirtualCPU) error
 }
 
+// PreRunConfig is an optional interface that RunConfig implementations can
+// implement to perform setup before secondary vCPUs are resumed. This is
+// critical for multi-CPU VMs where the program/payload must be loaded into
+// memory before secondary vCPUs are resumed, otherwise they may see stale data.
+type PreRunConfig interface {
+	PreRun() error
+}
+
 type Device interface {
 	Init(vm VirtualMachine) error
 }
@@ -466,6 +474,11 @@ type VirtualMachine interface {
 	MemoryBase() uint64
 
 	Run(ctx context.Context, cfg RunConfig) error
+
+	// RunAll runs all vCPUs concurrently. vCPU 0 uses the provided RunConfig,
+	// while secondary vCPUs wait in parked state for PSCI CPU_ON (on ARM64)
+	// or INIT/SIPI (on x86_64). For single-vCPU VMs, this is equivalent to Run.
+	RunAll(ctx context.Context, cfg RunConfig) error
 
 	SetIRQ(irqLine uint32, level bool) error
 

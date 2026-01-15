@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"runtime"
 	"time"
@@ -301,6 +302,18 @@ type programRunner struct {
 	program       *ir.Program
 	configureVcpu func(vcpu hv.VirtualCPU) error
 	onUserYield   func(context.Context, hv.VirtualCPU) error
+	flushConsole  func() error // Called after yield to flush pending output
+}
+
+// PreRun implements hv.PreRunConfig.
+// This is called before secondary vCPUs are resumed to ensure the program
+// is loaded into memory before any vCPU can see it.
+func (p *programRunner) PreRun() error {
+	if err := p.loader.LoadProgram(p.program); err != nil {
+		return fmt.Errorf("load program into loader: %w", err)
+	}
+	p.loader.runResultDetail = 0xdeadbeef
+	return nil
 }
 
 // Run implements hv.RunConfig.
@@ -311,10 +324,11 @@ func (p *programRunner) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 		}
 	}
 
+	// On first RunAll, program isn't loaded yet (no PreRun call), so load it here.
+	// On subsequent RunAll, PreRun has already been called, but LoadProgram is idempotent.
 	if err := p.loader.LoadProgram(p.program); err != nil {
 		return fmt.Errorf("load program into loader: %w", err)
 	}
-
 	p.loader.runResultDetail = 0xdeadbeef
 
 	for {
@@ -326,6 +340,10 @@ func (p *programRunner) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 				break
 			}
 			if errors.Is(err, hv.ErrYield) {
+				break
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				// Context cancelled (e.g., secondary vCPU yielded) - break and flush
 				break
 			}
 			if errors.Is(err, hv.ErrUserYield) {
@@ -341,6 +359,14 @@ func (p *programRunner) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 		}
 	}
 
+	// Flush pending console output after yield to ensure all guest output is captured
+	if p.flushConsole != nil {
+		slog.Info("programRunner: flushing console after yield")
+		if err := p.flushConsole(); err != nil {
+			slog.Info("console flush after yield", "err", err)
+		}
+	}
+
 	if code := p.loader.runResultDetail; code != 0 {
 		return &ExitError{Code: int(code)}
 	}
@@ -349,7 +375,8 @@ func (p *programRunner) Run(ctx context.Context, vcpu hv.VirtualCPU) error {
 }
 
 var (
-	_ hv.RunConfig = &programRunner{}
+	_ hv.RunConfig    = &programRunner{}
+	_ hv.PreRunConfig = &programRunner{}
 )
 
 type VirtualMachine struct {
@@ -407,6 +434,15 @@ func (vm *VirtualMachine) SetConsoleSize(cols, rows int) {
 		rows = 1
 	}
 	vm.consoleDevice.SetSize(uint16(cols), uint16(rows))
+}
+
+// FlushConsole processes any pending output in the virtio-console transmit queue.
+// This ensures all guest output is captured before the VM exits.
+func (vm *VirtualMachine) FlushConsole() error {
+	if vm == nil || vm.consoleDevice == nil {
+		return nil
+	}
+	return vm.consoleDevice.Flush()
 }
 
 // GPU returns the virtio-gpu device if GPU is enabled, nil otherwise.
@@ -511,12 +547,13 @@ func (vm *VirtualMachine) runProgram(
 		vm.firstRunComplete = true
 	}
 
-	return vm.vm.Run(ctx, &programRunner{
+	return vm.vm.RunAll(ctx, &programRunner{
 		configRegion:  vm.configRegion,
 		program:       prog,
 		loader:        vm.programLoader,
 		configureVcpu: configureVcpu,
 		onUserYield:   onUserYield,
+		flushConsole:  vm.FlushConsole,
 	})
 }
 

@@ -292,6 +292,12 @@ func (v *virtualMachine) Run(ctx context.Context, cfg hv.RunConfig) error {
 	return err
 }
 
+// RunAll implements hv.VirtualMachine.
+// TODO: KVM currently only supports 1 vCPU, so this delegates to Run.
+func (v *virtualMachine) RunAll(ctx context.Context, cfg hv.RunConfig) error {
+	return v.Run(ctx, cfg)
+}
+
 func (v *virtualMachine) ReadAt(p []byte, off int64) (n int, err error) {
 	v.memMu.RLock()
 	defer v.memMu.RUnlock()

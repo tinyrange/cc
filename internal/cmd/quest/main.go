@@ -1444,8 +1444,8 @@ func RunInitX(debug bool) error {
 	return nil
 }
 
-func RunExecutable(path string, gpuEnabled bool) error {
-	slog.Info("Starting Bringup Quest: Run Executable", "path", path, "gpu", gpuEnabled)
+func RunExecutable(path string, gpuEnabled bool, cpuCount int) error {
+	slog.Info("Starting Bringup Quest: Run Executable", "path", path, "gpu", gpuEnabled, "cpus", cpuCount)
 
 	if os.Getenv("CC_DEBUG_FILE") != "" {
 		if os.Getenv("CC_DEBUG_MEMORY") != "" {
@@ -1703,7 +1703,13 @@ func RunExecutable(path string, gpuEnabled bool) error {
 		vmOptions = append(vmOptions, initx.WithGPUEnabled(true))
 	}
 
-	vm, err := initx.NewVirtualMachine(hv, 1, 256, kernel, vmOptions...)
+	// Enable early serial console and dmesg logging for debugging (only when needed)
+	// vmOptions = append(vmOptions,
+	// 	initx.WithDebugLogging(true),
+	// 	initx.WithDmesgLogging(true),
+	// )
+
+	vm, err := initx.NewVirtualMachine(hv, cpuCount, 256, kernel, vmOptions...)
 	if err != nil {
 		return fmt.Errorf("create initx virtual machine: %w", err)
 	}
@@ -1806,6 +1812,7 @@ func main() {
 	exec := fs.String("exec", "", "Run the executable using initx")
 	gpuEnabled := fs.Bool("gpu", false, "Enable GPU support (virtio-gpu and virtio-input)")
 	debug := fs.Bool("debug", false, "Enable debug logging")
+	cpuCount := fs.Int("cpus", 1, "Number of vCPUs (1-16)")
 	hostArch, err := hostArchitecture()
 	if err != nil {
 		slog.Error("failed to determine host architecture", "error", err)
@@ -1843,7 +1850,7 @@ func main() {
 	}
 
 	if *exec != "" {
-		if err := RunExecutable(*exec, *gpuEnabled); err != nil {
+		if err := RunExecutable(*exec, *gpuEnabled, *cpuCount); err != nil {
 			slog.Error("failed to run executable", "error", err)
 			os.Exit(1)
 		}

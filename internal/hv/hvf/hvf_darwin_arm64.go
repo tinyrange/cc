@@ -5,6 +5,7 @@ package hvf
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"runtime"
@@ -155,6 +156,22 @@ func (ctx *exitContext) SetExitTimeslice(id timeslice.TimesliceID) {
 	ctx.kind = id
 }
 
+// vcpuState represents the power state of a vCPU for SMP support.
+type vcpuState int
+
+const (
+	vcpuStateParked  vcpuState = iota // Waiting for PSCI CPU_ON
+	vcpuStateRunning                  // Actively executing
+	vcpuStateOff                      // Powered off via PSCI CPU_OFF
+	vcpuStatePaused                   // Running but paused between RunAll calls
+)
+
+// vcpuWakeup contains the parameters for booting a secondary vCPU via PSCI CPU_ON.
+type vcpuWakeup struct {
+	entryPoint uint64 // Entry point address (from PSCI CPU_ON x2)
+	contextID  uint64 // Context ID passed to entry point (from PSCI CPU_ON x3)
+}
+
 type virtualCPU struct {
 	vm *virtualMachine
 
@@ -168,6 +185,11 @@ type virtualCPU struct {
 	runQueue chan func()
 
 	initError chan error
+
+	// SMP support: vCPU state tracking
+	state    vcpuState
+	stateMu  sync.Mutex
+	wakeupCh chan vcpuWakeup // Channel to receive CPU_ON wakeup signal
 }
 
 // implements [hv.VirtualCPU].
@@ -441,6 +463,12 @@ const (
 	psciSystemReset     psciFunctionID = 0x84000009
 	psciFeatures        psciFunctionID = 0x8400000A
 
+	// PSCI function IDs (SMC64 calling convention - bit 30 set)
+	psciCpuSuspend64   psciFunctionID = 0xC4000001
+	psciCpuOff64       psciFunctionID = 0xC4000002
+	psciCpuOn64        psciFunctionID = 0xC4000003
+	psciAffinityInfo64 psciFunctionID = 0xC4000004
+
 	// PSCI return values
 	psciSuccess           psciFunctionID = 0
 	psciNotSupported      psciFunctionID = 0xFFFFFFFF // -1 as uint32
@@ -536,12 +564,76 @@ func (v *virtualCPU) handleHvc(exitCtx *exitContext) error {
 
 		return nil
 	case psciFeatures:
-		// report not supported
-		if err := bindings.HvVcpuSetReg(v.id, bindings.HV_REG_X0, 0xffff_ffff); err != bindings.HV_SUCCESS {
-			return fmt.Errorf("hvf: failed to get x0: %w", err)
+		// Get the queried function ID from x1
+		var x1 uint64
+		if err := bindings.HvVcpuGetReg(v.id, bindings.HV_REG_X1, &x1); err != bindings.HV_SUCCESS {
+			return fmt.Errorf("hvf: failed to get x1 for FEATURES: %w", err)
 		}
 
+		// Report support for implemented PSCI functions (both 32-bit and 64-bit versions)
+		var result psciFunctionID
+		switch psciFunctionID(x1) {
+		case psciVersion, psciCpuOn, psciCpuOff, psciAffinityInfo, psciSystemOff, psciSystemReset, psciFeatures, psciMigrateInfoType,
+			psciCpuOn64, psciCpuOff64, psciAffinityInfo64:
+			result = psciSuccess
+		default:
+			result = psciNotSupported
+		}
+
+		if err := bindings.HvVcpuSetReg(v.id, bindings.HV_REG_X0, uint64(result)); err != bindings.HV_SUCCESS {
+			return fmt.Errorf("hvf: failed to set FEATURES return value: %w", err)
+		}
 		return nil
+
+	case psciCpuOn, psciCpuOn64:
+		// Get target CPU MPIDR from x1, entry point from x2, context ID from x3
+		var x1, x2, x3 uint64
+		if err := bindings.HvVcpuGetReg(v.id, bindings.HV_REG_X1, &x1); err != bindings.HV_SUCCESS {
+			return fmt.Errorf("hvf: failed to get x1 for CPU_ON: %w", err)
+		}
+		if err := bindings.HvVcpuGetReg(v.id, bindings.HV_REG_X2, &x2); err != bindings.HV_SUCCESS {
+			return fmt.Errorf("hvf: failed to get x2 for CPU_ON: %w", err)
+		}
+		if err := bindings.HvVcpuGetReg(v.id, bindings.HV_REG_X3, &x3); err != bindings.HV_SUCCESS {
+			return fmt.Errorf("hvf: failed to get x3 for CPU_ON: %w", err)
+		}
+
+		slog.Debug("hvf: PSCI CPU_ON", "caller", v.id, "targetMPIDR", x1, "entryPoint", fmt.Sprintf("0x%x", x2), "contextID", x3)
+
+		result := v.vm.handlePsciCpuOn(x1, x2, x3)
+
+		slog.Debug("hvf: PSCI CPU_ON result", "result", result)
+
+		if err := bindings.HvVcpuSetReg(v.id, bindings.HV_REG_X0, uint64(result)); err != bindings.HV_SUCCESS {
+			return fmt.Errorf("hvf: failed to set CPU_ON return value: %w", err)
+		}
+		return nil
+
+	case psciCpuOff, psciCpuOff64:
+		// Mark this vCPU as off and return success
+		v.stateMu.Lock()
+		v.state = vcpuStateOff
+		v.stateMu.Unlock()
+
+		if err := bindings.HvVcpuSetReg(v.id, bindings.HV_REG_X0, uint64(psciSuccess)); err != bindings.HV_SUCCESS {
+			return fmt.Errorf("hvf: failed to set CPU_OFF return value: %w", err)
+		}
+		// Signal that this vCPU should stop running
+		return hv.ErrVMHalted
+
+	case psciAffinityInfo, psciAffinityInfo64:
+		// Get target CPU MPIDR from x1, lowest affinity level from x2
+		var x1 uint64
+		if err := bindings.HvVcpuGetReg(v.id, bindings.HV_REG_X1, &x1); err != bindings.HV_SUCCESS {
+			return fmt.Errorf("hvf: failed to get x1 for AFFINITY_INFO: %w", err)
+		}
+
+		result := v.vm.handlePsciAffinityInfo(x1)
+		if err := bindings.HvVcpuSetReg(v.id, bindings.HV_REG_X0, uint64(result)); err != bindings.HV_SUCCESS {
+			return fmt.Errorf("hvf: failed to set AFFINITY_INFO return value: %w", err)
+		}
+		return nil
+
 	default:
 		return fmt.Errorf("hvf: HVC %s not implemented", fid)
 	}
@@ -876,6 +968,27 @@ type virtualMachine struct {
 	closed bool
 
 	gicInfo hv.Arm64GICInfo
+
+	// Secondary vCPU lifecycle management (persists across RunAll calls)
+	secondaryCtx     context.Context    // VM-lifetime context for secondary vCPUs
+	secondaryCancel  context.CancelFunc // Cancels secondaryCtx when VM closes
+	secondaryWg      sync.WaitGroup     // Tracks running secondary vCPU goroutines
+	secondaryStarted bool               // Whether secondary loops have been started
+	secondaryErrCh   chan error         // Collects errors from secondary vCPUs
+
+	// Resume signaling using channel close for broadcast
+	resumeCh  chan struct{}
+	resumeMu  sync.Mutex // Protects resumeCh replacement
+	resumeGen atomic.Int64
+
+	// Per-RunAll context (cancelled when RunAll ends, allows next RunAll to set new context)
+	runMu     sync.RWMutex
+	runCtx    context.Context
+	runCancel context.CancelFunc
+
+	// secondaryYielded is set to true when a secondary vCPU triggers VM yield.
+	// This is used to distinguish between intentional cancellation (success) and errors.
+	secondaryYielded atomic.Bool
 }
 
 // implements hv.VirtualMachine
@@ -1081,6 +1194,12 @@ func (v *virtualMachine) Close() error {
 
 	v.closed = true
 
+	// Cancel secondary vCPU context and wait for goroutines to exit
+	if v.secondaryCancel != nil {
+		v.secondaryCancel()
+		v.secondaryWg.Wait()
+	}
+
 	if v.memory != nil {
 		// unmap the memory from the VM
 		if err := bindings.HvVmUnmap(bindings.IPA(v.memoryBase), uintptr(len(v.memory))); err != bindings.HV_SUCCESS {
@@ -1213,6 +1332,7 @@ func (v *virtualMachine) WriteAt(p []byte, off int64) (n int, err error) {
 }
 
 // Run implements [hv.VirtualMachine].
+// Note: This only runs vCPU 0. For SMP support, use RunAll.
 func (v *virtualMachine) Run(ctx context.Context, cfg hv.RunConfig) error {
 	if cfg == nil {
 		return fmt.Errorf("hvf: RunConfig cannot be nil")
@@ -1221,6 +1341,380 @@ func (v *virtualMachine) Run(ctx context.Context, cfg hv.RunConfig) error {
 	return v.VirtualCPUCall(0, func(vcpu hv.VirtualCPU) error {
 		return cfg.Run(ctx, vcpu)
 	})
+}
+
+// RunAll runs all vCPUs concurrently. vCPU 0 uses the provided RunConfig,
+// while secondary vCPUs wait in parked state for PSCI CPU_ON.
+//
+// Secondary vCPUs persist across multiple RunAll calls - they are started once
+// and paused/resumed between calls. This allows Linux to boot secondary CPUs
+// in one RunAll and have them continue executing in subsequent RunAll calls.
+func (v *virtualMachine) RunAll(ctx context.Context, cfg hv.RunConfig) error {
+	if cfg == nil {
+		return fmt.Errorf("hvf: RunConfig cannot be nil")
+	}
+
+	// If only 1 vCPU, use the simpler Run path
+	if len(v.cpus) == 1 {
+		return v.Run(ctx, cfg)
+	}
+
+	// Reset state for this run
+	v.secondaryYielded.Store(false)
+
+	// Create per-RunAll context for coordinating secondary vCPUs
+	runCtx, runCancel := context.WithCancel(ctx)
+	v.runMu.Lock()
+	v.runCtx = runCtx
+	v.runCancel = runCancel
+	v.runMu.Unlock()
+	defer runCancel()
+
+	// Start secondary loops once (first RunAll) or resume paused secondaries
+	if !v.secondaryStarted {
+		// First RunAll: reset secondary vCPU states and start loops
+		for id, vcpu := range v.cpus {
+			if id == 0 {
+				continue
+			}
+			// Drain stale wakeups
+			select {
+			case <-vcpu.wakeupCh:
+				slog.Debug("hvf: RunAll drained stale wakeup", "vcpuID", id)
+			default:
+			}
+			vcpu.stateMu.Lock()
+			vcpu.state = vcpuStateParked
+			vcpu.stateMu.Unlock()
+		}
+		v.startSecondaryLoops()
+	} else {
+		// Subsequent RunAll: call PreRun before resuming secondaries.
+		// This ensures the program is loaded before secondaries see it.
+		if preRun, ok := cfg.(hv.PreRunConfig); ok {
+			if err := preRun.PreRun(); err != nil {
+				return fmt.Errorf("hvf: PreRun: %w", err)
+			}
+		}
+
+		// Resume paused secondaries by closing the channel.
+		// We close and immediately create a new channel atomically to ensure that:
+		// 1. Secondaries already waiting on the old channel wake up
+		// 2. Secondaries about to wait will get the new (blocking) channel
+		slog.Info("hvf: RunAll resuming paused secondaries", "numSecondaries", len(v.cpus)-1)
+		v.resumeMu.Lock()
+		close(v.resumeCh)
+		v.resumeCh = make(chan struct{})
+		v.resumeGen.Add(1)
+		v.resumeMu.Unlock()
+		slog.Info("hvf: RunAll resume complete")
+	}
+
+	// Run primary vCPU (vCPU 0) with the provided RunConfig
+	var primaryErr error
+	v.VirtualCPUCall(0, func(vcpu hv.VirtualCPU) error {
+		primaryErr = cfg.Run(runCtx, vcpu)
+		return nil
+	})
+
+	// Cancel runCtx to signal secondaries to pause (they stay running but paused)
+	runCancel()
+
+	// Create new resumeCh for next pause/resume cycle.
+	// This must happen AFTER runCancel() so secondaries transitioning to Paused
+	// will wait on the new (blocking) channel.
+	// We also close the old channel to wake up any secondaries that already
+	// grabbed a reference to it before the replacement.
+	v.resumeMu.Lock()
+	close(v.resumeCh)
+	v.resumeCh = make(chan struct{})
+	v.resumeGen.Add(1)
+	v.resumeMu.Unlock()
+
+	// Check for secondary errors (non-blocking)
+	select {
+	case err := <-v.secondaryErrCh:
+		if primaryErr == nil {
+			primaryErr = err
+		}
+	default:
+	}
+
+	// If a secondary CPU triggered the yield, the VM completed successfully
+	// even though the primary CPU got context.Canceled
+	if v.secondaryYielded.Load() && errors.Is(primaryErr, context.Canceled) {
+		return nil
+	}
+
+	return primaryErr
+}
+
+// startSecondaryLoops starts the persistent goroutines for secondary vCPUs.
+// These goroutines persist for the lifetime of the VM and handle pause/resume.
+func (v *virtualMachine) startSecondaryLoops() {
+	slog.Debug("hvf: starting secondary vCPU loops", "count", len(v.cpus)-1)
+
+	// Initialize resume channel
+	v.resumeCh = make(chan struct{})
+
+	for id, vcpu := range v.cpus {
+		if id == 0 {
+			continue
+		}
+		v.secondaryWg.Add(1)
+		go func(vcpu *virtualCPU, cpuID int) {
+			defer v.secondaryWg.Done()
+			if err := vcpu.runSecondaryLoop(); err != nil {
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					v.secondaryErrCh <- fmt.Errorf("hvf: secondary vCPU %d: %w", cpuID, err)
+				}
+			}
+			slog.Debug("hvf: secondary vCPU loop exited", "vcpuID", cpuID)
+		}(vcpu, id)
+	}
+	v.secondaryStarted = true
+}
+
+// runSecondaryLoop is the main loop for secondary vCPUs.
+// This loop persists for the lifetime of the VM - it pauses between RunAll calls
+// and resumes when the next RunAll starts, preserving guest CPU state.
+func (v *virtualCPU) runSecondaryLoop() error {
+	slog.Debug("hvf: runSecondaryLoop started", "vcpuID", v.id)
+
+	for {
+		v.stateMu.Lock()
+		state := v.state
+		v.stateMu.Unlock()
+
+		// If paused, wait for resume signal or VM shutdown
+		if state == vcpuStatePaused {
+			slog.Info("hvf: runSecondaryLoop waiting for resume", "vcpuID", v.id)
+
+			// Get current resumeCh under lock to avoid racing with channel replacement
+			v.vm.resumeMu.Lock()
+			resumeCh := v.vm.resumeCh
+			resumeGen := v.vm.resumeGen.Load()
+			v.vm.resumeMu.Unlock()
+
+			// Wait for resume signal using channel
+			select {
+			case <-v.vm.secondaryCtx.Done():
+				slog.Info("hvf: runSecondaryLoop VM closed while paused", "vcpuID", v.id)
+				return v.vm.secondaryCtx.Err()
+			case <-resumeCh:
+				// Resume signal received
+			}
+
+			// Resume signal received - continue execution
+			slog.Info("hvf: runSecondaryLoop resumed", "vcpuID", v.id)
+			v.stateMu.Lock()
+			v.state = vcpuStateRunning
+			v.stateMu.Unlock()
+
+			// Continue running the vCPU from where it left off
+			err := v.continueRun()
+			slog.Info("hvf: runSecondaryLoop continueRun returned", "vcpuID", v.id, "error", err)
+			if err != nil {
+				if errors.Is(err, hv.ErrVMHalted) {
+					v.stateMu.Lock()
+					v.state = vcpuStateOff
+					v.stateMu.Unlock()
+					continue
+				}
+				if errors.Is(err, hv.ErrYield) {
+					// Secondary vCPU hit yield - this happens when guest code that yields
+					// is scheduled on a secondary CPU. We need to signal this to end the
+					// current RunAll stage. Set the flag and cancel runCtx.
+					slog.Info("hvf: runSecondaryLoop yield from secondary, signaling", "vcpuID", v.id)
+					v.vm.secondaryYielded.Store(true)
+					v.cancelCurrentRun()
+					v.stateMu.Lock()
+					v.state = vcpuStatePaused
+					v.stateMu.Unlock()
+					continue
+				}
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					// RunAll ended - wait for next generation before going back to paused
+					// This prevents busy-looping on a closed channel
+					currentGen := v.vm.resumeGen.Load()
+					if currentGen == resumeGen {
+						slog.Info("hvf: runSecondaryLoop waiting for gen change", "vcpuID", v.id, "resumeGen", resumeGen)
+						for v.vm.resumeGen.Load() == resumeGen {
+							select {
+							case <-v.vm.secondaryCtx.Done():
+								return v.vm.secondaryCtx.Err()
+							case <-time.After(100 * time.Microsecond):
+							}
+						}
+						slog.Info("hvf: runSecondaryLoop gen changed", "vcpuID", v.id, "newGen", v.vm.resumeGen.Load())
+					}
+					v.stateMu.Lock()
+					v.state = vcpuStatePaused
+					v.stateMu.Unlock()
+					continue
+				}
+				return fmt.Errorf("hvf: secondary vCPU run failed after resume: %w", err)
+			}
+			continue
+		}
+
+		// Normal operation: wait for wakeup, VM shutdown, or run context end
+		// Get current run context for checking cancellation
+		v.vm.runMu.RLock()
+		runCtx := v.vm.runCtx
+		v.vm.runMu.RUnlock()
+
+		select {
+		case <-v.vm.secondaryCtx.Done():
+			slog.Debug("hvf: runSecondaryLoop VM closed", "vcpuID", v.id)
+			return v.vm.secondaryCtx.Err()
+
+		case <-runCtx.Done():
+			// RunAll ended but we never got CPU_ON, transition to Paused
+			slog.Debug("hvf: runSecondaryLoop runCtx cancelled while waiting for wakeup", "vcpuID", v.id)
+			v.stateMu.Lock()
+			v.state = vcpuStatePaused
+			v.stateMu.Unlock()
+			continue
+
+		case wakeup := <-v.wakeupCh:
+			slog.Debug("hvf: runSecondaryLoop received wakeup", "vcpuID", v.id, "entryPoint", fmt.Sprintf("0x%x", wakeup.entryPoint), "contextID", wakeup.contextID)
+
+			// Get current run context
+			v.vm.runMu.RLock()
+			runCtx := v.vm.runCtx
+			v.vm.runMu.RUnlock()
+
+			// Configure vCPU for entry and run
+			if err := v.runFromWakeup(runCtx, wakeup); err != nil {
+				slog.Debug("hvf: runSecondaryLoop runFromWakeup error", "vcpuID", v.id, "error", err)
+				if errors.Is(err, hv.ErrVMHalted) {
+					// CPU_OFF was called, go back to parked state
+					v.stateMu.Lock()
+					v.state = vcpuStateParked
+					v.stateMu.Unlock()
+					slog.Debug("hvf: runSecondaryLoop CPU_OFF, going to parked", "vcpuID", v.id)
+					continue
+				}
+				if errors.Is(err, hv.ErrYield) {
+					// Secondary vCPU hit yield - signal to end the stage
+					slog.Info("hvf: runSecondaryLoop yield from secondary (normal op), signaling", "vcpuID", v.id)
+					v.vm.secondaryYielded.Store(true)
+					v.cancelCurrentRun()
+					v.stateMu.Lock()
+					v.state = vcpuStatePaused
+					v.stateMu.Unlock()
+					continue
+				}
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					// RunAll ended (primary yielded or timeout), pause and wait for resume
+					slog.Debug("hvf: runSecondaryLoop context cancelled, pausing", "vcpuID", v.id)
+					v.stateMu.Lock()
+					v.state = vcpuStatePaused
+					v.stateMu.Unlock()
+					continue
+				}
+				return fmt.Errorf("hvf: secondary vCPU run failed: %w", err)
+			}
+		}
+	}
+}
+
+// continueRun continues the vCPU execution from where it was paused.
+func (v *virtualCPU) continueRun() error {
+	v.vm.runMu.RLock()
+	runCtx := v.vm.runCtx
+	v.vm.runMu.RUnlock()
+
+	// Check if context is already cancelled
+	select {
+	case <-runCtx.Done():
+		slog.Info("hvf: continueRun runCtx already cancelled", "vcpuID", v.id)
+		return runCtx.Err()
+	default:
+	}
+
+	done := make(chan error, 1)
+	v.runQueue <- func() {
+		done <- v.runLoop(runCtx)
+	}
+
+	// Wait for the run to complete while pumping the VM runQueue
+	for {
+		select {
+		case err := <-done:
+			return err
+		case f := <-v.vm.runQueue:
+			f()
+		}
+	}
+}
+
+// cancelCurrentRun cancels the current RunAll context to signal other vCPUs to pause.
+func (v *virtualCPU) cancelCurrentRun() {
+	v.vm.runMu.Lock()
+	if v.vm.runCancel != nil {
+		v.vm.runCancel()
+	}
+	v.vm.runMu.Unlock()
+}
+
+// runFromWakeup configures the vCPU with the wakeup parameters and runs it.
+func (v *virtualCPU) runFromWakeup(ctx context.Context, wakeup vcpuWakeup) error {
+	done := make(chan error, 1)
+
+	v.runQueue <- func() {
+		// Configure vCPU registers for entry
+		// PC = entry point, X0 = context ID
+		// PSTATE = EL1h mode with interrupts masked
+		const pstateEL1h = 0x3c5 // EL1h, DAIF masked
+
+		if err := bindings.HvVcpuSetReg(v.id, bindings.HV_REG_PC, wakeup.entryPoint); err != bindings.HV_SUCCESS {
+			done <- fmt.Errorf("hvf: failed to set PC for secondary vCPU: %w", err)
+			return
+		}
+		if err := bindings.HvVcpuSetReg(v.id, bindings.HV_REG_X0, wakeup.contextID); err != bindings.HV_SUCCESS {
+			done <- fmt.Errorf("hvf: failed to set X0 for secondary vCPU: %w", err)
+			return
+		}
+		if err := bindings.HvVcpuSetReg(v.id, bindings.HV_REG_CPSR, pstateEL1h); err != bindings.HV_SUCCESS {
+			done <- fmt.Errorf("hvf: failed to set PSTATE for secondary vCPU: %w", err)
+			return
+		}
+
+		// Run the vCPU until it exits
+		done <- v.runLoop(ctx)
+	}
+
+	// Wait for the run to complete while pumping the VM runQueue.
+	// IMPORTANT: We must always wait for 'done' even if context is cancelled,
+	// because the vCPU thread is still executing runLoop. Returning early would
+	// cause a race condition on the next RunAll call.
+	for {
+		select {
+		case err := <-done:
+			return err
+		case f := <-v.vm.runQueue:
+			f()
+		}
+	}
+}
+
+// runLoop runs the vCPU in a loop, handling exits until it halts or errors.
+func (v *virtualCPU) runLoop(ctx context.Context) error {
+	for {
+		if err := v.Run(ctx); err != nil {
+			// Handle expected exit conditions for secondary vCPUs
+			if errors.Is(err, hv.ErrVMHalted) {
+				return hv.ErrVMHalted
+			}
+			if errors.Is(err, hv.ErrYield) {
+				// Yield means the VM is done, return ErrYield so runSecondaryLoop exits
+				return hv.ErrYield
+			}
+			return err
+		}
+	}
 }
 
 // VirtualCPUCall implements [hv.VirtualMachine].
@@ -1258,6 +1752,75 @@ func (v *virtualMachine) callMainThread(f func() error) error {
 // Arm64GICInfo implements [hv.Arm64GICProvider].
 func (v *virtualMachine) Arm64GICInfo() (hv.Arm64GICInfo, bool) {
 	return v.gicInfo, v.gicInfo.Version != hv.Arm64GICVersionUnknown
+}
+
+// handlePsciCpuOn handles the PSCI CPU_ON call to boot a secondary vCPU.
+// targetMPIDR is the MPIDR of the target CPU, entryPoint is the address to start
+// execution, and contextID is passed to the target CPU in X0.
+func (v *virtualMachine) handlePsciCpuOn(targetMPIDR, entryPoint, contextID uint64) psciFunctionID {
+	// Extract CPU ID from MPIDR (Aff0 field, bits [7:0])
+	targetID := int(targetMPIDR & 0xFF)
+
+	slog.Debug("hvf: handlePsciCpuOn", "targetID", targetID, "numCPUs", len(v.cpus))
+
+	vcpu, ok := v.cpus[targetID]
+	if !ok {
+		slog.Debug("hvf: handlePsciCpuOn invalid target", "targetID", targetID)
+		return psciInvalidParameters
+	}
+
+	vcpu.stateMu.Lock()
+	defer vcpu.stateMu.Unlock()
+
+	slog.Debug("hvf: handlePsciCpuOn target state", "targetID", targetID, "state", vcpu.state)
+
+	switch vcpu.state {
+	case vcpuStateRunning, vcpuStatePaused:
+		// Paused CPUs are still "on" from the guest's perspective
+		return psciAlreadyOn
+	case vcpuStateParked, vcpuStateOff:
+		// Send wakeup signal to the target vCPU
+		select {
+		case vcpu.wakeupCh <- vcpuWakeup{entryPoint: entryPoint, contextID: contextID}:
+			slog.Debug("hvf: handlePsciCpuOn wakeup sent", "targetID", targetID)
+			vcpu.state = vcpuStateRunning
+			return psciSuccess
+		default:
+			// Channel full - CPU_ON already pending
+			slog.Debug("hvf: handlePsciCpuOn channel full", "targetID", targetID)
+			return psciOnPending
+		}
+	default:
+		return psciInternalFailure
+	}
+}
+
+// handlePsciAffinityInfo returns the power state of a vCPU.
+// Returns 0 for ON, 1 for OFF, 2 for ON_PENDING.
+func (v *virtualMachine) handlePsciAffinityInfo(targetMPIDR uint64) psciFunctionID {
+	// Extract CPU ID from MPIDR (Aff0 field, bits [7:0])
+	targetID := int(targetMPIDR & 0xFF)
+
+	vcpu, ok := v.cpus[targetID]
+	if !ok {
+		return psciInvalidParameters
+	}
+
+	vcpu.stateMu.Lock()
+	state := vcpu.state
+	vcpu.stateMu.Unlock()
+
+	switch state {
+	case vcpuStateRunning, vcpuStatePaused:
+		// Paused CPUs are still "on" from the guest's perspective
+		return 0 // AFFINITY_LEVEL_ON
+	case vcpuStateOff:
+		return 1 // AFFINITY_LEVEL_OFF
+	case vcpuStateParked:
+		return 1 // Also OFF (parked means not yet started)
+	default:
+		return psciInternalFailure
+	}
 }
 
 var (
@@ -1428,16 +1991,28 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 	ret.rec.Record(tsHvfOnCreateVMWithMemory)
 
 	// create vCPUs
-	if config.CPUCount() != 1 {
-		return nil, fmt.Errorf("hvf: only 1 vCPU supported, got %d", config.CPUCount())
+	if config.CPUCount() < 1 || config.CPUCount() > 16 {
+		return nil, fmt.Errorf("hvf: CPU count must be between 1 and 16, got %d", config.CPUCount())
 	}
 
+	// Initialize secondary vCPU lifecycle management (persists across RunAll calls)
+	ret.secondaryCtx, ret.secondaryCancel = context.WithCancel(context.Background())
+	ret.secondaryErrCh = make(chan error, config.CPUCount())
+
 	for i := 0; i < config.CPUCount(); i++ {
+		// Determine initial state: vCPU 0 starts running, others start parked
+		initialState := vcpuStateParked
+		if i == 0 {
+			initialState = vcpuStateRunning
+		}
+
 		vcpu := &virtualCPU{
 			vm:        ret,
 			runQueue:  make(chan func(), 16),
 			initError: make(chan error, 1),
 			rec:       timeslice.NewState(),
+			state:     initialState,
+			wakeupCh:  make(chan vcpuWakeup, 1),
 		}
 
 		ret.cpus[i] = vcpu

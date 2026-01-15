@@ -462,6 +462,12 @@ func (v *virtualMachine) Run(ctx context.Context, cfg hv.RunConfig) error {
 	}
 }
 
+// RunAll implements hv.VirtualMachine.
+// TODO: WHP currently only supports 1 vCPU, so this delegates to Run.
+func (v *virtualMachine) RunAll(ctx context.Context, cfg hv.RunConfig) error {
+	return v.Run(ctx, cfg)
+}
+
 // VirtualCPUCall implements hv.VirtualMachine.
 func (v *virtualMachine) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error {
 	vcpu, ok := v.vcpus[id]

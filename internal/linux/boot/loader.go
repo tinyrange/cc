@@ -687,7 +687,7 @@ func (l *LinuxLoader) loadARM64(rec *timeslice.Recorder, vm hv.VirtualMachine, k
 		numCPUs = 1
 	}
 
-	gicConfig, err := detectArm64GICConfig(vm)
+	gicConfig, err := detectArm64GICConfig(vm, numCPUs)
 	if err != nil {
 		return fmt.Errorf("detect GIC config: %w", err)
 	}
@@ -728,7 +728,7 @@ func (l *LinuxLoader) loadARM64(rec *timeslice.Recorder, vm hv.VirtualMachine, k
 	return nil
 }
 
-func detectArm64GICConfig(vm hv.VirtualMachine) (*arm64boot.GICConfig, error) {
+func detectArm64GICConfig(vm hv.VirtualMachine, numCPUs int) (*arm64boot.GICConfig, error) {
 	if vm == nil {
 		return nil, errors.New("vm is nil")
 	}
@@ -750,7 +750,8 @@ func detectArm64GICConfig(vm hv.VirtualMachine) (*arm64boot.GICConfig, error) {
 				config.RedistributorBase = info.RedistributorBase
 			}
 			if info.RedistributorSize != 0 {
-				config.RedistributorSize = info.RedistributorSize
+				// RedistributorSize from HVF is the per-CPU size; multiply by numCPUs for total region
+				config.RedistributorSize = info.RedistributorSize * uint64(numCPUs)
 			}
 			if info.CpuInterfaceBase != 0 {
 				config.CpuInterfaceBase = info.CpuInterfaceBase

@@ -111,6 +111,12 @@ func (v *virtualMachine) Run(ctx context.Context, cfg hv.RunConfig) error {
 	return cfg.Run(ctx, v.vcpu)
 }
 
+// RunAll implements hv.VirtualMachine.
+// RISC-V interpreter only supports 1 vCPU, so this delegates to Run.
+func (v *virtualMachine) RunAll(ctx context.Context, cfg hv.RunConfig) error {
+	return v.Run(ctx, cfg)
+}
+
 func (v *virtualMachine) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error {
 	if id != 0 {
 		return fmt.Errorf("riscv: only vCPU 0 supported")
