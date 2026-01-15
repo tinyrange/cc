@@ -350,6 +350,9 @@ type virtualMachine struct {
 	// arm64 interrupt bookkeeping for level-aware delivery.
 	arm64GICMu       sync.Mutex
 	arm64GICAsserted map[uint32]bool
+
+	// addressSpace manages physical address allocation for MMIO regions
+	addressSpace *hv.AddressSpace
 }
 
 // implements hv.VirtualMachine.
@@ -392,13 +395,16 @@ func (v *virtualMachine) AddDevice(dev hv.Device) error {
 }
 
 // AddDeviceFromTemplate implements hv.VirtualMachine.
-func (v *virtualMachine) AddDeviceFromTemplate(template hv.DeviceTemplate) error {
+func (v *virtualMachine) AddDeviceFromTemplate(template hv.DeviceTemplate) (hv.Device, error) {
 	dev, err := template.Create(v)
 	if err != nil {
-		return fmt.Errorf("create device from template: %w", err)
+		return nil, fmt.Errorf("create device from template: %w", err)
 	}
 
-	return v.AddDevice(dev)
+	if err := v.AddDevice(dev); err != nil {
+		return nil, err
+	}
+	return dev, nil
 }
 
 // Close implements hv.VirtualMachine.
@@ -504,6 +510,30 @@ func (v *virtualMachine) ReadAt(p []byte, off int64) (n int, err error) {
 		err = fmt.Errorf("whp: ReadAt short read")
 	}
 	return n, err
+}
+
+// AllocateMMIO implements hv.VirtualMachine.
+func (v *virtualMachine) AllocateMMIO(req hv.MMIOAllocationRequest) (hv.MMIOAllocation, error) {
+	if v.addressSpace == nil {
+		return hv.MMIOAllocation{}, fmt.Errorf("whp: address space not initialized")
+	}
+	return v.addressSpace.Allocate(req)
+}
+
+// RegisterFixedMMIO implements hv.VirtualMachine.
+func (v *virtualMachine) RegisterFixedMMIO(name string, base, size uint64) error {
+	if v.addressSpace == nil {
+		return fmt.Errorf("whp: address space not initialized")
+	}
+	return v.addressSpace.RegisterFixed(name, base, size)
+}
+
+// GetAllocatedMMIORegions implements hv.VirtualMachine.
+func (v *virtualMachine) GetAllocatedMMIORegions() []hv.MMIOAllocation {
+	if v.addressSpace == nil {
+		return nil
+	}
+	return v.addressSpace.Allocations()
 }
 
 var (
@@ -740,6 +770,9 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 	vm.memory = mem
 	vm.memoryBase = config.MemoryBase()
+
+	// Initialize the physical address space allocator
+	vm.addressSpace = hv.NewAddressSpace(h.Architecture(), config.MemoryBase(), config.MemorySize())
 
 	if err := bindings.MapGPARange(
 		vm.part,

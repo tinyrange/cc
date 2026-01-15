@@ -224,6 +224,21 @@ func (b *MMIODeviceBase) IRQLine() uint32 {
 	return b.irqLine
 }
 
+// AllocatedMMIOBase implements AllocatedVirtioMMIODevice.
+func (b *MMIODeviceBase) AllocatedMMIOBase() uint64 {
+	return b.base
+}
+
+// AllocatedMMIOSize implements AllocatedVirtioMMIODevice.
+func (b *MMIODeviceBase) AllocatedMMIOSize() uint64 {
+	return b.size
+}
+
+// AllocatedIRQLine implements AllocatedVirtioMMIODevice.
+func (b *MMIODeviceBase) AllocatedIRQLine() uint32 {
+	return b.irqLine
+}
+
 // NewMMIODeviceBase creates a new MMIODeviceBase with the given configuration.
 func NewMMIODeviceBase(base, size uint64, irqLine uint32, config *MMIODeviceConfig) MMIODeviceBase {
 	return MMIODeviceBase{

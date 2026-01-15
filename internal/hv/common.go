@@ -359,6 +359,20 @@ type MMIORegion struct {
 	Size    uint64
 }
 
+// MMIOAllocationRequest describes requirements for an MMIO region allocation.
+type MMIOAllocationRequest struct {
+	Name      string // Device name for debugging/logging
+	Size      uint64 // Required size in bytes
+	Alignment uint64 // Required alignment (power of 2, e.g., 0x1000 for 4KB)
+}
+
+// MMIOAllocation is the result of an MMIO allocation.
+type MMIOAllocation struct {
+	Name string // Device name
+	Base uint64 // Allocated base address
+	Size uint64 // Allocated size (may be larger than requested due to alignment)
+}
+
 type MemoryMappedIODevice interface {
 	Device
 
@@ -458,9 +472,23 @@ type VirtualMachine interface {
 	VirtualCPUCall(id int, f func(vcpu VirtualCPU) error) error
 
 	AddDevice(dev Device) error
-	AddDeviceFromTemplate(template DeviceTemplate) error
+	AddDeviceFromTemplate(template DeviceTemplate) (Device, error)
 
 	AllocateMemory(physAddr, size uint64) (MemoryRegion, error)
+
+	// AllocateMMIO requests an MMIO region from the VM's physical address allocator.
+	// The region is allocated above RAM to avoid conflicts. Returns the allocated
+	// base address and size.
+	AllocateMMIO(req MMIOAllocationRequest) (MMIOAllocation, error)
+
+	// RegisterFixedMMIO registers a pre-determined MMIO region (for legacy devices
+	// like GIC, UART, HPET, IO-APIC). Returns error if the region conflicts with
+	// RAM or other allocations.
+	RegisterFixedMMIO(name string, base, size uint64) error
+
+	// GetAllocatedMMIORegions returns all dynamically allocated MMIO regions.
+	// Used for E820 map and device tree generation.
+	GetAllocatedMMIORegions() []MMIOAllocation
 
 	CaptureSnapshot() (Snapshot, error)
 	RestoreSnapshot(snap Snapshot) error

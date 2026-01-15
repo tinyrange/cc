@@ -24,11 +24,9 @@ import (
 )
 
 const (
-	mailboxPhysAddr        = 0xf000_0000
-	mailboxRegionSize      = 0x1000
-	configRegionPhysAddr   = 0xf000_3000
-	configRegionSize       = 4 * 1024 * 1024
-	configRegionPageOffset = configRegionPhysAddr - mailboxPhysAddr
+	// Default region sizes for MMIO allocations
+	mailboxRegionSize = 0x1000
+	configRegionSize  = 4 * 1024 * 1024
 
 	configHeaderMagicValue = 0xcafebabe
 	configHeaderSize       = 40
@@ -41,11 +39,6 @@ const (
 	writeFileTransferRegion = writeFileMaxChunkLen + writeFileLengthPrefix
 
 	userYieldValue = 0x5553_4552 // "USER"
-
-	// arm64MaxMemoryMB is the maximum memory for ARM64 to avoid overlap
-	// with the mailbox/config regions at 0xf0000000.
-	// Max = (0xf0000000 - 0x80000000) / (1024*1024) = 1792 MB
-	arm64MaxMemoryMB = 1792
 )
 
 type proxyReader struct {
@@ -118,6 +111,10 @@ type programLoader struct {
 
 	runResultDetail uint32
 	runResultStage  uint32
+
+	// Dynamically allocated MMIO addresses
+	mailboxPhysAddr      uint64
+	configRegionPhysAddr uint64
 }
 
 func (p *programLoader) ReserveDataRegion(size int) {
@@ -142,15 +139,15 @@ func (p *programLoader) Init(vm hv.VirtualMachine) error {
 // MMIORegions implements hv.MemoryMappedIODevice.
 func (p *programLoader) MMIORegions() []hv.MMIORegion {
 	return []hv.MMIORegion{
-		{Address: mailboxPhysAddr, Size: mailboxRegionSize},
-		{Address: configRegionPhysAddr, Size: configRegionSize},
+		{Address: p.mailboxPhysAddr, Size: mailboxRegionSize},
+		{Address: p.configRegionPhysAddr, Size: configRegionSize},
 	}
 }
 
 // ReadMMIO implements hv.MemoryMappedIODevice.
 func (p *programLoader) ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
-	if addr >= configRegionPhysAddr && addr < configRegionPhysAddr+configRegionSize {
-		offset := addr - configRegionPhysAddr
+	if addr >= p.configRegionPhysAddr && addr < p.configRegionPhysAddr+configRegionSize {
+		offset := addr - p.configRegionPhysAddr
 		copy(data, p.dataRegion[offset:])
 		return nil
 	}
@@ -166,18 +163,18 @@ func (p *programLoader) DeviceTreeNodes() ([]fdt.Node, error) {
 	}
 	return []fdt.Node{
 		{
-			Name: fmt.Sprintf("initx-mailbox@%x", mailboxPhysAddr),
+			Name: fmt.Sprintf("initx-mailbox@%x", p.mailboxPhysAddr),
 			Properties: map[string]fdt.Property{
 				"compatible": {Strings: []string{"tinyrange,initx-mailbox"}},
-				"reg":        {U64: []uint64{mailboxPhysAddr, mailboxRegionSize}},
+				"reg":        {U64: []uint64{p.mailboxPhysAddr, mailboxRegionSize}},
 				"status":     {Strings: []string{"okay"}},
 			},
 		},
 		{
-			Name: fmt.Sprintf("initx-config@%x", configRegionPhysAddr),
+			Name: fmt.Sprintf("initx-config@%x", p.configRegionPhysAddr),
 			Properties: map[string]fdt.Property{
 				"compatible": {Strings: []string{"tinyrange,initx-config"}},
-				"reg":        {U64: []uint64{configRegionPhysAddr, configRegionSize}},
+				"reg":        {U64: []uint64{p.configRegionPhysAddr, configRegionSize}},
 				"status":     {Strings: []string{"okay"}},
 			},
 		},
@@ -186,7 +183,7 @@ func (p *programLoader) DeviceTreeNodes() ([]fdt.Node, error) {
 
 // WriteMMIO implements hv.MemoryMappedIODevice.
 func (p *programLoader) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
-	offset := addr - mailboxPhysAddr
+	offset := addr - p.mailboxPhysAddr
 
 	switch offset {
 	case mailboxRunResultDetailOffset:
@@ -387,6 +384,10 @@ type VirtualMachine struct {
 
 	// consoleDevice is the virtio-console device for interactive console I/O.
 	consoleDevice *virtio.Console
+
+	// Dynamically allocated MMIO addresses for initx regions
+	mailboxPhysAddr      uint64
+	configRegionPhysAddr uint64
 }
 
 func (vm *VirtualMachine) Close() error {
@@ -717,16 +718,11 @@ func NewVirtualMachine(
 	ret.programLoader = programLoader
 	ret.kernelLoader = kernelLoader
 
-	// Cap ARM64 memory to avoid overlap with mailbox/config regions at 0xf0000000
-	memSize := memSizeMB
-	if h.Architecture() == hv.ArchitectureARM64 && memSize > arm64MaxMemoryMB {
-		memSize = arm64MaxMemoryMB
-	}
-
+	// No longer cap memory - MMIO regions are now allocated dynamically above RAM
 	ret.loader = &boot.LinuxLoader{
 		NumCPUs: numCPUs,
 
-		MemSize: memSize << 20,
+		MemSize: memSizeMB << 20,
 		MemBase: func() uint64 {
 			switch h.Architecture() {
 			case hv.ArchitectureARM64:
@@ -756,7 +752,9 @@ func NewVirtualMachine(
 
 		GetInit: func(arch hv.CpuArchitecture) (*ir.Program, error) {
 			cfg := BuilderConfig{
-				Arch: arch,
+				Arch:                 arch,
+				MailboxPhysAddr:      ret.mailboxPhysAddr,
+				ConfigRegionPhysAddr: ret.configRegionPhysAddr,
 			}
 
 			modules, err := kernelLoader.PlanModuleLoad(
@@ -878,21 +876,48 @@ func NewVirtualMachine(
 	)
 
 	ret.loader.CreateVMWithMemory = func(vm hv.VirtualMachine) error {
-		if runtime.GOOS == "linux" && h.Architecture() == hv.ArchitectureARM64 {
-			return nil
+		// Allocate mailbox MMIO region dynamically above RAM
+		mailboxAlloc, err := vm.AllocateMMIO(hv.MMIOAllocationRequest{
+			Name:      "initx-mailbox",
+			Size:      mailboxRegionSize,
+			Alignment: 0x1000,
+		})
+		if err != nil {
+			return fmt.Errorf("allocate initx mailbox region: %v", err)
 		}
+		ret.mailboxPhysAddr = mailboxAlloc.Base
+		programLoader.mailboxPhysAddr = mailboxAlloc.Base
 
-		if runtime.GOOS == "darwin" && h.Architecture() == hv.ArchitectureARM64 {
-			return nil
-		}
-
-		mem, err := vm.AllocateMemory(configRegionPhysAddr, configRegionSize)
+		// Allocate config MMIO region dynamically above RAM
+		configAlloc, err := vm.AllocateMMIO(hv.MMIOAllocationRequest{
+			Name:      "initx-config",
+			Size:      configRegionSize,
+			Alignment: 0x1000,
+		})
 		if err != nil {
 			return fmt.Errorf("allocate initx config region: %v", err)
 		}
+		ret.configRegionPhysAddr = configAlloc.Base
+		programLoader.configRegionPhysAddr = configAlloc.Base
 
-		ret.configRegion = mem
-		programLoader.region = mem
+		// On x86 (and non-ARM64 Linux/Darwin), we need to allocate backing memory
+		// for the config region since it's not handled by the MMU like ARM64
+		needsBackingMemory := true
+		if runtime.GOOS == "linux" && h.Architecture() == hv.ArchitectureARM64 {
+			needsBackingMemory = false
+		}
+		if runtime.GOOS == "darwin" && h.Architecture() == hv.ArchitectureARM64 {
+			needsBackingMemory = false
+		}
+
+		if needsBackingMemory {
+			mem, err := vm.AllocateMemory(configAlloc.Base, configRegionSize)
+			if err != nil {
+				return fmt.Errorf("allocate initx config backing memory: %v", err)
+			}
+			ret.configRegion = mem
+			programLoader.region = mem
+		}
 
 		return nil
 	}
@@ -1020,7 +1045,7 @@ func (vm *VirtualMachine) WriteFile(ctx context.Context, in io.Reader, size int6
 					ir.Int64(linux.PROT_READ|linux.PROT_WRITE),
 					ir.Int64(linux.MAP_SHARED),
 					memFd,
-					ir.Int64(mailboxPhysAddr),
+					ir.Int64(int64(vm.mailboxPhysAddr)),
 				)),
 				ir.Assign(errVar, mailboxPtr),
 				ir.If(ir.IsNegative(errVar), ir.Block{
@@ -1036,7 +1061,7 @@ func (vm *VirtualMachine) WriteFile(ctx context.Context, in io.Reader, size int6
 					ir.Int64(linux.PROT_READ),
 					ir.Int64(linux.MAP_SHARED),
 					memFd,
-					ir.Int64(configRegionPhysAddr),
+					ir.Int64(int64(vm.configRegionPhysAddr)),
 				)),
 				ir.Assign(errVar, configPtr),
 				ir.If(ir.IsNegative(errVar), ir.Block{

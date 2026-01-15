@@ -870,6 +870,9 @@ type virtualMachine struct {
 
 	devices []hv.Device
 
+	// Physical address space allocator for MMIO regions
+	addressSpace *hv.AddressSpace
+
 	closed bool
 
 	gicInfo hv.Arm64GICInfo
@@ -1112,13 +1115,16 @@ func (v *virtualMachine) Close() error {
 }
 
 // AddDeviceFromTemplate implements [hv.VirtualMachine].
-func (v *virtualMachine) AddDeviceFromTemplate(template hv.DeviceTemplate) error {
+func (v *virtualMachine) AddDeviceFromTemplate(template hv.DeviceTemplate) (hv.Device, error) {
 	dev, err := template.Create(v)
 	if err != nil {
-		return fmt.Errorf("failed to create device from template: %w", err)
+		return nil, fmt.Errorf("failed to create device from template: %w", err)
 	}
 
-	return v.AddDevice(dev)
+	if err := v.AddDevice(dev); err != nil {
+		return nil, err
+	}
+	return dev, nil
 }
 
 // AllocateMemory implements [hv.VirtualMachine].
@@ -1146,6 +1152,30 @@ func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.Memory
 	return &memoryRegion{
 		memory: mem,
 	}, nil
+}
+
+// AllocateMMIO implements [hv.VirtualMachine].
+func (v *virtualMachine) AllocateMMIO(req hv.MMIOAllocationRequest) (hv.MMIOAllocation, error) {
+	if v.addressSpace == nil {
+		return hv.MMIOAllocation{}, fmt.Errorf("hvf: address space not initialized")
+	}
+	return v.addressSpace.Allocate(req)
+}
+
+// RegisterFixedMMIO implements [hv.VirtualMachine].
+func (v *virtualMachine) RegisterFixedMMIO(name string, base, size uint64) error {
+	if v.addressSpace == nil {
+		return fmt.Errorf("hvf: address space not initialized")
+	}
+	return v.addressSpace.RegisterFixed(name, base, size)
+}
+
+// GetAllocatedMMIORegions implements [hv.VirtualMachine].
+func (v *virtualMachine) GetAllocatedMMIORegions() []hv.MMIOAllocation {
+	if v.addressSpace == nil {
+		return nil
+	}
+	return v.addressSpace.Allocations()
 }
 
 // ReadAt implements [hv.VirtualMachine].
@@ -1311,6 +1341,9 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 	ret.memory = mem.(*memoryRegion).memory
 	ret.memoryBase = config.MemoryBase()
+
+	// Initialize the physical address space allocator
+	ret.addressSpace = hv.NewAddressSpace(h.Architecture(), config.MemoryBase(), config.MemorySize())
 
 	// create GICv3 device if needed
 	if config.NeedsInterruptSupport() {
