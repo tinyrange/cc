@@ -62,6 +62,7 @@ const (
 	GuestTsContainerWorkdir  = 62
 	GuestTsContainerDropPriv = 63
 	GuestTsContainerExec     = 64
+	GuestTsContainerComplete = 65
 )
 
 // guestTimesliceNames maps guest timeslice IDs to descriptive names
@@ -103,6 +104,7 @@ var guestTimesliceNames = map[int]string{
 	GuestTsContainerWorkdir:  "guest::container_workdir",
 	GuestTsContainerDropPriv: "guest::container_drop_priv",
 	GuestTsContainerExec:     "guest::container_exec",
+	GuestTsContainerComplete: "guest::container_complete",
 }
 
 // guestTimeslices holds pre-registered timeslice IDs for guest-recorded markers.

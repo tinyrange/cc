@@ -18,7 +18,7 @@ const (
 // 50=container_start, 51=container_mkdir, 52=container_virtiofs, 53=container_mkdir_mnt
 // 54=container_mount_fs, 55=container_chroot, 56=container_devpts, 57=container_qemu
 // 58=container_hostname, 59=container_loopback, 60=container_hosts, 61=container_network
-// 62=container_workdir, 63=container_drop_priv, 64=container_exec
+// 62=container_workdir, 63=container_drop_priv, 64=container_exec, 65=continer_complete
 
 // main is the entrypoint for the container init program.
 // Helper function bodies are replaced at IR level with actual implementations.
@@ -237,6 +237,12 @@ func main() int64 {
 		forkExecWait()
 	}
 
+	// === Phase 11: Complete
+	// Record: continer_complete (65)
+	if timesliceMem > 0 {
+		runtime.Store32(timesliceMem, 0, 65)
+	}
+
 	return 0
 }
 
@@ -335,7 +341,7 @@ func setHostsFile() int64 {
 // configureInterface configures the network interface.
 // This is a placeholder - body is replaced at IR level with actual implementation.
 func configureInterface() int64 { return 0 }
-func addDefaultRoute() int64     { return 0 }
+func addDefaultRoute() int64    { return 0 }
 
 // setResolvConf writes /etc/resolv.conf with the DNS server.
 // The resolv.conf content is provided via the "resolv_content" config value.
@@ -368,9 +374,9 @@ func changeWorkDir() int64 {
 	runtime.Syscall(runtime.SYS_CHDIR, ptr)
 	return 0
 }
-func execCommand() int64      { return 0 }
-func forkExecWait() int64     { return 0 }
-func dropPrivileges() int64   { return 0 }
+func execCommand() int64        { return 0 }
+func forkExecWait() int64       { return 0 }
+func dropPrivileges() int64     { return 0 }
 func setupQEMUEmulation() int64 { return 0 }
 
 // reboot issues a reboot syscall with the architecture-appropriate command.
