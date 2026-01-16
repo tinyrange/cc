@@ -573,22 +573,6 @@ func run() error {
 		qemuConfig = cfg
 	}
 
-	// Build and run the container init program
-	prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
-		Arch:          hvArch,
-		Cmd:           execCmd,
-		Env:           env,
-		WorkDir:       workDir,
-		EnableNetwork: networkFlag.v,
-		Exec:          execFlag.v,
-		UID:           img.Config.UID,
-		GID:           img.Config.GID,
-		QEMUEmulation: qemuConfig,
-	})
-	if err != nil {
-		return err
-	}
-
 	slog.Debug("Booting VM")
 
 	var ctx context.Context
@@ -605,15 +589,41 @@ func run() error {
 
 	debug.Writef("cc.run running command", "running command %v", execCmd)
 
+	// Determine if we should use CommandLoop mode for snapshot caching
+	// CommandLoop mode allows capturing snapshots after full container setup,
+	// then injecting the command at runtime via WriteExecCommand()
+	useCommandLoop := snapshotCacheFlag.v && getSnapshotIO() != nil
+
+	// Build the container init program
+	prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
+		Arch:                  hvArch,
+		Cmd:                   execCmd, // Used when CommandLoop is false
+		Env:                   env,
+		WorkDir:               workDir,
+		EnableNetwork:         networkFlag.v,
+		Exec:                  execFlag.v,
+		CommandLoop:           useCommandLoop,
+		UID:                   img.Config.UID,
+		GID:                   img.Config.GID,
+		QEMUEmulation:         qemuConfig,
+		MailboxPhysAddr:       vm.MailboxPhysAddr(),
+		TimesliceMMIOPhysAddr: vm.TimesliceMMIOPhysAddr(),
+		ConfigRegionPhysAddr:  vm.ConfigRegionPhysAddr(),
+	})
+	if err != nil {
+		return err
+	}
+
 	// Snapshot caching setup
 	var sessionCfg initx.SessionConfig
-	if snapshotCacheFlag.v && getSnapshotIO() != nil {
+	if useCommandLoop {
 		// Get cache directory for snapshots
 		snapshotCacheDir, err := getSnapshotCacheDir(*cacheDir)
 		if err == nil {
 			snapshotCache := initx.NewSnapshotCache(snapshotCacheDir, getSnapshotIO())
 
 			// Compute config hash based on VM configuration
+			// Include image reference to ensure different images get different snapshots
 			configHash := hv.ComputeConfigHash(
 				hvArch,
 				memoryFlag.v<<20, // Convert MB to bytes
@@ -632,6 +642,12 @@ func run() error {
 					if restoreErr := vm.RestoreSnapshot(snap); restoreErr == nil {
 						debug.Writef("cc.run snapshot", "restored from cache")
 						sessionCfg.SkipBoot = true
+						// Write the command to config region for the guest command loop to execute
+						if writeErr := vm.WriteExecCommand(execCmd[0], execCmd, env); writeErr != nil {
+							slog.Debug("Failed to write exec command after restore", "error", writeErr)
+							// Fall back to fresh boot
+							sessionCfg.SkipBoot = false
+						}
 					} else {
 						slog.Debug("Failed to restore snapshot, falling back to boot", "error", restoreErr)
 					}
@@ -641,8 +657,14 @@ func run() error {
 			}
 
 			if !sessionCfg.SkipBoot {
-				// Set up callback to capture snapshot after boot
+				// Set up callback to capture snapshot after boot completes
+				// In CommandLoop mode, the guest signals readiness after full container setup
 				sessionCfg.OnBootComplete = func() error {
+					// Clear any stale command before capturing snapshot
+					if clearErr := vm.ClearExecCommand(); clearErr != nil {
+						slog.Debug("Failed to clear exec command before snapshot", "error", clearErr)
+					}
+
 					snap, captureErr := vm.CaptureSnapshot()
 					if captureErr != nil {
 						slog.Debug("Failed to capture boot snapshot", "error", captureErr)
@@ -653,6 +675,12 @@ func run() error {
 					} else {
 						debug.Writef("cc.run snapshot", "saved to cache")
 					}
+
+					// Write the command for the guest to execute
+					if writeErr := vm.WriteExecCommand(execCmd[0], execCmd, env); writeErr != nil {
+						return fmt.Errorf("write exec command: %w", writeErr)
+					}
+
 					return nil
 				}
 			}
