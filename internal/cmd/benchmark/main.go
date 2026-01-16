@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/pprof"
 	"time"
 
 	"github.com/schollz/progressbar/v3"
@@ -258,6 +259,7 @@ func (b *benchmark) run() error {
 	bundleName := fs.String("bundle", "alpine", "the oci image name to run inside the virtual machine")
 	testCommand := fs.String("cmd", "/usr/bin/whoami", "the command to execute inside the virtual machine")
 	tsFile := fs.String("tsfile", "", "record a timeslice file for later analysis")
+	memprofile := fs.String("memprofile", "", "write memory profile to file")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return fmt.Errorf("failed to parse args: %w", err)
@@ -275,6 +277,21 @@ func (b *benchmark) run() error {
 			return fmt.Errorf("failed to start recording timeslices: %w", err)
 		}
 		defer closer.Close()
+	}
+
+	if *memprofile != "" {
+		defer func() {
+			f, err := os.Create(*memprofile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to create memprofile: %v\n", err)
+				return
+			}
+			defer f.Close()
+			if err := pprof.Lookup("heap").WriteTo(f, 0); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to write memory profile: %v\n", err)
+				return
+			}
+		}()
 	}
 
 	if *bundleDir == "" {
