@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/schollz/progressbar/v3"
 	"github.com/tinyrange/cc/internal/bundle"
@@ -33,6 +34,7 @@ func parseArchitecture(arch string) (hv.CpuArchitecture, error) {
 }
 
 type benchmark struct {
+	snapshot hv.Snapshot
 }
 
 var (
@@ -47,9 +49,18 @@ var (
 	tsStartSession              = timeslice.RegisterKind("benchmark::start_session", 0)
 	tsWaitForSession            = timeslice.RegisterKind("benchmark::wait_for_session", 0)
 	tsCleanup                   = timeslice.RegisterKind("benchmark::cleanup", 0)
+	tsOnBootComplete            = timeslice.RegisterKind("benchmark::on_boot_complete", 0)
+	tsCaptureSnapshot           = timeslice.RegisterKind("benchmark::capture_snapshot", 0)
+	tsRestoreSnapshot           = timeslice.RegisterKind("benchmark::restore_snapshot", 0)
+	tsOverallTime               = timeslice.RegisterKind("benchmark::overall", 0)
 )
 
-func (b *benchmark) runCommand(tsRecord *timeslice.Recorder, bundleDir string, bundleName string, command string) error {
+func (b *benchmark) runCommand(
+	tsRecord *timeslice.Recorder,
+	bundleDir string,
+	bundleName string,
+	command string,
+) error {
 	bundlePath := filepath.Join(bundleDir, bundleName)
 
 	meta, err := bundle.LoadMetadata(bundlePath)
@@ -87,7 +98,7 @@ func (b *benchmark) runCommand(tsRecord *timeslice.Recorder, bundleDir string, b
 
 	tsRecord.Record(tsNewContainerFS)
 
-	commandArgs := []string{"/bin/sh", "-c", command}
+	commandArgs := []string{command}
 
 	fsBackend := vfs.NewVirtioFsBackendWithAbstract()
 	if err := fsBackend.SetAbstractRoot(containerFS); err != nil {
@@ -130,6 +141,31 @@ func (b *benchmark) runCommand(tsRecord *timeslice.Recorder, bundleDir string, b
 
 	tsRecord.Record(tsNewVirtualMachine)
 
+	var sessionCfg initx.SessionConfig
+	if b.snapshot == nil {
+		sessionCfg.OnBootComplete = func() error {
+			tsRecord.Record(tsOnBootComplete)
+
+			snap, err := vm.CaptureSnapshot()
+			if err != nil {
+				return fmt.Errorf("failed to capture snapshot: %w", err)
+			}
+
+			b.snapshot = snap
+
+			tsRecord.Record(tsCaptureSnapshot)
+
+			return nil
+		}
+	} else {
+		if err := vm.RestoreSnapshot(b.snapshot); err != nil {
+			return fmt.Errorf("failed to resotre snapshot: %w", err)
+		}
+		sessionCfg.SkipBoot = true
+
+		tsRecord.Record(tsRestoreSnapshot)
+	}
+
 	// Build init program
 	prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
 		Arch:    hvArch,
@@ -146,7 +182,7 @@ func (b *benchmark) runCommand(tsRecord *timeslice.Recorder, bundleDir string, b
 
 	tsRecord.Record(tsBuildContainerInitProgram)
 
-	session := initx.StartSession(context.Background(), vm, prog, initx.SessionConfig{})
+	session := initx.StartSession(context.Background(), vm, prog, sessionCfg)
 
 	tsRecord.Record(tsStartSession)
 
@@ -165,7 +201,7 @@ func (b *benchmark) run() error {
 	n := fs.Int("n", 10, "the number of VM runs to execute")
 	bundleDir := fs.String("bundleDir", "", "the directory to load bundles from")
 	bundleName := fs.String("bundle", "alpine", "the oci image name to run inside the virtual machine")
-	testCommand := fs.String("cmd", "whoami", "the command to execute inside the virtual machine")
+	testCommand := fs.String("cmd", "/usr/bin/whoami", "the command to execute inside the virtual machine")
 
 	tsFile := fs.String("tsfile", "", "record a timeslice file for later analysis")
 
@@ -196,10 +232,22 @@ func (b *benchmark) run() error {
 		*bundleDir = filepath.Join(userDir, "ccapp", "bundles")
 	}
 
+	start := time.Now()
+
+	// execute a first boot to check and capture the snapshot.
+	if err := b.runCommand(timeslice.NewState(), *bundleDir, *bundleName, *testCommand); err != nil {
+		return fmt.Errorf("failed to perform first boot: %w", err)
+	}
+
+	timeslice.Record(tsOverallTime, time.Since(start))
+
+	// enter the main loop
 	pb := progressbar.Default(int64(*n))
 	defer pb.Close()
 
 	for range *n {
+		start := time.Now()
+
 		state := timeslice.NewState()
 
 		if err := b.runCommand(state, *bundleDir, *bundleName, *testCommand); err != nil {
@@ -207,6 +255,8 @@ func (b *benchmark) run() error {
 		}
 
 		state.Record(tsCleanup)
+
+		timeslice.Record(tsOverallTime, time.Since(start))
 
 		pb.Add(1)
 	}
