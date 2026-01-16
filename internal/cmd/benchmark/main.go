@@ -115,12 +115,17 @@ func (b *benchmark) runCommand(
 
 	tsRecord.Record(tsFactoryOpen)
 
-	kernelLoader, err := kernel.LoadForArchitecture(hvArch)
-	if err != nil {
-		return fmt.Errorf("load kernel: %w", err)
+	// Only load kernel when no snapshot exists (first boot)
+	// When restoring from snapshot, the kernel is already in guest memory
+	var kernelLoader kernel.Kernel
+	if b.snapshot == nil {
+		var err error
+		kernelLoader, err = kernel.LoadForArchitecture(hvArch)
+		if err != nil {
+			return fmt.Errorf("load kernel: %w", err)
+		}
+		tsRecord.Record(tsKernelLoad)
 	}
-
-	tsRecord.Record(tsKernelLoad)
 
 	buf := new(bytes.Buffer)
 

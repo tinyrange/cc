@@ -752,6 +752,10 @@ func NewVirtualMachine(
 		}(),
 
 		GetKernel: func() (io.ReaderAt, int64, error) {
+			if kernelLoader == nil {
+				return nil, 0, fmt.Errorf("kernel not loaded (use WithSnapshot for snapshot restore)")
+			}
+
 			size, err := kernelLoader.Size()
 			if err != nil {
 				return nil, 0, fmt.Errorf("get kernel size: %v", err)
@@ -766,10 +770,17 @@ func NewVirtualMachine(
 		},
 
 		GetSystemMap: func() (io.ReaderAt, error) {
+			if kernelLoader == nil {
+				return nil, fmt.Errorf("kernel not loaded (use WithSnapshot for snapshot restore)")
+			}
 			return kernelLoader.GetSystemMap()
 		},
 
 		GetInit: func(arch hv.CpuArchitecture) (*ir.Program, error) {
+			if kernelLoader == nil {
+				return nil, fmt.Errorf("kernel not loaded (use WithSnapshot for snapshot restore)")
+			}
+
 			cfg := BuilderConfig{
 				Arch:                 arch,
 				MailboxPhysAddr:      ret.mailboxPhysAddr,
