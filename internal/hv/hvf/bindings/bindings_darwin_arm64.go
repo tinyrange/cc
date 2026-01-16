@@ -150,6 +150,7 @@ func Load() error {
 
 		purego.RegisterLibFunc(&mach_task_self, libSystemLib, "mach_task_self")
 		purego.RegisterLibFunc(&vm_copy, libSystemLib, "vm_copy")
+		purego.RegisterLibFunc(&os_release, libSystemLib, "os_release")
 	})
 	return loadErr
 }
@@ -284,6 +285,7 @@ var (
 var (
 	mach_task_self func() uint32
 	vm_copy        func(targetTask uint32, sourceAddr uintptr, size uintptr, destAddr uintptr) int32
+	os_release     func(obj uintptr)
 )
 
 // VmCopy performs a copy-on-write memory copy using the Mach vm_copy syscall.
@@ -295,4 +297,12 @@ func VmCopy(source, dest uintptr, size uintptr) error {
 		return fmt.Errorf("vm_copy failed with kern_return_t: %d", ret)
 	}
 	return nil
+}
+
+// OsRelease releases an os_object (such as VMConfig, VcpuConfig, GICConfig, GICState).
+// These objects are reference-counted and must be released to avoid resource leaks.
+func OsRelease(obj uintptr) {
+	if obj != 0 {
+		os_release(obj)
+	}
 }

@@ -345,6 +345,7 @@ func (v *virtualCPU) Close() error {
 
 	val := <-errChan
 	close(errChan)
+	close(v.runQueue)
 	return val
 }
 
@@ -976,9 +977,11 @@ func (v *virtualCPU) start() {
 	var exit *bindings.VcpuExit = new(bindings.VcpuExit)
 
 	if err := bindings.HvVcpuCreate(&id, &exit, cfg); err != bindings.HV_SUCCESS {
+		bindings.OsRelease(uintptr(cfg))
 		v.initError <- err
 		return
 	}
+	bindings.OsRelease(uintptr(cfg))
 
 	// Set the MPIDR_EL1 to the vCPU ID.
 	// Okay setting this is required to get the GICv3 to work properly.
@@ -1076,7 +1079,7 @@ func (v *virtualMachine) captureGICState() ([]byte, error) {
 	if state == 0 {
 		return nil, fmt.Errorf("hvf: failed to create GIC state object")
 	}
-	// Note: state is an os_object that should be released, but we don't have os_release binding
+	defer bindings.OsRelease(uintptr(state))
 
 	var size uintptr
 	if err := bindings.HvGicStateGetSize(state, &size); err != bindings.HV_SUCCESS {
@@ -1610,8 +1613,10 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 	vm := bindings.HvVmCreate(vmConfig)
 	if vm != bindings.HV_SUCCESS {
+		bindings.OsRelease(uintptr(vmConfig))
 		return nil, fmt.Errorf("failed to create VM: %d", vm)
 	}
+	bindings.OsRelease(uintptr(vmConfig))
 
 	ret.rec.Record(tsHvfVmCreate)
 
@@ -1687,16 +1692,20 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 		// check alignment
 		if uintptr(distributorBase)%uintptr(distributorBaseAlignment) != 0 {
+			bindings.OsRelease(uintptr(cfg))
 			return nil, fmt.Errorf("failed to set GIC distributor base: %#x is not aligned to %#x", distributorBase, distributorBaseAlignment)
 		}
 		if uintptr(redistributorBase)%uintptr(redistributorBaseAlignment) != 0 {
+			bindings.OsRelease(uintptr(cfg))
 			return nil, fmt.Errorf("failed to set GIC redistributor base: %#x is not aligned to %#x", redistributorBase, redistributorBaseAlignment)
 		}
 
 		if err := bindings.HvGicConfigSetDistributorBase(cfg, distributorBase); err != bindings.HV_SUCCESS {
+			bindings.OsRelease(uintptr(cfg))
 			return nil, fmt.Errorf("failed to set GIC distributor base: %s", err)
 		}
 		if err := bindings.HvGicConfigSetRedistributorBase(cfg, redistributorBase); err != bindings.HV_SUCCESS {
+			bindings.OsRelease(uintptr(cfg))
 			return nil, fmt.Errorf("failed to set GIC redistributor base: %s", err)
 		}
 
@@ -1710,8 +1719,10 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		}
 
 		if err := bindings.HvGicCreate(cfg); err != bindings.HV_SUCCESS {
+			bindings.OsRelease(uintptr(cfg))
 			return nil, fmt.Errorf("failed to create GICv3: %s", err)
 		}
+		bindings.OsRelease(uintptr(cfg))
 
 		ret.rec.Record(tsHvfGicCreate)
 	}

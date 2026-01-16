@@ -56,6 +56,7 @@ var (
 	tsCaptureSnapshot           = timeslice.RegisterKind("benchmark::capture_snapshot", 0)
 	tsRestoreSnapshot           = timeslice.RegisterKind("benchmark::restore_snapshot", 0)
 	tsOverallTime               = timeslice.RegisterKind("benchmark::overall", 0)
+	tsWriteCommand              = timeslice.RegisterKind("benchmark::write_command", 0)
 )
 
 func (b *benchmark) runCommand(
@@ -256,7 +257,6 @@ func (b *benchmark) run() error {
 	bundleDir := fs.String("bundleDir", "", "the directory to load bundles from")
 	bundleName := fs.String("bundle", "alpine", "the oci image name to run inside the virtual machine")
 	testCommand := fs.String("cmd", "/usr/bin/whoami", "the command to execute inside the virtual machine")
-
 	tsFile := fs.String("tsfile", "", "record a timeslice file for later analysis")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
@@ -286,6 +286,7 @@ func (b *benchmark) run() error {
 		*bundleDir = filepath.Join(userDir, "ccapp", "bundles")
 	}
 
+	// Original mode: create new VM for each iteration
 	start := time.Now()
 
 	// execute a first boot to check and capture the snapshot.
