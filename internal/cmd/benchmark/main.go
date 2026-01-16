@@ -16,6 +16,7 @@ import (
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/factory"
 	"github.com/tinyrange/cc/internal/initx"
+	"github.com/tinyrange/cc/internal/ir"
 	"github.com/tinyrange/cc/internal/linux/kernel"
 	"github.com/tinyrange/cc/internal/oci"
 	"github.com/tinyrange/cc/internal/timeslice"
@@ -34,7 +35,9 @@ func parseArchitecture(arch string) (hv.CpuArchitecture, error) {
 }
 
 type benchmark struct {
-	snapshot hv.Snapshot
+	snapshot    hv.Snapshot
+	commandArgs []string // The command to execute (path + args)
+	commandEnv  []string // Environment variables for the command
 }
 
 var (
@@ -65,7 +68,7 @@ func (b *benchmark) runCommand(
 
 	meta, err := bundle.LoadMetadata(bundlePath)
 	if err != nil {
-		return fmt.Errorf("")
+		return fmt.Errorf("load metadata: %w", err)
 	}
 
 	tsRecord.Record(tsLoadMetadata)
@@ -98,6 +101,7 @@ func (b *benchmark) runCommand(
 
 	tsRecord.Record(tsNewContainerFS)
 
+	// Parse command - first element is path, rest are args
 	commandArgs := []string{command}
 
 	fsBackend := vfs.NewVirtioFsBackendWithAbstract()
@@ -151,55 +155,96 @@ func (b *benchmark) runCommand(
 
 	tsRecord.Record(tsNewVirtualMachine)
 
-	var sessionCfg initx.SessionConfig
 	if b.snapshot == nil {
-		// First boot - capture snapshot after boot completes
-		sessionCfg.OnBootComplete = func() error {
-			tsRecord.Record(tsOnBootComplete)
-
-			snap, err := vm.CaptureSnapshot()
-			if err != nil {
-				return fmt.Errorf("failed to capture snapshot: %w", err)
-			}
-
-			b.snapshot = snap
-
-			tsRecord.Record(tsCaptureSnapshot)
-
-			return nil
+		// First boot - use CommandLoop mode and capture snapshot after container setup
+		// Build init program with CommandLoop=true
+		prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
+			Arch:                  hvArch,
+			CommandLoop:           true, // Enable command loop mode for late snapshot
+			Env:                   img.Config.Env,
+			WorkDir:               img.Config.WorkingDir,
+			UID:                   img.Config.UID,
+			GID:                   img.Config.GID,
+			MailboxPhysAddr:       vm.MailboxPhysAddr(),
+			TimesliceMMIOPhysAddr: vm.TimesliceMMIOPhysAddr(),
+			ConfigRegionPhysAddr:  vm.ConfigRegionPhysAddr(),
+		})
+		if err != nil {
+			return fmt.Errorf("build init program: %w", err)
 		}
+
+		tsRecord.Record(tsBuildContainerInitProgram)
+
+		// Store command info for later use
+		b.commandArgs = commandArgs
+		b.commandEnv = img.Config.Env
+
+		// First boot: Run the container init program directly (skip Boot() since we don't need it).
+		// The container init will signal snapshot ready (0xdeadbeef) when setup is complete,
+		// which causes vm.Run() to return (ErrYield is converted to nil when runResultDetail is cleared).
+		// We then capture the snapshot and write the command.
+
+		// Run container init until it signals snapshot ready
+		if err := vm.Run(context.Background(), prog); err != nil {
+			return fmt.Errorf("failed to run container init: %w", err)
+		}
+
+		tsRecord.Record(tsOnBootComplete)
+
+		// Capture snapshot while guest is in command loop
+		snap, err := vm.CaptureSnapshot()
+		if err != nil {
+			return fmt.Errorf("failed to capture snapshot: %w", err)
+		}
+		b.snapshot = snap
+
+		tsRecord.Record(tsCaptureSnapshot)
+
+		// Write the first command for guest to execute
+		if err := vm.WriteExecCommand(commandArgs[0], commandArgs, b.commandEnv); err != nil {
+			return fmt.Errorf("failed to write exec command: %w", err)
+		}
+
+		tsRecord.Record(tsStartSession)
+
+		// Resume VM to execute the command
+		// The guest is waiting in the command loop, will read the command and execute it
+		if err := vm.Run(context.Background(), prog); err != nil {
+			return fmt.Errorf("failed to run command: %w", err)
+		}
+
+		tsRecord.Record(tsWaitForSession)
 	} else {
-		// Snapshot was restored in NewVirtualMachine via WithSnapshot option
-		sessionCfg.SkipBoot = true
-
+		// Subsequent runs - restore snapshot and execute command directly
+		// The snapshot was restored when the VM was created (via WithSnapshot option)
 		tsRecord.Record(tsRestoreSnapshot)
+
+		// Write command to config region
+		if err := vm.WriteExecCommand(b.commandArgs[0], b.commandArgs, b.commandEnv); err != nil {
+			return fmt.Errorf("failed to write exec command: %w", err)
+		}
+
+		// We don't need to build a new program - the guest is already in the command loop
+		// from the restored snapshot. We just need to resume execution.
+		// However, vm.Run() requires a program to write to config region.
+		// Use a minimal no-op program since the guest doesn't need it.
+		prog := &ir.Program{
+			Entrypoint: "main",
+			Methods: map[string]ir.Method{
+				"main": {ir.Return(ir.Int64(0))},
+			},
+		}
+
+		tsRecord.Record(tsBuildContainerInitProgram)
+		tsRecord.Record(tsStartSession)
+
+		// Resume VM - guest will read command from config region and execute it
+		if err := vm.Run(context.Background(), prog); err != nil {
+			return fmt.Errorf("failed to run command: %w", err)
+		}
+
+		tsRecord.Record(tsWaitForSession)
 	}
-
-	// Build init program
-	prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
-		Arch:    hvArch,
-		Cmd:     commandArgs,
-		Env:     img.Config.Env,
-		WorkDir: img.Config.WorkingDir,
-		Exec:    meta.Boot.Exec,
-		UID:     img.Config.UID,
-		GID:     img.Config.GID,
-	})
-	if err != nil {
-		return fmt.Errorf("build init program: %w", err)
-	}
-
-	tsRecord.Record(tsBuildContainerInitProgram)
-
-	session := initx.StartSession(context.Background(), vm, prog, sessionCfg)
-
-	tsRecord.Record(tsStartSession)
-
-	if err := session.Wait(); err != nil {
-		return fmt.Errorf("failed to wait for session: %w", err)
-	}
-
-	tsRecord.Record(tsWaitForSession)
 
 	return nil
 }

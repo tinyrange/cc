@@ -63,6 +63,18 @@ const (
 	GuestTsContainerDropPriv = 63
 	GuestTsContainerExec     = 64
 	GuestTsContainerComplete = 65
+
+	// ForkExecWait phases (66-70)
+	GuestTsForkStart = 66
+	GuestTsForkDone  = 67
+	GuestTsWaitStart = 68
+	GuestTsWaitDone  = 69
+
+	// Command loop phases (70-79)
+	GuestTsContainerCmdLoopStart = 70
+	GuestTsContainerCmdRead      = 71
+	GuestTsContainerCmdExec      = 72
+	GuestTsContainerCmdDone      = 73
 )
 
 // guestTimesliceNames maps guest timeslice IDs to descriptive names
@@ -105,6 +117,18 @@ var guestTimesliceNames = map[int]string{
 	GuestTsContainerDropPriv: "guest::container_drop_priv",
 	GuestTsContainerExec:     "guest::container_exec",
 	GuestTsContainerComplete: "guest::container_complete",
+
+	// ForkExecWait phases
+	GuestTsForkStart: "guest::fork_start",
+	GuestTsForkDone:  "guest::fork_done",
+	GuestTsWaitStart: "guest::wait_start",
+	GuestTsWaitDone:  "guest::wait_done",
+
+	// Command loop phases
+	GuestTsContainerCmdLoopStart: "guest::container_cmd_loop_start",
+	GuestTsContainerCmdRead:      "guest::container_cmd_read",
+	GuestTsContainerCmdExec:      "guest::container_cmd_exec",
+	GuestTsContainerCmdDone:      "guest::container_cmd_done",
 }
 
 // guestTimeslices holds pre-registered timeslice IDs for guest-recorded markers.

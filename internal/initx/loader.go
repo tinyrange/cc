@@ -39,6 +39,19 @@ const (
 	writeFileTransferRegion = writeFileMaxChunkLen + writeFileLengthPrefix
 
 	userYieldValue = 0x5553_4552 // "USER"
+
+	// Config region command format (at offset 0x100000):
+	// Offset 0: Magic (0x434D4452 = "CMDR")
+	// Offset 4: path_len (uint32)
+	// Offset 8: argc (uint32)
+	// Offset 12: envc (uint32)
+	// Offset 16: path\0 + args\0...\0 + envs\0...\0
+	execCmdRegionOffset  = 0x100000
+	execCmdMagicValue    = 0x434D4452 // "CMDR"
+	execCmdPathLenOffset = 4
+	execCmdArgcOffset    = 8
+	execCmdEnvcOffset    = 12
+	execCmdDataOffset    = 16
 )
 
 type proxyReader struct {
@@ -183,6 +196,14 @@ func (p *programLoader) DeviceTreeNodes() ([]fdt.Node, error) {
 
 // WriteMMIO implements hv.MemoryMappedIODevice.
 func (p *programLoader) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
+	// Check if write is to config region (for command loop communication)
+	if addr >= p.configRegionPhysAddr && addr < p.configRegionPhysAddr+configRegionSize {
+		offset := addr - p.configRegionPhysAddr
+		copy(p.dataRegion[offset:], data)
+		return nil
+	}
+
+	// Handle mailbox writes
 	offset := addr - p.mailboxPhysAddr
 
 	switch offset {
@@ -198,6 +219,9 @@ func (p *programLoader) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) 
 		value := binary.LittleEndian.Uint32(data)
 		switch value {
 		case 0x444f4e45, snapshotRequestValue:
+			// Clear runResultDetail when guest signals done/ready
+			// to indicate successful yield (not an error)
+			p.runResultDetail = 0
 			return hv.ErrYield
 		case userYieldValue:
 			return hv.ErrUserYield
@@ -462,9 +486,127 @@ func (vm *VirtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 	return nil
 }
 
+// WriteExecCommand writes a command to the config region for the guest command loop.
+// The guest will read this command and execute it via fork/exec/wait.
+// Format at offset 0x100000:
+// - Magic (4 bytes): 0x434D4452 ("CMDR")
+// - path_len (4 bytes): length of path string (excluding null terminator)
+// - argc (4 bytes): number of arguments (including argv[0])
+// - envc (4 bytes): number of environment variables
+// - data: path\0 + args\0...\0 + envs\0...\0
+func (vm *VirtualMachine) WriteExecCommand(path string, args []string, env []string) error {
+	// Calculate total size needed
+	dataSize := len(path) + 1 // path + null terminator
+	for _, arg := range args {
+		dataSize += len(arg) + 1
+	}
+	for _, e := range env {
+		dataSize += len(e) + 1
+	}
+
+	// Check if data fits in the available region
+	// Config region is 4MB, command region starts at 0x100000, leaving ~3MB for command data
+	maxDataSize := configRegionSize - execCmdRegionOffset - execCmdDataOffset
+	if dataSize > maxDataSize {
+		return fmt.Errorf("command data too large: %d bytes (max %d)", dataSize, maxDataSize)
+	}
+
+	// Build the command buffer
+	totalSize := execCmdDataOffset + dataSize
+	buf := make([]byte, totalSize)
+
+	// Write header
+	binary.LittleEndian.PutUint32(buf[0:4], execCmdMagicValue)
+	binary.LittleEndian.PutUint32(buf[execCmdPathLenOffset:], uint32(len(path)))
+	binary.LittleEndian.PutUint32(buf[execCmdArgcOffset:], uint32(len(args)))
+	binary.LittleEndian.PutUint32(buf[execCmdEnvcOffset:], uint32(len(env)))
+
+	// Write data: path + args + env (all null-terminated)
+	offset := execCmdDataOffset
+	copy(buf[offset:], path)
+	offset += len(path)
+	buf[offset] = 0
+	offset++
+
+	for _, arg := range args {
+		copy(buf[offset:], arg)
+		offset += len(arg)
+		buf[offset] = 0
+		offset++
+	}
+
+	for _, e := range env {
+		copy(buf[offset:], e)
+		offset += len(e)
+		buf[offset] = 0
+		offset++
+	}
+
+	// Write to config region
+	if vm.programLoader.region != nil {
+		if _, err := vm.programLoader.region.WriteAt(buf, int64(execCmdRegionOffset)); err != nil {
+			return fmt.Errorf("write exec command to config region: %w", err)
+		}
+	} else {
+		// ARM64 uses direct dataRegion access
+		// Ensure dataRegion is allocated (it may not be if called before LoadProgram)
+		if len(vm.programLoader.dataRegion) < configRegionSize {
+			vm.programLoader.dataRegion = make([]byte, configRegionSize)
+		}
+		copy(vm.programLoader.dataRegion[execCmdRegionOffset:], buf)
+	}
+
+	return nil
+}
+
+// ClearExecCommand clears the command magic in the config region.
+// This should be called before capturing a snapshot to ensure the guest
+// doesn't try to execute a stale command after restore.
+func (vm *VirtualMachine) ClearExecCommand() error {
+	// Write zero to the magic field
+	buf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(buf, 0)
+
+	if vm.programLoader.region != nil {
+		if _, err := vm.programLoader.region.WriteAt(buf, int64(execCmdRegionOffset)); err != nil {
+			return fmt.Errorf("clear exec command magic: %w", err)
+		}
+	} else {
+		// ARM64 uses direct dataRegion access
+		// Ensure dataRegion is allocated (it may not be if called before LoadProgram)
+		if len(vm.programLoader.dataRegion) < configRegionSize {
+			vm.programLoader.dataRegion = make([]byte, configRegionSize)
+		}
+		copy(vm.programLoader.dataRegion[execCmdRegionOffset:], buf)
+	}
+
+	return nil
+}
+
 // HVVirtualMachine returns the underlying hv.VirtualMachine for low-level operations.
 func (vm *VirtualMachine) HVVirtualMachine() hv.VirtualMachine {
 	return vm.vm
+}
+
+// MailboxPhysAddr returns the physical address of the mailbox MMIO region.
+func (vm *VirtualMachine) MailboxPhysAddr() uint64 {
+	return vm.mailboxPhysAddr
+}
+
+// ConfigRegionPhysAddr returns the physical address of the config MMIO region.
+func (vm *VirtualMachine) ConfigRegionPhysAddr() uint64 {
+	return vm.configRegionPhysAddr
+}
+
+// TimesliceMMIOPhysAddr returns the physical address of the timeslice MMIO region.
+// This is derived from the config region address (timeslice is at config - 0x2000).
+func (vm *VirtualMachine) TimesliceMMIOPhysAddr() uint64 {
+	// Timeslice MMIO is at a fixed offset before the config region
+	// Default: 0xf0001000 when config is at 0xf0003000
+	if vm.configRegionPhysAddr >= 0x2000 {
+		return vm.configRegionPhysAddr - 0x2000
+	}
+	return 0xf0001000 // fallback to default
 }
 
 func (vm *VirtualMachine) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error {
