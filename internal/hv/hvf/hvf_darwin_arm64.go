@@ -284,6 +284,10 @@ type arm64HvfSnapshot struct {
 	memory          []byte // The mmap'd memory buffer
 	memoryOwned     bool   // If true, snapshot owns the memory and must free it on Close
 	gicState        []byte
+
+	// captureTimeNanos records the wall clock time when the snapshot was captured.
+	// Used to adjust vtimer offset during restore to prevent guest time jumps.
+	captureTimeNanos int64
 }
 
 // Close frees the snapshot's memory if it owns it.
@@ -452,9 +456,15 @@ func (v *virtualCPU) captureSnapshot() (arm64HvfVcpuSnapshot, error) {
 
 // restoreSnapshot restores the vCPU state from a snapshot.
 // Must be called from the vCPU's thread (via runQueue).
-func (v *virtualCPU) restoreSnapshot(snap arm64HvfVcpuSnapshot) error {
-	// Restore virtual timer offset first
-	if err := bindings.HvVcpuSetVtimerOffset(v.id, snap.VTimerOffset); err != bindings.HV_SUCCESS {
+// vtimerAdjustment is added to the snapshot's VTimerOffset to compensate for
+// wall clock time that has passed since the snapshot was captured. This prevents
+// the guest from seeing a large time jump when the snapshot is restored.
+func (v *virtualCPU) restoreSnapshot(snap arm64HvfVcpuSnapshot, vtimerAdjustment uint64) error {
+	// Restore virtual timer offset with adjustment for wall clock drift
+	// The adjustment prevents the guest from perceiving time jumps between
+	// snapshot capture and restore.
+	adjustedOffset := snap.VTimerOffset + vtimerAdjustment
+	if err := bindings.HvVcpuSetVtimerOffset(v.id, adjustedOffset); err != bindings.HV_SUCCESS {
 		return fmt.Errorf("hvf: restore vtimer offset: %w", err)
 	}
 
@@ -1040,6 +1050,14 @@ var (
 	_ hv.MemoryRegion = &memoryRegion{}
 )
 
+// allocatedMemoryRegion tracks memory regions allocated via AllocateMemory
+// for proper cleanup when the VM is closed.
+type allocatedMemoryRegion struct {
+	memory   []byte
+	physAddr uint64
+	size     uint64
+}
+
 type virtualMachine struct {
 	rec *timeslice.Recorder
 
@@ -1047,6 +1065,10 @@ type virtualMachine struct {
 	memMu      sync.RWMutex // protects memory during snapshot
 	memory     []byte
 	memoryBase uint64
+
+	// additionalMemory tracks memory regions allocated via AllocateMemory
+	// (excluding the main VM memory). These must be unmapped and freed on Close().
+	additionalMemory []allocatedMemoryRegion
 
 	runQueue chan func()
 
@@ -1117,8 +1139,9 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 	rec := timeslice.NewState()
 
 	ret := &arm64HvfSnapshot{
-		cpuStates:       make(map[int]arm64HvfVcpuSnapshot),
-		deviceSnapshots: make(map[string]any),
+		cpuStates:        make(map[int]arm64HvfVcpuSnapshot),
+		deviceSnapshots:  make(map[string]any),
+		captureTimeNanos: time.Now().UnixNano(),
 	}
 
 	// Capture each vCPU state
@@ -1301,6 +1324,21 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 	}
 	rec.Record(tsRestoreGicState)
 
+	// Calculate vtimer offset adjustment for wall clock drift.
+	// This prevents the guest from seeing a time jump when the snapshot is restored.
+	// ARM64 timer runs at 24MHz (24_000_000 Hz), so we convert nanoseconds to ticks.
+	// ticks = nanoseconds * 24 / 1000
+	var vtimerAdjustment uint64
+	if snapshotData.captureTimeNanos > 0 {
+		nowNanos := time.Now().UnixNano()
+		deltaNanos := nowNanos - snapshotData.captureTimeNanos
+		if deltaNanos > 0 {
+			// Convert nanoseconds to timer ticks (24MHz timer)
+			// Using uint64 to avoid overflow: deltaNanos * 24 / 1000
+			vtimerAdjustment = uint64(deltaNanos) * 24 / 1000
+		}
+	}
+
 	// Restore each vCPU state
 	for id, cpu := range v.cpus {
 		state, ok := snapshotData.cpuStates[id]
@@ -1310,7 +1348,7 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 
 		errChan := make(chan error, 1)
 		cpu.runQueue <- func() {
-			errChan <- cpu.restoreSnapshot(state)
+			errChan <- cpu.restoreSnapshot(state, vtimerAdjustment)
 		}
 
 		if err := <-errChan; err != nil {
@@ -1395,6 +1433,17 @@ func (v *virtualMachine) Close() error {
 		v.memory = nil
 	}
 
+	// Clean up additional memory regions allocated via AllocateMemory
+	for _, region := range v.additionalMemory {
+		if err := bindings.HvVmUnmap(bindings.IPA(region.physAddr), uintptr(region.size)); err != bindings.HV_SUCCESS {
+			slog.Error("failed to unmap additional memory region", "physAddr", region.physAddr, "error", err)
+		}
+		if err := unix.Munmap(region.memory); err != nil {
+			slog.Error("failed to munmap additional memory region", "error", err)
+		}
+	}
+	v.additionalMemory = nil
+
 	for _, cpu := range v.cpus {
 		if err := cpu.Close(); err != nil {
 			slog.Error("failed to close vCPU", "error", err)
@@ -1446,8 +1495,16 @@ func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.Memory
 		uintptr(size),
 		bindings.HV_MEMORY_READ|bindings.HV_MEMORY_WRITE|bindings.HV_MEMORY_EXEC,
 	); err != bindings.HV_SUCCESS {
+		unix.Munmap(mem)
 		return nil, fmt.Errorf("failed to map memory for VM at 0x%X,0x%X: %w", physAddr, size, err)
 	}
+
+	// Track the allocated region for cleanup on Close()
+	v.additionalMemory = append(v.additionalMemory, allocatedMemoryRegion{
+		memory:   mem,
+		physAddr: physAddr,
+		size:     size,
+	})
 
 	return &memoryRegion{
 		memory: mem,
@@ -1642,6 +1699,12 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 	ret.memory = mem.(*memoryRegion).memory
 	ret.memoryBase = config.MemoryBase()
+
+	// Remove main memory from additionalMemory tracking since it's tracked separately
+	// in v.memory and cleaned up by the main Close() logic.
+	if len(ret.additionalMemory) > 0 {
+		ret.additionalMemory = ret.additionalMemory[:len(ret.additionalMemory)-1]
+	}
 
 	// Initialize the physical address space allocator
 	ret.addressSpace = hv.NewAddressSpace(h.Architecture(), config.MemoryBase(), config.MemorySize())

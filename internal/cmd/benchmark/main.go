@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -60,6 +61,7 @@ var (
 )
 
 func (b *benchmark) runCommand(
+	consoleOutput io.Writer,
 	tsRecord *timeslice.Recorder,
 	bundleDir string,
 	bundleName string,
@@ -132,15 +134,13 @@ func (b *benchmark) runCommand(
 		tsRecord.Record(tsKernelLoad)
 	}
 
-	buf := new(bytes.Buffer)
-
 	opts := []initx.Option{
 		initx.WithDeviceTemplate(virtio.FSTemplate{
 			Tag:     "rootfs",
 			Backend: fsBackend,
 			Arch:    hvArch,
 		}),
-		initx.WithConsoleOutput(buf),
+		initx.WithConsoleOutput(consoleOutput),
 	}
 
 	// If we have a snapshot, use WithSnapshot to skip kernel loading and restore automatically
@@ -287,25 +287,33 @@ func (b *benchmark) run() error {
 	}
 
 	// Original mode: create new VM for each iteration
-	start := time.Now()
+	totalStart := time.Now()
+
+	buf := new(bytes.Buffer)
 
 	// execute a first boot to check and capture the snapshot.
-	if err := b.runCommand(timeslice.NewState(), *bundleDir, *bundleName, *testCommand); err != nil {
+	if err := b.runCommand(buf, timeslice.NewState(), *bundleDir, *bundleName, *testCommand); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to perform first boot: %v\n%s\n", err, buf.String())
 		return fmt.Errorf("failed to perform first boot: %w", err)
 	}
 
-	timeslice.Record(tsOverallTime, time.Since(start))
+	timeslice.Record(tsOverallTime, time.Since(totalStart))
 
 	// enter the main loop
 	pb := progressbar.Default(int64(*n))
 	defer pb.Close()
 
+	totalStart = time.Now()
+
 	for range *n {
+		buf := new(bytes.Buffer)
+
 		start := time.Now()
 
 		state := timeslice.NewState()
 
-		if err := b.runCommand(state, *bundleDir, *bundleName, *testCommand); err != nil {
+		if err := b.runCommand(buf, state, *bundleDir, *bundleName, *testCommand); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to run command: %v\n%s\n", err, buf.String())
 			return fmt.Errorf("failed to run command: %w", err)
 		}
 
