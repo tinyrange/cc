@@ -1862,8 +1862,8 @@ func main() {
 			os.Exit(1)
 		}
 
-		fmt.Printf("running %s %+v\n", out.Path, flag.Args())
-		if err := runBuildOutput(out, flag.Args(), runOpts); err != nil {
+		fmt.Printf("running %s %+v\n", out.Path, fs.Args())
+		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
 			os.Exit(1)
 		}
 

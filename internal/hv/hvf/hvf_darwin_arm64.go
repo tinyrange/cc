@@ -1285,7 +1285,6 @@ func (h *hypervisor) Close() error {
 }
 
 var (
-	tsHvfPreInit              = timeslice.RegisterKind("hvf_pre_init", 0)
 	tsHvfVmCreate             = timeslice.RegisterKind("hvf_vm_create", 0)
 	tsHvfOnCreateVM           = timeslice.RegisterKind("hvf_on_create_vm", 0)
 	tsHvfAllocateMemory       = timeslice.RegisterKind("hvf_allocate_memory", 0)
@@ -1309,8 +1308,6 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 	}
 
 	vmConfig := bindings.HvVmConfigCreate()
-
-	timeslice.Record(tsHvfPreInit, time.Since(tsHvfStartTime))
 
 	vm := bindings.HvVmCreate(vmConfig)
 	if vm != bindings.HV_SUCCESS {

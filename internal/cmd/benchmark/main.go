@@ -17,6 +17,7 @@ import (
 	"github.com/tinyrange/cc/internal/initx"
 	"github.com/tinyrange/cc/internal/linux/kernel"
 	"github.com/tinyrange/cc/internal/oci"
+	"github.com/tinyrange/cc/internal/timeslice"
 	"github.com/tinyrange/cc/internal/vfs"
 )
 
@@ -34,13 +35,29 @@ func parseArchitecture(arch string) (hv.CpuArchitecture, error) {
 type benchmark struct {
 }
 
-func (b *benchmark) runCommand(bundleDir string, bundleName string, command string) error {
+var (
+	tsLoadMetadata              = timeslice.RegisterKind("benchmark::load_metadata", 0)
+	tsOciLoadFromDir            = timeslice.RegisterKind("benchmark::oci_load_from_dir", 0)
+	tsNewContainerFS            = timeslice.RegisterKind("benchmark::new_container_fs", 0)
+	tsNewVirtioFsBackend        = timeslice.RegisterKind("benchmark::new_virtiofs_backend", 0)
+	tsFactoryOpen               = timeslice.RegisterKind("benchmark::factory_open", 0)
+	tsKernelLoad                = timeslice.RegisterKind("benchmark::kernel_load", 0)
+	tsNewVirtualMachine         = timeslice.RegisterKind("benchmark::new_virtual_machine", 0)
+	tsBuildContainerInitProgram = timeslice.RegisterKind("benchmark::build_container_init_program", 0)
+	tsStartSession              = timeslice.RegisterKind("benchmark::start_session", 0)
+	tsWaitForSession            = timeslice.RegisterKind("benchmark::wait_for_session", 0)
+	tsCleanup                   = timeslice.RegisterKind("benchmark::cleanup", 0)
+)
+
+func (b *benchmark) runCommand(tsRecord *timeslice.Recorder, bundleDir string, bundleName string, command string) error {
 	bundlePath := filepath.Join(bundleDir, bundleName)
 
 	meta, err := bundle.LoadMetadata(bundlePath)
 	if err != nil {
 		return fmt.Errorf("")
 	}
+
+	tsRecord.Record(tsLoadMetadata)
 
 	// Determine image directory
 	imageDir := filepath.Join(bundlePath, meta.Boot.ImageDir)
@@ -60,11 +77,15 @@ func (b *benchmark) runCommand(bundleDir string, bundleName string, command stri
 		return fmt.Errorf("load image: %w", err)
 	}
 
+	tsRecord.Record(tsOciLoadFromDir)
+
 	containerFS, err := oci.NewContainerFS(img)
 	if err != nil {
 		return fmt.Errorf("create container filesystem: %w", err)
 	}
 	defer containerFS.Close()
+
+	tsRecord.Record(tsNewContainerFS)
 
 	commandArgs := []string{"/bin/sh", "-c", command}
 
@@ -73,16 +94,22 @@ func (b *benchmark) runCommand(bundleDir string, bundleName string, command stri
 		return fmt.Errorf("set container filesystem as root: %w", err)
 	}
 
+	tsRecord.Record(tsNewVirtioFsBackend)
+
 	h, err := factory.OpenWithArchitecture(hvArch)
 	if err != nil {
 		return fmt.Errorf("create hypervisor: %w", err)
 	}
 	defer h.Close()
 
+	tsRecord.Record(tsFactoryOpen)
+
 	kernelLoader, err := kernel.LoadForArchitecture(hvArch)
 	if err != nil {
 		return fmt.Errorf("load kernel: %w", err)
 	}
+
+	tsRecord.Record(tsKernelLoad)
 
 	buf := new(bytes.Buffer)
 
@@ -101,6 +128,8 @@ func (b *benchmark) runCommand(bundleDir string, bundleName string, command stri
 	}
 	defer vm.Close()
 
+	tsRecord.Record(tsNewVirtualMachine)
+
 	// Build init program
 	prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
 		Arch:    hvArch,
@@ -115,9 +144,19 @@ func (b *benchmark) runCommand(bundleDir string, bundleName string, command stri
 		return fmt.Errorf("build init program: %w", err)
 	}
 
+	tsRecord.Record(tsBuildContainerInitProgram)
+
 	session := initx.StartSession(context.Background(), vm, prog, initx.SessionConfig{})
 
-	return session.Wait()
+	tsRecord.Record(tsStartSession)
+
+	if err := session.Wait(); err != nil {
+		return fmt.Errorf("failed to wait for session: %w", err)
+	}
+
+	tsRecord.Record(tsWaitForSession)
+
+	return nil
 }
 
 func (b *benchmark) run() error {
@@ -128,8 +167,24 @@ func (b *benchmark) run() error {
 	bundleName := fs.String("bundle", "alpine", "the oci image name to run inside the virtual machine")
 	testCommand := fs.String("cmd", "whoami", "the command to execute inside the virtual machine")
 
+	tsFile := fs.String("tsfile", "", "record a timeslice file for later analysis")
+
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return fmt.Errorf("failed to parse args: %w", err)
+	}
+
+	if *tsFile != "" {
+		f, err := os.Create(*tsFile)
+		if err != nil {
+			return fmt.Errorf("failed to create tsfile: %w", err)
+		}
+		defer f.Close()
+
+		closer, err := timeslice.StartRecording(f)
+		if err != nil {
+			return fmt.Errorf("failed to start recording timeslices: %w", err)
+		}
+		defer closer.Close()
 	}
 
 	if *bundleDir == "" {
@@ -145,9 +200,13 @@ func (b *benchmark) run() error {
 	defer pb.Close()
 
 	for range *n {
-		if err := b.runCommand(*bundleDir, *bundleName, *testCommand); err != nil {
+		state := timeslice.NewState()
+
+		if err := b.runCommand(state, *bundleDir, *bundleName, *testCommand); err != nil {
 			return fmt.Errorf("failed to run command: %w", err)
 		}
+
+		state.Record(tsCleanup)
 
 		pb.Add(1)
 	}
