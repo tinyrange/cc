@@ -99,8 +99,8 @@ func (m *mockVM) AddDevice(dev hv.Device) error {
 	return nil
 }
 
-func (m *mockVM) AddDeviceFromTemplate(template hv.DeviceTemplate) error {
-	return nil
+func (m *mockVM) AddDeviceFromTemplate(template hv.DeviceTemplate) (hv.Device, error) {
+	return nil, nil
 }
 
 func (m *mockVM) AllocateMemory(physAddr, size uint64) (hv.MemoryRegion, error) {
@@ -112,6 +112,18 @@ func (m *mockVM) CaptureSnapshot() (hv.Snapshot, error) {
 }
 
 func (m *mockVM) RestoreSnapshot(snap hv.Snapshot) error {
+	return nil
+}
+
+func (m *mockVM) AllocateMMIO(req hv.MMIOAllocationRequest) (hv.MMIOAllocation, error) {
+	return hv.MMIOAllocation{}, nil
+}
+
+func (m *mockVM) RegisterFixedMMIO(name string, base, size uint64) error {
+	return nil
+}
+
+func (m *mockVM) GetAllocatedMMIORegions() []hv.MMIOAllocation {
 	return nil
 }
 

@@ -17,6 +17,7 @@ type AppSettings struct {
 	CleanupPending        string    `json:"cleanup_pending,omitempty"`    // Path to delete on next startup
 	CleanupRetryCount     int       `json:"cleanup_retry_count,omitempty"` // Number of cleanup retry attempts
 	CreateDesktopShortcut bool      `json:"create_desktop_shortcut"`      // Create desktop/start menu shortcut (Windows/Linux)
+	SnapshotCacheEnabled  bool      `json:"snapshot_cache_enabled"`       // Enable VM boot snapshot caching (default: false)
 }
 
 // SettingsStore manages persistent storage of application settings
@@ -117,5 +118,11 @@ func (s *SettingsStore) IncrementCleanupRetryCount() (int, error) {
 func (s *SettingsStore) ClearCleanupPending() error {
 	s.settings.CleanupPending = ""
 	s.settings.CleanupRetryCount = 0
+	return s.save()
+}
+
+// SetSnapshotCacheEnabled sets the snapshot cache preference
+func (s *SettingsStore) SetSnapshotCacheEnabled(enabled bool) error {
+	s.settings.SnapshotCacheEnabled = enabled
 	return s.save()
 }

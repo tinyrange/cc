@@ -101,8 +101,22 @@ func (t GPUTemplate) Create(vm hv.VirtualMachine) (hv.Device, error) {
 		height = 768
 	}
 
+	// Allocate MMIO region dynamically
+	mmioBase := uint64(GPUDefaultMMIOBase)
+	if vm != nil {
+		alloc, err := vm.AllocateMMIO(hv.MMIOAllocationRequest{
+			Name:      "virtio-gpu",
+			Size:      GPUDefaultMMIOSize,
+			Alignment: 0x1000,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("virtio-gpu: allocate MMIO: %w", err)
+		}
+		mmioBase = alloc.Base
+	}
+
 	gpu := &GPU{
-		base:    GPUDefaultMMIOBase,
+		base:    mmioBase,
 		size:    GPUDefaultMMIOSize,
 		irqLine: encodedLine,
 		width:   width,
@@ -699,6 +713,21 @@ func (g *GPU) GetFramebuffer() (pixels []byte, width, height, format uint32, ok 
 	pixels = make([]byte, len(resource.pixels))
 	copy(pixels, resource.pixels)
 	return pixels, resource.width, resource.height, resource.format, true
+}
+
+// AllocatedMMIOBase implements AllocatedVirtioMMIODevice.
+func (g *GPU) AllocatedMMIOBase() uint64 {
+	return g.base
+}
+
+// AllocatedMMIOSize implements AllocatedVirtioMMIODevice.
+func (g *GPU) AllocatedMMIOSize() uint64 {
+	return g.size
+}
+
+// AllocatedIRQLine implements AllocatedVirtioMMIODevice.
+func (g *GPU) AllocatedIRQLine() uint32 {
+	return g.irqLine
 }
 
 var (

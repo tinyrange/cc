@@ -15,6 +15,7 @@ var (
 	loadErr  error
 
 	hypervisorLib uintptr
+	libSystemLib  uintptr
 )
 
 // Load loads Hypervisor.framework and binds all arm64-exported Hypervisor APIs.
@@ -136,6 +137,20 @@ func Load() error {
 
 		// SME config
 		purego.RegisterLibFunc(&hv_sme_config_get_max_svl_bytes, hypervisorLib, "hv_sme_config_get_max_svl_bytes")
+
+		// Load libSystem for Mach VM functions (vm_copy for COW)
+		libSystemLib, err = purego.Dlopen(
+			"/usr/lib/libSystem.B.dylib",
+			purego.RTLD_GLOBAL|purego.RTLD_LAZY,
+		)
+		if err != nil {
+			loadErr = fmt.Errorf("purego dlopen libSystem: %w", err)
+			return
+		}
+
+		purego.RegisterLibFunc(&mach_task_self, libSystemLib, "mach_task_self")
+		purego.RegisterLibFunc(&vm_copy, libSystemLib, "vm_copy")
+		purego.RegisterLibFunc(&os_release, libSystemLib, "os_release")
 	})
 	return loadErr
 }
@@ -265,3 +280,29 @@ var (
 var (
 	hv_sme_config_get_max_svl_bytes func(value *uintptr) Return
 )
+
+// Mach VM functions (from libSystem)
+var (
+	mach_task_self func() uint32
+	vm_copy        func(targetTask uint32, sourceAddr uintptr, size uintptr, destAddr uintptr) int32
+	os_release     func(obj uintptr)
+)
+
+// VmCopy performs a copy-on-write memory copy using the Mach vm_copy syscall.
+// This is an O(1) operation that sets up COW page table entries - the actual
+// page copying is deferred until either source or destination is written to.
+func VmCopy(source, dest uintptr, size uintptr) error {
+	ret := vm_copy(mach_task_self(), source, size, dest)
+	if ret != 0 {
+		return fmt.Errorf("vm_copy failed with kern_return_t: %d", ret)
+	}
+	return nil
+}
+
+// OsRelease releases an os_object (such as VMConfig, VcpuConfig, GICConfig, GICState).
+// These objects are reference-counted and must be released to avoid resource leaks.
+func OsRelease(obj uintptr) {
+	if obj != 0 {
+		os_release(obj)
+	}
+}

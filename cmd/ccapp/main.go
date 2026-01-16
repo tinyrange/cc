@@ -18,6 +18,7 @@ import (
 
 	"github.com/tinyrange/cc/internal/assets"
 	"github.com/tinyrange/cc/internal/bundle"
+	"github.com/tinyrange/cc/internal/debug"
 	"github.com/tinyrange/cc/internal/devices/virtio"
 	"github.com/tinyrange/cc/internal/gowin/graphics"
 	"github.com/tinyrange/cc/internal/gowin/text"
@@ -77,6 +78,9 @@ type bootPrep struct {
 
 	// QEMU emulation config (for cross-architecture images)
 	qemuConfig *initx.QEMUEmulationConfig
+
+	// Snapshot caching config
+	useCommandLoop bool // If true, use CommandLoop mode for snapshot caching
 
 	// resources created during prep (must be cleaned up on error)
 	containerFS  *oci.ContainerFS
@@ -206,6 +210,9 @@ type Application struct {
 	// Shutdown state
 	shutdownRequested bool
 	shutdownCode      int
+
+	// Snapshot cache for fast VM startup
+	snapshotCache *initx.SnapshotCache
 }
 
 type rect struct {
@@ -504,6 +511,15 @@ func getBundlesDir() string {
 	return filepath.Join(configDir, "ccapp", "bundles")
 }
 
+// getSnapshotCacheDir returns the path to the snapshot cache directory.
+func getSnapshotCacheDir() (string, error) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(configDir, "ccapp", "snapshots"), nil
+}
+
 func (app *Application) Run() error {
 	var err error
 
@@ -604,6 +620,21 @@ func (app *Application) Run() error {
 					settingsStore.ClearCleanupPending() // This resets retry count
 				}
 			}
+		}
+	}
+
+	// Initialize snapshot cache for fast VM startup (if enabled in settings)
+	if app.settings != nil && app.settings.Get().SnapshotCacheEnabled {
+		if snapshotIO := initx.GetSnapshotIO(); snapshotIO != nil {
+			cacheDir, err := getSnapshotCacheDir()
+			if err != nil {
+				slog.Warn("failed to get snapshot cache directory", "error", err)
+			} else {
+				app.snapshotCache = initx.NewSnapshotCache(cacheDir, snapshotIO)
+				slog.Info("snapshot cache initialized", "cache_dir", cacheDir)
+			}
+		} else {
+			slog.Debug("snapshot caching not available on this platform")
 		}
 	}
 
@@ -1271,20 +1302,23 @@ func (app *Application) startBootBundle(index int) {
 	preOpenedHV := app.hypervisor
 	app.hypervisor = nil
 
+	// Check if snapshot caching is enabled
+	useCommandLoop := app.snapshotCache != nil
+
 	// Background prep: do anything slow/off-GPU here (disk IO, kernel fetch, etc).
-	go func(b discoveredBundle, arch hv.CpuArchitecture, hvArg hv.Hypervisor, out chan<- bootResult) {
-		prep, err := prepareBootBundle(b, arch, hvArg)
+	go func(b discoveredBundle, arch hv.CpuArchitecture, hvArg hv.Hypervisor, cmdLoop bool, out chan<- bootResult) {
+		prep, err := prepareBootBundle(b, arch, hvArg, cmdLoop)
 		out <- bootResult{prep: prep, err: err}
-	}(b, hvArch, preOpenedHV, ch)
+	}(b, hvArch, preOpenedHV, useCommandLoop, ch)
 }
 
-func prepareBootBundle(b discoveredBundle, hvArch hv.CpuArchitecture, preOpenedHV hv.Hypervisor) (_ *bootPrep, retErr error) {
+func prepareBootBundle(b discoveredBundle, hvArch hv.CpuArchitecture, preOpenedHV hv.Hypervisor, useCommandLoop bool) (_ *bootPrep, retErr error) {
 	if b.Dir == "" {
 		return nil, fmt.Errorf("invalid bundle: empty dir")
 	}
-	slog.Info("boot bundle prep started", "bundle_dir", b.Dir, "bundle_name", b.Meta.Name, "arch", hvArch)
+	slog.Info("boot bundle prep started", "bundle_dir", b.Dir, "bundle_name", b.Meta.Name, "arch", hvArch, "command_loop", useCommandLoop)
 
-	prep := &bootPrep{hvArch: hvArch}
+	prep := &bootPrep{hvArch: hvArch, useCommandLoop: useCommandLoop}
 	defer func() {
 		if retErr != nil {
 			// Best-effort cleanup on failure.
@@ -1504,21 +1538,55 @@ func (app *Application) finalizeBoot(prep *bootPrep) (retErr error) {
 		opts = append(opts, initx.WithQEMUEmulationEnabled(true))
 	}
 
+	// Snapshot caching setup
+	var sessionCfg initx.SessionConfig
+	var configHash hv.VMConfigHash
+
+	if prep.useCommandLoop && app.snapshotCache != nil {
+		// Compute config hash based on VM configuration
+		configHash = hv.ComputeConfigHash(
+			prep.hvArch,
+			prep.memoryMB<<20, // Convert MB to bytes
+			0,                 // Memory base will be set by VM creation
+			prep.cpus,
+			nil, // Device configs - simplified for now
+		)
+
+		// Use a very old time as reference - snapshots are valid unless explicitly invalidated
+		var referenceTime time.Time
+
+		if app.snapshotCache.HasValidSnapshot(configHash, referenceTime) {
+			// Try to load cached snapshot
+			snap, loadErr := app.snapshotCache.LoadSnapshot(configHash)
+			if loadErr == nil {
+				debug.Writef("ccapp.finalizeBoot snapshot", "using cached snapshot")
+				opts = append(opts, initx.WithSnapshot(snap))
+				sessionCfg.SkipBoot = true
+			} else {
+				slog.Debug("Failed to load snapshot, falling back to boot", "error", loadErr)
+			}
+		}
+	}
+
 	vm, err := initx.NewVirtualMachine(prep.hypervisor, prep.cpus, prep.memoryMB, prep.kernelLoader, opts...)
 	if err != nil {
 		termView.Close()
 		return fmt.Errorf("create VM: %w", err)
 	}
 
-	// Build init program with network always enabled.
+	// Build init program - use CommandLoop mode if snapshot caching is enabled
 	prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
-		Arch:          prep.hvArch,
-		Cmd:           prep.execCmd,
-		Env:           prep.env,
-		WorkDir:       prep.workDir,
-		EnableNetwork: true,
-		Exec:          prep.exec,
-		QEMUEmulation: prep.qemuConfig,
+		Arch:                  prep.hvArch,
+		Cmd:                   prep.execCmd, // Used when CommandLoop is false
+		Env:                   prep.env,
+		WorkDir:               prep.workDir,
+		EnableNetwork:         true,
+		Exec:                  prep.exec,
+		CommandLoop:           prep.useCommandLoop,
+		QEMUEmulation:         prep.qemuConfig,
+		MailboxPhysAddr:       vm.MailboxPhysAddr(),
+		TimesliceMMIOPhysAddr: vm.TimesliceMMIOPhysAddr(),
+		ConfigRegionPhysAddr:  vm.ConfigRegionPhysAddr(),
 	})
 	if err != nil {
 		vm.Close()
@@ -1526,8 +1594,48 @@ func (app *Application) finalizeBoot(prep *bootPrep) (retErr error) {
 		return err
 	}
 
-	session := initx.StartSession(context.Background(), vm, prog, initx.SessionConfig{})
-	slog.Info("VM session started")
+	// Handle snapshot caching for CommandLoop mode
+	if prep.useCommandLoop && app.snapshotCache != nil {
+		if sessionCfg.SkipBoot {
+			// Restored from snapshot - write the command to execute
+			if writeErr := vm.WriteExecCommand(prep.execCmd[0], prep.execCmd, prep.env); writeErr != nil {
+				slog.Debug("Failed to write exec command after restore", "error", writeErr)
+				vm.Close()
+				termView.Close()
+				return fmt.Errorf("write exec command: %w", writeErr)
+			}
+			debug.Writef("ccapp.finalizeBoot snapshot", "command written after restore")
+		} else {
+			// Set up callback to capture snapshot after boot completes
+			sessionCfg.OnBootComplete = func() error {
+				// Clear any stale command before capturing snapshot
+				if clearErr := vm.ClearExecCommand(); clearErr != nil {
+					slog.Debug("Failed to clear exec command before snapshot", "error", clearErr)
+				}
+
+				snap, captureErr := vm.CaptureSnapshot()
+				if captureErr != nil {
+					slog.Debug("Failed to capture boot snapshot", "error", captureErr)
+					return nil // Don't fail the session
+				}
+				if saveErr := app.snapshotCache.SaveSnapshot(configHash, snap); saveErr != nil {
+					slog.Debug("Failed to save boot snapshot", "error", saveErr)
+				} else {
+					debug.Writef("ccapp.finalizeBoot snapshot", "saved to cache")
+				}
+
+				// Write the command for the guest to execute
+				if writeErr := vm.WriteExecCommand(prep.execCmd[0], prep.execCmd, prep.env); writeErr != nil {
+					return fmt.Errorf("write exec command: %w", writeErr)
+				}
+
+				return nil
+			}
+		}
+	}
+
+	session := initx.StartSession(context.Background(), vm, prog, sessionCfg)
+	slog.Info("VM session started", "command_loop", prep.useCommandLoop, "skip_boot", sessionCfg.SkipBoot)
 
 	app.running = &runningVM{
 		vm:          vm,
@@ -1613,6 +1721,9 @@ func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string
 	preOpenedHV := app.hypervisor
 	app.hypervisor = nil
 
+	// Check if snapshot caching is enabled
+	useCommandLoop := app.snapshotCache != nil
+
 	// Create progress callback for image downloads
 	progressCallback := func(progress oci.DownloadProgress) {
 		app.bootProgressMu.Lock()
@@ -1620,7 +1731,7 @@ func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string
 		app.bootProgressMu.Unlock()
 	}
 
-	go func(srcType VMSourceType, srcPath string, arch hv.CpuArchitecture, hvArg hv.Hypervisor, out chan<- bootResult, progressCb oci.ProgressCallback) {
+	go func(srcType VMSourceType, srcPath string, arch hv.CpuArchitecture, hvArg hv.Hypervisor, cmdLoop bool, out chan<- bootResult, progressCb oci.ProgressCallback) {
 		var prep *bootPrep
 		var err error
 
@@ -1632,20 +1743,20 @@ func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string
 				out <- bootResult{err: metaErr}
 				return
 			}
-			prep, err = prepareBootBundle(discoveredBundle{Dir: srcPath, Meta: meta}, arch, hvArg)
+			prep, err = prepareBootBundle(discoveredBundle{Dir: srcPath, Meta: meta}, arch, hvArg, cmdLoop)
 
 		case VMSourceTarball:
-			prep, err = prepareFromTarball(srcPath, arch, hvArg)
+			prep, err = prepareFromTarball(srcPath, arch, hvArg, cmdLoop)
 
 		case VMSourceImageName:
-			prep, err = prepareFromImageName(srcPath, arch, hvArg, progressCb)
+			prep, err = prepareFromImageName(srcPath, arch, hvArg, cmdLoop, progressCb)
 
 		default:
 			err = fmt.Errorf("unknown source type: %s", srcType)
 		}
 
 		out <- bootResult{prep: prep, err: err}
-	}(sourceType, sourcePath, hvArch, preOpenedHV, ch, progressCallback)
+	}(sourceType, sourcePath, hvArch, preOpenedHV, useCommandLoop, ch, progressCallback)
 }
 
 // installBundle installs a VM source as a bundle in the bundles directory.
@@ -1757,8 +1868,8 @@ func installImageAsBundle(img *oci.Image, bundlePath, name, source string) error
 }
 
 // prepareFromTarball loads a VM from an OCI tarball
-func prepareFromTarball(tarPath string, hvArch hv.CpuArchitecture, preOpenedHV hv.Hypervisor) (*bootPrep, error) {
-	slog.Info("loading VM from tarball", "path", tarPath, "arch", hvArch)
+func prepareFromTarball(tarPath string, hvArch hv.CpuArchitecture, preOpenedHV hv.Hypervisor, useCommandLoop bool) (*bootPrep, error) {
+	slog.Info("loading VM from tarball", "path", tarPath, "arch", hvArch, "command_loop", useCommandLoop)
 
 	client, err := oci.NewClient("")
 	if err != nil {
@@ -1770,12 +1881,12 @@ func prepareFromTarball(tarPath string, hvArch hv.CpuArchitecture, preOpenedHV h
 		return nil, fmt.Errorf("load tarball: %w", err)
 	}
 
-	return prepareFromImage(img, hvArch, preOpenedHV)
+	return prepareFromImage(img, hvArch, preOpenedHV, useCommandLoop)
 }
 
 // prepareFromImageName pulls a container image and prepares it for boot
-func prepareFromImageName(imageName string, hvArch hv.CpuArchitecture, preOpenedHV hv.Hypervisor, progressCallback oci.ProgressCallback) (*bootPrep, error) {
-	slog.Info("pulling container image", "image", imageName, "arch", hvArch)
+func prepareFromImageName(imageName string, hvArch hv.CpuArchitecture, preOpenedHV hv.Hypervisor, useCommandLoop bool, progressCallback oci.ProgressCallback) (*bootPrep, error) {
+	slog.Info("pulling container image", "image", imageName, "arch", hvArch, "command_loop", useCommandLoop)
 
 	client, err := oci.NewClient("")
 	if err != nil {
@@ -1792,12 +1903,12 @@ func prepareFromImageName(imageName string, hvArch hv.CpuArchitecture, preOpened
 		return nil, fmt.Errorf("pull image: %w", err)
 	}
 
-	return prepareFromImage(img, hvArch, preOpenedHV)
+	return prepareFromImage(img, hvArch, preOpenedHV, useCommandLoop)
 }
 
 // prepareFromImage prepares a VM from an already-loaded OCI image
-func prepareFromImage(img *oci.Image, hvArch hv.CpuArchitecture, preOpenedHV hv.Hypervisor) (_ *bootPrep, retErr error) {
-	prep := &bootPrep{hvArch: hvArch}
+func prepareFromImage(img *oci.Image, hvArch hv.CpuArchitecture, preOpenedHV hv.Hypervisor, useCommandLoop bool) (_ *bootPrep, retErr error) {
+	prep := &bootPrep{hvArch: hvArch, useCommandLoop: useCommandLoop}
 	defer func() {
 		if retErr != nil {
 			if prep.hypervisor != nil {

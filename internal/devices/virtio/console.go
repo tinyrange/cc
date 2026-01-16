@@ -81,9 +81,24 @@ func (t ConsoleTemplate) Create(vm hv.VirtualMachine) (hv.Device, error) {
 	arch := t.ArchOrDefault(vm)
 	irqLine := t.IRQLineForArch(arch)
 	encodedLine := EncodeIRQLineForArch(arch, irqLine)
+
+	// Allocate MMIO region dynamically
+	mmioBase := config.DefaultMMIOBase
+	if vm != nil {
+		alloc, err := vm.AllocateMMIO(hv.MMIOAllocationRequest{
+			Name:      config.DeviceName,
+			Size:      config.DefaultMMIOSize,
+			Alignment: 0x1000,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("virtio-console: allocate MMIO: %w", err)
+		}
+		mmioBase = alloc.Base
+	}
+
 	console := &Console{
 		MMIODeviceBase: NewMMIODeviceBase(
-			config.DefaultMMIOBase,
+			mmioBase,
 			config.DefaultMMIOSize,
 			encodedLine,
 			config,

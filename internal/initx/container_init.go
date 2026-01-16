@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"strings"
 
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/ir"
@@ -38,11 +39,18 @@ type QEMUEmulationConfig struct {
 
 type ContainerInitConfig struct {
 	Arch          hv.CpuArchitecture
-	Cmd           []string
+	Cmd           []string // Required unless CommandLoop is true
 	Env           []string
 	WorkDir       string
 	EnableNetwork bool
-	Exec          bool
+	Exec          bool // Only used when CommandLoop is false
+
+	// CommandLoop enables the late-snapshot command loop mode.
+	// When true, the container init will signal readiness for snapshot after
+	// container setup, then enter a loop waiting for commands from the host.
+	// Commands are passed via WriteExecCommand() after snapshot restore.
+	// When false (default), the Cmd field is baked into the init program.
+	CommandLoop bool
 
 	Hostname    string // default: tinyrange
 	DNS         string // default: 10.42.0.1
@@ -57,6 +65,12 @@ type ContainerInitConfig struct {
 	// QEMUEmulation enables cross-architecture binary emulation.
 	// If set, QEMU static binaries will be installed and binfmt-misc configured.
 	QEMUEmulation *QEMUEmulationConfig
+
+	// MMIO physical addresses (dynamically allocated by hypervisor)
+	// If 0, uses default values for backwards compatibility.
+	MailboxPhysAddr       uint64
+	TimesliceMMIOPhysAddr uint64
+	ConfigRegionPhysAddr  uint64
 }
 
 func (c *ContainerInitConfig) applyDefaults() {
@@ -101,8 +115,9 @@ func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
 	if cfg.Arch == "" || cfg.Arch == hv.ArchitectureInvalid {
 		return nil, fmt.Errorf("initx: container init requires valid architecture")
 	}
-	if len(cfg.Cmd) == 0 || cfg.Cmd[0] == "" {
-		return nil, fmt.Errorf("initx: container init requires non-empty command")
+	// Cmd is only required when not using command loop mode
+	if !cfg.CommandLoop && (len(cfg.Cmd) == 0 || cfg.Cmd[0] == "") {
+		return nil, fmt.Errorf("initx: container init requires non-empty command (unless CommandLoop is enabled)")
 	}
 
 	// Determine target architecture for runtime.GOARCH
@@ -120,6 +135,7 @@ func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
 	flags := map[string]bool{
 		"network":         cfg.EnableNetwork,
 		"exec":            cfg.Exec,
+		"command_loop":    cfg.CommandLoop,
 		"drop_privileges": cfg.UID != nil,
 		"qemu_emulation":  cfg.QEMUEmulation != nil,
 	}
@@ -152,8 +168,29 @@ func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
 		config["resolv_content"] = ""
 	}
 
+	// Preprocess the source to inject dynamic MMIO addresses
+	source := rtgContainerInitSource
+	if cfg.MailboxPhysAddr != 0 {
+		source = strings.Replace(source,
+			"mailboxPhysAddr       = 0xf0000000",
+			fmt.Sprintf("mailboxPhysAddr       = 0x%x", cfg.MailboxPhysAddr),
+			1)
+	}
+	if cfg.TimesliceMMIOPhysAddr != 0 {
+		source = strings.Replace(source,
+			"timesliceMMIOPhysAddr = 0xf0001000",
+			fmt.Sprintf("timesliceMMIOPhysAddr = 0x%x", cfg.TimesliceMMIOPhysAddr),
+			1)
+	}
+	if cfg.ConfigRegionPhysAddr != 0 {
+		source = strings.Replace(source,
+			"configRegionPhysAddr  = 0xf0003000",
+			fmt.Sprintf("configRegionPhysAddr  = 0x%x", cfg.ConfigRegionPhysAddr),
+			1)
+	}
+
 	// Compile the RTG source with architecture, flags, and config
-	prog, err := rtg.CompileProgramWithOptions(rtgContainerInitSource, rtg.CompileOptions{
+	prog, err := rtg.CompileProgramWithOptions(source, rtg.CompileOptions{
 		GOARCH: goarch,
 		Flags:  flags,
 		Config: config,
@@ -220,26 +257,42 @@ func injectContainerInitHelpers(prog *ir.Program, cfg ContainerInitConfig) error
 		}
 	}
 
-	// Command execution helpers (require dynamic argv/envp construction)
-	execErrLabel := ir.Label("__cc_exec_error")
-	forkErrLabel := ir.Label("__cc_fork_error")
+	// Command execution helpers
+	if cfg.CommandLoop {
+		// Command loop mode: inject forkExecWaitFromConfig helper
+		// This reads command from config region and executes it
+		forkConfigErrLabel := ir.Label("__cc_forkconfig_error")
 
-	prog.Methods["execCommand"] = ir.Method{
-		Exec(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, execErrLabel, errVar),
-		ir.Return(ir.Int64(0)),
-		ir.DeclareLabel(execErrLabel, ir.Block{
-			ir.Printf("cc: execCommand error: errno=0x%x\n", errVar),
-			rebootFragment(cfg.Arch),
-		}),
-	}
+		prog.Methods["forkExecWaitFromConfig"] = ir.Method{
+			ForkExecWaitFromConfig(cfg.Arch, cfg.Env, cfg.ConfigRegionPhysAddr, cfg.TimesliceMMIOPhysAddr, forkConfigErrLabel, errVar),
+			ir.Return(errVar),
+			ir.DeclareLabel(forkConfigErrLabel, ir.Block{
+				ir.Printf("cc: forkExecWaitFromConfig error: errno=0x%x\n", errVar),
+				rebootFragment(cfg.Arch),
+			}),
+		}
+	} else {
+		// Legacy mode: inject baked-in command helpers
+		execErrLabel := ir.Label("__cc_exec_error")
+		forkErrLabel := ir.Label("__cc_fork_error")
 
-	prog.Methods["forkExecWait"] = ir.Method{
-		ForkExecWait(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, forkErrLabel, errVar),
-		ir.Return(errVar),
-		ir.DeclareLabel(forkErrLabel, ir.Block{
-			ir.Printf("cc: forkExecWait error: errno=0x%x\n", errVar),
-			rebootFragment(cfg.Arch),
-		}),
+		prog.Methods["execCommand"] = ir.Method{
+			Exec(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, execErrLabel, errVar),
+			ir.Return(ir.Int64(0)),
+			ir.DeclareLabel(execErrLabel, ir.Block{
+				ir.Printf("cc: execCommand error: errno=0x%x\n", errVar),
+				rebootFragment(cfg.Arch),
+			}),
+		}
+
+		prog.Methods["forkExecWait"] = ir.Method{
+			ForkExecWait(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, forkErrLabel, errVar),
+			ir.Return(errVar),
+			ir.DeclareLabel(forkErrLabel, ir.Block{
+				ir.Printf("cc: forkExecWait error: errno=0x%x\n", errVar),
+				rebootFragment(cfg.Arch),
+			}),
+		}
 	}
 
 	// Privilege dropping helper (setgid must be called before setuid)

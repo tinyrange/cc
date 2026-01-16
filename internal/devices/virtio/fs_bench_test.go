@@ -74,12 +74,19 @@ func (vm *fsTestVM) MemoryBase() uint64                                        {
 func (vm *fsTestVM) Run(ctx context.Context, cfg hv.RunConfig) error           { return nil }
 func (vm *fsTestVM) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error { return nil }
 func (vm *fsTestVM) AddDevice(dev hv.Device) error                             { return nil }
-func (vm *fsTestVM) AddDeviceFromTemplate(template hv.DeviceTemplate) error    { return nil }
+func (vm *fsTestVM) AddDeviceFromTemplate(template hv.DeviceTemplate) (hv.Device, error) {
+	return nil, nil
+}
 func (vm *fsTestVM) AllocateMemory(physAddr, size uint64) (hv.MemoryRegion, error) {
 	return nil, fmt.Errorf("not implemented")
 }
-func (vm *fsTestVM) CaptureSnapshot() (hv.Snapshot, error) { return nil, nil }
+func (vm *fsTestVM) CaptureSnapshot() (hv.Snapshot, error)  { return nil, nil }
 func (vm *fsTestVM) RestoreSnapshot(snap hv.Snapshot) error { return nil }
+func (vm *fsTestVM) AllocateMMIO(req hv.MMIOAllocationRequest) (hv.MMIOAllocation, error) {
+	return hv.MMIOAllocation{}, nil
+}
+func (vm *fsTestVM) RegisterFixedMMIO(name string, base, size uint64) error { return nil }
+func (vm *fsTestVM) GetAllocatedMMIORegions() []hv.MMIOAllocation           { return nil }
 
 var _ hv.VirtualMachine = (*fsTestVM)(nil)
 

@@ -16,11 +16,22 @@ const (
 
 // Memory layout
 const (
-	mailboxMapSize       = 0x1000
-	configRegionSize     = 4194304 // 4MB
-	mailboxPhysAddr      = 0xf0000000
-	configRegionPhysAddr = 0xf0003000
+	mailboxMapSize         = 0x1000
+	configRegionSize       = 4194304 // 4MB
+	mailboxPhysAddr        = 0xf0000000
+	timesliceMMIOPhysAddr  = 0xf0001000
+	timesliceMMIOMapSize   = 0x1000
+	configRegionPhysAddr   = 0xf0003000
 )
+
+// Timeslice IDs - must match constants in hvf_darwin_arm64.go
+// Guest writes these values to timesliceMem offset 0 to record markers
+// 0=init_start, 1=phase1_dev_create, 2=phase2_mount_dev, 3=phase2_mount_shm
+// 5=phase4_console_open, 6=phase4_setsid, 8=phase4_dup
+// 9=phase5_mem_open, 10=phase5_mailbox_map, 11=phase5_ts_map
+// 12=phase5_config_map, 13=phase5_anon_map, 14=phase6_time_setup
+// 15=phase7_loop_start, 16=phase7_copy_payload, 17=phase7_relocate
+// 18=phase7_isb, 19=phase7_call_payload, 20=phase7_payload_done
 
 // Config region offsets
 const (
@@ -106,11 +117,26 @@ func main() int64 {
 		reboot()
 	}
 
+	// map timeslice MMIO region for guest-side timeslice recording
+	timesliceMem := runtime.Syscall(runtime.SYS_MMAP, 0, timesliceMMIOMapSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_SHARED, memFd, timesliceMMIOPhysAddr)
+	if timesliceMem < 0 {
+		// Timeslice mapping is optional - continue without it
+		timesliceMem = 0
+	}
+	// Record: phase5_ts_map (11)
+	if timesliceMem > 0 {
+		runtime.Store32(timesliceMem, 0, 11)
+	}
+
 	// map config region (4MB)
 	configMem := runtime.Syscall(runtime.SYS_MMAP, 0, configRegionSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_SHARED, memFd, configRegionPhysAddr)
 	if configMem < 0 {
 		runtime.Printf("initx: failed to map config region (errno=0x%x)\n", 0-configMem)
 		reboot()
+	}
+	// Record: phase5_config_map (12)
+	if timesliceMem > 0 {
+		runtime.Store32(timesliceMem, 0, 12)
 	}
 
 	// map anonymous region for payload execution (4MB)
@@ -118,6 +144,10 @@ func main() int64 {
 	if anonMem < 0 {
 		runtime.Printf("initx: failed to map anonymous payload region (errno=0x%x)\n", 0-anonMem)
 		reboot()
+	}
+	// Record: phase5_anon_map (13)
+	if timesliceMem > 0 {
+		runtime.Store32(timesliceMem, 0, 13)
 	}
 
 	// === Phase 6: Time setup ===
@@ -142,10 +172,18 @@ func main() int64 {
 		// free timespec buffer
 		runtime.Syscall(runtime.SYS_MUNMAP, timespecMem, 16)
 	}
+	// Record: phase6_time_setup (14)
+	if timesliceMem > 0 {
+		runtime.Store32(timesliceMem, 0, 14)
+	}
 
 	// === Phase 7: Main loop ===
 
 	for {
+		// Record: phase7_loop_start (15)
+		if timesliceMem > 0 {
+			runtime.Store32(timesliceMem, 0, 15)
+		}
 		// check for magic value
 		var configMagic int64 = 0
 		configMagic = runtime.Load32(configMem, 0)
@@ -189,6 +227,10 @@ func main() int64 {
 				copySrc = copySrc + 1
 				remaining = remaining - 1
 			}
+			// Record: phase7_copy_payload (16)
+			if timesliceMem > 0 {
+				runtime.Store32(timesliceMem, 0, 16)
+			}
 
 			// apply relocations
 			var relocPtr int64 = 0
@@ -211,14 +253,30 @@ func main() int64 {
 				runtime.Store64(patchPtr, 0, patchValue)
 				relocIndex = relocIndex + 1
 			}
+			// Record: phase7_relocate (17)
+			if timesliceMem > 0 {
+				runtime.Store32(timesliceMem, 0, 17)
+			}
 
 			// Instruction synchronization barrier - required on ARM64 after modifying
 			// code in memory before executing it. Without this, the instruction cache
 			// may contain stale data and cause SIGILL.
 			runtime.ISB()
+			// Record: phase7_isb (18)
+			if timesliceMem > 0 {
+				runtime.Store32(timesliceMem, 0, 18)
+			}
 
+			// Record: phase7_call_payload (19)
+			if timesliceMem > 0 {
+				runtime.Store32(timesliceMem, 0, 19)
+			}
 			// call the payload
 			payloadResult := runtime.Call(anonMem)
+			// Record: phase7_payload_done (20)
+			if timesliceMem > 0 {
+				runtime.Store32(timesliceMem, 0, 20)
+			}
 
 			// publish return code for host-side exit propagation
 			runtime.Store32(mailboxMem, mailboxRunResultDetailOffset, payloadResult)

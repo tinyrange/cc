@@ -19,8 +19,8 @@ type timesliceRecord struct {
 }
 
 func (r *timesliceRecord) String() string {
-	return fmt.Sprintf("% 40s flags=% 10s count=% 8d sum=% 16s min=% 16s max=% 16s avg=% 16s",
-		r.ID, r.Flags, r.Count,
+	return fmt.Sprintf("% 40s count=% 8d sum=% 16s min=% 16s max=% 16s avg=% 16s",
+		r.ID, r.Count,
 		r.Sum,
 		r.Min,
 		r.Max,

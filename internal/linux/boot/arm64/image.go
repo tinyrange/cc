@@ -3,10 +3,14 @@ package arm64
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 )
 
 const (
@@ -203,4 +207,73 @@ func (p ImageProbe) ExtractImage(reader io.ReaderAt, size int64) ([]byte, error)
 		return nil, fmt.Errorf("decompress arm64 image: %w", err)
 	}
 	return data, nil
+}
+
+// ExtractImageCached returns the full Image payload, using a cache directory
+// to avoid repeated decompression. For raw Images, no caching is performed.
+// If cacheDir is empty, falls back to ExtractImage (no caching).
+func (p ImageProbe) ExtractImageCached(reader io.ReaderAt, size int64, cacheDir string) ([]byte, error) {
+	// If no caching or not compressed, use the regular path
+	if cacheDir == "" || !p.NeedsDecompression {
+		return p.ExtractImage(reader, size)
+	}
+
+	// Compute cache key from compressed content hash
+	cacheKey, err := p.computeCacheKey(reader, size)
+	if err != nil {
+		// Fall back to uncached extraction on hash error
+		return p.ExtractImage(reader, size)
+	}
+
+	kernelCacheDir := filepath.Join(cacheDir, "kernels")
+	cachePath := filepath.Join(kernelCacheDir, cacheKey+".bin")
+
+	// Try to read from cache
+	if data, err := os.ReadFile(cachePath); err == nil {
+		// Validate cached data has correct header
+		if len(data) >= imageHeaderSizeBytes {
+			if _, err := parseKernelHeader(data[:imageHeaderSizeBytes]); err == nil {
+				return data, nil
+			}
+		}
+		// Invalid cache, remove it
+		os.Remove(cachePath)
+	}
+
+	// Cache miss - decompress
+	data, err := p.ExtractImage(reader, size)
+	if err != nil {
+		return nil, err
+	}
+
+	// Write to cache (best effort, ignore errors)
+	if err := os.MkdirAll(kernelCacheDir, 0755); err == nil {
+		// Write to temp file first, then rename for atomicity
+		tmpPath := cachePath + ".tmp"
+		if err := os.WriteFile(tmpPath, data, 0644); err == nil {
+			os.Rename(tmpPath, cachePath)
+		}
+	}
+
+	return data, nil
+}
+
+// computeCacheKey generates a cache key based on the compressed kernel content.
+// Uses first 64KB of compressed data to generate a unique hash.
+func (p ImageProbe) computeCacheKey(reader io.ReaderAt, size int64) (string, error) {
+	// Read enough of the compressed data to uniquely identify the kernel
+	const hashSize = 64 * 1024
+	readSize := size - p.CompressedOffset
+	if readSize > hashSize {
+		readSize = hashSize
+	}
+
+	buf := make([]byte, readSize)
+	n, err := reader.ReadAt(buf, p.CompressedOffset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+
+	hash := sha256.Sum256(buf[:n])
+	return hex.EncodeToString(hash[:16]), nil // Use first 16 bytes (128 bits)
 }

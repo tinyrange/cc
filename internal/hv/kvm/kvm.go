@@ -118,6 +118,9 @@ type virtualMachine struct {
 	devices        []hv.Device
 	lastMemorySlot uint32
 
+	// Physical address space allocator for MMIO regions
+	addressSpace *hv.AddressSpace
+
 	// amd64-specific fields
 	hasIRQChip   bool
 	splitIRQChip bool // true if using split IRQ chip mode (LAPIC in kernel, PIC/IOAPIC in userspace)
@@ -186,6 +189,30 @@ func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.Memory
 	return &memoryRegion{mem: mem}, nil
 }
 
+// AllocateMMIO implements hv.VirtualMachine.
+func (v *virtualMachine) AllocateMMIO(req hv.MMIOAllocationRequest) (hv.MMIOAllocation, error) {
+	if v.addressSpace == nil {
+		return hv.MMIOAllocation{}, fmt.Errorf("kvm: address space not initialized")
+	}
+	return v.addressSpace.Allocate(req)
+}
+
+// RegisterFixedMMIO implements hv.VirtualMachine.
+func (v *virtualMachine) RegisterFixedMMIO(name string, base, size uint64) error {
+	if v.addressSpace == nil {
+		return fmt.Errorf("kvm: address space not initialized")
+	}
+	return v.addressSpace.RegisterFixed(name, base, size)
+}
+
+// GetAllocatedMMIORegions implements hv.VirtualMachine.
+func (v *virtualMachine) GetAllocatedMMIORegions() []hv.MMIOAllocation {
+	if v.addressSpace == nil {
+		return nil
+	}
+	return v.addressSpace.Allocations()
+}
+
 // AddDevice implements hv.VirtualMachine.
 func (v *virtualMachine) AddDevice(dev hv.Device) error {
 	v.devices = append(v.devices, dev)
@@ -200,13 +227,16 @@ func (v *virtualMachine) AddDevice(dev hv.Device) error {
 }
 
 // AddDeviceFromTemplate implements hv.VirtualMachine.
-func (v *virtualMachine) AddDeviceFromTemplate(template hv.DeviceTemplate) error {
+func (v *virtualMachine) AddDeviceFromTemplate(template hv.DeviceTemplate) (hv.Device, error) {
 	dev, err := template.Create(v)
 	if err != nil {
-		return fmt.Errorf("create device from template: %w", err)
+		return nil, fmt.Errorf("create device from template: %w", err)
 	}
 
-	return v.AddDevice(dev)
+	if err := v.AddDevice(dev); err != nil {
+		return nil, err
+	}
+	return dev, nil
 }
 
 // Close implements hv.VirtualMachine.
@@ -571,6 +601,9 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 	vm.memory = mem
 	vm.memoryBase = config.MemoryBase()
+
+	// Initialize physical address space allocator
+	vm.addressSpace = hv.NewAddressSpace(h.Architecture(), config.MemoryBase(), config.MemorySize())
 
 	if err := setUserMemoryRegion(vm.vmFd, &kvmUserspaceMemoryRegion{
 		Slot:          0,

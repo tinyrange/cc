@@ -3,6 +3,7 @@ package initx
 import (
 	_ "embed"
 	"fmt"
+	"strings"
 
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/ir"
@@ -24,6 +25,19 @@ type BuilderConfig struct {
 	Arch hv.CpuArchitecture
 
 	PreloadModules []kernel.Module
+
+	// MailboxPhysAddr is the physical address of the mailbox region.
+	// If 0, uses the default value (for backwards compatibility).
+	MailboxPhysAddr uint64
+
+	// TimesliceMMIOPhysAddr is the physical address of the timeslice MMIO region.
+	// Guest code can write to this address to record timeslice markers.
+	// If 0, uses the default value 0xf0001000.
+	TimesliceMMIOPhysAddr uint64
+
+	// ConfigRegionPhysAddr is the physical address of the config region.
+	// If 0, uses the default value (for backwards compatibility).
+	ConfigRegionPhysAddr uint64
 }
 
 const (
@@ -123,8 +137,32 @@ func BuildFromRTG(cfg BuilderConfig) (*ir.Program, error) {
 		return nil, fmt.Errorf("unsupported architecture for RTG init: %s", cfg.Arch)
 	}
 
+	// Preprocess the source to inject dynamic MMIO addresses
+	source := rtgInitSource
+	if cfg.MailboxPhysAddr != 0 {
+		// Replace the hard-coded mailboxPhysAddr constant
+		source = strings.Replace(source,
+			"mailboxPhysAddr        = 0xf0000000",
+			fmt.Sprintf("mailboxPhysAddr        = 0x%x", cfg.MailboxPhysAddr),
+			1)
+	}
+	if cfg.TimesliceMMIOPhysAddr != 0 {
+		// Replace the hard-coded timesliceMMIOPhysAddr constant
+		source = strings.Replace(source,
+			"timesliceMMIOPhysAddr  = 0xf0001000",
+			fmt.Sprintf("timesliceMMIOPhysAddr  = 0x%x", cfg.TimesliceMMIOPhysAddr),
+			1)
+	}
+	if cfg.ConfigRegionPhysAddr != 0 {
+		// Replace the hard-coded configRegionPhysAddr constant
+		source = strings.Replace(source,
+			"configRegionPhysAddr   = 0xf0003000",
+			fmt.Sprintf("configRegionPhysAddr   = 0x%x", cfg.ConfigRegionPhysAddr),
+			1)
+	}
+
 	// Compile the RTG source with architecture information
-	prog, err := rtg.CompileProgramWithOptions(rtgInitSource, rtg.CompileOptions{
+	prog, err := rtg.CompileProgramWithOptions(source, rtg.CompileOptions{
 		GOARCH: goarch,
 	})
 	if err != nil {

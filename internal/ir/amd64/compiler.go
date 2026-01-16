@@ -243,6 +243,17 @@ func (c *compiler) compileAssign(assign ir.AssignFragment) error {
 		}
 		c.freeReg(reg)
 		return nil
+	case ir.CallFragment:
+		// Handle function calls in assignment context
+		// Compile the call, then store the result (RAX) to the destination
+		if err := c.compileCall(src); err != nil {
+			return err
+		}
+		// The call result is in RAX, store it to the destination
+		if err := c.storeValue(assign.Dst, amd64.RAX, ir.Width64); err != nil {
+			return err
+		}
+		return nil
 	default:
 		reg, width, err := c.evalValue(assign.Src)
 		if err != nil {

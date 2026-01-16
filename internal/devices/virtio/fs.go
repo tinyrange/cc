@@ -130,7 +130,22 @@ func (t FSTemplate) GetACPIDeviceInfo() ACPIDeviceInfo {
 func (t FSTemplate) Create(vm hv.VirtualMachine) (hv.Device, error) {
 	arch := t.archOrDefault(vm)
 	irqLine := t.irqLineForArch(arch)
-	fs := NewFS(vm, t.mmioBaseOrDefault(), FsDefaultMMIOSize, EncodeIRQLineForArch(arch, irqLine), t.Tag, t.Backend)
+
+	// Allocate MMIO region dynamically
+	mmioBase := t.mmioBaseOrDefault()
+	if vm != nil {
+		alloc, err := vm.AllocateMMIO(hv.MMIOAllocationRequest{
+			Name:      "virtio-fs",
+			Size:      FsDefaultMMIOSize,
+			Alignment: 0x1000,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("virtio-fs: allocate MMIO: %w", err)
+		}
+		mmioBase = alloc.Base
+	}
+
+	fs := NewFS(vm, mmioBase, FsDefaultMMIOSize, EncodeIRQLineForArch(arch, irqLine), t.Tag, t.Backend)
 	if err := fs.Init(vm); err != nil {
 		return nil, fmt.Errorf("virtio-fs: initialize device: %w", err)
 	}
@@ -2109,6 +2124,21 @@ type fsSnapshot struct {
 	IRQLine    uint32
 	Tag        [fsCfgTagSize]byte
 	MMIODevice MMIODeviceSnapshot
+}
+
+// AllocatedMMIOBase implements AllocatedVirtioMMIODevice.
+func (fs *FS) AllocatedMMIOBase() uint64 {
+	return fs.base
+}
+
+// AllocatedMMIOSize implements AllocatedVirtioMMIODevice.
+func (fs *FS) AllocatedMMIOSize() uint64 {
+	return fs.size
+}
+
+// AllocatedIRQLine implements AllocatedVirtioMMIODevice.
+func (fs *FS) AllocatedIRQLine() uint32 {
+	return fs.irqLine
 }
 
 var (
