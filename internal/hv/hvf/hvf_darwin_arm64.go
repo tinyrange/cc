@@ -24,6 +24,18 @@ var (
 	tsHvfHostTime      = timeslice.RegisterKind("hvf_host_time", 0)
 	tsHvfFirstRunStart = timeslice.RegisterKind("hvf_first_run_start", 0)
 
+	// Snapshot capture timeslice markers
+	tsCaptureVcpuState = timeslice.RegisterKind("snapshot::capture_vcpu_state", 0)
+	tsCaptureGicState  = timeslice.RegisterKind("snapshot::capture_gic_state", 0)
+	tsCaptureDevices   = timeslice.RegisterKind("snapshot::capture_devices", 0)
+	tsCaptureMemory    = timeslice.RegisterKind("snapshot::capture_memory", 0)
+
+	// Snapshot restore timeslice markers
+	tsRestoreMemory    = timeslice.RegisterKind("snapshot::restore_memory", 0)
+	tsRestoreGicState  = timeslice.RegisterKind("snapshot::restore_gic_state", 0)
+	tsRestoreVcpuState = timeslice.RegisterKind("snapshot::restore_vcpu_state", 0)
+	tsRestoreDevices   = timeslice.RegisterKind("snapshot::restore_devices", 0)
+
 	tsHvfStartTime = time.Now()
 )
 
@@ -143,8 +155,21 @@ type arm64HvfVcpuSnapshot struct {
 type arm64HvfSnapshot struct {
 	cpuStates       map[int]arm64HvfVcpuSnapshot
 	deviceSnapshots map[string]interface{}
-	memory          []byte
+	memory          []byte // The mmap'd memory buffer
+	memoryOwned     bool   // If true, snapshot owns the memory and must free it on Close
 	gicState        []byte
+}
+
+// Close frees the snapshot's memory if it owns it.
+func (s *arm64HvfSnapshot) Close() error {
+	if s.memoryOwned && s.memory != nil {
+		if err := unix.Munmap(s.memory); err != nil {
+			return fmt.Errorf("hvf: failed to unmap snapshot memory: %w", err)
+		}
+		s.memory = nil
+		s.memoryOwned = false
+	}
+	return nil
 }
 
 type exitContext struct {
@@ -926,7 +951,10 @@ func (v *virtualMachine) restoreGICState(data []byte) error {
 }
 
 // CaptureSnapshot implements [hv.VirtualMachine].
+// Uses COW (copy-on-write) via vm_copy for O(1) memory capture.
 func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
+	rec := timeslice.NewState()
+
 	ret := &arm64HvfSnapshot{
 		cpuStates:       make(map[int]arm64HvfVcpuSnapshot),
 		deviceSnapshots: make(map[string]any),
@@ -948,6 +976,7 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 		}
 		ret.cpuStates[id] = state
 	}
+	rec.Record(tsCaptureVcpuState)
 
 	// Capture GIC state
 	gicData, err := v.captureGICState()
@@ -955,6 +984,7 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 		return nil, fmt.Errorf("hvf: capture GIC state: %w", err)
 	}
 	ret.gicState = gicData
+	rec.Record(tsCaptureGicState)
 
 	// Capture device snapshots
 	for _, dev := range v.devices {
@@ -967,26 +997,80 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 			ret.deviceSnapshots[id] = snap
 		}
 	}
+	rec.Record(tsCaptureDevices)
 
-	// Capture memory (full copy of main guest RAM)
+	// Capture memory using COW (copy-on-write)
+	// The snapshot takes ownership of the current memory, and the VM gets a new
+	// COW copy. This makes capture O(1) instead of O(n).
 	v.memMu.Lock()
 	if len(v.memory) > 0 {
-		ret.memory = make([]byte, len(v.memory))
-		copy(ret.memory, v.memory)
+		memSize := len(v.memory)
+
+		// Allocate new memory for the VM to continue using
+		newMem, err := unix.Mmap(-1, 0, memSize,
+			unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANONYMOUS|unix.MAP_PRIVATE)
+		if err != nil {
+			v.memMu.Unlock()
+			return nil, fmt.Errorf("hvf: allocate new memory for COW: %w", err)
+		}
+
+		// COW copy from old memory to new memory (O(1) operation)
+		if err := bindings.VmCopy(
+			uintptr(unsafe.Pointer(&v.memory[0])),
+			uintptr(unsafe.Pointer(&newMem[0])),
+			uintptr(memSize),
+		); err != nil {
+			unix.Munmap(newMem)
+			v.memMu.Unlock()
+			return nil, fmt.Errorf("hvf: vm_copy for snapshot COW: %w", err)
+		}
+
+		// Unmap old memory from VM guest physical address space
+		if err := bindings.HvVmUnmap(bindings.IPA(v.memoryBase), uintptr(memSize)); err != bindings.HV_SUCCESS {
+			unix.Munmap(newMem)
+			v.memMu.Unlock()
+			return nil, fmt.Errorf("hvf: unmap old memory from VM: %w", err)
+		}
+
+		// Map new memory to VM guest physical address space
+		if err := bindings.HvVmMap(
+			unsafe.Pointer(&newMem[0]),
+			bindings.IPA(v.memoryBase),
+			uintptr(memSize),
+			bindings.HV_MEMORY_READ|bindings.HV_MEMORY_WRITE|bindings.HV_MEMORY_EXEC,
+		); err != bindings.HV_SUCCESS {
+			unix.Munmap(newMem)
+			v.memMu.Unlock()
+			return nil, fmt.Errorf("hvf: map new memory to VM: %w", err)
+		}
+
+		// Snapshot takes ownership of old memory
+		ret.memory = v.memory
+		ret.memoryOwned = true
+
+		// VM now uses new memory
+		v.memory = newMem
 	}
 	v.memMu.Unlock()
+	rec.Record(tsCaptureMemory)
 
 	return ret, nil
 }
 
 // RestoreSnapshot implements [hv.VirtualMachine].
+// Uses COW (copy-on-write) via vm_copy for O(1) memory restore.
+// We allocate fresh memory and vm_copy snapshot data to it, then swap with VM memory.
+// This ensures true COW behavior since we're copying to fresh pages.
 func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
+	rec := timeslice.NewState()
+
 	snapshotData, ok := snap.(*arm64HvfSnapshot)
 	if !ok {
 		return fmt.Errorf("hvf: invalid snapshot type")
 	}
 
-	// Restore memory first
+	// Restore memory using COW - allocate fresh memory and swap
+	// vm_copy to existing pages doesn't benefit from COW, so we need fresh pages
 	v.memMu.Lock()
 	if len(v.memory) != len(snapshotData.memory) {
 		v.memMu.Unlock()
@@ -994,14 +1078,67 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 			len(snapshotData.memory), len(v.memory))
 	}
 	if len(v.memory) > 0 {
-		copy(v.memory, snapshotData.memory)
+		memSize := len(v.memory)
+
+		// Allocate fresh memory for COW restore
+		newMem, err := unix.Mmap(-1, 0, memSize,
+			unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANONYMOUS|unix.MAP_PRIVATE)
+		if err != nil {
+			v.memMu.Unlock()
+			return fmt.Errorf("hvf: allocate new memory for COW restore: %w", err)
+		}
+
+		// COW copy from snapshot to fresh memory (O(1) operation)
+		if err := bindings.VmCopy(
+			uintptr(unsafe.Pointer(&snapshotData.memory[0])),
+			uintptr(unsafe.Pointer(&newMem[0])),
+			uintptr(memSize),
+		); err != nil {
+			unix.Munmap(newMem)
+			v.memMu.Unlock()
+			return fmt.Errorf("hvf: vm_copy for snapshot restore: %w", err)
+		}
+
+		// Unmap old memory from VM guest physical address space
+		if err := bindings.HvVmUnmap(bindings.IPA(v.memoryBase), uintptr(memSize)); err != bindings.HV_SUCCESS {
+			unix.Munmap(newMem)
+			v.memMu.Unlock()
+			return fmt.Errorf("hvf: unmap old memory from VM for restore: %w", err)
+		}
+
+		// Free old VM memory
+		if err := unix.Munmap(v.memory); err != nil {
+			// Try to remap old memory back to VM before returning error
+			bindings.HvVmMap(unsafe.Pointer(&v.memory[0]), bindings.IPA(v.memoryBase),
+				uintptr(memSize), bindings.HV_MEMORY_READ|bindings.HV_MEMORY_WRITE|bindings.HV_MEMORY_EXEC)
+			unix.Munmap(newMem)
+			v.memMu.Unlock()
+			return fmt.Errorf("hvf: munmap old VM memory: %w", err)
+		}
+
+		// Map new memory to VM guest physical address space
+		if err := bindings.HvVmMap(
+			unsafe.Pointer(&newMem[0]),
+			bindings.IPA(v.memoryBase),
+			uintptr(memSize),
+			bindings.HV_MEMORY_READ|bindings.HV_MEMORY_WRITE|bindings.HV_MEMORY_EXEC,
+		); err != bindings.HV_SUCCESS {
+			unix.Munmap(newMem)
+			v.memMu.Unlock()
+			return fmt.Errorf("hvf: map new memory to VM for restore: %w", err)
+		}
+
+		// VM now uses restored memory
+		v.memory = newMem
 	}
 	v.memMu.Unlock()
+	rec.Record(tsRestoreMemory)
 
 	// Restore GIC state (before vCPUs to ensure interrupts are configured)
 	if err := v.restoreGICState(snapshotData.gicState); err != nil {
 		return fmt.Errorf("hvf: restore GIC state: %w", err)
 	}
+	rec.Record(tsRestoreGicState)
 
 	// Restore each vCPU state
 	for id, cpu := range v.cpus {
@@ -1019,6 +1156,7 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 			return fmt.Errorf("hvf: restore vCPU %d snapshot: %w", id, err)
 		}
 	}
+	rec.Record(tsRestoreVcpuState)
 
 	// Restore device snapshots
 	for _, dev := range v.devices {
@@ -1033,6 +1171,7 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 			}
 		}
 	}
+	rec.Record(tsRestoreDevices)
 
 	return nil
 }

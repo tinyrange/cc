@@ -388,6 +388,10 @@ type VirtualMachine struct {
 	// Dynamically allocated MMIO addresses for initx regions
 	mailboxPhysAddr      uint64
 	configRegionPhysAddr uint64
+
+	// pendingSnapshot holds a snapshot to restore after VM creation.
+	// Set by WithSnapshot option.
+	pendingSnapshot hv.Snapshot
 }
 
 func (vm *VirtualMachine) Close() error {
@@ -609,6 +613,17 @@ func WithConsoleOutput(w io.Writer) Option {
 	})
 }
 
+// WithSnapshot configures the VM to restore from the given snapshot after creation.
+// This skips kernel loading since the snapshot contains the full VM state.
+// The snapshot will be restored automatically after VM creation.
+func WithSnapshot(snap hv.Snapshot) Option {
+	return funcOption(func(vm *VirtualMachine) error {
+		vm.pendingSnapshot = snap
+		vm.loader.SkipKernelLoad = true
+		return nil
+	})
+}
+
 // consoleCapturingTemplate wraps a ConsoleTemplate to capture the created device reference.
 type consoleCapturingTemplate struct {
 	inner  virtio.ConsoleTemplate
@@ -718,9 +733,13 @@ func NewVirtualMachine(
 	ret.programLoader = programLoader
 	ret.kernelLoader = kernelLoader
 
+	// Get cache directory for kernel decompression caching
+	cacheDir, _ := kernel.GetDefaultCachePath()
+
 	// No longer cap memory - MMIO regions are now allocated dynamically above RAM
 	ret.loader = &boot.LinuxLoader{
-		NumCPUs: numCPUs,
+		NumCPUs:  numCPUs,
+		CacheDir: cacheDir,
 
 		MemSize: memSizeMB << 20,
 		MemBase: func() uint64 {
@@ -950,6 +969,15 @@ func NewVirtualMachine(
 	ret.vm, err = h.NewVirtualMachine(ret.loader)
 	if err != nil {
 		return nil, err
+	}
+
+	// Restore pending snapshot if one was provided via WithSnapshot option
+	if ret.pendingSnapshot != nil {
+		if err := ret.vm.RestoreSnapshot(ret.pendingSnapshot); err != nil {
+			ret.vm.Close()
+			return nil, fmt.Errorf("restore snapshot: %w", err)
+		}
+		ret.firstRunComplete = true // Mark as booted since snapshot is post-boot state
 	}
 
 	return &ret, nil

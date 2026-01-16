@@ -133,6 +133,11 @@ func (b *benchmark) runCommand(
 		initx.WithConsoleOutput(buf),
 	}
 
+	// If we have a snapshot, use WithSnapshot to skip kernel loading and restore automatically
+	if b.snapshot != nil {
+		opts = append(opts, initx.WithSnapshot(b.snapshot))
+	}
+
 	vm, err := initx.NewVirtualMachine(h, 1, 1024, kernelLoader, opts...)
 	if err != nil {
 		return fmt.Errorf("create VM: %w", err)
@@ -143,6 +148,7 @@ func (b *benchmark) runCommand(
 
 	var sessionCfg initx.SessionConfig
 	if b.snapshot == nil {
+		// First boot - capture snapshot after boot completes
 		sessionCfg.OnBootComplete = func() error {
 			tsRecord.Record(tsOnBootComplete)
 
@@ -158,9 +164,7 @@ func (b *benchmark) runCommand(
 			return nil
 		}
 	} else {
-		if err := vm.RestoreSnapshot(b.snapshot); err != nil {
-			return fmt.Errorf("failed to resotre snapshot: %w", err)
-		}
+		// Snapshot was restored in NewVirtualMachine via WithSnapshot option
 		sessionCfg.SkipBoot = true
 
 		tsRecord.Record(tsRestoreSnapshot)
@@ -198,7 +202,7 @@ func (b *benchmark) runCommand(
 func (b *benchmark) run() error {
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
-	n := fs.Int("n", 10, "the number of VM runs to execute")
+	n := fs.Int("n", 100, "the number of VM runs to execute")
 	bundleDir := fs.String("bundleDir", "", "the directory to load bundles from")
 	bundleName := fs.String("bundle", "alpine", "the oci image name to run inside the virtual machine")
 	testCommand := fs.String("cmd", "/usr/bin/whoami", "the command to execute inside the virtual machine")

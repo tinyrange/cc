@@ -146,6 +146,15 @@ type LinuxLoader struct {
 	// This is populated automatically based on configuration (e.g. GPUEnabled).
 	PreloadModules []kernel.Module
 
+	// CacheDir is the directory for caching decompressed kernels.
+	// If empty, no caching is performed.
+	CacheDir string
+
+	// SkipKernelLoad skips kernel loading when restoring from a snapshot.
+	// When true, only device creation is performed during Load().
+	// The caller must restore a snapshot after VM creation.
+	SkipKernelLoad bool
+
 	plan         bootPlan
 	kernelReader io.ReaderAt
 }
@@ -197,6 +206,37 @@ var (
 
 // Load implements hv.VMLoader.
 func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
+	arch := vm.Hypervisor().Architecture()
+
+	// When SkipKernelLoad is true, only create devices for snapshot restore.
+	// The kernel and boot structures are not needed as they'll be restored from snapshot.
+	if l.SkipKernelLoad {
+		// Only allocate GSIs on x86 for device creation
+		if arch == hv.ArchitectureX86_64 {
+			allocator := NewGSIAllocator(16, []uint32{0, 1, 2, 4, 8, 9, 10})
+			for idx, dev := range l.Devices {
+				switch d := dev.(type) {
+				case virtio.ConsoleTemplate:
+					if d.IRQLine == 0 {
+						d.IRQLine = allocator.Allocate()
+						l.Devices[idx] = d
+					}
+				case virtio.FSTemplate:
+					if d.IRQLine == 0 {
+						d.IRQLine = allocator.Allocate()
+						l.Devices[idx] = d
+					}
+				}
+			}
+		}
+
+		// Create devices for snapshot restore (devices are needed to restore their state)
+		if _, err := l.createDevicesEarly(vm); err != nil {
+			return fmt.Errorf("create devices for snapshot restore: %w", err)
+		}
+		return nil
+	}
+
 	if l.GetKernel == nil {
 		return errors.New("linux loader missing kernel provider")
 	}
@@ -211,8 +251,6 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 	l.kernelReader = kernelReader
 
 	rec.Record(tsLinuxLoaderGotKernel)
-
-	arch := vm.Hypervisor().Architecture()
 
 	initPayload, err := l.buildInitPayload(arch)
 	if err != nil {
@@ -675,7 +713,7 @@ var (
 )
 
 func (l *LinuxLoader) loadARM64(rec *timeslice.Recorder, vm hv.VirtualMachine, kernelReader io.ReaderAt, kernelSize int64, cmdline string, initrd []byte, deviceTree []fdt.Node) error {
-	kernelImage, err := arm64boot.LoadKernel(kernelReader, kernelSize)
+	kernelImage, err := arm64boot.LoadKernelWithCache(kernelReader, kernelSize, l.CacheDir)
 	if err != nil {
 		return fmt.Errorf("load kernel: %w", err)
 	}
