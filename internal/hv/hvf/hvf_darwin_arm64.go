@@ -19,6 +19,106 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// timesliceMMIOAddr is the MMIO address for guest timeslice recording.
+// Writes to this address record a timeslice marker with the written value as ID (0-255).
+const timesliceMMIOAddr uint64 = 0xf0001000
+
+// Guest timeslice ID constants - these must match the values used in guest code
+const (
+	// init_source.go phases (0-49)
+	GuestTsInitStart         = 0
+	GuestTsPhase1DevCreate   = 1
+	GuestTsPhase2MountDev    = 2
+	GuestTsPhase2MountShm    = 3
+	GuestTsPhase4ConsoleOpen = 5
+	GuestTsPhase4Setsid      = 6
+	GuestTsPhase4Dup         = 8
+	GuestTsPhase5MemOpen     = 9
+	GuestTsPhase5MailboxMap  = 10
+	GuestTsPhase5TsMap       = 11
+	GuestTsPhase5ConfigMap   = 12
+	GuestTsPhase5AnonMap     = 13
+	GuestTsPhase6TimeSetup   = 14
+	GuestTsPhase7LoopStart   = 15
+	GuestTsPhase7CopyPayload = 16
+	GuestTsPhase7Relocate    = 17
+	GuestTsPhase7ISB         = 18
+	GuestTsPhase7CallPayload = 19
+	GuestTsPhase7PayloadDone = 20
+
+	// container_init_source.go phases (50-99)
+	GuestTsContainerStart    = 50
+	GuestTsContainerMkdir    = 51
+	GuestTsContainerVirtiofs = 52
+	GuestTsContainerMkdirMnt = 53
+	GuestTsContainerMountFs  = 54
+	GuestTsContainerChroot   = 55
+	GuestTsContainerDevpts   = 56
+	GuestTsContainerQemu     = 57
+	GuestTsContainerHostname = 58
+	GuestTsContainerLoopback = 59
+	GuestTsContainerHosts    = 60
+	GuestTsContainerNetwork  = 61
+	GuestTsContainerWorkdir  = 62
+	GuestTsContainerDropPriv = 63
+	GuestTsContainerExec     = 64
+)
+
+// guestTimesliceNames maps guest timeslice IDs to descriptive names
+var guestTimesliceNames = map[int]string{
+	// init_source.go phases
+	GuestTsInitStart:         "guest::init_start",
+	GuestTsPhase1DevCreate:   "guest::phase1_dev_create",
+	GuestTsPhase2MountDev:    "guest::phase2_mount_dev",
+	GuestTsPhase2MountShm:    "guest::phase2_mount_shm",
+	GuestTsPhase4ConsoleOpen: "guest::phase4_console_open",
+	GuestTsPhase4Setsid:      "guest::phase4_setsid",
+	GuestTsPhase4Dup:         "guest::phase4_dup",
+	GuestTsPhase5MemOpen:     "guest::phase5_mem_open",
+	GuestTsPhase5MailboxMap:  "guest::phase5_mailbox_map",
+	GuestTsPhase5TsMap:       "guest::phase5_ts_map",
+	GuestTsPhase5ConfigMap:   "guest::phase5_config_map",
+	GuestTsPhase5AnonMap:     "guest::phase5_anon_map",
+	GuestTsPhase6TimeSetup:   "guest::phase6_time_setup",
+	GuestTsPhase7LoopStart:   "guest::phase7_loop_start",
+	GuestTsPhase7CopyPayload: "guest::phase7_copy_payload",
+	GuestTsPhase7Relocate:    "guest::phase7_relocate",
+	GuestTsPhase7ISB:         "guest::phase7_isb",
+	GuestTsPhase7CallPayload: "guest::phase7_call_payload",
+	GuestTsPhase7PayloadDone: "guest::phase7_payload_done",
+
+	// container_init_source.go phases
+	GuestTsContainerStart:    "guest::container_start",
+	GuestTsContainerMkdir:    "guest::container_mkdir",
+	GuestTsContainerVirtiofs: "guest::container_virtiofs",
+	GuestTsContainerMkdirMnt: "guest::container_mkdir_mnt",
+	GuestTsContainerMountFs:  "guest::container_mount_fs",
+	GuestTsContainerChroot:   "guest::container_chroot",
+	GuestTsContainerDevpts:   "guest::container_devpts",
+	GuestTsContainerQemu:     "guest::container_qemu",
+	GuestTsContainerHostname: "guest::container_hostname",
+	GuestTsContainerLoopback: "guest::container_loopback",
+	GuestTsContainerHosts:    "guest::container_hosts",
+	GuestTsContainerNetwork:  "guest::container_network",
+	GuestTsContainerWorkdir:  "guest::container_workdir",
+	GuestTsContainerDropPriv: "guest::container_drop_priv",
+	GuestTsContainerExec:     "guest::container_exec",
+}
+
+// guestTimeslices holds pre-registered timeslice IDs for guest-recorded markers.
+// These are registered at init time to avoid allocation during MMIO handling.
+var guestTimeslices [256]timeslice.TimesliceID
+
+func init() {
+	for i := range guestTimeslices {
+		name, ok := guestTimesliceNames[i]
+		if !ok {
+			name = fmt.Sprintf("guest::%d", i)
+		}
+		guestTimeslices[i] = timeslice.RegisterKind(name, timeslice.SliceFlagGuestTime)
+	}
+}
+
 var (
 	tsHvfGuestTime     = timeslice.RegisterKind("hvf_guest_time", timeslice.SliceFlagGuestTime)
 	tsHvfHostTime      = timeslice.RegisterKind("hvf_host_time", 0)
@@ -647,14 +747,44 @@ var (
 )
 
 func (v *virtualCPU) handleDataAbort(exitCtx *exitContext, syndrome bindings.ExceptionSyndrome, physAddr bindings.IPA) error {
+	addr := uint64(physAddr)
+
+	// Fast-path: timeslice recording MMIO
+	// This check is done before any other processing to minimize overhead.
+	// We use v.rec.Record() directly to capture timing relative to the run loop.
+	if addr == timesliceMMIOAddr {
+		decoded, err := decodeDataAbort(syndrome)
+		if err != nil {
+			return fmt.Errorf("hvf: timeslice MMIO decode error: %w", err)
+		}
+		if decoded.write {
+			// Read the timeslice ID from the source register
+			var val uint64 = 0 // default to 0 for XZR
+			if decoded.target != hv.RegisterARM64Xzr {
+				hvReg, ok := registerMap[decoded.target]
+				if !ok {
+					return fmt.Errorf("hvf: timeslice MMIO unsupported register %v", decoded.target)
+				}
+				if err := bindings.HvVcpuGetReg(v.id, hvReg, &val); err != bindings.HV_SUCCESS {
+					return fmt.Errorf("hvf: timeslice MMIO failed to get register: %w", err)
+				}
+			}
+			// Record the guest timeslice directly for proper timing
+			if val < 256 {
+				v.vm.guestTimesliceState.Record(guestTimeslices[val])
+			}
+		}
+		// For reads, we just return 0 (no register write needed)
+		return v.advanceProgramCounter()
+	}
+
+	// Normal MMIO path
 	exitCtx.SetExitTimeslice(tsDataAbort)
 
 	decoded, err := decodeDataAbort(syndrome)
 	if err != nil {
 		return fmt.Errorf("hvf: failed to decode data abort syndrome 0x%X: %w", syndrome, err)
 	}
-
-	var addr uint64 = uint64(physAddr)
 
 	dev, err := v.findMMIODevice(addr, uint64(decoded.sizeBytes))
 	if err != nil {
@@ -901,6 +1031,8 @@ type virtualMachine struct {
 	closed bool
 
 	gicInfo hv.Arm64GICInfo
+
+	guestTimesliceState *timeslice.Recorder
 }
 
 // implements hv.VirtualMachine
@@ -1356,6 +1488,8 @@ func (v *virtualMachine) Run(ctx context.Context, cfg hv.RunConfig) error {
 	if cfg == nil {
 		return fmt.Errorf("hvf: RunConfig cannot be nil")
 	}
+
+	v.guestTimesliceState = timeslice.NewState()
 
 	return v.VirtualCPUCall(0, func(vcpu hv.VirtualCPU) error {
 		return cfg.Run(ctx, vcpu)

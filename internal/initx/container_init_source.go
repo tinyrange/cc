@@ -8,18 +8,50 @@ package main
 
 import "github.com/tinyrange/cc/internal/rtg/runtime"
 
+// Timeslice MMIO configuration
+const (
+	timesliceMMIOPhysAddr = 0xf0001000
+	timesliceMMIOMapSize  = 0x1000
+)
+
+// Timeslice IDs for container init phases (50-99) - must match hvf_darwin_arm64.go
+// 50=container_start, 51=container_mkdir, 52=container_virtiofs, 53=container_mkdir_mnt
+// 54=container_mount_fs, 55=container_chroot, 56=container_devpts, 57=container_qemu
+// 58=container_hostname, 59=container_loopback, 60=container_hosts, 61=container_network
+// 62=container_workdir, 63=container_drop_priv, 64=container_exec
+
 // main is the entrypoint for the container init program.
 // Helper function bodies are replaced at IR level with actual implementations.
 // Ifdef flags control which code paths are included:
 //   - "network": include network configuration (ConfigureInterface, AddDefaultRoute, SetResolvConf)
 //   - "exec": use exec instead of fork/exec/wait
 func main() int64 {
+	// Map timeslice MMIO region for performance instrumentation
+	// This requires /dev/mem to be available (usually from devtmpfs)
+	var timesliceMem int64 = 0
+	memFd := runtime.Syscall(runtime.SYS_OPENAT, runtime.AT_FDCWD, "/dev/mem", runtime.O_RDWR|runtime.O_SYNC, 0)
+	if memFd >= 0 {
+		timesliceMem = runtime.Syscall(runtime.SYS_MMAP, 0, timesliceMMIOMapSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_SHARED, memFd, timesliceMMIOPhysAddr)
+		runtime.Syscall(runtime.SYS_CLOSE, memFd)
+		if timesliceMem < 0 {
+			timesliceMem = 0
+		}
+	}
+	// Record: container_start (50)
+	if timesliceMem > 0 {
+		runtime.Store32(timesliceMem, 0, 50)
+	}
+
 	runtime.LogKmsg("cc: running container init program\n")
 
 	// === Phase 1: Create mount points ===
 	runtime.Syscall(runtime.SYS_MKDIRAT, runtime.AT_FDCWD, "/mnt", 0o755)
 	runtime.Syscall(runtime.SYS_MKDIRAT, runtime.AT_FDCWD, "/proc", 0o755)
 	runtime.Syscall(runtime.SYS_MKDIRAT, runtime.AT_FDCWD, "/sys", 0o755)
+	// Record: container_mkdir (51)
+	if timesliceMem > 0 {
+		runtime.Store32(timesliceMem, 0, 51)
+	}
 
 	// === Phase 2: Mount virtiofs ===
 	virtiofsMountErr := runtime.Syscall(runtime.SYS_MOUNT, "rootfs", "/mnt", "virtiofs", 0, "")
@@ -27,12 +59,20 @@ func main() int64 {
 		runtime.Printf("cc: failed to mount virtiofs: errno=0x%x\n", 0-virtiofsMountErr)
 		reboot()
 	}
+	// Record: container_virtiofs (52)
+	if timesliceMem > 0 {
+		runtime.Store32(timesliceMem, 0, 52)
+	}
 
 	// === Phase 3: Create directories in container ===
 	runtime.Syscall(runtime.SYS_MKDIRAT, runtime.AT_FDCWD, "/mnt/proc", 0o755)
 	runtime.Syscall(runtime.SYS_MKDIRAT, runtime.AT_FDCWD, "/mnt/sys", 0o755)
 	runtime.Syscall(runtime.SYS_MKDIRAT, runtime.AT_FDCWD, "/mnt/dev", 0o755)
 	runtime.Syscall(runtime.SYS_MKDIRAT, runtime.AT_FDCWD, "/mnt/tmp", 0o1777)
+	// Record: container_mkdir_mnt (53)
+	if timesliceMem > 0 {
+		runtime.Store32(timesliceMem, 0, 53)
+	}
 
 	// === Phase 4: Mount filesystems ===
 	runtime.Syscall(runtime.SYS_MOUNT, "proc", "/mnt/proc", "proc", 0, "")
@@ -43,6 +83,10 @@ func main() int64 {
 	// Mount /dev/shm (wlroots/xkbcommon use it for shm-backed buffers like keymaps)
 	runtime.Syscall(runtime.SYS_MKDIRAT, runtime.AT_FDCWD, "/mnt/dev/shm", 0o1777)
 	runtime.Syscall(runtime.SYS_MOUNT, "tmpfs", "/mnt/dev/shm", "tmpfs", 0, "mode=1777")
+	// Record: container_mount_fs (54)
+	if timesliceMem > 0 {
+		runtime.Store32(timesliceMem, 0, 54)
+	}
 
 	runtime.LogKmsg("cc: mounted filesystems\n")
 
@@ -83,6 +127,10 @@ func main() int64 {
 	}
 
 	runtime.LogKmsg("cc: changed root to container\n")
+	// Record: container_chroot (55)
+	if timesliceMem > 0 {
+		runtime.Store32(timesliceMem, 0, 55)
+	}
 
 	// Remove oldroot directory
 	unlinkErr := runtime.Syscall(runtime.SYS_UNLINKAT, runtime.AT_FDCWD, "/oldroot", runtime.AT_REMOVEDIR)
@@ -107,12 +155,20 @@ func main() int64 {
 		runtime.Printf("cc: failed to symlink /proc/self/fd to /dev/fd: errno=0x%x\n", 0-symlinkErr)
 		reboot()
 	}
+	// Record: container_devpts (56)
+	if timesliceMem > 0 {
+		runtime.Store32(timesliceMem, 0, 56)
+	}
 
 	runtime.LogKmsg("cc: mounted devpts\n")
 
 	// === Phase 6.5: QEMU Emulation Setup (conditional) ===
 	if runtime.Ifdef("qemu_emulation") {
 		setupQEMUEmulation()
+		// Record: container_qemu (57)
+		if timesliceMem > 0 {
+			runtime.Store32(timesliceMem, 0, 57)
+		}
 		runtime.LogKmsg("cc: configured QEMU user emulation\n")
 	}
 
@@ -120,12 +176,24 @@ func main() int64 {
 	// These helper functions are placeholders - their bodies are replaced at IR level
 
 	setHostname()
+	// Record: container_hostname (58)
+	if timesliceMem > 0 {
+		runtime.Store32(timesliceMem, 0, 58)
+	}
 	runtime.LogKmsg("cc: set hostname\n")
 
 	configureLoopback()
+	// Record: container_loopback (59)
+	if timesliceMem > 0 {
+		runtime.Store32(timesliceMem, 0, 59)
+	}
 	runtime.LogKmsg("cc: configured loopback interface\n")
 
 	setHostsFile()
+	// Record: container_hosts (60)
+	if timesliceMem > 0 {
+		runtime.Store32(timesliceMem, 0, 60)
+	}
 	runtime.LogKmsg("cc: configured /etc/hosts\n")
 
 	// === Phase 8: Network configuration (conditional) ===
@@ -133,19 +201,35 @@ func main() int64 {
 		configureInterface()
 		addDefaultRoute()
 		setResolvConf()
+		// Record: container_network (61)
+		if timesliceMem > 0 {
+			runtime.Store32(timesliceMem, 0, 61)
+		}
 		runtime.LogKmsg("cc: configured network interface\n")
 	}
 
 	// === Phase 9: Change to working directory ===
 	changeWorkDir()
+	// Record: container_workdir (62)
+	if timesliceMem > 0 {
+		runtime.Store32(timesliceMem, 0, 62)
+	}
 
 	// === Phase 9.5: Drop privileges if configured ===
 	if runtime.Ifdef("drop_privileges") {
 		dropPrivileges()
+		// Record: container_drop_priv (63)
+		if timesliceMem > 0 {
+			runtime.Store32(timesliceMem, 0, 63)
+		}
 		runtime.LogKmsg("cc: dropped privileges\n")
 	}
 
 	// === Phase 10: Execute command ===
+	// Record: container_exec (64)
+	if timesliceMem > 0 {
+		runtime.Store32(timesliceMem, 0, 64)
+	}
 	if runtime.Ifdef("exec") {
 		runtime.LogKmsg("cc: executing command\n")
 		execCommand()
