@@ -1150,6 +1150,7 @@ func main() {
 	snapshotE2E := fs.Bool("snapshot-e2e", false, "build and run snapshot e2e benchmark")
 	release := fs.Bool("release", false, "build a release binary")
 	runSpecial := fs.String("runs", "", "run a given package")
+	vibeboot := fs.Bool("vibeboot", false, "build and run the vibeboot VibeOS bootloader")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
@@ -1256,6 +1257,23 @@ func main() {
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to build miniplayer: %v\n", err)
+			os.Exit(1)
+		}
+		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *vibeboot {
+		out, err := goBuild(buildOptions{
+			Package:          "internal/cmd/vibeboot",
+			OutputName:       "vibeboot",
+			Build:            hostBuild,
+			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build vibeboot: %v\n", err)
 			os.Exit(1)
 		}
 		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {

@@ -152,7 +152,6 @@ func (p *pl011Device) writeRegister(offset uint64, value uint32) error {
 	switch offset {
 	case pl011RegDR:
 		p.outByte[0] = byte(value & 0xff)
-		fmt.Printf("pl011 write DR: %#x\n", p.outByte[0])
 		if _, err := p.out.Write(p.outByte[:]); err != nil {
 			return fmt.Errorf("pl011: write output: %w", err)
 		}

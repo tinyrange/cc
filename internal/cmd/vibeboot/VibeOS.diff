@@ -1,0 +1,264 @@
+diff --git a/kernel/hal/qemu/irq.c b/kernel/hal/qemu/irq.c
+index 2e66fd6..32802c0 100644
+--- a/kernel/hal/qemu/irq.c
++++ b/kernel/hal/qemu/irq.c
+@@ -1,8 +1,9 @@
+ /*
+  * QEMU virt machine Interrupt Controller Driver
+  *
+- * GIC-400 (GICv2) driver for QEMU virt machine.
+- * Distributor at 0x08000000, CPU Interface at 0x08010000.
++ * GICv3 driver for QEMU virt machine.
++ * Distributor at 0x08000000, Redistributor at 0x080a0000.
++ * CPU Interface via system registers.
+  */
+ 
+ #include "../hal.h"
+@@ -14,9 +15,23 @@
+ 
+ // QEMU virt machine GIC addresses
+ #define GICD_BASE   0x08000000UL  // Distributor
+-#define GICC_BASE   0x08010000UL  // CPU Interface
+-
+-// GIC Distributor registers
++#define GICR_BASE   0x080A0000UL  // Redistributor
++
++// GIC Redistributor registers (for SGIs/PPIs, interrupts 0-31)
++// Each CPU has 2 frames: RD_base (64KB) + SGI_base (64KB)
++#define GICR_RD_BASE    (GICR_BASE)
++#define GICR_SGI_BASE   (GICR_BASE + 0x10000)  // SGI frame
++
++#define GICR_WAKER      (*(volatile uint32_t *)(GICR_RD_BASE + 0x014))
++#define GICR_IGROUPR0   (*(volatile uint32_t *)(GICR_SGI_BASE + 0x080))
++#define GICR_ISENABLER0 (*(volatile uint32_t *)(GICR_SGI_BASE + 0x100))
++#define GICR_ICENABLER0 (*(volatile uint32_t *)(GICR_SGI_BASE + 0x180))
++#define GICR_ICPENDR0   (*(volatile uint32_t *)(GICR_SGI_BASE + 0x280))
++#define GICR_IPRIORITYR(n) (*(volatile uint32_t *)(GICR_SGI_BASE + 0x400 + (n)*4))
++#define GICR_ICFGR0     (*(volatile uint32_t *)(GICR_SGI_BASE + 0xC00))
++#define GICR_ICFGR1     (*(volatile uint32_t *)(GICR_SGI_BASE + 0xC04))
++
++// GIC Distributor registers (for SPIs, interrupts 32+)
+ #define GICD_CTLR       (*(volatile uint32_t *)(GICD_BASE + 0x000))
+ #define GICD_TYPER      (*(volatile uint32_t *)(GICD_BASE + 0x004))
+ #define GICD_IGROUPR(n)   (*(volatile uint32_t *)(GICD_BASE + 0x080 + (n)*4))
+@@ -25,15 +40,8 @@
+ #define GICD_ISPENDR(n)   (*(volatile uint32_t *)(GICD_BASE + 0x200 + (n)*4))
+ #define GICD_ICPENDR(n)   (*(volatile uint32_t *)(GICD_BASE + 0x280 + (n)*4))
+ #define GICD_IPRIORITYR(n) (*(volatile uint32_t *)(GICD_BASE + 0x400 + (n)*4))
+-#define GICD_ITARGETSR(n)  (*(volatile uint32_t *)(GICD_BASE + 0x800 + (n)*4))
+ #define GICD_ICFGR(n)      (*(volatile uint32_t *)(GICD_BASE + 0xC00 + (n)*4))
+ 
+-// GIC CPU Interface registers
+-#define GICC_CTLR   (*(volatile uint32_t *)(GICC_BASE + 0x000))
+-#define GICC_PMR    (*(volatile uint32_t *)(GICC_BASE + 0x004))
+-#define GICC_IAR    (*(volatile uint32_t *)(GICC_BASE + 0x00C))
+-#define GICC_EOIR   (*(volatile uint32_t *)(GICC_BASE + 0x010))
+-
+ // Timer IRQ (EL1 Physical Timer is PPI 30)
+ #define TIMER_IRQ   30
+ 
+@@ -57,6 +65,32 @@ static inline void isb(void) {
+     asm volatile("isb" ::: "memory");
+ }
+ 
++// GICv3 System Register Access
++static inline void gicv3_write_pmr(uint32_t val) {
++    asm volatile("msr S3_0_C4_C6_0, %0" :: "r"((uint64_t)val));  // ICC_PMR_EL1
++    isb();
++}
++
++static inline void gicv3_write_igrpen1(uint32_t val) {
++    asm volatile("msr S3_0_C12_C12_7, %0" :: "r"((uint64_t)val));  // ICC_IGRPEN1_EL1
++    isb();
++}
++
++static inline uint32_t gicv3_read_iar1(void) {
++    uint64_t val;
++    asm volatile("mrs %0, S3_0_C12_C12_0" : "=r"(val));  // ICC_IAR1_EL1
++    return (uint32_t)val;
++}
++
++static inline void gicv3_write_eoir1(uint32_t val) {
++    asm volatile("msr S3_0_C12_C12_1, %0" :: "r"((uint64_t)val));  // ICC_EOIR1_EL1
++}
++
++static inline void gicv3_write_sre(uint32_t val) {
++    asm volatile("msr S3_0_C12_C12_5, %0" :: "r"((uint64_t)val));  // ICC_SRE_EL1
++    isb();
++}
++
+ // Timer IRQ handler
+ static void timer_handler(void) {
+     timer_ticks++;
+@@ -79,72 +113,60 @@ static void timer_handler(void) {
+ // ============================================================================
+ 
+ void hal_irq_init(void) {
+-    printf("[IRQ] Initializing GIC...\n");
++    printf("[IRQ] Initializing GICv3...\n");
+ 
+     // Clear handler table
+     for (int i = 0; i < MAX_IRQS; i++) {
+         irq_handlers[i] = 0;
+     }
+ 
+-    // Disable distributor while configuring
+-    dsb();
+-    GICD_CTLR = 0;
+-    dsb();
++    // Enable System Register access
++    gicv3_write_sre(0x7);  // SRE=1, DFB=1, DIB=1
+ 
+-    // Get number of IRQ lines
+-    uint32_t typer = GICD_TYPER;
+-    uint32_t num_irqs = ((typer & 0x1F) + 1) * 32;
+-    printf("[IRQ] GIC supports %d IRQs\n", num_irqs);
+-
+-    // Disable all IRQs
+-    for (uint32_t i = 0; i < num_irqs / 32; i++) {
+-        GICD_ICENABLER(i) = 0xFFFFFFFF;
+-    }
++    // Wake up the Redistributor
++    uint32_t waker = GICR_WAKER;
++    waker &= ~(1 << 1);  // Clear ProcessorSleep bit
++    GICR_WAKER = waker;
+     dsb();
+ 
+-    // Clear all pending IRQs
+-    for (uint32_t i = 0; i < num_irqs / 32; i++) {
+-        GICD_ICPENDR(i) = 0xFFFFFFFF;
++    // Wait for redistributor to wake up (ChildrenAsleep should clear)
++    while (GICR_WAKER & (1 << 2)) {
++        dsb();
+     }
+-    dsb();
++    printf("[IRQ] Redistributor awake\n");
+ 
+-    // Set all SPIs to Group 0 (Secure)
+-    for (uint32_t i = 0; i < num_irqs / 32; i++) {
+-        GICD_IGROUPR(i) = 0x00000000;
+-    }
+-    dsb();
+-    printf("[IRQ] All interrupts set to Group 0 (Secure)\n");
++    // ========================================================================
++    // Configure Redistributor (SGIs/PPIs: interrupts 0-31)
++    // ========================================================================
+ 
+-    // Set all IRQs to mid priority
+-    for (uint32_t i = 0; i < num_irqs / 4; i++) {
+-        GICD_IPRIORITYR(i) = 0xA0A0A0A0;
+-    }
++    // Set all SGIs/PPIs to Group 1 (Non-secure)
++    GICR_IGROUPR0 = 0xFFFFFFFF;
+     dsb();
+ 
+-    // Route all SPIs to CPU 0
+-    for (uint32_t i = 8; i < num_irqs / 4; i++) {
+-        GICD_ITARGETSR(i) = 0x01010101;
++    // Set SGI/PPI priorities (8 interrupts per register)
++    for (uint32_t i = 0; i < 8; i++) {
++        GICR_IPRIORITYR(i) = 0xA0A0A0A0;
+     }
+     dsb();
+-    printf("[IRQ] All SPIs targeted to CPU 0\n");
+ 
+-    // Configure all SPIs as level-sensitive
+-    for (uint32_t i = 2; i < num_irqs / 16; i++) {
+-        GICD_ICFGR(i) = 0x00000000;
+-    }
++    // Configure PPIs as level-sensitive (SGIs are always edge)
++    GICR_ICFGR1 = 0x00000000;
+     dsb();
+ 
+-    // Enable distributor
+-    GICD_CTLR = 0x1;
++    // Clear all pending SGIs/PPIs
++    GICR_ICPENDR0 = 0xFFFFFFFF;
+     dsb();
+ 
+-    // Configure CPU interface
+-    GICC_PMR = 0xFF;
+-    dsb();
+-    GICC_CTLR = 0x1;
++    // ========================================================================
++    // Configure CPU interface via system registers
++    // Note: HVF manages GICD configuration through its API
++    // ========================================================================
++
++    gicv3_write_pmr(0xFF);       // Accept all priorities
++    gicv3_write_igrpen1(0x1);    // Enable Group 1 interrupts
+     dsb();
+ 
+-    printf("[IRQ] GIC initialized (Secure, Group 0)\n");
++    printf("[IRQ] GICv3 initialized\n");
+ }
+ 
+ void hal_irq_enable(void) {
+@@ -157,19 +179,27 @@ void hal_irq_disable(void) {
+ 
+ void hal_irq_enable_irq(uint32_t irq) {
+     if (irq >= MAX_IRQS) return;
+-    uint32_t reg = irq / 32;
+-    uint32_t bit = irq % 32;
+     dsb();
+-    GICD_ISENABLER(reg) = (1 << bit);
++    if (irq < 32) {
++        // SGI/PPI: use Redistributor
++        GICR_ISENABLER0 = (1 << irq);
++    } else {
++        // SPI: HVF manages SPI configuration through its API
++        // We skip GICD MMIO access as it's not supported
++    }
+     dsb();
+ }
+ 
+ void hal_irq_disable_irq(uint32_t irq) {
+     if (irq >= MAX_IRQS) return;
+-    uint32_t reg = irq / 32;
+-    uint32_t bit = irq % 32;
+     dsb();
+-    GICD_ICENABLER(reg) = (1 << bit);
++    if (irq < 32) {
++        // SGI/PPI: use Redistributor
++        GICR_ICENABLER0 = (1 << irq);
++    } else {
++        // SPI: HVF manages SPI configuration through its API
++        // We skip GICD MMIO access as it's not supported
++    }
+     dsb();
+ }
+ 
+@@ -221,26 +251,26 @@ void hal_timer_set_interval(uint32_t interval_ms) {
+ void handle_irq(void) {
+     dsb();
+ 
+-    // Read interrupt ID
+-    uint32_t iar = GICC_IAR;
+-    uint32_t irq = iar & 0x3FF;
++    // Read interrupt ID via system register
++    uint32_t iar = gicv3_read_iar1();
++    uint32_t irq = iar & 0xFFFFFF;  // GICv3 uses 24-bit INTID
+ 
+     // Check for spurious interrupt
+-    if (irq == 1023) {
++    if (irq == 1023 || irq >= 1020) {
+         return;
+     }
+ 
+     // Handle the interrupt
+     if (irq == TIMER_IRQ) {
+         timer_handler();
+-    } else if (irq_handlers[irq]) {
++    } else if (irq < MAX_IRQS && irq_handlers[irq]) {
+         irq_handlers[irq]();
+     } else {
+         printf("[IRQ] Unhandled IRQ %d\n", irq);
+     }
+ 
+-    // Signal end of interrupt
++    // Signal end of interrupt via system register
+     dsb();
+-    GICC_EOIR = iar;
++    gicv3_write_eoir1(iar);
+     dsb();
+ }
