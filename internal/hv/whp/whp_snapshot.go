@@ -22,6 +22,11 @@ type whpSnapshot struct {
 	Arm64GICState *arm64GICSnapshot
 }
 
+// Close implements io.Closer for the Snapshot interface.
+func (s *whpSnapshot) Close() error {
+	return nil
+}
+
 var whpSnapshotRegisters = map[hv.CpuArchitecture][]hv.Register{
 	hv.ArchitectureX86_64: {
 		hv.RegisterAMD64Rax,

@@ -20,7 +20,17 @@ import (
 	"github.com/tinyrange/cc/internal/linux/defs"
 	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 	"github.com/tinyrange/cc/internal/linux/kernel"
+	"github.com/tinyrange/cc/internal/timeslice"
 	"github.com/tinyrange/cc/internal/vfs"
+)
+
+var (
+	tsInitxNewVMStart        = timeslice.RegisterKind("initx_new_vm_start", 0)
+	tsInitxNewVMSetupLoader  = timeslice.RegisterKind("initx_new_vm_setup_loader", 0)
+	tsInitxNewVMApplyOptions = timeslice.RegisterKind("initx_new_vm_apply_options", 0)
+	tsInitxNewVMCreateHVVM   = timeslice.RegisterKind("initx_new_vm_create_hv_vm", 0)
+	tsInitxNewVMRestoreSnap  = timeslice.RegisterKind("initx_new_vm_restore_snapshot", 0)
+	tsInitxNewVMDone         = timeslice.RegisterKind("initx_new_vm_done", 0)
 )
 
 const (
@@ -543,17 +553,18 @@ func (vm *VirtualMachine) WriteExecCommand(path string, args []string, env []str
 	}
 
 	// Write to config region
+	// Always write to dataRegion so the command survives LoadProgram calls
+	// (LoadProgram copies dataRegion to region, which would overwrite the command)
+	if len(vm.programLoader.dataRegion) < configRegionSize {
+		vm.programLoader.dataRegion = make([]byte, configRegionSize)
+	}
+	copy(vm.programLoader.dataRegion[execCmdRegionOffset:], buf)
+
+	// Also write directly to backing memory for immediate visibility
 	if vm.programLoader.region != nil {
 		if _, err := vm.programLoader.region.WriteAt(buf, int64(execCmdRegionOffset)); err != nil {
 			return fmt.Errorf("write exec command to config region: %w", err)
 		}
-	} else {
-		// ARM64 uses direct dataRegion access
-		// Ensure dataRegion is allocated (it may not be if called before LoadProgram)
-		if len(vm.programLoader.dataRegion) < configRegionSize {
-			vm.programLoader.dataRegion = make([]byte, configRegionSize)
-		}
-		copy(vm.programLoader.dataRegion[execCmdRegionOffset:], buf)
 	}
 
 	return nil
@@ -567,17 +578,17 @@ func (vm *VirtualMachine) ClearExecCommand() error {
 	buf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(buf, 0)
 
+	// Always write to dataRegion so it survives LoadProgram calls
+	if len(vm.programLoader.dataRegion) < configRegionSize {
+		vm.programLoader.dataRegion = make([]byte, configRegionSize)
+	}
+	copy(vm.programLoader.dataRegion[execCmdRegionOffset:], buf)
+
+	// Also write directly to backing memory for immediate visibility
 	if vm.programLoader.region != nil {
 		if _, err := vm.programLoader.region.WriteAt(buf, int64(execCmdRegionOffset)); err != nil {
 			return fmt.Errorf("clear exec command magic: %w", err)
 		}
-	} else {
-		// ARM64 uses direct dataRegion access
-		// Ensure dataRegion is allocated (it may not be if called before LoadProgram)
-		if len(vm.programLoader.dataRegion) < configRegionSize {
-			vm.programLoader.dataRegion = make([]byte, configRegionSize)
-		}
-		copy(vm.programLoader.dataRegion[execCmdRegionOffset:], buf)
 	}
 
 	return nil
@@ -860,6 +871,9 @@ func NewVirtualMachine(
 	kernelLoader kernel.Kernel,
 	options ...Option,
 ) (*VirtualMachine, error) {
+	rec := timeslice.NewState()
+	rec.Record(tsInitxNewVMStart)
+
 	in := &proxyReader{update: make(chan io.Reader)}
 	out := &proxyWriter{w: os.Stderr} // default to stderr so we can see debugging output
 
@@ -1094,11 +1108,15 @@ func NewVirtualMachine(
 		return nil
 	}
 
+	rec.Record(tsInitxNewVMSetupLoader)
+
 	for _, option := range options {
 		if err := option.apply(&ret); err != nil {
 			return nil, err
 		}
 	}
+
+	rec.Record(tsInitxNewVMApplyOptions)
 
 	// Add GPU and Input devices if GPU is enabled
 	if ret.gpuEnabled {
@@ -1124,6 +1142,8 @@ func NewVirtualMachine(
 		return nil, err
 	}
 
+	rec.Record(tsInitxNewVMCreateHVVM)
+
 	// Restore pending snapshot if one was provided via WithSnapshot option
 	if ret.pendingSnapshot != nil {
 		if err := ret.vm.RestoreSnapshot(ret.pendingSnapshot); err != nil {
@@ -1131,7 +1151,10 @@ func NewVirtualMachine(
 			return nil, fmt.Errorf("restore snapshot: %w", err)
 		}
 		ret.firstRunComplete = true // Mark as booted since snapshot is post-boot state
+		rec.Record(tsInitxNewVMRestoreSnap)
 	}
+
+	rec.Record(tsInitxNewVMDone)
 
 	return &ret, nil
 }

@@ -5,6 +5,7 @@ package kvm
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"runtime"
 	"sync"
 	"unsafe"
@@ -240,33 +241,49 @@ func (v *virtualMachine) AddDeviceFromTemplate(template hv.DeviceTemplate) (hv.D
 }
 
 // Close implements hv.VirtualMachine.
+// Cleanup is performed asynchronously in a background goroutine to avoid
+// blocking on kernel resource cleanup (which can take 10-20ms on Linux).
 func (v *virtualMachine) Close() error {
-	for _, vcpu := range v.vcpus {
-		close(vcpu.runQueue)
-
-		if err := unix.Close(vcpu.fd); err != nil {
-			return fmt.Errorf("close vCPU %d fd: %w", vcpu.id, err)
-		}
-
-		if err := unix.Munmap(vcpu.run); err != nil {
-			return fmt.Errorf("munmap vCPU %d run area: %w", vcpu.id, err)
-		}
-	}
+	// Capture resources to clean up
+	vcpus := v.vcpus
+	v.vcpus = nil
 
 	v.memMu.Lock()
 	mem := v.memory
 	v.memory = nil
 	v.memMu.Unlock()
 
-	if mem != nil {
-		if err := unix.Munmap(mem); err != nil {
-			return fmt.Errorf("munmap vm memory: %w", err)
-		}
+	vmFd := v.vmFd
+	v.vmFd = -1
+
+	// Close vCPU run queues synchronously (just channel ops, fast)
+	for _, vcpu := range vcpus {
+		close(vcpu.runQueue)
 	}
 
-	if err := unix.Close(v.vmFd); err != nil {
-		return fmt.Errorf("close kvm vm fd: %w", err)
-	}
+	// Perform expensive kernel cleanup in background
+	go func() {
+		for _, vcpu := range vcpus {
+			if err := unix.Close(vcpu.fd); err != nil {
+				slog.Error("kvm: close vcpu fd", "error", err)
+			}
+			if err := unix.Munmap(vcpu.run); err != nil {
+				slog.Error("kvm: munmap vcpu run", "error", err)
+			}
+		}
+
+		if mem != nil {
+			if err := unix.Munmap(mem); err != nil {
+				slog.Error("kvm: munmap memory", "error", err)
+			}
+		}
+
+		if vmFd >= 0 {
+			if err := unix.Close(vmFd); err != nil {
+				slog.Error("kvm: close vm fd", "error", err)
+			}
+		}
+	}()
 
 	return nil
 }
@@ -721,6 +738,14 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 		vm.rec.Record(tsKvmLoaded)
 	}
+
+	// Set finalizer to catch VMs that are garbage collected without being closed
+	runtime.SetFinalizer(vm, func(v *virtualMachine) {
+		if v.vmFd >= 0 {
+			slog.Debug("kvm: VM was not closed before garbage collection, cleaning up")
+			v.Close()
+		}
+	})
 
 	return vm, nil
 }

@@ -452,6 +452,7 @@ type MemoryRegion interface {
 }
 
 type Snapshot interface {
+	io.Closer
 }
 
 type VirtualMachine interface {
