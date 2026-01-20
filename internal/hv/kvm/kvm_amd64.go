@@ -1126,7 +1126,15 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 			memAddr := uintptr(unsafe.Pointer(&v.memory[0]))
 			memSize := int(snapshotData.memorySize)
 
-			_, _, errno := unix.Syscall6(
+			// Verify the existing mapping is valid before replacing with MAP_FIXED
+			vec := make([]byte, (memSize+4095)/4096)
+			_, _, errno := unix.Syscall(unix.SYS_MINCORE, memAddr, uintptr(memSize), uintptr(unsafe.Pointer(&vec[0])))
+			if errno != 0 {
+				v.memMu.Unlock()
+				return fmt.Errorf("VM memory mapping invalid before restore: %w", errno)
+			}
+
+			_, _, errno = unix.Syscall6(
 				unix.SYS_MMAP,
 				memAddr,
 				uintptr(memSize),
