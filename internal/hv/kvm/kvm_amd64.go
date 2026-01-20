@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"unsafe"
@@ -941,6 +940,38 @@ func (v *virtualCPU) restoreSnapshot(snap vcpuSnapshot) error {
 	return nil
 }
 
+// isZeroPage checks if a 4KB page is all zeros using word-sized comparisons.
+func isZeroPage(page []byte) bool {
+	words := (*[512]uint64)(unsafe.Pointer(&page[0]))
+	for i := 0; i < 512; i++ {
+		if words[i] != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// writeSparseMemory writes memory to a file, skipping zero pages to create a sparse file.
+func writeSparseMemory(f *os.File, memory []byte) error {
+	const pageSize = 4096
+
+	// Pre-allocate to final size (required for sparse file semantics)
+	if err := f.Truncate(int64(len(memory))); err != nil {
+		return fmt.Errorf("truncate: %w", err)
+	}
+
+	for offset := 0; offset < len(memory); offset += pageSize {
+		page := memory[offset : offset+pageSize]
+		if isZeroPage(page) {
+			continue // Skip - creates hole in sparse file
+		}
+		if _, err := f.WriteAt(page, int64(offset)); err != nil {
+			return fmt.Errorf("write at %d: %w", offset, err)
+		}
+	}
+	return nil
+}
+
 // CaptureSnapshot implements hv.VirtualMachine.
 func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 	ret := &snapshot{
@@ -1030,7 +1061,7 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 			return nil, fmt.Errorf("create snapshot file: %w", err)
 		}
 
-		if _, err := f.Write(v.memory); err != nil {
+		if err := writeSparseMemory(f, v.memory); err != nil {
 			f.Close()
 			os.Remove(f.Name())
 			return nil, fmt.Errorf("write snapshot memory: %w", err)
