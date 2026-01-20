@@ -375,6 +375,11 @@ type arm64Snapshot struct {
 	clockData       *kvmClockData
 }
 
+// Close implements io.Closer for the Snapshot interface.
+func (s *arm64Snapshot) Close() error {
+	return nil
+}
+
 func (v *virtualCPU) captureSnapshot() (arm64VcpuSnapshot, error) {
 	ret := arm64VcpuSnapshot{
 		Registers: make(map[hv.Register]uint64, len(arm64RegisterIDs)),

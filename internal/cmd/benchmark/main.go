@@ -42,6 +42,14 @@ type benchmark struct {
 	commandEnv  []string // Environment variables for the command
 }
 
+// Close releases resources held by the benchmark, including snapshot files.
+func (b *benchmark) Close() error {
+	if b.snapshot != nil {
+		return b.snapshot.Close()
+	}
+	return nil
+}
+
 var (
 	tsLoadMetadata              = timeslice.RegisterKind("benchmark::load_metadata", 0)
 	tsOciLoadFromDir            = timeslice.RegisterKind("benchmark::oci_load_from_dir", 0)
@@ -354,6 +362,7 @@ func (b *benchmark) run() error {
 
 func main() {
 	b := benchmark{}
+	defer b.Close()
 
 	if err := b.run(); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to run benchmark: %v\n", err)

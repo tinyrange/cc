@@ -809,6 +809,7 @@ func (q *bringUpQuest) Run() error {
 		if err != nil {
 			return fmt.Errorf("create snapshot: %w", err)
 		}
+		defer snapshot.Close()
 
 		// Let the virtual machine continue and yield again
 		if err := vm.Run(context.Background(), resumeRunConfig{}); err != nil {
@@ -1186,6 +1187,7 @@ func (q *bringUpQuest) Run() error {
 		if err != nil {
 			return fmt.Errorf("create snapshot: %w", err)
 		}
+		defer snapshot.Close()
 
 		if err := vm.Run(context.Background(), resumeRunConfig{}); err != nil {
 			return fmt.Errorf("run virtual machine: %w", err)

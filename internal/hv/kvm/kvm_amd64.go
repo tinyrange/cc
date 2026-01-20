@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"unsafe"
 
 	"github.com/tinyrange/cc/internal/debug"
@@ -472,6 +474,13 @@ func (hv *hypervisor) archPostVCPUInit(vm *virtualMachine, config hv.VMConfig) e
 var (
 	tsKvmGetSupportedCpuId = timeslice.RegisterKind("kvm_get_supported_cpu_id", 0)
 	tsKvmSetVCPUID         = timeslice.RegisterKind("kvm_set_vcpu_id", 0)
+
+	tsKvmRestoreSnapshotStart   = timeslice.RegisterKind("kvm_restore_snapshot_start", 0)
+	tsKvmRestoreSnapshotMemory  = timeslice.RegisterKind("kvm_restore_snapshot_memory", 0)
+	tsKvmRestoreSnapshotVCPU    = timeslice.RegisterKind("kvm_restore_snapshot_vcpu", 0)
+	tsKvmRestoreSnapshotClock   = timeslice.RegisterKind("kvm_restore_snapshot_clock", 0)
+	tsKvmRestoreSnapshotDevices = timeslice.RegisterKind("kvm_restore_snapshot_devices", 0)
+	tsKvmRestoreSnapshotDone    = timeslice.RegisterKind("kvm_restore_snapshot_done", 0)
 )
 
 func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int) error {
@@ -801,10 +810,45 @@ type snapshot struct {
 	cpuStates map[int]vcpuSnapshot
 
 	deviceSnapshots map[string]interface{}
-	memory          []byte
-	clockData       *kvmClockData
-	irqChips        []kvmIRQChip
-	pitState        *kvmPitState2
+
+	// File-based storage fields for COW mmap
+	memoryPath  string   // Path to snapshot file
+	memoryFile  *os.File // Keep open for mmap lifetime
+	memoryMmap  []byte   // mmap'd region (read-only reference)
+	memorySize  uint64   // Size in bytes
+	memoryOwned bool     // If true, delete file on Close
+
+	// Fallback for in-memory snapshots (loaded from disk)
+	memory []byte
+
+	clockData *kvmClockData
+	irqChips  []kvmIRQChip
+	pitState  *kvmPitState2
+}
+
+// Close releases resources associated with the snapshot.
+func (s *snapshot) Close() error {
+	if s.memoryMmap != nil {
+		unix.Munmap(s.memoryMmap)
+		s.memoryMmap = nil
+	}
+	if s.memoryFile != nil {
+		s.memoryFile.Close()
+		s.memoryFile = nil
+	}
+	if s.memoryOwned && s.memoryPath != "" {
+		os.Remove(s.memoryPath)
+		s.memoryPath = ""
+	}
+	return nil
+}
+
+// getSnapshotDir returns the directory for snapshot files.
+func getSnapshotDir() string {
+	if dir := os.Getenv("CC_SNAPSHOT_DIR"); dir != "" {
+		return dir
+	}
+	return filepath.Join(os.TempDir(), fmt.Sprintf("cc-snapshots-%d", os.Getpid()))
 }
 
 func (v *virtualCPU) captureSnapshot() (vcpuSnapshot, error) {
@@ -972,17 +1016,56 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 	}
 
 	v.memMu.Lock()
+	defer v.memMu.Unlock()
+
 	if len(v.memory) > 0 {
-		ret.memory = make([]byte, len(v.memory))
-		copy(ret.memory, v.memory)
+		// Create snapshot directory
+		snapshotDir := getSnapshotDir()
+		if err := os.MkdirAll(snapshotDir, 0700); err != nil {
+			return nil, fmt.Errorf("create snapshot dir: %w", err)
+		}
+
+		// Create temp file and write memory
+		f, err := os.CreateTemp(snapshotDir, "kvm-snap-*.mem")
+		if err != nil {
+			return nil, fmt.Errorf("create snapshot file: %w", err)
+		}
+
+		if _, err := f.Write(v.memory); err != nil {
+			f.Close()
+			os.Remove(f.Name())
+			return nil, fmt.Errorf("write snapshot memory: %w", err)
+		}
+
+		if err := f.Sync(); err != nil {
+			f.Close()
+			os.Remove(f.Name())
+			return nil, fmt.Errorf("sync snapshot file: %w", err)
+		}
+
+		// mmap the file read-only for snapshot reference
+		mem, err := unix.Mmap(int(f.Fd()), 0, len(v.memory),
+			unix.PROT_READ, unix.MAP_PRIVATE)
+		if err != nil {
+			f.Close()
+			os.Remove(f.Name())
+			return nil, fmt.Errorf("mmap snapshot file: %w", err)
+		}
+
+		ret.memoryPath = f.Name()
+		ret.memoryFile = f
+		ret.memoryMmap = mem
+		ret.memorySize = uint64(len(v.memory))
+		ret.memoryOwned = true
 	}
-	v.memMu.Unlock()
 
 	return ret, nil
 }
 
 // RestoreSnapshot implements hv.VirtualMachine.
 func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
+	v.rec.Record(tsKvmRestoreSnapshotStart)
+
 	// Type assert to our snapshot type
 	snapshotData, ok := snap.(*snapshot)
 	if !ok {
@@ -990,15 +1073,53 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 	}
 
 	v.memMu.Lock()
-	if len(v.memory) != len(snapshotData.memory) {
+
+	// Validate sizes - handle both file-based and in-memory snapshots
+	var snapMemSize uint64
+	if snapshotData.memoryFile != nil {
+		snapMemSize = snapshotData.memorySize
+	} else if snapshotData.memory != nil {
+		snapMemSize = uint64(len(snapshotData.memory))
+	}
+	if uint64(len(v.memory)) != snapMemSize {
 		v.memMu.Unlock()
 		return fmt.Errorf("snapshot memory size mismatch: got %d bytes, want %d bytes",
-			len(snapshotData.memory), len(v.memory))
+			snapMemSize, len(v.memory))
 	}
+
 	if len(v.memory) > 0 {
-		copy(v.memory, snapshotData.memory)
+		if snapshotData.memoryFile != nil {
+			// COW path: use MAP_FIXED to remap the existing VM memory address
+			// to be backed by the snapshot file. This creates a COW mapping where
+			// the kernel only copies pages when written to by the guest.
+			// The virtual address stays the same, so KVM doesn't need to be updated.
+			memAddr := uintptr(unsafe.Pointer(&v.memory[0]))
+			memSize := int(snapshotData.memorySize)
+
+			_, _, errno := unix.Syscall6(
+				unix.SYS_MMAP,
+				memAddr,
+				uintptr(memSize),
+				uintptr(unix.PROT_READ|unix.PROT_WRITE),
+				uintptr(unix.MAP_PRIVATE|unix.MAP_FIXED),
+				uintptr(snapshotData.memoryFile.Fd()),
+				0,
+			)
+			if errno != 0 {
+				v.memMu.Unlock()
+				return fmt.Errorf("mmap snapshot for restore: %w", errno)
+			}
+		} else if snapshotData.memory != nil {
+			// Fallback for in-memory snapshots - copy the data
+			copy(v.memory, snapshotData.memory)
+		} else {
+			v.memMu.Unlock()
+			return fmt.Errorf("snapshot has no memory data")
+		}
 	}
 	v.memMu.Unlock()
+
+	v.rec.Record(tsKvmRestoreSnapshotMemory)
 
 	// Restore state to each vCPU
 	for i := range v.vcpus {
@@ -1018,11 +1139,15 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 		}
 	}
 
+	v.rec.Record(tsKvmRestoreSnapshotVCPU)
+
 	if snapshotData.clockData != nil {
 		if err := setClock(v.vmFd, snapshotData.clockData); err != nil {
 			return fmt.Errorf("restore clock: %w", err)
 		}
 	}
+
+	v.rec.Record(tsKvmRestoreSnapshotClock)
 
 	// In split IRQ chip mode, PIC/IOAPIC are in userspace and restored via device snapshots.
 	// Only restore kernel IRQ chip state if not in split mode.
@@ -1069,6 +1194,9 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 			}
 		}
 	}
+
+	v.rec.Record(tsKvmRestoreSnapshotDevices)
+	v.rec.Record(tsKvmRestoreSnapshotDone)
 
 	return nil
 }

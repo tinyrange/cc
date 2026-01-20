@@ -20,7 +20,17 @@ import (
 	"github.com/tinyrange/cc/internal/linux/defs"
 	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 	"github.com/tinyrange/cc/internal/linux/kernel"
+	"github.com/tinyrange/cc/internal/timeslice"
 	"github.com/tinyrange/cc/internal/vfs"
+)
+
+var (
+	tsInitxNewVMStart        = timeslice.RegisterKind("initx_new_vm_start", 0)
+	tsInitxNewVMSetupLoader  = timeslice.RegisterKind("initx_new_vm_setup_loader", 0)
+	tsInitxNewVMApplyOptions = timeslice.RegisterKind("initx_new_vm_apply_options", 0)
+	tsInitxNewVMCreateHVVM   = timeslice.RegisterKind("initx_new_vm_create_hv_vm", 0)
+	tsInitxNewVMRestoreSnap  = timeslice.RegisterKind("initx_new_vm_restore_snapshot", 0)
+	tsInitxNewVMDone         = timeslice.RegisterKind("initx_new_vm_done", 0)
 )
 
 const (
@@ -861,6 +871,9 @@ func NewVirtualMachine(
 	kernelLoader kernel.Kernel,
 	options ...Option,
 ) (*VirtualMachine, error) {
+	rec := timeslice.NewState()
+	rec.Record(tsInitxNewVMStart)
+
 	in := &proxyReader{update: make(chan io.Reader)}
 	out := &proxyWriter{w: os.Stderr} // default to stderr so we can see debugging output
 
@@ -1095,11 +1108,15 @@ func NewVirtualMachine(
 		return nil
 	}
 
+	rec.Record(tsInitxNewVMSetupLoader)
+
 	for _, option := range options {
 		if err := option.apply(&ret); err != nil {
 			return nil, err
 		}
 	}
+
+	rec.Record(tsInitxNewVMApplyOptions)
 
 	// Add GPU and Input devices if GPU is enabled
 	if ret.gpuEnabled {
@@ -1125,6 +1142,8 @@ func NewVirtualMachine(
 		return nil, err
 	}
 
+	rec.Record(tsInitxNewVMCreateHVVM)
+
 	// Restore pending snapshot if one was provided via WithSnapshot option
 	if ret.pendingSnapshot != nil {
 		if err := ret.vm.RestoreSnapshot(ret.pendingSnapshot); err != nil {
@@ -1132,7 +1151,10 @@ func NewVirtualMachine(
 			return nil, fmt.Errorf("restore snapshot: %w", err)
 		}
 		ret.firstRunComplete = true // Mark as booted since snapshot is post-boot state
+		rec.Record(tsInitxNewVMRestoreSnap)
 	}
+
+	rec.Record(tsInitxNewVMDone)
 
 	return &ret, nil
 }
