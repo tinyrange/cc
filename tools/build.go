@@ -17,7 +17,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"time"
 )
 
 const PACKAGE_NAME = "github.com/tinyrange/cc"
@@ -1131,7 +1130,6 @@ func main() {
 	buildOs := fs.String("os", "", "build for the specified OS (windows, linux, darwin)")
 	buildArch := fs.String("arch", "", "build for the specified architecture (amd64, arm64)")
 	test := fs.String("test", "", "run go tests in the specified package")
-	bench := fs.Bool("bench", false, "run all benchmarks and output results to benchmarks/<hostid>/<date>.json")
 	codesign := fs.Bool("codesign", false, "build the macos codesign tool")
 	oci := fs.Bool("oci", false, "build and execute the OCI image tool")
 	kernel := fs.Bool("kernel", false, "build and execute the kernel tool")
@@ -1610,69 +1608,6 @@ func main() {
 			os.Exit(1)
 		}
 
-		return
-	}
-
-	if *bench {
-		// go test -bench=. -run=none -benchmem -json > bench.json
-		cmd := exec.Command("go", "test", "-bench=.", "-run=none", "-benchmem", "-json", "./...")
-		hostId, err := getOrCreateHostID()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to get host ID: %v\n", err)
-			os.Exit(1)
-		}
-
-		benchDir := filepath.Join("benchmarks", hostId)
-		if err := os.MkdirAll(benchDir, 0755); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to create benchmark directory: %v\n", err)
-			os.Exit(1)
-		}
-
-		// benchmark_YYYYMMDD_HHMMSS.json (date in UTC)
-		benchFile := filepath.Join(benchDir,
-			fmt.Sprintf("benchmark_%s.njson", time.Now().UTC().Format("20060102_150405")),
-		)
-		f, err := os.Create(benchFile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to create benchmark file: %v\n", err)
-			os.Exit(1)
-		}
-		defer f.Close()
-
-		// if git is available, get the commit hash
-		commitHash := "unknown"
-		if cmd := exec.Command("git", "rev-parse", "HEAD"); cmd != nil {
-			if out, err := cmd.Output(); err == nil {
-				commitHash = string(out)
-				commitHash = strings.TrimSpace(commitHash)
-			}
-		}
-
-		// write a first line with the go version, GOOS, GOARCH
-		if err := json.NewEncoder(f).Encode(struct {
-			GoVersion string `json:"go_version"`
-			GOOS      string `json:"go_os"`
-			GOARCH    string `json:"go_arch"`
-			Commit    string `json:"commit"`
-		}{
-			GoVersion: runtime.Version(),
-			GOOS:      runtime.GOOS,
-			GOARCH:    runtime.GOARCH,
-			Commit:    commitHash,
-		}); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to write benchmark metadata: %v\n", err)
-			os.Exit(1)
-		}
-
-		cmd.Stdout = f
-		cmd.Stderr = os.Stderr
-
-		if err := cmd.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to run benchmarks: %v\n", err)
-			os.Exit(1)
-		}
-
-		fmt.Printf("benchmarks written to %s\n", benchFile)
 		return
 	}
 
