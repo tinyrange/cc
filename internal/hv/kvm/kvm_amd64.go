@@ -234,7 +234,6 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 		usingContext = true
 		tid := unix.Gettid()
 		stopNotify = context.AfterFunc(ctx, func() {
-			slog.Info("kvm: requesting immediate exit", "vCPU", v.id, "tid", tid)
 			_ = v.RequestImmediateExit(tid)
 		})
 	}
