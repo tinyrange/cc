@@ -239,6 +239,11 @@ func (v *virtualCPU) handleIOPortAccess(exitCtx *exitContext, access *bindings.E
 	return nil
 }
 
+// timesliceMMIOAddr is the MMIO address for guest timeslice recording.
+// Writes to this address record a timeslice marker with the written value as ID.
+// This must match the address used in initx/init_source.go and hvf/hvf_darwin_arm64.go.
+const timesliceMMIOAddr uint64 = 0xf0001000
+
 func (v *virtualCPU) handleMemoryAccess(exitCtx *exitContext, access *bindings.EmulatorMemoryAccessInfo) error {
 	gpa := access.GpaAddress
 	size := uint64(access.AccessSize)
@@ -246,6 +251,25 @@ func (v *virtualCPU) handleMemoryAccess(exitCtx *exitContext, access *bindings.E
 	// access.Data is now [8]byte in the bindings, backed directly by C memory.
 	// We slice it to the operation size to read/write directly without extra allocation.
 	dataSlice := access.Data[:size]
+
+	// Fast-path: timeslice recording MMIO
+	// This check is done before other processing to minimize overhead.
+	// Guest code writes a timeslice ID to this address for performance instrumentation.
+	if gpa == timesliceMMIOAddr {
+		if access.Direction != bindings.EmulatorMemoryAccessDirectionRead {
+			// Write: Record the timeslice marker
+			var id uint32
+			if size >= 4 {
+				id = binary.LittleEndian.Uint32(dataSlice)
+			} else if size >= 1 {
+				id = uint32(dataSlice[0])
+			}
+			// Record the guest timeslice using the ID as the timeslice kind
+			exitCtx.SetExitTimeslice(timeslice.TimesliceID(id))
+		}
+		// For reads, return zeros (no-op)
+		return nil
+	}
 
 	// 1. RAM Access (Instruction Fetch or Data Access)
 	if gpa >= v.vm.memoryBase && gpa < v.vm.memoryBase+uint64(v.vm.memory.Size()) {
