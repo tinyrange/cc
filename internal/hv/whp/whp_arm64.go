@@ -151,36 +151,53 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			return fmt.Errorf("whp: failed to decode data abort syndrome 0x%X: %w", mem.Syndrome, err)
 		}
 
-		dev, err := v.findMMIODevice(physAddr, uint64(decoded.sizeBytes))
-		if err != nil {
-			return err
-		}
-
 		var pendingError error = nil
 
-		data := make([]byte, decoded.sizeBytes)
-		if isWrite {
-			value, err := v.readRegister(decoded.target)
+		// Fast-path: timeslice recording MMIO
+		// This check is done before other processing to minimize overhead.
+		// Guest code writes a timeslice ID to this address for performance instrumentation.
+		if physAddr == timesliceMMIOAddr {
+			if isWrite {
+				// Write: Record the timeslice marker
+				var id uint32
+				value, err := v.readRegister(decoded.target)
+				if err != nil {
+					return err
+				}
+				id = uint32(value)
+				v.exitCtx.SetExitTimeslice(timeslice.TimesliceID(id))
+			}
+			return nil
+		} else {
+			dev, err := v.findMMIODevice(physAddr, uint64(decoded.sizeBytes))
 			if err != nil {
 				return err
 			}
-			for i := 0; i < decoded.sizeBytes; i++ {
-				data[i] = byte(value >> (8 * i))
-			}
 
-			if err := dev.WriteMMIO(v.exitCtx, physAddr, data); err != nil {
-				pendingError = fmt.Errorf("whp: MMIO write 0x%x (%d bytes): %w", physAddr, decoded.sizeBytes, err)
-			}
-		} else {
-			if err := dev.ReadMMIO(v.exitCtx, physAddr, data); err != nil {
-				pendingError = fmt.Errorf("whp: MMIO read 0x%x (%d bytes): %w", physAddr, decoded.sizeBytes, err)
-			}
+			data := make([]byte, decoded.sizeBytes)
+			if isWrite {
+				value, err := v.readRegister(decoded.target)
+				if err != nil {
+					return err
+				}
+				for i := 0; i < decoded.sizeBytes; i++ {
+					data[i] = byte(value >> (8 * i))
+				}
 
-			var tmp [8]byte
-			copy(tmp[:], data)
-			value := binary.LittleEndian.Uint64(tmp[:])
-			if err := v.writeRegister(decoded.target, value); err != nil {
-				return err
+				if err := dev.WriteMMIO(v.exitCtx, physAddr, data); err != nil {
+					pendingError = fmt.Errorf("whp: MMIO write 0x%x (%d bytes): %w", physAddr, decoded.sizeBytes, err)
+				}
+			} else {
+				if err := dev.ReadMMIO(v.exitCtx, physAddr, data); err != nil {
+					pendingError = fmt.Errorf("whp: MMIO read 0x%x (%d bytes): %w", physAddr, decoded.sizeBytes, err)
+				}
+
+				var tmp [8]byte
+				copy(tmp[:], data)
+				value := binary.LittleEndian.Uint64(tmp[:])
+				if err := v.writeRegister(decoded.target, value); err != nil {
+					return err
+				}
 			}
 		}
 
