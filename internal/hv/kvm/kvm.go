@@ -5,6 +5,7 @@ package kvm
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"runtime"
 	"sync"
 	"unsafe"
@@ -263,16 +264,24 @@ func (v *virtualMachine) Close() error {
 	// Perform expensive kernel cleanup in background
 	go func() {
 		for _, vcpu := range vcpus {
-			unix.Close(vcpu.fd)
-			unix.Munmap(vcpu.run)
+			if err := unix.Close(vcpu.fd); err != nil {
+				slog.Error("kvm: close vcpu fd", "error", err)
+			}
+			if err := unix.Munmap(vcpu.run); err != nil {
+				slog.Error("kvm: munmap vcpu run", "error", err)
+			}
 		}
 
 		if mem != nil {
-			unix.Munmap(mem)
+			if err := unix.Munmap(mem); err != nil {
+				slog.Error("kvm: munmap memory", "error", err)
+			}
 		}
 
 		if vmFd >= 0 {
-			unix.Close(vmFd)
+			if err := unix.Close(vmFd); err != nil {
+				slog.Error("kvm: close vm fd", "error", err)
+			}
 		}
 	}()
 
@@ -729,6 +738,14 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 		vm.rec.Record(tsKvmLoaded)
 	}
+
+	// Set finalizer to catch VMs that are garbage collected without being closed
+	runtime.SetFinalizer(vm, func(v *virtualMachine) {
+		if v.vmFd >= 0 {
+			slog.Debug("kvm: VM was not closed before garbage collection, cleaning up")
+			v.Close()
+		}
+	})
 
 	return vm, nil
 }
