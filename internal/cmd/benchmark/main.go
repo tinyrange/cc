@@ -362,10 +362,12 @@ func (b *benchmark) run() error {
 
 func main() {
 	b := benchmark{}
-	defer b.Close()
 
 	if err := b.run(); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to run benchmark: %v\n", err)
+		b.Close()
 		os.Exit(1)
 	}
+
+	b.Close()
 }
