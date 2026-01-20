@@ -1290,14 +1290,12 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 			return fmt.Errorf("hvf: unmap old memory from VM for restore: %w", err)
 		}
 
-		// Free old VM memory
+		// Free old VM memory. Failure here indicates a bug (invalid slice) and leaves
+		// the VM unusable since guest memory is already unmapped above.
 		if err := unix.Munmap(v.memory); err != nil {
-			// Try to remap old memory back to VM before returning error
-			bindings.HvVmMap(unsafe.Pointer(&v.memory[0]), bindings.IPA(v.memoryBase),
-				uintptr(memSize), bindings.HV_MEMORY_READ|bindings.HV_MEMORY_WRITE|bindings.HV_MEMORY_EXEC)
 			unix.Munmap(newMem)
 			v.memMu.Unlock()
-			return fmt.Errorf("hvf: munmap old VM memory: %w", err)
+			return fmt.Errorf("hvf: munmap old VM memory (VM now unusable): %w", err)
 		}
 
 		// Map new memory to VM guest physical address space
