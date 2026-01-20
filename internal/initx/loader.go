@@ -543,17 +543,18 @@ func (vm *VirtualMachine) WriteExecCommand(path string, args []string, env []str
 	}
 
 	// Write to config region
+	// Always write to dataRegion so the command survives LoadProgram calls
+	// (LoadProgram copies dataRegion to region, which would overwrite the command)
+	if len(vm.programLoader.dataRegion) < configRegionSize {
+		vm.programLoader.dataRegion = make([]byte, configRegionSize)
+	}
+	copy(vm.programLoader.dataRegion[execCmdRegionOffset:], buf)
+
+	// Also write directly to backing memory for immediate visibility
 	if vm.programLoader.region != nil {
 		if _, err := vm.programLoader.region.WriteAt(buf, int64(execCmdRegionOffset)); err != nil {
 			return fmt.Errorf("write exec command to config region: %w", err)
 		}
-	} else {
-		// ARM64 uses direct dataRegion access
-		// Ensure dataRegion is allocated (it may not be if called before LoadProgram)
-		if len(vm.programLoader.dataRegion) < configRegionSize {
-			vm.programLoader.dataRegion = make([]byte, configRegionSize)
-		}
-		copy(vm.programLoader.dataRegion[execCmdRegionOffset:], buf)
 	}
 
 	return nil
@@ -567,17 +568,17 @@ func (vm *VirtualMachine) ClearExecCommand() error {
 	buf := make([]byte, 4)
 	binary.LittleEndian.PutUint32(buf, 0)
 
+	// Always write to dataRegion so it survives LoadProgram calls
+	if len(vm.programLoader.dataRegion) < configRegionSize {
+		vm.programLoader.dataRegion = make([]byte, configRegionSize)
+	}
+	copy(vm.programLoader.dataRegion[execCmdRegionOffset:], buf)
+
+	// Also write directly to backing memory for immediate visibility
 	if vm.programLoader.region != nil {
 		if _, err := vm.programLoader.region.WriteAt(buf, int64(execCmdRegionOffset)); err != nil {
 			return fmt.Errorf("clear exec command magic: %w", err)
 		}
-	} else {
-		// ARM64 uses direct dataRegion access
-		// Ensure dataRegion is allocated (it may not be if called before LoadProgram)
-		if len(vm.programLoader.dataRegion) < configRegionSize {
-			vm.programLoader.dataRegion = make([]byte, configRegionSize)
-		}
-		copy(vm.programLoader.dataRegion[execCmdRegionOffset:], buf)
 	}
 
 	return nil

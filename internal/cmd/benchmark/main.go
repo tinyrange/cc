@@ -158,6 +158,7 @@ func (b *benchmark) runCommand(
 	tsRecord.Record(tsNewVirtualMachine)
 
 	if b.snapshot == nil {
+		// slog.Info("first boot", "command", commandArgs[0], "args", commandArgs[1:])
 		// First boot - use CommandLoop mode and capture snapshot after container setup
 		// Build init program with CommandLoop=true
 		prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
@@ -186,8 +187,11 @@ func (b *benchmark) runCommand(
 		// which causes vm.Run() to return (ErrYield is converted to nil when runResultDetail is cleared).
 		// We then capture the snapshot and write the command.
 
+		timeoutCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+
 		// Run container init until it signals snapshot ready
-		if err := vm.Run(context.Background(), prog); err != nil {
+		if err := vm.Run(timeoutCtx, prog); err != nil {
 			return fmt.Errorf("failed to run container init: %w", err)
 		}
 
@@ -211,12 +215,16 @@ func (b *benchmark) runCommand(
 
 		// Resume VM to execute the command
 		// The guest is waiting in the command loop, will read the command and execute it
-		if err := vm.Run(context.Background(), prog); err != nil {
+		timeoutCtx2, cancel2 := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel2()
+
+		if err := vm.Run(timeoutCtx2, prog); err != nil {
 			return fmt.Errorf("failed to run command: %w", err)
 		}
 
 		tsRecord.Record(tsWaitForSession)
 	} else {
+		// slog.Info("subsequent boot", "command", b.commandArgs[0], "args", b.commandArgs[1:])
 		// Subsequent runs - restore snapshot and execute command directly
 		// The snapshot was restored when the VM was created (via WithSnapshot option)
 		tsRecord.Record(tsRestoreSnapshot)
