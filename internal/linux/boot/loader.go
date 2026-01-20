@@ -146,6 +146,15 @@ type LinuxLoader struct {
 	// This is populated automatically based on configuration (e.g. GPUEnabled).
 	PreloadModules []kernel.Module
 
+	// CacheDir is the directory for caching decompressed kernels.
+	// If empty, no caching is performed.
+	CacheDir string
+
+	// SkipKernelLoad skips kernel loading when restoring from a snapshot.
+	// When true, only device creation is performed during Load().
+	// The caller must restore a snapshot after VM creation.
+	SkipKernelLoad bool
+
 	plan         bootPlan
 	kernelReader io.ReaderAt
 }
@@ -197,6 +206,37 @@ var (
 
 // Load implements hv.VMLoader.
 func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
+	arch := vm.Hypervisor().Architecture()
+
+	// When SkipKernelLoad is true, only create devices for snapshot restore.
+	// The kernel and boot structures are not needed as they'll be restored from snapshot.
+	if l.SkipKernelLoad {
+		// Only allocate GSIs on x86 for device creation
+		if arch == hv.ArchitectureX86_64 {
+			allocator := NewGSIAllocator(16, []uint32{0, 1, 2, 4, 8, 9, 10})
+			for idx, dev := range l.Devices {
+				switch d := dev.(type) {
+				case virtio.ConsoleTemplate:
+					if d.IRQLine == 0 {
+						d.IRQLine = allocator.Allocate()
+						l.Devices[idx] = d
+					}
+				case virtio.FSTemplate:
+					if d.IRQLine == 0 {
+						d.IRQLine = allocator.Allocate()
+						l.Devices[idx] = d
+					}
+				}
+			}
+		}
+
+		// Create devices for snapshot restore (devices are needed to restore their state)
+		if _, err := l.createDevicesEarly(vm); err != nil {
+			return fmt.Errorf("create devices for snapshot restore: %w", err)
+		}
+		return nil
+	}
+
 	if l.GetKernel == nil {
 		return errors.New("linux loader missing kernel provider")
 	}
@@ -211,8 +251,6 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 	l.kernelReader = kernelReader
 
 	rec.Record(tsLinuxLoaderGotKernel)
-
-	arch := vm.Hypervisor().Architecture()
 
 	initPayload, err := l.buildInitPayload(arch)
 	if err != nil {
@@ -240,8 +278,7 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 	}
 
 	cmdlineBase := append([]string(nil), cmdline...)
-	var virtioCmdline []string
-	var virtioNodes []fdt.Node
+
 	// Only allocate GSIs on x86. ARM64 virtio devices have architecture-specific
 	// defaults that work correctly with the GIC. Using the x86-style GSI allocator
 	// on ARM64 causes KVM_IRQ_LINE to fail with EINVAL.
@@ -264,31 +301,15 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 		}
 	}
 
-	// DeviceTreeProvider allows any device to provide device tree nodes
-	type DeviceTreeProvider interface {
-		DeviceTreeNodes() ([]fdt.Node, error)
+	// Create devices FIRST to allocate MMIO regions dynamically.
+	// This must happen before generating cmdline/device-tree so we have actual addresses.
+	createdDevices, err := l.createDevicesEarly(vm)
+	if err != nil {
+		return fmt.Errorf("create devices: %w", err)
 	}
 
-	for _, dev := range l.Devices {
-		if vdev, ok := dev.(virtio.VirtioMMIODevice); ok {
-			params, err := vdev.GetLinuxCommandLineParam()
-			if err != nil {
-				return fmt.Errorf("get virtio mmio device linux cmdline param: %w", err)
-			}
-			virtioCmdline = append(virtioCmdline, params...)
-			nodes, err := vdev.DeviceTreeNodes()
-			if err != nil {
-				return fmt.Errorf("get virtio mmio device tree nodes: %w", err)
-			}
-			virtioNodes = append(virtioNodes, nodes...)
-		} else if dtp, ok := dev.(DeviceTreeProvider); ok {
-			nodes, err := dtp.DeviceTreeNodes()
-			if err != nil {
-				return fmt.Errorf("get device tree nodes: %w", err)
-			}
-			virtioNodes = append(virtioNodes, nodes...)
-		}
-	}
+	// Build device tree nodes from created devices using their actual allocated addresses
+	virtioNodes := l.getVirtioDeviceTreeNodes(createdDevices)
 
 	rec.Record(tsLinuxLoaderGotDeviceTreeNodes)
 
@@ -297,7 +318,7 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 		// For x86_64 with ACPI, don't add virtio_mmio command line params
 		// because the devices will be discovered via ACPI DSDT.
 		cmdlineStr := strings.Join(cmdlineBase, " ")
-		return l.loadAMD64(rec, vm, kernelReader, kernelSize, cmdlineStr, initrd)
+		return l.loadAMD64(rec, vm, kernelReader, kernelSize, cmdlineStr, initrd, createdDevices)
 	case hv.ArchitectureARM64:
 		cmdlineStr := strings.Join(cmdlineBase, " ")
 		return l.loadARM64(rec, vm, kernelReader, kernelSize, cmdlineStr, initrd, virtioNodes)
@@ -306,6 +327,32 @@ func (l *LinuxLoader) Load(vm hv.VirtualMachine) error {
 	default:
 		return fmt.Errorf("unsupported architecture: %v", arch)
 	}
+}
+
+// createDevicesEarly creates devices from templates early in the boot process.
+// This is needed so MMIO addresses are allocated before generating cmdline/device-tree.
+func (l *LinuxLoader) createDevicesEarly(vm hv.VirtualMachine) ([]hv.Device, error) {
+	var createdDevices []hv.Device
+	for _, template := range l.Devices {
+		dev, err := vm.AddDeviceFromTemplate(template)
+		if err != nil {
+			return nil, fmt.Errorf("add device from template: %w", err)
+		}
+		createdDevices = append(createdDevices, dev)
+	}
+	return createdDevices, nil
+}
+
+// getVirtioDeviceTreeNodes builds FDT nodes for VirtIO devices using their
+// actual allocated MMIO addresses.
+func (l *LinuxLoader) getVirtioDeviceTreeNodes(devices []hv.Device) []fdt.Node {
+	var nodes []fdt.Node
+	for _, dev := range devices {
+		if vdev, ok := dev.(virtio.AllocatedVirtioMMIODevice); ok {
+			nodes = append(nodes, virtio.GetAllocatedDeviceTreeNode(vdev))
+		}
+	}
+	return nodes
 }
 
 func (l *LinuxLoader) buildInitPayload(arch hv.CpuArchitecture) ([]byte, error) {
@@ -354,7 +401,7 @@ var (
 	tsLinuxLoaderInstalledACPI     = timeslice.RegisterKind("linux_loader_installed_acpi", 0)
 )
 
-func (l *LinuxLoader) loadAMD64(rec *timeslice.Recorder, vm hv.VirtualMachine, kernelReader io.ReaderAt, kernelSize int64, cmdline string, initrd []byte) error {
+func (l *LinuxLoader) loadAMD64(rec *timeslice.Recorder, vm hv.VirtualMachine, kernelReader io.ReaderAt, kernelSize int64, cmdline string, initrd []byte, createdDevices []hv.Device) error {
 	kernelImage, err := amd64boot.LoadKernel(kernelReader, kernelSize)
 	if err != nil {
 		return fmt.Errorf("load kernel: %w", err)
@@ -545,19 +592,14 @@ func (l *LinuxLoader) loadAMD64(rec *timeslice.Recorder, vm hv.VirtualMachine, k
 		return fmt.Errorf("add i8042 controller: %w", err)
 	}
 
-	for _, dev := range l.Devices {
-		if err := vm.AddDeviceFromTemplate(dev); err != nil {
-			return fmt.Errorf("add device from template: %w", err)
-		}
-	}
-
+	// Devices were already created earlier via createDevicesEarly()
 	rec.Record(tsLinuxLoaderAddedDevices)
 
-	// Collect virtio-mmio device info for ACPI DSDT
+	// Collect virtio-mmio device info for ACPI DSDT using actual allocated addresses
 	var virtioACPIDevices []acpi.VirtioMMIODevice
-	for i, dev := range l.Devices {
-		if vdev, ok := dev.(virtio.VirtioMMIODevice); ok {
-			info := vdev.GetACPIDeviceInfo()
+	for i, dev := range createdDevices {
+		if vdev, ok := dev.(virtio.AllocatedVirtioMMIODevice); ok {
+			info := virtio.GetAllocatedACPIDeviceInfo(vdev)
 			virtioACPIDevices = append(virtioACPIDevices, acpi.VirtioMMIODevice{
 				Name:     fmt.Sprintf("VIO%d", i),
 				BaseAddr: info.BaseAddr,
@@ -671,7 +713,7 @@ var (
 )
 
 func (l *LinuxLoader) loadARM64(rec *timeslice.Recorder, vm hv.VirtualMachine, kernelReader io.ReaderAt, kernelSize int64, cmdline string, initrd []byte, deviceTree []fdt.Node) error {
-	kernelImage, err := arm64boot.LoadKernel(kernelReader, kernelSize)
+	kernelImage, err := arm64boot.LoadKernelWithCache(kernelReader, kernelSize, l.CacheDir)
 	if err != nil {
 		return fmt.Errorf("load kernel: %w", err)
 	}
@@ -718,12 +760,7 @@ func (l *LinuxLoader) loadARM64(rec *timeslice.Recorder, vm hv.VirtualMachine, k
 
 	rec.Record(tsLinuxLoaderAddedUART)
 
-	for _, dev := range l.Devices {
-		if err := vm.AddDeviceFromTemplate(dev); err != nil {
-			return fmt.Errorf("add device from template: %w", err)
-		}
-	}
-
+	// Devices were already created earlier via createDevicesEarly()
 	rec.Record(tsLinuxLoaderAddedDevices)
 
 	return nil

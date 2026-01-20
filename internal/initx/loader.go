@@ -24,11 +24,9 @@ import (
 )
 
 const (
-	mailboxPhysAddr        = 0xf000_0000
-	mailboxRegionSize      = 0x1000
-	configRegionPhysAddr   = 0xf000_3000
-	configRegionSize       = 4 * 1024 * 1024
-	configRegionPageOffset = configRegionPhysAddr - mailboxPhysAddr
+	// Default region sizes for MMIO allocations
+	mailboxRegionSize = 0x1000
+	configRegionSize  = 4 * 1024 * 1024
 
 	configHeaderMagicValue = 0xcafebabe
 	configHeaderSize       = 40
@@ -42,10 +40,18 @@ const (
 
 	userYieldValue = 0x5553_4552 // "USER"
 
-	// arm64MaxMemoryMB is the maximum memory for ARM64 to avoid overlap
-	// with the mailbox/config regions at 0xf0000000.
-	// Max = (0xf0000000 - 0x80000000) / (1024*1024) = 1792 MB
-	arm64MaxMemoryMB = 1792
+	// Config region command format (at offset 0x100000):
+	// Offset 0: Magic (0x434D4452 = "CMDR")
+	// Offset 4: path_len (uint32)
+	// Offset 8: argc (uint32)
+	// Offset 12: envc (uint32)
+	// Offset 16: path\0 + args\0...\0 + envs\0...\0
+	execCmdRegionOffset  = 0x100000
+	execCmdMagicValue    = 0x434D4452 // "CMDR"
+	execCmdPathLenOffset = 4
+	execCmdArgcOffset    = 8
+	execCmdEnvcOffset    = 12
+	execCmdDataOffset    = 16
 )
 
 type proxyReader struct {
@@ -118,6 +124,10 @@ type programLoader struct {
 
 	runResultDetail uint32
 	runResultStage  uint32
+
+	// Dynamically allocated MMIO addresses
+	mailboxPhysAddr      uint64
+	configRegionPhysAddr uint64
 }
 
 func (p *programLoader) ReserveDataRegion(size int) {
@@ -142,15 +152,15 @@ func (p *programLoader) Init(vm hv.VirtualMachine) error {
 // MMIORegions implements hv.MemoryMappedIODevice.
 func (p *programLoader) MMIORegions() []hv.MMIORegion {
 	return []hv.MMIORegion{
-		{Address: mailboxPhysAddr, Size: mailboxRegionSize},
-		{Address: configRegionPhysAddr, Size: configRegionSize},
+		{Address: p.mailboxPhysAddr, Size: mailboxRegionSize},
+		{Address: p.configRegionPhysAddr, Size: configRegionSize},
 	}
 }
 
 // ReadMMIO implements hv.MemoryMappedIODevice.
 func (p *programLoader) ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
-	if addr >= configRegionPhysAddr && addr < configRegionPhysAddr+configRegionSize {
-		offset := addr - configRegionPhysAddr
+	if addr >= p.configRegionPhysAddr && addr < p.configRegionPhysAddr+configRegionSize {
+		offset := addr - p.configRegionPhysAddr
 		copy(data, p.dataRegion[offset:])
 		return nil
 	}
@@ -166,18 +176,18 @@ func (p *programLoader) DeviceTreeNodes() ([]fdt.Node, error) {
 	}
 	return []fdt.Node{
 		{
-			Name: fmt.Sprintf("initx-mailbox@%x", mailboxPhysAddr),
+			Name: fmt.Sprintf("initx-mailbox@%x", p.mailboxPhysAddr),
 			Properties: map[string]fdt.Property{
 				"compatible": {Strings: []string{"tinyrange,initx-mailbox"}},
-				"reg":        {U64: []uint64{mailboxPhysAddr, mailboxRegionSize}},
+				"reg":        {U64: []uint64{p.mailboxPhysAddr, mailboxRegionSize}},
 				"status":     {Strings: []string{"okay"}},
 			},
 		},
 		{
-			Name: fmt.Sprintf("initx-config@%x", configRegionPhysAddr),
+			Name: fmt.Sprintf("initx-config@%x", p.configRegionPhysAddr),
 			Properties: map[string]fdt.Property{
 				"compatible": {Strings: []string{"tinyrange,initx-config"}},
-				"reg":        {U64: []uint64{configRegionPhysAddr, configRegionSize}},
+				"reg":        {U64: []uint64{p.configRegionPhysAddr, configRegionSize}},
 				"status":     {Strings: []string{"okay"}},
 			},
 		},
@@ -186,7 +196,15 @@ func (p *programLoader) DeviceTreeNodes() ([]fdt.Node, error) {
 
 // WriteMMIO implements hv.MemoryMappedIODevice.
 func (p *programLoader) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
-	offset := addr - mailboxPhysAddr
+	// Check if write is to config region (for command loop communication)
+	if addr >= p.configRegionPhysAddr && addr < p.configRegionPhysAddr+configRegionSize {
+		offset := addr - p.configRegionPhysAddr
+		copy(p.dataRegion[offset:], data)
+		return nil
+	}
+
+	// Handle mailbox writes
+	offset := addr - p.mailboxPhysAddr
 
 	switch offset {
 	case mailboxRunResultDetailOffset:
@@ -201,6 +219,9 @@ func (p *programLoader) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) 
 		value := binary.LittleEndian.Uint32(data)
 		switch value {
 		case 0x444f4e45, snapshotRequestValue:
+			// Clear runResultDetail when guest signals done/ready
+			// to indicate successful yield (not an error)
+			p.runResultDetail = 0
 			return hv.ErrYield
 		case userYieldValue:
 			return hv.ErrUserYield
@@ -387,6 +408,14 @@ type VirtualMachine struct {
 
 	// consoleDevice is the virtio-console device for interactive console I/O.
 	consoleDevice *virtio.Console
+
+	// Dynamically allocated MMIO addresses for initx regions
+	mailboxPhysAddr      uint64
+	configRegionPhysAddr uint64
+
+	// pendingSnapshot holds a snapshot to restore after VM creation.
+	// Set by WithSnapshot option.
+	pendingSnapshot hv.Snapshot
 }
 
 func (vm *VirtualMachine) Close() error {
@@ -457,9 +486,127 @@ func (vm *VirtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 	return nil
 }
 
+// WriteExecCommand writes a command to the config region for the guest command loop.
+// The guest will read this command and execute it via fork/exec/wait.
+// Format at offset 0x100000:
+// - Magic (4 bytes): 0x434D4452 ("CMDR")
+// - path_len (4 bytes): length of path string (excluding null terminator)
+// - argc (4 bytes): number of arguments (including argv[0])
+// - envc (4 bytes): number of environment variables
+// - data: path\0 + args\0...\0 + envs\0...\0
+func (vm *VirtualMachine) WriteExecCommand(path string, args []string, env []string) error {
+	// Calculate total size needed
+	dataSize := len(path) + 1 // path + null terminator
+	for _, arg := range args {
+		dataSize += len(arg) + 1
+	}
+	for _, e := range env {
+		dataSize += len(e) + 1
+	}
+
+	// Check if data fits in the available region
+	// Config region is 4MB, command region starts at 0x100000, leaving ~3MB for command data
+	maxDataSize := configRegionSize - execCmdRegionOffset - execCmdDataOffset
+	if dataSize > maxDataSize {
+		return fmt.Errorf("command data too large: %d bytes (max %d)", dataSize, maxDataSize)
+	}
+
+	// Build the command buffer
+	totalSize := execCmdDataOffset + dataSize
+	buf := make([]byte, totalSize)
+
+	// Write header
+	binary.LittleEndian.PutUint32(buf[0:4], execCmdMagicValue)
+	binary.LittleEndian.PutUint32(buf[execCmdPathLenOffset:], uint32(len(path)))
+	binary.LittleEndian.PutUint32(buf[execCmdArgcOffset:], uint32(len(args)))
+	binary.LittleEndian.PutUint32(buf[execCmdEnvcOffset:], uint32(len(env)))
+
+	// Write data: path + args + env (all null-terminated)
+	offset := execCmdDataOffset
+	copy(buf[offset:], path)
+	offset += len(path)
+	buf[offset] = 0
+	offset++
+
+	for _, arg := range args {
+		copy(buf[offset:], arg)
+		offset += len(arg)
+		buf[offset] = 0
+		offset++
+	}
+
+	for _, e := range env {
+		copy(buf[offset:], e)
+		offset += len(e)
+		buf[offset] = 0
+		offset++
+	}
+
+	// Write to config region
+	if vm.programLoader.region != nil {
+		if _, err := vm.programLoader.region.WriteAt(buf, int64(execCmdRegionOffset)); err != nil {
+			return fmt.Errorf("write exec command to config region: %w", err)
+		}
+	} else {
+		// ARM64 uses direct dataRegion access
+		// Ensure dataRegion is allocated (it may not be if called before LoadProgram)
+		if len(vm.programLoader.dataRegion) < configRegionSize {
+			vm.programLoader.dataRegion = make([]byte, configRegionSize)
+		}
+		copy(vm.programLoader.dataRegion[execCmdRegionOffset:], buf)
+	}
+
+	return nil
+}
+
+// ClearExecCommand clears the command magic in the config region.
+// This should be called before capturing a snapshot to ensure the guest
+// doesn't try to execute a stale command after restore.
+func (vm *VirtualMachine) ClearExecCommand() error {
+	// Write zero to the magic field
+	buf := make([]byte, 4)
+	binary.LittleEndian.PutUint32(buf, 0)
+
+	if vm.programLoader.region != nil {
+		if _, err := vm.programLoader.region.WriteAt(buf, int64(execCmdRegionOffset)); err != nil {
+			return fmt.Errorf("clear exec command magic: %w", err)
+		}
+	} else {
+		// ARM64 uses direct dataRegion access
+		// Ensure dataRegion is allocated (it may not be if called before LoadProgram)
+		if len(vm.programLoader.dataRegion) < configRegionSize {
+			vm.programLoader.dataRegion = make([]byte, configRegionSize)
+		}
+		copy(vm.programLoader.dataRegion[execCmdRegionOffset:], buf)
+	}
+
+	return nil
+}
+
 // HVVirtualMachine returns the underlying hv.VirtualMachine for low-level operations.
 func (vm *VirtualMachine) HVVirtualMachine() hv.VirtualMachine {
 	return vm.vm
+}
+
+// MailboxPhysAddr returns the physical address of the mailbox MMIO region.
+func (vm *VirtualMachine) MailboxPhysAddr() uint64 {
+	return vm.mailboxPhysAddr
+}
+
+// ConfigRegionPhysAddr returns the physical address of the config MMIO region.
+func (vm *VirtualMachine) ConfigRegionPhysAddr() uint64 {
+	return vm.configRegionPhysAddr
+}
+
+// TimesliceMMIOPhysAddr returns the physical address of the timeslice MMIO region.
+// This is derived from the config region address (timeslice is at config - 0x2000).
+func (vm *VirtualMachine) TimesliceMMIOPhysAddr() uint64 {
+	// Timeslice MMIO is at a fixed offset before the config region
+	// Default: 0xf0001000 when config is at 0xf0003000
+	if vm.configRegionPhysAddr >= 0x2000 {
+		return vm.configRegionPhysAddr - 0x2000
+	}
+	return 0xf0001000 // fallback to default
 }
 
 func (vm *VirtualMachine) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error {
@@ -608,6 +755,17 @@ func WithConsoleOutput(w io.Writer) Option {
 	})
 }
 
+// WithSnapshot configures the VM to restore from the given snapshot after creation.
+// This skips kernel loading since the snapshot contains the full VM state.
+// The snapshot will be restored automatically after VM creation.
+func WithSnapshot(snap hv.Snapshot) Option {
+	return funcOption(func(vm *VirtualMachine) error {
+		vm.pendingSnapshot = snap
+		vm.loader.SkipKernelLoad = true
+		return nil
+	})
+}
+
 // consoleCapturingTemplate wraps a ConsoleTemplate to capture the created device reference.
 type consoleCapturingTemplate struct {
 	inner  virtio.ConsoleTemplate
@@ -717,16 +875,15 @@ func NewVirtualMachine(
 	ret.programLoader = programLoader
 	ret.kernelLoader = kernelLoader
 
-	// Cap ARM64 memory to avoid overlap with mailbox/config regions at 0xf0000000
-	memSize := memSizeMB
-	if h.Architecture() == hv.ArchitectureARM64 && memSize > arm64MaxMemoryMB {
-		memSize = arm64MaxMemoryMB
-	}
+	// Get cache directory for kernel decompression caching
+	cacheDir, _ := kernel.GetDefaultCachePath()
 
+	// No longer cap memory - MMIO regions are now allocated dynamically above RAM
 	ret.loader = &boot.LinuxLoader{
-		NumCPUs: numCPUs,
+		NumCPUs:  numCPUs,
+		CacheDir: cacheDir,
 
-		MemSize: memSize << 20,
+		MemSize: memSizeMB << 20,
 		MemBase: func() uint64 {
 			switch h.Architecture() {
 			case hv.ArchitectureARM64:
@@ -737,6 +894,10 @@ func NewVirtualMachine(
 		}(),
 
 		GetKernel: func() (io.ReaderAt, int64, error) {
+			if kernelLoader == nil {
+				return nil, 0, fmt.Errorf("kernel not loaded (use WithSnapshot for snapshot restore)")
+			}
+
 			size, err := kernelLoader.Size()
 			if err != nil {
 				return nil, 0, fmt.Errorf("get kernel size: %v", err)
@@ -751,12 +912,21 @@ func NewVirtualMachine(
 		},
 
 		GetSystemMap: func() (io.ReaderAt, error) {
+			if kernelLoader == nil {
+				return nil, fmt.Errorf("kernel not loaded (use WithSnapshot for snapshot restore)")
+			}
 			return kernelLoader.GetSystemMap()
 		},
 
 		GetInit: func(arch hv.CpuArchitecture) (*ir.Program, error) {
+			if kernelLoader == nil {
+				return nil, fmt.Errorf("kernel not loaded (use WithSnapshot for snapshot restore)")
+			}
+
 			cfg := BuilderConfig{
-				Arch: arch,
+				Arch:                 arch,
+				MailboxPhysAddr:      ret.mailboxPhysAddr,
+				ConfigRegionPhysAddr: ret.configRegionPhysAddr,
 			}
 
 			modules, err := kernelLoader.PlanModuleLoad(
@@ -878,21 +1048,48 @@ func NewVirtualMachine(
 	)
 
 	ret.loader.CreateVMWithMemory = func(vm hv.VirtualMachine) error {
-		if runtime.GOOS == "linux" && h.Architecture() == hv.ArchitectureARM64 {
-			return nil
+		// Allocate mailbox MMIO region dynamically above RAM
+		mailboxAlloc, err := vm.AllocateMMIO(hv.MMIOAllocationRequest{
+			Name:      "initx-mailbox",
+			Size:      mailboxRegionSize,
+			Alignment: 0x1000,
+		})
+		if err != nil {
+			return fmt.Errorf("allocate initx mailbox region: %v", err)
 		}
+		ret.mailboxPhysAddr = mailboxAlloc.Base
+		programLoader.mailboxPhysAddr = mailboxAlloc.Base
 
-		if runtime.GOOS == "darwin" && h.Architecture() == hv.ArchitectureARM64 {
-			return nil
-		}
-
-		mem, err := vm.AllocateMemory(configRegionPhysAddr, configRegionSize)
+		// Allocate config MMIO region dynamically above RAM
+		configAlloc, err := vm.AllocateMMIO(hv.MMIOAllocationRequest{
+			Name:      "initx-config",
+			Size:      configRegionSize,
+			Alignment: 0x1000,
+		})
 		if err != nil {
 			return fmt.Errorf("allocate initx config region: %v", err)
 		}
+		ret.configRegionPhysAddr = configAlloc.Base
+		programLoader.configRegionPhysAddr = configAlloc.Base
 
-		ret.configRegion = mem
-		programLoader.region = mem
+		// On x86 (and non-ARM64 Linux/Darwin), we need to allocate backing memory
+		// for the config region since it's not handled by the MMU like ARM64
+		needsBackingMemory := true
+		if runtime.GOOS == "linux" && h.Architecture() == hv.ArchitectureARM64 {
+			needsBackingMemory = false
+		}
+		if runtime.GOOS == "darwin" && h.Architecture() == hv.ArchitectureARM64 {
+			needsBackingMemory = false
+		}
+
+		if needsBackingMemory {
+			mem, err := vm.AllocateMemory(configAlloc.Base, configRegionSize)
+			if err != nil {
+				return fmt.Errorf("allocate initx config backing memory: %v", err)
+			}
+			ret.configRegion = mem
+			programLoader.region = mem
+		}
 
 		return nil
 	}
@@ -925,6 +1122,15 @@ func NewVirtualMachine(
 	ret.vm, err = h.NewVirtualMachine(ret.loader)
 	if err != nil {
 		return nil, err
+	}
+
+	// Restore pending snapshot if one was provided via WithSnapshot option
+	if ret.pendingSnapshot != nil {
+		if err := ret.vm.RestoreSnapshot(ret.pendingSnapshot); err != nil {
+			ret.vm.Close()
+			return nil, fmt.Errorf("restore snapshot: %w", err)
+		}
+		ret.firstRunComplete = true // Mark as booted since snapshot is post-boot state
 	}
 
 	return &ret, nil
@@ -1020,7 +1226,7 @@ func (vm *VirtualMachine) WriteFile(ctx context.Context, in io.Reader, size int6
 					ir.Int64(linux.PROT_READ|linux.PROT_WRITE),
 					ir.Int64(linux.MAP_SHARED),
 					memFd,
-					ir.Int64(mailboxPhysAddr),
+					ir.Int64(int64(vm.mailboxPhysAddr)),
 				)),
 				ir.Assign(errVar, mailboxPtr),
 				ir.If(ir.IsNegative(errVar), ir.Block{
@@ -1036,7 +1242,7 @@ func (vm *VirtualMachine) WriteFile(ctx context.Context, in io.Reader, size int6
 					ir.Int64(linux.PROT_READ),
 					ir.Int64(linux.MAP_SHARED),
 					memFd,
-					ir.Int64(configRegionPhysAddr),
+					ir.Int64(int64(vm.configRegionPhysAddr)),
 				)),
 				ir.Assign(errVar, configPtr),
 				ir.If(ir.IsNegative(errVar), ir.Block{

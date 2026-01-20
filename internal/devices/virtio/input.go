@@ -131,7 +131,6 @@ func (t InputTemplate) Create(vm hv.VirtualMachine) (hv.Device, error) {
 	arch := t.archOrDefault(vm)
 	irqLine := t.irqLineForArch(arch)
 	encodedLine := EncodeIRQLineForArch(arch, irqLine)
-	base := t.mmioBase()
 
 	name := t.Name
 	if name == "" {
@@ -140,6 +139,24 @@ func (t InputTemplate) Create(vm hv.VirtualMachine) (hv.Device, error) {
 		} else {
 			name = "Virtio Tablet"
 		}
+	}
+
+	// Allocate MMIO region dynamically
+	base := t.mmioBase()
+	if vm != nil {
+		deviceName := "virtio-input-keyboard"
+		if t.Type == InputTypeTablet {
+			deviceName = "virtio-input-tablet"
+		}
+		alloc, err := vm.AllocateMMIO(hv.MMIOAllocationRequest{
+			Name:      deviceName,
+			Size:      InputDefaultMMIOSize,
+			Alignment: 0x1000,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("virtio-input: allocate MMIO: %w", err)
+		}
+		base = alloc.Base
 	}
 
 	input := &Input{
@@ -702,6 +719,21 @@ func (i *Input) InjectMouseMove(x, y int32) {
 	i.InjectAbsEvent(ABS_X, x)
 	i.InjectAbsEvent(ABS_Y, y)
 	i.InjectSynReport()
+}
+
+// AllocatedMMIOBase implements AllocatedVirtioMMIODevice.
+func (i *Input) AllocatedMMIOBase() uint64 {
+	return i.base
+}
+
+// AllocatedMMIOSize implements AllocatedVirtioMMIODevice.
+func (i *Input) AllocatedMMIOSize() uint64 {
+	return i.size
+}
+
+// AllocatedIRQLine implements AllocatedVirtioMMIODevice.
+func (i *Input) AllocatedIRQLine() uint32 {
+	return i.irqLine
 }
 
 var (

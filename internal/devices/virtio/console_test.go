@@ -71,14 +71,19 @@ func (vm *consoleTestVM) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error
 	return nil
 }
 func (vm *consoleTestVM) AddDevice(dev hv.Device) error { return nil }
-func (vm *consoleTestVM) AddDeviceFromTemplate(template hv.DeviceTemplate) error {
-	return nil
+func (vm *consoleTestVM) AddDeviceFromTemplate(template hv.DeviceTemplate) (hv.Device, error) {
+	return nil, nil
 }
 func (vm *consoleTestVM) AllocateMemory(physAddr, size uint64) (hv.MemoryRegion, error) {
 	return nil, fmt.Errorf("not implemented")
 }
-func (vm *consoleTestVM) CaptureSnapshot() (hv.Snapshot, error)         { return nil, nil }
-func (vm *consoleTestVM) RestoreSnapshot(snap hv.Snapshot) error        { return nil }
+func (vm *consoleTestVM) CaptureSnapshot() (hv.Snapshot, error)  { return nil, nil }
+func (vm *consoleTestVM) RestoreSnapshot(snap hv.Snapshot) error { return nil }
+func (vm *consoleTestVM) AllocateMMIO(req hv.MMIOAllocationRequest) (hv.MMIOAllocation, error) {
+	return hv.MMIOAllocation{}, nil
+}
+func (vm *consoleTestVM) RegisterFixedMMIO(name string, base, size uint64) error { return nil }
+func (vm *consoleTestVM) GetAllocatedMMIORegions() []hv.MMIOAllocation           { return nil }
 
 var _ hv.VirtualMachine = (*consoleTestVM)(nil)
 

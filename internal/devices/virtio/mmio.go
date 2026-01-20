@@ -25,6 +25,64 @@ type VirtioMMIODevice interface {
 	GetACPIDeviceInfo() ACPIDeviceInfo
 }
 
+// AllocatedVirtioMMIODevice is implemented by created VirtIO MMIO devices
+// to report their actual allocated MMIO addresses. This is used by the
+// LinuxLoader to generate cmdline and device tree entries after device
+// creation, when the actual addresses are known.
+type AllocatedVirtioMMIODevice interface {
+	// AllocatedMMIOBase returns the actual allocated MMIO base address
+	AllocatedMMIOBase() uint64
+	// AllocatedMMIOSize returns the MMIO region size
+	AllocatedMMIOSize() uint64
+	// AllocatedIRQLine returns the allocated IRQ line (already encoded for architecture)
+	AllocatedIRQLine() uint32
+}
+
+// GetAllocatedLinuxCommandLineParam returns the cmdline parameter for an
+// allocated VirtIO MMIO device using its actual addresses.
+func GetAllocatedLinuxCommandLineParam(dev AllocatedVirtioMMIODevice) string {
+	// The IRQ line stored in devices is encoded (for ARM64 it has SPI type bits).
+	// For cmdline we need the raw SPI offset.
+	irqLine := dev.AllocatedIRQLine()
+	// Mask off the type bits to get the raw IRQ number
+	rawIRQ := irqLine & 0xFFFF
+	return fmt.Sprintf("virtio_mmio.device=4k@0x%x:%d", dev.AllocatedMMIOBase(), rawIRQ)
+}
+
+// GetAllocatedDeviceTreeNode returns an FDT node for an allocated VirtIO
+// MMIO device using its actual addresses.
+func GetAllocatedDeviceTreeNode(dev AllocatedVirtioMMIODevice) fdt.Node {
+	base := dev.AllocatedMMIOBase()
+	size := dev.AllocatedMMIOSize()
+	// The IRQ line stored in devices is encoded (for ARM64 it has SPI type bits).
+	// For device tree we need the raw SPI offset.
+	irqLine := dev.AllocatedIRQLine()
+	rawIRQ := irqLine & 0xFFFF
+
+	return fdt.Node{
+		Name: fmt.Sprintf("virtio@%x", base),
+		Properties: map[string]fdt.Property{
+			"compatible": {Strings: []string{"virtio,mmio"}},
+			"reg":        {U64: []uint64{base, size}},
+			"interrupts": {U32: []uint32{0, rawIRQ, 4}},
+			"status":     {Strings: []string{"okay"}},
+		},
+	}
+}
+
+// GetAllocatedACPIDeviceInfo returns ACPI device info for an allocated
+// VirtIO MMIO device using its actual addresses.
+func GetAllocatedACPIDeviceInfo(dev AllocatedVirtioMMIODevice) ACPIDeviceInfo {
+	// For ACPI GSI we need the raw IRQ number
+	irqLine := dev.AllocatedIRQLine()
+	rawIRQ := irqLine & 0xFFFF
+	return ACPIDeviceInfo{
+		BaseAddr: dev.AllocatedMMIOBase(),
+		Size:     dev.AllocatedMMIOSize(),
+		GSI:      rawIRQ,
+	}
+}
+
 const (
 	VIRTIO_MMIO_MAGIC_VALUE         = 0x000
 	VIRTIO_MMIO_VERSION             = 0x004

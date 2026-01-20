@@ -211,6 +211,18 @@ func (f *fakeVM) AddDevice(hv.Device) error {
 	return fmt.Errorf("not implemented")
 }
 
-func (f *fakeVM) AddDeviceFromTemplate(hv.DeviceTemplate) error {
+func (f *fakeVM) AddDeviceFromTemplate(hv.DeviceTemplate) (hv.Device, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (f *fakeVM) AllocateMMIO(req hv.MMIOAllocationRequest) (hv.MMIOAllocation, error) {
+	return hv.MMIOAllocation{}, fmt.Errorf("not implemented")
+}
+
+func (f *fakeVM) RegisterFixedMMIO(name string, base, size uint64) error {
 	return fmt.Errorf("not implemented")
+}
+
+func (f *fakeVM) GetAllocatedMMIORegions() []hv.MMIOAllocation {
+	return nil
 }

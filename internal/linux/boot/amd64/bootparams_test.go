@@ -20,7 +20,9 @@ func (s *stubVM) SetIRQ(irqLine uint32, level bool) error                { panic
 func (s *stubVM) CaptureSnapshot() (hv.Snapshot, error)                  { panic("unimplemented") }
 func (s *stubVM) RestoreSnapshot(snap hv.Snapshot) error                 { panic("unimplemented") }
 func (s *stubVM) AddDevice(dev hv.Device) error                          { panic("unimplemented") }
-func (s *stubVM) AddDeviceFromTemplate(template hv.DeviceTemplate) error { panic("unimplemented") }
+func (s *stubVM) AddDeviceFromTemplate(template hv.DeviceTemplate) (hv.Device, error) {
+	panic("unimplemented")
+}
 func (s *stubVM) Close() error                                           { panic("unimplemented") }
 func (s *stubVM) Hypervisor() hv.Hypervisor                              { panic("unimplemented") }
 func (s *stubVM) Run(ctx context.Context, cfg hv.RunConfig) error        { panic("unimplemented") }
@@ -28,6 +30,15 @@ func (s *stubVM) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error 
 	panic("unimplemented")
 }
 func (s *stubVM) AllocateMemory(physAddr uint64, size uint64) (hv.MemoryRegion, error) {
+	panic("unimplemented")
+}
+func (s *stubVM) AllocateMMIO(req hv.MMIOAllocationRequest) (hv.MMIOAllocation, error) {
+	panic("unimplemented")
+}
+func (s *stubVM) RegisterFixedMMIO(name string, base, size uint64) error {
+	panic("unimplemented")
+}
+func (s *stubVM) GetAllocatedMMIORegions() []hv.MMIOAllocation {
 	panic("unimplemented")
 }
 

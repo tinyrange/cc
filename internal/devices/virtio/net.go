@@ -93,6 +93,7 @@ type Net struct {
 	device    device
 	base      uint64
 	size      uint64
+	irqLine   uint32
 	mac       net.HardwareAddr
 	backend   NetBackend
 	pendingRx [][]byte
@@ -119,6 +120,7 @@ func NewNet(vm hv.VirtualMachine, base uint64, size uint64, irqLine uint32, mac 
 		device:  nil, // Will be set below
 		base:    base,
 		size:    size,
+		irqLine: irqLine,
 		mac:     append(net.HardwareAddr(nil), mac...),
 		backend: backend,
 		linkUp:  true,
@@ -1050,6 +1052,21 @@ func (d *discardNetBackend) HandleTx(_ []byte, release func()) error {
 	return nil
 }
 
+// AllocatedMMIOBase implements AllocatedVirtioMMIODevice.
+func (vn *Net) AllocatedMMIOBase() uint64 {
+	return vn.base
+}
+
+// AllocatedMMIOSize implements AllocatedVirtioMMIODevice.
+func (vn *Net) AllocatedMMIOSize() uint64 {
+	return vn.size
+}
+
+// AllocatedIRQLine implements AllocatedVirtioMMIODevice.
+func (vn *Net) AllocatedIRQLine() uint32 {
+	return vn.irqLine
+}
+
 // NetTemplate is a template for creating virtio-net devices
 type NetTemplate struct {
 	Backend NetBackend
@@ -1126,7 +1143,22 @@ func (t NetTemplate) Create(vm hv.VirtualMachine) (hv.Device, error) {
 	if backend == nil {
 		backend = &discardNetBackend{}
 	}
-	netdev := NewNet(vm, NetDefaultMMIOBase, NetDefaultMMIOSize, EncodeIRQLineForArch(arch, irqLine), mac, backend)
+
+	// Allocate MMIO region dynamically
+	mmioBase := uint64(NetDefaultMMIOBase)
+	if vm != nil {
+		alloc, err := vm.AllocateMMIO(hv.MMIOAllocationRequest{
+			Name:      "virtio-net",
+			Size:      NetDefaultMMIOSize,
+			Alignment: 0x1000,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("virtio-net: allocate MMIO: %w", err)
+		}
+		mmioBase = alloc.Base
+	}
+
+	netdev := NewNet(vm, mmioBase, NetDefaultMMIOSize, EncodeIRQLineForArch(arch, irqLine), mac, backend)
 	if err := netdev.Init(vm); err != nil {
 		return nil, fmt.Errorf("virtio-net: initialize device: %w", err)
 	}

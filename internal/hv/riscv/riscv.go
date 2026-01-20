@@ -122,8 +122,8 @@ func (v *virtualMachine) AddDevice(dev hv.Device) error {
 	return fmt.Errorf("riscv: device support not implemented")
 }
 
-func (v *virtualMachine) AddDeviceFromTemplate(template hv.DeviceTemplate) error {
-	return fmt.Errorf("riscv: device template support not implemented")
+func (v *virtualMachine) AddDeviceFromTemplate(template hv.DeviceTemplate) (hv.Device, error) {
+	return nil, fmt.Errorf("riscv: device template support not implemented")
 }
 
 func (v *virtualMachine) AllocateMemory(physAddr, size uint64) (hv.MemoryRegion, error) {

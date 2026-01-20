@@ -21,6 +21,12 @@ var (
 // LoadKernel parses the supplied ARM64 Image (optionally compressed) and
 // returns an in-memory representation ready for placement into guest RAM.
 func LoadKernel(reader io.ReaderAt, size int64) (*KernelImage, error) {
+	return LoadKernelWithCache(reader, size, "")
+}
+
+// LoadKernelWithCache parses the supplied ARM64 Image with optional caching
+// of decompressed kernels. If cacheDir is empty, no caching is performed.
+func LoadKernelWithCache(reader io.ReaderAt, size int64, cacheDir string) (*KernelImage, error) {
 	rec := timeslice.NewState()
 
 	probe, err := ProbeKernelImage(reader, size)
@@ -30,7 +36,7 @@ func LoadKernel(reader io.ReaderAt, size int64) (*KernelImage, error) {
 
 	rec.Record(tsLinuxLoaderArm64ProbeKernel)
 
-	payload, err := probe.ExtractImage(reader, size)
+	payload, err := probe.ExtractImageCached(reader, size, cacheDir)
 	if err != nil {
 		return nil, fmt.Errorf("extract arm64 kernel image: %w", err)
 	}

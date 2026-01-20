@@ -19,10 +19,148 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// timesliceMMIOAddr is the MMIO address for guest timeslice recording.
+// Writes to this address record a timeslice marker with the written value as ID (0-255).
+const timesliceMMIOAddr uint64 = 0xf0001000
+
+// Guest timeslice ID constants - these must match the values used in guest code
+const (
+	// init_source.go phases (0-49)
+	GuestTsInitStart         = 0
+	GuestTsPhase1DevCreate   = 1
+	GuestTsPhase2MountDev    = 2
+	GuestTsPhase2MountShm    = 3
+	GuestTsPhase4ConsoleOpen = 5
+	GuestTsPhase4Setsid      = 6
+	GuestTsPhase4Dup         = 8
+	GuestTsPhase5MemOpen     = 9
+	GuestTsPhase5MailboxMap  = 10
+	GuestTsPhase5TsMap       = 11
+	GuestTsPhase5ConfigMap   = 12
+	GuestTsPhase5AnonMap     = 13
+	GuestTsPhase6TimeSetup   = 14
+	GuestTsPhase7LoopStart   = 15
+	GuestTsPhase7CopyPayload = 16
+	GuestTsPhase7Relocate    = 17
+	GuestTsPhase7ISB         = 18
+	GuestTsPhase7CallPayload = 19
+	GuestTsPhase7PayloadDone = 20
+
+	// container_init_source.go phases (50-99)
+	GuestTsContainerStart    = 50
+	GuestTsContainerMkdir    = 51
+	GuestTsContainerVirtiofs = 52
+	GuestTsContainerMkdirMnt = 53
+	GuestTsContainerMountFs  = 54
+	GuestTsContainerChroot   = 55
+	GuestTsContainerDevpts   = 56
+	GuestTsContainerQemu     = 57
+	GuestTsContainerHostname = 58
+	GuestTsContainerLoopback = 59
+	GuestTsContainerHosts    = 60
+	GuestTsContainerNetwork  = 61
+	GuestTsContainerWorkdir  = 62
+	GuestTsContainerDropPriv = 63
+	GuestTsContainerExec     = 64
+	GuestTsContainerComplete = 65
+
+	// ForkExecWait phases (66-70)
+	GuestTsForkStart = 66
+	GuestTsForkDone  = 67
+	GuestTsWaitStart = 68
+	GuestTsWaitDone  = 69
+
+	// Command loop phases (70-79)
+	GuestTsContainerCmdLoopStart = 70
+	GuestTsContainerCmdRead      = 71
+	GuestTsContainerCmdExec      = 72
+	GuestTsContainerCmdDone      = 73
+)
+
+// guestTimesliceNames maps guest timeslice IDs to descriptive names
+var guestTimesliceNames = map[int]string{
+	// init_source.go phases
+	GuestTsInitStart:         "guest::init_start",
+	GuestTsPhase1DevCreate:   "guest::phase1_dev_create",
+	GuestTsPhase2MountDev:    "guest::phase2_mount_dev",
+	GuestTsPhase2MountShm:    "guest::phase2_mount_shm",
+	GuestTsPhase4ConsoleOpen: "guest::phase4_console_open",
+	GuestTsPhase4Setsid:      "guest::phase4_setsid",
+	GuestTsPhase4Dup:         "guest::phase4_dup",
+	GuestTsPhase5MemOpen:     "guest::phase5_mem_open",
+	GuestTsPhase5MailboxMap:  "guest::phase5_mailbox_map",
+	GuestTsPhase5TsMap:       "guest::phase5_ts_map",
+	GuestTsPhase5ConfigMap:   "guest::phase5_config_map",
+	GuestTsPhase5AnonMap:     "guest::phase5_anon_map",
+	GuestTsPhase6TimeSetup:   "guest::phase6_time_setup",
+	GuestTsPhase7LoopStart:   "guest::phase7_loop_start",
+	GuestTsPhase7CopyPayload: "guest::phase7_copy_payload",
+	GuestTsPhase7Relocate:    "guest::phase7_relocate",
+	GuestTsPhase7ISB:         "guest::phase7_isb",
+	GuestTsPhase7CallPayload: "guest::phase7_call_payload",
+	GuestTsPhase7PayloadDone: "guest::phase7_payload_done",
+
+	// container_init_source.go phases
+	GuestTsContainerStart:    "guest::container_start",
+	GuestTsContainerMkdir:    "guest::container_mkdir",
+	GuestTsContainerVirtiofs: "guest::container_virtiofs",
+	GuestTsContainerMkdirMnt: "guest::container_mkdir_mnt",
+	GuestTsContainerMountFs:  "guest::container_mount_fs",
+	GuestTsContainerChroot:   "guest::container_chroot",
+	GuestTsContainerDevpts:   "guest::container_devpts",
+	GuestTsContainerQemu:     "guest::container_qemu",
+	GuestTsContainerHostname: "guest::container_hostname",
+	GuestTsContainerLoopback: "guest::container_loopback",
+	GuestTsContainerHosts:    "guest::container_hosts",
+	GuestTsContainerNetwork:  "guest::container_network",
+	GuestTsContainerWorkdir:  "guest::container_workdir",
+	GuestTsContainerDropPriv: "guest::container_drop_priv",
+	GuestTsContainerExec:     "guest::container_exec",
+	GuestTsContainerComplete: "guest::container_complete",
+
+	// ForkExecWait phases
+	GuestTsForkStart: "guest::fork_start",
+	GuestTsForkDone:  "guest::fork_done",
+	GuestTsWaitStart: "guest::wait_start",
+	GuestTsWaitDone:  "guest::wait_done",
+
+	// Command loop phases
+	GuestTsContainerCmdLoopStart: "guest::container_cmd_loop_start",
+	GuestTsContainerCmdRead:      "guest::container_cmd_read",
+	GuestTsContainerCmdExec:      "guest::container_cmd_exec",
+	GuestTsContainerCmdDone:      "guest::container_cmd_done",
+}
+
+// guestTimeslices holds pre-registered timeslice IDs for guest-recorded markers.
+// These are registered at init time to avoid allocation during MMIO handling.
+var guestTimeslices [256]timeslice.TimesliceID
+
+func init() {
+	for i := range guestTimeslices {
+		name, ok := guestTimesliceNames[i]
+		if !ok {
+			name = fmt.Sprintf("guest::%d", i)
+		}
+		guestTimeslices[i] = timeslice.RegisterKind(name, timeslice.SliceFlagGuestTime)
+	}
+}
+
 var (
 	tsHvfGuestTime     = timeslice.RegisterKind("hvf_guest_time", timeslice.SliceFlagGuestTime)
 	tsHvfHostTime      = timeslice.RegisterKind("hvf_host_time", 0)
 	tsHvfFirstRunStart = timeslice.RegisterKind("hvf_first_run_start", 0)
+
+	// Snapshot capture timeslice markers
+	tsCaptureVcpuState = timeslice.RegisterKind("snapshot::capture_vcpu_state", 0)
+	tsCaptureGicState  = timeslice.RegisterKind("snapshot::capture_gic_state", 0)
+	tsCaptureDevices   = timeslice.RegisterKind("snapshot::capture_devices", 0)
+	tsCaptureMemory    = timeslice.RegisterKind("snapshot::capture_memory", 0)
+
+	// Snapshot restore timeslice markers
+	tsRestoreMemory    = timeslice.RegisterKind("snapshot::restore_memory", 0)
+	tsRestoreGicState  = timeslice.RegisterKind("snapshot::restore_gic_state", 0)
+	tsRestoreVcpuState = timeslice.RegisterKind("snapshot::restore_vcpu_state", 0)
+	tsRestoreDevices   = timeslice.RegisterKind("snapshot::restore_devices", 0)
 
 	tsHvfStartTime = time.Now()
 )
@@ -143,8 +281,25 @@ type arm64HvfVcpuSnapshot struct {
 type arm64HvfSnapshot struct {
 	cpuStates       map[int]arm64HvfVcpuSnapshot
 	deviceSnapshots map[string]interface{}
-	memory          []byte
+	memory          []byte // The mmap'd memory buffer
+	memoryOwned     bool   // If true, snapshot owns the memory and must free it on Close
 	gicState        []byte
+
+	// captureTimeNanos records the wall clock time when the snapshot was captured.
+	// Used to adjust vtimer offset during restore to prevent guest time jumps.
+	captureTimeNanos int64
+}
+
+// Close frees the snapshot's memory if it owns it.
+func (s *arm64HvfSnapshot) Close() error {
+	if s.memoryOwned && s.memory != nil {
+		if err := unix.Munmap(s.memory); err != nil {
+			return fmt.Errorf("hvf: failed to unmap snapshot memory: %w", err)
+		}
+		s.memory = nil
+		s.memoryOwned = false
+	}
+	return nil
 }
 
 type exitContext struct {
@@ -194,6 +349,7 @@ func (v *virtualCPU) Close() error {
 
 	val := <-errChan
 	close(errChan)
+	close(v.runQueue)
 	return val
 }
 
@@ -300,9 +456,15 @@ func (v *virtualCPU) captureSnapshot() (arm64HvfVcpuSnapshot, error) {
 
 // restoreSnapshot restores the vCPU state from a snapshot.
 // Must be called from the vCPU's thread (via runQueue).
-func (v *virtualCPU) restoreSnapshot(snap arm64HvfVcpuSnapshot) error {
-	// Restore virtual timer offset first
-	if err := bindings.HvVcpuSetVtimerOffset(v.id, snap.VTimerOffset); err != bindings.HV_SUCCESS {
+// vtimerAdjustment is added to the snapshot's VTimerOffset to compensate for
+// wall clock time that has passed since the snapshot was captured. This prevents
+// the guest from seeing a large time jump when the snapshot is restored.
+func (v *virtualCPU) restoreSnapshot(snap arm64HvfVcpuSnapshot, vtimerAdjustment uint64) error {
+	// Restore virtual timer offset with adjustment for wall clock drift
+	// The adjustment prevents the guest from perceiving time jumps between
+	// snapshot capture and restore.
+	adjustedOffset := snap.VTimerOffset + vtimerAdjustment
+	if err := bindings.HvVcpuSetVtimerOffset(v.id, adjustedOffset); err != bindings.HV_SUCCESS {
 		return fmt.Errorf("hvf: restore vtimer offset: %w", err)
 	}
 
@@ -622,14 +784,44 @@ var (
 )
 
 func (v *virtualCPU) handleDataAbort(exitCtx *exitContext, syndrome bindings.ExceptionSyndrome, physAddr bindings.IPA) error {
+	addr := uint64(physAddr)
+
+	// Fast-path: timeslice recording MMIO
+	// This check is done before any other processing to minimize overhead.
+	// We use v.rec.Record() directly to capture timing relative to the run loop.
+	if addr == timesliceMMIOAddr {
+		decoded, err := decodeDataAbort(syndrome)
+		if err != nil {
+			return fmt.Errorf("hvf: timeslice MMIO decode error: %w", err)
+		}
+		if decoded.write {
+			// Read the timeslice ID from the source register
+			var val uint64 = 0 // default to 0 for XZR
+			if decoded.target != hv.RegisterARM64Xzr {
+				hvReg, ok := registerMap[decoded.target]
+				if !ok {
+					return fmt.Errorf("hvf: timeslice MMIO unsupported register %v", decoded.target)
+				}
+				if err := bindings.HvVcpuGetReg(v.id, hvReg, &val); err != bindings.HV_SUCCESS {
+					return fmt.Errorf("hvf: timeslice MMIO failed to get register: %w", err)
+				}
+			}
+			// Record the guest timeslice directly for proper timing
+			if val < 256 {
+				v.vm.guestTimesliceState.Record(guestTimeslices[val])
+			}
+		}
+		// For reads, we just return 0 (no register write needed)
+		return v.advanceProgramCounter()
+	}
+
+	// Normal MMIO path
 	exitCtx.SetExitTimeslice(tsDataAbort)
 
 	decoded, err := decodeDataAbort(syndrome)
 	if err != nil {
 		return fmt.Errorf("hvf: failed to decode data abort syndrome 0x%X: %w", syndrome, err)
 	}
-
-	var addr uint64 = uint64(physAddr)
 
 	dev, err := v.findMMIODevice(addr, uint64(decoded.sizeBytes))
 	if err != nil {
@@ -795,9 +987,11 @@ func (v *virtualCPU) start() {
 	var exit *bindings.VcpuExit = new(bindings.VcpuExit)
 
 	if err := bindings.HvVcpuCreate(&id, &exit, cfg); err != bindings.HV_SUCCESS {
+		bindings.OsRelease(uintptr(cfg))
 		v.initError <- err
 		return
 	}
+	bindings.OsRelease(uintptr(cfg))
 
 	// Set the MPIDR_EL1 to the vCPU ID.
 	// Okay setting this is required to get the GICv3 to work properly.
@@ -856,6 +1050,14 @@ var (
 	_ hv.MemoryRegion = &memoryRegion{}
 )
 
+// allocatedMemoryRegion tracks memory regions allocated via AllocateMemory
+// for proper cleanup when the VM is closed.
+type allocatedMemoryRegion struct {
+	memory   []byte
+	physAddr uint64
+	size     uint64
+}
+
 type virtualMachine struct {
 	rec *timeslice.Recorder
 
@@ -864,15 +1066,24 @@ type virtualMachine struct {
 	memory     []byte
 	memoryBase uint64
 
+	// additionalMemory tracks memory regions allocated via AllocateMemory
+	// (excluding the main VM memory). These must be unmapped and freed on Close().
+	additionalMemory []allocatedMemoryRegion
+
 	runQueue chan func()
 
 	cpus map[int]*virtualCPU
 
 	devices []hv.Device
 
+	// Physical address space allocator for MMIO regions
+	addressSpace *hv.AddressSpace
+
 	closed bool
 
 	gicInfo hv.Arm64GICInfo
+
+	guestTimesliceState *timeslice.Recorder
 }
 
 // implements hv.VirtualMachine
@@ -890,7 +1101,7 @@ func (v *virtualMachine) captureGICState() ([]byte, error) {
 	if state == 0 {
 		return nil, fmt.Errorf("hvf: failed to create GIC state object")
 	}
-	// Note: state is an os_object that should be released, but we don't have os_release binding
+	defer bindings.OsRelease(uintptr(state))
 
 	var size uintptr
 	if err := bindings.HvGicStateGetSize(state, &size); err != bindings.HV_SUCCESS {
@@ -923,10 +1134,14 @@ func (v *virtualMachine) restoreGICState(data []byte) error {
 }
 
 // CaptureSnapshot implements [hv.VirtualMachine].
+// Uses COW (copy-on-write) via vm_copy for O(1) memory capture.
 func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
+	rec := timeslice.NewState()
+
 	ret := &arm64HvfSnapshot{
-		cpuStates:       make(map[int]arm64HvfVcpuSnapshot),
-		deviceSnapshots: make(map[string]any),
+		cpuStates:        make(map[int]arm64HvfVcpuSnapshot),
+		deviceSnapshots:  make(map[string]any),
+		captureTimeNanos: time.Now().UnixNano(),
 	}
 
 	// Capture each vCPU state
@@ -945,6 +1160,7 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 		}
 		ret.cpuStates[id] = state
 	}
+	rec.Record(tsCaptureVcpuState)
 
 	// Capture GIC state
 	gicData, err := v.captureGICState()
@@ -952,6 +1168,7 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 		return nil, fmt.Errorf("hvf: capture GIC state: %w", err)
 	}
 	ret.gicState = gicData
+	rec.Record(tsCaptureGicState)
 
 	// Capture device snapshots
 	for _, dev := range v.devices {
@@ -964,26 +1181,80 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 			ret.deviceSnapshots[id] = snap
 		}
 	}
+	rec.Record(tsCaptureDevices)
 
-	// Capture memory (full copy of main guest RAM)
+	// Capture memory using COW (copy-on-write)
+	// The snapshot takes ownership of the current memory, and the VM gets a new
+	// COW copy. This makes capture O(1) instead of O(n).
 	v.memMu.Lock()
 	if len(v.memory) > 0 {
-		ret.memory = make([]byte, len(v.memory))
-		copy(ret.memory, v.memory)
+		memSize := len(v.memory)
+
+		// Allocate new memory for the VM to continue using
+		newMem, err := unix.Mmap(-1, 0, memSize,
+			unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANONYMOUS|unix.MAP_PRIVATE)
+		if err != nil {
+			v.memMu.Unlock()
+			return nil, fmt.Errorf("hvf: allocate new memory for COW: %w", err)
+		}
+
+		// COW copy from old memory to new memory (O(1) operation)
+		if err := bindings.VmCopy(
+			uintptr(unsafe.Pointer(&v.memory[0])),
+			uintptr(unsafe.Pointer(&newMem[0])),
+			uintptr(memSize),
+		); err != nil {
+			unix.Munmap(newMem)
+			v.memMu.Unlock()
+			return nil, fmt.Errorf("hvf: vm_copy for snapshot COW: %w", err)
+		}
+
+		// Unmap old memory from VM guest physical address space
+		if err := bindings.HvVmUnmap(bindings.IPA(v.memoryBase), uintptr(memSize)); err != bindings.HV_SUCCESS {
+			unix.Munmap(newMem)
+			v.memMu.Unlock()
+			return nil, fmt.Errorf("hvf: unmap old memory from VM: %w", err)
+		}
+
+		// Map new memory to VM guest physical address space
+		if err := bindings.HvVmMap(
+			unsafe.Pointer(&newMem[0]),
+			bindings.IPA(v.memoryBase),
+			uintptr(memSize),
+			bindings.HV_MEMORY_READ|bindings.HV_MEMORY_WRITE|bindings.HV_MEMORY_EXEC,
+		); err != bindings.HV_SUCCESS {
+			unix.Munmap(newMem)
+			v.memMu.Unlock()
+			return nil, fmt.Errorf("hvf: map new memory to VM: %w", err)
+		}
+
+		// Snapshot takes ownership of old memory
+		ret.memory = v.memory
+		ret.memoryOwned = true
+
+		// VM now uses new memory
+		v.memory = newMem
 	}
 	v.memMu.Unlock()
+	rec.Record(tsCaptureMemory)
 
 	return ret, nil
 }
 
 // RestoreSnapshot implements [hv.VirtualMachine].
+// Uses COW (copy-on-write) via vm_copy for O(1) memory restore.
+// We allocate fresh memory and vm_copy snapshot data to it, then swap with VM memory.
+// This ensures true COW behavior since we're copying to fresh pages.
 func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
+	rec := timeslice.NewState()
+
 	snapshotData, ok := snap.(*arm64HvfSnapshot)
 	if !ok {
 		return fmt.Errorf("hvf: invalid snapshot type")
 	}
 
-	// Restore memory first
+	// Restore memory using COW - allocate fresh memory and swap
+	// vm_copy to existing pages doesn't benefit from COW, so we need fresh pages
 	v.memMu.Lock()
 	if len(v.memory) != len(snapshotData.memory) {
 		v.memMu.Unlock()
@@ -991,13 +1262,79 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 			len(snapshotData.memory), len(v.memory))
 	}
 	if len(v.memory) > 0 {
-		copy(v.memory, snapshotData.memory)
+		memSize := len(v.memory)
+
+		// Allocate fresh memory for COW restore
+		newMem, err := unix.Mmap(-1, 0, memSize,
+			unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANONYMOUS|unix.MAP_PRIVATE)
+		if err != nil {
+			v.memMu.Unlock()
+			return fmt.Errorf("hvf: allocate new memory for COW restore: %w", err)
+		}
+
+		// COW copy from snapshot to fresh memory (O(1) operation)
+		if err := bindings.VmCopy(
+			uintptr(unsafe.Pointer(&snapshotData.memory[0])),
+			uintptr(unsafe.Pointer(&newMem[0])),
+			uintptr(memSize),
+		); err != nil {
+			unix.Munmap(newMem)
+			v.memMu.Unlock()
+			return fmt.Errorf("hvf: vm_copy for snapshot restore: %w", err)
+		}
+
+		// Unmap old memory from VM guest physical address space
+		if err := bindings.HvVmUnmap(bindings.IPA(v.memoryBase), uintptr(memSize)); err != bindings.HV_SUCCESS {
+			unix.Munmap(newMem)
+			v.memMu.Unlock()
+			return fmt.Errorf("hvf: unmap old memory from VM for restore: %w", err)
+		}
+
+		// Free old VM memory. Failure here indicates a bug (invalid slice) and leaves
+		// the VM unusable since guest memory is already unmapped above.
+		if err := unix.Munmap(v.memory); err != nil {
+			unix.Munmap(newMem)
+			v.memMu.Unlock()
+			return fmt.Errorf("hvf: munmap old VM memory (VM now unusable): %w", err)
+		}
+
+		// Map new memory to VM guest physical address space
+		if err := bindings.HvVmMap(
+			unsafe.Pointer(&newMem[0]),
+			bindings.IPA(v.memoryBase),
+			uintptr(memSize),
+			bindings.HV_MEMORY_READ|bindings.HV_MEMORY_WRITE|bindings.HV_MEMORY_EXEC,
+		); err != bindings.HV_SUCCESS {
+			unix.Munmap(newMem)
+			v.memMu.Unlock()
+			return fmt.Errorf("hvf: map new memory to VM for restore: %w", err)
+		}
+
+		// VM now uses restored memory
+		v.memory = newMem
 	}
 	v.memMu.Unlock()
+	rec.Record(tsRestoreMemory)
 
 	// Restore GIC state (before vCPUs to ensure interrupts are configured)
 	if err := v.restoreGICState(snapshotData.gicState); err != nil {
 		return fmt.Errorf("hvf: restore GIC state: %w", err)
+	}
+	rec.Record(tsRestoreGicState)
+
+	// Calculate vtimer offset adjustment for wall clock drift.
+	// This prevents the guest from seeing a time jump when the snapshot is restored.
+	// ARM64 timer runs at 24MHz (24_000_000 Hz), so we convert nanoseconds to ticks.
+	// ticks = nanoseconds * 24 / 1000
+	var vtimerAdjustment uint64
+	if snapshotData.captureTimeNanos > 0 {
+		nowNanos := time.Now().UnixNano()
+		deltaNanos := nowNanos - snapshotData.captureTimeNanos
+		if deltaNanos > 0 {
+			// Convert nanoseconds to timer ticks (24MHz timer)
+			// Using uint64 to avoid overflow: deltaNanos * 24 / 1000
+			vtimerAdjustment = uint64(deltaNanos) * 24 / 1000
+		}
 	}
 
 	// Restore each vCPU state
@@ -1009,13 +1346,14 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 
 		errChan := make(chan error, 1)
 		cpu.runQueue <- func() {
-			errChan <- cpu.restoreSnapshot(state)
+			errChan <- cpu.restoreSnapshot(state, vtimerAdjustment)
 		}
 
 		if err := <-errChan; err != nil {
 			return fmt.Errorf("hvf: restore vCPU %d snapshot: %w", id, err)
 		}
 	}
+	rec.Record(tsRestoreVcpuState)
 
 	// Restore device snapshots
 	for _, dev := range v.devices {
@@ -1030,6 +1368,7 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 			}
 		}
 	}
+	rec.Record(tsRestoreDevices)
 
 	return nil
 }
@@ -1092,6 +1431,17 @@ func (v *virtualMachine) Close() error {
 		v.memory = nil
 	}
 
+	// Clean up additional memory regions allocated via AllocateMemory
+	for _, region := range v.additionalMemory {
+		if err := bindings.HvVmUnmap(bindings.IPA(region.physAddr), uintptr(region.size)); err != bindings.HV_SUCCESS {
+			slog.Error("failed to unmap additional memory region", "physAddr", region.physAddr, "error", err)
+		}
+		if err := unix.Munmap(region.memory); err != nil {
+			slog.Error("failed to munmap additional memory region", "error", err)
+		}
+	}
+	v.additionalMemory = nil
+
 	for _, cpu := range v.cpus {
 		if err := cpu.Close(); err != nil {
 			slog.Error("failed to close vCPU", "error", err)
@@ -1112,13 +1462,16 @@ func (v *virtualMachine) Close() error {
 }
 
 // AddDeviceFromTemplate implements [hv.VirtualMachine].
-func (v *virtualMachine) AddDeviceFromTemplate(template hv.DeviceTemplate) error {
+func (v *virtualMachine) AddDeviceFromTemplate(template hv.DeviceTemplate) (hv.Device, error) {
 	dev, err := template.Create(v)
 	if err != nil {
-		return fmt.Errorf("failed to create device from template: %w", err)
+		return nil, fmt.Errorf("failed to create device from template: %w", err)
 	}
 
-	return v.AddDevice(dev)
+	if err := v.AddDevice(dev); err != nil {
+		return nil, err
+	}
+	return dev, nil
 }
 
 // AllocateMemory implements [hv.VirtualMachine].
@@ -1140,12 +1493,44 @@ func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.Memory
 		uintptr(size),
 		bindings.HV_MEMORY_READ|bindings.HV_MEMORY_WRITE|bindings.HV_MEMORY_EXEC,
 	); err != bindings.HV_SUCCESS {
+		unix.Munmap(mem)
 		return nil, fmt.Errorf("failed to map memory for VM at 0x%X,0x%X: %w", physAddr, size, err)
 	}
+
+	// Track the allocated region for cleanup on Close()
+	v.additionalMemory = append(v.additionalMemory, allocatedMemoryRegion{
+		memory:   mem,
+		physAddr: physAddr,
+		size:     size,
+	})
 
 	return &memoryRegion{
 		memory: mem,
 	}, nil
+}
+
+// AllocateMMIO implements [hv.VirtualMachine].
+func (v *virtualMachine) AllocateMMIO(req hv.MMIOAllocationRequest) (hv.MMIOAllocation, error) {
+	if v.addressSpace == nil {
+		return hv.MMIOAllocation{}, fmt.Errorf("hvf: address space not initialized")
+	}
+	return v.addressSpace.Allocate(req)
+}
+
+// RegisterFixedMMIO implements [hv.VirtualMachine].
+func (v *virtualMachine) RegisterFixedMMIO(name string, base, size uint64) error {
+	if v.addressSpace == nil {
+		return fmt.Errorf("hvf: address space not initialized")
+	}
+	return v.addressSpace.RegisterFixed(name, base, size)
+}
+
+// GetAllocatedMMIORegions implements [hv.VirtualMachine].
+func (v *virtualMachine) GetAllocatedMMIORegions() []hv.MMIOAllocation {
+	if v.addressSpace == nil {
+		return nil
+	}
+	return v.addressSpace.Allocations()
 }
 
 // ReadAt implements [hv.VirtualMachine].
@@ -1187,6 +1572,8 @@ func (v *virtualMachine) Run(ctx context.Context, cfg hv.RunConfig) error {
 	if cfg == nil {
 		return fmt.Errorf("hvf: RunConfig cannot be nil")
 	}
+
+	v.guestTimesliceState = timeslice.NewState()
 
 	return v.VirtualCPUCall(0, func(vcpu hv.VirtualCPU) error {
 		return cfg.Run(ctx, vcpu)
@@ -1255,7 +1642,6 @@ func (h *hypervisor) Close() error {
 }
 
 var (
-	tsHvfPreInit              = timeslice.RegisterKind("hvf_pre_init", 0)
 	tsHvfVmCreate             = timeslice.RegisterKind("hvf_vm_create", 0)
 	tsHvfOnCreateVM           = timeslice.RegisterKind("hvf_on_create_vm", 0)
 	tsHvfAllocateMemory       = timeslice.RegisterKind("hvf_allocate_memory", 0)
@@ -1280,12 +1666,12 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 	vmConfig := bindings.HvVmConfigCreate()
 
-	timeslice.Record(tsHvfPreInit, time.Since(tsHvfStartTime))
-
 	vm := bindings.HvVmCreate(vmConfig)
 	if vm != bindings.HV_SUCCESS {
+		bindings.OsRelease(uintptr(vmConfig))
 		return nil, fmt.Errorf("failed to create VM: %d", vm)
 	}
+	bindings.OsRelease(uintptr(vmConfig))
 
 	ret.rec.Record(tsHvfVmCreate)
 
@@ -1311,6 +1697,15 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 	ret.memory = mem.(*memoryRegion).memory
 	ret.memoryBase = config.MemoryBase()
+
+	// Remove main memory from additionalMemory tracking since it's tracked separately
+	// in v.memory and cleaned up by the main Close() logic.
+	if len(ret.additionalMemory) > 0 {
+		ret.additionalMemory = ret.additionalMemory[:len(ret.additionalMemory)-1]
+	}
+
+	// Initialize the physical address space allocator
+	ret.addressSpace = hv.NewAddressSpace(h.Architecture(), config.MemoryBase(), config.MemorySize())
 
 	// create GICv3 device if needed
 	if config.NeedsInterruptSupport() {
@@ -1358,16 +1753,20 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 		// check alignment
 		if uintptr(distributorBase)%uintptr(distributorBaseAlignment) != 0 {
+			bindings.OsRelease(uintptr(cfg))
 			return nil, fmt.Errorf("failed to set GIC distributor base: %#x is not aligned to %#x", distributorBase, distributorBaseAlignment)
 		}
 		if uintptr(redistributorBase)%uintptr(redistributorBaseAlignment) != 0 {
+			bindings.OsRelease(uintptr(cfg))
 			return nil, fmt.Errorf("failed to set GIC redistributor base: %#x is not aligned to %#x", redistributorBase, redistributorBaseAlignment)
 		}
 
 		if err := bindings.HvGicConfigSetDistributorBase(cfg, distributorBase); err != bindings.HV_SUCCESS {
+			bindings.OsRelease(uintptr(cfg))
 			return nil, fmt.Errorf("failed to set GIC distributor base: %s", err)
 		}
 		if err := bindings.HvGicConfigSetRedistributorBase(cfg, redistributorBase); err != bindings.HV_SUCCESS {
+			bindings.OsRelease(uintptr(cfg))
 			return nil, fmt.Errorf("failed to set GIC redistributor base: %s", err)
 		}
 
@@ -1381,8 +1780,10 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		}
 
 		if err := bindings.HvGicCreate(cfg); err != bindings.HV_SUCCESS {
+			bindings.OsRelease(uintptr(cfg))
 			return nil, fmt.Errorf("failed to create GICv3: %s", err)
 		}
+		bindings.OsRelease(uintptr(cfg))
 
 		ret.rec.Record(tsHvfGicCreate)
 	}
