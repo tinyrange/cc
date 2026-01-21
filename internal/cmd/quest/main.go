@@ -1356,7 +1356,7 @@ func (q *bringUpQuest) RunLinux() error {
 			}, nil
 		},
 
-		SerialStdout: os.Stdout,
+		SerialStdout: io.MultiWriter(os.Stdout, buf),
 
 		Devices: devices,
 	}

@@ -7,6 +7,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"unsafe"
 
 	"github.com/tinyrange/cc/internal/debug"
@@ -19,6 +21,14 @@ import (
 // Writes to this address record a timeslice marker with the written value as ID.
 // This must match the address used in initx/init_source.go and hvf/hvf_darwin_arm64.go.
 const timesliceMMIOAddr uint64 = 0xf0001000
+
+var (
+	tsArm64RestoreMadvise = timeslice.RegisterKind("arm64_restore_madvise", 0)
+	tsArm64RestoreMmap    = timeslice.RegisterKind("arm64_restore_mmap", 0)
+	tsArm64RestoreVcpu    = timeslice.RegisterKind("arm64_restore_vcpu", 0)
+	tsArm64RestoreClock   = timeslice.RegisterKind("arm64_restore_clock", 0)
+	tsArm64RestoreDevices = timeslice.RegisterKind("arm64_restore_devices", 0)
+)
 
 const (
 	kvmRegArm64         uint64 = 0x6000000000000000
@@ -80,8 +90,10 @@ var (
 	arm64SysRegAmairEl1      = arm64SysReg(3, 0, 10, 3, 0)
 )
 
-var arm64RegisterIDs = func() map[hv.Register]uint64 {
-	regs := make(map[hv.Register]uint64, 60)
+// arm64CoreRegisterIDs contains core registers that are always available.
+// These are the general-purpose registers, SP, PC, PSTATE, and VBAR.
+var arm64CoreRegisterIDs = func() map[hv.Register]uint64 {
+	regs := make(map[hv.Register]uint64, 40)
 
 	for i := 0; i <= 30; i++ {
 		reg := hv.Register(int(hv.RegisterARM64X0) + i)
@@ -91,33 +103,49 @@ var arm64RegisterIDs = func() map[hv.Register]uint64 {
 	regs[hv.RegisterARM64Sp] = arm64CoreRegister(uintptr(31 * 8))
 	regs[hv.RegisterARM64Pc] = arm64CoreRegister(uintptr(32 * 8))
 	regs[hv.RegisterARM64Pstate] = arm64CoreRegister(uintptr(33 * 8))
-	regs[hv.RegisterARM64Vbar] = arm64SysRegVbarEl1
 
-	// System registers for snapshots
-	regs[hv.RegisterARM64SctlrEl1] = arm64SysRegSctlrEl1
-	regs[hv.RegisterARM64TcrEl1] = arm64SysRegTcrEl1
-	regs[hv.RegisterARM64Ttbr0El1] = arm64SysRegTtbr0El1
-	regs[hv.RegisterARM64Ttbr1El1] = arm64SysRegTtbr1El1
-	regs[hv.RegisterARM64MairEl1] = arm64SysRegMairEl1
-	regs[hv.RegisterARM64ElrEl1] = arm64SysRegElrEl1
-	regs[hv.RegisterARM64SpsrEl1] = arm64SysRegSpsrEl1
-	regs[hv.RegisterARM64EsrEl1] = arm64SysRegEsrEl1
-	regs[hv.RegisterARM64FarEl1] = arm64SysRegFarEl1
-	regs[hv.RegisterARM64SpEl0] = arm64SysRegSpEl0
-	regs[hv.RegisterARM64SpEl1] = arm64SysRegSpEl1
-	regs[hv.RegisterARM64CntkctlEl1] = arm64SysRegCntkctlEl1
-	regs[hv.RegisterARM64CntvCtlEl0] = arm64SysRegCntvCtlEl0
-	regs[hv.RegisterARM64CntvCvalEl0] = arm64SysRegCntvCvalEl0
-	regs[hv.RegisterARM64CpacrEl1] = arm64SysRegCpacrEl1
-	regs[hv.RegisterARM64ContextidrEl1] = arm64SysRegContextidrEl1
-	regs[hv.RegisterARM64TpidrEl0] = arm64SysRegTpidrEl0
-	regs[hv.RegisterARM64TpidrEl1] = arm64SysRegTpidrEl1
-	regs[hv.RegisterARM64TpidrroEl0] = arm64SysRegTpidrroEl0
-	regs[hv.RegisterARM64ParEl1] = arm64SysRegParEl1
-	regs[hv.RegisterARM64Afsr0El1] = arm64SysRegAfsr0El1
-	regs[hv.RegisterARM64Afsr1El1] = arm64SysRegAfsr1El1
-	regs[hv.RegisterARM64AmairEl1] = arm64SysRegAmairEl1
+	return regs
+}()
 
+// arm64OptionalSysRegIDs contains system registers for snapshots that may not
+// be available on all kernels (e.g., Asahi Linux KVM doesn't expose many of these).
+// These are tried individually and failures are silently ignored.
+var arm64OptionalSysRegIDs = map[hv.Register]uint64{
+	hv.RegisterARM64Vbar:          arm64SysRegVbarEl1,
+	hv.RegisterARM64SctlrEl1:      arm64SysRegSctlrEl1,
+	hv.RegisterARM64TcrEl1:        arm64SysRegTcrEl1,
+	hv.RegisterARM64Ttbr0El1:      arm64SysRegTtbr0El1,
+	hv.RegisterARM64Ttbr1El1:      arm64SysRegTtbr1El1,
+	hv.RegisterARM64MairEl1:       arm64SysRegMairEl1,
+	hv.RegisterARM64ElrEl1:        arm64SysRegElrEl1,
+	hv.RegisterARM64SpsrEl1:       arm64SysRegSpsrEl1,
+	hv.RegisterARM64EsrEl1:        arm64SysRegEsrEl1,
+	hv.RegisterARM64FarEl1:        arm64SysRegFarEl1,
+	hv.RegisterARM64SpEl0:         arm64SysRegSpEl0,
+	hv.RegisterARM64SpEl1:         arm64SysRegSpEl1,
+	hv.RegisterARM64CntkctlEl1:    arm64SysRegCntkctlEl1,
+	hv.RegisterARM64CntvCtlEl0:    arm64SysRegCntvCtlEl0,
+	hv.RegisterARM64CntvCvalEl0:   arm64SysRegCntvCvalEl0,
+	hv.RegisterARM64CpacrEl1:      arm64SysRegCpacrEl1,
+	hv.RegisterARM64ContextidrEl1: arm64SysRegContextidrEl1,
+	hv.RegisterARM64TpidrEl0:      arm64SysRegTpidrEl0,
+	hv.RegisterARM64TpidrEl1:      arm64SysRegTpidrEl1,
+	hv.RegisterARM64TpidrroEl0:    arm64SysRegTpidrroEl0,
+	hv.RegisterARM64ParEl1:        arm64SysRegParEl1,
+	hv.RegisterARM64Afsr0El1:      arm64SysRegAfsr0El1,
+	hv.RegisterARM64Afsr1El1:      arm64SysRegAfsr1El1,
+	hv.RegisterARM64AmairEl1:      arm64SysRegAmairEl1,
+}
+
+// arm64RegisterIDs combines core and optional registers for SetRegisters/GetRegisters.
+var arm64RegisterIDs = func() map[hv.Register]uint64 {
+	regs := make(map[hv.Register]uint64, len(arm64CoreRegisterIDs)+len(arm64OptionalSysRegIDs))
+	for k, v := range arm64CoreRegisterIDs {
+		regs[k] = v
+	}
+	for k, v := range arm64OptionalSysRegIDs {
+		regs[k] = v
+	}
 	return regs
 }()
 
@@ -371,12 +399,33 @@ type arm64VcpuSnapshot struct {
 type arm64Snapshot struct {
 	cpuStates       map[int]arm64VcpuSnapshot
 	deviceSnapshots map[string]interface{}
-	memory          []byte
 	clockData       *kvmClockData
+
+	// File-based storage fields for COW mmap
+	memoryPath  string   // Path to snapshot file
+	memoryFile  *os.File // Keep open for mmap lifetime
+	memoryMmap  []byte   // mmap'd region (read-only reference)
+	memorySize  uint64   // Size in bytes
+	memoryOwned bool     // If true, delete file on Close
+
+	// Fallback for in-memory snapshots (loaded from disk)
+	memory []byte
 }
 
 // Close implements io.Closer for the Snapshot interface.
 func (s *arm64Snapshot) Close() error {
+	if s.memoryMmap != nil {
+		unix.Munmap(s.memoryMmap)
+		s.memoryMmap = nil
+	}
+	if s.memoryFile != nil {
+		s.memoryFile.Close()
+		s.memoryFile = nil
+	}
+	if s.memoryOwned && s.memoryPath != "" {
+		os.Remove(s.memoryPath)
+		s.memoryPath = ""
+	}
 	return nil
 }
 
@@ -385,32 +434,107 @@ func (v *virtualCPU) captureSnapshot() (arm64VcpuSnapshot, error) {
 		Registers: make(map[hv.Register]uint64, len(arm64RegisterIDs)),
 	}
 
-	regRequest := make(map[hv.Register]hv.RegisterValue, len(arm64RegisterIDs))
-	for reg := range arm64RegisterIDs {
-		regRequest[reg] = hv.Register64(0)
+	// First capture core registers - these must always succeed
+	coreRegs := make(map[hv.Register]hv.RegisterValue, len(arm64CoreRegisterIDs))
+	for reg := range arm64CoreRegisterIDs {
+		coreRegs[reg] = hv.Register64(0)
 	}
-
-	if err := v.GetRegisters(regRequest); err != nil {
-		return ret, fmt.Errorf("capture registers: %w", err)
+	if err := v.GetRegisters(coreRegs); err != nil {
+		return ret, fmt.Errorf("capture core registers: %w", err)
 	}
-
-	for reg, value := range regRequest {
+	for reg, value := range coreRegs {
 		ret.Registers[reg] = uint64(value.(hv.Register64))
+	}
+
+	// Try optional system registers individually - skip those that aren't available.
+	// Some kernels (e.g., Asahi Linux) don't expose all system registers via KVM.
+	for reg, kvmReg := range arm64OptionalSysRegIDs {
+		var val uint64
+		if err := getOneReg(v.fd, kvmReg, unsafe.Pointer(&val)); err != nil {
+			// Silently skip unavailable registers (ENOENT = not accessible on this kernel)
+			if errors.Is(err, unix.ENOENT) {
+				continue
+			}
+			// For other errors, continue anyway - the register is optional
+			continue
+		}
+		ret.Registers[reg] = val
 	}
 
 	return ret, nil
 }
 
 func (v *virtualCPU) restoreSnapshot(snap arm64VcpuSnapshot) error {
-	regs := make(map[hv.Register]hv.RegisterValue, len(snap.Registers))
-	for reg, value := range snap.Registers {
-		regs[reg] = hv.Register64(value)
+	// Restore core registers first - these must always succeed
+	coreRegs := make(map[hv.Register]hv.RegisterValue)
+	for reg := range arm64CoreRegisterIDs {
+		if value, ok := snap.Registers[reg]; ok {
+			coreRegs[reg] = hv.Register64(value)
+		}
+	}
+	if len(coreRegs) > 0 {
+		if err := v.SetRegisters(coreRegs); err != nil {
+			return fmt.Errorf("restore core registers: %w", err)
+		}
 	}
 
-	if err := v.SetRegisters(regs); err != nil {
-		return fmt.Errorf("restore registers: %w", err)
+	// Try to restore optional system registers - skip those that aren't available
+	for reg := range arm64OptionalSysRegIDs {
+		value, ok := snap.Registers[reg]
+		if !ok {
+			continue // Register wasn't captured, skip it
+		}
+		kvmReg, ok := arm64OptionalSysRegIDs[reg]
+		if !ok {
+			continue
+		}
+		val := value
+		if err := setOneReg(v.fd, kvmReg, unsafe.Pointer(&val)); err != nil {
+			// Silently skip unavailable registers
+			continue
+		}
 	}
 
+	return nil
+}
+
+// arm64GetSnapshotDir returns the directory for snapshot files.
+func arm64GetSnapshotDir() string {
+	if dir := os.Getenv("CC_SNAPSHOT_DIR"); dir != "" {
+		return dir
+	}
+	return filepath.Join(os.TempDir(), fmt.Sprintf("cc-snapshots-%d", os.Getpid()))
+}
+
+// arm64IsZeroPage checks if a 4KB page is all zeros using word-sized comparisons.
+func arm64IsZeroPage(page []byte) bool {
+	words := (*[512]uint64)(unsafe.Pointer(&page[0]))
+	for i := 0; i < 512; i++ {
+		if words[i] != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// arm64WriteSparseMemory writes memory to a file, skipping zero pages to create a sparse file.
+func arm64WriteSparseMemory(f *os.File, memory []byte) error {
+	const pageSize = 4096
+
+	// Pre-allocate to final size (required for sparse file semantics)
+	if err := f.Truncate(int64(len(memory))); err != nil {
+		return fmt.Errorf("truncate: %w", err)
+	}
+
+	for offset := 0; offset < len(memory); offset += pageSize {
+		page := memory[offset : offset+pageSize]
+		if arm64IsZeroPage(page) {
+			continue // Skip - creates hole in sparse file
+		}
+		if _, err := f.WriteAt(page, int64(offset)); err != nil {
+			return fmt.Errorf("write at %d: %w", offset, err)
+		}
+	}
 	return nil
 }
 
@@ -455,30 +579,109 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 	}
 
 	v.memMu.Lock()
+	defer v.memMu.Unlock()
+
 	if len(v.memory) > 0 {
-		ret.memory = make([]byte, len(v.memory))
-		copy(ret.memory, v.memory)
+		// Create snapshot directory
+		snapshotDir := arm64GetSnapshotDir()
+		if err := os.MkdirAll(snapshotDir, 0700); err != nil {
+			return nil, fmt.Errorf("create snapshot dir: %w", err)
+		}
+
+		// Create temp file and write memory
+		f, err := os.CreateTemp(snapshotDir, "kvm-snap-*.mem")
+		if err != nil {
+			return nil, fmt.Errorf("create snapshot file: %w", err)
+		}
+
+		if err := arm64WriteSparseMemory(f, v.memory); err != nil {
+			f.Close()
+			os.Remove(f.Name())
+			return nil, fmt.Errorf("write snapshot memory: %w", err)
+		}
+
+		if err := f.Sync(); err != nil {
+			f.Close()
+			os.Remove(f.Name())
+			return nil, fmt.Errorf("sync snapshot file: %w", err)
+		}
+
+		// mmap the file read-only for snapshot reference
+		mem, err := unix.Mmap(int(f.Fd()), 0, len(v.memory),
+			unix.PROT_READ, unix.MAP_PRIVATE)
+		if err != nil {
+			f.Close()
+			os.Remove(f.Name())
+			return nil, fmt.Errorf("mmap snapshot file: %w", err)
+		}
+
+		ret.memoryPath = f.Name()
+		ret.memoryFile = f
+		ret.memoryMmap = mem
+		ret.memorySize = uint64(len(v.memory))
+		ret.memoryOwned = true
 	}
-	v.memMu.Unlock()
 
 	return ret, nil
 }
 
 // RestoreSnapshot implements hv.VirtualMachine.
 func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
+	rec := timeslice.NewState()
+
 	snapshotData, ok := snap.(*arm64Snapshot)
 	if !ok {
 		return fmt.Errorf("invalid snapshot type")
 	}
 
 	v.memMu.Lock()
-	if len(v.memory) != len(snapshotData.memory) {
+
+	// Validate sizes - handle both file-based and in-memory snapshots
+	var snapMemSize uint64
+	if snapshotData.memoryFile != nil {
+		snapMemSize = snapshotData.memorySize
+	} else if snapshotData.memory != nil {
+		snapMemSize = uint64(len(snapshotData.memory))
+	}
+	if uint64(len(v.memory)) != snapMemSize {
 		v.memMu.Unlock()
 		return fmt.Errorf("snapshot memory size mismatch: got %d bytes, want %d bytes",
-			len(snapshotData.memory), len(v.memory))
+			snapMemSize, len(v.memory))
 	}
+
 	if len(v.memory) > 0 {
-		copy(v.memory, snapshotData.memory)
+		if snapshotData.memoryFile != nil {
+			// COW path: use MAP_FIXED to remap the existing VM memory address
+			// to be backed by the snapshot file. This creates a COW mapping where
+			// the kernel only copies pages when written to by the guest.
+			// The virtual address stays the same, so KVM doesn't need to be updated.
+			memAddr := uintptr(unsafe.Pointer(&v.memory[0]))
+			memSize := int(snapshotData.memorySize)
+
+			rec.Record(tsArm64RestoreMadvise)
+
+			_, _, errno := unix.Syscall6(
+				unix.SYS_MMAP,
+				memAddr,
+				uintptr(memSize),
+				uintptr(unix.PROT_READ|unix.PROT_WRITE),
+				uintptr(unix.MAP_PRIVATE|unix.MAP_FIXED),
+				uintptr(snapshotData.memoryFile.Fd()),
+				0,
+			)
+			if errno != 0 {
+				v.memMu.Unlock()
+				return fmt.Errorf("mmap snapshot for restore: %w", errno)
+			}
+
+			rec.Record(tsArm64RestoreMmap)
+		} else if snapshotData.memory != nil {
+			// Fallback for in-memory snapshots - copy the data
+			copy(v.memory, snapshotData.memory)
+		} else {
+			v.memMu.Unlock()
+			return fmt.Errorf("snapshot has no memory data")
+		}
 	}
 	v.memMu.Unlock()
 
@@ -495,11 +698,15 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 		}
 	}
 
+	rec.Record(tsArm64RestoreVcpu)
+
 	if snapshotData.clockData != nil {
 		if err := setClock(v.vmFd, snapshotData.clockData); err != nil {
 			return fmt.Errorf("restore clock: %w", err)
 		}
 	}
+
+	rec.Record(tsArm64RestoreClock)
 
 	for _, dev := range v.devices {
 		if snapshotter, ok := dev.(hv.DeviceSnapshotter); ok {
@@ -513,6 +720,8 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 			}
 		}
 	}
+
+	rec.Record(tsArm64RestoreDevices)
 
 	return nil
 }
