@@ -80,8 +80,10 @@ var (
 	arm64SysRegAmairEl1      = arm64SysReg(3, 0, 10, 3, 0)
 )
 
-var arm64RegisterIDs = func() map[hv.Register]uint64 {
-	regs := make(map[hv.Register]uint64, 60)
+// arm64CoreRegisterIDs contains core registers that are always available.
+// These are the general-purpose registers, SP, PC, PSTATE, and VBAR.
+var arm64CoreRegisterIDs = func() map[hv.Register]uint64 {
+	regs := make(map[hv.Register]uint64, 40)
 
 	for i := 0; i <= 30; i++ {
 		reg := hv.Register(int(hv.RegisterARM64X0) + i)
@@ -91,33 +93,49 @@ var arm64RegisterIDs = func() map[hv.Register]uint64 {
 	regs[hv.RegisterARM64Sp] = arm64CoreRegister(uintptr(31 * 8))
 	regs[hv.RegisterARM64Pc] = arm64CoreRegister(uintptr(32 * 8))
 	regs[hv.RegisterARM64Pstate] = arm64CoreRegister(uintptr(33 * 8))
-	regs[hv.RegisterARM64Vbar] = arm64SysRegVbarEl1
 
-	// System registers for snapshots
-	regs[hv.RegisterARM64SctlrEl1] = arm64SysRegSctlrEl1
-	regs[hv.RegisterARM64TcrEl1] = arm64SysRegTcrEl1
-	regs[hv.RegisterARM64Ttbr0El1] = arm64SysRegTtbr0El1
-	regs[hv.RegisterARM64Ttbr1El1] = arm64SysRegTtbr1El1
-	regs[hv.RegisterARM64MairEl1] = arm64SysRegMairEl1
-	regs[hv.RegisterARM64ElrEl1] = arm64SysRegElrEl1
-	regs[hv.RegisterARM64SpsrEl1] = arm64SysRegSpsrEl1
-	regs[hv.RegisterARM64EsrEl1] = arm64SysRegEsrEl1
-	regs[hv.RegisterARM64FarEl1] = arm64SysRegFarEl1
-	regs[hv.RegisterARM64SpEl0] = arm64SysRegSpEl0
-	regs[hv.RegisterARM64SpEl1] = arm64SysRegSpEl1
-	regs[hv.RegisterARM64CntkctlEl1] = arm64SysRegCntkctlEl1
-	regs[hv.RegisterARM64CntvCtlEl0] = arm64SysRegCntvCtlEl0
-	regs[hv.RegisterARM64CntvCvalEl0] = arm64SysRegCntvCvalEl0
-	regs[hv.RegisterARM64CpacrEl1] = arm64SysRegCpacrEl1
-	regs[hv.RegisterARM64ContextidrEl1] = arm64SysRegContextidrEl1
-	regs[hv.RegisterARM64TpidrEl0] = arm64SysRegTpidrEl0
-	regs[hv.RegisterARM64TpidrEl1] = arm64SysRegTpidrEl1
-	regs[hv.RegisterARM64TpidrroEl0] = arm64SysRegTpidrroEl0
-	regs[hv.RegisterARM64ParEl1] = arm64SysRegParEl1
-	regs[hv.RegisterARM64Afsr0El1] = arm64SysRegAfsr0El1
-	regs[hv.RegisterARM64Afsr1El1] = arm64SysRegAfsr1El1
-	regs[hv.RegisterARM64AmairEl1] = arm64SysRegAmairEl1
+	return regs
+}()
 
+// arm64OptionalSysRegIDs contains system registers for snapshots that may not
+// be available on all kernels (e.g., Asahi Linux KVM doesn't expose many of these).
+// These are tried individually and failures are silently ignored.
+var arm64OptionalSysRegIDs = map[hv.Register]uint64{
+	hv.RegisterARM64Vbar:          arm64SysRegVbarEl1,
+	hv.RegisterARM64SctlrEl1:      arm64SysRegSctlrEl1,
+	hv.RegisterARM64TcrEl1:        arm64SysRegTcrEl1,
+	hv.RegisterARM64Ttbr0El1:      arm64SysRegTtbr0El1,
+	hv.RegisterARM64Ttbr1El1:      arm64SysRegTtbr1El1,
+	hv.RegisterARM64MairEl1:       arm64SysRegMairEl1,
+	hv.RegisterARM64ElrEl1:        arm64SysRegElrEl1,
+	hv.RegisterARM64SpsrEl1:       arm64SysRegSpsrEl1,
+	hv.RegisterARM64EsrEl1:        arm64SysRegEsrEl1,
+	hv.RegisterARM64FarEl1:        arm64SysRegFarEl1,
+	hv.RegisterARM64SpEl0:         arm64SysRegSpEl0,
+	hv.RegisterARM64SpEl1:         arm64SysRegSpEl1,
+	hv.RegisterARM64CntkctlEl1:    arm64SysRegCntkctlEl1,
+	hv.RegisterARM64CntvCtlEl0:    arm64SysRegCntvCtlEl0,
+	hv.RegisterARM64CntvCvalEl0:   arm64SysRegCntvCvalEl0,
+	hv.RegisterARM64CpacrEl1:      arm64SysRegCpacrEl1,
+	hv.RegisterARM64ContextidrEl1: arm64SysRegContextidrEl1,
+	hv.RegisterARM64TpidrEl0:      arm64SysRegTpidrEl0,
+	hv.RegisterARM64TpidrEl1:      arm64SysRegTpidrEl1,
+	hv.RegisterARM64TpidrroEl0:    arm64SysRegTpidrroEl0,
+	hv.RegisterARM64ParEl1:        arm64SysRegParEl1,
+	hv.RegisterARM64Afsr0El1:      arm64SysRegAfsr0El1,
+	hv.RegisterARM64Afsr1El1:      arm64SysRegAfsr1El1,
+	hv.RegisterARM64AmairEl1:      arm64SysRegAmairEl1,
+}
+
+// arm64RegisterIDs combines core and optional registers for SetRegisters/GetRegisters.
+var arm64RegisterIDs = func() map[hv.Register]uint64 {
+	regs := make(map[hv.Register]uint64, len(arm64CoreRegisterIDs)+len(arm64OptionalSysRegIDs))
+	for k, v := range arm64CoreRegisterIDs {
+		regs[k] = v
+	}
+	for k, v := range arm64OptionalSysRegIDs {
+		regs[k] = v
+	}
 	return regs
 }()
 
@@ -385,30 +403,65 @@ func (v *virtualCPU) captureSnapshot() (arm64VcpuSnapshot, error) {
 		Registers: make(map[hv.Register]uint64, len(arm64RegisterIDs)),
 	}
 
-	regRequest := make(map[hv.Register]hv.RegisterValue, len(arm64RegisterIDs))
-	for reg := range arm64RegisterIDs {
-		regRequest[reg] = hv.Register64(0)
+	// First capture core registers - these must always succeed
+	coreRegs := make(map[hv.Register]hv.RegisterValue, len(arm64CoreRegisterIDs))
+	for reg := range arm64CoreRegisterIDs {
+		coreRegs[reg] = hv.Register64(0)
 	}
-
-	if err := v.GetRegisters(regRequest); err != nil {
-		return ret, fmt.Errorf("capture registers: %w", err)
+	if err := v.GetRegisters(coreRegs); err != nil {
+		return ret, fmt.Errorf("capture core registers: %w", err)
 	}
-
-	for reg, value := range regRequest {
+	for reg, value := range coreRegs {
 		ret.Registers[reg] = uint64(value.(hv.Register64))
+	}
+
+	// Try optional system registers individually - skip those that aren't available.
+	// Some kernels (e.g., Asahi Linux) don't expose all system registers via KVM.
+	for reg, kvmReg := range arm64OptionalSysRegIDs {
+		var val uint64
+		if err := getOneReg(v.fd, kvmReg, unsafe.Pointer(&val)); err != nil {
+			// Silently skip unavailable registers (ENOENT = not accessible on this kernel)
+			if errors.Is(err, unix.ENOENT) {
+				continue
+			}
+			// For other errors, continue anyway - the register is optional
+			continue
+		}
+		ret.Registers[reg] = val
 	}
 
 	return ret, nil
 }
 
 func (v *virtualCPU) restoreSnapshot(snap arm64VcpuSnapshot) error {
-	regs := make(map[hv.Register]hv.RegisterValue, len(snap.Registers))
-	for reg, value := range snap.Registers {
-		regs[reg] = hv.Register64(value)
+	// Restore core registers first - these must always succeed
+	coreRegs := make(map[hv.Register]hv.RegisterValue)
+	for reg := range arm64CoreRegisterIDs {
+		if value, ok := snap.Registers[reg]; ok {
+			coreRegs[reg] = hv.Register64(value)
+		}
+	}
+	if len(coreRegs) > 0 {
+		if err := v.SetRegisters(coreRegs); err != nil {
+			return fmt.Errorf("restore core registers: %w", err)
+		}
 	}
 
-	if err := v.SetRegisters(regs); err != nil {
-		return fmt.Errorf("restore registers: %w", err)
+	// Try to restore optional system registers - skip those that aren't available
+	for reg := range arm64OptionalSysRegIDs {
+		value, ok := snap.Registers[reg]
+		if !ok {
+			continue // Register wasn't captured, skip it
+		}
+		kvmReg, ok := arm64OptionalSysRegIDs[reg]
+		if !ok {
+			continue
+		}
+		val := value
+		if err := setOneReg(v.fd, kvmReg, unsafe.Pointer(&val)); err != nil {
+			// Silently skip unavailable registers
+			continue
+		}
 	}
 
 	return nil
