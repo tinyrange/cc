@@ -7,6 +7,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"unsafe"
 
 	"github.com/tinyrange/cc/internal/debug"
@@ -19,6 +21,14 @@ import (
 // Writes to this address record a timeslice marker with the written value as ID.
 // This must match the address used in initx/init_source.go and hvf/hvf_darwin_arm64.go.
 const timesliceMMIOAddr uint64 = 0xf0001000
+
+var (
+	tsArm64RestoreMadvise = timeslice.RegisterKind("arm64_restore_madvise", 0)
+	tsArm64RestoreMmap    = timeslice.RegisterKind("arm64_restore_mmap", 0)
+	tsArm64RestoreVcpu    = timeslice.RegisterKind("arm64_restore_vcpu", 0)
+	tsArm64RestoreClock   = timeslice.RegisterKind("arm64_restore_clock", 0)
+	tsArm64RestoreDevices = timeslice.RegisterKind("arm64_restore_devices", 0)
+)
 
 const (
 	kvmRegArm64         uint64 = 0x6000000000000000
@@ -389,12 +399,33 @@ type arm64VcpuSnapshot struct {
 type arm64Snapshot struct {
 	cpuStates       map[int]arm64VcpuSnapshot
 	deviceSnapshots map[string]interface{}
-	memory          []byte
 	clockData       *kvmClockData
+
+	// File-based storage fields for COW mmap
+	memoryPath  string   // Path to snapshot file
+	memoryFile  *os.File // Keep open for mmap lifetime
+	memoryMmap  []byte   // mmap'd region (read-only reference)
+	memorySize  uint64   // Size in bytes
+	memoryOwned bool     // If true, delete file on Close
+
+	// Fallback for in-memory snapshots (loaded from disk)
+	memory []byte
 }
 
 // Close implements io.Closer for the Snapshot interface.
 func (s *arm64Snapshot) Close() error {
+	if s.memoryMmap != nil {
+		unix.Munmap(s.memoryMmap)
+		s.memoryMmap = nil
+	}
+	if s.memoryFile != nil {
+		s.memoryFile.Close()
+		s.memoryFile = nil
+	}
+	if s.memoryOwned && s.memoryPath != "" {
+		os.Remove(s.memoryPath)
+		s.memoryPath = ""
+	}
 	return nil
 }
 
@@ -467,6 +498,46 @@ func (v *virtualCPU) restoreSnapshot(snap arm64VcpuSnapshot) error {
 	return nil
 }
 
+// arm64GetSnapshotDir returns the directory for snapshot files.
+func arm64GetSnapshotDir() string {
+	if dir := os.Getenv("CC_SNAPSHOT_DIR"); dir != "" {
+		return dir
+	}
+	return filepath.Join(os.TempDir(), fmt.Sprintf("cc-snapshots-%d", os.Getpid()))
+}
+
+// arm64IsZeroPage checks if a 4KB page is all zeros using word-sized comparisons.
+func arm64IsZeroPage(page []byte) bool {
+	words := (*[512]uint64)(unsafe.Pointer(&page[0]))
+	for i := 0; i < 512; i++ {
+		if words[i] != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// arm64WriteSparseMemory writes memory to a file, skipping zero pages to create a sparse file.
+func arm64WriteSparseMemory(f *os.File, memory []byte) error {
+	const pageSize = 4096
+
+	// Pre-allocate to final size (required for sparse file semantics)
+	if err := f.Truncate(int64(len(memory))); err != nil {
+		return fmt.Errorf("truncate: %w", err)
+	}
+
+	for offset := 0; offset < len(memory); offset += pageSize {
+		page := memory[offset : offset+pageSize]
+		if arm64IsZeroPage(page) {
+			continue // Skip - creates hole in sparse file
+		}
+		if _, err := f.WriteAt(page, int64(offset)); err != nil {
+			return fmt.Errorf("write at %d: %w", offset, err)
+		}
+	}
+	return nil
+}
+
 // CaptureSnapshot implements hv.VirtualMachine.
 func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 	ret := &arm64Snapshot{
@@ -508,30 +579,109 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 	}
 
 	v.memMu.Lock()
+	defer v.memMu.Unlock()
+
 	if len(v.memory) > 0 {
-		ret.memory = make([]byte, len(v.memory))
-		copy(ret.memory, v.memory)
+		// Create snapshot directory
+		snapshotDir := arm64GetSnapshotDir()
+		if err := os.MkdirAll(snapshotDir, 0700); err != nil {
+			return nil, fmt.Errorf("create snapshot dir: %w", err)
+		}
+
+		// Create temp file and write memory
+		f, err := os.CreateTemp(snapshotDir, "kvm-snap-*.mem")
+		if err != nil {
+			return nil, fmt.Errorf("create snapshot file: %w", err)
+		}
+
+		if err := arm64WriteSparseMemory(f, v.memory); err != nil {
+			f.Close()
+			os.Remove(f.Name())
+			return nil, fmt.Errorf("write snapshot memory: %w", err)
+		}
+
+		if err := f.Sync(); err != nil {
+			f.Close()
+			os.Remove(f.Name())
+			return nil, fmt.Errorf("sync snapshot file: %w", err)
+		}
+
+		// mmap the file read-only for snapshot reference
+		mem, err := unix.Mmap(int(f.Fd()), 0, len(v.memory),
+			unix.PROT_READ, unix.MAP_PRIVATE)
+		if err != nil {
+			f.Close()
+			os.Remove(f.Name())
+			return nil, fmt.Errorf("mmap snapshot file: %w", err)
+		}
+
+		ret.memoryPath = f.Name()
+		ret.memoryFile = f
+		ret.memoryMmap = mem
+		ret.memorySize = uint64(len(v.memory))
+		ret.memoryOwned = true
 	}
-	v.memMu.Unlock()
 
 	return ret, nil
 }
 
 // RestoreSnapshot implements hv.VirtualMachine.
 func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
+	rec := timeslice.NewState()
+
 	snapshotData, ok := snap.(*arm64Snapshot)
 	if !ok {
 		return fmt.Errorf("invalid snapshot type")
 	}
 
 	v.memMu.Lock()
-	if len(v.memory) != len(snapshotData.memory) {
+
+	// Validate sizes - handle both file-based and in-memory snapshots
+	var snapMemSize uint64
+	if snapshotData.memoryFile != nil {
+		snapMemSize = snapshotData.memorySize
+	} else if snapshotData.memory != nil {
+		snapMemSize = uint64(len(snapshotData.memory))
+	}
+	if uint64(len(v.memory)) != snapMemSize {
 		v.memMu.Unlock()
 		return fmt.Errorf("snapshot memory size mismatch: got %d bytes, want %d bytes",
-			len(snapshotData.memory), len(v.memory))
+			snapMemSize, len(v.memory))
 	}
+
 	if len(v.memory) > 0 {
-		copy(v.memory, snapshotData.memory)
+		if snapshotData.memoryFile != nil {
+			// COW path: use MAP_FIXED to remap the existing VM memory address
+			// to be backed by the snapshot file. This creates a COW mapping where
+			// the kernel only copies pages when written to by the guest.
+			// The virtual address stays the same, so KVM doesn't need to be updated.
+			memAddr := uintptr(unsafe.Pointer(&v.memory[0]))
+			memSize := int(snapshotData.memorySize)
+
+			rec.Record(tsArm64RestoreMadvise)
+
+			_, _, errno := unix.Syscall6(
+				unix.SYS_MMAP,
+				memAddr,
+				uintptr(memSize),
+				uintptr(unix.PROT_READ|unix.PROT_WRITE),
+				uintptr(unix.MAP_PRIVATE|unix.MAP_FIXED),
+				uintptr(snapshotData.memoryFile.Fd()),
+				0,
+			)
+			if errno != 0 {
+				v.memMu.Unlock()
+				return fmt.Errorf("mmap snapshot for restore: %w", errno)
+			}
+
+			rec.Record(tsArm64RestoreMmap)
+		} else if snapshotData.memory != nil {
+			// Fallback for in-memory snapshots - copy the data
+			copy(v.memory, snapshotData.memory)
+		} else {
+			v.memMu.Unlock()
+			return fmt.Errorf("snapshot has no memory data")
+		}
 	}
 	v.memMu.Unlock()
 
@@ -548,11 +698,15 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 		}
 	}
 
+	rec.Record(tsArm64RestoreVcpu)
+
 	if snapshotData.clockData != nil {
 		if err := setClock(v.vmFd, snapshotData.clockData); err != nil {
 			return fmt.Errorf("restore clock: %w", err)
 		}
 	}
+
+	rec.Record(tsArm64RestoreClock)
 
 	for _, dev := range v.devices {
 		if snapshotter, ok := dev.(hv.DeviceSnapshotter); ok {
@@ -566,6 +720,8 @@ func (v *virtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 			}
 		}
 	}
+
+	rec.Record(tsArm64RestoreDevices)
 
 	return nil
 }

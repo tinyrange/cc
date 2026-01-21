@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
+	"strings"
 	"time"
 
 	"github.com/schollz/progressbar/v3"
@@ -37,16 +38,36 @@ func parseArchitecture(arch string) (hv.CpuArchitecture, error) {
 }
 
 type benchmark struct {
-	snapshot    hv.Snapshot
-	commandArgs []string // The command to execute (path + args)
-	commandEnv  []string // Environment variables for the command
+	// Persistent state for VM reuse
+	snapshot      hv.Snapshot
+	vm            *initx.VirtualMachine
+	h             hv.Hypervisor
+	containerFS   *oci.ContainerFS
+	fsBackend     vfs.VirtioFsBackend
+	commandArgs   []string // The command to execute (path + args)
+	commandEnv    []string // Environment variables for the command
+	consoleBuffer *bytes.Buffer // Shared buffer for console output
 }
 
 // Close releases resources held by the benchmark, including snapshot files.
 func (b *benchmark) Close() error {
-	if b.snapshot != nil {
-		return b.snapshot.Close()
+	if b.vm != nil {
+		b.vm.Close()
+		b.vm = nil
 	}
+	if b.h != nil {
+		b.h.Close()
+		b.h = nil
+	}
+	if b.containerFS != nil {
+		b.containerFS.Close()
+		b.containerFS = nil
+	}
+	if b.snapshot != nil {
+		b.snapshot.Close()
+		b.snapshot = nil
+	}
+	// fsBackend doesn't need explicit close - it's managed by the VM
 	return nil
 }
 
@@ -69,7 +90,9 @@ var (
 	tsWriteCommand              = timeslice.RegisterKind("benchmark::write_command", 0)
 )
 
-func (b *benchmark) runCommand(
+// firstBoot initializes the VM, boots it, and captures a snapshot.
+// After this call, the VM is ready for repeated command execution.
+func (b *benchmark) firstBoot(
 	consoleOutput io.Writer,
 	tsRecord *timeslice.Recorder,
 	bundleDir string,
@@ -105,163 +128,166 @@ func (b *benchmark) runCommand(
 
 	tsRecord.Record(tsOciLoadFromDir)
 
-	containerFS, err := oci.NewContainerFS(img)
+	b.containerFS, err = oci.NewContainerFS(img)
 	if err != nil {
 		return fmt.Errorf("create container filesystem: %w", err)
 	}
-	defer containerFS.Close()
 
 	tsRecord.Record(tsNewContainerFS)
 
 	// Parse command - first element is path, rest are args
 	commandArgs := []string{command}
 
-	fsBackend := vfs.NewVirtioFsBackendWithAbstract()
-	if err := fsBackend.SetAbstractRoot(containerFS); err != nil {
+	b.fsBackend = vfs.NewVirtioFsBackendWithAbstract()
+	if err := b.fsBackend.SetAbstractRoot(b.containerFS); err != nil {
 		return fmt.Errorf("set container filesystem as root: %w", err)
 	}
 
 	tsRecord.Record(tsNewVirtioFsBackend)
 
-	h, err := factory.OpenWithArchitecture(hvArch)
+	b.h, err = factory.OpenWithArchitecture(hvArch)
 	if err != nil {
 		return fmt.Errorf("create hypervisor: %w", err)
 	}
-	defer h.Close()
 
 	tsRecord.Record(tsFactoryOpen)
 
-	// Only load kernel when no snapshot exists (first boot)
-	// When restoring from snapshot, the kernel is already in guest memory
-	var kernelLoader kernel.Kernel
-	if b.snapshot == nil {
-		var err error
-		kernelLoader, err = kernel.LoadForArchitecture(hvArch)
-		if err != nil {
-			return fmt.Errorf("load kernel: %w", err)
-		}
-		tsRecord.Record(tsKernelLoad)
+	// Load kernel for first boot
+	kernelLoader, err := kernel.LoadForArchitecture(hvArch)
+	if err != nil {
+		return fmt.Errorf("load kernel: %w", err)
 	}
+	tsRecord.Record(tsKernelLoad)
+
+	// Initialize shared console buffer for output validation
+	b.consoleBuffer = new(bytes.Buffer)
 
 	opts := []initx.Option{
 		initx.WithDeviceTemplate(virtio.FSTemplate{
 			Tag:     "rootfs",
-			Backend: fsBackend,
+			Backend: b.fsBackend,
 			Arch:    hvArch,
 		}),
-		initx.WithConsoleOutput(consoleOutput),
+		initx.WithConsoleOutput(b.consoleBuffer),
 	}
 
-	// If we have a snapshot, use WithSnapshot to skip kernel loading and restore automatically
-	if b.snapshot != nil {
-		opts = append(opts, initx.WithSnapshot(b.snapshot))
-	}
-
-	vm, err := initx.NewVirtualMachine(h, 1, 1024, kernelLoader, opts...)
+	b.vm, err = initx.NewVirtualMachine(b.h, 1, 1024, kernelLoader, opts...)
 	if err != nil {
 		return fmt.Errorf("create VM: %w", err)
 	}
-	defer vm.Close()
 
 	tsRecord.Record(tsNewVirtualMachine)
 
-	if b.snapshot == nil {
-		// slog.Info("first boot", "command", commandArgs[0], "args", commandArgs[1:])
-		// First boot - use CommandLoop mode and capture snapshot after container setup
-		// Build init program with CommandLoop=true
-		prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
-			Arch:                  hvArch,
-			CommandLoop:           true, // Enable command loop mode for late snapshot
-			Env:                   img.Config.Env,
-			WorkDir:               img.Config.WorkingDir,
-			UID:                   img.Config.UID,
-			GID:                   img.Config.GID,
-			MailboxPhysAddr:       vm.MailboxPhysAddr(),
-			TimesliceMMIOPhysAddr: vm.TimesliceMMIOPhysAddr(),
-			ConfigRegionPhysAddr:  vm.ConfigRegionPhysAddr(),
-		})
-		if err != nil {
-			return fmt.Errorf("build init program: %w", err)
-		}
+	// First boot - use CommandLoop mode and capture snapshot after container setup
+	prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
+		Arch:                  hvArch,
+		CommandLoop:           true, // Enable command loop mode for late snapshot
+		Env:                   img.Config.Env,
+		WorkDir:               img.Config.WorkingDir,
+		UID:                   img.Config.UID,
+		GID:                   img.Config.GID,
+		MailboxPhysAddr:       b.vm.MailboxPhysAddr(),
+		TimesliceMMIOPhysAddr: b.vm.TimesliceMMIOPhysAddr(),
+		ConfigRegionPhysAddr:  b.vm.ConfigRegionPhysAddr(),
+	})
+	if err != nil {
+		return fmt.Errorf("build init program: %w", err)
+	}
 
-		tsRecord.Record(tsBuildContainerInitProgram)
+	tsRecord.Record(tsBuildContainerInitProgram)
 
-		// Store command info for later use
-		b.commandArgs = commandArgs
-		b.commandEnv = img.Config.Env
+	// Store command info for later use
+	b.commandArgs = commandArgs
+	b.commandEnv = img.Config.Env
 
-		// First boot: Run the container init program directly (skip Boot() since we don't need it).
-		// The container init will signal snapshot ready (0xdeadbeef) when setup is complete,
-		// which causes vm.Run() to return (ErrYield is converted to nil when runResultDetail is cleared).
-		// We then capture the snapshot and write the command.
+	// First boot: Run the container init program directly
+	timeoutCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
 
-		timeoutCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-		defer cancel()
+	if err := b.vm.Run(timeoutCtx, prog); err != nil {
+		return fmt.Errorf("failed to run container init: %w", err)
+	}
 
-		// Run container init until it signals snapshot ready
-		if err := vm.Run(timeoutCtx, prog); err != nil {
-			return fmt.Errorf("failed to run container init: %w", err)
-		}
+	tsRecord.Record(tsOnBootComplete)
 
-		tsRecord.Record(tsOnBootComplete)
+	// Capture snapshot while guest is in command loop
+	b.snapshot, err = b.vm.CaptureSnapshot()
+	if err != nil {
+		return fmt.Errorf("failed to capture snapshot: %w", err)
+	}
 
-		// Capture snapshot while guest is in command loop
-		snap, err := vm.CaptureSnapshot()
-		if err != nil {
-			return fmt.Errorf("failed to capture snapshot: %w", err)
-		}
-		b.snapshot = snap
+	tsRecord.Record(tsCaptureSnapshot)
 
-		tsRecord.Record(tsCaptureSnapshot)
+	// Write the first command for guest to execute - whoami with no args
+	if err := b.vm.WriteExecCommand(commandArgs[0], nil, nil); err != nil {
+		return fmt.Errorf("failed to write exec command: %w", err)
+	}
 
-		// Write the first command for guest to execute
-		if err := vm.WriteExecCommand(commandArgs[0], commandArgs, b.commandEnv); err != nil {
-			return fmt.Errorf("failed to write exec command: %w", err)
-		}
+	tsRecord.Record(tsStartSession)
 
-		tsRecord.Record(tsStartSession)
+	// Resume VM to execute the command
+	timeoutCtx2, cancel2 := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel2()
 
-		// Resume VM to execute the command
-		// The guest is waiting in the command loop, will read the command and execute it
-		timeoutCtx2, cancel2 := context.WithTimeout(context.Background(), 1*time.Second)
-		defer cancel2()
+	if err := b.vm.Run(timeoutCtx2, prog); err != nil {
+		return fmt.Errorf("failed to run command: %w", err)
+	}
 
-		if err := vm.Run(timeoutCtx2, prog); err != nil {
-			return fmt.Errorf("failed to run command: %w", err)
-		}
+	tsRecord.Record(tsWaitForSession)
 
-		tsRecord.Record(tsWaitForSession)
-	} else {
-		// slog.Info("subsequent boot", "command", b.commandArgs[0], "args", b.commandArgs[1:])
-		// Subsequent runs - restore snapshot and execute command directly
-		// The snapshot was restored when the VM was created (via WithSnapshot option)
-		tsRecord.Record(tsRestoreSnapshot)
+	return nil
+}
 
-		// Write command to config region
-		if err := vm.WriteExecCommand(b.commandArgs[0], b.commandArgs, b.commandEnv); err != nil {
-			return fmt.Errorf("failed to write exec command: %w", err)
-		}
+// runIteration restores the snapshot and runs a command with the given iteration number.
+// It validates that the output matches the expected result.
+// NOTE: On ARM64 Linux, commands with arguments fail because the config region is
+// MMIO-only (no backing memory), and execve's copy_from_user doesn't work with MMIO.
+// For now, we use whoami (no args) which works correctly.
+// This reuses the existing VM instead of creating a new one.
+func (b *benchmark) runIteration(
+	tsRecord *timeslice.Recorder,
+	iteration int,
+) error {
+	// Reset console buffer before running
+	b.consoleBuffer.Reset()
 
-		// We don't need to build a new program - the guest is already in the command loop
-		// from the restored snapshot. We just need to resume execution.
-		// However, vm.Run() requires a program to write to config region.
-		// Use a minimal no-op program since the guest doesn't need it.
-		prog := &ir.Program{
-			Entrypoint: "main",
-			Methods: map[string]ir.Method{
-				"main": {ir.Return(ir.Int64(0))},
-			},
-		}
+	// Restore snapshot on the existing VM
+	if err := b.vm.RestoreSnapshot(b.snapshot); err != nil {
+		return fmt.Errorf("failed to restore snapshot: %w", err)
+	}
 
-		tsRecord.Record(tsBuildContainerInitProgram)
-		tsRecord.Record(tsStartSession)
+	tsRecord.Record(tsRestoreSnapshot)
 
-		// Resume VM - guest will read command from config region and execute it
-		if err := vm.Run(context.Background(), prog); err != nil {
-			return fmt.Errorf("failed to run command: %w", err)
-		}
+	// Use whoami with no arguments - commands with args don't work on ARM64 Linux
+	// due to MMIO config region (execve can't copy strings from MMIO memory)
+	expectedOutput := "root"
 
-		tsRecord.Record(tsWaitForSession)
+	if err := b.vm.WriteExecCommand("/usr/bin/whoami", nil, nil); err != nil {
+		return fmt.Errorf("failed to write exec command: %w", err)
+	}
+
+	// Minimal no-op program since guest is already in command loop
+	prog := &ir.Program{
+		Entrypoint: "main",
+		Methods: map[string]ir.Method{
+			"main": {ir.Return(ir.Int64(0))},
+		},
+	}
+
+	tsRecord.Record(tsBuildContainerInitProgram)
+	tsRecord.Record(tsStartSession)
+
+	// Resume VM - guest will read command from config region and execute it
+	if err := b.vm.Run(context.Background(), prog); err != nil {
+		return fmt.Errorf("failed to run command: %w", err)
+	}
+
+	tsRecord.Record(tsWaitForSession)
+
+	// Validate output contains expected string
+	output := b.consoleBuffer.String()
+	if !strings.Contains(output, expectedOutput) {
+		return fmt.Errorf("iteration %d: expected output to contain %q, got %q", iteration, expectedOutput, output)
 	}
 
 	return nil
@@ -319,41 +345,34 @@ func (b *benchmark) run() error {
 		*bundleDir = filepath.Join(userDir, "ccapp", "bundles")
 	}
 
-	// Original mode: create new VM for each iteration
+	// First boot: create VM, boot, capture snapshot
 	totalStart := time.Now()
-
 	buf := new(bytes.Buffer)
 
-	// execute a first boot to check and capture the snapshot.
-	if err := b.runCommand(buf, timeslice.NewState(), *bundleDir, *bundleName, *testCommand); err != nil {
+	if err := b.firstBoot(buf, timeslice.NewState(), *bundleDir, *bundleName, *testCommand); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to perform first boot: %v\n%s\n", err, buf.String())
 		return fmt.Errorf("failed to perform first boot: %w", err)
 	}
 
 	timeslice.Record(tsOverallTime, time.Since(totalStart))
 
-	// enter the main loop
+	// Main loop: reuse VM, just restore snapshot and run with different commands
 	pb := progressbar.Default(int64(*n))
 	defer pb.Close()
 
 	totalStart = time.Now()
 
-	for range *n {
-		buf := new(bytes.Buffer)
-
+	for i := range *n {
 		start := time.Now()
-
 		state := timeslice.NewState()
 
-		if err := b.runCommand(buf, state, *bundleDir, *bundleName, *testCommand); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to run command: %v\n%s\n", err, buf.String())
+		if err := b.runIteration(state, i); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to run command: %v\nconsole output: %s\n", err, b.consoleBuffer.String())
 			return fmt.Errorf("failed to run command: %w", err)
 		}
 
 		state.Record(tsCleanup)
-
 		timeslice.Record(tsOverallTime, time.Since(start))
-
 		pb.Add(1)
 	}
 

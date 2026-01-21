@@ -261,8 +261,7 @@ func (v *virtualMachine) Close() error {
 		close(vcpu.runQueue)
 	}
 
-	// Perform expensive kernel cleanup in background
-	go func() {
+	cleanup := func() {
 		for _, vcpu := range vcpus {
 			if err := unix.Close(vcpu.fd); err != nil {
 				slog.Error("kvm: close vcpu fd", "error", err)
@@ -283,7 +282,16 @@ func (v *virtualMachine) Close() error {
 				slog.Error("kvm: close vm fd", "error", err)
 			}
 		}
-	}()
+	}
+
+	// On arm64 Linux, perform cleanup synchronously to prevent accumulation
+	// of pending cleanups that slow down subsequent VM operations.
+	// On other platforms, use background cleanup for better latency.
+	if runtime.GOARCH == "arm64" && runtime.GOOS == "linux" {
+		cleanup()
+	} else {
+		go cleanup()
+	}
 
 	return nil
 }
@@ -529,6 +537,7 @@ func (h *hypervisor) Close() error {
 
 var (
 	tsKvmPreInit              = timeslice.RegisterKind("kvm_pre_init", 0)
+	tsKvmCheckIpaSize         = timeslice.RegisterKind("kvm_check_ipa_size", 0)
 	tsKvmCreateVm             = timeslice.RegisterKind("kvm_create_vm", 0)
 	tsKvmArchVMInit           = timeslice.RegisterKind("kvm_arch_vm_init", 0)
 	tsKvmOnCreateVM           = timeslice.RegisterKind("kvm_on_create_vm", 0)
@@ -563,6 +572,8 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		}
 		ipaSize = uint32(cap)
 	}
+
+	vm.rec.Record(tsKvmCheckIpaSize)
 
 	vmFd, err := createVm(h.fd, ipaSize)
 	if err != nil {
