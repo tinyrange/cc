@@ -1446,7 +1446,7 @@ func RunInitX(debug bool) error {
 	return nil
 }
 
-func RunExecutable(path string, gpuEnabled bool, vsockLoader bool) error {
+func RunExecutable(path string, gpuEnabled bool) error {
 	slog.Info("Starting Bringup Quest: Run Executable", "path", path, "gpu", gpuEnabled)
 
 	if os.Getenv("CC_DEBUG_FILE") != "" {
@@ -1736,10 +1736,8 @@ func RunExecutable(path string, gpuEnabled bool, vsockLoader bool) error {
 		vmOptions = append(vmOptions, initx.WithGPUEnabled(true))
 	}
 
-	// Add vsock program loader if enabled
-	if vsockLoader {
-		vmOptions = append(vmOptions, initx.WithVsockProgramLoader(vsockBackend, initx.VsockProgramPort))
-	}
+	// Vsock program loader is always enabled (MMIO paths have been removed)
+	vmOptions = append(vmOptions, initx.WithVsockProgramLoader(vsockBackend, initx.VsockProgramPort))
 
 	vm, err := initx.NewVirtualMachine(hv, 1, 256, kernel, vmOptions...)
 	if err != nil {
@@ -1843,7 +1841,6 @@ func main() {
 	initX := fs.Bool("initx", false, "Run bringup tests for initx")
 	exec := fs.String("exec", "", "Run the executable using initx")
 	gpuEnabled := fs.Bool("gpu", false, "Enable GPU support (virtio-gpu and virtio-input)")
-	vsockLoader := fs.Bool("vsock-loader", false, "Use vsock for program loading instead of MMIO")
 	debug := fs.Bool("debug", false, "Enable debug logging")
 	hostArch, err := hostArchitecture()
 	if err != nil {
@@ -1882,7 +1879,7 @@ func main() {
 	}
 
 	if *exec != "" {
-		if err := RunExecutable(*exec, *gpuEnabled, *vsockLoader); err != nil {
+		if err := RunExecutable(*exec, *gpuEnabled); err != nil {
 			slog.Error("failed to run executable", "error", err)
 			os.Exit(1)
 		}

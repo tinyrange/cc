@@ -203,7 +203,7 @@ type mmioDevice struct {
 	base    uint64
 	size    uint64
 	irqLine uint32
-	irqHigh bool
+	irqHigh atomic.Bool
 
 	deviceID uint32
 	vendorID uint32
@@ -690,6 +690,7 @@ func (d *mmioDevice) reset() {
 	d.queueSel = 0
 	d.deviceStatus = 0
 	d.interruptStatus.Store(0)
+	d.irqHigh.Store(false)
 	d.configGeneration = 0
 	for i := range d.queues {
 		d.queues[i].reset()
@@ -731,6 +732,12 @@ func (d *mmioDevice) updateInterruptLine() error {
 		return fmt.Errorf("virtio: virtual machine or irq line is nil")
 	}
 	levelAsserted := d.interruptStatus.Load() != 0
+	// Only call SetIRQ if the level actually changed to avoid spurious interrupts.
+	// Use Swap to atomically update and get the previous value.
+	prevHigh := d.irqHigh.Swap(levelAsserted)
+	if levelAsserted == prevHigh {
+		return nil
+	}
 	if err := d.vm.SetIRQ(d.irqLine, levelAsserted); err != nil {
 		slog.Error("virtio: pulse irq failed", "irq", fmt.Sprintf("0x%X", d.irqLine), "err", err)
 		return err

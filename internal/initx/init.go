@@ -25,21 +25,10 @@ type BuilderConfig struct {
 
 	PreloadModules []kernel.Module
 
-	// MailboxPhysAddr is the physical address of the mailbox region.
-	// If 0, uses the default value (for backwards compatibility).
-	MailboxPhysAddr uint64
-
 	// TimesliceMMIOPhysAddr is the physical address of the timeslice MMIO region.
 	// Guest code can write to this address to record timeslice markers.
 	// If 0, uses the default value 0xf0001000.
 	TimesliceMMIOPhysAddr uint64
-
-	// ConfigRegionPhysAddr is the physical address of the config region.
-	// If 0, uses the default value (for backwards compatibility).
-	ConfigRegionPhysAddr uint64
-
-	// UseVsock enables vsock-based program loading instead of MMIO.
-	UseVsock bool
 
 	// VsockPort is the vsock port to use for program loading.
 	// If 0, uses the default port (9998).
@@ -47,7 +36,6 @@ type BuilderConfig struct {
 }
 
 const (
-	devMemMode             = linux.S_IFCHR | 0o600
 	snapshotRequestValue   = 0xdeadbeef
 	snapshotSignalPhysAddr = 0xf0000000
 	mailboxMapSize         = 0x1000
@@ -63,36 +51,6 @@ const (
 	configTimeSecField  = 24
 	configTimeNsecField = 32
 )
-
-var (
-	devMemDeviceID = linux.Mkdev(1, 1)
-)
-
-func openFile(dest ir.Var, filename string, flags int) ir.Block {
-	return ir.Block{
-		ir.Assign(dest, ir.Syscall(
-			defs.SYS_OPENAT,
-			ir.Int64(linux.AT_FDCWD),
-			filename,
-			ir.Int64(flags),
-			ir.Int64(0),
-		)),
-	}
-}
-
-func mmapFile(dest ir.Var, fd any, length any, prot int, flags int, offset any) ir.Block {
-	return ir.Block{
-		ir.Assign(dest, ir.Syscall(
-			defs.SYS_MMAP,
-			ir.Int64(0),
-			length,
-			ir.Int64(prot),
-			ir.Int64(flags),
-			fd,
-			offset,
-		)),
-	}
-}
 
 func rebootOnError(arch hv.CpuArchitecture, val ir.Var, msg string) ir.Block {
 	return ir.Block{
@@ -143,36 +101,23 @@ func BuildFromRTG(cfg BuilderConfig) (*ir.Program, error) {
 		return nil, fmt.Errorf("unsupported architecture for RTG init: %s", cfg.Arch)
 	}
 
-	// Set up compile options with physical addresses and vsock configuration
+	// Set up compile options with vsock configuration (vsock is always enabled)
 	port := cfg.VsockPort
 	if port == 0 {
 		port = 9998 // Default vsock port
 	}
 
-	// Use default addresses if not specified
-	mailboxAddr := cfg.MailboxPhysAddr
-	if mailboxAddr == 0 {
-		mailboxAddr = 0xf0000000
-	}
-	timesliceAddr := cfg.TimesliceMMIOPhysAddr
-	if timesliceAddr == 0 {
-		timesliceAddr = 0xf0001000
-	}
-	configAddr := cfg.ConfigRegionPhysAddr
-	if configAddr == 0 {
-		configAddr = 0xf0003000
-	}
+	// Note: Timeslice MMIO is disabled because the MMIO handlers were removed
+	// as part of the vsock migration. Pass 0 to indicate timeslice is disabled.
 
 	compileOpts := rtg.CompileOptions{
 		GOARCH: goarch,
 		Flags: map[string]bool{
-			"USE_VSOCK": cfg.UseVsock,
+			"USE_VSOCK": true, // Vsock is always enabled (MMIO paths have been removed)
 		},
 		Config: map[string]any{
-			"VSOCK_PORT":              int64(port),
-			"MAILBOX_PHYS_ADDR":       int64(mailboxAddr),
-			"TIMESLICE_MMIO_PHYS_ADDR": int64(timesliceAddr),
-			"CONFIG_REGION_PHYS_ADDR": int64(configAddr),
+			"VSOCK_PORT":               int64(port),
+			"TIMESLICE_MMIO_PHYS_ADDR": int64(0), // Disabled - no MMIO handler
 		},
 	}
 

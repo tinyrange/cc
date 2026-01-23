@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"runtime"
 	"sync"
 	"time"
 
@@ -19,7 +18,6 @@ import (
 	"github.com/tinyrange/cc/internal/linux/boot"
 	"github.com/tinyrange/cc/internal/linux/boot/amd64"
 	"github.com/tinyrange/cc/internal/linux/defs"
-	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 	"github.com/tinyrange/cc/internal/linux/kernel"
 	"github.com/tinyrange/cc/internal/timeslice"
 	"github.com/tinyrange/cc/internal/vfs"
@@ -35,34 +33,15 @@ var (
 )
 
 const (
-	// Default region sizes for MMIO allocations
-	mailboxRegionSize = 0x1000
-	configRegionSize  = 4 * 1024 * 1024
-
+	// Header constants for program data serialization
 	configHeaderMagicValue = 0xcafebabe
 	configHeaderSize       = 40
 	configHeaderRelocOff   = configHeaderSize
 	configDataOffsetField  = 12
 	configDataLengthField  = 16
 
-	writeFileLengthPrefix   = 2
-	writeFileMaxChunkLen    = (1 << 16) - 1
-	writeFileTransferRegion = writeFileMaxChunkLen + writeFileLengthPrefix
-
-	userYieldValue = 0x5553_4552 // "USER"
-
-	// Config region command format (at offset 0x100000):
-	// Offset 0: Magic (0x434D4452 = "CMDR")
-	// Offset 4: path_len (uint32)
-	// Offset 8: argc (uint32)
-	// Offset 12: envc (uint32)
-	// Offset 16: path\0 + args\0...\0 + envs\0...\0
-	execCmdRegionOffset  = 0x100000
-	execCmdMagicValue    = 0x434D4452 // "CMDR"
-	execCmdPathLenOffset = 4
-	execCmdArgcOffset    = 8
-	execCmdEnvcOffset    = 12
-	execCmdDataOffset    = 16
+	// Default data region size for program loading
+	dataRegionSize = 4 * 1024 * 1024
 )
 
 type proxyReader struct {
@@ -135,10 +114,6 @@ type programLoader struct {
 
 	runResultDetail uint32
 	runResultStage  uint32
-
-	// Dynamically allocated MMIO addresses
-	mailboxPhysAddr      uint64
-	configRegionPhysAddr uint64
 }
 
 func (p *programLoader) ReserveDataRegion(size int) {
@@ -160,89 +135,6 @@ func (p *programLoader) Init(vm hv.VirtualMachine) error {
 	return nil
 }
 
-// MMIORegions implements hv.MemoryMappedIODevice.
-func (p *programLoader) MMIORegions() []hv.MMIORegion {
-	return []hv.MMIORegion{
-		{Address: p.mailboxPhysAddr, Size: mailboxRegionSize},
-		{Address: p.configRegionPhysAddr, Size: configRegionSize},
-	}
-}
-
-// ReadMMIO implements hv.MemoryMappedIODevice.
-func (p *programLoader) ReadMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
-	if addr >= p.configRegionPhysAddr && addr < p.configRegionPhysAddr+configRegionSize {
-		offset := addr - p.configRegionPhysAddr
-		copy(data, p.dataRegion[offset:])
-		return nil
-	}
-
-	return fmt.Errorf("unimplemented read at address 0x%x", addr)
-}
-
-// DeviceTreeNodes returns device tree nodes for the initx mailbox and config regions.
-// This allows /dev/mem access on ARM64 by declaring these as device I/O regions.
-func (p *programLoader) DeviceTreeNodes() ([]fdt.Node, error) {
-	if p.arch != hv.ArchitectureARM64 {
-		return nil, nil
-	}
-	return []fdt.Node{
-		{
-			Name: fmt.Sprintf("initx-mailbox@%x", p.mailboxPhysAddr),
-			Properties: map[string]fdt.Property{
-				"compatible": {Strings: []string{"tinyrange,initx-mailbox"}},
-				"reg":        {U64: []uint64{p.mailboxPhysAddr, mailboxRegionSize}},
-				"status":     {Strings: []string{"okay"}},
-			},
-		},
-		{
-			Name: fmt.Sprintf("initx-config@%x", p.configRegionPhysAddr),
-			Properties: map[string]fdt.Property{
-				"compatible": {Strings: []string{"tinyrange,initx-config"}},
-				"reg":        {U64: []uint64{p.configRegionPhysAddr, configRegionSize}},
-				"status":     {Strings: []string{"okay"}},
-			},
-		},
-	}, nil
-}
-
-// WriteMMIO implements hv.MemoryMappedIODevice.
-func (p *programLoader) WriteMMIO(ctx hv.ExitContext, addr uint64, data []byte) error {
-	// Check if write is to config region (for command loop communication)
-	if addr >= p.configRegionPhysAddr && addr < p.configRegionPhysAddr+configRegionSize {
-		offset := addr - p.configRegionPhysAddr
-		copy(p.dataRegion[offset:], data)
-		return nil
-	}
-
-	// Handle mailbox writes
-	offset := addr - p.mailboxPhysAddr
-
-	switch offset {
-	case mailboxRunResultDetailOffset:
-		p.runResultDetail = binary.LittleEndian.Uint32(data)
-		return nil
-	case mailboxRunResultStageOffset:
-		p.runResultStage = binary.LittleEndian.Uint32(data)
-		return nil
-	case mailboxStartResultDetailOffset, mailboxStartResultStageOffset:
-		return nil
-	case 0x0:
-		value := binary.LittleEndian.Uint32(data)
-		switch value {
-		case 0x444f4e45, snapshotRequestValue:
-			// Clear runResultDetail when guest signals done/ready
-			// to indicate successful yield (not an error)
-			p.runResultDetail = 0
-			return hv.ErrYield
-		case userYieldValue:
-			return hv.ErrUserYield
-		}
-	default:
-		// no-op
-	}
-
-	return fmt.Errorf("unimplemented write at address 0x%x", offset)
-}
 
 func (p *programLoader) LoadProgram(prog *ir.Program) error {
 	asmProg, err := ir.BuildStandaloneProgramForArch(p.arch, prog)
@@ -252,8 +144,8 @@ func (p *programLoader) LoadProgram(prog *ir.Program) error {
 	p.runResultDetail = 0
 	p.runResultStage = 0
 
-	if len(p.dataRegion) < configRegionSize {
-		p.dataRegion = make([]byte, configRegionSize)
+	if len(p.dataRegion) < dataRegionSize {
+		p.dataRegion = make([]byte, dataRegionSize)
 	}
 
 	// assume p.regionBuf is an already-allocated []byte with enough capacity
@@ -325,8 +217,7 @@ func (p *programLoader) LoadProgram(prog *ir.Program) error {
 }
 
 var (
-	_ hv.MemoryMappedIODevice = &programLoader{}
-	_ hv.DeviceTemplate       = &programLoader{}
+	_ hv.DeviceTemplate = &programLoader{}
 )
 
 // VsockProgramServer handles program loading via vsock.
@@ -690,8 +581,7 @@ func (s *VsockCommandServer) Close() error {
 }
 
 type programRunner struct {
-	configRegion hv.MemoryRegion
-	loader       *programLoader
+	loader *programLoader
 
 	program       *ir.Program
 	configureVcpu func(vcpu hv.VirtualCPU) error
@@ -762,8 +652,6 @@ type VirtualMachine struct {
 
 	programLoader *programLoader
 
-	configRegion hv.MemoryRegion
-
 	debugLogging         bool
 	dmesgLogging         bool
 	gpuEnabled           bool
@@ -780,9 +668,9 @@ type VirtualMachine struct {
 	// consoleDevice is the virtio-console device for interactive console I/O.
 	consoleDevice *virtio.Console
 
-	// Dynamically allocated MMIO addresses for initx regions
-	mailboxPhysAddr      uint64
-	configRegionPhysAddr uint64
+	// timesliceMMIOPhysAddr is the physical address of the timeslice MMIO region.
+	// Used for performance instrumentation.
+	timesliceMMIOPhysAddr uint64
 
 	// pendingSnapshot holds a snapshot to restore after VM creation.
 	// Set by WithSnapshot option.
@@ -879,7 +767,6 @@ func (vm *VirtualMachine) runFirstRunVsock(ctx context.Context) error {
 	vmDone := make(chan error, 1)
 	go func() {
 		err := vm.vm.Run(ctx, &programRunner{
-			configRegion: vm.configRegion,
 			program: &ir.Program{
 				Entrypoint: "main",
 				Methods: map[string]ir.Method{
@@ -966,104 +853,6 @@ func (vm *VirtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 	return nil
 }
 
-// WriteExecCommand writes a command to the config region for the guest command loop.
-// The guest will read this command and execute it via fork/exec/wait.
-// Format at offset 0x100000:
-// - Magic (4 bytes): 0x434D4452 ("CMDR")
-// - path_len (4 bytes): length of path string (excluding null terminator)
-// - argc (4 bytes): number of arguments (including argv[0])
-// - envc (4 bytes): number of environment variables
-// - data: path\0 + args\0...\0 + envs\0...\0
-func (vm *VirtualMachine) WriteExecCommand(path string, args []string, env []string) error {
-	// Calculate total size needed
-	dataSize := len(path) + 1 // path + null terminator
-	for _, arg := range args {
-		dataSize += len(arg) + 1
-	}
-	for _, e := range env {
-		dataSize += len(e) + 1
-	}
-
-	// Check if data fits in the available region
-	// Config region is 4MB, command region starts at 0x100000, leaving ~3MB for command data
-	maxDataSize := configRegionSize - execCmdRegionOffset - execCmdDataOffset
-	if dataSize > maxDataSize {
-		return fmt.Errorf("command data too large: %d bytes (max %d)", dataSize, maxDataSize)
-	}
-
-	// Build the command buffer
-	totalSize := execCmdDataOffset + dataSize
-	buf := make([]byte, totalSize)
-
-	// Write header
-	binary.LittleEndian.PutUint32(buf[0:4], execCmdMagicValue)
-	binary.LittleEndian.PutUint32(buf[execCmdPathLenOffset:], uint32(len(path)))
-	binary.LittleEndian.PutUint32(buf[execCmdArgcOffset:], uint32(len(args)))
-	binary.LittleEndian.PutUint32(buf[execCmdEnvcOffset:], uint32(len(env)))
-
-	// Write data: path + args + env (all null-terminated)
-	offset := execCmdDataOffset
-	copy(buf[offset:], path)
-	offset += len(path)
-	buf[offset] = 0
-	offset++
-
-	for _, arg := range args {
-		copy(buf[offset:], arg)
-		offset += len(arg)
-		buf[offset] = 0
-		offset++
-	}
-
-	for _, e := range env {
-		copy(buf[offset:], e)
-		offset += len(e)
-		buf[offset] = 0
-		offset++
-	}
-
-	// Write to config region
-	// Always write to dataRegion so the command survives LoadProgram calls
-	// (LoadProgram copies dataRegion to region, which would overwrite the command)
-	if len(vm.programLoader.dataRegion) < configRegionSize {
-		vm.programLoader.dataRegion = make([]byte, configRegionSize)
-	}
-	copy(vm.programLoader.dataRegion[execCmdRegionOffset:], buf)
-
-	// Also write directly to backing memory for immediate visibility
-	if vm.programLoader.region != nil {
-		if _, err := vm.programLoader.region.WriteAt(buf, int64(execCmdRegionOffset)); err != nil {
-			return fmt.Errorf("write exec command to config region: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// ClearExecCommand clears the command magic in the config region.
-// This should be called before capturing a snapshot to ensure the guest
-// doesn't try to execute a stale command after restore.
-func (vm *VirtualMachine) ClearExecCommand() error {
-	// Write zero to the magic field
-	buf := make([]byte, 4)
-	binary.LittleEndian.PutUint32(buf, 0)
-
-	// Always write to dataRegion so it survives LoadProgram calls
-	if len(vm.programLoader.dataRegion) < configRegionSize {
-		vm.programLoader.dataRegion = make([]byte, configRegionSize)
-	}
-	copy(vm.programLoader.dataRegion[execCmdRegionOffset:], buf)
-
-	// Also write directly to backing memory for immediate visibility
-	if vm.programLoader.region != nil {
-		if _, err := vm.programLoader.region.WriteAt(buf, int64(execCmdRegionOffset)); err != nil {
-			return fmt.Errorf("clear exec command magic: %w", err)
-		}
-	}
-
-	return nil
-}
-
 // SetupVsockCommands initializes the vsock command server for container command execution.
 // This should be called after the vsock backend is available and before starting the VM.
 func (vm *VirtualMachine) SetupVsockCommands(backend virtio.VsockBackend, port uint32) error {
@@ -1078,6 +867,16 @@ func (vm *VirtualMachine) SetupVsockCommands(backend virtio.VsockBackend, port u
 	vm.vsockCmdPort = port
 	vm.useVsockCommands = true
 	return nil
+}
+
+// SetupVsockCommandsFromProgramBackend sets up vsock command execution using the
+// same backend as the vsock program loader. This is a convenience method for callers
+// that use WithVsockProgramLoader.
+func (vm *VirtualMachine) SetupVsockCommandsFromProgramBackend(port uint32) error {
+	if vm.vsockProgramBackend == nil {
+		return fmt.Errorf("vsock program backend not set - use WithVsockProgramLoader first")
+	}
+	return vm.SetupVsockCommands(vm.vsockProgramBackend, port)
 }
 
 // AcceptVsockCommandConnection waits for the guest to connect to the vsock command server.
@@ -1126,23 +925,10 @@ func (vm *VirtualMachine) HVVirtualMachine() hv.VirtualMachine {
 	return vm.vm
 }
 
-// MailboxPhysAddr returns the physical address of the mailbox MMIO region.
-func (vm *VirtualMachine) MailboxPhysAddr() uint64 {
-	return vm.mailboxPhysAddr
-}
-
-// ConfigRegionPhysAddr returns the physical address of the config MMIO region.
-func (vm *VirtualMachine) ConfigRegionPhysAddr() uint64 {
-	return vm.configRegionPhysAddr
-}
-
 // TimesliceMMIOPhysAddr returns the physical address of the timeslice MMIO region.
-// This is derived from the config region address (timeslice is at config - 0x2000).
 func (vm *VirtualMachine) TimesliceMMIOPhysAddr() uint64 {
-	// Timeslice MMIO is at a fixed offset before the config region
-	// Default: 0xf0001000 when config is at 0xf0003000
-	if vm.configRegionPhysAddr >= 0x2000 {
-		return vm.configRegionPhysAddr - 0x2000
+	if vm.timesliceMMIOPhysAddr != 0 {
+		return vm.timesliceMMIOPhysAddr
 	}
 	return 0xf0001000 // fallback to default
 }
@@ -1196,7 +982,6 @@ func (vm *VirtualMachine) runProgram(
 	}
 
 	return vm.vm.Run(ctx, &programRunner{
-		configRegion:  vm.configRegion,
 		program:       prog,
 		loader:        vm.programLoader,
 		configureVcpu: configureVcpu,
@@ -1476,18 +1261,10 @@ func NewVirtualMachine(
 				return nil, fmt.Errorf("kernel not loaded (use WithSnapshot for snapshot restore)")
 			}
 
-			// Calculate timeslice MMIO address (fixed offset before config region)
-			timesliceAddr := uint64(0xf0001000) // default
-			if ret.configRegionPhysAddr >= 0x2000 {
-				timesliceAddr = ret.configRegionPhysAddr - 0x2000
-			}
-
+			// Vsock is always enabled (MMIO paths have been removed)
 			cfg := BuilderConfig{
 				Arch:                  arch,
-				MailboxPhysAddr:       ret.mailboxPhysAddr,
-				TimesliceMMIOPhysAddr: timesliceAddr,
-				ConfigRegionPhysAddr:  ret.configRegionPhysAddr,
-				UseVsock:              ret.useVsockLoader,
+				TimesliceMMIOPhysAddr: ret.timesliceMMIOPhysAddr,
 				VsockPort:             ret.vsockProgramPort,
 			}
 
@@ -1614,49 +1391,12 @@ func NewVirtualMachine(
 	)
 
 	ret.loader.CreateVMWithMemory = func(vm hv.VirtualMachine) error {
-		// Allocate mailbox MMIO region dynamically above RAM
-		mailboxAlloc, err := vm.AllocateMMIO(hv.MMIOAllocationRequest{
-			Name:      "initx-mailbox",
-			Size:      mailboxRegionSize,
-			Alignment: 0x1000,
-		})
-		if err != nil {
-			return fmt.Errorf("allocate initx mailbox region: %v", err)
-		}
-		ret.mailboxPhysAddr = mailboxAlloc.Base
-		programLoader.mailboxPhysAddr = mailboxAlloc.Base
-
-		// Allocate config MMIO region dynamically above RAM
-		configAlloc, err := vm.AllocateMMIO(hv.MMIOAllocationRequest{
-			Name:      "initx-config",
-			Size:      configRegionSize,
-			Alignment: 0x1000,
-		})
-		if err != nil {
-			return fmt.Errorf("allocate initx config region: %v", err)
-		}
-		ret.configRegionPhysAddr = configAlloc.Base
-		programLoader.configRegionPhysAddr = configAlloc.Base
-
-		// On x86 (and non-ARM64 Linux/Darwin), we need to allocate backing memory
-		// for the config region since it's not handled by the MMU like ARM64
-		needsBackingMemory := true
-		if runtime.GOOS == "linux" && h.Architecture() == hv.ArchitectureARM64 {
-			needsBackingMemory = false
-		}
-		if runtime.GOOS == "darwin" && h.Architecture() == hv.ArchitectureARM64 {
-			needsBackingMemory = false
-		}
-
-		if needsBackingMemory {
-			mem, err := vm.AllocateMemory(configAlloc.Base, configRegionSize)
-			if err != nil {
-				return fmt.Errorf("allocate initx config backing memory: %v", err)
-			}
-			ret.configRegion = mem
-			programLoader.region = mem
-		}
-
+		// Note: Timeslice MMIO is no longer allocated since the MMIO handlers
+		// were removed as part of the vsock migration. The guest init will
+		// fail to mmap the timeslice region (since it doesn't exist) and
+		// gracefully skip timeslice recording.
+		// ret.timesliceMMIOPhysAddr remains 0, causing the guest to use the
+		// default address (0xf0001000) which won't be mapped.
 		return nil
 	}
 
@@ -1723,205 +1463,6 @@ func NewVirtualMachine(
 	rec.Record(tsInitxNewVMDone)
 
 	return &ret, nil
-}
-
-// WriteFile copies data from in into the guest at guestPath using a shared buffer
-// handshake between host and guest.
-func (vm *VirtualMachine) WriteFile(ctx context.Context, in io.Reader, size int64, guestPath string) error {
-	if vm == nil {
-		return fmt.Errorf("initx: virtual machine is nil")
-	}
-	if guestPath == "" {
-		return fmt.Errorf("initx: guest path must not be empty")
-	}
-	if in == nil {
-		return fmt.Errorf("initx: reader must not be nil")
-	}
-	if size < 0 {
-		return fmt.Errorf("initx: file size must be non-negative (got %d)", size)
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	vm.programLoader.ReserveDataRegion(writeFileTransferRegion)
-	defer vm.programLoader.ReserveDataRegion(0)
-
-	errLabel := ir.Label("__initx_write_file_err")
-	errVar := ir.Var("__initx_write_file_errno")
-	errorFmt := fmt.Sprintf("initx: failed to write %s errno=0x%%x\n", guestPath)
-
-	fd := ir.Var("__initx_write_file_fd")
-	memFd := ir.Var("__initx_write_file_mem_fd")
-	mailboxPtr := ir.Var("__initx_write_file_mailbox_ptr")
-	configPtr := ir.Var("__initx_write_file_config_ptr")
-	bufferOffset := ir.Var("__initx_write_file_buffer_offset")
-	bufferPtr := ir.Var("__initx_write_file_buffer_ptr")
-	bufferLen := ir.Var("__initx_write_file_buffer_len")
-	chunkLen := ir.Var("__initx_write_file_chunk_len")
-	chunkPtr := ir.Var("__initx_write_file_chunk_ptr")
-
-	cleanup := func() ir.Fragment {
-		return ir.Block{
-			ir.Syscall(defs.SYS_MUNMAP, configPtr, ir.Int64(configRegionSize)),
-			ir.Syscall(defs.SYS_MUNMAP, mailboxPtr, ir.Int64(mailboxRegionSize)),
-			ir.Syscall(defs.SYS_CLOSE, memFd),
-			ir.Syscall(defs.SYS_CLOSE, fd),
-		}
-	}
-
-	requestChunk := func() ir.Fragment {
-		signal := ir.Var("__initx_write_file_signal")
-		return ir.Block{
-			ir.Assign(signal, ir.Int64(userYieldValue)),
-			ir.Assign(mailboxPtr.Mem().As32(), signal.As32()),
-		}
-	}
-
-	loopLabel := nextHelperLabel("write_file_loop")
-	doneLabel := nextHelperLabel("write_file_done")
-
-	prog := &ir.Program{
-		Entrypoint: "main",
-		Methods: map[string]ir.Method{
-			"main": {
-				ir.Assign(fd, ir.Syscall(
-					defs.SYS_OPENAT,
-					ir.Int64(linux.AT_FDCWD),
-					guestPath,
-					ir.Int64(linux.O_WRONLY|linux.O_CREAT|linux.O_TRUNC),
-					ir.Int64(0o755),
-				)),
-				ir.Assign(errVar, fd),
-				ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
-
-				ir.Assign(memFd, ir.Syscall(
-					defs.SYS_OPENAT,
-					ir.Int64(linux.AT_FDCWD),
-					"/dev/mem",
-					ir.Int64(linux.O_RDWR|linux.O_SYNC),
-					ir.Int64(0),
-				)),
-				ir.Assign(errVar, memFd),
-				ir.If(ir.IsNegative(errVar), ir.Block{
-					ir.Syscall(defs.SYS_CLOSE, fd),
-					ir.Goto(errLabel),
-				}),
-
-				ir.Assign(mailboxPtr, ir.Syscall(
-					defs.SYS_MMAP,
-					ir.Int64(0),
-					ir.Int64(mailboxRegionSize),
-					ir.Int64(linux.PROT_READ|linux.PROT_WRITE),
-					ir.Int64(linux.MAP_SHARED),
-					memFd,
-					ir.Int64(int64(vm.mailboxPhysAddr)),
-				)),
-				ir.Assign(errVar, mailboxPtr),
-				ir.If(ir.IsNegative(errVar), ir.Block{
-					ir.Syscall(defs.SYS_CLOSE, memFd),
-					ir.Syscall(defs.SYS_CLOSE, fd),
-					ir.Goto(errLabel),
-				}),
-
-				ir.Assign(configPtr, ir.Syscall(
-					defs.SYS_MMAP,
-					ir.Int64(0),
-					ir.Int64(configRegionSize),
-					ir.Int64(linux.PROT_READ),
-					ir.Int64(linux.MAP_SHARED),
-					memFd,
-					ir.Int64(int64(vm.configRegionPhysAddr)),
-				)),
-				ir.Assign(errVar, configPtr),
-				ir.If(ir.IsNegative(errVar), ir.Block{
-					ir.Syscall(defs.SYS_MUNMAP, mailboxPtr, ir.Int64(mailboxRegionSize)),
-					ir.Syscall(defs.SYS_CLOSE, memFd),
-					ir.Syscall(defs.SYS_CLOSE, fd),
-					ir.Goto(errLabel),
-				}),
-
-				ir.Assign(bufferOffset, configPtr.MemWithDisp(configDataOffsetField).As32()),
-				ir.Assign(bufferLen, configPtr.MemWithDisp(configDataLengthField).As32()),
-				ir.Assign(bufferPtr, ir.Op(ir.OpAdd, configPtr, bufferOffset)),
-				ir.If(ir.IsLessThan(bufferLen, ir.Int64(writeFileTransferRegion)), ir.Block{
-					cleanup(),
-					ir.Assign(errVar, ir.Int64(-int64(linux.EINVAL))),
-					ir.Goto(errLabel),
-				}),
-
-				ir.Assign(chunkPtr, ir.Op(ir.OpAdd, bufferPtr, ir.Int64(writeFileLengthPrefix))),
-				ir.Goto(loopLabel),
-
-				ir.DeclareLabel(loopLabel, ir.Block{
-					requestChunk(),
-					ir.Assign(chunkLen, bufferPtr.Mem().As16()),
-					ir.Assign(chunkLen, ir.Op(ir.OpAnd, chunkLen, ir.Int64(0xffff))),
-					ir.If(ir.IsZero(chunkLen), ir.Goto(doneLabel)),
-					ir.Assign(errVar, ir.Syscall(
-						defs.SYS_WRITE,
-						fd,
-						chunkPtr,
-						chunkLen,
-					)),
-					ir.If(ir.IsNegative(errVar), ir.Block{
-						cleanup(),
-						ir.Goto(errLabel),
-					}),
-					ir.Goto(loopLabel),
-				}),
-
-				ir.DeclareLabel(doneLabel, ir.Block{
-					cleanup(),
-					ir.Return(ir.Int64(0)),
-				}),
-
-				ir.DeclareLabel(errLabel, ir.Block{
-					ir.Printf(errorFmt, ir.Op(ir.OpSub, ir.Int64(0), errVar)),
-					ir.Syscall(defs.SYS_EXIT, ir.Int64(1)),
-				}),
-			},
-		},
-	}
-
-	buf := make([]byte, writeFileTransferRegion)
-	payloadBuf := buf[writeFileLengthPrefix : writeFileLengthPrefix+writeFileMaxChunkLen]
-
-	handler := func(ctx context.Context, vcpu hv.VirtualCPU) error {
-		if vm.programLoader.dataRegionOffset == 0 {
-			return fmt.Errorf("initx: transfer buffer offset unavailable")
-		}
-
-		n, err := in.Read(payloadBuf)
-		if err != nil && err != io.EOF {
-			return fmt.Errorf("initx: read input data: %w", err)
-		}
-
-		if n == 0 {
-			// signal zero-length chunk to guest
-			binary.LittleEndian.PutUint16(buf[:writeFileLengthPrefix], 0)
-		} else {
-			if n > writeFileMaxChunkLen {
-				n = writeFileMaxChunkLen
-			}
-			binary.LittleEndian.PutUint16(buf[:writeFileLengthPrefix], uint16(n))
-		}
-
-		if vm.programLoader.region != nil {
-			if _, err := vm.programLoader.region.WriteAt(
-				buf[:writeFileTransferRegion],
-				vm.programLoader.dataRegionOffset,
-			); err != nil {
-				return fmt.Errorf("initx: write transfer chunk: %w", err)
-			}
-		} else {
-			copy(vm.programLoader.dataRegion[vm.programLoader.dataRegionOffset:], buf)
-		}
-
-		return nil
-	}
-
-	return vm.runProgram(ctx, prog, handler)
 }
 
 // Spawn executes path inside the guest using fork/exec, waiting for it to complete.

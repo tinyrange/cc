@@ -16,9 +16,8 @@ const (
 
 // Memory layout
 const (
-	mailboxMapSize       = 0x1000
-	configRegionSize     = 4194304 // 4MB
 	timesliceMMIOMapSize = 0x1000
+	configRegionSize     = 4194304 // 4MB (for payload execution buffer)
 )
 
 // Timeslice IDs - must match constants in hvf_darwin_arm64.go
@@ -30,14 +29,6 @@ const (
 // 15=phase7_loop_start, 16=phase7_copy_payload, 17=phase7_relocate
 // 18=phase7_isb, 19=phase7_call_payload, 20=phase7_payload_done
 
-// Config region offsets
-const (
-	configTimeSecField           = 24
-	configTimeNsecField          = 32
-	configHeaderMagicValue       = 0xcafebabe
-	configHeaderSize             = 40
-	mailboxRunResultDetailOffset = 8
-)
 
 // main is the entrypoint for the init program.
 // Note: The RTG compiler uses the first function as the entrypoint,
@@ -70,21 +61,26 @@ func main() int64 {
 	// Module preloading is injected here at IR level
 
 	// === Phase 4: Console setup ===
+	runtime.LogKmsg("initx: phase4 starting console setup\n")
 
 	consoleFd := runtime.Syscall(runtime.SYS_OPENAT, runtime.AT_FDCWD, "/dev/console", runtime.O_RDWR, 0)
+	runtime.LogKmsg("initx: phase4 console open done\n")
 	if consoleFd < 0 {
 		runtime.Printf("initx: failed to open /dev/console (errno=0x%x)\n", 0-consoleFd)
 		reboot()
 	}
 
 	// create a new session to own the console
+	runtime.LogKmsg("initx: phase4 calling setsid\n")
 	setsidResult := runtime.Syscall(runtime.SYS_SETSID)
+	runtime.LogKmsg("initx: phase4 setsid done\n")
 	if setsidResult < 0 {
 		runtime.Printf("initx: failed to create session (errno=0x%x)\n", 0-setsidResult)
 		reboot()
 	}
 
 	// set controlling terminal
+	runtime.LogKmsg("initx: phase4 calling TIOCSCTTY\n")
 	ttyResult := runtime.Syscall(runtime.SYS_IOCTL, consoleFd, runtime.TIOCSCTTY, 0)
 	if ttyResult < 0 {
 		if ttyResult != runtime.EPERM {
@@ -94,51 +90,45 @@ func main() int64 {
 	}
 
 	// dup2 consoleFd to stdin, stdout, stderr
+	runtime.LogKmsg("initx: phase4 doing dup3\n")
 	runtime.Syscall(runtime.SYS_DUP3, consoleFd, 0, 0)
 	runtime.Syscall(runtime.SYS_DUP3, consoleFd, 1, 0)
 	runtime.Syscall(runtime.SYS_DUP3, consoleFd, 2, 0)
+	runtime.LogKmsg("initx: phase4 complete\n")
 
 	// === Phase 5: Memory mapping ===
+	runtime.LogKmsg("initx: phase5 starting\n")
 
 	// open /dev/mem
 	memFd := runtime.Syscall(runtime.SYS_OPENAT, runtime.AT_FDCWD, "/dev/mem", runtime.O_RDWR|runtime.O_SYNC, 0)
+	runtime.LogKmsg("initx: phase5 /dev/mem opened\n")
 	if memFd < 0 {
 		runtime.Printf("initx: failed to open /dev/mem (errno=0x%x)\n", 0-memFd)
 		reboot()
 	}
 
-	// map mailbox region
-	mailboxMem := runtime.Syscall(runtime.SYS_MMAP, 0, mailboxMapSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_SHARED, memFd, runtime.Config("MAILBOX_PHYS_ADDR"))
-	if mailboxMem < 0 {
-		runtime.Printf("initx: failed to map mailbox region (errno=0x%x)\n", 0-mailboxMem)
-		reboot()
-	}
-
-	// map timeslice MMIO region for guest-side timeslice recording
-	timesliceMem := runtime.Syscall(runtime.SYS_MMAP, 0, timesliceMMIOMapSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_SHARED, memFd, runtime.Config("TIMESLICE_MMIO_PHYS_ADDR"))
-	if timesliceMem < 0 {
-		// Timeslice mapping is optional - continue without it
-		timesliceMem = 0
-	}
-	// Record: phase5_ts_map (11)
-	if timesliceMem > 0 {
-		runtime.Store32(timesliceMem, 0, 11)
-	}
-
-	// map config region (4MB)
-	configMem := runtime.Syscall(runtime.SYS_MMAP, 0, configRegionSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_SHARED, memFd, runtime.Config("CONFIG_REGION_PHYS_ADDR"))
-	if configMem < 0 {
-		runtime.Printf("initx: failed to map config region (errno=0x%x)\n", 0-configMem)
-		reboot()
-	}
-	// Record: phase5_config_map (12)
-	if timesliceMem > 0 {
-		runtime.Store32(timesliceMem, 0, 12)
+	// Timeslice MMIO is disabled when TIMESLICE_MMIO_PHYS_ADDR is 0
+	// (MMIO handlers were removed as part of vsock migration)
+	var timesliceMem int64 = 0
+	var timesliceAddr int64 = 0
+	timesliceAddr = runtime.Config("TIMESLICE_MMIO_PHYS_ADDR")
+	if timesliceAddr > 0 {
+		runtime.LogKmsg("initx: phase5 mapping timeslice MMIO\n")
+		timesliceMem = runtime.Syscall(runtime.SYS_MMAP, 0, timesliceMMIOMapSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_SHARED, memFd, timesliceAddr)
+		runtime.LogKmsg("initx: phase5 timeslice mmap done\n")
+		if timesliceMem < 0 {
+			// Timeslice mapping is optional - continue without it
+			timesliceMem = 0
+		}
+		// Record: phase5_ts_map (11)
+		if timesliceMem > 0 {
+			runtime.Store32(timesliceMem, 0, 11)
+		}
 	}
 
 	// map anonymous region for payload execution (4MB)
 	anonMem := runtime.Syscall(runtime.SYS_MMAP, 0, configRegionSize, runtime.PROT_READ|runtime.PROT_WRITE|runtime.PROT_EXEC, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
-	// runtime.Printf("initx: mmap anonMem=0x%x\n", anonMem)
+	runtime.LogKmsg("initx: phase5 anonMem mapped\n")
 	if anonMem < 0 {
 		runtime.Printf("initx: failed to map anonymous payload region (errno=0x%x)\n", 0-anonMem)
 		reboot()
@@ -175,127 +165,13 @@ func main() int64 {
 		runtime.Store32(timesliceMem, 0, 14)
 	}
 
-	// === Phase 6.5: Vsock program loading (if enabled) ===
-	if runtime.Ifdef("USE_VSOCK") {
-		vsockMainLoop(anonMem, timesliceMem)
-		// vsockMainLoop never returns (reboots on error)
-	}
+	// === Phase 7: Vsock program loading ===
+	// Enter vsock main loop - this never returns (reboots on error)
+	runtime.LogKmsg("initx: entering vsockMainLoop\n")
+	vsockMainLoop(anonMem, timesliceMem)
 
-	// === Phase 7: Main loop (MMIO-based) ===
-
-	for {
-		// Record: phase7_loop_start (15)
-		if timesliceMem > 0 {
-			runtime.Store32(timesliceMem, 0, 15)
-		}
-		// check for magic value
-		var configMagic int64 = 0
-		configMagic = runtime.Load32(configMem, 0)
-		if configMagic == configHeaderMagicValue {
-			// load payload header
-			var codeLen int64 = 0
-			var relocCount int64 = 0
-			var relocBytes int64 = 0
-			var codeOffset int64 = 0
-
-			codeLen = runtime.Load32(configMem, 4)
-			relocCount = runtime.Load32(configMem, 8)
-			relocBytes = relocCount << 2
-			codeOffset = configHeaderSize + relocBytes
-
-			// copy binary payload
-			var copySrc int64 = 0
-			var copyDst int64 = 0
-			var remaining int64 = 0
-
-			copySrc = configMem + codeOffset
-			copyDst = anonMem
-			remaining = codeLen
-
-			// copy 4 bytes at a time
-			for remaining >= 4 {
-				var copyVal32 int64 = 0
-				copyVal32 = runtime.Load32(copySrc, 0)
-				runtime.Store32(copyDst, 0, copyVal32)
-				copyDst = copyDst + 4
-				copySrc = copySrc + 4
-				remaining = remaining - 4
-			}
-
-			// copy remaining bytes
-			for remaining > 0 {
-				var copyVal8 int64 = 0
-				copyVal8 = runtime.Load8(copySrc, 0)
-				runtime.Store8(copyDst, 0, copyVal8)
-				copyDst = copyDst + 1
-				copySrc = copySrc + 1
-				remaining = remaining - 1
-			}
-			// Record: phase7_copy_payload (16)
-			if timesliceMem > 0 {
-				runtime.Store32(timesliceMem, 0, 16)
-			}
-
-			// apply relocations
-			var relocPtr int64 = 0
-			var relocIndex int64 = 0
-
-			relocPtr = configMem + configHeaderSize
-			relocIndex = 0
-
-			for relocIndex < relocCount {
-				var relocEntryPtr int64 = 0
-				var relocOffset int64 = 0
-				var patchPtr int64 = 0
-				var patchValue int64 = 0
-
-				relocEntryPtr = relocPtr + (relocIndex << 2)
-				relocOffset = runtime.Load32(relocEntryPtr, 0)
-				patchPtr = anonMem + relocOffset
-				patchValue = runtime.Load64(patchPtr, 0)
-				patchValue = patchValue + anonMem
-				runtime.Store64(patchPtr, 0, patchValue)
-				relocIndex = relocIndex + 1
-			}
-			// Record: phase7_relocate (17)
-			if timesliceMem > 0 {
-				runtime.Store32(timesliceMem, 0, 17)
-			}
-
-			// Instruction synchronization barrier - required on ARM64 after modifying
-			// code in memory before executing it. Without this, the instruction cache
-			// may contain stale data and cause SIGILL.
-			runtime.ISB()
-			// Record: phase7_isb (18)
-			if timesliceMem > 0 {
-				runtime.Store32(timesliceMem, 0, 18)
-			}
-
-			// Record: phase7_call_payload (19)
-			if timesliceMem > 0 {
-				runtime.Store32(timesliceMem, 0, 19)
-			}
-			// call the payload
-			payloadResult := runtime.Call(anonMem)
-			// Record: phase7_payload_done (20)
-			if timesliceMem > 0 {
-				runtime.Store32(timesliceMem, 0, 20)
-			}
-
-			// publish return code for host-side exit propagation
-			runtime.Store32(mailboxMem, mailboxRunResultDetailOffset, payloadResult)
-
-			// signal completion to host
-			var doneSignal int64 = 0x444f4e45
-			runtime.Store32(mailboxMem, 0, doneSignal)
-		} else {
-			// magic value not found
-			var actualMagic int64 = 0
-			actualMagic = runtime.Load32(configMem, 0)
-			runtime.Printf("Magic value not found in config region: %x\n", actualMagic)
-			reboot()
-		}
-	}
+	// Unreachable - vsockMainLoop never returns
+	return 0
 }
 
 // reboot issues a reboot syscall with the architecture-appropriate command.
@@ -323,6 +199,7 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 	// Get vsock port from compile-time config (default 9998)
 	var vsockPort int64 = 0
 	vsockPort = runtime.Config("VSOCK_PORT")
+	runtime.LogKmsg("initx: vsockMainLoop starting\n")
 
 	// Create vsock socket
 	sockFd := runtime.Syscall(runtime.SYS_SOCKET, runtime.AF_VSOCK, runtime.SOCK_STREAM, 0)
@@ -330,6 +207,7 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 		runtime.Printf("initx: failed to create vsock socket (errno=0x%x)\n", 0-sockFd)
 		reboot()
 	}
+	runtime.LogKmsg("initx: vsock socket created\n")
 
 	// Build sockaddr_vm structure (16 bytes)
 	// struct sockaddr_vm {
@@ -359,6 +237,7 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 	// svm_flags and svm_zero are already 0
 
 	// Connect to host
+	runtime.LogKmsg("initx: connecting to vsock host...\n")
 	connectResult := runtime.Syscall(runtime.SYS_CONNECT, sockFd, sockaddrMem, 16)
 	if connectResult < 0 {
 		runtime.Printf("initx: failed to connect vsock (errno=0x%x)\n", 0-connectResult)
@@ -366,6 +245,7 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 		runtime.Syscall(runtime.SYS_CLOSE, sockFd)
 		reboot()
 	}
+	runtime.LogKmsg("initx: vsock connected successfully\n")
 
 	// Free sockaddr_vm - no longer needed
 	runtime.Syscall(runtime.SYS_MUNMAP, sockaddrMem, 16)
@@ -425,10 +305,12 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 			reboot()
 		}
 
-		// Test read - try reading just 4 bytes first
+		// Read payload: first do a test read, then read the rest
+		// The test read helps verify the connection is working before committing to a large read
 		testRead := runtime.Syscall(runtime.SYS_READ, sockFd, progBuf, 4)
 		if testRead < 0 {
 			runtime.Printf("initx: test read failed (errno=0x%x)\n", 0-testRead)
+			reboot()
 		}
 
 		// Read remaining payload

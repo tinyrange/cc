@@ -1538,6 +1538,20 @@ func (app *Application) finalizeBoot(prep *bootPrep) (retErr error) {
 		opts = append(opts, initx.WithQEMUEmulationEnabled(true))
 	}
 
+	// Set up vsock for program loading and command execution
+	vsockBackend := virtio.NewSimpleVsockBackend()
+	opts = append(opts,
+		initx.WithDeviceTemplate(virtio.VsockTemplate{
+			MMIODeviceTemplateBase: virtio.MMIODeviceTemplateBase{
+				Arch:   prep.hvArch,
+				Config: virtio.VsockDeviceConfig(),
+			},
+			GuestCID: 3,
+			Backend:  vsockBackend,
+		}),
+		initx.WithVsockProgramLoader(vsockBackend, initx.VsockProgramPort),
+	)
+
 	// Snapshot caching setup
 	var sessionCfg initx.SessionConfig
 	var configHash hv.VMConfigHash
@@ -1574,6 +1588,15 @@ func (app *Application) finalizeBoot(prep *bootPrep) (retErr error) {
 		return fmt.Errorf("create VM: %w", err)
 	}
 
+	// Set up vsock command server if using command loop mode
+	if prep.useCommandLoop {
+		if err := vm.SetupVsockCommandsFromProgramBackend(initx.VsockCmdPort); err != nil {
+			vm.Close()
+			termView.Close()
+			return fmt.Errorf("setup vsock commands: %w", err)
+		}
+	}
+
 	// Build init program - use CommandLoop mode if snapshot caching is enabled
 	prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
 		Arch:                  prep.hvArch,
@@ -1584,9 +1607,8 @@ func (app *Application) finalizeBoot(prep *bootPrep) (retErr error) {
 		Exec:                  prep.exec,
 		CommandLoop:           prep.useCommandLoop,
 		QEMUEmulation:         prep.qemuConfig,
-		MailboxPhysAddr:       vm.MailboxPhysAddr(),
 		TimesliceMMIOPhysAddr: vm.TimesliceMMIOPhysAddr(),
-		ConfigRegionPhysAddr:  vm.ConfigRegionPhysAddr(),
+		VsockCmdPort:          initx.VsockCmdPort,
 	})
 	if err != nil {
 		vm.Close()
@@ -1597,22 +1619,37 @@ func (app *Application) finalizeBoot(prep *bootPrep) (retErr error) {
 	// Handle snapshot caching for CommandLoop mode
 	if prep.useCommandLoop && app.snapshotCache != nil {
 		if sessionCfg.SkipBoot {
-			// Restored from snapshot - write the command to execute
-			if writeErr := vm.WriteExecCommand(prep.execCmd[0], prep.execCmd, prep.env); writeErr != nil {
-				slog.Debug("Failed to write exec command after restore", "error", writeErr)
-				vm.Close()
-				termView.Close()
-				return fmt.Errorf("write exec command: %w", writeErr)
+			// Restored from snapshot - set up callback to accept vsock and send command
+			sessionCfg.OnBootComplete = func() error {
+				// Accept vsock connection from guest (guest connects after resume)
+				if err := vm.AcceptVsockCommandConnection(); err != nil {
+					return fmt.Errorf("accept vsock connection: %w", err)
+				}
+				// Wait for READY signal
+				if err := vm.WaitVsockReady(context.Background()); err != nil {
+					return fmt.Errorf("wait for vsock ready: %w", err)
+				}
+				// Send the command via vsock
+				if err := vm.SendVsockCommand(prep.execCmd[0], prep.execCmd, prep.env); err != nil {
+					return fmt.Errorf("send vsock command: %w", err)
+				}
+				debug.Writef("ccapp.finalizeBoot snapshot", "command sent via vsock after restore")
+				return nil
 			}
-			debug.Writef("ccapp.finalizeBoot snapshot", "command written after restore")
 		} else {
 			// Set up callback to capture snapshot after boot completes
 			sessionCfg.OnBootComplete = func() error {
-				// Clear any stale command before capturing snapshot
-				if clearErr := vm.ClearExecCommand(); clearErr != nil {
-					slog.Debug("Failed to clear exec command before snapshot", "error", clearErr)
+				// Accept vsock connection from guest
+				if err := vm.AcceptVsockCommandConnection(); err != nil {
+					return fmt.Errorf("accept vsock connection: %w", err)
 				}
 
+				// Wait for READY signal from guest
+				if err := vm.WaitVsockReady(context.Background()); err != nil {
+					return fmt.Errorf("wait for vsock ready: %w", err)
+				}
+
+				// Capture snapshot now that container is ready
 				snap, captureErr := vm.CaptureSnapshot()
 				if captureErr != nil {
 					slog.Debug("Failed to capture boot snapshot", "error", captureErr)
@@ -1624,9 +1661,9 @@ func (app *Application) finalizeBoot(prep *bootPrep) (retErr error) {
 					debug.Writef("ccapp.finalizeBoot snapshot", "saved to cache")
 				}
 
-				// Write the command for the guest to execute
-				if writeErr := vm.WriteExecCommand(prep.execCmd[0], prep.execCmd, prep.env); writeErr != nil {
-					return fmt.Errorf("write exec command: %w", writeErr)
+				// Send the command via vsock
+				if err := vm.SendVsockCommand(prep.execCmd[0], prep.execCmd, prep.env); err != nil {
+					return fmt.Errorf("send vsock command: %w", err)
 				}
 
 				return nil

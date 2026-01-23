@@ -162,6 +162,9 @@ func (b *benchmark) firstBoot(
 	// Initialize shared console buffer for output validation
 	b.consoleBuffer = new(bytes.Buffer)
 
+	// Set up vsock for program loading and command execution
+	vsockBackend := virtio.NewSimpleVsockBackend()
+
 	opts := []initx.Option{
 		initx.WithDeviceTemplate(virtio.FSTemplate{
 			Tag:     "rootfs",
@@ -169,6 +172,15 @@ func (b *benchmark) firstBoot(
 			Arch:    hvArch,
 		}),
 		initx.WithConsoleOutput(b.consoleBuffer),
+		initx.WithDeviceTemplate(virtio.VsockTemplate{
+			MMIODeviceTemplateBase: virtio.MMIODeviceTemplateBase{
+				Arch:   hvArch,
+				Config: virtio.VsockDeviceConfig(),
+			},
+			GuestCID: 3,
+			Backend:  vsockBackend,
+		}),
+		initx.WithVsockProgramLoader(vsockBackend, initx.VsockProgramPort),
 	}
 
 	b.vm, err = initx.NewVirtualMachine(b.h, 1, 1024, kernelLoader, opts...)
@@ -178,6 +190,11 @@ func (b *benchmark) firstBoot(
 
 	tsRecord.Record(tsNewVirtualMachine)
 
+	// Set up vsock command server for command loop mode
+	if err := b.vm.SetupVsockCommandsFromProgramBackend(initx.VsockCmdPort); err != nil {
+		return fmt.Errorf("setup vsock commands: %w", err)
+	}
+
 	// First boot - use CommandLoop mode and capture snapshot after container setup
 	prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
 		Arch:                  hvArch,
@@ -186,9 +203,8 @@ func (b *benchmark) firstBoot(
 		WorkDir:               img.Config.WorkingDir,
 		UID:                   img.Config.UID,
 		GID:                   img.Config.GID,
-		MailboxPhysAddr:       b.vm.MailboxPhysAddr(),
 		TimesliceMMIOPhysAddr: b.vm.TimesliceMMIOPhysAddr(),
-		ConfigRegionPhysAddr:  b.vm.ConfigRegionPhysAddr(),
+		VsockCmdPort:          initx.VsockCmdPort,
 	})
 	if err != nil {
 		return fmt.Errorf("build init program: %w", err)
@@ -200,17 +216,30 @@ func (b *benchmark) firstBoot(
 	b.commandArgs = commandArgs
 	b.commandEnv = img.Config.Env
 
-	// First boot: Run the container init program directly
-	timeoutCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
+	// First boot: Run the container init program
+	// The VM runs in a goroutine while we accept the vsock connection
+	bootCtx, bootCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer bootCancel()
 
-	if err := b.vm.Run(timeoutCtx, prog); err != nil {
-		return fmt.Errorf("failed to run container init: %w", err)
+	bootDone := make(chan error, 1)
+	go func() {
+		bootDone <- b.vm.Run(bootCtx, prog)
+	}()
+
+	// Accept vsock connection from guest
+	if err := b.vm.AcceptVsockCommandConnection(); err != nil {
+		return fmt.Errorf("failed to accept vsock connection: %w", err)
+	}
+
+	// Wait for READY signal
+	if err := b.vm.WaitVsockReady(bootCtx); err != nil {
+		return fmt.Errorf("failed to wait for vsock ready: %w", err)
 	}
 
 	tsRecord.Record(tsOnBootComplete)
 
-	// Capture snapshot while guest is in command loop
+	// Capture snapshot while guest is in command loop (vsock connected)
+	// Note: Snapshot includes vsock connection state which may not restore correctly
 	b.snapshot, err = b.vm.CaptureSnapshot()
 	if err != nil {
 		return fmt.Errorf("failed to capture snapshot: %w", err)
@@ -218,19 +247,16 @@ func (b *benchmark) firstBoot(
 
 	tsRecord.Record(tsCaptureSnapshot)
 
-	// Write the first command for guest to execute - whoami with no args
-	if err := b.vm.WriteExecCommand(commandArgs[0], nil, nil); err != nil {
-		return fmt.Errorf("failed to write exec command: %w", err)
+	// Send the first command via vsock
+	if err := b.vm.SendVsockCommand(commandArgs[0], nil, nil); err != nil {
+		return fmt.Errorf("failed to send exec command: %w", err)
 	}
 
 	tsRecord.Record(tsStartSession)
 
-	// Resume VM to execute the command
-	timeoutCtx2, cancel2 := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel2()
-
-	if err := b.vm.Run(timeoutCtx2, prog); err != nil {
-		return fmt.Errorf("failed to run command: %w", err)
+	// Wait for command result
+	if _, err := b.vm.WaitVsockResult(bootCtx); err != nil {
+		return fmt.Errorf("failed to wait for command result: %w", err)
 	}
 
 	tsRecord.Record(tsWaitForSession)
@@ -240,10 +266,8 @@ func (b *benchmark) firstBoot(
 
 // runIteration restores the snapshot and runs a command with the given iteration number.
 // It validates that the output matches the expected result.
-// NOTE: On ARM64 Linux, commands with arguments fail because the config region is
-// MMIO-only (no backing memory), and execve's copy_from_user doesn't work with MMIO.
-// For now, we use whoami (no args) which works correctly.
 // This reuses the existing VM instead of creating a new one.
+// NOTE: With vsock, after snapshot restore the guest needs to reconnect.
 func (b *benchmark) runIteration(
 	tsRecord *timeslice.Recorder,
 	iteration int,
@@ -258,15 +282,9 @@ func (b *benchmark) runIteration(
 
 	tsRecord.Record(tsRestoreSnapshot)
 
-	// Use whoami with no arguments - commands with args don't work on ARM64 Linux
-	// due to MMIO config region (execve can't copy strings from MMIO memory)
 	expectedOutput := "root"
 
-	if err := b.vm.WriteExecCommand("/usr/bin/whoami", nil, nil); err != nil {
-		return fmt.Errorf("failed to write exec command: %w", err)
-	}
-
-	// Minimal no-op program since guest is already in command loop
+	// Minimal no-op program to resume VM execution
 	prog := &ir.Program{
 		Entrypoint: "main",
 		Methods: map[string]ir.Method{
@@ -274,12 +292,35 @@ func (b *benchmark) runIteration(
 		},
 	}
 
+	// Resume VM in background
+	ctx := context.Background()
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- b.vm.Run(ctx, prog)
+	}()
+
+	// Re-accept vsock connection (guest reconnects after snapshot restore)
+	if err := b.vm.AcceptVsockCommandConnection(); err != nil {
+		return fmt.Errorf("failed to accept vsock connection: %w", err)
+	}
+
+	// Wait for READY signal
+	if err := b.vm.WaitVsockReady(ctx); err != nil {
+		return fmt.Errorf("failed to wait for vsock ready: %w", err)
+	}
+
 	tsRecord.Record(tsBuildContainerInitProgram)
+
+	// Send command via vsock
+	if err := b.vm.SendVsockCommand("/usr/bin/whoami", nil, nil); err != nil {
+		return fmt.Errorf("failed to send exec command: %w", err)
+	}
+
 	tsRecord.Record(tsStartSession)
 
-	// Resume VM - guest will read command from config region and execute it
-	if err := b.vm.Run(context.Background(), prog); err != nil {
-		return fmt.Errorf("failed to run command: %w", err)
+	// Wait for command result
+	if _, err := b.vm.WaitVsockResult(ctx); err != nil {
+		return fmt.Errorf("failed to wait for command result: %w", err)
 	}
 
 	tsRecord.Record(tsWaitForSession)

@@ -47,15 +47,9 @@ type ContainerInitConfig struct {
 	// CommandLoop enables the late-snapshot command loop mode.
 	// When true, the container init will signal readiness for snapshot after
 	// container setup, then enter a loop waiting for commands from the host.
-	// Commands are passed via WriteExecCommand() after snapshot restore.
+	// Commands are passed via SendVsockCommand() after snapshot restore.
 	// When false (default), the Cmd field is baked into the init program.
 	CommandLoop bool
-
-	// UseVsock enables vsock-based command loop instead of MMIO.
-	// When true and CommandLoop is also true, commands are sent via vsock
-	// instead of the config region. This requires a vsock device to be
-	// configured on the VM.
-	UseVsock bool
 
 	// VsockCmdPort is the vsock port for command execution.
 	// Default: 9997 (separate from program loading port 9998)
@@ -75,11 +69,9 @@ type ContainerInitConfig struct {
 	// If set, QEMU static binaries will be installed and binfmt-misc configured.
 	QEMUEmulation *QEMUEmulationConfig
 
-	// MMIO physical addresses (dynamically allocated by hypervisor)
-	// If 0, uses default values for backwards compatibility.
-	MailboxPhysAddr       uint64
+	// TimesliceMMIOPhysAddr is the physical address of the timeslice MMIO region.
+	// If 0, uses default value 0xf0001000.
 	TimesliceMMIOPhysAddr uint64
-	ConfigRegionPhysAddr  uint64
 }
 
 func (c *ContainerInitConfig) applyDefaults() {
@@ -147,7 +139,7 @@ func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
 		"command_loop":    cfg.CommandLoop,
 		"drop_privileges": cfg.UID != nil,
 		"qemu_emulation":  cfg.QEMUEmulation != nil,
-		"USE_VSOCK":       cfg.UseVsock && cfg.CommandLoop, // Only enable vsock for command loop mode
+		"USE_VSOCK":       cfg.CommandLoop, // Vsock is always enabled for command loop mode
 	}
 
 	// Build config values for pure RTG helpers
@@ -178,26 +170,14 @@ func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
 		config["resolv_content"] = ""
 	}
 
-	// Add physical addresses to config (use defaults if not specified)
-	mailboxAddr := cfg.MailboxPhysAddr
-	if mailboxAddr == 0 {
-		mailboxAddr = 0xf0000000
-	}
-	config["MAILBOX_PHYS_ADDR"] = int64(mailboxAddr)
-
+	// Add timeslice MMIO address (use default if not specified)
 	timesliceAddr := cfg.TimesliceMMIOPhysAddr
 	if timesliceAddr == 0 {
 		timesliceAddr = 0xf0001000
 	}
 	config["TIMESLICE_MMIO_PHYS_ADDR"] = int64(timesliceAddr)
 
-	configAddr := cfg.ConfigRegionPhysAddr
-	if configAddr == 0 {
-		configAddr = 0xf0003000
-	}
-	config["CONFIG_REGION_PHYS_ADDR"] = int64(configAddr)
-
-	// Add vsock command port (used when USE_VSOCK is enabled)
+	// Add vsock command port (used for command loop mode)
 	vsockCmdPort := cfg.VsockCmdPort
 	if vsockCmdPort == 0 {
 		vsockCmdPort = 9997 // Default command port
@@ -274,32 +254,17 @@ func injectContainerInitHelpers(prog *ir.Program, cfg ContainerInitConfig) error
 
 	// Command execution helpers
 	if cfg.CommandLoop {
-		if cfg.UseVsock {
-			// Vsock command loop mode: inject forkExecWaitFromBuffer helper
-			// This reads command from a buffer (populated from vsock) and executes it
-			forkBufferErrLabel := ir.Label("__cc_forkbuffer_error")
+		// Command loop mode: inject forkExecWaitFromBuffer helper
+		// This reads command from a buffer (populated from vsock) and executes it
+		forkBufferErrLabel := ir.Label("__cc_forkbuffer_error")
 
-			prog.Methods["forkExecWaitFromBuffer"] = ir.Method{
-				ForkExecWaitFromBuffer(cfg.Arch, cfg.Env, cfg.TimesliceMMIOPhysAddr, forkBufferErrLabel, errVar),
-				ir.Return(errVar),
-				ir.DeclareLabel(forkBufferErrLabel, ir.Block{
-					ir.Printf("cc: forkExecWaitFromBuffer error: errno=0x%x\n", errVar),
-					rebootFragment(cfg.Arch),
-				}),
-			}
-		} else {
-			// MMIO command loop mode: inject forkExecWaitFromConfig helper
-			// This reads command from config region and executes it
-			forkConfigErrLabel := ir.Label("__cc_forkconfig_error")
-
-			prog.Methods["forkExecWaitFromConfig"] = ir.Method{
-				ForkExecWaitFromConfig(cfg.Arch, cfg.Env, cfg.ConfigRegionPhysAddr, cfg.TimesliceMMIOPhysAddr, forkConfigErrLabel, errVar),
-				ir.Return(errVar),
-				ir.DeclareLabel(forkConfigErrLabel, ir.Block{
-					ir.Printf("cc: forkExecWaitFromConfig error: errno=0x%x\n", errVar),
-					rebootFragment(cfg.Arch),
-				}),
-			}
+		prog.Methods["forkExecWaitFromBuffer"] = ir.Method{
+			ForkExecWaitFromBuffer(cfg.Arch, cfg.Env, cfg.TimesliceMMIOPhysAddr, forkBufferErrLabel, errVar),
+			ir.Return(errVar),
+			ir.DeclareLabel(forkBufferErrLabel, ir.Block{
+				ir.Printf("cc: forkExecWaitFromBuffer error: errno=0x%x\n", errVar),
+				rebootFragment(cfg.Arch),
+			}),
 		}
 	} else {
 		// Legacy mode: inject baked-in command helpers
