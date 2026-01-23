@@ -65,8 +65,14 @@ func (f *instanceFS) ReadFile(name string) ([]byte, error) {
 	// Use the ContainerFS directly for efficient reads
 	cfs := f.inst.src.cfs
 
-	// Lookup the file in the container filesystem
-	entry, err := cfs.Lookup(name)
+	// Resolve symlinks to get the actual file path
+	resolvedPath, err := cfs.ResolvePath(name)
+	if err != nil {
+		return nil, &Error{Op: "readfile", Path: name, Err: err}
+	}
+
+	// Lookup the resolved file in the container filesystem
+	entry, err := cfs.Lookup(resolvedPath)
 	if err != nil {
 		return nil, &Error{Op: "readfile", Path: name, Err: err}
 	}

@@ -13,6 +13,15 @@ var (
 	ErrNotRunning    = errors.New("instance not running")
 	ErrAlreadyClosed = errors.New("instance already closed")
 	ErrTimeout       = errors.New("operation timed out")
+
+	// ErrHypervisorUnavailable indicates the hypervisor is not available.
+	// This can happen when:
+	// - Running on a platform without hypervisor support
+	// - Missing permissions (e.g., macOS entitlements, Linux /dev/kvm access)
+	// - Running in a VM or container without nested virtualization
+	//
+	// Use errors.Is(err, cc.ErrHypervisorUnavailable) to check and skip tests in CI.
+	ErrHypervisorUnavailable = errors.New("hypervisor unavailable")
 )
 
 // generateID returns a new unique identifier for instances.

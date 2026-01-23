@@ -62,6 +62,15 @@ var (
 	ErrNotRunning    = api.ErrNotRunning
 	ErrAlreadyClosed = api.ErrAlreadyClosed
 	ErrTimeout       = api.ErrTimeout
+
+	// ErrHypervisorUnavailable indicates the hypervisor is not available.
+	// This can happen when:
+	// - Running on a platform without hypervisor support
+	// - Missing permissions (e.g., macOS entitlements, Linux /dev/kvm access)
+	// - Running in a VM or container without nested virtualization
+	//
+	// Use errors.Is(err, cc.ErrHypervisorUnavailable) to check and skip tests in CI.
+	ErrHypervisorUnavailable = api.ErrHypervisorUnavailable
 )
 
 // -----------------------------------------------------------------------------
@@ -171,4 +180,25 @@ func NewOCIClient() (OCIClient, error) {
 // Close when finished to release resources.
 func New(source InstanceSource, opts ...Option) (Instance, error) {
 	return api.New(source, opts...)
+}
+
+// EnsureExecutableIsSigned checks if the current executable is signed with
+// the hypervisor entitlement (macOS only). If not, it signs the executable
+// and re-executes itself. This is useful for test binaries.
+//
+// On non-macOS platforms, this is a no-op.
+//
+// Call this at the start of TestMain(). If signing and re-exec succeed,
+// this function does not return. If already signed, it returns nil.
+//
+// Example:
+//
+//	func TestMain(m *testing.M) {
+//	    if err := cc.EnsureExecutableIsSigned(); err != nil {
+//	        log.Fatalf("Failed to sign executable: %v", err)
+//	    }
+//	    os.Exit(m.Run())
+//	}
+func EnsureExecutableIsSigned() error {
+	return api.EnsureExecutableIsSigned()
 }

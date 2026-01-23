@@ -93,7 +93,7 @@ func (inst *instance) start() error {
 	// Open hypervisor
 	inst.h, err = factory.Open()
 	if err != nil {
-		return &Error{Op: "new", Err: fmt.Errorf("open hypervisor: %w", err)}
+		return &Error{Op: "new", Err: fmt.Errorf("%w: %v", ErrHypervisorUnavailable, err)}
 	}
 
 	arch := inst.src.arch
