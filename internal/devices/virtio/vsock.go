@@ -514,7 +514,11 @@ func (v *Vsock) sendData(dev device, conn *vsockConnection, data []byte) {
 
 // readFromBackend reads data from the backend and sends to guest.
 func (v *Vsock) readFromBackend(dev device, conn *vsockConnection) {
-	buf := make([]byte, 4096)
+	// Use 3072-byte chunks to ensure total packet (header + data) fits in common
+	// kernel RX buffers. The vsock header is 44 bytes, so 3072 + 44 = 3116 total.
+	// Linux kernel typically provides buffers <= 4KB, and we've observed 3776-byte
+	// buffers in practice. Using 3072 provides comfortable margin.
+	buf := make([]byte, 3072)
 	for {
 		n, err := conn.backend.Read(buf)
 		if err != nil {
@@ -603,43 +607,41 @@ func (v *Vsock) processRxQueue(dev device, q *queue) error {
 // tryDeliverRx attempts to deliver pending RX packets.
 func (v *Vsock) tryDeliverRx(dev device) {
 	q := dev.queue(vsockQueueRX)
-	if q != nil {
-		// Note: we already hold v.mu, so we call the inner logic directly
-		if !QueueReady(q) {
-			return
-		}
+	if q == nil || !QueueReady(q) {
+		return
+	}
 
-		_, availIdx, err := dev.readAvailState(q)
+	// Note: we already hold v.mu, so we call the inner logic directly
+	_, availIdx, err := dev.readAvailState(q)
+	if err != nil {
+		return
+	}
+
+	var anyProcessed bool
+	for q.lastAvailIdx != availIdx && len(v.pendingRx) > 0 {
+		ringIndex := q.lastAvailIdx % q.size
+		head, err := dev.readAvailEntry(q, ringIndex)
 		if err != nil {
 			return
 		}
 
-		var anyProcessed bool
-		for q.lastAvailIdx != availIdx && len(v.pendingRx) > 0 {
-			ringIndex := q.lastAvailIdx % q.size
-			head, err := dev.readAvailEntry(q, ringIndex)
-			if err != nil {
-				return
-			}
-
-			packet := v.pendingRx[0]
-			written, _, err := FillDescriptorChain(dev, q, head, packet)
-			if err != nil {
-				return
-			}
-
-			if err := dev.recordUsedElement(q, head, written); err != nil {
-				return
-			}
-
-			v.pendingRx = v.pendingRx[1:]
-			q.lastAvailIdx++
-			anyProcessed = true
+		packet := v.pendingRx[0]
+		written, _, err := FillDescriptorChain(dev, q, head, packet)
+		if err != nil {
+			return
 		}
 
-		if anyProcessed {
-			dev.raiseInterrupt(vsockInterruptBit)
+		if err := dev.recordUsedElement(q, head, written); err != nil {
+			return
 		}
+
+		v.pendingRx = v.pendingRx[1:]
+		q.lastAvailIdx++
+		anyProcessed = true
+	}
+
+	if anyProcessed {
+		dev.raiseInterrupt(vsockInterruptBit)
 	}
 }
 
