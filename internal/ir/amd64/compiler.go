@@ -304,13 +304,66 @@ func (c *compiler) compileGoto(g ir.GotoFragment) error {
 	return nil
 }
 
+// callArgRegisters defines the System V AMD64 ABI argument registers.
+var callArgRegisters = []asm.Variable{amd64.RDI, amd64.RSI, amd64.RDX, amd64.RCX, amd64.R8, amd64.R9}
+
 func (c *compiler) compileCall(f ir.CallFragment) error {
+	// Maximum 6 arguments for System V AMD64 ABI
+	if len(f.Args) > len(callArgRegisters) {
+		return fmt.Errorf("ir: too many arguments for function call (max %d, got %d)", len(callArgRegisters), len(f.Args))
+	}
+
+	// Evaluate target first (before we mess with argument registers)
 	targetReg, _, err := c.evalValue(f.Target)
 	if err != nil {
 		return err
 	}
+
+	// If target is in an argument register, save it to a safe place
+	targetIsSafe := true
+	for _, argReg := range callArgRegisters[:len(f.Args)] {
+		if targetReg == argReg {
+			targetIsSafe = false
+			break
+		}
+	}
+	if !targetIsSafe {
+		// Move target to R11 which is caller-saved but not used for arguments
+		c.emit(amd64.MovReg(amd64.Reg64(amd64.R11), amd64.Reg64(targetReg)))
+		c.freeReg(targetReg)
+		targetReg = amd64.R11
+		c.reserveReg(amd64.R11)
+	}
+
+	// Evaluate all arguments into temporary registers
+	argRegs := make([]asm.Variable, len(f.Args))
+	for i, arg := range f.Args {
+		reg, _, err := c.evalValue(arg)
+		if err != nil {
+			// Free any already-allocated arg registers
+			for j := 0; j < i; j++ {
+				c.freeReg(argRegs[j])
+			}
+			c.freeReg(targetReg)
+			return err
+		}
+		argRegs[i] = reg
+	}
+
+	// Move arguments into calling convention registers
+	for i, reg := range argRegs {
+		destReg := callArgRegisters[i]
+		if reg != destReg {
+			c.emit(amd64.MovReg(amd64.Reg64(destReg), amd64.Reg64(reg)))
+		}
+		c.freeReg(reg)
+	}
+
+	// Call the target
 	c.emit(amd64.CallReg(amd64.Reg64(targetReg)))
 	c.freeReg(targetReg)
+
+	// Store result if needed
 	if f.Result != "" {
 		mem, err := c.stackSlotMem(string(f.Result))
 		if err != nil {
@@ -428,7 +481,12 @@ func (c *compiler) storeValue(dst ir.Fragment, reg asm.Variable, width ir.ValueW
 			return err
 		}
 		mem := amd64.Mem(amd64.Reg64(baseReg)).WithDisp(disp)
-		switch width {
+		// Use the destination's width if specified, otherwise fall back to source width
+		dstWidth := dest.Width
+		if dstWidth == 0 {
+			dstWidth = width
+		}
+		switch dstWidth {
 		case ir.Width8:
 			c.emit(amd64.MovToMemory(mem, amd64.Reg8(reg)))
 		case ir.Width32:
@@ -449,7 +507,12 @@ func (c *compiler) storeValue(dst ir.Fragment, reg asm.Variable, width ir.ValueW
 			return err
 		}
 		mem := amd64.Mem(amd64.Reg64(baseReg)).WithDisp(disp)
-		switch width {
+		// Use the destination's width if specified, otherwise fall back to source width
+		dstWidth := dest.Width
+		if dstWidth == 0 {
+			dstWidth = width
+		}
+		switch dstWidth {
 		case ir.Width8:
 			c.emit(amd64.MovToMemory(mem, amd64.Reg8(reg)))
 		case ir.Width32:
@@ -592,6 +655,17 @@ func (c *compiler) compileSyscall(sc ir.SyscallFragment, needResult bool) (asm.V
 			c.emit(amd64.MovReg(amd64.Reg64(reg), amd64.Reg64(amd64.RSP)))
 			if offset != 0 {
 				c.emit(amd64.AddRegImm(amd64.Reg64(reg), offset))
+			}
+			args[idx] = asm.Variable(reg)
+			regs = append(regs, reg)
+		case ir.OpFragment:
+			// Evaluate the expression
+			reg, _, err := c.evalValue(a)
+			if err != nil {
+				for _, r := range regs {
+					c.freeReg(r)
+				}
+				return 0, err
 			}
 			args[idx] = asm.Variable(reg)
 			regs = append(regs, reg)
@@ -1160,6 +1234,14 @@ func collectVariables(f ir.Fragment, vars map[string]struct{}) {
 		if v.Disp != nil {
 			collectVariables(v.Disp, vars)
 		}
+	case ir.CallFragment:
+		collectVariables(v.Target, vars)
+		for _, arg := range v.Args {
+			collectVariables(arg, vars)
+		}
+		if v.Result != "" {
+			vars[string(v.Result)] = struct{}{}
+		}
 	case ir.ConstantBytesFragment:
 		// constants do not reference stack variables
 	case ir.ConstantPointerFragment:
@@ -1200,6 +1282,9 @@ func collectGlobals(f ir.Fragment, globals map[string]struct{}) {
 		}
 	case ir.CallFragment:
 		collectGlobals(v.Target, globals)
+		for _, arg := range v.Args {
+			collectGlobals(arg, globals)
+		}
 	case ir.OpFragment:
 		collectGlobals(v.Left, globals)
 		collectGlobals(v.Right, globals)

@@ -299,6 +299,7 @@ func Goto(label Fragment) Fragment {
 
 type CallFragment struct {
 	Target Fragment
+	Args   []Fragment // Arguments to pass to the function
 	Result Var
 }
 
@@ -311,6 +312,22 @@ func Call(target any, result ...Var) Fragment {
 	}
 	return CallFragment{
 		Target: asFragment(target),
+		Result: res,
+	}
+}
+
+// CallWithArgs emits a call with arguments. Arguments are passed via registers
+// according to the calling convention (System V AMD64 ABI for x86-64, AAPCS64
+// for ARM64). When result is specified the callee's return value is stored
+// into that variable.
+func CallWithArgs(target any, args []Fragment, result ...Var) Fragment {
+	var res Var
+	if len(result) > 0 {
+		res = result[0]
+	}
+	return CallFragment{
+		Target: asFragment(target),
+		Args:   args,
 		Result: res,
 	}
 }
