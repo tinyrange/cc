@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/tinyrange/cc/internal/debug"
@@ -328,6 +329,155 @@ var (
 	_ hv.DeviceTemplate       = &programLoader{}
 )
 
+// VsockProgramServer handles program loading via vsock.
+// Protocol:
+//   - Host → Guest: [len:4][code_len:4][reloc_count:4][relocs:4*count][code:code_len]
+//   - Guest → Host: [len:4][exit_code:4]
+const (
+	VsockProgramPort = 9998
+)
+
+// VsockProgramServer is the host-side server for vsock-based program loading.
+type VsockProgramServer struct {
+	listener virtio.VsockListener
+	conn     virtio.VsockConn
+	arch     hv.CpuArchitecture
+	mu       sync.Mutex
+}
+
+// NewVsockProgramServer creates a new vsock program server listening on the specified port.
+func NewVsockProgramServer(backend virtio.VsockBackend, port uint32, arch hv.CpuArchitecture) (*VsockProgramServer, error) {
+	listener, err := backend.Listen(port)
+	if err != nil {
+		return nil, fmt.Errorf("listen on port %d: %w", port, err)
+	}
+	return &VsockProgramServer{
+		listener: listener,
+		arch:     arch,
+	}, nil
+}
+
+// Accept waits for a guest connection.
+func (s *VsockProgramServer) Accept() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	conn, err := s.listener.Accept()
+	if err != nil {
+		return fmt.Errorf("accept connection: %w", err)
+	}
+	s.conn = conn
+	return nil
+}
+
+// SendProgram sends a compiled program to the guest.
+func (s *VsockProgramServer) SendProgram(prog *ir.Program) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.conn == nil {
+		return fmt.Errorf("no connection established")
+	}
+
+	asmProg, err := ir.BuildStandaloneProgramForArch(s.arch, prog)
+	if err != nil {
+		return fmt.Errorf("build standalone program: %w", err)
+	}
+
+	progBytes := asmProg.Bytes()
+	relocs := asmProg.Relocations()
+
+	// Calculate total message size: code_len(4) + reloc_count(4) + relocs(4*N) + code
+	payloadLen := 4 + 4 + 4*len(relocs) + len(progBytes)
+
+	// Build the message
+	msg := make([]byte, 4+payloadLen) // len prefix + payload
+
+	// Length prefix (excludes itself)
+	binary.LittleEndian.PutUint32(msg[0:4], uint32(payloadLen))
+
+	// code_len
+	binary.LittleEndian.PutUint32(msg[4:8], uint32(len(progBytes)))
+
+	// reloc_count
+	binary.LittleEndian.PutUint32(msg[8:12], uint32(len(relocs)))
+
+	// relocations
+	for i, reloc := range relocs {
+		binary.LittleEndian.PutUint32(msg[12+4*i:], uint32(reloc))
+	}
+
+	// code
+	copy(msg[12+4*len(relocs):], progBytes)
+
+	// Write the entire message
+	if _, err := s.conn.Write(msg); err != nil {
+		return fmt.Errorf("write program: %w", err)
+	}
+
+	return nil
+}
+
+// WaitResult waits for and returns the exit code from the guest.
+func (s *VsockProgramServer) WaitResult(ctx context.Context) (int32, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.conn == nil {
+		return -1, fmt.Errorf("no connection established")
+	}
+
+	// Read length prefix (4 bytes) + exit code (4 bytes)
+	buf := make([]byte, 8)
+	done := make(chan error, 1)
+
+	go func() {
+		_, err := io.ReadFull(s.conn, buf)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return -1, fmt.Errorf("read result: %w", err)
+		}
+	case <-ctx.Done():
+		return -1, ctx.Err()
+	}
+
+	length := binary.LittleEndian.Uint32(buf[0:4])
+	if length != 4 {
+		return -1, fmt.Errorf("unexpected result length: %d", length)
+	}
+
+	exitCode := int32(binary.LittleEndian.Uint32(buf[4:8]))
+	return exitCode, nil
+}
+
+// Close closes the server and any active connection.
+func (s *VsockProgramServer) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var errs []error
+	if s.conn != nil {
+		if err := s.conn.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		s.conn = nil
+	}
+	if s.listener != nil {
+		if err := s.listener.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		s.listener = nil
+	}
+	if len(errs) > 0 {
+		return errs[0]
+	}
+	return nil
+}
+
 type programRunner struct {
 	configRegion hv.MemoryRegion
 	loader       *programLoader
@@ -426,9 +576,18 @@ type VirtualMachine struct {
 	// pendingSnapshot holds a snapshot to restore after VM creation.
 	// Set by WithSnapshot option.
 	pendingSnapshot hv.Snapshot
+
+	// Vsock program loading
+	vsockProgramServer  *VsockProgramServer
+	vsockProgramBackend virtio.VsockBackend
+	vsockProgramPort    uint32
+	useVsockLoader      bool
 }
 
 func (vm *VirtualMachine) Close() error {
+	if vm.vsockProgramServer != nil {
+		vm.vsockProgramServer.Close()
+	}
 	return vm.vm.Close()
 }
 
@@ -474,7 +633,99 @@ func (vm *VirtualMachine) StartStdinForwarding() {
 }
 
 func (vm *VirtualMachine) Run(ctx context.Context, prog *ir.Program) error {
+	// If vsock loader is enabled and we have a server, use vsock path
+	if vm.useVsockLoader && vm.vsockProgramServer != nil {
+		// First run boots the kernel, then accept vsock connection
+		if !vm.firstRunComplete {
+			if err := vm.runFirstRunVsock(ctx); err != nil {
+				return err
+			}
+		}
+		return vm.runProgramVsock(ctx, prog)
+	}
 	return vm.runProgram(ctx, prog, nil)
+}
+
+// runFirstRunVsock handles the initial boot and vsock connection acceptance.
+func (vm *VirtualMachine) runFirstRunVsock(ctx context.Context) error {
+	// Boot the kernel (this will run init which connects to vsock)
+	// We use a dummy program that immediately returns - init will handle the actual
+	// program loading via vsock
+	configureVcpu := func(vcpu hv.VirtualCPU) error {
+		return vm.loader.ConfigureVCPU(vcpu)
+	}
+	vm.firstRunComplete = true
+
+	// Start the VM in a goroutine so we can accept the vsock connection
+	vmDone := make(chan error, 1)
+	go func() {
+		err := vm.vm.Run(ctx, &programRunner{
+			configRegion: vm.configRegion,
+			program: &ir.Program{
+				Entrypoint: "main",
+				Methods: map[string]ir.Method{
+					"main": {ir.Return(ir.Int64(0))},
+				},
+			},
+			loader:        vm.programLoader,
+			configureVcpu: configureVcpu,
+		})
+		// The VM will keep running (init's main loop), but we need to accept
+		// the vsock connection. Any error here is not necessarily fatal.
+		vmDone <- err
+	}()
+
+	// Accept the vsock connection from the guest
+	acceptDone := make(chan error, 1)
+	go func() {
+		acceptDone <- vm.vsockProgramServer.Accept()
+	}()
+
+	// Wait for either the accept to complete or the VM to exit
+	select {
+	case err := <-acceptDone:
+		if err != nil {
+			return fmt.Errorf("accept vsock connection: %w", err)
+		}
+		debug.Writef("initx.runFirstRunVsock", "vsock connection accepted")
+		return nil
+	case err := <-vmDone:
+		if err != nil && !errors.Is(err, hv.ErrYield) {
+			return fmt.Errorf("VM exited during vsock accept: %w", err)
+		}
+		// VM yielded but we haven't accepted yet - wait for accept
+		select {
+		case err := <-acceptDone:
+			if err != nil {
+				return fmt.Errorf("accept vsock connection after yield: %w", err)
+			}
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// runProgramVsock runs a program using the vsock protocol.
+func (vm *VirtualMachine) runProgramVsock(ctx context.Context, prog *ir.Program) error {
+	// Send program over vsock
+	if err := vm.vsockProgramServer.SendProgram(prog); err != nil {
+		return fmt.Errorf("send program via vsock: %w", err)
+	}
+
+	// Wait for result
+	exitCode, err := vm.vsockProgramServer.WaitResult(ctx)
+	if err != nil {
+		return fmt.Errorf("wait for vsock result: %w", err)
+	}
+
+	if exitCode != 0 {
+		return &ExitError{Code: int(exitCode)}
+	}
+
+	return nil
 }
 
 func (vm *VirtualMachine) Architecture() hv.CpuArchitecture {
@@ -777,6 +1028,18 @@ func WithSnapshot(snap hv.Snapshot) Option {
 	})
 }
 
+// WithVsockProgramLoader configures the VM to use vsock for program loading.
+// The vsock backend must already have a vsock device added to the VM.
+// This option should be used together with a vsock device template.
+func WithVsockProgramLoader(backend virtio.VsockBackend, port uint32) Option {
+	return funcOption(func(vm *VirtualMachine) error {
+		vm.vsockProgramBackend = backend
+		vm.vsockProgramPort = port
+		vm.useVsockLoader = true
+		return nil
+	})
+}
+
 // consoleCapturingTemplate wraps a ConsoleTemplate to capture the created device reference.
 type consoleCapturingTemplate struct {
 	inner  virtio.ConsoleTemplate
@@ -941,6 +1204,8 @@ func NewVirtualMachine(
 				Arch:                 arch,
 				MailboxPhysAddr:      ret.mailboxPhysAddr,
 				ConfigRegionPhysAddr: ret.configRegionPhysAddr,
+				UseVsock:             ret.useVsockLoader,
+				VsockPort:            ret.vsockProgramPort,
 			}
 
 			modules, err := kernelLoader.PlanModuleLoad(
@@ -1156,6 +1421,20 @@ func NewVirtualMachine(
 		}
 		ret.firstRunComplete = true // Mark as booted since snapshot is post-boot state
 		rec.Record(tsInitxNewVMRestoreSnap)
+	}
+
+	// Create vsock program server if vsock loader is enabled
+	if ret.useVsockLoader && ret.vsockProgramBackend != nil {
+		port := ret.vsockProgramPort
+		if port == 0 {
+			port = VsockProgramPort
+		}
+		server, err := NewVsockProgramServer(ret.vsockProgramBackend, port, h.Architecture())
+		if err != nil {
+			ret.vm.Close()
+			return nil, fmt.Errorf("create vsock program server: %w", err)
+		}
+		ret.vsockProgramServer = server
 	}
 
 	rec.Record(tsInitxNewVMDone)

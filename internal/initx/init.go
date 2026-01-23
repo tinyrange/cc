@@ -38,6 +38,13 @@ type BuilderConfig struct {
 	// ConfigRegionPhysAddr is the physical address of the config region.
 	// If 0, uses the default value (for backwards compatibility).
 	ConfigRegionPhysAddr uint64
+
+	// UseVsock enables vsock-based program loading instead of MMIO.
+	UseVsock bool
+
+	// VsockPort is the vsock port to use for program loading.
+	// If 0, uses the default port (9998).
+	VsockPort uint32
 }
 
 const (
@@ -161,10 +168,25 @@ func BuildFromRTG(cfg BuilderConfig) (*ir.Program, error) {
 			1)
 	}
 
-	// Compile the RTG source with architecture information
-	prog, err := rtg.CompileProgramWithOptions(source, rtg.CompileOptions{
+	// Set up compile options with vsock configuration
+	// Always provide VSOCK_PORT config since the RTG compiler processes
+	// all code paths, not just the ones that will be taken at runtime
+	port := cfg.VsockPort
+	if port == 0 {
+		port = 9998 // Default vsock port
+	}
+	compileOpts := rtg.CompileOptions{
 		GOARCH: goarch,
-	})
+		Flags: map[string]bool{
+			"USE_VSOCK": cfg.UseVsock,
+		},
+		Config: map[string]any{
+			"VSOCK_PORT": int64(port),
+		},
+	}
+
+	// Compile the RTG source with architecture information
+	prog, err := rtg.CompileProgramWithOptions(source, compileOpts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compile RTG init source: %w", err)
 	}
