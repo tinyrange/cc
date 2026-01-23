@@ -1584,6 +1584,255 @@ func ForkExecWaitFromConfig(arch hv.CpuArchitecture, defaultEnv []string, config
 	}
 }
 
+// ForkExecWaitFromBuffer is like ForkExecWaitFromConfig but reads the command from a buffer.
+// The buffer contains: path\0 + args\0...\0 + envs\0...\0
+// Parameters (passed as RTG function parameters):
+//   - bufPtr: pointer to buffer containing command data
+//   - pathLen: length of path string
+//   - argc: number of arguments
+//   - envc: number of environment variables
+//
+// This is used by vsock command loop mode where commands are received over vsock.
+func ForkExecWaitFromBuffer(arch hv.CpuArchitecture, defaultEnv []string, timeslicePhysAddr uint64, errLabel ir.Label, errVar ir.Var) ir.Fragment {
+	if timeslicePhysAddr == 0 {
+		timeslicePhysAddr = forkExecTimeslicePhysAddr
+	}
+
+	// Variables for command data (populated from function parameters)
+	bufPtr := ir.Var("bufPtr")
+	pathLen := ir.Var("pathLen")
+	argc := ir.Var("argc")
+	envc := ir.Var("envc")
+
+	pid := ir.Var("fecb_pid")
+	status := ir.Var("fecb_status")
+	signal := ir.Var("fecb_signal")
+	exitCode := ir.Var("fecb_exit_code")
+	memFd := ir.Var("fecb_mem_fd")
+	tsPtr := ir.Var("fecb_ts_ptr")
+
+	// Command parsing variables
+	pathPtr := ir.Var("fecb_path_ptr")
+	argvPtr := ir.Var("fecb_argv_ptr")
+	envpPtr := ir.Var("fecb_envp_ptr")
+	currentPtr := ir.Var("fecb_current_ptr")
+	argIdx := ir.Var("fecb_arg_idx")
+	envIdx := ir.Var("fecb_env_idx")
+	charVal := ir.Var("fecb_char_val")
+
+	argLoop := nextHelperLabel("fecb_arg_loop")
+	argFindNull := nextHelperLabel("fecb_arg_find_null")
+	envLoop := nextHelperLabel("fecb_env_loop")
+	envFindNull := nextHelperLabel("fecb_env_find_null")
+
+	// Helper to emit a timeslice marker
+	emitTs := func(id int64) ir.Fragment {
+		return ir.If(ir.IsGreaterThan(tsPtr, ir.Int64(0)), ir.Block{
+			ir.Assign(tsPtr.Mem().As32(), ir.Int32(int32(id))),
+		})
+	}
+
+	maxPointers := 128 // Support up to 127 args/envs combined
+	slotSize := int64(maxPointers * 8)
+
+	return ir.Block{
+		// Declare parameters (these will be filled by the RTG compiler from function args)
+		ir.DeclareParam("bufPtr"),
+		ir.DeclareParam("pathLen"),
+		ir.DeclareParam("argc"),
+		ir.DeclareParam("envc"),
+
+		// Map timeslice MMIO for instrumentation (optional)
+		ir.Assign(tsPtr, ir.Int64(0)),
+		ir.Assign(memFd, ir.Syscall(
+			defs.SYS_OPENAT,
+			ir.Int64(linux.AT_FDCWD),
+			"/dev/mem",
+			ir.Int64(linux.O_RDWR|linux.O_SYNC),
+			ir.Int64(0),
+		)),
+		ir.If(ir.IsGreaterOrEqual(memFd, ir.Int64(0)), ir.Block{
+			ir.Assign(tsPtr, ir.Syscall(
+				defs.SYS_MMAP,
+				ir.Int64(0),
+				ir.Int64(forkExecTimesliceMapSize),
+				ir.Int64(linux.PROT_READ|linux.PROT_WRITE),
+				ir.Int64(linux.MAP_SHARED),
+				memFd,
+				ir.Int64(int64(timeslicePhysAddr)),
+			)),
+			ir.Syscall(defs.SYS_CLOSE, memFd),
+			ir.If(ir.IsNegative(tsPtr), ir.Assign(tsPtr, ir.Int64(0))),
+		}),
+
+		ir.WithStackSlot(ir.StackSlotConfig{
+			Size: slotSize,
+			Body: func(slot ir.StackSlot) ir.Fragment {
+				return ir.Block{
+					// pathPtr points directly to bufPtr (path is first in buffer)
+					ir.Assign(pathPtr, bufPtr),
+
+					// argv array starts at slot base
+					ir.Assign(argvPtr, slot.Pointer()),
+
+					// Skip path to find start of args
+					// currentPtr = bufPtr + pathLen + 1 (skip null terminator)
+					ir.Assign(currentPtr, ir.Op(ir.OpAdd, bufPtr, pathLen)),
+					ir.Assign(currentPtr, ir.Op(ir.OpAdd, currentPtr, ir.Int64(1))),
+
+					// Build argv array: first entry is path, then args from buffer
+					ir.Assign(slot.At(0), pathPtr),
+					ir.Assign(argIdx, ir.Int64(1)),
+
+					// Copy arg pointers
+					ir.DeclareLabel(argLoop, ir.Block{
+						ir.If(ir.IsGreaterOrEqual(argIdx, ir.Op(ir.OpAdd, argc, ir.Int64(1))), ir.Block{
+							// Done with args - store NULL terminator
+							ir.Assign(ir.Var("fecb_argv_term_offset"), ir.Op(ir.OpShl, argIdx, ir.Int64(3))),
+							ir.Assign(ir.Var("fecb_argv_term_ptr"), ir.Op(ir.OpAdd, argvPtr, ir.Var("fecb_argv_term_offset"))),
+							ir.Assign(ir.Var("fecb_argv_term_ptr").Mem(), ir.Int64(0)),
+							ir.Goto(envLoop),
+						}),
+						// Store pointer to current arg
+						ir.Assign(ir.Var("fecb_argv_offset"), ir.Op(ir.OpShl, argIdx, ir.Int64(3))),
+						ir.Assign(ir.Var("fecb_argv_slot_ptr"), ir.Op(ir.OpAdd, argvPtr, ir.Var("fecb_argv_offset"))),
+						ir.Assign(ir.Var("fecb_argv_slot_ptr").Mem(), currentPtr),
+						// Advance to next arg (find null terminator)
+						ir.Goto(argFindNull),
+					}),
+
+					ir.DeclareLabel(argFindNull, ir.Block{
+						ir.Assign(charVal, currentPtr.Mem().As8()),
+						ir.Assign(currentPtr, ir.Op(ir.OpAdd, currentPtr, ir.Int64(1))),
+						ir.If(ir.IsNotEqual(charVal, ir.Int64(0)), ir.Goto(argFindNull)),
+						// Found null, currentPtr now points to next arg
+						ir.Assign(argIdx, ir.Op(ir.OpAdd, argIdx, ir.Int64(1))),
+						ir.Goto(argLoop),
+					}),
+
+					ir.DeclareLabel(envLoop, ir.Block{
+						// envpPtr = argvPtr + (argc + 2) * 8 (argc + 1 for path, + 1 for NULL terminator)
+						ir.Assign(envpPtr, ir.Op(ir.OpShl, ir.Op(ir.OpAdd, argc, ir.Int64(2)), ir.Int64(3))),
+						ir.Assign(envpPtr, ir.Op(ir.OpAdd, argvPtr, envpPtr)),
+
+						// First, add default environment variables
+						func() ir.Fragment {
+							var frags []ir.Fragment
+							for i, env := range defaultEnv {
+								ptrVar := ir.Var(fmt.Sprintf("fecb_defenv_%d_ptr", i))
+								frags = append(frags,
+									ir.LoadConstantBytesConfig(ir.ConstantBytesConfig{
+										Target:        nextExecVar(),
+										Data:          []byte(env),
+										ZeroTerminate: true,
+										Pointer:       ptrVar,
+									}),
+									ir.Assign(ir.Var("fecb_envp_offset"), ir.Int64(int64(i*8))),
+									ir.Assign(ir.Var("fecb_envp_slot_ptr"), ir.Op(ir.OpAdd, envpPtr, ir.Var("fecb_envp_offset"))),
+									ir.Assign(ir.Var("fecb_envp_slot_ptr").Mem(), ptrVar),
+								)
+							}
+							return ir.Block(frags)
+						}(),
+
+						// Now add environment from buffer
+						ir.Assign(envIdx, ir.Int64(int64(len(defaultEnv)))),
+						ir.Goto(ir.Label("fecb_env_copy_loop")),
+					}),
+
+					ir.DeclareLabel(ir.Label("fecb_env_copy_loop"), ir.Block{
+						ir.If(ir.IsGreaterOrEqual(envIdx, ir.Op(ir.OpAdd, envc, ir.Int64(int64(len(defaultEnv))))), ir.Block{
+							// Done with envs - store NULL terminator
+							ir.Assign(ir.Var("fecb_envp_term_offset"), ir.Op(ir.OpShl, envIdx, ir.Int64(3))),
+							ir.Assign(ir.Var("fecb_envp_term_ptr"), ir.Op(ir.OpAdd, envpPtr, ir.Var("fecb_envp_term_offset"))),
+							ir.Assign(ir.Var("fecb_envp_term_ptr").Mem(), ir.Int64(0)),
+							ir.Goto(ir.Label("fecb_do_fork")),
+						}),
+						// Store pointer to current env
+						ir.Assign(ir.Var("fecb_envp_offset"), ir.Op(ir.OpShl, envIdx, ir.Int64(3))),
+						ir.Assign(ir.Var("fecb_envp_slot_ptr"), ir.Op(ir.OpAdd, envpPtr, ir.Var("fecb_envp_offset"))),
+						ir.Assign(ir.Var("fecb_envp_slot_ptr").Mem(), currentPtr),
+						// Advance to next env (find null terminator)
+						ir.Goto(envFindNull),
+					}),
+
+					ir.DeclareLabel(envFindNull, ir.Block{
+						ir.Assign(charVal, currentPtr.Mem().As8()),
+						ir.Assign(currentPtr, ir.Op(ir.OpAdd, currentPtr, ir.Int64(1))),
+						ir.If(ir.IsNotEqual(charVal, ir.Int64(0)), ir.Goto(envFindNull)),
+						// Found null, currentPtr now points to next env
+						ir.Assign(envIdx, ir.Op(ir.OpAdd, envIdx, ir.Int64(1))),
+						ir.Goto(ir.Label("fecb_env_copy_loop")),
+					}),
+
+					ir.DeclareLabel(ir.Label("fecb_do_fork"), ir.Block{
+						// Emit: fork_start (66)
+						emitTs(tsForkStart),
+
+						ir.Assign(pid, ir.Syscall(defs.SYS_CLONE, ir.Int64(defs.SIGCHLD), 0, 0, 0, 0)),
+						ir.If(ir.IsNegative(pid), ir.Block{
+							ir.Assign(errVar, pid),
+							ir.Goto(errLabel),
+						}),
+						ir.If(ir.IsZero(pid), ir.Block{
+							// Child: exec the command
+							ir.Assign(errVar, ir.Syscall(
+								defs.SYS_EXECVE,
+								pathPtr,
+								argvPtr,
+								envpPtr,
+							)),
+							// If execve returns, it failed
+							ir.Printf("cc: execve failed: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+							ir.Syscall(defs.SYS_EXIT, ir.Int64(1)),
+						}),
+
+						// Emit: fork_done (67) - parent continues here
+						emitTs(tsForkDone),
+
+						// Parent: wait for child
+						ir.WithStackSlot(ir.StackSlotConfig{
+							Size: 8,
+							Body: func(statusSlot ir.StackSlot) ir.Fragment {
+								statusPtr := ir.Var("fecb_status_ptr")
+								return ir.Block{
+									ir.Assign(statusPtr, statusSlot.Pointer()),
+
+									// Emit: wait_start (68)
+									emitTs(tsWaitStart),
+
+									ir.Assign(errVar, ir.Syscall(defs.SYS_WAIT4, pid, statusPtr, ir.Int64(0), ir.Int64(0))),
+
+									// Emit: wait_done (69)
+									emitTs(tsWaitDone),
+
+									ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
+									ir.Assign(status, statusPtr.Mem().As32()),
+									ir.Assign(signal, ir.Op(ir.OpAnd, status, ir.Int64(0x7f))),
+									ir.Assign(exitCode, ir.Op(
+										ir.OpAnd,
+										ir.Op(ir.OpShr, status, ir.Int64(8)),
+										ir.Int64(0xff),
+									)),
+									ir.If(ir.IsNotEqual(signal, ir.Int64(0)), ir.Block{
+										ir.Assign(exitCode, ir.Op(ir.OpAdd, signal, ir.Int64(128))),
+									}),
+									ir.Assign(errVar, exitCode),
+								}
+							},
+						}),
+					}),
+				}
+			},
+		}),
+
+		// Unmap timeslice region
+		ir.If(ir.IsGreaterThan(tsPtr, ir.Int64(0)), ir.Block{
+			ir.Syscall(defs.SYS_MUNMAP, tsPtr, ir.Int64(forkExecTimesliceMapSize)),
+		}),
+	}
+}
+
 // Profiling & Misc
 
 func SetupProfiling(basePtr ir.Var, errLabel ir.Label, errVar ir.Var) ir.Fragment {
