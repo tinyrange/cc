@@ -1685,6 +1685,29 @@ func RunExecutable(path string, gpuEnabled bool) error {
 		cancel()
 	}()
 
+	// Create vsock backend with echo service on port 9999
+	const vsockEchoPort = 9999
+	vsockBackend := virtio.NewSimpleVsockBackend()
+	vsockListener, err := vsockBackend.Listen(vsockEchoPort)
+	if err != nil {
+		return fmt.Errorf("create vsock listener: %w", err)
+	}
+	defer vsockListener.Close()
+
+	// Start vsock echo service
+	go func() {
+		for {
+			conn, err := vsockListener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c virtio.VsockConn) {
+				defer c.Close()
+				io.Copy(c, c) // Echo
+			}(conn)
+		}
+	}()
+
 	// Build VM options
 	vmOptions := []initx.Option{
 		initx.WithFileFromBytes("/initx-exec", fileData, fs.FileMode(0755)),
@@ -1697,6 +1720,14 @@ func RunExecutable(path string, gpuEnabled bool) error {
 			Backend: netBackend,
 			MAC:     guestMAC,
 			Arch:    hv.Architecture(),
+		}),
+		initx.WithDeviceTemplate(virtio.VsockTemplate{
+			MMIODeviceTemplateBase: virtio.MMIODeviceTemplateBase{
+				Arch:   hv.Architecture(),
+				Config: virtio.VsockDeviceConfig(),
+			},
+			GuestCID: 3,
+			Backend:  vsockBackend,
 		}),
 	}
 
