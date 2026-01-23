@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
-	"strings"
 
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/ir"
@@ -168,29 +167,27 @@ func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
 		config["resolv_content"] = ""
 	}
 
-	// Preprocess the source to inject dynamic MMIO addresses
-	source := rtgContainerInitSource
-	if cfg.MailboxPhysAddr != 0 {
-		source = strings.Replace(source,
-			"mailboxPhysAddr       = 0xf0000000",
-			fmt.Sprintf("mailboxPhysAddr       = 0x%x", cfg.MailboxPhysAddr),
-			1)
+	// Add physical addresses to config (use defaults if not specified)
+	mailboxAddr := cfg.MailboxPhysAddr
+	if mailboxAddr == 0 {
+		mailboxAddr = 0xf0000000
 	}
-	if cfg.TimesliceMMIOPhysAddr != 0 {
-		source = strings.Replace(source,
-			"timesliceMMIOPhysAddr = 0xf0001000",
-			fmt.Sprintf("timesliceMMIOPhysAddr = 0x%x", cfg.TimesliceMMIOPhysAddr),
-			1)
+	config["MAILBOX_PHYS_ADDR"] = int64(mailboxAddr)
+
+	timesliceAddr := cfg.TimesliceMMIOPhysAddr
+	if timesliceAddr == 0 {
+		timesliceAddr = 0xf0001000
 	}
-	if cfg.ConfigRegionPhysAddr != 0 {
-		source = strings.Replace(source,
-			"configRegionPhysAddr  = 0xf0003000",
-			fmt.Sprintf("configRegionPhysAddr  = 0x%x", cfg.ConfigRegionPhysAddr),
-			1)
+	config["TIMESLICE_MMIO_PHYS_ADDR"] = int64(timesliceAddr)
+
+	configAddr := cfg.ConfigRegionPhysAddr
+	if configAddr == 0 {
+		configAddr = 0xf0003000
 	}
+	config["CONFIG_REGION_PHYS_ADDR"] = int64(configAddr)
 
 	// Compile the RTG source with architecture, flags, and config
-	prog, err := rtg.CompileProgramWithOptions(source, rtg.CompileOptions{
+	prog, err := rtg.CompileProgramWithOptions(rtgContainerInitSource, rtg.CompileOptions{
 		GOARCH: goarch,
 		Flags:  flags,
 		Config: config,

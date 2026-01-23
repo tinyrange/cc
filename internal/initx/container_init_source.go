@@ -8,15 +8,11 @@ package main
 
 import "github.com/tinyrange/cc/internal/rtg/runtime"
 
-// MMIO configuration
-// These addresses are defaults and may be replaced at compile time for dynamic allocation
+// MMIO configuration sizes (constants)
 const (
-	timesliceMMIOPhysAddr = 0xf0001000
-	timesliceMMIOMapSize  = 0x1000
-	mailboxPhysAddr       = 0xf0000000
-	mailboxMapSize        = 0x1000
-	configRegionPhysAddr  = 0xf0003000
-	configRegionSize      = 4194304 // 4MB
+	timesliceMMIOMapSize = 0x1000
+	mailboxMapSize       = 0x1000
+	configRegionSize     = 4194304 // 4MB
 )
 
 // Timeslice IDs for container init phases (50-99) - must match hvf_darwin_arm64.go
@@ -63,19 +59,19 @@ func main() int64 {
 	memFd := runtime.Syscall(runtime.SYS_OPENAT, runtime.AT_FDCWD, "/dev/mem", runtime.O_RDWR|runtime.O_SYNC, 0)
 	if memFd >= 0 {
 		// Map timeslice MMIO region (optional - for performance tracing)
-		timesliceMem = runtime.Syscall(runtime.SYS_MMAP, 0, timesliceMMIOMapSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_SHARED, memFd, timesliceMMIOPhysAddr)
+		timesliceMem = runtime.Syscall(runtime.SYS_MMAP, 0, timesliceMMIOMapSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_SHARED, memFd, runtime.Config("TIMESLICE_MMIO_PHYS_ADDR"))
 		if timesliceMem < 0 {
 			timesliceMem = 0
 		}
 
 		// Map mailbox region (needed for command loop signaling)
-		mailboxMem = runtime.Syscall(runtime.SYS_MMAP, 0, mailboxMapSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_SHARED, memFd, mailboxPhysAddr)
+		mailboxMem = runtime.Syscall(runtime.SYS_MMAP, 0, mailboxMapSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_SHARED, memFd, runtime.Config("MAILBOX_PHYS_ADDR"))
 		if mailboxMem < 0 {
 			mailboxMem = 0
 		}
 
 		// Map config region (needed for command loop to read commands)
-		configMem = runtime.Syscall(runtime.SYS_MMAP, 0, configRegionSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_SHARED, memFd, configRegionPhysAddr)
+		configMem = runtime.Syscall(runtime.SYS_MMAP, 0, configRegionSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_SHARED, memFd, runtime.Config("CONFIG_REGION_PHYS_ADDR"))
 		if configMem < 0 {
 			configMem = 0
 		}

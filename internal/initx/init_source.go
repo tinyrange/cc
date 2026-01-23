@@ -16,12 +16,9 @@ const (
 
 // Memory layout
 const (
-	mailboxMapSize        = 0x1000
-	configRegionSize      = 4194304 // 4MB
-	mailboxPhysAddr       = 0xf0000000
-	timesliceMMIOPhysAddr = 0xf0001000
-	timesliceMMIOMapSize  = 0x1000
-	configRegionPhysAddr  = 0xf0003000
+	mailboxMapSize       = 0x1000
+	configRegionSize     = 4194304 // 4MB
+	timesliceMMIOMapSize = 0x1000
 )
 
 // Timeslice IDs - must match constants in hvf_darwin_arm64.go
@@ -111,14 +108,14 @@ func main() int64 {
 	}
 
 	// map mailbox region
-	mailboxMem := runtime.Syscall(runtime.SYS_MMAP, 0, mailboxMapSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_SHARED, memFd, mailboxPhysAddr)
+	mailboxMem := runtime.Syscall(runtime.SYS_MMAP, 0, mailboxMapSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_SHARED, memFd, runtime.Config("MAILBOX_PHYS_ADDR"))
 	if mailboxMem < 0 {
 		runtime.Printf("initx: failed to map mailbox region (errno=0x%x)\n", 0-mailboxMem)
 		reboot()
 	}
 
 	// map timeslice MMIO region for guest-side timeslice recording
-	timesliceMem := runtime.Syscall(runtime.SYS_MMAP, 0, timesliceMMIOMapSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_SHARED, memFd, timesliceMMIOPhysAddr)
+	timesliceMem := runtime.Syscall(runtime.SYS_MMAP, 0, timesliceMMIOMapSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_SHARED, memFd, runtime.Config("TIMESLICE_MMIO_PHYS_ADDR"))
 	if timesliceMem < 0 {
 		// Timeslice mapping is optional - continue without it
 		timesliceMem = 0
@@ -129,7 +126,7 @@ func main() int64 {
 	}
 
 	// map config region (4MB)
-	configMem := runtime.Syscall(runtime.SYS_MMAP, 0, configRegionSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_SHARED, memFd, configRegionPhysAddr)
+	configMem := runtime.Syscall(runtime.SYS_MMAP, 0, configRegionSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_SHARED, memFd, runtime.Config("CONFIG_REGION_PHYS_ADDR"))
 	if configMem < 0 {
 		runtime.Printf("initx: failed to map config region (errno=0x%x)\n", 0-configMem)
 		reboot()

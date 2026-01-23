@@ -173,7 +173,7 @@ func (m MemVar) As32() MemVar {
 }
 
 func (v Var) AsMem() MemoryFragment {
-	return MemVar{Base: v, Width: Width64}
+	return MemVar{Base: v}
 }
 
 func (g GlobalVar) AsMem() MemoryFragment {
@@ -183,13 +183,13 @@ func (g GlobalVar) AsMem() MemoryFragment {
 // Mem exposes a typed memory reference so width helpers (As8/As16/As32) may be
 // chained without losing the underlying memVar type.
 func (v Var) Mem() MemVar {
-	return MemVar{Base: v, Width: Width64}
+	return MemVar{Base: v}
 }
 
 // MemWithDisp is equivalent to Mem().WithDisp(disp) but preserves the memVar
 // type so callers can chain width conversions.
 func (v Var) MemWithDisp(disp any) MemVar {
-	return MemVar{Base: v, Width: Width64, Disp: asFragment(disp)}
+	return MemVar{Base: v, Disp: asFragment(disp)}
 }
 
 type GlobalMem struct {
@@ -222,13 +222,13 @@ func (m GlobalMem) As32() GlobalMem {
 
 // Mem exposes a typed global memory reference so width helpers may be chained.
 func (g GlobalVar) Mem() GlobalMem {
-	return GlobalMem{Name: string(g), Width: Width64}
+	return GlobalMem{Name: string(g)}
 }
 
 // MemWithDisp is equivalent to Mem().WithDisp(disp) while retaining the
 // concrete type for chaining width helpers.
 func (g GlobalVar) MemWithDisp(disp any) GlobalMem {
-	return GlobalMem{Name: string(g), Width: Width64, Disp: asFragment(disp)}
+	return GlobalMem{Name: string(g), Disp: asFragment(disp)}
 }
 
 type Label string

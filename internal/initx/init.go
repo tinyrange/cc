@@ -3,7 +3,6 @@ package initx
 import (
 	_ "embed"
 	"fmt"
-	"strings"
 
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/ir"
@@ -144,49 +143,41 @@ func BuildFromRTG(cfg BuilderConfig) (*ir.Program, error) {
 		return nil, fmt.Errorf("unsupported architecture for RTG init: %s", cfg.Arch)
 	}
 
-	// Preprocess the source to inject dynamic MMIO addresses
-	source := rtgInitSource
-	if cfg.MailboxPhysAddr != 0 {
-		// Replace the hard-coded mailboxPhysAddr constant
-		source = strings.Replace(source,
-			"mailboxPhysAddr        = 0xf0000000",
-			fmt.Sprintf("mailboxPhysAddr        = 0x%x", cfg.MailboxPhysAddr),
-			1)
-	}
-	if cfg.TimesliceMMIOPhysAddr != 0 {
-		// Replace the hard-coded timesliceMMIOPhysAddr constant
-		source = strings.Replace(source,
-			"timesliceMMIOPhysAddr  = 0xf0001000",
-			fmt.Sprintf("timesliceMMIOPhysAddr  = 0x%x", cfg.TimesliceMMIOPhysAddr),
-			1)
-	}
-	if cfg.ConfigRegionPhysAddr != 0 {
-		// Replace the hard-coded configRegionPhysAddr constant
-		source = strings.Replace(source,
-			"configRegionPhysAddr   = 0xf0003000",
-			fmt.Sprintf("configRegionPhysAddr   = 0x%x", cfg.ConfigRegionPhysAddr),
-			1)
-	}
-
-	// Set up compile options with vsock configuration
-	// Always provide VSOCK_PORT config since the RTG compiler processes
-	// all code paths, not just the ones that will be taken at runtime
+	// Set up compile options with physical addresses and vsock configuration
 	port := cfg.VsockPort
 	if port == 0 {
 		port = 9998 // Default vsock port
 	}
+
+	// Use default addresses if not specified
+	mailboxAddr := cfg.MailboxPhysAddr
+	if mailboxAddr == 0 {
+		mailboxAddr = 0xf0000000
+	}
+	timesliceAddr := cfg.TimesliceMMIOPhysAddr
+	if timesliceAddr == 0 {
+		timesliceAddr = 0xf0001000
+	}
+	configAddr := cfg.ConfigRegionPhysAddr
+	if configAddr == 0 {
+		configAddr = 0xf0003000
+	}
+
 	compileOpts := rtg.CompileOptions{
 		GOARCH: goarch,
 		Flags: map[string]bool{
 			"USE_VSOCK": cfg.UseVsock,
 		},
 		Config: map[string]any{
-			"VSOCK_PORT": int64(port),
+			"VSOCK_PORT":              int64(port),
+			"MAILBOX_PHYS_ADDR":       int64(mailboxAddr),
+			"TIMESLICE_MMIO_PHYS_ADDR": int64(timesliceAddr),
+			"CONFIG_REGION_PHYS_ADDR": int64(configAddr),
 		},
 	}
 
 	// Compile the RTG source with architecture information
-	prog, err := rtg.CompileProgramWithOptions(source, compileOpts)
+	prog, err := rtg.CompileProgramWithOptions(rtgInitSource, compileOpts)
 	if err != nil {
 		return nil, fmt.Errorf("failed to compile RTG init source: %w", err)
 	}
