@@ -45,6 +45,9 @@ type instance struct {
 	workdir  string
 	user     string
 	timeout  time.Duration
+
+	// Filesystem backend for direct FS operations
+	fsBackend vfs.VirtioFsBackend
 }
 
 // New creates and starts a new Instance from the given source.
@@ -111,6 +114,9 @@ func (inst *instance) start() error {
 	// Create VirtioFS backend
 	fsBackend := vfs.NewVirtioFsBackendWithAbstract()
 
+	// Store reference for direct FS operations
+	inst.fsBackend = fsBackend
+
 	// Set the container filesystem as the root
 	if err := fsBackend.SetAbstractRoot(inst.src.cfs); err != nil {
 		inst.h.Close()
@@ -147,6 +153,9 @@ func (inst *instance) start() error {
 		inst.h.Close()
 		return &Error{Op: "new", Err: fmt.Errorf("create net backend: %w", err)}
 	}
+
+	// Create vsock backend for program loading
+	vsockBackend := virtio.NewSimpleVsockBackend()
 
 	// Parse user option
 	var uid, gid *int
@@ -185,6 +194,8 @@ func (inst *instance) start() error {
 			MAC:     guestMAC,
 			Arch:    arch,
 		}),
+		initx.WithDeviceTemplate(virtio.NewVsockTemplate(3, vsockBackend)),
+		initx.WithVsockProgramLoader(vsockBackend, initx.VsockProgramPort),
 	}
 
 	// Create VM
@@ -201,18 +212,25 @@ func (inst *instance) start() error {
 		return &Error{Op: "new", Err: fmt.Errorf("create VM: %w", err)}
 	}
 
-	// Build container init program with CommandLoop enabled
+	// Get command from image config
+	cmd := inst.src.image.Config.Entrypoint
+	if len(inst.src.image.Config.Cmd) > 0 {
+		cmd = append(cmd, inst.src.image.Config.Cmd...)
+	}
+	if len(cmd) == 0 {
+		cmd = []string{"/bin/sh"}
+	}
+
+	// Build container init program
 	initProg, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
 		Arch:                  arch,
+		Cmd:                   cmd,
 		Env:                   env,
 		WorkDir:               workdir,
 		EnableNetwork:         true,
-		CommandLoop:           true,
 		UID:                   uid,
 		GID:                   gid,
-		MailboxPhysAddr:       inst.vm.MailboxPhysAddr(),
 		TimesliceMMIOPhysAddr: inst.vm.TimesliceMMIOPhysAddr(),
-		ConfigRegionPhysAddr:  inst.vm.ConfigRegionPhysAddr(),
 	})
 	if err != nil {
 		inst.vm.Close()

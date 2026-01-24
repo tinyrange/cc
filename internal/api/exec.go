@@ -6,6 +6,10 @@ import (
 	"fmt"
 	"io"
 	"sync"
+
+	"github.com/tinyrange/cc/internal/initx"
+	"github.com/tinyrange/cc/internal/ir"
+	"github.com/tinyrange/cc/internal/linux/defs"
 )
 
 // instanceCmd implements Cmd.
@@ -71,7 +75,6 @@ func (c *instanceCmd) Wait() error {
 func (c *instanceCmd) runCommand() {
 	// Prepare command path and args
 	path := c.name
-	args := append([]string{c.name}, c.args...)
 
 	// Prepare environment
 	env := c.env
@@ -79,22 +82,39 @@ func (c *instanceCmd) runCommand() {
 		env = c.inst.env
 	}
 
-	// Write the exec command to the VM
-	if err := c.inst.vm.WriteExecCommand(path, args, env); err != nil {
-		c.mu.Lock()
-		c.err = &Error{Op: "exec", Path: c.name, Err: err}
-		c.finished = true
-		c.mu.Unlock()
-		return
+	// Build IR program using ForkExecWait helper
+	errLabel := ir.Label("exec_error")
+	errVar := ir.Var("exec_errno")
+
+	prog := &ir.Program{
+		Entrypoint: "main",
+		Methods: map[string]ir.Method{
+			"main": {
+				initx.ForkExecWait(path, c.args, env, errLabel, errVar),
+				ir.Return(errVar),
+				ir.DeclareLabel(errLabel, ir.Block{
+					ir.Printf("cc: exec error: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+					ir.Syscall(defs.SYS_EXIT, ir.Int64(1)),
+				}),
+			},
+		},
 	}
 
-	// Run the command loop program to execute the command
-	// The VM's command loop will pick up the command from the config region
-	// and execute it via fork/exec/wait
+	// Run program via vsock
+	err := c.inst.vm.Run(c.ctx, prog)
 
-	// For now, we signal completion - the actual execution happens
-	// via the session's ongoing program
 	c.mu.Lock()
+	if err != nil {
+		if exitErr, ok := err.(*initx.ExitError); ok {
+			c.exitCode = exitErr.Code
+			// Non-zero exit code is not necessarily an error
+			if c.exitCode != 0 {
+				c.err = &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("exit status %d", c.exitCode)}
+			}
+		} else {
+			c.err = &Error{Op: "exec", Path: c.name, Err: err}
+		}
+	}
 	c.finished = true
 	c.mu.Unlock()
 }

@@ -250,14 +250,25 @@ func NewVsockProgramServer(backend virtio.VsockBackend, port uint32, arch hv.Cpu
 
 // Accept waits for a guest connection.
 func (s *VsockProgramServer) Accept() error {
+	// Get listener under lock, but don't hold lock during blocking accept
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	listener := s.listener
+	s.mu.Unlock()
 
-	conn, err := s.listener.Accept()
+	if listener == nil {
+		return fmt.Errorf("listener is nil")
+	}
+
+	conn, err := listener.Accept()
 	if err != nil {
 		return fmt.Errorf("accept connection: %w", err)
 	}
+
+	// Store connection under lock
+	s.mu.Lock()
 	s.conn = conn
+	s.mu.Unlock()
+
 	return nil
 }
 
