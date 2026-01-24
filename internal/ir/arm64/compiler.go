@@ -345,13 +345,69 @@ func (c *compiler) compileGoto(g ir.GotoFragment) error {
 	return nil
 }
 
+// callArgRegisters defines the AAPCS64 argument registers.
+var callArgRegisters = []asm.Variable{
+	arm64asm.X0, arm64asm.X1, arm64asm.X2, arm64asm.X3,
+	arm64asm.X4, arm64asm.X5, arm64asm.X6, arm64asm.X7,
+}
+
 func (c *compiler) compileCall(f ir.CallFragment) error {
+	// Maximum 8 arguments for AAPCS64
+	if len(f.Args) > len(callArgRegisters) {
+		return fmt.Errorf("ir: too many arguments for function call (max %d, got %d)", len(callArgRegisters), len(f.Args))
+	}
+
+	// Evaluate target first (before we mess with argument registers)
 	targetReg, _, err := c.evalValue(f.Target)
 	if err != nil {
 		return err
 	}
+
+	// If target is in an argument register, save it to a safe place (X9-X15 are caller-saved scratch)
+	targetIsSafe := true
+	for _, argReg := range callArgRegisters[:len(f.Args)] {
+		if targetReg == argReg {
+			targetIsSafe = false
+			break
+		}
+	}
+	if !targetIsSafe {
+		// Move target to X9 which is caller-saved but not used for arguments
+		c.emit(arm64asm.MovReg(arm64asm.Reg64(arm64asm.X9), arm64asm.Reg64(targetReg)))
+		c.freeReg(targetReg)
+		targetReg = arm64asm.X9
+		c.reserveReg(arm64asm.X9)
+	}
+
+	// Evaluate all arguments into temporary registers
+	argRegs := make([]asm.Variable, len(f.Args))
+	for i, arg := range f.Args {
+		reg, _, err := c.evalValue(arg)
+		if err != nil {
+			// Free any already-allocated arg registers
+			for j := 0; j < i; j++ {
+				c.freeReg(argRegs[j])
+			}
+			c.freeReg(targetReg)
+			return err
+		}
+		argRegs[i] = reg
+	}
+
+	// Move arguments into calling convention registers
+	for i, reg := range argRegs {
+		destReg := callArgRegisters[i]
+		if reg != destReg {
+			c.emit(arm64asm.MovReg(arm64asm.Reg64(destReg), arm64asm.Reg64(reg)))
+		}
+		c.freeReg(reg)
+	}
+
+	// Call the target
 	c.emit(arm64asm.CallReg(arm64asm.Reg64(targetReg)))
 	c.freeReg(targetReg)
+
+	// Store result if needed
 	if f.Result != "" {
 		mem, err := c.stackSlotMem(string(f.Result))
 		if err != nil {
@@ -468,9 +524,16 @@ func (c *compiler) storeValue(dst ir.Fragment, reg asm.Variable, width ir.ValueW
 			return err
 		}
 		mem := arm64asm.Mem(arm64asm.Reg64(baseReg)).WithDisp(disp)
-		switch width {
+		// Use the destination's width if specified, otherwise fall back to source width
+		dstWidth := dest.Width
+		if dstWidth == 0 {
+			dstWidth = width
+		}
+		switch dstWidth {
 		case ir.Width8:
 			c.emit(arm64asm.MovToMemory(mem, arm64asm.Reg8(reg)))
+		case ir.Width16:
+			c.emit(arm64asm.MovToMemory(mem, arm64asm.Reg16(reg)))
 		case ir.Width32:
 			c.emit(arm64asm.MovToMemory(mem, arm64asm.Reg32(reg)))
 		default:
@@ -489,9 +552,16 @@ func (c *compiler) storeValue(dst ir.Fragment, reg asm.Variable, width ir.ValueW
 			return err
 		}
 		mem := arm64asm.Mem(arm64asm.Reg64(baseReg)).WithDisp(disp)
-		switch width {
+		// Use the destination's width if specified, otherwise fall back to source width
+		dstWidth := dest.Width
+		if dstWidth == 0 {
+			dstWidth = width
+		}
+		switch dstWidth {
 		case ir.Width8:
 			c.emit(arm64asm.MovToMemory(mem, arm64asm.Reg8(reg)))
+		case ir.Width16:
+			c.emit(arm64asm.MovToMemory(mem, arm64asm.Reg16(reg)))
 		case ir.Width32:
 			c.emit(arm64asm.MovToMemory(mem, arm64asm.Reg32(reg)))
 		default:
@@ -630,6 +700,17 @@ func (c *compiler) compileSyscall(sc ir.SyscallFragment, needResult bool) (asm.V
 			c.emit(arm64asm.MovRegFromSP(arm64asm.Reg64(reg)))
 			if offset != 0 {
 				c.emit(arm64asm.AddRegImm(arm64asm.Reg64(reg), offset))
+			}
+			args[idx] = asm.Variable(reg)
+			regs = append(regs, reg)
+		case ir.OpFragment:
+			// Evaluate the expression
+			reg, _, err := c.evalValue(a)
+			if err != nil {
+				for _, r := range regs {
+					c.freeReg(r)
+				}
+				return 0, err
 			}
 			args[idx] = asm.Variable(reg)
 			regs = append(regs, reg)
@@ -1261,6 +1342,14 @@ func collectVariables(f ir.Fragment, vars map[string]struct{}) {
 		if v.Disp != nil {
 			collectVariables(v.Disp, vars)
 		}
+	case ir.CallFragment:
+		collectVariables(v.Target, vars)
+		for _, arg := range v.Args {
+			collectVariables(arg, vars)
+		}
+		if v.Result != "" {
+			vars[string(v.Result)] = struct{}{}
+		}
 	case ir.ConstantBytesFragment:
 		// constants do not reference stack variables
 	case ir.ConstantPointerFragment:
@@ -1301,6 +1390,9 @@ func collectGlobals(f ir.Fragment, globals map[string]struct{}) {
 		}
 	case ir.CallFragment:
 		collectGlobals(v.Target, globals)
+		for _, arg := range v.Args {
+			collectGlobals(arg, globals)
+		}
 	case ir.OpFragment:
 		collectGlobals(v.Left, globals)
 		collectGlobals(v.Right, globals)
