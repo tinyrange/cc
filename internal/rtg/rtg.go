@@ -116,6 +116,12 @@ type bufferInfo struct {
 	slotID int
 }
 
+// funcSignature holds information about a function's signature.
+type funcSignature struct {
+	params     []string // parameter names in order
+	returnType Type     // return type (TypeInvalid if void)
+}
+
 // Compiler holds the state for a single source-to-IR lowering.
 type Compiler struct {
 	fset        *token.FileSet
@@ -123,11 +129,12 @@ type Compiler struct {
 	scope       *scope
 	returnType  Type
 	opts        CompileOptions
-	constants   map[string]int64 // package-level constants
-	labelCount  int              // counter for generating unique labels
-	buffers     []bufferInfo     // stack buffers declared in current function
-	nextSlotID  int              // counter for unique slot IDs
-	embedVarCtr int              // counter for unique embed variable names
+	constants   map[string]int64      // package-level constants
+	funcSigs    map[string]funcSignature // function signatures
+	labelCount  int                   // counter for generating unique labels
+	buffers     []bufferInfo          // stack buffers declared in current function
+	nextSlotID  int                   // counter for unique slot IDs
+	embedVarCtr int                   // counter for unique embed variable names
 }
 
 // CompileProgram parses src and lowers it into an ir.Program. The accepted
@@ -152,6 +159,7 @@ func CompileProgramWithOptions(src string, opts CompileOptions) (*ir.Program, er
 		scope:     newScope(nil),
 		opts:      opts,
 		constants: make(map[string]int64),
+		funcSigs:  make(map[string]funcSignature),
 	}
 	return c.compile()
 }
@@ -174,7 +182,20 @@ func (c *Compiler) compile() (*ir.Program, error) {
 		}
 	}
 
-	// Second pass: compile functions
+	// Second pass: collect function signatures
+	for _, decl := range c.file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		sig, err := c.extractFuncSignature(fn)
+		if err != nil {
+			return nil, err
+		}
+		c.funcSigs[fn.Name.Name] = sig
+	}
+
+	// Third pass: compile functions
 	methods := make(map[string]ir.Method)
 	var entrypoint string
 
@@ -262,6 +283,36 @@ func (c *Compiler) processGenDecl(decl *ast.GenDecl) error {
 	default:
 		return fmt.Errorf("rtg: unsupported declaration %v", decl.Tok)
 	}
+}
+
+// extractFuncSignature extracts a function's signature (parameter names and return type).
+func (c *Compiler) extractFuncSignature(fn *ast.FuncDecl) (funcSignature, error) {
+	var sig funcSignature
+
+	// Extract return type
+	if fn.Type.Results != nil && fn.Type.Results.NumFields() > 0 {
+		if fn.Type.Results.NumFields() > 1 {
+			return sig, fmt.Errorf("rtg: multiple return values are not supported (%s)", fn.Name.Name)
+		}
+		field := fn.Type.Results.List[0]
+		typ, err := resolveType(field.Type)
+		if err != nil {
+			return sig, fmt.Errorf("rtg: result type: %w", err)
+		}
+		sig.returnType = typ
+	}
+
+	// Extract parameter names
+	if fn.Type.Params != nil {
+		for _, field := range fn.Type.Params.List {
+			if len(field.Names) != 1 {
+				return sig, fmt.Errorf("rtg: parameters must be named (%s)", fn.Name.Name)
+			}
+			sig.params = append(sig.params, field.Names[0].Name)
+		}
+	}
+
+	return sig, nil
 }
 
 func (c *Compiler) lowerFunc(fn *ast.FuncDecl) (ir.Method, error) {
@@ -437,8 +488,16 @@ func replaceSlotRefs(frag ir.Fragment, slotID int, slot ir.StackSlot) ir.Fragmen
 			Right: replaceSlotRefs(f.Right, slotID, slot),
 		}
 	case ir.CallFragment:
+		var args []ir.Fragment
+		if len(f.Args) > 0 {
+			args = make([]ir.Fragment, len(f.Args))
+			for i, arg := range f.Args {
+				args[i] = replaceSlotRefs(arg, slotID, slot).(ir.Fragment)
+			}
+		}
 		return ir.CallFragment{
 			Target: replaceSlotRefs(f.Target, slotID, slot),
+			Args:   args,
 			Result: f.Result,
 		}
 	case bufferMemPlaceholder:
@@ -999,11 +1058,34 @@ func (c *Compiler) lowerCallStmt(call *ast.CallExpr) ([]ir.Fragment, error) {
 	case "logKmsg", "LogKmsg":
 		return c.lowerLogKmsg(call)
 	default:
+		// Check if it's a call to a user-defined function
+		sig, ok := c.funcSigs[funcName]
+		if !ok {
+			return nil, fmt.Errorf("rtg: unknown function %q", funcName)
+		}
+
+		// Validate argument count
+		if len(call.Args) != len(sig.params) {
+			return nil, fmt.Errorf("rtg: function %q expects %d arguments, got %d", funcName, len(sig.params), len(call.Args))
+		}
+
 		// Allow calling user-defined functions as statements (void calls)
 		if len(call.Args) == 0 {
 			return []ir.Fragment{ir.CallMethod(funcName)}, nil
 		}
-		return nil, fmt.Errorf("rtg: unsupported call %q (user function calls with arguments not yet supported)", funcName)
+
+		// Evaluate arguments
+		args := make([]ir.Fragment, len(call.Args))
+		for i, arg := range call.Args {
+			frag, _, err := c.lowerExpr(arg)
+			if err != nil {
+				return nil, err
+			}
+			args[i] = frag
+		}
+
+		// Generate CallWithArgs using method pointer
+		return []ir.Fragment{ir.CallWithArgs(ir.MethodPointer(funcName), args)}, nil
 	}
 }
 
@@ -1344,11 +1426,38 @@ func (c *Compiler) lowerExprCall(call *ast.CallExpr) (ir.Fragment, Type, error) 
 		return c.lowerConfig(call)
 	default:
 		// Check if it's a call to a user-defined function
+		sig, ok := c.funcSigs[funcName]
+		if !ok {
+			return nil, Type{}, fmt.Errorf("rtg: unknown function %q", funcName)
+		}
+
+		// Validate argument count
+		if len(call.Args) != len(sig.params) {
+			return nil, Type{}, fmt.Errorf("rtg: function %q expects %d arguments, got %d", funcName, len(sig.params), len(call.Args))
+		}
+
 		// User-defined functions are called via ir.CallMethod and return int64
 		if len(call.Args) == 0 {
 			return ir.CallMethod(funcName), Type{Kind: TypeI64}, nil
 		}
-		return nil, Type{}, fmt.Errorf("rtg: unsupported call %q (user function calls with arguments not yet supported)", funcName)
+
+		// Evaluate arguments
+		args := make([]ir.Fragment, len(call.Args))
+		for i, arg := range call.Args {
+			frag, _, err := c.lowerExpr(arg)
+			if err != nil {
+				return nil, Type{}, err
+			}
+			args[i] = frag
+		}
+
+		// Generate CallWithArgs using method pointer
+		// Return type is int64 (or the function's actual return type)
+		retType := sig.returnType
+		if retType.Kind == TypeInvalid {
+			retType = Type{Kind: TypeI64}
+		}
+		return ir.CallWithArgs(ir.MethodPointer(funcName), args), retType, nil
 	}
 }
 
@@ -2002,6 +2111,15 @@ var syscallNames = map[string]defs.Syscall{
 	"SYS_UMOUNT2":        defs.SYS_UMOUNT2,
 	"SYS_UNLINKAT":       defs.SYS_UNLINKAT,
 	"SYS_SYMLINKAT":      defs.SYS_SYMLINKAT,
+	"SYS_CONNECT":        defs.SYS_CONNECT,
+	"SYS_BIND":           defs.SYS_BIND,
+	"SYS_LISTEN":         defs.SYS_LISTEN,
+	"SYS_ACCEPT":         defs.SYS_ACCEPT,
+	"SYS_SHUTDOWN":       defs.SYS_SHUTDOWN,
+	"SYS_SETSOCKOPT":     defs.SYS_SETSOCKOPT,
+	"SYS_GETSOCKOPT":     defs.SYS_GETSOCKOPT,
+	"SYS_SENDMSG":        defs.SYS_SENDMSG,
+	"SYS_RECVMSG":        defs.SYS_RECVMSG,
 }
 
 var constantValues = map[string]int64{
@@ -2080,6 +2198,13 @@ var constantValues = map[string]int64{
 	"RTN_UNICAST":     int64(linux.RTN_UNICAST),
 	"RTA_OIF":         int64(linux.RTA_OIF),
 	"RTA_GATEWAY":     int64(linux.RTA_GATEWAY),
+
+	// Vsock constants
+	"AF_VSOCK":        int64(40),   // AF_VSOCK
+	"SOCK_STREAM":     int64(1),    // Stream socket type
+	"VMADDR_CID_HOST": int64(2),    // Host CID
+	"VMADDR_CID_ANY":  int64(-1),   // Bind to any CID
+	"VMADDR_PORT_ANY": int64(-1),   // Bind to any port
 }
 
 // FormatErrors joins multiple errors when tests want deterministic output.

@@ -129,6 +129,15 @@ const (
 	SYS_UMOUNT2       int64 = 30
 	SYS_UNLINKAT      int64 = 31
 	SYS_SYMLINKAT     int64 = 32
+	SYS_CONNECT       int64 = 33
+	SYS_BIND          int64 = 34
+	SYS_LISTEN        int64 = 35
+	SYS_ACCEPT        int64 = 36
+	SYS_SHUTDOWN      int64 = 37
+	SYS_SETSOCKOPT    int64 = 38
+	SYS_GETSOCKOPT    int64 = 39
+	SYS_SENDMSG       int64 = 40
+	SYS_RECVMSG       int64 = 41
 )
 
 // File descriptor constants
@@ -213,6 +222,15 @@ const (
 // Clone flags
 const (
 	SIGCHLD int64 = 17
+)
+
+// Vsock constants
+const (
+	AF_VSOCK         int64 = 40    // Address family for vsock
+	SOCK_STREAM      int64 = 1     // Stream socket type
+	VMADDR_CID_HOST  int64 = 2     // Host CID
+	VMADDR_CID_ANY   int64 = -1    // Bind to any CID
+	VMADDR_PORT_ANY  int64 = -1    // Bind to any port
 )
 
 // Network interface ioctl constants

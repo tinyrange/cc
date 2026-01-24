@@ -559,3 +559,47 @@ func TestNetworkHTTPDownload1MiB(t *testing.T) {
 		})
 	}
 }
+
+func TestVsockEcho(t *testing.T) {
+	// Create AF_VSOCK socket
+	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("failed to create vsock socket: %v", err)
+	}
+	defer unix.Close(fd)
+
+	// Connect to host (CID 2) on port 9999
+	addr := &unix.SockaddrVM{
+		CID:  2, // VMADDR_CID_HOST
+		Port: 9999,
+	}
+	if err := unix.Connect(fd, addr); err != nil {
+		t.Fatalf("failed to connect to vsock: %v", err)
+	}
+
+	// Send test payload
+	payload := []byte("vsock-echo-test-payload")
+	n, err := unix.Write(fd, payload)
+	if err != nil {
+		t.Fatalf("failed to write to vsock: %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("short write: got %d want %d", n, len(payload))
+	}
+	t.Logf("wrote %d bytes to vsock", n)
+
+	// Read echo response
+	buf := make([]byte, 64)
+	n, err = unix.Read(fd, buf)
+	if err != nil {
+		t.Fatalf("failed to read from vsock: %v", err)
+	}
+	t.Logf("read %d bytes from vsock: %q", n, buf[:n])
+
+	// Verify echo
+	if !bytes.Equal(buf[:n], payload) {
+		t.Fatalf("vsock echo mismatch: got %q want %q", buf[:n], payload)
+	}
+
+	t.Logf("vsock echo test passed")
+}

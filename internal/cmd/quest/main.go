@@ -1685,6 +1685,29 @@ func RunExecutable(path string, gpuEnabled bool) error {
 		cancel()
 	}()
 
+	// Create vsock backend with echo service on port 9999
+	const vsockEchoPort = 9999
+	vsockBackend := virtio.NewSimpleVsockBackend()
+	vsockListener, err := vsockBackend.Listen(vsockEchoPort)
+	if err != nil {
+		return fmt.Errorf("create vsock listener: %w", err)
+	}
+	defer vsockListener.Close()
+
+	// Start vsock echo service
+	go func() {
+		for {
+			conn, err := vsockListener.Accept()
+			if err != nil {
+				return
+			}
+			go func(c virtio.VsockConn) {
+				defer c.Close()
+				io.Copy(c, c) // Echo
+			}(conn)
+		}
+	}()
+
 	// Build VM options
 	vmOptions := []initx.Option{
 		initx.WithFileFromBytes("/initx-exec", fileData, fs.FileMode(0755)),
@@ -1698,12 +1721,23 @@ func RunExecutable(path string, gpuEnabled bool) error {
 			MAC:     guestMAC,
 			Arch:    hv.Architecture(),
 		}),
+		initx.WithDeviceTemplate(virtio.VsockTemplate{
+			MMIODeviceTemplateBase: virtio.MMIODeviceTemplateBase{
+				Arch:   hv.Architecture(),
+				Config: virtio.VsockDeviceConfig(),
+			},
+			GuestCID: 3,
+			Backend:  vsockBackend,
+		}),
 	}
 
 	// Add GPU support if enabled
 	if gpuEnabled {
 		vmOptions = append(vmOptions, initx.WithGPUEnabled(true))
 	}
+
+	// Vsock program loader is always enabled (MMIO paths have been removed)
+	vmOptions = append(vmOptions, initx.WithVsockProgramLoader(vsockBackend, initx.VsockProgramPort))
 
 	vm, err := initx.NewVirtualMachine(hv, 1, 256, kernel, vmOptions...)
 	if err != nil {

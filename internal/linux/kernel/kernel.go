@@ -521,6 +521,18 @@ var BinfmtMiscModuleMap = map[string]string{
 	"CONFIG_BINFMT_MISC": "kernel/fs/binfmt_misc.ko.gz",
 }
 
+// VsockModuleConfigs lists the kernel config options needed for vsock support
+var VsockModuleConfigs = []string{
+	"CONFIG_VSOCKETS",
+	"CONFIG_VIRTIO_VSOCKETS",
+}
+
+// VsockModuleMap maps kernel config options to module file paths
+var VsockModuleMap = map[string]string{
+	"CONFIG_VSOCKETS":        "kernel/net/vmw_vsock/vsock.ko.gz",
+	"CONFIG_VIRTIO_VSOCKETS": "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
+}
+
 var defaultCachePath = ""
 
 func GetDefaultCachePath() (string, error) {
