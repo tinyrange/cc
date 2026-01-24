@@ -226,14 +226,6 @@ var (
 //   - Guest → Host: [len:4][exit_code:4]
 const (
 	VsockProgramPort = 9998
-	VsockCmdPort     = 9997 // Port for container command execution via vsock
-)
-
-// Vsock command protocol message types
-const (
-	vsockMsgReady   = 0x52454459 // "REDY" - guest -> host: container ready
-	vsockMsgCmdDone = 0x444F4E45 // "DONE" - guest -> host: command done (followed by exit code)
-	vsockMsgExecCmd = 0x45584543 // "EXEC" - host -> guest: execute command
 )
 
 // VsockProgramServer is the host-side server for vsock-based program loading.
@@ -377,209 +369,6 @@ func (s *VsockProgramServer) Close() error {
 	return nil
 }
 
-// VsockCommandServer is the host-side server for vsock-based container command execution.
-// This is separate from VsockProgramServer and handles the command loop protocol.
-// Protocol:
-//   - Guest -> Host: [type:4=READY]
-//   - Host -> Guest: [type:4=EXEC][data_len:4][path_len:4][argc:4][envc:4][path\0][args\0...][envs\0...]
-//   - Guest -> Host: [type:4=DONE][exit_code:4]
-type VsockCommandServer struct {
-	listener virtio.VsockListener
-	conn     virtio.VsockConn
-	mu       sync.Mutex
-	ready    bool
-}
-
-// NewVsockCommandServer creates a new vsock command server listening on the specified port.
-func NewVsockCommandServer(backend virtio.VsockBackend, port uint32) (*VsockCommandServer, error) {
-	listener, err := backend.Listen(port)
-	if err != nil {
-		return nil, fmt.Errorf("listen on port %d: %w", port, err)
-	}
-	return &VsockCommandServer{
-		listener: listener,
-	}, nil
-}
-
-// Accept waits for a guest connection.
-func (s *VsockCommandServer) Accept() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	conn, err := s.listener.Accept()
-	if err != nil {
-		return fmt.Errorf("accept connection: %w", err)
-	}
-	s.conn = conn
-	s.ready = false
-	return nil
-}
-
-// WaitReady waits for the READY message from the guest.
-// This should be called after Accept() to confirm the container is ready.
-func (s *VsockCommandServer) WaitReady(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.conn == nil {
-		return fmt.Errorf("no connection established")
-	}
-
-	// Read the 4-byte READY message type
-	buf := make([]byte, 4)
-	done := make(chan error, 1)
-
-	go func() {
-		_, err := io.ReadFull(s.conn, buf)
-		done <- err
-	}()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			return fmt.Errorf("read ready message: %w", err)
-		}
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-
-	msgType := binary.LittleEndian.Uint32(buf)
-	if msgType != vsockMsgReady {
-		return fmt.Errorf("unexpected message type: 0x%x, expected READY (0x%x)", msgType, vsockMsgReady)
-	}
-
-	s.ready = true
-	debug.Writef("initx.VsockCommandServer", "received READY from guest")
-	return nil
-}
-
-// SendCommand sends a command to the guest for execution.
-// The command is sent as: [type:4=EXEC][data_len:4][path_len:4][argc:4][envc:4][path\0][args\0...][envs\0...]
-func (s *VsockCommandServer) SendCommand(path string, args []string, envs []string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.conn == nil {
-		return fmt.Errorf("no connection established")
-	}
-	if !s.ready {
-		return fmt.Errorf("guest not ready")
-	}
-
-	// Calculate data size: path + null + each arg + null + each env + null
-	dataSize := len(path) + 1
-	for _, arg := range args {
-		dataSize += len(arg) + 1
-	}
-	for _, env := range envs {
-		dataSize += len(env) + 1
-	}
-
-	// Build the message:
-	// Header: type(4) + data_len(4) + path_len(4) + argc(4) + envc(4) = 20 bytes
-	// Data: path\0 + args\0... + envs\0...
-	headerSize := 20
-	msg := make([]byte, headerSize+dataSize)
-
-	// Header
-	binary.LittleEndian.PutUint32(msg[0:4], vsockMsgExecCmd)
-	binary.LittleEndian.PutUint32(msg[4:8], uint32(dataSize))
-	binary.LittleEndian.PutUint32(msg[8:12], uint32(len(path)))
-	binary.LittleEndian.PutUint32(msg[12:16], uint32(len(args)))
-	binary.LittleEndian.PutUint32(msg[16:20], uint32(len(envs)))
-
-	// Data: path\0 + args\0... + envs\0...
-	offset := headerSize
-	copy(msg[offset:], path)
-	offset += len(path)
-	msg[offset] = 0
-	offset++
-
-	for _, arg := range args {
-		copy(msg[offset:], arg)
-		offset += len(arg)
-		msg[offset] = 0
-		offset++
-	}
-
-	for _, env := range envs {
-		copy(msg[offset:], env)
-		offset += len(env)
-		msg[offset] = 0
-		offset++
-	}
-
-	// Send the message
-	if _, err := s.conn.Write(msg); err != nil {
-		return fmt.Errorf("write command: %w", err)
-	}
-
-	debug.Writef("initx.VsockCommandServer", "sent command: %s with %d args, %d envs", path, len(args), len(envs))
-	return nil
-}
-
-// WaitResult waits for and returns the exit code from the guest.
-// The result is received as: [type:4=DONE][exit_code:4]
-func (s *VsockCommandServer) WaitResult(ctx context.Context) (int32, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.conn == nil {
-		return -1, fmt.Errorf("no connection established")
-	}
-
-	// Read the 8-byte result: type(4) + exit_code(4)
-	buf := make([]byte, 8)
-	done := make(chan error, 1)
-
-	go func() {
-		_, err := io.ReadFull(s.conn, buf)
-		done <- err
-	}()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			return -1, fmt.Errorf("read result: %w", err)
-		}
-	case <-ctx.Done():
-		return -1, ctx.Err()
-	}
-
-	msgType := binary.LittleEndian.Uint32(buf[0:4])
-	if msgType != vsockMsgCmdDone {
-		return -1, fmt.Errorf("unexpected message type: 0x%x, expected CMD_DONE (0x%x)", msgType, vsockMsgCmdDone)
-	}
-
-	exitCode := int32(binary.LittleEndian.Uint32(buf[4:8]))
-	debug.Writef("initx.VsockCommandServer", "received exit code: %d", exitCode)
-	return exitCode, nil
-}
-
-// Close closes the server and any active connection.
-func (s *VsockCommandServer) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var errs []error
-	if s.conn != nil {
-		if err := s.conn.Close(); err != nil {
-			errs = append(errs, err)
-		}
-		s.conn = nil
-	}
-	if s.listener != nil {
-		if err := s.listener.Close(); err != nil {
-			errs = append(errs, err)
-		}
-		s.listener = nil
-	}
-	if len(errs) > 0 {
-		return errs[0]
-	}
-	return nil
-}
-
 type programRunner struct {
 	loader *programLoader
 
@@ -681,19 +470,11 @@ type VirtualMachine struct {
 	vsockProgramBackend virtio.VsockBackend
 	vsockProgramPort    uint32
 	useVsockLoader      bool
-
-	// Vsock command execution (for container command loop mode)
-	vsockCommandServer *VsockCommandServer
-	vsockCmdPort       uint32
-	useVsockCommands   bool
 }
 
 func (vm *VirtualMachine) Close() error {
 	if vm.vsockProgramServer != nil {
 		vm.vsockProgramServer.Close()
-	}
-	if vm.vsockCommandServer != nil {
-		vm.vsockCommandServer.Close()
 	}
 	return vm.vm.Close()
 }
@@ -851,73 +632,6 @@ func (vm *VirtualMachine) RestoreSnapshot(snap hv.Snapshot) error {
 	// Mark first run as complete since the vCPU state is already configured from the snapshot
 	vm.firstRunComplete = true
 	return nil
-}
-
-// SetupVsockCommands initializes the vsock command server for container command execution.
-// This should be called after the vsock backend is available and before starting the VM.
-func (vm *VirtualMachine) SetupVsockCommands(backend virtio.VsockBackend, port uint32) error {
-	if port == 0 {
-		port = VsockCmdPort
-	}
-	server, err := NewVsockCommandServer(backend, port)
-	if err != nil {
-		return fmt.Errorf("create vsock command server: %w", err)
-	}
-	vm.vsockCommandServer = server
-	vm.vsockCmdPort = port
-	vm.useVsockCommands = true
-	return nil
-}
-
-// SetupVsockCommandsFromProgramBackend sets up vsock command execution using the
-// same backend as the vsock program loader. This is a convenience method for callers
-// that use WithVsockProgramLoader.
-func (vm *VirtualMachine) SetupVsockCommandsFromProgramBackend(port uint32) error {
-	if vm.vsockProgramBackend == nil {
-		return fmt.Errorf("vsock program backend not set - use WithVsockProgramLoader first")
-	}
-	return vm.SetupVsockCommands(vm.vsockProgramBackend, port)
-}
-
-// AcceptVsockCommandConnection waits for the guest to connect to the vsock command server.
-// This should be called after the VM has started and the container is initializing.
-func (vm *VirtualMachine) AcceptVsockCommandConnection() error {
-	if vm.vsockCommandServer == nil {
-		return fmt.Errorf("vsock command server not initialized")
-	}
-	return vm.vsockCommandServer.Accept()
-}
-
-// WaitVsockReady waits for the READY message from the guest over vsock.
-// This indicates the container is ready to receive commands.
-func (vm *VirtualMachine) WaitVsockReady(ctx context.Context) error {
-	if vm.vsockCommandServer == nil {
-		return fmt.Errorf("vsock command server not initialized")
-	}
-	return vm.vsockCommandServer.WaitReady(ctx)
-}
-
-// SendVsockCommand sends a command to the guest for execution via vsock.
-// This is the vsock-based alternative to WriteExecCommand.
-func (vm *VirtualMachine) SendVsockCommand(path string, args []string, envs []string) error {
-	if vm.vsockCommandServer == nil {
-		return fmt.Errorf("vsock command server not initialized")
-	}
-	return vm.vsockCommandServer.SendCommand(path, args, envs)
-}
-
-// WaitVsockResult waits for the command execution result from the guest via vsock.
-// Returns the exit code from the executed command.
-func (vm *VirtualMachine) WaitVsockResult(ctx context.Context) (int32, error) {
-	if vm.vsockCommandServer == nil {
-		return -1, fmt.Errorf("vsock command server not initialized")
-	}
-	return vm.vsockCommandServer.WaitResult(ctx)
-}
-
-// UseVsockCommands returns true if vsock-based command execution is enabled.
-func (vm *VirtualMachine) UseVsockCommands() bool {
-	return vm.useVsockCommands
 }
 
 // HVVirtualMachine returns the underlying hv.VirtualMachine for low-level operations.

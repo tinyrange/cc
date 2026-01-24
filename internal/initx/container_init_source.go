@@ -18,26 +18,12 @@ const (
 // 54=container_mount_fs, 55=container_chroot, 56=container_devpts, 57=container_qemu
 // 58=container_hostname, 59=container_loopback, 60=container_hosts, 61=container_network
 // 62=container_workdir, 63=container_drop_priv, 64=container_exec, 65=container_complete
-// 70=container_cmd_loop_start, 71=container_cmd_read, 72=container_cmd_exec, 73=container_cmd_done
-
-// Vsock command protocol constants
-// These are used for vsock-based command execution instead of MMIO
-const (
-	// vsockCmdPort is the vsock port for container command execution (separate from program loading port 9998)
-	vsockCmdPort = 9997
-
-	// Message types for vsock command protocol
-	vsockMsgReady   = 0x52454459 // "REDY" - guest -> host: container ready
-	vsockMsgCmdDone = 0x444F4E45 // "DONE" - guest -> host: command done (followed by exit code)
-	vsockMsgExecCmd = 0x45584543 // "EXEC" - host -> guest: execute command
-)
 
 // main is the entrypoint for the container init program.
 // Helper function bodies are replaced at IR level with actual implementations.
 // Ifdef flags control which code paths are included:
 //   - "network": include network configuration (ConfigureInterface, AddDefaultRoute, SetResolvConf)
-//   - "command_loop": use command loop instead of baked-in command (for late snapshots)
-//   - "exec": use exec instead of fork/exec/wait (only when command_loop is false)
+//   - "exec": use exec instead of fork/exec/wait
 func main() int64 {
 	// Map MMIO regions for performance instrumentation
 	// This requires /dev/mem to be available (usually from devtmpfs)
@@ -241,30 +227,23 @@ func main() int64 {
 		runtime.LogKmsg("cc: dropped privileges\n")
 	}
 
-	// === Phase 10: Execute command or enter command loop ===
+	// === Phase 10: Execute command ===
 	// Record: container_exec (64)
 	if timesliceMem > 0 {
 		runtime.Store32(timesliceMem, 0, 64)
 	}
 
-	if runtime.Ifdef("command_loop") {
-		// Late snapshot mode: enter vsock command loop
-		vsockCommandLoop(timesliceMem)
-		// vsockCommandLoop never returns
+	if runtime.Ifdef("exec") {
+		runtime.LogKmsg("cc: executing command\n")
+		execCommand()
 	} else {
-		// Legacy mode: execute baked-in command
-		if runtime.Ifdef("exec") {
-			runtime.LogKmsg("cc: executing command\n")
-			execCommand()
-		} else {
-			forkExecWait()
-		}
+		forkExecWait()
+	}
 
-		// === Phase 11: Complete
-		// Record: container_complete (65)
-		if timesliceMem > 0 {
-			runtime.Store32(timesliceMem, 0, 65)
-		}
+	// === Phase 11: Complete
+	// Record: container_complete (65)
+	if timesliceMem > 0 {
+		runtime.Store32(timesliceMem, 0, 65)
 	}
 
 	return 0
@@ -402,168 +381,6 @@ func execCommand() int64        { return 0 }
 func forkExecWait() int64       { return 0 }
 func dropPrivileges() int64     { return 0 }
 func setupQEMUEmulation() int64 { return 0 }
-
-// vsockCommandLoop handles vsock-based command execution.
-// This function never returns - it loops forever waiting for commands or reboots on error.
-// Protocol:
-//   - Guest -> Host: [type:4=READY]
-//   - Host -> Guest: [type:4=EXEC][data_len:4][path_len:4][argc:4][envc:4][path\0][args\0...][envs\0...]
-//   - Guest -> Host: [type:4=DONE][exit_code:4]
-func vsockCommandLoop(timesliceMem int64) {
-	// Get vsock port from compile-time config
-	var port int64 = 0
-	port = runtime.Config("VSOCK_CMD_PORT")
-
-	// Create vsock socket
-	sockFd := runtime.Syscall(runtime.SYS_SOCKET, runtime.AF_VSOCK, runtime.SOCK_STREAM, 0)
-	if sockFd < 0 {
-		runtime.Printf("cc: failed to create vsock socket (errno=0x%x)\n", 0-sockFd)
-		reboot()
-	}
-
-	// Allocate sockaddr_vm structure (16 bytes)
-	sockaddrMem := runtime.Syscall(runtime.SYS_MMAP, 0, 16, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
-	if sockaddrMem < 0 {
-		runtime.Printf("cc: failed to alloc sockaddr_vm (errno=0x%x)\n", 0-sockaddrMem)
-		runtime.Syscall(runtime.SYS_CLOSE, sockFd)
-		reboot()
-	}
-
-	// Zero and fill sockaddr_vm
-	runtime.Store64(sockaddrMem, 0, 0)
-	runtime.Store64(sockaddrMem, 8, 0)
-	runtime.Store16(sockaddrMem, 0, runtime.AF_VSOCK)        // svm_family
-	runtime.Store32(sockaddrMem, 4, port)                    // svm_port
-	runtime.Store32(sockaddrMem, 8, runtime.VMADDR_CID_HOST) // svm_cid = 2 (host)
-
-	// Connect to host
-	connectResult := runtime.Syscall(runtime.SYS_CONNECT, sockFd, sockaddrMem, 16)
-	if connectResult < 0 {
-		runtime.Printf("cc: failed to connect vsock (errno=0x%x)\n", 0-connectResult)
-		runtime.Syscall(runtime.SYS_MUNMAP, sockaddrMem, 16)
-		runtime.Syscall(runtime.SYS_CLOSE, sockFd)
-		reboot()
-	}
-
-	// Free sockaddr_vm
-	runtime.Syscall(runtime.SYS_MUNMAP, sockaddrMem, 16)
-
-	// Allocate receive buffer (1MB should be sufficient for command data)
-	var recvBufSize int64 = 1048576
-	recvBuf := runtime.Syscall(runtime.SYS_MMAP, 0, recvBufSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
-	if recvBuf < 0 {
-		runtime.Printf("cc: failed to alloc recv buffer (errno=0x%x)\n", 0-recvBuf)
-		runtime.Syscall(runtime.SYS_CLOSE, sockFd)
-		reboot()
-	}
-
-	// Send READY message to host
-	runtime.LogKmsg("cc: container ready, sending vsock READY\n")
-	runtime.Store32(recvBuf, 0, vsockMsgReady)
-	writeResult := runtime.Syscall(runtime.SYS_WRITE, sockFd, recvBuf, 4)
-	if writeResult < 0 {
-		runtime.Printf("cc: failed to send READY (errno=0x%x)\n", 0-writeResult)
-		reboot()
-	}
-
-	// Main command loop
-	for {
-		// Record: container_cmd_loop_start (70)
-		if timesliceMem > 0 {
-			runtime.Store32(timesliceMem, 0, 70)
-		}
-
-		// Read message header: type(4) + data_len(4) + path_len(4) + argc(4) + envc(4) = 20 bytes
-		readResult := vsockReadFull(sockFd, recvBuf, 20)
-		if readResult < 0 {
-			runtime.Printf("cc: failed to read message header (errno=0x%x)\n", 0-readResult)
-			reboot()
-		}
-
-		msgType := runtime.Load32(recvBuf, 0)
-		if msgType != vsockMsgExecCmd {
-			runtime.Printf("cc: unexpected message type: 0x%x\n", msgType)
-			reboot()
-		}
-
-		// Record: container_cmd_read (71)
-		if timesliceMem > 0 {
-			runtime.Store32(timesliceMem, 0, 71)
-		}
-
-		dataLen := runtime.Load32(recvBuf, 4)
-		pathLen := runtime.Load32(recvBuf, 8)
-		argc := runtime.Load32(recvBuf, 12)
-		envc := runtime.Load32(recvBuf, 16)
-
-		// Read the command data (path\0 + args\0...\0 + envs\0...\0)
-		if dataLen > recvBufSize-20 {
-			runtime.Printf("cc: command data too large: 0x%x\n", dataLen)
-			reboot()
-		}
-		// Read command data into buffer starting at offset 20 (after header)
-		readResult = vsockReadFull(sockFd, recvBuf+20, dataLen)
-		if readResult < 0 {
-			runtime.Printf("cc: failed to read command data (errno=0x%x)\n", 0-readResult)
-			reboot()
-		}
-
-		// Record: container_cmd_exec (72)
-		if timesliceMem > 0 {
-			runtime.Store32(timesliceMem, 0, 72)
-		}
-
-		// Execute the command
-		// Data layout in recvBuf:
-		// [0-3]: msgType (ignored now)
-		// [4-7]: dataLen
-		// [8-11]: pathLen
-		// [12-15]: argc
-		// [16-19]: envc
-		// [20...]: path\0 + args\0... + envs\0...
-		exitCode := forkExecWaitFromBuffer(recvBuf+20, pathLen, argc, envc)
-
-		// Record: container_cmd_done (73)
-		if timesliceMem > 0 {
-			runtime.Store32(timesliceMem, 0, 73)
-		}
-
-		// Send CMD_DONE with exit code: [type:4][exit_code:4]
-		runtime.Store32(recvBuf, 0, vsockMsgCmdDone)
-		runtime.Store32(recvBuf, 4, exitCode)
-		writeResult = runtime.Syscall(runtime.SYS_WRITE, sockFd, recvBuf, 8)
-		if writeResult < 0 {
-			runtime.Printf("cc: failed to send CMD_DONE (errno=0x%x)\n", 0-writeResult)
-			reboot()
-		}
-	}
-}
-
-// forkExecWaitFromBuffer forks and executes command from a memory buffer.
-// The buffer contains: path\0 + args\0... + envs\0...
-// This is a placeholder - the body is replaced at IR level.
-func forkExecWaitFromBuffer(bufPtr int64, pathLen int64, argc int64, envc int64) int64 {
-	return 0
-}
-
-// vsockReadFull reads exactly n bytes from fd into buf.
-// Returns 0 on success, negative errno on error.
-func vsockReadFull(fd int64, buf int64, n int64) int64 {
-	var totalRead int64 = 0
-	for totalRead < n {
-		var readResult int64 = 0
-		readResult = runtime.Syscall(runtime.SYS_READ, fd, buf+totalRead, n-totalRead)
-		if readResult < 0 {
-			return readResult
-		}
-		if readResult == 0 {
-			// EOF - connection closed
-			return runtime.EPIPE
-		}
-		totalRead = totalRead + readResult
-	}
-	return 0
-}
 
 // reboot issues a reboot syscall with the architecture-appropriate command.
 // On x86_64, it uses RESTART; on ARM64, it uses POWER_OFF.

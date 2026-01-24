@@ -144,9 +144,6 @@ func run() error {
 	termWin := flag.Bool("term", false, "Open a terminal window and connect it to the VM console")
 	addVirtioFs := flag.String("add-virtiofs", "", "Specify a comma-separated list of blank virtio-fs tags to create")
 	timesliceFile := flag.String("timeslice-file", "", "Write timeslice data to file")
-	var snapshotCacheFlag boolFlag
-	snapshotCacheFlag.v = false // Disable by default
-	flag.Var(&snapshotCacheFlag, "snapshot-cache", "Enable boot snapshot caching (default: false)")
 	archFlag := flag.String("arch", "", "Target architecture (amd64, arm64). If different from host, enables QEMU emulation")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <image> [command] [args...]\n\n", os.Args[0])
@@ -603,126 +600,24 @@ func run() error {
 
 	debug.Writef("cc.run running command", "running command %v", execCmd)
 
-	// Determine if we should use CommandLoop mode for snapshot caching
-	// CommandLoop mode allows capturing snapshots after full container setup,
-	// then injecting the command at runtime via vsock
-	useCommandLoop := snapshotCacheFlag.v && getSnapshotIO() != nil
-
-	// Set up vsock command server if using command loop mode
-	if useCommandLoop {
-		if err := vm.SetupVsockCommandsFromProgramBackend(initx.VsockCmdPort); err != nil {
-			return fmt.Errorf("setup vsock commands: %w", err)
-		}
-	}
-
 	// Build the container init program
 	prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
 		Arch:                  hvArch,
-		Cmd:                   execCmd, // Used when CommandLoop is false
+		Cmd:                   execCmd,
 		Env:                   env,
 		WorkDir:               workDir,
 		EnableNetwork:         networkFlag.v,
 		Exec:                  execFlag.v,
-		CommandLoop:           useCommandLoop,
 		UID:                   img.Config.UID,
 		GID:                   img.Config.GID,
 		QEMUEmulation:         qemuConfig,
 		TimesliceMMIOPhysAddr: vm.TimesliceMMIOPhysAddr(),
-		VsockCmdPort:          initx.VsockCmdPort,
 	})
 	if err != nil {
 		return err
 	}
 
-	// Snapshot caching setup
 	var sessionCfg initx.SessionConfig
-	if useCommandLoop {
-		// Get cache directory for snapshots
-		snapshotCacheDir, err := getSnapshotCacheDir(*cacheDir)
-		if err == nil {
-			snapshotCache := initx.NewSnapshotCache(snapshotCacheDir, getSnapshotIO())
-
-			// Compute config hash based on VM configuration
-			// Include image reference to ensure different images get different snapshots
-			configHash := hv.ComputeConfigHash(
-				hvArch,
-				memoryFlag.v<<20, // Convert MB to bytes
-				vm.HVVirtualMachine().MemoryBase(),
-				cpusFlag.v,
-				nil, // Device configs - simplified for now
-			)
-
-			// Use a very old time as reference - snapshots are valid unless explicitly invalidated
-			var referenceTime time.Time
-
-			if snapshotCache.HasValidSnapshot(configHash, referenceTime) {
-				// Try to load and restore cached snapshot
-				snap, loadErr := snapshotCache.LoadSnapshot(configHash)
-				if loadErr == nil {
-					if restoreErr := vm.RestoreSnapshot(snap); restoreErr == nil {
-						debug.Writef("cc.run snapshot", "restored from cache")
-						sessionCfg.SkipBoot = true
-						// After snapshot restore, the guest will reconnect to vsock.
-						// We'll accept the connection and send the command in the session.
-						sessionCfg.OnBootComplete = func() error {
-							// Accept vsock connection from guest (guest connects after resume)
-							if err := vm.AcceptVsockCommandConnection(); err != nil {
-								return fmt.Errorf("accept vsock connection: %w", err)
-							}
-							// Wait for READY signal
-							if err := vm.WaitVsockReady(ctx); err != nil {
-								return fmt.Errorf("wait for vsock ready: %w", err)
-							}
-							// Send the command via vsock
-							if err := vm.SendVsockCommand(execCmd[0], execCmd, env); err != nil {
-								return fmt.Errorf("send vsock command: %w", err)
-							}
-							return nil
-						}
-					} else {
-						slog.Debug("Failed to restore snapshot, falling back to boot", "error", restoreErr)
-					}
-				} else {
-					slog.Debug("Failed to load snapshot, falling back to boot", "error", loadErr)
-				}
-			}
-
-			if !sessionCfg.SkipBoot {
-				// Set up callback to capture snapshot after boot completes
-				// In CommandLoop mode, the guest signals readiness after full container setup
-				sessionCfg.OnBootComplete = func() error {
-					// Accept vsock connection from guest
-					if err := vm.AcceptVsockCommandConnection(); err != nil {
-						return fmt.Errorf("accept vsock connection: %w", err)
-					}
-
-					// Wait for READY signal from guest
-					if err := vm.WaitVsockReady(ctx); err != nil {
-						return fmt.Errorf("wait for vsock ready: %w", err)
-					}
-
-					// Capture snapshot now that container is ready
-					snap, captureErr := vm.CaptureSnapshot()
-					if captureErr != nil {
-						slog.Debug("Failed to capture boot snapshot", "error", captureErr)
-						return nil // Don't fail the session
-					}
-					if saveErr := snapshotCache.SaveSnapshot(configHash, snap); saveErr != nil {
-						slog.Debug("Failed to save boot snapshot", "error", saveErr)
-					} else {
-						debug.Writef("cc.run snapshot", "saved to cache")
-					}
-
-					// Send the command via vsock
-					if err := vm.SendVsockCommand(execCmd[0], execCmd, env); err != nil {
-						return fmt.Errorf("send vsock command: %w", err)
-					}
-
-					return nil
-				}
-			}
-		}
-	}
 
 	// Start the VM session now that we have the final execution context.
 	// This handles boot → stdin forwarding → payload run.

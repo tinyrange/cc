@@ -38,22 +38,11 @@ type QEMUEmulationConfig struct {
 
 type ContainerInitConfig struct {
 	Arch          hv.CpuArchitecture
-	Cmd           []string // Required unless CommandLoop is true
+	Cmd           []string
 	Env           []string
 	WorkDir       string
 	EnableNetwork bool
-	Exec          bool // Only used when CommandLoop is false
-
-	// CommandLoop enables the late-snapshot command loop mode.
-	// When true, the container init will signal readiness for snapshot after
-	// container setup, then enter a loop waiting for commands from the host.
-	// Commands are passed via SendVsockCommand() after snapshot restore.
-	// When false (default), the Cmd field is baked into the init program.
-	CommandLoop bool
-
-	// VsockCmdPort is the vsock port for command execution.
-	// Default: 9997 (separate from program loading port 9998)
-	VsockCmdPort uint32
+	Exec          bool
 
 	Hostname    string // default: tinyrange
 	DNS         string // default: 10.42.0.1
@@ -116,9 +105,8 @@ func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
 	if cfg.Arch == "" || cfg.Arch == hv.ArchitectureInvalid {
 		return nil, fmt.Errorf("initx: container init requires valid architecture")
 	}
-	// Cmd is only required when not using command loop mode
-	if !cfg.CommandLoop && (len(cfg.Cmd) == 0 || cfg.Cmd[0] == "") {
-		return nil, fmt.Errorf("initx: container init requires non-empty command (unless CommandLoop is enabled)")
+	if len(cfg.Cmd) == 0 || cfg.Cmd[0] == "" {
+		return nil, fmt.Errorf("initx: container init requires non-empty command")
 	}
 
 	// Determine target architecture for runtime.GOARCH
@@ -136,10 +124,8 @@ func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
 	flags := map[string]bool{
 		"network":         cfg.EnableNetwork,
 		"exec":            cfg.Exec,
-		"command_loop":    cfg.CommandLoop,
 		"drop_privileges": cfg.UID != nil,
 		"qemu_emulation":  cfg.QEMUEmulation != nil,
-		"USE_VSOCK":       cfg.CommandLoop, // Vsock is always enabled for command loop mode
 	}
 
 	// Build config values for pure RTG helpers
@@ -176,13 +162,6 @@ func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
 		timesliceAddr = 0xf0001000
 	}
 	config["TIMESLICE_MMIO_PHYS_ADDR"] = int64(timesliceAddr)
-
-	// Add vsock command port (used for command loop mode)
-	vsockCmdPort := cfg.VsockCmdPort
-	if vsockCmdPort == 0 {
-		vsockCmdPort = 9997 // Default command port
-	}
-	config["VSOCK_CMD_PORT"] = int64(vsockCmdPort)
 
 	// Compile the RTG source with architecture, flags, and config
 	prog, err := rtg.CompileProgramWithOptions(rtgContainerInitSource, rtg.CompileOptions{
@@ -253,41 +232,25 @@ func injectContainerInitHelpers(prog *ir.Program, cfg ContainerInitConfig) error
 	}
 
 	// Command execution helpers
-	if cfg.CommandLoop {
-		// Command loop mode: inject forkExecWaitFromBuffer helper
-		// This reads command from a buffer (populated from vsock) and executes it
-		forkBufferErrLabel := ir.Label("__cc_forkbuffer_error")
+	execErrLabel := ir.Label("__cc_exec_error")
+	forkErrLabel := ir.Label("__cc_fork_error")
 
-		prog.Methods["forkExecWaitFromBuffer"] = ir.Method{
-			ForkExecWaitFromBuffer(cfg.Arch, cfg.Env, cfg.TimesliceMMIOPhysAddr, forkBufferErrLabel, errVar),
-			ir.Return(errVar),
-			ir.DeclareLabel(forkBufferErrLabel, ir.Block{
-				ir.Printf("cc: forkExecWaitFromBuffer error: errno=0x%x\n", errVar),
-				rebootFragment(cfg.Arch),
-			}),
-		}
-	} else {
-		// Legacy mode: inject baked-in command helpers
-		execErrLabel := ir.Label("__cc_exec_error")
-		forkErrLabel := ir.Label("__cc_fork_error")
+	prog.Methods["execCommand"] = ir.Method{
+		Exec(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, execErrLabel, errVar),
+		ir.Return(ir.Int64(0)),
+		ir.DeclareLabel(execErrLabel, ir.Block{
+			ir.Printf("cc: execCommand error: errno=0x%x\n", errVar),
+			rebootFragment(cfg.Arch),
+		}),
+	}
 
-		prog.Methods["execCommand"] = ir.Method{
-			Exec(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, execErrLabel, errVar),
-			ir.Return(ir.Int64(0)),
-			ir.DeclareLabel(execErrLabel, ir.Block{
-				ir.Printf("cc: execCommand error: errno=0x%x\n", errVar),
-				rebootFragment(cfg.Arch),
-			}),
-		}
-
-		prog.Methods["forkExecWait"] = ir.Method{
-			ForkExecWait(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, forkErrLabel, errVar),
-			ir.Return(errVar),
-			ir.DeclareLabel(forkErrLabel, ir.Block{
-				ir.Printf("cc: forkExecWait error: errno=0x%x\n", errVar),
-				rebootFragment(cfg.Arch),
-			}),
-		}
+	prog.Methods["forkExecWait"] = ir.Method{
+		ForkExecWait(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, forkErrLabel, errVar),
+		ir.Return(errVar),
+		ir.DeclareLabel(forkErrLabel, ir.Block{
+			ir.Printf("cc: forkExecWait error: errno=0x%x\n", errVar),
+			rebootFragment(cfg.Arch),
+		}),
 	}
 
 	// Privilege dropping helper (setgid must be called before setuid)
