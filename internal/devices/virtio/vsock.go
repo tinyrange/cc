@@ -148,6 +148,7 @@ func (t VsockTemplate) Create(vm hv.VirtualMachine) (hv.Device, error) {
 		guestCID:    t.GuestCID,
 		backend:     t.Backend,
 		connections: make(map[vsockConnKey]*vsockConnection),
+		closed:      make(chan struct{}),
 	}
 	if err := vsock.Init(vm); err != nil {
 		return nil, fmt.Errorf("virtio-vsock: initialize device: %w", err)
@@ -168,6 +169,8 @@ type Vsock struct {
 	mu          sync.Mutex
 	connections map[vsockConnKey]*vsockConnection
 	pendingRx   [][]byte // packets to deliver to guest
+	closed      chan struct{}
+	wg          sync.WaitGroup
 }
 
 // Init implements hv.MemoryMappedIODevice.
@@ -181,6 +184,34 @@ func (v *Vsock) Init(vm hv.VirtualMachine) error {
 	if mmio, ok := v.Device().(*mmioDevice); ok && vm != nil {
 		mmio.vm = vm
 	}
+	return nil
+}
+
+// Close shuts down the vsock device and waits for all goroutines to finish.
+// This must be called before the VM memory is unmapped.
+func (v *Vsock) Close() error {
+	// Signal all goroutines to stop
+	select {
+	case <-v.closed:
+		// Already closed
+		return nil
+	default:
+		close(v.closed)
+	}
+
+	// Close all backend connections to unblock reads
+	v.mu.Lock()
+	for key, conn := range v.connections {
+		if conn.backend != nil {
+			conn.backend.Close()
+		}
+		delete(v.connections, key)
+	}
+	v.mu.Unlock()
+
+	// Wait for all goroutines to finish
+	v.wg.Wait()
+
 	return nil
 }
 
@@ -332,6 +363,7 @@ func (v *Vsock) handleConnect(dev device, hdr vsockHeader) {
 	v.sendResponse(dev, hdr)
 
 	// Start reading from backend
+	v.wg.Add(1)
 	go v.readFromBackend(dev, vsConn)
 }
 
@@ -514,14 +546,30 @@ func (v *Vsock) sendData(dev device, conn *vsockConnection, data []byte) {
 
 // readFromBackend reads data from the backend and sends to guest.
 func (v *Vsock) readFromBackend(dev device, conn *vsockConnection) {
+	defer v.wg.Done()
+
 	// Use 3072-byte chunks to ensure total packet (header + data) fits in common
 	// kernel RX buffers. The vsock header is 44 bytes, so 3072 + 44 = 3116 total.
 	// Linux kernel typically provides buffers <= 4KB, and we've observed 3776-byte
 	// buffers in practice. Using 3072 provides comfortable margin.
 	buf := make([]byte, 3072)
 	for {
+		// Check if device is being closed
+		select {
+		case <-v.closed:
+			return
+		default:
+		}
+
 		n, err := conn.backend.Read(buf)
 		if err != nil {
+			// Check again if closed - don't try to write to guest after close
+			select {
+			case <-v.closed:
+				return
+			default:
+			}
+
 			v.mu.Lock()
 			if conn.state == vsockConnStateConnected {
 				// Send shutdown
@@ -542,6 +590,13 @@ func (v *Vsock) readFromBackend(dev device, conn *vsockConnection) {
 			return
 		}
 		if n > 0 {
+			// Check if closed before writing to guest
+			select {
+			case <-v.closed:
+				return
+			default:
+			}
+
 			v.mu.Lock()
 			if conn.state == vsockConnStateConnected {
 				v.sendData(dev, conn, buf[:n])
@@ -724,6 +779,8 @@ type simpleVsockListener struct {
 func (l *simpleVsockListener) Accept() (VsockConn, error) {
 	select {
 	case conn := <-l.conns:
+		// Clear any stale read buffer to ensure clean connection state
+		conn.readBuf = nil
 		return conn, nil
 	case <-l.closed:
 		return nil, fmt.Errorf("listener closed")
@@ -797,6 +854,24 @@ func (c *simpleVsockConn) Close() error {
 		close(c.closed)
 	}
 	return nil
+}
+
+// Drain clears any pending read data from the connection.
+// This is used to ensure clean buffer state before sending new data.
+func (c *simpleVsockConn) Drain() {
+	// Clear the read buffer
+	c.readBuf = nil
+
+	// Drain the channel non-blocking
+	for {
+		select {
+		case <-c.readCh:
+			// Discard data
+		default:
+			// No more data available
+			return
+		}
+	}
 }
 
 func (c *simpleVsockConn) LocalPort() uint32 {

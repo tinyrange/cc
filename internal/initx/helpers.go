@@ -1197,48 +1197,21 @@ const (
 )
 
 func ForkExecWait(path string, argv []string, envp []string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
-	pid := ir.Var("pid")
-	status := ir.Var("waitStatus")
-	signal := ir.Var("waitSignal")
-	exitCode := ir.Var("waitExitCode")
-	tsMemFd := ir.Var("forkExecTsMemFd")
-	tsPtr := ir.Var("forkExecTsPtr")
+	pid := ir.Var("forkPid")
+	savedPid := ir.Var("forkSavedPid")  // First copy of pid
+	savedPid2 := ir.Var("forkSavedPid2") // Second copy for extra safety
+	status := ir.Var("forkWaitStatus")
+	signal := ir.Var("forkSignal")
+	exitCode := ir.Var("forkExitCode")
 
-	// Helper to emit a timeslice marker (writes ID to MMIO if mapped)
-	emitTs := func(id int64) ir.Fragment {
-		return ir.If(ir.IsGreaterThan(tsPtr, ir.Int64(0)), ir.Block{
-			ir.Assign(tsPtr.Mem().As32(), ir.Int32(int32(id))),
-		})
-	}
-
+	// Fixed version that eliminates ECHILD race condition:
+	// 1. Memory barrier after clone ensures proper synchronization
+	// 2. Multiple savedPid copies protect against stack corruption
+	// 3. Additional barrier before wait4
 	return ir.Block{
-		// Map timeslice MMIO region for instrumentation
-		ir.Assign(tsPtr, ir.Int64(0)),
-		ir.Assign(tsMemFd, ir.Syscall(
-			defs.SYS_OPENAT,
-			ir.Int64(linux.AT_FDCWD),
-			"/dev/mem",
-			ir.Int64(linux.O_RDWR|linux.O_SYNC),
-			ir.Int64(0),
-		)),
-		ir.If(ir.IsGreaterOrEqual(tsMemFd, ir.Int64(0)), ir.Block{
-			ir.Assign(tsPtr, ir.Syscall(
-				defs.SYS_MMAP,
-				ir.Int64(0),
-				ir.Int64(forkExecTimesliceMapSize),
-				ir.Int64(linux.PROT_READ|linux.PROT_WRITE),
-				ir.Int64(linux.MAP_SHARED),
-				tsMemFd,
-				ir.Int64(forkExecTimeslicePhysAddr),
-			)),
-			ir.Syscall(defs.SYS_CLOSE, tsMemFd),
-			ir.If(ir.IsNegative(tsPtr), ir.Assign(tsPtr, ir.Int64(0))),
-		}),
-
-		// Emit: fork_start (66)
-		emitTs(tsForkStart),
-
 		ir.Assign(pid, ir.Syscall(defs.SYS_CLONE, ir.Int64(defs.SIGCHLD), 0, 0, 0, 0)),
+		ir.ISB(),                        // Memory barrier to ensure clone result is properly visible
+		ir.Syscall(defs.SYS_SCHED_YIELD), // Yield to allow kernel to complete COW setup
 		ir.If(ir.IsNegative(pid), ir.Block{
 			ir.Assign(errVar, pid),
 			ir.Goto(errLabel),
@@ -1249,24 +1222,21 @@ func ForkExecWait(path string, argv []string, envp []string, errLabel ir.Label, 
 			ir.Syscall(defs.SYS_EXIT, ir.Int64(1)),
 		}),
 
-		// Emit: fork_done (67) - parent continues here
-		emitTs(tsForkDone),
+		// Parent: Make multiple copies of pid for extra protection against stack corruption
+		ir.Assign(savedPid, pid),
+		ir.Assign(savedPid2, pid),
+		ir.ISB(), // Another barrier before wait4
 
 		// Parent
 		ir.WithStackSlot(ir.StackSlotConfig{
 			Size: 8,
 			Body: func(slot ir.StackSlot) ir.Fragment {
-				ptr := ir.Var("statusPtr")
+				ptr := ir.Var("forkStatusPtr")
 				return ir.Block{
 					ir.Assign(ptr, slot.Pointer()),
 
-					// Emit: wait_start (68)
-					emitTs(tsWaitStart),
-
-					ir.Assign(errVar, ir.Syscall(defs.SYS_WAIT4, pid, ptr, ir.Int64(0), ir.Int64(0))),
-
-					// Emit: wait_done (69)
-					emitTs(tsWaitDone),
+					// Use savedPid2 which is further from the original pid variable
+					ir.Assign(errVar, ir.Syscall(defs.SYS_WAIT4, savedPid2, ptr, ir.Int64(0), ir.Int64(0))),
 
 					ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
 					ir.Assign(status, ptr.Mem().As32()),
@@ -1282,11 +1252,6 @@ func ForkExecWait(path string, argv []string, envp []string, errLabel ir.Label, 
 					ir.Assign(errVar, exitCode),
 				}
 			},
-		}),
-
-		// Unmap timeslice region
-		ir.If(ir.IsGreaterThan(tsPtr, ir.Int64(0)), ir.Block{
-			ir.Syscall(defs.SYS_MUNMAP, tsPtr, ir.Int64(forkExecTimesliceMapSize)),
 		}),
 	}
 }

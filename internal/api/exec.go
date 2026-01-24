@@ -29,6 +29,7 @@ type instanceCmd struct {
 	mu       sync.Mutex
 	started  bool
 	finished bool
+	done     chan struct{} // signaled when command completes
 	exitCode int
 	err      error
 }
@@ -50,6 +51,7 @@ func (c *instanceCmd) Start() error {
 		return &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("already started")}
 	}
 	c.started = true
+	c.done = make(chan struct{})
 
 	// In the current architecture, commands are executed synchronously
 	// via the command loop protocol. We'll execute immediately.
@@ -60,12 +62,10 @@ func (c *instanceCmd) Start() error {
 
 // Wait waits for a started command to complete.
 func (c *instanceCmd) Wait() error {
+	// Wait for completion signal
+	<-c.done
+
 	c.mu.Lock()
-	for !c.finished {
-		c.mu.Unlock()
-		// Simple polling - in production, would use channels
-		c.mu.Lock()
-	}
 	err := c.err
 	c.mu.Unlock()
 	return err
@@ -117,6 +117,9 @@ func (c *instanceCmd) runCommand() {
 	}
 	c.finished = true
 	c.mu.Unlock()
+
+	// Signal completion
+	close(c.done)
 }
 
 // Output runs the command and returns its stdout.

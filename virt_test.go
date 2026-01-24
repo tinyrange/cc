@@ -93,3 +93,91 @@ func TestPullPolicy(t *testing.T) {
 		t.Error("PullNever should be 2")
 	}
 }
+
+// BenchmarkCommandInExistingGuest benchmarks running commands in an already-running guest.
+// This measures the overhead of command execution via vsock.
+func BenchmarkCommandInExistingGuest(b *testing.B) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// Create OCI client
+	client, err := cc.NewOCIClient()
+	if err != nil {
+		b.Fatalf("NewOCIClient() error = %v", err)
+	}
+
+	// Pull alpine image
+	source, err := client.Pull(ctx, "alpine:latest")
+	if err != nil {
+		b.Fatalf("Pull() error = %v", err)
+	}
+
+	// Create instance (entrypoint is skipped by default for command execution)
+	inst, err := cc.New(source, cc.WithMemoryMB(128))
+	if err != nil {
+		if errors.Is(err, cc.ErrHypervisorUnavailable) {
+			b.Skip("Skipping: hypervisor unavailable (CI environment)")
+		}
+		b.Fatalf("New() error = %v", err)
+	}
+	defer inst.Close()
+
+	// Reset timer after setup
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		cmd := inst.Command("/bin/true")
+		err := cmd.Run()
+		if err != nil {
+			b.Fatalf("Command() error = %v", err)
+		}
+	}
+}
+
+// BenchmarkCommandWithNewGuest benchmarks the full cycle of creating a guest and running a command.
+// This measures the total latency including VM boot time.
+func BenchmarkCommandWithNewGuest(b *testing.B) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	// Create OCI client
+	client, err := cc.NewOCIClient()
+	if err != nil {
+		b.Fatalf("NewOCIClient() error = %v", err)
+	}
+
+	// Pull alpine image once (not part of benchmark)
+	source, err := client.Pull(ctx, "alpine:latest")
+	if err != nil {
+		b.Fatalf("Pull() error = %v", err)
+	}
+
+	// Verify hypervisor is available
+	testInst, err := cc.New(source, cc.WithMemoryMB(128))
+	if err != nil {
+		if errors.Is(err, cc.ErrHypervisorUnavailable) {
+			b.Skip("Skipping: hypervisor unavailable (CI environment)")
+		}
+		b.Fatalf("New() error = %v", err)
+	}
+	testInst.Close()
+
+	// Reset timer after setup
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		inst, err := cc.New(source, cc.WithMemoryMB(128))
+		if err != nil {
+			b.Fatalf("New() error = %v", err)
+		}
+
+		cmd := inst.Command("/bin/true")
+		err = cmd.Run()
+		if err != nil {
+			inst.Close()
+			b.Fatalf("Command() error = %v", err)
+		}
+
+		inst.Close()
+	}
+}

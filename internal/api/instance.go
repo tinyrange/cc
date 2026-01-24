@@ -39,12 +39,13 @@ type instance struct {
 	closed bool
 
 	// Config from options
-	memoryMB uint64
-	cpus     int
-	env      []string
-	workdir  string
-	user     string
-	timeout  time.Duration
+	memoryMB       uint64
+	cpus           int
+	env            []string
+	workdir        string
+	user           string
+	timeout        time.Duration
+	skipEntrypoint bool
 
 	// Filesystem backend for direct FS operations
 	fsBackend vfs.VirtioFsBackend
@@ -69,16 +70,17 @@ func New(source InstanceSource, opts ...Option) (Instance, error) {
 	}
 
 	inst := &instance{
-		id:       generateID(),
-		src:      src,
-		ctx:      ctx,
-		cancel:   cancel,
-		memoryMB: cfg.memoryMB,
-		cpus:     cfg.cpus,
-		env:      cfg.env,
-		workdir:  cfg.workdir,
-		user:     cfg.user,
-		timeout:  cfg.timeout,
+		id:             generateID(),
+		src:            src,
+		ctx:            ctx,
+		cancel:         cancel,
+		memoryMB:       cfg.memoryMB,
+		cpus:           cfg.cpus,
+		env:            cfg.env,
+		workdir:        cfg.workdir,
+		user:           cfg.user,
+		timeout:        cfg.timeout,
+		skipEntrypoint: cfg.skipEntrypoint,
 	}
 
 	if err := inst.start(); err != nil {
@@ -222,6 +224,7 @@ func (inst *instance) start() error {
 	}
 
 	// Build container init program
+	// Always skip entrypoint - commands are run via inst.Command()
 	initProg, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
 		Arch:                  arch,
 		Cmd:                   cmd,
@@ -230,6 +233,7 @@ func (inst *instance) start() error {
 		EnableNetwork:         true,
 		UID:                   uid,
 		GID:                   gid,
+		SkipEntrypoint:        true,
 		TimesliceMMIOPhysAddr: inst.vm.TimesliceMMIOPhysAddr(),
 	})
 	if err != nil {
@@ -239,8 +243,52 @@ func (inst *instance) start() error {
 		return &Error{Op: "new", Err: fmt.Errorf("build init program: %w", err)}
 	}
 
-	// Start session (boots VM and runs init program)
-	inst.session = initx.StartSession(inst.ctx, inst.vm, initProg, initx.SessionConfig{})
+	// Start session (boots VM only, skip the init program for now)
+	// We'll run the container init program synchronously after boot to ensure
+	// it completes before returning from New(). This prevents race conditions
+	// between container init and user commands.
+	bootDone := make(chan error, 1)
+	inst.session = initx.StartSession(inst.ctx, inst.vm, nil, initx.SessionConfig{
+		OnBootComplete: func() error {
+			bootDone <- nil
+			return nil
+		},
+	})
+
+	// Wait for boot to complete
+	select {
+	case err := <-bootDone:
+		if err != nil {
+			inst.vm.Close()
+			inst.ns.Close()
+			inst.h.Close()
+			return &Error{Op: "new", Err: fmt.Errorf("boot failed: %w", err)}
+		}
+	case err := <-inst.session.Done:
+		// Session ended before boot completed - something went wrong
+		inst.vm.Close()
+		inst.ns.Close()
+		inst.h.Close()
+		if err != nil {
+			return &Error{Op: "new", Err: fmt.Errorf("session failed during boot: %w", err)}
+		}
+		return &Error{Op: "new", Err: fmt.Errorf("session ended unexpectedly during boot")}
+	case <-inst.ctx.Done():
+		inst.vm.Close()
+		inst.ns.Close()
+		inst.h.Close()
+		return &Error{Op: "new", Err: inst.ctx.Err()}
+	}
+
+	// Now run the container init program synchronously.
+	// This sets up the container (chroot, mounts, etc.) and must complete
+	// before user commands can run.
+	if err := inst.vm.Run(inst.ctx, initProg); err != nil {
+		inst.vm.Close()
+		inst.ns.Close()
+		inst.h.Close()
+		return &Error{Op: "new", Err: fmt.Errorf("container init failed: %w", err)}
+	}
 
 	return nil
 }
@@ -295,10 +343,8 @@ func (inst *instance) Close() error {
 		inst.h.Close()
 	}
 
-	// Close source
-	if inst.src != nil {
-		inst.src.Close()
-	}
+	// Note: source is not closed here - it's owned by the caller
+	// and may be reused to create additional instances
 
 	return nil
 }

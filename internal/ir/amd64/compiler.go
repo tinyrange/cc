@@ -36,17 +36,24 @@ var syscallArgRegisters = []asm.Variable{
 	amd64.R9,
 }
 
+// printfStackUsage is the stack space Printf requires for register saves and buffer.
+// This must be reserved when the method contains Printf calls to prevent stack overlap.
+// Printf saves 13 registers (104 bytes) plus 32 bytes buffer = 136 bytes total.
+const printfStackUsage = 136
+
 type compiler struct {
 	method       ir.Method
 	fragments    asm.Group
 	varOffsets   map[string]int32
 	frameSize    int32
+	varFrameSize int32 // Size of variable area (before printf padding)
 	freeRegs     []asm.Variable
 	usedRegs     map[asm.Variable]bool
 	paramIndex   int
 	labels       map[string]asm.Label
 	labelCounter int
 	slotStack    []ir.StackSlotContext
+	hasPrintf    bool // true if method contains Printf calls
 }
 
 func Compile(method ir.Method) (asm.Fragment, error) {
@@ -91,15 +98,27 @@ func newCompiler(method ir.Method) (*compiler, error) {
 		offsets[name] = int32(idx) * 8
 	}
 
-	frameSize := alignTo(int32(len(names))*8, stackAlignment)
+	varFrameSize := alignTo(int32(len(names))*8, stackAlignment)
+
+	// Check if the method uses Printf. If so, we need extra padding because
+	// Printf adjusts RSP down and stores registers there.
+	// Without padding, Printf's saved register area can overlap with our variables.
+	hasPrintf := methodUsesPrintf(ir.Block(method))
+	frameSize := varFrameSize
+	if hasPrintf {
+		// Add padding equal to Printf's stack usage to prevent overlap.
+		frameSize = alignTo(varFrameSize+printfStackUsage, stackAlignment)
+	}
 
 	return &compiler{
-		method:     method,
-		varOffsets: offsets,
-		frameSize:  frameSize,
-		freeRegs:   append([]asm.Variable(nil), initialFreeRegisters...),
-		usedRegs:   make(map[asm.Variable]bool),
-		labels:     make(map[string]asm.Label),
+		method:       method,
+		varOffsets:   offsets,
+		varFrameSize: varFrameSize,
+		frameSize:    frameSize,
+		hasPrintf:    hasPrintf,
+		freeRegs:     append([]asm.Variable(nil), initialFreeRegisters...),
+		usedRegs:     make(map[asm.Variable]bool),
+		labels:       make(map[string]asm.Label),
 	}, nil
 }
 
@@ -1664,4 +1683,51 @@ func normalizeGlobalConfig(name string, cfg ir.GlobalConfig) (normalizedGlobal, 
 		return normalizedGlobal{}, fmt.Errorf("ir: global %q alignment %d is not a power of two", name, align)
 	}
 	return normalizedGlobal{size: size, align: align}, nil
+}
+
+// methodUsesPrintf returns true if the method contains any ir.PrintfFragment.
+// Printf has significant stack usage (136 bytes for register saves + buffer)
+// that must be accounted for in the frame size to prevent stack corruption.
+func methodUsesPrintf(f ir.Fragment) bool {
+	switch v := f.(type) {
+	case nil:
+		return false
+	case ir.Block:
+		for _, inner := range v {
+			if methodUsesPrintf(inner) {
+				return true
+			}
+		}
+		return false
+	case ir.Method:
+		return methodUsesPrintf(ir.Block(v))
+	case ir.IfFragment:
+		if methodUsesPrintf(v.Then) {
+			return true
+		}
+		if v.Otherwise != nil && methodUsesPrintf(v.Otherwise) {
+			return true
+		}
+		return false
+	case ir.LabelFragment:
+		return methodUsesPrintf(v.Block)
+	case ir.StackSlotFragment:
+		if v.Body != nil {
+			return methodUsesPrintf(v.Body)
+		}
+		return false
+	case ir.PrintfFragment:
+		return true
+	case ir.AssignFragment:
+		return methodUsesPrintf(v.Src) || methodUsesPrintf(v.Dst)
+	case ir.SyscallFragment:
+		for _, arg := range v.Args {
+			if methodUsesPrintf(arg) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
 }

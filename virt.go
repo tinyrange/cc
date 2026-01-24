@@ -130,6 +130,18 @@ type userOption struct{ user string }
 func (*userOption) IsOption()      {}
 func (o *userOption) User() string { return o.user }
 
+// WithSkipEntrypoint tells the instance to initialize without running the
+// container's entrypoint. This is useful when you want to run commands via
+// inst.Command() without the entrypoint interfering.
+func WithSkipEntrypoint() Option {
+	return &skipEntrypointOption{}
+}
+
+type skipEntrypointOption struct{}
+
+func (*skipEntrypointOption) IsOption()            {}
+func (*skipEntrypointOption) SkipEntrypoint() bool { return true }
+
 // -----------------------------------------------------------------------------
 // OCI Pull Options
 // -----------------------------------------------------------------------------

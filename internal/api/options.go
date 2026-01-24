@@ -8,12 +8,13 @@ import (
 
 // instanceConfig holds parsed instance options.
 type instanceConfig struct {
-	memoryMB uint64
-	cpus     int
-	env      []string
-	timeout  time.Duration
-	workdir  string
-	user     string
+	memoryMB       uint64
+	cpus           int
+	env            []string
+	timeout        time.Duration
+	workdir        string
+	user           string
+	skipEntrypoint bool
 }
 
 // defaultInstanceConfig returns a config with default values.
@@ -40,6 +41,8 @@ func parseInstanceOptions(opts []Option) instanceConfig {
 			cfg.workdir = o.Path()
 		case interface{ User() string }:
 			cfg.user = o.User()
+		case interface{ SkipEntrypoint() bool }:
+			cfg.skipEntrypoint = o.SkipEntrypoint()
 		}
 	}
 
