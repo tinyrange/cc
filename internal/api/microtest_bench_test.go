@@ -1,4 +1,4 @@
-package cc_test
+package api
 
 import (
 	"context"
