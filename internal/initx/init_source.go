@@ -139,27 +139,7 @@ func main() int64 {
 	}
 
 	// === Phase 6: Time setup ===
-
-	// allocate timespec buffer
-	// timespecMem := runtime.Syscall(runtime.SYS_MMAP, 0, 16, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
-	// if timespecMem >= 0 {
-	// 	// read time from config region and store in timespec struct
-	// 	var timeSec int64 = 0
-	// 	var timeNsec int64 = 0
-	// 	timeSec = runtime.Load64(configMem, configTimeSecField)
-	// 	timeNsec = runtime.Load64(configMem, configTimeNsecField)
-	// 	runtime.Store64(timespecMem, 0, timeSec)
-	// 	runtime.Store64(timespecMem, 8, timeNsec)
-
-	// 	// call clock_settime
-	// 	clockSetResult := runtime.Syscall(runtime.SYS_CLOCK_SETTIME, runtime.CLOCK_REALTIME, timespecMem)
-	// 	if clockSetResult < 0 {
-	// 		runtime.Printf("initx: clock_settime failed (errno=0x%x), continuing anyway\n", 0-clockSetResult)
-	// 	}
-
-	// 	// free timespec buffer
-	// 	runtime.Syscall(runtime.SYS_MUNMAP, timespecMem, 16)
-	// }
+	// Time is now set via vsock message - see vsockMainLoop
 	// Record: phase6_time_setup (14)
 	if timesliceMem > 0 {
 		runtime.Store32(timesliceMem, 0, 14)
@@ -325,17 +305,35 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 			reboot()
 		}
 
-		// Parse header: code_len(4) + reloc_count(4)
+		// Parse header: time_sec(8) + time_nsec(8) + code_len(4) + reloc_count(4)
+		// First, set the system clock from the host time
+		var timeSec int64 = 0
+		var timeNsec int64 = 0
+		timeSec = runtime.Load64(progBuf, 0)
+		timeNsec = runtime.Load64(progBuf, 8)
+
+		// Allocate timespec and call clock_settime
+		timespecMem := runtime.Syscall(runtime.SYS_MMAP, 0, 16, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
+		if timespecMem >= 0 {
+			runtime.Store64(timespecMem, 0, timeSec)
+			runtime.Store64(timespecMem, 8, timeNsec)
+			clockSetResult := runtime.Syscall(runtime.SYS_CLOCK_SETTIME, runtime.CLOCK_REALTIME, timespecMem)
+			if clockSetResult < 0 {
+				runtime.Printf("initx: clock_settime failed (errno=0x%x)\n", 0-clockSetResult)
+			}
+			runtime.Syscall(runtime.SYS_MUNMAP, timespecMem, 16)
+		}
+
 		var codeLen int64 = 0
 		var relocCount int64 = 0
-		codeLen = runtime.Load32(progBuf, 0)
-		relocCount = runtime.Load32(progBuf, 4)
+		codeLen = runtime.Load32(progBuf, 16)
+		relocCount = runtime.Load32(progBuf, 20)
 
 		// Calculate offsets
 		var relocBytes int64 = 0
 		var codeOffset int64 = 0
 		relocBytes = relocCount << 2
-		codeOffset = 8 + relocBytes // 8 = code_len(4) + reloc_count(4)
+		codeOffset = 24 + relocBytes // 24 = time_sec(8) + time_nsec(8) + code_len(4) + reloc_count(4)
 
 		// Copy code to anonMem
 		var copySrc int64 = 0
@@ -373,7 +371,7 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 		// Apply relocations
 		var relocPtr int64 = 0
 		var relocIndex int64 = 0
-		relocPtr = progBuf + 8 // relocations start at offset 8
+		relocPtr = progBuf + 24 // relocations start at offset 24 (after time_sec, time_nsec, code_len, reloc_count)
 		relocIndex = 0
 
 		for relocIndex < relocCount {

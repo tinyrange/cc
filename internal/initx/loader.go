@@ -222,7 +222,7 @@ var (
 
 // VsockProgramServer handles program loading via vsock.
 // Protocol:
-//   - Host → Guest: [len:4][code_len:4][reloc_count:4][relocs:4*count][code:code_len]
+//   - Host → Guest: [len:4][time_sec:8][time_nsec:8][code_len:4][reloc_count:4][relocs:4*count][code:code_len]
 //   - Guest → Host: [len:4][exit_code:4]
 const (
 	VsockProgramPort = 9998
@@ -313,6 +313,7 @@ func (s *VsockProgramServer) drainStaleData() {
 }
 
 // SendProgram sends a compiled program to the guest.
+// Protocol: [len:4][time_sec:8][time_nsec:8][code_len:4][reloc_count:4][relocs:4*count][code:code_len]
 func (s *VsockProgramServer) SendProgram(prog *ir.Program) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -332,8 +333,8 @@ func (s *VsockProgramServer) SendProgram(prog *ir.Program) error {
 	progBytes := asmProg.Bytes()
 	relocs := asmProg.Relocations()
 
-	// Calculate total message size: code_len(4) + reloc_count(4) + relocs(4*N) + code
-	payloadLen := 4 + 4 + 4*len(relocs) + len(progBytes)
+	// Calculate total message size: time_sec(8) + time_nsec(8) + code_len(4) + reloc_count(4) + relocs(4*N) + code
+	payloadLen := 8 + 8 + 4 + 4 + 4*len(relocs) + len(progBytes)
 
 	// Build the message
 	msg := make([]byte, 4+payloadLen) // len prefix + payload
@@ -341,19 +342,24 @@ func (s *VsockProgramServer) SendProgram(prog *ir.Program) error {
 	// Length prefix (excludes itself)
 	binary.LittleEndian.PutUint32(msg[0:4], uint32(payloadLen))
 
+	// Current time for guest clock synchronization
+	now := time.Now()
+	binary.LittleEndian.PutUint64(msg[4:12], uint64(now.Unix()))
+	binary.LittleEndian.PutUint64(msg[12:20], uint64(now.Nanosecond()))
+
 	// code_len
-	binary.LittleEndian.PutUint32(msg[4:8], uint32(len(progBytes)))
+	binary.LittleEndian.PutUint32(msg[20:24], uint32(len(progBytes)))
 
 	// reloc_count
-	binary.LittleEndian.PutUint32(msg[8:12], uint32(len(relocs)))
+	binary.LittleEndian.PutUint32(msg[24:28], uint32(len(relocs)))
 
 	// relocations
 	for i, reloc := range relocs {
-		binary.LittleEndian.PutUint32(msg[12+4*i:], uint32(reloc))
+		binary.LittleEndian.PutUint32(msg[28+4*i:], uint32(reloc))
 	}
 
 	// code
-	copy(msg[12+4*len(relocs):], progBytes)
+	copy(msg[28+4*len(relocs):], progBytes)
 
 	// Write the entire message
 	if _, err := s.conn.Write(msg); err != nil {
