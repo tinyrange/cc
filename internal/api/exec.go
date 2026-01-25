@@ -25,13 +25,40 @@ func extractPathFromEnv(env []string) string {
 	return defaultPathEnv
 }
 
+// lookupPathInBackend walks a path through the fsBackend and returns the node ID and attributes.
+// Returns errno != 0 if the path doesn't exist.
+func (c *instanceCmd) lookupPathInBackend(p string) (nodeID uint64, mode uint32, errno int32) {
+	p = path.Clean(p)
+	if p == "/" || p == "" {
+		attr, err := c.inst.fsBackend.GetAttr(1)
+		return 1, attr.Mode, err
+	}
+
+	// Remove leading slash and split
+	p = strings.TrimPrefix(p, "/")
+	parts := strings.Split(p, "/")
+
+	currentID := uint64(1) // root node ID
+
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		childID, attr, err := c.inst.fsBackend.Lookup(currentID, part)
+		if err != 0 {
+			return 0, 0, err
+		}
+		currentID = childID
+		mode = attr.Mode
+	}
+
+	return currentID, mode, 0
+}
+
 func (c *instanceCmd) lookPath(file string) (string, error) {
 	if file == "" {
 		return "", fmt.Errorf("executable name is empty")
 	}
-
-	// Get ContainerFS from instance
-	cfs := c.inst.src.cfs
 
 	pathEnv := extractPathFromEnv(c.env)
 	if pathEnv == "" {
@@ -52,28 +79,19 @@ func (c *instanceCmd) lookPath(file string) (string, error) {
 		}
 
 		candidate := path.Join(dir, file)
-		entry, err := cfs.Lookup(candidate)
-		if err != nil {
+
+		// Look up the file in the live filesystem
+		_, mode, errno := c.lookupPathInBackend(candidate)
+		if errno != 0 {
 			continue
 		}
 
-		// If symlink, resolve and check target
-		if entry.Symlink != nil {
-			resolved, err := cfs.ResolvePath(candidate)
-			if err != nil {
-				continue
-			}
-			entry, err = cfs.Lookup(resolved)
-			if err != nil {
-				continue
-			}
-		}
+		// Check if it's a regular file with execute permission
+		// S_IFMT = 0170000, S_IFREG = 0100000
+		isRegular := (mode & 0170000) == 0100000
+		isExecutable := (mode & 0111) != 0
 
-		if entry.File == nil {
-			continue
-		}
-		_, mode := entry.File.Stat()
-		if mode.IsDir() || mode&0o111 == 0 {
+		if !isRegular || !isExecutable {
 			continue
 		}
 
@@ -148,6 +166,7 @@ func (c *instanceCmd) runCommand() {
 	cmdPath := c.name
 
 	// Resolve command path if it doesn't contain "/"
+	// Search the live filesystem (fsBackend) for the executable in PATH.
 	if !strings.Contains(cmdPath, "/") {
 		resolved, err := c.lookPath(cmdPath)
 		if err != nil {
