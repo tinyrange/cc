@@ -1,8 +1,10 @@
-package api
+package bench
 
 import (
 	"context"
 	"errors"
+	"log"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -36,6 +38,13 @@ func setupAlpine(t *testing.T, ctx context.Context) (cc.OCIClient, cc.InstanceSo
 	}
 
 	return client, source
+}
+
+func TestMain(m *testing.M) {
+	if err := cc.EnsureExecutableIsSigned(); err != nil {
+		log.Fatalf("Failed to sign executable: %v", err)
+	}
+	os.Exit(m.Run())
 }
 
 // TestMicroBench_RapidInstanceCreateDestroy tests if rapid instance
