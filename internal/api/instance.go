@@ -451,12 +451,16 @@ func (inst *instance) Command(name string, args ...string) Cmd {
 }
 
 func (inst *instance) CommandContext(ctx context.Context, name string, args ...string) Cmd {
+	// Merge environment: image config env + instance options env
+	env := append([]string{}, inst.src.image.Config.Env...)
+	env = append(env, inst.env...)
+
 	return &instanceCmd{
 		inst: inst,
 		ctx:  ctx,
 		name: name,
 		args: args,
-		env:  inst.env,
+		env:  env,
 		dir:  inst.workdir,
 	}
 }

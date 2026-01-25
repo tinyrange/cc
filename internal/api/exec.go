@@ -5,12 +5,83 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"path"
+	"strings"
 	"sync"
 
 	"github.com/tinyrange/cc/internal/initx"
 	"github.com/tinyrange/cc/internal/ir"
 	"github.com/tinyrange/cc/internal/linux/defs"
 )
+
+const defaultPathEnv = "/bin:/usr/bin"
+
+func extractPathFromEnv(env []string) string {
+	for _, entry := range env {
+		if after, ok := strings.CutPrefix(entry, "PATH="); ok {
+			return after
+		}
+	}
+	return defaultPathEnv
+}
+
+func (c *instanceCmd) lookPath(file string) (string, error) {
+	if file == "" {
+		return "", fmt.Errorf("executable name is empty")
+	}
+
+	// Get ContainerFS from instance
+	cfs := c.inst.src.cfs
+
+	pathEnv := extractPathFromEnv(c.env)
+	if pathEnv == "" {
+		pathEnv = defaultPathEnv
+	}
+
+	workDir := c.dir
+	if workDir == "" {
+		workDir = "/"
+	}
+
+	for dir := range strings.SplitSeq(pathEnv, ":") {
+		switch {
+		case dir == "":
+			dir = workDir
+		case !path.IsAbs(dir):
+			dir = path.Join(workDir, dir)
+		}
+
+		candidate := path.Join(dir, file)
+		entry, err := cfs.Lookup(candidate)
+		if err != nil {
+			continue
+		}
+
+		// If symlink, resolve and check target
+		if entry.Symlink != nil {
+			resolved, err := cfs.ResolvePath(candidate)
+			if err != nil {
+				continue
+			}
+			entry, err = cfs.Lookup(resolved)
+			if err != nil {
+				continue
+			}
+		}
+
+		if entry.File == nil {
+			continue
+		}
+		_, mode := entry.File.Stat()
+		if mode.IsDir() || mode&0o111 == 0 {
+			continue
+		}
+
+		return candidate, nil
+	}
+
+	return "", fmt.Errorf("executable %q not found in PATH", file)
+}
 
 // instanceCmd implements Cmd.
 type instanceCmd struct {
@@ -74,13 +145,24 @@ func (c *instanceCmd) Wait() error {
 // runCommand executes the command in the guest.
 func (c *instanceCmd) runCommand() {
 	// Prepare command path and args
-	path := c.name
+	cmdPath := c.name
 
-	// Prepare environment
-	env := c.env
-	if len(env) == 0 {
-		env = c.inst.env
+	// Resolve command path if it doesn't contain "/"
+	if !strings.Contains(cmdPath, "/") {
+		resolved, err := c.lookPath(cmdPath)
+		if err != nil {
+			c.mu.Lock()
+			c.err = &Error{Op: "exec", Path: c.name, Err: err}
+			c.finished = true
+			c.mu.Unlock()
+			close(c.done)
+			return
+		}
+		cmdPath = resolved
 	}
+
+	// Use the command's environment (already merged in CommandContext)
+	env := c.env
 
 	// Build IR program using ForkExecWait helper
 	errLabel := ir.Label("exec_error")
@@ -90,7 +172,7 @@ func (c *instanceCmd) runCommand() {
 		Entrypoint: "main",
 		Methods: map[string]ir.Method{
 			"main": {
-				initx.ForkExecWait(path, c.args, env, errLabel, errVar),
+				initx.ForkExecWait(cmdPath, c.args, env, errLabel, errVar),
 				ir.Return(errVar),
 				ir.DeclareLabel(errLabel, ir.Block{
 					ir.Printf("cc: exec error: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
