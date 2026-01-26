@@ -1,6 +1,6 @@
-//go:build linux && amd64
+//go:build (darwin || linux) && arm64
 
-package amd64
+package arm64
 
 import (
 	"encoding/binary"
@@ -12,6 +12,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// Func represents a compiled assembly function that can be called with arguments.
 type Func struct {
 	entry uintptr
 	call  func(...any) uintptr
@@ -36,6 +37,7 @@ func (fn Func) Program() asm.Program {
 	return fn.prog.Clone()
 }
 
+// Compile compiles an assembly fragment and returns a callable Func.
 func Compile(f asm.Fragment) (Func, func(), error) {
 	prog, err := EmitProgram(f)
 	if err != nil {
@@ -52,6 +54,7 @@ func Compile(f asm.Fragment) (Func, func(), error) {
 	return fn, release, nil
 }
 
+// MustCompile compiles an assembly fragment and panics on error.
 func MustCompile(f asm.Fragment) Func {
 	fn, _, err := Compile(f)
 	if err != nil {
@@ -60,6 +63,7 @@ func MustCompile(f asm.Fragment) Func {
 	return fn
 }
 
+// PrepareAssembly prepares assembly code for execution without arguments.
 func PrepareAssembly(code []byte, relocations []int, bssSize ...int) (func(), func(), error) {
 	bss := 0
 	if len(bssSize) > 0 {
@@ -76,7 +80,7 @@ func PrepareAssembly(code []byte, relocations []int, bssSize ...int) (func(), fu
 }
 
 // PrepareAssemblyWithArgs is like PrepareAssembly, but allows calling the assembled code with up to
-// six integer or pointer arguments (passed in the System V calling convention registers).
+// eight integer or pointer arguments (passed in the AAPCS64 calling convention registers X0-X7).
 // It also accepts an optional bssSize parameter to allocate space for BSS (globals).
 func PrepareAssemblyWithArgs(code []byte, relocations []int, bssSize ...int) (Func, func(), error) {
 	bss := 0
@@ -115,7 +119,7 @@ func PrepareAssemblyWithArgs(code []byte, relocations []int, bssSize ...int) (Fu
 	}, release, nil
 }
 
-const maxAssemblyArguments = 6
+const maxAssemblyArguments = 8 // AAPCS64 uses X0-X7 for arguments
 
 func assemblyArgValue(arg any) (uintptr, error) {
 	switch v := arg.(type) {
@@ -221,6 +225,9 @@ func createAssemblyTrampoline(code []byte, relocations []int, bssSize int) (uint
 		return 0, nil, fmt.Errorf("mprotect code region: %w", err)
 	}
 
+	// Clear instruction cache - critical for ARM64
+	clearInstructionCache(base, uintptr(size))
+
 	release = false
 
 	return base, func() {
@@ -228,7 +235,12 @@ func createAssemblyTrampoline(code []byte, relocations []int, bssSize int) (uint
 	}, nil
 }
 
-// callAssemblyEntry jumps to the provided code pointer and never returns on success.
+// callAssemblyEntry jumps to the provided code pointer.
 func callAssemblyEntry(entry uintptr)
 
+// callAssemblyEntryWithArgs calls the provided code pointer with arguments in X0-X7.
 func callAssemblyEntryWithArgs(entry uintptr, args *uintptr, nargs uintptr) uintptr
+
+// clearInstructionCache clears the instruction cache for the given memory region.
+// This is required on ARM64 because instruction and data caches are not coherent.
+func clearInstructionCache(addr uintptr, size uintptr)

@@ -1185,7 +1185,9 @@ func (c *compiler) loadGlobalAddress(name string) (asm.Variable, error) {
 	if err != nil {
 		return 0, err
 	}
-	c.emit(arm64asm.MovImmediate(arm64asm.Reg64(reg), int64(globalPointerPlaceholder(name))))
+	// Use LoadImmediate64FromLiteral to store the placeholder in the literal pool
+	// as raw bytes, allowing BuildStandaloneProgram to scan and replace it.
+	c.emit(arm64asm.LoadImmediate64FromLiteral(arm64asm.Reg64(reg), globalPointerPlaceholder(name)))
 	return reg, nil
 }
 

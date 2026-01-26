@@ -14,6 +14,16 @@ type Backend interface {
 	BuildStandaloneProgram(p *Program) (asm.Program, error)
 }
 
+// NativeBackend extends Backend with native execution support.
+// Implementations are only available on platforms that support native code execution.
+type NativeBackend interface {
+	Backend
+	// PrepareNativeExecution prepares a compiled program for native execution.
+	// Returns a callable function, a cleanup function, and an error.
+	// The cleanup function must be called when the function is no longer needed.
+	PrepareNativeExecution(prog asm.Program) (asm.NativeFunc, func(), error)
+}
+
 var (
 	backendsMu sync.RWMutex
 	backends   = make(map[hv.CpuArchitecture]Backend)
@@ -63,4 +73,19 @@ func BuildStandaloneProgramForArch(arch hv.CpuArchitecture, prog *Program) (asm.
 		return asm.Program{}, err
 	}
 	return backend.BuildStandaloneProgram(prog)
+}
+
+// LookupNativeBackend returns the NativeBackend for the specified architecture.
+// Returns an error if no backend is registered or if the backend does not
+// support native execution.
+func LookupNativeBackend(arch hv.CpuArchitecture) (NativeBackend, error) {
+	backend, err := lookupBackend(arch)
+	if err != nil {
+		return nil, err
+	}
+	native, ok := backend.(NativeBackend)
+	if !ok {
+		return nil, fmt.Errorf("ir: backend for %q does not support native execution", arch)
+	}
+	return native, nil
 }
