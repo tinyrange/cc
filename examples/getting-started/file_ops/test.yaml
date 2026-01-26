@@ -1,0 +1,63 @@
+name: file_ops
+description: Demonstrate filesystem operations in a sandboxed environment
+
+build:
+  package: ./getting-started/file_ops
+  timeout: 30s
+
+cli:
+  timeout: 60s
+
+cli_tests:
+  - name: create directory
+    args: ["-op", "mkdir", "-path", "/app/data"]
+    expect:
+      exit_code: 0
+      stdout_contains: "created directory"
+
+  - name: write file
+    args: ["-op", "write", "-path", "/app/test.txt", "-content", "Hello, File!"]
+    expect:
+      exit_code: 0
+      stdout_contains: "wrote 12 bytes"
+
+  - name: read file from root
+    args: ["-op", "read", "-path", "/etc/hostname"]
+    expect:
+      exit_code: 0
+
+  - name: list root directory
+    args: ["-op", "list", "-path", "/"]
+    expect:
+      exit_code: 0
+      stdout_contains: "dev/"
+
+  - name: list etc directory
+    args: ["-op", "list", "-path", "/etc"]
+    expect:
+      exit_code: 0
+      stdout_contains: "hostname"
+
+  - name: read non-existent file
+    args: ["-op", "read", "-path", "/nonexistent/file.txt"]
+    expect:
+      exit_code: 1
+      stderr_contains: "error"
+
+  - name: unknown operation
+    args: ["-op", "unknown", "-path", "/app"]
+    expect:
+      exit_code: 1
+      stderr_contains: "unknown operation"
+
+  - name: missing operation
+    args: ["-path", "/app"]
+    expect:
+      exit_code: 1
+      stderr_contains: "must provide -op"
+
+  - name: missing path
+    args: ["-op", "list"]
+    expect:
+      exit_code: 1
+      stderr_contains: "must provide -path"

@@ -1,0 +1,52 @@
+name: stdin_echo
+description: Process stdin in a sandboxed environment
+
+build:
+  package: ./getting-started/stdin_echo
+  timeout: 30s
+
+cli:
+  timeout: 60s
+
+cli_tests:
+  - name: cat mode
+    args: ["-mode", "cat", "-input", "Hello, World!"]
+    expect:
+      exit_code: 0
+      stdout_equals: "Hello, World!"
+
+  - name: uppercase mode
+    args: ["-mode", "upper", "-input", "hello world"]
+    expect:
+      exit_code: 0
+      stdout_equals: "HELLO WORLD"
+
+  - name: lowercase mode
+    args: ["-mode", "lower", "-input", "HELLO WORLD"]
+    expect:
+      exit_code: 0
+      stdout_equals: "hello world"
+
+  - name: sort mode
+    args: ["-mode", "sort", "-input", "banana\napple\ncherry\n"]
+    expect:
+      exit_code: 0
+      stdout_equals: "apple\nbanana\ncherry\n"
+
+  - name: reverse mode
+    args: ["-mode", "reverse", "-input", "hello\nworld\n"]
+    expect:
+      exit_code: 0
+      stdout_equals: "olleh\ndlrow\n"
+
+  - name: wc mode
+    args: ["-mode", "wc", "-input", "one two three\nfour five\n"]
+    expect:
+      exit_code: 0
+      stdout_contains: "2"
+
+  - name: unknown mode
+    args: ["-mode", "unknown", "-input", "test"]
+    expect:
+      exit_code: 1
+      stderr_contains: "unknown mode"

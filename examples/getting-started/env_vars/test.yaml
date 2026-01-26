@@ -1,0 +1,74 @@
+name: env_vars
+description: Pass environment variables to sandboxed processes
+
+build:
+  package: ./getting-started/env_vars
+  timeout: 30s
+
+cli:
+  timeout: 60s
+
+cli_tests:
+  - name: access single env var
+    args:
+      - "-env"
+      - "GREETING=Hello"
+      - "-code"
+      - |
+        import os
+        print(os.environ.get('GREETING', 'not set'))
+    expect:
+      exit_code: 0
+      stdout_equals: "Hello\n"
+
+  - name: access multiple env vars
+    args:
+      - "-env"
+      - "NAME=Alice,AGE=30"
+      - "-code"
+      - |
+        import os
+        name = os.environ.get('NAME')
+        age = os.environ.get('AGE')
+        print(f'{name} is {age} years old')
+    expect:
+      exit_code: 0
+      stdout_equals: "Alice is 30 years old\n"
+
+  - name: default when env not set
+    args:
+      - "-code"
+      - |
+        import os
+        print(os.environ.get('UNDEFINED_VAR', 'default_value'))
+    expect:
+      exit_code: 0
+      stdout_equals: "default_value\n"
+
+  - name: env var in calculation
+    args:
+      - "-env"
+      - "MULTIPLIER=5"
+      - "-code"
+      - |
+        import os
+        mult = int(os.environ.get('MULTIPLIER', '1'))
+        print(10 * mult)
+    expect:
+      exit_code: 0
+      stdout_equals: "50\n"
+
+  - name: list shows custom env
+    args:
+      - "-env"
+      - "CUSTOM_VAR=custom_value"
+      - "-list"
+    expect:
+      exit_code: 0
+      stdout_contains: "CUSTOM_VAR=custom_value"
+
+  - name: missing code or list flag
+    args: []
+    expect:
+      exit_code: 1
+      stderr_contains: "must provide -code or -list"

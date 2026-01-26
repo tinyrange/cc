@@ -1,0 +1,98 @@
+name: compile_go
+description: Compile and run Go code in a sandboxed environment
+
+build:
+  package: ./getting-started/compile_go
+  timeout: 30s
+
+cli:
+  timeout: 120s
+
+cli_tests:
+  - name: hello world
+    args:
+      - "-code"
+      - |
+        package main
+
+        import "fmt"
+
+        func main() {
+            fmt.Println("Hello, World!")
+        }
+    expect:
+      exit_code: 0
+      stdout_equals: "Hello, World!\n"
+
+  - name: arithmetic
+    args:
+      - "-code"
+      - |
+        package main
+
+        import "fmt"
+
+        func main() {
+            fmt.Println(2 + 2)
+        }
+    expect:
+      exit_code: 0
+      stdout_equals: "4\n"
+
+  - name: function call
+    args:
+      - "-code"
+      - |
+        package main
+
+        import "fmt"
+
+        func add(a, b int) int {
+            return a + b
+        }
+
+        func main() {
+            fmt.Println(add(3, 5))
+        }
+    expect:
+      exit_code: 0
+      stdout_equals: "8\n"
+
+  - name: slice operations
+    args:
+      - "-code"
+      - |
+        package main
+
+        import "fmt"
+
+        func main() {
+            nums := []int{1, 2, 3, 4, 5}
+            sum := 0
+            for _, n := range nums {
+                sum += n
+            }
+            fmt.Println(sum)
+        }
+    expect:
+      exit_code: 0
+      stdout_equals: "15\n"
+
+  - name: compile error
+    args:
+      - "-code"
+      - |
+        package main
+
+        func main() {
+            undefinedFunction()
+        }
+    expect:
+      exit_code: 1
+      stderr_contains: "undefined"
+
+  - name: missing argument
+    args: []
+    expect:
+      exit_code: 1
+      stderr_contains: "must provide"

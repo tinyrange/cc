@@ -1,0 +1,52 @@
+name: run_python
+description: Run Python scripts in a sandboxed environment
+
+build:
+  package: ./getting-started/run_python
+  timeout: 30s
+
+cli:
+  timeout: 60s
+
+cli_tests:
+  - name: hello world
+    args: ["-code", "print('Hello, World!')"]
+    expect:
+      exit_code: 0
+      stdout_equals: "Hello, World!\n"
+
+  - name: arithmetic
+    args: ["-code", "print(2 + 2)"]
+    expect:
+      exit_code: 0
+      stdout_equals: "4\n"
+
+  - name: list comprehension
+    args: ["-code", "print([x*2 for x in range(5)])"]
+    expect:
+      exit_code: 0
+      stdout_contains: "[0, 2, 4, 6, 8]"
+
+  - name: multiline script
+    args: ["-code", "def greet(name):\n    return f'Hello, {name}!'\nprint(greet('Alice'))"]
+    expect:
+      exit_code: 0
+      stdout_equals: "Hello, Alice!\n"
+
+  - name: syntax error
+    args: ["-code", "print('unclosed"]
+    expect:
+      exit_code: 1
+      stderr_contains: "SyntaxError"
+
+  - name: import standard library
+    args: ["-code", "import json\nprint(json.dumps({'key': 'value'}))"]
+    expect:
+      exit_code: 0
+      stdout_contains: '"key"'
+
+  - name: missing argument
+    args: []
+    expect:
+      exit_code: 1
+      stderr_contains: "must provide"
