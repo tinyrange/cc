@@ -43,6 +43,7 @@ func (f *instanceFS) WithContext(ctx context.Context) FS {
 
 // resolvePath walks the path and returns the parent nodeID, base name, and nodeID of the target.
 // Returns errno if any part of the path cannot be resolved (except the last component).
+// This does NOT follow symlinks for the final component.
 func (f *instanceFS) resolvePath(p string) (parentID uint64, name string, nodeID uint64, errno int32) {
 	p = path.Clean(p)
 	if p == "/" || p == "" {
@@ -75,6 +76,86 @@ func (f *instanceFS) resolvePath(p string) (parentID uint64, name string, nodeID
 	return currentID, "", currentID, 0
 }
 
+// resolvePathFollowSymlinks is like resolvePath but follows symlinks for all components including the final one.
+// It returns the final nodeID after following all symlinks.
+func (f *instanceFS) resolvePathFollowSymlinks(p string) (nodeID uint64, errno int32) {
+	const maxSymlinkDepth = 40 // prevent infinite loops
+
+	p = path.Clean(p)
+	if p == "/" || p == "" {
+		return 1, 0 // root
+	}
+
+	readlinkBackend, hasReadlink := f.inst.fsBackend.(interface {
+		Readlink(nodeID uint64) (target string, errno int32)
+	})
+	if !hasReadlink {
+		// No symlink support, fall back to regular resolution
+		_, _, id, err := f.resolvePath(p)
+		return id, err
+	}
+
+	// Start from root
+	currentID := uint64(1)
+	p = strings.TrimPrefix(p, "/")
+	parts := strings.Split(p, "/")
+
+	symlinkDepth := 0
+
+	for i := 0; i < len(parts); i++ {
+		part := parts[i]
+		if part == "" {
+			continue
+		}
+
+		childID, attr, err := f.inst.fsBackend.Lookup(currentID, part)
+		if err != 0 {
+			return 0, err
+		}
+
+		// Check if this is a symlink
+		if (attr.Mode & 0170000) == 0120000 { // S_IFLNK
+			symlinkDepth++
+			if symlinkDepth > maxSymlinkDepth {
+				return 0, -int32(syscall.ELOOP)
+			}
+
+			// Read symlink target
+			target, err := readlinkBackend.Readlink(childID)
+			if err != 0 {
+				return 0, err
+			}
+
+			// Construct new path
+			var newPath string
+			if strings.HasPrefix(target, "/") {
+				// Absolute symlink
+				newPath = target
+			} else {
+				// Relative symlink - resolve from parent directory
+				currentParts := parts[:i]
+				newPath = "/" + strings.Join(currentParts, "/") + "/" + target
+			}
+
+			// Append remaining parts
+			if i+1 < len(parts) {
+				newPath = newPath + "/" + strings.Join(parts[i+1:], "/")
+			}
+
+			// Restart resolution with new path
+			newPath = path.Clean(newPath)
+			currentID = 1
+			parts = strings.Split(strings.TrimPrefix(newPath, "/"), "/")
+			i = -1 // Will be incremented to 0
+			continue
+		}
+
+		currentID = childID
+	}
+
+	return currentID, 0
+}
+
 // Open opens a file for reading.
 func (f *instanceFS) Open(name string) (File, error) {
 	return f.OpenFile(name, os.O_RDONLY, 0)
@@ -87,55 +168,92 @@ func (f *instanceFS) Create(name string) (File, error) {
 
 // OpenFile is the generalized open call.
 func (f *instanceFS) OpenFile(name string, flag int, perm fs.FileMode) (File, error) {
-	// For read-only operations, we can use the ContainerFS directly
-	if flag == os.O_RDONLY {
-		return &instanceFile{
-			inst: f.inst,
-			ctx:  f.ctx,
-			path: name,
-			flag: flag,
-			perm: perm,
-		}, nil
+	if f.inst.fsBackend == nil {
+		return nil, &Error{Op: "open", Path: name, Err: ErrNotRunning}
 	}
 
-	// For write operations, we need to track the file differently
+	// Resolve path through fsBackend, following symlinks
+	nodeID, errno := f.resolvePathFollowSymlinks(name)
+	if errno != 0 || nodeID == 0 {
+		return nil, &Error{Op: "open", Path: name, Err: errnoToError(errno)}
+	}
+
+	// Check if Open is supported
+	openBackend, hasOpen := f.inst.fsBackend.(interface {
+		Open(nodeID uint64, flags uint32) (fh uint64, errno int32)
+	})
+	if !hasOpen {
+		return nil, &Error{Op: "open", Path: name, Err: fmt.Errorf("backend does not support open")}
+	}
+
+	// Convert Go flags to POSIX flags
+	var flags uint32
+	switch flag & (os.O_RDONLY | os.O_WRONLY | os.O_RDWR) {
+	case os.O_RDONLY:
+		flags = uint32(syscall.O_RDONLY)
+	case os.O_WRONLY:
+		flags = uint32(syscall.O_WRONLY)
+	case os.O_RDWR:
+		flags = uint32(syscall.O_RDWR)
+	}
+
+	fh, errno := openBackend.Open(nodeID, flags)
+	if errno != 0 {
+		return nil, &Error{Op: "open", Path: name, Err: errnoToError(errno)}
+	}
+
 	return &instanceFile{
-		inst: f.inst,
-		ctx:  f.ctx,
-		path: name,
-		flag: flag,
-		perm: perm,
+		inst:   f.inst,
+		ctx:    f.ctx,
+		path:   name,
+		flag:   flag,
+		perm:   perm,
+		nodeID: nodeID,
+		fh:     fh,
 	}, nil
 }
 
 // ReadFile reads the entire contents of a file.
 func (f *instanceFS) ReadFile(name string) ([]byte, error) {
-	// Use the ContainerFS directly for efficient reads
-	cfs := f.inst.src.cfs
-
-	// Resolve symlinks to get the actual file path
-	resolvedPath, err := cfs.ResolvePath(name)
-	if err != nil {
-		return nil, &Error{Op: "readfile", Path: name, Err: err}
+	if f.inst.fsBackend == nil {
+		return nil, &Error{Op: "readfile", Path: name, Err: ErrNotRunning}
 	}
 
-	// Lookup the resolved file in the container filesystem
-	entry, err := cfs.Lookup(resolvedPath)
-	if err != nil {
-		return nil, &Error{Op: "readfile", Path: name, Err: err}
+	// Resolve path through the fsBackend, following symlinks
+	nodeID, errno := f.resolvePathFollowSymlinks(name)
+	if errno != 0 || nodeID == 0 {
+		return nil, &Error{Op: "readfile", Path: name, Err: errnoToError(errno)}
 	}
 
-	if entry.File == nil {
+	// Get file attributes to check type and size
+	attr, errno := f.inst.fsBackend.GetAttr(nodeID)
+	if errno != 0 {
+		return nil, &Error{Op: "readfile", Path: name, Err: errnoToError(errno)}
+	}
+
+	// Check if it's a regular file (S_IFREG = 0100000)
+	if (attr.Mode & 0170000) != 0100000 {
 		return nil, &Error{Op: "readfile", Path: name, Err: fmt.Errorf("not a regular file")}
 	}
 
-	// Get file size
-	size, _ := entry.File.Stat()
+	// Open the file
+	openBackend, hasOpen := f.inst.fsBackend.(interface {
+		Open(nodeID uint64, flags uint32) (fh uint64, errno int32)
+	})
+	if !hasOpen {
+		return nil, &Error{Op: "readfile", Path: name, Err: fmt.Errorf("backend does not support open")}
+	}
+
+	fh, errno := openBackend.Open(nodeID, uint32(syscall.O_RDONLY))
+	if errno != 0 {
+		return nil, &Error{Op: "readfile", Path: name, Err: errnoToError(errno)}
+	}
+	defer f.inst.fsBackend.Release(nodeID, fh)
 
 	// Read the entire file
-	data, err := entry.File.ReadAt(0, uint32(size))
-	if err != nil {
-		return nil, &Error{Op: "readfile", Path: name, Err: err}
+	data, errno := f.inst.fsBackend.Read(nodeID, fh, 0, uint32(attr.Size))
+	if errno != 0 {
+		return nil, &Error{Op: "readfile", Path: name, Err: errnoToError(errno)}
 	}
 
 	return data, nil
@@ -214,22 +332,44 @@ func (f *instanceFS) WriteFile(name string, data []byte, perm fs.FileMode) error
 	return nil
 }
 
-// Stat returns file info for the named file.
+// Stat returns file info for the named file, following symlinks.
 func (f *instanceFS) Stat(name string) (fs.FileInfo, error) {
-	cfs := f.inst.src.cfs
-
-	entry, err := cfs.Lookup(name)
-	if err != nil {
-		return nil, &Error{Op: "stat", Path: name, Err: err}
+	if f.inst.fsBackend == nil {
+		return nil, &Error{Op: "stat", Path: name, Err: ErrNotRunning}
 	}
 
-	return entryToFileInfo(name, entry), nil
+	// Resolve path through the fsBackend, following symlinks
+	nodeID, errno := f.resolvePathFollowSymlinks(name)
+	if errno != 0 || nodeID == 0 {
+		return nil, &Error{Op: "stat", Path: name, Err: errnoToError(errno)}
+	}
+
+	attr, errno := f.inst.fsBackend.GetAttr(nodeID)
+	if errno != 0 {
+		return nil, &Error{Op: "stat", Path: name, Err: errnoToError(errno)}
+	}
+
+	return fuseAttrToFileInfo(name, attr), nil
 }
 
 // Lstat returns file info without following symlinks.
 func (f *instanceFS) Lstat(name string) (fs.FileInfo, error) {
-	// For now, same as Stat - ContainerFS handles symlinks internally
-	return f.Stat(name)
+	if f.inst.fsBackend == nil {
+		return nil, &Error{Op: "lstat", Path: name, Err: ErrNotRunning}
+	}
+
+	// resolvePath doesn't follow symlinks for the final component
+	_, _, nodeID, errno := f.resolvePath(name)
+	if errno != 0 || nodeID == 0 {
+		return nil, &Error{Op: "lstat", Path: name, Err: errnoToError(errno)}
+	}
+
+	attr, errno := f.inst.fsBackend.GetAttr(nodeID)
+	if errno != 0 {
+		return nil, &Error{Op: "lstat", Path: name, Err: errnoToError(errno)}
+	}
+
+	return fuseAttrToFileInfo(name, attr), nil
 }
 
 // Remove removes a file or empty directory.
@@ -542,48 +682,92 @@ func (f *instanceFS) Symlink(oldname, newname string) error {
 
 // Readlink returns the destination of a symbolic link.
 func (f *instanceFS) Readlink(name string) (string, error) {
-	cfs := f.inst.src.cfs
-
-	entry, err := cfs.Lookup(name)
-	if err != nil {
-		return "", &Error{Op: "readlink", Path: name, Err: err}
+	if f.inst.fsBackend == nil {
+		return "", &Error{Op: "readlink", Path: name, Err: ErrNotRunning}
 	}
 
-	if entry.Symlink == nil {
-		return "", &Error{Op: "readlink", Path: name, Err: fmt.Errorf("not a symlink")}
+	// Resolve path to get node ID
+	_, _, nodeID, errno := f.resolvePath(name)
+	if errno != 0 || nodeID == 0 {
+		return "", &Error{Op: "readlink", Path: name, Err: errnoToError(errno)}
 	}
 
-	return entry.Symlink.Target(), nil
+	// Check if Readlink is supported
+	readlinkBackend, hasReadlink := f.inst.fsBackend.(interface {
+		Readlink(nodeID uint64) (target string, errno int32)
+	})
+	if !hasReadlink {
+		return "", &Error{Op: "readlink", Path: name, Err: fmt.Errorf("backend does not support readlink")}
+	}
+
+	target, errno := readlinkBackend.Readlink(nodeID)
+	if errno != 0 {
+		return "", &Error{Op: "readlink", Path: name, Err: errnoToError(errno)}
+	}
+
+	return target, nil
 }
 
 // ReadDir reads the named directory and returns its entries.
 func (f *instanceFS) ReadDir(name string) ([]fs.DirEntry, error) {
-	cfs := f.inst.src.cfs
+	if f.inst.fsBackend == nil {
+		return nil, &Error{Op: "readdir", Path: name, Err: ErrNotRunning}
+	}
 
-	// Handle root directory
-	var entries []vfs.AbstractDirEntry
-	var err error
-
+	// Resolve directory path
+	var nodeID uint64
 	if name == "/" || name == "" || name == "." {
-		entries, err = cfs.ReadDir()
+		nodeID = 1 // root
 	} else {
-		entry, lookupErr := cfs.Lookup(name)
-		if lookupErr != nil {
-			return nil, &Error{Op: "readdir", Path: name, Err: lookupErr}
+		_, _, id, errno := f.resolvePath(name)
+		if errno != 0 || id == 0 {
+			return nil, &Error{Op: "readdir", Path: name, Err: errnoToError(errno)}
 		}
-		if entry.Dir == nil {
-			return nil, &Error{Op: "readdir", Path: name, Err: fmt.Errorf("not a directory")}
-		}
-		entries, err = entry.Dir.ReadDir()
+		nodeID = id
 	}
 
-	if err != nil {
-		return nil, &Error{Op: "readdir", Path: name, Err: err}
+	// Verify it's a directory
+	attr, errno := f.inst.fsBackend.GetAttr(nodeID)
+	if errno != 0 {
+		return nil, &Error{Op: "readdir", Path: name, Err: errnoToError(errno)}
+	}
+	if (attr.Mode & 0170000) != 0040000 {
+		return nil, &Error{Op: "readdir", Path: name, Err: fmt.Errorf("not a directory")}
 	}
 
-	result := make([]fs.DirEntry, len(entries))
-	for i, e := range entries {
-		result[i] = &abstractDirEntry{e: e}
+	// Read directory entries from fsBackend (FUSE dirent format)
+	data, errno := f.inst.fsBackend.ReadDir(nodeID, 0, 1<<20) // 1MB max
+	if errno != 0 {
+		return nil, &Error{Op: "readdir", Path: name, Err: errnoToError(errno)}
+	}
+
+	// Parse FUSE dirent entries
+	var result []fs.DirEntry
+	offset := 0
+	for offset < len(data) {
+		if offset+24 > len(data) {
+			break
+		}
+		// struct fuse_dirent: ino(8) + off(8) + namelen(4) + type(4) + name(namelen)
+		nameLen := int(data[offset+16]) | int(data[offset+17])<<8 | int(data[offset+18])<<16 | int(data[offset+19])<<24
+		entryType := data[offset+20]
+		if offset+24+nameLen > len(data) {
+			break
+		}
+		entryName := string(data[offset+24 : offset+24+nameLen])
+
+		// Skip . and ..
+		if entryName != "." && entryName != ".." {
+			result = append(result, &fuseDirEntry{
+				name:      entryName,
+				entryType: entryType,
+			})
+		}
+
+		// Move to next entry (align to 8 bytes)
+		entrySize := 24 + nameLen
+		entrySize = (entrySize + 7) &^ 7
+		offset += entrySize
 	}
 
 	return result, nil
@@ -689,6 +873,8 @@ type instanceFile struct {
 	perm   fs.FileMode
 	offset int64
 	closed bool
+	nodeID uint64 // fsBackend node ID
+	fh     uint64 // fsBackend file handle
 }
 
 func (f *instanceFile) Read(p []byte) (int, error) {
@@ -696,36 +882,32 @@ func (f *instanceFile) Read(p []byte) (int, error) {
 		return 0, &Error{Op: "read", Path: f.path, Err: fs.ErrClosed}
 	}
 
-	cfs := f.inst.src.cfs
-	entry, err := cfs.Lookup(f.path)
-	if err != nil {
-		return 0, &Error{Op: "read", Path: f.path, Err: err}
+	// Get current file size from fsBackend
+	attr, errno := f.inst.fsBackend.GetAttr(f.nodeID)
+	if errno != 0 {
+		return 0, &Error{Op: "read", Path: f.path, Err: errnoToError(errno)}
 	}
 
-	if entry.File == nil {
-		return 0, &Error{Op: "read", Path: f.path, Err: fmt.Errorf("not a regular file")}
-	}
-
-	size, _ := entry.File.Stat()
-	if f.offset >= int64(size) {
+	size := int64(attr.Size)
+	if f.offset >= size {
 		return 0, io.EOF
 	}
 
 	toRead := len(p)
-	remaining := int64(size) - f.offset
+	remaining := size - f.offset
 	if int64(toRead) > remaining {
 		toRead = int(remaining)
 	}
 
-	data, err := entry.File.ReadAt(uint64(f.offset), uint32(toRead))
-	if err != nil {
-		return 0, &Error{Op: "read", Path: f.path, Err: err}
+	data, errno := f.inst.fsBackend.Read(f.nodeID, f.fh, uint64(f.offset), uint32(toRead))
+	if errno != 0 {
+		return 0, &Error{Op: "read", Path: f.path, Err: errnoToError(errno)}
 	}
 
 	copy(p, data)
 	f.offset += int64(len(data))
 
-	if f.offset >= int64(size) {
+	if f.offset >= size {
 		return len(data), io.EOF
 	}
 
@@ -739,21 +921,28 @@ func (f *instanceFile) Write(p []byte) (int, error) {
 }
 
 func (f *instanceFile) Close() error {
+	if f.closed {
+		return nil
+	}
 	f.closed = true
+	// Release the file handle
+	f.inst.fsBackend.Release(f.nodeID, f.fh)
 	return nil
 }
 
 func (f *instanceFile) Seek(offset int64, whence int) (int64, error) {
-	cfs := f.inst.src.cfs
-	entry, err := cfs.Lookup(f.path)
-	if err != nil {
-		return 0, &Error{Op: "seek", Path: f.path, Err: err}
+	if f.closed {
+		return 0, &Error{Op: "seek", Path: f.path, Err: fs.ErrClosed}
 	}
 
-	size := int64(0)
-	if entry.File != nil {
-		s, _ := entry.File.Stat()
-		size = int64(s)
+	var size int64
+	if whence == io.SeekEnd {
+		// Only need to get size for SeekEnd
+		attr, errno := f.inst.fsBackend.GetAttr(f.nodeID)
+		if errno != 0 {
+			return 0, &Error{Op: "seek", Path: f.path, Err: errnoToError(errno)}
+		}
+		size = int64(attr.Size)
 	}
 
 	switch whence {
@@ -773,19 +962,13 @@ func (f *instanceFile) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (f *instanceFile) ReadAt(p []byte, off int64) (int, error) {
-	cfs := f.inst.src.cfs
-	entry, err := cfs.Lookup(f.path)
-	if err != nil {
-		return 0, &Error{Op: "readat", Path: f.path, Err: err}
+	if f.closed {
+		return 0, &Error{Op: "readat", Path: f.path, Err: fs.ErrClosed}
 	}
 
-	if entry.File == nil {
-		return 0, &Error{Op: "readat", Path: f.path, Err: fmt.Errorf("not a regular file")}
-	}
-
-	data, err := entry.File.ReadAt(uint64(off), uint32(len(p)))
-	if err != nil {
-		return 0, &Error{Op: "readat", Path: f.path, Err: err}
+	data, errno := f.inst.fsBackend.Read(f.nodeID, f.fh, uint64(off), uint32(len(p)))
+	if errno != 0 {
+		return 0, &Error{Op: "readat", Path: f.path, Err: errnoToError(errno)}
 	}
 
 	copy(p, data)
@@ -797,13 +980,16 @@ func (f *instanceFile) WriteAt(p []byte, off int64) (int, error) {
 }
 
 func (f *instanceFile) Stat() (fs.FileInfo, error) {
-	cfs := f.inst.src.cfs
-	entry, err := cfs.Lookup(f.path)
-	if err != nil {
-		return nil, &Error{Op: "stat", Path: f.path, Err: err}
+	if f.closed {
+		return nil, &Error{Op: "stat", Path: f.path, Err: fs.ErrClosed}
 	}
 
-	return entryToFileInfo(f.path, entry), nil
+	attr, errno := f.inst.fsBackend.GetAttr(f.nodeID)
+	if errno != 0 {
+		return nil, &Error{Op: "stat", Path: f.path, Err: errnoToError(errno)}
+	}
+
+	return fuseAttrToFileInfo(f.path, attr), nil
 }
 
 func (f *instanceFile) Sync() error {
@@ -826,6 +1012,109 @@ func entryToFileInfo(name string, entry vfs.AbstractEntry) fs.FileInfo {
 		entry: entry,
 	}
 }
+
+// fuseAttrToFileInfo converts a virtio.FuseAttr to fs.FileInfo.
+func fuseAttrToFileInfo(name string, attr virtio.FuseAttr) fs.FileInfo {
+	return &fuseFileInfo{
+		name: path.Base(name),
+		attr: attr,
+	}
+}
+
+type fuseFileInfo struct {
+	name string
+	attr virtio.FuseAttr
+}
+
+func (fi *fuseFileInfo) Name() string {
+	return fi.name
+}
+
+func (fi *fuseFileInfo) Size() int64 {
+	return int64(fi.attr.Size)
+}
+
+func (fi *fuseFileInfo) Mode() fs.FileMode {
+	// Convert Unix mode to Go FileMode
+	mode := fs.FileMode(fi.attr.Mode & 0777)
+	switch fi.attr.Mode & 0170000 {
+	case 0040000: // S_IFDIR
+		mode |= fs.ModeDir
+	case 0120000: // S_IFLNK
+		mode |= fs.ModeSymlink
+	case 0060000: // S_IFBLK
+		mode |= fs.ModeDevice
+	case 0020000: // S_IFCHR
+		mode |= fs.ModeDevice | fs.ModeCharDevice
+	case 0010000: // S_IFIFO
+		mode |= fs.ModeNamedPipe
+	case 0140000: // S_IFSOCK
+		mode |= fs.ModeSocket
+	}
+	return mode
+}
+
+func (fi *fuseFileInfo) ModTime() time.Time {
+	return time.Unix(int64(fi.attr.MTimeSec), int64(fi.attr.MTimeNsec))
+}
+
+func (fi *fuseFileInfo) IsDir() bool {
+	return (fi.attr.Mode & 0170000) == 0040000
+}
+
+func (fi *fuseFileInfo) Sys() any {
+	return &fi.attr
+}
+
+// fuseDirEntry wraps FUSE directory entry data to implement fs.DirEntry.
+type fuseDirEntry struct {
+	name      string
+	entryType uint8 // DT_* type from FUSE dirent
+}
+
+func (d *fuseDirEntry) Name() string {
+	return d.name
+}
+
+func (d *fuseDirEntry) IsDir() bool {
+	return d.entryType == 4 // DT_DIR
+}
+
+func (d *fuseDirEntry) Type() fs.FileMode {
+	switch d.entryType {
+	case 4: // DT_DIR
+		return fs.ModeDir
+	case 10: // DT_LNK
+		return fs.ModeSymlink
+	case 2: // DT_CHR
+		return fs.ModeDevice | fs.ModeCharDevice
+	case 6: // DT_BLK
+		return fs.ModeDevice
+	case 1: // DT_FIFO
+		return fs.ModeNamedPipe
+	case 12: // DT_SOCK
+		return fs.ModeSocket
+	default: // DT_REG (8) or unknown
+		return 0
+	}
+}
+
+func (d *fuseDirEntry) Info() (fs.FileInfo, error) {
+	// Return minimal info; caller can use Stat for full details
+	return &fuseDirEntryInfo{name: d.name, entryType: d.entryType}, nil
+}
+
+type fuseDirEntryInfo struct {
+	name      string
+	entryType uint8
+}
+
+func (di *fuseDirEntryInfo) Name() string       { return di.name }
+func (di *fuseDirEntryInfo) Size() int64        { return 0 }
+func (di *fuseDirEntryInfo) Mode() fs.FileMode  { return (&fuseDirEntry{entryType: di.entryType}).Type() }
+func (di *fuseDirEntryInfo) ModTime() time.Time { return time.Time{} }
+func (di *fuseDirEntryInfo) IsDir() bool        { return di.entryType == 4 }
+func (di *fuseDirEntryInfo) Sys() any           { return nil }
 
 type fileInfo struct {
 	name  string

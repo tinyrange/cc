@@ -25,22 +25,31 @@ func extractPathFromEnv(env []string) string {
 	return defaultPathEnv
 }
 
-// lookupPathInBackend walks a path through the fsBackend and returns the node ID and attributes.
+// lookupPathInBackend walks a path through the fsBackend, following symlinks,
+// and returns the final node ID and attributes.
 // Returns errno != 0 if the path doesn't exist.
 func (c *instanceCmd) lookupPathInBackend(p string) (nodeID uint64, mode uint32, errno int32) {
+	const maxSymlinkDepth = 40
+
 	p = path.Clean(p)
 	if p == "/" || p == "" {
 		attr, err := c.inst.fsBackend.GetAttr(1)
 		return 1, attr.Mode, err
 	}
 
+	readlinkBackend, hasReadlink := c.inst.fsBackend.(interface {
+		Readlink(nodeID uint64) (target string, errno int32)
+	})
+
 	// Remove leading slash and split
 	p = strings.TrimPrefix(p, "/")
 	parts := strings.Split(p, "/")
 
 	currentID := uint64(1) // root node ID
+	symlinkDepth := 0
 
-	for _, part := range parts {
+	for i := 0; i < len(parts); i++ {
+		part := parts[i]
 		if part == "" {
 			continue
 		}
@@ -48,6 +57,43 @@ func (c *instanceCmd) lookupPathInBackend(p string) (nodeID uint64, mode uint32,
 		if err != 0 {
 			return 0, 0, err
 		}
+
+		// Check if this is a symlink and follow it
+		if hasReadlink && (attr.Mode&0170000) == 0120000 {
+			symlinkDepth++
+			if symlinkDepth > maxSymlinkDepth {
+				return 0, 0, -int32(40) // ELOOP
+			}
+
+			target, err := readlinkBackend.Readlink(childID)
+			if err != 0 {
+				return 0, 0, err
+			}
+
+			// Construct new path
+			var newPath string
+			if strings.HasPrefix(target, "/") {
+				// Absolute symlink
+				newPath = target
+			} else {
+				// Relative symlink - resolve from current directory
+				currentParts := parts[:i]
+				newPath = "/" + strings.Join(currentParts, "/") + "/" + target
+			}
+
+			// Append remaining parts
+			if i+1 < len(parts) {
+				newPath = newPath + "/" + strings.Join(parts[i+1:], "/")
+			}
+
+			// Restart resolution with new path
+			newPath = path.Clean(newPath)
+			currentID = 1
+			parts = strings.Split(strings.TrimPrefix(newPath, "/"), "/")
+			i = -1 // Will be incremented to 0
+			continue
+		}
+
 		currentID = childID
 		mode = attr.Mode
 	}
