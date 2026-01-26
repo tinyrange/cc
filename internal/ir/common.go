@@ -351,6 +351,27 @@ func ISB() Fragment {
 	return ISBFragment{}
 }
 
+// CacheFlushFragment represents a cache flush operation for self-modifying code.
+// On ARM64, this performs the full cache maintenance sequence:
+// 1. Clean data cache lines (DC CVAU) for the entire region
+// 2. DSB ISH (data synchronization barrier)
+// 3. Invalidate instruction cache lines (IC IVAU) for the entire region
+// 4. DSB ISH
+// 5. ISB (instruction synchronization barrier)
+// On x86-64, this is a no-op since x86 has coherent instruction caches.
+type CacheFlushFragment struct {
+	// Base is the starting address of the region to flush
+	Base Fragment
+	// Size is the size of the region in bytes
+	Size Fragment
+}
+
+// CacheFlush returns a cache flush fragment for the given memory region.
+// This must be called after writing code to memory and before executing it.
+func CacheFlush(base, size Fragment) Fragment {
+	return CacheFlushFragment{Base: base, Size: size}
+}
+
 type OpKind int
 
 const (

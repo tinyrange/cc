@@ -1055,6 +1055,20 @@ func (c *Compiler) lowerCallStmt(call *ast.CallExpr) ([]ir.Fragment, error) {
 			return nil, fmt.Errorf("rtg: isb() takes no arguments")
 		}
 		return []ir.Fragment{ir.ISB()}, nil
+	case "cacheFlush", "CacheFlush":
+		// Cache flush for self-modifying code
+		if len(call.Args) != 2 {
+			return nil, fmt.Errorf("rtg: cacheFlush(base, size) takes 2 arguments")
+		}
+		baseFrag, _, err := c.lowerExpr(call.Args[0])
+		if err != nil {
+			return nil, fmt.Errorf("rtg: cacheFlush base: %w", err)
+		}
+		sizeFrag, _, err := c.lowerExpr(call.Args[1])
+		if err != nil {
+			return nil, fmt.Errorf("rtg: cacheFlush size: %w", err)
+		}
+		return []ir.Fragment{ir.CacheFlush(baseFrag, sizeFrag)}, nil
 	case "logKmsg", "LogKmsg":
 		return c.lowerLogKmsg(call)
 	default:

@@ -215,6 +215,9 @@ func (c *compiler) compileFragment(f ir.Fragment) error {
 	case ir.ISBFragment:
 		// x86-64 has coherent instruction caches, no barrier needed
 		return nil
+	case ir.CacheFlushFragment:
+		// x86-64 has coherent instruction caches, no cache flush needed
+		return nil
 	case ir.ConstantBytesFragment:
 		c.emit(amd64.LoadConstantBytes(frag.Target, frag.Data))
 		return nil

@@ -590,6 +590,52 @@ func DSB() asm.Fragment {
 	})
 }
 
+// DSBISH emits a Data Synchronization Barrier (Inner Shareable).
+// This ensures all memory operations complete within the inner shareable domain.
+func DSBISH() asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		// DSB ISH: 0xD5033B9F
+		c.emit32(0xD5033B9F)
+		return nil
+	})
+}
+
+// DCCVAU emits a Data Cache Clean by VA to Point of Unification.
+// This cleans the data cache line containing the address in reg.
+// Required for self-modifying code on ARM64.
+func DCCVAU(reg asm.Variable) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		// DC CVAU, Xt: SYS #3, c7, c11, #1, Xt
+		// Encoding: 0xD50B7B20 | Rt
+		c.emit32(0xD50B7B20 | uint32(reg))
+		return nil
+	})
+}
+
+// ICIVAU emits an Instruction Cache Invalidate by VA to Point of Unification.
+// This invalidates the instruction cache line containing the address in reg.
+// Required for self-modifying code on ARM64.
+func ICIVAU(reg asm.Variable) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		// IC IVAU, Xt: SYS #3, c7, c5, #1, Xt
+		// Encoding: 0xD50B7520 | Rt
+		c.emit32(0xD50B7520 | uint32(reg))
+		return nil
+	})
+}
+
 // StpPreIndex stores a pair of 64-bit registers to memory with pre-indexed addressing.
 // STP Rt, Rt2, [Rn, #imm]! where imm is the byte offset (must be multiple of 8).
 func StpPreIndex(rt, rt2, rn asm.Variable, imm int) asm.Fragment {

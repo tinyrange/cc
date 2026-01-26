@@ -55,6 +55,17 @@ func GotoLabel(label int64) {}
 // Required after modifying code in memory before executing it.
 func ISB() {}
 
+// CacheFlush flushes the CPU caches for the given memory region.
+// On ARM64, this performs the full cache maintenance sequence:
+// 1. Clean data cache lines (DC CVAU)
+// 2. DSB ISH (data synchronization barrier)
+// 3. Invalidate instruction cache lines (IC IVAU)
+// 4. DSB ISH
+// 5. ISB (instruction synchronization barrier)
+// This MUST be called after writing code to memory and before executing it.
+// On x86-64, this is a no-op since x86 has coherent instruction caches.
+func CacheFlush(base int64, size int64) {}
+
 // Ifdef returns true if the named compile-time flag is set.
 // This is evaluated at RTG compile time, not at runtime.
 // The flag name must be a string literal.

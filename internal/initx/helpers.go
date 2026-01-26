@@ -1210,7 +1210,7 @@ func ForkExecWait(path string, argv []string, envp []string, forkErrLabel ir.Lab
 	// 3. Additional barrier before wait4
 	return ir.Block{
 		ir.Assign(pid, ir.Syscall(defs.SYS_CLONE, ir.Int64(defs.SIGCHLD), 0, 0, 0, 0)),
-		ir.ISB(),                        // Memory barrier to ensure clone result is properly visible
+		ir.ISB(),                         // Memory barrier to ensure clone result is properly visible
 		ir.Syscall(defs.SYS_SCHED_YIELD), // Yield to allow kernel to complete COW setup
 		ir.If(ir.IsNegative(pid), ir.Block{
 			ir.Assign(errVar, pid),

@@ -394,8 +394,9 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 			runtime.Store32(timesliceMem, 0, 17)
 		}
 
-		// Instruction synchronization barrier
-		runtime.ISB()
+		// Flush caches for self-modifying code (required on ARM64)
+		// This performs DC CVAU + DSB ISH + IC IVAU + DSB ISH + ISB
+		runtime.CacheFlush(anonMem, codeLen)
 
 		// Record: phase7_isb (18)
 		if timesliceMem > 0 {

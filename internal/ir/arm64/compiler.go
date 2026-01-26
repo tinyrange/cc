@@ -258,6 +258,8 @@ func (c *compiler) compileFragment(f ir.Fragment) error {
 		c.emit(arm64asm.DSB())
 		c.emit(arm64asm.ISB())
 		return nil
+	case ir.CacheFlushFragment:
+		return c.compileCacheFlush(frag)
 	case ir.ConstantBytesFragment:
 		c.emit(arm64asm.LoadConstantBytes(frag.Target, frag.Data))
 		return nil
@@ -462,6 +464,98 @@ func (c *compiler) compileReturn(ret ir.ReturnFragment) error {
 	// This ensures proper stack cleanup and link register handling for all return paths.
 	c.emit(arm64asm.Jump(c.epilogueLabel))
 	c.freeReg(arm64asm.X0)
+	return nil
+}
+
+// compileCacheFlush emits the ARM64 cache maintenance sequence for self-modifying code.
+// This performs:
+// 1. DC CVAU (clean data cache) for each cache line in the region
+// 2. DSB ISH (data sync barrier)
+// 3. IC IVAU (invalidate instruction cache) for each cache line in the region
+// 4. DSB ISH
+// 5. ISB (instruction sync barrier)
+func (c *compiler) compileCacheFlush(frag ir.CacheFlushFragment) error {
+	const cacheLineSize int32 = 64 // Apple Silicon cache line size
+
+	// Evaluate base address
+	baseReg, _, err := c.evalValue(frag.Base)
+	if err != nil {
+		return err
+	}
+
+	// Evaluate size
+	sizeReg, _, err := c.evalValue(frag.Size)
+	if err != nil {
+		c.freeReg(baseReg)
+		return err
+	}
+
+	// Calculate end address: end = base + size
+	endReg, err := c.allocReg()
+	if err != nil {
+		c.freeReg(baseReg)
+		c.freeReg(sizeReg)
+		return err
+	}
+	c.emit(arm64asm.MovReg(arm64asm.Reg64(endReg), arm64asm.Reg64(baseReg)))
+	c.emit(arm64asm.AddRegReg(arm64asm.Reg64(endReg), arm64asm.Reg64(sizeReg)))
+	c.freeReg(sizeReg)
+
+	// Current address register (starts at base)
+	curReg, err := c.allocReg()
+	if err != nil {
+		c.freeReg(baseReg)
+		c.freeReg(endReg)
+		return err
+	}
+	c.emit(arm64asm.MovReg(arm64asm.Reg64(curReg), arm64asm.Reg64(baseReg)))
+
+	// Loop 1: Clean data cache lines (DC CVAU)
+	dcLoopLabel := c.newInternalLabel("dc_loop")
+	dcDoneLabel := c.newInternalLabel("dc_done")
+
+	c.emit(asm.MarkLabel(dcLoopLabel))
+	// Compare cur >= end
+	c.emit(arm64asm.CmpRegReg(arm64asm.Reg64(curReg), arm64asm.Reg64(endReg)))
+	c.emit(arm64asm.JumpIfGreaterOrEqual(dcDoneLabel))
+	// DC CVAU, cur
+	c.emit(arm64asm.DCCVAU(curReg))
+	// cur += cacheLineSize
+	c.emit(arm64asm.AddRegImm(arm64asm.Reg64(curReg), cacheLineSize))
+	c.emit(arm64asm.Jump(dcLoopLabel))
+	c.emit(asm.MarkLabel(dcDoneLabel))
+
+	// DSB ISH - ensure all DC CVAU operations complete
+	c.emit(arm64asm.DSBISH())
+
+	// Reset cur to base for IC loop
+	c.emit(arm64asm.MovReg(arm64asm.Reg64(curReg), arm64asm.Reg64(baseReg)))
+
+	// Loop 2: Invalidate instruction cache lines (IC IVAU)
+	icLoopLabel := c.newInternalLabel("ic_loop")
+	icDoneLabel := c.newInternalLabel("ic_done")
+
+	c.emit(asm.MarkLabel(icLoopLabel))
+	// Compare cur >= end
+	c.emit(arm64asm.CmpRegReg(arm64asm.Reg64(curReg), arm64asm.Reg64(endReg)))
+	c.emit(arm64asm.JumpIfGreaterOrEqual(icDoneLabel))
+	// IC IVAU, cur
+	c.emit(arm64asm.ICIVAU(curReg))
+	// cur += cacheLineSize
+	c.emit(arm64asm.AddRegImm(arm64asm.Reg64(curReg), cacheLineSize))
+	c.emit(arm64asm.Jump(icLoopLabel))
+	c.emit(asm.MarkLabel(icDoneLabel))
+
+	// DSB ISH - ensure all IC IVAU operations complete
+	c.emit(arm64asm.DSBISH())
+
+	// ISB - flush the pipeline
+	c.emit(arm64asm.ISB())
+
+	c.freeReg(baseReg)
+	c.freeReg(endReg)
+	c.freeReg(curReg)
+
 	return nil
 }
 
