@@ -237,6 +237,10 @@ type VsockProgramServer struct {
 
 	// drainBuf is reused for draining stale data
 	drainBuf []byte
+
+	// vmTerminated is closed when the VM terminates unexpectedly.
+	// This allows WaitResult to detect early termination.
+	vmTerminated <-chan struct{}
 }
 
 // NewVsockProgramServer creates a new vsock program server listening on the specified port.
@@ -249,6 +253,13 @@ func NewVsockProgramServer(backend virtio.VsockBackend, port uint32, arch hv.Cpu
 		listener: listener,
 		arch:     arch,
 	}, nil
+}
+
+// SetVMTerminatedChannel configures the channel that signals VM termination.
+func (s *VsockProgramServer) SetVMTerminatedChannel(ch <-chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.vmTerminated = ch
 }
 
 // Accept waits for a guest connection.
@@ -371,9 +382,10 @@ func (s *VsockProgramServer) SendProgram(prog *ir.Program) error {
 
 // WaitResult waits for and returns the exit code from the guest.
 func (s *VsockProgramServer) WaitResult(ctx context.Context) (int32, error) {
-	// Get connection under lock, but don't hold lock during blocking read
+	// Get connection and vmTerminated under lock, but don't hold lock during blocking read
 	s.mu.Lock()
 	conn := s.conn
+	vmTerminated := s.vmTerminated
 	s.mu.Unlock()
 
 	if conn == nil {
@@ -399,6 +411,8 @@ func (s *VsockProgramServer) WaitResult(ctx context.Context) (int32, error) {
 		}
 	case <-ctx.Done():
 		return -1, ctx.Err()
+	case <-vmTerminated:
+		return -1, ErrVMTerminated
 	case <-timeout:
 		return -1, fmt.Errorf("timeout waiting for guest response")
 	}
@@ -648,6 +662,11 @@ func (vm *VirtualMachine) runFirstRunVsock(ctx context.Context) error {
 	// Initialize vmRunDone channel to track when the VM run loop exits
 	if vm.vmRunDone == nil {
 		vm.vmRunDone = make(chan struct{})
+	}
+
+	// Connect VM termination signal to vsock server for early error detection
+	if vm.vsockProgramServer != nil {
+		vm.vsockProgramServer.SetVMTerminatedChannel(vm.vmRunDone)
 	}
 
 	// Start the VM in a goroutine so we can accept the vsock connection

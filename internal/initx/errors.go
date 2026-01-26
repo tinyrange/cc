@@ -1,6 +1,13 @@
 package initx
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+// ErrVMTerminated is returned when a vsock operation fails because
+// the virtual machine has terminated unexpectedly.
+var ErrVMTerminated = errors.New("virtual machine terminated")
 
 // ExitError represents a non-zero exit code returned from an initx payload.
 type ExitError struct {
