@@ -418,10 +418,50 @@ func (c *compiler) compileCall(f ir.CallFragment) error {
 	}
 
 	// Move arguments into calling convention registers
+	// Handle the parallel assignment problem: if argRegs[j] == callArgRegisters[i] for j > i,
+	// moving argRegs[i] to callArgRegisters[i] would clobber the value needed for argRegs[j].
+	// Solution: first save any conflicting values to scratch registers.
+
+	// Scratch registers X9-X15 are caller-saved and not used for arguments
+	scratchRegs := []asm.Variable{arm64asm.X10, arm64asm.X11, arm64asm.X12, arm64asm.X13, arm64asm.X14, arm64asm.X15}
+	scratchIdx := 0
+
+	// Map from original register to saved scratch register
+	savedRegs := make(map[asm.Variable]asm.Variable)
+
+	// First pass: identify and save any argument values that would be clobbered
+	for i := range argRegs {
+		destReg := callArgRegisters[i]
+		// Check if any later argument is in this destination register
+		for j := i + 1; j < len(argRegs); j++ {
+			if argRegs[j] == destReg {
+				// argRegs[j] will be clobbered by moving to destReg
+				// Save it to a scratch register if not already saved
+				if _, saved := savedRegs[argRegs[j]]; !saved {
+					if scratchIdx >= len(scratchRegs) {
+						// This shouldn't happen with 8 args and 6 scratch regs
+						// Fall back to X9 (target should already be moved if needed)
+						savedRegs[argRegs[j]] = arm64asm.X9
+					} else {
+						savedRegs[argRegs[j]] = scratchRegs[scratchIdx]
+						scratchIdx++
+					}
+					c.emit(arm64asm.MovReg(arm64asm.Reg64(savedRegs[argRegs[j]]), arm64asm.Reg64(argRegs[j])))
+				}
+			}
+		}
+	}
+
+	// Second pass: move arguments to their destinations
 	for i, reg := range argRegs {
 		destReg := callArgRegisters[i]
-		if reg != destReg {
-			c.emit(arm64asm.MovReg(arm64asm.Reg64(destReg), arm64asm.Reg64(reg)))
+		// Use saved register if the original was clobbered
+		srcReg := reg
+		if saved, ok := savedRegs[reg]; ok {
+			srcReg = saved
+		}
+		if srcReg != destReg {
+			c.emit(arm64asm.MovReg(arm64asm.Reg64(destReg), arm64asm.Reg64(srcReg)))
 		}
 		c.freeReg(reg)
 	}

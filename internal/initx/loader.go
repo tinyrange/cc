@@ -222,11 +222,27 @@ var (
 
 // VsockProgramServer handles program loading via vsock.
 // Protocol:
-//   - Host → Guest: [len:4][time_sec:8][time_nsec:8][code_len:4][reloc_count:4][relocs:4*count][code:code_len]
-//   - Guest → Host: [len:4][exit_code:4]
+//   - Host → Guest: [len:4][time_sec:8][time_nsec:8][flags:4][code_len:4][reloc_count:4][relocs:4*count][code:code_len]
+//   - Guest → Host: [len:4][exit_code:4][stdout_len:4][stdout_data][stderr_len:4][stderr_data]
+//
+// Note: time_sec and time_nsec come before flags to maintain 8-byte alignment for ARM64.
+// When flags=0, guest response is just [len:4][exit_code:4] for backward compatibility.
 const (
 	VsockProgramPort = 9998
+
+	// Capture flags for stdout/stderr capture
+	CaptureFlagNone    uint32 = 0x00
+	CaptureFlagStdout  uint32 = 0x01
+	CaptureFlagStderr  uint32 = 0x02
+	CaptureFlagCombine uint32 = 0x04 // Combine stdout+stderr into single stream
 )
+
+// ProgramResult contains the result of a program execution including captured output.
+type ProgramResult struct {
+	ExitCode int32
+	Stdout   []byte
+	Stderr   []byte
+}
 
 // VsockProgramServer is the host-side server for vsock-based program loading.
 type VsockProgramServer struct {
@@ -323,9 +339,16 @@ func (s *VsockProgramServer) drainStaleData() {
 	}
 }
 
-// SendProgram sends a compiled program to the guest.
-// Protocol: [len:4][time_sec:8][time_nsec:8][code_len:4][reloc_count:4][relocs:4*count][code:code_len]
+// SendProgram sends a compiled program to the guest without capture flags.
+// This is a convenience wrapper around SendProgramWithFlags with flags=0.
 func (s *VsockProgramServer) SendProgram(prog *ir.Program) error {
+	return s.SendProgramWithFlags(prog, CaptureFlagNone)
+}
+
+// SendProgramWithFlags sends a compiled program to the guest with capture flags.
+// Protocol: [len:4][time_sec:8][time_nsec:8][flags:4][code_len:4][reloc_count:4][relocs:4*count][code:code_len]
+// Note: time_sec and time_nsec come first to maintain 8-byte alignment for ARM64.
+func (s *VsockProgramServer) SendProgramWithFlags(prog *ir.Program, flags uint32) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -344,8 +367,8 @@ func (s *VsockProgramServer) SendProgram(prog *ir.Program) error {
 	progBytes := asmProg.Bytes()
 	relocs := asmProg.Relocations()
 
-	// Calculate total message size: time_sec(8) + time_nsec(8) + code_len(4) + reloc_count(4) + relocs(4*N) + code
-	payloadLen := 8 + 8 + 4 + 4 + 4*len(relocs) + len(progBytes)
+	// Calculate total message size: time_sec(8) + time_nsec(8) + flags(4) + code_len(4) + reloc_count(4) + relocs(4*N) + code
+	payloadLen := 8 + 8 + 4 + 4 + 4 + 4*len(relocs) + len(progBytes)
 
 	// Build the message
 	msg := make([]byte, 4+payloadLen) // len prefix + payload
@@ -353,24 +376,27 @@ func (s *VsockProgramServer) SendProgram(prog *ir.Program) error {
 	// Length prefix (excludes itself)
 	binary.LittleEndian.PutUint32(msg[0:4], uint32(payloadLen))
 
-	// Current time for guest clock synchronization
+	// Current time for guest clock synchronization (8-byte aligned)
 	now := time.Now()
 	binary.LittleEndian.PutUint64(msg[4:12], uint64(now.Unix()))
 	binary.LittleEndian.PutUint64(msg[12:20], uint64(now.Nanosecond()))
 
+	// Flags
+	binary.LittleEndian.PutUint32(msg[20:24], flags)
+
 	// code_len
-	binary.LittleEndian.PutUint32(msg[20:24], uint32(len(progBytes)))
+	binary.LittleEndian.PutUint32(msg[24:28], uint32(len(progBytes)))
 
 	// reloc_count
-	binary.LittleEndian.PutUint32(msg[24:28], uint32(len(relocs)))
+	binary.LittleEndian.PutUint32(msg[28:32], uint32(len(relocs)))
 
 	// relocations
 	for i, reloc := range relocs {
-		binary.LittleEndian.PutUint32(msg[28+4*i:], uint32(reloc))
+		binary.LittleEndian.PutUint32(msg[32+4*i:], uint32(reloc))
 	}
 
 	// code
-	copy(msg[28+4*len(relocs):], progBytes)
+	copy(msg[32+4*len(relocs):], progBytes)
 
 	// Write the entire message
 	if _, err := s.conn.Write(msg); err != nil {
@@ -381,7 +407,19 @@ func (s *VsockProgramServer) SendProgram(prog *ir.Program) error {
 }
 
 // WaitResult waits for and returns the exit code from the guest.
+// This is a convenience wrapper for backward compatibility when capture is not needed.
 func (s *VsockProgramServer) WaitResult(ctx context.Context) (int32, error) {
+	result, err := s.WaitResultWithCapture(ctx, CaptureFlagNone)
+	if err != nil {
+		return -1, err
+	}
+	return result.ExitCode, nil
+}
+
+// WaitResultWithCapture waits for the result from the guest including captured output.
+// Protocol response: [len:4][exit_code:4][stdout_len:4][stdout_data][stderr_len:4][stderr_data]
+// When flags=0, response is just [len:4][exit_code:4].
+func (s *VsockProgramServer) WaitResultWithCapture(ctx context.Context, flags uint32) (*ProgramResult, error) {
 	// Get connection and vmTerminated under lock, but don't hold lock during blocking read
 	s.mu.Lock()
 	conn := s.conn
@@ -389,15 +427,15 @@ func (s *VsockProgramServer) WaitResult(ctx context.Context) (int32, error) {
 	s.mu.Unlock()
 
 	if conn == nil {
-		return -1, fmt.Errorf("no connection established")
+		return nil, fmt.Errorf("no connection established")
 	}
 
-	// Read length prefix (4 bytes) + exit code (4 bytes)
-	buf := make([]byte, 8)
+	// Read length prefix (4 bytes)
+	lenBuf := make([]byte, 4)
 	done := make(chan error, 1)
 
 	go func() {
-		_, err := io.ReadFull(conn, buf)
+		_, err := io.ReadFull(conn, lenBuf)
 		done <- err
 	}()
 
@@ -407,23 +445,75 @@ func (s *VsockProgramServer) WaitResult(ctx context.Context) (int32, error) {
 	select {
 	case err := <-done:
 		if err != nil {
-			return -1, fmt.Errorf("read result: %w", err)
+			return nil, fmt.Errorf("read result length: %w", err)
 		}
 	case <-ctx.Done():
-		return -1, ctx.Err()
+		return nil, ctx.Err()
 	case <-vmTerminated:
-		return -1, ErrVMTerminated
+		return nil, ErrVMTerminated
 	case <-timeout:
-		return -1, fmt.Errorf("timeout waiting for guest response")
+		return nil, fmt.Errorf("timeout waiting for guest response")
 	}
 
-	length := binary.LittleEndian.Uint32(buf[0:4])
-	if length != 4 {
-		return -1, fmt.Errorf("unexpected result length: %d", length)
+	length := binary.LittleEndian.Uint32(lenBuf)
+	if length < 4 {
+		return nil, fmt.Errorf("result length too small: %d", length)
 	}
 
-	exitCode := int32(binary.LittleEndian.Uint32(buf[4:8]))
-	return exitCode, nil
+	// Read the rest of the response
+	dataBuf := make([]byte, length)
+	done = make(chan error, 1)
+
+	go func() {
+		_, err := io.ReadFull(conn, dataBuf)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return nil, fmt.Errorf("read result data: %w", err)
+		}
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-vmTerminated:
+		return nil, ErrVMTerminated
+	case <-timeout:
+		return nil, fmt.Errorf("timeout waiting for guest result data")
+	}
+
+	result := &ProgramResult{
+		ExitCode: int32(binary.LittleEndian.Uint32(dataBuf[0:4])),
+	}
+
+	// If capture flags were set, parse stdout and stderr
+	if flags != CaptureFlagNone && length > 4 {
+		offset := 4
+
+		// Parse stdout
+		if offset+4 <= int(length) {
+			stdoutLen := binary.LittleEndian.Uint32(dataBuf[offset : offset+4])
+			offset += 4
+			if offset+int(stdoutLen) <= int(length) {
+				result.Stdout = make([]byte, stdoutLen)
+				copy(result.Stdout, dataBuf[offset:offset+int(stdoutLen)])
+				offset += int(stdoutLen)
+			}
+		}
+
+		// Parse stderr
+		// Parse stderr
+		if offset+4 <= int(length) {
+			stderrLen := binary.LittleEndian.Uint32(dataBuf[offset : offset+4])
+			offset += 4
+			if offset+int(stderrLen) <= int(length) {
+				result.Stderr = make([]byte, stderrLen)
+				copy(result.Stderr, dataBuf[offset:offset+int(stderrLen)])
+			}
+		}
+	}
+
+	return result, nil
 }
 
 // Close closes the server and any active connection.
@@ -747,6 +837,55 @@ func (vm *VirtualMachine) runProgramVsock(ctx context.Context, prog *ir.Program)
 	}
 
 	return nil
+}
+
+// RunWithCapture runs a program and captures stdout/stderr based on the flags.
+// Returns a ProgramResult containing the exit code and captured output.
+func (vm *VirtualMachine) RunWithCapture(ctx context.Context, prog *ir.Program, flags uint32) (*ProgramResult, error) {
+	// If vsock loader is enabled and we have a server, use vsock path
+	if vm.useVsockLoader && vm.vsockProgramServer != nil {
+		// First run boots the kernel, then accept vsock connection
+		if !vm.firstRunComplete {
+			if err := vm.runFirstRunVsock(ctx); err != nil {
+				return nil, err
+			}
+		}
+		return vm.runProgramVsockWithCapture(ctx, prog, flags)
+	}
+
+	// Fallback to non-capture mode for non-vsock path
+	err := vm.runProgram(ctx, prog, nil)
+	if err != nil {
+		if exitErr, ok := err.(*ExitError); ok {
+			return &ProgramResult{ExitCode: int32(exitErr.Code)}, nil
+		}
+		return nil, err
+	}
+	return &ProgramResult{ExitCode: 0}, nil
+}
+
+// runProgramVsockWithCapture runs a program using vsock with output capture.
+func (vm *VirtualMachine) runProgramVsockWithCapture(ctx context.Context, prog *ir.Program, flags uint32) (*ProgramResult, error) {
+	debug.Writef("initx.runProgramVsockWithCapture", "sending program with flags=0x%x", flags)
+
+	// Send program over vsock with capture flags
+	if err := vm.vsockProgramServer.SendProgramWithFlags(prog, flags); err != nil {
+		return nil, fmt.Errorf("send program via vsock: %w", err)
+	}
+
+	debug.Writef("initx.runProgramVsockWithCapture", "waiting for result")
+
+	// Wait for result with capture
+	result, err := vm.vsockProgramServer.WaitResultWithCapture(ctx, flags)
+	if err != nil {
+		debug.Writef("initx.runProgramVsockWithCapture", "wait error: %v", err)
+		return nil, fmt.Errorf("wait for vsock result: %w", err)
+	}
+
+	debug.Writef("initx.runProgramVsockWithCapture", "got exit code: %d, stdout=%d bytes, stderr=%d bytes",
+		result.ExitCode, len(result.Stdout), len(result.Stderr))
+
+	return result, nil
 }
 
 func (vm *VirtualMachine) Architecture() hv.CpuArchitecture {

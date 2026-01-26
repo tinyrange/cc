@@ -751,8 +751,58 @@ func (s *syscallFragment) Emit(ctx asm.Context) error {
 	if len(s.args) > len(argRegs) {
 		return fmt.Errorf("arm64 asm: too many syscall arguments (%d)", len(s.args))
 	}
-	for idx, value := range s.args {
-		if err := moveValueIntoReg(c, argRegs[idx], value); err != nil {
+
+	// Create a working copy of args that we may modify
+	args := make([]asm.Value, len(s.args))
+	copy(args, s.args)
+
+	// Detect and handle register conflicts:
+	// If arg[j] (j>i) uses a register that arg[i] will write to as its target,
+	// we need to save arg[j]'s value to a temp register first.
+	tempRegs := []Reg{Reg64(X9), Reg64(X10), Reg64(X11), Reg64(X12), Reg64(X13), Reg64(X14), Reg64(X15)}
+	tempIdx := 0
+
+	for i := 0; i < len(args); i++ {
+		targetReg := argRegs[i]
+
+		// Check if any later argument uses this target register as a source
+		for j := i + 1; j < len(args); j++ {
+			if v, ok := args[j].(asm.Variable); ok {
+				if asm.Variable(targetReg.id) == v {
+					// Conflict! arg[j] uses the register that arg[i] will overwrite.
+					// Save arg[j]'s value to a temp register now.
+					if tempIdx >= len(tempRegs) {
+						return fmt.Errorf("arm64 asm: too many syscall register conflicts")
+					}
+					temp := tempRegs[tempIdx]
+					tempIdx++
+
+					// Move the current value to temp register
+					if err := moveValueIntoReg(c, temp, v); err != nil {
+						return err
+					}
+					// Update args[j] to use the temp register
+					args[j] = asm.Variable(temp.id)
+				}
+			} else if r, ok := args[j].(asm.Register); ok {
+				if asm.Variable(targetReg.id) == asm.Variable(r) {
+					// Conflict! Same as above but for asm.Register type
+					if tempIdx >= len(tempRegs) {
+						return fmt.Errorf("arm64 asm: too many syscall register conflicts")
+					}
+					temp := tempRegs[tempIdx]
+					tempIdx++
+
+					if err := moveValueIntoReg(c, temp, asm.Variable(r)); err != nil {
+						return err
+					}
+					args[j] = asm.Variable(temp.id)
+				}
+			}
+		}
+
+		// Now move arg[i] to its target register
+		if err := moveValueIntoReg(c, targetReg, args[i]); err != nil {
 			return err
 		}
 	}

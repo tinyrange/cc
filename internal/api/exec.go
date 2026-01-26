@@ -251,8 +251,29 @@ func (c *instanceCmd) runCommand() {
 		},
 	}
 
-	// Run program via vsock
-	err := c.inst.vm.Run(c.ctx, prog)
+	// Determine capture flags based on whether stdout/stderr writers are set
+	var captureFlags uint32 = initx.CaptureFlagNone
+	if c.stdout != nil {
+		captureFlags |= initx.CaptureFlagStdout
+	}
+	if c.stderr != nil {
+		// If stdout and stderr point to the same writer, use combined mode
+		if c.stdout == c.stderr {
+			captureFlags |= initx.CaptureFlagCombine
+		} else {
+			captureFlags |= initx.CaptureFlagStderr
+		}
+	}
+
+	// Run program via vsock with capture
+	var result *initx.ProgramResult
+	var err error
+
+	if captureFlags != initx.CaptureFlagNone {
+		result, err = c.inst.vm.RunWithCapture(c.ctx, prog, captureFlags)
+	} else {
+		err = c.inst.vm.Run(c.ctx, prog)
+	}
 
 	c.mu.Lock()
 	if err != nil {
@@ -269,9 +290,29 @@ func (c *instanceCmd) runCommand() {
 		} else {
 			c.err = &Error{Op: "exec", Path: c.name, Err: err}
 		}
+	} else if result != nil {
+		// Process capture result
+		c.exitCode = int(result.ExitCode)
+		if c.exitCode != 0 {
+			if c.exitCode < 0 {
+				c.err = &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("errno=0x%x", -c.exitCode)}
+			} else {
+				c.err = &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("exit status %d", c.exitCode)}
+			}
+		}
 	}
 	c.finished = true
 	c.mu.Unlock()
+
+	// Write captured output to writers (outside the lock)
+	if result != nil {
+		if c.stdout != nil && len(result.Stdout) > 0 {
+			c.stdout.Write(result.Stdout)
+		}
+		if c.stderr != nil && c.stderr != c.stdout && len(result.Stderr) > 0 {
+			c.stderr.Write(result.Stderr)
+		}
+	}
 
 	// Signal completion
 	close(c.done)

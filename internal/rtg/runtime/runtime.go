@@ -149,6 +149,8 @@ const (
 	SYS_GETSOCKOPT    int64 = 39
 	SYS_SENDMSG       int64 = 40
 	SYS_RECVMSG       int64 = 41
+	SYS_PIPE2         int64 = 42
+	SYS_FCNTL         int64 = 43
 )
 
 // File descriptor constants
@@ -163,12 +165,21 @@ const (
 
 // File open flags
 const (
-	O_RDONLY int64 = 0
-	O_WRONLY int64 = 1
-	O_RDWR   int64 = 2
-	O_CREAT  int64 = 0o100
-	O_TRUNC  int64 = 0o1000
-	O_SYNC   int64 = 0o4010000
+	O_RDONLY   int64 = 0
+	O_WRONLY   int64 = 1
+	O_RDWR     int64 = 2
+	O_CREAT    int64 = 0o100
+	O_TRUNC    int64 = 0o1000
+	O_SYNC     int64 = 0o4010000
+	O_NONBLOCK int64 = 0o4000
+	O_CLOEXEC  int64 = 0o2000000
+)
+
+// fcntl commands
+const (
+	F_GETFL        int64 = 3
+	F_SETFL        int64 = 4
+	F_DUPFD_CLOEXEC int64 = 0x406
 )
 
 // Memory protection flags

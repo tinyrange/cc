@@ -2134,6 +2134,8 @@ var syscallNames = map[string]defs.Syscall{
 	"SYS_GETSOCKOPT":     defs.SYS_GETSOCKOPT,
 	"SYS_SENDMSG":        defs.SYS_SENDMSG,
 	"SYS_RECVMSG":        defs.SYS_RECVMSG,
+	"SYS_PIPE2":          defs.SYS_PIPE2,
+	"SYS_FCNTL":          defs.SYS_FCNTL,
 }
 
 var constantValues = map[string]int64{
@@ -2144,12 +2146,19 @@ var constantValues = map[string]int64{
 	"S_IFCHR": int64(linux.S_IFCHR),
 
 	// File open flags
-	"O_RDONLY": int64(linux.O_RDONLY),
-	"O_WRONLY": int64(linux.O_WRONLY),
-	"O_RDWR":   int64(linux.O_RDWR),
-	"O_CREAT":  int64(linux.O_CREAT),
-	"O_TRUNC":  int64(linux.O_TRUNC),
-	"O_SYNC":   int64(linux.O_SYNC),
+	"O_RDONLY":   int64(linux.O_RDONLY),
+	"O_WRONLY":   int64(linux.O_WRONLY),
+	"O_RDWR":     int64(linux.O_RDWR),
+	"O_CREAT":    int64(linux.O_CREAT),
+	"O_TRUNC":    int64(linux.O_TRUNC),
+	"O_SYNC":     int64(linux.O_SYNC),
+	"O_NONBLOCK": int64(linux.O_NONBLOCK),
+	"O_CLOEXEC":  int64(linux.O_CLOEXEC),
+
+	// fcntl commands
+	"F_GETFL":         int64(linux.F_GETFL),
+	"F_SETFL":         int64(linux.F_SETFL),
+	"F_DUPFD_CLOEXEC": int64(linux.F_DUPFD_CLOEXEC),
 
 	// Memory protection flags
 	"PROT_READ":  int64(linux.PROT_READ),
