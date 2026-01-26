@@ -27,6 +27,7 @@ const (
 	captureFlagStdout  = 0x01
 	captureFlagStderr  = 0x02
 	captureFlagCombine = 0x04
+	captureFlagStdin   = 0x08
 )
 
 // Timeslice IDs - must match constants in hvf_darwin_arm64.go
@@ -354,14 +355,16 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 			reboot()
 		}
 
-		// Parse header: time_sec(8) + time_nsec(8) + flags(4) + code_len(4) + reloc_count(4)
+		// Parse header: time_sec(8) + time_nsec(8) + flags(4) + stdin_len(4) + code_len(4) + reloc_count(4)
 		// time_sec and time_nsec come first for ARM64 8-byte alignment
 		var flags int64 = 0
 		var timeSec int64 = 0
 		var timeNsec int64 = 0
+		var stdinLen int64 = 0
 		timeSec = runtime.Load64(progBuf, 0)
 		timeNsec = runtime.Load64(progBuf, 8)
 		flags = runtime.Load32(progBuf, 16)
+		stdinLen = runtime.Load32(progBuf, 20) // offset 20 = time_sec(8) + time_nsec(8) + flags(4)
 
 		// Allocate timespec and call clock_settime
 		timespecMem := runtime.Syscall(runtime.SYS_MMAP, 0, 16, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
@@ -377,14 +380,16 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 
 		var codeLen int64 = 0
 		var relocCount int64 = 0
-		codeLen = runtime.Load32(progBuf, 20)    // offset 20 = time_sec(8) + time_nsec(8) + flags(4)
-		relocCount = runtime.Load32(progBuf, 24) // offset 24 = above + code_len(4)
+		codeLen = runtime.Load32(progBuf, 24)    // offset 24 = time_sec(8) + time_nsec(8) + flags(4) + stdin_len(4)
+		relocCount = runtime.Load32(progBuf, 28) // offset 28 = above + code_len(4)
 
 		// Calculate offsets
 		var relocBytes int64 = 0
 		var codeOffset int64 = 0
+		var stdinOffset int64 = 0
 		relocBytes = relocCount << 2
-		codeOffset = 28 + relocBytes // 28 = time_sec(8) + time_nsec(8) + flags(4) + code_len(4) + reloc_count(4)
+		codeOffset = 32 + relocBytes              // 32 = time_sec(8) + time_nsec(8) + flags(4) + stdin_len(4) + code_len(4) + reloc_count(4)
+		stdinOffset = codeOffset + codeLen        // stdin data follows code
 
 		// Copy code to anonMem
 		var copySrc int64 = 0
@@ -422,7 +427,7 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 		// Apply relocations
 		var relocPtr int64 = 0
 		var relocIndex int64 = 0
-		relocPtr = progBuf + 28 // relocations start at offset 28 (after flags, time_sec, time_nsec, code_len, reloc_count)
+		relocPtr = progBuf + 32 // relocations start at offset 32 (after time_sec, time_nsec, flags, stdin_len, code_len, reloc_count)
 		relocIndex = 0
 
 		for relocIndex < relocCount {
@@ -452,6 +457,57 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 		// Record: phase7_isb (18)
 		if timesliceMem > 0 {
 			runtime.Store32(timesliceMem, 0, 18)
+		}
+
+		// Set up stdin pipe if stdin data is present
+		var stdinPipeRead int64 = -1
+		var stdinPipeWrite int64 = -1
+		var stdinWriterPid int64 = -1
+		var savedStdin int64 = -1
+
+		var hasStdinFlag int64 = 0
+		hasStdinFlag = flags & captureFlagStdin
+		if hasStdinFlag != 0 {
+			// Create pipe for stdin (even if empty, to signal EOF)
+			stdinPipeResult := runtime.Syscall(runtime.SYS_PIPE2, pipeFdBuf, 0)
+			if stdinPipeResult >= 0 {
+				stdinPipeRead = runtime.Load32(pipeFdBuf, 0)
+				stdinPipeWrite = runtime.Load32(pipeFdBuf, 4)
+
+				// Fork writer process to write stdin data to pipe
+				// This avoids blocking on >64KB stdin (pipe buffer limit)
+				stdinWriterPid = runtime.Syscall(runtime.SYS_CLONE, runtime.SIGCHLD, 0, 0, 0, 0)
+
+				if stdinWriterPid == 0 {
+					// === STDIN WRITER PROCESS (child) ===
+					// Close read end
+					runtime.Syscall(runtime.SYS_CLOSE, stdinPipeRead)
+
+					// Write stdin data to pipe (if any)
+					if stdinLen > 0 {
+						var stdinDataPtr int64 = 0
+						stdinDataPtr = progBuf + stdinOffset
+						vsockWriteFull(stdinPipeWrite, stdinDataPtr, stdinLen)
+					}
+
+					// Close write end (signals EOF to reader)
+					runtime.Syscall(runtime.SYS_CLOSE, stdinPipeWrite)
+
+					// Exit writer process
+					runtime.Syscall(runtime.SYS_EXIT, 0)
+				}
+
+				// === PARENT PROCESS ===
+				// Close write end (child will write to it)
+				runtime.Syscall(runtime.SYS_CLOSE, stdinPipeWrite)
+				stdinPipeWrite = -1
+
+				// Save original stdin and redirect to pipe read end
+				savedStdin = runtime.Syscall(runtime.SYS_FCNTL, 0, runtime.F_DUPFD_CLOEXEC, 10)
+				runtime.Syscall(runtime.SYS_DUP3, stdinPipeRead, 0, 0)
+				runtime.Syscall(runtime.SYS_CLOSE, stdinPipeRead)
+				stdinPipeRead = -1
+			}
 		}
 
 		// Set up capture if flags are set
@@ -754,6 +810,22 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 		// Record: phase7_payload_done (20)
 		if timesliceMem > 0 {
 			runtime.Store32(timesliceMem, 0, 20)
+		}
+
+		// Restore stdin and wait for stdin writer process
+		if savedStdin >= 0 {
+			runtime.Syscall(runtime.SYS_DUP3, savedStdin, 0, 0)
+			runtime.Syscall(runtime.SYS_CLOSE, savedStdin)
+			savedStdin = -1
+		}
+		if stdinWriterPid > 0 {
+			// Wait for stdin writer process to complete
+			stdinStatusBuf := runtime.Syscall(runtime.SYS_MMAP, 0, 4096, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
+			if stdinStatusBuf >= 0 {
+				runtime.Syscall(runtime.SYS_WAIT4, stdinWriterPid, stdinStatusBuf, 0, 0)
+				runtime.Syscall(runtime.SYS_MUNMAP, stdinStatusBuf, 4096)
+			}
+			stdinWriterPid = -1
 		}
 
 		// Restore stdout/stderr and wait for reader

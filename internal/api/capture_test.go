@@ -358,3 +358,166 @@ func TestCapture_StdoutOnly(t *testing.T) {
 		t.Errorf("stdout = %q, want %q", stdout.String(), "OUT\n")
 	}
 }
+
+func TestCapture_StdinBasic(t *testing.T) {
+	// Test basic stdin functionality with cat
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	source := setupAlpineForCapture(t, ctx)
+
+	inst, err := New(source, withMemoryMB(128))
+	if err != nil {
+		if errors.Is(err, ErrHypervisorUnavailable) {
+			t.Skip("Skipping: hypervisor unavailable")
+		}
+		t.Fatalf("New() error = %v", err)
+	}
+	defer inst.Close()
+
+	// Use cat to echo stdin to stdout
+	cmd := inst.CommandContext(ctx, "/bin/cat")
+	cmd.SetStdin(bytes.NewReader([]byte("hello world")))
+
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("Output() error = %v", err)
+	}
+
+	expected := []byte("hello world")
+	if !bytes.Equal(out, expected) {
+		t.Errorf("Output() = %q, want %q", out, expected)
+	}
+}
+
+func TestCapture_StdinMultiLine(t *testing.T) {
+	// Test multi-line stdin
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	source := setupAlpineForCapture(t, ctx)
+
+	inst, err := New(source, withMemoryMB(128))
+	if err != nil {
+		if errors.Is(err, ErrHypervisorUnavailable) {
+			t.Skip("Skipping: hypervisor unavailable")
+		}
+		t.Fatalf("New() error = %v", err)
+	}
+	defer inst.Close()
+
+	input := "line1\nline2\nline3\n"
+	cmd := inst.CommandContext(ctx, "/bin/cat")
+	cmd.SetStdin(bytes.NewReader([]byte(input)))
+
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("Output() error = %v", err)
+	}
+
+	if !bytes.Equal(out, []byte(input)) {
+		t.Errorf("Output() = %q, want %q", out, input)
+	}
+}
+
+func TestCapture_StdinLarge(t *testing.T) {
+	// Test large stdin (>64KB pipe buffer) to ensure forked writer works
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	source := setupAlpineForCapture(t, ctx)
+
+	inst, err := New(source, withMemoryMB(128))
+	if err != nil {
+		if errors.Is(err, ErrHypervisorUnavailable) {
+			t.Skip("Skipping: hypervisor unavailable")
+		}
+		t.Fatalf("New() error = %v", err)
+	}
+	defer inst.Close()
+
+	// 100KB of data - exceeds 64KB pipe buffer
+	input := bytes.Repeat([]byte("x"), 100*1024)
+	cmd := inst.CommandContext(ctx, "/bin/cat")
+	cmd.SetStdin(bytes.NewReader(input))
+
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("Output() error = %v", err)
+	}
+
+	if !bytes.Equal(out, input) {
+		t.Errorf("Output() length = %d, want %d", len(out), len(input))
+		if len(out) > 0 && len(input) > 0 {
+			// Show first and last bytes for debugging
+			t.Logf("Output first 10 bytes: %q", out[:min(10, len(out))])
+			t.Logf("Output last 10 bytes: %q", out[max(0, len(out)-10):])
+		}
+	}
+}
+
+func TestCapture_StdinWithStdoutStderr(t *testing.T) {
+	// Test stdin with both stdout and stderr capture
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	source := setupAlpineForCapture(t, ctx)
+
+	inst, err := New(source, withMemoryMB(128))
+	if err != nil {
+		if errors.Is(err, ErrHypervisorUnavailable) {
+			t.Skip("Skipping: hypervisor unavailable")
+		}
+		t.Fatalf("New() error = %v", err)
+	}
+	defer inst.Close()
+
+	// Use a shell command that reads stdin and writes to both stdout and stderr
+	cmd := inst.CommandContext(ctx, "/bin/sh", "-c", "cat; echo 'done' >&2")
+	cmd.SetStdin(bytes.NewReader([]byte("input data\n")))
+
+	var stdout, stderr bytes.Buffer
+	cmd.SetStdout(&stdout)
+	cmd.SetStderr(&stderr)
+
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if stdout.String() != "input data\n" {
+		t.Errorf("stdout = %q, want %q", stdout.String(), "input data\n")
+	}
+	if stderr.String() != "done\n" {
+		t.Errorf("stderr = %q, want %q", stderr.String(), "done\n")
+	}
+}
+
+func TestCapture_StdinEmpty(t *testing.T) {
+	// Test empty stdin (should not block)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	source := setupAlpineForCapture(t, ctx)
+
+	inst, err := New(source, withMemoryMB(128))
+	if err != nil {
+		if errors.Is(err, ErrHypervisorUnavailable) {
+			t.Skip("Skipping: hypervisor unavailable")
+		}
+		t.Fatalf("New() error = %v", err)
+	}
+	defer inst.Close()
+
+	// Empty stdin should result in empty output
+	cmd := inst.CommandContext(ctx, "/bin/cat")
+	cmd.SetStdin(bytes.NewReader([]byte{}))
+
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("Output() error = %v", err)
+	}
+
+	if len(out) != 0 {
+		t.Errorf("Output() = %q, want empty", out)
+	}
+}

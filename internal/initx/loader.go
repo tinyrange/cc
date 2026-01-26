@@ -230,11 +230,12 @@ var (
 const (
 	VsockProgramPort = 9998
 
-	// Capture flags for stdout/stderr capture
+	// Capture flags for stdout/stderr capture and stdin delivery
 	CaptureFlagNone    uint32 = 0x00
 	CaptureFlagStdout  uint32 = 0x01
 	CaptureFlagStderr  uint32 = 0x02
 	CaptureFlagCombine uint32 = 0x04 // Combine stdout+stderr into single stream
+	CaptureFlagStdin   uint32 = 0x08 // Stdin data is included in the message
 )
 
 // ProgramResult contains the result of a program execution including captured output.
@@ -346,9 +347,16 @@ func (s *VsockProgramServer) SendProgram(prog *ir.Program) error {
 }
 
 // SendProgramWithFlags sends a compiled program to the guest with capture flags.
-// Protocol: [len:4][time_sec:8][time_nsec:8][flags:4][code_len:4][reloc_count:4][relocs:4*count][code:code_len]
+// Protocol: [len:4][time_sec:8][time_nsec:8][flags:4][stdin_len:4][code_len:4][reloc_count:4][relocs:4*count][code:code_len][stdin_data]
 // Note: time_sec and time_nsec come first to maintain 8-byte alignment for ARM64.
 func (s *VsockProgramServer) SendProgramWithFlags(prog *ir.Program, flags uint32) error {
+	return s.SendProgramWithFlagsAndStdin(prog, flags, nil)
+}
+
+// SendProgramWithFlagsAndStdin sends a compiled program to the guest with capture flags and optional stdin data.
+// Protocol: [len:4][time_sec:8][time_nsec:8][flags:4][stdin_len:4][code_len:4][reloc_count:4][relocs:4*count][code:code_len][stdin_data]
+// Note: time_sec and time_nsec come first to maintain 8-byte alignment for ARM64.
+func (s *VsockProgramServer) SendProgramWithFlagsAndStdin(prog *ir.Program, flags uint32, stdin []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -367,8 +375,11 @@ func (s *VsockProgramServer) SendProgramWithFlags(prog *ir.Program, flags uint32
 	progBytes := asmProg.Bytes()
 	relocs := asmProg.Relocations()
 
-	// Calculate total message size: time_sec(8) + time_nsec(8) + flags(4) + code_len(4) + reloc_count(4) + relocs(4*N) + code
-	payloadLen := 8 + 8 + 4 + 4 + 4 + 4*len(relocs) + len(progBytes)
+	// Note: CaptureFlagStdin should be set by the caller if stdin is needed.
+	// This allows the caller to signal EOF even with empty stdin data.
+
+	// Calculate total message size: time_sec(8) + time_nsec(8) + flags(4) + stdin_len(4) + code_len(4) + reloc_count(4) + relocs(4*N) + code + stdin
+	payloadLen := 8 + 8 + 4 + 4 + 4 + 4 + 4*len(relocs) + len(progBytes) + len(stdin)
 
 	// Build the message
 	msg := make([]byte, 4+payloadLen) // len prefix + payload
@@ -384,19 +395,29 @@ func (s *VsockProgramServer) SendProgramWithFlags(prog *ir.Program, flags uint32
 	// Flags
 	binary.LittleEndian.PutUint32(msg[20:24], flags)
 
+	// stdin_len
+	binary.LittleEndian.PutUint32(msg[24:28], uint32(len(stdin)))
+
 	// code_len
-	binary.LittleEndian.PutUint32(msg[24:28], uint32(len(progBytes)))
+	binary.LittleEndian.PutUint32(msg[28:32], uint32(len(progBytes)))
 
 	// reloc_count
-	binary.LittleEndian.PutUint32(msg[28:32], uint32(len(relocs)))
+	binary.LittleEndian.PutUint32(msg[32:36], uint32(len(relocs)))
 
 	// relocations
 	for i, reloc := range relocs {
-		binary.LittleEndian.PutUint32(msg[32+4*i:], uint32(reloc))
+		binary.LittleEndian.PutUint32(msg[36+4*i:], uint32(reloc))
 	}
 
 	// code
-	copy(msg[32+4*len(relocs):], progBytes)
+	codeOffset := 36 + 4*len(relocs)
+	copy(msg[codeOffset:], progBytes)
+
+	// stdin data
+	if len(stdin) > 0 {
+		stdinOffset := codeOffset + len(progBytes)
+		copy(msg[stdinOffset:], stdin)
+	}
 
 	// Write the entire message
 	if _, err := s.conn.Write(msg); err != nil {
@@ -842,6 +863,12 @@ func (vm *VirtualMachine) runProgramVsock(ctx context.Context, prog *ir.Program)
 // RunWithCapture runs a program and captures stdout/stderr based on the flags.
 // Returns a ProgramResult containing the exit code and captured output.
 func (vm *VirtualMachine) RunWithCapture(ctx context.Context, prog *ir.Program, flags uint32) (*ProgramResult, error) {
+	return vm.RunWithCaptureAndStdin(ctx, prog, flags, nil)
+}
+
+// RunWithCaptureAndStdin runs a program with optional stdin data and captures stdout/stderr.
+// Returns a ProgramResult containing the exit code and captured output.
+func (vm *VirtualMachine) RunWithCaptureAndStdin(ctx context.Context, prog *ir.Program, flags uint32, stdin []byte) (*ProgramResult, error) {
 	// If vsock loader is enabled and we have a server, use vsock path
 	if vm.useVsockLoader && vm.vsockProgramServer != nil {
 		// First run boots the kernel, then accept vsock connection
@@ -850,7 +877,7 @@ func (vm *VirtualMachine) RunWithCapture(ctx context.Context, prog *ir.Program, 
 				return nil, err
 			}
 		}
-		return vm.runProgramVsockWithCapture(ctx, prog, flags)
+		return vm.runProgramVsockWithCaptureAndStdin(ctx, prog, flags, stdin)
 	}
 
 	// Fallback to non-capture mode for non-vsock path
@@ -866,23 +893,28 @@ func (vm *VirtualMachine) RunWithCapture(ctx context.Context, prog *ir.Program, 
 
 // runProgramVsockWithCapture runs a program using vsock with output capture.
 func (vm *VirtualMachine) runProgramVsockWithCapture(ctx context.Context, prog *ir.Program, flags uint32) (*ProgramResult, error) {
-	debug.Writef("initx.runProgramVsockWithCapture", "sending program with flags=0x%x", flags)
+	return vm.runProgramVsockWithCaptureAndStdin(ctx, prog, flags, nil)
+}
 
-	// Send program over vsock with capture flags
-	if err := vm.vsockProgramServer.SendProgramWithFlags(prog, flags); err != nil {
+// runProgramVsockWithCaptureAndStdin runs a program using vsock with output capture and optional stdin.
+func (vm *VirtualMachine) runProgramVsockWithCaptureAndStdin(ctx context.Context, prog *ir.Program, flags uint32, stdin []byte) (*ProgramResult, error) {
+	debug.Writef("initx.runProgramVsockWithCaptureAndStdin", "sending program with flags=0x%x, stdin=%d bytes", flags, len(stdin))
+
+	// Send program over vsock with capture flags and stdin
+	if err := vm.vsockProgramServer.SendProgramWithFlagsAndStdin(prog, flags, stdin); err != nil {
 		return nil, fmt.Errorf("send program via vsock: %w", err)
 	}
 
-	debug.Writef("initx.runProgramVsockWithCapture", "waiting for result")
+	debug.Writef("initx.runProgramVsockWithCaptureAndStdin", "waiting for result")
 
 	// Wait for result with capture
 	result, err := vm.vsockProgramServer.WaitResultWithCapture(ctx, flags)
 	if err != nil {
-		debug.Writef("initx.runProgramVsockWithCapture", "wait error: %v", err)
+		debug.Writef("initx.runProgramVsockWithCaptureAndStdin", "wait error: %v", err)
 		return nil, fmt.Errorf("wait for vsock result: %w", err)
 	}
 
-	debug.Writef("initx.runProgramVsockWithCapture", "got exit code: %d, stdout=%d bytes, stderr=%d bytes",
+	debug.Writef("initx.runProgramVsockWithCaptureAndStdin", "got exit code: %d, stdout=%d bytes, stderr=%d bytes",
 		result.ExitCode, len(result.Stdout), len(result.Stderr))
 
 	return result, nil

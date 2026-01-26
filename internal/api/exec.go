@@ -226,6 +226,23 @@ func (c *instanceCmd) runCommand() {
 		cmdPath = resolved
 	}
 
+	// Read stdin data if stdin reader is set
+	var stdinData []byte
+	var hasStdin bool
+	if c.stdin != nil {
+		hasStdin = true
+		var err error
+		stdinData, err = io.ReadAll(c.stdin)
+		if err != nil {
+			c.mu.Lock()
+			c.err = &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("read stdin: %w", err)}
+			c.finished = true
+			c.mu.Unlock()
+			close(c.done)
+			return
+		}
+	}
+
 	// Use the command's environment (already merged in CommandContext)
 	env := c.env
 
@@ -265,12 +282,17 @@ func (c *instanceCmd) runCommand() {
 		}
 	}
 
-	// Run program via vsock with capture
+	// Run program via vsock with capture and optional stdin
 	var result *initx.ProgramResult
 	var err error
 
+	// Set stdin flag if stdin was provided (even if empty, to signal EOF)
+	if hasStdin {
+		captureFlags |= initx.CaptureFlagStdin
+	}
+
 	if captureFlags != initx.CaptureFlagNone {
-		result, err = c.inst.vm.RunWithCapture(c.ctx, prog, captureFlags)
+		result, err = c.inst.vm.RunWithCaptureAndStdin(c.ctx, prog, captureFlags, stdinData)
 	} else {
 		err = c.inst.vm.Run(c.ctx, prog)
 	}
