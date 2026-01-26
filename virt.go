@@ -10,6 +10,14 @@ import (
 )
 
 // -----------------------------------------------------------------------------
+// Environment Variables
+// -----------------------------------------------------------------------------
+
+// CC_VERBOSE enables verbose logging. Set it to any value to enable.
+// CC_DEBUG_FILE enables binary debug logging. Set it to a file name to enable.
+// CC_TIMESLICE_FILE enables timeslice recording. Set it to a file name to enable.
+
+// -----------------------------------------------------------------------------
 // Type Aliases - These re-export types from internal/api
 // -----------------------------------------------------------------------------
 
@@ -95,7 +103,7 @@ func WithEnv(env ...string) Option {
 
 type envOption struct{ env []string }
 
-func (*envOption) IsOption()        {}
+func (*envOption) IsOption()       {}
 func (o *envOption) Env() []string { return o.env }
 
 // WithTimeout sets a maximum lifetime for the instance. After this duration,

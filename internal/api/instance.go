@@ -8,19 +8,73 @@ import (
 	"io/fs"
 	"log/slog"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/tinyrange/cc/internal/debug"
 	"github.com/tinyrange/cc/internal/devices/virtio"
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/hv/factory"
 	"github.com/tinyrange/cc/internal/initx"
 	"github.com/tinyrange/cc/internal/linux/kernel"
 	"github.com/tinyrange/cc/internal/netstack"
+	"github.com/tinyrange/cc/internal/timeslice"
 	"github.com/tinyrange/cc/internal/vfs"
 )
+
+var (
+	envInitOnce       sync.Once
+	envInitErr        error
+	timesliceCloser   io.Closer
+	timesliceCloserMu sync.Mutex
+)
+
+// initFromEnv initializes debug, timeslice, and verbose logging from environment variables.
+// This is called once per process, before the first instance is created.
+func initFromEnv() error {
+	envInitOnce.Do(func() {
+		// CC_VERBOSE: enable verbose slog logging
+		if os.Getenv("CC_VERBOSE") != "" {
+			slog.SetDefault(slog.New(slog.NewTextHandler(
+				os.Stderr,
+				&slog.HandlerOptions{Level: slog.LevelDebug},
+			)))
+		}
+
+		// CC_DEBUG_FILE: enable binary debug logging
+		if debugFile := os.Getenv("CC_DEBUG_FILE"); debugFile != "" {
+			if err := debug.OpenFile(debugFile); err != nil {
+				envInitErr = fmt.Errorf("open debug file: %w", err)
+				return
+			}
+			debug.Writef("api debug logging enabled", "filename=%s", debugFile)
+		}
+
+		// CC_TIMESLICE_FILE: enable timeslice recording
+		if tsFile := os.Getenv("CC_TIMESLICE_FILE"); tsFile != "" {
+			f, err := os.Create(tsFile)
+			if err != nil {
+				envInitErr = fmt.Errorf("create timeslice file: %w", err)
+				return
+			}
+
+			w, err := timeslice.StartRecording(f)
+			if err != nil {
+				f.Close()
+				envInitErr = fmt.Errorf("start timeslice recording: %w", err)
+				return
+			}
+
+			timesliceCloserMu.Lock()
+			timesliceCloser = w
+			timesliceCloserMu.Unlock()
+		}
+	})
+	return envInitErr
+}
 
 // instance implements Instance.
 type instance struct {
@@ -53,6 +107,11 @@ type instance struct {
 
 // New creates and starts a new Instance from the given source.
 func New(source InstanceSource, opts ...Option) (Instance, error) {
+	// Initialize debug/timeslice/verbose from environment variables (once per process)
+	if err := initFromEnv(); err != nil {
+		return nil, &Error{Op: "new", Err: err}
+	}
+
 	src, ok := source.(*ociSource)
 	if !ok {
 		return nil, &Error{Op: "new", Err: fmt.Errorf("unsupported source type: %T", source)}
