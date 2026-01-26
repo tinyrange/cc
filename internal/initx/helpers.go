@@ -1196,7 +1196,7 @@ const (
 	tsWaitDone  = 69
 )
 
-func ForkExecWait(path string, argv []string, envp []string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
+func ForkExecWait(path string, argv []string, envp []string, forkErrLabel ir.Label, execErrLabel ir.Label, errVar ir.Var) ir.Fragment {
 	pid := ir.Var("forkPid")
 	savedPid := ir.Var("forkSavedPid")  // First copy of pid
 	savedPid2 := ir.Var("forkSavedPid2") // Second copy for extra safety
@@ -1214,11 +1214,11 @@ func ForkExecWait(path string, argv []string, envp []string, errLabel ir.Label, 
 		ir.Syscall(defs.SYS_SCHED_YIELD), // Yield to allow kernel to complete COW setup
 		ir.If(ir.IsNegative(pid), ir.Block{
 			ir.Assign(errVar, pid),
-			ir.Goto(errLabel),
+			ir.Goto(forkErrLabel),
 		}),
 		ir.If(ir.IsZero(pid), ir.Block{
 			// Child
-			Exec(path, argv, envp, errLabel, errVar),
+			Exec(path, argv, envp, execErrLabel, errVar),
 			ir.Syscall(defs.SYS_EXIT, ir.Int64(1)),
 		}),
 
@@ -1238,7 +1238,15 @@ func ForkExecWait(path string, argv []string, envp []string, errLabel ir.Label, 
 					// Use savedPid2 which is further from the original pid variable
 					ir.Assign(errVar, ir.Syscall(defs.SYS_WAIT4, savedPid2, ptr, ir.Int64(0), ir.Int64(0))),
 
-					ir.If(ir.IsNegative(errVar), ir.Goto(errLabel)),
+					ir.If(ir.IsNegative(errVar), ir.Block{
+						ir.If(ir.IsEqual(errVar, ir.Int64(-int64(linux.ECHILD))), ir.Block{
+							ir.Assign(errVar, ir.Syscall(defs.SYS_WAIT4, savedPid, ptr, ir.Int64(0), ir.Int64(0))),
+							ir.If(ir.IsEqual(errVar, ir.Int64(-int64(linux.ECHILD))), ir.Block{
+								ir.Assign(errVar, ir.Syscall(defs.SYS_WAIT4, ir.Int64(-1), ptr, ir.Int64(0), ir.Int64(0))),
+							}),
+						}),
+						ir.If(ir.IsNegative(errVar), ir.Goto(forkErrLabel)),
+					}),
 					ir.Assign(status, ptr.Mem().As32()),
 					ir.Assign(signal, ir.Op(ir.OpAnd, status, ir.Int64(0x7f))),
 					ir.Assign(exitCode, ir.Op(

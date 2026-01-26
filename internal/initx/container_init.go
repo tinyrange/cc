@@ -248,7 +248,7 @@ func injectContainerInitHelpers(prog *ir.Program, cfg ContainerInitConfig) error
 		}
 
 		prog.Methods["forkExecWait"] = ir.Method{
-			ForkExecWait(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, forkErrLabel, errVar),
+			ForkExecWait(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, forkErrLabel, forkErrLabel, errVar),
 			ir.Return(errVar),
 			ir.DeclareLabel(forkErrLabel, ir.Block{
 				ir.Printf("cc: forkExecWait error: errno=0x%x\n", errVar),

@@ -1344,6 +1344,7 @@ func (vm *VirtualMachine) Spawn(ctx context.Context, path string, args ...string
 	}
 
 	errLabel := ir.Label("__initx_spawn_err")
+	execErrLabel := ir.Label("__initx_spawn_child_err")
 	errVar := ir.Var("__initx_spawn_errno")
 	errorFmt := fmt.Sprintf("initx: failed to spawn %s errno=0x%%x\n", path)
 
@@ -1351,10 +1352,13 @@ func (vm *VirtualMachine) Spawn(ctx context.Context, path string, args ...string
 		Entrypoint: "main",
 		Methods: map[string]ir.Method{
 			"main": {
-				ForkExecWait(path, args, nil, errLabel, errVar),
+				ForkExecWait(path, args, nil, errLabel, execErrLabel, errVar),
 				ir.Return(errVar),
 				ir.DeclareLabel(errLabel, ir.Block{
 					ir.Printf(errorFmt, ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+					ir.Return(errVar),
+				}),
+				ir.DeclareLabel(execErrLabel, ir.Block{
 					ir.Syscall(defs.SYS_EXIT, ir.Int64(1)),
 				}),
 			},

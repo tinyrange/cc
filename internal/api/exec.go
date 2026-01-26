@@ -185,16 +185,20 @@ func (c *instanceCmd) runCommand() {
 
 	// Build IR program using ForkExecWait helper
 	errLabel := ir.Label("exec_error")
+	execErrLabel := ir.Label("exec_child_error")
 	errVar := ir.Var("exec_errno")
 
 	prog := &ir.Program{
 		Entrypoint: "main",
 		Methods: map[string]ir.Method{
 			"main": {
-				initx.ForkExecWait(cmdPath, c.args, env, errLabel, errVar),
+				initx.ForkExecWait(cmdPath, c.args, env, errLabel, execErrLabel, errVar),
 				ir.Return(errVar),
 				ir.DeclareLabel(errLabel, ir.Block{
 					ir.Printf("cc: exec error: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+					ir.Return(errVar),
+				}),
+				ir.DeclareLabel(execErrLabel, ir.Block{
 					ir.Syscall(defs.SYS_EXIT, ir.Int64(1)),
 				}),
 			},
@@ -210,7 +214,11 @@ func (c *instanceCmd) runCommand() {
 			c.exitCode = exitErr.Code
 			// Non-zero exit code is not necessarily an error
 			if c.exitCode != 0 {
-				c.err = &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("exit status %d", c.exitCode)}
+				if c.exitCode < 0 {
+					c.err = &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("errno=0x%x", -c.exitCode)}
+				} else {
+					c.err = &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("exit status %d", c.exitCode)}
+				}
 			}
 		} else {
 			c.err = &Error{Op: "exec", Path: c.name, Err: err}
