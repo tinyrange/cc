@@ -460,9 +460,7 @@ func (s *VsockProgramServer) WaitResultWithCapture(ctx context.Context, flags ui
 		done <- err
 	}()
 
-	// Use a timeout to prevent hanging forever if guest doesn't respond
-	timeout := time.After(30 * time.Second)
-
+	// Wait for result - timeout is controlled by the caller via context
 	select {
 	case err := <-done:
 		if err != nil {
@@ -472,8 +470,6 @@ func (s *VsockProgramServer) WaitResultWithCapture(ctx context.Context, flags ui
 		return nil, ctx.Err()
 	case <-vmTerminated:
 		return nil, ErrVMTerminated
-	case <-timeout:
-		return nil, fmt.Errorf("timeout waiting for guest response")
 	}
 
 	length := binary.LittleEndian.Uint32(lenBuf)
@@ -499,8 +495,6 @@ func (s *VsockProgramServer) WaitResultWithCapture(ctx context.Context, flags ui
 		return nil, ctx.Err()
 	case <-vmTerminated:
 		return nil, ErrVMTerminated
-	case <-timeout:
-		return nil, fmt.Errorf("timeout waiting for guest result data")
 	}
 
 	result := &ProgramResult{
