@@ -47,6 +47,27 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// runCommandWithTimeout runs a command with timeout and waits for the goroutine to complete.
+// Returns the error from cmd.Run() or context.DeadlineExceeded if timed out.
+func runCommandWithTimeout(ctx context.Context, cmd cc.Cmd, timeout time.Duration) error {
+	cmdCtx, cmdCancel := context.WithTimeout(ctx, timeout)
+	defer cmdCancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Run()
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-cmdCtx.Done():
+		// Wait for goroutine to finish even on timeout to avoid leaks
+		<-done
+		return cmdCtx.Err()
+	}
+}
+
 // TestMicroBench_RapidInstanceCreateDestroy tests if rapid instance
 // creation/destruction causes corruption or hangs.
 func TestMicroBench_RapidInstanceCreateDestroy(t *testing.T) {
@@ -67,53 +88,25 @@ func TestMicroBench_RapidInstanceCreateDestroy(t *testing.T) {
 			}
 			t.Fatalf("[%d] New() error = %v", i, err)
 		}
+		instToClose := inst
+		t.Cleanup(func() { instToClose.Close() })
 
 		t.Logf("[%d/%d] Instance created in %v", i+1, iterations, time.Since(startCreate))
 
 		// Run a quick command
 		cmdStart := time.Now()
 		cmd := inst.Command("/bin/true")
-		cmdCtx, cmdCancel := context.WithTimeout(ctx, commandTimeout)
 
-		done := make(chan error, 1)
-		go func() {
-			done <- cmd.Run()
-		}()
-
-		select {
-		case err := <-done:
-			if err != nil {
-				cmdCancel()
-				inst.Close()
-				t.Fatalf("[%d] Command() error = %v", i, err)
-			}
-		case <-cmdCtx.Done():
-			cmdCancel()
-			inst.Close()
-			t.Fatalf("[%d] Command timed out after %v", i, commandTimeout)
+		if err := runCommandWithTimeout(ctx, cmd, commandTimeout); err != nil {
+			t.Fatalf("[%d] Command error = %v", i, err)
 		}
-		cmdCancel()
 
 		t.Logf("[%d/%d] Command completed in %v", i+1, iterations, time.Since(cmdStart))
 
-		// Close with timeout
+		// Close and measure timing (cleanup will also close, but Close is idempotent)
 		closeStart := time.Now()
-		closeCtx, closeCancel := context.WithTimeout(ctx, closeTimeout)
-
-		closeDone := make(chan struct{})
-		go func() {
-			inst.Close()
-			close(closeDone)
-		}()
-
-		select {
-		case <-closeDone:
-			t.Logf("[%d/%d] Close completed in %v", i+1, iterations, time.Since(closeStart))
-		case <-closeCtx.Done():
-			closeCancel()
-			t.Fatalf("[%d] Close timed out after %v", i, closeTimeout)
-		}
-		closeCancel()
+		inst.Close()
+		t.Logf("[%d/%d] Close completed in %v", i+1, iterations, time.Since(closeStart))
 	}
 
 	t.Log("All iterations completed successfully")
@@ -135,7 +128,7 @@ func TestMicroBench_SequentialCommandsInSingleInstance(t *testing.T) {
 		}
 		t.Fatalf("New() error = %v", err)
 	}
-	defer inst.Close()
+	t.Cleanup(func() { inst.Close() })
 
 	t.Log("Instance created, running sequential commands...")
 
@@ -144,24 +137,10 @@ func TestMicroBench_SequentialCommandsInSingleInstance(t *testing.T) {
 		cmdStart := time.Now()
 		cmd := inst.Command("/bin/true")
 
-		cmdCtx, cmdCancel := context.WithTimeout(ctx, commandTimeout)
-		done := make(chan error, 1)
-		go func() {
-			done <- cmd.Run()
-		}()
-
-		select {
-		case err := <-done:
-			if err != nil {
-				cmdCancel()
-				t.Fatalf("[%d] Command() error = %v", i, err)
-			}
-			t.Logf("[%d/%d] Command completed in %v", i+1, iterations, time.Since(cmdStart))
-		case <-cmdCtx.Done():
-			cmdCancel()
-			t.Fatalf("[%d] Command timed out after %v", i, commandTimeout)
+		if err := runCommandWithTimeout(ctx, cmd, commandTimeout); err != nil {
+			t.Fatalf("[%d] Command error = %v", i, err)
 		}
-		cmdCancel()
+		t.Logf("[%d/%d] Command completed in %v", i+1, iterations, time.Since(cmdStart))
 	}
 
 	t.Log("All commands completed successfully")
@@ -199,33 +178,19 @@ func TestMicroBench_FreshSourcePerInstance(t *testing.T) {
 			}
 			t.Fatalf("[%d] New() error = %v", i, err)
 		}
+		instToClose := inst
+		t.Cleanup(func() { instToClose.Close() })
 		t.Logf("[%d/%d] Instance created at %v", i+1, iterations, time.Since(iterStart))
 
 		// Run command with detailed timing
 		cmdStart := time.Now()
 		cmd := inst.Command("/bin/true")
-		cmdCtx, cmdCancel := context.WithTimeout(ctx, commandTimeout)
-		done := make(chan error, 1)
-		go func() {
-			done <- cmd.Run()
-		}()
 
-		select {
-		case err := <-done:
-			if err != nil {
-				cmdCancel()
-				t.Logf("[%d] FAILED: Command error after %v (iter total: %v)", i, time.Since(cmdStart), time.Since(iterStart))
-				inst.Close()
-				t.Fatalf("[%d] Command() error = %v", i, err)
-			}
-			t.Logf("[%d/%d] Command completed in %v", i+1, iterations, time.Since(cmdStart))
-		case <-cmdCtx.Done():
-			cmdCancel()
-			t.Logf("[%d] FAILED: Command timeout after %v (iter total: %v)", i, time.Since(cmdStart), time.Since(iterStart))
-			inst.Close()
-			t.Fatalf("[%d] Command timed out after %v", i, commandTimeout)
+		if err := runCommandWithTimeout(ctx, cmd, commandTimeout); err != nil {
+			t.Logf("[%d] FAILED: Command error after %v (iter total: %v)", i, time.Since(cmdStart), time.Since(iterStart))
+			t.Fatalf("[%d] Command error = %v", i, err)
 		}
-		cmdCancel()
+		t.Logf("[%d/%d] Command completed in %v", i+1, iterations, time.Since(cmdStart))
 
 		inst.Close()
 		t.Logf("[%d/%d] Instance completed in %v", i+1, iterations, time.Since(iterStart))
@@ -250,50 +215,35 @@ func TestMicroBench_InstanceCloseWaitsForVMDone(t *testing.T) {
 		}
 		t.Fatalf("New() error = %v", err)
 	}
+	t.Cleanup(func() { inst.Close() })
 
 	// Run a command to ensure VM is fully initialized
 	t.Log("Running command to ensure VM is initialized...")
 	cmd := inst.Command("/bin/true")
 	if err := cmd.Run(); err != nil {
-		inst.Close()
 		t.Fatalf("Command() error = %v", err)
 	}
 
 	// Measure close timing
 	t.Log("Closing instance...")
 	closeStart := time.Now()
+	inst.Close()
+	closeDuration := time.Since(closeStart)
+	t.Logf("Close completed in %v", closeDuration)
 
-	closeCtx, closeCancel := context.WithTimeout(ctx, closeTimeout)
-	defer closeCancel()
-
-	closeDone := make(chan struct{})
-	go func() {
-		inst.Close()
-		close(closeDone)
-	}()
-
-	select {
-	case <-closeDone:
-		closeDuration := time.Since(closeStart)
-		t.Logf("Close completed in %v", closeDuration)
-
-		// Verify we can create a new instance immediately
-		t.Log("Creating second instance to verify cleanup...")
-		inst2, err := cc.New(source, cc.WithMemoryMB(128))
-		if err != nil {
-			t.Fatalf("Second New() error = %v (cleanup may be incomplete)", err)
-		}
-		defer inst2.Close()
-
-		cmd2 := inst2.Command("/bin/true")
-		if err := cmd2.Run(); err != nil {
-			t.Fatalf("Second Command() error = %v", err)
-		}
-		t.Log("Second instance works correctly")
-
-	case <-closeCtx.Done():
-		t.Fatalf("Close timed out after %v", closeTimeout)
+	// Verify we can create a new instance immediately
+	t.Log("Creating second instance to verify cleanup...")
+	inst2, err := cc.New(source, cc.WithMemoryMB(128))
+	if err != nil {
+		t.Fatalf("Second New() error = %v (cleanup may be incomplete)", err)
 	}
+	t.Cleanup(func() { inst2.Close() })
+
+	cmd2 := inst2.Command("/bin/true")
+	if err := cmd2.Run(); err != nil {
+		t.Fatalf("Second Command() error = %v", err)
+	}
+	t.Log("Second instance works correctly")
 }
 
 // TestMicroBench_VsockServerReset tests VsockProgramServer state between programs.
@@ -311,7 +261,7 @@ func TestMicroBench_VsockServerReset(t *testing.T) {
 		}
 		t.Fatalf("New() error = %v", err)
 	}
-	defer inst.Close()
+	t.Cleanup(func() { inst.Close() })
 
 	// Run different commands to exercise vsock
 	commands := []string{
@@ -335,32 +285,19 @@ func TestMicroBench_VsockServerReset(t *testing.T) {
 			cmd = inst.Command(cmdName)
 		}
 
-		cmdCtx, cmdCancel := context.WithTimeout(ctx, commandTimeout)
-		done := make(chan error, 1)
-		go func() {
-			done <- cmd.Run()
-		}()
-
-		select {
-		case err := <-done:
-			// /bin/false is expected to return exit code 1
-			if cmdName == "/bin/false" {
-				if err == nil {
-					t.Logf("[%d] /bin/false unexpectedly succeeded", i)
-				} else {
-					t.Logf("[%d] /bin/false returned error (expected): %v", i, err)
-				}
-			} else if err != nil {
-				cmdCancel()
-				t.Fatalf("[%d] %s error = %v", i, cmdName, err)
+		err := runCommandWithTimeout(ctx, cmd, commandTimeout)
+		// /bin/false is expected to return exit code 1
+		if cmdName == "/bin/false" {
+			if err == nil {
+				t.Logf("[%d] /bin/false unexpectedly succeeded", i)
 			} else {
-				t.Logf("[%d] %s completed in %v", i, cmdName, time.Since(cmdStart))
+				t.Logf("[%d] /bin/false returned error (expected): %v", i, err)
 			}
-		case <-cmdCtx.Done():
-			cmdCancel()
-			t.Fatalf("[%d] %s timed out after %v", i, cmdName, commandTimeout)
+		} else if err != nil {
+			t.Fatalf("[%d] %s error = %v", i, cmdName, err)
+		} else {
+			t.Logf("[%d] %s completed in %v", i, cmdName, time.Since(cmdStart))
 		}
-		cmdCancel()
 	}
 
 	t.Log("All vsock commands completed successfully")
@@ -385,10 +322,10 @@ func TestMicroBench_ParallelInstancesFromSameSource(t *testing.T) {
 		}
 		t.Fatalf("First instance error: %v", err)
 	}
+	t.Cleanup(func() { inst1.Close() })
 
 	inst2, err := cc.New(source, cc.WithMemoryMB(128))
 	if err != nil {
-		inst1.Close()
 		// Check if this is a "VM already exists" error (single-VM platform)
 		if errors.Is(err, cc.ErrHypervisorUnavailable) {
 			t.Skip("Skipping: hypervisor unavailable")
@@ -396,6 +333,7 @@ func TestMicroBench_ParallelInstancesFromSameSource(t *testing.T) {
 		// HVF on macOS only supports one VM per process
 		t.Skipf("Skipping: platform may only support one VM per process: %v", err)
 	}
+	t.Cleanup(func() { inst2.Close() })
 
 	// Both created successfully, now test parallel execution
 	t.Log("Parallel VMs supported, testing concurrent access...")
@@ -414,22 +352,8 @@ func TestMicroBench_ParallelInstancesFromSameSource(t *testing.T) {
 			t.Logf("[%d] Running command...", idx)
 			cmd := instances[idx].Command("/bin/true")
 
-			cmdCtx, cmdCancel := context.WithTimeout(ctx, commandTimeout)
-			defer cmdCancel()
-
-			done := make(chan error, 1)
-			go func() {
-				done <- cmd.Run()
-			}()
-
-			select {
-			case err := <-done:
-				if err != nil {
-					errChan <- err
-					return
-				}
-			case <-cmdCtx.Done():
-				errChan <- cmdCtx.Err()
+			if err := runCommandWithTimeout(ctx, cmd, commandTimeout); err != nil {
+				errChan <- err
 				return
 			}
 
@@ -440,10 +364,6 @@ func TestMicroBench_ParallelInstancesFromSameSource(t *testing.T) {
 	// Wait for all goroutines
 	wg.Wait()
 	close(errChan)
-
-	// Clean up
-	inst1.Close()
-	inst2.Close()
 
 	// Check for errors
 	for err := range errChan {
@@ -469,6 +389,7 @@ func TestMicroBench_InstanceAfterPreviousFailed(t *testing.T) {
 		}
 		t.Fatalf("First New() error = %v", err)
 	}
+	t.Cleanup(func() { inst1.Close() })
 
 	// Run a command that will "fail" (exit code 1)
 	t.Log("Running command that exits with error...")
@@ -500,27 +421,15 @@ func TestMicroBench_InstanceAfterPreviousFailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Second New() error = %v (recovery failed)", err)
 	}
-	defer inst2.Close()
+	t.Cleanup(func() { inst2.Close() })
 
 	t.Log("Running command in second instance...")
 	cmd = inst2.Command("/bin/true")
-	cmdCtx, cmdCancel := context.WithTimeout(ctx, commandTimeout)
-	defer cmdCancel()
 
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Run()
-	}()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("Second instance command error = %v", err)
-		}
-		t.Log("Second instance command succeeded")
-	case <-cmdCtx.Done():
-		t.Fatalf("Second instance command timed out after %v", commandTimeout)
+	if err := runCommandWithTimeout(ctx, cmd, commandTimeout); err != nil {
+		t.Fatalf("Second instance command error = %v", err)
 	}
+	t.Log("Second instance command succeeded")
 
 	t.Log("Recovery test completed successfully")
 }
@@ -545,17 +454,17 @@ func TestMicroBench_FilesystemVerification(t *testing.T) {
 			}
 			t.Fatalf("[%d] New() error = %v", i, err)
 		}
+		instToClose := inst
+		t.Cleanup(func() { instToClose.Close() })
 		t.Logf("[%d/%d] Instance created at %v", i+1, iterations, time.Since(iterStart))
 
 		// First, verify filesystem is accessible by reading a known file
 		readStart := time.Now()
 		data, err := inst.ReadFile("/etc/os-release")
 		if err != nil {
-			inst.Close()
 			t.Fatalf("[%d] ReadFile(/etc/os-release) error = %v (filesystem may not be mounted)", i, err)
 		}
 		if len(data) == 0 {
-			inst.Close()
 			t.Fatalf("[%d] ReadFile returned empty data", i)
 		}
 		t.Logf("[%d/%d] ReadFile completed in %v (%d bytes)", i+1, iterations, time.Since(readStart), len(data))
@@ -565,7 +474,6 @@ func TestMicroBench_FilesystemVerification(t *testing.T) {
 		cmd := inst.Command("/bin/true")
 		if err := cmd.Run(); err != nil {
 			t.Logf("[%d] FAILED: Command error after %v (FS was readable)", i, time.Since(cmdStart))
-			inst.Close()
 			t.Fatalf("[%d] Command() error = %v (but FS was readable!)", i, err)
 		}
 		t.Logf("[%d/%d] Command completed in %v", i+1, iterations, time.Since(cmdStart))
@@ -600,13 +508,14 @@ func TestMicroBench_SharedSourceMultipleRuns(t *testing.T) {
 			}
 			t.Fatalf("[%d] New() error = %v", i, err)
 		}
+		instToClose := inst
+		t.Cleanup(func() { instToClose.Close() })
 		t.Logf("[%d/%d] Create: %v", i+1, iterations, time.Since(createStart))
 
 		// Run command
 		cmdStart := time.Now()
 		cmd := inst.Command("/bin/true")
 		if err := cmd.Run(); err != nil {
-			inst.Close()
 			t.Fatalf("[%d] Command() error = %v", i, err)
 		}
 		t.Logf("[%d/%d] Command: %v", i+1, iterations, time.Since(cmdStart))
