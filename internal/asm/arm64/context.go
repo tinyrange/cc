@@ -94,6 +94,10 @@ func (c *Context) emit32(word uint32) int {
 }
 
 func (c *Context) SetLabel(label asm.Label) {
+	if existing, exists := c.labels[label]; exists {
+		panic(fmt.Sprintf("arm64 asm: DUPLICATE LABEL %q: already at 0x%x, redefining at 0x%x",
+			label, existing, len(c.text)))
+	}
 	c.labels[label] = len(c.text)
 }
 

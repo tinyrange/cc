@@ -590,6 +590,52 @@ func DSB() asm.Fragment {
 	})
 }
 
+// DSBISH emits a Data Synchronization Barrier (Inner Shareable).
+// This ensures all memory operations complete within the inner shareable domain.
+func DSBISH() asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		// DSB ISH: 0xD5033B9F
+		c.emit32(0xD5033B9F)
+		return nil
+	})
+}
+
+// DCCVAU emits a Data Cache Clean by VA to Point of Unification.
+// This cleans the data cache line containing the address in reg.
+// Required for self-modifying code on ARM64.
+func DCCVAU(reg asm.Variable) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		// DC CVAU, Xt: SYS #3, c7, c11, #1, Xt
+		// Encoding: 0xD50B7B20 | Rt
+		c.emit32(0xD50B7B20 | uint32(reg))
+		return nil
+	})
+}
+
+// ICIVAU emits an Instruction Cache Invalidate by VA to Point of Unification.
+// This invalidates the instruction cache line containing the address in reg.
+// Required for self-modifying code on ARM64.
+func ICIVAU(reg asm.Variable) asm.Fragment {
+	return fragmentFunc(func(ctx asm.Context) error {
+		c, err := requireContext(ctx)
+		if err != nil {
+			return err
+		}
+		// IC IVAU, Xt: SYS #3, c7, c5, #1, Xt
+		// Encoding: 0xD50B7520 | Rt
+		c.emit32(0xD50B7520 | uint32(reg))
+		return nil
+	})
+}
+
 // StpPreIndex stores a pair of 64-bit registers to memory with pre-indexed addressing.
 // STP Rt, Rt2, [Rn, #imm]! where imm is the byte offset (must be multiple of 8).
 func StpPreIndex(rt, rt2, rn asm.Variable, imm int) asm.Fragment {
@@ -705,8 +751,58 @@ func (s *syscallFragment) Emit(ctx asm.Context) error {
 	if len(s.args) > len(argRegs) {
 		return fmt.Errorf("arm64 asm: too many syscall arguments (%d)", len(s.args))
 	}
-	for idx, value := range s.args {
-		if err := moveValueIntoReg(c, argRegs[idx], value); err != nil {
+
+	// Create a working copy of args that we may modify
+	args := make([]asm.Value, len(s.args))
+	copy(args, s.args)
+
+	// Detect and handle register conflicts:
+	// If arg[j] (j>i) uses a register that arg[i] will write to as its target,
+	// we need to save arg[j]'s value to a temp register first.
+	tempRegs := []Reg{Reg64(X9), Reg64(X10), Reg64(X11), Reg64(X12), Reg64(X13), Reg64(X14), Reg64(X15)}
+	tempIdx := 0
+
+	for i := 0; i < len(args); i++ {
+		targetReg := argRegs[i]
+
+		// Check if any later argument uses this target register as a source
+		for j := i + 1; j < len(args); j++ {
+			if v, ok := args[j].(asm.Variable); ok {
+				if asm.Variable(targetReg.id) == v {
+					// Conflict! arg[j] uses the register that arg[i] will overwrite.
+					// Save arg[j]'s value to a temp register now.
+					if tempIdx >= len(tempRegs) {
+						return fmt.Errorf("arm64 asm: too many syscall register conflicts")
+					}
+					temp := tempRegs[tempIdx]
+					tempIdx++
+
+					// Move the current value to temp register
+					if err := moveValueIntoReg(c, temp, v); err != nil {
+						return err
+					}
+					// Update args[j] to use the temp register
+					args[j] = asm.Variable(temp.id)
+				}
+			} else if r, ok := args[j].(asm.Register); ok {
+				if asm.Variable(targetReg.id) == asm.Variable(r) {
+					// Conflict! Same as above but for asm.Register type
+					if tempIdx >= len(tempRegs) {
+						return fmt.Errorf("arm64 asm: too many syscall register conflicts")
+					}
+					temp := tempRegs[tempIdx]
+					tempIdx++
+
+					if err := moveValueIntoReg(c, temp, asm.Variable(r)); err != nil {
+						return err
+					}
+					args[j] = asm.Variable(temp.id)
+				}
+			}
+		}
+
+		// Now move arg[i] to its target register
+		if err := moveValueIntoReg(c, targetReg, args[i]); err != nil {
 			return err
 		}
 	}

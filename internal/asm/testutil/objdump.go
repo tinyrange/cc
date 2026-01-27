@@ -178,7 +178,7 @@ func parseObjdumpOutput(out string) ([]DisasmLine, error) {
 		if text == "" || strings.HasPrefix(text, "<") {
 			continue
 		}
-		if strings.HasPrefix(text, ".") || strings.HasPrefix(text, "file format") {
+		if strings.HasPrefix(text, ".") || strings.Contains(text, "file format") {
 			continue
 		}
 		fields := strings.Fields(text)

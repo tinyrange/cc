@@ -1244,6 +1244,7 @@ type udpEndpointConn struct {
 	incoming chan udpPacket
 
 	closed    atomic.Bool
+	deadMu    sync.RWMutex
 	readDead  time.Time
 	writeDead time.Time
 }
@@ -1274,7 +1275,9 @@ func (ep *udpEndpointConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	if ep.closed.Load() {
 		return 0, nil, net.ErrClosed
 	}
+	ep.deadMu.RLock()
 	deadline := ep.readDead
+	ep.deadMu.RUnlock()
 	ch := ep.incoming
 
 	var (
@@ -1315,7 +1318,9 @@ func (ep *udpEndpointConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if ep.closed.Load() {
 		return 0, net.ErrClosed
 	}
+	ep.deadMu.RLock()
 	dead := ep.writeDead
+	ep.deadMu.RUnlock()
 
 	if !dead.IsZero() && time.Now().After(dead) {
 		return 0, &net.OpError{Op: "write", Net: "udp", Err: udpTimeoutError{}}
@@ -1356,12 +1361,16 @@ func (ep *udpEndpointConn) SetDeadline(t time.Time) error {
 }
 
 func (ep *udpEndpointConn) SetReadDeadline(t time.Time) error {
+	ep.deadMu.Lock()
 	ep.readDead = t
+	ep.deadMu.Unlock()
 	return nil
 }
 
 func (ep *udpEndpointConn) SetWriteDeadline(t time.Time) error {
+	ep.deadMu.Lock()
 	ep.writeDead = t
+	ep.deadMu.Unlock()
 	return nil
 }
 

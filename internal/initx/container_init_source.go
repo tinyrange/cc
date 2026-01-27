@@ -227,13 +227,15 @@ func main() int64 {
 		runtime.LogKmsg("cc: dropped privileges\n")
 	}
 
-	// === Phase 10: Execute command ===
+	// === Phase 10: Execute command (unless skip_entrypoint is set) ===
 	// Record: container_exec (64)
 	if timesliceMem > 0 {
 		runtime.Store32(timesliceMem, 0, 64)
 	}
 
-	if runtime.Ifdef("exec") {
+	if runtime.Ifdef("skip_entrypoint") {
+		runtime.LogKmsg("cc: skip_entrypoint set, waiting for vsock commands\n")
+	} else if runtime.Ifdef("exec") {
 		runtime.LogKmsg("cc: executing command\n")
 		execCommand()
 	} else {

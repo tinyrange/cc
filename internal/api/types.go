@@ -1,0 +1,190 @@
+package api
+
+import (
+	"context"
+	"io"
+	"io/fs"
+	"net"
+	"time"
+)
+
+// File represents an open file in a guest filesystem.
+type File interface {
+	io.Reader
+	io.Writer
+
+	io.Closer
+	io.Seeker
+
+	io.ReaderAt
+	io.WriterAt
+
+	// Stat returns the FileInfo for the named file.
+	Stat() (fs.FileInfo, error)
+	// Sync flushes the file to disk.
+	Sync() error
+	// Truncate truncates the file to the given size.
+	Truncate(size int64) error
+	// Name returns the name of the file.
+	Name() string
+}
+
+// FS provides filesystem operations on a guest.
+type FS interface {
+	// WithContext returns a new FS with the given context.
+	WithContext(ctx context.Context) FS
+	// Open opens the named file for reading.
+	Open(name string) (File, error)
+	// Create creates or truncates the named file.
+	Create(name string) (File, error)
+	// OpenFile opens the named file with the given flags and permissions.
+	OpenFile(name string, flag int, perm fs.FileMode) (File, error)
+	// ReadFile reads the named file and returns its contents.
+	ReadFile(name string) ([]byte, error)
+	// WriteFile writes the given data to the named file.
+	WriteFile(name string, data []byte, perm fs.FileMode) error
+	// Stat returns the FileInfo for the named file.
+	Stat(name string) (fs.FileInfo, error)
+	// Lstat returns the FileInfo for the named file.
+	Lstat(name string) (fs.FileInfo, error)
+	// Remove removes the named file.
+	Remove(name string) error
+	// RemoveAll removes the named file and all its children.
+	RemoveAll(path string) error
+	// Mkdir creates the named directory.
+	Mkdir(name string, perm fs.FileMode) error
+	// MkdirAll creates the named directory and all its parents.
+	MkdirAll(path string, perm fs.FileMode) error
+	// Rename renames the named file.
+	Rename(oldpath, newpath string) error
+	// Symlink creates a new symlink.
+	Symlink(oldname, newname string) error
+	// Readlink reads the contents of the named symlink.
+	Readlink(name string) (string, error)
+	// ReadDir reads the named directory and returns its contents.
+	ReadDir(name string) ([]fs.DirEntry, error)
+	// Chmod changes the mode of the named file.
+	Chmod(name string, mode fs.FileMode) error
+	// Chown changes the owner and group of the named file.
+	Chown(name string, uid, gid int) error
+	// Chtimes changes the access and modification times of the named file.
+	Chtimes(name string, atime, mtime time.Time) error
+}
+
+// Cmd represents a command ready to be run in the guest.
+type Cmd interface {
+	// Run runs the command.
+	Run() error
+	// Start starts the command.
+	Start() error
+	// Wait waits for the command to complete.
+	Wait() error
+	// Output runs the command and returns its stdout.
+	Output() ([]byte, error)
+	// CombinedOutput runs the command and returns its stdout and stderr.
+	CombinedOutput() ([]byte, error)
+	// StdinPipe returns a pipe that can be used to write to the command's stdin.
+	StdinPipe() (io.WriteCloser, error)
+	// StdoutPipe returns a pipe that can be used to read the command's stdout.
+	StdoutPipe() (io.ReadCloser, error)
+	// StderrPipe returns a pipe that can be used to read the command's stderr.
+	StderrPipe() (io.ReadCloser, error)
+	// SetStdin sets the command's stdin.
+	SetStdin(r io.Reader) Cmd
+	// SetStdout sets the command's stdout.
+	SetStdout(w io.Writer) Cmd
+	// SetStderr sets the command's stderr.
+	SetStderr(w io.Writer) Cmd
+	// SetDir sets the command's working directory.
+	SetDir(dir string) Cmd
+	// SetEnv sets the command's environment variables.
+	SetEnv(env []string) Cmd
+	// ExitCode returns the command's exit code.
+	ExitCode() int
+}
+
+// Exec provides process execution on a guest.
+type Exec interface {
+	// Command creates a new command.
+	Command(name string, args ...string) Cmd
+	// CommandContext creates a new command with the given context.
+	CommandContext(ctx context.Context, name string, args ...string) Cmd
+}
+
+// Net provides network operations on a guest.
+type Net interface {
+	// Dial dials the given network and address.
+	Dial(network, address string) (net.Conn, error)
+	// DialContext dials the given network and address with the given context.
+	DialContext(ctx context.Context, network, address string) (net.Conn, error)
+	// Listen listens for incoming connections on the given network and address.
+	Listen(network, address string) (net.Listener, error)
+	// ListenPacket listens for incoming packets on the given network and address.
+	ListenPacket(network, address string) (net.PacketConn, error)
+	// Expose exposes a guest network listener on the given host network and address.
+	Expose(guestNetwork, guestAddress string, host net.Listener) (io.Closer, error)
+	// Forward forwards a guest network listener to the given host network and address.
+	Forward(guest net.Listener, hostNetwork, hostAddress string) (io.Closer, error)
+}
+
+// Instance represents a running virtual machine.
+type Instance interface {
+	FS
+	Exec
+	Net
+
+	// Close closes the instance.
+	Close() error
+	// Wait waits for the instance to complete.
+	Wait() error
+	// ID returns the instance's ID.
+	ID() string
+}
+
+// InstanceSource is the source for creating a new Instance.
+type InstanceSource interface {
+	IsInstanceSource()
+}
+
+// OCIClient pulls OCI images and converts them to InstanceSources.
+type OCIClient interface {
+	// Pull pulls the given image and returns an InstanceSource.
+	Pull(ctx context.Context, imageRef string, opts ...OCIPullOption) (InstanceSource, error)
+}
+
+// Option configures an Instance.
+type Option interface {
+	IsOption()
+}
+
+// OCIPullOption configures an OCI pull operation.
+type OCIPullOption interface {
+	IsOCIPullOption()
+}
+
+// PullPolicy determines when images are fetched from the registry.
+type PullPolicy int
+
+const (
+	PullIfNotPresent PullPolicy = iota
+	PullAlways
+	PullNever
+)
+
+// Error represents an operation error with structured information.
+type Error struct {
+	Op   string
+	Path string
+	Err  error
+}
+
+func (e *Error) Error() string {
+	if e.Path != "" {
+		return e.Op + " " + e.Path + ": " + e.Err.Error()
+	}
+	return e.Op + ": " + e.Err.Error()
+}
+
+func (e *Error) Unwrap() error {
+	return e.Err
+}

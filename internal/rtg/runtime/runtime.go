@@ -55,6 +55,17 @@ func GotoLabel(label int64) {}
 // Required after modifying code in memory before executing it.
 func ISB() {}
 
+// CacheFlush flushes the CPU caches for the given memory region.
+// On ARM64, this performs the full cache maintenance sequence:
+// 1. Clean data cache lines (DC CVAU)
+// 2. DSB ISH (data synchronization barrier)
+// 3. Invalidate instruction cache lines (IC IVAU)
+// 4. DSB ISH
+// 5. ISB (instruction synchronization barrier)
+// This MUST be called after writing code to memory and before executing it.
+// On x86-64, this is a no-op since x86 has coherent instruction caches.
+func CacheFlush(base int64, size int64) {}
+
 // Ifdef returns true if the named compile-time flag is set.
 // This is evaluated at RTG compile time, not at runtime.
 // The flag name must be a string literal.
@@ -138,6 +149,8 @@ const (
 	SYS_GETSOCKOPT    int64 = 39
 	SYS_SENDMSG       int64 = 40
 	SYS_RECVMSG       int64 = 41
+	SYS_PIPE2         int64 = 42
+	SYS_FCNTL         int64 = 43
 )
 
 // File descriptor constants
@@ -152,12 +165,21 @@ const (
 
 // File open flags
 const (
-	O_RDONLY int64 = 0
-	O_WRONLY int64 = 1
-	O_RDWR   int64 = 2
-	O_CREAT  int64 = 0o100
-	O_TRUNC  int64 = 0o1000
-	O_SYNC   int64 = 0o4010000
+	O_RDONLY   int64 = 0
+	O_WRONLY   int64 = 1
+	O_RDWR     int64 = 2
+	O_CREAT    int64 = 0o100
+	O_TRUNC    int64 = 0o1000
+	O_SYNC     int64 = 0o4010000
+	O_NONBLOCK int64 = 0o4000
+	O_CLOEXEC  int64 = 0o2000000
+)
+
+// fcntl commands
+const (
+	F_GETFL        int64 = 3
+	F_SETFL        int64 = 4
+	F_DUPFD_CLOEXEC int64 = 0x406
 )
 
 // Memory protection flags

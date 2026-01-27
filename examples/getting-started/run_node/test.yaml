@@ -1,0 +1,58 @@
+name: run_node
+description: Run JavaScript/Node.js scripts in a sandboxed environment
+
+build:
+  package: ./examples/getting-started/run_node
+  timeout: 30s
+
+cli:
+  timeout: 60s
+
+cli_tests:
+  - name: hello world
+    args: ["-code", "console.log('Hello, World!')"]
+    expect:
+      exit_code: 0
+      stdout_equals: "Hello, World!\n"
+
+  - name: arithmetic
+    args: ["-code", "console.log(2 + 2)"]
+    expect:
+      exit_code: 0
+      stdout_equals: "4\n"
+
+  - name: array operations
+    args: ["-code", "console.log([1,2,3].map(x => x * 2))"]
+    expect:
+      exit_code: 0
+      stdout_contains: "2, 4, 6"
+
+  - name: async await
+    args: ["-code", "async function main() { return 'async result'; }\nmain().then(console.log);"]
+    expect:
+      exit_code: 0
+      stdout_equals: "async result\n"
+
+  - name: json parsing
+    args: ["-code", "const obj = JSON.parse('{\"name\":\"test\"}');\nconsole.log(obj.name);"]
+    expect:
+      exit_code: 0
+      stdout_equals: "test\n"
+
+  - name: syntax error
+    args: ["-code", "console.log('unclosed"]
+    expect:
+      exit_code: 1
+      stderr_contains: "SyntaxError"
+
+  - name: reference error
+    args: ["-code", "console.log(undefinedVariable)"]
+    expect:
+      exit_code: 1
+      stderr_contains: "ReferenceError"
+
+  - name: missing argument
+    args: []
+    expect:
+      exit_code: 1
+      stderr_contains: "must provide"

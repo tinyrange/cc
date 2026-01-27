@@ -71,6 +71,15 @@ func startSession(parent context.Context, vmPtr *VirtualMachine, runner sessionR
 		}
 
 		runner.StartStdinForwarding()
+
+		// If no program was provided, just wait for cancellation
+		// This is useful when the caller wants to run programs manually via vm.Run()
+		if prog == nil {
+			<-ctx.Done()
+			doneCh <- ctx.Err()
+			return
+		}
+
 		doneCh <- runner.Run(ctx, prog)
 	}()
 

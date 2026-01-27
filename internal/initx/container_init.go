@@ -43,6 +43,7 @@ type ContainerInitConfig struct {
 	WorkDir       string
 	EnableNetwork bool
 	Exec          bool
+	SkipEntrypoint bool // If true, don't run Cmd - just initialize and wait for commands via vsock
 
 	Hostname    string // default: tinyrange
 	DNS         string // default: 10.42.0.1
@@ -105,8 +106,8 @@ func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
 	if cfg.Arch == "" || cfg.Arch == hv.ArchitectureInvalid {
 		return nil, fmt.Errorf("initx: container init requires valid architecture")
 	}
-	if len(cfg.Cmd) == 0 || cfg.Cmd[0] == "" {
-		return nil, fmt.Errorf("initx: container init requires non-empty command")
+	if !cfg.SkipEntrypoint && (len(cfg.Cmd) == 0 || cfg.Cmd[0] == "") {
+		return nil, fmt.Errorf("initx: container init requires non-empty command (or SkipEntrypoint=true)")
 	}
 
 	// Determine target architecture for runtime.GOARCH
@@ -124,6 +125,7 @@ func BuildContainerInitProgram(cfg ContainerInitConfig) (*ir.Program, error) {
 	flags := map[string]bool{
 		"network":         cfg.EnableNetwork,
 		"exec":            cfg.Exec,
+		"skip_entrypoint": cfg.SkipEntrypoint,
 		"drop_privileges": cfg.UID != nil,
 		"qemu_emulation":  cfg.QEMUEmulation != nil,
 	}
@@ -231,26 +233,28 @@ func injectContainerInitHelpers(prog *ir.Program, cfg ContainerInitConfig) error
 		}
 	}
 
-	// Command execution helpers
-	execErrLabel := ir.Label("__cc_exec_error")
-	forkErrLabel := ir.Label("__cc_fork_error")
+	// Command execution helpers (only if not skipping entrypoint)
+	if !cfg.SkipEntrypoint && len(cfg.Cmd) > 0 {
+		execErrLabel := ir.Label("__cc_exec_error")
+		forkErrLabel := ir.Label("__cc_fork_error")
 
-	prog.Methods["execCommand"] = ir.Method{
-		Exec(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, execErrLabel, errVar),
-		ir.Return(ir.Int64(0)),
-		ir.DeclareLabel(execErrLabel, ir.Block{
-			ir.Printf("cc: execCommand error: errno=0x%x\n", errVar),
-			rebootFragment(cfg.Arch),
-		}),
-	}
+		prog.Methods["execCommand"] = ir.Method{
+			Exec(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, execErrLabel, errVar),
+			ir.Return(ir.Int64(0)),
+			ir.DeclareLabel(execErrLabel, ir.Block{
+				ir.Printf("cc: execCommand error: errno=0x%x\n", errVar),
+				rebootFragment(cfg.Arch),
+			}),
+		}
 
-	prog.Methods["forkExecWait"] = ir.Method{
-		ForkExecWait(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, forkErrLabel, errVar),
-		ir.Return(errVar),
-		ir.DeclareLabel(forkErrLabel, ir.Block{
-			ir.Printf("cc: forkExecWait error: errno=0x%x\n", errVar),
-			rebootFragment(cfg.Arch),
-		}),
+		prog.Methods["forkExecWait"] = ir.Method{
+			ForkExecWait(cfg.Cmd[0], cfg.Cmd[1:], cfg.Env, forkErrLabel, forkErrLabel, errVar),
+			ir.Return(errVar),
+			ir.DeclareLabel(forkErrLabel, ir.Block{
+				ir.Printf("cc: forkExecWait error: errno=0x%x\n", errVar),
+				rebootFragment(cfg.Arch),
+			}),
+		}
 	}
 
 	// Privilege dropping helper (setgid must be called before setuid)

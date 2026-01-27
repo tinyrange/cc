@@ -42,7 +42,7 @@ func Compile(f asm.Fragment) (Func, func(), error) {
 		return Func{}, nil, fmt.Errorf("emit assembly program: %w", err)
 	}
 
-	fn, release, err := PrepareAssemblyWithArgs(prog.Bytes(), prog.Relocations())
+	fn, release, err := PrepareAssemblyWithArgs(prog.Bytes(), prog.Relocations(), prog.BSSSize())
 	if err != nil {
 		return Func{}, nil, fmt.Errorf("prepare assembly with args: %w", err)
 	}
@@ -60,8 +60,12 @@ func MustCompile(f asm.Fragment) Func {
 	return fn
 }
 
-func PrepareAssembly(code []byte, relocations []int) (func(), func(), error) {
-	entry, release, err := createAssemblyTrampoline(code, relocations)
+func PrepareAssembly(code []byte, relocations []int, bssSize ...int) (func(), func(), error) {
+	bss := 0
+	if len(bssSize) > 0 {
+		bss = bssSize[0]
+	}
+	entry, release, err := createAssemblyTrampoline(code, relocations, bss)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -73,8 +77,13 @@ func PrepareAssembly(code []byte, relocations []int) (func(), func(), error) {
 
 // PrepareAssemblyWithArgs is like PrepareAssembly, but allows calling the assembled code with up to
 // six integer or pointer arguments (passed in the System V calling convention registers).
-func PrepareAssemblyWithArgs(code []byte, relocations []int) (Func, func(), error) {
-	entry, release, err := createAssemblyTrampoline(code, relocations)
+// It also accepts an optional bssSize parameter to allocate space for BSS (globals).
+func PrepareAssemblyWithArgs(code []byte, relocations []int, bssSize ...int) (Func, func(), error) {
+	bss := 0
+	if len(bssSize) > 0 {
+		bss = bssSize[0]
+	}
+	entry, release, err := createAssemblyTrampoline(code, relocations, bss)
 	if err != nil {
 		return Func{}, nil, err
 	}
@@ -154,9 +163,23 @@ func assemblyArgValue(arg any) (uintptr, error) {
 	return 0, fmt.Errorf("unsupported argument type %T", arg)
 }
 
-func createAssemblyTrampoline(code []byte, relocations []int) (uintptr, func(), error) {
+func createAssemblyTrampoline(code []byte, relocations []int, bssSize int) (uintptr, func(), error) {
 	size := len(code)
-	mem, err := unix.Mmap(-1, 0, size, unix.PROT_READ|unix.PROT_WRITE|unix.PROT_EXEC, unix.MAP_PRIVATE|unix.MAP_ANON)
+	if size == 0 {
+		return 0, nil, fmt.Errorf("empty code")
+	}
+
+	pageSize := unix.Getpagesize()
+
+	// Round up code size to page boundary so BSS is always on a separate page.
+	// This allows us to mprotect code pages as RX while keeping BSS pages RW.
+	codeAllocSize := ((size + pageSize - 1) / pageSize) * pageSize
+
+	// Total allocation: page-aligned code + BSS
+	totalSize := codeAllocSize + bssSize
+	allocSize := ((totalSize + pageSize - 1) / pageSize) * pageSize
+
+	mem, err := unix.Mmap(-1, 0, allocSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_PRIVATE|unix.MAP_ANON)
 	if err != nil {
 		return 0, nil, fmt.Errorf("mmap assembly region: %w", err)
 	}
@@ -170,17 +193,32 @@ func createAssemblyTrampoline(code []byte, relocations []int) (uintptr, func(), 
 	copy(mem, code)
 
 	base := uintptr(unsafe.Pointer(&mem[0]))
+
+	// Relocations need to be adjusted for the page-aligned BSS offset.
+	// The compiler calculates BSS at align(len(code), 16), but we put it at codeAllocSize.
+	// We need to adjust any relocation values that point into the BSS region.
+	bssAdjustment := uint64(codeAllocSize - size)
+	codeSize := uint64(size)
+
 	for _, reloc := range relocations {
 		offset := int(reloc)
 		if offset < 0 || offset+8 > len(mem) {
 			return 0, nil, fmt.Errorf("assembly relocation offset %d out of range (code len %d)", offset, len(mem))
 		}
 		value := binary.LittleEndian.Uint64(mem[offset:])
+
+		// Check if this relocation points into the BSS region (beyond code size).
+		// If so, adjust it to account for the page-aligned BSS placement.
+		if value >= codeSize {
+			value += bssAdjustment
+		}
+
 		binary.LittleEndian.PutUint64(mem[offset:], value+uint64(base))
 	}
 
-	if err := unix.Mprotect(mem, unix.PROT_READ|unix.PROT_EXEC); err != nil {
-		return 0, nil, fmt.Errorf("mprotect assembly region: %w", err)
+	// Make code region executable. BSS region (if any) remains writable.
+	if err := unix.Mprotect(mem[:codeAllocSize], unix.PROT_READ|unix.PROT_EXEC); err != nil {
+		return 0, nil, fmt.Errorf("mprotect code region: %w", err)
 	}
 
 	release = false

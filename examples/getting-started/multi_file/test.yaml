@@ -1,0 +1,93 @@
+name: multi_file
+description: Work with multi-file projects in a sandboxed environment
+
+build:
+  package: ./examples/getting-started/multi_file
+  timeout: 30s
+
+cli:
+  timeout: 120s
+
+cli_tests:
+  - name: python multi-file
+    args:
+      - "-project"
+      - |
+        {
+          "language": "python",
+          "files": {
+            "utils.py": "def greet(name):\n    return f'Hello, {name}!'",
+            "main.py": "from utils import greet\nprint(greet('World'))"
+          },
+          "main": "main.py"
+        }
+    expect:
+      exit_code: 0
+      stdout_equals: "Hello, World!\n"
+
+  - name: python math module
+    args:
+      - "-project"
+      - |
+        {
+          "language": "python",
+          "files": {
+            "math_utils.py": "def add(a, b):\n    return a + b\ndef multiply(a, b):\n    return a * b",
+            "main.py": "from math_utils import add, multiply\nprint(add(2, 3))\nprint(multiply(4, 5))"
+          },
+          "main": "main.py"
+        }
+    expect:
+      exit_code: 0
+      stdout_equals: "5\n20\n"
+
+  - name: node multi-file
+    args:
+      - "-project"
+      - |
+        {
+          "language": "node",
+          "files": {
+            "utils.js": "module.exports = { greet: (name) => `Hello, ${name}!` };",
+            "main.js": "const { greet } = require('./utils');\nconsole.log(greet('World'));"
+          },
+          "main": "main.js"
+        }
+    expect:
+      exit_code: 0
+      stdout_equals: "Hello, World!\n"
+
+  - name: node calculator module
+    args:
+      - "-project"
+      - |
+        {
+          "language": "node",
+          "files": {
+            "calc.js": "module.exports = {\n  add: (a, b) => a + b,\n  sub: (a, b) => a - b\n};",
+            "main.js": "const calc = require('./calc');\nconsole.log(calc.add(10, 5));\nconsole.log(calc.sub(10, 5));"
+          },
+          "main": "main.js"
+        }
+    expect:
+      exit_code: 0
+      stdout_equals: "15\n5\n"
+
+  - name: unsupported language
+    args:
+      - "-project"
+      - |
+        {
+          "language": "ruby",
+          "files": {"main.rb": "puts 'hello'"},
+          "main": "main.rb"
+        }
+    expect:
+      exit_code: 1
+      stderr_contains: "unsupported language"
+
+  - name: missing project
+    args: []
+    expect:
+      exit_code: 1
+      stderr_contains: "must provide -project"

@@ -1,0 +1,77 @@
+name: compile_rust
+description: Compile and run Rust code in a sandboxed environment
+
+build:
+  package: ./examples/getting-started/compile_rust
+  timeout: 30s
+
+cli:
+  timeout: 180s
+
+cli_tests:
+  - name: hello world
+    args:
+      - "-code"
+      - |
+        fn main() {
+            println!("Hello, World!");
+        }
+    expect:
+      exit_code: 0
+      stdout_equals: "Hello, World!\n"
+
+  - name: arithmetic
+    args:
+      - "-code"
+      - |
+        fn main() {
+            println!("{}", 2 + 2);
+        }
+    expect:
+      exit_code: 0
+      stdout_equals: "4\n"
+
+  - name: function call
+    args:
+      - "-code"
+      - |
+        fn add(a: i32, b: i32) -> i32 {
+            a + b
+        }
+
+        fn main() {
+            println!("{}", add(3, 5));
+        }
+    expect:
+      exit_code: 0
+      stdout_equals: "8\n"
+
+  - name: vector operations
+    args:
+      - "-code"
+      - |
+        fn main() {
+            let nums = vec![1, 2, 3, 4, 5];
+            let sum: i32 = nums.iter().sum();
+            println!("{}", sum);
+        }
+    expect:
+      exit_code: 0
+      stdout_equals: "15\n"
+
+  - name: compile error
+    args:
+      - "-code"
+      - |
+        fn main() {
+            undefined_function();
+        }
+    expect:
+      exit_code: 1
+      stderr_contains: "cannot find function"
+
+  - name: missing argument
+    args: []
+    expect:
+      exit_code: 1
+      stderr_contains: "must provide"

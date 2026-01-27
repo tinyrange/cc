@@ -222,11 +222,28 @@ var (
 
 // VsockProgramServer handles program loading via vsock.
 // Protocol:
-//   - Host → Guest: [len:4][code_len:4][reloc_count:4][relocs:4*count][code:code_len]
-//   - Guest → Host: [len:4][exit_code:4]
+//   - Host → Guest: [len:4][time_sec:8][time_nsec:8][flags:4][code_len:4][reloc_count:4][relocs:4*count][code:code_len]
+//   - Guest → Host: [len:4][exit_code:4][stdout_len:4][stdout_data][stderr_len:4][stderr_data]
+//
+// Note: time_sec and time_nsec come before flags to maintain 8-byte alignment for ARM64.
+// When flags=0, guest response is just [len:4][exit_code:4] for backward compatibility.
 const (
 	VsockProgramPort = 9998
+
+	// Capture flags for stdout/stderr capture and stdin delivery
+	CaptureFlagNone    uint32 = 0x00
+	CaptureFlagStdout  uint32 = 0x01
+	CaptureFlagStderr  uint32 = 0x02
+	CaptureFlagCombine uint32 = 0x04 // Combine stdout+stderr into single stream
+	CaptureFlagStdin   uint32 = 0x08 // Stdin data is included in the message
 )
+
+// ProgramResult contains the result of a program execution including captured output.
+type ProgramResult struct {
+	ExitCode int32
+	Stdout   []byte
+	Stderr   []byte
+}
 
 // VsockProgramServer is the host-side server for vsock-based program loading.
 type VsockProgramServer struct {
@@ -234,6 +251,13 @@ type VsockProgramServer struct {
 	conn     virtio.VsockConn
 	arch     hv.CpuArchitecture
 	mu       sync.Mutex
+
+	// drainBuf is reused for draining stale data
+	drainBuf []byte
+
+	// vmTerminated is closed when the VM terminates unexpectedly.
+	// This allows WaitResult to detect early termination.
+	vmTerminated <-chan struct{}
 }
 
 // NewVsockProgramServer creates a new vsock program server listening on the specified port.
@@ -248,27 +272,100 @@ func NewVsockProgramServer(backend virtio.VsockBackend, port uint32, arch hv.Cpu
 	}, nil
 }
 
-// Accept waits for a guest connection.
-func (s *VsockProgramServer) Accept() error {
+// SetVMTerminatedChannel configures the channel that signals VM termination.
+func (s *VsockProgramServer) SetVMTerminatedChannel(ch <-chan struct{}) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.vmTerminated = ch
+}
 
-	conn, err := s.listener.Accept()
+// Accept waits for a guest connection.
+func (s *VsockProgramServer) Accept() error {
+	// Get listener under lock, but don't hold lock during blocking accept
+	s.mu.Lock()
+	listener := s.listener
+	s.mu.Unlock()
+
+	if listener == nil {
+		return fmt.Errorf("listener is nil")
+	}
+
+	conn, err := listener.Accept()
 	if err != nil {
 		return fmt.Errorf("accept connection: %w", err)
 	}
+
+	// Store connection under lock
+	s.mu.Lock()
 	s.conn = conn
+	s.mu.Unlock()
+
 	return nil
 }
 
-// SendProgram sends a compiled program to the guest.
+// drainStaleData attempts to drain any stale data from the connection.
+// This is called before sending a new program to ensure buffer state is clean.
+// It uses a non-blocking approach that reads whatever is available without blocking.
+func (s *VsockProgramServer) drainStaleData() {
+	if s.conn == nil {
+		return
+	}
+
+	// Try to drain using the Drain interface if available
+	if drainer, ok := s.conn.(interface{ Drain() }); ok {
+		drainer.Drain()
+		return
+	}
+
+	// Fallback: allocate drain buffer if needed
+	if s.drainBuf == nil {
+		s.drainBuf = make([]byte, 4096)
+	}
+
+	// For connections that support deadlines, set a very short deadline
+	if deadline, ok := s.conn.(interface {
+		SetReadDeadline(time.Time) error
+	}); ok {
+		deadline.SetReadDeadline(time.Now().Add(1 * time.Millisecond))
+		for {
+			n, err := s.conn.Read(s.drainBuf)
+			if n > 0 {
+				debug.Writef("initx.drainStaleData", "drained %d stale bytes", n)
+			}
+			if err != nil || n == 0 {
+				break
+			}
+		}
+		deadline.SetReadDeadline(time.Time{})
+	}
+}
+
+// SendProgram sends a compiled program to the guest without capture flags.
+// This is a convenience wrapper around SendProgramWithFlags with flags=0.
 func (s *VsockProgramServer) SendProgram(prog *ir.Program) error {
+	return s.SendProgramWithFlags(prog, CaptureFlagNone)
+}
+
+// SendProgramWithFlags sends a compiled program to the guest with capture flags.
+// Protocol: [len:4][time_sec:8][time_nsec:8][flags:4][stdin_len:4][code_len:4][reloc_count:4][relocs:4*count][code:code_len][stdin_data]
+// Note: time_sec and time_nsec come first to maintain 8-byte alignment for ARM64.
+func (s *VsockProgramServer) SendProgramWithFlags(prog *ir.Program, flags uint32) error {
+	return s.SendProgramWithFlagsAndStdin(prog, flags, nil)
+}
+
+// SendProgramWithFlagsAndStdin sends a compiled program to the guest with capture flags and optional stdin data.
+// Protocol: [len:4][time_sec:8][time_nsec:8][flags:4][stdin_len:4][code_len:4][reloc_count:4][relocs:4*count][code:code_len][stdin_data]
+// Note: time_sec and time_nsec come first to maintain 8-byte alignment for ARM64.
+func (s *VsockProgramServer) SendProgramWithFlagsAndStdin(prog *ir.Program, flags uint32, stdin []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.conn == nil {
 		return fmt.Errorf("no connection established")
 	}
+
+	// Drain any stale data from previous program runs to ensure clean buffer state
+	s.drainStaleData()
 
 	asmProg, err := ir.BuildStandaloneProgramForArch(s.arch, prog)
 	if err != nil {
@@ -278,8 +375,11 @@ func (s *VsockProgramServer) SendProgram(prog *ir.Program) error {
 	progBytes := asmProg.Bytes()
 	relocs := asmProg.Relocations()
 
-	// Calculate total message size: code_len(4) + reloc_count(4) + relocs(4*N) + code
-	payloadLen := 4 + 4 + 4*len(relocs) + len(progBytes)
+	// Note: CaptureFlagStdin should be set by the caller if stdin is needed.
+	// This allows the caller to signal EOF even with empty stdin data.
+
+	// Calculate total message size: time_sec(8) + time_nsec(8) + flags(4) + stdin_len(4) + code_len(4) + reloc_count(4) + relocs(4*N) + code + stdin
+	payloadLen := 8 + 8 + 4 + 4 + 4 + 4 + 4*len(relocs) + len(progBytes) + len(stdin)
 
 	// Build the message
 	msg := make([]byte, 4+payloadLen) // len prefix + payload
@@ -287,19 +387,37 @@ func (s *VsockProgramServer) SendProgram(prog *ir.Program) error {
 	// Length prefix (excludes itself)
 	binary.LittleEndian.PutUint32(msg[0:4], uint32(payloadLen))
 
+	// Current time for guest clock synchronization (8-byte aligned)
+	now := time.Now()
+	binary.LittleEndian.PutUint64(msg[4:12], uint64(now.Unix()))
+	binary.LittleEndian.PutUint64(msg[12:20], uint64(now.Nanosecond()))
+
+	// Flags
+	binary.LittleEndian.PutUint32(msg[20:24], flags)
+
+	// stdin_len
+	binary.LittleEndian.PutUint32(msg[24:28], uint32(len(stdin)))
+
 	// code_len
-	binary.LittleEndian.PutUint32(msg[4:8], uint32(len(progBytes)))
+	binary.LittleEndian.PutUint32(msg[28:32], uint32(len(progBytes)))
 
 	// reloc_count
-	binary.LittleEndian.PutUint32(msg[8:12], uint32(len(relocs)))
+	binary.LittleEndian.PutUint32(msg[32:36], uint32(len(relocs)))
 
 	// relocations
 	for i, reloc := range relocs {
-		binary.LittleEndian.PutUint32(msg[12+4*i:], uint32(reloc))
+		binary.LittleEndian.PutUint32(msg[36+4*i:], uint32(reloc))
 	}
 
 	// code
-	copy(msg[12+4*len(relocs):], progBytes)
+	codeOffset := 36 + 4*len(relocs)
+	copy(msg[codeOffset:], progBytes)
+
+	// stdin data
+	if len(stdin) > 0 {
+		stdinOffset := codeOffset + len(progBytes)
+		copy(msg[stdinOffset:], stdin)
+	}
 
 	// Write the entire message
 	if _, err := s.conn.Write(msg); err != nil {
@@ -310,39 +428,107 @@ func (s *VsockProgramServer) SendProgram(prog *ir.Program) error {
 }
 
 // WaitResult waits for and returns the exit code from the guest.
+// This is a convenience wrapper for backward compatibility when capture is not needed.
 func (s *VsockProgramServer) WaitResult(ctx context.Context) (int32, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	result, err := s.WaitResultWithCapture(ctx, CaptureFlagNone)
+	if err != nil {
+		return -1, err
+	}
+	return result.ExitCode, nil
+}
 
-	if s.conn == nil {
-		return -1, fmt.Errorf("no connection established")
+// WaitResultWithCapture waits for the result from the guest including captured output.
+// Protocol response: [len:4][exit_code:4][stdout_len:4][stdout_data][stderr_len:4][stderr_data]
+// When flags=0, response is just [len:4][exit_code:4].
+func (s *VsockProgramServer) WaitResultWithCapture(ctx context.Context, flags uint32) (*ProgramResult, error) {
+	// Get connection and vmTerminated under lock, but don't hold lock during blocking read
+	s.mu.Lock()
+	conn := s.conn
+	vmTerminated := s.vmTerminated
+	s.mu.Unlock()
+
+	if conn == nil {
+		return nil, fmt.Errorf("no connection established")
 	}
 
-	// Read length prefix (4 bytes) + exit code (4 bytes)
-	buf := make([]byte, 8)
+	// Read length prefix (4 bytes)
+	lenBuf := make([]byte, 4)
 	done := make(chan error, 1)
 
 	go func() {
-		_, err := io.ReadFull(s.conn, buf)
+		_, err := io.ReadFull(conn, lenBuf)
+		done <- err
+	}()
+
+	// Wait for result - timeout is controlled by the caller via context
+	select {
+	case err := <-done:
+		if err != nil {
+			return nil, fmt.Errorf("read result length: %w", err)
+		}
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-vmTerminated:
+		return nil, ErrVMTerminated
+	}
+
+	length := binary.LittleEndian.Uint32(lenBuf)
+	if length < 4 {
+		return nil, fmt.Errorf("result length too small: %d", length)
+	}
+
+	// Read the rest of the response
+	dataBuf := make([]byte, length)
+	done = make(chan error, 1)
+
+	go func() {
+		_, err := io.ReadFull(conn, dataBuf)
 		done <- err
 	}()
 
 	select {
 	case err := <-done:
 		if err != nil {
-			return -1, fmt.Errorf("read result: %w", err)
+			return nil, fmt.Errorf("read result data: %w", err)
 		}
 	case <-ctx.Done():
-		return -1, ctx.Err()
+		return nil, ctx.Err()
+	case <-vmTerminated:
+		return nil, ErrVMTerminated
 	}
 
-	length := binary.LittleEndian.Uint32(buf[0:4])
-	if length != 4 {
-		return -1, fmt.Errorf("unexpected result length: %d", length)
+	result := &ProgramResult{
+		ExitCode: int32(binary.LittleEndian.Uint32(dataBuf[0:4])),
 	}
 
-	exitCode := int32(binary.LittleEndian.Uint32(buf[4:8]))
-	return exitCode, nil
+	// If capture flags were set, parse stdout and stderr
+	if flags != CaptureFlagNone && length > 4 {
+		offset := 4
+
+		// Parse stdout
+		if offset+4 <= int(length) {
+			stdoutLen := binary.LittleEndian.Uint32(dataBuf[offset : offset+4])
+			offset += 4
+			if offset+int(stdoutLen) <= int(length) {
+				result.Stdout = make([]byte, stdoutLen)
+				copy(result.Stdout, dataBuf[offset:offset+int(stdoutLen)])
+				offset += int(stdoutLen)
+			}
+		}
+
+		// Parse stderr
+		// Parse stderr
+		if offset+4 <= int(length) {
+			stderrLen := binary.LittleEndian.Uint32(dataBuf[offset : offset+4])
+			offset += 4
+			if offset+int(stderrLen) <= int(length) {
+				result.Stderr = make([]byte, stderrLen)
+				copy(result.Stderr, dataBuf[offset:offset+int(stderrLen)])
+			}
+		}
+	}
+
+	return result, nil
 }
 
 // Close closes the server and any active connection.
@@ -470,11 +656,39 @@ type VirtualMachine struct {
 	vsockProgramBackend virtio.VsockBackend
 	vsockProgramPort    uint32
 	useVsockLoader      bool
+
+	// vsockDevice is the virtio-vsock device for proper cleanup
+	vsockDevice *virtio.Vsock
+
+	// vmCtx is a long-lived context for the VM run loop.
+	// It's separate from boot/session contexts and only canceled on Close().
+	vmCtx    context.Context
+	vmCancel context.CancelFunc
+
+	// vmRunDone is signaled when the VM run loop goroutine exits.
+	// This is used to ensure proper cleanup ordering in Close().
+	vmRunDone chan struct{}
 }
 
 func (vm *VirtualMachine) Close() error {
+	// Cancel VM context to stop the VM run loop
+	if vm.vmCancel != nil {
+		vm.vmCancel()
+	}
+
+	// Wait for VM run loop goroutine to exit before cleaning up resources.
+	// This ensures the guest has fully stopped before we close vsock/memory.
+	if vm.vmRunDone != nil {
+		<-vm.vmRunDone
+	}
+
 	if vm.vsockProgramServer != nil {
 		vm.vsockProgramServer.Close()
+	}
+	// Close vsock device before VM to stop all goroutines
+	// that might be writing to guest memory
+	if vm.vsockDevice != nil {
+		vm.vsockDevice.Close()
 	}
 	return vm.vm.Close()
 }
@@ -544,10 +758,28 @@ func (vm *VirtualMachine) runFirstRunVsock(ctx context.Context) error {
 	}
 	vm.firstRunComplete = true
 
+	// Create VM context if not already created. This context is used for the VM
+	// run loop and outlives the boot context. It's only canceled on Close().
+	if vm.vmCtx == nil {
+		vm.vmCtx, vm.vmCancel = context.WithCancel(context.Background())
+	}
+
+	// Initialize vmRunDone channel to track when the VM run loop exits
+	if vm.vmRunDone == nil {
+		vm.vmRunDone = make(chan struct{})
+	}
+
+	// Connect VM termination signal to vsock server for early error detection
+	if vm.vsockProgramServer != nil {
+		vm.vsockProgramServer.SetVMTerminatedChannel(vm.vmRunDone)
+	}
+
 	// Start the VM in a goroutine so we can accept the vsock connection
+	// Use vm.vmCtx so the VM keeps running after boot completes
 	vmDone := make(chan error, 1)
 	go func() {
-		err := vm.vm.Run(ctx, &programRunner{
+		defer close(vm.vmRunDone) // Signal that VM run loop has exited
+		err := vm.vm.Run(vm.vmCtx, &programRunner{
 			program: &ir.Program{
 				Entrypoint: "main",
 				Methods: map[string]ir.Method{
@@ -597,22 +829,89 @@ func (vm *VirtualMachine) runFirstRunVsock(ctx context.Context) error {
 
 // runProgramVsock runs a program using the vsock protocol.
 func (vm *VirtualMachine) runProgramVsock(ctx context.Context, prog *ir.Program) error {
+	debug.Writef("initx.runProgramVsock", "sending program")
+
 	// Send program over vsock
 	if err := vm.vsockProgramServer.SendProgram(prog); err != nil {
 		return fmt.Errorf("send program via vsock: %w", err)
 	}
 
+	debug.Writef("initx.runProgramVsock", "waiting for result")
+
 	// Wait for result
 	exitCode, err := vm.vsockProgramServer.WaitResult(ctx)
 	if err != nil {
+		debug.Writef("initx.runProgramVsock", "wait error: %v", err)
 		return fmt.Errorf("wait for vsock result: %w", err)
 	}
+
+	debug.Writef("initx.runProgramVsock", "got exit code: %d", exitCode)
 
 	if exitCode != 0 {
 		return &ExitError{Code: int(exitCode)}
 	}
 
 	return nil
+}
+
+// RunWithCapture runs a program and captures stdout/stderr based on the flags.
+// Returns a ProgramResult containing the exit code and captured output.
+func (vm *VirtualMachine) RunWithCapture(ctx context.Context, prog *ir.Program, flags uint32) (*ProgramResult, error) {
+	return vm.RunWithCaptureAndStdin(ctx, prog, flags, nil)
+}
+
+// RunWithCaptureAndStdin runs a program with optional stdin data and captures stdout/stderr.
+// Returns a ProgramResult containing the exit code and captured output.
+func (vm *VirtualMachine) RunWithCaptureAndStdin(ctx context.Context, prog *ir.Program, flags uint32, stdin []byte) (*ProgramResult, error) {
+	// If vsock loader is enabled and we have a server, use vsock path
+	if vm.useVsockLoader && vm.vsockProgramServer != nil {
+		// First run boots the kernel, then accept vsock connection
+		if !vm.firstRunComplete {
+			if err := vm.runFirstRunVsock(ctx); err != nil {
+				return nil, err
+			}
+		}
+		return vm.runProgramVsockWithCaptureAndStdin(ctx, prog, flags, stdin)
+	}
+
+	// Fallback to non-capture mode for non-vsock path
+	err := vm.runProgram(ctx, prog, nil)
+	if err != nil {
+		if exitErr, ok := err.(*ExitError); ok {
+			return &ProgramResult{ExitCode: int32(exitErr.Code)}, nil
+		}
+		return nil, err
+	}
+	return &ProgramResult{ExitCode: 0}, nil
+}
+
+// runProgramVsockWithCapture runs a program using vsock with output capture.
+func (vm *VirtualMachine) runProgramVsockWithCapture(ctx context.Context, prog *ir.Program, flags uint32) (*ProgramResult, error) {
+	return vm.runProgramVsockWithCaptureAndStdin(ctx, prog, flags, nil)
+}
+
+// runProgramVsockWithCaptureAndStdin runs a program using vsock with output capture and optional stdin.
+func (vm *VirtualMachine) runProgramVsockWithCaptureAndStdin(ctx context.Context, prog *ir.Program, flags uint32, stdin []byte) (*ProgramResult, error) {
+	debug.Writef("initx.runProgramVsockWithCaptureAndStdin", "sending program with flags=0x%x, stdin=%d bytes", flags, len(stdin))
+
+	// Send program over vsock with capture flags and stdin
+	if err := vm.vsockProgramServer.SendProgramWithFlagsAndStdin(prog, flags, stdin); err != nil {
+		return nil, fmt.Errorf("send program via vsock: %w", err)
+	}
+
+	debug.Writef("initx.runProgramVsockWithCaptureAndStdin", "waiting for result")
+
+	// Wait for result with capture
+	result, err := vm.vsockProgramServer.WaitResultWithCapture(ctx, flags)
+	if err != nil {
+		debug.Writef("initx.runProgramVsockWithCaptureAndStdin", "wait error: %v", err)
+		return nil, fmt.Errorf("wait for vsock result: %w", err)
+	}
+
+	debug.Writef("initx.runProgramVsockWithCaptureAndStdin", "got exit code: %d, stdout=%d bytes, stderr=%d bytes",
+		result.ExitCode, len(result.Stdout), len(result.Stderr))
+
+	return result, nil
 }
 
 func (vm *VirtualMachine) Architecture() hv.CpuArchitecture {
@@ -720,6 +1019,14 @@ var (
 
 func WithDeviceTemplate(dev hv.DeviceTemplate) Option {
 	return funcOption(func(vm *VirtualMachine) error {
+		// Wrap VsockTemplate to capture the device for proper cleanup
+		if vsockTemplate, ok := dev.(virtio.VsockTemplate); ok {
+			vm.loader.Devices = append(vm.loader.Devices, &vsockCapturingTemplate{
+				inner:  vsockTemplate,
+				target: &vm.vsockDevice,
+			})
+			return nil
+		}
 		vm.loader.Devices = append(vm.loader.Devices, dev)
 		return nil
 	})
@@ -899,6 +1206,35 @@ func (t *inputCapturingTemplate) DeviceTreeNodes() ([]fdt.Node, error) {
 }
 
 func (t *inputCapturingTemplate) GetACPIDeviceInfo() virtio.ACPIDeviceInfo {
+	return t.inner.GetACPIDeviceInfo()
+}
+
+// vsockCapturingTemplate wraps a VsockTemplate to capture the created device reference
+type vsockCapturingTemplate struct {
+	inner  virtio.VsockTemplate
+	target **virtio.Vsock
+}
+
+func (t *vsockCapturingTemplate) Create(vm hv.VirtualMachine) (hv.Device, error) {
+	dev, err := t.inner.Create(vm)
+	if err != nil {
+		return nil, err
+	}
+	if vsock, ok := dev.(*virtio.Vsock); ok {
+		*t.target = vsock
+	}
+	return dev, nil
+}
+
+func (t *vsockCapturingTemplate) GetLinuxCommandLineParam() ([]string, error) {
+	return t.inner.GetLinuxCommandLineParam()
+}
+
+func (t *vsockCapturingTemplate) DeviceTreeNodes() ([]fdt.Node, error) {
+	return t.inner.DeviceTreeNodes()
+}
+
+func (t *vsockCapturingTemplate) GetACPIDeviceInfo() virtio.ACPIDeviceInfo {
 	return t.inner.GetACPIDeviceInfo()
 }
 
@@ -1192,6 +1528,7 @@ func (vm *VirtualMachine) Spawn(ctx context.Context, path string, args ...string
 	}
 
 	errLabel := ir.Label("__initx_spawn_err")
+	execErrLabel := ir.Label("__initx_spawn_child_err")
 	errVar := ir.Var("__initx_spawn_errno")
 	errorFmt := fmt.Sprintf("initx: failed to spawn %s errno=0x%%x\n", path)
 
@@ -1199,10 +1536,13 @@ func (vm *VirtualMachine) Spawn(ctx context.Context, path string, args ...string
 		Entrypoint: "main",
 		Methods: map[string]ir.Method{
 			"main": {
-				ForkExecWait(path, args, nil, errLabel, errVar),
+				ForkExecWait(path, args, nil, errLabel, execErrLabel, errVar),
 				ir.Return(errVar),
 				ir.DeclareLabel(errLabel, ir.Block{
 					ir.Printf(errorFmt, ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+					ir.Return(errVar),
+				}),
+				ir.DeclareLabel(execErrLabel, ir.Block{
 					ir.Syscall(defs.SYS_EXIT, ir.Int64(1)),
 				}),
 			},

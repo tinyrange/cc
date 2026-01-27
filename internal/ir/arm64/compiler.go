@@ -54,18 +54,25 @@ var syscallArgRegisters = []asm.Variable{
 	arm64asm.X5,
 }
 
+// printfStackUsage is the stack space Printf requires for register saves and buffer.
+// This must be reserved when the method contains Printf calls to prevent stack overlap.
+// Printf saves 26 registers (208 bytes) plus 32 bytes buffer = 240 bytes total.
+const printfStackUsage = 240
+
 type compiler struct {
-	method       ir.Method
-	fragments    asm.Group
-	varOffsets   map[string]int32
-	frameSize    int32
-	freeRegs     []asm.Variable
-	usedRegs     map[asm.Variable]bool
-	paramIndex   int
-	labels       map[string]asm.Label
-	labelCounter int
-	slotStack    []ir.StackSlotContext
+	method        ir.Method
+	fragments     asm.Group
+	varOffsets    map[string]int32
+	frameSize     int32
+	varFrameSize  int32 // Size of variable area (before printf padding)
+	freeRegs      []asm.Variable
+	usedRegs      map[asm.Variable]bool
+	paramIndex    int
+	labels        map[string]asm.Label
+	labelCounter  int
+	slotStack     []ir.StackSlotContext
 	epilogueLabel asm.Label // label for epilogue code (used by return statements)
+	hasPrintf     bool      // true if method contains Printf calls
 }
 
 func Compile(method ir.Method) (asm.Fragment, error) {
@@ -131,15 +138,29 @@ func newCompiler(method ir.Method) (*compiler, error) {
 		offsets[name] = int32(idx) * 8
 	}
 
-	frameSize := alignTo(int32(len(names))*8, stackAlignment)
+	varFrameSize := alignTo(int32(len(names))*8, stackAlignment)
+
+	// Check if the method uses Printf. If so, we need extra padding because
+	// Printf adjusts SP down by 240 bytes and stores registers there.
+	// Without padding, Printf's saved register area can overlap with our variables.
+	hasPrintf := methodUsesPrintf(ir.Block(method))
+	frameSize := varFrameSize
+	if hasPrintf {
+		// Add padding equal to Printf's stack usage to prevent overlap.
+		// This ensures that even when Printf does SUB SP, SP, #240,
+		// its register save area doesn't overlap with our variables.
+		frameSize = alignTo(varFrameSize+printfStackUsage, stackAlignment)
+	}
 
 	return &compiler{
-		method:     method,
-		varOffsets: offsets,
-		frameSize:  frameSize,
-		freeRegs:   append([]asm.Variable(nil), initialFreeRegisters...),
-		usedRegs:   make(map[asm.Variable]bool),
-		labels:     make(map[string]asm.Label),
+		method:       method,
+		varOffsets:   offsets,
+		varFrameSize: varFrameSize,
+		frameSize:    frameSize,
+		hasPrintf:    hasPrintf,
+		freeRegs:     append([]asm.Variable(nil), initialFreeRegisters...),
+		usedRegs:     make(map[asm.Variable]bool),
+		labels:       make(map[string]asm.Label),
 	}, nil
 }
 
@@ -237,6 +258,8 @@ func (c *compiler) compileFragment(f ir.Fragment) error {
 		c.emit(arm64asm.DSB())
 		c.emit(arm64asm.ISB())
 		return nil
+	case ir.CacheFlushFragment:
+		return c.compileCacheFlush(frag)
 	case ir.ConstantBytesFragment:
 		c.emit(arm64asm.LoadConstantBytes(frag.Target, frag.Data))
 		return nil
@@ -395,10 +418,50 @@ func (c *compiler) compileCall(f ir.CallFragment) error {
 	}
 
 	// Move arguments into calling convention registers
+	// Handle the parallel assignment problem: if argRegs[j] == callArgRegisters[i] for j > i,
+	// moving argRegs[i] to callArgRegisters[i] would clobber the value needed for argRegs[j].
+	// Solution: first save any conflicting values to scratch registers.
+
+	// Scratch registers X9-X15 are caller-saved and not used for arguments
+	scratchRegs := []asm.Variable{arm64asm.X10, arm64asm.X11, arm64asm.X12, arm64asm.X13, arm64asm.X14, arm64asm.X15}
+	scratchIdx := 0
+
+	// Map from original register to saved scratch register
+	savedRegs := make(map[asm.Variable]asm.Variable)
+
+	// First pass: identify and save any argument values that would be clobbered
+	for i := range argRegs {
+		destReg := callArgRegisters[i]
+		// Check if any later argument is in this destination register
+		for j := i + 1; j < len(argRegs); j++ {
+			if argRegs[j] == destReg {
+				// argRegs[j] will be clobbered by moving to destReg
+				// Save it to a scratch register if not already saved
+				if _, saved := savedRegs[argRegs[j]]; !saved {
+					if scratchIdx >= len(scratchRegs) {
+						// This shouldn't happen with 8 args and 6 scratch regs
+						// Fall back to X9 (target should already be moved if needed)
+						savedRegs[argRegs[j]] = arm64asm.X9
+					} else {
+						savedRegs[argRegs[j]] = scratchRegs[scratchIdx]
+						scratchIdx++
+					}
+					c.emit(arm64asm.MovReg(arm64asm.Reg64(savedRegs[argRegs[j]]), arm64asm.Reg64(argRegs[j])))
+				}
+			}
+		}
+	}
+
+	// Second pass: move arguments to their destinations
 	for i, reg := range argRegs {
 		destReg := callArgRegisters[i]
-		if reg != destReg {
-			c.emit(arm64asm.MovReg(arm64asm.Reg64(destReg), arm64asm.Reg64(reg)))
+		// Use saved register if the original was clobbered
+		srcReg := reg
+		if saved, ok := savedRegs[reg]; ok {
+			srcReg = saved
+		}
+		if srcReg != destReg {
+			c.emit(arm64asm.MovReg(arm64asm.Reg64(destReg), arm64asm.Reg64(srcReg)))
 		}
 		c.freeReg(reg)
 	}
@@ -441,6 +504,98 @@ func (c *compiler) compileReturn(ret ir.ReturnFragment) error {
 	// This ensures proper stack cleanup and link register handling for all return paths.
 	c.emit(arm64asm.Jump(c.epilogueLabel))
 	c.freeReg(arm64asm.X0)
+	return nil
+}
+
+// compileCacheFlush emits the ARM64 cache maintenance sequence for self-modifying code.
+// This performs:
+// 1. DC CVAU (clean data cache) for each cache line in the region
+// 2. DSB ISH (data sync barrier)
+// 3. IC IVAU (invalidate instruction cache) for each cache line in the region
+// 4. DSB ISH
+// 5. ISB (instruction sync barrier)
+func (c *compiler) compileCacheFlush(frag ir.CacheFlushFragment) error {
+	const cacheLineSize int32 = 64 // Apple Silicon cache line size
+
+	// Evaluate base address
+	baseReg, _, err := c.evalValue(frag.Base)
+	if err != nil {
+		return err
+	}
+
+	// Evaluate size
+	sizeReg, _, err := c.evalValue(frag.Size)
+	if err != nil {
+		c.freeReg(baseReg)
+		return err
+	}
+
+	// Calculate end address: end = base + size
+	endReg, err := c.allocReg()
+	if err != nil {
+		c.freeReg(baseReg)
+		c.freeReg(sizeReg)
+		return err
+	}
+	c.emit(arm64asm.MovReg(arm64asm.Reg64(endReg), arm64asm.Reg64(baseReg)))
+	c.emit(arm64asm.AddRegReg(arm64asm.Reg64(endReg), arm64asm.Reg64(sizeReg)))
+	c.freeReg(sizeReg)
+
+	// Current address register (starts at base)
+	curReg, err := c.allocReg()
+	if err != nil {
+		c.freeReg(baseReg)
+		c.freeReg(endReg)
+		return err
+	}
+	c.emit(arm64asm.MovReg(arm64asm.Reg64(curReg), arm64asm.Reg64(baseReg)))
+
+	// Loop 1: Clean data cache lines (DC CVAU)
+	dcLoopLabel := c.newInternalLabel("dc_loop")
+	dcDoneLabel := c.newInternalLabel("dc_done")
+
+	c.emit(asm.MarkLabel(dcLoopLabel))
+	// Compare cur >= end
+	c.emit(arm64asm.CmpRegReg(arm64asm.Reg64(curReg), arm64asm.Reg64(endReg)))
+	c.emit(arm64asm.JumpIfGreaterOrEqual(dcDoneLabel))
+	// DC CVAU, cur
+	c.emit(arm64asm.DCCVAU(curReg))
+	// cur += cacheLineSize
+	c.emit(arm64asm.AddRegImm(arm64asm.Reg64(curReg), cacheLineSize))
+	c.emit(arm64asm.Jump(dcLoopLabel))
+	c.emit(asm.MarkLabel(dcDoneLabel))
+
+	// DSB ISH - ensure all DC CVAU operations complete
+	c.emit(arm64asm.DSBISH())
+
+	// Reset cur to base for IC loop
+	c.emit(arm64asm.MovReg(arm64asm.Reg64(curReg), arm64asm.Reg64(baseReg)))
+
+	// Loop 2: Invalidate instruction cache lines (IC IVAU)
+	icLoopLabel := c.newInternalLabel("ic_loop")
+	icDoneLabel := c.newInternalLabel("ic_done")
+
+	c.emit(asm.MarkLabel(icLoopLabel))
+	// Compare cur >= end
+	c.emit(arm64asm.CmpRegReg(arm64asm.Reg64(curReg), arm64asm.Reg64(endReg)))
+	c.emit(arm64asm.JumpIfGreaterOrEqual(icDoneLabel))
+	// IC IVAU, cur
+	c.emit(arm64asm.ICIVAU(curReg))
+	// cur += cacheLineSize
+	c.emit(arm64asm.AddRegImm(arm64asm.Reg64(curReg), cacheLineSize))
+	c.emit(arm64asm.Jump(icLoopLabel))
+	c.emit(asm.MarkLabel(icDoneLabel))
+
+	// DSB ISH - ensure all IC IVAU operations complete
+	c.emit(arm64asm.DSBISH())
+
+	// ISB - flush the pipeline
+	c.emit(arm64asm.ISB())
+
+	c.freeReg(baseReg)
+	c.freeReg(endReg)
+	c.freeReg(curReg)
+
 	return nil
 }
 
@@ -1164,7 +1319,9 @@ func (c *compiler) loadGlobalAddress(name string) (asm.Variable, error) {
 	if err != nil {
 		return 0, err
 	}
-	c.emit(arm64asm.MovImmediate(arm64asm.Reg64(reg), int64(globalPointerPlaceholder(name))))
+	// Use LoadImmediate64FromLiteral to store the placeholder in the literal pool
+	// as raw bytes, allowing BuildStandaloneProgram to scan and replace it.
+	c.emit(arm64asm.LoadImmediate64FromLiteral(arm64asm.Reg64(reg), globalPointerPlaceholder(name)))
 	return reg, nil
 }
 
@@ -1273,6 +1430,53 @@ func methodMakesCalls(f ir.Fragment) bool {
 		return false
 	case ir.CallFragment:
 		return true
+	default:
+		return false
+	}
+}
+
+// methodUsesPrintf returns true if the method contains any ir.PrintfFragment.
+// Printf has significant stack usage (240 bytes for register saves + buffer)
+// that must be accounted for in the frame size to prevent stack corruption.
+func methodUsesPrintf(f ir.Fragment) bool {
+	switch v := f.(type) {
+	case nil:
+		return false
+	case ir.Block:
+		for _, inner := range v {
+			if methodUsesPrintf(inner) {
+				return true
+			}
+		}
+		return false
+	case ir.Method:
+		return methodUsesPrintf(ir.Block(v))
+	case ir.IfFragment:
+		if methodUsesPrintf(v.Then) {
+			return true
+		}
+		if v.Otherwise != nil && methodUsesPrintf(v.Otherwise) {
+			return true
+		}
+		return false
+	case ir.LabelFragment:
+		return methodUsesPrintf(v.Block)
+	case ir.StackSlotFragment:
+		if v.Body != nil {
+			return methodUsesPrintf(v.Body)
+		}
+		return false
+	case ir.PrintfFragment:
+		return true
+	case ir.AssignFragment:
+		return methodUsesPrintf(v.Src) || methodUsesPrintf(v.Dst)
+	case ir.SyscallFragment:
+		for _, arg := range v.Args {
+			if methodUsesPrintf(arg) {
+				return true
+			}
+		}
+		return false
 	default:
 		return false
 	}

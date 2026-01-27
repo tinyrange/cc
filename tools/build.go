@@ -1148,6 +1148,8 @@ func main() {
 	snapshotE2E := fs.Bool("snapshot-e2e", false, "build and run snapshot e2e benchmark")
 	release := fs.Bool("release", false, "build a release binary")
 	runSpecial := fs.String("runs", "", "run a given package")
+	exampleTest := fs.Bool("example-test", false, "build and run example tests with testrunner")
+	example := fs.String("example", "", "build and run an example (path to example directory)")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
@@ -1239,6 +1241,41 @@ func main() {
 			fmt.Fprintf(os.Stderr, "failed to build timeslice tool: %v\n", err)
 			os.Exit(1)
 		}
+		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *exampleTest {
+		out, err := goBuild(buildOptions{
+			Package:    "examples/shared/testrunner/cmd/runtest",
+			OutputName: "runtest",
+			Build:      hostBuild,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build example test runner: %v\n", err)
+			os.Exit(1)
+		}
+		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *example != "" {
+		// Build the example binary directly
+		exampleName := filepath.Base(*example)
+		out, err := goBuild(buildOptions{
+			Package:    *example,
+			OutputName: exampleName,
+			Build:      hostBuild,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build example %s: %v\n", *example, err)
+			os.Exit(1)
+		}
+
 		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
 			os.Exit(1)
 		}

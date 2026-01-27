@@ -1,0 +1,90 @@
+name: shell_script
+description: Run shell scripts in a sandboxed environment
+
+build:
+  package: ./examples/getting-started/shell_script
+  timeout: 30s
+
+cli:
+  timeout: 60s
+
+cli_tests:
+  - name: echo hello
+    args: ["-c", "echo 'Hello, World!'"]
+    expect:
+      exit_code: 0
+      stdout_equals: "Hello, World!\n"
+
+  - name: arithmetic with expr
+    args: ["-c", "echo $((2 + 2))"]
+    expect:
+      exit_code: 0
+      stdout_equals: "4\n"
+
+  - name: for loop
+    args:
+      - "-script"
+      - |
+        for i in 1 2 3; do
+          echo "Number: $i"
+        done
+    expect:
+      exit_code: 0
+      stdout_contains: "Number: 1"
+
+  - name: pipe command
+    args: ["-c", "echo 'hello world' | tr ' ' '\\n' | sort"]
+    expect:
+      exit_code: 0
+      stdout_equals: "hello\nworld\n"
+
+  - name: variable assignment
+    args:
+      - "-script"
+      - |
+        NAME="Alice"
+        echo "Hello, $NAME!"
+    expect:
+      exit_code: 0
+      stdout_equals: "Hello, Alice!\n"
+
+  - name: conditional
+    args:
+      - "-script"
+      - |
+        X=5
+        if [ $X -gt 3 ]; then
+          echo "greater"
+        else
+          echo "not greater"
+        fi
+    expect:
+      exit_code: 0
+      stdout_equals: "greater\n"
+
+  - name: command substitution
+    args: ["-c", "echo \"Today is $(date +%A)\""]
+    expect:
+      exit_code: 0
+      stdout_contains: "Today is"
+
+  - name: exit code propagation
+    args: ["-c", "exit 42"]
+    expect:
+      exit_code: 42
+
+  - name: file operations
+    args:
+      - "-script"
+      - |
+        echo "test content" > /tmp/test.txt
+        cat /tmp/test.txt
+    expect:
+      exit_code: 0
+      stdout_equals: "test content\n"
+
+  - name: missing script
+    args: []
+    expect:
+      exit_code: 1
+      stderr_contains: "must provide"

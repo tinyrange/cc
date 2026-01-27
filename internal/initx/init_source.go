@@ -17,7 +17,17 @@ const (
 // Memory layout
 const (
 	timesliceMMIOMapSize = 0x1000
-	configRegionSize     = 4194304 // 4MB (for payload execution buffer)
+	configRegionSize     = 4194304  // 4MB (for payload execution buffer)
+	captureBufferSize    = 16777216 // 16MB max per capture stream
+)
+
+// Capture flags (must match loader.go)
+const (
+	captureFlagNone    = 0x00
+	captureFlagStdout  = 0x01
+	captureFlagStderr  = 0x02
+	captureFlagCombine = 0x04
+	captureFlagStdin   = 0x08
 )
 
 // Timeslice IDs - must match constants in hvf_darwin_arm64.go
@@ -52,6 +62,20 @@ func main() int64 {
 			reboot()
 		}
 	}
+
+	// mount /proc for /proc/self/fd access
+	runtime.Syscall(runtime.SYS_MKDIRAT, runtime.AT_FDCWD, "/proc", 0755)
+	procMountErr := runtime.Syscall(runtime.SYS_MOUNT, "proc", "/proc", "proc", 0, "")
+	if procMountErr < 0 {
+		if procMountErr != runtime.EBUSY {
+			runtime.Printf("failed to mount proc on /proc: 0x%x\n", 0-procMountErr)
+		}
+	}
+
+	// create /dev/stdin, /dev/stdout, /dev/stderr symlinks
+	runtime.Syscall(runtime.SYS_SYMLINKAT, "/proc/self/fd/0", runtime.AT_FDCWD, "/dev/stdin")
+	runtime.Syscall(runtime.SYS_SYMLINKAT, "/proc/self/fd/1", runtime.AT_FDCWD, "/dev/stdout")
+	runtime.Syscall(runtime.SYS_SYMLINKAT, "/proc/self/fd/2", runtime.AT_FDCWD, "/dev/stderr")
 
 	// create /dev/shm for POSIX shared memory
 	runtime.Syscall(runtime.SYS_MKDIRAT, runtime.AT_FDCWD, "/dev/shm", 0o1777)
@@ -139,27 +163,7 @@ func main() int64 {
 	}
 
 	// === Phase 6: Time setup ===
-
-	// allocate timespec buffer
-	// timespecMem := runtime.Syscall(runtime.SYS_MMAP, 0, 16, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
-	// if timespecMem >= 0 {
-	// 	// read time from config region and store in timespec struct
-	// 	var timeSec int64 = 0
-	// 	var timeNsec int64 = 0
-	// 	timeSec = runtime.Load64(configMem, configTimeSecField)
-	// 	timeNsec = runtime.Load64(configMem, configTimeNsecField)
-	// 	runtime.Store64(timespecMem, 0, timeSec)
-	// 	runtime.Store64(timespecMem, 8, timeNsec)
-
-	// 	// call clock_settime
-	// 	clockSetResult := runtime.Syscall(runtime.SYS_CLOCK_SETTIME, runtime.CLOCK_REALTIME, timespecMem)
-	// 	if clockSetResult < 0 {
-	// 		runtime.Printf("initx: clock_settime failed (errno=0x%x), continuing anyway\n", 0-clockSetResult)
-	// 	}
-
-	// 	// free timespec buffer
-	// 	runtime.Syscall(runtime.SYS_MUNMAP, timespecMem, 16)
-	// }
+	// Time is now set via vsock message - see vsockMainLoop
 	// Record: phase6_time_setup (14)
 	if timesliceMem > 0 {
 		runtime.Store32(timesliceMem, 0, 14)
@@ -193,8 +197,11 @@ func reboot() {
 // vsockMainLoop handles program loading via vsock.
 // This function never returns - it either loops forever or reboots on error.
 // Protocol:
-//   - Host → Guest: [len:4][code_len:4][reloc_count:4][relocs:4*count][code:code_len]
-//   - Guest → Host: [len:4][exit_code:4]
+//   - Host → Guest: [len:4][time_sec:8][time_nsec:8][flags:4][code_len:4][reloc_count:4][relocs:4*count][code:code_len]
+//   - Guest → Host: [len:4][exit_code:4][stdout_len:4][stdout_data][stderr_len:4][stderr_data]
+//
+// Note: time_sec and time_nsec come before flags to maintain 8-byte alignment for ARM64.
+// When flags=0, response is just [len:4][exit_code:4] for backward compatibility.
 func vsockMainLoop(anonMem int64, timesliceMem int64) {
 	// Get vsock port from compile-time config (default 9998)
 	var vsockPort int64 = 0
@@ -267,8 +274,10 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 		reboot()
 	}
 
-	// Allocate result buffer (page size for safety)
-	resultBuf := runtime.Syscall(runtime.SYS_MMAP, 0, 4096, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
+	// Allocate larger result buffer for captured output (16MB + header space)
+	// Format: [len:4][exit_code:4][stdout_len:4][stdout_data][stderr_len:4][stderr_data]
+	resultBufSize := captureBufferSize + captureBufferSize + 64 // stdout + stderr + headers
+	resultBuf := runtime.Syscall(runtime.SYS_MMAP, 0, resultBufSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
 	if resultBuf < 0 {
 		runtime.Printf("initx: failed to alloc result buffer (errno=0x%x)\n", 0-resultBuf)
 		runtime.Syscall(runtime.SYS_MUNMAP, progBuf, configRegionSize)
@@ -277,8 +286,29 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 		reboot()
 	}
 
-	// Pre-fill result buffer length field (always 4)
-	runtime.Store32(resultBuf, 0, 4)
+	// Allocate pipe fd array (2 ints = 8 bytes, but allocate a page for safety)
+	pipeFdBuf := runtime.Syscall(runtime.SYS_MMAP, 0, 4096, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
+	if pipeFdBuf < 0 {
+		runtime.Printf("initx: failed to alloc pipe fd buffer (errno=0x%x)\n", 0-pipeFdBuf)
+		runtime.Syscall(runtime.SYS_MUNMAP, resultBuf, resultBufSize)
+		runtime.Syscall(runtime.SYS_MUNMAP, progBuf, configRegionSize)
+		runtime.Syscall(runtime.SYS_MUNMAP, lenBuf, 4096)
+		runtime.Syscall(runtime.SYS_CLOSE, sockFd)
+		reboot()
+	}
+
+	// Allocate reader buffer for concurrent capture (stdout + stderr + overhead)
+	readerBufSize := captureBufferSize + captureBufferSize + 64
+	readerBuf := runtime.Syscall(runtime.SYS_MMAP, 0, readerBufSize, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
+	if readerBuf < 0 {
+		runtime.Printf("initx: failed to alloc reader buffer (errno=0x%x)\n", 0-readerBuf)
+		runtime.Syscall(runtime.SYS_MUNMAP, pipeFdBuf, 4096)
+		runtime.Syscall(runtime.SYS_MUNMAP, resultBuf, resultBufSize)
+		runtime.Syscall(runtime.SYS_MUNMAP, progBuf, configRegionSize)
+		runtime.Syscall(runtime.SYS_MUNMAP, lenBuf, 4096)
+		runtime.Syscall(runtime.SYS_CLOSE, sockFd)
+		reboot()
+	}
 
 	// Main vsock loop
 	for {
@@ -325,17 +355,41 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 			reboot()
 		}
 
-		// Parse header: code_len(4) + reloc_count(4)
+		// Parse header: time_sec(8) + time_nsec(8) + flags(4) + stdin_len(4) + code_len(4) + reloc_count(4)
+		// time_sec and time_nsec come first for ARM64 8-byte alignment
+		var flags int64 = 0
+		var timeSec int64 = 0
+		var timeNsec int64 = 0
+		var stdinLen int64 = 0
+		timeSec = runtime.Load64(progBuf, 0)
+		timeNsec = runtime.Load64(progBuf, 8)
+		flags = runtime.Load32(progBuf, 16)
+		stdinLen = runtime.Load32(progBuf, 20) // offset 20 = time_sec(8) + time_nsec(8) + flags(4)
+
+		// Allocate timespec and call clock_settime
+		timespecMem := runtime.Syscall(runtime.SYS_MMAP, 0, 16, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
+		if timespecMem >= 0 {
+			runtime.Store64(timespecMem, 0, timeSec)
+			runtime.Store64(timespecMem, 8, timeNsec)
+			clockSetResult := runtime.Syscall(runtime.SYS_CLOCK_SETTIME, runtime.CLOCK_REALTIME, timespecMem)
+			if clockSetResult < 0 {
+				runtime.Printf("initx: clock_settime failed (errno=0x%x)\n", 0-clockSetResult)
+			}
+			runtime.Syscall(runtime.SYS_MUNMAP, timespecMem, 16)
+		}
+
 		var codeLen int64 = 0
 		var relocCount int64 = 0
-		codeLen = runtime.Load32(progBuf, 0)
-		relocCount = runtime.Load32(progBuf, 4)
+		codeLen = runtime.Load32(progBuf, 24)    // offset 24 = time_sec(8) + time_nsec(8) + flags(4) + stdin_len(4)
+		relocCount = runtime.Load32(progBuf, 28) // offset 28 = above + code_len(4)
 
 		// Calculate offsets
 		var relocBytes int64 = 0
 		var codeOffset int64 = 0
+		var stdinOffset int64 = 0
 		relocBytes = relocCount << 2
-		codeOffset = 8 + relocBytes // 8 = code_len(4) + reloc_count(4)
+		codeOffset = 32 + relocBytes              // 32 = time_sec(8) + time_nsec(8) + flags(4) + stdin_len(4) + code_len(4) + reloc_count(4)
+		stdinOffset = codeOffset + codeLen        // stdin data follows code
 
 		// Copy code to anonMem
 		var copySrc int64 = 0
@@ -373,7 +427,7 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 		// Apply relocations
 		var relocPtr int64 = 0
 		var relocIndex int64 = 0
-		relocPtr = progBuf + 8 // relocations start at offset 8
+		relocPtr = progBuf + 32 // relocations start at offset 32 (after time_sec, time_nsec, flags, stdin_len, code_len, reloc_count)
 		relocIndex = 0
 
 		for relocIndex < relocCount {
@@ -396,12 +450,353 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 			runtime.Store32(timesliceMem, 0, 17)
 		}
 
-		// Instruction synchronization barrier
-		runtime.ISB()
+		// Flush caches for self-modifying code (required on ARM64)
+		// This performs DC CVAU + DSB ISH + IC IVAU + DSB ISH + ISB
+		runtime.CacheFlush(anonMem, codeLen)
 
 		// Record: phase7_isb (18)
 		if timesliceMem > 0 {
 			runtime.Store32(timesliceMem, 0, 18)
+		}
+
+		// Set up stdin pipe if stdin data is present
+		var stdinPipeRead int64 = -1
+		var stdinPipeWrite int64 = -1
+		var stdinWriterPid int64 = -1
+		var savedStdin int64 = -1
+
+		var hasStdinFlag int64 = 0
+		hasStdinFlag = flags & captureFlagStdin
+		if hasStdinFlag != 0 {
+			// Create pipe for stdin (even if empty, to signal EOF)
+			stdinPipeResult := runtime.Syscall(runtime.SYS_PIPE2, pipeFdBuf, 0)
+			if stdinPipeResult >= 0 {
+				stdinPipeRead = runtime.Load32(pipeFdBuf, 0)
+				stdinPipeWrite = runtime.Load32(pipeFdBuf, 4)
+
+				// Fork writer process to write stdin data to pipe
+				// This avoids blocking on >64KB stdin (pipe buffer limit)
+				stdinWriterPid = runtime.Syscall(runtime.SYS_CLONE, runtime.SIGCHLD, 0, 0, 0, 0)
+
+				if stdinWriterPid == 0 {
+					// === STDIN WRITER PROCESS (child) ===
+					// Close read end
+					runtime.Syscall(runtime.SYS_CLOSE, stdinPipeRead)
+
+					// Write stdin data to pipe (if any)
+					if stdinLen > 0 {
+						var stdinDataPtr int64 = 0
+						stdinDataPtr = progBuf + stdinOffset
+						vsockWriteFull(stdinPipeWrite, stdinDataPtr, stdinLen)
+					}
+
+					// Close write end (signals EOF to reader)
+					runtime.Syscall(runtime.SYS_CLOSE, stdinPipeWrite)
+
+					// Exit writer process
+					runtime.Syscall(runtime.SYS_EXIT, 0)
+				}
+
+				// === PARENT PROCESS ===
+				// Close write end (child will write to it)
+				runtime.Syscall(runtime.SYS_CLOSE, stdinPipeWrite)
+				stdinPipeWrite = -1
+
+				// Save original stdin and redirect to pipe read end
+				savedStdin = runtime.Syscall(runtime.SYS_FCNTL, 0, runtime.F_DUPFD_CLOEXEC, 10)
+				runtime.Syscall(runtime.SYS_DUP3, stdinPipeRead, 0, 0)
+				runtime.Syscall(runtime.SYS_CLOSE, stdinPipeRead)
+				stdinPipeRead = -1
+			}
+		}
+
+		// Set up capture if flags are set
+		var captureStdout int64 = 0
+		var captureStderr int64 = 0
+		var stdoutPipeRead int64 = -1
+		var stdoutPipeWrite int64 = -1
+		var stderrPipeRead int64 = -1
+		var stderrPipeWrite int64 = -1
+		var returnPipeRead int64 = -1
+		var returnPipeWrite int64 = -1
+		var savedStdout int64 = -1
+		var savedStderr int64 = -1
+		var readerPid int64 = -1
+
+		captureStdout = flags & captureFlagStdout
+		captureStderr = flags & captureFlagStderr
+
+		// Check for combined mode flag separately
+		var combineMode int64 = 0
+		combineMode = flags & captureFlagCombine
+
+		// Captured output lengths (will be read from return pipe)
+		var stdoutLen int64 = 0
+		var stderrLen int64 = 0
+
+		// For capture mode, we use a concurrent reader process to avoid deadlock
+		// when payload output exceeds the pipe buffer (64KB on Linux).
+		// The reader process drains stdout/stderr pipes while the payload runs,
+		// then sends captured data back via a return pipe.
+		var needCapture int64 = 0
+		if captureStdout != 0 {
+			needCapture = 1
+		}
+		if captureStderr != 0 {
+			needCapture = 1
+		}
+
+		if needCapture != 0 {
+			// Create stdout pipe
+			var stdoutPipeResult int64 = 0
+			if captureStdout != 0 {
+				stdoutPipeResult = runtime.Syscall(runtime.SYS_PIPE2, pipeFdBuf, 0)
+				if stdoutPipeResult >= 0 {
+					stdoutPipeRead = runtime.Load32(pipeFdBuf, 0)
+					stdoutPipeWrite = runtime.Load32(pipeFdBuf, 4)
+				}
+			}
+
+			// Create stderr pipe (only if separate capture, not combined mode)
+			var stderrPipeResult int64 = 0
+			// Check conditions explicitly
+			var shouldCreateStderrPipe int64 = 0
+			if captureStderr != 0 {
+				if combineMode == 0 {
+					shouldCreateStderrPipe = 1
+				}
+			}
+			if shouldCreateStderrPipe != 0 {
+				stderrPipeResult = runtime.Syscall(runtime.SYS_PIPE2, pipeFdBuf, 0)
+				if stderrPipeResult >= 0 {
+					stderrPipeRead = runtime.Load32(pipeFdBuf, 0)
+					stderrPipeWrite = runtime.Load32(pipeFdBuf, 4)
+				}
+			}
+
+			// Create return pipe for reader→parent data transfer
+			returnPipeResult := runtime.Syscall(runtime.SYS_PIPE2, pipeFdBuf, 0)
+			if returnPipeResult >= 0 {
+				returnPipeRead = runtime.Load32(pipeFdBuf, 0)
+				returnPipeWrite = runtime.Load32(pipeFdBuf, 4)
+			}
+
+			// Fork the reader process
+			// clone(SIGCHLD, 0, 0, 0, 0) - creates a new process without shared memory
+			readerPid = runtime.Syscall(runtime.SYS_CLONE, runtime.SIGCHLD, 0, 0, 0, 0)
+
+			if readerPid == 0 {
+				// === READER PROCESS (child) ===
+				// Close pipe ends we don't need
+				if stdoutPipeWrite >= 0 {
+					runtime.Syscall(runtime.SYS_CLOSE, stdoutPipeWrite)
+				}
+				if stderrPipeWrite >= 0 {
+					runtime.Syscall(runtime.SYS_CLOSE, stderrPipeWrite)
+				}
+				if returnPipeRead >= 0 {
+					runtime.Syscall(runtime.SYS_CLOSE, returnPipeRead)
+				}
+
+				// Set pipes to non-blocking for polling
+				var pipeFlags int64 = 0
+				if stdoutPipeRead >= 0 {
+					pipeFlags = runtime.Syscall(runtime.SYS_FCNTL, stdoutPipeRead, runtime.F_GETFL, 0)
+					if pipeFlags >= 0 {
+						runtime.Syscall(runtime.SYS_FCNTL, stdoutPipeRead, runtime.F_SETFL, pipeFlags|runtime.O_NONBLOCK)
+					}
+				}
+				if stderrPipeRead >= 0 {
+					pipeFlags = runtime.Syscall(runtime.SYS_FCNTL, stderrPipeRead, runtime.F_GETFL, 0)
+					if pipeFlags >= 0 {
+						runtime.Syscall(runtime.SYS_FCNTL, stderrPipeRead, runtime.F_SETFL, pipeFlags|runtime.O_NONBLOCK)
+					}
+				}
+
+				// Read from pipes into readerBuf
+				// Layout: [stdout_data...][stderr_data...]
+				var readerStdoutLen int64 = 0
+				var readerStderrLen int64 = 0
+				var stdoutEof int64 = 0
+				var stderrEof int64 = 0
+
+				// Compute stderr buffer base pointer (once, before loop)
+				// stderr data starts at readerBuf + captureBufferSize
+				var stderrBufBase int64 = 0
+				stderrBufBase = readerBuf + captureBufferSize
+
+				// If no stdout pipe, mark as EOF
+				if stdoutPipeRead < 0 {
+					stdoutEof = 1
+				}
+				// If no stderr pipe, mark as EOF
+				if stderrPipeRead < 0 {
+					stderrEof = 1
+				}
+
+				// Read loop - drain both pipes until EOF on both
+				var bothEof int64 = 0
+				var readResult int64 = 0
+				var gotDataThisIter int64 = 0
+				for bothEof == 0 {
+					gotDataThisIter = 0
+
+					// Try to read from stdout pipe
+					if stdoutEof == 0 {
+						if readerStdoutLen < captureBufferSize {
+							readResult = runtime.Syscall(runtime.SYS_READ, stdoutPipeRead, readerBuf+readerStdoutLen, captureBufferSize-readerStdoutLen)
+							if readResult > 0 {
+								readerStdoutLen = readerStdoutLen + readResult
+								gotDataThisIter = 1
+							} else {
+								if readResult == 0 {
+									// EOF
+									stdoutEof = 1
+								} else {
+									// EAGAIN (-11) means no data available, other errors mark EOF
+									if readResult != -11 {
+										stdoutEof = 1
+									}
+								}
+							}
+						} else {
+							// Buffer full, mark EOF to stop trying
+							stdoutEof = 1
+						}
+					}
+
+					// Try to read from stderr pipe
+					if stderrEof == 0 {
+						if readerStderrLen < captureBufferSize {
+							readResult = runtime.Syscall(runtime.SYS_READ, stderrPipeRead, stderrBufBase+readerStderrLen, captureBufferSize-readerStderrLen)
+							if readResult > 0 {
+								readerStderrLen = readerStderrLen + readResult
+								gotDataThisIter = 1
+							} else {
+								if readResult == 0 {
+									// EOF
+									stderrEof = 1
+								} else {
+									// EAGAIN (-11) means no data available, other errors mark EOF
+									if readResult != -11 {
+										stderrEof = 1
+									}
+								}
+							}
+						} else {
+							// Buffer full, mark EOF to stop trying
+							stderrEof = 1
+						}
+					}
+
+					// Check if both pipes are at EOF
+					if stdoutEof != 0 {
+						if stderrEof != 0 {
+							bothEof = 1
+						}
+					}
+
+					// If no data was read this iteration and not done, yield to scheduler
+					// This prevents starving the parent process on single-vCPU VMs
+					if gotDataThisIter == 0 {
+						if bothEof == 0 {
+							// Use getpid() as a cheap syscall to yield to scheduler
+							runtime.Syscall(runtime.SYS_GETPID)
+						}
+					}
+				}
+
+				// Close read ends
+				if stdoutPipeRead >= 0 {
+					runtime.Syscall(runtime.SYS_CLOSE, stdoutPipeRead)
+				}
+				if stderrPipeRead >= 0 {
+					runtime.Syscall(runtime.SYS_CLOSE, stderrPipeRead)
+				}
+
+				// Write captured data to return pipe
+				// Format: [stdout_len:4][stdout_data][stderr_len:4][stderr_data]
+				// Use a small header buffer at end of readerBuf
+				var headerPtr int64 = 0
+				headerPtr = readerBuf + captureBufferSize + captureBufferSize
+
+				// Write stdout_len
+				runtime.Store32(headerPtr, 0, readerStdoutLen)
+				runtime.Syscall(runtime.SYS_WRITE, returnPipeWrite, headerPtr, 4)
+
+				// Write stdout_data
+				if readerStdoutLen > 0 {
+					vsockWriteFull(returnPipeWrite, readerBuf, readerStdoutLen)
+				}
+
+				// Write stderr_len
+				runtime.Store32(headerPtr, 0, readerStderrLen)
+				runtime.Syscall(runtime.SYS_WRITE, returnPipeWrite, headerPtr, 4)
+
+				// Write stderr_data
+				var stderrDataPtr int64 = 0
+				stderrDataPtr = readerBuf + captureBufferSize
+				if readerStderrLen > 0 {
+					vsockWriteFull(returnPipeWrite, stderrDataPtr, readerStderrLen)
+				}
+
+				// Close return pipe and exit
+				runtime.Syscall(runtime.SYS_CLOSE, returnPipeWrite)
+				runtime.Syscall(runtime.SYS_EXIT, 0)
+			}
+
+			// === PARENT PROCESS ===
+			// Close pipe ends we don't need
+			if stdoutPipeRead >= 0 {
+				runtime.Syscall(runtime.SYS_CLOSE, stdoutPipeRead)
+				stdoutPipeRead = -1
+			}
+			if stderrPipeRead >= 0 {
+				runtime.Syscall(runtime.SYS_CLOSE, stderrPipeRead)
+				stderrPipeRead = -1
+			}
+			if returnPipeWrite >= 0 {
+				runtime.Syscall(runtime.SYS_CLOSE, returnPipeWrite)
+				returnPipeWrite = -1
+			}
+
+			// Save original stdout/stderr and redirect to pipes
+			if captureStdout != 0 {
+				if stdoutPipeWrite >= 0 {
+					savedStdout = runtime.Syscall(runtime.SYS_FCNTL, 1, runtime.F_DUPFD_CLOEXEC, 10)
+					runtime.Syscall(runtime.SYS_DUP3, stdoutPipeWrite, 1, 0)
+					runtime.Syscall(runtime.SYS_CLOSE, stdoutPipeWrite)
+					stdoutPipeWrite = -1
+				}
+			}
+
+			// Handle combined mode: redirect stderr to stdout
+			if combineMode != 0 {
+				if savedStdout >= 0 {
+					savedStderr = runtime.Syscall(runtime.SYS_FCNTL, 2, runtime.F_DUPFD_CLOEXEC, 10)
+					runtime.Syscall(runtime.SYS_DUP3, 1, 2, 0)
+				}
+			}
+
+			// Redirect stderr to its own pipe (if separate capture)
+			// NOTE: Use flattened conditionals to work around RTG compiler bug
+			// with nested if statements (the inner block runs unconditionally)
+			var shouldRedirectStderr int64 = 0
+			if captureStderr != 0 {
+				shouldRedirectStderr = 1
+			}
+			if combineMode != 0 {
+				shouldRedirectStderr = 0
+			}
+			if stderrPipeWrite < 0 {
+				shouldRedirectStderr = 0
+			}
+			if shouldRedirectStderr != 0 {
+				savedStderr = runtime.Syscall(runtime.SYS_FCNTL, 2, runtime.F_DUPFD_CLOEXEC, 10)
+				runtime.Syscall(runtime.SYS_DUP3, stderrPipeWrite, 2, 0)
+				runtime.Syscall(runtime.SYS_CLOSE, stderrPipeWrite)
+				stderrPipeWrite = -1
+			}
 		}
 
 		// Record: phase7_call_payload (19)
@@ -417,17 +812,178 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 			runtime.Store32(timesliceMem, 0, 20)
 		}
 
-		// Send result back: [len=4][exit_code]
-		runtime.Store32(resultBuf, 4, payloadResult)
+		// Restore stdin and wait for stdin writer process
+		if savedStdin >= 0 {
+			runtime.Syscall(runtime.SYS_DUP3, savedStdin, 0, 0)
+			runtime.Syscall(runtime.SYS_CLOSE, savedStdin)
+			savedStdin = -1
+		}
+		if stdinWriterPid > 0 {
+			// Wait for stdin writer process to complete
+			stdinStatusBuf := runtime.Syscall(runtime.SYS_MMAP, 0, 4096, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
+			if stdinStatusBuf >= 0 {
+				runtime.Syscall(runtime.SYS_WAIT4, stdinWriterPid, stdinStatusBuf, 0, 0)
+				runtime.Syscall(runtime.SYS_MUNMAP, stdinStatusBuf, 4096)
+			}
+			stdinWriterPid = -1
+		}
 
-		// Try a direct write syscall to debug
-		var directWrite int64 = 0
-		directWrite = runtime.Syscall(runtime.SYS_WRITE, sockFd, resultBuf, 8)
-		if directWrite < 0 {
-			runtime.Printf("initx: vsock write result failed (errno=0x%x)\n", 0-directWrite)
-			reboot()
+		// Restore stdout/stderr and wait for reader
+		if needCapture != 0 {
+			// Restore stdout (closes pipe write end, signals EOF to reader)
+			if savedStdout >= 0 {
+				runtime.Syscall(runtime.SYS_DUP3, savedStdout, 1, 0)
+				runtime.Syscall(runtime.SYS_CLOSE, savedStdout)
+				savedStdout = -1
+			}
+
+			// Restore stderr
+			if savedStderr >= 0 {
+				runtime.Syscall(runtime.SYS_DUP3, savedStderr, 2, 0)
+				runtime.Syscall(runtime.SYS_CLOSE, savedStderr)
+				savedStderr = -1
+			}
+
+			// Read captured data from return pipe BEFORE waiting for reader
+			// This prevents deadlock when captured data exceeds pipe buffer (64KB)
+			// Format: [stdout_len:4][stdout_data][stderr_len:4][stderr_data]
+			if returnPipeRead >= 0 {
+				// Read stdout_len
+				vsockReadFull(returnPipeRead, resultBuf, 4)
+				stdoutLen = runtime.Load32(resultBuf, 0)
+				if stdoutLen < 0 {
+					stdoutLen = 0
+				}
+				if stdoutLen > captureBufferSize {
+					stdoutLen = captureBufferSize
+				}
+
+				// Read stdout_data into result buffer at offset 12
+				if stdoutLen > 0 {
+					vsockReadFull(returnPipeRead, resultBuf+12, stdoutLen)
+				}
+
+				// Read stderr_len
+				vsockReadFull(returnPipeRead, resultBuf, 4)
+				stderrLen = runtime.Load32(resultBuf, 0)
+				if stderrLen < 0 {
+					stderrLen = 0
+				}
+				if stderrLen > captureBufferSize {
+					stderrLen = captureBufferSize
+				}
+
+				// Read stderr_data into result buffer after stdout
+				if stderrLen > 0 {
+					var stderrDataOffset int64 = 0
+					stderrDataOffset = 12 + stdoutLen + 4
+					vsockReadFull(returnPipeRead, resultBuf+stderrDataOffset, stderrLen)
+				}
+
+				runtime.Syscall(runtime.SYS_CLOSE, returnPipeRead)
+				returnPipeRead = -1
+			}
+
+			// Wait for reader process to complete (after reading all data)
+			if readerPid > 0 {
+				// Allocate status buffer for wait4
+				statusBuf := runtime.Syscall(runtime.SYS_MMAP, 0, 4096, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
+				if statusBuf >= 0 {
+					runtime.Syscall(runtime.SYS_WAIT4, readerPid, statusBuf, 0, 0)
+					runtime.Syscall(runtime.SYS_MUNMAP, statusBuf, 4096)
+				}
+			}
+		}
+
+		// Build response
+		if flags == captureFlagNone {
+			// Legacy response: [len=4][exit_code]
+			runtime.Store32(resultBuf, 0, 4)
+			runtime.Store32(resultBuf, 4, payloadResult)
+
+			directWrite := runtime.Syscall(runtime.SYS_WRITE, sockFd, resultBuf, 8)
+			if directWrite < 0 {
+				reboot()
+			}
+		} else {
+			// New response: [len:4][exit_code:4][stdout_len:4][stdout_data][stderr_len:4][stderr_data]
+			// Calculate total response length (excluding the len field itself)
+			var responseLen int64 = 0
+			responseLen = 4 + 4 + stdoutLen + 4 + stderrLen // exit_code + stdout_len + stdout_data + stderr_len + stderr_data
+
+			runtime.Store32(resultBuf, 0, responseLen)
+			runtime.Store32(resultBuf, 4, payloadResult)
+			runtime.Store32(resultBuf, 8, stdoutLen)
+			// stdout_data is already at offset 12
+
+			// Write stderr_len after stdout_data using pointer arithmetic
+			// We use Store32 with the base pointer + offset and constant 0
+			var stderrLenPtr int64 = 0
+			stderrLenPtr = resultBuf + 12 + stdoutLen
+			runtime.Store32(stderrLenPtr, 0, stderrLen)
+			// stderr_data is already at stderrLenPtr + 4
+
+			// Write the entire response
+			var totalWriteLen int64 = 0
+			totalWriteLen = 4 + responseLen // len field + response data
+			writeResult := vsockWriteFull(sockFd, resultBuf, totalWriteLen)
+			if writeResult < 0 {
+				runtime.Printf("initx: vsock write result failed (errno=0x%x)\n", 0-writeResult)
+				reboot()
+			}
 		}
 	}
+}
+
+// readPipeNonBlocking reads all available data from a pipe fd into buf.
+// Returns the number of bytes read, or negative errno on error.
+// This function sets the pipe to non-blocking mode to avoid hanging.
+func readPipeNonBlocking(fd int64, buf int64, maxLen int64) int64 {
+	// Set non-blocking mode
+	oldFlags := runtime.Syscall(runtime.SYS_FCNTL, fd, runtime.F_GETFL, 0)
+	if oldFlags >= 0 {
+		runtime.Syscall(runtime.SYS_FCNTL, fd, runtime.F_SETFL, oldFlags|runtime.O_NONBLOCK)
+	}
+
+	var totalRead int64 = 0
+	var done int64 = 0
+	var errorResult int64 = 0
+
+	for done == 0 {
+		if totalRead >= maxLen {
+			done = 1
+		}
+		if done == 0 {
+			var readResult int64 = 0
+			readResult = runtime.Syscall(runtime.SYS_READ, fd, buf+totalRead, maxLen-totalRead)
+			if readResult < 0 {
+				// EAGAIN/EWOULDBLOCK means no more data available
+				if readResult == -11 {
+					done = 1
+				} else {
+					// Other error
+					if totalRead > 0 {
+						done = 1
+					} else {
+						errorResult = readResult
+						done = 1
+					}
+				}
+			} else {
+				if readResult == 0 {
+					// EOF
+					done = 1
+				} else {
+					totalRead = totalRead + readResult
+				}
+			}
+		}
+	}
+
+	if errorResult < 0 {
+		return errorResult
+	}
+	return totalRead
 }
 
 // vsockReadFull reads exactly n bytes from fd into buf.
