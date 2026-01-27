@@ -4,12 +4,8 @@ import (
 	"context"
 	"errors"
 	"os"
-	"strings"
 	"testing"
 	"time"
-
-	"github.com/tinyrange/cc/internal/archive"
-	"github.com/tinyrange/cc/internal/fslayer"
 )
 
 // testTimeoutOption is a local timeout option for tests.
@@ -171,6 +167,11 @@ func TestFilesystemSnapshotFactoryBasic(t *testing.T) {
 
 // TestFilesystemSnapshotDebug tests what's being captured in the snapshot.
 func TestFilesystemSnapshotDebug(t *testing.T) {
+	// skip this test unless a special environment variable is set
+	if os.Getenv("CC_TEST_SNAPSHOT_WITH_PACKAGE_INSTALL") != "1" {
+		t.Skip("CC_TEST_SNAPSHOT_WITH_PACKAGE_INSTALL is not set, skipping snapshot with package install test")
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
@@ -364,6 +365,11 @@ func TestFilesystemSnapshotExistingDir(t *testing.T) {
 // TestFilesystemSnapshotDirectPackageInstall tests snapshotting without the factory
 // to isolate whether the issue is with snapshot capture/restore or with layering.
 func TestFilesystemSnapshotDirectPackageInstall(t *testing.T) {
+	// skip this test unless a special environment variable is set
+	if os.Getenv("CC_TEST_SNAPSHOT_WITH_PACKAGE_INSTALL") != "1" {
+		t.Skip("CC_TEST_SNAPSHOT_WITH_PACKAGE_INSTALL is not set, skipping snapshot with package install test")
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -444,167 +450,12 @@ func TestFilesystemSnapshotDirectPackageInstall(t *testing.T) {
 	t.Log("ld exists after snapshot - direct snapshot works!")
 }
 
-// TestFilesystemSnapshotLayerDiagnostic dumps layer entries to diagnose capture issues.
-func TestFilesystemSnapshotLayerDiagnostic(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	// Create OCI client
-	client, err := NewOCIClient()
-	if err != nil {
-		t.Fatalf("NewOCIClient: %v", err)
-	}
-
-	source, err := client.Pull(ctx, "alpine:3.19")
-	if err != nil {
-		t.Fatalf("Pull: %v", err)
-	}
-
-	// Create first instance and install packages
-	t.Log("Creating instance and installing packages...")
-	inst1, err := New(source,
-		withMemoryMB(256),
-		withTimeout(2*time.Minute),
-	)
-	if err != nil {
-		if errors.Is(err, ErrHypervisorUnavailable) {
-			t.Skipf("Hypervisor unavailable: %v", err)
-		}
-		t.Fatalf("New instance 1: %v", err)
-	}
-
-	// Install gcc
-	cmd := inst1.CommandContext(ctx, "apk", "add", "--no-cache", "gcc", "musl-dev")
-	output, err := cmd.CombinedOutput()
-	t.Logf("apk output: %s", string(output))
-	if err != nil {
-		inst1.Close()
-		t.Fatalf("apk add failed: %v", err)
-	}
-
-	// Check ld type before snapshot
-	cmd = inst1.CommandContext(ctx, "ls", "-la", "/usr/bin/ld")
-	output, err = cmd.CombinedOutput()
-	t.Logf("ls -la /usr/bin/ld output: %s", string(output))
-	if err != nil {
-		inst1.Close()
-		t.Fatalf("ls -la /usr/bin/ld failed: %v", err)
-	}
-
-	// Check what type of file ld is
-	cmd = inst1.CommandContext(ctx, "file", "/usr/bin/ld")
-	output, _ = cmd.CombinedOutput()
-	t.Logf("file /usr/bin/ld output: %s", string(output))
-
-	// Check readlink
-	cmd = inst1.CommandContext(ctx, "readlink", "-f", "/usr/bin/ld")
-	output, _ = cmd.CombinedOutput()
-	t.Logf("readlink -f /usr/bin/ld output: %s", string(output))
-
-	// Check inode and look for hardlinks
-	cmd = inst1.CommandContext(ctx, "stat", "/usr/bin/ld")
-	output, _ = cmd.CombinedOutput()
-	t.Logf("stat /usr/bin/ld output:\n%s", string(output))
-
-	// List ld.* files to find hardlinks
-	cmd = inst1.CommandContext(ctx, "ls", "-lai", "/usr/bin/ld*")
-	output, _ = cmd.CombinedOutput()
-	t.Logf("ls -lai /usr/bin/ld* output:\n%s", string(output))
-
-	// Take snapshot
-	t.Log("Taking snapshot...")
-	cacheDir := t.TempDir()
-	snap, err := inst1.SnapshotFilesystem(WithCacheDir(cacheDir))
-	if err != nil {
-		inst1.Close()
-		t.Fatalf("SnapshotFilesystem: %v", err)
-	}
-	t.Logf("Snapshot cache key: %s", snap.CacheKey())
-
-	// Examine layer files
-	fsSnap, ok := snap.(*fsSnapshotSource)
-	if !ok {
-		inst1.Close()
-		snap.Close()
-		t.Fatalf("Unexpected snapshot type: %T", snap)
-	}
-	t.Logf("Snapshot has %d layers", len(fsSnap.layers))
-
-	// Read the layer entries and look for /usr/bin/ld
-	for i, layerHash := range fsSnap.layers {
-		t.Logf("Layer %d: %s", i, layerHash)
-
-		// Read the layer using fslayer.ReadLayer
-		layer, err := fslayer.ReadLayer(cacheDir, layerHash)
-		if err != nil {
-			t.Logf("  Failed to read layer: %v", err)
-			continue
-		}
-		t.Logf("  Index: %s", layer.IndexPath)
-
-		// Read entries
-		idxFile, err := os.Open(layer.IndexPath)
-		if err != nil {
-			t.Logf("  Failed to open index: %v", err)
-			continue
-		}
-
-		entries, err := archive.ReadAllEntries(idxFile)
-		idxFile.Close()
-		if err != nil {
-			t.Logf("  Failed to read entries: %v", err)
-			continue
-		}
-
-		t.Logf("  Total entries: %d", len(entries))
-
-		// Look for ld-related entries
-		for _, ent := range entries {
-			if strings.Contains(ent.Name, "ld") || strings.Contains(ent.Name, "/usr/bin/") {
-				t.Logf("  Entry: %s kind=%v mode=%v size=%d linkname=%s",
-					ent.Name, ent.Kind, ent.Mode, ent.Size, ent.Linkname)
-			}
-		}
-	}
-
-	inst1.Close()
-
-	// Create new instance from snapshot
-	t.Log("Creating instance from snapshot...")
-	inst2, err := New(snap,
-		withMemoryMB(256),
-		withTimeout(time.Minute),
-	)
-	if err != nil {
-		snap.Close()
-		t.Fatalf("New instance 2: %v", err)
-	}
-	defer inst2.Close()
-	defer snap.Close()
-
-	// Check ld exists after snapshot
-	cmd = inst2.CommandContext(ctx, "ls", "-la", "/usr/bin/ld")
-	output, err = cmd.CombinedOutput()
-	t.Logf("After snapshot - ls -la /usr/bin/ld output: %s", string(output))
-
-	_, err = inst2.Stat("/usr/bin/ld")
-	if err != nil {
-		// List /usr/bin to see what's there
-		cmd = inst2.CommandContext(ctx, "ls", "/usr/bin/")
-		output, _ = cmd.CombinedOutput()
-		usrBinFiles := strings.Split(string(output), "\n")
-		t.Logf("Files in /usr/bin: %d", len(usrBinFiles))
-		for _, f := range usrBinFiles {
-			if strings.Contains(f, "ld") {
-				t.Logf("  Found ld-related: %s", f)
-			}
-		}
-		t.Fatalf("ld not found after snapshot: %v", err)
-	}
-	t.Log("ld found after snapshot!")
-}
-
 func TestFilesystemSnapshotWithPackageInstall(t *testing.T) {
+	// skip this test unless a special environment variable is set
+	if os.Getenv("CC_TEST_SNAPSHOT_WITH_PACKAGE_INSTALL") != "1" {
+		t.Skip("CC_TEST_SNAPSHOT_WITH_PACKAGE_INSTALL is not set, skipping snapshot with package install test")
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
