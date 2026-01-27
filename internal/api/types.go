@@ -69,6 +69,9 @@ type FS interface {
 	Chown(name string, uid, gid int) error
 	// Chtimes changes the access and modification times of the named file.
 	Chtimes(name string, atime, mtime time.Time) error
+	// SnapshotFilesystem creates a snapshot of the current filesystem state.
+	// The snapshot uses COW semantics and can be used as an InstanceSource.
+	SnapshotFilesystem(opts ...FilesystemSnapshotOption) (FilesystemSnapshot, error)
 }
 
 // Cmd represents a command ready to be run in the guest.
@@ -144,6 +147,31 @@ type Instance interface {
 // InstanceSource is the source for creating a new Instance.
 type InstanceSource interface {
 	IsInstanceSource()
+}
+
+// FilesystemSnapshot represents a snapshot of a filesystem that can be used
+// as an InstanceSource. It provides COW (copy-on-write) semantics and can be
+// persisted and restored.
+//
+// Note: Named FilesystemSnapshot (not Snapshot) to reserve Snapshot for future
+// full VM snapshots (memory + devices + filesystem).
+type FilesystemSnapshot interface {
+	InstanceSource
+
+	// CacheKey returns a unique key for this snapshot derived from its
+	// operation chain. Used for caching and deduplication.
+	CacheKey() string
+
+	// Parent returns the parent snapshot, or nil if this is a base snapshot.
+	Parent() FilesystemSnapshot
+
+	// Close releases resources held by the snapshot.
+	Close() error
+}
+
+// FilesystemSnapshotOption configures a filesystem snapshot operation.
+type FilesystemSnapshotOption interface {
+	IsFilesystemSnapshotOption()
 }
 
 // OCIClient pulls OCI images and converts them to InstanceSources.

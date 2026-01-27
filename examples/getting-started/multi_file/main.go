@@ -1,6 +1,7 @@
 // multi_file demonstrates working with multi-file projects in a sandboxed environment.
 //
 // This example shows how to:
+// - Use FilesystemSnapshotFactory to cache language environments
 // - Write multiple source files to the sandbox
 // - Build a project with multiple files
 // - Handle project dependencies and imports
@@ -52,38 +53,62 @@ func main() {
 	}
 }
 
+// getSnapshotForLanguage returns a cached filesystem snapshot for the given language.
+func getSnapshotForLanguage(ctx context.Context, client cc.OCIClient, cacheDir, language string) (cc.FilesystemSnapshot, error) {
+	switch language {
+	case "python":
+		return cc.NewFilesystemSnapshotFactory(client, cacheDir).
+			From("python:3.12-slim").
+			Exclude("/tmp/*").
+			Build(ctx)
+
+	case "node":
+		return cc.NewFilesystemSnapshotFactory(client, cacheDir).
+			From("node:20-slim").
+			Exclude("/tmp/*").
+			Build(ctx)
+
+	case "go":
+		return cc.NewFilesystemSnapshotFactory(client, cacheDir).
+			From("golang:1.22-alpine").
+			Env("GOCACHE=/tmp/gocache").
+			Run("mkdir", "-p", "/tmp/gocache").
+			Exclude("/tmp/*").
+			Build(ctx)
+
+	default:
+		return nil, fmt.Errorf("unsupported language: %s (use: python, node, go)", language)
+	}
+}
+
 func run(project Project, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout+10*time.Second)
 	defer cancel()
 
-	// Determine image based on language
-	var image string
-	switch project.Language {
-	case "python":
-		image = "python:3.12-slim"
-	case "node":
-		image = "node:20-slim"
-	case "go":
-		image = "golang:1.22-alpine"
-	default:
-		return fmt.Errorf("unsupported language: %s (use: python, node, go)", project.Language)
-	}
-
-	// Create OCI client and pull image
+	// Create OCI client
 	client, err := cc.NewOCIClient()
 	if err != nil {
 		return fmt.Errorf("creating OCI client: %w", err)
 	}
-	source, err := client.Pull(ctx, image)
+
+	// Get cached snapshot for the language
+	cacheDir := shared.GetCacheDir()
+	snap, err := getSnapshotForLanguage(ctx, client, cacheDir, project.Language)
 	if err != nil {
-		return fmt.Errorf("pulling image: %w", err)
+		return fmt.Errorf("getting snapshot: %w", err)
+	}
+	defer snap.Close()
+
+	// Create sandbox instance from the cached snapshot
+	opts := []cc.Option{
+		cc.WithMemoryMB(512),
+		cc.WithTimeout(timeout + 5*time.Second),
+	}
+	if project.Language == "go" {
+		opts = append(opts, cc.WithEnv("GOCACHE=/tmp/gocache"))
 	}
 
-	// Create sandbox instance
-	instance, err := cc.New(source,
-		cc.WithMemoryMB(512),
-		cc.WithTimeout(timeout+5*time.Second),
-	)
+	instance, err := cc.New(snap, opts...)
 	if err != nil {
 		return fmt.Errorf("creating instance: %w", err)
 	}

@@ -1,8 +1,9 @@
 // compile_c demonstrates compiling and running C code in a sandboxed environment.
 //
 // This example shows how to:
+// - Use FilesystemSnapshotFactory to cache image setup (gcc installation)
 // - Pull an OCI image (alpine with gcc)
-// - Create a sandbox instance
+// - Create a sandbox instance from a cached snapshot
 // - Write C source code to the filesystem
 // - Compile the code using gcc
 // - Execute the compiled binary
@@ -55,18 +56,29 @@ func run(code string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout+10*time.Second)
 	defer cancel()
 
-	// Create OCI client and pull Alpine with build tools
+	// Create OCI client
 	client, err := cc.NewOCIClient()
 	if err != nil {
 		return fmt.Errorf("creating OCI client: %w", err)
 	}
-	source, err := client.Pull(ctx, "alpine:3.19")
-	if err != nil {
-		return fmt.Errorf("pulling image: %w", err)
-	}
 
-	// Create sandbox instance
-	instance, err := cc.New(source,
+	// Use FilesystemSnapshotFactory to cache gcc installation
+	// On first run, this installs gcc and caches the result
+	// On subsequent runs, the cached snapshot is used directly
+	cacheDir := shared.GetCacheDir()
+	snap, err := cc.NewFilesystemSnapshotFactory(client, cacheDir).
+		From("alpine:3.19").
+		Run("apk", "add", "--no-cache", "gcc", "musl-dev").
+		Exclude("/var/cache/*", "/tmp/*").
+		Build(ctx)
+	if err != nil {
+		return fmt.Errorf("building snapshot: %w", err)
+	}
+	defer snap.Close()
+
+	// Create sandbox instance from the cached snapshot
+	// gcc is already installed, no need for apk add
+	instance, err := cc.New(snap,
 		cc.WithMemoryMB(256),
 		cc.WithTimeout(timeout+5*time.Second),
 	)
@@ -74,15 +86,6 @@ func run(code string, timeout time.Duration) error {
 		return fmt.Errorf("creating instance: %w", err)
 	}
 	defer instance.Close()
-
-	// Install gcc
-	installCtx, installCancel := context.WithTimeout(ctx, 60*time.Second)
-	defer installCancel()
-
-	installResult := shared.RunCommand(installCtx, instance, "apk", "add", "--no-cache", "gcc", "musl-dev")
-	if installResult.ExitCode != 0 {
-		return fmt.Errorf("installing gcc: %s", installResult.Stderr)
-	}
 
 	// Write the C source file
 	fs := instance.WithContext(ctx)

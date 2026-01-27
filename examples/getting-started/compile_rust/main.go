@@ -1,8 +1,9 @@
 // compile_rust demonstrates compiling and running Rust code in a sandboxed environment.
 //
 // This example shows how to:
+// - Use FilesystemSnapshotFactory to cache the Rust environment
 // - Pull an OCI image (rust:slim)
-// - Create a sandbox instance
+// - Create a sandbox instance from a cached snapshot
 // - Write Rust source code to the filesystem
 // - Compile the code using rustc
 // - Execute the compiled binary
@@ -55,18 +56,26 @@ func run(code string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout+10*time.Second)
 	defer cancel()
 
-	// Create OCI client and pull Rust image
+	// Create OCI client
 	client, err := cc.NewOCIClient()
 	if err != nil {
 		return fmt.Errorf("creating OCI client: %w", err)
 	}
-	source, err := client.Pull(ctx, "rust:slim")
-	if err != nil {
-		return fmt.Errorf("pulling image: %w", err)
-	}
 
-	// Create sandbox instance
-	instance, err := cc.New(source,
+	// Use FilesystemSnapshotFactory to cache the Rust environment
+	// Rust is pre-installed in the image, so this mainly caches the base image
+	cacheDir := shared.GetCacheDir()
+	snap, err := cc.NewFilesystemSnapshotFactory(client, cacheDir).
+		From("rust:slim").
+		Exclude("/tmp/*").
+		Build(ctx)
+	if err != nil {
+		return fmt.Errorf("building snapshot: %w", err)
+	}
+	defer snap.Close()
+
+	// Create sandbox instance from the cached snapshot
+	instance, err := cc.New(snap,
 		cc.WithMemoryMB(512),
 		cc.WithTimeout(timeout+5*time.Second),
 	)

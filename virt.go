@@ -222,3 +222,62 @@ func New(source InstanceSource, opts ...Option) (Instance, error) {
 func EnsureExecutableIsSigned() error {
 	return api.EnsureExecutableIsSigned()
 }
+
+// -----------------------------------------------------------------------------
+// Filesystem Snapshot Types
+// -----------------------------------------------------------------------------
+
+// FilesystemSnapshot represents a point-in-time snapshot of a filesystem.
+// It can be used as an InstanceSource to create new instances with the
+// captured filesystem state.
+type FilesystemSnapshot = api.FilesystemSnapshot
+
+// FilesystemSnapshotOption configures a snapshot operation.
+type FilesystemSnapshotOption = api.FilesystemSnapshotOption
+
+// FilesystemSnapshotFactory builds filesystem snapshots using Dockerfile-like
+// operations. It supports caching intermediate layers to speed up repeated builds.
+type FilesystemSnapshotFactory = api.FilesystemSnapshotFactory
+
+// NewFilesystemSnapshotFactory creates a new factory for building filesystem snapshots.
+// The factory uses the provided cacheDir to store and retrieve cached layers.
+//
+// Example:
+//
+//	snap, err := cc.NewFilesystemSnapshotFactory(client, cacheDir).
+//	    From("alpine:3.19").
+//	    Run("apk", "add", "--no-cache", "gcc", "musl-dev").
+//	    Exclude("/var/cache/*", "/tmp/*").
+//	    Build(ctx)
+func NewFilesystemSnapshotFactory(client OCIClient, cacheDir string) *FilesystemSnapshotFactory {
+	return api.NewFilesystemSnapshotFactory(client, cacheDir)
+}
+
+// -----------------------------------------------------------------------------
+// Filesystem Snapshot Options
+// -----------------------------------------------------------------------------
+
+// WithSnapshotExcludes specifies path patterns to exclude from snapshots.
+// Patterns use glob-style matching (*, ?, []).
+func WithSnapshotExcludes(patterns ...string) FilesystemSnapshotOption {
+	return &snapshotExcludesOption{patterns: patterns}
+}
+
+type snapshotExcludesOption struct{ patterns []string }
+
+func (*snapshotExcludesOption) IsFilesystemSnapshotOption() {}
+
+// Excludes returns the path patterns to exclude.
+func (o *snapshotExcludesOption) Excludes() []string { return o.patterns }
+
+// WithSnapshotCacheDir sets the directory for snapshot cache storage.
+func WithSnapshotCacheDir(dir string) FilesystemSnapshotOption {
+	return &snapshotCacheDirOption{dir: dir}
+}
+
+type snapshotCacheDirOption struct{ dir string }
+
+func (*snapshotCacheDirOption) IsFilesystemSnapshotOption() {}
+
+// CacheDir returns the cache directory.
+func (o *snapshotCacheDirOption) CacheDir() string { return o.dir }
