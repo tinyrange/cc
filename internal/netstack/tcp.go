@@ -195,6 +195,57 @@ func (sb *tcpSendBuffer) markRetransmitted() {
 	}
 }
 
+// markRetransmittedN updates the retx count and timestamp for the oldest n segments.
+func (sb *tcpSendBuffer) markRetransmittedN(n int) {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+
+	now := time.Now()
+	for i := 0; i < n && i < len(sb.segments); i++ {
+		sb.segments[i].retxCount++
+		sb.segments[i].sentAt = now
+	}
+}
+
+// oldestCoalesced returns the oldest segments coalesced up to maxSize bytes.
+// Returns the coalesced segment, the number of segments coalesced, and whether any were found.
+func (sb *tcpSendBuffer) oldestCoalesced(maxSize int) (tcpSendSegment, int, bool) {
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+
+	if len(sb.segments) == 0 {
+		return tcpSendSegment{}, 0, false
+	}
+
+	// Start with oldest
+	coalesced := tcpSendSegment{
+		seqStart:  sb.segments[0].seqStart,
+		seqEnd:    sb.segments[0].seqEnd,
+		payload:   append([]byte(nil), sb.segments[0].payload...),
+		sentAt:    sb.segments[0].sentAt,
+		retxCount: sb.segments[0].retxCount,
+	}
+	count := 1
+
+	// Coalesce consecutive segments
+	for i := 1; i < len(sb.segments); i++ {
+		seg := sb.segments[i]
+		if seg.seqStart != coalesced.seqEnd {
+			break
+		}
+		if len(coalesced.payload)+len(seg.payload) > maxSize {
+			break
+		}
+		coalesced.payload = append(coalesced.payload, seg.payload...)
+		coalesced.seqEnd = seg.seqEnd
+		if seg.retxCount > coalesced.retxCount {
+			coalesced.retxCount = seg.retxCount
+		}
+		count++
+	}
+	return coalesced, count, true
+}
+
 // len returns the number of segments in the buffer.
 func (sb *tcpSendBuffer) len() int {
 	sb.mu.Lock()
@@ -321,19 +372,23 @@ func (rb *tcpRecvBuffer) clear() {
 
 // tcpRTTEstimator implements RTT estimation per RFC 6298.
 type tcpRTTEstimator struct {
-	mu         sync.Mutex
-	srtt       time.Duration // smoothed RTT
-	rttVar     time.Duration // RTT variance
-	rto        time.Duration // retransmission timeout
-	hasInitial bool          // whether first measurement has been made
+	mu           sync.Mutex
+	srtt         time.Duration // smoothed RTT
+	rttVar       time.Duration // RTT variance
+	rto          time.Duration // retransmission timeout
+	hasInitial   bool          // whether first measurement has been made
+	backoffCount int           // track consecutive backoffs
 }
 
 // Default RTO bounds.
 const (
-	minRTO     = 200 * time.Millisecond
+	minRTO     = 50 * time.Millisecond // Lower min for virtual networks
 	maxRTO     = 60 * time.Second
-	initialRTO = 1 * time.Second
+	initialRTO = 500 * time.Millisecond // Lower initial for virtual networks
 )
+
+// maxBackoffCount limits exponential backoff iterations.
+const maxBackoffCount = 5
 
 // newTCPRTTEstimator creates an RTT estimator with initial RTO.
 func newTCPRTTEstimator() *tcpRTTEstimator {
@@ -376,15 +431,25 @@ func (r *tcpRTTEstimator) update(rtt time.Duration) {
 	}
 }
 
-// backoff doubles the RTO (exponential backoff on timeout).
+// backoff applies gentler exponential backoff (1.5x) with a cap on iterations.
 func (r *tcpRTTEstimator) backoff() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	r.rto *= 2
+	if r.backoffCount < maxBackoffCount {
+		r.rto = (r.rto * 3) / 2 // 1.5x instead of 2x
+		r.backoffCount++
+	}
 	if r.rto > maxRTO {
 		r.rto = maxRTO
 	}
+}
+
+// resetBackoff resets the backoff counter after successful ACK.
+func (r *tcpRTTEstimator) resetBackoff() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.backoffCount = 0
 }
 
 // getRTO returns the current RTO.
@@ -409,6 +474,10 @@ type tcpCongestionControl struct {
 
 // Initial congestion window per RFC 5681.
 const initialCwndSegments = 10
+
+// fastRetransmitThreshold is the number of duplicate ACKs to trigger fast retransmit.
+// Lowered from standard 3 for virtual networks with small receive windows.
+const fastRetransmitThreshold = 2
 
 // newTCPCongestionControl creates a congestion controller.
 func newTCPCongestionControl(mss uint16) *tcpCongestionControl {
@@ -442,22 +511,22 @@ func (cc *tcpCongestionControl) onAck(bytesAcked int) {
 }
 
 // onDupAck is called when a duplicate ACK is received.
-// Returns true if fast retransmit should be triggered (3 dup acks).
+// Returns true if fast retransmit should be triggered.
 func (cc *tcpCongestionControl) onDupAck() bool {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 
 	cc.dupAcks++
-	if cc.dupAcks == 3 {
+	if cc.dupAcks == fastRetransmitThreshold {
 		// Fast retransmit threshold reached
 		cc.ssthresh = cc.cwnd / 2
 		if cc.ssthresh < 2*uint32(cc.mss) {
 			cc.ssthresh = 2 * uint32(cc.mss)
 		}
-		cc.cwnd = cc.ssthresh + 3*uint32(cc.mss)
+		cc.cwnd = cc.ssthresh + uint32(fastRetransmitThreshold)*uint32(cc.mss)
 		return true
 	}
-	if cc.dupAcks > 3 {
+	if cc.dupAcks > fastRetransmitThreshold {
 		// Fast recovery: inflate cwnd by MSS for each additional dup ack
 		cc.cwnd += uint32(cc.mss)
 	}

@@ -560,6 +560,51 @@ func TestNetworkHTTPDownload1MiB(t *testing.T) {
 	}
 }
 
+func TestNetworkHTTPDownload100MiB(t *testing.T) {
+	if !*bringupLarge {
+		t.Skip("set -bringup.large to run 100MiB download test")
+	}
+	if err := configureInterfaceIP("eth0", net.ParseIP("10.42.0.2"), net.CIDRMask(24, 32)); err != nil {
+		t.Fatalf("failed to configure IP address: %v", err)
+	}
+
+	iters := *bringupLargeIters
+	if iters <= 0 {
+		iters = 1
+	}
+
+	for i := 0; i < iters; i++ {
+		t.Run(fmt.Sprintf("iter_%d", i), func(t *testing.T) {
+			client := &http.Client{Timeout: 120 * time.Second}
+			resp, err := client.Get(fmt.Sprintf("http://10.42.0.1:4244/download/%d", 100*1024*1024))
+			if err != nil {
+				t.Fatalf("http get: %v", err)
+			}
+			defer resp.Body.Close()
+
+			t.Logf("got response")
+
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("unexpected status: %s", resp.Status)
+			}
+
+			t.Logf("downloading %d bytes", resp.ContentLength)
+
+			start := time.Now()
+
+			n, err := io.Copy(io.Discard, resp.Body)
+			if err != nil {
+				t.Fatalf("download body: %v", err)
+			}
+			if n != resp.ContentLength {
+				t.Fatalf("unexpected download size: got %d want %d", n, resp.ContentLength)
+			}
+
+			t.Logf("downloaded %d bytes in %s (%.2f MB/s)", n, time.Since(start), float64(n)/time.Since(start).Seconds()/1024/1024)
+		})
+	}
+}
+
 func TestVsockEcho(t *testing.T) {
 	// Create AF_VSOCK socket
 	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)

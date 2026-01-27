@@ -804,7 +804,7 @@ func TestTCPRecvBuffer(t *testing.T) {
 func TestTCPRTTEstimator(t *testing.T) {
 	rtt := newTCPRTTEstimator()
 
-	// Initial RTO should be 1s
+	// Initial RTO should be 500ms
 	if rtt.getRTO() != initialRTO {
 		t.Fatalf("expected initial RTO %v, got %v", initialRTO, rtt.getRTO())
 	}
@@ -820,11 +820,18 @@ func TestTCPRTTEstimator(t *testing.T) {
 		t.Fatalf("RTO %v should be >= minRTO %v", rtt.getRTO(), minRTO)
 	}
 
-	// Backoff should double RTO
+	// Backoff should apply 1.5x multiplier
 	prevRTO := rtt.getRTO()
 	rtt.backoff()
-	if rtt.getRTO() != prevRTO*2 {
-		t.Fatalf("expected RTO %v after backoff, got %v", prevRTO*2, rtt.getRTO())
+	expectedRTO := (prevRTO * 3) / 2
+	if rtt.getRTO() != expectedRTO {
+		t.Fatalf("expected RTO %v after backoff, got %v", expectedRTO, rtt.getRTO())
+	}
+
+	// Test resetBackoff
+	rtt.resetBackoff()
+	if rtt.backoffCount != 0 {
+		t.Fatalf("expected backoffCount 0 after reset, got %d", rtt.backoffCount)
 	}
 }
 
@@ -843,16 +850,14 @@ func TestTCPCongestionControl(t *testing.T) {
 		t.Fatalf("expected cwnd %d after ack, got %d", expectedCwnd+1460, cc.getCwnd())
 	}
 
-	// Test duplicate ACK handling
+	// Test duplicate ACK handling - fast retransmit threshold is 2
 	cc.dupAcks = 0
-	for i := 0; i < 2; i++ {
-		if cc.onDupAck() {
-			t.Fatalf("should not trigger fast retransmit on dup ack %d", i+1)
-		}
+	if cc.onDupAck() {
+		t.Fatal("should not trigger fast retransmit on dup ack 1")
 	}
-	// Third dup ack should trigger fast retransmit
+	// Second dup ack should trigger fast retransmit (threshold is 2)
 	if !cc.onDupAck() {
-		t.Fatal("should trigger fast retransmit on 3rd dup ack")
+		t.Fatal("should trigger fast retransmit on 2nd dup ack")
 	}
 
 	// Test timeout
