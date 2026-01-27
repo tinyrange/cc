@@ -357,9 +357,9 @@ type snapshotSymlink struct {
 	gid     uint32
 }
 
-func (s *snapshotSymlink) Stat() fs.FileMode    { return s.mode }
-func (s *snapshotSymlink) ModTime() time.Time   { return s.modTime }
-func (s *snapshotSymlink) Target() string       { return s.target }
+func (s *snapshotSymlink) Stat() fs.FileMode       { return s.mode }
+func (s *snapshotSymlink) ModTime() time.Time      { return s.modTime }
+func (s *snapshotSymlink) Target() string          { return s.target }
 func (s *snapshotSymlink) Owner() (uint32, uint32) { return s.uid, s.gid }
 
 var (
