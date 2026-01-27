@@ -11,18 +11,53 @@ on:
 
 jobs:
 
-  build:
+  fmt:
+    name: Check formatting
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
 
     - name: Set up Go
-      uses: actions/setup-go@v4
+      uses: actions/setup-go@v5
       with:
-        go-version: '1.25.1'
+        go-version-file: go.mod
+
+    - name: Check go fmt
+      run: |
+        gofmt -l -w .
+        if [ -n "$(git status --porcelain)" ]; then
+          echo "The following files need formatting:"
+          git diff --name-only
+          echo ""
+          echo "Please run 'gofmt -l -w .' and commit the changes."
+          exit 1
+        fi
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux amd64
+          - os: ubuntu-24.04-arm
+            name: Linux arm64
+          - os: macos-latest
+            name: macOS arm64
+          - os: windows-latest
+            name: Windows amd64
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
 
     - name: Build
       run: go build -v ./...
 
     - name: Test
-      run: go test -v ./...
+      run: go test -p 1 -v ./...

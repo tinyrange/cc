@@ -508,9 +508,9 @@ func TestNative_RegisterPressure_MatrixOps(t *testing.T) {
 
 	// Add diagonal elements to corners (still keeps all vars live)
 	// m[0] += m[5], m[3] += m[6], m[12] += m[9], m[15] += m[10]
-	method = append(method, ir.Assign(matrix[0], ir.Op(ir.OpAdd, matrix[0], matrix[5])))   // 1+6=7
-	method = append(method, ir.Assign(matrix[3], ir.Op(ir.OpAdd, matrix[3], matrix[6])))   // 4+7=11
-	method = append(method, ir.Assign(matrix[12], ir.Op(ir.OpAdd, matrix[12], matrix[9]))) // 13+10=23
+	method = append(method, ir.Assign(matrix[0], ir.Op(ir.OpAdd, matrix[0], matrix[5])))    // 1+6=7
+	method = append(method, ir.Assign(matrix[3], ir.Op(ir.OpAdd, matrix[3], matrix[6])))    // 4+7=11
+	method = append(method, ir.Assign(matrix[12], ir.Op(ir.OpAdd, matrix[12], matrix[9])))  // 13+10=23
 	method = append(method, ir.Assign(matrix[15], ir.Op(ir.OpAdd, matrix[15], matrix[10]))) // 16+11=27
 
 	// Sum all elements
@@ -555,12 +555,12 @@ func TestNative_RegisterPressure_BitManipulation(t *testing.T) {
 		ir.Assign(vars[11], ir.Int64(0xFF)),
 
 		// Various bitwise operations
-		ir.Assign(vars[0], ir.Op(ir.OpAnd, vars[0], vars[1])),   // 0xFF & 0xF0 = 0xF0
-		ir.Assign(vars[1], ir.Op(ir.OpOr, vars[2], vars[3])),    // 0x0F | 0xAA = 0xAF
-		ir.Assign(vars[2], ir.Op(ir.OpXor, vars[4], vars[5])),   // 0x55 ^ 0xCC = 0x99
+		ir.Assign(vars[0], ir.Op(ir.OpAnd, vars[0], vars[1])),     // 0xFF & 0xF0 = 0xF0
+		ir.Assign(vars[1], ir.Op(ir.OpOr, vars[2], vars[3])),      // 0x0F | 0xAA = 0xAF
+		ir.Assign(vars[2], ir.Op(ir.OpXor, vars[4], vars[5])),     // 0x55 ^ 0xCC = 0x99
 		ir.Assign(vars[3], ir.Op(ir.OpShl, vars[7], ir.Int64(4))), // 0x01 << 4 = 0x10
 		ir.Assign(vars[4], ir.Op(ir.OpShr, vars[8], ir.Int64(4))), // 0x80 >> 4 = 0x08
-		ir.Assign(vars[5], ir.Op(ir.OpAnd, vars[9], vars[11])),  // 0x7F & 0xFF = 0x7F
+		ir.Assign(vars[5], ir.Op(ir.OpAnd, vars[9], vars[11])),    // 0x7F & 0xFF = 0x7F
 
 		// Combine results
 		ir.Assign(vars[6], ir.Op(ir.OpOr, vars[0], vars[1])),  // 0xF0 | 0xAF = 0xFF
@@ -594,11 +594,11 @@ func TestNative_RegisterPressure_MixedOperations(t *testing.T) {
 	}
 
 	// Mixed operations
-	method = append(method, ir.Assign(vars[0], ir.Op(ir.OpAdd, vars[0], vars[1])))  // 1+2=3
-	method = append(method, ir.Assign(vars[2], ir.Op(ir.OpSub, vars[3], vars[2])))  // 4-3=1
-	method = append(method, ir.Assign(vars[4], ir.Op(ir.OpAnd, vars[4], vars[5])))  // 5&6=4
-	method = append(method, ir.Assign(vars[6], ir.Op(ir.OpOr, vars[6], vars[7])))   // 7|8=15
-	method = append(method, ir.Assign(vars[8], ir.Op(ir.OpXor, vars[8], vars[9])))  // 9^10=3
+	method = append(method, ir.Assign(vars[0], ir.Op(ir.OpAdd, vars[0], vars[1])))    // 1+2=3
+	method = append(method, ir.Assign(vars[2], ir.Op(ir.OpSub, vars[3], vars[2])))    // 4-3=1
+	method = append(method, ir.Assign(vars[4], ir.Op(ir.OpAnd, vars[4], vars[5])))    // 5&6=4
+	method = append(method, ir.Assign(vars[6], ir.Op(ir.OpOr, vars[6], vars[7])))     // 7|8=15
+	method = append(method, ir.Assign(vars[8], ir.Op(ir.OpXor, vars[8], vars[9])))    // 9^10=3
 	method = append(method, ir.Assign(vars[10], ir.Op(ir.OpAdd, vars[10], vars[11]))) // 11+12=23
 
 	// Second round

@@ -53,20 +53,20 @@ var binfmtConfigs = map[hv.CpuArchitecture]BinfmtConfig{
 		// Magic and mask from QEMU's qemu-binfmt-conf.sh
 		Magic: []byte{
 			0x7f, 0x45, 0x4c, 0x46, // ELF magic
-			0x02,                   // ELF64
-			0x01,                   // Little endian
-			0x01,                   // ELF version
-			0x00,                   // OS/ABI
+			0x02,                                           // ELF64
+			0x01,                                           // Little endian
+			0x01,                                           // ELF version
+			0x00,                                           // OS/ABI
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Padding
 			0x02, 0x00, // Executable type
 			0xb7, 0x00, // Machine: aarch64
 		},
 		Mask: []byte{
 			0xff, 0xff, 0xff, 0xff, // ELF magic must match
-			0xff,                   // ELF64 must match
-			0xfe,                   // Little endian (allow 01 or 03)
-			0xfe,                   // ELF version (allow 00 or 01)
-			0x00,                   // Ignore OSABI
+			0xff,                                           // ELF64 must match
+			0xfe,                                           // Little endian (allow 01 or 03)
+			0xfe,                                           // ELF version (allow 00 or 01)
+			0x00,                                           // Ignore OSABI
 			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // Padding mask from QEMU
 			0xfe, 0xff, // Match ET_EXEC or ET_DYN
 			0xff, 0xff, // Machine must match
@@ -79,20 +79,20 @@ var binfmtConfigs = map[hv.CpuArchitecture]BinfmtConfig{
 		// Magic and mask from QEMU's qemu-binfmt-conf.sh
 		Magic: []byte{
 			0x7f, 0x45, 0x4c, 0x46, // ELF magic
-			0x02,                   // ELF64
-			0x01,                   // Little endian
-			0x01,                   // ELF version
-			0x00,                   // OS/ABI
+			0x02,                                           // ELF64
+			0x01,                                           // Little endian
+			0x01,                                           // ELF version
+			0x00,                                           // OS/ABI
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Padding
 			0x02, 0x00, // Executable type
 			0x3e, 0x00, // Machine: x86_64
 		},
 		Mask: []byte{
 			0xff, 0xff, 0xff, 0xff, // ELF magic must match
-			0xff,                   // ELF64 must match
-			0xfe,                   // Little endian (allow 01 or 03)
-			0xfe,                   // ELF version (allow 00 or 01)
-			0x00,                   // Ignore OSABI
+			0xff,                                           // ELF64 must match
+			0xfe,                                           // Little endian (allow 01 or 03)
+			0xfe,                                           // ELF version (allow 00 or 01)
+			0x00,                                           // Ignore OSABI
 			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // Padding mask from QEMU
 			0xfe, 0xff, // Match ET_EXEC or ET_DYN
 			0xff, 0xff, // Machine must match

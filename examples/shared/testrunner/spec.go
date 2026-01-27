@@ -49,11 +49,11 @@ type CLIConfig struct {
 
 // CLITestCase defines a single CLI test case.
 type CLITestCase struct {
-	Name   string   `yaml:"name"`
-	Args   []string `yaml:"args"`
-	Stdin  string   `yaml:"stdin"`
+	Name   string            `yaml:"name"`
+	Args   []string          `yaml:"args"`
+	Stdin  string            `yaml:"stdin"`
 	Env    map[string]string `yaml:"env"`
-	Expect CLIExpectation `yaml:"expect"`
+	Expect CLIExpectation    `yaml:"expect"`
 }
 
 // CLIExpectation defines expected CLI output values.

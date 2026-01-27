@@ -67,13 +67,13 @@ func (vm *netTestVM) GetIRQ(line uint32) bool {
 }
 
 // Implement other required hv.VirtualMachine methods as no-ops
-func (vm *netTestVM) Close() error                                              { return nil }
-func (vm *netTestVM) Hypervisor() hv.Hypervisor                                 { return nil }
-func (vm *netTestVM) MemorySize() uint64                                        { return uint64(len(vm.memory)) }
-func (vm *netTestVM) MemoryBase() uint64                                        { return 0 }
-func (vm *netTestVM) Run(ctx context.Context, cfg hv.RunConfig) error           { return nil }
+func (vm *netTestVM) Close() error                                                  { return nil }
+func (vm *netTestVM) Hypervisor() hv.Hypervisor                                     { return nil }
+func (vm *netTestVM) MemorySize() uint64                                            { return uint64(len(vm.memory)) }
+func (vm *netTestVM) MemoryBase() uint64                                            { return 0 }
+func (vm *netTestVM) Run(ctx context.Context, cfg hv.RunConfig) error               { return nil }
 func (vm *netTestVM) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error { return nil }
-func (vm *netTestVM) AddDevice(dev hv.Device) error                             { return nil }
+func (vm *netTestVM) AddDevice(dev hv.Device) error                                 { return nil }
 func (vm *netTestVM) AddDeviceFromTemplate(template hv.DeviceTemplate) (hv.Device, error) {
 	return nil, nil
 }
@@ -583,7 +583,7 @@ func TestNetRxSinglePacket(t *testing.T) {
 
 	// Inject packet from backend
 	packet := make([]byte, 64)
-	copy(packet[0:6], []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}) // Dst MAC
+	copy(packet[0:6], []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x01})  // Dst MAC
 	copy(packet[6:12], []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x02}) // Src MAC
 	binary.BigEndian.PutUint16(packet[12:14], 0x0800)
 	copy(packet[14:], []byte("Test packet"))

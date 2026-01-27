@@ -1249,4 +1249,3 @@ func getDisplayScale() float32 {
 	}
 	return 1.0
 }
-

@@ -1198,7 +1198,7 @@ const (
 
 func ForkExecWait(path string, argv []string, envp []string, forkErrLabel ir.Label, execErrLabel ir.Label, errVar ir.Var) ir.Fragment {
 	pid := ir.Var("forkPid")
-	savedPid := ir.Var("forkSavedPid")  // First copy of pid
+	savedPid := ir.Var("forkSavedPid")   // First copy of pid
 	savedPid2 := ir.Var("forkSavedPid2") // Second copy for extra safety
 	status := ir.Var("forkWaitStatus")
 	signal := ir.Var("forkSignal")

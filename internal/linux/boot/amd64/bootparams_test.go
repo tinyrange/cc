@@ -16,16 +16,16 @@ type stubVM struct {
 }
 
 // SetIRQ implements [hv.VirtualMachine].
-func (s *stubVM) SetIRQ(irqLine uint32, level bool) error                { panic("unimplemented") }
-func (s *stubVM) CaptureSnapshot() (hv.Snapshot, error)                  { panic("unimplemented") }
-func (s *stubVM) RestoreSnapshot(snap hv.Snapshot) error                 { panic("unimplemented") }
-func (s *stubVM) AddDevice(dev hv.Device) error                          { panic("unimplemented") }
+func (s *stubVM) SetIRQ(irqLine uint32, level bool) error { panic("unimplemented") }
+func (s *stubVM) CaptureSnapshot() (hv.Snapshot, error)   { panic("unimplemented") }
+func (s *stubVM) RestoreSnapshot(snap hv.Snapshot) error  { panic("unimplemented") }
+func (s *stubVM) AddDevice(dev hv.Device) error           { panic("unimplemented") }
 func (s *stubVM) AddDeviceFromTemplate(template hv.DeviceTemplate) (hv.Device, error) {
 	panic("unimplemented")
 }
-func (s *stubVM) Close() error                                           { panic("unimplemented") }
-func (s *stubVM) Hypervisor() hv.Hypervisor                              { panic("unimplemented") }
-func (s *stubVM) Run(ctx context.Context, cfg hv.RunConfig) error        { panic("unimplemented") }
+func (s *stubVM) Close() error                                    { panic("unimplemented") }
+func (s *stubVM) Hypervisor() hv.Hypervisor                       { panic("unimplemented") }
+func (s *stubVM) Run(ctx context.Context, cfg hv.RunConfig) error { panic("unimplemented") }
 func (s *stubVM) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error {
 	panic("unimplemented")
 }

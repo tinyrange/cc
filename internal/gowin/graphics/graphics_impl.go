@@ -434,25 +434,25 @@ func (f glFrame) renderQuadWithUV(x, y, width, height float32, tex Texture, c co
 		// Flipped V for FBO textures: read from (0,1) at top, (0,0) at bottom
 		vertices = [6 * 8]float32{
 			// Triangle 1
-			x, y, 0, 1, rgba[0], rgba[1], rgba[2], rgba[3],                         // top-left
-			x + width, y, 1, 1, rgba[0], rgba[1], rgba[2], rgba[3],                 // top-right
-			x, y + height, 0, 0, rgba[0], rgba[1], rgba[2], rgba[3],                // bottom-left
+			x, y, 0, 1, rgba[0], rgba[1], rgba[2], rgba[3], // top-left
+			x + width, y, 1, 1, rgba[0], rgba[1], rgba[2], rgba[3], // top-right
+			x, y + height, 0, 0, rgba[0], rgba[1], rgba[2], rgba[3], // bottom-left
 			// Triangle 2
-			x + width, y, 1, 1, rgba[0], rgba[1], rgba[2], rgba[3],                 // top-right
-			x + width, y + height, 1, 0, rgba[0], rgba[1], rgba[2], rgba[3],        // bottom-right
-			x, y + height, 0, 0, rgba[0], rgba[1], rgba[2], rgba[3],                // bottom-left
+			x + width, y, 1, 1, rgba[0], rgba[1], rgba[2], rgba[3], // top-right
+			x + width, y + height, 1, 0, rgba[0], rgba[1], rgba[2], rgba[3], // bottom-right
+			x, y + height, 0, 0, rgba[0], rgba[1], rgba[2], rgba[3], // bottom-left
 		}
 	} else {
 		// Standard UV for normal textures: (0,0) at top-left
 		vertices = [6 * 8]float32{
 			// Triangle 1
-			x, y, 0, 0, rgba[0], rgba[1], rgba[2], rgba[3],                         // top-left
-			x + width, y, 1, 0, rgba[0], rgba[1], rgba[2], rgba[3],                 // top-right
-			x, y + height, 0, 1, rgba[0], rgba[1], rgba[2], rgba[3],                // bottom-left
+			x, y, 0, 0, rgba[0], rgba[1], rgba[2], rgba[3], // top-left
+			x + width, y, 1, 0, rgba[0], rgba[1], rgba[2], rgba[3], // top-right
+			x, y + height, 0, 1, rgba[0], rgba[1], rgba[2], rgba[3], // bottom-left
 			// Triangle 2
-			x + width, y, 1, 0, rgba[0], rgba[1], rgba[2], rgba[3],                 // top-right
-			x + width, y + height, 1, 1, rgba[0], rgba[1], rgba[2], rgba[3],        // bottom-right
-			x, y + height, 0, 1, rgba[0], rgba[1], rgba[2], rgba[3],                // bottom-left
+			x + width, y, 1, 0, rgba[0], rgba[1], rgba[2], rgba[3], // top-right
+			x + width, y + height, 1, 1, rgba[0], rgba[1], rgba[2], rgba[3], // bottom-right
+			x, y + height, 0, 1, rgba[0], rgba[1], rgba[2], rgba[3], // bottom-left
 		}
 	}
 

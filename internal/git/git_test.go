@@ -36,12 +36,13 @@ func testRepo(t *testing.T) (*Repository, func()) {
 		t.Fatalf("git init failed: %v\n%s", err, out)
 	}
 
-	// Configure user and disable signing
+	// Configure user, disable signing, and prevent line ending conversion
 	for _, args := range [][]string{
 		{"config", "user.name", "Test User"},
 		{"config", "user.email", "test@example.com"},
 		{"config", "commit.gpgsign", "false"},
 		{"config", "tag.gpgsign", "false"},
+		{"config", "core.autocrlf", "false"},
 	} {
 		cmd := exec.Command("git", args...)
 		cmd.Dir = dir

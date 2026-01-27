@@ -1669,7 +1669,14 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 	vm := bindings.HvVmCreate(vmConfig)
 	if vm != bindings.HV_SUCCESS {
 		bindings.OsRelease(uintptr(vmConfig))
-		return nil, fmt.Errorf("failed to create VM: %d", vm)
+		// HV_UNSUPPORTED, HV_DENIED, HV_NO_DEVICE, and HV_ERROR typically indicate
+		// the hypervisor is not available (no entitlements, running in CI, etc.)
+		switch vm {
+		case bindings.HV_UNSUPPORTED, bindings.HV_DENIED, bindings.HV_NO_DEVICE, bindings.HV_ERROR:
+			return nil, fmt.Errorf("%w: %s", hv.ErrHypervisorUnsupported, vm)
+		default:
+			return nil, fmt.Errorf("failed to create VM: %s", vm)
+		}
 	}
 	bindings.OsRelease(uintptr(vmConfig))
 

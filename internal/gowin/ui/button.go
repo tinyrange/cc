@@ -64,10 +64,10 @@ type Button struct {
 	textWidth float32
 
 	// Rounded corner rendering
-	gfxWindow      graphics.Window
-	shapeBuilder   *graphics.ShapeBuilder
-	lastBounds     Rect
-	lastBgColor    color.Color
+	gfxWindow       graphics.Window
+	shapeBuilder    *graphics.ShapeBuilder
+	lastBounds      Rect
+	lastBgColor     color.Color
 	lastUseGradient bool
 }
 

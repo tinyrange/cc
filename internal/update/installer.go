@@ -594,7 +594,6 @@ func validatePathForScript(path string) error {
 	return nil
 }
 
-
 // removeWindowsShortcut removes the Start Menu shortcut.
 func removeWindowsShortcut() error {
 	appData := os.Getenv("APPDATA")

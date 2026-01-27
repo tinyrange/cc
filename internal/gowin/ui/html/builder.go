@@ -597,10 +597,10 @@ func (b *builder) buildHeading(n *node) ui.Widget {
 func (b *builder) buildGradientLabel(text string, textSize float64) ui.Widget {
 	// CrumbleCracker gradient: #FF9500 0% → #F43F7A 40% → #8B5CF6 70% → #06B6D4 100%
 	stops := []graphics.ColorStop{
-		{Position: 0.0, Color: color.RGBA{R: 0xFF, G: 0x95, B: 0x00, A: 255}},  // mango-500
-		{Position: 0.4, Color: color.RGBA{R: 0xF4, G: 0x3F, B: 0x7A, A: 255}},  // berry-500
-		{Position: 0.7, Color: color.RGBA{R: 0x8B, G: 0x5C, B: 0xF6, A: 255}},  // grape-500
-		{Position: 1.0, Color: color.RGBA{R: 0x06, G: 0xB6, B: 0xD4, A: 255}},  // ocean-500
+		{Position: 0.0, Color: color.RGBA{R: 0xFF, G: 0x95, B: 0x00, A: 255}}, // mango-500
+		{Position: 0.4, Color: color.RGBA{R: 0xF4, G: 0x3F, B: 0x7A, A: 255}}, // berry-500
+		{Position: 0.7, Color: color.RGBA{R: 0x8B, G: 0x5C, B: 0xF6, A: 255}}, // grape-500
+		{Position: 1.0, Color: color.RGBA{R: 0x06, G: 0xB6, B: 0xD4, A: 255}}, // ocean-500
 	}
 
 	return ui.NewGradientLabel(text).
@@ -1314,9 +1314,9 @@ func (b *builder) buildTable(n *node) ui.Widget {
 	}
 
 	// Colors for light theme
-	headerBg := color.RGBA{R: 0xe9, G: 0xd5, B: 0xff, A: 255}   // grape-200 (light purple)
-	headerText := color.RGBA{R: 0x44, G: 0x40, B: 0x3c, A: 255} // ink-700 (dark text)
-	cellText := color.RGBA{R: 0x44, G: 0x40, B: 0x3c, A: 255}   // ink-700
+	headerBg := color.RGBA{R: 0xe9, G: 0xd5, B: 0xff, A: 255}    // grape-200 (light purple)
+	headerText := color.RGBA{R: 0x44, G: 0x40, B: 0x3c, A: 255}  // ink-700 (dark text)
+	cellText := color.RGBA{R: 0x44, G: 0x40, B: 0x3c, A: 255}    // ink-700
 	borderColor := color.RGBA{R: 0xe8, G: 0xe2, B: 0xdc, A: 255} // light border
 
 	container := ui.Column().WithGap(0)

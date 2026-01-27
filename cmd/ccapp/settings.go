@@ -14,10 +14,10 @@ type AppSettings struct {
 	AutoUpdateEnabled     bool      `json:"auto_update_enabled"`
 	InstallPath           string    `json:"install_path,omitempty"`
 	InstalledAt           time.Time `json:"installed_at,omitempty"`
-	CleanupPending        string    `json:"cleanup_pending,omitempty"`    // Path to delete on next startup
+	CleanupPending        string    `json:"cleanup_pending,omitempty"`     // Path to delete on next startup
 	CleanupRetryCount     int       `json:"cleanup_retry_count,omitempty"` // Number of cleanup retry attempts
-	CreateDesktopShortcut bool      `json:"create_desktop_shortcut"`      // Create desktop/start menu shortcut (Windows/Linux)
-	SnapshotCacheEnabled  bool      `json:"snapshot_cache_enabled"`       // Enable VM boot snapshot caching (default: false)
+	CreateDesktopShortcut bool      `json:"create_desktop_shortcut"`       // Create desktop/start menu shortcut (Windows/Linux)
+	SnapshotCacheEnabled  bool      `json:"snapshot_cache_enabled"`        // Enable VM boot snapshot caching (default: false)
 }
 
 // SettingsStore manages persistent storage of application settings

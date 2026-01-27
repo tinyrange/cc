@@ -33,13 +33,13 @@ type Arm64LocalInterruptControllerState struct {
 	GicVersion uint8
 	Reserved0  [6]uint8
 
-	IccIgrpen1El1     uint64
+	IccIgrpen1El1      uint64
 	GicrCtlrEnableLpis uint64
-	IccBpr1El1        uint64
-	IccPmrEl1         uint64
-	GicrPropbaser     uint64
-	GicrPendbaser     uint64
-	IchAp1REl2        [4]uint32
+	IccBpr1El1         uint64
+	IccPmrEl1          uint64
+	GicrPropbaser      uint64
+	GicrPendbaser      uint64
+	IchAp1REl2         [4]uint32
 
 	// BankedInterruptState contains state for 32 banked interrupts (SGIs and PPIs).
 	BankedInterruptState [32]Arm64InterruptState
@@ -54,10 +54,10 @@ type Arm64GlobalInterruptState struct {
 // Arm64GlobalInterruptControllerStateHeader is the fixed-size header of the global GIC state.
 // The full state is variable size: header + NumInterrupts * Arm64GlobalInterruptState
 type Arm64GlobalInterruptControllerStateHeader struct {
-	Version       uint8
-	GicVersion    uint8
-	Reserved0     [2]uint8
-	NumInterrupts uint32
+	Version             uint8
+	GicVersion          uint8
+	Reserved0           [2]uint8
+	NumInterrupts       uint32
 	GicdCtlrEnableGrp1A uint64
 }
 

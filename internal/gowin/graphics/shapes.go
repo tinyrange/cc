@@ -31,7 +31,7 @@ const (
 
 // ColorStop defines a color at a specific position in a gradient.
 type ColorStop struct {
-	Position float32     // 0.0 to 1.0
+	Position float32 // 0.0 to 1.0
 	Color    color.Color
 }
 
@@ -193,10 +193,10 @@ func interpolateColor(style ShapeStyle, px, py, rx, ry, rw, rh float32) [4]float
 		t = (px - rx) / rw
 	case GradientDiagonalTL:
 		// 135deg: top-left (0,0) = 0.0, bottom-right (1,1) = 1.0
-		t = ((px - rx) / rw + (py - ry) / rh) / 2
+		t = ((px-rx)/rw + (py-ry)/rh) / 2
 	case GradientDiagonalTR:
 		// 45deg: top-right (1,0) = 0.0, bottom-left (0,1) = 1.0
-		t = ((rw - (px - rx)) / rw + (py - ry) / rh) / 2
+		t = ((rw-(px-rx))/rw + (py-ry)/rh) / 2
 	}
 
 	t = clampf(t, 0, 1)

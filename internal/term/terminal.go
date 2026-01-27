@@ -131,7 +131,6 @@ type View struct {
 	// pendingEvents holds events to process instead of draining.
 	// If non-nil, Step uses these events and clears the slice.
 	pendingEvents []window.InputEvent
-
 }
 
 // Point represents a cell position in the terminal grid.

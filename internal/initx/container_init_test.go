@@ -38,4 +38,3 @@ func TestBuildContainerInitProgram_Compiles(t *testing.T) {
 		})
 	}
 }
-

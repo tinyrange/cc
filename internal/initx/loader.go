@@ -135,7 +135,6 @@ func (p *programLoader) Init(vm hv.VirtualMachine) error {
 	return nil
 }
 
-
 func (p *programLoader) LoadProgram(prog *ir.Program) error {
 	asmProg, err := ir.BuildStandaloneProgramForArch(p.arch, prog)
 	if err != nil {

@@ -67,13 +67,13 @@ func (vm *fsTestVM) GetIRQ(line uint32) bool {
 }
 
 // Implement other required hv.VirtualMachine methods as no-ops
-func (vm *fsTestVM) Close() error                                              { return nil }
-func (vm *fsTestVM) Hypervisor() hv.Hypervisor                                 { return nil }
-func (vm *fsTestVM) MemorySize() uint64                                        { return uint64(len(vm.memory)) }
-func (vm *fsTestVM) MemoryBase() uint64                                        { return 0 }
-func (vm *fsTestVM) Run(ctx context.Context, cfg hv.RunConfig) error           { return nil }
+func (vm *fsTestVM) Close() error                                                  { return nil }
+func (vm *fsTestVM) Hypervisor() hv.Hypervisor                                     { return nil }
+func (vm *fsTestVM) MemorySize() uint64                                            { return uint64(len(vm.memory)) }
+func (vm *fsTestVM) MemoryBase() uint64                                            { return 0 }
+func (vm *fsTestVM) Run(ctx context.Context, cfg hv.RunConfig) error               { return nil }
 func (vm *fsTestVM) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error { return nil }
-func (vm *fsTestVM) AddDevice(dev hv.Device) error                             { return nil }
+func (vm *fsTestVM) AddDevice(dev hv.Device) error                                 { return nil }
 func (vm *fsTestVM) AddDeviceFromTemplate(template hv.DeviceTemplate) (hv.Device, error) {
 	return nil, nil
 }
@@ -112,8 +112,8 @@ const (
 	fsTestReqUsedRingAddr  = 0x112000
 
 	// Data buffers
-	fsTestBufferAddr     = 0x200000 // 2 MB
-	fsTestFileDataAddr   = 0x800000 // 8 MB - for file data storage
+	fsTestBufferAddr   = 0x200000 // 2 MB
+	fsTestFileDataAddr = 0x800000 // 8 MB - for file data storage
 )
 
 // fsMMIOHelper provides convenience methods for MMIO operations
@@ -274,9 +274,9 @@ type testFsNode struct {
 	uid      uint32
 	gid      uint32
 	size     uint64
-	data     []byte              // For files
-	children map[string]uint64   // For directories
-	target   string              // For symlinks
+	data     []byte            // For files
+	children map[string]uint64 // For directories
+	target   string            // For symlinks
 	xattrs   map[string][]byte
 	atime    time.Time
 	mtime    time.Time
@@ -318,7 +318,7 @@ func newTestFsBackend() *testFsBackend {
 		handles:    make(map[uint64]*testFsHandle),
 		dirHandles: make(map[uint64]*testFsHandle),
 		locks:      make(map[uint64][]testLockRange),
-		nextID:     2,  // 1 is reserved for root
+		nextID:     2, // 1 is reserved for root
 		nextFH:     1,
 	}
 	// Create root directory
@@ -1133,24 +1133,24 @@ func (be *testFsBackend) Flush(nodeID uint64, fh uint64, lockOwner uint64) int32
 
 // Verify interface implementations
 var (
-	_ FsBackend            = (*testFsBackend)(nil)
-	_ fsCreateBackend      = (*testFsBackend)(nil)
-	_ fsMkdirBackend       = (*testFsBackend)(nil)
-	_ fsMknodBackend       = (*testFsBackend)(nil)
-	_ fsWriteBackend       = (*testFsBackend)(nil)
-	_ fsOpenDirBackend     = (*testFsBackend)(nil)
+	_ FsBackend              = (*testFsBackend)(nil)
+	_ fsCreateBackend        = (*testFsBackend)(nil)
+	_ fsMkdirBackend         = (*testFsBackend)(nil)
+	_ fsMknodBackend         = (*testFsBackend)(nil)
+	_ fsWriteBackend         = (*testFsBackend)(nil)
+	_ fsOpenDirBackend       = (*testFsBackend)(nil)
 	_ fsReadDirHandleBackend = (*testFsBackend)(nil)
-	_ fsSymlinkBackend     = (*testFsBackend)(nil)
-	_ fsReadlinkBackend    = (*testFsBackend)(nil)
-	_ fsLinkBackend        = (*testFsBackend)(nil)
-	_ fsRenameBackend      = (*testFsBackend)(nil)
-	_ fsRemoveBackend      = (*testFsBackend)(nil)
-	_ fsSetattrBackend     = (*testFsBackend)(nil)
-	_ fsXattrBackend       = (*testFsBackend)(nil)
-	_ fsLseekBackend       = (*testFsBackend)(nil)
-	_ fsFallocateBackend   = (*testFsBackend)(nil)
-	_ fsLockBackend        = (*testFsBackend)(nil)
-	_ fsFlushBackend       = (*testFsBackend)(nil)
+	_ fsSymlinkBackend       = (*testFsBackend)(nil)
+	_ fsReadlinkBackend      = (*testFsBackend)(nil)
+	_ fsLinkBackend          = (*testFsBackend)(nil)
+	_ fsRenameBackend        = (*testFsBackend)(nil)
+	_ fsRemoveBackend        = (*testFsBackend)(nil)
+	_ fsSetattrBackend       = (*testFsBackend)(nil)
+	_ fsXattrBackend         = (*testFsBackend)(nil)
+	_ fsLseekBackend         = (*testFsBackend)(nil)
+	_ fsFallocateBackend     = (*testFsBackend)(nil)
+	_ fsLockBackend          = (*testFsBackend)(nil)
+	_ fsFlushBackend         = (*testFsBackend)(nil)
 )
 
 // -----------------------------------------------------------------------------
@@ -1252,10 +1252,10 @@ func (c *testFuseClient) sendRequest(opcode uint32, nodeID uint64, payload []byt
 
 func (c *testFuseClient) Init() error {
 	payload := make([]byte, 64)
-	binary.LittleEndian.PutUint32(payload[0:4], 7)  // Major
-	binary.LittleEndian.PutUint32(payload[4:8], 31) // Minor
+	binary.LittleEndian.PutUint32(payload[0:4], 7)         // Major
+	binary.LittleEndian.PutUint32(payload[4:8], 31)        // Minor
 	binary.LittleEndian.PutUint32(payload[8:12], 128*1024) // Max readahead
-	binary.LittleEndian.PutUint32(payload[12:16], 0) // Flags
+	binary.LittleEndian.PutUint32(payload[12:16], 0)       // Flags
 
 	_, errno, err := c.sendRequest(FUSE_INIT, 0, payload, 256)
 	if err != nil {

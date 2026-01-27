@@ -359,14 +359,14 @@ type fsNode struct {
 	entries        map[string]uint64
 	deletedEntries map[string]struct{} // tracks entries deleted from abstractDir to prevent re-creation
 	xattr          map[string][]byte
-	modTime  time.Time // best-effort mtime
-	aTime    time.Time // best-effort atime
-	ctime    time.Time // change time (metadata changes like chmod/chown/xattr)
-	nlink    uint32    // number of hard links (POSIX st_nlink); may be 0 when unlinked but still open
-	openRefs uint32    // open handle refcount (file handles + directory handles)
-	unlinked bool      // true once link count reaches 0 (or directory removed); inode may still be open
-	uid      uint32    // owner user ID
-	gid      uint32    // owner group ID
+	modTime        time.Time // best-effort mtime
+	aTime          time.Time // best-effort atime
+	ctime          time.Time // change time (metadata changes like chmod/chown/xattr)
+	nlink          uint32    // number of hard links (POSIX st_nlink); may be 0 when unlinked but still open
+	openRefs       uint32    // open handle refcount (file handles + directory handles)
+	unlinked       bool      // true once link count reaches 0 (or directory removed); inode may still be open
+	uid            uint32    // owner user ID
+	gid            uint32    // owner group ID
 
 	symlinkTarget string
 
