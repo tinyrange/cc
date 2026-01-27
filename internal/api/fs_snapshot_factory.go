@@ -47,6 +47,7 @@ type copyOp struct {
 	src         string // Host path
 	dst         string // Guest path
 	contentHash string // Hash of source content
+	hashErr     error  // Error from hashing source (checked at Apply time)
 }
 
 func (o *copyOp) CacheKey() string {
@@ -54,6 +55,9 @@ func (o *copyOp) CacheKey() string {
 }
 
 func (o *copyOp) Apply(ctx context.Context, inst Instance) error {
+	if o.hashErr != nil {
+		return fmt.Errorf("source %s: %w", o.src, o.hashErr)
+	}
 	// Read source file
 	data, err := os.ReadFile(o.src)
 	if err != nil {
@@ -116,8 +120,12 @@ func (f *FilesystemSnapshotFactory) Run(cmd ...string) *FilesystemSnapshotFactor
 // Copy adds a file copy operation from host to guest.
 func (f *FilesystemSnapshotFactory) Copy(src, dst string) *FilesystemSnapshotFactory {
 	// Compute content hash of source file
-	contentHash := ""
-	if data, err := os.ReadFile(src); err == nil {
+	var contentHash string
+	var hashErr error
+	data, err := os.ReadFile(src)
+	if err != nil {
+		hashErr = err
+	} else {
 		h := sha256.Sum256(data)
 		contentHash = hex.EncodeToString(h[:])
 	}
@@ -126,6 +134,7 @@ func (f *FilesystemSnapshotFactory) Copy(src, dst string) *FilesystemSnapshotFac
 		src:         src,
 		dst:         dst,
 		contentHash: contentHash,
+		hashErr:     hashErr,
 	})
 	return f
 }
@@ -228,6 +237,9 @@ func (f *FilesystemSnapshotFactory) Build(ctx context.Context) (FilesystemSnapsh
 			if err == nil {
 				snap, err := f.loadFromManifest(ctx, manifest)
 				if err == nil {
+					if currentSnap != baseSource {
+						currentSnap.Close()
+					}
 					currentSnap = snap
 					startIdx = i + 1
 					continue
