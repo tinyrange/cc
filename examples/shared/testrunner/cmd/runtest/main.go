@@ -33,19 +33,21 @@ func main() {
 	signal.Notify(sigCh, os.Interrupt)
 	go func() {
 		<-sigCh
-		fmt.Println("\nInterrupted, cleaning up...")
-		cancel()
+		runner.Output.Cleanup()
+		fmt.Println("\nInterrupted")
+		os.Exit(130) // 128 + SIGINT(2)
 	}()
 
 	// Run tests
 	results, err := runner.Run(ctx, patterns)
 	if err != nil {
+		runner.Output.Cleanup()
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
 	// Print summary
-	testrunner.PrintResults(results)
+	runner.PrintResults(results)
 
 	// Exit with error code if tests failed
 	if results.Failed > 0 {

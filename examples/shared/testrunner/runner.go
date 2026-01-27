@@ -23,12 +23,14 @@ type Runner struct {
 	Verbose   bool
 	KeepAlive bool
 	Parallel  int
+	Output    *Output
 }
 
 // NewRunner creates a new test runner.
 func NewRunner() *Runner {
 	return &Runner{
 		Parallel: 4, // Default parallelism for builds
+		Output:   NewOutput(),
 	}
 }
 
@@ -58,6 +60,22 @@ type TestResult struct {
 	Passed   bool
 	Error    string
 	Duration time.Duration
+	// Details contains additional context for debugging failures.
+	Details *TestResultDetails
+}
+
+// TestResultDetails provides additional context for test failures.
+type TestResultDetails struct {
+	// For CLI tests
+	Stdout   string
+	Stderr   string
+	ExitCode int
+	Args     []string
+	// For HTTP tests
+	Method     string
+	Path       string
+	StatusCode int
+	Body       string
 }
 
 // Run executes tests for all matching patterns.
@@ -78,6 +96,7 @@ func (r *Runner) Run(ctx context.Context, patterns []string) (*Results, error) {
 	// Load specs
 	specs := make([]*TestSpec, 0, len(specPaths))
 	specDirs := make([]string, 0, len(specPaths))
+	totalTests := 0
 	for _, path := range specPaths {
 		spec, err := LoadSpec(path)
 		if err != nil {
@@ -85,14 +104,20 @@ func (r *Runner) Run(ctx context.Context, patterns []string) (*Results, error) {
 		}
 		specs = append(specs, spec)
 		specDirs = append(specDirs, filepath.Dir(path))
+		if spec.IsCLI() {
+			totalTests += len(spec.CLITests)
+		} else {
+			totalTests += len(spec.Tests)
+		}
 	}
+
+	// Print banner
+	r.Output.PrintBanner(len(specs), totalTests)
 
 	// Build all binaries in parallel
-	if r.Verbose {
-		fmt.Printf("Building %d examples...\n", len(specs))
-	}
-
+	r.Output.StartSpinner(fmt.Sprintf("Building %d examples", len(specs)))
 	binaries, err := r.buildAll(ctx, specs, specDirs)
+	r.Output.StopSpinner()
 	if err != nil {
 		return nil, fmt.Errorf("building: %w", err)
 	}
@@ -103,7 +128,7 @@ func (r *Runner) Run(ctx context.Context, patterns []string) (*Results, error) {
 			break
 		}
 
-		result := r.runExample(ctx, spec, binaries[i])
+		result := r.runExample(ctx, spec, specDirs[i], binaries[i])
 		results.Examples = append(results.Examples, result)
 		results.Total += result.Total
 		results.Passed += result.Passed
@@ -236,12 +261,12 @@ func (r *Runner) buildExample(ctx context.Context, spec *TestSpec, dir string) (
 }
 
 // runExample runs tests for a single example.
-func (r *Runner) runExample(ctx context.Context, spec *TestSpec, binaryPath string) ExampleResult {
+func (r *Runner) runExample(ctx context.Context, spec *TestSpec, dir string, binaryPath string) ExampleResult {
 	start := time.Now()
 
 	// Handle CLI tests (no server)
 	if spec.IsCLI() {
-		return r.runCLIExample(ctx, spec, binaryPath)
+		return r.runCLIExample(ctx, spec, dir, binaryPath)
 	}
 
 	result := ExampleResult{
@@ -254,12 +279,18 @@ func (r *Runner) runExample(ctx context.Context, spec *TestSpec, binaryPath stri
 		defer os.Remove(binaryPath)
 	}
 
+	// Print example header
+	r.Output.PrintExampleHeader(spec.Name)
+
 	// Start server
+	r.Output.StartSpinner("Starting server")
 	server, err := r.startServer(ctx, spec, binaryPath)
+	r.Output.StopSpinner()
 	if err != nil {
 		result.Error = fmt.Sprintf("failed to start server: %v", err)
 		result.Failed = result.Total
 		result.Duration = time.Since(start)
+		r.Output.PrintExampleError(result.Error)
 		return result
 	}
 
@@ -269,34 +300,24 @@ func (r *Runner) runExample(ctx context.Context, spec *TestSpec, binaryPath stri
 
 	// Run test cases
 	for _, tc := range spec.Tests {
+		r.Output.StartTestRun(tc.Name)
 		tcResult := r.runTestCase(ctx, server, tc)
 		result.Tests = append(result.Tests, tcResult)
 		if tcResult.Passed {
 			result.Passed++
+			r.Output.PrintTestPass(tc.Name, tcResult.Duration)
 		} else {
 			result.Failed++
+			r.Output.PrintTestFail(tc.Name, tcResult.Error, dir, tcResult.Details)
 		}
 	}
 
 	result.Duration = time.Since(start)
-
-	// Print result
-	if result.Failed > 0 {
-		fmt.Printf("[FAIL] %s (%d/%d tests)\n", spec.Name, result.Passed, result.Total)
-		for _, tr := range result.Tests {
-			if !tr.Passed {
-				fmt.Printf("       - %s: %s\n", tr.Name, tr.Error)
-			}
-		}
-	} else if r.Verbose {
-		fmt.Printf("[PASS] %s (%d/%d tests)\n", spec.Name, result.Passed, result.Total)
-	}
-
 	return result
 }
 
 // runCLIExample runs CLI tests for a single example (no server).
-func (r *Runner) runCLIExample(ctx context.Context, spec *TestSpec, binaryPath string) ExampleResult {
+func (r *Runner) runCLIExample(ctx context.Context, spec *TestSpec, dir string, binaryPath string) ExampleResult {
 	start := time.Now()
 	result := ExampleResult{
 		Name:  spec.Name,
@@ -308,6 +329,9 @@ func (r *Runner) runCLIExample(ctx context.Context, spec *TestSpec, binaryPath s
 		defer os.Remove(binaryPath)
 	}
 
+	// Print example header
+	r.Output.PrintExampleHeader(spec.Name)
+
 	// Determine timeout
 	timeout := 30 * time.Second
 	if spec.CLI != nil && spec.CLI.Timeout.Duration() > 0 {
@@ -316,29 +340,19 @@ func (r *Runner) runCLIExample(ctx context.Context, spec *TestSpec, binaryPath s
 
 	// Run CLI test cases
 	for _, tc := range spec.CLITests {
+		r.Output.StartTestRun(tc.Name)
 		tcResult := r.runCLITestCase(ctx, spec, binaryPath, tc, timeout)
 		result.Tests = append(result.Tests, tcResult)
 		if tcResult.Passed {
 			result.Passed++
+			r.Output.PrintTestPass(tc.Name, tcResult.Duration)
 		} else {
 			result.Failed++
+			r.Output.PrintTestFail(tc.Name, tcResult.Error, dir, tcResult.Details)
 		}
 	}
 
 	result.Duration = time.Since(start)
-
-	// Print result
-	if result.Failed > 0 {
-		fmt.Printf("[FAIL] %s (%d/%d tests)\n", spec.Name, result.Passed, result.Total)
-		for _, tr := range result.Tests {
-			if !tr.Passed {
-				fmt.Printf("       - %s: %s\n", tr.Name, tr.Error)
-			}
-		}
-	} else if r.Verbose {
-		fmt.Printf("[PASS] %s (%d/%d tests)\n", spec.Name, result.Passed, result.Total)
-	}
-
 	return result
 }
 
@@ -385,6 +399,12 @@ func (r *Runner) runCLITestCase(ctx context.Context, spec *TestSpec, binaryPath 
 			exitCode = exitErr.ExitCode()
 		} else if testCtx.Err() == context.DeadlineExceeded {
 			result.Error = "test timed out"
+			result.Details = &TestResultDetails{
+				Args:     tc.Args,
+				ExitCode: -1,
+				Stdout:   stdout.String(),
+				Stderr:   stderr.String(),
+			}
 			result.Duration = time.Since(start)
 			return result
 		}
@@ -394,6 +414,12 @@ func (r *Runner) runCLITestCase(ctx context.Context, spec *TestSpec, binaryPath 
 	errors := AssertCLIOutput(stdout.String(), stderr.String(), exitCode, tc.Expect)
 	if len(errors) > 0 {
 		result.Error = FormatErrors(errors)
+		result.Details = &TestResultDetails{
+			Args:     tc.Args,
+			ExitCode: exitCode,
+			Stdout:   stdout.String(),
+			Stderr:   stderr.String(),
+		}
 	} else {
 		result.Passed = true
 	}
@@ -518,6 +544,10 @@ func (r *Runner) runTestCase(ctx context.Context, server *Server, tc TestCase) T
 	req, err := r.buildRequest(ctx, server.baseURL, tc)
 	if err != nil {
 		result.Error = fmt.Sprintf("building request: %v", err)
+		result.Details = &TestResultDetails{
+			Method: tc.Method,
+			Path:   tc.Path,
+		}
 		result.Duration = time.Since(start)
 		return result
 	}
@@ -526,6 +556,10 @@ func (r *Runner) runTestCase(ctx context.Context, server *Server, tc TestCase) T
 	resp, err := server.client.Do(req)
 	if err != nil {
 		result.Error = fmt.Sprintf("request failed: %v", err)
+		result.Details = &TestResultDetails{
+			Method: tc.Method,
+			Path:   tc.Path,
+		}
 		result.Duration = time.Since(start)
 		return result
 	}
@@ -535,6 +569,11 @@ func (r *Runner) runTestCase(ctx context.Context, server *Server, tc TestCase) T
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		result.Error = fmt.Sprintf("reading response: %v", err)
+		result.Details = &TestResultDetails{
+			Method:     tc.Method,
+			Path:       tc.Path,
+			StatusCode: resp.StatusCode,
+		}
 		result.Duration = time.Since(start)
 		return result
 	}
@@ -550,6 +589,12 @@ func (r *Runner) runTestCase(ctx context.Context, server *Server, tc TestCase) T
 	errors := AssertResponse(response, tc.Expect)
 	if len(errors) > 0 {
 		result.Error = FormatErrors(errors)
+		result.Details = &TestResultDetails{
+			Method:     tc.Method,
+			Path:       tc.Path,
+			StatusCode: resp.StatusCode,
+			Body:       string(body),
+		}
 	} else {
 		result.Passed = true
 	}
@@ -625,10 +670,7 @@ func findAvailablePort() (int, error) {
 	return listener.Addr().(*net.TCPAddr).Port, nil
 }
 
-// PrintResults prints a summary of test results.
-func PrintResults(results *Results) {
-	fmt.Println()
-	fmt.Printf("Results: %d examples, %d tests, %d passed, %d failed\n",
-		len(results.Examples), results.Total, results.Passed, results.Failed)
-	fmt.Printf("Duration: %s\n", results.Duration.Round(time.Millisecond))
+// PrintResults prints a summary of test results using the runner's output.
+func (r *Runner) PrintResults(results *Results) {
+	r.Output.PrintResults(results)
 }

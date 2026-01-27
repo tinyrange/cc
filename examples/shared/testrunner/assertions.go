@@ -318,10 +318,11 @@ func truncate(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
-	return s[:maxLen] + "..."
+	return s[:maxLen] + fmt.Sprintf("... (%d bytes total)", len(s))
 }
 
 // FormatErrors formats multiple errors into a single string.
+// Uses newlines for separation to preserve readability.
 func FormatErrors(errors []error) string {
 	if len(errors) == 0 {
 		return ""
@@ -330,7 +331,7 @@ func FormatErrors(errors []error) string {
 	for _, err := range errors {
 		msgs = append(msgs, err.Error())
 	}
-	return strings.Join(msgs, "; ")
+	return strings.Join(msgs, "\n")
 }
 
 // AssertHeaders checks response headers match expectations.
