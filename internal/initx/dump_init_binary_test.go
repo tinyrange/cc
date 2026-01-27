@@ -38,7 +38,7 @@ func TestDumpInitBinary(t *testing.T) {
 	t.Logf("Binary size: %d bytes", len(binary))
 
 	// Write to file
-	outPath := "/tmp/init_binary.bin"
+	outPath := t.TempDir() + "/init_binary.bin"
 	if err := os.WriteFile(outPath, binary, 0644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
