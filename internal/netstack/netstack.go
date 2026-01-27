@@ -1768,6 +1768,7 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 				// Update RTT estimator with sample from non-retransmitted segment
 				if hasRTT && c.rttEst != nil {
 					c.rttEst.update(rttSample)
+					c.rttEst.resetBackoff()
 				}
 
 				// Manage retransmit timer
@@ -2255,8 +2256,14 @@ func (c *tcpConn) onRetxTimeout() {
 		return
 	}
 
-	// Get oldest unacked segment
-	seg, ok := c.sendBuf.oldest()
+	// Determine MSS for coalescing
+	mss := int(c.mss)
+	if mss == 0 {
+		mss = defaultMSS
+	}
+
+	// Get oldest unacked segments, coalesced up to MSS
+	seg, coalescedCount, ok := c.sendBuf.oldestCoalesced(mss)
 	if !ok {
 		// No unacked data - clear timer and return
 		c.retxTimerMu.Lock()
@@ -2309,10 +2316,10 @@ func (c *tcpConn) onRetxTimeout() {
 	rto = c.rttEst.getRTO() // Get updated RTO after backoff
 	c.mu.Unlock()
 
-	// Mark segment as retransmitted
-	c.sendBuf.markRetransmitted()
+	// Mark coalesced segments as retransmitted
+	c.sendBuf.markRetransmittedN(coalescedCount)
 
-	debug.Writef("netstack.tcpConn retransmitting segment", "seq=%d len=%d retxCount=%d", seg.seqStart, len(seg.payload), seg.retxCount+1)
+	debug.Writef("netstack.tcpConn retransmitting segment", "seq=%d len=%d retxCount=%d coalesced=%d", seg.seqStart, len(seg.payload), seg.retxCount+1, coalescedCount)
 
 	// Retransmit
 	_ = c.stack.sendTCPPacket(c.localIPv4, c.key, seg.seqStart, ack, tcpFlagACK, seg.payload)
