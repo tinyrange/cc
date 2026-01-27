@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -234,7 +235,12 @@ func (r *Runner) buildExample(ctx context.Context, spec *TestSpec, dir string) (
 	}
 
 	// Create temp file for binary
-	tmpFile, err := os.CreateTemp("", "testrunner-*")
+	// On Windows, we need .exe extension for executables
+	pattern := "testrunner-*"
+	if runtime.GOOS == "windows" {
+		pattern = "testrunner-*.exe"
+	}
+	tmpFile, err := os.CreateTemp("", pattern)
 	if err != nil {
 		return "", fmt.Errorf("creating temp file: %w", err)
 	}
