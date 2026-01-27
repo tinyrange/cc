@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -270,6 +271,10 @@ func (inst *instance) start() error {
 	if err != nil {
 		inst.ns.Close()
 		inst.h.Close()
+		// Check if the error indicates hypervisor unavailability (e.g., CI, no entitlements)
+		if errors.Is(err, hv.ErrHypervisorUnsupported) {
+			return &Error{Op: "new", Err: fmt.Errorf("%w: %v", ErrHypervisorUnavailable, err)}
+		}
 		return &Error{Op: "new", Err: fmt.Errorf("create VM: %w", err)}
 	}
 

@@ -887,11 +887,11 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 func Open() (hv.Hypervisor, error) {
 	present, err := bindings.IsHypervisorPresent()
 	if err != nil {
-		return nil, fmt.Errorf("whp: check hypervisor present: %w", err)
+		return nil, fmt.Errorf("%w: check hypervisor present: %v", hv.ErrHypervisorUnsupported, err)
 	}
 
 	if !present {
-		return nil, fmt.Errorf("whp: hypervisor not present")
+		return nil, fmt.Errorf("%w: hypervisor not present", hv.ErrHypervisorUnsupported)
 	}
 
 	return &hypervisor{}, nil
