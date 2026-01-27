@@ -1,8 +1,9 @@
 // compile_go demonstrates compiling and running Go code in a sandboxed environment.
 //
 // This example shows how to:
+// - Use FilesystemSnapshotFactory to cache the Go build environment
 // - Pull an OCI image (golang:1.22-alpine)
-// - Create a sandbox instance
+// - Create a sandbox instance from a cached snapshot
 // - Write Go source code to the filesystem
 // - Compile the code using go build
 // - Execute the compiled binary
@@ -55,18 +56,28 @@ func run(code string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout+10*time.Second)
 	defer cancel()
 
-	// Create OCI client and pull Go image
+	// Create OCI client
 	client, err := cc.NewOCIClient()
 	if err != nil {
 		return fmt.Errorf("creating OCI client: %w", err)
 	}
-	source, err := client.Pull(ctx, "golang:1.22-alpine")
-	if err != nil {
-		return fmt.Errorf("pulling image: %w", err)
-	}
 
-	// Create sandbox instance
-	instance, err := cc.New(source,
+	// Use FilesystemSnapshotFactory to cache Go environment setup
+	// This caches the base image with GOCACHE directory prepared
+	cacheDir := shared.GetCacheDir()
+	snap, err := cc.NewFilesystemSnapshotFactory(client, cacheDir).
+		From("golang:1.22-alpine").
+		Env("GOCACHE=/tmp/gocache").
+		Run("mkdir", "-p", "/tmp/gocache").
+		Exclude("/tmp/*").
+		Build(ctx)
+	if err != nil {
+		return fmt.Errorf("building snapshot: %w", err)
+	}
+	defer snap.Close()
+
+	// Create sandbox instance from the cached snapshot
+	instance, err := cc.New(snap,
 		cc.WithMemoryMB(512),
 		cc.WithTimeout(timeout+5*time.Second),
 		cc.WithEnv("GOCACHE=/tmp/gocache"),

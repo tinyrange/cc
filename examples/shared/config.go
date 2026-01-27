@@ -2,6 +2,7 @@ package shared
 
 import (
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 )
@@ -72,4 +73,17 @@ func LoadBaseConfig() BaseConfig {
 		DefaultTimeout:  GetEnvDuration("DEFAULT_TIMEOUT", 30*time.Second),
 		MaxConcurrent:   GetEnvInt("MAX_CONCURRENT", 10),
 	}
+}
+
+// GetCacheDir returns a directory for caching filesystem snapshots.
+// Uses CC_CACHE_DIR env var, or falls back to user cache directory.
+func GetCacheDir() string {
+	if dir := os.Getenv("CC_CACHE_DIR"); dir != "" {
+		return dir
+	}
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		return os.TempDir()
+	}
+	return filepath.Join(cacheDir, "cc", "snapshots")
 }

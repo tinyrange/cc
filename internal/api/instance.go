@@ -22,6 +22,7 @@ import (
 	"github.com/tinyrange/cc/internal/initx"
 	"github.com/tinyrange/cc/internal/linux/kernel"
 	"github.com/tinyrange/cc/internal/netstack"
+	"github.com/tinyrange/cc/internal/oci"
 	"github.com/tinyrange/cc/internal/timeslice"
 	"github.com/tinyrange/cc/internal/vfs"
 )
@@ -85,7 +86,14 @@ type instance struct {
 	h       hv.Hypervisor
 	session *initx.Session
 	ns      *netstack.NetStack
-	src     *ociSource
+
+	// Source components (extracted from ociSource or fsSnapshotSource)
+	abstractRoot vfs.AbstractDir
+	imageConfig  *oci.RuntimeConfig
+	arch         hv.CpuArchitecture
+
+	// Original source (for snapshotting - stores *ociSource or *fsSnapshotSource)
+	source InstanceSource
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -113,8 +121,21 @@ func New(source InstanceSource, opts ...Option) (Instance, error) {
 		return nil, &Error{Op: "new", Err: err}
 	}
 
-	src, ok := source.(*ociSource)
-	if !ok {
+	// Extract components from source (supports ociSource and fsSnapshotSource)
+	var abstractRoot vfs.AbstractDir
+	var imageConfig *oci.RuntimeConfig
+	var arch hv.CpuArchitecture
+
+	switch src := source.(type) {
+	case *ociSource:
+		abstractRoot = src.cfs
+		imageConfig = &src.image.Config
+		arch = src.arch
+	case *fsSnapshotSource:
+		abstractRoot = src.lcfs
+		imageConfig = &src.baseImage.Config
+		arch = src.arch
+	default:
 		return nil, &Error{Op: "new", Err: fmt.Errorf("unsupported source type: %T", source)}
 	}
 
@@ -131,7 +152,10 @@ func New(source InstanceSource, opts ...Option) (Instance, error) {
 
 	inst := &instance{
 		id:             generateID(),
-		src:            src,
+		abstractRoot:   abstractRoot,
+		imageConfig:    imageConfig,
+		arch:           arch,
+		source:         source,
 		ctx:            ctx,
 		cancel:         cancel,
 		memoryMB:       cfg.memoryMB,
@@ -161,7 +185,7 @@ func (inst *instance) start() error {
 		return &Error{Op: "new", Err: fmt.Errorf("%w: %v", ErrHypervisorUnavailable, err)}
 	}
 
-	arch := inst.src.arch
+	arch := inst.arch
 	if arch == "" || arch == hv.ArchitectureInvalid {
 		arch = inst.h.Architecture()
 	}
@@ -180,7 +204,7 @@ func (inst *instance) start() error {
 	inst.fsBackend = fsBackend
 
 	// Set the container filesystem as the root
-	if err := fsBackend.SetAbstractRoot(inst.src.cfs); err != nil {
+	if err := fsBackend.SetAbstractRoot(inst.abstractRoot); err != nil {
 		inst.h.Close()
 		return &Error{Op: "new", Err: fmt.Errorf("set filesystem root: %w", err)}
 	}
@@ -234,14 +258,14 @@ func (inst *instance) start() error {
 	// Determine workdir
 	workdir := inst.workdir
 	if workdir == "" {
-		workdir = inst.src.image.Config.WorkingDir
+		workdir = inst.imageConfig.WorkingDir
 		if workdir == "" {
 			workdir = "/"
 		}
 	}
 
 	// Merge environment
-	env := append([]string{}, inst.src.image.Config.Env...)
+	env := append([]string{}, inst.imageConfig.Env...)
 	env = append(env, inst.env...)
 
 	// Create VM options
@@ -279,9 +303,9 @@ func (inst *instance) start() error {
 	}
 
 	// Get command from image config
-	cmd := inst.src.image.Config.Entrypoint
-	if len(inst.src.image.Config.Cmd) > 0 {
-		cmd = append(cmd, inst.src.image.Config.Cmd...)
+	cmd := inst.imageConfig.Entrypoint
+	if len(inst.imageConfig.Cmd) > 0 {
+		cmd = append(cmd, inst.imageConfig.Cmd...)
 	}
 	if len(cmd) == 0 {
 		cmd = []string{"/bin/sh"}
@@ -508,6 +532,10 @@ func (inst *instance) Chtimes(name string, atime, mtime time.Time) error {
 	return inst.WithContext(inst.ctx).Chtimes(name, atime, mtime)
 }
 
+func (inst *instance) SnapshotFilesystem(opts ...FilesystemSnapshotOption) (FilesystemSnapshot, error) {
+	return inst.WithContext(inst.ctx).SnapshotFilesystem(opts...)
+}
+
 // Exec interface methods
 
 func (inst *instance) Command(name string, args ...string) Cmd {
@@ -516,7 +544,7 @@ func (inst *instance) Command(name string, args ...string) Cmd {
 
 func (inst *instance) CommandContext(ctx context.Context, name string, args ...string) Cmd {
 	// Merge environment: image config env + instance options env
-	env := append([]string{}, inst.src.image.Config.Env...)
+	env := append([]string{}, inst.imageConfig.Env...)
 	env = append(env, inst.env...)
 
 	return &instanceCmd{

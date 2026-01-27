@@ -43,8 +43,9 @@ func (c *ociClient) Pull(ctx context.Context, imageRef string, opts ...OCIPullOp
 	}
 
 	return &ociSource{
-		image: image,
-		cfs:   cfs,
-		arch:  cfg.arch,
+		image:    image,
+		cfs:      cfs,
+		arch:     cfg.arch,
+		imageRef: imageRef,
 	}, nil
 }

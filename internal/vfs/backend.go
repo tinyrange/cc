@@ -16,6 +16,7 @@ import (
 
 	"github.com/tinyrange/cc/internal/debug"
 	"github.com/tinyrange/cc/internal/devices/virtio"
+	"github.com/tinyrange/cc/internal/fslayer"
 	linux "github.com/tinyrange/cc/internal/linux/defs/amd64"
 )
 
@@ -2634,6 +2635,10 @@ type VirtioFsBackend interface {
 	SetAbstractRoot(dir AbstractDir) error
 	// AddKernelModules adds kernel module files at /lib/modules/<version>/.
 	AddKernelModules(version string, files []ModuleFile) error
+	// CaptureLayer captures all filesystem modifications as a layer.
+	CaptureLayer(opts *SnapshotOptions) (*fslayer.LayerData, error)
+	// FreezeCurrentLayer marks the current state as a layer boundary.
+	FreezeCurrentLayer() uint64
 }
 
 // AddAbstractFile adds an abstract file at the specified path.

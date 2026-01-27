@@ -486,17 +486,17 @@ func (o *Output) PrintResults(results *Results) {
 	if o.isTTY {
 		if results.Failed > 0 {
 			fmt.Println(o.color(colorRed+colorBold, "╭"+strings.Repeat("─", 40)+"╮"))
-			fmt.Printf("%s  %s  %s\n",
+			fmt.Printf("%s%s%s\n",
 				o.color(colorRed+colorBold, "│"),
 				o.color(colorRed+colorBold, padCenter(fmt.Sprintf("FAILED: %d/%d tests passed", results.Passed, results.Total), 40)),
 				o.color(colorRed+colorBold, "│"))
 			fmt.Println(o.color(colorRed+colorBold, "╰"+strings.Repeat("─", 40)+"╯"))
 		} else {
 			fmt.Println(o.color(colorGreen+colorBold, "╭"+strings.Repeat("─", 40)+"╮"))
-			fmt.Printf("%s  %s  %s\n",
+			fmt.Printf("%s%s%s\n",
 				o.color(colorGreen+colorBold, "│"),
 				o.color(colorGreen+colorBold, padCenter(fmt.Sprintf("PASSED: %d/%d tests", results.Passed, results.Total), 40)),
-				o.color(colorGreen+colorBold, "              │"))
+				o.color(colorGreen+colorBold, "│"))
 			fmt.Println(o.color(colorGreen+colorBold, "╰"+strings.Repeat("─", 40)+"╯"))
 		}
 		fmt.Printf("  %s %d examples in %s\n",

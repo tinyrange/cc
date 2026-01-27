@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/tinyrange/cc/internal/devices/virtio"
+	"github.com/tinyrange/cc/internal/fslayer"
+	"github.com/tinyrange/cc/internal/oci"
 	"github.com/tinyrange/cc/internal/vfs"
 )
 
@@ -1204,6 +1206,111 @@ func (di *dirEntryInfo) Mode() fs.FileMode  { return di.e.Mode }
 func (di *dirEntryInfo) ModTime() time.Time { return time.Time{} }
 func (di *dirEntryInfo) IsDir() bool        { return di.e.IsDir }
 func (di *dirEntryInfo) Sys() any           { return nil }
+
+// SnapshotFilesystem captures the current filesystem state as a snapshot.
+func (f *instanceFS) SnapshotFilesystem(opts ...FilesystemSnapshotOption) (FilesystemSnapshot, error) {
+	if f.inst.fsBackend == nil {
+		return nil, &Error{Op: "snapshot", Err: ErrNotRunning}
+	}
+
+	cfg := parseFSSnapshotOptions(opts)
+
+	// Extract source-specific fields based on source type
+	var baseCFS *oci.ContainerFS
+	var baseImage *oci.Image
+	var parentKey string
+	var parent FilesystemSnapshot
+	var existingLayers []string
+
+	switch src := f.inst.source.(type) {
+	case *ociSource:
+		baseCFS = src.cfs
+		baseImage = src.image
+		parentKey = src.CacheKey()
+		parent = src
+	case *fsSnapshotSource:
+		baseCFS = src.lcfs.Base()
+		baseImage = src.baseImage
+		parentKey = src.CacheKey()
+		parent = src
+		existingLayers = src.layers
+	default:
+		return nil, &Error{Op: "snapshot", Err: fmt.Errorf("unsupported source type for snapshot: %T", f.inst.source)}
+	}
+
+	// Determine cache directory
+	cacheDir := cfg.cacheDir
+	if cacheDir == "" {
+		// Default to a subdirectory of the image directory
+		cacheDir = baseImage.Dir + "/layers"
+	}
+
+	// Capture VFS state
+	snapshotOpts := &vfs.SnapshotOptions{
+		Excludes: cfg.excludes,
+	}
+	layerData, err := f.inst.fsBackend.CaptureLayer(snapshotOpts)
+	if err != nil {
+		return nil, &Error{Op: "snapshot", Err: fmt.Errorf("capture layer: %w", err)}
+	}
+
+	// Freeze current layer (mark COW boundary)
+	f.inst.fsBackend.FreezeCurrentLayer()
+
+	// Write layer to cache
+	layer, err := fslayer.WriteLayer(layerData, cacheDir)
+	if err != nil {
+		return nil, &Error{Op: "snapshot", Err: fmt.Errorf("write layer: %w", err)}
+	}
+
+	// Derive new cache key
+	opKey := fslayer.SnapshotOpKey(layer.Hash)
+	cacheKey := fslayer.DeriveKey(parentKey, opKey)
+
+	// Add cache prefix if specified
+	if cfg.cachePrefix != "" {
+		cacheKey = cfg.cachePrefix + ":" + cacheKey
+	}
+
+	// Build LayeredContainerFS with all layers (existing + new)
+	allLayers := append(existingLayers, layer.Hash)
+	snapshotLayers := make([]oci.ImageLayer, len(allLayers))
+	for i, hash := range allLayers {
+		if hash == layer.Hash {
+			// This is the new layer we just created
+			snapshotLayers[i] = oci.ImageLayer{
+				Hash:         layer.Hash,
+				IndexPath:    layer.IndexPath,
+				ContentsPath: layer.ContentsPath,
+			}
+		} else {
+			// Load existing layer from cache
+			existingLayer, err := fslayer.ReadLayer(cacheDir, hash)
+			if err != nil {
+				return nil, &Error{Op: "snapshot", Err: fmt.Errorf("read existing layer %s: %w", hash, err)}
+			}
+			snapshotLayers[i] = oci.ImageLayer{
+				Hash:         existingLayer.Hash,
+				IndexPath:    existingLayer.IndexPath,
+				ContentsPath: existingLayer.ContentsPath,
+			}
+		}
+	}
+
+	lcfs, err := oci.NewLayeredContainerFS(baseCFS, snapshotLayers)
+	if err != nil {
+		return nil, &Error{Op: "snapshot", Err: fmt.Errorf("create layered fs: %w", err)}
+	}
+
+	return &fsSnapshotSource{
+		lcfs:      lcfs,
+		baseImage: baseImage,
+		parent:    parent,
+		cacheKey:  cacheKey,
+		arch:      f.inst.arch,
+		layers:    allLayers,
+	}, nil
+}
 
 var (
 	_ FS   = (*instanceFS)(nil)
