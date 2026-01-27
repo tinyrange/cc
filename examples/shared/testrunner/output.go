@@ -228,17 +228,23 @@ func (o *Output) printDetailsLocked(details interface{}) {
 		return
 	}
 
-	// For CLI tests, show args, stdout, and stderr
+	// For CLI tests, show args, stderr (first - more important), and stdout
+	isCLI := len(d.Args) > 0 || d.ExitCode != 0 || d.Stdout != "" || d.Stderr != ""
 	if len(d.Args) > 0 {
 		fmt.Printf("    %s %s\n", o.color(colorDim, "args:"), o.color(colorCyan, strings.Join(d.Args, " ")))
+	}
+	// Always show stderr for CLI tests - it's usually the most important for debugging
+	if isCLI {
+		if d.Stderr != "" {
+			fmt.Printf("    %s\n", o.color(colorDim, "stderr:"))
+			o.printIndentedOutput(d.Stderr, 500)
+		} else {
+			fmt.Printf("    %s %s\n", o.color(colorDim, "stderr:"), o.color(colorDim, "(empty)"))
+		}
 	}
 	if d.Stdout != "" {
 		fmt.Printf("    %s\n", o.color(colorDim, "stdout:"))
 		o.printIndentedOutput(d.Stdout, 500)
-	}
-	if d.Stderr != "" {
-		fmt.Printf("    %s\n", o.color(colorDim, "stderr:"))
-		o.printIndentedOutput(d.Stderr, 500)
 	}
 
 	// For HTTP tests, show request info and response body
@@ -266,19 +272,25 @@ func (o *Output) printDetailsPlainLocked(details interface{}) {
 		return
 	}
 
-	// For CLI tests
+	// For CLI tests - show stderr first (more important for debugging)
+	isCLI := len(d.Args) > 0 || d.ExitCode != 0 || d.Stdout != "" || d.Stderr != ""
 	if len(d.Args) > 0 {
 		fmt.Printf("      args: %s\n", strings.Join(d.Args, " "))
+	}
+	// Always show stderr for CLI tests
+	if isCLI {
+		if d.Stderr != "" {
+			fmt.Printf("      stderr:\n")
+			for _, line := range strings.Split(truncateOutput(d.Stderr, 500), "\n") {
+				fmt.Printf("        %s\n", line)
+			}
+		} else {
+			fmt.Printf("      stderr: (empty)\n")
+		}
 	}
 	if d.Stdout != "" {
 		fmt.Printf("      stdout:\n")
 		for _, line := range strings.Split(truncateOutput(d.Stdout, 500), "\n") {
-			fmt.Printf("        %s\n", line)
-		}
-	}
-	if d.Stderr != "" {
-		fmt.Printf("      stderr:\n")
-		for _, line := range strings.Split(truncateOutput(d.Stderr, 500), "\n") {
 			fmt.Printf("        %s\n", line)
 		}
 	}
