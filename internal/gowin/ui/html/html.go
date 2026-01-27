@@ -20,8 +20,8 @@
 package html
 
 import (
-	"github.com/tinyrange/cc/internal/gowin/text"
 	"github.com/tinyrange/cc/internal/gowin/graphics"
+	"github.com/tinyrange/cc/internal/gowin/text"
 	"github.com/tinyrange/cc/internal/gowin/ui"
 )
 

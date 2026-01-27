@@ -4,9 +4,9 @@ package ui
 // Similar to CSS flexbox with flex-wrap: wrap.
 type FlowContainer struct {
 	BaseWidget
-	children   []Widget
-	gap        float32 // Horizontal gap between items
-	lineGap    float32 // Vertical gap between lines
+	children []Widget
+	gap      float32 // Horizontal gap between items
+	lineGap  float32 // Vertical gap between lines
 
 	// Cached layout data
 	childSizes  map[WidgetID]Size

@@ -19,8 +19,8 @@ const (
 // ToggleStyle defines toggle switch appearance.
 type ToggleStyle struct {
 	// Track (background pill)
-	TrackWidth  float32
-	TrackHeight float32
+	TrackWidth    float32
+	TrackHeight   float32
 	TrackColorOn  color.Color
 	TrackColorOff color.Color
 
@@ -38,7 +38,7 @@ func DefaultToggleStyle() ToggleStyle {
 	return ToggleStyle{
 		TrackWidth:        50,
 		TrackHeight:       28,
-		TrackColorOn:      color.RGBA{R: 52, G: 120, B: 246, A: 255}, // Blue
+		TrackColorOn:      color.RGBA{R: 52, G: 120, B: 246, A: 255},  // Blue
 		TrackColorOff:     color.RGBA{R: 120, G: 120, B: 120, A: 255}, // Gray
 		ThumbSize:         22,
 		ThumbColor:        graphics.ColorWhite,

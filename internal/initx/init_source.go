@@ -39,7 +39,6 @@ const (
 // 15=phase7_loop_start, 16=phase7_copy_payload, 17=phase7_relocate
 // 18=phase7_isb, 19=phase7_call_payload, 20=phase7_payload_done
 
-
 // main is the entrypoint for the init program.
 // Note: The RTG compiler uses the first function as the entrypoint,
 // so main must be declared before reboot.
@@ -388,8 +387,8 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 		var codeOffset int64 = 0
 		var stdinOffset int64 = 0
 		relocBytes = relocCount << 2
-		codeOffset = 32 + relocBytes              // 32 = time_sec(8) + time_nsec(8) + flags(4) + stdin_len(4) + code_len(4) + reloc_count(4)
-		stdinOffset = codeOffset + codeLen        // stdin data follows code
+		codeOffset = 32 + relocBytes       // 32 = time_sec(8) + time_nsec(8) + flags(4) + stdin_len(4) + code_len(4) + reloc_count(4)
+		stdinOffset = codeOffset + codeLen // stdin data follows code
 
 		// Copy code to anonMem
 		var copySrc int64 = 0

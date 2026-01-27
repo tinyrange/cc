@@ -12,7 +12,7 @@ import (
 type VMSourceType string
 
 const (
-	VMSourceBundle    VMSourceType = "bundle" // Bundle directory with ccbundle.yaml
+	VMSourceBundle    VMSourceType = "bundle"  // Bundle directory with ccbundle.yaml
 	VMSourceTarball   VMSourceType = "tarball" // OCI tarball (.tar file)
 	VMSourceImageName VMSourceType = "image"   // Container image name to pull
 )

@@ -17,9 +17,9 @@ var (
 	procGetClipboardData = user32.NewProc("GetClipboardData")
 	procSetClipboardData = user32.NewProc("SetClipboardData")
 
-	procGlobalAlloc = kernel32.NewProc("GlobalAlloc")
-	procGlobalFree  = kernel32.NewProc("GlobalFree")
-	procGlobalLock  = kernel32.NewProc("GlobalLock")
+	procGlobalAlloc  = kernel32.NewProc("GlobalAlloc")
+	procGlobalFree   = kernel32.NewProc("GlobalFree")
+	procGlobalLock   = kernel32.NewProc("GlobalLock")
 	procGlobalUnlock = kernel32.NewProc("GlobalUnlock")
 )
 

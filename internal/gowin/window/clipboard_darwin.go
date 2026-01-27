@@ -16,11 +16,11 @@ var (
 	clipboardOnce sync.Once
 
 	// Cached selectors for NSPasteboard.
-	selGeneralPasteboard  objc.SEL
-	selClearContents      objc.SEL
-	selSetStringForType   objc.SEL
-	selStringForType      objc.SEL
-	selPasteboardTypeStr  objc.ID // NSPasteboardTypeString constant
+	selGeneralPasteboard objc.SEL
+	selClearContents     objc.SEL
+	selSetStringForType  objc.SEL
+	selStringForType     objc.SEL
+	selPasteboardTypeStr objc.ID // NSPasteboardTypeString constant
 )
 
 func initClipboardSelectors() {
@@ -110,4 +110,3 @@ func (c *darwinClipboard) SetText(text string) error {
 
 	return nil
 }
-

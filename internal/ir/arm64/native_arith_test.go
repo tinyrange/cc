@@ -351,7 +351,7 @@ func TestNative_Arith_AlternatingSign(t *testing.T) {
 	result := compileAndRun(t, ir.Method{
 		ir.Assign(a, ir.Int64(100)),
 		ir.Assign(b, ir.Int64(50)),
-		ir.Assign(c, ir.Op(ir.OpAdd, a, b)),   // 150
+		ir.Assign(c, ir.Op(ir.OpAdd, a, b)),            // 150
 		ir.Assign(c, ir.Op(ir.OpSub, c, ir.Int64(75))), // 75
 		ir.Assign(c, ir.Op(ir.OpAdd, c, ir.Int64(25))), // 100
 		ir.Assign(c, ir.Op(ir.OpSub, c, ir.Int64(40))), // 60

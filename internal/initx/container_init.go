@@ -37,12 +37,12 @@ type QEMUEmulationConfig struct {
 }
 
 type ContainerInitConfig struct {
-	Arch          hv.CpuArchitecture
-	Cmd           []string
-	Env           []string
-	WorkDir       string
-	EnableNetwork bool
-	Exec          bool
+	Arch           hv.CpuArchitecture
+	Cmd            []string
+	Env            []string
+	WorkDir        string
+	EnableNetwork  bool
+	Exec           bool
 	SkipEntrypoint bool // If true, don't run Cmd - just initialize and wait for commands via vsock
 
 	Hostname    string // default: tinyrange

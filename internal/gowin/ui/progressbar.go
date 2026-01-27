@@ -41,11 +41,11 @@ type ProgressBar struct {
 	minWidth float32
 
 	// Rounded corner rendering
-	gfxWindow          graphics.Window
-	bgShapeBuilder     *graphics.ShapeBuilder
-	fillShapeBuilder   *graphics.ShapeBuilder
-	lastBounds         Rect
-	lastValue          float64
+	gfxWindow        graphics.Window
+	bgShapeBuilder   *graphics.ShapeBuilder
+	fillShapeBuilder *graphics.ShapeBuilder
+	lastBounds       Rect
+	lastValue        float64
 }
 
 // NewProgressBar creates a new progress bar.

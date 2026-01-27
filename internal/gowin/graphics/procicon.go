@@ -323,4 +323,3 @@ func (p *ProceduralIcon) Draw(f Frame, x, y float32) {
 	model := TranslateMat4(x, y)
 	f.RenderMesh(p.mesh, DrawOptions{Model: model})
 }
-

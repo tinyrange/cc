@@ -875,7 +875,7 @@ func (stash *Stash) DrawText(idx int, size, x, y float64, s string, color [4]flo
 
 // GradientStop represents a color stop in a gradient.
 type GradientStop struct {
-	Position float32     // 0.0 to 1.0
+	Position   float32 // 0.0 to 1.0
 	R, G, B, A float32
 }
 

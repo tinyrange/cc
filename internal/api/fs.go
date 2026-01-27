@@ -590,7 +590,7 @@ func (f *instanceFS) MkdirAll(name string, perm fs.FileMode) error {
 	name = strings.TrimPrefix(name, "/")
 	parts := strings.Split(name, "/")
 
-	currentID := uint64(1) // root
+	currentID := uint64(1)                // root
 	mode := uint32(perm.Perm()) | 0040000 // S_IFDIR
 
 	for _, part := range parts {
@@ -1109,9 +1109,11 @@ type fuseDirEntryInfo struct {
 	entryType uint8
 }
 
-func (di *fuseDirEntryInfo) Name() string       { return di.name }
-func (di *fuseDirEntryInfo) Size() int64        { return 0 }
-func (di *fuseDirEntryInfo) Mode() fs.FileMode  { return (&fuseDirEntry{entryType: di.entryType}).Type() }
+func (di *fuseDirEntryInfo) Name() string { return di.name }
+func (di *fuseDirEntryInfo) Size() int64  { return 0 }
+func (di *fuseDirEntryInfo) Mode() fs.FileMode {
+	return (&fuseDirEntry{entryType: di.entryType}).Type()
+}
 func (di *fuseDirEntryInfo) ModTime() time.Time { return time.Time{} }
 func (di *fuseDirEntryInfo) IsDir() bool        { return di.entryType == 4 }
 func (di *fuseDirEntryInfo) Sys() any           { return nil }

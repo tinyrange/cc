@@ -1425,4 +1425,3 @@ func handleGetURLEvent(self objc.ID, _cmd objc.SEL, event objc.ID, replyEvent ob
 		queuePendingURL(url)
 	}
 }
-

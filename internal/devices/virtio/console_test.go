@@ -62,10 +62,10 @@ func (vm *consoleTestVM) GetIRQ(line uint32) bool {
 }
 
 // Implement other required hv.VirtualMachine methods as no-ops
-func (vm *consoleTestVM) Close() error                                   { return nil }
-func (vm *consoleTestVM) Hypervisor() hv.Hypervisor                      { return nil }
-func (vm *consoleTestVM) MemorySize() uint64                             { return uint64(len(vm.memory)) }
-func (vm *consoleTestVM) MemoryBase() uint64                             { return 0 }
+func (vm *consoleTestVM) Close() error                                    { return nil }
+func (vm *consoleTestVM) Hypervisor() hv.Hypervisor                       { return nil }
+func (vm *consoleTestVM) MemorySize() uint64                              { return uint64(len(vm.memory)) }
+func (vm *consoleTestVM) MemoryBase() uint64                              { return 0 }
 func (vm *consoleTestVM) Run(ctx context.Context, cfg hv.RunConfig) error { return nil }
 func (vm *consoleTestVM) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error {
 	return nil

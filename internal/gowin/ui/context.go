@@ -45,9 +45,9 @@ type EventContext struct {
 type Root struct {
 	child Widget
 
-	layoutCtx    *LayoutContext
-	inputProc    *InputProcessor
-	eventCtx     *EventContext
+	layoutCtx *LayoutContext
+	inputProc *InputProcessor
+	eventCtx  *EventContext
 
 	textRenderer *text.Renderer
 

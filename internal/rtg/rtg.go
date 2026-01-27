@@ -129,12 +129,12 @@ type Compiler struct {
 	scope       *scope
 	returnType  Type
 	opts        CompileOptions
-	constants   map[string]int64      // package-level constants
+	constants   map[string]int64         // package-level constants
 	funcSigs    map[string]funcSignature // function signatures
-	labelCount  int                   // counter for generating unique labels
-	buffers     []bufferInfo          // stack buffers declared in current function
-	nextSlotID  int                   // counter for unique slot IDs
-	embedVarCtr int                   // counter for unique embed variable names
+	labelCount  int                      // counter for generating unique labels
+	buffers     []bufferInfo             // stack buffers declared in current function
+	nextSlotID  int                      // counter for unique slot IDs
+	embedVarCtr int                      // counter for unique embed variable names
 }
 
 // CompileProgram parses src and lowers it into an ir.Program. The accepted
@@ -2092,50 +2092,50 @@ var comparisonOps = map[token.Token]ir.CompareKind{
 }
 
 var syscallNames = map[string]defs.Syscall{
-	"SYS_EXIT":           defs.SYS_EXIT,
-	"SYS_EXIT_GROUP":     defs.SYS_EXIT_GROUP,
-	"SYS_WRITE":          defs.SYS_WRITE,
-	"SYS_READ":           defs.SYS_READ,
-	"SYS_OPENAT":         defs.SYS_OPENAT,
-	"SYS_CLOSE":          defs.SYS_CLOSE,
-	"SYS_MMAP":           defs.SYS_MMAP,
-	"SYS_MUNMAP":         defs.SYS_MUNMAP,
-	"SYS_MOUNT":          defs.SYS_MOUNT,
-	"SYS_MKDIRAT":        defs.SYS_MKDIRAT,
-	"SYS_MKNODAT":        defs.SYS_MKNODAT,
-	"SYS_CHROOT":         defs.SYS_CHROOT,
-	"SYS_CHDIR":          defs.SYS_CHDIR,
-	"SYS_SETHOSTNAME":    defs.SYS_SETHOSTNAME,
-	"SYS_IOCTL":          defs.SYS_IOCTL,
-	"SYS_DUP3":           defs.SYS_DUP3,
-	"SYS_SETSID":         defs.SYS_SETSID,
-	"SYS_REBOOT":         defs.SYS_REBOOT,
-	"SYS_INIT_MODULE":    defs.SYS_INIT_MODULE,
-	"SYS_CLOCK_SETTIME":  defs.SYS_CLOCK_SETTIME,
-	"SYS_CLOCK_GETTIME":  defs.SYS_CLOCK_GETTIME,
-	"SYS_SOCKET":         defs.SYS_SOCKET,
-	"SYS_SENDTO":         defs.SYS_SENDTO,
-	"SYS_RECVFROM":       defs.SYS_RECVFROM,
-	"SYS_EXECVE":         defs.SYS_EXECVE,
-	"SYS_CLONE":          defs.SYS_CLONE,
-	"SYS_WAIT4":          defs.SYS_WAIT4,
-	"SYS_MPROTECT":       defs.SYS_MPROTECT,
-	"SYS_GETPID":         defs.SYS_GETPID,
-	"SYS_PIVOT_ROOT":     defs.SYS_PIVOT_ROOT,
-	"SYS_UMOUNT2":        defs.SYS_UMOUNT2,
-	"SYS_UNLINKAT":       defs.SYS_UNLINKAT,
-	"SYS_SYMLINKAT":      defs.SYS_SYMLINKAT,
-	"SYS_CONNECT":        defs.SYS_CONNECT,
-	"SYS_BIND":           defs.SYS_BIND,
-	"SYS_LISTEN":         defs.SYS_LISTEN,
-	"SYS_ACCEPT":         defs.SYS_ACCEPT,
-	"SYS_SHUTDOWN":       defs.SYS_SHUTDOWN,
-	"SYS_SETSOCKOPT":     defs.SYS_SETSOCKOPT,
-	"SYS_GETSOCKOPT":     defs.SYS_GETSOCKOPT,
-	"SYS_SENDMSG":        defs.SYS_SENDMSG,
-	"SYS_RECVMSG":        defs.SYS_RECVMSG,
-	"SYS_PIPE2":          defs.SYS_PIPE2,
-	"SYS_FCNTL":          defs.SYS_FCNTL,
+	"SYS_EXIT":          defs.SYS_EXIT,
+	"SYS_EXIT_GROUP":    defs.SYS_EXIT_GROUP,
+	"SYS_WRITE":         defs.SYS_WRITE,
+	"SYS_READ":          defs.SYS_READ,
+	"SYS_OPENAT":        defs.SYS_OPENAT,
+	"SYS_CLOSE":         defs.SYS_CLOSE,
+	"SYS_MMAP":          defs.SYS_MMAP,
+	"SYS_MUNMAP":        defs.SYS_MUNMAP,
+	"SYS_MOUNT":         defs.SYS_MOUNT,
+	"SYS_MKDIRAT":       defs.SYS_MKDIRAT,
+	"SYS_MKNODAT":       defs.SYS_MKNODAT,
+	"SYS_CHROOT":        defs.SYS_CHROOT,
+	"SYS_CHDIR":         defs.SYS_CHDIR,
+	"SYS_SETHOSTNAME":   defs.SYS_SETHOSTNAME,
+	"SYS_IOCTL":         defs.SYS_IOCTL,
+	"SYS_DUP3":          defs.SYS_DUP3,
+	"SYS_SETSID":        defs.SYS_SETSID,
+	"SYS_REBOOT":        defs.SYS_REBOOT,
+	"SYS_INIT_MODULE":   defs.SYS_INIT_MODULE,
+	"SYS_CLOCK_SETTIME": defs.SYS_CLOCK_SETTIME,
+	"SYS_CLOCK_GETTIME": defs.SYS_CLOCK_GETTIME,
+	"SYS_SOCKET":        defs.SYS_SOCKET,
+	"SYS_SENDTO":        defs.SYS_SENDTO,
+	"SYS_RECVFROM":      defs.SYS_RECVFROM,
+	"SYS_EXECVE":        defs.SYS_EXECVE,
+	"SYS_CLONE":         defs.SYS_CLONE,
+	"SYS_WAIT4":         defs.SYS_WAIT4,
+	"SYS_MPROTECT":      defs.SYS_MPROTECT,
+	"SYS_GETPID":        defs.SYS_GETPID,
+	"SYS_PIVOT_ROOT":    defs.SYS_PIVOT_ROOT,
+	"SYS_UMOUNT2":       defs.SYS_UMOUNT2,
+	"SYS_UNLINKAT":      defs.SYS_UNLINKAT,
+	"SYS_SYMLINKAT":     defs.SYS_SYMLINKAT,
+	"SYS_CONNECT":       defs.SYS_CONNECT,
+	"SYS_BIND":          defs.SYS_BIND,
+	"SYS_LISTEN":        defs.SYS_LISTEN,
+	"SYS_ACCEPT":        defs.SYS_ACCEPT,
+	"SYS_SHUTDOWN":      defs.SYS_SHUTDOWN,
+	"SYS_SETSOCKOPT":    defs.SYS_SETSOCKOPT,
+	"SYS_GETSOCKOPT":    defs.SYS_GETSOCKOPT,
+	"SYS_SENDMSG":       defs.SYS_SENDMSG,
+	"SYS_RECVMSG":       defs.SYS_RECVMSG,
+	"SYS_PIPE2":         defs.SYS_PIPE2,
+	"SYS_FCNTL":         defs.SYS_FCNTL,
 }
 
 var constantValues = map[string]int64{
@@ -2205,29 +2205,29 @@ var constantValues = map[string]int64{
 	"SIGCHLD": int64(defs.SIGCHLD),
 
 	// Network interface flags
-	"IFF_UP":          int64(linux.IFF_UP),
-	"SIOCSIFFLAGS":    int64(linux.SIOCSIFFLAGS),
-	"SIOCSIFADDR":     int64(linux.SIOCSIFADDR),
-	"SIOCSIFNETMASK":  int64(linux.SIOCSIFNETMASK),
-	"SIOCGIFINDEX":    int64(linux.SIOCGIFINDEX),
-	"RTM_NEWROUTE":    int64(linux.RTM_NEWROUTE),
-	"NLM_F_REQUEST":   int64(linux.NLM_F_REQUEST),
-	"NLM_F_CREATE":    int64(linux.NLM_F_CREATE),
-	"NLM_F_REPLACE":   int64(linux.NLM_F_REPLACE),
-	"NLM_F_ACK":       int64(linux.NLM_F_ACK),
-	"RT_TABLE_MAIN":   int64(linux.RT_TABLE_MAIN),
-	"RTPROT_BOOT":     int64(linux.RTPROT_BOOT),
+	"IFF_UP":            int64(linux.IFF_UP),
+	"SIOCSIFFLAGS":      int64(linux.SIOCSIFFLAGS),
+	"SIOCSIFADDR":       int64(linux.SIOCSIFADDR),
+	"SIOCSIFNETMASK":    int64(linux.SIOCSIFNETMASK),
+	"SIOCGIFINDEX":      int64(linux.SIOCGIFINDEX),
+	"RTM_NEWROUTE":      int64(linux.RTM_NEWROUTE),
+	"NLM_F_REQUEST":     int64(linux.NLM_F_REQUEST),
+	"NLM_F_CREATE":      int64(linux.NLM_F_CREATE),
+	"NLM_F_REPLACE":     int64(linux.NLM_F_REPLACE),
+	"NLM_F_ACK":         int64(linux.NLM_F_ACK),
+	"RT_TABLE_MAIN":     int64(linux.RT_TABLE_MAIN),
+	"RTPROT_BOOT":       int64(linux.RTPROT_BOOT),
 	"RT_SCOPE_UNIVERSE": int64(linux.RT_SCOPE_UNIVERSE),
-	"RTN_UNICAST":     int64(linux.RTN_UNICAST),
-	"RTA_OIF":         int64(linux.RTA_OIF),
-	"RTA_GATEWAY":     int64(linux.RTA_GATEWAY),
+	"RTN_UNICAST":       int64(linux.RTN_UNICAST),
+	"RTA_OIF":           int64(linux.RTA_OIF),
+	"RTA_GATEWAY":       int64(linux.RTA_GATEWAY),
 
 	// Vsock constants
-	"AF_VSOCK":        int64(40),   // AF_VSOCK
-	"SOCK_STREAM":     int64(1),    // Stream socket type
-	"VMADDR_CID_HOST": int64(2),    // Host CID
-	"VMADDR_CID_ANY":  int64(-1),   // Bind to any CID
-	"VMADDR_PORT_ANY": int64(-1),   // Bind to any port
+	"AF_VSOCK":        int64(40), // AF_VSOCK
+	"SOCK_STREAM":     int64(1),  // Stream socket type
+	"VMADDR_CID_HOST": int64(2),  // Host CID
+	"VMADDR_CID_ANY":  int64(-1), // Bind to any CID
+	"VMADDR_PORT_ANY": int64(-1), // Bind to any port
 }
 
 // FormatErrors joins multiple errors when tests want deterministic output.

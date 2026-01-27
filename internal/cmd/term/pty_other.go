@@ -22,5 +22,3 @@ func (p *PtyShell) Resize(cols, rows int) error {
 }
 func (p *PtyShell) Close() error { return nil }
 func (p *PtyShell) Wait() error  { return nil }
-
-

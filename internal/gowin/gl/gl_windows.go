@@ -454,7 +454,7 @@ func Load() (OpenGL, error) {
 		genRenderbuffers:        loadProc("glGenRenderbuffers"),
 		deleteRenderbuffers:     loadProc("glDeleteRenderbuffers"),
 		bindRenderbuffer:        loadProc("glBindRenderbuffer"),
-		renderbufferStorage:    loadProc("glRenderbufferStorage"),
+		renderbufferStorage:     loadProc("glRenderbufferStorage"),
 		framebufferRenderbuffer: loadProc("glFramebufferRenderbuffer"),
 
 		// Additional uniform operations

@@ -24,22 +24,22 @@ var (
 	atomTargets   uintptr
 
 	// X11 functions for clipboard.
-	xOpenDisplayClip  func(*byte) uintptr
-	xCloseDisplayClip func(uintptr) int32
-	xInternAtomClip   func(uintptr, *byte, int32) uintptr
-	xGetSelectionOwner func(uintptr, uintptr) uintptr
-	xConvertSelection  func(uintptr, uintptr, uintptr, uintptr, uintptr, uintptr)
-	xGetWindowProperty func(uintptr, uintptr, uintptr, int64, int64, int32, uintptr, *uintptr, *int32, *uint64, *uint64, *uintptr) int32
-	xFree              func(uintptr) int32
-	xDefaultRootWindow func(uintptr) uintptr
-	xNextEventClip     func(uintptr, unsafe.Pointer)
-	xPendingClip       func(uintptr) int32
-	xSetSelectionOwner func(uintptr, uintptr, uintptr, uintptr) int32
-	xChangeProperty    func(uintptr, uintptr, uintptr, uintptr, int32, int32, *byte, int32) int32
+	xOpenDisplayClip    func(*byte) uintptr
+	xCloseDisplayClip   func(uintptr) int32
+	xInternAtomClip     func(uintptr, *byte, int32) uintptr
+	xGetSelectionOwner  func(uintptr, uintptr) uintptr
+	xConvertSelection   func(uintptr, uintptr, uintptr, uintptr, uintptr, uintptr)
+	xGetWindowProperty  func(uintptr, uintptr, uintptr, int64, int64, int32, uintptr, *uintptr, *int32, *uint64, *uint64, *uintptr) int32
+	xFree               func(uintptr) int32
+	xDefaultRootWindow  func(uintptr) uintptr
+	xNextEventClip      func(uintptr, unsafe.Pointer)
+	xPendingClip        func(uintptr) int32
+	xSetSelectionOwner  func(uintptr, uintptr, uintptr, uintptr) int32
+	xChangeProperty     func(uintptr, uintptr, uintptr, uintptr, int32, int32, *byte, int32) int32
 	xCreateSimpleWindow func(uintptr, uintptr, int32, int32, uint32, uint32, uint32, uint64, uint64) uintptr
-	xDestroyWindowClip func(uintptr, uintptr) int32
-	xSelectInputClip   func(uintptr, uintptr, int64)
-	xFlush             func(uintptr)
+	xDestroyWindowClip  func(uintptr, uintptr) int32
+	xSelectInputClip    func(uintptr, uintptr, int64)
+	xFlush              func(uintptr)
 
 	// Store clipboard data for owner events.
 	clipboardData     string

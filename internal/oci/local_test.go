@@ -76,4 +76,3 @@ func TestLoadFromDirNoConfig(t *testing.T) {
 		t.Error("LoadFromDir on empty dir should fail")
 	}
 }
-

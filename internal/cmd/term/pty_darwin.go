@@ -28,7 +28,7 @@ var (
 	ptyInitErr  error
 
 	libSystem uintptr
-	openptyFn  func(master, slave *int32, name *byte, termp *unix.Termios, winp *unix.Winsize) int32
+	openptyFn func(master, slave *int32, name *byte, termp *unix.Termios, winp *unix.Winsize) int32
 )
 
 func ensurePty() error {
@@ -178,5 +178,3 @@ func (p *PtyShell) Wait() error {
 	}
 	return cmd.Wait()
 }
-
-

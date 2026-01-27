@@ -177,8 +177,8 @@ const (
 
 // fcntl commands
 const (
-	F_GETFL        int64 = 3
-	F_SETFL        int64 = 4
+	F_GETFL         int64 = 3
+	F_SETFL         int64 = 4
 	F_DUPFD_CLOEXEC int64 = 0x406
 )
 
@@ -248,29 +248,29 @@ const (
 
 // Vsock constants
 const (
-	AF_VSOCK         int64 = 40    // Address family for vsock
-	SOCK_STREAM      int64 = 1     // Stream socket type
-	VMADDR_CID_HOST  int64 = 2     // Host CID
-	VMADDR_CID_ANY   int64 = -1    // Bind to any CID
-	VMADDR_PORT_ANY  int64 = -1    // Bind to any port
+	AF_VSOCK        int64 = 40 // Address family for vsock
+	SOCK_STREAM     int64 = 1  // Stream socket type
+	VMADDR_CID_HOST int64 = 2  // Host CID
+	VMADDR_CID_ANY  int64 = -1 // Bind to any CID
+	VMADDR_PORT_ANY int64 = -1 // Bind to any port
 )
 
 // Network interface ioctl constants
 const (
-	IFF_UP           int64 = 0x1
-	SIOCSIFFLAGS     int64 = 0x8914
-	SIOCSIFADDR      int64 = 0x8916
-	SIOCSIFNETMASK   int64 = 0x891c
-	SIOCGIFINDEX     int64 = 0x8933
-	RTM_NEWROUTE     int64 = 24
-	NLM_F_REQUEST    int64 = 0x1
-	NLM_F_CREATE     int64 = 0x400
-	NLM_F_REPLACE    int64 = 0x100
-	NLM_F_ACK        int64 = 0x4
-	RT_TABLE_MAIN    int64 = 254
-	RTPROT_BOOT      int64 = 3
+	IFF_UP            int64 = 0x1
+	SIOCSIFFLAGS      int64 = 0x8914
+	SIOCSIFADDR       int64 = 0x8916
+	SIOCSIFNETMASK    int64 = 0x891c
+	SIOCGIFINDEX      int64 = 0x8933
+	RTM_NEWROUTE      int64 = 24
+	NLM_F_REQUEST     int64 = 0x1
+	NLM_F_CREATE      int64 = 0x400
+	NLM_F_REPLACE     int64 = 0x100
+	NLM_F_ACK         int64 = 0x4
+	RT_TABLE_MAIN     int64 = 254
+	RTPROT_BOOT       int64 = 3
 	RT_SCOPE_UNIVERSE int64 = 0
-	RTN_UNICAST      int64 = 1
-	RTA_OIF          int64 = 4
-	RTA_GATEWAY      int64 = 5
+	RTN_UNICAST       int64 = 1
+	RTA_OIF           int64 = 4
+	RTA_GATEWAY       int64 = 5
 )

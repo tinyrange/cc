@@ -24,14 +24,14 @@ type AppSettingsScreen struct {
 	deleteOriginal        bool
 
 	// Widgets
-	autoUpdateCheckbox     *ui.Checkbox
+	autoUpdateCheckbox      *ui.Checkbox
 	desktopShortcutCheckbox *ui.Checkbox
-	installButton          *ui.Button
-	deleteCheckbox         *ui.Checkbox
-	updateButton           *ui.Button
-	logsButton             *ui.Button
-	closeButton            *ui.Button
-	logo                   *ui.AnimatedLogo
+	installButton           *ui.Button
+	deleteCheckbox          *ui.Checkbox
+	updateButton            *ui.Button
+	logsButton              *ui.Button
+	closeButton             *ui.Button
+	logo                    *ui.AnimatedLogo
 }
 
 // NewAppSettingsScreen creates the app settings screen

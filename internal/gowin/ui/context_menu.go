@@ -18,35 +18,35 @@ type ContextMenuItem struct {
 
 // ContextMenuStyle defines the appearance of a context menu.
 type ContextMenuStyle struct {
-	Background     color.Color
-	ItemHover      color.Color
-	TextNormal     color.Color
-	TextDisabled   color.Color
-	Separator      color.Color
-	CornerRadius   float32
-	ItemHeight     float32
+	Background      color.Color
+	ItemHover       color.Color
+	TextNormal      color.Color
+	TextDisabled    color.Color
+	Separator       color.Color
+	CornerRadius    float32
+	ItemHeight      float32
 	SeparatorHeight float32
-	PaddingX       float32
-	PaddingY       float32
-	TextSize       float64
-	MinWidth       float32
+	PaddingX        float32
+	PaddingY        float32
+	TextSize        float64
+	MinWidth        float32
 }
 
 // DefaultContextMenuStyle returns the default context menu styling (Tokyo Night theme).
 func DefaultContextMenuStyle() ContextMenuStyle {
 	return ContextMenuStyle{
-		Background:     color.RGBA{R: 0x1f, G: 0x23, B: 0x35, A: 245},
-		ItemHover:      color.RGBA{R: 0x3d, G: 0x59, B: 0xa1, A: 180},
-		TextNormal:     color.RGBA{R: 0xa9, G: 0xb1, B: 0xd6, A: 255},
-		TextDisabled:   color.RGBA{R: 0x56, G: 0x5f, B: 0x89, A: 255},
-		Separator:      color.RGBA{R: 0x3b, G: 0x40, B: 0x54, A: 255},
-		CornerRadius:   6,
-		ItemHeight:     28,
+		Background:      color.RGBA{R: 0x1f, G: 0x23, B: 0x35, A: 245},
+		ItemHover:       color.RGBA{R: 0x3d, G: 0x59, B: 0xa1, A: 180},
+		TextNormal:      color.RGBA{R: 0xa9, G: 0xb1, B: 0xd6, A: 255},
+		TextDisabled:    color.RGBA{R: 0x56, G: 0x5f, B: 0x89, A: 255},
+		Separator:       color.RGBA{R: 0x3b, G: 0x40, B: 0x54, A: 255},
+		CornerRadius:    6,
+		ItemHeight:      28,
 		SeparatorHeight: 9,
-		PaddingX:       12,
-		PaddingY:       6,
-		TextSize:       14,
-		MinWidth:       120,
+		PaddingX:        12,
+		PaddingY:        6,
+		TextSize:        14,
+		MinWidth:        120,
 	}
 }
 
@@ -54,11 +54,11 @@ func DefaultContextMenuStyle() ContextMenuStyle {
 type ContextMenu struct {
 	BaseWidget
 
-	items       []ContextMenuItem
-	style       ContextMenuStyle
-	hoveredIdx  int // -1 = none hovered
-	onSelect    func(tag int)
-	onDismiss   func()
+	items      []ContextMenuItem
+	style      ContextMenuStyle
+	hoveredIdx int // -1 = none hovered
+	onSelect   func(tag int)
+	onDismiss  func()
 
 	// Positioning
 	anchorX float32
@@ -72,9 +72,9 @@ type ContextMenu struct {
 	lastBounds   Rect
 
 	// Layout cache (computed once on Show)
-	layoutDone bool
-	itemWidths []float32
-	totalWidth float32
+	layoutDone  bool
+	itemWidths  []float32
+	totalWidth  float32
 	totalHeight float32
 }
 
