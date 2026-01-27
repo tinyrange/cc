@@ -2,7 +2,7 @@ name: shell_script
 description: Run shell scripts in a sandboxed environment
 
 build:
-  package: ./getting-started/shell_script
+  package: ./examples/getting-started/shell_script
   timeout: 30s
 
 cli:

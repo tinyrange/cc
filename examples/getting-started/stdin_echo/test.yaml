@@ -2,7 +2,7 @@ name: stdin_echo
 description: Process stdin in a sandboxed environment
 
 build:
-  package: ./getting-started/stdin_echo
+  package: ./examples/getting-started/stdin_echo
   timeout: 30s
 
 cli:

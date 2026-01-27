@@ -2,7 +2,7 @@ name: compile_c
 description: Compile and run C code in a sandboxed environment
 
 build:
-  package: ./getting-started/compile_c
+  package: ./examples/getting-started/compile_c
   timeout: 30s
 
 cli:

@@ -2,7 +2,7 @@ name: file_ops
 description: Demonstrate filesystem operations in a sandboxed environment
 
 build:
-  package: ./getting-started/file_ops
+  package: ./examples/getting-started/file_ops
   timeout: 30s
 
 cli:

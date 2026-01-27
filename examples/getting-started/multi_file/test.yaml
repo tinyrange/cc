@@ -2,7 +2,7 @@ name: multi_file
 description: Work with multi-file projects in a sandboxed environment
 
 build:
-  package: ./getting-started/multi_file
+  package: ./examples/getting-started/multi_file
   timeout: 30s
 
 cli:

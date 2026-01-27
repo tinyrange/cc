@@ -2,7 +2,7 @@ name: run_node
 description: Run JavaScript/Node.js scripts in a sandboxed environment
 
 build:
-  package: ./getting-started/run_node
+  package: ./examples/getting-started/run_node
   timeout: 30s
 
 cli:

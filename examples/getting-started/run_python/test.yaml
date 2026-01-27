@@ -2,7 +2,7 @@ name: run_python
 description: Run Python scripts in a sandboxed environment
 
 build:
-  package: ./getting-started/run_python
+  package: ./examples/getting-started/run_python
   timeout: 30s
 
 cli:

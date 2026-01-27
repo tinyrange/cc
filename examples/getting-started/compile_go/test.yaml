@@ -2,7 +2,7 @@ name: compile_go
 description: Compile and run Go code in a sandboxed environment
 
 build:
-  package: ./getting-started/compile_go
+  package: ./examples/getting-started/compile_go
   timeout: 30s
 
 cli:

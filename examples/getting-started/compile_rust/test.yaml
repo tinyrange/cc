@@ -2,7 +2,7 @@ name: compile_rust
 description: Compile and run Rust code in a sandboxed environment
 
 build:
-  package: ./getting-started/compile_rust
+  package: ./examples/getting-started/compile_rust
   timeout: 30s
 
 cli:

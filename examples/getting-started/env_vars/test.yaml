@@ -2,7 +2,7 @@ name: env_vars
 description: Pass environment variables to sandboxed processes
 
 build:
-  package: ./getting-started/env_vars
+  package: ./examples/getting-started/env_vars
   timeout: 30s
 
 cli:
