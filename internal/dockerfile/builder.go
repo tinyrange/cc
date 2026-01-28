@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 
 	"github.com/tinyrange/cc/internal/fslayer"
@@ -287,11 +288,11 @@ func (b *Builder) processCopy(instr Instruction, result *BuildResult, vars map[s
 		h := sha256.Sum256(data)
 		contentHash := hex.EncodeToString(h[:])
 
-		// Determine final destination path
+		// Determine final destination path (use path package for Linux-style container paths)
 		finalDst := dst
 		if len(srcs) > 1 || isDir(dst) {
 			// Multiple sources or directory destination: append filename
-			finalDst = filepath.Join(dst, filepath.Base(src))
+			finalDst = path.Join(dst, path.Base(src))
 		}
 
 		op := &readerOp{
@@ -328,25 +329,25 @@ func (b *Builder) processWorkDir(instr Instruction, result *BuildResult, vars ma
 		return &BuildError{Op: "WORKDIR", Line: instr.Line, Message: "requires a path"}
 	}
 
-	path, err := ExpandVariables(instr.Args[0], vars)
+	dir, err := ExpandVariables(instr.Args[0], vars)
 	if err != nil {
 		return &BuildError{Op: "WORKDIR", Line: instr.Line, Message: "variable expansion failed", Err: err}
 	}
 
-	// Make absolute if relative
-	if !filepath.IsAbs(path) {
+	// Make absolute if relative (use path package for Linux-style paths)
+	if !path.IsAbs(dir) {
 		if result.WorkDir == "" {
-			path = "/" + path
+			dir = "/" + dir
 		} else {
-			path = filepath.Join(result.WorkDir, path)
+			dir = path.Join(result.WorkDir, dir)
 		}
 	}
 
-	result.WorkDir = path
+	result.WorkDir = dir
 
 	// Add operation to create directory
 	op := &runOp{
-		cmd:     []string{"mkdir", "-p", path},
+		cmd:     []string{"mkdir", "-p", dir},
 		env:     result.Env,
 		workDir: "",
 	}
