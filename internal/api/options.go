@@ -1,6 +1,7 @@
 package api
 
 import (
+	"io"
 	"time"
 
 	"github.com/tinyrange/cc/internal/hv"
@@ -15,6 +16,11 @@ type instanceConfig struct {
 	workdir        string
 	user           string
 	skipEntrypoint bool
+
+	// Interactive mode - uses virtio-console for live I/O instead of vsock capture
+	interactive       bool
+	interactiveStdin  io.Reader
+	interactiveStdout io.Writer
 }
 
 // defaultInstanceConfig returns a config with default values.
@@ -43,6 +49,9 @@ func parseInstanceOptions(opts []Option) instanceConfig {
 			cfg.user = o.User()
 		case interface{ SkipEntrypoint() bool }:
 			cfg.skipEntrypoint = o.SkipEntrypoint()
+		case interface{ InteractiveIO() (io.Reader, io.Writer) }:
+			cfg.interactive = true
+			cfg.interactiveStdin, cfg.interactiveStdout = o.InteractiveIO()
 		}
 	}
 

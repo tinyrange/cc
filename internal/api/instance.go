@@ -110,6 +110,11 @@ type instance struct {
 	timeout        time.Duration
 	skipEntrypoint bool
 
+	// Interactive mode - uses virtio-console for live I/O instead of vsock capture
+	interactive       bool
+	interactiveStdin  io.Reader
+	interactiveStdout io.Writer
+
 	// Filesystem backend for direct FS operations
 	fsBackend vfs.VirtioFsBackend
 }
@@ -151,20 +156,23 @@ func New(source InstanceSource, opts ...Option) (Instance, error) {
 	}
 
 	inst := &instance{
-		id:             generateID(),
-		abstractRoot:   abstractRoot,
-		imageConfig:    imageConfig,
-		arch:           arch,
-		source:         source,
-		ctx:            ctx,
-		cancel:         cancel,
-		memoryMB:       cfg.memoryMB,
-		cpus:           cfg.cpus,
-		env:            cfg.env,
-		workdir:        cfg.workdir,
-		user:           cfg.user,
-		timeout:        cfg.timeout,
-		skipEntrypoint: cfg.skipEntrypoint,
+		id:                generateID(),
+		abstractRoot:      abstractRoot,
+		imageConfig:       imageConfig,
+		arch:              arch,
+		source:            source,
+		ctx:               ctx,
+		cancel:            cancel,
+		memoryMB:          cfg.memoryMB,
+		cpus:              cfg.cpus,
+		env:               cfg.env,
+		workdir:           cfg.workdir,
+		user:              cfg.user,
+		timeout:           cfg.timeout,
+		skipEntrypoint:    cfg.skipEntrypoint,
+		interactive:       cfg.interactive,
+		interactiveStdin:  cfg.interactiveStdin,
+		interactiveStdout: cfg.interactiveStdout,
 	}
 
 	if err := inst.start(); err != nil {
@@ -282,6 +290,16 @@ func (inst *instance) start() error {
 		}),
 		initx.WithDeviceTemplate(virtio.NewVsockTemplate(3, vsockBackend)),
 		initx.WithVsockProgramLoader(vsockBackend, initx.VsockProgramPort),
+	}
+
+	// Configure interactive mode - route stdin/stdout to virtio-console
+	if inst.interactive {
+		if inst.interactiveStdin != nil {
+			vmOpts = append(vmOpts, initx.WithStdin(inst.interactiveStdin))
+		}
+		if inst.interactiveStdout != nil {
+			vmOpts = append(vmOpts, initx.WithConsoleOutput(inst.interactiveStdout))
+		}
 	}
 
 	// Create VM

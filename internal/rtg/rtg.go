@@ -2136,6 +2136,7 @@ var syscallNames = map[string]defs.Syscall{
 	"SYS_RECVMSG":       defs.SYS_RECVMSG,
 	"SYS_PIPE2":         defs.SYS_PIPE2,
 	"SYS_FCNTL":         defs.SYS_FCNTL,
+	"SYS_KILL":          defs.SYS_KILL,
 }
 
 var constantValues = map[string]int64{

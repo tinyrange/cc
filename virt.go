@@ -5,6 +5,7 @@ package cc
 
 import (
 	"context"
+	"io"
 	"time"
 
 	"github.com/tinyrange/cc/internal/api"
@@ -150,6 +151,28 @@ type skipEntrypointOption struct{}
 
 func (*skipEntrypointOption) IsOption()            {}
 func (*skipEntrypointOption) SkipEntrypoint() bool { return true }
+
+// WithInteractiveIO enables interactive terminal mode and sets the stdin/stdout.
+// When enabled, stdin/stdout connect to virtio-console for live I/O instead
+// of the default vsock-based capture mode. This is suitable for running
+// interactive commands like shells.
+//
+// Example:
+//
+//	inst, err := cc.New(source,
+//	    cc.WithInteractiveIO(os.Stdin, os.Stdout),
+//	)
+func WithInteractiveIO(stdin io.Reader, stdout io.Writer) Option {
+	return &interactiveIOOption{stdin: stdin, stdout: stdout}
+}
+
+type interactiveIOOption struct {
+	stdin  io.Reader
+	stdout io.Writer
+}
+
+func (*interactiveIOOption) IsOption()                               {}
+func (o *interactiveIOOption) InteractiveIO() (io.Reader, io.Writer) { return o.stdin, o.stdout }
 
 // -----------------------------------------------------------------------------
 // OCI Pull Options
