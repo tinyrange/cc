@@ -4,6 +4,7 @@
 package cc
 
 import (
+	"context"
 	"time"
 
 	"github.com/tinyrange/cc/internal/api"
@@ -281,3 +282,67 @@ func (*snapshotCacheDirOption) IsFilesystemSnapshotOption() {}
 
 // CacheDir returns the cache directory.
 func (o *snapshotCacheDirOption) CacheDir() string { return o.dir }
+
+// -----------------------------------------------------------------------------
+// Dockerfile Building
+// -----------------------------------------------------------------------------
+
+// DockerfileOption configures Dockerfile building.
+type DockerfileOption = api.DockerfileOption
+
+// DockerfileBuildContext provides access to files during COPY/ADD operations.
+type DockerfileBuildContext = api.DockerfileBuildContext
+
+// DockerfileRuntimeConfig holds metadata from CMD, ENTRYPOINT, USER, etc.
+type DockerfileRuntimeConfig = api.DockerfileRuntimeConfig
+
+// WithBuildContext sets the build context for COPY/ADD operations.
+func WithBuildContext(ctx DockerfileBuildContext) DockerfileOption {
+	return api.WithBuildContext(ctx)
+}
+
+// WithBuildContextDir creates a build context from a directory path.
+func WithBuildContextDir(dir string) DockerfileOption {
+	return api.WithBuildContextDir(dir)
+}
+
+// WithBuildArg sets a build argument (ARG instruction).
+func WithBuildArg(key, value string) DockerfileOption {
+	return api.WithBuildArg(key, value)
+}
+
+// WithDockerfileCacheDir sets the cache directory for filesystem snapshots.
+func WithDockerfileCacheDir(dir string) DockerfileOption {
+	return api.WithDockerfileCacheDir(dir)
+}
+
+// BuildDockerfileSource builds an InstanceSource from Dockerfile content.
+// It parses the Dockerfile, converts instructions to filesystem operations,
+// and executes them to produce a cached filesystem snapshot.
+//
+// Example:
+//
+//	dockerfile := []byte(`
+//	    FROM alpine:3.19
+//	    RUN apk add --no-cache curl
+//	    COPY app /usr/local/bin/
+//	    CMD ["app"]
+//	`)
+//	source, err := cc.BuildDockerfileSource(ctx, dockerfile, client,
+//	    cc.WithBuildContextDir("./build"),
+//	    cc.WithDockerfileCacheDir(cacheDir),
+//	)
+func BuildDockerfileSource(ctx context.Context, dockerfileContent []byte, client OCIClient, opts ...DockerfileOption) (FilesystemSnapshot, error) {
+	return api.BuildDockerfileSource(ctx, dockerfileContent, client, opts...)
+}
+
+// BuildDockerfileRuntimeConfig parses a Dockerfile and returns the runtime
+// configuration (CMD, ENTRYPOINT, USER, etc.) without building the image.
+func BuildDockerfileRuntimeConfig(dockerfileContent []byte, opts ...DockerfileOption) (*DockerfileRuntimeConfig, error) {
+	return api.BuildDockerfileRuntimeConfig(dockerfileContent, opts...)
+}
+
+// NewDirBuildContext creates a new directory-based build context.
+func NewDirBuildContext(dir string) (DockerfileBuildContext, error) {
+	return api.NewDirBuildContext(dir)
+}
