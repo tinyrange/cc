@@ -81,7 +81,7 @@ type KeyValue struct {
 
 // Stage represents a build stage in a Dockerfile.
 type Stage struct {
-	Name         string        // Stage name from "AS name" (empty if unnamed)
+	Name         string // Stage name from "AS name" (empty if unnamed)
 	From         FromInstruction
 	Instructions []Instruction
 }
