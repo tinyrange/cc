@@ -613,10 +613,10 @@ func TestVsockEcho(t *testing.T) {
 	}
 	defer unix.Close(fd)
 
-	// Connect to host (CID 2) on port 9999
+	// Connect to host (CID 2) on port 10000 (echo service)
 	addr := &unix.SockaddrVM{
 		CID:  2, // VMADDR_CID_HOST
-		Port: 9999,
+		Port: 10000,
 	}
 	if err := unix.Connect(fd, addr); err != nil {
 		t.Fatalf("failed to connect to vsock: %v", err)

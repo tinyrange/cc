@@ -238,7 +238,7 @@ func (c *instanceCmd) runCommand() {
 	// Use the command's environment (already merged in CommandContext)
 	env := c.env
 
-	// Build IR program using ForkExecWait helper
+	// Build IR program using ForkExecWaitWithCwd helper (supports working directory)
 	errLabel := ir.Label("exec_error")
 	execErrLabel := ir.Label("exec_child_error")
 	errVar := ir.Var("exec_errno")
@@ -247,7 +247,7 @@ func (c *instanceCmd) runCommand() {
 		Entrypoint: "main",
 		Methods: map[string]ir.Method{
 			"main": {
-				initx.ForkExecWait(cmdPath, c.args, env, errLabel, execErrLabel, errVar),
+				initx.ForkExecWaitWithCwd(cmdPath, c.args, env, c.dir, errLabel, execErrLabel, errVar),
 				ir.Return(errVar),
 				ir.DeclareLabel(errLabel, ir.Block{
 					ir.Printf("cc: exec error: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
@@ -359,7 +359,7 @@ func (c *instanceCmd) runInteractiveCommand() {
 	// Use the command's environment (already merged in CommandContext)
 	env := c.env
 
-	// Build IR program using ForkExecWait helper
+	// Build IR program using ForkExecWaitWithCwd helper (supports working directory)
 	errLabel := ir.Label("exec_error")
 	execErrLabel := ir.Label("exec_child_error")
 	errVar := ir.Var("exec_errno")
@@ -368,7 +368,7 @@ func (c *instanceCmd) runInteractiveCommand() {
 		Entrypoint: "main",
 		Methods: map[string]ir.Method{
 			"main": {
-				initx.ForkExecWait(cmdPath, c.args, env, errLabel, execErrLabel, errVar),
+				initx.ForkExecWaitWithCwd(cmdPath, c.args, env, c.dir, errLabel, execErrLabel, errVar),
 				ir.Return(errVar),
 				ir.DeclareLabel(errLabel, ir.Block{
 					ir.Printf("cc: exec error: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),

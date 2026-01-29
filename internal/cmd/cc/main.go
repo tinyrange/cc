@@ -1,46 +1,47 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"log/slog"
-	"net"
 	"os"
-	"path"
 	"path/filepath"
 	"runtime"
-	"runtime/pprof"
-	"strconv"
 	"strings"
 	"time"
 
+	cc "github.com/tinyrange/cc"
 	"github.com/tinyrange/cc/internal/bundle"
-	"github.com/tinyrange/cc/internal/debug"
-	"github.com/tinyrange/cc/internal/devices/virtio"
 	"github.com/tinyrange/cc/internal/gowin/window"
-	"github.com/tinyrange/cc/internal/hv"
-	"github.com/tinyrange/cc/internal/hv/factory"
 	"github.com/tinyrange/cc/internal/initx"
-	"github.com/tinyrange/cc/internal/linux/kernel"
-	"github.com/tinyrange/cc/internal/netstack"
-	"github.com/tinyrange/cc/internal/oci"
-	termwin "github.com/tinyrange/cc/internal/term"
-	"github.com/tinyrange/cc/internal/timeslice"
-	"github.com/tinyrange/cc/internal/vfs"
 	"golang.org/x/term"
 )
 
+// Track which flags were explicitly set
+var flagsSet = make(map[string]bool)
+
+func recordSetFlags() {
+	flag.Visit(func(f *flag.Flag) {
+		flagsSet[f.Name] = true
+	})
+}
+
+func isFlagSet(name string) bool {
+	return flagsSet[name]
+}
+
 func main() {
-	// Cocoa requires UI objects (e.g. NSWindow) to be created on the process main
-	// thread. The Go scheduler can migrate the main goroutine across OS threads,
-	// so we pin it early on darwin to keep later window creation safe.
+	// On macOS, pin to main thread for potential future window support
 	if runtime.GOOS == "darwin" {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
+	}
+
+	if err := cc.EnsureExecutableIsSigned(); err != nil {
+		fmt.Fprintf(os.Stderr, "cc: ensure executable is signed: %v\n", err)
+		os.Exit(1)
 	}
 
 	if err := run(); err != nil {
@@ -53,829 +54,459 @@ func main() {
 	}
 }
 
-type fixCrlf struct {
-	w io.Writer
-}
-
-func (f *fixCrlf) Write(p []byte) (n int, err error) {
-	return f.w.Write(bytes.ReplaceAll(p, []byte{'\n'}, []byte{'\r', '\n'}))
-}
-
-type intFlag struct {
-	v   int
-	set bool
-}
-
-func (f *intFlag) String() string { return strconv.Itoa(f.v) }
-
-func (f *intFlag) Set(s string) error {
-	v, err := strconv.Atoi(s)
-	if err != nil {
-		return err
-	}
-	f.v = v
-	f.set = true
-	return nil
-}
-
-type uint64Flag struct {
-	v   uint64
-	set bool
-}
-
-func (f *uint64Flag) String() string { return strconv.FormatUint(f.v, 10) }
-
-func (f *uint64Flag) Set(s string) error {
-	v, err := strconv.ParseUint(s, 10, 64)
-	if err != nil {
-		return err
-	}
-	f.v = v
-	f.set = true
-	return nil
-}
-
-type boolFlag struct {
-	v   bool
-	set bool
-}
-
-func (f *boolFlag) String() string {
-	if f.v {
-		return "true"
-	}
-	return "false"
-}
-
-func (f *boolFlag) Set(s string) error {
-	v, err := strconv.ParseBool(s)
-	if err != nil {
-		return err
-	}
-	f.v = v
-	f.set = true
-	return nil
-}
-
-func (f *boolFlag) IsBoolFlag() bool { return true }
-
 func run() error {
-	cacheDir := flag.String("cache-dir", "", "Cache directory (default: ~/.config/cc/)")
-	buildOut := flag.String("build", "", "Build a prebaked bundle folder at this path, then exit")
-	var cpusFlag intFlag
-	cpusFlag.v = 1
-	flag.Var(&cpusFlag, "cpus", "Number of vCPUs")
-	var memoryFlag uint64Flag
-	memoryFlag.v = 1024
-	flag.Var(&memoryFlag, "memory", "Memory in MB")
-	dbg := flag.Bool("debug", false, "Enable debug logging")
-	debugFile := flag.String("debug-file", "", "Write debug stream to file")
-	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
-	memprofile := flag.String("memprofile", "", "Write memory profile to file")
-	var dmesgFlag boolFlag
-	flag.Var(&dmesgFlag, "dmesg", "Print kernel dmesg during boot and runtime")
-	var networkFlag boolFlag
-	flag.Var(&networkFlag, "network", "Enable networking")
+	memoryMB := flag.Uint64("memory", 256, "Memory in MB")
+	cpus := flag.Int("cpus", 1, "Number of vCPUs")
 	timeout := flag.Duration("timeout", 0, "Timeout for the container")
-	packetdump := flag.String("packetdump", "", "Write packet capture (pcap) to file (requires -network)")
-	var execFlag boolFlag
-	flag.Var(&execFlag, "exec", "Execute the entrypoint as PID 1 taking over init")
-	gpu := flag.Bool("gpu", false, "Enable GPU and create a window")
-	termWin := flag.Bool("term", false, "Open a terminal window and connect it to the VM console")
-	addVirtioFs := flag.String("add-virtiofs", "", "Specify a comma-separated list of blank virtio-fs tags to create")
-	timesliceFile := flag.String("timeslice-file", "", "Write timeslice data to file")
-	archFlag := flag.String("arch", "", "Target architecture (amd64, arm64). If different from host, enables QEMU emulation")
+	workdir := flag.String("workdir", "", "Working directory inside the container")
+	user := flag.String("user", "", "User to run as (uid or uid:gid)")
+	dmesg := flag.Bool("dmesg", false, "Enable kernel dmesg output (loglevel=7)")
+	execMode := flag.Bool("exec", false, "Run entrypoint as PID 1 (no fork)")
+	packetdump := flag.String("packetdump", "", "Write packet capture to file (pcap format)")
+	mountFlags := &mountSlice{}
+	flag.Var(mountFlags, "mount", "Mount: tag (empty writable), tag:hostpath (read-only), or tag:hostpath:rw")
+	gpuFlag := flag.Bool("gpu", false, "Enable GPU and open a window for display")
+	cacheDir := flag.String("cache-dir", "", "OCI image cache directory (default: platform-specific)")
+	envFlags := &stringSlice{}
+	flag.Var(envFlags, "env", "Environment variables (KEY=value), can be specified multiple times")
+
+	// New flags for bundle, arch, and dockerfile support
+	buildOut := flag.String("build", "", "Build a prebaked bundle at this path and exit")
+	archFlag := flag.String("arch", "", "Target architecture (amd64, arm64)")
+	dockerfile := flag.String("dockerfile", "", "Path to Dockerfile to build and run")
+
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <image> [command] [args...]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <image|bundle> [command] [args...]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Run a command inside an OCI container image in a virtual machine.\n\n")
 		fmt.Fprintf(os.Stderr, "Examples:\n")
 		fmt.Fprintf(os.Stderr, "  %s alpine:latest /bin/sh -c 'echo hello'\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "  %s ubuntu:22.04 ls -la\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "Flags:\n")
+		fmt.Fprintf(os.Stderr, "  %s -memory 512 -timeout 30s alpine:latest sleep 10\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -arch arm64 alpine:latest uname -m\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -dockerfile ./Dockerfile\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s -build ./mybundle alpine:latest\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s ./mybundle\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nFlags:\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-
-	var virtioFsTags []string
-
-	if *addVirtioFs != "" {
-		virtioFsTags = strings.Split(*addVirtioFs, ",")
-		for _, tag := range virtioFsTags {
-			if tag == "" {
-				return fmt.Errorf("empty virtio-fs tag")
-			}
-		}
-	}
-
-	// Check for debug file from flag or environment variable
-	debugFilePath := *debugFile
-	if debugFilePath == "" {
-		debugFilePath = os.Getenv("CC_DEBUG_FILE")
-	}
-	if debugFilePath != "" {
-		if err := debug.OpenFile(debugFilePath); err != nil {
-			return fmt.Errorf("open debug file: %w", err)
-		}
-		defer debug.Close()
-
-		debug.Writef("cc debug logging enabled", "filename=%s", debugFilePath)
-	}
-
-	if *timesliceFile != "" {
-		f, err := os.Create(*timesliceFile)
-		if err != nil {
-			return fmt.Errorf("create timeslice file: %w", err)
-		}
-		defer f.Close()
-
-		w, err := timeslice.StartRecording(f)
-		if err != nil {
-			return fmt.Errorf("open timeslice file: %w", err)
-		}
-		defer w.Close()
-	}
-
-	if *dbg {
-		slog.SetDefault(slog.New(slog.NewTextHandler(
-			&fixCrlf{w: os.Stderr},
-			&slog.HandlerOptions{Level: slog.LevelDebug},
-		)))
-	} else {
-		slog.SetDefault(slog.New(slog.NewTextHandler(
-			&fixCrlf{w: os.Stderr},
-			&slog.HandlerOptions{Level: slog.LevelInfo},
-		)))
-	}
-
-	if *cpuprofile != "" {
-		f, err := os.Create(*cpuprofile)
-		if err != nil {
-			return fmt.Errorf("create cpu profile file: %w", err)
-		}
-		defer f.Close()
-
-		if err := pprof.StartCPUProfile(f); err != nil {
-			return fmt.Errorf("start cpu profile: %w", err)
-		}
-		defer pprof.StopCPUProfile()
-	}
-
-	if *memprofile != "" {
-		defer func() {
-			f, err := os.Create(*memprofile)
-			if err != nil {
-				slog.Error("create memory profile file", "error", err)
-				return
-			}
-			defer f.Close()
-
-			if err := pprof.Lookup("heap").WriteTo(f, 0); err != nil {
-				slog.Error("write memory profile", "error", err)
-			}
-		}()
-	}
-
-	if *packetdump != "" && !networkFlag.v {
-		return fmt.Errorf("-packetdump requires -network")
-	}
-	if *termWin && *gpu {
-		return fmt.Errorf("-term and -gpu are mutually exclusive")
-	}
-	if *termWin && *dbg {
-		return fmt.Errorf("-term and -debug are mutually exclusive")
-	}
+	recordSetFlags()
 
 	args := flag.Args()
-	if len(args) < 1 {
+
+	// Validate conflicting options
+	if *dockerfile != "" && *buildOut != "" {
+		return fmt.Errorf("-dockerfile and -build cannot be used together")
+	}
+
+	// For -dockerfile mode, no positional args required
+	// For other modes, need at least one arg (image or bundle)
+	if *dockerfile == "" && len(args) < 1 {
 		flag.Usage()
 		return fmt.Errorf("image reference required")
 	}
 
-	imageRef := args[0]
+	var imageRef string
 	var cmd []string
-	if len(args) > 1 {
-		cmd = args[1:]
-	}
-
-	// Determine host architecture (for hypervisor)
-	hvArch, err := parseArchitecture(runtime.GOARCH)
-	if err != nil {
-		return err
-	}
-
-	// Determine target architecture for image
-	imageArch := hvArch
-	if *archFlag != "" {
-		imageArch, err = parseArchitecture(*archFlag)
-		if err != nil {
-			return fmt.Errorf("invalid -arch value: %w", err)
+	if len(args) > 0 {
+		imageRef = args[0]
+		if len(args) > 1 {
+			cmd = args[1:]
 		}
 	}
 
-	// Create OCI client
-	client, err := oci.NewClient(*cacheDir)
+	// Create shared cache directory
+	cache, err := cc.NewCacheDir(*cacheDir)
+	if err != nil {
+		return fmt.Errorf("create cache: %w", err)
+	}
+
+	// Create OCI client using shared cache
+	client, err := cc.NewOCIClientWithCache(cache)
 	if err != nil {
 		return fmt.Errorf("create OCI client: %w", err)
 	}
 
-	if *buildOut != "" {
-		img, err := client.PullForArch(imageRef, hvArch)
+	// Create context with optional timeout
+	ctx := context.Background()
+	if *timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, *timeout)
+		defer cancel()
+	}
+
+	// Source selection
+	var source cc.InstanceSource
+	var bundleMeta *bundle.Metadata
+	var runtimeConfig *cc.DockerfileRuntimeConfig
+
+	switch {
+	case *dockerfile != "":
+		// Build from Dockerfile
+		content, err := os.ReadFile(*dockerfile)
+		if err != nil {
+			return fmt.Errorf("read dockerfile: %w", err)
+		}
+		contextDir := filepath.Dir(*dockerfile)
+
+		source, err = cc.BuildDockerfileSource(ctx, content, client,
+			cc.WithBuildContextDir(contextDir),
+			cc.WithDockerfileCacheDir(cache.SnapshotPath()),
+		)
+		if err != nil {
+			return fmt.Errorf("build dockerfile: %w", err)
+		}
+		runtimeConfig, _ = cc.BuildDockerfileRuntimeConfig(content)
+
+	case bundle.IsBundleDir(imageRef):
+		// Load from bundle
+		meta, err := bundle.LoadMetadata(imageRef)
+		if err != nil {
+			return fmt.Errorf("load bundle metadata: %w", err)
+		}
+		bundleMeta = &meta
+
+		imageDir := filepath.Join(imageRef, meta.Boot.ImageDir)
+		pullOpts := buildPullOpts(*archFlag)
+		source, err = client.LoadFromDir(imageDir, pullOpts...)
+		if err != nil {
+			return fmt.Errorf("load bundle image: %w", err)
+		}
+
+	default:
+		// Pull OCI image
+		pullOpts := buildPullOpts(*archFlag)
+		source, err = client.Pull(ctx, imageRef, pullOpts...)
 		if err != nil {
 			return fmt.Errorf("pull image: %w", err)
 		}
+	}
 
+	defer func() {
+		if closer, ok := source.(io.Closer); ok {
+			closer.Close()
+		}
+	}()
+
+	// Apply bundle defaults (only if flag not explicitly set)
+	if bundleMeta != nil {
+		if !isFlagSet("cpus") && bundleMeta.Boot.CPUs != 0 {
+			*cpus = bundleMeta.Boot.CPUs
+		}
+		if !isFlagSet("memory") && bundleMeta.Boot.MemoryMB != 0 {
+			*memoryMB = bundleMeta.Boot.MemoryMB
+		}
+		if !isFlagSet("exec") && bundleMeta.Boot.Exec {
+			*execMode = true
+		}
+		if !isFlagSet("dmesg") && bundleMeta.Boot.Dmesg {
+			*dmesg = true
+		}
+		// Prepend bundle env to user env
+		if len(bundleMeta.Boot.Env) > 0 {
+			envFlags.values = append(bundleMeta.Boot.Env, envFlags.values...)
+		}
+	}
+
+	// Handle bundle building (-build flag)
+	if *buildOut != "" {
+		// Export image to bundle directory
 		imageDir := filepath.Join(*buildOut, bundle.DefaultImageDir)
-		if err := oci.ExportToDir(img, imageDir); err != nil {
-			return fmt.Errorf("export prebaked image: %w", err)
+		if err := client.ExportToDir(source, imageDir); err != nil {
+			return fmt.Errorf("export image: %w", err)
 		}
 
+		// Create metadata
 		meta := bundle.Metadata{
 			Version:     1,
 			Name:        "{{name}}",
 			Description: "{{description}}",
 			Boot: bundle.BootConfig{
 				ImageDir: bundle.DefaultImageDir,
-				Command:  img.Command(cmd),
-				CPUs:     cpusFlag.v,
-				MemoryMB: memoryFlag.v,
-				Exec:     execFlag.v,
-				Dmesg:    dmesgFlag.v,
+				Command:  cmd,
+				CPUs:     *cpus,
+				MemoryMB: *memoryMB,
+				Exec:     *execMode,
+				Dmesg:    *dmesg,
+				Env:      envFlags.values,
 			},
 		}
+
 		if err := bundle.WriteTemplate(*buildOut, meta); err != nil {
 			return fmt.Errorf("write bundle metadata: %w", err)
 		}
 
-		slog.Info("bundle built", "dir", *buildOut)
+		fmt.Printf("Bundle created at %s\n", *buildOut)
 		return nil
 	}
 
-	slog.Debug("Loading image", "ref", imageRef, "arch", imageArch)
-	debug.Writef("cc.run load image", "loading image %s for architecture %s", imageRef, imageArch)
-
-	var meta bundle.Metadata
-	var img *oci.Image
-
-	switch {
-	case bundle.IsBundleDir(imageRef):
-		m, loaded, err := bundle.Load(imageRef)
-		if err != nil {
-			return err
-		}
-		meta, img = m, loaded
-
-		// Apply bundle boot defaults iff the user did not override via flags.
-		if !cpusFlag.set && meta.Boot.CPUs != 0 {
-			cpusFlag.v = meta.Boot.CPUs
-		}
-		if !memoryFlag.set && meta.Boot.MemoryMB != 0 {
-			memoryFlag.v = meta.Boot.MemoryMB
-		}
-		if !execFlag.set {
-			execFlag.v = meta.Boot.Exec
-		}
-		if !dmesgFlag.set {
-			dmesgFlag.v = meta.Boot.Dmesg
-		}
-	case hasConfigJSON(imageRef):
-		loaded, err := oci.LoadFromDir(imageRef)
-		if err != nil {
-			return fmt.Errorf("load prebaked image: %w", err)
-		}
-		img = loaded
-	default:
-		loaded, err := client.PullForArch(imageRef, imageArch)
-		if err != nil {
-			return fmt.Errorf("pull image: %w", err)
-		}
-		img = loaded
-	}
-
-	slog.Debug("Image pulled", "layers", len(img.Layers), "arch", img.Config.Architecture)
-	debug.Writef("cc.run image pulled", "image pulled with %d layers, arch=%s", len(img.Layers), img.Config.Architecture)
-
-	// Update imageArch based on actual pulled image architecture (may differ from requested)
-	if img.Config.Architecture != "" {
-		actualArch, err := parseArchitecture(img.Config.Architecture)
-		if err == nil && actualArch != imageArch {
-			slog.Info("Image architecture differs from requested", "requested", imageArch, "actual", actualArch)
-			imageArch = actualArch
-		}
-	}
-
-	// Determine command to run
-	var execCmd []string
-	if len(cmd) > 0 {
-		execCmd = img.Command(cmd)
-	} else if meta.Version != 0 && len(meta.Boot.Command) > 0 {
-		execCmd = meta.Boot.Command
-	} else {
-		execCmd = img.Command(nil)
-	}
-	if len(execCmd) == 0 {
-		return fmt.Errorf("no command specified and image has no entrypoint/cmd")
-	}
-
-	pathEnv := extractInitialPath(img.Config.Env)
-	workDir := containerWorkDir(img)
-
-	// Create container filesystem
-	containerFS, err := oci.NewContainerFS(img)
-	if err != nil {
-		return fmt.Errorf("create container filesystem: %w", err)
-	}
-	defer containerFS.Close()
-
-	debug.Writef("cc.run container filesystem created", "container filesystem created")
-
-	execCmd, err = resolveCommandPath(containerFS, execCmd, pathEnv, workDir)
-	if err != nil {
-		return fmt.Errorf("resolve command: %w", err)
-	}
-
-	// If we're executing the entrypoint as PID 1, prefer exec'ing the resolved
-	// target rather than a symlink path. This matters for binaries that rely on
-	// $ORIGIN-based RUNPATH (e.g. Debian's systemd via /sbin/init symlink).
-	if execFlag.v && strings.HasPrefix(execCmd[0], "/") {
-		if resolved, err := containerFS.ResolvePath(execCmd[0]); err == nil {
-			execCmd[0] = resolved
-		}
-	}
-
-	slog.Debug("Running command", "cmd", execCmd)
-	debug.Writef("cc.run running command", "running command %v", execCmd)
-
-	// Create VirtioFS backend with container filesystem as root
-	fsBackend := vfs.NewVirtioFsBackendWithAbstract()
-	if err := fsBackend.SetAbstractRoot(containerFS); err != nil {
-		return fmt.Errorf("set container filesystem as root: %w", err)
-	}
-
-	// Create hypervisor
-	h, err := factory.OpenWithArchitecture(hvArch)
-	if err != nil {
-		return fmt.Errorf("create hypervisor: %w", err)
-	}
-	defer h.Close()
-
-	debug.Writef("cc.run hypervisor created", "hypervisor created")
-
-	// Load kernel
-	kernelLoader, err := kernel.LoadForArchitecture(hvArch)
-	if err != nil {
-		return fmt.Errorf("load kernel: %w", err)
-	}
-
-	debug.Writef("cc.run kernel loaded", "kernel loaded for architecture %s", hvArch)
-
-	// Add kernel modules to VFS for modprobe support
-	if err := initx.AddKernelModulesToVFS(fsBackend, kernelLoader); err != nil {
-		return fmt.Errorf("add kernel modules: %w", err)
-	}
-	debug.Writef("cc.run modules added", "added kernel modules to VFS")
-
-	// Create VM with VirtioFS
-	opts := []initx.Option{
-		initx.WithDeviceTemplate(virtio.FSTemplate{
-			Tag:     "rootfs",
-			Backend: fsBackend,
-			Arch:    hvArch,
-		}),
-		initx.WithDebugLogging(*dbg),
-		initx.WithDmesgLogging(dmesgFlag.v),
-	}
-
-	base := uint64(0xd0006000)
-
-	for _, tag := range virtioFsTags {
-		opts = append(opts, initx.WithDeviceTemplate(virtio.FSTemplate{
-			Tag:      tag,
-			Backend:  vfs.NewVirtioFsBackendWithAbstract(),
-			MMIOBase: base,
-			Arch:     hvArch,
-		}))
-		base += 0x2000
-	}
-
-	var termWindow *termwin.Terminal
-	if *termWin {
-		scale := window.GetDisplayScale()
-		physWidth := int(float32(1024) * scale)
-		physHeight := int(float32(768) * scale)
-
-		tw, err := termwin.New("cc", physWidth, physHeight)
-		if err != nil {
-			return fmt.Errorf("create terminal window: %w", err)
-		}
-		termWindow = tw
-		defer termWindow.Close()
-
-		opts = append(opts,
-			initx.WithStdin(termWindow),
-			initx.WithConsoleOutput(termWindow),
-		)
-	} else {
-		// Wrap stdin with a filter to strip CPR responses on Windows.
-		opts = append(opts, initx.WithStdin(wrapStdinForVT(os.Stdin)))
-	}
-
-	// Add network device if enabled
-	if networkFlag.v {
-		backend := netstack.New(slog.Default())
-		var packetDumpFile *os.File
-		defer func() {
-			_ = backend.Close()
-			if packetDumpFile != nil {
-				_ = packetDumpFile.Close()
-			}
-		}()
-
-		if *packetdump != "" {
-			dir := filepath.Dir(*packetdump)
-			if dir != "." {
-				if err := os.MkdirAll(dir, 0o755); err != nil {
-					return fmt.Errorf("create packet dump directory: %w", err)
-				}
-			}
-			f, err := os.Create(*packetdump)
-			if err != nil {
-				return fmt.Errorf("create packet dump file: %w", err)
-			}
-			packetDumpFile = f
-			if err := backend.OpenPacketCapture(packetDumpFile); err != nil {
-				return fmt.Errorf("enable packet capture: %w", err)
+	// Determine command (priority: CLI > bundle > Dockerfile > image default > /bin/sh)
+	if len(cmd) == 0 {
+		if bundleMeta != nil && len(bundleMeta.Boot.Command) > 0 {
+			cmd = bundleMeta.Boot.Command
+		} else if runtimeConfig != nil {
+			if len(runtimeConfig.Entrypoint) > 0 {
+				cmd = append(runtimeConfig.Entrypoint, runtimeConfig.Cmd...)
+			} else if len(runtimeConfig.Cmd) > 0 {
+				cmd = runtimeConfig.Cmd
 			}
 		}
-
-		if err := backend.StartDNSServer(); err != nil {
-			return fmt.Errorf("start DNS server: %w", err)
+		if len(cmd) == 0 {
+			cmd = []string{"/bin/sh"}
 		}
+	}
 
-		mac := net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
+	// Detect if stdin is a terminal for interactive mode
+	isTerminal := term.IsTerminal(int(os.Stdin.Fd()))
 
-		netBackend, err := virtio.NewNetstackBackend(backend, mac)
+	// Set up packet capture if requested
+	var pcapFile *os.File
+	if *packetdump != "" {
+		var err error
+		pcapFile, err = os.Create(*packetdump)
 		if err != nil {
-			return fmt.Errorf("create netstack backend: %w", err)
+			return fmt.Errorf("create packet capture file: %w", err)
 		}
-
-		opts = append(opts, initx.WithDeviceTemplate(virtio.NetTemplate{
-			Backend: netBackend,
-			MAC:     mac,
-			Arch:    hvArch,
-		}))
-
-		debug.Writef("cc.run networking enabled", "networking enabled")
+		defer pcapFile.Close()
 	}
 
-	if *gpu {
-		opts = append(opts, initx.WithGPUEnabled(true))
+	// Build instance options
+	var opts []cc.Option
+	opts = append(opts, cc.WithMemoryMB(*memoryMB))
+	opts = append(opts, cc.WithCPUs(*cpus))
+	if *dmesg {
+		opts = append(opts, cc.WithDmesg())
+	}
+	// Note: execMode is handled after instance creation via inst.Exec()
+	if pcapFile != nil {
+		opts = append(opts, cc.WithPacketCapture(pcapFile))
+	}
+	for _, mount := range mountFlags.mounts {
+		opts = append(opts, cc.WithMount(mount))
+	}
+	if *gpuFlag {
+		opts = append(opts, cc.WithGPU())
 	}
 
-	// Check if we need QEMU emulation for cross-architecture support
-	// We need to detect this before creating the VM so binfmt_misc module is loaded
-	needsQEMU := initx.NeedsQEMUEmulation(hvArch, imageArch)
-	if needsQEMU {
-		opts = append(opts, initx.WithQEMUEmulationEnabled(true))
+	// Note: env and workdir are set at command level via SetEnv/SetDir
+
+	if *user != "" {
+		opts = append(opts, cc.WithUser(*user))
 	}
 
-	// Set up vsock for program loading and command execution
-	vsockBackend := virtio.NewSimpleVsockBackend()
-	opts = append(opts,
-		initx.WithDeviceTemplate(virtio.VsockTemplate{
-			MMIODeviceTemplateBase: virtio.MMIODeviceTemplateBase{
-				Arch:   hvArch,
-				Config: virtio.VsockDeviceConfig(),
-			},
-			GuestCID: 3,
-			Backend:  vsockBackend,
-		}),
-		initx.WithVsockProgramLoader(vsockBackend, initx.VsockProgramPort),
-	)
-
-	vm, err := initx.NewVirtualMachine(
-		h,
-		cpusFlag.v,
-		memoryFlag.v,
-		kernelLoader,
-		opts...,
-	)
-	if err != nil {
-		return fmt.Errorf("create VM: %w", err)
-	}
-	defer vm.Close()
-
-	// Ensure TERM is set for the container so terminal apps work correctly.
-	env := img.Config.Env
-	if !hasEnvVar(env, "TERM") {
-		env = append(env, "TERM=xterm-256color")
-	}
-
-	// Prepare QEMU emulation config if needed (detection was done above before VM creation)
-	var qemuConfig *initx.QEMUEmulationConfig
-	if needsQEMU {
-		slog.Info("Cross-architecture image detected, enabling QEMU emulation",
-			"host", hvArch, "image", imageArch)
-		debug.Writef("cc.run qemu", "enabling QEMU emulation for %s on %s host", imageArch, hvArch)
-
-		cfg, err := initx.PrepareQEMUEmulation(hvArch, imageArch, client.CacheDir())
-		if err != nil {
-			return fmt.Errorf("prepare QEMU emulation: %w", err)
-		}
-		qemuConfig = cfg
-	}
-
-	slog.Debug("Booting VM")
-
-	var ctx context.Context
 	if *timeout > 0 {
-		newCtx, cancel := context.WithTimeout(context.Background(), *timeout)
-		defer cancel()
-		ctx = newCtx
-	} else {
-		ctx = context.Background()
+		opts = append(opts, cc.WithTimeout(*timeout))
 	}
 
-	// Put stdin into raw mode so we don't send cooked/echoed characters into the guest.
-	// Do this after booting so that any Ctrl+C during boot still works to kill cc itself.
+	// Use shared cache directory for QEMU emulation and other cached resources
+	opts = append(opts, cc.WithCache(cache))
 
-	debug.Writef("cc.run running command", "running command %v", execCmd)
+	// Enable interactive mode when connected to a terminal
+	if isTerminal {
+		opts = append(opts, cc.WithInteractiveIO(wrapStdinForVT(os.Stdin), os.Stdout))
+	}
 
-	// Build the container init program
-	prog, err := initx.BuildContainerInitProgram(initx.ContainerInitConfig{
-		Arch:                  hvArch,
-		Cmd:                   execCmd,
-		Env:                   env,
-		WorkDir:               workDir,
-		EnableNetwork:         networkFlag.v,
-		Exec:                  execFlag.v,
-		UID:                   img.Config.UID,
-		GID:                   img.Config.GID,
-		QEMUEmulation:         qemuConfig,
-		TimesliceMMIOPhysAddr: vm.TimesliceMMIOPhysAddr(),
-	})
+	// Create and start the instance
+	inst, err := cc.New(source, opts...)
 	if err != nil {
-		return err
+		if errors.Is(err, cc.ErrHypervisorUnavailable) {
+			return fmt.Errorf("hypervisor unavailable: %w", err)
+		}
+		return fmt.Errorf("create instance: %w", err)
+	}
+	defer inst.Close()
+
+	// Put stdin into raw mode if it's a terminal (for interactive mode)
+	var oldState *term.State
+	if isTerminal && !*gpuFlag {
+		// Enable Windows VT processing if needed (no-op on Unix)
+		restoreVT, err := enableVTProcessing()
+		if err != nil {
+			// Not fatal - some older Windows versions may not support VT processing
+			fmt.Fprintf(os.Stderr, "warning: could not enable VT processing: %v\n", err)
+		} else {
+			defer restoreVT()
+		}
+
+		oldState, err = term.MakeRaw(int(os.Stdin.Fd()))
+		if err != nil {
+			return fmt.Errorf("enable raw mode: %w", err)
+		}
+		defer term.Restore(int(os.Stdin.Fd()), oldState)
 	}
 
-	var sessionCfg initx.SessionConfig
+	// Handle GPU mode with display loop
+	if *gpuFlag && inst.GPU() != nil {
+		return runWithGPU(inst, cmd)
+	}
 
-	// Start the VM session now that we have the final execution context.
-	// This handles boot → stdin forwarding → payload run.
-	session := initx.StartSession(ctx, vm, prog, sessionCfg)
-
-	// If GPU is enabled, set up the display manager and drive the window loop
-	// on the main thread while the VM runs in the background.
-	if *gpu && vm.GPU() != nil {
-		// Get display scale factor and calculate physical window dimensions
-		scale := window.GetDisplayScale()
-		physWidth := int(float32(1024) * scale)
-		physHeight := int(float32(768) * scale)
-
-		// Create window for display with scaled dimensions
-		win, err := window.New("cc", physWidth, physHeight, true)
-		if err != nil {
-			return fmt.Errorf("failed to create window: %w", err)
-		} else {
-			defer win.Close()
-
-			// Create display manager and connect to GPU/Input devices
-			displayMgr := virtio.NewDisplayManager(vm.GPU(), vm.Keyboard(), vm.Tablet())
-			displayMgr.SetWindow(win)
-
-			// Run display loop on main thread
-			ticker := time.NewTicker(16 * time.Millisecond) // ~60 FPS
-			defer ticker.Stop()
-
-		displayLoop:
-			for {
-				select {
-				case err := <-session.Done:
-					if err != nil {
-						return fmt.Errorf("run executable in initx virtual machine: %w", err)
-					}
-					break displayLoop
-				case <-ctx.Done():
-					return fmt.Errorf("context cancelled: %w", ctx.Err())
-				case <-ticker.C:
-					// Poll window events
-					if !displayMgr.Poll() {
-						// Window was closed
-						return fmt.Errorf("window closed by user")
-					}
-					// Render and swap
-					displayMgr.Render()
-					displayMgr.Swap()
-				}
+	// Handle exec mode - command replaces init as PID 1
+	if *execMode {
+		if err := inst.Exec(cmd[0], cmd[1:]...); err != nil {
+			// Restore terminal before exiting
+			if oldState != nil {
+				term.Restore(int(os.Stdin.Fd()), oldState)
 			}
-
-			slog.Info("cc: command exited")
-			return nil
+			return fmt.Errorf("exec: %w", err)
 		}
-	} else if *termWin && termWindow != nil {
-		// If terminal window is enabled, run VM in background and drive the window loop
-		// on the main thread.
+		return nil
+	}
 
-		var lastResize struct {
-			cols int
-			rows int
+	// Run the command (fork/exec mode)
+	cmdObj := inst.Command(cmd[0], cmd[1:]...)
+
+	// Apply environment variables from -env flags
+	for _, env := range envFlags.values {
+		key, value, _ := strings.Cut(env, "=")
+		cmdObj.SetEnv(key, value)
+	}
+
+	// Apply working directory from -workdir flag
+	if *workdir != "" {
+		cmdObj.SetDir(*workdir)
+	}
+
+	// Configure I/O
+	if !isTerminal {
+		// Capture mode - use vsock for stdin/stdout
+		cmdObj.SetStdin(os.Stdin).
+			SetStdout(os.Stdout).
+			SetStderr(os.Stderr)
+	}
+	// Interactive mode - stdin/stdout are handled by virtio-console
+
+	if err := cmdObj.Run(); err != nil {
+		// Restore terminal before exiting
+		if oldState != nil {
+			term.Restore(int(os.Stdin.Fd()), oldState)
 		}
 
-		err := termWindow.Run(ctx, termwin.Hooks{
-			OnResize: func(cols, rows int) {
-				if cols == lastResize.cols && rows == lastResize.rows {
-					return
-				}
-				lastResize.cols, lastResize.rows = cols, rows
-				vm.SetConsoleSize(cols, rows)
-			},
-			OnFrame: func() error {
-				select {
-				case err := <-session.Done:
-					if err != nil {
-						var exitErr *initx.ExitError
-						if errors.As(err, &exitErr) {
-							return exitErr
-						}
-						return fmt.Errorf("run VM: %w", err)
+		// Check if it's an exit error with a non-zero code
+		exitCode := cmdObj.ExitCode()
+		if exitCode != 0 {
+			return &initx.ExitError{Code: exitCode}
+		}
+		return fmt.Errorf("run command: %w", err)
+	}
+
+	return nil
+}
+
+// buildPullOpts constructs pull options based on the arch flag.
+func buildPullOpts(arch string) []cc.OCIPullOption {
+	var opts []cc.OCIPullOption
+	if arch != "" {
+		opts = append(opts, cc.WithPlatform("linux", arch))
+	}
+	return opts
+}
+
+// runWithGPU runs a command with GPU display enabled.
+// The display loop runs on the main thread while the command runs in a goroutine.
+func runWithGPU(inst cc.Instance, cmd []string) error {
+	gpu := inst.GPU()
+
+	// Get display scale factor and calculate physical window dimensions
+	scale := window.GetDisplayScale()
+	physWidth := int(float32(1024) * scale)
+	physHeight := int(float32(768) * scale)
+
+	// Create window (useCoreProfile=true for modern OpenGL)
+	win, err := window.New("cc", physWidth, physHeight, true)
+	if err != nil {
+		return fmt.Errorf("create window: %w", err)
+	}
+	defer win.Close()
+
+	// Connect GPU to window
+	gpu.SetWindow(win)
+
+	// Run command in a goroutine
+	cmdDone := make(chan error, 1)
+	var cmdObj cc.Cmd
+	go func() {
+		cmdObj = inst.Command(cmd[0], cmd[1:]...).
+			SetStdin(os.Stdin).
+			SetStdout(os.Stdout).
+			SetStderr(os.Stderr)
+		cmdDone <- cmdObj.Run()
+	}()
+
+	// Run display loop on main thread at ~60 FPS
+	ticker := time.NewTicker(16 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case err := <-cmdDone:
+			if err != nil {
+				if cmdObj != nil {
+					exitCode := cmdObj.ExitCode()
+					if exitCode != 0 {
+						return &initx.ExitError{Code: exitCode}
 					}
-					return io.EOF // stop loop cleanly
-				default:
-					return nil
 				}
-			},
-		})
-		if err != nil {
-			if errors.Is(err, termwin.ErrWindowClosed) {
-				// Best-effort: stop the VM when the user closes the window.
-				_ = session.Stop(2 * time.Second)
+				return fmt.Errorf("run command: %w", err)
+			}
+			return nil
+
+		case <-ticker.C:
+			// Poll window events
+			if !gpu.Poll() {
+				// Window was closed
 				return fmt.Errorf("window closed by user")
 			}
-			if errors.Is(err, io.EOF) {
-				// VM finished successfully and asked us to stop the loop.
-				slog.Info("cc: command exited")
-				return nil
-			}
-			var exitErr *initx.ExitError
-			if errors.As(err, &exitErr) {
-				return exitErr
-			}
-			return err
+			// Render and swap
+			gpu.Render()
+			gpu.Swap()
 		}
-
-		// If the loop returned nil, treat it as window closed.
-		return fmt.Errorf("window closed by user")
-	} else {
-		if term.IsTerminal(int(os.Stdin.Fd())) {
-			// On Windows, enable VT processing on stdout so ANSI sequences are interpreted.
-			restoreVT, err := enableVTProcessing()
-			if err != nil {
-				return fmt.Errorf("enable VT processing: %w", err)
-			}
-			defer restoreVT()
-
-			oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
-			if err != nil {
-				return fmt.Errorf("enable raw mode: %w", err)
-			}
-			defer term.Restore(int(os.Stdin.Fd()), oldState)
-		}
-
-		if err := session.Wait(); err != nil {
-			var exitErr *initx.ExitError
-			if errors.As(err, &exitErr) {
-				return exitErr
-			}
-			return fmt.Errorf("run VM: %w", err)
-		}
-
-		debug.Writef("cc.run command exited", "command exited")
-
-		return nil
 	}
 }
 
-func parseArchitecture(arch string) (hv.CpuArchitecture, error) {
-	switch arch {
-	case "amd64", "x86_64":
-		return hv.ArchitectureX86_64, nil
-	case "arm64", "aarch64":
-		return hv.ArchitectureARM64, nil
-	default:
-		return "", fmt.Errorf("unsupported architecture: %s", arch)
-	}
+// stringSlice implements flag.Value for collecting multiple string flags.
+type stringSlice struct {
+	values []string
 }
 
-const defaultPathEnv = "/bin:/usr/bin"
-
-func extractInitialPath(env []string) string {
-	for _, entry := range env {
-		if after, ok := strings.CutPrefix(entry, "PATH="); ok {
-			return after
-		}
-	}
-	return defaultPathEnv
+func (s *stringSlice) String() string {
+	return strings.Join(s.values, ", ")
 }
 
-func hasEnvVar(env []string, name string) bool {
-	prefix := name + "="
-	for _, e := range env {
-		if strings.HasPrefix(e, prefix) {
-			return true
-		}
-	}
-	return false
+func (s *stringSlice) Set(value string) error {
+	s.values = append(s.values, value)
+	return nil
 }
 
-func hasConfigJSON(dir string) bool {
-	_, err := os.Stat(filepath.Join(dir, "config.json"))
-	return err == nil
+// mountSlice implements flag.Value for collecting multiple mount flags.
+type mountSlice struct {
+	mounts []cc.MountConfig
 }
 
-func containerWorkDir(img *oci.Image) string {
-	if img.Config.WorkingDir == "" {
-		return "/"
-	}
-	return img.Config.WorkingDir
+func (m *mountSlice) String() string {
+	return ""
 }
 
-func resolveCommandPath(fs *oci.ContainerFS, cmd []string, pathEnv string, workDir string) ([]string, error) {
-	if len(cmd) == 0 {
-		return nil, fmt.Errorf("empty command")
+func (m *mountSlice) Set(value string) error {
+	// Format: tag (empty writable), tag:hostpath (read-only), or tag:hostpath:rw
+	parts := strings.Split(value, ":")
+	if len(parts) == 0 || parts[0] == "" {
+		return fmt.Errorf("mount format: tag, tag:hostpath, or tag:hostpath:rw")
 	}
 
-	resolved := make([]string, len(cmd))
-	copy(resolved, cmd)
-
-	if strings.Contains(resolved[0], "/") {
-		return resolved, nil
+	config := cc.MountConfig{
+		Tag:      parts[0],
+		Writable: true, // default writable for empty mounts
 	}
 
-	resolvedPath, err := lookPath(fs, pathEnv, workDir, resolved[0])
-	if err != nil {
-		return nil, err
-	}
-	resolved[0] = resolvedPath
-	return resolved, nil
-}
-
-func lookPath(fs *oci.ContainerFS, pathEnv string, workDir string, file string) (string, error) {
-	if file == "" {
-		return "", fmt.Errorf("executable name is empty")
-	}
-	if pathEnv == "" {
-		pathEnv = defaultPathEnv
-	}
-	if workDir == "" {
-		workDir = "/"
+	if len(parts) >= 2 && parts[1] != "" {
+		config.HostPath = parts[1]
+		config.Writable = false // default read-only for host mounts
 	}
 
-	for dir := range strings.SplitSeq(pathEnv, ":") {
-		switch {
-		case dir == "":
-			dir = workDir
-		case !path.IsAbs(dir):
-			dir = path.Join(workDir, dir)
-		}
-
-		candidate := path.Join(dir, file)
-		entry, err := fs.Lookup(candidate)
-		if err != nil {
-			continue
-		}
-
-		// If it's a symlink, resolve it and check the target
-		if entry.Symlink != nil {
-			resolved, err := fs.ResolvePath(candidate)
-			if err != nil {
-				continue
-			}
-			entry, err = fs.Lookup(resolved)
-			if err != nil {
-				continue
-			}
-		}
-
-		if entry.File == nil {
-			continue
-		}
-		_, mode := entry.File.Stat()
-		if mode.IsDir() || mode&0o111 == 0 {
-			continue
-		}
-
-		return candidate, nil
+	if len(parts) >= 3 && parts[2] == "rw" {
+		config.Writable = true
 	}
 
-	return "", fmt.Errorf("executable %q not found in PATH", file)
-}
-
-func getSnapshotCacheDir(cacheDir string) (string, error) {
-	if cacheDir == "" {
-		cfg, err := os.UserConfigDir()
-		if err != nil {
-			return "", err
-		}
-		cacheDir = filepath.Join(cfg, "cc")
-	}
-	return filepath.Join(cacheDir, "snapshots"), nil
+	m.mounts = append(m.mounts, config)
+	return nil
 }
