@@ -483,10 +483,37 @@ func (c *instanceCmd) SetDir(dir string) Cmd {
 	return c
 }
 
-// SetEnv sets the environment variables for the command.
-func (c *instanceCmd) SetEnv(env []string) Cmd {
-	c.env = env
+// SetEnv sets a single environment variable (like os.Setenv).
+func (c *instanceCmd) SetEnv(key, value string) Cmd {
+	// Look for existing key and update it
+	prefix := key + "="
+	for i, entry := range c.env {
+		if strings.HasPrefix(entry, prefix) {
+			c.env[i] = key + "=" + value
+			return c
+		}
+	}
+	// Not found, append new entry
+	c.env = append(c.env, key+"="+value)
 	return c
+}
+
+// GetEnv returns the value of an environment variable (like os.Getenv).
+func (c *instanceCmd) GetEnv(key string) string {
+	prefix := key + "="
+	for _, entry := range c.env {
+		if strings.HasPrefix(entry, prefix) {
+			return strings.TrimPrefix(entry, prefix)
+		}
+	}
+	return ""
+}
+
+// Environ returns a copy of the command's environment variables.
+func (c *instanceCmd) Environ() []string {
+	result := make([]string, len(c.env))
+	copy(result, c.env)
+	return result
 }
 
 // ExitCode returns the exit code of the exited process.
@@ -495,3 +522,61 @@ func (c *instanceCmd) ExitCode() int {
 }
 
 var _ Cmd = (*instanceCmd)(nil)
+
+// execCommand executes a command in "exec mode" - the command replaces init as PID 1.
+// Unlike Command().Run(), there is no fork - the command directly replaces the init process.
+// When the command exits, the VM terminates.
+func (inst *instance) execCommand(ctx context.Context, name string, args []string) error {
+	// Resolve command path
+	cmdPath := name
+	if !strings.Contains(cmdPath, "/") {
+		// Create a temporary cmd to use lookPath
+		tmpCmd := &instanceCmd{
+			inst: inst,
+			env:  inst.imageConfig.Env,
+			dir:  inst.imageConfig.WorkingDir,
+		}
+		resolved, err := tmpCmd.lookPath(cmdPath)
+		if err != nil {
+			return &Error{Op: "exec", Path: name, Err: err}
+		}
+		cmdPath = resolved
+	}
+
+	// Merge environment from image config
+	env := append([]string{}, inst.imageConfig.Env...)
+
+	// Build IR program using ExecOnly helper (no fork, just exec)
+	errLabel := ir.Label("exec_error")
+	errVar := ir.Var("exec_errno")
+
+	prog := &ir.Program{
+		Entrypoint: "main",
+		Methods: map[string]ir.Method{
+			"main": {
+				initx.ExecOnly(cmdPath, args, env, errLabel, errVar),
+				// If we get here, execve failed
+				ir.DeclareLabel(errLabel, ir.Block{
+					ir.Printf("cc: exec error: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+					ir.Return(errVar),
+				}),
+			},
+		},
+	}
+
+	// Run the program - this will replace init with the specified command
+	err := inst.vm.Run(ctx, prog)
+	if err != nil {
+		if exitErr, ok := err.(*initx.ExitError); ok {
+			if exitErr.Code != 0 {
+				if exitErr.Code < 0 {
+					return &Error{Op: "exec", Path: name, Err: fmt.Errorf("errno=0x%x", -exitErr.Code)}
+				}
+				return &Error{Op: "exec", Path: name, Err: fmt.Errorf("exit status %d", exitErr.Code)}
+			}
+			return nil
+		}
+		return &Error{Op: "exec", Path: name, Err: err}
+	}
+	return nil
+}

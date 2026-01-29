@@ -97,17 +97,6 @@ type memoryOption struct{ sizeMB uint64 }
 func (*memoryOption) IsOption()        {}
 func (o *memoryOption) SizeMB() uint64 { return o.sizeMB }
 
-// WithEnv sets environment variables for the guest init process.
-// Each entry should be in "KEY=value" format.
-func WithEnv(env ...string) Option {
-	return &envOption{env: env}
-}
-
-type envOption struct{ env []string }
-
-func (*envOption) IsOption()       {}
-func (o *envOption) Env() []string { return o.env }
-
 // WithTimeout sets a maximum lifetime for the instance. After this duration,
 // the instance is forcibly terminated.
 func WithTimeout(d time.Duration) Option {
@@ -118,16 +107,6 @@ type timeoutOption struct{ d time.Duration }
 
 func (*timeoutOption) IsOption()                 {}
 func (o *timeoutOption) Duration() time.Duration { return o.d }
-
-// WithWorkdir sets the initial working directory for commands.
-func WithWorkdir(path string) Option {
-	return &workdirOption{path: path}
-}
-
-type workdirOption struct{ path string }
-
-func (*workdirOption) IsOption()      {}
-func (o *workdirOption) Path() string { return o.path }
 
 // WithUser sets the user (and optionally group) to run as inside the guest.
 // Format: "user" or "user:group" or numeric "1000" or "1000:1000".
@@ -174,6 +153,119 @@ type interactiveIOOption struct {
 func (*interactiveIOOption) IsOption()                               {}
 func (o *interactiveIOOption) InteractiveIO() (io.Reader, io.Writer) { return o.stdin, o.stdout }
 
+// WithCPUs sets the number of virtual CPUs. Default is 1.
+func WithCPUs(count int) Option {
+	return &cpuOption{count: count}
+}
+
+type cpuOption struct{ count int }
+
+func (*cpuOption) IsOption()   {}
+func (o *cpuOption) CPUs() int { return o.count }
+
+// WithDmesg enables kernel dmesg output (loglevel=7).
+// When enabled, kernel messages are printed to the console which is useful
+// for debugging boot issues and driver problems.
+func WithDmesg() Option {
+	return &dmesgOption{}
+}
+
+type dmesgOption struct{}
+
+func (*dmesgOption) IsOption()   {}
+func (*dmesgOption) Dmesg() bool { return true }
+
+// WithPacketCapture enables packet capture (pcap format) to the given writer.
+// The captured packets can be analyzed with tools like Wireshark or tcpdump.
+//
+// Example:
+//
+//	f, _ := os.Create("capture.pcap")
+//	defer f.Close()
+//	inst, err := cc.New(source, cc.WithPacketCapture(f))
+func WithPacketCapture(w io.Writer) Option {
+	return &packetCaptureOption{w: w}
+}
+
+type packetCaptureOption struct{ w io.Writer }
+
+func (*packetCaptureOption) IsOption()                  {}
+func (o *packetCaptureOption) PacketCapture() io.Writer { return o.w }
+
+// WithGPU enables virtio-gpu and virtio-input devices for graphical output.
+// When enabled, the instance's GPU() method returns a non-nil GPU interface.
+// The caller must run the display loop on the main thread using Poll/Render/Swap.
+//
+// Example:
+//
+//	runtime.LockOSThread() // Required for windowing on macOS
+//	inst, err := cc.New(source, cc.WithGPU())
+//	if gpu := inst.GPU(); gpu != nil {
+//	    win := createWindow() // Platform-specific
+//	    gpu.SetWindow(win)
+//	    for {
+//	        if !gpu.Poll() { break }
+//	        gpu.Render()
+//	        gpu.Swap()
+//	    }
+//	}
+func WithGPU() Option {
+	return &gpuOption{}
+}
+
+type gpuOption struct{}
+
+func (*gpuOption) IsOption() {}
+func (*gpuOption) GPU() bool { return true }
+
+// WithQEMUCacheDir sets the cache directory for QEMU emulation binaries.
+// This is only used when running containers for a different architecture
+// than the host (cross-architecture emulation).
+func WithQEMUCacheDir(dir string) Option {
+	return &qemuCacheDirOption{dir: dir}
+}
+
+type qemuCacheDirOption struct{ dir string }
+
+func (*qemuCacheDirOption) IsOption()              {}
+func (o *qemuCacheDirOption) QEMUCacheDir() string { return o.dir }
+
+// GPU provides access to guest display and input devices.
+type GPU = api.GPU
+
+// MountConfig configures a host directory mount via virtio-fs.
+type MountConfig struct {
+	// Tag is the virtio-fs tag used to mount in the guest.
+	// The guest mounts it with: mount -t virtiofs <tag> /mnt/path
+	Tag string
+
+	// HostPath is the host directory to expose. If empty, an empty writable
+	// filesystem is created.
+	HostPath string
+
+	// ReadOnly makes the mount read-only if true.
+	ReadOnly bool
+}
+
+// WithMount adds a virtio-fs mount to the guest.
+// The guest can mount it with: mount -t virtiofs <tag> /mnt/path
+//
+// Example:
+//
+//	inst, err := cc.New(source,
+//	    cc.WithMount(cc.MountConfig{Tag: "shared", HostPath: "/host/data"}),
+//	)
+//
+// Then in guest: mount -t virtiofs shared /mnt/shared
+func WithMount(config MountConfig) Option {
+	return &mountOption{config: config}
+}
+
+type mountOption struct{ config MountConfig }
+
+func (*mountOption) IsOption()            {}
+func (o *mountOption) Mount() MountConfig { return o.config }
+
 // -----------------------------------------------------------------------------
 // OCI Pull Options
 // -----------------------------------------------------------------------------
@@ -214,8 +306,15 @@ func (o *pullPolicyOption) Policy() PullPolicy { return o.policy }
 // -----------------------------------------------------------------------------
 
 // NewOCIClient creates a new OCI client for pulling images.
+// Uses the default cache directory (platform-specific user config directory).
 func NewOCIClient() (OCIClient, error) {
 	return api.NewOCIClient()
+}
+
+// NewOCIClientWithCacheDir creates a new OCI client with a custom cache directory.
+// If cacheDir is empty, the default cache directory is used.
+func NewOCIClientWithCacheDir(cacheDir string) (OCIClient, error) {
+	return api.NewOCIClientWithCacheDir(cacheDir)
 }
 
 // New creates and starts a new Instance from the given source.
@@ -369,3 +468,35 @@ func BuildDockerfileRuntimeConfig(dockerfileContent []byte, opts ...DockerfileOp
 func NewDirBuildContext(dir string) (DockerfileBuildContext, error) {
 	return api.NewDirBuildContext(dir)
 }
+
+// -----------------------------------------------------------------------------
+// Cache Directory
+// -----------------------------------------------------------------------------
+
+// CacheDir represents a cache directory configuration.
+// It provides a unified way to configure cache directories for both
+// OCIClient and Instance, ensuring they share the same cache location.
+type CacheDir = api.CacheDir
+
+// NewCacheDir creates a cache directory config.
+// If path is empty, uses the platform-specific default cache directory.
+func NewCacheDir(path string) (*CacheDir, error) {
+	return api.NewCacheDir(path)
+}
+
+// NewOCIClientWithCache creates a new OCI client using the provided CacheDir.
+// This ensures the OCI client uses the same cache location as other components.
+func NewOCIClientWithCache(cache *CacheDir) (OCIClient, error) {
+	return api.NewOCIClientWithCache(cache)
+}
+
+// WithCache sets the cache directory for the instance.
+// This is used for QEMU emulation binaries and other cached resources.
+func WithCache(cache *CacheDir) Option {
+	return &cacheOption{cache: cache}
+}
+
+type cacheOption struct{ cache *CacheDir }
+
+func (*cacheOption) IsOption()           {}
+func (o *cacheOption) Cache() *CacheDir { return o.cache }

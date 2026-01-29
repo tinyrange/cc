@@ -88,6 +88,14 @@ func (dm *DisplayManager) SetWindow(w window.Window) {
 	}
 }
 
+// SetWindowAny is like SetWindow but accepts any type for use in public APIs.
+// The window must be a window.Window from the gowin package.
+func (dm *DisplayManager) SetWindowAny(w any) {
+	if win, ok := w.(window.Window); ok {
+		dm.SetWindow(win)
+	}
+}
+
 // Poll polls the window for events and forwards them to input devices.
 // Returns false if the window was closed.
 func (dm *DisplayManager) Poll() bool {

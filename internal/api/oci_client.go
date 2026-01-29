@@ -13,12 +13,25 @@ type ociClient struct {
 }
 
 // NewOCIClient creates a new OCI client for pulling images.
+// Uses the default cache directory (platform-specific user config directory).
 func NewOCIClient() (OCIClient, error) {
-	client, err := oci.NewClient("")
+	return NewOCIClientWithCacheDir("")
+}
+
+// NewOCIClientWithCacheDir creates a new OCI client with a custom cache directory.
+// If cacheDir is empty, the default cache directory is used.
+func NewOCIClientWithCacheDir(cacheDir string) (OCIClient, error) {
+	client, err := oci.NewClient(cacheDir)
 	if err != nil {
 		return nil, fmt.Errorf("create OCI client: %w", err)
 	}
 	return &ociClient{client: client}, nil
+}
+
+// NewOCIClientWithCache creates a new OCI client using the provided CacheDir.
+// This ensures the OCI client uses the same cache location as other components.
+func NewOCIClientWithCache(cache *CacheDir) (OCIClient, error) {
+	return NewOCIClientWithCacheDir(cache.OCIPath())
 }
 
 // Pull fetches an image and prepares it for use with New.
@@ -48,4 +61,40 @@ func (c *ociClient) Pull(ctx context.Context, imageRef string, opts ...OCIPullOp
 		arch:     cfg.arch,
 		imageRef: imageRef,
 	}, nil
+}
+
+// LoadFromDir loads a prebaked image from a directory.
+func (c *ociClient) LoadFromDir(dir string, opts ...OCIPullOption) (InstanceSource, error) {
+	cfg := parsePullOptions(opts)
+
+	image, err := oci.LoadFromDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("load image from %q: %w", dir, err)
+	}
+
+	cfs, err := oci.NewContainerFS(image)
+	if err != nil {
+		return nil, fmt.Errorf("create container filesystem: %w", err)
+	}
+
+	return &ociSource{
+		image:    image,
+		cfs:      cfs,
+		arch:     cfg.arch,
+		imageRef: dir,
+	}, nil
+}
+
+// ExportToDir exports an InstanceSource to a directory.
+func (c *ociClient) ExportToDir(source InstanceSource, dir string) error {
+	src, ok := source.(*ociSource)
+	if !ok {
+		return fmt.Errorf("source type %T does not support export", source)
+	}
+	return oci.ExportToDir(src.image, dir)
+}
+
+// CacheDir returns the cache directory used by this client.
+func (c *ociClient) CacheDir() string {
+	return c.client.CacheDir()
 }

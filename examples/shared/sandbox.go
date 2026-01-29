@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -104,6 +105,41 @@ func RunCommand(ctx context.Context, instance cc.Instance, name string, args ...
 	result := RunResult{}
 
 	cmd := instance.CommandContext(ctx, name, args...)
+
+	var stdout, stderr bytes.Buffer
+	cmd.SetStdout(&stdout)
+	cmd.SetStderr(&stderr)
+
+	err := cmd.Run()
+	result.Duration = time.Since(start)
+	result.Stdout = stdout.String()
+	result.Stderr = stderr.String()
+	result.ExitCode = cmd.ExitCode()
+
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			result.TimedOut = true
+		}
+		result.Error = err.Error()
+	}
+
+	return result
+}
+
+// RunCommandWithEnv runs a command with environment variables.
+// Each env entry should be in "KEY=value" format.
+func RunCommandWithEnv(ctx context.Context, instance cc.Instance, env []string, name string, args ...string) RunResult {
+	start := time.Now()
+	result := RunResult{}
+
+	cmd := instance.CommandContext(ctx, name, args...)
+
+	// Apply environment variables
+	for _, e := range env {
+		if key, value, ok := strings.Cut(e, "="); ok {
+			cmd.SetEnv(key, value)
+		}
+	}
 
 	var stdout, stderr bytes.Buffer
 	cmd.SetStdout(&stdout)

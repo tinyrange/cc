@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/tinyrange/cc/internal/dockerfile"
 )
@@ -125,7 +126,15 @@ func (a *cmdAdapter) Run() error {
 }
 
 func (a *cmdAdapter) SetEnv(env []string) dockerfile.Cmd {
-	return &cmdAdapter{cmd: a.cmd.SetEnv(env)}
+	// The dockerfile.Cmd interface uses []string, but api.Cmd uses key-value pairs
+	// Apply each environment variable from the slice
+	cmd := a.cmd
+	for _, e := range env {
+		if key, value, ok := strings.Cut(e, "="); ok {
+			cmd = cmd.SetEnv(key, value)
+		}
+	}
+	return &cmdAdapter{cmd: cmd}
 }
 
 func (a *cmdAdapter) SetDir(dir string) dockerfile.Cmd {
