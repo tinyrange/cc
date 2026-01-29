@@ -80,7 +80,6 @@ func run(code string, timeout time.Duration) error {
 	instance, err := cc.New(snap,
 		cc.WithMemoryMB(512),
 		cc.WithTimeout(timeout+5*time.Second),
-		cc.WithEnv("GOCACHE=/tmp/gocache"),
 	)
 	if err != nil {
 		return fmt.Errorf("creating instance: %w", err)
@@ -96,11 +95,11 @@ func run(code string, timeout time.Duration) error {
 		return fmt.Errorf("writing source: %w", err)
 	}
 
-	// Compile the code
+	// Compile the code (with GOCACHE env var set at command level)
 	compileCtx, compileCancel := context.WithTimeout(ctx, timeout/2)
 	defer compileCancel()
 
-	compileResult := shared.RunCommand(compileCtx, instance, "go", "build", "-o", "/app/main", "/app/main.go")
+	compileResult := shared.RunCommandWithEnv(compileCtx, instance, []string{"GOCACHE=/tmp/gocache"}, "go", "build", "-o", "/app/main", "/app/main.go")
 	if compileResult.ExitCode != 0 {
 		fmt.Fprint(os.Stderr, compileResult.Stderr)
 		os.Exit(compileResult.ExitCode)

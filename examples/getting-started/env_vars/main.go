@@ -1,7 +1,7 @@
 // env_vars demonstrates passing environment variables to sandboxed processes.
 //
 // This example shows how to:
-// - Set environment variables using cc.WithEnv
+// - Set environment variables using cmd.SetEnv
 // - Access environment variables in sandboxed code
 // - Pass sensitive configuration without hardcoding
 package main
@@ -61,15 +61,10 @@ func run(envPairs []string, code string, listEnv bool, timeout time.Duration) er
 		return fmt.Errorf("pulling image: %w", err)
 	}
 
-	// Create sandbox instance with environment variables
+	// Create sandbox instance
 	opts := []cc.Option{
 		cc.WithMemoryMB(256),
 		cc.WithTimeout(timeout + 5*time.Second),
-	}
-
-	// Add environment variables
-	if len(envPairs) > 0 {
-		opts = append(opts, cc.WithEnv(envPairs...))
 	}
 
 	instance, err := cc.New(source, opts...)
@@ -84,8 +79,8 @@ func run(envPairs []string, code string, listEnv bool, timeout time.Duration) er
 	var result shared.RunResult
 
 	if listEnv {
-		// List all environment variables
-		result = shared.RunCommand(execCtx, instance, "python3", "-c", "import os\nfor k, v in sorted(os.environ.items()):\n    print(f'{k}={v}')")
+		// List all environment variables (with env vars applied at command level)
+		result = shared.RunCommandWithEnv(execCtx, instance, envPairs, "python3", "-c", "import os\nfor k, v in sorted(os.environ.items()):\n    print(f'{k}={v}')")
 	} else {
 		// Write and execute the provided code
 		fs := instance.WithContext(ctx)
@@ -95,7 +90,7 @@ func run(envPairs []string, code string, listEnv bool, timeout time.Duration) er
 		if err := fs.WriteFile("/app/script.py", []byte(code), 0644); err != nil {
 			return fmt.Errorf("writing script: %w", err)
 		}
-		result = shared.RunCommand(execCtx, instance, "python3", "/app/script.py")
+		result = shared.RunCommandWithEnv(execCtx, instance, envPairs, "python3", "/app/script.py")
 	}
 
 	// Output results

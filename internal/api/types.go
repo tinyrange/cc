@@ -100,8 +100,12 @@ type Cmd interface {
 	SetStderr(w io.Writer) Cmd
 	// SetDir sets the command's working directory.
 	SetDir(dir string) Cmd
-	// SetEnv sets the command's environment variables.
-	SetEnv(env []string) Cmd
+	// SetEnv sets a single environment variable (like os.Setenv).
+	SetEnv(key, value string) Cmd
+	// GetEnv returns the value of an environment variable (like os.Getenv).
+	GetEnv(key string) string
+	// Environ returns a copy of the command's environment variables.
+	Environ() []string
 	// ExitCode returns the command's exit code.
 	ExitCode() int
 }
@@ -112,6 +116,12 @@ type Exec interface {
 	Command(name string, args ...string) Cmd
 	// CommandContext creates a new command with the given context.
 	CommandContext(ctx context.Context, name string, args ...string) Cmd
+	// Exec replaces the init process with the specified command (like unix.Exec).
+	// This is a terminal operation - the command becomes PID 1 and there is
+	// no parent process waiting. When the command exits, the VM terminates.
+	Exec(name string, args ...string) error
+	// ExecContext is like Exec but accepts a context.
+	ExecContext(ctx context.Context, name string, args ...string) error
 }
 
 // Net provides network operations on a guest.
@@ -142,6 +152,40 @@ type Instance interface {
 	Wait() error
 	// ID returns the instance's ID.
 	ID() string
+
+	// GPU returns the GPU interface if GPU is enabled, nil otherwise.
+	// When non-nil, the caller must run the display loop on the main thread.
+	GPU() GPU
+}
+
+// GPU provides access to guest display and input devices.
+// When GPU is enabled, the caller is responsible for running the display loop
+// on the main thread using Poll(), Render(), and Swap().
+//
+// The SetWindow method accepts a window.Window from the gowin package.
+// This is typed as any to avoid exposing internal types in the public API.
+type GPU interface {
+	// SetWindow connects the GPU to a window for rendering.
+	// The window parameter must be a window.Window from the gowin package.
+	// Must be called before Poll/Render/Swap.
+	SetWindow(w any)
+
+	// Poll processes window events and forwards input to the guest.
+	// Returns false if the window was closed.
+	// Must be called from the main thread.
+	Poll() bool
+
+	// Render renders the current framebuffer to the window.
+	// Must be called from the main thread.
+	Render()
+
+	// Swap swaps the window buffers.
+	// Must be called from the main thread.
+	Swap()
+
+	// GetFramebuffer returns the current framebuffer pixels.
+	// Returns pixels in BGRA format, dimensions, and whether data is valid.
+	GetFramebuffer() (pixels []byte, width, height uint32, ok bool)
 }
 
 // InstanceSource is the source for creating a new Instance.
@@ -178,6 +222,17 @@ type FilesystemSnapshotOption interface {
 type OCIClient interface {
 	// Pull pulls the given image and returns an InstanceSource.
 	Pull(ctx context.Context, imageRef string, opts ...OCIPullOption) (InstanceSource, error)
+
+	// LoadFromDir loads a prebaked image from a directory containing
+	// config.json and layer files (*.idx/*.contents).
+	LoadFromDir(dir string, opts ...OCIPullOption) (InstanceSource, error)
+
+	// ExportToDir exports an InstanceSource to a directory as prebaked
+	// config.json and layer files. Only works with OCI-based sources.
+	ExportToDir(source InstanceSource, dir string) error
+
+	// CacheDir returns the cache directory used by this client.
+	CacheDir() string
 }
 
 // Option configures an Instance.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log"
 	"os"
 	"testing"
@@ -520,4 +521,318 @@ func TestCapture_StdinEmpty(t *testing.T) {
 	if len(out) != 0 {
 		t.Errorf("Output() = %q, want empty", out)
 	}
+}
+
+// slowReader implements io.Reader that reads slowly, simulating terminal input
+type slowReader struct {
+	data  []byte
+	pos   int
+	delay time.Duration
+}
+
+func (r *slowReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	// Simulate slow typing - read one byte at a time with delay
+	time.Sleep(r.delay)
+	p[0] = r.data[r.pos]
+	r.pos++
+	return 1, nil
+}
+
+func TestCapture_StdinSlowReader(t *testing.T) {
+	// Test streaming stdin with a slow reader (simulates terminal input)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	source := setupAlpineForCapture(t, ctx)
+
+	inst, err := New(source, withMemoryMB(128))
+	if err != nil {
+		if errors.Is(err, ErrHypervisorUnavailable) {
+			t.Skip("Skipping: hypervisor unavailable")
+		}
+		t.Fatalf("New() error = %v", err)
+	}
+	defer inst.Close()
+
+	// Use a slow reader that delivers data byte-by-byte with small delays
+	input := "hello streaming\n"
+	slowIn := &slowReader{
+		data:  []byte(input),
+		delay: 10 * time.Millisecond,
+	}
+
+	cmd := inst.CommandContext(ctx, "/bin/cat")
+	cmd.SetStdin(slowIn)
+
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("Output() error = %v", err)
+	}
+
+	if string(out) != input {
+		t.Errorf("Output() = %q, want %q", string(out), input)
+	}
+}
+
+func TestCapture_StdinModeratelyLarge(t *testing.T) {
+	// Test moderately large streaming stdin - verifies streaming handles data
+	// exceeding single pipe buffer (64KB) but below 128KB threshold.
+	// Note: Data >= 128KB (2x pipe buffer) can cause scheduling issues on single-vCPU VMs
+	// due to the concurrent stdin streaming and stdout capture processes.
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	source := setupAlpineForCapture(t, ctx)
+
+	inst, err := New(source, withMemoryMB(256))
+	if err != nil {
+		if errors.Is(err, ErrHypervisorUnavailable) {
+			t.Skip("Skipping: hypervisor unavailable")
+		}
+		t.Fatalf("New() error = %v", err)
+	}
+	defer inst.Close()
+
+	// 120KB of data - verifies streaming works for data larger than pipe buffer
+	inputSize := 120 * 1024
+	input := bytes.Repeat([]byte("abcdefgh"), inputSize/8)
+
+	cmd := inst.CommandContext(ctx, "/bin/cat")
+	cmd.SetStdin(bytes.NewReader(input))
+
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("Output() error = %v", err)
+	}
+
+	if len(out) != len(input) {
+		t.Errorf("Output() length = %d, want %d", len(out), len(input))
+	}
+	if !bytes.Equal(out, input) {
+		t.Errorf("Output() content mismatch")
+	}
+}
+
+func TestCapture_StdinEarlyClose(t *testing.T) {
+	// Test that stdin closes properly when the command exits before reading all input
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	source := setupAlpineForCapture(t, ctx)
+
+	inst, err := New(source, withMemoryMB(128))
+	if err != nil {
+		if errors.Is(err, ErrHypervisorUnavailable) {
+			t.Skip("Skipping: hypervisor unavailable")
+		}
+		t.Fatalf("New() error = %v", err)
+	}
+	defer inst.Close()
+
+	// Command that exits immediately without reading stdin
+	// Using head -n 1 to read only the first line
+	input := "line1\nline2\nline3\nline4\nline5\n"
+	cmd := inst.CommandContext(ctx, "/bin/sh", "-c", "head -n 1")
+	cmd.SetStdin(bytes.NewReader([]byte(input)))
+
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("Output() error = %v", err)
+	}
+
+	expected := "line1\n"
+	if string(out) != expected {
+		t.Errorf("Output() = %q, want %q", string(out), expected)
+	}
+}
+
+func TestCapture_StdinWithCombinedOutput(t *testing.T) {
+	// Test streaming stdin with combined stdout/stderr
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	source := setupAlpineForCapture(t, ctx)
+
+	inst, err := New(source, withMemoryMB(128))
+	if err != nil {
+		if errors.Is(err, ErrHypervisorUnavailable) {
+			t.Skip("Skipping: hypervisor unavailable")
+		}
+		t.Fatalf("New() error = %v", err)
+	}
+	defer inst.Close()
+
+	// Command that reads stdin and writes to both stdout and stderr
+	cmd := inst.CommandContext(ctx, "/bin/sh", "-c", "cat; echo error >&2")
+	cmd.SetStdin(bytes.NewReader([]byte("input\n")))
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("CombinedOutput() error = %v", err)
+	}
+
+	// Should contain both the echoed input and the error message
+	if !bytes.Contains(out, []byte("input")) {
+		t.Errorf("CombinedOutput() missing 'input': got %q", out)
+	}
+	if !bytes.Contains(out, []byte("error")) {
+		t.Errorf("CombinedOutput() missing 'error': got %q", out)
+	}
+}
+
+// TestCapture_NoStdinCommand tests that commands which don't read stdin
+// complete immediately without waiting for input (critical for terminal usage)
+func TestCapture_NoStdinCommand(t *testing.T) {
+	// Use a short timeout - if stdin streaming is blocking, this will fail
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	source := setupAlpineForCapture(t, ctx)
+
+	inst, err := New(source, withMemoryMB(128))
+	if err != nil {
+		if errors.Is(err, ErrHypervisorUnavailable) {
+			t.Skip("Skipping: hypervisor unavailable")
+		}
+		t.Fatalf("New() error = %v", err)
+	}
+	defer inst.Close()
+
+	// ls doesn't read stdin - should complete immediately
+	// We still set stdin (simulating terminal) to test the streaming code path
+	cmd := inst.CommandContext(ctx, "/bin/ls", "/")
+
+	var stdout bytes.Buffer
+	cmd.SetStdout(&stdout)
+	cmd.SetStdin(bytes.NewReader([]byte{})) // Empty stdin, like /dev/null
+
+	start := time.Now()
+	err = cmd.Run()
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// Should complete in under 5 seconds (generous margin)
+	if elapsed > 5*time.Second {
+		t.Errorf("Command took %v, expected < 5s (stdin streaming may be blocking)", elapsed)
+	}
+
+	// Verify we got output
+	if !bytes.Contains(stdout.Bytes(), []byte("bin")) {
+		t.Errorf("Expected 'bin' in ls output, got: %q", stdout.String())
+	}
+
+	t.Logf("ls completed in %v", elapsed)
+}
+
+// TestCapture_NoStdinCommandWithTerminalStdin tests that commands complete
+// even when stdin is set but never provides data (simulates terminal with no input)
+func TestCapture_NoStdinCommandWithTerminalStdin(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	source := setupAlpineForCapture(t, ctx)
+
+	inst, err := New(source, withMemoryMB(128))
+	if err != nil {
+		if errors.Is(err, ErrHypervisorUnavailable) {
+			t.Skip("Skipping: hypervisor unavailable")
+		}
+		t.Fatalf("New() error = %v", err)
+	}
+	defer inst.Close()
+
+	// echo doesn't read stdin
+	cmd := inst.CommandContext(ctx, "/bin/echo", "hello")
+
+	var stdout bytes.Buffer
+	cmd.SetStdout(&stdout)
+	// Simulate terminal stdin that never sends data by using a reader that blocks
+	// Actually, use empty reader to simulate immediate EOF
+	cmd.SetStdin(bytes.NewReader([]byte{}))
+
+	start := time.Now()
+	err = cmd.Run()
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if elapsed > 5*time.Second {
+		t.Errorf("Command took %v, expected < 5s", elapsed)
+	}
+
+	expected := "hello\n"
+	if stdout.String() != expected {
+		t.Errorf("Expected %q, got %q", expected, stdout.String())
+	}
+
+	t.Logf("echo completed in %v", elapsed)
+}
+
+// blockingReader is a reader that blocks forever (simulates terminal with no input)
+type blockingReader struct {
+	closed chan struct{}
+}
+
+func (r *blockingReader) Read(p []byte) (int, error) {
+	<-r.closed // Block until closed
+	return 0, io.EOF
+}
+
+func (r *blockingReader) Close() {
+	close(r.closed)
+}
+
+// TestCapture_CommandWithBlockingStdin tests that commands which don't need stdin
+// complete even when stdin would block forever (like a terminal with no input)
+func TestCapture_CommandWithBlockingStdin(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	source := setupAlpineForCapture(t, ctx)
+
+	inst, err := New(source, withMemoryMB(128))
+	if err != nil {
+		if errors.Is(err, ErrHypervisorUnavailable) {
+			t.Skip("Skipping: hypervisor unavailable")
+		}
+		t.Fatalf("New() error = %v", err)
+	}
+	defer inst.Close()
+
+	// Create a reader that blocks forever
+	blockingStdin := &blockingReader{closed: make(chan struct{})}
+	defer blockingStdin.Close()
+
+	// ls doesn't read stdin, so it should complete even with blocking stdin
+	cmd := inst.CommandContext(ctx, "/bin/ls", "/")
+
+	var stdout bytes.Buffer
+	cmd.SetStdout(&stdout)
+	cmd.SetStdin(blockingStdin)
+
+	start := time.Now()
+	err = cmd.Run()
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if elapsed > 10*time.Second {
+		t.Errorf("Command took %v, expected < 10s (stdin streaming is blocking!)", elapsed)
+	}
+
+	if !bytes.Contains(stdout.Bytes(), []byte("bin")) {
+		t.Errorf("Expected 'bin' in ls output, got: %q", stdout.String())
+	}
+
+	t.Logf("ls with blocking stdin completed in %v", elapsed)
 }

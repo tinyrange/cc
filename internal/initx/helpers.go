@@ -1110,6 +1110,8 @@ func SetHostsOptional(hostname string) ir.Fragment {
 
 // Execution
 
+// Exec performs an execve syscall, replacing the current process with the specified program.
+// This is used by ForkExecWait for the child process after fork.
 func Exec(path string, argv []string, envp []string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
 	// We need to construct argv and envp arrays on stack.
 	// argv = [path, arg1, ..., NULL]
@@ -1182,6 +1184,13 @@ func Exec(path string, argv []string, envp []string, errLabel ir.Label, errVar i
 			return ir.Block(frags)
 		},
 	})
+}
+
+// ExecOnly performs an execve syscall directly without forking.
+// This is used for "exec mode" where the command replaces init as PID 1.
+// Unlike ForkExecWait, there is no parent process waiting for the child.
+func ExecOnly(path string, argv []string, envp []string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
+	return Exec(path, argv, envp, errLabel, errVar)
 }
 
 // Timeslice MMIO constants for ForkExecWait instrumentation

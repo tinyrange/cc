@@ -15,12 +15,14 @@ func main() {
 	verbose := flag.Bool("v", false, "Verbose output")
 	keepAlive := flag.Bool("keep-alive", false, "Keep servers running after tests")
 	parallel := flag.Int("p", 4, "Number of parallel builds")
+	cc2Binary := flag.String("cc2-binary", "", "Path to cc2 binary for CC2 tests")
 	flag.Parse()
 
 	runner := testrunner.NewRunner()
 	runner.Verbose = *verbose
 	runner.KeepAlive = *keepAlive
 	runner.Parallel = *parallel
+	runner.CC2Binary = *cc2Binary
 
 	// Get patterns from args
 	patterns := flag.Args()

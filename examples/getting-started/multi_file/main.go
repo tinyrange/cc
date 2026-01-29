@@ -104,9 +104,6 @@ func run(project Project, timeout time.Duration) error {
 		cc.WithMemoryMB(512),
 		cc.WithTimeout(timeout + 5*time.Second),
 	}
-	if project.Language == "go" {
-		opts = append(opts, cc.WithEnv("GOCACHE=/tmp/gocache"))
-	}
 
 	instance, err := cc.New(snap, opts...)
 	if err != nil {
@@ -142,8 +139,8 @@ func run(project Project, timeout time.Duration) error {
 		result = shared.RunCommand(execCtx, instance, "node", mainFile)
 
 	case "go":
-		// For Go, we need to compile first
-		compileResult := shared.RunCommand(execCtx, instance, "go", "build", "-o", "/app/main", mainFile)
+		// For Go, we need to compile first (with GOCACHE env var set at command level)
+		compileResult := shared.RunCommandWithEnv(execCtx, instance, []string{"GOCACHE=/tmp/gocache"}, "go", "build", "-o", "/app/main", mainFile)
 		if compileResult.ExitCode != 0 {
 			fmt.Fprint(os.Stderr, compileResult.Stderr)
 			os.Exit(compileResult.ExitCode)

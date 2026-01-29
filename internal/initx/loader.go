@@ -228,13 +228,20 @@ var (
 // When flags=0, guest response is just [len:4][exit_code:4] for backward compatibility.
 const (
 	VsockProgramPort = 9998
+	VsockStdinPort   = 9999 // Separate port for streaming stdin
 
 	// Capture flags for stdout/stderr capture and stdin delivery
 	CaptureFlagNone    uint32 = 0x00
 	CaptureFlagStdout  uint32 = 0x01
 	CaptureFlagStderr  uint32 = 0x02
 	CaptureFlagCombine uint32 = 0x04 // Combine stdout+stderr into single stream
-	CaptureFlagStdin   uint32 = 0x08 // Stdin data is included in the message
+	CaptureFlagStdin   uint32 = 0x08 // Stdin data is included in the message (buffered mode)
+
+	// Stdin mode constants for streaming stdin protocol
+	// These replace stdin_len field in the protocol when stdin_mode >= 0x02
+	StdinModeNone      uint32 = 0x00 // No stdin (EOF immediately)
+	StdinModeBuffered  uint32 = 0x01 // Buffered stdin (legacy - stdin_len and data follow code)
+	StdinModeStreaming uint32 = 0x02 // Streaming stdin (separate vsock connection on port 9999)
 )
 
 // ProgramResult contains the result of a program execution including captured output.
@@ -246,10 +253,11 @@ type ProgramResult struct {
 
 // VsockProgramServer is the host-side server for vsock-based program loading.
 type VsockProgramServer struct {
-	listener virtio.VsockListener
-	conn     virtio.VsockConn
-	arch     hv.CpuArchitecture
-	mu       sync.Mutex
+	listener      virtio.VsockListener
+	stdinListener virtio.VsockListener // Listener for streaming stdin connections
+	conn          virtio.VsockConn
+	arch          hv.CpuArchitecture
+	mu            sync.Mutex
 
 	// drainBuf is reused for draining stale data
 	drainBuf []byte
@@ -265,9 +273,18 @@ func NewVsockProgramServer(backend virtio.VsockBackend, port uint32, arch hv.Cpu
 	if err != nil {
 		return nil, fmt.Errorf("listen on port %d: %w", port, err)
 	}
+
+	// Create stdin listener on the next port for streaming stdin
+	stdinListener, err := backend.Listen(VsockStdinPort)
+	if err != nil {
+		listener.Close()
+		return nil, fmt.Errorf("listen on stdin port %d: %w", VsockStdinPort, err)
+	}
+
 	return &VsockProgramServer{
-		listener: listener,
-		arch:     arch,
+		listener:      listener,
+		stdinListener: stdinListener,
+		arch:          arch,
 	}, nil
 }
 
@@ -426,6 +443,213 @@ func (s *VsockProgramServer) SendProgramWithFlagsAndStdin(prog *ir.Program, flag
 	return nil
 }
 
+// SendProgramWithStreamingStdin sends a compiled program to the guest with streaming stdin.
+// Protocol: [len:4][time_sec:8][time_nsec:8][flags:4][stdin_mode:4][code_len:4][reloc_count:4][relocs:4*count][code:code_len]
+// When stdin_mode=StdinModeStreaming, the guest connects back to port 9999 to receive stdin chunks.
+// Note: This method does NOT hold the lock during the entire operation - it acquires/releases as needed.
+func (s *VsockProgramServer) SendProgramWithStreamingStdin(prog *ir.Program, flags uint32, stdinMode uint32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.conn == nil {
+		return fmt.Errorf("no connection established")
+	}
+
+	// Drain any stale data from previous program runs to ensure clean buffer state
+	s.drainStaleData()
+
+	asmProg, err := ir.BuildStandaloneProgramForArch(s.arch, prog)
+	if err != nil {
+		return fmt.Errorf("build standalone program: %w", err)
+	}
+
+	progBytes := asmProg.Bytes()
+	relocs := asmProg.Relocations()
+
+	// Calculate total message size: time_sec(8) + time_nsec(8) + flags(4) + stdin_mode(4) + code_len(4) + reloc_count(4) + relocs(4*N) + code
+	// Note: No stdin data in the message for streaming mode
+	payloadLen := 8 + 8 + 4 + 4 + 4 + 4 + 4*len(relocs) + len(progBytes)
+
+	// Build the message
+	msg := make([]byte, 4+payloadLen) // len prefix + payload
+
+	// Length prefix (excludes itself)
+	binary.LittleEndian.PutUint32(msg[0:4], uint32(payloadLen))
+
+	// Current time for guest clock synchronization (8-byte aligned)
+	now := time.Now()
+	binary.LittleEndian.PutUint64(msg[4:12], uint64(now.Unix()))
+	binary.LittleEndian.PutUint64(msg[12:20], uint64(now.Nanosecond()))
+
+	// Flags
+	binary.LittleEndian.PutUint32(msg[20:24], flags)
+
+	// stdin_mode (replaces stdin_len for streaming)
+	// For streaming mode, this signals the guest to connect back for stdin
+	binary.LittleEndian.PutUint32(msg[24:28], stdinMode)
+
+	// code_len
+	binary.LittleEndian.PutUint32(msg[28:32], uint32(len(progBytes)))
+
+	// reloc_count
+	binary.LittleEndian.PutUint32(msg[32:36], uint32(len(relocs)))
+
+	// relocations
+	for i, reloc := range relocs {
+		binary.LittleEndian.PutUint32(msg[36+4*i:], uint32(reloc))
+	}
+
+	// code
+	codeOffset := 36 + 4*len(relocs)
+	copy(msg[codeOffset:], progBytes)
+
+	// Write the entire message
+	if _, err := s.conn.Write(msg); err != nil {
+		return fmt.Errorf("write program: %w", err)
+	}
+
+	return nil
+}
+
+// RunWithStreamingStdin sends a program and streams stdin from an io.Reader.
+// This is the main entry point for streaming stdin support.
+// It sends the program with stdin_mode=StdinModeStreaming, then concurrently:
+// - Accepts a stdin connection from the guest on port 9999
+// - Streams stdin data in chunks until EOF
+// - Waits for the program result
+func (s *VsockProgramServer) RunWithStreamingStdin(ctx context.Context, prog *ir.Program, flags uint32, stdin io.Reader) (*ProgramResult, error) {
+	// Determine stdin mode
+	stdinMode := StdinModeNone
+	if stdin != nil {
+		stdinMode = StdinModeStreaming
+	}
+
+	// Send program with streaming stdin mode
+	if err := s.SendProgramWithStreamingStdin(prog, flags, stdinMode); err != nil {
+		return nil, fmt.Errorf("send program: %w", err)
+	}
+
+	// If no stdin, just wait for result
+	if stdin == nil {
+		return s.WaitResultWithCapture(ctx, flags)
+	}
+
+	// Start stdin streaming goroutine
+	stdinDone := make(chan error, 1)
+	go func() {
+		stdinDone <- s.streamStdinToGuest(ctx, stdin)
+	}()
+
+	// Wait for result concurrently with stdin streaming
+	result, err := s.WaitResultWithCapture(ctx, flags)
+
+	// Don't block indefinitely waiting for stdin streaming to complete.
+	// The streaming goroutine may be blocked on stdin.Read() (e.g., terminal input).
+	// When the guest finishes the command and closes the stdin vsock connection,
+	// the goroutine will eventually exit when it tries to write.
+	// Use a short timeout to allow clean shutdown, but don't block forever.
+	select {
+	case <-stdinDone:
+		// Stdin streaming finished normally
+	case <-time.After(100 * time.Millisecond):
+		// Timeout - streaming goroutine is probably blocked on stdin.Read()
+		// It will eventually exit when the connection is closed and it tries to write
+		debug.Writef("initx.RunWithStreamingStdin", "stdin streaming still running after result received, not waiting")
+	}
+
+	return result, err
+}
+
+// streamStdinToGuest accepts a connection from the guest and streams stdin data.
+// Protocol: [len:4][data]... [len=0] (EOF marker)
+func (s *VsockProgramServer) streamStdinToGuest(ctx context.Context, stdin io.Reader) error {
+	// Get stdin listener under lock
+	s.mu.Lock()
+	stdinListener := s.stdinListener
+	vmTerminated := s.vmTerminated
+	s.mu.Unlock()
+
+	if stdinListener == nil {
+		return fmt.Errorf("stdin listener not available")
+	}
+
+	// Accept connection from guest with context cancellation
+	acceptDone := make(chan struct {
+		conn virtio.VsockConn
+		err  error
+	}, 1)
+
+	go func() {
+		conn, err := stdinListener.Accept()
+		acceptDone <- struct {
+			conn virtio.VsockConn
+			err  error
+		}{conn, err}
+	}()
+
+	var stdinConn virtio.VsockConn
+	select {
+	case result := <-acceptDone:
+		if result.err != nil {
+			return fmt.Errorf("accept stdin connection: %w", result.err)
+		}
+		stdinConn = result.conn
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-vmTerminated:
+		return ErrVMTerminated
+	}
+
+	defer stdinConn.Close()
+
+	debug.Writef("initx.streamStdinToGuest", "stdin connection accepted, starting streaming")
+
+	// Stream stdin data in chunks
+	// Use a combined buffer for length+data to reduce vsock transactions
+	const chunkSize = 16384                  // 16KB chunks
+	combinedBuf := make([]byte, 4+chunkSize) // length prefix + data
+
+	for {
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			// Send EOF marker before returning
+			binary.LittleEndian.PutUint32(combinedBuf, 0)
+			stdinConn.Write(combinedBuf[:4])
+			return ctx.Err()
+		default:
+		}
+
+		// Read from stdin into buffer after length prefix
+		n, err := stdin.Read(combinedBuf[4:])
+
+		// Send any data we got
+		if n > 0 {
+			// Write length prefix into buffer
+			binary.LittleEndian.PutUint32(combinedBuf, uint32(n))
+
+			// Send length + data in single write
+			if _, writeErr := stdinConn.Write(combinedBuf[:4+n]); writeErr != nil {
+				return fmt.Errorf("write stdin chunk: %w", writeErr)
+			}
+		}
+
+		// Handle EOF or error
+		if err != nil {
+			if err == io.EOF {
+				// Send EOF marker (length = 0)
+				binary.LittleEndian.PutUint32(combinedBuf, 0)
+				if _, writeErr := stdinConn.Write(combinedBuf[:4]); writeErr != nil {
+					return fmt.Errorf("write stdin EOF: %w", writeErr)
+				}
+				debug.Writef("initx.streamStdinToGuest", "stdin EOF sent")
+				return nil
+			}
+			return fmt.Errorf("read stdin: %w", err)
+		}
+	}
+}
+
 // WaitResult waits for and returns the exit code from the guest.
 // This is a convenience wrapper for backward compatibility when capture is not needed.
 func (s *VsockProgramServer) WaitResult(ctx context.Context) (int32, error) {
@@ -547,6 +771,12 @@ func (s *VsockProgramServer) Close() error {
 			errs = append(errs, err)
 		}
 		s.listener = nil
+	}
+	if s.stdinListener != nil {
+		if err := s.stdinListener.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		s.stdinListener = nil
 	}
 	if len(errs) > 0 {
 		return errs[0]
@@ -882,6 +1112,34 @@ func (vm *VirtualMachine) RunWithCaptureAndStdin(ctx context.Context, prog *ir.P
 		return nil, err
 	}
 	return &ProgramResult{ExitCode: 0}, nil
+}
+
+// RunWithStreamingStdin runs a program with streaming stdin from an io.Reader.
+// This enables terminal-like stdin without blocking, and supports large stdin without memory overhead.
+// Returns a ProgramResult containing the exit code and captured output.
+func (vm *VirtualMachine) RunWithStreamingStdin(ctx context.Context, prog *ir.Program, flags uint32, stdin io.Reader) (*ProgramResult, error) {
+	// If vsock loader is enabled and we have a server, use vsock path
+	if vm.useVsockLoader && vm.vsockProgramServer != nil {
+		// First run boots the kernel, then accept vsock connection
+		if !vm.firstRunComplete {
+			if err := vm.runFirstRunVsock(ctx); err != nil {
+				return nil, err
+			}
+		}
+		return vm.vsockProgramServer.RunWithStreamingStdin(ctx, prog, flags, stdin)
+	}
+
+	// Fallback: for non-vsock path, read all stdin into memory (legacy behavior)
+	var stdinData []byte
+	if stdin != nil {
+		var err error
+		stdinData, err = io.ReadAll(stdin)
+		if err != nil {
+			return nil, fmt.Errorf("read stdin: %w", err)
+		}
+	}
+
+	return vm.RunWithCaptureAndStdin(ctx, prog, flags, stdinData)
 }
 
 // runProgramVsockWithCapture runs a program using vsock with output capture.

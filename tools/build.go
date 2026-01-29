@@ -1150,6 +1150,7 @@ func main() {
 	runSpecial := fs.String("runs", "", "run a given package")
 	exampleTest := fs.Bool("example-test", false, "build and run example tests with testrunner")
 	example := fs.String("example", "", "build and run an example (path to example directory)")
+	cc2Tests := fs.Bool("cc2-tests", false, "build cc2 and run cc2 integration tests")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
@@ -1258,6 +1259,45 @@ func main() {
 			os.Exit(1)
 		}
 		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *cc2Tests {
+		// Build cc2 first
+		cc2Out, err := goBuild(buildOptions{
+			Package:          "internal/cmd/cc2",
+			OutputName:       "cc2",
+			Build:            hostBuild,
+			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build cc2: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("built %s\n", cc2Out.Path)
+
+		// Build testrunner
+		runnerOut, err := goBuild(buildOptions{
+			Package:    "examples/shared/testrunner/cmd/runtest",
+			OutputName: "runtest",
+			Build:      hostBuild,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build testrunner: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Run testrunner with cc2 tests
+		// Pass --cc2-binary flag to tell testrunner where cc2 is
+		// Pass test paths from args, or default to all cc2 tests
+		testPaths := fs.Args()
+		if len(testPaths) == 0 {
+			testPaths = []string{"./internal/cmd/cc2/tests/..."}
+		}
+		args := append([]string{"--cc2-binary", cc2Out.Path}, testPaths...)
+		if err := runBuildOutput(runnerOut, args, runOpts); err != nil {
 			os.Exit(1)
 		}
 		return
