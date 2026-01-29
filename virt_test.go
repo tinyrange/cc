@@ -71,10 +71,10 @@ func TestNewOCIClient(t *testing.T) {
 func TestOptions(t *testing.T) {
 	// Verify options implement the Option interface
 	var _ cc.Option = cc.WithMemoryMB(256)
-	var _ cc.Option = cc.WithEnv("FOO=bar")
 	var _ cc.Option = cc.WithTimeout(0)
-	var _ cc.Option = cc.WithWorkdir("/app")
 	var _ cc.Option = cc.WithUser("1000")
+	var _ cc.Option = cc.WithCPUs(2)
+	var _ cc.Option = cc.WithSkipEntrypoint()
 
 	// Verify pull options implement the OCIPullOption interface
 	var _ cc.OCIPullOption = cc.WithPlatform("linux", "amd64")
