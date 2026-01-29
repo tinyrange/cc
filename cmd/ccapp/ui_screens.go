@@ -7,11 +7,11 @@ import (
 	"path/filepath"
 	"time"
 
+	cc "github.com/tinyrange/cc"
 	"github.com/tinyrange/cc/internal/assets"
 	"github.com/tinyrange/cc/internal/gowin/graphics"
 	"github.com/tinyrange/cc/internal/gowin/ui"
 	"github.com/tinyrange/cc/internal/gowin/window"
-	"github.com/tinyrange/cc/internal/oci"
 )
 
 // formatBytes formats a byte count as a human-readable string.
@@ -654,7 +654,7 @@ func (s *LoadingScreen) buildUI() {
 func (s *LoadingScreen) Update(f graphics.Frame) {
 	// Get the appropriate start time and progress based on mode
 	var startTime time.Time
-	var progress oci.DownloadProgress
+	var progress cc.DownloadProgress
 
 	if s.app.mode == modeInstalling {
 		startTime = s.app.installStarted

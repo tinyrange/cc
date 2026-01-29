@@ -43,6 +43,22 @@ func (c *ociClient) Pull(ctx context.Context, imageRef string, opts ...OCIPullOp
 	// TODO: Handle pull policy (cfg.policy)
 	// For now, we always pull if not in cache (the default behavior of PullForArch).
 
+	// Set up progress callback if provided
+	if cfg.progressCallback != nil {
+		c.client.SetProgressCallback(func(p oci.DownloadProgress) {
+			cfg.progressCallback(DownloadProgress{
+				Current:        p.Current,
+				Total:          p.Total,
+				Filename:       p.Filename,
+				BlobIndex:      p.BlobIndex,
+				BlobCount:      p.BlobCount,
+				BytesPerSecond: p.BytesPerSecond,
+				ETA:            p.ETA,
+			})
+		})
+		defer c.client.SetProgressCallback(nil) // Clear after pull completes
+	}
+
 	image, err := c.client.PullForArch(imageRef, cfg.arch)
 	if err != nil {
 		return nil, fmt.Errorf("pull image %q: %w", imageRef, err)
@@ -80,6 +96,44 @@ func (c *ociClient) LoadFromDir(dir string, opts ...OCIPullOption) (InstanceSour
 		cfs:      cfs,
 		arch:     cfg.arch,
 		imageRef: dir,
+	}, nil
+}
+
+// LoadFromTar loads an OCI image from a tarball (docker save format).
+func (c *ociClient) LoadFromTar(tarPath string, opts ...OCIPullOption) (InstanceSource, error) {
+	cfg := parsePullOptions(opts)
+
+	// Set up progress callback if provided
+	if cfg.progressCallback != nil {
+		c.client.SetProgressCallback(func(p oci.DownloadProgress) {
+			cfg.progressCallback(DownloadProgress{
+				Current:        p.Current,
+				Total:          p.Total,
+				Filename:       p.Filename,
+				BlobIndex:      p.BlobIndex,
+				BlobCount:      p.BlobCount,
+				BytesPerSecond: p.BytesPerSecond,
+				ETA:            p.ETA,
+			})
+		})
+		defer c.client.SetProgressCallback(nil)
+	}
+
+	image, err := c.client.LoadFromTar(tarPath, cfg.arch)
+	if err != nil {
+		return nil, fmt.Errorf("load image from tar %q: %w", tarPath, err)
+	}
+
+	cfs, err := oci.NewContainerFS(image)
+	if err != nil {
+		return nil, fmt.Errorf("create container filesystem: %w", err)
+	}
+
+	return &ociSource{
+		image:    image,
+		cfs:      cfs,
+		arch:     cfg.arch,
+		imageRef: tarPath,
 	}, nil
 }
 

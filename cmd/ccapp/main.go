@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	cc "github.com/tinyrange/cc"
 	"github.com/tinyrange/cc/internal/assets"
 	"github.com/tinyrange/cc/internal/bundle"
 	"github.com/tinyrange/cc/internal/devices/virtio"
@@ -146,16 +147,16 @@ type Application struct {
 
 	// Boot loading state
 	bootCh         chan bootResult
-	bootStarted    time.Time            // Protected by bootProgressMu
-	bootName       string               // Protected by bootProgressMu
-	bootProgress   oci.DownloadProgress // Protected by bootProgressMu
-	bootProgressMu sync.Mutex           // Protects bootStarted, bootName, bootProgress
+	bootStarted    time.Time           // Protected by bootProgressMu
+	bootName       string              // Protected by bootProgressMu
+	bootProgress   cc.DownloadProgress // Protected by bootProgressMu
+	bootProgressMu sync.Mutex          // Protects bootStarted, bootName, bootProgress
 
 	// Install state (for installing bundles from images/tarballs)
 	installCh         chan installResult
 	installStarted    time.Time
 	installName       string
-	installProgress   oci.DownloadProgress
+	installProgress   cc.DownloadProgress
 	installProgressMu sync.Mutex
 
 	// Error state (full-screen)
@@ -387,7 +388,7 @@ func (app *Application) startUpdate() {
 			slog.Debug("update download progress", "current", p.Current, "total", p.Total, "status", p.Status)
 			// Update progress for loading screen
 			app.bootProgressMu.Lock()
-			app.bootProgress = oci.DownloadProgress{
+			app.bootProgress = cc.DownloadProgress{
 				Current: p.Current,
 				Total:   p.Total,
 			}
@@ -679,17 +680,25 @@ func (app *Application) Run() error {
 	app.launcherScreen = NewLauncherScreen(app)
 	app.terminalScreen = NewTerminalScreen(app)
 
-	// Open hypervisor at startup to check availability
-	slog.Info("opening hypervisor")
-	h, hvErr := factory.Open()
-	if hvErr != nil {
+	// Check hypervisor availability at startup using the public API
+	slog.Info("checking hypervisor availability")
+	if hvErr := cc.SupportsHypervisor(); hvErr != nil {
 		slog.Error("hypervisor unavailable at startup", "error", hvErr)
 		app.errMsg = formatHypervisorError(hvErr)
 		app.fatalError = true
 		app.mode = modeError
 	} else {
-		app.hypervisor = h
-		slog.Info("hypervisor opened successfully")
+		// Pre-open hypervisor for faster VM startup
+		h, err := factory.Open()
+		if err != nil {
+			slog.Error("failed to pre-open hypervisor", "error", err)
+			app.errMsg = formatHypervisorError(err)
+			app.fatalError = true
+			app.mode = modeError
+		} else {
+			app.hypervisor = h
+			slog.Info("hypervisor opened successfully")
+		}
 	}
 
 	// Determine if onboarding should be shown (only if not in error state)
@@ -1631,7 +1640,15 @@ func (app *Application) startCustomVM(sourceType VMSourceType, sourcePath string
 	// Create progress callback for image downloads
 	progressCallback := func(progress oci.DownloadProgress) {
 		app.bootProgressMu.Lock()
-		app.bootProgress = progress
+		app.bootProgress = cc.DownloadProgress{
+			Current:        progress.Current,
+			Total:          progress.Total,
+			Filename:       progress.Filename,
+			BlobIndex:      progress.BlobIndex,
+			BlobCount:      progress.BlobCount,
+			BytesPerSecond: progress.BytesPerSecond,
+			ETA:            progress.ETA,
+		}
 		app.bootProgressMu.Unlock()
 	}
 
@@ -1687,7 +1704,15 @@ func (app *Application) installBundle(sourceType VMSourceType, sourcePath string
 
 	progressCallback := func(progress oci.DownloadProgress) {
 		app.installProgressMu.Lock()
-		app.installProgress = progress
+		app.installProgress = cc.DownloadProgress{
+			Current:        progress.Current,
+			Total:          progress.Total,
+			Filename:       progress.Filename,
+			BlobIndex:      progress.BlobIndex,
+			BlobCount:      progress.BlobCount,
+			BytesPerSecond: progress.BytesPerSecond,
+			ETA:            progress.ETA,
+		}
 		app.installProgressMu.Unlock()
 	}
 

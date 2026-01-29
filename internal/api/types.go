@@ -160,6 +160,21 @@ type Instance interface {
 	// ID returns the instance's ID.
 	ID() string
 
+	// Done returns a channel that receives an error when the VM exits.
+	// The channel is closed after the error is sent.
+	// This allows non-blocking monitoring of VM termination.
+	Done() <-chan error
+
+	// SetConsoleSize updates the virtio-console size so the guest sees
+	// the correct terminal dimensions. This is a best-effort operation
+	// (no-op if console is unavailable).
+	SetConsoleSize(cols, rows int)
+
+	// SetNetworkEnabled enables or disables internet access for the VM.
+	// When disabled, the VM can still communicate with the host netstack
+	// but cannot reach external networks.
+	SetNetworkEnabled(enabled bool)
+
 	// GPU returns the GPU interface if GPU is enabled, nil otherwise.
 	// When non-nil, the caller must run the display loop on the main thread.
 	GPU() GPU
@@ -200,6 +215,43 @@ type InstanceSource interface {
 	IsInstanceSource()
 }
 
+// ImageConfig contains OCI image configuration metadata.
+// This provides access to container runtime settings like environment,
+// entrypoint, and working directory.
+type ImageConfig struct {
+	Architecture string            // "amd64", "arm64", etc.
+	Env          []string          // Environment variables (KEY=VALUE format)
+	WorkingDir   string            // Working directory for commands
+	Entrypoint   []string          // Container entrypoint
+	Cmd          []string          // Container CMD
+	User         string            // User specification (e.g., "1000:1000")
+	Labels       map[string]string // OCI labels
+}
+
+// Command returns the combined command to run, merging Entrypoint and Cmd.
+// If overrideCmd is provided, it replaces the default Cmd.
+// Returns the full command suitable for execution.
+func (c *ImageConfig) Command(overrideCmd []string) []string {
+	var result []string
+	result = append(result, c.Entrypoint...)
+	if len(overrideCmd) > 0 {
+		result = append(result, overrideCmd...)
+	} else {
+		result = append(result, c.Cmd...)
+	}
+	if len(result) == 0 {
+		return []string{"/bin/sh"}
+	}
+	return result
+}
+
+// OCISource extends InstanceSource with OCI-specific metadata.
+// Use type assertion or SourceConfig() to access the ImageConfig.
+type OCISource interface {
+	InstanceSource
+	Config() *ImageConfig
+}
+
 // FilesystemSnapshot represents a snapshot of a filesystem that can be used
 // as an InstanceSource. It provides COW (copy-on-write) semantics and can be
 // persisted and restored.
@@ -233,6 +285,9 @@ type OCIClient interface {
 	// LoadFromDir loads a prebaked image from a directory containing
 	// config.json and layer files (*.idx/*.contents).
 	LoadFromDir(dir string, opts ...OCIPullOption) (InstanceSource, error)
+
+	// LoadFromTar loads an OCI image from a tarball (docker save format).
+	LoadFromTar(tarPath string, opts ...OCIPullOption) (InstanceSource, error)
 
 	// ExportToDir exports an InstanceSource to a directory as prebaked
 	// config.json and layer files. Only works with OCI-based sources.

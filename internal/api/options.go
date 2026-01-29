@@ -94,12 +94,32 @@ func parseInstanceOptions(opts []Option) instanceConfig {
 	return cfg
 }
 
+// DownloadProgress represents the current state of a download.
+// This mirrors the oci.DownloadProgress type for the public API.
+type DownloadProgress struct {
+	Current  int64  // Bytes downloaded so far
+	Total    int64  // Total bytes to download (-1 if unknown)
+	Filename string // Name/path being downloaded
+
+	// Blob count tracking
+	BlobIndex int // Index of current blob (0-based)
+	BlobCount int // Total number of blobs to download
+
+	// Speed and ETA tracking
+	BytesPerSecond float64       // Current download speed in bytes per second
+	ETA            time.Duration // Estimated time remaining (-1 if unknown)
+}
+
+// ProgressCallback is called periodically during downloads.
+type ProgressCallback func(progress DownloadProgress)
+
 // pullConfig holds parsed OCI pull options.
 type pullConfig struct {
-	arch     hv.CpuArchitecture
-	username string
-	password string
-	policy   PullPolicy
+	arch             hv.CpuArchitecture
+	username         string
+	password         string
+	policy           PullPolicy
+	progressCallback ProgressCallback
 }
 
 // defaultPullConfig returns a config with default values.
@@ -130,6 +150,8 @@ func parsePullOptions(opts []OCIPullOption) pullConfig {
 			cfg.username, cfg.password = o.Auth()
 		case interface{ Policy() PullPolicy }:
 			cfg.policy = o.Policy()
+		case interface{ ProgressCallback() ProgressCallback }:
+			cfg.progressCallback = o.ProgressCallback()
 		}
 	}
 

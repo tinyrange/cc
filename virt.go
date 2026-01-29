@@ -45,6 +45,21 @@ type Instance = api.Instance
 // InstanceSource is the source for creating a new Instance.
 type InstanceSource = api.InstanceSource
 
+// ImageConfig contains OCI image configuration metadata.
+// This provides access to container runtime settings like environment,
+// entrypoint, and working directory.
+type ImageConfig = api.ImageConfig
+
+// OCISource extends InstanceSource with OCI-specific metadata.
+// Use type assertion or SourceConfig() to access the ImageConfig.
+type OCISource = api.OCISource
+
+// SourceConfig returns the ImageConfig for a source, or nil if unavailable.
+// This is a convenience function that performs a type assertion to OCISource.
+func SourceConfig(source InstanceSource) *ImageConfig {
+	return api.SourceConfig(source)
+}
+
 // OCIClient pulls OCI images and converts them to InstanceSources.
 type OCIClient = api.OCIClient
 
@@ -56,6 +71,12 @@ type OCIPullOption = api.OCIPullOption
 
 // PullPolicy determines when images are fetched from the registry.
 type PullPolicy = api.PullPolicy
+
+// DownloadProgress represents the current state of a download.
+type DownloadProgress = api.DownloadProgress
+
+// ProgressCallback is called periodically during downloads.
+type ProgressCallback = api.ProgressCallback
 
 // Error represents a cc operation error with structured information.
 type Error = api.Error
@@ -277,6 +298,26 @@ type pullPolicyOption struct{ policy PullPolicy }
 func (*pullPolicyOption) IsOCIPullOption()     {}
 func (o *pullPolicyOption) Policy() PullPolicy { return o.policy }
 
+// WithProgressCallback sets a callback function for download progress updates.
+// The callback receives progress updates with current/total bytes, filename,
+// and blob index information. Set to nil to disable progress reporting.
+//
+// Example:
+//
+//	source, err := client.Pull(ctx, "alpine:latest",
+//	    cc.WithProgressCallback(func(p cc.DownloadProgress) {
+//	        fmt.Printf("Downloading %s: %d/%d bytes\n", p.Filename, p.Current, p.Total)
+//	    }),
+//	)
+func WithProgressCallback(fn ProgressCallback) OCIPullOption {
+	return &progressCallbackOption{fn: fn}
+}
+
+type progressCallbackOption struct{ fn ProgressCallback }
+
+func (*progressCallbackOption) IsOCIPullOption()                     {}
+func (o *progressCallbackOption) ProgressCallback() ProgressCallback { return o.fn }
+
 // -----------------------------------------------------------------------------
 // Constructors
 // -----------------------------------------------------------------------------
@@ -293,6 +334,19 @@ func NewOCIClient() (OCIClient, error) {
 // Close when finished to release resources.
 func New(source InstanceSource, opts ...Option) (Instance, error) {
 	return api.New(source, opts...)
+}
+
+// SupportsHypervisor checks if the hypervisor is available on this system.
+// Returns nil if available, or an error describing why not.
+// Use this for early startup checks to show a friendly error message.
+//
+// Example:
+//
+//	if err := cc.SupportsHypervisor(); err != nil {
+//	    log.Fatal("Hypervisor unavailable:", err)
+//	}
+func SupportsHypervisor() error {
+	return api.SupportsHypervisor()
 }
 
 // EnsureExecutableIsSigned checks if the current executable is signed with
@@ -468,5 +522,5 @@ func WithCache(cache CacheDir) Option {
 
 type cacheOption struct{ cache CacheDir }
 
-func (*cacheOption) IsOption()        {}
+func (*cacheOption) IsOption()         {}
 func (o *cacheOption) Cache() CacheDir { return o.cache }

@@ -51,6 +51,14 @@ func run() error {
 	_ = cache.SnapshotPath() // filesystem snapshots
 
 	// =========================================================================
+	// SupportsHypervisor - early startup check
+	// =========================================================================
+	if err := cc.SupportsHypervisor(); err != nil {
+		// Show friendly error to user instead of proceeding
+		return fmt.Errorf("hypervisor unavailable: %w", err)
+	}
+
+	// =========================================================================
 	// OCIClient - image pulling and management
 	// =========================================================================
 
@@ -78,6 +86,16 @@ func run() error {
 	_ = cc.PullAlways
 	_ = cc.PullNever
 
+	// WithProgressCallback - download progress reporting
+	_ = cc.WithProgressCallback(func(p cc.DownloadProgress) {
+		// DownloadProgress fields
+		_ = p.Current   // Bytes downloaded so far
+		_ = p.Total     // Total bytes to download (-1 if unknown)
+		_ = p.Filename  // Name/path being downloaded
+		_ = p.BlobIndex // Index of current blob (0-based)
+		_ = p.BlobCount // Total number of blobs to download
+	})
+
 	// Pull an image
 	source, err := client.Pull(ctx, "alpine:latest", pullOpts...)
 	if err != nil {
@@ -87,8 +105,41 @@ func run() error {
 	// OCIClient.LoadFromDir - load prebaked image
 	source, _ = client.LoadFromDir("/path/to/image", pullOpts...)
 
+	// OCIClient.LoadFromTar - load from tarball (docker save format)
+	source, _ = client.LoadFromTar("/path/to/image.tar", pullOpts...)
+
 	// OCIClient.ExportToDir - export image to directory
 	_ = client.ExportToDir(source, "/path/to/export")
+
+	// =========================================================================
+	// ImageConfig and OCISource - access container metadata
+	// =========================================================================
+
+	// SourceConfig helper - get ImageConfig from any InstanceSource
+	cfg := cc.SourceConfig(source)
+	if cfg != nil {
+		_ = cfg.Architecture // "amd64", "arm64", etc.
+		_ = cfg.Env          // []string{"PATH=/bin:/usr/bin", ...}
+		_ = cfg.WorkingDir   // "/app"
+		_ = cfg.Entrypoint   // []string{"/entrypoint.sh"}
+		_ = cfg.Cmd          // []string{"--config", "/etc/app.conf"}
+		_ = cfg.User         // "1000:1000"
+		_ = cfg.Labels       // map[string]string{"version": "1.0"}
+
+		// Get combined command (entrypoint + cmd)
+		fullCmd := cfg.Command(nil)
+		_ = fullCmd
+
+		// Override cmd while keeping entrypoint
+		overrideCmd := cfg.Command([]string{"custom", "args"})
+		_ = overrideCmd
+	}
+
+	// Type assertion for OCISource interface
+	if ociSrc, ok := source.(cc.OCISource); ok {
+		cfg := ociSrc.Config()
+		_ = cfg.Architecture
+	}
 
 	// =========================================================================
 	// Option - instance configuration
@@ -272,9 +323,16 @@ func run() error {
 	// Net interface - network operations (mirrors net package)
 	// =========================================================================
 
-	// Dial/DialContext - connect to guest
-	// conn, _ := inst.Dial("tcp", "127.0.0.1:8080")
-	// conn, _ := inst.DialContext(ctx, "tcp", "127.0.0.1:8080")
+	// Dial/DialContext - connect to guest'
+	{
+		conn, _ := inst.Dial("tcp", "127.0.0.1:8080")
+		_ = conn
+	}
+
+	{
+		conn, _ := inst.DialContext(ctx, "tcp", "127.0.0.1:8080")
+		_ = conn
+	}
 
 	// Listen - listen for guest connections
 	listener, _ := inst.Listen("tcp", ":8080")
@@ -317,6 +375,26 @@ func run() error {
 		pixels, width, height, ok := gpu.GetFramebuffer()
 		_, _, _, _ = pixels, width, height, ok
 	}
+
+	// =========================================================================
+	// Instance control methods
+	// =========================================================================
+
+	// Done - async VM exit notification
+	doneCh := inst.Done()
+	select {
+	case err := <-doneCh:
+		_ = err // VM exit error (nil on clean shutdown)
+	default:
+		// VM still running
+	}
+
+	// SetConsoleSize - update terminal dimensions
+	inst.SetConsoleSize(80, 24) // cols, rows
+
+	// SetNetworkEnabled - toggle internet access
+	inst.SetNetworkEnabled(false) // disable internet
+	inst.SetNetworkEnabled(true)  // re-enable internet
 
 	// =========================================================================
 	// Instance lifecycle
@@ -407,10 +485,14 @@ CMD ["/bin/sh"]
 		_ cc.Net                       // network interface
 		_ cc.Instance                  // running VM
 		_ cc.InstanceSource            // source for creating instances
+		_ cc.ImageConfig               // OCI image configuration
+		_ cc.OCISource                 // OCI source with Config()
 		_ cc.OCIClient                 // OCI image client
 		_ cc.Option                    // instance option
 		_ cc.OCIPullOption             // pull option
 		_ cc.PullPolicy                // pull policy
+		_ cc.DownloadProgress          // download progress info
+		_ cc.ProgressCallback          // download progress callback
 		_ cc.Error                     // structured error
 		_ cc.GPU                       // graphics interface
 		_ cc.MountConfig               // mount configuration

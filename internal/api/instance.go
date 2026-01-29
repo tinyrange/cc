@@ -34,6 +34,24 @@ var (
 	timesliceCloserMu sync.Mutex
 )
 
+// SupportsHypervisor checks if the hypervisor is available on this system.
+// Returns nil if available, or an error describing why not.
+// Use this for early startup checks to show a friendly error message.
+//
+// Example:
+//
+//	if err := cc.SupportsHypervisor(); err != nil {
+//	    log.Fatal("Hypervisor unavailable:", err)
+//	}
+func SupportsHypervisor() error {
+	h, err := factory.Open()
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrHypervisorUnavailable, err)
+	}
+	h.Close()
+	return nil
+}
+
 // initFromEnv initializes debug, timeslice, and verbose logging from environment variables.
 // This is called once per process, before the first instance is created.
 func initFromEnv() error {
@@ -775,5 +793,31 @@ func (g *gpuAdapter) GetFramebuffer() (pixels []byte, width, height uint32, ok b
 }
 
 var _ GPU = (*gpuAdapter)(nil)
+
+// Done returns a channel that receives an error when the VM exits.
+func (inst *instance) Done() <-chan error {
+	if inst.session == nil {
+		// Return a closed channel with nil error if no session
+		ch := make(chan error, 1)
+		ch <- nil
+		close(ch)
+		return ch
+	}
+	return inst.session.Done
+}
+
+// SetConsoleSize updates the virtio-console size.
+func (inst *instance) SetConsoleSize(cols, rows int) {
+	if inst.vm != nil {
+		inst.vm.SetConsoleSize(cols, rows)
+	}
+}
+
+// SetNetworkEnabled enables or disables internet access for the VM.
+func (inst *instance) SetNetworkEnabled(enabled bool) {
+	if inst.ns != nil {
+		inst.ns.SetInternetAccessEnabled(enabled)
+	}
+}
 
 var _ Instance = (*instance)(nil)
