@@ -69,17 +69,37 @@ func TestNewOCIClient(t *testing.T) {
 }
 
 func TestOptions(t *testing.T) {
+	// Create a cache directory for testing
+	cache, err := cc.NewCacheDir(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewCacheDir() error = %v", err)
+	}
+
 	// Verify options implement the Option interface
 	var _ cc.Option = cc.WithMemoryMB(256)
-	var _ cc.Option = cc.WithEnv("FOO=bar")
 	var _ cc.Option = cc.WithTimeout(0)
-	var _ cc.Option = cc.WithWorkdir("/app")
 	var _ cc.Option = cc.WithUser("1000")
+	var _ cc.Option = cc.WithCPUs(2)
+	var _ cc.Option = cc.WithInteractiveIO(nil, nil)
+	var _ cc.Option = cc.WithDmesg()
+	var _ cc.Option = cc.WithPacketCapture(nil)
+	var _ cc.Option = cc.WithGPU()
+	var _ cc.Option = cc.WithMount(cc.MountConfig{Tag: "test"})
+	var _ cc.Option = cc.WithCache(cache)
 
 	// Verify pull options implement the OCIPullOption interface
 	var _ cc.OCIPullOption = cc.WithPlatform("linux", "amd64")
 	var _ cc.OCIPullOption = cc.WithAuth("user", "pass")
 	var _ cc.OCIPullOption = cc.WithPullPolicy(cc.PullAlways)
+
+	// Verify filesystem snapshot options implement the FilesystemSnapshotOption interface
+	var _ cc.FilesystemSnapshotOption = cc.WithSnapshotExcludes("/tmp/*")
+	var _ cc.FilesystemSnapshotOption = cc.WithSnapshotCacheDir(cache.SnapshotPath())
+
+	// Verify dockerfile options implement the DockerfileOption interface
+	var _ cc.DockerfileOption = cc.WithBuildContextDir(".")
+	var _ cc.DockerfileOption = cc.WithBuildArg("key", "value")
+	var _ cc.DockerfileOption = cc.WithDockerfileCacheDir(cache.SnapshotPath())
 }
 
 func TestPullPolicy(t *testing.T) {

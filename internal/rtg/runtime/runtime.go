@@ -151,6 +151,7 @@ const (
 	SYS_RECVMSG       int64 = 41
 	SYS_PIPE2         int64 = 42
 	SYS_FCNTL         int64 = 43
+	SYS_KILL          int64 = 44
 )
 
 // File descriptor constants

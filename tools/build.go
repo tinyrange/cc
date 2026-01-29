@@ -1150,6 +1150,8 @@ func main() {
 	runSpecial := fs.String("runs", "", "run a given package")
 	exampleTest := fs.Bool("example-test", false, "build and run example tests with testrunner")
 	example := fs.String("example", "", "build and run an example (path to example directory)")
+	ccTests := fs.Bool("cc-tests", false, "build cc and run cc integration tests")
+	ciTests := fs.Bool("ci-tests", false, "run all CI tests: quest, bringup, cc-tests, examples")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
@@ -1260,6 +1262,133 @@ func main() {
 		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
 			os.Exit(1)
 		}
+		return
+	}
+
+	if *ccTests {
+		// Build cc first
+		ccOut, err := goBuild(buildOptions{
+			Package:          "internal/cmd/cc",
+			OutputName:       "cc",
+			Build:            hostBuild,
+			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build cc: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("built %s\n", ccOut.Path)
+
+		// Build testrunner
+		runnerOut, err := goBuild(buildOptions{
+			Package:    "examples/shared/testrunner/cmd/runtest",
+			OutputName: "runtest",
+			Build:      hostBuild,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build testrunner: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Run testrunner with cc tests
+		// Pass --cc2-binary flag to tell testrunner where cc is
+		// Pass test paths from args, or default to all cc tests
+		testPaths := fs.Args()
+		if len(testPaths) == 0 {
+			testPaths = []string{"./internal/cmd/cc/tests/..."}
+		}
+		args := append([]string{"--cc2-binary", ccOut.Path}, testPaths...)
+		if err := runBuildOutput(runnerOut, args, runOpts); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *ciTests {
+		fmt.Println("=== Running CI Tests ===")
+		fmt.Println()
+
+		// Step 1: Run quest
+		fmt.Println("=== Step 1/4: Quest ===")
+		questOut, err := goBuild(buildOptions{
+			Package:          "internal/cmd/quest",
+			OutputName:       "quest",
+			Build:            hostBuild,
+			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build quest: %v\n", err)
+			os.Exit(1)
+		}
+		if err := runBuildOutput(questOut, nil, runOpts); err != nil {
+			fmt.Fprintf(os.Stderr, "quest failed\n")
+			os.Exit(1)
+		}
+		fmt.Println()
+
+		// Step 2: Run bringup
+		fmt.Println("=== Step 2/4: Bringup ===")
+		bringupBuild := crossBuild{GOOS: "linux", GOARCH: hostBuild.GOARCH}
+		bringupOut, err := goBuild(buildOptions{
+			Package:    "internal/cmd/bringup",
+			OutputName: "bringup",
+			CgoEnabled: false,
+			Build:      bringupBuild,
+			BuildTests: true,
+			Tags:       []string{"guest"},
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build bringup tool: %v\n", err)
+			os.Exit(1)
+		}
+		bringupArgs := []string{"-exec", bringupOut.Path}
+		if err := runBuildOutput(questOut, bringupArgs, runOpts); err != nil {
+			fmt.Fprintf(os.Stderr, "bringup failed\n")
+			os.Exit(1)
+		}
+		fmt.Println()
+
+		// Step 3: Run cc-tests
+		fmt.Println("=== Step 3/4: CC Tests ===")
+		ccOut, err := goBuild(buildOptions{
+			Package:          "internal/cmd/cc",
+			OutputName:       "cc",
+			Build:            hostBuild,
+			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build cc: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("built %s\n", ccOut.Path)
+
+		runnerOut, err := goBuild(buildOptions{
+			Package:    "examples/shared/testrunner/cmd/runtest",
+			OutputName: "runtest",
+			Build:      hostBuild,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build testrunner: %v\n", err)
+			os.Exit(1)
+		}
+
+		ccTestArgs := []string{"--cc2-binary", ccOut.Path, "./internal/cmd/cc/tests/..."}
+		if err := runBuildOutput(runnerOut, ccTestArgs, runOpts); err != nil {
+			fmt.Fprintf(os.Stderr, "cc-tests failed\n")
+			os.Exit(1)
+		}
+		fmt.Println()
+
+		// Step 4: Run example tests
+		fmt.Println("=== Step 4/4: Example Tests ===")
+		exampleTestArgs := []string{"--cc2-binary", ccOut.Path, "./examples/getting-started/..."}
+		if err := runBuildOutput(runnerOut, exampleTestArgs, runOpts); err != nil {
+			fmt.Fprintf(os.Stderr, "example tests failed\n")
+			os.Exit(1)
+		}
+		fmt.Println()
+
+		fmt.Println("=== All CI Tests Passed ===")
 		return
 	}
 

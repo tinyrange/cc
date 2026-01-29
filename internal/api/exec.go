@@ -208,6 +208,12 @@ func (c *instanceCmd) Wait() error {
 
 // runCommand executes the command in the guest.
 func (c *instanceCmd) runCommand() {
+	// Check if instance is in interactive mode
+	if c.inst.interactive {
+		c.runInteractiveCommand()
+		return
+	}
+
 	// Prepare command path and args
 	cmdPath := c.name
 
@@ -226,27 +232,13 @@ func (c *instanceCmd) runCommand() {
 		cmdPath = resolved
 	}
 
-	// Read stdin data if stdin reader is set
-	var stdinData []byte
-	var hasStdin bool
-	if c.stdin != nil {
-		hasStdin = true
-		var err error
-		stdinData, err = io.ReadAll(c.stdin)
-		if err != nil {
-			c.mu.Lock()
-			c.err = &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("read stdin: %w", err)}
-			c.finished = true
-			c.mu.Unlock()
-			close(c.done)
-			return
-		}
-	}
+	// Check if stdin is set (we'll use streaming mode if so)
+	hasStdin := c.stdin != nil
 
 	// Use the command's environment (already merged in CommandContext)
 	env := c.env
 
-	// Build IR program using ForkExecWait helper
+	// Build IR program using ForkExecWaitWithCwd helper (supports working directory)
 	errLabel := ir.Label("exec_error")
 	execErrLabel := ir.Label("exec_child_error")
 	errVar := ir.Var("exec_errno")
@@ -255,7 +247,7 @@ func (c *instanceCmd) runCommand() {
 		Entrypoint: "main",
 		Methods: map[string]ir.Method{
 			"main": {
-				initx.ForkExecWait(cmdPath, c.args, env, errLabel, execErrLabel, errVar),
+				initx.ForkExecWaitWithCwd(cmdPath, c.args, env, c.dir, errLabel, execErrLabel, errVar),
 				ir.Return(errVar),
 				ir.DeclareLabel(errLabel, ir.Block{
 					ir.Printf("cc: exec error: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
@@ -282,7 +274,7 @@ func (c *instanceCmd) runCommand() {
 		}
 	}
 
-	// Run program via vsock with capture and optional stdin
+	// Run program via vsock with capture and optional streaming stdin
 	var result *initx.ProgramResult
 	var err error
 
@@ -291,8 +283,11 @@ func (c *instanceCmd) runCommand() {
 		captureFlags |= initx.CaptureFlagStdin
 	}
 
-	if captureFlags != initx.CaptureFlagNone {
-		result, err = c.inst.vm.RunWithCaptureAndStdin(c.ctx, prog, captureFlags, stdinData)
+	// Use streaming stdin when stdin is provided, otherwise use regular capture
+	if hasStdin || captureFlags != initx.CaptureFlagNone {
+		// RunWithStreamingStdin handles both streaming stdin and capture
+		// If stdin is nil, it uses StdinModeNone; otherwise StdinModeStreaming
+		result, err = c.inst.vm.RunWithStreamingStdin(c.ctx, prog, captureFlags, c.stdin)
 	} else {
 		err = c.inst.vm.Run(c.ctx, prog)
 	}
@@ -340,8 +335,87 @@ func (c *instanceCmd) runCommand() {
 	close(c.done)
 }
 
+// runInteractiveCommand executes a command in interactive mode using virtio-console.
+// In this mode, stdin/stdout are already connected to the console via WithStdin/WithConsoleOutput,
+// so we just run the command and let the console handle I/O directly.
+func (c *instanceCmd) runInteractiveCommand() {
+	// Prepare command path and args
+	cmdPath := c.name
+
+	// Resolve command path if it doesn't contain "/"
+	if !strings.Contains(cmdPath, "/") {
+		resolved, err := c.lookPath(cmdPath)
+		if err != nil {
+			c.mu.Lock()
+			c.err = &Error{Op: "exec", Path: c.name, Err: err}
+			c.finished = true
+			c.mu.Unlock()
+			close(c.done)
+			return
+		}
+		cmdPath = resolved
+	}
+
+	// Use the command's environment (already merged in CommandContext)
+	env := c.env
+
+	// Build IR program using ForkExecWaitWithCwd helper (supports working directory)
+	errLabel := ir.Label("exec_error")
+	execErrLabel := ir.Label("exec_child_error")
+	errVar := ir.Var("exec_errno")
+
+	prog := &ir.Program{
+		Entrypoint: "main",
+		Methods: map[string]ir.Method{
+			"main": {
+				initx.ForkExecWaitWithCwd(cmdPath, c.args, env, c.dir, errLabel, execErrLabel, errVar),
+				ir.Return(errVar),
+				ir.DeclareLabel(errLabel, ir.Block{
+					ir.Printf("cc: exec error: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+					ir.Return(errVar),
+				}),
+				ir.DeclareLabel(execErrLabel, ir.Block{
+					ir.Syscall(defs.SYS_EXIT, ir.Int64(1)),
+				}),
+			},
+		},
+	}
+
+	// Start stdin forwarding before running the command so the user can type
+	c.inst.vm.StartStdinForwarding()
+
+	// Run the program directly - output goes to virtio-console
+	err := c.inst.vm.Run(c.ctx, prog)
+
+	c.mu.Lock()
+	if err != nil {
+		if exitErr, ok := err.(*initx.ExitError); ok {
+			c.exitCode = exitErr.Code
+			if c.exitCode != 0 {
+				if c.exitCode < 0 {
+					c.err = &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("errno=0x%x", -c.exitCode)}
+				} else {
+					c.err = &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("exit status %d", c.exitCode)}
+				}
+			}
+		} else {
+			c.err = &Error{Op: "exec", Path: c.name, Err: err}
+		}
+	}
+	c.finished = true
+	c.mu.Unlock()
+
+	// Signal completion
+	close(c.done)
+}
+
 // Output runs the command and returns its stdout.
+// This method is not supported in interactive mode; use Run() instead.
 func (c *instanceCmd) Output() ([]byte, error) {
+	if c.inst.interactive {
+		return nil, &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("Output() is not supported in interactive mode; use Run() instead")}
+	}
+
 	var stdout bytes.Buffer
 	c.stdout = &stdout
 
@@ -353,7 +427,12 @@ func (c *instanceCmd) Output() ([]byte, error) {
 }
 
 // CombinedOutput runs the command and returns stdout and stderr combined.
+// This method is not supported in interactive mode; use Run() instead.
 func (c *instanceCmd) CombinedOutput() ([]byte, error) {
+	if c.inst.interactive {
+		return nil, &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("CombinedOutput() is not supported in interactive mode; use Run() instead")}
+	}
+
 	var combined bytes.Buffer
 	c.stdout = &combined
 	c.stderr = &combined
@@ -404,10 +483,37 @@ func (c *instanceCmd) SetDir(dir string) Cmd {
 	return c
 }
 
-// SetEnv sets the environment variables for the command.
-func (c *instanceCmd) SetEnv(env []string) Cmd {
-	c.env = env
+// SetEnv sets a single environment variable (like os.Setenv).
+func (c *instanceCmd) SetEnv(key, value string) Cmd {
+	// Look for existing key and update it
+	prefix := key + "="
+	for i, entry := range c.env {
+		if strings.HasPrefix(entry, prefix) {
+			c.env[i] = key + "=" + value
+			return c
+		}
+	}
+	// Not found, append new entry
+	c.env = append(c.env, key+"="+value)
 	return c
+}
+
+// GetEnv returns the value of an environment variable (like os.Getenv).
+func (c *instanceCmd) GetEnv(key string) string {
+	prefix := key + "="
+	for _, entry := range c.env {
+		if strings.HasPrefix(entry, prefix) {
+			return strings.TrimPrefix(entry, prefix)
+		}
+	}
+	return ""
+}
+
+// Environ returns a copy of the command's environment variables.
+func (c *instanceCmd) Environ() []string {
+	result := make([]string, len(c.env))
+	copy(result, c.env)
+	return result
 }
 
 // ExitCode returns the exit code of the exited process.
@@ -416,3 +522,61 @@ func (c *instanceCmd) ExitCode() int {
 }
 
 var _ Cmd = (*instanceCmd)(nil)
+
+// execCommand executes a command in "exec mode" - the command replaces init as PID 1.
+// Unlike Command().Run(), there is no fork - the command directly replaces the init process.
+// When the command exits, the VM terminates.
+func (inst *instance) execCommand(ctx context.Context, name string, args []string) error {
+	// Resolve command path
+	cmdPath := name
+	if !strings.Contains(cmdPath, "/") {
+		// Create a temporary cmd to use lookPath
+		tmpCmd := &instanceCmd{
+			inst: inst,
+			env:  inst.imageConfig.Env,
+			dir:  inst.imageConfig.WorkingDir,
+		}
+		resolved, err := tmpCmd.lookPath(cmdPath)
+		if err != nil {
+			return &Error{Op: "exec", Path: name, Err: err}
+		}
+		cmdPath = resolved
+	}
+
+	// Merge environment from image config
+	env := append([]string{}, inst.imageConfig.Env...)
+
+	// Build IR program using ExecOnly helper (no fork, just exec)
+	errLabel := ir.Label("exec_error")
+	errVar := ir.Var("exec_errno")
+
+	prog := &ir.Program{
+		Entrypoint: "main",
+		Methods: map[string]ir.Method{
+			"main": {
+				initx.ExecOnly(cmdPath, args, env, errLabel, errVar),
+				// If we get here, execve failed
+				ir.DeclareLabel(errLabel, ir.Block{
+					ir.Printf("cc: exec error: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
+					ir.Return(errVar),
+				}),
+			},
+		},
+	}
+
+	// Run the program - this will replace init with the specified command
+	err := inst.vm.Run(ctx, prog)
+	if err != nil {
+		if exitErr, ok := err.(*initx.ExitError); ok {
+			if exitErr.Code != 0 {
+				if exitErr.Code < 0 {
+					return &Error{Op: "exec", Path: name, Err: fmt.Errorf("errno=0x%x", -exitErr.Code)}
+				}
+				return &Error{Op: "exec", Path: name, Err: fmt.Errorf("exit status %d", exitErr.Code)}
+			}
+			return nil
+		}
+		return &Error{Op: "exec", Path: name, Err: err}
+	}
+	return nil
+}

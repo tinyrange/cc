@@ -30,6 +30,17 @@ const (
 	captureFlagStdin   = 0x08
 )
 
+// Stdin mode constants (must match loader.go)
+// These are used in the stdin_len field position to indicate streaming mode
+const (
+	stdinModeNone      = 0x00 // No stdin (EOF immediately)
+	stdinModeBuffered  = 0x01 // Buffered stdin (legacy - stdin_len and data follow code)
+	stdinModeStreaming = 0x02 // Streaming stdin (connect to host port 9999)
+)
+
+// Vsock port for streaming stdin (must match loader.go VsockStdinPort)
+const vsockStdinPort = 9999
+
 // Timeslice IDs - must match constants in hvf_darwin_arm64.go
 // Guest writes these values to timesliceMem offset 0 to record markers
 // 0=init_start, 1=phase1_dev_create, 2=phase2_mount_dev, 3=phase2_mount_shm
@@ -458,7 +469,14 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 			runtime.Store32(timesliceMem, 0, 18)
 		}
 
-		// Set up stdin pipe if stdin data is present
+		// Set up stdin pipe if stdin is needed
+		// stdinLen field is now overloaded:
+		// - stdinModeNone (0): no stdin
+		// - stdinModeBuffered (1): legacy, but we treat any value > stdinModeStreaming as buffered length
+		// - stdinModeStreaming (2): streaming mode, connect to host port 9999
+		// For backward compatibility, if captureFlagStdin is set:
+		// - stdinLen == stdinModeStreaming (2) → streaming mode
+		// - otherwise → buffered mode with stdinLen bytes of data
 		var stdinPipeRead int64 = -1
 		var stdinPipeWrite int64 = -1
 		var stdinWriterPid int64 = -1
@@ -466,7 +484,134 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 
 		var hasStdinFlag int64 = 0
 		hasStdinFlag = flags & captureFlagStdin
+
+		// Check for streaming mode
+		var isStreamingStdin int64 = 0
 		if hasStdinFlag != 0 {
+			if stdinLen == stdinModeStreaming {
+				isStreamingStdin = 1
+			}
+		}
+
+		if isStreamingStdin != 0 {
+			// === STREAMING STDIN MODE ===
+			// Create pipe for stdin
+			streamingPipeResult := runtime.Syscall(runtime.SYS_PIPE2, pipeFdBuf, 0)
+			if streamingPipeResult >= 0 {
+				stdinPipeRead = runtime.Load32(pipeFdBuf, 0)
+				stdinPipeWrite = runtime.Load32(pipeFdBuf, 4)
+
+				// Fork stdin reader process that connects to host and streams data
+				stdinWriterPid = runtime.Syscall(runtime.SYS_CLONE, runtime.SIGCHLD, 0, 0, 0, 0)
+
+				if stdinWriterPid == 0 {
+					// === STDIN STREAMING PROCESS (child) ===
+					// Close read end of pipe
+					runtime.Syscall(runtime.SYS_CLOSE, stdinPipeRead)
+
+					// Connect to host for stdin streaming
+					stdinSockFd := runtime.Syscall(runtime.SYS_SOCKET, runtime.AF_VSOCK, runtime.SOCK_STREAM, 0)
+					if stdinSockFd < 0 {
+						runtime.Syscall(runtime.SYS_CLOSE, stdinPipeWrite)
+						runtime.Syscall(runtime.SYS_EXIT, 1)
+					}
+
+					// Build sockaddr_vm for stdin port
+					stdinSockaddr := runtime.Syscall(runtime.SYS_MMAP, 0, 16, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
+					if stdinSockaddr < 0 {
+						runtime.Syscall(runtime.SYS_CLOSE, stdinSockFd)
+						runtime.Syscall(runtime.SYS_CLOSE, stdinPipeWrite)
+						runtime.Syscall(runtime.SYS_EXIT, 1)
+					}
+
+					// Zero and fill sockaddr_vm
+					runtime.Store64(stdinSockaddr, 0, 0)
+					runtime.Store64(stdinSockaddr, 8, 0)
+					runtime.Store16(stdinSockaddr, 0, runtime.AF_VSOCK)
+					runtime.Store32(stdinSockaddr, 4, vsockStdinPort)
+					runtime.Store32(stdinSockaddr, 8, runtime.VMADDR_CID_HOST)
+
+					// Connect to host stdin port
+					stdinConnectResult := runtime.Syscall(runtime.SYS_CONNECT, stdinSockFd, stdinSockaddr, 16)
+					runtime.Syscall(runtime.SYS_MUNMAP, stdinSockaddr, 16)
+
+					if stdinConnectResult < 0 {
+						runtime.Syscall(runtime.SYS_CLOSE, stdinSockFd)
+						runtime.Syscall(runtime.SYS_CLOSE, stdinPipeWrite)
+						runtime.Syscall(runtime.SYS_EXIT, 1)
+					}
+
+					// Allocate buffer for streaming (reuse lenBuf area if available, or allocate new)
+					stdinStreamBuf := runtime.Syscall(runtime.SYS_MMAP, 0, 16384+4, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
+					if stdinStreamBuf < 0 {
+						runtime.Syscall(runtime.SYS_CLOSE, stdinSockFd)
+						runtime.Syscall(runtime.SYS_CLOSE, stdinPipeWrite)
+						runtime.Syscall(runtime.SYS_EXIT, 1)
+					}
+
+					// Stream stdin: read [len:4][data] chunks from vsock, write to pipe
+					var stdinStreamDone int64 = 0
+					for stdinStreamDone == 0 {
+						// Read chunk length (4 bytes)
+						readLenResult := vsockReadFull(stdinSockFd, stdinStreamBuf, 4)
+						if readLenResult < 0 {
+							stdinStreamDone = 1
+						}
+						if stdinStreamDone == 0 {
+							var chunkLen int64 = 0
+							chunkLen = runtime.Load32(stdinStreamBuf, 0)
+
+							if chunkLen == 0 {
+								// EOF marker
+								stdinStreamDone = 1
+							}
+							if stdinStreamDone == 0 {
+								// Read chunk data
+								if chunkLen > 16384 {
+									chunkLen = 16384 // Safety limit
+								}
+								readDataResult := vsockReadFull(stdinSockFd, stdinStreamBuf+4, chunkLen)
+								if readDataResult < 0 {
+									stdinStreamDone = 1
+								}
+								if stdinStreamDone == 0 {
+									// Write to pipe
+									vsockWriteFull(stdinPipeWrite, stdinStreamBuf+4, chunkLen)
+								}
+							}
+						}
+					}
+
+					// Clean up
+					runtime.Syscall(runtime.SYS_MUNMAP, stdinStreamBuf, 16384+4)
+					runtime.Syscall(runtime.SYS_CLOSE, stdinSockFd)
+					runtime.Syscall(runtime.SYS_CLOSE, stdinPipeWrite)
+					runtime.Syscall(runtime.SYS_EXIT, 0)
+				}
+
+				// === PARENT PROCESS ===
+				// Close write end (child will write to it)
+				runtime.Syscall(runtime.SYS_CLOSE, stdinPipeWrite)
+				stdinPipeWrite = -1
+
+				// Save original stdin and redirect to pipe read end
+				savedStdin = runtime.Syscall(runtime.SYS_FCNTL, 0, runtime.F_DUPFD_CLOEXEC, 10)
+				runtime.Syscall(runtime.SYS_DUP3, stdinPipeRead, 0, 0)
+				runtime.Syscall(runtime.SYS_CLOSE, stdinPipeRead)
+				stdinPipeRead = -1
+			}
+		}
+
+		// Check for buffered stdin mode (legacy)
+		var isBufferedStdin int64 = 0
+		if hasStdinFlag != 0 {
+			if isStreamingStdin == 0 {
+				isBufferedStdin = 1
+			}
+		}
+
+		if isBufferedStdin != 0 {
+			// === BUFFERED STDIN MODE (legacy) ===
 			// Create pipe for stdin (even if empty, to signal EOF)
 			stdinPipeResult := runtime.Syscall(runtime.SYS_PIPE2, pipeFdBuf, 0)
 			if stdinPipeResult >= 0 {
@@ -818,6 +963,10 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 			savedStdin = -1
 		}
 		if stdinWriterPid > 0 {
+			// Kill stdin writer process - it may be blocked waiting for host input
+			// (e.g., when command doesn't read stdin, like 'ls')
+			runtime.Syscall(runtime.SYS_KILL, stdinWriterPid, 9) // SIGKILL = 9
+
 			// Wait for stdin writer process to complete
 			stdinStatusBuf := runtime.Syscall(runtime.SYS_MMAP, 0, 4096, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
 			if stdinStatusBuf >= 0 {

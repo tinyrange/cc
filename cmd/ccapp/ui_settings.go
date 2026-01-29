@@ -7,11 +7,11 @@ import (
 	"runtime"
 	"strings"
 
+	cc "github.com/tinyrange/cc"
 	"github.com/tinyrange/cc/internal/bundle"
 	"github.com/tinyrange/cc/internal/gowin/graphics"
 	"github.com/tinyrange/cc/internal/gowin/ui"
 	"github.com/tinyrange/cc/internal/initx"
-	"github.com/tinyrange/cc/internal/oci"
 )
 
 // envVarRow represents a single environment variable row in the settings dialog
@@ -75,22 +75,28 @@ func NewSettingsScreen(app *Application, bundleIndex int) *SettingsScreen {
 	if b.Meta.Boot.ImageDir == "" {
 		imageDir = filepath.Join(b.Dir, "image")
 	}
-	if img, err := oci.LoadFromDir(imageDir); err == nil {
-		screen.imageEntrypoint = img.Config.Entrypoint
-		screen.imageCmd = img.Config.Cmd
-		screen.imageEnv = img.Config.Env
-		screen.imageArch = img.Config.Architecture
+	if client, err := cc.NewOCIClient(); err == nil {
+		if source, err := client.LoadFromDir(imageDir); err == nil {
+			if cfg := cc.SourceConfig(source); cfg != nil {
+				screen.imageEntrypoint = cfg.Entrypoint
+				screen.imageCmd = cfg.Cmd
+				screen.imageEnv = cfg.Env
+				screen.imageArch = cfg.Architecture
 
-		// Check if QEMU emulation would be needed
-		if screen.imageArch != "" {
-			hostArch, hostErr := parseArchitecture(runtime.GOARCH)
-			imageArch, imageErr := parseArchitecture(screen.imageArch)
-			if hostErr == nil && imageErr == nil {
-				screen.needsQEMU = initx.NeedsQEMUEmulation(hostArch, imageArch)
+				// Check if QEMU emulation would be needed
+				if screen.imageArch != "" {
+					hostArch, hostErr := parseArchitecture(runtime.GOARCH)
+					imageArch, imageErr := parseArchitecture(screen.imageArch)
+					if hostErr == nil && imageErr == nil {
+						screen.needsQEMU = initx.NeedsQEMUEmulation(hostArch, imageArch)
+					}
+				}
 			}
+		} else {
+			slog.Warn("failed to load image config for settings", "error", err)
 		}
 	} else {
-		slog.Warn("failed to load image config for settings", "error", err)
+		slog.Warn("failed to create OCI client for settings", "error", err)
 	}
 
 	screen.buildUI()

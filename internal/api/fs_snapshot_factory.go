@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/tinyrange/cc/internal/fslayer"
 	"github.com/tinyrange/cc/internal/oci"
@@ -33,8 +34,10 @@ func (o *runOp) CacheKey() string {
 
 func (o *runOp) Apply(ctx context.Context, inst Instance) error {
 	cmd := inst.CommandContext(ctx, o.cmd[0], o.cmd[1:]...)
-	if len(o.env) > 0 {
-		cmd = cmd.SetEnv(o.env)
+	for _, e := range o.env {
+		if key, value, ok := strings.Cut(e, "="); ok {
+			cmd = cmd.SetEnv(key, value)
+		}
 	}
 	if o.workDir != "" {
 		cmd = cmd.SetDir(o.workDir)

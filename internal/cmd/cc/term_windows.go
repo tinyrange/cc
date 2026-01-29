@@ -9,28 +9,45 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// enableVTProcessing enables Virtual Terminal processing on stdout so that
-// ANSI escape sequences are interpreted by the Windows console rather than
-// being displayed as raw text. This must be called before entering raw mode.
-//
-// Returns a cleanup function that restores the original console mode.
+// enableVTProcessing enables Windows Virtual Terminal (VT) processing for
+// proper ANSI escape code handling in interactive mode.
 func enableVTProcessing() (restore func(), err error) {
-	h := windows.Handle(os.Stdout.Fd())
+	stdin := windows.Handle(os.Stdin.Fd())
+	stdout := windows.Handle(os.Stdout.Fd())
 
-	var originalMode uint32
-	if err := windows.GetConsoleMode(h, &originalMode); err != nil {
-		// Not a console (e.g. redirected to file) - no-op.
-		return func() {}, nil
+	var originalInMode, originalOutMode uint32
+
+	// Get current console modes
+	if err := windows.GetConsoleMode(stdin, &originalInMode); err != nil {
+		return nil, err
 	}
-
-	newMode := originalMode | windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING
-	if err := windows.SetConsoleMode(h, newMode); err != nil {
+	if err := windows.GetConsoleMode(stdout, &originalOutMode); err != nil {
 		return nil, err
 	}
 
-	return func() {
-		_ = windows.SetConsoleMode(h, originalMode)
-	}, nil
+	// Enable VT processing on stdout (for escape codes)
+	// ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+	newOutMode := originalOutMode | 0x0004
+	if err := windows.SetConsoleMode(stdout, newOutMode); err != nil {
+		return nil, err
+	}
+
+	// Enable VT input on stdin
+	// ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
+	newInMode := originalInMode | 0x0200
+	if err := windows.SetConsoleMode(stdin, newInMode); err != nil {
+		// Restore stdout mode on error
+		windows.SetConsoleMode(stdout, originalOutMode)
+		return nil, err
+	}
+
+	// Return a function to restore original modes
+	restore = func() {
+		windows.SetConsoleMode(stdin, originalInMode)
+		windows.SetConsoleMode(stdout, originalOutMode)
+	}
+
+	return restore, nil
 }
 
 // cprFilterReader wraps an io.Reader to filter out Cursor Position Report (CPR)

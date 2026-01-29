@@ -36,5 +36,40 @@ func (s *ociSource) Close() error {
 	return nil
 }
 
-// Ensure ociSource implements FilesystemSnapshot
+// Config returns the OCI image configuration metadata.
+func (s *ociSource) Config() *ImageConfig {
+	return &ImageConfig{
+		Architecture: s.image.Config.Architecture,
+		Env:          append([]string{}, s.image.Config.Env...),
+		WorkingDir:   s.image.Config.WorkingDir,
+		Entrypoint:   append([]string{}, s.image.Config.Entrypoint...),
+		Cmd:          append([]string{}, s.image.Config.Cmd...),
+		User:         s.image.Config.User,
+		Labels:       copyLabels(s.image.Config.Labels),
+	}
+}
+
+// copyLabels creates a copy of a labels map.
+func copyLabels(labels map[string]string) map[string]string {
+	if labels == nil {
+		return nil
+	}
+	result := make(map[string]string, len(labels))
+	for k, v := range labels {
+		result[k] = v
+	}
+	return result
+}
+
+// Ensure ociSource implements FilesystemSnapshot and OCISource
 var _ FilesystemSnapshot = (*ociSource)(nil)
+var _ OCISource = (*ociSource)(nil)
+
+// SourceConfig returns the ImageConfig for a source, or nil if unavailable.
+// This is a convenience function that performs a type assertion to OCISource.
+func SourceConfig(source InstanceSource) *ImageConfig {
+	if ociSrc, ok := source.(OCISource); ok {
+		return ociSrc.Config()
+	}
+	return nil
+}

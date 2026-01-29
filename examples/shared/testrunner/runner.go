@@ -25,6 +25,9 @@ type Runner struct {
 	KeepAlive bool
 	Parallel  int
 	Output    *Output
+	// CC2Binary is the path to the cc2 binary for CC2 tests.
+	// If empty, CC2 tests will attempt to build cc2 automatically.
+	CC2Binary string
 }
 
 // NewRunner creates a new test runner.
@@ -105,7 +108,9 @@ func (r *Runner) Run(ctx context.Context, patterns []string) (*Results, error) {
 		}
 		specs = append(specs, spec)
 		specDirs = append(specDirs, filepath.Dir(path))
-		if spec.IsCLI() {
+		if spec.IsCC2() {
+			totalTests += len(spec.CC2Tests)
+		} else if spec.IsCLI() {
 			totalTests += len(spec.CLITests)
 		} else {
 			totalTests += len(spec.Tests)
@@ -197,6 +202,17 @@ func (r *Runner) buildAll(ctx context.Context, specs []*TestSpec, dirs []string)
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
+			// CC2 tests use the pre-built cc2 binary
+			if specs[idx].IsCC2() {
+				if r.CC2Binary != "" {
+					binaries[idx] = r.CC2Binary
+				} else {
+					// No CC2Binary set and no build needed - cc2 must be provided
+					errors[idx] = fmt.Errorf("CC2Binary not set for cc2 tests")
+				}
+				return
+			}
+
 			binary, err := r.buildExample(ctx, specs[idx], dirs[idx])
 			if err != nil {
 				errors[idx] = err
@@ -269,6 +285,11 @@ func (r *Runner) buildExample(ctx context.Context, spec *TestSpec, dir string) (
 // runExample runs tests for a single example.
 func (r *Runner) runExample(ctx context.Context, spec *TestSpec, dir string, binaryPath string) ExampleResult {
 	start := time.Now()
+
+	// Handle CC2 tests (container VM)
+	if spec.IsCC2() {
+		return r.runCC2Example(ctx, spec, dir, binaryPath)
+	}
 
 	// Handle CLI tests (no server)
 	if spec.IsCLI() {

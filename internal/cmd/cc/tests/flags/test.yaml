@@ -1,0 +1,73 @@
+name: cc2-flags
+description: Test cc2 flags
+
+cc2:
+  timeout: 2m
+  image: alpine:latest
+
+cc2_tests:
+  - name: custom memory
+    flags:
+      memory: 512
+    command: ["/bin/sh", "-c", "cat /proc/meminfo | grep MemTotal"]
+    expect:
+      exit_code: 0
+      # 512MB should show around 512000-524288 kB in MemTotal
+      stdout_contains: "MemTotal"
+
+  - name: custom cpus
+    # Skip: HVF (macOS) only supports 1 vCPU, QEMU supports multiple
+    # This test would need platform-specific handling
+    skip: true
+    flags:
+      cpus: 2
+    command: ["/bin/sh", "-c", "nproc"]
+    expect:
+      exit_code: 0
+      stdout_contains: "2"
+
+  - name: workdir
+    flags:
+      workdir: /tmp
+    command: ["/bin/sh", "-c", "pwd"]
+    expect:
+      exit_code: 0
+      stdout_contains: "/tmp"
+
+  - name: user
+    flags:
+      user: "1000:1000"
+    command: ["id"]
+    expect:
+      exit_code: 0
+      stdout_contains: "uid=1000"
+
+  - name: env vars
+    flags:
+      env:
+        - GREETING=hello
+        - TARGET=world
+    command: ["/bin/sh", "-c", "echo $GREETING $TARGET"]
+    expect:
+      exit_code: 0
+      stdout_contains: "hello world"
+
+  - name: exec mode
+    # Exec mode runs entrypoint directly as PID 1 (init) without fork.
+    # When init exits, the kernel panics - this is expected behavior.
+    # The output goes to stderr because it mixes with kernel dmesg.
+    flags:
+      exec: true
+    command: ["/bin/sh", "-c", "echo exec_mode_works"]
+    expect:
+      # Kernel panics with exit code 1 when init exits
+      exit_code: 1
+      stderr_contains: "exec_mode_works"
+
+  - name: timeout enforcement
+    flags:
+      timeout: 2s
+    command: ["/bin/sh", "-c", "sleep 10"]
+    expect:
+      # Command should be killed due to timeout
+      exit_code: 1

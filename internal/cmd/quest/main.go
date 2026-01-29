@@ -1685,8 +1685,9 @@ func RunExecutable(path string, gpuEnabled bool) error {
 		cancel()
 	}()
 
-	// Create vsock backend with echo service on port 9999
-	const vsockEchoPort = 9999
+	// Create vsock backend with echo service on port 10000
+	// Note: Port 9999 is reserved for VsockStdinPort used by VsockProgramServer
+	const vsockEchoPort = 10000
 	vsockBackend := virtio.NewSimpleVsockBackend()
 	vsockListener, err := vsockBackend.Listen(vsockEchoPort)
 	if err != nil {

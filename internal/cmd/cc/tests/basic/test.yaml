@@ -1,0 +1,28 @@
+name: cc2-basic
+description: Basic cc2 functionality tests
+
+cc2:
+  timeout: 2m
+  image: alpine:latest
+
+cc2_tests:
+  - name: simple echo
+    command: ["/bin/sh", "-c", "echo hello"]
+    expect:
+      exit_code: 0
+      stdout_contains: "hello"
+
+  - name: exit code propagation
+    command: ["/bin/sh", "-c", "exit 42"]
+    expect:
+      exit_code: 42
+
+  - name: stderr output
+    command: ["/bin/sh", "-c", "echo error >&2"]
+    expect:
+      exit_code: 0
+      stderr_contains: "error"
+
+  - name: default shell
+    expect:
+      exit_code: 0

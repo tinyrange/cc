@@ -1110,6 +1110,8 @@ func SetHostsOptional(hostname string) ir.Fragment {
 
 // Execution
 
+// Exec performs an execve syscall, replacing the current process with the specified program.
+// This is used by ForkExecWait for the child process after fork.
 func Exec(path string, argv []string, envp []string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
 	// We need to construct argv and envp arrays on stack.
 	// argv = [path, arg1, ..., NULL]
@@ -1184,6 +1186,13 @@ func Exec(path string, argv []string, envp []string, errLabel ir.Label, errVar i
 	})
 }
 
+// ExecOnly performs an execve syscall directly without forking.
+// This is used for "exec mode" where the command replaces init as PID 1.
+// Unlike ForkExecWait, there is no parent process waiting for the child.
+func ExecOnly(path string, argv []string, envp []string, errLabel ir.Label, errVar ir.Var) ir.Fragment {
+	return Exec(path, argv, envp, errLabel, errVar)
+}
+
 // Timeslice MMIO constants for ForkExecWait instrumentation
 const (
 	forkExecTimeslicePhysAddr = 0xf0001000
@@ -1221,6 +1230,85 @@ func ForkExecWait(path string, argv []string, envp []string, forkErrLabel ir.Lab
 			Exec(path, argv, envp, execErrLabel, errVar),
 			ir.Syscall(defs.SYS_EXIT, ir.Int64(1)),
 		}),
+
+		// Parent: Make multiple copies of pid for extra protection against stack corruption
+		ir.Assign(savedPid, pid),
+		ir.Assign(savedPid2, pid),
+		ir.ISB(), // Another barrier before wait4
+
+		// Parent
+		ir.WithStackSlot(ir.StackSlotConfig{
+			Size: 8,
+			Body: func(slot ir.StackSlot) ir.Fragment {
+				ptr := ir.Var("forkStatusPtr")
+				return ir.Block{
+					ir.Assign(ptr, slot.Pointer()),
+
+					// Use savedPid2 which is further from the original pid variable
+					ir.Assign(errVar, ir.Syscall(defs.SYS_WAIT4, savedPid2, ptr, ir.Int64(0), ir.Int64(0))),
+
+					ir.If(ir.IsNegative(errVar), ir.Block{
+						ir.If(ir.IsEqual(errVar, ir.Int64(-int64(linux.ECHILD))), ir.Block{
+							ir.Assign(errVar, ir.Syscall(defs.SYS_WAIT4, savedPid, ptr, ir.Int64(0), ir.Int64(0))),
+							ir.If(ir.IsEqual(errVar, ir.Int64(-int64(linux.ECHILD))), ir.Block{
+								ir.Assign(errVar, ir.Syscall(defs.SYS_WAIT4, ir.Int64(-1), ptr, ir.Int64(0), ir.Int64(0))),
+							}),
+						}),
+						ir.If(ir.IsNegative(errVar), ir.Goto(forkErrLabel)),
+					}),
+					ir.Assign(status, ptr.Mem().As32()),
+					ir.Assign(signal, ir.Op(ir.OpAnd, status, ir.Int64(0x7f))),
+					ir.Assign(exitCode, ir.Op(
+						ir.OpAnd,
+						ir.Op(ir.OpShr, status, ir.Int64(8)),
+						ir.Int64(0xff),
+					)),
+					ir.If(ir.IsNotEqual(signal, ir.Int64(0)), ir.Block{
+						ir.Assign(exitCode, ir.Op(ir.OpAdd, signal, ir.Int64(128))),
+					}),
+					ir.Assign(errVar, exitCode),
+				}
+			},
+		}),
+	}
+}
+
+// ForkExecWaitWithCwd is like ForkExecWait but changes to the specified working directory
+// before executing the program. If cwd is empty, no chdir is performed.
+func ForkExecWaitWithCwd(path string, argv []string, envp []string, cwd string, forkErrLabel ir.Label, execErrLabel ir.Label, errVar ir.Var) ir.Fragment {
+	pid := ir.Var("forkPid")
+	savedPid := ir.Var("forkSavedPid")   // First copy of pid
+	savedPid2 := ir.Var("forkSavedPid2") // Second copy for extra safety
+	status := ir.Var("forkWaitStatus")
+	signal := ir.Var("forkSignal")
+	exitCode := ir.Var("forkExitCode")
+
+	// Build the child block with optional chdir
+	var childBlock ir.Block
+	if cwd != "" {
+		// Change to working directory before exec
+		childBlock = ir.Block{
+			ir.Assign(errVar, ir.Syscall(defs.SYS_CHDIR, cwd)),
+			ir.If(ir.IsNegative(errVar), ir.Goto(execErrLabel)),
+			Exec(path, argv, envp, execErrLabel, errVar),
+			ir.Syscall(defs.SYS_EXIT, ir.Int64(1)),
+		}
+	} else {
+		childBlock = ir.Block{
+			Exec(path, argv, envp, execErrLabel, errVar),
+			ir.Syscall(defs.SYS_EXIT, ir.Int64(1)),
+		}
+	}
+
+	return ir.Block{
+		ir.Assign(pid, ir.Syscall(defs.SYS_CLONE, ir.Int64(defs.SIGCHLD), 0, 0, 0, 0)),
+		ir.ISB(),                         // Memory barrier to ensure clone result is properly visible
+		ir.Syscall(defs.SYS_SCHED_YIELD), // Yield to allow kernel to complete COW setup
+		ir.If(ir.IsNegative(pid), ir.Block{
+			ir.Assign(errVar, pid),
+			ir.Goto(forkErrLabel),
+		}),
+		ir.If(ir.IsZero(pid), childBlock),
 
 		// Parent: Make multiple copies of pid for extra protection against stack corruption
 		ir.Assign(savedPid, pid),

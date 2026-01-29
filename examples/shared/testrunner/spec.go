@@ -18,11 +18,19 @@ type TestSpec struct {
 	// CLI specifies this is a CLI test (no server).
 	CLI      *CLIConfig    `yaml:"cli,omitempty"`
 	CLITests []CLITestCase `yaml:"cli_tests,omitempty"`
+	// CC2 specifies this is a cc2 test (container VM).
+	CC2      *CC2Config    `yaml:"cc2,omitempty"`
+	CC2Tests []CC2TestCase `yaml:"cc2_tests,omitempty"`
 }
 
 // IsCLI returns true if this spec is for CLI tests (no server).
 func (s *TestSpec) IsCLI() bool {
 	return s.CLI != nil || len(s.CLITests) > 0
+}
+
+// IsCC2 returns true if this spec is for cc2 tests (container VM).
+func (s *TestSpec) IsCC2() bool {
+	return s.CC2 != nil || len(s.CC2Tests) > 0
 }
 
 // BuildConfig configures how to build the example binary.
@@ -109,6 +117,78 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 // Duration returns the time.Duration value.
 func (d Duration) Duration() time.Duration {
 	return time.Duration(d)
+}
+
+// CC2Config configures cc2 tests.
+type CC2Config struct {
+	Timeout  Duration `yaml:"timeout"`   // Default timeout per test (default: 2m)
+	CacheDir string   `yaml:"cache_dir"` // Shared OCI cache
+	Image    string   `yaml:"image"`     // Default image (alpine:latest)
+}
+
+// CC2TestCase defines a single cc2 test case.
+type CC2TestCase struct {
+	Name   string `yaml:"name"`
+	Skip   bool   `yaml:"skip"`
+	SkipCI bool   `yaml:"skip_ci"`
+
+	// Source (one of - uses cc2.Image default if none specified)
+	Image      string `yaml:"image"`
+	Dockerfile string `yaml:"dockerfile"`
+	Bundle     string `yaml:"bundle"`
+
+	// cc2 flags
+	Flags CC2Flags `yaml:"flags"`
+
+	// Command and input
+	Command []string `yaml:"command"`
+	Stdin   string   `yaml:"stdin"`
+
+	// Fixtures
+	Fixtures CC2Fixtures `yaml:"fixtures"`
+
+	// Expected results
+	Expect CC2Expectation `yaml:"expect"`
+}
+
+// CC2Flags maps to cc2 command-line flags.
+type CC2Flags struct {
+	Memory     uint64   `yaml:"memory"`
+	CPUs       int      `yaml:"cpus"`
+	Timeout    Duration `yaml:"timeout"`
+	Workdir    string   `yaml:"workdir"`
+	User       string   `yaml:"user"`
+	Dmesg      bool     `yaml:"dmesg"`
+	Exec       bool     `yaml:"exec"`
+	Packetdump string   `yaml:"packetdump"`
+	GPU        bool     `yaml:"gpu"`
+	Arch       string   `yaml:"arch"`
+	CacheDir   string   `yaml:"cache_dir"`
+	Build      string   `yaml:"build"`
+	Env        []string `yaml:"env"`
+	Mounts     []string `yaml:"mounts"`
+}
+
+// CC2Fixtures defines test setup files.
+type CC2Fixtures struct {
+	Files map[string]string `yaml:"files"` // path -> content
+	Dirs  []string          `yaml:"dirs"`
+}
+
+// CC2Expectation defines expected cc2 test results.
+type CC2Expectation struct {
+	ExitCode       int                   `yaml:"exit_code"`
+	StdoutEquals   string                `yaml:"stdout_equals"`
+	StdoutContains string                `yaml:"stdout_contains"`
+	StderrEquals   string                `yaml:"stderr_equals"`
+	StderrContains string                `yaml:"stderr_contains"`
+	Files          map[string]FileExpect `yaml:"files"`
+}
+
+// FileExpect defines file existence/content expectations.
+type FileExpect struct {
+	Exists   bool   `yaml:"exists"`
+	Contains string `yaml:"contains"`
 }
 
 // LoadSpec loads a test specification from a YAML file.
