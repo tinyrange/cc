@@ -498,5 +498,5 @@ func WithCache(cache *CacheDir) Option {
 
 type cacheOption struct{ cache *CacheDir }
 
-func (*cacheOption) IsOption()           {}
+func (*cacheOption) IsOption()          {}
 func (o *cacheOption) Cache() *CacheDir { return o.cache }

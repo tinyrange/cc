@@ -165,8 +165,8 @@ type osDirEntry struct {
 	info    fs.FileInfo
 }
 
-func (d *osDirEntry) Stat() fs.FileMode       { return d.info.Mode() }
-func (d *osDirEntry) ModTime() time.Time      { return d.info.ModTime() }
+func (d *osDirEntry) Stat() fs.FileMode  { return d.info.Mode() }
+func (d *osDirEntry) ModTime() time.Time { return d.info.ModTime() }
 func (d *osDirEntry) ReadDir() ([]AbstractDirEntry, error) {
 	return d.backend.readDirPath(d.relPath)
 }
