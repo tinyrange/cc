@@ -9,11 +9,10 @@ import (
 
 // instanceConfig holds parsed instance options.
 type instanceConfig struct {
-	memoryMB       uint64
-	cpus           int
-	timeout        time.Duration
-	user           string
-	skipEntrypoint bool
+	memoryMB uint64
+	cpus     int
+	timeout  time.Duration
+	user     string
 
 	// Interactive mode - uses virtio-console for live I/O instead of vsock capture
 	interactive       bool
@@ -32,18 +31,15 @@ type instanceConfig struct {
 	// GPU
 	gpu bool
 
-	// QEMU emulation cache directory
-	qemuCacheDir string
-
 	// Cache directory configuration
-	cache *CacheDir
+	cache CacheDir
 }
 
 // mountConfig holds parsed mount configuration.
 type mountConfig struct {
 	tag      string
 	hostPath string
-	readOnly bool
+	writable bool
 }
 
 // defaultInstanceConfig returns a config with default values.
@@ -68,8 +64,6 @@ func parseInstanceOptions(opts []Option) instanceConfig {
 			cfg.timeout = o.Duration()
 		case interface{ User() string }:
 			cfg.user = o.User()
-		case interface{ SkipEntrypoint() bool }:
-			cfg.skipEntrypoint = o.SkipEntrypoint()
 		case interface{ InteractiveIO() (io.Reader, io.Writer) }:
 			cfg.interactive = true
 			cfg.interactiveStdin, cfg.interactiveStdout = o.InteractiveIO()
@@ -81,20 +75,18 @@ func parseInstanceOptions(opts []Option) instanceConfig {
 			Mount() struct {
 				Tag      string
 				HostPath string
-				ReadOnly bool
+				Writable bool
 			}
 		}:
 			m := o.Mount()
 			cfg.mounts = append(cfg.mounts, mountConfig{
 				tag:      m.Tag,
 				hostPath: m.HostPath,
-				readOnly: m.ReadOnly,
+				writable: m.Writable,
 			})
 		case interface{ GPU() bool }:
 			cfg.gpu = o.GPU()
-		case interface{ QEMUCacheDir() string }:
-			cfg.qemuCacheDir = o.QEMUCacheDir()
-		case interface{ Cache() *CacheDir }:
+		case interface{ Cache() CacheDir }:
 			cfg.cache = o.Cache()
 		}
 	}

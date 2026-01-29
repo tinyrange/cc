@@ -119,18 +119,6 @@ type userOption struct{ user string }
 func (*userOption) IsOption()      {}
 func (o *userOption) User() string { return o.user }
 
-// WithSkipEntrypoint tells the instance to initialize without running the
-// container's entrypoint. This is useful when you want to run commands via
-// inst.Command() without the entrypoint interfering.
-func WithSkipEntrypoint() Option {
-	return &skipEntrypointOption{}
-}
-
-type skipEntrypointOption struct{}
-
-func (*skipEntrypointOption) IsOption()            {}
-func (*skipEntrypointOption) SkipEntrypoint() bool { return true }
-
 // WithInteractiveIO enables interactive terminal mode and sets the stdin/stdout.
 // When enabled, stdin/stdout connect to virtio-console for live I/O instead
 // of the default vsock-based capture mode. This is suitable for running
@@ -218,18 +206,6 @@ type gpuOption struct{}
 func (*gpuOption) IsOption() {}
 func (*gpuOption) GPU() bool { return true }
 
-// WithQEMUCacheDir sets the cache directory for QEMU emulation binaries.
-// This is only used when running containers for a different architecture
-// than the host (cross-architecture emulation).
-func WithQEMUCacheDir(dir string) Option {
-	return &qemuCacheDirOption{dir: dir}
-}
-
-type qemuCacheDirOption struct{ dir string }
-
-func (*qemuCacheDirOption) IsOption()              {}
-func (o *qemuCacheDirOption) QEMUCacheDir() string { return o.dir }
-
 // GPU provides access to guest display and input devices.
 type GPU = api.GPU
 
@@ -243,8 +219,8 @@ type MountConfig struct {
 	// filesystem is created.
 	HostPath string
 
-	// ReadOnly makes the mount read-only if true.
-	ReadOnly bool
+	// Writable makes the mount writable. By default, mounts are read-only.
+	Writable bool
 }
 
 // WithMount adds a virtio-fs mount to the guest.
@@ -309,12 +285,6 @@ func (o *pullPolicyOption) Policy() PullPolicy { return o.policy }
 // Uses the default cache directory (platform-specific user config directory).
 func NewOCIClient() (OCIClient, error) {
 	return api.NewOCIClient()
-}
-
-// NewOCIClientWithCacheDir creates a new OCI client with a custom cache directory.
-// If cacheDir is empty, the default cache directory is used.
-func NewOCIClientWithCacheDir(cacheDir string) (OCIClient, error) {
-	return api.NewOCIClientWithCacheDir(cacheDir)
 }
 
 // New creates and starts a new Instance from the given source.
@@ -480,23 +450,23 @@ type CacheDir = api.CacheDir
 
 // NewCacheDir creates a cache directory config.
 // If path is empty, uses the platform-specific default cache directory.
-func NewCacheDir(path string) (*CacheDir, error) {
+func NewCacheDir(path string) (CacheDir, error) {
 	return api.NewCacheDir(path)
 }
 
 // NewOCIClientWithCache creates a new OCI client using the provided CacheDir.
 // This ensures the OCI client uses the same cache location as other components.
-func NewOCIClientWithCache(cache *CacheDir) (OCIClient, error) {
+func NewOCIClientWithCache(cache CacheDir) (OCIClient, error) {
 	return api.NewOCIClientWithCache(cache)
 }
 
 // WithCache sets the cache directory for the instance.
 // This is used for QEMU emulation binaries and other cached resources.
-func WithCache(cache *CacheDir) Option {
+func WithCache(cache CacheDir) Option {
 	return &cacheOption{cache: cache}
 }
 
-type cacheOption struct{ cache *CacheDir }
+type cacheOption struct{ cache CacheDir }
 
-func (*cacheOption) IsOption()          {}
-func (o *cacheOption) Cache() *CacheDir { return o.cache }
+func (*cacheOption) IsOption()        {}
+func (o *cacheOption) Cache() CacheDir { return o.cache }

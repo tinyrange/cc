@@ -102,11 +102,10 @@ type instance struct {
 	closed bool
 
 	// Config from options
-	memoryMB       uint64
-	cpus           int
-	user           string
-	timeout        time.Duration
-	skipEntrypoint bool
+	memoryMB uint64
+	cpus     int
+	user     string
+	timeout  time.Duration
 
 	// Interactive mode - uses virtio-console for live I/O instead of vsock capture
 	interactive       bool
@@ -129,11 +128,8 @@ type instance struct {
 	// Filesystem backend for direct FS operations
 	fsBackend vfs.VirtioFsBackend
 
-	// QEMU emulation cache directory
-	qemuCacheDir string
-
 	// Cache directory configuration
-	cache *CacheDir
+	cache CacheDir
 }
 
 // New creates and starts a new Instance from the given source.
@@ -184,7 +180,6 @@ func New(source InstanceSource, opts ...Option) (Instance, error) {
 		cpus:              cfg.cpus,
 		user:              cfg.user,
 		timeout:           cfg.timeout,
-		skipEntrypoint:    cfg.skipEntrypoint,
 		interactive:       cfg.interactive,
 		interactiveStdin:  cfg.interactiveStdin,
 		interactiveStdout: cfg.interactiveStdout,
@@ -192,7 +187,6 @@ func New(source InstanceSource, opts ...Option) (Instance, error) {
 		packetCapture:     cfg.packetCapture,
 		mounts:            cfg.mounts,
 		gpu:               cfg.gpu,
-		qemuCacheDir:      cfg.qemuCacheDir,
 		cache:             cfg.cache,
 	}
 
@@ -226,8 +220,8 @@ func (inst *instance) start() error {
 	// Check if QEMU emulation is needed for cross-architecture
 	var qemuConfig *initx.QEMUEmulationConfig
 	if initx.NeedsQEMUEmulation(hostArch, containerArch) {
-		cacheDir := inst.qemuCacheDir
-		if cacheDir == "" && inst.cache != nil {
+		var cacheDir string
+		if inst.cache != nil {
 			// Use the shared cache directory
 			cacheDir = inst.cache.QEMUPath()
 		}
@@ -373,7 +367,9 @@ func (inst *instance) start() error {
 		backend := vfs.NewVirtioFsBackendWithAbstract()
 		if mount.hostPath != "" {
 			// Create OS filesystem backend for host directory
-			osDir, err := vfs.NewOSDirBackend(mount.hostPath, mount.readOnly)
+			// Default is read-only unless Writable is set
+			readOnly := !mount.writable
+			osDir, err := vfs.NewOSDirBackend(mount.hostPath, readOnly)
 			if err != nil {
 				inst.ns.Close()
 				inst.h.Close()
@@ -678,6 +674,25 @@ func (inst *instance) CommandContext(ctx context.Context, name string, args ...s
 		env:  env,
 		dir:  workdir,
 	}
+}
+
+func (inst *instance) EntrypointCommand(args ...string) Cmd {
+	return inst.EntrypointCommandContext(inst.ctx, args...)
+}
+
+func (inst *instance) EntrypointCommandContext(ctx context.Context, args ...string) Cmd {
+	// Build entrypoint command from image config
+	cmd := append([]string{}, inst.imageConfig.Entrypoint...)
+	if len(args) > 0 {
+		cmd = append(cmd, args...)
+	} else if len(inst.imageConfig.Cmd) > 0 {
+		cmd = append(cmd, inst.imageConfig.Cmd...)
+	}
+	if len(cmd) == 0 {
+		cmd = []string{"/bin/sh"}
+	}
+
+	return inst.CommandContext(ctx, cmd[0], cmd[1:]...)
 }
 
 func (inst *instance) Exec(name string, args ...string) error {

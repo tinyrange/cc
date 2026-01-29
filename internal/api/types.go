@@ -116,6 +116,13 @@ type Exec interface {
 	Command(name string, args ...string) Cmd
 	// CommandContext creates a new command with the given context.
 	CommandContext(ctx context.Context, name string, args ...string) Cmd
+	// EntrypointCommand returns a command preconfigured with the container's
+	// entrypoint. If args are provided, they replace the image's default CMD.
+	// If no args are provided, the image's CMD is appended to ENTRYPOINT.
+	// If neither ENTRYPOINT nor CMD are set, defaults to /bin/sh.
+	EntrypointCommand(args ...string) Cmd
+	// EntrypointCommandContext is like EntrypointCommand but accepts a context.
+	EntrypointCommandContext(ctx context.Context, args ...string) Cmd
 	// Exec replaces the init process with the specified command (like unix.Exec).
 	// This is a terminal operation - the command becomes PID 1 and there is
 	// no parent process waiting. When the command exits, the VM terminates.

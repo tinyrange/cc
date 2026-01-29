@@ -64,7 +64,7 @@ func run() error {
 	execMode := flag.Bool("exec", false, "Run entrypoint as PID 1 (no fork)")
 	packetdump := flag.String("packetdump", "", "Write packet capture to file (pcap format)")
 	mountFlags := &mountSlice{}
-	flag.Var(mountFlags, "mount", "Mount host directory (tag:hostpath or tag:hostpath:ro)")
+	flag.Var(mountFlags, "mount", "Mount host directory (tag:hostpath or tag:hostpath:rw, default read-only)")
 	gpuFlag := flag.Bool("gpu", false, "Enable GPU and open a window for display")
 	cacheDir := flag.String("cache-dir", "", "OCI image cache directory (default: platform-specific)")
 	envFlags := &stringSlice{}
@@ -275,7 +275,6 @@ func run() error {
 	var opts []cc.Option
 	opts = append(opts, cc.WithMemoryMB(*memoryMB))
 	opts = append(opts, cc.WithCPUs(*cpus))
-	opts = append(opts, cc.WithSkipEntrypoint())
 	if *dmesg {
 		opts = append(opts, cc.WithDmesg())
 	}
@@ -489,10 +488,10 @@ func (m *mountSlice) String() string {
 }
 
 func (m *mountSlice) Set(value string) error {
-	// Format: tag:hostpath or tag:hostpath:ro
+	// Format: tag:hostpath or tag:hostpath:rw (default is read-only)
 	parts := strings.Split(value, ":")
 	if len(parts) < 2 {
-		return fmt.Errorf("mount format: tag:hostpath or tag:hostpath:ro")
+		return fmt.Errorf("mount format: tag:hostpath or tag:hostpath:rw")
 	}
 
 	config := cc.MountConfig{
@@ -500,8 +499,8 @@ func (m *mountSlice) Set(value string) error {
 		HostPath: parts[1],
 	}
 
-	if len(parts) >= 3 && parts[2] == "ro" {
-		config.ReadOnly = true
+	if len(parts) >= 3 && parts[2] == "rw" {
+		config.Writable = true
 	}
 
 	m.mounts = append(m.mounts, config)

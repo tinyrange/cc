@@ -15,23 +15,21 @@ type ociClient struct {
 // NewOCIClient creates a new OCI client for pulling images.
 // Uses the default cache directory (platform-specific user config directory).
 func NewOCIClient() (OCIClient, error) {
-	return NewOCIClientWithCacheDir("")
-}
-
-// NewOCIClientWithCacheDir creates a new OCI client with a custom cache directory.
-// If cacheDir is empty, the default cache directory is used.
-func NewOCIClientWithCacheDir(cacheDir string) (OCIClient, error) {
-	client, err := oci.NewClient(cacheDir)
+	cache, err := NewCacheDir("")
 	if err != nil {
-		return nil, fmt.Errorf("create OCI client: %w", err)
+		return nil, err
 	}
-	return &ociClient{client: client}, nil
+	return NewOCIClientWithCache(cache)
 }
 
 // NewOCIClientWithCache creates a new OCI client using the provided CacheDir.
 // This ensures the OCI client uses the same cache location as other components.
-func NewOCIClientWithCache(cache *CacheDir) (OCIClient, error) {
-	return NewOCIClientWithCacheDir(cache.OCIPath())
+func NewOCIClientWithCache(cache CacheDir) (OCIClient, error) {
+	client, err := oci.NewClient(cache.OCIPath())
+	if err != nil {
+		return nil, fmt.Errorf("create OCI client: %w", err)
+	}
+	return &ociClient{client: client}, nil
 }
 
 // Pull fetches an image and prepares it for use with New.
