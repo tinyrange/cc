@@ -1,0 +1,91 @@
+---
+title: CrumbleCracker
+description: Fast, lightweight virtualization for running containers as VMs
+template: splash
+hero:
+  tagline: Run containers as lightweight virtual machines with hardware-level isolation
+  actions:
+    - text: Get Started
+      link: /getting-started/introduction/
+      icon: right-arrow
+    - text: View on GitHub
+      link: https://github.com/tinyrange/cc
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+## Why CrumbleCracker?
+
+CrumbleCracker runs OCI containers inside lightweight virtual machines, combining the convenience of container images with the security of hardware virtualization.
+
+<CardGrid stagger>
+	<Card title="Container Compatible" icon="seti:docker">
+		Pull any Docker or OCI image and run it directly. No conversion needed.
+	</Card>
+	<Card title="Hardware Isolation" icon="laptop">
+		Each VM runs with its own kernel, providing true isolation via your platform's native hypervisor.
+	</Card>
+	<Card title="Go-Native API" icon="seti:go">
+		Program VMs using familiar Go patterns. The API mirrors `os`, `os/exec`, and `net` packages.
+	</Card>
+	<Card title="Cross-Platform" icon="linux">
+		Runs on macOS (Hypervisor.framework), Linux (KVM), and Windows (WHP).
+	</Card>
+</CardGrid>
+
+## Two Ways to Use CrumbleCracker
+
+<CardGrid>
+	<Card title="CrumbleCracker App" icon="rocket">
+		A GUI desktop application for running VMs interactively. Perfect for development, testing, and exploring container images.
+
+		[Learn more →](/app/overview/)
+	</Card>
+	<Card title="Go API" icon="puzzle">
+		A programming library for embedding VMs in your Go applications. Build sandboxed code execution, CI runners, or custom tooling.
+
+		[Learn more →](/api/overview/)
+	</Card>
+</CardGrid>
+
+## Quick Example
+
+```go
+package main
+
+import (
+    "fmt"
+    cc "github.com/tinyrange/cc"
+)
+
+func main() {
+    // Create OCI client and pull an image
+    client, _ := cc.NewOCIClient()
+    source, _ := client.Pull(ctx, "alpine:latest")
+
+    // Start a VM from the image
+    instance, _ := cc.New(source, cc.WithMemoryMB(256))
+    defer instance.Close()
+
+    // Run a command (mirrors os/exec)
+    output, _ := instance.Command("echo", "Hello from VM!").Output()
+    fmt.Println(string(output))
+}
+```
+
+## Next Steps
+
+<CardGrid>
+	<Card title="Installation" icon="setting">
+		Get CrumbleCracker running on your machine.
+
+		[Install →](/getting-started/installation/)
+	</Card>
+	<Card title="Quick Start" icon="document">
+		Build your first VM in under 5 minutes.
+
+		[Start →](/getting-started/quick-start/)
+	</Card>
+</CardGrid>
