@@ -9,17 +9,18 @@ CrumbleCracker can be installed as a desktop application (ccapp) or as a Go libr
 
 ### macOS
 
-Download the latest `.dmg` from the [GitHub releases page](https://github.com/tinyrange/cc/releases) and drag the app to your Applications folder.
+Download the latest `.zip` from the [GitHub releases page](https://github.com/tinyrange/cc/releases) and extract it. Move the app to your Applications folder or run it directly.
 
 On first launch, macOS may require you to approve the app in System Preferences → Security & Privacy.
 
 ### Linux
 
-Download the appropriate package for your distribution from the releases page:
+Download the binary from the [GitHub releases page](https://github.com/tinyrange/cc/releases) and make it executable:
 
-- `.deb` for Debian/Ubuntu
-- `.rpm` for Fedora/RHEL
-- Standalone binary for other distributions
+```bash
+chmod +x ccapp
+./ccapp
+```
 
 Ensure KVM is enabled:
 
@@ -34,7 +35,7 @@ sudo usermod -aG kvm $USER
 
 ### Windows
 
-Download the installer from the releases page and run it. You may need to enable Windows Hypervisor Platform:
+Download the binary from the [GitHub releases page](https://github.com/tinyrange/cc/releases) and run it. You may need to enable Windows Hypervisor Platform:
 
 1. Open "Turn Windows features on or off"
 2. Enable "Windows Hypervisor Platform"

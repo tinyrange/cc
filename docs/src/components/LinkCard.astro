@@ -1,0 +1,239 @@
+---
+interface Props {
+  title: string;
+  href: string;
+  icon: string;
+  color?: 'blue' | 'purple' | 'green' | 'orange' | 'cyan' | 'magenta';
+}
+
+const { title, href, icon, color = 'blue' } = Astro.props;
+
+const colorMap = {
+  blue: 229,
+  purple: 276,
+  green: 134,
+  orange: 26,
+  cyan: 192,
+  magenta: 322,
+};
+
+const hue = colorMap[color];
+---
+
+<a href={href} class="link-card" style={`--card-hue: ${hue}`}>
+  <div class="link-card-border"></div>
+  <div class="link-card-inner">
+    <div class="link-card-header">
+      <span class="link-card-icon">{icon}</span>
+      <h3 class="link-card-title">{title}</h3>
+    </div>
+    <div class="link-card-body">
+      <slot />
+    </div>
+    <div class="link-card-footer">
+      <span class="link-card-cta">
+        Learn more
+        <svg class="arrow-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M5 12h14M12 5l7 7-7 7"/>
+        </svg>
+      </span>
+    </div>
+    <div class="link-card-shine"></div>
+  </div>
+</a>
+
+<style>
+  .link-card {
+    --card-hue: 229;
+    position: relative;
+    display: block;
+    text-decoration: none;
+    border-radius: 16px;
+  }
+
+  /* Rainbow gradient border - sits behind inner content */
+  .link-card-border {
+    position: absolute;
+    inset: 0;
+    border-radius: 16px;
+    background: linear-gradient(
+      90deg,
+      hsl(229, 80%, 60%) 0%,
+      hsl(276, 80%, 60%) 16.6%,
+      hsl(322, 80%, 60%) 33.3%,
+      hsl(26, 85%, 55%) 50%,
+      hsl(52, 85%, 50%) 66.6%,
+      hsl(89, 75%, 50%) 83.3%,
+      hsl(229, 80%, 60%) 100%
+    );
+    background-size: 200% 100%;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+    animation: rainbowShift 4s linear infinite;
+  }
+
+  .link-card:hover .link-card-border {
+    opacity: 1;
+  }
+
+  @keyframes rainbowShift {
+    0% {
+      background-position: 0% 50%;
+    }
+    100% {
+      background-position: 200% 50%;
+    }
+  }
+
+  /* Inner content area */
+  .link-card-inner {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    min-height: 180px;
+    padding: 1.75rem;
+    margin: 2px;
+    background: linear-gradient(
+      145deg,
+      rgba(22, 27, 34, 1) 0%,
+      rgba(13, 17, 23, 1) 100%
+    );
+    border: 1px solid rgba(139, 148, 158, 0.15);
+    border-radius: 14px;
+    overflow: hidden;
+    transition: border-color 0.3s ease;
+  }
+
+  .link-card:hover .link-card-inner {
+    border-color: transparent;
+  }
+
+  /* Shine effect - clipped by inner */
+  .link-card-shine {
+    position: absolute;
+    inset: -1.75rem;
+    width: calc(50% + 3.5rem);
+    left: calc(-100% - 1.75rem);
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      rgba(255, 255, 255, 0.04) 50%,
+      transparent 100%
+    );
+    transform: skewX(-20deg);
+    transition: left 0.6s ease;
+    pointer-events: none;
+  }
+
+  .link-card:hover .link-card-shine {
+    left: calc(150% + 1.75rem);
+  }
+
+  /* Header with icon and title */
+  .link-card-header {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 1rem;
+  }
+
+  .link-card-icon {
+    font-size: 2rem;
+    filter: drop-shadow(0 0 6px hsla(var(--card-hue), 60%, 50%, 0.3));
+    transition: filter 0.3s ease;
+  }
+
+  .link-card:hover .link-card-icon {
+    filter: drop-shadow(0 0 10px hsla(var(--card-hue), 60%, 50%, 0.5));
+  }
+
+  .link-card-title {
+    font-size: 1.375rem;
+    font-weight: 700;
+    color: #ffffff;
+    margin: 0;
+    letter-spacing: -0.02em;
+    transition: color 0.3s ease;
+  }
+
+  .link-card:hover .link-card-title {
+    color: hsl(var(--card-hue), 80%, 75%);
+  }
+
+  /* Body text */
+  .link-card-body {
+    color: rgba(198, 208, 218, 0.85);
+    font-size: 0.95rem;
+    line-height: 1.6;
+    flex-grow: 1;
+    margin-bottom: 1rem;
+  }
+
+  /* Footer with CTA */
+  .link-card-footer {
+    display: flex;
+    align-items: center;
+  }
+
+  .link-card-cta {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: hsl(var(--card-hue), 70%, 65%);
+    transition: gap 0.3s ease, color 0.3s ease;
+  }
+
+  .link-card:hover .link-card-cta {
+    gap: 0.75rem;
+    color: hsl(var(--card-hue), 80%, 75%);
+  }
+
+  .arrow-icon {
+    transition: transform 0.3s ease;
+  }
+
+  .link-card:hover .arrow-icon {
+    transform: translateX(4px);
+  }
+
+  /* Light theme */
+  :global(:root[data-theme='light']) .link-card-inner {
+    background: linear-gradient(
+      145deg,
+      rgba(255, 255, 255, 0.98) 0%,
+      rgba(246, 248, 250, 1) 100%
+    );
+    border-color: rgba(0, 0, 0, 0.08);
+  }
+
+  :global(:root[data-theme='light']) .link-card-title {
+    color: #1f2328;
+  }
+
+  :global(:root[data-theme='light']) .link-card:hover .link-card-title {
+    color: hsl(var(--card-hue), 70%, 40%);
+  }
+
+  :global(:root[data-theme='light']) .link-card-body {
+    color: rgba(31, 35, 40, 0.8);
+  }
+
+  :global(:root[data-theme='light']) .link-card-cta {
+    color: hsl(var(--card-hue), 70%, 45%);
+  }
+
+  :global(:root[data-theme='light']) .link-card:hover .link-card-cta {
+    color: hsl(var(--card-hue), 80%, 35%);
+  }
+
+  :global(:root[data-theme='light']) .link-card-shine {
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      rgba(0, 0, 0, 0.02) 50%,
+      transparent 100%
+    );
+  }
+</style>

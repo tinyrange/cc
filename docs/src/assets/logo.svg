@@ -8,6 +8,12 @@
   height="500px"
   viewBox="0 0 500 500"
 >
+  <style>
+    #inner-circle,
+    #outer-circle polygon {
+      fill: white;
+    }
+  </style>
   <g id="morse-circle">
     <polygon
       points="103,101 153,144 202,186 162,135 122,83 112,92"

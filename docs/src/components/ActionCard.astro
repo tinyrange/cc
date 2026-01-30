@@ -1,0 +1,241 @@
+---
+interface Props {
+  title: string;
+  href: string;
+  icon: string;
+  color?: 'blue' | 'purple' | 'green' | 'orange' | 'cyan' | 'magenta';
+}
+
+const { title, href, icon, color = 'blue' } = Astro.props;
+
+const colorMap = {
+  blue: 229,
+  purple: 276,
+  green: 134,
+  orange: 26,
+  cyan: 192,
+  magenta: 322,
+};
+
+const hue = colorMap[color];
+---
+
+<a href={href} class="action-card" style={`--card-hue: ${hue}`}>
+  <div class="action-card-border"></div>
+  <div class="action-card-inner">
+    <div class="action-icon-wrap">
+      <span class="action-icon">{icon}</span>
+      <div class="icon-pulse"></div>
+    </div>
+    <div class="action-content">
+      <h4 class="action-title">{title}</h4>
+      <p class="action-desc"><slot /></p>
+    </div>
+    <div class="action-arrow">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M5 12h14M12 5l7 7-7 7"/>
+      </svg>
+    </div>
+    <div class="action-shine"></div>
+  </div>
+</a>
+
+<style>
+  .action-card {
+    --card-hue: 229;
+    position: relative;
+    display: block;
+    text-decoration: none;
+    border-radius: 14px;
+  }
+
+  /* Rainbow gradient border - sits behind inner content */
+  .action-card-border {
+    position: absolute;
+    inset: 0;
+    border-radius: 14px;
+    background: linear-gradient(
+      90deg,
+      hsl(229, 80%, 60%) 0%,
+      hsl(276, 80%, 60%) 16.6%,
+      hsl(322, 80%, 60%) 33.3%,
+      hsl(26, 85%, 55%) 50%,
+      hsl(52, 85%, 50%) 66.6%,
+      hsl(89, 75%, 50%) 83.3%,
+      hsl(229, 80%, 60%) 100%
+    );
+    background-size: 200% 100%;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+    animation: rainbowShift 4s linear infinite;
+  }
+
+  .action-card:hover .action-card-border {
+    opacity: 1;
+  }
+
+  @keyframes rainbowShift {
+    0% {
+      background-position: 0% 50%;
+    }
+    100% {
+      background-position: 200% 50%;
+    }
+  }
+
+  .action-card-inner {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 1.25rem;
+    padding: 1.25rem 1.5rem;
+    margin: 2px;
+    background: linear-gradient(
+      135deg,
+      rgba(22, 27, 34, 1) 0%,
+      rgba(13, 17, 23, 1) 100%
+    );
+    border: 1px solid rgba(139, 148, 158, 0.12);
+    border-radius: 12px;
+    overflow: hidden;
+    transition: border-color 0.3s ease;
+  }
+
+  .action-card:hover .action-card-inner {
+    border-color: transparent;
+  }
+
+  /* Shine effect */
+  .action-shine {
+    position: absolute;
+    inset: -1.25rem;
+    width: calc(50% + 2.5rem);
+    left: calc(-100% - 1.25rem);
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      rgba(255, 255, 255, 0.04) 50%,
+      transparent 100%
+    );
+    transform: skewX(-20deg);
+    transition: left 0.5s ease;
+    pointer-events: none;
+  }
+
+  .action-card:hover .action-shine {
+    left: calc(150% + 1.25rem);
+  }
+
+  /* Icon */
+  .action-icon-wrap {
+    position: relative;
+    flex-shrink: 0;
+  }
+
+  .action-icon {
+    font-size: 1.75rem;
+    display: block;
+    filter: drop-shadow(0 0 8px hsla(var(--card-hue), 60%, 50%, 0.4));
+    transition: transform 0.3s ease;
+  }
+
+  .action-card:hover .action-icon {
+    transform: scale(1.15);
+  }
+
+  .icon-pulse {
+    position: absolute;
+    inset: -8px;
+    border: 2px solid hsla(var(--card-hue), 60%, 50%, 0.3);
+    border-radius: 50%;
+    opacity: 0;
+    transform: scale(0.8);
+    transition: all 0.3s ease;
+  }
+
+  .action-card:hover .icon-pulse {
+    opacity: 1;
+    transform: scale(1);
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% {
+      opacity: 1;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 0.5;
+      transform: scale(1.1);
+    }
+  }
+
+  /* Content */
+  .action-content {
+    flex-grow: 1;
+    min-width: 0;
+  }
+
+  .action-title {
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: #ffffff;
+    margin: 0 0 0.25rem 0;
+    letter-spacing: -0.01em;
+    transition: color 0.3s ease;
+  }
+
+  .action-card:hover .action-title {
+    color: hsl(var(--card-hue), 80%, 75%);
+  }
+
+  .action-desc {
+    font-size: 0.875rem;
+    color: rgba(198, 208, 218, 0.7);
+    margin: 0;
+    line-height: 1.4;
+  }
+
+  /* Arrow */
+  .action-arrow {
+    flex-shrink: 0;
+    color: rgba(139, 148, 158, 0.5);
+    transition: all 0.3s ease;
+  }
+
+  .action-card:hover .action-arrow {
+    color: hsl(var(--card-hue), 70%, 65%);
+    transform: translateX(4px);
+  }
+
+  /* Light theme */
+  :global(:root[data-theme='light']) .action-card-inner {
+    background: linear-gradient(
+      135deg,
+      rgba(255, 255, 255, 0.98) 0%,
+      rgba(246, 248, 250, 1) 100%
+    );
+    border-color: rgba(0, 0, 0, 0.08);
+  }
+
+  :global(:root[data-theme='light']) .action-title {
+    color: #1f2328;
+  }
+
+  :global(:root[data-theme='light']) .action-card:hover .action-title {
+    color: hsl(var(--card-hue), 70%, 40%);
+  }
+
+  :global(:root[data-theme='light']) .action-desc {
+    color: rgba(31, 35, 40, 0.7);
+  }
+
+  :global(:root[data-theme='light']) .action-shine {
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      rgba(0, 0, 0, 0.02) 50%,
+      transparent 100%
+    );
+  }
+</style>

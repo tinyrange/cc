@@ -1,0 +1,1147 @@
+/* ============================================================================
+   CrumbleCracker Documentation - Custom Styles
+   A developer-focused design inspired by the colorful spectrum logo
+   ============================================================================ */
+
+/* ----------------------------------------------------------------------------
+   CSS Custom Properties - Design Tokens
+   ---------------------------------------------------------------------------- */
+
+:root {
+  /* Logo-inspired spectrum colors */
+  --cc-blue: hsl(229, 60%, 50%);
+  --cc-purple: hsl(276, 60%, 50%);
+  --cc-magenta: hsl(322, 60%, 50%);
+  --cc-red: hsl(358, 60%, 50%);
+  --cc-orange: hsl(26, 60%, 50%);
+  --cc-yellow: hsl(52, 60%, 50%);
+  --cc-lime: hsl(89, 60%, 50%);
+  --cc-green: hsl(134, 60%, 50%);
+  --cc-teal: hsl(172, 60%, 50%);
+  --cc-cyan: hsl(192, 60%, 50%);
+
+  /* Primary accent - using the blue from logo */
+  --cc-accent: hsl(229, 70%, 58%);
+  --cc-accent-light: hsl(229, 70%, 70%);
+  --cc-accent-dark: hsl(229, 70%, 45%);
+
+  /* Gradient for highlights - full spectrum */
+  --cc-gradient: linear-gradient(135deg,
+      hsl(229, 60%, 55%) 0%,
+      hsl(276, 60%, 55%) 20%,
+      hsl(322, 60%, 55%) 40%,
+      hsl(26, 70%, 55%) 60%,
+      hsl(52, 70%, 50%) 80%,
+      hsl(89, 60%, 50%) 100%);
+
+  --cc-gradient-vibrant: linear-gradient(90deg,
+      hsl(229, 70%, 60%) 0%,
+      hsl(276, 70%, 55%) 25%,
+      hsl(322, 70%, 55%) 50%,
+      hsl(26, 80%, 55%) 75%,
+      hsl(89, 70%, 50%) 100%);
+
+  --cc-gradient-subtle: linear-gradient(135deg,
+      hsla(229, 60%, 50%, 0.1) 0%,
+      hsla(276, 60%, 50%, 0.1) 50%,
+      hsla(89, 60%, 50%, 0.1) 100%);
+
+  /* Typography */
+  --sl-font-mono: 'JetBrains Mono', 'Fira Code', 'SF Mono', Monaco, 'Cascadia Code',
+    ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* Content width for better readability */
+  --sl-content-width: 52rem;
+}
+
+/* ----------------------------------------------------------------------------
+   Dark Theme - Primary Developer Experience
+   ---------------------------------------------------------------------------- */
+
+:root[data-theme='dark'] {
+  /* Deep, rich dark background */
+  --sl-color-bg: #0a0c10;
+  --sl-color-bg-nav: #06080c;
+  --sl-color-bg-sidebar: #0a0c10;
+  --sl-color-bg-inline-code: rgba(110, 118, 129, 0.2);
+
+  /* Text colors with good contrast */
+  --sl-color-text: #e6edf3;
+  --sl-color-text-accent: var(--cc-accent-light);
+
+  /* Accent colors mapped to Starlight */
+  --sl-color-accent-low: hsla(229, 60%, 50%, 0.15);
+  --sl-color-accent: var(--cc-accent);
+  --sl-color-accent-high: var(--cc-accent-light);
+
+  /* Borders and dividers */
+  --sl-color-hairline-light: rgba(139, 148, 158, 0.1);
+  --sl-color-hairline: rgba(139, 148, 158, 0.2);
+
+  /* White for contrast elements */
+  --sl-color-white: #ffffff;
+  --sl-color-gray-1: #e6edf3;
+  --sl-color-gray-2: #c9d1d9;
+  --sl-color-gray-3: #8b949e;
+  --sl-color-gray-4: #6e7681;
+  --sl-color-gray-5: #484f58;
+  --sl-color-gray-6: #30363d;
+  --sl-color-black: #010409;
+}
+
+/* ----------------------------------------------------------------------------
+   Light Theme - Clean and Professional
+   ---------------------------------------------------------------------------- */
+
+:root[data-theme='light'] {
+  --sl-color-bg: #ffffff;
+  --sl-color-bg-nav: #f6f8fa;
+  --sl-color-bg-sidebar: #f6f8fa;
+
+  --sl-color-accent-low: hsla(229, 70%, 50%, 0.1);
+  --sl-color-accent: hsl(229, 70%, 45%);
+  --sl-color-accent-high: hsl(229, 70%, 30%);
+
+  --sl-color-text: #1f2328;
+  --sl-color-text-accent: hsl(229, 70%, 40%);
+}
+
+/* ----------------------------------------------------------------------------
+   Global Styles
+   ---------------------------------------------------------------------------- */
+
+html {
+  scroll-behavior: smooth;
+}
+
+/* Better focus visibility for accessibility */
+:focus-visible {
+  outline: 2px solid var(--cc-accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Selection styling */
+::selection {
+  background: hsla(229, 60%, 50%, 0.3);
+}
+
+/* ----------------------------------------------------------------------------
+   Navigation & Header
+   ---------------------------------------------------------------------------- */
+
+/* Header styling */
+:root[data-theme='dark'] header.header {
+  background: rgba(6, 8, 12, 0.9);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border-bottom: 1px solid rgba(139, 148, 158, 0.1);
+}
+
+/* Logo sizing */
+.site-title img {
+  height: 2rem;
+  width: auto;
+}
+
+/* Site title styling */
+.site-title {
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  gap: 0.625rem;
+}
+
+/* Rainbow gradient on site title text - enhanced visibility */
+:root[data-theme='dark'] .site-title span {
+  background: linear-gradient(
+    90deg,
+    hsl(229, 85%, 65%) 0%,
+    hsl(276, 85%, 65%) 20%,
+    hsl(322, 85%, 65%) 40%,
+    hsl(358, 85%, 65%) 55%,
+    hsl(26, 90%, 60%) 70%,
+    hsl(52, 90%, 55%) 85%,
+    hsl(89, 80%, 55%) 100%
+  );
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  font-weight: 700;
+  font-size: 1.1em;
+  animation: titleGradient 8s ease-in-out infinite;
+}
+
+@keyframes titleGradient {
+  0%, 100% {
+    background-position: 0% center;
+  }
+  50% {
+    background-position: 100% center;
+  }
+}
+
+:root[data-theme='light'] .site-title span {
+  background: linear-gradient(
+    90deg,
+    hsl(229, 75%, 45%) 0%,
+    hsl(276, 75%, 45%) 20%,
+    hsl(322, 75%, 45%) 40%,
+    hsl(358, 75%, 50%) 55%,
+    hsl(26, 80%, 45%) 70%,
+    hsl(52, 80%, 40%) 85%,
+    hsl(89, 70%, 40%) 100%
+  );
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  font-weight: 700;
+  font-size: 1.1em;
+  animation: titleGradient 8s ease-in-out infinite;
+}
+
+/* Navigation links */
+:root[data-theme='dark'] nav a {
+  transition: color 0.15s ease;
+}
+
+:root[data-theme='dark'] nav a:hover {
+  color: var(--cc-accent-light);
+}
+
+/* ----------------------------------------------------------------------------
+   Sidebar - Enhanced Navigation
+   ---------------------------------------------------------------------------- */
+
+/* Sidebar container */
+:root[data-theme='dark'] .sidebar-content {
+  border-right: 1px solid rgba(139, 148, 158, 0.1);
+  padding: 1rem 0;
+}
+
+/* Sidebar group labels - section headers */
+.sidebar-content .top-level>li>details>summary,
+.sidebar-content .top-level>li>a {
+  font-weight: 700;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--sl-color-gray-3);
+  padding: 0.75rem 1rem;
+  margin-top: 0.5rem;
+}
+
+:root[data-theme='dark'] .sidebar-content .top-level>li>details>summary {
+  position: relative;
+}
+
+/* Gradient accent on section headers */
+:root[data-theme='dark'] .sidebar-content .top-level>li>details>summary::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 60%;
+  background: var(--cc-gradient-vibrant);
+  border-radius: 0 2px 2px 0;
+  opacity: 0.6;
+}
+
+/* Sidebar links styling */
+:root[data-theme='dark'] .sidebar-content ul ul a {
+  padding: 0.5rem 1rem 0.5rem 1.25rem;
+  margin: 0.125rem 0.5rem;
+  border-radius: 6px;
+  font-size: 0.9rem;
+  color: var(--sl-color-gray-3);
+  transition: all 0.15s ease;
+  position: relative;
+}
+
+/* Active sidebar link - prominent styling */
+:root[data-theme='dark'] .sidebar-content a[aria-current='page'] {
+  background: linear-gradient(90deg, hsla(229, 70%, 55%, 0.2) 0%, hsla(276, 60%, 50%, 0.1) 100%);
+  border-left: none;
+  color: var(--cc-accent-light);
+  font-weight: 600;
+  box-shadow: inset 3px 0 0 var(--cc-accent);
+}
+
+/* Sidebar link hover */
+:root[data-theme='dark'] .sidebar-content a:not([aria-current='page']):hover {
+  color: var(--sl-color-text);
+  background: rgba(139, 148, 158, 0.1);
+  padding-left: 1.5rem;
+}
+
+/* Sidebar group expand/collapse icon */
+:root[data-theme='dark'] .sidebar-content details summary svg {
+  color: var(--sl-color-gray-4);
+  transition: transform 0.2s ease, color 0.2s ease;
+}
+
+:root[data-theme='dark'] .sidebar-content details[open] summary svg {
+  color: var(--cc-accent-light);
+}
+
+/* Sidebar scrollbar */
+:root[data-theme='dark'] .sidebar-content::-webkit-scrollbar {
+  width: 6px;
+}
+
+:root[data-theme='dark'] .sidebar-content::-webkit-scrollbar-thumb {
+  background: rgba(139, 148, 158, 0.2);
+  border-radius: 3px;
+}
+
+:root[data-theme='dark'] .sidebar-content::-webkit-scrollbar-thumb:hover {
+  background: rgba(139, 148, 158, 0.4);
+}
+
+/* ----------------------------------------------------------------------------
+   Main Content Area
+   ---------------------------------------------------------------------------- */
+
+/* Content container */
+.main-frame {
+  background: var(--sl-color-bg);
+}
+
+/* Page title */
+.content-panel h1 {
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1.2;
+  margin-bottom: 1.5rem;
+}
+
+/* Heading styles - font properties only, spacing handled by wrapper */
+.sl-markdown-content h2 {
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.sl-markdown-content h3 {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.sl-markdown-content h4 {
+  font-weight: 600;
+}
+
+/* Heading wrapper spacing */
+.sl-markdown-content .sl-heading-wrapper.level-h2 {
+  margin-top: 2.5rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--sl-color-hairline);
+}
+
+.sl-markdown-content .sl-heading-wrapper.level-h3 {
+  margin-top: 2rem;
+}
+
+.sl-markdown-content .sl-heading-wrapper.level-h4 {
+  margin-top: 1.5rem;
+}
+
+/* Paragraph spacing */
+.sl-markdown-content p {
+  line-height: 1.7;
+}
+
+/* Strong text */
+.sl-markdown-content strong {
+  font-weight: 600;
+  color: var(--sl-color-white);
+}
+
+:root[data-theme='light'] .sl-markdown-content strong {
+  color: var(--sl-color-text);
+}
+
+/* ----------------------------------------------------------------------------
+   Code Blocks - Developer Focused
+   ---------------------------------------------------------------------------- */
+
+/* Code block container */
+:root[data-theme='dark'] .expressive-code {
+  --ec-brdCol: rgba(139, 148, 158, 0.2);
+  margin: 1.5rem 0;
+}
+
+:root[data-theme='dark'] .expressive-code .frame {
+  border-radius: 12px;
+  border: 1px solid rgba(139, 148, 158, 0.15);
+  box-shadow:
+    0 4px 6px -1px rgba(0, 0, 0, 0.3),
+    0 2px 4px -2px rgba(0, 0, 0, 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  overflow: hidden;
+  background: linear-gradient(180deg, rgba(22, 27, 34, 0.8) 0%, rgba(13, 17, 23, 0.95) 100%);
+}
+
+/* Code block header/title bar */
+:root[data-theme='dark'] .expressive-code .frame.has-title .header {
+  background: rgba(22, 27, 34, 0.9);
+  border-bottom: 1px solid rgba(139, 148, 158, 0.1);
+  padding: 0.5rem 1rem;
+}
+
+/* Code content area */
+:root[data-theme='dark'] .expressive-code pre {
+  background: transparent !important;
+  padding: 1rem 0;
+}
+
+:root[data-theme='dark'] .expressive-code code {
+  font-family: var(--sl-font-mono);
+  font-size: 0.875rem;
+  line-height: 1.6;
+}
+
+/* Inline code */
+:root[data-theme='dark'] :not(pre)>code {
+  background: rgba(110, 118, 129, 0.25);
+  border-radius: 4px;
+  padding: 0.2em 0.4em;
+  font-size: 0.9em;
+  font-family: var(--sl-font-mono);
+  color: #79c0ff;
+}
+
+:root[data-theme='light'] :not(pre)>code {
+  background: rgba(175, 184, 193, 0.2);
+  color: hsl(229, 70%, 40%);
+}
+
+/* ----------------------------------------------------------------------------
+   Tables - Clean Data Display
+   ---------------------------------------------------------------------------- */
+
+:root[data-theme='dark'] .sl-markdown-content table {
+  border-collapse: separate;
+  border-spacing: 0;
+  border-radius: 12px;
+  border: 1px solid rgba(139, 148, 158, 0.2);
+  overflow: hidden;
+  width: 100%;
+  margin: 1.5rem 0;
+  background: rgba(13, 17, 23, 0.5);
+}
+
+:root[data-theme='dark'] .sl-markdown-content th {
+  background: rgba(22, 27, 34, 0.8);
+  font-weight: 600;
+  text-align: left;
+  padding: 0.875rem 1rem;
+  border-bottom: 1px solid rgba(139, 148, 158, 0.2);
+  font-size: 0.8125rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--sl-color-gray-2);
+}
+
+:root[data-theme='dark'] .sl-markdown-content td {
+  padding: 0.875rem 1rem;
+  border-bottom: 1px solid rgba(139, 148, 158, 0.1);
+}
+
+:root[data-theme='dark'] .sl-markdown-content tr:last-child td {
+  border-bottom: none;
+}
+
+:root[data-theme='dark'] .sl-markdown-content tr:hover td {
+  background: rgba(139, 148, 158, 0.05);
+}
+
+/* Light mode tables */
+:root[data-theme='light'] .sl-markdown-content table {
+  border-collapse: separate;
+  border-spacing: 0;
+  border-radius: 12px;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  overflow: hidden;
+}
+
+:root[data-theme='light'] .sl-markdown-content th {
+  background: #f6f8fa;
+  font-weight: 600;
+  padding: 0.875rem 1rem;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+}
+
+/* ----------------------------------------------------------------------------
+   Links
+   ---------------------------------------------------------------------------- */
+
+.sl-markdown-content a:not(.card):not([class*='astro']) {
+  color: var(--cc-accent-light);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.sl-markdown-content a:not(.card):not([class*='astro']):hover {
+  color: #ffffff;
+  border-bottom-color: var(--cc-accent-light);
+}
+
+:root[data-theme='light'] .sl-markdown-content a:not(.card):not([class*='astro']) {
+  color: var(--sl-color-accent);
+}
+
+:root[data-theme='light'] .sl-markdown-content a:not(.card):not([class*='astro']):hover {
+  color: var(--sl-color-accent-high);
+  border-bottom-color: var(--sl-color-accent);
+}
+
+/* ----------------------------------------------------------------------------
+   Blockquotes & Callouts
+   ---------------------------------------------------------------------------- */
+
+:root[data-theme='dark'] .sl-markdown-content blockquote {
+  border-left: 3px solid var(--cc-accent);
+  background: linear-gradient(90deg, hsla(229, 60%, 50%, 0.08) 0%, transparent 100%);
+  padding: 1rem 1.25rem;
+  margin: 1.5rem 0;
+  border-radius: 0 12px 12px 0;
+}
+
+:root[data-theme='dark'] .sl-markdown-content blockquote p {
+  margin: 0;
+  color: var(--sl-color-gray-2);
+}
+
+/* Starlight aside/callout boxes */
+:root[data-theme='dark'] .starlight-aside {
+  border-radius: 12px;
+  border: 1px solid rgba(139, 148, 158, 0.15);
+}
+
+/* ----------------------------------------------------------------------------
+   Lists
+   ---------------------------------------------------------------------------- */
+
+.sl-markdown-content ul,
+.sl-markdown-content ol {
+  padding-left: 1.5rem;
+}
+
+.sl-markdown-content li {
+  margin: 0.5rem 0;
+  line-height: 1.6;
+}
+
+.sl-markdown-content li::marker {
+  color: var(--sl-color-gray-4);
+}
+
+/* Nested lists */
+.sl-markdown-content li ul,
+.sl-markdown-content li ol {
+  margin-top: 0.5rem;
+}
+
+/* ----------------------------------------------------------------------------
+   Cards & Feature Boxes (Homepage) - ENHANCED
+   ---------------------------------------------------------------------------- */
+
+/* Card grid container */
+:root[data-theme='dark'] .card-grid {
+  gap: 1.5rem;
+}
+
+/* Individual cards with gradient border effect */
+:root[data-theme='dark'] .card-grid .card {
+  position: relative;
+  background: linear-gradient(180deg, rgba(22, 27, 34, 0.8) 0%, rgba(13, 17, 23, 0.95) 100%);
+  border: 1px solid rgba(139, 148, 158, 0.15);
+  border-radius: 16px;
+  padding: 1.75rem;
+  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.3s cubic-bezier(0.4, 0, 0.2, 1), border-color 0.3s ease;
+  overflow: hidden;
+  /* Prevent layout shift on hover by reserving space for transform */
+  will-change: transform;
+}
+
+/* Gradient border on hover using pseudo-element */
+:root[data-theme='dark'] .card-grid .card::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 16px;
+  padding: 1px;
+  background: var(--cc-gradient-vibrant);
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  pointer-events: none;
+  z-index: 1;
+}
+
+:root[data-theme='dark'] .card-grid .card:hover::before {
+  opacity: 1;
+}
+
+:root[data-theme='dark'] .card-grid .card:hover {
+  transform: translateY(-4px);
+  box-shadow:
+    0 20px 40px -12px rgba(0, 0, 0, 0.5),
+    0 0 60px -20px hsla(229, 60%, 50%, 0.3);
+  border-color: transparent;
+}
+
+/* Card title */
+:root[data-theme='dark'] .card-grid .card .title {
+  font-weight: 600;
+  font-size: 1.125rem;
+  margin-bottom: 0.5rem;
+  color: var(--sl-color-white);
+}
+
+/* Card icon styling */
+:root[data-theme='dark'] .card-grid .card .icon {
+  color: var(--cc-accent-light);
+  filter: drop-shadow(0 0 8px hsla(229, 60%, 50%, 0.4));
+}
+
+/* Card body text */
+:root[data-theme='dark'] .card-grid .card .body {
+  color: var(--sl-color-gray-3);
+}
+
+/* Link cards */
+:root[data-theme='dark'] .sl-link-card {
+  position: relative;
+  background: linear-gradient(180deg, rgba(22, 27, 34, 0.8) 0%, rgba(13, 17, 23, 0.95) 100%);
+  border: 1px solid rgba(139, 148, 158, 0.15);
+  border-radius: 12px;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+:root[data-theme='dark'] .sl-link-card:hover {
+  border-color: var(--cc-accent);
+  box-shadow:
+    0 12px 24px -8px rgba(0, 0, 0, 0.4),
+    0 0 40px -15px hsla(229, 60%, 50%, 0.3);
+  transform: translateY(-2px);
+}
+
+/* ----------------------------------------------------------------------------
+   Hero Section (Homepage) - ENHANCED
+   ---------------------------------------------------------------------------- */
+
+:root[data-theme='dark'] .hero {
+  position: relative;
+  background: #0a0c10;
+  padding: 5rem 0 4rem;
+  overflow: hidden;
+}
+
+@keyframes heroGlow {
+  0% {
+    opacity: 0.8;
+    transform: scale(1);
+  }
+
+  100% {
+    opacity: 1;
+    transform: scale(1.05);
+  }
+}
+
+/* Grid pattern overlay */
+:root[data-theme='dark'] .hero::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(139, 148, 158, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(139, 148, 158, 0.03) 1px, transparent 1px);
+  background-size: 60px 60px;
+  pointer-events: none;
+}
+
+/* Hero content z-index */
+.hero>* {
+  position: relative;
+  z-index: 1;
+}
+
+/* Hero title with enhanced gradient */
+.hero h1 {
+  font-size: 3.5rem;
+  font-weight: 800;
+  letter-spacing: -0.04em;
+  background: var(--cc-gradient-vibrant);
+  background-size: 200% auto;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  animation: gradientShift 6s ease-in-out infinite;
+}
+
+/* Remove any card/box background from hero content area */
+:root[data-theme='dark'] .hero .sl-flex {
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+}
+
+:root[data-theme='dark'] .hero>div {
+  background: transparent;
+}
+
+@keyframes gradientShift {
+
+  0%,
+  100% {
+    background-position: 0% center;
+  }
+
+  50% {
+    background-position: 100% center;
+  }
+}
+
+@media (min-width: 50rem) {
+  .hero h1 {
+    font-size: 4.5rem;
+  }
+}
+
+/* Hero tagline */
+.hero .tagline {
+  font-size: 1.375rem;
+  color: var(--sl-color-gray-2);
+  max-width: 42rem;
+  line-height: 1.6;
+}
+
+/* Hero logo image with glow effect */
+:root[data-theme='dark'] .hero img {
+  /* filter: drop-shadow(0 0 40px hsla(229, 60%, 50%, 0.4)) drop-shadow(0 0 80px hsla(276, 60%, 50%, 0.2)); */
+  animation: logoFloat 6s ease-in-out infinite;
+}
+
+@keyframes logoFloat {
+
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+
+  50% {
+    transform: translateY(-10px);
+  }
+}
+
+/* Hero action buttons */
+:root[data-theme='dark'] .hero .action {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.875rem 1.75rem;
+  border-radius: 10px;
+  font-weight: 600;
+  font-size: 1rem;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Primary button with gradient */
+:root[data-theme='dark'] .hero .action.primary {
+  background: var(--cc-gradient-vibrant);
+  background-size: 200% auto;
+  color: white;
+  border: none;
+  box-shadow:
+    0 4px 15px hsla(229, 60%, 50%, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+}
+
+:root[data-theme='dark'] .hero .action.primary:hover {
+  background-position: right center;
+  transform: translateY(-2px);
+  box-shadow:
+    0 8px 25px hsla(229, 60%, 50%, 0.5),
+    0 0 40px hsla(276, 60%, 50%, 0.3),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
+}
+
+/* Secondary/minimal button */
+:root[data-theme='dark'] .hero .action.minimal,
+:root[data-theme='dark'] .hero .action.secondary {
+  background: rgba(22, 27, 34, 0.6);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(139, 148, 158, 0.3);
+  color: var(--sl-color-text);
+}
+
+:root[data-theme='dark'] .hero .action.minimal:hover,
+:root[data-theme='dark'] .hero .action.secondary:hover {
+  border-color: var(--cc-accent);
+  color: var(--cc-accent-light);
+  background: rgba(22, 27, 34, 0.8);
+  box-shadow: 0 0 20px hsla(229, 60%, 50%, 0.2);
+}
+
+/* ----------------------------------------------------------------------------
+   Section Headings on Homepage - ENHANCED
+   ---------------------------------------------------------------------------- */
+
+/* "Why CrumbleCracker?" and similar section headings */
+:root[data-theme='dark'] .sl-markdown-content h2,
+:root[data-theme='dark'] main h2 {
+  font-size: 2rem;
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+
+/* Heading wrapper styling for h2 - this contains both the h2 and anchor link */
+:root[data-theme='dark'] .sl-markdown-content .sl-heading-wrapper.level-h2,
+:root[data-theme='dark'] main .sl-heading-wrapper.level-h2 {
+  margin-top: 4rem;
+  margin-bottom: 1.5rem;
+  padding-bottom: 0.75rem;
+  border-bottom: none;
+  position: relative;
+  width: 100%;
+}
+
+/* Gradient underline for section headings - full width */
+:root[data-theme='dark'] .sl-markdown-content .sl-heading-wrapper.level-h2::after,
+:root[data-theme='dark'] main .sl-heading-wrapper.level-h2::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  width: 100%;
+  height: 3px;
+  background: var(--cc-gradient-vibrant);
+  border-radius: 2px;
+}
+
+/* ----------------------------------------------------------------------------
+   Anchor Links - Keep inline with headings
+   ---------------------------------------------------------------------------- */
+
+/* The heading wrapper contains both the heading and the anchor link as siblings */
+.sl-heading-wrapper {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+/* Ensure headings inside wrapper don't add extra margin that breaks alignment */
+.sl-heading-wrapper h1,
+.sl-heading-wrapper h2,
+.sl-heading-wrapper h3,
+.sl-heading-wrapper h4,
+.sl-heading-wrapper h5,
+.sl-heading-wrapper h6 {
+  margin: 0;
+}
+
+/* Anchor link icon styling */
+.sl-anchor-link {
+  display: inline-flex;
+  align-items: center;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+  flex-shrink: 0;
+}
+
+/* Show anchor link on wrapper hover */
+.sl-heading-wrapper:hover .sl-anchor-link,
+.sl-anchor-link:focus {
+  opacity: 1;
+}
+
+:root[data-theme='dark'] .sl-anchor-link {
+  color: var(--sl-color-gray-4);
+}
+
+:root[data-theme='dark'] .sl-anchor-link:hover {
+  color: var(--cc-accent-light);
+}
+
+/* ----------------------------------------------------------------------------
+   Search
+   ---------------------------------------------------------------------------- */
+
+:root[data-theme='dark'] button[data-open-modal] {
+  background: rgba(22, 27, 34, 0.8);
+  border: 1px solid rgba(139, 148, 158, 0.2);
+  border-radius: 10px;
+  transition: all 0.2s ease;
+}
+
+:root[data-theme='dark'] button[data-open-modal]:hover {
+  border-color: rgba(139, 148, 158, 0.4);
+  background: rgba(22, 27, 34, 1);
+  box-shadow: 0 0 20px rgba(0, 0, 0, 0.3);
+}
+
+/* Search modal */
+:root[data-theme='dark'] dialog {
+  background: #0d1117;
+  border: 1px solid rgba(139, 148, 158, 0.2);
+  border-radius: 16px;
+  box-shadow:
+    0 24px 48px rgba(0, 0, 0, 0.5),
+    0 0 80px hsla(229, 60%, 50%, 0.1);
+}
+
+/* ----------------------------------------------------------------------------
+   Table of Contents (Right Sidebar)
+   ---------------------------------------------------------------------------- */
+
+:root[data-theme='dark'] .right-sidebar {
+  border-left: 1px solid rgba(139, 148, 158, 0.1);
+}
+
+:root[data-theme='dark'] .right-sidebar-panel h2 {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--sl-color-gray-4);
+}
+
+:root[data-theme='dark'] starlight-toc a {
+  font-size: 0.875rem;
+  color: var(--sl-color-gray-3);
+  transition: color 0.15s ease;
+}
+
+:root[data-theme='dark'] starlight-toc a:hover,
+:root[data-theme='dark'] starlight-toc a[aria-current='true'] {
+  color: var(--sl-color-text);
+}
+
+:root[data-theme='dark'] starlight-toc a[aria-current='true'] {
+  font-weight: 500;
+}
+
+/* ----------------------------------------------------------------------------
+   Pagination (Prev/Next Links)
+   ---------------------------------------------------------------------------- */
+
+:root[data-theme='dark'] .pagination-links a {
+  position: relative;
+  background: linear-gradient(180deg, rgba(22, 27, 34, 0.8) 0%, rgba(13, 17, 23, 0.95) 100%);
+  border: 1px solid rgba(139, 148, 158, 0.15);
+  border-radius: 12px;
+  padding: 1.25rem 1.5rem;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+:root[data-theme='dark'] .pagination-links a:hover {
+  border-color: var(--cc-accent);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+  transform: translateY(-2px);
+}
+
+/* ----------------------------------------------------------------------------
+   Footer
+   ---------------------------------------------------------------------------- */
+
+:root[data-theme='dark'] footer {
+  border-top: 1px solid rgba(139, 148, 158, 0.1);
+  color: var(--sl-color-gray-4);
+}
+
+/* ----------------------------------------------------------------------------
+   Scrollbar Styling
+   ---------------------------------------------------------------------------- */
+
+:root[data-theme='dark'] {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(139, 148, 158, 0.3) transparent;
+}
+
+:root[data-theme='dark'] ::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+:root[data-theme='dark'] ::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+:root[data-theme='dark'] ::-webkit-scrollbar-thumb {
+  background: rgba(139, 148, 158, 0.3);
+  border-radius: 4px;
+}
+
+:root[data-theme='dark'] ::-webkit-scrollbar-thumb:hover {
+  background: rgba(139, 148, 158, 0.5);
+}
+
+/* ----------------------------------------------------------------------------
+   Responsive Adjustments
+   ---------------------------------------------------------------------------- */
+
+@media (max-width: 72rem) {
+  :root {
+    --sl-content-width: 100%;
+  }
+}
+
+@media (max-width: 50rem) {
+  .hero h1 {
+    font-size: 2.5rem;
+  }
+
+  .hero .tagline {
+    font-size: 1.125rem;
+  }
+
+  :root[data-theme='dark'] .card-grid .card {
+    padding: 1.25rem;
+  }
+}
+
+/* ----------------------------------------------------------------------------
+   Print Styles
+   ---------------------------------------------------------------------------- */
+
+@media print {
+  :root {
+    --sl-color-bg: white;
+    --sl-color-text: black;
+  }
+
+  header.header,
+  .sidebar,
+  .right-sidebar,
+  .pagination-links {
+    display: none !important;
+  }
+
+  .main-frame {
+    margin: 0;
+    padding: 0;
+  }
+}
+
+/* ----------------------------------------------------------------------------
+   Syntax Highlighting Enhancements
+   ---------------------------------------------------------------------------- */
+
+/* Add subtle gradient border to code blocks on hover */
+:root[data-theme='dark'] .expressive-code .frame:hover {
+  border-color: rgba(139, 148, 158, 0.25);
+  box-shadow:
+    0 8px 16px -4px rgba(0, 0, 0, 0.4),
+    0 0 40px -10px hsla(229, 60%, 50%, 0.15);
+}
+
+/* Line numbers styling */
+:root[data-theme='dark'] .expressive-code .line-numbers {
+  color: var(--sl-color-gray-5);
+  user-select: none;
+}
+
+/* Highlighted lines */
+:root[data-theme='dark'] .expressive-code .highlight {
+  background: hsla(229, 60%, 50%, 0.1);
+  border-left: 2px solid var(--cc-accent);
+}
+
+/* ----------------------------------------------------------------------------
+   Animations
+   ---------------------------------------------------------------------------- */
+
+/* Subtle fade-in for main content */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.main-pane {
+  animation: fadeIn 0.3s ease-out;
+}
+
+/* Reduced motion preference */
+@media (prefers-reduced-motion: reduce) {
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  html {
+    scroll-behavior: auto;
+  }
+
+  .hero img,
+  .hero h1 {
+    animation: none !important;
+  }
+}
+
+/* ----------------------------------------------------------------------------
+   Splash Page Specific Enhancements
+   ---------------------------------------------------------------------------- */
+
+/* Better spacing for splash template */
+:root[data-theme='dark'] [data-template='splash'] .sl-markdown-content {
+  max-width: 72rem;
+  margin: 0 auto;
+  padding: 0 1.5rem;
+}
+
+/* First section after hero */
+:root[data-theme='dark'] [data-template='splash'] .sl-markdown-content>h2:first-of-type {
+  margin-top: 3rem;
+}
+
+/* Card icon color variations based on position */
+:root[data-theme='dark'] .card-grid .card:nth-child(1) .icon {
+  color: var(--cc-blue);
+  filter: drop-shadow(0 0 8px hsla(229, 60%, 50%, 0.5));
+}
+
+:root[data-theme='dark'] .card-grid .card:nth-child(2) .icon {
+  color: var(--cc-purple);
+  filter: drop-shadow(0 0 8px hsla(276, 60%, 50%, 0.5));
+}
+
+:root[data-theme='dark'] .card-grid .card:nth-child(3) .icon {
+  color: var(--cc-green);
+  filter: drop-shadow(0 0 8px hsla(134, 60%, 50%, 0.5));
+}
+
+:root[data-theme='dark'] .card-grid .card:nth-child(4) .icon {
+  color: var(--cc-orange);
+  filter: drop-shadow(0 0 8px hsla(26, 60%, 50%, 0.5));
+}
+
+:root[data-theme='dark'] .card-grid .card:nth-child(5) .icon {
+  color: var(--cc-cyan);
+  filter: drop-shadow(0 0 8px hsla(192, 60%, 50%, 0.5));
+}
+
+:root[data-theme='dark'] .card-grid .card:nth-child(6) .icon {
+  color: var(--cc-magenta);
+  filter: drop-shadow(0 0 8px hsla(322, 60%, 50%, 0.5));
+}

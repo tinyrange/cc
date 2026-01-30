@@ -74,7 +74,7 @@ The API is designed to feel natural to Go developers, mirroring standard library
 
 | Platform | Hypervisor | Architectures |
 |----------|------------|---------------|
-| macOS | Hypervisor.framework | x86_64, arm64 |
+| macOS | Hypervisor.framework | arm64 |
 | Linux | KVM | x86_64, arm64 |
 | Windows | Windows Hypervisor Platform | x86_64 |
 

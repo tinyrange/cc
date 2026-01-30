@@ -7,6 +7,11 @@ export default defineConfig({
 	integrations: [
 		starlight({
 			title: 'CrumbleCracker',
+			logo: {
+				light: './src/assets/logo-dark.svg',
+				dark: './src/assets/logo.svg',
+			},
+			customCss: ['./src/styles/custom.css'],
 			social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/tinyrange/cc' }],
 			sidebar: [
 				{

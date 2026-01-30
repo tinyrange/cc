@@ -1,0 +1,263 @@
+---
+interface Props {
+  title: string;
+  icon: string;
+  color?: 'blue' | 'purple' | 'green' | 'orange' | 'cyan' | 'magenta';
+}
+
+const { title, icon, color = 'blue' } = Astro.props;
+
+const colorMap = {
+  blue: { hue: 229, gradient: 'from-blue-500 to-indigo-600' },
+  purple: { hue: 276, gradient: 'from-purple-500 to-violet-600' },
+  green: { hue: 134, gradient: 'from-emerald-500 to-green-600' },
+  orange: { hue: 26, gradient: 'from-orange-500 to-amber-600' },
+  cyan: { hue: 192, gradient: 'from-cyan-500 to-teal-600' },
+  magenta: { hue: 322, gradient: 'from-pink-500 to-rose-600' },
+};
+
+const colorConfig = colorMap[color];
+---
+
+<div class="feature-card" data-color={color} style={`--card-hue: ${colorConfig.hue}`}>
+  <div class="card-glow"></div>
+  <div class="card-border"></div>
+  <div class="card-content">
+    <div class="card-icon">
+      <span class="icon-symbol">{icon}</span>
+      <div class="icon-ring"></div>
+      <div class="icon-ring icon-ring-2"></div>
+    </div>
+    <h3 class="card-title">{title}</h3>
+    <div class="card-description">
+      <slot />
+    </div>
+    <div class="card-shine"></div>
+  </div>
+</div>
+
+<style>
+  .feature-card {
+    --card-hue: 229;
+    position: relative;
+    border-radius: 16px;
+    background: transparent;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* Glow effect behind card - allowed to extend */
+  .card-glow {
+    position: absolute;
+    top: -30%;
+    left: -30%;
+    right: -30%;
+    bottom: -30%;
+    background: radial-gradient(
+      circle at 50% 50%,
+      hsla(var(--card-hue), 70%, 50%, 0.12) 0%,
+      transparent 60%
+    );
+    opacity: 0;
+    transition: opacity 0.4s ease;
+    pointer-events: none;
+    z-index: -1;
+  }
+
+  .feature-card:hover .card-glow {
+    opacity: 1;
+  }
+
+  /* Rainbow gradient border - sits behind content */
+  .card-border {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    border-radius: 16px;
+    background: linear-gradient(
+      90deg,
+      hsl(229, 80%, 60%) 0%,
+      hsl(276, 80%, 60%) 16.6%,
+      hsl(322, 80%, 60%) 33.3%,
+      hsl(26, 85%, 55%) 50%,
+      hsl(52, 85%, 50%) 66.6%,
+      hsl(89, 75%, 50%) 83.3%,
+      hsl(229, 80%, 60%) 100%
+    );
+    background-size: 200% 100%;
+    opacity: 0;
+    transition: opacity 0.4s ease;
+    animation: rainbowShift 4s linear infinite;
+  }
+
+  .feature-card:hover .card-border {
+    opacity: 1;
+  }
+
+  @keyframes rainbowShift {
+    0% {
+      background-position: 0% 50%;
+    }
+    100% {
+      background-position: 200% 50%;
+    }
+  }
+
+  /* Main card content area - clips all internal effects */
+  .card-content {
+    position: relative;
+    background: linear-gradient(
+      165deg,
+      rgba(22, 27, 34, 1) 0%,
+      rgba(13, 17, 23, 1) 100%
+    );
+    border-radius: 14px;
+    padding: 1.5rem;
+    margin: 2px;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    overflow: hidden;
+    border: 1px solid rgba(139, 148, 158, 0.15);
+    transition: border-color 0.3s ease;
+  }
+
+  .feature-card:hover .card-content {
+    border-color: transparent;
+  }
+
+  /* Shine effect - inside card-content so it clips properly */
+  .card-shine {
+    position: absolute;
+    inset: -2rem;
+    width: calc(60% + 4rem);
+    left: calc(-100% - 2rem);
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      rgba(255, 255, 255, 0.05) 50%,
+      transparent 100%
+    );
+    transform: skewX(-20deg);
+    transition: left 0.7s ease;
+    pointer-events: none;
+  }
+
+  .feature-card:hover .card-shine {
+    left: calc(150% + 2rem);
+  }
+
+  /* Icon container */
+  .card-icon {
+    position: relative;
+    width: 56px;
+    height: 56px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 1.25rem;
+  }
+
+  .icon-symbol {
+    font-size: 1.75rem;
+    position: relative;
+    z-index: 2;
+    filter: drop-shadow(0 0 8px hsla(var(--card-hue), 70%, 50%, 0.4));
+    transition: filter 0.3s ease;
+  }
+
+  .feature-card:hover .icon-symbol {
+    filter: drop-shadow(0 0 12px hsla(var(--card-hue), 70%, 50%, 0.6));
+  }
+
+  /* Subtle ring around icon */
+  .icon-ring {
+    position: absolute;
+    inset: -4px;
+    border: 1px solid hsla(var(--card-hue), 60%, 50%, 0.2);
+    border-radius: 50%;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+  }
+
+  .icon-ring-2 {
+    display: none;
+  }
+
+  .feature-card:hover .icon-ring {
+    opacity: 1;
+  }
+
+  /* Card title */
+  .card-title {
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: #ffffff;
+    margin: 0 0 0.75rem 0;
+    letter-spacing: -0.02em;
+    transition: color 0.3s ease;
+  }
+
+  .feature-card:hover .card-title {
+    background: linear-gradient(
+      90deg,
+      hsl(var(--card-hue), 80%, 70%) 0%,
+      hsl(calc(var(--card-hue) + 60), 80%, 70%) 100%
+    );
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  /* Card description */
+  .card-description {
+    color: rgba(198, 208, 218, 0.85);
+    font-size: 0.95rem;
+    line-height: 1.6;
+    flex-grow: 1;
+  }
+
+  .card-description :global(code) {
+    background: rgba(110, 118, 129, 0.3);
+    padding: 0.15em 0.4em;
+    border-radius: 4px;
+    font-size: 0.85em;
+  }
+
+  /* Light theme adjustments */
+  :global(:root[data-theme='light']) .card-content {
+    background: linear-gradient(
+      165deg,
+      rgba(255, 255, 255, 0.98) 0%,
+      rgba(246, 248, 250, 1) 100%
+    );
+    border-color: rgba(0, 0, 0, 0.08);
+  }
+
+  :global(:root[data-theme='light']) .card-title {
+    color: #1f2328;
+  }
+
+  :global(:root[data-theme='light']) .card-description {
+    color: rgba(31, 35, 40, 0.8);
+  }
+
+  :global(:root[data-theme='light']) .card-glow {
+    background: radial-gradient(
+      circle at 50% 50%,
+      hsla(var(--card-hue), 70%, 50%, 0.08) 0%,
+      transparent 60%
+    );
+  }
+
+  :global(:root[data-theme='light']) .card-shine {
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      rgba(0, 0, 0, 0.02) 50%,
+      transparent 100%
+    );
+  }
+</style>

@@ -4,6 +4,8 @@ description: Fast, lightweight virtualization for running containers as VMs
 template: splash
 hero:
   tagline: Run containers as lightweight virtual machines with hardware-level isolation
+  image:
+    file: ../../assets/logo.svg
   actions:
     - text: Get Started
       link: /getting-started/introduction/
@@ -14,41 +16,40 @@ hero:
       variant: minimal
 ---
 
-import { Card, CardGrid } from '@astrojs/starlight/components';
+import FeatureCard from '../../components/FeatureCard.astro';
+import FeatureGrid from '../../components/FeatureGrid.astro';
+import LinkCard from '../../components/LinkCard.astro';
+import ActionCard from '../../components/ActionCard.astro';
 
 ## Why CrumbleCracker?
 
 CrumbleCracker runs OCI containers inside lightweight virtual machines, combining the convenience of container images with the security of hardware virtualization.
 
-<CardGrid stagger>
-	<Card title="Container Compatible" icon="seti:docker">
-		Pull any Docker or OCI image and run it directly. No conversion needed.
-	</Card>
-	<Card title="Hardware Isolation" icon="laptop">
-		Each VM runs with its own kernel, providing true isolation via your platform's native hypervisor.
-	</Card>
-	<Card title="Go-Native API" icon="seti:go">
-		Program VMs using familiar Go patterns. The API mirrors `os`, `os/exec`, and `net` packages.
-	</Card>
-	<Card title="Cross-Platform" icon="linux">
-		Runs on macOS (Hypervisor.framework), Linux (KVM), and Windows (WHP).
-	</Card>
-</CardGrid>
+<FeatureGrid columns={4}>
+  <FeatureCard title="Container Compatible" icon="🐳" color="blue">
+    Pull any Docker or OCI image and run it directly. No conversion needed.
+  </FeatureCard>
+  <FeatureCard title="Hardware Isolation" icon="🔒" color="purple">
+    Each VM runs with its own kernel, providing true isolation via your platform's native hypervisor.
+  </FeatureCard>
+  <FeatureCard title="Go-Native API" icon="⚡" color="green">
+    Program VMs using familiar Go patterns. The API mirrors `os`, `os/exec`, and `net` packages.
+  </FeatureCard>
+  <FeatureCard title="Cross-Platform" icon="🌐" color="orange">
+    Runs on macOS (Hypervisor.framework), Linux (KVM), and Windows (WHP).
+  </FeatureCard>
+</FeatureGrid>
 
 ## Two Ways to Use CrumbleCracker
 
-<CardGrid>
-	<Card title="CrumbleCracker App" icon="rocket">
-		A GUI desktop application for running VMs interactively. Perfect for development, testing, and exploring container images.
-
-		[Learn more →](/app/overview/)
-	</Card>
-	<Card title="Go API" icon="puzzle">
-		A programming library for embedding VMs in your Go applications. Build sandboxed code execution, CI runners, or custom tooling.
-
-		[Learn more →](/api/overview/)
-	</Card>
-</CardGrid>
+<FeatureGrid columns={2}>
+  <LinkCard title="CrumbleCracker App" href="/app/overview/" icon="🚀" color="cyan">
+    A GUI desktop application for running VMs interactively. Perfect for development, testing, and exploring container images.
+  </LinkCard>
+  <LinkCard title="Go API" href="/api/overview/" icon="🧩" color="magenta">
+    A programming library for embedding VMs in your Go applications. Build sandboxed code execution, CI runners, or custom tooling.
+  </LinkCard>
+</FeatureGrid>
 
 ## Quick Example
 
@@ -77,15 +78,11 @@ func main() {
 
 ## Next Steps
 
-<CardGrid>
-	<Card title="Installation" icon="setting">
-		Get CrumbleCracker running on your machine.
-
-		[Install →](/getting-started/installation/)
-	</Card>
-	<Card title="Quick Start" icon="document">
-		Build your first VM in under 5 minutes.
-
-		[Start →](/getting-started/quick-start/)
-	</Card>
-</CardGrid>
+<FeatureGrid columns={2}>
+  <ActionCard title="Installation" href="/getting-started/installation/" icon="⚙️" color="blue">
+    Get CrumbleCracker running on your machine.
+  </ActionCard>
+  <ActionCard title="Quick Start" href="/getting-started/quick-start/" icon="📖" color="green">
+    Build your first VM in under 5 minutes.
+  </ActionCard>
+</FeatureGrid>

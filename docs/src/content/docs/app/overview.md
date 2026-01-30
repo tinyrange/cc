@@ -50,7 +50,6 @@ Create new VMs from various sources:
 | Platform | Status |
 |----------|--------|
 | macOS (Apple Silicon) | Fully supported |
-| macOS (Intel) | Fully supported |
 | Linux (x86_64) | Fully supported |
 | Linux (arm64) | Fully supported |
 | Windows (x86_64) | Fully supported |
