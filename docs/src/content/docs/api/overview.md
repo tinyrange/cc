@@ -134,7 +134,7 @@ if errors.Is(err, cc.ErrHypervisorUnavailable) {
 
 ## Next Steps
 
-- [Creating Instances](/api/creating-instances/): VM creation and configuration
-- [Filesystem](/api/filesystem/): Working with files in VMs
-- [Commands](/api/commands/): Running programs and capturing output
-- [Networking](/api/networking/): Connecting to and from VMs
+- [Creating Instances](/cc/api/creating-instances/): VM creation and configuration
+- [Filesystem](/cc/api/filesystem/): Working with files in VMs
+- [Commands](/cc/api/commands/): Running programs and capturing output
+- [Networking](/cc/api/networking/): Connecting to and from VMs

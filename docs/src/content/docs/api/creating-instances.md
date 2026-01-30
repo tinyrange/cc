@@ -214,6 +214,6 @@ The captured packets can be analyzed with Wireshark or tcpdump.
 
 ## Next Steps
 
-- [Filesystem Operations](/api/filesystem/) - Work with files in VMs
-- [Command Execution](/api/commands/) - Run programs
-- [Instance Options Reference](/reference/options/) - Complete options list
+- [Filesystem Operations](/cc/api/filesystem/) - Work with files in VMs
+- [Command Execution](/cc/api/commands/) - Run programs
+- [Instance Options Reference](/cc/reference/options/) - Complete options list

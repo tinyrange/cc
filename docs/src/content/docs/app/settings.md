@@ -50,7 +50,7 @@ From the bundle settings dialog, you can:
 
 ### Editing Bundle Configuration
 
-To change boot options (memory, CPUs, command), edit the `ccbundle.yaml` file directly in the bundle directory. See [Bundles](/app/bundles/) for the full configuration reference.
+To change boot options (memory, CPUs, command), edit the `ccbundle.yaml` file directly in the bundle directory. See [Bundles](/cc/app/bundles/) for the full configuration reference.
 
 ## Site Configuration
 
@@ -166,5 +166,5 @@ URL-triggered VM launches require user confirmation before execution.
 
 ## Next Steps
 
-- [Bundles](/app/bundles/) - Configure individual VMs
-- [Overview](/app/overview/) - Return to app overview
+- [Bundles](/cc/app/bundles/) - Configure individual VMs
+- [Overview](/cc/app/overview/) - Return to app overview

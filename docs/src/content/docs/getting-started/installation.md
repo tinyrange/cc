@@ -129,6 +129,6 @@ cd cc
 
 ## Next Steps
 
-- [Quick Start](/getting-started/quick-start/): Build your first VM
-- [Go API Overview](/api/overview/): Learn the programming interface
-- [App Overview](/app/overview/): Explore the desktop application
+- [Quick Start](/cc/getting-started/quick-start/): Build your first VM
+- [Go API Overview](/cc/api/overview/): Learn the programming interface
+- [App Overview](/cc/app/overview/): Explore the desktop application

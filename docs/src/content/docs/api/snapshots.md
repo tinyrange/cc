@@ -246,5 +246,5 @@ This makes creating many instances from a snapshot very fast and memory-efficien
 
 ## Next Steps
 
-- [Dockerfile Support](/api/dockerfile/) - Build from Dockerfiles
-- [Creating Instances](/api/creating-instances/) - Use snapshots to create VMs
+- [Dockerfile Support](/cc/api/dockerfile/) - Build from Dockerfiles
+- [Creating Instances](/cc/api/creating-instances/) - Use snapshots to create VMs

@@ -8,7 +8,7 @@ This tutorial walks you through creating and running a VM using the CrumbleCrack
 ## Prerequisites
 
 - Go 1.24.7 or later
-- Hypervisor enabled ([see Installation](/getting-started/installation/))
+- Hypervisor enabled ([see Installation](/cc/getting-started/installation/))
 
 ## Create a Project
 
@@ -172,7 +172,7 @@ fmt.Println(string(output)) // "hello"
 
 ## Next Steps
 
-- [Filesystem Operations](/api/filesystem/): Full file manipulation API
-- [Command Execution](/api/commands/): Streaming, stdin, and more
-- [OCI Images](/api/oci-images/): Working with registries and images
-- [Snapshots](/api/snapshots/): Fast startup with filesystem snapshots
+- [Filesystem Operations](/cc/api/filesystem/): Full file manipulation API
+- [Command Execution](/cc/api/commands/): Streaming, stdin, and more
+- [OCI Images](/cc/api/oci-images/): Working with registries and images
+- [Snapshots](/cc/api/snapshots/): Fast startup with filesystem snapshots
