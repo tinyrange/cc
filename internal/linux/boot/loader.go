@@ -38,6 +38,7 @@ type bootPlan interface {
 const (
 	amd64ACPITablesSize = 0x10000
 	amd64StackGuard     = 0x1000
+	amd64PCIHoleStart   = 0xC0000000 // 3GB - start of PCI/MMIO hole on x86_64
 
 	arm64UARTMMIOBase = 0x09000000
 	arm64UARTRegShift = 0
@@ -419,7 +420,16 @@ func (l *LinuxLoader) loadAMD64(rec *timeslice.Recorder, vm hv.VirtualMachine, k
 	if memSize <= amd64ACPITablesSize {
 		return fmt.Errorf("guest memory (%d bytes) too small for ACPI tables", memSize)
 	}
-	tablesBase := memBase + memSize - amd64ACPITablesSize
+
+	// Calculate ACPI tables base address
+	// On x86_64, if memory extends into the PCI hole (above 3GB), place tables
+	// just below the PCI hole to avoid the MMIO region (3GB-4GB).
+	memEnd := memBase + memSize
+	tablesBase := memEnd - amd64ACPITablesSize
+	if memEnd > amd64PCIHoleStart {
+		// Place ACPI tables just below the PCI hole
+		tablesBase = amd64PCIHoleStart - amd64ACPITablesSize
+	}
 
 	e820 := amd64boot.DefaultE820Map(memBase, memBase+memSize)
 	e820, err = reserveE820Region(e820, tablesBase, amd64ACPITablesSize)
@@ -445,6 +455,12 @@ func (l *LinuxLoader) loadAMD64(rec *timeslice.Recorder, vm hv.VirtualMachine, k
 		}
 
 		top := reserveTop - guard
+
+		// Respect the kernel's maximum initrd address limit
+		if max := uint64(kernelImage.Header.InitrdAddrMax); max != 0 && top > max+1 {
+			top = max + 1
+		}
+
 		if top <= memBase || top < initrdSize {
 			return fmt.Errorf("not enough space for initrd (size %d) with guard below ACPI tables", initrdSize)
 		}

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	corechipset "github.com/tinyrange/cc/internal/chipset"
 	"github.com/tinyrange/cc/internal/devices/amd64/chipset"
@@ -272,9 +273,8 @@ func (v *virtualCPU) handleMemoryAccess(exitCtx *exitContext, access *bindings.E
 	}
 
 	// 1. RAM Access (Instruction Fetch or Data Access)
-	if gpa >= v.vm.memoryBase && gpa < v.vm.memoryBase+uint64(v.vm.memory.Size()) {
-		offset := gpa - v.vm.memoryBase
-
+	// 1. RAM Access - use GPA translation for split memory support
+	if offset, ok := v.vm.gpaToHostOffset(gpa); ok {
 		// Bounds check
 		if offset+size > uint64(v.vm.memory.Size()) {
 			return fmt.Errorf("whp: memory access out of bounds: gpa=0x%x size=%d", gpa, size)
@@ -351,6 +351,12 @@ var (
 	_ hv.MemoryRegion = &memoryRegion{}
 )
 
+// Split memory constants for x86_64 (same as KVM)
+const (
+	x86PCIHoleStart    uint64 = 0xC0000000  // 3GB - start of PCI/MMIO hole
+	x86HighMemoryStart uint64 = 0x100000000 // 4GB - start of high memory above PCI hole
+)
+
 type virtualMachine struct {
 	rec *timeslice.Recorder
 
@@ -362,6 +368,13 @@ type virtualMachine struct {
 	memMu      sync.RWMutex // protects memory during snapshot
 	memory     *bindings.Allocation
 	memoryBase uint64
+
+	// Split memory support for x86_64 with >3GB RAM:
+	// When memory exceeds 3GB, we need to split it around the PCI/MMIO hole:
+	//   - Low memory: GPA [memoryBase, x86PCIHoleStart) -> host mmap [0, lowMemSize)
+	//   - High memory: GPA [x86HighMemoryStart, x86HighMemoryStart+highMemSize) -> host mmap [lowMemSize, lowMemSize+highMemSize)
+	lowMemSize  uint64 // Size of memory below PCI hole (0 if not using split memory)
+	highMemSize uint64 // Size of memory above 4GB (0 if not using split memory)
 
 	devices []hv.Device
 
@@ -383,6 +396,39 @@ type virtualMachine struct {
 func (v *virtualMachine) MemoryBase() uint64        { return v.memoryBase }
 func (v *virtualMachine) MemorySize() uint64        { return uint64(v.memory.Size()) }
 func (v *virtualMachine) Hypervisor() hv.Hypervisor { return v.hv }
+
+// gpaToHostOffset translates a guest physical address (GPA) to an offset within
+// the host memory allocation. For split memory configurations, this handles the
+// discontinuity around the PCI hole:
+//   - Low memory [memoryBase, x86PCIHoleStart) -> host offset [0, lowMemSize)
+//   - High memory [x86HighMemoryStart, x86HighMemoryStart+highMemSize) -> host offset [lowMemSize, lowMemSize+highMemSize)
+func (v *virtualMachine) gpaToHostOffset(gpa uint64) (uint64, bool) {
+	// If not using split memory, simple linear translation
+	if v.lowMemSize == 0 {
+		if gpa < v.memoryBase || gpa >= v.memoryBase+v.memory.Size() {
+			return 0, false
+		}
+		return gpa - v.memoryBase, true
+	}
+
+	// Split memory mode
+	if gpa >= v.memoryBase && gpa < x86PCIHoleStart {
+		// Low memory region
+		offset := gpa - v.memoryBase
+		if offset >= v.lowMemSize {
+			return 0, false
+		}
+		return offset, true
+	}
+
+	if gpa >= x86HighMemoryStart && gpa < x86HighMemoryStart+v.highMemSize {
+		// High memory region - mapped after low memory in host allocation
+		offset := v.lowMemSize + (gpa - x86HighMemoryStart)
+		return offset, true
+	}
+
+	return 0, false
+}
 
 // AllocateMemory implements hv.VirtualMachine.
 func (v *virtualMachine) AllocateMemory(physAddr uint64, size uint64) (hv.MemoryRegion, error) {
@@ -507,9 +553,13 @@ func (v *virtualMachine) WriteAt(p []byte, off int64) (n int, err error) {
 	v.memMu.RLock()
 	defer v.memMu.RUnlock()
 
-	offset := off - int64(v.memoryBase)
-	if offset < 0 || uint64(offset) >= v.memory.Size() {
-		return 0, fmt.Errorf("whp: WriteAt offset out of bounds")
+	offset, ok := v.gpaToHostOffset(uint64(off))
+	if !ok {
+		return 0, fmt.Errorf("whp: WriteAt GPA 0x%x out of bounds", off)
+	}
+
+	if offset+uint64(len(p)) > v.memory.Size() {
+		return 0, fmt.Errorf("whp: WriteAt would exceed memory bounds")
 	}
 
 	n = copy(v.memory.Slice()[offset:], p)
@@ -524,9 +574,13 @@ func (v *virtualMachine) ReadAt(p []byte, off int64) (n int, err error) {
 	v.memMu.RLock()
 	defer v.memMu.RUnlock()
 
-	offset := off - int64(v.memoryBase)
-	if offset < 0 || uint64(offset) >= v.memory.Size() {
-		return 0, fmt.Errorf("whp: ReadAt offset out of bounds")
+	offset, ok := v.gpaToHostOffset(uint64(off))
+	if !ok {
+		return 0, fmt.Errorf("whp: ReadAt GPA 0x%x out of bounds", off)
+	}
+
+	if offset+uint64(len(p)) > v.memory.Size() {
+		return 0, fmt.Errorf("whp: ReadAt would exceed memory bounds")
 	}
 
 	n = copy(p, v.memory.Slice()[offset:])
@@ -776,8 +830,17 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 	// Allocate guest memory
 	if config.MemorySize() == 0 {
 		bindings.DeletePartition(vm.part)
-		return nil, fmt.Errorf("kvm: memory size must be greater than 0")
+		return nil, fmt.Errorf("whp: memory size must be greater than 0")
 	}
+
+	memBase := config.MemoryBase()
+	memSize := config.MemorySize()
+	memEnd := memBase + memSize
+
+	// Detect if we need split memory layout for x86_64
+	// This is needed when memory would overlap the PCI/MMIO hole (3GB-4GB)
+	needsSplitMemory := h.Architecture() == hv.ArchitectureX86_64 &&
+		memBase < x86PCIHoleStart && memEnd > x86PCIHoleStart
 
 	mem, err := bindings.VirtualAlloc(
 		0,
@@ -793,20 +856,56 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 	vm.rec.Record(tsWhpAllocateMemory)
 
 	vm.memory = mem
-	vm.memoryBase = config.MemoryBase()
+	vm.memoryBase = memBase
 
-	// Initialize the physical address space allocator
-	vm.addressSpace = hv.NewAddressSpace(h.Architecture(), config.MemoryBase(), config.MemorySize())
+	if needsSplitMemory {
+		// Split memory around the PCI hole:
+		// - Low memory: [memBase, x86PCIHoleStart) at GPA [memBase, x86PCIHoleStart)
+		// - High memory: remaining at GPA [x86HighMemoryStart, x86HighMemoryStart+highMemSize)
+		vm.lowMemSize = x86PCIHoleStart - memBase
+		vm.highMemSize = memSize - vm.lowMemSize
 
-	if err := bindings.MapGPARange(
-		vm.part,
-		vm.memory.Pointer(),
-		bindings.GuestPhysicalAddress(vm.memoryBase),
-		uint64(vm.memory.Size()),
-		bindings.MapGPARangeFlagRead|bindings.MapGPARangeFlagWrite|bindings.MapGPARangeFlagExecute,
-	); err != nil {
-		bindings.DeletePartition(vm.part)
-		return nil, fmt.Errorf("whp: MapGPARange failed: %w", err)
+		// Initialize address space for split memory
+		vm.addressSpace = hv.NewAddressSpaceSplit(h.Architecture(), memBase, vm.lowMemSize, x86HighMemoryStart, vm.highMemSize)
+
+		// Map slot 0: low memory [memBase, x86PCIHoleStart) -> host [0, lowMemSize)
+		if err := bindings.MapGPARange(
+			vm.part,
+			vm.memory.Pointer(),
+			bindings.GuestPhysicalAddress(memBase),
+			vm.lowMemSize,
+			bindings.MapGPARangeFlagRead|bindings.MapGPARangeFlagWrite|bindings.MapGPARangeFlagExecute,
+		); err != nil {
+			bindings.DeletePartition(vm.part)
+			return nil, fmt.Errorf("whp: MapGPARange (low memory) failed: %w", err)
+		}
+
+		// Map slot 1: high memory [x86HighMemoryStart, x86HighMemoryStart+highMemSize) -> host [lowMemSize, lowMemSize+highMemSize)
+		highMemHostPtr := uintptr(vm.memory.Pointer()) + uintptr(vm.lowMemSize)
+		if err := bindings.MapGPARange(
+			vm.part,
+			unsafe.Pointer(highMemHostPtr),
+			bindings.GuestPhysicalAddress(x86HighMemoryStart),
+			vm.highMemSize,
+			bindings.MapGPARangeFlagRead|bindings.MapGPARangeFlagWrite|bindings.MapGPARangeFlagExecute,
+		); err != nil {
+			bindings.DeletePartition(vm.part)
+			return nil, fmt.Errorf("whp: MapGPARange (high memory) failed: %w", err)
+		}
+	} else {
+		// Contiguous memory layout
+		vm.addressSpace = hv.NewAddressSpace(h.Architecture(), memBase, memSize)
+
+		if err := bindings.MapGPARange(
+			vm.part,
+			vm.memory.Pointer(),
+			bindings.GuestPhysicalAddress(vm.memoryBase),
+			uint64(vm.memory.Size()),
+			bindings.MapGPARangeFlagRead|bindings.MapGPARangeFlagWrite|bindings.MapGPARangeFlagExecute,
+		); err != nil {
+			bindings.DeletePartition(vm.part)
+			return nil, fmt.Errorf("whp: MapGPARange failed: %w", err)
+		}
 	}
 
 	vm.rec.Record(tsWhpMapGPARange)

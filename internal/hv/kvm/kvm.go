@@ -18,6 +18,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// x86_64 memory layout constants for split memory (PCI hole at 3GB-4GB)
+const (
+	x86PCIHoleStart    uint64 = 0xC0000000  // 3GB - start of PCI/MMIO hole
+	x86HighMemoryStart uint64 = 0x100000000 // 4GB - start of high memory above PCI hole
+)
+
 var (
 	tsKvmHostTime  = timeslice.RegisterKind("kvm_host_time", 0)
 	tsKvmGuestTime = timeslice.RegisterKind("kvm_guest_time", timeslice.SliceFlagGuestTime)
@@ -121,6 +127,13 @@ type virtualMachine struct {
 
 	// Physical address space allocator for MMIO regions
 	addressSpace *hv.AddressSpace
+
+	// Split memory layout tracking (x86_64 only, for >3GB RAM)
+	// When highMemSize > 0, memory is split around the PCI hole:
+	//   - Low memory: GPA [memoryBase, memoryBase+lowMemSize) -> host mmap [0, lowMemSize)
+	//   - High memory: GPA [0x100000000, 0x100000000+highMemSize) -> host mmap [lowMemSize, lowMemSize+highMemSize)
+	lowMemSize  uint64 // Size of memory below PCI hole (0 means contiguous layout)
+	highMemSize uint64 // Size of memory above 4GB (0 means no high memory)
 
 	// amd64-specific fields
 	hasIRQChip   bool
@@ -323,13 +336,18 @@ func (v *virtualMachine) ReadAt(p []byte, off int64) (n int, err error) {
 	if v.memory == nil {
 		return 0, fmt.Errorf("kvm: ReadAt after close")
 	}
-	off = off - int64(v.memoryBase)
 
-	if off < 0 || int(off) >= len(v.memory) {
+	gpa := uint64(off)
+	hostOff, ok := v.gpaToHostOffset(gpa)
+	if !ok {
+		return 0, fmt.Errorf("kvm: ReadAt GPA 0x%x out of bounds or in PCI hole", gpa)
+	}
+
+	if hostOff < 0 || int(hostOff) >= len(v.memory) {
 		return 0, fmt.Errorf("kvm: ReadAt offset out of bounds")
 	}
 
-	n = copy(p, v.memory[off:])
+	n = copy(p, v.memory[hostOff:])
 	if n < len(p) {
 		err = fmt.Errorf("kvm: ReadAt short read")
 	}
@@ -343,13 +361,18 @@ func (v *virtualMachine) WriteAt(p []byte, off int64) (n int, err error) {
 	if v.memory == nil {
 		return 0, fmt.Errorf("kvm: WriteAt after close")
 	}
-	off = off - int64(v.memoryBase)
 
-	if off < 0 || int(off) >= len(v.memory) {
-		return 0, fmt.Errorf("kvm: WriteAt offset 0x%x out of bounds 0x%x", off, len(v.memory))
+	gpa := uint64(off)
+	hostOff, ok := v.gpaToHostOffset(gpa)
+	if !ok {
+		return 0, fmt.Errorf("kvm: WriteAt GPA 0x%x out of bounds or in PCI hole", gpa)
 	}
 
-	n = copy(v.memory[off:], p)
+	if hostOff < 0 || int(hostOff) >= len(v.memory) {
+		return 0, fmt.Errorf("kvm: WriteAt offset 0x%x out of bounds 0x%x", hostOff, len(v.memory))
+	}
+
+	n = copy(v.memory[hostOff:], p)
 	if n < len(p) {
 		err = fmt.Errorf("kvm: WriteAt short write")
 	}
@@ -365,6 +388,39 @@ func (v *virtualMachine) Arm64GICInfo() (hv.Arm64GICInfo, bool) {
 		return hv.Arm64GICInfo{}, false
 	}
 	return v.arm64GICInfo, true
+}
+
+// gpaToHostOffset translates a guest physical address to a host memory offset.
+// For split memory layouts (x86_64 with >3GB RAM), this handles the PCI hole gap:
+//   - Low memory [memoryBase, memoryBase+lowMemSize) -> host offset [0, lowMemSize)
+//   - High memory [0x100000000, 0x100000000+highMemSize) -> host offset [lowMemSize, lowMemSize+highMemSize)
+//
+// Returns the host offset and true if valid, or 0 and false if the GPA is invalid
+// (e.g., in the PCI hole or out of range).
+func (v *virtualMachine) gpaToHostOffset(gpa uint64) (int64, bool) {
+	// Contiguous layout (no split memory)
+	if v.highMemSize == 0 {
+		if gpa < v.memoryBase || gpa >= v.memoryBase+uint64(len(v.memory)) {
+			return 0, false
+		}
+		return int64(gpa - v.memoryBase), true
+	}
+
+	// Split layout: low memory below PCI hole
+	lowMemEnd := v.memoryBase + v.lowMemSize
+	if gpa >= v.memoryBase && gpa < lowMemEnd {
+		return int64(gpa - v.memoryBase), true
+	}
+
+	// Split layout: high memory above 4GB
+	highMemEnd := x86HighMemoryStart + v.highMemSize
+	if gpa >= x86HighMemoryStart && gpa < highMemEnd {
+		// High memory is stored after low memory in the host mmap
+		return int64(v.lowMemSize + (gpa - x86HighMemoryStart)), true
+	}
+
+	// GPA is in the PCI hole or out of range
+	return 0, false
 }
 
 func (v *virtualMachine) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error {
@@ -630,18 +686,65 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 	vm.memory = mem
 	vm.memoryBase = config.MemoryBase()
 
-	// Initialize physical address space allocator
-	vm.addressSpace = hv.NewAddressSpace(h.Architecture(), config.MemoryBase(), config.MemorySize())
+	// Determine if we need split memory layout (x86_64 with memory extending into PCI hole)
+	memEnd := config.MemoryBase() + config.MemorySize()
+	needsSplitMemory := h.Architecture() == hv.ArchitectureX86_64 && memEnd > x86PCIHoleStart
 
-	if err := setUserMemoryRegion(vm.vmFd, &kvmUserspaceMemoryRegion{
-		Slot:          0,
-		Flags:         0,
-		GuestPhysAddr: config.MemoryBase(),
-		MemorySize:    config.MemorySize(),
-		UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[0]))),
-	}); err != nil {
-		unix.Close(vmFd)
-		return nil, fmt.Errorf("set user memory region: %w", err)
+	if needsSplitMemory {
+		// Split memory layout: low memory below PCI hole, high memory above 4GB
+		vm.lowMemSize = x86PCIHoleStart - config.MemoryBase()
+		vm.highMemSize = config.MemorySize() - vm.lowMemSize
+
+		// Initialize physical address space allocator for split layout
+		// The address space needs to know about both memory regions
+		vm.addressSpace = hv.NewAddressSpaceSplit(
+			h.Architecture(),
+			config.MemoryBase(),
+			vm.lowMemSize,
+			x86HighMemoryStart,
+			vm.highMemSize,
+		)
+
+		// Register slot 0: low memory [memoryBase, x86PCIHoleStart)
+		if err := setUserMemoryRegion(vm.vmFd, &kvmUserspaceMemoryRegion{
+			Slot:          0,
+			Flags:         0,
+			GuestPhysAddr: config.MemoryBase(),
+			MemorySize:    vm.lowMemSize,
+			UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[0]))),
+		}); err != nil {
+			unix.Close(vmFd)
+			return nil, fmt.Errorf("set user memory region (low): %w", err)
+		}
+
+		// Register slot 1: high memory [0x100000000, 0x100000000+highMemSize)
+		// Points to the host mmap at offset lowMemSize
+		if err := setUserMemoryRegion(vm.vmFd, &kvmUserspaceMemoryRegion{
+			Slot:          1,
+			Flags:         0,
+			GuestPhysAddr: x86HighMemoryStart,
+			MemorySize:    vm.highMemSize,
+			UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[vm.lowMemSize]))),
+		}); err != nil {
+			unix.Close(vmFd)
+			return nil, fmt.Errorf("set user memory region (high): %w", err)
+		}
+
+		vm.lastMemorySlot = 1
+	} else {
+		// Contiguous memory layout (default)
+		vm.addressSpace = hv.NewAddressSpace(h.Architecture(), config.MemoryBase(), config.MemorySize())
+
+		if err := setUserMemoryRegion(vm.vmFd, &kvmUserspaceMemoryRegion{
+			Slot:          0,
+			Flags:         0,
+			GuestPhysAddr: config.MemoryBase(),
+			MemorySize:    config.MemorySize(),
+			UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[0]))),
+		}); err != nil {
+			unix.Close(vmFd)
+			return nil, fmt.Errorf("set user memory region: %w", err)
+		}
 	}
 
 	vm.rec.Record(tsKvmSetUserMemoryRegion)

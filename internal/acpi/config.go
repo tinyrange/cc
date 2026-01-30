@@ -75,6 +75,9 @@ func DefaultOEMInfo() OEMInfo {
 	}
 }
 
+// x86_64 memory layout constant
+const x86PCIHoleStart uint64 = 0xC0000000 // 3GB - start of PCI/MMIO hole
+
 func (c *Config) normalize(vm hv.VirtualMachine) {
 	if c.MemoryBase == 0 {
 		c.MemoryBase = vm.MemoryBase()
@@ -86,7 +89,13 @@ func (c *Config) normalize(vm hv.VirtualMachine) {
 		c.TablesSize = 0x10000
 	}
 	if c.TablesBase == 0 {
-		c.TablesBase = c.MemoryBase + c.MemorySize - c.TablesSize
+		memEnd := c.MemoryBase + c.MemorySize
+		c.TablesBase = memEnd - c.TablesSize
+		// On x86_64, if memory extends into the PCI hole (above 3GB),
+		// place tables just below the PCI hole to avoid MMIO region (3GB-4GB).
+		if memEnd > x86PCIHoleStart {
+			c.TablesBase = x86PCIHoleStart - c.TablesSize
+		}
 	}
 	if c.RSDPBase == 0 {
 		c.RSDPBase = c.MemoryBase + 0x000E0000
