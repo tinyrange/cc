@@ -4,10 +4,15 @@ package kvm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"os/signal"
 	"runtime"
 	"sync"
+	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/tinyrange/cc/internal/acpi"
@@ -17,6 +22,19 @@ import (
 	"github.com/tinyrange/cc/internal/timeslice"
 	"golang.org/x/sys/unix"
 )
+
+func init() {
+	// Install a no-op handler for SIGUSR1 so that it can interrupt
+	// blocking ioctls (KVM_RUN) when we need to stop vCPU threads.
+	// Without a handler, the signal may be ignored and not cause EINTR.
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, unix.SIGUSR1)
+	go func() {
+		for range ch {
+			// Discard signals - they're just used to interrupt ioctls
+		}
+	}()
+}
 
 // x86_64 memory layout constants for split memory (PCI hole at 3GB-4GB)
 const (
@@ -45,6 +63,7 @@ type virtualCPU struct {
 	id       int
 	fd       int
 	run      []byte
+	closed   uint32 // atomic: 1 if closed, 0 otherwise
 }
 
 // implements hv.VirtualCPU.
@@ -61,6 +80,12 @@ func (v *virtualCPU) start() {
 }
 
 func (v *virtualCPU) RequestImmediateExit(tid int) error {
+	// Check if vCPU has been closed to avoid accessing unmapped memory.
+	// This can happen when AfterFunc runs after Close() has been called.
+	if atomic.LoadUint32(&v.closed) != 0 {
+		return nil
+	}
+
 	run := (*kvmRunData)(unsafe.Pointer(&v.run[0]))
 
 	// set immediate_exit to request vCPU exit
@@ -270,7 +295,10 @@ func (v *virtualMachine) Close() error {
 	v.vmFd = -1
 
 	// Close vCPU run queues synchronously (just channel ops, fast)
+	// and mark each vCPU as closed to prevent AfterFunc from accessing
+	// unmapped memory.
 	for _, vcpu := range vcpus {
+		atomic.StoreUint32(&vcpu.closed, 1)
 		close(vcpu.runQueue)
 	}
 
@@ -315,18 +343,78 @@ func (v *virtualMachine) Run(ctx context.Context, cfg hv.RunConfig) error {
 		return fmt.Errorf("kvm: RunConfig is nil")
 	}
 
-	vcpu, ok := v.vcpus[0]
+	vcpuCtx, vcpuCancel := context.WithCancel(ctx)
+	defer vcpuCancel()
+
+	// Start BSP (vCPU 0)
+	bspVcpu, ok := v.vcpus[0]
 	if !ok {
 		return fmt.Errorf("kvm: no vCPU 0 found")
 	}
 
-	done := make(chan error, 1)
-
-	vcpu.runQueue <- func() {
-		done <- cfg.Run(ctx, vcpu)
+	bspDone := make(chan error, 1)
+	bspVcpu.runQueue <- func() {
+		bspDone <- cfg.Run(vcpuCtx, bspVcpu)
 	}
 
-	err := <-done
+	// Start APs (vCPUs 1..N-1) - they wait for INIT-SIPI from guest kernel.
+	// APs run in a simple loop: when halted they will be woken by IPIs
+	// (e.g., reschedule interrupts) injected via the in-kernel LAPIC.
+	var apWg sync.WaitGroup
+	for i := 1; i < len(v.vcpus); i++ {
+		vcpu, ok := v.vcpus[i]
+		if !ok {
+			continue
+		}
+		apWg.Add(1)
+		// Capture vcpu in a new variable to avoid closure capturing loop variable
+		apVcpu := vcpu
+		apVcpu.runQueue <- func() {
+			defer apWg.Done()
+			for {
+				select {
+				case <-vcpuCtx.Done():
+					return
+				default:
+				}
+				err := apVcpu.Run(vcpuCtx)
+				if err != nil {
+					if errors.Is(err, context.Canceled) ||
+						errors.Is(err, context.DeadlineExceeded) {
+						return
+					}
+					// For ErrVMHalted and other errors, continue the loop.
+					// APs halt when idle and will be woken by IPIs from BSP.
+					// KVM's LAPIC will handle interrupt injection on next KVM_RUN.
+				}
+			}
+		}
+	}
+
+	// Wait for BSP
+	err := <-bspDone
+	vcpuCancel()
+
+	// Force APs to exit by requesting immediate exit and sending signals.
+	// This is needed because APs might be blocked in KVM_RUN waiting for interrupts.
+	for i := 1; i < len(v.vcpus); i++ {
+		if vcpu, ok := v.vcpus[i]; ok {
+			run := (*kvmRunData)(unsafe.Pointer(&vcpu.run[0]))
+			run.immediate_exit = 1
+		}
+	}
+
+	// Wait for APs to notice cancellation with a reasonable timeout.
+	// The context cancellation triggers AfterFunc handlers that send SIGUSR1
+	// to each vCPU thread, which interrupts the KVM_RUN ioctl.
+	done := make(chan struct{})
+	go func() { apWg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		slog.Debug("kvm: timeout waiting for APs to stop, forcing exit")
+	}
+
 	return err
 }
 
@@ -753,6 +841,7 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		if err := acpi.Install(vm, acpi.Config{
 			MemoryBase: config.MemoryBase(),
 			MemorySize: config.MemorySize(),
+			NumCPUs:    config.CPUCount(),
 		}); err != nil {
 			unix.Close(vmFd)
 			return nil, fmt.Errorf("install ACPI tables: %w", err)
@@ -769,11 +858,6 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 	vm.rec.Record(tsKvmOnCreateVMWithMemory)
 
 	// Create vCPUs
-	if config.CPUCount() != 1 {
-		unix.Close(vmFd)
-		return nil, fmt.Errorf("kvm: only 1 vCPU supported, got %d", config.CPUCount())
-	}
-
 	mmapSize, err := getVcpuMmapSize(h.fd)
 	if err != nil {
 		unix.Close(vmFd)
@@ -815,7 +899,7 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 		vm.vcpus[i] = vcpu
 
-		if err := h.archVCPUInit(vm, vcpuFd); err != nil {
+		if err := h.archVCPUInit(vm, vcpuFd, i); err != nil {
 			unix.Close(vmFd)
 			return nil, fmt.Errorf("initialize VM: %w", err)
 		}
