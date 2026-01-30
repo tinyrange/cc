@@ -14,8 +14,8 @@ const { columns = 2, carousel = false } = Astro.props;
 <style>
   .feature-grid {
     display: grid;
-    gap: 1.5rem;
-    margin: 2rem 0;
+    gap: 1.25rem;
+    margin: 1.75rem 0;
   }
 
   .feature-grid[data-columns="2"] {
@@ -48,24 +48,22 @@ const { columns = 2, carousel = false } = Astro.props;
     }
   }
 
-  /* Carousel mode - horizontal scrolling, full viewport width */
+  /* Carousel mode */
   .feature-grid[data-carousel="true"] {
     display: flex;
     align-items: stretch;
-    gap: 1.5rem;
+    gap: 1.25rem;
     overflow-x: auto;
     overflow-y: hidden;
     scroll-snap-type: x mandatory;
     scroll-behavior: smooth;
     -webkit-overflow-scrolling: touch;
 
-    /* Break out of container to full viewport width */
     width: 100vw;
     margin-left: calc(-50vw + 50%);
-    padding: 1rem 2rem 1.5rem 2rem;
+    padding: 1rem 2rem 1.25rem 2rem;
     box-sizing: border-box;
 
-    /* Hide scrollbar */
     scrollbar-width: none;
     -ms-overflow-style: none;
   }
@@ -75,45 +73,45 @@ const { columns = 2, carousel = false } = Astro.props;
   }
 
   .feature-grid[data-carousel="true"] :global(> *) {
-    flex: 0 0 min(80vw, 300px);
+    flex: 0 0 min(80vw, 280px);
     scroll-snap-align: start;
   }
 
   @media (min-width: 640px) {
     .feature-grid[data-carousel="true"] {
-      padding: 1rem 3rem 1.5rem 3rem;
+      padding: 1rem 3rem 1.25rem 3rem;
     }
 
     .feature-grid[data-carousel="true"] :global(> *) {
-      flex: 0 0 min(45vw, 340px);
+      flex: 0 0 min(45vw, 320px);
     }
   }
 
   @media (min-width: 1024px) {
     .feature-grid[data-carousel="true"] {
-      padding: 1rem 4rem 1.5rem 4rem;
+      padding: 1rem 4rem 1.25rem 4rem;
     }
 
     .feature-grid[data-carousel="true"] :global(> *) {
-      flex: 0 0 min(30vw, 360px);
+      flex: 0 0 min(30vw, 340px);
     }
   }
 
-  /* Entry animations */
+  /* Entry animations - subtle fade and slide */
   .feature-grid:not([data-carousel="true"]) :global(> *) {
     opacity: 0;
-    transform: translateY(12px);
-    animation: cardEntry 0.5s ease forwards;
+    transform: translateY(8px);
+    animation: gridItemEntry 0.4s cubic-bezier(0.4, 0, 0.2, 1) forwards;
   }
 
-  .feature-grid:not([data-carousel="true"]) :global(> *:nth-child(1)) { animation-delay: 0.05s; }
-  .feature-grid:not([data-carousel="true"]) :global(> *:nth-child(2)) { animation-delay: 0.1s; }
-  .feature-grid:not([data-carousel="true"]) :global(> *:nth-child(3)) { animation-delay: 0.15s; }
-  .feature-grid:not([data-carousel="true"]) :global(> *:nth-child(4)) { animation-delay: 0.2s; }
-  .feature-grid:not([data-carousel="true"]) :global(> *:nth-child(5)) { animation-delay: 0.25s; }
-  .feature-grid:not([data-carousel="true"]) :global(> *:nth-child(6)) { animation-delay: 0.3s; }
+  .feature-grid:not([data-carousel="true"]) :global(> *:nth-child(1)) { animation-delay: 0.04s; }
+  .feature-grid:not([data-carousel="true"]) :global(> *:nth-child(2)) { animation-delay: 0.08s; }
+  .feature-grid:not([data-carousel="true"]) :global(> *:nth-child(3)) { animation-delay: 0.12s; }
+  .feature-grid:not([data-carousel="true"]) :global(> *:nth-child(4)) { animation-delay: 0.16s; }
+  .feature-grid:not([data-carousel="true"]) :global(> *:nth-child(5)) { animation-delay: 0.20s; }
+  .feature-grid:not([data-carousel="true"]) :global(> *:nth-child(6)) { animation-delay: 0.24s; }
 
-  @keyframes cardEntry {
+  @keyframes gridItemEntry {
     to {
       opacity: 1;
       transform: translateY(0);

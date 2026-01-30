@@ -1,26 +1,30 @@
 ---
 title: Introduction
-description: What is CrumbleCracker and what can you do with it?
+description: What CrumbleCracker does and why it matters
 ---
 
-CrumbleCracker is a lightweight virtualization platform that runs OCI containers inside virtual machines. It combines the convenience of Docker images with the security of hardware-level isolation.
+CrumbleCracker runs OCI containers inside lightweight virtual machines. You get the convenience of Docker images with hardware-level isolation—each container runs in its own VM with its own kernel.
 
-## What is CrumbleCracker?
+## The Problem With Containers
 
-CrumbleCracker takes standard container images (the same ones you use with Docker) and runs them inside lightweight virtual machines. Each VM has its own Linux kernel and uses your platform's native hypervisor for hardware-level isolation.
+Standard containers share your host kernel. That's what makes them fast, but it's also what makes them vulnerable. Container escapes are a real and recurring threat. When containers share a kernel, a single vulnerability can compromise everything.
 
-**Key characteristics:**
+CrumbleCracker takes a different approach: **every container gets its own VM**.
 
-- **Container-compatible**: Pull images from Docker Hub, GitHub Container Registry, or any OCI registry
-- **Hardware isolation**: Each VM runs in a separate virtual machine, not just a namespace
-- **Native performance**: Uses platform hypervisors (macOS Hypervisor.framework, Linux KVM, Windows WHP)
-- **Go-native API**: Program VMs using familiar patterns from `os`, `os/exec`, and `net` packages
+## How It Works
+
+When you run a container with CrumbleCracker:
+
+1. **Pull**: Download the image from Docker Hub or any OCI registry—same images you already use
+2. **Boot**: Start a lightweight VM with its own Linux kernel
+3. **Run**: Execute your workload inside the VM
+4. **Isolate**: If something goes wrong, it hits the hypervisor, not your host
+
+The result is the familiar container workflow with VM-grade security boundaries.
 
 ## Use Cases
 
-### Sandboxed Code Execution
-
-Run untrusted code in isolated environments:
+**Sandboxed code execution**: Run untrusted code without risk. Each execution gets its own VM that's destroyed when done.
 
 ```go
 instance, _ := cc.New(source, cc.WithTimeout(30*time.Second))
@@ -30,47 +34,41 @@ instance.WriteFile("/code/script.py", userCode, 0644)
 output, _ := instance.Command("python3", "/code/script.py").Output()
 ```
 
-### Development Environments
+**CI/CD runners**: Build and test in isolated environments. No contamination between jobs, no persistent state to clean up.
 
-Test code in clean, reproducible environments without affecting your host system.
+**Development environments**: Test Linux software from macOS or Windows. Reproduce production environments locally without affecting your host.
 
-### CI/CD Runners
-
-Build isolated test runners with stronger isolation than containers alone.
-
-### Cross-Platform Testing
-
-Test Linux software from macOS or Windows development machines.
+**Multi-tenant systems**: Give each tenant their own VM. Isolation is enforced by hardware, not trust in namespace boundaries.
 
 ## Two Products
 
-### CrumbleCracker App (ccapp)
+### CrumbleCracker App
 
-A GUI desktop application for running VMs interactively. It provides:
+A desktop application for running VMs interactively:
 
-- Visual launcher for installed VMs
-- Terminal interface for running sessions
-- Easy installation of Docker images as VM bundles
+- Visual launcher for managing VM bundles
+- Full terminal interface for running sessions
+- Easy installation from Docker images
 - Cross-architecture support via QEMU emulation
 
-Perfect for developers who want to quickly spin up and interact with containerized environments.
+Best for developers who want to quickly spin up and interact with containerized environments.
 
-[Learn more about ccapp →](/app/overview/)
+[Learn more about the App →](/app/overview/)
 
 ### Go API
 
-A programming library for embedding VMs in Go applications. Use it to:
+A programming library for embedding VMs in Go applications:
 
-- Execute code in sandboxed environments
-- Build custom container tooling
-- Create isolated test harnesses
-- Implement secure multi-tenant systems
+- API mirrors `os`, `os/exec`, and `net` packages
+- Full filesystem, command, and networking support
+- Snapshots for fast cold starts
+- GPU passthrough for compute workloads
 
-The API is designed to feel natural to Go developers, mirroring standard library patterns.
+Best for building automated systems that need strong isolation.
 
 [Learn more about the API →](/api/overview/)
 
-## Supported Platforms
+## Platform Support
 
 | Platform | Hypervisor | Architectures |
 |----------|------------|---------------|
@@ -78,9 +76,9 @@ The API is designed to feel natural to Go developers, mirroring standard library
 | Linux | KVM | x86_64, arm64 |
 | Windows | Windows Hypervisor Platform | x86_64 |
 
-Cross-architecture execution (e.g., running arm64 images on x86_64 hosts) is supported via QEMU user-mode emulation.
+Cross-architecture execution (running arm64 images on x86_64 or vice versa) is supported via QEMU user-mode emulation.
 
 ## Next Steps
 
-- [Install CrumbleCracker](/getting-started/installation/)
-- [Try the Quick Start tutorial](/getting-started/quick-start/)
+- [Install CrumbleCracker](/getting-started/installation/) on your machine
+- [Build your first VM](/getting-started/quick-start/) in the Quick Start tutorial

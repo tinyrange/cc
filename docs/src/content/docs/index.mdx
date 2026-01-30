@@ -1,16 +1,16 @@
 ---
 title: CrumbleCracker
-description: Fast, lightweight virtualization for running containers as VMs
+description: Containers with Kernels. Fast cross-platform unprivileged sandboxes for any application.
 template: splash
 hero:
-  tagline: Run containers as lightweight virtual machines with hardware-level isolation
+  tagline: Containers with Kernels. Fast cross-platform unprivileged sandboxes for any application.
   image:
     file: ../../assets/logo.svg
   actions:
     - text: Get Started
       link: /getting-started/introduction/
       icon: right-arrow
-    - text: View on GitHub
+    - text: GitHub
       link: https://github.com/tinyrange/cc
       icon: external
       variant: minimal
@@ -23,66 +23,66 @@ import ActionCard from '../../components/ActionCard.astro';
 
 ## Why CrumbleCracker?
 
-CrumbleCracker runs OCI containers inside lightweight virtual machines, combining the convenience of container images with the security of hardware virtualization.
+Containers share your kernel. That's fast, but it's also a security boundary that keeps getting breached. CrumbleCracker gives you **real isolation**—each workload runs in its own virtual machine with its own kernel—while keeping the container workflow you already know.
 
 <FeatureGrid columns={4}>
-  <FeatureCard title="Container Compatible" icon="🐳" color="blue">
-    Pull any Docker or OCI image and run it directly. No conversion needed.
+  <FeatureCard title="Same Images, Real Isolation" icon="🐳" color="blue">
+    Pull from Docker Hub or any OCI registry. No conversion, no special builds. Your existing images work out of the box.
   </FeatureCard>
-  <FeatureCard title="Hardware Isolation" icon="🔒" color="purple">
-    Each VM runs with its own kernel, providing true isolation via your platform's native hypervisor.
+  <FeatureCard title="Hardware Security Boundaries" icon="🔒" color="purple">
+    Each VM runs its own Linux kernel. A container escape hits a hypervisor, not your host. That's the difference between "oops" and "breach."
   </FeatureCard>
-  <FeatureCard title="Go-Native API" icon="⚡" color="green">
-    Program VMs using familiar Go patterns. The API mirrors `os`, `os/exec`, and `net` packages.
+  <FeatureCard title="Go-Native Programming" icon="⚡" color="green">
+    The API mirrors `os`, `os/exec`, and `net`. If you know Go, you already know how to use it. No new paradigms to learn.
   </FeatureCard>
-  <FeatureCard title="Cross-Platform" icon="🌐" color="orange">
-    Runs on macOS (Hypervisor.framework), Linux (KVM), and Windows (WHP).
+  <FeatureCard title="Native Hypervisors" icon="🌐" color="orange">
+    Hypervisor.framework on macOS, KVM on Linux, WHP on Windows. Your platform's fastest virtualization, automatically.
   </FeatureCard>
 </FeatureGrid>
 
-## Two Ways to Use CrumbleCracker
+## Choose Your Interface
 
 <FeatureGrid columns={2}>
-  <LinkCard title="CrumbleCracker App" href="/app/overview/" icon="🚀" color="cyan">
-    A GUI desktop application for running VMs interactively. Perfect for development, testing, and exploring container images.
+  <LinkCard title="CrumbleCracker App" href="/app/overview/" icon="🖥️" color="cyan">
+    Desktop application for interactive VM management. Spin up containers visually, access full terminal sessions, and manage your development environments without touching the command line.
   </LinkCard>
-  <LinkCard title="Go API" href="/api/overview/" icon="🧩" color="magenta">
-    A programming library for embedding VMs in your Go applications. Build sandboxed code execution, CI runners, or custom tooling.
+  <LinkCard title="Go API" href="/api/overview/" icon="📦" color="magenta">
+    Embed VMs directly in your Go applications. Build sandboxed code execution, isolated CI runners, or secure multi-tenant systems with a familiar, idiomatic interface.
   </LinkCard>
 </FeatureGrid>
 
-## Quick Example
+## See It In Action
 
 ```go
 package main
 
 import (
+    "context"
     "fmt"
     cc "github.com/tinyrange/cc"
 )
 
 func main() {
-    // Create OCI client and pull an image
     client, _ := cc.NewOCIClient()
-    source, _ := client.Pull(ctx, "alpine:latest")
+    source, _ := client.Pull(context.Background(), "alpine:latest")
 
-    // Start a VM from the image
+    // Boot a VM from a container image
     instance, _ := cc.New(source, cc.WithMemoryMB(256))
     defer instance.Close()
 
-    // Run a command (mirrors os/exec)
-    output, _ := instance.Command("echo", "Hello from VM!").Output()
+    // Run commands exactly like os/exec
+    output, _ := instance.Command("cat", "/etc/os-release").Output()
     fmt.Println(string(output))
 }
 ```
 
-## Next Steps
+## Get Started
 
 <FeatureGrid columns={2}>
-  <ActionCard title="Installation" href="/getting-started/installation/" icon="⚙️" color="blue">
-    Get CrumbleCracker running on your machine.
+  <ActionCard title="Install CrumbleCracker" href="/getting-started/installation/" icon="⚙️" color="blue">
+    Set up the CLI, desktop app, or Go library on your machine.
   </ActionCard>
-  <ActionCard title="Quick Start" href="/getting-started/quick-start/" icon="📖" color="green">
-    Build your first VM in under 5 minutes.
+  <ActionCard title="Build Your First VM" href="/getting-started/quick-start/" icon="🚀" color="green">
+    Pull an image, boot a VM, and run commands in under 5 minutes.
   </ActionCard>
 </FeatureGrid>

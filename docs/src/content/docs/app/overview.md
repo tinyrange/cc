@@ -1,98 +1,96 @@
 ---
-title: CrumbleCracker App Overview
-description: Introduction to the ccapp desktop application
+title: App Overview
+description: The CrumbleCracker desktop application
 ---
 
-CrumbleCracker App (ccapp) is a GUI desktop application for running virtual machines. It provides a visual interface for managing and interacting with VMs built from container images.
+CrumbleCracker App is a desktop application for running VMs interactively. It provides a visual interface for managing VMs built from container images—no code required.
 
-## Features
+## What It Does
 
-- **Visual VM Launcher**: Browse and launch installed VMs from a graphical interface
-- **Terminal Mode**: Full terminal interface for interactive sessions
-- **Multiple Input Sources**: Create VMs from Docker images, OCI tarballs, or bundle directories
-- **Cross-Architecture Support**: Run arm64 images on x86_64 and vice versa via QEMU emulation
-- **Auto-Update**: Automatic updates to the latest version
-- **Recent VMs**: Quick access to recently used VMs
+- **Visual VM launcher**: Browse and launch VMs from a graphical interface
+- **Full terminal access**: Interactive terminal sessions inside running VMs
+- **Multiple image sources**: Create VMs from Docker images, OCI tarballs, or bundle directories
+- **Cross-architecture**: Run arm64 images on x86_64 and vice versa via QEMU emulation
 
 ## Main Screens
 
-### Launcher Screen
+### Launcher
 
-The launcher displays all installed VM bundles. Each bundle appears as a card showing:
+The launcher displays installed VM bundles. Each bundle shows:
 
-- Bundle name and description
+- Name and description
 - Icon (if configured)
-- Settings button for configuration
+- Settings button
 
-Click a bundle to start the VM.
+Click a bundle to start its VM.
 
-### Terminal Screen
+### Terminal
 
-When a VM is running, ccapp switches to terminal mode. This provides:
+When a VM is running, the app switches to terminal mode:
 
 - Full terminal emulation
 - Keyboard and mouse input
 - Network status indicator
 - Shutdown controls
 
-The terminal uses the Tokyo Night color scheme for comfortable extended use.
+The terminal uses the Tokyo Night color scheme.
 
 ### Custom VM Dialog
 
-Create new VMs from various sources:
+Create new VMs from:
 
 - **Docker Image**: Pull from Docker Hub or any OCI registry
 - **OCI Tarball**: Load from a `.tar` file (docker save format)
 - **Bundle Directory**: Open an existing bundle folder
 
-## Supported Platforms
+## Platform Support
 
 | Platform | Status |
 |----------|--------|
-| macOS (Apple Silicon) | Fully supported |
-| Linux (x86_64) | Fully supported |
-| Linux (arm64) | Fully supported |
-| Windows (x86_64) | Fully supported |
+| macOS (Apple Silicon) | Supported |
+| Linux (x86_64) | Supported |
+| Linux (arm64) | Supported |
+| Windows (x86_64) | Supported |
 
 ## System Requirements
 
-- **macOS**: macOS 11+ with Hypervisor.framework entitlement
+- **macOS**: macOS 11+ with Hypervisor.framework
 - **Linux**: KVM enabled, user in `kvm` group
 - **Windows**: Windows Hypervisor Platform enabled
 
 ## Quick Start
 
-1. **Download** the latest release from GitHub
-2. **Install** the application for your platform
-3. **Launch** ccapp
-4. **Add a VM**: Click "+" and enter a Docker image name (e.g., `alpine:latest`)
-5. **Run**: Click the newly installed bundle to start the VM
+1. Download the latest release from [GitHub](https://github.com/tinyrange/cc/releases)
+2. Install for your platform
+3. Launch the app
+4. Click "+" and enter an image name (e.g., `alpine:latest`)
+5. Click the new bundle to start the VM
 
-## Application Data Locations
+## Data Locations
 
-### Bundles Directory
+### Bundles
 
-Installed VM bundles are stored in the user config directory:
+Installed bundles are stored in:
 
-- macOS: `~/Library/Application Support/ccapp/bundles/`
-- Linux: `~/.config/ccapp/bundles/`
-- Windows: `%APPDATA%\ccapp\bundles\`
+- **macOS**: `~/Library/Application Support/ccapp/bundles/`
+- **Linux**: `~/.config/ccapp/bundles/`
+- **Windows**: `%APPDATA%\ccapp\bundles\`
 
-### Logs Directory
+### Logs
 
-Application logs are written to the cache directory:
+Application logs are written to:
 
-- macOS: `~/Library/Caches/ccapp/`
-- Linux: `~/.cache/ccapp/`
-- Windows: `%LOCALAPPDATA%\ccapp\`
+- **macOS**: `~/Library/Caches/ccapp/`
+- **Linux**: `~/.cache/ccapp/`
+- **Windows**: `%LOCALAPPDATA%\ccapp\`
 
 ### Settings
 
-User settings are stored alongside bundles in `settings.json`.
+User settings are stored in `settings.json` alongside bundles.
 
 ## Next Steps
 
-- [Creating VMs](/app/creating-vms/) - Learn the different ways to create VMs
-- [Terminal Mode](/app/terminal-mode/) - Using the terminal interface
-- [Bundles](/app/bundles/) - Understanding the bundle format
-- [Settings](/app/settings/) - Configure the application
+- [Creating VMs](/app/creating-vms/): Different ways to create VMs
+- [Terminal Mode](/app/terminal-mode/): Using the terminal interface
+- [Bundles](/app/bundles/): Understanding the bundle format
+- [Settings](/app/settings/): Configure the application

@@ -9,19 +9,18 @@ interface Props {
 const { title, href, icon, color = 'blue' } = Astro.props;
 
 const colorMap = {
-  blue: 229,
-  purple: 276,
-  green: 134,
-  orange: 26,
-  cyan: 192,
-  magenta: 322,
+  blue: { hue: 220, sat: 70 },
+  purple: { hue: 265, sat: 60 },
+  green: { hue: 155, sat: 55 },
+  orange: { hue: 25, sat: 75 },
+  cyan: { hue: 195, sat: 70 },
+  magenta: { hue: 330, sat: 55 },
 };
 
-const hue = colorMap[color];
+const colorConfig = colorMap[color];
 ---
 
-<a href={href} class="link-card" style={`--card-hue: ${hue}`}>
-  <div class="link-card-border"></div>
+<a href={href} class="link-card" style={`--card-hue: ${colorConfig.hue}; --card-sat: ${colorConfig.sat}%`}>
   <div class="link-card-inner">
     <div class="link-card-header">
       <span class="link-card-icon">{icon}</span>
@@ -32,144 +31,135 @@ const hue = colorMap[color];
     </div>
     <div class="link-card-footer">
       <span class="link-card-cta">
-        Learn more
-        <svg class="arrow-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        Explore
+        <svg class="arrow-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M5 12h14M12 5l7 7-7 7"/>
         </svg>
       </span>
     </div>
-    <div class="link-card-shine"></div>
   </div>
+  <div class="link-card-border"></div>
+  <div class="link-card-glow"></div>
 </a>
 
 <style>
   .link-card {
-    --card-hue: 229;
+    --card-hue: 220;
+    --card-sat: 70%;
     position: relative;
     display: block;
     text-decoration: none;
-    border-radius: 16px;
+    border-radius: var(--radius-lg, 14px);
   }
 
-  /* Rainbow gradient border - sits behind inner content */
+  /* Inner content */
+  .link-card-inner {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    min-height: 160px;
+    padding: 1.5rem;
+    background: var(--surface-2, #10131a);
+    border: 1px solid var(--border-default, rgba(140, 155, 175, 0.12));
+    border-radius: var(--radius-lg, 14px);
+    transition:
+      border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+      background 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  .link-card:hover .link-card-inner {
+    border-color: hsla(var(--card-hue), var(--card-sat), 56%, 0.3);
+    background: var(--surface-3, #151922);
+  }
+
+  /* Gradient border */
   .link-card-border {
     position: absolute;
     inset: 0;
-    border-radius: 16px;
+    border-radius: var(--radius-lg, 14px);
+    padding: 1px;
     background: linear-gradient(
-      90deg,
-      hsl(229, 80%, 60%) 0%,
-      hsl(276, 80%, 60%) 16.6%,
-      hsl(322, 80%, 60%) 33.3%,
-      hsl(26, 85%, 55%) 50%,
-      hsl(52, 85%, 50%) 66.6%,
-      hsl(89, 75%, 50%) 83.3%,
-      hsl(229, 80%, 60%) 100%
+      135deg,
+      hsla(var(--card-hue), var(--card-sat), 56%, 0.5) 0%,
+      hsla(calc(var(--card-hue) + 40), var(--card-sat), 56%, 0.25) 100%
     );
-    background-size: 200% 100%;
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
     opacity: 0;
-    transition: opacity 0.3s ease;
-    animation: rainbowShift 4s linear infinite;
+    transition: opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    pointer-events: none;
+    z-index: 1;
   }
 
   .link-card:hover .link-card-border {
     opacity: 1;
   }
 
-  @keyframes rainbowShift {
-    0% {
-      background-position: 0% 50%;
-    }
-    100% {
-      background-position: 200% 50%;
-    }
-  }
-
-  /* Inner content area */
-  .link-card-inner {
-    position: relative;
-    display: flex;
-    flex-direction: column;
-    min-height: 180px;
-    padding: 1.75rem;
-    margin: 2px;
-    background: linear-gradient(
-      145deg,
-      rgba(22, 27, 34, 1) 0%,
-      rgba(13, 17, 23, 1) 100%
-    );
-    border: 1px solid rgba(139, 148, 158, 0.15);
-    border-radius: 14px;
-    overflow: hidden;
-    transition: border-color 0.3s ease;
-  }
-
-  .link-card:hover .link-card-inner {
-    border-color: transparent;
-  }
-
-  /* Shine effect - clipped by inner */
-  .link-card-shine {
+  /* Glow effect */
+  .link-card-glow {
     position: absolute;
-    inset: -1.75rem;
-    width: calc(50% + 3.5rem);
-    left: calc(-100% - 1.75rem);
-    background: linear-gradient(
-      90deg,
-      transparent 0%,
-      rgba(255, 255, 255, 0.04) 50%,
-      transparent 100%
+    inset: -15%;
+    background: radial-gradient(
+      circle at 50% 50%,
+      hsla(var(--card-hue), var(--card-sat), 50%, 0.06) 0%,
+      transparent 50%
     );
-    transform: skewX(-20deg);
-    transition: left 0.6s ease;
+    opacity: 0;
+    transition: opacity 0.4s cubic-bezier(0.4, 0, 0.2, 1);
     pointer-events: none;
+    z-index: 0;
   }
 
-  .link-card:hover .link-card-shine {
-    left: calc(150% + 1.75rem);
+  .link-card:hover .link-card-glow {
+    opacity: 1;
   }
 
-  /* Header with icon and title */
+  /* Header */
   .link-card-header {
     display: flex;
     align-items: center;
-    gap: 1rem;
-    margin-bottom: 1rem;
+    gap: 0.875rem;
+    margin-bottom: 0.875rem;
   }
 
   .link-card-icon {
-    font-size: 2rem;
-    filter: drop-shadow(0 0 6px hsla(var(--card-hue), 60%, 50%, 0.3));
-    transition: filter 0.3s ease;
+    font-size: 1.75rem;
+    filter: drop-shadow(0 0 5px hsla(var(--card-hue), var(--card-sat), 50%, 0.2));
+    transition: filter 0.25s ease, transform 0.25s ease;
   }
 
   .link-card:hover .link-card-icon {
-    filter: drop-shadow(0 0 10px hsla(var(--card-hue), 60%, 50%, 0.5));
+    filter: drop-shadow(0 0 8px hsla(var(--card-hue), var(--card-sat), 50%, 0.35));
+    transform: scale(1.06);
   }
 
   .link-card-title {
-    font-size: 1.375rem;
-    font-weight: 700;
-    color: #ffffff;
+    font-family: var(--sl-font-mono, 'IBM Plex Mono', monospace);
+    font-size: 1.125rem;
+    font-weight: 600;
+    color: var(--sl-color-text, #e8edf4);
     margin: 0;
-    letter-spacing: -0.02em;
-    transition: color 0.3s ease;
+    letter-spacing: -0.01em;
+    transition: color 0.25s ease;
   }
 
   .link-card:hover .link-card-title {
-    color: hsl(var(--card-hue), 80%, 75%);
+    color: hsl(var(--card-hue), calc(var(--card-sat) + 10%), 75%);
   }
 
-  /* Body text */
+  /* Body */
   .link-card-body {
-    color: rgba(198, 208, 218, 0.85);
-    font-size: 0.95rem;
+    color: var(--text-secondary, rgba(200, 210, 225, 0.75));
+    font-size: 0.9rem;
     line-height: 1.6;
     flex-grow: 1;
-    margin-bottom: 1rem;
+    margin-bottom: 0.875rem;
   }
 
-  /* Footer with CTA */
+  /* Footer */
   .link-card-footer {
     display: flex;
     align-items: center;
@@ -178,62 +168,61 @@ const hue = colorMap[color];
   .link-card-cta {
     display: inline-flex;
     align-items: center;
-    gap: 0.5rem;
-    font-size: 0.9rem;
+    gap: 0.4rem;
+    font-size: 0.85rem;
     font-weight: 600;
-    color: hsl(var(--card-hue), 70%, 65%);
-    transition: gap 0.3s ease, color 0.3s ease;
+    color: hsl(var(--card-hue), calc(var(--card-sat) - 5%), 62%);
+    transition: gap 0.25s ease, color 0.25s ease;
   }
 
   .link-card:hover .link-card-cta {
-    gap: 0.75rem;
-    color: hsl(var(--card-hue), 80%, 75%);
+    gap: 0.6rem;
+    color: hsl(var(--card-hue), var(--card-sat), 72%);
   }
 
   .arrow-icon {
-    transition: transform 0.3s ease;
+    transition: transform 0.25s ease;
   }
 
   .link-card:hover .arrow-icon {
-    transform: translateX(4px);
+    transform: translateX(3px);
   }
 
   /* Light theme */
   :global(:root[data-theme='light']) .link-card-inner {
-    background: linear-gradient(
-      145deg,
-      rgba(255, 255, 255, 0.98) 0%,
-      rgba(246, 248, 250, 1) 100%
-    );
-    border-color: rgba(0, 0, 0, 0.08);
+    background: var(--surface-1, #ffffff);
+    border-color: var(--border-default, rgba(0, 20, 50, 0.1));
+  }
+
+  :global(:root[data-theme='light']) .link-card:hover .link-card-inner {
+    background: var(--surface-2, #f8f9fb);
   }
 
   :global(:root[data-theme='light']) .link-card-title {
-    color: #1f2328;
+    color: var(--sl-color-text, #1a1f28);
   }
 
   :global(:root[data-theme='light']) .link-card:hover .link-card-title {
-    color: hsl(var(--card-hue), 70%, 40%);
+    color: hsl(var(--card-hue), calc(var(--card-sat) - 10%), 40%);
   }
 
   :global(:root[data-theme='light']) .link-card-body {
-    color: rgba(31, 35, 40, 0.8);
+    color: var(--text-secondary, rgba(30, 40, 60, 0.7));
   }
 
   :global(:root[data-theme='light']) .link-card-cta {
-    color: hsl(var(--card-hue), 70%, 45%);
+    color: hsl(var(--card-hue), calc(var(--card-sat) - 15%), 45%);
   }
 
   :global(:root[data-theme='light']) .link-card:hover .link-card-cta {
-    color: hsl(var(--card-hue), 80%, 35%);
+    color: hsl(var(--card-hue), calc(var(--card-sat) - 10%), 38%);
   }
 
-  :global(:root[data-theme='light']) .link-card-shine {
-    background: linear-gradient(
-      90deg,
-      transparent 0%,
-      rgba(0, 0, 0, 0.02) 50%,
-      transparent 100%
+  :global(:root[data-theme='light']) .link-card-glow {
+    background: radial-gradient(
+      circle at 50% 50%,
+      hsla(var(--card-hue), var(--card-sat), 50%, 0.04) 0%,
+      transparent 50%
     );
   }
 </style>

@@ -1,23 +1,23 @@
 ---
 title: API Overview
-description: Introduction to the CrumbleCracker Go API
+description: The CrumbleCracker Go API at a glance
 ---
 
-The CrumbleCracker Go API lets you create and manage virtual machines programmatically. It's designed to feel familiar to Go developers by mirroring standard library patterns.
+The CrumbleCracker Go API lets you create and manage VMs programmatically. It's designed to feel like the Go standard library—if you know `os`, `os/exec`, and `net`, you already know how to use it.
 
-## Design Philosophy
+## Design Principles
 
-The API is built around three core principles:
+**Mirror the standard library**: Filesystem operations work like `os`. Command execution works like `os/exec`. Networking works like `net`. No new paradigms.
 
-1. **Mirror the standard library**: Filesystem operations mirror `os`, command execution mirrors `os/exec`, and networking mirrors `net`
-2. **Explicit over implicit**: No hidden state or global configuration
-3. **Composition**: Build complex workflows from simple primitives
+**Explicit over implicit**: No hidden state or global configuration. Everything is passed explicitly.
+
+**Composition**: Build complex workflows from simple primitives.
 
 ## Core Types
 
 ### Instance
 
-An `Instance` represents a running virtual machine. It embeds three interfaces:
+An `Instance` represents a running VM. It embeds three interfaces:
 
 ```go
 type Instance interface {
@@ -35,7 +35,7 @@ type Instance interface {
 
 ### FS (Filesystem)
 
-The `FS` interface provides filesystem operations that mirror the `os` package:
+The `FS` interface mirrors the `os` package:
 
 ```go
 type FS interface {
@@ -49,13 +49,13 @@ type FS interface {
     Mkdir(name string, perm fs.FileMode) error
     MkdirAll(path string, perm fs.FileMode) error
     ReadDir(name string) ([]fs.DirEntry, error)
-    // ... more
+    // ...
 }
 ```
 
 ### Exec (Command Execution)
 
-The `Exec` interface provides command execution that mirrors `os/exec`:
+The `Exec` interface mirrors `os/exec`:
 
 ```go
 type Exec interface {
@@ -67,7 +67,7 @@ type Exec interface {
 
 ### Net (Networking)
 
-The `Net` interface provides network operations that mirror the `net` package:
+The `Net` interface mirrors the `net` package:
 
 ```go
 type Net interface {
@@ -87,11 +87,11 @@ client, err := cc.NewOCIClient()
 // 2. Pull an image
 source, err := client.Pull(ctx, "alpine:latest")
 
-// 3. Create an instance
+// 3. Create a VM
 instance, err := cc.New(source, cc.WithMemoryMB(256))
 defer instance.Close()
 
-// 4. Use the instance
+// 4. Use it like you would use os, os/exec, and net
 output, err := instance.Command("echo", "hello").Output()
 err = instance.WriteFile("/tmp/test.txt", data, 0644)
 conn, err := instance.Dial("tcp", "example.com:80")
@@ -105,7 +105,7 @@ Import the package:
 import cc "github.com/tinyrange/cc"
 ```
 
-All public types and functions are exported from the main `cc` package. The API surface is intentionally small:
+The API surface is intentionally small:
 
 - **Constructors**: `New`, `NewOCIClient`, `NewFilesystemSnapshotFactory`
 - **Options**: `WithMemoryMB`, `WithTimeout`, `WithUser`, etc.
@@ -113,7 +113,7 @@ All public types and functions are exported from the main `cc` package. The API 
 
 ## Error Handling
 
-Errors follow Go conventions. The package provides sentinel errors for common conditions:
+Sentinel errors for common conditions:
 
 ```go
 var (
@@ -124,7 +124,7 @@ var (
 )
 ```
 
-Use `errors.Is()` to check for specific errors:
+Check with `errors.Is()`:
 
 ```go
 if errors.Is(err, cc.ErrHypervisorUnavailable) {
@@ -134,7 +134,7 @@ if errors.Is(err, cc.ErrHypervisorUnavailable) {
 
 ## Next Steps
 
-- [Creating Instances](/api/creating-instances/) - Learn about instance creation and options
-- [Filesystem Operations](/api/filesystem/) - Work with files in VMs
-- [Command Execution](/api/commands/) - Run programs and capture output
-- [Networking](/api/networking/) - Connect to and from VMs
+- [Creating Instances](/api/creating-instances/): VM creation and configuration
+- [Filesystem](/api/filesystem/): Working with files in VMs
+- [Commands](/api/commands/): Running programs and capturing output
+- [Networking](/api/networking/): Connecting to and from VMs

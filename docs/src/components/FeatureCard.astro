@@ -8,256 +8,188 @@ interface Props {
 const { title, icon, color = 'blue' } = Astro.props;
 
 const colorMap = {
-  blue: { hue: 229, gradient: 'from-blue-500 to-indigo-600' },
-  purple: { hue: 276, gradient: 'from-purple-500 to-violet-600' },
-  green: { hue: 134, gradient: 'from-emerald-500 to-green-600' },
-  orange: { hue: 26, gradient: 'from-orange-500 to-amber-600' },
-  cyan: { hue: 192, gradient: 'from-cyan-500 to-teal-600' },
-  magenta: { hue: 322, gradient: 'from-pink-500 to-rose-600' },
+  blue: { hue: 220, sat: 70 },
+  purple: { hue: 265, sat: 60 },
+  green: { hue: 155, sat: 55 },
+  orange: { hue: 25, sat: 75 },
+  cyan: { hue: 195, sat: 70 },
+  magenta: { hue: 330, sat: 55 },
 };
 
 const colorConfig = colorMap[color];
 ---
 
-<div class="feature-card" data-color={color} style={`--card-hue: ${colorConfig.hue}`}>
-  <div class="card-glow"></div>
-  <div class="card-border"></div>
+<div class="feature-card" data-color={color} style={`--card-hue: ${colorConfig.hue}; --card-sat: ${colorConfig.sat}%`}>
   <div class="card-content">
     <div class="card-icon">
       <span class="icon-symbol">{icon}</span>
-      <div class="icon-ring"></div>
-      <div class="icon-ring icon-ring-2"></div>
     </div>
     <h3 class="card-title">{title}</h3>
     <div class="card-description">
       <slot />
     </div>
-    <div class="card-shine"></div>
   </div>
+  <div class="card-border"></div>
+  <div class="card-glow"></div>
 </div>
 
 <style>
   .feature-card {
-    --card-hue: 229;
+    --card-hue: 220;
+    --card-sat: 70%;
     position: relative;
-    border-radius: 16px;
-    background: transparent;
+    border-radius: var(--radius-lg, 14px);
     display: flex;
     flex-direction: column;
   }
 
-  /* Glow effect behind card - allowed to extend */
-  .card-glow {
-    position: absolute;
-    top: -30%;
-    left: -30%;
-    right: -30%;
-    bottom: -30%;
-    background: radial-gradient(
-      circle at 50% 50%,
-      hsla(var(--card-hue), 70%, 50%, 0.12) 0%,
-      transparent 60%
-    );
-    opacity: 0;
-    transition: opacity 0.4s ease;
-    pointer-events: none;
-    z-index: -1;
+  /* Main content area */
+  .card-content {
+    position: relative;
+    z-index: 2;
+    background: var(--surface-2, #10131a);
+    border-radius: var(--radius-lg, 14px);
+    padding: 1.5rem;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    border: 1px solid var(--border-default, rgba(140, 155, 175, 0.12));
+    transition:
+      border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+      background 0.25s cubic-bezier(0.4, 0, 0.2, 1);
   }
 
-  .feature-card:hover .card-glow {
-    opacity: 1;
+  .feature-card:hover .card-content {
+    border-color: hsla(var(--card-hue), var(--card-sat), 56%, 0.3);
+    background: var(--surface-3, #151922);
   }
 
-  /* Rainbow gradient border - sits behind content */
+  /* Gradient border effect */
   .card-border {
     position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    border-radius: 16px;
+    inset: 0;
+    border-radius: var(--radius-lg, 14px);
+    padding: 1px;
     background: linear-gradient(
-      90deg,
-      hsl(229, 80%, 60%) 0%,
-      hsl(276, 80%, 60%) 16.6%,
-      hsl(322, 80%, 60%) 33.3%,
-      hsl(26, 85%, 55%) 50%,
-      hsl(52, 85%, 50%) 66.6%,
-      hsl(89, 75%, 50%) 83.3%,
-      hsl(229, 80%, 60%) 100%
+      135deg,
+      hsla(var(--card-hue), var(--card-sat), 56%, 0.4) 0%,
+      hsla(calc(var(--card-hue) + 40), var(--card-sat), 56%, 0.2) 100%
     );
-    background-size: 200% 100%;
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
     opacity: 0;
-    transition: opacity 0.4s ease;
-    animation: rainbowShift 4s linear infinite;
+    transition: opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    pointer-events: none;
+    z-index: 1;
   }
 
   .feature-card:hover .card-border {
     opacity: 1;
   }
 
-  @keyframes rainbowShift {
-    0% {
-      background-position: 0% 50%;
-    }
-    100% {
-      background-position: 200% 50%;
-    }
-  }
-
-  /* Main card content area - clips all internal effects */
-  .card-content {
-    position: relative;
-    background: linear-gradient(
-      165deg,
-      rgba(22, 27, 34, 1) 0%,
-      rgba(13, 17, 23, 1) 100%
-    );
-    border-radius: 14px;
-    padding: 1.5rem;
-    margin: 2px;
-    display: flex;
-    flex-direction: column;
-    flex: 1;
-    overflow: hidden;
-    border: 1px solid rgba(139, 148, 158, 0.15);
-    transition: border-color 0.3s ease;
-  }
-
-  .feature-card:hover .card-content {
-    border-color: transparent;
-  }
-
-  /* Shine effect - inside card-content so it clips properly */
-  .card-shine {
+  /* Subtle glow effect */
+  .card-glow {
     position: absolute;
-    inset: -2rem;
-    width: calc(60% + 4rem);
-    left: calc(-100% - 2rem);
-    background: linear-gradient(
-      90deg,
-      transparent 0%,
-      rgba(255, 255, 255, 0.05) 50%,
-      transparent 100%
+    inset: -20%;
+    background: radial-gradient(
+      circle at 50% 50%,
+      hsla(var(--card-hue), var(--card-sat), 50%, 0.06) 0%,
+      transparent 50%
     );
-    transform: skewX(-20deg);
-    transition: left 0.7s ease;
-    pointer-events: none;
-  }
-
-  .feature-card:hover .card-shine {
-    left: calc(150% + 2rem);
-  }
-
-  /* Icon container */
-  .card-icon {
-    position: relative;
-    width: 56px;
-    height: 56px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    margin-bottom: 1.25rem;
-  }
-
-  .icon-symbol {
-    font-size: 1.75rem;
-    position: relative;
-    z-index: 2;
-    filter: drop-shadow(0 0 8px hsla(var(--card-hue), 70%, 50%, 0.4));
-    transition: filter 0.3s ease;
-  }
-
-  .feature-card:hover .icon-symbol {
-    filter: drop-shadow(0 0 12px hsla(var(--card-hue), 70%, 50%, 0.6));
-  }
-
-  /* Subtle ring around icon */
-  .icon-ring {
-    position: absolute;
-    inset: -4px;
-    border: 1px solid hsla(var(--card-hue), 60%, 50%, 0.2);
-    border-radius: 50%;
     opacity: 0;
-    transition: opacity 0.3s ease;
+    transition: opacity 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+    pointer-events: none;
+    z-index: 0;
   }
 
-  .icon-ring-2 {
-    display: none;
-  }
-
-  .feature-card:hover .icon-ring {
+  .feature-card:hover .card-glow {
     opacity: 1;
   }
 
-  /* Card title */
+  /* Icon */
+  .card-icon {
+    position: relative;
+    width: 48px;
+    height: 48px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 1rem;
+  }
+
+  .icon-symbol {
+    font-size: 1.625rem;
+    position: relative;
+    z-index: 2;
+    filter: drop-shadow(0 0 6px hsla(var(--card-hue), var(--card-sat), 50%, 0.25));
+    transition: filter 0.3s ease, transform 0.3s ease;
+  }
+
+  .feature-card:hover .icon-symbol {
+    filter: drop-shadow(0 0 10px hsla(var(--card-hue), var(--card-sat), 50%, 0.4));
+    transform: scale(1.08);
+  }
+
+  /* Title */
   .card-title {
-    font-size: 1.25rem;
-    font-weight: 700;
-    color: #ffffff;
-    margin: 0 0 0.75rem 0;
-    letter-spacing: -0.02em;
-    transition: color 0.3s ease;
+    font-family: var(--sl-font-mono, 'IBM Plex Mono', monospace);
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--sl-color-text, #e8edf4);
+    margin: 0 0 0.625rem 0;
+    letter-spacing: -0.01em;
+    line-height: 1.35;
+    transition: color 0.25s ease;
   }
 
   .feature-card:hover .card-title {
-    background: linear-gradient(
-      90deg,
-      hsl(var(--card-hue), 80%, 70%) 0%,
-      hsl(calc(var(--card-hue) + 60), 80%, 70%) 100%
-    );
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    background-clip: text;
+    color: hsl(var(--card-hue), calc(var(--card-sat) + 10%), 75%);
   }
 
-  /* Card description */
+  /* Description */
   .card-description {
-    color: rgba(198, 208, 218, 0.85);
-    font-size: 0.95rem;
+    color: var(--text-secondary, rgba(200, 210, 225, 0.75));
+    font-size: 0.9rem;
     line-height: 1.6;
     flex-grow: 1;
   }
 
   .card-description :global(code) {
-    background: rgba(110, 118, 129, 0.3);
-    padding: 0.15em 0.4em;
+    background: rgba(120, 130, 150, 0.2);
+    padding: 0.125em 0.35em;
     border-radius: 4px;
     font-size: 0.85em;
   }
 
-  /* Light theme adjustments */
+  /* Light theme */
   :global(:root[data-theme='light']) .card-content {
-    background: linear-gradient(
-      165deg,
-      rgba(255, 255, 255, 0.98) 0%,
-      rgba(246, 248, 250, 1) 100%
-    );
-    border-color: rgba(0, 0, 0, 0.08);
+    background: var(--surface-1, #ffffff);
+    border-color: var(--border-default, rgba(0, 20, 50, 0.1));
+  }
+
+  :global(:root[data-theme='light']) .feature-card:hover .card-content {
+    background: var(--surface-2, #f8f9fb);
   }
 
   :global(:root[data-theme='light']) .card-title {
-    color: #1f2328;
+    color: var(--sl-color-text, #1a1f28);
+  }
+
+  :global(:root[data-theme='light']) .feature-card:hover .card-title {
+    color: hsl(var(--card-hue), calc(var(--card-sat) - 10%), 40%);
   }
 
   :global(:root[data-theme='light']) .card-description {
-    color: rgba(31, 35, 40, 0.8);
+    color: var(--text-secondary, rgba(30, 40, 60, 0.7));
   }
 
   :global(:root[data-theme='light']) .card-glow {
     background: radial-gradient(
       circle at 50% 50%,
-      hsla(var(--card-hue), 70%, 50%, 0.08) 0%,
-      transparent 60%
-    );
-  }
-
-  :global(:root[data-theme='light']) .card-shine {
-    background: linear-gradient(
-      90deg,
-      transparent 0%,
-      rgba(0, 0, 0, 0.02) 50%,
-      transparent 100%
+      hsla(var(--card-hue), var(--card-sat), 50%, 0.04) 0%,
+      transparent 50%
     );
   }
 </style>

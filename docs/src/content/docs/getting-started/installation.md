@@ -1,57 +1,61 @@
 ---
 title: Installation
-description: Install CrumbleCracker on your machine
+description: Get CrumbleCracker running on your machine
 ---
 
-CrumbleCracker can be installed as a desktop application (ccapp) or as a Go library for programmatic use.
+CrumbleCracker is available as a desktop application or as a Go library. Choose based on how you want to use it.
 
 ## CrumbleCracker App
 
+The desktop application provides a visual interface for managing VMs.
+
 ### macOS
 
-Download the latest `.zip` from the [GitHub releases page](https://github.com/tinyrange/cc/releases) and extract it. Move the app to your Applications folder or run it directly.
-
-On first launch, macOS may require you to approve the app in System Preferences → Security & Privacy.
+1. Download the latest `.zip` from [GitHub Releases](https://github.com/tinyrange/cc/releases)
+2. Extract and move to Applications (or run directly)
+3. On first launch, approve the app in **System Preferences → Security & Privacy** if prompted
 
 ### Linux
 
-Download the binary from the [GitHub releases page](https://github.com/tinyrange/cc/releases) and make it executable:
+1. Download the binary from [GitHub Releases](https://github.com/tinyrange/cc/releases)
+2. Make it executable and run:
 
 ```bash
 chmod +x ccapp
 ./ccapp
 ```
 
-Ensure KVM is enabled:
+3. Ensure KVM is available:
 
 ```bash
-# Check KVM availability
+# Check KVM device exists
 ls -la /dev/kvm
 
-# Add your user to the kvm group if needed
+# Add yourself to the kvm group if needed
 sudo usermod -aG kvm $USER
 # Log out and back in for the group change to take effect
 ```
 
 ### Windows
 
-Download the binary from the [GitHub releases page](https://github.com/tinyrange/cc/releases) and run it. You may need to enable Windows Hypervisor Platform:
-
-1. Open "Turn Windows features on or off"
-2. Enable "Windows Hypervisor Platform"
-3. Restart your computer
+1. Download the binary from [GitHub Releases](https://github.com/tinyrange/cc/releases)
+2. Enable Windows Hypervisor Platform:
+   - Open "Turn Windows features on or off"
+   - Check "Windows Hypervisor Platform"
+   - Restart your computer
+3. Run the binary
 
 ## Go Library
 
-Add CrumbleCracker to your Go project:
+Add the library to your project:
 
 ```bash
 go get github.com/tinyrange/cc
 ```
 
-### macOS Code Signing
+### macOS: Hypervisor Entitlement
 
-On macOS, executables that use the hypervisor must be signed with the hypervisor entitlement. For development and testing, use `EnsureExecutableIsSigned()`:
+Executables using the hypervisor must be signed with the hypervisor entitlement. For development, CrumbleCracker provides a helper:
 
 ```go
 func TestMain(m *testing.M) {
@@ -62,7 +66,7 @@ func TestMain(m *testing.M) {
 }
 ```
 
-This automatically signs the test binary with the required entitlement and re-executes it. For production builds, sign your binary properly with:
+This automatically signs the test binary and re-executes it. For production builds, sign properly:
 
 ```bash
 codesign --entitlements entitlements.plist -s - your-binary
@@ -81,19 +85,20 @@ Where `entitlements.plist` contains:
 </plist>
 ```
 
-### Linux Permissions
+### Linux: KVM Access
 
-On Linux, your program needs access to `/dev/kvm`:
+Your program needs read/write access to `/dev/kvm`:
 
 ```bash
-# Option 1: Add user to kvm group
+# Recommended: add user to kvm group
 sudo usermod -aG kvm $USER
+# Log out and back in
 
-# Option 2: Run with sudo (not recommended for production)
+# Alternative: run with sudo (not recommended for production)
 sudo ./your-program
 ```
 
-### Verifying Installation
+### Verify Installation
 
 Test that the hypervisor is available:
 
@@ -101,29 +106,29 @@ Test that the hypervisor is available:
 if err := cc.SupportsHypervisor(); err != nil {
     log.Fatal("Hypervisor unavailable:", err)
 }
-fmt.Println("Hypervisor is ready!")
+fmt.Println("Ready to create VMs")
 ```
 
-## Building from Source
+## Building From Source
 
-Clone the repository and use the build tool:
+Clone and build with the included build tool:
 
 ```bash
 git clone https://github.com/tinyrange/cc.git
 cd cc
 
-# Build the cc CLI and ccapp
+# Build CLI and desktop app
 ./tools/build.go
 
 # Run tests
 ./tools/build.go -test ./...
 
-# Build and run ccapp
+# Build and launch the desktop app
 ./tools/build.go -app
 ```
 
 ## Next Steps
 
-- [Try the Quick Start tutorial](/getting-started/quick-start/)
-- [Learn about the Go API](/api/overview/)
-- [Explore ccapp features](/app/overview/)
+- [Quick Start](/getting-started/quick-start/): Build your first VM
+- [Go API Overview](/api/overview/): Learn the programming interface
+- [App Overview](/app/overview/): Explore the desktop application

@@ -1,24 +1,24 @@
 ---
 title: Quick Start
-description: Build your first VM with CrumbleCracker
+description: Boot your first VM in under 5 minutes
 ---
 
-This tutorial shows you how to create and run a VM using the CrumbleCracker Go API. You'll pull a container image, start a VM, and execute commands inside it.
+This tutorial walks you through creating and running a VM using the CrumbleCracker Go API. You'll pull a container image, boot a VM, and run commands inside it.
 
 ## Prerequisites
 
 - Go 1.21 or later
-- Hypervisor support enabled (see [Installation](/getting-started/installation/))
+- Hypervisor enabled ([see Installation](/getting-started/installation/))
 
-## Hello World
-
-Create a new Go project:
+## Create a Project
 
 ```bash
 mkdir hello-cc && cd hello-cc
 go mod init hello-cc
 go get github.com/tinyrange/cc
 ```
+
+## Write the Code
 
 Create `main.go`:
 
@@ -36,7 +36,7 @@ import (
 )
 
 func main() {
-    // On macOS, ensure the binary is signed with hypervisor entitlement
+    // On macOS, handle hypervisor entitlement
     if err := cc.EnsureExecutableIsSigned(); err != nil {
         log.Fatalf("Failed to sign executable: %v", err)
     }
@@ -51,21 +51,21 @@ func run() error {
     ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
     defer cancel()
 
-    // Create an OCI client to pull images
+    // Create an OCI client
     client, err := cc.NewOCIClient()
     if err != nil {
         return fmt.Errorf("creating client: %w", err)
     }
 
-    // Pull Alpine Linux (a small, fast-booting image)
+    // Pull Alpine (small and fast to boot)
     fmt.Println("Pulling alpine:latest...")
     source, err := client.Pull(ctx, "alpine:latest")
     if err != nil {
         return fmt.Errorf("pulling image: %w", err)
     }
 
-    // Create a VM from the image
-    fmt.Println("Starting VM...")
+    // Create a VM
+    fmt.Println("Booting VM...")
     instance, err := cc.New(source,
         cc.WithMemoryMB(128),
         cc.WithTimeout(30*time.Second),
@@ -75,7 +75,7 @@ func run() error {
     }
     defer instance.Close()
 
-    // Run a command inside the VM
+    // Run a command
     fmt.Println("Running command...")
     output, err := instance.Command("echo", "Hello from CrumbleCracker!").Output()
     if err != nil {
@@ -87,50 +87,44 @@ func run() error {
 }
 ```
 
-Run it:
+## Run It
 
 ```bash
 go run main.go
 ```
 
-You should see:
+Expected output:
 
 ```
 Pulling alpine:latest...
-Starting VM...
+Booting VM...
 Running command...
 Output: Hello from CrumbleCracker!
 ```
 
-## What Just Happened?
+## What Happened
 
-1. **Pull**: The OCI client downloaded the Alpine Linux container image from Docker Hub
-2. **Boot**: A lightweight VM started with its own Linux kernel
-3. **Execute**: The `echo` command ran inside the VM and output was captured
-4. **Cleanup**: The VM was shut down when `Close()` was called
+1. **Pull**: Downloaded Alpine Linux from Docker Hub
+2. **Boot**: Started a lightweight VM with its own Linux kernel
+3. **Execute**: Ran `echo` inside the VM and captured output
+4. **Cleanup**: Shut down the VM when `Close()` was called
 
-## Working with Files
+## Working With Files
 
-You can read and write files in the VM's filesystem:
+Read and write files in the VM's filesystem:
 
 ```go
 // Write a file
 err := instance.WriteFile("/tmp/hello.txt", []byte("Hello!"), 0644)
-if err != nil {
-    return err
-}
 
 // Read it back
 content, err := instance.ReadFile("/tmp/hello.txt")
-if err != nil {
-    return err
-}
 fmt.Println(string(content)) // "Hello!"
 
 // Create directories
 err = instance.MkdirAll("/app/data", 0755)
 
-// List directory contents
+// List contents
 entries, err := instance.ReadDir("/tmp")
 for _, entry := range entries {
     fmt.Println(entry.Name())
@@ -146,7 +140,6 @@ source, _ := client.Pull(ctx, "python:3.12-slim")
 instance, _ := cc.New(source, cc.WithMemoryMB(256))
 defer instance.Close()
 
-// Write a Python script
 script := `
 import sys
 print(f"Python {sys.version}")
@@ -154,26 +147,21 @@ print("2 + 2 =", 2 + 2)
 `
 instance.WriteFile("/app/script.py", []byte(script), 0644)
 
-// Run it
 output, _ := instance.Command("python3", "/app/script.py").Output()
 fmt.Println(string(output))
 ```
 
-## Capturing Exit Codes
-
-Check the exit status of commands:
+## Checking Exit Codes
 
 ```go
 cmd := instance.Command("sh", "-c", "exit 42")
 err := cmd.Run()
 if err != nil {
-    fmt.Printf("Command failed with exit code: %d\n", cmd.ExitCode())
+    fmt.Printf("Exit code: %d\n", cmd.ExitCode())
 }
 ```
 
-## Setting Environment Variables
-
-Pass environment variables to commands:
+## Environment Variables
 
 ```go
 cmd := instance.Command("sh", "-c", "echo $MY_VAR")
@@ -184,7 +172,7 @@ fmt.Println(string(output)) // "hello"
 
 ## Next Steps
 
-- [Learn about the filesystem interface](/api/filesystem/)
-- [Explore command execution](/api/commands/)
-- [Work with OCI images](/api/oci-images/)
-- [Use filesystem snapshots for faster startup](/api/snapshots/)
+- [Filesystem Operations](/api/filesystem/): Full file manipulation API
+- [Command Execution](/api/commands/): Streaming, stdin, and more
+- [OCI Images](/api/oci-images/): Working with registries and images
+- [Snapshots](/api/snapshots/): Fast startup with filesystem snapshots

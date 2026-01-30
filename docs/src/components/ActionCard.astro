@@ -9,121 +9,89 @@ interface Props {
 const { title, href, icon, color = 'blue' } = Astro.props;
 
 const colorMap = {
-  blue: 229,
-  purple: 276,
-  green: 134,
-  orange: 26,
-  cyan: 192,
-  magenta: 322,
+  blue: { hue: 220, sat: 70 },
+  purple: { hue: 265, sat: 60 },
+  green: { hue: 155, sat: 55 },
+  orange: { hue: 25, sat: 75 },
+  cyan: { hue: 195, sat: 70 },
+  magenta: { hue: 330, sat: 55 },
 };
 
-const hue = colorMap[color];
+const colorConfig = colorMap[color];
 ---
 
-<a href={href} class="action-card" style={`--card-hue: ${hue}`}>
-  <div class="action-card-border"></div>
+<a href={href} class="action-card" style={`--card-hue: ${colorConfig.hue}; --card-sat: ${colorConfig.sat}%`}>
   <div class="action-card-inner">
     <div class="action-icon-wrap">
       <span class="action-icon">{icon}</span>
-      <div class="icon-pulse"></div>
     </div>
     <div class="action-content">
       <h4 class="action-title">{title}</h4>
       <p class="action-desc"><slot /></p>
     </div>
     <div class="action-arrow">
-      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M5 12h14M12 5l7 7-7 7"/>
       </svg>
     </div>
-    <div class="action-shine"></div>
   </div>
+  <div class="action-card-border"></div>
 </a>
 
 <style>
   .action-card {
-    --card-hue: 229;
+    --card-hue: 220;
+    --card-sat: 70%;
     position: relative;
     display: block;
     text-decoration: none;
-    border-radius: 14px;
+    border-radius: var(--radius-md, 10px);
   }
 
-  /* Rainbow gradient border - sits behind inner content */
+  /* Inner content */
+  .action-card-inner {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 1rem 1.25rem;
+    background: var(--surface-2, #10131a);
+    border: 1px solid var(--border-default, rgba(140, 155, 175, 0.12));
+    border-radius: var(--radius-md, 10px);
+    transition:
+      border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+      background 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  .action-card:hover .action-card-inner {
+    border-color: hsla(var(--card-hue), var(--card-sat), 56%, 0.3);
+    background: var(--surface-3, #151922);
+  }
+
+  /* Gradient border */
   .action-card-border {
     position: absolute;
     inset: 0;
-    border-radius: 14px;
+    border-radius: var(--radius-md, 10px);
+    padding: 1px;
     background: linear-gradient(
-      90deg,
-      hsl(229, 80%, 60%) 0%,
-      hsl(276, 80%, 60%) 16.6%,
-      hsl(322, 80%, 60%) 33.3%,
-      hsl(26, 85%, 55%) 50%,
-      hsl(52, 85%, 50%) 66.6%,
-      hsl(89, 75%, 50%) 83.3%,
-      hsl(229, 80%, 60%) 100%
+      135deg,
+      hsla(var(--card-hue), var(--card-sat), 56%, 0.4) 0%,
+      hsla(calc(var(--card-hue) + 40), var(--card-sat), 56%, 0.2) 100%
     );
-    background-size: 200% 100%;
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
     opacity: 0;
-    transition: opacity 0.3s ease;
-    animation: rainbowShift 4s linear infinite;
+    transition: opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    pointer-events: none;
+    z-index: 1;
   }
 
   .action-card:hover .action-card-border {
     opacity: 1;
-  }
-
-  @keyframes rainbowShift {
-    0% {
-      background-position: 0% 50%;
-    }
-    100% {
-      background-position: 200% 50%;
-    }
-  }
-
-  .action-card-inner {
-    position: relative;
-    display: flex;
-    align-items: center;
-    gap: 1.25rem;
-    padding: 1.25rem 1.5rem;
-    margin: 2px;
-    background: linear-gradient(
-      135deg,
-      rgba(22, 27, 34, 1) 0%,
-      rgba(13, 17, 23, 1) 100%
-    );
-    border: 1px solid rgba(139, 148, 158, 0.12);
-    border-radius: 12px;
-    overflow: hidden;
-    transition: border-color 0.3s ease;
-  }
-
-  .action-card:hover .action-card-inner {
-    border-color: transparent;
-  }
-
-  /* Shine effect */
-  .action-shine {
-    position: absolute;
-    inset: -1.25rem;
-    width: calc(50% + 2.5rem);
-    left: calc(-100% - 1.25rem);
-    background: linear-gradient(
-      90deg,
-      transparent 0%,
-      rgba(255, 255, 255, 0.04) 50%,
-      transparent 100%
-    );
-    transform: skewX(-20deg);
-    transition: left 0.5s ease;
-    pointer-events: none;
-  }
-
-  .action-card:hover .action-shine {
-    left: calc(150% + 1.25rem);
   }
 
   /* Icon */
@@ -133,41 +101,15 @@ const hue = colorMap[color];
   }
 
   .action-icon {
-    font-size: 1.75rem;
+    font-size: 1.5rem;
     display: block;
-    filter: drop-shadow(0 0 8px hsla(var(--card-hue), 60%, 50%, 0.4));
-    transition: transform 0.3s ease;
+    filter: drop-shadow(0 0 6px hsla(var(--card-hue), var(--card-sat), 50%, 0.25));
+    transition: transform 0.25s ease, filter 0.25s ease;
   }
 
   .action-card:hover .action-icon {
-    transform: scale(1.15);
-  }
-
-  .icon-pulse {
-    position: absolute;
-    inset: -8px;
-    border: 2px solid hsla(var(--card-hue), 60%, 50%, 0.3);
-    border-radius: 50%;
-    opacity: 0;
-    transform: scale(0.8);
-    transition: all 0.3s ease;
-  }
-
-  .action-card:hover .icon-pulse {
-    opacity: 1;
-    transform: scale(1);
-    animation: pulse 1.5s ease-in-out infinite;
-  }
-
-  @keyframes pulse {
-    0%, 100% {
-      opacity: 1;
-      transform: scale(1);
-    }
-    50% {
-      opacity: 0.5;
-      transform: scale(1.1);
-    }
+    transform: scale(1.1);
+    filter: drop-shadow(0 0 8px hsla(var(--card-hue), var(--card-sat), 50%, 0.4));
   }
 
   /* Content */
@@ -177,65 +119,65 @@ const hue = colorMap[color];
   }
 
   .action-title {
-    font-size: 1.1rem;
-    font-weight: 700;
-    color: #ffffff;
-    margin: 0 0 0.25rem 0;
-    letter-spacing: -0.01em;
-    transition: color 0.3s ease;
+    font-family: var(--sl-font-mono, 'IBM Plex Mono', monospace);
+    font-size: 0.9375rem;
+    font-weight: 600;
+    color: var(--sl-color-text, #e8edf4);
+    margin: 0 0 0.2rem 0;
+    letter-spacing: -0.005em;
+    transition: color 0.25s ease;
   }
 
   .action-card:hover .action-title {
-    color: hsl(var(--card-hue), 80%, 75%);
+    color: hsl(var(--card-hue), calc(var(--card-sat) + 10%), 75%);
   }
 
   .action-desc {
-    font-size: 0.875rem;
-    color: rgba(198, 208, 218, 0.7);
+    font-size: 0.8125rem;
+    color: var(--text-secondary, rgba(200, 210, 225, 0.65));
     margin: 0;
-    line-height: 1.4;
+    line-height: 1.45;
   }
 
   /* Arrow */
   .action-arrow {
     flex-shrink: 0;
-    color: rgba(139, 148, 158, 0.5);
-    transition: all 0.3s ease;
+    color: var(--text-tertiary, rgba(160, 175, 195, 0.5));
+    transition: all 0.25s ease;
   }
 
   .action-card:hover .action-arrow {
-    color: hsl(var(--card-hue), 70%, 65%);
-    transform: translateX(4px);
+    color: hsl(var(--card-hue), calc(var(--card-sat) - 5%), 62%);
+    transform: translateX(3px);
   }
 
   /* Light theme */
   :global(:root[data-theme='light']) .action-card-inner {
-    background: linear-gradient(
-      135deg,
-      rgba(255, 255, 255, 0.98) 0%,
-      rgba(246, 248, 250, 1) 100%
-    );
-    border-color: rgba(0, 0, 0, 0.08);
+    background: var(--surface-1, #ffffff);
+    border-color: var(--border-default, rgba(0, 20, 50, 0.1));
+  }
+
+  :global(:root[data-theme='light']) .action-card:hover .action-card-inner {
+    background: var(--surface-2, #f8f9fb);
   }
 
   :global(:root[data-theme='light']) .action-title {
-    color: #1f2328;
+    color: var(--sl-color-text, #1a1f28);
   }
 
   :global(:root[data-theme='light']) .action-card:hover .action-title {
-    color: hsl(var(--card-hue), 70%, 40%);
+    color: hsl(var(--card-hue), calc(var(--card-sat) - 10%), 40%);
   }
 
   :global(:root[data-theme='light']) .action-desc {
-    color: rgba(31, 35, 40, 0.7);
+    color: var(--text-secondary, rgba(30, 40, 60, 0.65));
   }
 
-  :global(:root[data-theme='light']) .action-shine {
-    background: linear-gradient(
-      90deg,
-      transparent 0%,
-      rgba(0, 0, 0, 0.02) 50%,
-      transparent 100%
-    );
+  :global(:root[data-theme='light']) .action-arrow {
+    color: var(--text-tertiary, rgba(60, 75, 100, 0.45));
+  }
+
+  :global(:root[data-theme='light']) .action-card:hover .action-arrow {
+    color: hsl(var(--card-hue), calc(var(--card-sat) - 15%), 45%);
   }
 </style>
