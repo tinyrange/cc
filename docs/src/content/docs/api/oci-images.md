@@ -329,5 +329,5 @@ func loadOffline(exportDir, imageName string) (cc.InstanceSource, error) {
 
 ## Next Steps
 
-- [Filesystem Snapshots](/api/snapshots/) - Cache modified filesystems
-- [Creating Instances](/api/creating-instances/) - Start VMs from images
+- [Filesystem Snapshots](/cc/api/snapshots/) - Cache modified filesystems
+- [Creating Instances](/cc/api/creating-instances/) - Start VMs from images

@@ -53,7 +53,7 @@ A desktop application for running VMs interactively:
 
 Best for developers who want to quickly spin up and interact with containerized environments.
 
-[Learn more about the App →](/app/overview/)
+[Learn more about the App →](/cc/app/overview/)
 
 ### Go API
 
@@ -65,7 +65,7 @@ A programming library for embedding VMs in Go applications:
 
 Best for building automated systems that need strong isolation.
 
-[Learn more about the API →](/api/overview/)
+[Learn more about the API →](/cc/api/overview/)
 
 ## Platform Support
 
@@ -79,5 +79,5 @@ Cross-architecture execution (running arm64 images on x86_64 or vice versa) is s
 
 ## Next Steps
 
-- [Install CrumbleCracker](/getting-started/installation/) on your machine
-- [Build your first VM](/getting-started/quick-start/) in the Quick Start tutorial
+- [Install CrumbleCracker](/cc/getting-started/installation/) on your machine
+- [Build your first VM](/cc/getting-started/quick-start/) in the Quick Start tutorial

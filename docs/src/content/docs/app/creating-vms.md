@@ -121,5 +121,5 @@ Check that:
 
 ## Next Steps
 
-- [Terminal Mode](/app/terminal-mode/) - Using the running VM
-- [Bundles](/app/bundles/) - Customizing bundle configuration
+- [Terminal Mode](/cc/app/terminal-mode/) - Using the running VM
+- [Bundles](/cc/app/bundles/) - Customizing bundle configuration

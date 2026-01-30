@@ -302,5 +302,5 @@ func deploy(instance cc.Instance, appDir string) error {
 
 ## Next Steps
 
-- [Command Execution](/api/commands/) - Run programs in the VM
-- [Filesystem Snapshots](/api/snapshots/) - Save and restore filesystem state
+- [Command Execution](/cc/api/commands/) - Run programs in the VM
+- [Filesystem Snapshots](/cc/api/snapshots/) - Save and restore filesystem state

@@ -163,5 +163,5 @@ This updates the virtio-console device so the guest sees the correct terminal di
 
 ## Next Steps
 
-- [Instance Options](/reference/options/) - All GPU-related options
-- [ccapp Overview](/app/overview/) - GUI application with built-in GPU support
+- [Instance Options](/cc/reference/options/) - All GPU-related options
+- [ccapp Overview](/cc/app/overview/) - GUI application with built-in GPU support

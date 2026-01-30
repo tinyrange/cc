@@ -268,5 +268,5 @@ Use `WithDockerfileCacheDir` to persist the cache across runs.
 
 ## Next Steps
 
-- [Snapshots](/api/snapshots/) - Cache built images as snapshots
-- [Creating Instances](/api/creating-instances/) - Start VMs from Dockerfile builds
+- [Snapshots](/cc/api/snapshots/) - Cache built images as snapshots
+- [Creating Instances](/cc/api/creating-instances/) - Start VMs from Dockerfile builds

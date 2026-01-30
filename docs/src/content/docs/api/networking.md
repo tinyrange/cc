@@ -269,5 +269,5 @@ defer instance.Close()
 
 ## Next Steps
 
-- [OCI Images](/api/oci-images/) - Pull and manage container images
-- [Options Reference](/reference/options/) - Network-related options
+- [OCI Images](/cc/api/oci-images/) - Pull and manage container images
+- [Options Reference](/cc/reference/options/) - Network-related options

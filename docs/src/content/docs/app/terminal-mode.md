@@ -158,5 +158,5 @@ If keyboard input doesn't register:
 
 ## Next Steps
 
-- [Bundles](/app/bundles/) - Customize VM configuration
-- [Settings](/app/settings/) - Configure application preferences
+- [Bundles](/cc/app/bundles/) - Customize VM configuration
+- [Settings](/cc/app/settings/) - Configure application preferences

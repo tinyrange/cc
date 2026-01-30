@@ -230,5 +230,5 @@ This is set automatically if not specified.
 
 ## Next Steps
 
-- [Settings](/app/settings/) - Application configuration
-- [Creating VMs](/app/creating-vms/) - Adding new VMs
+- [Settings](/cc/app/settings/) - Application configuration
+- [Creating VMs](/cc/app/creating-vms/) - Adding new VMs

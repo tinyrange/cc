@@ -90,7 +90,7 @@ User settings are stored in `settings.json` alongside bundles.
 
 ## Next Steps
 
-- [Creating VMs](/app/creating-vms/): Different ways to create VMs
-- [Terminal Mode](/app/terminal-mode/): Using the terminal interface
-- [Bundles](/app/bundles/): Understanding the bundle format
-- [Settings](/app/settings/): Configure the application
+- [Creating VMs](/cc/app/creating-vms/): Different ways to create VMs
+- [Terminal Mode](/cc/app/terminal-mode/): Using the terminal interface
+- [Bundles](/cc/app/bundles/): Understanding the bundle format
+- [Settings](/cc/app/settings/): Configure the application

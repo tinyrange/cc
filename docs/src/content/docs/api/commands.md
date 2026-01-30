@@ -321,5 +321,5 @@ func runPythonREPL(instance cc.Instance) error {
 
 ## Next Steps
 
-- [Networking](/api/networking/) - Connect to network services
-- [Environment Variables Reference](/reference/options/) - All command options
+- [Networking](/cc/api/networking/) - Connect to network services
+- [Environment Variables Reference](/cc/reference/options/) - All command options
