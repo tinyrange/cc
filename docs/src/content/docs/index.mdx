@@ -23,20 +23,20 @@ import ActionCard from '../../components/ActionCard.astro';
 
 ## Why CrumbleCracker?
 
-Containers share your kernel. That's fast, but it's also a security boundary that keeps getting breached. CrumbleCracker gives you **real isolation**—each workload runs in its own virtual machine with its own kernel—while keeping the container workflow you already know.
+Containers share the host kernel. That's efficient, but it's also a security boundary with a history of breakouts. CrumbleCracker runs each workload in its own virtual machine with a dedicated kernel, while staying compatible with standard container tooling.
 
 <FeatureGrid columns={4}>
   <FeatureCard title="Same Images, Real Isolation" icon="🐳" color="blue">
     Pull from Docker Hub or any OCI registry. No conversion, no special builds. Your existing images work out of the box.
   </FeatureCard>
   <FeatureCard title="Hardware Security Boundaries" icon="🔒" color="purple">
-    Each VM runs its own Linux kernel. A container escape hits a hypervisor, not your host. That's the difference between "oops" and "breach."
+    Each VM runs its own Linux kernel. An escape hits the hypervisor, not your host.
   </FeatureCard>
   <FeatureCard title="Go-Native Programming" icon="⚡" color="green">
-    The API mirrors `os`, `os/exec`, and `net`. If you know Go, you already know how to use it. No new paradigms to learn.
+    The API mirrors `os`, `os/exec`, and `net`—no new abstractions to learn.
   </FeatureCard>
   <FeatureCard title="Native Hypervisors" icon="🌐" color="orange">
-    Hypervisor.framework on macOS, KVM on Linux, WHP on Windows. Your platform's fastest virtualization, automatically.
+    Hypervisor.framework on macOS, KVM on Linux, WHP on Windows. Uses each platform's native virtualization with no extra configuration.
   </FeatureCard>
 </FeatureGrid>
 
@@ -80,9 +80,9 @@ func main() {
 
 <FeatureGrid columns={2}>
   <ActionCard title="Install CrumbleCracker" href="/getting-started/installation/" icon="⚙️" color="blue">
-    Set up the CLI, desktop app, or Go library on your machine.
+    Set up the desktop app and discover fast accessible virtualization for all your systems.
   </ActionCard>
-  <ActionCard title="Build Your First VM" href="/getting-started/quick-start/" icon="🚀" color="green">
-    Pull an image, boot a VM, and run commands in under 5 minutes.
+  <ActionCard title="Learn the Go library" href="/getting-started/quick-start/" icon="🚀" color="green">
+     Make your first Sandbox and build cross-platform sandboxes in no time.
   </ActionCard>
 </FeatureGrid>

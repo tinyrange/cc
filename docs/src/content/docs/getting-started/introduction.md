@@ -62,7 +62,6 @@ A programming library for embedding VMs in Go applications:
 - API mirrors `os`, `os/exec`, and `net` packages
 - Full filesystem, command, and networking support
 - Snapshots for fast cold starts
-- GPU passthrough for compute workloads
 
 Best for building automated systems that need strong isolation.
 
@@ -74,7 +73,7 @@ Best for building automated systems that need strong isolation.
 |----------|------------|---------------|
 | macOS | Hypervisor.framework | arm64 |
 | Linux | KVM | x86_64, arm64 |
-| Windows | Windows Hypervisor Platform | x86_64 |
+| Windows | Windows Hypervisor Platform | x86_64, arm64 |
 
 Cross-architecture execution (running arm64 images on x86_64 or vice versa) is supported via QEMU user-mode emulation.
 

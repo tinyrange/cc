@@ -7,7 +7,7 @@ This tutorial walks you through creating and running a VM using the CrumbleCrack
 
 ## Prerequisites
 
-- Go 1.21 or later
+- Go 1.24 or later
 - Hypervisor enabled ([see Installation](/getting-started/installation/))
 
 ## Create a Project
