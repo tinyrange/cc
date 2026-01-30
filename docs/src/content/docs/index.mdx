@@ -1,0 +1,88 @@
+---
+title: CrumbleCracker
+description: Containers with Kernels. Fast cross-platform unprivileged sandboxes for any application.
+template: splash
+hero:
+  tagline: Containers with Kernels. Fast cross-platform unprivileged sandboxes for any application.
+  image:
+    file: ../../assets/logo.svg
+  actions:
+    - text: Get Started
+      link: /getting-started/introduction/
+      icon: right-arrow
+    - text: GitHub
+      link: https://github.com/tinyrange/cc
+      icon: external
+      variant: minimal
+---
+
+import FeatureCard from '../../components/FeatureCard.astro';
+import FeatureGrid from '../../components/FeatureGrid.astro';
+import LinkCard from '../../components/LinkCard.astro';
+import ActionCard from '../../components/ActionCard.astro';
+
+## Why CrumbleCracker?
+
+Containers share the host kernel. That's efficient, but it's also a security boundary with a history of breakouts. CrumbleCracker runs each workload in its own virtual machine with a dedicated kernel, while staying compatible with standard container tooling.
+
+<FeatureGrid columns={4}>
+  <FeatureCard title="Same Images, Real Isolation" icon="🐳" color="blue">
+    Pull from Docker Hub or any OCI registry. No conversion, no special builds. Your existing images work out of the box.
+  </FeatureCard>
+  <FeatureCard title="Hardware Security Boundaries" icon="🔒" color="purple">
+    Each VM runs its own Linux kernel. An escape hits the hypervisor, not your host.
+  </FeatureCard>
+  <FeatureCard title="Go-Native Programming" icon="⚡" color="green">
+    The API mirrors `os`, `os/exec`, and `net`—no new abstractions to learn.
+  </FeatureCard>
+  <FeatureCard title="Native Hypervisors" icon="🌐" color="orange">
+    Hypervisor.framework on macOS, KVM on Linux, WHP on Windows. Uses each platform's native virtualization with no extra configuration.
+  </FeatureCard>
+</FeatureGrid>
+
+## Choose Your Interface
+
+<FeatureGrid columns={2}>
+  <LinkCard title="CrumbleCracker App" href="/app/overview/" icon="🖥️" color="cyan">
+    Desktop application for interactive VM management. Spin up containers visually, access full terminal sessions, and manage your development environments without touching the command line.
+  </LinkCard>
+  <LinkCard title="Go API" href="/api/overview/" icon="📦" color="magenta">
+    Embed VMs directly in your Go applications. Build sandboxed code execution, isolated CI runners, or secure multi-tenant systems with a familiar, idiomatic interface.
+  </LinkCard>
+</FeatureGrid>
+
+## See It In Action
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    cc "github.com/tinyrange/cc"
+)
+
+func main() {
+    client, _ := cc.NewOCIClient()
+    source, _ := client.Pull(context.Background(), "alpine:latest")
+
+    // Boot a VM from a container image
+    instance, _ := cc.New(source, cc.WithMemoryMB(256))
+    defer instance.Close()
+
+    // Run commands exactly like os/exec
+    output, _ := instance.Command("cat", "/etc/os-release").Output()
+    fmt.Println(string(output))
+}
+```
+
+## Get Started
+
+<FeatureGrid columns={2}>
+  <ActionCard title="Install CrumbleCracker" href="/getting-started/installation/" icon="⚙️" color="blue">
+    Set up the desktop app and discover fast accessible virtualization for all your systems.
+  </ActionCard>
+  <ActionCard title="Learn the Go library" href="/getting-started/quick-start/" icon="🚀" color="green">
+     Make your first Sandbox and build cross-platform sandboxes in no time.
+  </ActionCard>
+</FeatureGrid>

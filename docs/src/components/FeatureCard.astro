@@ -1,0 +1,195 @@
+---
+interface Props {
+  title: string;
+  icon: string;
+  color?: 'blue' | 'purple' | 'green' | 'orange' | 'cyan' | 'magenta';
+}
+
+const { title, icon, color = 'blue' } = Astro.props;
+
+const colorMap = {
+  blue: { hue: 220, sat: 70 },
+  purple: { hue: 265, sat: 60 },
+  green: { hue: 155, sat: 55 },
+  orange: { hue: 25, sat: 75 },
+  cyan: { hue: 195, sat: 70 },
+  magenta: { hue: 330, sat: 55 },
+};
+
+const colorConfig = colorMap[color];
+---
+
+<div class="feature-card" data-color={color} style={`--card-hue: ${colorConfig.hue}; --card-sat: ${colorConfig.sat}%`}>
+  <div class="card-content">
+    <div class="card-icon">
+      <span class="icon-symbol">{icon}</span>
+    </div>
+    <h3 class="card-title">{title}</h3>
+    <div class="card-description">
+      <slot />
+    </div>
+  </div>
+  <div class="card-border"></div>
+  <div class="card-glow"></div>
+</div>
+
+<style>
+  .feature-card {
+    --card-hue: 220;
+    --card-sat: 70%;
+    position: relative;
+    border-radius: var(--radius-lg, 14px);
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* Main content area */
+  .card-content {
+    position: relative;
+    z-index: 2;
+    background: var(--surface-2, #10131a);
+    border-radius: var(--radius-lg, 14px);
+    padding: 1.5rem;
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    border: 1px solid var(--border-default, rgba(140, 155, 175, 0.12));
+    transition:
+      border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+      background 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  .feature-card:hover .card-content {
+    border-color: hsla(var(--card-hue), var(--card-sat), 56%, 0.3);
+    background: var(--surface-3, #151922);
+  }
+
+  /* Gradient border effect */
+  .card-border {
+    position: absolute;
+    inset: 0;
+    border-radius: var(--radius-lg, 14px);
+    padding: 1px;
+    background: linear-gradient(
+      135deg,
+      hsla(var(--card-hue), var(--card-sat), 56%, 0.4) 0%,
+      hsla(calc(var(--card-hue) + 40), var(--card-sat), 56%, 0.2) 100%
+    );
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    opacity: 0;
+    transition: opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  .feature-card:hover .card-border {
+    opacity: 1;
+  }
+
+  /* Subtle glow effect */
+  .card-glow {
+    position: absolute;
+    inset: -20%;
+    background: radial-gradient(
+      circle at 50% 50%,
+      hsla(var(--card-hue), var(--card-sat), 50%, 0.06) 0%,
+      transparent 50%
+    );
+    opacity: 0;
+    transition: opacity 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .feature-card:hover .card-glow {
+    opacity: 1;
+  }
+
+  /* Icon */
+  .card-icon {
+    position: relative;
+    width: 48px;
+    height: 48px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 1rem;
+  }
+
+  .icon-symbol {
+    font-size: 1.625rem;
+    position: relative;
+    z-index: 2;
+    filter: drop-shadow(0 0 6px hsla(var(--card-hue), var(--card-sat), 50%, 0.25));
+    transition: filter 0.3s ease, transform 0.3s ease;
+  }
+
+  .feature-card:hover .icon-symbol {
+    filter: drop-shadow(0 0 10px hsla(var(--card-hue), var(--card-sat), 50%, 0.4));
+    transform: scale(1.08);
+  }
+
+  /* Title */
+  .card-title {
+    font-family: var(--sl-font-mono, 'IBM Plex Mono', monospace);
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--sl-color-text, #e8edf4);
+    margin: 0 0 0.625rem 0;
+    letter-spacing: -0.01em;
+    line-height: 1.35;
+    transition: color 0.25s ease;
+  }
+
+  .feature-card:hover .card-title {
+    color: hsl(var(--card-hue), calc(var(--card-sat) + 10%), 75%);
+  }
+
+  /* Description */
+  .card-description {
+    color: var(--text-secondary, rgba(200, 210, 225, 0.75));
+    font-size: 0.9rem;
+    line-height: 1.6;
+    flex-grow: 1;
+  }
+
+  .card-description :global(code) {
+    background: rgba(120, 130, 150, 0.2);
+    padding: 0.125em 0.35em;
+    border-radius: 4px;
+    font-size: 0.85em;
+  }
+
+  /* Light theme */
+  :global(:root[data-theme='light']) .card-content {
+    background: var(--surface-1, #ffffff);
+    border-color: var(--border-default, rgba(0, 20, 50, 0.1));
+  }
+
+  :global(:root[data-theme='light']) .feature-card:hover .card-content {
+    background: var(--surface-2, #f8f9fb);
+  }
+
+  :global(:root[data-theme='light']) .card-title {
+    color: var(--sl-color-text, #1a1f28);
+  }
+
+  :global(:root[data-theme='light']) .feature-card:hover .card-title {
+    color: hsl(var(--card-hue), calc(var(--card-sat) - 10%), 40%);
+  }
+
+  :global(:root[data-theme='light']) .card-description {
+    color: var(--text-secondary, rgba(30, 40, 60, 0.7));
+  }
+
+  :global(:root[data-theme='light']) .card-glow {
+    background: radial-gradient(
+      circle at 50% 50%,
+      hsla(var(--card-hue), var(--card-sat), 50%, 0.04) 0%,
+      transparent 50%
+    );
+  }
+</style>

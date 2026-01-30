@@ -54,10 +54,10 @@ Examples:
 
 ### Fast unit tests (host Go tests)
 
-Run Go unit tests via `tools/build.go`:
+Run Go unit tests via `go test`:
 
-- **All packages**: `./tools/build.go -test ./...`
-- **Single package**: `./tools/build.go -test ./internal/netstack`
+- **All packages**: `go test ./...`
+- **Single package**: `go test ./internal/netstack`
 
 ### Quest (bringup quest + minimal Linux boot check)
 
@@ -117,22 +117,3 @@ Notes:
 - Docker is required to build the image tar (but `tools/build.go` will reuse `build/test-<name>.tar` if the context hasn’t changed).
 - If you pass `cc` flags (like `-gpu`) you need `--` so `tools/build.go` doesn’t try to parse them.
 - `tools/build.go` uses `CC_CACHE_DIR` (or the default `~/Library/Application Support/cc/oci`-style config dir) when managing image extraction cache.
-
-### Benchmarks
-
-Run all Go benchmarks and store results under `benchmarks/<hostid>/benchmark_<UTC>.njson`:
-
-- `./tools/build.go -bench`
-
-## Remote execution (optional)
-
-`tools/build.go` supports running `quest`/`bringup`/`bringup-gpu` on a remote host alias from `local/remotes.json` via `remotectl`:
-
-- `./tools/build.go -quest -remote <alias>`
-- `./tools/build.go -bringup -remote <alias>`
-- `./tools/build.go -bringup-gpu -remote <alias>`
-
-Constraints:
-
-- `-remote` only works with `-quest`, `-bringup`, or `-bringup-gpu`
-- `-remote` cannot be combined with `-cross`

@@ -1,0 +1,133 @@
+---
+interface Props {
+  columns?: 2 | 3 | 4;
+  carousel?: boolean;
+}
+
+const { columns = 2, carousel = false } = Astro.props;
+---
+
+<div class="feature-grid not-content" data-columns={columns} data-carousel={carousel}>
+  <slot />
+</div>
+
+<style>
+  .feature-grid {
+    display: grid;
+    gap: 1.25rem;
+    margin: 1.75rem 0;
+  }
+
+  .feature-grid[data-columns="2"] {
+    grid-template-columns: repeat(1, 1fr);
+  }
+
+  .feature-grid[data-columns="3"] {
+    grid-template-columns: repeat(1, 1fr);
+  }
+
+  .feature-grid[data-columns="4"] {
+    grid-template-columns: repeat(1, 1fr);
+  }
+
+  @media (min-width: 640px) {
+    .feature-grid[data-columns="2"],
+    .feature-grid[data-columns="3"],
+    .feature-grid[data-columns="4"] {
+      grid-template-columns: repeat(2, 1fr);
+    }
+  }
+
+  @media (min-width: 1024px) {
+    .feature-grid[data-columns="3"] {
+      grid-template-columns: repeat(3, 1fr);
+    }
+
+    .feature-grid[data-columns="4"] {
+      grid-template-columns: repeat(4, 1fr);
+    }
+  }
+
+  /* Carousel mode */
+  .feature-grid[data-carousel="true"] {
+    display: flex;
+    align-items: stretch;
+    gap: 1.25rem;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scroll-snap-type: x mandatory;
+    scroll-behavior: smooth;
+    -webkit-overflow-scrolling: touch;
+
+    width: 100vw;
+    margin-left: calc(-50vw + 50%);
+    padding: 1rem 2rem 1.25rem 2rem;
+    box-sizing: border-box;
+
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+
+  .feature-grid[data-carousel="true"]::-webkit-scrollbar {
+    display: none;
+  }
+
+  .feature-grid[data-carousel="true"] :global(> *) {
+    flex: 0 0 min(80vw, 280px);
+    scroll-snap-align: start;
+  }
+
+  @media (min-width: 640px) {
+    .feature-grid[data-carousel="true"] {
+      padding: 1rem 3rem 1.25rem 3rem;
+    }
+
+    .feature-grid[data-carousel="true"] :global(> *) {
+      flex: 0 0 min(45vw, 320px);
+    }
+  }
+
+  @media (min-width: 1024px) {
+    .feature-grid[data-carousel="true"] {
+      padding: 1rem 4rem 1.25rem 4rem;
+    }
+
+    .feature-grid[data-carousel="true"] :global(> *) {
+      flex: 0 0 min(30vw, 340px);
+    }
+  }
+
+  /* Entry animations - subtle fade and slide */
+  .feature-grid:not([data-carousel="true"]) :global(> *) {
+    opacity: 0;
+    transform: translateY(8px);
+    animation: gridItemEntry 0.4s cubic-bezier(0.4, 0, 0.2, 1) forwards;
+  }
+
+  .feature-grid:not([data-carousel="true"]) :global(> *:nth-child(1)) { animation-delay: 0.04s; }
+  .feature-grid:not([data-carousel="true"]) :global(> *:nth-child(2)) { animation-delay: 0.08s; }
+  .feature-grid:not([data-carousel="true"]) :global(> *:nth-child(3)) { animation-delay: 0.12s; }
+  .feature-grid:not([data-carousel="true"]) :global(> *:nth-child(4)) { animation-delay: 0.16s; }
+  .feature-grid:not([data-carousel="true"]) :global(> *:nth-child(5)) { animation-delay: 0.20s; }
+  .feature-grid:not([data-carousel="true"]) :global(> *:nth-child(6)) { animation-delay: 0.24s; }
+
+  @keyframes gridItemEntry {
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  /* Reduced motion */
+  @media (prefers-reduced-motion: reduce) {
+    .feature-grid :global(> *) {
+      animation: none;
+      opacity: 1;
+      transform: none;
+    }
+
+    .feature-grid[data-carousel="true"] {
+      scroll-behavior: auto;
+    }
+  }
+</style>

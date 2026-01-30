@@ -1,0 +1,228 @@
+---
+interface Props {
+  title: string;
+  href: string;
+  icon: string;
+  color?: 'blue' | 'purple' | 'green' | 'orange' | 'cyan' | 'magenta';
+}
+
+const { title, href, icon, color = 'blue' } = Astro.props;
+
+const colorMap = {
+  blue: { hue: 220, sat: 70 },
+  purple: { hue: 265, sat: 60 },
+  green: { hue: 155, sat: 55 },
+  orange: { hue: 25, sat: 75 },
+  cyan: { hue: 195, sat: 70 },
+  magenta: { hue: 330, sat: 55 },
+};
+
+const colorConfig = colorMap[color];
+---
+
+<a href={href} class="link-card" style={`--card-hue: ${colorConfig.hue}; --card-sat: ${colorConfig.sat}%`}>
+  <div class="link-card-inner">
+    <div class="link-card-header">
+      <span class="link-card-icon">{icon}</span>
+      <h3 class="link-card-title">{title}</h3>
+    </div>
+    <div class="link-card-body">
+      <slot />
+    </div>
+    <div class="link-card-footer">
+      <span class="link-card-cta">
+        Explore
+        <svg class="arrow-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M5 12h14M12 5l7 7-7 7"/>
+        </svg>
+      </span>
+    </div>
+  </div>
+  <div class="link-card-border"></div>
+  <div class="link-card-glow"></div>
+</a>
+
+<style>
+  .link-card {
+    --card-hue: 220;
+    --card-sat: 70%;
+    position: relative;
+    display: block;
+    text-decoration: none;
+    border-radius: var(--radius-lg, 14px);
+  }
+
+  /* Inner content */
+  .link-card-inner {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    min-height: 160px;
+    padding: 1.5rem;
+    background: var(--surface-2, #10131a);
+    border: 1px solid var(--border-default, rgba(140, 155, 175, 0.12));
+    border-radius: var(--radius-lg, 14px);
+    transition:
+      border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1),
+      background 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  .link-card:hover .link-card-inner {
+    border-color: hsla(var(--card-hue), var(--card-sat), 56%, 0.3);
+    background: var(--surface-3, #151922);
+  }
+
+  /* Gradient border */
+  .link-card-border {
+    position: absolute;
+    inset: 0;
+    border-radius: var(--radius-lg, 14px);
+    padding: 1px;
+    background: linear-gradient(
+      135deg,
+      hsla(var(--card-hue), var(--card-sat), 56%, 0.5) 0%,
+      hsla(calc(var(--card-hue) + 40), var(--card-sat), 56%, 0.25) 100%
+    );
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask-composite: exclude;
+    opacity: 0;
+    transition: opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  .link-card:hover .link-card-border {
+    opacity: 1;
+  }
+
+  /* Glow effect */
+  .link-card-glow {
+    position: absolute;
+    inset: -15%;
+    background: radial-gradient(
+      circle at 50% 50%,
+      hsla(var(--card-hue), var(--card-sat), 50%, 0.06) 0%,
+      transparent 50%
+    );
+    opacity: 0;
+    transition: opacity 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .link-card:hover .link-card-glow {
+    opacity: 1;
+  }
+
+  /* Header */
+  .link-card-header {
+    display: flex;
+    align-items: center;
+    gap: 0.875rem;
+    margin-bottom: 0.875rem;
+  }
+
+  .link-card-icon {
+    font-size: 1.75rem;
+    filter: drop-shadow(0 0 5px hsla(var(--card-hue), var(--card-sat), 50%, 0.2));
+    transition: filter 0.25s ease, transform 0.25s ease;
+  }
+
+  .link-card:hover .link-card-icon {
+    filter: drop-shadow(0 0 8px hsla(var(--card-hue), var(--card-sat), 50%, 0.35));
+    transform: scale(1.06);
+  }
+
+  .link-card-title {
+    font-family: var(--sl-font-mono, 'IBM Plex Mono', monospace);
+    font-size: 1.125rem;
+    font-weight: 600;
+    color: var(--sl-color-text, #e8edf4);
+    margin: 0;
+    letter-spacing: -0.01em;
+    transition: color 0.25s ease;
+  }
+
+  .link-card:hover .link-card-title {
+    color: hsl(var(--card-hue), calc(var(--card-sat) + 10%), 75%);
+  }
+
+  /* Body */
+  .link-card-body {
+    color: var(--text-secondary, rgba(200, 210, 225, 0.75));
+    font-size: 0.9rem;
+    line-height: 1.6;
+    flex-grow: 1;
+    margin-bottom: 0.875rem;
+  }
+
+  /* Footer */
+  .link-card-footer {
+    display: flex;
+    align-items: center;
+  }
+
+  .link-card-cta {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: hsl(var(--card-hue), calc(var(--card-sat) - 5%), 62%);
+    transition: gap 0.25s ease, color 0.25s ease;
+  }
+
+  .link-card:hover .link-card-cta {
+    gap: 0.6rem;
+    color: hsl(var(--card-hue), var(--card-sat), 72%);
+  }
+
+  .arrow-icon {
+    transition: transform 0.25s ease;
+  }
+
+  .link-card:hover .arrow-icon {
+    transform: translateX(3px);
+  }
+
+  /* Light theme */
+  :global(:root[data-theme='light']) .link-card-inner {
+    background: var(--surface-1, #ffffff);
+    border-color: var(--border-default, rgba(0, 20, 50, 0.1));
+  }
+
+  :global(:root[data-theme='light']) .link-card:hover .link-card-inner {
+    background: var(--surface-2, #f8f9fb);
+  }
+
+  :global(:root[data-theme='light']) .link-card-title {
+    color: var(--sl-color-text, #1a1f28);
+  }
+
+  :global(:root[data-theme='light']) .link-card:hover .link-card-title {
+    color: hsl(var(--card-hue), calc(var(--card-sat) - 10%), 40%);
+  }
+
+  :global(:root[data-theme='light']) .link-card-body {
+    color: var(--text-secondary, rgba(30, 40, 60, 0.7));
+  }
+
+  :global(:root[data-theme='light']) .link-card-cta {
+    color: hsl(var(--card-hue), calc(var(--card-sat) - 15%), 45%);
+  }
+
+  :global(:root[data-theme='light']) .link-card:hover .link-card-cta {
+    color: hsl(var(--card-hue), calc(var(--card-sat) - 10%), 38%);
+  }
+
+  :global(:root[data-theme='light']) .link-card-glow {
+    background: radial-gradient(
+      circle at 50% 50%,
+      hsla(var(--card-hue), var(--card-sat), 50%, 0.04) 0%,
+      transparent 50%
+    );
+  }
+</style>
