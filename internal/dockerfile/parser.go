@@ -81,6 +81,19 @@ func (p *parser) parse(data []byte) (*Dockerfile, error) {
 
 		// Handle continuation
 		trimmed := strings.TrimRightFunc(line, unicode.IsSpace)
+
+		// If we're in a continuation and this is an empty or comment-only line (without backslash),
+		// skip it but DON'T end the continuation
+		if continuation.Len() > 0 {
+			stripped := strings.TrimSpace(trimmed)
+			if !strings.HasSuffix(trimmed, "\\") {
+				if stripped == "" || strings.HasPrefix(stripped, "#") {
+					// Empty or comment line in middle of continuation - skip without ending continuation
+					continue
+				}
+			}
+		}
+
 		if strings.HasSuffix(trimmed, "\\") {
 			if continuation.Len() == 0 {
 				continuationStartLine = lineNum
