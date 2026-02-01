@@ -461,15 +461,35 @@ func ValidateTar(tarPath string) error {
 
 // ParseImageRef parses an OCI image reference into registry, image, and tag.
 func ParseImageRef(imageRef string) (registry string, image string, tag string, err error) {
-	image, tag, ok := strings.Cut(imageRef, ":")
-	if !ok {
-		tag = "latest"
+	// The tag is after the LAST colon, but only if it comes after any slashes.
+	// For example: localhost:5000/image:tag -> registry=localhost:5000, image=image, tag=tag
+	// We need to find the tag separator carefully.
+	image = imageRef
+	tag = "latest"
+
+	// Find the last colon that could be a tag separator.
+	// A tag separator colon must come after the last slash (if any).
+	lastSlash := strings.LastIndex(imageRef, "/")
+	lastColon := strings.LastIndex(imageRef, ":")
+
+	if lastColon > lastSlash {
+		// The colon is after the last slash, so it's a tag separator
+		image = imageRef[:lastColon]
+		tag = imageRef[lastColon+1:]
 	}
 
-	if strings.Contains(image, ".") {
-		registry, image, ok = strings.Cut(image, "/")
-		if !ok {
-			return "", "", "", fmt.Errorf("invalid OCI image format %s", imageRef)
+	// Check ONLY the first path component for hostname markers.
+	// Docker treats the first component as a hostname only if it contains
+	// ".", ":", or equals "localhost".
+	firstSlash := strings.Index(image, "/")
+	if firstSlash != -1 {
+		firstComponent := image[:firstSlash]
+		isHostname := strings.Contains(firstComponent, ".") ||
+			strings.Contains(firstComponent, ":") ||
+			firstComponent == "localhost"
+		if isHostname {
+			registry = firstComponent
+			image = image[firstSlash+1:]
 		}
 	}
 

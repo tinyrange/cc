@@ -116,6 +116,10 @@ func (a *instanceAdapter) WriteFile(name string, data []byte, perm os.FileMode) 
 	return a.inst.WriteFile(name, data, perm)
 }
 
+func (a *instanceAdapter) Stat(name string) (os.FileInfo, error) {
+	return a.inst.Stat(name)
+}
+
 // cmdAdapter adapts api.Cmd to dockerfile.Cmd.
 type cmdAdapter struct {
 	cmd Cmd

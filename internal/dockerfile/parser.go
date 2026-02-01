@@ -309,6 +309,11 @@ func (p *parser) parseRun(rest string, lineNum int, original string) error {
 		return &ParseError{Line: lineNum, Message: "RUN must come after FROM"}
 	}
 
+	// Parse BuildKit flags like --mount=type=bind,...
+	// These are stripped and stored but not currently implemented
+	flags := make(map[string]string)
+	rest = parseFlags(rest, flags)
+
 	// Parse exec form [...] or shell form
 	args, isExec := parseExecOrShellForm(rest)
 
@@ -316,16 +321,19 @@ func (p *parser) parseRun(rest string, lineNum int, original string) error {
 	// Shell variables like $PATH should be left for the shell to expand.
 	// Only Dockerfile ARG references need expansion, which is done at build time.
 
+	// Set form flag
+	if isExec {
+		flags["form"] = "exec"
+	} else {
+		flags["form"] = "shell"
+	}
+
 	instr := Instruction{
 		Kind:     InstructionRun,
 		Line:     lineNum,
 		Original: original,
 		Args:     args,
-	}
-	if isExec {
-		instr.Flags = map[string]string{"form": "exec"}
-	} else {
-		instr.Flags = map[string]string{"form": "shell"}
+		Flags:    flags,
 	}
 
 	p.currentStage.Instructions = append(p.currentStage.Instructions, instr)

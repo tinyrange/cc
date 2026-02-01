@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestBuildSimpleDockerfile(t *testing.T) {
@@ -58,6 +59,43 @@ RUN echo $MYVAR
 	// The env should be set
 	if result.Env[0] != "MYVAR=myvalue" {
 		t.Errorf("unexpected env: %s", result.Env[0])
+	}
+}
+
+func TestBuildWithEnvSelfReference(t *testing.T) {
+	// Test that ENV PATH="${PATH}:..." expands correctly without infinite recursion.
+	// This is critical for Dockerfiles that append to PATH.
+	dockerfile := []byte(`FROM alpine
+ENV PATH="${PATH}:/opt/bin"
+ENV PATH="${PATH}:/usr/local/bin"
+RUN echo $PATH
+`)
+
+	df, err := Parse(dockerfile)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	builder := NewBuilder(df)
+	result, err := builder.Build()
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+
+	// Should have 2 ENV vars (both PATH settings)
+	if len(result.Env) != 2 {
+		t.Fatalf("expected 2 env vars, got %d: %v", len(result.Env), result.Env)
+	}
+
+	// First PATH: ${PATH} expands to "" (undefined), so result is ":/opt/bin"
+	// (This matches Docker behavior - undefined vars expand to empty string)
+	if result.Env[0] != "PATH=:/opt/bin" {
+		t.Errorf("expected PATH=:/opt/bin, got %s", result.Env[0])
+	}
+
+	// Second PATH should be expanded from previous PATH + /usr/local/bin
+	if result.Env[1] != "PATH=:/opt/bin:/usr/local/bin" {
+		t.Errorf("expected PATH=:/opt/bin:/usr/local/bin, got %s", result.Env[1])
 	}
 }
 
@@ -390,12 +428,14 @@ func TestDirBuildContext(t *testing.T) {
 type mockInstance struct {
 	commands   [][]string
 	files      map[string][]byte
+	dirs       map[string]bool // Tracks which paths are directories
 	currentDir string
 }
 
 func newMockInstance() *mockInstance {
 	return &mockInstance{
 		files: make(map[string][]byte),
+		dirs:  make(map[string]bool),
 	}
 }
 
@@ -411,6 +451,29 @@ func (m *mockInstance) WriteFile(name string, data []byte, _ os.FileMode) error 
 	m.files[name] = data
 	return nil
 }
+
+func (m *mockInstance) Stat(name string) (os.FileInfo, error) {
+	if m.dirs[name] {
+		return &mockFileInfo{name: name, isDir: true}, nil
+	}
+	if _, ok := m.files[name]; ok {
+		return &mockFileInfo{name: name, isDir: false}, nil
+	}
+	return nil, os.ErrNotExist
+}
+
+// mockFileInfo implements os.FileInfo for testing.
+type mockFileInfo struct {
+	name  string
+	isDir bool
+}
+
+func (fi *mockFileInfo) Name() string       { return fi.name }
+func (fi *mockFileInfo) Size() int64        { return 0 }
+func (fi *mockFileInfo) Mode() os.FileMode  { return 0o644 }
+func (fi *mockFileInfo) ModTime() time.Time { return time.Time{} }
+func (fi *mockFileInfo) IsDir() bool        { return fi.isDir }
+func (fi *mockFileInfo) Sys() any           { return nil }
 
 type mockCmd struct {
 	inst    *mockInstance
@@ -469,5 +532,146 @@ func TestReaderOpApply(t *testing.T) {
 
 	if string(inst.files["/app/file.txt"]) != "test content" {
 		t.Errorf("file not written correctly")
+	}
+}
+
+func TestReaderOpApplyToExistingDirectory(t *testing.T) {
+	// Test case: COPY file /opt where /opt is an existing directory
+	// Should write to /opt/file, not /opt
+	op := &readerOp{
+		data:        []byte("test content"),
+		dst:         "/opt",
+		srcBasename: "myfile.txt",
+		contentHash: "abc123",
+	}
+
+	inst := newMockInstance()
+	inst.dirs["/opt"] = true // Mark /opt as an existing directory
+	ctx := context.Background()
+
+	if err := op.Apply(ctx, inst); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+
+	// Should have written to /opt/myfile.txt
+	if _, ok := inst.files["/opt/myfile.txt"]; !ok {
+		t.Errorf("expected file at /opt/myfile.txt, got files: %v", inst.files)
+	}
+	if string(inst.files["/opt/myfile.txt"]) != "test content" {
+		t.Errorf("file content mismatch")
+	}
+}
+
+func TestReaderOpApplyToNonExistingPath(t *testing.T) {
+	// Test case: COPY file /opt where /opt does not exist
+	// Should write to /opt (file-to-file copy)
+	op := &readerOp{
+		data:        []byte("test content"),
+		dst:         "/opt",
+		srcBasename: "myfile.txt",
+		contentHash: "abc123",
+	}
+
+	inst := newMockInstance()
+	// /opt does not exist in dirs or files
+	ctx := context.Background()
+
+	if err := op.Apply(ctx, inst); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+
+	// Should have written to /opt (not /opt/myfile.txt)
+	if _, ok := inst.files["/opt"]; !ok {
+		t.Errorf("expected file at /opt, got files: %v", inst.files)
+	}
+	if string(inst.files["/opt"]) != "test content" {
+		t.Errorf("file content mismatch")
+	}
+}
+
+func TestReaderOpApplyWithTrailingSlash(t *testing.T) {
+	// Test case: COPY file /opt/ (trailing slash means directory)
+	// srcBasename should be empty because processCopy already resolved the path
+	op := &readerOp{
+		data:        []byte("test content"),
+		dst:         "/opt/myfile.txt", // Already resolved by processCopy
+		srcBasename: "",                // Empty because trailing slash was explicit
+		contentHash: "abc123",
+	}
+
+	inst := newMockInstance()
+	ctx := context.Background()
+
+	if err := op.Apply(ctx, inst); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+
+	if _, ok := inst.files["/opt/myfile.txt"]; !ok {
+		t.Errorf("expected file at /opt/myfile.txt, got files: %v", inst.files)
+	}
+}
+
+func TestCopyToExistingDirectory(t *testing.T) {
+	// Integration test: build a Dockerfile with COPY to a path that could be a directory
+	tempDir := t.TempDir()
+	testFile := filepath.Join(tempDir, "config.json")
+	if err := os.WriteFile(testFile, []byte(`{"key": "value"}`), 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	dockerfile := []byte(`FROM alpine
+COPY config.json /opt
+`)
+
+	df, err := Parse(dockerfile)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	ctx, err := NewDirBuildContext(tempDir)
+	if err != nil {
+		t.Fatalf("NewDirBuildContext failed: %v", err)
+	}
+
+	builder := NewBuilder(df).WithContext(ctx)
+	result, err := builder.Build()
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+
+	if len(result.Ops) != 1 {
+		t.Fatalf("expected 1 op, got %d", len(result.Ops))
+	}
+
+	// Verify the op has srcBasename set for deferred directory detection
+	op, ok := result.Ops[0].(*readerOp)
+	if !ok {
+		t.Fatalf("expected readerOp, got %T", result.Ops[0])
+	}
+
+	if op.srcBasename != "config.json" {
+		t.Errorf("expected srcBasename 'config.json', got %q", op.srcBasename)
+	}
+	if op.dst != "/opt" {
+		t.Errorf("expected dst '/opt', got %q", op.dst)
+	}
+
+	// Test apply to directory
+	inst := newMockInstance()
+	inst.dirs["/opt"] = true
+	if err := op.Apply(context.Background(), inst); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+	if _, ok := inst.files["/opt/config.json"]; !ok {
+		t.Errorf("expected file at /opt/config.json when /opt is a directory")
+	}
+
+	// Test apply to non-existing path
+	inst2 := newMockInstance()
+	if err := op.Apply(context.Background(), inst2); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+	if _, ok := inst2.files["/opt"]; !ok {
+		t.Errorf("expected file at /opt when /opt does not exist")
 	}
 }
