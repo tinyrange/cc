@@ -1263,6 +1263,20 @@ func main() {
 		libPath := filepath.Join("build", "libcc"+libExt)
 		headerPath := filepath.Join("build", "libcc.h")
 
+		// Build the cc-helper binary (codesigned on macOS)
+		fmt.Printf("building cc-helper...\n")
+		helperOut, err := goBuild(buildOptions{
+			Package:          "cmd/cc-helper",
+			OutputName:       "cc-helper",
+			Build:            hostBuild,
+			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build cc-helper: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("built %s\n", helperOut.Path)
+
 		// Build the shared library
 		fmt.Printf("building C bindings library...\n")
 		cmd := exec.Command("go", "build", "-buildmode=c-shared",

@@ -187,6 +187,7 @@ import (
 	"unsafe"
 
 	cc "github.com/tinyrange/cc"
+	"github.com/tinyrange/cc/bindings/c/ipc"
 	"github.com/tinyrange/cc/internal/api"
 )
 
@@ -564,7 +565,12 @@ func cc_oci_client_load_tar(
 		return setError(err, cErr)
 	}
 
-	h := newHandle(source)
+	// Store source info for IPC mode
+	h := newHandle(&sourceInfo{
+		source:     source,
+		sourceType: 0, // tar
+		sourcePath: path,
+	})
 	out._h = C.uint64_t(h)
 	C.clear_error(cErr)
 	return C.CC_OK
@@ -599,7 +605,12 @@ func cc_oci_client_load_dir(
 		return setError(err, cErr)
 	}
 
-	h := newHandle(source)
+	// Store source info for IPC mode
+	h := newHandle(&sourceInfo{
+		source:     source,
+		sourceType: 1, // dir
+		sourcePath: path,
+	})
 	out._h = C.uint64_t(h)
 	C.clear_error(cErr)
 	return C.CC_OK
@@ -621,7 +632,7 @@ func cc_oci_client_export_dir(
 		return setInvalidHandle(cErr, "oci_client")
 	}
 
-	src, ok := getHandleTyped[cc.InstanceSource](uint64(source._h))
+	src, ok := getSource(uint64(source._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance_source")
 	}
@@ -664,7 +675,7 @@ func cc_source_get_config(
 		return setInvalidHandle(cErr, "library")
 	}
 
-	src, ok := getHandleTyped[cc.InstanceSource](uint64(source._h))
+	src, ok := getSource(uint64(source._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance_source")
 	}
@@ -799,7 +810,7 @@ func cc_instance_new(
 		return setInvalidHandle(cErr, "library")
 	}
 
-	src, ok := getHandleTyped[cc.InstanceSource](uint64(source._h))
+	src, ok := getSource(uint64(source._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance_source")
 	}
@@ -807,22 +818,29 @@ func cc_instance_new(
 		return setInvalidArgument(cErr, "out is NULL")
 	}
 
+	// Extract options
+	var ipcOpts ipc.InstanceOptions
 	var ccOpts []cc.Option
 
 	if opts != nil {
 		if opts.memory_mb > 0 {
+			ipcOpts.MemoryMB = uint64(opts.memory_mb)
 			ccOpts = append(ccOpts, cc.WithMemoryMB(uint64(opts.memory_mb)))
 		}
 		if opts.cpus > 0 {
+			ipcOpts.CPUs = int(opts.cpus)
 			ccOpts = append(ccOpts, cc.WithCPUs(int(opts.cpus)))
 		}
 		if opts.timeout_seconds > 0 {
+			ipcOpts.TimeoutSecs = float64(opts.timeout_seconds)
 			ccOpts = append(ccOpts, cc.WithTimeout(time.Duration(float64(opts.timeout_seconds)*float64(time.Second))))
 		}
 		if opts.user != nil {
-			ccOpts = append(ccOpts, cc.WithUser(C.GoString(opts.user)))
+			ipcOpts.User = C.GoString(opts.user)
+			ccOpts = append(ccOpts, cc.WithUser(ipcOpts.User))
 		}
 		if opts.enable_dmesg {
+			ipcOpts.EnableDmesg = true
 			ccOpts = append(ccOpts, cc.WithDmesg())
 		}
 
@@ -837,6 +855,11 @@ func cc_instance_new(
 				if mountPtr.host_path != nil {
 					hostPath = C.GoString(mountPtr.host_path)
 				}
+				ipcOpts.Mounts = append(ipcOpts.Mounts, ipc.MountConfig{
+					Tag:      tag,
+					HostPath: hostPath,
+					Writable: bool(mountPtr.writable),
+				})
 				ccOpts = append(ccOpts, cc.WithMount(cc.MountConfig{
 					Tag:      tag,
 					HostPath: hostPath,
@@ -846,25 +869,70 @@ func cc_instance_new(
 		}
 	}
 
-	inst, err := cc.New(src, ccOpts...)
-	if err != nil {
-		return setError(err, cErr)
+	var proxy *instanceProxy
+
+	useIPC := ipc.UseHelper()
+	if useIPC {
+		// IPC mode: spawn helper process
+		// We need to get the source path from the source metadata
+		srcInfo, ok := getHandleTyped[*sourceInfo](uint64(source._h))
+		if !ok {
+			// Fall back to direct mode if we don't have source info
+			useIPC = false
+		} else {
+			var err error
+			proxy, err = newInstanceProxyIPC(helperInfo{
+				sourceType: srcInfo.sourceType,
+				sourcePath: srcInfo.sourcePath,
+				opts:       ipcOpts,
+			})
+			if err != nil {
+				return setError(err, cErr)
+			}
+		}
 	}
 
-	h := newHandle(inst)
+	if !useIPC {
+		// Direct mode: create instance in-process
+		inst, err := cc.New(src, ccOpts...)
+		if err != nil {
+			return setError(err, cErr)
+		}
+		proxy = newInstanceProxyDirect(inst)
+	}
+
+	h := newHandle(proxy)
 	out._h = C.uint64_t(h)
 	C.clear_error(cErr)
 	return C.CC_OK
 }
 
+// sourceInfo stores metadata about a source for IPC mode.
+type sourceInfo struct {
+	source     cc.InstanceSource
+	sourceType uint8  // 0=tar, 1=dir
+	sourcePath string
+}
+
+// getSource extracts the cc.InstanceSource from a handle that may be either
+// a *sourceInfo or a direct cc.InstanceSource.
+func getSource(handle uint64) (cc.InstanceSource, bool) {
+	// Try sourceInfo first (for tar/dir loaded sources)
+	if srcInfo, ok := getHandleTyped[*sourceInfo](handle); ok {
+		return srcInfo.source, true
+	}
+	// Fall back to direct InstanceSource (for pulled sources)
+	return getHandleTyped[cc.InstanceSource](handle)
+}
+
 //export cc_instance_close
 func cc_instance_close(inst C.cc_instance, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := freeHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := freeHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
 
-	err := instance.Close()
+	err := proxy.Close()
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -875,7 +943,7 @@ func cc_instance_close(inst C.cc_instance, cErr *C.cc_error) C.cc_error_code {
 
 //export cc_instance_wait
 func cc_instance_wait(inst C.cc_instance, cancel C.cc_cancel_token, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -883,7 +951,7 @@ func cc_instance_wait(inst C.cc_instance, cancel C.cc_cancel_token, cErr *C.cc_e
 	// TODO: Implement cancellation support by wrapping Wait with a context
 	_ = cancel
 
-	err := instance.Wait()
+	err := proxy.Wait()
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -894,49 +962,42 @@ func cc_instance_wait(inst C.cc_instance, cancel C.cc_cancel_token, cErr *C.cc_e
 
 //export cc_instance_id
 func cc_instance_id(inst C.cc_instance) *C.char {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return nil
 	}
-	return C.CString(instance.ID())
+	return C.CString(proxy.ID())
 }
 
 //export cc_instance_is_running
 func cc_instance_is_running(inst C.cc_instance) C.bool {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return C.bool(false)
 	}
-
-	// Check if instance is still running by checking the Done channel
-	select {
-	case <-instance.Done():
-		return C.bool(false)
-	default:
-		return C.bool(true)
-	}
+	return C.bool(proxy.IsRunning())
 }
 
 //export cc_instance_set_console_size
 func cc_instance_set_console_size(inst C.cc_instance, cols, rows C.int, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
 
-	instance.SetConsoleSize(int(cols), int(rows))
+	proxy.SetConsoleSize(int(cols), int(rows))
 	C.clear_error(cErr)
 	return C.CC_OK
 }
 
 //export cc_instance_set_network_enabled
 func cc_instance_set_network_enabled(inst C.cc_instance, enabled C.bool, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
 
-	instance.SetNetworkEnabled(bool(enabled))
+	proxy.SetNetworkEnabled(bool(enabled))
 	C.clear_error(cErr)
 	return C.CC_OK
 }
@@ -953,7 +1014,7 @@ type instanceFile struct {
 
 //export cc_fs_open
 func cc_fs_open(inst C.cc_instance, path *C.char, out *C.cc_file, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -965,7 +1026,7 @@ func cc_fs_open(inst C.cc_instance, path *C.char, out *C.cc_file, cErr *C.cc_err
 	}
 
 	goPath := C.GoString(path)
-	f, err := instance.Open(goPath)
+	f, err := proxy.Open(goPath)
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -978,7 +1039,7 @@ func cc_fs_open(inst C.cc_instance, path *C.char, out *C.cc_file, cErr *C.cc_err
 
 //export cc_fs_create
 func cc_fs_create(inst C.cc_instance, path *C.char, out *C.cc_file, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -990,7 +1051,7 @@ func cc_fs_create(inst C.cc_instance, path *C.char, out *C.cc_file, cErr *C.cc_e
 	}
 
 	goPath := C.GoString(path)
-	f, err := instance.Create(goPath)
+	f, err := proxy.Create(goPath)
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -1010,7 +1071,7 @@ func cc_fs_open_file(
 	out *C.cc_file,
 	cErr *C.cc_error,
 ) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -1022,7 +1083,7 @@ func cc_fs_open_file(
 	}
 
 	goPath := C.GoString(path)
-	f, err := instance.OpenFile(goPath, int(flags), fs.FileMode(perm))
+	f, err := proxy.OpenFile(goPath, int(flags), fs.FileMode(perm))
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -1195,7 +1256,7 @@ func cc_file_name(f C.cc_file) *C.char {
 
 //export cc_fs_read_file
 func cc_fs_read_file(inst C.cc_instance, path *C.char, out **C.uint8_t, length *C.size_t, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -1210,7 +1271,7 @@ func cc_fs_read_file(inst C.cc_instance, path *C.char, out **C.uint8_t, length *
 	}
 
 	goPath := C.GoString(path)
-	data, err := instance.ReadFile(goPath)
+	data, err := proxy.ReadFile(goPath)
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -1230,7 +1291,7 @@ func cc_fs_read_file(inst C.cc_instance, path *C.char, out **C.uint8_t, length *
 
 //export cc_fs_write_file
 func cc_fs_write_file(inst C.cc_instance, path *C.char, data *C.uint8_t, length C.size_t, perm C.cc_file_mode, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -1241,7 +1302,7 @@ func cc_fs_write_file(inst C.cc_instance, path *C.char, data *C.uint8_t, length 
 	goPath := C.GoString(path)
 	goData := C.GoBytes(unsafe.Pointer(data), C.int(length))
 
-	err := instance.WriteFile(goPath, goData, fs.FileMode(perm))
+	err := proxy.WriteFile(goPath, goData, fs.FileMode(perm))
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -1252,7 +1313,7 @@ func cc_fs_write_file(inst C.cc_instance, path *C.char, data *C.uint8_t, length 
 
 //export cc_fs_stat
 func cc_fs_stat(inst C.cc_instance, path *C.char, out *C.cc_file_info, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -1264,7 +1325,7 @@ func cc_fs_stat(inst C.cc_instance, path *C.char, out *C.cc_file_info, cErr *C.c
 	}
 
 	goPath := C.GoString(path)
-	info, err := instance.Stat(goPath)
+	info, err := proxy.Stat(goPath)
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -1282,7 +1343,7 @@ func cc_fs_stat(inst C.cc_instance, path *C.char, out *C.cc_file_info, cErr *C.c
 
 //export cc_fs_lstat
 func cc_fs_lstat(inst C.cc_instance, path *C.char, out *C.cc_file_info, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -1294,7 +1355,7 @@ func cc_fs_lstat(inst C.cc_instance, path *C.char, out *C.cc_file_info, cErr *C.
 	}
 
 	goPath := C.GoString(path)
-	info, err := instance.Lstat(goPath)
+	info, err := proxy.Lstat(goPath)
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -1323,7 +1384,7 @@ func cc_file_info_free(info *C.cc_file_info) {
 
 //export cc_fs_remove
 func cc_fs_remove(inst C.cc_instance, path *C.char, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -1332,7 +1393,7 @@ func cc_fs_remove(inst C.cc_instance, path *C.char, cErr *C.cc_error) C.cc_error
 	}
 
 	goPath := C.GoString(path)
-	err := instance.Remove(goPath)
+	err := proxy.Remove(goPath)
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -1343,7 +1404,7 @@ func cc_fs_remove(inst C.cc_instance, path *C.char, cErr *C.cc_error) C.cc_error
 
 //export cc_fs_remove_all
 func cc_fs_remove_all(inst C.cc_instance, path *C.char, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -1352,7 +1413,7 @@ func cc_fs_remove_all(inst C.cc_instance, path *C.char, cErr *C.cc_error) C.cc_e
 	}
 
 	goPath := C.GoString(path)
-	err := instance.RemoveAll(goPath)
+	err := proxy.RemoveAll(goPath)
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -1363,7 +1424,7 @@ func cc_fs_remove_all(inst C.cc_instance, path *C.char, cErr *C.cc_error) C.cc_e
 
 //export cc_fs_mkdir
 func cc_fs_mkdir(inst C.cc_instance, path *C.char, perm C.cc_file_mode, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -1372,7 +1433,7 @@ func cc_fs_mkdir(inst C.cc_instance, path *C.char, perm C.cc_file_mode, cErr *C.
 	}
 
 	goPath := C.GoString(path)
-	err := instance.Mkdir(goPath, fs.FileMode(perm))
+	err := proxy.Mkdir(goPath, fs.FileMode(perm))
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -1383,7 +1444,7 @@ func cc_fs_mkdir(inst C.cc_instance, path *C.char, perm C.cc_file_mode, cErr *C.
 
 //export cc_fs_mkdir_all
 func cc_fs_mkdir_all(inst C.cc_instance, path *C.char, perm C.cc_file_mode, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -1392,7 +1453,7 @@ func cc_fs_mkdir_all(inst C.cc_instance, path *C.char, perm C.cc_file_mode, cErr
 	}
 
 	goPath := C.GoString(path)
-	err := instance.MkdirAll(goPath, fs.FileMode(perm))
+	err := proxy.MkdirAll(goPath, fs.FileMode(perm))
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -1403,7 +1464,7 @@ func cc_fs_mkdir_all(inst C.cc_instance, path *C.char, perm C.cc_file_mode, cErr
 
 //export cc_fs_rename
 func cc_fs_rename(inst C.cc_instance, oldpath, newpath *C.char, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -1411,7 +1472,7 @@ func cc_fs_rename(inst C.cc_instance, oldpath, newpath *C.char, cErr *C.cc_error
 		return setInvalidArgument(cErr, "path is NULL")
 	}
 
-	err := instance.Rename(C.GoString(oldpath), C.GoString(newpath))
+	err := proxy.Rename(C.GoString(oldpath), C.GoString(newpath))
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -1422,7 +1483,7 @@ func cc_fs_rename(inst C.cc_instance, oldpath, newpath *C.char, cErr *C.cc_error
 
 //export cc_fs_symlink
 func cc_fs_symlink(inst C.cc_instance, oldname, newname *C.char, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -1430,7 +1491,7 @@ func cc_fs_symlink(inst C.cc_instance, oldname, newname *C.char, cErr *C.cc_erro
 		return setInvalidArgument(cErr, "path is NULL")
 	}
 
-	err := instance.Symlink(C.GoString(oldname), C.GoString(newname))
+	err := proxy.Symlink(C.GoString(oldname), C.GoString(newname))
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -1441,7 +1502,7 @@ func cc_fs_symlink(inst C.cc_instance, oldname, newname *C.char, cErr *C.cc_erro
 
 //export cc_fs_readlink
 func cc_fs_readlink(inst C.cc_instance, path *C.char, out **C.char, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -1453,7 +1514,7 @@ func cc_fs_readlink(inst C.cc_instance, path *C.char, out **C.char, cErr *C.cc_e
 	}
 
 	goPath := C.GoString(path)
-	target, err := instance.Readlink(goPath)
+	target, err := proxy.Readlink(goPath)
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -1465,7 +1526,7 @@ func cc_fs_readlink(inst C.cc_instance, path *C.char, out **C.char, cErr *C.cc_e
 
 //export cc_fs_read_dir
 func cc_fs_read_dir(inst C.cc_instance, path *C.char, out **C.cc_dir_entry, count *C.size_t, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -1477,7 +1538,7 @@ func cc_fs_read_dir(inst C.cc_instance, path *C.char, out **C.cc_dir_entry, coun
 	}
 
 	goPath := C.GoString(path)
-	entries, err := instance.ReadDir(goPath)
+	entries, err := proxy.ReadDir(goPath)
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -1526,7 +1587,7 @@ func cc_dir_entries_free(entries *C.cc_dir_entry, count C.size_t) {
 
 //export cc_fs_chmod
 func cc_fs_chmod(inst C.cc_instance, path *C.char, mode C.cc_file_mode, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -1535,7 +1596,7 @@ func cc_fs_chmod(inst C.cc_instance, path *C.char, mode C.cc_file_mode, cErr *C.
 	}
 
 	goPath := C.GoString(path)
-	err := instance.Chmod(goPath, fs.FileMode(mode))
+	err := proxy.Chmod(goPath, fs.FileMode(mode))
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -1546,7 +1607,7 @@ func cc_fs_chmod(inst C.cc_instance, path *C.char, mode C.cc_file_mode, cErr *C.
 
 //export cc_fs_chown
 func cc_fs_chown(inst C.cc_instance, path *C.char, uid, gid C.int, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -1555,7 +1616,7 @@ func cc_fs_chown(inst C.cc_instance, path *C.char, uid, gid C.int, cErr *C.cc_er
 	}
 
 	goPath := C.GoString(path)
-	err := instance.Chown(goPath, int(uid), int(gid))
+	err := proxy.Chown(goPath, int(uid), int(gid))
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -1566,7 +1627,7 @@ func cc_fs_chown(inst C.cc_instance, path *C.char, uid, gid C.int, cErr *C.cc_er
 
 //export cc_fs_chtimes
 func cc_fs_chtimes(inst C.cc_instance, path *C.char, atimeUnix, mtimeUnix C.int64_t, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -1578,7 +1639,7 @@ func cc_fs_chtimes(inst C.cc_instance, path *C.char, atimeUnix, mtimeUnix C.int6
 	atime := time.Unix(int64(atimeUnix), 0)
 	mtime := time.Unix(int64(mtimeUnix), 0)
 
-	err := instance.Chtimes(goPath, atime, mtime)
+	err := proxy.Chtimes(goPath, atime, mtime)
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -1593,7 +1654,7 @@ func cc_fs_chtimes(inst C.cc_instance, path *C.char, atimeUnix, mtimeUnix C.int6
 
 //export cc_cmd_new
 func cc_cmd_new(inst C.cc_instance, name *C.char, args **C.char, out *C.cc_cmd, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -1618,7 +1679,7 @@ func cc_cmd_new(inst C.cc_instance, name *C.char, args **C.char, out *C.cc_cmd, 
 		}
 	}
 
-	cmd := instance.Command(cmdName, goArgs...)
+	cmd := proxy.Command(cmdName, goArgs...)
 	h := newHandle(cmd)
 	out._h = C.uint64_t(h)
 
@@ -1628,7 +1689,7 @@ func cc_cmd_new(inst C.cc_instance, name *C.char, args **C.char, out *C.cc_cmd, 
 
 //export cc_cmd_entrypoint
 func cc_cmd_entrypoint(inst C.cc_instance, args **C.char, out *C.cc_cmd, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -1648,7 +1709,7 @@ func cc_cmd_entrypoint(inst C.cc_instance, args **C.char, out *C.cc_cmd, cErr *C
 		}
 	}
 
-	cmd := instance.EntrypointCommand(goArgs...)
+	cmd := proxy.EntrypointCommand(goArgs...)
 	h := newHandle(cmd)
 	out._h = C.uint64_t(h)
 
@@ -1913,7 +1974,7 @@ func cc_cmd_kill(cmd C.cc_cmd, cErr *C.cc_error) C.cc_error_code {
 
 //export cc_instance_exec
 func cc_instance_exec(inst C.cc_instance, name *C.char, args **C.char, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -1935,7 +1996,7 @@ func cc_instance_exec(inst C.cc_instance, name *C.char, args **C.char, cErr *C.c
 		}
 	}
 
-	err := instance.Exec(cmdName, goArgs...)
+	err := proxy.Exec(cmdName, goArgs...)
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -1950,7 +2011,7 @@ func cc_instance_exec(inst C.cc_instance, name *C.char, args **C.char, cErr *C.c
 
 //export cc_net_listen
 func cc_net_listen(inst C.cc_instance, network, address *C.char, out *C.cc_listener, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -1961,7 +2022,7 @@ func cc_net_listen(inst C.cc_instance, network, address *C.char, out *C.cc_liste
 		return setInvalidArgument(cErr, "out is NULL")
 	}
 
-	ln, err := instance.Listen(C.GoString(network), C.GoString(address))
+	ln, err := proxy.Listen(C.GoString(network), C.GoString(address))
 	if err != nil {
 		return setError(err, cErr)
 	}
@@ -2113,7 +2174,7 @@ func cc_conn_remote_addr(c C.cc_conn) *C.char {
 
 //export cc_fs_snapshot
 func cc_fs_snapshot(inst C.cc_instance, opts *C.cc_snapshot_options, out *C.cc_snapshot, cErr *C.cc_error) C.cc_error_code {
-	instance, ok := getHandleTyped[cc.Instance](uint64(inst._h))
+	proxy, ok := getHandleTyped[*instanceProxy](uint64(inst._h))
 	if !ok {
 		return setInvalidHandle(cErr, "instance")
 	}
@@ -2144,7 +2205,7 @@ func cc_fs_snapshot(inst C.cc_instance, opts *C.cc_snapshot_options, out *C.cc_s
 		}
 	}
 
-	snap, err := instance.SnapshotFilesystem(snapshotOpts...)
+	snap, err := proxy.SnapshotFilesystem(snapshotOpts...)
 	if err != nil {
 		return setError(err, cErr)
 	}
