@@ -150,7 +150,7 @@ bindings-python: libcc
 # Python bindings test
 bindings-python-test: bindings-python
     requires darwin linux
-    sh CC_LIBRARY_PATH=$(PWD)/$(OUTPUT) CC_HELPER_PATH=$(PWD)/$(OUTPUT)/cc-helper \
+    sh LIBCC_PATH=$(PWD)/$(OUTPUT)/libcc$(SHLIB_EXT) CC_HELPER_PATH=$(PWD)/$(OUTPUT)/cc-helper \
         bindings/python/.venv/bin/pytest -v bindings/python/tests/
 
 # --- Node.js Bindings ---
