@@ -1,0 +1,24 @@
+---
+import { TabItem } from '@astrojs/starlight/components';
+import type { LanguageKey } from './LanguageIcons';
+
+interface Props {
+  lang: LanguageKey;
+}
+
+const { lang } = Astro.props;
+
+const labelMap: Record<LanguageKey, string> = {
+  python: 'Python',
+  rust: 'Rust',
+  typescript: 'TypeScript',
+  c: 'C',
+  go: 'Go',
+};
+
+const label = labelMap[lang];
+---
+
+<TabItem label={label}>
+  <slot />
+</TabItem>

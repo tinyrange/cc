@@ -1,0 +1,616 @@
+---
+title: API Overview
+description: The CrumbleCracker API at a glance
+---
+
+import LanguageTabs from '../../../components/LanguageTabs.astro';
+import LangTabItem from '../../../components/LangTabItem.astro';
+
+The CrumbleCracker API lets you create and manage VMs programmatically. It's designed to feel familiar—if you know your language's standard I/O and process APIs, you already know how to use it.
+
+## Installation
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```bash
+go get github.com/tinyrange/cc
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```bash
+# Build libcc first
+cd /path/to/cc
+./tools/build.go -bindings-c
+export LIBCC_PATH=/path/to/cc/build/libcc.dylib  # or .so on Linux
+
+# Install the package
+pip install -e /path/to/cc/bindings/python
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```toml
+# Cargo.toml
+[dependencies]
+cc-vm = { path = "/path/to/cc/bindings/rust" }
+```
+
+Build libcc first:
+
+```bash
+./tools/build.go -bindings-c
+export LIBCC_PATH=/path/to/cc/build/libcc.dylib  # or .so on Linux
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```bash
+npm install @crumblecracker/cc
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```bash
+# Build libcc
+./tools/build.go -bindings-c
+
+# Link against build/libcc.dylib (macOS) or build/libcc.so (Linux)
+# Include bindings/c/libcc.h
+gcc -o myapp myapp.c -L/path/to/cc/build -lcc -I/path/to/cc/bindings/c
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Design Principles
+
+**Mirror the standard library**: Filesystem operations work like your language's native I/O. Command execution works like subprocess APIs. Networking works like socket APIs. No new paradigms.
+
+**Explicit over implicit**: No hidden state or global configuration. Everything is passed explicitly.
+
+**Composition**: Build complex workflows from simple primitives.
+
+## Core Types
+
+### Instance
+
+An `Instance` represents a running VM. It provides filesystem, command execution, and networking interfaces:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+type Instance interface {
+    FS      // Filesystem operations (mirrors os)
+    Exec    // Command execution (mirrors os/exec)
+    Net     // Network operations (mirrors net)
+
+    Close() error
+    Wait() error
+    ID() string
+    Done() <-chan error
+    GPU() GPU
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+class Instance:
+    """A running VM instance with filesystem, command, and network access."""
+
+    # Properties
+    id: str               # Instance ID
+    is_running: bool      # Check if running
+
+    # Lifecycle
+    def wait(self) -> None: ...
+    def close(self) -> None: ...
+
+    # Filesystem (FS)
+    def read_file(self, path: str) -> bytes: ...
+    def write_file(self, path: str, data: bytes, mode: int = 0o644) -> None: ...
+
+    # Commands (Exec)
+    def command(self, name: str, *args: str) -> Cmd: ...
+
+    # Networking (Net)
+    def listen(self, network: str, address: str) -> Listener: ...
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+impl Instance {
+    // Implements FS, Exec, Net traits
+
+    // Lifecycle
+    pub fn close(&self) -> Result<()>;
+    pub fn wait(&self, cancel: Option<CancelToken>) -> Result<()>;
+    pub fn id(&self) -> String;
+    pub fn is_running(&self) -> bool;
+
+    // Filesystem (FS trait)
+    pub fn read_file(&self, path: &str) -> Result<Vec<u8>>;
+    pub fn write_file(&self, path: &str, data: &[u8], mode: u32) -> Result<()>;
+
+    // Commands (Exec trait)
+    pub fn command(&self, name: &str, args: &[&str]) -> Result<Cmd>;
+
+    // Networking (Net trait)
+    pub fn listen(&self, network: &str, address: &str) -> Result<Listener>;
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+interface Instance extends AsyncDisposable {
+    // Properties
+    id(): Promise<string>;
+    isRunning(): Promise<boolean>;
+
+    // Lifecycle
+    close(): Promise<void>;
+    wait(): Promise<void>;
+
+    // Filesystem (FS)
+    readFile(path: string): Promise<Buffer>;
+    writeFile(path: string, data: Buffer, mode?: number): Promise<void>;
+
+    // Commands (Exec)
+    command(...args: string[]): Promise<Cmd>;
+
+    // Networking (Net)
+    listen(network: string, address: string): Promise<Listener>;
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// Handle type - operations via cc_* functions
+cc_instance inst;
+
+// Lifecycle
+char* cc_instance_id(cc_instance inst);
+bool cc_instance_is_running(cc_instance inst);
+cc_error_code cc_instance_close(cc_instance inst, cc_error* err);
+cc_error_code cc_instance_wait(cc_instance inst, cc_cancel_token cancel, cc_error* err);
+
+// Filesystem (cc_fs_* functions)
+cc_error_code cc_fs_read_file(cc_instance inst, const char* path,
+                               uint8_t** out, size_t* len, cc_error* err);
+cc_error_code cc_fs_write_file(cc_instance inst, const char* path,
+                                const uint8_t* data, size_t len,
+                                cc_file_mode perm, cc_error* err);
+
+// Commands (cc_cmd_* functions)
+cc_error_code cc_cmd_new(cc_instance inst, const char* name,
+                          const char* const* args, cc_cmd* out, cc_error* err);
+
+// Networking (cc_net_* functions)
+cc_error_code cc_net_listen(cc_instance inst, const char* network,
+                             const char* address, cc_listener* out, cc_error* err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### FS (Filesystem)
+
+The filesystem interface mirrors standard library file operations:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+type FS interface {
+    Open(name string) (File, error)
+    Create(name string) (File, error)
+    ReadFile(name string) ([]byte, error)
+    WriteFile(name string, data []byte, perm fs.FileMode) error
+    Stat(name string) (fs.FileInfo, error)
+    Remove(name string) error
+    RemoveAll(path string) error
+    Mkdir(name string, perm fs.FileMode) error
+    MkdirAll(path string, perm fs.FileMode) error
+    ReadDir(name string) ([]fs.DirEntry, error)
+    // ...
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# Filesystem methods on Instance
+def open(self, path: str) -> File: ...
+def create(self, path: str) -> File: ...
+def read_file(self, path: str) -> bytes: ...
+def write_file(self, path: str, data: bytes, mode: int = 0o644) -> None: ...
+def stat(self, path: str) -> FileInfo: ...
+def remove(self, path: str) -> None: ...
+def mkdir(self, path: str, mode: int = 0o755) -> None: ...
+def read_dir(self, path: str) -> list[DirEntry]: ...
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// FS trait methods on Instance
+fn open(&self, path: &str) -> Result<File>;
+fn create(&self, path: &str) -> Result<File>;
+fn read_file(&self, path: &str) -> Result<Vec<u8>>;
+fn write_file(&self, path: &str, data: &[u8], mode: u32) -> Result<()>;
+fn stat(&self, path: &str) -> Result<FileInfo>;
+fn remove(&self, path: &str) -> Result<()>;
+fn mkdir(&self, path: &str, mode: u32) -> Result<()>;
+fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>>;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// Filesystem methods on Instance
+open(path: string): Promise<File>;
+create(path: string): Promise<File>;
+readFile(path: string): Promise<Buffer>;
+writeFile(path: string, data: Buffer, mode?: number): Promise<void>;
+stat(path: string): Promise<FileInfo>;
+remove(path: string): Promise<void>;
+mkdir(path: string, mode?: number): Promise<void>;
+readDir(path: string): Promise<DirEntry[]>;
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_error_code cc_fs_open(cc_instance inst, const char* path, cc_file* out, cc_error* err);
+cc_error_code cc_fs_create(cc_instance inst, const char* path, cc_file* out, cc_error* err);
+cc_error_code cc_fs_read_file(cc_instance inst, const char* path,
+                               uint8_t** out, size_t* len, cc_error* err);
+cc_error_code cc_fs_write_file(cc_instance inst, const char* path,
+                                const uint8_t* data, size_t len,
+                                cc_file_mode perm, cc_error* err);
+cc_error_code cc_fs_stat(cc_instance inst, const char* path, cc_file_info* out, cc_error* err);
+cc_error_code cc_fs_remove(cc_instance inst, const char* path, cc_error* err);
+cc_error_code cc_fs_mkdir(cc_instance inst, const char* path, cc_file_mode perm, cc_error* err);
+cc_error_code cc_fs_read_dir(cc_instance inst, const char* path,
+                              cc_dir_entry** out, size_t* count, cc_error* err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### Exec (Command Execution)
+
+The exec interface mirrors subprocess/process execution APIs:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+type Exec interface {
+    Command(name string, args ...string) Cmd
+    CommandContext(ctx context.Context, name string, args ...string) Cmd
+    EntrypointCommand(args ...string) Cmd
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# Command execution methods on Instance
+def command(self, name: str, *args: str) -> Cmd: ...
+def entrypoint_command(self, *args: str) -> Cmd: ...
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// Exec trait methods on Instance
+fn command(&self, name: &str, args: &[&str]) -> Result<Cmd>;
+fn entrypoint_command(&self, args: &[&str]) -> Result<Cmd>;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// Command execution methods on Instance
+command(...args: string[]): Promise<Cmd>;
+entrypointCommand(...args: string[]): Promise<Cmd>;
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_error_code cc_cmd_new(cc_instance inst, const char* name,
+                          const char* const* args, cc_cmd* out, cc_error* err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### Net (Networking)
+
+The network interface mirrors socket APIs:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+type Net interface {
+    Dial(network, address string) (net.Conn, error)
+    DialContext(ctx context.Context, network, address string) (net.Conn, error)
+    Listen(network, address string) (net.Listener, error)
+    ListenPacket(network, address string) (net.PacketConn, error)
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# Networking methods on Instance
+def listen(self, network: str, address: str) -> Listener: ...
+# Note: Dial is available via running commands (curl, etc.)
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// Net trait methods on Instance
+fn listen(&self, network: &str, address: &str) -> Result<Listener>;
+// Note: Dial is available via running commands
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// Networking methods on Instance
+listen(network: string, address: string): Promise<Listener>;
+// Note: Dial is available via running commands
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_error_code cc_net_listen(cc_instance inst, const char* network,
+                             const char* address, cc_listener* out, cc_error* err);
+cc_error_code cc_listener_accept(cc_listener ln, cc_conn* out, cc_error* err);
+cc_error_code cc_conn_read(cc_conn c, uint8_t* buf, size_t len, size_t* n, cc_error* err);
+cc_error_code cc_conn_write(cc_conn c, const uint8_t* buf, size_t len, size_t* n, cc_error* err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Basic Workflow
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+// 1. Create an OCI client
+client, err := cc.NewOCIClient()
+
+// 2. Pull an image
+source, err := client.Pull(ctx, "alpine:latest")
+
+// 3. Create a VM
+instance, err := cc.New(source, cc.WithMemoryMB(256))
+defer instance.Close()
+
+// 4. Use it like you would use os, os/exec, and net
+output, err := instance.Command("echo", "hello").Output()
+err = instance.WriteFile("/tmp/test.txt", data, 0644)
+conn, err := instance.Dial("tcp", "example.com:80")
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+import cc
+
+# 1. Initialize the library
+cc.init()
+
+# 2. Create client and pull image
+with cc.OCIClient() as client:
+    source = client.pull("alpine:latest")
+
+    # 3. Create a VM
+    options = cc.InstanceOptions(memory_mb=256)
+    with cc.Instance(source, options) as inst:
+        # 4. Use it like standard Python I/O
+        output = inst.command("echo", "hello").output()
+        inst.write_file("/tmp/test.txt", data)
+
+# 5. Cleanup
+cc.shutdown()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// 1. Initialize and create client
+cc::init()?;
+let client = OciClient::new()?;
+
+// 2. Pull an image
+let source = client.pull("alpine:latest", None, None)?;
+
+// 3. Create a VM
+let opts = InstanceOptions { memory_mb: 256, ..Default::default() };
+let inst = Instance::new(source, Some(opts))?;
+
+// 4. Use it like std::io and std::process
+let output = inst.command("echo", &["hello"])?.output()?;
+inst.write_file("/tmp/test.txt", &data, 0o644)?;
+
+// Cleanup happens automatically on drop
+cc::shutdown();
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+import { init, shutdown, OCIClient } from '@crumblecracker/cc';
+
+// 1. Initialize the library
+init();
+
+// 2. Create client and pull image
+const client = new OCIClient();
+const source = await client.pull('alpine:latest');
+
+// 3. Create a VM with automatic cleanup
+await using inst = await source.createInstance({ memoryMb: 256 });
+
+// 4. Use it like Node.js fs and child_process
+const cmd = await inst.command('echo', 'hello');
+const output = await cmd.output();
+await inst.writeFile('/tmp/test.txt', data);
+
+// 5. Cleanup
+client.close();
+shutdown();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_error err = {0};
+cc_oci_client client;
+cc_instance_source source;
+cc_instance inst;
+
+// 1. Initialize and create client
+cc_init();
+cc_oci_client_new(&client, &err);
+
+// 2. Pull an image
+cc_oci_client_pull(client, "alpine:latest", NULL, NULL, NULL,
+                   CC_HANDLE_INVALID(cc_cancel_token), &source, &err);
+
+// 3. Create a VM
+cc_instance_options opts = { .memory_mb = 256 };
+cc_instance_new(source, &opts, &inst, &err);
+
+// 4. Use it
+const char* args[] = {"hello", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "echo", args, &cmd, &err);
+uint8_t* output;
+size_t len;
+int exit_code;
+cc_cmd_output(cmd, &output, &len, &exit_code, &err);
+
+// 5. Cleanup
+cc_free_bytes(output);
+cc_instance_close(inst, &err);
+cc_instance_source_free(source);
+cc_oci_client_free(client);
+cc_shutdown();
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Package Structure
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+import cc "github.com/tinyrange/cc"
+```
+
+The API surface is intentionally small: **Constructors** (`New`, `NewOCIClient`, `NewFilesystemSnapshotFactory`), **Options** (`WithMemoryMB`, `WithTimeout`, `WithUser`, etc.), and **Types** (`Instance`, `FS`, `Exec`, `Net`, `Cmd`, `File`, `OCIClient`).
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+import cc
+```
+
+The API surface is intentionally small: **Lifecycle** (`cc.init()`, `cc.shutdown()`), **Classes** (`OCIClient`, `Instance`, `Cmd`, `File`, `Listener`), **Options** (`InstanceOptions`, `PullOptions`), and **Exceptions** (`CCError`, `IOError`, `NotRunningError`, etc.).
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+use cc::{OciClient, Instance, InstanceOptions};
+```
+
+The API surface is intentionally small: **Lifecycle** (`cc::init()`, `cc::shutdown()`), **Types** (`OciClient`, `Instance`, `Cmd`, `File`, `Listener`), **Options** (`InstanceOptions`, `PullOptions`), and **Errors** (`cc::Error`, `cc::Result<T>`).
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+import { init, shutdown, OCIClient } from '@crumblecracker/cc';
+```
+
+The API surface is intentionally small: **Lifecycle** (`init()`, `shutdown()`), **Classes** (`OCIClient`, `Instance`, `Cmd`, `File`, `Listener`), **Types** (`InstanceOptions`, `PullOptions`, `FileInfo`), and **Errors** (`CCError`, `IOError`, `NotRunningError`, etc.).
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+#include <libcc.h>
+```
+
+The API surface is intentionally small: **Lifecycle** (`cc_init()`, `cc_shutdown()`), **Handles** (`cc_oci_client`, `cc_instance`, `cc_cmd`, `cc_file`, `cc_listener`), **Options** (`cc_instance_options`, `cc_pull_options`), and **Errors** (`cc_error_code`, `cc_error`).
+  </LangTabItem>
+</LanguageTabs>
+
+## Error Handling
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+var (
+    ErrNotRunning            // Instance is not running
+    ErrAlreadyClosed         // Instance was already closed
+    ErrTimeout               // Operation timed out
+    ErrHypervisorUnavailable // Hypervisor not available
+)
+
+// Check with errors.Is()
+if errors.Is(err, cc.ErrHypervisorUnavailable) {
+    log.Fatal("Hypervisor not available on this system")
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+try:
+    inst.read_file("/nonexistent")
+except cc.IOError as e:
+    print(f"File error: {e}")
+except cc.NotRunningError:
+    print("Instance has terminated")
+except cc.CCError as e:
+    print(f"CC error: {e}")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+use cc::Error;
+
+match result {
+    Err(Error::NotRunning) => println!("Instance has terminated"),
+    Err(Error::AlreadyClosed) => println!("Resource already closed"),
+    Err(Error::Timeout) => println!("Operation timed out"),
+    Err(Error::HypervisorUnavailable(msg)) => println!("No hypervisor: {}", msg),
+    Err(Error::Io { message, .. }) => println!("I/O error: {}", message),
+    Err(e) => println!("Error: {}", e),
+    Ok(value) => { /* success */ }
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+import { CCError, IOError, NotRunningError } from '@crumblecracker/cc';
+
+try {
+    await inst.readFile('/nonexistent');
+} catch (err) {
+    if (err instanceof IOError) {
+        console.error('File not found:', err.message);
+    } else if (err instanceof NotRunningError) {
+        console.error('Instance has terminated');
+    } else if (err instanceof CCError) {
+        console.error('CC error:', err.message);
+    }
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_error err = {0};
+
+if (cc_instance_new(source, NULL, &inst, &err) != CC_OK) {
+    switch (err.code) {
+        case CC_ERR_NOT_RUNNING:
+            fprintf(stderr, "Instance has terminated\n");
+            break;
+        case CC_ERR_HYPERVISOR_UNAVAILABLE:
+            fprintf(stderr, "No hypervisor: %s\n", err.message);
+            break;
+        case CC_ERR_IO:
+            fprintf(stderr, "I/O error: %s (path: %s)\n", err.message, err.path);
+            break;
+        default:
+            fprintf(stderr, "Error: %s\n", err.message);
+    }
+    cc_error_free(&err);
+}
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Next Steps
+
+- [Creating Instances](/cc/api/creating-instances/): VM creation and configuration
+- [Filesystem](/cc/api/filesystem/): Working with files in VMs
+- [Commands](/cc/api/commands/): Running programs and capturing output
+- [Networking](/cc/api/networking/): Connecting to and from VMs

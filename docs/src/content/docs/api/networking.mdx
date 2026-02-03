@@ -1,0 +1,855 @@
+---
+title: Networking
+description: Network operations in guest VMs
+---
+
+import LanguageTabs from '../../../components/LanguageTabs.astro';
+import LangTabItem from '../../../components/LangTabItem.astro';
+
+The networking interface provides network operations that mirror standard socket APIs. Connect from the guest to external services, or expose guest services to the host.
+
+## Overview
+
+Every instance provides networking operations directly:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+// Dial from guest to external service
+conn, err := instance.Dial("tcp", "example.com:80")
+
+// Listen inside the guest
+listener, err := instance.Listen("tcp", ":8080")
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# Listen inside the guest
+listener = inst.listen("tcp", ":8080")
+
+# Run network commands via command execution
+output = inst.command("curl", "http://example.com").output()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// Listen inside the guest
+let listener = inst.listen("tcp", ":8080")?;
+
+// Run network commands via command execution
+let output = inst.command("curl", &["http://example.com"])?.output()?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// Listen inside the guest
+const listener = await inst.listen('tcp', ':8080');
+
+// Run network commands via command execution
+const cmd = await inst.command('curl', 'http://example.com');
+const output = await cmd.output();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// Listen inside the guest
+cc_listener listener;
+cc_net_listen(inst, "tcp", ":8080", &listener, &err);
+
+// Run network commands via command execution
+const char* args[] = {"http://example.com", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "curl", args, &cmd, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Network Architecture
+
+Each VM gets a virtual network stack with:
+
+- **Default route**: Internet access via the host
+- **DNS resolution**: Automatic DNS forwarding
+- **Guest IP**: Typically `10.0.2.15`
+- **Host-accessible gateway**: The host can connect to guest services
+
+## Dialing Out
+
+### Dial
+
+Connect from the guest to a remote service (Go API only):
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+conn, err := instance.Dial("tcp", "api.example.com:443")
+if err != nil {
+    return err
+}
+defer conn.Close()
+
+// Use the connection
+conn.Write([]byte("GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n"))
+response, _ := io.ReadAll(conn)
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# Use commands for network operations
+output = inst.command("curl", "-s", "https://api.example.com/").output()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// Use commands for network operations
+let output = inst.command("curl", &["-s", "https://api.example.com/"])?.output()?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// Use commands for network operations
+const cmd = await inst.command('curl', '-s', 'https://api.example.com/');
+const output = await cmd.output();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// Use commands for network operations
+const char* args[] = {"-s", "https://api.example.com/", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "curl", args, &cmd, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### DialContext
+
+Dial with a context for cancellation or timeout (Go API only):
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+conn, err := instance.DialContext(ctx, "tcp", "slow-server.com:80")
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# Use timeout flags with curl/wget commands
+output = inst.command("curl", "--connect-timeout", "5", "http://slow-server.com").output()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// Use timeout flags with curl/wget commands
+let output = inst.command("curl", &["--connect-timeout", "5", "http://slow-server.com"])?.output()?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// Use timeout flags with curl/wget commands
+const cmd = await inst.command('curl', '--connect-timeout', '5', 'http://slow-server.com');
+const output = await cmd.output();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// Use timeout flags with curl/wget commands
+const char* args[] = {"--connect-timeout", "5", "http://slow-server.com", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "curl", args, &cmd, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### Supported Networks
+
+- `tcp`, `tcp4`, `tcp6` - TCP connections
+- `udp`, `udp4`, `udp6` - UDP connections
+
+## HTTP Requests
+
+Combine Dial with an HTTP client (Go API) or use command-based HTTP tools:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+// Create a transport that uses the guest's network
+transport := &http.Transport{
+    DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+        return instance.DialContext(ctx, network, addr)
+    },
+}
+
+client := &http.Client{Transport: transport}
+resp, err := client.Get("https://api.example.com/data")
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# Use curl or wget inside the VM
+output = inst.command("curl", "-s", "https://api.example.com/data").output()
+data = output.decode()
+
+# Or use Python's requests library if installed
+output = inst.command("python3", "-c", """
+import requests
+r = requests.get('https://api.example.com/data')
+print(r.text)
+""").output()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// Use curl or wget inside the VM
+let output = inst.command("curl", &["-s", "https://api.example.com/data"])?.output()?;
+let data = String::from_utf8_lossy(&output.stdout);
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// Use curl or wget inside the VM
+const cmd = await inst.command('curl', '-s', 'https://api.example.com/data');
+const output = await cmd.output();
+const data = output.toString();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// Use curl or wget inside the VM
+const char* args[] = {"-s", "https://api.example.com/data", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "curl", args, &cmd, &err);
+uint8_t* output;
+size_t len;
+int exit_code;
+cc_cmd_output(cmd, &output, &len, &exit_code, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Listening
+
+### Listen
+
+Create a TCP listener inside the guest:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+listener, err := instance.Listen("tcp", ":8080")
+if err != nil {
+    return err
+}
+defer listener.Close()
+
+for {
+    conn, err := listener.Accept()
+    if err != nil {
+        return err
+    }
+    go handleConnection(conn)
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+listener = inst.listen("tcp", ":8080")
+conn = listener.accept()
+# Handle connection...
+listener.close()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let listener = inst.listen("tcp", ":8080")?;
+let conn = listener.accept()?;
+// Handle connection...
+listener.close()?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const listener = await inst.listen('tcp', ':8080');
+const conn = await listener.accept();
+// Handle connection...
+await listener.close();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_listener listener;
+cc_net_listen(inst, "tcp", ":8080", &listener, &err);
+
+cc_conn conn;
+cc_listener_accept(listener, &conn, &err);
+// Handle connection...
+
+cc_conn_close(conn, &err);
+cc_listener_close(listener, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### ListenPacket
+
+Create a UDP listener (Go API only):
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+packetConn, err := instance.ListenPacket("udp", ":5353")
+if err != nil {
+    return err
+}
+defer packetConn.Close()
+
+buf := make([]byte, 1024)
+n, addr, err := packetConn.ReadFrom(buf)
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# UDP operations via commands
+inst.command("nc", "-u", "-l", "5353").start()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// UDP operations via commands
+inst.command("nc", &["-u", "-l", "5353"])?.start()?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// UDP operations via commands
+const cmd = await inst.command('nc', '-u', '-l', '5353');
+await cmd.start();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// UDP operations via commands
+const char* args[] = {"-u", "-l", "5353", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "nc", args, &cmd, &err);
+cc_cmd_start(cmd, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Port Forwarding
+
+### Expose (Guest to Host)
+
+Expose a guest listener on the host (Go API):
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+// Guest listens on :8080
+guestListener, _ := instance.Listen("tcp", ":8080")
+
+// Create a host listener
+hostListener, _ := net.Listen("tcp", "127.0.0.1:8080")
+
+// Forward host connections to guest
+closer, err := instance.Expose("tcp", ":8080", hostListener)
+if err != nil {
+    return err
+}
+defer closer.Close()
+
+// Now connections to localhost:8080 reach the guest
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# Start a server in the guest
+inst.command("python3", "-m", "http.server", "8080").start()
+
+# Access via guest listener
+listener = inst.listen("tcp", ":8080")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// Start a server in the guest
+inst.command("python3", &["-m", "http.server", "8080"])?.start()?;
+
+// Access via guest listener
+let listener = inst.listen("tcp", ":8080")?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// Start a server in the guest
+const serverCmd = await inst.command('python3', '-m', 'http.server', '8080');
+await serverCmd.start();
+
+// Access via guest listener
+const listener = await inst.listen('tcp', ':8080');
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// Start a server in the guest
+const char* args[] = {"-m", "http.server", "8080", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "python3", args, &cmd, &err);
+cc_cmd_start(cmd, &err);
+
+// Access via guest listener
+cc_listener listener;
+cc_net_listen(inst, "tcp", ":8080", &listener, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## DNS Resolution
+
+DNS works automatically inside the guest. The VM uses the host's DNS configuration by default.
+
+Run DNS lookups from guest commands:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+output, _ := instance.Command("nslookup", "example.com").Output()
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+output = inst.command("nslookup", "example.com").output()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let output = inst.command("nslookup", &["example.com"])?.output()?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const cmd = await inst.command('nslookup', 'example.com');
+const output = await cmd.output();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+const char* args[] = {"example.com", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "nslookup", args, &cmd, &err);
+uint8_t* output;
+size_t len;
+int exit_code;
+cc_cmd_output(cmd, &output, &len, &exit_code, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Example: HTTP Server
+
+Run a web server in the guest and access it:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+func runWebServer(instance cc.Instance) error {
+    // Write a simple Python server
+    serverCode := `
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+import os
+os.chdir('/www')
+httpd = HTTPServer(('', 8080), SimpleHTTPRequestHandler)
+print('Serving on port 8080')
+httpd.serve_forever()
+`
+    instance.MkdirAll("/www", 0755)
+    instance.WriteFile("/www/index.html", []byte("<h1>Hello from VM!</h1>"), 0644)
+    instance.WriteFile("/server.py", []byte(serverCode), 0644)
+
+    // Start the server
+    cmd := instance.Command("python3", "/server.py")
+    if err := cmd.Start(); err != nil {
+        return err
+    }
+
+    // Wait for server to start
+    time.Sleep(time.Second)
+
+    // Access it via Dial
+    conn, err := instance.Dial("tcp", "127.0.0.1:8080")
+    if err != nil {
+        return err
+    }
+    defer conn.Close()
+
+    conn.Write([]byte("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+    response, _ := io.ReadAll(conn)
+    fmt.Println(string(response))
+
+    return nil
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+import time
+
+def run_web_server(inst):
+    # Write a simple Python server
+    server_code = '''
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+import os
+os.chdir('/www')
+httpd = HTTPServer(('', 8080), SimpleHTTPRequestHandler)
+print('Serving on port 8080')
+httpd.serve_forever()
+'''
+    inst.mkdir_all("/www")
+    inst.write_file("/www/index.html", b"<h1>Hello from VM!</h1>")
+    inst.write_file("/server.py", server_code.encode())
+
+    # Start the server
+    cmd = inst.command("python3", "/server.py")
+    cmd.start()
+
+    # Wait for server to start
+    time.sleep(1)
+
+    # Access it via curl
+    output = inst.command("curl", "-s", "http://127.0.0.1:8080/").output()
+    print(output.decode())
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+use std::thread;
+use std::time::Duration;
+
+fn run_web_server(inst: &Instance) -> cc::Result<()> {
+    // Write a simple Python server
+    let server_code = r#"
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+import os
+os.chdir('/www')
+httpd = HTTPServer(('', 8080), SimpleHTTPRequestHandler)
+print('Serving on port 8080')
+httpd.serve_forever()
+"#;
+    inst.mkdir_all("/www", 0o755)?;
+    inst.write_file("/www/index.html", b"<h1>Hello from VM!</h1>", 0o644)?;
+    inst.write_file("/server.py", server_code.as_bytes(), 0o644)?;
+
+    // Start the server
+    let mut cmd = inst.command("python3", &["/server.py"])?;
+    cmd.start()?;
+
+    // Wait for server to start
+    thread::sleep(Duration::from_secs(1));
+
+    // Access it via curl
+    let output = inst.command("curl", &["-s", "http://127.0.0.1:8080/"])?.output()?;
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+
+    Ok(())
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+async function runWebServer(inst: Instance) {
+    // Write a simple Python server
+    const serverCode = `
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+import os
+os.chdir('/www')
+httpd = HTTPServer(('', 8080), SimpleHTTPRequestHandler)
+print('Serving on port 8080')
+httpd.serve_forever()
+`;
+    await inst.mkdirAll('/www');
+    await inst.writeFile('/www/index.html', Buffer.from('<h1>Hello from VM!</h1>'));
+    await inst.writeFile('/server.py', Buffer.from(serverCode));
+
+    // Start the server
+    const serverCmd = await inst.command('python3', '/server.py');
+    await serverCmd.start();
+
+    // Wait for server to start
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    // Access it via curl
+    const curlCmd = await inst.command('curl', '-s', 'http://127.0.0.1:8080/');
+    const output = await curlCmd.output();
+    console.log(output.toString());
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+void run_web_server(cc_instance inst) {
+    cc_error err = {0};
+
+    // Write a simple Python server
+    const char* server_code =
+        "from http.server import HTTPServer, SimpleHTTPRequestHandler\n"
+        "import os\n"
+        "os.chdir('/www')\n"
+        "httpd = HTTPServer(('', 8080), SimpleHTTPRequestHandler)\n"
+        "print('Serving on port 8080')\n"
+        "httpd.serve_forever()\n";
+
+    cc_fs_mkdir_all(inst, "/www", 0755, &err);
+    cc_fs_write_file(inst, "/www/index.html",
+                     (const uint8_t*)"<h1>Hello from VM!</h1>", 23, 0644, &err);
+    cc_fs_write_file(inst, "/server.py",
+                     (const uint8_t*)server_code, strlen(server_code), 0644, &err);
+
+    // Start the server
+    const char* args[] = {"/server.py", NULL};
+    cc_cmd cmd;
+    cc_cmd_new(inst, "python3", args, &cmd, &err);
+    cc_cmd_start(cmd, &err);
+
+    // Wait for server to start
+    sleep(1);
+
+    // Access it via curl
+    const char* curl_args[] = {"-s", "http://127.0.0.1:8080/", NULL};
+    cc_cmd curl_cmd;
+    cc_cmd_new(inst, "curl", curl_args, &curl_cmd, &err);
+    uint8_t* output;
+    size_t len;
+    int exit_code;
+    cc_cmd_output(curl_cmd, &output, &len, &exit_code, &err);
+    printf("%.*s\n", (int)len, output);
+    cc_free_bytes(output);
+}
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Example: Web Scraping Sandbox
+
+Create an isolated environment for web scraping:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+func scrapeInSandbox(url string) ([]byte, error) {
+    client, _ := cc.NewOCIClient()
+    source, _ := client.Pull(ctx, "python:3.12-slim")
+
+    instance, _ := cc.New(source,
+        cc.WithMemoryMB(256),
+        cc.WithTimeout(30*time.Second),
+    )
+    defer instance.Close()
+
+    // Install requests
+    instance.Command("pip", "install", "requests").Run()
+
+    // Write scraper script
+    script := fmt.Sprintf(`
+import requests
+r = requests.get('%s')
+print(r.text)
+`, url)
+    instance.WriteFile("/scrape.py", []byte(script), 0644)
+
+    // Run it
+    return instance.Command("python3", "/scrape.py").Output()
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+def scrape_in_sandbox(url):
+    with cc.OCIClient() as client:
+        source = client.pull("python:3.12-slim")
+        options = cc.InstanceOptions(memory_mb=256, timeout_seconds=30)
+
+        with cc.Instance(source, options) as inst:
+            # Install requests
+            inst.command("pip", "install", "requests").run()
+
+            # Write scraper script
+            script = f'''
+import requests
+r = requests.get('{url}')
+print(r.text)
+'''
+            inst.write_file("/scrape.py", script.encode())
+
+            # Run it
+            return inst.command("python3", "/scrape.py").output()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+fn scrape_in_sandbox(url: &str) -> cc::Result<Vec<u8>> {
+    let client = OciClient::new()?;
+    let source = client.pull("python:3.12-slim", None, None)?;
+
+    let opts = InstanceOptions {
+        memory_mb: 256,
+        timeout_seconds: 30.0,
+        ..Default::default()
+    };
+    let inst = Instance::new(source, Some(opts))?;
+
+    // Install requests
+    inst.command("pip", &["install", "requests"])?.run()?;
+
+    // Write scraper script
+    let script = format!(r#"
+import requests
+r = requests.get('{}')
+print(r.text)
+"#, url);
+    inst.write_file("/scrape.py", script.as_bytes(), 0o644)?;
+
+    // Run it
+    let output = inst.command("python3", &["/scrape.py"])?.output()?;
+    Ok(output.stdout)
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+async function scrapeInSandbox(url: string): Promise<Buffer> {
+    const client = new OCIClient();
+    const source = await client.pull('python:3.12-slim');
+
+    await using inst = await source.createInstance({
+        memoryMb: 256,
+        timeoutSeconds: 30,
+    });
+
+    // Install requests
+    const pipCmd = await inst.command('pip', 'install', 'requests');
+    await pipCmd.run();
+
+    // Write scraper script
+    const script = `
+import requests
+r = requests.get('${url}')
+print(r.text)
+`;
+    await inst.writeFile('/scrape.py', Buffer.from(script));
+
+    // Run it
+    const scrapeCmd = await inst.command('python3', '/scrape.py');
+    return await scrapeCmd.output();
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+void scrape_in_sandbox(const char* url, uint8_t** output, size_t* len) {
+    cc_error err = {0};
+    cc_oci_client client;
+    cc_instance_source source;
+    cc_instance inst;
+
+    cc_oci_client_new(&client, &err);
+    cc_oci_client_pull(client, "python:3.12-slim", NULL, NULL, NULL,
+                       CC_HANDLE_INVALID(cc_cancel_token), &source, &err);
+
+    cc_instance_options opts = { .memory_mb = 256, .timeout_seconds = 30.0 };
+    cc_instance_new(source, &opts, &inst, &err);
+
+    // Install requests
+    const char* pip_args[] = {"install", "requests", NULL};
+    cc_cmd pip_cmd;
+    cc_cmd_new(inst, "pip", pip_args, &pip_cmd, &err);
+    int exit_code;
+    cc_cmd_run(pip_cmd, &exit_code, &err);
+
+    // Write scraper script
+    char script[512];
+    snprintf(script, sizeof(script),
+             "import requests\nr = requests.get('%s')\nprint(r.text)\n", url);
+    cc_fs_write_file(inst, "/scrape.py", (const uint8_t*)script, strlen(script), 0644, &err);
+
+    // Run it
+    const char* py_args[] = {"/scrape.py", NULL};
+    cc_cmd py_cmd;
+    cc_cmd_new(inst, "python3", py_args, &py_cmd, &err);
+    cc_cmd_output(py_cmd, output, len, &exit_code, &err);
+
+    cc_instance_close(inst, &err);
+    cc_instance_source_free(source);
+    cc_oci_client_free(client);
+}
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Packet Capture
+
+Capture network traffic for debugging (Go API or environment variable):
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+f, _ := os.Create("traffic.pcap")
+defer f.Close()
+
+instance, err := cc.New(source, cc.WithPacketCapture(f))
+defer instance.Close()
+
+// All network traffic is captured to traffic.pcap
+// View with: wireshark traffic.pcap
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# Set CC_NETSTACK_PCAP_DIR environment variable before creating instance
+import os
+os.environ["CC_NETSTACK_PCAP_DIR"] = "/path/to/pcaps"
+
+# Or capture inside the VM
+inst.command("tcpdump", "-i", "eth0", "-w", "/tmp/capture.pcap").start()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// Set CC_NETSTACK_PCAP_DIR environment variable before creating instance
+std::env::set_var("CC_NETSTACK_PCAP_DIR", "/path/to/pcaps");
+
+// Or capture inside the VM
+inst.command("tcpdump", &["-i", "eth0", "-w", "/tmp/capture.pcap"])?.start()?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// Set CC_NETSTACK_PCAP_DIR environment variable before creating instance
+process.env.CC_NETSTACK_PCAP_DIR = '/path/to/pcaps';
+
+// Or capture inside the VM
+const tcpCmd = await inst.command('tcpdump', '-i', 'eth0', '-w', '/tmp/capture.pcap');
+await tcpCmd.start();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// Set CC_NETSTACK_PCAP_DIR environment variable before creating instance
+setenv("CC_NETSTACK_PCAP_DIR", "/path/to/pcaps", 1);
+
+// Or capture inside the VM
+const char* args[] = {"-i", "eth0", "-w", "/tmp/capture.pcap", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "tcpdump", args, &cmd, &err);
+cc_cmd_start(cmd, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Next Steps
+
+- [OCI Images](/cc/api/oci-images/) - Pull and manage container images
+- [Options Reference](/cc/reference/options/) - Network-related options

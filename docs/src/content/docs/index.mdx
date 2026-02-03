@@ -20,6 +20,8 @@ import FeatureCard from '../../components/FeatureCard.astro';
 import FeatureGrid from '../../components/FeatureGrid.astro';
 import LinkCard from '../../components/LinkCard.astro';
 import ActionCard from '../../components/ActionCard.astro';
+import LanguageTabs from '../../components/LanguageTabs.astro';
+import LangTabItem from '../../components/LangTabItem.astro';
 
 ## Why CrumbleCracker?
 
@@ -32,8 +34,8 @@ Containers share the host kernel. That's efficient, but it's also a security bou
   <FeatureCard title="Hardware Security Boundaries" icon="🔒" color="purple">
     Each VM runs its own Linux kernel. An escape hits the hypervisor, not your host.
   </FeatureCard>
-  <FeatureCard title="Go-Native Programming" icon="⚡" color="green">
-    The API mirrors `os`, `os/exec`, and `net`—no new abstractions to learn.
+  <FeatureCard title="Familiar APIs" icon="⚡" color="green">
+    Idiomatic bindings for Go, Python, Rust, TypeScript, and C. Use your language's native patterns.
   </FeatureCard>
   <FeatureCard title="Native Hypervisors" icon="🌐" color="orange">
     Hypervisor.framework on macOS, KVM on Linux, WHP on Windows. Uses each platform's native virtualization with no extra configuration.
@@ -46,13 +48,15 @@ Containers share the host kernel. That's efficient, but it's also a security bou
   <LinkCard title="CrumbleCracker App" href="/cc/app/overview/" icon="🖥️" color="cyan">
     Desktop application for interactive VM management. Spin up containers visually, access full terminal sessions, and manage your development environments without touching the command line.
   </LinkCard>
-  <LinkCard title="Go API" href="/cc/api/overview/" icon="📦" color="magenta">
-    Embed VMs directly in your Go applications. Build sandboxed code execution, isolated CI runners, or secure multi-tenant systems with a familiar, idiomatic interface.
+  <LinkCard title="API" href="/cc/api/overview/" icon="📦" color="magenta">
+    Embed VMs directly in your applications. Available in Go, Python, Rust, TypeScript, and C with idiomatic APIs for each language.
   </LinkCard>
 </FeatureGrid>
 
 ## See It In Action
 
+<LanguageTabs>
+  <LangTabItem lang="go">
 ```go
 package main
 
@@ -75,6 +79,105 @@ func main() {
     fmt.Println(string(output))
 }
 ```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+import cc
+
+cc.init()
+
+with cc.OCIClient() as client:
+    source = client.pull("alpine:latest")
+
+    # Boot a VM from a container image
+    with cc.Instance(source, cc.InstanceOptions(memory_mb=256)) as instance:
+        # Run commands with familiar Python patterns
+        output = instance.command("cat", "/etc/os-release").output()
+        print(output.decode())
+
+cc.shutdown()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+use cc::{OciClient, Instance, InstanceOptions};
+
+fn main() -> cc::Result<()> {
+    cc::init()?;
+
+    let client = OciClient::new()?;
+    let source = client.pull("alpine:latest", None, None)?;
+
+    // Boot a VM from a container image
+    let opts = InstanceOptions { memory_mb: 256, ..Default::default() };
+    let instance = Instance::new(source, Some(opts))?;
+
+    // Run commands with std::io patterns
+    let output = instance.command("cat", &["/etc/os-release"])?.output()?;
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+
+    cc::shutdown();
+    Ok(())
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+import { init, shutdown, OCIClient } from '@crumblecracker/cc';
+
+init();
+
+const client = new OCIClient();
+const source = await client.pull('alpine:latest');
+
+// Boot a VM from a container image
+await using instance = await source.createInstance({ memoryMb: 256 });
+
+// Run commands with async/await
+const cmd = await instance.command('cat', '/etc/os-release');
+const output = await cmd.output();
+console.log(output.toString());
+
+client.close();
+shutdown();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+#include <libcc.h>
+#include <stdio.h>
+
+int main() {
+    cc_error err = {0};
+    cc_oci_client client;
+    cc_instance_source source;
+    cc_instance instance;
+
+    cc_init();
+    cc_oci_client_new(&client, &err);
+    cc_oci_client_pull(client, "alpine:latest", NULL, NULL, NULL,
+                       CC_HANDLE_INVALID(cc_cancel_token), &source, &err);
+
+    // Boot a VM from a container image
+    cc_instance_options opts = { .memory_mb = 256 };
+    cc_instance_new(source, &opts, &instance, &err);
+
+    // Run commands via handle-based API
+    const char* args[] = {"/etc/os-release", NULL};
+    cc_cmd cmd;
+    cc_cmd_new(instance, "cat", args, &cmd, &err);
+    uint8_t* output; size_t len; int exit_code;
+    cc_cmd_output(cmd, &output, &len, &exit_code, &err);
+    printf("%.*s", (int)len, output);
+
+    cc_free_bytes(output);
+    cc_instance_close(instance, &err);
+    cc_shutdown();
+    return 0;
+}
+```
+  </LangTabItem>
+</LanguageTabs>
 
 ## Get Started
 
@@ -82,7 +185,7 @@ func main() {
   <ActionCard title="Install CrumbleCracker" href="/cc/getting-started/installation/" icon="⚙️" color="blue">
     Set up the desktop app and discover fast accessible virtualization for all your systems.
   </ActionCard>
-  <ActionCard title="Learn the Go library" href="/cc/getting-started/quick-start/" icon="🚀" color="green">
-     Make your first Sandbox and build cross-platform sandboxes in no time.
+  <ActionCard title="Explore the API" href="/cc/getting-started/quick-start/" icon="🚀" color="green">
+    Build your first sandbox in Go, Python, Rust, TypeScript, or C.
   </ActionCard>
 </FeatureGrid>

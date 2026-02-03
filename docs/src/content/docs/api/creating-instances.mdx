@@ -1,0 +1,760 @@
+---
+title: Creating Instances
+description: How to create and configure VM instances
+---
+
+import LanguageTabs from '../../../components/LanguageTabs.astro';
+import LangTabItem from '../../../components/LangTabItem.astro';
+
+An `Instance` is a running virtual machine. This page covers how to create instances and configure them with options.
+
+## Basic Creation
+
+Create an instance from an `InstanceSource` (typically pulled from a registry):
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+client, err := cc.NewOCIClient()
+if err != nil {
+    return err
+}
+
+source, err := client.Pull(ctx, "alpine:latest")
+if err != nil {
+    return err
+}
+
+instance, err := cc.New(source)
+if err != nil {
+    return err
+}
+defer instance.Close()
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+with cc.OCIClient() as client:
+    source = client.pull("alpine:latest")
+
+    with cc.Instance(source) as inst:
+        # Use the instance
+        pass
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let client = OciClient::new()?;
+let source = client.pull("alpine:latest", None, None)?;
+let inst = Instance::new(source, None)?;
+// Instance closed automatically on drop
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const client = new OCIClient();
+const source = await client.pull('alpine:latest');
+
+await using inst = await source.createInstance();
+// Instance closed automatically when scope exits
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_oci_client client;
+cc_instance_source source;
+cc_instance inst;
+cc_error err = {0};
+
+cc_oci_client_new(&client, &err);
+cc_oci_client_pull(client, "alpine:latest", NULL, NULL, NULL,
+                   CC_HANDLE_INVALID(cc_cancel_token), &source, &err);
+cc_instance_new(source, NULL, &inst, &err);
+
+// Use the instance...
+
+cc_instance_close(inst, &err);
+cc_instance_source_free(source);
+cc_oci_client_free(client);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+The instance creation blocks until the VM is fully booted and ready to accept commands.
+
+## Instance Sources
+
+An `InstanceSource` is anything that can be used to create a VM. The package provides several ways to get one:
+
+### From a Registry
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+source, err := client.Pull(ctx, "alpine:latest")
+source, err := client.Pull(ctx, "python:3.12-slim")
+source, err := client.Pull(ctx, "ghcr.io/user/image:tag")
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+source = client.pull("alpine:latest")
+source = client.pull("python:3.12-slim")
+source = client.pull("ghcr.io/user/image:tag")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let source = client.pull("alpine:latest", None, None)?;
+let source = client.pull("python:3.12-slim", None, None)?;
+let source = client.pull("ghcr.io/user/image:tag", None, None)?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const source = await client.pull('alpine:latest');
+const source = await client.pull('python:3.12-slim');
+const source = await client.pull('ghcr.io/user/image:tag');
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_oci_client_pull(client, "alpine:latest", NULL, NULL, NULL,
+                   CC_HANDLE_INVALID(cc_cancel_token), &source, &err);
+cc_oci_client_pull(client, "python:3.12-slim", NULL, NULL, NULL,
+                   CC_HANDLE_INVALID(cc_cancel_token), &source, &err);
+cc_oci_client_pull(client, "ghcr.io/user/image:tag", NULL, NULL, NULL,
+                   CC_HANDLE_INVALID(cc_cancel_token), &source, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### From a Tarball
+
+Load an OCI tarball (created with `docker save`):
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+source, err := client.LoadFromTar("/path/to/image.tar")
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+source = client.load_tar("/path/to/image.tar")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let source = client.load_tar("/path/to/image.tar", None)?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const source = await client.loadTar('/path/to/image.tar');
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_oci_client_load_tar(client, "/path/to/image.tar", NULL, &source, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### From a Local Directory
+
+Load a pre-exported image directory:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+source, err := client.LoadFromDir("/path/to/image-dir")
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+source = client.load_dir("/path/to/image-dir")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let source = client.load_dir("/path/to/image-dir", None)?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const source = await client.loadDir('/path/to/image-dir');
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_oci_client_load_dir(client, "/path/to/image-dir", NULL, &source, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### From a Snapshot
+
+Use a filesystem snapshot for faster startup:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+snapshot, err := instance.SnapshotFilesystem()
+newInstance, err := cc.New(snapshot)
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+snapshot = inst.snapshot_filesystem()
+new_inst = cc.Instance(snapshot)
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let snapshot = inst.snapshot(None)?;
+let new_inst = Instance::new(snapshot.into(), None)?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const snapshot = await inst.snapshotFilesystem();
+const newInst = await snapshot.createInstance();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_filesystem_snapshot snapshot;
+cc_instance_snapshot_filesystem(inst, NULL, &snapshot, &err);
+// Use snapshot as instance source
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Common Options
+
+### Memory
+
+Set the VM memory size in megabytes:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+instance, err := cc.New(source, cc.WithMemoryMB(512))
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+options = cc.InstanceOptions(memory_mb=512)
+inst = cc.Instance(source, options)
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let opts = InstanceOptions { memory_mb: 512, ..Default::default() };
+let inst = Instance::new(source, Some(opts))?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const inst = await source.createInstance({ memoryMb: 512 });
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_instance_options opts = { .memory_mb = 512 };
+cc_instance_new(source, &opts, &inst, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+The default is platform-dependent. Larger images may require more memory.
+
+### Timeout
+
+Set a maximum lifetime for the instance:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+instance, err := cc.New(source, cc.WithTimeout(30*time.Second))
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+options = cc.InstanceOptions(timeout_seconds=30)
+inst = cc.Instance(source, options)
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let opts = InstanceOptions { timeout_seconds: 30.0, ..Default::default() };
+let inst = Instance::new(source, Some(opts))?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const inst = await source.createInstance({ timeoutSeconds: 30 });
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_instance_options opts = { .timeout_seconds = 30.0 };
+cc_instance_new(source, &opts, &inst, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+After this duration, the instance is forcibly terminated. This is useful for sandboxed code execution.
+
+### CPUs
+
+Set the number of virtual CPUs:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+instance, err := cc.New(source, cc.WithCPUs(2))
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+options = cc.InstanceOptions(cpus=2)
+inst = cc.Instance(source, options)
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let opts = InstanceOptions { cpus: 2, ..Default::default() };
+let inst = Instance::new(source, Some(opts))?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const inst = await source.createInstance({ cpus: 2 });
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_instance_options opts = { .cpus = 2 };
+cc_instance_new(source, &opts, &inst, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+The default is 1.
+
+### User
+
+Run commands as a specific user:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+// By username
+instance, err := cc.New(source, cc.WithUser("nobody"))
+
+// By UID
+instance, err := cc.New(source, cc.WithUser("1000"))
+
+// User and group
+instance, err := cc.New(source, cc.WithUser("1000:1000"))
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# By username
+options = cc.InstanceOptions(user="nobody")
+
+# By UID
+options = cc.InstanceOptions(user="1000")
+
+# User and group
+options = cc.InstanceOptions(user="1000:1000")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// By username
+let opts = InstanceOptions { user: Some("nobody".to_string()), ..Default::default() };
+
+// By UID
+let opts = InstanceOptions { user: Some("1000".to_string()), ..Default::default() };
+
+// User and group
+let opts = InstanceOptions { user: Some("1000:1000".to_string()), ..Default::default() };
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// By username
+const inst = await source.createInstance({ user: 'nobody' });
+
+// By UID
+const inst = await source.createInstance({ user: '1000' });
+
+// User and group
+const inst = await source.createInstance({ user: '1000:1000' });
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// By username
+cc_instance_options opts = { .user = "nobody" };
+
+// By UID
+cc_instance_options opts = { .user = "1000" };
+
+// User and group
+cc_instance_options opts = { .user = "1000:1000" };
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Combining Options
+
+Pass multiple options when creating an instance:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+instance, err := cc.New(source,
+    cc.WithMemoryMB(256),
+    cc.WithCPUs(2),
+    cc.WithTimeout(60*time.Second),
+    cc.WithUser("nobody"),
+)
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+options = cc.InstanceOptions(
+    memory_mb=256,
+    cpus=2,
+    timeout_seconds=60,
+    user="nobody"
+)
+inst = cc.Instance(source, options)
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let opts = InstanceOptions {
+    memory_mb: 256,
+    cpus: 2,
+    timeout_seconds: 60.0,
+    user: Some("nobody".to_string()),
+    ..Default::default()
+};
+let inst = Instance::new(source, Some(opts))?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const inst = await source.createInstance({
+    memoryMb: 256,
+    cpus: 2,
+    timeoutSeconds: 60,
+    user: 'nobody'
+});
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_instance_options opts = {
+    .memory_mb = 256,
+    .cpus = 2,
+    .timeout_seconds = 60.0,
+    .user = "nobody"
+};
+cc_instance_new(source, &opts, &inst, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Instance Lifecycle
+
+### Closing
+
+Always close instances to release resources:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+instance, err := cc.New(source)
+if err != nil {
+    return err
+}
+defer instance.Close()
+
+// Use the instance...
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# Using context manager (recommended)
+with cc.Instance(source) as inst:
+    # Use the instance...
+    pass
+# Automatically closed
+
+# Manual cleanup
+inst = cc.Instance(source)
+try:
+    # Use the instance...
+finally:
+    inst.close()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+{
+    let inst = Instance::new(source, None)?;
+    // Use the instance...
+} // Automatically closed on drop
+
+// Or manually
+let inst = Instance::new(source, None)?;
+// Use the instance...
+inst.close()?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// Using await using (recommended)
+await using inst = await source.createInstance();
+// Use the instance...
+// Automatically closed when scope exits
+
+// Manual cleanup
+const inst = await source.createInstance();
+try {
+    // Use the instance...
+} finally {
+    await inst.close();
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_instance inst;
+cc_instance_new(source, NULL, &inst, &err);
+
+// Use the instance...
+
+cc_instance_close(inst, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### Waiting for Exit
+
+If the VM's init process exits, you can wait for it:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+err := instance.Wait()
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+inst.wait()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+inst.wait(None)?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+await inst.wait();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_instance_wait(inst, CC_HANDLE_INVALID(cc_cancel_token), &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### Non-blocking Exit Check
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+select {
+case err := <-instance.Done():
+    if err != nil {
+        log.Printf("VM exited with error: %v", err)
+    }
+default:
+    // VM still running
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+if not inst.is_running:
+    print("VM has exited")
+else:
+    print("VM still running")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+if !inst.is_running() {
+    println!("VM has exited");
+} else {
+    println!("VM still running");
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+if (!await inst.isRunning()) {
+    console.log('VM has exited');
+} else {
+    console.log('VM still running');
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+if (!cc_instance_is_running(inst)) {
+    printf("VM has exited\n");
+} else {
+    printf("VM still running\n");
+}
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Checking Hypervisor Availability
+
+Check if the hypervisor is available before creating instances:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+if err := cc.SupportsHypervisor(); err != nil {
+    log.Fatal("Hypervisor unavailable:", err)
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+if not cc.supports_hypervisor():
+    print("Hypervisor unavailable")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+if !cc::supports_hypervisor()? {
+    eprintln!("Hypervisor unavailable");
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+if (!supportsHypervisor()) {
+    console.error('Hypervisor unavailable');
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+if (cc_supports_hypervisor(&err) != CC_OK) {
+    fprintf(stderr, "Hypervisor unavailable: %s\n", err.message);
+    cc_error_free(&err);
+}
+```
+  </LangTabItem>
+</LanguageTabs>
+
+This returns a descriptive error explaining why the hypervisor isn't available (missing permissions, disabled in BIOS, etc.).
+
+## Debug Options
+
+### Kernel Messages
+
+Enable kernel dmesg output for debugging boot issues:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+instance, err := cc.New(source, cc.WithDmesg())
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+options = cc.InstanceOptions(enable_dmesg=True)
+inst = cc.Instance(source, options)
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let opts = InstanceOptions { enable_dmesg: true, ..Default::default() };
+let inst = Instance::new(source, Some(opts))?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const inst = await source.createInstance({ enableDmesg: true });
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_instance_options opts = { .enable_dmesg = true };
+cc_instance_new(source, &opts, &inst, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### Packet Capture
+
+Capture network traffic for debugging (Go API only):
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+f, _ := os.Create("capture.pcap")
+defer f.Close()
+
+instance, err := cc.New(source, cc.WithPacketCapture(f))
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# Use CC_NETSTACK_PCAP_DIR environment variable
+# or capture via tcpdump inside the VM
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// Use CC_NETSTACK_PCAP_DIR environment variable
+// or capture via tcpdump inside the VM
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// Use CC_NETSTACK_PCAP_DIR environment variable
+// or capture via tcpdump inside the VM
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// Use CC_NETSTACK_PCAP_DIR environment variable
+// or capture via tcpdump inside the VM
+```
+  </LangTabItem>
+</LanguageTabs>
+
+The captured packets can be analyzed with Wireshark or tcpdump.
+
+## Next Steps
+
+- [Filesystem Operations](/cc/api/filesystem/) - Work with files in VMs
+- [Command Execution](/cc/api/commands/) - Run programs
+- [Instance Options Reference](/cc/reference/options/) - Complete options list

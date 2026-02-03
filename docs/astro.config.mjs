@@ -35,7 +35,7 @@ export default defineConfig({
 					],
 				},
 				{
-					label: 'Go API',
+					label: 'API',
 					items: [
 						{ label: 'Overview', slug: 'api/overview' },
 						{ label: 'Creating Instances', slug: 'api/creating-instances' },

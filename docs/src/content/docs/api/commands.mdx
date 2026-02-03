@@ -1,0 +1,950 @@
+---
+title: Commands
+description: Execute programs in the guest VM
+---
+
+import LanguageTabs from '../../../components/LanguageTabs.astro';
+import LangTabItem from '../../../components/LangTabItem.astro';
+
+The `Exec` interface provides command execution that mirrors your language's subprocess APIs. Run programs, capture output, and manage processes in the guest VM.
+
+## Overview
+
+Every instance provides command execution directly:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+output, err := instance.Command("echo", "hello").Output()
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+output = inst.command("echo", "hello").output()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let output = inst.command("echo", &["hello"])?.output()?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const cmd = await inst.command('echo', 'hello');
+const output = await cmd.output();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+const char* args[] = {"hello", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "echo", args, &cmd, &err);
+uint8_t* output;
+size_t len;
+int exit_code;
+cc_cmd_output(cmd, &output, &len, &exit_code, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Creating Commands
+
+### Command
+
+Create a command to run:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+cmd := instance.Command("ls", "-la", "/etc")
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+cmd = inst.command("ls", "-la", "/etc")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let cmd = inst.command("ls", &["-la", "/etc"])?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const cmd = await inst.command('ls', '-la', '/etc');
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+const char* args[] = {"-la", "/etc", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "ls", args, &cmd, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### CommandContext
+
+Create a command with a context for cancellation (Go only):
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+
+cmd := instance.CommandContext(ctx, "long-running-process")
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# Use a timeout when starting the command
+cmd = inst.command("long-running-process")
+cmd.start()
+# ... then wait with timeout or kill
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// Use a cancel token
+let cancel = CancelToken::new();
+let cmd = inst.command("long-running-process", &[])?;
+cmd.start()?;
+// ... then cancel or wait
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// Use AbortController for cancellation
+const controller = new AbortController();
+setTimeout(() => controller.abort(), 10000);
+
+const cmd = await inst.command('long-running-process');
+await cmd.start();
+// ... then wait or kill
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// Use a cancel token
+cc_cancel_token token = cc_cancel_token_new();
+// ... start command, then cancel from another thread
+cc_cancel_token_cancel(token);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### EntrypointCommand
+
+Run the container's configured entrypoint:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+// Use the image's CMD as-is
+cmd := instance.EntrypointCommand()
+
+// Override the CMD but keep ENTRYPOINT
+cmd := instance.EntrypointCommand("--verbose", "--config", "/app/config.yaml")
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# Use the image's CMD as-is
+cmd = inst.entrypoint_command()
+
+# Override the CMD but keep ENTRYPOINT
+cmd = inst.entrypoint_command("--verbose", "--config", "/app/config.yaml")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// Use the image's CMD as-is
+let cmd = inst.entrypoint_command(&[])?;
+
+// Override the CMD but keep ENTRYPOINT
+let cmd = inst.entrypoint_command(&["--verbose", "--config", "/app/config.yaml"])?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// Use the image's CMD as-is
+const cmd = await inst.entrypointCommand();
+
+// Override the CMD but keep ENTRYPOINT
+const cmd = await inst.entrypointCommand('--verbose', '--config', '/app/config.yaml');
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// Entrypoint command uses the image's configured entrypoint
+// Build the full command path from image config
+```
+  </LangTabItem>
+</LanguageTabs>
+
+This is useful when you want to respect the container's intended startup behavior.
+
+## Running Commands
+
+### Output
+
+Run and capture stdout:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+output, err := instance.Command("cat", "/etc/os-release").Output()
+if err != nil {
+    return err
+}
+fmt.Println(string(output))
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+output = inst.command("cat", "/etc/os-release").output()
+print(output.decode())
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let output = inst.command("cat", &["/etc/os-release"])?.output()?;
+println!("{}", String::from_utf8_lossy(&output.stdout));
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const cmd = await inst.command('cat', '/etc/os-release');
+const output = await cmd.output();
+console.log(output.toString());
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+const char* args[] = {"/etc/os-release", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "cat", args, &cmd, &err);
+uint8_t* output;
+size_t len;
+int exit_code;
+cc_cmd_output(cmd, &output, &len, &exit_code, &err);
+printf("%.*s\n", (int)len, output);
+cc_free_bytes(output);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### CombinedOutput
+
+Capture both stdout and stderr:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+output, err := instance.Command("sh", "-c", "echo stdout; echo stderr >&2").CombinedOutput()
+if err != nil {
+    // output still contains whatever was written before the error
+    fmt.Println("Output:", string(output))
+    return err
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+output = inst.command("sh", "-c", "echo stdout; echo stderr >&2").combined_output()
+print(output.decode())
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let output = inst.command("sh", &["-c", "echo stdout; echo stderr >&2"])?.combined_output()?;
+println!("{}", String::from_utf8_lossy(&output));
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const cmd = await inst.command('sh', '-c', 'echo stdout; echo stderr >&2');
+const output = await cmd.combinedOutput();
+console.log(output.toString());
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+const char* args[] = {"-c", "echo stdout; echo stderr >&2", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "sh", args, &cmd, &err);
+uint8_t* output;
+size_t len;
+int exit_code;
+cc_cmd_combined_output(cmd, &output, &len, &exit_code, &err);
+printf("%.*s\n", (int)len, output);
+cc_free_bytes(output);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### Run
+
+Run without capturing output:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+err := instance.Command("touch", "/tmp/marker").Run()
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+exit_code = inst.command("touch", "/tmp/marker").run()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let exit_code = inst.command("touch", &["/tmp/marker"])?.run()?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const cmd = await inst.command('touch', '/tmp/marker');
+const exitCode = await cmd.run();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+const char* args[] = {"/tmp/marker", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "touch", args, &cmd, &err);
+int exit_code;
+cc_cmd_run(cmd, &exit_code, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### Start and Wait
+
+Start a command asynchronously:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+cmd := instance.Command("sleep", "10")
+if err := cmd.Start(); err != nil {
+    return err
+}
+
+// Do other work...
+
+if err := cmd.Wait(); err != nil {
+    return err
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+cmd = inst.command("sleep", "10")
+cmd.start()
+
+# Do other work...
+
+exit_code = cmd.wait()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let mut cmd = inst.command("sleep", &["10"])?;
+cmd.start()?;
+
+// Do other work...
+
+let exit_code = cmd.wait()?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const cmd = await inst.command('sleep', '10');
+await cmd.start();
+
+// Do other work...
+
+const exitCode = await cmd.wait();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+const char* args[] = {"10", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "sleep", args, &cmd, &err);
+cc_cmd_start(cmd, &err);
+
+// Do other work...
+
+int exit_code;
+cc_cmd_wait(cmd, &exit_code, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## I/O Handling
+
+### Setting Stdin
+
+Provide input to a command:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+input := strings.NewReader("hello world")
+cmd := instance.Command("cat")
+cmd.SetStdin(input)
+output, err := cmd.Output()
+// output is "hello world"
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+cmd = inst.command("cat")
+cmd.set_stdin(b"hello world")
+output = cmd.output()
+# output is b"hello world"
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let mut cmd = inst.command("cat", &[])?;
+cmd.set_stdin(b"hello world")?;
+let output = cmd.output()?;
+// output.stdout is b"hello world"
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const cmd = await inst.command('cat');
+await cmd.setStdin(Buffer.from('hello world'));
+const output = await cmd.output();
+// output is Buffer containing "hello world"
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+const char* args[] = {NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "cat", args, &cmd, &err);
+cc_cmd_set_stdin(cmd, (const uint8_t*)"hello world", 11, &err);
+uint8_t* output;
+size_t len;
+int exit_code;
+cc_cmd_output(cmd, &output, &len, &exit_code, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### Setting Stdout/Stderr
+
+Redirect output to writers (Go specific, other languages capture output via methods):
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+var stdout, stderr bytes.Buffer
+cmd := instance.Command("sh", "-c", "echo out; echo err >&2")
+cmd.SetStdout(&stdout)
+cmd.SetStderr(&stderr)
+err := cmd.Run()
+
+fmt.Println("stdout:", stdout.String())
+fmt.Println("stderr:", stderr.String())
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# Use combined_output() or output() to capture
+output = inst.command("sh", "-c", "echo out; echo err >&2").combined_output()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// Use combined_output() or output() to capture
+let output = inst.command("sh", &["-c", "echo out; echo err >&2"])?.combined_output()?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// Use combinedOutput() or output() to capture
+const cmd = await inst.command('sh', '-c', 'echo out; echo err >&2');
+const output = await cmd.combinedOutput();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// Use cc_cmd_combined_output() or cc_cmd_output() to capture
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### Pipes
+
+Get pipes for streaming I/O (Go API specific):
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+cmd := instance.Command("cat")
+
+stdin, err := cmd.StdinPipe()
+if err != nil {
+    return err
+}
+
+stdout, err := cmd.StdoutPipe()
+if err != nil {
+    return err
+}
+
+if err := cmd.Start(); err != nil {
+    return err
+}
+
+// Write to stdin
+go func() {
+    stdin.Write([]byte("hello"))
+    stdin.Close()
+}()
+
+// Read from stdout
+output, _ := io.ReadAll(stdout)
+fmt.Println(string(output))
+
+cmd.Wait()
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# For streaming I/O, use start() and write to stdin before wait()
+cmd = inst.command("cat")
+cmd.set_stdin(b"hello")
+output = cmd.output()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// For streaming I/O, use start() and write stdin before wait()
+let mut cmd = inst.command("cat", &[])?;
+cmd.set_stdin(b"hello")?;
+let output = cmd.output()?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// For streaming I/O, use start() and write stdin before wait()
+const cmd = await inst.command('cat');
+await cmd.setStdin(Buffer.from('hello'));
+const output = await cmd.output();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// Use cc_cmd_set_stdin for input before running
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Environment Variables
+
+### SetEnv
+
+Set a single environment variable:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+cmd := instance.Command("sh", "-c", "echo $MY_VAR")
+cmd.SetEnv("MY_VAR", "hello")
+output, _ := cmd.Output()
+// output is "hello\n"
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+cmd = inst.command("sh", "-c", "echo $MY_VAR")
+cmd.set_env("MY_VAR", "hello")
+output = cmd.output()
+# output is b"hello\n"
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let cmd = inst.command("sh", &["-c", "echo $MY_VAR"])?
+    .env("MY_VAR", "hello")?;
+let output = cmd.output()?;
+// output.stdout is b"hello\n"
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const cmd = await inst.command('sh', '-c', 'echo $MY_VAR');
+await cmd.setEnv('MY_VAR', 'hello');
+const output = await cmd.output();
+// output is Buffer containing "hello\n"
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+const char* args[] = {"-c", "echo $MY_VAR", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "sh", args, &cmd, &err);
+cc_cmd_set_env(cmd, "MY_VAR", "hello", &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Working Directory
+
+Set the working directory for the command:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+cmd := instance.Command("ls")
+cmd.SetDir("/app")
+output, _ := cmd.Output()
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+cmd = inst.command("ls")
+cmd.set_dir("/app")
+output = cmd.output()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let cmd = inst.command("ls", &[])?.dir("/app")?;
+let output = cmd.output()?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const cmd = await inst.command('ls');
+await cmd.setDir('/app');
+const output = await cmd.output();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+const char* args[] = {NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "ls", args, &cmd, &err);
+cc_cmd_set_dir(cmd, "/app", &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Exit Codes
+
+Get the exit code after a command completes:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+cmd := instance.Command("sh", "-c", "exit 42")
+err := cmd.Run()
+if err != nil {
+    fmt.Printf("Exit code: %d\n", cmd.ExitCode())
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+exit_code = inst.command("sh", "-c", "exit 42").run()
+print(f"Exit code: {exit_code}")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let exit_code = inst.command("sh", &["-c", "exit 42"])?.run()?;
+println!("Exit code: {}", exit_code);
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const cmd = await inst.command('sh', '-c', 'exit 42');
+const exitCode = await cmd.run();
+console.log(`Exit code: ${exitCode}`);
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+const char* args[] = {"-c", "exit 42", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "sh", args, &cmd, &err);
+int exit_code;
+cc_cmd_run(cmd, &exit_code, &err);
+printf("Exit code: %d\n", exit_code);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Shell Commands
+
+Run shell commands with `sh -c`:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+// Pipes and redirects
+output, _ := instance.Command("sh", "-c", "cat /etc/passwd | grep root").Output()
+
+// Multiple commands
+output, _ := instance.Command("sh", "-c", "cd /app && make build").Output()
+
+// Environment variable expansion
+instance.Command("sh", "-c", "echo $HOME").Output()
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# Pipes and redirects
+output = inst.command("sh", "-c", "cat /etc/passwd | grep root").output()
+
+# Multiple commands
+output = inst.command("sh", "-c", "cd /app && make build").output()
+
+# Environment variable expansion
+output = inst.command("sh", "-c", "echo $HOME").output()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// Pipes and redirects
+let output = inst.command("sh", &["-c", "cat /etc/passwd | grep root"])?.output()?;
+
+// Multiple commands
+let output = inst.command("sh", &["-c", "cd /app && make build"])?.output()?;
+
+// Environment variable expansion
+let output = inst.command("sh", &["-c", "echo $HOME"])?.output()?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// Pipes and redirects
+const cmd1 = await inst.command('sh', '-c', 'cat /etc/passwd | grep root');
+const output1 = await cmd1.output();
+
+// Multiple commands
+const cmd2 = await inst.command('sh', '-c', 'cd /app && make build');
+const output2 = await cmd2.output();
+
+// Environment variable expansion
+const cmd3 = await inst.command('sh', '-c', 'echo $HOME');
+const output3 = await cmd3.output();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// Pipes and redirects
+const char* args1[] = {"-c", "cat /etc/passwd | grep root", NULL};
+cc_cmd_new(inst, "sh", args1, &cmd, &err);
+
+// Multiple commands
+const char* args2[] = {"-c", "cd /app && make build", NULL};
+cc_cmd_new(inst, "sh", args2, &cmd, &err);
+
+// Environment variable expansion
+const char* args3[] = {"-c", "echo $HOME", NULL};
+cc_cmd_new(inst, "sh", args3, &cmd, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Example: Build and Test
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+func buildAndTest(instance cc.Instance) error {
+    // Write source code
+    code := `
+package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("Hello!")
+}
+`
+    if err := instance.MkdirAll("/app", 0755); err != nil {
+        return err
+    }
+    if err := instance.WriteFile("/app/main.go", []byte(code), 0644); err != nil {
+        return err
+    }
+
+    // Initialize Go module
+    cmd := instance.Command("go", "mod", "init", "app")
+    cmd.SetDir("/app")
+    if err := cmd.Run(); err != nil {
+        return err
+    }
+
+    // Build
+    cmd = instance.Command("go", "build", "-o", "app")
+    cmd.SetDir("/app")
+    output, err := cmd.CombinedOutput()
+    if err != nil {
+        return fmt.Errorf("build failed: %s", output)
+    }
+
+    // Run
+    output, err = instance.Command("/app/app").Output()
+    if err != nil {
+        return err
+    }
+    fmt.Println("Output:", string(output))
+
+    return nil
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+def build_and_test(inst):
+    # Write source code
+    code = '''
+package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("Hello!")
+}
+'''
+    inst.mkdir("/app")
+    inst.write_file("/app/main.go", code.encode())
+
+    # Initialize Go module
+    cmd = inst.command("go", "mod", "init", "app")
+    cmd.set_dir("/app")
+    cmd.run()
+
+    # Build
+    cmd = inst.command("go", "build", "-o", "app")
+    cmd.set_dir("/app")
+    output = cmd.combined_output()
+
+    # Run
+    output = inst.command("/app/app").output()
+    print("Output:", output.decode())
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+fn build_and_test(inst: &Instance) -> cc::Result<()> {
+    // Write source code
+    let code = r#"
+package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("Hello!")
+}
+"#;
+    inst.mkdir("/app", 0o755)?;
+    inst.write_file("/app/main.go", code.as_bytes(), 0o644)?;
+
+    // Initialize Go module
+    inst.command("go", &["mod", "init", "app"])?.dir("/app")?.run()?;
+
+    // Build
+    let output = inst.command("go", &["build", "-o", "app"])?.dir("/app")?.combined_output()?;
+
+    // Run
+    let output = inst.command("/app/app", &[])?.output()?;
+    println!("Output: {}", String::from_utf8_lossy(&output.stdout));
+
+    Ok(())
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+async function buildAndTest(inst: Instance) {
+    // Write source code
+    const code = `
+package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("Hello!")
+}
+`;
+    await inst.mkdir('/app');
+    await inst.writeFile('/app/main.go', Buffer.from(code));
+
+    // Initialize Go module
+    let cmd = await inst.command('go', 'mod', 'init', 'app');
+    await cmd.setDir('/app');
+    await cmd.run();
+
+    // Build
+    cmd = await inst.command('go', 'build', '-o', 'app');
+    await cmd.setDir('/app');
+    await cmd.combinedOutput();
+
+    // Run
+    cmd = await inst.command('/app/app');
+    const output = await cmd.output();
+    console.log('Output:', output.toString());
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+void build_and_test(cc_instance inst) {
+    cc_error err = {0};
+
+    // Write source code
+    const char* code =
+        "package main\n"
+        "import \"fmt\"\n"
+        "func main() {\n"
+        "    fmt.Println(\"Hello!\")\n"
+        "}\n";
+
+    cc_fs_mkdir(inst, "/app", 0755, &err);
+    cc_fs_write_file(inst, "/app/main.go", (const uint8_t*)code, strlen(code), 0644, &err);
+
+    // Initialize Go module
+    const char* init_args[] = {"mod", "init", "app", NULL};
+    cc_cmd cmd;
+    cc_cmd_new(inst, "go", init_args, &cmd, &err);
+    cc_cmd_set_dir(cmd, "/app", &err);
+    int exit_code;
+    cc_cmd_run(cmd, &exit_code, &err);
+
+    // Build
+    const char* build_args[] = {"build", "-o", "app", NULL};
+    cc_cmd_new(inst, "go", build_args, &cmd, &err);
+    cc_cmd_set_dir(cmd, "/app", &err);
+    cc_cmd_run(cmd, &exit_code, &err);
+
+    // Run
+    const char* run_args[] = {NULL};
+    cc_cmd_new(inst, "/app/app", run_args, &cmd, &err);
+    uint8_t* output;
+    size_t len;
+    cc_cmd_output(cmd, &output, &len, &exit_code, &err);
+    printf("Output: %.*s\n", (int)len, output);
+    cc_free_bytes(output);
+}
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Next Steps
+
+- [Networking](/cc/api/networking/) - Connect to network services
+- [Environment Variables Reference](/cc/reference/options/) - All command options

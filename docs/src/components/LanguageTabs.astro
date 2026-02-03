@@ -1,0 +1,109 @@
+---
+import { Tabs } from '@astrojs/starlight/components';
+import { icons } from './LanguageIcons';
+---
+
+<div class="language-tabs">
+  <Tabs syncKey="lang">
+    <slot />
+  </Tabs>
+</div>
+
+<script define:vars={{ icons }}>
+  // Replace tab text with icons + names on page load
+  function updateTabs() {
+    document.querySelectorAll('.language-tabs').forEach(container => {
+      const tabs = container.querySelectorAll('[role="tab"]');
+      tabs.forEach(tab => {
+        // Skip if already processed
+        if (tab.classList.contains('lang-tab-processed')) return;
+
+        const label = tab.textContent?.trim().toLowerCase();
+        if (label && icons[label]) {
+          const capitalizedLabel = label.charAt(0).toUpperCase() + label.slice(1);
+          tab.innerHTML = '<span class="lang-icon">' + icons[label] + '</span><span class="lang-name">' + capitalizedLabel + '</span>';
+          tab.setAttribute('title', capitalizedLabel);
+          tab.classList.add(`lang-tab-${label}`);
+          tab.classList.add('lang-tab-processed');
+        }
+      });
+    });
+  }
+
+  document.addEventListener('DOMContentLoaded', updateTabs);
+  document.addEventListener('astro:page-load', updateTabs);
+</script>
+
+<style>
+  .language-tabs {
+    position: relative;
+  }
+
+  /* Right-align the tab list */
+  .language-tabs :global([role="tablist"]) {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.25rem;
+    border-bottom: none;
+    margin-bottom: 0;
+    padding: 0;
+  }
+
+  /* Small icon-only tabs */
+  .language-tabs :global([role="tab"]) {
+    padding: 0.375rem;
+    border-radius: var(--radius-sm, 6px);
+    border: 1px solid transparent;
+    opacity: 0.5;
+    transition: all 150ms ease;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .language-tabs :global([role="tab"]:hover) {
+    opacity: 0.8;
+    background: var(--surface-2, rgba(140, 155, 175, 0.08));
+  }
+
+  .language-tabs :global([role="tab"][aria-selected="true"]) {
+    opacity: 1;
+    background: var(--surface-2, rgba(140, 155, 175, 0.08));
+    border-color: var(--border-default, rgba(140, 155, 175, 0.12));
+  }
+
+  /* Icon + name layout */
+  .language-tabs :global([role="tab"] .lang-icon) {
+    display: flex;
+    align-items: center;
+  }
+
+  .language-tabs :global([role="tab"] .lang-icon svg) {
+    width: 1rem;
+    height: 1rem;
+  }
+
+  .language-tabs :global([role="tab"] .lang-name) {
+    margin-left: 0.375rem;
+    font-size: 0.8125rem;
+    font-weight: 500;
+  }
+
+  /* Language-specific colors */
+  .language-tabs :global(.lang-tab-go) { color: var(--lang-go, #00add8); }
+  .language-tabs :global(.lang-tab-python) { color: var(--lang-python, #3776ab); }
+  .language-tabs :global(.lang-tab-rust) { color: var(--lang-rust, #ce422b); }
+  .language-tabs :global(.lang-tab-typescript) { color: var(--lang-typescript, #3178c6); }
+  .language-tabs :global(.lang-tab-c) { color: var(--lang-c, #a8b9cc); }
+
+  /* Remove gap between tabs and code */
+  .language-tabs :global([role="tabpanel"]) {
+    padding: 0;
+    margin-top: 0.5rem;
+  }
+
+  /* Remove code block top margin */
+  .language-tabs :global([role="tabpanel"] .expressive-code) {
+    margin-top: 0;
+  }
+</style>

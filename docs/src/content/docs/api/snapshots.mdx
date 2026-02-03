@@ -1,0 +1,430 @@
+---
+title: Snapshots
+description: Filesystem snapshots for faster startup
+---
+
+import LanguageTabs from '../../../components/LanguageTabs.astro';
+import LangTabItem from '../../../components/LangTabItem.astro';
+
+Filesystem snapshots capture the state of a VM's filesystem and can be used to quickly create new instances. They're especially useful when you need to run many VMs with the same base setup.
+
+## Why Snapshots?
+
+Consider a development workflow where you need to run user code with Python and some pip packages. Without snapshots:
+
+1. Pull `python:3.12-slim` image (cached after first time)
+2. Start VM
+3. Run `pip install` (slow, downloads packages each time)
+4. Run user code
+5. Shutdown
+
+With snapshots:
+
+1. First time: Create snapshot after `pip install`
+2. Subsequent runs: Start from snapshot (packages already installed)
+
+Startup goes from several seconds to under a second.
+
+## Basic Usage
+
+### Creating a Snapshot
+
+After setting up a VM, capture its filesystem state:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+instance, err := cc.New(source)
+if err != nil {
+    return err
+}
+
+// Set up the environment
+instance.Command("pip", "install", "numpy", "pandas").Run()
+
+// Create a snapshot
+snapshot, err := instance.SnapshotFilesystem()
+if err != nil {
+    return err
+}
+defer snapshot.Close()
+
+// Use the snapshot to create new instances
+newInstance, err := cc.New(snapshot)
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+with cc.Instance(source) as inst:
+    # Set up the environment
+    inst.command("pip", "install", "numpy", "pandas").run()
+
+    # Create a snapshot
+    snapshot = inst.snapshot_filesystem()
+
+# Use the snapshot to create new instances
+with cc.Instance(snapshot) as new_inst:
+    # numpy and pandas are already installed
+    pass
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let inst = Instance::new(source, None)?;
+
+// Set up the environment
+inst.command("pip", &["install", "numpy", "pandas"])?.run()?;
+
+// Create a snapshot
+let snapshot = inst.snapshot(None)?;
+
+// Use the snapshot to create new instances
+let new_inst = Instance::new(snapshot.into(), None)?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+await using inst = await source.createInstance();
+
+// Set up the environment
+const pipCmd = await inst.command('pip', 'install', 'numpy', 'pandas');
+await pipCmd.run();
+
+// Create a snapshot
+const snapshot = await inst.snapshotFilesystem();
+
+// Use the snapshot to create new instances
+await using newInst = await snapshot.createInstance();
+// numpy and pandas are already installed
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_instance inst;
+cc_instance_new(source, NULL, &inst, &err);
+
+// Set up the environment
+const char* pip_args[] = {"install", "numpy", "pandas", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "pip", pip_args, &cmd, &err);
+int exit_code;
+cc_cmd_run(cmd, &exit_code, &err);
+
+// Create a snapshot
+cc_filesystem_snapshot snapshot;
+cc_instance_snapshot_filesystem(inst, NULL, &snapshot, &err);
+
+// Use the snapshot to create new instances
+cc_instance new_inst;
+cc_instance_new_from_snapshot(snapshot, NULL, &new_inst, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### Snapshot Options
+
+Exclude paths from snapshots to reduce size:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+snapshot, err := instance.SnapshotFilesystem(
+    cc.WithSnapshotExcludes("/var/cache/*", "/tmp/*"),
+)
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+snapshot = inst.snapshot_filesystem(excludes=["/var/cache/*", "/tmp/*"])
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let opts = SnapshotOptions {
+    excludes: vec!["/var/cache/*".to_string(), "/tmp/*".to_string()],
+};
+let snapshot = inst.snapshot(Some(opts))?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const snapshot = await inst.snapshotFilesystem({
+    excludes: ['/var/cache/*', '/tmp/*'],
+});
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+const char* excludes[] = {"/var/cache/*", "/tmp/*", NULL};
+cc_snapshot_options opts = { .excludes = excludes };
+cc_instance_snapshot_filesystem(inst, &opts, &snapshot, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## FilesystemSnapshotFactory
+
+The factory provides a declarative way to build snapshots with automatic caching (Go API):
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+factory := cc.NewFilesystemSnapshotFactory(client, cacheDir)
+
+snapshot, err := factory.
+    From("alpine:3.19").
+    Run("apk", "add", "--no-cache", "gcc", "musl-dev").
+    Exclude("/var/cache/*", "/tmp/*").
+    Build(ctx)
+if err != nil {
+    return err
+}
+defer snapshot.Close()
+
+instance, err := cc.New(snapshot)
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# Manual snapshot creation (factory pattern available in Go)
+with cc.OCIClient() as client:
+    source = client.pull("alpine:3.19")
+    with cc.Instance(source) as inst:
+        inst.command("apk", "add", "--no-cache", "gcc", "musl-dev").run()
+        snapshot = inst.snapshot_filesystem(excludes=["/var/cache/*", "/tmp/*"])
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// Manual snapshot creation (factory pattern available in Go)
+let client = OciClient::new()?;
+let source = client.pull("alpine:3.19", None, None)?;
+let inst = Instance::new(source, None)?;
+
+inst.command("apk", &["add", "--no-cache", "gcc", "musl-dev"])?.run()?;
+
+let opts = SnapshotOptions {
+    excludes: vec!["/var/cache/*".to_string(), "/tmp/*".to_string()],
+};
+let snapshot = inst.snapshot(Some(opts))?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// Manual snapshot creation (factory pattern available in Go)
+const client = new OCIClient();
+const source = await client.pull('alpine:3.19');
+
+await using inst = await source.createInstance();
+
+const apkCmd = await inst.command('apk', 'add', '--no-cache', 'gcc', 'musl-dev');
+await apkCmd.run();
+
+const snapshot = await inst.snapshotFilesystem({
+    excludes: ['/var/cache/*', '/tmp/*'],
+});
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// Manual snapshot creation
+cc_oci_client client;
+cc_instance_source source;
+cc_instance inst;
+
+cc_oci_client_new(&client, &err);
+cc_oci_client_pull(client, "alpine:3.19", NULL, NULL, NULL,
+                   CC_HANDLE_INVALID(cc_cancel_token), &source, &err);
+cc_instance_new(source, NULL, &inst, &err);
+
+const char* apk_args[] = {"add", "--no-cache", "gcc", "musl-dev", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "apk", apk_args, &cmd, &err);
+int exit_code;
+cc_cmd_run(cmd, &exit_code, &err);
+
+const char* excludes[] = {"/var/cache/*", "/tmp/*", NULL};
+cc_snapshot_options opts = { .excludes = excludes };
+cc_filesystem_snapshot snapshot;
+cc_instance_snapshot_filesystem(inst, &opts, &snapshot, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### How Caching Works
+
+The factory generates a cache key from the operation chain. On subsequent runs:
+
+1. If a cached snapshot exists for this key, load it directly
+2. Otherwise, execute the operations and cache the result
+
+This means `factory.From("alpine:3.19").Run("apk", "add", "gcc")` will only run `apk add` once, regardless of how many times you build.
+
+## Example: Compiler Cache
+
+Create a snapshot with a C compiler installed:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+func getCompilerSnapshot(client cc.OCIClient, cacheDir string) (cc.FilesystemSnapshot, error) {
+    return cc.NewFilesystemSnapshotFactory(client, cacheDir).
+        From("alpine:3.19").
+        Run("apk", "add", "--no-cache", "gcc", "musl-dev", "make").
+        Exclude("/var/cache/*").
+        Build(context.Background())
+}
+
+func compileCode(code string) ([]byte, error) {
+    client, _ := cc.NewOCIClient()
+    cacheDir := filepath.Join(os.TempDir(), "cc-cache")
+
+    snapshot, err := getCompilerSnapshot(client, cacheDir)
+    if err != nil {
+        return nil, err
+    }
+    defer snapshot.Close()
+
+    instance, err := cc.New(snapshot, cc.WithMemoryMB(256))
+    if err != nil {
+        return nil, err
+    }
+    defer instance.Close()
+
+    // Compiler is already installed, just compile
+    instance.WriteFile("/code/main.c", []byte(code), 0644)
+
+    output, err := instance.Command("gcc", "-o", "/code/main", "/code/main.c").CombinedOutput()
+    if err != nil {
+        return nil, fmt.Errorf("compile failed: %s", output)
+    }
+
+    return instance.Command("/code/main").Output()
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+def get_compiler_snapshot(client):
+    source = client.pull("alpine:3.19")
+    with cc.Instance(source) as inst:
+        inst.command("apk", "add", "--no-cache", "gcc", "musl-dev", "make").run()
+        return inst.snapshot_filesystem(excludes=["/var/cache/*"])
+
+def compile_code(code):
+    with cc.OCIClient() as client:
+        snapshot = get_compiler_snapshot(client)
+
+        options = cc.InstanceOptions(memory_mb=256)
+        with cc.Instance(snapshot, options) as inst:
+            # Compiler is already installed, just compile
+            inst.mkdir("/code")
+            inst.write_file("/code/main.c", code.encode())
+
+            output = inst.command("gcc", "-o", "/code/main", "/code/main.c").combined_output()
+            return inst.command("/code/main").output()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+fn get_compiler_snapshot(client: &OciClient) -> cc::Result<FilesystemSnapshot> {
+    let source = client.pull("alpine:3.19", None, None)?;
+    let inst = Instance::new(source, None)?;
+
+    inst.command("apk", &["add", "--no-cache", "gcc", "musl-dev", "make"])?.run()?;
+
+    let opts = SnapshotOptions {
+        excludes: vec!["/var/cache/*".to_string()],
+    };
+    inst.snapshot(Some(opts))
+}
+
+fn compile_code(code: &str) -> cc::Result<Vec<u8>> {
+    let client = OciClient::new()?;
+    let snapshot = get_compiler_snapshot(&client)?;
+
+    let opts = InstanceOptions { memory_mb: 256, ..Default::default() };
+    let inst = Instance::new(snapshot.into(), Some(opts))?;
+
+    // Compiler is already installed, just compile
+    inst.mkdir("/code", 0o755)?;
+    inst.write_file("/code/main.c", code.as_bytes(), 0o644)?;
+
+    let output = inst.command("gcc", &["-o", "/code/main", "/code/main.c"])?.combined_output()?;
+    inst.command("/code/main", &[])?.output().map(|o| o.stdout)
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+async function getCompilerSnapshot(client: OCIClient) {
+    const source = await client.pull('alpine:3.19');
+    await using inst = await source.createInstance();
+
+    const apkCmd = await inst.command('apk', 'add', '--no-cache', 'gcc', 'musl-dev', 'make');
+    await apkCmd.run();
+
+    return await inst.snapshotFilesystem({ excludes: ['/var/cache/*'] });
+}
+
+async function compileCode(code: string): Promise<Buffer> {
+    const client = new OCIClient();
+    const snapshot = await getCompilerSnapshot(client);
+
+    await using inst = await snapshot.createInstance({ memoryMb: 256 });
+
+    // Compiler is already installed, just compile
+    await inst.mkdir('/code');
+    await inst.writeFile('/code/main.c', Buffer.from(code));
+
+    const gccCmd = await inst.command('gcc', '-o', '/code/main', '/code/main.c');
+    await gccCmd.combinedOutput();
+
+    const runCmd = await inst.command('/code/main');
+    return await runCmd.output();
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_filesystem_snapshot get_compiler_snapshot(cc_oci_client client) {
+    cc_error err = {0};
+    cc_instance_source source;
+    cc_instance inst;
+
+    cc_oci_client_pull(client, "alpine:3.19", NULL, NULL, NULL,
+                       CC_HANDLE_INVALID(cc_cancel_token), &source, &err);
+    cc_instance_new(source, NULL, &inst, &err);
+
+    const char* args[] = {"add", "--no-cache", "gcc", "musl-dev", "make", NULL};
+    cc_cmd cmd;
+    cc_cmd_new(inst, "apk", args, &cmd, &err);
+    int exit_code;
+    cc_cmd_run(cmd, &exit_code, &err);
+
+    const char* excludes[] = {"/var/cache/*", NULL};
+    cc_snapshot_options opts = { .excludes = excludes };
+    cc_filesystem_snapshot snapshot;
+    cc_instance_snapshot_filesystem(inst, &opts, &snapshot, &err);
+
+    cc_instance_close(inst, &err);
+    return snapshot;
+}
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Snapshot Internals
+
+A filesystem snapshot implements the instance source interface, so it can be passed to instance creation. Snapshots use copy-on-write semantics:
+
+- The base filesystem is shared (read-only)
+- Changes are stored in an overlay
+- Multiple instances from the same snapshot share the base
+
+This makes creating many instances from a snapshot very fast and memory-efficient.
+
+## Next Steps
+
+- [Dockerfile Support](/cc/api/dockerfile/) - Build from Dockerfiles
+- [Creating Instances](/cc/api/creating-instances/) - Use snapshots to create VMs
