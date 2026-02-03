@@ -20,15 +20,36 @@ The cc library provides virtualization primitives with APIs that mirror the Go s
 
 1. **CGO Layer**: Export a C-compatible API from Go using `//export` directives
 2. **Language Wrappers**: Idiomatic wrappers for each target language
-3. **Handle-Based Design**: Opaque handles for Go objects, preventing direct memory access from foreign code
+3. **Handle-Based Design**: Opaque struct handles for Go objects, preventing direct memory access from foreign code
 
 ### Design Principles
 
-- **Handle-based opaque types**: All Go objects are referenced by integer handles
+- **Type-safe opaque handles**: Each handle type is a distinct struct, catching type mismatches at compile time
 - **Explicit memory management**: `cc_*_free()` functions for all allocated resources
 - **Error handling via structs**: Errors returned as `cc_error` with code and message
-- **Thread safety**: The C API is thread-safe; Go's runtime handles synchronization
+- **Thread safety**: Operations on different instances are thread-safe; a single instance should not be used from multiple threads without external synchronization
 - **Mirrored APIs**: Language bindings mirror Go's `os`, `os/exec`, and `net` patterns
+- **Cancellation support**: Long-running operations accept cancellation tokens
+
+### Minimum Version Requirements
+
+| Platform | Minimum Version |
+|----------|----------------|
+| macOS | 11.0 (Big Sur) |
+| Linux | Kernel 4.15+ with KVM |
+| Windows | 10 1803+ with Hyper-V |
+| Python | 3.10+ |
+| Node.js | 18.18+ |
+| Rust | 1.70+ |
+| TypeScript | 5.2+ (for `using` declarations) |
+
+### Ownership Conventions
+
+- **Input strings**: Copied internally, caller retains ownership
+- **Output strings**: Caller owns, must free with `cc_free_string()`
+- **Output byte buffers**: Caller owns, must free with `cc_free_bytes()`
+- **Handles**: Caller owns, must free with corresponding `cc_*_free()` function
+- **Progress callbacks**: Must remain valid for the duration of the operation
 
 ---
 
@@ -49,22 +70,44 @@ extern "C" {
 #endif
 
 /* ==========================================================================
- * Handle Types (opaque references to Go objects)
+ * API Version
  * ========================================================================== */
 
-typedef uint64_t cc_handle;
+#define CC_API_VERSION_MAJOR 0
+#define CC_API_VERSION_MINOR 1
+#define CC_API_VERSION_PATCH 0
 
-#define CC_INVALID_HANDLE 0
+// Returns the API version as a string (e.g., "0.1.0")
+const char* cc_api_version(void);
 
-typedef cc_handle cc_oci_client;
-typedef cc_handle cc_instance_source;
-typedef cc_handle cc_instance;
-typedef cc_handle cc_file;
-typedef cc_handle cc_cmd;
-typedef cc_handle cc_listener;
-typedef cc_handle cc_conn;
-typedef cc_handle cc_snapshot;
-typedef cc_handle cc_snapshot_factory;
+// Check if the runtime library is compatible with the header version
+bool cc_api_version_compatible(int major, int minor);
+
+/* ==========================================================================
+ * Handle Types (opaque references to Go objects)
+ *
+ * Each handle type is a distinct struct to enable compile-time type checking.
+ * Passing the wrong handle type to a function will produce a compiler error.
+ * ========================================================================== */
+
+#define CC_DEFINE_HANDLE(name) typedef struct { uint64_t _h; } name
+
+CC_DEFINE_HANDLE(cc_oci_client);
+CC_DEFINE_HANDLE(cc_instance_source);
+CC_DEFINE_HANDLE(cc_instance);
+CC_DEFINE_HANDLE(cc_file);
+CC_DEFINE_HANDLE(cc_cmd);
+CC_DEFINE_HANDLE(cc_listener);
+CC_DEFINE_HANDLE(cc_conn);
+CC_DEFINE_HANDLE(cc_snapshot);
+CC_DEFINE_HANDLE(cc_snapshot_factory);
+CC_DEFINE_HANDLE(cc_cancel_token);
+
+// Check if a handle is valid (non-zero)
+#define CC_HANDLE_VALID(h) ((h)._h != 0)
+
+// Initialize a handle to invalid state
+#define CC_HANDLE_INVALID(type) ((type){0})
 
 /* ==========================================================================
  * Error Handling
@@ -72,16 +115,22 @@ typedef cc_handle cc_snapshot_factory;
 
 typedef enum {
     CC_OK = 0,
-    CC_ERR_INVALID_HANDLE = 1,
-    CC_ERR_INVALID_ARGUMENT = 2,
-    CC_ERR_NOT_RUNNING = 3,
-    CC_ERR_ALREADY_CLOSED = 4,
-    CC_ERR_TIMEOUT = 5,
-    CC_ERR_HYPERVISOR_UNAVAILABLE = 6,
-    CC_ERR_IO = 7,
-    CC_ERR_NETWORK = 8,
+    CC_ERR_INVALID_HANDLE = 1,      // Handle is NULL, zero, or already freed
+    CC_ERR_INVALID_ARGUMENT = 2,    // Function argument is invalid
+    CC_ERR_NOT_RUNNING = 3,         // Instance has terminated
+    CC_ERR_ALREADY_CLOSED = 4,      // Resource was already closed
+    CC_ERR_TIMEOUT = 5,             // Operation exceeded time limit
+    CC_ERR_HYPERVISOR_UNAVAILABLE = 6, // No hypervisor support
+    CC_ERR_IO = 7,                  // Filesystem I/O error (local to guest)
+    CC_ERR_NETWORK = 8,             // Network error (DNS, TCP connect, etc.)
+    CC_ERR_CANCELLED = 9,           // Operation was cancelled via cancel token
     CC_ERR_UNKNOWN = 99
 } cc_error_code;
+
+// Error classification:
+// - CC_ERR_IO: Guest filesystem operations (open, read, write, stat, etc.)
+// - CC_ERR_NETWORK: External network operations (registry pulls, DNS, HTTP)
+// For guest network operations (e.g., Dial to guest port), use CC_ERR_IO.
 
 typedef struct {
     cc_error_code code;
@@ -100,19 +149,48 @@ void cc_free_string(char* str);
 void cc_free_bytes(uint8_t* buf);
 
 /* ==========================================================================
+ * Cancellation
+ * ========================================================================== */
+
+// Create a cancellation token. Must be freed with cc_cancel_token_free().
+cc_cancel_token cc_cancel_token_new(void);
+
+// Cancel the token. All operations using this token will return CC_ERR_CANCELLED.
+void cc_cancel_token_cancel(cc_cancel_token token);
+
+// Check if token is cancelled.
+bool cc_cancel_token_is_cancelled(cc_cancel_token token);
+
+// Free a cancellation token.
+void cc_cancel_token_free(cc_cancel_token token);
+
+/* ==========================================================================
  * Library Initialization
  * ========================================================================== */
 
 // Initialize the library. Must be called before any other function.
-// Returns CC_OK on success.
+// Returns CC_OK on success. Safe to call multiple times (reference counted).
 cc_error_code cc_init(void);
 
 // Shutdown the library and release all resources.
+// After shutdown, all handles become invalid and any function call
+// (except cc_init) returns CC_ERR_INVALID_HANDLE.
+// Reference counted: only shuts down when all cc_init calls are balanced.
 void cc_shutdown(void);
 
 // Check if hypervisor is available on this system.
 // Returns CC_OK if available, CC_ERR_HYPERVISOR_UNAVAILABLE otherwise.
 cc_error_code cc_supports_hypervisor(cc_error* err);
+
+// Query system capabilities.
+typedef struct {
+    bool hypervisor_available;
+    uint64_t max_memory_mb;     // 0 if unknown
+    int max_cpus;               // 0 if unknown
+    const char* architecture;   // "x86_64", "arm64", etc.
+} cc_capabilities;
+
+cc_error_code cc_query_capabilities(cc_capabilities* out, cc_error* err);
 
 /* ==========================================================================
  * OCI Client - Image Management
@@ -161,12 +239,15 @@ typedef struct {
 typedef void (*cc_progress_callback)(const cc_download_progress* progress, void* user_data);
 
 // Pull an OCI image from a registry.
+// The progress_user_data pointer must remain valid until the function returns.
+// Pass CC_HANDLE_INVALID(cc_cancel_token) if cancellation is not needed.
 cc_error_code cc_oci_client_pull(
     cc_oci_client client,
     const char* image_ref,
     const cc_pull_options* opts,        // May be NULL for defaults
     cc_progress_callback progress_cb,   // May be NULL
-    void* progress_user_data,
+    void* progress_user_data,           // Must remain valid until return
+    cc_cancel_token cancel,             // For cancellation, or invalid handle
     cc_instance_source* out,
     cc_error* err
 );
@@ -245,10 +326,10 @@ typedef struct {
     int cpus;                   // Number of vCPUs (default: 1)
     double timeout_seconds;     // Instance timeout (0 for no timeout)
     const char* user;           // User:group to run as (e.g., "1000:1000")
-    bool enable_gpu;            // Enable virtio-gpu
     bool enable_dmesg;          // Enable kernel dmesg output
     const cc_mount_config* mounts;
     size_t mount_count;
+    // Note: GPU is not supported in bindings. Use Go API directly.
 } cc_instance_options;
 
 // Create and start a new instance from a source.
@@ -263,7 +344,12 @@ cc_error_code cc_instance_new(
 cc_error_code cc_instance_close(cc_instance inst, cc_error* err);
 
 // Wait for an instance to terminate.
-cc_error_code cc_instance_wait(cc_instance inst, cc_error* err);
+// Pass CC_HANDLE_INVALID(cc_cancel_token) if cancellation is not needed.
+cc_error_code cc_instance_wait(
+    cc_instance inst,
+    cc_cancel_token cancel,     // For cancellation, or invalid handle
+    cc_error* err
+);
 
 // Get instance ID. Caller must free with cc_free_string().
 char* cc_instance_id(cc_instance inst);
@@ -698,37 +784,17 @@ cc_error_code cc_conn_set_read_deadline(cc_conn c, int64_t unix_time, cc_error* 
 cc_error_code cc_conn_set_write_deadline(cc_conn c, int64_t unix_time, cc_error* err);
 
 /* ==========================================================================
- * GPU Operations (virtio-gpu)
+ * GPU Operations - NOT INCLUDED IN INITIAL RELEASE
+ *
+ * GPU support (virtio-gpu) is available in the Go API but is excluded from
+ * the C bindings in the initial release due to platform-specific complexity:
+ * - Window handle ownership semantics differ across platforms
+ * - Main-thread requirements conflict with Go's runtime
+ * - Wayland vs X11 vs macOS window system differences
+ *
+ * GPU bindings will be added in a future version with a platform abstraction
+ * layer. For now, use the Go API directly for GPU workloads.
  * ========================================================================== */
-
-typedef cc_handle cc_gpu;
-
-// Get GPU interface (returns CC_INVALID_HANDLE if GPU not enabled).
-cc_gpu cc_instance_gpu(cc_instance inst);
-
-// Set the window for rendering (platform-specific window handle).
-// On macOS: NSWindow*, on Linux: X11 Window or Wayland surface.
-cc_error_code cc_gpu_set_window(cc_gpu gpu, void* window, cc_error* err);
-
-// Poll for window events. Returns false if window closed.
-bool cc_gpu_poll(cc_gpu gpu);
-
-// Render current framebuffer to window.
-void cc_gpu_render(cc_gpu gpu);
-
-// Swap window buffers.
-void cc_gpu_swap(cc_gpu gpu);
-
-// Framebuffer data.
-typedef struct {
-    uint8_t* pixels;    // BGRA format, caller must NOT free
-    uint32_t width;
-    uint32_t height;
-    bool valid;
-} cc_framebuffer;
-
-// Get current framebuffer (pixels valid until next render).
-cc_framebuffer cc_gpu_get_framebuffer(cc_gpu gpu);
 
 /* ==========================================================================
  * Filesystem Snapshots
@@ -1010,14 +1076,31 @@ from .types import PullPolicy, DownloadProgress, ImageConfig
 from ._ffi import lib, ffi
 
 class InstanceSource:
-    """Opaque reference to an image source."""
+    """Opaque reference to an image source.
+
+    Can be used as a context manager for explicit cleanup:
+        with client.pull("alpine") as source:
+            with Instance(source) as inst:
+                ...
+    """
 
     def __init__(self, handle: int):
         self._handle = handle
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
     def __del__(self):
+        self.close()
+
+    def close(self):
+        """Release the source. Safe to call multiple times."""
         if self._handle:
             lib.cc_instance_source_free(self._handle)
+            self._handle = 0
 
     @property
     def config(self) -> Optional[ImageConfig]:
@@ -1550,7 +1633,12 @@ async def test_web_app():
 
 ## Node.js/Bun Bindings
 
-The JavaScript bindings use N-API for Node.js compatibility and optionally Bun FFI for performance. TypeScript types are provided.
+The JavaScript bindings use N-API for Node.js compatibility. Bun users can use the same package (Bun supports N-API). TypeScript types are provided.
+
+**Requirements:**
+- Node.js 18.18+ or 20+ (for `Symbol.dispose` support)
+- TypeScript 5.2+ (for `using` declarations, optional)
+- Bun 1.0+ (uses N-API compatibility layer)
 
 ### Installation
 
@@ -2573,6 +2661,11 @@ pub struct Instance {
     handle: ffi::cc_instance,
 }
 
+// Instance is not thread-safe. Use external synchronization or create
+// separate instances for different threads.
+impl !Send for Instance {}
+impl !Sync for Instance {}
+
 impl Instance {
     /// Create and start a new instance.
     pub fn new(source: &InstanceSource, options: Option<InstanceOptions>) -> Result<Self> {
@@ -2664,7 +2757,15 @@ impl Instance {
             return Err(err.into());
         }
 
-        let vec = unsafe { Vec::from_raw_parts(data, len, len) };
+        // IMPORTANT: Copy data into Rust-owned Vec, then free the C buffer.
+        // We cannot use Vec::from_raw_parts because the pointer was allocated
+        // by Go/C (malloc), not Rust's allocator.
+        let vec = unsafe {
+            let slice = std::slice::from_raw_parts(data, len);
+            let owned = slice.to_vec();
+            ffi::cc_free_bytes(data);
+            owned
+        };
         Ok(vec)
     }
 
@@ -2894,13 +2995,21 @@ pub struct Output {
 }
 
 /// A command ready to run in the guest.
+///
+/// Note: Cmd tracks whether it has been started. If started, the handle
+/// is consumed by wait() and cannot be freed. If not started, drop() frees it.
 pub struct Cmd {
     handle: ffi::cc_cmd,
+    _started: bool,
 }
+
+// Cmd is not Send because the underlying Go object may have thread affinity
+impl !Send for Cmd {}
+impl !Sync for Cmd {}
 
 impl Cmd {
     pub(crate) fn new(handle: ffi::cc_cmd) -> Self {
-        Self { handle }
+        Self { handle, _started: false }
     }
 
     /// Set working directory.
@@ -2966,7 +3075,13 @@ impl Cmd {
             return Err(err.into());
         }
 
-        let vec = unsafe { Vec::from_raw_parts(data, len, len) };
+        // Copy and free - see read_file for explanation
+        let vec = unsafe {
+            let slice = std::slice::from_raw_parts(data, len);
+            let owned = slice.to_vec();
+            ffi::cc_free_bytes(data);
+            owned
+        };
         Ok(vec)
     }
 
@@ -2985,14 +3100,23 @@ impl Cmd {
             return Err(err.into());
         }
 
-        let vec = unsafe { Vec::from_raw_parts(data, len, len) };
+        // Copy and free - see read_file for explanation
+        let vec = unsafe {
+            let slice = std::slice::from_raw_parts(data, len);
+            let owned = slice.to_vec();
+            ffi::cc_free_bytes(data);
+            owned
+        };
         Ok(vec)
     }
 }
 
 impl Drop for Cmd {
     fn drop(&mut self) {
-        if self.handle != 0 {
+        if self._started {
+            // Command was started - must wait for completion, cannot free
+            // The handle is consumed by cc_cmd_wait
+        } else if CC_HANDLE_VALID(self.handle) {
             unsafe { ffi::cc_cmd_free(self.handle) };
         }
     }
@@ -3251,28 +3375,51 @@ import (
 	cc "github.com/tinyrange/cc"
 )
 
-// Handle table for tracking Go objects
+// Handle table for tracking Go objects.
+// Uses sharded locking to reduce contention when operating on different handles.
+const numShards = 64
+
+type handleShard struct {
+	sync.RWMutex
+	handles map[uint64]interface{}
+}
+
 var (
-	handleMu    sync.RWMutex
+	shards      [numShards]handleShard
 	nextHandle  uint64 = 1
-	handles     = make(map[uint64]interface{})
+	nextHandleMu sync.Mutex
 )
 
-func newHandle(obj interface{}) C.cc_handle {
-	handleMu.Lock()
-	defer handleMu.Unlock()
+func init() {
+	for i := range shards {
+		shards[i].handles = make(map[uint64]interface{})
+	}
+}
 
+func getShard(h uint64) *handleShard {
+	return &shards[h%numShards]
+}
+
+func newHandle(obj interface{}) C.cc_handle {
+	nextHandleMu.Lock()
 	h := nextHandle
 	nextHandle++
-	handles[h] = obj
-	return C.cc_handle(h)
+	nextHandleMu.Unlock()
+
+	shard := getShard(h)
+	shard.Lock()
+	shard.handles[h] = obj
+	shard.Unlock()
+
+	return C.cc_handle{_h: h}
 }
 
 func getHandle[T any](h C.cc_handle) (T, bool) {
-	handleMu.RLock()
-	defer handleMu.RUnlock()
+	shard := getShard(h._h)
+	shard.RLock()
+	defer shard.RUnlock()
 
-	obj, ok := handles[uint64(h)]
+	obj, ok := shard.handles[h._h]
 	if !ok {
 		var zero T
 		return zero, false
@@ -3283,9 +3430,10 @@ func getHandle[T any](h C.cc_handle) (T, bool) {
 }
 
 func freeHandle(h C.cc_handle) {
-	handleMu.Lock()
-	defer handleMu.Unlock()
-	delete(handles, uint64(h))
+	shard := getShard(h._h)
+	shard.Lock()
+	delete(shard.handles, h._h)
+	shard.Unlock()
 }
 
 func setError(err *C.cc_error, code C.cc_error_code, msg string) {
@@ -3303,15 +3451,17 @@ func cc_init() C.cc_error_code {
 
 //export cc_shutdown
 func cc_shutdown() {
-	handleMu.Lock()
-	defer handleMu.Unlock()
-
-	// Close all tracked handles
-	for h, obj := range handles {
-		if closer, ok := obj.(interface{ Close() error }); ok {
-			closer.Close()
+	// Close all tracked handles across all shards
+	for i := range shards {
+		shard := &shards[i]
+		shard.Lock()
+		for h, obj := range shard.handles {
+			if closer, ok := obj.(interface{ Close() error }); ok {
+				closer.Close()
+			}
+			delete(shard.handles, h)
 		}
-		delete(handles, h)
+		shard.Unlock()
 	}
 }
 
@@ -3587,6 +3737,8 @@ codesign --entitlements entitlements.plist --force --sign - libcc.dylib
 
 ## Appendix: API Reference Summary
 
+All handle types are distinct structs (not integer aliases) to enable compile-time type checking:
+
 | Go Type | C Handle Type | Primary Operations |
 |---------|---------------|-------------------|
 | `OCIClient` | `cc_oci_client` | pull, load_tar, load_dir |
@@ -3598,6 +3750,7 @@ codesign --entitlements entitlements.plist --force --sign - libcc.dylib
 | `Conn` | `cc_conn` | read, write, close |
 | `Snapshot` | `cc_snapshot` | cache_key, parent, as_source |
 | `SnapshotFactory` | `cc_snapshot_factory` | from, run, copy, build |
+| `CancelToken` | `cc_cancel_token` | cancel, is_cancelled |
 
 ### Error Code Reference
 
@@ -3610,6 +3763,15 @@ codesign --entitlements entitlements.plist --force --sign - libcc.dylib
 | 4 | `CC_ERR_ALREADY_CLOSED` | Resource already closed |
 | 5 | `CC_ERR_TIMEOUT` | Operation timed out |
 | 6 | `CC_ERR_HYPERVISOR_UNAVAILABLE` | Hypervisor not available |
-| 7 | `CC_ERR_IO` | I/O or filesystem error |
-| 8 | `CC_ERR_NETWORK` | Network error |
+| 7 | `CC_ERR_IO` | Guest filesystem I/O error |
+| 8 | `CC_ERR_NETWORK` | External network error (DNS, HTTP, registry) |
+| 9 | `CC_ERR_CANCELLED` | Operation cancelled via cancel token |
 | 99 | `CC_ERR_UNKNOWN` | Unknown error |
+
+### Thread Safety Summary
+
+- **Different instances**: Thread-safe, can be used concurrently
+- **Same instance**: NOT thread-safe, use external synchronization
+- **OCI client**: Thread-safe for all operations
+- **Cancel tokens**: Thread-safe (can cancel from any thread)
+- **Handles**: Stable across threads, but operations must respect instance thread safety
