@@ -1152,6 +1152,8 @@ func main() {
 	example := fs.String("example", "", "build and run an example (path to example directory)")
 	ccTests := fs.Bool("cc-tests", false, "build cc and run cc integration tests")
 	ciTests := fs.Bool("ci-tests", false, "run all CI tests: quest, bringup, cc-tests, examples")
+	bindingsC := fs.Bool("bindings-c", false, "build C bindings library (libcc.so/.dylib/.dll)")
+	bindingsCTest := fs.Bool("bindings-c-test", false, "build and run C bindings test")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(1)
@@ -1246,6 +1248,123 @@ func main() {
 		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
 			os.Exit(1)
 		}
+		return
+	}
+
+	if *bindingsC || *bindingsCTest {
+		// Determine library extension
+		libExt := ".so"
+		if runtime.GOOS == "darwin" {
+			libExt = ".dylib"
+		} else if runtime.GOOS == "windows" {
+			libExt = ".dll"
+		}
+
+		libPath := filepath.Join("build", "libcc"+libExt)
+		headerPath := filepath.Join("build", "libcc.h")
+
+		// Build the shared library
+		fmt.Printf("building C bindings library...\n")
+		cmd := exec.Command("go", "build", "-buildmode=c-shared",
+			"-o", libPath, "./bindings/c")
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=1")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to build C bindings: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("built %s\n", libPath)
+
+		// Copy header to build directory
+		if err := copyFile(headerPath, filepath.Join("bindings", "c", "libcc.h"), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to copy header: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("copied %s\n", headerPath)
+
+		if *bindingsCTest {
+			// Build and run the C test
+			testSrc := filepath.Join("bindings", "c", "test_basic.c")
+			testBin := filepath.Join("build", "test_basic")
+
+			// Check if test file exists
+			if _, err := os.Stat(testSrc); os.IsNotExist(err) {
+				fmt.Fprintf(os.Stderr, "C test file not found: %s\n", testSrc)
+				os.Exit(1)
+			}
+
+			// Compile the test
+			fmt.Printf("compiling C test...\n")
+			var compileArgs []string
+			if runtime.GOOS == "darwin" {
+				compileArgs = []string{
+					"-o", testBin,
+					testSrc,
+					"-L", "build",
+					"-lcc",
+					"-Wl,-rpath,@executable_path",
+				}
+			} else {
+				compileArgs = []string{
+					"-o", testBin,
+					testSrc,
+					"-L", "build",
+					"-lcc",
+					"-Wl,-rpath,$ORIGIN",
+				}
+			}
+
+			cmd = exec.Command("gcc", compileArgs...)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to compile C test: %v\n", err)
+				os.Exit(1)
+			}
+
+			// macOS: codesign the test executable with entitlements
+			if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
+				codesignOut, err := goBuild(buildOptions{
+					Package:    "internal/cmd/codesign",
+					OutputName: "codesign",
+					Build:      hostBuild,
+				})
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "failed to build codesign tool: %v\n", err)
+					os.Exit(1)
+				}
+
+				cmd = exec.Command(codesignOut.Path,
+					"-entitlements", filepath.Join("tools", "entitlements.xml"),
+					"-bin", testBin,
+				)
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
+				if err := cmd.Run(); err != nil {
+					fmt.Fprintf(os.Stderr, "failed to codesign test executable: %v\n", err)
+					os.Exit(1)
+				}
+			}
+
+			// Run the test
+			fmt.Printf("running C test...\n")
+			cmd = exec.Command(testBin)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			cmd.Env = os.Environ()
+			if runtime.GOOS == "darwin" {
+				cmd.Env = append(cmd.Env, "DYLD_LIBRARY_PATH="+filepath.Join(".", "build"))
+			} else {
+				cmd.Env = append(cmd.Env, "LD_LIBRARY_PATH="+filepath.Join(".", "build"))
+			}
+			if err := cmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "C test failed: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("C test passed!\n")
+		}
+
 		return
 	}
 
