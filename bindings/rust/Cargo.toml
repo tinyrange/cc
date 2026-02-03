@@ -1,0 +1,25 @@
+[package]
+name = "cc-vm"
+version = "0.1.0"
+edition = "2021"
+authors = ["cc contributors"]
+description = "Rust bindings for the cc virtualization library"
+license = "MIT"
+repository = "https://github.com/example/cc"
+readme = "README.md"
+keywords = ["virtualization", "vm", "container", "oci"]
+categories = ["virtualization", "api-bindings"]
+
+[lib]
+name = "cc"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "2"
+
+[build-dependencies]
+
+[dev-dependencies]
+
+[features]
+default = []

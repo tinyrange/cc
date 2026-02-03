@@ -44,7 +44,17 @@ func findHelper(libPath string) (string, []string) {
 		}
 	}
 
-	// 2. Adjacent to libcc (same directory as library)
+	// 2. Adjacent to current executable (for static linking)
+	if exePath, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exePath)
+		path := filepath.Join(dir, "cc-helper")
+		searched = append(searched, path)
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		}
+	}
+
+	// 3. Adjacent to libcc (same directory as library)
 	if libPath != "" {
 		dir := filepath.Dir(libPath)
 		path := filepath.Join(dir, "cc-helper")
@@ -54,7 +64,7 @@ func findHelper(libPath string) (string, []string) {
 		}
 	}
 
-	// 3. Platform-specific user directory
+	// 4. Platform-specific user directory
 	switch runtime.GOOS {
 	case "darwin":
 		if home, err := os.UserHomeDir(); err == nil {
@@ -82,7 +92,7 @@ func findHelper(libPath string) (string, []string) {
 		}
 	}
 
-	// 4. System PATH
+	// 5. System PATH
 	if path, err := exec.LookPath("cc-helper"); err == nil {
 		return path, nil
 	}
