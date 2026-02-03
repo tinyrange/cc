@@ -7,19 +7,704 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"encoding/xml"
-	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 )
 
 const PACKAGE_NAME = "github.com/tinyrange/cc"
+
+// ============================================================================
+// Data Structures
+// ============================================================================
+
+// Command represents a single command in a target
+type Command struct {
+	Line     string   // Original line for error messages
+	LineNum  int      // Line number for error messages
+	Platform string   // "" (any), "darwin", "linux", "windows"
+	Type     string   // "gobuild", "run", "copy", "mkdir", "rm", "sh"
+	Args     []string // Parsed arguments
+}
+
+// Target represents a build target
+type Target struct {
+	Name         string
+	Platforms    []string  // Empty = all platforms (from name[platforms]:)
+	Requires     []string  // Required OS (errors if not met)
+	Dependencies []string  // Target names this depends on
+	Commands     []Command // Commands to execute
+	LineNum      int       // Line number where target was defined
+}
+
+// Buildfile represents a parsed build configuration
+type Buildfile struct {
+	Variables map[string]string
+	Targets   map[string]*Target
+	Path      string // Path to the buildfile
+}
+
+// ============================================================================
+// Parser
+// ============================================================================
+
+type parseState int
+
+const (
+	stateTopLevel parseState = iota
+	stateInTarget
+)
+
+// parseBuildfile parses a Buildfile from a reader
+func parseBuildfile(path string, content []byte) (*Buildfile, error) {
+	bf := &Buildfile{
+		Variables: make(map[string]string),
+		Targets:   make(map[string]*Target),
+		Path:      path,
+	}
+
+	// Add built-in variables
+	bf.Variables["GOOS"] = runtime.GOOS
+	bf.Variables["GOARCH"] = runtime.GOARCH
+	bf.Variables["EXE"] = ""
+	if runtime.GOOS == "windows" {
+		bf.Variables["EXE"] = ".exe"
+	}
+	bf.Variables["SHLIB_EXT"] = ".so"
+	if runtime.GOOS == "darwin" {
+		bf.Variables["SHLIB_EXT"] = ".dylib"
+	} else if runtime.GOOS == "windows" {
+		bf.Variables["SHLIB_EXT"] = ".dll"
+	}
+
+	// Get version from git
+	bf.Variables["VERSION"] = getVersionFromGit()
+
+	lines := strings.Split(string(content), "\n")
+	state := stateTopLevel
+	var currentTarget *Target
+	var continuedLine string
+	continuedLineNum := 0
+
+	for i, line := range lines {
+		lineNum := i + 1
+
+		// Handle line continuation
+		if strings.HasSuffix(line, "\\") {
+			if continuedLine == "" {
+				continuedLineNum = lineNum
+			}
+			continuedLine += strings.TrimSuffix(line, "\\") + " "
+			continue
+		}
+		if continuedLine != "" {
+			line = continuedLine + line
+			lineNum = continuedLineNum
+			continuedLine = ""
+			continuedLineNum = 0
+		}
+
+		// Strip comments (but not inside quoted strings - simple approach)
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			// Simple check: count quotes before the #
+			prefix := line[:idx]
+			if strings.Count(prefix, `"`)%2 == 0 && strings.Count(prefix, `'`)%2 == 0 {
+				line = prefix
+			}
+		}
+
+		// Trim trailing whitespace
+		line = strings.TrimRight(line, " \t\r")
+
+		// Empty line
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+
+		// Check if line starts with whitespace (command in target)
+		startsWithWhitespace := len(line) > 0 && (line[0] == ' ' || line[0] == '\t')
+		trimmedLine := strings.TrimSpace(line)
+
+		if startsWithWhitespace && state == stateInTarget && currentTarget != nil {
+			// Parse command
+			cmd, err := parseCommand(trimmedLine, lineNum)
+			if err != nil {
+				return nil, fmt.Errorf("%s:%d: %w", path, lineNum, err)
+			}
+
+			// Check for requires directive (must be first command)
+			if cmd.Type == "requires" {
+				if len(currentTarget.Commands) > 0 {
+					return nil, fmt.Errorf("%s:%d: 'requires' must be the first directive in a target", path, lineNum)
+				}
+				currentTarget.Requires = cmd.Args
+				continue
+			}
+
+			currentTarget.Commands = append(currentTarget.Commands, cmd)
+			continue
+		}
+
+		// Non-indented line - either variable or target header
+		state = stateTopLevel
+		currentTarget = nil
+
+		// Variable definition: NAME = value
+		if idx := strings.Index(trimmedLine, "="); idx > 0 {
+			// Check it's not inside a target header (has :)
+			if !strings.Contains(trimmedLine[:idx], ":") {
+				name := strings.TrimSpace(trimmedLine[:idx])
+				value := strings.TrimSpace(trimmedLine[idx+1:])
+				if isValidIdentifier(name) {
+					bf.Variables[name] = value
+					continue
+				}
+			}
+		}
+
+		// Target header: name: deps or name[platforms]: deps
+		if idx := strings.Index(trimmedLine, ":"); idx > 0 {
+			header := trimmedLine[:idx]
+			deps := strings.TrimSpace(trimmedLine[idx+1:])
+
+			// Parse platform specifier: name[platforms]
+			var name string
+			var platforms []string
+			if bracketIdx := strings.Index(header, "["); bracketIdx > 0 {
+				if !strings.HasSuffix(header, "]") {
+					return nil, fmt.Errorf("%s:%d: unclosed platform specifier", path, lineNum)
+				}
+				name = strings.TrimSpace(header[:bracketIdx])
+				platformStr := header[bracketIdx+1 : len(header)-1]
+				for _, p := range strings.Fields(platformStr) {
+					platforms = append(platforms, p)
+				}
+			} else {
+				name = strings.TrimSpace(header)
+			}
+
+			if !isValidIdentifier(name) {
+				return nil, fmt.Errorf("%s:%d: invalid target name %q", path, lineNum, name)
+			}
+
+			// Parse dependencies
+			var dependencies []string
+			if deps != "" {
+				for _, dep := range strings.Fields(deps) {
+					dependencies = append(dependencies, dep)
+				}
+			}
+
+			currentTarget = &Target{
+				Name:         name,
+				Platforms:    platforms,
+				Dependencies: dependencies,
+				LineNum:      lineNum,
+			}
+			bf.Targets[name] = currentTarget
+			state = stateInTarget
+			continue
+		}
+
+		return nil, fmt.Errorf("%s:%d: unexpected line: %s", path, lineNum, trimmedLine)
+	}
+
+	return bf, nil
+}
+
+// parseCommand parses a command line into a Command struct
+func parseCommand(line string, lineNum int) (Command, error) {
+	cmd := Command{
+		Line:    line,
+		LineNum: lineNum,
+	}
+
+	// Check for platform conditional: @darwin, @linux, @windows
+	if strings.HasPrefix(line, "@") {
+		parts := strings.SplitN(line, " ", 2)
+		cmd.Platform = strings.TrimPrefix(parts[0], "@")
+		if len(parts) < 2 {
+			return cmd, fmt.Errorf("platform conditional without command")
+		}
+		line = strings.TrimSpace(parts[1])
+	}
+
+	// Parse command type and arguments
+	args := tokenize(line)
+	if len(args) == 0 {
+		return cmd, fmt.Errorf("empty command")
+	}
+
+	cmd.Type = args[0]
+	cmd.Args = args[1:]
+
+	// Validate command type
+	validTypes := map[string]bool{
+		"gobuild":  true,
+		"run":      true,
+		"copy":     true,
+		"mkdir":    true,
+		"rm":       true,
+		"sh":       true,
+		"requires": true,
+	}
+
+	if !validTypes[cmd.Type] {
+		return cmd, fmt.Errorf("unknown command type %q (use 'sh' prefix for shell commands)", cmd.Type)
+	}
+
+	return cmd, nil
+}
+
+// tokenize splits a command line into tokens, respecting quoted strings
+func tokenize(line string) []string {
+	var tokens []string
+	var current strings.Builder
+	inQuote := false
+	quoteChar := rune(0)
+
+	for _, r := range line {
+		if inQuote {
+			if r == quoteChar {
+				inQuote = false
+			} else {
+				current.WriteRune(r)
+			}
+		} else {
+			switch r {
+			case '"', '\'':
+				inQuote = true
+				quoteChar = r
+			case ' ', '\t':
+				if current.Len() > 0 {
+					tokens = append(tokens, current.String())
+					current.Reset()
+				}
+			default:
+				current.WriteRune(r)
+			}
+		}
+	}
+
+	if current.Len() > 0 {
+		tokens = append(tokens, current.String())
+	}
+
+	return tokens
+}
+
+// isValidIdentifier checks if a string is a valid identifier
+func isValidIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		if i == 0 {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_') {
+				return false
+			}
+		} else {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// expandVariables expands $(VAR) and ${VAR} in a string
+func (bf *Buildfile) expandVariables(s string) string {
+	// Pattern for $(VAR) or ${VAR}
+	re := regexp.MustCompile(`\$\(([^)]+)\)|\$\{([^}]+)\}`)
+	return re.ReplaceAllStringFunc(s, func(match string) string {
+		var name string
+		if strings.HasPrefix(match, "$(") {
+			name = match[2 : len(match)-1]
+		} else {
+			name = match[2 : len(match)-1]
+		}
+		if val, ok := bf.Variables[name]; ok {
+			return val
+		}
+		// Try environment variable
+		if val := os.Getenv(name); val != "" {
+			return val
+		}
+		return match // Keep original if not found
+	})
+}
+
+// ============================================================================
+// Dependency Resolution & Execution
+// ============================================================================
+
+// resolveDependencies returns targets in execution order (topological sort)
+func (bf *Buildfile) resolveDependencies(targetName string) ([]*Target, error) {
+	visited := make(map[string]bool)
+	inStack := make(map[string]bool)
+	var result []*Target
+
+	var visit func(name string) error
+	visit = func(name string) error {
+		if inStack[name] {
+			return fmt.Errorf("circular dependency detected involving %q", name)
+		}
+		if visited[name] {
+			return nil
+		}
+
+		target, ok := bf.Targets[name]
+		if !ok {
+			return fmt.Errorf("target %q not found", name)
+		}
+
+		inStack[name] = true
+
+		for _, dep := range target.Dependencies {
+			if err := visit(dep); err != nil {
+				return err
+			}
+		}
+
+		inStack[name] = false
+		visited[name] = true
+		result = append(result, target)
+		return nil
+	}
+
+	if err := visit(targetName); err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// shouldRunOnPlatform checks if a target should run on the current platform
+func (target *Target) shouldRunOnPlatform() bool {
+	if len(target.Platforms) == 0 {
+		return true
+	}
+
+	currentPlatform := fmt.Sprintf("%s/%s", runtime.GOOS, runtime.GOARCH)
+	for _, p := range target.Platforms {
+		if p == currentPlatform || p == runtime.GOOS {
+			return true
+		}
+	}
+	return false
+}
+
+// checkRequires checks if the current OS is in the requires list
+func (target *Target) checkRequires() error {
+	if len(target.Requires) == 0 {
+		return nil
+	}
+
+	for _, req := range target.Requires {
+		if req == runtime.GOOS {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("target %q requires one of %v, but running on %s", target.Name, target.Requires, runtime.GOOS)
+}
+
+// Executor handles running targets
+type Executor struct {
+	Buildfile    *Buildfile
+	DryRun       bool
+	ExtraArgs    []string // Arguments passed after --
+	builtOutputs map[string]buildOutput
+}
+
+// NewExecutor creates a new executor
+func NewExecutor(bf *Buildfile, dryRun bool, extraArgs []string) *Executor {
+	return &Executor{
+		Buildfile:    bf,
+		DryRun:       dryRun,
+		ExtraArgs:    extraArgs,
+		builtOutputs: make(map[string]buildOutput),
+	}
+}
+
+// Run executes a target and its dependencies
+func (e *Executor) Run(targetName string) error {
+	targets, err := e.Buildfile.resolveDependencies(targetName)
+	if err != nil {
+		return err
+	}
+
+	for _, target := range targets {
+		if err := e.executeTarget(target); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// executeTarget runs a single target
+func (e *Executor) executeTarget(target *Target) error {
+	// Check platform filter from target header
+	if !target.shouldRunOnPlatform() {
+		if !e.DryRun {
+			fmt.Printf("skipping target %q (not for current platform)\n", target.Name)
+		}
+		return nil
+	}
+
+	// Check requires directive
+	if err := target.checkRequires(); err != nil {
+		return err
+	}
+
+	fmt.Printf("=== %s ===\n", target.Name)
+
+	for _, cmd := range target.Commands {
+		if err := e.executeCommand(cmd, target); err != nil {
+			return fmt.Errorf("target %s: %w", target.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// executeCommand runs a single command
+func (e *Executor) executeCommand(cmd Command, target *Target) error {
+	// Check platform conditional
+	if cmd.Platform != "" && cmd.Platform != runtime.GOOS {
+		return nil
+	}
+
+	// Expand variables in arguments
+	args := make([]string, len(cmd.Args))
+	for i, arg := range cmd.Args {
+		args[i] = e.Buildfile.expandVariables(arg)
+	}
+
+	if e.DryRun {
+		if cmd.Platform != "" {
+			fmt.Printf("  [@%s] %s %s\n", cmd.Platform, cmd.Type, strings.Join(args, " "))
+		} else {
+			fmt.Printf("  %s %s\n", cmd.Type, strings.Join(args, " "))
+		}
+		return nil
+	}
+
+	switch cmd.Type {
+	case "gobuild":
+		return e.handleGoBuild(args, target)
+	case "run":
+		return e.handleRun(args)
+	case "copy":
+		return e.handleCopy(args)
+	case "mkdir":
+		return e.handleMkdir(args)
+	case "rm":
+		return e.handleRm(args)
+	case "sh":
+		return e.handleSh(args)
+	default:
+		return fmt.Errorf("unknown command type %q", cmd.Type)
+	}
+}
+
+// ============================================================================
+// Command Handlers
+// ============================================================================
+
+// handleGoBuild handles the gobuild command
+func (e *Executor) handleGoBuild(args []string, target *Target) error {
+	if len(args) < 1 {
+		return fmt.Errorf("gobuild requires a package argument")
+	}
+
+	opts := buildOptions{
+		Package: args[0],
+		Build:   crossBuild{GOOS: runtime.GOOS, GOARCH: runtime.GOARCH},
+	}
+
+	// Parse flags
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "-o":
+			if i+1 >= len(args) {
+				return fmt.Errorf("-o requires an argument")
+			}
+			i++
+			opts.OutputName = filepath.Base(args[i])
+			// Handle output directory
+			if dir := filepath.Dir(args[i]); dir != "." {
+				opts.OutputDir = dir
+			}
+		case "-os":
+			if i+1 >= len(args) {
+				return fmt.Errorf("-os requires an argument")
+			}
+			i++
+			opts.Build.GOOS = args[i]
+		case "-arch":
+			if i+1 >= len(args) {
+				return fmt.Errorf("-arch requires an argument")
+			}
+			i++
+			opts.Build.GOARCH = args[i]
+		case "-tags":
+			if i+1 >= len(args) {
+				return fmt.Errorf("-tags requires an argument")
+			}
+			i++
+			opts.Tags = strings.Split(args[i], ",")
+		case "-race":
+			opts.RaceEnabled = true
+		case "-cgo":
+			opts.CgoEnabled = true
+		case "-test":
+			opts.BuildTests = true
+		case "-entitlements":
+			if i+1 >= len(args) {
+				return fmt.Errorf("-entitlements requires an argument")
+			}
+			i++
+			opts.EntitlementsPath = args[i]
+		case "-app":
+			opts.BuildApp = true
+		case "-logo":
+			if i+1 >= len(args) {
+				return fmt.Errorf("-logo requires an argument")
+			}
+			i++
+			opts.LogoPath = args[i]
+		case "-icon":
+			if i+1 >= len(args) {
+				return fmt.Errorf("-icon requires an argument")
+			}
+			i++
+			opts.IconPath = args[i]
+		case "-version":
+			if i+1 >= len(args) {
+				return fmt.Errorf("-version requires an argument")
+			}
+			i++
+			opts.Version = args[i]
+		case "-shared":
+			opts.BuildShared = true
+		case "-appname":
+			if i+1 >= len(args) {
+				return fmt.Errorf("-appname requires an argument")
+			}
+			i++
+			opts.ApplicationName = args[i]
+		default:
+			return fmt.Errorf("unknown gobuild flag: %s", args[i])
+		}
+	}
+
+	// Default output name from package
+	if opts.OutputName == "" {
+		opts.OutputName = filepath.Base(opts.Package)
+	}
+
+	out, err := goBuild(opts)
+	if err != nil {
+		return err
+	}
+
+	// Store the output for later use
+	e.builtOutputs[target.Name] = out
+	fmt.Printf("built %s\n", out.Path)
+
+	return nil
+}
+
+// handleRun handles the run command
+func (e *Executor) handleRun(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("run requires a binary argument")
+	}
+
+	binary := args[0]
+	runArgs := args[1:]
+
+	// Append extra args from command line
+	runArgs = append(runArgs, e.ExtraArgs...)
+
+	out := buildOutput{Path: binary}
+
+	return runBuildOutput(out, runArgs, runOptions{})
+}
+
+// handleCopy handles the copy command
+func (e *Executor) handleCopy(args []string) error {
+	if len(args) != 2 {
+		return fmt.Errorf("copy requires exactly 2 arguments (src dst)")
+	}
+
+	return copyFile(args[1], args[0], 0644)
+}
+
+// handleMkdir handles the mkdir command
+func (e *Executor) handleMkdir(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("mkdir requires at least 1 argument")
+	}
+
+	for _, dir := range args {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// handleRm handles the rm command
+func (e *Executor) handleRm(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("rm requires at least 1 argument")
+	}
+
+	for _, path := range args {
+		if err := os.RemoveAll(path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// handleSh handles the sh command
+func (e *Executor) handleSh(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("sh requires a command")
+	}
+
+	// Join args back into a command string
+	cmdStr := strings.Join(args, " ")
+
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("cmd", "/c", cmdStr)
+	} else {
+		cmd = exec.Command("sh", "-c", cmdStr)
+	}
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+
+	return cmd.Run()
+}
+
+// ============================================================================
+// Build System Core (preserved from original)
+// ============================================================================
 
 type crossBuild struct {
 	GOOS   string
@@ -48,39 +733,22 @@ var hostBuild = crossBuild{
 	GOARCH: runtime.GOARCH,
 }
 
-var crossBuilds = []crossBuild{
-	{"linux", "amd64"},
-	{"windows", "amd64"},
-	{"linux", "arm64"},
-	{"darwin", "arm64"},
-	{"windows", "arm64"},
-}
-
-type remoteTarget struct {
-	Address   string `json:"address"`
-	GOOS      string `json:"os"`
-	GOARCH    string `json:"arch"`
-	TargetDir string `json:"targetDir"`
-}
-
 type buildOptions struct {
 	Package          string
 	ApplicationName  string
 	OutputName       string
+	OutputDir        string
 	CgoEnabled       bool
 	Build            crossBuild
 	RaceEnabled      bool
 	EntitlementsPath string
 	BuildTests       bool
 	Tags             []string
-	// Build a bundle on macOS, build as a windows executable on windows, and build as a normal executable on linux
-	BuildApp bool
-	// LogoPath is the path to a PNG image to use as the application icon (macOS only)
-	LogoPath string
-	// IconPath is the path to a .ico file to use as the application icon (Windows only)
-	IconPath string
-	// Version is injected into the binary via ldflags (for ccapp auto-update)
-	Version string
+	BuildApp         bool
+	LogoPath         string
+	IconPath         string
+	Version          string
+	BuildShared      bool
 }
 
 type buildOutput struct {
@@ -112,15 +780,6 @@ func copyFile(dstPath, srcPath string, perm os.FileMode) error {
 }
 
 // encodePlist marshals a struct into a minimal XML property list.
-//
-// Supported field kinds:
-// - string => <string>
-// - bool   => <true/> / <false/>
-// - int/uint and sized variants => <integer>
-// - slice of strings => <array> of <string>
-// - slice of structs => <array> of <dict>
-//
-// Fields are encoded in declaration order. Use struct tags: `plist:"CFBundleName"`.
 func encodePlist(v any) ([]byte, error) {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() == reflect.Pointer {
@@ -152,7 +811,7 @@ func encodePlist(v any) ([]byte, error) {
 
 	for i := 0; i < rt.NumField(); i++ {
 		f := rt.Field(i)
-		if f.PkgPath != "" { // unexported
+		if f.PkgPath != "" {
 			continue
 		}
 		key := f.Tag.Get("plist")
@@ -201,7 +860,7 @@ func encodePlist(v any) ([]byte, error) {
 			}
 		case reflect.Slice:
 			if fv.Len() == 0 {
-				continue // Skip empty slices
+				continue
 			}
 			arrayStart := xml.StartElement{Name: xml.Name{Local: "array"}}
 			if err := enc.EncodeToken(arrayStart); err != nil {
@@ -216,7 +875,6 @@ func encodePlist(v any) ([]byte, error) {
 						return nil, fmt.Errorf("plist: encode string in array %q: %w", key, err)
 					}
 				case reflect.Struct:
-					// Encode struct as dict
 					if err := encodePlistDict(enc, elem); err != nil {
 						return nil, fmt.Errorf("plist: encode dict in array %q: %w", key, err)
 					}
@@ -245,7 +903,6 @@ func encodePlist(v any) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// encodePlistDict encodes a struct value as a plist dict element.
 func encodePlistDict(enc *xml.Encoder, rv reflect.Value) error {
 	if rv.Kind() == reflect.Pointer {
 		rv = rv.Elem()
@@ -262,7 +919,7 @@ func encodePlistDict(enc *xml.Encoder, rv reflect.Value) error {
 
 	for i := 0; i < rt.NumField(); i++ {
 		f := rt.Field(i)
-		if f.PkgPath != "" { // unexported
+		if f.PkgPath != "" {
 			continue
 		}
 		key := f.Tag.Get("plist")
@@ -350,7 +1007,6 @@ func writeMacOSAppBundle(bundlePath, executablePath, appName, logoPath string) e
 		return fmt.Errorf("copy app executable: %w", err)
 	}
 
-	// Copy the logo to Resources if provided
 	var iconFileName string
 	if logoPath != "" {
 		iconFileName = filepath.Base(logoPath)
@@ -360,11 +1016,8 @@ func writeMacOSAppBundle(bundlePath, executablePath, appName, logoPath string) e
 		}
 	}
 
-	// Minimal Info.plist required for a runnable app bundle.
-	// Keep it simple: this is primarily for local development workflows.
 	bundleID := "com.tinyrange." + strings.ToLower(appName)
 
-	// URL scheme type for custom URL handlers
 	type urlSchemeType struct {
 		CFBundleURLName    string   `plist:"CFBundleURLName"`
 		CFBundleURLSchemes []string `plist:"CFBundleURLSchemes"`
@@ -411,40 +1064,30 @@ func writeMacOSAppBundle(bundlePath, executablePath, appName, logoPath string) e
 	return nil
 }
 
-// generateWindowsResources creates a .syso file with embedded Windows resources (icon).
-// It returns the path to the generated .syso file for cleanup after the build.
-// If the icon file doesn't exist, it silently returns without generating resources.
 func generateWindowsResources(pkgPath, iconPath, arch string) (string, error) {
 	if iconPath == "" {
 		return "", nil
 	}
 
-	// Check if the icon file exists
 	if _, err := os.Stat(iconPath); os.IsNotExist(err) {
 		return "", nil
 	}
 
-	// Resolve absolute path for the icon
 	absIconPath, err := filepath.Abs(iconPath)
 	if err != nil {
 		return "", fmt.Errorf("resolve icon path: %w", err)
 	}
 
-	// Resolve absolute path for the package directory
 	absPkgPath, err := filepath.Abs(pkgPath)
 	if err != nil {
 		return "", fmt.Errorf("resolve package path: %w", err)
 	}
 
-	// Calculate relative path from package directory to icon
-	// (go-winres resolves paths relative to the config file location)
 	relIconPath, err := filepath.Rel(absPkgPath, absIconPath)
 	if err != nil {
 		return "", fmt.Errorf("calculate relative icon path: %w", err)
 	}
 
-	// Create a temporary winres.json config
-	// The format requires a language code (0000 = language neutral)
 	winresConfig := map[string]any{
 		"RT_GROUP_ICON": map[string]any{
 			"APP": map[string]any{
@@ -458,14 +1101,12 @@ func generateWindowsResources(pkgPath, iconPath, arch string) (string, error) {
 		return "", fmt.Errorf("marshal winres config: %w", err)
 	}
 
-	// Write config to the package directory
 	configPath := filepath.Join(absPkgPath, "winres.json")
 	if err := os.WriteFile(configPath, configBytes, 0644); err != nil {
 		return "", fmt.Errorf("write winres config: %w", err)
 	}
 	defer os.Remove(configPath)
 
-	// Run go-winres to generate the .syso file
 	cmd := exec.Command("go", "run", "github.com/tc-hib/go-winres@latest", "make",
 		"--in", configPath,
 		"--out", filepath.Join(absPkgPath, "rsrc"),
@@ -478,13 +1119,17 @@ func generateWindowsResources(pkgPath, iconPath, arch string) (string, error) {
 		return "", fmt.Errorf("run go-winres: %w", err)
 	}
 
-	// go-winres generates files named rsrc_windows_<arch>.syso
 	sysoPath := filepath.Join(absPkgPath, fmt.Sprintf("rsrc_windows_%s.syso", arch))
 	return sysoPath, nil
 }
 
 func goBuild(opts buildOptions) (buildOutput, error) {
-	output := filepath.Join("build", opts.Build.OutputName(opts.OutputName))
+	outputDir := "build"
+	if opts.OutputDir != "" {
+		outputDir = opts.OutputDir
+	}
+
+	output := filepath.Join(outputDir, opts.Build.OutputName(opts.OutputName))
 	macosBundlePath := ""
 	if opts.BuildApp && opts.Build.GOOS == "darwin" {
 		macosBundlePath = output + ".app"
@@ -499,7 +1144,7 @@ func goBuild(opts buildOptions) (buildOutput, error) {
 	env := os.Environ()
 	env = append(env, "GOOS="+opts.Build.GOOS)
 	env = append(env, "GOARCH="+opts.Build.GOARCH)
-	if opts.CgoEnabled || opts.RaceEnabled {
+	if opts.CgoEnabled || opts.RaceEnabled || opts.BuildShared {
 		env = append(env, "CGO_ENABLED=1")
 	} else {
 		env = append(env, "CGO_ENABLED=0")
@@ -512,6 +1157,8 @@ func goBuild(opts buildOptions) (buildOutput, error) {
 	var args []string
 	if opts.BuildTests {
 		args = []string{"go", "test", "-c", "-o", output}
+	} else if opts.BuildShared {
+		args = []string{"go", "build", "-buildmode=c-shared", "-o", output}
 	} else {
 		args = []string{"go", "build", "-o", output}
 	}
@@ -520,15 +1167,12 @@ func goBuild(opts buildOptions) (buildOutput, error) {
 		args = append(args, "-tags", strings.Join(opts.Tags, " "))
 	}
 
-	// Build ldflags
 	var ldflags []string
 
-	// Inject version if specified
 	if opts.Version != "" {
 		ldflags = append(ldflags, fmt.Sprintf("-X %s/cmd/ccapp.Version=%s", PACKAGE_NAME, opts.Version))
 	}
 
-	// if the target is windows and BuildApp is true use the windows subsystem rather than the default console subsystem
 	if opts.Build.GOOS == "windows" && opts.BuildApp {
 		ldflags = append(ldflags, "-H windowsgui")
 	}
@@ -537,7 +1181,6 @@ func goBuild(opts buildOptions) (buildOutput, error) {
 		args = append(args, "-ldflags="+strings.Join(ldflags, " "))
 	}
 
-	// Generate Windows resources (.syso file with icon) if building for Windows with an icon
 	var sysoPath string
 	if opts.Build.GOOS == "windows" && opts.BuildApp && opts.IconPath != "" {
 		var err error
@@ -561,9 +1204,7 @@ func goBuild(opts buildOptions) (buildOutput, error) {
 		return buildOutput{}, fmt.Errorf("go build failed: %w", err)
 	}
 
-	// if entitlements path is set and building for darwin/arm64, codesign the output
 	if opts.EntitlementsPath != "" && opts.Build.GOOS == "darwin" && opts.Build.GOARCH == "arm64" {
-		// build internal/cmd/codesign first
 		codesignOut, err := goBuild(buildOptions{
 			Package:    "internal/cmd/codesign",
 			OutputName: "codesign",
@@ -586,8 +1227,11 @@ func goBuild(opts buildOptions) (buildOutput, error) {
 	}
 
 	if opts.BuildApp && opts.Build.GOOS == "darwin" {
-		// Turn the output binary into a macOS .app bundle.
-		if err := writeMacOSAppBundle(macosBundlePath, output, opts.ApplicationName, opts.LogoPath); err != nil {
+		appName := opts.ApplicationName
+		if appName == "" {
+			appName = opts.OutputName
+		}
+		if err := writeMacOSAppBundle(macosBundlePath, output, appName, opts.LogoPath); err != nil {
 			return buildOutput{}, fmt.Errorf("failed to create macOS app bundle: %w", err)
 		}
 		return buildOutput{Path: macosBundlePath}, nil
@@ -602,7 +1246,6 @@ type runOptions struct {
 }
 
 func runBuildOutput(output buildOutput, args []string, opts runOptions) error {
-	// If this is a macOS app bundle, run via `open`.
 	if runtime.GOOS == "darwin" && strings.HasSuffix(output.Path, ".app") {
 		openArgs := []string{"-n", output.Path}
 		if len(args) > 0 {
@@ -619,12 +1262,10 @@ func runBuildOutput(output buildOutput, args []string, opts runOptions) error {
 		return nil
 	}
 
-	// if cpu profile path is set then add -cpuprofile to the start of the args
 	if opts.CpuProfilePath != "" {
 		args = append([]string{"-cpuprofile", opts.CpuProfilePath}, args...)
 	}
 
-	// if mem profile path is set then add -memprofile to the start of the args
 	if opts.MemProfilePath != "" {
 		args = append([]string{"-memprofile", opts.MemProfilePath}, args...)
 	}
@@ -647,7 +1288,6 @@ func getOrCreateHostID() (string, error) {
 		return string(data), nil
 	}
 
-	// Just 4 random bytes hex-encoded
 	b := make([]byte, 4)
 	if _, err := rand.Read(b); err != nil {
 		return "", fmt.Errorf("failed to generate host ID: %w", err)
@@ -666,413 +1306,11 @@ func getOrCreateHostID() (string, error) {
 	return hostID, nil
 }
 
-func loadRemoteTarget(alias string) (remoteTarget, error) {
-	remotesPath := filepath.Join("local", "remotes.json")
-	data, err := os.ReadFile(remotesPath)
-	if err != nil {
-		return remoteTarget{}, fmt.Errorf("failed to read remotes from %s: %w", remotesPath, err)
-	}
-
-	var remotes map[string]remoteTarget
-	if err := json.Unmarshal(data, &remotes); err != nil {
-		return remoteTarget{}, fmt.Errorf("failed to parse remotes file %s: %w", remotesPath, err)
-	}
-
-	target, ok := remotes[alias]
-	if !ok {
-		return remoteTarget{}, fmt.Errorf("remote alias %q not found in %s", alias, remotesPath)
-	}
-
-	if target.Address == "" || target.GOOS == "" || target.GOARCH == "" || target.TargetDir == "" {
-		return remoteTarget{}, fmt.Errorf("remote alias %q missing required fields (address/os/arch/targetDir)", alias)
-	}
-
-	return target, nil
-}
-
-func runRemoteCommand(remote remoteTarget, output buildOutput, args []string) error {
-	cmdName := filepath.Join(remote.TargetDir, filepath.Base(output.Path))
-
-	cmdArgs := append([]string{"run", "-timeout", "30s", remote.Address, cmdName}, args...)
-	cmd := exec.Command("remotectl", cmdArgs...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("remotectl execution failed: %w", err)
-	}
-
-	return nil
-}
-
-func pushBuildOutput(remote remoteTarget, output buildOutput) error {
-	targetFile := filepath.Join(remote.TargetDir, filepath.Base(output.Path))
-
-	// push the file using remotectl push-file
-	cmd := exec.Command(
-		"remotectl", "push-file",
-		remote.Address,
-		output.Path,
-		targetFile,
-	)
-
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("remotectl push failed: %w", err)
-	}
-
-	// make the file executable using remotectl run chmod +x
-	cmd = exec.Command(
-		"remotectl", "run", remote.Address,
-		"chmod", "+x", targetFile,
-	)
-
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("remotectl chmod failed: %w", err)
-	}
-
-	return nil
-}
-
-// isContextOlderThanOutput checks if all files in the context directory
-// are older than the output file. Returns true if the output is newer
-// than all context files, false otherwise.
-func isContextOlderThanOutput(contextDir, outputPath string) (bool, error) {
-	outputInfo, err := os.Stat(outputPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
-		}
-		return false, fmt.Errorf("failed to stat output file: %w", err)
-	}
-
-	outputModTime := outputInfo.ModTime()
-
-	err = filepath.Walk(contextDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		// Skip directories themselves, only check files
-		if info.IsDir() {
-			return nil
-		}
-
-		if info.ModTime().After(outputModTime) {
-			return fmt.Errorf("file %s is newer than output", path)
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		// If we found a newer file, return false
-		return false, nil
-	}
-
-	// All files are older than the output
-	return true, nil
-}
-
-// clearCCCache clears the cc cache for a given tar file path.
-// This ensures that when we rebuild a Docker image, cc will re-extract it.
-func clearCCCache(tarPath string) error {
-	// Resolve absolute path (same as cc does)
-	absPath, err := filepath.Abs(tarPath)
-	if err != nil {
-		return fmt.Errorf("resolve tar path: %w", err)
-	}
-
-	// Handle relative paths starting with "./" (same as cc does)
-	if strings.HasPrefix(tarPath, "./") {
-		wd, err := os.Getwd()
-		if err != nil {
-			return fmt.Errorf("get working directory: %w", err)
-		}
-		absPath = filepath.Join(wd, tarPath[2:])
-		absPath, err = filepath.Abs(absPath)
-		if err != nil {
-			return fmt.Errorf("resolve tar path: %w", err)
-		}
-	}
-
-	// Get cache directory (same default as cc uses)
-	cacheDir := os.Getenv("CC_CACHE_DIR")
-	if cacheDir == "" {
-		configDir, err := os.UserConfigDir()
-		if err != nil {
-			return fmt.Errorf("get user config dir: %w", err)
-		}
-		cacheDir = filepath.Join(configDir, "cc", "oci")
-	}
-
-	// Sanitize the tar path for use as a filename (same as cc does)
-	sanitized := sanitizeForFilename(absPath)
-	cachePath := filepath.Join(cacheDir, "images", sanitized)
-
-	// Remove the cache directory if it exists
-	if _, err := os.Stat(cachePath); err == nil {
-		if err := os.RemoveAll(cachePath); err != nil {
-			return fmt.Errorf("remove cache directory: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// sanitizeForFilename sanitizes a string for use as a filename.
-// This matches the implementation in internal/oci/client.go
-func sanitizeForFilename(value string) string {
-	value = strings.TrimPrefix(value, "/")
-	var b strings.Builder
-	for _, r := range value {
-		switch r {
-		case '/', '\\', ':', '?', '*', '"', '<', '>', '|', ' ':
-			b.WriteByte('_')
-		default:
-			b.WriteRune(r)
-		}
-	}
-	if b.Len() == 0 {
-		return "root"
-	}
-	return b.String()
-}
-
-// releaseConfig holds the configuration for macOS code signing and notarization.
-type releaseConfig struct {
-	DeveloperID      string `json:"developer_id"`
-	AppleID          string `json:"apple_id"`
-	AppleIDPassword  string `json:"apple_id_password"`
-	TeamID           string `json:"team_id"`
-	KeychainPath     string `json:"keychain_path"`
-	EntitlementsPath string `json:"-"`
-}
-
-// loadReleaseConfig loads the signing configuration from local/release.json,
-// falling back to environment variables for any missing values.
-func loadReleaseConfig() (*releaseConfig, error) {
-	cfg := &releaseConfig{
-		EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
-	}
-
-	// Try to load from local/release.json first
-	configPath := filepath.Join("local", "release.json")
-	if data, err := os.ReadFile(configPath); err == nil {
-		if err := json.Unmarshal(data, cfg); err != nil {
-			return nil, fmt.Errorf("failed to parse %s: %w", configPath, err)
-		}
-	}
-
-	// Override with environment variables if set
-	if env := os.Getenv("CC_DEVELOPER_ID"); env != "" {
-		cfg.DeveloperID = env
-	}
-	if env := os.Getenv("CC_APPLE_ID"); env != "" {
-		cfg.AppleID = env
-	}
-	if env := os.Getenv("CC_APPLE_ID_PASSWORD"); env != "" {
-		cfg.AppleIDPassword = env
-	}
-	if env := os.Getenv("CC_TEAM_ID"); env != "" {
-		cfg.TeamID = env
-	}
-	if env := os.Getenv("CC_KEYCHAIN_PATH"); env != "" {
-		cfg.KeychainPath = env
-	}
-
-	// Validate required fields
-	if cfg.DeveloperID == "" {
-		return nil, fmt.Errorf("developer_id is required (set in local/release.json or CC_DEVELOPER_ID env var)")
-	}
-	if cfg.AppleID == "" {
-		return nil, fmt.Errorf("apple_id is required (set in local/release.json or CC_APPLE_ID env var)")
-	}
-	if cfg.AppleIDPassword == "" {
-		return nil, fmt.Errorf("apple_id_password is required (set in local/release.json or CC_APPLE_ID_PASSWORD env var)")
-	}
-	if cfg.TeamID == "" {
-		return nil, fmt.Errorf("team_id is required (set in local/release.json or CC_TEAM_ID env var)")
-	}
-
-	return cfg, nil
-}
-
-// signAppBundle signs a macOS .app bundle with Developer ID certificate.
-func signAppBundle(appPath string, cfg *releaseConfig) error {
-	// First, sign the main executable inside the bundle
-	macosDir := filepath.Join(appPath, "Contents", "MacOS")
-	entries, err := os.ReadDir(macosDir)
-	if err != nil {
-		return fmt.Errorf("failed to read MacOS directory: %w", err)
-	}
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		execPath := filepath.Join(macosDir, entry.Name())
-		if err := signBinaryForRelease(execPath, cfg); err != nil {
-			return fmt.Errorf("failed to sign executable %s: %w", entry.Name(), err)
-		}
-	}
-
-	// Then sign the entire bundle
-	args := []string{
-		"-s", cfg.DeveloperID,
-		"-f",
-		"-v",
-		"--timestamp",
-		"--options", "runtime",
-		"--entitlements", cfg.EntitlementsPath,
-	}
-
-	if cfg.KeychainPath != "" {
-		args = append(args, "--keychain", cfg.KeychainPath)
-	}
-
-	args = append(args, appPath)
-
-	cmd := exec.Command("codesign", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("codesign failed: %w", err)
-	}
-
-	return nil
-}
-
-// signBinaryForRelease signs a standalone binary with Developer ID certificate.
-func signBinaryForRelease(binPath string, cfg *releaseConfig) error {
-	args := []string{
-		"-s", cfg.DeveloperID,
-		"-f",
-		"-v",
-		"--timestamp",
-		"--options", "runtime",
-		"--entitlements", cfg.EntitlementsPath,
-	}
-
-	if cfg.KeychainPath != "" {
-		args = append(args, "--keychain", cfg.KeychainPath)
-	}
-
-	args = append(args, binPath)
-
-	cmd := exec.Command("codesign", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("codesign failed: %w", err)
-	}
-
-	return nil
-}
-
-// notarize submits the app to Apple's notary service and waits for completion.
-func notarize(appPath string, cfg *releaseConfig) error {
-	// Create a temporary zip file for notarization
-	zipPath := appPath + ".zip"
-	defer os.Remove(zipPath)
-
-	// Use ditto to create the zip (preserves extended attributes and symlinks)
-	dittoCmd := exec.Command("ditto", "-c", "-k", "--keepParent", appPath, zipPath)
-	dittoCmd.Stdout = os.Stdout
-	dittoCmd.Stderr = os.Stderr
-	if err := dittoCmd.Run(); err != nil {
-		return fmt.Errorf("failed to create zip for notarization: %w", err)
-	}
-
-	// Submit to notary service
-	args := []string{"notarytool", "submit", zipPath}
-
-	// Check if using keychain profile (e.g., "@keychain:CC_NOTARY")
-	if strings.HasPrefix(cfg.AppleIDPassword, "@keychain:") {
-		profileName := strings.TrimPrefix(cfg.AppleIDPassword, "@keychain:")
-		args = append(args, "--keychain-profile", profileName)
-	} else {
-		args = append(args,
-			"--apple-id", cfg.AppleID,
-			"--password", cfg.AppleIDPassword,
-			"--team-id", cfg.TeamID,
-		)
-	}
-
-	args = append(args, "--wait", "--timeout", "30m")
-
-	cmd := exec.Command("xcrun", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("notarization failed: %w", err)
-	}
-
-	return nil
-}
-
-// staple attaches the notarization ticket to the app bundle.
-func staple(appPath string) error {
-	cmd := exec.Command("xcrun", "stapler", "staple", appPath)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("stapling failed: %w", err)
-	}
-
-	return nil
-}
-
-// verifyRelease checks that the app is properly signed and notarized.
-func verifyRelease(appPath string) error {
-	// Check Gatekeeper acceptance (most important for distribution)
-	spctlCmd := exec.Command("spctl", "--assess", "--type", "exec", "-v", appPath)
-	spctlCmd.Stdout = os.Stdout
-	spctlCmd.Stderr = os.Stderr
-	if err := spctlCmd.Run(); err != nil {
-		return fmt.Errorf("Gatekeeper assessment failed: %w", err)
-	}
-
-	// Check hardened runtime is enabled
-	displayCmd := exec.Command("codesign", "-d", "--verbose=4", appPath)
-	output, err := displayCmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to display signature info: %w", err)
-	}
-	if !strings.Contains(string(output), "runtime") {
-		return fmt.Errorf("hardened runtime is not enabled")
-	}
-
-	// Validate stapled ticket
-	staplerCmd := exec.Command("xcrun", "stapler", "validate", appPath)
-	staplerCmd.Stdout = os.Stdout
-	staplerCmd.Stderr = os.Stderr
-	if err := staplerCmd.Run(); err != nil {
-		return fmt.Errorf("notarization ticket validation failed: %w", err)
-	}
-
-	fmt.Printf("verification successful for %s\n", appPath)
-	return nil
-}
-
-// getVersionFromGit returns the version from GITHUB_REF_NAME (for CI) or git describe --tags.
 func getVersionFromGit() string {
-	// Check for GitHub Actions ref name (e.g., "v1.0.0" for tags)
 	if ref := os.Getenv("GITHUB_REF_NAME"); ref != "" && strings.HasPrefix(ref, "v") {
 		return ref
 	}
 
-	// Fall back to git describe
 	cmd := exec.Command("git", "describe", "--tags", "--always")
 	out, err := cmd.Output()
 	if err == nil {
@@ -1085,1080 +1323,149 @@ func getVersionFromGit() string {
 	return "dev"
 }
 
-// buildInstaller builds the ccinstaller binary for the specified platform and copies it
-// to internal/update/installers/ for embedding.
-func buildInstaller(platform crossBuild) error {
-	installersDir := filepath.Join("internal", "update", "installers")
-	if err := os.MkdirAll(installersDir, 0755); err != nil {
-		return fmt.Errorf("create installers dir: %w", err)
-	}
+// ============================================================================
+// CLI Interface
+// ============================================================================
 
-	fmt.Printf("building ccinstaller for %s/%s...\n", platform.GOOS, platform.GOARCH)
+func usage() {
+	fmt.Fprintf(os.Stderr, `Usage: %s [options] [target] [-- args...]
 
-	suffix := ""
-	if platform.GOOS == "windows" {
-		suffix = ".exe"
-	}
+Options:
+  -f <file>      Use specified Buildfile (default: tools/Buildfile)
+  --dry-run      Show what would be done without executing
+  --list         List all available targets
+  -h, --help     Show this help message
 
-	out, err := goBuild(buildOptions{
-		Package:    "cmd/ccinstaller",
-		OutputName: "ccinstaller",
-		Build:      platform,
-	})
-	if err != nil {
-		return fmt.Errorf("build installer for %s/%s: %w", platform.GOOS, platform.GOARCH, err)
-	}
+Arguments after -- are passed to 'run' commands.
 
-	// Copy to installers directory with platform-specific name
-	destName := fmt.Sprintf("ccinstaller_%s_%s%s", platform.GOOS, platform.GOARCH, suffix)
-	destPath := filepath.Join(installersDir, destName)
-
-	if err := copyFile(destPath, out.Path, 0755); err != nil {
-		return fmt.Errorf("copy installer to %s: %w", destPath, err)
-	}
-
-	fmt.Printf("  -> %s\n", destPath)
-	return nil
+Examples:
+  %s                    Build default target
+  %s cc                 Build the cc target
+  %s bringup            Build and run bringup tests
+  %s --list             List all targets
+  %s cc -- --help       Build cc and pass --help to run commands
+`, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
 }
 
 func main() {
-	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	// Parse arguments manually to handle -- separator
+	var buildfilePath string
+	var dryRun bool
+	var listTargets bool
+	var showHelp bool
+	var targetName string
+	var extraArgs []string
 
-	race := fs.Bool("race", false, "build with race detector enabled")
-	quest := fs.Bool("quest", false, "build and execute the bringup quest")
-	cross := fs.Bool("cross", false, "attempt to cross compile the quest for all supported platforms")
-	buildOs := fs.String("os", "", "build for the specified OS (windows, linux, darwin)")
-	buildArch := fs.String("arch", "", "build for the specified architecture (amd64, arm64)")
-	test := fs.String("test", "", "run go tests in the specified package")
-	codesign := fs.Bool("codesign", false, "build the macos codesign tool")
-	oci := fs.Bool("oci", false, "build and execute the OCI image tool")
-	kernel := fs.Bool("kernel", false, "build and execute the kernel tool")
-	bringup := fs.Bool("bringup", false, "build and execute the bringup tool inside a linux VM")
-	bringupGPU := fs.Bool("bringup-gpu", false, "build and execute the GPU bringup tool with graphics support")
-	remote := fs.String("remote", "", "run quest/bringup on remote host alias from local/remotes.json")
-	run := fs.Bool("run", false, "run the built cc tool after building")
-	runtest := fs.String("runtest", "", "build a Dockerfile in tests/<name>/Dockerfile and run it using cc (Linux only)")
-	dbgTool := fs.Bool("dbg-tool", false, "build and run the debug tool")
-	tsTool := fs.Bool("ts-tool", false, "build and run the timeslice tool")
-	app := fs.Bool("app", false, "build and run ccapp")
-	miniplayer := fs.Bool("miniplayer", false, "build and run miniplayer")
-	cpuprofile := fs.String("cpuprofile", "", "write CPU profile of built binary to file")
-	memprofile := fs.String("memprofile", "", "write memory profile of built binary to file")
-	benchTests := fs.Bool("bench-tests", false, "build and run the benchmark tests")
-	snapshotE2E := fs.Bool("snapshot-e2e", false, "build and run snapshot e2e benchmark")
-	release := fs.Bool("release", false, "build a release binary")
-	runSpecial := fs.String("runs", "", "run a given package")
-	exampleTest := fs.Bool("example-test", false, "build and run example tests with testrunner")
-	example := fs.String("example", "", "build and run an example (path to example directory)")
-	ccTests := fs.Bool("cc-tests", false, "build cc and run cc integration tests")
-	ciTests := fs.Bool("ci-tests", false, "run all CI tests: quest, bringup, cc-tests, examples")
-	bindingsC := fs.Bool("bindings-c", false, "build C bindings library (libcc.so/.dylib/.dll)")
-	bindingsCTest := fs.Bool("bindings-c-test", false, "build and run C bindings test")
+	args := os.Args[1:]
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
 
-	if err := fs.Parse(os.Args[1:]); err != nil {
-		os.Exit(1)
-	}
-
-	var buildTarget crossBuild = hostBuild
-
-	if *buildOs != "" || *buildArch != "" {
-		if *buildOs == "" {
-			*buildOs = hostBuild.GOOS
+		if arg == "--" {
+			extraArgs = args[i+1:]
+			break
 		}
 
-		if *buildArch == "" {
-			*buildArch = hostBuild.GOARCH
-		}
-
-		buildTarget = crossBuild{
-			GOOS:   *buildOs,
-			GOARCH: *buildArch,
-		}
-	}
-
-	runOpts := runOptions{
-		CpuProfilePath: *cpuprofile,
-		MemProfilePath: *memprofile,
-	}
-
-	var remoteTargetConfig *remoteTarget
-	if *remote != "" {
-		if !*quest && !*bringup && !*bringupGPU {
-			fmt.Fprintf(os.Stderr, "-remote can only be used with -quest, -bringup, or -bringup-gpu\n")
-			os.Exit(1)
-		}
-		if *cross {
-			fmt.Fprintf(os.Stderr, "-remote cannot be combined with -cross\n")
-			os.Exit(1)
-		}
-		target, err := loadRemoteTarget(*remote)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to load remote alias: %v\n", err)
-			os.Exit(1)
-		}
-		remoteTargetConfig = &target
-	}
-
-	if *codesign {
-		out, err := goBuild(buildOptions{
-			Package:    "internal/cmd/codesign",
-			OutputName: "codesign",
-			Build:      hostBuild,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build codesign: %v\n", err)
-			os.Exit(1)
-		}
-
-		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
-			os.Exit(1)
-		}
-
-		return
-	}
-
-	if *dbgTool {
-		out, err := goBuild(buildOptions{
-			Package:    "cmd/debug",
-			OutputName: "debug",
-			Build:      hostBuild,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build debug tool: %v\n", err)
-			os.Exit(1)
-		}
-
-		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
-			os.Exit(1)
-		}
-
-		return
-	}
-
-	if *tsTool {
-		out, err := goBuild(buildOptions{
-			Package:    "cmd/timeslice",
-			OutputName: "timeslice",
-			Build:      hostBuild,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build timeslice tool: %v\n", err)
-			os.Exit(1)
-		}
-		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
-			os.Exit(1)
-		}
-		return
-	}
-
-	if *bindingsC || *bindingsCTest {
-		// Determine library extension
-		libExt := ".so"
-		if runtime.GOOS == "darwin" {
-			libExt = ".dylib"
-		} else if runtime.GOOS == "windows" {
-			libExt = ".dll"
-		}
-
-		libPath := filepath.Join("build", "libcc"+libExt)
-		headerPath := filepath.Join("build", "libcc.h")
-
-		// Build the cc-helper binary (codesigned on macOS)
-		fmt.Printf("building cc-helper...\n")
-		helperOut, err := goBuild(buildOptions{
-			Package:          "cmd/cc-helper",
-			OutputName:       "cc-helper",
-			Build:            hostBuild,
-			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build cc-helper: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("built %s\n", helperOut.Path)
-
-		// Build the shared library
-		fmt.Printf("building C bindings library...\n")
-		cmd := exec.Command("go", "build", "-buildmode=c-shared",
-			"-o", libPath, "./bindings/c")
-		cmd.Env = append(os.Environ(), "CGO_ENABLED=1")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build C bindings: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("built %s\n", libPath)
-
-		// Copy header to build directory
-		if err := copyFile(headerPath, filepath.Join("bindings", "c", "libcc.h"), 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to copy header: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("copied %s\n", headerPath)
-
-		if *bindingsCTest {
-			// Build and run the C test
-			testSrc := filepath.Join("bindings", "c", "test_basic.c")
-			testBin := filepath.Join("build", "test_basic")
-
-			// Check if test file exists
-			if _, err := os.Stat(testSrc); os.IsNotExist(err) {
-				fmt.Fprintf(os.Stderr, "C test file not found: %s\n", testSrc)
+		switch arg {
+		case "-f":
+			if i+1 >= len(args) {
+				fmt.Fprintf(os.Stderr, "-f requires an argument\n")
 				os.Exit(1)
 			}
-
-			// Compile the test
-			fmt.Printf("compiling C test...\n")
-			var compileArgs []string
-			if runtime.GOOS == "darwin" {
-				compileArgs = []string{
-					"-o", testBin,
-					testSrc,
-					"-L", "build",
-					"-lcc",
-					"-Wl,-rpath,@executable_path",
-				}
+			i++
+			buildfilePath = args[i]
+		case "--dry-run":
+			dryRun = true
+		case "--list":
+			listTargets = true
+		case "-h", "--help":
+			showHelp = true
+		default:
+			if strings.HasPrefix(arg, "-") {
+				fmt.Fprintf(os.Stderr, "unknown option: %s\n", arg)
+				usage()
+				os.Exit(1)
+			}
+			if targetName == "" {
+				targetName = arg
 			} else {
-				compileArgs = []string{
-					"-o", testBin,
-					testSrc,
-					"-L", "build",
-					"-lcc",
-					"-Wl,-rpath,$ORIGIN",
-				}
-			}
-
-			cmd = exec.Command("gcc", compileArgs...)
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			if err := cmd.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to compile C test: %v\n", err)
+				fmt.Fprintf(os.Stderr, "unexpected argument: %s\n", arg)
+				usage()
 				os.Exit(1)
 			}
-
-			// macOS: codesign the test executable with entitlements
-			if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
-				codesignOut, err := goBuild(buildOptions{
-					Package:    "internal/cmd/codesign",
-					OutputName: "codesign",
-					Build:      hostBuild,
-				})
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "failed to build codesign tool: %v\n", err)
-					os.Exit(1)
-				}
-
-				cmd = exec.Command(codesignOut.Path,
-					"-entitlements", filepath.Join("tools", "entitlements.xml"),
-					"-bin", testBin,
-				)
-				cmd.Stdout = os.Stdout
-				cmd.Stderr = os.Stderr
-				if err := cmd.Run(); err != nil {
-					fmt.Fprintf(os.Stderr, "failed to codesign test executable: %v\n", err)
-					os.Exit(1)
-				}
-			}
-
-			// Run the test
-			fmt.Printf("running C test...\n")
-			cmd = exec.Command(testBin)
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			cmd.Env = os.Environ()
-			if runtime.GOOS == "darwin" {
-				cmd.Env = append(cmd.Env, "DYLD_LIBRARY_PATH="+filepath.Join(".", "build"))
-			} else {
-				cmd.Env = append(cmd.Env, "LD_LIBRARY_PATH="+filepath.Join(".", "build"))
-			}
-			if err := cmd.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "C test failed: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Printf("C test passed!\n")
 		}
-
-		return
 	}
 
-	if *exampleTest {
-		out, err := goBuild(buildOptions{
-			Package:    "examples/shared/testrunner/cmd/runtest",
-			OutputName: "runtest",
-			Build:      hostBuild,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build example test runner: %v\n", err)
-			os.Exit(1)
-		}
-		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
-			os.Exit(1)
-		}
-		return
-	}
-
-	if *ccTests {
-		// Build cc first
-		ccOut, err := goBuild(buildOptions{
-			Package:          "internal/cmd/cc",
-			OutputName:       "cc",
-			Build:            hostBuild,
-			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build cc: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("built %s\n", ccOut.Path)
-
-		// Build testrunner
-		runnerOut, err := goBuild(buildOptions{
-			Package:    "examples/shared/testrunner/cmd/runtest",
-			OutputName: "runtest",
-			Build:      hostBuild,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build testrunner: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Run testrunner with cc tests
-		// Pass --cc2-binary flag to tell testrunner where cc is
-		// Pass test paths from args, or default to all cc tests
-		testPaths := fs.Args()
-		if len(testPaths) == 0 {
-			testPaths = []string{"./internal/cmd/cc/tests/..."}
-		}
-		args := append([]string{"--cc2-binary", ccOut.Path}, testPaths...)
-		if err := runBuildOutput(runnerOut, args, runOpts); err != nil {
-			os.Exit(1)
-		}
-		return
-	}
-
-	if *ciTests {
-		fmt.Println("=== Running CI Tests ===")
-		fmt.Println()
-
-		// Step 1: Run quest
-		fmt.Println("=== Step 1/4: Quest ===")
-		questOut, err := goBuild(buildOptions{
-			Package:          "internal/cmd/quest",
-			OutputName:       "quest",
-			Build:            hostBuild,
-			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build quest: %v\n", err)
-			os.Exit(1)
-		}
-		if err := runBuildOutput(questOut, nil, runOpts); err != nil {
-			fmt.Fprintf(os.Stderr, "quest failed\n")
-			os.Exit(1)
-		}
-		fmt.Println()
-
-		// Step 2: Run bringup
-		fmt.Println("=== Step 2/4: Bringup ===")
-		bringupBuild := crossBuild{GOOS: "linux", GOARCH: hostBuild.GOARCH}
-		bringupOut, err := goBuild(buildOptions{
-			Package:    "internal/cmd/bringup",
-			OutputName: "bringup",
-			CgoEnabled: false,
-			Build:      bringupBuild,
-			BuildTests: true,
-			Tags:       []string{"guest"},
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build bringup tool: %v\n", err)
-			os.Exit(1)
-		}
-		bringupArgs := []string{"-exec", bringupOut.Path}
-		if err := runBuildOutput(questOut, bringupArgs, runOpts); err != nil {
-			fmt.Fprintf(os.Stderr, "bringup failed\n")
-			os.Exit(1)
-		}
-		fmt.Println()
-
-		// Step 3: Run cc-tests
-		fmt.Println("=== Step 3/4: CC Tests ===")
-		ccOut, err := goBuild(buildOptions{
-			Package:          "internal/cmd/cc",
-			OutputName:       "cc",
-			Build:            hostBuild,
-			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build cc: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("built %s\n", ccOut.Path)
-
-		runnerOut, err := goBuild(buildOptions{
-			Package:    "examples/shared/testrunner/cmd/runtest",
-			OutputName: "runtest",
-			Build:      hostBuild,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build testrunner: %v\n", err)
-			os.Exit(1)
-		}
-
-		ccTestArgs := []string{"--cc2-binary", ccOut.Path, "./internal/cmd/cc/tests/..."}
-		if err := runBuildOutput(runnerOut, ccTestArgs, runOpts); err != nil {
-			fmt.Fprintf(os.Stderr, "cc-tests failed\n")
-			os.Exit(1)
-		}
-		fmt.Println()
-
-		// Step 4: Run example tests
-		fmt.Println("=== Step 4/4: Example Tests ===")
-		exampleTestArgs := []string{"--cc2-binary", ccOut.Path, "./examples/getting-started/..."}
-		if err := runBuildOutput(runnerOut, exampleTestArgs, runOpts); err != nil {
-			fmt.Fprintf(os.Stderr, "example tests failed\n")
-			os.Exit(1)
-		}
-		fmt.Println()
-
-		fmt.Println("=== All CI Tests Passed ===")
-		return
-	}
-
-	if *example != "" {
-		// Build the example binary directly
-		exampleName := filepath.Base(*example)
-		out, err := goBuild(buildOptions{
-			Package:    *example,
-			OutputName: exampleName,
-			Build:      hostBuild,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build example %s: %v\n", *example, err)
-			os.Exit(1)
-		}
-
-		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
-			os.Exit(1)
-		}
-		return
-	}
-
-	if *miniplayer {
-		out, err := goBuild(buildOptions{
-			Package:          "internal/cmd/miniplayer",
-			OutputName:       "miniplayer",
-			Build:            hostBuild,
-			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build miniplayer: %v\n", err)
-			os.Exit(1)
-		}
-		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
-			os.Exit(1)
-		}
-		return
-	}
-
-	if *oci {
-		out, err := goBuild(buildOptions{
-			Package:    "internal/cmd/oci",
-			OutputName: "oci",
-			Build:      hostBuild,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build oci tool: %v\n", err)
-			os.Exit(1)
-		}
-
-		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
-			os.Exit(1)
-		}
-
-		return
-	}
-
-	if *kernel {
-		out, err := goBuild(buildOptions{
-			Package:    "internal/cmd/kernel",
-			OutputName: "kernel",
-			Build:      hostBuild,
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build kernel tool: %v\n", err)
-			os.Exit(1)
-		}
-
-		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
-			os.Exit(1)
-		}
-
-		return
-	}
-
-	if *quest {
-		buildTarget := hostBuild
-		if remoteTargetConfig != nil {
-			buildTarget = crossBuild{
-				GOOS:   remoteTargetConfig.GOOS,
-				GOARCH: remoteTargetConfig.GOARCH,
-			}
-		}
-
-		out, err := goBuild(buildOptions{
-			Package:          "internal/cmd/quest",
-			OutputName:       "quest",
-			Build:            buildTarget,
-			RaceEnabled:      *race,
-			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build quest: %v\n", err)
-			os.Exit(1)
-		}
-
-		if remoteTargetConfig != nil {
-			if err := pushBuildOutput(*remoteTargetConfig, out); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to push quest to remote: %v\n", err)
-				os.Exit(1)
-			}
-
-			if err := runRemoteCommand(*remoteTargetConfig, out, fs.Args()); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to run quest remotely: %v\n", err)
-				os.Exit(1)
-			}
-		} else {
-			if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
-				os.Exit(1)
-			}
-		}
-
-		return
-	}
-
-	if *bringup {
-		bringupBuild := crossBuild{GOOS: "linux", GOARCH: hostBuild.GOARCH}
-		questBuild := hostBuild
-
-		if remoteTargetConfig != nil {
-			bringupBuild = crossBuild{
-				GOOS:   "linux",
-				GOARCH: remoteTargetConfig.GOARCH,
-			}
-			questBuild = crossBuild{
-				GOOS:   remoteTargetConfig.GOOS,
-				GOARCH: remoteTargetConfig.GOARCH,
-			}
-		}
-
-		bringupOut, err := goBuild(buildOptions{
-			Package:    "internal/cmd/bringup",
-			OutputName: "bringup",
-			CgoEnabled: false,
-			Build:      bringupBuild,
-			BuildTests: true,
-			Tags:       []string{"guest"},
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build bringup tool: %v\n", err)
-			os.Exit(1)
-		}
-
-		out, err := goBuild(buildOptions{
-			Package:          "internal/cmd/quest",
-			OutputName:       "quest",
-			Build:            questBuild,
-			RaceEnabled:      *race,
-			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build bringup quest: %v\n", err)
-			os.Exit(1)
-		}
-
-		bringupExecPath := bringupOut.Path
-
-		if remoteTargetConfig != nil {
-			bringupExecPath = filepath.Join(remoteTargetConfig.TargetDir, filepath.Base(bringupOut.Path))
-
-			if err := pushBuildOutput(*remoteTargetConfig, bringupOut); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to push bringup to remote: %v\n", err)
-				os.Exit(1)
-			}
-
-			if err := pushBuildOutput(*remoteTargetConfig, out); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to push bringup quest to remote: %v\n", err)
-				os.Exit(1)
-			}
-		}
-
-		args := append([]string{"-exec", bringupExecPath}, fs.Args()...)
-		if remoteTargetConfig != nil {
-			if err := runRemoteCommand(*remoteTargetConfig, out, args); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to run bringup quest remotely: %v\n", err)
-				os.Exit(1)
-			}
-		} else {
-			if err := runBuildOutput(out, args, runOpts); err != nil {
-				os.Exit(1)
-			}
-		}
-
-		return
-	}
-
-	if *bringupGPU {
-		// GPU bringup: builds a special guest test that uses framebuffer and input
-		bringupBuild := crossBuild{GOOS: "linux", GOARCH: hostBuild.GOARCH}
-		questBuild := hostBuild
-
-		if remoteTargetConfig != nil {
-			bringupBuild = crossBuild{
-				GOOS:   "linux",
-				GOARCH: remoteTargetConfig.GOARCH,
-			}
-			questBuild = crossBuild{
-				GOOS:   remoteTargetConfig.GOOS,
-				GOARCH: remoteTargetConfig.GOARCH,
-			}
-		}
-
-		// Build the GPU bringup test binary (runs inside guest)
-		bringupOut, err := goBuild(buildOptions{
-			Package:    "internal/cmd/bringup-gpu",
-			OutputName: "bringup-gpu",
-			CgoEnabled: false,
-			Build:      bringupBuild,
-			BuildTests: true,
-			Tags:       []string{"guest"},
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build bringup-gpu tool: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Build quest (host-side VM runner)
-		out, err := goBuild(buildOptions{
-			Package:          "internal/cmd/quest",
-			OutputName:       "quest",
-			Build:            questBuild,
-			RaceEnabled:      *race,
-			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build quest for bringup-gpu: %v\n", err)
-			os.Exit(1)
-		}
-
-		bringupExecPath := bringupOut.Path
-
-		if remoteTargetConfig != nil {
-			bringupExecPath = filepath.Join(remoteTargetConfig.TargetDir, filepath.Base(bringupOut.Path))
-
-			if err := pushBuildOutput(*remoteTargetConfig, bringupOut); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to push bringup-gpu to remote: %v\n", err)
-				os.Exit(1)
-			}
-
-			if err := pushBuildOutput(*remoteTargetConfig, out); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to push quest to remote: %v\n", err)
-				os.Exit(1)
-			}
-		}
-
-		// Run quest with -exec for the bringup-gpu binary and -gpu flag to enable GPU
-		args := append([]string{"-exec", bringupExecPath, "-gpu"}, fs.Args()...)
-		if remoteTargetConfig != nil {
-			if err := runRemoteCommand(*remoteTargetConfig, out, args); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to run bringup-gpu quest remotely: %v\n", err)
-				os.Exit(1)
-			}
-		} else {
-			if err := runBuildOutput(out, args, runOpts); err != nil {
-				os.Exit(1)
-			}
-		}
-
-		return
-	}
-
-	if *cross {
-		for _, cb := range crossBuilds {
-			fmt.Printf("Building for %s/%s...\n", cb.GOOS, cb.GOARCH)
-			_, err := goBuild(buildOptions{
-				Package:          "cmd/ccapp",
-				OutputName:       "ccapp",
-				Build:            cb,
-				EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
-				BuildApp:         true,
-				LogoPath:         filepath.Join("internal", "assets", "logo-color-black.png"),
-				ApplicationName:  "CrumbleCracker",
-			})
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to build for %s/%s: %v\n", cb.GOOS, cb.GOARCH, err)
-				os.Exit(1)
-			}
-		}
-
-		return
-	}
-
-	if *test != "" {
-		cmd := exec.Command("go", "test", *test)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			os.Exit(1)
-		}
-
-		return
-	}
-
-	if *runtest != "" {
-		testName := *runtest
-		dockerfilePath := filepath.Join("tests", testName, "Dockerfile")
-		if _, err := os.Stat(dockerfilePath); err != nil {
-			fmt.Fprintf(os.Stderr, "Dockerfile not found: %s\n", dockerfilePath)
-			os.Exit(1)
-		}
-
-		// Build cc first
-		ccOut, err := goBuild(buildOptions{
-			Package:          "internal/cmd/cc",
-			OutputName:       "cc",
-			Build:            hostBuild,
-			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build cc: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Check if we can skip building the Docker image
-		buildDir := filepath.Join("tests", testName)
-		tarPath := filepath.Join("build", fmt.Sprintf("test-%s.tar", testName))
-		if err := os.MkdirAll(filepath.Dir(tarPath), 0755); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to create build directory: %v\n", err)
-			os.Exit(1)
-		}
-
-		hasDocker := false
-		if _, err := exec.LookPath("docker"); err == nil {
-			hasDocker = true
-		}
-
-		shouldRebuild := true
-		if isOlder, err := isContextOlderThanOutput(buildDir, tarPath); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to check cache: %v\n", err)
-			os.Exit(1)
-		} else if isOlder || !hasDocker {
-			fmt.Printf("Context is older than output tar file, using cached build...\n")
-			shouldRebuild = false
-		}
-
-		if shouldRebuild {
-			if !hasDocker {
-				fmt.Fprintf(os.Stderr, "docker is not installed, cannot build Docker image\n")
-				os.Exit(1)
-			}
-			// Clear cc cache for this tar file so it will be re-extracted
-			if err := clearCCCache(tarPath); err != nil {
-				// Log but don't fail - cache clearing is best effort
-				fmt.Fprintf(os.Stderr, "warning: failed to clear cc cache: %v\n", err)
-			}
-
-			// Build Docker image
-			imageTag := fmt.Sprintf("cc-test-%s:latest", testName)
-
-			fmt.Printf("Building Docker image from %s...\n", dockerfilePath)
-			buildCmd := exec.Command("docker", "build",
-				"-t", imageTag,
-				"-f", dockerfilePath,
-				buildDir,
-			)
-			buildCmd.Stdout = os.Stdout
-			buildCmd.Stderr = os.Stderr
-			if err := buildCmd.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to build Docker image: %v\n", err)
-				os.Exit(1)
-			}
-
-			// Save Docker image as tar archive
-			fmt.Printf("Saving Docker image to %s...\n", tarPath)
-			saveCmd := exec.Command("docker", "save", "-o", tarPath, imageTag)
-			saveCmd.Stdout = os.Stdout
-			saveCmd.Stderr = os.Stderr
-			if err := saveCmd.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to save Docker image: %v\n", err)
-				os.Exit(1)
-			}
-		}
-
-		// Run cc with the tar file
-		// Use relative path so cc can load it
-		relativeTarPath := filepath.Join(".", "build", fmt.Sprintf("test-%s.tar", testName))
-		if !filepath.IsAbs(relativeTarPath) {
-			relativeTarPath = strings.Join([]string{".", relativeTarPath}, string(filepath.Separator))
-		}
-		ccArgs := append(fs.Args(), relativeTarPath)
-		fmt.Printf("Running cc with image %s and args %s...\n", relativeTarPath, strings.Join(ccArgs, " "))
-		if err := runBuildOutput(ccOut, ccArgs, runOpts); err != nil {
-			os.Exit(1)
-		}
-
-		return
-	}
-
-	if *benchTests {
-		outPath := filepath.Join("build", "benchTests")
-		if runtime.GOOS == "windows" {
-			outPath += ".exe"
-		}
-
-		// generate from ./internal/bench
-		cmd := exec.Command("go", "test", "-o", outPath, "-c", "./internal/bench")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build benchmark tests: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("benchmarks written to %s\n", outPath)
-
-		// then codesign the binary if on macOS
-		if runtime.GOOS == "darwin" {
-			// build internal/cmd/codesign first
-			codesignOut, err := goBuild(buildOptions{
-				Package:    "internal/cmd/codesign",
-				OutputName: "codesign",
-				Build:      hostBuild,
-			})
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to build codesign tool: %v\n", err)
-				os.Exit(1)
-			}
-
-			cmd := exec.Command(codesignOut.Path,
-				"-entitlements", filepath.Join("tools", "entitlements.xml"),
-				"-bin", outPath,
-			)
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-
-			if err := cmd.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to codesign output: %v\n", err)
-				os.Exit(1)
-			}
-		}
-
-		fmt.Printf("running %s\n", outPath)
-
-		// then run the binary
-		cmd = exec.Command(outPath, "-test.bench=.", "-test.run=none", "-test.benchmem", "-test.v")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to run benchmark tests: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("benchmark tests run successfully\n")
-
+	if showHelp {
+		usage()
 		os.Exit(0)
 	}
 
-	if *snapshotE2E {
-		out, err := goBuild(buildOptions{
-			Package:          "cmd/snapshot-e2e",
-			OutputName:       "snapshot-e2e",
-			Build:            hostBuild,
-			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build snapshot-e2e: %v\n", err)
-			os.Exit(1)
-		}
-
-		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
-			os.Exit(1)
-		}
-		return
+	// Default buildfile path
+	if buildfilePath == "" {
+		buildfilePath = filepath.Join("tools", "Buildfile")
 	}
 
-	if *release {
-		if runtime.GOOS == "darwin" {
-			// macOS: Build, sign, notarize, staple, and verify
-			cfg, err := loadReleaseConfig()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "release config: %v\n", err)
-				os.Exit(1)
-			}
-
-			// Build CrumbleCracker.app (only release artifact, cc is internal)
-			appOut, err := goBuild(buildOptions{
-				Package:          "cmd/ccapp",
-				ApplicationName:  "CrumbleCracker",
-				OutputName:       "CrumbleCracker",
-				Build:            crossBuild{GOOS: "darwin", GOARCH: "arm64"},
-				EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
-				BuildApp:         true,
-				LogoPath:         filepath.Join("internal", "assets", "logo-color-black.png"),
-			})
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to build CrumbleCracker.app: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Printf("built %s\n", appOut.Path)
-
-			// Sign with Developer ID
-			fmt.Println("signing with Developer ID...")
-			if err := signAppBundle(appOut.Path, cfg); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to sign: %v\n", err)
-				os.Exit(1)
-			}
-
-			// Notarize
-			fmt.Println("notarizing with Apple...")
-			if err := notarize(appOut.Path, cfg); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to notarize: %v\n", err)
-				os.Exit(1)
-			}
-
-			// Staple
-			fmt.Println("stapling notarization ticket...")
-			if err := staple(appOut.Path); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to staple: %v\n", err)
-				os.Exit(1)
-			}
-
-			// Verify
-			fmt.Println("verifying signature and notarization...")
-			if err := verifyRelease(appOut.Path); err != nil {
-				fmt.Fprintf(os.Stderr, "verification failed: %v\n", err)
-				os.Exit(1)
-			}
-
-			fmt.Println("release build completed successfully!")
-		} else {
-			// Non-macOS: Cross-compile for Windows and Linux
-			platforms := []crossBuild{
-				{GOOS: "windows", GOARCH: "amd64"},
-				{GOOS: "windows", GOARCH: "arm64"},
-				{GOOS: "linux", GOARCH: "amd64"},
-				{GOOS: "linux", GOARCH: "arm64"},
-			}
-
-			for _, platform := range platforms {
-				out, err := goBuild(buildOptions{
-					Package:         "cmd/ccapp",
-					ApplicationName: "CrumbleCracker",
-					OutputName:      "CrumbleCracker",
-					Build:           platform,
-					BuildApp:        true,
-					IconPath:        filepath.Join("internal", "assets", "logo.ico"),
-				})
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "failed to build for %s/%s: %v\n", platform.GOOS, platform.GOARCH, err)
-					os.Exit(1)
-				}
-
-				// For release builds, always use platform suffix (rename if native)
-				if platform.IsNative() {
-					suffix := ""
-					if platform.GOOS == "windows" {
-						suffix = ".exe"
-					}
-					newPath := filepath.Join("build", fmt.Sprintf("CrumbleCracker_%s_%s%s", platform.GOOS, platform.GOARCH, suffix))
-					if err := os.Rename(out.Path, newPath); err != nil {
-						fmt.Fprintf(os.Stderr, "failed to rename %s to %s: %v\n", out.Path, newPath, err)
-						os.Exit(1)
-					}
-					out.Path = newPath
-				}
-
-				fmt.Printf("built %s\n", out.Path)
-			}
-
-			fmt.Println("cross-platform release build completed!")
-		}
-		return
-	}
-
-	if *runSpecial != "" {
-		out, err := goBuild(buildOptions{
-			Package:          *runSpecial,
-			OutputName:       filepath.Base(*runSpecial),
-			Build:            buildTarget,
-			EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
-		})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to build special: %v\n", err)
-			os.Exit(1)
-		}
-
-		fmt.Printf("running %s %+v\n", out.Path, fs.Args())
-		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
-			os.Exit(1)
-		}
-
-		return
-	}
-
-	// build cmd/cc by default
-	out, err := goBuild(buildOptions{
-		Package:          "internal/cmd/cc",
-		OutputName:       "cc",
-		Build:            buildTarget,
-		EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
-	})
+	// Read and parse buildfile
+	content, err := os.ReadFile(buildfilePath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to build cc: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("built %s\n", out.Path)
-
-	// Build installer for target platform (for embedding into ccapp)
-	if err := buildInstaller(buildTarget); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to build installer: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to read buildfile: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Get version for ccapp
-	version := getVersionFromGit()
-	fmt.Printf("ccapp version: %s\n", version)
-
-	// also build cmd/ccapp (with embedded installers and version)
-	ccappOut, err := goBuild(buildOptions{
-		Package:          "cmd/ccapp",
-		ApplicationName:  "CrumbleCracker",
-		OutputName:       "CrumbleCracker",
-		Build:            buildTarget,
-		EntitlementsPath: filepath.Join("tools", "entitlements.xml"),
-		BuildApp:         true,
-		LogoPath:         filepath.Join("internal", "assets", "logo-color-black.png"),
-		IconPath:         filepath.Join("internal", "assets", "logo.ico"),
-		Version:          version,
-		Tags:             []string{"embed_installer"},
-	})
+	bf, err := parseBuildfile(buildfilePath, content)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to build ccapp: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to parse buildfile: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("built %s\n", ccappOut.Path)
 
-	if *run {
-		if !buildTarget.IsNative() {
-			fmt.Fprintf(os.Stderr, "cannot run cross-compiled binary\n")
-			os.Exit(1)
+	// List targets
+	if listTargets {
+		var names []string
+		for name := range bf.Targets {
+			names = append(names, name)
 		}
+		sort.Strings(names)
 
-		fmt.Printf("running %s %s\n", out.Path, strings.Join(fs.Args(), " "))
-		if err := runBuildOutput(out, fs.Args(), runOpts); err != nil {
+		fmt.Println("Available targets:")
+		for _, name := range names {
+			target := bf.Targets[name]
+			platforms := ""
+			if len(target.Platforms) > 0 {
+				platforms = fmt.Sprintf(" [%s]", strings.Join(target.Platforms, " "))
+			}
+			requires := ""
+			if len(target.Requires) > 0 {
+				requires = fmt.Sprintf(" (requires: %s)", strings.Join(target.Requires, ", "))
+			}
+			deps := ""
+			if len(target.Dependencies) > 0 {
+				deps = fmt.Sprintf(" <- %s", strings.Join(target.Dependencies, ", "))
+			}
+			fmt.Printf("  %s%s%s%s\n", name, platforms, requires, deps)
+		}
+		os.Exit(0)
+	}
+
+	// Default target
+	if targetName == "" {
+		targetName = "default"
+		if _, ok := bf.Targets["default"]; !ok {
+			fmt.Fprintf(os.Stderr, "no target specified and no 'default' target found\n")
+			usage()
 			os.Exit(1)
 		}
-	} else if *app {
-		if err := runBuildOutput(ccappOut, fs.Args(), runOpts); err != nil {
-			os.Exit(1)
-		}
+	}
+
+	// Check target exists
+	if _, ok := bf.Targets[targetName]; !ok {
+		fmt.Fprintf(os.Stderr, "target %q not found\n", targetName)
+		os.Exit(1)
+	}
+
+	// Execute
+	executor := NewExecutor(bf, dryRun, extraArgs)
+	if err := executor.Run(targetName); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
 	}
 }

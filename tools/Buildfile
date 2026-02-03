@@ -1,0 +1,238 @@
+# CrumbleCracker Build Configuration
+#
+# Usage:
+#   ./tools/build.go [target]        Build a target
+#   ./tools/build.go --list          List all targets
+#   ./tools/build.go target -- args  Pass args to run commands
+
+# Paths
+OUTPUT = build
+ENTITLEMENTS = tools/entitlements.xml
+ASSETS = internal/assets
+INSTALLERS_DIR = internal/update/installers
+
+# ============================================================================
+# Core Binaries
+# ============================================================================
+
+cc:
+    gobuild internal/cmd/cc -o $(OUTPUT)/cc -entitlements $(ENTITLEMENTS)
+
+cc-helper:
+    gobuild cmd/cc-helper -o $(OUTPUT)/cc-helper -entitlements $(ENTITLEMENTS)
+
+quest:
+    gobuild internal/cmd/quest -o $(OUTPUT)/quest -entitlements $(ENTITLEMENTS)
+
+codesign:
+    gobuild internal/cmd/codesign -o $(OUTPUT)/codesign
+
+# ============================================================================
+# Desktop App
+# ============================================================================
+
+# Build installer for embedding
+ccinstaller:
+    gobuild cmd/ccinstaller -o $(INSTALLERS_DIR)/ccinstaller_$(GOOS)_$(GOARCH)$(EXE)
+
+# Main desktop application
+ccapp: cc ccinstaller
+    gobuild cmd/ccapp -o $(OUTPUT)/CrumbleCracker -app \
+        -appname CrumbleCracker \
+        -logo $(ASSETS)/logo-color-black.png \
+        -icon $(ASSETS)/logo.ico \
+        -version $(VERSION) \
+        -tags embed_installer \
+        -entitlements $(ENTITLEMENTS)
+
+# ============================================================================
+# Development Tools
+# ============================================================================
+
+debug:
+    gobuild cmd/debug -o $(OUTPUT)/debug
+    run $(OUTPUT)/debug
+
+timeslice:
+    gobuild cmd/timeslice -o $(OUTPUT)/timeslice
+    run $(OUTPUT)/timeslice
+
+oci:
+    gobuild internal/cmd/oci -o $(OUTPUT)/oci
+    run $(OUTPUT)/oci
+
+kernel:
+    gobuild internal/cmd/kernel -o $(OUTPUT)/kernel
+    run $(OUTPUT)/kernel
+
+miniplayer:
+    gobuild internal/cmd/miniplayer -o $(OUTPUT)/miniplayer -entitlements $(ENTITLEMENTS)
+    run $(OUTPUT)/miniplayer
+
+# ============================================================================
+# Testing
+# ============================================================================
+
+# Basic quest test (hypervisor bringup + Linux boot)
+quest-run: quest
+    run $(OUTPUT)/quest
+
+# Bringup: guest test binary executed inside a VM
+bringup: quest
+    gobuild internal/cmd/bringup -o $(OUTPUT)/bringup_linux_$(GOARCH) \
+        -os linux -tags guest -test
+    run $(OUTPUT)/quest -exec $(OUTPUT)/bringup_linux_$(GOARCH)
+
+# GPU bringup: framebuffer + input tests
+bringup-gpu: quest
+    gobuild internal/cmd/bringup-gpu -o $(OUTPUT)/bringup-gpu_linux_$(GOARCH) \
+        -os linux -tags guest -test
+    run $(OUTPUT)/quest -exec $(OUTPUT)/bringup-gpu_linux_$(GOARCH) -gpu
+
+# Example test runner
+example-test:
+    gobuild examples/shared/testrunner/cmd/runtest -o $(OUTPUT)/runtest
+    run $(OUTPUT)/runtest
+
+# CC integration tests
+cc-tests: cc
+    gobuild examples/shared/testrunner/cmd/runtest -o $(OUTPUT)/runtest
+    run $(OUTPUT)/runtest --cc2-binary $(OUTPUT)/cc ./internal/cmd/cc/tests/...
+
+# ============================================================================
+# CI Suite
+# ============================================================================
+
+# Core CI tests (quest, bringup, cc integration tests, example tests)
+ci-tests: quest cc
+    gobuild internal/cmd/bringup -o $(OUTPUT)/bringup_linux_$(GOARCH) \
+        -os linux -tags guest -test
+    run $(OUTPUT)/quest
+    run $(OUTPUT)/quest -exec $(OUTPUT)/bringup_linux_$(GOARCH)
+    gobuild examples/shared/testrunner/cmd/runtest -o $(OUTPUT)/runtest
+    run $(OUTPUT)/runtest --cc2-binary $(OUTPUT)/cc ./internal/cmd/cc/tests/...
+    run $(OUTPUT)/runtest --cc2-binary $(OUTPUT)/cc ./examples/getting-started/...
+
+# Full CI tests including bindings (for platforms that support them)
+ci-tests-full: ci-tests bindings-test
+    requires darwin linux
+
+# ============================================================================
+# Bindings
+# ============================================================================
+
+# --- C Bindings ---
+
+# C bindings shared library
+libcc: cc-helper
+    gobuild bindings/c -o $(OUTPUT)/libcc$(SHLIB_EXT) -shared -cgo
+    @darwin sh install_name_tool -id @rpath/libcc.dylib $(OUTPUT)/libcc.dylib
+    copy bindings/c/libcc.h $(OUTPUT)/libcc.h
+
+# C bindings test
+libcc-test: libcc codesign
+    requires darwin linux
+    @darwin sh gcc -o $(OUTPUT)/test_basic bindings/c/testdata/test_basic.c \
+        -I$(OUTPUT) -L$(OUTPUT) -lcc '-Wl,-rpath,@executable_path'
+    @linux sh gcc -o $(OUTPUT)/test_basic bindings/c/testdata/test_basic.c \
+        -I$(OUTPUT) -L$(OUTPUT) -lcc '-Wl,-rpath,$ORIGIN'
+    @darwin sh $(OUTPUT)/codesign -entitlements $(ENTITLEMENTS) -bin $(OUTPUT)/test_basic
+    run $(OUTPUT)/test_basic
+
+# --- Python Bindings ---
+
+# Python bindings (requires libcc)
+bindings-python: libcc
+    requires darwin linux
+    sh test -d bindings/python/.venv || python3 -m venv bindings/python/.venv
+    sh bindings/python/.venv/bin/pip install -e "bindings/python[dev]" --quiet
+
+# Python bindings test
+bindings-python-test: bindings-python
+    requires darwin linux
+    sh CC_LIBRARY_PATH=$(PWD)/$(OUTPUT) CC_HELPER_PATH=$(PWD)/$(OUTPUT)/cc-helper \
+        bindings/python/.venv/bin/pytest -v bindings/python/tests/
+
+# --- Node.js Bindings ---
+
+# Node.js bindings build
+bindings-nodejs: libcc
+    requires darwin linux
+    sh cd bindings/nodejs && npm install --silent && npm run build
+
+# Node.js bindings test
+bindings-nodejs-test: bindings-nodejs
+    requires darwin linux
+    sh cd bindings/nodejs && CC_LIBRARY_PATH=$(PWD)/$(OUTPUT) CC_HELPER_PATH=$(PWD)/$(OUTPUT)/cc-helper npm test
+
+# --- Rust Bindings ---
+
+# Rust bindings build (builds libcc.a statically via build.rs)
+bindings-rust:
+    requires darwin linux
+    sh cd bindings/rust && cargo build
+
+# Rust bindings test
+bindings-rust-test: bindings-rust
+    requires darwin linux
+    sh cd bindings/rust && cargo test
+
+# --- All Bindings ---
+
+# Build all bindings
+bindings: libcc bindings-python bindings-nodejs bindings-rust
+
+# Test all bindings
+bindings-test: libcc-test bindings-python-test bindings-nodejs-test bindings-rust-test
+
+# ============================================================================
+# Benchmarks
+# ============================================================================
+
+bench-tests:
+    sh go test -o $(OUTPUT)/benchTests -c ./internal/bench
+    @darwin gobuild internal/cmd/codesign -o $(OUTPUT)/codesign
+    @darwin sh $(OUTPUT)/codesign -entitlements $(ENTITLEMENTS) -bin $(OUTPUT)/benchTests
+    run $(OUTPUT)/benchTests -test.bench=. -test.run=none -test.benchmem -test.v
+
+snapshot-e2e:
+    gobuild cmd/snapshot-e2e -o $(OUTPUT)/snapshot-e2e -entitlements $(ENTITLEMENTS)
+    run $(OUTPUT)/snapshot-e2e
+
+# ============================================================================
+# Release Builds
+# ============================================================================
+
+# Cross-platform release (Windows/Linux)
+release-cross:
+    gobuild cmd/ccapp -o $(OUTPUT)/CrumbleCracker_linux_amd64 \
+        -os linux -arch amd64 -appname CrumbleCracker
+    gobuild cmd/ccapp -o $(OUTPUT)/CrumbleCracker_linux_arm64 \
+        -os linux -arch arm64 -appname CrumbleCracker
+    gobuild cmd/ccapp -o $(OUTPUT)/CrumbleCracker_windows_amd64.exe \
+        -os windows -arch amd64 -app -appname CrumbleCracker \
+        -icon $(ASSETS)/logo.ico
+    gobuild cmd/ccapp -o $(OUTPUT)/CrumbleCracker_windows_arm64.exe \
+        -os windows -arch arm64 -app -appname CrumbleCracker \
+        -icon $(ASSETS)/logo.ico
+
+# ============================================================================
+# Utilities
+# ============================================================================
+
+clean:
+    rm $(OUTPUT)
+
+# Run cc after building
+run: cc
+    run $(OUTPUT)/cc
+
+# Run ccapp after building
+run-app: ccapp
+    run $(OUTPUT)/CrumbleCracker$(EXE)
+
+# ============================================================================
+# Default Target
+# ============================================================================
+
+default: ccapp
