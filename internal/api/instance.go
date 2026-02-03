@@ -148,6 +148,12 @@ type instance struct {
 
 	// Cache directory configuration
 	cache CacheDir
+
+	// Boot snapshot configuration
+	bootSnapshotEnabled bool
+
+	// Boot statistics (filled during start)
+	bootStats *BootStats
 }
 
 // New creates and starts a new Instance from the given source.
@@ -187,25 +193,26 @@ func New(source InstanceSource, opts ...Option) (Instance, error) {
 	}
 
 	inst := &instance{
-		id:                generateID(),
-		abstractRoot:      abstractRoot,
-		imageConfig:       imageConfig,
-		arch:              arch,
-		source:            source,
-		ctx:               ctx,
-		cancel:            cancel,
-		memoryMB:          cfg.memoryMB,
-		cpus:              cfg.cpus,
-		user:              cfg.user,
-		timeout:           cfg.timeout,
-		interactive:       cfg.interactive,
-		interactiveStdin:  cfg.interactiveStdin,
-		interactiveStdout: cfg.interactiveStdout,
-		dmesg:             cfg.dmesg,
-		packetCapture:     cfg.packetCapture,
-		mounts:            cfg.mounts,
-		gpu:               cfg.gpu,
-		cache:             cfg.cache,
+		id:                  generateID(),
+		abstractRoot:        abstractRoot,
+		imageConfig:         imageConfig,
+		arch:                arch,
+		source:              source,
+		ctx:                 ctx,
+		cancel:              cancel,
+		memoryMB:            cfg.memoryMB,
+		cpus:                cfg.cpus,
+		user:                cfg.user,
+		timeout:             cfg.timeout,
+		interactive:         cfg.interactive,
+		interactiveStdin:    cfg.interactiveStdin,
+		interactiveStdout:   cfg.interactiveStdout,
+		dmesg:               cfg.dmesg,
+		packetCapture:       cfg.packetCapture,
+		mounts:              cfg.mounts,
+		gpu:                 cfg.gpu,
+		cache:               cfg.cache,
+		bootSnapshotEnabled: cfg.bootSnapshotEnabled,
 	}
 
 	if err := inst.start(); err != nil {
@@ -431,6 +438,73 @@ func (inst *instance) start() error {
 		)
 	}
 
+	// Initialize boot stats
+	bootStartTime := time.Now()
+	inst.bootStats = &BootStats{ColdBoot: true}
+
+	// Boot snapshot handling
+	var snapshotCache *initx.SnapshotCache
+	var configHash hv.VMConfigHash
+	var restoredFromSnapshot bool
+
+	if inst.bootSnapshotEnabled && inst.cache != nil {
+		snapshotIO := initx.GetSnapshotIO()
+		fmt.Fprintf(os.Stderr, "[DEBUG] bootSnapshotEnabled=%v cache=%v snapshotIO=%v\n", inst.bootSnapshotEnabled, inst.cache != nil, snapshotIO != nil)
+		if snapshotIO != nil {
+			snapshotCache = initx.NewSnapshotCache(inst.cache.BootSnapshotPath(), snapshotIO)
+			fmt.Fprintf(os.Stderr, "[DEBUG] snapshotCache created at %s\n", inst.cache.BootSnapshotPath())
+
+			// Compute config hash for snapshot lookup
+			configHash = hv.ComputeConfigHash(
+				arch,
+				inst.memoryMB<<20,
+				inst.vm.HVVirtualMachine().MemoryBase(),
+				inst.cpus,
+				nil, // TODO: include device configs for more precise cache invalidation
+			)
+
+			// Try to restore from snapshot
+			hasSnapshot := snapshotCache.HasValidSnapshot(configHash, time.Time{})
+			fmt.Fprintf(os.Stderr, "[DEBUG] HasValidSnapshot=%v configHash=%x\n", hasSnapshot, configHash[:8])
+			if hasSnapshot {
+				restoreStart := time.Now()
+				fmt.Fprintf(os.Stderr, "[DEBUG] Loading snapshot...\n")
+				snap, err := snapshotCache.LoadSnapshot(configHash)
+				if err == nil {
+					fmt.Fprintf(os.Stderr, "[DEBUG] Restoring snapshot...\n")
+					if err := inst.vm.RestoreSnapshot(snap); err == nil {
+						restoredFromSnapshot = true
+						inst.bootStats.ColdBoot = false
+						inst.bootStats.SnapshotRestoreTime = time.Since(restoreStart)
+						fmt.Fprintf(os.Stderr, "[DEBUG] Snapshot restored in %v\n", inst.bootStats.SnapshotRestoreTime)
+
+						// Queue RST packets to trigger guest reconnection after VM starts.
+						// The guest's init is blocked waiting for data on a stale vsock connection.
+						// When the VM runs, these RST packets will be delivered, causing the
+						// guest's read to error and trigger reconnection.
+						if vsockDev := inst.vm.VsockDevice(); vsockDev != nil {
+							fmt.Fprintf(os.Stderr, "[DEBUG] Injecting RST packets...\n")
+							if err := vsockDev.InjectRstToGuest(initx.VsockProgramPort); err != nil {
+								fmt.Fprintf(os.Stderr, "[DEBUG] Failed to inject RST to program port: %v\n", err)
+							}
+							if err := vsockDev.InjectRstToGuest(initx.VsockStdinPort); err != nil {
+								fmt.Fprintf(os.Stderr, "[DEBUG] Failed to inject RST to stdin port: %v\n", err)
+							}
+							fmt.Fprintf(os.Stderr, "[DEBUG] RST packets injected\n")
+						} else {
+							fmt.Fprintf(os.Stderr, "[DEBUG] No vsock device found\n")
+						}
+						// Note: ReacceptVsockConnection is called after session starts below
+					} else {
+						fmt.Fprintf(os.Stderr, "[DEBUG] Failed to restore snapshot: %v\n", err)
+					}
+				} else {
+					fmt.Fprintf(os.Stderr, "[DEBUG] Failed to load snapshot: %v\n", err)
+				}
+			}
+		}
+	}
+
 	// Get command from image config
 	cmd := inst.imageConfig.Entrypoint
 	if len(inst.imageConfig.Cmd) > 0 {
@@ -463,17 +537,72 @@ func (inst *instance) start() error {
 		return &Error{Op: "new", Err: fmt.Errorf("build init program: %w", err)}
 	}
 
-	// Start session (boots VM only, skip the init program for now)
-	// We'll run the container init program synchronously after boot to ensure
-	// it completes before returning from New(). This prevents race conditions
-	// between container init and user commands.
+	// Configure session based on whether we restored from snapshot
+	sessionCfg := initx.SessionConfig{
+		SkipBoot: restoredFromSnapshot,
+	}
+
 	bootDone := make(chan error, 1)
-	inst.session = initx.StartSession(inst.ctx, inst.vm, nil, initx.SessionConfig{
-		OnBootComplete: func() error {
+	kernelBootStart := time.Now()
+
+	if !restoredFromSnapshot {
+		// Cold boot path - capture snapshot after boot completes
+		sessionCfg.OnBootComplete = func() error {
+			inst.bootStats.KernelBootTime = time.Since(kernelBootStart)
+			fmt.Fprintf(os.Stderr, "[DEBUG] OnBootComplete called, kernelBootTime=%v\n", inst.bootStats.KernelBootTime)
+
+			// Capture snapshot for future use
+			if snapshotCache != nil {
+				fmt.Fprintf(os.Stderr, "[DEBUG] Capturing snapshot...\n")
+				snap, err := inst.vm.CaptureSnapshot()
+				if err == nil {
+					fmt.Fprintf(os.Stderr, "[DEBUG] Snapshot captured, saving...\n")
+					if err := snapshotCache.SaveSnapshot(configHash, snap); err != nil {
+						fmt.Fprintf(os.Stderr, "[DEBUG] Failed to save snapshot: %v\n", err)
+						slog.Debug("failed to save boot snapshot", "error", err)
+					} else {
+						fmt.Fprintf(os.Stderr, "[DEBUG] Snapshot saved successfully\n")
+						slog.Debug("saved boot snapshot", "duration", inst.bootStats.KernelBootTime)
+					}
+				} else {
+					fmt.Fprintf(os.Stderr, "[DEBUG] Failed to capture snapshot: %v\n", err)
+					slog.Debug("failed to capture boot snapshot", "error", err)
+				}
+			} else {
+				fmt.Fprintf(os.Stderr, "[DEBUG] snapshotCache is nil, not saving\n")
+			}
+
 			bootDone <- nil
 			return nil
-		},
-	})
+		}
+	} else {
+		// Warm boot path - OnBootComplete is not called when SkipBoot is true,
+		// so we signal bootDone immediately after starting the session
+	}
+
+	// For snapshot restore, we need to start the VM run loop and wait for
+	// the guest to reconnect before starting the session
+	if restoredFromSnapshot {
+		fmt.Fprintf(os.Stderr, "[DEBUG] Calling ResumeAfterSnapshotRestore...\n")
+		// ResumeAfterSnapshotRestore starts the VM run loop and waits for
+		// the guest to reconnect (RST packets were already injected above)
+		if err := inst.vm.ResumeAfterSnapshotRestore(inst.ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "[DEBUG] ResumeAfterSnapshotRestore failed: %v\n", err)
+			inst.vm.Close()
+			inst.ns.Close()
+			inst.h.Close()
+			return &Error{Op: "new", Err: fmt.Errorf("resume after snapshot restore: %w", err)}
+		}
+		fmt.Fprintf(os.Stderr, "[DEBUG] ResumeAfterSnapshotRestore succeeded\n")
+	}
+
+	// Start session
+	inst.session = initx.StartSession(inst.ctx, inst.vm, nil, sessionCfg)
+
+	// Signal boot done for snapshot restore (session won't call OnBootComplete when SkipBoot=true)
+	if restoredFromSnapshot {
+		bootDone <- nil
+	}
 
 	// Wait for boot to complete
 	select {
@@ -503,12 +632,15 @@ func (inst *instance) start() error {
 	// Now run the container init program synchronously.
 	// This sets up the container (chroot, mounts, etc.) and must complete
 	// before user commands can run.
+	containerInitStart := time.Now()
 	if err := inst.vm.Run(inst.ctx, initProg); err != nil {
 		inst.vm.Close()
 		inst.ns.Close()
 		inst.h.Close()
 		return &Error{Op: "new", Err: fmt.Errorf("container init failed: %w", err)}
 	}
+	inst.bootStats.ContainerInitTime = time.Since(containerInitStart)
+	inst.bootStats.TotalBootTime = time.Since(bootStartTime)
 
 	return nil
 }
@@ -818,6 +950,11 @@ func (inst *instance) SetNetworkEnabled(enabled bool) {
 	if inst.ns != nil {
 		inst.ns.SetInternetAccessEnabled(enabled)
 	}
+}
+
+// BootStats returns timing information about how the instance was created.
+func (inst *instance) BootStats() *BootStats {
+	return inst.bootStats
 }
 
 var _ Instance = (*instance)(nil)

@@ -33,6 +33,10 @@ type instanceConfig struct {
 
 	// Cache directory configuration
 	cache CacheDir
+
+	// Boot snapshot configuration
+	bootSnapshotEnabled  bool // true = use snapshots, false = disabled
+	bootSnapshotExplicit bool // true if user explicitly set the option
 }
 
 // mountConfig holds parsed mount configuration.
@@ -88,8 +92,16 @@ func parseInstanceOptions(opts []Option) instanceConfig {
 			cfg.gpu = o.GPU()
 		case interface{ Cache() CacheDir }:
 			cfg.cache = o.Cache()
+		case interface{ BootSnapshot() bool }:
+			cfg.bootSnapshotEnabled = o.BootSnapshot()
+			cfg.bootSnapshotExplicit = true
 		}
 	}
+
+	// Boot snapshots are disabled by default until the vsock reconnection
+	// after snapshot restore is properly implemented.
+	// Users can explicitly enable with WithBootSnapshot().
+	// TODO: Enable by default once snapshot restore properly handles vsock
 
 	return cfg
 }

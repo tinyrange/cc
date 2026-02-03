@@ -7,6 +7,7 @@ func init() {
 	// This is needed for VM snapshot serialization to work with device snapshots.
 	gob.Register(&consoleSnapshot{})
 	gob.Register(&fsSnapshot{})
+	gob.Register(&vsockSnapshot{})
 	gob.Register(&QueueSnapshot{})
 	gob.Register(&MMIODeviceSnapshot{})
 }

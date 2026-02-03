@@ -107,8 +107,13 @@ func BuildFromRTG(cfg BuilderConfig) (*ir.Program, error) {
 		port = 9998 // Default vsock port
 	}
 
-	// Note: Timeslice MMIO is disabled because the MMIO handlers were removed
-	// as part of the vsock migration. Pass 0 to indicate timeslice is disabled.
+	// Timeslice MMIO allows guest code to record timing markers that are captured
+	// by the host hypervisor. The default address 0xf0001000 is handled by MMIO
+	// handlers in HVF/KVM/WHP.
+	timesliceAddr := cfg.TimesliceMMIOPhysAddr
+	if timesliceAddr == 0 {
+		timesliceAddr = 0xf0001000 // Default timeslice MMIO address
+	}
 
 	compileOpts := rtg.CompileOptions{
 		GOARCH: goarch,
@@ -117,7 +122,7 @@ func BuildFromRTG(cfg BuilderConfig) (*ir.Program, error) {
 		},
 		Config: map[string]any{
 			"VSOCK_PORT":               int64(port),
-			"TIMESLICE_MMIO_PHYS_ADDR": int64(0), // Disabled - no MMIO handler
+			"TIMESLICE_MMIO_PHYS_ADDR": int64(timesliceAddr), // Enable timeslice recording
 		},
 	}
 

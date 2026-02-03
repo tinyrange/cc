@@ -700,10 +700,116 @@ func (v *Vsock) tryDeliverRx(dev device) {
 	}
 }
 
+// InjectRstToGuest sends an RST packet to force the guest's socket to error.
+// Used after snapshot restore to trigger reconnection. The guestPort is the
+// port number the guest is using for its connection.
+func (v *Vsock) InjectRstToGuest(guestPort uint32) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	dev := v.Device()
+	if dev == nil {
+		return fmt.Errorf("vsock device not initialized")
+	}
+
+	mmioDevice, ok := dev.(*mmioDevice)
+	if !ok {
+		return fmt.Errorf("unexpected device type: %T", dev)
+	}
+
+	rst := vsockHeader{
+		SrcCID:  VSOCK_CID_HOST,
+		DstCID:  v.guestCID,
+		SrcPort: guestPort, // Use guest's port as source (host side of connection)
+		DstPort: guestPort, // Target guest's listening port
+		Type:    VIRTIO_VSOCK_TYPE_STREAM,
+		Op:      VIRTIO_VSOCK_OP_RST,
+	}
+
+	v.queueRxPacket(encodeVsockHeader(rst))
+	v.tryDeliverRx(mmioDevice)
+	return nil
+}
+
 var (
 	_ hv.MemoryMappedIODevice = (*Vsock)(nil)
 	_ deviceHandler           = (*Vsock)(nil)
+	_ hv.DeviceSnapshotter    = (*Vsock)(nil)
 )
+
+// DeviceSnapshot support ----------------------------------------------------
+
+// vsockSnapshot holds the vsock device state for snapshotting
+type vsockSnapshot struct {
+	Arch      hv.CpuArchitecture
+	Base      uint64
+	Size      uint64
+	IRQLine   uint32
+	GuestCID  uint64
+	PendingRx [][]byte
+	// Note: We don't snapshot connections - the guest must reconnect after restore
+	MMIODevice MMIODeviceSnapshot
+}
+
+func (v *Vsock) DeviceId() string { return "virtio-vsock" }
+
+func (v *Vsock) CaptureSnapshot() (hv.DeviceSnapshot, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	snap := &vsockSnapshot{
+		Arch:     v.Arch(),
+		Base:     v.Base(),
+		Size:     v.Size(),
+		IRQLine:  v.IRQLine(),
+		GuestCID: v.guestCID,
+	}
+
+	// Capture pending RX packets (deep copy)
+	for _, pkt := range v.pendingRx {
+		snap.PendingRx = append(snap.PendingRx, append([]byte(nil), pkt...))
+	}
+
+	// Capture MMIO device state (queue indices, features, etc.)
+	if dev := v.Device(); dev != nil {
+		if mmio, ok := dev.(*mmioDevice); ok {
+			snap.MMIODevice = mmio.CaptureMMIOSnapshot()
+		}
+	}
+
+	return snap, nil
+}
+
+func (v *Vsock) RestoreSnapshot(snap hv.DeviceSnapshot) error {
+	data, ok := snap.(*vsockSnapshot)
+	if !ok {
+		return fmt.Errorf("virtio-vsock: invalid snapshot type")
+	}
+
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	v.RestoreBase(data.Arch, data.Base, data.Size, data.IRQLine)
+	v.guestCID = data.GuestCID
+	v.pendingRx = nil
+	for _, pkt := range data.PendingRx {
+		v.pendingRx = append(v.pendingRx, append([]byte(nil), pkt...))
+	}
+
+	// Clear connection state - guest must reconnect
+	v.connections = make(map[vsockConnKey]*vsockConnection)
+
+	// Restore MMIO device state (queue indices, features, etc.)
+	if dev := v.Device(); dev != nil {
+		if mmio, ok := dev.(*mmioDevice); ok {
+			if err := mmio.RestoreMMIOSnapshot(data.MMIODevice); err != nil {
+				return fmt.Errorf("virtio-vsock: restore MMIO state: %w", err)
+			}
+		}
+	}
+
+	return nil
+}
 
 // SimpleVsockBackend is a simple in-memory vsock backend for testing.
 type SimpleVsockBackend struct {

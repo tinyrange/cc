@@ -17,6 +17,8 @@ type CacheDir interface {
 	QEMUPath() string
 	// SnapshotPath returns the path for filesystem snapshot cache.
 	SnapshotPath() string
+	// BootSnapshotPath returns the path for VM boot snapshot cache.
+	BootSnapshotPath() string
 }
 
 // cacheDir is the concrete implementation of CacheDir.
@@ -62,4 +64,9 @@ func (c *cacheDir) QEMUPath() string {
 // SnapshotPath returns the path for filesystem snapshot cache.
 func (c *cacheDir) SnapshotPath() string {
 	return filepath.Join(c.path, "snapshots")
+}
+
+// BootSnapshotPath returns the path for VM boot snapshot cache.
+func (c *cacheDir) BootSnapshotPath() string {
+	return filepath.Join(c.path, "boot-snapshots")
 }

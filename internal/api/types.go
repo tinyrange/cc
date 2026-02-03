@@ -8,6 +8,25 @@ import (
 	"time"
 )
 
+// BootStats contains timing information about instance creation.
+// Use Instance.BootStats() to retrieve after New() returns.
+type BootStats struct {
+	// ColdBoot is true if the VM booted from scratch (no snapshot).
+	ColdBoot bool
+
+	// SnapshotRestoreTime is the time spent restoring from snapshot (0 if cold boot).
+	SnapshotRestoreTime time.Duration
+
+	// KernelBootTime is the time spent booting the kernel (0 if restored from snapshot).
+	KernelBootTime time.Duration
+
+	// ContainerInitTime is the time spent in container initialization.
+	ContainerInitTime time.Duration
+
+	// TotalBootTime is the total time from New() call to ready.
+	TotalBootTime time.Duration
+}
+
 // File represents an open file in a guest filesystem.
 type File interface {
 	io.Reader
@@ -178,6 +197,11 @@ type Instance interface {
 	// GPU returns the GPU interface if GPU is enabled, nil otherwise.
 	// When non-nil, the caller must run the display loop on the main thread.
 	GPU() GPU
+
+	// BootStats returns timing information about how the instance was created.
+	// This includes whether it was a cold boot or restored from snapshot,
+	// and detailed timing breakdowns.
+	BootStats() *BootStats
 }
 
 // GPU provides access to guest display and input devices.

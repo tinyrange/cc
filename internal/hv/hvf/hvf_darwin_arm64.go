@@ -252,6 +252,17 @@ var hvfSysRegsToCapture = []bindings.SysReg{
 	bindings.HV_SYS_REG_AFSR0_EL1,
 	bindings.HV_SYS_REG_AFSR1_EL1,
 	bindings.HV_SYS_REG_AMAIR_EL1,
+	// Pointer Authentication Code (PAC) keys - required for kernels with PAC enabled
+	bindings.HV_SYS_REG_APIAKEYLO_EL1,
+	bindings.HV_SYS_REG_APIAKEYHI_EL1,
+	bindings.HV_SYS_REG_APIBKEYLO_EL1,
+	bindings.HV_SYS_REG_APIBKEYHI_EL1,
+	bindings.HV_SYS_REG_APDAKEYLO_EL1,
+	bindings.HV_SYS_REG_APDAKEYHI_EL1,
+	bindings.HV_SYS_REG_APDBKEYLO_EL1,
+	bindings.HV_SYS_REG_APDBKEYHI_EL1,
+	bindings.HV_SYS_REG_APGAKEYLO_EL1,
+	bindings.HV_SYS_REG_APGAKEYHI_EL1,
 }
 
 // GIC ICC (CPU interface) registers to capture for snapshots.
@@ -310,6 +321,18 @@ func (ctx *exitContext) SetExitTimeslice(id timeslice.TimesliceID) {
 	ctx.kind = id
 }
 
+// snapshotRequest is used to request a snapshot capture from the vCPU thread.
+type snapshotRequest struct {
+	result  chan snapshotResult
+	release chan struct{} // Closed when vCPU can resume
+}
+
+// snapshotResult is the result of a snapshot capture request.
+type snapshotResult struct {
+	state arm64HvfVcpuSnapshot
+	err   error
+}
+
 type virtualCPU struct {
 	vm *virtualMachine
 
@@ -323,6 +346,10 @@ type virtualCPU struct {
 	runQueue chan func()
 
 	initError chan error
+
+	// snapshotChan receives snapshot requests while the vCPU is running.
+	// This allows capturing snapshots without blocking on runQueue.
+	snapshotChan chan *snapshotRequest
 }
 
 // implements [hv.VirtualCPU].
@@ -532,6 +559,19 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 			return err
 		}
 	case bindings.HV_EXIT_REASON_CANCELED:
+		// Check if a snapshot was requested before returning
+		select {
+		case req := <-v.snapshotChan:
+			// Capture snapshot on the vCPU thread
+			state, err := v.captureSnapshot()
+			req.result <- snapshotResult{state: state, err: err}
+			// Wait for release signal before resuming - this ensures the full
+			// snapshot (memory, GIC, devices) is captured while vCPU is paused
+			<-req.release
+			// Return nil so the caller will loop and run the vCPU again
+			return nil
+		default:
+		}
 		return ctx.Err()
 	default:
 		return fmt.Errorf("hvf: unknown exit reason %s", v.exit.Reason)
@@ -1145,20 +1185,56 @@ func (v *virtualMachine) CaptureSnapshot() (hv.Snapshot, error) {
 	}
 
 	// Capture each vCPU state
+	// We use the snapshotChan to request snapshot capture from the vCPU thread,
+	// then force the vCPU to exit so it can process the request. This allows
+	// capturing snapshots while the VM is running (e.g., during boot completion).
+	//
+	// The vCPUs remain paused until we close their release channels, ensuring
+	// the full snapshot (GIC, devices, memory) is captured atomically.
+	type pendingRequest struct {
+		id  int
+		req *snapshotRequest
+	}
+	var pending []pendingRequest
+
+	// Send snapshot requests to all vCPUs
 	for id, cpu := range v.cpus {
-		errChan := make(chan error, 1)
-		var state arm64HvfVcpuSnapshot
-
-		cpu.runQueue <- func() {
-			var err error
-			state, err = cpu.captureSnapshot()
-			errChan <- err
+		req := &snapshotRequest{
+			result:  make(chan snapshotResult, 1),
+			release: make(chan struct{}),
 		}
 
-		if err := <-errChan; err != nil {
-			return nil, fmt.Errorf("hvf: capture vCPU %d snapshot: %w", id, err)
+		// Send the snapshot request
+		select {
+		case cpu.snapshotChan <- req:
+			// Request sent, force vCPU to exit so it processes the request
+			exitList := []bindings.VCPU{cpu.id}
+			_ = bindings.HvVcpusExit(&exitList[0], 1)
+			pending = append(pending, pendingRequest{id: id, req: req})
+		default:
+			// Channel full - shouldn't happen with capacity 1
+			// Release any already-pending vCPUs
+			for _, p := range pending {
+				close(p.req.release)
+			}
+			return nil, fmt.Errorf("hvf: snapshot request channel full for vCPU %d", id)
 		}
-		ret.cpuStates[id] = state
+	}
+
+	// Ensure all vCPUs are released even if we fail
+	defer func() {
+		for _, p := range pending {
+			close(p.req.release)
+		}
+	}()
+
+	// Wait for all vCPU state captures to complete
+	for _, p := range pending {
+		res := <-p.req.result
+		if res.err != nil {
+			return nil, fmt.Errorf("hvf: capture vCPU %d snapshot: %w", p.id, res.err)
+		}
+		ret.cpuStates[p.id] = res.state
 	}
 	rec.Record(tsCaptureVcpuState)
 
@@ -1809,10 +1885,11 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 	for i := 0; i < config.CPUCount(); i++ {
 		vcpu := &virtualCPU{
-			vm:        ret,
-			runQueue:  make(chan func(), 16),
-			initError: make(chan error, 1),
-			rec:       timeslice.NewState(),
+			vm:           ret,
+			runQueue:     make(chan func(), 16),
+			initError:    make(chan error, 1),
+			rec:          timeslice.NewState(),
+			snapshotChan: make(chan *snapshotRequest, 1),
 		}
 
 		ret.cpus[i] = vcpu

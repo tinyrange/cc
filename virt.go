@@ -524,3 +524,41 @@ type cacheOption struct{ cache CacheDir }
 
 func (*cacheOption) IsOption()         {}
 func (o *cacheOption) Cache() CacheDir { return o.cache }
+
+// WithBootSnapshot enables boot snapshot caching for faster VM startup.
+// When enabled, the first VM boot captures a snapshot after kernel boot
+// (before container initialization). Subsequent VMs restore from this snapshot,
+// skipping the kernel boot time (~100ms savings).
+//
+// Snapshots are automatically invalidated when:
+//   - The kernel image changes
+//   - VM configuration changes (memory, CPUs, devices)
+//   - The cache directory is cleared
+//
+// This is enabled by default when a CacheDir is configured.
+// Use WithBootSnapshotDisabled() to opt out.
+//
+// Example:
+//
+//	cache, _ := cc.NewCacheDir("")
+//	inst, err := cc.New(source,
+//	    cc.WithCache(cache),
+//	    cc.WithBootSnapshot(), // Explicit enable (optional, on by default with cache)
+//	)
+func WithBootSnapshot() Option {
+	return &bootSnapshotOption{enabled: true}
+}
+
+// WithBootSnapshotDisabled disables boot snapshot caching.
+// Use this for debugging or when you need a clean boot every time.
+func WithBootSnapshotDisabled() Option {
+	return &bootSnapshotOption{enabled: false}
+}
+
+type bootSnapshotOption struct{ enabled bool }
+
+func (*bootSnapshotOption) IsOption()        {}
+func (o *bootSnapshotOption) BootSnapshot() bool { return o.enabled }
+
+// BootStats contains timing information about instance creation.
+type BootStats = api.BootStats

@@ -952,6 +952,97 @@ func (vm *VirtualMachine) Tablet() *virtio.Input {
 	return vm.tabletDevice
 }
 
+// VsockDevice returns the vsock device for snapshot restore handling.
+func (vm *VirtualMachine) VsockDevice() *virtio.Vsock {
+	return vm.vsockDevice
+}
+
+// ReacceptVsockConnection waits for the guest to reconnect after snapshot restore.
+// This should be called after injecting RST packets to invalidate stale connections.
+func (vm *VirtualMachine) ReacceptVsockConnection(ctx context.Context) error {
+	if vm.vsockProgramServer == nil {
+		return nil
+	}
+	return vm.vsockProgramServer.Accept()
+}
+
+// ResumeAfterSnapshotRestore starts the VM run loop after restoring from a snapshot.
+// This is similar to runFirstRunVsock but doesn't configure the vCPU (already done in snapshot)
+// and waits for the guest to reconnect (after RST injection) instead of initial connect.
+func (vm *VirtualMachine) ResumeAfterSnapshotRestore(ctx context.Context) error {
+	debug.Writef("initx.ResumeAfterSnapshotRestore", "starting")
+	if !vm.useVsockLoader || vm.vsockProgramServer == nil {
+		debug.Writef("initx.ResumeAfterSnapshotRestore", "vsock loader not enabled, skipping")
+		return nil
+	}
+
+	// Create VM context if not already created
+	if vm.vmCtx == nil {
+		vm.vmCtx, vm.vmCancel = context.WithCancel(context.Background())
+	}
+
+	// Initialize vmRunDone channel
+	if vm.vmRunDone == nil {
+		vm.vmRunDone = make(chan struct{})
+	}
+
+	// Connect VM termination signal to vsock server
+	vm.vsockProgramServer.SetVMTerminatedChannel(vm.vmRunDone)
+
+	debug.Writef("initx.ResumeAfterSnapshotRestore", "starting VM run goroutine")
+	// Start the VM in a goroutine - vCPU state is already configured from snapshot
+	vmDone := make(chan error, 1)
+	go func() {
+		defer close(vm.vmRunDone)
+		// Run with nil configureVcpu since vCPU is already configured from snapshot
+		debug.Writef("initx.ResumeAfterSnapshotRestore", "VM Run starting")
+		err := vm.vm.Run(vm.vmCtx, &programRunner{
+			program: &ir.Program{
+				Entrypoint: "main",
+				Methods: map[string]ir.Method{
+					"main": {ir.Return(ir.Int64(0))},
+				},
+			},
+			loader:        vm.programLoader,
+			configureVcpu: nil, // Already configured from snapshot
+		})
+		debug.Writef("initx.ResumeAfterSnapshotRestore", "VM Run completed with err=%v", err)
+		vmDone <- err
+	}()
+
+	// Wait for guest to reconnect (RST was already injected before this call)
+	debug.Writef("initx.ResumeAfterSnapshotRestore", "waiting for vsock reconnection")
+	acceptDone := make(chan error, 1)
+	go func() {
+		acceptDone <- vm.vsockProgramServer.Accept()
+	}()
+
+	select {
+	case err := <-acceptDone:
+		if err != nil {
+			return fmt.Errorf("reaccept vsock connection: %w", err)
+		}
+		debug.Writef("initx.ResumeAfterSnapshotRestore", "vsock reconnection accepted")
+		return nil
+	case err := <-vmDone:
+		debug.Writef("initx.ResumeAfterSnapshotRestore", "VM exited with err=%v", err)
+		if err != nil && !errors.Is(err, hv.ErrYield) {
+			return fmt.Errorf("VM exited during vsock reaccept: %w", err)
+		}
+		select {
+		case err := <-acceptDone:
+			if err != nil {
+				return fmt.Errorf("reaccept vsock connection after yield: %w", err)
+			}
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // StartStdinForwarding activates stdin forwarding to the guest console.
 // This should be called after the VM has booted and before the user command runs,
 // to ensure stdin data is delivered to the user command rather than the init process.

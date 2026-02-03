@@ -42,11 +42,14 @@ const (
 const vsockStdinPort = 9999
 
 // Timeslice IDs - must match constants in hvf_darwin_arm64.go
-// Guest writes these values to timesliceMem offset 0 to record markers
+// Guest writes these values to timesliceMem offset 0 to record markers.
+// Note: IDs 0-10, 12 cannot be recorded because timesliceMem isn't available
+// until after phase5_ts_map (ID 11) completes. Only IDs 11+ are recorded.
+//
 // 0=init_start, 1=phase1_dev_create, 2=phase2_mount_dev, 3=phase2_mount_shm
 // 5=phase4_console_open, 6=phase4_setsid, 8=phase4_dup
-// 9=phase5_mem_open, 10=phase5_mailbox_map, 11=phase5_ts_map
-// 12=phase5_config_map, 13=phase5_anon_map, 14=phase6_time_setup
+// 9=phase5_mem_open, 10=phase5_mailbox_map, 11=phase5_ts_map (first recorded)
+// 12=phase5_config_map (obsolete in vsock mode), 13=phase5_anon_map, 14=phase6_time_setup
 // 15=phase7_loop_start, 16=phase7_copy_payload, 17=phase7_relocate
 // 18=phase7_isb, 19=phase7_call_payload, 20=phase7_payload_done
 
@@ -218,54 +221,13 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 	vsockPort = runtime.Config("VSOCK_PORT")
 	runtime.LogKmsg("initx: vsockMainLoop starting\n")
 
-	// Create vsock socket
-	sockFd := runtime.Syscall(runtime.SYS_SOCKET, runtime.AF_VSOCK, runtime.SOCK_STREAM, 0)
+	// Initial connection using helper
+	sockFd := vsockReconnect(vsockPort)
 	if sockFd < 0 {
-		runtime.Printf("initx: failed to create vsock socket (errno=0x%x)\n", 0-sockFd)
-		reboot()
-	}
-	runtime.LogKmsg("initx: vsock socket created\n")
-
-	// Build sockaddr_vm structure (16 bytes)
-	// struct sockaddr_vm {
-	//   sa_family_t svm_family;     // AF_VSOCK (2 bytes)
-	//   unsigned short svm_reserved1; // 0 (2 bytes)
-	//   unsigned int svm_port;      // port (4 bytes)
-	//   unsigned int svm_cid;       // CID (4 bytes)
-	//   unsigned char svm_flags;    // 0 (1 byte)
-	//   unsigned char svm_zero[3];  // 0 (3 bytes)
-	// }
-	sockaddrMem := runtime.Syscall(runtime.SYS_MMAP, 0, 16, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
-	if sockaddrMem < 0 {
-		runtime.Printf("initx: failed to alloc sockaddr_vm (errno=0x%x)\n", 0-sockaddrMem)
-		runtime.Syscall(runtime.SYS_CLOSE, sockFd)
-		reboot()
-	}
-
-	// Zero the structure
-	runtime.Store64(sockaddrMem, 0, 0)
-	runtime.Store64(sockaddrMem, 8, 0)
-
-	// Fill in the fields
-	runtime.Store16(sockaddrMem, 0, runtime.AF_VSOCK) // svm_family
-	// svm_reserved1 is already 0
-	runtime.Store32(sockaddrMem, 4, vsockPort)               // svm_port
-	runtime.Store32(sockaddrMem, 8, runtime.VMADDR_CID_HOST) // svm_cid = 2 (host)
-	// svm_flags and svm_zero are already 0
-
-	// Connect to host
-	runtime.LogKmsg("initx: connecting to vsock host...\n")
-	connectResult := runtime.Syscall(runtime.SYS_CONNECT, sockFd, sockaddrMem, 16)
-	if connectResult < 0 {
-		runtime.Printf("initx: failed to connect vsock (errno=0x%x)\n", 0-connectResult)
-		runtime.Syscall(runtime.SYS_MUNMAP, sockaddrMem, 16)
-		runtime.Syscall(runtime.SYS_CLOSE, sockFd)
+		runtime.Printf("initx: initial vsock connection failed (errno=0x%x)\n", 0-sockFd)
 		reboot()
 	}
 	runtime.LogKmsg("initx: vsock connected successfully\n")
-
-	// Free sockaddr_vm - no longer needed
-	runtime.Syscall(runtime.SYS_MUNMAP, sockaddrMem, 16)
 
 	// Allocate receive buffer for length prefix (4 bytes)
 	lenBuf := runtime.Syscall(runtime.SYS_MMAP, 0, 4096, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
@@ -328,11 +290,25 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 		}
 
 		// Read 4-byte length prefix
+		// needReconnect flag is used instead of continue (RTG doesn't support continue)
+		var needReconnect int64 = 0
 		readLen := vsockReadFull(sockFd, lenBuf, 4)
 		if readLen < 0 {
-			runtime.Printf("initx: vsock read length failed (errno=0x%x)\n", 0-readLen)
-			reboot()
+			// Read error - attempt to reconnect (handles snapshot restore case)
+			runtime.LogKmsg("initx: vsock read error, reconnecting\n")
+			runtime.Syscall(runtime.SYS_CLOSE, sockFd)
+
+			sockFd = vsockReconnect(vsockPort)
+			if sockFd < 0 {
+				runtime.Printf("initx: reconnection failed (errno=0x%x)\n", 0-sockFd)
+				reboot()
+			}
+			runtime.LogKmsg("initx: vsock reconnected\n")
+			needReconnect = 1
 		}
+
+		// Skip rest of loop iteration if we just reconnected
+		if needReconnect == 0 {
 
 		var payloadLen int64 = 0
 		payloadLen = runtime.Load32(lenBuf, 0)
@@ -1080,6 +1056,7 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 				reboot()
 			}
 		}
+		} // end if needReconnect == 0
 	}
 }
 
@@ -1169,4 +1146,43 @@ func vsockWriteFull(fd int64, buf int64, n int64) int64 {
 		totalWritten = totalWritten + writeResult
 	}
 	return 0
+}
+
+// vsockReconnect creates a new vsock socket and connects to the host.
+// Returns the new socket fd on success, or negative errno on error.
+func vsockReconnect(port int64) int64 {
+	// Create vsock socket
+	sockFd := runtime.Syscall(runtime.SYS_SOCKET, runtime.AF_VSOCK, runtime.SOCK_STREAM, 0)
+	if sockFd < 0 {
+		return sockFd
+	}
+
+	// Allocate sockaddr_vm structure (16 bytes)
+	sockaddrMem := runtime.Syscall(runtime.SYS_MMAP, 0, 16, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
+	if sockaddrMem < 0 {
+		runtime.Syscall(runtime.SYS_CLOSE, sockFd)
+		return sockaddrMem
+	}
+
+	// Zero the structure
+	runtime.Store64(sockaddrMem, 0, 0)
+	runtime.Store64(sockaddrMem, 8, 0)
+
+	// Fill in the fields
+	runtime.Store16(sockaddrMem, 0, runtime.AF_VSOCK) // svm_family
+	runtime.Store32(sockaddrMem, 4, port)             // svm_port
+	runtime.Store32(sockaddrMem, 8, runtime.VMADDR_CID_HOST) // svm_cid = 2 (host)
+
+	// Connect to host
+	connectResult := runtime.Syscall(runtime.SYS_CONNECT, sockFd, sockaddrMem, 16)
+
+	// Free sockaddr_vm
+	runtime.Syscall(runtime.SYS_MUNMAP, sockaddrMem, 16)
+
+	if connectResult < 0 {
+		runtime.Syscall(runtime.SYS_CLOSE, sockFd)
+		return connectResult
+	}
+
+	return sockFd
 }
