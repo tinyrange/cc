@@ -50,6 +50,7 @@ import (
 	"errors"
 	"unsafe"
 
+	"github.com/tinyrange/cc/bindings/c/ipc"
 	"github.com/tinyrange/cc/internal/api"
 )
 
@@ -57,6 +58,35 @@ import (
 func errorCode(err error) C.cc_error_code {
 	if err == nil {
 		return C.CC_OK
+	}
+
+	// Check for IPC errors first (they carry their own error code)
+	var ipcErr *ipc.IPCError
+	if errors.As(err, &ipcErr) {
+		switch ipcErr.Code {
+		case ipc.ErrCodeOK:
+			return C.CC_OK
+		case ipc.ErrCodeInvalidHandle:
+			return C.CC_ERR_INVALID_HANDLE
+		case ipc.ErrCodeInvalidArgument:
+			return C.CC_ERR_INVALID_ARGUMENT
+		case ipc.ErrCodeNotRunning:
+			return C.CC_ERR_NOT_RUNNING
+		case ipc.ErrCodeAlreadyClosed:
+			return C.CC_ERR_ALREADY_CLOSED
+		case ipc.ErrCodeTimeout:
+			return C.CC_ERR_TIMEOUT
+		case ipc.ErrCodeHypervisorUnavailable:
+			return C.CC_ERR_HYPERVISOR_UNAVAILABLE
+		case ipc.ErrCodeIO:
+			return C.CC_ERR_IO
+		case ipc.ErrCodeNetwork:
+			return C.CC_ERR_NETWORK
+		case ipc.ErrCodeCancelled:
+			return C.CC_ERR_CANCELLED
+		default:
+			return C.CC_ERR_UNKNOWN
+		}
 	}
 
 	// Check for sentinel errors
@@ -100,6 +130,11 @@ func setError(err error, cErr *C.cc_error) C.cc_error_code {
 
 	// Extract op and path if available
 	var op, path string
+	var ipcErr *ipc.IPCError
+	if errors.As(err, &ipcErr) {
+		op = ipcErr.Op
+		path = ipcErr.Path
+	}
 	var apiErr *api.Error
 	if errors.As(err, &apiErr) {
 		op = apiErr.Op

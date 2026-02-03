@@ -236,7 +236,7 @@ func (h *Helper) requireInstance() error {
 // ==========================================================================
 
 func (h *Helper) handleInstanceNew(dec *ipc.Decoder) ([]byte, error) {
-	// Decode: sourceType (0=tar, 1=dir), sourcePath, options
+	// Decode: sourceType (0=tar, 1=dir, 2=ref), sourcePath, imageRef, cacheDir, options
 	sourceType, err := dec.Uint8()
 	if err != nil {
 		return nil, err
@@ -245,15 +245,35 @@ func (h *Helper) handleInstanceNew(dec *ipc.Decoder) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	imageRef, err := dec.String()
+	if err != nil {
+		return nil, err
+	}
+	cacheDir, err := dec.String()
+	if err != nil {
+		return nil, err
+	}
 	opts, err := ipc.DecodeInstanceOptions(dec)
 	if err != nil {
 		return nil, err
 	}
 
-	// Create OCI client
-	client, err := cc.NewOCIClient()
-	if err != nil {
-		return nil, errorToIPC(err)
+	// Create OCI client (with cache dir for ref type)
+	var client cc.OCIClient
+	if sourceType == 2 && cacheDir != "" {
+		cache, err := cc.NewCacheDir(cacheDir)
+		if err != nil {
+			return nil, errorToIPC(err)
+		}
+		client, err = cc.NewOCIClientWithCache(cache)
+		if err != nil {
+			return nil, errorToIPC(err)
+		}
+	} else {
+		client, err = cc.NewOCIClient()
+		if err != nil {
+			return nil, errorToIPC(err)
+		}
 	}
 
 	// Load source
@@ -263,6 +283,9 @@ func (h *Helper) handleInstanceNew(dec *ipc.Decoder) ([]byte, error) {
 		source, err = client.LoadFromTar(sourcePath)
 	case 1: // directory
 		source, err = client.LoadFromDir(sourcePath)
+	case 2: // ref (pulled from registry)
+		// Pull from cache - should be fast since already cached
+		source, err = client.Pull(context.Background(), imageRef, cc.WithPullPolicy(cc.PullIfNotPresent))
 	default:
 		return nil, &ipc.IPCError{Code: ipc.ErrCodeInvalidArgument, Message: fmt.Sprintf("unknown source type: %d", sourceType)}
 	}

@@ -178,6 +178,7 @@ import "C"
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"net"
 	"runtime"
@@ -530,7 +531,13 @@ func cc_oci_client_pull(
 		return setError(err, cErr)
 	}
 
-	h := newHandle(source)
+	// Store source info for IPC mode (ref type)
+	h := newHandle(&sourceInfo{
+		source:     source,
+		sourceType: 2, // ref (pulled from registry)
+		imageRef:   ref,
+		cacheDir:   ociClient.CacheDir(),
+	})
 	out._h = C.uint64_t(h)
 	C.clear_error(cErr)
 	return C.CC_OK
@@ -877,22 +884,22 @@ func cc_instance_new(
 		// We need to get the source path from the source metadata
 		srcInfo, ok := getHandleTyped[*sourceInfo](uint64(source._h))
 		if !ok {
-			// Fall back to direct mode if we don't have source info
-			useIPC = false
-		} else {
-			var err error
-			proxy, err = newInstanceProxyIPC(helperInfo{
-				sourceType: srcInfo.sourceType,
-				sourcePath: srcInfo.sourcePath,
-				opts:       ipcOpts,
-			})
-			if err != nil {
-				return setError(err, cErr)
-			}
+			// Source info is required for IPC mode - this should not happen
+			// as all source creation functions now store sourceInfo
+			return setError(fmt.Errorf("IPC mode requires source info (internal error: source was not stored as *sourceInfo)"), cErr)
 		}
-	}
-
-	if !useIPC {
+		var err error
+		proxy, err = newInstanceProxyIPC(helperInfo{
+			sourceType: srcInfo.sourceType,
+			sourcePath: srcInfo.sourcePath,
+			imageRef:   srcInfo.imageRef,
+			cacheDir:   srcInfo.cacheDir,
+			opts:       ipcOpts,
+		})
+		if err != nil {
+			return setError(err, cErr)
+		}
+	} else {
 		// Direct mode: create instance in-process
 		inst, err := cc.New(src, ccOpts...)
 		if err != nil {
@@ -910,8 +917,10 @@ func cc_instance_new(
 // sourceInfo stores metadata about a source for IPC mode.
 type sourceInfo struct {
 	source     cc.InstanceSource
-	sourceType uint8 // 0=tar, 1=dir
+	sourceType uint8 // 0=tar, 1=dir, 2=ref (pulled from registry)
 	sourcePath string
+	imageRef   string // for sourceType=2: the image reference
+	cacheDir   string // for sourceType=2: the cache directory
 }
 
 // getSource extracts the cc.InstanceSource from a handle that may be either

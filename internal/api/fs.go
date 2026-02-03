@@ -174,34 +174,96 @@ func (f *instanceFS) OpenFile(name string, flag int, perm fs.FileMode) (File, er
 		return nil, &Error{Op: "open", Path: name, Err: ErrNotRunning}
 	}
 
-	// Resolve path through fsBackend, following symlinks
-	nodeID, errno := f.resolvePathFollowSymlinks(name)
-	if errno != 0 || nodeID == 0 {
+	// Resolve path to get parent and check if file exists
+	parentID, baseName, nodeID, errno := f.resolvePath(name)
+	if errno != 0 && parentID == 0 {
 		return nil, &Error{Op: "open", Path: name, Err: errnoToError(errno)}
 	}
 
-	// Check if Open is supported
-	openBackend, hasOpen := f.inst.fsBackend.(interface {
-		Open(nodeID uint64, flags uint32) (fh uint64, errno int32)
-	})
-	if !hasOpen {
-		return nil, &Error{Op: "open", Path: name, Err: fmt.Errorf("backend does not support open")}
-	}
+	var fh uint64
 
-	// Convert Go flags to POSIX flags
-	var flags uint32
-	switch flag & (os.O_RDONLY | os.O_WRONLY | os.O_RDWR) {
-	case os.O_RDONLY:
-		flags = uint32(syscall.O_RDONLY)
-	case os.O_WRONLY:
-		flags = uint32(syscall.O_WRONLY)
-	case os.O_RDWR:
-		flags = uint32(syscall.O_RDWR)
-	}
+	if nodeID == 0 {
+		// File doesn't exist
+		if flag&os.O_CREATE == 0 {
+			// O_CREATE not set, return error
+			return nil, &Error{Op: "open", Path: name, Err: syscall.ENOENT}
+		}
 
-	fh, errno := openBackend.Open(nodeID, flags)
-	if errno != 0 {
-		return nil, &Error{Op: "open", Path: name, Err: errnoToError(errno)}
+		// Create the file
+		createBackend, hasCreate := f.inst.fsBackend.(interface {
+			Create(parent uint64, name string, mode uint32, flags uint32, umask uint32, uid uint32, gid uint32) (nodeID uint64, fh uint64, attr virtio.FuseAttr, errno int32)
+		})
+		if !hasCreate {
+			return nil, &Error{Op: "open", Path: name, Err: fmt.Errorf("backend does not support file creation")}
+		}
+
+		// Convert fs.FileMode to unix mode
+		mode := uint32(perm.Perm()) | 0100000 // S_IFREG
+
+		// Convert Go flags to POSIX flags for create
+		var posixFlags uint32 = uint32(syscall.O_CREAT)
+		switch flag & (os.O_RDONLY | os.O_WRONLY | os.O_RDWR) {
+		case os.O_RDONLY:
+			posixFlags |= uint32(syscall.O_RDONLY)
+		case os.O_WRONLY:
+			posixFlags |= uint32(syscall.O_WRONLY)
+		case os.O_RDWR:
+			posixFlags |= uint32(syscall.O_RDWR)
+		}
+		if flag&os.O_TRUNC != 0 {
+			posixFlags |= uint32(syscall.O_TRUNC)
+		}
+
+		var err int32
+		nodeID, fh, _, err = createBackend.Create(parentID, baseName, mode, posixFlags, 0022, 0, 0)
+		if err != 0 {
+			return nil, &Error{Op: "open", Path: name, Err: errnoToError(err)}
+		}
+	} else {
+		// File exists
+		if flag&os.O_EXCL != 0 && flag&os.O_CREATE != 0 {
+			// O_EXCL with O_CREATE means fail if file exists
+			return nil, &Error{Op: "open", Path: name, Err: syscall.EEXIST}
+		}
+
+		// Check if Open is supported
+		openBackend, hasOpen := f.inst.fsBackend.(interface {
+			Open(nodeID uint64, flags uint32) (fh uint64, errno int32)
+		})
+		if !hasOpen {
+			return nil, &Error{Op: "open", Path: name, Err: fmt.Errorf("backend does not support open")}
+		}
+
+		// Convert Go flags to POSIX flags
+		var flags uint32
+		switch flag & (os.O_RDONLY | os.O_WRONLY | os.O_RDWR) {
+		case os.O_RDONLY:
+			flags = uint32(syscall.O_RDONLY)
+		case os.O_WRONLY:
+			flags = uint32(syscall.O_WRONLY)
+		case os.O_RDWR:
+			flags = uint32(syscall.O_RDWR)
+		}
+		if flag&os.O_TRUNC != 0 {
+			flags |= uint32(syscall.O_TRUNC)
+		}
+
+		var err int32
+		fh, err = openBackend.Open(nodeID, flags)
+		if err != 0 {
+			return nil, &Error{Op: "open", Path: name, Err: errnoToError(err)}
+		}
+
+		// Handle O_TRUNC
+		if flag&os.O_TRUNC != 0 {
+			setattrBackend, hasSetattr := f.inst.fsBackend.(interface {
+				SetAttr(nodeID uint64, size *uint64, mode *uint32, uid *uint32, gid *uint32, atime *time.Time, mtime *time.Time, reqUID uint32, reqGID uint32) int32
+			})
+			if hasSetattr {
+				zero := uint64(0)
+				setattrBackend.SetAttr(nodeID, &zero, nil, nil, nil, nil, nil, 0, 0)
+			}
+		}
 	}
 
 	return &instanceFile{
@@ -917,9 +979,27 @@ func (f *instanceFile) Read(p []byte) (int, error) {
 }
 
 func (f *instanceFile) Write(p []byte) (int, error) {
-	// Writing to files requires using VM.WriteFile which writes the entire file
-	// For streaming writes, we would need to buffer and write on Close
-	return 0, &Error{Op: "write", Path: f.path, Err: fmt.Errorf("streaming write not yet implemented")}
+	if f.closed {
+		return 0, &Error{Op: "write", Path: f.path, Err: fs.ErrClosed}
+	}
+
+	// Check if backend supports write
+	writeBackend, hasWrite := f.inst.fsBackend.(interface {
+		Write(nodeID uint64, fh uint64, off uint64, data []byte) (uint32, int32)
+	})
+	if !hasWrite {
+		return 0, &Error{Op: "write", Path: f.path, Err: fmt.Errorf("backend does not support write")}
+	}
+
+	// Write data at current offset
+	n, errno := writeBackend.Write(f.nodeID, f.fh, uint64(f.offset), p)
+	if errno != 0 {
+		return 0, &Error{Op: "write", Path: f.path, Err: errnoToError(errno)}
+	}
+
+	// Update offset
+	f.offset += int64(n)
+	return int(n), nil
 }
 
 func (f *instanceFile) Close() error {

@@ -30,8 +30,10 @@ type instanceProxy struct {
 
 // helperInfo stores information needed to spawn a helper.
 type helperInfo struct {
-	sourceType uint8 // 0=tar, 1=dir
+	sourceType uint8 // 0=tar, 1=dir, 2=ref (pulled from registry)
 	sourcePath string
+	imageRef   string // for sourceType=2: the image reference
+	cacheDir   string // for sourceType=2: the cache directory
 	opts       ipc.InstanceOptions
 }
 
@@ -44,7 +46,13 @@ var (
 // getLibPath returns the path to the library for helper discovery.
 func getLibPath() string {
 	libPathOnce.Do(func() {
-		// Try to find our own library path
+		// 1. Check LIBCC_PATH environment variable (set by Python/other bindings)
+		if path := os.Getenv("LIBCC_PATH"); path != "" {
+			libPath = path
+			return
+		}
+
+		// 2. Fall back to executable path (for statically linked binaries)
 		exe, err := os.Executable()
 		if err == nil {
 			libPath = filepath.Dir(exe)
@@ -72,6 +80,8 @@ func newInstanceProxyIPC(info helperInfo) (*instanceProxy, error) {
 	enc := ipc.NewEncoder()
 	enc.Uint8(info.sourceType)
 	enc.String(info.sourcePath)
+	enc.String(info.imageRef)
+	enc.String(info.cacheDir)
 	ipc.EncodeInstanceOptions(enc, info.opts)
 
 	resp, err := client.Call(ipc.MsgInstanceNew, enc.Bytes())
