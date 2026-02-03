@@ -134,12 +134,16 @@ typedef enum {
 
 typedef struct {
     cc_error_code code;
-    char* message;      // Caller must free with cc_free_string()
-    char* op;           // Operation that failed (may be NULL)
-    char* path;         // Path involved (may be NULL)
+    char* message;      // Error message (NULL on success)
+    char* op;           // Operation that failed (NULL on success, may be NULL on error)
+    char* path;         // Path involved (NULL on success, may be NULL on error)
 } cc_error;
 
-// Free error message strings
+// IMPORTANT: On success (CC_OK), all pointers in cc_error are NULL.
+// On error, call cc_error_free() to release any allocated strings.
+// Safe to call cc_error_free() even when code == CC_OK (no-op).
+
+// Free error message strings. Safe to call on success (no-op).
 void cc_error_free(cc_error* err);
 
 // Free a string allocated by the library
@@ -189,6 +193,14 @@ typedef struct {
     int max_cpus;               // 0 if unknown
     const char* architecture;   // "x86_64", "arm64", etc.
 } cc_capabilities;
+
+// Guest protocol version for host/guest compatibility checking.
+// The protocol version is incremented when the host-guest interface changes
+// in incompatible ways (virtio features, init program format, etc.).
+#define CC_GUEST_PROTOCOL_VERSION 1
+
+// Get the guest protocol version supported by this library.
+int cc_guest_protocol_version(void);
 
 cc_error_code cc_query_capabilities(cc_capabilities* out, cc_error* err);
 
@@ -352,16 +364,24 @@ cc_error_code cc_instance_wait(
 );
 
 // Get instance ID. Caller must free with cc_free_string().
+// Returns NULL if handle is invalid.
 char* cc_instance_id(cc_instance inst);
 
 // Check if instance is still running.
+// Returns false if handle is invalid.
 bool cc_instance_is_running(cc_instance inst);
 
 // Set console size (for interactive mode).
-void cc_instance_set_console_size(cc_instance inst, int cols, int rows);
+// Returns CC_ERR_INVALID_HANDLE if handle is invalid.
+cc_error_code cc_instance_set_console_size(cc_instance inst, int cols, int rows, cc_error* err);
 
 // Enable/disable network access.
-void cc_instance_set_network_enabled(cc_instance inst, bool enabled);
+// Returns CC_ERR_INVALID_HANDLE if handle is invalid.
+cc_error_code cc_instance_set_network_enabled(cc_instance inst, bool enabled, cc_error* err);
+
+// NOTE: All functions in this API validate handles and return CC_ERR_INVALID_HANDLE
+// if the handle is invalid. Functions that cannot return errors (bool/pointer returns)
+// return false/NULL for invalid handles.
 ```
 
 /* ==========================================================================
@@ -707,6 +727,11 @@ cc_error_code cc_cmd_combined_output(
 // Get exit code (after Wait).
 int cc_cmd_exit_code(cc_cmd cmd);
 
+// Kill a started command and release resources.
+// Safe to call on commands that have already completed.
+// After calling, the handle is invalid.
+cc_error_code cc_cmd_kill(cc_cmd cmd, cc_error* err);
+
 // Replace init process with command (terminal operation).
 cc_error_code cc_instance_exec(
     cc_instance inst,
@@ -891,7 +916,16 @@ cc_error_code cc_snapshot_factory_exclude(
     cc_error* err
 );
 
+// Validate factory configuration without executing.
+// Returns CC_OK if configuration is valid, error otherwise.
+// Use this to check for errors before a potentially long build.
+cc_error_code cc_snapshot_factory_validate(
+    cc_snapshot_factory factory,
+    cc_error* err
+);
+
 // Build the snapshot (executes all operations).
+// Consider calling cc_snapshot_factory_validate first for expensive builds.
 cc_error_code cc_snapshot_factory_build(
     cc_snapshot_factory factory,
     cc_snapshot* out,
@@ -1150,7 +1184,9 @@ class OCIClient:
             platform: Target platform (os, arch). Defaults to host platform.
             auth: Registry credentials (username, password).
             policy: When to pull from registry vs use cache.
-            on_progress: Callback for download progress updates.
+            on_progress: Callback for download progress updates. The callback
+                and any objects it captures are prevented from garbage collection
+                until pull() returns.
 
         Returns:
             InstanceSource that can be used with Instance().
@@ -1161,6 +1197,10 @@ class OCIClient:
                 platform=("linux", "arm64"),
                 on_progress=lambda p: print(f"{p.current}/{p.total}")
             )
+
+        Note:
+            The on_progress callback runs in a background thread. Avoid modifying
+            shared state without synchronization.
         """
         ...
 
@@ -1240,7 +1280,12 @@ class Instance:
     Provides filesystem, command execution, and networking APIs
     that mirror Python's os, subprocess, and socket modules.
 
+    IMPORTANT: Always use Instance as a context manager (with statement) to
+    ensure proper cleanup. While __del__ provides fallback cleanup, its timing
+    is unpredictable in Python and may not run promptly or at all.
+
     Example:
+        # RECOMMENDED: Use context manager for automatic cleanup
         with Instance(source, memory_mb=512, cpus=2) as inst:
             # Filesystem operations (like os module)
             inst.write_file("/tmp/hello.txt", b"Hello, World!")
@@ -1249,7 +1294,7 @@ class Instance:
             # Command execution (like subprocess)
             result = inst.command("cat", "/etc/os-release").output()
 
-            # Or use the context manager pattern:
+            # File handles also support context managers:
             with inst.open("/etc/passwd") as f:
                 print(f.read())
     """
@@ -1523,6 +1568,12 @@ from .instance import Instance, InstanceSource
 class AsyncInstance:
     """Async wrapper for Instance.
 
+    NOTE: This is a thread-pool based async wrapper, not true async I/O.
+    Operations are dispatched to a ThreadPoolExecutor, so they don't block
+    the event loop but do consume thread pool resources. For high-concurrency
+    scenarios, consider using multiple Instance objects in separate threads
+    instead.
+
     Example:
         async with AsyncInstance(source) as inst:
             output = await inst.command("echo", "hello").output()
@@ -1750,6 +1801,9 @@ export class OCIClient implements Disposable {
 
   /**
    * Pull an image from a registry.
+   *
+   * Note: The onProgress callback and any objects it captures are prevented
+   * from garbage collection until the promise resolves.
    *
    * @example
    * const source = await client.pull('alpine:latest');
@@ -2659,12 +2713,14 @@ pub struct FileInfo {
 /// ```
 pub struct Instance {
     handle: ffi::cc_instance,
+    // Mark as !Send + !Sync using stable Rust pattern.
+    // *const () is neither Send nor Sync, so PhantomData<*const ()>
+    // makes the containing type also !Send + !Sync.
+    _not_send_sync: std::marker::PhantomData<*const ()>,
 }
 
-// Instance is not thread-safe. Use external synchronization or create
-// separate instances for different threads.
-impl !Send for Instance {}
-impl !Sync for Instance {}
+// Instance is not thread-safe. Each instance should be used from a single
+// thread only. Create separate instances for different threads.
 
 impl Instance {
     /// Create and start a new instance.
@@ -2681,7 +2737,10 @@ impl Instance {
             return Err(err.into());
         }
 
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            _not_send_sync: std::marker::PhantomData,
+        })
     }
 
     /// Get instance ID.
@@ -2996,20 +3055,36 @@ pub struct Output {
 
 /// A command ready to run in the guest.
 ///
-/// Note: Cmd tracks whether it has been started. If started, the handle
-/// is consumed by wait() and cannot be freed. If not started, drop() frees it.
+/// Note: Cmd tracks whether it has been started. If started, you must call
+/// `wait()` or `kill()` to clean up. If not started, drop() frees it.
 pub struct Cmd {
     handle: ffi::cc_cmd,
-    _started: bool,
+    started: bool,
+    _not_send_sync: std::marker::PhantomData<*const ()>,
 }
-
-// Cmd is not Send because the underlying Go object may have thread affinity
-impl !Send for Cmd {}
-impl !Sync for Cmd {}
 
 impl Cmd {
     pub(crate) fn new(handle: ffi::cc_cmd) -> Self {
-        Self { handle, _started: false }
+        Self {
+            handle,
+            started: false,
+            _not_send_sync: std::marker::PhantomData,
+        }
+    }
+
+    /// Kill a started command and release resources.
+    /// This is safe to call on commands that have already completed.
+    pub fn kill(mut self) -> Result<()> {
+        if !self.started {
+            return Ok(()); // Not started, drop will handle it
+        }
+        let mut err = ffi::cc_error::default();
+        let code = unsafe { ffi::cc_cmd_kill(self.handle, &mut err) };
+        self.started = false; // Prevent drop from trying to free
+        if code != ffi::CC_OK {
+            return Err(err.into());
+        }
+        Ok(())
     }
 
     /// Set working directory.
@@ -3113,9 +3188,12 @@ impl Cmd {
 
 impl Drop for Cmd {
     fn drop(&mut self) {
-        if self._started {
-            // Command was started - must wait for completion, cannot free
-            // The handle is consumed by cc_cmd_wait
+        if self.started {
+            // Command was started but not waited on - kill it to prevent leak.
+            // This logs a warning since it indicates a likely bug.
+            eprintln!("warning: Cmd dropped without wait() or kill() - killing process");
+            let mut err = ffi::cc_error::default();
+            unsafe { ffi::cc_cmd_kill(self.handle, &mut err) };
         } else if CC_HANDLE_VALID(self.handle) {
             unsafe { ffi::cc_cmd_free(self.handle) };
         }
@@ -3735,6 +3813,44 @@ codesign --entitlements entitlements.plist --force --sign - libcc.dylib
 
 ---
 
+## Future Considerations
+
+The following features are not included in the initial release but may be added in future versions:
+
+### Resource Limits and Backpressure
+
+- **Concurrent operation limits**: Limiting simultaneous pulls or instance operations
+- **Memory limits for reads**: `cc_fs_read_file` currently loads entire files into memory; streaming alternatives needed for large files
+- **Backpressure on connections**: Mechanisms for when readers can't keep up with writers
+
+### True Async I/O
+
+The current async wrappers (Python's `AsyncInstance`, Node.js promises) use thread pools internally. True non-blocking async would require:
+
+- C-level async API with completion callbacks or pollable handles
+- Integration with language event loops (libuv for Node, asyncio for Python)
+
+### Batch Operations
+
+For workloads with many small operations:
+
+- `cc_fs_read_files` / `cc_fs_write_files` for batch I/O
+- Pipelined command execution
+
+### GPU Bindings
+
+GPU support is available in the Go API but excluded from C bindings due to platform complexity. Future versions may add a platform abstraction layer.
+
+### File Mode Constants
+
+The current `CC_O_*` constants are cc-specific values, not POSIX values. Future versions may align with platform conventions or provide explicit mapping.
+
+### Timestamp Precision
+
+`cc_fs_chtimes` uses seconds. Nanosecond precision (`int64_t atime_nsec`) may be added for compatibility with modern filesystems.
+
+---
+
 ## Appendix: API Reference Summary
 
 All handle types are distinct structs (not integer aliases) to enable compile-time type checking:
@@ -3770,8 +3886,15 @@ All handle types are distinct structs (not integer aliases) to enable compile-ti
 
 ### Thread Safety Summary
 
-- **Different instances**: Thread-safe, can be used concurrently
-- **Same instance**: NOT thread-safe, use external synchronization
-- **OCI client**: Thread-safe for all operations
-- **Cancel tokens**: Thread-safe (can cancel from any thread)
-- **Handles**: Stable across threads, but operations must respect instance thread safety
+| Object | Thread Safety |
+|--------|---------------|
+| **OCI Client** | Thread-safe. Multiple threads can pull images concurrently. |
+| **Instance** | NOT thread-safe. Use one instance per thread, or synchronize externally. |
+| **File** | NOT thread-safe. Belongs to its parent instance's thread. |
+| **Cmd** | NOT thread-safe. Belongs to its parent instance's thread. |
+| **Listener/Conn** | NOT thread-safe. Belongs to its parent instance's thread. |
+| **Snapshot** | Thread-safe for read operations (cache_key, parent). |
+| **SnapshotFactory** | NOT thread-safe. Use from a single thread. |
+| **Cancel Token** | Thread-safe. Can cancel from any thread. |
+
+**Important**: Handle values (the struct contents) are just integers and can be copied between threads. However, the objects they reference are NOT thread-safe. Do not pass Instance handles to other threads unless you provide external synchronization. The recommended pattern is to create separate instances for each thread.
