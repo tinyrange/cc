@@ -14,14 +14,14 @@ import (
 // Organized by category with a prefix byte.
 const (
 	// Instance lifecycle (0x01xx)
-	MsgInstanceNew          uint16 = 0x0100
-	MsgInstanceClose        uint16 = 0x0101
-	MsgInstanceWait         uint16 = 0x0102
-	MsgInstanceID           uint16 = 0x0103
-	MsgInstanceIsRunning    uint16 = 0x0104
-	MsgInstanceSetConsole   uint16 = 0x0105
-	MsgInstanceSetNetwork   uint16 = 0x0106
-	MsgInstanceExec         uint16 = 0x0107
+	MsgInstanceNew        uint16 = 0x0100
+	MsgInstanceClose      uint16 = 0x0101
+	MsgInstanceWait       uint16 = 0x0102
+	MsgInstanceID         uint16 = 0x0103
+	MsgInstanceIsRunning  uint16 = 0x0104
+	MsgInstanceSetConsole uint16 = 0x0105
+	MsgInstanceSetNetwork uint16 = 0x0106
+	MsgInstanceExec       uint16 = 0x0107
 
 	// Filesystem operations (0x02xx)
 	MsgFsOpen      uint16 = 0x0200
@@ -330,17 +330,17 @@ func (d *Decoder) StringSlice() ([]string, error) {
 
 // Error codes for IPC errors (matches C error codes).
 const (
-	ErrCodeOK                     = 0
-	ErrCodeInvalidHandle          = 1
-	ErrCodeInvalidArgument        = 2
-	ErrCodeNotRunning             = 3
-	ErrCodeAlreadyClosed          = 4
-	ErrCodeTimeout                = 5
-	ErrCodeHypervisorUnavailable  = 6
-	ErrCodeIO                     = 7
-	ErrCodeNetwork                = 8
-	ErrCodeCancelled              = 9
-	ErrCodeUnknown                = 99
+	ErrCodeOK                    = 0
+	ErrCodeInvalidHandle         = 1
+	ErrCodeInvalidArgument       = 2
+	ErrCodeNotRunning            = 3
+	ErrCodeAlreadyClosed         = 4
+	ErrCodeTimeout               = 5
+	ErrCodeHypervisorUnavailable = 6
+	ErrCodeIO                    = 7
+	ErrCodeNetwork               = 8
+	ErrCodeCancelled             = 9
+	ErrCodeUnknown               = 99
 )
 
 // IPCError represents an error in the IPC protocol.
@@ -395,12 +395,12 @@ func DecodeError(dec *Decoder) (*IPCError, error) {
 
 // FileInfo holds file metadata for IPC transfer.
 type FileInfo struct {
-	Name       string
-	Size       int64
-	Mode       fs.FileMode
-	ModTime    int64 // Unix timestamp
-	IsDir      bool
-	IsSymlink  bool
+	Name      string
+	Size      int64
+	Mode      fs.FileMode
+	ModTime   int64 // Unix timestamp
+	IsDir     bool
+	IsSymlink bool
 }
 
 // EncodeFileInfo encodes file info.
@@ -514,12 +514,12 @@ func DecodeMountConfig(dec *Decoder) (MountConfig, error) {
 
 // InstanceOptions holds instance options for IPC transfer.
 type InstanceOptions struct {
-	MemoryMB     uint64
-	CPUs         int
-	TimeoutSecs  float64
-	User         string
-	EnableDmesg  bool
-	Mounts       []MountConfig
+	MemoryMB    uint64
+	CPUs        int
+	TimeoutSecs float64
+	User        string
+	EnableDmesg bool
+	Mounts      []MountConfig
 }
 
 // EncodeInstanceOptions encodes instance options.

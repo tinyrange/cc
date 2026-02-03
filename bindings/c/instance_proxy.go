@@ -30,7 +30,7 @@ type instanceProxy struct {
 
 // helperInfo stores information needed to spawn a helper.
 type helperInfo struct {
-	sourceType uint8  // 0=tar, 1=dir
+	sourceType uint8 // 0=tar, 1=dir
 	sourcePath string
 	opts       ipc.InstanceOptions
 }

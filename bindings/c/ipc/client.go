@@ -15,11 +15,11 @@ import (
 
 // Client manages a connection to a cc-helper process.
 type Client struct {
-	conn     net.Conn
-	cmd      *exec.Cmd
-	mu       sync.Mutex
-	closed   atomic.Bool
-	reqID    atomic.Uint64
+	conn       net.Conn
+	cmd        *exec.Cmd
+	mu         sync.Mutex
+	closed     atomic.Bool
+	reqID      atomic.Uint64
 	socketPath string
 }
 

@@ -910,7 +910,7 @@ func cc_instance_new(
 // sourceInfo stores metadata about a source for IPC mode.
 type sourceInfo struct {
 	source     cc.InstanceSource
-	sourceType uint8  // 0=tar, 1=dir
+	sourceType uint8 // 0=tar, 1=dir
 	sourcePath string
 }
 
@@ -2272,4 +2272,3 @@ func cc_snapshot_as_source(snap C.cc_snapshot) C.cc_instance_source {
 
 // Required for CGO shared library
 func main() {}
-
