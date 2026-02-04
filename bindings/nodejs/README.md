@@ -1,67 +1,55 @@
 # @crumblecracker/cc
 
-TypeScript bindings for the cc virtualization library. Works on Node.js 18+ and Bun.
+TypeScript bindings for the cc virtualization library. Run containers as lightweight VMs with full isolation.
 
 ## Installation
 
 ```bash
 npm install @crumblecracker/cc
+# or
+bun add @crumblecracker/cc
 ```
+
+The `cc-helper` binary is automatically installed for your platform.
 
 ## Requirements
 
 - Node.js 18+ or Bun
-- cc-helper binary (for VM operations)
-- Hypervisor support (macOS with Apple Silicon, or Linux with KVM)
+- Hypervisor support:
+  - **macOS**: Apple Silicon (M1/M2/M3) with Hypervisor.framework
+  - **Linux**: KVM support (`/dev/kvm` accessible)
+
+## Supported Platforms
+
+| Platform | Architecture | Package |
+|----------|-------------|---------|
+| macOS | arm64 (Apple Silicon) | `@crumblecracker/cc-darwin-arm64` |
+| macOS | x64 (Intel) | `@crumblecracker/cc-darwin-x64` |
+| Linux | x64 | `@crumblecracker/cc-linux-x64` |
+| Linux | arm64 | `@crumblecracker/cc-linux-arm64` |
 
 ## Quick Start
 
 ```typescript
-import {
-  init,
-  shutdown,
-  apiVersion,
-  supportsHypervisor,
-  OCIClient,
-} from '@crumblecracker/cc';
+import { OCIClient } from '@crumblecracker/cc';
 
-// Initialize library
-init();
-
-// Check version
-console.log(apiVersion()); // "0.1.0"
-
-// Check hypervisor
-const available = supportsHypervisor();
-console.log(`Hypervisor available: ${available}`);
-
-// OCI Client usage
+// Pull an image and create a VM instance
 const client = new OCIClient();
-const source = await client.pull('alpine:latest');
+const source = await client.pull('python:3-alpine');
 
-// Create instance with "await using" for automatic cleanup
-await using inst = await source.createInstance({
-  memoryMb: 256,
-  cpus: 1,
-});
+await using inst = await source.createInstance({});
 
-console.log(`Instance ID: ${await inst.id()}`);
-console.log(`Running: ${await inst.isRunning()}`);
+// Write a file to the VM
+await inst.writeFile('/hello.txt', 'Hello, World!');
 
-// Run command
-const cmd = await inst.command('echo', 'Hello from Node.js!');
+// Run Python to read it
+const cmd = await inst.command('python3', '-c', 'print(open("/hello.txt").read())');
 const output = await cmd.output();
-console.log(output.toString());
-
-// File operations
-await inst.writeFile('/tmp/test.txt', Buffer.from('Hello'));
-const data = await inst.readFile('/tmp/test.txt');
-console.log(data.toString());
+console.log(output.toString().trim()); // "Hello, World!"
 
 // Cleanup
 await source.helper.close();
 client.close();
-shutdown();
 ```
 
 ## API Reference
@@ -253,7 +241,7 @@ try {
 
 ## Environment Variables
 
-- `CC_HELPER_PATH` - Path to cc-helper binary
+- `CC_HELPER_PATH` - Override path to cc-helper binary (optional, bundled by default)
 - `CC_RUN_VM_TESTS` - Set to `1` to run VM integration tests
 
 ## Development

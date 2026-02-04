@@ -1,6 +1,6 @@
 {
   "name": "@crumblecracker/cc",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "TypeScript bindings for the cc virtualization library",
   "repository": {
     "type": "git",
