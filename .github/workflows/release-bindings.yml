@@ -302,10 +302,13 @@ jobs:
         with:
           packages-dir: dist/
 
-  # Rust publishing
+  # Rust publishing (using OIDC trusted publishing)
   publish-cargo:
     needs: [validate-version, test-bindings]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # Required for crates.io OIDC trusted publishing
     steps:
       - uses: actions/checkout@v4
 
@@ -334,9 +337,15 @@ jobs:
         env:
           LIBCC_PATH: ${{ github.workspace }}/build/libcc.so
 
+      - name: Get crates.io token
+        if: ${{ inputs.dry_run != true }}
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
       - name: Publish to crates.io
         if: ${{ inputs.dry_run != true }}
         working-directory: bindings/rust
-        run: cargo publish --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish
         env:
           LIBCC_PATH: ${{ github.workspace }}/build/libcc.so
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
