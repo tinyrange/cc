@@ -145,6 +145,20 @@ typedef struct {
     const char* cache_dir;
 } cc_snapshot_options;
 
+// Dockerfile build arg
+typedef struct {
+    const char* key;
+    const char* value;
+} cc_build_arg;
+
+// Dockerfile build options
+typedef struct {
+    const char* context_dir;
+    const char* cache_dir;
+    const cc_build_arg* build_args;
+    size_t build_arg_count;
+} cc_dockerfile_options;
+
 // System capabilities
 typedef struct {
     bool hypervisor_available;
@@ -2277,6 +2291,93 @@ func cc_snapshot_as_source(snap C.cc_snapshot) C.cc_instance_source {
 	// FilesystemSnapshot implements InstanceSource
 	h := newHandle(cc.InstanceSource(snapshot))
 	return C.cc_instance_source{_h: C.uint64_t(h)}
+}
+
+// ==========================================================================
+// Dockerfile Building
+// ==========================================================================
+
+//export cc_build_dockerfile_source
+func cc_build_dockerfile_source(
+	client C.cc_oci_client,
+	dockerfile *C.uint8_t,
+	dockerfileLen C.size_t,
+	opts *C.cc_dockerfile_options,
+	cancel C.cc_cancel_token,
+	out *C.cc_snapshot,
+	cErr *C.cc_error,
+) {
+	if libShutdown.Load() {
+		setInvalidHandle(cErr, "library")
+		return
+	}
+
+	ociClient, ok := getHandleTyped[cc.OCIClient](uint64(client._h))
+	if !ok {
+		setInvalidHandle(cErr, "oci_client")
+		return
+	}
+
+	if dockerfile == nil || dockerfileLen == 0 {
+		setInvalidArgument(cErr, "dockerfile is NULL or empty")
+		return
+	}
+
+	if out == nil {
+		setInvalidArgument(cErr, "out is NULL")
+		return
+	}
+
+	if opts == nil {
+		setInvalidArgument(cErr, "options is NULL")
+		return
+	}
+
+	if opts.cache_dir == nil {
+		setInvalidArgument(cErr, "cache_dir is required")
+		return
+	}
+
+	// Convert dockerfile content to Go bytes
+	dockerfileContent := C.GoBytes(unsafe.Pointer(dockerfile), C.int(dockerfileLen))
+
+	// Build DockerfileOption slice
+	var dockerfileOpts []cc.DockerfileOption
+
+	// Cache dir (required)
+	cacheDir := C.GoString(opts.cache_dir)
+	dockerfileOpts = append(dockerfileOpts, cc.WithDockerfileCacheDir(cacheDir))
+
+	// Context dir (optional)
+	if opts.context_dir != nil {
+		contextDir := C.GoString(opts.context_dir)
+		if contextDir != "" {
+			dockerfileOpts = append(dockerfileOpts, cc.WithBuildContextDir(contextDir))
+		}
+	}
+
+	// Build args (optional)
+	if opts.build_args != nil && opts.build_arg_count > 0 {
+		for i := C.size_t(0); i < opts.build_arg_count; i++ {
+			argPtr := (*C.cc_build_arg)(unsafe.Pointer(uintptr(unsafe.Pointer(opts.build_args)) + uintptr(i)*unsafe.Sizeof(C.cc_build_arg{})))
+			if argPtr.key != nil && argPtr.value != nil {
+				key := C.GoString(argPtr.key)
+				value := C.GoString(argPtr.value)
+				dockerfileOpts = append(dockerfileOpts, cc.WithBuildArg(key, value))
+			}
+		}
+	}
+
+	ctx := getCancelContext(cancel)
+	snap, err := cc.BuildDockerfileSource(ctx, dockerfileContent, ociClient, dockerfileOpts...)
+	if err != nil {
+		setError(err, cErr)
+		return
+	}
+
+	h := newHandle(snap)
+	out._h = C.uint64_t(h)
+	C.clear_error(cErr)
 }
 
 // Required for CGO shared library

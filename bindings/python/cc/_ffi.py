@@ -294,6 +294,26 @@ class SnapshotOptionsStruct(Structure):
     ]
 
 
+class BuildArgStruct(Structure):
+    """Dockerfile build argument key-value pair."""
+
+    _fields_ = [
+        ("key", c_char_p),
+        ("value", c_char_p),
+    ]
+
+
+class DockerfileOptionsStruct(Structure):
+    """Dockerfile build options."""
+
+    _fields_ = [
+        ("context_dir", c_char_p),
+        ("cache_dir", c_char_p),
+        ("build_args", POINTER(BuildArgStruct)),
+        ("build_arg_count", c_size_t),
+    ]
+
+
 # ==========================================================================
 # Function setup
 # ==========================================================================
@@ -656,6 +676,18 @@ def _setup_functions(lib: Any) -> None:
 
     lib.cc_snapshot_as_source.argtypes = [SnapshotHandle]
     lib.cc_snapshot_as_source.restype = InstanceSourceHandle
+
+    # Dockerfile building
+    lib.cc_build_dockerfile_source.argtypes = [
+        OCIClientHandle,
+        POINTER(c_uint8),
+        c_size_t,
+        POINTER(DockerfileOptionsStruct),
+        CancelTokenHandle,
+        POINTER(SnapshotHandle),
+        POINTER(CCErrorStruct),
+    ]
+    lib.cc_build_dockerfile_source.restype = None
 
 
 # ==========================================================================

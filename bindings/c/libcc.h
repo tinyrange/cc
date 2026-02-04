@@ -741,6 +741,49 @@ typedef struct {
     const char* cache_dir;          /* Cache directory for layers */
 } cc_snapshot_options;
 
+/* ==========================================================================
+ * Dockerfile Building
+ * ========================================================================== */
+
+/* Build argument key-value pair for Dockerfile ARG instructions. */
+typedef struct {
+    const char* key;
+    const char* value;
+} cc_build_arg;
+
+/* Dockerfile build options. */
+typedef struct {
+    const char* context_dir;           /* Directory for COPY/ADD (optional) */
+    const char* cache_dir;             /* Cache directory (required) */
+    const cc_build_arg* build_args;    /* NULL-terminated array of build args (optional) */
+    size_t build_arg_count;            /* Number of build args */
+} cc_dockerfile_options;
+
+/*
+ * Build a filesystem snapshot from Dockerfile content.
+ * This parses the Dockerfile and executes instructions to produce a snapshot.
+ *
+ * Parameters:
+ *   client - OCI client for pulling base images
+ *   dockerfile - Dockerfile content as bytes
+ *   dockerfile_len - Length of dockerfile content
+ *   options - Build options (cache_dir is required)
+ *   cancel - Cancellation token, or CC_HANDLE_INVALID(cc_cancel_token)
+ *   out_snapshot - Output snapshot handle
+ *   err - Error output
+ *
+ * Returns CC_OK on success, error code otherwise.
+ */
+void cc_build_dockerfile_source(
+    cc_oci_client client,
+    const uint8_t* dockerfile,
+    size_t dockerfile_len,
+    const cc_dockerfile_options* options,
+    cc_cancel_token cancel,
+    cc_snapshot* out_snapshot,
+    cc_error* err
+);
+
 /* Take a filesystem snapshot. */
 cc_error_code cc_fs_snapshot(
     cc_instance inst,

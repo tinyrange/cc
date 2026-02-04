@@ -79,46 +79,7 @@ cc_instance_new(source, NULL, &inst, &err);
 
 ## Creating a Client
 
-### Default Cache
-
-Create a client with the default cache directory:
-
-<LanguageTabs>
-  <LangTabItem lang="go">
-```go
-client, err := cc.NewOCIClient()
-if err != nil {
-    return err
-}
-```
-  </LangTabItem>
-  <LangTabItem lang="python">
-```python
-client = cc.OCIClient()
-```
-  </LangTabItem>
-  <LangTabItem lang="rust">
-```rust
-let client = OciClient::new()?;
-```
-  </LangTabItem>
-  <LangTabItem lang="typescript">
-```typescript
-const client = new OCIClient();
-```
-  </LangTabItem>
-  <LangTabItem lang="c">
-```c
-cc_oci_client client;
-cc_oci_client_new(&client, &err);
-```
-  </LangTabItem>
-</LanguageTabs>
-
-The cache location is platform-specific:
-- macOS: `~/Library/Application Support/cc/oci`
-- Linux: `~/.cache/cc/oci`
-- Windows: `%APPDATA%\cc\oci`
+By default, images are cached in a platform-specific location (`~/Library/Application Support/cc/oci` on macOS, `~/.cache/cc/oci` on Linux, `%APPDATA%\cc\oci` on Windows).
 
 ### Custom Cache
 
@@ -521,6 +482,8 @@ cc_oci_client_load_dir(client, "/path/to/image-dir", NULL, &source, &err);
 ```
   </LangTabItem>
 </LanguageTabs>
+
+The directory should contain an extracted OCI image with the standard structure: `oci-layout`, `index.json`, and `blobs/` subdirectory. You can create this structure by exporting an image (see below) or by manually extracting an OCI-format tarball.
 
 ## Exporting Images
 

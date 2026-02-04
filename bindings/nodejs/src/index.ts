@@ -77,6 +77,7 @@ export {
   type ImageConfig,
   type Capabilities,
   type SnapshotOptions,
+  type DockerfileOptions,
 } from './types.js';
 
 // Re-export classes
@@ -176,9 +177,11 @@ export class CancelToken {
 
 // Import for OCIClient
 import { HelperProcess, spawnHelper } from './helper.js';
-import { Instance, SourceType } from './instance.js';
+import { Instance, Snapshot, SourceType } from './instance.js';
 import { IPCClient } from './ipc/client.js';
-import type { ImageConfig, InstanceOptions, PullOptions } from './types.js';
+import { MsgBuildDockerfile } from './ipc/messages.js';
+import { Decoder, Encoder } from './ipc/protocol.js';
+import type { DockerfileOptions, ImageConfig, InstanceOptions, PullOptions } from './types.js';
 import { PullPolicy } from './types.js';
 
 /**
@@ -369,6 +372,48 @@ export class OCIClient implements AsyncDisposable {
       '',
       this._cacheDir ?? ''
     );
+  }
+
+  /**
+   * Build an image from Dockerfile content.
+   *
+   * @param dockerfile - Dockerfile content as Buffer or string
+   * @param options - Build options including cache_dir (required)
+   * @returns A Snapshot that can be used to create instances
+   *
+   * @example
+   * const dockerfile = `
+   * FROM alpine:3.19
+   * RUN apk add --no-cache curl
+   * `;
+   * const snapshot = await client.buildDockerfile(dockerfile, {
+   *   cacheDir: '/tmp/cache'
+   * });
+   */
+  async buildDockerfile(
+    dockerfile: Buffer | string,
+    options: DockerfileOptions
+  ): Promise<Snapshot> {
+    if (this._closed) {
+      throw new Error('OCIClient is closed');
+    }
+
+    const helper = await spawnHelper();
+
+    const dockerfileBytes = typeof dockerfile === 'string'
+      ? Buffer.from(dockerfile, 'utf-8')
+      : dockerfile;
+
+    const enc = new Encoder();
+    enc.dockerfileOptions(dockerfileBytes, options);
+
+    const resp = await helper.client.call(MsgBuildDockerfile, enc.getBytes());
+    const dec = new Decoder(resp);
+    const err = dec.error();
+    if (err) throw err;
+
+    const snapshotHandle = dec.uint64();
+    return new Snapshot(helper.client, snapshotHandle);
   }
 
   /**

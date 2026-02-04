@@ -5,7 +5,7 @@
  */
 
 import { ErrorCode, errorFromCode, type CCError } from '../errors.js';
-import type { DirEntry, FileInfo, InstanceOptions, MountConfig, SnapshotOptions } from '../types.js';
+import type { DirEntry, DockerfileOptions, FileInfo, InstanceOptions, MountConfig, SnapshotOptions } from '../types.js';
 
 /** Header size in bytes */
 export const HEADER_SIZE = 6;
@@ -210,6 +210,24 @@ export class Encoder {
   snapshotOptions(opts: SnapshotOptions): this {
     this.stringSlice(opts.excludes ?? []);
     this.string(opts.cacheDir ?? '');
+    return this;
+  }
+
+  /**
+   * Encode dockerfile options.
+   */
+  dockerfileOptions(dockerfile: Buffer | Uint8Array, opts: DockerfileOptions): this {
+    this.bytes(dockerfile);
+    this.string(opts.contextDir ?? '');
+    this.string(opts.cacheDir);
+    // Encode build args as count + key/value pairs
+    const buildArgs = opts.buildArgs ?? {};
+    const entries = Object.entries(buildArgs);
+    this.uint32(entries.length);
+    for (const [key, value] of entries) {
+      this.string(key);
+      this.string(value);
+    }
     return this;
   }
 }

@@ -221,6 +221,33 @@ impl Default for CcSnapshotOptions {
     }
 }
 
+/// Build argument for Dockerfile builds.
+#[repr(C)]
+pub struct CcBuildArg {
+    pub key: *const c_char,
+    pub value: *const c_char,
+}
+
+/// Dockerfile build options.
+#[repr(C)]
+pub struct CcDockerfileOptions {
+    pub context_dir: *const c_char,
+    pub cache_dir: *const c_char,
+    pub build_args: *const CcBuildArg,
+    pub build_arg_count: usize,
+}
+
+impl Default for CcDockerfileOptions {
+    fn default() -> Self {
+        Self {
+            context_dir: std::ptr::null(),
+            cache_dir: std::ptr::null(),
+            build_args: std::ptr::null(),
+            build_arg_count: 0,
+        }
+    }
+}
+
 // External C functions
 extern "C" {
     // API version
@@ -561,4 +588,15 @@ extern "C" {
     pub fn cc_snapshot_parent(snap: CcSnapshot) -> CcSnapshot;
     pub fn cc_snapshot_close(snap: CcSnapshot, err: *mut CcError) -> CcErrorCode;
     pub fn cc_snapshot_as_source(snap: CcSnapshot) -> CcInstanceSource;
+
+    // Dockerfile building
+    pub fn cc_build_dockerfile_source(
+        client: CcOciClient,
+        dockerfile: *const u8,
+        dockerfile_len: usize,
+        options: *const CcDockerfileOptions,
+        cancel: CcCancelToken,
+        out_snapshot: *mut CcSnapshot,
+        err: *mut CcError,
+    );
 }

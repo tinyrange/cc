@@ -22,6 +22,7 @@ CMD ["app"]
 
 source, err := cc.BuildDockerfileSource(ctx, dockerfile, client,
     cc.WithBuildContextDir("./build"),
+    cc.WithDockerfileCacheDir("/tmp/cache"),
 )
 if err != nil {
     return err
@@ -32,64 +33,91 @@ instance, err := cc.New(source)
   </LangTabItem>
   <LangTabItem lang="python">
 ```python
-# Dockerfile building is available via the Go API
-# For Python, use pre-built images or snapshots
+dockerfile = b"""
+FROM alpine:3.19
+RUN apk add --no-cache curl
+COPY app /usr/local/bin/
+CMD ["app"]
+"""
 
-# Pull base image and customize
-source = client.pull("alpine:3.19")
-with cc.Instance(source) as inst:
-    inst.command("apk", "add", "--no-cache", "curl").run()
-    # Create snapshot for reuse
-    snapshot = inst.snapshot_filesystem()
+snapshot = client.build_dockerfile(
+    dockerfile,
+    cache_dir="/tmp/cache",
+    context_dir="./build",
+)
+
+instance = cc.Instance(snapshot.as_source())
 ```
   </LangTabItem>
   <LangTabItem lang="rust">
 ```rust
-// Dockerfile building is available via the Go API
-// For Rust, use pre-built images or snapshots
+let dockerfile = b"
+FROM alpine:3.19
+RUN apk add --no-cache curl
+COPY app /usr/local/bin/
+CMD [\"app\"]
+";
 
-// Pull base image and customize
-let source = client.pull("alpine:3.19", None, None)?;
-let inst = Instance::new(source, None)?;
-inst.command("apk", &["add", "--no-cache", "curl"])?.run()?;
-// Create snapshot for reuse
-let snapshot = inst.snapshot(None)?;
+let options = DockerfileOptions {
+    cache_dir: "/tmp/cache".to_string(),
+    context_dir: Some("./build".to_string()),
+    ..Default::default()
+};
+
+let snapshot = client.build_dockerfile(dockerfile, options, None)?;
+let instance = Instance::new(snapshot.as_source(), None)?;
 ```
   </LangTabItem>
   <LangTabItem lang="typescript">
 ```typescript
-// Dockerfile building is available via the Go API
-// For TypeScript, use pre-built images or snapshots
+const dockerfile = `
+FROM alpine:3.19
+RUN apk add --no-cache curl
+COPY app /usr/local/bin/
+CMD ["app"]
+`;
 
-// Pull base image and customize
-const source = await client.pull('alpine:3.19');
-await using inst = await source.createInstance();
-const apkCmd = await inst.command('apk', 'add', '--no-cache', 'curl');
-await apkCmd.run();
-// Create snapshot for reuse
-const snapshot = await inst.snapshotFilesystem();
+const snapshot = await client.buildDockerfile(dockerfile, {
+    cacheDir: '/tmp/cache',
+    contextDir: './build',
+});
+
+// Use snapshot to create instance
 ```
   </LangTabItem>
   <LangTabItem lang="c">
 ```c
-// Dockerfile building is available via the Go API
-// For C, use pre-built images or snapshots
+const char* dockerfile =
+    "FROM alpine:3.19\n"
+    "RUN apk add --no-cache curl\n"
+    "COPY app /usr/local/bin/\n"
+    "CMD [\"app\"]\n";
 
-// Pull base image and customize
-cc_oci_client_pull(client, "alpine:3.19", NULL, NULL, NULL,
-                   CC_HANDLE_INVALID(cc_cancel_token), &source, &err);
-cc_instance_new(source, NULL, &inst, &err);
-const char* args[] = {"add", "--no-cache", "curl", NULL};
-cc_cmd cmd;
-cc_cmd_new(inst, "apk", args, &cmd, &err);
-int exit_code;
-cc_cmd_run(cmd, &exit_code, &err);
-// Create snapshot for reuse
+cc_dockerfile_options opts = {
+    .cache_dir = "/tmp/cache",
+    .context_dir = "./build",
+    .build_args = NULL,
+    .build_arg_count = 0,
+};
+
+cc_snapshot snapshot;
+cc_error err = {0};
+cc_build_dockerfile_source(
+    client,
+    (const uint8_t*)dockerfile,
+    strlen(dockerfile),
+    &opts,
+    CC_HANDLE_INVALID(cc_cancel_token),
+    &snapshot,
+    &err
+);
+
+cc_instance_source source = cc_snapshot_as_source(snapshot);
 ```
   </LangTabItem>
 </LanguageTabs>
 
-## Building from Dockerfile (Go API)
+## Building from Dockerfile
 
 ### Basic Build
 
@@ -108,7 +136,9 @@ WORKDIR /app
 CMD ["python", "-m", "flask", "run"]
 `)
 
-source, err := cc.BuildDockerfileSource(ctx, dockerfile, client)
+source, err := cc.BuildDockerfileSource(ctx, dockerfile, client,
+    cc.WithDockerfileCacheDir("/tmp/cache"),
+)
 if err != nil {
     return err
 }
@@ -119,53 +149,88 @@ instance, err := cc.New(source)
   </LangTabItem>
   <LangTabItem lang="python">
 ```python
-# Equivalent using snapshots
 with cc.OCIClient() as client:
-    source = client.pull("python:3.12-slim")
-    with cc.Instance(source) as inst:
-        inst.command("pip", "install", "flask").run()
-        inst.command("mkdir", "-p", "/app").run()
-        snapshot = inst.snapshot_filesystem()
+    dockerfile = b"""
+FROM python:3.12-slim
+RUN pip install flask
+WORKDIR /app
+CMD ["python", "-m", "flask", "run"]
+"""
 
-    with cc.Instance(snapshot) as app_inst:
+    snapshot = client.build_dockerfile(
+        dockerfile,
+        cache_dir="/tmp/cache",
+    )
+
+    with cc.Instance(snapshot.as_source()) as app_inst:
         # Flask is installed
         pass
 ```
   </LangTabItem>
   <LangTabItem lang="rust">
 ```rust
-// Equivalent using snapshots
 let client = OciClient::new()?;
-let source = client.pull("python:3.12-slim", None, None)?;
-let inst = Instance::new(source, None)?;
 
-inst.command("pip", &["install", "flask"])?.run()?;
-inst.mkdir("/app", 0o755)?;
-let snapshot = inst.snapshot(None)?;
+let dockerfile = b"
+FROM python:3.12-slim
+RUN pip install flask
+WORKDIR /app
+CMD [\"python\", \"-m\", \"flask\", \"run\"]
+";
 
-let app_inst = Instance::new(snapshot.into(), None)?;
+let options = DockerfileOptions {
+    cache_dir: "/tmp/cache".to_string(),
+    ..Default::default()
+};
+
+let snapshot = client.build_dockerfile(dockerfile, options, None)?;
+let app_inst = Instance::new(snapshot.as_source(), None)?;
 // Flask is installed
 ```
   </LangTabItem>
   <LangTabItem lang="typescript">
 ```typescript
-// Equivalent using snapshots
 const client = new OCIClient();
-const source = await client.pull('python:3.12-slim');
 
-await using inst = await source.createInstance();
-const pipCmd = await inst.command('pip', 'install', 'flask');
-await pipCmd.run();
-await inst.mkdir('/app');
-const snapshot = await inst.snapshotFilesystem();
+const dockerfile = `
+FROM python:3.12-slim
+RUN pip install flask
+WORKDIR /app
+CMD ["python", "-m", "flask", "run"]
+`;
 
-await using appInst = await snapshot.createInstance();
-// Flask is installed
+const snapshot = await client.buildDockerfile(dockerfile, {
+    cacheDir: '/tmp/cache',
+});
+
+// Create instance from snapshot
 ```
   </LangTabItem>
   <LangTabItem lang="c">
 ```c
-// Equivalent using snapshots in C
+cc_oci_client client;
+cc_oci_client_new(&client, &err);
+
+const char* dockerfile =
+    "FROM python:3.12-slim\n"
+    "RUN pip install flask\n"
+    "WORKDIR /app\n"
+    "CMD [\"python\", \"-m\", \"flask\", \"run\"]\n";
+
+cc_dockerfile_options opts = {
+    .cache_dir = "/tmp/cache",
+};
+
+cc_snapshot snapshot;
+cc_build_dockerfile_source(
+    client,
+    (const uint8_t*)dockerfile,
+    strlen(dockerfile),
+    &opts,
+    CC_HANDLE_INVALID(cc_cancel_token),
+    &snapshot,
+    &err
+);
 ```
   </LangTabItem>
 </LanguageTabs>
@@ -179,36 +244,46 @@ Provide files for COPY/ADD instructions:
 ```go
 source, err := cc.BuildDockerfileSource(ctx, dockerfile, client,
     cc.WithBuildContextDir("/path/to/context"),
+    cc.WithDockerfileCacheDir("/tmp/cache"),
 )
 ```
   </LangTabItem>
   <LangTabItem lang="python">
 ```python
-# Copy files manually
-with cc.Instance(source) as inst:
-    # Read from host and write to guest
-    with open("/path/to/context/app.py", "rb") as f:
-        inst.write_file("/app/app.py", f.read())
+snapshot = client.build_dockerfile(
+    dockerfile,
+    cache_dir="/tmp/cache",
+    context_dir="/path/to/context",
+)
 ```
   </LangTabItem>
   <LangTabItem lang="rust">
 ```rust
-// Copy files manually
-let data = std::fs::read("/path/to/context/app.py")?;
-inst.write_file("/app/app.py", &data, 0o644)?;
+let options = DockerfileOptions {
+    cache_dir: "/tmp/cache".to_string(),
+    context_dir: Some("/path/to/context".to_string()),
+    ..Default::default()
+};
+
+let snapshot = client.build_dockerfile(dockerfile, options, None)?;
 ```
   </LangTabItem>
   <LangTabItem lang="typescript">
 ```typescript
-// Copy files manually
-import * as fs from 'fs';
-const data = fs.readFileSync('/path/to/context/app.py');
-await inst.writeFile('/app/app.py', data);
+const snapshot = await client.buildDockerfile(dockerfile, {
+    cacheDir: '/tmp/cache',
+    contextDir: '/path/to/context',
+});
 ```
   </LangTabItem>
   <LangTabItem lang="c">
 ```c
-// Copy files manually using cc_fs_write_file
+cc_dockerfile_options opts = {
+    .cache_dir = "/tmp/cache",
+    .context_dir = "/path/to/context",
+};
+
+cc_build_dockerfile_source(client, dockerfile, len, &opts, cancel, &snapshot, &err);
 ```
   </LangTabItem>
 </LanguageTabs>
@@ -227,38 +302,73 @@ RUN echo "Building version $VERSION"
 `)
 
 source, err := cc.BuildDockerfileSource(ctx, dockerfile, client,
+    cc.WithDockerfileCacheDir("/tmp/cache"),
     cc.WithBuildArg("VERSION", "2.0.0"),
 )
 ```
   </LangTabItem>
   <LangTabItem lang="python">
 ```python
-# Set environment variables in commands
-with cc.Instance(source) as inst:
-    cmd = inst.command("sh", "-c", "echo Building version $VERSION")
-    cmd.set_env("VERSION", "2.0.0")
-    cmd.run()
+dockerfile = b"""
+FROM alpine:3.19
+ARG VERSION=1.0.0
+RUN echo "Building version $VERSION"
+"""
+
+snapshot = client.build_dockerfile(
+    dockerfile,
+    cache_dir="/tmp/cache",
+    build_args={"VERSION": "2.0.0"},
+)
 ```
   </LangTabItem>
   <LangTabItem lang="rust">
 ```rust
-// Set environment variables in commands
-let cmd = inst.command("sh", &["-c", "echo Building version $VERSION"])?
-    .env("VERSION", "2.0.0")?;
-cmd.run()?;
+let dockerfile = b"
+FROM alpine:3.19
+ARG VERSION=1.0.0
+RUN echo \"Building version $VERSION\"
+";
+
+let mut build_args = HashMap::new();
+build_args.insert("VERSION".to_string(), "2.0.0".to_string());
+
+let options = DockerfileOptions {
+    cache_dir: "/tmp/cache".to_string(),
+    build_args,
+    ..Default::default()
+};
+
+let snapshot = client.build_dockerfile(dockerfile, options, None)?;
 ```
   </LangTabItem>
   <LangTabItem lang="typescript">
 ```typescript
-// Set environment variables in commands
-const cmd = await inst.command('sh', '-c', 'echo Building version $VERSION');
-await cmd.setEnv('VERSION', '2.0.0');
-await cmd.run();
+const dockerfile = `
+FROM alpine:3.19
+ARG VERSION=1.0.0
+RUN echo "Building version $VERSION"
+`;
+
+const snapshot = await client.buildDockerfile(dockerfile, {
+    cacheDir: '/tmp/cache',
+    buildArgs: { VERSION: '2.0.0' },
+});
 ```
   </LangTabItem>
   <LangTabItem lang="c">
 ```c
-// Set environment variables via cc_cmd_set_env
+cc_build_arg args[] = {
+    { .key = "VERSION", .value = "2.0.0" },
+};
+
+cc_dockerfile_options opts = {
+    .cache_dir = "/tmp/cache",
+    .build_args = args,
+    .build_arg_count = 1,
+};
+
+cc_build_dockerfile_source(client, dockerfile, len, &opts, cancel, &snapshot, &err);
 ```
   </LangTabItem>
 </LanguageTabs>
@@ -327,35 +437,30 @@ CMD ["npm", "start"]
   <LangTabItem lang="python">
 ```python
 import os
+import tempfile
 
 def build_and_run_app(app_dir):
     with cc.OCIClient() as client:
-        source = client.pull("node:20-slim")
+        dockerfile = b"""
+FROM node:20-slim
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+EXPOSE 3000
+CMD ["npm", "start"]
+"""
+
+        snapshot = client.build_dockerfile(
+            dockerfile,
+            cache_dir=os.path.join(tempfile.gettempdir(), "cc-dockerfile-cache"),
+            context_dir=app_dir,
+        )
 
         options = cc.InstanceOptions(memory_mb=512)
-        with cc.Instance(source, options) as inst:
-            # Set up working directory
-            inst.mkdir("/app")
-
-            # Copy package.json
-            with open(os.path.join(app_dir, "package.json"), "rb") as f:
-                inst.write_file("/app/package.json", f.read())
-
-            # Install dependencies
-            cmd = inst.command("npm", "install")
-            cmd.set_dir("/app")
-            cmd.run()
-
-            # Copy app files
-            for filename in os.listdir(app_dir):
-                filepath = os.path.join(app_dir, filename)
-                if os.path.isfile(filepath):
-                    with open(filepath, "rb") as f:
-                        inst.write_file(f"/app/{filename}", f.read())
-
+        with cc.Instance(snapshot.as_source(), options) as inst:
             # Start the server
-            cmd = inst.command("npm", "start")
-            cmd.set_dir("/app")
+            cmd = inst.entrypoint_command()
             cmd.run()
 ```
   </LangTabItem>
@@ -363,23 +468,31 @@ def build_and_run_app(app_dir):
 ```rust
 fn build_and_run_app(app_dir: &str) -> cc::Result<()> {
     let client = OciClient::new()?;
-    let source = client.pull("node:20-slim", None, None)?;
 
-    let opts = InstanceOptions { memory_mb: 512, ..Default::default() };
-    let inst = Instance::new(source, Some(opts))?;
+    let dockerfile = b"
+FROM node:20-slim
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+EXPOSE 3000
+CMD [\"npm\", \"start\"]
+";
 
-    // Set up working directory
-    inst.mkdir("/app", 0o755)?;
+    let options = DockerfileOptions {
+        cache_dir: std::env::temp_dir().join("cc-dockerfile-cache")
+            .to_string_lossy().to_string(),
+        context_dir: Some(app_dir.to_string()),
+        ..Default::default()
+    };
 
-    // Copy package.json
-    let package_json = std::fs::read(format!("{}/package.json", app_dir))?;
-    inst.write_file("/app/package.json", &package_json, 0o644)?;
+    let snapshot = client.build_dockerfile(dockerfile, options, None)?;
 
-    // Install dependencies
-    inst.command("npm", &["install"])?.dir("/app")?.run()?;
+    let inst_opts = InstanceOptions { memory_mb: 512, ..Default::default() };
+    let inst = Instance::new(snapshot.as_source(), Some(inst_opts))?;
 
-    // Copy app files and start
-    // ...
+    // Start the server
+    inst.entrypoint_command(&[])?.run()?;
 
     Ok(())
 }
@@ -387,53 +500,73 @@ fn build_and_run_app(app_dir: &str) -> cc::Result<()> {
   </LangTabItem>
   <LangTabItem lang="typescript">
 ```typescript
-import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 
 async function buildAndRunApp(appDir: string) {
     const client = new OCIClient();
-    const source = await client.pull('node:20-slim');
 
-    await using inst = await source.createInstance({ memoryMb: 512 });
+    const dockerfile = `
+FROM node:20-slim
+WORKDIR /app
+COPY package*.json ./
+RUN npm install
+COPY . .
+EXPOSE 3000
+CMD ["npm", "start"]
+`;
 
-    // Set up working directory
-    await inst.mkdir('/app');
+    const snapshot = await client.buildDockerfile(dockerfile, {
+        cacheDir: path.join(os.tmpdir(), 'cc-dockerfile-cache'),
+        contextDir: appDir,
+    });
 
-    // Copy package.json
-    const packageJson = fs.readFileSync(path.join(appDir, 'package.json'));
-    await inst.writeFile('/app/package.json', packageJson);
-
-    // Install dependencies
-    let cmd = await inst.command('npm', 'install');
-    await cmd.setDir('/app');
-    await cmd.run();
-
-    // Copy app files
-    for (const filename of fs.readdirSync(appDir)) {
-        const filepath = path.join(appDir, filename);
-        if (fs.statSync(filepath).isFile()) {
-            const data = fs.readFileSync(filepath);
-            await inst.writeFile(`/app/${filename}`, data);
-        }
-    }
-
-    // Start the server
-    cmd = await inst.command('npm', 'start');
-    await cmd.setDir('/app');
-    await cmd.run();
+    // Create instance from snapshot and run
 }
 ```
   </LangTabItem>
   <LangTabItem lang="c">
 ```c
-// Similar pattern: pull base image, copy files, run commands
+void build_and_run_app(const char* app_dir) {
+    cc_oci_client client;
+    cc_error err = {0};
+    cc_oci_client_new(&client, &err);
+
+    const char* dockerfile =
+        "FROM node:20-slim\n"
+        "WORKDIR /app\n"
+        "COPY package*.json ./\n"
+        "RUN npm install\n"
+        "COPY . .\n"
+        "EXPOSE 3000\n"
+        "CMD [\"npm\", \"start\"]\n";
+
+    cc_dockerfile_options opts = {
+        .cache_dir = "/tmp/cc-dockerfile-cache",
+        .context_dir = app_dir,
+    };
+
+    cc_snapshot snapshot;
+    cc_build_dockerfile_source(
+        client,
+        (const uint8_t*)dockerfile,
+        strlen(dockerfile),
+        &opts,
+        CC_HANDLE_INVALID(cc_cancel_token),
+        &snapshot,
+        &err
+    );
+
+    cc_instance_source source = cc_snapshot_as_source(snapshot);
+    // Create instance and run...
+}
 ```
   </LangTabItem>
 </LanguageTabs>
 
-## Multi-stage Builds (Go API)
+## Multi-stage Builds
 
-Multi-stage builds are supported:
+Multi-stage builds are supported. Only the final stage becomes the VM filesystem:
 
 <LanguageTabs>
   <LangTabItem lang="go">
@@ -451,81 +584,92 @@ CMD ["app"]
 
 source, err := cc.BuildDockerfileSource(ctx, dockerfile, client,
     cc.WithBuildContextDir("./"),
+    cc.WithDockerfileCacheDir("/tmp/cache"),
 )
 ```
   </LangTabItem>
   <LangTabItem lang="python">
 ```python
-# Multi-stage equivalent: use two instances
-with cc.OCIClient() as client:
-    # Build stage
-    builder_source = client.pull("golang:1.22")
-    with cc.Instance(builder_source) as builder:
-        builder.mkdir("/src")
-        # Copy source files
-        builder.write_file("/src/main.go", source_code)
-        builder.command("go", "build", "-o", "/app").run()
-        # Read built binary
-        binary = builder.read_file("/app")
+dockerfile = b"""
+FROM golang:1.22 AS builder
+WORKDIR /src
+COPY . .
+RUN go build -o /app
 
-    # Runtime stage
-    runtime_source = client.pull("alpine:3.19")
-    with cc.Instance(runtime_source) as runtime:
-        runtime.write_file("/usr/local/bin/app", binary, mode=0o755)
-        runtime.command("/usr/local/bin/app").run()
+FROM alpine:3.19
+COPY --from=builder /app /usr/local/bin/app
+CMD ["app"]
+"""
+
+snapshot = client.build_dockerfile(
+    dockerfile,
+    cache_dir="/tmp/cache",
+    context_dir="./",
+)
 ```
   </LangTabItem>
   <LangTabItem lang="rust">
 ```rust
-// Multi-stage equivalent: use two instances
-let client = OciClient::new()?;
+let dockerfile = b"
+FROM golang:1.22 AS builder
+WORKDIR /src
+COPY . .
+RUN go build -o /app
 
-// Build stage
-let builder_source = client.pull("golang:1.22", None, None)?;
-let builder = Instance::new(builder_source, None)?;
-builder.mkdir("/src", 0o755)?;
-builder.write_file("/src/main.go", source_code, 0o644)?;
-builder.command("go", &["build", "-o", "/app"])?.run()?;
-let binary = builder.read_file("/app")?;
+FROM alpine:3.19
+COPY --from=builder /app /usr/local/bin/app
+CMD [\"app\"]
+";
 
-// Runtime stage
-let runtime_source = client.pull("alpine:3.19", None, None)?;
-let runtime = Instance::new(runtime_source, None)?;
-runtime.write_file("/usr/local/bin/app", &binary, 0o755)?;
-runtime.command("/usr/local/bin/app", &[])?.run()?;
+let options = DockerfileOptions {
+    cache_dir: "/tmp/cache".to_string(),
+    context_dir: Some("./".to_string()),
+    ..Default::default()
+};
+
+let snapshot = client.build_dockerfile(dockerfile, options, None)?;
 ```
   </LangTabItem>
   <LangTabItem lang="typescript">
 ```typescript
-// Multi-stage equivalent: use two instances
-const client = new OCIClient();
+const dockerfile = `
+FROM golang:1.22 AS builder
+WORKDIR /src
+COPY . .
+RUN go build -o /app
 
-// Build stage
-const builderSource = await client.pull('golang:1.22');
-await using builder = await builderSource.createInstance();
-await builder.mkdir('/src');
-await builder.writeFile('/src/main.go', Buffer.from(sourceCode));
-let cmd = await builder.command('go', 'build', '-o', '/app');
-await cmd.run();
-const binary = await builder.readFile('/app');
+FROM alpine:3.19
+COPY --from=builder /app /usr/local/bin/app
+CMD ["app"]
+`;
 
-// Runtime stage
-const runtimeSource = await client.pull('alpine:3.19');
-await using runtime = await runtimeSource.createInstance();
-await runtime.writeFile('/usr/local/bin/app', binary, 0o755);
-cmd = await runtime.command('/usr/local/bin/app');
-await cmd.run();
+const snapshot = await client.buildDockerfile(dockerfile, {
+    cacheDir: '/tmp/cache',
+    contextDir: './',
+});
 ```
   </LangTabItem>
   <LangTabItem lang="c">
 ```c
-// Multi-stage equivalent: use two instances
-// Build in first instance, copy binary to second
+const char* dockerfile =
+    "FROM golang:1.22 AS builder\n"
+    "WORKDIR /src\n"
+    "COPY . .\n"
+    "RUN go build -o /app\n"
+    "\n"
+    "FROM alpine:3.19\n"
+    "COPY --from=builder /app /usr/local/bin/app\n"
+    "CMD [\"app\"]\n";
+
+cc_dockerfile_options opts = {
+    .cache_dir = "/tmp/cache",
+    .context_dir = "./",
+};
+
+cc_build_dockerfile_source(client, dockerfile, len, &opts, cancel, &snapshot, &err);
 ```
   </LangTabItem>
 </LanguageTabs>
-
-Only the final stage becomes the VM filesystem.
 
 ## Limitations
 

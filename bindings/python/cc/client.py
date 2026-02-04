@@ -4,6 +4,7 @@ OCI client for pulling and managing container images.
 
 from __future__ import annotations
 
+import ctypes
 from ctypes import POINTER, byref, c_char_p
 
 from . import _ffi
@@ -317,6 +318,82 @@ class OCIClient:
             byref(err),
         )
         _ffi.check_error(code, err)
+
+    def build_dockerfile(
+        self,
+        dockerfile: bytes,
+        *,
+        cache_dir: str,
+        context_dir: str | None = None,
+        build_args: dict[str, str] | None = None,
+        cancel_token: "CancelToken | None" = None,
+    ) -> "Snapshot":
+        """Build an image from Dockerfile content.
+
+        Args:
+            dockerfile: Dockerfile content as bytes
+            cache_dir: Cache directory for intermediate layers (required)
+            context_dir: Directory for COPY/ADD instructions (optional)
+            build_args: Build arguments for ARG instructions (optional)
+            cancel_token: Optional cancellation token
+
+        Returns:
+            A Snapshot that can be used to create instances.
+
+        Example:
+            dockerfile = b'''
+            FROM alpine:3.19
+            RUN apk add --no-cache curl
+            '''
+            snapshot = client.build_dockerfile(dockerfile, cache_dir="/tmp/cache")
+        """
+        # Import here to avoid circular imports
+        from .instance import Snapshot
+
+        lib = _ffi.get_lib()
+        snapshot_handle = _ffi.SnapshotHandle()
+        err = _ffi.CCErrorStruct()
+
+        # Build options struct
+        opts = _ffi.DockerfileOptionsStruct()
+        opts.cache_dir = cache_dir.encode("utf-8")
+
+        if context_dir is not None:
+            opts.context_dir = context_dir.encode("utf-8")
+
+        # Build args array
+        build_args_array = None
+        if build_args:
+            build_args_array = (_ffi.BuildArgStruct * len(build_args))()
+            for i, (key, value) in enumerate(build_args.items()):
+                build_args_array[i].key = key.encode("utf-8")
+                build_args_array[i].value = value.encode("utf-8")
+            opts.build_args = build_args_array
+            opts.build_arg_count = len(build_args)
+
+        # Get cancel token handle
+        cancel_handle = _ffi.CancelTokenHandle.invalid()
+        if cancel_token:
+            cancel_handle = cancel_token.handle
+
+        # Convert dockerfile to C buffer
+        dockerfile_buf = (ctypes.c_uint8 * len(dockerfile)).from_buffer_copy(dockerfile)
+
+        lib.cc_build_dockerfile_source(
+            self.handle,
+            dockerfile_buf,
+            len(dockerfile),
+            byref(opts),
+            cancel_handle,
+            byref(snapshot_handle),
+            byref(err),
+        )
+
+        # Check for errors (function returns void, check error struct)
+        if err.code != 0:
+            _ffi.check_error(err.code, err)
+
+        return Snapshot(snapshot_handle)
 
 
 class CancelToken:

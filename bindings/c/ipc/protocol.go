@@ -87,6 +87,9 @@ const (
 	MsgSnapshotClose    uint16 = 0x0602
 	MsgSnapshotAsSource uint16 = 0x0603
 
+	// Dockerfile operations (0x07xx)
+	MsgBuildDockerfile uint16 = 0x0700
+
 	// Response types (0xFFxx)
 	MsgResponse uint16 = 0xFF00
 	MsgError    uint16 = 0xFF01
@@ -599,5 +602,68 @@ func DecodeSnapshotOptions(dec *Decoder) (SnapshotOptions, error) {
 	if err != nil {
 		return opts, err
 	}
+	return opts, nil
+}
+
+// DockerfileOptions holds Dockerfile build options for IPC transfer.
+type DockerfileOptions struct {
+	Dockerfile []byte            // Dockerfile content
+	ContextDir string            // Directory for COPY/ADD (optional)
+	CacheDir   string            // Cache directory (required)
+	BuildArgs  map[string]string // Build arguments (optional)
+}
+
+// EncodeDockerfileOptions encodes Dockerfile build options.
+func EncodeDockerfileOptions(enc *Encoder, opts DockerfileOptions) {
+	enc.WriteBytes(opts.Dockerfile)
+	enc.String(opts.ContextDir)
+	enc.String(opts.CacheDir)
+	enc.Uint32(uint32(len(opts.BuildArgs)))
+	for k, v := range opts.BuildArgs {
+		enc.String(k)
+		enc.String(v)
+	}
+}
+
+// DecodeDockerfileOptions decodes Dockerfile build options.
+func DecodeDockerfileOptions(dec *Decoder) (DockerfileOptions, error) {
+	var opts DockerfileOptions
+	var err error
+
+	opts.Dockerfile, err = dec.Bytes()
+	if err != nil {
+		return opts, err
+	}
+
+	opts.ContextDir, err = dec.String()
+	if err != nil {
+		return opts, err
+	}
+
+	opts.CacheDir, err = dec.String()
+	if err != nil {
+		return opts, err
+	}
+
+	count, err := dec.Uint32()
+	if err != nil {
+		return opts, err
+	}
+
+	if count > 0 {
+		opts.BuildArgs = make(map[string]string, count)
+		for i := uint32(0); i < count; i++ {
+			k, err := dec.String()
+			if err != nil {
+				return opts, err
+			}
+			v, err := dec.String()
+			if err != nil {
+				return opts, err
+			}
+			opts.BuildArgs[k] = v
+		}
+	}
+
 	return opts, nil
 }

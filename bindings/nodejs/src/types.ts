@@ -142,3 +142,15 @@ export interface SnapshotOptions {
   excludes?: string[];
   cacheDir?: string;
 }
+
+/**
+ * Options for Dockerfile builds.
+ */
+export interface DockerfileOptions {
+  /** Directory for COPY/ADD instructions (optional) */
+  contextDir?: string;
+  /** Cache directory for intermediate layers (required) */
+  cacheDir: string;
+  /** Build arguments for ARG instructions */
+  buildArgs?: Record<string, string>;
+}

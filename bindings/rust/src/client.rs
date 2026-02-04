@@ -4,8 +4,9 @@ use std::ffi::{CStr, CString};
 use std::ptr;
 
 use crate::error::Result;
-use crate::ffi::{self, check_error, CcCancelToken, CcInstanceSource, CcOciClient};
-use crate::types::{ImageConfig, PullOptions};
+use crate::ffi::{self, check_error, CcCancelToken, CcInstanceSource, CcOciClient, CcSnapshot};
+use crate::snapshot::Snapshot;
+use crate::types::{DockerfileOptions, ImageConfig, PullOptions};
 
 /// An opaque reference to a pulled container image.
 ///
@@ -415,6 +416,108 @@ impl OciClient {
                 &mut err,
             );
             check_error(code, &mut err)
+        }
+    }
+
+    /// Build an image from Dockerfile content.
+    ///
+    /// # Arguments
+    ///
+    /// * `dockerfile` - Dockerfile content as bytes
+    /// * `options` - Build options including cache_dir (required)
+    /// * `cancel_token` - Optional cancellation token
+    ///
+    /// # Returns
+    ///
+    /// A [`Snapshot`] that can be used to create instances.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use cc::{OciClient, DockerfileOptions};
+    ///
+    /// let client = OciClient::new()?;
+    /// let dockerfile = b"FROM alpine:3.19\nRUN apk add --no-cache curl";
+    /// let options = DockerfileOptions {
+    ///     cache_dir: "/tmp/cache".to_string(),
+    ///     ..Default::default()
+    /// };
+    /// let snapshot = client.build_dockerfile(dockerfile, options, None)?;
+    /// # Ok::<(), cc::Error>(())
+    /// ```
+    pub fn build_dockerfile(
+        &self,
+        dockerfile: &[u8],
+        options: DockerfileOptions,
+        cancel_token: Option<&CancelToken>,
+    ) -> Result<Snapshot> {
+        unsafe {
+            // Build options struct
+            let cache_dir_c = CString::new(options.cache_dir.as_str())
+                .expect("cache_dir contains null byte");
+            let context_dir_c = options
+                .context_dir
+                .as_ref()
+                .map(|s| CString::new(s.as_str()).expect("context_dir contains null byte"));
+
+            // Build args array
+            let build_args_keys: Vec<CString> = options
+                .build_args
+                .keys()
+                .map(|k| CString::new(k.as_str()).expect("build_arg key contains null byte"))
+                .collect();
+            let build_args_values: Vec<CString> = options
+                .build_args
+                .values()
+                .map(|v| CString::new(v.as_str()).expect("build_arg value contains null byte"))
+                .collect();
+
+            let build_args_c: Vec<ffi::CcBuildArg> = build_args_keys
+                .iter()
+                .zip(build_args_values.iter())
+                .map(|(k, v)| ffi::CcBuildArg {
+                    key: k.as_ptr(),
+                    value: v.as_ptr(),
+                })
+                .collect();
+
+            let c_opts = ffi::CcDockerfileOptions {
+                context_dir: context_dir_c
+                    .as_ref()
+                    .map(|s| s.as_ptr())
+                    .unwrap_or(ptr::null()),
+                cache_dir: cache_dir_c.as_ptr(),
+                build_args: if build_args_c.is_empty() {
+                    ptr::null()
+                } else {
+                    build_args_c.as_ptr()
+                },
+                build_arg_count: build_args_c.len(),
+            };
+
+            let cancel_handle = cancel_token
+                .map(|t| t.handle())
+                .unwrap_or(CcCancelToken::invalid());
+
+            let mut snapshot_handle = CcSnapshot::invalid();
+            let mut err = ffi::CcError::default();
+
+            ffi::cc_build_dockerfile_source(
+                self.handle,
+                dockerfile.as_ptr(),
+                dockerfile.len(),
+                &c_opts,
+                cancel_handle,
+                &mut snapshot_handle,
+                &mut err,
+            );
+
+            // Check for errors (function returns void, check error struct)
+            if err.code != ffi::CC_OK {
+                check_error(err.code, &mut err)?;
+            }
+
+            Ok(Snapshot::from_handle(snapshot_handle))
         }
     }
 }

@@ -222,6 +222,9 @@ func (h *Helper) RegisterHandlers(mux *ipc.Mux) {
 	mux.Handle(ipc.MsgSnapshotParent, h.handleSnapshotParent)
 	mux.Handle(ipc.MsgSnapshotClose, h.handleSnapshotClose)
 	mux.Handle(ipc.MsgSnapshotAsSource, h.handleSnapshotAsSource)
+
+	// Dockerfile operations
+	mux.Handle(ipc.MsgBuildDockerfile, h.handleBuildDockerfile)
 }
 
 func (h *Helper) requireInstance() error {
@@ -1802,5 +1805,60 @@ func (h *Helper) handleSnapshotAsSource(dec *ipc.Decoder) ([]byte, error) {
 	// FilesystemSnapshot implements InstanceSource, so we just need to
 	// return a reference to it. The snapshot handle can be used as a source.
 	_ = snap
+	return ipc.NewResponseBuilder().Success().Uint64(handle).Build(), nil
+}
+
+// ==========================================================================
+// Dockerfile handlers
+// ==========================================================================
+
+func (h *Helper) handleBuildDockerfile(dec *ipc.Decoder) ([]byte, error) {
+	opts, err := ipc.DecodeDockerfileOptions(dec)
+	if err != nil {
+		return nil, err
+	}
+
+	if opts.CacheDir == "" {
+		return nil, &ipc.IPCError{Code: ipc.ErrCodeInvalidArgument, Message: "cache_dir is required"}
+	}
+
+	if len(opts.Dockerfile) == 0 {
+		return nil, &ipc.IPCError{Code: ipc.ErrCodeInvalidArgument, Message: "dockerfile is empty"}
+	}
+
+	// Create OCI client with cache dir
+	cache, err := cc.NewCacheDir(opts.CacheDir)
+	if err != nil {
+		return nil, errorToIPC(err)
+	}
+	client, err := cc.NewOCIClientWithCache(cache)
+	if err != nil {
+		return nil, errorToIPC(err)
+	}
+
+	// Build DockerfileOption slice
+	var dockerfileOpts []cc.DockerfileOption
+	dockerfileOpts = append(dockerfileOpts, cc.WithDockerfileCacheDir(opts.CacheDir))
+
+	if opts.ContextDir != "" {
+		dockerfileOpts = append(dockerfileOpts, cc.WithBuildContextDir(opts.ContextDir))
+	}
+
+	for k, v := range opts.BuildArgs {
+		dockerfileOpts = append(dockerfileOpts, cc.WithBuildArg(k, v))
+	}
+
+	// Build the Dockerfile
+	snap, err := cc.BuildDockerfileSource(context.Background(), opts.Dockerfile, client, dockerfileOpts...)
+	if err != nil {
+		return nil, errorToIPC(err)
+	}
+
+	// Store the snapshot and return handle
+	h.mu.Lock()
+	handle := h.newHandle()
+	h.snapshots[handle] = snap
+	h.mu.Unlock()
+
 	return ipc.NewResponseBuilder().Success().Uint64(handle).Build(), nil
 }

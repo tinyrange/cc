@@ -82,6 +82,50 @@ cc_oci_client_free(client);
 
 The instance creation blocks until the VM is fully booted and ready to accept commands.
 
+## Checking Hypervisor Availability
+
+Before creating instances, you can check if the hypervisor is available on this system:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+if err := cc.SupportsHypervisor(); err != nil {
+    log.Fatal("Hypervisor unavailable:", err)
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+if not cc.supports_hypervisor():
+    print("Hypervisor unavailable")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+if !cc::supports_hypervisor()? {
+    eprintln!("Hypervisor unavailable");
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+if (!supportsHypervisor()) {
+    console.error('Hypervisor unavailable');
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+if (cc_supports_hypervisor(&err) != CC_OK) {
+    fprintf(stderr, "Hypervisor unavailable: %s\n", err.message);
+    cc_error_free(&err);
+}
+```
+  </LangTabItem>
+</LanguageTabs>
+
+This returns a descriptive error explaining why the hypervisor isn't available (missing permissions, disabled in BIOS, etc.).
+
 ## Instance Sources
 
 An `InstanceSource` is anything that can be used to create a VM. The package provides several ways to get one:
@@ -195,7 +239,13 @@ cc_oci_client_load_dir(client, "/path/to/image-dir", NULL, &source, &err);
 
 ### From a Snapshot
 
-Use a filesystem snapshot for faster startup:
+Snapshots capture the current state of a VM's filesystem, allowing you to quickly create new instances from a known state. This is much faster than pulling an image and booting from scratch because:
+
+- The filesystem is already prepared and cached locally
+- Boot-time initialization has already been completed
+- Any installed packages or configuration changes are preserved
+
+Common use cases include creating a "golden image" with pre-installed dependencies, or rapidly spawning multiple identical sandbox environments:
 
 <LanguageTabs>
   <LangTabItem lang="go">
@@ -307,43 +357,6 @@ cc_instance_new(source, &opts, &inst, &err);
 
 After this duration, the instance is forcibly terminated. This is useful for sandboxed code execution.
 
-### CPUs
-
-Set the number of virtual CPUs:
-
-<LanguageTabs>
-  <LangTabItem lang="go">
-```go
-instance, err := cc.New(source, cc.WithCPUs(2))
-```
-  </LangTabItem>
-  <LangTabItem lang="python">
-```python
-options = cc.InstanceOptions(cpus=2)
-inst = cc.Instance(source, options)
-```
-  </LangTabItem>
-  <LangTabItem lang="rust">
-```rust
-let opts = InstanceOptions { cpus: 2, ..Default::default() };
-let inst = Instance::new(source, Some(opts))?;
-```
-  </LangTabItem>
-  <LangTabItem lang="typescript">
-```typescript
-const inst = await source.createInstance({ cpus: 2 });
-```
-  </LangTabItem>
-  <LangTabItem lang="c">
-```c
-cc_instance_options opts = { .cpus = 2 };
-cc_instance_new(source, &opts, &inst, &err);
-```
-  </LangTabItem>
-</LanguageTabs>
-
-The default is 1.
-
 ### User
 
 Run commands as a specific user:
@@ -420,7 +433,6 @@ Pass multiple options when creating an instance:
 ```go
 instance, err := cc.New(source,
     cc.WithMemoryMB(256),
-    cc.WithCPUs(2),
     cc.WithTimeout(60*time.Second),
     cc.WithUser("nobody"),
 )
@@ -430,7 +442,6 @@ instance, err := cc.New(source,
 ```python
 options = cc.InstanceOptions(
     memory_mb=256,
-    cpus=2,
     timeout_seconds=60,
     user="nobody"
 )
@@ -441,7 +452,6 @@ inst = cc.Instance(source, options)
 ```rust
 let opts = InstanceOptions {
     memory_mb: 256,
-    cpus: 2,
     timeout_seconds: 60.0,
     user: Some("nobody".to_string()),
     ..Default::default()
@@ -453,7 +463,6 @@ let inst = Instance::new(source, Some(opts))?;
 ```typescript
 const inst = await source.createInstance({
     memoryMb: 256,
-    cpus: 2,
     timeoutSeconds: 60,
     user: 'nobody'
 });
@@ -463,7 +472,6 @@ const inst = await source.createInstance({
 ```c
 cc_instance_options opts = {
     .memory_mb = 256,
-    .cpus = 2,
     .timeout_seconds = 60.0,
     .user = "nobody"
 };
@@ -549,7 +557,7 @@ cc_instance_close(inst, &err);
 
 ### Waiting for Exit
 
-If the VM's init process exits, you can wait for it:
+Use `Wait()` to block until the VM's init process exits. This is useful when running a single command or script and waiting for it to complete, rather than interacting with the VM interactively:
 
 <LanguageTabs>
   <LangTabItem lang="go">
@@ -630,50 +638,6 @@ if (!cc_instance_is_running(inst)) {
 ```
   </LangTabItem>
 </LanguageTabs>
-
-## Checking Hypervisor Availability
-
-Check if the hypervisor is available before creating instances:
-
-<LanguageTabs>
-  <LangTabItem lang="go">
-```go
-if err := cc.SupportsHypervisor(); err != nil {
-    log.Fatal("Hypervisor unavailable:", err)
-}
-```
-  </LangTabItem>
-  <LangTabItem lang="python">
-```python
-if not cc.supports_hypervisor():
-    print("Hypervisor unavailable")
-```
-  </LangTabItem>
-  <LangTabItem lang="rust">
-```rust
-if !cc::supports_hypervisor()? {
-    eprintln!("Hypervisor unavailable");
-}
-```
-  </LangTabItem>
-  <LangTabItem lang="typescript">
-```typescript
-if (!supportsHypervisor()) {
-    console.error('Hypervisor unavailable');
-}
-```
-  </LangTabItem>
-  <LangTabItem lang="c">
-```c
-if (cc_supports_hypervisor(&err) != CC_OK) {
-    fprintf(stderr, "Hypervisor unavailable: %s\n", err.message);
-    cc_error_free(&err);
-}
-```
-  </LangTabItem>
-</LanguageTabs>
-
-This returns a descriptive error explaining why the hypervisor isn't available (missing permissions, disabled in BIOS, etc.).
 
 ## Debug Options
 

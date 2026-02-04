@@ -31,6 +31,15 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// Create a new Snapshot from a handle.
+    ///
+    /// # Safety
+    ///
+    /// The handle must be valid and not already owned by another Snapshot.
+    pub(crate) fn from_handle(handle: CcSnapshot) -> Self {
+        Self { handle }
+    }
+
     /// Take a filesystem snapshot from an instance.
     ///
     /// Users should use [`Instance::snapshot()`](crate::Instance::snapshot) instead.

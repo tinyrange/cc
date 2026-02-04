@@ -212,3 +212,14 @@ pub struct CommandOutput {
     /// Exit code.
     pub exit_code: i32,
 }
+
+/// Options for Dockerfile builds.
+#[derive(Debug, Clone, Default)]
+pub struct DockerfileOptions {
+    /// Directory for COPY/ADD instructions (optional).
+    pub context_dir: Option<String>,
+    /// Cache directory for intermediate layers (required).
+    pub cache_dir: String,
+    /// Build arguments for ARG instructions.
+    pub build_args: std::collections::HashMap<String, String>,
+}

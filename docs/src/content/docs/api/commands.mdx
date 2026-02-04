@@ -484,7 +484,7 @@ const output = await cmd.combinedOutput();
 
 ### Pipes
 
-Get pipes for streaming I/O (Go API specific):
+Get pipes for streaming I/O. This Go-specific feature provides fine-grained control over command I/O through `io.Reader` and `io.Writer` interfaces. For other languages, use `set_stdin()` before running the command and capture output via `output()` or `combined_output()`.
 
 <LanguageTabs>
   <LangTabItem lang="go">
@@ -598,9 +598,9 @@ cc_cmd_set_env(cmd, "MY_VAR", "hello", &err);
   </LangTabItem>
 </LanguageTabs>
 
-## Working Directory
+## Working Directory (chdir)
 
-Set the working directory for the command:
+Set the working directory for the command. This is equivalent to running `chdir` before executing:
 
 <LanguageTabs>
   <LangTabItem lang="go">

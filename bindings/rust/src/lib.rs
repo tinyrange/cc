@@ -72,8 +72,8 @@ pub use instance::Instance;
 pub use net::{Conn, Listener};
 pub use snapshot::Snapshot;
 pub use types::{
-    flags, Capabilities, CommandOutput, DirEntry, DownloadProgress, FileInfo, ImageConfig,
-    InstanceOptions, MountConfig, PullOptions, PullPolicy, SeekWhence, SnapshotOptions,
+    flags, Capabilities, CommandOutput, DirEntry, DockerfileOptions, DownloadProgress, FileInfo,
+    ImageConfig, InstanceOptions, MountConfig, PullOptions, PullPolicy, SeekWhence, SnapshotOptions,
 };
 
 use std::ffi::CStr;

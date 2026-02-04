@@ -58,6 +58,50 @@ gcc -o myapp myapp.c -L/path/to/cc/build -lcc -I/path/to/cc/bindings/c
   </LangTabItem>
 </LanguageTabs>
 
+## Library Initialization
+
+Non-Go bindings require explicit initialization and shutdown. This is because the bindings use a shared library (`libcc`) that manages the hypervisor connection and internal state. Go's runtime handles this automatically.
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+// No initialization needed - Go handles this automatically
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+import cc
+
+cc.init()       # Initialize at program start
+# ... use the library ...
+cc.shutdown()   # Clean up at program end
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+cc::init()?;    // Initialize at program start
+// ... use the library ...
+cc::shutdown(); // Clean up at program end
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+import { init, shutdown } from '@crumblecracker/cc';
+
+init();       // Initialize at program start
+// ... use the library ...
+shutdown();   // Clean up at program end
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_init();    // Initialize at program start
+// ... use the library ...
+cc_shutdown(); // Clean up at program end
+```
+  </LangTabItem>
+</LanguageTabs>
+
 ## Design Principles
 
 **Mirror the standard library**: Filesystem operations work like your language's native I/O. Command execution works like subprocess APIs. Networking works like socket APIs. No new paradigms.
@@ -84,7 +128,6 @@ type Instance interface {
     Wait() error
     ID() string
     Done() <-chan error
-    GPU() GPU
 }
 ```
   </LangTabItem>
@@ -187,9 +230,47 @@ cc_error_code cc_net_listen(cc_instance inst, const char* network,
   </LangTabItem>
 </LanguageTabs>
 
+The Instance type embeds three interfaces for different operations. See [FS](#fs-filesystem), [Exec](#exec-command-execution), and [Net](#net-networking) below for details on each.
+
 ### FS (Filesystem)
 
-The filesystem interface mirrors standard library file operations:
+Read and write files inside the VM, just like local filesystem operations:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+data, _ := instance.ReadFile("/etc/os-release")
+instance.WriteFile("/tmp/hello.txt", []byte("Hello!"), 0644)
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+data = inst.read_file("/etc/os-release")
+inst.write_file("/tmp/hello.txt", b"Hello!")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let data = inst.read_file("/etc/os-release")?;
+inst.write_file("/tmp/hello.txt", b"Hello!", 0o644)?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const data = await inst.readFile('/etc/os-release');
+await inst.writeFile('/tmp/hello.txt', Buffer.from('Hello!'));
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+uint8_t* data; size_t len;
+cc_fs_read_file(inst, "/etc/os-release", &data, &len, &err);
+cc_fs_write_file(inst, "/tmp/hello.txt", (uint8_t*)"Hello!", 6, 0644, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+**Full interface:**
 
 <LanguageTabs>
   <LangTabItem lang="go">
@@ -268,7 +349,41 @@ cc_error_code cc_fs_read_dir(cc_instance inst, const char* path,
 
 ### Exec (Command Execution)
 
-The exec interface mirrors subprocess/process execution APIs:
+Run commands inside the VM and capture their output:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+output, _ := instance.Command("uname", "-a").Output()
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+output = inst.command("uname", "-a").output()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let output = inst.command("uname", &["-a"])?.output()?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const cmd = await inst.command('uname', '-a');
+const output = await cmd.output();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+const char* args[] = {"-a", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "uname", args, &cmd, &err);
+cc_cmd_output(cmd, &output, &len, &exit_code, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+**Full interface:**
 
 <LanguageTabs>
   <LangTabItem lang="go">
@@ -311,7 +426,39 @@ cc_error_code cc_cmd_new(cc_instance inst, const char* name,
 
 ### Net (Networking)
 
-The network interface mirrors socket APIs:
+Connect to guest services or accept connections from inside the VM:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+conn, _ := instance.Dial("tcp", "127.0.0.1:8080")  // Connect to guest service
+listener, _ := instance.Listen("tcp", ":9000")     // Accept connections from guest
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+listener = inst.listen("tcp", ":9000")  # Accept connections from guest
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let listener = inst.listen("tcp", ":9000")?;  // Accept connections from guest
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const listener = await inst.listen('tcp', ':9000');  // Accept connections from guest
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_listener listener;
+cc_net_listen(inst, "tcp", ":9000", &listener, &err);  // Accept connections from guest
+```
+  </LangTabItem>
+</LanguageTabs>
+
+**Full interface:**
 
 <LanguageTabs>
   <LangTabItem lang="go">
@@ -356,7 +503,7 @@ cc_error_code cc_conn_write(cc_conn c, const uint8_t* buf, size_t len, size_t* n
   </LangTabItem>
 </LanguageTabs>
 
-## Basic Workflow
+## Complete Example
 
 <LanguageTabs>
   <LangTabItem lang="go">

@@ -53,6 +53,43 @@ Containers share the host kernel. That's efficient, but it's also a security bou
   </LinkCard>
 </FeatureGrid>
 
+## Try It Now
+
+Get started in seconds with a single command:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```bash
+go get github.com/tinyrange/cc
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```bash
+# Build libcc and install the Python package
+./tools/build.go -bindings-c
+pip install -e /path/to/cc/bindings/python
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```bash
+# Add to Cargo.toml
+cargo add cc-vm --path /path/to/cc/bindings/rust
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```bash
+npm install @crumblecracker/cc
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```bash
+# Build the shared library
+./tools/build.go -bindings-c
+# Link: -L/path/to/cc/build -lcc
+```
+  </LangTabItem>
+</LanguageTabs>
+
 ## See It In Action
 
 <LanguageTabs>

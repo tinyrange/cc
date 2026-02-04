@@ -77,6 +77,9 @@ export const MsgSnapshotParent = 0x0601;
 export const MsgSnapshotClose = 0x0602;
 export const MsgSnapshotAsSource = 0x0603;
 
+// Dockerfile operations (0x07xx)
+export const MsgBuildDockerfile = 0x0700;
+
 // Response types (0xFFxx)
 export const MsgResponse = 0xff00;
 export const MsgError = 0xff01;

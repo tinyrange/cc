@@ -45,7 +45,6 @@ export default defineConfig({
 						{ label: 'OCI Images', slug: 'api/oci-images' },
 						{ label: 'Snapshots', slug: 'api/snapshots' },
 						{ label: 'Dockerfile', slug: 'api/dockerfile' },
-						{ label: 'GPU Support', slug: 'api/gpu' },
 					],
 				},
 				{
