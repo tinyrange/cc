@@ -9,10 +9,10 @@ import sys
 
 import pytest
 
-# Add the parent directory to the path so we can import cc
+# Add the parent directory to the path so we can import crumblecracker
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import cc
+import crumblecracker as cc
 
 
 class TestAPIVersion:

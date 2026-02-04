@@ -2,6 +2,15 @@
   "name": "@crumblecracker/cc",
   "version": "0.1.0",
   "description": "TypeScript bindings for the cc virtualization library",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tinyrange/cc.git",
+    "directory": "bindings/nodejs"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.mjs",
@@ -39,6 +48,12 @@
   "license": "GPL-3.0-only",
   "engines": {
     "node": ">=18.0.0"
+  },
+  "optionalDependencies": {
+    "@crumblecracker/cc-darwin-arm64": "0.1.0",
+    "@crumblecracker/cc-darwin-x64": "0.1.0",
+    "@crumblecracker/cc-linux-x64": "0.1.0",
+    "@crumblecracker/cc-linux-arm64": "0.1.0"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",

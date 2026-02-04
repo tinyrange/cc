@@ -26,13 +26,69 @@ export class HelperNotFoundError extends CCError {
 }
 
 /**
+ * Get the platform package name for the current OS/arch.
+ */
+function getPlatformPackageName(): string | null {
+  const platform = os.platform();
+  const arch = os.arch();
+
+  // Map Node.js os.arch() to our package names
+  const archMap: Record<string, string> = {
+    'arm64': 'arm64',
+    'x64': 'x64',
+  };
+
+  const platformMap: Record<string, string> = {
+    'darwin': 'darwin',
+    'linux': 'linux',
+  };
+
+  const mappedPlatform = platformMap[platform];
+  const mappedArch = archMap[arch];
+
+  if (!mappedPlatform || !mappedArch) {
+    return null;
+  }
+
+  return `@crumblecracker/cc-${mappedPlatform}-${mappedArch}`;
+}
+
+/**
+ * Try to find cc-helper in the npm platform package.
+ */
+function findHelperInPackage(): string | null {
+  const packageName = getPlatformPackageName();
+  if (!packageName) {
+    return null;
+  }
+
+  try {
+    // Use require.resolve to find the package, then navigate to the bin directory
+    // We resolve the package.json to get the package root
+    const packageJsonPath = require.resolve(`${packageName}/package.json`);
+    const packageDir = path.dirname(packageJsonPath);
+    const helperName = os.platform() === 'win32' ? 'cc-helper.exe' : 'cc-helper';
+    const helperPath = path.join(packageDir, 'bin', helperName);
+
+    if (fs.existsSync(helperPath)) {
+      return helperPath;
+    }
+  } catch {
+    // Package not installed
+  }
+
+  return null;
+}
+
+/**
  * Find the cc-helper binary.
  *
  * Search order:
  * 1. CC_HELPER_PATH env
- * 2. Adjacent to lib (same dir as bindings)
- * 3. Platform dirs: ~/Library/Application Support/cc/bin/cc-helper (macOS)
- * 4. PATH
+ * 2. Bundled npm platform package (@crumblecracker/cc-{platform}-{arch})
+ * 3. Adjacent to lib (same dir as bindings)
+ * 4. Platform dirs: ~/Library/Application Support/cc/bin/cc-helper (macOS)
+ * 5. PATH
  */
 export function findHelper(libPath?: string): { path: string; searched: string[] } | { path: null; searched: string[] } {
   const searched: string[] = [];
@@ -46,7 +102,17 @@ export function findHelper(libPath?: string): { path: string; searched: string[]
     }
   }
 
-  // 2. Adjacent to lib path
+  // 2. Bundled npm platform package
+  const packagePath = findHelperInPackage();
+  if (packagePath) {
+    return { path: packagePath, searched: [] };
+  }
+  const packageName = getPlatformPackageName();
+  if (packageName) {
+    searched.push(`${packageName}/bin/cc-helper`);
+  }
+
+  // 3. Adjacent to lib path
   if (libPath) {
     const dir = path.dirname(libPath);
     const helperPath = path.join(dir, 'cc-helper');

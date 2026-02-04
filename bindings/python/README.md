@@ -1,10 +1,18 @@
-# cc Python Bindings
+# CrumbleCracker Python Bindings
 
-Python bindings for the cc virtualization library, providing a Pythonic interface to cc's virtualization primitives.
+Python bindings for the CrumbleCracker virtualization library, providing a Pythonic interface to cc's virtualization primitives.
 
 ## Installation
 
-### Prerequisites
+### From PyPI (Recommended)
+
+```bash
+pip install crumblecracker
+```
+
+The PyPI package includes the native library (`libcc.so`/`libcc.dylib`) for supported platforms.
+
+### From Source
 
 1. Build the `libcc` shared library:
    ```bash
@@ -17,16 +25,15 @@ Python bindings for the cc virtualization library, providing a Pythonic interfac
    export LIBCC_PATH=/path/to/cc/build/libcc.dylib
    ```
 
-### Install the Package
-
-```bash
-pip install -e /path/to/cc/bindings/python
-```
+3. Install the package:
+   ```bash
+   pip install -e /path/to/cc/bindings/python
+   ```
 
 ## Quick Start
 
 ```python
-import cc
+import crumblecracker as cc
 
 # Initialize the library
 cc.init()

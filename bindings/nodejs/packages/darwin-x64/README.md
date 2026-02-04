@@ -1,0 +1,13 @@
+# @crumblecracker/cc-darwin-x64
+
+Platform-specific binary package for `@crumblecracker/cc` on macOS x64 (Intel).
+
+This package is automatically installed as an optional dependency of `@crumblecracker/cc`. You should not need to install it directly.
+
+## Contents
+
+- `bin/cc-helper` - The cc-helper binary for macOS x64
+
+## License
+
+GPL-3.0-only

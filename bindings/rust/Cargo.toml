@@ -5,10 +5,19 @@ edition = "2021"
 authors = ["cc contributors"]
 description = "Rust bindings for the cc virtualization library"
 license = "MIT"
-repository = "https://github.com/example/cc"
+repository = "https://github.com/tinyrange/cc"
 readme = "README.md"
 keywords = ["virtualization", "vm", "container", "oci"]
 categories = ["virtualization", "api-bindings"]
+links = "cc"
+
+# Build requires Go toolchain - see README for details
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata]
+# IMPORTANT: Building this crate requires Go 1.21+ installed.
+# See README.md for build instructions.
 
 [lib]
 name = "cc"

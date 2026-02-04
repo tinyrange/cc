@@ -2,9 +2,39 @@
 
 Rust bindings for the cc virtualization library, providing a safe Rust interface to cc's virtualization primitives.
 
+## Build Requirements
+
+**IMPORTANT**: Building this crate requires Go 1.21+ to compile the native `libcc` library.
+
+| Requirement | Version | Notes |
+|-------------|---------|-------|
+| Rust | 1.70+ | Stable toolchain |
+| Go | 1.21+ | Required to build libcc |
+
+The build.rs script will automatically compile libcc using Go if `LIBCC_PATH` is not set.
+
 ## Installation
 
-### Prerequisites
+### From crates.io
+
+```toml
+[dependencies]
+cc-vm = "0.1"
+```
+
+Ensure Go is installed and available in your PATH:
+```bash
+# macOS
+brew install go
+
+# Ubuntu/Debian
+sudo apt install golang
+
+# Verify installation
+go version
+```
+
+### From Source
 
 1. Build the `libcc` shared library:
    ```bash
@@ -17,12 +47,11 @@ Rust bindings for the cc virtualization library, providing a safe Rust interface
    export LIBCC_PATH=/path/to/cc/build/libcc.dylib
    ```
 
-### Add to Cargo.toml
-
-```toml
-[dependencies]
-cc-vm = { path = "/path/to/cc/bindings/rust" }
-```
+3. Add to Cargo.toml:
+   ```toml
+   [dependencies]
+   cc-vm = { path = "/path/to/cc/bindings/rust" }
+   ```
 
 ## Quick Start
 
