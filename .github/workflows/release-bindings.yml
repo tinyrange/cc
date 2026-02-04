@@ -270,10 +270,13 @@ jobs:
           name: wheel-${{ matrix.os }}-${{ matrix.arch }}
           path: bindings/python/dist/*.whl
 
-  # Publish all wheels to PyPI
+  # Publish all wheels to PyPI (using OIDC trusted publishing)
   publish-pypi:
     needs: [validate-version, build-python-wheels]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # Required for PyPI OIDC trusted publishing
     steps:
       - uses: actions/checkout@v4
 
@@ -298,7 +301,6 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
-          password: ${{ secrets.PYPI_API_TOKEN }}
 
   # Rust publishing
   publish-cargo:
