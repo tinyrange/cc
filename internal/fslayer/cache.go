@@ -32,7 +32,7 @@ func SnapshotOpKey(layerHash string) string {
 }
 
 // RunOpKey generates an operation key for a Run operation.
-func RunOpKey(cmd []string, env []string, workDir string) string {
+func RunOpKey(cmd []string, env []string, workDir string, user string) string {
 	h := sha256.New()
 	h.Write([]byte("run:"))
 	for _, c := range cmd {
@@ -46,6 +46,8 @@ func RunOpKey(cmd []string, env []string, workDir string) string {
 	}
 	h.Write([]byte{1}) // Separator
 	h.Write([]byte(workDir))
+	h.Write([]byte{1}) // Separator
+	h.Write([]byte(user))
 	return hex.EncodeToString(h.Sum(nil))[:32]
 }
 

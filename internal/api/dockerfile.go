@@ -22,9 +22,10 @@ type DockerfileRuntimeConfig = dockerfile.RuntimeConfig
 
 // dockerfileConfig holds configuration for building a Dockerfile.
 type dockerfileConfig struct {
-	context   dockerfile.BuildContext
-	buildArgs map[string]string
-	cacheDir  string
+	context      dockerfile.BuildContext
+	buildArgs    map[string]string
+	cacheDir     string
+	buildOptions []Option
 }
 
 // dockerfileOption implements DockerfileOption using a function.
@@ -84,6 +85,9 @@ func parseDockerfileOptions(opts []DockerfileOption) *dockerfileConfig {
 		if o, ok := opt.(*dockerfileOption); ok {
 			o.apply(cfg)
 		}
+		if r, ok := opt.(Option); ok {
+			cfg.buildOptions = append(cfg.buildOptions, r)
+		}
 	}
 	return cfg
 }
@@ -141,6 +145,10 @@ func (a *cmdAdapter) SetDir(dir string) dockerfile.Cmd {
 	return &cmdAdapter{cmd: a.cmd.SetDir(dir)}
 }
 
+func (a *cmdAdapter) SetUser(user string) dockerfile.Cmd {
+	return &cmdAdapter{cmd: a.cmd.SetUser(user)}
+}
+
 // BuildDockerfileSource builds an InstanceSource from Dockerfile content.
 // It parses the Dockerfile, converts instructions to filesystem operations,
 // and executes them to produce a cached filesystem snapshot.
@@ -173,6 +181,8 @@ func BuildDockerfileSource(ctx context.Context, dockerfileContent []byte, client
 
 	// Create factory and execute
 	factory := NewFilesystemSnapshotFactory(client, cfg.cacheDir).From(result.ImageRef)
+
+	factory.SetBuildOptions(cfg.buildOptions...)
 
 	// Set initial environment and workdir
 	if len(result.Env) > 0 {

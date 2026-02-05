@@ -27,6 +27,9 @@ quest:
 codesign:
     gobuild internal/cmd/codesign -o $(OUTPUT)/codesign
 
+agents:
+    gobuild cmd/agents -o $(OUTPUT)/agents -entitlements $(ENTITLEMENTS)
+
 # ============================================================================
 # Desktop App
 # ============================================================================

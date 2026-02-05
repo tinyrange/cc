@@ -916,6 +916,11 @@ func (c *cmdProxy) SetStderr(w io.Writer) cc.Cmd {
 	return c
 }
 
+func (c *cmdProxy) SetUser(user string) cc.Cmd {
+	// Not supported over IPC - silently ignore
+	return c
+}
+
 // listenerProxy implements net.Listener over IPC.
 type listenerProxy struct {
 	client *ipc.Client

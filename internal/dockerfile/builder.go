@@ -26,6 +26,7 @@ type Cmd interface {
 	Run() error
 	SetEnv(env []string) Cmd
 	SetDir(dir string) Cmd
+	SetUser(user string) Cmd
 }
 
 // FSLayerOp represents an operation in the filesystem snapshot factory.
@@ -236,6 +237,7 @@ func (b *Builder) processRun(instr Instruction, result *BuildResult, vars map[st
 		cmd:     cmd,
 		env:     append([]string{}, result.Env...),
 		workDir: result.WorkDir,
+		user:    result.RuntimeConfig.User,
 	}
 	result.Ops = append(result.Ops, op)
 	return nil
@@ -433,10 +435,11 @@ type runOp struct {
 	cmd     []string
 	env     []string
 	workDir string
+	user    string
 }
 
 func (o *runOp) CacheKey() string {
-	return fslayer.RunOpKey(o.cmd, o.env, o.workDir)
+	return fslayer.RunOpKey(o.cmd, o.env, o.workDir, o.user)
 }
 
 func (o *runOp) Apply(ctx context.Context, inst Instance) error {
@@ -446,6 +449,9 @@ func (o *runOp) Apply(ctx context.Context, inst Instance) error {
 	}
 	if o.workDir != "" {
 		cmd = cmd.SetDir(o.workDir)
+	}
+	if o.user != "" {
+		cmd = cmd.SetUser(o.user)
 	}
 	return cmd.Run()
 }

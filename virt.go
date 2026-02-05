@@ -108,15 +108,21 @@ var (
 // Instance Options
 // -----------------------------------------------------------------------------
 
+type DockerAndRuntimeOption interface {
+	Option
+	DockerfileOption
+}
+
 // WithMemoryMB sets the memory size in megabytes.
-func WithMemoryMB(size uint64) Option {
+func WithMemoryMB(size uint64) DockerAndRuntimeOption {
 	return &memoryOption{sizeMB: size}
 }
 
 type memoryOption struct{ sizeMB uint64 }
 
-func (*memoryOption) IsOption()        {}
-func (o *memoryOption) SizeMB() uint64 { return o.sizeMB }
+func (*memoryOption) IsOption()           {}
+func (*memoryOption) IsDockerfileOption() {}
+func (o *memoryOption) SizeMB() uint64    { return o.sizeMB }
 
 // WithTimeout sets a maximum lifetime for the instance. After this duration,
 // the instance is forcibly terminated.
