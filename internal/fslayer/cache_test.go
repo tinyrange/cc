@@ -63,28 +63,34 @@ func TestSnapshotOpKey(t *testing.T) {
 }
 
 func TestRunOpKey(t *testing.T) {
-	key1 := RunOpKey([]string{"echo", "hello"}, []string{"FOO=bar"}, "/tmp")
-	key2 := RunOpKey([]string{"echo", "hello"}, []string{"FOO=bar"}, "/tmp")
+	key1 := RunOpKey([]string{"echo", "hello"}, []string{"FOO=bar"}, "/tmp", "root")
+	key2 := RunOpKey([]string{"echo", "hello"}, []string{"FOO=bar"}, "/tmp", "root")
 	if key1 != key2 {
 		t.Errorf("RunOpKey not deterministic: %s != %s", key1, key2)
 	}
 
 	// Different command should produce different key
-	key3 := RunOpKey([]string{"echo", "world"}, []string{"FOO=bar"}, "/tmp")
+	key3 := RunOpKey([]string{"echo", "world"}, []string{"FOO=bar"}, "/tmp", "root")
 	if key1 == key3 {
 		t.Error("Different commands should produce different keys")
 	}
 
 	// Different env should produce different key
-	key4 := RunOpKey([]string{"echo", "hello"}, []string{"FOO=baz"}, "/tmp")
+	key4 := RunOpKey([]string{"echo", "hello"}, []string{"FOO=baz"}, "/tmp", "root")
 	if key1 == key4 {
 		t.Error("Different env should produce different keys")
 	}
 
 	// Different workdir should produce different key
-	key5 := RunOpKey([]string{"echo", "hello"}, []string{"FOO=bar"}, "/home")
+	key5 := RunOpKey([]string{"echo", "hello"}, []string{"FOO=bar"}, "/home", "root")
 	if key1 == key5 {
 		t.Error("Different workdir should produce different keys")
+	}
+
+	// Different user should produce different key
+	key6 := RunOpKey([]string{"echo", "hello"}, []string{"FOO=bar"}, "/tmp", "nobody")
+	if key1 == key6 {
+		t.Error("Different user should produce different keys")
 	}
 }
 
@@ -117,8 +123,8 @@ func TestCopyOpKey(t *testing.T) {
 func TestKeyChaining(t *testing.T) {
 	// Simulate a chain of operations
 	base := BaseKey("alpine:latest", "amd64")
-	after1 := DeriveKey(base, RunOpKey([]string{"apk", "add", "curl"}, nil, "/"))
-	after2 := DeriveKey(after1, RunOpKey([]string{"apk", "add", "vim"}, nil, "/"))
+	after1 := DeriveKey(base, RunOpKey([]string{"apk", "add", "curl"}, nil, "/", "root"))
+	after2 := DeriveKey(after1, RunOpKey([]string{"apk", "add", "vim"}, nil, "/", "root"))
 
 	// Keys should all be different
 	if base == after1 {
@@ -133,8 +139,8 @@ func TestKeyChaining(t *testing.T) {
 
 	// Same chain should be reproducible
 	base2 := BaseKey("alpine:latest", "amd64")
-	after1b := DeriveKey(base2, RunOpKey([]string{"apk", "add", "curl"}, nil, "/"))
-	after2b := DeriveKey(after1b, RunOpKey([]string{"apk", "add", "vim"}, nil, "/"))
+	after1b := DeriveKey(base2, RunOpKey([]string{"apk", "add", "curl"}, nil, "/", "root"))
+	after2b := DeriveKey(after1b, RunOpKey([]string{"apk", "add", "vim"}, nil, "/", "root"))
 
 	if after2 != after2b {
 		t.Errorf("Same chain should produce same final key: %s != %s", after2, after2b)

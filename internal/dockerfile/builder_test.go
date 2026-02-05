@@ -669,6 +669,10 @@ func (c *mockCmd) SetDir(dir string) Cmd {
 	return c
 }
 
+func (c *mockCmd) SetUser(user string) Cmd {
+	return c
+}
+
 func TestRunOpApply(t *testing.T) {
 	op := &runOp{
 		cmd:     []string{"/bin/sh", "-c", "echo hello"},
