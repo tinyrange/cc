@@ -220,6 +220,13 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	// clear immediate_exit in case it was set
 	run.immediate_exit = 0
 
+	// Check if context is already cancelled before running.
+	// This handles the race where context was cancelled between iterations:
+	// the signal was delivered but we cleared immediate_exit above.
+	if usingContext && ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	debug.Writef("kvm-arm64.Run run", "vCPU %d running", v.id)
 
 	v.rec.Record(tsKvmHostTime)
@@ -356,8 +363,8 @@ func (hv *hypervisor) archPostVCPUInit(vm *virtualMachine, config hv.VMConfig) e
 	return nil
 }
 
-func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int) error {
-	debug.Writef("kvm hypervisor archVCPUInit", "vcpuFd: %d", vcpuFd)
+func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int, vcpuID int) error {
+	debug.Writef("kvm hypervisor archVCPUInit", "vcpuFd: %d vcpuID: %d", vcpuFd, vcpuID)
 
 	init, err := armPreferredTarget(vm.vmFd)
 	if err != nil {

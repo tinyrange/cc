@@ -19,6 +19,7 @@ import (
 type Instance interface {
 	CommandContext(ctx context.Context, name string, args ...string) Cmd
 	WriteFile(name string, data []byte, perm fs.FileMode) error
+	Stat(name string) (fs.FileInfo, error)
 }
 
 // Cmd is a minimal interface for command execution.
@@ -91,9 +92,10 @@ func (c *DirBuildContext) Stat(path string) (os.FileInfo, error) {
 
 // Builder converts a parsed Dockerfile into filesystem layer operations.
 type Builder struct {
-	dockerfile *Dockerfile
-	buildArgs  map[string]string
-	context    BuildContext
+	dockerfile   *Dockerfile
+	buildArgs    map[string]string
+	context      BuildContext
+	baseImageEnv []string // Environment from base image
 }
 
 // NewBuilder creates a new Builder for the given Dockerfile.
@@ -114,6 +116,47 @@ func (b *Builder) WithBuildArg(key, value string) *Builder {
 func (b *Builder) WithContext(ctx BuildContext) *Builder {
 	b.context = ctx
 	return b
+}
+
+// WithBaseImageEnv sets the environment from the base image.
+// This allows ENV instructions to reference variables from the base image
+// (e.g., ENV PATH="$PATH:/opt/bin").
+func (b *Builder) WithBaseImageEnv(env []string) *Builder {
+	b.baseImageEnv = env
+	return b
+}
+
+// ResolveImageRef resolves the FROM image reference using build args.
+// This can be called before Build() to determine which image to pull,
+// so the caller can extract the base image's environment.
+func (b *Builder) ResolveImageRef() (string, error) {
+	if len(b.dockerfile.Stages) == 0 {
+		return "", ErrMissingFrom
+	}
+
+	// For now, only support single-stage builds (last stage)
+	stage := b.dockerfile.Stages[len(b.dockerfile.Stages)-1]
+
+	// Build variable map from global ARGs and build args (NOT ENV or base image env)
+	vars := make(map[string]string)
+	for _, arg := range b.dockerfile.Args {
+		vars[arg.Key] = arg.Value
+	}
+	for k, v := range b.buildArgs {
+		vars[k] = v
+	}
+
+	// Expand the image reference
+	imageRef := stage.From.Image
+	if stage.From.ImageTemplate != "" {
+		expanded, err := ExpandVariables(stage.From.ImageTemplate, vars)
+		if err != nil {
+			return "", &BuildError{Op: "FROM", Message: "variable expansion failed", Err: err}
+		}
+		imageRef = expanded
+	}
+
+	return imageRef, nil
 }
 
 // BuildResult contains the result of building a Dockerfile.
@@ -139,19 +182,16 @@ func (b *Builder) Build() (*BuildResult, error) {
 	// For now, only support single-stage builds (last stage)
 	stage := b.dockerfile.Stages[len(b.dockerfile.Stages)-1]
 
-	// Initialize variables from global ARGs and build args
+	// Initialize variables for FROM expansion (only ARG/build args, per Docker spec)
 	vars := make(map[string]string)
-	// First, set defaults from global ARGs
 	for _, arg := range b.dockerfile.Args {
 		vars[arg.Key] = arg.Value
 	}
-	// Then, override with provided build args
 	for k, v := range b.buildArgs {
 		vars[k] = v
 	}
 
-	// Re-expand the image reference with the complete variable set
-	// This allows build args to override ARG defaults
+	// Expand the image reference (FROM can only use ARG/build args, not ENV)
 	imageRef := stage.From.Image
 	if stage.From.ImageTemplate != "" {
 		expanded, err := ExpandVariables(stage.From.ImageTemplate, vars)
@@ -159,6 +199,28 @@ func (b *Builder) Build() (*BuildResult, error) {
 			return nil, &BuildError{Op: "FROM", Message: "variable expansion failed", Err: err}
 		}
 		imageRef = expanded
+	}
+
+	// Now add base image environment for subsequent instruction processing.
+	// Precedence: base image env (lowest) < ARG defaults < build args (highest)
+	// We rebuild vars with proper precedence for ENV expansion.
+	vars = make(map[string]string)
+
+	// 1. Base image environment (lowest precedence)
+	for _, env := range b.baseImageEnv {
+		if idx := findEq(env); idx != -1 {
+			vars[env[:idx]] = env[idx+1:]
+		}
+	}
+
+	// 2. Global ARG defaults
+	for _, arg := range b.dockerfile.Args {
+		vars[arg.Key] = arg.Value
+	}
+
+	// 3. Provided build args (highest precedence)
+	for k, v := range b.buildArgs {
+		vars[k] = v
 	}
 
 	result := &BuildResult{
@@ -224,9 +286,11 @@ func (b *Builder) processRun(instr Instruction, result *BuildResult, vars map[st
 		cmd = append(result.RuntimeConfig.Shell, instr.Args[0])
 	}
 
-	// Expand variables in command
+	// Expand variables in command, preserving undefined variables for shell expansion.
+	// This allows shell variables set within the same RUN command (e.g., var=value && echo $var)
+	// to be passed through to the shell rather than being expanded to empty string.
 	for i, arg := range cmd {
-		expanded, err := ExpandVariables(arg, vars)
+		expanded, err := ExpandVariablesPreserve(arg, vars)
 		if err != nil {
 			return &BuildError{Op: "RUN", Line: instr.Line, Message: "variable expansion failed", Err: err}
 		}
@@ -290,16 +354,27 @@ func (b *Builder) processCopy(instr Instruction, result *BuildResult, vars map[s
 		h := sha256.Sum256(data)
 		contentHash := hex.EncodeToString(h[:])
 
-		// Determine final destination path (use path package for Linux-style container paths)
-		finalDst := dst
+		// Determine destination path handling:
+		// - Multiple sources or trailing slash: append filename now (directory is explicit)
+		// - Single source without trailing slash: defer directory check to apply time
+		var finalDst string
+		var srcBasename string
+
 		if len(srcs) > 1 || isDir(dst) {
-			// Multiple sources or directory destination: append filename
+			// Multiple sources or explicit directory destination: append filename immediately
 			finalDst = path.Join(dst, path.Base(src))
+			srcBasename = "" // Already resolved
+		} else {
+			// Single source without trailing slash: might be file-to-file or file-to-dir
+			// Defer directory detection to apply time when the container filesystem exists
+			finalDst = dst
+			srcBasename = path.Base(src)
 		}
 
 		op := &readerOp{
 			data:        data,
 			dst:         finalDst,
+			srcBasename: srcBasename,
 			contentHash: contentHash,
 			chown:       instr.Flags["chown"],
 		}
@@ -317,10 +392,20 @@ func (b *Builder) processAdd(instr Instruction, result *BuildResult, vars map[st
 
 func (b *Builder) processEnv(instr Instruction, result *BuildResult, vars map[string]string) error {
 	for _, kv := range instr.Args {
-		result.Env = append(result.Env, kv)
-		// Also add to vars for subsequent expansion
 		if idx := findEq(kv); idx != -1 {
-			vars[kv[:idx]] = kv[idx+1:]
+			key := kv[:idx]
+			value := kv[idx+1:]
+			// Expand variables in the value using current vars (Docker behavior)
+			expanded, err := ExpandVariables(value, vars)
+			if err != nil {
+				return &BuildError{Op: "ENV", Line: instr.Line, Message: "variable expansion failed", Err: err}
+			}
+			// Store expanded value for subsequent expansion
+			vars[key] = expanded
+			// Add to result.Env with expanded value
+			result.Env = append(result.Env, key+"="+expanded)
+		} else {
+			result.Env = append(result.Env, kv)
 		}
 	}
 	return nil
@@ -460,6 +545,7 @@ func (o *runOp) Apply(ctx context.Context, inst Instance) error {
 type readerOp struct {
 	data        []byte
 	dst         string
+	srcBasename string // Source basename for directory destination handling at apply time
 	contentHash string
 	chown       string // Optional --chown flag value
 }
@@ -469,9 +555,19 @@ func (o *readerOp) CacheKey() string {
 }
 
 func (o *readerOp) Apply(ctx context.Context, inst Instance) error {
+	dst := o.dst
+
+	// If srcBasename is set, we need to check if dst is an existing directory
+	// and append the source filename if so.
+	if o.srcBasename != "" {
+		if info, err := inst.Stat(dst); err == nil && info.IsDir() {
+			dst = path.Join(dst, o.srcBasename)
+		}
+	}
+
 	// Write file
-	if err := inst.WriteFile(o.dst, o.data, 0o644); err != nil {
-		return fmt.Errorf("write %s: %w", o.dst, err)
+	if err := inst.WriteFile(dst, o.data, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", dst, err)
 	}
 
 	// Handle --chown if specified

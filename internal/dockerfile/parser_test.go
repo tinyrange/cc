@@ -608,6 +608,81 @@ FOOBAR something
 	}
 }
 
+func TestParseRunWithCommentInContinuation(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name: "comment without backslash in continuation",
+			input: `FROM alpine
+RUN echo "test" \
+    && echo "more" \
+    # This comment doesn't end with backslash
+    && echo "end"
+`,
+		},
+		{
+			name: "multiple comments in continuation",
+			input: `FROM alpine
+RUN echo "start" \
+    # comment 1
+    && echo "middle" \
+    # comment 2
+    && echo "end"
+`,
+		},
+		{
+			name: "comment with backslash still works",
+			input: `FROM alpine
+RUN echo "test" \
+    # This comment DOES end with backslash \
+    && echo "end"
+`,
+		},
+		{
+			name: "comment at start of continuation",
+			input: `FROM alpine
+RUN echo "test" \
+    # comment at start
+    && echo "end"
+`,
+		},
+		{
+			name: "empty line in continuation",
+			input: `FROM alpine
+RUN echo "test" \
+
+    && echo "end"
+`,
+		},
+		{
+			name: "empty line and comment in continuation",
+			input: `FROM alpine
+RUN echo "test" \
+
+    # comment after empty line
+    && echo "end"
+`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			df, err := Parse([]byte(tc.input))
+			if err != nil {
+				t.Fatalf("Parse failed: %v", err)
+			}
+			if len(df.Stages) != 1 {
+				t.Errorf("expected 1 stage, got %d", len(df.Stages))
+			}
+			if len(df.Stages[0].Instructions) != 1 {
+				t.Errorf("expected 1 RUN instruction, got %d", len(df.Stages[0].Instructions))
+			}
+		})
+	}
+}
+
 func TestParseRealDockerfile(t *testing.T) {
 	// Test parsing a real Dockerfile from the tests directory
 	input := `FROM alpine:latest

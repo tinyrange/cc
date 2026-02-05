@@ -69,6 +69,8 @@ func defaultE820Map(memStart, memEnd uint64) []E820Entry {
 		isaMemEnd       = 0x0009f000
 		biosRegionStart = 0x000f0000
 		biosRegionEnd   = 0x00100000
+		pciHoleStart    = 0xC0000000  // 3GB - start of PCI/MMIO hole
+		highMemoryStart = 0x100000000 // 4GB - start of high memory
 	)
 
 	memStart = alignDown(memStart, pageSize)
@@ -92,6 +94,7 @@ func defaultE820Map(memStart, memEnd uint64) []E820Entry {
 
 	var entries []E820Entry
 
+	// Entry 1: Low memory (0 - 640KB)
 	lowEnd := min(memEnd, isaMemEnd)
 	if lowEnd > memStart {
 		entries = append(entries, E820Entry{
@@ -101,6 +104,7 @@ func defaultE820Map(memStart, memEnd uint64) []E820Entry {
 		})
 	}
 
+	// Entry 2: ISA/BIOS reserved region (640KB - 1MB) - marked as reserved
 	if memEnd > isaMemEnd {
 		reserveStart := max(isaMemEnd, memStart)
 		reserveStart = alignDown(reserveStart, pageSize)
@@ -115,12 +119,27 @@ func defaultE820Map(memStart, memEnd uint64) []E820Entry {
 		}
 	}
 
-	highStart := max(biosRegionEnd, memStart)
-	highStart = alignUp(highStart, pageSize)
-	if memEnd > highStart {
+	// Entry 3: Extended memory (1MB - 3GB or end of low memory)
+	extendedStart := max(biosRegionEnd, memStart)
+	extendedStart = alignUp(extendedStart, pageSize)
+	extendedEnd := min(memEnd, pciHoleStart)
+	if extendedEnd > extendedStart {
 		entries = append(entries, E820Entry{
-			Addr: highStart,
-			Size: memEnd - highStart,
+			Addr: extendedStart,
+			Size: extendedEnd - extendedStart,
+			Type: 1,
+		})
+	}
+
+	// Entry 4: High memory above 4GB (if memory extends past PCI hole)
+	// The PCI hole (3GB-4GB) is NOT reported - it's reserved for MMIO.
+	// Memory that would have been in the PCI hole is relocated above 4GB.
+	if memEnd > pciHoleStart {
+		// Memory past the PCI hole start is relocated above 4GB
+		highMemSize := memEnd - pciHoleStart
+		entries = append(entries, E820Entry{
+			Addr: highMemoryStart,
+			Size: highMemSize,
 			Type: 1,
 		})
 	}
@@ -233,6 +252,10 @@ func (k *KernelImage) prepareBzImage(vm hv.VirtualMachine, opts BootOptions) (*B
 			if opts.StackTopGPA != 0 {
 				top = opts.StackTopGPA
 			}
+			// Respect the kernel's maximum initrd address limit
+			if max := uint64(k.Header.InitrdAddrMax); max != 0 && top > max+1 {
+				top = max + 1
+			}
 			if top <= memStart+initrdSize {
 				return nil, fmt.Errorf("not enough space to place initrd (%d bytes) below %#x", len(opts.Initrd), top)
 			}
@@ -331,6 +354,10 @@ func (k *KernelImage) prepareELF(vm hv.VirtualMachine, opts BootOptions) (*BootP
 			top := memEnd
 			if opts.StackTopGPA != 0 {
 				top = opts.StackTopGPA
+			}
+			// Respect the kernel's maximum initrd address limit
+			if max := uint64(k.Header.InitrdAddrMax); max != 0 && top > max+1 {
+				top = max + 1
 			}
 			if top <= memStart+initrdSize {
 				return nil, fmt.Errorf("not enough space to place initrd (%d bytes) below %#x", len(opts.Initrd), top)

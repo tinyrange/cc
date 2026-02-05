@@ -108,7 +108,10 @@ func run() error {
 
 	var imageRef string
 	var cmd []string
-	if len(args) > 0 {
+	if *dockerfile != "" {
+		// For -dockerfile mode, all positional args are the command
+		cmd = args
+	} else if len(args) > 0 {
 		imageRef = args[0]
 		if len(args) > 1 {
 			cmd = args[1:]

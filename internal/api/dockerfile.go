@@ -120,6 +120,10 @@ func (a *instanceAdapter) WriteFile(name string, data []byte, perm os.FileMode) 
 	return a.inst.WriteFile(name, data, perm)
 }
 
+func (a *instanceAdapter) Stat(name string) (os.FileInfo, error) {
+	return a.inst.Stat(name)
+}
+
 // cmdAdapter adapts api.Cmd to dockerfile.Cmd.
 type cmdAdapter struct {
 	cmd Cmd
@@ -165,7 +169,7 @@ func BuildDockerfileSource(ctx context.Context, dockerfileContent []byte, client
 		return nil, fmt.Errorf("parse dockerfile: %w", err)
 	}
 
-	// Build operations
+	// Create builder and configure with build args
 	builder := dockerfile.NewBuilder(df)
 	if cfg.context != nil {
 		builder = builder.WithContext(cfg.context)
@@ -174,12 +178,30 @@ func BuildDockerfileSource(ctx context.Context, dockerfileContent []byte, client
 		builder = builder.WithBuildArg(k, v)
 	}
 
+	// Resolve the base image reference (this only uses ARG/build args, not ENV)
+	imageRef, err := builder.ResolveImageRef()
+	if err != nil {
+		return nil, fmt.Errorf("resolve image ref: %w", err)
+	}
+
+	// Pull the base image to get its environment
+	baseSource, err := client.Pull(ctx, imageRef)
+	if err != nil {
+		return nil, fmt.Errorf("pull base image %s: %w", imageRef, err)
+	}
+
+	// Extract environment from base image and pass to builder
+	if baseCfg := SourceConfig(baseSource); baseCfg != nil {
+		builder = builder.WithBaseImageEnv(baseCfg.Env)
+	}
+
+	// Build operations (now with base image env available for variable expansion)
 	result, err := builder.Build()
 	if err != nil {
 		return nil, fmt.Errorf("build dockerfile: %w", err)
 	}
 
-	// Create factory and execute
+	// Create factory and execute (use the already-pulled base image)
 	factory := NewFilesystemSnapshotFactory(client, cfg.cacheDir).From(result.ImageRef)
 
 	factory.SetBuildOptions(cfg.buildOptions...)
