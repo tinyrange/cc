@@ -2,13 +2,10 @@ package testrunner
 
 import (
 	"fmt"
-	"os"
 	"reflect"
 	"strings"
 	"sync"
 	"time"
-
-	"golang.org/x/term"
 )
 
 // ANSI color codes
@@ -41,10 +38,10 @@ type Output struct {
 	spinnerDone chan struct{}
 }
 
-// NewOutput creates a new Output instance, detecting terminal capabilities.
+// NewOutput creates a new Output instance.
 func NewOutput() *Output {
 	return &Output{
-		isTTY: term.IsTerminal(int(os.Stdout.Fd())),
+		isTTY: false, // Disable fancy terminal output to avoid hangs
 	}
 }
 
