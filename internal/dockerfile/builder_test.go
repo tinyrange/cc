@@ -99,6 +99,178 @@ RUN echo $PATH
 	}
 }
 
+func TestBuildWithBaseImageEnv(t *testing.T) {
+	// Test that ENV PATH="$PATH:/opt/bin" correctly expands when base image
+	// has PATH set. This is the fix for the neurocontainers bug where
+	// $PATH expanded to empty string because base image env wasn't included.
+	dockerfile := []byte(`FROM ubuntu:22.04
+ENV PATH="/opt/miniconda/bin:$PATH"
+RUN which apt-get
+`)
+
+	df, err := Parse(dockerfile)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	// Simulate base image environment (like ubuntu:22.04)
+	baseEnv := []string{
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+	}
+
+	builder := NewBuilder(df).WithBaseImageEnv(baseEnv)
+	result, err := builder.Build()
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+
+	// Should have 1 ENV var
+	if len(result.Env) != 1 {
+		t.Fatalf("expected 1 env var, got %d: %v", len(result.Env), result.Env)
+	}
+
+	// PATH should include both the new path and the base image path
+	expected := "PATH=/opt/miniconda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	if result.Env[0] != expected {
+		t.Errorf("expected %s, got %s", expected, result.Env[0])
+	}
+}
+
+func TestBuildWithBaseImageEnvPrecedence(t *testing.T) {
+	// Test precedence: base image env < global ARG < build args
+	dockerfile := []byte(`ARG VERSION=default
+FROM alpine:$VERSION
+ENV MY_VAR="value is $MY_VAR"
+`)
+
+	df, err := Parse(dockerfile)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	// Simulate base image having MY_VAR set
+	baseEnv := []string{
+		"MY_VAR=from_base",
+	}
+
+	builder := NewBuilder(df).WithBaseImageEnv(baseEnv)
+	result, err := builder.Build()
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+
+	// ENV should expand $MY_VAR using base image value
+	if len(result.Env) != 1 {
+		t.Fatalf("expected 1 env var, got %d: %v", len(result.Env), result.Env)
+	}
+
+	expected := "MY_VAR=value is from_base"
+	if result.Env[0] != expected {
+		t.Errorf("expected %s, got %s", expected, result.Env[0])
+	}
+}
+
+func TestResolveImageRef(t *testing.T) {
+	tests := []struct {
+		name       string
+		dockerfile string
+		buildArgs  map[string]string
+		wantRef    string
+	}{
+		{
+			name:       "simple image",
+			dockerfile: "FROM alpine:3.19\n",
+			wantRef:    "alpine:3.19",
+		},
+		{
+			name:       "ARG with default",
+			dockerfile: "ARG VERSION=3.19\nFROM alpine:$VERSION\n",
+			wantRef:    "alpine:3.19",
+		},
+		{
+			name:       "ARG overridden by build arg",
+			dockerfile: "ARG VERSION=3.19\nFROM alpine:$VERSION\n",
+			buildArgs:  map[string]string{"VERSION": "3.18"},
+			wantRef:    "alpine:3.18",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			df, err := Parse([]byte(tc.dockerfile))
+			if err != nil {
+				t.Fatalf("Parse failed: %v", err)
+			}
+
+			builder := NewBuilder(df)
+			for k, v := range tc.buildArgs {
+				builder = builder.WithBuildArg(k, v)
+			}
+
+			ref, err := builder.ResolveImageRef()
+			if err != nil {
+				t.Fatalf("ResolveImageRef failed: %v", err)
+			}
+
+			if ref != tc.wantRef {
+				t.Errorf("expected %s, got %s", tc.wantRef, ref)
+			}
+		})
+	}
+}
+
+func TestResolveImageRefMatchesBuild(t *testing.T) {
+	// Verify that ResolveImageRef() and Build() return the same image ref,
+	// even when base image env contains variables that could affect expansion.
+	// This is important because FROM can only use ARG/build args, not ENV.
+	dockerfile := []byte(`ARG VERSION=3.19
+FROM alpine:$VERSION
+ENV PATH="/opt/bin:$PATH"
+`)
+
+	df, err := Parse(dockerfile)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	// Simulate base image having VERSION set (shouldn't affect FROM)
+	baseEnv := []string{
+		"VERSION=SHOULD_NOT_BE_USED",
+		"PATH=/usr/local/bin:/usr/bin:/bin",
+	}
+
+	builder := NewBuilder(df).WithBaseImageEnv(baseEnv)
+
+	resolvedRef, err := builder.ResolveImageRef()
+	if err != nil {
+		t.Fatalf("ResolveImageRef failed: %v", err)
+	}
+
+	result, err := builder.Build()
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+
+	// Both should return the same image ref (using ARG default, not base env)
+	if resolvedRef != result.ImageRef {
+		t.Errorf("ResolveImageRef returned %q but Build returned %q", resolvedRef, result.ImageRef)
+	}
+
+	// Should use ARG default, not base env VERSION
+	if resolvedRef != "alpine:3.19" {
+		t.Errorf("expected alpine:3.19, got %s", resolvedRef)
+	}
+
+	// ENV PATH should still expand correctly using base env
+	if len(result.Env) != 1 {
+		t.Fatalf("expected 1 env var, got %d", len(result.Env))
+	}
+	expected := "PATH=/opt/bin:/usr/local/bin:/usr/bin:/bin"
+	if result.Env[0] != expected {
+		t.Errorf("expected %s, got %s", expected, result.Env[0])
+	}
+}
+
 func TestBuildWithWorkdir(t *testing.T) {
 	dockerfile := []byte(`FROM alpine
 WORKDIR /app

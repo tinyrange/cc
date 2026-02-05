@@ -147,6 +147,71 @@ func TestExpandVariables(t *testing.T) {
 	}
 }
 
+func TestExpandVariablesPreserve(t *testing.T) {
+	// ExpandVariablesPreserve leaves undefined variables as-is, for RUN commands
+	tests := []struct {
+		name     string
+		input    string
+		vars     map[string]string
+		expected string
+	}{
+		{
+			name:     "defined variable is expanded",
+			input:    "$VAR",
+			vars:     map[string]string{"VAR": "value"},
+			expected: "value",
+		},
+		{
+			name:     "undefined variable is preserved",
+			input:    "$UNDEFINED",
+			vars:     map[string]string{},
+			expected: "$UNDEFINED",
+		},
+		{
+			name:     "undefined braced variable is preserved",
+			input:    "${UNDEFINED}",
+			vars:     map[string]string{},
+			expected: "${UNDEFINED}",
+		},
+		{
+			name:     "mixed defined and undefined",
+			input:    "$DEFINED and $UNDEFINED",
+			vars:     map[string]string{"DEFINED": "value"},
+			expected: "value and $UNDEFINED",
+		},
+		{
+			name:     "shell variable in RUN command",
+			input:    "conda_installer=/tmp/miniconda.sh && curl -o \"$conda_installer\" https://example.com",
+			vars:     map[string]string{},
+			expected: "conda_installer=/tmp/miniconda.sh && curl -o \"$conda_installer\" https://example.com",
+		},
+		{
+			name:     "default value still works for undefined",
+			input:    "${VAR:-default}",
+			vars:     map[string]string{},
+			expected: "default",
+		},
+		{
+			name:     "alternate value empty for undefined",
+			input:    "${VAR:+alternate}",
+			vars:     map[string]string{},
+			expected: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := ExpandVariablesPreserve(tc.input, tc.vars)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if result != tc.expected {
+				t.Errorf("ExpandVariablesPreserve(%q) = %q, want %q", tc.input, result, tc.expected)
+			}
+		})
+	}
+}
+
 func TestExpandVariablesDepthLimit(t *testing.T) {
 	// Create a chain of variable references that would exceed the depth limit
 	vars := make(map[string]string)

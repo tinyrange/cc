@@ -14,9 +14,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
-
-	"github.com/schollz/progressbar/v3"
 )
 
 const (
@@ -275,11 +274,15 @@ func (c *Client) fetchToCache(ctx *registryContext, path string, accept []string
 			return "", fmt.Errorf("create temp cache file: %w", err)
 		}
 
-		title := fmt.Sprintf("download %s", path)
-		var writer io.Writer = tmpFile
-		var bar *progressbar.ProgressBar
+		title := path
+		// Shorten title if too long
+		if len(title) > 40 {
+			title = "..." + title[len(title)-37:]
+		}
 
-		// Use progress callback if set, otherwise use terminal progress bar.
+		var writer io.Writer = tmpFile
+
+		// Use progress callback if set, otherwise use terminal progress display.
 		// These are mutually exclusive: callers that set a callback (e.g., GUI apps)
 		// handle progress display themselves and don't want terminal output.
 		if c.progressCallback != nil {
@@ -293,16 +296,9 @@ func (c *Client) fetchToCache(ctx *registryContext, path string, accept []string
 			}
 			writer = pw
 		} else {
-			if resp.ContentLength > 0 {
-				bar = progressbar.DefaultBytes(resp.ContentLength, title)
-			} else {
-				bar = progressbar.DefaultBytes(-1, title)
-			}
-
-			if bar != nil {
-				defer bar.Close()
-				writer = io.MultiWriter(tmpFile, bar)
-			}
+			tp := newTerminalProgress(title, resp.ContentLength)
+			defer tp.Close()
+			writer = io.MultiWriter(tmpFile, tp)
 		}
 
 		if _, err := io.Copy(writer, resp.Body); err != nil {
@@ -417,6 +413,106 @@ func (pw *progressWriter) Write(p []byte) (int, error) {
 		})
 	}
 	return n, err
+}
+
+// terminalProgress displays download progress to stderr.
+// It always outputs regardless of TTY detection, updating at reasonable intervals.
+type terminalProgress struct {
+	title      string
+	total      int64
+	current    int64
+	startTime  time.Time
+	lastUpdate time.Time
+	mu         sync.Mutex
+}
+
+func newTerminalProgress(title string, total int64) *terminalProgress {
+	tp := &terminalProgress{
+		title:     title,
+		total:     total,
+		startTime: time.Now(),
+	}
+	// Print initial line
+	tp.print()
+	return tp
+}
+
+func (tp *terminalProgress) Write(p []byte) (int, error) {
+	n := len(p)
+	tp.mu.Lock()
+	tp.current += int64(n)
+	// Update display at most every 100ms to avoid flooding
+	if time.Since(tp.lastUpdate) >= 100*time.Millisecond {
+		tp.lastUpdate = time.Now()
+		tp.print()
+	}
+	tp.mu.Unlock()
+	return n, nil
+}
+
+func (tp *terminalProgress) print() {
+	elapsed := time.Since(tp.startTime).Seconds()
+	if elapsed < 0.001 {
+		elapsed = 0.001
+	}
+	speed := float64(tp.current) / elapsed
+
+	// Format current/total
+	var progress string
+	if tp.total > 0 {
+		pct := float64(tp.current) * 100 / float64(tp.total)
+		progress = fmt.Sprintf("%s / %s (%.1f%%)",
+			formatBytes(tp.current), formatBytes(tp.total), pct)
+	} else {
+		progress = formatBytes(tp.current)
+	}
+
+	// Format speed
+	speedStr := formatBytes(int64(speed)) + "/s"
+
+	// Format ETA
+	var eta string
+	if tp.total > 0 && speed > 0 {
+		remaining := float64(tp.total-tp.current) / speed
+		if remaining > 0 {
+			eta = fmt.Sprintf(" ETA %s", formatDuration(time.Duration(remaining)*time.Second))
+		}
+	}
+
+	// Use \r to overwrite line, but also print newline-terminated status periodically
+	// This ensures output is visible even without proper terminal handling
+	fmt.Fprintf(os.Stderr, "\r%-40s %s @ %s%s    ", tp.title, progress, speedStr, eta)
+}
+
+func (tp *terminalProgress) Close() {
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+	// Final update with newline
+	tp.print()
+	fmt.Fprintln(os.Stderr)
+}
+
+func formatBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+func formatDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
+	}
+	return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
 }
 
 // IsLocalTar checks if the image reference is a local tar file.

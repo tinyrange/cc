@@ -782,6 +782,9 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 				var bothEof int64 = 0
 				var readResult int64 = 0
 				var gotDataThisIter int64 = 0
+				// Discard buffer for when capture buffers are full - use last 4KB of stderr area
+				var discardBuf int64 = 0
+				discardBuf = stderrBufBase + captureBufferSize - 4096
 				for bothEof == 0 {
 					gotDataThisIter = 0
 
@@ -804,8 +807,22 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 								}
 							}
 						} else {
-							// Buffer full, mark EOF to stop trying
-							stdoutEof = 1
+							// Buffer full - keep draining pipe to prevent SIGPIPE
+							// This keeps the child process alive even if we can't capture all output
+							readResult = runtime.Syscall(runtime.SYS_READ, stdoutPipeRead, discardBuf, 4096)
+							if readResult > 0 {
+								gotDataThisIter = 1
+							} else {
+								if readResult == 0 {
+									// Real EOF
+									stdoutEof = 1
+								} else {
+									// EAGAIN (-11) means no data available, other errors mark EOF
+									if readResult != -11 {
+										stdoutEof = 1
+									}
+								}
+							}
 						}
 					}
 
@@ -828,8 +845,22 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 								}
 							}
 						} else {
-							// Buffer full, mark EOF to stop trying
-							stderrEof = 1
+							// Buffer full - keep draining pipe to prevent SIGPIPE
+							// This keeps the child process alive even if we can't capture all output
+							readResult = runtime.Syscall(runtime.SYS_READ, stderrPipeRead, discardBuf, 4096)
+							if readResult > 0 {
+								gotDataThisIter = 1
+							} else {
+								if readResult == 0 {
+									// Real EOF
+									stderrEof = 1
+								} else {
+									// EAGAIN (-11) means no data available, other errors mark EOF
+									if readResult != -11 {
+										stderrEof = 1
+									}
+								}
+							}
 						}
 					}
 
