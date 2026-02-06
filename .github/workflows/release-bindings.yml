@@ -178,15 +178,17 @@ jobs:
         run: |
           npm ci --ignore-scripts
           npm run build
+        env:
+          CC_NPM_PUBLISH: 1
 
       - name: Publish (dry run)
         if: ${{ inputs.dry_run == true }}
-        working-directory: bindings/nodejs
+        working-directory: bindings/nodejs/dist
         run: npm pack
 
       - name: Publish with provenance
         if: ${{ inputs.dry_run != true }}
-        working-directory: bindings/nodejs
+        working-directory: bindings/nodejs/dist
         run: npm publish --access public --provenance
 
   # Python wheel building (matrix)

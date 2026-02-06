@@ -17,6 +17,28 @@ import (
 	"github.com/tinyrange/cc/internal/vfs"
 )
 
+// guestMountedPaths are directories that the guest init mounts over with
+// tmpfs or other filesystems. Writes via the host FS API land on the
+// underlying VirtioFS layer but are invisible inside the guest because
+// the mount hides them.
+var guestMountedPaths = []string{"/tmp", "/proc", "/sys", "/dev"}
+
+// errGuestMount is returned when an operation targets a path that is
+// mounted over inside the guest and therefore not accessible via the host API.
+var errGuestMount = fmt.Errorf("path is mounted over inside the guest (e.g. tmpfs) and not accessible via the host filesystem API")
+
+// checkGuestMountPath returns an error if the path falls under a directory
+// that the guest init mounts over, making host-side writes invisible.
+func checkGuestMountPath(op, name string) error {
+	clean := path.Clean(name)
+	for _, mp := range guestMountedPaths {
+		if clean == mp || strings.HasPrefix(clean, mp+"/") {
+			return &Error{Op: op, Path: name, Err: errGuestMount}
+		}
+	}
+	return nil
+}
+
 // errnoToError converts a FUSE errno to a Go error.
 func errnoToError(errno int32) error {
 	if errno == 0 {
@@ -173,6 +195,9 @@ func (f *instanceFS) OpenFile(name string, flag int, perm fs.FileMode) (File, er
 	if f.inst.fsBackend == nil {
 		return nil, &Error{Op: "open", Path: name, Err: ErrNotRunning}
 	}
+	if err := checkGuestMountPath("open", name); err != nil {
+		return nil, err
+	}
 
 	// Resolve path to get parent and check if file exists
 	parentID, baseName, nodeID, errno := f.resolvePath(name)
@@ -282,6 +307,9 @@ func (f *instanceFS) ReadFile(name string) ([]byte, error) {
 	if f.inst.fsBackend == nil {
 		return nil, &Error{Op: "readfile", Path: name, Err: ErrNotRunning}
 	}
+	if err := checkGuestMountPath("readfile", name); err != nil {
+		return nil, err
+	}
 
 	// Resolve path through the fsBackend, following symlinks
 	nodeID, errno := f.resolvePathFollowSymlinks(name)
@@ -327,6 +355,9 @@ func (f *instanceFS) ReadFile(name string) ([]byte, error) {
 func (f *instanceFS) WriteFile(name string, data []byte, perm fs.FileMode) error {
 	if f.inst.fsBackend == nil {
 		return &Error{Op: "writefile", Path: name, Err: ErrNotRunning}
+	}
+	if err := checkGuestMountPath("writefile", name); err != nil {
+		return err
 	}
 
 	// Resolve path to get parent
@@ -401,6 +432,9 @@ func (f *instanceFS) Stat(name string) (fs.FileInfo, error) {
 	if f.inst.fsBackend == nil {
 		return nil, &Error{Op: "stat", Path: name, Err: ErrNotRunning}
 	}
+	if err := checkGuestMountPath("stat", name); err != nil {
+		return nil, err
+	}
 
 	// Resolve path through the fsBackend, following symlinks
 	nodeID, errno := f.resolvePathFollowSymlinks(name)
@@ -421,6 +455,9 @@ func (f *instanceFS) Lstat(name string) (fs.FileInfo, error) {
 	if f.inst.fsBackend == nil {
 		return nil, &Error{Op: "lstat", Path: name, Err: ErrNotRunning}
 	}
+	if err := checkGuestMountPath("lstat", name); err != nil {
+		return nil, err
+	}
 
 	// resolvePath doesn't follow symlinks for the final component
 	_, _, nodeID, errno := f.resolvePath(name)
@@ -440,6 +477,9 @@ func (f *instanceFS) Lstat(name string) (fs.FileInfo, error) {
 func (f *instanceFS) Remove(name string) error {
 	if f.inst.fsBackend == nil {
 		return &Error{Op: "remove", Path: name, Err: ErrNotRunning}
+	}
+	if err := checkGuestMountPath("remove", name); err != nil {
+		return err
 	}
 
 	// Resolve path
@@ -480,6 +520,9 @@ func (f *instanceFS) Remove(name string) error {
 func (f *instanceFS) RemoveAll(name string) error {
 	if f.inst.fsBackend == nil {
 		return &Error{Op: "removeall", Path: name, Err: ErrNotRunning}
+	}
+	if err := checkGuestMountPath("removeall", name); err != nil {
+		return err
 	}
 
 	// Resolve path
@@ -604,6 +647,9 @@ func (f *instanceFS) Mkdir(name string, perm fs.FileMode) error {
 	if f.inst.fsBackend == nil {
 		return &Error{Op: "mkdir", Path: name, Err: ErrNotRunning}
 	}
+	if err := checkGuestMountPath("mkdir", name); err != nil {
+		return err
+	}
 
 	// Resolve path
 	parentID, baseName, _, errno := f.resolvePath(name)
@@ -636,6 +682,9 @@ func (f *instanceFS) Mkdir(name string, perm fs.FileMode) error {
 func (f *instanceFS) MkdirAll(name string, perm fs.FileMode) error {
 	if f.inst.fsBackend == nil {
 		return &Error{Op: "mkdirall", Path: name, Err: ErrNotRunning}
+	}
+	if err := checkGuestMountPath("mkdirall", name); err != nil {
+		return err
 	}
 
 	mkdirBackend, hasMkdir := f.inst.fsBackend.(interface {
@@ -686,6 +735,12 @@ func (f *instanceFS) Rename(oldpath, newpath string) error {
 	if f.inst.fsBackend == nil {
 		return &Error{Op: "rename", Path: oldpath, Err: ErrNotRunning}
 	}
+	if err := checkGuestMountPath("rename", oldpath); err != nil {
+		return err
+	}
+	if err := checkGuestMountPath("rename", newpath); err != nil {
+		return err
+	}
 
 	renameBackend, hasRename := f.inst.fsBackend.(interface {
 		Rename(oldParent uint64, oldName string, newParent uint64, newName string, flags uint32) int32
@@ -719,6 +774,9 @@ func (f *instanceFS) Symlink(oldname, newname string) error {
 	if f.inst.fsBackend == nil {
 		return &Error{Op: "symlink", Path: newname, Err: ErrNotRunning}
 	}
+	if err := checkGuestMountPath("symlink", newname); err != nil {
+		return err
+	}
 
 	symlinkBackend, hasSymlink := f.inst.fsBackend.(interface {
 		Symlink(parent uint64, name string, target string, umask uint32, uid uint32, gid uint32) (nodeID uint64, attr virtio.FuseAttr, errno int32)
@@ -749,6 +807,9 @@ func (f *instanceFS) Readlink(name string) (string, error) {
 	if f.inst.fsBackend == nil {
 		return "", &Error{Op: "readlink", Path: name, Err: ErrNotRunning}
 	}
+	if err := checkGuestMountPath("readlink", name); err != nil {
+		return "", err
+	}
 
 	// Resolve path to get node ID
 	_, _, nodeID, errno := f.resolvePath(name)
@@ -776,6 +837,9 @@ func (f *instanceFS) Readlink(name string) (string, error) {
 func (f *instanceFS) ReadDir(name string) ([]fs.DirEntry, error) {
 	if f.inst.fsBackend == nil {
 		return nil, &Error{Op: "readdir", Path: name, Err: ErrNotRunning}
+	}
+	if err := checkGuestMountPath("readdir", name); err != nil {
+		return nil, err
 	}
 
 	// Resolve directory path
@@ -842,6 +906,9 @@ func (f *instanceFS) Chmod(name string, mode fs.FileMode) error {
 	if f.inst.fsBackend == nil {
 		return &Error{Op: "chmod", Path: name, Err: ErrNotRunning}
 	}
+	if err := checkGuestMountPath("chmod", name); err != nil {
+		return err
+	}
 
 	setattrBackend, hasSetattr := f.inst.fsBackend.(interface {
 		SetAttr(nodeID uint64, size *uint64, mode *uint32, uid *uint32, gid *uint32, atime *time.Time, mtime *time.Time, reqUID uint32, reqGID uint32) int32
@@ -877,6 +944,9 @@ func (f *instanceFS) Chown(name string, uid, gid int) error {
 	if f.inst.fsBackend == nil {
 		return &Error{Op: "chown", Path: name, Err: ErrNotRunning}
 	}
+	if err := checkGuestMountPath("chown", name); err != nil {
+		return err
+	}
 
 	setattrBackend, hasSetattr := f.inst.fsBackend.(interface {
 		SetAttr(nodeID uint64, size *uint64, mode *uint32, uid *uint32, gid *uint32, atime *time.Time, mtime *time.Time, reqUID uint32, reqGID uint32) int32
@@ -905,6 +975,9 @@ func (f *instanceFS) Chown(name string, uid, gid int) error {
 func (f *instanceFS) Chtimes(name string, atime, mtime time.Time) error {
 	if f.inst.fsBackend == nil {
 		return &Error{Op: "chtimes", Path: name, Err: ErrNotRunning}
+	}
+	if err := checkGuestMountPath("chtimes", name); err != nil {
+		return err
 	}
 
 	setattrBackend, hasSetattr := f.inst.fsBackend.(interface {

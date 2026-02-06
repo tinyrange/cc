@@ -187,7 +187,7 @@ import { PullPolicy } from './types.js';
 /**
  * Instance source representing a pulled or loaded image.
  */
-export class InstanceSource {
+export class InstanceSource implements AsyncDisposable {
   private _helper: HelperProcess;
   private _imageRef: string;
   private _cacheDir: string;
@@ -283,10 +283,19 @@ export class InstanceSource {
   }
 
   /**
-   * Close the source.
+   * Close the source and its helper process.
    */
-  close(): void {
+  async close(): Promise<void> {
+    if (this._closed) return;
     this._closed = true;
+    await this._helper.close();
+  }
+
+  /**
+   * Async dispose support for "await using" syntax.
+   */
+  async [Symbol.asyncDispose](): Promise<void> {
+    await this.close();
   }
 }
 
