@@ -340,8 +340,8 @@ func (inst *instance) start() error {
 		workdir = "/"
 	}
 
-	// Use environment from image config
-	env := append([]string{}, inst.imageConfig.Env...)
+	// Use environment from image config with defaults
+	env := envWithDefaults(inst.imageConfig.Env)
 
 	// Create VM options
 	vmOpts := []initx.Option{
@@ -513,6 +513,30 @@ func (inst *instance) start() error {
 	return nil
 }
 
+// hasEnvKey checks if an environment variable list contains a given key.
+func hasEnvKey(env []string, key string) bool {
+	prefix := key + "="
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// envWithDefaults returns a copy of env with default PATH and HOME if not set.
+// This provides Docker-compatible defaults when the image doesn't specify them.
+func envWithDefaults(env []string) []string {
+	result := append([]string{}, env...)
+	if !hasEnvKey(result, "PATH") {
+		result = append(result, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+	}
+	if !hasEnvKey(result, "HOME") {
+		result = append(result, "HOME=/root")
+	}
+	return result
+}
+
 // parseUser parses a user string into uid and gid.
 func parseUser(user string) (int, int, error) {
 	parts := strings.SplitN(user, ":", 2)
@@ -675,8 +699,8 @@ func (inst *instance) Command(name string, args ...string) Cmd {
 }
 
 func (inst *instance) CommandContext(ctx context.Context, name string, args ...string) Cmd {
-	// Use environment from image config (commands can override via SetEnv)
-	env := append([]string{}, inst.imageConfig.Env...)
+	// Use environment from image config with defaults (commands can override via SetEnv)
+	env := envWithDefaults(inst.imageConfig.Env)
 
 	// Use workdir from image config (commands can override via SetDir)
 	workdir := inst.imageConfig.WorkingDir
