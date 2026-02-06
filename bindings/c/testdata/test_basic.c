@@ -285,7 +285,7 @@ int main(int argc, char** argv) {
     /* Test 16: Filesystem operations */
     TEST("cc_fs_write_file + cc_fs_read_file");
     {
-        const char* test_path = "/tmp/test_file.txt";
+        const char* test_path = "/root/test_file.txt";
         const char* test_data = "Hello, filesystem!";
         size_t test_len = strlen(test_data);
 
@@ -317,7 +317,7 @@ int main(int argc, char** argv) {
     TEST("cc_fs_stat");
     {
         cc_file_info info = {0};
-        code = cc_fs_stat(inst, "/tmp/test_file.txt", &info, &err);
+        code = cc_fs_stat(inst, "/root/test_file.txt", &info, &err);
         check_error(code, &err, "cc_fs_stat");
 
         if (info.size != 18) {  /* "Hello, filesystem!" is 18 bytes */
@@ -338,7 +338,7 @@ int main(int argc, char** argv) {
         cc_dir_entry* entries = NULL;
         size_t count = 0;
 
-        code = cc_fs_read_dir(inst, "/tmp", &entries, &count, &err);
+        code = cc_fs_read_dir(inst, "/root", &entries, &count, &err);
         check_error(code, &err, "cc_fs_read_dir");
 
         printf("(%zu entries) ", count);
@@ -352,7 +352,7 @@ int main(int argc, char** argv) {
     /* Test 19: Remove file */
     TEST("cc_fs_remove");
     {
-        code = cc_fs_remove(inst, "/tmp/test_file.txt", &err);
+        code = cc_fs_remove(inst, "/root/test_file.txt", &err);
         check_error(code, &err, "cc_fs_remove");
         PASS();
     }

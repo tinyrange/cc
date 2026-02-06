@@ -138,7 +138,7 @@ libcc-test: libcc codesign
     @darwin sh gcc -o $(OUTPUT)/test_basic bindings/c/testdata/test_basic.c \
         -I$(OUTPUT) -L$(OUTPUT) -lcc '-Wl,-rpath,@executable_path'
     @linux sh gcc -o $(OUTPUT)/test_basic bindings/c/testdata/test_basic.c \
-        -I$(OUTPUT) -L$(OUTPUT) -lcc '-Wl,-rpath,$ORIGIN'
+        -I$(OUTPUT) -L$(OUTPUT) -lcc '-Wl,-rpath,\$ORIGIN'
     @darwin sh $(OUTPUT)/codesign -entitlements $(ENTITLEMENTS) -bin $(OUTPUT)/test_basic
     run $(OUTPUT)/test_basic
 
