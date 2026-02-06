@@ -87,6 +87,9 @@ func newGvisorHarness(tb testing.TB) *gvisorHarness {
 	if err != nil {
 		tb.Fatalf("attach network interface: %v", err)
 	}
+	if nic == nil {
+		tb.Fatalf("AttachNetworkInterface returned nil without error")
+	}
 	h.nic = nic
 
 	// gVisor stack + channel endpoint.
