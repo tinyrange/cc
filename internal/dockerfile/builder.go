@@ -1,6 +1,7 @@
 package dockerfile
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -28,6 +29,7 @@ type Cmd interface {
 	SetEnv(env []string) Cmd
 	SetDir(dir string) Cmd
 	SetUser(user string) Cmd
+	SetStdin(r io.Reader) Cmd
 }
 
 // FSLayerOp represents an operation in the filesystem snapshot factory.
@@ -297,11 +299,22 @@ func (b *Builder) processRun(instr Instruction, result *BuildResult, vars map[st
 		cmd[i] = expanded
 	}
 
+	env := append([]string{}, result.Env...)
+
+	// Inject DEBIAN_FRONTEND=noninteractive for build-time RUN commands if not
+	// already set. During docker build, stdin is not connected so dpkg/debconf
+	// prompts cannot block. In our VM execution environment stdin may be
+	// available, causing interactive prompts (e.g. tzdata) to hang the build.
+	if !envHasKey(env, "DEBIAN_FRONTEND") {
+		env = append(env, "DEBIAN_FRONTEND=noninteractive")
+	}
+
 	op := &runOp{
 		cmd:     cmd,
-		env:     append([]string{}, result.Env...),
+		env:     env,
 		workDir: result.WorkDir,
 		user:    result.RuntimeConfig.User,
+		stdin:   bytes.NewReader(nil), // close stdin for build commands
 	}
 	result.Ops = append(result.Ops, op)
 	return nil
@@ -521,6 +534,7 @@ type runOp struct {
 	env     []string
 	workDir string
 	user    string
+	stdin   io.Reader
 }
 
 func (o *runOp) CacheKey() string {
@@ -537,6 +551,9 @@ func (o *runOp) Apply(ctx context.Context, inst Instance) error {
 	}
 	if o.user != "" {
 		cmd = cmd.SetUser(o.user)
+	}
+	if o.stdin != nil {
+		cmd = cmd.SetStdin(o.stdin)
 	}
 	return cmd.Run()
 }
@@ -579,6 +596,17 @@ func (o *readerOp) Apply(ctx context.Context, inst Instance) error {
 // isDir returns true if the path looks like a directory (ends with /).
 func isDir(path string) bool {
 	return len(path) > 0 && path[len(path)-1] == '/'
+}
+
+// envHasKey checks if an environment variable list contains a given key.
+func envHasKey(env []string, key string) bool {
+	prefix := key + "="
+	for _, e := range env {
+		if len(e) >= len(prefix) && e[:len(prefix)] == prefix {
+			return true
+		}
+	}
+	return false
 }
 
 // findEq finds the index of '=' in a string.

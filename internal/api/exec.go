@@ -234,15 +234,18 @@ func (c *instanceCmd) runCommand() {
 		cmdPath = resolved
 	}
 
-	// If a user is specified, wrap command with su
-	if c.user != "" {
+	// If a non-root user is specified, wrap command with su.
+	// Skip for root since the process already runs as root.
+	// Use -p (preserve environment) instead of - (login shell) so that
+	// environment variables (e.g. from Dockerfile ENV) are not cleared.
+	if c.user != "" && c.user != "root" {
 		// Build the command string for su -c
 		cmdStr := cmdPath
 		for _, arg := range args {
 			cmdStr += " " + shellQuote(arg)
 		}
 		cmdPath = "/bin/su"
-		args = []string{"-", c.user, "-c", cmdStr}
+		args = []string{"-p", c.user, "-c", cmdStr}
 	}
 
 	// Check if stdin is set (we'll use streaming mode if so)
@@ -370,15 +373,18 @@ func (c *instanceCmd) runInteractiveCommand() {
 		cmdPath = resolved
 	}
 
-	// If a user is specified, wrap command with su
-	if c.user != "" {
+	// If a non-root user is specified, wrap command with su.
+	// Skip for root since the process already runs as root.
+	// Use -p (preserve environment) instead of - (login shell) so that
+	// environment variables (e.g. from Dockerfile ENV) are not cleared.
+	if c.user != "" && c.user != "root" {
 		// Build the command string for su -c
 		cmdStr := cmdPath
 		for _, arg := range args {
 			cmdStr += " " + shellQuote(arg)
 		}
 		cmdPath = "/bin/su"
-		args = []string{"-", c.user, "-c", cmdStr}
+		args = []string{"-p", c.user, "-c", cmdStr}
 	}
 
 	// Use the command's environment (already merged in CommandContext)

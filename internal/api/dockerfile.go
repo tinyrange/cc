@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -151,6 +152,10 @@ func (a *cmdAdapter) SetDir(dir string) dockerfile.Cmd {
 
 func (a *cmdAdapter) SetUser(user string) dockerfile.Cmd {
 	return &cmdAdapter{cmd: a.cmd.SetUser(user)}
+}
+
+func (a *cmdAdapter) SetStdin(r io.Reader) dockerfile.Cmd {
+	return &cmdAdapter{cmd: a.cmd.SetStdin(r)}
 }
 
 // BuildDockerfileSource builds an InstanceSource from Dockerfile content.

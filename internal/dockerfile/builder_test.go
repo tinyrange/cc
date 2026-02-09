@@ -2,6 +2,7 @@ package dockerfile
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -670,6 +671,10 @@ func (c *mockCmd) SetDir(dir string) Cmd {
 }
 
 func (c *mockCmd) SetUser(user string) Cmd {
+	return c
+}
+
+func (c *mockCmd) SetStdin(r io.Reader) Cmd {
 	return c
 }
 
