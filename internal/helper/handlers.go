@@ -13,8 +13,8 @@ import (
 	"time"
 
 	cc "github.com/tinyrange/cc"
-	"github.com/tinyrange/cc/internal/ipc"
 	"github.com/tinyrange/cc/internal/api"
+	"github.com/tinyrange/cc/internal/ipc"
 )
 
 // Helper manages state for a single cc-helper process.

@@ -50,8 +50,8 @@ import (
 	"errors"
 	"unsafe"
 
-	"github.com/tinyrange/cc/internal/ipc"
 	"github.com/tinyrange/cc/internal/api"
+	"github.com/tinyrange/cc/internal/ipc"
 )
 
 // errorCode maps a Go error to a C error code.
