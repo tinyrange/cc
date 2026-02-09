@@ -13,7 +13,6 @@ import (
 	"time"
 
 	cc "github.com/tinyrange/cc"
-	"github.com/tinyrange/cc/internal/ipc"
 )
 
 func main() {
@@ -76,7 +75,7 @@ func run(n int, imageRef, cacheDir string) error {
 		go func(idx int) {
 			defer wg.Done()
 			start := time.Now()
-			err := runOneVM(imageRef, cacheDir)
+			err := runOneVM(imageRef)
 			mu.Lock()
 			results[idx] = result{id: idx, duration: time.Since(start), err: err}
 			mu.Unlock()
@@ -106,70 +105,26 @@ func run(n int, imageRef, cacheDir string) error {
 }
 
 // runOneVM spawns a helper, creates an instance, runs whoami, and cleans up.
-func runOneVM(imageRef, cacheDir string) error {
-	client, err := ipc.SpawnHelper("")
+func runOneVM(imageRef string) error {
+	h, err := cc.SpawnHelper()
 	if err != nil {
 		return fmt.Errorf("spawn helper: %w", err)
 	}
-	defer client.Close()
+	defer h.Close()
 
-	// Create instance: sourceType=2 (ref), sourcePath="", imageRef, cacheDir, default options
-	enc := ipc.NewEncoder()
-	enc.Uint8(2) // ref
-	enc.String("")
-	enc.String(imageRef)
-	enc.String(cacheDir)
-	ipc.EncodeInstanceOptions(enc, ipc.InstanceOptions{})
-
-	resp, err := client.Call(ipc.MsgInstanceNew, enc.Bytes())
+	source, err := h.Pull(context.Background(), imageRef)
 	if err != nil {
-		return fmt.Errorf("instance new: %w", err)
-	}
-	dec := ipc.NewDecoder(resp)
-	if code, err := dec.Uint8(); err != nil {
-		return err
-	} else if code != ipc.ErrCodeOK {
-		return fmt.Errorf("instance new: error code %d", code)
+		return fmt.Errorf("pull: %w", err)
 	}
 
-	// Create command: whoami
-	enc = ipc.NewEncoder()
-	enc.String("whoami")
-	enc.StringSlice(nil)
-	resp, err = client.Call(ipc.MsgCmdNew, enc.Bytes())
+	inst, err := h.New(source)
 	if err != nil {
-		return fmt.Errorf("cmd new: %w", err)
+		return fmt.Errorf("new instance: %w", err)
 	}
-	dec = ipc.NewDecoder(resp)
-	if code, err := dec.Uint8(); err != nil {
-		return err
-	} else if code != ipc.ErrCodeOK {
-		return fmt.Errorf("cmd new: error code %d", code)
-	}
-	cmdHandle, err := dec.Uint64()
-	if err != nil {
-		return err
-	}
+	defer inst.Close()
 
-	// Run command
-	enc = ipc.NewEncoder()
-	enc.Uint64(cmdHandle)
-	resp, err = client.Call(ipc.MsgCmdRun, enc.Bytes())
-	if err != nil {
-		return fmt.Errorf("cmd run: %w", err)
-	}
-	dec = ipc.NewDecoder(resp)
-	if code, err := dec.Uint8(); err != nil {
-		return err
-	} else if code != ipc.ErrCodeOK {
-		return fmt.Errorf("cmd run: error code %d", code)
-	}
-	exitCode, err := dec.Int32()
-	if err != nil {
-		return err
-	}
-	if exitCode != 0 {
-		return fmt.Errorf("whoami exited with code %d", exitCode)
+	if err := inst.Command("whoami").Run(); err != nil {
+		return fmt.Errorf("whoami: %w", err)
 	}
 
 	return nil

@@ -60,6 +60,9 @@ func SourceConfig(source InstanceSource) *ImageConfig {
 	return api.SourceConfig(source)
 }
 
+// Helper manages a connection to a cc-helper process.
+type Helper = api.Helper
+
 // OCIClient pulls OCI images and converts them to InstanceSources.
 type OCIClient = api.OCIClient
 
@@ -327,6 +330,12 @@ func (o *progressCallbackOption) ProgressCallback() ProgressCallback { return o.
 // -----------------------------------------------------------------------------
 // Constructors
 // -----------------------------------------------------------------------------
+
+// SpawnHelper starts a new cc-helper process and returns a Helper
+// for creating and managing VM instances through it.
+func SpawnHelper() (Helper, error) {
+	return api.SpawnHelper()
+}
 
 // NewOCIClient creates a new OCI client for pulling images.
 // Uses the default cache directory (platform-specific user config directory).

@@ -1,6 +1,6 @@
-// helper-fstest validates filesystem operations through the IPC protocol.
+// helper-fstest validates filesystem operations through the helper API.
 // It spawns a cc-helper, creates an alpine instance, and exercises every
-// filesystem-related IPC message type.
+// filesystem operation via the public cc.Instance interface.
 package main
 
 import (
@@ -8,11 +8,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/fs"
+	"io"
 	"os"
+	"time"
 
 	cc "github.com/tinyrange/cc"
-	"github.com/tinyrange/cc/internal/ipc"
 )
 
 func main() {
@@ -70,50 +70,57 @@ func run(imageRef, cacheDir string) error {
 
 	// Spawn helper and create instance.
 	fmt.Println("Spawning helper...")
-	c, err := ipc.SpawnHelper("")
+	h, err := cc.SpawnHelper()
 	if err != nil {
 		return fmt.Errorf("spawn helper: %w", err)
 	}
-	defer c.Close()
+	defer h.Close()
 
-	if err := createInstance(c, imageRef, cacheDir); err != nil {
+	source, err := h.Pull(context.Background(), imageRef)
+	if err != nil {
+		return fmt.Errorf("pull: %w", err)
+	}
+
+	inst, err := h.New(source)
+	if err != nil {
 		return fmt.Errorf("create instance: %w", err)
 	}
+	defer inst.Close()
 
 	fmt.Println("Running filesystem tests...")
 
 	// Test: WriteFile + ReadFile roundtrip
-	check("WriteFile+ReadFile", testWriteReadFile(c))
+	check("WriteFile+ReadFile", testWriteReadFile(inst))
 
 	// Test: Stat
-	check("Stat", testStat(c))
+	check("Stat", testStat(inst))
 
 	// Test: Lstat
-	check("Lstat", testLstat(c))
+	check("Lstat", testLstat(inst))
 
 	// Test: Mkdir + ReadDir
-	check("Mkdir+ReadDir", testMkdirReadDir(c))
+	check("Mkdir+ReadDir", testMkdirReadDir(inst))
 
 	// Test: Rename
-	check("Rename", testRename(c))
+	check("Rename", testRename(inst))
 
 	// Test: Remove
-	check("Remove", testRemove(c))
+	check("Remove", testRemove(inst))
 
 	// Test: Symlink + Readlink
-	check("Symlink+Readlink", testSymlinkReadlink(c))
+	check("Symlink+Readlink", testSymlinkReadlink(inst))
 
 	// Test: Chmod
-	check("Chmod", testChmod(c))
+	check("Chmod", testChmod(inst))
 
 	// Test: Chown
-	check("Chown", testChown(c))
+	check("Chown", testChown(inst))
 
 	// Test: Chtimes
-	check("Chtimes", testChtimes(c))
+	check("Chtimes", testChtimes(inst))
 
 	// Test: File handle ops (Open, Write, Seek, Read, Close)
-	check("FileHandleOps", testFileHandleOps(c))
+	check("FileHandleOps", testFileHandleOps(inst))
 
 	fmt.Printf("\nResults: %d passed, %d failed\n", passed, failed)
 	if failed > 0 {
@@ -122,69 +129,17 @@ func run(imageRef, cacheDir string) error {
 	return nil
 }
 
-func createInstance(c *ipc.Client, imageRef, cacheDir string) error {
-	enc := ipc.NewEncoder()
-	enc.Uint8(2) // ref
-	enc.String("")
-	enc.String(imageRef)
-	enc.String(cacheDir)
-	ipc.EncodeInstanceOptions(enc, ipc.InstanceOptions{})
-
-	resp, err := c.Call(ipc.MsgInstanceNew, enc.Bytes())
-	if err != nil {
-		return err
-	}
-	dec := ipc.NewDecoder(resp)
-	code, err := dec.Uint8()
-	if err != nil {
-		return err
-	}
-	if code != ipc.ErrCodeOK {
-		return fmt.Errorf("error code %d", code)
-	}
-	return nil
-}
-
-// callOK sends a message and checks the error code is 0.
-func callOK(c *ipc.Client, msgType uint16, enc *ipc.Encoder) (*ipc.Decoder, error) {
-	resp, err := c.Call(msgType, enc.Bytes())
-	if err != nil {
-		return nil, err
-	}
-	dec := ipc.NewDecoder(resp)
-	code, err := dec.Uint8()
-	if err != nil {
-		return nil, err
-	}
-	if code != ipc.ErrCodeOK {
-		return nil, fmt.Errorf("IPC error code %d", code)
-	}
-	return dec, nil
-}
-
-func testWriteReadFile(c *ipc.Client) error {
+func testWriteReadFile(inst cc.Instance) error {
 	data := []byte("hello from fstest")
 	path := "/root/fstest_write_read"
 
-	// WriteFile
-	enc := ipc.NewEncoder()
-	enc.String(path)
-	enc.WriteBytes(data)
-	enc.Uint32(uint32(fs.FileMode(0644)))
-	if _, err := callOK(c, ipc.MsgFsWriteFile, enc); err != nil {
+	if err := inst.WriteFile(path, data, 0644); err != nil {
 		return fmt.Errorf("WriteFile: %w", err)
 	}
 
-	// ReadFile
-	enc = ipc.NewEncoder()
-	enc.String(path)
-	dec, err := callOK(c, ipc.MsgFsReadFile, enc)
+	got, err := inst.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("ReadFile: %w", err)
-	}
-	got, err := dec.Bytes()
-	if err != nil {
-		return err
 	}
 	if !bytes.Equal(got, data) {
 		return fmt.Errorf("ReadFile: got %q, want %q", got, data)
@@ -192,87 +147,55 @@ func testWriteReadFile(c *ipc.Client) error {
 	return nil
 }
 
-func testStat(c *ipc.Client) error {
-	enc := ipc.NewEncoder()
-	enc.String("/etc/hostname")
-	dec, err := callOK(c, ipc.MsgFsStat, enc)
+func testStat(inst cc.Instance) error {
+	fi, err := inst.Stat("/etc/hostname")
 	if err != nil {
 		return fmt.Errorf("Stat: %w", err)
 	}
-	fi, err := ipc.DecodeFileInfo(dec)
-	if err != nil {
-		return err
+	if fi.Name() != "hostname" {
+		return fmt.Errorf("Stat: name=%q, want %q", fi.Name(), "hostname")
 	}
-	if fi.Name != "hostname" {
-		return fmt.Errorf("Stat: name=%q, want %q", fi.Name, "hostname")
-	}
-	if fi.IsDir {
+	if fi.IsDir() {
 		return fmt.Errorf("Stat: IsDir=true, want false")
 	}
 	return nil
 }
 
-func testLstat(c *ipc.Client) error {
-	enc := ipc.NewEncoder()
-	enc.String("/etc")
-	dec, err := callOK(c, ipc.MsgFsLstat, enc)
+func testLstat(inst cc.Instance) error {
+	fi, err := inst.Lstat("/etc")
 	if err != nil {
 		return fmt.Errorf("Lstat: %w", err)
 	}
-	fi, err := ipc.DecodeFileInfo(dec)
-	if err != nil {
-		return err
+	if fi.Name() != "etc" {
+		return fmt.Errorf("Lstat: name=%q, want %q", fi.Name(), "etc")
 	}
-	if fi.Name != "etc" {
-		return fmt.Errorf("Lstat: name=%q, want %q", fi.Name, "etc")
-	}
-	if !fi.IsDir {
+	if !fi.IsDir() {
 		return fmt.Errorf("Lstat: IsDir=false, want true")
 	}
 	return nil
 }
 
-func testMkdirReadDir(c *ipc.Client) error {
+func testMkdirReadDir(inst cc.Instance) error {
 	dir := "/root/fstest_dir"
 
-	// Mkdir
-	enc := ipc.NewEncoder()
-	enc.String(dir)
-	enc.Uint32(uint32(fs.FileMode(0755)))
-	if _, err := callOK(c, ipc.MsgFsMkdir, enc); err != nil {
+	if err := inst.Mkdir(dir, 0755); err != nil {
 		return fmt.Errorf("Mkdir: %w", err)
 	}
 
-	// Write a file inside
-	enc = ipc.NewEncoder()
-	enc.String(dir + "/child.txt")
-	enc.WriteBytes([]byte("child"))
-	enc.Uint32(uint32(fs.FileMode(0644)))
-	if _, err := callOK(c, ipc.MsgFsWriteFile, enc); err != nil {
+	if err := inst.WriteFile(dir+"/child.txt", []byte("child"), 0644); err != nil {
 		return fmt.Errorf("WriteFile in dir: %w", err)
 	}
 
-	// ReadDir
-	enc = ipc.NewEncoder()
-	enc.String(dir)
-	dec, err := callOK(c, ipc.MsgFsReadDir, enc)
+	entries, err := inst.ReadDir(dir)
 	if err != nil {
 		return fmt.Errorf("ReadDir: %w", err)
 	}
-	count, err := dec.Uint32()
-	if err != nil {
-		return err
-	}
-	if count == 0 {
+	if len(entries) == 0 {
 		return fmt.Errorf("ReadDir: empty directory")
 	}
 	found := false
-	for i := uint32(0); i < count; i++ {
-		de, err := ipc.DecodeDirEntry(dec)
-		if err != nil {
-			return err
-		}
-		if de.Name == "child.txt" {
+	for _, e := range entries {
+		if e.Name() == "child.txt" {
 			found = true
 		}
 	}
@@ -282,96 +205,56 @@ func testMkdirReadDir(c *ipc.Client) error {
 	return nil
 }
 
-func testRename(c *ipc.Client) error {
+func testRename(inst cc.Instance) error {
 	src := "/root/fstest_rename_src"
 	dst := "/root/fstest_rename_dst"
 
-	// Create source file
-	enc := ipc.NewEncoder()
-	enc.String(src)
-	enc.WriteBytes([]byte("rename me"))
-	enc.Uint32(uint32(fs.FileMode(0644)))
-	if _, err := callOK(c, ipc.MsgFsWriteFile, enc); err != nil {
+	if err := inst.WriteFile(src, []byte("rename me"), 0644); err != nil {
 		return fmt.Errorf("WriteFile: %w", err)
 	}
 
-	// Rename
-	enc = ipc.NewEncoder()
-	enc.String(src)
-	enc.String(dst)
-	if _, err := callOK(c, ipc.MsgFsRename, enc); err != nil {
+	if err := inst.Rename(src, dst); err != nil {
 		return fmt.Errorf("Rename: %w", err)
 	}
 
-	// Verify destination exists
-	enc = ipc.NewEncoder()
-	enc.String(dst)
-	if _, err := callOK(c, ipc.MsgFsStat, enc); err != nil {
+	if _, err := inst.Stat(dst); err != nil {
 		return fmt.Errorf("Stat after rename: %w", err)
 	}
 	return nil
 }
 
-func testRemove(c *ipc.Client) error {
+func testRemove(inst cc.Instance) error {
 	path := "/root/fstest_remove"
 
-	// Create file
-	enc := ipc.NewEncoder()
-	enc.String(path)
-	enc.WriteBytes([]byte("remove me"))
-	enc.Uint32(uint32(fs.FileMode(0644)))
-	if _, err := callOK(c, ipc.MsgFsWriteFile, enc); err != nil {
+	if err := inst.WriteFile(path, []byte("remove me"), 0644); err != nil {
 		return fmt.Errorf("WriteFile: %w", err)
 	}
 
-	// Remove
-	enc = ipc.NewEncoder()
-	enc.String(path)
-	if _, err := callOK(c, ipc.MsgFsRemove, enc); err != nil {
+	if err := inst.Remove(path); err != nil {
 		return fmt.Errorf("Remove: %w", err)
 	}
 
-	// Verify gone (Stat should fail)
-	enc = ipc.NewEncoder()
-	enc.String(path)
-	_, err := c.Call(ipc.MsgFsStat, enc.Bytes())
-	if err == nil {
+	if _, err := inst.Stat(path); err == nil {
 		return fmt.Errorf("Stat after Remove: expected error, got nil")
 	}
 	return nil
 }
 
-func testSymlinkReadlink(c *ipc.Client) error {
+func testSymlinkReadlink(inst cc.Instance) error {
 	target := "/root/fstest_symlink_target"
 	link := "/root/fstest_symlink_link"
 
-	// Create target
-	enc := ipc.NewEncoder()
-	enc.String(target)
-	enc.WriteBytes([]byte("target"))
-	enc.Uint32(uint32(fs.FileMode(0644)))
-	if _, err := callOK(c, ipc.MsgFsWriteFile, enc); err != nil {
+	if err := inst.WriteFile(target, []byte("target"), 0644); err != nil {
 		return fmt.Errorf("WriteFile: %w", err)
 	}
 
-	// Symlink
-	enc = ipc.NewEncoder()
-	enc.String(target)
-	enc.String(link)
-	if _, err := callOK(c, ipc.MsgFsSymlink, enc); err != nil {
+	if err := inst.Symlink(target, link); err != nil {
 		return fmt.Errorf("Symlink: %w", err)
 	}
 
-	// Readlink
-	enc = ipc.NewEncoder()
-	enc.String(link)
-	dec, err := callOK(c, ipc.MsgFsReadlink, enc)
+	got, err := inst.Readlink(link)
 	if err != nil {
 		return fmt.Errorf("Readlink: %w", err)
-	}
-	got, err := dec.String()
-	if err != nil {
-		return err
 	}
 	if got != target {
 		return fmt.Errorf("Readlink: got %q, want %q", got, target)
@@ -379,176 +262,105 @@ func testSymlinkReadlink(c *ipc.Client) error {
 	return nil
 }
 
-func testChmod(c *ipc.Client) error {
+func testChmod(inst cc.Instance) error {
 	path := "/root/fstest_chmod"
 
-	// Create file
-	enc := ipc.NewEncoder()
-	enc.String(path)
-	enc.WriteBytes([]byte("chmod test"))
-	enc.Uint32(uint32(fs.FileMode(0644)))
-	if _, err := callOK(c, ipc.MsgFsWriteFile, enc); err != nil {
+	if err := inst.WriteFile(path, []byte("chmod test"), 0644); err != nil {
 		return fmt.Errorf("WriteFile: %w", err)
 	}
 
-	// Chmod
-	enc = ipc.NewEncoder()
-	enc.String(path)
-	enc.Uint32(uint32(fs.FileMode(0755)))
-	if _, err := callOK(c, ipc.MsgFsChmod, enc); err != nil {
+	if err := inst.Chmod(path, 0755); err != nil {
 		return fmt.Errorf("Chmod: %w", err)
 	}
 
-	// Verify
-	enc = ipc.NewEncoder()
-	enc.String(path)
-	dec, err := callOK(c, ipc.MsgFsStat, enc)
+	fi, err := inst.Stat(path)
 	if err != nil {
 		return fmt.Errorf("Stat after Chmod: %w", err)
 	}
-	fi, err := ipc.DecodeFileInfo(dec)
-	if err != nil {
-		return err
-	}
-	if fi.Mode.Perm() != 0755 {
-		return fmt.Errorf("Chmod: mode=%o, want 0755", fi.Mode.Perm())
+	if fi.Mode().Perm() != 0755 {
+		return fmt.Errorf("Chmod: mode=%o, want 0755", fi.Mode().Perm())
 	}
 	return nil
 }
 
-func testChown(c *ipc.Client) error {
+func testChown(inst cc.Instance) error {
 	path := "/root/fstest_chown"
 
-	// Create file
-	enc := ipc.NewEncoder()
-	enc.String(path)
-	enc.WriteBytes([]byte("chown test"))
-	enc.Uint32(uint32(fs.FileMode(0644)))
-	if _, err := callOK(c, ipc.MsgFsWriteFile, enc); err != nil {
+	if err := inst.WriteFile(path, []byte("chown test"), 0644); err != nil {
 		return fmt.Errorf("WriteFile: %w", err)
 	}
 
-	// Chown (set to root:root)
-	enc = ipc.NewEncoder()
-	enc.String(path)
-	enc.Int32(0) // uid
-	enc.Int32(0) // gid
-	if _, err := callOK(c, ipc.MsgFsChown, enc); err != nil {
+	if err := inst.Chown(path, 0, 0); err != nil {
 		return fmt.Errorf("Chown: %w", err)
 	}
 	return nil
 }
 
-func testChtimes(c *ipc.Client) error {
+func testChtimes(inst cc.Instance) error {
 	path := "/root/fstest_chtimes"
 
-	// Create file
-	enc := ipc.NewEncoder()
-	enc.String(path)
-	enc.WriteBytes([]byte("chtimes test"))
-	enc.Uint32(uint32(fs.FileMode(0644)))
-	if _, err := callOK(c, ipc.MsgFsWriteFile, enc); err != nil {
+	if err := inst.WriteFile(path, []byte("chtimes test"), 0644); err != nil {
 		return fmt.Errorf("WriteFile: %w", err)
 	}
 
-	// Chtimes (set to Unix epoch 1000000)
-	enc = ipc.NewEncoder()
-	enc.String(path)
-	enc.Int64(1000000) // atime
-	enc.Int64(1000000) // mtime
-	if _, err := callOK(c, ipc.MsgFsChtimes, enc); err != nil {
+	t := time.Unix(1000000, 0)
+	if err := inst.Chtimes(path, t, t); err != nil {
 		return fmt.Errorf("Chtimes: %w", err)
 	}
 
-	// Verify
-	enc = ipc.NewEncoder()
-	enc.String(path)
-	dec, err := callOK(c, ipc.MsgFsStat, enc)
+	fi, err := inst.Stat(path)
 	if err != nil {
 		return fmt.Errorf("Stat after Chtimes: %w", err)
 	}
-	fi, err := ipc.DecodeFileInfo(dec)
-	if err != nil {
-		return err
-	}
-	if fi.ModTime != 1000000 {
-		return fmt.Errorf("Chtimes: ModTime=%d, want 1000000", fi.ModTime)
+	if fi.ModTime().Unix() != 1000000 {
+		return fmt.Errorf("Chtimes: ModTime=%d, want 1000000", fi.ModTime().Unix())
 	}
 	return nil
 }
 
-func testFileHandleOps(c *ipc.Client) error {
+func testFileHandleOps(inst cc.Instance) error {
 	path := "/root/fstest_handle_ops"
 
-	// OpenFile (create+write)
-	enc := ipc.NewEncoder()
-	enc.String(path)
-	enc.Int32(int32(os.O_CREATE | os.O_RDWR | os.O_TRUNC))
-	enc.Uint32(uint32(fs.FileMode(0644)))
-	dec, err := callOK(c, ipc.MsgFsOpenFile, enc)
+	f, err := inst.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("OpenFile: %w", err)
 	}
-	handle, err := dec.Uint64()
-	if err != nil {
-		return err
-	}
 
-	// FileWrite
 	writeData := []byte("file handle test data")
-	enc = ipc.NewEncoder()
-	enc.Uint64(handle)
-	enc.WriteBytes(writeData)
-	dec, err = callOK(c, ipc.MsgFileWrite, enc)
+	written, err := f.Write(writeData)
 	if err != nil {
-		return fmt.Errorf("FileWrite: %w", err)
+		f.Close()
+		return fmt.Errorf("Write: %w", err)
 	}
-	written, err := dec.Uint32()
-	if err != nil {
-		return err
-	}
-	if int(written) != len(writeData) {
-		return fmt.Errorf("FileWrite: wrote %d, want %d", written, len(writeData))
+	if written != len(writeData) {
+		f.Close()
+		return fmt.Errorf("Write: wrote %d, want %d", written, len(writeData))
 	}
 
-	// FileSeek back to start
-	enc = ipc.NewEncoder()
-	enc.Uint64(handle)
-	enc.Int64(0)
-	enc.Int32(0) // io.SeekStart
-	dec, err = callOK(c, ipc.MsgFileSeek, enc)
+	offset, err := f.Seek(0, io.SeekStart)
 	if err != nil {
-		return fmt.Errorf("FileSeek: %w", err)
-	}
-	offset, err := dec.Int64()
-	if err != nil {
-		return err
+		f.Close()
+		return fmt.Errorf("Seek: %w", err)
 	}
 	if offset != 0 {
-		return fmt.Errorf("FileSeek: offset=%d, want 0", offset)
+		f.Close()
+		return fmt.Errorf("Seek: offset=%d, want 0", offset)
 	}
 
-	// FileRead
-	enc = ipc.NewEncoder()
-	enc.Uint64(handle)
-	enc.Uint32(uint32(len(writeData)))
-	dec, err = callOK(c, ipc.MsgFileRead, enc)
+	readData := make([]byte, len(writeData))
+	n, err := f.Read(readData)
 	if err != nil {
-		return fmt.Errorf("FileRead: %w", err)
+		f.Close()
+		return fmt.Errorf("Read: %w", err)
 	}
-	readData, err := dec.Bytes()
-	if err != nil {
-		return err
-	}
+	readData = readData[:n]
 	if !bytes.Equal(readData, writeData) {
-		return fmt.Errorf("FileRead: got %q, want %q", readData, writeData)
+		f.Close()
+		return fmt.Errorf("Read: got %q, want %q", readData, writeData)
 	}
 
-	// FileClose
-	enc = ipc.NewEncoder()
-	enc.Uint64(handle)
-	if _, err := callOK(c, ipc.MsgFileClose, enc); err != nil {
-		return fmt.Errorf("FileClose: %w", err)
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("Close: %w", err)
 	}
 
 	return nil
