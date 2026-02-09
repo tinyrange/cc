@@ -185,21 +185,46 @@ func emitCRS(buf *bytes.Buffer, io ioRange, irq uint8) {
 }
 
 // emitVirtioCRS emits a _CRS buffer for virtio-mmio devices with Memory32Fixed
-// and Extended Interrupt descriptors.
+// (or QWordMemory for addresses >= 4GB) and Extended Interrupt descriptors.
 func emitVirtioCRS(buf *bytes.Buffer, baseAddr, size uint64, gsi uint32) {
 	buf.WriteByte(0x08)     // NameOp
 	buf.WriteString("_CRS") // NameString
 
 	template := bytes.Buffer{}
 
-	// Memory32Fixed Descriptor (large resource, type 0x86)
-	// Format: Tag(2) + Length(1) + ReadWrite(1) + BaseAddr(4) + Length(4)
-	template.WriteByte(0x86) // Memory32Fixed tag
-	template.WriteByte(0x09) // Length low byte (9 bytes follow)
-	template.WriteByte(0x00) // Length high byte
-	template.WriteByte(0x01) // Read/Write (1 = read-write)
-	binary.Write(&template, binary.LittleEndian, uint32(baseAddr))
-	binary.Write(&template, binary.LittleEndian, uint32(size))
+	if baseAddr < 0x100000000 && baseAddr+size <= 0x100000000 {
+		// Memory32Fixed Descriptor (large resource, type 0x86)
+		// Format: Tag(1) + Length(2) + ReadWrite(1) + BaseAddr(4) + Length(4)
+		template.WriteByte(0x86) // Memory32Fixed tag
+		template.WriteByte(0x09) // Length low byte (9 bytes follow)
+		template.WriteByte(0x00) // Length high byte
+		template.WriteByte(0x01) // Read/Write (1 = read-write)
+		binary.Write(&template, binary.LittleEndian, uint32(baseAddr))
+		binary.Write(&template, binary.LittleEndian, uint32(size))
+	} else {
+		// QWordMemory Descriptor (large resource, type 0x8A) for 64-bit addresses
+		// Format: Tag(1) + Length(2) + ResourceType(1) + GeneralFlags(1) +
+		//         TypeSpecificFlags(1) + Granularity(8) + RangeMin(8) +
+		//         RangeMax(8) + TranslationOffset(8) + Length(8) = 43 bytes
+		template.WriteByte(0x8A) // QWordMemory tag
+		template.WriteByte(0x2B) // Length low byte (43 bytes follow)
+		template.WriteByte(0x00) // Length high byte
+		template.WriteByte(0x00) // Resource Type: Memory Range
+		// General Flags: bit 0=1 (consumer), bit 1=0 (no subtractive decode)
+		template.WriteByte(0x01)
+		// Type Specific Flags: bits 0-1=01 (read-write), bits 2-4=000 (non-cacheable)
+		template.WriteByte(0x01)
+		// Granularity (0 = byte granularity)
+		binary.Write(&template, binary.LittleEndian, uint64(0))
+		// Range Minimum (base address)
+		binary.Write(&template, binary.LittleEndian, baseAddr)
+		// Range Maximum (base + size - 1)
+		binary.Write(&template, binary.LittleEndian, baseAddr+size-1)
+		// Translation Offset (0 = identity mapped)
+		binary.Write(&template, binary.LittleEndian, uint64(0))
+		// Address Length
+		binary.Write(&template, binary.LittleEndian, size)
+	}
 
 	// Extended Interrupt Descriptor (large resource, type 0x89)
 	// Format: Tag(2) + Length(2) + Flags(1) + Count(1) + Interrupts(4*count)
@@ -235,16 +260,50 @@ func wrapPkg(opcode byte, opcode2 byte, body []byte) []byte {
 	return out.Bytes()
 }
 
-// pkgLength encodes AML PkgLength for bodies that fit in 2 bytes.
+// pkgLength encodes AML PkgLength. The length includes the PkgLength bytes themselves.
 func pkgLength(bodyLen int) []byte {
-	// PkgLength encodes the length of following bytes (excluding opcode bytes).
-	if bodyLen < 0x40 {
-		return []byte{byte(bodyLen)}
+	// PkgLength encoding rules per ACPI spec:
+	// - Bits 7:6 of first byte = number of following bytes (0-3)
+	// - Single byte (0 following): bits 5:0 = length (max 63)
+	// - Two bytes (1 following): bits 3:0 of byte 0 = bits 3:0 of length,
+	//   byte 1 = bits 11:4 of length (max 4095)
+	// - The encoded length INCLUDES the PkgLength bytes themselves.
+
+	// Try single-byte encoding (total length 1-63)
+	total := bodyLen + 1 // +1 for PkgLength byte
+	if total <= 0x3F {
+		return []byte{byte(total)}
 	}
-	// two-byte encoding: bits 6:0 hold low byte, bits 7-6 set count-1
-	low := byte(bodyLen & 0xFF)
-	high := byte((bodyLen >> 8) & 0x0F)
-	return []byte{0x40 | (low & 0x3F), high}
+
+	// Try two-byte encoding (total length 64-4095)
+	total = bodyLen + 2 // +2 for PkgLength bytes
+	if total <= 0xFFF {
+		// byte 0: bits 7:6 = 01 (1 following byte), bits 3:0 = bits 3:0 of length
+		// byte 1: bits 11:4 of length
+		return []byte{0x40 | byte(total&0x0F), byte((total >> 4) & 0xFF)}
+	}
+
+	// Try three-byte encoding (total length 4096-1048575)
+	total = bodyLen + 3 // +3 for PkgLength bytes
+	if total <= 0xFFFFF {
+		// byte 0: bits 7:6 = 10 (2 following bytes), bits 3:0 = bits 3:0 of length
+		// byte 1: bits 11:4 of length
+		// byte 2: bits 19:12 of length
+		return []byte{
+			0x80 | byte(total&0x0F),
+			byte((total >> 4) & 0xFF),
+			byte((total >> 12) & 0xFF),
+		}
+	}
+
+	// Four-byte encoding for very large bodies
+	total = bodyLen + 4
+	return []byte{
+		0xC0 | byte(total&0x0F),
+		byte((total >> 4) & 0xFF),
+		byte((total >> 12) & 0xFF),
+		byte((total >> 20) & 0xFF),
+	}
 }
 
 func buildMADTBody(cfg Config) []byte {

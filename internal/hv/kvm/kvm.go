@@ -4,10 +4,15 @@ package kvm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"os/signal"
 	"runtime"
 	"sync"
+	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/tinyrange/cc/internal/acpi"
@@ -16,6 +21,25 @@ import (
 	"github.com/tinyrange/cc/internal/hv"
 	"github.com/tinyrange/cc/internal/timeslice"
 	"golang.org/x/sys/unix"
+)
+
+func init() {
+	// Install a no-op handler for SIGUSR1 so that it can interrupt
+	// blocking ioctls (KVM_RUN) when we need to stop vCPU threads.
+	// Without a handler, the signal may be ignored and not cause EINTR.
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, unix.SIGUSR1)
+	go func() {
+		for range ch {
+			// Discard signals - they're just used to interrupt ioctls
+		}
+	}()
+}
+
+// x86_64 memory layout constants for split memory (PCI hole at 3GB-4GB)
+const (
+	x86PCIHoleStart    uint64 = 0xC0000000  // 3GB - start of PCI/MMIO hole
+	x86HighMemoryStart uint64 = 0x100000000 // 4GB - start of high memory above PCI hole
 )
 
 var (
@@ -39,6 +63,7 @@ type virtualCPU struct {
 	id       int
 	fd       int
 	run      []byte
+	closed   uint32 // atomic: 1 if closed, 0 otherwise
 }
 
 // implements hv.VirtualCPU.
@@ -55,6 +80,12 @@ func (v *virtualCPU) start() {
 }
 
 func (v *virtualCPU) RequestImmediateExit(tid int) error {
+	// Check if vCPU has been closed to avoid accessing unmapped memory.
+	// This can happen when AfterFunc runs after Close() has been called.
+	if atomic.LoadUint32(&v.closed) != 0 {
+		return nil
+	}
+
 	run := (*kvmRunData)(unsafe.Pointer(&v.run[0]))
 
 	// set immediate_exit to request vCPU exit
@@ -121,6 +152,13 @@ type virtualMachine struct {
 
 	// Physical address space allocator for MMIO regions
 	addressSpace *hv.AddressSpace
+
+	// Split memory layout tracking (x86_64 only, for >3GB RAM)
+	// When highMemSize > 0, memory is split around the PCI hole:
+	//   - Low memory: GPA [memoryBase, memoryBase+lowMemSize) -> host mmap [0, lowMemSize)
+	//   - High memory: GPA [0x100000000, 0x100000000+highMemSize) -> host mmap [lowMemSize, lowMemSize+highMemSize)
+	lowMemSize  uint64 // Size of memory below PCI hole (0 means contiguous layout)
+	highMemSize uint64 // Size of memory above 4GB (0 means no high memory)
 
 	// amd64-specific fields
 	hasIRQChip   bool
@@ -257,7 +295,10 @@ func (v *virtualMachine) Close() error {
 	v.vmFd = -1
 
 	// Close vCPU run queues synchronously (just channel ops, fast)
+	// and mark each vCPU as closed to prevent AfterFunc from accessing
+	// unmapped memory.
 	for _, vcpu := range vcpus {
+		atomic.StoreUint32(&vcpu.closed, 1)
 		close(vcpu.runQueue)
 	}
 
@@ -302,18 +343,78 @@ func (v *virtualMachine) Run(ctx context.Context, cfg hv.RunConfig) error {
 		return fmt.Errorf("kvm: RunConfig is nil")
 	}
 
-	vcpu, ok := v.vcpus[0]
+	vcpuCtx, vcpuCancel := context.WithCancel(ctx)
+	defer vcpuCancel()
+
+	// Start BSP (vCPU 0)
+	bspVcpu, ok := v.vcpus[0]
 	if !ok {
 		return fmt.Errorf("kvm: no vCPU 0 found")
 	}
 
-	done := make(chan error, 1)
-
-	vcpu.runQueue <- func() {
-		done <- cfg.Run(ctx, vcpu)
+	bspDone := make(chan error, 1)
+	bspVcpu.runQueue <- func() {
+		bspDone <- cfg.Run(vcpuCtx, bspVcpu)
 	}
 
-	err := <-done
+	// Start APs (vCPUs 1..N-1) - they wait for INIT-SIPI from guest kernel.
+	// APs run in a simple loop: when halted they will be woken by IPIs
+	// (e.g., reschedule interrupts) injected via the in-kernel LAPIC.
+	var apWg sync.WaitGroup
+	for i := 1; i < len(v.vcpus); i++ {
+		vcpu, ok := v.vcpus[i]
+		if !ok {
+			continue
+		}
+		apWg.Add(1)
+		// Capture vcpu in a new variable to avoid closure capturing loop variable
+		apVcpu := vcpu
+		apVcpu.runQueue <- func() {
+			defer apWg.Done()
+			for {
+				select {
+				case <-vcpuCtx.Done():
+					return
+				default:
+				}
+				err := apVcpu.Run(vcpuCtx)
+				if err != nil {
+					if errors.Is(err, context.Canceled) ||
+						errors.Is(err, context.DeadlineExceeded) {
+						return
+					}
+					// For ErrVMHalted and other errors, continue the loop.
+					// APs halt when idle and will be woken by IPIs from BSP.
+					// KVM's LAPIC will handle interrupt injection on next KVM_RUN.
+				}
+			}
+		}
+	}
+
+	// Wait for BSP
+	err := <-bspDone
+	vcpuCancel()
+
+	// Force APs to exit by requesting immediate exit and sending signals.
+	// This is needed because APs might be blocked in KVM_RUN waiting for interrupts.
+	for i := 1; i < len(v.vcpus); i++ {
+		if vcpu, ok := v.vcpus[i]; ok {
+			run := (*kvmRunData)(unsafe.Pointer(&vcpu.run[0]))
+			run.immediate_exit = 1
+		}
+	}
+
+	// Wait for APs to notice cancellation with a reasonable timeout.
+	// The context cancellation triggers AfterFunc handlers that send SIGUSR1
+	// to each vCPU thread, which interrupts the KVM_RUN ioctl.
+	done := make(chan struct{})
+	go func() { apWg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		slog.Debug("kvm: timeout waiting for APs to stop, forcing exit")
+	}
+
 	return err
 }
 
@@ -323,13 +424,18 @@ func (v *virtualMachine) ReadAt(p []byte, off int64) (n int, err error) {
 	if v.memory == nil {
 		return 0, fmt.Errorf("kvm: ReadAt after close")
 	}
-	off = off - int64(v.memoryBase)
 
-	if off < 0 || int(off) >= len(v.memory) {
+	gpa := uint64(off)
+	hostOff, ok := v.gpaToHostOffset(gpa)
+	if !ok {
+		return 0, fmt.Errorf("kvm: ReadAt GPA 0x%x out of bounds or in PCI hole", gpa)
+	}
+
+	if hostOff < 0 || int(hostOff) >= len(v.memory) {
 		return 0, fmt.Errorf("kvm: ReadAt offset out of bounds")
 	}
 
-	n = copy(p, v.memory[off:])
+	n = copy(p, v.memory[hostOff:])
 	if n < len(p) {
 		err = fmt.Errorf("kvm: ReadAt short read")
 	}
@@ -343,13 +449,18 @@ func (v *virtualMachine) WriteAt(p []byte, off int64) (n int, err error) {
 	if v.memory == nil {
 		return 0, fmt.Errorf("kvm: WriteAt after close")
 	}
-	off = off - int64(v.memoryBase)
 
-	if off < 0 || int(off) >= len(v.memory) {
-		return 0, fmt.Errorf("kvm: WriteAt offset 0x%x out of bounds 0x%x", off, len(v.memory))
+	gpa := uint64(off)
+	hostOff, ok := v.gpaToHostOffset(gpa)
+	if !ok {
+		return 0, fmt.Errorf("kvm: WriteAt GPA 0x%x out of bounds or in PCI hole", gpa)
 	}
 
-	n = copy(v.memory[off:], p)
+	if hostOff < 0 || int(hostOff) >= len(v.memory) {
+		return 0, fmt.Errorf("kvm: WriteAt offset 0x%x out of bounds 0x%x", hostOff, len(v.memory))
+	}
+
+	n = copy(v.memory[hostOff:], p)
 	if n < len(p) {
 		err = fmt.Errorf("kvm: WriteAt short write")
 	}
@@ -365,6 +476,39 @@ func (v *virtualMachine) Arm64GICInfo() (hv.Arm64GICInfo, bool) {
 		return hv.Arm64GICInfo{}, false
 	}
 	return v.arm64GICInfo, true
+}
+
+// gpaToHostOffset translates a guest physical address to a host memory offset.
+// For split memory layouts (x86_64 with >3GB RAM), this handles the PCI hole gap:
+//   - Low memory [memoryBase, memoryBase+lowMemSize) -> host offset [0, lowMemSize)
+//   - High memory [0x100000000, 0x100000000+highMemSize) -> host offset [lowMemSize, lowMemSize+highMemSize)
+//
+// Returns the host offset and true if valid, or 0 and false if the GPA is invalid
+// (e.g., in the PCI hole or out of range).
+func (v *virtualMachine) gpaToHostOffset(gpa uint64) (int64, bool) {
+	// Contiguous layout (no split memory)
+	if v.highMemSize == 0 {
+		if gpa < v.memoryBase || gpa >= v.memoryBase+uint64(len(v.memory)) {
+			return 0, false
+		}
+		return int64(gpa - v.memoryBase), true
+	}
+
+	// Split layout: low memory below PCI hole
+	lowMemEnd := v.memoryBase + v.lowMemSize
+	if gpa >= v.memoryBase && gpa < lowMemEnd {
+		return int64(gpa - v.memoryBase), true
+	}
+
+	// Split layout: high memory above 4GB
+	highMemEnd := x86HighMemoryStart + v.highMemSize
+	if gpa >= x86HighMemoryStart && gpa < highMemEnd {
+		// High memory is stored after low memory in the host mmap
+		return int64(v.lowMemSize + (gpa - x86HighMemoryStart)), true
+	}
+
+	// GPA is in the PCI hole or out of range
+	return 0, false
 }
 
 func (v *virtualMachine) VirtualCPUCall(id int, f func(vcpu hv.VirtualCPU) error) error {
@@ -630,18 +774,65 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 	vm.memory = mem
 	vm.memoryBase = config.MemoryBase()
 
-	// Initialize physical address space allocator
-	vm.addressSpace = hv.NewAddressSpace(h.Architecture(), config.MemoryBase(), config.MemorySize())
+	// Determine if we need split memory layout (x86_64 with memory extending into PCI hole)
+	memEnd := config.MemoryBase() + config.MemorySize()
+	needsSplitMemory := h.Architecture() == hv.ArchitectureX86_64 && memEnd > x86PCIHoleStart
 
-	if err := setUserMemoryRegion(vm.vmFd, &kvmUserspaceMemoryRegion{
-		Slot:          0,
-		Flags:         0,
-		GuestPhysAddr: config.MemoryBase(),
-		MemorySize:    config.MemorySize(),
-		UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[0]))),
-	}); err != nil {
-		unix.Close(vmFd)
-		return nil, fmt.Errorf("set user memory region: %w", err)
+	if needsSplitMemory {
+		// Split memory layout: low memory below PCI hole, high memory above 4GB
+		vm.lowMemSize = x86PCIHoleStart - config.MemoryBase()
+		vm.highMemSize = config.MemorySize() - vm.lowMemSize
+
+		// Initialize physical address space allocator for split layout
+		// The address space needs to know about both memory regions
+		vm.addressSpace = hv.NewAddressSpaceSplit(
+			h.Architecture(),
+			config.MemoryBase(),
+			vm.lowMemSize,
+			x86HighMemoryStart,
+			vm.highMemSize,
+		)
+
+		// Register slot 0: low memory [memoryBase, x86PCIHoleStart)
+		if err := setUserMemoryRegion(vm.vmFd, &kvmUserspaceMemoryRegion{
+			Slot:          0,
+			Flags:         0,
+			GuestPhysAddr: config.MemoryBase(),
+			MemorySize:    vm.lowMemSize,
+			UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[0]))),
+		}); err != nil {
+			unix.Close(vmFd)
+			return nil, fmt.Errorf("set user memory region (low): %w", err)
+		}
+
+		// Register slot 1: high memory [0x100000000, 0x100000000+highMemSize)
+		// Points to the host mmap at offset lowMemSize
+		if err := setUserMemoryRegion(vm.vmFd, &kvmUserspaceMemoryRegion{
+			Slot:          1,
+			Flags:         0,
+			GuestPhysAddr: x86HighMemoryStart,
+			MemorySize:    vm.highMemSize,
+			UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[vm.lowMemSize]))),
+		}); err != nil {
+			unix.Close(vmFd)
+			return nil, fmt.Errorf("set user memory region (high): %w", err)
+		}
+
+		vm.lastMemorySlot = 1
+	} else {
+		// Contiguous memory layout (default)
+		vm.addressSpace = hv.NewAddressSpace(h.Architecture(), config.MemoryBase(), config.MemorySize())
+
+		if err := setUserMemoryRegion(vm.vmFd, &kvmUserspaceMemoryRegion{
+			Slot:          0,
+			Flags:         0,
+			GuestPhysAddr: config.MemoryBase(),
+			MemorySize:    config.MemorySize(),
+			UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[0]))),
+		}); err != nil {
+			unix.Close(vmFd)
+			return nil, fmt.Errorf("set user memory region: %w", err)
+		}
 	}
 
 	vm.rec.Record(tsKvmSetUserMemoryRegion)
@@ -650,6 +841,7 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 		if err := acpi.Install(vm, acpi.Config{
 			MemoryBase: config.MemoryBase(),
 			MemorySize: config.MemorySize(),
+			NumCPUs:    config.CPUCount(),
 		}); err != nil {
 			unix.Close(vmFd)
 			return nil, fmt.Errorf("install ACPI tables: %w", err)
@@ -666,11 +858,6 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 	vm.rec.Record(tsKvmOnCreateVMWithMemory)
 
 	// Create vCPUs
-	if config.CPUCount() != 1 {
-		unix.Close(vmFd)
-		return nil, fmt.Errorf("kvm: only 1 vCPU supported, got %d", config.CPUCount())
-	}
-
 	mmapSize, err := getVcpuMmapSize(h.fd)
 	if err != nil {
 		unix.Close(vmFd)
@@ -712,7 +899,7 @@ func (h *hypervisor) NewVirtualMachine(config hv.VMConfig) (hv.VirtualMachine, e
 
 		vm.vcpus[i] = vcpu
 
-		if err := h.archVCPUInit(vm, vcpuFd); err != nil {
+		if err := h.archVCPUInit(vm, vcpuFd, i); err != nil {
 			unix.Close(vmFd)
 			return nil, fmt.Errorf("initialize VM: %w", err)
 		}

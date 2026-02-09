@@ -505,17 +505,16 @@ func (v *virtualCPU) SetLongModeWithSelectors(pagingBase uint64, addrSpaceSize i
 
 	// 1. Setup Identity Mapping in Memory (Same logic as KVM)
 
-	// Translate a guest-phys address to an index into mem.Data.
+	// Translate a guest-phys address to a host memory offset.
+	// Uses gpaToHostOffset to handle split memory configurations.
 	host := func(gpa uint64) int {
-		if gpa < memoryBase {
-			panic("GPA below memory base")
+		offset, ok := v.vm.gpaToHostOffset(gpa)
+		if !ok {
+			panic(fmt.Sprintf("GPA 0x%X out of bounds", gpa))
 		}
-		off := gpa - memoryBase
-		if off > mem.Size() {
-			panic(fmt.Sprintf("GPA 0x%X out of bounds (memory size 0x%X)", gpa, mem.Size()))
-		}
-		return int(off)
+		return int(offset)
 	}
+	_ = memoryBase // used for computing paging structure addresses
 
 	// All paging structures must be 4KiB aligned GPAs.
 	pml4Addr := (memoryBase + pagingBase + 0x0000) &^ 0xFFF

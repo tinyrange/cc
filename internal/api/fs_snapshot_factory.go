@@ -26,10 +26,11 @@ type runOp struct {
 	cmd     []string
 	env     []string
 	workDir string
+	user    string
 }
 
 func (o *runOp) CacheKey() string {
-	return fslayer.RunOpKey(o.cmd, o.env, o.workDir)
+	return fslayer.RunOpKey(o.cmd, o.env, o.workDir, o.user)
 }
 
 func (o *runOp) Apply(ctx context.Context, inst Instance) error {
@@ -41,6 +42,9 @@ func (o *runOp) Apply(ctx context.Context, inst Instance) error {
 	}
 	if o.workDir != "" {
 		cmd = cmd.SetDir(o.workDir)
+	}
+	if o.user != "" {
+		cmd = cmd.SetUser(o.user)
 	}
 	return cmd.Run()
 }
@@ -87,12 +91,13 @@ func (o *fromOp) Apply(ctx context.Context, inst Instance) error {
 
 // FilesystemSnapshotFactory builds filesystem snapshots using Dockerfile-like operations.
 type FilesystemSnapshotFactory struct {
-	client   OCIClient
-	cacheDir string
-	ops      []FSLayerOp
-	excludes []string
-	env      []string
-	workDir  string
+	client       OCIClient
+	cacheDir     string
+	ops          []FSLayerOp
+	excludes     []string
+	env          []string
+	workDir      string
+	buildOptions []Option
 }
 
 // NewFilesystemSnapshotFactory creates a new factory for building filesystem snapshots.
@@ -101,6 +106,10 @@ func NewFilesystemSnapshotFactory(client OCIClient, cacheDir string) *Filesystem
 		client:   client,
 		cacheDir: cacheDir,
 	}
+}
+
+func (f *FilesystemSnapshotFactory) SetBuildOptions(opts ...Option) {
+	f.buildOptions = append(f.buildOptions, opts...)
 }
 
 // From sets the base image for the snapshot.
@@ -257,7 +266,7 @@ func (f *FilesystemSnapshotFactory) Build(ctx context.Context) (FilesystemSnapsh
 		op := f.ops[i]
 
 		// Create instance from current snapshot (no timeout for factory builds)
-		inst, err := New(currentSnap)
+		inst, err := New(currentSnap, f.buildOptions...)
 		if err != nil {
 			return nil, fmt.Errorf("create instance for op %d: %w", i, err)
 		}

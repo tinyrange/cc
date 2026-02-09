@@ -156,6 +156,7 @@ type instanceCmd struct {
 	args []string
 	env  []string
 	dir  string
+	user string
 
 	stdin  io.Reader
 	stdout io.Writer
@@ -216,6 +217,7 @@ func (c *instanceCmd) runCommand() {
 
 	// Prepare command path and args
 	cmdPath := c.name
+	args := c.args
 
 	// Resolve command path if it doesn't contain "/"
 	// Search the live filesystem (fsBackend) for the executable in PATH.
@@ -230,6 +232,20 @@ func (c *instanceCmd) runCommand() {
 			return
 		}
 		cmdPath = resolved
+	}
+
+	// If a non-root user is specified, wrap command with su.
+	// Skip for root since the process already runs as root.
+	// Use -p (preserve environment) instead of - (login shell) so that
+	// environment variables (e.g. from Dockerfile ENV) are not cleared.
+	if c.user != "" && c.user != "root" {
+		// Build the command string for su -c
+		cmdStr := cmdPath
+		for _, arg := range args {
+			cmdStr += " " + shellQuote(arg)
+		}
+		cmdPath = "/bin/su"
+		args = []string{"-p", c.user, "-c", cmdStr}
 	}
 
 	// Check if stdin is set (we'll use streaming mode if so)
@@ -247,7 +263,7 @@ func (c *instanceCmd) runCommand() {
 		Entrypoint: "main",
 		Methods: map[string]ir.Method{
 			"main": {
-				initx.ForkExecWaitWithCwd(cmdPath, c.args, env, c.dir, errLabel, execErrLabel, errVar),
+				initx.ForkExecWaitWithCwd(cmdPath, args, env, c.dir, errLabel, execErrLabel, errVar),
 				ir.Return(errVar),
 				ir.DeclareLabel(errLabel, ir.Block{
 					ir.Printf("cc: exec error: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
@@ -341,6 +357,7 @@ func (c *instanceCmd) runCommand() {
 func (c *instanceCmd) runInteractiveCommand() {
 	// Prepare command path and args
 	cmdPath := c.name
+	args := c.args
 
 	// Resolve command path if it doesn't contain "/"
 	if !strings.Contains(cmdPath, "/") {
@@ -356,6 +373,20 @@ func (c *instanceCmd) runInteractiveCommand() {
 		cmdPath = resolved
 	}
 
+	// If a non-root user is specified, wrap command with su.
+	// Skip for root since the process already runs as root.
+	// Use -p (preserve environment) instead of - (login shell) so that
+	// environment variables (e.g. from Dockerfile ENV) are not cleared.
+	if c.user != "" && c.user != "root" {
+		// Build the command string for su -c
+		cmdStr := cmdPath
+		for _, arg := range args {
+			cmdStr += " " + shellQuote(arg)
+		}
+		cmdPath = "/bin/su"
+		args = []string{"-p", c.user, "-c", cmdStr}
+	}
+
 	// Use the command's environment (already merged in CommandContext)
 	env := c.env
 
@@ -368,7 +399,7 @@ func (c *instanceCmd) runInteractiveCommand() {
 		Entrypoint: "main",
 		Methods: map[string]ir.Method{
 			"main": {
-				initx.ForkExecWaitWithCwd(cmdPath, c.args, env, c.dir, errLabel, execErrLabel, errVar),
+				initx.ForkExecWaitWithCwd(cmdPath, args, env, c.dir, errLabel, execErrLabel, errVar),
 				ir.Return(errVar),
 				ir.DeclareLabel(errLabel, ir.Block{
 					ir.Printf("cc: exec error: errno=0x%x\n", ir.Op(ir.OpSub, ir.Int64(0), errVar)),
@@ -483,6 +514,12 @@ func (c *instanceCmd) SetDir(dir string) Cmd {
 	return c
 }
 
+// SetUser sets the user to run the command as.
+func (c *instanceCmd) SetUser(user string) Cmd {
+	c.user = user
+	return c
+}
+
 // SetEnv sets a single environment variable (like os.Setenv).
 func (c *instanceCmd) SetEnv(key, value string) Cmd {
 	// Look for existing key and update it
@@ -579,4 +616,22 @@ func (inst *instance) execCommand(ctx context.Context, name string, args []strin
 		return &Error{Op: "exec", Path: name, Err: err}
 	}
 	return nil
+}
+
+// shellQuote quotes a string for safe use in a shell command.
+func shellQuote(s string) string {
+	// If the string is safe (alphanumeric, underscore, dash, dot, slash), return as-is
+	safe := true
+	for _, c := range s {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			c == '_' || c == '-' || c == '.' || c == '/') {
+			safe = false
+			break
+		}
+	}
+	if safe && len(s) > 0 {
+		return s
+	}
+	// Use single quotes and escape any single quotes in the string
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }

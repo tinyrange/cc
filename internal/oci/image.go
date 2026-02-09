@@ -506,6 +506,7 @@ func populateRuntimeConfig(cfg *RuntimeConfig, imageCfg imageConfig) {
 	if len(imageCfg.Config.Env) > 0 {
 		cfg.Env = append(cfg.Env, imageCfg.Config.Env...)
 	}
+
 	if len(imageCfg.Config.Cmd) > 0 {
 		cfg.Cmd = append(cfg.Cmd, imageCfg.Config.Cmd...)
 	}

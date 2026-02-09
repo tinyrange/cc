@@ -245,6 +245,13 @@ func (v *virtualCPU) Run(ctx context.Context) error {
 	// clear immediate_exit in case it was set
 	run.immediate_exit = 0
 
+	// Check if context is already cancelled before running.
+	// This handles the race where context was cancelled between iterations:
+	// the signal was delivered but we cleared immediate_exit above.
+	if usingContext && ctx.Err() != nil {
+		return ctx.Err()
+	}
+
 	debug.Writef("kvm-amd64.Run run", "vCPU %d running", v.id)
 
 	v.rec.Record(tsKvmHostTime)
@@ -481,8 +488,8 @@ var (
 	tsKvmRestoreSnapshotDone    = timeslice.RegisterKind("kvm_restore_snapshot_done", 0)
 )
 
-func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int) error {
-	debug.Writef("kvm-amd64.archVCPUInit", "archVCPUInit")
+func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int, vcpuID int) error {
+	debug.Writef("kvm-amd64.archVCPUInit", "archVCPUInit vcpuID=%d", vcpuID)
 
 	cpuId, err := getSupportedCpuId(hv.fd)
 	if err != nil {
@@ -491,17 +498,19 @@ func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int) error {
 
 	vm.rec.Record(tsKvmGetSupportedCpuId)
 
-	// Normalize CPUID-reported APIC IDs to match LAPIC ID 0 in our ACPI/MADT.
+	// Set per-vCPU APIC IDs to match ACPI/MADT entries (APIC ID = vCPU index).
 	// Hosts may return a non-zero APIC ID in leaf 0x1 EBX[31:24], which leads
 	// to kernel warnings and can break timer setup during boot.
 	entries := unsafe.Slice((*kvmCPUIDEntry2)(unsafe.Pointer(uintptr(unsafe.Pointer(cpuId))+unsafe.Sizeof(*cpuId))), cpuId.Nr)
 	for i := range entries {
 		switch entries[i].Function {
 		case 0x1:
-			entries[i].Ebx &^= 0xFF000000 // clear initial APIC ID
+			// EBX[31:24] = initial APIC ID
+			entries[i].Ebx &^= 0xFF000000
+			entries[i].Ebx |= uint32(vcpuID) << 24
 		case 0xB: // extended topology (x2APIC ID in EDX)
 			entries[i].Ebx = 1 // one logical processor at this level
-			entries[i].Edx = 0 // x2APIC ID
+			entries[i].Edx = uint32(vcpuID)
 		}
 	}
 
