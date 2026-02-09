@@ -4,7 +4,7 @@
 // entitlements on macOS.
 package main
 
-import "github.com/tinyrange/cc/bindings/c/helper"
+import "github.com/tinyrange/cc/internal/helper"
 
 func main() {
 	helper.Main()

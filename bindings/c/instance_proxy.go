@@ -11,7 +11,7 @@ import (
 	"time"
 
 	cc "github.com/tinyrange/cc"
-	"github.com/tinyrange/cc/bindings/c/ipc"
+	"github.com/tinyrange/cc/internal/ipc"
 )
 
 // instanceProxy wraps either a direct cc.Instance or an IPC client connection.

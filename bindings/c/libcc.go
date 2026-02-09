@@ -202,7 +202,7 @@ import (
 	"unsafe"
 
 	cc "github.com/tinyrange/cc"
-	"github.com/tinyrange/cc/bindings/c/ipc"
+	"github.com/tinyrange/cc/internal/ipc"
 	"github.com/tinyrange/cc/internal/api"
 )
 

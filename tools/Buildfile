@@ -192,6 +192,16 @@ bindings-test: libcc-test bindings-python-test bindings-nodejs-test bindings-rus
 # Benchmarks
 # ============================================================================
 
+# Helper multi-VM benchmark
+helper-bench: cc-helper
+    gobuild cmd/helper-bench -o $(OUTPUT)/helper-bench -entitlements $(ENTITLEMENTS)
+    run $(OUTPUT)/helper-bench
+
+# Helper filesystem test
+helper-fstest: cc-helper
+    gobuild cmd/helper-fstest -o $(OUTPUT)/helper-fstest -entitlements $(ENTITLEMENTS)
+    run $(OUTPUT)/helper-fstest
+
 bench-tests:
     sh go test -o $(OUTPUT)/benchTests -c ./internal/bench
     @darwin gobuild internal/cmd/codesign -o $(OUTPUT)/codesign

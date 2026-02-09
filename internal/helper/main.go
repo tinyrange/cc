@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/tinyrange/cc/bindings/c/ipc"
+	"github.com/tinyrange/cc/internal/ipc"
 )
 
 // Main runs the cc-helper process.
