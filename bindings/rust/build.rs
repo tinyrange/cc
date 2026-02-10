@@ -49,14 +49,14 @@ fn main() {
     // Build cc-helper and copy to target directory
     build_and_install_helper(&out_dir, &project_root);
 
-    // Rerun if Go source files change
+    // Rerun if Go source files change (bindings/c and its internal dependencies)
     let bindings_c_dir = manifest_dir.join("../c");
     if bindings_c_dir.exists() {
-        println!("cargo:rerun-if-changed={}", bindings_c_dir.join("libcc.go").display());
-        println!("cargo:rerun-if-changed={}", bindings_c_dir.join("instance_proxy.go").display());
-        println!("cargo:rerun-if-changed={}", bindings_c_dir.join("error.go").display());
-        println!("cargo:rerun-if-changed={}", bindings_c_dir.join("handles.go").display());
-        println!("cargo:rerun-if-changed={}", bindings_c_dir.join("ipc/client.go").display());
+        emit_rerun_if_changed_go(&bindings_c_dir);
+    }
+    let internal_ipc_dir = project_root.join("internal/ipc");
+    if internal_ipc_dir.exists() {
+        emit_rerun_if_changed_go(&internal_ipc_dir);
     }
 
     // Rerun if helper source changes
@@ -238,18 +238,18 @@ fn needs_rebuild(lib_path: &PathBuf, bindings_c: &PathBuf) -> bool {
         Err(_) => return true,
     };
 
-    let source_files = [
-        bindings_c.join("libcc.go"),
-        bindings_c.join("instance_proxy.go"),
-        bindings_c.join("error.go"),
-        bindings_c.join("handles.go"),
-    ];
+    // Check bindings/c source files
+    if walkdir_newer_than(bindings_c, lib_mtime) {
+        return true;
+    }
 
-    source_files.iter().any(|src| {
-        std::fs::metadata(src)
-            .and_then(|m| m.modified())
-            .map_or(true, |src_time| src_time > lib_mtime)
-    })
+    // Check internal/ipc (imported by bindings/c/libcc.go)
+    let internal_ipc = bindings_c.join("../../internal/ipc");
+    if internal_ipc.exists() && walkdir_newer_than(&internal_ipc, lib_mtime) {
+        return true;
+    }
+
+    false
 }
 
 /// Check if any file in a directory tree is newer than the given time.
@@ -273,6 +273,20 @@ fn walkdir_newer_than(dir: &PathBuf, threshold: std::time::SystemTime) -> bool {
         }
     }
     false
+}
+
+/// Emit cargo:rerun-if-changed for every .go file in a directory tree.
+fn emit_rerun_if_changed_go(dir: &PathBuf) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                emit_rerun_if_changed_go(&path);
+            } else if path.extension().map_or(false, |e| e == "go") {
+                println!("cargo:rerun-if-changed={}", path.display());
+            }
+        }
+    }
 }
 
 /// Find the profile directory (e.g. target/debug/ or target/<triple>/debug/) from OUT_DIR.
