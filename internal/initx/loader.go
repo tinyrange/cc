@@ -1311,6 +1311,7 @@ func WithDmesgLogging(enabled bool) Option {
 	return funcOption(func(vm *VirtualMachine) error {
 		if enabled {
 			vm.dmesgLogging = true
+			vm.debugLogging = true // Enable serial console output so dmesg is visible
 		}
 		return nil
 	})

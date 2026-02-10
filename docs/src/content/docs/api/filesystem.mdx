@@ -1,0 +1,984 @@
+---
+title: Filesystem
+description: Working with the guest filesystem
+---
+
+import LanguageTabs from '../../../components/LanguageTabs.astro';
+import LangTabItem from '../../../components/LangTabItem.astro';
+
+The filesystem interface provides operations on the guest VM. It mirrors functions from standard library I/O, making it familiar to use.
+
+## Overview
+
+Every instance provides filesystem methods directly:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+// Write a file
+err := instance.WriteFile("/tmp/hello.txt", []byte("Hello!"), 0644)
+
+// Read it back
+content, err := instance.ReadFile("/tmp/hello.txt")
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# Write a file
+inst.write_file("/tmp/hello.txt", b"Hello!")
+
+# Read it back
+content = inst.read_file("/tmp/hello.txt")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// Write a file
+inst.write_file("/tmp/hello.txt", b"Hello!", 0o644)?;
+
+// Read it back
+let content = inst.read_file("/tmp/hello.txt")?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// Write a file
+await inst.writeFile('/tmp/hello.txt', Buffer.from('Hello!'));
+
+// Read it back
+const content = await inst.readFile('/tmp/hello.txt');
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// Write a file
+cc_fs_write_file(inst, "/tmp/hello.txt", (const uint8_t*)"Hello!", 6, 0644, &err);
+
+// Read it back
+uint8_t* content;
+size_t len;
+cc_fs_read_file(inst, "/tmp/hello.txt", &content, &len, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Reading Files
+
+### ReadFile
+
+Read an entire file into memory:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+content, err := instance.ReadFile("/etc/os-release")
+if err != nil {
+    return err
+}
+fmt.Println(string(content))
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+content = inst.read_file("/etc/os-release")
+print(content.decode())
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let content = inst.read_file("/etc/os-release")?;
+println!("{}", String::from_utf8_lossy(&content));
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const content = await inst.readFile('/etc/os-release');
+console.log(content.toString());
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+uint8_t* content;
+size_t len;
+cc_fs_read_file(inst, "/etc/os-release", &content, &len, &err);
+printf("%.*s\n", (int)len, content);
+cc_free_bytes(content);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### Open
+
+Open a file for reading (returns a file handle):
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+file, err := instance.Open("/etc/passwd")
+if err != nil {
+    return err
+}
+defer file.Close()
+
+// Read line by line
+scanner := bufio.NewScanner(file)
+for scanner.Scan() {
+    fmt.Println(scanner.Text())
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+with inst.open("/etc/passwd") as f:
+    content = f.read()
+    for line in content.decode().splitlines():
+        print(line)
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+use std::io::Read;
+
+let mut file = inst.open("/etc/passwd")?;
+let mut contents = String::new();
+file.read_to_string(&mut contents)?;
+for line in contents.lines() {
+    println!("{}", line);
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+await using file = await inst.open('/etc/passwd');
+const content = await file.read();
+content.toString().split('\n').forEach(line => console.log(line));
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_file file;
+cc_fs_open(inst, "/etc/passwd", &file, &err);
+
+uint8_t buf[1024];
+size_t n;
+while (cc_file_read(file, buf, sizeof(buf), &n, &err) == CC_OK && n > 0) {
+    printf("%.*s", (int)n, buf);
+}
+
+cc_file_close(file, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### Stat
+
+Get file information:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+info, err := instance.Stat("/tmp/file.txt")
+if err != nil {
+    if os.IsNotExist(err) {
+        fmt.Println("File doesn't exist")
+    }
+    return err
+}
+
+fmt.Printf("Size: %d bytes\n", info.Size())
+fmt.Printf("Mode: %s\n", info.Mode())
+fmt.Printf("Modified: %s\n", info.ModTime())
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+try:
+    info = inst.stat("/tmp/file.txt")
+    print(f"Size: {info.size} bytes")
+    print(f"Mode: {oct(info.mode)}")
+    print(f"Is dir: {info.is_dir}")
+except cc.IOError:
+    print("File doesn't exist")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+match inst.stat("/tmp/file.txt") {
+    Ok(info) => {
+        println!("Size: {} bytes", info.size);
+        println!("Mode: {:o}", info.mode);
+        println!("Is dir: {}", info.is_dir);
+    }
+    Err(cc::Error::Io { .. }) => println!("File doesn't exist"),
+    Err(e) => return Err(e),
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+try {
+    const info = await inst.stat('/tmp/file.txt');
+    console.log(`Size: ${info.size} bytes`);
+    console.log(`Mode: ${info.mode.toString(8)}`);
+    console.log(`Is dir: ${info.isDir}`);
+} catch (e) {
+    if (e instanceof IOError) {
+        console.log("File doesn't exist");
+    }
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_file_info info;
+if (cc_fs_stat(inst, "/tmp/file.txt", &info, &err) == CC_OK) {
+    printf("Size: %lld bytes\n", info.size);
+    printf("Mode: %o\n", info.mode);
+    printf("Is dir: %d\n", info.is_dir);
+} else {
+    printf("File doesn't exist\n");
+    cc_error_free(&err);
+}
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Writing Files
+
+### WriteFile
+
+Write data to a file, creating it if necessary:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+data := []byte("Hello, World!\n")
+err := instance.WriteFile("/app/output.txt", data, 0644)
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+data = b"Hello, World!\n"
+inst.write_file("/app/output.txt", data, mode=0o644)
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let data = b"Hello, World!\n";
+inst.write_file("/app/output.txt", data, 0o644)?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const data = Buffer.from('Hello, World!\n');
+await inst.writeFile('/app/output.txt', data, 0o644);
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+const char* data = "Hello, World!\n";
+cc_fs_write_file(inst, "/app/output.txt", (const uint8_t*)data, strlen(data), 0644, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### Create
+
+Create or truncate a file for writing:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+file, err := instance.Create("/app/log.txt")
+if err != nil {
+    return err
+}
+defer file.Close()
+
+file.Write([]byte("Log entry 1\n"))
+file.Write([]byte("Log entry 2\n"))
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+with inst.create("/app/log.txt") as f:
+    f.write(b"Log entry 1\n")
+    f.write(b"Log entry 2\n")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+use std::io::Write;
+
+let mut file = inst.create("/app/log.txt")?;
+file.write_all(b"Log entry 1\n")?;
+file.write_all(b"Log entry 2\n")?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+await using file = await inst.create('/app/log.txt');
+await file.write(Buffer.from('Log entry 1\n'));
+await file.write(Buffer.from('Log entry 2\n'));
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_file file;
+cc_fs_create(inst, "/app/log.txt", &file, &err);
+cc_file_write(file, (const uint8_t*)"Log entry 1\n", 12, NULL, &err);
+cc_file_write(file, (const uint8_t*)"Log entry 2\n", 12, NULL, &err);
+cc_file_close(file, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### OpenFile
+
+Open with specific flags and permissions:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+file, err := instance.OpenFile("/app/data.bin",
+    os.O_RDWR|os.O_CREATE|os.O_APPEND, 0644)
+if err != nil {
+    return err
+}
+defer file.Close()
+
+file.Write([]byte("appended data"))
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# Use open with flags
+file = inst.open_file("/app/data.bin", cc.O_RDWR | cc.O_CREATE | cc.O_APPEND, 0o644)
+file.write(b"appended data")
+file.close()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+use cc::flags::*;
+use std::io::Write;
+
+let mut file = inst.open_file("/app/data.bin", O_RDWR | O_CREATE | O_APPEND, 0o644)?;
+file.write_all(b"appended data")?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// Use openFile with flags
+await using file = await inst.openFile('/app/data.bin',
+    OpenFlags.RDWR | OpenFlags.CREATE | OpenFlags.APPEND, 0o644);
+await file.write(Buffer.from('appended data'));
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_file file;
+cc_fs_open_file(inst, "/app/data.bin", CC_O_RDWR | CC_O_CREATE | CC_O_APPEND, 0644, &file, &err);
+cc_file_write(file, (const uint8_t*)"appended data", 13, NULL, &err);
+cc_file_close(file, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Directories
+
+### Mkdir
+
+Create a single directory:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+err := instance.Mkdir("/app/data", 0755)
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+inst.mkdir("/app/data", mode=0o755)
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+inst.mkdir("/app/data", 0o755)?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+await inst.mkdir('/app/data', 0o755);
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_fs_mkdir(inst, "/app/data", 0755, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### MkdirAll
+
+Create a directory and all parent directories:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+err := instance.MkdirAll("/app/data/cache/temp", 0755)
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+inst.mkdir_all("/app/data/cache/temp", mode=0o755)
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+inst.mkdir_all("/app/data/cache/temp", 0o755)?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+await inst.mkdirAll('/app/data/cache/temp', 0o755);
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_fs_mkdir_all(inst, "/app/data/cache/temp", 0755, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### ReadDir
+
+List directory contents:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+entries, err := instance.ReadDir("/etc")
+if err != nil {
+    return err
+}
+
+for _, entry := range entries {
+    if entry.IsDir() {
+        fmt.Printf("[DIR]  %s\n", entry.Name())
+    } else {
+        fmt.Printf("[FILE] %s\n", entry.Name())
+    }
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+entries = inst.read_dir("/etc")
+for entry in entries:
+    if entry.is_dir:
+        print(f"[DIR]  {entry.name}")
+    else:
+        print(f"[FILE] {entry.name}")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let entries = inst.read_dir("/etc")?;
+for entry in entries {
+    if entry.is_dir {
+        println!("[DIR]  {}", entry.name);
+    } else {
+        println!("[FILE] {}", entry.name);
+    }
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const entries = await inst.readDir('/etc');
+for (const entry of entries) {
+    if (entry.isDir) {
+        console.log(`[DIR]  ${entry.name}`);
+    } else {
+        console.log(`[FILE] ${entry.name}`);
+    }
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_dir_entry* entries;
+size_t count;
+cc_fs_read_dir(inst, "/etc", &entries, &count, &err);
+
+for (size_t i = 0; i < count; i++) {
+    if (entries[i].is_dir) {
+        printf("[DIR]  %s\n", entries[i].name);
+    } else {
+        printf("[FILE] %s\n", entries[i].name);
+    }
+}
+
+cc_free_dir_entries(entries, count);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Removing Files
+
+### Remove
+
+Remove a single file or empty directory:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+err := instance.Remove("/tmp/file.txt")
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+inst.remove("/tmp/file.txt")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+inst.remove("/tmp/file.txt")?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+await inst.remove('/tmp/file.txt');
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_fs_remove(inst, "/tmp/file.txt", &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### RemoveAll
+
+Remove a file or directory tree recursively:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+err := instance.RemoveAll("/app/cache")
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+inst.remove_all("/app/cache")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+inst.remove_all("/app/cache")?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+await inst.removeAll('/app/cache');
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_fs_remove_all(inst, "/app/cache", &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Symlinks
+
+### Symlink
+
+Create a symbolic link:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+err := instance.Symlink("/usr/bin/python3", "/usr/local/bin/python")
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+inst.symlink("/usr/bin/python3", "/usr/local/bin/python")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+inst.symlink("/usr/bin/python3", "/usr/local/bin/python")?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+await inst.symlink('/usr/bin/python3', '/usr/local/bin/python');
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_fs_symlink(inst, "/usr/bin/python3", "/usr/local/bin/python", &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### Readlink
+
+Read the target of a symbolic link:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+target, err := instance.Readlink("/usr/bin/python")
+fmt.Printf("python -> %s\n", target)
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+target = inst.readlink("/usr/bin/python")
+print(f"python -> {target}")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let target = inst.readlink("/usr/bin/python")?;
+println!("python -> {}", target);
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const target = await inst.readlink('/usr/bin/python');
+console.log(`python -> ${target}`);
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+char* target;
+cc_fs_readlink(inst, "/usr/bin/python", &target, &err);
+printf("python -> %s\n", target);
+cc_free_string(target);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## File Permissions
+
+### Chmod
+
+Change file permissions:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+err := instance.Chmod("/app/script.sh", 0755)
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+inst.chmod("/app/script.sh", 0o755)
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+inst.chmod("/app/script.sh", 0o755)?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+await inst.chmod('/app/script.sh', 0o755);
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_fs_chmod(inst, "/app/script.sh", 0755, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### Chown
+
+Change file ownership:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+err := instance.Chown("/app/data", 1000, 1000) // uid, gid
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+inst.chown("/app/data", 1000, 1000)  # uid, gid
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+inst.chown("/app/data", 1000, 1000)?; // uid, gid
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+await inst.chown('/app/data', 1000, 1000); // uid, gid
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_fs_chown(inst, "/app/data", 1000, 1000, &err); // uid, gid
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Rename
+
+Move or rename a file:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+err := instance.Rename("/tmp/old.txt", "/tmp/new.txt")
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+inst.rename("/tmp/old.txt", "/tmp/new.txt")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+inst.rename("/tmp/old.txt", "/tmp/new.txt")?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+await inst.rename('/tmp/old.txt', '/tmp/new.txt');
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_fs_rename(inst, "/tmp/old.txt", "/tmp/new.txt", &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## File Interface
+
+The file handle type returned by open/create implements standard I/O traits:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+type File interface {
+    io.Reader
+    io.Writer
+    io.Closer
+    io.Seeker
+    io.ReaderAt
+    io.WriterAt
+
+    Stat() (fs.FileInfo, error)
+    Sync() error
+    Truncate(size int64) error
+    Name() string
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+class File:
+    def read(self, size: int = -1) -> bytes: ...
+    def write(self, data: bytes) -> int: ...
+    def seek(self, offset: int, whence: int = 0) -> int: ...
+    def stat(self) -> FileInfo: ...
+    def sync(self) -> None: ...
+    def truncate(self, size: int) -> None: ...
+    def close(self) -> None: ...
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// File implements std::io::Read, Write, Seek
+impl std::io::Read for File { ... }
+impl std::io::Write for File { ... }
+impl std::io::Seek for File { ... }
+
+impl File {
+    pub fn stat(&self) -> Result<FileInfo>;
+    pub fn sync(&self) -> Result<()>;
+    pub fn truncate(&self, size: i64) -> Result<()>;
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+interface File extends AsyncDisposable {
+    read(size?: number): Promise<Buffer>;
+    write(data: Buffer): Promise<number>;
+    seek(offset: number, whence?: SeekWhence): Promise<number>;
+    stat(): Promise<FileInfo>;
+    sync(): Promise<void>;
+    truncate(size: number): Promise<void>;
+    close(): Promise<void>;
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_error_code cc_file_read(cc_file f, uint8_t* buf, size_t len, size_t* n, cc_error* err);
+cc_error_code cc_file_write(cc_file f, const uint8_t* buf, size_t len, size_t* n, cc_error* err);
+cc_error_code cc_file_seek(cc_file f, int64_t offset, cc_seek_whence whence, int64_t* pos, cc_error* err);
+cc_error_code cc_file_stat(cc_file f, cc_file_info* out, cc_error* err);
+cc_error_code cc_file_sync(cc_file f, cc_error* err);
+cc_error_code cc_file_truncate(cc_file f, int64_t size, cc_error* err);
+cc_error_code cc_file_close(cc_file f, cc_error* err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Example: Deploy a Web Application
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+func deploy(instance cc.Instance, appDir string) error {
+    // Create application directory
+    if err := instance.MkdirAll("/app", 0755); err != nil {
+        return err
+    }
+
+    // Copy files from host to guest
+    entries, err := os.ReadDir(appDir)
+    if err != nil {
+        return err
+    }
+
+    for _, entry := range entries {
+        if entry.IsDir() {
+            continue
+        }
+
+        hostPath := filepath.Join(appDir, entry.Name())
+        guestPath := "/app/" + entry.Name()
+
+        data, err := os.ReadFile(hostPath)
+        if err != nil {
+            return err
+        }
+
+        if err := instance.WriteFile(guestPath, data, 0644); err != nil {
+            return err
+        }
+    }
+
+    return nil
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+import os
+
+def deploy(inst, app_dir):
+    # Create application directory
+    inst.mkdir_all("/app")
+
+    # Copy files from host to guest
+    for entry in os.listdir(app_dir):
+        host_path = os.path.join(app_dir, entry)
+        if os.path.isdir(host_path):
+            continue
+
+        guest_path = f"/app/{entry}"
+        with open(host_path, "rb") as f:
+            data = f.read()
+        inst.write_file(guest_path, data)
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+use std::fs;
+use std::path::Path;
+
+fn deploy(inst: &Instance, app_dir: &str) -> cc::Result<()> {
+    // Create application directory
+    inst.mkdir_all("/app", 0o755)?;
+
+    // Copy files from host to guest
+    for entry in fs::read_dir(app_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            continue;
+        }
+
+        let host_path = entry.path();
+        let guest_path = format!("/app/{}", entry.file_name().to_string_lossy());
+
+        let data = fs::read(&host_path)?;
+        inst.write_file(&guest_path, &data, 0o644)?;
+    }
+
+    Ok(())
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+import * as fs from 'fs';
+import * as path from 'path';
+
+async function deploy(inst: Instance, appDir: string) {
+    // Create application directory
+    await inst.mkdirAll('/app');
+
+    // Copy files from host to guest
+    const entries = fs.readdirSync(appDir);
+    for (const entry of entries) {
+        const hostPath = path.join(appDir, entry);
+        if (fs.statSync(hostPath).isDirectory()) {
+            continue;
+        }
+
+        const guestPath = `/app/${entry}`;
+        const data = fs.readFileSync(hostPath);
+        await inst.writeFile(guestPath, data);
+    }
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// Simplified example - real implementation would use dirent.h
+void deploy(cc_instance inst, const char* app_dir) {
+    cc_error err = {0};
+
+    // Create application directory
+    cc_fs_mkdir_all(inst, "/app", 0755, &err);
+
+    // Read and copy each file
+    // (platform-specific directory iteration omitted)
+    const char* filename = "index.html";
+    char host_path[512], guest_path[512];
+    snprintf(host_path, sizeof(host_path), "%s/%s", app_dir, filename);
+    snprintf(guest_path, sizeof(guest_path), "/app/%s", filename);
+
+    // Read from host, write to guest
+    FILE* f = fopen(host_path, "rb");
+    fseek(f, 0, SEEK_END);
+    size_t len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t* data = malloc(len);
+    fread(data, 1, len, f);
+    fclose(f);
+
+    cc_fs_write_file(inst, guest_path, data, len, 0644, &err);
+    free(data);
+}
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Next Steps
+
+- [Command Execution](/cc/api/commands/) - Run programs in the VM
+- [Filesystem Snapshots](/cc/api/snapshots/) - Save and restore filesystem state

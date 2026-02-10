@@ -4,10 +4,12 @@ import (
 	"strings"
 )
 
-// expandVariables expands variable references in a string.
+// expandVariablesImpl expands variable references in a string.
 // Supports: $VAR, ${VAR}, ${VAR:-default}, ${VAR:+alternate}
 // Use $$ for literal $.
-func expandVariables(s string, vars map[string]string, depth int) (string, error) {
+// If preserveUndefined is true, undefined variables are left as-is (for RUN commands).
+// If preserveUndefined is false, undefined variables expand to empty string (for ENV, COPY, etc).
+func expandVariablesImpl(s string, vars map[string]string, depth int, preserveUndefined bool) (string, error) {
 	if depth > MaxVariableExpansion {
 		return "", ErrVariableExpansionLoop
 	}
@@ -52,7 +54,7 @@ func expandVariables(s string, vars map[string]string, depth int) (string, error
 			end += i // Convert to absolute index
 
 			expr := s[i+2 : end] // Content between ${ and }
-			expanded, err := expandBraceExpr(expr, vars, depth)
+			expanded, err := expandBraceExprImpl(expr, vars, depth, preserveUndefined)
 			if err != nil {
 				return "", err
 			}
@@ -77,27 +79,34 @@ func expandVariables(s string, vars map[string]string, depth int) (string, error
 		varName := s[i+1 : j]
 		if val, ok := vars[varName]; ok {
 			// Recursively expand the value
-			expanded, err := expandVariables(val, vars, depth+1)
+			expanded, err := expandVariablesImpl(val, vars, depth+1, preserveUndefined)
 			if err != nil {
 				return "", err
 			}
 			result.WriteString(expanded)
+		} else if preserveUndefined {
+			// Variable not found - leave as-is for shell to handle
+			result.WriteByte('$')
+			result.WriteString(varName)
 		}
-		// If variable not found, expand to empty string (Docker behavior)
+		// If not preserveUndefined, expand to empty string (Docker behavior for ENV, etc)
 		i = j
 	}
 
 	return result.String(), nil
 }
 
-// expandBraceExpr expands a ${...} expression.
-func expandBraceExpr(expr string, vars map[string]string, depth int) (string, error) {
+// expandBraceExprImpl expands a ${...} expression.
+func expandBraceExprImpl(expr string, vars map[string]string, depth int, preserveUndefined bool) (string, error) {
 	// Check for modifier patterns
 	colonIdx := strings.Index(expr, ":")
 	if colonIdx == -1 {
 		// Simple ${VAR}
 		if val, ok := vars[expr]; ok {
-			return expandVariables(val, vars, depth+1)
+			return expandVariablesImpl(val, vars, depth+1, preserveUndefined)
+		}
+		if preserveUndefined {
+			return "${" + expr + "}", nil
 		}
 		return "", nil
 	}
@@ -106,7 +115,10 @@ func expandBraceExpr(expr string, vars map[string]string, depth int) (string, er
 	if colonIdx+1 >= len(expr) {
 		// ${VAR:} with nothing after colon
 		if val, ok := vars[varName]; ok {
-			return expandVariables(val, vars, depth+1)
+			return expandVariablesImpl(val, vars, depth+1, preserveUndefined)
+		}
+		if preserveUndefined {
+			return "${" + expr + "}", nil
 		}
 		return "", nil
 	}
@@ -121,21 +133,24 @@ func expandBraceExpr(expr string, vars map[string]string, depth int) (string, er
 	case '-':
 		// ${VAR:-default}: use default if VAR is unset or empty
 		if varEmpty {
-			return expandVariables(value, vars, depth+1)
+			return expandVariablesImpl(value, vars, depth+1, preserveUndefined)
 		}
-		return expandVariables(varVal, vars, depth+1)
+		return expandVariablesImpl(varVal, vars, depth+1, preserveUndefined)
 
 	case '+':
 		// ${VAR:+alternate}: use alternate if VAR is set and non-empty
 		if !varEmpty {
-			return expandVariables(value, vars, depth+1)
+			return expandVariablesImpl(value, vars, depth+1, preserveUndefined)
 		}
 		return "", nil
 
 	default:
 		// Unknown modifier, treat as literal
 		if val, ok := vars[varName]; ok {
-			return expandVariables(val, vars, depth+1)
+			return expandVariablesImpl(val, vars, depth+1, preserveUndefined)
+		}
+		if preserveUndefined {
+			return "${" + expr + "}", nil
 		}
 		return "", nil
 	}
@@ -150,7 +165,15 @@ func isVarChar(c byte) bool {
 }
 
 // ExpandVariables expands variables in a string using the provided map.
+// Undefined variables are expanded to empty string (Docker behavior for ENV, COPY, etc).
 // This is the public entry point.
 func ExpandVariables(s string, vars map[string]string) (string, error) {
-	return expandVariables(s, vars, 0)
+	return expandVariablesImpl(s, vars, 0, false)
+}
+
+// ExpandVariablesPreserve expands variables in a string, but leaves undefined
+// variables as-is. This is used for RUN commands where shell variables should
+// be passed through to the shell for expansion.
+func ExpandVariablesPreserve(s string, vars map[string]string) (string, error) {
+	return expandVariablesImpl(s, vars, 0, true)
 }

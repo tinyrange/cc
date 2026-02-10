@@ -55,3 +55,40 @@ func TestNewVirtualMachine(t *testing.T) {
 		t.Fatalf("Close KVM virtual machine: %v", err)
 	}
 }
+
+func TestNewVirtualMachineMultiCPU(t *testing.T) {
+	checkKVMAvailable(t)
+
+	kvm, err := Open()
+	if err != nil {
+		t.Fatalf("Open KVM hypervisor: %v", err)
+	}
+	defer kvm.Close()
+
+	for _, numCPUs := range []int{2, 4, 8} {
+		t.Run("CPUs="+string(rune('0'+numCPUs)), func(t *testing.T) {
+			vm, err := kvm.NewVirtualMachine(hv.SimpleVMConfig{
+				NumCPUs: numCPUs,
+				MemSize: 0x200000,
+				MemBase: 0,
+			})
+			if err != nil {
+				t.Fatalf("Create KVM virtual machine with %d CPUs: %v", numCPUs, err)
+			}
+			defer vm.Close()
+
+			// Verify each vCPU exists and has correct ID
+			for i := 0; i < numCPUs; i++ {
+				err := vm.VirtualCPUCall(i, func(vcpu hv.VirtualCPU) error {
+					if vcpu.ID() != i {
+						t.Errorf("vCPU %d has wrong ID: got %d", i, vcpu.ID())
+					}
+					return nil
+				})
+				if err != nil {
+					t.Errorf("VirtualCPUCall(%d) failed: %v", i, err)
+				}
+			}
+		})
+	}
+}

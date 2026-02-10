@@ -17,6 +17,28 @@ import (
 	"github.com/tinyrange/cc/internal/vfs"
 )
 
+// guestMountedPaths are directories that the guest init mounts over with
+// tmpfs or other filesystems. Writes via the host FS API land on the
+// underlying VirtioFS layer but are invisible inside the guest because
+// the mount hides them.
+var guestMountedPaths = []string{"/tmp", "/proc", "/sys", "/dev"}
+
+// errGuestMount is returned when an operation targets a path that is
+// mounted over inside the guest and therefore not accessible via the host API.
+var errGuestMount = fmt.Errorf("path is mounted over inside the guest (e.g. tmpfs) and not accessible via the host filesystem API")
+
+// checkGuestMountPath returns an error if the path falls under a directory
+// that the guest init mounts over, making host-side writes invisible.
+func checkGuestMountPath(op, name string) error {
+	clean := path.Clean(name)
+	for _, mp := range guestMountedPaths {
+		if clean == mp || strings.HasPrefix(clean, mp+"/") {
+			return &Error{Op: op, Path: name, Err: errGuestMount}
+		}
+	}
+	return nil
+}
+
 // errnoToError converts a FUSE errno to a Go error.
 func errnoToError(errno int32) error {
 	if errno == 0 {
@@ -173,35 +195,100 @@ func (f *instanceFS) OpenFile(name string, flag int, perm fs.FileMode) (File, er
 	if f.inst.fsBackend == nil {
 		return nil, &Error{Op: "open", Path: name, Err: ErrNotRunning}
 	}
+	if err := checkGuestMountPath("open", name); err != nil {
+		return nil, err
+	}
 
-	// Resolve path through fsBackend, following symlinks
-	nodeID, errno := f.resolvePathFollowSymlinks(name)
-	if errno != 0 || nodeID == 0 {
+	// Resolve path to get parent and check if file exists
+	parentID, baseName, nodeID, errno := f.resolvePath(name)
+	if errno != 0 && parentID == 0 {
 		return nil, &Error{Op: "open", Path: name, Err: errnoToError(errno)}
 	}
 
-	// Check if Open is supported
-	openBackend, hasOpen := f.inst.fsBackend.(interface {
-		Open(nodeID uint64, flags uint32) (fh uint64, errno int32)
-	})
-	if !hasOpen {
-		return nil, &Error{Op: "open", Path: name, Err: fmt.Errorf("backend does not support open")}
-	}
+	var fh uint64
 
-	// Convert Go flags to POSIX flags
-	var flags uint32
-	switch flag & (os.O_RDONLY | os.O_WRONLY | os.O_RDWR) {
-	case os.O_RDONLY:
-		flags = uint32(syscall.O_RDONLY)
-	case os.O_WRONLY:
-		flags = uint32(syscall.O_WRONLY)
-	case os.O_RDWR:
-		flags = uint32(syscall.O_RDWR)
-	}
+	if nodeID == 0 {
+		// File doesn't exist
+		if flag&os.O_CREATE == 0 {
+			// O_CREATE not set, return error
+			return nil, &Error{Op: "open", Path: name, Err: syscall.ENOENT}
+		}
 
-	fh, errno := openBackend.Open(nodeID, flags)
-	if errno != 0 {
-		return nil, &Error{Op: "open", Path: name, Err: errnoToError(errno)}
+		// Create the file
+		createBackend, hasCreate := f.inst.fsBackend.(interface {
+			Create(parent uint64, name string, mode uint32, flags uint32, umask uint32, uid uint32, gid uint32) (nodeID uint64, fh uint64, attr virtio.FuseAttr, errno int32)
+		})
+		if !hasCreate {
+			return nil, &Error{Op: "open", Path: name, Err: fmt.Errorf("backend does not support file creation")}
+		}
+
+		// Convert fs.FileMode to unix mode
+		mode := uint32(perm.Perm()) | 0100000 // S_IFREG
+
+		// Convert Go flags to POSIX flags for create
+		var posixFlags uint32 = uint32(syscall.O_CREAT)
+		switch flag & (os.O_RDONLY | os.O_WRONLY | os.O_RDWR) {
+		case os.O_RDONLY:
+			posixFlags |= uint32(syscall.O_RDONLY)
+		case os.O_WRONLY:
+			posixFlags |= uint32(syscall.O_WRONLY)
+		case os.O_RDWR:
+			posixFlags |= uint32(syscall.O_RDWR)
+		}
+		if flag&os.O_TRUNC != 0 {
+			posixFlags |= uint32(syscall.O_TRUNC)
+		}
+
+		var err int32
+		nodeID, fh, _, err = createBackend.Create(parentID, baseName, mode, posixFlags, 0022, 0, 0)
+		if err != 0 {
+			return nil, &Error{Op: "open", Path: name, Err: errnoToError(err)}
+		}
+	} else {
+		// File exists
+		if flag&os.O_EXCL != 0 && flag&os.O_CREATE != 0 {
+			// O_EXCL with O_CREATE means fail if file exists
+			return nil, &Error{Op: "open", Path: name, Err: syscall.EEXIST}
+		}
+
+		// Check if Open is supported
+		openBackend, hasOpen := f.inst.fsBackend.(interface {
+			Open(nodeID uint64, flags uint32) (fh uint64, errno int32)
+		})
+		if !hasOpen {
+			return nil, &Error{Op: "open", Path: name, Err: fmt.Errorf("backend does not support open")}
+		}
+
+		// Convert Go flags to POSIX flags
+		var flags uint32
+		switch flag & (os.O_RDONLY | os.O_WRONLY | os.O_RDWR) {
+		case os.O_RDONLY:
+			flags = uint32(syscall.O_RDONLY)
+		case os.O_WRONLY:
+			flags = uint32(syscall.O_WRONLY)
+		case os.O_RDWR:
+			flags = uint32(syscall.O_RDWR)
+		}
+		if flag&os.O_TRUNC != 0 {
+			flags |= uint32(syscall.O_TRUNC)
+		}
+
+		var err int32
+		fh, err = openBackend.Open(nodeID, flags)
+		if err != 0 {
+			return nil, &Error{Op: "open", Path: name, Err: errnoToError(err)}
+		}
+
+		// Handle O_TRUNC
+		if flag&os.O_TRUNC != 0 {
+			setattrBackend, hasSetattr := f.inst.fsBackend.(interface {
+				SetAttr(nodeID uint64, size *uint64, mode *uint32, uid *uint32, gid *uint32, atime *time.Time, mtime *time.Time, reqUID uint32, reqGID uint32) int32
+			})
+			if hasSetattr {
+				zero := uint64(0)
+				setattrBackend.SetAttr(nodeID, &zero, nil, nil, nil, nil, nil, 0, 0)
+			}
+		}
 	}
 
 	return &instanceFile{
@@ -219,6 +306,9 @@ func (f *instanceFS) OpenFile(name string, flag int, perm fs.FileMode) (File, er
 func (f *instanceFS) ReadFile(name string) ([]byte, error) {
 	if f.inst.fsBackend == nil {
 		return nil, &Error{Op: "readfile", Path: name, Err: ErrNotRunning}
+	}
+	if err := checkGuestMountPath("readfile", name); err != nil {
+		return nil, err
 	}
 
 	// Resolve path through the fsBackend, following symlinks
@@ -265,6 +355,9 @@ func (f *instanceFS) ReadFile(name string) ([]byte, error) {
 func (f *instanceFS) WriteFile(name string, data []byte, perm fs.FileMode) error {
 	if f.inst.fsBackend == nil {
 		return &Error{Op: "writefile", Path: name, Err: ErrNotRunning}
+	}
+	if err := checkGuestMountPath("writefile", name); err != nil {
+		return err
 	}
 
 	// Resolve path to get parent
@@ -339,6 +432,9 @@ func (f *instanceFS) Stat(name string) (fs.FileInfo, error) {
 	if f.inst.fsBackend == nil {
 		return nil, &Error{Op: "stat", Path: name, Err: ErrNotRunning}
 	}
+	if err := checkGuestMountPath("stat", name); err != nil {
+		return nil, err
+	}
 
 	// Resolve path through the fsBackend, following symlinks
 	nodeID, errno := f.resolvePathFollowSymlinks(name)
@@ -359,6 +455,9 @@ func (f *instanceFS) Lstat(name string) (fs.FileInfo, error) {
 	if f.inst.fsBackend == nil {
 		return nil, &Error{Op: "lstat", Path: name, Err: ErrNotRunning}
 	}
+	if err := checkGuestMountPath("lstat", name); err != nil {
+		return nil, err
+	}
 
 	// resolvePath doesn't follow symlinks for the final component
 	_, _, nodeID, errno := f.resolvePath(name)
@@ -378,6 +477,9 @@ func (f *instanceFS) Lstat(name string) (fs.FileInfo, error) {
 func (f *instanceFS) Remove(name string) error {
 	if f.inst.fsBackend == nil {
 		return &Error{Op: "remove", Path: name, Err: ErrNotRunning}
+	}
+	if err := checkGuestMountPath("remove", name); err != nil {
+		return err
 	}
 
 	// Resolve path
@@ -418,6 +520,9 @@ func (f *instanceFS) Remove(name string) error {
 func (f *instanceFS) RemoveAll(name string) error {
 	if f.inst.fsBackend == nil {
 		return &Error{Op: "removeall", Path: name, Err: ErrNotRunning}
+	}
+	if err := checkGuestMountPath("removeall", name); err != nil {
+		return err
 	}
 
 	// Resolve path
@@ -542,6 +647,9 @@ func (f *instanceFS) Mkdir(name string, perm fs.FileMode) error {
 	if f.inst.fsBackend == nil {
 		return &Error{Op: "mkdir", Path: name, Err: ErrNotRunning}
 	}
+	if err := checkGuestMountPath("mkdir", name); err != nil {
+		return err
+	}
 
 	// Resolve path
 	parentID, baseName, _, errno := f.resolvePath(name)
@@ -574,6 +682,9 @@ func (f *instanceFS) Mkdir(name string, perm fs.FileMode) error {
 func (f *instanceFS) MkdirAll(name string, perm fs.FileMode) error {
 	if f.inst.fsBackend == nil {
 		return &Error{Op: "mkdirall", Path: name, Err: ErrNotRunning}
+	}
+	if err := checkGuestMountPath("mkdirall", name); err != nil {
+		return err
 	}
 
 	mkdirBackend, hasMkdir := f.inst.fsBackend.(interface {
@@ -624,6 +735,12 @@ func (f *instanceFS) Rename(oldpath, newpath string) error {
 	if f.inst.fsBackend == nil {
 		return &Error{Op: "rename", Path: oldpath, Err: ErrNotRunning}
 	}
+	if err := checkGuestMountPath("rename", oldpath); err != nil {
+		return err
+	}
+	if err := checkGuestMountPath("rename", newpath); err != nil {
+		return err
+	}
 
 	renameBackend, hasRename := f.inst.fsBackend.(interface {
 		Rename(oldParent uint64, oldName string, newParent uint64, newName string, flags uint32) int32
@@ -657,6 +774,9 @@ func (f *instanceFS) Symlink(oldname, newname string) error {
 	if f.inst.fsBackend == nil {
 		return &Error{Op: "symlink", Path: newname, Err: ErrNotRunning}
 	}
+	if err := checkGuestMountPath("symlink", newname); err != nil {
+		return err
+	}
 
 	symlinkBackend, hasSymlink := f.inst.fsBackend.(interface {
 		Symlink(parent uint64, name string, target string, umask uint32, uid uint32, gid uint32) (nodeID uint64, attr virtio.FuseAttr, errno int32)
@@ -687,6 +807,9 @@ func (f *instanceFS) Readlink(name string) (string, error) {
 	if f.inst.fsBackend == nil {
 		return "", &Error{Op: "readlink", Path: name, Err: ErrNotRunning}
 	}
+	if err := checkGuestMountPath("readlink", name); err != nil {
+		return "", err
+	}
 
 	// Resolve path to get node ID
 	_, _, nodeID, errno := f.resolvePath(name)
@@ -714,6 +837,9 @@ func (f *instanceFS) Readlink(name string) (string, error) {
 func (f *instanceFS) ReadDir(name string) ([]fs.DirEntry, error) {
 	if f.inst.fsBackend == nil {
 		return nil, &Error{Op: "readdir", Path: name, Err: ErrNotRunning}
+	}
+	if err := checkGuestMountPath("readdir", name); err != nil {
+		return nil, err
 	}
 
 	// Resolve directory path
@@ -780,6 +906,9 @@ func (f *instanceFS) Chmod(name string, mode fs.FileMode) error {
 	if f.inst.fsBackend == nil {
 		return &Error{Op: "chmod", Path: name, Err: ErrNotRunning}
 	}
+	if err := checkGuestMountPath("chmod", name); err != nil {
+		return err
+	}
 
 	setattrBackend, hasSetattr := f.inst.fsBackend.(interface {
 		SetAttr(nodeID uint64, size *uint64, mode *uint32, uid *uint32, gid *uint32, atime *time.Time, mtime *time.Time, reqUID uint32, reqGID uint32) int32
@@ -815,6 +944,9 @@ func (f *instanceFS) Chown(name string, uid, gid int) error {
 	if f.inst.fsBackend == nil {
 		return &Error{Op: "chown", Path: name, Err: ErrNotRunning}
 	}
+	if err := checkGuestMountPath("chown", name); err != nil {
+		return err
+	}
 
 	setattrBackend, hasSetattr := f.inst.fsBackend.(interface {
 		SetAttr(nodeID uint64, size *uint64, mode *uint32, uid *uint32, gid *uint32, atime *time.Time, mtime *time.Time, reqUID uint32, reqGID uint32) int32
@@ -843,6 +975,9 @@ func (f *instanceFS) Chown(name string, uid, gid int) error {
 func (f *instanceFS) Chtimes(name string, atime, mtime time.Time) error {
 	if f.inst.fsBackend == nil {
 		return &Error{Op: "chtimes", Path: name, Err: ErrNotRunning}
+	}
+	if err := checkGuestMountPath("chtimes", name); err != nil {
+		return err
 	}
 
 	setattrBackend, hasSetattr := f.inst.fsBackend.(interface {
@@ -917,9 +1052,27 @@ func (f *instanceFile) Read(p []byte) (int, error) {
 }
 
 func (f *instanceFile) Write(p []byte) (int, error) {
-	// Writing to files requires using VM.WriteFile which writes the entire file
-	// For streaming writes, we would need to buffer and write on Close
-	return 0, &Error{Op: "write", Path: f.path, Err: fmt.Errorf("streaming write not yet implemented")}
+	if f.closed {
+		return 0, &Error{Op: "write", Path: f.path, Err: fs.ErrClosed}
+	}
+
+	// Check if backend supports write
+	writeBackend, hasWrite := f.inst.fsBackend.(interface {
+		Write(nodeID uint64, fh uint64, off uint64, data []byte) (uint32, int32)
+	})
+	if !hasWrite {
+		return 0, &Error{Op: "write", Path: f.path, Err: fmt.Errorf("backend does not support write")}
+	}
+
+	// Write data at current offset
+	n, errno := writeBackend.Write(f.nodeID, f.fh, uint64(f.offset), p)
+	if errno != 0 {
+		return 0, &Error{Op: "write", Path: f.path, Err: errnoToError(errno)}
+	}
+
+	// Update offset
+	f.offset += int64(n)
+	return int(n), nil
 }
 
 func (f *instanceFile) Close() error {

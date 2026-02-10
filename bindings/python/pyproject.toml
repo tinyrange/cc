@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crumblecracker"
+version = "0.1.0"
+description = "Python bindings for the CrumbleCracker virtualization library"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "TinyRange", email = "contact@tinyrange.com"}
+]
+keywords = ["virtualization", "vm", "containers", "oci"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Emulators",
+    "Topic :: System :: Operating System Kernels :: Linux",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "mypy>=1.0",
+    "ruff>=0.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/tinyrange/cc"
+Documentation = "https://github.com/tinyrange/cc"
+Repository = "https://github.com/tinyrange/cc"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["crumblecracker*"]
+
+[tool.setuptools.package-data]
+crumblecracker = ["py.typed", "libcc.so", "libcc.dylib", "libcc.dll", "cc-helper", "cc-helper.exe"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+strict = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]

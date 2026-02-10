@@ -14,6 +14,13 @@
    ---------------------------------------------------------------------------- */
 
 :root {
+  /* Language-specific colors */
+  --lang-python: #3776ab;
+  --lang-rust: #ce422b;
+  --lang-typescript: #3178c6;
+  --lang-c: #a8b9cc;
+  --lang-go: #00add8;
+
   /* Primary brand colors - refined spectrum */
   --cc-blue: hsl(220, 65%, 54%);
   --cc-purple: hsl(265, 55%, 52%);

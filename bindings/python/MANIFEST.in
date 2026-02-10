@@ -1,0 +1,8 @@
+include README.md
+include LICENSE
+recursive-include crumblecracker *.py *.typed
+include crumblecracker/libcc.so
+include crumblecracker/libcc.dylib
+include crumblecracker/libcc.dll
+include crumblecracker/cc-helper
+include crumblecracker/cc-helper.exe

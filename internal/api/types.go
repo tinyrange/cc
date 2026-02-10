@@ -100,6 +100,8 @@ type Cmd interface {
 	SetStderr(w io.Writer) Cmd
 	// SetDir sets the command's working directory.
 	SetDir(dir string) Cmd
+	// SetUser sets the user to run the command as.
+	SetUser(user string) Cmd
 	// SetEnv sets a single environment variable (like os.Setenv).
 	SetEnv(key, value string) Cmd
 	// GetEnv returns the value of an environment variable (like os.Getenv).

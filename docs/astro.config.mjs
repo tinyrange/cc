@@ -35,7 +35,7 @@ export default defineConfig({
 					],
 				},
 				{
-					label: 'Go API',
+					label: 'API',
 					items: [
 						{ label: 'Overview', slug: 'api/overview' },
 						{ label: 'Creating Instances', slug: 'api/creating-instances' },
@@ -45,7 +45,6 @@ export default defineConfig({
 						{ label: 'OCI Images', slug: 'api/oci-images' },
 						{ label: 'Snapshots', slug: 'api/snapshots' },
 						{ label: 'Dockerfile', slug: 'api/dockerfile' },
-						{ label: 'GPU Support', slug: 'api/gpu' },
 					],
 				},
 				{

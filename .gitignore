@@ -41,3 +41,6 @@ go.work.sum
 
 # macOS
 .DS_Store
+
+# Python
+__pycache__/

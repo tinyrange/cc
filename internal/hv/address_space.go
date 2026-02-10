@@ -14,6 +14,15 @@ type AddressSpace struct {
 	ramBase uint64
 	ramSize uint64
 
+	// Split memory layout (x86_64 only, for >3GB RAM)
+	// When isSplit is true, RAM is split around the PCI hole:
+	//   - Low memory: [ramBase, ramBase+lowMemSize)
+	//   - High memory: [highMemBase, highMemBase+highMemSize)
+	isSplit     bool
+	lowMemSize  uint64
+	highMemBase uint64
+	highMemSize uint64
+
 	// nextMMIO is the next available address for MMIO allocation (above RAM)
 	nextMMIO uint64
 
@@ -34,6 +43,26 @@ func NewAddressSpace(arch CpuArchitecture, ramBase, ramSize uint64) *AddressSpac
 	}
 	// Start MMIO allocation above RAM, aligned to 4KB
 	a.nextMMIO = alignUp(ramBase+ramSize, 0x1000)
+	return a
+}
+
+// NewAddressSpaceSplit creates a physical address allocator for split memory layouts.
+// This is used on x86_64 when RAM exceeds the PCI hole (3GB-4GB).
+// Low memory: [lowBase, lowBase+lowSize)
+// High memory: [highBase, highBase+highSize)
+// MMIO allocations start above the high memory region.
+func NewAddressSpaceSplit(arch CpuArchitecture, lowBase, lowSize, highBase, highSize uint64) *AddressSpace {
+	a := &AddressSpace{
+		arch:        arch,
+		ramBase:     lowBase,
+		ramSize:     lowSize + highSize, // Total RAM for reporting purposes
+		isSplit:     true,
+		lowMemSize:  lowSize,
+		highMemBase: highBase,
+		highMemSize: highSize,
+	}
+	// For split memory, MMIO allocations start above high memory
+	a.nextMMIO = alignUp(highBase+highSize, 0x1000)
 	return a
 }
 
@@ -85,13 +114,33 @@ func (a *AddressSpace) RegisterFixed(name string, base, size uint64) error {
 		return fmt.Errorf("address_space: cannot register zero-size fixed region %s", name)
 	}
 
-	ramEnd := a.ramBase + a.ramSize
-
-	// Check for overlap with RAM
 	regionEnd := base + size
-	if base < ramEnd && regionEnd > a.ramBase {
-		return fmt.Errorf("address_space: fixed region %s [0x%x-0x%x) overlaps RAM [0x%x-0x%x)",
-			name, base, regionEnd, a.ramBase, ramEnd)
+
+	if a.isSplit {
+		// Split memory layout: check overlap with both low and high memory regions
+		lowMemEnd := a.ramBase + a.lowMemSize
+		highMemEnd := a.highMemBase + a.highMemSize
+
+		// Check overlap with low memory
+		if base < lowMemEnd && regionEnd > a.ramBase {
+			return fmt.Errorf("address_space: fixed region %s [0x%x-0x%x) overlaps low RAM [0x%x-0x%x)",
+				name, base, regionEnd, a.ramBase, lowMemEnd)
+		}
+
+		// Check overlap with high memory
+		if base < highMemEnd && regionEnd > a.highMemBase {
+			return fmt.Errorf("address_space: fixed region %s [0x%x-0x%x) overlaps high RAM [0x%x-0x%x)",
+				name, base, regionEnd, a.highMemBase, highMemEnd)
+		}
+	} else {
+		// Contiguous memory layout
+		ramEnd := a.ramBase + a.ramSize
+
+		// Check for overlap with RAM
+		if base < ramEnd && regionEnd > a.ramBase {
+			return fmt.Errorf("address_space: fixed region %s [0x%x-0x%x) overlaps RAM [0x%x-0x%x)",
+				name, base, regionEnd, a.ramBase, ramEnd)
+		}
 	}
 
 	a.fixedRegions = append(a.fixedRegions, MMIOAllocation{

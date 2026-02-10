@@ -62,8 +62,10 @@ func runCommandWithTimeout(ctx context.Context, cmd cc.Cmd, timeout time.Duratio
 	case err := <-done:
 		return err
 	case <-cmdCtx.Done():
-		// Wait for goroutine to finish even on timeout to avoid leaks
-		<-done
+		// Don't block waiting for cmd.Run() — if the VM is stuck, it will
+		// never return and we'd hang forever (defeating the timeout).
+		// Accept the potential goroutine leak; the test cleanup will tear
+		// down the instance and unblock it.
 		return cmdCtx.Err()
 	}
 }

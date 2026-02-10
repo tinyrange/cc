@@ -192,17 +192,21 @@ func (r *Runner) buildAll(ctx context.Context, specs []*TestSpec, dirs []string)
 	errors := make([]error, len(specs))
 	var wg sync.WaitGroup
 
+	// Ensure parallelism is at least 1 to prevent deadlock
+	parallel := r.Parallel
+	if parallel < 1 {
+		parallel = 1
+	}
+
 	// Create semaphore for parallelism
-	sem := make(chan struct{}, r.Parallel)
+	sem := make(chan struct{}, parallel)
 
 	for i := range specs {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
 
-			// CC2 tests use the pre-built cc2 binary
+			// CC2 tests use the pre-built cc2 binary - no build needed
 			if specs[idx].IsCC2() {
 				if r.CC2Binary != "" {
 					binaries[idx] = r.CC2Binary
@@ -212,6 +216,10 @@ func (r *Runner) buildAll(ctx context.Context, specs []*TestSpec, dirs []string)
 				}
 				return
 			}
+
+			// Acquire semaphore for actual builds
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
 			binary, err := r.buildExample(ctx, specs[idx], dirs[idx])
 			if err != nil {

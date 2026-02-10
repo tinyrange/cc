@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestBuildSimpleDockerfile(t *testing.T) {
@@ -58,6 +59,215 @@ RUN echo $MYVAR
 	// The env should be set
 	if result.Env[0] != "MYVAR=myvalue" {
 		t.Errorf("unexpected env: %s", result.Env[0])
+	}
+}
+
+func TestBuildWithEnvSelfReference(t *testing.T) {
+	// Test that ENV PATH="${PATH}:..." expands correctly without infinite recursion.
+	// This is critical for Dockerfiles that append to PATH.
+	dockerfile := []byte(`FROM alpine
+ENV PATH="${PATH}:/opt/bin"
+ENV PATH="${PATH}:/usr/local/bin"
+RUN echo $PATH
+`)
+
+	df, err := Parse(dockerfile)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	builder := NewBuilder(df)
+	result, err := builder.Build()
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+
+	// Should have 2 ENV vars (both PATH settings)
+	if len(result.Env) != 2 {
+		t.Fatalf("expected 2 env vars, got %d: %v", len(result.Env), result.Env)
+	}
+
+	// First PATH: ${PATH} expands to "" (undefined), so result is ":/opt/bin"
+	// (This matches Docker behavior - undefined vars expand to empty string)
+	if result.Env[0] != "PATH=:/opt/bin" {
+		t.Errorf("expected PATH=:/opt/bin, got %s", result.Env[0])
+	}
+
+	// Second PATH should be expanded from previous PATH + /usr/local/bin
+	if result.Env[1] != "PATH=:/opt/bin:/usr/local/bin" {
+		t.Errorf("expected PATH=:/opt/bin:/usr/local/bin, got %s", result.Env[1])
+	}
+}
+
+func TestBuildWithBaseImageEnv(t *testing.T) {
+	// Test that ENV PATH="$PATH:/opt/bin" correctly expands when base image
+	// has PATH set. This is the fix for the neurocontainers bug where
+	// $PATH expanded to empty string because base image env wasn't included.
+	dockerfile := []byte(`FROM ubuntu:22.04
+ENV PATH="/opt/miniconda/bin:$PATH"
+RUN which apt-get
+`)
+
+	df, err := Parse(dockerfile)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	// Simulate base image environment (like ubuntu:22.04)
+	baseEnv := []string{
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+	}
+
+	builder := NewBuilder(df).WithBaseImageEnv(baseEnv)
+	result, err := builder.Build()
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+
+	// Should have 1 ENV var
+	if len(result.Env) != 1 {
+		t.Fatalf("expected 1 env var, got %d: %v", len(result.Env), result.Env)
+	}
+
+	// PATH should include both the new path and the base image path
+	expected := "PATH=/opt/miniconda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	if result.Env[0] != expected {
+		t.Errorf("expected %s, got %s", expected, result.Env[0])
+	}
+}
+
+func TestBuildWithBaseImageEnvPrecedence(t *testing.T) {
+	// Test precedence: base image env < global ARG < build args
+	dockerfile := []byte(`ARG VERSION=default
+FROM alpine:$VERSION
+ENV MY_VAR="value is $MY_VAR"
+`)
+
+	df, err := Parse(dockerfile)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	// Simulate base image having MY_VAR set
+	baseEnv := []string{
+		"MY_VAR=from_base",
+	}
+
+	builder := NewBuilder(df).WithBaseImageEnv(baseEnv)
+	result, err := builder.Build()
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+
+	// ENV should expand $MY_VAR using base image value
+	if len(result.Env) != 1 {
+		t.Fatalf("expected 1 env var, got %d: %v", len(result.Env), result.Env)
+	}
+
+	expected := "MY_VAR=value is from_base"
+	if result.Env[0] != expected {
+		t.Errorf("expected %s, got %s", expected, result.Env[0])
+	}
+}
+
+func TestResolveImageRef(t *testing.T) {
+	tests := []struct {
+		name       string
+		dockerfile string
+		buildArgs  map[string]string
+		wantRef    string
+	}{
+		{
+			name:       "simple image",
+			dockerfile: "FROM alpine:3.19\n",
+			wantRef:    "alpine:3.19",
+		},
+		{
+			name:       "ARG with default",
+			dockerfile: "ARG VERSION=3.19\nFROM alpine:$VERSION\n",
+			wantRef:    "alpine:3.19",
+		},
+		{
+			name:       "ARG overridden by build arg",
+			dockerfile: "ARG VERSION=3.19\nFROM alpine:$VERSION\n",
+			buildArgs:  map[string]string{"VERSION": "3.18"},
+			wantRef:    "alpine:3.18",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			df, err := Parse([]byte(tc.dockerfile))
+			if err != nil {
+				t.Fatalf("Parse failed: %v", err)
+			}
+
+			builder := NewBuilder(df)
+			for k, v := range tc.buildArgs {
+				builder = builder.WithBuildArg(k, v)
+			}
+
+			ref, err := builder.ResolveImageRef()
+			if err != nil {
+				t.Fatalf("ResolveImageRef failed: %v", err)
+			}
+
+			if ref != tc.wantRef {
+				t.Errorf("expected %s, got %s", tc.wantRef, ref)
+			}
+		})
+	}
+}
+
+func TestResolveImageRefMatchesBuild(t *testing.T) {
+	// Verify that ResolveImageRef() and Build() return the same image ref,
+	// even when base image env contains variables that could affect expansion.
+	// This is important because FROM can only use ARG/build args, not ENV.
+	dockerfile := []byte(`ARG VERSION=3.19
+FROM alpine:$VERSION
+ENV PATH="/opt/bin:$PATH"
+`)
+
+	df, err := Parse(dockerfile)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	// Simulate base image having VERSION set (shouldn't affect FROM)
+	baseEnv := []string{
+		"VERSION=SHOULD_NOT_BE_USED",
+		"PATH=/usr/local/bin:/usr/bin:/bin",
+	}
+
+	builder := NewBuilder(df).WithBaseImageEnv(baseEnv)
+
+	resolvedRef, err := builder.ResolveImageRef()
+	if err != nil {
+		t.Fatalf("ResolveImageRef failed: %v", err)
+	}
+
+	result, err := builder.Build()
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+
+	// Both should return the same image ref (using ARG default, not base env)
+	if resolvedRef != result.ImageRef {
+		t.Errorf("ResolveImageRef returned %q but Build returned %q", resolvedRef, result.ImageRef)
+	}
+
+	// Should use ARG default, not base env VERSION
+	if resolvedRef != "alpine:3.19" {
+		t.Errorf("expected alpine:3.19, got %s", resolvedRef)
+	}
+
+	// ENV PATH should still expand correctly using base env
+	if len(result.Env) != 1 {
+		t.Fatalf("expected 1 env var, got %d", len(result.Env))
+	}
+	expected := "PATH=/opt/bin:/usr/local/bin:/usr/bin:/bin"
+	if result.Env[0] != expected {
+		t.Errorf("expected %s, got %s", expected, result.Env[0])
 	}
 }
 
@@ -390,12 +600,14 @@ func TestDirBuildContext(t *testing.T) {
 type mockInstance struct {
 	commands   [][]string
 	files      map[string][]byte
+	dirs       map[string]bool // Tracks which paths are directories
 	currentDir string
 }
 
 func newMockInstance() *mockInstance {
 	return &mockInstance{
 		files: make(map[string][]byte),
+		dirs:  make(map[string]bool),
 	}
 }
 
@@ -411,6 +623,29 @@ func (m *mockInstance) WriteFile(name string, data []byte, _ os.FileMode) error 
 	m.files[name] = data
 	return nil
 }
+
+func (m *mockInstance) Stat(name string) (os.FileInfo, error) {
+	if m.dirs[name] {
+		return &mockFileInfo{name: name, isDir: true}, nil
+	}
+	if _, ok := m.files[name]; ok {
+		return &mockFileInfo{name: name, isDir: false}, nil
+	}
+	return nil, os.ErrNotExist
+}
+
+// mockFileInfo implements os.FileInfo for testing.
+type mockFileInfo struct {
+	name  string
+	isDir bool
+}
+
+func (fi *mockFileInfo) Name() string       { return fi.name }
+func (fi *mockFileInfo) Size() int64        { return 0 }
+func (fi *mockFileInfo) Mode() os.FileMode  { return 0o644 }
+func (fi *mockFileInfo) ModTime() time.Time { return time.Time{} }
+func (fi *mockFileInfo) IsDir() bool        { return fi.isDir }
+func (fi *mockFileInfo) Sys() any           { return nil }
 
 type mockCmd struct {
 	inst    *mockInstance
@@ -431,6 +666,10 @@ func (c *mockCmd) SetEnv(env []string) Cmd {
 
 func (c *mockCmd) SetDir(dir string) Cmd {
 	c.workDir = dir
+	return c
+}
+
+func (c *mockCmd) SetUser(user string) Cmd {
 	return c
 }
 
@@ -469,5 +708,146 @@ func TestReaderOpApply(t *testing.T) {
 
 	if string(inst.files["/app/file.txt"]) != "test content" {
 		t.Errorf("file not written correctly")
+	}
+}
+
+func TestReaderOpApplyToExistingDirectory(t *testing.T) {
+	// Test case: COPY file /opt where /opt is an existing directory
+	// Should write to /opt/file, not /opt
+	op := &readerOp{
+		data:        []byte("test content"),
+		dst:         "/opt",
+		srcBasename: "myfile.txt",
+		contentHash: "abc123",
+	}
+
+	inst := newMockInstance()
+	inst.dirs["/opt"] = true // Mark /opt as an existing directory
+	ctx := context.Background()
+
+	if err := op.Apply(ctx, inst); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+
+	// Should have written to /opt/myfile.txt
+	if _, ok := inst.files["/opt/myfile.txt"]; !ok {
+		t.Errorf("expected file at /opt/myfile.txt, got files: %v", inst.files)
+	}
+	if string(inst.files["/opt/myfile.txt"]) != "test content" {
+		t.Errorf("file content mismatch")
+	}
+}
+
+func TestReaderOpApplyToNonExistingPath(t *testing.T) {
+	// Test case: COPY file /opt where /opt does not exist
+	// Should write to /opt (file-to-file copy)
+	op := &readerOp{
+		data:        []byte("test content"),
+		dst:         "/opt",
+		srcBasename: "myfile.txt",
+		contentHash: "abc123",
+	}
+
+	inst := newMockInstance()
+	// /opt does not exist in dirs or files
+	ctx := context.Background()
+
+	if err := op.Apply(ctx, inst); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+
+	// Should have written to /opt (not /opt/myfile.txt)
+	if _, ok := inst.files["/opt"]; !ok {
+		t.Errorf("expected file at /opt, got files: %v", inst.files)
+	}
+	if string(inst.files["/opt"]) != "test content" {
+		t.Errorf("file content mismatch")
+	}
+}
+
+func TestReaderOpApplyWithTrailingSlash(t *testing.T) {
+	// Test case: COPY file /opt/ (trailing slash means directory)
+	// srcBasename should be empty because processCopy already resolved the path
+	op := &readerOp{
+		data:        []byte("test content"),
+		dst:         "/opt/myfile.txt", // Already resolved by processCopy
+		srcBasename: "",                // Empty because trailing slash was explicit
+		contentHash: "abc123",
+	}
+
+	inst := newMockInstance()
+	ctx := context.Background()
+
+	if err := op.Apply(ctx, inst); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+
+	if _, ok := inst.files["/opt/myfile.txt"]; !ok {
+		t.Errorf("expected file at /opt/myfile.txt, got files: %v", inst.files)
+	}
+}
+
+func TestCopyToExistingDirectory(t *testing.T) {
+	// Integration test: build a Dockerfile with COPY to a path that could be a directory
+	tempDir := t.TempDir()
+	testFile := filepath.Join(tempDir, "config.json")
+	if err := os.WriteFile(testFile, []byte(`{"key": "value"}`), 0o644); err != nil {
+		t.Fatalf("WriteFile failed: %v", err)
+	}
+
+	dockerfile := []byte(`FROM alpine
+COPY config.json /opt
+`)
+
+	df, err := Parse(dockerfile)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	ctx, err := NewDirBuildContext(tempDir)
+	if err != nil {
+		t.Fatalf("NewDirBuildContext failed: %v", err)
+	}
+
+	builder := NewBuilder(df).WithContext(ctx)
+	result, err := builder.Build()
+	if err != nil {
+		t.Fatalf("Build failed: %v", err)
+	}
+
+	if len(result.Ops) != 1 {
+		t.Fatalf("expected 1 op, got %d", len(result.Ops))
+	}
+
+	// Verify the op has srcBasename set for deferred directory detection
+	op, ok := result.Ops[0].(*readerOp)
+	if !ok {
+		t.Fatalf("expected readerOp, got %T", result.Ops[0])
+	}
+
+	if op.srcBasename != "config.json" {
+		t.Errorf("expected srcBasename 'config.json', got %q", op.srcBasename)
+	}
+	if op.dst != "/opt" {
+		t.Errorf("expected dst '/opt', got %q", op.dst)
+	}
+
+	// Test apply to directory
+	inst := newMockInstance()
+	inst.dirs["/opt"] = true
+	if err := op.Apply(context.Background(), inst); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+	if _, ok := inst.files["/opt/config.json"]; !ok {
+		t.Errorf("expected file at /opt/config.json when /opt is a directory")
+	}
+
+	// Test apply to non-existing path
+	inst2 := newMockInstance()
+	if err := op.Apply(context.Background(), inst2); err != nil {
+		t.Fatalf("Apply failed: %v", err)
+	}
+	if _, ok := inst2.files["/opt"]; !ok {
+		t.Errorf("expected file at /opt when /opt does not exist")
 	}
 }

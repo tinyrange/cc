@@ -198,12 +198,12 @@ func run() error {
 		file.Close()
 	}
 
-	file, _ = inst.Create("/tmp/test.txt")
+	file, _ = inst.Create("/opt/test.txt")
 	if file != nil {
 		file.Close()
 	}
 
-	file, _ = inst.OpenFile("/tmp/test2.txt", os.O_RDWR|os.O_CREATE, 0644)
+	file, _ = inst.OpenFile("/opt/test2.txt", os.O_RDWR|os.O_CREATE, 0644)
 	if file != nil {
 		// File interface methods
 		var buf [1024]byte
@@ -222,7 +222,7 @@ func run() error {
 	// ReadFile/WriteFile
 	data, _ := inst.ReadFile("/etc/os-release")
 	_ = data
-	_ = inst.WriteFile("/tmp/output.txt", []byte("content"), 0644)
+	_ = inst.WriteFile("/opt/output.txt", []byte("content"), 0644)
 
 	// Stat/Lstat
 	info, _ := inst.Stat("/etc")
@@ -231,31 +231,31 @@ func run() error {
 	_ = info
 
 	// Directory operations
-	_ = inst.Mkdir("/tmp/newdir", 0755)
-	_ = inst.MkdirAll("/tmp/nested/dirs", 0755)
-	entries, _ := inst.ReadDir("/tmp")
+	_ = inst.Mkdir("/opt/newdir", 0755)
+	_ = inst.MkdirAll("/opt/nested/dirs", 0755)
+	entries, _ := inst.ReadDir("/opt")
 	_ = entries
 
 	// File manipulation
-	_ = inst.Rename("/tmp/old", "/tmp/new")
-	_ = inst.Remove("/tmp/file")
-	_ = inst.RemoveAll("/tmp/dir")
+	_ = inst.Rename("/opt/old", "/opt/new")
+	_ = inst.Remove("/opt/file")
+	_ = inst.RemoveAll("/opt/dir")
 
 	// Symlinks
-	_ = inst.Symlink("/target", "/tmp/link")
-	target, _ := inst.Readlink("/tmp/link")
+	_ = inst.Symlink("/target", "/opt/link")
+	target, _ := inst.Readlink("/opt/link")
 	_ = target
 
 	// Permissions and times
-	_ = inst.Chmod("/tmp/file", fs.FileMode(0755))
-	_ = inst.Chown("/tmp/file", 1000, 1000)
-	_ = inst.Chtimes("/tmp/file", time.Now(), time.Now())
+	_ = inst.Chmod("/opt/file", fs.FileMode(0755))
+	_ = inst.Chown("/opt/file", 1000, 1000)
+	_ = inst.Chtimes("/opt/file", time.Now(), time.Now())
 
 	// =========================================================================
 	// FilesystemSnapshotOption - snapshot configuration
 	// =========================================================================
 	snapshotOpts := []cc.FilesystemSnapshotOption{
-		cc.WithSnapshotExcludes("/tmp/*", "/var/cache/*"),
+		cc.WithSnapshotExcludes("/opt/*", "/var/cache/*"),
 		cc.WithSnapshotCacheDir(cache.SnapshotPath()),
 	}
 

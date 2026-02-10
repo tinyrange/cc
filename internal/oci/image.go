@@ -502,10 +502,29 @@ func makeLayerFromTar(hash string, r io.Reader, compression string, outputDir st
 	return nil
 }
 
+func hasEnvKey(env []string, key string) bool {
+	prefix := key + "="
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func populateRuntimeConfig(cfg *RuntimeConfig, imageCfg imageConfig) {
 	if len(imageCfg.Config.Env) > 0 {
 		cfg.Env = append(cfg.Env, imageCfg.Config.Env...)
 	}
+
+	// Inject Docker-compatible defaults if not provided by image
+	if !hasEnvKey(cfg.Env, "PATH") {
+		cfg.Env = append(cfg.Env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+	}
+	if !hasEnvKey(cfg.Env, "HOME") {
+		cfg.Env = append(cfg.Env, "HOME=/root")
+	}
+
 	if len(imageCfg.Config.Cmd) > 0 {
 		cfg.Cmd = append(cfg.Cmd, imageCfg.Config.Cmd...)
 	}

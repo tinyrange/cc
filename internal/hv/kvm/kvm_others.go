@@ -25,7 +25,7 @@ func (hv *hypervisor) archVMInit(vm *virtualMachine, config hv.VMConfig) error {
 	return nil
 }
 
-func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int) error {
+func (hv *hypervisor) archVCPUInit(vm *virtualMachine, vcpuFd int, vcpuID int) error {
 	return nil
 }
 

@@ -1,0 +1,734 @@
+---
+title: OCI Images
+description: Pulling and managing container images
+---
+
+import LanguageTabs from '../../../components/LanguageTabs.astro';
+import LangTabItem from '../../../components/LangTabItem.astro';
+
+The OCI client handles pulling, loading, and exporting OCI container images. It provides access to images from Docker Hub, GitHub Container Registry, and other OCI-compliant registries.
+
+## Overview
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+// Create a client
+client, err := cc.NewOCIClient()
+
+// Pull an image
+source, err := client.Pull(ctx, "alpine:latest")
+
+// Use it to create a VM
+instance, err := cc.New(source)
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# Create a client
+with cc.OCIClient() as client:
+    # Pull an image
+    source = client.pull("alpine:latest")
+
+    # Use it to create a VM
+    with cc.Instance(source) as inst:
+        pass
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// Create a client
+let client = OciClient::new()?;
+
+// Pull an image
+let source = client.pull("alpine:latest", None, None)?;
+
+// Use it to create a VM
+let inst = Instance::new(source, None)?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// Create a client
+const client = new OCIClient();
+
+// Pull an image
+const source = await client.pull('alpine:latest');
+
+// Use it to create a VM
+await using inst = await source.createInstance();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// Create a client
+cc_oci_client client;
+cc_oci_client_new(&client, &err);
+
+// Pull an image
+cc_instance_source source;
+cc_oci_client_pull(client, "alpine:latest", NULL, NULL, NULL,
+                   CC_HANDLE_INVALID(cc_cancel_token), &source, &err);
+
+// Use it to create a VM
+cc_instance inst;
+cc_instance_new(source, NULL, &inst, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Creating a Client
+
+By default, images are cached in a platform-specific location (`~/Library/Application Support/cc/oci` on macOS, `~/.cache/cc/oci` on Linux, `%APPDATA%\cc\oci` on Windows).
+
+### Custom Cache
+
+Use a specific cache directory:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+cacheDir, err := cc.NewCacheDir("/path/to/cache")
+if err != nil {
+    return err
+}
+
+client, err := cc.NewOCIClientWithCache(cacheDir)
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+client = cc.OCIClient(cache_dir="/path/to/cache")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let client = OciClient::with_cache_dir("/path/to/cache")?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const client = new OCIClient('/path/to/cache');
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_oci_client client;
+cc_oci_client_new_with_cache("/path/to/cache", &client, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Pulling Images
+
+### Basic Pull
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+source, err := client.Pull(ctx, "alpine:latest")
+source, err := client.Pull(ctx, "python:3.12-slim")
+source, err := client.Pull(ctx, "ubuntu:22.04")
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+source = client.pull("alpine:latest")
+source = client.pull("python:3.12-slim")
+source = client.pull("ubuntu:22.04")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let source = client.pull("alpine:latest", None, None)?;
+let source = client.pull("python:3.12-slim", None, None)?;
+let source = client.pull("ubuntu:22.04", None, None)?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const source = await client.pull('alpine:latest');
+const source = await client.pull('python:3.12-slim');
+const source = await client.pull('ubuntu:22.04');
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_oci_client_pull(client, "alpine:latest", NULL, NULL, NULL,
+                   CC_HANDLE_INVALID(cc_cancel_token), &source, &err);
+cc_oci_client_pull(client, "python:3.12-slim", NULL, NULL, NULL,
+                   CC_HANDLE_INVALID(cc_cancel_token), &source, &err);
+cc_oci_client_pull(client, "ubuntu:22.04", NULL, NULL, NULL,
+                   CC_HANDLE_INVALID(cc_cancel_token), &source, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### From Other Registries
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+// GitHub Container Registry
+source, err := client.Pull(ctx, "ghcr.io/username/image:tag")
+
+// Amazon ECR
+source, err := client.Pull(ctx, "123456789.dkr.ecr.us-east-1.amazonaws.com/myapp:latest")
+
+// Google Container Registry
+source, err := client.Pull(ctx, "gcr.io/project/image:tag")
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# GitHub Container Registry
+source = client.pull("ghcr.io/username/image:tag")
+
+# Amazon ECR
+source = client.pull("123456789.dkr.ecr.us-east-1.amazonaws.com/myapp:latest")
+
+# Google Container Registry
+source = client.pull("gcr.io/project/image:tag")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// GitHub Container Registry
+let source = client.pull("ghcr.io/username/image:tag", None, None)?;
+
+// Amazon ECR
+let source = client.pull("123456789.dkr.ecr.us-east-1.amazonaws.com/myapp:latest", None, None)?;
+
+// Google Container Registry
+let source = client.pull("gcr.io/project/image:tag", None, None)?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// GitHub Container Registry
+const source = await client.pull('ghcr.io/username/image:tag');
+
+// Amazon ECR
+const source = await client.pull('123456789.dkr.ecr.us-east-1.amazonaws.com/myapp:latest');
+
+// Google Container Registry
+const source = await client.pull('gcr.io/project/image:tag');
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// GitHub Container Registry
+cc_oci_client_pull(client, "ghcr.io/username/image:tag", NULL, NULL, NULL,
+                   CC_HANDLE_INVALID(cc_cancel_token), &source, &err);
+
+// Amazon ECR
+cc_oci_client_pull(client, "123456789.dkr.ecr.us-east-1.amazonaws.com/myapp:latest",
+                   NULL, NULL, NULL, CC_HANDLE_INVALID(cc_cancel_token), &source, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### With Authentication
+
+Pull from private registries:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+source, err := client.Pull(ctx, "private-registry.com/image:tag",
+    cc.WithAuth("username", "password"),
+)
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+options = cc.PullOptions(username="username", password="password")
+source = client.pull("private-registry.com/image:tag", options=options)
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let opts = PullOptions {
+    username: Some("username".to_string()),
+    password: Some("password".to_string()),
+    ..Default::default()
+};
+let source = client.pull("private-registry.com/image:tag", Some(opts), None)?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const source = await client.pull('private-registry.com/image:tag', {
+    username: 'username',
+    password: 'password',
+});
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_pull_options opts = {
+    .username = "username",
+    .password = "password",
+};
+cc_oci_client_pull(client, "private-registry.com/image:tag", &opts, NULL, NULL,
+                   CC_HANDLE_INVALID(cc_cancel_token), &source, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### Platform Selection
+
+Pull a specific platform variant:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+// Pull arm64 image
+source, err := client.Pull(ctx, "alpine:latest",
+    cc.WithPlatform("linux", "arm64"),
+)
+
+// Pull amd64 image
+source, err := client.Pull(ctx, "python:3.12",
+    cc.WithPlatform("linux", "amd64"),
+)
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+# Pull arm64 image
+options = cc.PullOptions(platform="linux/arm64")
+source = client.pull("alpine:latest", options=options)
+
+# Pull amd64 image
+options = cc.PullOptions(platform="linux/amd64")
+source = client.pull("python:3.12", options=options)
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+// Pull arm64 image
+let opts = PullOptions {
+    platform_os: Some("linux".to_string()),
+    platform_arch: Some("arm64".to_string()),
+    ..Default::default()
+};
+let source = client.pull("alpine:latest", Some(opts), None)?;
+
+// Pull amd64 image
+let opts = PullOptions {
+    platform_os: Some("linux".to_string()),
+    platform_arch: Some("amd64".to_string()),
+    ..Default::default()
+};
+let source = client.pull("python:3.12", Some(opts), None)?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+// Pull arm64 image
+const source = await client.pull('alpine:latest', { platform: 'linux/arm64' });
+
+// Pull amd64 image
+const source = await client.pull('python:3.12', { platform: 'linux/amd64' });
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+// Pull arm64 image
+cc_pull_options opts = {
+    .platform_os = "linux",
+    .platform_arch = "arm64",
+};
+cc_oci_client_pull(client, "alpine:latest", &opts, NULL, NULL,
+                   CC_HANDLE_INVALID(cc_cancel_token), &source, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+By default, pulls match the host platform.
+
+## Progress Reporting
+
+Track download progress:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+source, err := client.Pull(ctx, "large-image:latest",
+    cc.WithProgressCallback(func(p cc.DownloadProgress) {
+        if p.Total > 0 {
+            pct := float64(p.Current) / float64(p.Total) * 100
+            fmt.Printf("\rDownloading: %.1f%% (%s)", pct, p.Filename)
+        }
+    }),
+)
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+def on_progress(progress):
+    if progress.total > 0:
+        pct = progress.current * 100 // progress.total
+        print(f"\rDownloading: {pct}%", end="")
+
+source = client.pull("large-image:latest", progress_callback=on_progress)
+print()  # newline after progress
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let source = client.pull("large-image:latest", None, Some(|progress| {
+    if progress.total > 0 {
+        let pct = progress.current * 100 / progress.total;
+        print!("\rDownloading: {}%", pct);
+    }
+}))?;
+println!();
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const source = await client.pull('large-image:latest', {
+    onProgress: (progress) => {
+        if (progress.total > 0) {
+            const pct = Math.floor(progress.current * 100 / progress.total);
+            process.stdout.write(`\rDownloading: ${pct}%`);
+        }
+    },
+});
+console.log();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+void on_progress(const cc_download_progress* progress, void* user_data) {
+    if (progress->total > 0) {
+        int pct = (int)(progress->current * 100 / progress->total);
+        printf("\rDownloading: %d%%", pct);
+        fflush(stdout);
+    }
+}
+
+cc_oci_client_pull(client, "large-image:latest", NULL, on_progress, NULL,
+                   CC_HANDLE_INVALID(cc_cancel_token), &source, &err);
+printf("\n");
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Loading Local Images
+
+### From Tarball
+
+Load an image exported with `docker save`:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+source, err := client.LoadFromTar("/path/to/image.tar")
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+source = client.load_tar("/path/to/image.tar")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let source = client.load_tar("/path/to/image.tar", None)?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const source = await client.loadTar('/path/to/image.tar');
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_oci_client_load_tar(client, "/path/to/image.tar", NULL, &source, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+### From Directory
+
+Load a pre-extracted image:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+source, err := client.LoadFromDir("/path/to/image-dir")
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+source = client.load_dir("/path/to/image-dir")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let source = client.load_dir("/path/to/image-dir", None)?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const source = await client.loadDir('/path/to/image-dir');
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_oci_client_load_dir(client, "/path/to/image-dir", NULL, &source, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+The directory should contain an extracted OCI image with the standard structure: `oci-layout`, `index.json`, and `blobs/` subdirectory. You can create this structure by exporting an image (see below) or by manually extracting an OCI-format tarball.
+
+## Exporting Images
+
+Export an image to a directory for faster future loading:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+err := client.ExportToDir(source, "/path/to/export-dir")
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+client.export_dir(source, "/path/to/export-dir")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+client.export_dir(&source, "/path/to/export-dir")?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+await client.exportDir(source, '/path/to/export-dir');
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_oci_client_export_dir(client, source, "/path/to/export-dir", &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Image Configuration
+
+Access container metadata from the image:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+config := cc.SourceConfig(source)
+if config != nil {
+    fmt.Println("Architecture:", config.Architecture)
+    fmt.Println("Entrypoint:", config.Entrypoint)
+    fmt.Println("Cmd:", config.Cmd)
+    fmt.Println("Env:", config.Env)
+    fmt.Println("WorkingDir:", config.WorkingDir)
+    fmt.Println("User:", config.User)
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+config = source.get_config()
+print(f"Architecture: {config.architecture}")
+print(f"Entrypoint: {config.entrypoint}")
+print(f"Cmd: {config.cmd}")
+print(f"Env: {config.env}")
+print(f"WorkingDir: {config.working_dir}")
+print(f"User: {config.user}")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let config = source.get_config()?;
+println!("Architecture: {:?}", config.architecture);
+println!("Entrypoint: {:?}", config.entrypoint);
+println!("Cmd: {:?}", config.cmd);
+println!("Env: {:?}", config.env);
+println!("WorkingDir: {:?}", config.working_dir);
+println!("User: {:?}", config.user);
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const config = await source.getConfig();
+console.log('Architecture:', config.architecture);
+console.log('Entrypoint:', config.entrypoint);
+console.log('Cmd:', config.cmd);
+console.log('Env:', config.env);
+console.log('WorkingDir:', config.workingDir);
+console.log('User:', config.user);
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+cc_image_config config;
+cc_instance_source_get_config(source, &config, &err);
+printf("Architecture: %s\n", config.architecture);
+// Access other fields...
+cc_image_config_free(&config);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Example: Pull and Inspect
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+func inspectImage(imageName string) error {
+    client, err := cc.NewOCIClient()
+    if err != nil {
+        return err
+    }
+
+    source, err := client.Pull(context.Background(), imageName,
+        cc.WithProgressCallback(func(p cc.DownloadProgress) {
+            if p.Total > 0 {
+                fmt.Printf("\rPulling %s: %d/%d bytes",
+                    p.Filename, p.Current, p.Total)
+            }
+        }),
+    )
+    if err != nil {
+        return err
+    }
+    fmt.Println() // newline after progress
+
+    config := cc.SourceConfig(source)
+    if config == nil {
+        fmt.Println("No config available")
+        return nil
+    }
+
+    fmt.Println("Image:", imageName)
+    fmt.Println("Architecture:", config.Architecture)
+
+    if len(config.Entrypoint) > 0 {
+        fmt.Println("Entrypoint:", strings.Join(config.Entrypoint, " "))
+    }
+    if len(config.Cmd) > 0 {
+        fmt.Println("Cmd:", strings.Join(config.Cmd, " "))
+    }
+
+    return nil
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+def inspect_image(image_name):
+    with cc.OCIClient() as client:
+        def on_progress(p):
+            if p.total > 0:
+                print(f"\rPulling {p.filename}: {p.current}/{p.total} bytes", end="")
+
+        source = client.pull(image_name, progress_callback=on_progress)
+        print()  # newline after progress
+
+        config = source.get_config()
+        print(f"Image: {image_name}")
+        print(f"Architecture: {config.architecture}")
+
+        if config.entrypoint:
+            print(f"Entrypoint: {' '.join(config.entrypoint)}")
+        if config.cmd:
+            print(f"Cmd: {' '.join(config.cmd)}")
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+fn inspect_image(image_name: &str) -> cc::Result<()> {
+    let client = OciClient::new()?;
+
+    let source = client.pull(image_name, None, Some(|p| {
+        if p.total > 0 {
+            print!("\rPulling {}: {}/{} bytes", p.filename, p.current, p.total);
+        }
+    }))?;
+    println!();
+
+    let config = source.get_config()?;
+    println!("Image: {}", image_name);
+    println!("Architecture: {:?}", config.architecture);
+
+    if let Some(entrypoint) = config.entrypoint {
+        println!("Entrypoint: {}", entrypoint.join(" "));
+    }
+    if let Some(cmd) = config.cmd {
+        println!("Cmd: {}", cmd.join(" "));
+    }
+
+    Ok(())
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+async function inspectImage(imageName: string) {
+    const client = new OCIClient();
+
+    const source = await client.pull(imageName, {
+        onProgress: (p) => {
+            if (p.total > 0) {
+                process.stdout.write(`\rPulling ${p.filename}: ${p.current}/${p.total} bytes`);
+            }
+        },
+    });
+    console.log();
+
+    const config = await source.getConfig();
+    console.log('Image:', imageName);
+    console.log('Architecture:', config.architecture);
+
+    if (config.entrypoint?.length) {
+        console.log('Entrypoint:', config.entrypoint.join(' '));
+    }
+    if (config.cmd?.length) {
+        console.log('Cmd:', config.cmd.join(' '));
+    }
+
+    client.close();
+}
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+void inspect_image(const char* image_name) {
+    cc_error err = {0};
+    cc_oci_client client;
+    cc_instance_source source;
+
+    cc_oci_client_new(&client, &err);
+    cc_oci_client_pull(client, image_name, NULL, NULL, NULL,
+                       CC_HANDLE_INVALID(cc_cancel_token), &source, &err);
+
+    cc_image_config config;
+    cc_instance_source_get_config(source, &config, &err);
+
+    printf("Image: %s\n", image_name);
+    printf("Architecture: %s\n", config.architecture);
+    if (config.entrypoint) {
+        printf("Entrypoint: %s\n", config.entrypoint[0]);
+    }
+
+    cc_image_config_free(&config);
+    cc_instance_source_free(source);
+    cc_oci_client_free(client);
+}
+```
+  </LangTabItem>
+</LanguageTabs>
+
+## Next Steps
+
+- [Filesystem Snapshots](/cc/api/snapshots/) - Cache modified filesystems
+- [Creating Instances](/cc/api/creating-instances/) - Start VMs from images

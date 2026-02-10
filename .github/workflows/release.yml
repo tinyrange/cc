@@ -24,7 +24,7 @@ jobs:
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
         run: |
-          echo $MACOS_CERTIFICATE | base64 --decode > certificate.p12
+          printf '%s' "$MACOS_CERTIFICATE" | base64 -D > certificate.p12
           trap "rm -f certificate.p12" EXIT
           security create-keychain -p actions build.keychain
           security default-keychain -s build.keychain
@@ -39,18 +39,47 @@ jobs:
           CC_APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           CC_TEAM_ID: ${{ secrets.TEAM_ID }}
           CC_KEYCHAIN_PATH: build.keychain
-        run: ./tools/build.go -release
+        run: |
+          ./tools/build.go ccapp
+          ./tools/build.go cc-helper
+          GOOS=darwin GOARCH=amd64 go build -o build/cc-helper_darwin_amd64 ./cmd/cc-helper
+
+          # Sign app contents and bundle with Developer ID + hardened runtime.
+          codesign -s "$CC_DEVELOPER_ID" -f -v --timestamp --options runtime --entitlements tools/entitlements.xml --keychain "$CC_KEYCHAIN_PATH" build/CrumbleCracker.app/Contents/MacOS/CrumbleCracker
+          codesign -s "$CC_DEVELOPER_ID" -f -v --timestamp --options runtime --entitlements tools/entitlements.xml --keychain "$CC_KEYCHAIN_PATH" build/CrumbleCracker.app
+
+          # Sign standalone helper binary as a release artifact.
+          codesign -s "$CC_DEVELOPER_ID" -f -v --timestamp --options runtime --entitlements tools/entitlements.xml --keychain "$CC_KEYCHAIN_PATH" build/cc-helper
+          codesign -s "$CC_DEVELOPER_ID" -f -v --timestamp --options runtime --entitlements tools/entitlements.xml --keychain "$CC_KEYCHAIN_PATH" build/cc-helper_darwin_amd64
+
+          # Notarize app bundle and staple ticket (parity with main's previous release flow).
+          ditto -c -k --keepParent build/CrumbleCracker.app build/CrumbleCracker_notary.zip
+          if [[ "$CC_APPLE_ID_PASSWORD" == @keychain:* ]]; then
+            NOTARY_PROFILE="${CC_APPLE_ID_PASSWORD#@keychain:}"
+            xcrun notarytool submit build/CrumbleCracker_notary.zip --keychain-profile "$NOTARY_PROFILE" --wait --timeout 30m
+          else
+            xcrun notarytool submit build/CrumbleCracker_notary.zip --apple-id "$CC_APPLE_ID" --password "$CC_APPLE_ID_PASSWORD" --team-id "$CC_TEAM_ID" --wait --timeout 30m
+          fi
+          xcrun stapler staple build/CrumbleCracker.app
+          xcrun stapler validate build/CrumbleCracker.app
+          codesign -d --verbose=4 build/CrumbleCracker.app | grep runtime
+          spctl --assess --type exec -v build/CrumbleCracker.app
+          rm -f build/CrumbleCracker_notary.zip
 
       - name: Create zip for release
         run: |
           cd build
-          zip -r CrumbleCracker_darwin_arm64.zip CrumbleCracker.app
+          ditto -c -k --keepParent CrumbleCracker.app CrumbleCracker_darwin_arm64.zip
+          cp cc-helper cc-helper_darwin_arm64
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: macos-arm64
-          path: build/CrumbleCracker_darwin_arm64.zip
+          path: |
+            build/CrumbleCracker_darwin_arm64.zip
+            build/cc-helper_darwin_arm64
+            build/cc-helper_darwin_amd64
 
   build-other:
     runs-on: ubuntu-latest
@@ -63,7 +92,12 @@ jobs:
           go-version-file: go.mod
 
       - name: Build for Windows and Linux
-        run: ./tools/build.go -release
+        run: |
+          ./tools/build.go release-cross
+          GOOS=linux GOARCH=amd64 go build -o build/cc-helper_linux_amd64 ./cmd/cc-helper
+          GOOS=linux GOARCH=arm64 go build -o build/cc-helper_linux_arm64 ./cmd/cc-helper
+          GOOS=windows GOARCH=amd64 go build -o build/cc-helper_windows_amd64.exe ./cmd/cc-helper
+          GOOS=windows GOARCH=arm64 go build -o build/cc-helper_windows_arm64.exe ./cmd/cc-helper
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -74,6 +108,10 @@ jobs:
             build/CrumbleCracker_windows_arm64.exe
             build/CrumbleCracker_linux_amd64
             build/CrumbleCracker_linux_arm64
+            build/cc-helper_windows_amd64.exe
+            build/cc-helper_windows_arm64.exe
+            build/cc-helper_linux_amd64
+            build/cc-helper_linux_arm64
 
   release:
     needs: [build-macos, build-other]
@@ -90,10 +128,16 @@ jobs:
           # Generate checksums with explicit filenames (preserving full format)
           for file in \
             macos-arm64/CrumbleCracker_darwin_arm64.zip \
+            macos-arm64/cc-helper_darwin_arm64 \
+            macos-arm64/cc-helper_darwin_amd64 \
             other-platforms/CrumbleCracker_windows_amd64.exe \
             other-platforms/CrumbleCracker_windows_arm64.exe \
             other-platforms/CrumbleCracker_linux_amd64 \
-            other-platforms/CrumbleCracker_linux_arm64
+            other-platforms/CrumbleCracker_linux_arm64 \
+            other-platforms/cc-helper_windows_amd64.exe \
+            other-platforms/cc-helper_windows_arm64.exe \
+            other-platforms/cc-helper_linux_amd64 \
+            other-platforms/cc-helper_linux_arm64
           do
             if [ -f "$file" ]; then
               sha256sum "$file" | sed "s|.*/||"
@@ -111,8 +155,14 @@ jobs:
           prerelease: true
           files: |
             artifacts/macos-arm64/CrumbleCracker_darwin_arm64.zip
+            artifacts/macos-arm64/cc-helper_darwin_arm64
+            artifacts/macos-arm64/cc-helper_darwin_amd64
             artifacts/other-platforms/CrumbleCracker_windows_amd64.exe
             artifacts/other-platforms/CrumbleCracker_windows_arm64.exe
             artifacts/other-platforms/CrumbleCracker_linux_amd64
             artifacts/other-platforms/CrumbleCracker_linux_arm64
+            artifacts/other-platforms/cc-helper_windows_amd64.exe
+            artifacts/other-platforms/cc-helper_windows_arm64.exe
+            artifacts/other-platforms/cc-helper_linux_amd64
+            artifacts/other-platforms/cc-helper_linux_arm64
             artifacts/checksums.txt
