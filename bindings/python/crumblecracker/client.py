@@ -24,11 +24,20 @@ class InstanceSource:
     This class represents a source that can be used to create VM instances.
     It should not be created directly; instead use OCIClient.pull(),
     OCIClient.load_tar(), or OCIClient.load_dir().
+
+    When using the IPC backend, this stores metadata needed to recreate the
+    source on the helper side (source_type, source_path, image_ref, cache_dir).
     """
 
-    def __init__(self, handle: _ffi.InstanceSourceHandle):
+    def __init__(self, handle=None, *, ipc_source_type: int = 0, ipc_source_path: str = "",
+                 ipc_image_ref: str = "", ipc_cache_dir: str = ""):
         self._handle = handle
         self._closed = False
+        # IPC backend metadata
+        self._ipc_source_type = ipc_source_type
+        self._ipc_source_path = ipc_source_path
+        self._ipc_image_ref = ipc_image_ref
+        self._ipc_cache_dir = ipc_cache_dir
 
     def __del__(self) -> None:
         self.close()
@@ -41,12 +50,13 @@ class InstanceSource:
 
     def close(self) -> None:
         """Release the instance source."""
-        if not self._closed and self._handle:
-            _ffi.get_lib().cc_instance_source_free(self._handle)
+        if not self._closed and self._handle is not None:
+            if not _ffi.using_ipc():
+                _ffi.get_lib().cc_instance_source_free(self._handle)
             self._closed = True
 
     @property
-    def handle(self) -> _ffi.InstanceSourceHandle:
+    def handle(self):
         """Get the underlying handle."""
         if self._closed:
             raise CCError("InstanceSource is closed", code=4)
@@ -54,6 +64,13 @@ class InstanceSource:
 
     def get_config(self) -> ImageConfig:
         """Get the image configuration."""
+        if _ffi.using_ipc():
+            # Image config is not available via IPC in the current protocol
+            return ImageConfig(
+                architecture=None, env=[], working_dir=None,
+                entrypoint=[], cmd=[], user=None,
+            )
+
         lib = _ffi.get_lib()
         config_ptr = POINTER(_ffi.ImageConfigStruct)()
         err = _ffi.CCErrorStruct()
@@ -112,6 +129,15 @@ class OCIClient:
         Args:
             cache_dir: Optional custom cache directory. If None, uses the default.
         """
+        self._cache_dir_str = cache_dir or ""
+        self._closed = False
+
+        if _ffi.using_ipc():
+            # IPC backend: OCI client lives in the helper process.
+            # We just store the cache_dir to pass when creating instances.
+            self._handle = None
+            return
+
         lib = _ffi.get_lib()
         handle = _ffi.OCIClientHandle()
         err = _ffi.CCErrorStruct()
@@ -125,7 +151,6 @@ class OCIClient:
 
         _ffi.check_error(code, err)
         self._handle = handle
-        self._closed = False
 
     def __del__(self) -> None:
         self.close()
@@ -138,12 +163,13 @@ class OCIClient:
 
     def close(self) -> None:
         """Close the client and release resources."""
-        if not self._closed and self._handle:
-            _ffi.get_lib().cc_oci_client_free(self._handle)
+        if not self._closed:
+            if self._handle is not None and not _ffi.using_ipc():
+                _ffi.get_lib().cc_oci_client_free(self._handle)
             self._closed = True
 
     @property
-    def handle(self) -> _ffi.OCIClientHandle:
+    def handle(self):
         """Get the underlying handle."""
         if self._closed:
             raise CCError("OCIClient is closed", code=4)
@@ -152,6 +178,8 @@ class OCIClient:
     @property
     def cache_dir(self) -> str:
         """Get the cache directory path."""
+        if _ffi.using_ipc():
+            return self._cache_dir_str
         lib = _ffi.get_lib()
         ptr = lib.cc_oci_client_cache_dir(self.handle)
         return _ffi._get_string_and_free(lib, ptr)
@@ -174,6 +202,15 @@ class OCIClient:
         Returns:
             An InstanceSource that can be used to create instances.
         """
+        if _ffi.using_ipc():
+            # For IPC, we store metadata about how to recreate this source
+            # in the helper process. The actual pull happens at instance creation.
+            return InstanceSource(
+                ipc_source_type=2,  # ref
+                ipc_image_ref=image_ref,
+                ipc_cache_dir=self._cache_dir_str,
+            )
+
         lib = _ffi.get_lib()
         source = _ffi.InstanceSourceHandle()
         err = _ffi.CCErrorStruct()
@@ -241,6 +278,13 @@ class OCIClient:
         Returns:
             An InstanceSource that can be used to create instances.
         """
+        if _ffi.using_ipc():
+            return InstanceSource(
+                ipc_source_type=0,  # tar
+                ipc_source_path=tar_path,
+                ipc_cache_dir=self._cache_dir_str,
+            )
+
         lib = _ffi.get_lib()
         source = _ffi.InstanceSourceHandle()
         err = _ffi.CCErrorStruct()
@@ -276,6 +320,13 @@ class OCIClient:
         Returns:
             An InstanceSource that can be used to create instances.
         """
+        if _ffi.using_ipc():
+            return InstanceSource(
+                ipc_source_type=1,  # directory
+                ipc_source_path=dir_path,
+                ipc_cache_dir=self._cache_dir_str,
+            )
+
         lib = _ffi.get_lib()
         source = _ffi.InstanceSourceHandle()
         err = _ffi.CCErrorStruct()
@@ -308,6 +359,9 @@ class OCIClient:
             source: The instance source to export
             dir_path: Path to the output directory
         """
+        if _ffi.using_ipc():
+            raise CCError("export_dir is not supported via IPC backend", code=2)
+
         lib = _ffi.get_lib()
         err = _ffi.CCErrorStruct()
 
@@ -349,6 +403,15 @@ class OCIClient:
         """
         # Import here to avoid circular imports
         from .instance import Snapshot
+
+        if _ffi.using_ipc():
+            backend = _ffi.get_ipc_backend()
+            handle = backend.build_dockerfile(
+                dockerfile, cache_dir,
+                context_dir=context_dir or "",
+                build_args=build_args,
+            )
+            return Snapshot(handle, _ipc=True)
 
         lib = _ffi.get_lib()
         snapshot_handle = _ffi.SnapshotHandle()
@@ -406,8 +469,12 @@ class CancelToken:
     """
 
     def __init__(self):
-        self._handle = _ffi.get_lib().cc_cancel_token_new()
         self._freed = False
+        self._cancelled = False
+        if _ffi.using_ipc():
+            self._handle = None
+            return
+        self._handle = _ffi.get_lib().cc_cancel_token_new()
 
     def __del__(self) -> None:
         self.close()
@@ -420,20 +487,25 @@ class CancelToken:
 
     def close(self) -> None:
         """Free the cancel token."""
-        if not self._freed and self._handle:
-            _ffi.get_lib().cc_cancel_token_free(self._handle)
+        if not self._freed:
+            if self._handle is not None and not _ffi.using_ipc():
+                _ffi.get_lib().cc_cancel_token_free(self._handle)
             self._freed = True
 
     @property
-    def handle(self) -> _ffi.CancelTokenHandle:
+    def handle(self):
         """Get the underlying handle."""
         return self._handle
 
     def cancel(self) -> None:
         """Cancel the token. All operations using this token will be cancelled."""
-        _ffi.get_lib().cc_cancel_token_cancel(self._handle)
+        self._cancelled = True
+        if self._handle is not None and not _ffi.using_ipc():
+            _ffi.get_lib().cc_cancel_token_cancel(self._handle)
 
     @property
     def is_cancelled(self) -> bool:
         """Check if the token has been cancelled."""
+        if _ffi.using_ipc():
+            return self._cancelled
         return bool(_ffi.get_lib().cc_cancel_token_is_cancelled(self._handle))

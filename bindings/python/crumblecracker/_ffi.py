@@ -92,9 +92,53 @@ def _find_library() -> str:
 # Load the library
 _lib: Any = None
 
+# IPC backend instance (used when ctypes/libcc is unavailable)
+_ipc_backend = None
+_use_ipc: bool | None = None  # None = auto-detect
+
+
+def _should_use_ipc() -> bool:
+    """Determine whether to use the IPC backend instead of ctypes."""
+    global _use_ipc
+    if _use_ipc is not None:
+        return _use_ipc
+
+    # Explicit opt-in via environment variable
+    if os.environ.get("CC_USE_HELPER", "").strip() in ("1", "true", "yes"):
+        _use_ipc = True
+        return True
+
+    # Try loading the native library
+    try:
+        _find_library()
+        _use_ipc = False
+        return False
+    except RuntimeError:
+        # Native library not found — fall back to IPC
+        _use_ipc = True
+        return True
+
+
+def get_ipc_backend():
+    """Get the IPC backend instance, creating it if necessary."""
+    global _ipc_backend
+    if _ipc_backend is None:
+        from ._ipc_backend import IPCBackend
+        _ipc_backend = IPCBackend()
+    return _ipc_backend
+
+
+def using_ipc() -> bool:
+    """Check if the IPC backend is in use."""
+    return _should_use_ipc()
+
 
 def _get_lib() -> Any:
-    """Get the loaded library, loading it if necessary."""
+    """Get the loaded library, loading it if necessary.
+
+    Raises RuntimeError if the native library cannot be found and the
+    IPC backend should be used instead — callers should check using_ipc() first.
+    """
     global _lib
     if _lib is None:
         lib_path = _find_library()
@@ -716,6 +760,8 @@ def _get_string_and_free(lib, ptr: int) -> str:
 
 def api_version() -> str:
     """Get the API version string."""
+    if _should_use_ipc():
+        return "ipc"
     lib = _get_lib()
     # Use c_void_p to keep the original pointer for freeing
     lib.cc_api_version.restype = c_void_p
@@ -729,11 +775,16 @@ def api_version() -> str:
 
 def api_version_compatible(major: int, minor: int) -> bool:
     """Check if the runtime library is compatible with the given version."""
+    if _should_use_ipc():
+        return True  # IPC backend handles version compatibility
     return bool(_get_lib().cc_api_version_compatible(major, minor))
 
 
 def init() -> None:
     """Initialize the library. Must be called before any other function."""
+    if _should_use_ipc():
+        # IPC backend is lazily initialized — nothing to do here
+        return
     code = _get_lib().cc_init()
     if code != 0:
         raise CCError(f"Failed to initialize library: code {code}", code=code)
@@ -741,11 +792,21 @@ def init() -> None:
 
 def shutdown() -> None:
     """Shutdown the library and release all resources."""
+    global _ipc_backend
+    if _should_use_ipc():
+        if _ipc_backend is not None:
+            _ipc_backend.close()
+            _ipc_backend = None
+        return
     _get_lib().cc_shutdown()
 
 
 def supports_hypervisor() -> bool:
     """Check if hypervisor is available. Raises HypervisorUnavailableError if not."""
+    if _should_use_ipc():
+        # When using the helper, assume hypervisor is available
+        # (the helper process has access to the hypervisor)
+        return True
     lib = _get_lib()
     err = CCErrorStruct()
     code = lib.cc_supports_hypervisor(byref(err))
@@ -758,6 +819,8 @@ def supports_hypervisor() -> bool:
 
 def guest_protocol_version() -> int:
     """Get the guest protocol version supported by this library."""
+    if _should_use_ipc():
+        return 0  # Not available via IPC
     return _get_lib().cc_guest_protocol_version()
 
 

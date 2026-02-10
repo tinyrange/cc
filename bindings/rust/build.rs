@@ -37,6 +37,15 @@ fn main() {
         println!("cargo:rustc-link-lib=resolv");
     }
 
+    // On Windows, link against libs required by Go runtime and net packages
+    #[cfg(target_os = "windows")]
+    {
+        println!("cargo:rustc-link-lib=ws2_32");
+        println!("cargo:rustc-link-lib=advapi32");
+        println!("cargo:rustc-link-lib=ntdll");
+        println!("cargo:rustc-link-lib=userenv");
+    }
+
     // Build cc-helper and copy to target directory
     build_and_install_helper(&out_dir, &project_root);
 
@@ -69,7 +78,11 @@ fn build_libcc(out_dir: &PathBuf, project_root: &PathBuf) -> PathBuf {
         );
     }
 
-    let lib_path = out_dir.join("libcc.a");
+    let lib_path = if cfg!(target_os = "windows") {
+        out_dir.join("cc.lib")
+    } else {
+        out_dir.join("libcc.a")
+    };
 
     // Check if we need to rebuild
     if !needs_rebuild(&lib_path, &bindings_c) {

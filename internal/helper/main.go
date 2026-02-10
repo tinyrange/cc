@@ -4,8 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/signal"
-	"syscall"
 
 	"github.com/tinyrange/cc/internal/ipc"
 )
@@ -38,7 +36,7 @@ func Main() {
 
 	// Handle signals for graceful shutdown
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signalNotify(sigCh)
 	go func() {
 		<-sigCh
 		server.Close()

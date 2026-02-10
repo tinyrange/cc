@@ -29,10 +29,11 @@ class File:
     Supports context manager protocol for automatic cleanup.
     """
 
-    def __init__(self, handle: _ffi.FileHandle, path: str):
+    def __init__(self, handle, path: str, *, _ipc: bool = False):
         self._handle = handle
         self._path = path
         self._closed = False
+        self._ipc = _ipc
 
     def __del__(self) -> None:
         self.close()
@@ -45,10 +46,13 @@ class File:
 
     def close(self) -> None:
         """Close the file."""
-        if not self._closed and self._handle:
-            lib = _ffi.get_lib()
-            err = _ffi.CCErrorStruct()
-            lib.cc_file_close(self._handle, byref(err))
+        if not self._closed and self._handle is not None:
+            if self._ipc:
+                _ffi.get_ipc_backend().file_close(self._handle)
+            else:
+                lib = _ffi.get_lib()
+                err = _ffi.CCErrorStruct()
+                lib.cc_file_close(self._handle, byref(err))
             self._closed = True
 
     @property
@@ -61,6 +65,8 @@ class File:
         """Get the file name."""
         if self._closed:
             return self._path
+        if self._ipc:
+            return _ffi.get_ipc_backend().file_name(self._handle) or self._path
         lib = _ffi.get_lib()
         ptr = lib.cc_file_name(self._handle)
         name = _ffi._get_string_and_free(lib, ptr)
@@ -78,10 +84,7 @@ class File:
         if self._closed:
             raise CCError("File is closed", code=4)
 
-        lib = _ffi.get_lib()
-
         if size == -1:
-            # Read all
             chunks = []
             chunk_size = 65536
             while True:
@@ -95,6 +98,9 @@ class File:
 
     def _read_chunk(self, size: int) -> bytes:
         """Read a chunk of data."""
+        if self._ipc:
+            return _ffi.get_ipc_backend().file_read(self._handle, size)
+
         lib = _ffi.get_lib()
         buf = (c_uint8 * size)()
         n = c_size_t()
@@ -117,6 +123,9 @@ class File:
         if self._closed:
             raise CCError("File is closed", code=4)
 
+        if self._ipc:
+            return _ffi.get_ipc_backend().file_write(self._handle, data)
+
         lib = _ffi.get_lib()
         buf = (c_uint8 * len(data)).from_buffer_copy(data)
         n = c_size_t()
@@ -128,17 +137,12 @@ class File:
         return n.value
 
     def seek(self, offset: int, whence: SeekWhence = SeekWhence.SET) -> int:
-        """Seek to a position in the file.
-
-        Args:
-            offset: Offset to seek to
-            whence: Origin for the seek (SET, CUR, or END)
-
-        Returns:
-            New file position
-        """
+        """Seek to a position in the file."""
         if self._closed:
             raise CCError("File is closed", code=4)
+
+        if self._ipc:
+            return _ffi.get_ipc_backend().file_seek(self._handle, offset, int(whence))
 
         lib = _ffi.get_lib()
         new_offset = c_int64()
@@ -154,6 +158,10 @@ class File:
         if self._closed:
             raise CCError("File is closed", code=4)
 
+        if self._ipc:
+            _ffi.get_ipc_backend().file_sync(self._handle)
+            return
+
         lib = _ffi.get_lib()
         err = _ffi.CCErrorStruct()
 
@@ -165,6 +173,10 @@ class File:
         if self._closed:
             raise CCError("File is closed", code=4)
 
+        if self._ipc:
+            _ffi.get_ipc_backend().file_truncate(self._handle, size)
+            return
+
         lib = _ffi.get_lib()
         err = _ffi.CCErrorStruct()
 
@@ -175,6 +187,9 @@ class File:
         """Get file information."""
         if self._closed:
             raise CCError("File is closed", code=4)
+
+        if self._ipc:
+            return _ffi.get_ipc_backend().file_stat(self._handle)
 
         lib = _ffi.get_lib()
         info = _ffi.FileInfoStruct()
@@ -202,9 +217,10 @@ class Snapshot:
     Snapshots can be used to create new instances from a known state.
     """
 
-    def __init__(self, handle: _ffi.SnapshotHandle):
+    def __init__(self, handle, *, _ipc: bool = False):
         self._handle = handle
         self._closed = False
+        self._ipc = _ipc
 
     def __del__(self) -> None:
         self.close()
@@ -217,10 +233,13 @@ class Snapshot:
 
     def close(self) -> None:
         """Close the snapshot."""
-        if not self._closed and self._handle:
-            lib = _ffi.get_lib()
-            err = _ffi.CCErrorStruct()
-            lib.cc_snapshot_close(self._handle, byref(err))
+        if not self._closed and self._handle is not None:
+            if self._ipc:
+                _ffi.get_ipc_backend().snapshot_close(self._handle)
+            else:
+                lib = _ffi.get_lib()
+                err = _ffi.CCErrorStruct()
+                lib.cc_snapshot_close(self._handle, byref(err))
             self._closed = True
 
     @property
@@ -228,6 +247,9 @@ class Snapshot:
         """Get the snapshot cache key."""
         if self._closed:
             raise CCError("Snapshot is closed", code=4)
+
+        if self._ipc:
+            return _ffi.get_ipc_backend().snapshot_cache_key(self._handle)
 
         lib = _ffi.get_lib()
         ptr = lib.cc_snapshot_cache_key(self._handle)
@@ -238,6 +260,12 @@ class Snapshot:
         """Get the parent snapshot, if any."""
         if self._closed:
             raise CCError("Snapshot is closed", code=4)
+
+        if self._ipc:
+            parent_handle = _ffi.get_ipc_backend().snapshot_parent(self._handle)
+            if parent_handle == 0:
+                return None
+            return Snapshot(parent_handle, _ipc=True)
 
         lib = _ffi.get_lib()
         parent_handle = lib.cc_snapshot_parent(self._handle)
@@ -253,6 +281,10 @@ class Snapshot:
             raise CCError("Snapshot is closed", code=4)
 
         from .client import InstanceSource
+
+        if self._ipc:
+            source_handle = _ffi.get_ipc_backend().snapshot_as_source(self._handle)
+            return InstanceSource(source_handle)
 
         lib = _ffi.get_lib()
         source_handle = lib.cc_snapshot_as_source(self._handle)
@@ -287,6 +319,30 @@ class Instance:
         # Initialize state first to prevent __del__ errors if __init__ fails
         self._handle = None
         self._closed = True
+        self._ipc = _ffi.using_ipc()
+
+        if self._ipc:
+            backend = _ffi.get_ipc_backend()
+            mounts = []
+            if options and options.mounts:
+                mounts = [
+                    (m.tag, m.host_path or "", m.writable)
+                    for m in options.mounts
+                ]
+            backend.instance_new(
+                source_type=source._ipc_source_type,
+                source_path=source._ipc_source_path,
+                image_ref=source._ipc_image_ref,
+                cache_dir=source._ipc_cache_dir,
+                memory_mb=options.memory_mb if options else 256,
+                cpus=options.cpus if options else 1,
+                timeout_seconds=options.timeout_seconds if options else 0,
+                user=options.user or "" if options else "",
+                enable_dmesg=options.enable_dmesg if options else False,
+                mounts=mounts,
+            )
+            self._closed = False
+            return
 
         lib = _ffi.get_lib()
         handle = _ffi.InstanceHandle()
@@ -334,14 +390,17 @@ class Instance:
 
     def close(self) -> None:
         """Close the instance and release resources."""
-        if not self._closed and self._handle:
-            lib = _ffi.get_lib()
-            err = _ffi.CCErrorStruct()
-            lib.cc_instance_close(self._handle, byref(err))
+        if not self._closed:
+            if self._ipc:
+                _ffi.get_ipc_backend().instance_close()
+            elif self._handle:
+                lib = _ffi.get_lib()
+                err = _ffi.CCErrorStruct()
+                lib.cc_instance_close(self._handle, byref(err))
             self._closed = True
 
     @property
-    def handle(self) -> _ffi.InstanceHandle:
+    def handle(self):
         """Get the underlying handle."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
@@ -352,6 +411,8 @@ class Instance:
         """Get the instance ID."""
         if self._closed:
             return ""
+        if self._ipc:
+            return _ffi.get_ipc_backend().instance_id()
         lib = _ffi.get_lib()
         ptr = lib.cc_instance_id(self._handle)
         return _ffi._get_string_and_free(lib, ptr)
@@ -361,15 +422,16 @@ class Instance:
         """Check if the instance is still running."""
         if self._closed:
             return False
+        if self._ipc:
+            return _ffi.get_ipc_backend().instance_is_running()
         return bool(_ffi.get_lib().cc_instance_is_running(self._handle))
 
     def wait(self, cancel_token: "CancelToken | None" = None) -> None:
-        """Wait for the instance to terminate.
-
-        Args:
-            cancel_token: Optional cancellation token
-        """
+        """Wait for the instance to terminate."""
         if self._closed:
+            return
+        if self._ipc:
+            _ffi.get_ipc_backend().instance_wait()
             return
 
         lib = _ffi.get_lib()
@@ -386,6 +448,9 @@ class Instance:
         """Set the console size for interactive mode."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
+        if self._ipc:
+            _ffi.get_ipc_backend().instance_set_console(cols, rows)
+            return
 
         lib = _ffi.get_lib()
         err = _ffi.CCErrorStruct()
@@ -397,6 +462,9 @@ class Instance:
         """Enable or disable network access."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
+        if self._ipc:
+            _ffi.get_ipc_backend().instance_set_network(enabled)
+            return
 
         lib = _ffi.get_lib()
         err = _ffi.CCErrorStruct()
@@ -410,67 +478,64 @@ class Instance:
         """Open a file for reading."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
+        if self._ipc:
+            handle = _ffi.get_ipc_backend().fs_open(path)
+            return File(handle, path, _ipc=True)
 
         lib = _ffi.get_lib()
         handle = _ffi.FileHandle()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_fs_open(self._handle, path.encode("utf-8"), byref(handle), byref(err))
         _ffi.check_error(code, err)
-
         return File(handle, path)
 
     def create(self, path: str) -> File:
         """Create or truncate a file."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
+        if self._ipc:
+            handle = _ffi.get_ipc_backend().fs_create(path)
+            return File(handle, path, _ipc=True)
 
         lib = _ffi.get_lib()
         handle = _ffi.FileHandle()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_fs_create(self._handle, path.encode("utf-8"), byref(handle), byref(err))
         _ffi.check_error(code, err)
-
         return File(handle, path)
 
     def open_file(self, path: str, flags: int, mode: int = 0o644) -> File:
-        """Open a file with specific flags and permissions.
-
-        Args:
-            path: File path
-            flags: Open flags (O_RDONLY, O_WRONLY, O_RDWR, O_CREATE, etc.)
-            mode: File permissions (default 0o644)
-        """
+        """Open a file with specific flags and permissions."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
+        if self._ipc:
+            handle = _ffi.get_ipc_backend().fs_open_file(path, flags, mode)
+            return File(handle, path, _ipc=True)
 
         lib = _ffi.get_lib()
         handle = _ffi.FileHandle()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_fs_open_file(
             self._handle, path.encode("utf-8"), flags, mode, byref(handle), byref(err)
         )
         _ffi.check_error(code, err)
-
         return File(handle, path)
 
     def read_file(self, path: str) -> bytes:
         """Read entire file contents."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
+        if self._ipc:
+            return _ffi.get_ipc_backend().fs_read_file(path)
 
         lib = _ffi.get_lib()
         data_ptr = POINTER(c_uint8)()
         length = c_size_t()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_fs_read_file(
             self._handle, path.encode("utf-8"), byref(data_ptr), byref(length), byref(err)
         )
         _ffi.check_error(code, err)
-
         if data_ptr and length.value > 0:
             result = bytes(data_ptr[: length.value])
             lib.cc_free_bytes(data_ptr)
@@ -481,10 +546,12 @@ class Instance:
         """Write entire file contents."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
+        if self._ipc:
+            _ffi.get_ipc_backend().fs_write_file(path, data, mode)
+            return
 
         lib = _ffi.get_lib()
         err = _ffi.CCErrorStruct()
-
         buf = (c_uint8 * len(data)).from_buffer_copy(data)
         code = lib.cc_fs_write_file(
             self._handle, path.encode("utf-8"), buf, len(data), mode, byref(err)
@@ -495,22 +562,19 @@ class Instance:
         """Get file information by path."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
+        if self._ipc:
+            return _ffi.get_ipc_backend().fs_stat(path)
 
         lib = _ffi.get_lib()
         info = _ffi.FileInfoStruct()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_fs_stat(self._handle, path.encode("utf-8"), byref(info), byref(err))
         _ffi.check_error(code, err)
-
         try:
             return FileInfo(
                 name=info.name.decode("utf-8") if info.name else "",
-                size=info.size,
-                mode=info.mode,
-                mod_time_unix=info.mod_time_unix,
-                is_dir=info.is_dir,
-                is_symlink=info.is_symlink,
+                size=info.size, mode=info.mode, mod_time_unix=info.mod_time_unix,
+                is_dir=info.is_dir, is_symlink=info.is_symlink,
             )
         finally:
             lib.cc_file_info_free(byref(info))
@@ -519,22 +583,19 @@ class Instance:
         """Get file information (don't follow symlinks)."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
+        if self._ipc:
+            return _ffi.get_ipc_backend().fs_lstat(path)
 
         lib = _ffi.get_lib()
         info = _ffi.FileInfoStruct()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_fs_lstat(self._handle, path.encode("utf-8"), byref(info), byref(err))
         _ffi.check_error(code, err)
-
         try:
             return FileInfo(
                 name=info.name.decode("utf-8") if info.name else "",
-                size=info.size,
-                mode=info.mode,
-                mod_time_unix=info.mod_time_unix,
-                is_dir=info.is_dir,
-                is_symlink=info.is_symlink,
+                size=info.size, mode=info.mode, mod_time_unix=info.mod_time_unix,
+                is_dir=info.is_dir, is_symlink=info.is_symlink,
             )
         finally:
             lib.cc_file_info_free(byref(info))
@@ -543,10 +604,11 @@ class Instance:
         """Remove a file."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
-
+        if self._ipc:
+            _ffi.get_ipc_backend().fs_remove(path)
+            return
         lib = _ffi.get_lib()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_fs_remove(self._handle, path.encode("utf-8"), byref(err))
         _ffi.check_error(code, err)
 
@@ -554,10 +616,11 @@ class Instance:
         """Remove a file or directory recursively."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
-
+        if self._ipc:
+            _ffi.get_ipc_backend().fs_remove_all(path)
+            return
         lib = _ffi.get_lib()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_fs_remove_all(self._handle, path.encode("utf-8"), byref(err))
         _ffi.check_error(code, err)
 
@@ -565,10 +628,11 @@ class Instance:
         """Create a directory."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
-
+        if self._ipc:
+            _ffi.get_ipc_backend().fs_mkdir(path, mode)
+            return
         lib = _ffi.get_lib()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_fs_mkdir(self._handle, path.encode("utf-8"), mode, byref(err))
         _ffi.check_error(code, err)
 
@@ -576,10 +640,11 @@ class Instance:
         """Create a directory and all parent directories."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
-
+        if self._ipc:
+            _ffi.get_ipc_backend().fs_mkdir_all(path, mode)
+            return
         lib = _ffi.get_lib()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_fs_mkdir_all(self._handle, path.encode("utf-8"), mode, byref(err))
         _ffi.check_error(code, err)
 
@@ -587,10 +652,11 @@ class Instance:
         """Rename a file or directory."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
-
+        if self._ipc:
+            _ffi.get_ipc_backend().fs_rename(old_path, new_path)
+            return
         lib = _ffi.get_lib()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_fs_rename(
             self._handle, old_path.encode("utf-8"), new_path.encode("utf-8"), byref(err)
         )
@@ -600,10 +666,11 @@ class Instance:
         """Create a symbolic link."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
-
+        if self._ipc:
+            _ffi.get_ipc_backend().fs_symlink(target, link_path)
+            return
         lib = _ffi.get_lib()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_fs_symlink(
             self._handle, target.encode("utf-8"), link_path.encode("utf-8"), byref(err)
         )
@@ -613,54 +680,50 @@ class Instance:
         """Read a symbolic link target."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
-
+        if self._ipc:
+            return _ffi.get_ipc_backend().fs_readlink(path)
         lib = _ffi.get_lib()
         target = c_void_p()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_fs_readlink(self._handle, path.encode("utf-8"), byref(target), byref(err))
         _ffi.check_error(code, err)
-
         return _ffi._get_string_and_free(lib, target.value)
 
     def read_dir(self, path: str) -> list[DirEntry]:
         """Read directory contents."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
+        if self._ipc:
+            return _ffi.get_ipc_backend().fs_read_dir(path)
 
         lib = _ffi.get_lib()
         entries_ptr = POINTER(_ffi.DirEntryStruct)()
         count = c_size_t()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_fs_read_dir(
             self._handle, path.encode("utf-8"), byref(entries_ptr), byref(count), byref(err)
         )
         _ffi.check_error(code, err)
-
         entries = []
         if entries_ptr and count.value > 0:
             for i in range(count.value):
                 e = entries_ptr[i]
-                entries.append(
-                    DirEntry(
-                        name=e.name.decode("utf-8") if e.name else "",
-                        is_dir=e.is_dir,
-                        mode=e.mode,
-                    )
-                )
+                entries.append(DirEntry(
+                    name=e.name.decode("utf-8") if e.name else "",
+                    is_dir=e.is_dir, mode=e.mode,
+                ))
             lib.cc_dir_entries_free(entries_ptr, count)
-
         return entries
 
     def chmod(self, path: str, mode: int) -> None:
         """Change file permissions."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
-
+        if self._ipc:
+            _ffi.get_ipc_backend().fs_chmod(path, mode)
+            return
         lib = _ffi.get_lib()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_fs_chmod(self._handle, path.encode("utf-8"), mode, byref(err))
         _ffi.check_error(code, err)
 
@@ -668,10 +731,11 @@ class Instance:
         """Change file owner."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
-
+        if self._ipc:
+            _ffi.get_ipc_backend().fs_chown(path, uid, gid)
+            return
         lib = _ffi.get_lib()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_fs_chown(self._handle, path.encode("utf-8"), uid, gid, byref(err))
         _ffi.check_error(code, err)
 
@@ -679,10 +743,11 @@ class Instance:
         """Change file access and modification times."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
-
+        if self._ipc:
+            _ffi.get_ipc_backend().fs_chtimes(path, atime_unix, mtime_unix)
+            return
         lib = _ffi.get_lib()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_fs_chtimes(
             self._handle, path.encode("utf-8"), atime_unix, mtime_unix, byref(err)
         )
@@ -718,27 +783,19 @@ class Instance:
         return Cmd.entrypoint(self, list(args) if args else None)
 
     def exec(self, name: str, *args: str) -> None:
-        """Replace the init process with the specified command.
-
-        This is a terminal operation - the instance cannot be used for
-        other operations after this.
-
-        Args:
-            name: Command name
-            *args: Command arguments
-        """
+        """Replace the init process with the specified command."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
+        if self._ipc:
+            _ffi.get_ipc_backend().instance_exec(name, list(args))
+            return
 
         lib = _ffi.get_lib()
         err = _ffi.CCErrorStruct()
-
-        # Build NULL-terminated args array
         args_array = (c_char_p * (len(args) + 1))()
         for i, arg in enumerate(args):
             args_array[i] = arg.encode("utf-8")
         args_array[len(args)] = None
-
         code = lib.cc_instance_exec(
             self._handle, name.encode("utf-8"), args_array, byref(err)
         )
@@ -747,22 +804,16 @@ class Instance:
     # ========== Networking ==========
 
     def listen(self, network: str, address: str) -> "Listener":
-        """Listen for connections on the guest network.
-
-        Args:
-            network: Network type ("tcp", "tcp4")
-            address: Address to listen on (e.g., ":8080", "0.0.0.0:80")
-
-        Returns:
-            A Listener that can accept connections.
-        """
+        """Listen for connections on the guest network."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
+        if self._ipc:
+            handle = _ffi.get_ipc_backend().net_listen(network, address)
+            return Listener(handle, _ipc=True)
 
         lib = _ffi.get_lib()
         handle = _ffi.ListenerHandle()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_net_listen(
             self._handle,
             network.encode("utf-8"),
@@ -771,27 +822,23 @@ class Instance:
             byref(err),
         )
         _ffi.check_error(code, err)
-
         return Listener(handle)
 
     # ========== Snapshots ==========
 
     def snapshot_filesystem(self, options: SnapshotOptions | None = None) -> Snapshot:
-        """Take a filesystem snapshot.
-
-        Args:
-            options: Snapshot options (excludes, cache_dir)
-
-        Returns:
-            A Snapshot that can be used to create new instances.
-        """
+        """Take a filesystem snapshot."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
+        if self._ipc:
+            excludes = options.excludes or [] if options else []
+            cache_dir = options.cache_dir or "" if options else ""
+            handle = _ffi.get_ipc_backend().fs_snapshot(excludes, cache_dir)
+            return Snapshot(handle, _ipc=True)
 
         lib = _ffi.get_lib()
         handle = _ffi.SnapshotHandle()
         err = _ffi.CCErrorStruct()
-
         opts_ptr = None
         excludes_array = None
         if options:
@@ -806,19 +853,18 @@ class Instance:
             if options.cache_dir:
                 opts.cache_dir = options.cache_dir.encode("utf-8")
             opts_ptr = byref(opts)
-
         code = lib.cc_fs_snapshot(self._handle, opts_ptr, byref(handle), byref(err))
         _ffi.check_error(code, err)
-
         return Snapshot(handle)
 
 
 class Listener:
     """A network listener for accepting connections."""
 
-    def __init__(self, handle: _ffi.ListenerHandle):
+    def __init__(self, handle, *, _ipc: bool = False):
         self._handle = handle
         self._closed = False
+        self._ipc = _ipc
 
     def __del__(self) -> None:
         self.close()
@@ -831,10 +877,13 @@ class Listener:
 
     def close(self) -> None:
         """Close the listener."""
-        if not self._closed and self._handle:
-            lib = _ffi.get_lib()
-            err = _ffi.CCErrorStruct()
-            lib.cc_listener_close(self._handle, byref(err))
+        if not self._closed and self._handle is not None:
+            if self._ipc:
+                _ffi.get_ipc_backend().listener_close(self._handle)
+            else:
+                lib = _ffi.get_lib()
+                err = _ffi.CCErrorStruct()
+                lib.cc_listener_close(self._handle, byref(err))
             self._closed = True
 
     @property
@@ -842,6 +891,8 @@ class Listener:
         """Get the listener address."""
         if self._closed:
             return ""
+        if self._ipc:
+            return _ffi.get_ipc_backend().listener_addr(self._handle)
         lib = _ffi.get_lib()
         ptr = lib.cc_listener_addr(self._handle)
         return _ffi._get_string_and_free(lib, ptr)
@@ -850,23 +901,25 @@ class Listener:
         """Accept a connection from a client."""
         if self._closed:
             raise CCError("Listener is closed", code=4)
+        if self._ipc:
+            handle = _ffi.get_ipc_backend().listener_accept(self._handle)
+            return Conn(handle, _ipc=True)
 
         lib = _ffi.get_lib()
         handle = _ffi.ConnHandle()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_listener_accept(self._handle, byref(handle), byref(err))
         _ffi.check_error(code, err)
-
         return Conn(handle)
 
 
 class Conn:
     """A network connection."""
 
-    def __init__(self, handle: _ffi.ConnHandle):
+    def __init__(self, handle, *, _ipc: bool = False):
         self._handle = handle
         self._closed = False
+        self._ipc = _ipc
 
     def __del__(self) -> None:
         self.close()
@@ -879,10 +932,13 @@ class Conn:
 
     def close(self) -> None:
         """Close the connection."""
-        if not self._closed and self._handle:
-            lib = _ffi.get_lib()
-            err = _ffi.CCErrorStruct()
-            lib.cc_conn_close(self._handle, byref(err))
+        if not self._closed and self._handle is not None:
+            if self._ipc:
+                _ffi.get_ipc_backend().conn_close(self._handle)
+            else:
+                lib = _ffi.get_lib()
+                err = _ffi.CCErrorStruct()
+                lib.cc_conn_close(self._handle, byref(err))
             self._closed = True
 
     @property
@@ -890,6 +946,8 @@ class Conn:
         """Get the local address."""
         if self._closed:
             return ""
+        if self._ipc:
+            return _ffi.get_ipc_backend().conn_local_addr(self._handle)
         lib = _ffi.get_lib()
         ptr = lib.cc_conn_local_addr(self._handle)
         return _ffi._get_string_and_free(lib, ptr)
@@ -899,6 +957,8 @@ class Conn:
         """Get the remote address."""
         if self._closed:
             return ""
+        if self._ipc:
+            return _ffi.get_ipc_backend().conn_remote_addr(self._handle)
         lib = _ffi.get_lib()
         ptr = lib.cc_conn_remote_addr(self._handle)
         return _ffi._get_string_and_free(lib, ptr)
@@ -907,34 +967,30 @@ class Conn:
         """Read up to size bytes from the connection."""
         if self._closed:
             raise CCError("Connection is closed", code=4)
+        if self._ipc:
+            return _ffi.get_ipc_backend().conn_read(self._handle, size)
 
         lib = _ffi.get_lib()
         buf = (c_uint8 * size)()
         n = c_size_t()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_conn_read(self._handle, buf, size, byref(n), byref(err))
         _ffi.check_error(code, err)
-
         return bytes(buf[: n.value])
 
     def write(self, data: bytes) -> int:
-        """Write data to the connection.
-
-        Returns:
-            Number of bytes written.
-        """
+        """Write data to the connection."""
         if self._closed:
             raise CCError("Connection is closed", code=4)
+        if self._ipc:
+            return _ffi.get_ipc_backend().conn_write(self._handle, data)
 
         lib = _ffi.get_lib()
         buf = (c_uint8 * len(data)).from_buffer_copy(data)
         n = c_size_t()
         err = _ffi.CCErrorStruct()
-
         code = lib.cc_conn_write(self._handle, buf, len(data), byref(n), byref(err))
         _ffi.check_error(code, err)
-
         return n.value
 
 
@@ -943,6 +999,20 @@ class Conn:
 
 def query_capabilities() -> Capabilities:
     """Query system capabilities."""
+    if _ffi.using_ipc():
+        # When using IPC, capabilities are determined locally.
+        # The helper process runs on the same machine.
+        import platform
+        machine = platform.machine().lower()
+        arch_map = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}
+        arch = arch_map.get(machine, machine)
+        return Capabilities(
+            hypervisor_available=True,
+            max_memory_mb=0,
+            max_cpus=0,
+            architecture=arch,
+        )
+
     lib = _ffi.get_lib()
     caps = _ffi.CapabilitiesStruct()
     err = _ffi.CCErrorStruct()

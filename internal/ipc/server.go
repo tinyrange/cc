@@ -179,7 +179,7 @@ func (s *Server) Close() error {
 
 	// Clean up socket file
 	if s.socketPath != "" {
-		os.Remove(s.socketPath)
+		removeSocket(s.socketPath)
 	}
 
 	return nil

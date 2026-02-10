@@ -13,9 +13,6 @@ import (
 	"time"
 )
 
-// socketCounter provides unique socket paths when multiple helpers are spawned concurrently.
-var socketCounter atomic.Uint64
-
 // Client manages a connection to a cc-helper process.
 type Client struct {
 	conn       net.Conn
@@ -113,8 +110,7 @@ func SpawnHelper(libPath string) (*Client, error) {
 	}
 
 	// Create a temporary socket path (counter ensures uniqueness under concurrent spawns)
-	tmpDir := os.TempDir()
-	socketPath := filepath.Join(tmpDir, fmt.Sprintf("cc-helper-%d-%d-%d.sock", os.Getpid(), time.Now().UnixNano(), socketCounter.Add(1)))
+	socketPath := SocketPath()
 
 	// Start the helper process
 	cmd := exec.Command(helperPath, "-socket", socketPath)
@@ -138,7 +134,7 @@ func SpawnHelper(libPath string) (*Client, error) {
 	if conn == nil {
 		cmd.Process.Kill()
 		cmd.Wait()
-		os.Remove(socketPath)
+		removeSocket(socketPath)
 		return nil, fmt.Errorf("failed to connect to cc-helper: %w", lastErr)
 	}
 
@@ -195,7 +191,7 @@ func (c *Client) Close() error {
 
 	// Clean up socket file
 	if c.socketPath != "" {
-		os.Remove(c.socketPath)
+		removeSocket(c.socketPath)
 	}
 
 	if len(errs) > 0 {

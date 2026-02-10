@@ -41,6 +41,7 @@ function getPlatformPackageName(): string | null {
   const platformMap: Record<string, string> = {
     'darwin': 'darwin',
     'linux': 'linux',
+    'win32': 'windows',
   };
 
   const mappedPlatform = platformMap[platform];
@@ -208,7 +209,7 @@ export class HelperProcess {
     // Give the helper a chance to exit gracefully
     const exitPromise = new Promise<void>((resolve) => {
       const timeout = setTimeout(() => {
-        this.process.kill('SIGKILL');
+        this.process.kill();
         resolve();
       }, 2000);
 
@@ -218,14 +219,33 @@ export class HelperProcess {
       });
     });
 
-    this.process.kill('SIGTERM');
+    // On Windows, SIGTERM is not supported; process.kill() sends
+    // TerminateProcess. Use 'SIGINT' which Node.js handles cross-platform.
+    try {
+      this.process.kill(os.platform() === 'win32' ? 'SIGINT' : 'SIGTERM');
+    } catch {
+      // Process may have already exited
+    }
     await exitPromise;
 
-    // Clean up socket file
-    try {
-      fs.unlinkSync(this.socketPath);
-    } catch {
-      // Ignore errors
+    // Clean up socket file (retry on Windows for file lock delays)
+    if (os.platform() === 'win32') {
+      for (let i = 0; i < 5; i++) {
+        try {
+          fs.unlinkSync(this.socketPath);
+          break;
+        } catch {
+          if (i < 4) {
+            await new Promise((r) => setTimeout(r, 50));
+          }
+        }
+      }
+    } else {
+      try {
+        fs.unlinkSync(this.socketPath);
+      } catch {
+        // Ignore errors
+      }
     }
   }
 }
@@ -253,17 +273,29 @@ export async function spawnHelper(libPath?: string): Promise<HelperProcess> {
     throw new HelperNotFoundError(result.searched);
   }
 
-  // Create a temporary socket path
-  const tmpDir = os.tmpdir();
-  const socketPath = path.join(
-    tmpDir,
-    `cc-helper-${process.pid}-${Date.now()}.sock`
-  );
+  // Create a temporary socket path (shorter on Windows to stay under
+  // the 108-char sun_path limit)
+  let socketPath: string;
+  if (os.platform() === 'win32') {
+    const shortDir = path.join(os.tmpdir(), 'cc');
+    fs.mkdirSync(shortDir, { recursive: true });
+    socketPath = path.join(shortDir, `h-${process.pid}-${Date.now()}.sock`);
+  } else {
+    socketPath = path.join(
+      os.tmpdir(),
+      `cc-helper-${process.pid}-${Date.now()}.sock`
+    );
+  }
 
   // Start the helper process
-  const helperProcess = spawn(result.path, ['-socket', socketPath], {
+  const spawnOptions: Parameters<typeof spawn>[2] = {
     stdio: ['ignore', 'pipe', 'inherit'],
-  });
+  };
+  // On Windows, hide the console window
+  if (os.platform() === 'win32') {
+    spawnOptions.windowsHide = true;
+  }
+  const helperProcess = spawn(result.path, ['-socket', socketPath], spawnOptions);
 
   // First, wait for the socket file to exist on the filesystem
   // This is important for Bun compatibility - Bun may try to connect
@@ -296,7 +328,7 @@ export async function spawnHelper(libPath?: string): Promise<HelperProcess> {
   try {
     fs.unlinkSync(socketPath);
   } catch {
-    // Ignore
+    // Ignore - file may not exist or may be locked on Windows
   }
 
   throw new CCError(

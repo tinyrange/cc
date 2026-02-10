@@ -133,7 +133,7 @@ def test_filesystem_write_read():
             source = client.pull("alpine:latest")
 
             with cc.Instance(source) as inst:
-                test_path = "/tmp/test_file.txt"
+                test_path = "/root/test_file.txt"
                 test_data = b"Hello, filesystem!"
 
                 # Write file
@@ -158,7 +158,7 @@ def test_filesystem_stat():
             source = client.pull("alpine:latest")
 
             with cc.Instance(source) as inst:
-                test_path = "/tmp/stat_test.txt"
+                test_path = "/root/stat_test.txt"
                 test_data = b"Hello, World!"
 
                 inst.write_file(test_path, test_data)
@@ -183,14 +183,14 @@ def test_filesystem_mkdir():
 
             with cc.Instance(source) as inst:
                 # Create directory
-                inst.mkdir("/tmp/testdir")
+                inst.mkdir("/root/testdir")
 
                 # Verify it exists
-                info = inst.stat("/tmp/testdir")
+                info = inst.stat("/root/testdir")
                 assert info.is_dir, "Should be a directory"
 
                 # List parent directory
-                entries = inst.read_dir("/tmp")
+                entries = inst.read_dir("/root")
                 names = [e.name for e in entries]
                 assert "testdir" in names, f"testdir not found in {names}"
 
@@ -208,7 +208,7 @@ def test_filesystem_remove():
             source = client.pull("alpine:latest")
 
             with cc.Instance(source) as inst:
-                test_path = "/tmp/remove_test.txt"
+                test_path = "/root/remove_test.txt"
 
                 # Create file
                 inst.write_file(test_path, b"delete me")
@@ -237,7 +237,7 @@ def test_file_handle():
             source = client.pull("alpine:latest")
 
             with cc.Instance(source) as inst:
-                test_path = "/tmp/handle_test.txt"
+                test_path = "/root/handle_test.txt"
 
                 # Create and write
                 with inst.create(test_path) as f:

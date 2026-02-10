@@ -43,6 +43,16 @@ class Cmd:
 
         Users should use Instance.command() instead of this constructor.
         """
+        self._ipc = _ffi.using_ipc()
+        self._instance = instance
+        self._started = False
+        self._freed = False
+
+        if self._ipc:
+            backend = _ffi.get_ipc_backend()
+            self._handle = backend.cmd_new(name, args)
+            return
+
         lib = _ffi.get_lib()
         handle = _ffi.CmdHandle()
         err = _ffi.CCErrorStruct()
@@ -59,13 +69,21 @@ class Cmd:
         _ffi.check_error(code, err)
 
         self._handle = handle
-        self._instance = instance
-        self._started = False
-        self._freed = False
 
     @classmethod
     def entrypoint(cls, instance: "Instance", args: list[str] | None = None) -> "Cmd":
         """Create a command using the container's entrypoint."""
+        cmd = cls.__new__(cls)
+        cmd._ipc = _ffi.using_ipc()
+        cmd._instance = instance
+        cmd._started = False
+        cmd._freed = False
+
+        if cmd._ipc:
+            backend = _ffi.get_ipc_backend()
+            cmd._handle = backend.cmd_entrypoint(args or [])
+            return cmd
+
         lib = _ffi.get_lib()
         handle = _ffi.CmdHandle()
         err = _ffi.CCErrorStruct()
@@ -82,11 +100,7 @@ class Cmd:
         code = lib.cc_cmd_entrypoint(instance.handle, args_ptr, byref(handle), byref(err))
         _ffi.check_error(code, err)
 
-        cmd = cls.__new__(cls)
         cmd._handle = handle
-        cmd._instance = instance
-        cmd._started = False
-        cmd._freed = False
         return cmd
 
     def __del__(self) -> None:
@@ -95,7 +109,10 @@ class Cmd:
     def _free(self) -> None:
         """Free the command if not yet started."""
         if not self._freed and not self._started and self._handle:
-            _ffi.get_lib().cc_cmd_free(self._handle)
+            if self._ipc:
+                _ffi.get_ipc_backend().cmd_free(self._handle)
+            else:
+                _ffi.get_lib().cc_cmd_free(self._handle)
             self._freed = True
 
     @property
@@ -114,6 +131,10 @@ class Cmd:
         Returns:
             self for method chaining
         """
+        if self._ipc:
+            _ffi.get_ipc_backend().cmd_set_dir(self._handle, dir)
+            return self
+
         lib = _ffi.get_lib()
         err = _ffi.CCErrorStruct()
 
@@ -132,6 +153,10 @@ class Cmd:
         Returns:
             self for method chaining
         """
+        if self._ipc:
+            _ffi.get_ipc_backend().cmd_set_env(self._handle, key, value)
+            return self
+
         lib = _ffi.get_lib()
         err = _ffi.CCErrorStruct()
 
@@ -151,6 +176,10 @@ class Cmd:
         Returns:
             Variable value, or None if not set
         """
+        if self._ipc:
+            val = _ffi.get_ipc_backend().cmd_get_env(self._handle, key)
+            return val if val else None
+
         lib = _ffi.get_lib()
         ptr = lib.cc_cmd_get_env(self.handle, key.encode("utf-8"))
         if not ptr:
@@ -163,6 +192,9 @@ class Cmd:
         Returns:
             List of "KEY=VALUE" strings
         """
+        if self._ipc:
+            return _ffi.get_ipc_backend().cmd_environ(self._handle)
+
         lib = _ffi.get_lib()
         env_ptr = POINTER(c_void_p)()
         count = c_size_t()
@@ -193,6 +225,11 @@ class Cmd:
         if self._started:
             raise CCError("Cmd has already been started", code=2)
 
+        if self._ipc:
+            _ffi.get_ipc_backend().cmd_start(self._handle)
+            self._started = True
+            return
+
         lib = _ffi.get_lib()
         err = _ffi.CCErrorStruct()
 
@@ -210,6 +247,9 @@ class Cmd:
         if not self._started:
             raise CCError("Cmd has not been started", code=2)
 
+        if self._ipc:
+            return _ffi.get_ipc_backend().cmd_wait(self._handle)
+
         lib = _ffi.get_lib()
         exit_code = c_int()
         err = _ffi.CCErrorStruct()
@@ -225,6 +265,10 @@ class Cmd:
         Returns:
             Exit code
         """
+        if self._ipc:
+            self._started = True
+            return _ffi.get_ipc_backend().cmd_run(self._handle)
+
         lib = _ffi.get_lib()
         exit_code = c_int()
         err = _ffi.CCErrorStruct()
@@ -241,6 +285,11 @@ class Cmd:
         Returns:
             Standard output as bytes
         """
+        if self._ipc:
+            self._started = True
+            data, _ = _ffi.get_ipc_backend().cmd_output(self._handle)
+            return data
+
         lib = _ffi.get_lib()
         out_ptr = POINTER(c_uint8)()
         length = c_size_t()
@@ -265,6 +314,11 @@ class Cmd:
         Returns:
             Combined output as bytes
         """
+        if self._ipc:
+            self._started = True
+            data, _ = _ffi.get_ipc_backend().cmd_combined_output(self._handle)
+            return data
+
         lib = _ffi.get_lib()
         out_ptr = POINTER(c_uint8)()
         length = c_size_t()
@@ -286,6 +340,8 @@ class Cmd:
     @property
     def exit_code(self) -> int:
         """Get the exit code (after wait/run)."""
+        if self._ipc:
+            return _ffi.get_ipc_backend().cmd_exit_code(self._handle)
         return _ffi.get_lib().cc_cmd_exit_code(self.handle)
 
     def kill(self) -> None:
@@ -295,6 +351,11 @@ class Cmd:
         After calling, the handle is invalid.
         """
         if self._freed:
+            return
+
+        if self._ipc:
+            _ffi.get_ipc_backend().cmd_kill(self._handle)
+            self._freed = True
             return
 
         lib = _ffi.get_lib()
