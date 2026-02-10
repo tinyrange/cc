@@ -36,6 +36,11 @@ func (e *HelperNotFoundError) Error() string {
 func findHelper(libPath string) (string, []string) {
 	var searched []string
 
+	helperName := "cc-helper"
+	if runtime.GOOS == "windows" {
+		helperName = "cc-helper.exe"
+	}
+
 	// 1. CC_HELPER_PATH environment variable
 	if path := os.Getenv("CC_HELPER_PATH"); path != "" {
 		searched = append(searched, path)
@@ -47,7 +52,7 @@ func findHelper(libPath string) (string, []string) {
 	// 2. Adjacent to current executable (for static linking)
 	if exePath, err := os.Executable(); err == nil {
 		dir := filepath.Dir(exePath)
-		path := filepath.Join(dir, "cc-helper")
+		path := filepath.Join(dir, helperName)
 		searched = append(searched, path)
 		if _, err := os.Stat(path); err == nil {
 			return path, nil
@@ -57,7 +62,7 @@ func findHelper(libPath string) (string, []string) {
 	// 3. Adjacent to libcc (same directory as library)
 	if libPath != "" {
 		dir := filepath.Dir(libPath)
-		path := filepath.Join(dir, "cc-helper")
+		path := filepath.Join(dir, helperName)
 		searched = append(searched, path)
 		if _, err := os.Stat(path); err == nil {
 			return path, nil

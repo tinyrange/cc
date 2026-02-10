@@ -116,9 +116,8 @@ ci-tests: quest cc
     run $(OUTPUT)/runtest --cc2-binary $(OUTPUT)/cc ./internal/cmd/cc/tests/...
     run $(OUTPUT)/runtest --cc2-binary $(OUTPUT)/cc ./examples/getting-started/...
 
-# Full CI tests including bindings (for platforms that support them)
+# Full CI tests including bindings
 ci-tests-full: ci-tests bindings-test
-    requires darwin linux
 
 # ============================================================================
 # Bindings
@@ -134,51 +133,63 @@ libcc: cc-helper
 
 # C bindings test
 libcc-test: libcc codesign
-    requires darwin linux
     @darwin sh gcc -o $(OUTPUT)/test_basic bindings/c/testdata/test_basic.c \
         -I$(OUTPUT) -L$(OUTPUT) -lcc '-Wl,-rpath,@executable_path'
     @linux sh gcc -o $(OUTPUT)/test_basic bindings/c/testdata/test_basic.c \
         -I$(OUTPUT) -L$(OUTPUT) -lcc '-Wl,-rpath,\$ORIGIN'
+    @windows sh gcc -o $(OUTPUT)/test_basic.exe bindings/c/testdata/test_basic.c \
+        -I$(OUTPUT) -L$(OUTPUT) -lcc
     @darwin sh $(OUTPUT)/codesign -entitlements $(ENTITLEMENTS) -bin $(OUTPUT)/test_basic
-    run $(OUTPUT)/test_basic
+    run $(OUTPUT)/test_basic$(EXE)
 
 # --- Python Bindings ---
 
 # Python bindings (requires libcc)
 bindings-python: libcc
-    requires darwin linux
-    sh test -d bindings/python/.venv || python3 -m venv bindings/python/.venv
-    sh bindings/python/.venv/bin/pip install -e "bindings/python[dev]" --quiet
+    @darwin sh test -d bindings/python/.venv || python3 -m venv bindings/python/.venv
+    @darwin sh bindings/python/.venv/bin/pip install -e "bindings/python[dev]" --quiet
+    @linux sh test -d bindings/python/.venv || python3 -m venv bindings/python/.venv
+    @linux sh bindings/python/.venv/bin/pip install -e "bindings/python[dev]" --quiet
+    @windows sh if (!(Test-Path bindings/python/.venv)) { python -m venv bindings/python/.venv }
+    @windows sh bindings/python/.venv/Scripts/pip install -e "bindings/python[dev]" --quiet
 
 # Python bindings test
 bindings-python-test: bindings-python
-    requires darwin linux
-    sh LIBCC_PATH=$(PWD)/$(OUTPUT)/libcc$(SHLIB_EXT) CC_HELPER_PATH=$(PWD)/$(OUTPUT)/cc-helper \
-        bindings/python/.venv/bin/pytest -v bindings/python/tests/
+    env LIBCC_PATH=$(PWD)/$(OUTPUT)/libcc$(SHLIB_EXT)
+    env CC_HELPER_PATH=$(PWD)/$(OUTPUT)/cc-helper$(EXE)
+    @darwin sh bindings/python/.venv/bin/pytest -v bindings/python/tests/
+    @linux sh bindings/python/.venv/bin/pytest -v bindings/python/tests/
+    @windows sh bindings/python/.venv/Scripts/pytest -v bindings/python/tests/
 
 # --- Node.js Bindings ---
 
 # Node.js bindings build
 bindings-nodejs: libcc
-    requires darwin linux
-    sh cd bindings/nodejs && npm install --silent && npm run build
+    @darwin sh cd bindings/nodejs && npm install --silent && npm run build
+    @linux sh cd bindings/nodejs && npm install --silent && npm run build
+    @windows sh cd bindings/nodejs; npm install --silent; npm run build
 
 # Node.js bindings test
 bindings-nodejs-test: bindings-nodejs
-    requires darwin linux
-    sh cd bindings/nodejs && CC_LIBRARY_PATH=$(PWD)/$(OUTPUT) CC_HELPER_PATH=$(PWD)/$(OUTPUT)/cc-helper npm test
+    env CC_LIBRARY_PATH=$(PWD)/$(OUTPUT)
+    env CC_HELPER_PATH=$(PWD)/$(OUTPUT)/cc-helper$(EXE)
+    @darwin sh cd bindings/nodejs && npm test
+    @linux sh cd bindings/nodejs && npm test
+    @windows sh cd bindings/nodejs; npm test
 
 # --- Rust Bindings ---
 
 # Rust bindings build (builds libcc.a statically via build.rs)
 bindings-rust:
-    requires darwin linux
-    sh cd bindings/rust && cargo build
+    @darwin sh cd bindings/rust && cargo build
+    @linux sh cd bindings/rust && cargo build
+    @windows sh cd bindings/rust; cargo build
 
 # Rust bindings test
 bindings-rust-test: bindings-rust
-    requires darwin linux
-    sh cd bindings/rust && cargo test
+    @darwin sh cd bindings/rust && cargo test
+    @linux sh cd bindings/rust && cargo test
+    @windows sh cd bindings/rust; cargo test
 
 # --- All Bindings ---
 

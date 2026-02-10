@@ -41,13 +41,17 @@ describe.skipIf(!RUN_VM_TESTS)('TestWithVM', () => {
       console.log(`Image architecture: ${config.architecture}`);
 
       // Create instance
-      await using inst = await source.createInstance({
+      const inst = await source.createInstance({
         memoryMb: 256,
         cpus: 1,
       });
 
-      expect(await inst.isRunning()).toBe(true);
-      console.log(`Instance ID: ${await inst.id()}`);
+      try {
+        expect(await inst.isRunning()).toBe(true);
+        console.log(`Instance ID: ${await inst.id()}`);
+      } finally {
+        await inst.close();
+      }
 
       // Close helper after instance
       await source.helper.close();
@@ -66,12 +70,15 @@ describe.skipIf(!RUN_VM_TESTS)('TestWithVM', () => {
     try {
       const source = await client.pull('alpine:latest');
 
-      await using inst = await source.createInstance();
-
-      // Run echo command
-      const cmd = await inst.command('echo', 'Hello from Node.js!');
-      const output = await cmd.output();
-      expect(output.toString()).toContain('Hello from Node.js!');
+      const inst = await source.createInstance();
+      try {
+        // Run echo command
+        const cmd = await inst.command('echo', 'Hello from Node.js!');
+        const output = await cmd.output();
+        expect(output.toString()).toContain('Hello from Node.js!');
+      } finally {
+        await inst.close();
+      }
 
       await source.helper.close();
     } finally {
@@ -89,25 +96,28 @@ describe.skipIf(!RUN_VM_TESTS)('TestWithVM', () => {
     try {
       const source = await client.pull('alpine:latest');
 
-      await using inst = await source.createInstance();
+      const inst = await source.createInstance();
+      try {
+        const testPath = '/tmp/test_file.txt';
+        const testData = Buffer.from('Hello, filesystem!');
 
-      const testPath = '/tmp/test_file.txt';
-      const testData = Buffer.from('Hello, filesystem!');
+        // Write file
+        await inst.writeFile(testPath, testData);
 
-      // Write file
-      await inst.writeFile(testPath, testData);
+        // Read file back
+        const readData = await inst.readFile(testPath);
+        expect(readData.equals(testData)).toBe(true);
 
-      // Read file back
-      const readData = await inst.readFile(testPath);
-      expect(readData.equals(testData)).toBe(true);
+        // Stat file
+        const info = await inst.stat(testPath);
+        expect(info.size).toBe(testData.length);
+        expect(info.isDir).toBe(false);
 
-      // Stat file
-      const info = await inst.stat(testPath);
-      expect(info.size).toBe(testData.length);
-      expect(info.isDir).toBe(false);
-
-      // Remove file
-      await inst.remove(testPath);
+        // Remove file
+        await inst.remove(testPath);
+      } finally {
+        await inst.close();
+      }
 
       await source.helper.close();
     } finally {
@@ -125,18 +135,21 @@ describe.skipIf(!RUN_VM_TESTS)('TestWithVM', () => {
     try {
       const source = await client.pull('alpine:latest');
 
-      await using inst = await source.createInstance();
+      const inst = await source.createInstance();
+      try {
+        // Create directory
+        await inst.mkdir('/tmp/testdir');
 
-      // Create directory
-      await inst.mkdir('/tmp/testdir');
+        // List directory
+        const entries = await inst.readDir('/tmp');
+        const names = entries.map((e) => e.name);
+        expect(names).toContain('testdir');
 
-      // List directory
-      const entries = await inst.readDir('/tmp');
-      const names = entries.map((e) => e.name);
-      expect(names).toContain('testdir');
-
-      // Remove directory
-      await inst.removeAll('/tmp/testdir');
+        // Remove directory
+        await inst.removeAll('/tmp/testdir');
+      } finally {
+        await inst.close();
+      }
 
       await source.helper.close();
     } finally {
@@ -154,25 +167,32 @@ describe.skipIf(!RUN_VM_TESTS)('TestWithVM', () => {
     try {
       const source = await client.pull('alpine:latest');
 
-      await using inst = await source.createInstance();
+      const inst = await source.createInstance();
+      try {
+        // Create and write to file
+        const fw = await inst.create('/tmp/handle_test.txt');
+        try {
+          const n = await fw.write(Buffer.from('Hello, World!'));
+          expect(n).toBe(13);
+        } finally {
+          await fw.close();
+        }
 
-      // Create and write to file
-      {
-        await using f = await inst.create('/tmp/handle_test.txt');
-        const n = await f.write(Buffer.from('Hello, World!'));
-        expect(n).toBe(13);
-      }
+        // Open and read file
+        const fr = await inst.open('/tmp/handle_test.txt');
+        try {
+          const data = await fr.read();
+          expect(data.toString()).toBe('Hello, World!');
 
-      // Open and read file
-      {
-        await using f = await inst.open('/tmp/handle_test.txt');
-        const data = await f.read();
-        expect(data.toString()).toBe('Hello, World!');
-
-        // Seek and read
-        await f.seek(0);
-        const data2 = await f.read(5);
-        expect(data2.toString()).toBe('Hello');
+          // Seek and read
+          await fr.seek(0);
+          const data2 = await fr.read(5);
+          expect(data2.toString()).toBe('Hello');
+        } finally {
+          await fr.close();
+        }
+      } finally {
+        await inst.close();
       }
 
       await source.helper.close();

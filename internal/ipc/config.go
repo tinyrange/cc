@@ -15,6 +15,7 @@ var (
 // UseHelper returns true if the IPC helper should be used for instance operations.
 // By default:
 // - macOS: true (codesigning required for hypervisor access)
+// - Windows: true (Go c-archive crashes with hypervisor APIs in-process)
 // - Other platforms: false (library can access hypervisor directly)
 //
 // This can be overridden by environment variables:
@@ -34,8 +35,8 @@ func UseHelper() bool {
 			}
 		}
 
-		// Default: use helper on macOS, direct on other platforms
-		useHelperVal = runtime.GOOS == "darwin"
+		// Default: use helper on macOS and Windows, direct on other platforms
+		useHelperVal = runtime.GOOS == "darwin" || runtime.GOOS == "windows"
 	})
 	return useHelperVal
 }

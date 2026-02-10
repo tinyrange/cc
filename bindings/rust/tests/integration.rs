@@ -224,7 +224,7 @@ fn test_filesystem_write_read() {
 
     let inst = cc::Instance::new(source, None).expect("Instance::new should succeed");
 
-    let test_path = "/tmp/test_file.txt";
+    let test_path = "/root/test_file.txt";
     let test_data = b"Hello, filesystem!";
 
     // Write file
@@ -263,7 +263,7 @@ fn test_filesystem_stat() {
 
     let inst = cc::Instance::new(source, None).expect("Instance::new should succeed");
 
-    let test_path = "/tmp/stat_test.txt";
+    let test_path = "/root/stat_test.txt";
     let test_data = b"Hello, World!";
 
     inst.write_file(test_path, test_data, 0o644)
@@ -303,15 +303,15 @@ fn test_filesystem_mkdir() {
     let inst = cc::Instance::new(source, None).expect("Instance::new should succeed");
 
     // Create directory
-    inst.mkdir("/tmp/testdir", 0o755)
+    inst.mkdir("/root/testdir", 0o755)
         .expect("mkdir should succeed");
 
     // Verify it exists
-    let info = inst.stat("/tmp/testdir").expect("stat should succeed");
+    let info = inst.stat("/root/testdir").expect("stat should succeed");
     assert!(info.is_dir, "should be a directory");
 
     // List parent directory
-    let entries = inst.read_dir("/tmp").expect("read_dir should succeed");
+    let entries = inst.read_dir("/root").expect("read_dir should succeed");
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
     assert!(
         names.contains(&"testdir"),
@@ -343,7 +343,7 @@ fn test_filesystem_remove() {
 
     let inst = cc::Instance::new(source, None).expect("Instance::new should succeed");
 
-    let test_path = "/tmp/remove_test.txt";
+    let test_path = "/root/remove_test.txt";
 
     // Create file
     inst.write_file(test_path, b"delete me", 0o644)
@@ -380,7 +380,7 @@ fn test_file_handle() {
 
     let inst = cc::Instance::new(source, None).expect("Instance::new should succeed");
 
-    let test_path = "/tmp/handle_test.txt";
+    let test_path = "/root/handle_test.txt";
 
     // Create and write
     {

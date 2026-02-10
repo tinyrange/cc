@@ -85,6 +85,11 @@ func parseBuildfile(path string, content []byte) (*Buildfile, error) {
 		bf.Variables["SHLIB_EXT"] = ".dll"
 	}
 
+	// Add PWD for cross-platform compatibility (not always set on Windows)
+	if pwd, err := os.Getwd(); err == nil {
+		bf.Variables["PWD"] = pwd
+	}
+
 	// Get version from git
 	bf.Variables["VERSION"] = getVersionFromGit()
 
@@ -254,6 +259,7 @@ func parseCommand(line string, lineNum int) (Command, error) {
 		"mkdir":    true,
 		"rm":       true,
 		"sh":       true,
+		"env":      true,
 		"requires": true,
 	}
 
@@ -423,6 +429,7 @@ type Executor struct {
 	DryRun       bool
 	ExtraArgs    []string // Arguments passed after --
 	builtOutputs map[string]buildOutput
+	envVars      map[string]string // Per-target env vars set by 'env' command
 }
 
 // NewExecutor creates a new executor
@@ -468,6 +475,8 @@ func (e *Executor) executeTarget(target *Target) error {
 
 	fmt.Printf("=== %s ===\n", target.Name)
 
+	e.envVars = nil
+
 	for _, cmd := range target.Commands {
 		if err := e.executeCommand(cmd, target); err != nil {
 			return fmt.Errorf("target %s: %w", target.Name, err)
@@ -512,6 +521,8 @@ func (e *Executor) executeCommand(cmd Command, target *Target) error {
 		return e.handleRm(args)
 	case "sh":
 		return e.handleSh(args)
+	case "env":
+		return e.handleEnv(args)
 	default:
 		return fmt.Errorf("unknown command type %q", cmd.Type)
 	}
@@ -639,7 +650,7 @@ func (e *Executor) handleRun(args []string) error {
 
 	out := buildOutput{Path: binary}
 
-	return runBuildOutput(out, runArgs, runOptions{})
+	return runBuildOutput(out, runArgs, runOptions{}, e.getEnv())
 }
 
 // handleCopy handles the copy command
@@ -690,7 +701,7 @@ func (e *Executor) handleSh(args []string) error {
 
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
-		cmd = exec.Command("cmd", "/c", cmdStr)
+		cmd = exec.Command("powershell", "-NoProfile", "-Command", cmdStr)
 	} else {
 		cmd = exec.Command("sh", "-c", cmdStr)
 	}
@@ -698,8 +709,124 @@ func (e *Executor) handleSh(args []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
+	cmd.Env = e.getEnv()
 
 	return cmd.Run()
+}
+
+// handleEnv sets environment variables for subsequent commands in this target
+func (e *Executor) handleEnv(args []string) error {
+	for _, arg := range args {
+		parts := strings.SplitN(arg, "=", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("env: expected KEY=VALUE, got %q", arg)
+		}
+		if e.envVars == nil {
+			e.envVars = make(map[string]string)
+		}
+		e.envVars[parts[0]] = parts[1]
+	}
+	return nil
+}
+
+// getEnv returns the environment for child processes, including any env vars
+// set by 'env' commands. Returns nil if no extra env vars are set (and no
+// Windows MSVC env fix is needed).
+func (e *Executor) getEnv() []string {
+	vcEnv := getVCVarsEnv()
+
+	if len(e.envVars) == 0 && vcEnv == nil {
+		return nil
+	}
+
+	var env []string
+	if vcEnv != nil {
+		env = vcEnv
+	} else {
+		env = os.Environ()
+	}
+
+	for k, v := range e.envVars {
+		env = append(env, k+"="+v)
+	}
+	return env
+}
+
+// vcVarsEnvCached caches the result of getVCVarsEnv so we only run
+// vcvarsall.bat once per process invocation.
+var vcVarsEnvCached struct {
+	done bool
+	env  []string
+}
+
+// getVCVarsEnv returns a full environment with MSVC tools configured.
+// On Windows, it runs vcvarsall.bat x64 and captures the resulting
+// environment. This ensures the MSVC linker, libraries, and include paths
+// are all properly set (avoiding issues like Git's link.exe shadowing
+// the MSVC linker). Returns nil on non-Windows or if detection fails.
+func getVCVarsEnv() []string {
+	if vcVarsEnvCached.done {
+		return vcVarsEnvCached.env
+	}
+	vcVarsEnvCached.done = true
+
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+
+	// Use vswhere to find the Visual Studio installation path.
+	programFiles := os.Getenv("ProgramFiles(x86)")
+	if programFiles == "" {
+		return nil
+	}
+	vswhere := filepath.Join(programFiles, "Microsoft Visual Studio", "Installer", "vswhere.exe")
+	cmd := exec.Command(vswhere, "-latest", "-property", "installationPath")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+	vsPath := strings.TrimSpace(string(out))
+	if vsPath == "" {
+		return nil
+	}
+
+	vcvarsall := filepath.Join(vsPath, "VC", "Auxiliary", "Build", "vcvarsall.bat")
+	if _, err := os.Stat(vcvarsall); err != nil {
+		return nil
+	}
+
+	// Run vcvarsall.bat and capture the resulting environment.
+	// Use a temp batch file to avoid Go's command-line escaping interacting
+	// badly with cmd.exe's quote parsing.
+	tmpFile, err := os.CreateTemp("", "vcvars*.bat")
+	if err != nil {
+		return nil
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+	fmt.Fprintf(tmpFile, "@call \"%s\" x64 >nul 2>&1\r\n@set\r\n", vcvarsall)
+	tmpFile.Close()
+
+	cmd = exec.Command("cmd", "/c", tmpPath)
+	out, err = cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	var env []string
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimRight(line, "\r")
+		if strings.Contains(line, "=") {
+			env = append(env, line)
+		}
+	}
+
+	if len(env) == 0 {
+		return nil
+	}
+
+	vcVarsEnvCached.env = env
+	return env
 }
 
 // ============================================================================
@@ -717,7 +844,7 @@ func (cb crossBuild) IsNative() bool {
 
 func (cb crossBuild) OutputName(name string) string {
 	suffix := ""
-	if cb.GOOS == "windows" {
+	if cb.GOOS == "windows" && filepath.Ext(name) != ".dll" {
 		suffix = ".exe"
 	}
 
@@ -1245,7 +1372,7 @@ type runOptions struct {
 	MemProfilePath string
 }
 
-func runBuildOutput(output buildOutput, args []string, opts runOptions) error {
+func runBuildOutput(output buildOutput, args []string, opts runOptions, env []string) error {
 	if runtime.GOOS == "darwin" && strings.HasSuffix(output.Path, ".app") {
 		openArgs := []string{"-n", output.Path}
 		if len(args) > 0 {
@@ -1256,6 +1383,7 @@ func runBuildOutput(output buildOutput, args []string, opts runOptions) error {
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		cmd.Stdin = os.Stdin
+		cmd.Env = env
 		if err := cmd.Run(); err != nil {
 			return fmt.Errorf("failed to run app bundle: %w", err)
 		}
@@ -1274,6 +1402,7 @@ func runBuildOutput(output buildOutput, args []string, opts runOptions) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
+	cmd.Env = env
 
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to run build output: %w", err)

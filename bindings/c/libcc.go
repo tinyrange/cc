@@ -709,8 +709,8 @@ func cc_source_get_config(
 		return setInvalidArgument(cErr, "source has no image config")
 	}
 
-	// Allocate C struct
-	cCfg := (*C.cc_image_config)(C.malloc(C.size_t(unsafe.Sizeof(C.cc_image_config{}))))
+	// Allocate C struct (zero-initialized so unset pointer fields are NULL)
+	cCfg := (*C.cc_image_config)(C.calloc(1, C.size_t(unsafe.Sizeof(C.cc_image_config{}))))
 	if cCfg == nil {
 		return setInvalidArgument(cErr, "out of memory")
 	}

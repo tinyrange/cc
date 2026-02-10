@@ -10,10 +10,17 @@ Run with: python3 tests/test_vm.py
 import sys
 import os
 
+import pytest
+
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import crumblecracker as cc
+
+pytestmark = pytest.mark.skipif(
+    not os.environ.get("CC_RUN_VM_TESTS"),
+    reason="Set CC_RUN_VM_TESTS=1 to run VM tests",
+)
 
 
 def check_hypervisor():

@@ -78,7 +78,8 @@ fn build_libcc(out_dir: &PathBuf, project_root: &PathBuf) -> PathBuf {
         );
     }
 
-    let lib_path = if cfg!(target_os = "windows") {
+    let target = env::var("TARGET").unwrap_or_default();
+    let lib_path = if target.contains("msvc") {
         out_dir.join("cc.lib")
     } else {
         out_dir.join("libcc.a")
@@ -195,27 +196,32 @@ fn build_and_install_helper(out_dir: &PathBuf, project_root: &PathBuf) {
         }
     }
 
-    // Copy helper to target directory
-    // OUT_DIR is something like target/debug/build/cc-vm-xxx/out
-    // We want to copy to target/debug/ (and target/debug/examples/)
-    if let Some(target_dir) = find_target_dir(out_dir) {
-        let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
-        let target_profile_dir = target_dir.join(&profile);
+    // Copy helper to target profile directory.
+    // OUT_DIR is something like target/<triple>/debug/build/cc-vm-<hash>/out
+    // or target/debug/build/cc-vm-<hash>/out (no triple for native builds).
+    // We navigate up from OUT_DIR to find the profile directory.
+    if let Some(profile_dir) = find_profile_dir(out_dir) {
+        // Copy to main profile dir (where regular binaries go)
+        let dest = profile_dir.join(helper_name);
+        if copy_if_different(&helper_build_path, &dest) {
+            println!("cargo:warning=Installed cc-helper to {}", dest.display());
+        }
 
-        // Copy to main target dir
-        if target_profile_dir.exists() {
-            let dest = target_profile_dir.join(helper_name);
+        // Also copy to deps/ subdirectory (where test binaries run from)
+        let deps_dir = profile_dir.join("deps");
+        if deps_dir.exists() {
+            let dest = deps_dir.join(helper_name);
             if copy_if_different(&helper_build_path, &dest) {
                 println!("cargo:warning=Installed cc-helper to {}", dest.display());
             }
+        }
 
-            // Also copy to examples dir if it exists
-            let examples_dir = target_profile_dir.join("examples");
-            if examples_dir.exists() {
-                let dest = examples_dir.join(helper_name);
-                if copy_if_different(&helper_build_path, &dest) {
-                    println!("cargo:warning=Installed cc-helper to {}", dest.display());
-                }
+        // Also copy to examples dir if it exists
+        let examples_dir = profile_dir.join("examples");
+        if examples_dir.exists() {
+            let dest = examples_dir.join(helper_name);
+            if copy_if_different(&helper_build_path, &dest) {
+                println!("cargo:warning=Installed cc-helper to {}", dest.display());
             }
         }
     }
@@ -269,18 +275,26 @@ fn walkdir_newer_than(dir: &PathBuf, threshold: std::time::SystemTime) -> bool {
     false
 }
 
-/// Find the target directory from OUT_DIR.
-fn find_target_dir(out_dir: &PathBuf) -> Option<PathBuf> {
-    // OUT_DIR is like: target/debug/build/cc-vm-xxx/out
-    // We want: target/
-    let mut dir = out_dir.clone();
-    while let Some(parent) = dir.parent() {
-        if parent.file_name().map_or(false, |n| n == "target") {
-            return Some(parent.to_path_buf());
-        }
-        dir = parent.to_path_buf();
+/// Find the profile directory (e.g. target/debug/ or target/<triple>/debug/) from OUT_DIR.
+///
+/// OUT_DIR layout:
+///   target[/<triple>]/<profile>/build/<crate>-<hash>/out
+///                     ^^^^^^^^^ we want this directory
+///
+/// We go up 3 levels from OUT_DIR: out -> <hash> -> build -> <profile>,
+/// then verify that the parent of <profile> is named "build".
+fn find_profile_dir(out_dir: &PathBuf) -> Option<PathBuf> {
+    // out_dir = .../build/<crate>-<hash>/out
+    let hash_dir = out_dir.parent()?;       // .../build/<crate>-<hash>
+    let build_dir = hash_dir.parent()?;     // .../<profile>/build
+    let profile_dir = build_dir.parent()?;  // .../<profile>
+
+    // Verify we actually traversed through a "build" directory
+    if build_dir.file_name().map_or(false, |n| n == "build") {
+        Some(profile_dir.to_path_buf())
+    } else {
+        None
     }
-    None
 }
 
 /// Copy a file if the contents are different or dest doesn't exist.

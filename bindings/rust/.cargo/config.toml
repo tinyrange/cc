@@ -1,0 +1,5 @@
+[build]
+# On Windows, use the GNU target so that linking is compatible with Go's
+# CGO c-archive output (which produces GCC-format objects).
+# The MSVC linker cannot handle GCC-style .pdata sections (LNK1223).
+target = "x86_64-pc-windows-gnu"
