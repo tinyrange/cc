@@ -138,6 +138,11 @@ pub struct Conn {
 }
 
 impl Conn {
+    /// Create a Conn from a raw handle.
+    pub(crate) fn from_handle(handle: CcConn) -> Self {
+        Self { handle }
+    }
+
     /// Get the local address.
     pub fn local_addr(&self) -> String {
         if !self.handle.is_valid() {

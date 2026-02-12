@@ -235,6 +235,86 @@ def test_filesystem_remove():
         cc.shutdown()
 
 
+def test_stdout_pipe():
+    """Test reading command stdout through a pipe."""
+    print("TEST: Stdout pipe...", end=" ", flush=True)
+    cc.init()
+    try:
+        with cc.OCIClient() as client:
+            source = client.pull("alpine:latest")
+
+            with cc.Instance(source) as inst:
+                cmd = inst.command("echo", "Hello from pipe!")
+                stdout = cmd.stdout_pipe()
+                cmd.start()
+
+                # Read from pipe
+                data = stdout.read(256)
+                assert b"Hello from pipe!" in data, \
+                    f"Expected 'Hello from pipe!' in output, got: {data}"
+
+                stdout.close()
+                cmd.wait()
+                print("PASSED")
+    finally:
+        cc.shutdown()
+
+
+def test_stdin_stdout_pipe():
+    """Test writing to stdin pipe and reading from stdout pipe."""
+    print("TEST: Stdin/stdout pipe...", end=" ", flush=True)
+    cc.init()
+    try:
+        with cc.OCIClient() as client:
+            source = client.pull("alpine:latest")
+
+            with cc.Instance(source) as inst:
+                cmd = inst.command("cat")
+                stdin = cmd.stdin_pipe()
+                stdout = cmd.stdout_pipe()
+                cmd.start()
+
+                # Write to stdin and close to signal EOF
+                stdin.write(b"echo test data")
+                stdin.close()
+
+                # Read from stdout
+                data = stdout.read(256)
+                assert b"echo test data" in data, \
+                    f"Expected 'echo test data' in output, got: {data}"
+
+                stdout.close()
+                cmd.wait()
+                print("PASSED")
+    finally:
+        cc.shutdown()
+
+
+def test_stderr_pipe():
+    """Test reading command stderr through a pipe."""
+    print("TEST: Stderr pipe...", end=" ", flush=True)
+    cc.init()
+    try:
+        with cc.OCIClient() as client:
+            source = client.pull("alpine:latest")
+
+            with cc.Instance(source) as inst:
+                cmd = inst.command("sh", "-c", "echo error message >&2")
+                stderr = cmd.stderr_pipe()
+                cmd.start()
+
+                # Read from pipe
+                data = stderr.read(256)
+                assert b"error message" in data, \
+                    f"Expected 'error message' in stderr, got: {data}"
+
+                stderr.close()
+                cmd.wait()
+                print("PASSED")
+    finally:
+        cc.shutdown()
+
+
 def test_file_handle():
     """Test File object operations."""
     print("TEST: File handle...", end=" ", flush=True)
@@ -279,6 +359,9 @@ def main():
         test_create_instance,
         test_command_execution,
         test_command_exit_code,
+        test_stdout_pipe,
+        test_stdin_stdout_pipe,
+        test_stderr_pipe,
         test_filesystem_write_read,
         test_filesystem_stat,
         test_filesystem_mkdir,

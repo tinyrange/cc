@@ -162,6 +162,10 @@ type instanceCmd struct {
 	stdout io.Writer
 	stderr io.Writer
 
+	// Pipe writers that need to be closed after command completes
+	stdoutPipeWriter *io.PipeWriter
+	stderrPipeWriter *io.PipeWriter
+
 	mu       sync.Mutex
 	started  bool
 	finished bool
@@ -296,8 +300,12 @@ func (c *instanceCmd) runCommand() {
 		captureFlags |= initx.CaptureFlagStdin
 	}
 
-	// Use streaming stdin when stdin is provided, otherwise use regular capture
-	if hasStdin || captureFlags != initx.CaptureFlagNone {
+	// Choose execution path based on capture/streaming needs
+	if c.stdout != nil || c.stderr != nil {
+		// Use streaming output when stdout/stderr writers are set
+		// Output arrives at writers in real time during execution
+		result, err = c.inst.vm.RunWithStreamingOutput(c.ctx, prog, captureFlags, c.stdin, c.stdout, c.stderr)
+	} else if hasStdin || captureFlags != initx.CaptureFlagNone {
 		// RunWithStreamingStdin handles both streaming stdin and capture
 		// If stdin is nil, it uses StdinModeNone; otherwise StdinModeStreaming
 		result, err = c.inst.vm.RunWithStreamingStdin(c.ctx, prog, captureFlags, c.stdin)
@@ -334,14 +342,15 @@ func (c *instanceCmd) runCommand() {
 	c.finished = true
 	c.mu.Unlock()
 
-	// Write captured output to writers (outside the lock)
-	if result != nil {
-		if c.stdout != nil && len(result.Stdout) > 0 {
-			c.stdout.Write(result.Stdout)
-		}
-		if c.stderr != nil && c.stderr != c.stdout && len(result.Stderr) > 0 {
-			c.stderr.Write(result.Stderr)
-		}
+	// Note: When stdout/stderr writers are set, RunWithStreamingOutput streams
+	// data directly to the writers in real time, so no post-hoc copying is needed.
+
+	// Close pipe writers to signal EOF to pipe readers
+	if c.stdoutPipeWriter != nil {
+		c.stdoutPipeWriter.Close()
+	}
+	if c.stderrPipeWriter != nil {
+		c.stderrPipeWriter.Close()
 	}
 
 	// Signal completion
@@ -470,18 +479,50 @@ func (c *instanceCmd) CombinedOutput() ([]byte, error) {
 }
 
 // StdinPipe returns a pipe connected to the command's stdin.
+// The pipe's WriteCloser must be closed to signal EOF to the command.
+// Must be called before Start().
 func (c *instanceCmd) StdinPipe() (io.WriteCloser, error) {
-	return nil, &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("stdin pipe not yet implemented")}
+	if c.started {
+		return nil, &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("StdinPipe after Start")}
+	}
+	if c.stdin != nil {
+		return nil, &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("stdin already set")}
+	}
+	pr, pw := io.Pipe()
+	c.stdin = pr
+	return pw, nil
 }
 
 // StdoutPipe returns a pipe connected to the command's stdout.
+// The pipe will be closed automatically after the command finishes and Wait() completes.
+// Must be called before Start().
 func (c *instanceCmd) StdoutPipe() (io.ReadCloser, error) {
-	return nil, &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("stdout pipe not yet implemented")}
+	if c.started {
+		return nil, &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("StdoutPipe after Start")}
+	}
+	if c.stdout != nil {
+		return nil, &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("stdout already set")}
+	}
+	pr, pw := io.Pipe()
+	c.stdout = pw
+	c.stdoutPipeWriter = pw
+	return pr, nil
 }
 
 // StderrPipe returns a pipe connected to the command's stderr.
+// The pipe will be closed automatically after the command finishes and Wait() completes.
+// Must be called before Start().
 func (c *instanceCmd) StderrPipe() (io.ReadCloser, error) {
-	return nil, &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("stderr pipe not yet implemented")}
+	if c.started {
+		return nil, &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("StderrPipe after Start")}
+	}
+	if c.stderr != nil {
+		return nil, &Error{Op: "exec", Path: c.name, Err: fmt.Errorf("stderr already set")}
+	}
+	pr, pw := io.Pipe()
+	c.stderr = pw
+	c.stderrPipeWriter = pw
+	return pr, nil
 }
 
 // SetStdin sets the command's stdin.

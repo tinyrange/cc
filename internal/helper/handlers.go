@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"sync"
@@ -26,11 +27,13 @@ type Helper struct {
 	source   cc.InstanceSource
 
 	// Sub-resources tied to the instance
-	files     map[uint64]cc.File
-	cmds      map[uint64]cc.Cmd
-	listeners map[uint64]net.Listener
-	conns     map[uint64]net.Conn
-	snapshots map[uint64]cc.FilesystemSnapshot
+	files      map[uint64]cc.File
+	cmds       map[uint64]cc.Cmd
+	listeners  map[uint64]net.Listener
+	conns      map[uint64]net.Conn
+	pipeRds    map[uint64]io.ReadCloser
+	pipeWrs    map[uint64]io.WriteCloser
+	snapshots  map[uint64]cc.FilesystemSnapshot
 
 	// Handle allocation
 	nextHandle atomic.Uint64
@@ -43,6 +46,8 @@ func NewHelper() *Helper {
 		cmds:      make(map[uint64]cc.Cmd),
 		listeners: make(map[uint64]net.Listener),
 		conns:     make(map[uint64]net.Conn),
+		pipeRds:   make(map[uint64]io.ReadCloser),
+		pipeWrs:   make(map[uint64]io.WriteCloser),
 		snapshots: make(map[uint64]cc.FilesystemSnapshot),
 	}
 	h.nextHandle.Store(1)
@@ -205,6 +210,10 @@ func (h *Helper) RegisterHandlers(mux *ipc.Mux) {
 	mux.Handle(ipc.MsgCmdCombinedOutput, h.handleCmdCombinedOutput)
 	mux.Handle(ipc.MsgCmdExitCode, h.handleCmdExitCode)
 	mux.Handle(ipc.MsgCmdKill, h.handleCmdKill)
+	mux.Handle(ipc.MsgCmdStdoutPipe, h.handleCmdStdoutPipe)
+	mux.Handle(ipc.MsgCmdStderrPipe, h.handleCmdStderrPipe)
+	mux.Handle(ipc.MsgCmdStdinPipe, h.handleCmdStdinPipe)
+	mux.HandleStreaming(ipc.MsgCmdRunStreaming, h.handleCmdRunStreaming)
 
 	// Network operations
 	mux.Handle(ipc.MsgNetListen, h.handleNetListen)
@@ -1505,6 +1514,136 @@ func (h *Helper) handleCmdKill(dec *ipc.Decoder) ([]byte, error) {
 	h.mu.Unlock()
 
 	return ipc.NewResponseBuilder().Success().Build(), nil
+}
+
+func (h *Helper) handleCmdStdoutPipe(dec *ipc.Decoder) ([]byte, error) {
+	handle, err := dec.Uint64()
+	if err != nil {
+		return nil, err
+	}
+
+	h.mu.RLock()
+	cmd, ok := h.cmds[handle]
+	h.mu.RUnlock()
+
+	if !ok {
+		return nil, &ipc.IPCError{Code: ipc.ErrCodeInvalidHandle, Message: "invalid cmd handle"}
+	}
+
+	reader, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, errorToIPC(err)
+	}
+
+	pipeHandle := h.nextHandle.Add(1)
+	h.mu.Lock()
+	h.pipeRds[pipeHandle] = reader
+	h.mu.Unlock()
+
+	return ipc.NewResponseBuilder().Success().Uint64(pipeHandle).Build(), nil
+}
+
+func (h *Helper) handleCmdStderrPipe(dec *ipc.Decoder) ([]byte, error) {
+	handle, err := dec.Uint64()
+	if err != nil {
+		return nil, err
+	}
+
+	h.mu.RLock()
+	cmd, ok := h.cmds[handle]
+	h.mu.RUnlock()
+
+	if !ok {
+		return nil, &ipc.IPCError{Code: ipc.ErrCodeInvalidHandle, Message: "invalid cmd handle"}
+	}
+
+	reader, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, errorToIPC(err)
+	}
+
+	pipeHandle := h.nextHandle.Add(1)
+	h.mu.Lock()
+	h.pipeRds[pipeHandle] = reader
+	h.mu.Unlock()
+
+	return ipc.NewResponseBuilder().Success().Uint64(pipeHandle).Build(), nil
+}
+
+func (h *Helper) handleCmdStdinPipe(dec *ipc.Decoder) ([]byte, error) {
+	handle, err := dec.Uint64()
+	if err != nil {
+		return nil, err
+	}
+
+	h.mu.RLock()
+	cmd, ok := h.cmds[handle]
+	h.mu.RUnlock()
+
+	if !ok {
+		return nil, &ipc.IPCError{Code: ipc.ErrCodeInvalidHandle, Message: "invalid cmd handle"}
+	}
+
+	writer, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, errorToIPC(err)
+	}
+
+	pipeHandle := h.nextHandle.Add(1)
+	h.mu.Lock()
+	h.pipeWrs[pipeHandle] = writer
+	h.mu.Unlock()
+
+	return ipc.NewResponseBuilder().Success().Uint64(pipeHandle).Build(), nil
+}
+
+func (h *Helper) handleCmdRunStreaming(dec *ipc.Decoder, sw *ipc.StreamWriter) error {
+	handle, err := dec.Uint64()
+	if err != nil {
+		return err
+	}
+
+	h.mu.RLock()
+	cmd, ok := h.cmds[handle]
+	h.mu.RUnlock()
+
+	if !ok {
+		return &ipc.IPCError{Code: ipc.ErrCodeInvalidHandle, Message: "invalid cmd handle"}
+	}
+
+	// Create writers that forward to StreamWriter
+	stdoutWriter := &streamForwarder{sw: sw, streamType: 1}
+	stderrWriter := &streamForwarder{sw: sw, streamType: 2}
+
+	cmd.SetStdout(stdoutWriter)
+	cmd.SetStderr(stderrWriter)
+
+	runErr := cmd.Run()
+	exitCode := int32(cmd.ExitCode())
+
+	// If Run returns an error that's just a non-zero exit code, that's expected
+	if runErr != nil {
+		var apiErr *api.Error
+		if !errors.As(runErr, &apiErr) || exitCode == 0 {
+			// Real error - send via stream end
+			return sw.WriteEnd(exitCode)
+		}
+	}
+
+	return sw.WriteEnd(exitCode)
+}
+
+// streamForwarder is an io.Writer that sends data as stream chunks via IPC.
+type streamForwarder struct {
+	sw         *ipc.StreamWriter
+	streamType uint8
+}
+
+func (f *streamForwarder) Write(p []byte) (int, error) {
+	if err := f.sw.WriteStreamChunk(f.streamType, p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
 // ==========================================================================

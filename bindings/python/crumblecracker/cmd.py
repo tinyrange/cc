@@ -11,7 +11,7 @@ from . import _ffi
 from .errors import CCError
 
 if TYPE_CHECKING:
-    from .instance import Instance
+    from .instance import Conn, Instance
 
 
 class Cmd:
@@ -216,6 +216,81 @@ class Cmd:
             lib.cc_free_bytes(cast(env_ptr, POINTER(c_uint8)))
 
         return result
+
+    def stdout_pipe(self) -> "Conn":
+        """Get a pipe connected to the command's stdout.
+
+        Must be called before start(). Returns a Conn that can be read from
+        while the command is running.
+
+        Returns:
+            A Conn object for reading stdout data.
+        """
+        from .instance import Conn
+
+        if self._started:
+            raise CCError("Cmd has already been started", code=2)
+
+        if self._ipc:
+            handle = _ffi.get_ipc_backend().cmd_stdout_pipe(self._handle)
+            return Conn(handle, _ipc=True)
+
+        lib = _ffi.get_lib()
+        conn_handle = _ffi.ConnHandle()
+        err = _ffi.CCErrorStruct()
+        code = lib.cc_cmd_stdout_pipe(self.handle, byref(conn_handle), byref(err))
+        _ffi.check_error(code, err)
+        return Conn(conn_handle, _ipc=False)
+
+    def stderr_pipe(self) -> "Conn":
+        """Get a pipe connected to the command's stderr.
+
+        Must be called before start(). Returns a Conn that can be read from
+        while the command is running.
+
+        Returns:
+            A Conn object for reading stderr data.
+        """
+        from .instance import Conn
+
+        if self._started:
+            raise CCError("Cmd has already been started", code=2)
+
+        if self._ipc:
+            handle = _ffi.get_ipc_backend().cmd_stderr_pipe(self._handle)
+            return Conn(handle, _ipc=True)
+
+        lib = _ffi.get_lib()
+        conn_handle = _ffi.ConnHandle()
+        err = _ffi.CCErrorStruct()
+        code = lib.cc_cmd_stderr_pipe(self.handle, byref(conn_handle), byref(err))
+        _ffi.check_error(code, err)
+        return Conn(conn_handle, _ipc=False)
+
+    def stdin_pipe(self) -> "Conn":
+        """Get a pipe connected to the command's stdin.
+
+        Must be called before start(). Returns a Conn that can be written to
+        while the command is running. Close the Conn to signal EOF.
+
+        Returns:
+            A Conn object for writing stdin data.
+        """
+        from .instance import Conn
+
+        if self._started:
+            raise CCError("Cmd has already been started", code=2)
+
+        if self._ipc:
+            handle = _ffi.get_ipc_backend().cmd_stdin_pipe(self._handle)
+            return Conn(handle, _ipc=True)
+
+        lib = _ffi.get_lib()
+        conn_handle = _ffi.ConnHandle()
+        err = _ffi.CCErrorStruct()
+        code = lib.cc_cmd_stdin_pipe(self.handle, byref(conn_handle), byref(err))
+        _ffi.check_error(code, err)
+        return Conn(conn_handle, _ipc=False)
 
     def start(self) -> None:
         """Start the command (non-blocking).

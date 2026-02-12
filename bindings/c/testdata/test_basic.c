@@ -357,7 +357,95 @@ int main(int argc, char** argv) {
         PASS();
     }
 
-    /* Test 20: Close instance */
+    /* Test 20: Stdout pipe */
+    TEST("cc_cmd_stdout_pipe");
+    {
+        const char* args[] = {"Hello from pipe!", NULL};
+        cc_cmd cmd = CC_HANDLE_INVALID(cc_cmd);
+
+        code = cc_cmd_new(inst, "echo", args, &cmd, &err);
+        check_error(code, &err, "cc_cmd_new");
+
+        cc_conn pipe = CC_HANDLE_INVALID(cc_conn);
+        code = cc_cmd_stdout_pipe(cmd, &pipe, &err);
+        check_error(code, &err, "cc_cmd_stdout_pipe");
+        if (!CC_HANDLE_VALID(pipe)) FAIL("pipe handle is invalid");
+
+        code = cc_cmd_start(cmd, &err);
+        check_error(code, &err, "cc_cmd_start");
+
+        /* Read from pipe */
+        uint8_t buf[256];
+        size_t n = 0;
+        code = cc_conn_read(pipe, buf, sizeof(buf) - 1, &n, &err);
+        check_error(code, &err, "cc_conn_read");
+
+        buf[n] = '\0';
+        if (strstr((char*)buf, "Hello from pipe!") == NULL) {
+            printf("pipe output: '%s'\n", buf);
+            FAIL("pipe output doesn't contain expected text");
+        }
+
+        cc_conn_close(pipe, &err);
+
+        int exit_code = -1;
+        code = cc_cmd_wait(cmd, &exit_code, &err);
+        check_error(code, &err, "cc_cmd_wait");
+        if (exit_code != 0) FAIL("exit code should be 0");
+
+        PASS();
+    }
+
+    /* Test 21: Stdin pipe */
+    TEST("cc_cmd_stdin_pipe + cc_cmd_stdout_pipe");
+    {
+        const char* args[] = {NULL};
+        cc_cmd cmd = CC_HANDLE_INVALID(cc_cmd);
+
+        code = cc_cmd_new(inst, "cat", args, &cmd, &err);
+        check_error(code, &err, "cc_cmd_new");
+
+        cc_conn stdin_pipe = CC_HANDLE_INVALID(cc_conn);
+        code = cc_cmd_stdin_pipe(cmd, &stdin_pipe, &err);
+        check_error(code, &err, "cc_cmd_stdin_pipe");
+
+        cc_conn stdout_pipe = CC_HANDLE_INVALID(cc_conn);
+        code = cc_cmd_stdout_pipe(cmd, &stdout_pipe, &err);
+        check_error(code, &err, "cc_cmd_stdout_pipe");
+
+        code = cc_cmd_start(cmd, &err);
+        check_error(code, &err, "cc_cmd_start");
+
+        /* Write to stdin pipe */
+        const char* input = "echo test";
+        size_t written = 0;
+        code = cc_conn_write(stdin_pipe, (const uint8_t*)input, strlen(input), &written, &err);
+        check_error(code, &err, "cc_conn_write");
+        cc_conn_close(stdin_pipe, &err);
+
+        /* Read from stdout pipe */
+        uint8_t buf[256];
+        size_t n = 0;
+        code = cc_conn_read(stdout_pipe, buf, sizeof(buf) - 1, &n, &err);
+        check_error(code, &err, "cc_conn_read");
+
+        buf[n] = '\0';
+        if (strstr((char*)buf, "echo test") == NULL) {
+            printf("pipe output: '%s'\n", buf);
+            FAIL("echo-back output doesn't match");
+        }
+
+        cc_conn_close(stdout_pipe, &err);
+
+        int exit_code = -1;
+        code = cc_cmd_wait(cmd, &exit_code, &err);
+        check_error(code, &err, "cc_cmd_wait");
+        if (exit_code != 0) FAIL("exit code should be 0");
+
+        PASS();
+    }
+
+    /* Test 22: Close instance */
     TEST("cc_instance_close");
     {
         code = cc_instance_close(inst, &err);

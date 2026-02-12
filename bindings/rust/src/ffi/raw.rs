@@ -536,6 +536,9 @@ extern "C" {
     ) -> CcErrorCode;
     pub fn cc_cmd_exit_code(cmd: CcCmd) -> c_int;
     pub fn cc_cmd_kill(cmd: CcCmd, err: *mut CcError) -> CcErrorCode;
+    pub fn cc_cmd_stdout_pipe(cmd: CcCmd, out: *mut CcConn, err: *mut CcError) -> CcErrorCode;
+    pub fn cc_cmd_stderr_pipe(cmd: CcCmd, out: *mut CcConn, err: *mut CcError) -> CcErrorCode;
+    pub fn cc_cmd_stdin_pipe(cmd: CcCmd, out: *mut CcConn, err: *mut CcError) -> CcErrorCode;
 
     pub fn cc_instance_exec(
         inst: CcInstance,

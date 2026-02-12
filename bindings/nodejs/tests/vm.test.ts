@@ -157,6 +157,105 @@ describe.skipIf(!RUN_VM_TESTS)('TestWithVM', () => {
     }
   });
 
+  it('should read stdout through pipe', async () => {
+    if (!supportsHypervisor()) {
+      console.log('Skipping: Hypervisor not available');
+      return;
+    }
+
+    const client = new OCIClient();
+    try {
+      const source = await client.pull('alpine:latest');
+
+      const inst = await source.createInstance();
+      try {
+        const cmd = await inst.command('echo', 'Hello from pipe!');
+        const stdout = await cmd.stdoutPipe();
+        await cmd.start();
+
+        const data = await stdout.read(256);
+        expect(data.toString()).toContain('Hello from pipe!');
+
+        await stdout.close();
+        await cmd.wait();
+      } finally {
+        await inst.close();
+      }
+
+      await source.helper.close();
+    } finally {
+      client.close();
+    }
+  });
+
+  it('should echo through stdin/stdout pipes', async () => {
+    if (!supportsHypervisor()) {
+      console.log('Skipping: Hypervisor not available');
+      return;
+    }
+
+    const client = new OCIClient();
+    try {
+      const source = await client.pull('alpine:latest');
+
+      const inst = await source.createInstance();
+      try {
+        const cmd = await inst.command('cat');
+        const stdinPipe = await cmd.stdinPipe();
+        const stdoutPipe = await cmd.stdoutPipe();
+        await cmd.start();
+
+        // Write to stdin and close to signal EOF
+        await stdinPipe.write(Buffer.from('echo test data'));
+        await stdinPipe.close();
+
+        // Read from stdout
+        const data = await stdoutPipe.read(256);
+        expect(data.toString()).toContain('echo test data');
+
+        await stdoutPipe.close();
+        await cmd.wait();
+      } finally {
+        await inst.close();
+      }
+
+      await source.helper.close();
+    } finally {
+      client.close();
+    }
+  });
+
+  it('should read stderr through pipe', async () => {
+    if (!supportsHypervisor()) {
+      console.log('Skipping: Hypervisor not available');
+      return;
+    }
+
+    const client = new OCIClient();
+    try {
+      const source = await client.pull('alpine:latest');
+
+      const inst = await source.createInstance();
+      try {
+        const cmd = await inst.command('sh', '-c', 'echo error message >&2');
+        const stderr = await cmd.stderrPipe();
+        await cmd.start();
+
+        const data = await stderr.read(256);
+        expect(data.toString()).toContain('error message');
+
+        await stderr.close();
+        await cmd.wait();
+      } finally {
+        await inst.close();
+      }
+
+      await source.helper.close();
+    } finally {
+      client.close();
+    }
+  });
+
   it('should handle file handles', async () => {
     if (!supportsHypervisor()) {
       console.log('Skipping: Hypervisor not available');

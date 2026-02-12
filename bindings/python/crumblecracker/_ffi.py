@@ -663,6 +663,15 @@ def _setup_functions(lib: Any) -> None:
     lib.cc_cmd_kill.argtypes = [CmdHandle, POINTER(CCErrorStruct)]
     lib.cc_cmd_kill.restype = c_int
 
+    lib.cc_cmd_stdout_pipe.argtypes = [CmdHandle, POINTER(ConnHandle), POINTER(CCErrorStruct)]
+    lib.cc_cmd_stdout_pipe.restype = c_int
+
+    lib.cc_cmd_stderr_pipe.argtypes = [CmdHandle, POINTER(ConnHandle), POINTER(CCErrorStruct)]
+    lib.cc_cmd_stderr_pipe.restype = c_int
+
+    lib.cc_cmd_stdin_pipe.argtypes = [CmdHandle, POINTER(ConnHandle), POINTER(CCErrorStruct)]
+    lib.cc_cmd_stdin_pipe.restype = c_int
+
     lib.cc_instance_exec.argtypes = [InstanceHandle, c_char_p, POINTER(c_char_p), POINTER(CCErrorStruct)]
     lib.cc_instance_exec.restype = c_int
 
