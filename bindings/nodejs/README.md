@@ -154,6 +154,20 @@ const exitCode = await cmd.run();            // just run
 // Async execution
 await cmd.start();
 const exitCode = await cmd.wait();
+
+// Streaming I/O with pipes
+const cmd2 = await inst.command('cat');
+const stdin = await cmd2.stdinPipe();    // Returns Conn (writable)
+const stdout = await cmd2.stdoutPipe();  // Returns Conn (readable)
+const stderr = await cmd2.stderrPipe();  // Returns Conn (readable)
+await cmd2.start();
+
+await stdin.write(Buffer.from('hello'));
+await stdin.close();                     // Close to signal EOF
+
+const data = await stdout.read(256);     // Read output incrementally
+await stdout.close();
+await cmd2.wait();
 ```
 
 ## Types

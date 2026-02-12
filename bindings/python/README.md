@@ -171,6 +171,20 @@ combined = cmd.combined_output()
 cmd.start()
 # ... do other work ...
 exit_code = cmd.wait()
+
+# Streaming I/O with pipes
+cmd = inst.command("cat")
+stdin = cmd.stdin_pipe()    # Returns Conn (writable)
+stdout = cmd.stdout_pipe()  # Returns Conn (readable)
+stderr = cmd.stderr_pipe()  # Returns Conn (readable)
+cmd.start()
+
+stdin.write(b"hello")
+stdin.close()               # Close to signal EOF
+
+data = stdout.read(256)     # Read output incrementally
+stdout.close()
+cmd.wait()
 ```
 
 #### `File`

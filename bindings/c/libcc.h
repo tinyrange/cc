@@ -669,6 +669,27 @@ int cc_cmd_exit_code(cc_cmd cmd);
  */
 cc_error_code cc_cmd_kill(cc_cmd cmd, cc_error* err);
 
+/*
+ * Get a pipe connected to the command's stdout.
+ * Must be called before cc_cmd_start(). Read from the returned cc_conn
+ * with cc_conn_read() while the command is running.
+ */
+cc_error_code cc_cmd_stdout_pipe(cc_cmd cmd, cc_conn* out, cc_error* err);
+
+/*
+ * Get a pipe connected to the command's stderr.
+ * Must be called before cc_cmd_start(). Read from the returned cc_conn
+ * with cc_conn_read() while the command is running.
+ */
+cc_error_code cc_cmd_stderr_pipe(cc_cmd cmd, cc_conn* out, cc_error* err);
+
+/*
+ * Get a pipe connected to the command's stdin.
+ * Must be called before cc_cmd_start(). Write to the returned cc_conn
+ * with cc_conn_write(). Close with cc_conn_close() to signal EOF.
+ */
+cc_error_code cc_cmd_stdin_pipe(cc_cmd cmd, cc_conn* out, cc_error* err);
+
 /* Replace init process with command (terminal operation). */
 cc_error_code cc_instance_exec(
     cc_instance inst,
