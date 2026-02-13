@@ -24,7 +24,6 @@ The `cc-helper` binary is automatically installed for your platform.
 | Platform | Architecture | Package |
 |----------|-------------|---------|
 | macOS | arm64 (Apple Silicon) | `@crumblecracker/cc-darwin-arm64` |
-| macOS | x64 (Intel) | `@crumblecracker/cc-darwin-x64` |
 | Linux | x64 | `@crumblecracker/cc-linux-x64` |
 | Linux | arm64 | `@crumblecracker/cc-linux-arm64` |
 

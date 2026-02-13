@@ -42,15 +42,12 @@ jobs:
         run: |
           ./tools/build.go ccapp
           ./tools/build.go cc-helper
-          GOOS=darwin GOARCH=amd64 go build -o build/cc-helper_darwin_amd64 ./cmd/cc-helper
-
           # Sign app contents and bundle with Developer ID + hardened runtime.
           codesign -s "$CC_DEVELOPER_ID" -f -v --timestamp --options runtime --entitlements tools/entitlements.xml --keychain "$CC_KEYCHAIN_PATH" build/CrumbleCracker.app/Contents/MacOS/CrumbleCracker
           codesign -s "$CC_DEVELOPER_ID" -f -v --timestamp --options runtime --entitlements tools/entitlements.xml --keychain "$CC_KEYCHAIN_PATH" build/CrumbleCracker.app
 
           # Sign standalone helper binary as a release artifact.
           codesign -s "$CC_DEVELOPER_ID" -f -v --timestamp --options runtime --entitlements tools/entitlements.xml --keychain "$CC_KEYCHAIN_PATH" build/cc-helper
-          codesign -s "$CC_DEVELOPER_ID" -f -v --timestamp --options runtime --entitlements tools/entitlements.xml --keychain "$CC_KEYCHAIN_PATH" build/cc-helper_darwin_amd64
 
           # Notarize app bundle and staple ticket (parity with main's previous release flow).
           ditto -c -k --keepParent build/CrumbleCracker.app build/CrumbleCracker_notary.zip
@@ -79,7 +76,6 @@ jobs:
           path: |
             build/CrumbleCracker_darwin_arm64.zip
             build/cc-helper_darwin_arm64
-            build/cc-helper_darwin_amd64
 
   build-other:
     runs-on: ubuntu-latest
@@ -129,7 +125,6 @@ jobs:
           for file in \
             macos-arm64/CrumbleCracker_darwin_arm64.zip \
             macos-arm64/cc-helper_darwin_arm64 \
-            macos-arm64/cc-helper_darwin_amd64 \
             other-platforms/CrumbleCracker_windows_amd64.exe \
             other-platforms/CrumbleCracker_windows_arm64.exe \
             other-platforms/CrumbleCracker_linux_amd64 \
@@ -156,7 +151,6 @@ jobs:
           files: |
             artifacts/macos-arm64/CrumbleCracker_darwin_arm64.zip
             artifacts/macos-arm64/cc-helper_darwin_arm64
-            artifacts/macos-arm64/cc-helper_darwin_amd64
             artifacts/other-platforms/CrumbleCracker_windows_amd64.exe
             artifacts/other-platforms/CrumbleCracker_windows_arm64.exe
             artifacts/other-platforms/CrumbleCracker_linux_amd64
