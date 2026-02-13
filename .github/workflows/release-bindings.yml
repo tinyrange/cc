@@ -100,10 +100,6 @@ jobs:
             goos: darwin
             goarch: arm64
             npm_platform: darwin-arm64
-          - os: macos-13
-            goos: darwin
-            goarch: amd64
-            npm_platform: darwin-x64
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -169,7 +165,6 @@ jobs:
           npm version $VERSION --no-git-tag-version
           # Update optionalDependencies to match
           npm pkg set optionalDependencies.@crumblecracker/cc-darwin-arm64=$VERSION
-          npm pkg set optionalDependencies.@crumblecracker/cc-darwin-x64=$VERSION
           npm pkg set optionalDependencies.@crumblecracker/cc-linux-x64=$VERSION
           npm pkg set optionalDependencies.@crumblecracker/cc-linux-arm64=$VERSION
 
@@ -206,9 +201,6 @@ jobs:
           - os: macos-latest
             arch: arm64
             platform_tag: macosx_11_0_arm64
-          - os: macos-13
-            arch: x86_64
-            platform_tag: macosx_10_9_x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

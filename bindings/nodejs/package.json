@@ -51,7 +51,6 @@
   },
   "optionalDependencies": {
     "@crumblecracker/cc-darwin-arm64": "0.1.0",
-    "@crumblecracker/cc-darwin-x64": "0.1.0",
     "@crumblecracker/cc-linux-x64": "0.1.0",
     "@crumblecracker/cc-linux-arm64": "0.1.0"
   },
