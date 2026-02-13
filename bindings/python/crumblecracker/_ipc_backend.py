@@ -25,6 +25,9 @@ from ._ipc_protocol import (
     MSG_CMD_SET_DIR,
     MSG_CMD_SET_ENV,
     MSG_CMD_START,
+    MSG_CMD_STDERR_PIPE,
+    MSG_CMD_STDIN_PIPE,
+    MSG_CMD_STDOUT_PIPE,
     MSG_CMD_WAIT,
     MSG_CONN_CLOSE,
     MSG_CONN_LOCAL_ADDR,
@@ -155,7 +158,7 @@ class IPCBackend:
         resp = self.client.call(MSG_INSTANCE_IS_RUNNING)
         dec = Decoder(resp)
         _check_error(dec)
-        return dec.bool()
+        return dec.decode_bool()
 
     def instance_set_console(self, cols: int, rows: int) -> None:
         enc = Encoder()
@@ -167,7 +170,7 @@ class IPCBackend:
 
     def instance_set_network(self, enabled: bool) -> None:
         enc = Encoder()
-        enc.bool(enabled)
+        enc.encode_bool(enabled)
         resp = self.client.call(MSG_INSTANCE_SET_NETWORK, enc.get_bytes())
         dec = Decoder(resp)
         _check_error(dec)
@@ -536,6 +539,30 @@ class IPCBackend:
         resp = self.client.call(MSG_CMD_KILL, enc.get_bytes())
         dec = Decoder(resp)
         _check_error(dec)
+
+    def cmd_stdout_pipe(self, handle: int) -> int:
+        enc = Encoder()
+        enc.uint64(handle)
+        resp = self.client.call(MSG_CMD_STDOUT_PIPE, enc.get_bytes())
+        dec = Decoder(resp)
+        _check_error(dec)
+        return dec.uint64()
+
+    def cmd_stderr_pipe(self, handle: int) -> int:
+        enc = Encoder()
+        enc.uint64(handle)
+        resp = self.client.call(MSG_CMD_STDERR_PIPE, enc.get_bytes())
+        dec = Decoder(resp)
+        _check_error(dec)
+        return dec.uint64()
+
+    def cmd_stdin_pipe(self, handle: int) -> int:
+        enc = Encoder()
+        enc.uint64(handle)
+        resp = self.client.call(MSG_CMD_STDIN_PIPE, enc.get_bytes())
+        dec = Decoder(resp)
+        _check_error(dec)
+        return dec.uint64()
 
     # ======================================================================
     # Network operations

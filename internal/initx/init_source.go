@@ -23,11 +23,12 @@ const (
 
 // Capture flags (must match loader.go)
 const (
-	captureFlagNone    = 0x00
-	captureFlagStdout  = 0x01
-	captureFlagStderr  = 0x02
-	captureFlagCombine = 0x04
-	captureFlagStdin   = 0x08
+	captureFlagNone            = 0x00
+	captureFlagStdout          = 0x01
+	captureFlagStderr          = 0x02
+	captureFlagCombine         = 0x04
+	captureFlagStdin           = 0x08
+	captureFlagStreamingOutput = 0x10
 )
 
 // Stdin mode constants (must match loader.go)
@@ -40,6 +41,16 @@ const (
 
 // Vsock port for streaming stdin (must match loader.go VsockStdinPort)
 const vsockStdinPort = 9999
+
+// Vsock port for streaming output (must match loader.go VsockStdoutPort)
+const vsockStdoutPort = 10001
+
+// Stream type constants for streaming output protocol (must match loader.go)
+const (
+	streamTypeTerminator = 0 // End of stream
+	streamTypeStdout     = 1 // Stdout data
+	streamTypeStderr     = 2 // Stderr data
+)
 
 // Timeslice IDs - must match constants in hvf_darwin_arm64.go
 // Guest writes these values to timesliceMem offset 0 to record markers
@@ -678,16 +689,27 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 		var stdoutLen int64 = 0
 		var stderrLen int64 = 0
 
+		// Check for streaming output mode
+		var isStreamingOutput int64 = 0
+		isStreamingOutput = flags & captureFlagStreamingOutput
+
 		// For capture mode, we use a concurrent reader process to avoid deadlock
 		// when payload output exceeds the pipe buffer (64KB on Linux).
 		// The reader process drains stdout/stderr pipes while the payload runs,
 		// then sends captured data back via a return pipe.
+		// In streaming output mode, the reader connects to host vsock and streams.
 		var needCapture int64 = 0
 		if captureStdout != 0 {
 			needCapture = 1
 		}
 		if captureStderr != 0 {
 			needCapture = 1
+		}
+		if isStreamingOutput != 0 {
+			needCapture = 1
+			// Ensure stdout and stderr capture flags are set for streaming
+			captureStdout = captureFlagStdout
+			captureStderr = captureFlagStderr
 		}
 
 		if needCapture != 0 {
@@ -757,6 +779,157 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 					}
 				}
 
+				if isStreamingOutput != 0 {
+					// === STREAMING OUTPUT MODE ===
+					// Connect to host vsock port for streaming output
+					streamSockFd := runtime.Syscall(runtime.SYS_SOCKET, runtime.AF_VSOCK, runtime.SOCK_STREAM, 0)
+					if streamSockFd < 0 {
+						runtime.Syscall(runtime.SYS_CLOSE, returnPipeWrite)
+						if stdoutPipeRead >= 0 {
+							runtime.Syscall(runtime.SYS_CLOSE, stdoutPipeRead)
+						}
+						if stderrPipeRead >= 0 {
+							runtime.Syscall(runtime.SYS_CLOSE, stderrPipeRead)
+						}
+						runtime.Syscall(runtime.SYS_EXIT, 1)
+					}
+
+					// Build sockaddr_vm for stdout port
+					streamSockaddr := runtime.Syscall(runtime.SYS_MMAP, 0, 16, runtime.PROT_READ|runtime.PROT_WRITE, runtime.MAP_PRIVATE|runtime.MAP_ANONYMOUS, -1, 0)
+					if streamSockaddr < 0 {
+						runtime.Syscall(runtime.SYS_CLOSE, streamSockFd)
+						runtime.Syscall(runtime.SYS_CLOSE, returnPipeWrite)
+						if stdoutPipeRead >= 0 {
+							runtime.Syscall(runtime.SYS_CLOSE, stdoutPipeRead)
+						}
+						if stderrPipeRead >= 0 {
+							runtime.Syscall(runtime.SYS_CLOSE, stderrPipeRead)
+						}
+						runtime.Syscall(runtime.SYS_EXIT, 1)
+					}
+
+					// Zero and fill sockaddr_vm
+					runtime.Store64(streamSockaddr, 0, 0)
+					runtime.Store64(streamSockaddr, 8, 0)
+					runtime.Store16(streamSockaddr, 0, runtime.AF_VSOCK)
+					runtime.Store32(streamSockaddr, 4, vsockStdoutPort)
+					runtime.Store32(streamSockaddr, 8, runtime.VMADDR_CID_HOST)
+
+					// Connect to host stdout port
+					streamConnectResult := runtime.Syscall(runtime.SYS_CONNECT, streamSockFd, streamSockaddr, 16)
+					runtime.Syscall(runtime.SYS_MUNMAP, streamSockaddr, 16)
+
+					if streamConnectResult < 0 {
+						runtime.Syscall(runtime.SYS_CLOSE, streamSockFd)
+						runtime.Syscall(runtime.SYS_CLOSE, returnPipeWrite)
+						if stdoutPipeRead >= 0 {
+							runtime.Syscall(runtime.SYS_CLOSE, stdoutPipeRead)
+						}
+						if stderrPipeRead >= 0 {
+							runtime.Syscall(runtime.SYS_CLOSE, stderrPipeRead)
+						}
+						runtime.Syscall(runtime.SYS_EXIT, 1)
+					}
+
+					// Allocate chunk buffer: [stream_type:4][len:4][data:16384]
+					// We use readerBuf for data reads, and a small header area
+					var chunkHeaderBuf int64 = 0
+					chunkHeaderBuf = readerBuf // Use start of readerBuf for header (8 bytes, aligned)
+					var chunkDataBuf int64 = 0
+					chunkDataBuf = readerBuf + 8 // Data starts at offset 8 (aligned)
+					var chunkDataMax int64 = 16384
+
+					var strOutEof int64 = 0
+					var strErrEof int64 = 0
+					if stdoutPipeRead < 0 {
+						strOutEof = 1
+					}
+					if stderrPipeRead < 0 {
+						strErrEof = 1
+					}
+
+					// Stream loop - read from pipes and send chunks to host
+					var strBothEof int64 = 0
+					var strReadResult int64 = 0
+					var strGotData int64 = 0
+					for strBothEof == 0 {
+						strGotData = 0
+
+						// Try to read from stdout pipe and stream
+						if strOutEof == 0 {
+							strReadResult = runtime.Syscall(runtime.SYS_READ, stdoutPipeRead, chunkDataBuf, chunkDataMax)
+							if strReadResult > 0 {
+								// Send chunk: [stream_type:4][len:4][data]
+								runtime.Store32(chunkHeaderBuf, 0, streamTypeStdout)
+								runtime.Store32(chunkHeaderBuf, 4, strReadResult)
+								vsockWriteFull(streamSockFd, chunkHeaderBuf, 8)
+								vsockWriteFull(streamSockFd, chunkDataBuf, strReadResult)
+								strGotData = 1
+							} else {
+								if strReadResult == 0 {
+									strOutEof = 1
+								} else {
+									if strReadResult != -11 {
+										strOutEof = 1
+									}
+								}
+							}
+						}
+
+						// Try to read from stderr pipe and stream
+						if strErrEof == 0 {
+							strReadResult = runtime.Syscall(runtime.SYS_READ, stderrPipeRead, chunkDataBuf, chunkDataMax)
+							if strReadResult > 0 {
+								// Send chunk: [stream_type:4][len:4][data]
+								runtime.Store32(chunkHeaderBuf, 0, streamTypeStderr)
+								runtime.Store32(chunkHeaderBuf, 4, strReadResult)
+								vsockWriteFull(streamSockFd, chunkHeaderBuf, 8)
+								vsockWriteFull(streamSockFd, chunkDataBuf, strReadResult)
+								strGotData = 1
+							} else {
+								if strReadResult == 0 {
+									strErrEof = 1
+								} else {
+									if strReadResult != -11 {
+										strErrEof = 1
+									}
+								}
+							}
+						}
+
+						// Check if both pipes are at EOF
+						if strOutEof != 0 {
+							if strErrEof != 0 {
+								strBothEof = 1
+							}
+						}
+
+						// Yield to scheduler if no data
+						if strGotData == 0 {
+							if strBothEof == 0 {
+								runtime.Syscall(runtime.SYS_GETPID)
+							}
+						}
+					}
+
+					// Send terminator: [stream_type=0][len=0]
+					runtime.Store32(chunkHeaderBuf, 0, streamTypeTerminator)
+					runtime.Store32(chunkHeaderBuf, 4, 0)
+					vsockWriteFull(streamSockFd, chunkHeaderBuf, 8)
+
+					// Close everything and exit
+					if stdoutPipeRead >= 0 {
+						runtime.Syscall(runtime.SYS_CLOSE, stdoutPipeRead)
+					}
+					if stderrPipeRead >= 0 {
+						runtime.Syscall(runtime.SYS_CLOSE, stderrPipeRead)
+					}
+					runtime.Syscall(runtime.SYS_CLOSE, streamSockFd)
+					runtime.Syscall(runtime.SYS_CLOSE, returnPipeWrite)
+					runtime.Syscall(runtime.SYS_EXIT, 0)
+				}
+
+				// === BUFFERED CAPTURE MODE (legacy) ===
 				// Read from pipes into readerBuf
 				// Layout: [stdout_data...][stderr_data...]
 				var readerStdoutLen int64 = 0
@@ -1023,42 +1196,52 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 				savedStderr = -1
 			}
 
-			// Read captured data from return pipe BEFORE waiting for reader
-			// This prevents deadlock when captured data exceeds pipe buffer (64KB)
-			// Format: [stdout_len:4][stdout_data][stderr_len:4][stderr_data]
+			// In streaming output mode, skip reading from return pipe
+			// (output was already streamed to host via vsock)
+			if isStreamingOutput == 0 {
+				// Read captured data from return pipe BEFORE waiting for reader
+				// This prevents deadlock when captured data exceeds pipe buffer (64KB)
+				// Format: [stdout_len:4][stdout_data][stderr_len:4][stderr_data]
+				if returnPipeRead >= 0 {
+					// Read stdout_len
+					vsockReadFull(returnPipeRead, resultBuf, 4)
+					stdoutLen = runtime.Load32(resultBuf, 0)
+					if stdoutLen < 0 {
+						stdoutLen = 0
+					}
+					if stdoutLen > captureBufferSize {
+						stdoutLen = captureBufferSize
+					}
+
+					// Read stdout_data into result buffer at offset 12
+					if stdoutLen > 0 {
+						vsockReadFull(returnPipeRead, resultBuf+12, stdoutLen)
+					}
+
+					// Read stderr_len
+					vsockReadFull(returnPipeRead, resultBuf, 4)
+					stderrLen = runtime.Load32(resultBuf, 0)
+					if stderrLen < 0 {
+						stderrLen = 0
+					}
+					if stderrLen > captureBufferSize {
+						stderrLen = captureBufferSize
+					}
+
+					// Read stderr_data into result buffer after stdout
+					if stderrLen > 0 {
+						var stderrDataOffset int64 = 0
+						stderrDataOffset = 12 + stdoutLen + 4
+						vsockReadFull(returnPipeRead, resultBuf+stderrDataOffset, stderrLen)
+					}
+
+					runtime.Syscall(runtime.SYS_CLOSE, returnPipeRead)
+					returnPipeRead = -1
+				}
+			}
+
+			// Close return pipe if still open (streaming mode skips reading)
 			if returnPipeRead >= 0 {
-				// Read stdout_len
-				vsockReadFull(returnPipeRead, resultBuf, 4)
-				stdoutLen = runtime.Load32(resultBuf, 0)
-				if stdoutLen < 0 {
-					stdoutLen = 0
-				}
-				if stdoutLen > captureBufferSize {
-					stdoutLen = captureBufferSize
-				}
-
-				// Read stdout_data into result buffer at offset 12
-				if stdoutLen > 0 {
-					vsockReadFull(returnPipeRead, resultBuf+12, stdoutLen)
-				}
-
-				// Read stderr_len
-				vsockReadFull(returnPipeRead, resultBuf, 4)
-				stderrLen = runtime.Load32(resultBuf, 0)
-				if stderrLen < 0 {
-					stderrLen = 0
-				}
-				if stderrLen > captureBufferSize {
-					stderrLen = captureBufferSize
-				}
-
-				// Read stderr_data into result buffer after stdout
-				if stderrLen > 0 {
-					var stderrDataOffset int64 = 0
-					stderrDataOffset = 12 + stdoutLen + 4
-					vsockReadFull(returnPipeRead, resultBuf+stderrDataOffset, stderrLen)
-				}
-
 				runtime.Syscall(runtime.SYS_CLOSE, returnPipeRead)
 				returnPipeRead = -1
 			}
@@ -1075,8 +1258,17 @@ func vsockMainLoop(anonMem int64, timesliceMem int64) {
 		}
 
 		// Build response
+		// When streaming output, send just exit code (no captured data)
+		var sendLegacyResponse int64 = 0
 		if flags == captureFlagNone {
-			// Legacy response: [len=4][exit_code]
+			sendLegacyResponse = 1
+		}
+		if isStreamingOutput != 0 {
+			sendLegacyResponse = 1
+		}
+
+		if sendLegacyResponse != 0 {
+			// Simple response: [len=4][exit_code]
 			runtime.Store32(resultBuf, 0, 4)
 			runtime.Store32(resultBuf, 4, payloadResult)
 

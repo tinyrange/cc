@@ -16,8 +16,12 @@ import {
   MsgCmdSetDir,
   MsgCmdSetEnv,
   MsgCmdStart,
+  MsgCmdStderrPipe,
+  MsgCmdStdinPipe,
+  MsgCmdStdoutPipe,
   MsgCmdWait,
 } from './ipc/messages.js';
+import { Conn } from './network.js';
 import { Decoder, Encoder } from './ipc/protocol.js';
 
 /**
@@ -140,6 +144,69 @@ export class Cmd implements AsyncDisposable {
     if (err) throw err;
 
     return dec.stringSlice();
+  }
+
+  /**
+   * Get a pipe connected to the command's stdout.
+   * Must be called before start().
+   * @returns A Conn that can be read from while the command is running.
+   */
+  async stdoutPipe(): Promise<Conn> {
+    if (this._started) {
+      throw new CCError('Cmd has already been started', ErrorCode.InvalidArgument);
+    }
+
+    const enc = new Encoder();
+    enc.uint64(this.handle);
+
+    const resp = await this.client.call(MsgCmdStdoutPipe, enc.getBytes());
+    const dec = new Decoder(resp);
+    const err = dec.error();
+    if (err) throw err;
+
+    return new Conn(this.client, dec.uint64());
+  }
+
+  /**
+   * Get a pipe connected to the command's stderr.
+   * Must be called before start().
+   * @returns A Conn that can be read from while the command is running.
+   */
+  async stderrPipe(): Promise<Conn> {
+    if (this._started) {
+      throw new CCError('Cmd has already been started', ErrorCode.InvalidArgument);
+    }
+
+    const enc = new Encoder();
+    enc.uint64(this.handle);
+
+    const resp = await this.client.call(MsgCmdStderrPipe, enc.getBytes());
+    const dec = new Decoder(resp);
+    const err = dec.error();
+    if (err) throw err;
+
+    return new Conn(this.client, dec.uint64());
+  }
+
+  /**
+   * Get a pipe connected to the command's stdin.
+   * Must be called before start(). Close the Conn to signal EOF.
+   * @returns A Conn that can be written to while the command is running.
+   */
+  async stdinPipe(): Promise<Conn> {
+    if (this._started) {
+      throw new CCError('Cmd has already been started', ErrorCode.InvalidArgument);
+    }
+
+    const enc = new Encoder();
+    enc.uint64(this.handle);
+
+    const resp = await this.client.call(MsgCmdStdinPipe, enc.getBytes());
+    const dec = new Decoder(resp);
+    const err = dec.error();
+    if (err) throw err;
+
+    return new Conn(this.client, dec.uint64());
   }
 
   /**

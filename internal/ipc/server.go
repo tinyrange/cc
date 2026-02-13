@@ -17,6 +17,7 @@ type Server struct {
 	listener   net.Listener
 	socketPath string
 	handler    Handler
+	mux        *Mux // optional, for streaming handler support
 	closed     atomic.Bool
 	wg         sync.WaitGroup
 	conns      map[net.Conn]struct{}
@@ -39,6 +40,16 @@ func NewServer(socketPath string, handler Handler) (*Server, error) {
 		handler:    handler,
 		conns:      make(map[net.Conn]struct{}),
 	}, nil
+}
+
+// NewServerWithMux creates a new IPC server with a Mux, enabling streaming handler support.
+func NewServerWithMux(socketPath string, mux *Mux) (*Server, error) {
+	server, err := NewServer(socketPath, mux.Handler())
+	if err != nil {
+		return nil, err
+	}
+	server.mux = mux
+	return server, nil
 }
 
 // SocketPath returns the path to the Unix socket.
@@ -121,6 +132,15 @@ func (s *Server) handleConn(conn net.Conn) {
 			}
 		}
 
+		// Check for streaming handler first
+		if s.mux != nil && s.mux.isStreamingMessage(header.Type) {
+			sw := &StreamWriter{conn: conn}
+			if err := s.mux.handleStreamingMessage(header.Type, payload, sw); err != nil {
+				s.sendErrorFromGoError(conn, err)
+			}
+			continue
+		}
+
 		// Handle the request
 		resp, err := s.handler(header.Type, payload)
 		if err != nil {
@@ -185,19 +205,67 @@ func (s *Server) Close() error {
 	return nil
 }
 
+// StreamWriter allows sending multiple streaming messages over a connection.
+type StreamWriter struct {
+	conn net.Conn
+}
+
+// WriteChunk sends a streaming output chunk to the client.
+// streamType: 1=stdout, 2=stderr
+// WriteStreamChunk sends a stream chunk message with type and data.
+// WriteStreamChunk sends a stream chunk message with type and data.
+func (sw *StreamWriter) WriteStreamChunk(streamType uint8, data []byte) error {
+	enc := NewEncoder()
+	enc.Uint8(streamType)
+	enc.WriteBytes(data)
+	payload := enc.Bytes()
+	if err := WriteHeader(sw.conn, Header{Type: MsgStreamChunk, Length: uint32(len(payload))}); err != nil {
+		return err
+	}
+	if len(payload) > 0 {
+		if _, err := sw.conn.Write(payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// WriteEnd sends the stream end message with exit code.
+func (sw *StreamWriter) WriteEnd(exitCode int32) error {
+	enc := NewEncoder()
+	enc.Uint8(ErrCodeOK)
+	enc.Int32(exitCode)
+	payload := enc.Bytes()
+	if err := WriteHeader(sw.conn, Header{Type: MsgStreamEnd, Length: uint32(len(payload))}); err != nil {
+		return err
+	}
+	if len(payload) > 0 {
+		if _, err := sw.conn.Write(payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Mux is a message type multiplexer for the server.
 type Mux struct {
-	handlers map[uint16]MuxHandler
-	mu       sync.RWMutex
+	handlers          map[uint16]MuxHandler
+	streamingHandlers map[uint16]StreamingMuxHandler
+	mu                sync.RWMutex
 }
 
 // MuxHandler handles a specific message type.
 type MuxHandler func(dec *Decoder) ([]byte, error)
 
+// StreamingMuxHandler handles a message type that produces streaming output.
+// Instead of returning a single response, it writes multiple messages via the StreamWriter.
+type StreamingMuxHandler func(dec *Decoder, sw *StreamWriter) error
+
 // NewMux creates a new message multiplexer.
 func NewMux() *Mux {
 	return &Mux{
-		handlers: make(map[uint16]MuxHandler),
+		handlers:          make(map[uint16]MuxHandler),
+		streamingHandlers: make(map[uint16]StreamingMuxHandler),
 	}
 }
 
@@ -206,6 +274,13 @@ func (m *Mux) Handle(msgType uint16, handler MuxHandler) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.handlers[msgType] = handler
+}
+
+// HandleStreaming registers a streaming handler for a message type.
+func (m *Mux) HandleStreaming(msgType uint16, handler StreamingMuxHandler) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.streamingHandlers[msgType] = handler
 }
 
 // Handler returns a Handler function for use with Server.
@@ -225,6 +300,31 @@ func (m *Mux) Handler() Handler {
 		dec := NewDecoder(payload)
 		return handler(dec)
 	}
+}
+
+// isStreamingMessage checks if a message type has a streaming handler registered.
+func (m *Mux) isStreamingMessage(msgType uint16) bool {
+	m.mu.RLock()
+	_, ok := m.streamingHandlers[msgType]
+	m.mu.RUnlock()
+	return ok
+}
+
+// handleStreamingMessage invokes the streaming handler for a message type.
+func (m *Mux) handleStreamingMessage(msgType uint16, payload []byte, sw *StreamWriter) error {
+	m.mu.RLock()
+	handler, ok := m.streamingHandlers[msgType]
+	m.mu.RUnlock()
+
+	if !ok {
+		return &IPCError{
+			Code:    ErrCodeInvalidArgument,
+			Message: fmt.Sprintf("unknown streaming message type: 0x%04x", msgType),
+		}
+	}
+
+	dec := NewDecoder(payload)
+	return handler(dec, sw)
 }
 
 // ResponseBuilder helps build response payloads.

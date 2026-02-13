@@ -204,6 +204,146 @@ fn test_command_exit_code() {
 }
 
 #[test]
+fn test_stdout_pipe() {
+    if !should_run_vm_tests() {
+        println!("Skipping VM test (CC_RUN_VM_TESTS not set)");
+        return;
+    }
+
+    if !check_hypervisor() {
+        println!("Skipping: hypervisor not accessible");
+        return;
+    }
+
+    cc::init().expect("init should succeed");
+
+    let client = cc::OciClient::new().expect("OciClient::new should succeed");
+    let source = client
+        .pull("alpine:latest", None, None)
+        .expect("pull should succeed");
+
+    let inst = cc::Instance::new(source, None).expect("Instance::new should succeed");
+
+    let mut cmd = inst
+        .command("echo", &["Hello from pipe!"])
+        .expect("command should succeed");
+
+    let mut stdout = cmd.stdout_pipe().expect("stdout_pipe should succeed");
+    cmd.start().expect("start should succeed");
+
+    // Read from pipe
+    let mut buf = [0u8; 256];
+    let n = stdout.read(&mut buf).expect("read should succeed");
+
+    let output = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        output.contains("Hello from pipe!"),
+        "pipe output should contain 'Hello from pipe!', got: {}",
+        output
+    );
+
+    stdout.close().expect("close should succeed");
+    cmd.wait().expect("wait should succeed");
+
+    cc::shutdown();
+}
+
+#[test]
+fn test_stdin_stdout_pipe() {
+    if !should_run_vm_tests() {
+        println!("Skipping VM test (CC_RUN_VM_TESTS not set)");
+        return;
+    }
+
+    if !check_hypervisor() {
+        println!("Skipping: hypervisor not accessible");
+        return;
+    }
+
+    cc::init().expect("init should succeed");
+
+    let client = cc::OciClient::new().expect("OciClient::new should succeed");
+    let source = client
+        .pull("alpine:latest", None, None)
+        .expect("pull should succeed");
+
+    let inst = cc::Instance::new(source, None).expect("Instance::new should succeed");
+
+    let mut cmd = inst
+        .command("cat", &[])
+        .expect("command should succeed");
+
+    let mut stdin_pipe = cmd.stdin_pipe().expect("stdin_pipe should succeed");
+    let mut stdout_pipe = cmd.stdout_pipe().expect("stdout_pipe should succeed");
+    cmd.start().expect("start should succeed");
+
+    // Write to stdin and close to signal EOF
+    stdin_pipe.write(b"echo test data").expect("write should succeed");
+    stdin_pipe.close().expect("close should succeed");
+
+    // Read from stdout
+    let mut buf = [0u8; 256];
+    let n = stdout_pipe.read(&mut buf).expect("read should succeed");
+
+    let output = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        output.contains("echo test data"),
+        "echo-back output should match, got: {}",
+        output
+    );
+
+    stdout_pipe.close().expect("close should succeed");
+    cmd.wait().expect("wait should succeed");
+
+    cc::shutdown();
+}
+
+#[test]
+fn test_stderr_pipe() {
+    if !should_run_vm_tests() {
+        println!("Skipping VM test (CC_RUN_VM_TESTS not set)");
+        return;
+    }
+
+    if !check_hypervisor() {
+        println!("Skipping: hypervisor not accessible");
+        return;
+    }
+
+    cc::init().expect("init should succeed");
+
+    let client = cc::OciClient::new().expect("OciClient::new should succeed");
+    let source = client
+        .pull("alpine:latest", None, None)
+        .expect("pull should succeed");
+
+    let inst = cc::Instance::new(source, None).expect("Instance::new should succeed");
+
+    let mut cmd = inst
+        .command("sh", &["-c", "echo error message >&2"])
+        .expect("command should succeed");
+
+    let mut stderr = cmd.stderr_pipe().expect("stderr_pipe should succeed");
+    cmd.start().expect("start should succeed");
+
+    // Read from pipe
+    let mut buf = [0u8; 256];
+    let n = stderr.read(&mut buf).expect("read should succeed");
+
+    let output = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        output.contains("error message"),
+        "stderr should contain 'error message', got: {}",
+        output
+    );
+
+    stderr.close().expect("close should succeed");
+    cmd.wait().expect("wait should succeed");
+
+    cc::shutdown();
+}
+
+#[test]
 fn test_filesystem_write_read() {
     if !should_run_vm_tests() {
         println!("Skipping VM test (CC_RUN_VM_TESTS not set)");

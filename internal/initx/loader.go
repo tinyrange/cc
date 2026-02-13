@@ -228,20 +228,27 @@ var (
 // When flags=0, guest response is just [len:4][exit_code:4] for backward compatibility.
 const (
 	VsockProgramPort = 9998
-	VsockStdinPort   = 9999 // Separate port for streaming stdin
+	VsockStdinPort   = 9999  // Separate port for streaming stdin
+	VsockStdoutPort  = 10001 // Separate port for streaming output
 
 	// Capture flags for stdout/stderr capture and stdin delivery
-	CaptureFlagNone    uint32 = 0x00
-	CaptureFlagStdout  uint32 = 0x01
-	CaptureFlagStderr  uint32 = 0x02
-	CaptureFlagCombine uint32 = 0x04 // Combine stdout+stderr into single stream
-	CaptureFlagStdin   uint32 = 0x08 // Stdin data is included in the message (buffered mode)
+	CaptureFlagNone            uint32 = 0x00
+	CaptureFlagStdout          uint32 = 0x01
+	CaptureFlagStderr          uint32 = 0x02
+	CaptureFlagCombine         uint32 = 0x04 // Combine stdout+stderr into single stream
+	CaptureFlagStdin           uint32 = 0x08 // Stdin data is included in the message (buffered mode)
+	CaptureFlagStreamingOutput uint32 = 0x10 // Stream output via separate vsock connection
 
 	// Stdin mode constants for streaming stdin protocol
 	// These replace stdin_len field in the protocol when stdin_mode >= 0x02
 	StdinModeNone      uint32 = 0x00 // No stdin (EOF immediately)
 	StdinModeBuffered  uint32 = 0x01 // Buffered stdin (legacy - stdin_len and data follow code)
 	StdinModeStreaming uint32 = 0x02 // Streaming stdin (separate vsock connection on port 9999)
+
+	// Stream type constants for streaming output protocol
+	StreamTypeTerminator uint8 = 0 // End of stream
+	StreamTypeStdout     uint8 = 1 // Stdout data
+	StreamTypeStderr     uint8 = 2 // Stderr data
 )
 
 // ProgramResult contains the result of a program execution including captured output.
@@ -253,11 +260,12 @@ type ProgramResult struct {
 
 // VsockProgramServer is the host-side server for vsock-based program loading.
 type VsockProgramServer struct {
-	listener      virtio.VsockListener
-	stdinListener virtio.VsockListener // Listener for streaming stdin connections
-	conn          virtio.VsockConn
-	arch          hv.CpuArchitecture
-	mu            sync.Mutex
+	listener       virtio.VsockListener
+	stdinListener  virtio.VsockListener // Listener for streaming stdin connections
+	stdoutListener virtio.VsockListener // Listener for streaming output connections
+	conn           virtio.VsockConn
+	arch           hv.CpuArchitecture
+	mu             sync.Mutex
 
 	// drainBuf is reused for draining stale data
 	drainBuf []byte
@@ -281,10 +289,19 @@ func NewVsockProgramServer(backend virtio.VsockBackend, port uint32, arch hv.Cpu
 		return nil, fmt.Errorf("listen on stdin port %d: %w", VsockStdinPort, err)
 	}
 
+	// Create stdout listener for streaming output
+	stdoutListener, err := backend.Listen(VsockStdoutPort)
+	if err != nil {
+		listener.Close()
+		stdinListener.Close()
+		return nil, fmt.Errorf("listen on stdout port %d: %w", VsockStdoutPort, err)
+	}
+
 	return &VsockProgramServer{
-		listener:      listener,
-		stdinListener: stdinListener,
-		arch:          arch,
+		listener:       listener,
+		stdinListener:  stdinListener,
+		stdoutListener: stdoutListener,
+		arch:           arch,
 	}, nil
 }
 
@@ -650,6 +667,173 @@ func (s *VsockProgramServer) streamStdinToGuest(ctx context.Context, stdin io.Re
 	}
 }
 
+// streamOutputFromGuest accepts a connection from the guest on the stdout port
+// and reads streaming output chunks, routing them to stdout/stderr writers.
+// Protocol: [stream_type:1][len:4][data]... [stream_type=0] (terminator)
+func (s *VsockProgramServer) streamOutputFromGuest(ctx context.Context, stdout, stderr io.Writer) error {
+	// Get stdout listener under lock
+	s.mu.Lock()
+	stdoutListener := s.stdoutListener
+	vmTerminated := s.vmTerminated
+	s.mu.Unlock()
+
+	if stdoutListener == nil {
+		return fmt.Errorf("stdout listener not available")
+	}
+
+	// Accept connection from guest with context cancellation
+	acceptDone := make(chan struct {
+		conn virtio.VsockConn
+		err  error
+	}, 1)
+
+	go func() {
+		conn, err := stdoutListener.Accept()
+		acceptDone <- struct {
+			conn virtio.VsockConn
+			err  error
+		}{conn, err}
+	}()
+
+	var stdoutConn virtio.VsockConn
+	select {
+	case result := <-acceptDone:
+		if result.err != nil {
+			return fmt.Errorf("accept stdout connection: %w", result.err)
+		}
+		stdoutConn = result.conn
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-vmTerminated:
+		return ErrVMTerminated
+	}
+
+	defer stdoutConn.Close()
+
+	debug.Writef("initx.streamOutputFromGuest", "stdout connection accepted, starting streaming")
+
+	// Read chunks: [stream_type:4][len:4][data]
+	headerBuf := make([]byte, 8) // 4 bytes stream type + 4 bytes length (aligned)
+	for {
+		// Check for context cancellation
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		// Read chunk header
+		if _, err := io.ReadFull(stdoutConn, headerBuf); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("read output chunk header: %w", err)
+		}
+
+		streamType := uint8(binary.LittleEndian.Uint32(headerBuf[0:4]))
+		chunkLen := binary.LittleEndian.Uint32(headerBuf[4:8])
+
+		// Terminator: stream_type=0
+		if streamType == StreamTypeTerminator {
+			debug.Writef("initx.streamOutputFromGuest", "received terminator")
+			return nil
+		}
+
+		if chunkLen == 0 {
+			continue
+		}
+
+		// Read chunk data
+		data := make([]byte, chunkLen)
+		if _, err := io.ReadFull(stdoutConn, data); err != nil {
+			return fmt.Errorf("read output chunk data: %w", err)
+		}
+
+		// Route to appropriate writer
+		switch streamType {
+		case StreamTypeStdout:
+			if stdout != nil {
+				if _, err := stdout.Write(data); err != nil {
+					return fmt.Errorf("write stdout: %w", err)
+				}
+			}
+		case StreamTypeStderr:
+			if stderr != nil {
+				if _, err := stderr.Write(data); err != nil {
+					return fmt.Errorf("write stderr: %w", err)
+				}
+			}
+		default:
+			debug.Writef("initx.streamOutputFromGuest", "unknown stream type: %d", streamType)
+		}
+	}
+}
+
+// RunWithStreamingOutput sends a program and streams stdout/stderr to writers in real time.
+// It combines streaming stdin (if provided) with streaming output.
+// The exit code is returned via the main vsock connection as [len:4][exit_code:4].
+func (s *VsockProgramServer) RunWithStreamingOutput(ctx context.Context, prog *ir.Program, flags uint32, stdin io.Reader, stdout, stderr io.Writer) (*ProgramResult, error) {
+	// Add streaming output flag
+	flags |= CaptureFlagStreamingOutput
+
+	// Determine stdin mode
+	stdinMode := StdinModeNone
+	if stdin != nil {
+		stdinMode = StdinModeStreaming
+	}
+
+	// Send program with streaming flags
+	if err := s.SendProgramWithStreamingStdin(prog, flags, stdinMode); err != nil {
+		return nil, fmt.Errorf("send program: %w", err)
+	}
+
+	// Start concurrent operations
+	type resultOrErr struct {
+		result *ProgramResult
+		err    error
+	}
+
+	// Start stdin streaming if needed
+	var stdinDone chan error
+	if stdin != nil {
+		stdinDone = make(chan error, 1)
+		go func() {
+			stdinDone <- s.streamStdinToGuest(ctx, stdin)
+		}()
+	}
+
+	// Start output streaming
+	outputDone := make(chan error, 1)
+	go func() {
+		outputDone <- s.streamOutputFromGuest(ctx, stdout, stderr)
+	}()
+
+	// Wait for exit code result on the main connection
+	// When streaming output, the guest sends just [len:4][exit_code:4] (no captured data)
+	result, err := s.WaitResultWithCapture(ctx, CaptureFlagNone)
+
+	// Wait for output streaming to finish (it should end before or shortly after the result)
+	select {
+	case outputErr := <-outputDone:
+		if outputErr != nil && err == nil {
+			debug.Writef("initx.RunWithStreamingOutput", "output streaming error: %v", outputErr)
+		}
+	case <-time.After(5 * time.Second):
+		debug.Writef("initx.RunWithStreamingOutput", "output streaming still running after result, not waiting")
+	}
+
+	// Don't block on stdin streaming (same as RunWithStreamingStdin)
+	if stdinDone != nil {
+		select {
+		case <-stdinDone:
+		case <-time.After(100 * time.Millisecond):
+			debug.Writef("initx.RunWithStreamingOutput", "stdin streaming still running after result, not waiting")
+		}
+	}
+
+	return result, err
+}
+
 // WaitResult waits for and returns the exit code from the guest.
 // This is a convenience wrapper for backward compatibility when capture is not needed.
 func (s *VsockProgramServer) WaitResult(ctx context.Context) (int32, error) {
@@ -777,6 +961,12 @@ func (s *VsockProgramServer) Close() error {
 			errs = append(errs, err)
 		}
 		s.stdinListener = nil
+	}
+	if s.stdoutListener != nil {
+		if err := s.stdoutListener.Close(); err != nil {
+			errs = append(errs, err)
+		}
+		s.stdoutListener = nil
 	}
 	if len(errs) > 0 {
 		return errs[0]
@@ -1140,6 +1330,46 @@ func (vm *VirtualMachine) RunWithStreamingStdin(ctx context.Context, prog *ir.Pr
 	}
 
 	return vm.RunWithCaptureAndStdin(ctx, prog, flags, stdinData)
+}
+
+// RunWithStreamingOutput runs a program with streaming stdout/stderr to writers in real time.
+// If stdin is non-nil, it is also streamed. Output arrives at the writers as the guest produces it.
+func (vm *VirtualMachine) RunWithStreamingOutput(ctx context.Context, prog *ir.Program, flags uint32, stdin io.Reader, stdout, stderr io.Writer) (*ProgramResult, error) {
+	// If vsock loader is enabled and we have a server, use vsock path
+	if vm.useVsockLoader && vm.vsockProgramServer != nil {
+		// First run boots the kernel, then accept vsock connection
+		if !vm.firstRunComplete {
+			if err := vm.runFirstRunVsock(ctx); err != nil {
+				return nil, err
+			}
+		}
+		return vm.vsockProgramServer.RunWithStreamingOutput(ctx, prog, flags, stdin, stdout, stderr)
+	}
+
+	// Fallback: for non-vsock path, use buffered capture and copy after
+	var stdinData []byte
+	if stdin != nil {
+		var err error
+		stdinData, err = io.ReadAll(stdin)
+		if err != nil {
+			return nil, fmt.Errorf("read stdin: %w", err)
+		}
+	}
+
+	result, err := vm.RunWithCaptureAndStdin(ctx, prog, flags|CaptureFlagStdout|CaptureFlagStderr, stdinData)
+	if err != nil {
+		return nil, err
+	}
+
+	// Write captured output to writers
+	if stdout != nil && len(result.Stdout) > 0 {
+		stdout.Write(result.Stdout)
+	}
+	if stderr != nil && len(result.Stderr) > 0 {
+		stderr.Write(result.Stderr)
+	}
+
+	return result, nil
 }
 
 // runProgramVsockWithCapture runs a program using vsock with output capture.

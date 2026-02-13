@@ -59,6 +59,10 @@ export const MsgCmdOutput = 0x040a;
 export const MsgCmdCombinedOutput = 0x040b;
 export const MsgCmdExitCode = 0x040c;
 export const MsgCmdKill = 0x040d;
+export const MsgCmdStdoutPipe = 0x040e;
+export const MsgCmdStderrPipe = 0x040f;
+export const MsgCmdStdinPipe = 0x0410;
+export const MsgCmdRunStreaming = 0x0411;
 
 // Network operations (0x05xx)
 export const MsgNetListen = 0x0500;
@@ -83,3 +87,5 @@ export const MsgBuildDockerfile = 0x0700;
 // Response types (0xFFxx)
 export const MsgResponse = 0xff00;
 export const MsgError = 0xff01;
+export const MsgStreamChunk = 0xff02;
+export const MsgStreamEnd = 0xff03;

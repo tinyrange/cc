@@ -5,7 +5,7 @@ Instance class for running VM instances and filesystem operations.
 from __future__ import annotations
 
 from ctypes import POINTER, byref, c_char_p, c_int, c_int64, c_size_t, c_uint8, c_void_p
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from . import _ffi
 from .errors import CCError
@@ -20,7 +20,8 @@ from .types import (
 )
 
 if TYPE_CHECKING:
-    from .client import InstanceSource
+    from .client import CancelToken, InstanceSource
+    from .cmd import Cmd
 
 
 class File:
@@ -29,7 +30,7 @@ class File:
     Supports context manager protocol for automatic cleanup.
     """
 
-    def __init__(self, handle, path: str, *, _ipc: bool = False):
+    def __init__(self, handle: Any, path: str, *, _ipc: bool = False) -> None:
         self._handle = handle
         self._path = path
         self._closed = False
@@ -41,7 +42,7 @@ class File:
     def __enter__(self) -> "File":
         return self
 
-    def __exit__(self, *args) -> None:
+    def __exit__(self, *args: Any) -> None:
         self.close()
 
     def close(self) -> None:
@@ -217,7 +218,7 @@ class Snapshot:
     Snapshots can be used to create new instances from a known state.
     """
 
-    def __init__(self, handle, *, _ipc: bool = False):
+    def __init__(self, handle: Any, *, _ipc: bool = False) -> None:
         self._handle = handle
         self._closed = False
         self._ipc = _ipc
@@ -228,7 +229,7 @@ class Snapshot:
     def __enter__(self) -> "Snapshot":
         return self
 
-    def __exit__(self, *args) -> None:
+    def __exit__(self, *args: Any) -> None:
         self.close()
 
     def close(self) -> None:
@@ -385,7 +386,7 @@ class Instance:
     def __enter__(self) -> "Instance":
         return self
 
-    def __exit__(self, *args) -> None:
+    def __exit__(self, *args: Any) -> None:
         self.close()
 
     def close(self) -> None:
@@ -400,7 +401,7 @@ class Instance:
             self._closed = True
 
     @property
-    def handle(self):
+    def handle(self) -> Any:
         """Get the underlying handle."""
         if self._closed:
             raise CCError("Instance is closed", code=4)
@@ -479,8 +480,8 @@ class Instance:
         if self._closed:
             raise CCError("Instance is closed", code=4)
         if self._ipc:
-            handle = _ffi.get_ipc_backend().fs_open(path)
-            return File(handle, path, _ipc=True)
+            ipc_handle = _ffi.get_ipc_backend().fs_open(path)
+            return File(ipc_handle, path, _ipc=True)
 
         lib = _ffi.get_lib()
         handle = _ffi.FileHandle()
@@ -494,8 +495,8 @@ class Instance:
         if self._closed:
             raise CCError("Instance is closed", code=4)
         if self._ipc:
-            handle = _ffi.get_ipc_backend().fs_create(path)
-            return File(handle, path, _ipc=True)
+            ipc_handle = _ffi.get_ipc_backend().fs_create(path)
+            return File(ipc_handle, path, _ipc=True)
 
         lib = _ffi.get_lib()
         handle = _ffi.FileHandle()
@@ -509,8 +510,8 @@ class Instance:
         if self._closed:
             raise CCError("Instance is closed", code=4)
         if self._ipc:
-            handle = _ffi.get_ipc_backend().fs_open_file(path, flags, mode)
-            return File(handle, path, _ipc=True)
+            ipc_handle = _ffi.get_ipc_backend().fs_open_file(path, flags, mode)
+            return File(ipc_handle, path, _ipc=True)
 
         lib = _ffi.get_lib()
         handle = _ffi.FileHandle()
@@ -687,7 +688,7 @@ class Instance:
         err = _ffi.CCErrorStruct()
         code = lib.cc_fs_readlink(self._handle, path.encode("utf-8"), byref(target), byref(err))
         _ffi.check_error(code, err)
-        return _ffi._get_string_and_free(lib, target.value)
+        return _ffi._get_string_and_free(lib, target.value or 0)
 
     def read_dir(self, path: str) -> list[DirEntry]:
         """Read directory contents."""
@@ -808,8 +809,8 @@ class Instance:
         if self._closed:
             raise CCError("Instance is closed", code=4)
         if self._ipc:
-            handle = _ffi.get_ipc_backend().net_listen(network, address)
-            return Listener(handle, _ipc=True)
+            ipc_handle = _ffi.get_ipc_backend().net_listen(network, address)
+            return Listener(ipc_handle, _ipc=True)
 
         lib = _ffi.get_lib()
         handle = _ffi.ListenerHandle()
@@ -833,8 +834,8 @@ class Instance:
         if self._ipc:
             excludes = options.excludes or [] if options else []
             cache_dir = options.cache_dir or "" if options else ""
-            handle = _ffi.get_ipc_backend().fs_snapshot(excludes, cache_dir)
-            return Snapshot(handle, _ipc=True)
+            ipc_handle = _ffi.get_ipc_backend().fs_snapshot(excludes, cache_dir)
+            return Snapshot(ipc_handle, _ipc=True)
 
         lib = _ffi.get_lib()
         handle = _ffi.SnapshotHandle()
@@ -861,7 +862,7 @@ class Instance:
 class Listener:
     """A network listener for accepting connections."""
 
-    def __init__(self, handle, *, _ipc: bool = False):
+    def __init__(self, handle: Any, *, _ipc: bool = False) -> None:
         self._handle = handle
         self._closed = False
         self._ipc = _ipc
@@ -872,7 +873,7 @@ class Listener:
     def __enter__(self) -> "Listener":
         return self
 
-    def __exit__(self, *args) -> None:
+    def __exit__(self, *args: Any) -> None:
         self.close()
 
     def close(self) -> None:
@@ -902,8 +903,8 @@ class Listener:
         if self._closed:
             raise CCError("Listener is closed", code=4)
         if self._ipc:
-            handle = _ffi.get_ipc_backend().listener_accept(self._handle)
-            return Conn(handle, _ipc=True)
+            ipc_handle = _ffi.get_ipc_backend().listener_accept(self._handle)
+            return Conn(ipc_handle, _ipc=True)
 
         lib = _ffi.get_lib()
         handle = _ffi.ConnHandle()
@@ -916,7 +917,7 @@ class Listener:
 class Conn:
     """A network connection."""
 
-    def __init__(self, handle, *, _ipc: bool = False):
+    def __init__(self, handle: Any, *, _ipc: bool = False) -> None:
         self._handle = handle
         self._closed = False
         self._ipc = _ipc
@@ -927,7 +928,7 @@ class Conn:
     def __enter__(self) -> "Conn":
         return self
 
-    def __exit__(self, *args) -> None:
+    def __exit__(self, *args: Any) -> None:
         self.close()
 
     def close(self) -> None:

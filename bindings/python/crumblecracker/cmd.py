@@ -5,13 +5,13 @@ Command execution for VM instances.
 from __future__ import annotations
 
 from ctypes import POINTER, byref, c_char_p, c_int, c_size_t, c_uint8, c_void_p, cast
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from . import _ffi
 from .errors import CCError
 
 if TYPE_CHECKING:
-    from .instance import Instance
+    from .instance import Conn, Instance
 
 
 class Cmd:
@@ -50,7 +50,7 @@ class Cmd:
 
         if self._ipc:
             backend = _ffi.get_ipc_backend()
-            self._handle = backend.cmd_new(name, args)
+            self._handle: Any = backend.cmd_new(name, args)
             return
 
         lib = _ffi.get_lib()
@@ -116,7 +116,7 @@ class Cmd:
             self._freed = True
 
     @property
-    def handle(self) -> _ffi.CmdHandle:
+    def handle(self) -> Any:
         """Get the underlying handle."""
         if self._freed:
             raise CCError("Cmd has been freed", code=4)
@@ -216,6 +216,81 @@ class Cmd:
             lib.cc_free_bytes(cast(env_ptr, POINTER(c_uint8)))
 
         return result
+
+    def stdout_pipe(self) -> "Conn":
+        """Get a pipe connected to the command's stdout.
+
+        Must be called before start(). Returns a Conn that can be read from
+        while the command is running.
+
+        Returns:
+            A Conn object for reading stdout data.
+        """
+        from .instance import Conn
+
+        if self._started:
+            raise CCError("Cmd has already been started", code=2)
+
+        if self._ipc:
+            handle = _ffi.get_ipc_backend().cmd_stdout_pipe(self._handle)
+            return Conn(handle, _ipc=True)
+
+        lib = _ffi.get_lib()
+        conn_handle = _ffi.ConnHandle()
+        err = _ffi.CCErrorStruct()
+        code = lib.cc_cmd_stdout_pipe(self.handle, byref(conn_handle), byref(err))
+        _ffi.check_error(code, err)
+        return Conn(conn_handle, _ipc=False)
+
+    def stderr_pipe(self) -> "Conn":
+        """Get a pipe connected to the command's stderr.
+
+        Must be called before start(). Returns a Conn that can be read from
+        while the command is running.
+
+        Returns:
+            A Conn object for reading stderr data.
+        """
+        from .instance import Conn
+
+        if self._started:
+            raise CCError("Cmd has already been started", code=2)
+
+        if self._ipc:
+            handle = _ffi.get_ipc_backend().cmd_stderr_pipe(self._handle)
+            return Conn(handle, _ipc=True)
+
+        lib = _ffi.get_lib()
+        conn_handle = _ffi.ConnHandle()
+        err = _ffi.CCErrorStruct()
+        code = lib.cc_cmd_stderr_pipe(self.handle, byref(conn_handle), byref(err))
+        _ffi.check_error(code, err)
+        return Conn(conn_handle, _ipc=False)
+
+    def stdin_pipe(self) -> "Conn":
+        """Get a pipe connected to the command's stdin.
+
+        Must be called before start(). Returns a Conn that can be written to
+        while the command is running. Close the Conn to signal EOF.
+
+        Returns:
+            A Conn object for writing stdin data.
+        """
+        from .instance import Conn
+
+        if self._started:
+            raise CCError("Cmd has already been started", code=2)
+
+        if self._ipc:
+            handle = _ffi.get_ipc_backend().cmd_stdin_pipe(self._handle)
+            return Conn(handle, _ipc=True)
+
+        lib = _ffi.get_lib()
+        conn_handle = _ffi.ConnHandle()
+        err = _ffi.CCErrorStruct()
+        code = lib.cc_cmd_stdin_pipe(self.handle, byref(conn_handle), byref(err))
+        _ffi.check_error(code, err)
+        return Conn(conn_handle, _ipc=False)
 
     def start(self) -> None:
         """Start the command (non-blocking).
@@ -342,7 +417,7 @@ class Cmd:
         """Get the exit code (after wait/run)."""
         if self._ipc:
             return _ffi.get_ipc_backend().cmd_exit_code(self._handle)
-        return _ffi.get_lib().cc_cmd_exit_code(self.handle)
+        return int(_ffi.get_lib().cc_cmd_exit_code(self.handle))
 
     def kill(self) -> None:
         """Kill a started command and release resources.

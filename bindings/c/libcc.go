@@ -193,6 +193,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"runtime"
@@ -1991,6 +1992,119 @@ func cc_cmd_kill(cmd C.cc_cmd, cErr *C.cc_error) C.cc_error_code {
 		return setInvalidHandle(cErr, "cmd")
 	}
 	// TODO: Actually kill the running command if possible
+	C.clear_error(cErr)
+	return C.CC_OK
+}
+
+// pipeConn wraps an io.ReadCloser or io.WriteCloser to satisfy net.Conn interface.
+// Only the relevant Read/Write/Close methods work; others return errors.
+type pipeConn struct {
+	reader io.ReadCloser
+	writer io.WriteCloser
+}
+
+func (p *pipeConn) Read(b []byte) (int, error) {
+	if p.reader != nil {
+		return p.reader.Read(b)
+	}
+	return 0, fmt.Errorf("not readable")
+}
+
+func (p *pipeConn) Write(b []byte) (int, error) {
+	if p.writer != nil {
+		return p.writer.Write(b)
+	}
+	return 0, fmt.Errorf("not writable")
+}
+
+func (p *pipeConn) Close() error {
+	if p.reader != nil {
+		return p.reader.Close()
+	}
+	if p.writer != nil {
+		return p.writer.Close()
+	}
+	return nil
+}
+
+func (p *pipeConn) LocalAddr() net.Addr                { return pipeAddr{} }
+func (p *pipeConn) RemoteAddr() net.Addr               { return pipeAddr{} }
+func (p *pipeConn) SetDeadline(t time.Time) error      { return nil }
+func (p *pipeConn) SetReadDeadline(t time.Time) error  { return nil }
+func (p *pipeConn) SetWriteDeadline(t time.Time) error { return nil }
+
+type pipeAddr struct{}
+
+func (pipeAddr) Network() string { return "pipe" }
+func (pipeAddr) String() string  { return "pipe" }
+
+var _ net.Conn = (*pipeConn)(nil)
+
+//export cc_cmd_stdout_pipe
+func cc_cmd_stdout_pipe(cmd C.cc_cmd, out *C.cc_conn, cErr *C.cc_error) C.cc_error_code {
+	c, ok := getHandleTyped[cc.Cmd](uint64(cmd._h))
+	if !ok {
+		return setInvalidHandle(cErr, "cmd")
+	}
+	if out == nil {
+		return setInvalidArgument(cErr, "out is NULL")
+	}
+
+	reader, err := c.StdoutPipe()
+	if err != nil {
+		return setError(err, cErr)
+	}
+
+	conn := &pipeConn{reader: reader}
+	h := newHandle(net.Conn(conn))
+	out._h = C.uint64_t(h)
+
+	C.clear_error(cErr)
+	return C.CC_OK
+}
+
+//export cc_cmd_stderr_pipe
+func cc_cmd_stderr_pipe(cmd C.cc_cmd, out *C.cc_conn, cErr *C.cc_error) C.cc_error_code {
+	c, ok := getHandleTyped[cc.Cmd](uint64(cmd._h))
+	if !ok {
+		return setInvalidHandle(cErr, "cmd")
+	}
+	if out == nil {
+		return setInvalidArgument(cErr, "out is NULL")
+	}
+
+	reader, err := c.StderrPipe()
+	if err != nil {
+		return setError(err, cErr)
+	}
+
+	conn := &pipeConn{reader: reader}
+	h := newHandle(net.Conn(conn))
+	out._h = C.uint64_t(h)
+
+	C.clear_error(cErr)
+	return C.CC_OK
+}
+
+//export cc_cmd_stdin_pipe
+func cc_cmd_stdin_pipe(cmd C.cc_cmd, out *C.cc_conn, cErr *C.cc_error) C.cc_error_code {
+	c, ok := getHandleTyped[cc.Cmd](uint64(cmd._h))
+	if !ok {
+		return setInvalidHandle(cErr, "cmd")
+	}
+	if out == nil {
+		return setInvalidArgument(cErr, "out is NULL")
+	}
+
+	writer, err := c.StdinPipe()
+	if err != nil {
+		return setError(err, cErr)
+	}
+
+	conn := &pipeConn{writer: writer}
+	h := newHandle(net.Conn(conn))
+	out._h = C.uint64_t(h)
+
 	C.clear_error(cErr)
 	return C.CC_OK
 }

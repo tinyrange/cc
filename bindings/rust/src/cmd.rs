@@ -4,7 +4,8 @@ use std::ffi::{CStr, CString};
 use std::ptr;
 
 use crate::error::{Error, Result};
-use crate::ffi::{self, check_error, CcCmd, CcInstance};
+use crate::ffi::{self, check_error, CcCmd, CcConn, CcInstance};
+use crate::net::Conn;
 use crate::types::CommandOutput;
 
 /// A command to run in a VM instance.
@@ -168,6 +169,66 @@ impl Cmd {
             }
 
             Ok(result)
+        }
+    }
+
+    /// Get a pipe connected to the command's stdout.
+    ///
+    /// Must be called before [`start()`](Self::start). Returns a [`Conn`] that
+    /// implements [`std::io::Read`] semantics via its `read()` method.
+    pub fn stdout_pipe(&mut self) -> Result<Conn> {
+        if self.started {
+            return Err(Error::InvalidArgument("command already started".to_string()));
+        }
+
+        unsafe {
+            let mut conn = CcConn::invalid();
+            let mut err = ffi::CcError::default();
+
+            let code = ffi::cc_cmd_stdout_pipe(self.handle, &mut conn, &mut err);
+            check_error(code, &mut err)?;
+
+            Ok(Conn::from_handle(conn))
+        }
+    }
+
+    /// Get a pipe connected to the command's stderr.
+    ///
+    /// Must be called before [`start()`](Self::start). Returns a [`Conn`] that
+    /// implements [`std::io::Read`] semantics via its `read()` method.
+    pub fn stderr_pipe(&mut self) -> Result<Conn> {
+        if self.started {
+            return Err(Error::InvalidArgument("command already started".to_string()));
+        }
+
+        unsafe {
+            let mut conn = CcConn::invalid();
+            let mut err = ffi::CcError::default();
+
+            let code = ffi::cc_cmd_stderr_pipe(self.handle, &mut conn, &mut err);
+            check_error(code, &mut err)?;
+
+            Ok(Conn::from_handle(conn))
+        }
+    }
+
+    /// Get a pipe connected to the command's stdin.
+    ///
+    /// Must be called before [`start()`](Self::start). Returns a [`Conn`] that
+    /// can be written to. Close the [`Conn`] to signal EOF.
+    pub fn stdin_pipe(&mut self) -> Result<Conn> {
+        if self.started {
+            return Err(Error::InvalidArgument("command already started".to_string()));
+        }
+
+        unsafe {
+            let mut conn = CcConn::invalid();
+            let mut err = ffi::CcError::default();
+
+            let code = ffi::cc_cmd_stdin_pipe(self.handle, &mut conn, &mut err);
+            check_error(code, &mut err)?;
+
+            Ok(Conn::from_handle(conn))
         }
     }
 

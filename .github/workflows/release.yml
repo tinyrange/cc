@@ -62,8 +62,8 @@ jobs:
           fi
           xcrun stapler staple build/CrumbleCracker.app
           xcrun stapler validate build/CrumbleCracker.app
-          codesign -d --verbose=4 build/CrumbleCracker.app | grep runtime
-          spctl --assess --type exec -v build/CrumbleCracker.app
+          codesign -d --verbose=4 build/CrumbleCracker.app 2>&1 | grep runtime
+          spctl --assess --type exec -v build/CrumbleCracker.app 2>&1
           rm -f build/CrumbleCracker_notary.zip
 
       - name: Create zip for release

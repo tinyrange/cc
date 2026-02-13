@@ -10,7 +10,7 @@ with a 4-byte big-endian length.
 from __future__ import annotations
 
 import struct
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .errors import error_from_code
 
@@ -80,6 +80,10 @@ MSG_CMD_OUTPUT = 0x040A
 MSG_CMD_COMBINED_OUTPUT = 0x040B
 MSG_CMD_EXIT_CODE = 0x040C
 MSG_CMD_KILL = 0x040D
+MSG_CMD_STDOUT_PIPE = 0x040E
+MSG_CMD_STDERR_PIPE = 0x040F
+MSG_CMD_STDIN_PIPE = 0x0410
+MSG_CMD_RUN_STREAMING = 0x0411
 
 # Network operations (0x05xx)
 MSG_NET_LISTEN = 0x0500
@@ -104,6 +108,8 @@ MSG_BUILD_DOCKERFILE = 0x0700
 # Response types (0xFFxx)
 MSG_RESPONSE = 0xFF00
 MSG_ERROR = 0xFF01
+MSG_STREAM_CHUNK = 0xFF02
+MSG_STREAM_END = 0xFF03
 
 # Error codes
 ERR_CODE_OK = 0
@@ -149,7 +155,7 @@ class Encoder:
         self._parts.append(struct.pack("!q", v))
         return self
 
-    def bool(self, v: bool) -> "Encoder":
+    def encode_bool(self, v: bool) -> "Encoder":
         self._parts.append(b"\x01" if v else b"\x00")
         return self
 
@@ -173,7 +179,7 @@ class Encoder:
     def mount_config(self, tag: str, host_path: str, writable: bool) -> "Encoder":
         self.string(tag)
         self.string(host_path)
-        self.bool(writable)
+        self.encode_bool(writable)
         return self
 
     def instance_options(
@@ -191,7 +197,7 @@ class Encoder:
         timeout_nanos = int(timeout_seconds * 1e9)
         self.uint64(timeout_nanos)
         self.string(user)
-        self.bool(enable_dmesg)
+        self.encode_bool(enable_dmesg)
         self.uint32(len(mounts))
         for tag, host_path, writable in mounts:
             self.mount_config(tag, host_path, writable)
@@ -245,39 +251,39 @@ class Decoder:
         self._check(1)
         (v,) = struct.unpack_from("!B", self._buf, self._pos)
         self._pos += 1
-        return v
+        return int(v)
 
     def uint16(self) -> int:
         self._check(2)
         (v,) = struct.unpack_from("!H", self._buf, self._pos)
         self._pos += 2
-        return v
+        return int(v)
 
     def uint32(self) -> int:
         self._check(4)
         (v,) = struct.unpack_from("!I", self._buf, self._pos)
         self._pos += 4
-        return v
+        return int(v)
 
     def uint64(self) -> int:
         self._check(8)
         (v,) = struct.unpack_from("!Q", self._buf, self._pos)
         self._pos += 8
-        return v
+        return int(v)
 
     def int32(self) -> int:
         self._check(4)
         (v,) = struct.unpack_from("!i", self._buf, self._pos)
         self._pos += 4
-        return v
+        return int(v)
 
     def int64(self) -> int:
         self._check(8)
         (v,) = struct.unpack_from("!q", self._buf, self._pos)
         self._pos += 8
-        return v
+        return int(v)
 
-    def bool(self) -> bool:
+    def decode_bool(self) -> bool:
         return self.uint8() != 0
 
     def string(self) -> str:
@@ -298,20 +304,20 @@ class Decoder:
         count = self.uint32()
         return [self.string() for _ in range(count)]
 
-    def file_info(self) -> dict:
+    def file_info(self) -> dict[str, Any]:
         return {
             "name": self.string(),
             "size": self.int64(),
             "mode": self.uint32(),
             "mod_time_unix": self.int64(),
-            "is_dir": self.bool(),
-            "is_symlink": self.bool(),
+            "is_dir": self.decode_bool(),
+            "is_symlink": self.decode_bool(),
         }
 
-    def dir_entry(self) -> dict:
+    def dir_entry(self) -> dict[str, Any]:
         return {
             "name": self.string(),
-            "is_dir": self.bool(),
+            "is_dir": self.decode_bool(),
             "mode": self.uint32(),
         }
 

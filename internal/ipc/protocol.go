@@ -69,6 +69,10 @@ const (
 	MsgCmdCombinedOutput uint16 = 0x040B
 	MsgCmdExitCode       uint16 = 0x040C
 	MsgCmdKill           uint16 = 0x040D
+	MsgCmdStdoutPipe     uint16 = 0x040E
+	MsgCmdStderrPipe     uint16 = 0x040F
+	MsgCmdStdinPipe      uint16 = 0x0410
+	MsgCmdRunStreaming   uint16 = 0x0411
 
 	// Network operations (0x05xx)
 	MsgNetListen      uint16 = 0x0500
@@ -91,8 +95,10 @@ const (
 	MsgBuildDockerfile uint16 = 0x0700
 
 	// Response types (0xFFxx)
-	MsgResponse uint16 = 0xFF00
-	MsgError    uint16 = 0xFF01
+	MsgResponse    uint16 = 0xFF00
+	MsgError       uint16 = 0xFF01
+	MsgStreamChunk uint16 = 0xFF02 // Streaming output chunk (server→client)
+	MsgStreamEnd   uint16 = 0xFF03 // End of streaming output (server→client)
 )
 
 // Wire format:

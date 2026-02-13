@@ -201,6 +201,21 @@ let mut cmd = inst.command("sleep", &["10"])?;
 cmd.start()?;
 // ... do other work ...
 let exit_code = cmd.wait()?;
+
+// Streaming I/O with pipes
+let mut cmd = inst.command("cat", &[])?;
+let mut stdin = cmd.stdin_pipe()?;    // Returns Conn (writable)
+let mut stdout = cmd.stdout_pipe()?;  // Returns Conn (readable)
+let mut stderr = cmd.stderr_pipe()?;  // Returns Conn (readable)
+cmd.start()?;
+
+stdin.write(b"hello")?;
+stdin.close()?;                       // Close to signal EOF
+
+let mut buf = [0u8; 256];
+let n = stdout.read(&mut buf)?;       // Read output incrementally
+stdout.close()?;
+cmd.wait()?;
 ```
 
 #### `File`

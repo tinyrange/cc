@@ -26,8 +26,8 @@ func Main() {
 	mux := ipc.NewMux()
 	helper.RegisterHandlers(mux)
 
-	// Create server
-	server, err := ipc.NewServer(*socketPath, mux.Handler())
+	// Create server with mux (enables streaming handler support)
+	server, err := ipc.NewServerWithMux(*socketPath, mux)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "cc-helper: failed to create server: %v\n", err)
 		os.Exit(1)

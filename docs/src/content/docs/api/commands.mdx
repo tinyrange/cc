@@ -441,7 +441,7 @@ cc_cmd_output(cmd, &output, &len, &exit_code, &err);
 
 ### Setting Stdout/Stderr
 
-Redirect output to writers (Go specific, other languages capture output via methods):
+Redirect output to writers. In Go, output streams to the writer in real time as the command produces it. Other languages use pipes for the same effect.
 
 <LanguageTabs>
   <LangTabItem lang="go">
@@ -458,33 +458,40 @@ fmt.Println("stderr:", stderr.String())
   </LangTabItem>
   <LangTabItem lang="python">
 ```python
-# Use combined_output() or output() to capture
+# Use combined_output() for buffered capture
 output = inst.command("sh", "-c", "echo out; echo err >&2").combined_output()
+
+# Or use pipes for streaming (see Pipes section below)
 ```
   </LangTabItem>
   <LangTabItem lang="rust">
 ```rust
-// Use combined_output() or output() to capture
+// Use combined_output() for buffered capture
 let output = inst.command("sh", &["-c", "echo out; echo err >&2"])?.combined_output()?;
+
+// Or use pipes for streaming (see Pipes section below)
 ```
   </LangTabItem>
   <LangTabItem lang="typescript">
 ```typescript
-// Use combinedOutput() or output() to capture
+// Use combinedOutput() for buffered capture
 const cmd = await inst.command('sh', '-c', 'echo out; echo err >&2');
 const output = await cmd.combinedOutput();
+
+// Or use pipes for streaming (see Pipes section below)
 ```
   </LangTabItem>
   <LangTabItem lang="c">
 ```c
-// Use cc_cmd_combined_output() or cc_cmd_output() to capture
+// Use cc_cmd_combined_output() for buffered capture
+// Or use pipes for streaming (see Pipes section below)
 ```
   </LangTabItem>
 </LanguageTabs>
 
 ### Pipes
 
-Get pipes for streaming I/O. This Go-specific feature provides fine-grained control over command I/O through `io.Reader` and `io.Writer` interfaces. For other languages, use `set_stdin()` before running the command and capture output via `output()` or `combined_output()`.
+Get pipes for streaming I/O. Pipes provide fine-grained control over command input and output, allowing you to read stdout/stderr incrementally and write to stdin while the command is running. Pipe methods must be called before `Start()`.
 
 <LanguageTabs>
   <LangTabItem lang="go">
@@ -520,31 +527,155 @@ cmd.Wait()
   </LangTabItem>
   <LangTabItem lang="python">
 ```python
-# For streaming I/O, use start() and write to stdin before wait()
 cmd = inst.command("cat")
-cmd.set_stdin(b"hello")
-output = cmd.output()
+
+stdin = cmd.stdin_pipe()
+stdout = cmd.stdout_pipe()
+cmd.start()
+
+# Write to stdin and close to signal EOF
+stdin.write(b"hello")
+stdin.close()
+
+# Read from stdout
+data = stdout.read(256)
+print(data)  # b"hello"
+
+stdout.close()
+cmd.wait()
 ```
   </LangTabItem>
   <LangTabItem lang="rust">
 ```rust
-// For streaming I/O, use start() and write stdin before wait()
 let mut cmd = inst.command("cat", &[])?;
-cmd.set_stdin(b"hello")?;
-let output = cmd.output()?;
+
+let mut stdin = cmd.stdin_pipe()?;
+let mut stdout = cmd.stdout_pipe()?;
+cmd.start()?;
+
+// Write to stdin and close to signal EOF
+stdin.write(b"hello")?;
+stdin.close()?;
+
+// Read from stdout
+let mut buf = [0u8; 256];
+let n = stdout.read(&mut buf)?;
+println!("{}", String::from_utf8_lossy(&buf[..n]));
+
+stdout.close()?;
+cmd.wait()?;
 ```
   </LangTabItem>
   <LangTabItem lang="typescript">
 ```typescript
-// For streaming I/O, use start() and write stdin before wait()
 const cmd = await inst.command('cat');
-await cmd.setStdin(Buffer.from('hello'));
-const output = await cmd.output();
+
+const stdin = await cmd.stdinPipe();
+const stdout = await cmd.stdoutPipe();
+await cmd.start();
+
+// Write to stdin and close to signal EOF
+await stdin.write(Buffer.from('hello'));
+await stdin.close();
+
+// Read from stdout
+const data = await stdout.read(256);
+console.log(data.toString()); // "hello"
+
+await stdout.close();
+await cmd.wait();
 ```
   </LangTabItem>
   <LangTabItem lang="c">
 ```c
-// Use cc_cmd_set_stdin for input before running
+const char* args[] = {NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "cat", args, &cmd, &err);
+
+cc_conn stdin_pipe, stdout_pipe;
+cc_cmd_stdin_pipe(cmd, &stdin_pipe, &err);
+cc_cmd_stdout_pipe(cmd, &stdout_pipe, &err);
+cc_cmd_start(cmd, &err);
+
+// Write to stdin and close to signal EOF
+cc_conn_write(stdin_pipe, (const uint8_t*)"hello", 5, &written, &err);
+cc_conn_close(stdin_pipe, &err);
+
+// Read from stdout
+uint8_t buf[256];
+size_t n;
+cc_conn_read(stdout_pipe, buf, sizeof(buf), &n, &err);
+
+cc_conn_close(stdout_pipe, &err);
+int exit_code;
+cc_cmd_wait(cmd, &exit_code, &err);
+```
+  </LangTabItem>
+</LanguageTabs>
+
+#### Stderr Pipe
+
+Read stderr separately from stdout:
+
+<LanguageTabs>
+  <LangTabItem lang="go">
+```go
+cmd := instance.Command("sh", "-c", "echo err >&2")
+stderr, err := cmd.StderrPipe()
+if err != nil {
+    return err
+}
+cmd.Start()
+data, _ := io.ReadAll(stderr)
+cmd.Wait()
+fmt.Println(string(data)) // "err\n"
+```
+  </LangTabItem>
+  <LangTabItem lang="python">
+```python
+cmd = inst.command("sh", "-c", "echo err >&2")
+stderr = cmd.stderr_pipe()
+cmd.start()
+data = stderr.read(256)
+stderr.close()
+cmd.wait()
+```
+  </LangTabItem>
+  <LangTabItem lang="rust">
+```rust
+let mut cmd = inst.command("sh", &["-c", "echo err >&2"])?;
+let mut stderr = cmd.stderr_pipe()?;
+cmd.start()?;
+let mut buf = [0u8; 256];
+let n = stderr.read(&mut buf)?;
+stderr.close()?;
+cmd.wait()?;
+```
+  </LangTabItem>
+  <LangTabItem lang="typescript">
+```typescript
+const cmd = await inst.command('sh', '-c', 'echo err >&2');
+const stderr = await cmd.stderrPipe();
+await cmd.start();
+const data = await stderr.read(256);
+await stderr.close();
+await cmd.wait();
+```
+  </LangTabItem>
+  <LangTabItem lang="c">
+```c
+const char* args[] = {"-c", "echo err >&2", NULL};
+cc_cmd cmd;
+cc_cmd_new(inst, "sh", args, &cmd, &err);
+cc_conn stderr_pipe;
+cc_cmd_stderr_pipe(cmd, &stderr_pipe, &err);
+cc_cmd_start(cmd, &err);
+uint8_t buf[256];
+size_t n;
+cc_conn_read(stderr_pipe, buf, sizeof(buf), &n, &err);
+cc_conn_close(stderr_pipe, &err);
+int exit_code;
+cc_cmd_wait(cmd, &exit_code, &err);
 ```
   </LangTabItem>
 </LanguageTabs>
