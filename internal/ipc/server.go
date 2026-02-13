@@ -212,14 +212,7 @@ type StreamWriter struct {
 
 // WriteChunk sends a streaming output chunk to the client.
 // streamType: 1=stdout, 2=stderr
-func (sw *StreamWriter) WriteChunk(streamType uint8, data []byte) error {
-	enc := NewEncoder()
-	enc.Uint8(streamType)
-	enc.WriteBytes(data)
-	return WriteHeader(sw.conn, Header{Type: MsgStreamChunk, Length: uint32(len(enc.Bytes()))})
-	// Note: we need to also write the payload
-}
-
+// WriteStreamChunk sends a stream chunk message with type and data.
 // WriteStreamChunk sends a stream chunk message with type and data.
 func (sw *StreamWriter) WriteStreamChunk(streamType uint8, data []byte) error {
 	enc := NewEncoder()
