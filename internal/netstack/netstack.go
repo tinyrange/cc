@@ -560,7 +560,11 @@ func (nic *NetworkInterface) DeliverGuestPacket(
 
 // sendFrame transmits a frame back to the guest via the backend.
 func (nic *NetworkInterface) sendFrame(frame []byte) error {
-	if nic.backend == nil {
+	// Snapshot the backend function pointer once to avoid a TOCTOU race:
+	// Close() can nil out nic.backend from another goroutine between our
+	// nil check and the call.
+	fn := nic.backend
+	if fn == nil {
 		debug.Writef("netstack.sendFrame(nic) drop backend=nil", "len=%d", len(frame))
 		return fmt.Errorf("virtio backend not attached")
 	}
@@ -580,7 +584,7 @@ func (nic *NetworkInterface) sendFrame(frame []byte) error {
 	// Ownership/lifetime: `frame` is only valid for the duration of this call.
 	// Backends must not retain the slice; if they need to keep it (e.g. queue
 	// asynchronously), they must make their own copy.
-	return nic.backend(frame)
+	return fn(frame)
 }
 
 // sendFrame transmits a prebuilt Ethernet frame to the attached NIC backend.
