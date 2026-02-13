@@ -5,6 +5,8 @@ This module provides direct bindings to the C API. Users should prefer
 the higher-level wrapper classes in the other modules.
 """
 
+from __future__ import annotations
+
 import ctypes
 import ctypes.util
 import os
@@ -26,9 +28,12 @@ from ctypes import (
     c_uint64,
     c_void_p,
 )
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .errors import CCError, HypervisorUnavailableError, error_from_code
+
+if TYPE_CHECKING:
+    from ._ipc_backend import IPCBackend
 
 # ==========================================================================
 # Library loading
@@ -93,7 +98,7 @@ def _find_library() -> str:
 _lib: Any = None
 
 # IPC backend instance (used when ctypes/libcc is unavailable)
-_ipc_backend = None
+_ipc_backend: IPCBackend | None = None
 _use_ipc: bool | None = None  # None = auto-detect
 
 
@@ -119,12 +124,12 @@ def _should_use_ipc() -> bool:
         return True
 
 
-def get_ipc_backend():
+def get_ipc_backend() -> IPCBackend:
     """Get the IPC backend instance, creating it if necessary."""
     global _ipc_backend
     if _ipc_backend is None:
-        from ._ipc_backend import IPCBackend
-        _ipc_backend = IPCBackend()
+        from ._ipc_backend import IPCBackend as _IPCBackend
+        _ipc_backend = _IPCBackend()
     return _ipc_backend
 
 
@@ -158,7 +163,7 @@ class Handle(Structure):
     _fields_ = [("_h", c_uint64)]
 
     def __bool__(self) -> bool:
-        return self._h != 0
+        return bool(self._h != 0)
 
     @classmethod
     def invalid(cls) -> "Handle":
@@ -748,7 +753,7 @@ def _setup_functions(lib: Any) -> None:
 # ==========================================================================
 
 
-def _get_string_and_free(lib, ptr: int) -> str:
+def _get_string_and_free(lib: Any, ptr: int) -> str:
     """Extract string from a c_void_p pointer and free it.
 
     This is needed because ctypes converts c_char_p return values to Python bytes,
@@ -757,7 +762,7 @@ def _get_string_and_free(lib, ptr: int) -> str:
     if not ptr:
         return ""
     value = ctypes.cast(ptr, c_char_p).value
-    result = value.decode("utf-8") if value else ""
+    result = value.decode("utf-8") if value is not None else ""
     lib.cc_free_string(ptr)
     return result
 
@@ -777,7 +782,8 @@ def api_version() -> str:
     ptr = lib.cc_api_version()
     if not ptr:
         return ""
-    version = ctypes.cast(ptr, c_char_p).value.decode("utf-8")
+    raw = ctypes.cast(ptr, c_char_p).value
+    version = raw.decode("utf-8") if raw is not None else ""
     lib.cc_free_string(ptr)
     return version
 
@@ -830,7 +836,7 @@ def guest_protocol_version() -> int:
     """Get the guest protocol version supported by this library."""
     if _should_use_ipc():
         return 0  # Not available via IPC
-    return _get_lib().cc_guest_protocol_version()
+    return int(_get_lib().cc_guest_protocol_version())
 
 
 # Convenience function to get the library for use in other modules

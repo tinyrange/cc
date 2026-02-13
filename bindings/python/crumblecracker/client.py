@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import POINTER, byref, c_char_p
+from typing import TYPE_CHECKING, Any
 
 from . import _ffi
 from .errors import CCError
@@ -16,6 +17,9 @@ from .types import (
     PullOptions,
     PullPolicy,
 )
+
+if TYPE_CHECKING:
+    from .instance import Snapshot
 
 
 class InstanceSource:
@@ -29,8 +33,8 @@ class InstanceSource:
     source on the helper side (source_type, source_path, image_ref, cache_dir).
     """
 
-    def __init__(self, handle=None, *, ipc_source_type: int = 0, ipc_source_path: str = "",
-                 ipc_image_ref: str = "", ipc_cache_dir: str = ""):
+    def __init__(self, handle: Any = None, *, ipc_source_type: int = 0, ipc_source_path: str = "",
+                 ipc_image_ref: str = "", ipc_cache_dir: str = "") -> None:
         self._handle = handle
         self._closed = False
         # IPC backend metadata
@@ -45,7 +49,7 @@ class InstanceSource:
     def __enter__(self) -> "InstanceSource":
         return self
 
-    def __exit__(self, *args) -> None:
+    def __exit__(self, *args: Any) -> None:
         self.close()
 
     def close(self) -> None:
@@ -56,7 +60,7 @@ class InstanceSource:
             self._closed = True
 
     @property
-    def handle(self):
+    def handle(self) -> Any:
         """Get the underlying handle."""
         if self._closed:
             raise CCError("InstanceSource is closed", code=4)
@@ -158,7 +162,7 @@ class OCIClient:
     def __enter__(self) -> "OCIClient":
         return self
 
-    def __exit__(self, *args) -> None:
+    def __exit__(self, *args: Any) -> None:
         self.close()
 
     def close(self) -> None:
@@ -169,7 +173,7 @@ class OCIClient:
             self._closed = True
 
     @property
-    def handle(self):
+    def handle(self) -> Any:
         """Get the underlying handle."""
         if self._closed:
             raise CCError("OCIClient is closed", code=4)
@@ -234,7 +238,7 @@ class OCIClient:
         c_callback = _ffi.ProgressCallbackType()  # Creates a null function pointer
         if progress_callback:
 
-            def _progress_wrapper(progress_ptr, user_data):
+            def _progress_wrapper(progress_ptr: Any, user_data: Any) -> None:
                 p = progress_ptr.contents
                 progress = DownloadProgress(
                     current=p.current,
@@ -468,11 +472,11 @@ class CancelToken:
         token.cancel()
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._freed = False
         self._cancelled = False
         if _ffi.using_ipc():
-            self._handle = None
+            self._handle: Any = None
             return
         self._handle = _ffi.get_lib().cc_cancel_token_new()
 
@@ -482,7 +486,7 @@ class CancelToken:
     def __enter__(self) -> "CancelToken":
         return self
 
-    def __exit__(self, *args) -> None:
+    def __exit__(self, *args: Any) -> None:
         self.close()
 
     def close(self) -> None:
@@ -493,7 +497,7 @@ class CancelToken:
             self._freed = True
 
     @property
-    def handle(self):
+    def handle(self) -> Any:
         """Get the underlying handle."""
         return self._handle
 

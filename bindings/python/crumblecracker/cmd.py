@@ -5,7 +5,7 @@ Command execution for VM instances.
 from __future__ import annotations
 
 from ctypes import POINTER, byref, c_char_p, c_int, c_size_t, c_uint8, c_void_p, cast
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from . import _ffi
 from .errors import CCError
@@ -50,7 +50,7 @@ class Cmd:
 
         if self._ipc:
             backend = _ffi.get_ipc_backend()
-            self._handle = backend.cmd_new(name, args)
+            self._handle: Any = backend.cmd_new(name, args)
             return
 
         lib = _ffi.get_lib()
@@ -116,7 +116,7 @@ class Cmd:
             self._freed = True
 
     @property
-    def handle(self) -> _ffi.CmdHandle:
+    def handle(self) -> Any:
         """Get the underlying handle."""
         if self._freed:
             raise CCError("Cmd has been freed", code=4)
@@ -417,7 +417,7 @@ class Cmd:
         """Get the exit code (after wait/run)."""
         if self._ipc:
             return _ffi.get_ipc_backend().cmd_exit_code(self._handle)
-        return _ffi.get_lib().cc_cmd_exit_code(self.handle)
+        return int(_ffi.get_lib().cc_cmd_exit_code(self.handle))
 
     def kill(self) -> None:
         """Kill a started command and release resources.

@@ -158,7 +158,7 @@ class IPCBackend:
         resp = self.client.call(MSG_INSTANCE_IS_RUNNING)
         dec = Decoder(resp)
         _check_error(dec)
-        return dec.bool()
+        return dec.decode_bool()
 
     def instance_set_console(self, cols: int, rows: int) -> None:
         enc = Encoder()
@@ -170,7 +170,7 @@ class IPCBackend:
 
     def instance_set_network(self, enabled: bool) -> None:
         enc = Encoder()
-        enc.bool(enabled)
+        enc.encode_bool(enabled)
         resp = self.client.call(MSG_INSTANCE_SET_NETWORK, enc.get_bytes())
         dec = Decoder(resp)
         _check_error(dec)

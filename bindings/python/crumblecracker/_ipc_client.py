@@ -15,15 +15,18 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from threading import Lock
+from typing import Any
 
 from .errors import CCError, error_from_code
 from ._ipc_protocol import (
     HEADER_SIZE,
     MSG_ERROR,
+    Decoder,
+    Encoder,
     decode_header,
     encode_header,
-    Decoder,
 )
 
 
@@ -131,7 +134,7 @@ def _next_socket_path() -> str:
 class IPCClient:
     """Synchronous IPC client for communicating with cc-helper."""
 
-    def __init__(self, sock: socket.socket, socket_path: str, process: subprocess.Popen | None = None):
+    def __init__(self, sock: socket.socket, socket_path: str, process: subprocess.Popen[bytes] | None = None):
         self._sock = sock
         self._socket_path = socket_path
         self._process = process
@@ -167,7 +170,7 @@ class IPCClient:
 
             return resp_payload
 
-    def call_with_encoder(self, msg_type: int, encode_fn) -> bytes:
+    def call_with_encoder(self, msg_type: int, encode_fn: Callable[["Encoder"], None]) -> bytes:
         """Convenience: call using an Encoder callback."""
         from ._ipc_protocol import Encoder
 
@@ -219,7 +222,7 @@ class IPCClient:
     def __enter__(self) -> "IPCClient":
         return self
 
-    def __exit__(self, *args) -> None:
+    def __exit__(self, *args: Any) -> None:
         self.close()
 
 
@@ -253,7 +256,7 @@ def spawn_helper() -> IPCClient:
     socket_path = _next_socket_path()
 
     # Build subprocess creation kwargs
-    kwargs: dict = {
+    kwargs: dict[str, Any] = {
         "stdin": subprocess.DEVNULL,
         "stderr": sys.stderr,
         "stdout": subprocess.DEVNULL,
