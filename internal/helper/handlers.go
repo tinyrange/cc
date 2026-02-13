@@ -27,13 +27,13 @@ type Helper struct {
 	source   cc.InstanceSource
 
 	// Sub-resources tied to the instance
-	files      map[uint64]cc.File
-	cmds       map[uint64]cc.Cmd
-	listeners  map[uint64]net.Listener
-	conns      map[uint64]net.Conn
-	pipeRds    map[uint64]io.ReadCloser
-	pipeWrs    map[uint64]io.WriteCloser
-	snapshots  map[uint64]cc.FilesystemSnapshot
+	files     map[uint64]cc.File
+	cmds      map[uint64]cc.Cmd
+	listeners map[uint64]net.Listener
+	conns     map[uint64]net.Conn
+	pipeRds   map[uint64]io.ReadCloser
+	pipeWrs   map[uint64]io.WriteCloser
+	snapshots map[uint64]cc.FilesystemSnapshot
 
 	// Handle allocation
 	nextHandle atomic.Uint64
