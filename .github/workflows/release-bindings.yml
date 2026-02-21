@@ -62,7 +62,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -115,7 +115,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
       - name: Build cc-helper
@@ -155,7 +155,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
           registry-url: 'https://registry.npmjs.org'
 
       - name: Update version in package.json and dependencies
@@ -171,7 +171,7 @@ jobs:
       - name: Install and build
         working-directory: bindings/nodejs
         run: |
-          npm ci --ignore-scripts
+          npm install --ignore-scripts
           npm run build
         env:
           CC_NPM_PUBLISH: 1
