@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"io"
 	"io/fs"
 	"net"
@@ -888,17 +887,55 @@ func (c *cmdProxy) ExitCode() int {
 	return c.exitCode
 }
 
-// Pipe methods - not supported over IPC (return errors)
 func (c *cmdProxy) StdinPipe() (io.WriteCloser, error) {
-	return nil, fmt.Errorf("StdinPipe not supported over IPC")
+	enc := ipc.NewEncoder()
+	enc.Uint64(c.handle)
+	resp, err := c.client.Call(ipc.MsgCmdStdinPipe, enc.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	dec := ipc.NewDecoder(resp)
+	if ipcErr, err := ipc.DecodeError(dec); err != nil {
+		return nil, err
+	} else if ipcErr != nil {
+		return nil, ipcErr
+	}
+	pipeHandle, _ := dec.Uint64()
+	return &connProxy{client: c.client, handle: pipeHandle}, nil
 }
 
 func (c *cmdProxy) StdoutPipe() (io.ReadCloser, error) {
-	return nil, fmt.Errorf("StdoutPipe not supported over IPC")
+	enc := ipc.NewEncoder()
+	enc.Uint64(c.handle)
+	resp, err := c.client.Call(ipc.MsgCmdStdoutPipe, enc.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	dec := ipc.NewDecoder(resp)
+	if ipcErr, err := ipc.DecodeError(dec); err != nil {
+		return nil, err
+	} else if ipcErr != nil {
+		return nil, ipcErr
+	}
+	pipeHandle, _ := dec.Uint64()
+	return &connProxy{client: c.client, handle: pipeHandle}, nil
 }
 
 func (c *cmdProxy) StderrPipe() (io.ReadCloser, error) {
-	return nil, fmt.Errorf("StderrPipe not supported over IPC")
+	enc := ipc.NewEncoder()
+	enc.Uint64(c.handle)
+	resp, err := c.client.Call(ipc.MsgCmdStderrPipe, enc.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	dec := ipc.NewDecoder(resp)
+	if ipcErr, err := ipc.DecodeError(dec); err != nil {
+		return nil, err
+	} else if ipcErr != nil {
+		return nil, ipcErr
+	}
+	pipeHandle, _ := dec.Uint64()
+	return &connProxy{client: c.client, handle: pipeHandle}, nil
 }
 
 func (c *cmdProxy) SetStdin(r io.Reader) cc.Cmd {

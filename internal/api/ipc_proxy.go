@@ -691,15 +691,48 @@ func (c *cmdIPCProxy) ExitCode() int {
 }
 
 func (c *cmdIPCProxy) StdinPipe() (io.WriteCloser, error) {
-	return nil, fmt.Errorf("StdinPipe not supported over IPC")
+	enc := ipc.NewEncoder()
+	enc.Uint64(c.handle)
+	resp, err := c.client.Call(ipc.MsgCmdStdinPipe, enc.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	dec, err := decodeError(resp)
+	if err != nil {
+		return nil, err
+	}
+	pipeHandle, _ := dec.Uint64()
+	return &connIPCProxy{client: c.client, handle: pipeHandle}, nil
 }
 
 func (c *cmdIPCProxy) StdoutPipe() (io.ReadCloser, error) {
-	return nil, fmt.Errorf("StdoutPipe not supported over IPC")
+	enc := ipc.NewEncoder()
+	enc.Uint64(c.handle)
+	resp, err := c.client.Call(ipc.MsgCmdStdoutPipe, enc.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	dec, err := decodeError(resp)
+	if err != nil {
+		return nil, err
+	}
+	pipeHandle, _ := dec.Uint64()
+	return &connIPCProxy{client: c.client, handle: pipeHandle}, nil
 }
 
 func (c *cmdIPCProxy) StderrPipe() (io.ReadCloser, error) {
-	return nil, fmt.Errorf("StderrPipe not supported over IPC")
+	enc := ipc.NewEncoder()
+	enc.Uint64(c.handle)
+	resp, err := c.client.Call(ipc.MsgCmdStderrPipe, enc.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	dec, err := decodeError(resp)
+	if err != nil {
+		return nil, err
+	}
+	pipeHandle, _ := dec.Uint64()
+	return &connIPCProxy{client: c.client, handle: pipeHandle}, nil
 }
 
 func (c *cmdIPCProxy) SetStdin(_ io.Reader) Cmd  { return c }
