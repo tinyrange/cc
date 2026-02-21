@@ -1551,7 +1551,7 @@ func (h *Helper) handleCmdStdoutPipe(dec *ipc.Decoder) ([]byte, error) {
 		return nil, errorToIPC(err)
 	}
 
-	pipeHandle := h.nextHandle.Add(1)
+	pipeHandle := h.newHandle()
 	h.mu.Lock()
 	h.pipeRds[pipeHandle] = reader
 	h.mu.Unlock()
@@ -1578,7 +1578,7 @@ func (h *Helper) handleCmdStderrPipe(dec *ipc.Decoder) ([]byte, error) {
 		return nil, errorToIPC(err)
 	}
 
-	pipeHandle := h.nextHandle.Add(1)
+	pipeHandle := h.newHandle()
 	h.mu.Lock()
 	h.pipeRds[pipeHandle] = reader
 	h.mu.Unlock()
@@ -1605,7 +1605,7 @@ func (h *Helper) handleCmdStdinPipe(dec *ipc.Decoder) ([]byte, error) {
 		return nil, errorToIPC(err)
 	}
 
-	pipeHandle := h.nextHandle.Add(1)
+	pipeHandle := h.newHandle()
 	h.mu.Lock()
 	h.pipeWrs[pipeHandle] = writer
 	h.mu.Unlock()
