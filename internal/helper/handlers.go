@@ -73,6 +73,22 @@ func (h *Helper) Close() error {
 	}
 	h.conns = nil
 
+	// Close all command pipe readers
+	for _, r := range h.pipeRds {
+		if err := r.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	h.pipeRds = nil
+
+	// Close all command pipe writers
+	for _, w := range h.pipeWrs {
+		if err := w.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	h.pipeWrs = nil
+
 	// Close all listeners
 	for _, l := range h.listeners {
 		if err := l.Close(); err != nil {
@@ -1535,7 +1551,7 @@ func (h *Helper) handleCmdStdoutPipe(dec *ipc.Decoder) ([]byte, error) {
 		return nil, errorToIPC(err)
 	}
 
-	pipeHandle := h.nextHandle.Add(1)
+	pipeHandle := h.newHandle()
 	h.mu.Lock()
 	h.pipeRds[pipeHandle] = reader
 	h.mu.Unlock()
@@ -1562,7 +1578,7 @@ func (h *Helper) handleCmdStderrPipe(dec *ipc.Decoder) ([]byte, error) {
 		return nil, errorToIPC(err)
 	}
 
-	pipeHandle := h.nextHandle.Add(1)
+	pipeHandle := h.newHandle()
 	h.mu.Lock()
 	h.pipeRds[pipeHandle] = reader
 	h.mu.Unlock()
@@ -1589,7 +1605,7 @@ func (h *Helper) handleCmdStdinPipe(dec *ipc.Decoder) ([]byte, error) {
 		return nil, errorToIPC(err)
 	}
 
-	pipeHandle := h.nextHandle.Add(1)
+	pipeHandle := h.newHandle()
 	h.mu.Lock()
 	h.pipeWrs[pipeHandle] = writer
 	h.mu.Unlock()
@@ -1756,16 +1772,21 @@ func (h *Helper) handleConnRead(dec *ipc.Decoder) ([]byte, error) {
 		return nil, err
 	}
 
+	buf := make([]byte, length)
+
 	h.mu.RLock()
-	conn, ok := h.conns[handle]
+	conn, connOK := h.conns[handle]
+	pipeRd, pipeOK := h.pipeRds[handle]
 	h.mu.RUnlock()
 
-	if !ok {
+	var n int
+	if connOK {
+		n, err = conn.Read(buf)
+	} else if pipeOK {
+		n, err = pipeRd.Read(buf)
+	} else {
 		return nil, &ipc.IPCError{Code: ipc.ErrCodeInvalidHandle, Message: "invalid conn handle"}
 	}
-
-	buf := make([]byte, length)
-	n, err := conn.Read(buf)
 	if err != nil {
 		return nil, errorToIPC(err)
 	}
@@ -1784,14 +1805,18 @@ func (h *Helper) handleConnWrite(dec *ipc.Decoder) ([]byte, error) {
 	}
 
 	h.mu.RLock()
-	conn, ok := h.conns[handle]
+	conn, connOK := h.conns[handle]
+	pipeWr, pipeOK := h.pipeWrs[handle]
 	h.mu.RUnlock()
 
-	if !ok {
+	var n int
+	if connOK {
+		n, err = conn.Write(data)
+	} else if pipeOK {
+		n, err = pipeWr.Write(data)
+	} else {
 		return nil, &ipc.IPCError{Code: ipc.ErrCodeInvalidHandle, Message: "invalid conn handle"}
 	}
-
-	n, err := conn.Write(data)
 	if err != nil {
 		return nil, errorToIPC(err)
 	}
@@ -1806,18 +1831,35 @@ func (h *Helper) handleConnClose(dec *ipc.Decoder) ([]byte, error) {
 	}
 
 	h.mu.Lock()
-	conn, ok := h.conns[handle]
-	if ok {
+	conn, connOK := h.conns[handle]
+	if connOK {
 		delete(h.conns, handle)
+	}
+	pipeRd, pipeRdOK := h.pipeRds[handle]
+	if pipeRdOK {
+		delete(h.pipeRds, handle)
+	}
+	pipeWr, pipeWrOK := h.pipeWrs[handle]
+	if pipeWrOK {
+		delete(h.pipeWrs, handle)
 	}
 	h.mu.Unlock()
 
-	if !ok {
+	switch {
+	case connOK:
+		if err := conn.Close(); err != nil {
+			return nil, errorToIPC(err)
+		}
+	case pipeRdOK:
+		if err := pipeRd.Close(); err != nil {
+			return nil, errorToIPC(err)
+		}
+	case pipeWrOK:
+		if err := pipeWr.Close(); err != nil {
+			return nil, errorToIPC(err)
+		}
+	default:
 		return nil, &ipc.IPCError{Code: ipc.ErrCodeInvalidHandle, Message: "invalid conn handle"}
-	}
-
-	if err := conn.Close(); err != nil {
-		return nil, errorToIPC(err)
 	}
 
 	return ipc.NewResponseBuilder().Success().Build(), nil
@@ -1830,14 +1872,18 @@ func (h *Helper) handleConnLocalAddr(dec *ipc.Decoder) ([]byte, error) {
 	}
 
 	h.mu.RLock()
-	conn, ok := h.conns[handle]
+	conn, connOK := h.conns[handle]
+	_, pipeRdOK := h.pipeRds[handle]
+	_, pipeWrOK := h.pipeWrs[handle]
 	h.mu.RUnlock()
 
-	if !ok {
-		return nil, &ipc.IPCError{Code: ipc.ErrCodeInvalidHandle, Message: "invalid conn handle"}
+	if connOK {
+		return ipc.NewResponseBuilder().Success().String(conn.LocalAddr().String()).Build(), nil
 	}
-
-	return ipc.NewResponseBuilder().Success().String(conn.LocalAddr().String()).Build(), nil
+	if pipeRdOK || pipeWrOK {
+		return ipc.NewResponseBuilder().Success().String("pipe").Build(), nil
+	}
+	return nil, &ipc.IPCError{Code: ipc.ErrCodeInvalidHandle, Message: "invalid conn handle"}
 }
 
 func (h *Helper) handleConnRemoteAddr(dec *ipc.Decoder) ([]byte, error) {
@@ -1847,14 +1893,18 @@ func (h *Helper) handleConnRemoteAddr(dec *ipc.Decoder) ([]byte, error) {
 	}
 
 	h.mu.RLock()
-	conn, ok := h.conns[handle]
+	conn, connOK := h.conns[handle]
+	_, pipeRdOK := h.pipeRds[handle]
+	_, pipeWrOK := h.pipeWrs[handle]
 	h.mu.RUnlock()
 
-	if !ok {
-		return nil, &ipc.IPCError{Code: ipc.ErrCodeInvalidHandle, Message: "invalid conn handle"}
+	if connOK {
+		return ipc.NewResponseBuilder().Success().String(conn.RemoteAddr().String()).Build(), nil
 	}
-
-	return ipc.NewResponseBuilder().Success().String(conn.RemoteAddr().String()).Build(), nil
+	if pipeRdOK || pipeWrOK {
+		return ipc.NewResponseBuilder().Success().String("pipe").Build(), nil
+	}
+	return nil, &ipc.IPCError{Code: ipc.ErrCodeInvalidHandle, Message: "invalid conn handle"}
 }
 
 // ==========================================================================

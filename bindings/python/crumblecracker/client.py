@@ -5,6 +5,7 @@ OCI client for pulling and managing container images.
 from __future__ import annotations
 
 import ctypes
+import platform
 from ctypes import POINTER, byref, c_char_p
 from typing import TYPE_CHECKING, Any
 
@@ -69,9 +70,19 @@ class InstanceSource:
     def get_config(self) -> ImageConfig:
         """Get the image configuration."""
         if _ffi.using_ipc():
-            # Image config is not available via IPC in the current protocol
+            # IPC currently doesn't expose source config over the wire.
+            # Return a best-effort config with host architecture filled in.
+            machine = platform.machine().lower()
+            arch_map = {
+                "x86_64": "amd64",
+                "amd64": "amd64",
+                "aarch64": "arm64",
+                "arm64": "arm64",
+            }
             return ImageConfig(
-                architecture=None, env=[], working_dir=None,
+                architecture=arch_map.get(machine, machine),
+                env=[],
+                working_dir=None,
                 entrypoint=[], cmd=[], user=None,
             )
 
