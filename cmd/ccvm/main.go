@@ -13,6 +13,7 @@ import (
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/kernel/alpine"
+	"j5.nz/cc/internal/macos"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/vm"
 )
@@ -24,6 +25,10 @@ type server struct {
 }
 
 func main() {
+	if err := macos.EnsureExecutableIsSigned(); err != nil {
+		panic(err)
+	}
+
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
 	addr := fs.String("addr", "localhost:0", "Address to listen on")
