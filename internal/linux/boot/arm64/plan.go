@@ -1,0 +1,290 @@
+package arm64
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+
+	"j5.nz/cc/internal/fdt"
+)
+
+const (
+	dtbAlignment    = 0x8
+	stackGuardBytes = 0x2000
+
+	pstateModeEL1h    = 0x5
+	pstateDF          = 0x200
+	pstateAF          = 0x100
+	pstateIF          = 0x80
+	pstateFF          = 0x40
+	DefaultPStateBits = pstateModeEL1h | pstateDF | pstateAF | pstateIF | pstateFF
+
+	DefaultUARTBase     = 0x09000000
+	DefaultUARTSize     = 0x1000
+	DefaultUARTClockHz  = 1843200
+	DefaultUARTRegShift = 0
+	DefaultUARTBaudRate = 115200
+
+	defaultGICDistributorBase          = 0x08000000
+	defaultGICDistributorSize          = 0x00010000
+	defaultGICRedistributorBase        = 0x080a0000
+	defaultGICRedistributorSize        = 0x00020000
+	defaultGICMaintenanceIntNum        = 9
+	gicDefaultPhandle           uint32 = 1
+)
+
+type BootOptions struct {
+	MemoryBase uint64
+	MemorySize uint64
+	Cmdline    string
+	NumCPUs    int
+	UART       *UARTConfig
+}
+
+type UARTConfig struct {
+	Base      uint64
+	Size      uint64
+	ClockHz   uint32
+	RegShift  uint32
+	BaudRate  uint32
+	Interrupt InterruptSpec
+}
+
+type InterruptSpec struct {
+	Type  uint32
+	Num   uint32
+	Flags uint32
+}
+
+type BootPlan struct {
+	EntryGPA      uint64
+	StackTopGPA   uint64
+	DeviceTreeGPA uint64
+	KernelGPA     uint64
+	KernelBytes   []byte
+	DeviceTree    []byte
+}
+
+func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan, error) {
+	if len(memory) == 0 {
+		return nil, errors.New("guest memory is empty")
+	}
+	if len(kernelFile) == 0 {
+		return nil, errors.New("kernel file is empty")
+	}
+	if opts.MemorySize == 0 {
+		opts.MemorySize = uint64(len(memory))
+	}
+	if opts.NumCPUs <= 0 {
+		opts.NumCPUs = 1
+	}
+	if opts.UART == nil {
+		opts.UART = &UARTConfig{
+			Base:      DefaultUARTBase,
+			Size:      DefaultUARTSize,
+			ClockHz:   DefaultUARTClockHz,
+			RegShift:  DefaultUARTRegShift,
+			BaudRate:  DefaultUARTBaudRate,
+			Interrupt: InterruptSpec{Type: 0, Num: 33, Flags: 0x4},
+		}
+	}
+
+	reader := bytes.NewReader(kernelFile)
+	probe, err := ProbeKernelImage(reader, int64(len(kernelFile)))
+	if err != nil {
+		return nil, err
+	}
+	image, err := probe.ExtractImage(reader, int64(len(kernelFile)))
+	if err != nil {
+		return nil, err
+	}
+
+	base := alignUp(opts.MemoryBase, ImageLoadAlignment)
+	loadAddr := base + probe.Header.TextOffset
+	if loadAddr < opts.MemoryBase {
+		return nil, fmt.Errorf("kernel load address %#x below RAM base %#x", loadAddr, opts.MemoryBase)
+	}
+
+	loadOff := loadAddr - opts.MemoryBase
+	if loadOff+uint64(len(image)) > uint64(len(memory)) {
+		return nil, fmt.Errorf("kernel does not fit in guest RAM")
+	}
+	copy(memory[loadOff:loadOff+uint64(len(image))], image)
+
+	dtb, err := buildDeviceTree(deviceTreeConfig{
+		MemoryBase: opts.MemoryBase,
+		MemorySize: opts.MemorySize,
+		NumCPUs:    opts.NumCPUs,
+		Cmdline:    opts.Cmdline,
+		UART:       opts.UART,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	dtbAddr := alignUp(loadAddr+uint64(len(image)), dtbAlignment)
+	dtbOff := dtbAddr - opts.MemoryBase
+	if dtbOff+uint64(len(dtb)) > uint64(len(memory)) {
+		return nil, fmt.Errorf("device tree does not fit in guest RAM")
+	}
+	copy(memory[dtbOff:dtbOff+uint64(len(dtb))], dtb)
+
+	stackTop := alignDown(opts.MemoryBase+opts.MemorySize, 16)
+	if stackTop <= dtbAddr+uint64(len(dtb))+stackGuardBytes {
+		return nil, fmt.Errorf("stack overlaps device tree")
+	}
+
+	entry, err := probe.Header.EntryPoint(base)
+	if err != nil {
+		return nil, err
+	}
+
+	return &BootPlan{
+		EntryGPA:      entry,
+		StackTopGPA:   stackTop,
+		DeviceTreeGPA: dtbAddr,
+		KernelGPA:     loadAddr,
+		KernelBytes:   image,
+		DeviceTree:    dtb,
+	}, nil
+}
+
+type deviceTreeConfig struct {
+	MemoryBase uint64
+	MemorySize uint64
+	NumCPUs    int
+	Cmdline    string
+	UART       *UARTConfig
+}
+
+func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
+	root := fdt.Node{
+		Name: "",
+		Properties: map[string]fdt.Property{
+			"#address-cells":   {U32: []uint32{2}},
+			"#size-cells":      {U32: []uint32{2}},
+			"compatible":       {Strings: []string{"ccx3,arm64"}},
+			"model":            {Strings: []string{"ccx3-arm64"}},
+			"interrupt-parent": {U32: []uint32{gicDefaultPhandle}},
+		},
+	}
+
+	cpus := fdt.Node{
+		Name: "cpus",
+		Properties: map[string]fdt.Property{
+			"#address-cells": {U32: []uint32{2}},
+			"#size-cells":    {U32: []uint32{0}},
+		},
+	}
+	for cpu := 0; cpu < cfg.NumCPUs; cpu++ {
+		cpus.Children = append(cpus.Children, fdt.Node{
+			Name: fmt.Sprintf("cpu@%d", cpu),
+			Properties: map[string]fdt.Property{
+				"device_type":   {Strings: []string{"cpu"}},
+				"compatible":    {Strings: []string{"arm,armv8"}},
+				"reg":           {U64: []uint64{uint64(cpu)}},
+				"enable-method": {Strings: []string{"psci"}},
+			},
+		})
+	}
+	root.Children = append(root.Children, cpus)
+
+	root.Children = append(root.Children, fdt.Node{
+		Name: fmt.Sprintf("memory@%x", cfg.MemoryBase),
+		Properties: map[string]fdt.Property{
+			"device_type": {Strings: []string{"memory"}},
+			"reg":         {U64: []uint64{cfg.MemoryBase, cfg.MemorySize}},
+		},
+	})
+
+	if cfg.UART != nil {
+		serialNode := fdt.Node{
+			Name: fmt.Sprintf("serial@%x", cfg.UART.Base),
+			Properties: map[string]fdt.Property{
+				"compatible":   {Strings: []string{"ns16550a"}},
+				"reg":          {U64: []uint64{cfg.UART.Base, cfg.UART.Size}},
+				"reg-io-width": {U32: []uint32{1}},
+				"status":       {Strings: []string{"okay"}},
+			},
+		}
+		if cfg.UART.ClockHz != 0 {
+			serialNode.Properties["clock-frequency"] = fdt.Property{U32: []uint32{cfg.UART.ClockHz}}
+		}
+		if cfg.UART.RegShift != 0 {
+			serialNode.Properties["reg-shift"] = fdt.Property{U32: []uint32{cfg.UART.RegShift}}
+		}
+		if cfg.UART.Interrupt != (InterruptSpec{}) {
+			serialNode.Properties["interrupts"] = fdt.Property{U32: []uint32{
+				cfg.UART.Interrupt.Type, cfg.UART.Interrupt.Num, cfg.UART.Interrupt.Flags,
+			}}
+			serialNode.Properties["interrupt-parent"] = fdt.Property{U32: []uint32{gicDefaultPhandle}}
+		}
+		root.Children = append(root.Children, serialNode)
+		root.Children = append(root.Children, fdt.Node{
+			Name: "aliases",
+			Properties: map[string]fdt.Property{
+				"serial0": {Strings: []string{fmt.Sprintf("/%s", serialNode.Name)}},
+			},
+		})
+		root.Children = append(root.Children, fdt.Node{
+			Name: "chosen",
+			Properties: map[string]fdt.Property{
+				"bootargs":          {Strings: []string{cfg.Cmdline}},
+				"stdout-path":       {Strings: []string{fmt.Sprintf("serial0:%dn8", cfg.UART.BaudRate)}},
+				"linux,stdout-path": {Strings: []string{fmt.Sprintf("serial0:%dn8", cfg.UART.BaudRate)}},
+			},
+		})
+	}
+
+	root.Children = append(root.Children, fdt.Node{
+		Name: "psci",
+		Properties: map[string]fdt.Property{
+			"compatible": {Strings: []string{"arm,psci-0.2", "arm,psci"}},
+			"method":     {Strings: []string{"hvc"}},
+		},
+	})
+
+	root.Children = append(root.Children, fdt.Node{
+		Name: "timer",
+		Properties: map[string]fdt.Property{
+			"compatible": {Strings: []string{"arm,armv8-timer"}},
+			"always-on":  {Flag: true},
+			"interrupts": {U32: []uint32{1, 13, 4, 1, 14, 4, 1, 11, 4, 1, 10, 4}},
+		},
+	})
+
+	root.Children = append(root.Children, fdt.Node{
+		Name: fmt.Sprintf("interrupt-controller@%x", defaultGICDistributorBase),
+		Properties: map[string]fdt.Property{
+			"#interrupt-cells":     {U32: []uint32{3}},
+			"#address-cells":       {U32: []uint32{2}},
+			"#size-cells":          {U32: []uint32{2}},
+			"interrupt-controller": {Flag: true},
+			"phandle":              {U32: []uint32{gicDefaultPhandle}},
+			"linux,phandle":        {U32: []uint32{gicDefaultPhandle}},
+			"compatible":           {Strings: []string{"arm,gic-v3"}},
+			"reg": {U64: []uint64{
+				defaultGICDistributorBase, defaultGICDistributorSize,
+				defaultGICRedistributorBase, defaultGICRedistributorSize,
+			}},
+			"interrupts": {U32: []uint32{1, defaultGICMaintenanceIntNum, 0xF04}},
+		},
+	})
+
+	return fdt.Build(root)
+}
+
+func alignUp(value, align uint64) uint64 {
+	if align == 0 {
+		return value
+	}
+	mask := align - 1
+	return (value + mask) &^ mask
+}
+
+func alignDown(value, align uint64) uint64 {
+	if align == 0 {
+		return value
+	}
+	return value &^ (align - 1)
+}

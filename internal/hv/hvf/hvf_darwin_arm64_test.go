@@ -97,4 +97,8 @@ func TestHVFBringupStages(t *testing.T) {
 			t.Fatalf("Run() physical address = %#x, want %#x", got, mmioAddr)
 		}
 	})
+
+	t.Run("kernel prints to serial", func(t *testing.T) {
+		testBootKernelPrintsToSerial(t, vm)
+	})
 }

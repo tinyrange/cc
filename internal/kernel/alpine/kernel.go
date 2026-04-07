@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 
@@ -69,6 +70,56 @@ func (m *Manager) Status() client.KernelState {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.statusLocked()
+}
+
+func (m *Manager) PackagePath() (string, error) {
+	meta, err := m.readMetadata()
+	if err != nil {
+		return "", err
+	}
+	return meta.PackageFile, nil
+}
+
+func (m *Manager) ReadKernel() ([]byte, error) {
+	meta, err := m.readMetadata()
+	if err != nil {
+		return nil, err
+	}
+
+	f, err := os.Open(meta.PackageFile)
+	if err != nil {
+		return nil, fmt.Errorf("open kernel package: %w", err)
+	}
+	defer f.Close()
+
+	gzr, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, fmt.Errorf("open kernel package gzip: %w", err)
+	}
+	defer gzr.Close()
+
+	tr := tar.NewReader(gzr)
+	candidates := []string{"boot/vmlinuz-virt", "boot/vmlinuz-lts"}
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("kernel image not found in package")
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read kernel package tar: %w", err)
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			continue
+		}
+		if !slices.Contains(candidates, hdr.Name) {
+			continue
+		}
+		data, err := io.ReadAll(tr)
+		if err != nil {
+			return nil, fmt.Errorf("read kernel image %q: %w", hdr.Name, err)
+		}
+		return data, nil
+	}
 }
 
 func (m *Manager) Ensure(ctx context.Context) error {

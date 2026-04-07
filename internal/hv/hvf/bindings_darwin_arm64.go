@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
@@ -47,6 +48,7 @@ type VCPU uint64
 type MemoryFlags uint64
 type ExitReason uint32
 type Reg uint32
+type SysReg uint16
 
 type VcpuExitException struct {
 	Syndrome        uint64
@@ -76,8 +78,13 @@ const (
 	hvExitReasonException ExitReason  = 1
 	hvRegX0               Reg         = 0
 	hvRegX1               Reg         = 1
+	hvRegX2               Reg         = 2
+	hvRegX3               Reg         = 3
 	hvRegPC               Reg         = 31
 	hvRegCPSR             Reg         = 34
+	hvRegXZR              Reg         = 0xffffffff
+
+	hvSysRegSP_EL1 SysReg = 0xe208
 )
 
 var (
@@ -95,7 +102,9 @@ var (
 	hvVcpuConfigCreate func() VcpuConfig
 	hvVcpuCreate       func(vcpu *VCPU, exit **VcpuExit, config VcpuConfig) Return
 	hvVcpuDestroy      func(vcpu VCPU) Return
+	hvVcpuGetReg       func(vcpu VCPU, reg Reg, value *uint64) Return
 	hvVcpuSetReg       func(vcpu VCPU, reg Reg, value uint64) Return
+	hvVcpuSetSysReg    func(vcpu VCPU, reg SysReg, value uint64) Return
 	hvVcpuRun          func(vcpu VCPU) Return
 
 	hvGICConfigCreate                  func() GICConfig
@@ -132,7 +141,9 @@ func load() error {
 		purego.RegisterLibFunc(&hvVcpuConfigCreate, hvLib, "hv_vcpu_config_create")
 		purego.RegisterLibFunc(&hvVcpuCreate, hvLib, "hv_vcpu_create")
 		purego.RegisterLibFunc(&hvVcpuDestroy, hvLib, "hv_vcpu_destroy")
+		purego.RegisterLibFunc(&hvVcpuGetReg, hvLib, "hv_vcpu_get_reg")
 		purego.RegisterLibFunc(&hvVcpuSetReg, hvLib, "hv_vcpu_set_reg")
+		purego.RegisterLibFunc(&hvVcpuSetSysReg, hvLib, "hv_vcpu_set_sys_reg")
 		purego.RegisterLibFunc(&hvVcpuRun, hvLib, "hv_vcpu_run")
 
 		purego.RegisterLibFunc(&hvGICConfigCreate, hvLib, "hv_gic_config_create")
@@ -174,7 +185,8 @@ func NewVM() (*VM, error) {
 	errCh := make(chan error, 1)
 	v.threadCh <- func() {
 		vmCfg := hvVMConfigCreate()
-		if ret := hvVMCreate(vmCfg); ret != hvSuccess {
+		ret := createVMWithRetry(vmCfg)
+		if ret != hvSuccess {
 			osRelease(uintptr(vmCfg))
 			errCh <- fmt.Errorf("create vm: %w", ret)
 			return
@@ -207,6 +219,21 @@ func NewVM() (*VM, error) {
 		return nil, err
 	}
 	return v, nil
+}
+
+func createVMWithRetry(cfg VMConfig) Return {
+	const (
+		maxAttempts = 10
+		retryDelay  = 50 * time.Millisecond
+	)
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		ret := hvVMCreate(cfg)
+		if ret != hvBusy {
+			return ret
+		}
+		time.Sleep(retryDelay)
+	}
+	return hvBusy
 }
 
 func createMinimalGIC() error {
@@ -294,6 +321,41 @@ func (v *VM) SetReg(reg Reg, value uint64) error {
 	return <-errCh
 }
 
+func (v *VM) GetReg(reg Reg) (uint64, error) {
+	respCh := make(chan struct {
+		val uint64
+		err error
+	}, 1)
+	v.threadCh <- func() {
+		var value uint64
+		if ret := hvVcpuGetReg(v.vcpu, reg, &value); ret != hvSuccess {
+			respCh <- struct {
+				val uint64
+				err error
+			}{err: fmt.Errorf("get reg %d: %w", reg, ret)}
+			return
+		}
+		respCh <- struct {
+			val uint64
+			err error
+		}{val: value}
+	}
+	res := <-respCh
+	return res.val, res.err
+}
+
+func (v *VM) SetSysReg(reg SysReg, value uint64) error {
+	errCh := make(chan error, 1)
+	v.threadCh <- func() {
+		if ret := hvVcpuSetSysReg(v.vcpu, reg, value); ret != hvSuccess {
+			errCh <- fmt.Errorf("set sys reg %d: %w", reg, ret)
+			return
+		}
+		errCh <- nil
+	}
+	return <-errCh
+}
+
 func (v *VM) Run() (*VcpuExit, error) {
 	type result struct {
 		exit *VcpuExit
@@ -368,4 +430,69 @@ func (v *VM) Close() error {
 	}
 	close(v.threadCh)
 	return firstErr
+}
+
+type ExceptionClass uint64
+
+const (
+	ExceptionClassHVC64            ExceptionClass = 0x16
+	ExceptionClassDataAbortLowerEL ExceptionClass = 0x24
+)
+
+type DataAbortInfo struct {
+	SizeBytes int
+	Write     bool
+	Target    Reg
+}
+
+func DecodeExceptionClass(syndrome uint64) ExceptionClass {
+	return ExceptionClass((syndrome >> 26) & 0x3f)
+}
+
+func DecodeDataAbort(syndrome uint64) (DataAbortInfo, error) {
+	const (
+		dataAbortISSMask uint64 = (1 << 25) - 1
+		isvBit                  = 24
+		sasShift                = 22
+		sasMask          uint64 = 0x3
+		srtShift                = 16
+		srtMask          uint64 = 0x1f
+		wnrBit                  = 6
+	)
+
+	iss := syndrome & dataAbortISSMask
+	if ((iss >> isvBit) & 0x1) == 0 {
+		return DataAbortInfo{}, fmt.Errorf("data abort without ISV set: syndrome=0x%x", syndrome)
+	}
+	sas := (iss >> sasShift) & sasMask
+	if sas > 3 {
+		return DataAbortInfo{}, fmt.Errorf("invalid SAS value %d", sas)
+	}
+	srt := int((iss >> srtShift) & srtMask)
+	write := ((iss >> wnrBit) & 0x1) == 1
+
+	var reg Reg
+	switch {
+	case srt >= 0 && srt <= 31:
+		reg = Reg(srt)
+		if srt == 31 {
+			reg = hvRegXZR
+		}
+	default:
+		return DataAbortInfo{}, fmt.Errorf("unsupported register index %d", srt)
+	}
+
+	return DataAbortInfo{
+		SizeBytes: 1 << sas,
+		Write:     write,
+		Target:    reg,
+	}, nil
+}
+
+func (v *VM) AdvanceProgramCounter() error {
+	pc, err := v.GetReg(hvRegPC)
+	if err != nil {
+		return err
+	}
+	return v.SetReg(hvRegPC, pc+4)
 }
