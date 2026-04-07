@@ -1,25 +1,38 @@
 package alpine
 
 import (
+	"archive/tar"
+	"bufio"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 
 	"j5.nz/cc/client"
 )
 
 const (
-	defaultVersion = "alpine-edge"
-	defaultSource  = "alpine:edge"
+	defaultMirror  = "https://dl-cdn.alpinelinux.org"
+	defaultVersion = "latest-stable"
+	defaultRepo    = "main"
 )
 
 type Manager struct {
-	root string
+	root        string
+	mirror      string
+	version     string
+	repo        string
+	arch        string
+	packageName string
+	httpClient  *http.Client
 
 	mu          sync.Mutex
 	downloading bool
@@ -27,12 +40,29 @@ type Manager struct {
 }
 
 type metadata struct {
-	Version string `json:"version"`
-	Source  string `json:"source"`
+	Version     string `json:"version"`
+	Source      string `json:"source"`
+	PackageName string `json:"package_name"`
+	PackageFile string `json:"package_file"`
+	Arch        string `json:"arch"`
+}
+
+type indexEntry struct {
+	Name    string
+	Version string
+	Arch    string
 }
 
 func NewManager(root string) *Manager {
-	return &Manager{root: root}
+	return &Manager{
+		root:        root,
+		mirror:      defaultMirror,
+		version:     defaultVersion,
+		repo:        defaultRepo,
+		arch:        defaultArch(),
+		packageName: defaultPackageName(),
+		httpClient:  http.DefaultClient,
+	}
 }
 
 func (m *Manager) Status() client.KernelState {
@@ -42,8 +72,6 @@ func (m *Manager) Status() client.KernelState {
 }
 
 func (m *Manager) Ensure(ctx context.Context) error {
-	_ = ctx
-
 	m.mu.Lock()
 	if m.downloading {
 		m.mu.Unlock()
@@ -53,7 +81,7 @@ func (m *Manager) Ensure(ctx context.Context) error {
 	m.lastErr = nil
 	m.mu.Unlock()
 
-	err := m.ensureMetadata()
+	err := m.ensureDownloaded(ctx)
 
 	m.mu.Lock()
 	m.downloading = false
@@ -67,7 +95,7 @@ func (m *Manager) statusLocked() client.KernelState {
 	if m.downloading {
 		return client.KernelState{
 			Status: "downloading",
-			Source: defaultSource,
+			Source: m.sourceName(),
 		}
 	}
 
@@ -83,23 +111,42 @@ func (m *Manager) statusLocked() client.KernelState {
 		return client.KernelState{
 			Status: "error",
 			Error:  m.lastErr.Error(),
-			Source: defaultSource,
+			Source: m.sourceName(),
 		}
 	}
 	return client.KernelState{
 		Status: "missing",
-		Source: defaultSource,
+		Source: m.sourceName(),
 	}
 }
 
-func (m *Manager) ensureMetadata() error {
+func (m *Manager) ensureDownloaded(ctx context.Context) error {
 	if err := os.MkdirAll(m.root, 0o755); err != nil {
 		return fmt.Errorf("create kernel cache dir: %w", err)
 	}
 
+	entry, err := m.fetchIndexEntry(ctx)
+	if err != nil {
+		return err
+	}
+
+	filename := fmt.Sprintf("%s-%s.apk", entry.Name, entry.Version)
+	destDir := filepath.Join(m.root, "packages")
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return fmt.Errorf("create kernel package dir: %w", err)
+	}
+	destPath := filepath.Join(destDir, filename)
+
+	if err := m.downloadFile(ctx, m.packageURL(filename), destPath); err != nil {
+		return err
+	}
+
 	meta := metadata{
-		Version: defaultVersion + "-" + runtime.GOARCH,
-		Source:  defaultSource,
+		Version:     entry.Version,
+		Source:      m.sourceName(),
+		PackageName: entry.Name,
+		PackageFile: destPath,
+		Arch:        entry.Arch,
 	}
 
 	buf, err := json.MarshalIndent(meta, "", "  ")
@@ -109,7 +156,140 @@ func (m *Manager) ensureMetadata() error {
 	if err := os.WriteFile(m.metadataPath(), buf, 0o644); err != nil {
 		return fmt.Errorf("write kernel metadata: %w", err)
 	}
+
 	return nil
+}
+
+func (m *Manager) fetchIndexEntry(ctx context.Context) (indexEntry, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.indexURL(), nil)
+	if err != nil {
+		return indexEntry{}, err
+	}
+	resp, err := m.httpClient.Do(req)
+	if err != nil {
+		return indexEntry{}, fmt.Errorf("download kernel index: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return indexEntry{}, fmt.Errorf("download kernel index: status %s", resp.Status)
+	}
+
+	indexData, err := readAPKIndex(resp.Body)
+	if err != nil {
+		return indexEntry{}, err
+	}
+
+	entry, ok := indexData[m.packageName]
+	if !ok {
+		return indexEntry{}, fmt.Errorf("kernel package %q not found in APKINDEX", m.packageName)
+	}
+	if entry.Arch != m.arch {
+		return indexEntry{}, fmt.Errorf("kernel package arch %q does not match expected %q", entry.Arch, m.arch)
+	}
+	return entry, nil
+}
+
+func (m *Manager) downloadFile(ctx context.Context, url, destPath string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := m.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("download kernel package: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download kernel package: status %s", resp.Status)
+	}
+
+	tmpPath := destPath + ".tmp"
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("create kernel package file: %w", err)
+	}
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("write kernel package: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close kernel package: %w", err)
+	}
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("finalize kernel package: %w", err)
+	}
+	return nil
+}
+
+func readAPKIndex(r io.Reader) (map[string]indexEntry, error) {
+	gzr, err := gzip.NewReader(r)
+	if err != nil {
+		return nil, fmt.Errorf("open APKINDEX gzip: %w", err)
+	}
+	defer gzr.Close()
+
+	tr := tar.NewReader(gzr)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("APKINDEX entry not found")
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read APKINDEX tar: %w", err)
+		}
+		if hdr.Name != "APKINDEX" {
+			continue
+		}
+		return parseAPKIndex(tr)
+	}
+}
+
+func parseAPKIndex(r io.Reader) (map[string]indexEntry, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	out := map[string]indexEntry{}
+	var current indexEntry
+
+	flush := func() {
+		if current.Name != "" {
+			out[current.Name] = current
+		}
+		current = indexEntry{}
+	}
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			flush()
+			continue
+		}
+		if len(line) < 3 || line[1] != ':' {
+			return nil, fmt.Errorf("invalid APKINDEX line %q", line)
+		}
+
+		key := line[:1]
+		value := line[2:]
+
+		switch key {
+		case "P":
+			current.Name = value
+		case "V":
+			current.Version = value
+		case "A":
+			current.Arch = value
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan APKINDEX: %w", err)
+	}
+	flush()
+	return out, nil
 }
 
 func (m *Manager) readMetadata() (metadata, error) {
@@ -121,7 +301,7 @@ func (m *Manager) readMetadata() (metadata, error) {
 	if err := json.Unmarshal(buf, &ret); err != nil {
 		return ret, fmt.Errorf("decode kernel metadata: %w", err)
 	}
-	if ret.Version == "" || ret.Source == "" {
+	if ret.Version == "" || ret.Source == "" || ret.PackageFile == "" {
 		return ret, errors.New("kernel metadata is incomplete")
 	}
 	return ret, nil
@@ -129,4 +309,34 @@ func (m *Manager) readMetadata() (metadata, error) {
 
 func (m *Manager) metadataPath() string {
 	return filepath.Join(m.root, "kernel.json")
+}
+
+func (m *Manager) sourceName() string {
+	return "alpine:" + m.version
+}
+
+func (m *Manager) indexURL() string {
+	return strings.TrimRight(m.mirror, "/") + "/" + m.version + "/" + m.repo + "/" + m.arch + "/APKINDEX.tar.gz"
+}
+
+func (m *Manager) packageURL(filename string) string {
+	return strings.TrimRight(m.mirror, "/") + "/" + m.version + "/" + m.repo + "/" + m.arch + "/" + filename
+}
+
+func defaultArch() string {
+	switch runtime.GOARCH {
+	case "arm64":
+		return "aarch64"
+	case "amd64":
+		return "x86_64"
+	default:
+		return runtime.GOARCH
+	}
+}
+
+func defaultPackageName() string {
+	if defaultArch() == "riscv64" {
+		return "linux-lts"
+	}
+	return "linux-virt"
 }
