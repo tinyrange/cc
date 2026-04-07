@@ -1,0 +1,371 @@
+//go:build darwin && arm64
+
+package hvf
+
+import (
+	"fmt"
+	"runtime"
+	"sync"
+	"syscall"
+	"unsafe"
+
+	"github.com/ebitengine/purego"
+)
+
+type Return int32
+
+func (r Return) Error() string {
+	switch r {
+	case hvSuccess:
+		return ""
+	case hvError:
+		return "error"
+	case hvBusy:
+		return "busy"
+	case hvBadArgument:
+		return "bad argument"
+	case hvIllegalGuestState:
+		return "illegal guest state"
+	case hvNoResources:
+		return "no resources"
+	case hvNoDevice:
+		return "no device"
+	case hvDenied:
+		return "denied"
+	case hvUnsupported:
+		return "unsupported"
+	default:
+		return fmt.Sprintf("unknown error: %d", r)
+	}
+}
+
+type VMConfig uintptr
+type VcpuConfig uintptr
+type GICConfig uintptr
+type IPA uint64
+type VCPU uint64
+type MemoryFlags uint64
+type ExitReason uint32
+type Reg uint32
+
+type VcpuExitException struct {
+	Syndrome        uint64
+	VirtualAddress  uint64
+	PhysicalAddress IPA
+}
+
+type VcpuExit struct {
+	Reason    ExitReason
+	_         uint32
+	Exception VcpuExitException
+}
+
+const (
+	hvSuccess             Return      = 0
+	hvError               Return      = -0x516bfff
+	hvBusy                Return      = -0x516bffe
+	hvBadArgument         Return      = -0x516bffd
+	hvIllegalGuestState   Return      = -0x516bffc
+	hvNoResources         Return      = -0x516bffb
+	hvNoDevice            Return      = -0x516bffa
+	hvDenied              Return      = -0x516bff9
+	hvUnsupported         Return      = -0x516bff1
+	hvMemoryRead          MemoryFlags = 0x1
+	hvMemoryWrite         MemoryFlags = 0x2
+	hvMemoryExec          MemoryFlags = 0x4
+	hvExitReasonException ExitReason  = 1
+	hvRegX0               Reg         = 0
+	hvRegX1               Reg         = 1
+	hvRegPC               Reg         = 31
+	hvRegCPSR             Reg         = 34
+)
+
+var (
+	loadOnce sync.Once
+	loadErr  error
+	hvLib    uintptr
+	sysLib   uintptr
+
+	hvVMConfigCreate func() VMConfig
+	hvVMCreate       func(config VMConfig) Return
+	hvVMDestroy      func() Return
+	hvVMMap          func(addr unsafe.Pointer, ipa IPA, size uintptr, flags MemoryFlags) Return
+	hvVMUnmap        func(ipa IPA, size uintptr) Return
+
+	hvVcpuConfigCreate func() VcpuConfig
+	hvVcpuCreate       func(vcpu *VCPU, exit **VcpuExit, config VcpuConfig) Return
+	hvVcpuDestroy      func(vcpu VCPU) Return
+	hvVcpuSetReg       func(vcpu VCPU, reg Reg, value uint64) Return
+	hvVcpuRun          func(vcpu VCPU) Return
+
+	hvGICConfigCreate                  func() GICConfig
+	hvGICConfigSetDistributorBase      func(config GICConfig, distributorBase IPA) Return
+	hvGICConfigSetRedistributorBase    func(config GICConfig, redistributorBase IPA) Return
+	hvGICGetDistributorBaseAlignment   func(alignment *uintptr) Return
+	hvGICGetRedistributorBaseAlignment func(alignment *uintptr) Return
+	hvGICCreate                        func(config GICConfig) Return
+
+	osRelease func(obj uintptr)
+)
+
+func load() error {
+	loadOnce.Do(func() {
+		var err error
+		hvLib, err = purego.Dlopen("/System/Library/Frameworks/Hypervisor.framework/Hypervisor", purego.RTLD_GLOBAL|purego.RTLD_LAZY)
+		if err != nil {
+			loadErr = fmt.Errorf("open Hypervisor.framework: %w", err)
+			return
+		}
+
+		sysLib, err = purego.Dlopen("/usr/lib/libSystem.B.dylib", purego.RTLD_GLOBAL|purego.RTLD_LAZY)
+		if err != nil {
+			loadErr = fmt.Errorf("open libSystem: %w", err)
+			return
+		}
+
+		purego.RegisterLibFunc(&hvVMConfigCreate, hvLib, "hv_vm_config_create")
+		purego.RegisterLibFunc(&hvVMCreate, hvLib, "hv_vm_create")
+		purego.RegisterLibFunc(&hvVMDestroy, hvLib, "hv_vm_destroy")
+		purego.RegisterLibFunc(&hvVMMap, hvLib, "hv_vm_map")
+		purego.RegisterLibFunc(&hvVMUnmap, hvLib, "hv_vm_unmap")
+
+		purego.RegisterLibFunc(&hvVcpuConfigCreate, hvLib, "hv_vcpu_config_create")
+		purego.RegisterLibFunc(&hvVcpuCreate, hvLib, "hv_vcpu_create")
+		purego.RegisterLibFunc(&hvVcpuDestroy, hvLib, "hv_vcpu_destroy")
+		purego.RegisterLibFunc(&hvVcpuSetReg, hvLib, "hv_vcpu_set_reg")
+		purego.RegisterLibFunc(&hvVcpuRun, hvLib, "hv_vcpu_run")
+
+		purego.RegisterLibFunc(&hvGICConfigCreate, hvLib, "hv_gic_config_create")
+		purego.RegisterLibFunc(&hvGICConfigSetDistributorBase, hvLib, "hv_gic_config_set_distributor_base")
+		purego.RegisterLibFunc(&hvGICConfigSetRedistributorBase, hvLib, "hv_gic_config_set_redistributor_base")
+		purego.RegisterLibFunc(&hvGICGetDistributorBaseAlignment, hvLib, "hv_gic_get_distributor_base_alignment")
+		purego.RegisterLibFunc(&hvGICGetRedistributorBaseAlignment, hvLib, "hv_gic_get_redistributor_base_alignment")
+		purego.RegisterLibFunc(&hvGICCreate, hvLib, "hv_gic_create")
+
+		purego.RegisterLibFunc(&osRelease, sysLib, "os_release")
+	})
+	return loadErr
+}
+
+type VM struct {
+	vcpu     VCPU
+	exitInfo *VcpuExit
+	mappings []mapping
+	threadCh chan func()
+}
+
+type mapping struct {
+	ipa       IPA
+	size      uintptr
+	mem       []byte
+	anonymous bool
+}
+
+func NewVM() (*VM, error) {
+	if err := load(); err != nil {
+		return nil, err
+	}
+
+	v := &VM{
+		threadCh: make(chan func()),
+	}
+	go v.threadMain()
+
+	errCh := make(chan error, 1)
+	v.threadCh <- func() {
+		vmCfg := hvVMConfigCreate()
+		if ret := hvVMCreate(vmCfg); ret != hvSuccess {
+			osRelease(uintptr(vmCfg))
+			errCh <- fmt.Errorf("create vm: %w", ret)
+			return
+		}
+		osRelease(uintptr(vmCfg))
+
+		if err := createMinimalGIC(); err != nil {
+			_ = hvVMDestroy()
+			errCh <- err
+			return
+		}
+
+		vcpuCfg := hvVcpuConfigCreate()
+		var id VCPU
+		exitInfo := new(VcpuExit)
+		if ret := hvVcpuCreate(&id, &exitInfo, vcpuCfg); ret != hvSuccess {
+			osRelease(uintptr(vcpuCfg))
+			_ = hvVMDestroy()
+			errCh <- fmt.Errorf("create vcpu: %w", ret)
+			return
+		}
+		osRelease(uintptr(vcpuCfg))
+
+		v.vcpu = id
+		v.exitInfo = exitInfo
+		errCh <- nil
+	}
+	if err := <-errCh; err != nil {
+		close(v.threadCh)
+		return nil, err
+	}
+	return v, nil
+}
+
+func createMinimalGIC() error {
+	var distAlign uintptr
+	if ret := hvGICGetDistributorBaseAlignment(&distAlign); ret != hvSuccess {
+		return fmt.Errorf("get gic distributor alignment: %w", ret)
+	}
+	var redistAlign uintptr
+	if ret := hvGICGetRedistributorBaseAlignment(&redistAlign); ret != hvSuccess {
+		return fmt.Errorf("get gic redistributor alignment: %w", ret)
+	}
+
+	const distributorBase IPA = 0x08000000
+	const redistributorBase IPA = 0x080a0000
+
+	if distAlign != 0 && uintptr(distributorBase)%distAlign != 0 {
+		return fmt.Errorf("gic distributor base %#x not aligned to %#x", distributorBase, distAlign)
+	}
+	if redistAlign != 0 && uintptr(redistributorBase)%redistAlign != 0 {
+		return fmt.Errorf("gic redistributor base %#x not aligned to %#x", redistributorBase, redistAlign)
+	}
+
+	cfg := hvGICConfigCreate()
+	if ret := hvGICConfigSetDistributorBase(cfg, distributorBase); ret != hvSuccess {
+		osRelease(uintptr(cfg))
+		return fmt.Errorf("set gic distributor base: %w", ret)
+	}
+	if ret := hvGICConfigSetRedistributorBase(cfg, redistributorBase); ret != hvSuccess {
+		osRelease(uintptr(cfg))
+		return fmt.Errorf("set gic redistributor base: %w", ret)
+	}
+	if ret := hvGICCreate(cfg); ret != hvSuccess {
+		osRelease(uintptr(cfg))
+		return fmt.Errorf("create gic: %w", ret)
+	}
+	osRelease(uintptr(cfg))
+	return nil
+}
+
+func (v *VM) MapMemory(mem []byte, ipa IPA, flags MemoryFlags) error {
+	if len(mem) == 0 {
+		return fmt.Errorf("memory mapping cannot be empty")
+	}
+	errCh := make(chan error, 1)
+	v.threadCh <- func() {
+		if ret := hvVMMap(unsafe.Pointer(&mem[0]), ipa, uintptr(len(mem)), flags); ret != hvSuccess {
+			errCh <- fmt.Errorf("map memory: %w", ret)
+			return
+		}
+		v.mappings = append(v.mappings, mapping{ipa: ipa, size: uintptr(len(mem)), mem: mem})
+		errCh <- nil
+	}
+	return <-errCh
+}
+
+func (v *VM) MapAnonymousMemory(size uintptr, ipa IPA, flags MemoryFlags) ([]byte, error) {
+	mem, err := syscall.Mmap(-1, 0, int(size), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_ANON|syscall.MAP_PRIVATE)
+	if err != nil {
+		return nil, fmt.Errorf("allocate anonymous memory: %w", err)
+	}
+	if err := v.MapMemory(mem, ipa, flags); err != nil {
+		_ = syscall.Munmap(mem)
+		return nil, err
+	}
+	done := make(chan struct{}, 1)
+	v.threadCh <- func() {
+		if len(v.mappings) > 0 {
+			v.mappings[len(v.mappings)-1].anonymous = true
+		}
+		done <- struct{}{}
+	}
+	<-done
+	return mem, nil
+}
+
+func (v *VM) SetReg(reg Reg, value uint64) error {
+	errCh := make(chan error, 1)
+	v.threadCh <- func() {
+		if ret := hvVcpuSetReg(v.vcpu, reg, value); ret != hvSuccess {
+			errCh <- fmt.Errorf("set reg %d: %w", reg, ret)
+			return
+		}
+		errCh <- nil
+	}
+	return <-errCh
+}
+
+func (v *VM) Run() (*VcpuExit, error) {
+	type result struct {
+		exit *VcpuExit
+		err  error
+	}
+	resCh := make(chan result, 1)
+	v.threadCh <- func() {
+		if ret := hvVcpuRun(v.vcpu); ret != hvSuccess {
+			resCh <- result{err: fmt.Errorf("run vcpu: %w", ret)}
+			return
+		}
+		resCh <- result{exit: v.exitInfo}
+	}
+	res := <-resCh
+	return res.exit, res.err
+}
+
+func (v *VM) threadMain() {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	for fn := range v.threadCh {
+		fn()
+	}
+}
+
+func (v *VM) Close() error {
+	var firstErr error
+	if v.vcpu != 0 {
+		errCh := make(chan error, 1)
+		v.threadCh <- func() {
+			if ret := hvVcpuDestroy(v.vcpu); ret != hvSuccess {
+				errCh <- fmt.Errorf("destroy vcpu: %w", ret)
+				return
+			}
+			errCh <- nil
+		}
+		if err := <-errCh; err != nil && firstErr == nil {
+			firstErr = err
+		}
+		v.vcpu = 0
+	}
+	for _, m := range v.mappings {
+		m := m
+		errCh := make(chan error, 1)
+		v.threadCh <- func() {
+			if ret := hvVMUnmap(m.ipa, m.size); ret != hvSuccess {
+				errCh <- fmt.Errorf("unmap memory: %w", ret)
+				return
+			}
+			errCh <- nil
+		}
+		if err := <-errCh; err != nil && firstErr == nil {
+			firstErr = err
+		}
+		if m.anonymous {
+			if err := syscall.Munmap(m.mem); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("munmap memory: %w", err)
+			}
+		}
+	}
+	v.mappings = nil
+	errCh := make(chan error, 1)
+	v.threadCh <- func() {
+		if ret := hvVMDestroy(); ret != hvSuccess {
+			errCh <- fmt.Errorf("destroy vm: %w", ret)
+			return
+		}
+		errCh <- nil
+	}
+	if err := <-errCh; err != nil && firstErr == nil {
+		firstErr = err
+	}
+	close(v.threadCh)
+	return firstErr
+}
