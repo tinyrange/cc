@@ -49,6 +49,9 @@ type MemoryFlags uint64
 type ExitReason uint32
 type Reg uint32
 type SysReg uint16
+type GICDistributorReg uint16
+type GICRedistributorReg uint32
+type GICICCReg uint16
 
 type VcpuExitException struct {
 	Syndrome        uint64
@@ -80,11 +83,45 @@ const (
 	hvRegX1               Reg         = 1
 	hvRegX2               Reg         = 2
 	hvRegX3               Reg         = 3
+	hvRegX4               Reg         = 4
+	hvRegX5               Reg         = 5
+	hvRegX6               Reg         = 6
+	hvRegX7               Reg         = 7
+	hvRegX8               Reg         = 8
+	hvRegX9               Reg         = 9
+	hvRegX10              Reg         = 10
+	hvRegX11              Reg         = 11
+	hvRegX12              Reg         = 12
+	hvRegX13              Reg         = 13
+	hvRegX14              Reg         = 14
+	hvRegX15              Reg         = 15
+	hvRegX16              Reg         = 16
+	hvRegX17              Reg         = 17
+	hvRegX18              Reg         = 18
+	hvRegX19              Reg         = 19
+	hvRegX20              Reg         = 20
+	hvRegX21              Reg         = 21
+	hvRegX22              Reg         = 22
+	hvRegX23              Reg         = 23
+	hvRegX24              Reg         = 24
+	hvRegX25              Reg         = 25
+	hvRegX26              Reg         = 26
+	hvRegX27              Reg         = 27
+	hvRegX28              Reg         = 28
+	hvRegX29              Reg         = 29
+	hvRegX30              Reg         = 30
 	hvRegPC               Reg         = 31
 	hvRegCPSR             Reg         = 34
 	hvRegXZR              Reg         = 0xffffffff
 
-	hvSysRegSP_EL1 SysReg = 0xe208
+	hvSysRegSP_EL1   SysReg = 0xe208
+	hvSysRegTTBR1EL1 SysReg = 0xc101
+
+	hvGICICCRegPMR_EL1     GICICCReg = 0xc230
+	hvGICICCRegCTLR_EL1    GICICCReg = 0xc664
+	hvGICICCRegSRE_EL1     GICICCReg = 0xc665
+	hvGICICCRegIGRPEN0_EL1 GICICCReg = 0xc666
+	hvGICICCRegIGRPEN1_EL1 GICICCReg = 0xc667
 )
 
 var (
@@ -104,10 +141,18 @@ var (
 	hvVcpuDestroy      func(vcpu VCPU) Return
 	hvVcpuGetReg       func(vcpu VCPU, reg Reg, value *uint64) Return
 	hvVcpuSetReg       func(vcpu VCPU, reg Reg, value uint64) Return
+	hvVcpuGetSysReg    func(vcpu VCPU, reg SysReg, value *uint64) Return
 	hvVcpuSetSysReg    func(vcpu VCPU, reg SysReg, value uint64) Return
 	hvVcpuRun          func(vcpu VCPU) Return
 
 	hvGICConfigCreate                  func() GICConfig
+	hvGICGetDistributorReg             func(reg GICDistributorReg, value *uint64) Return
+	hvGICSetDistributorReg             func(reg GICDistributorReg, value uint64) Return
+	hvGICGetRedistributorBase          func(vcpu VCPU, redistributorBaseAddress *IPA) Return
+	hvGICGetRedistributorReg           func(vcpu VCPU, reg GICRedistributorReg, value *uint64) Return
+	hvGICSetRedistributorReg           func(vcpu VCPU, reg GICRedistributorReg, value uint64) Return
+	hvGICGetICCReg                     func(vcpu VCPU, reg GICICCReg, value *uint64) Return
+	hvGICSetICCReg                     func(vcpu VCPU, reg GICICCReg, value uint64) Return
 	hvGICConfigSetDistributorBase      func(config GICConfig, distributorBase IPA) Return
 	hvGICConfigSetRedistributorBase    func(config GICConfig, redistributorBase IPA) Return
 	hvGICGetDistributorBaseAlignment   func(alignment *uintptr) Return
@@ -143,10 +188,18 @@ func load() error {
 		purego.RegisterLibFunc(&hvVcpuDestroy, hvLib, "hv_vcpu_destroy")
 		purego.RegisterLibFunc(&hvVcpuGetReg, hvLib, "hv_vcpu_get_reg")
 		purego.RegisterLibFunc(&hvVcpuSetReg, hvLib, "hv_vcpu_set_reg")
+		purego.RegisterLibFunc(&hvVcpuGetSysReg, hvLib, "hv_vcpu_get_sys_reg")
 		purego.RegisterLibFunc(&hvVcpuSetSysReg, hvLib, "hv_vcpu_set_sys_reg")
 		purego.RegisterLibFunc(&hvVcpuRun, hvLib, "hv_vcpu_run")
 
 		purego.RegisterLibFunc(&hvGICConfigCreate, hvLib, "hv_gic_config_create")
+		purego.RegisterLibFunc(&hvGICGetDistributorReg, hvLib, "hv_gic_get_distributor_reg")
+		purego.RegisterLibFunc(&hvGICSetDistributorReg, hvLib, "hv_gic_set_distributor_reg")
+		purego.RegisterLibFunc(&hvGICGetRedistributorBase, hvLib, "hv_gic_get_redistributor_base")
+		purego.RegisterLibFunc(&hvGICGetRedistributorReg, hvLib, "hv_gic_get_redistributor_reg")
+		purego.RegisterLibFunc(&hvGICSetRedistributorReg, hvLib, "hv_gic_set_redistributor_reg")
+		purego.RegisterLibFunc(&hvGICGetICCReg, hvLib, "hv_gic_get_icc_reg")
+		purego.RegisterLibFunc(&hvGICSetICCReg, hvLib, "hv_gic_set_icc_reg")
 		purego.RegisterLibFunc(&hvGICConfigSetDistributorBase, hvLib, "hv_gic_config_set_distributor_base")
 		purego.RegisterLibFunc(&hvGICConfigSetRedistributorBase, hvLib, "hv_gic_config_set_redistributor_base")
 		purego.RegisterLibFunc(&hvGICGetDistributorBaseAlignment, hvLib, "hv_gic_get_distributor_base_alignment")
@@ -212,7 +265,7 @@ func NewVM() (*VM, error) {
 
 		v.vcpu = id
 		v.exitInfo = exitInfo
-		errCh <- nil
+		errCh <- initMinimalGICCPUInterface(v)
 	}
 	if err := <-errCh; err != nil {
 		close(v.threadCh)
@@ -223,7 +276,7 @@ func NewVM() (*VM, error) {
 
 func createVMWithRetry(cfg VMConfig) Return {
 	const (
-		maxAttempts = 10
+		maxAttempts = 100
 		retryDelay  = 50 * time.Millisecond
 	)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -270,6 +323,25 @@ func createMinimalGIC() error {
 		return fmt.Errorf("create gic: %w", ret)
 	}
 	osRelease(uintptr(cfg))
+	return nil
+}
+
+func initMinimalGICCPUInterface(v *VM) error {
+	if err := v.setGICICCRegOnOwnerThread(hvGICICCRegSRE_EL1, 0x1); err != nil {
+		return err
+	}
+	if err := v.setGICICCRegOnOwnerThread(hvGICICCRegPMR_EL1, 0xff); err != nil {
+		return err
+	}
+	if err := v.setGICICCRegOnOwnerThread(hvGICICCRegCTLR_EL1, 0x0); err != nil {
+		return err
+	}
+	if err := v.setGICICCRegOnOwnerThread(hvGICICCRegIGRPEN0_EL1, 0x1); err != nil {
+		return err
+	}
+	if err := v.setGICICCRegOnOwnerThread(hvGICICCRegIGRPEN1_EL1, 0x1); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -342,6 +414,138 @@ func (v *VM) GetReg(reg Reg) (uint64, error) {
 	}
 	res := <-respCh
 	return res.val, res.err
+}
+
+func (v *VM) GetSysReg(reg SysReg) (uint64, error) {
+	respCh := make(chan struct {
+		val uint64
+		err error
+	}, 1)
+	v.threadCh <- func() {
+		var value uint64
+		if ret := hvVcpuGetSysReg(v.vcpu, reg, &value); ret != hvSuccess {
+			respCh <- struct {
+				val uint64
+				err error
+			}{err: fmt.Errorf("get sys reg %d: %w", reg, ret)}
+			return
+		}
+		respCh <- struct {
+			val uint64
+			err error
+		}{val: value}
+	}
+	res := <-respCh
+	return res.val, res.err
+}
+
+func (v *VM) GetGICDistributorReg(reg GICDistributorReg) (uint64, error) {
+	respCh := make(chan struct {
+		val uint64
+		err error
+	}, 1)
+	v.threadCh <- func() {
+		var value uint64
+		if ret := hvGICGetDistributorReg(reg, &value); ret != hvSuccess {
+			respCh <- struct {
+				val uint64
+				err error
+			}{err: fmt.Errorf("get gic distributor reg %#x: %w", reg, ret)}
+			return
+		}
+		respCh <- struct {
+			val uint64
+			err error
+		}{val: value}
+	}
+	res := <-respCh
+	return res.val, res.err
+}
+
+func (v *VM) SetGICDistributorReg(reg GICDistributorReg, value uint64) error {
+	errCh := make(chan error, 1)
+	v.threadCh <- func() {
+		if ret := hvGICSetDistributorReg(reg, value); ret != hvSuccess {
+			errCh <- fmt.Errorf("set gic distributor reg %#x: %w", reg, ret)
+			return
+		}
+		errCh <- nil
+	}
+	return <-errCh
+}
+
+func (v *VM) GetGICRedistributorReg(reg GICRedistributorReg) (uint64, error) {
+	respCh := make(chan struct {
+		val uint64
+		err error
+	}, 1)
+	v.threadCh <- func() {
+		var value uint64
+		if ret := hvGICGetRedistributorReg(v.vcpu, reg, &value); ret != hvSuccess {
+			respCh <- struct {
+				val uint64
+				err error
+			}{err: fmt.Errorf("get gic redistributor reg %#x: %w", reg, ret)}
+			return
+		}
+		respCh <- struct {
+			val uint64
+			err error
+		}{val: value}
+	}
+	res := <-respCh
+	return res.val, res.err
+}
+
+func (v *VM) SetGICRedistributorReg(reg GICRedistributorReg, value uint64) error {
+	errCh := make(chan error, 1)
+	v.threadCh <- func() {
+		if ret := hvGICSetRedistributorReg(v.vcpu, reg, value); ret != hvSuccess {
+			errCh <- fmt.Errorf("set gic redistributor reg %#x: %w", reg, ret)
+			return
+		}
+		errCh <- nil
+	}
+	return <-errCh
+}
+
+func (v *VM) GetGICICCReg(reg GICICCReg) (uint64, error) {
+	respCh := make(chan struct {
+		val uint64
+		err error
+	}, 1)
+	v.threadCh <- func() {
+		value, err := v.getGICICCRegOnOwnerThread(reg)
+		respCh <- struct {
+			val uint64
+			err error
+		}{val: value, err: err}
+	}
+	res := <-respCh
+	return res.val, res.err
+}
+
+func (v *VM) getGICICCRegOnOwnerThread(reg GICICCReg) (uint64, error) {
+	var value uint64
+	if ret := hvGICGetICCReg(v.vcpu, reg, &value); ret != hvSuccess {
+		return 0, fmt.Errorf("get gic icc reg %#x: %w", reg, ret)
+	}
+	return value, nil
+}
+
+func (v *VM) SetGICICCReg(reg GICICCReg, value uint64) error {
+	errCh := make(chan error, 1)
+	v.threadCh <- func() {
+		errCh <- v.setGICICCRegOnOwnerThread(reg, value)
+	}
+	return <-errCh
+}
+
+func (v *VM) setGICICCRegOnOwnerThread(reg GICICCReg, value uint64) error {
+	if ret := hvGICSetICCReg(v.vcpu, reg, value); ret != hvSuccess {
+		return fmt.Errorf("set gic icc reg %#x: %w", reg, ret)
+	}
+	return nil
 }
 
 func (v *VM) SetSysReg(reg SysReg, value uint64) error {

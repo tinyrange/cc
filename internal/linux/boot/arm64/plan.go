@@ -10,6 +10,7 @@ import (
 
 const (
 	dtbAlignment    = 0x8
+	initrdAlignment = 0x1000
 	stackGuardBytes = 0x2000
 
 	pstateModeEL1h    = 0x5
@@ -39,6 +40,8 @@ type BootOptions struct {
 	Cmdline    string
 	NumCPUs    int
 	UART       *UARTConfig
+	Initrd     []byte
+	InitrdGPA  uint64
 }
 
 type UARTConfig struct {
@@ -61,6 +64,8 @@ type BootPlan struct {
 	StackTopGPA   uint64
 	DeviceTreeGPA uint64
 	KernelGPA     uint64
+	InitrdGPA     uint64
+	InitrdSize    uint64
 	KernelBytes   []byte
 	DeviceTree    []byte
 }
@@ -111,18 +116,36 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 	}
 	copy(memory[loadOff:loadOff+uint64(len(image))], image)
 
+	initrdAddr := opts.InitrdGPA
+	if len(opts.Initrd) > 0 {
+		if initrdAddr == 0 {
+			initrdAddr = alignUp(loadAddr+uint64(len(image)), initrdAlignment)
+		}
+		initrdOff := initrdAddr - opts.MemoryBase
+		if initrdAddr < opts.MemoryBase || initrdOff+uint64(len(opts.Initrd)) > uint64(len(memory)) {
+			return nil, fmt.Errorf("initrd does not fit in guest RAM")
+		}
+		copy(memory[initrdOff:initrdOff+uint64(len(opts.Initrd))], opts.Initrd)
+	}
+
 	dtb, err := buildDeviceTree(deviceTreeConfig{
 		MemoryBase: opts.MemoryBase,
 		MemorySize: opts.MemorySize,
 		NumCPUs:    opts.NumCPUs,
 		Cmdline:    opts.Cmdline,
 		UART:       opts.UART,
+		InitrdGPA:  initrdAddr,
+		InitrdSize: uint64(len(opts.Initrd)),
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	dtbAddr := alignUp(loadAddr+uint64(len(image)), dtbAlignment)
+	dtbStart := loadAddr + uint64(len(image))
+	if len(opts.Initrd) > 0 {
+		dtbStart = initrdAddr + uint64(len(opts.Initrd))
+	}
+	dtbAddr := alignUp(dtbStart, dtbAlignment)
 	dtbOff := dtbAddr - opts.MemoryBase
 	if dtbOff+uint64(len(dtb)) > uint64(len(memory)) {
 		return nil, fmt.Errorf("device tree does not fit in guest RAM")
@@ -144,6 +167,8 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 		StackTopGPA:   stackTop,
 		DeviceTreeGPA: dtbAddr,
 		KernelGPA:     loadAddr,
+		InitrdGPA:     initrdAddr,
+		InitrdSize:    uint64(len(opts.Initrd)),
 		KernelBytes:   image,
 		DeviceTree:    dtb,
 	}, nil
@@ -155,6 +180,8 @@ type deviceTreeConfig struct {
 	NumCPUs    int
 	Cmdline    string
 	UART       *UARTConfig
+	InitrdGPA  uint64
+	InitrdSize uint64
 }
 
 func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
@@ -234,6 +261,25 @@ func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
 				"linux,stdout-path": {Strings: []string{fmt.Sprintf("serial0:%dn8", cfg.UART.BaudRate)}},
 			},
 		})
+	}
+
+	if cfg.InitrdSize > 0 {
+		chosenIndex := -1
+		for i, child := range root.Children {
+			if child.Name == "chosen" {
+				chosenIndex = i
+				break
+			}
+		}
+		if chosenIndex == -1 {
+			root.Children = append(root.Children, fdt.Node{
+				Name:       "chosen",
+				Properties: map[string]fdt.Property{},
+			})
+			chosenIndex = len(root.Children) - 1
+		}
+		root.Children[chosenIndex].Properties["linux,initrd-start"] = fdt.Property{U64: []uint64{cfg.InitrdGPA}}
+		root.Children[chosenIndex].Properties["linux,initrd-end"] = fdt.Property{U64: []uint64{cfg.InitrdGPA + cfg.InitrdSize}}
 	}
 
 	root.Children = append(root.Children, fdt.Node{

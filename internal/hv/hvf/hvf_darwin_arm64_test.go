@@ -32,6 +32,24 @@ func TestHVFBringupStages(t *testing.T) {
 
 	pageSize := os.Getpagesize()
 
+	t.Run("gic icc cpu interface is initialized", func(t *testing.T) {
+		sre, err := vm.GetGICICCReg(hvGICICCRegSRE_EL1)
+		if err != nil {
+			t.Fatalf("GetGICICCReg(SRE_EL1) error = %v", err)
+		}
+		if sre&0x1 == 0 {
+			t.Fatalf("ICC_SRE_EL1 = %#x, want SRE bit set", sre)
+		}
+
+		pmr, err := vm.GetGICICCReg(hvGICICCRegPMR_EL1)
+		if err != nil {
+			t.Fatalf("GetGICICCReg(PMR_EL1) error = %v", err)
+		}
+		if pmr&0xf8 != 0xf8 {
+			t.Fatalf("ICC_PMR_EL1 = %#x, want implemented priority mask bits set", pmr)
+		}
+	})
+
 	t.Run("single brk exits", func(t *testing.T) {
 		const guestAddr IPA = 0x80000000
 		mem, err := vm.MapAnonymousMemory(uintptr(pageSize), guestAddr, hvMemoryRead|hvMemoryWrite|hvMemoryExec)
@@ -98,7 +116,7 @@ func TestHVFBringupStages(t *testing.T) {
 		}
 	})
 
-	t.Run("kernel prints to serial", func(t *testing.T) {
-		testBootKernelPrintsToSerial(t, vm)
+	t.Run("initramfs init prints hello world", func(t *testing.T) {
+		testBootHelloWorldInit(t, vm)
 	})
 }
