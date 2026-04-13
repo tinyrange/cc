@@ -78,6 +78,7 @@ const (
 	hvMemoryRead          MemoryFlags = 0x1
 	hvMemoryWrite         MemoryFlags = 0x2
 	hvMemoryExec          MemoryFlags = 0x4
+	hvExitReasonCanceled  ExitReason  = 0
 	hvExitReasonException ExitReason  = 1
 	hvRegX0               Reg         = 0
 	hvRegX1               Reg         = 1
@@ -144,6 +145,7 @@ var (
 	hvVcpuGetSysReg    func(vcpu VCPU, reg SysReg, value *uint64) Return
 	hvVcpuSetSysReg    func(vcpu VCPU, reg SysReg, value uint64) Return
 	hvVcpuRun          func(vcpu VCPU) Return
+	hvVcpusExit        func(vcpus *VCPU, count uint32) Return
 
 	hvGICConfigCreate                  func() GICConfig
 	hvGICGetDistributorReg             func(reg GICDistributorReg, value *uint64) Return
@@ -191,6 +193,7 @@ func load() error {
 		purego.RegisterLibFunc(&hvVcpuGetSysReg, hvLib, "hv_vcpu_get_sys_reg")
 		purego.RegisterLibFunc(&hvVcpuSetSysReg, hvLib, "hv_vcpu_set_sys_reg")
 		purego.RegisterLibFunc(&hvVcpuRun, hvLib, "hv_vcpu_run")
+		purego.RegisterLibFunc(&hvVcpusExit, hvLib, "hv_vcpus_exit")
 
 		purego.RegisterLibFunc(&hvGICConfigCreate, hvLib, "hv_gic_config_create")
 		purego.RegisterLibFunc(&hvGICGetDistributorReg, hvLib, "hv_gic_get_distributor_reg")
@@ -575,6 +578,14 @@ func (v *VM) Run() (*VcpuExit, error) {
 	}
 	res := <-resCh
 	return res.exit, res.err
+}
+
+func (v *VM) CancelRun() error {
+	vcpu := v.vcpu
+	if ret := hvVcpusExit(&vcpu, 1); ret != hvSuccess {
+		return fmt.Errorf("cancel vcpu run: %w", ret)
+	}
+	return nil
 }
 
 func (v *VM) threadMain() {

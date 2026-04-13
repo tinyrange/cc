@@ -360,6 +360,16 @@ func runWithTimeout(vm *VM, timeout time.Duration) (*VcpuExit, error, bool) {
 	case res := <-resCh:
 		return res.exit, res.err, false
 	case <-time.After(timeout):
+		if err := vm.CancelRun(); err != nil {
+			return nil, err, false
+		}
+		res := <-resCh
+		if res.err != nil {
+			return nil, res.err, false
+		}
+		if res.exit == nil || res.exit.Reason != hvExitReasonCanceled {
+			return nil, fmt.Errorf("cancelled run returned unexpected exit %#v", res.exit), false
+		}
 		return nil, nil, true
 	}
 }
