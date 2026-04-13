@@ -3,6 +3,7 @@ package alpine
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -52,6 +53,19 @@ type indexEntry struct {
 	Name    string
 	Version string
 	Arch    string
+}
+
+type Tristate int
+
+const (
+	TristateNo Tristate = iota
+	TristateYes
+	TristateModule
+)
+
+type Module struct {
+	Name string
+	Data []byte
 }
 
 func NewManager(root string) *Manager {
@@ -120,6 +134,74 @@ func (m *Manager) ReadKernel() ([]byte, error) {
 		}
 		return data, nil
 	}
+}
+
+func (m *Manager) KernelVersion() (string, error) {
+	path, err := m.findModuleFile("modules.dep")
+	if err != nil {
+		return "", err
+	}
+	parts := strings.Split(path, "/")
+	if len(parts) < 4 {
+		return "", fmt.Errorf("unexpected modules.dep path %q", path)
+	}
+	return parts[len(parts)-2], nil
+}
+
+func (m *Manager) PlanModuleLoad(configVars []string, moduleMap map[string]string) ([]Module, error) {
+	config, err := m.readKernelConfig()
+	if err != nil {
+		return nil, err
+	}
+	depends, prefix, err := m.readModuleDependencies()
+	if err != nil {
+		return nil, err
+	}
+
+	var planned []Module
+	seen := map[string]bool{}
+	var loadModule func(string) error
+	loadModule = func(name string) error {
+		if seen[name] {
+			return nil
+		}
+		seen[name] = true
+
+		for _, dep := range depends[name] {
+			if err := loadModule(dep); err != nil {
+				return err
+			}
+		}
+
+		data, err := m.readModuleFile(prefix + name)
+		if err != nil {
+			return fmt.Errorf("read module %q: %w", name, err)
+		}
+		planned = append(planned, Module{Name: strings.TrimSuffix(filepath.Base(name), ".ko.gz"), Data: data})
+		return nil
+	}
+
+	for _, configVar := range configVars {
+		state, ok := config[configVar]
+		if !ok {
+			return nil, fmt.Errorf("kernel config %q not found", configVar)
+		}
+		switch state {
+		case TristateYes:
+		case TristateNo:
+			return nil, fmt.Errorf("required kernel config %q is disabled", configVar)
+		case TristateModule:
+			moduleName, ok := moduleMap[configVar]
+			if !ok {
+				return nil, fmt.Errorf("no module mapping for %q", configVar)
+			}
+			if err := loadModule(moduleName); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return planned, nil
 }
 
 func (m *Manager) Ensure(ctx context.Context) error {
@@ -209,6 +291,187 @@ func (m *Manager) ensureDownloaded(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (m *Manager) readKernelConfig() (map[string]Tristate, error) {
+	packagePath, err := m.PackagePath()
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Open(packagePath)
+	if err != nil {
+		return nil, fmt.Errorf("open kernel package: %w", err)
+	}
+	defer f.Close()
+
+	gzr, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, fmt.Errorf("open kernel package gzip: %w", err)
+	}
+	defer gzr.Close()
+
+	tr := tar.NewReader(gzr)
+	config := map[string]Tristate{}
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read kernel package tar: %w", err)
+		}
+		if hdr.Typeflag != tar.TypeReg || !strings.HasPrefix(hdr.Name, "boot/config-") {
+			continue
+		}
+		scanner := bufio.NewScanner(tr)
+		for scanner.Scan() {
+			line := scanner.Text()
+			switch {
+			case strings.HasPrefix(line, "# CONFIG_") && strings.HasSuffix(line, " is not set"):
+				key := strings.TrimSuffix(strings.TrimPrefix(line, "# "), " is not set")
+				config[key] = TristateNo
+			case strings.HasPrefix(line, "CONFIG_"):
+				key, value, ok := strings.Cut(line, "=")
+				if !ok {
+					continue
+				}
+				switch value {
+				case "y":
+					config[key] = TristateYes
+				case "m":
+					config[key] = TristateModule
+				}
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			return nil, fmt.Errorf("scan kernel config: %w", err)
+		}
+		return config, nil
+	}
+	return nil, fmt.Errorf("kernel config not found in package")
+}
+
+func (m *Manager) readModuleDependencies() (map[string][]string, string, error) {
+	path, err := m.findModuleFile("modules.dep")
+	if err != nil {
+		return nil, "", err
+	}
+	data, err := m.readRawPackageFile(path)
+	if err != nil {
+		return nil, "", err
+	}
+	prefix := strings.TrimSuffix(path, "modules.dep")
+	depends := map[string][]string{}
+	scanner := bufio.NewScanner(strings.NewReader(string(data)))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		moduleName, depsRaw, ok := strings.Cut(line, ":")
+		if !ok {
+			return nil, "", fmt.Errorf("invalid modules.dep line %q", line)
+		}
+		moduleName = strings.TrimSpace(moduleName)
+		for _, dep := range strings.Fields(strings.TrimSpace(depsRaw)) {
+			depends[moduleName] = append(depends[moduleName], dep)
+		}
+		if _, ok := depends[moduleName]; !ok {
+			depends[moduleName] = nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, "", fmt.Errorf("scan modules.dep: %w", err)
+	}
+	return depends, prefix, nil
+}
+
+func (m *Manager) findModuleFile(suffix string) (string, error) {
+	packagePath, err := m.PackagePath()
+	if err != nil {
+		return "", err
+	}
+	f, err := os.Open(packagePath)
+	if err != nil {
+		return "", fmt.Errorf("open kernel package: %w", err)
+	}
+	defer f.Close()
+
+	gzr, err := gzip.NewReader(f)
+	if err != nil {
+		return "", fmt.Errorf("open kernel package gzip: %w", err)
+	}
+	defer gzr.Close()
+
+	tr := tar.NewReader(gzr)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return "", fmt.Errorf("module file with suffix %q not found", suffix)
+		}
+		if err != nil {
+			return "", fmt.Errorf("read kernel package tar: %w", err)
+		}
+		if hdr.Typeflag == tar.TypeReg && strings.HasSuffix(hdr.Name, suffix) {
+			return hdr.Name, nil
+		}
+	}
+}
+
+func (m *Manager) readModuleFile(path string) ([]byte, error) {
+	data, err := m.readRawPackageFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasSuffix(path, ".gz") {
+		gzr, err := gzip.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return nil, fmt.Errorf("open module gzip %q: %w", path, err)
+		}
+		defer gzr.Close()
+		data, err = io.ReadAll(gzr)
+		if err != nil {
+			return nil, fmt.Errorf("read module %q: %w", path, err)
+		}
+	}
+	return data, nil
+}
+
+func (m *Manager) readRawPackageFile(path string) ([]byte, error) {
+	packagePath, err := m.PackagePath()
+	if err != nil {
+		return nil, err
+	}
+	f, err := os.Open(packagePath)
+	if err != nil {
+		return nil, fmt.Errorf("open kernel package: %w", err)
+	}
+	defer f.Close()
+
+	gzr, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, fmt.Errorf("open kernel package gzip: %w", err)
+	}
+	defer gzr.Close()
+
+	tr := tar.NewReader(gzr)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("package file %q not found", path)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read kernel package tar: %w", err)
+		}
+		if hdr.Typeflag != tar.TypeReg || hdr.Name != path {
+			continue
+		}
+		data, err := io.ReadAll(tr)
+		if err != nil {
+			return nil, fmt.Errorf("read package file %q: %w", path, err)
+		}
+		return data, nil
+	}
 }
 
 func (m *Manager) fetchIndexEntry(ctx context.Context) (indexEntry, error) {

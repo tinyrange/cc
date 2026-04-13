@@ -61,6 +61,11 @@ type VMState struct {
 	Error     string   `json:"error,omitempty"`
 }
 
+type RunVMResponse struct {
+	ExitCode int    `json:"exit_code"`
+	Output   string `json:"output,omitempty"`
+}
+
 type ExecRequest struct {
 	Command []string `json:"command"`
 	Env     []string `json:"env,omitempty"`

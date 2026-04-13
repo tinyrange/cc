@@ -42,6 +42,7 @@ type BootOptions struct {
 	UART       *UARTConfig
 	Initrd     []byte
 	InitrdGPA  uint64
+	ExtraNodes []fdt.Node
 }
 
 type UARTConfig struct {
@@ -136,6 +137,7 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 		UART:       opts.UART,
 		InitrdGPA:  initrdAddr,
 		InitrdSize: uint64(len(opts.Initrd)),
+		ExtraNodes: append([]fdt.Node(nil), opts.ExtraNodes...),
 	})
 	if err != nil {
 		return nil, err
@@ -182,6 +184,7 @@ type deviceTreeConfig struct {
 	UART       *UARTConfig
 	InitrdGPA  uint64
 	InitrdSize uint64
+	ExtraNodes []fdt.Node
 }
 
 func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
@@ -316,6 +319,7 @@ func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
 			"interrupts": {U32: []uint32{1, defaultGICMaintenanceIntNum, 0xF04}},
 		},
 	})
+	root.Children = append(root.Children, cfg.ExtraNodes...)
 
 	return fdt.Build(root)
 }

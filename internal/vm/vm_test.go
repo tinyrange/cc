@@ -58,12 +58,19 @@ func TestManagerClearsRunningStateWhenInstanceExits(t *testing.T) {
 type fakeBackend struct {
 	instance Instance
 	err      error
+	runResp  client.RunVMResponse
 }
 
 func (f fakeBackend) Start(ctx context.Context, req client.StartVMRequest) (Instance, error) {
 	_ = ctx
 	_ = req
 	return f.instance, f.err
+}
+
+func (f fakeBackend) Run(ctx context.Context, req client.StartVMRequest) (client.RunVMResponse, error) {
+	_ = ctx
+	_ = req
+	return f.runResp, f.err
 }
 
 type fakeInstance struct {

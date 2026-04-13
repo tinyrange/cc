@@ -3,7 +3,9 @@ package initramfs
 import (
 	"bytes"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -11,6 +13,7 @@ type File struct {
 	Path     string
 	Mode     os.FileMode
 	Data     []byte
+	Linkname string
 	Type     Type
 	DevMajor uint32
 	DevMinor uint32
@@ -22,15 +25,17 @@ const (
 	TypeRegular Type = iota
 	TypeDirectory
 	TypeCharDevice
+	TypeSymlink
 )
 
 const (
-	newcMagic           = "070701"
-	newcHeaderLen       = 110
-	newcTrailerName     = "TRAILER!!!"
-	newcRegularFileBit  = 0o100000
-	newcDirectoryBit    = 0o040000
-	newcCharDeviceBit   = 0o020000
+	newcMagic          = "070701"
+	newcHeaderLen      = 110
+	newcTrailerName    = "TRAILER!!!"
+	newcRegularFileBit = 0o100000
+	newcDirectoryBit   = 0o040000
+	newcCharDeviceBit  = 0o020000
+	newcSymlinkBit     = 0o120000
 )
 
 func Build(files []File) ([]byte, error) {
@@ -46,13 +51,14 @@ func Build(files []File) ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("file %d (%s): %w", idx, file.Path, err)
 		}
+		data := fileData(file)
 		if err := writeEntry(buf, entry{
-			ino:      ino,
-			mode:     mode,
-			nlink:    1,
-			filesize: uint32(len(file.Data)),
-			name:     name,
-			data:     file.Data,
+			ino:       ino,
+			mode:      mode,
+			nlink:     1,
+			filesize:  uint32(len(data)),
+			name:      name,
+			data:      data,
 			rdevmajor: file.DevMajor,
 			rdevminor: file.DevMinor,
 		}); err != nil {
@@ -70,6 +76,63 @@ func Build(files []File) ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
+}
+
+func BuildFromDirectory(root string, extra []File) ([]byte, error) {
+	files := []File{}
+	if err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == root {
+			return nil
+		}
+
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		rel = "/" + filepath.ToSlash(rel)
+
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+
+		file := File{
+			Path: rel,
+			Mode: info.Mode().Perm(),
+		}
+
+		switch mode := info.Mode(); {
+		case mode.IsDir():
+			file.Type = TypeDirectory
+		case mode&os.ModeSymlink != 0:
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			file.Type = TypeSymlink
+			file.Linkname = target
+		case mode.IsRegular():
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			file.Type = TypeRegular
+			file.Data = data
+		default:
+			return fmt.Errorf("unsupported filesystem entry %s (%s)", path, info.Mode())
+		}
+
+		files = append(files, file)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+
+	files = append(files, extra...)
+	return Build(files)
 }
 
 type entry struct {
@@ -152,7 +215,16 @@ func encodeMode(file File) (uint32, error) {
 		return mode | newcDirectoryBit, nil
 	case TypeCharDevice:
 		return mode | newcCharDeviceBit, nil
+	case TypeSymlink:
+		return mode | newcSymlinkBit, nil
 	default:
 		return 0, fmt.Errorf("unsupported file type %d", file.Type)
 	}
+}
+
+func fileData(file File) []byte {
+	if file.Type == TypeSymlink {
+		return []byte(file.Linkname)
+	}
+	return file.Data
 }

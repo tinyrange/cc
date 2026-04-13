@@ -117,6 +117,8 @@ const (
 
 	hvSysRegSP_EL1   SysReg = 0xe208
 	hvSysRegTTBR1EL1 SysReg = 0xc101
+	hvSysRegMPIDR_EL1 SysReg = 0xc005
+	hvSysRegVBAR_EL1 SysReg = 0xc600
 
 	hvGICICCRegPMR_EL1     GICICCReg = 0xc230
 	hvGICICCRegCTLR_EL1    GICICCReg = 0xc664
@@ -155,6 +157,7 @@ var (
 	hvGICSetRedistributorReg           func(vcpu VCPU, reg GICRedistributorReg, value uint64) Return
 	hvGICGetICCReg                     func(vcpu VCPU, reg GICICCReg, value *uint64) Return
 	hvGICSetICCReg                     func(vcpu VCPU, reg GICICCReg, value uint64) Return
+	hvGICSetSPI                        func(intid uint32, level bool) Return
 	hvGICConfigSetDistributorBase      func(config GICConfig, distributorBase IPA) Return
 	hvGICConfigSetRedistributorBase    func(config GICConfig, redistributorBase IPA) Return
 	hvGICGetDistributorBaseAlignment   func(alignment *uintptr) Return
@@ -203,6 +206,7 @@ func load() error {
 		purego.RegisterLibFunc(&hvGICSetRedistributorReg, hvLib, "hv_gic_set_redistributor_reg")
 		purego.RegisterLibFunc(&hvGICGetICCReg, hvLib, "hv_gic_get_icc_reg")
 		purego.RegisterLibFunc(&hvGICSetICCReg, hvLib, "hv_gic_set_icc_reg")
+		purego.RegisterLibFunc(&hvGICSetSPI, hvLib, "hv_gic_set_spi")
 		purego.RegisterLibFunc(&hvGICConfigSetDistributorBase, hvLib, "hv_gic_config_set_distributor_base")
 		purego.RegisterLibFunc(&hvGICConfigSetRedistributorBase, hvLib, "hv_gic_config_set_redistributor_base")
 		purego.RegisterLibFunc(&hvGICGetDistributorBaseAlignment, hvLib, "hv_gic_get_distributor_base_alignment")
@@ -268,6 +272,12 @@ func NewVM() (*VM, error) {
 
 		v.vcpu = id
 		v.exitInfo = exitInfo
+		if ret := hvVcpuSetSysReg(v.vcpu, hvSysRegMPIDR_EL1, uint64(v.vcpu)); ret != hvSuccess {
+			_ = hvVcpuDestroy(v.vcpu)
+			_ = hvVMDestroy()
+			errCh <- fmt.Errorf("set MPIDR_EL1: %w", ret)
+			return
+		}
 		errCh <- initMinimalGICCPUInterface(v)
 	}
 	if err := <-errCh; err != nil {
@@ -279,7 +289,7 @@ func NewVM() (*VM, error) {
 
 func createVMWithRetry(cfg VMConfig) Return {
 	const (
-		maxAttempts = 100
+		maxAttempts = 400
 		retryDelay  = 50 * time.Millisecond
 	)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -710,4 +720,73 @@ func (v *VM) AdvanceProgramCounter() error {
 		return err
 	}
 	return v.SetReg(hvRegPC, pc+4)
+}
+
+func (v *VM) ReadIPA(addr uint64, size int) ([]byte, error) {
+	if size < 0 {
+		return nil, fmt.Errorf("invalid read size %d", size)
+	}
+	respCh := make(chan struct {
+		data []byte
+		err  error
+	}, 1)
+	v.threadCh <- func() {
+		for _, m := range v.mappings {
+			start := uint64(m.ipa)
+			end := start + uint64(m.size)
+			if addr < start || addr+uint64(size) > end {
+				continue
+			}
+			off := addr - start
+			data := append([]byte(nil), m.mem[off:off+uint64(size)]...)
+			respCh <- struct {
+				data []byte
+				err  error
+			}{data: data}
+			return
+		}
+		respCh <- struct {
+			data []byte
+			err  error
+		}{err: fmt.Errorf("read guest memory %#x size %d: unmapped", addr, size)}
+	}
+	res := <-respCh
+	return res.data, res.err
+}
+
+func (v *VM) WriteIPA(addr uint64, data []byte) error {
+	errCh := make(chan error, 1)
+	v.threadCh <- func() {
+		for _, m := range v.mappings {
+			start := uint64(m.ipa)
+			end := start + uint64(m.size)
+			if addr < start || addr+uint64(len(data)) > end {
+				continue
+			}
+			off := addr - start
+			copy(m.mem[off:off+uint64(len(data))], data)
+			errCh <- nil
+			return
+		}
+		errCh <- fmt.Errorf("write guest memory %#x size %d: unmapped", addr, len(data))
+	}
+	return <-errCh
+}
+
+const gicSPIBase = 32
+
+func (v *VM) SetIRQ(irq uint32, level bool) error {
+	if irq >= 1020 {
+		return fmt.Errorf("irq %d out of range", irq)
+	}
+	intid := irq + gicSPIBase
+	errCh := make(chan error, 1)
+	v.threadCh <- func() {
+		if ret := hvGICSetSPI(intid, level); ret != hvSuccess {
+			errCh <- fmt.Errorf("set gic spi %d level=%v: %w", intid, level, ret)
+			return
+		}
+		errCh <- nil
+	}
+	return <-errCh
 }

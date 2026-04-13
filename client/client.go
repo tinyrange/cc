@@ -147,6 +147,12 @@ func (c *Client) ShutdownVM() error {
 	return c.postJSONExpectOK("/vm/shutdown", nil, nil)
 }
 
+func (c *Client) RunVM(req StartVMRequest) (RunVMResponse, error) {
+	var ret RunVMResponse
+	err := c.postJSONExpectOK("/vm/run", req, &ret)
+	return ret, err
+}
+
 func (c *Client) postJSONExpectOK(path string, reqBody any, respBody any) error {
 	var body io.Reader
 	if reqBody != nil {

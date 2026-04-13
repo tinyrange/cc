@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -46,8 +47,8 @@ func main() {
 	srvState := &server{
 		kernel: alpine.NewManager(filepath.Join(rootCache, "kernel")),
 		images: oci.NewStore(filepath.Join(rootCache, "images")),
-		vms:    vm.NewManager(),
 	}
+	srvState.vms = vm.NewManagerWithBackend(vm.NewRuntimeBackend(srvState.kernel, srvState.images))
 
 	l, err := net.Listen("tcp", *addr)
 	if err != nil {
@@ -72,7 +73,9 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 		go func() {
 			time.Sleep(10 * time.Millisecond)
-			_ = httpServer.Shutdown(r.Context())
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = httpServer.Shutdown(ctx)
 		}()
 	})
 
@@ -172,8 +175,28 @@ func main() {
 		writeJSON(w, http.StatusOK, srvState.vms.Status())
 	})
 
-	mux.HandleFunc("/vm/run", func(w http.ResponseWriter, r *http.Request) {
-		writeError(w, http.StatusNotImplemented, fmt.Errorf("exec websocket is not implemented yet"))
+	mux.HandleFunc("POST /vm/run", func(w http.ResponseWriter, r *http.Request) {
+		var req client.StartVMRequest
+		if err := decodeRequiredJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if _, err := srvState.images.Open(req.Image); err != nil {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("image %q is not available", req.Image))
+			return
+		}
+		if srvState.kernel.Status().Status != "downloaded" {
+			if err := srvState.kernel.Ensure(r.Context()); err != nil {
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+		}
+		resp, err := srvState.vms.Run(r.Context(), req)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, resp)
 	})
 
 	httpServer = http.Server{Handler: mux}

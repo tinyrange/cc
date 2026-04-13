@@ -2,6 +2,8 @@ package initramfs
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -19,5 +21,30 @@ func TestBuildIncludesFileAndTrailer(t *testing.T) {
 	}
 	if !bytes.Contains(data, []byte("TRAILER!!!\x00")) {
 		t.Fatalf("archive missing trailer entry")
+	}
+}
+
+func TestBuildFromDirectoryIncludesSymlink(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "bin"), 0o755); err != nil {
+		t.Fatalf("Mkdir(bin) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "bin", "busybox"), []byte("busy"), 0o755); err != nil {
+		t.Fatalf("WriteFile(busybox) error = %v", err)
+	}
+	if err := os.Symlink("busybox", filepath.Join(root, "bin", "sh")); err != nil {
+		t.Fatalf("Symlink(sh) error = %v", err)
+	}
+
+	data, err := BuildFromDirectory(root, nil)
+	if err != nil {
+		t.Fatalf("BuildFromDirectory() error = %v", err)
+	}
+
+	if !bytes.Contains(data, []byte("bin/sh\x00")) {
+		t.Fatalf("archive missing symlink entry")
+	}
+	if !bytes.Contains(data, []byte("busybox")) {
+		t.Fatalf("archive missing symlink target payload")
 	}
 }

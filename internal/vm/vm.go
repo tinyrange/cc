@@ -12,6 +12,7 @@ import (
 
 type Backend interface {
 	Start(context.Context, client.StartVMRequest) (Instance, error)
+	Run(context.Context, client.StartVMRequest) (client.RunVMResponse, error)
 }
 
 type Instance interface {
@@ -37,7 +38,7 @@ type Machine struct {
 }
 
 func NewManager() *Manager {
-	return &Manager{backend: stubBackend{}, supports: Supports}
+	return &Manager{backend: unsupportedBackend{}, supports: Supports}
 }
 
 func NewManagerWithBackend(backend Backend) *Manager {
@@ -102,6 +103,16 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	return machine.instance.Close()
 }
 
+func (m *Manager) Run(ctx context.Context, req client.StartVMRequest) (client.RunVMResponse, error) {
+	if req.Image == "" {
+		return client.RunVMResponse{}, fmt.Errorf("image is required")
+	}
+	if err := m.supports(); err != nil {
+		return client.RunVMResponse{}, err
+	}
+	return m.backend.Run(ctx, req)
+}
+
 func (m *Manager) Status() client.VMState {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -139,27 +150,16 @@ func (m *Manager) watch(machine *Machine) {
 	machine.exitedAt = time.Now().UTC()
 }
 
-type stubBackend struct{}
+type unsupportedBackend struct{}
 
-func (stubBackend) Start(ctx context.Context, req client.StartVMRequest) (Instance, error) {
+func (unsupportedBackend) Start(ctx context.Context, req client.StartVMRequest) (Instance, error) {
 	_ = ctx
 	_ = req
-	return &stubInstance{waitCh: make(chan error)}, nil
+	return nil, fmt.Errorf("VM backend is not configured")
 }
 
-type stubInstance struct {
-	waitCh chan error
-	once   sync.Once
-}
-
-func (s *stubInstance) Wait() error {
-	return <-s.waitCh
-}
-
-func (s *stubInstance) Close() error {
-	s.once.Do(func() {
-		s.waitCh <- nil
-		close(s.waitCh)
-	})
-	return nil
+func (unsupportedBackend) Run(ctx context.Context, req client.StartVMRequest) (client.RunVMResponse, error) {
+	_ = ctx
+	_ = req
+	return client.RunVMResponse{}, fmt.Errorf("VM backend is not configured")
 }

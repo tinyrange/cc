@@ -1,0 +1,50 @@
+//go:build !darwin || !arm64
+
+package hvf
+
+import (
+	"context"
+	"fmt"
+
+	"j5.nz/cc/internal/oci"
+)
+
+type ContainerRunRequest struct {
+	Kernel   []byte
+	Image    *oci.Image
+	Command  []string
+	Env      []string
+	WorkDir  string
+	User     string
+	MemoryMB uint64
+	CPUs     int
+	Dmesg    bool
+}
+
+type ContainerRunResult struct {
+	ExitCode   int
+	Output     string
+	Transcript string
+}
+
+type ContainerSession struct{}
+
+func StartContainer(ctx context.Context, req ContainerRunRequest) (*ContainerSession, error) {
+	_ = ctx
+	_ = req
+	return nil, fmt.Errorf("hvf container runner is unsupported on this host")
+}
+
+func (s *ContainerSession) Wait() error {
+	return fmt.Errorf("hvf container runner is unsupported on this host")
+}
+
+func (s *ContainerSession) Close() error {
+	return nil
+}
+
+func RunContainer(ctx context.Context, req ContainerRunRequest) (ContainerRunResult, error) {
+	_ = ctx
+	_ = req
+	return ContainerRunResult{}, fmt.Errorf("hvf container runner is unsupported on this host")
+}

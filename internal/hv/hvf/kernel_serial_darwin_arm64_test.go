@@ -15,19 +15,23 @@ import (
 	"time"
 
 	"j5.nz/cc/internal/kernel/alpine"
-	"j5.nz/cc/internal/linux/initramfs"
 	bootarm64 "j5.nz/cc/internal/linux/boot/arm64"
+	"j5.nz/cc/internal/linux/initramfs"
 	"j5.nz/cc/internal/serial"
 )
 
 const (
-	testMemoryBase    = 0xa0000000
-	testMemoryBase2   = 0xc0000000
-	testMemorySize    = 256 << 20
-	gicDistributorMin = 0x08000000
-	gicDistributorMax = gicDistributorMin + 0x00010000
-	gicRedistribMin   = 0x080a0000
-	gicRedistribMax   = gicRedistribMin + 0x00020000
+	testMemoryBase     = 0xa0000000
+	testMemoryBase2    = 0xc0000000
+	testMemorySize     = 256 << 20
+	gicDistributorMin  = 0x08000000
+	gicDistributorMax  = gicDistributorMin + 0x00010000
+	gicRedistribMin    = 0x080a0000
+	gicRedistribMax    = gicRedistribMin + 0x00020000
+	testUARTSPI        = 33
+	irqReadyMarker     = "===IRQ_READY===\n"
+	irqBeforeMarker    = "===IRQ_BEFORE==="
+	irqAfterMarker     = "===IRQ_AFTER==="
 )
 
 type bootProbeMode int
@@ -104,6 +108,43 @@ func testBootHelloWorldInit(t *testing.T, vm *VM) {
 		t.Fatalf("serial output did not contain hello world\nserial:\n%s", result.Serial)
 	}
 	t.Logf("serial output:\n%s", result.Serial)
+}
+
+func TestSerialInterruptDelivery(t *testing.T) {
+	vm, err := NewVM()
+	if err != nil {
+		t.Fatalf("NewVM() error = %v", err)
+	}
+	defer vm.Close()
+
+	initBin := buildInterruptProbeInit(t)
+	initrd, err := initramfs.Build([]initramfs.File{
+		{Path: "/dev", Mode: 0o755, Type: initramfs.TypeDirectory},
+		{Path: "/proc", Mode: 0o755, Type: initramfs.TypeDirectory},
+		{Path: "/dev/console", Mode: 0o600, Type: initramfs.TypeCharDevice, DevMajor: 5, DevMinor: 1},
+		{Path: "/dev/kmsg", Mode: 0o600, Type: initramfs.TypeCharDevice, DevMajor: 1, DevMinor: 11},
+		{Path: "/init", Mode: 0o755, Data: initBin},
+	})
+	if err != nil {
+		t.Fatalf("initramfs.Build() error = %v", err)
+	}
+
+	result, err := bootKernelProbeWithInitrd(t, vm, testMemoryBase2, bootProbeUntilBoundary, initrd, irqAfterMarker, 8*time.Second)
+	if err != nil {
+		t.Fatalf("interrupt probe boot error after %d steps: %v\nserial:\n%s", result.Steps, err, result.Serial)
+	}
+
+	beforeCount, ok := markedValue(result.Serial, irqBeforeMarker)
+	if !ok {
+		t.Fatalf("missing before marker in serial output\nserial:\n%s", result.Serial)
+	}
+	afterCount, ok := markedValue(result.Serial, irqAfterMarker)
+	if !ok {
+		t.Fatalf("missing interrupt markers in serial output\nserial:\n%s", result.Serial)
+	}
+	if afterCount <= beforeCount {
+		t.Fatalf("irq 13 count did not increase: before=%d after=%d\nserial:\n%s", beforeCount, afterCount, result.Serial)
+	}
 }
 
 func TestKernelBootProgress(t *testing.T) {
@@ -196,14 +237,29 @@ func bootKernelProbeWithInitrd(t *testing.T, vm *VM, memoryBase uint64, mode boo
 	}
 
 	result := bootProbeResult{}
+	irqInjected := false
 	deadline := time.Now().Add(runFor)
 	for time.Now().Before(deadline) {
 		result.Steps++
 		exitInfo, err, stalled := runWithTimeout(vm, 500*time.Millisecond)
 		if stalled {
-			result.HaltReason = "vcpu_run_blocked"
-			result.Serial = serialOut.String()
-			return result, nil
+			if !irqInjected && strings.Contains(serialOut.String(), irqReadyMarker) {
+				uart.InjectRXByte('!')
+				if err := vm.SetIRQ(testUARTSPI, true); err != nil {
+					result.Serial = serialOut.String()
+					return result, err
+				}
+				irqInjected = true
+			}
+			if wantSerial != "" && hasWantedSerial(serialOut.String(), wantSerial) {
+				result.Serial = serialOut.String()
+				return result, nil
+			}
+			if mode == bootProbeFirstSerial && serialOut.Len() > 0 {
+				result.Serial = serialOut.String()
+				return result, nil
+			}
+			continue
 		}
 		if err != nil {
 			result.Serial = serialOut.String()
@@ -213,7 +269,15 @@ func bootKernelProbeWithInitrd(t *testing.T, vm *VM, memoryBase uint64, mode boo
 			result.Serial = serialOut.String()
 			return result, fmt.Errorf("Run() exit info = nil")
 		}
-		if wantSerial != "" && strings.Contains(serialOut.String(), wantSerial) {
+		if !irqInjected && strings.Contains(serialOut.String(), irqReadyMarker) {
+			uart.InjectRXByte('!')
+			if err := vm.SetIRQ(testUARTSPI, true); err != nil {
+				result.Serial = serialOut.String()
+				return result, err
+			}
+			irqInjected = true
+		}
+		if wantSerial != "" && hasWantedSerial(serialOut.String(), wantSerial) {
 			result.Serial = serialOut.String()
 			return result, nil
 		}
@@ -236,7 +300,7 @@ func bootKernelProbeWithInitrd(t *testing.T, vm *VM, memoryBase uint64, mode boo
 			}
 		case ExceptionClassHVC64:
 			result.HVCCount++
-			halt, reason, hvcLog, err := handleTestHVC(vm, mem, memoryBase)
+			halt, reason, hvcLog, err := handleTestHVC(vm, uart, mem, memoryBase)
 			if err != nil {
 				result.Serial = serialOut.String()
 				result.HVCLog = hvcLog
@@ -349,6 +413,261 @@ void _start(void) {
 	return bin
 }
 
+func buildInterruptProbeInit(t *testing.T) []byte {
+	t.Helper()
+
+	src := filepath.Join(t.TempDir(), "init.c")
+	if err := os.WriteFile(src, []byte(`#define AT_FDCWD -100
+#define O_WRONLY 1
+
+typedef unsigned long size_t;
+
+static long syscall1(long n, long a0) {
+	long ret;
+	__asm__ volatile(
+		"mov x8, %1\n"
+		"mov x0, %2\n"
+		"svc #0\n"
+		"mov %0, x0\n"
+		: "=r"(ret)
+		: "r"(n), "r"(a0)
+		: "x0", "x8", "memory");
+	return ret;
+}
+
+static long syscall3(long n, long a0, long a1, long a2) {
+	long ret;
+	__asm__ volatile(
+		"mov x8, %1\n"
+		"mov x0, %2\n"
+		"mov x1, %3\n"
+		"mov x2, %4\n"
+		"svc #0\n"
+		"mov %0, x0\n"
+		: "=r"(ret)
+		: "r"(n), "r"(a0), "r"(a1), "r"(a2)
+		: "x0", "x1", "x2", "x8", "memory");
+	return ret;
+}
+
+static long syscall4(long n, long a0, long a1, long a2, long a3) {
+	long ret;
+	__asm__ volatile(
+		"mov x8, %1\n"
+		"mov x0, %2\n"
+		"mov x1, %3\n"
+		"mov x2, %4\n"
+		"mov x3, %5\n"
+		"svc #0\n"
+		"mov %0, x0\n"
+		: "=r"(ret)
+		: "r"(n), "r"(a0), "r"(a1), "r"(a2), "r"(a3)
+		: "x0", "x1", "x2", "x3", "x8", "memory");
+	return ret;
+}
+
+static long syscall5(long n, long a0, long a1, long a2, long a3, long a4) {
+	long ret;
+	__asm__ volatile(
+		"mov x8, %1\n"
+		"mov x0, %2\n"
+		"mov x1, %3\n"
+		"mov x2, %4\n"
+		"mov x3, %5\n"
+		"mov x4, %6\n"
+		"svc #0\n"
+		"mov %0, x0\n"
+		: "=r"(ret)
+		: "r"(n), "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4)
+		: "x0", "x1", "x2", "x3", "x4", "x8", "memory");
+	return ret;
+}
+
+static void write_fd(long fd, const char* s, size_t n) {
+	while (fd >= 0 && n > 0) {
+		long written = syscall3(64, fd, (long)s, n);
+		if (written <= 0) return;
+		s += written;
+		n -= (size_t)written;
+	}
+}
+
+static void write_all(long consolefd, const char* s, size_t n) {
+	write_fd(consolefd, s, n);
+	write_fd(1, s, n);
+	write_fd(2, s, n);
+}
+
+static size_t append_long(char* buf, long value) {
+	char tmp[32];
+	size_t n = 0;
+	unsigned long u = (unsigned long)value;
+	if (value < 0) {
+		*buf++ = '-';
+		u = (unsigned long)(-value);
+	}
+	do {
+		tmp[n++] = (char)('0' + (u % 10));
+		u /= 10;
+	} while (u != 0);
+	for (size_t i = 0; i < n; i++) {
+		buf[i] = tmp[n - 1 - i];
+	}
+	return n + (value < 0 ? 1 : 0);
+}
+
+static void write_status(long consolefd, const char* prefix, long value) {
+	char buf[96];
+	size_t n = 0;
+	while (prefix[n] != 0) {
+		buf[n] = prefix[n];
+		n++;
+	}
+	n += append_long(buf + n, value);
+	buf[n++] = '\n';
+	write_all(consolefd, buf, n);
+}
+
+static long read_irq_count(long irq) {
+	char buf[8192];
+	long fd = syscall4(56, AT_FDCWD, (long)"/proc/interrupts", 0, 0);
+	if (fd < 0) {
+		return fd;
+	}
+	long n = syscall3(63, fd, (long)buf, sizeof(buf));
+	syscall1(57, fd);
+	if (n <= 0) {
+		return n;
+	}
+	for (long i = 0; i < n; i++) {
+		long start = i;
+		while (i < n && buf[i] != '\n') {
+			i++;
+		}
+		long end = i;
+		long pos = start;
+		long value = 0;
+		long seen = 0;
+		long currentIRQ = -1;
+		while (pos < end) {
+			char c = buf[pos];
+			if (c >= '0' && c <= '9') {
+				long num = 0;
+				while (pos < end && buf[pos] >= '0' && buf[pos] <= '9') {
+					num = num*10 + (long)(buf[pos] - '0');
+					pos++;
+				}
+				if (pos < end && buf[pos] == ':') {
+					currentIRQ = num;
+				} else if (currentIRQ == irq && seen == 0) {
+					value = num;
+					seen = 1;
+					break;
+				}
+				continue;
+			}
+			pos++;
+		}
+		if (seen != 0) {
+			return value;
+		}
+	}
+	return -1000;
+}
+
+static void write_irq_count(long outfd, long kfd, const char* prefix, long value) {
+	write_status(outfd, prefix, value);
+	write_status(kfd, prefix, value);
+}
+
+void _start(void) {
+	static const char console[] = "/dev/console";
+	static const char kmsg[] = "/dev/kmsg";
+	static const char start[] = "===IRQ_START===\n";
+	static const char ready[] = "===IRQ_READY===\n";
+	static const char before[] = "===IRQ_BEFORE===";
+	static const char after[] = "===IRQ_AFTER===";
+
+	long fd = syscall4(56, AT_FDCWD, (long)console, O_WRONLY, 0);
+	long kfd = syscall4(56, AT_FDCWD, (long)kmsg, O_WRONLY, 0);
+	long mountRet;
+	write_all(fd, start, sizeof(start) - 1);
+	write_fd(kfd, "<0>===IRQ_START===\n", sizeof("<0>===IRQ_START===\n") - 1);
+	write_status(fd, "===CONSOLE_FD===", fd);
+	write_status(kfd, "<0>===CONSOLE_FD===", fd);
+	mountRet = syscall5(40, (long)"proc", (long)"/proc", (long)"proc", 0, 0);
+	write_status(fd, "===MOUNT_PROC===", mountRet);
+	write_status(kfd, "<0>===MOUNT_PROC===", mountRet);
+	write_irq_count(fd, kfd, before, read_irq_count(13));
+	write_all(fd, ready, sizeof(ready) - 1);
+	write_fd(kfd, "<0>===IRQ_READY===\n", sizeof("<0>===IRQ_READY===\n") - 1);
+	for (volatile unsigned long i = 0; i < 50000UL; i++) {
+		__asm__ volatile("" ::: "memory");
+	}
+	write_irq_count(fd, kfd, after, read_irq_count(13));
+	for (;;) {
+		__asm__ volatile("wfe");
+	}
+}
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(init.c) error = %v", err)
+	}
+
+	out := filepath.Join(filepath.Dir(src), "init")
+	cmd := exec.Command("clang",
+		"-target", "aarch64-linux-gnu",
+		"-nostdlib",
+		"-static",
+		"-fuse-ld=lld",
+		"-Wl,-e,_start",
+		"-Wl,--build-id=none",
+		"-o", out,
+		src,
+	)
+	buildOut, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("clang build init error = %v\n%s", err, string(buildOut))
+	}
+
+	bin, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("ReadFile(init) error = %v", err)
+	}
+	return bin
+}
+
+func markedValue(serial, begin string) (int, bool) {
+	start := strings.Index(serial, begin)
+	if start < 0 {
+		return 0, false
+	}
+	start += len(begin)
+	end := start
+	for end < len(serial) && serial[end] >= '0' && serial[end] <= '9' {
+		end++
+	}
+	if end == start {
+		return 0, false
+	}
+	n := 0
+	for _, ch := range serial[start:end] {
+		n = n*10 + int(ch-'0')
+	}
+	return n, true
+}
+
+func hasWantedSerial(serial, want string) bool {
+	if !strings.HasSuffix(want, "===") {
+		return strings.Contains(serial, want)
+	}
+	start := strings.Index(serial, want)
+	if start < 0 {
+		return false
+	}
+	start += len(want)
+	return start < len(serial) && serial[start] >= '0' && serial[start] <= '9'
+}
+
 func runWithTimeout(vm *VM, timeout time.Duration) (*VcpuExit, error, bool) {
 	resCh := make(chan runResult, 1)
 	go func() {
@@ -417,7 +736,7 @@ func handleTestDataAbort(vm *VM, uart *serial.UART8250, exitInfo *VcpuExit) erro
 	return vm.AdvanceProgramCounter()
 }
 
-func handleTestHVC(vm *VM, mem []byte, memoryBase uint64) (halt bool, reason string, hvcLog string, err error) {
+func handleTestHVC(vm *VM, uart *serial.UART8250, mem []byte, memoryBase uint64) (halt bool, reason string, hvcLog string, err error) {
 	x0, err := vm.GetReg(hvRegX0)
 	if err != nil {
 		return false, "", "", err
@@ -437,10 +756,17 @@ func handleTestHVC(vm *VM, mem []byte, memoryBase uint64) (halt bool, reason str
 		psciNotSupported    = 0xffffffff
 		psciInvalidParams   = 0xfffffffe
 		psciTosNotPresent   = 2
+		testInjectSerialIRQ = 0xcc03000d
 	)
 
 	var ret uint64
 	switch x0 {
+	case testInjectSerialIRQ:
+		uart.InjectRXByte('!')
+		if err := vm.SetIRQ(testUARTSPI, true); err != nil {
+			return false, "", "", err
+		}
+		ret = 0
 	case psciVersion:
 		ret = 0x00010000
 	case psciMigrateInfoType:

@@ -26,17 +26,20 @@ type UART8250 struct {
 	stride uint64
 	out    io.Writer
 
-	dll        byte
-	dlm        byte
-	ier        byte
-	fcr        byte
-	lcr        byte
-	mcr        byte
-	lsr        byte
-	scr        byte
-	rbr        byte
-	pendingIIR byte
-	skipLF     bool
+	dll         byte
+	dlm         byte
+	ier         byte
+	fcr         byte
+	lcr         byte
+	mcr         byte
+	lsr         byte
+	msrStatus   byte
+	msrDelta    byte
+	scr         byte
+	rbr         byte
+	pendingIIR  byte
+	fifoEnabled bool
+	skipLF      bool
 }
 
 func NewUART8250(base uint64, regShift uint32, out io.Writer) *UART8250 {
@@ -44,7 +47,7 @@ func NewUART8250(base uint64, regShift uint32, out io.Writer) *UART8250 {
 	if stride == 0 {
 		stride = 1
 	}
-	return &UART8250{
+	u := &UART8250{
 		base:       base,
 		size:       UART8250Size,
 		stride:     stride,
@@ -52,6 +55,9 @@ func NewUART8250(base uint64, regShift uint32, out io.Writer) *UART8250 {
 		lsr:        uartLSRTHRE | uartLSRTEMT,
 		pendingIIR: 0x01,
 	}
+	u.updateModemStatus()
+	u.updateInterrupts()
+	return u
 }
 
 func (u *UART8250) Contains(addr uint64, size int) bool {
@@ -102,6 +108,12 @@ func (u *UART8250) ReadValue(addr uint64, size int) (uint64, error) {
 	return binary.LittleEndian.Uint64(buf[:]), nil
 }
 
+func (u *UART8250) InjectRXByte(value byte) {
+	u.rbr = value
+	u.lsr |= uartLSRDataReady
+	u.updateInterrupts()
+}
+
 func (u *UART8250) writeByte(addr uint64, value byte) error {
 	reg, err := u.registerAt(addr)
 	if err != nil {
@@ -142,20 +154,20 @@ func (u *UART8250) writeRegister(reg uint16, value byte) {
 			return
 		}
 		u.lsr &^= uartLSRTHRE
+		u.updateInterrupts()
 		u.transmit(value)
 	case 1:
 		if u.lcr&uartLCRDLAB != 0 {
 			u.dlm = value
 			return
 		}
-		u.ier = value & 0x0f
-		u.updateInterrupts()
+		u.setIER(value)
 	case 2:
-		u.fcr = value
+		u.setFCR(value)
 	case 3:
 		u.lcr = value
 	case 4:
-		u.mcr = value
+		u.setMCR(value)
 	case 7:
 		u.scr = value
 	}
@@ -186,7 +198,7 @@ func (u *UART8250) readRegister(reg uint16) byte {
 	case 5:
 		return u.lsr
 	case 6:
-		return 0xb0
+		return u.modemStatus()
 	case 7:
 		return u.scr
 	default:
@@ -195,13 +207,18 @@ func (u *UART8250) readRegister(reg uint16) byte {
 }
 
 func (u *UART8250) updateInterrupts() {
-	u.pendingIIR = 0x01
+	interrupt := byte(0x01)
 	switch {
+	case u.ier&0x04 != 0 && (u.lsr&0x1e) != 0:
+		interrupt = 0x06
 	case u.ier&0x01 != 0 && u.lsr&uartLSRDataReady != 0:
-		u.pendingIIR = 0x04
+		interrupt = 0x04
 	case u.ier&0x02 != 0 && u.lsr&uartLSRTHRE != 0:
-		u.pendingIIR = 0x02
+		interrupt = 0x02
+	case u.ier&0x08 != 0 && u.msrDelta != 0:
+		interrupt = 0x00
 	}
+	u.pendingIIR = interrupt
 }
 
 func (u *UART8250) transmit(value byte) {
@@ -229,4 +246,52 @@ func (u *UART8250) transmit(value byte) {
 	}
 	u.lsr |= uartLSRTHRE | uartLSRTEMT
 	u.updateInterrupts()
+}
+
+func (u *UART8250) clearRX() {
+	u.rbr = 0
+	u.lsr &^= uartLSRDataReady
+	u.updateInterrupts()
+}
+
+func (u *UART8250) setIER(value byte) {
+	u.ier = value & 0x0f
+	u.updateInterrupts()
+}
+
+func (u *UART8250) setFCR(value byte) {
+	if value&0x02 != 0 {
+		u.clearRX()
+	}
+	u.fcr = value
+	u.fifoEnabled = value&0x01 != 0
+}
+
+func (u *UART8250) setMCR(value byte) {
+	prev := u.mcr
+	u.mcr = value & 0x1f
+	if prev&uartMCRLoop != 0 && u.mcr&uartMCRLoop == 0 {
+		u.clearRX()
+	}
+	u.updateModemStatus()
+	u.updateInterrupts()
+}
+
+func (u *UART8250) modemStatus() byte {
+	value := u.msrStatus | u.msrDelta
+	u.msrDelta = 0
+	return value
+}
+
+func (u *UART8250) updateModemStatus() {
+	const (
+		bitCTS = 1 << 4
+		bitDSR = 1 << 5
+		bitRI  = 1 << 6
+		bitDCD = 1 << 7
+	)
+	u.msrStatus = bitCTS | bitDSR | bitDCD
+	if u.mcr&0x04 != 0 {
+		u.msrStatus |= bitRI
+	}
 }
