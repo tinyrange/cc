@@ -35,9 +35,11 @@ const (
 	containerFSBase       = 0x0a101000
 	containerFSSize       = 0x1000
 	containerFSIRQ        = 41
+	containerUARTSPI      = 33
 	containerRootFSTag    = "rootfs"
 	commandBeginMarker    = "__CCX3_BEGIN__"
 	commandExitMarkerPref = "__CCX3_EXIT__:"
+	arm64VirtualTimerPPI  = 27
 )
 
 type ContainerRunRequest struct {
@@ -45,6 +47,7 @@ type ContainerRunRequest struct {
 	Init     []byte
 	Modules  []alpine.Module
 	Image    *oci.Image
+	RootFS   virtio.FSBackend
 	Command  []string
 	Env      []string
 	WorkDir  string
@@ -116,8 +119,8 @@ func RunContainer(ctx context.Context, req ContainerRunRequest) (ContainerRunRes
 }
 
 func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- error) (ContainerRunResult, error) {
-	if req.Image == nil {
-		return ContainerRunResult{}, fmt.Errorf("image is required")
+	if req.Image == nil && req.RootFS == nil {
+		return ContainerRunResult{}, fmt.Errorf("image or rootfs backend is required")
 	}
 	if len(req.Kernel) == 0 {
 		return ContainerRunResult{}, fmt.Errorf("kernel is required")
@@ -126,23 +129,32 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 		return ContainerRunResult{}, fmt.Errorf("only 1 CPU is supported")
 	}
 	user := strings.TrimSpace(req.User)
-	if user == "" {
+	if user == "" && req.Image != nil {
 		user = strings.TrimSpace(req.Image.Config.User)
 	}
 	if user != "" && user != "root" && user != "0" && user != "0:0" {
 		return ContainerRunResult{}, fmt.Errorf("only root user is supported")
 	}
 
-	command := req.Image.Command(req.Command)
-	if len(command) == 0 {
-		command = []string{"/bin/sh"}
+	var command []string
+	switch {
+	case req.Image != nil:
+		command = req.Image.Command(req.Command)
+		if len(command) == 0 {
+			command = []string{"/bin/sh"}
+		}
+	default:
+		command = append([]string(nil), req.Command...)
+		if len(command) == 0 {
+			return ContainerRunResult{}, fmt.Errorf("command is required when running without an image")
+		}
 	}
 	if len(req.Init) == 0 {
 		return ContainerRunResult{}, fmt.Errorf("guest init binary is required")
 	}
 
 	workDir := req.WorkDir
-	if workDir == "" {
+	if workDir == "" && req.Image != nil {
 		workDir = req.Image.Config.WorkingDir
 	}
 	if workDir == "" {
@@ -152,7 +164,11 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 		return ContainerRunResult{}, fmt.Errorf("workdir must be absolute")
 	}
 
-	env := mergeEnv(req.Image.Config.Env, req.Env)
+	var baseEnv []string
+	if req.Image != nil {
+		baseEnv = req.Image.Config.Env
+	}
+	env := mergeEnv(baseEnv, req.Env)
 	if !hasEnvKey(env, "PATH") {
 		env = append(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	}
@@ -160,9 +176,12 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 		env = append(env, "HOME=/root")
 	}
 
-	command, err := resolveGuestCommand(req.Image.RootFSDir, command, env)
-	if err != nil {
-		return ContainerRunResult{}, err
+	var err error
+	if req.Image != nil {
+		command, err = resolveGuestCommand(req.Image.RootFSDir, command, env)
+		if err != nil {
+			return ContainerRunResult{}, err
+		}
 	}
 	configJSON, err := json.Marshal(guestInitConfig{
 		Command:          command,
@@ -223,12 +242,19 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	var serialOut bytes.Buffer
 	var consoleOut bytes.Buffer
 	var fsTrace bytes.Buffer
+	var runTrace bytes.Buffer
 	uart := serial.NewUART8250(bootarm64.DefaultUARTBase, bootarm64.DefaultUARTRegShift, &serialOut)
+	uart.AttachIRQ(vm, containerUARTSPI)
 	console := virtio.NewConsole(containerConsoleBase, containerConsoleSize, containerConsoleIRQ, &consoleOut)
 	console.Attach(vm, vm)
-	fsdev := virtio.NewFS(containerFSBase, containerFSSize, containerFSIRQ, containerRootFSTag, virtio.NewPassthroughFS(req.Image.RootFSDir))
+	rootFSBackend := req.RootFS
+	if rootFSBackend == nil {
+		rootFSBackend = virtio.NewImageFS(req.Image.RootFSDir, req.Image.FSMetadata)
+	}
+	fsdev := virtio.NewFS(containerFSBase, containerFSSize, containerFSIRQ, containerRootFSTag, rootFSBackend)
 	fsdev.Attach(vm, vm)
 	fsdev.Log = &fsTrace
+	fsdev.Strict = true
 
 	plan, err := bootarm64.PrepareBoot(mem, req.Kernel, bootarm64.BootOptions{
 		MemoryBase: containerMemoryBase,
@@ -269,16 +295,28 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	}
 
 	readySent := false
+	stallSamples := 0
+	var lastSamplePC uint64
+	var lastSampleCPSR uint64
+	includeTraceOnExit := os.Getenv("CCX3_DEBUG_VIRTIOFS") != ""
 	for {
-		exitInfo, err, stalled := runWithCancel(ctx, vm, 500*time.Millisecond)
+		exitInfo, err, stalled := runWithCancel(ctx, vm, 5*time.Second)
 		if stalled {
+			pc, _ := vm.GetReg(hvRegPC)
+			cpsr, _ := vm.GetReg(hvRegCPSR)
+			if stallSamples < 16 && (stallSamples == 0 || pc != lastSamplePC || cpsr != lastSampleCPSR) {
+				fmt.Fprintf(&runTrace, "stall pc=%#x cpsr=%#x transcript_len=%d\n", pc, cpsr, serialOut.Len())
+				lastSamplePC = pc
+				lastSampleCPSR = cpsr
+				stallSamples++
+			}
 			if ctx.Err() != nil {
-				return ContainerRunResult{}, fmt.Errorf("%w\nserial:\n%s\nvirtio-fs:\n%s", ctx.Err(), serialOut.String(), fsTrace.String())
+				return ContainerRunResult{}, fmt.Errorf("%w\npc=%#x cpsr=%#x\nrun:\n%sserial:\n%s\nvirtio-fs:\n%s", ctx.Err(), pc, cpsr, runTrace.String(), serialOut.String(), fsTrace.String())
 			}
 			continue
 		}
 		if err != nil {
-			return ContainerRunResult{}, fmt.Errorf("%w\nserial:\n%s\nvirtio-fs:\n%s", err, serialOut.String(), fsTrace.String())
+			return ContainerRunResult{}, fmt.Errorf("%w\nrun:\n%sserial:\n%s\nvirtio-fs:\n%s", err, runTrace.String(), serialOut.String(), fsTrace.String())
 		}
 
 		transcript := serialOut.String()
@@ -291,6 +329,9 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 			}
 		}
 		if exitCode, output, ok := extractCommandResult(transcript, req.Dmesg); ok {
+			if includeTraceOnExit {
+				transcript = transcript + "\n[virtio-fs trace]\n" + fsTrace.String()
+			}
 			return ContainerRunResult{
 				ExitCode:   exitCode,
 				Output:     output,
@@ -300,6 +341,12 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 
 		if exitInfo == nil {
 			return ContainerRunResult{}, fmt.Errorf("vcpu returned nil exit info")
+		}
+		if exitInfo.Reason == hvExitReasonVTimerActivated {
+			if err := injectVirtualTimerPPI(vm); err != nil {
+				return ContainerRunResult{}, fmt.Errorf("inject virtual timer ppi: %w", err)
+			}
+			continue
 		}
 		if exitInfo.Reason != hvExitReasonException {
 			return ContainerRunResult{}, fmt.Errorf("unexpected exit reason %v", exitInfo.Reason)
@@ -317,17 +364,21 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 			}
 			if halt {
 				if exitCode, output, ok := extractCommandResult(serialOut.String(), req.Dmesg); ok {
+					transcript := serialOut.String()
+					if includeTraceOnExit {
+						transcript = transcript + "\n[virtio-fs trace]\n" + fsTrace.String()
+					}
 					return ContainerRunResult{
 						ExitCode:   exitCode,
 						Output:     output,
-						Transcript: serialOut.String(),
+						Transcript: transcript,
 					}, nil
 				}
 				return ContainerRunResult{}, fmt.Errorf("guest halted before command completed\nserial:\n%s\nvirtio-fs:\n%s", serialOut.String(), fsTrace.String())
 			}
 		default:
-			return ContainerRunResult{}, fmt.Errorf("unexpected exception class %#x syndrome=%#x physical=%#x\nserial:\n%s\nvirtio-fs:\n%s",
-				DecodeExceptionClass(exitInfo.Exception.Syndrome), exitInfo.Exception.Syndrome, uint64(exitInfo.Exception.PhysicalAddress), serialOut.String(), fsTrace.String())
+			return ContainerRunResult{}, fmt.Errorf("unexpected exception class %#x syndrome=%#x physical=%#x\nrun:\n%sserial:\n%s\nvirtio-fs:\n%s",
+				DecodeExceptionClass(exitInfo.Exception.Syndrome), exitInfo.Exception.Syndrome, uint64(exitInfo.Exception.PhysicalAddress), runTrace.String(), serialOut.String(), fsTrace.String())
 		}
 	}
 }
@@ -581,6 +632,30 @@ func handleGICAccess(vm *VM, addr uint64, info DataAbortInfo) (uint64, error) {
 	default:
 		return 0, fmt.Errorf("address %#x outside GIC MMIO ranges", addr)
 	}
+}
+
+func injectVirtualTimerPPI(vm *VM) error {
+	const (
+		gicrISENABLER0 = GICRedistributorReg(0x10100)
+		gicrISPENDR0   = GICRedistributorReg(0x10200)
+		timerMask      = uint64(1) << arm64VirtualTimerPPI
+	)
+
+	enabled, err := vm.GetGICRedistributorReg(gicrISENABLER0)
+	if err == nil && enabled&timerMask == 0 {
+		if err := vm.SetGICRedistributorReg(gicrISENABLER0, enabled|timerMask); err != nil {
+			return err
+		}
+	}
+
+	pending, err := vm.GetGICRedistributorReg(gicrISPENDR0)
+	if err != nil {
+		return err
+	}
+	if pending&timerMask != 0 {
+		return nil
+	}
+	return vm.SetGICRedistributorReg(gicrISPENDR0, timerMask)
 }
 
 func extractCommandResult(serial string, dmesg bool) (int, string, bool) {

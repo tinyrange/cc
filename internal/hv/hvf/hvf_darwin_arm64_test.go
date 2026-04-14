@@ -50,6 +50,16 @@ func TestHVFBringupStages(t *testing.T) {
 		}
 	})
 
+	t.Run("virtual timer is unmasked", func(t *testing.T) {
+		masked, err := vm.GetVTimerMask()
+		if err != nil {
+			t.Fatalf("GetVTimerMask() error = %v", err)
+		}
+		if masked {
+			t.Fatal("virtual timer is masked, want unmasked")
+		}
+	})
+
 	t.Run("single brk exits", func(t *testing.T) {
 		const guestAddr IPA = 0x80000000
 		mem, err := vm.MapAnonymousMemory(uintptr(pageSize), guestAddr, hvMemoryRead|hvMemoryWrite|hvMemoryExec)
@@ -118,5 +128,12 @@ func TestHVFBringupStages(t *testing.T) {
 
 	t.Run("initramfs init prints hello world", func(t *testing.T) {
 		testBootHelloWorldInit(t, vm)
+	})
+
+	t.Run("serial interrupt delivery", func(t *testing.T) {
+		if os.Getenv("CCX3_RUN_HVF_IRQ_TEST") == "" {
+			t.Skip("set CCX3_RUN_HVF_IRQ_TEST=1 to run the serial interrupt delivery test")
+		}
+		testSerialInterruptDelivery(t, vm)
 	})
 }

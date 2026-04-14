@@ -7,35 +7,22 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sync"
-)
-
-var (
-	buildMu   sync.Mutex
-	buildPath string
 )
 
 func Build(ctx context.Context, cacheDir string) ([]byte, error) {
-	buildMu.Lock()
-	defer buildMu.Unlock()
-
-	outPath := buildPath
-	if outPath == "" {
-		root, err := repoRoot()
-		if err != nil {
-			return nil, err
-		}
-		outPath = filepath.Join(cacheDir, "guest-init")
-		if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
-			return nil, fmt.Errorf("create guest init dir: %w", err)
-		}
-		cmd := exec.CommandContext(ctx, "go", "build", "-o", outPath, "./internal/cmd/init")
-		cmd.Dir = root
-		cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=arm64", "CGO_ENABLED=0")
-		if output, err := cmd.CombinedOutput(); err != nil {
-			return nil, fmt.Errorf("build guest init: %w\n%s", err, string(output))
-		}
-		buildPath = outPath
+	root, err := repoRoot()
+	if err != nil {
+		return nil, err
+	}
+	outPath := filepath.Join(cacheDir, "guest-init")
+	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+		return nil, fmt.Errorf("create guest init dir: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, "go", "build", "-o", outPath, "./internal/cmd/init")
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=arm64", "CGO_ENABLED=0")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("build guest init: %w\n%s", err, string(output))
 	}
 	data, err := os.ReadFile(outPath)
 	if err != nil {

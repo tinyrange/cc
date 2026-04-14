@@ -21,9 +21,11 @@ import (
 	"sync"
 
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/fsmeta"
 )
 
 const defaultRegistry = "https://registry-1.docker.io/v2"
+const sharedCacheEnv = "CCX3_OCI_SHARED_CACHE_DIR"
 
 type Store struct {
 	root       string
@@ -39,6 +41,7 @@ type metadata struct {
 	Source       string      `json:"source"`
 	Architecture string      `json:"architecture,omitempty"`
 	RootFSDir    string      `json:"rootfs_dir"`
+	MetadataPath string      `json:"metadata_path,omitempty"`
 	Env          []string    `json:"env,omitempty"`
 	Entrypoint   []string    `json:"entrypoint,omitempty"`
 	Cmd          []string    `json:"cmd,omitempty"`
@@ -57,6 +60,7 @@ type Image struct {
 	Source       string
 	Architecture string
 	RootFSDir    string
+	FSMetadata   map[string]fsmeta.Entry
 	Config       RuntimeConfig
 }
 
@@ -195,11 +199,24 @@ func (s *Store) Open(name string) (*Image, error) {
 	if err != nil {
 		return nil, err
 	}
+	var entries map[string]fsmeta.Entry
+	if meta.MetadataPath != "" {
+		buf, err := os.ReadFile(meta.MetadataPath)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("read fs metadata: %w", err)
+		}
+		if len(buf) > 0 {
+			if err := json.Unmarshal(buf, &entries); err != nil {
+				return nil, fmt.Errorf("decode fs metadata: %w", err)
+			}
+		}
+	}
 	return &Image{
 		Name:         meta.Name,
 		Source:       meta.Source,
 		Architecture: meta.Architecture,
 		RootFSDir:    meta.RootFSDir,
+		FSMetadata:   entries,
 		Config: RuntimeConfig{
 			Env:        append([]string(nil), meta.Env...),
 			Entrypoint: append([]string(nil), meta.Entrypoint...),
@@ -217,6 +234,16 @@ func (s *Store) Pull(ctx context.Context, name, source string) (client.ImageStat
 	}
 	if source == "" {
 		return client.ImageState{}, fmt.Errorf("image source is required")
+	}
+	if state, ok, err := s.existingState(name, source); err != nil {
+		return client.ImageState{}, err
+	} else if ok {
+		return state, nil
+	}
+	if state, ok, err := s.restoreFromSharedCache(name, source); err != nil {
+		return client.ImageState{}, err
+	} else if ok {
+		return state, nil
 	}
 
 	s.mu.Lock()
@@ -246,7 +273,24 @@ func (s *Store) pull(ctx context.Context, name, source string) error {
 	if err := os.MkdirAll(s.root, 0o755); err != nil {
 		return fmt.Errorf("create image store: %w", err)
 	}
+	if err := os.MkdirAll(s.sharedRoot(), 0o755); err != nil {
+		return fmt.Errorf("create shared image store: %w", err)
+	}
 
+	sharedName := sharedImageKey(source)
+	shared := NewStore(s.sharedRoot())
+	shared.httpClient = s.httpClient
+	if _, ok, err := shared.existingState(sharedName, source); err != nil {
+		return err
+	} else if !ok {
+		if err := shared.pullDirect(ctx, sharedName, source); err != nil {
+			return err
+		}
+	}
+	return s.cloneFromStore(shared, sharedName, name, source)
+}
+
+func (s *Store) pullDirect(ctx context.Context, name, source string) error {
 	registry, imageName, tag, err := ParseImageRef(source)
 	if err != nil {
 		return err
@@ -280,14 +324,25 @@ func (s *Store) pull(ctx context.Context, name, source string) error {
 	if err := os.MkdirAll(rootfsDir, 0o755); err != nil {
 		return fmt.Errorf("create rootfs dir: %w", err)
 	}
+	fsEntries := map[string]fsmeta.Entry{
+		"/": {UID: 0, GID: 0, Mode: fsmeta.LinuxModeFromFileMode(os.ModeDir | 0o755)},
+	}
 	for _, layer := range mani.Layers {
 		layerBlob, err := s.fetchBlob(ctx, reg, imageName, layer.Digest)
 		if err != nil {
 			return fmt.Errorf("fetch layer %s: %w", layer.Digest, err)
 		}
-		if err := applyLayer(rootfsDir, layer.MediaType, layerBlob); err != nil {
+		if err := applyLayer(rootfsDir, layer.MediaType, layerBlob, fsEntries); err != nil {
 			return fmt.Errorf("apply layer %s: %w", layer.Digest, err)
 		}
+	}
+	metadataPath := filepath.Join(imageDir, "rootfs.metadata.json")
+	fsMetaBuf, err := json.MarshalIndent(fsEntries, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal fs metadata: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "rootfs.metadata.json"), fsMetaBuf, 0o644); err != nil {
+		return fmt.Errorf("write fs metadata: %w", err)
 	}
 
 	meta := metadata{
@@ -295,6 +350,7 @@ func (s *Store) pull(ctx context.Context, name, source string) error {
 		Source:       source,
 		Architecture: cfg.Architecture,
 		RootFSDir:    filepath.Join(imageDir, "rootfs"),
+		MetadataPath: metadataPath,
 		Env:          append([]string(nil), cfg.Config.Env...),
 		Entrypoint:   append([]string(nil), cfg.Config.Entrypoint...),
 		Cmd:          append([]string(nil), cfg.Config.Cmd...),
@@ -311,6 +367,79 @@ func (s *Store) pull(ctx context.Context, name, source string) error {
 	}
 	if err := s.writeMetadata(name, meta); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (s *Store) existingState(name, source string) (client.ImageState, bool, error) {
+	meta, err := s.readMetadata(name)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return client.ImageState{}, false, nil
+		}
+		return client.ImageState{}, false, err
+	}
+	if meta.Source != source {
+		return client.ImageState{}, false, nil
+	}
+	if !dirExists(meta.RootFSDir) {
+		return client.ImageState{}, false, nil
+	}
+	return client.ImageState{Name: meta.Name, Source: meta.Source, Status: "downloaded"}, true, nil
+}
+
+func (s *Store) restoreFromSharedCache(name, source string) (client.ImageState, bool, error) {
+	shared := NewStore(s.sharedRoot())
+	sharedName := sharedImageKey(source)
+	meta, err := shared.readMetadata(sharedName)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return client.ImageState{}, false, nil
+		}
+		return client.ImageState{}, false, err
+	}
+	if meta.Source != source || !dirExists(meta.RootFSDir) {
+		return client.ImageState{}, false, nil
+	}
+	if err := s.cloneFromStore(shared, sharedName, name, source); err != nil {
+		return client.ImageState{}, false, err
+	}
+	return client.ImageState{Name: name, Source: source, Status: "downloaded"}, true, nil
+}
+
+func (s *Store) cloneFromStore(src *Store, srcName, dstName, source string) error {
+	srcMeta, err := src.readMetadata(srcName)
+	if err != nil {
+		return err
+	}
+	srcDir := src.imageDir(srcName)
+	dstDir := s.imageDir(dstName)
+	tmpDir := dstDir + ".tmp"
+	if err := os.RemoveAll(tmpDir); err != nil {
+		return fmt.Errorf("remove temp image dir: %w", err)
+	}
+	if err := copyTree(srcDir, tmpDir); err != nil {
+		return fmt.Errorf("copy cached image: %w", err)
+	}
+	meta := srcMeta
+	meta.Name = dstName
+	meta.Source = source
+	meta.RootFSDir = filepath.Join(dstDir, "rootfs")
+	if meta.MetadataPath != "" {
+		meta.MetadataPath = filepath.Join(dstDir, "rootfs.metadata.json")
+	}
+	buf, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal image metadata: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "image.json"), buf, 0o644); err != nil {
+		return fmt.Errorf("write image metadata: %w", err)
+	}
+	if err := os.RemoveAll(dstDir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove old image dir: %w", err)
+	}
+	if err := os.Rename(tmpDir, dstDir); err != nil {
+		return fmt.Errorf("activate image dir: %w", err)
 	}
 	return nil
 }
@@ -538,6 +667,17 @@ func (s *Store) imageDir(name string) string {
 	return filepath.Join(s.root, name)
 }
 
+func (s *Store) sharedRoot() string {
+	if root := strings.TrimSpace(os.Getenv(sharedCacheEnv)); root != "" {
+		return root
+	}
+	cacheRoot, err := os.UserCacheDir()
+	if err != nil || cacheRoot == "" {
+		return filepath.Join(os.TempDir(), "ccx3-oci-cache")
+	}
+	return filepath.Join(cacheRoot, "ccx3", "oci")
+}
+
 func (img *Image) Command(override []string) []string {
 	if len(override) > 0 {
 		if len(img.Config.Entrypoint) > 0 {
@@ -611,7 +751,7 @@ func parseAuthenticate(value string) (map[string]string, error) {
 	return ret, nil
 }
 
-func applyLayer(rootfsDir, mediaType string, blob []byte) error {
+func applyLayer(rootfsDir, mediaType string, blob []byte, entries map[string]fsmeta.Entry) error {
 	var src io.Reader = bytes.NewReader(blob)
 	if isGzipMediaType(mediaType, blob) {
 		gzr, err := gzip.NewReader(src)
@@ -644,13 +784,21 @@ func applyLayer(rootfsDir, mediaType string, blob []byte) error {
 			if err := clearDirectoryContents(opaqueDir); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return err
 			}
+			opaquePrefix := fsmeta.Normalize(dir)
+			for key := range entries {
+				if key != opaquePrefix && strings.HasPrefix(key, opaquePrefix+"/") {
+					delete(entries, key)
+				}
+			}
 			continue
 		}
 		if strings.HasPrefix(base, ".wh.") {
-			deleted := filepath.Join(rootfsDir, filepath.FromSlash(path.Join(dir, strings.TrimPrefix(base, ".wh."))))
+			deletedName := path.Join(dir, strings.TrimPrefix(base, ".wh."))
+			deleted := filepath.Join(rootfsDir, filepath.FromSlash(deletedName))
 			if err := os.RemoveAll(deleted); err != nil && !errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("apply whiteout %s: %w", deleted, err)
 			}
+			delete(entries, fsmeta.Normalize(deletedName))
 			continue
 		}
 
@@ -693,6 +841,11 @@ func applyLayer(rootfsDir, mediaType string, blob []byte) error {
 		case tar.TypeXGlobalHeader:
 		default:
 			return fmt.Errorf("unsupported layer entry type %d for %s", hdr.Typeflag, name)
+		}
+		entries[fsmeta.Normalize(name)] = fsmeta.Entry{
+			UID:  uint32(hdr.Uid),
+			GID:  uint32(hdr.Gid),
+			Mode: fsmeta.LinuxModeFromTarHeader(hdr),
 		}
 	}
 }
@@ -739,6 +892,64 @@ func digestToFileName(digest string) string {
 	}
 	sum := sha256.Sum256([]byte(digest))
 	return hex.EncodeToString(sum[:])
+}
+
+func sharedImageKey(source string) string {
+	sum := sha256.Sum256([]byte(nativeArch() + "\n" + source))
+	return hex.EncodeToString(sum[:16])
+}
+
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+func copyTree(srcDir, dstDir string) error {
+	return filepath.WalkDir(srcDir, func(current string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(srcDir, current)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dstDir, rel)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return err
+		}
+		switch mode := info.Mode(); {
+		case mode.IsDir():
+			return os.MkdirAll(target, mode.Perm())
+		case mode&os.ModeSymlink != 0:
+			link, err := os.Readlink(current)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(link, target)
+		case mode.IsRegular():
+			return copyFile(current, target, mode.Perm())
+		default:
+			return fmt.Errorf("unsupported file mode %v at %s", mode, current)
+		}
+	})
+}
+
+func copyFile(srcPath, dstPath string, mode os.FileMode) error {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	dst, err := os.OpenFile(dstPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(dst, src); err != nil {
+		_ = dst.Close()
+		return err
+	}
+	return dst.Close()
 }
 
 func nativeArch() string {

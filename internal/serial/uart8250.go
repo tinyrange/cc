@@ -25,6 +25,8 @@ type UART8250 struct {
 	size   uint64
 	stride uint64
 	out    io.Writer
+	irq    irqController
+	irqLine uint32
 
 	dll         byte
 	dlm         byte
@@ -40,6 +42,10 @@ type UART8250 struct {
 	pendingIIR  byte
 	fifoEnabled bool
 	skipLF      bool
+}
+
+type irqController interface {
+	SetIRQ(line uint32, level bool) error
 }
 
 func NewUART8250(base uint64, regShift uint32, out io.Writer) *UART8250 {
@@ -58,6 +64,12 @@ func NewUART8250(base uint64, regShift uint32, out io.Writer) *UART8250 {
 	u.updateModemStatus()
 	u.updateInterrupts()
 	return u
+}
+
+func (u *UART8250) AttachIRQ(irq irqController, irqLine uint32) {
+	u.irq = irq
+	u.irqLine = irqLine
+	u.updateInterrupts()
 }
 
 func (u *UART8250) Contains(addr uint64, size int) bool {
@@ -219,6 +231,9 @@ func (u *UART8250) updateInterrupts() {
 		interrupt = 0x00
 	}
 	u.pendingIIR = interrupt
+	if u.irq != nil && u.irqLine != 0 {
+		_ = u.irq.SetIRQ(u.irqLine, interrupt != 0x01)
+	}
 }
 
 func (u *UART8250) transmit(value byte) {

@@ -21,17 +21,18 @@ import (
 )
 
 const (
-	testMemoryBase     = 0xa0000000
-	testMemoryBase2    = 0xc0000000
-	testMemorySize     = 256 << 20
-	gicDistributorMin  = 0x08000000
-	gicDistributorMax  = gicDistributorMin + 0x00010000
-	gicRedistribMin    = 0x080a0000
-	gicRedistribMax    = gicRedistribMin + 0x00020000
-	testUARTSPI        = 33
-	irqReadyMarker     = "===IRQ_READY===\n"
-	irqBeforeMarker    = "===IRQ_BEFORE==="
-	irqAfterMarker     = "===IRQ_AFTER==="
+	testMemoryBase    = 0xa0000000
+	testMemoryBase2   = 0xc0000000
+	testMemoryBase3   = 0xe0000000
+	testMemorySize    = 256 << 20
+	gicDistributorMin = 0x08000000
+	gicDistributorMax = gicDistributorMin + 0x00010000
+	gicRedistribMin   = 0x080a0000
+	gicRedistribMax   = gicRedistribMin + 0x00020000
+	testUARTSPI       = 33
+	irqReadyMarker    = "===IRQ_READY===\n"
+	irqBeforeMarker   = "===IRQ_BEFORE==="
+	irqAfterMarker    = "===IRQ_AFTER==="
 )
 
 type bootProbeMode int
@@ -110,13 +111,8 @@ func testBootHelloWorldInit(t *testing.T, vm *VM) {
 	t.Logf("serial output:\n%s", result.Serial)
 }
 
-func TestSerialInterruptDelivery(t *testing.T) {
-	vm, err := NewVM()
-	if err != nil {
-		t.Fatalf("NewVM() error = %v", err)
-	}
-	defer vm.Close()
-
+func testSerialInterruptDelivery(t *testing.T, vm *VM) {
+	t.Helper()
 	initBin := buildInterruptProbeInit(t)
 	initrd, err := initramfs.Build([]initramfs.File{
 		{Path: "/dev", Mode: 0o755, Type: initramfs.TypeDirectory},
@@ -129,7 +125,7 @@ func TestSerialInterruptDelivery(t *testing.T) {
 		t.Fatalf("initramfs.Build() error = %v", err)
 	}
 
-	result, err := bootKernelProbeWithInitrd(t, vm, testMemoryBase2, bootProbeUntilBoundary, initrd, irqAfterMarker, 8*time.Second)
+	result, err := bootKernelProbeWithInitrd(t, vm, testMemoryBase3, bootProbeUntilBoundary, initrd, irqAfterMarker, 8*time.Second)
 	if err != nil {
 		t.Fatalf("interrupt probe boot error after %d steps: %v\nserial:\n%s", result.Steps, err, result.Serial)
 	}
@@ -195,6 +191,7 @@ func bootKernelProbeWithInitrd(t *testing.T, vm *VM, memoryBase uint64, mode boo
 
 	var serialOut bytes.Buffer
 	uart := serial.NewUART8250(bootarm64.DefaultUARTBase, bootarm64.DefaultUARTRegShift, &serialOut)
+	uart.AttachIRQ(vm, testUARTSPI)
 
 	plan, err := bootarm64.PrepareBoot(mem, kernelFile, bootarm64.BootOptions{
 		MemoryBase: memoryBase,
@@ -245,10 +242,6 @@ func bootKernelProbeWithInitrd(t *testing.T, vm *VM, memoryBase uint64, mode boo
 		if stalled {
 			if !irqInjected && strings.Contains(serialOut.String(), irqReadyMarker) {
 				uart.InjectRXByte('!')
-				if err := vm.SetIRQ(testUARTSPI, true); err != nil {
-					result.Serial = serialOut.String()
-					return result, err
-				}
 				irqInjected = true
 			}
 			if wantSerial != "" && hasWantedSerial(serialOut.String(), wantSerial) {
@@ -271,10 +264,6 @@ func bootKernelProbeWithInitrd(t *testing.T, vm *VM, memoryBase uint64, mode boo
 		}
 		if !irqInjected && strings.Contains(serialOut.String(), irqReadyMarker) {
 			uart.InjectRXByte('!')
-			if err := vm.SetIRQ(testUARTSPI, true); err != nil {
-				result.Serial = serialOut.String()
-				return result, err
-			}
 			irqInjected = true
 		}
 		if wantSerial != "" && hasWantedSerial(serialOut.String(), wantSerial) {
@@ -763,9 +752,6 @@ func handleTestHVC(vm *VM, uart *serial.UART8250, mem []byte, memoryBase uint64)
 	switch x0 {
 	case testInjectSerialIRQ:
 		uart.InjectRXByte('!')
-		if err := vm.SetIRQ(testUARTSPI, true); err != nil {
-			return false, "", "", err
-		}
 		ret = 0
 	case psciVersion:
 		ret = 0x00010000

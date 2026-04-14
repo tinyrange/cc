@@ -66,59 +66,66 @@ type VcpuExit struct {
 }
 
 const (
-	hvSuccess             Return      = 0
-	hvError               Return      = -0x516bfff
-	hvBusy                Return      = -0x516bffe
-	hvBadArgument         Return      = -0x516bffd
-	hvIllegalGuestState   Return      = -0x516bffc
-	hvNoResources         Return      = -0x516bffb
-	hvNoDevice            Return      = -0x516bffa
-	hvDenied              Return      = -0x516bff9
-	hvUnsupported         Return      = -0x516bff1
-	hvMemoryRead          MemoryFlags = 0x1
-	hvMemoryWrite         MemoryFlags = 0x2
-	hvMemoryExec          MemoryFlags = 0x4
-	hvExitReasonCanceled  ExitReason  = 0
-	hvExitReasonException ExitReason  = 1
-	hvRegX0               Reg         = 0
-	hvRegX1               Reg         = 1
-	hvRegX2               Reg         = 2
-	hvRegX3               Reg         = 3
-	hvRegX4               Reg         = 4
-	hvRegX5               Reg         = 5
-	hvRegX6               Reg         = 6
-	hvRegX7               Reg         = 7
-	hvRegX8               Reg         = 8
-	hvRegX9               Reg         = 9
-	hvRegX10              Reg         = 10
-	hvRegX11              Reg         = 11
-	hvRegX12              Reg         = 12
-	hvRegX13              Reg         = 13
-	hvRegX14              Reg         = 14
-	hvRegX15              Reg         = 15
-	hvRegX16              Reg         = 16
-	hvRegX17              Reg         = 17
-	hvRegX18              Reg         = 18
-	hvRegX19              Reg         = 19
-	hvRegX20              Reg         = 20
-	hvRegX21              Reg         = 21
-	hvRegX22              Reg         = 22
-	hvRegX23              Reg         = 23
-	hvRegX24              Reg         = 24
-	hvRegX25              Reg         = 25
-	hvRegX26              Reg         = 26
-	hvRegX27              Reg         = 27
-	hvRegX28              Reg         = 28
-	hvRegX29              Reg         = 29
-	hvRegX30              Reg         = 30
-	hvRegPC               Reg         = 31
-	hvRegCPSR             Reg         = 34
-	hvRegXZR              Reg         = 0xffffffff
+	hvSuccess                   Return      = 0
+	hvError                     Return      = -0x516bfff
+	hvBusy                      Return      = -0x516bffe
+	hvBadArgument               Return      = -0x516bffd
+	hvIllegalGuestState         Return      = -0x516bffc
+	hvNoResources               Return      = -0x516bffb
+	hvNoDevice                  Return      = -0x516bffa
+	hvDenied                    Return      = -0x516bff9
+	hvUnsupported               Return      = -0x516bff1
+	hvMemoryRead                MemoryFlags = 0x1
+	hvMemoryWrite               MemoryFlags = 0x2
+	hvMemoryExec                MemoryFlags = 0x4
+	hvExitReasonCanceled        ExitReason  = 0
+	hvExitReasonException       ExitReason  = 1
+	hvExitReasonVTimerActivated ExitReason  = 2
+	hvRegX0                     Reg         = 0
+	hvRegX1                     Reg         = 1
+	hvRegX2                     Reg         = 2
+	hvRegX3                     Reg         = 3
+	hvRegX4                     Reg         = 4
+	hvRegX5                     Reg         = 5
+	hvRegX6                     Reg         = 6
+	hvRegX7                     Reg         = 7
+	hvRegX8                     Reg         = 8
+	hvRegX9                     Reg         = 9
+	hvRegX10                    Reg         = 10
+	hvRegX11                    Reg         = 11
+	hvRegX12                    Reg         = 12
+	hvRegX13                    Reg         = 13
+	hvRegX14                    Reg         = 14
+	hvRegX15                    Reg         = 15
+	hvRegX16                    Reg         = 16
+	hvRegX17                    Reg         = 17
+	hvRegX18                    Reg         = 18
+	hvRegX19                    Reg         = 19
+	hvRegX20                    Reg         = 20
+	hvRegX21                    Reg         = 21
+	hvRegX22                    Reg         = 22
+	hvRegX23                    Reg         = 23
+	hvRegX24                    Reg         = 24
+	hvRegX25                    Reg         = 25
+	hvRegX26                    Reg         = 26
+	hvRegX27                    Reg         = 27
+	hvRegX28                    Reg         = 28
+	hvRegX29                    Reg         = 29
+	hvRegX30                    Reg         = 30
+	hvRegPC                     Reg         = 31
+	hvRegCPSR                   Reg         = 34
+	hvRegXZR                    Reg         = 0xffffffff
 
-	hvSysRegSP_EL1   SysReg = 0xe208
-	hvSysRegTTBR1EL1 SysReg = 0xc101
-	hvSysRegMPIDR_EL1 SysReg = 0xc005
-	hvSysRegVBAR_EL1 SysReg = 0xc600
+	hvSysRegSP_EL1           SysReg = 0xe208
+	hvSysRegTTBR1EL1         SysReg = 0xc101
+	hvSysRegMPIDR_EL1        SysReg = 0xc005
+	hvSysRegID_AA64PFR0_EL1  SysReg = 0xc020
+	hvSysRegID_AA64PFR1_EL1  SysReg = 0xc021
+	hvSysRegID_AA64ISAR1_EL1 SysReg = 0xc031
+	hvSysRegID_AA64ISAR2_EL1 SysReg = 0xc032
+	hvSysRegID_AA64ZFR0_EL1  SysReg = 0xc024
+	hvSysRegID_AA64SMFR0_EL1 SysReg = 0xc025
+	hvSysRegVBAR_EL1         SysReg = 0xc600
 
 	hvGICICCRegPMR_EL1     GICICCReg = 0xc230
 	hvGICICCRegCTLR_EL1    GICICCReg = 0xc664
@@ -128,10 +135,11 @@ const (
 )
 
 var (
-	loadOnce sync.Once
-	loadErr  error
-	hvLib    uintptr
-	sysLib   uintptr
+	loadOnce      sync.Once
+	loadErr       error
+	vmLifecycleMu sync.Mutex
+	hvLib         uintptr
+	sysLib        uintptr
 
 	hvVMConfigCreate func() VMConfig
 	hvVMCreate       func(config VMConfig) Return
@@ -139,15 +147,19 @@ var (
 	hvVMMap          func(addr unsafe.Pointer, ipa IPA, size uintptr, flags MemoryFlags) Return
 	hvVMUnmap        func(ipa IPA, size uintptr) Return
 
-	hvVcpuConfigCreate func() VcpuConfig
-	hvVcpuCreate       func(vcpu *VCPU, exit **VcpuExit, config VcpuConfig) Return
-	hvVcpuDestroy      func(vcpu VCPU) Return
-	hvVcpuGetReg       func(vcpu VCPU, reg Reg, value *uint64) Return
-	hvVcpuSetReg       func(vcpu VCPU, reg Reg, value uint64) Return
-	hvVcpuGetSysReg    func(vcpu VCPU, reg SysReg, value *uint64) Return
-	hvVcpuSetSysReg    func(vcpu VCPU, reg SysReg, value uint64) Return
-	hvVcpuRun          func(vcpu VCPU) Return
-	hvVcpusExit        func(vcpus *VCPU, count uint32) Return
+	hvVcpuConfigCreate    func() VcpuConfig
+	hvVcpuCreate          func(vcpu *VCPU, exit **VcpuExit, config VcpuConfig) Return
+	hvVcpuDestroy         func(vcpu VCPU) Return
+	hvVcpuGetReg          func(vcpu VCPU, reg Reg, value *uint64) Return
+	hvVcpuSetReg          func(vcpu VCPU, reg Reg, value uint64) Return
+	hvVcpuGetSysReg       func(vcpu VCPU, reg SysReg, value *uint64) Return
+	hvVcpuSetSysReg       func(vcpu VCPU, reg SysReg, value uint64) Return
+	hvVcpuRun             func(vcpu VCPU) Return
+	hvVcpusExit           func(vcpus *VCPU, count uint32) Return
+	hvVcpuGetVtimerMask   func(vcpu VCPU, masked *bool) Return
+	hvVcpuSetVtimerMask   func(vcpu VCPU, masked bool) Return
+	hvVcpuGetVtimerOffset func(vcpu VCPU, offset *uint64) Return
+	hvVcpuSetVtimerOffset func(vcpu VCPU, offset uint64) Return
 
 	hvGICConfigCreate                  func() GICConfig
 	hvGICGetDistributorReg             func(reg GICDistributorReg, value *uint64) Return
@@ -197,6 +209,10 @@ func load() error {
 		purego.RegisterLibFunc(&hvVcpuSetSysReg, hvLib, "hv_vcpu_set_sys_reg")
 		purego.RegisterLibFunc(&hvVcpuRun, hvLib, "hv_vcpu_run")
 		purego.RegisterLibFunc(&hvVcpusExit, hvLib, "hv_vcpus_exit")
+		purego.RegisterLibFunc(&hvVcpuGetVtimerMask, hvLib, "hv_vcpu_get_vtimer_mask")
+		purego.RegisterLibFunc(&hvVcpuSetVtimerMask, hvLib, "hv_vcpu_set_vtimer_mask")
+		purego.RegisterLibFunc(&hvVcpuGetVtimerOffset, hvLib, "hv_vcpu_get_vtimer_offset")
+		purego.RegisterLibFunc(&hvVcpuSetVtimerOffset, hvLib, "hv_vcpu_set_vtimer_offset")
 
 		purego.RegisterLibFunc(&hvGICConfigCreate, hvLib, "hv_gic_config_create")
 		purego.RegisterLibFunc(&hvGICGetDistributorReg, hvLib, "hv_gic_get_distributor_reg")
@@ -236,6 +252,7 @@ func NewVM() (*VM, error) {
 	if err := load(); err != nil {
 		return nil, err
 	}
+	vmLifecycleMu.Lock()
 
 	v := &VM{
 		threadCh: make(chan func()),
@@ -278,10 +295,23 @@ func NewVM() (*VM, error) {
 			errCh <- fmt.Errorf("set MPIDR_EL1: %w", ret)
 			return
 		}
+		if err := sanitizeFeatureRegs(v.vcpu); err != nil {
+			_ = hvVcpuDestroy(v.vcpu)
+			_ = hvVMDestroy()
+			errCh <- err
+			return
+		}
+		if ret := hvVcpuSetVtimerMask(v.vcpu, false); ret != hvSuccess {
+			_ = hvVcpuDestroy(v.vcpu)
+			_ = hvVMDestroy()
+			errCh <- fmt.Errorf("unmask virtual timer: %w", ret)
+			return
+		}
 		errCh <- initMinimalGICCPUInterface(v)
 	}
 	if err := <-errCh; err != nil {
 		close(v.threadCh)
+		vmLifecycleMu.Unlock()
 		return nil, err
 	}
 	return v, nil
@@ -300,6 +330,81 @@ func createVMWithRetry(cfg VMConfig) Return {
 		time.Sleep(retryDelay)
 	}
 	return hvBusy
+}
+
+func sanitizeFeatureRegs(vcpu VCPU) error {
+	const (
+		idAA64PFR0SVEShift   = 32
+		idAA64PFR1SMEShift   = 24
+		idAA64PFR1MTEShift   = 8
+		idAA64PFR1BTShift    = 0
+		idAA64ISAR1GPIShift  = 28
+		idAA64ISAR1GPAShift  = 24
+		idAA64ISAR1APIShift  = 8
+		idAA64ISAR1APAShift  = 4
+		idAA64ISAR2GPA3Shift = 8
+		idAA64ISAR2APA3Shift = 12
+		idAA64FieldMask      = uint64(0xf)
+	)
+
+	pfr0, ret := getSysRegRaw(vcpu, hvSysRegID_AA64PFR0_EL1)
+	if ret != hvSuccess {
+		return fmt.Errorf("read ID_AA64PFR0_EL1: %w", ret)
+	}
+	pfr1, ret := getSysRegRaw(vcpu, hvSysRegID_AA64PFR1_EL1)
+	if ret != hvSuccess {
+		return fmt.Errorf("read ID_AA64PFR1_EL1: %w", ret)
+	}
+	isar1, ret := getSysRegRaw(vcpu, hvSysRegID_AA64ISAR1_EL1)
+	if ret != hvSuccess {
+		return fmt.Errorf("read ID_AA64ISAR1_EL1: %w", ret)
+	}
+	isar2, ret := getSysRegRaw(vcpu, hvSysRegID_AA64ISAR2_EL1)
+	if ret != hvSuccess {
+		isar2 = 0
+	}
+
+	sanitizedPFR0 := pfr0 &^ (idAA64FieldMask << idAA64PFR0SVEShift)
+	sanitizedPFR1 := pfr1 &
+		^((idAA64FieldMask << idAA64PFR1SMEShift) |
+			(idAA64FieldMask << idAA64PFR1MTEShift) |
+			(idAA64FieldMask << idAA64PFR1BTShift))
+	sanitizedISAR1 := isar1 &
+		^((idAA64FieldMask << idAA64ISAR1GPIShift) |
+			(idAA64FieldMask << idAA64ISAR1GPAShift) |
+			(idAA64FieldMask << idAA64ISAR1APIShift) |
+			(idAA64FieldMask << idAA64ISAR1APAShift))
+	sanitizedISAR2 := isar2 &
+		^((idAA64FieldMask << idAA64ISAR2GPA3Shift) |
+			(idAA64FieldMask << idAA64ISAR2APA3Shift))
+
+	if ret := hvVcpuSetSysReg(vcpu, hvSysRegID_AA64PFR0_EL1, sanitizedPFR0); ret != hvSuccess {
+		return fmt.Errorf("set ID_AA64PFR0_EL1: %w", ret)
+	}
+	if ret := hvVcpuSetSysReg(vcpu, hvSysRegID_AA64PFR1_EL1, sanitizedPFR1); ret != hvSuccess {
+		return fmt.Errorf("set ID_AA64PFR1_EL1: %w", ret)
+	}
+	if ret := hvVcpuSetSysReg(vcpu, hvSysRegID_AA64ISAR1_EL1, sanitizedISAR1); ret != hvSuccess {
+		return fmt.Errorf("set ID_AA64ISAR1_EL1: %w", ret)
+	}
+	if isar2 != 0 {
+		if ret := hvVcpuSetSysReg(vcpu, hvSysRegID_AA64ISAR2_EL1, sanitizedISAR2); ret != hvSuccess {
+			return fmt.Errorf("set ID_AA64ISAR2_EL1: %w", ret)
+		}
+	}
+	if ret := hvVcpuSetSysReg(vcpu, hvSysRegID_AA64ZFR0_EL1, 0); ret != hvSuccess {
+		return fmt.Errorf("set ID_AA64ZFR0_EL1: %w", ret)
+	}
+	if ret := hvVcpuSetSysReg(vcpu, hvSysRegID_AA64SMFR0_EL1, 0); ret != hvSuccess {
+		return fmt.Errorf("set ID_AA64SMFR0_EL1: %w", ret)
+	}
+	return nil
+}
+
+func getSysRegRaw(vcpu VCPU, reg SysReg) (uint64, Return) {
+	var value uint64
+	ret := hvVcpuGetSysReg(vcpu, reg, &value)
+	return value, ret
 }
 
 func createMinimalGIC() error {
@@ -450,6 +555,41 @@ func (v *VM) GetSysReg(reg SysReg) (uint64, error) {
 	}
 	res := <-respCh
 	return res.val, res.err
+}
+
+func (v *VM) GetVTimerMask() (bool, error) {
+	respCh := make(chan struct {
+		masked bool
+		err    error
+	}, 1)
+	v.threadCh <- func() {
+		var masked bool
+		if ret := hvVcpuGetVtimerMask(v.vcpu, &masked); ret != hvSuccess {
+			respCh <- struct {
+				masked bool
+				err    error
+			}{err: fmt.Errorf("get vtimer mask: %w", ret)}
+			return
+		}
+		respCh <- struct {
+			masked bool
+			err    error
+		}{masked: masked}
+	}
+	res := <-respCh
+	return res.masked, res.err
+}
+
+func (v *VM) SetVTimerMask(masked bool) error {
+	errCh := make(chan error, 1)
+	v.threadCh <- func() {
+		if ret := hvVcpuSetVtimerMask(v.vcpu, masked); ret != hvSuccess {
+			errCh <- fmt.Errorf("set vtimer mask: %w", ret)
+			return
+		}
+		errCh <- nil
+	}
+	return <-errCh
 }
 
 func (v *VM) GetGICDistributorReg(reg GICDistributorReg) (uint64, error) {
@@ -608,6 +748,7 @@ func (v *VM) threadMain() {
 
 func (v *VM) Close() error {
 	var firstErr error
+	defer vmLifecycleMu.Unlock()
 	if v.vcpu != 0 {
 		errCh := make(chan error, 1)
 		v.threadCh <- func() {

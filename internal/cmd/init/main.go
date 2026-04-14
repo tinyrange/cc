@@ -4,8 +4,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -61,13 +63,16 @@ func run() error {
 	if cfg.WorkDir == "" {
 		cfg.WorkDir = "/"
 	}
+
 	_ = syscall.Mount("proc", "/proc", "proc", 0, "")
 	_ = syscall.Mount("sysfs", "/sys", "sysfs", 0, "")
+
 	writeKernel("ccx3-init: loading modules")
 	if err := loadModules(cfg.Modules); err != nil {
 		return err
 	}
 	writeKernel("ccx3-init: modules loaded")
+
 	if cfg.RootFSTag != "" {
 		writeKernel("ccx3-init: mounting rootfs")
 		if err := mountRootFS(cfg.RootFSTag); err != nil {
@@ -83,86 +88,39 @@ func run() error {
 		writeKernel(cfg.BeginMarker)
 	}
 
-	var pipeFDs [2]int
-	if err := syscall.Pipe(pipeFDs[:]); err != nil {
-		return fmt.Errorf("create pipe: %w", err)
+	writeKernel("ccx3-init: exec " + strings.Join(cfg.Command, " "))
+	if err := execCommand(cfg); err != nil {
+		return err
 	}
-	attr := &syscall.ProcAttr{
-		Dir:   cfg.WorkDir,
-		Env:   cfg.Env,
-		Files: []uintptr{uintptr(consoleFD), uintptr(pipeFDs[1]), uintptr(pipeFDs[1])},
-	}
-	pid, err := syscall.ForkExec(cfg.Command[0], cfg.Command, attr)
-	if err != nil {
-		return fmt.Errorf("exec %s: %w", cfg.Command[0], err)
-	}
-	_ = syscall.Close(pipeFDs[1])
-
-	output := readAll(pipeFDs[0])
-	_ = syscall.Close(pipeFDs[0])
-
-	var status syscall.WaitStatus
-	_, err = syscall.Wait4(pid, &status, 0, nil)
-	if err != nil {
-		return fmt.Errorf("wait for child: %w", err)
-	}
-
-	exitCode := 0
-	if status.Exited() {
-		exitCode = status.ExitStatus()
-	} else if status.Signaled() {
-		exitCode = 128 + int(status.Signal())
-	}
-
-	if len(output) > 0 {
-		for _, line := range strings.Split(strings.TrimRight(output, "\n"), "\n") {
-			writeKernel(line)
-		}
-	}
-
-	if cfg.ExitMarkerPrefix != "" {
-		writeKernel(cfg.ExitMarkerPrefix + itoa(exitCode))
-	}
-
-	syscall.Sync()
-	_ = syscall.Reboot(syscall.LINUX_REBOOT_CMD_POWER_OFF)
-	for {
-		syscall.Pause()
-	}
+	return fmt.Errorf("exec command returned unexpectedly")
 }
 
 func mountRootFS(tag string) error {
-	for _, dir := range []string{"/mnt", "/mnt/proc", "/mnt/sys", "/mnt/dev", "/mnt/tmp"} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return fmt.Errorf("mkdir %s: %w", dir, err)
-		}
+	if err := os.MkdirAll("/mnt", 0o755); err != nil {
+		return fmt.Errorf("mkdir /mnt: %w", err)
 	}
 	if err := syscall.Mount(tag, "/mnt", "virtiofs", 0, ""); err != nil {
 		return fmt.Errorf("mount virtiofs %s: %w", tag, err)
 	}
-	_ = syscall.Mount("proc", "/mnt/proc", "proc", 0, "")
-	_ = syscall.Mount("sysfs", "/mnt/sys", "sysfs", 0, "")
-	_ = syscall.Mount("devtmpfs", "/mnt/dev", "devtmpfs", 0, "")
-	_ = syscall.Mount("tmpfs", "/mnt/tmp", "tmpfs", 0, "mode=1777")
-	if err := os.Chdir("/mnt"); err != nil {
-		return fmt.Errorf("chdir /mnt: %w", err)
-	}
-	_ = os.MkdirAll("oldroot", 0o755)
-	if err := syscall.PivotRoot(".", "oldroot"); err != nil {
-		if err := syscall.Chroot("."); err != nil {
-			return fmt.Errorf("chroot /mnt: %w", err)
-		}
-	} else {
-		if err := os.Chdir("/"); err != nil {
-			return fmt.Errorf("chdir / after pivot_root: %w", err)
-		}
-		_ = syscall.Unmount("/oldroot", syscall.MNT_DETACH)
-		_ = os.Remove("/oldroot")
-		return nil
+	if err := syscall.Chroot("/mnt"); err != nil {
+		return fmt.Errorf("chroot /mnt: %w", err)
 	}
 	if err := os.Chdir("/"); err != nil {
 		return fmt.Errorf("chdir / after chroot: %w", err)
 	}
+
+	for _, dir := range []string{"/proc", "/sys", "/dev", "/tmp", "/dev/pts", "/dev/shm"} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", dir, err)
+		}
+	}
+	_ = syscall.Mount("proc", "/proc", "proc", 0, "")
+	_ = syscall.Mount("sysfs", "/sys", "sysfs", 0, "")
+	_ = syscall.Mount("devtmpfs", "/dev", "devtmpfs", 0, "")
+	_ = syscall.Mount("tmpfs", "/tmp", "tmpfs", 0, "mode=1777")
+	_ = syscall.Mount("devpts", "/dev/pts", "devpts", 0, "")
+	_ = syscall.Mount("tmpfs", "/dev/shm", "tmpfs", 0, "mode=1777")
+	_ = os.Symlink("/proc/self/fd", "/dev/fd")
 	return nil
 }
 
@@ -214,21 +172,6 @@ func itoa(v int) string {
 	return string(buf[i:])
 }
 
-func readAll(fd int) string {
-	var b strings.Builder
-	buf := make([]byte, 4096)
-	for {
-		n, err := syscall.Read(fd, buf)
-		if n > 0 {
-			b.Write(buf[:n])
-		}
-		if err != nil || n == 0 {
-			break
-		}
-	}
-	return b.String()
-}
-
 func loadModules(modules []string) error {
 	for _, path := range modules {
 		data, err := os.ReadFile(path)
@@ -248,4 +191,47 @@ func loadModules(modules []string) error {
 		}
 	}
 	return nil
+}
+
+func execCommand(cfg config) error {
+	if info, err := os.Stat(cfg.Command[0]); err != nil {
+		writeKernel("ccx3-init: stat failed for " + cfg.Command[0] + ": " + err.Error())
+	} else {
+		writeKernel("ccx3-init: stat mode for " + cfg.Command[0] + " is " + fmt.Sprintf("%#o", info.Mode()&0o777))
+	}
+
+	exitCode, err := execCommandGo(cfg.Command, cfg.Env, cfg.WorkDir)
+	if err != nil {
+		return fmt.Errorf("run %s: %w", cfg.Command[0], err)
+	}
+	if cfg.ExitMarkerPrefix != "" {
+		writeKernel(cfg.ExitMarkerPrefix + itoa(exitCode))
+	}
+	syscall.Sync()
+	_ = syscall.Reboot(syscall.LINUX_REBOOT_CMD_POWER_OFF)
+	for {
+		syscall.Pause()
+	}
+}
+
+func execCommandGo(argv []string, env []string, workDir string) (int, error) {
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Env = env
+	if workDir != "" {
+		cmd.Dir = workDir
+	}
+	console := os.NewFile(uintptr(consoleFD), "/dev/console")
+	cmd.Stdin = console
+	cmd.Stdout = console
+	cmd.Stderr = console
+
+	err := cmd.Run()
+	if err == nil {
+		return 0, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode(), nil
+	}
+	return 0, err
 }
