@@ -787,9 +787,15 @@ func buildMinimalELF(ctx context.Context, outPath string) error {
 		return fmt.Errorf("write minimal elf source: %w", err)
 	}
 	defer os.Remove(src)
+
+	toolchain, err := clangAArch64LinuxToolchain()
+	if err != nil {
+		return err
+	}
+
 	cmd := exec.CommandContext(ctx,
-		"clang",
-		"--target=aarch64-linux-gnu",
+		toolchain.clang,
+		"-target", "aarch64-linux-gnu",
 		"-nostdlib",
 		"-static",
 		"-fuse-ld=lld",
@@ -797,6 +803,7 @@ func buildMinimalELF(ctx context.Context, outPath string) error {
 		"-o", outPath,
 		src,
 	)
+	cmd.Env = toolchain.env
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("build minimal elf: %w\n%s", err, string(output))
 	}

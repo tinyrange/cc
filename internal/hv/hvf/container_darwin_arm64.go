@@ -5,14 +5,19 @@ package hvf
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"j5.nz/cc/client"
 	"j5.nz/cc/internal/fdt"
 	"j5.nz/cc/internal/kernel/alpine"
 	bootarm64 "j5.nz/cc/internal/linux/boot/arm64"
@@ -35,26 +40,35 @@ const (
 	containerFSBase       = 0x0a101000
 	containerFSSize       = 0x1000
 	containerFSIRQ        = 41
+	containerVsockBase    = 0x0a102000
+	containerVsockSize    = 0x1000
+	containerVsockIRQ     = 42
 	containerUARTSPI      = 33
 	containerRootFSTag    = "rootfs"
-	commandBeginMarker    = "__CCX3_BEGIN__"
+	containerGuestCID     = 3
+	containerControlPort  = 10777
+	instanceReadyMarker   = "__CCX3_READY__"
+	commandBeginMarker    = "__CCX3_BEGIN__:"
+	commandOutputMarker   = "__CCX3_OUT__:"
+	commandErrorMarker    = "__CCX3_ERR__:"
 	commandExitMarkerPref = "__CCX3_EXIT__:"
 	arm64VirtualTimerPPI  = 27
 )
 
 type ContainerRunRequest struct {
-	Kernel   []byte
-	Init     []byte
-	Modules  []alpine.Module
-	Image    *oci.Image
-	RootFS   virtio.FSBackend
-	Command  []string
-	Env      []string
-	WorkDir  string
-	User     string
-	MemoryMB uint64
-	CPUs     int
-	Dmesg    bool
+	Kernel     []byte
+	Init       []byte
+	Modules    []alpine.Module
+	Image      *oci.Image
+	RootFS     virtio.FSBackend
+	Command    []string
+	Env        []string
+	WorkDir    string
+	User       string
+	MemoryMB   uint64
+	CPUs       int
+	Dmesg      bool
+	Persistent bool
 }
 
 type ContainerRunResult struct {
@@ -64,8 +78,23 @@ type ContainerRunResult struct {
 }
 
 type ContainerSession struct {
-	cancel context.CancelFunc
-	doneCh chan sessionRunResult
+	cancel     context.CancelFunc
+	doneCh     chan sessionRunResult
+	image      *oci.Image
+	baseEnv    []string
+	workDir    string
+	dmesg      bool
+	control    virtio.VsockConn
+	transcript *serialTranscript
+	listener   virtio.VsockListener
+	vsock      *virtio.Vsock
+	sendMu     sync.Mutex
+	nextID     atomic.Uint64
+}
+
+type readyResult struct {
+	conn virtio.VsockConn
+	err  error
 }
 
 type sessionRunResult struct {
@@ -73,7 +102,74 @@ type sessionRunResult struct {
 	err    error
 }
 
+type serialTranscript struct {
+	mu   sync.Mutex
+	cond *sync.Cond
+	buf  bytes.Buffer
+}
+
+func newSerialTranscript() *serialTranscript {
+	s := &serialTranscript{}
+	s.cond = sync.NewCond(&s.mu)
+	return s
+}
+
+func (s *serialTranscript) Write(data []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n, err := s.buf.Write(data)
+	s.cond.Broadcast()
+	return n, err
+}
+
+func (s *serialTranscript) Len() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Len()
+}
+
+func (s *serialTranscript) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+func (s *serialTranscript) waitFor(ctx context.Context, start int, predicate func(string) bool) (string, error) {
+	for {
+		s.mu.Lock()
+		if start <= s.buf.Len() {
+			text := s.buf.String()[start:]
+			if predicate(text) {
+				s.mu.Unlock()
+				return text, nil
+			}
+		}
+		s.mu.Unlock()
+
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+type guestExecRequest struct {
+	ID      string   `json:"id"`
+	Command []string `json:"command"`
+	Env     []string `json:"env,omitempty"`
+	WorkDir string   `json:"workdir,omitempty"`
+	Stdin   []byte   `json:"stdin,omitempty"`
+	TTY     bool     `json:"tty,omitempty"`
+	Kind    string   `json:"kind,omitempty"`
+	Signal  string   `json:"signal,omitempty"`
+	Cols    int      `json:"cols,omitempty"`
+	Rows    int      `json:"rows,omitempty"`
+}
+
 func StartContainer(ctx context.Context, req ContainerRunRequest) (*ContainerSession, error) {
+	if req.Persistent {
+		return startPersistentContainer(ctx, req)
+	}
 	runCtx, cancel := context.WithCancel(context.Background())
 	readyCh := make(chan error, 1)
 	doneCh := make(chan sessionRunResult, 1)
@@ -109,9 +205,526 @@ func (s *ContainerSession) Wait() error {
 	return res.err
 }
 
+func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
+	if len(req.Command) == 0 {
+		return client.ExecResponse{}, fmt.Errorf("exec command is required")
+	}
+	user := strings.TrimSpace(req.User)
+	if user != "" && user != "root" && user != "0" && user != "0:0" {
+		return client.ExecResponse{}, fmt.Errorf("only root user is supported")
+	}
+
+	env := mergeEnv(s.baseEnv, req.Env)
+	if !hasEnvKey(env, "PATH") {
+		env = append(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+	}
+	if !hasEnvKey(env, "HOME") {
+		env = append(env, "HOME=/root")
+	}
+	command, err := resolveGuestCommand(s.image.RootFSDir, req.Command, env)
+	if err != nil {
+		return client.ExecResponse{}, err
+	}
+	workDir := req.WorkDir
+	if workDir == "" {
+		workDir = s.workDir
+	}
+	if workDir == "" {
+		workDir = "/"
+	}
+	if !strings.HasPrefix(workDir, "/") {
+		return client.ExecResponse{}, fmt.Errorf("workdir must be absolute")
+	}
+	id := strconv.FormatUint(s.nextID.Add(1), 10)
+
+	payload, err := json.Marshal(guestExecRequest{
+		Kind:    "exec",
+		ID:      id,
+		Command: command,
+		Env:     env,
+		WorkDir: workDir,
+		Stdin:   append([]byte(nil), req.Stdin...),
+		TTY:     req.TTY,
+		Cols:    req.Cols,
+		Rows:    req.Rows,
+	})
+	if err != nil {
+		return client.ExecResponse{}, fmt.Errorf("marshal exec request: %w", err)
+	}
+
+	start := s.transcript.Len()
+	s.sendMu.Lock()
+	_, err = s.control.Write(append(payload, '\n'))
+	s.sendMu.Unlock()
+	if err != nil {
+		return client.ExecResponse{}, err
+	}
+	if err := s.sendStdinClose(id); err != nil {
+		return client.ExecResponse{}, err
+	}
+
+	segment, err := s.transcript.waitFor(ctx, start, func(text string) bool {
+		_, _, ok := extractManagedExecResult(text, id, s.dmesg)
+		return ok
+	})
+	if err != nil {
+		return client.ExecResponse{}, err
+	}
+	exitCode, output, ok := extractManagedExecResult(segment, id, s.dmesg)
+	if !ok {
+		return client.ExecResponse{}, fmt.Errorf("exec did not produce a complete result")
+	}
+	return client.ExecResponse{ExitCode: exitCode, Output: output}, nil
+}
+
+func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	if len(req.Command) == 0 {
+		return fmt.Errorf("exec command is required")
+	}
+	user := strings.TrimSpace(req.User)
+	if user != "" && user != "root" && user != "0" && user != "0:0" {
+		return fmt.Errorf("only root user is supported")
+	}
+
+	env := mergeEnv(s.baseEnv, req.Env)
+	if !hasEnvKey(env, "PATH") {
+		env = append(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+	}
+	if !hasEnvKey(env, "HOME") {
+		env = append(env, "HOME=/root")
+	}
+	command, err := resolveGuestCommand(s.image.RootFSDir, req.Command, env)
+	if err != nil {
+		return err
+	}
+	workDir := req.WorkDir
+	if workDir == "" {
+		workDir = s.workDir
+	}
+	if workDir == "" {
+		workDir = "/"
+	}
+	if !strings.HasPrefix(workDir, "/") {
+		return fmt.Errorf("workdir must be absolute")
+	}
+
+	id := strconv.FormatUint(s.nextID.Add(1), 10)
+	payload, err := json.Marshal(guestExecRequest{
+		Kind:    "exec",
+		ID:      id,
+		Command: command,
+		Env:     env,
+		WorkDir: workDir,
+		Stdin:   append([]byte(nil), req.Stdin...),
+		TTY:     req.TTY,
+		Cols:    req.Cols,
+		Rows:    req.Rows,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal exec request: %w", err)
+	}
+
+	start := s.transcript.Len()
+	s.sendMu.Lock()
+	_, err = s.control.Write(append(payload, '\n'))
+	s.sendMu.Unlock()
+	if err != nil {
+		return err
+	}
+
+	if inputs != nil {
+		go s.forwardExecInputs(ctx, id, inputs)
+	} else {
+		if err := s.sendStdinClose(id); err != nil {
+			return err
+		}
+	}
+
+	return s.streamExecEvents(ctx, start, id, onEvent)
+}
+
+func (s *ContainerSession) forwardExecInputs(ctx context.Context, id string, inputs <-chan client.ExecInput) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case input, ok := <-inputs:
+			if !ok {
+				_ = s.sendStdinClose(id)
+				return
+			}
+			msg := guestExecRequest{ID: id, Kind: input.Kind}
+			switch input.Kind {
+			case "stdin":
+				if len(input.Data) > 0 {
+					msg.Stdin = append([]byte(nil), input.Data...)
+				} else if input.Input != "" {
+					msg.Stdin = []byte(input.Input)
+				}
+			case "signal":
+				msg.Signal = input.Signal
+			case "resize":
+				msg.Cols = input.Cols
+				msg.Rows = input.Rows
+			}
+			payload, err := json.Marshal(msg)
+			if err != nil {
+				return
+			}
+			s.sendMu.Lock()
+			_, _ = s.control.Write(append(payload, '\n'))
+			s.sendMu.Unlock()
+		}
+	}
+}
+
+func (s *ContainerSession) sendStdinClose(id string) error {
+	payload, err := json.Marshal(guestExecRequest{ID: id, Kind: "stdin_close"})
+	if err != nil {
+		return fmt.Errorf("marshal stdin close request: %w", err)
+	}
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	_, err = s.control.Write(append(payload, '\n'))
+	return err
+}
+
+func (s *ContainerSession) streamExecEvents(ctx context.Context, start int, id string, onEvent func(client.ExecEvent) error) error {
+	offset := start
+	var pending string
+	for {
+		text := s.transcript.String()
+		if offset < len(text) {
+			pending += text[offset:]
+			offset = len(text)
+			for {
+				lineEnd := strings.IndexByte(pending, '\n')
+				if lineEnd < 0 {
+					break
+				}
+				line := strings.TrimSpace(pending[:lineEnd])
+				pending = pending[lineEnd+1:]
+				event, done, ok, err := parseManagedExecEventLine(line, id)
+				if err != nil {
+					return err
+				}
+				if !ok {
+					continue
+				}
+				if onEvent != nil {
+					if err := onEvent(event); err != nil {
+						return err
+					}
+				}
+				if done {
+					return nil
+				}
+			}
+			continue
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func (s *ContainerSession) Close() error {
+	if s.control != nil {
+		_ = s.control.Close()
+	}
+	if s.listener != nil {
+		_ = s.listener.Close()
+	}
+	if s.vsock != nil {
+		_ = s.vsock.Close()
+	}
 	s.cancel()
 	return nil
+}
+
+func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*ContainerSession, error) {
+	if req.Image == nil && req.RootFS == nil {
+		return nil, fmt.Errorf("image or rootfs backend is required")
+	}
+	if len(req.Kernel) == 0 {
+		return nil, fmt.Errorf("kernel is required")
+	}
+	if req.CPUs > 1 {
+		return nil, fmt.Errorf("only 1 CPU is supported")
+	}
+	if req.Image == nil {
+		return nil, fmt.Errorf("persistent instances require an image")
+	}
+
+	user := strings.TrimSpace(req.User)
+	if user == "" {
+		user = strings.TrimSpace(req.Image.Config.User)
+	}
+	if user != "" && user != "root" && user != "0" && user != "0:0" {
+		return nil, fmt.Errorf("only root user is supported")
+	}
+
+	workDir := req.WorkDir
+	if workDir == "" {
+		workDir = req.Image.Config.WorkingDir
+	}
+	if workDir == "" {
+		workDir = "/"
+	}
+	if !strings.HasPrefix(workDir, "/") {
+		return nil, fmt.Errorf("workdir must be absolute")
+	}
+
+	baseEnv := append([]string(nil), req.Image.Config.Env...)
+	if !hasEnvKey(baseEnv, "PATH") {
+		baseEnv = append(baseEnv, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+	}
+	if !hasEnvKey(baseEnv, "HOME") {
+		baseEnv = append(baseEnv, "HOME=/root")
+	}
+
+	configJSON, err := json.Marshal(guestInitConfig{
+		Env:              baseEnv,
+		WorkDir:          workDir,
+		Modules:          moduleConfig(req.Modules),
+		RootFSTag:        containerRootFSTag,
+		VsockPort:        containerControlPort,
+		ReadyMarker:      instanceReadyMarker,
+		BeginMarker:      commandBeginMarker,
+		OutputMarkerPref: commandOutputMarker,
+		ErrorMarkerPref:  commandErrorMarker,
+		ExitMarkerPrefix: commandExitMarkerPref,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal guest init config: %w", err)
+	}
+
+	extraFiles := []initramfs.File{
+		{Path: "/dev", Mode: 0o755, Type: initramfs.TypeDirectory},
+		{Path: "/proc", Mode: 0o755, Type: initramfs.TypeDirectory},
+		{Path: "/sys", Mode: 0o755, Type: initramfs.TypeDirectory},
+		{Path: "/run", Mode: 0o755, Type: initramfs.TypeDirectory},
+		{Path: "/tmp", Mode: 0o1777, Type: initramfs.TypeDirectory},
+		{Path: "/etc", Mode: 0o755, Type: initramfs.TypeDirectory},
+		{Path: "/ccx3", Mode: 0o755, Type: initramfs.TypeDirectory},
+		{Path: "/ccx3/modules", Mode: 0o755, Type: initramfs.TypeDirectory},
+		{Path: "/dev/console", Mode: 0o600, Type: initramfs.TypeCharDevice, DevMajor: 5, DevMinor: 1},
+		{Path: "/dev/null", Mode: 0o666, Type: initramfs.TypeCharDevice, DevMajor: 1, DevMinor: 3},
+		{Path: "/dev/kmsg", Mode: 0o600, Type: initramfs.TypeCharDevice, DevMajor: 1, DevMinor: 11},
+		{Path: "/etc/ccx3-init.json", Mode: 0o600, Data: configJSON, Type: initramfs.TypeRegular},
+		{Path: "/init", Mode: 0o755, Data: req.Init, Type: initramfs.TypeRegular},
+	}
+	for _, mod := range req.Modules {
+		extraFiles = append(extraFiles, initramfs.File{
+			Path: "/ccx3/modules/" + mod.Name + ".ko",
+			Mode: 0o644,
+			Data: mod.Data,
+			Type: initramfs.TypeRegular,
+		})
+	}
+	initrd, err := initramfs.Build(extraFiles)
+	if err != nil {
+		return nil, fmt.Errorf("build initramfs: %w", err)
+	}
+
+	vm, err := NewVM()
+	if err != nil {
+		return nil, err
+	}
+
+	memorySize := uint64(defaultMemorySize)
+	if req.MemoryMB != 0 {
+		memorySize = req.MemoryMB << 20
+	}
+	mem, err := vm.MapAnonymousMemory(uintptr(memorySize), IPA(containerMemoryBase), hvMemoryRead|hvMemoryWrite|hvMemoryExec)
+	if err != nil {
+		vm.Close()
+		return nil, fmt.Errorf("map guest memory: %w", err)
+	}
+
+	serialOut := newSerialTranscript()
+	var consoleOut bytes.Buffer
+	var fsTrace bytes.Buffer
+	var runTrace bytes.Buffer
+	uart := serial.NewUART8250(bootarm64.DefaultUARTBase, bootarm64.DefaultUARTRegShift, serialOut)
+	uart.AttachIRQ(vm, containerUARTSPI)
+	console := virtio.NewConsole(containerConsoleBase, containerConsoleSize, containerConsoleIRQ, &consoleOut)
+	console.Attach(vm, vm)
+	vsockBackend := virtio.NewSimpleVsockBackend()
+	listener, err := vsockBackend.Listen(containerControlPort)
+	if err != nil {
+		vm.Close()
+		return nil, fmt.Errorf("create vsock listener: %w", err)
+	}
+	vsock := virtio.NewVsock(containerVsockBase, containerVsockSize, containerVsockIRQ, containerGuestCID, vsockBackend)
+	vsock.Attach(vm, vm)
+	rootFSBackend := req.RootFS
+	if rootFSBackend == nil {
+		rootFSBackend = virtio.NewImageFS(req.Image.RootFSDir, req.Image.FSMetadata)
+	}
+	fsdev := virtio.NewFS(containerFSBase, containerFSSize, containerFSIRQ, containerRootFSTag, rootFSBackend)
+	fsdev.Attach(vm, vm)
+	fsdev.Log = &fsTrace
+	fsdev.Strict = true
+
+	plan, err := bootarm64.PrepareBoot(mem, req.Kernel, bootarm64.BootOptions{
+		MemoryBase: containerMemoryBase,
+		MemorySize: memorySize,
+		NumCPUs:    1,
+		Initrd:     initrd,
+		ExtraNodes: []fdt.Node{console.DeviceTreeNode(), fsdev.DeviceTreeNode(), vsock.DeviceTreeNode()},
+		Cmdline: strings.Join([]string{
+			"console=ttyS0,115200n8",
+			fmt.Sprintf("earlycon=uart8250,mmio,0x%x", bootarm64.DefaultUARTBase),
+			"keep_bootcon",
+			"nokaslr",
+			"panic=-1",
+			"loglevel=8",
+			"rdinit=/init",
+		}, " "),
+	})
+	if err != nil {
+		vm.Close()
+		return nil, fmt.Errorf("prepare boot: %w", err)
+	}
+
+	if err := vm.SetReg(hvRegPC, plan.EntryGPA); err != nil {
+		vm.Close()
+		return nil, fmt.Errorf("set PC: %w", err)
+	}
+	if err := vm.SetReg(hvRegCPSR, bootarm64.DefaultPStateBits); err != nil {
+		vm.Close()
+		return nil, fmt.Errorf("set CPSR: %w", err)
+	}
+	if err := vm.SetSysReg(hvSysRegSP_EL1, plan.StackTopGPA); err != nil {
+		vm.Close()
+		return nil, fmt.Errorf("set SP_EL1: %w", err)
+	}
+	if err := vm.SetReg(hvRegX0, plan.DeviceTreeGPA); err != nil {
+		vm.Close()
+		return nil, fmt.Errorf("set X0: %w", err)
+	}
+	for _, reg := range []Reg{hvRegX1, hvRegX2, hvRegX3} {
+		if err := vm.SetReg(reg, 0); err != nil {
+			vm.Close()
+			return nil, fmt.Errorf("clear reg %d: %w", reg, err)
+		}
+	}
+
+	runCtx, cancel := context.WithCancel(context.Background())
+	readyCh := make(chan readyResult, 1)
+	doneCh := make(chan sessionRunResult, 1)
+	controlTranscript := newSerialTranscript()
+
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			readyCh <- readyResult{err: fmt.Errorf("accept control vsock: %w", err)}
+			return
+		}
+		go func() {
+			_, _ = io.Copy(controlTranscript, conn)
+		}()
+		_, err = controlTranscript.waitFor(runCtx, 0, func(text string) bool {
+			return strings.Contains(text, instanceReadyMarker)
+		})
+		readyCh <- readyResult{conn: conn, err: err}
+	}()
+
+	go func() {
+		defer listener.Close()
+		defer vsock.Close()
+		defer vm.Close()
+		for {
+			exitInfo, err, stalled := runWithCancel(runCtx, vm, 5*time.Second)
+			if stalled {
+				if runCtx.Err() != nil {
+					doneCh <- sessionRunResult{err: runCtx.Err()}
+					return
+				}
+				continue
+			}
+			if err != nil {
+				doneCh <- sessionRunResult{err: fmt.Errorf("%w\nrun:\n%sserial:\n%s\nvirtio-fs:\n%s", err, runTrace.String(), serialOut.String(), fsTrace.String())}
+				return
+			}
+			if exitInfo == nil {
+				doneCh <- sessionRunResult{err: fmt.Errorf("vcpu returned nil exit info")}
+				return
+			}
+			if exitInfo.Reason == hvExitReasonVTimerActivated {
+				if err := injectVirtualTimerPPI(vm); err != nil {
+					doneCh <- sessionRunResult{err: fmt.Errorf("inject virtual timer ppi: %w", err)}
+					return
+				}
+				continue
+			}
+			if exitInfo.Reason != hvExitReasonException {
+				doneCh <- sessionRunResult{err: fmt.Errorf("unexpected exit reason %v", exitInfo.Reason)}
+				return
+			}
+			switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
+			case ExceptionClassDataAbortLowerEL:
+				if err := handleContainerDataAbort(vm, uart, console, fsdev, vsock, exitInfo); err != nil {
+					doneCh <- sessionRunResult{err: err}
+					return
+				}
+			case ExceptionClassHVC64:
+				halt, err := handleContainerHVC(vm)
+				if err != nil {
+					doneCh <- sessionRunResult{err: err}
+					return
+				}
+				if halt {
+					doneCh <- sessionRunResult{err: fmt.Errorf("guest halted while instance was running\nserial:\n%s\nvirtio-fs:\n%s", serialOut.String(), fsTrace.String())}
+					return
+				}
+			default:
+				doneCh <- sessionRunResult{err: fmt.Errorf("unexpected exception class %#x syndrome=%#x physical=%#x\nserial:\n%s\nvirtio-fs:\n%s",
+					DecodeExceptionClass(exitInfo.Exception.Syndrome), exitInfo.Exception.Syndrome, uint64(exitInfo.Exception.PhysicalAddress), serialOut.String(), fsTrace.String())}
+				return
+			}
+		}
+	}()
+
+	select {
+	case ready := <-readyCh:
+		if ready.err != nil {
+			cancel()
+			res := <-doneCh
+			if res.err != nil {
+				return nil, res.err
+			}
+			return nil, ready.err
+		}
+		return &ContainerSession{
+			cancel:     cancel,
+			doneCh:     doneCh,
+			image:      req.Image,
+			baseEnv:    baseEnv,
+			workDir:    workDir,
+			dmesg:      req.Dmesg,
+			control:    ready.conn,
+			transcript: controlTranscript,
+			listener:   listener,
+			vsock:      vsock,
+		}, nil
+	case res := <-doneCh:
+		cancel()
+		if res.err != nil {
+			return nil, res.err
+		}
+		return nil, fmt.Errorf("guest exited before control connection became ready")
+	case <-ctx.Done():
+		cancel()
+		_ = listener.Close()
+		res := <-doneCh
+		if res.err != nil {
+			return nil, res.err
+		}
+		return nil, ctx.Err()
+	}
 }
 
 func RunContainer(ctx context.Context, req ContainerRunRequest) (ContainerRunResult, error) {
@@ -190,6 +803,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 		Modules:          moduleConfig(req.Modules),
 		RootFSTag:        containerRootFSTag,
 		BeginMarker:      commandBeginMarker,
+		ErrorMarkerPref:  commandErrorMarker,
 		ExitMarkerPrefix: commandExitMarkerPref,
 	})
 	if err != nil {
@@ -247,6 +861,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	uart.AttachIRQ(vm, containerUARTSPI)
 	console := virtio.NewConsole(containerConsoleBase, containerConsoleSize, containerConsoleIRQ, &consoleOut)
 	console.Attach(vm, vm)
+	var vsock *virtio.Vsock
 	rootFSBackend := req.RootFS
 	if rootFSBackend == nil {
 		rootFSBackend = virtio.NewImageFS(req.Image.RootFSDir, req.Image.FSMetadata)
@@ -354,7 +969,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 
 		switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 		case ExceptionClassDataAbortLowerEL:
-			if err := handleContainerDataAbort(vm, uart, console, fsdev, exitInfo); err != nil {
+			if err := handleContainerDataAbort(vm, uart, console, fsdev, vsock, exitInfo); err != nil {
 				return ContainerRunResult{}, err
 			}
 		case ExceptionClassHVC64:
@@ -425,7 +1040,7 @@ type runResultVM struct {
 	err  error
 }
 
-func handleContainerDataAbort(vm *VM, uart *serial.UART8250, console *virtio.Console, fsdev *virtio.FS, exitInfo *VcpuExit) error {
+func handleContainerDataAbort(vm *VM, uart *serial.UART8250, console *virtio.Console, fsdev *virtio.FS, vsock *virtio.Vsock, exitInfo *VcpuExit) error {
 	info, err := DecodeDataAbort(exitInfo.Exception.Syndrome)
 	if err != nil {
 		return err
@@ -480,6 +1095,24 @@ func handleContainerDataAbort(vm *VM, uart *serial.UART8250, console *virtio.Con
 			}
 		} else {
 			value, err := fsdev.Read(addr, info.SizeBytes)
+			if err != nil {
+				return err
+			}
+			if err := writeAbortValue(vm, info, value); err != nil {
+				return err
+			}
+		}
+	case vsock != nil && vsock.Contains(addr, info.SizeBytes):
+		if info.Write {
+			value, err := readAbortValue(vm, info)
+			if err != nil {
+				return err
+			}
+			if err := vsock.Write(addr, info.SizeBytes, value); err != nil {
+				return err
+			}
+		} else {
+			value, err := vsock.Read(addr, info.SizeBytes)
 			if err != nil {
 				return err
 			}
@@ -659,7 +1292,7 @@ func injectVirtualTimerPPI(vm *VM) error {
 }
 
 func extractCommandResult(serial string, dmesg bool) (int, string, bool) {
-	begin := strings.Index(serial, commandBeginMarker)
+	begin := strings.Index(serial, strings.TrimSuffix(commandBeginMarker, ":"))
 	exit := strings.Index(serial, commandExitMarkerPref)
 	if begin == -1 || exit == -1 || exit < begin {
 		return 0, "", false
@@ -692,6 +1325,88 @@ func extractCommandResult(serial string, dmesg bool) (int, string, bool) {
 		output = cleanCommandOutput(output)
 	}
 	return code, output, true
+}
+
+func extractManagedExecResult(serial, id string, dmesg bool) (int, string, bool) {
+	beginMarker := commandBeginMarker + id
+	outputPrefix := commandOutputMarker + id + ":"
+	errorPrefix := commandErrorMarker + id + ":"
+	exitPrefix := commandExitMarkerPref + id + ":"
+
+	begin := strings.Index(serial, beginMarker)
+	if begin == -1 {
+		return 0, "", false
+	}
+
+	var output bytes.Buffer
+	lines := strings.Split(serial[begin:], "\n")
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if idx := strings.Index(line, outputPrefix); idx >= 0 {
+			encoded := line[idx+len(outputPrefix):]
+			data, err := base64.StdEncoding.DecodeString(encoded)
+			if err != nil {
+				continue
+			}
+			output.Write(data)
+			continue
+		}
+		if idx := strings.Index(line, errorPrefix); idx >= 0 {
+			encoded := line[idx+len(errorPrefix):]
+			data, err := base64.StdEncoding.DecodeString(encoded)
+			if err != nil {
+				continue
+			}
+			output.Write(data)
+			continue
+		}
+		if idx := strings.Index(line, exitPrefix); idx >= 0 {
+			code, err := strconv.Atoi(strings.TrimSpace(line[idx+len(exitPrefix):]))
+			if err != nil {
+				return 0, "", false
+			}
+			if dmesg {
+				return code, strings.TrimRight(serial[begin:], "\r\n"), true
+			}
+			return code, strings.TrimRight(output.String(), "\r\n"), true
+		}
+	}
+	return 0, "", false
+}
+
+func parseManagedExecEventLine(line, id string) (client.ExecEvent, bool, bool, error) {
+	beginMarker := commandBeginMarker + id
+	stdoutPrefix := commandOutputMarker + id + ":"
+	stderrPrefix := commandErrorMarker + id + ":"
+	exitPrefix := commandExitMarkerPref + id + ":"
+
+	switch {
+	case line == beginMarker:
+		return client.ExecEvent{}, false, false, nil
+	case strings.HasPrefix(line, stdoutPrefix):
+		data, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(line, stdoutPrefix))
+		if err != nil {
+			return client.ExecEvent{}, false, false, nil
+		}
+		return client.ExecEvent{Kind: "stdout", Stream: "stdout", Output: string(data), Data: data}, false, true, nil
+	case strings.HasPrefix(line, stderrPrefix):
+		data, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(line, stderrPrefix))
+		if err != nil {
+			return client.ExecEvent{}, false, false, nil
+		}
+		return client.ExecEvent{Kind: "stderr", Stream: "stderr", Output: string(data), Data: data}, false, true, nil
+	case strings.HasPrefix(line, exitPrefix):
+		code, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, exitPrefix)))
+		if err != nil {
+			return client.ExecEvent{}, false, false, err
+		}
+		return client.ExecEvent{Kind: "exit", ExitCode: code}, true, true, nil
+	default:
+		return client.ExecEvent{}, false, false, nil
+	}
 }
 
 func mergeEnv(base, overrides []string) []string {
@@ -736,7 +1451,11 @@ type guestInitConfig struct {
 	WorkDir          string   `json:"workdir"`
 	Modules          []string `json:"modules,omitempty"`
 	RootFSTag        string   `json:"rootfs_tag,omitempty"`
+	VsockPort        uint32   `json:"vsock_port,omitempty"`
+	ReadyMarker      string   `json:"ready_marker,omitempty"`
 	BeginMarker      string   `json:"begin_marker"`
+	OutputMarkerPref string   `json:"output_marker_prefix,omitempty"`
+	ErrorMarkerPref  string   `json:"error_marker_prefix,omitempty"`
 	ExitMarkerPrefix string   `json:"exit_marker_prefix"`
 }
 

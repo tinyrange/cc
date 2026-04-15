@@ -42,40 +42,61 @@ type VMSupportedResponse struct {
 	Error     string `json:"error,omitempty"`
 }
 
-type StartVMRequest struct {
+type CreateInstanceRequest struct {
+	Image    string `json:"image"`
+	MemoryMB uint64 `json:"memory_mb,omitempty"`
+	CPUs     int    `json:"cpus,omitempty"`
+	Dmesg    bool   `json:"dmesg,omitempty"`
+}
+
+type InstanceState struct {
+	Status    string `json:"status"`
+	Image     string `json:"image,omitempty"`
+	MemoryMB  uint64 `json:"memory_mb,omitempty"`
+	CPUs      int    `json:"cpus,omitempty"`
+	StartedAt string `json:"started_at,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+type RunRequest struct {
 	Image    string   `json:"image"`
 	Command  []string `json:"command,omitempty"`
 	Env      []string `json:"env,omitempty"`
 	WorkDir  string   `json:"workdir,omitempty"`
 	User     string   `json:"user,omitempty"`
+	Stdin    []byte   `json:"stdin,omitempty"`
+	TTY      bool     `json:"tty,omitempty"`
+	Cols     int      `json:"cols,omitempty"`
+	Rows     int      `json:"rows,omitempty"`
 	MemoryMB uint64   `json:"memory_mb,omitempty"`
 	CPUs     int      `json:"cpus,omitempty"`
 	Dmesg    bool     `json:"dmesg,omitempty"`
 }
 
-type VMState struct {
-	Status    string   `json:"status"`
-	Image     string   `json:"image,omitempty"`
-	Command   []string `json:"command,omitempty"`
-	StartedAt string   `json:"started_at,omitempty"`
-	Error     string   `json:"error,omitempty"`
-}
-
-type RunVMResponse struct {
+type ExecResponse struct {
 	ExitCode int    `json:"exit_code"`
 	Output   string `json:"output,omitempty"`
 }
+
+type StartVMRequest = CreateInstanceRequest
+type VMState = InstanceState
+type RunVMResponse = ExecResponse
 
 type ExecRequest struct {
 	Command []string `json:"command"`
 	Env     []string `json:"env,omitempty"`
 	WorkDir string   `json:"workdir,omitempty"`
 	User    string   `json:"user,omitempty"`
+	Stdin   []byte   `json:"stdin,omitempty"`
+	TTY     bool     `json:"tty,omitempty"`
+	Cols    int      `json:"cols,omitempty"`
+	Rows    int      `json:"rows,omitempty"`
 }
 
 type ExecInput struct {
 	Kind   string `json:"kind"`
 	Input  string `json:"input,omitempty"`
+	Data   []byte `json:"data,omitempty"`
 	Signal string `json:"signal,omitempty"`
 	Cols   int    `json:"cols,omitempty"`
 	Rows   int    `json:"rows,omitempty"`
@@ -83,7 +104,9 @@ type ExecInput struct {
 
 type ExecEvent struct {
 	Kind     string `json:"kind"`
+	Stream   string `json:"stream,omitempty"`
 	Output   string `json:"output,omitempty"`
+	Data     []byte `json:"data,omitempty"`
 	Error    string `json:"error,omitempty"`
 	ExitCode int    `json:"exit_code,omitempty"`
 }

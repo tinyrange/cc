@@ -3,20 +3,28 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 const configPath = "/etc/ccx3-init.json"
 
 var consoleFD = 2
 var kmsgFD = -1
+var protocolMu sync.Mutex
 
 type config struct {
 	Command          []string `json:"command"`
@@ -24,8 +32,93 @@ type config struct {
 	WorkDir          string   `json:"workdir"`
 	Modules          []string `json:"modules"`
 	RootFSTag        string   `json:"rootfs_tag"`
+	VsockPort        uint32   `json:"vsock_port,omitempty"`
+	ReadyMarker      string   `json:"ready_marker"`
 	BeginMarker      string   `json:"begin_marker"`
+	OutputMarkerPref string   `json:"output_marker_prefix"`
+	ErrorMarkerPref  string   `json:"error_marker_prefix"`
 	ExitMarkerPrefix string   `json:"exit_marker_prefix"`
+}
+
+type execRequest struct {
+	Kind    string   `json:"kind,omitempty"`
+	ID      string   `json:"id"`
+	Command []string `json:"command,omitempty"`
+	Env     []string `json:"env,omitempty"`
+	WorkDir string   `json:"workdir,omitempty"`
+	Stdin   []byte   `json:"stdin,omitempty"`
+	TTY     bool     `json:"tty,omitempty"`
+	Signal  string   `json:"signal,omitempty"`
+	Cols    int      `json:"cols,omitempty"`
+	Rows    int      `json:"rows,omitempty"`
+}
+
+type managedExec struct {
+	stdinMu sync.Mutex
+	stdin   io.WriteCloser
+	pty     *os.File
+	process *os.Process
+}
+
+func (m *managedExec) writeStdin(data []byte) error {
+	m.stdinMu.Lock()
+	defer m.stdinMu.Unlock()
+	if m.stdin == nil {
+		return fmt.Errorf("stdin is closed")
+	}
+	_, err := m.stdin.Write(data)
+	return err
+}
+
+func (m *managedExec) closeStdin() error {
+	m.stdinMu.Lock()
+	defer m.stdinMu.Unlock()
+	if m.stdin == nil {
+		return nil
+	}
+	err := m.stdin.Close()
+	m.stdin = nil
+	return err
+}
+
+func (m *managedExec) setProcess(proc *os.Process) {
+	m.stdinMu.Lock()
+	defer m.stdinMu.Unlock()
+	m.process = proc
+}
+
+func (m *managedExec) setPTY(pty *os.File) {
+	m.stdinMu.Lock()
+	defer m.stdinMu.Unlock()
+	m.pty = pty
+}
+
+func (m *managedExec) signal(name string) error {
+	sig, err := parseSignal(name)
+	if err != nil {
+		return err
+	}
+	m.stdinMu.Lock()
+	defer m.stdinMu.Unlock()
+	if m.process == nil {
+		return fmt.Errorf("process is not started")
+	}
+	return m.process.Signal(sig)
+}
+
+func (m *managedExec) resize(cols, rows int) error {
+	m.stdinMu.Lock()
+	defer m.stdinMu.Unlock()
+	if m.pty == nil {
+		return fmt.Errorf("exec has no tty")
+	}
+	if cols <= 0 || rows <= 0 {
+		return fmt.Errorf("invalid tty size %dx%d", cols, rows)
+	}
+	return unix.IoctlSetWinsize(int(m.pty.Fd()), unix.TIOCSWINSZ, &unix.Winsize{
+		Col: uint16(cols),
+		Row: uint16(rows),
+	})
 }
 
 func main() {
@@ -57,9 +150,6 @@ func run() error {
 	if err := json.Unmarshal(buf, &cfg); err != nil {
 		return fmt.Errorf("decode config: %w", err)
 	}
-	if len(cfg.Command) == 0 {
-		return fmt.Errorf("config command is empty")
-	}
 	if cfg.WorkDir == "" {
 		cfg.WorkDir = "/"
 	}
@@ -82,6 +172,24 @@ func run() error {
 	}
 	if err := os.Chdir(cfg.WorkDir); err != nil {
 		return fmt.Errorf("chdir %s: %w", cfg.WorkDir, err)
+	}
+
+	if len(cfg.Command) == 0 {
+		if cfg.VsockPort != 0 {
+			control, err := connectVsock(cfg.VsockPort)
+			if err != nil {
+				return fmt.Errorf("connect vsock control: %w", err)
+			}
+			defer control.Close()
+			if cfg.ReadyMarker != "" {
+				writeProtocolLineTo(control, cfg.ReadyMarker)
+			}
+			return commandLoop(cfg, control)
+		}
+		if cfg.ReadyMarker != "" {
+			writeKernel(cfg.ReadyMarker)
+		}
+		return commandLoop(cfg, os.Stdin)
 	}
 
 	if cfg.BeginMarker != "" {
@@ -138,6 +246,18 @@ func writeConsole(value string) {
 	writeString(consoleFD, value)
 }
 
+func writeProtocolLine(value string) {
+	protocolMu.Lock()
+	defer protocolMu.Unlock()
+	writeConsole(strings.TrimRight(value, "\n") + "\n")
+}
+
+func writeProtocolLineTo(w io.Writer, value string) {
+	protocolMu.Lock()
+	defer protocolMu.Unlock()
+	_, _ = io.WriteString(w, strings.TrimRight(value, "\n")+"\n")
+}
+
 func writeKernel(value string) {
 	value = strings.TrimRight(value, "\n")
 	if value == "" {
@@ -170,6 +290,66 @@ func itoa(v int) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+func parseSignal(name string) (syscall.Signal, error) {
+	switch strings.ToUpper(strings.TrimPrefix(strings.TrimSpace(name), "SIG")) {
+	case "HUP":
+		return syscall.SIGHUP, nil
+	case "INT":
+		return syscall.SIGINT, nil
+	case "QUIT":
+		return syscall.SIGQUIT, nil
+	case "TERM":
+		return syscall.SIGTERM, nil
+	case "KILL":
+		return syscall.SIGKILL, nil
+	case "USR1":
+		return syscall.SIGUSR1, nil
+	case "USR2":
+		return syscall.SIGUSR2, nil
+	case "WINCH":
+		return syscall.SIGWINCH, nil
+	default:
+		return 0, fmt.Errorf("unsupported signal %q", name)
+	}
+}
+
+func openPTY(cols, rows int) (*os.File, *os.File, error) {
+	masterFD, err := unix.Open("/dev/ptmx", unix.O_RDWR|unix.O_NOCTTY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, nil, err
+	}
+	master := os.NewFile(uintptr(masterFD), "ptmx")
+	if master == nil {
+		_ = unix.Close(masterFD)
+		return nil, nil, fmt.Errorf("open /dev/ptmx: no file handle")
+	}
+
+	if err := unix.IoctlSetPointerInt(masterFD, unix.TIOCSPTLCK, 0); err != nil {
+		_ = master.Close()
+		return nil, nil, fmt.Errorf("unlock ptmx: %w", err)
+	}
+	ptn, err := unix.IoctlGetInt(masterFD, unix.TIOCGPTN)
+	if err != nil {
+		_ = master.Close()
+		return nil, nil, fmt.Errorf("query pty number: %w", err)
+	}
+	if cols > 0 && rows > 0 {
+		if err := unix.IoctlSetWinsize(masterFD, unix.TIOCSWINSZ, &unix.Winsize{
+			Col: uint16(cols),
+			Row: uint16(rows),
+		}); err != nil {
+			_ = master.Close()
+			return nil, nil, fmt.Errorf("set initial winsize: %w", err)
+		}
+	}
+	slave, err := os.OpenFile("/dev/pts/"+itoa(ptn), os.O_RDWR, 0)
+	if err != nil {
+		_ = master.Close()
+		return nil, nil, fmt.Errorf("open slave pty: %w", err)
+	}
+	return master, slave, nil
 }
 
 func loadModules(modules []string) error {
@@ -234,4 +414,339 @@ func execCommandGo(argv []string, env []string, workDir string) (int, error) {
 		return exitErr.ExitCode(), nil
 	}
 	return 0, err
+}
+
+func commandLoop(cfg config, control io.ReadWriter) error {
+	reader := bufio.NewReader(control)
+	active := map[string]*managedExec{}
+	var activeMu sync.Mutex
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return fmt.Errorf("read exec request: %w", err)
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+
+		var req execRequest
+		if err := json.Unmarshal(line, &req); err != nil {
+			writeKernel("ccx3-init: decode exec request: " + err.Error())
+			if cfg.ExitMarkerPrefix != "" {
+				writeKernel(cfg.ExitMarkerPrefix + "125")
+			}
+			continue
+		}
+		if req.Kind == "" {
+			req.Kind = "exec"
+		}
+		switch req.Kind {
+		case "exec":
+		case "stdin":
+			activeMu.Lock()
+			managed := active[req.ID]
+			activeMu.Unlock()
+			if managed == nil {
+				writeKernel("ccx3-init: stdin for unknown exec id " + req.ID)
+				continue
+			}
+			if err := managed.writeStdin(req.Stdin); err != nil {
+				writeKernel("ccx3-init: write stdin: " + err.Error())
+			}
+			continue
+		case "stdin_close":
+			activeMu.Lock()
+			managed := active[req.ID]
+			activeMu.Unlock()
+			if managed == nil {
+				continue
+			}
+			if err := managed.closeStdin(); err != nil {
+				writeKernel("ccx3-init: close stdin: " + err.Error())
+			}
+			continue
+		case "signal":
+			activeMu.Lock()
+			managed := active[req.ID]
+			activeMu.Unlock()
+			if managed == nil {
+				writeKernel("ccx3-init: signal for unknown exec id " + req.ID)
+				continue
+			}
+			if err := managed.signal(req.Signal); err != nil {
+				writeKernel("ccx3-init: signal " + req.Signal + ": " + err.Error())
+			}
+			continue
+		case "resize":
+			activeMu.Lock()
+			managed := active[req.ID]
+			activeMu.Unlock()
+			if managed == nil {
+				continue
+			}
+			if err := managed.resize(req.Cols, req.Rows); err != nil {
+				writeKernel("ccx3-init: resize " + itoa(req.Cols) + "x" + itoa(req.Rows) + ": " + err.Error())
+			}
+			continue
+		default:
+			writeKernel("ccx3-init: unsupported control kind " + req.Kind)
+			continue
+		}
+		if len(req.Command) == 0 {
+			writeKernel("ccx3-init: exec request missing command")
+			if cfg.ExitMarkerPrefix != "" {
+				writeKernel(cfg.ExitMarkerPrefix + "125")
+			}
+			continue
+		}
+		if req.ID == "" {
+			writeKernel("ccx3-init: exec request missing id")
+			continue
+		}
+
+		workDir := req.WorkDir
+		if workDir == "" {
+			workDir = cfg.WorkDir
+		}
+		env := req.Env
+		if len(env) == 0 {
+			env = cfg.Env
+		}
+
+		stdinR, stdinW := io.Pipe()
+		managed := &managedExec{stdin: stdinW}
+		activeMu.Lock()
+		active[req.ID] = managed
+		activeMu.Unlock()
+		if len(req.Stdin) > 0 {
+			if err := managed.writeStdin(req.Stdin); err != nil {
+				writeKernel("ccx3-init: write initial stdin: " + err.Error())
+			}
+		}
+
+		go runManagedExec(cfg, control, req.ID, req.Command, env, workDir, stdinR, managed, req.TTY, req.Cols, req.Rows, func() {
+			_ = managed.closeStdin()
+			activeMu.Lock()
+			delete(active, req.ID)
+			activeMu.Unlock()
+		})
+	}
+}
+
+func runManagedExec(cfg config, control io.Writer, id string, argv []string, env []string, workDir string, stdin io.ReadCloser, managed *managedExec, tty bool, cols int, rows int, cleanup func()) {
+	defer cleanup()
+	if cfg.BeginMarker != "" {
+		writeProtocolLineTo(control, cfg.BeginMarker+id)
+	}
+	writeKernel("ccx3-init: exec " + strings.Join(argv, " "))
+
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Env = env
+	if workDir != "" {
+		cmd.Dir = workDir
+	}
+	var (
+		done       chan struct{}
+		stdoutW    *io.PipeWriter
+		stderrW    *io.PipeWriter
+		ptyMaster  *os.File
+		ptySlave   *os.File
+		startError error
+	)
+
+	if tty {
+		ptyMaster, ptySlave, startError = openPTY(cols, rows)
+		if startError != nil {
+			writeKernel("ccx3-init: open pty: " + startError.Error())
+			if cfg.ExitMarkerPrefix != "" {
+				writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
+			}
+			return
+		}
+		defer func() {
+			if ptyMaster != nil {
+				_ = ptyMaster.Close()
+			}
+		}()
+		defer func() {
+			if ptySlave != nil {
+				_ = ptySlave.Close()
+			}
+		}()
+		managed.setPTY(ptyMaster)
+		cmd.Stdin = ptySlave
+		cmd.Stdout = ptySlave
+		cmd.Stderr = ptySlave
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Setsid:  true,
+			Setctty: true,
+			Ctty:    0,
+		}
+		streams := 1
+		if stdin != nil {
+			streams++
+		}
+		done = make(chan struct{}, streams)
+		go func() {
+			defer func() { done <- struct{}{} }()
+			var buf [256]byte
+			for {
+				n, err := ptyMaster.Read(buf[:])
+				if n > 0 && cfg.OutputMarkerPref != "" {
+					writeProtocolLineTo(control, cfg.OutputMarkerPref+id+":"+base64.StdEncoding.EncodeToString(buf[:n]))
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+		if stdin != nil {
+			go func() {
+				defer func() { done <- struct{}{} }()
+				defer stdin.Close()
+				var buf [256]byte
+				for {
+					n, err := stdin.Read(buf[:])
+					if n > 0 {
+						if _, writeErr := ptyMaster.Write(buf[:n]); writeErr != nil {
+							return
+						}
+					}
+					if err != nil {
+						if err == io.EOF {
+							_, _ = ptyMaster.Write([]byte{4})
+						}
+						return
+					}
+				}
+			}()
+		}
+	} else {
+		if stdin != nil {
+			defer stdin.Close()
+			cmd.Stdin = stdin
+		} else {
+			devNull, err := os.Open("/dev/null")
+			if err == nil {
+				defer devNull.Close()
+				cmd.Stdin = devNull
+			}
+		}
+
+		stdoutR, stdoutPipeW := io.Pipe()
+		stderrR, stderrPipeW := io.Pipe()
+		stdoutW = stdoutPipeW
+		stderrW = stderrPipeW
+		cmd.Stdout = stdoutW
+		cmd.Stderr = stderrW
+
+		done = make(chan struct{}, 2)
+		go func() {
+			defer func() { done <- struct{}{} }()
+			defer stdoutR.Close()
+			var buf [256]byte
+			for {
+				n, err := stdoutR.Read(buf[:])
+				if n > 0 && cfg.OutputMarkerPref != "" {
+					writeProtocolLineTo(control, cfg.OutputMarkerPref+id+":"+base64.StdEncoding.EncodeToString(buf[:n]))
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+		go func() {
+			defer func() { done <- struct{}{} }()
+			defer stderrR.Close()
+			var buf [256]byte
+			for {
+				n, err := stderrR.Read(buf[:])
+				if n > 0 && cfg.ErrorMarkerPref != "" {
+					writeProtocolLineTo(control, cfg.ErrorMarkerPref+id+":"+base64.StdEncoding.EncodeToString(buf[:n]))
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+	}
+
+	startErr := cmd.Start()
+	if startErr != nil {
+		_ = managed.closeStdin()
+		if stdoutW != nil {
+			_ = stdoutW.Close()
+		}
+		if stderrW != nil {
+			_ = stderrW.Close()
+		}
+		for i := 0; i < cap(done); i++ {
+			<-done
+		}
+		writeKernel("ccx3-init: exec error: " + startErr.Error())
+		if cfg.ExitMarkerPrefix != "" {
+			writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
+		}
+		return
+	}
+	managed.setProcess(cmd.Process)
+	if ptySlave != nil {
+		_ = ptySlave.Close()
+		ptySlave = nil
+	}
+
+	waitErr := cmd.Wait()
+	if tty {
+		_ = managed.closeStdin()
+	}
+	if stdoutW != nil {
+		_ = stdoutW.Close()
+	}
+	if stderrW != nil {
+		_ = stderrW.Close()
+	}
+	for i := 0; i < cap(done); i++ {
+		<-done
+	}
+
+	exitCode := 0
+	if waitErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(waitErr, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else {
+			writeKernel("ccx3-init: exec error: " + waitErr.Error())
+			exitCode = 126
+		}
+	}
+	if cfg.ExitMarkerPrefix != "" {
+		writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":"+itoa(exitCode))
+	}
+}
+
+type sockaddrVM struct {
+	Family   uint16
+	Reserved uint16
+	Port     uint32
+	CID      uint32
+	Zero     [4]byte
+}
+
+func connectVsock(port uint32) (*os.File, error) {
+	fd, err := syscall.Socket(syscall.AF_VSOCK, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		return nil, err
+	}
+	addr := sockaddrVM{
+		Family: syscall.AF_VSOCK,
+		Port:   port,
+		CID:    2,
+	}
+	_, _, errno := syscall.Syscall(syscall.SYS_CONNECT, uintptr(fd), uintptr(unsafe.Pointer(&addr)), unsafe.Sizeof(addr))
+	if errno != 0 {
+		_ = syscall.Close(fd)
+		return nil, errno
+	}
+	return os.NewFile(uintptr(fd), fmt.Sprintf("vsock:%d", port)), nil
 }

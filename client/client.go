@@ -7,16 +7,22 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
+
+	"golang.org/x/net/websocket"
 )
 
 type Client struct {
 	url    string
+	dialer func() (net.Conn, error)
 	client http.Client
 }
 
 func NewClient(url string, dialer func() (net.Conn, error)) *Client {
 	return &Client{
-		url: url,
+		url:    url,
+		dialer: dialer,
 		client: http.Client{
 			Transport: &http.Transport{
 				Dial: func(_, _ string) (net.Conn, error) {
@@ -123,14 +129,14 @@ func (c *Client) VMSupported() (VMSupportedResponse, error) {
 	return ret, err
 }
 
-func (c *Client) StartVM(req StartVMRequest) (VMState, error) {
-	var ret VMState
+func (c *Client) CreateInstance(req CreateInstanceRequest) (InstanceState, error) {
+	var ret InstanceState
 	err := c.postJSONExpectOK("/vm", req, &ret)
 	return ret, err
 }
 
-func (c *Client) VMStatus() (VMState, error) {
-	var ret VMState
+func (c *Client) InstanceStatus() (InstanceState, error) {
+	var ret InstanceState
 	resp, err := c.client.Get(c.url + "/vm/status")
 	if err != nil {
 		return ret, err
@@ -143,14 +149,116 @@ func (c *Client) VMStatus() (VMState, error) {
 	return ret, err
 }
 
-func (c *Client) ShutdownVM() error {
+func (c *Client) ShutdownInstance() error {
 	return c.postJSONExpectOK("/vm/shutdown", nil, nil)
 }
 
-func (c *Client) RunVM(req StartVMRequest) (RunVMResponse, error) {
-	var ret RunVMResponse
+func (c *Client) Run(req RunRequest) (ExecResponse, error) {
+	var ret ExecResponse
 	err := c.postJSONExpectOK("/vm/run", req, &ret)
 	return ret, err
+}
+
+func (c *Client) RunEvents(req RunRequest) ([]ExecEvent, error) {
+	return c.ExecEvents(ExecRequest{
+		Command: append([]string(nil), req.Command...),
+		Env:     append([]string(nil), req.Env...),
+		WorkDir: req.WorkDir,
+		User:    req.User,
+		Stdin:   append([]byte(nil), req.Stdin...),
+		TTY:     req.TTY,
+		Cols:    req.Cols,
+		Rows:    req.Rows,
+	})
+}
+
+func (c *Client) ExecEvents(req ExecRequest) ([]ExecEvent, error) {
+	var events []ExecEvent
+	err := c.ExecStream(req, nil, func(event ExecEvent) error {
+		events = append(events, event)
+		return nil
+	})
+	return events, err
+}
+
+func (c *Client) ExecStream(req ExecRequest, inputs <-chan ExecInput, onEvent func(ExecEvent) error) error {
+	wsURL, err := websocketURL(c.url, "/vm/run")
+	if err != nil {
+		return err
+	}
+	cfg, err := websocket.NewConfig(wsURL, c.url)
+	if err != nil {
+		return err
+	}
+	if c.dialer != nil {
+		cfg.Dialer = &net.Dialer{}
+	}
+	ws, err := websocket.DialConfig(cfg)
+	if err != nil {
+		return err
+	}
+	defer ws.Close()
+
+	if err := websocket.JSON.Send(ws, req); err != nil {
+		return err
+	}
+	if inputs != nil {
+		go func() {
+			for input := range inputs {
+				_ = websocket.JSON.Send(ws, input)
+			}
+		}()
+	}
+
+	for {
+		var event ExecEvent
+		if err := websocket.JSON.Receive(ws, &event); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+		if onEvent != nil {
+			if err := onEvent(event); err != nil {
+				return err
+			}
+		}
+		if event.Kind == "exit" || event.Kind == "error" {
+			break
+		}
+	}
+	return nil
+}
+
+func websocketURL(baseURL, path string) (string, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return "", err
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	default:
+		return "", fmt.Errorf("unsupported base URL scheme %q", u.Scheme)
+	}
+	u.Path = path
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String(), nil
+}
+
+func (c *Client) StartVM(req StartVMRequest) (VMState, error) { return c.CreateInstance(req) }
+func (c *Client) VMStatus() (VMState, error)                  { return c.InstanceStatus() }
+func (c *Client) ShutdownVM() error                           { return c.ShutdownInstance() }
+func (c *Client) RunVM(req StartVMRequest) (RunVMResponse, error) {
+	return c.Run(RunRequest{
+		Image:    req.Image,
+		MemoryMB: req.MemoryMB,
+		CPUs:     req.CPUs,
+		Dmesg:    req.Dmesg,
+	})
 }
 
 func (c *Client) postJSONExpectOK(path string, reqBody any, respBody any) error {

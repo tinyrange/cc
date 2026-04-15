@@ -11,11 +11,13 @@ import (
 )
 
 type Backend interface {
-	Start(context.Context, client.StartVMRequest) (Instance, error)
-	Run(context.Context, client.StartVMRequest) (client.RunVMResponse, error)
+	Start(context.Context, client.CreateInstanceRequest) (Instance, error)
+	Run(context.Context, client.RunRequest) (client.ExecResponse, error)
 }
 
 type Instance interface {
+	Exec(context.Context, client.ExecRequest) (client.ExecResponse, error)
+	ExecStream(context.Context, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 	Wait() error
 	Close() error
 }
@@ -29,7 +31,8 @@ type Manager struct {
 
 type Machine struct {
 	image      string
-	command    []string
+	memoryMB   uint64
+	cpus       int
 	startedAt  time.Time
 	instance   Instance
 	lastErr    error
@@ -49,12 +52,12 @@ func Supports() error {
 	return hv.Supports()
 }
 
-func (m *Manager) Start(ctx context.Context, req client.StartVMRequest) (client.VMState, error) {
+func (m *Manager) Start(ctx context.Context, req client.CreateInstanceRequest) (client.InstanceState, error) {
 	if req.Image == "" {
-		return client.VMState{}, fmt.Errorf("image is required")
+		return client.InstanceState{}, fmt.Errorf("image is required")
 	}
 	if err := m.supports(); err != nil {
-		return client.VMState{}, err
+		return client.InstanceState{}, err
 	}
 
 	m.mu.Lock()
@@ -67,12 +70,13 @@ func (m *Manager) Start(ctx context.Context, req client.StartVMRequest) (client.
 
 	inst, err := m.backend.Start(ctx, req)
 	if err != nil {
-		return client.VMState{}, err
+		return client.InstanceState{}, err
 	}
 
 	machine := &Machine{
 		image:      req.Image,
-		command:    append([]string(nil), req.Command...),
+		memoryMB:   req.MemoryMB,
+		cpus:       req.CPUs,
 		startedAt:  time.Now().UTC(),
 		instance:   inst,
 		shutdownCh: make(chan struct{}),
@@ -103,30 +107,59 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	return machine.instance.Close()
 }
 
-func (m *Manager) Run(ctx context.Context, req client.StartVMRequest) (client.RunVMResponse, error) {
+func (m *Manager) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
+	m.mu.Lock()
+	machine := m.running
+	m.mu.Unlock()
+	if machine != nil {
+		if req.Image != "" && req.Image != machine.image {
+			return client.ExecResponse{}, fmt.Errorf("running instance image is %q, got exec request for %q", machine.image, req.Image)
+		}
+		return machine.instance.Exec(ctx, client.ExecRequest{
+			Command: append([]string(nil), req.Command...),
+			Env:     append([]string(nil), req.Env...),
+			WorkDir: req.WorkDir,
+			User:    req.User,
+			Stdin:   append([]byte(nil), req.Stdin...),
+			TTY:     req.TTY,
+			Cols:    req.Cols,
+			Rows:    req.Rows,
+		})
+	}
 	if req.Image == "" {
-		return client.RunVMResponse{}, fmt.Errorf("image is required")
+		return client.ExecResponse{}, fmt.Errorf("image is required")
 	}
 	if err := m.supports(); err != nil {
-		return client.RunVMResponse{}, err
+		return client.ExecResponse{}, err
 	}
 	return m.backend.Run(ctx, req)
 }
 
-func (m *Manager) Status() client.VMState {
+func (m *Manager) Stream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	m.mu.Lock()
+	machine := m.running
+	m.mu.Unlock()
+	if machine == nil {
+		return fmt.Errorf("no VM is running")
+	}
+	return machine.instance.ExecStream(ctx, req, inputs, onEvent)
+}
+
+func (m *Manager) Status() client.InstanceState {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.statusLocked()
 }
 
-func (m *Manager) statusLocked() client.VMState {
+func (m *Manager) statusLocked() client.InstanceState {
 	if m.running == nil {
-		return client.VMState{Status: "stopped"}
+		return client.InstanceState{Status: "stopped"}
 	}
-	return client.VMState{
+	return client.InstanceState{
 		Status:    "running",
 		Image:     m.running.image,
-		Command:   append([]string(nil), m.running.command...),
+		MemoryMB:  m.running.memoryMB,
+		CPUs:      m.running.cpus,
 		StartedAt: m.running.startedAt.Format(time.RFC3339),
 	}
 }
@@ -152,14 +185,14 @@ func (m *Manager) watch(machine *Machine) {
 
 type unsupportedBackend struct{}
 
-func (unsupportedBackend) Start(ctx context.Context, req client.StartVMRequest) (Instance, error) {
+func (unsupportedBackend) Start(ctx context.Context, req client.CreateInstanceRequest) (Instance, error) {
 	_ = ctx
 	_ = req
 	return nil, fmt.Errorf("VM backend is not configured")
 }
 
-func (unsupportedBackend) Run(ctx context.Context, req client.StartVMRequest) (client.RunVMResponse, error) {
+func (unsupportedBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
 	_ = ctx
 	_ = req
-	return client.RunVMResponse{}, fmt.Errorf("VM backend is not configured")
+	return client.ExecResponse{}, fmt.Errorf("VM backend is not configured")
 }

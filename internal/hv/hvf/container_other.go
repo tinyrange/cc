@@ -6,19 +6,21 @@ import (
 	"context"
 	"fmt"
 
+	"j5.nz/cc/client"
 	"j5.nz/cc/internal/oci"
 )
 
 type ContainerRunRequest struct {
-	Kernel   []byte
-	Image    *oci.Image
-	Command  []string
-	Env      []string
-	WorkDir  string
-	User     string
-	MemoryMB uint64
-	CPUs     int
-	Dmesg    bool
+	Kernel     []byte
+	Image      *oci.Image
+	Command    []string
+	Env        []string
+	WorkDir    string
+	User       string
+	MemoryMB   uint64
+	CPUs       int
+	Dmesg      bool
+	Persistent bool
 }
 
 type ContainerRunResult struct {
@@ -28,6 +30,12 @@ type ContainerRunResult struct {
 }
 
 type ContainerSession struct{}
+
+func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
+	_ = ctx
+	_ = req
+	return client.ExecResponse{}, fmt.Errorf("hvf container runner is unsupported on this host")
+}
 
 func StartContainer(ctx context.Context, req ContainerRunRequest) (*ContainerSession, error) {
 	_ = ctx

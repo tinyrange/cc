@@ -379,8 +379,13 @@ void _start(void) {
 		t.Fatalf("WriteFile(init.c) error = %v", err)
 	}
 
+	toolchain, err := clangAArch64LinuxToolchain()
+	if err != nil {
+		t.Skip(err)
+	}
+
 	out := filepath.Join(filepath.Dir(src), "init")
-	cmd := exec.Command("clang",
+	cmd := exec.Command(toolchain.clang,
 		"-target", "aarch64-linux-gnu",
 		"-nostdlib",
 		"-static",
@@ -390,6 +395,7 @@ void _start(void) {
 		"-o", out,
 		src,
 	)
+	cmd.Env = toolchain.env
 	buildOut, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("clang build init error = %v\n%s", err, string(buildOut))
@@ -602,8 +608,13 @@ void _start(void) {
 		t.Fatalf("WriteFile(init.c) error = %v", err)
 	}
 
+	toolchain, err := clangAArch64LinuxToolchain()
+	if err != nil {
+		t.Skip(err)
+	}
+
 	out := filepath.Join(filepath.Dir(src), "init")
-	cmd := exec.Command("clang",
+	cmd := exec.Command(toolchain.clang,
 		"-target", "aarch64-linux-gnu",
 		"-nostdlib",
 		"-static",
@@ -613,6 +624,7 @@ void _start(void) {
 		"-o", out,
 		src,
 	)
+	cmd.Env = toolchain.env
 	buildOut, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("clang build init error = %v\n%s", err, string(buildOut))

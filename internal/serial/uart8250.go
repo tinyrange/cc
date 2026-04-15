@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"sync"
+	"time"
 )
 
 const (
@@ -21,11 +23,12 @@ const (
 )
 
 type UART8250 struct {
-	base   uint64
-	size   uint64
-	stride uint64
-	out    io.Writer
-	irq    irqController
+	mu      sync.Mutex
+	base    uint64
+	size    uint64
+	stride  uint64
+	out     io.Writer
+	irq     irqController
 	irqLine uint32
 
 	dll         byte
@@ -67,6 +70,8 @@ func NewUART8250(base uint64, regShift uint32, out io.Writer) *UART8250 {
 }
 
 func (u *UART8250) AttachIRQ(irq irqController, irqLine uint32) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
 	u.irq = irq
 	u.irqLine = irqLine
 	u.updateInterrupts()
@@ -81,6 +86,8 @@ func (u *UART8250) Contains(addr uint64, size int) bool {
 }
 
 func (u *UART8250) Write(addr uint64, data []byte) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
 	for i, value := range data {
 		if err := u.writeByte(addr+uint64(i), value); err != nil {
 			return err
@@ -90,6 +97,8 @@ func (u *UART8250) Write(addr uint64, data []byte) error {
 }
 
 func (u *UART8250) Read(addr uint64, data []byte) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
 	for i := range data {
 		value, err := u.readByte(addr + uint64(i))
 		if err != nil {
@@ -121,9 +130,29 @@ func (u *UART8250) ReadValue(addr uint64, size int) (uint64, error) {
 }
 
 func (u *UART8250) InjectRXByte(value byte) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
 	u.rbr = value
 	u.lsr |= uartLSRDataReady
 	u.updateInterrupts()
+}
+
+func (u *UART8250) InjectRXBytes(data []byte) error {
+	for _, value := range data {
+		for {
+			u.mu.Lock()
+			if u.lsr&uartLSRDataReady == 0 {
+				u.rbr = value
+				u.lsr |= uartLSRDataReady
+				u.updateInterrupts()
+				u.mu.Unlock()
+				break
+			}
+			u.mu.Unlock()
+			time.Sleep(500 * time.Microsecond)
+		}
+	}
+	return nil
 }
 
 func (u *UART8250) writeByte(addr uint64, value byte) error {

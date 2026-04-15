@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/macos"
@@ -62,7 +63,15 @@ func main() {
 	}
 
 	var httpServer http.Server
+	mux := newMux(srvState, &httpServer)
 
+	httpServer = http.Server{Handler: mux}
+	if err := httpServer.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		panic(err)
+	}
+}
+
+func newMux(srvState *server, httpServer *http.Server) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -75,7 +84,9 @@ func main() {
 			time.Sleep(10 * time.Millisecond)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			_ = httpServer.Shutdown(ctx)
+			if httpServer != nil {
+				_ = httpServer.Shutdown(ctx)
+			}
 		}()
 	})
 
@@ -142,9 +153,8 @@ func main() {
 	mux.HandleFunc("GET /vm/status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, srvState.vms.Status())
 	})
-
 	mux.HandleFunc("POST /vm", func(w http.ResponseWriter, r *http.Request) {
-		var req client.StartVMRequest
+		var req client.CreateInstanceRequest
 		if err := decodeRequiredJSON(r, &req); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
@@ -166,7 +176,6 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, state)
 	})
-
 	mux.HandleFunc("POST /vm/shutdown", func(w http.ResponseWriter, r *http.Request) {
 		if err := srvState.vms.Shutdown(r.Context()); err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -174,18 +183,19 @@ func main() {
 		}
 		writeJSON(w, http.StatusOK, srvState.vms.Status())
 	})
-
 	mux.HandleFunc("POST /vm/run", func(w http.ResponseWriter, r *http.Request) {
-		var req client.StartVMRequest
-		if err := decodeRequiredJSON(r, &req); err != nil {
+		req, err := decodeRunRequest(r)
+		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		if _, err := srvState.images.Open(req.Image); err != nil {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("image %q is not available", req.Image))
-			return
+		if req.Image != "" {
+			if _, err := srvState.images.Open(req.Image); err != nil {
+				writeError(w, http.StatusBadRequest, fmt.Errorf("image %q is not available", req.Image))
+				return
+			}
 		}
-		if srvState.kernel.Status().Status != "downloaded" {
+		if srvState.kernel.Status().Status != "downloaded" && (req.Image != "" || srvState.vms.Status().Status == "running") {
 			if err := srvState.kernel.Ensure(r.Context()); err != nil {
 				writeError(w, http.StatusInternalServerError, err)
 				return
@@ -196,13 +206,21 @@ func main() {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		if wantsExecEventStream(r) {
+			writeExecEventStream(w, resp)
+			return
+		}
 		writeJSON(w, http.StatusOK, resp)
 	})
-
-	httpServer = http.Server{Handler: mux}
-	if err := httpServer.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		panic(err)
-	}
+	mux.Handle("/vm/run", websocket.Server{
+		Handshake: func(*websocket.Config, *http.Request) error { return nil },
+		Handler: func(ws *websocket.Conn) {
+			serveRunWebSocket(ws, func(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+				return srvState.vms.Stream(ctx, req, inputs, onEvent)
+			})
+		},
+	})
+	return mux
 }
 
 func resolveCacheDir(arg string) (string, error) {
@@ -237,10 +255,70 @@ func decodeOptionalJSON(r *http.Request, dst any) error {
 	return nil
 }
 
+func decodeRunRequest(r *http.Request) (client.RunRequest, error) {
+	var req client.RunRequest
+	if err := decodeRequiredJSON(r, &req); err != nil {
+		return req, err
+	}
+	return req, nil
+}
+
+func serveRunWebSocket(ws *websocket.Conn, runner func(context.Context, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error) {
+	defer ws.Close()
+
+	var req client.ExecRequest
+	if err := websocket.JSON.Receive(ws, &req); err != nil {
+		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "error", Error: fmt.Sprintf("decode exec request: %v", err)})
+		return
+	}
+
+	inputs := make(chan client.ExecInput, 16)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		defer close(inputs)
+		for {
+			var input client.ExecInput
+			if err := websocket.JSON.Receive(ws, &input); err != nil {
+				return
+			}
+			inputs <- input
+		}
+	}()
+
+	err := runner(ctx, req, inputs, func(event client.ExecEvent) error {
+		return websocket.JSON.Send(ws, event)
+	})
+	if err != nil {
+		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "error", Error: err.Error()})
+	}
+}
+
 func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func wantsExecEventStream(r *http.Request) bool {
+	if r.URL.Query().Get("stream") == "1" {
+		return true
+	}
+	return r.Header.Get("Accept") == "application/x-ndjson"
+}
+
+func writeExecEventStream(w http.ResponseWriter, resp client.ExecResponse) {
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.WriteHeader(http.StatusOK)
+	enc := json.NewEncoder(w)
+	if resp.Output != "" {
+		_ = enc.Encode(client.ExecEvent{Kind: "output", Output: resp.Output})
+	}
+	_ = enc.Encode(client.ExecEvent{Kind: "exit", ExitCode: resp.ExitCode})
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 func writeError(w http.ResponseWriter, status int, err error) {

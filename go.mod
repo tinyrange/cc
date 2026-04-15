@@ -1,7 +1,10 @@
 module j5.nz/cc
 
-go 1.23.3
+go 1.25.5
 
 require github.com/ebitengine/purego v0.10.0
 
-require github.com/ebitengine/purego v0.10.0 // indirect
+require (
+	golang.org/x/net v0.53.0
+	golang.org/x/sys v0.43.0
+)

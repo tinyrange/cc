@@ -23,8 +23,8 @@ func NewRuntimeBackend(kernel *alpine.Manager, images *oci.Store) Backend {
 	return &runtimeBackend{kernel: kernel, images: images}
 }
 
-func (b *runtimeBackend) Start(ctx context.Context, req client.StartVMRequest) (Instance, error) {
-	runReq, err := b.buildRunRequest(ctx, req)
+func (b *runtimeBackend) Start(ctx context.Context, req client.CreateInstanceRequest) (Instance, error) {
+	runReq, err := b.buildStartRequest(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -35,26 +35,26 @@ func (b *runtimeBackend) Start(ctx context.Context, req client.StartVMRequest) (
 	return session, nil
 }
 
-func (b *runtimeBackend) Run(ctx context.Context, req client.StartVMRequest) (client.RunVMResponse, error) {
+func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
 	runReq, err := b.buildRunRequest(ctx, req)
 	if err != nil {
-		return client.RunVMResponse{}, err
+		return client.ExecResponse{}, err
 	}
 	result, err := hvf.RunContainer(ctx, runReq)
 	if err != nil {
-		return client.RunVMResponse{}, err
+		return client.ExecResponse{}, err
 	}
-	return client.RunVMResponse{
+	return client.ExecResponse{
 		ExitCode: result.ExitCode,
 		Output:   result.Output,
 	}, nil
 }
 
-func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.StartVMRequest) (hvf.ContainerRunRequest, error) {
+func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, memoryMB uint64, cpus int, dmesg bool) (hvf.ContainerRunRequest, error) {
 	if b.kernel == nil || b.images == nil {
 		return hvf.ContainerRunRequest{}, fmt.Errorf("runtime backend is not configured")
 	}
-	image, err := b.images.Open(req.Image)
+	image, err := b.images.Open(imageName)
 	if err != nil {
 		return hvf.ContainerRunRequest{}, err
 	}
@@ -63,11 +63,13 @@ func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.StartVM
 		return hvf.ContainerRunRequest{}, err
 	}
 	modules, err := b.kernel.PlanModuleLoad(
-		[]string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS"},
+		[]string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS"},
 		map[string]string{
-			"CONFIG_VIRTIO_MMIO": "kernel/drivers/virtio/virtio_mmio.ko.gz",
-			"CONFIG_FUSE_FS":     "kernel/fs/fuse/fuse.ko.gz",
-			"CONFIG_VIRTIO_FS":   "kernel/fs/fuse/virtiofs.ko.gz",
+			"CONFIG_VIRTIO_MMIO":     "kernel/drivers/virtio/virtio_mmio.ko.gz",
+			"CONFIG_FUSE_FS":         "kernel/fs/fuse/fuse.ko.gz",
+			"CONFIG_VIRTIO_FS":       "kernel/fs/fuse/virtiofs.ko.gz",
+			"CONFIG_VSOCKETS":        "kernel/net/vmw_vsock/vsock.ko.gz",
+			"CONFIG_VIRTIO_VSOCKETS": "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
 		},
 	)
 	if err != nil {
@@ -82,12 +84,29 @@ func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.StartVM
 		Init:     initBin,
 		Modules:  modules,
 		Image:    image,
-		Command:  append([]string(nil), req.Command...),
-		Env:      append([]string(nil), req.Env...),
-		WorkDir:  req.WorkDir,
-		User:     req.User,
-		MemoryMB: req.MemoryMB,
-		CPUs:     req.CPUs,
-		Dmesg:    req.Dmesg,
+		MemoryMB: memoryMB,
+		CPUs:     cpus,
+		Dmesg:    dmesg,
 	}, ctx.Err()
+}
+
+func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.CreateInstanceRequest) (hvf.ContainerRunRequest, error) {
+	runReq, err := b.buildBaseRequest(ctx, req.Image, req.MemoryMB, req.CPUs, req.Dmesg)
+	if err != nil {
+		return hvf.ContainerRunRequest{}, err
+	}
+	runReq.Persistent = true
+	return runReq, nil
+}
+
+func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.RunRequest) (hvf.ContainerRunRequest, error) {
+	runReq, err := b.buildBaseRequest(ctx, req.Image, req.MemoryMB, req.CPUs, req.Dmesg)
+	if err != nil {
+		return hvf.ContainerRunRequest{}, err
+	}
+	runReq.Command = append([]string(nil), req.Command...)
+	runReq.Env = append([]string(nil), req.Env...)
+	runReq.WorkDir = req.WorkDir
+	runReq.User = req.User
+	return runReq, nil
 }

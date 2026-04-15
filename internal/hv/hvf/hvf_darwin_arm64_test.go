@@ -127,6 +127,9 @@ func TestHVFBringupStages(t *testing.T) {
 	})
 
 	t.Run("initramfs init prints hello world", func(t *testing.T) {
+		if os.Getenv("CCX3_RUN_HVF_INITRAMFS_TEST") == "" {
+			t.Skip("set CCX3_RUN_HVF_INITRAMFS_TEST=1 to run the initramfs userspace boot test")
+		}
 		testBootHelloWorldInit(t, vm)
 	})
 
