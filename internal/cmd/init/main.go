@@ -32,12 +32,19 @@ type config struct {
 	WorkDir          string   `json:"workdir"`
 	Modules          []string `json:"modules"`
 	RootFSTag        string   `json:"rootfs_tag"`
+	Shares           []share  `json:"shares,omitempty"`
 	VsockPort        uint32   `json:"vsock_port,omitempty"`
 	ReadyMarker      string   `json:"ready_marker"`
 	BeginMarker      string   `json:"begin_marker"`
 	OutputMarkerPref string   `json:"output_marker_prefix"`
 	ErrorMarkerPref  string   `json:"error_marker_prefix"`
 	ExitMarkerPrefix string   `json:"exit_marker_prefix"`
+}
+
+type share struct {
+	Tag      string `json:"tag"`
+	Mount    string `json:"mount"`
+	Writable bool   `json:"writable,omitempty"`
 }
 
 type execRequest struct {
@@ -169,6 +176,12 @@ func run() error {
 			return err
 		}
 		writeKernel("ccx3-init: rootfs mounted")
+		if err := mountShares(cfg.Shares); err != nil {
+			return err
+		}
+		if err := configureBinfmt(); err != nil {
+			return fmt.Errorf("configure binfmt: %w", err)
+		}
 	}
 	if err := os.Chdir(cfg.WorkDir); err != nil {
 		return fmt.Errorf("chdir %s: %w", cfg.WorkDir, err)
@@ -229,6 +242,54 @@ func mountRootFS(tag string) error {
 	_ = syscall.Mount("devpts", "/dev/pts", "devpts", 0, "")
 	_ = syscall.Mount("tmpfs", "/dev/shm", "tmpfs", 0, "mode=1777")
 	_ = os.Symlink("/proc/self/fd", "/dev/fd")
+	return nil
+}
+
+func mountShares(shares []share) error {
+	for _, share := range shares {
+		if strings.TrimSpace(share.Tag) == "" {
+			return fmt.Errorf("share tag is required")
+		}
+		mountpoint := strings.TrimSpace(share.Mount)
+		if mountpoint == "" || !strings.HasPrefix(mountpoint, "/") {
+			return fmt.Errorf("share mount %q must be absolute", mountpoint)
+		}
+		if err := os.MkdirAll(mountpoint, 0o755); err != nil {
+			return fmt.Errorf("mkdir share mount %s: %w", mountpoint, err)
+		}
+		flags := uintptr(0)
+		if !share.Writable {
+			flags |= syscall.MS_RDONLY
+		}
+		if err := syscall.Mount(share.Tag, mountpoint, "virtiofs", flags, ""); err != nil {
+			return fmt.Errorf("mount share %s at %s: %w", share.Tag, mountpoint, err)
+		}
+	}
+	return nil
+}
+
+func configureBinfmt() error {
+	if _, err := os.Stat("/usr/bin/qemu-x86_64-static"); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if err := os.MkdirAll("/proc/sys/fs/binfmt_misc", 0o755); err != nil {
+		return fmt.Errorf("mkdir binfmt_misc: %w", err)
+	}
+	if err := syscall.Mount("binfmt_misc", "/proc/sys/fs/binfmt_misc", "binfmt_misc", 0, ""); err != nil && !errors.Is(err, syscall.EBUSY) {
+		return fmt.Errorf("mount binfmt_misc: %w", err)
+	}
+	if _, err := os.Stat("/proc/sys/fs/binfmt_misc/qemu-x86_64"); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat qemu-x86_64 registration: %w", err)
+	}
+	const qemuX8664Registration = ":qemu-x86_64:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-x86_64-static:CF"
+	if err := os.WriteFile("/proc/sys/fs/binfmt_misc/register", []byte(qemuX8664Registration), 0o644); err != nil {
+		return fmt.Errorf("register qemu-x86_64: %w", err)
+	}
 	return nil
 }
 

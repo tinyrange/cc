@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,6 +18,7 @@ import (
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/fdt"
+	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/kernel/alpine"
 	bootarm64 "j5.nz/cc/internal/linux/boot/arm64"
 	"j5.nz/cc/internal/linux/initramfs"
@@ -43,6 +43,9 @@ const (
 	containerVsockBase    = 0x0a102000
 	containerVsockSize    = 0x1000
 	containerVsockIRQ     = 42
+	containerShareFSBase  = 0x0a103000
+	containerShareFSIRQ   = 43
+	containerFSStride     = 0x1000
 	containerUARTSPI      = 33
 	containerRootFSTag    = "rootfs"
 	containerGuestCID     = 3
@@ -61,6 +64,7 @@ type ContainerRunRequest struct {
 	Modules    []alpine.Module
 	Image      *oci.Image
 	RootFS     virtio.FSBackend
+	Shares     []DirectoryShare
 	Command    []string
 	Env        []string
 	WorkDir    string
@@ -69,6 +73,12 @@ type ContainerRunRequest struct {
 	CPUs       int
 	Dmesg      bool
 	Persistent bool
+}
+
+type DirectoryShare struct {
+	Source   string
+	Mount    string
+	Writable bool
 }
 
 type ContainerRunResult struct {
@@ -221,7 +231,7 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 	if !hasEnvKey(env, "HOME") {
 		env = append(env, "HOME=/root")
 	}
-	command, err := resolveGuestCommand(s.image.RootFSDir, req.Command, env)
+	command, err := imagefs.ResolveCommand(s.image.RootFS, req.Command, env)
 	if err != nil {
 		return client.ExecResponse{}, err
 	}
@@ -293,7 +303,7 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 	if !hasEnvKey(env, "HOME") {
 		env = append(env, "HOME=/root")
 	}
-	command, err := resolveGuestCommand(s.image.RootFSDir, req.Command, env)
+	command, err := imagefs.ResolveCommand(s.image.RootFS, req.Command, env)
 	if err != nil {
 		return err
 	}
@@ -489,6 +499,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 		WorkDir:          workDir,
 		Modules:          moduleConfig(req.Modules),
 		RootFSTag:        containerRootFSTag,
+		Shares:           guestShareConfig(req.Shares),
 		VsockPort:        containerControlPort,
 		ReadyMarker:      instanceReadyMarker,
 		BeginMarker:      commandBeginMarker,
@@ -559,21 +570,21 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 	}
 	vsock := virtio.NewVsock(containerVsockBase, containerVsockSize, containerVsockIRQ, containerGuestCID, vsockBackend)
 	vsock.Attach(vm, vm)
-	rootFSBackend := req.RootFS
-	if rootFSBackend == nil {
-		rootFSBackend = virtio.NewImageFS(req.Image.RootFSDir, req.Image.FSMetadata)
+	fsdevs, err := buildFSDevices(req, &fsTrace)
+	if err != nil {
+		vm.Close()
+		return nil, err
 	}
-	fsdev := virtio.NewFS(containerFSBase, containerFSSize, containerFSIRQ, containerRootFSTag, rootFSBackend)
-	fsdev.Attach(vm, vm)
-	fsdev.Log = &fsTrace
-	fsdev.Strict = true
+	for _, fsdev := range fsdevs {
+		fsdev.Attach(vm, vm)
+	}
 
 	plan, err := bootarm64.PrepareBoot(mem, req.Kernel, bootarm64.BootOptions{
 		MemoryBase: containerMemoryBase,
 		MemorySize: memorySize,
 		NumCPUs:    1,
 		Initrd:     initrd,
-		ExtraNodes: []fdt.Node{console.DeviceTreeNode(), fsdev.DeviceTreeNode(), vsock.DeviceTreeNode()},
+		ExtraNodes: appendFSNodes([]fdt.Node{console.DeviceTreeNode(), vsock.DeviceTreeNode()}, fsdevs),
 		Cmdline: strings.Join([]string{
 			"console=ttyS0,115200n8",
 			fmt.Sprintf("earlycon=uart8250,mmio,0x%x", bootarm64.DefaultUARTBase),
@@ -666,7 +677,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 			}
 			switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 			case ExceptionClassDataAbortLowerEL:
-				if err := handleContainerDataAbort(vm, uart, console, fsdev, vsock, exitInfo); err != nil {
+				if err := handleContainerDataAbort(vm, uart, console, fsdevs, vsock, exitInfo); err != nil {
 					doneCh <- sessionRunResult{err: err}
 					return
 				}
@@ -791,7 +802,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 
 	var err error
 	if req.Image != nil {
-		command, err = resolveGuestCommand(req.Image.RootFSDir, command, env)
+		command, err = imagefs.ResolveCommand(req.Image.RootFS, command, env)
 		if err != nil {
 			return ContainerRunResult{}, err
 		}
@@ -802,6 +813,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 		WorkDir:          workDir,
 		Modules:          moduleConfig(req.Modules),
 		RootFSTag:        containerRootFSTag,
+		Shares:           guestShareConfig(req.Shares),
 		BeginMarker:      commandBeginMarker,
 		ErrorMarkerPref:  commandErrorMarker,
 		ExitMarkerPrefix: commandExitMarkerPref,
@@ -862,21 +874,20 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	console := virtio.NewConsole(containerConsoleBase, containerConsoleSize, containerConsoleIRQ, &consoleOut)
 	console.Attach(vm, vm)
 	var vsock *virtio.Vsock
-	rootFSBackend := req.RootFS
-	if rootFSBackend == nil {
-		rootFSBackend = virtio.NewImageFS(req.Image.RootFSDir, req.Image.FSMetadata)
+	fsdevs, err := buildFSDevices(req, &fsTrace)
+	if err != nil {
+		return ContainerRunResult{}, err
 	}
-	fsdev := virtio.NewFS(containerFSBase, containerFSSize, containerFSIRQ, containerRootFSTag, rootFSBackend)
-	fsdev.Attach(vm, vm)
-	fsdev.Log = &fsTrace
-	fsdev.Strict = true
+	for _, fsdev := range fsdevs {
+		fsdev.Attach(vm, vm)
+	}
 
 	plan, err := bootarm64.PrepareBoot(mem, req.Kernel, bootarm64.BootOptions{
 		MemoryBase: containerMemoryBase,
 		MemorySize: memorySize,
 		NumCPUs:    1,
 		Initrd:     initrd,
-		ExtraNodes: []fdt.Node{console.DeviceTreeNode(), fsdev.DeviceTreeNode()},
+		ExtraNodes: appendFSNodes([]fdt.Node{console.DeviceTreeNode()}, fsdevs),
 		Cmdline: strings.Join([]string{
 			"console=ttyS0,115200n8",
 			fmt.Sprintf("earlycon=uart8250,mmio,0x%x", bootarm64.DefaultUARTBase),
@@ -969,7 +980,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 
 		switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 		case ExceptionClassDataAbortLowerEL:
-			if err := handleContainerDataAbort(vm, uart, console, fsdev, vsock, exitInfo); err != nil {
+			if err := handleContainerDataAbort(vm, uart, console, fsdevs, vsock, exitInfo); err != nil {
 				return ContainerRunResult{}, err
 			}
 		case ExceptionClassHVC64:
@@ -1040,7 +1051,81 @@ type runResultVM struct {
 	err  error
 }
 
-func handleContainerDataAbort(vm *VM, uart *serial.UART8250, console *virtio.Console, fsdev *virtio.FS, vsock *virtio.Vsock, exitInfo *VcpuExit) error {
+func buildFSDevices(req ContainerRunRequest, trace io.Writer) ([]*virtio.FS, error) {
+	rootFSBackend := req.RootFS
+	if rootFSBackend == nil {
+		if req.Image == nil {
+			return nil, fmt.Errorf("image or rootfs backend is required")
+		}
+		rootFSBackend = virtio.NewImageFS(req.Image.RootFS, req.Image.RootFSDir)
+	}
+	devs := []*virtio.FS{
+		newFSDevice(containerFSBase, containerFSIRQ, containerRootFSTag, rootFSBackend, trace),
+	}
+	for i, share := range req.Shares {
+		tag, backend, err := buildShareBackend(i, share)
+		if err != nil {
+			return nil, err
+		}
+		devs = append(devs, newFSDevice(containerShareFSBase+uint64(i)*containerFSStride, containerShareFSIRQ+uint32(i), tag, backend, trace))
+	}
+	return devs, nil
+}
+
+func newFSDevice(base uint64, irq uint32, tag string, backend virtio.FSBackend, trace io.Writer) *virtio.FS {
+	fsdev := virtio.NewFS(base, containerFSSize, irq, tag, backend)
+	fsdev.Log = trace
+	fsdev.Strict = true
+	return fsdev
+}
+
+func buildShareBackend(index int, share DirectoryShare) (string, virtio.FSBackend, error) {
+	source := strings.TrimSpace(share.Source)
+	if source == "" {
+		return "", nil, fmt.Errorf("share %d: source is required", index)
+	}
+	mount := strings.TrimSpace(share.Mount)
+	if mount == "" || !strings.HasPrefix(mount, "/") {
+		return "", nil, fmt.Errorf("share %d: mount must be an absolute guest path", index)
+	}
+	info, err := os.Stat(source)
+	if err != nil {
+		return "", nil, fmt.Errorf("share %d: stat source: %w", index, err)
+	}
+	if !info.IsDir() {
+		return "", nil, fmt.Errorf("share %d: source must be a directory", index)
+	}
+	tag := fmt.Sprintf("share%d", index)
+	if share.Writable {
+		return tag, virtio.NewPassthroughFS(source, nil), nil
+	}
+	return tag, virtio.NewImageFS(imagefs.NewHostFS(source, nil), source), nil
+}
+
+func appendFSNodes(nodes []fdt.Node, fsdevs []*virtio.FS) []fdt.Node {
+	out := append([]fdt.Node(nil), nodes...)
+	for _, fsdev := range fsdevs {
+		out = append(out, fsdev.DeviceTreeNode())
+	}
+	return out
+}
+
+func guestShareConfig(shares []DirectoryShare) []guestInitShare {
+	if len(shares) == 0 {
+		return nil
+	}
+	out := make([]guestInitShare, 0, len(shares))
+	for i, share := range shares {
+		out = append(out, guestInitShare{
+			Tag:      fmt.Sprintf("share%d", i),
+			Mount:    share.Mount,
+			Writable: share.Writable,
+		})
+	}
+	return out
+}
+
+func handleContainerDataAbort(vm *VM, uart *serial.UART8250, console *virtio.Console, fsdevs []*virtio.FS, vsock *virtio.Vsock, exitInfo *VcpuExit) error {
 	info, err := DecodeDataAbort(exitInfo.Exception.Syndrome)
 	if err != nil {
 		return err
@@ -1084,23 +1169,9 @@ func handleContainerDataAbort(vm *VM, uart *serial.UART8250, console *virtio.Con
 				return err
 			}
 		}
-	case fsdev != nil && fsdev.Contains(addr, info.SizeBytes):
-		if info.Write {
-			value, err := readAbortValue(vm, info)
-			if err != nil {
-				return err
-			}
-			if err := fsdev.Write(addr, info.SizeBytes, value); err != nil {
-				return err
-			}
-		} else {
-			value, err := fsdev.Read(addr, info.SizeBytes)
-			if err != nil {
-				return err
-			}
-			if err := writeAbortValue(vm, info, value); err != nil {
-				return err
-			}
+	case hasFSDevice(fsdevs, addr, info.SizeBytes):
+		if err := handleFSDataAbort(vm, fsdevs, addr, info); err != nil {
+			return err
 		}
 	case vsock != nil && vsock.Contains(addr, info.SizeBytes):
 		if info.Write {
@@ -1135,6 +1206,36 @@ func handleContainerDataAbort(vm *VM, uart *serial.UART8250, console *virtio.Con
 	}
 
 	return vm.AdvanceProgramCounter()
+}
+
+func hasFSDevice(fsdevs []*virtio.FS, addr uint64, size int) bool {
+	for _, fsdev := range fsdevs {
+		if fsdev != nil && fsdev.Contains(addr, size) {
+			return true
+		}
+	}
+	return false
+}
+
+func handleFSDataAbort(vm *VM, fsdevs []*virtio.FS, addr uint64, info DataAbortInfo) error {
+	for _, fsdev := range fsdevs {
+		if fsdev == nil || !fsdev.Contains(addr, info.SizeBytes) {
+			continue
+		}
+		if info.Write {
+			value, err := readAbortValue(vm, info)
+			if err != nil {
+				return err
+			}
+			return fsdev.Write(addr, info.SizeBytes, value)
+		}
+		value, err := fsdev.Read(addr, info.SizeBytes)
+		if err != nil {
+			return err
+		}
+		return writeAbortValue(vm, info, value)
+	}
+	return fmt.Errorf("unhandled virtio-fs access addr=%#x size=%d", addr, info.SizeBytes)
 }
 
 func handleContainerHVC(vm *VM) (bool, error) {
@@ -1446,17 +1547,24 @@ func hasEnvKey(env []string, key string) bool {
 }
 
 type guestInitConfig struct {
-	Command          []string `json:"command"`
-	Env              []string `json:"env"`
-	WorkDir          string   `json:"workdir"`
-	Modules          []string `json:"modules,omitempty"`
-	RootFSTag        string   `json:"rootfs_tag,omitempty"`
-	VsockPort        uint32   `json:"vsock_port,omitempty"`
-	ReadyMarker      string   `json:"ready_marker,omitempty"`
-	BeginMarker      string   `json:"begin_marker"`
-	OutputMarkerPref string   `json:"output_marker_prefix,omitempty"`
-	ErrorMarkerPref  string   `json:"error_marker_prefix,omitempty"`
-	ExitMarkerPrefix string   `json:"exit_marker_prefix"`
+	Command          []string         `json:"command"`
+	Env              []string         `json:"env"`
+	WorkDir          string           `json:"workdir"`
+	Modules          []string         `json:"modules,omitempty"`
+	RootFSTag        string           `json:"rootfs_tag,omitempty"`
+	Shares           []guestInitShare `json:"shares,omitempty"`
+	VsockPort        uint32           `json:"vsock_port,omitempty"`
+	ReadyMarker      string           `json:"ready_marker,omitempty"`
+	BeginMarker      string           `json:"begin_marker"`
+	OutputMarkerPref string           `json:"output_marker_prefix,omitempty"`
+	ErrorMarkerPref  string           `json:"error_marker_prefix,omitempty"`
+	ExitMarkerPrefix string           `json:"exit_marker_prefix"`
+}
+
+type guestInitShare struct {
+	Tag      string `json:"tag"`
+	Mount    string `json:"mount"`
+	Writable bool   `json:"writable,omitempty"`
 }
 
 func moduleConfig(modules []alpine.Module) []string {
@@ -1468,43 +1576,6 @@ func moduleConfig(modules []alpine.Module) []string {
 		out = append(out, "/ccx3/modules/"+mod.Name+".ko")
 	}
 	return out
-}
-
-func resolveGuestCommand(rootfs string, command []string, env []string) ([]string, error) {
-	if len(command) == 0 {
-		return nil, fmt.Errorf("command is empty")
-	}
-	if strings.Contains(command[0], "/") {
-		hostPath := filepath.Join(rootfs, strings.TrimPrefix(command[0], "/"))
-		info, err := os.Lstat(hostPath)
-		if err != nil {
-			return nil, fmt.Errorf("resolve command %q: %w", command[0], err)
-		}
-		if info.IsDir() {
-			return nil, fmt.Errorf("command %q is a directory", command[0])
-		}
-		return command, nil
-	}
-	pathEnv := "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-	for _, kv := range env {
-		if strings.HasPrefix(kv, "PATH=") {
-			pathEnv = strings.TrimPrefix(kv, "PATH=")
-			break
-		}
-	}
-	for _, dir := range strings.Split(pathEnv, ":") {
-		if dir == "" {
-			continue
-		}
-		guestPath := filepath.ToSlash(filepath.Join(dir, command[0]))
-		hostPath := filepath.Join(rootfs, strings.TrimPrefix(guestPath, "/"))
-		info, err := os.Lstat(hostPath)
-		if err == nil && !info.IsDir() && (info.Mode()&os.ModeSymlink != 0 || info.Mode()&0o111 != 0) {
-			resolved := append([]string{guestPath}, command[1:]...)
-			return resolved, nil
-		}
-	}
-	return nil, fmt.Errorf("resolve command %q in PATH", command[0])
 }
 
 func cleanCommandOutput(output string) string {

@@ -62,16 +62,23 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	if err != nil {
 		return hvf.ContainerRunRequest{}, err
 	}
-	modules, err := b.kernel.PlanModuleLoad(
-		[]string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS"},
-		map[string]string{
-			"CONFIG_VIRTIO_MMIO":     "kernel/drivers/virtio/virtio_mmio.ko.gz",
-			"CONFIG_FUSE_FS":         "kernel/fs/fuse/fuse.ko.gz",
-			"CONFIG_VIRTIO_FS":       "kernel/fs/fuse/virtiofs.ko.gz",
-			"CONFIG_VSOCKETS":        "kernel/net/vmw_vsock/vsock.ko.gz",
-			"CONFIG_VIRTIO_VSOCKETS": "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
-		},
-	)
+	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS"}
+	moduleMap := map[string]string{
+		"CONFIG_VIRTIO_MMIO":     "kernel/drivers/virtio/virtio_mmio.ko.gz",
+		"CONFIG_FUSE_FS":         "kernel/fs/fuse/fuse.ko.gz",
+		"CONFIG_VIRTIO_FS":       "kernel/fs/fuse/virtiofs.ko.gz",
+		"CONFIG_VSOCKETS":        "kernel/net/vmw_vsock/vsock.ko.gz",
+		"CONFIG_VIRTIO_VSOCKETS": "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
+	}
+	if needsAMD64Emulation(image) {
+		configVars = append(configVars, "CONFIG_BINFMT_MISC")
+		moduleMap["CONFIG_BINFMT_MISC"] = "kernel/fs/binfmt_misc.ko.gz"
+	}
+	modules, err := b.kernel.PlanModuleLoad(configVars, moduleMap)
+	if err != nil {
+		return hvf.ContainerRunRequest{}, err
+	}
+	image, err = prepareImageForAMD64Emulation(ctx, image, b.kernel.ReadPackageFile)
 	if err != nil {
 		return hvf.ContainerRunRequest{}, err
 	}
@@ -95,6 +102,7 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 	if err != nil {
 		return hvf.ContainerRunRequest{}, err
 	}
+	runReq.Shares = append(runReq.Shares, convertShareMounts(req.Shares)...)
 	runReq.Persistent = true
 	return runReq, nil
 }
@@ -104,9 +112,25 @@ func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.RunRequ
 	if err != nil {
 		return hvf.ContainerRunRequest{}, err
 	}
+	runReq.Shares = append(runReq.Shares, convertShareMounts(req.Shares)...)
 	runReq.Command = append([]string(nil), req.Command...)
 	runReq.Env = append([]string(nil), req.Env...)
 	runReq.WorkDir = req.WorkDir
 	runReq.User = req.User
 	return runReq, nil
+}
+
+func convertShareMounts(shares []client.ShareMount) []hvf.DirectoryShare {
+	if len(shares) == 0 {
+		return nil
+	}
+	out := make([]hvf.DirectoryShare, 0, len(shares))
+	for _, share := range shares {
+		out = append(out, hvf.DirectoryShare{
+			Source:   share.Source,
+			Mount:    share.Mount,
+			Writable: share.Writable,
+		})
+	}
+	return out
 }

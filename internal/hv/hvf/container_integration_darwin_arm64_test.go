@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"j5.nz/cc/internal/guestinit"
+	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/virtio"
@@ -601,9 +602,11 @@ func TestRunStaticProbeFromVirtioFS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open() error = %v", err)
 	}
-	if err := buildStaticProbe(ctx, filepath.Join(image.RootFSDir, "bin", "ccx3-static-probe")); err != nil {
-		t.Fatalf("buildStaticProbe() error = %v", err)
+	staticProbe, err := buildStaticProbeBytes(ctx, root)
+	if err != nil {
+		t.Fatalf("buildStaticProbeBytes() error = %v", err)
 	}
+	image = overlayImageWithFile(t, image, "/bin/ccx3-static-probe", 0o755, staticProbe)
 
 	initBin, err := guestinit.Build(ctx, filepath.Join(root, "guestinit"))
 	if err != nil {
@@ -666,9 +669,11 @@ func TestRunMinimalELFFromVirtioFS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Open() error = %v", err)
 	}
-	if err := buildMinimalELF(ctx, filepath.Join(image.RootFSDir, "bin", "ccx3-min-elf")); err != nil {
-		t.Fatalf("buildMinimalELF() error = %v", err)
+	minElf, err := buildMinimalELFBytes(ctx, root)
+	if err != nil {
+		t.Fatalf("buildMinimalELFBytes() error = %v", err)
 	}
+	image = overlayImageWithFile(t, image, "/bin/ccx3-min-elf", 0o755, minElf)
 
 	initBin, err := guestinit.Build(ctx, filepath.Join(root, "guestinit"))
 	if err != nil {
@@ -776,6 +781,14 @@ func buildStaticProbe(ctx context.Context, outPath string) error {
 	return nil
 }
 
+func buildStaticProbeBytes(ctx context.Context, dir string) ([]byte, error) {
+	outPath := filepath.Join(dir, "ccx3-static-probe")
+	if err := buildStaticProbe(ctx, outPath); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(outPath)
+}
+
 func buildMinimalELF(ctx context.Context, outPath string) error {
 	dir := filepath.Dir(outPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -820,4 +833,15 @@ func buildMinimalELFBytes(ctx context.Context, dir string) ([]byte, error) {
 		return nil, err
 	}
 	return data, nil
+}
+
+func overlayImageWithFile(t *testing.T, image *oci.Image, guestPath string, mode os.FileMode, data []byte) *oci.Image {
+	t.Helper()
+	overlay := imagefs.NewOverlay(image.RootFS)
+	if err := overlay.AddFile(guestPath, mode, data); err != nil {
+		t.Fatalf("overlay.AddFile(%q) error = %v", guestPath, err)
+	}
+	cloned := *image
+	cloned.RootFS = overlay.Root()
+	return &cloned
 }

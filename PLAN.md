@@ -1,266 +1,258 @@
-# ccx3 cleanup plan
+# ccx3 image source plan
 
 ## Goal
 
-Prepare `ccx3` for feature work by cleaning up the parts of the codebase that currently fight the product shape in `VISION.md`.
+Add `.simg` and CVMFS image support to `ccx3`, but do it on the right filesystem foundation first.
 
-The main objective is not to add new capabilities yet. It is to make the next capabilities land on the right abstractions without drifting from the documented public API shape already established in git history.
+The immediate priority is no longer “ingest new source kinds as fast as possible.” The immediate priority is:
 
-That public API shape should remain:
+- stop exploding OCI images into large host `rootfs/` directory trees
+- move the runtime to a lazy filesystem model
+- use that same model for OCI, `.simg`, and CVMFS
 
-- `GET /vm/supported`
-- `GET /vm/status`
-- `POST /vm`
-- `POST /vm/shutdown`
-- `/vm/run` as the exec transport
-
-The cleanup should improve the internals and make `/vm/run` truly support repeated execs inside one live VM. It should not rename the public resources to `/instance` unless the documented API is intentionally changed later.
-
-The architectural objective is to make the next capabilities land on the right abstractions:
-
-- long-lived VM or instance lifecycle
-- separate exec lifecycle
-- portable workload-shaped API
-- explicit image identity
-- reliable build and test paths
+This keeps the VM and API shape stable while fixing the part of the implementation that would otherwise make all new source kinds awkward, wasteful, and especially painful on Windows.
 
 ## Guiding constraints
 
-This cleanup should preserve the core intent from `VISION.md`:
+This work should preserve the current public runtime model:
 
-- the VM is the isolation boundary
-- an image is the environment template, not the whole runtime model
-- multiple execs may run inside the same live VM over time
-- networking, shares, and snapshots are runtime features, not afterthoughts
-- the control plane should stay workload-centric rather than hypervisor-centric
-- the system should stay unprivileged and portable across host platforms
+- `pull <name> <source>`
+- `vm-start <image>`
+- `run <image> ...`
 
-## Current problems to fix first
+It should also preserve the product shape in `VISION.md`:
 
-### 1. VM and exec lifecycles are still conflated
+- image-backed long-lived VMs
+- multi-exec session semantics
+- workload-centric API
+- unprivileged implementation
 
-Today the public and internal runtime APIs are still shaped around:
+The image layer should become more general, but the external VM API should not need to change.
 
-- `StartVMRequest`
-- `RunVMResponse`
-- `POST /vm`
-- `POST /vm/run`
+## Why the plan changed
 
-That makes the system behave more like a VM-backed single-command runner than a long-lived instance with many execs.
+The old plan assumed `.simg` and CVMFS would prepare images into the same on-disk `rootfs` directory layout used by OCI today.
 
-This is the biggest mismatch with `VISION.md`, and it should be fixed before adding:
+That is no longer the right direction.
 
-- shares
-- networking
-- snapshots
-- richer exec semantics
+The problem is not just `.simg` and CVMFS. The current OCI implementation is already too eager:
 
-### 2. Runtime state is too shallow
+- it expands whole merged filesystems to disk
+- it uses too much disk space
+- it creates a lot of filesystem churn
+- it makes Linux metadata and permission behavior harder to preserve cleanly
+- it is an especially poor fit for Windows
 
-The current VM manager tracks only a small amount of state and loses useful lifecycle information once a VM exits or is shut down.
+The better design is captured in [FS_PLAN.md](/Users/joshua/dev/projects/ccx3/FS_PLAN.md:1):
 
-Before adding more lifecycle-heavy features, the runtime needs durable state for:
+- metadata in memory
+- file contents lazy
+- content read through offsets or chunk mappings
 
-- creating
-- booting
-- ready
-- exec running
-- stopping
-- stopped
-- failed
+That is now the prerequisite for the rest of this roadmap.
 
-It also needs explicit shutdown behavior and better error retention.
+## Reference interpretation
 
-### 3. Image identity is not explicit enough
+Based on the reference code:
 
-The image layer still defaults silently to mutable tags like `latest`, and the runtime state does not expose a resolved digest.
+- `../gosimg` shows that `.simg` is a SIF container with a squashfs payload
+- `../tinyrange` shows a useful lazy CVMFS model based on metadata plus chunk-backed reads
 
-That is tolerable for a prototype pull path, but it is the wrong basis for:
+Based on the Neurodesk CVMFS documentation:
 
-- snapshots
-- warm boot caches
-- reproducible exec environments
-- compatibility checks
+- the user-facing repo is `neurodesk.ardc.edu.au`
+- containers are published under `/cvmfs/neurodesk.ardc.edu.au/containers/...`
+- the user-facing launch path ends in `.simg`
+- the Neurodesk architecture docs indicate their CVMFS side is populated from unpacked Singularity containers
 
-### 4. Build and test paths are too host-toolchain-sensitive
+For `ccx3`, that means:
 
-Some runtime paths and tests still rely on building guest-side components on the host at runtime.
+- real `.simg` files should be supported directly
+- CVMFS support should target Neurodesk’s published repository layout
+- both should plug into the same lazy filesystem abstraction as OCI
 
-That increases flakiness and makes it harder to trust the system as the codebase grows.
+## Desired end state
 
-## Cleanup phases
+After this plan:
 
-## Phase 1: split instance lifecycle from exec lifecycle behind the existing `/vm` API
+- OCI images are no longer expanded into a host directory tree
+- `.simg` images are read directly from SIF/squashfs structures
+- CVMFS images are read from cached metadata plus lazy chunk fetches
+- the VM runtime consumes a prepared filesystem abstraction, not just `RootFSDir`
+- `pull`, `image-get`, `vm-start`, and `run` still look the same from the outside
 
-Introduce a clear runtime model centered on:
+## Phase 1: make image sources explicit
 
-- `Image`
-- `Instance`
-- `Exec`
-
-Concrete work:
-
-- keep the public `/vm` and `/vm/run` API shape documented in history
-- separate instance-create and exec semantics internally even if the public request types remain VM-named for compatibility
-- redesign `internal/vm` around a live instance handle instead of `Start` plus `Run`
-- add an internal API roughly shaped like:
-  - `CreateInstance(ctx, req) (*Instance, error)`
-  - `(*Instance) Start(ctx) error`
-  - `(*Instance) Exec(ctx, req) (*ExecSession, error)`
-  - `(*Instance) Shutdown(ctx) error`
-  - `(*Instance) Status() InstanceState`
-- stop treating “boot until first command begins” as equivalent to “VM is ready”
-- implement `/vm/run` as the repeated exec path against the running VM rather than a one-shot replacement for VM lifecycle
-
-Desired outcome:
-
-- the runtime can describe a booted VM without tying that state to a specific command
-- exec becomes an operation against a running instance, not a side effect of creation
-
-## Phase 2: align the HTTP behavior to the documented `/vm` surface
-
-Once the internal model is separated, make the existing public API behave according to the documented design.
+Refactor the image store so it understands source kinds even before all preparers exist.
 
 Concrete work:
 
-- keep `POST /vm` as the public VM start or create endpoint
-- keep `GET /vm/status` and `POST /vm/shutdown` as the public lifecycle endpoints
-- make `/vm/run` the real exec transport for repeated commands inside the running VM
-- wire the existing `ExecRequest`, `ExecInput`, and `ExecEvent` concepts into `/vm/run`
-- avoid introducing parallel public routes that duplicate the documented API
+- add parsed source kinds:
+  - `oci`
+  - `simg`
+  - `cvmfs`
+- persist source kind in image metadata
+- expose source kind in `ImageState`
+- route pull requests through source-aware dispatch
+- keep OCI as the only fully implemented preparer initially
 
 Desired outcome:
 
-- the external API matches both the documented history and the thesis in `VISION.md`
-- future shares, networking, and snapshots can attach to instances cleanly
+- the store stops pretending every source is OCI
+- the next phases can plug in cleanly
 
-## Phase 3: strengthen runtime state and lifecycle correctness
+## Phase 2: introduce the shared filesystem abstraction
 
-Refactor the manager and backend so state transitions are explicit and observable.
+Implement the common model described in `FS_PLAN.md`.
 
 Concrete work:
 
-- define a richer instance state model
-- retain terminal failure information after exit
-- make shutdown wait for a terminal state, not just fire cancellation
-- stop dropping lifecycle details when the running pointer is cleared
-- surface state transitions through typed status objects instead of ad hoc strings only
-- audit context handling so shutdown and boot honor caller timeouts
-
-Suggested status model:
-
-- `creating`
-- `booting`
-- `ready`
-- `exec_running`
-- `stopping`
-- `stopped`
-- `failed`
+- add an in-memory filesystem tree model:
+  - path
+  - file type
+  - mode
+  - uid
+  - gid
+  - size
+  - symlink target
+- add a content-provider abstraction for regular files:
+  - `ReadAt`
+  - `Size`
+- define a prepared-image contract that exposes:
+  - runtime config
+  - architecture
+  - filesystem tree
+  - content providers
+- stop treating `RootFSDir` as the universal image contract
 
 Desired outcome:
 
-- lifecycle-heavy features have a trustworthy base
-- status and failure reporting become stable enough for API consumers
+- the runtime has one filesystem-shaped interface that OCI, `.simg`, and CVMFS can all implement
 
-## Phase 4: make image identity explicit and reproducible
+## Phase 3: refactor OCI onto lazy indexed tar layers
 
-Refactor the OCI layer so runtime state is based on resolved identity, not just the caller’s original reference.
+This is now the first major implementation phase.
 
 Concrete work:
 
-- record the resolved manifest digest in image metadata
-- expose digest and platform in `ImageState`
-- stop silently depending on mutable `latest` semantics in runtime-facing paths
-- keep the original source ref for UX, but separate it from the resolved identity
-- key shared cache and future snapshot compatibility off resolved content identity where possible
+- keep downloaded layer blobs
+- decompress `.tar.gz` layers once into cached `.tar` files
+- walk each tar file once and build an in-memory layer index:
+  - path
+  - type
+  - mode
+  - uid
+  - gid
+  - size
+  - link target
+  - tar data offset
+  - whiteout and opaque directory semantics
+- merge layer indexes into one in-memory filesystem tree
+- serve regular file contents by seeking directly into cached tar files
+
+Also update:
+
+- host-side command resolution
+- virtio-fs integration
+- VM startup paths
+
+So they consume the new filesystem abstraction rather than a host directory tree.
 
 Desired outcome:
 
-- the runtime can reason about compatibility and reproducibility
-- snapshot and restore design work has a safe foundation
+- OCI no longer writes a merged rootfs to disk
+- metadata is in memory
+- file contents are read lazily from tar offsets
 
-## Phase 5: remove runtime host-build work from the hot path
+## Phase 4: add `.simg` support on the shared filesystem model
 
-The runtime should not need to rebuild guest helpers every time that functionality is used.
+Once OCI is on the new filesystem path, add `.simg`.
 
 Concrete work:
 
-- decide how guest init should be produced:
-  - checked-in artifact
-  - generated once and content-address cached
-  - explicit build step in development workflows
-- keep host toolchain probing out of normal runtime execution paths
-- make integration tests depend on explicit prerequisites rather than implicit local compiler quirks
-- separate “always-on correctness tests” from “opt-in host integration tests”
+- parse SIF headers and descriptors
+- locate the squashfs payload
+- walk squashfs metadata into the common in-memory filesystem tree
+- implement a `.simg` content provider that:
+  - finds file blocks from squashfs metadata
+  - reads only the required blocks
+  - decompresses only those blocks
 
 Desired outcome:
 
-- more predictable runtime behavior
-- less CI and local-env sensitivity
-- clearer guarantees about what test coverage is always enforced
+- `.simg` support does not require extraction to a host directory
+- `.simg` behaves like OCI at the VM boundary
 
-## Phase 6: clean package boundaries before adding features
+## Phase 5: add Neurodesk-compatible CVMFS support
 
-After the lifecycle and identity refactors, tighten package responsibilities.
-
-Target package roles:
-
-- `client`
-  - protocol types and client transport only
-- `internal/oci`
-  - image ingestion, metadata, resolved identity, rootfs preparation
-- `internal/kernel/alpine`
-  - managed kernel acquisition and metadata
-- `internal/vm`
-  - instance and exec lifecycle orchestration
-- `internal/hv`
-  - hypervisor-facing machinery only
-- `internal/guestinit`
-  - guest supervisor artifact management, not policy
+Build CVMFS on the same filesystem model.
 
 Concrete work:
 
-- remove request or response types that mix instance creation concerns with exec concerns
-- move guest command resolution and policy decisions to the lifecycle layer that owns them
-- keep `internal/hv/hvf` focused on guest machine execution rather than control-plane semantics
+- support a CVMFS source syntax such as:
+  - `http+cvmfs://host/cvmfs/<repo>?path=<root>`
+- target Neurodesk’s published layout and mirrors first
+- fetch filesystem metadata for the requested root
+- build the common in-memory filesystem tree
+- implement a CVMFS content provider that:
+  - resolves chunk mappings
+  - fetches missing chunks lazily
+  - serves requested byte ranges from cache or remote
 
 Desired outcome:
 
-- future features land in predictable places
-- the API layer stops leaking backend assumptions into product semantics
+- CVMFS remains lazy instead of materializing a whole tree
+- Neurodesk containers can be used without requiring host-side CVMFS setup in the first remote-import path
 
-## Deferred until after cleanup
+## Phase 6: cache identity and restore semantics
 
-Do not start these until Phases 1 through 4 are in place:
+Once multiple lazy source kinds exist, tighten cache rules.
 
-- snapshots
-- persistent share attachment APIs
-- runtime networking APIs
-- multiple concurrent exec sessions
-- richer non-root user support
-- multi-platform backend expansion beyond the current shape
+Concrete work:
 
-These features depend on the lifecycle and identity work above. Shipping them first would harden the wrong abstractions.
+- define stable shared-cache keys per source kind
+- preserve enough metadata to debug source resolution
+- separate user-facing source strings from stronger cache identity where available
 
-## Implementation order
+Desired outcome:
 
-Recommended order:
+- cache reuse is predictable
+- future snapshot work has a safer foundation
 
-1. split instance and exec models in `internal/vm` and related runtime code while preserving the public `/vm` API
-2. make `cmd/ccvm` serve the documented `/vm` lifecycle and `/vm/run` exec behavior
-3. preserve and expose richer instance state
-4. record and expose resolved image identity
-5. harden guest-init and host-toolchain handling
-6. only then begin feature work for shares, networking, snapshots, and richer exec support
+## Phase 7: testing and integration coverage
 
-## Definition of done for cleanup
+Add tests at both the source-ingestion and VM-runtime layers.
 
-The cleanup is complete when:
+Concrete work:
 
-- a booted instance exists independently from a command run inside it
-- exec is a first-class operation against a running instance
-- the public `/vm` API behaves according to the documented multi-exec design
-- instance status survives failures and shutdowns with meaningful detail
-- image metadata includes resolved identity suitable for compatibility checks
-- normal runtime execution does not rely on incidental host build behavior
-- always-on tests cover the stable core without depending on optional host toolchains
+- source parser tests
+- OCI layer index and merge tests
+- `.simg` parser and lazy-read tests
+- CVMFS metadata and chunk-read tests
+- VM integration tests for OCI, `.simg`, and CVMFS-backed images
+
+Desired outcome:
+
+- all image source kinds are validated on the same runtime contract
+
+## Explicit non-goals for this pass
+
+Do not take on these at the same time:
+
+- eager extraction to a host rootfs directory
+- lazy runtime guest mounts of native host CVMFS
+- a new public VM API shape
+- snapshot semantics for the new source kinds
+- share or network feature work
+
+Those can build on this work later, but they should not distract from the filesystem foundation.
+
+## Recommended implementation order
+
+1. source kind parsing and metadata
+2. shared filesystem abstraction
+3. lazy indexed OCI
+4. `.simg` backend
+5. CVMFS backend
+6. cache identity tightening
+7. integration coverage

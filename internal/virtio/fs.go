@@ -16,6 +16,7 @@ import (
 
 	"j5.nz/cc/internal/fdt"
 	"j5.nz/cc/internal/fsmeta"
+	"j5.nz/cc/internal/imagefs"
 )
 
 const (
@@ -37,17 +38,23 @@ const (
 	fuseInitOutSize    = 40
 	fuseStatfsOutSize  = 80
 	fuseDirentBaseSize = 24
+	fuseWriteOutSize   = 8
 )
 
 const (
 	fuseLookup     = 1
 	fuseForget     = 2
 	fuseGetAttr    = 3
+	fuseSetAttr    = 4
 	fuseReadlink   = 5
+	fuseMknod      = 8
 	fuseMkdir      = 9
+	fuseUnlink     = 10
 	fuseRmDir      = 11
+	fuseRename     = 12
 	fuseOpen       = 14
 	fuseRead       = 15
+	fuseWrite      = 16
 	fuseStatfs     = 17
 	fuseRelease    = 18
 	fuseGetXattr   = 22
@@ -58,10 +65,31 @@ const (
 	fuseReadDir    = 28
 	fuseReleaseDir = 29
 	fuseAccess     = 34
+	fuseCreate     = 35
 	fuseDestroy    = 38
 	fusePoll       = 40
 	fuseLseek      = 46
 	fuseSyncFS     = 50
+)
+
+const (
+	fattrMode  = 1 << 0
+	fattrUID   = 1 << 1
+	fattrGID   = 1 << 2
+	fattrSize  = 1 << 3
+	fattrATime = 1 << 4
+	fattrMTime = 1 << 5
+	fattrFH    = 1 << 6
+)
+
+const (
+	linuxORDONLY = 0
+	linuxOWRONLY = 1
+	linuxORDWR   = 2
+	linuxOCREAT  = 0x40
+	linuxOEXCL   = 0x80
+	linuxOTRUNC  = 0x200
+	linuxOAPPEND = 0x400
 )
 
 const (
@@ -118,6 +146,26 @@ type fsMkdirBackend interface {
 
 type fsRmDirBackend interface {
 	RmDir(parent uint64, name string) int32
+}
+
+type fsCreateBackend interface {
+	Create(parent uint64, name string, flags uint32, mode uint32) (nodeID uint64, fh uint64, attr FuseAttr, errno int32)
+}
+
+type fsWriteBackend interface {
+	Write(nodeID uint64, fh uint64, off uint64, data []byte, flags uint32) (uint32, int32)
+}
+
+type fsSetAttrBackend interface {
+	SetAttr(nodeID uint64, valid uint32, fh uint64, size uint64, mode uint32, uid uint32, gid uint32, atime time.Time, mtime time.Time) (FuseAttr, int32)
+}
+
+type fsUnlinkBackend interface {
+	Unlink(parent uint64, name string) int32
+}
+
+type fsRenameBackend interface {
+	Rename(parent uint64, name string, newParent uint64, newName string, flags uint32) int32
 }
 
 type FuseAttr struct {
@@ -498,6 +546,29 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 		binary.LittleEndian.PutUint64(extra[0:8], 1)
 		encodeFuseAttr(extra[16:], attr)
 		return reply(0, extra), nil
+	case fuseSetAttr:
+		if len(req) < fuseInHeaderSize+72 {
+			return nil, fmt.Errorf("virtio-fs SETATTR too short")
+		}
+		if be, ok := f.backend.(fsSetAttrBackend); ok {
+			valid := binary.LittleEndian.Uint32(req[40:44])
+			fh := binary.LittleEndian.Uint64(req[48:56])
+			size := binary.LittleEndian.Uint64(req[56:64])
+			atime := time.Unix(int64(binary.LittleEndian.Uint64(req[72:80])), int64(binary.LittleEndian.Uint32(req[96:100])))
+			mtime := time.Unix(int64(binary.LittleEndian.Uint64(req[80:88])), int64(binary.LittleEndian.Uint32(req[100:104])))
+			mode := binary.LittleEndian.Uint32(req[108:112])
+			uid := binary.LittleEndian.Uint32(req[112:116])
+			gid := binary.LittleEndian.Uint32(req[116:120])
+			attr, errno := be.SetAttr(nodeID, valid, fh, size, mode, uid, gid, atime, mtime)
+			if errno != 0 {
+				return reply(errno, nil), nil
+			}
+			extra := make([]byte, fuseAttrOutSize)
+			binary.LittleEndian.PutUint64(extra[0:8], 1)
+			encodeFuseAttr(extra[16:], attr)
+			return reply(0, extra), nil
+		}
+		return reply(-linuxENOSYS, nil), nil
 	case fuseLookup:
 		name := readCStringName(req[fuseInHeaderSize:])
 		f.logPathf("lookup-parent", nodeID, fmt.Sprintf(" name=%q", name))
@@ -532,6 +603,12 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 			return reply(0, extra), nil
 		}
 		return nil, fmt.Errorf("virtio-fs missing mkdir backend for parent=%d name=%q", nodeID, name)
+	case fuseUnlink:
+		name := readCStringName(req[fuseInHeaderSize:])
+		if be, ok := f.backend.(fsUnlinkBackend); ok {
+			return reply(be.Unlink(nodeID, path.Clean(name)), nil), nil
+		}
+		return reply(-linuxENOSYS, nil), nil
 	case fuseOpen:
 		if len(req) < fuseInHeaderSize+8 {
 			return nil, fmt.Errorf("virtio-fs OPEN too short")
@@ -558,6 +635,28 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 			return reply(errno, nil), nil
 		}
 		return reply(0, data), nil
+	case fuseWrite:
+		if len(req) < fuseInHeaderSize+40 {
+			return nil, fmt.Errorf("virtio-fs WRITE too short")
+		}
+		if be, ok := f.backend.(fsWriteBackend); ok {
+			fh := binary.LittleEndian.Uint64(req[40:48])
+			off := binary.LittleEndian.Uint64(req[48:56])
+			size := binary.LittleEndian.Uint32(req[56:60])
+			writeFlags := binary.LittleEndian.Uint32(req[60:64])
+			dataStart := fuseInHeaderSize + 40
+			if len(req) < dataStart+int(size) {
+				return nil, fmt.Errorf("virtio-fs WRITE short payload")
+			}
+			count, errno := be.Write(nodeID, fh, off, req[dataStart:dataStart+int(size)], writeFlags)
+			if errno != 0 {
+				return reply(errno, nil), nil
+			}
+			extra := make([]byte, fuseWriteOutSize)
+			binary.LittleEndian.PutUint32(extra[0:4], count)
+			return reply(0, extra), nil
+		}
+		return reply(-linuxENOSYS, nil), nil
 	case fuseRelease:
 		if len(req) < fuseInHeaderSize+24 {
 			return nil, fmt.Errorf("virtio-fs RELEASE too short")
@@ -606,6 +705,22 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 			return reply(errno, nil), nil
 		}
 		return nil, fmt.Errorf("virtio-fs missing rmdir backend for parent=%d name=%q", nodeID, name)
+	case fuseRename:
+		if len(req) < fuseInHeaderSize+8 {
+			return nil, fmt.Errorf("virtio-fs RENAME too short")
+		}
+		if be, ok := f.backend.(fsRenameBackend); ok {
+			newParent := binary.LittleEndian.Uint64(req[40:48])
+			names := req[fuseInHeaderSize+8:]
+			split := bytesIndexByte(names, 0)
+			if split < 0 {
+				return nil, fmt.Errorf("virtio-fs RENAME missing old name")
+			}
+			oldName := string(names[:split])
+			newName := readCStringName(names[split+1:])
+			return reply(be.Rename(nodeID, path.Clean(oldName), newParent, path.Clean(newName), 0), nil), nil
+		}
+		return reply(-linuxENOSYS, nil), nil
 	case fuseReadlink:
 		f.logPathf("readlink", nodeID, "")
 		target, errno := f.backend.Readlink(nodeID)
@@ -723,6 +838,27 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 		return reply(0, nil), nil
 	case fuseDestroy:
 		return reply(0, nil), nil
+	case fuseCreate:
+		if len(req) < fuseInHeaderSize+16 {
+			return nil, fmt.Errorf("virtio-fs CREATE too short")
+		}
+		if be, ok := f.backend.(fsCreateBackend); ok {
+			flags := binary.LittleEndian.Uint32(req[40:44])
+			mode := binary.LittleEndian.Uint32(req[44:48])
+			name := readCStringName(req[fuseInHeaderSize+16:])
+			childID, fh, attr, errno := be.Create(nodeID, path.Clean(name), flags, mode)
+			if errno != 0 {
+				return reply(errno, nil), nil
+			}
+			extra := make([]byte, fuseEntryOutSize+fuseOpenOutSize)
+			binary.LittleEndian.PutUint64(extra[0:8], childID)
+			binary.LittleEndian.PutUint64(extra[16:24], 1)
+			binary.LittleEndian.PutUint64(extra[24:32], 1)
+			encodeFuseAttr(extra[40:], attr)
+			binary.LittleEndian.PutUint64(extra[fuseEntryOutSize:fuseEntryOutSize+8], fh)
+			return reply(0, extra), nil
+		}
+		return reply(-linuxENOSYS, nil), nil
 	default:
 		if f.Strict {
 			return nil, fmt.Errorf("virtio-fs unsupported opcode %s(%d) node=%d", fuseOpcodeName(opcode), opcode, nodeID)
@@ -739,16 +875,26 @@ func fuseOpcodeName(opcode uint32) string {
 		return "FORGET"
 	case fuseGetAttr:
 		return "GETATTR"
+	case fuseSetAttr:
+		return "SETATTR"
 	case fuseReadlink:
 		return "READLINK"
+	case fuseMknod:
+		return "MKNOD"
 	case fuseMkdir:
 		return "MKDIR"
+	case fuseUnlink:
+		return "UNLINK"
 	case fuseRmDir:
 		return "RMDIR"
+	case fuseRename:
+		return "RENAME"
 	case fuseOpen:
 		return "OPEN"
 	case fuseRead:
 		return "READ"
+	case fuseWrite:
+		return "WRITE"
 	case fuseStatfs:
 		return "STATFS"
 	case fuseRelease:
@@ -769,6 +915,8 @@ func fuseOpcodeName(opcode uint32) string {
 		return "RELEASEDIR"
 	case fuseAccess:
 		return "ACCESS"
+	case fuseCreate:
+		return "CREATE"
 	case fuseDestroy:
 		return "DESTROY"
 	case fusePoll:
@@ -932,8 +1080,13 @@ type passthroughFS struct {
 	nextHandle uint64
 	nodes      map[uint64]string
 	pathToNode map[string]uint64
-	handles    map[uint64]uint64
+	handles    map[uint64]*passthroughHandle
 	dirHandles map[uint64][]dirEntry
+}
+
+type passthroughHandle struct {
+	nodeID uint64
+	file   *os.File
 }
 
 type imageFS struct {
@@ -960,82 +1113,15 @@ type imageNode struct {
 	symlinkTarget string
 	entries       map[string]uint64
 	modTime       time.Time
-	abstractFile  imageAbstractFile
-	abstractDir   imageAbstractDir
-	abstractLink  imageAbstractSymlink
+	abstractFile  imagefs.File
+	abstractDir   imagefs.Directory
+	abstractLink  imagefs.Symlink
 }
 
 type dirEntry struct {
 	name string
 	typ  uint32
 	ino  uint64
-}
-
-type imageAbstractFile interface {
-	Stat() (size uint64, mode fs.FileMode)
-	ModTime() time.Time
-	ReadAt(off uint64, size uint32) ([]byte, error)
-	Owner() (uid, gid uint32)
-	RDev() uint32
-}
-
-type imageAbstractDir interface {
-	Stat() fs.FileMode
-	ModTime() time.Time
-	ReadDir() ([]imageDirEnt, error)
-	Lookup(name string) (imageAbstractEntry, error)
-	Owner() (uid, gid uint32)
-	RDev() uint32
-}
-
-type imageAbstractSymlink interface {
-	Stat() fs.FileMode
-	ModTime() time.Time
-	Target() string
-	Owner() (uid, gid uint32)
-	RDev() uint32
-}
-
-type imageAbstractEntry struct {
-	File    imageAbstractFile
-	Dir     imageAbstractDir
-	Symlink imageAbstractSymlink
-}
-
-type imageDirEnt struct {
-	Name string
-	Mode fs.FileMode
-}
-
-type imageHostFile struct {
-	hostPath string
-	mode     fs.FileMode
-	uid      uint32
-	gid      uint32
-	rdev     uint32
-	size     uint64
-	modTime  time.Time
-}
-
-type imageHostDir struct {
-	rootPath string
-	hostPath string
-	mode     fs.FileMode
-	uid      uint32
-	gid      uint32
-	rdev     uint32
-	modTime  time.Time
-	meta     map[string]fsmeta.Entry
-}
-
-type imageHostSymlink struct {
-	hostPath string
-	mode     fs.FileMode
-	uid      uint32
-	gid      uint32
-	rdev     uint32
-	target   string
-	modTime  time.Time
 }
 
 func NewPassthroughFS(root string, meta map[string]fsmeta.Entry) FSBackend {
@@ -1046,55 +1132,42 @@ func NewPassthroughFS(root string, meta map[string]fsmeta.Entry) FSBackend {
 		nextHandle: 1,
 		nodes:      map[uint64]string{1: "/"},
 		pathToNode: map[string]uint64{"/": 1},
-		handles:    map[uint64]uint64{},
+		handles:    map[uint64]*passthroughHandle{},
 		dirHandles: map[uint64][]dirEntry{},
 	}
 	return fs
 }
 
-func NewImageFS(root string, meta map[string]fsmeta.Entry) FSBackend {
+func NewImageFS(root imagefs.Directory, statfsPath string) FSBackend {
 	imgFS := &imageFS{
-		root:       root,
+		root:       statfsPath,
 		nextNodeID: 2,
 		nextHandle: 1,
 		nodes:      map[uint64]*imageNode{},
 		handles:    map[uint64]uint64{},
 		dirHandles: map[uint64][]dirEntry{},
 	}
-	rootMode := fs.ModeDir | 0o755
-	rootUID := uint32(0)
-	rootGID := uint32(0)
-	rootRDev := uint32(0)
-	if entry, ok := meta["/"]; ok {
-		rootMode = linuxModeToGo(fsmeta.NormalizeLinuxMode(entry.Mode, fs.ModeDir|0o755))
-		rootUID = entry.UID
-		rootGID = entry.GID
-		rootRDev = entry.RDev
+	if root == nil {
+		root = imagefs.NewHostFS("", nil)
 	}
-	rootModTime := time.Unix(0, 0)
-	if info, err := os.Lstat(root); err == nil {
-		rootModTime = info.ModTime()
+	rootMode := fs.ModeDir | root.Stat()
+	rootUID, rootGID := root.Owner()
+	rootRDev := root.RDev()
+	rootModTime := root.ModTime()
+	if rootModTime.IsZero() {
+		rootModTime = time.Unix(0, 0)
 	}
 	imgFS.nodes[1] = &imageNode{
-		id:      1,
-		parent:  1,
-		name:    "/",
-		mode:    rootMode,
-		uid:     rootUID,
-		gid:     rootGID,
-		rdev:    rootRDev,
-		entries: map[string]uint64{},
-		modTime: rootModTime,
-		abstractDir: &imageHostDir{
-			rootPath: root,
-			hostPath: root,
-			mode:     rootMode,
-			uid:      rootUID,
-			gid:      rootGID,
-			rdev:     rootRDev,
-			modTime:  rootModTime,
-			meta:     meta,
-		},
+		id:          1,
+		parent:      1,
+		name:        "/",
+		mode:        rootMode,
+		uid:         rootUID,
+		gid:         rootGID,
+		rdev:        rootRDev,
+		entries:     map[string]uint64{},
+		modTime:     rootModTime,
+		abstractDir: root,
 	}
 	return imgFS
 }
@@ -1176,7 +1249,37 @@ func (p *passthroughFS) Mkdir(parent uint64, name string, mode uint32) (uint64, 
 	return nodeID, p.fileAttr(nodeID, info), 0
 }
 
-func (p *passthroughFS) Open(nodeID uint64, _ uint32) (uint64, int32) {
+func (p *passthroughFS) Create(parent uint64, name string, flags uint32, mode uint32) (uint64, uint64, FuseAttr, int32) {
+	p.logNode("create-parent", parent)
+	hostParent, errno := p.hostPath(parent)
+	if errno != 0 {
+		return 0, 0, FuseAttr{}, errno
+	}
+	clean := path.Clean("/" + name)
+	if clean == "/" {
+		return 0, 0, FuseAttr{}, -linuxEINVAL
+	}
+	host := filepath.Join(hostParent, filepath.FromSlash(strings.TrimPrefix(clean, "/")))
+	file, err := os.OpenFile(host, translateLinuxOpenFlags(flags)|os.O_CREATE, fs.FileMode(mode&linuxPermMask))
+	if err != nil {
+		return 0, 0, FuseAttr{}, errnoFromError(err)
+	}
+	info, err := os.Lstat(host)
+	if err != nil {
+		_ = file.Close()
+		return 0, 0, FuseAttr{}, errnoFromError(err)
+	}
+	guestPath := p.guestPathForHost(host)
+	nodeID := p.ensureNode(guestPath)
+	p.mu.Lock()
+	handle := p.nextHandle
+	p.nextHandle++
+	p.handles[handle] = &passthroughHandle{nodeID: nodeID, file: file}
+	p.mu.Unlock()
+	return nodeID, handle, p.fileAttr(nodeID, info), 0
+}
+
+func (p *passthroughFS) Open(nodeID uint64, flags uint32) (uint64, int32) {
 	p.logNode("open", nodeID)
 	host, errno := p.hostPath(nodeID)
 	if errno != 0 {
@@ -1189,43 +1292,51 @@ func (p *passthroughFS) Open(nodeID uint64, _ uint32) (uint64, int32) {
 	if info.IsDir() {
 		return 0, -linuxEISDIR
 	}
+	file, err := os.OpenFile(host, translateLinuxOpenFlags(flags), 0)
+	if err != nil {
+		return 0, errnoFromError(err)
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	handle := p.nextHandle
 	p.nextHandle++
-	p.handles[handle] = nodeID
+	p.handles[handle] = &passthroughHandle{nodeID: nodeID, file: file}
 	return handle, 0
 }
 
 func (p *passthroughFS) Release(_ uint64, fh uint64) {
 	p.mu.Lock()
+	handle := p.handles[fh]
 	delete(p.handles, fh)
 	p.mu.Unlock()
+	if handle != nil && handle.file != nil {
+		_ = handle.file.Close()
+	}
 }
 
-func (p *passthroughFS) Flush(_ uint64, _ uint64, _ uint64) int32 {
+func (p *passthroughFS) Flush(_ uint64, fh uint64, _ uint64) int32 {
+	p.mu.Lock()
+	handle := p.handles[fh]
+	p.mu.Unlock()
+	if handle == nil || handle.file == nil {
+		return -linuxEBADF
+	}
+	if err := handle.file.Sync(); err != nil {
+		return errnoFromError(err)
+	}
 	return 0
 }
 
 func (p *passthroughFS) Read(nodeID uint64, fh uint64, off uint64, size uint32) ([]byte, int32) {
 	p.logf("read node=%d path=%q fh=%d off=%d size=%d", nodeID, p.DebugPath(nodeID), fh, off, size)
 	p.mu.Lock()
-	nid, ok := p.handles[fh]
+	handle, ok := p.handles[fh]
 	p.mu.Unlock()
-	if !ok || nid != nodeID {
+	if !ok || handle == nil || handle.nodeID != nodeID || handle.file == nil {
 		return nil, -linuxEBADF
 	}
-	host, errno := p.hostPath(nodeID)
-	if errno != 0 {
-		return nil, errno
-	}
-	f, err := os.Open(host)
-	if err != nil {
-		return nil, errnoFromError(err)
-	}
-	defer f.Close()
 	buf := make([]byte, size)
-	n, err := f.ReadAt(buf, int64(off))
+	n, err := handle.file.ReadAt(buf, int64(off))
 	if err != nil && err != io.EOF {
 		return nil, errnoFromError(err)
 	}
@@ -1234,9 +1345,9 @@ func (p *passthroughFS) Read(nodeID uint64, fh uint64, off uint64, size uint32) 
 
 func (p *passthroughFS) Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32) (uint64, int32) {
 	p.mu.Lock()
-	nid, ok := p.handles[fh]
+	handle, ok := p.handles[fh]
 	p.mu.Unlock()
-	if !ok || nid != nodeID {
+	if !ok || handle == nil || handle.nodeID != nodeID {
 		return 0, -linuxEBADF
 	}
 	host, errno := p.hostPath(nodeID)
@@ -1296,6 +1407,20 @@ func (p *passthroughFS) OpenDir(nodeID uint64, _ uint32) (uint64, int32) {
 	p.nextHandle++
 	p.dirHandles[handle] = dirEntries
 	return handle, 0
+}
+
+func (p *passthroughFS) Write(nodeID uint64, fh uint64, off uint64, data []byte, _ uint32) (uint32, int32) {
+	p.mu.Lock()
+	handle := p.handles[fh]
+	p.mu.Unlock()
+	if handle == nil || handle.nodeID != nodeID || handle.file == nil {
+		return 0, -linuxEBADF
+	}
+	n, err := handle.file.WriteAt(data, int64(off))
+	if err != nil {
+		return uint32(n), errnoFromError(err)
+	}
+	return uint32(n), 0
 }
 
 func (p *passthroughFS) ReadDir(_ uint64, fh uint64, off uint64, maxBytes uint32) ([]byte, int32) {
@@ -1370,6 +1495,94 @@ func (p *passthroughFS) RmDir(parent uint64, name string) int32 {
 	}
 	p.mu.Unlock()
 	return 0
+}
+
+func (p *passthroughFS) Unlink(parent uint64, name string) int32 {
+	hostParent, errno := p.hostPath(parent)
+	if errno != 0 {
+		return errno
+	}
+	clean := path.Clean("/" + name)
+	if clean == "/" {
+		return -linuxEINVAL
+	}
+	host := filepath.Join(hostParent, filepath.FromSlash(strings.TrimPrefix(clean, "/")))
+	if err := os.Remove(host); err != nil {
+		return errnoFromError(err)
+	}
+	p.removeNodeForGuestPath(p.guestPathForHost(host))
+	return 0
+}
+
+func (p *passthroughFS) Rename(parent uint64, name string, newParent uint64, newName string, _ uint32) int32 {
+	oldParent, errno := p.hostPath(parent)
+	if errno != 0 {
+		return errno
+	}
+	newParentPath, errno := p.hostPath(newParent)
+	if errno != 0 {
+		return errno
+	}
+	oldHost := filepath.Join(oldParent, filepath.FromSlash(strings.TrimPrefix(path.Clean("/"+name), "/")))
+	newHost := filepath.Join(newParentPath, filepath.FromSlash(strings.TrimPrefix(path.Clean("/"+newName), "/")))
+	if err := os.Rename(oldHost, newHost); err != nil {
+		return errnoFromError(err)
+	}
+	p.renameNodeGuestPath(p.guestPathForHost(oldHost), p.guestPathForHost(newHost))
+	return 0
+}
+
+func (p *passthroughFS) SetAttr(nodeID uint64, valid uint32, fh uint64, size uint64, mode uint32, uid uint32, gid uint32, atime time.Time, mtime time.Time) (FuseAttr, int32) {
+	host, errno := p.hostPath(nodeID)
+	if errno != 0 {
+		return FuseAttr{}, errno
+	}
+	var file *os.File
+	if valid&fattrFH != 0 {
+		p.mu.Lock()
+		handle := p.handles[fh]
+		p.mu.Unlock()
+		if handle == nil || handle.nodeID != nodeID {
+			return FuseAttr{}, -linuxEBADF
+		}
+		file = handle.file
+	}
+	if valid&fattrSize != 0 {
+		if file != nil {
+			if err := file.Truncate(int64(size)); err != nil {
+				return FuseAttr{}, errnoFromError(err)
+			}
+		} else if err := os.Truncate(host, int64(size)); err != nil {
+			return FuseAttr{}, errnoFromError(err)
+		}
+	}
+	if valid&fattrMode != 0 {
+		if err := os.Chmod(host, fs.FileMode(mode&linuxPermMask)); err != nil {
+			return FuseAttr{}, errnoFromError(err)
+		}
+	}
+	if valid&(fattrUID|fattrGID) != 0 {
+		if err := os.Chown(host, int(uid), int(gid)); err != nil {
+			return FuseAttr{}, errnoFromError(err)
+		}
+	}
+	if valid&(fattrATime|fattrMTime) != 0 {
+		current := time.Now()
+		if valid&fattrATime == 0 {
+			atime = current
+		}
+		if valid&fattrMTime == 0 {
+			mtime = current
+		}
+		if err := os.Chtimes(host, atime, mtime); err != nil {
+			return FuseAttr{}, errnoFromError(err)
+		}
+	}
+	info, err := os.Lstat(host)
+	if err != nil {
+		return FuseAttr{}, errnoFromError(err)
+	}
+	return p.fileAttr(nodeID, info), 0
 }
 
 func (p *passthroughFS) StatFS(_ uint64) (uint64, uint64, uint64, uint64, uint64, uint64, uint64, uint64, int32) {
@@ -1447,6 +1660,28 @@ func (p *passthroughFS) ensureNode(guestPath string) uint64 {
 	p.pathToNode[guestPath] = id
 	p.nodes[id] = guestPath
 	return id
+}
+
+func (p *passthroughFS) removeNodeForGuestPath(guestPath string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.pathToNode, guestPath)
+	for id, existing := range p.nodes {
+		if existing == guestPath {
+			delete(p.nodes, id)
+			break
+		}
+	}
+}
+
+func (p *passthroughFS) renameNodeGuestPath(oldPath, newPath string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if id, ok := p.pathToNode[oldPath]; ok {
+		delete(p.pathToNode, oldPath)
+		p.pathToNode[newPath] = id
+		p.nodes[id] = newPath
+	}
 }
 
 func (p *passthroughFS) fileAttr(nodeID uint64, info os.FileInfo) FuseAttr {
@@ -1865,7 +2100,7 @@ func (p *imageFS) dirType(node *imageNode) uint32 {
 	}
 }
 
-func (p *imageFS) createAbstractNode(parent *imageNode, name string, entry imageAbstractEntry) (*imageNode, int32) {
+func (p *imageFS) createAbstractNode(parent *imageNode, name string, entry imagefs.Entry) (*imageNode, int32) {
 	node := &imageNode{
 		id:      p.nextNodeID,
 		parent:  parent.id,
@@ -1906,7 +2141,7 @@ func (p *imageFS) createAbstractNode(parent *imageNode, name string, entry image
 	return node, 0
 }
 
-func (p *imageFS) materializeDirEntriesLocked(node *imageNode) ([]imageDirEnt, int32) {
+func (p *imageFS) materializeDirEntriesLocked(node *imageNode) ([]imagefs.DirEnt, int32) {
 	if node.abstractDir == nil {
 		return nil, 0
 	}
@@ -1940,77 +2175,6 @@ func (n *imageNode) isDir() bool {
 func (n *imageNode) isSymlink() bool {
 	return n.abstractLink != nil || n.mode&fs.ModeSymlink != 0
 }
-
-func (f *imageHostFile) Stat() (uint64, fs.FileMode) { return f.size, f.mode }
-func (f *imageHostFile) ModTime() time.Time          { return f.modTime }
-func (f *imageHostFile) Owner() (uint32, uint32)     { return f.uid, f.gid }
-func (f *imageHostFile) RDev() uint32                { return f.rdev }
-func (f *imageHostFile) ReadAt(off uint64, size uint32) ([]byte, error) {
-	file, err := os.Open(f.hostPath)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	buf := make([]byte, size)
-	n, err := file.ReadAt(buf, int64(off))
-	if err != nil && err != io.EOF {
-		return nil, err
-	}
-	return buf[:n], nil
-}
-
-func (d *imageHostDir) Stat() fs.FileMode       { return d.mode & linuxPermMask }
-func (d *imageHostDir) ModTime() time.Time      { return d.modTime }
-func (d *imageHostDir) Owner() (uint32, uint32) { return d.uid, d.gid }
-func (d *imageHostDir) RDev() uint32            { return d.rdev }
-func (d *imageHostDir) ReadDir() ([]imageDirEnt, error) {
-	entries, err := os.ReadDir(d.hostPath)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]imageDirEnt, 0, len(entries))
-	for _, entry := range entries {
-		info, err := entry.Info()
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, imageDirEnt{Name: entry.Name(), Mode: info.Mode()})
-	}
-	return out, nil
-}
-func (d *imageHostDir) Lookup(name string) (imageAbstractEntry, error) {
-	host := filepath.Join(d.hostPath, filepath.FromSlash(name))
-	info, err := os.Lstat(host)
-	if err != nil {
-		return imageAbstractEntry{}, err
-	}
-	rel, err := filepath.Rel(d.rootPath, host)
-	if err != nil {
-		return imageAbstractEntry{}, err
-	}
-	guest := fsmeta.Normalize(rel)
-	meta := d.meta[guest]
-	mode := linuxModeToGo(fsmeta.NormalizeLinuxMode(meta.Mode, info.Mode()))
-	modTime := info.ModTime()
-	switch {
-	case info.Mode()&os.ModeSymlink != 0:
-		target, err := os.Readlink(host)
-		if err != nil {
-			return imageAbstractEntry{}, err
-		}
-		return imageAbstractEntry{Symlink: &imageHostSymlink{hostPath: host, mode: mode, uid: meta.UID, gid: meta.GID, rdev: meta.RDev, target: target, modTime: modTime}}, nil
-	case info.IsDir():
-		return imageAbstractEntry{Dir: &imageHostDir{rootPath: d.rootPath, hostPath: host, mode: mode, uid: meta.UID, gid: meta.GID, rdev: meta.RDev, modTime: modTime, meta: d.meta}}, nil
-	default:
-		return imageAbstractEntry{File: &imageHostFile{hostPath: host, mode: mode, uid: meta.UID, gid: meta.GID, rdev: meta.RDev, size: uint64(info.Size()), modTime: modTime}}, nil
-	}
-}
-
-func (l *imageHostSymlink) Stat() fs.FileMode       { return l.mode & linuxPermMask }
-func (l *imageHostSymlink) ModTime() time.Time      { return l.modTime }
-func (l *imageHostSymlink) Target() string          { return l.target }
-func (l *imageHostSymlink) Owner() (uint32, uint32) { return l.uid, l.gid }
-func (l *imageHostSymlink) RDev() uint32            { return l.rdev }
 
 const (
 	linuxSIFMT    = 0o170000
@@ -2192,6 +2356,31 @@ func errorAs(err error, target any) bool {
 		}
 	}
 	return false
+}
+
+func translateLinuxOpenFlags(flags uint32) int {
+	openFlags := 0
+	switch flags & 0x3 {
+	case linuxOWRONLY:
+		openFlags |= os.O_WRONLY
+	case linuxORDWR:
+		openFlags |= os.O_RDWR
+	default:
+		openFlags |= os.O_RDONLY
+	}
+	if flags&linuxOCREAT != 0 {
+		openFlags |= os.O_CREATE
+	}
+	if flags&linuxOEXCL != 0 {
+		openFlags |= os.O_EXCL
+	}
+	if flags&linuxOTRUNC != 0 {
+		openFlags |= os.O_TRUNC
+	}
+	if flags&linuxOAPPEND != 0 {
+		openFlags |= os.O_APPEND
+	}
+	return openFlags
 }
 
 func align8(n int) int {

@@ -22,10 +22,18 @@ import (
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/fsmeta"
+	"j5.nz/cc/internal/imagefs"
+	"j5.nz/cc/internal/simg"
 )
 
 const defaultRegistry = "https://registry-1.docker.io/v2"
 const sharedCacheEnv = "CCX3_OCI_SHARED_CACHE_DIR"
+
+const (
+	SourceKindOCI   = "oci"
+	SourceKindSIMG  = "simg"
+	SourceKindCVMFS = "cvmfs"
+)
 
 type Store struct {
 	root       string
@@ -39,9 +47,11 @@ type Store struct {
 type metadata struct {
 	Name         string      `json:"name"`
 	Source       string      `json:"source"`
+	SourceKind   string      `json:"source_kind,omitempty"`
 	Architecture string      `json:"architecture,omitempty"`
 	RootFSDir    string      `json:"rootfs_dir"`
 	MetadataPath string      `json:"metadata_path,omitempty"`
+	IndexPath    string      `json:"index_path,omitempty"`
 	Env          []string    `json:"env,omitempty"`
 	Entrypoint   []string    `json:"entrypoint,omitempty"`
 	Cmd          []string    `json:"cmd,omitempty"`
@@ -58,10 +68,17 @@ type labelPair struct {
 type Image struct {
 	Name         string
 	Source       string
+	SourceKind   string
 	Architecture string
 	RootFSDir    string
 	FSMetadata   map[string]fsmeta.Entry
+	RootFS       imagefs.Directory
 	Config       RuntimeConfig
+}
+
+type SourceSpec struct {
+	Kind string
+	Raw  string
 }
 
 type RuntimeConfig struct {
@@ -211,12 +228,52 @@ func (s *Store) Open(name string) (*Image, error) {
 			}
 		}
 	}
+	rootFS := imagefs.NewHostFS(meta.RootFSDir, entries)
+	if meta.SourceKind == SourceKindSIMG {
+		rootFS, entries, arch, err := simg.BuildImageFS(filepath.Join(meta.RootFSDir, "rootfs.simg"))
+		if err != nil {
+			return nil, fmt.Errorf("build simg rootfs: %w", err)
+		}
+		return &Image{
+			Name:         meta.Name,
+			Source:       meta.Source,
+			SourceKind:   meta.SourceKind,
+			Architecture: firstNonEmpty(meta.Architecture, arch),
+			RootFSDir:    meta.RootFSDir,
+			FSMetadata:   entries,
+			RootFS:       rootFS,
+			Config: RuntimeConfig{
+				Env:        append([]string(nil), meta.Env...),
+				Entrypoint: append([]string(nil), meta.Entrypoint...),
+				Cmd:        append([]string(nil), meta.Cmd...),
+				WorkingDir: meta.WorkingDir,
+				User:       meta.User,
+				Labels:     labelsFromPairs(meta.Labels),
+			},
+		}, nil
+	}
+	if meta.IndexPath != "" {
+		indexBuf, err := os.ReadFile(meta.IndexPath)
+		if err != nil {
+			return nil, fmt.Errorf("read fs index: %w", err)
+		}
+		index, err := decodeFSIndex(indexBuf)
+		if err != nil {
+			return nil, fmt.Errorf("decode fs index: %w", err)
+		}
+		rootFS, err = buildIndexedRootFS(meta.RootFSDir, index)
+		if err != nil {
+			return nil, fmt.Errorf("build indexed rootfs: %w", err)
+		}
+	}
 	return &Image{
 		Name:         meta.Name,
 		Source:       meta.Source,
+		SourceKind:   meta.SourceKind,
 		Architecture: meta.Architecture,
 		RootFSDir:    meta.RootFSDir,
 		FSMetadata:   entries,
+		RootFS:       rootFS,
 		Config: RuntimeConfig{
 			Env:        append([]string(nil), meta.Env...),
 			Entrypoint: append([]string(nil), meta.Entrypoint...),
@@ -235,12 +292,16 @@ func (s *Store) Pull(ctx context.Context, name, source string) (client.ImageStat
 	if source == "" {
 		return client.ImageState{}, fmt.Errorf("image source is required")
 	}
-	if state, ok, err := s.existingState(name, source); err != nil {
+	spec, err := ParseSource(source)
+	if err != nil {
+		return client.ImageState{}, err
+	}
+	if state, ok, err := s.existingState(name, spec); err != nil {
 		return client.ImageState{}, err
 	} else if ok {
 		return state, nil
 	}
-	if state, ok, err := s.restoreFromSharedCache(name, source); err != nil {
+	if state, ok, err := s.restoreFromSharedCache(name, spec); err != nil {
 		return client.ImageState{}, err
 	} else if ok {
 		return state, nil
@@ -255,7 +316,7 @@ func (s *Store) Pull(ctx context.Context, name, source string) (client.ImageStat
 	delete(s.lastErr, name)
 	s.mu.Unlock()
 
-	err := s.pull(ctx, name, source)
+	err = s.pull(ctx, name, spec)
 
 	s.mu.Lock()
 	delete(s.downloading, name)
@@ -269,7 +330,7 @@ func (s *Store) Pull(ctx context.Context, name, source string) (client.ImageStat
 	return state, stateErr
 }
 
-func (s *Store) pull(ctx context.Context, name, source string) error {
+func (s *Store) pull(ctx context.Context, name string, spec SourceSpec) error {
 	if err := os.MkdirAll(s.root, 0o755); err != nil {
 		return fmt.Errorf("create image store: %w", err)
 	}
@@ -277,21 +338,127 @@ func (s *Store) pull(ctx context.Context, name, source string) error {
 		return fmt.Errorf("create shared image store: %w", err)
 	}
 
-	sharedName := sharedImageKey(source)
+	sharedName := sharedImageKey(spec)
 	shared := NewStore(s.sharedRoot())
 	shared.httpClient = s.httpClient
-	if _, ok, err := shared.existingState(sharedName, source); err != nil {
+	if _, ok, err := shared.existingState(sharedName, spec); err != nil {
 		return err
 	} else if !ok {
-		if err := shared.pullDirect(ctx, sharedName, source); err != nil {
+		if err := shared.pullDirect(ctx, sharedName, spec); err != nil {
 			return err
 		}
 	}
-	return s.cloneFromStore(shared, sharedName, name, source)
+	return s.cloneFromStore(shared, sharedName, name, spec)
 }
 
-func (s *Store) pullDirect(ctx context.Context, name, source string) error {
-	registry, imageName, tag, err := ParseImageRef(source)
+func (s *Store) pullDirect(ctx context.Context, name string, spec SourceSpec) error {
+	switch spec.Kind {
+	case SourceKindOCI:
+		return s.pullOCIDirect(ctx, name, spec)
+	case SourceKindSIMG:
+		return s.pullSIMGDirect(ctx, name, spec)
+	case SourceKindCVMFS:
+		return fmt.Errorf("cvmfs image ingestion is not implemented yet")
+	default:
+		return fmt.Errorf("unsupported image source kind %q", spec.Kind)
+	}
+}
+
+func (s *Store) pullSIMGDirect(ctx context.Context, name string, spec SourceSpec) error {
+	imageDir := s.imageDir(name)
+	tmpDir := imageDir + ".tmp"
+	if err := os.RemoveAll(tmpDir); err != nil {
+		return fmt.Errorf("remove temp image dir: %w", err)
+	}
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		return fmt.Errorf("create temp image dir: %w", err)
+	}
+	simgPath := filepath.Join(tmpDir, "rootfs.simg")
+	if err := s.fetchSIMG(ctx, spec.Raw, simgPath); err != nil {
+		return err
+	}
+	rootFS, entries, arch, err := simg.BuildImageFS(simgPath)
+	if err != nil {
+		return fmt.Errorf("index simg: %w", err)
+	}
+	_ = rootFS
+	metadataPath := filepath.Join(imageDir, "rootfs.metadata.json")
+	fsMetaBuf, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal fs metadata: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "rootfs.metadata.json"), fsMetaBuf, 0o644); err != nil {
+		return fmt.Errorf("write fs metadata: %w", err)
+	}
+	meta := metadata{
+		Name:         name,
+		Source:       spec.Raw,
+		SourceKind:   spec.Kind,
+		Architecture: arch,
+		RootFSDir:    imageDir,
+		MetadataPath: metadataPath,
+	}
+	if err := os.RemoveAll(imageDir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove old image dir: %w", err)
+	}
+	if err := os.Rename(tmpDir, imageDir); err != nil {
+		return fmt.Errorf("activate image dir: %w", err)
+	}
+	if err := s.writeMetadata(name, meta); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) fetchSIMG(ctx context.Context, source, destPath string) error {
+	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+		return fmt.Errorf("create simg dir: %w", err)
+	}
+	tmpPath := destPath + ".tmp"
+	if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := s.httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("download simg: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("download simg: status %s", resp.Status)
+		}
+		dst, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			return err
+		}
+		if _, err := io.Copy(dst, resp.Body); err != nil {
+			_ = dst.Close()
+			_ = os.Remove(tmpPath)
+			return err
+		}
+		if err := dst.Close(); err != nil {
+			_ = os.Remove(tmpPath)
+			return err
+		}
+		return os.Rename(tmpPath, destPath)
+	}
+	info, err := os.Stat(source)
+	if err != nil {
+		return fmt.Errorf("stat simg source: %w", err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("simg source must be a file")
+	}
+	if err := copyFile(source, tmpPath, 0o644); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("copy simg source: %w", err)
+	}
+	return os.Rename(tmpPath, destPath)
+}
+
+func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec) error {
+	registry, imageName, tag, err := ParseImageRef(spec.Raw)
 	if err != nil {
 		return err
 	}
@@ -305,8 +472,11 @@ func (s *Store) pullDirect(ctx context.Context, name, source string) error {
 	if err := os.MkdirAll(filepath.Join(tmpDir, "blobs"), 0o755); err != nil {
 		return fmt.Errorf("create temp image dir: %w", err)
 	}
+	if err := os.MkdirAll(filepath.Join(tmpDir, "layers"), 0o755); err != nil {
+		return fmt.Errorf("create layers dir: %w", err)
+	}
 
-	mani, err := s.fetchManifest(ctx, reg, imageName, tag, nativeArch())
+	mani, err := s.fetchManifest(ctx, reg, imageName, tag, preferredManifestArchitectures()...)
 	if err != nil {
 		return err
 	}
@@ -320,21 +490,40 @@ func (s *Store) pullDirect(ctx context.Context, name, source string) error {
 		return fmt.Errorf("decode image config: %w", err)
 	}
 
-	rootfsDir := filepath.Join(tmpDir, "rootfs")
-	if err := os.MkdirAll(rootfsDir, 0o755); err != nil {
-		return fmt.Errorf("create rootfs dir: %w", err)
-	}
 	fsEntries := map[string]fsmeta.Entry{
 		"/": {UID: 0, GID: 0, Mode: fsmeta.LinuxModeFromFileMode(os.ModeDir | 0o755)},
+	}
+	merged := map[string]*indexedNode{
+		"/": {
+			Path: "/",
+			Kind: indexedKindDir,
+			Mode: fsEntries["/"].Mode,
+			UID:  0,
+			GID:  0,
+		},
 	}
 	for _, layer := range mani.Layers {
 		layerBlob, err := s.fetchBlob(ctx, reg, imageName, layer.Digest)
 		if err != nil {
 			return fmt.Errorf("fetch layer %s: %w", layer.Digest, err)
 		}
-		if err := applyLayer(rootfsDir, layer.MediaType, layerBlob, fsEntries); err != nil {
-			return fmt.Errorf("apply layer %s: %w", layer.Digest, err)
+		layerTarRel := filepath.Join("layers", digestToFileName(layer.Digest)+".tar")
+		layerTarPath := filepath.Join(tmpDir, layerTarRel)
+		if err := writeLayerTar(layerTarPath, layer.MediaType, layerBlob); err != nil {
+			return fmt.Errorf("cache layer %s: %w", layer.Digest, err)
 		}
+		if err := applyIndexedLayer(layerTarPath, layerTarRel, merged, fsEntries); err != nil {
+			return fmt.Errorf("index layer %s: %w", layer.Digest, err)
+		}
+	}
+	ensureIndexedParents(merged, fsEntries)
+	indexPath := filepath.Join(imageDir, "rootfs.index.json")
+	indexBuf, err := encodeFSIndex(merged)
+	if err != nil {
+		return fmt.Errorf("marshal fs index: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "rootfs.index.json"), indexBuf, 0o644); err != nil {
+		return fmt.Errorf("write fs index: %w", err)
 	}
 	metadataPath := filepath.Join(imageDir, "rootfs.metadata.json")
 	fsMetaBuf, err := json.MarshalIndent(fsEntries, "", "  ")
@@ -347,10 +536,12 @@ func (s *Store) pullDirect(ctx context.Context, name, source string) error {
 
 	meta := metadata{
 		Name:         name,
-		Source:       source,
+		Source:       spec.Raw,
+		SourceKind:   spec.Kind,
 		Architecture: cfg.Architecture,
-		RootFSDir:    filepath.Join(imageDir, "rootfs"),
+		RootFSDir:    imageDir,
 		MetadataPath: metadataPath,
+		IndexPath:    indexPath,
 		Env:          append([]string(nil), cfg.Config.Env...),
 		Entrypoint:   append([]string(nil), cfg.Config.Entrypoint...),
 		Cmd:          append([]string(nil), cfg.Config.Cmd...),
@@ -371,7 +562,7 @@ func (s *Store) pullDirect(ctx context.Context, name, source string) error {
 	return nil
 }
 
-func (s *Store) existingState(name, source string) (client.ImageState, bool, error) {
+func (s *Store) existingState(name string, spec SourceSpec) (client.ImageState, bool, error) {
 	meta, err := s.readMetadata(name)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -379,18 +570,18 @@ func (s *Store) existingState(name, source string) (client.ImageState, bool, err
 		}
 		return client.ImageState{}, false, err
 	}
-	if meta.Source != source {
+	if meta.Source != spec.Raw || meta.SourceKind != spec.Kind {
 		return client.ImageState{}, false, nil
 	}
 	if !dirExists(meta.RootFSDir) {
 		return client.ImageState{}, false, nil
 	}
-	return client.ImageState{Name: meta.Name, Source: meta.Source, Status: "downloaded"}, true, nil
+	return client.ImageState{Name: meta.Name, Source: meta.Source, SourceKind: meta.SourceKind, Status: "downloaded"}, true, nil
 }
 
-func (s *Store) restoreFromSharedCache(name, source string) (client.ImageState, bool, error) {
+func (s *Store) restoreFromSharedCache(name string, spec SourceSpec) (client.ImageState, bool, error) {
 	shared := NewStore(s.sharedRoot())
-	sharedName := sharedImageKey(source)
+	sharedName := sharedImageKey(spec)
 	meta, err := shared.readMetadata(sharedName)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -398,16 +589,16 @@ func (s *Store) restoreFromSharedCache(name, source string) (client.ImageState, 
 		}
 		return client.ImageState{}, false, err
 	}
-	if meta.Source != source || !dirExists(meta.RootFSDir) {
+	if meta.Source != spec.Raw || meta.SourceKind != spec.Kind || !dirExists(meta.RootFSDir) {
 		return client.ImageState{}, false, nil
 	}
-	if err := s.cloneFromStore(shared, sharedName, name, source); err != nil {
+	if err := s.cloneFromStore(shared, sharedName, name, spec); err != nil {
 		return client.ImageState{}, false, err
 	}
-	return client.ImageState{Name: name, Source: source, Status: "downloaded"}, true, nil
+	return client.ImageState{Name: name, Source: spec.Raw, SourceKind: spec.Kind, Status: "downloaded"}, true, nil
 }
 
-func (s *Store) cloneFromStore(src *Store, srcName, dstName, source string) error {
+func (s *Store) cloneFromStore(src *Store, srcName, dstName string, spec SourceSpec) error {
 	srcMeta, err := src.readMetadata(srcName)
 	if err != nil {
 		return err
@@ -423,10 +614,14 @@ func (s *Store) cloneFromStore(src *Store, srcName, dstName, source string) erro
 	}
 	meta := srcMeta
 	meta.Name = dstName
-	meta.Source = source
-	meta.RootFSDir = filepath.Join(dstDir, "rootfs")
+	meta.Source = spec.Raw
+	meta.SourceKind = spec.Kind
+	meta.RootFSDir = dstDir
 	if meta.MetadataPath != "" {
 		meta.MetadataPath = filepath.Join(dstDir, "rootfs.metadata.json")
+	}
+	if meta.IndexPath != "" {
+		meta.IndexPath = filepath.Join(dstDir, "rootfs.index.json")
 	}
 	buf, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
@@ -444,7 +639,7 @@ func (s *Store) cloneFromStore(src *Store, srcName, dstName, source string) erro
 	return nil
 }
 
-func (s *Store) fetchManifest(ctx context.Context, reg *registryContext, imageName, tag, arch string) (manifest, error) {
+func (s *Store) fetchManifest(ctx context.Context, reg *registryContext, imageName, tag string, archs ...string) (manifest, error) {
 	body, mediaType, err := s.getJSONBlob(ctx, reg, "/"+imageName+"/manifests/"+tag, []string{
 		"application/vnd.docker.distribution.manifest.list.v2+json",
 		"application/vnd.oci.image.index.v1+json",
@@ -468,24 +663,26 @@ func (s *Store) fetchManifest(ctx context.Context, reg *registryContext, imageNa
 		return manifest{}, fmt.Errorf("decode manifest list: %w", err)
 	}
 
-	for _, entry := range index.Manifests {
-		if entry.Platform.OS == "linux" && entry.Platform.Architecture == arch {
-			body, _, err := s.getJSONBlob(ctx, reg, "/"+imageName+"/manifests/"+entry.Digest, []string{
-				"application/vnd.docker.distribution.manifest.v2+json",
-				"application/vnd.oci.image.manifest.v1+json",
-			})
-			if err != nil {
-				return manifest{}, err
+	for _, arch := range archs {
+		for _, entry := range index.Manifests {
+			if entry.Platform.OS == "linux" && entry.Platform.Architecture == arch {
+				body, _, err := s.getJSONBlob(ctx, reg, "/"+imageName+"/manifests/"+entry.Digest, []string{
+					"application/vnd.docker.distribution.manifest.v2+json",
+					"application/vnd.oci.image.manifest.v1+json",
+				})
+				if err != nil {
+					return manifest{}, err
+				}
+				var mani manifest
+				if err := json.Unmarshal(body, &mani); err != nil {
+					return manifest{}, fmt.Errorf("decode manifest: %w", err)
+				}
+				return mani, nil
 			}
-			var mani manifest
-			if err := json.Unmarshal(body, &mani); err != nil {
-				return manifest{}, fmt.Errorf("decode manifest: %w", err)
-			}
-			return mani, nil
 		}
 	}
 
-	return manifest{}, fmt.Errorf("manifest for linux/%s not found", arch)
+	return manifest{}, fmt.Errorf("manifest for %v not found", archs)
 }
 
 func (s *Store) fetchBlob(ctx context.Context, reg *registryContext, imageName, digest string) ([]byte, error) {
@@ -612,14 +809,14 @@ func (s *Store) getLocked(name string) (client.ImageState, error) {
 	if s.downloading[name] {
 		meta, err := s.readMetadata(name)
 		if err == nil {
-			return client.ImageState{Name: name, Source: meta.Source, Status: "downloading"}, nil
+			return client.ImageState{Name: name, Source: meta.Source, SourceKind: meta.SourceKind, Status: "downloading"}, nil
 		}
 		return client.ImageState{Name: name, Status: "downloading"}, nil
 	}
 
 	meta, err := s.readMetadata(name)
 	if err == nil {
-		return client.ImageState{Name: meta.Name, Source: meta.Source, Status: "downloaded"}, nil
+		return client.ImageState{Name: meta.Name, Source: meta.Source, SourceKind: meta.SourceKind, Status: "downloaded"}, nil
 	}
 	if lastErr := s.lastErr[name]; lastErr != nil {
 		return client.ImageState{Name: name, Status: "error", Error: lastErr.Error()}, nil
@@ -660,6 +857,13 @@ func (s *Store) readMetadata(name string) (metadata, error) {
 	if ret.Source == "" {
 		return ret, errors.New("image metadata missing source")
 	}
+	if ret.SourceKind == "" {
+		spec, err := ParseSource(ret.Source)
+		if err != nil {
+			return ret, fmt.Errorf("infer source kind: %w", err)
+		}
+		ret.SourceKind = spec.Kind
+	}
 	return ret, nil
 }
 
@@ -693,6 +897,27 @@ func (img *Image) Command(override []string) []string {
 		return append([]string(nil), img.Config.Entrypoint...)
 	}
 	return append([]string(nil), img.Config.Cmd...)
+}
+
+func ParseSource(source string) (SourceSpec, error) {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return SourceSpec{}, fmt.Errorf("image source is required")
+	}
+	lower := strings.ToLower(source)
+	switch {
+	case strings.HasPrefix(lower, "http+cvmfs://"):
+		return SourceSpec{Kind: SourceKindCVMFS, Raw: source}, nil
+	case strings.HasPrefix(lower, "cvmfs://"):
+		return SourceSpec{Kind: SourceKindCVMFS, Raw: source}, nil
+	case strings.HasSuffix(lower, ".simg"), strings.HasSuffix(lower, ".sif"):
+		return SourceSpec{Kind: SourceKindSIMG, Raw: source}, nil
+	default:
+		if _, _, _, err := ParseImageRef(source); err == nil {
+			return SourceSpec{Kind: SourceKindOCI, Raw: source}, nil
+		}
+		return SourceSpec{}, fmt.Errorf("unsupported image source %q", source)
+	}
 }
 
 func ParseImageRef(imageRef string) (registry string, image string, tag string, err error) {
@@ -894,8 +1119,8 @@ func digestToFileName(digest string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func sharedImageKey(source string) string {
-	sum := sha256.Sum256([]byte(nativeArch() + "\n" + source))
+func sharedImageKey(spec SourceSpec) string {
+	sum := sha256.Sum256([]byte(nativeArch() + "\n" + spec.Kind + "\n" + spec.Raw))
 	return hex.EncodeToString(sum[:16])
 }
 
@@ -963,6 +1188,14 @@ func nativeArch() string {
 	}
 }
 
+func preferredManifestArchitectures() []string {
+	out := []string{nativeArch()}
+	if nativeArch() == "arm64" {
+		out = append(out, "amd64")
+	}
+	return out
+}
+
 func labelPairsFromMap(labels map[string]string) []labelPair {
 	if len(labels) == 0 {
 		return nil
@@ -977,6 +1210,15 @@ func labelPairsFromMap(labels map[string]string) []labelPair {
 		out = append(out, labelPair{Key: key, Value: labels[key]})
 	}
 	return out
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func labelsFromPairs(pairs []labelPair) map[string]string {

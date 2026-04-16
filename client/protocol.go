@@ -27,14 +27,21 @@ type ProgressEvent struct {
 }
 
 type ImageState struct {
-	Name   string `json:"name"`
-	Source string `json:"source,omitempty"`
-	Status string `json:"status"`
-	Error  string `json:"error,omitempty"`
+	Name       string `json:"name"`
+	Source     string `json:"source,omitempty"`
+	SourceKind string `json:"source_kind,omitempty"`
+	Status     string `json:"status"`
+	Error      string `json:"error,omitempty"`
 }
 
 type PullImageRequest struct {
 	Source string `json:"source"`
+}
+
+type ShareMount struct {
+	Source   string `json:"source"`
+	Mount    string `json:"mount"`
+	Writable bool   `json:"writable,omitempty"`
 }
 
 type VMSupportedResponse struct {
@@ -43,10 +50,11 @@ type VMSupportedResponse struct {
 }
 
 type CreateInstanceRequest struct {
-	Image    string `json:"image"`
-	MemoryMB uint64 `json:"memory_mb,omitempty"`
-	CPUs     int    `json:"cpus,omitempty"`
-	Dmesg    bool   `json:"dmesg,omitempty"`
+	Image    string       `json:"image"`
+	Shares   []ShareMount `json:"shares,omitempty"`
+	MemoryMB uint64       `json:"memory_mb,omitempty"`
+	CPUs     int          `json:"cpus,omitempty"`
+	Dmesg    bool         `json:"dmesg,omitempty"`
 }
 
 type InstanceState struct {
@@ -59,18 +67,19 @@ type InstanceState struct {
 }
 
 type RunRequest struct {
-	Image    string   `json:"image"`
-	Command  []string `json:"command,omitempty"`
-	Env      []string `json:"env,omitempty"`
-	WorkDir  string   `json:"workdir,omitempty"`
-	User     string   `json:"user,omitempty"`
-	Stdin    []byte   `json:"stdin,omitempty"`
-	TTY      bool     `json:"tty,omitempty"`
-	Cols     int      `json:"cols,omitempty"`
-	Rows     int      `json:"rows,omitempty"`
-	MemoryMB uint64   `json:"memory_mb,omitempty"`
-	CPUs     int      `json:"cpus,omitempty"`
-	Dmesg    bool     `json:"dmesg,omitempty"`
+	Image    string       `json:"image"`
+	Shares   []ShareMount `json:"shares,omitempty"`
+	Command  []string     `json:"command,omitempty"`
+	Env      []string     `json:"env,omitempty"`
+	WorkDir  string       `json:"workdir,omitempty"`
+	User     string       `json:"user,omitempty"`
+	Stdin    []byte       `json:"stdin,omitempty"`
+	TTY      bool         `json:"tty,omitempty"`
+	Cols     int          `json:"cols,omitempty"`
+	Rows     int          `json:"rows,omitempty"`
+	MemoryMB uint64       `json:"memory_mb,omitempty"`
+	CPUs     int          `json:"cpus,omitempty"`
+	Dmesg    bool         `json:"dmesg,omitempty"`
 }
 
 type ExecResponse struct {

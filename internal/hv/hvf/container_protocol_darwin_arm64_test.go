@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/oci"
 )
 
@@ -99,6 +100,7 @@ func TestContainerSessionExecAllowsConcurrentCommands(t *testing.T) {
 	session := &ContainerSession{
 		image: &oci.Image{
 			RootFSDir: rootfs,
+			RootFS:    imagefs.NewHostFS(rootfs, nil),
 			Config: oci.RuntimeConfig{
 				Env: []string{"PATH=/bin"},
 			},
@@ -176,6 +178,7 @@ func TestContainerSessionExecIncludesStdin(t *testing.T) {
 	session := &ContainerSession{
 		image: &oci.Image{
 			RootFSDir: rootfs,
+			RootFS:    imagefs.NewHostFS(rootfs, nil),
 			Config: oci.RuntimeConfig{
 				Env: []string{"PATH=/bin"},
 			},
@@ -241,6 +244,7 @@ func TestContainerSessionExecStreamForwardsTTYControl(t *testing.T) {
 	session := &ContainerSession{
 		image: &oci.Image{
 			RootFSDir: rootfs,
+			RootFS:    imagefs.NewHostFS(rootfs, nil),
 			Config: oci.RuntimeConfig{
 				Env: []string{"PATH=/bin"},
 			},

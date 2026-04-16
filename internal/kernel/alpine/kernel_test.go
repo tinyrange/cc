@@ -145,6 +145,41 @@ func TestManagerPlanModuleLoad(t *testing.T) {
 	}
 }
 
+func TestManagerReadPackageFile(t *testing.T) {
+	indexBytes := buildAPKIndexArchive(t, "qemu-x86_64", "10.1.3-r1", "aarch64")
+	apkBytes := buildKernelPackage(t, map[string][]byte{
+		"usr/bin/qemu-x86_64": []byte("static qemu"),
+	})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/latest-stable/community/aarch64/APKINDEX.tar.gz":
+			w.Write(indexBytes)
+		case "/latest-stable/community/aarch64/qemu-x86_64-10.1.3-r1.apk":
+			w.Write(apkBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	mgr := NewManager(t.TempDir())
+	mgr.mirror = srv.URL
+	mgr.arch = "aarch64"
+	mgr.httpClient = srv.Client()
+
+	data, err := mgr.ReadPackageFile(context.Background(), "community", "qemu-x86_64", "usr/bin/qemu-x86_64")
+	if err != nil {
+		t.Fatalf("ReadPackageFile() error = %v", err)
+	}
+	if string(data) != "static qemu" {
+		t.Fatalf("ReadPackageFile() = %q, want %q", string(data), "static qemu")
+	}
+	if _, err := os.Stat(filepath.Join(mgr.root, "packages", "community", "qemu-x86_64-10.1.3-r1.apk")); err != nil {
+		t.Fatalf("cached package missing: %v", err)
+	}
+}
+
 func buildAPKIndexArchive(t *testing.T, pkgName, version, arch string) []byte {
 	t.Helper()
 

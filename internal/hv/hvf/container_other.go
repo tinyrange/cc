@@ -13,6 +13,7 @@ import (
 type ContainerRunRequest struct {
 	Kernel     []byte
 	Image      *oci.Image
+	Shares     []DirectoryShare
 	Command    []string
 	Env        []string
 	WorkDir    string
@@ -21,6 +22,12 @@ type ContainerRunRequest struct {
 	CPUs       int
 	Dmesg      bool
 	Persistent bool
+}
+
+type DirectoryShare struct {
+	Source   string
+	Mount    string
+	Writable bool
 }
 
 type ContainerRunResult struct {
