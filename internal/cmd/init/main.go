@@ -176,9 +176,6 @@ func run() error {
 			return err
 		}
 		writeKernel("ccx3-init: rootfs mounted")
-		if err := mountShares(cfg.Shares); err != nil {
-			return err
-		}
 		if err := configureBinfmt(); err != nil {
 			return fmt.Errorf("configure binfmt: %w", err)
 		}
@@ -223,6 +220,21 @@ func mountRootFS(tag string) error {
 	if err := syscall.Mount(tag, "/mnt", "virtiofs", 0, ""); err != nil {
 		return fmt.Errorf("mount virtiofs %s: %w", tag, err)
 	}
+	if _, err := os.Stat("/ccx3/qemu-x86_64-static"); err == nil {
+		if err := os.MkdirAll("/mnt/.pkg", 0o755); err != nil {
+			return fmt.Errorf("mkdir /mnt/.pkg: %w", err)
+		}
+		if err := syscall.Mount("tmpfs", "/mnt/.pkg", "tmpfs", 0, "mode=0755"); err != nil {
+			return fmt.Errorf("mount tmpfs /mnt/.pkg: %w", err)
+		}
+		data, err := os.ReadFile("/ccx3/qemu-x86_64-static")
+		if err != nil {
+			return fmt.Errorf("read bundled qemu-x86_64-static: %w", err)
+		}
+		if err := os.WriteFile("/mnt/.pkg/qemu-x86_64-static", data, 0o755); err != nil {
+			return fmt.Errorf("write /mnt/.pkg/qemu-x86_64-static: %w", err)
+		}
+	}
 	if err := syscall.Chroot("/mnt"); err != nil {
 		return fmt.Errorf("chroot /mnt: %w", err)
 	}
@@ -245,31 +257,8 @@ func mountRootFS(tag string) error {
 	return nil
 }
 
-func mountShares(shares []share) error {
-	for _, share := range shares {
-		if strings.TrimSpace(share.Tag) == "" {
-			return fmt.Errorf("share tag is required")
-		}
-		mountpoint := strings.TrimSpace(share.Mount)
-		if mountpoint == "" || !strings.HasPrefix(mountpoint, "/") {
-			return fmt.Errorf("share mount %q must be absolute", mountpoint)
-		}
-		if err := os.MkdirAll(mountpoint, 0o755); err != nil {
-			return fmt.Errorf("mkdir share mount %s: %w", mountpoint, err)
-		}
-		flags := uintptr(0)
-		if !share.Writable {
-			flags |= syscall.MS_RDONLY
-		}
-		if err := syscall.Mount(share.Tag, mountpoint, "virtiofs", flags, ""); err != nil {
-			return fmt.Errorf("mount share %s at %s: %w", share.Tag, mountpoint, err)
-		}
-	}
-	return nil
-}
-
 func configureBinfmt() error {
-	if _, err := os.Stat("/usr/bin/qemu-x86_64-static"); err != nil {
+	if _, err := os.Stat("/.pkg/qemu-x86_64-static"); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
@@ -286,9 +275,12 @@ func configureBinfmt() error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("stat qemu-x86_64 registration: %w", err)
 	}
-	const qemuX8664Registration = ":qemu-x86_64:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-x86_64-static:CF"
+	const qemuX8664Registration = ":qemu-x86_64:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00:\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:/.pkg/qemu-x86_64-static:OCF"
 	if err := os.WriteFile("/proc/sys/fs/binfmt_misc/register", []byte(qemuX8664Registration), 0o644); err != nil {
 		return fmt.Errorf("register qemu-x86_64: %w", err)
+	}
+	if _, err := os.Stat("/proc/sys/fs/binfmt_misc/qemu-x86_64"); err != nil {
+		return fmt.Errorf("verify qemu-x86_64 registration: %w", err)
 	}
 	return nil
 }
@@ -317,6 +309,46 @@ func writeProtocolLineTo(w io.Writer, value string) {
 	protocolMu.Lock()
 	defer protocolMu.Unlock()
 	_, _ = io.WriteString(w, strings.TrimRight(value, "\n")+"\n")
+}
+
+func writeExecStderr(cfg config, control io.Writer, id, value string) {
+	if cfg.ErrorMarkerPref == "" || value == "" {
+		return
+	}
+	writeProtocolLineTo(control, cfg.ErrorMarkerPref+id+":"+base64.StdEncoding.EncodeToString([]byte(value)))
+}
+
+func appendFileContents(buf *strings.Builder, path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		buf.WriteString(path)
+		buf.WriteString(": ")
+		buf.WriteString(err.Error())
+		buf.WriteString("\n")
+		return
+	}
+	buf.WriteString(path)
+	buf.WriteString(":\n")
+	buf.Write(data)
+	if len(data) == 0 || data[len(data)-1] != '\n' {
+		buf.WriteString("\n")
+	}
+}
+
+func collectExecDiagnostics() string {
+	var buf strings.Builder
+	if info, err := os.Stat("/.pkg/qemu-x86_64-static"); err != nil {
+		buf.WriteString("/.pkg/qemu-x86_64-static: ")
+		buf.WriteString(err.Error())
+		buf.WriteString("\n")
+	} else {
+		buf.WriteString("/.pkg/qemu-x86_64-static mode: ")
+		buf.WriteString(fmt.Sprintf("%#o", info.Mode()&0o777))
+		buf.WriteString("\n")
+	}
+	appendFileContents(&buf, "/proc/sys/fs/binfmt_misc/status")
+	appendFileContents(&buf, "/proc/sys/fs/binfmt_misc/qemu-x86_64")
+	return buf.String()
 }
 
 func writeKernel(value string) {
@@ -746,6 +778,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			<-done
 		}
 		writeKernel("ccx3-init: exec error: " + startErr.Error())
+		writeExecStderr(cfg, control, id, "ccx3-init: exec error: "+startErr.Error()+"\n"+collectExecDiagnostics())
 		if cfg.ExitMarkerPrefix != "" {
 			writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
 		}
@@ -778,6 +811,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			exitCode = exitErr.ExitCode()
 		} else {
 			writeKernel("ccx3-init: exec error: " + waitErr.Error())
+			writeExecStderr(cfg, control, id, "ccx3-init: exec error: "+waitErr.Error()+"\n")
 			exitCode = 126
 		}
 	}

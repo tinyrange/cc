@@ -3,15 +3,12 @@ package vm
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"runtime"
 	"sync"
 	"testing"
 	"time"
 
 	"j5.nz/cc/client"
-	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/oci"
 )
 
@@ -157,24 +154,15 @@ func TestManagerRunForwardsStdinToRunningInstance(t *testing.T) {
 	}
 }
 
-func TestPrepareImageForAMD64EmulationOverlaysQEMU(t *testing.T) {
+func TestLoadAMD64EmulatorReadsQEMU(t *testing.T) {
 	if runtime.GOARCH != "arm64" {
-		t.Skip("amd64 emulation overlay is only enabled on arm64 hosts")
-	}
-
-	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "bin"), 0o755); err != nil {
-		t.Fatalf("MkdirAll(bin) error = %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "bin", "sh"), []byte("busybox"), 0o755); err != nil {
-		t.Fatalf("WriteFile(bin/sh) error = %v", err)
+		t.Skip("amd64 emulation helper is only enabled on arm64 hosts")
 	}
 	image := &oci.Image{
 		Architecture: "amd64",
-		RootFS:       imagefs.NewHostFS(root, nil),
 	}
 
-	prepared, err := prepareImageForAMD64Emulation(context.Background(), image, func(ctx context.Context, repo, packageName, innerPath string) ([]byte, error) {
+	qemu, err := loadAMD64Emulator(context.Background(), image, func(ctx context.Context, repo, packageName, innerPath string) ([]byte, error) {
 		_ = ctx
 		if repo != "community" || packageName != "qemu-x86_64" || innerPath != "usr/bin/qemu-x86_64" {
 			t.Fatalf("unexpected package lookup %q %q %q", repo, packageName, innerPath)
@@ -182,23 +170,10 @@ func TestPrepareImageForAMD64EmulationOverlaysQEMU(t *testing.T) {
 		return []byte("qemu-static"), nil
 	})
 	if err != nil {
-		t.Fatalf("prepareImageForAMD64Emulation() error = %v", err)
+		t.Fatalf("loadAMD64Emulator() error = %v", err)
 	}
-	entry, err := imagefs.LookupPath(prepared.RootFS, "/usr/bin/qemu-x86_64-static")
-	if err != nil {
-		t.Fatalf("LookupPath(/usr/bin/qemu-x86_64-static) error = %v", err)
-	}
-	data, err := entry.File.ReadAt(0, 32)
-	if err != nil {
-		t.Fatalf("ReadAt(qemu) error = %v", err)
-	}
-	if string(data) != "qemu-static" {
-		t.Fatalf("qemu data = %q, want %q", string(data), "qemu-static")
-	}
-
-	baseEntry, err := imagefs.LookupPath(image.RootFS, "/usr/bin/qemu-x86_64-static")
-	if err == nil && baseEntry.File != nil {
-		t.Fatal("base image unexpectedly contains /usr/bin/qemu-x86_64-static")
+	if string(qemu) != "qemu-static" {
+		t.Fatalf("qemu data = %q, want %q", string(qemu), "qemu-static")
 	}
 }
 

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"runtime"
 
-	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/oci"
 )
 
@@ -26,9 +25,9 @@ func needsAMD64Emulation(image *oci.Image) bool {
 	}
 }
 
-func prepareImageForAMD64Emulation(ctx context.Context, image *oci.Image, readPackageFile packageFileReader) (*oci.Image, error) {
+func loadAMD64Emulator(ctx context.Context, image *oci.Image, readPackageFile packageFileReader) ([]byte, error) {
 	if !needsAMD64Emulation(image) {
-		return image, nil
+		return nil, nil
 	}
 	if readPackageFile == nil {
 		return nil, fmt.Errorf("package file reader is nil")
@@ -37,11 +36,5 @@ func prepareImageForAMD64Emulation(ctx context.Context, image *oci.Image, readPa
 	if err != nil {
 		return nil, fmt.Errorf("read qemu-x86_64 package file: %w", err)
 	}
-	overlay := imagefs.NewOverlay(image.RootFS)
-	if err := overlay.AddFile("/usr/bin/qemu-x86_64-static", 0o755, qemu); err != nil {
-		return nil, fmt.Errorf("overlay qemu-x86_64-static: %w", err)
-	}
-	cloned := *image
-	cloned.RootFS = overlay.Root()
-	return &cloned, nil
+	return qemu, nil
 }

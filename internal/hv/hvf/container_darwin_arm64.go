@@ -59,20 +59,21 @@ const (
 )
 
 type ContainerRunRequest struct {
-	Kernel     []byte
-	Init       []byte
-	Modules    []alpine.Module
-	Image      *oci.Image
-	RootFS     virtio.FSBackend
-	Shares     []DirectoryShare
-	Command    []string
-	Env        []string
-	WorkDir    string
-	User       string
-	MemoryMB   uint64
-	CPUs       int
-	Dmesg      bool
-	Persistent bool
+	Kernel        []byte
+	Init          []byte
+	AMD64Emulator []byte
+	Modules       []alpine.Module
+	Image         *oci.Image
+	RootFS        virtio.FSBackend
+	Shares        []DirectoryShare
+	Command       []string
+	Env           []string
+	WorkDir       string
+	User          string
+	MemoryMB      uint64
+	CPUs          int
+	Dmesg         bool
+	Persistent    bool
 }
 
 type DirectoryShare struct {
@@ -535,6 +536,14 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 		{Path: "/etc/ccx3-init.json", Mode: 0o600, Data: configJSON, Type: initramfs.TypeRegular},
 		{Path: "/init", Mode: 0o755, Data: req.Init, Type: initramfs.TypeRegular},
 	}
+	if len(req.AMD64Emulator) > 0 {
+		extraFiles = append(extraFiles, initramfs.File{
+			Path: "/ccx3/qemu-x86_64-static",
+			Mode: 0o755,
+			Data: req.AMD64Emulator,
+			Type: initramfs.TypeRegular,
+		})
+	}
 	for _, mod := range req.Modules {
 		extraFiles = append(extraFiles, initramfs.File{
 			Path: "/ccx3/modules/" + mod.Name + ".ko",
@@ -837,6 +846,14 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 		{Path: "/dev/kmsg", Mode: 0o600, Type: initramfs.TypeCharDevice, DevMajor: 1, DevMinor: 11},
 		{Path: "/etc/ccx3-init.json", Mode: 0o600, Data: configJSON, Type: initramfs.TypeRegular},
 		{Path: "/init", Mode: 0o755, Data: req.Init, Type: initramfs.TypeRegular},
+	}
+	if len(req.AMD64Emulator) > 0 {
+		extraFiles = append(extraFiles, initramfs.File{
+			Path: "/ccx3/qemu-x86_64-static",
+			Mode: 0o755,
+			Data: req.AMD64Emulator,
+			Type: initramfs.TypeRegular,
+		})
 	}
 	for _, mod := range req.Modules {
 		extraFiles = append(extraFiles, initramfs.File{

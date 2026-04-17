@@ -78,7 +78,7 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	if err != nil {
 		return hvf.ContainerRunRequest{}, err
 	}
-	image, err = prepareImageForAMD64Emulation(ctx, image, b.kernel.ReadPackageFile)
+	qemuX8664, err := loadAMD64Emulator(ctx, image, b.kernel.ReadPackageFile)
 	if err != nil {
 		return hvf.ContainerRunRequest{}, err
 	}
@@ -87,13 +87,14 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 		return hvf.ContainerRunRequest{}, err
 	}
 	return hvf.ContainerRunRequest{
-		Kernel:   kernel,
-		Init:     initBin,
-		Modules:  modules,
-		Image:    image,
-		MemoryMB: memoryMB,
-		CPUs:     cpus,
-		Dmesg:    dmesg,
+		Kernel:        kernel,
+		Init:          initBin,
+		AMD64Emulator: qemuX8664,
+		Modules:       modules,
+		Image:         image,
+		MemoryMB:      memoryMB,
+		CPUs:          cpus,
+		Dmesg:         dmesg,
 	}, ctx.Err()
 }
 
