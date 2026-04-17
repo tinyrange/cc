@@ -239,6 +239,10 @@ type VM struct {
 	exitInfo *VcpuExit
 	mappings []mapping
 	threadCh chan func()
+	dit      bool
+	mdscrEL1 uint64
+	osdlrEL1 uint64
+	osLock   bool
 }
 
 type mapping struct {
@@ -256,6 +260,7 @@ func NewVM() (*VM, error) {
 
 	v := &VM{
 		threadCh: make(chan func()),
+		osLock:   true,
 	}
 	go v.threadMain()
 
@@ -802,6 +807,7 @@ type ExceptionClass uint64
 
 const (
 	ExceptionClassHVC64            ExceptionClass = 0x16
+	ExceptionClassSystemRegister   ExceptionClass = 0x18
 	ExceptionClassDataAbortLowerEL ExceptionClass = 0x24
 )
 
@@ -809,6 +815,17 @@ type DataAbortInfo struct {
 	SizeBytes int
 	Write     bool
 	Target    Reg
+}
+
+type SystemInstructionInfo struct {
+	Op0   uint8
+	Op1   uint8
+	Op2   uint8
+	CRn   uint8
+	CRm   uint8
+	Rt    Reg
+	Read  bool
+	RawRt uint8
 }
 
 func DecodeExceptionClass(syndrome uint64) ExceptionClass {
@@ -853,6 +870,182 @@ func DecodeDataAbort(syndrome uint64) (DataAbortInfo, error) {
 		Write:     write,
 		Target:    reg,
 	}, nil
+}
+
+func DecodeSystemInstruction(syndrome uint64) (SystemInstructionInfo, error) {
+	const (
+		systemInstructionISSMask uint64 = (1 << 25) - 1
+		ilBit                           = 25
+		op0Shift                        = 20
+		op0Mask                  uint64 = 0x3
+		op2Shift                        = 17
+		op2Mask                  uint64 = 0x7
+		op1Shift                        = 14
+		op1Mask                  uint64 = 0x7
+		crnShift                        = 10
+		crnMask                  uint64 = 0xf
+		rtShift                         = 5
+		rtMask                   uint64 = 0x1f
+		crmShift                        = 1
+		crmMask                  uint64 = 0xf
+	)
+
+	if DecodeExceptionClass(syndrome) != ExceptionClassSystemRegister {
+		return SystemInstructionInfo{}, fmt.Errorf("not a trapped system instruction: syndrome=%#x", syndrome)
+	}
+	if ((syndrome >> ilBit) & 0x1) == 0 {
+		return SystemInstructionInfo{}, fmt.Errorf("system instruction without IL set: syndrome=%#x", syndrome)
+	}
+
+	iss := syndrome & systemInstructionISSMask
+	rawRt := uint8((iss >> rtShift) & rtMask)
+	rt := Reg(rawRt)
+	if rawRt == 31 {
+		rt = hvRegXZR
+	}
+
+	return SystemInstructionInfo{
+		Op0:   uint8((iss >> op0Shift) & op0Mask),
+		Op1:   uint8((iss >> op1Shift) & op1Mask),
+		Op2:   uint8((iss >> op2Shift) & op2Mask),
+		CRn:   uint8((iss >> crnShift) & crnMask),
+		CRm:   uint8((iss >> crmShift) & crmMask),
+		Rt:    rt,
+		Read:  (iss & 0x1) == 1,
+		RawRt: rawRt,
+	}, nil
+}
+
+func (s SystemInstructionInfo) IsDITRegisterAccess() bool {
+	return s.Op0 == 0x3 && s.Op1 == 0x3 && s.CRn == 0x4 && s.CRm == 0x2 && s.Op2 == 0x5
+}
+
+func (s SystemInstructionInfo) IsDITImmediateAccess() bool {
+	return s.Op0 == 0x0 && s.Op1 == 0x3 && s.CRn == 0x4 && s.Op2 == 0x2
+}
+
+func (s SystemInstructionInfo) ImmediateValue() uint8 {
+	return s.CRm
+}
+
+func (s SystemInstructionInfo) IsMDSCREL1Access() bool {
+	return s.Op0 == 0x2 && s.Op1 == 0x0 && s.CRn == 0x0 && s.CRm == 0x2 && s.Op2 == 0x2
+}
+
+func (s SystemInstructionInfo) IsOSDLREL1Access() bool {
+	return s.Op0 == 0x2 && s.Op1 == 0x0 && s.CRn == 0x1 && s.CRm == 0x3 && s.Op2 == 0x4
+}
+
+func (s SystemInstructionInfo) IsOSLAREL1Access() bool {
+	return s.Op0 == 0x2 && s.Op1 == 0x0 && s.CRn == 0x1 && s.CRm == 0x0 && s.Op2 == 0x4
+}
+
+func (s SystemInstructionInfo) IsOSLSREL1Access() bool {
+	return s.Op0 == 0x2 && s.Op1 == 0x0 && s.CRn == 0x1 && s.CRm == 0x1 && s.Op2 == 0x4
+}
+
+func (v *VM) GetProgramCounter() (uint64, error) {
+	return v.GetReg(hvRegPC)
+}
+
+func (v *VM) HandleSystemInstruction(syndrome uint64) (bool, error) {
+	info, err := DecodeSystemInstruction(syndrome)
+	if err != nil {
+		return false, err
+	}
+
+	switch {
+	case info.IsDITRegisterAccess():
+		if info.Read {
+			var value uint64
+			if v.dit {
+				value = 1 << 24
+			}
+			if info.Rt != hvRegXZR {
+				if err := v.SetReg(info.Rt, value); err != nil {
+					return false, err
+				}
+			}
+		} else {
+			var value uint64
+			if info.Rt != hvRegXZR {
+				value, err = v.GetReg(info.Rt)
+				if err != nil {
+					return false, err
+				}
+			}
+			v.dit = ((value >> 24) & 0x1) == 1
+		}
+	case info.IsDITImmediateAccess():
+		v.dit = (info.ImmediateValue() & 0x1) == 1
+	case info.IsMDSCREL1Access():
+		if info.Read {
+			if info.Rt != hvRegXZR {
+				if err := v.SetReg(info.Rt, v.mdscrEL1); err != nil {
+					return false, err
+				}
+			}
+		} else {
+			if info.Rt == hvRegXZR {
+				v.mdscrEL1 = 0
+			} else {
+				value, err := v.GetReg(info.Rt)
+				if err != nil {
+					return false, err
+				}
+				v.mdscrEL1 = value
+			}
+		}
+	case info.IsOSDLREL1Access():
+		if info.Read {
+			if info.Rt != hvRegXZR {
+				if err := v.SetReg(info.Rt, v.osdlrEL1); err != nil {
+					return false, err
+				}
+			}
+		} else {
+			if info.Rt == hvRegXZR {
+				v.osdlrEL1 = 0
+			} else {
+				value, err := v.GetReg(info.Rt)
+				if err != nil {
+					return false, err
+				}
+				v.osdlrEL1 = value
+			}
+		}
+	case info.IsOSLAREL1Access():
+		if info.Read {
+			if info.Rt != hvRegXZR {
+				if err := v.SetReg(info.Rt, 0); err != nil {
+					return false, err
+				}
+			}
+		} else {
+			var value uint64
+			if info.Rt != hvRegXZR {
+				value, err = v.GetReg(info.Rt)
+				if err != nil {
+					return false, err
+				}
+			}
+			v.osLock = (value & 0x1) == 1
+		}
+	case info.IsOSLSREL1Access():
+		value := uint64(0x8)
+		if v.osLock {
+			value |= 0x2
+		}
+		if info.Rt != hvRegXZR {
+			if err := v.SetReg(info.Rt, value); err != nil {
+				return false, err
+			}
+		}
+	default:
+		return false, nil
+	}
+
+	return true, v.AdvanceProgramCounter()
 }
 
 func (v *VM) AdvanceProgramCounter() error {

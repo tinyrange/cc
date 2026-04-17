@@ -287,6 +287,19 @@ func bootKernelProbeWithInitrd(t *testing.T, vm *VM, memoryBase uint64, mode boo
 				result.Serial = serialOut.String()
 				return result, err
 			}
+		case ExceptionClassSystemRegister:
+			handled, err := vm.HandleSystemInstruction(exitInfo.Exception.Syndrome)
+			if err != nil {
+				result.Serial = serialOut.String()
+				return result, err
+			}
+			if !handled {
+				pc, _ := vm.GetProgramCounter()
+				info, _ := DecodeSystemInstruction(exitInfo.Exception.Syndrome)
+				result.Serial = serialOut.String()
+				return result, fmt.Errorf("unsupported system instruction trap pc=%#x syndrome=%#x op0=%d op1=%d op2=%d crn=%d crm=%d rt=%d read=%t",
+					pc, exitInfo.Exception.Syndrome, info.Op0, info.Op1, info.Op2, info.CRn, info.CRm, info.RawRt, info.Read)
+			}
 		case ExceptionClassHVC64:
 			result.HVCCount++
 			halt, reason, hvcLog, err := handleTestHVC(vm, uart, mem, memoryBase)
@@ -304,9 +317,10 @@ func bootKernelProbeWithInitrd(t *testing.T, vm *VM, memoryBase uint64, mode boo
 				return result, nil
 			}
 		default:
+			pc, _ := vm.GetProgramCounter()
 			result.Serial = serialOut.String()
-			return result, fmt.Errorf("unexpected exception class %#x syndrome=%#x physical=%#x",
-				class, exitInfo.Exception.Syndrome, uint64(exitInfo.Exception.PhysicalAddress))
+			return result, fmt.Errorf("unexpected exception class %#x pc=%#x syndrome=%#x physical=%#x",
+				class, pc, exitInfo.Exception.Syndrome, uint64(exitInfo.Exception.PhysicalAddress))
 		}
 	}
 

@@ -94,6 +94,7 @@ type ContainerSession struct {
 	baseEnv    []string
 	workDir    string
 	dmesg      bool
+	uart       *serial.UART8250
 	control    virtio.VsockConn
 	transcript *serialTranscript
 	listener   virtio.VsockListener
@@ -264,7 +265,7 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 
 	start := s.transcript.Len()
 	s.sendMu.Lock()
-	_, err = s.control.Write(append(payload, '\n'))
+	err = s.writeControlPayload(append(payload, '\n'))
 	s.sendMu.Unlock()
 	if err != nil {
 		return client.ExecResponse{}, err
@@ -336,7 +337,7 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 
 	start := s.transcript.Len()
 	s.sendMu.Lock()
-	_, err = s.control.Write(append(payload, '\n'))
+	err = s.writeControlPayload(append(payload, '\n'))
 	s.sendMu.Unlock()
 	if err != nil {
 		return err
@@ -382,7 +383,7 @@ func (s *ContainerSession) forwardExecInputs(ctx context.Context, id string, inp
 				return
 			}
 			s.sendMu.Lock()
-			_, _ = s.control.Write(append(payload, '\n'))
+			_ = s.writeControlPayload(append(payload, '\n'))
 			s.sendMu.Unlock()
 		}
 	}
@@ -395,8 +396,7 @@ func (s *ContainerSession) sendStdinClose(id string) error {
 	}
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
-	_, err = s.control.Write(append(payload, '\n'))
-	return err
+	return s.writeControlPayload(append(payload, '\n'))
 }
 
 func (s *ContainerSession) streamExecEvents(ctx context.Context, start int, id string, onEvent func(client.ExecEvent) error) error {
@@ -453,6 +453,17 @@ func (s *ContainerSession) Close() error {
 	return nil
 }
 
+func (s *ContainerSession) writeControlPayload(payload []byte) error {
+	if s.control != nil {
+		_, err := s.control.Write(payload)
+		return err
+	}
+	if s.uart == nil {
+		return fmt.Errorf("control channel is not available")
+	}
+	return s.uart.InjectRXBytes(payload)
+}
+
 func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*ContainerSession, error) {
 	if req.Image == nil && req.RootFS == nil {
 		return nil, fmt.Errorf("image or rootfs backend is required")
@@ -499,8 +510,6 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 		WorkDir:          workDir,
 		Modules:          moduleConfig(req.Modules),
 		RootFSTag:        containerRootFSTag,
-		Shares:           guestShareConfig(req.Shares),
-		VsockPort:        containerControlPort,
 		ReadyMarker:      instanceReadyMarker,
 		BeginMarker:      commandBeginMarker,
 		OutputMarkerPref: commandOutputMarker,
@@ -562,14 +571,6 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 	uart.AttachIRQ(vm, containerUARTSPI)
 	console := virtio.NewConsole(containerConsoleBase, containerConsoleSize, containerConsoleIRQ, &consoleOut)
 	console.Attach(vm, vm)
-	vsockBackend := virtio.NewSimpleVsockBackend()
-	listener, err := vsockBackend.Listen(containerControlPort)
-	if err != nil {
-		vm.Close()
-		return nil, fmt.Errorf("create vsock listener: %w", err)
-	}
-	vsock := virtio.NewVsock(containerVsockBase, containerVsockSize, containerVsockIRQ, containerGuestCID, vsockBackend)
-	vsock.Attach(vm, vm)
 	fsdevs, err := buildFSDevices(req, &fsTrace)
 	if err != nil {
 		vm.Close()
@@ -584,7 +585,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 		MemorySize: memorySize,
 		NumCPUs:    1,
 		Initrd:     initrd,
-		ExtraNodes: appendFSNodes([]fdt.Node{console.DeviceTreeNode(), vsock.DeviceTreeNode()}, fsdevs),
+		ExtraNodes: appendFSNodes([]fdt.Node{console.DeviceTreeNode()}, fsdevs),
 		Cmdline: strings.Join([]string{
 			"console=ttyS0,115200n8",
 			fmt.Sprintf("earlycon=uart8250,mmio,0x%x", bootarm64.DefaultUARTBase),
@@ -624,28 +625,18 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 	}
 
 	runCtx, cancel := context.WithCancel(context.Background())
-	readyCh := make(chan readyResult, 1)
+	readyCh := make(chan error, 1)
 	doneCh := make(chan sessionRunResult, 1)
-	controlTranscript := newSerialTranscript()
+	controlTranscript := serialOut
 
 	go func() {
-		conn, err := listener.Accept()
-		if err != nil {
-			readyCh <- readyResult{err: fmt.Errorf("accept control vsock: %w", err)}
-			return
-		}
-		go func() {
-			_, _ = io.Copy(controlTranscript, conn)
-		}()
-		_, err = controlTranscript.waitFor(runCtx, 0, func(text string) bool {
+		_, err := controlTranscript.waitFor(runCtx, 0, func(text string) bool {
 			return strings.Contains(text, instanceReadyMarker)
 		})
-		readyCh <- readyResult{conn: conn, err: err}
+		readyCh <- err
 	}()
 
 	go func() {
-		defer listener.Close()
-		defer vsock.Close()
 		defer vm.Close()
 		for {
 			exitInfo, err, stalled := runWithCancel(runCtx, vm, 5*time.Second)
@@ -677,8 +668,21 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 			}
 			switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 			case ExceptionClassDataAbortLowerEL:
-				if err := handleContainerDataAbort(vm, uart, console, fsdevs, vsock, exitInfo); err != nil {
+				if err := handleContainerDataAbort(vm, uart, console, fsdevs, nil, exitInfo); err != nil {
 					doneCh <- sessionRunResult{err: err}
+					return
+				}
+			case ExceptionClassSystemRegister:
+				handled, err := vm.HandleSystemInstruction(exitInfo.Exception.Syndrome)
+				if err != nil {
+					doneCh <- sessionRunResult{err: err}
+					return
+				}
+				if !handled {
+					pc, _ := vm.GetProgramCounter()
+					info, _ := DecodeSystemInstruction(exitInfo.Exception.Syndrome)
+					doneCh <- sessionRunResult{err: fmt.Errorf("unsupported system instruction trap pc=%#x syndrome=%#x op0=%d op1=%d op2=%d crn=%d crm=%d rt=%d read=%t\nserial:\n%s\nvirtio-fs:\n%s",
+						pc, exitInfo.Exception.Syndrome, info.Op0, info.Op1, info.Op2, info.CRn, info.CRm, info.RawRt, info.Read, serialOut.String(), fsTrace.String())}
 					return
 				}
 			case ExceptionClassHVC64:
@@ -692,22 +696,23 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 					return
 				}
 			default:
-				doneCh <- sessionRunResult{err: fmt.Errorf("unexpected exception class %#x syndrome=%#x physical=%#x\nserial:\n%s\nvirtio-fs:\n%s",
-					DecodeExceptionClass(exitInfo.Exception.Syndrome), exitInfo.Exception.Syndrome, uint64(exitInfo.Exception.PhysicalAddress), serialOut.String(), fsTrace.String())}
+				pc, _ := vm.GetProgramCounter()
+				doneCh <- sessionRunResult{err: fmt.Errorf("unexpected exception class %#x pc=%#x syndrome=%#x physical=%#x\nserial:\n%s\nvirtio-fs:\n%s",
+					DecodeExceptionClass(exitInfo.Exception.Syndrome), pc, exitInfo.Exception.Syndrome, uint64(exitInfo.Exception.PhysicalAddress), serialOut.String(), fsTrace.String())}
 				return
 			}
 		}
 	}()
 
 	select {
-	case ready := <-readyCh:
-		if ready.err != nil {
+	case err := <-readyCh:
+		if err != nil {
 			cancel()
 			res := <-doneCh
 			if res.err != nil {
 				return nil, res.err
 			}
-			return nil, ready.err
+			return nil, err
 		}
 		return &ContainerSession{
 			cancel:     cancel,
@@ -716,10 +721,8 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 			baseEnv:    baseEnv,
 			workDir:    workDir,
 			dmesg:      req.Dmesg,
-			control:    ready.conn,
+			uart:       uart,
 			transcript: controlTranscript,
-			listener:   listener,
-			vsock:      vsock,
 		}, nil
 	case res := <-doneCh:
 		cancel()
@@ -729,7 +732,6 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 		return nil, fmt.Errorf("guest exited before control connection became ready")
 	case <-ctx.Done():
 		cancel()
-		_ = listener.Close()
 		res := <-doneCh
 		if res.err != nil {
 			return nil, res.err
@@ -813,7 +815,6 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 		WorkDir:          workDir,
 		Modules:          moduleConfig(req.Modules),
 		RootFSTag:        containerRootFSTag,
-		Shares:           guestShareConfig(req.Shares),
 		BeginMarker:      commandBeginMarker,
 		ErrorMarkerPref:  commandErrorMarker,
 		ExitMarkerPrefix: commandExitMarkerPref,
@@ -983,6 +984,17 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 			if err := handleContainerDataAbort(vm, uart, console, fsdevs, vsock, exitInfo); err != nil {
 				return ContainerRunResult{}, err
 			}
+		case ExceptionClassSystemRegister:
+			handled, err := vm.HandleSystemInstruction(exitInfo.Exception.Syndrome)
+			if err != nil {
+				return ContainerRunResult{}, err
+			}
+			if !handled {
+				pc, _ := vm.GetProgramCounter()
+				info, _ := DecodeSystemInstruction(exitInfo.Exception.Syndrome)
+				return ContainerRunResult{}, fmt.Errorf("unsupported system instruction trap pc=%#x syndrome=%#x op0=%d op1=%d op2=%d crn=%d crm=%d rt=%d read=%t\nrun:\n%sserial:\n%s\nvirtio-fs:\n%s",
+					pc, exitInfo.Exception.Syndrome, info.Op0, info.Op1, info.Op2, info.CRn, info.CRm, info.RawRt, info.Read, runTrace.String(), serialOut.String(), fsTrace.String())
+			}
 		case ExceptionClassHVC64:
 			halt, err := handleContainerHVC(vm)
 			if err != nil {
@@ -1003,8 +1015,9 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 				return ContainerRunResult{}, fmt.Errorf("guest halted before command completed\nserial:\n%s\nvirtio-fs:\n%s", serialOut.String(), fsTrace.String())
 			}
 		default:
-			return ContainerRunResult{}, fmt.Errorf("unexpected exception class %#x syndrome=%#x physical=%#x\nrun:\n%sserial:\n%s\nvirtio-fs:\n%s",
-				DecodeExceptionClass(exitInfo.Exception.Syndrome), exitInfo.Exception.Syndrome, uint64(exitInfo.Exception.PhysicalAddress), runTrace.String(), serialOut.String(), fsTrace.String())
+			pc, _ := vm.GetProgramCounter()
+			return ContainerRunResult{}, fmt.Errorf("unexpected exception class %#x pc=%#x syndrome=%#x physical=%#x\nrun:\n%sserial:\n%s\nvirtio-fs:\n%s",
+				DecodeExceptionClass(exitInfo.Exception.Syndrome), pc, exitInfo.Exception.Syndrome, uint64(exitInfo.Exception.PhysicalAddress), runTrace.String(), serialOut.String(), fsTrace.String())
 		}
 	}
 }
@@ -1059,15 +1072,23 @@ func buildFSDevices(req ContainerRunRequest, trace io.Writer) ([]*virtio.FS, err
 		}
 		rootFSBackend = virtio.NewImageFS(req.Image.RootFS, req.Image.RootFSDir)
 	}
+	if len(req.Shares) > 0 {
+		shares := make([]virtio.ShareMount, 0, len(req.Shares))
+		for i, share := range req.Shares {
+			_, backend, err := buildShareBackend(i, share)
+			if err != nil {
+				return nil, err
+			}
+			shares = append(shares, virtio.ShareMount{
+				GuestPath: share.Mount,
+				Backend:   backend,
+				Writable:  share.Writable,
+			})
+		}
+		rootFSBackend = virtio.NewMountedFS(rootFSBackend, shares)
+	}
 	devs := []*virtio.FS{
 		newFSDevice(containerFSBase, containerFSIRQ, containerRootFSTag, rootFSBackend, trace),
-	}
-	for i, share := range req.Shares {
-		tag, backend, err := buildShareBackend(i, share)
-		if err != nil {
-			return nil, err
-		}
-		devs = append(devs, newFSDevice(containerShareFSBase+uint64(i)*containerFSStride, containerShareFSIRQ+uint32(i), tag, backend, trace))
 	}
 	return devs, nil
 }
