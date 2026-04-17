@@ -2,39 +2,20 @@ package guestinit
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"runtime"
 )
 
-func Build(ctx context.Context, cacheDir string) ([]byte, error) {
-	root, err := repoRoot()
-	if err != nil {
-		return nil, err
-	}
-	outPath := filepath.Join(cacheDir, "guest-init")
-	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
-		return nil, fmt.Errorf("create guest init dir: %w", err)
-	}
-	cmd := exec.CommandContext(ctx, "go", "build", "-o", outPath, "./internal/cmd/init")
-	cmd.Dir = root
-	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH=arm64", "CGO_ENABLED=0")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("build guest init: %w\n%s", err, string(output))
-	}
-	data, err := os.ReadFile(outPath)
-	if err != nil {
-		return nil, fmt.Errorf("read guest init: %w", err)
-	}
-	return data, nil
-}
+// guestInitLinuxARM64 contains the prebuilt Linux arm64 guest init binary
+// bundled directly into the ccvm executable so daemon startup never shells out
+// to the Go toolchain.
+//
+//go:embed guest-init-linux-arm64
+var guestInitLinuxARM64 []byte
 
-func repoRoot() (string, error) {
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		return "", fmt.Errorf("resolve caller path")
+func Build(_ context.Context, _ string) ([]byte, error) {
+	if len(guestInitLinuxARM64) == 0 {
+		return nil, fmt.Errorf("embedded guest init payload is empty")
 	}
-	return filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..")), nil
+	return append([]byte(nil), guestInitLinuxARM64...), nil
 }

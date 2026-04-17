@@ -10,8 +10,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+
+	intsqlite "j5.nz/cc/internal/sqlite"
 )
 
 func TestParseTarget(t *testing.T) {
@@ -84,6 +87,296 @@ func TestRemoteReadDirAndFile(t *testing.T) {
 	}
 	if string(chunked) != "hello chunked world" {
 		t.Fatalf("ReadFile(chunked) = %q", string(chunked))
+	}
+}
+
+func TestRemoteWalkReturnsSubtreeMetadata(t *testing.T) {
+	t.Parallel()
+
+	server := newTestRepoServer(t)
+	client := &Client{HTTPClient: server.Client()}
+
+	var entries []WalkEntry
+	err := client.Walk(server.URL+"/cvmfs/test.repo/containers/niimath", func(entry WalkEntry) error {
+		entries = append(entries, entry)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Walk() error = %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("Walk() returned %d entries, want 2", len(entries))
+	}
+	if entries[0].Path != "/containers/niimath" || !entries[0].Mode.IsDir() {
+		t.Fatalf("Walk()[0] = %#v", entries[0])
+	}
+	if entries[1].Path != "/containers/niimath/niimath" || entries[1].Mode.IsDir() {
+		t.Fatalf("Walk()[1] = %#v", entries[1])
+	}
+}
+
+func TestWalkDescendsIntoDescendantNestedCatalogs(t *testing.T) {
+	t.Parallel()
+
+	rootCatalogHash := strings.Repeat("a", 40)
+	containersCatalogHash := strings.Repeat("b", 40)
+	descendantCatalogHash := strings.Repeat("c", 40)
+	fileHash := strings.Repeat("d", 40)
+
+	rootCatalog := createCatalogDB(t, []string{
+		`CREATE TABLE catalog (md5path_1 INTEGER, md5path_2 INTEGER, parent_1 INTEGER, parent_2 INTEGER, hardlinks INTEGER, hash BLOB, size INTEGER, mode INTEGER, mtime INTEGER, mtimens INTEGER, flags INTEGER, name TEXT, symlink TEXT, uid INTEGER, gid INTEGER, xattr BLOB);`,
+		`CREATE TABLE nested_catalogs (path TEXT, sha1 TEXT, size INTEGER);`,
+		`INSERT INTO catalog VALUES (1, 1, 0, 0, 1, NULL, 0, 16877, 0, 0, 1, 'containers', '', 0, 0, NULL);`,
+		`INSERT INTO nested_catalogs VALUES ('containers', '` + containersCatalogHash + `', 0);`,
+	})
+	containersCatalog := createCatalogDB(t, []string{
+		`CREATE TABLE catalog (md5path_1 INTEGER, md5path_2 INTEGER, parent_1 INTEGER, parent_2 INTEGER, hardlinks INTEGER, hash BLOB, size INTEGER, mode INTEGER, mtime INTEGER, mtimens INTEGER, flags INTEGER, name TEXT, symlink TEXT, uid INTEGER, gid INTEGER, xattr BLOB);`,
+		`CREATE TABLE nested_catalogs (path TEXT, sha1 TEXT, size INTEGER);`,
+		`INSERT INTO catalog VALUES (2, 2, 0, 0, 1, NULL, 0, 16877, 0, 0, 1, 'containers', '', 0, 0, NULL);`,
+		`INSERT INTO catalog VALUES (3, 3, 2, 2, 1, NULL, 0, 16877, 0, 0, 1, 'niimath', '', 0, 0, NULL);`,
+		`INSERT INTO nested_catalogs VALUES ('containers/niimath', '` + descendantCatalogHash + `', 0);`,
+	})
+	descendantCatalog := createCatalogDB(t, []string{
+		`CREATE TABLE catalog (md5path_1 INTEGER, md5path_2 INTEGER, parent_1 INTEGER, parent_2 INTEGER, hardlinks INTEGER, hash BLOB, size INTEGER, mode INTEGER, mtime INTEGER, mtimens INTEGER, flags INTEGER, name TEXT, symlink TEXT, uid INTEGER, gid INTEGER, xattr BLOB);`,
+		`INSERT INTO catalog VALUES (4, 4, 3, 3, 1, NULL, 0, 16877, 0, 0, 1, 'usr', '', 0, 0, NULL);`,
+		`INSERT INTO catalog VALUES (5, 5, 4, 4, 1, X'` + strings.ToUpper(fileHash) + `', 2, 33188, 0, 0, 4, 'ok', '', 0, 0, NULL);`,
+	})
+
+	objects := map[string][]byte{
+		"/cvmfs/test.repo/.cvmfspublished":     []byte("C" + rootCatalogHash + "\nNtest.repo\n--\n"),
+		objectPath(rootCatalogHash, "C"):       compressZlib(t, rootCatalog),
+		objectPath(containersCatalogHash, "C"): compressZlib(t, containersCatalog),
+		objectPath(descendantCatalogHash, "C"): compressZlib(t, descendantCatalog),
+		objectPath(fileHash, ""):               compressZlib(t, []byte("ok")),
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, ok := objects[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(server.Close)
+
+	client := &Client{HTTPClient: server.Client()}
+	var got []string
+	err := client.Walk(server.URL+"/cvmfs/test.repo/containers/niimath", func(entry WalkEntry) error {
+		got = append(got, entry.Path)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Walk() error = %v", err)
+	}
+	if !slices.Contains(got, "/containers/niimath/usr/ok") {
+		t.Fatalf("Walk() paths = %#v, want descendant nested entry", got)
+	}
+}
+
+func TestReadDirDoesNotWalkDescendantNestedCatalogs(t *testing.T) {
+	t.Parallel()
+
+	rootCatalogHash := strings.Repeat("a", 40)
+	containersCatalogHash := strings.Repeat("b", 40)
+	descendantCatalogHash := strings.Repeat("c", 40)
+
+	rootCatalog := createCatalogDB(t, []string{
+		`CREATE TABLE catalog (md5path_1 INTEGER, md5path_2 INTEGER, parent_1 INTEGER, parent_2 INTEGER, hardlinks INTEGER, hash BLOB, size INTEGER, mode INTEGER, mtime INTEGER, mtimens INTEGER, flags INTEGER, name TEXT, symlink TEXT, uid INTEGER, gid INTEGER, xattr BLOB);`,
+		`CREATE TABLE nested_catalogs (path TEXT, sha1 TEXT, size INTEGER);`,
+		`INSERT INTO catalog VALUES (1, 1, 0, 0, 1, NULL, 0, 16877, 0, 0, 1, 'containers', '', 0, 0, NULL);`,
+		`INSERT INTO nested_catalogs VALUES ('containers', '` + containersCatalogHash + `', 0);`,
+	})
+	containersCatalog := createCatalogDB(t, []string{
+		`CREATE TABLE catalog (md5path_1 INTEGER, md5path_2 INTEGER, parent_1 INTEGER, parent_2 INTEGER, hardlinks INTEGER, hash BLOB, size INTEGER, mode INTEGER, mtime INTEGER, mtimens INTEGER, flags INTEGER, name TEXT, symlink TEXT, uid INTEGER, gid INTEGER, xattr BLOB);`,
+		`CREATE TABLE nested_catalogs (path TEXT, sha1 TEXT, size INTEGER);`,
+		`INSERT INTO catalog VALUES (2, 2, 0, 0, 1, NULL, 0, 16877, 0, 0, 1, 'containers', '', 0, 0, NULL);`,
+		`INSERT INTO catalog VALUES (3, 3, 2, 2, 1, NULL, 0, 16877, 0, 0, 1, 'niimath_1.0.20250804_20251016', '', 0, 0, NULL);`,
+		`INSERT INTO nested_catalogs VALUES ('containers/niimath_1.0.20250804_20251016', '` + descendantCatalogHash + `', 0);`,
+	})
+
+	requested := make([]string, 0, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requested = append(requested, r.URL.Path)
+		switch r.URL.Path {
+		case "/cvmfs/test.repo/.cvmfspublished":
+			_, _ = w.Write([]byte("C" + rootCatalogHash + "\nNtest.repo\n--\n"))
+		case objectPath(rootCatalogHash, "C"):
+			_, _ = w.Write(compressZlib(t, rootCatalog))
+		case objectPath(containersCatalogHash, "C"):
+			_, _ = w.Write(compressZlib(t, containersCatalog))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	client := &Client{HTTPClient: server.Client()}
+	entries, err := client.ReadDir(server.URL + "/cvmfs/test.repo/containers")
+	if err != nil {
+		t.Fatalf("ReadDir(/containers) error = %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "niimath_1.0.20250804_20251016" {
+		t.Fatalf("ReadDir(/containers) = %#v", entries)
+	}
+	for _, requestPath := range requested {
+		if requestPath == objectPath(descendantCatalogHash, "C") {
+			t.Fatalf("ReadDir(/containers) fetched descendant nested catalog %q", requestPath)
+		}
+	}
+}
+
+func TestRemoteReadUsesObjectCacheAfterServerShutdown(t *testing.T) {
+	t.Parallel()
+
+	server := newTestRepoServer(t)
+	cacheDir := t.TempDir()
+	client := &Client{
+		HTTPClient: server.Client(),
+		CacheDir:   cacheDir,
+	}
+
+	data, err := client.ReadFile(server.URL + "/cvmfs/test.repo/containers/niimath/niimath")
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(data) != "niimath-data" {
+		t.Fatalf("ReadFile() = %q, want %q", string(data), "niimath-data")
+	}
+
+	rootCatalogHash := strings.Repeat("1", 40)
+	nestedCatalogHash := strings.Repeat("2", 40)
+	fileHash := strings.Repeat("3", 40)
+	for _, tc := range []struct {
+		hash   string
+		suffix string
+	}{
+		{hash: rootCatalogHash, suffix: "C"},
+		{hash: nestedCatalogHash, suffix: "C"},
+		{hash: fileHash, suffix: ""},
+	} {
+		cachePath := CVMFSObjectCachePath(cacheDir, tc.hash, tc.suffix)
+		if _, err := os.Stat(cachePath); err != nil {
+			t.Fatalf("Stat(%q) error = %v", cachePath, err)
+		}
+	}
+	manifestPath := filepath.Join(cacheDir, "state", "test.repo", "manifest")
+	if _, err := os.Stat(manifestPath); err != nil {
+		t.Fatalf("Stat(%q) error = %v", manifestPath, err)
+	}
+
+	server.Close()
+
+	data, err = client.ReadFile(server.URL + "/cvmfs/test.repo/containers/niimath/niimath")
+	if err != nil {
+		t.Fatalf("ReadFile() using cache error = %v", err)
+	}
+	if string(data) != "niimath-data" {
+		t.Fatalf("cached ReadFile() = %q, want %q", string(data), "niimath-data")
+	}
+}
+
+func TestChunkedFileUsesCachedCompressedChunks(t *testing.T) {
+	t.Parallel()
+
+	server := newTestRepoServer(t)
+	cacheDir := t.TempDir()
+	client := &Client{
+		HTTPClient: server.Client(),
+		CacheDir:   cacheDir,
+	}
+
+	data, err := client.ReadFile(server.URL + "/cvmfs/test.repo/chunked.txt")
+	if err != nil {
+		t.Fatalf("ReadFile(chunked) error = %v", err)
+	}
+	if string(data) != "hello chunked world" {
+		t.Fatalf("ReadFile(chunked) = %q", string(data))
+	}
+
+	chunk1Hash := strings.Repeat("4", 40)
+	chunk2Hash := strings.Repeat("5", 40)
+	for _, tc := range []struct {
+		hash   string
+		suffix string
+	}{
+		{hash: chunk1Hash, suffix: "P"},
+		{hash: chunk2Hash, suffix: "P"},
+	} {
+		cachePath := CVMFSObjectCachePath(cacheDir, tc.hash, tc.suffix)
+		if _, err := os.Stat(cachePath); err != nil {
+			t.Fatalf("Stat(%q) error = %v", cachePath, err)
+		}
+	}
+	manifestPath := filepath.Join(cacheDir, "state", "test.repo", "manifest")
+	if _, err := os.Stat(manifestPath); err != nil {
+		t.Fatalf("Stat(%q) error = %v", manifestPath, err)
+	}
+
+	server.Close()
+
+	data, err = client.ReadFile(server.URL + "/cvmfs/test.repo/chunked.txt")
+	if err != nil {
+		t.Fatalf("ReadFile(chunked) using cache error = %v", err)
+	}
+	if string(data) != "hello chunked world" {
+		t.Fatalf("cached ReadFile(chunked) = %q", string(data))
+	}
+}
+
+func TestCVMFSObjectCachePathUsesTwoLevelFanout(t *testing.T) {
+	t.Parallel()
+
+	got := CVMFSObjectCachePath("/cache", "aabbccddeeff", "P")
+	want := filepath.Join("/cache", "objects", "aa", "bb", "ccddeeffP")
+	if got != want {
+		t.Fatalf("CVMFSObjectCachePath() = %q, want %q", got, want)
+	}
+}
+
+func TestShouldWalkNestedCatalog(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		nestedPath string
+		prefix     string
+		want       bool
+	}{
+		{name: "exact match", nestedPath: "/containers", prefix: "/containers", want: true},
+		{name: "prefix within nested", nestedPath: "/containers/niimath", prefix: "/containers/niimath/bin/niimath", want: true},
+		{name: "parent listing skips descendants", nestedPath: "/containers/niimath", prefix: "/containers", want: false},
+		{name: "unrelated path", nestedPath: "/apps", prefix: "/containers", want: false},
+	}
+
+	for _, tt := range tests {
+		if got := shouldWalkNestedCatalog(tt.nestedPath, tt.prefix); got != tt.want {
+			t.Fatalf("%s: shouldWalkNestedCatalog(%q, %q) = %v, want %v", tt.name, tt.nestedPath, tt.prefix, got, tt.want)
+		}
+	}
+}
+
+func TestLoadEntriesUsesSchemaColumnOrder(t *testing.T) {
+	t.Parallel()
+
+	dbBytes := createCatalogDB(t, []string{
+		`CREATE TABLE catalog (md5path_1 INTEGER, md5path_2 INTEGER, parent_1 INTEGER, parent_2 INTEGER, hardlinks INTEGER, hash BLOB, size INTEGER, mode INTEGER, mtime INTEGER, flags INTEGER, name TEXT, symlink TEXT, uid INTEGER, gid INTEGER, xattr BLOB, mtimens INTEGER);`,
+		`INSERT INTO catalog VALUES (1, 1, 0, 0, 1, NULL, 0, 16877, 123, 3, 'containers', '', 0, 0, NULL, 456);`,
+	})
+
+	db, err := intsqlite.ParseDatabase(dbBytes)
+	if err != nil {
+		t.Fatalf("ParseDatabase() error = %v", err)
+	}
+	entries, err := loadEntries(db, nil)
+	if err != nil {
+		t.Fatalf("loadEntries() error = %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("loadEntries() got %d entries, want 1", len(entries))
+	}
+	entry := entries[0]
+	if entry.Name != "containers" || entry.Flags != 3 || entry.Mtime != 123 || entry.MtimeNS != 456 {
+		t.Fatalf("loadEntries() = %#v", entry)
 	}
 }
 

@@ -14,6 +14,7 @@ func TestPrepareBootPlacesKernelAndDeviceTree(t *testing.T) {
 		MemoryBase: memBase,
 		MemorySize: uint64(len(mem)),
 		Cmdline:    "console=ttyS0",
+		Console:    true,
 		NumCPUs:    1,
 	})
 	if err != nil {

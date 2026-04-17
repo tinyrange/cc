@@ -15,12 +15,16 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
 const configPath = "/etc/ccx3-init.json"
+const guestQEMUPath = "/.pkg/qemu-x86_64"
+const initDurationMarker = "__CCX3_INIT_MS__:"
+const execTimingMarker = "__CCX3_TIMING__:"
 
 var consoleFD = 2
 var kmsgFD = -1
@@ -31,6 +35,7 @@ type config struct {
 	Env              []string `json:"env"`
 	WorkDir          string   `json:"workdir"`
 	Modules          []string `json:"modules"`
+	EmulatorTag      string   `json:"emulator_tag,omitempty"`
 	RootFSTag        string   `json:"rootfs_tag"`
 	Shares           []share  `json:"shares,omitempty"`
 	VsockPort        uint32   `json:"vsock_port,omitempty"`
@@ -138,6 +143,7 @@ func main() {
 }
 
 func run() error {
+	bootStart := time.Now()
 	fd, err := syscall.Open("/dev/console", syscall.O_RDWR, 0)
 	if err == nil {
 		consoleFD = fd
@@ -164,36 +170,42 @@ func run() error {
 	_ = syscall.Mount("proc", "/proc", "proc", 0, "")
 	_ = syscall.Mount("sysfs", "/sys", "sysfs", 0, "")
 
-	writeKernel("ccx3-init: loading modules")
+	writeStage(bootStart, "loading modules")
 	if err := loadModules(cfg.Modules); err != nil {
 		return err
 	}
-	writeKernel("ccx3-init: modules loaded")
-
+	writeStage(bootStart, "modules loaded")
 	if cfg.RootFSTag != "" {
-		writeKernel("ccx3-init: mounting rootfs")
-		if err := mountRootFS(cfg.RootFSTag); err != nil {
+		writeStage(bootStart, "mounting rootfs")
+		if err := mountRootFS(cfg.RootFSTag, cfg.EmulatorTag); err != nil {
 			return err
 		}
-		writeKernel("ccx3-init: rootfs mounted")
+		writeStage(bootStart, "rootfs mounted")
+		writeStage(bootStart, "configuring binfmt")
 		if err := configureBinfmt(); err != nil {
 			return fmt.Errorf("configure binfmt: %w", err)
 		}
+		writeStage(bootStart, "binfmt configured")
 	}
+	writeStage(bootStart, "changing workdir")
 	if err := os.Chdir(cfg.WorkDir); err != nil {
 		return fmt.Errorf("chdir %s: %w", cfg.WorkDir, err)
 	}
 
 	if len(cfg.Command) == 0 {
 		if cfg.VsockPort != 0 {
+			writeStage(bootStart, "connecting vsock control")
 			control, err := connectVsock(cfg.VsockPort)
 			if err != nil {
 				return fmt.Errorf("connect vsock control: %w", err)
 			}
 			defer control.Close()
 			if cfg.ReadyMarker != "" {
+				writeProtocolLineTo(control, initDurationMarker+itoa(int(time.Since(bootStart).Milliseconds())))
+				writeStage(bootStart, "sending ready marker")
 				writeProtocolLineTo(control, cfg.ReadyMarker)
 			}
+			writeStage(bootStart, "entering command loop")
 			return commandLoop(cfg, control)
 		}
 		if cfg.ReadyMarker != "" {
@@ -213,26 +225,25 @@ func run() error {
 	return fmt.Errorf("exec command returned unexpectedly")
 }
 
-func mountRootFS(tag string) error {
+func writeStage(start time.Time, stage string) {
+	line := fmt.Sprintf("ccx3-init: +%dms %s", time.Since(start).Milliseconds(), stage)
+	writeKernel(line)
+	writeConsole(line + "\n")
+}
+
+func mountRootFS(tag, emulatorTag string) error {
 	if err := os.MkdirAll("/mnt", 0o755); err != nil {
 		return fmt.Errorf("mkdir /mnt: %w", err)
 	}
 	if err := syscall.Mount(tag, "/mnt", "virtiofs", 0, ""); err != nil {
 		return fmt.Errorf("mount virtiofs %s: %w", tag, err)
 	}
-	if _, err := os.Stat("/ccx3/qemu-x86_64-static"); err == nil {
+	if emulatorTag != "" {
 		if err := os.MkdirAll("/mnt/.pkg", 0o755); err != nil {
 			return fmt.Errorf("mkdir /mnt/.pkg: %w", err)
 		}
-		if err := syscall.Mount("tmpfs", "/mnt/.pkg", "tmpfs", 0, "mode=0755"); err != nil {
-			return fmt.Errorf("mount tmpfs /mnt/.pkg: %w", err)
-		}
-		data, err := os.ReadFile("/ccx3/qemu-x86_64-static")
-		if err != nil {
-			return fmt.Errorf("read bundled qemu-x86_64-static: %w", err)
-		}
-		if err := os.WriteFile("/mnt/.pkg/qemu-x86_64-static", data, 0o755); err != nil {
-			return fmt.Errorf("write /mnt/.pkg/qemu-x86_64-static: %w", err)
+		if err := syscall.Mount(emulatorTag, "/mnt/.pkg", "virtiofs", 0, ""); err != nil {
+			return fmt.Errorf("mount emulator virtiofs %s: %w", emulatorTag, err)
 		}
 	}
 	if err := syscall.Chroot("/mnt"); err != nil {
@@ -258,7 +269,7 @@ func mountRootFS(tag string) error {
 }
 
 func configureBinfmt() error {
-	if _, err := os.Stat("/.pkg/qemu-x86_64-static"); err != nil {
+	if _, err := os.Stat(guestQEMUPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
@@ -275,7 +286,7 @@ func configureBinfmt() error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("stat qemu-x86_64 registration: %w", err)
 	}
-	const qemuX8664Registration = ":qemu-x86_64:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00:\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:/.pkg/qemu-x86_64-static:OCF"
+	const qemuX8664Registration = ":qemu-x86_64:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00:\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:" + guestQEMUPath + ":OCF"
 	if err := os.WriteFile("/proc/sys/fs/binfmt_misc/register", []byte(qemuX8664Registration), 0o644); err != nil {
 		return fmt.Errorf("register qemu-x86_64: %w", err)
 	}
@@ -318,6 +329,13 @@ func writeExecStderr(cfg config, control io.Writer, id, value string) {
 	writeProtocolLineTo(control, cfg.ErrorMarkerPref+id+":"+base64.StdEncoding.EncodeToString([]byte(value)))
 }
 
+func writeExecTiming(control io.Writer, id, phase string, start time.Time) {
+	if id == "" || phase == "" {
+		return
+	}
+	writeProtocolLineTo(control, execTimingMarker+id+":"+phase+":"+itoa(int(time.Since(start).Milliseconds())))
+}
+
 func appendFileContents(buf *strings.Builder, path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -337,12 +355,14 @@ func appendFileContents(buf *strings.Builder, path string) {
 
 func collectExecDiagnostics() string {
 	var buf strings.Builder
-	if info, err := os.Stat("/.pkg/qemu-x86_64-static"); err != nil {
-		buf.WriteString("/.pkg/qemu-x86_64-static: ")
+	if info, err := os.Stat(guestQEMUPath); err != nil {
+		buf.WriteString(guestQEMUPath)
+		buf.WriteString(": ")
 		buf.WriteString(err.Error())
 		buf.WriteString("\n")
 	} else {
-		buf.WriteString("/.pkg/qemu-x86_64-static mode: ")
+		buf.WriteString(guestQEMUPath)
+		buf.WriteString(" mode: ")
 		buf.WriteString(fmt.Sprintf("%#o", info.Mode()&0o777))
 		buf.WriteString("\n")
 	}
@@ -629,10 +649,13 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 
 func runManagedExec(cfg config, control io.Writer, id string, argv []string, env []string, workDir string, stdin io.ReadCloser, managed *managedExec, tty bool, cols int, rows int, cleanup func()) {
 	defer cleanup()
+	execStart := time.Now()
+	writeExecTiming(control, id, "recv", execStart)
 	if cfg.BeginMarker != "" {
 		writeProtocolLineTo(control, cfg.BeginMarker+id)
 	}
 	writeKernel("ccx3-init: exec " + strings.Join(argv, " "))
+	writeExecTiming(control, id, "start_begin", execStart)
 
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = env
@@ -784,6 +807,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		}
 		return
 	}
+	writeExecTiming(control, id, "started", execStart)
 	managed.setProcess(cmd.Process)
 	if ptySlave != nil {
 		_ = ptySlave.Close()
@@ -791,6 +815,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	}
 
 	waitErr := cmd.Wait()
+	writeExecTiming(control, id, "wait_done", execStart)
 	if tty {
 		_ = managed.closeStdin()
 	}
@@ -803,6 +828,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	for i := 0; i < cap(done); i++ {
 		<-done
 	}
+	writeExecTiming(control, id, "streams_done", execStart)
 
 	exitCode := 0
 	if waitErr != nil {
@@ -816,6 +842,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		}
 	}
 	if cfg.ExitMarkerPrefix != "" {
+		writeExecTiming(control, id, "exit_sent", execStart)
 		writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":"+itoa(exitCode))
 	}
 }

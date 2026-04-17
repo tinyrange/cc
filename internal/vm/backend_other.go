@@ -7,8 +7,9 @@ import (
 	"j5.nz/cc/internal/oci"
 )
 
-func NewRuntimeBackend(kernel *alpine.Manager, images *oci.Store) Backend {
+func NewRuntimeBackend(kernel *alpine.Manager, images *oci.Store, guestInitCache string) Backend {
 	_ = kernel
 	_ = images
+	_ = guestInitCache
 	return unsupportedBackend{}
 }

@@ -5,7 +5,10 @@ package vm
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/guestinit"
@@ -14,24 +17,37 @@ import (
 	"j5.nz/cc/internal/oci"
 )
 
-type runtimeBackend struct {
-	kernel *alpine.Manager
-	images *oci.Store
+var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
+
+func timingLog(format string, args ...any) {
+	if !debugTiming {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "ccx3 timing: "+format+"\n", args...)
 }
 
-func NewRuntimeBackend(kernel *alpine.Manager, images *oci.Store) Backend {
-	return &runtimeBackend{kernel: kernel, images: images}
+type runtimeBackend struct {
+	kernel         *alpine.Manager
+	images         *oci.Store
+	guestInitCache string
+}
+
+func NewRuntimeBackend(kernel *alpine.Manager, images *oci.Store, guestInitCache string) Backend {
+	return &runtimeBackend{kernel: kernel, images: images, guestInitCache: guestInitCache}
 }
 
 func (b *runtimeBackend) Start(ctx context.Context, req client.CreateInstanceRequest) (Instance, error) {
+	start := time.Now()
 	runReq, err := b.buildStartRequest(ctx, req)
 	if err != nil {
 		return nil, err
 	}
+	timingLog("runtime.Start buildStartRequest took=%s image=%q", time.Since(start), req.Image)
 	session, err := hvf.StartContainer(ctx, runReq)
 	if err != nil {
 		return nil, err
 	}
+	timingLog("runtime.Start hvf.StartContainer took=%s image=%q", time.Since(start), req.Image)
 	return session, nil
 }
 
@@ -51,6 +67,7 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 }
 
 func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, memoryMB uint64, cpus int, dmesg bool) (hvf.ContainerRunRequest, error) {
+	start := time.Now()
 	if b.kernel == nil || b.images == nil {
 		return hvf.ContainerRunRequest{}, fmt.Errorf("runtime backend is not configured")
 	}
@@ -58,10 +75,12 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	if err != nil {
 		return hvf.ContainerRunRequest{}, err
 	}
+	timingLog("buildBaseRequest image open took=%s image=%q", time.Since(start), imageName)
 	kernel, err := b.kernel.ReadKernel()
 	if err != nil {
 		return hvf.ContainerRunRequest{}, err
 	}
+	timingLog("buildBaseRequest ReadKernel took=%s image=%q", time.Since(start), imageName)
 	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS"}
 	moduleMap := map[string]string{
 		"CONFIG_VIRTIO_MMIO":     "kernel/drivers/virtio/virtio_mmio.ko.gz",
@@ -78,23 +97,30 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	if err != nil {
 		return hvf.ContainerRunRequest{}, err
 	}
-	qemuX8664, err := loadAMD64Emulator(ctx, image, b.kernel.ReadPackageFile)
+	timingLog("buildBaseRequest PlanModuleLoad took=%s image=%q modules=%d", time.Since(start), imageName, len(modules))
+	qemuX8664, err := loadAMD64Emulator(ctx, image, b.kernel.ExtractPackageFile)
 	if err != nil {
 		return hvf.ContainerRunRequest{}, err
 	}
-	initBin, err := guestinit.Build(ctx, filepath.Join(b.images.Root(), "_guestinit"))
+	timingLog("buildBaseRequest loadAMD64Emulator took=%s image=%q emulator_path=%q", time.Since(start), imageName, qemuX8664)
+	guestInitCache := b.guestInitCache
+	if guestInitCache == "" {
+		guestInitCache = filepath.Join(b.images.Root(), "_guestinit")
+	}
+	initBin, err := guestinit.Build(ctx, guestInitCache)
 	if err != nil {
 		return hvf.ContainerRunRequest{}, err
 	}
+	timingLog("buildBaseRequest guestinit.Build took=%s image=%q init_bytes=%d", time.Since(start), imageName, len(initBin))
 	return hvf.ContainerRunRequest{
-		Kernel:        kernel,
-		Init:          initBin,
-		AMD64Emulator: qemuX8664,
-		Modules:       modules,
-		Image:         image,
-		MemoryMB:      memoryMB,
-		CPUs:          cpus,
-		Dmesg:         dmesg,
+		Kernel:            kernel,
+		Init:              initBin,
+		AMD64EmulatorPath: qemuX8664,
+		Modules:           modules,
+		Image:             image,
+		MemoryMB:          memoryMB,
+		CPUs:              cpus,
+		Dmesg:             dmesg,
 	}, ctx.Err()
 }
 

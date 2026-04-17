@@ -14,12 +14,21 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"j5.nz/cc/client"
 )
+
+var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
+
+func timingLog(format string, args ...any) {
+	if !debugTiming {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "ccx3 timing: "+format+"\n", args...)
+}
 
 const (
 	defaultMirror  = "https://dl-cdn.alpinelinux.org"
@@ -36,9 +45,19 @@ type Manager struct {
 	packageName string
 	httpClient  *http.Client
 
-	mu          sync.Mutex
-	downloading bool
-	lastErr     error
+	mu           sync.Mutex
+	downloading  bool
+	lastErr      error
+	kernelBytes  []byte
+	kernelConfig map[string]Tristate
+	moduleDeps   map[string][]string
+	modulePrefix string
+	packageFiles map[string][]byte
+	modulePaths  map[string]string
+	packageIndex map[string]tarIndexEntry
+	repoIndexes  map[string]map[string]indexEntry
+	tarIndexes   map[string]map[string]tarIndexEntry
+	indexedTar   string
 }
 
 type metadata struct {
@@ -53,6 +72,12 @@ type indexEntry struct {
 	Name    string
 	Version string
 	Arch    string
+}
+
+type tarIndexEntry struct {
+	Offset int64
+	Size   int64
+	Mode   int64
 }
 
 type Tristate int
@@ -70,13 +95,18 @@ type Module struct {
 
 func NewManager(root string) *Manager {
 	return &Manager{
-		root:        root,
-		mirror:      defaultMirror,
-		version:     defaultVersion,
-		repo:        defaultRepo,
-		arch:        defaultArch(),
-		packageName: defaultPackageName(),
-		httpClient:  http.DefaultClient,
+		root:         root,
+		mirror:       defaultMirror,
+		version:      defaultVersion,
+		repo:         defaultRepo,
+		arch:         defaultArch(),
+		packageName:  defaultPackageName(),
+		httpClient:   http.DefaultClient,
+		packageFiles: map[string][]byte{},
+		modulePaths:  map[string]string{},
+		packageIndex: map[string]tarIndexEntry{},
+		repoIndexes:  map[string]map[string]indexEntry{},
+		tarIndexes:   map[string]map[string]tarIndexEntry{},
 	}
 }
 
@@ -91,49 +121,57 @@ func (m *Manager) PackagePath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return meta.PackageFile, nil
+	if strings.HasSuffix(meta.PackageFile, ".tar") {
+		return meta.PackageFile, nil
+	}
+	if !strings.HasSuffix(meta.PackageFile, ".apk") {
+		return meta.PackageFile, nil
+	}
+	tarPath := strings.TrimSuffix(meta.PackageFile, ".apk") + ".tar"
+	if _, err := os.Stat(tarPath); err == nil {
+		meta.PackageFile = tarPath
+		if err := m.writeMetadata(meta); err != nil {
+			return "", err
+		}
+		return tarPath, nil
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("stat kernel tar package: %w", err)
+	}
+	if err := decompressAPKToTar(meta.PackageFile, tarPath); err != nil {
+		return "", err
+	}
+	meta.PackageFile = tarPath
+	if err := m.writeMetadata(meta); err != nil {
+		return "", err
+	}
+	return tarPath, nil
 }
 
 func (m *Manager) ReadKernel() ([]byte, error) {
+	m.mu.Lock()
+	if len(m.kernelBytes) > 0 {
+		data := append([]byte(nil), m.kernelBytes...)
+		m.mu.Unlock()
+		return data, nil
+	}
+	m.mu.Unlock()
+
 	meta, err := m.readMetadata()
 	if err != nil {
 		return nil, err
 	}
-
-	f, err := os.Open(meta.PackageFile)
-	if err != nil {
-		return nil, fmt.Errorf("open kernel package: %w", err)
-	}
-	defer f.Close()
-
-	gzr, err := gzip.NewReader(f)
-	if err != nil {
-		return nil, fmt.Errorf("open kernel package gzip: %w", err)
-	}
-	defer gzr.Close()
-
-	tr := tar.NewReader(gzr)
 	candidates := []string{"boot/vmlinuz-virt", "boot/vmlinuz-lts"}
-	for {
-		hdr, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			return nil, fmt.Errorf("kernel image not found in package")
+	for _, candidate := range candidates {
+		data, err := m.readRawPackageFile(candidate)
+		if err == nil {
+			m.mu.Lock()
+			m.kernelBytes = append(m.kernelBytes[:0], data...)
+			cached := append([]byte(nil), m.kernelBytes...)
+			m.mu.Unlock()
+			return cached, nil
 		}
-		if err != nil {
-			return nil, fmt.Errorf("read kernel package tar: %w", err)
-		}
-		if hdr.Typeflag != tar.TypeReg {
-			continue
-		}
-		if !slices.Contains(candidates, hdr.Name) {
-			continue
-		}
-		data, err := io.ReadAll(tr)
-		if err != nil {
-			return nil, fmt.Errorf("read kernel image %q: %w", hdr.Name, err)
-		}
-		return data, nil
 	}
+	return nil, fmt.Errorf("kernel image not found in package %s", meta.PackageFile)
 }
 
 func (m *Manager) KernelVersion() (string, error) {
@@ -149,14 +187,17 @@ func (m *Manager) KernelVersion() (string, error) {
 }
 
 func (m *Manager) PlanModuleLoad(configVars []string, moduleMap map[string]string) ([]Module, error) {
+	start := time.Now()
 	config, err := m.readKernelConfig()
 	if err != nil {
 		return nil, err
 	}
+	timingLog("kernel.PlanModuleLoad readKernelConfig took=%s", time.Since(start))
 	depends, prefix, err := m.readModuleDependencies()
 	if err != nil {
 		return nil, err
 	}
+	timingLog("kernel.PlanModuleLoad readModuleDependencies took=%s", time.Since(start))
 
 	var planned []Module
 	seen := map[string]bool{}
@@ -173,10 +214,12 @@ func (m *Manager) PlanModuleLoad(configVars []string, moduleMap map[string]strin
 			}
 		}
 
+		moduleStart := time.Now()
 		data, err := m.readModuleFile(prefix + name)
 		if err != nil {
 			return fmt.Errorf("read module %q: %w", name, err)
 		}
+		timingLog("kernel.PlanModuleLoad readModuleFile module=%q took=%s bytes=%d", name, time.Since(moduleStart), len(data))
 		planned = append(planned, Module{Name: strings.TrimSuffix(filepath.Base(name), ".ko.gz"), Data: data})
 		return nil
 	}
@@ -201,6 +244,7 @@ func (m *Manager) PlanModuleLoad(configVars []string, moduleMap map[string]strin
 		}
 	}
 
+	timingLog("kernel.PlanModuleLoad total=%s modules=%d", time.Since(start), len(planned))
 	return planned, nil
 }
 
@@ -257,6 +301,11 @@ func (m *Manager) ensureDownloaded(ctx context.Context) error {
 	if err := os.MkdirAll(m.root, 0o755); err != nil {
 		return fmt.Errorf("create kernel cache dir: %w", err)
 	}
+	if meta, err := m.readMetadata(); err == nil {
+		if _, statErr := os.Stat(meta.PackageFile); statErr == nil {
+			return nil
+		}
+	}
 
 	entry, err := m.fetchIndexEntry(ctx)
 	if err != nil {
@@ -268,62 +317,68 @@ func (m *Manager) ensureDownloaded(ctx context.Context) error {
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return fmt.Errorf("create kernel package dir: %w", err)
 	}
-	destPath := filepath.Join(destDir, filename)
+	apkPath := filepath.Join(destDir, filename)
+	tarPath := filepath.Join(destDir, fmt.Sprintf("%s-%s.tar", entry.Name, entry.Version))
 
-	if err := m.downloadFile(ctx, m.packageURL(filename), destPath); err != nil {
+	if err := m.downloadFile(ctx, m.packageURL(filename), apkPath); err != nil {
 		return err
 	}
+	if err := decompressAPKToTar(apkPath, tarPath); err != nil {
+		return err
+	}
+	_ = os.Remove(apkPath)
 
 	meta := metadata{
 		Version:     entry.Version,
 		Source:      m.sourceName(),
 		PackageName: entry.Name,
-		PackageFile: destPath,
+		PackageFile: tarPath,
 		Arch:        entry.Arch,
 	}
 
-	buf, err := json.MarshalIndent(meta, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal kernel metadata: %w", err)
+	if err := m.writeMetadata(meta); err != nil {
+		return err
 	}
-	if err := os.WriteFile(m.metadataPath(), buf, 0o644); err != nil {
-		return fmt.Errorf("write kernel metadata: %w", err)
-	}
+	m.mu.Lock()
+	m.kernelBytes = nil
+	m.kernelConfig = nil
+	m.moduleDeps = nil
+	m.modulePrefix = ""
+	m.packageFiles = map[string][]byte{}
+	m.modulePaths = map[string]string{}
+	m.packageIndex = map[string]tarIndexEntry{}
+	m.indexedTar = ""
+	m.mu.Unlock()
 
 	return nil
 }
 
 func (m *Manager) readKernelConfig() (map[string]Tristate, error) {
-	packagePath, err := m.PackagePath()
+	m.mu.Lock()
+	if len(m.kernelConfig) > 0 {
+		cfg := make(map[string]Tristate, len(m.kernelConfig))
+		for key, value := range m.kernelConfig {
+			cfg[key] = value
+		}
+		m.mu.Unlock()
+		return cfg, nil
+	}
+	m.mu.Unlock()
+
+	index, _, err := m.ensurePackageIndex()
 	if err != nil {
 		return nil, err
 	}
-	f, err := os.Open(packagePath)
-	if err != nil {
-		return nil, fmt.Errorf("open kernel package: %w", err)
-	}
-	defer f.Close()
-
-	gzr, err := gzip.NewReader(f)
-	if err != nil {
-		return nil, fmt.Errorf("open kernel package gzip: %w", err)
-	}
-	defer gzr.Close()
-
-	tr := tar.NewReader(gzr)
-	config := map[string]Tristate{}
-	for {
-		hdr, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("read kernel package tar: %w", err)
-		}
-		if hdr.Typeflag != tar.TypeReg || !strings.HasPrefix(hdr.Name, "boot/config-") {
+	for path := range index {
+		if !strings.HasPrefix(path, "boot/config-") {
 			continue
 		}
-		scanner := bufio.NewScanner(tr)
+		data, err := m.readRawPackageFile(path)
+		if err != nil {
+			return nil, err
+		}
+		config := map[string]Tristate{}
+		scanner := bufio.NewScanner(bytes.NewReader(data))
 		for scanner.Scan() {
 			line := scanner.Text()
 			switch {
@@ -346,12 +401,31 @@ func (m *Manager) readKernelConfig() (map[string]Tristate, error) {
 		if err := scanner.Err(); err != nil {
 			return nil, fmt.Errorf("scan kernel config: %w", err)
 		}
-		return config, nil
+		m.mu.Lock()
+		m.kernelConfig = make(map[string]Tristate, len(config))
+		for key, value := range config {
+			m.kernelConfig[key] = value
+		}
+		cached := make(map[string]Tristate, len(m.kernelConfig))
+		for key, value := range m.kernelConfig {
+			cached[key] = value
+		}
+		m.mu.Unlock()
+		return cached, nil
 	}
 	return nil, fmt.Errorf("kernel config not found in package")
 }
 
 func (m *Manager) readModuleDependencies() (map[string][]string, string, error) {
+	m.mu.Lock()
+	if len(m.moduleDeps) > 0 && m.modulePrefix != "" {
+		deps := cloneModuleDeps(m.moduleDeps)
+		prefix := m.modulePrefix
+		m.mu.Unlock()
+		return deps, prefix, nil
+	}
+	m.mu.Unlock()
+
 	path, err := m.findModuleFile("modules.dep")
 	if err != nil {
 		return nil, "", err
@@ -383,39 +457,36 @@ func (m *Manager) readModuleDependencies() (map[string][]string, string, error) 
 	if err := scanner.Err(); err != nil {
 		return nil, "", fmt.Errorf("scan modules.dep: %w", err)
 	}
-	return depends, prefix, nil
+	m.mu.Lock()
+	m.moduleDeps = cloneModuleDeps(depends)
+	m.modulePrefix = prefix
+	deps := cloneModuleDeps(m.moduleDeps)
+	cachedPrefix := m.modulePrefix
+	m.mu.Unlock()
+	return deps, cachedPrefix, nil
 }
 
 func (m *Manager) findModuleFile(suffix string) (string, error) {
-	packagePath, err := m.PackagePath()
+	m.mu.Lock()
+	if path := m.modulePaths[suffix]; path != "" {
+		m.mu.Unlock()
+		return path, nil
+	}
+	m.mu.Unlock()
+
+	index, _, err := m.ensurePackageIndex()
 	if err != nil {
 		return "", err
 	}
-	f, err := os.Open(packagePath)
-	if err != nil {
-		return "", fmt.Errorf("open kernel package: %w", err)
-	}
-	defer f.Close()
-
-	gzr, err := gzip.NewReader(f)
-	if err != nil {
-		return "", fmt.Errorf("open kernel package gzip: %w", err)
-	}
-	defer gzr.Close()
-
-	tr := tar.NewReader(gzr)
-	for {
-		hdr, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			return "", fmt.Errorf("module file with suffix %q not found", suffix)
-		}
-		if err != nil {
-			return "", fmt.Errorf("read kernel package tar: %w", err)
-		}
-		if hdr.Typeflag == tar.TypeReg && strings.HasSuffix(hdr.Name, suffix) {
-			return hdr.Name, nil
+	for path := range index {
+		if strings.HasSuffix(path, suffix) {
+			m.mu.Lock()
+			m.modulePaths[suffix] = path
+			m.mu.Unlock()
+			return path, nil
 		}
 	}
+	return "", fmt.Errorf("module file with suffix %q not found", suffix)
 }
 
 func (m *Manager) readModuleFile(path string) ([]byte, error) {
@@ -438,40 +509,55 @@ func (m *Manager) readModuleFile(path string) ([]byte, error) {
 }
 
 func (m *Manager) readRawPackageFile(path string) ([]byte, error) {
+	start := time.Now()
+	m.mu.Lock()
+	if data, ok := m.packageFiles[path]; ok {
+		cached := append([]byte(nil), data...)
+		m.mu.Unlock()
+		timingLog("kernel.readRawPackageFile cache_hit path=%q took=%s bytes=%d", path, time.Since(start), len(cached))
+		return cached, nil
+	}
+	m.mu.Unlock()
+
 	packagePath, err := m.PackagePath()
 	if err != nil {
 		return nil, err
 	}
-	f, err := os.Open(packagePath)
+	index, tarPath, err := m.ensurePackageIndex()
+	if err != nil {
+		return nil, err
+	}
+	entry, ok := index[path]
+	if !ok {
+		return nil, fmt.Errorf("package file %q not found", path)
+	}
+	f, err := os.Open(tarPath)
 	if err != nil {
 		return nil, fmt.Errorf("open kernel package: %w", err)
 	}
 	defer f.Close()
-
-	gzr, err := gzip.NewReader(f)
-	if err != nil {
-		return nil, fmt.Errorf("open kernel package gzip: %w", err)
+	data := make([]byte, entry.Size)
+	n, err := f.ReadAt(data, entry.Offset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("read package file %q: %w", path, err)
 	}
-	defer gzr.Close()
-
-	tr := tar.NewReader(gzr)
-	for {
-		hdr, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			return nil, fmt.Errorf("package file %q not found", path)
-		}
-		if err != nil {
-			return nil, fmt.Errorf("read kernel package tar: %w", err)
-		}
-		if hdr.Typeflag != tar.TypeReg || hdr.Name != path {
-			continue
-		}
-		data, err := io.ReadAll(tr)
-		if err != nil {
-			return nil, fmt.Errorf("read package file %q: %w", path, err)
-		}
-		return data, nil
+	if int64(n) != entry.Size {
+		return nil, fmt.Errorf("read package file %q: short read %d/%d", path, n, entry.Size)
 	}
+	m.mu.Lock()
+	m.packageFiles[path] = append([]byte(nil), data...)
+	cached := append([]byte(nil), m.packageFiles[path]...)
+	m.mu.Unlock()
+	timingLog("kernel.readRawPackageFile cache_miss path=%q took=%s bytes=%d package=%q", path, time.Since(start), len(cached), packagePath)
+	return cached, nil
+}
+
+func cloneModuleDeps(src map[string][]string) map[string][]string {
+	out := make(map[string][]string, len(src))
+	for key, value := range src {
+		out[key] = append([]string(nil), value...)
+	}
+	return out
 }
 
 func (m *Manager) fetchIndexEntry(ctx context.Context) (indexEntry, error) {
@@ -536,6 +622,116 @@ func (m *Manager) downloadFile(ctx context.Context, url, destPath string) error 
 	if err := os.Rename(tmpPath, destPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("finalize kernel package: %w", err)
+	}
+	return nil
+}
+
+func (m *Manager) ensurePackageIndex() (map[string]tarIndexEntry, string, error) {
+	packagePath, err := m.PackagePath()
+	if err != nil {
+		return nil, "", err
+	}
+
+	m.mu.Lock()
+	if m.indexedTar == packagePath && len(m.packageIndex) > 0 {
+		index := make(map[string]tarIndexEntry, len(m.packageIndex))
+		for path, entry := range m.packageIndex {
+			index[path] = entry
+		}
+		m.mu.Unlock()
+		return index, packagePath, nil
+	}
+	m.mu.Unlock()
+
+	index, err := buildTarIndex(packagePath)
+	if err != nil {
+		return nil, "", err
+	}
+
+	m.mu.Lock()
+	m.packageIndex = make(map[string]tarIndexEntry, len(index))
+	for path, entry := range index {
+		m.packageIndex[path] = entry
+	}
+	m.indexedTar = packagePath
+	cached := make(map[string]tarIndexEntry, len(m.packageIndex))
+	for path, entry := range m.packageIndex {
+		cached[path] = entry
+	}
+	m.mu.Unlock()
+	return cached, packagePath, nil
+}
+
+func buildTarIndex(packagePath string) (map[string]tarIndexEntry, error) {
+	f, err := os.Open(packagePath)
+	if err != nil {
+		return nil, fmt.Errorf("open kernel package: %w", err)
+	}
+	defer f.Close()
+
+	cr := &countingReader{r: f}
+	tr := tar.NewReader(cr)
+	index := make(map[string]tarIndexEntry)
+	for {
+		hdr, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return index, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read kernel package tar: %w", err)
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			continue
+		}
+		index[hdr.Name] = tarIndexEntry{
+			Offset: cr.n,
+			Size:   hdr.Size,
+			Mode:   int64(hdr.FileInfo().Mode().Perm()),
+		}
+	}
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	r.n += int64(n)
+	return n, err
+}
+
+func decompressAPKToTar(srcPath, destPath string) error {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return fmt.Errorf("open kernel package apk: %w", err)
+	}
+	defer src.Close()
+
+	gzr, err := gzip.NewReader(src)
+	if err != nil {
+		return fmt.Errorf("open kernel package gzip: %w", err)
+	}
+	defer gzr.Close()
+
+	tmpPath := destPath + ".tmp"
+	dst, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("create kernel tar file: %w", err)
+	}
+	if _, err := io.Copy(dst, gzr); err != nil {
+		dst.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("write kernel tar file: %w", err)
+	}
+	if err := dst.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close kernel tar file: %w", err)
+	}
+	if err := os.Rename(tmpPath, destPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("finalize kernel tar file: %w", err)
 	}
 	return nil
 }
@@ -619,6 +815,17 @@ func (m *Manager) readMetadata() (metadata, error) {
 		return ret, errors.New("kernel metadata is incomplete")
 	}
 	return ret, nil
+}
+
+func (m *Manager) writeMetadata(meta metadata) error {
+	buf, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal kernel metadata: %w", err)
+	}
+	if err := os.WriteFile(m.metadataPath(), buf, 0o644); err != nil {
+		return fmt.Errorf("write kernel metadata: %w", err)
+	}
+	return nil
 }
 
 func (m *Manager) metadataPath() string {

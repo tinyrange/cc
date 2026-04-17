@@ -6,19 +6,32 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
+	intcvmfs "j5.nz/cc/internal/cvmfs"
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/macos"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/vm"
 )
+
+var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
+
+func timingLog(format string, args ...any) {
+	if !debugTiming {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "ccx3 timing: "+format+"\n", args...)
+}
 
 type server struct {
 	kernel *alpine.Manager
@@ -46,10 +59,10 @@ func main() {
 	}
 
 	srvState := &server{
-		kernel: alpine.NewManager(filepath.Join(rootCache, "kernel")),
+		kernel: alpine.NewManager(filepath.Join(sharedRuntimeRoot(), "kernel")),
 		images: oci.NewStore(filepath.Join(rootCache, "images")),
 	}
-	srvState.vms = vm.NewManagerWithBackend(vm.NewRuntimeBackend(srvState.kernel, srvState.images))
+	srvState.vms = vm.NewManagerWithBackend(vm.NewRuntimeBackend(srvState.kernel, srvState.images, filepath.Join(sharedRuntimeRoot(), "guestinit")))
 
 	l, err := net.Listen("tcp", *addr)
 	if err != nil {
@@ -133,12 +146,72 @@ func newMux(srvState *server, httpServer *http.Server) *http.ServeMux {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		state, err := srvState.images.Pull(r.Context(), imageName, req.Source)
+		source, err := req.SourceString()
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		state, err := srvState.images.Pull(r.Context(), imageName, source)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, state)
+	})
+
+	mux.HandleFunc("POST /cvmfs/list", func(w http.ResponseWriter, r *http.Request) {
+		var req client.CVMFSListRequest
+		if err := decodeRequiredJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		cvmfsClient := intcvmfs.NewClient()
+		cvmfsClient.CacheDir = strings.TrimSpace(req.CacheDir)
+		target := cvmfsTarget(req.Mirror, req.Repo, req.Path)
+		entries, err := cvmfsClient.ReadDir(target)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		resp := client.CVMFSListResponse{Entries: make([]client.CVMFSDirectoryEntry, 0, len(entries))}
+		basePath := ensureAbsolutePath(req.Path)
+		for _, entry := range entries {
+			kind := "file"
+			if entry.Mode.IsDir() {
+				kind = "directory"
+			} else if entry.Mode&fs.ModeSymlink != 0 {
+				kind = "symlink"
+			}
+			resp.Entries = append(resp.Entries, client.CVMFSDirectoryEntry{
+				Name: entry.Name,
+				Path: pathJoin(basePath, entry.Name),
+				Kind: kind,
+				Size: entry.Size,
+			})
+		}
+		writeJSON(w, http.StatusOK, resp)
+	})
+
+	mux.HandleFunc("POST /cvmfs/read", func(w http.ResponseWriter, r *http.Request) {
+		var req client.CVMFSReadRequest
+		if err := decodeRequiredJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		cvmfsClient := intcvmfs.NewClient()
+		cvmfsClient.CacheDir = strings.TrimSpace(req.CacheDir)
+		target := cvmfsTarget(req.Mirror, req.Repo, req.Path)
+		data, eof, err := cvmfsClient.ReadFileRange(target, req.Offset, req.Length)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, client.CVMFSReadResponse{
+			Path:   ensureAbsolutePath(req.Path),
+			Offset: req.Offset,
+			Data:   data,
+			EOF:    eof,
+		})
 	})
 
 	mux.HandleFunc("GET /vm/supported", func(w http.ResponseWriter, r *http.Request) {
@@ -154,27 +227,33 @@ func newMux(srvState *server, httpServer *http.Server) *http.ServeMux {
 		writeJSON(w, http.StatusOK, srvState.vms.Status())
 	})
 	mux.HandleFunc("POST /vm", func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
 		var req client.CreateInstanceRequest
 		if err := decodeRequiredJSON(r, &req); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		timingLog("POST /vm decode took=%s image=%q", time.Since(start), req.Image)
 		if _, err := srvState.images.Get(req.Image); err != nil {
 			writeError(w, http.StatusBadRequest, fmt.Errorf("image %q is not available", req.Image))
 			return
 		}
+		timingLog("POST /vm image lookup took=%s", time.Since(start))
 		if srvState.kernel.Status().Status != "downloaded" {
 			if err := srvState.kernel.Ensure(r.Context()); err != nil {
 				writeError(w, http.StatusInternalServerError, err)
 				return
 			}
 		}
+		timingLog("POST /vm kernel ensure/status took=%s", time.Since(start))
 		state, err := srvState.vms.Start(r.Context(), req)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		timingLog("POST /vm vms.Start took=%s", time.Since(start))
 		writeJSON(w, http.StatusOK, state)
+		timingLog("POST /vm total=%s", time.Since(start))
 	})
 	mux.HandleFunc("POST /vm/shutdown", func(w http.ResponseWriter, r *http.Request) {
 		if err := srvState.vms.Shutdown(r.Context()); err != nil {
@@ -233,6 +312,17 @@ func resolveCacheDir(arg string) (string, error) {
 	}
 	dir := filepath.Join(userCacheDir, "ccx3")
 	return dir, os.MkdirAll(dir, 0o755)
+}
+
+func sharedRuntimeRoot() string {
+	if root := strings.TrimSpace(os.Getenv("CCX3_RUNTIME_SHARED_CACHE_DIR")); root != "" {
+		return root
+	}
+	userCacheDir, err := os.UserCacheDir()
+	if err != nil || userCacheDir == "" {
+		return filepath.Join(os.TempDir(), "ccx3-runtime")
+	}
+	return filepath.Join(userCacheDir, "ccx3", "runtime")
 }
 
 func decodeRequiredJSON(r *http.Request, dst any) error {
@@ -323,4 +413,49 @@ func writeExecEventStream(w http.ResponseWriter, resp client.ExecResponse) {
 
 func writeError(w http.ResponseWriter, status int, err error) {
 	writeJSON(w, status, client.ErrorResponse{Error: err.Error()})
+}
+
+func cvmfsTarget(mirror, repo, innerPath string) string {
+	repo = strings.TrimSpace(repo)
+	pathValue := ensureAbsolutePath(innerPath)
+	mirror = strings.TrimRight(strings.TrimSpace(mirror), "/")
+	if mirror == "" {
+		return fmt.Sprintf("cvmfs://%s%s", repo, pathValue)
+	}
+	mirror = ensureCVMFSMirrorPath(mirror)
+	return fmt.Sprintf("%s/%s%s", mirror, repo, pathValue)
+}
+
+func pathJoin(base, name string) string {
+	base = ensureAbsolutePath(base)
+	if base == "/" {
+		return "/" + strings.TrimPrefix(name, "/")
+	}
+	return strings.TrimRight(base, "/") + "/" + strings.TrimPrefix(name, "/")
+}
+
+func ensureAbsolutePath(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "/"
+	}
+	if strings.HasPrefix(value, "/") {
+		return value
+	}
+	return "/" + value
+}
+
+func ensureCVMFSMirrorPath(mirror string) string {
+	mirror = strings.TrimRight(strings.TrimSpace(mirror), "/")
+	u, err := url.Parse(mirror)
+	if err != nil {
+		if !strings.HasSuffix(mirror, "/cvmfs") {
+			return mirror + "/cvmfs"
+		}
+		return mirror
+	}
+	if !strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/cvmfs") {
+		u.Path = strings.TrimRight(u.Path, "/") + "/cvmfs"
+	}
+	return strings.TrimRight(u.String(), "/")
 }

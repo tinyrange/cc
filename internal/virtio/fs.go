@@ -793,11 +793,13 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 			return nil, fmt.Errorf("virtio-fs missing flush backend for FLUSH node=%d fh=%d", nodeID, fh)
 		}
 		return reply(0, nil), nil
-	case fuseAccess, fusePoll:
+	case fuseAccess:
 		if f.Strict {
 			return nil, fmt.Errorf("virtio-fs unsupported opcode %s node=%d", fuseOpcodeName(opcode), nodeID)
 		}
 		return reply(-linuxENOSYS, nil), nil
+	case fusePoll:
+		return reply(0, make([]byte, 8)), nil
 	case fuseLseek:
 		if len(req) < fuseInHeaderSize+24 {
 			return nil, fmt.Errorf("virtio-fs LSEEK too short")
@@ -1096,8 +1098,14 @@ type imageFS struct {
 	nextNodeID uint64
 	nextHandle uint64
 	nodes      map[uint64]*imageNode
-	handles    map[uint64]uint64
+	handles    map[uint64]*imageHandle
 	dirHandles map[uint64][]dirEntry
+}
+
+type imageHandle struct {
+	nodeID uint64
+	reader io.ReaderAt
+	closer io.Closer
 }
 
 type imageNode struct {
@@ -1144,7 +1152,7 @@ func NewImageFS(root imagefs.Directory, statfsPath string) FSBackend {
 		nextNodeID: 2,
 		nextHandle: 1,
 		nodes:      map[uint64]*imageNode{},
-		handles:    map[uint64]uint64{},
+		handles:    map[uint64]*imageHandle{},
 		dirHandles: map[uint64][]dirEntry{},
 	}
 	if root == nil {
@@ -1820,14 +1828,27 @@ func (p *imageFS) Open(nodeID uint64, _ uint32) (uint64, int32) {
 	}
 	fh := p.nextHandle
 	p.nextHandle++
-	p.handles[fh] = nodeID
+	handle := &imageHandle{nodeID: nodeID}
+	if openable, ok := node.abstractFile.(imagefs.OpenReaderFile); ok {
+		reader, closer, err := openable.OpenReader()
+		if err != nil {
+			return 0, errnoFromError(err)
+		}
+		handle.reader = reader
+		handle.closer = closer
+	}
+	p.handles[fh] = handle
 	return fh, 0
 }
 
 func (p *imageFS) Release(_ uint64, fh uint64) {
 	p.mu.Lock()
+	handle := p.handles[fh]
 	delete(p.handles, fh)
 	p.mu.Unlock()
+	if handle != nil && handle.closer != nil {
+		_ = handle.closer.Close()
+	}
 }
 
 func (p *imageFS) Flush(_ uint64, _ uint64, _ uint64) int32 {
@@ -1836,14 +1857,22 @@ func (p *imageFS) Flush(_ uint64, _ uint64, _ uint64) int32 {
 
 func (p *imageFS) Read(nodeID uint64, fh uint64, off uint64, size uint32) ([]byte, int32) {
 	p.mu.Lock()
-	nid, ok := p.handles[fh]
+	handle, ok := p.handles[fh]
 	node := p.nodes[nodeID]
 	p.mu.Unlock()
-	if !ok || nid != nodeID || node == nil {
+	if !ok || handle == nil || handle.nodeID != nodeID || node == nil {
 		return nil, -linuxEBADF
 	}
 	if node.abstractFile == nil {
 		return nil, -linuxEIO
+	}
+	if handle.reader != nil {
+		buf := make([]byte, size)
+		n, err := handle.reader.ReadAt(buf, int64(off))
+		if err != nil && err != io.EOF {
+			return nil, errnoFromError(err)
+		}
+		return buf[:n], 0
 	}
 	data, err := node.abstractFile.ReadAt(off, size)
 	if err != nil {
@@ -1857,10 +1886,10 @@ func (p *imageFS) Read(nodeID uint64, fh uint64, off uint64, size uint32) ([]byt
 
 func (p *imageFS) Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32) (uint64, int32) {
 	p.mu.Lock()
-	nid, ok := p.handles[fh]
+	handle, ok := p.handles[fh]
 	node := p.nodes[nodeID]
 	p.mu.Unlock()
-	if !ok || nid != nodeID || node == nil {
+	if !ok || handle == nil || handle.nodeID != nodeID || node == nil {
 		return 0, -linuxEBADF
 	}
 	switch whence {

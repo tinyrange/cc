@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -21,6 +22,7 @@ import (
 	"sync"
 
 	"j5.nz/cc/client"
+	intcvmfs "j5.nz/cc/internal/cvmfs"
 	"j5.nz/cc/internal/fsmeta"
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/simg"
@@ -28,6 +30,7 @@ import (
 
 const defaultRegistry = "https://registry-1.docker.io/v2"
 const sharedCacheEnv = "CCX3_OCI_SHARED_CACHE_DIR"
+const sharedCacheSchemaVersion = "2"
 
 const (
 	SourceKindOCI   = "oci"
@@ -45,19 +48,20 @@ type Store struct {
 }
 
 type metadata struct {
-	Name         string      `json:"name"`
-	Source       string      `json:"source"`
-	SourceKind   string      `json:"source_kind,omitempty"`
-	Architecture string      `json:"architecture,omitempty"`
-	RootFSDir    string      `json:"rootfs_dir"`
-	MetadataPath string      `json:"metadata_path,omitempty"`
-	IndexPath    string      `json:"index_path,omitempty"`
-	Env          []string    `json:"env,omitempty"`
-	Entrypoint   []string    `json:"entrypoint,omitempty"`
-	Cmd          []string    `json:"cmd,omitempty"`
-	WorkingDir   string      `json:"working_dir,omitempty"`
-	User         string      `json:"user,omitempty"`
-	Labels       []labelPair `json:"labels,omitempty"`
+	Name          string      `json:"name"`
+	Source        string      `json:"source"`
+	SourceKind    string      `json:"source_kind,omitempty"`
+	CVMFSRootHash string      `json:"cvmfs_root_hash,omitempty"`
+	Architecture  string      `json:"architecture,omitempty"`
+	RootFSDir     string      `json:"rootfs_dir"`
+	MetadataPath  string      `json:"metadata_path,omitempty"`
+	IndexPath     string      `json:"index_path,omitempty"`
+	Env           []string    `json:"env,omitempty"`
+	Entrypoint    []string    `json:"entrypoint,omitempty"`
+	Cmd           []string    `json:"cmd,omitempty"`
+	WorkingDir    string      `json:"working_dir,omitempty"`
+	User          string      `json:"user,omitempty"`
+	Labels        []labelPair `json:"labels,omitempty"`
 }
 
 type labelPair struct {
@@ -229,6 +233,48 @@ func (s *Store) Open(name string) (*Image, error) {
 		}
 	}
 	rootFS := imagefs.NewHostFS(meta.RootFSDir, entries)
+	if meta.IndexPath != "" {
+		indexBuf, err := os.ReadFile(meta.IndexPath)
+		if err != nil {
+			return nil, fmt.Errorf("read fs index: %w", err)
+		}
+		index, err := decodeFSIndex(indexBuf)
+		if err != nil {
+			return nil, fmt.Errorf("decode fs index: %w", err)
+		}
+		if meta.SourceKind == SourceKindCVMFS {
+			cvmfsClient := &intcvmfs.Client{
+				HTTPClient: s.httpClient,
+				CacheDir:   cvmfsCacheDir(s.sharedRoot()),
+			}
+			rootFS, err = buildCVMFSIndexedRootFS(cvmfsClient, index)
+			if err != nil {
+				return nil, fmt.Errorf("build cvmfs rootfs: %w", err)
+			}
+		} else {
+			rootFS, err = buildIndexedRootFS(meta.RootFSDir, index)
+			if err != nil {
+				return nil, fmt.Errorf("build indexed rootfs: %w", err)
+			}
+		}
+		return &Image{
+			Name:         meta.Name,
+			Source:       meta.Source,
+			SourceKind:   meta.SourceKind,
+			Architecture: meta.Architecture,
+			RootFSDir:    meta.RootFSDir,
+			FSMetadata:   entries,
+			RootFS:       rootFS,
+			Config: RuntimeConfig{
+				Env:        append([]string(nil), meta.Env...),
+				Entrypoint: append([]string(nil), meta.Entrypoint...),
+				Cmd:        append([]string(nil), meta.Cmd...),
+				WorkingDir: meta.WorkingDir,
+				User:       meta.User,
+				Labels:     labelsFromPairs(meta.Labels),
+			},
+		}, nil
+	}
 	if meta.SourceKind == SourceKindSIMG {
 		rootFS, entries, arch, err := simg.BuildImageFS(filepath.Join(meta.RootFSDir, "rootfs.simg"))
 		if err != nil {
@@ -251,20 +297,6 @@ func (s *Store) Open(name string) (*Image, error) {
 				Labels:     labelsFromPairs(meta.Labels),
 			},
 		}, nil
-	}
-	if meta.IndexPath != "" {
-		indexBuf, err := os.ReadFile(meta.IndexPath)
-		if err != nil {
-			return nil, fmt.Errorf("read fs index: %w", err)
-		}
-		index, err := decodeFSIndex(indexBuf)
-		if err != nil {
-			return nil, fmt.Errorf("decode fs index: %w", err)
-		}
-		rootFS, err = buildIndexedRootFS(meta.RootFSDir, index)
-		if err != nil {
-			return nil, fmt.Errorf("build indexed rootfs: %w", err)
-		}
 	}
 	return &Image{
 		Name:         meta.Name,
@@ -358,7 +390,7 @@ func (s *Store) pullDirect(ctx context.Context, name string, spec SourceSpec) er
 	case SourceKindSIMG:
 		return s.pullSIMGDirect(ctx, name, spec)
 	case SourceKindCVMFS:
-		return fmt.Errorf("cvmfs image ingestion is not implemented yet")
+		return s.pullCVMFSDirect(ctx, name, spec)
 	default:
 		return fmt.Errorf("unsupported image source kind %q", spec.Kind)
 	}
@@ -377,6 +409,85 @@ func (s *Store) pullSIMGDirect(ctx context.Context, name string, spec SourceSpec
 	if err := s.fetchSIMG(ctx, spec.Raw, simgPath); err != nil {
 		return err
 	}
+	return s.finalizeSIMGImage(name, spec, imageDir, tmpDir, simgPath)
+}
+
+func (s *Store) pullCVMFSDirect(ctx context.Context, name string, spec SourceSpec) error {
+	_ = ctx
+	imageDir := s.imageDir(name)
+	tmpDir := imageDir + ".tmp"
+	if err := os.RemoveAll(tmpDir); err != nil {
+		return fmt.Errorf("remove temp image dir: %w", err)
+	}
+	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
+		return fmt.Errorf("create temp image dir: %w", err)
+	}
+	cvmfsClient := &intcvmfs.Client{
+		HTTPClient: s.httpClient,
+		CacheDir:   cvmfsCacheDir(s.sharedRoot()),
+	}
+	normalizedSource := normalizeCVMFSSource(spec.Raw)
+	rootTarget, isDir, err := resolveCVMFSRootTarget(cvmfsClient, normalizedSource)
+	if err != nil {
+		return err
+	}
+	if !isDir {
+		return fmt.Errorf("resolve cvmfs container root: %q is not a container directory", spec.Raw)
+	}
+	rootHash, err := cvmfsClient.ManifestRootHash(normalizedSource)
+	if err != nil {
+		return fmt.Errorf("read cvmfs manifest root hash: %w", err)
+	}
+	nodes, entries, arch, ok, err := loadCVMFSDirectoryIndexCache(cvmfsClient.CacheDir, rootHash, rootTarget)
+	if err != nil {
+		return fmt.Errorf("load cached cvmfs rootfs index: %w", err)
+	}
+	if !ok {
+		nodes, entries, arch, err = buildCVMFSDirectoryIndex(cvmfsClient, rootTarget)
+		if err != nil {
+			return fmt.Errorf("index cvmfs rootfs: %w", err)
+		}
+		if err := saveCVMFSDirectoryIndexCache(cvmfsClient.CacheDir, rootHash, rootTarget, nodes, entries, arch); err != nil {
+			return fmt.Errorf("cache cvmfs rootfs index: %w", err)
+		}
+	}
+	fsMetaBuf, err := json.MarshalIndent(entries, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal fs metadata: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "rootfs.metadata.json"), fsMetaBuf, 0o644); err != nil {
+		return fmt.Errorf("write fs metadata: %w", err)
+	}
+	indexBuf, err := encodeIndexedNodes(nodes)
+	if err != nil {
+		return fmt.Errorf("marshal fs index: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(tmpDir, "rootfs.index.json"), indexBuf, 0o644); err != nil {
+		return fmt.Errorf("write fs index: %w", err)
+	}
+	meta := metadata{
+		Name:          name,
+		Source:        spec.Raw,
+		SourceKind:    spec.Kind,
+		CVMFSRootHash: rootHash,
+		Architecture:  arch,
+		RootFSDir:     imageDir,
+		MetadataPath:  filepath.Join(imageDir, "rootfs.metadata.json"),
+		IndexPath:     filepath.Join(imageDir, "rootfs.index.json"),
+	}
+	if err := os.RemoveAll(imageDir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove old image dir: %w", err)
+	}
+	if err := os.Rename(tmpDir, imageDir); err != nil {
+		return fmt.Errorf("activate image dir: %w", err)
+	}
+	if err := s.writeMetadata(name, meta); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) finalizeSIMGImage(name string, spec SourceSpec, imageDir, tmpDir, simgPath string) error {
 	rootFS, entries, arch, err := simg.BuildImageFS(simgPath)
 	if err != nil {
 		return fmt.Errorf("index simg: %w", err)
@@ -408,6 +519,23 @@ func (s *Store) pullSIMGDirect(ctx context.Context, name string, spec SourceSpec
 		return err
 	}
 	return nil
+}
+
+func normalizeCVMFSSource(source string) string {
+	lower := strings.ToLower(source)
+	if strings.HasPrefix(lower, "http+cvmfs://") {
+		u, err := url.Parse("https://" + source[len("http+cvmfs://"):])
+		if err == nil {
+			queryPath := strings.TrimSpace(u.Query().Get("path"))
+			if queryPath != "" {
+				u.RawQuery = ""
+				u.Path = strings.TrimRight(u.Path, "/") + "/" + strings.TrimPrefix(path.Clean("/"+queryPath), "/")
+				return u.String()
+			}
+		}
+		return "https://" + source[len("http+cvmfs://"):]
+	}
+	return source
 }
 
 func (s *Store) fetchSIMG(ctx context.Context, source, destPath string) error {
@@ -573,6 +701,18 @@ func (s *Store) existingState(name string, spec SourceSpec) (client.ImageState, 
 	if meta.Source != spec.Raw || meta.SourceKind != spec.Kind {
 		return client.ImageState{}, false, nil
 	}
+	if spec.Kind == SourceKindCVMFS {
+		if meta.CVMFSRootHash == "" {
+			return client.ImageState{}, false, nil
+		}
+		currentHash, err := s.currentCVMFSRootHash(spec)
+		if err != nil {
+			return client.ImageState{}, false, err
+		}
+		if currentHash != meta.CVMFSRootHash {
+			return client.ImageState{}, false, nil
+		}
+	}
 	if !dirExists(meta.RootFSDir) {
 		return client.ImageState{}, false, nil
 	}
@@ -592,10 +732,33 @@ func (s *Store) restoreFromSharedCache(name string, spec SourceSpec) (client.Ima
 	if meta.Source != spec.Raw || meta.SourceKind != spec.Kind || !dirExists(meta.RootFSDir) {
 		return client.ImageState{}, false, nil
 	}
+	if spec.Kind == SourceKindCVMFS {
+		if meta.CVMFSRootHash == "" {
+			return client.ImageState{}, false, nil
+		}
+		currentHash, err := s.currentCVMFSRootHash(spec)
+		if err != nil {
+			return client.ImageState{}, false, err
+		}
+		if currentHash != meta.CVMFSRootHash {
+			return client.ImageState{}, false, nil
+		}
+	}
+	if !dirExists(meta.RootFSDir) {
+		return client.ImageState{}, false, nil
+	}
 	if err := s.cloneFromStore(shared, sharedName, name, spec); err != nil {
 		return client.ImageState{}, false, err
 	}
 	return client.ImageState{Name: name, Source: spec.Raw, SourceKind: spec.Kind, Status: "downloaded"}, true, nil
+}
+
+func (s *Store) currentCVMFSRootHash(spec SourceSpec) (string, error) {
+	cvmfsClient := &intcvmfs.Client{
+		HTTPClient: s.httpClient,
+		CacheDir:   cvmfsCacheDir(s.sharedRoot()),
+	}
+	return cvmfsClient.ManifestRootHash(normalizeCVMFSSource(spec.Raw))
 }
 
 func (s *Store) cloneFromStore(src *Store, srcName, dstName string, spec SourceSpec) error {
@@ -910,6 +1073,8 @@ func ParseSource(source string) (SourceSpec, error) {
 		return SourceSpec{Kind: SourceKindCVMFS, Raw: source}, nil
 	case strings.HasPrefix(lower, "cvmfs://"):
 		return SourceSpec{Kind: SourceKindCVMFS, Raw: source}, nil
+	case (strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")) && strings.Contains(lower, "/cvmfs/"):
+		return SourceSpec{Kind: SourceKindCVMFS, Raw: source}, nil
 	case strings.HasSuffix(lower, ".simg"), strings.HasSuffix(lower, ".sif"):
 		return SourceSpec{Kind: SourceKindSIMG, Raw: source}, nil
 	default:
@@ -1120,7 +1285,7 @@ func digestToFileName(digest string) string {
 }
 
 func sharedImageKey(spec SourceSpec) string {
-	sum := sha256.Sum256([]byte(nativeArch() + "\n" + spec.Kind + "\n" + spec.Raw))
+	sum := sha256.Sum256([]byte(sharedCacheSchemaVersion + "\n" + nativeArch() + "\n" + spec.Kind + "\n" + spec.Raw))
 	return hex.EncodeToString(sum[:16])
 }
 

@@ -1,7 +1,10 @@
 package cvmfs
 
 import (
+	"bytes"
 	"compress/zlib"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -55,8 +59,20 @@ type DirEntry struct {
 	ModTime time.Time
 }
 
+type WalkEntry struct {
+	Path    string
+	Mode    fs.FileMode
+	Size    int64
+	ModTime time.Time
+	UID     uint32
+	GID     uint32
+	RDev    uint32
+	Symlink string
+}
+
 type Client struct {
 	HTTPClient *http.Client
+	CacheDir   string
 }
 
 type manifest struct {
@@ -214,8 +230,118 @@ func (c *Client) ReadFile(target string) ([]byte, error) {
 	if !parsed.Remote {
 		return os.ReadFile(parsed.LocalPath)
 	}
+	if data, err := c.readCachedFile(parsed); err == nil {
+		return data, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
 	repo := c.newRepository(parsed)
-	return repo.ReadFile(parsed.Path)
+	data, err := repo.ReadFile(parsed.Path)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.writeCachedFile(parsed, data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func (c *Client) ReadFileRange(target string, offset, length int64) ([]byte, bool, error) {
+	if offset < 0 {
+		return nil, false, fmt.Errorf("offset must be >= 0")
+	}
+	if length < 0 {
+		return nil, false, fmt.Errorf("length must be >= 0")
+	}
+	parsed, err := ParseTarget(target)
+	if err != nil {
+		return nil, false, err
+	}
+	if !parsed.Remote {
+		data, err := os.ReadFile(parsed.LocalPath)
+		if err != nil {
+			return nil, false, err
+		}
+		return sliceRange(data, offset, length), endOfRange(data, offset, length), nil
+	}
+	cachePath := cvmfsFileCachePath(c.CacheDir, parsed.Repo, parsed.Path)
+	if file, err := os.Open(cachePath); err == nil {
+		defer file.Close()
+		info, statErr := file.Stat()
+		if statErr != nil {
+			return nil, false, statErr
+		}
+		if offset >= info.Size() {
+			return []byte{}, true, nil
+		}
+		end := info.Size()
+		if length > 0 && offset+length < end {
+			end = offset + length
+		}
+		buf := make([]byte, end-offset)
+		n, readErr := file.ReadAt(buf, offset)
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return nil, false, readErr
+		}
+		return buf[:n], end == info.Size(), nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, false, err
+	}
+	data, err := c.ReadFile(target)
+	if err != nil {
+		return nil, false, err
+	}
+	return sliceRange(data, offset, length), endOfRange(data, offset, length), nil
+}
+
+func sliceRange(data []byte, offset, length int64) []byte {
+	if offset >= int64(len(data)) {
+		return []byte{}
+	}
+	end := int64(len(data))
+	if length > 0 && offset+length < end {
+		end = offset + length
+	}
+	return append([]byte(nil), data[offset:end]...)
+}
+
+func endOfRange(data []byte, offset, length int64) bool {
+	if offset >= int64(len(data)) {
+		return true
+	}
+	end := int64(len(data))
+	if length > 0 && offset+length < end {
+		end = offset + length
+	}
+	return end == int64(len(data))
+}
+
+func (c *Client) Walk(target string, visit func(WalkEntry) error) error {
+	parsed, err := ParseTarget(target)
+	if err != nil {
+		return err
+	}
+	if !parsed.Remote {
+		return walkLocal(parsed.LocalPath, visit)
+	}
+	repo := c.newRepository(parsed)
+	return repo.Walk(parsed.Path, visit)
+}
+
+func (c *Client) ManifestRootHash(target string) (string, error) {
+	parsed, err := ParseTarget(target)
+	if err != nil {
+		return "", err
+	}
+	if !parsed.Remote {
+		return "", fmt.Errorf("manifest root hash is only available for remote CVMFS targets")
+	}
+	repo := c.newRepository(parsed)
+	manifest, err := repo.getManifest()
+	if err != nil {
+		return "", err
+	}
+	return manifest.RootCatalogHash, nil
 }
 
 func (c *Client) newRepository(target Target) *repository {
@@ -228,7 +354,7 @@ func (c *Client) newRepository(target Target) *repository {
 		httpClient = http.DefaultClient
 	}
 	return &repository{
-		client:   &Client{HTTPClient: httpClient},
+		client:   &Client{HTTPClient: httpClient, CacheDir: client.CacheDir},
 		mirror:   strings.TrimRight(target.Mirror, "/"),
 		repo:     target.Repo,
 		catalogs: map[string]*catalog{},
@@ -255,6 +381,44 @@ func readLocalDir(dir string) ([]DirEntry, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
+}
+
+func walkLocal(root string, visit func(WalkEntry) error) error {
+	root = filepath.Clean(root)
+	if _, err := os.Lstat(root); err != nil {
+		return err
+	}
+	return filepath.WalkDir(root, func(current string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		info, err := os.Lstat(current)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, current)
+		if err != nil {
+			return err
+		}
+		guestPath := "/"
+		if rel != "." {
+			guestPath = "/" + filepath.ToSlash(rel)
+		}
+		walkEntry := WalkEntry{
+			Path:    guestPath,
+			Mode:    info.Mode(),
+			Size:    info.Size(),
+			ModTime: info.ModTime(),
+		}
+		if info.Mode()&fs.ModeSymlink != 0 {
+			target, err := os.Readlink(current)
+			if err != nil {
+				return err
+			}
+			walkEntry.Symlink = target
+		}
+		return visit(walkEntry)
+	})
 }
 
 func (r *repository) ReadDir(dirPath string) ([]DirEntry, error) {
@@ -317,6 +481,34 @@ func (r *repository) ReadFile(filePath string) ([]byte, error) {
 	return r.readEntryData(*found)
 }
 
+func (r *repository) Walk(rootPath string, visit func(WalkEntry) error) error {
+	rootPath = path.Clean("/" + strings.TrimPrefix(rootPath, "/"))
+	found := false
+	err := r.walkPrefixWithNested(rootPath, shouldWalkNestedCatalogForWalk, func(ent catalogEntry) error {
+		if !isWithinPrefix(ent.FullPath, rootPath) {
+			return nil
+		}
+		found = true
+		return visit(WalkEntry{
+			Path:    ent.FullPath,
+			Mode:    linuxModeToGo(uint32(ent.Mode)),
+			Size:    ent.Size,
+			ModTime: time.Unix(ent.Mtime, ent.MtimeNS),
+			UID:     uint32(ent.UID),
+			GID:     uint32(ent.GID),
+			RDev:    0,
+			Symlink: ent.Symlink,
+		})
+	})
+	if err != nil {
+		return err
+	}
+	if !found {
+		return os.ErrNotExist
+	}
+	return nil
+}
+
 func (r *repository) readEntryData(ent catalogEntry) ([]byte, error) {
 	if ent.Flags&flagExternalFile == 0 && !ent.isChunked() {
 		return r.fetchDataObject(stringifyHash(ent.Hash), false)
@@ -339,15 +531,19 @@ func (r *repository) readEntryData(ent catalogEntry) ([]byte, error) {
 }
 
 func (r *repository) walkPrefix(prefix string, visit func(ent catalogEntry) error) error {
+	return r.walkPrefixWithNested(prefix, shouldWalkNestedCatalog, visit)
+}
+
+func (r *repository) walkPrefixWithNested(prefix string, shouldWalkNested func(string, string) bool, visit func(ent catalogEntry) error) error {
 	root, err := r.rootCatalog()
 	if err != nil {
 		return err
 	}
 	globalPaths := map[string]string{"0:0": "/"}
-	return r.walkCatalog(root, "/", prefix, globalPaths, visit)
+	return r.walkCatalog(root, "/", prefix, globalPaths, shouldWalkNested, visit)
 }
 
-func (r *repository) walkCatalog(cat *catalog, baseParent, prefix string, globalPaths map[string]string, visit func(ent catalogEntry) error) error {
+func (r *repository) walkCatalog(cat *catalog, baseParent, prefix string, globalPaths map[string]string, shouldWalkNested func(string, string) bool, visit func(ent catalogEntry) error) error {
 	local := make(map[string]catalogEntry, len(cat.entries))
 	for _, ent := range cat.entries {
 		local[ent.pathHash()] = ent
@@ -391,14 +587,14 @@ func (r *repository) walkCatalog(cat *catalog, baseParent, prefix string, global
 	}
 	for _, nested := range cat.nested {
 		nestedPath := path.Clean("/" + strings.TrimPrefix(nested.Path, "/"))
-		if !hasCommonFragment(nestedPath, prefix) {
+		if !shouldWalkNested(nestedPath, prefix) {
 			continue
 		}
 		child, err := r.openCatalog(nested.Sha1)
 		if err != nil {
 			return err
 		}
-		if err := r.walkCatalog(child, path.Dir(nestedPath), prefix, globalPaths, visit); err != nil {
+		if err := r.walkCatalog(child, path.Dir(nestedPath), prefix, globalPaths, shouldWalkNested, visit); err != nil {
 			return err
 		}
 	}
@@ -417,18 +613,42 @@ func (r *repository) getManifest() (*manifest, error) {
 	if r.manifest != nil {
 		return r.manifest, nil
 	}
+	body, err := r.fetchManifest()
+	if err != nil {
+		return nil, err
+	}
+	out, err := parseManifest(body)
+	if err != nil {
+		return nil, err
+	}
+	r.manifest = &out
+	return r.manifest, nil
+}
+
+func (r *repository) fetchManifest() ([]byte, error) {
 	resp, err := r.client.HTTPClient.Get(r.mirror + "/" + r.repo + "/.cvmfspublished")
-	if err != nil {
-		return nil, err
+	if err == nil {
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			err = fmt.Errorf("fetch manifest: unexpected status %s", resp.Status)
+		} else {
+			body, readErr := io.ReadAll(resp.Body)
+			if readErr != nil {
+				return nil, readErr
+			}
+			if writeErr := r.writeCachedManifest(body); writeErr != nil {
+				return nil, writeErr
+			}
+			return body, nil
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetch manifest: unexpected status %s", resp.Status)
+	if body, cacheErr := r.readCachedManifest(); cacheErr == nil {
+		return body, nil
 	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
+	return nil, err
+}
+
+func parseManifest(body []byte) (manifest, error) {
 	var out manifest
 	for _, line := range strings.Split(string(body), "\n") {
 		line = strings.TrimSpace(line)
@@ -441,10 +661,27 @@ func (r *repository) getManifest() (*manifest, error) {
 		}
 	}
 	if out.RootCatalogHash == "" {
-		return nil, fmt.Errorf("manifest missing root catalog hash")
+		return manifest{}, fmt.Errorf("manifest missing root catalog hash")
 	}
-	r.manifest = &out
-	return r.manifest, nil
+	return out, nil
+}
+
+func (r *repository) readCachedManifest() ([]byte, error) {
+	if r.client == nil || strings.TrimSpace(r.client.CacheDir) == "" {
+		return nil, os.ErrNotExist
+	}
+	return os.ReadFile(filepath.Join(r.client.CacheDir, "state", r.repo, "manifest"))
+}
+
+func (r *repository) writeCachedManifest(data []byte) error {
+	if r.client == nil || strings.TrimSpace(r.client.CacheDir) == "" {
+		return nil
+	}
+	manifestPath := filepath.Join(r.client.CacheDir, "state", r.repo, "manifest")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o755); err != nil {
+		return fmt.Errorf("create cvmfs manifest cache dir: %w", err)
+	}
+	return os.WriteFile(manifestPath, data, 0o644)
 }
 
 func (r *repository) openCatalog(hash string) (*catalog, error) {
@@ -468,15 +705,11 @@ func (r *repository) openCatalog(hash string) (*catalog, error) {
 }
 
 func (r *repository) fetchCatalogDB(hash string) ([]byte, error) {
-	resp, err := r.client.HTTPClient.Get(r.objectURL(hash, "C"))
+	raw, err := r.fetchCompressedObject(hash, "C")
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetch catalog: unexpected status %s", resp.Status)
-	}
-	zr, err := zlib.NewReader(resp.Body)
+	zr, err := zlib.NewReader(bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
@@ -489,20 +722,80 @@ func (r *repository) fetchDataObject(hash string, partial bool) ([]byte, error) 
 	if partial {
 		suffix = "P"
 	}
+	raw, err := r.fetchCompressedObject(hash, suffix)
+	if err != nil {
+		return nil, err
+	}
+	zr, err := zlib.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+	return io.ReadAll(zr)
+}
+
+func (r *repository) fetchCompressedObject(hash, suffix string) ([]byte, error) {
+	if data, err := r.readCachedObject(hash, suffix); err == nil {
+		return data, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+
 	resp, err := r.client.HTTPClient.Get(r.objectURL(hash, suffix))
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetch data object: unexpected status %s", resp.Status)
+		return nil, fmt.Errorf("fetch object: unexpected status %s", resp.Status)
 	}
-	zr, err := zlib.NewReader(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-	defer zr.Close()
-	return io.ReadAll(zr)
+	if err := r.writeCachedObject(hash, suffix, data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func (r *repository) readCachedObject(hash, suffix string) ([]byte, error) {
+	if r.client == nil || strings.TrimSpace(r.client.CacheDir) == "" {
+		return nil, os.ErrNotExist
+	}
+	return os.ReadFile(cvmfsObjectCachePath(r.client.CacheDir, hash, suffix))
+}
+
+func (r *repository) writeCachedObject(hash, suffix string, data []byte) error {
+	if r.client == nil || strings.TrimSpace(r.client.CacheDir) == "" {
+		return nil
+	}
+	cachePath := cvmfsObjectCachePath(r.client.CacheDir, hash, suffix)
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
+		return fmt.Errorf("create cvmfs cache dir: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(cachePath), "cvmfs-object-*")
+	if err != nil {
+		return fmt.Errorf("create cvmfs cache temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("write cvmfs cache temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close cvmfs cache temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, cachePath); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil
+		}
+		return fmt.Errorf("commit cvmfs cache object: %w", err)
+	}
+	return nil
 }
 
 func (r *repository) objectURL(hash, suffix string) string {
@@ -530,16 +823,10 @@ func loadEntries(db *intsqlite.SQLiteDatabase, chunks map[string][]catalogChunk)
 	if err != nil {
 		return nil, err
 	}
+	cols := tableColumnNames(tbl.Sql)
 	var out []catalogEntry
 	if err := tbl.Read(func(row []any) error {
-		byName := sliceToRowMap([]string{
-			"md5path_1", "md5path_2", "parent_1", "parent_2", "hardlinks", "hash", "size", "mode", "mtime", "mtimens", "flags", "name", "symlink", "uid", "gid", "xattr",
-		}, row)
-		if len(row) == 15 {
-			byName = sliceToRowMap([]string{
-				"md5path_1", "md5path_2", "parent_1", "parent_2", "hardlinks", "hash", "size", "mode", "mtime", "flags", "name", "symlink", "uid", "gid", "xattr",
-			}, row)
-		}
+		byName := sliceToRowMap(cols, row)
 		entry := catalogEntry{
 			Md5Path1: asInt64(byName["md5path_1"]),
 			Md5Path2: asInt64(byName["md5path_2"]),
@@ -576,11 +863,13 @@ func loadNestedCatalogs(db *intsqlite.SQLiteDatabase) ([]nestedCatalog, error) {
 	if err != nil {
 		return nil, err
 	}
+	cols := tableColumnNames(tbl.Sql)
 	var out []nestedCatalog
 	if err := tbl.Read(func(row []any) error {
+		byName := sliceToRowMap(cols, row)
 		out = append(out, nestedCatalog{
-			Path: asString(row[0]),
-			Sha1: asString(row[1]),
+			Path: asString(byName["path"]),
+			Sha1: asString(byName["sha1"]),
 		})
 		return nil
 	}); err != nil {
@@ -597,14 +886,16 @@ func loadChunks(db *intsqlite.SQLiteDatabase) (map[string][]catalogChunk, error)
 	if err != nil {
 		return nil, err
 	}
+	cols := tableColumnNames(tbl.Sql)
 	out := map[string][]catalogChunk{}
 	if err := tbl.Read(func(row []any) error {
+		byName := sliceToRowMap(cols, row)
 		chunk := catalogChunk{
-			Md5Path1: asInt64(row[0]),
-			Md5Path2: asInt64(row[1]),
-			Offset:   asInt64(row[2]),
-			Size:     asInt64(row[3]),
-			Hash:     asBytes(row[4]),
+			Md5Path1: asInt64(byName["md5path_1"]),
+			Md5Path2: asInt64(byName["md5path_2"]),
+			Offset:   asInt64(byName["offset"]),
+			Size:     asInt64(byName["size"]),
+			Hash:     asBytes(byName["hash"]),
 		}
 		key := fmt.Sprintf("%x:%x", chunk.Md5Path1, chunk.Md5Path2)
 		out[key] = append(out[key], chunk)
@@ -678,6 +969,33 @@ func sliceToRowMap(cols []string, values []any) map[string]any {
 	return out
 }
 
+func tableColumnNames(createSQL string) []string {
+	start := strings.IndexByte(createSQL, '(')
+	end := strings.LastIndexByte(createSQL, ')')
+	if start == -1 || end == -1 || end <= start {
+		return nil
+	}
+	defs := strings.Split(createSQL[start+1:end], ",")
+	cols := make([]string, 0, len(defs))
+	for _, def := range defs {
+		def = strings.TrimSpace(def)
+		if def == "" {
+			continue
+		}
+		field := strings.Fields(def)
+		if len(field) == 0 {
+			continue
+		}
+		name := strings.Trim(field[0], "`\"[]")
+		upper := strings.ToUpper(name)
+		if upper == "PRIMARY" || upper == "UNIQUE" || upper == "CONSTRAINT" || upper == "FOREIGN" || upper == "CHECK" {
+			continue
+		}
+		cols = append(cols, name)
+	}
+	return cols
+}
+
 func cleanRepoPath(escaped, raw string) string {
 	if escaped != "" {
 		if unescaped, err := url.PathUnescape(escaped); err == nil {
@@ -696,8 +1014,94 @@ func hasCommonFragment(a, b string) bool {
 	return len(b) > len(a) && strings.HasPrefix(b, a+"/")
 }
 
+func shouldWalkNestedCatalog(nestedPath, prefix string) bool {
+	nestedPath = path.Clean("/" + strings.TrimPrefix(nestedPath, "/"))
+	prefix = path.Clean("/" + strings.TrimPrefix(prefix, "/"))
+	if prefix == nestedPath {
+		return true
+	}
+	return len(prefix) > len(nestedPath) && strings.HasPrefix(prefix, nestedPath+"/")
+}
+
+func shouldWalkNestedCatalogForWalk(nestedPath, prefix string) bool {
+	nestedPath = path.Clean("/" + strings.TrimPrefix(nestedPath, "/"))
+	prefix = path.Clean("/" + strings.TrimPrefix(prefix, "/"))
+	return isWithinPrefix(nestedPath, prefix) || isWithinPrefix(prefix, nestedPath)
+}
+
+func isWithinPrefix(candidate, prefix string) bool {
+	candidate = path.Clean("/" + strings.TrimPrefix(candidate, "/"))
+	prefix = path.Clean("/" + strings.TrimPrefix(prefix, "/"))
+	return candidate == prefix || strings.HasPrefix(candidate, prefix+"/")
+}
+
 func stringifyHash(hash []byte) string {
 	return fmt.Sprintf("%x", hash)
+}
+
+func CVMFSObjectCachePath(cacheDir, hash, suffix string) string {
+	return cvmfsObjectCachePath(cacheDir, hash, suffix)
+}
+
+func cvmfsFileCachePath(cacheDir, repo, filePath string) string {
+	cacheDir = strings.TrimSpace(cacheDir)
+	if cacheDir == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(repo + "\n" + path.Clean("/"+strings.TrimPrefix(filePath, "/"))))
+	hexSum := hex.EncodeToString(sum[:])
+	return filepath.Join(cacheDir, "files", repo, hexSum[:2], hexSum[2:4], hexSum[4:])
+}
+
+func cvmfsObjectCachePath(cacheDir, hash, suffix string) string {
+	cacheDir = strings.TrimSpace(cacheDir)
+	if cacheDir == "" {
+		return ""
+	}
+	key := strings.ToLower(hash) + suffix
+	if len(key) < 4 {
+		return filepath.Join(cacheDir, "objects", key)
+	}
+	return filepath.Join(cacheDir, "objects", key[:2], key[2:4], key[4:])
+}
+
+func (c *Client) readCachedFile(parsed Target) ([]byte, error) {
+	if strings.TrimSpace(c.CacheDir) == "" {
+		return nil, os.ErrNotExist
+	}
+	return os.ReadFile(cvmfsFileCachePath(c.CacheDir, parsed.Repo, parsed.Path))
+}
+
+func (c *Client) writeCachedFile(parsed Target, data []byte) error {
+	if strings.TrimSpace(c.CacheDir) == "" {
+		return nil
+	}
+	cachePath := cvmfsFileCachePath(c.CacheDir, parsed.Repo, parsed.Path)
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
+		return fmt.Errorf("create cvmfs file cache dir: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(cachePath), "cvmfs-file-*")
+	if err != nil {
+		return fmt.Errorf("create cvmfs file cache temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("write cvmfs file cache temp file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close cvmfs file cache temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, cachePath); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil
+		}
+		return fmt.Errorf("commit cvmfs file cache: %w", err)
+	}
+	return nil
 }
 
 func (ent catalogEntry) pathHash() string {

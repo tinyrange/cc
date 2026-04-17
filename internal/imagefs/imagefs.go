@@ -21,6 +21,10 @@ type File interface {
 	RDev() uint32
 }
 
+type OpenReaderFile interface {
+	OpenReader() (io.ReaderAt, io.Closer, error)
+}
+
 type Directory interface {
 	Stat() fs.FileMode
 	ModTime() time.Time
@@ -180,6 +184,13 @@ func (f *hostFile) Stat() (uint64, fs.FileMode) { return f.size, f.mode }
 func (f *hostFile) ModTime() time.Time          { return f.modTime }
 func (f *hostFile) Owner() (uint32, uint32)     { return f.uid, f.gid }
 func (f *hostFile) RDev() uint32                { return f.rdev }
+func (f *hostFile) OpenReader() (io.ReaderAt, io.Closer, error) {
+	file, err := os.Open(f.hostPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	return file, file, nil
+}
 func (f *hostFile) ReadAt(off uint64, size uint32) ([]byte, error) {
 	file, err := os.Open(f.hostPath)
 	if err != nil {

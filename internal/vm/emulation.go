@@ -8,7 +8,7 @@ import (
 	"j5.nz/cc/internal/oci"
 )
 
-type packageFileReader func(ctx context.Context, repo, packageName, innerPath string) ([]byte, error)
+type packageFileExtractor func(ctx context.Context, repo, packageName, innerPath string) (string, error)
 
 func needsAMD64Emulation(image *oci.Image) bool {
 	if image == nil {
@@ -25,16 +25,16 @@ func needsAMD64Emulation(image *oci.Image) bool {
 	}
 }
 
-func loadAMD64Emulator(ctx context.Context, image *oci.Image, readPackageFile packageFileReader) ([]byte, error) {
+func loadAMD64Emulator(ctx context.Context, image *oci.Image, extractPackageFile packageFileExtractor) (string, error) {
 	if !needsAMD64Emulation(image) {
-		return nil, nil
+		return "", nil
 	}
-	if readPackageFile == nil {
-		return nil, fmt.Errorf("package file reader is nil")
+	if extractPackageFile == nil {
+		return "", fmt.Errorf("package file extractor is nil")
 	}
-	qemu, err := readPackageFile(ctx, "community", "qemu-x86_64", "usr/bin/qemu-x86_64")
+	qemu, err := extractPackageFile(ctx, "community", "qemu-x86_64", "usr/bin/qemu-x86_64")
 	if err != nil {
-		return nil, fmt.Errorf("read qemu-x86_64 package file: %w", err)
+		return "", fmt.Errorf("extract qemu-x86_64 package file: %w", err)
 	}
 	return qemu, nil
 }

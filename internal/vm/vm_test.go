@@ -162,18 +162,18 @@ func TestLoadAMD64EmulatorReadsQEMU(t *testing.T) {
 		Architecture: "amd64",
 	}
 
-	qemu, err := loadAMD64Emulator(context.Background(), image, func(ctx context.Context, repo, packageName, innerPath string) ([]byte, error) {
+	qemu, err := loadAMD64Emulator(context.Background(), image, func(ctx context.Context, repo, packageName, innerPath string) (string, error) {
 		_ = ctx
 		if repo != "community" || packageName != "qemu-x86_64" || innerPath != "usr/bin/qemu-x86_64" {
 			t.Fatalf("unexpected package lookup %q %q %q", repo, packageName, innerPath)
 		}
-		return []byte("qemu-static"), nil
+		return "/tmp/qemu-static", nil
 	})
 	if err != nil {
 		t.Fatalf("loadAMD64Emulator() error = %v", err)
 	}
-	if string(qemu) != "qemu-static" {
-		t.Fatalf("qemu data = %q, want %q", string(qemu), "qemu-static")
+	if qemu != "/tmp/qemu-static" {
+		t.Fatalf("qemu path = %q, want %q", qemu, "/tmp/qemu-static")
 	}
 }
 

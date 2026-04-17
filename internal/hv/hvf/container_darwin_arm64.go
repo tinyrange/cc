@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,6 +27,15 @@ import (
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
 )
+
+var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
+
+func timingLog(format string, args ...any) {
+	if !debugTiming {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "ccx3 timing: "+format+"\n", args...)
+}
 
 const (
 	containerMemoryBase   = 0xa0000000
@@ -48,9 +58,12 @@ const (
 	containerFSStride     = 0x1000
 	containerUARTSPI      = 33
 	containerRootFSTag    = "rootfs"
+	containerEmulatorTag  = "ccx3"
 	containerGuestCID     = 3
 	containerControlPort  = 10777
 	instanceReadyMarker   = "__CCX3_READY__"
+	initDurationMarker    = "__CCX3_INIT_MS__:"
+	execTimingMarker      = "__CCX3_TIMING__:"
 	commandBeginMarker    = "__CCX3_BEGIN__:"
 	commandOutputMarker   = "__CCX3_OUT__:"
 	commandErrorMarker    = "__CCX3_ERR__:"
@@ -59,21 +72,21 @@ const (
 )
 
 type ContainerRunRequest struct {
-	Kernel        []byte
-	Init          []byte
-	AMD64Emulator []byte
-	Modules       []alpine.Module
-	Image         *oci.Image
-	RootFS        virtio.FSBackend
-	Shares        []DirectoryShare
-	Command       []string
-	Env           []string
-	WorkDir       string
-	User          string
-	MemoryMB      uint64
-	CPUs          int
-	Dmesg         bool
-	Persistent    bool
+	Kernel            []byte
+	Init              []byte
+	AMD64EmulatorPath string
+	Modules           []alpine.Module
+	Image             *oci.Image
+	RootFS            virtio.FSBackend
+	Shares            []DirectoryShare
+	Command           []string
+	Env               []string
+	WorkDir           string
+	User              string
+	MemoryMB          uint64
+	CPUs              int
+	Dmesg             bool
+	Persistent        bool
 }
 
 type DirectoryShare struct {
@@ -89,19 +102,20 @@ type ContainerRunResult struct {
 }
 
 type ContainerSession struct {
-	cancel     context.CancelFunc
-	doneCh     chan sessionRunResult
-	image      *oci.Image
-	baseEnv    []string
-	workDir    string
-	dmesg      bool
-	uart       *serial.UART8250
-	control    virtio.VsockConn
-	transcript *serialTranscript
-	listener   virtio.VsockListener
-	vsock      *virtio.Vsock
-	sendMu     sync.Mutex
-	nextID     atomic.Uint64
+	cancel      context.CancelFunc
+	doneCh      chan sessionRunResult
+	image       *oci.Image
+	baseEnv     []string
+	workDir     string
+	dmesg       bool
+	uart        *serial.UART8250
+	control     virtio.VsockConn
+	transcript  *serialTranscript
+	listener    virtio.VsockListener
+	vsock       *virtio.Vsock
+	sendMu      sync.Mutex
+	nextID      atomic.Uint64
+	activeExecs *atomic.Int32
 }
 
 type readyResult struct {
@@ -165,6 +179,61 @@ func (s *serialTranscript) waitFor(ctx context.Context, start int, predicate fun
 	}
 }
 
+func parseInitDurationMarker(text string) (int, bool) {
+	idx := strings.LastIndex(text, initDurationMarker)
+	if idx < 0 {
+		return 0, false
+	}
+	rest := text[idx+len(initDurationMarker):]
+	end := strings.IndexByte(rest, '\n')
+	if end >= 0 {
+		rest = rest[:end]
+	}
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return 0, false
+	}
+	ms, err := strconv.Atoi(rest)
+	if err != nil {
+		return 0, false
+	}
+	return ms, true
+}
+
+func parseExecTimingMarkers(text, id string) map[string]int {
+	out := map[string]int{}
+	if text == "" || id == "" {
+		return out
+	}
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, execTimingMarker+id+":") {
+			continue
+		}
+		rest := strings.TrimPrefix(line, execTimingMarker+id+":")
+		parts := strings.SplitN(rest, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		ms, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if err != nil {
+			continue
+		}
+		out[strings.TrimSpace(parts[0])] = ms
+	}
+	return out
+}
+
+func hasManagedExecBegin(text, id string) bool {
+	return strings.Contains(text, commandBeginMarker+id)
+}
+
+func hasManagedExecFirstByte(text, id string) bool {
+	return strings.Contains(text, commandOutputMarker+id+":") ||
+		strings.Contains(text, commandErrorMarker+id+":") ||
+		strings.Contains(text, commandExitMarkerPref+id+":")
+}
+
 type guestExecRequest struct {
 	ID      string   `json:"id"`
 	Command []string `json:"command"`
@@ -218,9 +287,12 @@ func (s *ContainerSession) Wait() error {
 }
 
 func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
+	startTime := time.Now()
 	if len(req.Command) == 0 {
 		return client.ExecResponse{}, fmt.Errorf("exec command is required")
 	}
+	s.markExecActive()
+	defer s.markExecDone()
 	user := strings.TrimSpace(req.User)
 	if user != "" && user != "root" && user != "0" && user != "0:0" {
 		return client.ExecResponse{}, fmt.Errorf("only root user is supported")
@@ -237,6 +309,7 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 	if err != nil {
 		return client.ExecResponse{}, err
 	}
+	timingLog("session.Exec ResolveCommand took=%s argv=%q", time.Since(startTime), req.Command)
 	workDir := req.WorkDir
 	if workDir == "" {
 		workDir = s.workDir
@@ -271,10 +344,26 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 	if err != nil {
 		return client.ExecResponse{}, err
 	}
+	timingLog("session.Exec writeControlPayload took=%s argv=%q id=%s", time.Since(startTime), req.Command, id)
 	if err := s.sendStdinClose(id); err != nil {
 		return client.ExecResponse{}, err
 	}
+	timingLog("session.Exec sendStdinClose took=%s argv=%q id=%s", time.Since(startTime), req.Command, id)
 
+	beginSegment, err := s.transcript.waitFor(ctx, start, func(text string) bool {
+		return hasManagedExecBegin(text, id)
+	})
+	if err != nil {
+		return client.ExecResponse{}, err
+	}
+	timingLog("session.Exec waitForBegin took=%s argv=%q id=%s segment_bytes=%d", time.Since(startTime), req.Command, id, len(beginSegment))
+	firstByteSegment, err := s.transcript.waitFor(ctx, start, func(text string) bool {
+		return hasManagedExecFirstByte(text, id)
+	})
+	if err != nil {
+		return client.ExecResponse{}, err
+	}
+	timingLog("session.Exec waitForFirstByte took=%s argv=%q id=%s segment_bytes=%d", time.Since(startTime), req.Command, id, len(firstByteSegment))
 	segment, err := s.transcript.waitFor(ctx, start, func(text string) bool {
 		_, _, ok := extractManagedExecResult(text, id, s.dmesg)
 		return ok
@@ -282,10 +371,24 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 	if err != nil {
 		return client.ExecResponse{}, err
 	}
+	timingLog("session.Exec waitForResult took=%s argv=%q id=%s segment_bytes=%d", time.Since(startTime), req.Command, id, len(segment))
+	if phases := parseExecTimingMarkers(segment, id); len(phases) > 0 {
+		order := []string{"recv", "start_begin", "started", "wait_done", "streams_done", "exit_sent"}
+		parts := make([]string, 0, len(order))
+		for _, name := range order {
+			if ms, ok := phases[name]; ok {
+				parts = append(parts, fmt.Sprintf("%s=%dms", name, ms))
+			}
+		}
+		if len(parts) > 0 {
+			timingLog("session.Exec guest phases argv=%q id=%s %s", req.Command, id, strings.Join(parts, " "))
+		}
+	}
 	exitCode, output, ok := extractManagedExecResult(segment, id, s.dmesg)
 	if !ok {
 		return client.ExecResponse{}, fmt.Errorf("exec did not produce a complete result")
 	}
+	timingLog("session.Exec total=%s argv=%q id=%s exit=%d output_bytes=%d", time.Since(startTime), req.Command, id, exitCode, len(output))
 	return client.ExecResponse{ExitCode: exitCode, Output: output}, nil
 }
 
@@ -293,6 +396,8 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 	if len(req.Command) == 0 {
 		return fmt.Errorf("exec command is required")
 	}
+	s.markExecActive()
+	defer s.markExecDone()
 	user := strings.TrimSpace(req.User)
 	if user != "" && user != "root" && user != "0" && user != "0:0" {
 		return fmt.Errorf("only root user is supported")
@@ -465,7 +570,20 @@ func (s *ContainerSession) writeControlPayload(payload []byte) error {
 	return s.uart.InjectRXBytes(payload)
 }
 
+func (s *ContainerSession) markExecActive() {
+	if s.activeExecs != nil {
+		s.activeExecs.Add(1)
+	}
+}
+
+func (s *ContainerSession) markExecDone() {
+	if s.activeExecs != nil {
+		s.activeExecs.Add(-1)
+	}
+}
+
 func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*ContainerSession, error) {
+	start := time.Now()
 	if req.Image == nil && req.RootFS == nil {
 		return nil, fmt.Errorf("image or rootfs backend is required")
 	}
@@ -510,7 +628,9 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 		Env:              baseEnv,
 		WorkDir:          workDir,
 		Modules:          moduleConfig(req.Modules),
+		EmulatorTag:      emulatorTagConfig(req.AMD64EmulatorPath),
 		RootFSTag:        containerRootFSTag,
+		VsockPort:        containerControlPort,
 		ReadyMarker:      instanceReadyMarker,
 		BeginMarker:      commandBeginMarker,
 		OutputMarkerPref: commandOutputMarker,
@@ -520,6 +640,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 	if err != nil {
 		return nil, fmt.Errorf("marshal guest init config: %w", err)
 	}
+	timingLog("hvf.StartContainer config marshal took=%s", time.Since(start))
 
 	extraFiles := []initramfs.File{
 		{Path: "/dev", Mode: 0o755, Type: initramfs.TypeDirectory},
@@ -536,14 +657,6 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 		{Path: "/etc/ccx3-init.json", Mode: 0o600, Data: configJSON, Type: initramfs.TypeRegular},
 		{Path: "/init", Mode: 0o755, Data: req.Init, Type: initramfs.TypeRegular},
 	}
-	if len(req.AMD64Emulator) > 0 {
-		extraFiles = append(extraFiles, initramfs.File{
-			Path: "/ccx3/qemu-x86_64-static",
-			Mode: 0o755,
-			Data: req.AMD64Emulator,
-			Type: initramfs.TypeRegular,
-		})
-	}
 	for _, mod := range req.Modules {
 		extraFiles = append(extraFiles, initramfs.File{
 			Path: "/ccx3/modules/" + mod.Name + ".ko",
@@ -556,11 +669,13 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
 	}
+	timingLog("hvf.StartContainer initramfs.Build took=%s size=%d", time.Since(start), len(initrd))
 
 	vm, err := NewVM()
 	if err != nil {
 		return nil, err
 	}
+	timingLog("hvf.StartContainer NewVM took=%s", time.Since(start))
 
 	memorySize := uint64(defaultMemorySize)
 	if req.MemoryMB != 0 {
@@ -571,6 +686,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 		vm.Close()
 		return nil, fmt.Errorf("map guest memory: %w", err)
 	}
+	timingLog("hvf.StartContainer MapAnonymousMemory took=%s", time.Since(start))
 
 	serialOut := newSerialTranscript()
 	var consoleOut bytes.Buffer
@@ -580,35 +696,52 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 	uart.AttachIRQ(vm, containerUARTSPI)
 	console := virtio.NewConsole(containerConsoleBase, containerConsoleSize, containerConsoleIRQ, &consoleOut)
 	console.Attach(vm, vm)
+	vsockBackend := virtio.NewSimpleVsockBackend()
+	listener, err := vsockBackend.Listen(containerControlPort)
+	if err != nil {
+		vm.Close()
+		return nil, fmt.Errorf("listen vsock control: %w", err)
+	}
+	vsock := virtio.NewVsock(containerVsockBase, containerVsockSize, containerVsockIRQ, containerGuestCID, vsockBackend)
+	vsock.Attach(vm, vm)
 	fsdevs, err := buildFSDevices(req, &fsTrace)
 	if err != nil {
+		_ = listener.Close()
 		vm.Close()
 		return nil, err
 	}
 	for _, fsdev := range fsdevs {
 		fsdev.Attach(vm, vm)
 	}
+	timingLog("hvf.StartContainer device setup took=%s fsdevs=%d", time.Since(start), len(fsdevs))
 
+	bootCmdline := []string{
+		"nokaslr",
+		"panic=-1",
+		"rdinit=/init",
+	}
+	if req.Dmesg {
+		bootCmdline = append([]string{
+			"console=ttyS0,115200n8",
+			fmt.Sprintf("earlycon=uart8250,mmio,0x%x", bootarm64.DefaultUARTBase),
+			"keep_bootcon",
+			"loglevel=8",
+		}, bootCmdline...)
+	}
 	plan, err := bootarm64.PrepareBoot(mem, req.Kernel, bootarm64.BootOptions{
 		MemoryBase: containerMemoryBase,
 		MemorySize: memorySize,
 		NumCPUs:    1,
 		Initrd:     initrd,
-		ExtraNodes: appendFSNodes([]fdt.Node{console.DeviceTreeNode()}, fsdevs),
-		Cmdline: strings.Join([]string{
-			"console=ttyS0,115200n8",
-			fmt.Sprintf("earlycon=uart8250,mmio,0x%x", bootarm64.DefaultUARTBase),
-			"keep_bootcon",
-			"nokaslr",
-			"panic=-1",
-			"loglevel=8",
-			"rdinit=/init",
-		}, " "),
+		Console:    req.Dmesg,
+		ExtraNodes: appendFSNodes([]fdt.Node{console.DeviceTreeNode(), vsock.DeviceTreeNode()}, fsdevs),
+		Cmdline: strings.Join(bootCmdline, " "),
 	})
 	if err != nil {
 		vm.Close()
 		return nil, fmt.Errorf("prepare boot: %w", err)
 	}
+	timingLog("hvf.StartContainer PrepareBoot took=%s", time.Since(start))
 
 	if err := vm.SetReg(hvRegPC, plan.EntryGPA); err != nil {
 		vm.Close()
@@ -632,23 +765,67 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 			return nil, fmt.Errorf("clear reg %d: %w", reg, err)
 		}
 	}
+	timingLog("hvf.StartContainer register setup took=%s", time.Since(start))
 
 	runCtx, cancel := context.WithCancel(context.Background())
 	readyCh := make(chan error, 1)
 	doneCh := make(chan sessionRunResult, 1)
-	controlTranscript := serialOut
+	controlTranscript := newSerialTranscript()
+	controlAcceptCh := make(chan readyResult, 1)
+	controlConnCh := make(chan readyResult, 1)
+	activeExecs := &atomic.Int32{}
+	guestReady := &atomic.Bool{}
 
 	go func() {
-		_, err := controlTranscript.waitFor(runCtx, 0, func(text string) bool {
-			return strings.Contains(text, instanceReadyMarker)
-		})
-		readyCh <- err
+		conn, err := listener.Accept()
+		if err != nil {
+			controlAcceptCh <- readyResult{err: err}
+			return
+		}
+		go func() {
+			_, _ = io.Copy(controlTranscript, conn)
+		}()
+		controlAcceptCh <- readyResult{conn: conn}
+	}()
+
+	go func() {
+		select {
+		case res := <-controlAcceptCh:
+			if res.err != nil {
+				readyCh <- res.err
+				return
+			}
+			text, err := controlTranscript.waitFor(runCtx, 0, func(text string) bool {
+				return strings.Contains(text, instanceReadyMarker)
+			})
+			if err != nil {
+				_ = res.conn.Close()
+				readyCh <- err
+				return
+			}
+			if initMS, ok := parseInitDurationMarker(text); ok {
+				totalMS := int(time.Since(start).Milliseconds())
+				kernelMS := totalMS - initMS
+				if kernelMS < 0 {
+					kernelMS = 0
+				}
+				timingLog("hvf.StartContainer kernel-to-init=%dms init=%dms", kernelMS, initMS)
+			} else {
+				timingLog("hvf.StartContainer init duration marker missing")
+			}
+			timingLog("hvf.StartContainer guest ready marker took=%s", time.Since(start))
+			guestReady.Store(true)
+			controlConnCh <- res
+			readyCh <- nil
+		case <-runCtx.Done():
+			readyCh <- runCtx.Err()
+		}
 	}()
 
 	go func() {
 		defer vm.Close()
 		for {
-			exitInfo, err, stalled := runWithCancel(runCtx, vm, 5*time.Second)
+			exitInfo, err, stalled := runWithCancel(runCtx, vm, persistentRunSlice(guestReady.Load(), activeExecs.Load() > 0))
 			if stalled {
 				if runCtx.Err() != nil {
 					doneCh <- sessionRunResult{err: runCtx.Err()}
@@ -671,13 +848,19 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 				}
 				continue
 			}
+			if exitInfo.Reason == hvExitReasonCanceled {
+				// HVF can occasionally surface a canceled run even when we did not
+				// explicitly cancel the vCPU slice. Treat it like a retry instead of
+				// tearing down the persistent guest during startup.
+				continue
+			}
 			if exitInfo.Reason != hvExitReasonException {
 				doneCh <- sessionRunResult{err: fmt.Errorf("unexpected exit reason %v", exitInfo.Reason)}
 				return
 			}
 			switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 			case ExceptionClassDataAbortLowerEL:
-				if err := handleContainerDataAbort(vm, uart, console, fsdevs, nil, exitInfo); err != nil {
+				if err := handleContainerDataAbort(vm, uart, console, fsdevs, vsock, exitInfo); err != nil {
 					doneCh <- sessionRunResult{err: err}
 					return
 				}
@@ -717,35 +900,66 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 	case err := <-readyCh:
 		if err != nil {
 			cancel()
+			_ = listener.Close()
 			res := <-doneCh
 			if res.err != nil {
 				return nil, res.err
 			}
 			return nil, err
 		}
+		res, ok := <-controlConnCh
+		if !ok || res.err != nil || res.conn == nil {
+			cancel()
+			_ = listener.Close()
+			resDone := <-doneCh
+			if resDone.err != nil {
+				return nil, resDone.err
+			}
+			if res.err != nil {
+				return nil, res.err
+			}
+			return nil, fmt.Errorf("guest control connection became ready without an accepted vsock connection")
+		}
+		_ = listener.Close()
+		timingLog("hvf.StartContainer total ready=%s", time.Since(start))
 		return &ContainerSession{
-			cancel:     cancel,
-			doneCh:     doneCh,
-			image:      req.Image,
-			baseEnv:    baseEnv,
-			workDir:    workDir,
-			dmesg:      req.Dmesg,
-			uart:       uart,
-			transcript: controlTranscript,
+			cancel:      cancel,
+			doneCh:      doneCh,
+			image:       req.Image,
+			baseEnv:     baseEnv,
+			workDir:     workDir,
+			dmesg:       req.Dmesg,
+			control:     res.conn,
+			transcript:  controlTranscript,
+			vsock:       vsock,
+			activeExecs: activeExecs,
 		}, nil
 	case res := <-doneCh:
 		cancel()
+		_ = listener.Close()
 		if res.err != nil {
 			return nil, res.err
 		}
 		return nil, fmt.Errorf("guest exited before control connection became ready")
 	case <-ctx.Done():
 		cancel()
+		_ = listener.Close()
 		res := <-doneCh
 		if res.err != nil {
 			return nil, res.err
 		}
 		return nil, ctx.Err()
+	}
+}
+
+func persistentRunSlice(ready bool, active bool) time.Duration {
+	switch {
+	case !ready:
+		return 10 * time.Millisecond
+	case active:
+		return 5 * time.Millisecond
+	default:
+		return 250 * time.Millisecond
 	}
 }
 
@@ -823,6 +1037,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 		Env:              env,
 		WorkDir:          workDir,
 		Modules:          moduleConfig(req.Modules),
+		EmulatorTag:      emulatorTagConfig(req.AMD64EmulatorPath),
 		RootFSTag:        containerRootFSTag,
 		BeginMarker:      commandBeginMarker,
 		ErrorMarkerPref:  commandErrorMarker,
@@ -846,14 +1061,6 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 		{Path: "/dev/kmsg", Mode: 0o600, Type: initramfs.TypeCharDevice, DevMajor: 1, DevMinor: 11},
 		{Path: "/etc/ccx3-init.json", Mode: 0o600, Data: configJSON, Type: initramfs.TypeRegular},
 		{Path: "/init", Mode: 0o755, Data: req.Init, Type: initramfs.TypeRegular},
-	}
-	if len(req.AMD64Emulator) > 0 {
-		extraFiles = append(extraFiles, initramfs.File{
-			Path: "/ccx3/qemu-x86_64-static",
-			Mode: 0o755,
-			Data: req.AMD64Emulator,
-			Type: initramfs.TypeRegular,
-		})
 	}
 	for _, mod := range req.Modules {
 		extraFiles = append(extraFiles, initramfs.File{
@@ -900,21 +1107,27 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 		fsdev.Attach(vm, vm)
 	}
 
+	bootCmdline := []string{
+		"nokaslr",
+		"panic=-1",
+		"rdinit=/init",
+	}
+	if req.Dmesg {
+		bootCmdline = append([]string{
+			"console=ttyS0,115200n8",
+			fmt.Sprintf("earlycon=uart8250,mmio,0x%x", bootarm64.DefaultUARTBase),
+			"keep_bootcon",
+			"loglevel=8",
+		}, bootCmdline...)
+	}
 	plan, err := bootarm64.PrepareBoot(mem, req.Kernel, bootarm64.BootOptions{
 		MemoryBase: containerMemoryBase,
 		MemorySize: memorySize,
 		NumCPUs:    1,
 		Initrd:     initrd,
+		Console:    req.Dmesg,
 		ExtraNodes: appendFSNodes([]fdt.Node{console.DeviceTreeNode()}, fsdevs),
-		Cmdline: strings.Join([]string{
-			"console=ttyS0,115200n8",
-			fmt.Sprintf("earlycon=uart8250,mmio,0x%x", bootarm64.DefaultUARTBase),
-			"keep_bootcon",
-			"nokaslr",
-			"panic=-1",
-			"loglevel=8",
-			"rdinit=/init",
-		}, " "),
+		Cmdline: strings.Join(bootCmdline, " "),
 	})
 	if err != nil {
 		return ContainerRunResult{}, fmt.Errorf("prepare boot: %w", err)
@@ -1069,8 +1282,11 @@ func runWithCancel(ctx context.Context, vm *VM, timeout time.Duration) (*VcpuExi
 		if res.err != nil {
 			return nil, res.err, false
 		}
-		if res.exit == nil || res.exit.Reason != hvExitReasonCanceled {
-			return nil, fmt.Errorf("cancelled run returned unexpected exit %#v", res.exit), false
+		if res.exit == nil {
+			return nil, fmt.Errorf("cancelled run returned nil exit"), false
+		}
+		if res.exit.Reason != hvExitReasonCanceled {
+			return res.exit, nil, false
 		}
 		return nil, nil, true
 	}
@@ -1106,6 +1322,10 @@ func buildFSDevices(req ContainerRunRequest, trace io.Writer) ([]*virtio.FS, err
 	}
 	devs := []*virtio.FS{
 		newFSDevice(containerFSBase, containerFSIRQ, containerRootFSTag, rootFSBackend, trace),
+	}
+	if strings.TrimSpace(req.AMD64EmulatorPath) != "" {
+		sourceDir := filepath.Dir(req.AMD64EmulatorPath)
+		devs = append(devs, newFSDevice(containerShareFSBase, containerShareFSIRQ, containerEmulatorTag, virtio.NewImageFS(imagefs.NewHostFS(sourceDir, nil), sourceDir), trace))
 	}
 	return devs, nil
 }
@@ -1171,7 +1391,7 @@ func handleContainerDataAbort(vm *VM, uart *serial.UART8250, console *virtio.Con
 	addr := uint64(exitInfo.Exception.PhysicalAddress)
 
 	switch {
-	case uart.Contains(addr, info.SizeBytes):
+	case uart != nil && uart.Contains(addr, info.SizeBytes):
 		if info.Write {
 			value, err := readAbortValue(vm, info)
 			if err != nil {
@@ -1589,6 +1809,7 @@ type guestInitConfig struct {
 	Env              []string         `json:"env"`
 	WorkDir          string           `json:"workdir"`
 	Modules          []string         `json:"modules,omitempty"`
+	EmulatorTag      string           `json:"emulator_tag,omitempty"`
 	RootFSTag        string           `json:"rootfs_tag,omitempty"`
 	Shares           []guestInitShare `json:"shares,omitempty"`
 	VsockPort        uint32           `json:"vsock_port,omitempty"`
@@ -1614,6 +1835,13 @@ func moduleConfig(modules []alpine.Module) []string {
 		out = append(out, "/ccx3/modules/"+mod.Name+".ko")
 	}
 	return out
+}
+
+func emulatorTagConfig(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return ""
+	}
+	return containerEmulatorTag
 }
 
 func cleanCommandOutput(output string) string {

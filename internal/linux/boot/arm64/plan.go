@@ -40,6 +40,7 @@ type BootOptions struct {
 	Cmdline    string
 	NumCPUs    int
 	UART       *UARTConfig
+	Console    bool
 	Initrd     []byte
 	InitrdGPA  uint64
 	ExtraNodes []fdt.Node
@@ -135,6 +136,7 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 		NumCPUs:    opts.NumCPUs,
 		Cmdline:    opts.Cmdline,
 		UART:       opts.UART,
+		Console:    opts.Console,
 		InitrdGPA:  initrdAddr,
 		InitrdSize: uint64(len(opts.Initrd)),
 		ExtraNodes: append([]fdt.Node(nil), opts.ExtraNodes...),
@@ -182,6 +184,7 @@ type deviceTreeConfig struct {
 	NumCPUs    int
 	Cmdline    string
 	UART       *UARTConfig
+	Console    bool
 	InitrdGPA  uint64
 	InitrdSize uint64
 	ExtraNodes []fdt.Node
@@ -256,14 +259,18 @@ func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
 				"serial0": {Strings: []string{fmt.Sprintf("/%s", serialNode.Name)}},
 			},
 		})
-		root.Children = append(root.Children, fdt.Node{
+		chosen := fdt.Node{
 			Name: "chosen",
 			Properties: map[string]fdt.Property{
-				"bootargs":          {Strings: []string{cfg.Cmdline}},
-				"stdout-path":       {Strings: []string{fmt.Sprintf("serial0:%dn8", cfg.UART.BaudRate)}},
-				"linux,stdout-path": {Strings: []string{fmt.Sprintf("serial0:%dn8", cfg.UART.BaudRate)}},
+				"bootargs": {Strings: []string{cfg.Cmdline}},
 			},
-		})
+		}
+		if cfg.Console {
+			consolePath := fmt.Sprintf("serial0:%dn8", cfg.UART.BaudRate)
+			chosen.Properties["stdout-path"] = fdt.Property{Strings: []string{consolePath}}
+			chosen.Properties["linux,stdout-path"] = fdt.Property{Strings: []string{consolePath}}
+		}
+		root.Children = append(root.Children, chosen)
 	}
 
 	if cfg.InitrdSize > 0 {

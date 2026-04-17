@@ -4,18 +4,23 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 
+	"j5.nz/cc/internal/fsmeta"
 	"j5.nz/cc/internal/imagefs"
 )
 
@@ -383,6 +388,7 @@ func TestParseSource(t *testing.T) {
 		{source: "localhost:5000/repo/image:tag", wantKind: SourceKindOCI},
 		{source: "/tmp/tool.simg", wantKind: SourceKindSIMG},
 		{source: "https://example.com/image.sif", wantKind: SourceKindSIMG},
+		{source: "https://cvmfs.neurodesk.org/cvmfs/neurodesk.ardc.edu.au/containers/tool/tool.simg", wantKind: SourceKindCVMFS},
 		{source: "http+cvmfs://cvmfs.neurodesk.org/cvmfs/neurodesk.ardc.edu.au?path=containers/tool", wantKind: SourceKindCVMFS},
 		{source: "cvmfs://neurodesk.ardc.edu.au?path=containers/tool", wantKind: SourceKindCVMFS},
 		{source: "", wantErr: true},
@@ -448,7 +454,7 @@ func TestStorePullReportsUnsupportedSourceKinds(t *testing.T) {
 		want   string
 	}{
 		{source: "/tmp/tool.simg", want: "stat simg source:"},
-		{source: "http+cvmfs://cvmfs.neurodesk.org/cvmfs/neurodesk.ardc.edu.au?path=containers/tool", want: "cvmfs image ingestion is not implemented yet"},
+		{source: "http+cvmfs://cvmfs.neurodesk.org/cvmfs/neurodesk.ardc.edu.au?path=containers/tool", want: "read cvmfs container directory: file does not exist"},
 	}
 	for _, tt := range tests {
 		_, err := store.Pull(context.Background(), "test", tt.source)
@@ -462,6 +468,294 @@ func TestStorePullReportsUnsupportedSourceKinds(t *testing.T) {
 			t.Fatalf("store.lastErr[test] was not recorded")
 		}
 	}
+}
+
+func TestStorePullImportsDirectoryBackedCVMFSContainer(t *testing.T) {
+	server := newOCICVMFSDirectoryRepoServer(t)
+	store := NewStore(t.TempDir())
+	store.httpClient = server.Client()
+
+	source := server.URL + "/cvmfs/test.repo/containers/niimath_1.0.20250804_20251016"
+	state, err := store.Pull(context.Background(), "niimath", source)
+	if err != nil {
+		t.Fatalf("Pull() error = %v", err)
+	}
+	if state.SourceKind != SourceKindCVMFS {
+		t.Fatalf("Pull().SourceKind = %q, want %q", state.SourceKind, SourceKindCVMFS)
+	}
+
+	img, err := store.Open("niimath")
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if img.Architecture != "amd64" {
+		t.Fatalf("img.Architecture = %q, want amd64", img.Architecture)
+	}
+	entry, err := imagefs.LookupPath(img.RootFS, "/etc/alpine-release")
+	if err != nil {
+		t.Fatalf("LookupPath(/etc/alpine-release) error = %v", err)
+	}
+	data, err := entry.File.ReadAt(0, 64)
+	if err != nil {
+		t.Fatalf("ReadAt(/etc/alpine-release) error = %v", err)
+	}
+	if string(data) != "3.20.0\n" {
+		t.Fatalf("/etc/alpine-release = %q, want %q", string(data), "3.20.0\n")
+	}
+}
+
+func TestStorePullImportsInnerSIMGDirectoryBackedCVMFSContainer(t *testing.T) {
+	server := newOCICVMFSDirectoryRepoServer(t)
+	store := NewStore(t.TempDir())
+	store.httpClient = server.Client()
+
+	source := server.URL + "/cvmfs/test.repo/containers/niimath_1.0.20250804_20251016/niimath_1.0.20250804_20251016.simg"
+	state, err := store.Pull(context.Background(), "niimath", source)
+	if err != nil {
+		t.Fatalf("Pull() error = %v", err)
+	}
+	if state.SourceKind != SourceKindCVMFS {
+		t.Fatalf("Pull().SourceKind = %q, want %q", state.SourceKind, SourceKindCVMFS)
+	}
+
+	img, err := store.Open("niimath")
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if img.Architecture != "amd64" {
+		t.Fatalf("img.Architecture = %q, want amd64", img.Architecture)
+	}
+	entry, err := imagefs.LookupPath(img.RootFS, "/etc/alpine-release")
+	if err != nil {
+		t.Fatalf("LookupPath(/etc/alpine-release) error = %v", err)
+	}
+	data, err := entry.File.ReadAt(0, 64)
+	if err != nil {
+		t.Fatalf("ReadAt(/etc/alpine-release) error = %v", err)
+	}
+	if string(data) != "3.20.0\n" {
+		t.Fatalf("/etc/alpine-release = %q, want %q", string(data), "3.20.0\n")
+	}
+}
+
+func TestCVMFSDirectoryIndexCacheRoundTrips(t *testing.T) {
+	cacheDir := t.TempDir()
+	nodes := []indexedNode{
+		{Path: "/", Kind: indexedKindDir, Mode: fsmeta.LinuxModeFromFileMode(fs.ModeDir | 0o755)},
+		{Path: "/bin", Kind: indexedKindDir, Mode: fsmeta.LinuxModeFromFileMode(fs.ModeDir | 0o755)},
+		{Path: "/bin/sh", Kind: indexedKindFile, Mode: fsmeta.LinuxModeFromFileMode(0o755), Size: 7, CVMFSTarget: "https://example.invalid/cvmfs/test.repo/bin/sh"},
+	}
+	entries := map[string]fsmeta.Entry{
+		"/":       {UID: 0, GID: 0, Mode: fsmeta.LinuxModeFromFileMode(fs.ModeDir | 0o755)},
+		"/bin":    {UID: 0, GID: 0, Mode: fsmeta.LinuxModeFromFileMode(fs.ModeDir | 0o755)},
+		"/bin/sh": {UID: 0, GID: 0, Mode: fsmeta.LinuxModeFromFileMode(0o755)},
+	}
+	if err := saveCVMFSDirectoryIndexCache(cacheDir, "abc123", "https://example.invalid/cvmfs/test.repo/container", nodes, entries, "amd64"); err != nil {
+		t.Fatalf("saveCVMFSDirectoryIndexCache() error = %v", err)
+	}
+	gotNodes, gotEntries, gotArch, ok, err := loadCVMFSDirectoryIndexCache(cacheDir, "abc123", "https://example.invalid/cvmfs/test.repo/container")
+	if err != nil {
+		t.Fatalf("loadCVMFSDirectoryIndexCache() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("loadCVMFSDirectoryIndexCache() ok = false, want true")
+	}
+	if gotArch != "amd64" {
+		t.Fatalf("loaded arch = %q, want amd64", gotArch)
+	}
+	if len(gotNodes) != len(nodes) {
+		t.Fatalf("loaded %d nodes, want %d", len(gotNodes), len(nodes))
+	}
+	if gotNodes[2].CVMFSTarget != nodes[2].CVMFSTarget {
+		t.Fatalf("loaded file target = %q, want %q", gotNodes[2].CVMFSTarget, nodes[2].CVMFSTarget)
+	}
+	if gotEntries["/bin/sh"].Mode != entries["/bin/sh"].Mode {
+		t.Fatalf("loaded mode = %#o, want %#o", gotEntries["/bin/sh"].Mode, entries["/bin/sh"].Mode)
+	}
+}
+
+func TestStorePullRefreshesDirectoryBackedCVMFSWhenManifestChanges(t *testing.T) {
+	sharedCache := t.TempDir()
+	if err := os.Setenv(sharedCacheEnv, sharedCache); err != nil {
+		t.Fatalf("Setenv(%s) error = %v", sharedCacheEnv, err)
+	}
+	defer os.Unsetenv(sharedCacheEnv)
+
+	rootCatalogHashA := strings.Repeat("a", 40)
+	rootCatalogHashB := strings.Repeat("f", 40)
+	nestedCatalogHash := strings.Repeat("b", 40)
+	commandsHash := strings.Repeat("c", 40)
+	releaseHash := strings.Repeat("d", 40)
+	shHash := strings.Repeat("e", 40)
+
+	rootCatalog := createOCITestCatalogDB(t, []string{
+		`CREATE TABLE catalog (md5path_1 INTEGER, md5path_2 INTEGER, parent_1 INTEGER, parent_2 INTEGER, hardlinks INTEGER, hash BLOB, size INTEGER, mode INTEGER, mtime INTEGER, mtimens INTEGER, flags INTEGER, name TEXT, symlink TEXT, uid INTEGER, gid INTEGER, xattr BLOB);`,
+		`CREATE TABLE nested_catalogs (path TEXT, sha1 TEXT, size INTEGER);`,
+		`INSERT INTO catalog VALUES (1, 1, 0, 0, 1, NULL, 0, 16877, 0, 0, 1, 'containers', '', 0, 0, NULL);`,
+		`INSERT INTO nested_catalogs VALUES ('containers/niimath_1.0.20250804_20251016', '` + nestedCatalogHash + `', 0);`,
+	})
+	nestedCatalog := createOCITestCatalogDB(t, []string{
+		`CREATE TABLE catalog (md5path_1 INTEGER, md5path_2 INTEGER, parent_1 INTEGER, parent_2 INTEGER, hardlinks INTEGER, hash BLOB, size INTEGER, mode INTEGER, mtime INTEGER, mtimens INTEGER, flags INTEGER, name TEXT, symlink TEXT, uid INTEGER, gid INTEGER, xattr BLOB);`,
+		`INSERT INTO catalog VALUES (2, 2, 1, 1, 1, NULL, 0, 16877, 0, 0, 1, 'niimath_1.0.20250804_20251016', '', 0, 0, NULL);`,
+		`INSERT INTO catalog VALUES (3, 3, 2, 2, 1, X'` + strings.ToUpper(commandsHash) + `', 8, 33188, 0, 0, 4, 'commands.txt', '', 0, 0, NULL);`,
+		`INSERT INTO catalog VALUES (4, 4, 2, 2, 1, NULL, 0, 16877, 0, 0, 1, 'niimath_1.0.20250804_20251016.simg', '', 0, 0, NULL);`,
+		`INSERT INTO catalog VALUES (5, 5, 4, 4, 1, NULL, 0, 16877, 0, 0, 1, 'etc', '', 0, 0, NULL);`,
+		`INSERT INTO catalog VALUES (6, 6, 5, 5, 1, X'` + strings.ToUpper(releaseHash) + `', 7, 33188, 0, 0, 4, 'alpine-release', '', 0, 0, NULL);`,
+		`INSERT INTO catalog VALUES (7, 7, 4, 4, 1, NULL, 0, 16877, 0, 0, 1, 'bin', '', 0, 0, NULL);`,
+		`INSERT INTO catalog VALUES (8, 8, 7, 7, 1, X'` + strings.ToUpper(shHash) + `', 64, 33261, 0, 0, 4, 'sh', '', 0, 0, NULL);`,
+	})
+
+	shData := make([]byte, 64)
+	copy(shData, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1, 0})
+	shData[18] = 0x3e
+	shData[19] = 0x00
+
+	var currentRootHash atomic.Value
+	currentRootHash.Store(rootCatalogHashA)
+
+	objects := map[string][]byte{
+		ociObjectPath(rootCatalogHashA, "C"):  compressOCIObject(t, rootCatalog),
+		ociObjectPath(rootCatalogHashB, "C"):  compressOCIObject(t, rootCatalog),
+		ociObjectPath(nestedCatalogHash, "C"): compressOCIObject(t, nestedCatalog),
+		ociObjectPath(commandsHash, ""):       compressOCIObject(t, []byte("niimath\n")),
+		ociObjectPath(releaseHash, ""):        compressOCIObject(t, []byte("3.20.0\n")),
+		ociObjectPath(shHash, ""):             compressOCIObject(t, shData),
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/cvmfs/test.repo/.cvmfspublished" {
+			_, _ = w.Write([]byte("C" + currentRootHash.Load().(string) + "\nNtest.repo\n--\n"))
+			return
+		}
+		body, ok := objects[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+
+	store := NewStore(t.TempDir())
+	store.httpClient = server.Client()
+	source := server.URL + "/cvmfs/test.repo/containers/niimath_1.0.20250804_20251016"
+
+	if _, err := store.Pull(context.Background(), "niimath", source); err != nil {
+		t.Fatalf("first Pull() error = %v", err)
+	}
+	meta, err := store.readMetadata("niimath")
+	if err != nil {
+		t.Fatalf("readMetadata(first) error = %v", err)
+	}
+	if meta.CVMFSRootHash != rootCatalogHashA {
+		t.Fatalf("first CVMFSRootHash = %q, want %q", meta.CVMFSRootHash, rootCatalogHashA)
+	}
+
+	currentRootHash.Store(rootCatalogHashB)
+	if _, err := store.Pull(context.Background(), "niimath", source); err != nil {
+		t.Fatalf("second Pull() error = %v", err)
+	}
+	meta, err = store.readMetadata("niimath")
+	if err != nil {
+		t.Fatalf("readMetadata(second) error = %v", err)
+	}
+	if meta.CVMFSRootHash != rootCatalogHashB {
+		t.Fatalf("second CVMFSRootHash = %q, want %q", meta.CVMFSRootHash, rootCatalogHashB)
+	}
+}
+
+func newOCICVMFSDirectoryRepoServer(t *testing.T) *httptest.Server {
+	t.Helper()
+
+	rootCatalogHash := strings.Repeat("a", 40)
+	nestedCatalogHash := strings.Repeat("b", 40)
+	commandsHash := strings.Repeat("c", 40)
+	releaseHash := strings.Repeat("d", 40)
+	shHash := strings.Repeat("e", 40)
+
+	rootCatalog := createOCITestCatalogDB(t, []string{
+		`CREATE TABLE catalog (md5path_1 INTEGER, md5path_2 INTEGER, parent_1 INTEGER, parent_2 INTEGER, hardlinks INTEGER, hash BLOB, size INTEGER, mode INTEGER, mtime INTEGER, mtimens INTEGER, flags INTEGER, name TEXT, symlink TEXT, uid INTEGER, gid INTEGER, xattr BLOB);`,
+		`CREATE TABLE nested_catalogs (path TEXT, sha1 TEXT, size INTEGER);`,
+		`INSERT INTO catalog VALUES (1, 1, 0, 0, 1, NULL, 0, 16877, 0, 0, 1, 'containers', '', 0, 0, NULL);`,
+		`INSERT INTO nested_catalogs VALUES ('containers/niimath_1.0.20250804_20251016', '` + nestedCatalogHash + `', 0);`,
+	})
+	nestedCatalog := createOCITestCatalogDB(t, []string{
+		`CREATE TABLE catalog (md5path_1 INTEGER, md5path_2 INTEGER, parent_1 INTEGER, parent_2 INTEGER, hardlinks INTEGER, hash BLOB, size INTEGER, mode INTEGER, mtime INTEGER, mtimens INTEGER, flags INTEGER, name TEXT, symlink TEXT, uid INTEGER, gid INTEGER, xattr BLOB);`,
+		`INSERT INTO catalog VALUES (2, 2, 1, 1, 1, NULL, 0, 16877, 0, 0, 1, 'niimath_1.0.20250804_20251016', '', 0, 0, NULL);`,
+		`INSERT INTO catalog VALUES (3, 3, 2, 2, 1, X'` + strings.ToUpper(commandsHash) + `', 8, 33188, 0, 0, 4, 'commands.txt', '', 0, 0, NULL);`,
+		`INSERT INTO catalog VALUES (4, 4, 2, 2, 1, NULL, 0, 16877, 0, 0, 1, 'niimath_1.0.20250804_20251016.simg', '', 0, 0, NULL);`,
+		`INSERT INTO catalog VALUES (5, 5, 4, 4, 1, NULL, 0, 16877, 0, 0, 1, 'etc', '', 0, 0, NULL);`,
+		`INSERT INTO catalog VALUES (6, 6, 5, 5, 1, X'` + strings.ToUpper(releaseHash) + `', 7, 33188, 0, 0, 4, 'alpine-release', '', 0, 0, NULL);`,
+		`INSERT INTO catalog VALUES (7, 7, 4, 4, 1, NULL, 0, 16877, 0, 0, 1, 'bin', '', 0, 0, NULL);`,
+		`INSERT INTO catalog VALUES (8, 8, 7, 7, 1, X'` + strings.ToUpper(shHash) + `', 64, 33261, 0, 0, 4, 'sh', '', 0, 0, NULL);`,
+	})
+
+	shData := make([]byte, 64)
+	copy(shData, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1, 0})
+	shData[18] = 0x3e
+	shData[19] = 0x00
+
+	objects := map[string][]byte{
+		"/cvmfs/test.repo/.cvmfspublished":    []byte("C" + rootCatalogHash + "\nNtest.repo\n--\n"),
+		ociObjectPath(rootCatalogHash, "C"):   compressOCIObject(t, rootCatalog),
+		ociObjectPath(nestedCatalogHash, "C"): compressOCIObject(t, nestedCatalog),
+		ociObjectPath(commandsHash, ""):       compressOCIObject(t, []byte("niimath\n")),
+		ociObjectPath(releaseHash, ""):        compressOCIObject(t, []byte("3.20.0\n")),
+		ociObjectPath(shHash, ""):             compressOCIObject(t, shData),
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, ok := objects[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(ts.Close)
+	return ts
+}
+
+func compressOCIObject(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := zlib.NewWriter(&buf)
+	if _, err := zw.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func ociObjectPath(hash, suffix string) string {
+	return "/cvmfs/test.repo/data/" + hash[:2] + "/" + hash[2:] + suffix
+}
+
+func createOCITestCatalogDB(t *testing.T, statements []string) []byte {
+	t.Helper()
+	if _, err := exec.LookPath("sqlite3"); err != nil {
+		t.Skip("sqlite3 not available")
+	}
+	file, err := os.CreateTemp("", "ccx3-oci-cvmfs-test-*.sqlite")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = file.Close()
+	t.Cleanup(func() { _ = os.Remove(file.Name()) })
+	cmd := exec.Command("sqlite3", file.Name())
+	cmd.Stdin = strings.NewReader(strings.Join(statements, "\n"))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("sqlite3: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(file.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func itoa(v int) string {
+	return strconv.Itoa(v)
 }
 
 type tarEntry struct {
