@@ -1,0 +1,1014 @@
+from __future__ import annotations
+
+import json
+import os
+import posixpath
+import subprocess
+import sys
+import uuid
+from collections.abc import Callable
+from pathlib import Path
+from typing import Protocol
+
+import httpx
+
+from .client import PyNeurodeskClient
+from .models import CVMFSSource, ContainerReference, DaemonState, ImageSource, ImportImageRequest, ShareMount
+
+DEFAULT_CVMFS_MIRROR = "https://cvmfs.neurodesk.org"
+DEFAULT_CVMFS_REPO = "neurodesk.ardc.edu.au"
+DEFAULT_CONTAINERS_PATH = "/containers"
+DEFAULT_RELEASES_API = "https://api.github.com/repos/NeuroDesk/neurocontainers/contents/releases"
+
+
+class ProgressReporter(Protocol):
+    def update(self, step: int, message: str) -> None: ...
+
+    def close(self, message: str | None = None) -> None: ...
+
+
+class NullProgressReporter:
+    def update(self, step: int, message: str) -> None:
+        return None
+
+    def close(self, message: str | None = None) -> None:
+        return None
+
+
+class StreamProgressReporter:
+    def __init__(self, total_steps: int, stream: object | None = None) -> None:
+        self.total_steps = max(total_steps, 1)
+        self.stream = stream if stream is not None else sys.stdout
+
+    def update(self, step: int, message: str) -> None:
+        current = max(0, min(step, self.total_steps))
+        width = 24
+        filled = int(width * current / self.total_steps)
+        bar = "#" * filled + "-" * (width - filled)
+        print(f"[{bar}] {current}/{self.total_steps} {message}", file=self.stream, flush=True)
+
+    def close(self, message: str | None = None) -> None:
+        if message:
+            print(message, file=self.stream, flush=True)
+
+
+class NotebookProgressReporter:
+    def __init__(self, total_steps: int) -> None:
+        self.total_steps = max(total_steps, 1)
+        from IPython.display import HTML, display
+
+        self._HTML = HTML
+        self._display = display
+        self._handle = display(self._render(0, "Starting..."), display_id=True)
+
+    def update(self, step: int, message: str) -> None:
+        current = max(0, min(step, self.total_steps))
+        self._handle.update(self._render(current, message))
+
+    def close(self, message: str | None = None) -> None:
+        if message:
+            self._handle.update(self._render(self.total_steps, message))
+
+    def _render(self, step: int, message: str):
+        percent = int((100 * step) / self.total_steps)
+        return self._HTML(
+            """
+            <div style="max-width: 42rem; font-family: sans-serif;">
+              <div style="margin-bottom: 0.4rem; font-weight: 600;">{message}</div>
+              <div style="width: 100%; background: #e5e7eb; border-radius: 9999px; overflow: hidden; height: 0.8rem;">
+                <div style="width: {percent}%; background: #2563eb; height: 100%; transition: width 150ms ease;"></div>
+              </div>
+              <div style="margin-top: 0.35rem; color: #4b5563; font-size: 0.9rem;">Step {step} of {total}</div>
+            </div>
+            """.format(message=_escape_html(message), percent=percent, step=step, total=self.total_steps)
+        )
+
+
+class SharedDirectory:
+    def __init__(self, source: str | os.PathLike[str], *, writable: bool = False, share_id: str | None = None) -> None:
+        source_path = Path(source).expanduser().resolve(strict=True)
+        if not source_path.is_dir():
+            raise NotADirectoryError(str(source_path))
+        self.source = source_path
+        self.writable = writable
+        self.share_id = share_id or uuid.uuid4().hex
+
+    @property
+    def guest_path(self) -> str:
+        return f"/.share/{self.share_id}"
+
+    def __truediv__(self, child: str | os.PathLike[str]) -> "SharedPath":
+        return SharedPath(self, (str(child),))
+
+
+class SharedPath:
+    def __init__(self, directory: SharedDirectory, parts: tuple[str, ...] = ()) -> None:
+        self.directory = directory
+        self.parts = parts
+
+    @property
+    def guest_path(self) -> str:
+        current = self.directory.guest_path
+        for part in self.parts:
+            current = posixpath.join(current, str(part))
+        return current
+
+    def __truediv__(self, child: str | os.PathLike[str]) -> "SharedPath":
+        return SharedPath(self.directory, self.parts + (str(child),))
+
+
+def share_dir(source: str | os.PathLike[str], *, writable: bool = False) -> SharedDirectory:
+    return SharedDirectory(source, writable=writable)
+
+
+class NeurodeskContainer:
+    def __init__(
+        self,
+        client: PyNeurodeskClient,
+        reference: ContainerReference,
+        *,
+        owned_daemon: DaemonState | None = None,
+    ) -> None:
+        self._client = client
+        self.reference = reference
+        self._owned_daemon = owned_daemon
+        self._closed = False
+
+    @property
+    def name(self) -> str:
+        return self.reference.name
+
+    @property
+    def image(self) -> str:
+        return self.reference.image
+
+    @property
+    def path(self) -> str:
+        return self.reference.path
+
+    @property
+    def base_url(self) -> str:
+        return str(self._client._client.base_url).rstrip("/")
+
+    @property
+    def owns_daemon(self) -> bool:
+        return self._owned_daemon is not None
+
+    def run(self, *args: object) -> str:
+        if self._closed:
+            raise RuntimeError("container handle is closed")
+        command, shares = self._resolve_command(args)
+        if not command:
+            raise ValueError("at least one command argument is required")
+        try:
+            result = self._client.run(self.reference.image, command, shares=shares)
+        except httpx.ConnectError as exc:
+            if not self._recover_owned_daemon():
+                raise RuntimeError(
+                    f"container daemon at {self.base_url} is no longer reachable; create a new container handle"
+                ) from exc
+            result = self._client.run(self.reference.image, command, shares=shares)
+        if result.exit_code != 0:
+            raise RuntimeError(
+                f"command {' '.join(command)!r} exited with status {result.exit_code}: {result.output}"
+            )
+        return result.output
+
+    def shell(self, *args: object) -> str:
+        return self.run(*args)
+
+    def __getattr__(self, name: str) -> Callable[..., str]:
+        if not name.isidentifier():
+            raise AttributeError(name)
+
+        def invoke(*args: object) -> str:
+            return self.run(name, *args)
+
+        return invoke
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            if self._owned_daemon is not None:
+                try:
+                    self._client.shutdown_instance()
+                except httpx.HTTPError:
+                    pass
+                try:
+                    with httpx.Client(base_url=self._owned_daemon.base_url, timeout=2.0) as http_client:
+                        http_client.post("/shutdown")
+                except httpx.HTTPError:
+                    pass
+                state_path = daemon_state_path_for_cache_dir(Path(self._owned_daemon.cache_dir))
+                state_path.unlink(missing_ok=True)
+        finally:
+            self._client.close()
+            self._closed = True
+
+    def __enter__(self) -> "NeurodeskContainer":
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.close()
+
+    def _resolve_command(self, args: tuple[object, ...]) -> tuple[list[str], list[ShareMount]]:
+        share_map: dict[str, ShareMount] = {}
+        command: list[str] = []
+        for arg in args:
+            if isinstance(arg, SharedDirectory):
+                share = self._mount_for_directory(arg)
+                share_map.setdefault(share.mount, share)
+                command.append(arg.guest_path)
+                continue
+            if isinstance(arg, SharedPath):
+                share = self._mount_for_directory(arg.directory)
+                share_map.setdefault(share.mount, share)
+                command.append(arg.guest_path)
+                continue
+            command.append(str(arg))
+        return command, list(share_map.values())
+
+    def _mount_for_directory(self, directory: SharedDirectory) -> ShareMount:
+        return ShareMount(
+            source=str(directory.source),
+            mount=directory.guest_path,
+            writable=directory.writable,
+        )
+
+    def _recover_owned_daemon(self) -> bool:
+        if self._owned_daemon is None or not self._owned_daemon.cache_dir:
+            return False
+        if _health_check(self.base_url):
+            return False
+        cache_root = Path(self._owned_daemon.cache_dir)
+        self._client.close()
+        new_state = start_daemon_for_cache_dir(cache_root)
+        self._owned_daemon = new_state
+        self._client = PyNeurodeskClient(new_state.base_url)
+        self._client.ensure_image(self.reference)
+        self._client.ensure_instance(self.reference.image)
+        return True
+
+
+def connect(*, base_url: str | None = None) -> PyNeurodeskClient:
+    resolved_base_url = resolve_base_url(base_url)
+    return PyNeurodeskClient(resolved_base_url)
+
+
+def search(
+    name: str,
+    *,
+    base_url: str | None = None,
+    client: PyNeurodeskClient | None = None,
+    mirror: str = DEFAULT_CVMFS_MIRROR,
+    repo: str = DEFAULT_CVMFS_REPO,
+    cache_dir: str | None = None,
+) -> list[str]:
+    local_versions = _search_local_release_versions(name)
+    if local_versions:
+        return sorted(local_versions)
+    remote_versions = _search_remote_release_versions(name)
+    if remote_versions:
+        return sorted(remote_versions)
+
+    active_client = client if client is not None else connect(base_url=base_url)
+    versions, _, _ = _search_versions(
+        active_client,
+        name,
+        mirror=mirror,
+        repo=repo,
+        cache_dir=cache_dir,
+    )
+    return versions
+
+
+def _search_versions(
+    client: PyNeurodeskClient,
+    name: str,
+    *,
+    mirror: str,
+    repo: str,
+    cache_dir: str | None,
+) -> tuple[list[str], object | None, object]:
+    normalized_name = name.strip()
+    if not normalized_name:
+        raise ValueError("container name is required")
+
+    versions: set[str] = set()
+
+    direct_directory = path_join(DEFAULT_CONTAINERS_PATH, normalized_name)
+    try:
+        direct_entries = client.cvmfs_list(
+            CVMFSSource(
+                mirror=mirror,
+                repo=repo,
+                path=direct_directory,
+                cache_dir=cache_dir,
+            )
+        )
+    except httpx.HTTPError:
+        direct_entries = None
+    if direct_entries is not None:
+        versions.update(_extract_versions_from_entries(direct_entries, normalized_name))
+
+    root_entries = client.cvmfs_list(
+        CVMFSSource(
+            mirror=mirror,
+            repo=repo,
+            path=DEFAULT_CONTAINERS_PATH,
+            cache_dir=cache_dir,
+        )
+    )
+    versions.update(_extract_versions_from_entries(root_entries, normalized_name))
+    return sorted(versions), direct_entries, root_entries
+
+
+def container(
+    name: str,
+    *,
+    base_url: str | None = None,
+    client: PyNeurodeskClient | None = None,
+    mirror: str = DEFAULT_CVMFS_MIRROR,
+    repo: str = DEFAULT_CVMFS_REPO,
+    cache_dir: str | None = None,
+    progress: bool = True,
+    debug: bool = False,
+) -> NeurodeskContainer:
+    reporter = create_progress_reporter(enabled=progress, total_steps=9)
+    reporter.update(1, f"Preparing container {name}")
+    try:
+        reporter.update(2, f"Checking bundled metadata for {name}")
+        reference = _resolve_release_reference(name, mirror=mirror, repo=repo, cache_dir=cache_dir)
+
+        owned_daemon: DaemonState | None = None
+        if client is not None:
+            reporter.update(3, f"Using existing daemon client for {name}")
+            active_client = client
+        elif base_url is not None and base_url.strip():
+            reporter.update(3, f"Connecting to daemon at {base_url.rstrip('/')}")
+            active_client = connect(base_url=base_url)
+        else:
+            reporter.update(3, f"Starting dedicated daemon for {name}")
+            owned_daemon = start_container_daemon()
+            active_client = PyNeurodeskClient(owned_daemon.base_url)
+
+        if reference is None:
+            reporter.update(4, f"Searching CVMFS for {name}")
+            reference = resolve_container_reference(
+                active_client,
+                name,
+                mirror=mirror,
+                repo=repo,
+                cache_dir=cache_dir,
+            )
+        else:
+            reporter.update(4, f"Resolved {name} from bundled release metadata")
+
+        reporter.update(5, f"Checking image cache for {reference.image}")
+        image_state = active_client.get_image(reference.image)
+        if image_state is None:
+            reporter.update(6, f"Importing {Path(reference.path).name}")
+            active_client.import_image(
+                reference.image,
+                ImportImageRequest(source=reference.source, cache_dir=reference.cache_dir),
+            )
+        else:
+            reporter.update(6, f"Image {reference.image} is already cached")
+
+        reporter.update(7, f"Checking VM status for {reference.image}")
+        vm_state = active_client.instance_status()
+        if vm_state.status == "running" and vm_state.image == reference.image:
+            reporter.update(8, f"VM for {reference.image} is already running")
+        else:
+            if vm_state.status == "running" and vm_state.image not in ("", None, reference.image):
+                reporter.update(8, f"Stopping running VM {vm_state.image} before booting {reference.image}")
+                active_client.shutdown_instance()
+            boot_message = f"Requesting boot of {reference.image} and waiting for guest ready"
+            if debug:
+                boot_message += " with serial console enabled"
+            reporter.update(9, boot_message)
+            if debug:
+                _stream_debug_boot(active_client, reference.image)
+            else:
+                active_client.create_instance(reference.image, dmesg=False)
+        container_handle = NeurodeskContainer(active_client, reference, owned_daemon=owned_daemon)
+        reporter.close(f"{reference.image} is ready")
+        return container_handle
+    except httpx.HTTPStatusError as exc:
+        if debug:
+            _emit_debug_boot_log(exc)
+        reporter.close(f"Failed to prepare {name}")
+        raise
+    except Exception:
+        reporter.close(f"Failed to prepare {name}")
+        raise
+
+
+def resolve_container_reference(
+    client: PyNeurodeskClient | None,
+    name: str,
+    *,
+    base_url: str | None = None,
+    mirror: str,
+    repo: str,
+    cache_dir: str | None = None,
+) -> ContainerReference:
+    normalized_name = name.strip()
+    if not normalized_name:
+        raise ValueError("container name is required")
+
+    metadata_reference = _resolve_release_reference(
+        normalized_name,
+        mirror=mirror,
+        repo=repo,
+        cache_dir=cache_dir,
+    )
+    if metadata_reference is not None:
+        return metadata_reference
+
+    active_client = client if client is not None else connect(base_url=base_url)
+
+    versions, direct_entries, root_entries = _search_versions(
+        active_client,
+        normalized_name,
+        mirror=mirror,
+        repo=repo,
+        cache_dir=cache_dir,
+    )
+    if not versions:
+        raise LookupError(f"container {normalized_name!r} was not found in CVMFS")
+
+    selected_version = _select_preferred_version(versions)
+    selected_path = _resolve_version_path(
+        active_client,
+        normalized_name,
+        selected_version,
+        direct_entries=direct_entries,
+        root_entries=root_entries,
+        mirror=mirror,
+        repo=repo,
+        cache_dir=cache_dir,
+    )
+    return ContainerReference(
+        name=normalized_name,
+        image=normalized_name,
+        source=ImageSource(
+            type="cvmfs",
+            mirror=mirror,
+            repo=repo,
+            path=selected_path,
+        ),
+        cache_dir=cache_dir,
+    )
+
+
+def _resolve_release_reference(
+    name: str,
+    *,
+    mirror: str,
+    repo: str,
+    cache_dir: str | None,
+) -> ContainerReference | None:
+    normalized_name = name.strip()
+    if not normalized_name:
+        raise ValueError("container name is required")
+
+    local_versions = _search_local_release_versions(normalized_name)
+    if local_versions:
+        selected_version = _select_preferred_version(sorted(local_versions))
+        selected_path = build_release_container_path(
+            normalized_name,
+            selected_version,
+            local_versions[selected_version],
+        )
+        return ContainerReference(
+            name=normalized_name,
+            image=normalized_name,
+            source=ImageSource(
+                type="cvmfs",
+                mirror=mirror,
+                repo=repo,
+                path=selected_path,
+            ),
+            cache_dir=cache_dir,
+        )
+
+    remote_versions = _search_remote_release_versions(normalized_name)
+    if remote_versions:
+        selected_version = _select_preferred_version(sorted(remote_versions))
+        selected_path = build_release_container_path(
+            normalized_name,
+            selected_version,
+            remote_versions[selected_version],
+        )
+        return ContainerReference(
+            name=normalized_name,
+            image=normalized_name,
+            source=ImageSource(
+                type="cvmfs",
+                mirror=mirror,
+                repo=repo,
+                path=selected_path,
+            ),
+            cache_dir=cache_dir,
+        )
+    return None
+
+
+def start_default_daemon() -> DaemonState:
+    cache_root = default_cache_root()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    state_path = daemon_state_path_for_cache_dir(cache_root)
+    if state_path.exists():
+        state = DaemonState.from_file(state_path)
+        if _health_check(state.base_url):
+            return state
+        state_path.unlink(missing_ok=True)
+
+    return start_daemon_for_cache_dir(cache_root)
+
+
+def start_container_daemon() -> DaemonState:
+    cache_root = create_container_cache_dir()
+    return start_daemon_for_cache_dir(cache_root)
+
+
+def start_daemon_for_cache_dir(cache_root: Path) -> DaemonState:
+    cache_root.mkdir(parents=True, exist_ok=True)
+    state_path = daemon_state_path_for_cache_dir(cache_root)
+    ccvm_path = resolve_ccvm_binary_path()
+    log_path = cache_root / "ccvm-python.log"
+    with log_path.open("ab") as log_file:
+        proc = subprocess.Popen(
+            [str(ccvm_path), "-cache-dir", str(cache_root)],
+            stdout=subprocess.PIPE,
+            stderr=log_file,
+            text=True,
+            start_new_session=True,
+            cwd=str(ccvm_path.parent),
+        )
+        hello_line = ""
+        assert proc.stdout is not None
+        hello_line = proc.stdout.readline()
+        if not hello_line:
+            proc.kill()
+            proc.wait()
+            raise RuntimeError(f"failed to start ccvm from {ccvm_path}; see {log_path}")
+
+    try:
+        payload = json.loads(hello_line)
+    except json.JSONDecodeError as exc:
+        proc.kill()
+        proc.wait()
+        raise RuntimeError(f"failed to decode ccvm startup banner: {hello_line!r}") from exc
+
+    addr = str(payload.get("addr", "")).strip()
+    if not addr:
+        proc.kill()
+        proc.wait()
+        raise RuntimeError(f"ccvm startup banner did not include an address: {payload!r}")
+
+    state = DaemonState(addr=addr, cache_dir=str(cache_root))
+    state_path.write_text(json.dumps({"addr": addr}, indent=2))
+    if not _health_check(state.base_url):
+        state_path.unlink(missing_ok=True)
+        raise RuntimeError(f"started ccvm at {state.base_url}, but health check failed")
+    return state
+
+
+def resolve_ccvm_binary_path() -> Path:
+    for env_name in ("CCX3_CCVM", "CCVM_BINARY"):
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            path = Path(value).expanduser()
+            if path.exists():
+                return path
+            raise RuntimeError(f"{env_name} points to missing ccvm binary: {path}")
+
+    project_root = pyneurodesk_root()
+    candidates = [
+        project_root / "bin" / "ccvm",
+        project_root / "bin" / "ccvm.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            maybe_refresh_bundled_ccvm(candidate)
+            return candidate
+
+    raise RuntimeError(
+        "unable to find bundled ccvm binary; expected one of "
+        + ", ".join(str(candidate) for candidate in candidates)
+    )
+
+
+def pyneurodesk_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def repo_root() -> Path | None:
+    root = pyneurodesk_root().parent.parent
+    if (root / "go.mod").exists() and (root / "cmd" / "ccvm" / "main.go").exists():
+        return root
+    return None
+
+
+def maybe_refresh_bundled_ccvm(binary_path: Path) -> None:
+    root = repo_root()
+    if root is None:
+        return
+    if not _should_rebuild_ccvm(binary_path, root):
+        return
+    _build_ccvm_binary(binary_path, root)
+
+
+def _should_rebuild_ccvm(binary_path: Path, root: Path) -> bool:
+    if not binary_path.exists():
+        return True
+    try:
+        binary_mtime = binary_path.stat().st_mtime
+    except OSError:
+        return True
+    for rel_dir in ("cmd/ccvm", "client", "internal"):
+        source_dir = root / rel_dir
+        if not source_dir.exists():
+            continue
+        for source in source_dir.rglob("*.go"):
+            try:
+                if source.stat().st_mtime > binary_mtime:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def _build_ccvm_binary(binary_path: Path, root: Path) -> None:
+    binary_path.parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        ["go", "build", "-o", str(binary_path), "./cmd/ccvm"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip()
+        stdout = proc.stdout.strip()
+        detail = stderr or stdout or f"exit status {proc.returncode}"
+        raise RuntimeError(f"failed to build bundled ccvm binary: {detail}")
+
+
+def default_cache_root() -> Path:
+    home = Path.home()
+    if sys.platform == "darwin":
+        cache_root = Path(os.environ.get("HOME", str(home))) / "Library" / "Caches"
+    elif os.name == "nt":
+        cache_root = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local"))
+    else:
+        cache_root = Path(os.environ.get("XDG_CACHE_HOME", home / ".cache"))
+    return cache_root / "ccx3"
+
+
+def default_daemon_state_path() -> Path:
+    return daemon_state_path_for_cache_dir(default_cache_root())
+
+
+def daemon_state_path_for_cache_dir(cache_root: Path) -> Path:
+    return cache_root / "ccvm.json"
+
+
+def create_container_cache_dir() -> Path:
+    return default_cache_root() / "pyneurodesk-daemons" / uuid.uuid4().hex
+
+
+def _health_check(base_url: str) -> bool:
+    try:
+        with httpx.Client(base_url=base_url, timeout=2.0) as client:
+            response = client.get("/healthz")
+            return response.status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+def resolve_base_url(base_url: str | None = None) -> str:
+    if base_url is not None and base_url.strip():
+        return base_url.rstrip("/")
+
+    for env_name in ("CCX3_URL", "CCVM_URL"):
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            return value.rstrip("/")
+
+    state_path = default_daemon_state_path()
+    if state_path.exists():
+        state = DaemonState.from_file(state_path)
+        if _health_check(state.base_url):
+            return state.base_url
+        state_path.unlink(missing_ok=True)
+
+    return start_default_daemon().base_url
+
+
+def create_progress_reporter(*, enabled: bool, total_steps: int) -> ProgressReporter:
+    if not enabled:
+        return NullProgressReporter()
+    if _supports_notebook_display():
+        try:
+            return NotebookProgressReporter(total_steps)
+        except Exception:
+            pass
+    return StreamProgressReporter(total_steps)
+
+
+def _supports_notebook_display() -> bool:
+    try:
+        from IPython import get_ipython
+    except Exception:
+        return False
+    shell = get_ipython()
+    if shell is None:
+        return False
+    return shell.__class__.__name__ in {"ZMQInteractiveShell", "Shell"}
+
+
+def _escape_html(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _emit_debug_boot_log(exc: httpx.HTTPStatusError) -> None:
+    response = exc.response
+    if response is None:
+        print(f"ccx3 boot debug: {exc}", flush=True)
+        return
+    body = response.text.strip()
+    if not body:
+        print(f"ccx3 boot debug: {exc}", flush=True)
+        return
+    print("ccx3 boot debug output:", flush=True)
+    print(body, flush=True)
+
+
+def _stream_debug_boot(client: PyNeurodeskClient, image: str) -> None:
+    last_error: str | None = None
+    for event in client.create_instance_stream(image, dmesg=True):
+        kind = str(event.get("kind", ""))
+        if kind == "serial":
+            data = event.get("data", "")
+            if data:
+                print(data, end="", flush=True)
+            continue
+        if kind == "status":
+            message = str(event.get("message", "")).strip()
+            if message:
+                print(f"ccx3 boot: {message}", flush=True)
+            continue
+        if kind == "ready":
+            return
+        if kind == "error":
+            last_error = str(event.get("error", "")).strip() or "boot failed"
+            break
+    if last_error:
+        raise RuntimeError(last_error)
+    raise RuntimeError(f"boot stream for {image} ended before reporting readiness")
+
+
+def _find_exact_directory(entries: object, name: str):
+    for entry in entries.entries:
+        if entry.kind == "directory" and entry.name == name:
+            return entry
+    return None
+
+
+def _find_prefix_directory(entries: object, name: str):
+    matches = [
+        entry
+        for entry in entries.entries
+        if entry.kind == "directory" and entry.name.startswith(f"{name}_")
+    ]
+    if not matches:
+        return None
+    return sorted(matches, key=lambda entry: entry.name)[-1]
+
+def _find_best_container_path(entries: object, name: str) -> str | None:
+    exact_dir: str | None = None
+    prefix_dirs: list[str] = []
+    for entry in entries.entries:
+        if entry.kind == "directory":
+            if entry.name == name:
+                exact_dir = entry.path
+            elif entry.name.startswith(f"{name}_"):
+                prefix_dirs.append(entry.path)
+    if exact_dir is not None:
+        return exact_dir
+    if prefix_dirs:
+        return sorted(prefix_dirs)[-1]
+    return None
+
+
+def _find_simg_in_directory(
+    client: PyNeurodeskClient,
+    directory: str,
+    name: str,
+    mirror: str,
+    repo: str,
+    cache_dir: str | None,
+) -> str:
+    entries = client.cvmfs_list(
+        CVMFSSource(
+            mirror=mirror,
+            repo=repo,
+            path=directory,
+            cache_dir=cache_dir,
+        )
+    )
+    container_path = _find_best_container_path(entries, name)
+    if container_path is not None:
+        return container_path
+    raise LookupError(f"no container directory found under {directory}")
+
+
+def _try_find_simg_in_directory(
+    client: PyNeurodeskClient,
+    directory: str,
+    name: str,
+    mirror: str,
+    repo: str,
+    cache_dir: str | None,
+) -> str | None:
+    try:
+        return _find_simg_in_directory(client, directory, name, mirror, repo, cache_dir)
+    except (LookupError, httpx.HTTPStatusError):
+        return None
+
+
+def path_join(base: str, name: str) -> str:
+    base = base.rstrip("/")
+    name = name.lstrip("/")
+    if not base:
+        return "/" + name
+    return f"{base}/{name}"
+
+
+def _extract_versions_from_entries(entries: object, name: str) -> set[str]:
+    versions: set[str] = set()
+    prefix = f"{name}_"
+    for entry in entries.entries:
+        if entry.kind == "directory":
+            if entry.name == name:
+                versions.add(name)
+            elif entry.name.startswith(prefix):
+                versions.add(entry.name[len(prefix) :])
+    return versions
+
+
+def _search_local_release_versions(name: str) -> dict[str, str]:
+    releases_dir = resolve_release_index_dir()
+    if releases_dir is None:
+        return {}
+    container_dir = releases_dir / name
+    if not container_dir.is_dir():
+        return {}
+
+    ret: dict[str, str] = {}
+    for path in sorted(container_dir.glob("*.json")):
+        build = _extract_release_build(path)
+        if build:
+            ret[path.stem] = build
+    return ret
+
+
+def _search_remote_release_versions(name: str) -> dict[str, str]:
+    api_base = os.environ.get("PYNEURODESK_RELEASES_API", DEFAULT_RELEASES_API).rstrip("/")
+    url = f"{api_base}/{name}"
+    try:
+        with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=20.0, write=20.0, pool=5.0)) as client:
+            response = client.get(url, headers={"Accept": "application/vnd.github+json"})
+            if response.status_code == 404:
+                return {}
+            response.raise_for_status()
+            payload = response.json()
+    except Exception:
+        return {}
+
+    if not isinstance(payload, list):
+        return {}
+
+    versions: dict[str, str] = {}
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        name_value = entry.get("name")
+        download_url = entry.get("download_url")
+        if not isinstance(name_value, str) or not name_value.endswith(".json"):
+            continue
+        if not isinstance(download_url, str) or not download_url:
+            continue
+        build = _extract_remote_release_build(download_url)
+        if build:
+            versions[Path(name_value).stem] = build
+    return versions
+
+
+def _extract_remote_release_build(download_url: str) -> str | None:
+    try:
+        with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=20.0, write=20.0, pool=5.0)) as client:
+            response = client.get(download_url)
+            response.raise_for_status()
+            payload = response.json()
+    except Exception:
+        return None
+    apps = payload.get("apps")
+    if not isinstance(apps, dict) or not apps:
+        return None
+    first = next(iter(apps.values()))
+    if not isinstance(first, dict):
+        return None
+    build = first.get("version")
+    if not isinstance(build, str) or not build.strip():
+        return None
+    return build.strip()
+
+
+def resolve_release_index_dir() -> Path | None:
+    env = os.environ.get("PYNEURODESK_RELEASES_DIR", "").strip()
+    if env:
+        path = Path(env).expanduser()
+        return path if path.is_dir() else None
+
+    candidate = pyneurodesk_root().parent / "neurocontainers" / "releases"
+    if candidate.is_dir():
+        return candidate
+    return None
+
+
+def _extract_release_build(path: Path) -> str | None:
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return None
+    apps = payload.get("apps")
+    if not isinstance(apps, dict) or not apps:
+        return None
+    first = next(iter(apps.values()))
+    if not isinstance(first, dict):
+        return None
+    build = first.get("version")
+    if not isinstance(build, str) or not build.strip():
+        return None
+    return build.strip()
+
+
+def build_release_container_path(name: str, version: str, build: str) -> str:
+    stem = f"{name}_{version}_{build}"
+    return path_join(path_join(DEFAULT_CONTAINERS_PATH, stem), f"{stem}.simg")
+
+
+def _select_preferred_version(versions: list[str]) -> str:
+    def sort_key(value: str) -> tuple[int, str]:
+        if value == "":
+            return (0, value)
+        if value.isidentifier():
+            return (0, value)
+        return (1, value)
+
+    return sorted(versions, key=sort_key)[-1]
+
+
+def _resolve_version_path(
+    client: PyNeurodeskClient,
+    name: str,
+    version: str,
+    *,
+    direct_entries: object | None,
+    root_entries: object,
+    mirror: str,
+    repo: str,
+    cache_dir: str | None,
+) -> str:
+    if version == name:
+        return path_join(DEFAULT_CONTAINERS_PATH, name)
+
+    versioned_prefix = f"{name}_{version}"
+    root_entry = _find_matching_entry(root_entries, versioned_prefix)
+    if root_entry is not None:
+        if root_entry.kind == "directory":
+            return root_entry.path
+        if root_entry.kind == "file":
+            return root_entry.path
+    versioned_directory = path_join(DEFAULT_CONTAINERS_PATH, versioned_prefix)
+    simg_path = _try_find_simg_in_directory(client, versioned_directory, name, mirror, repo, cache_dir)
+    if simg_path is not None:
+        return simg_path
+    return versioned_directory
+
+
+def _find_matching_entry(entries: object, stem: str):
+    for entry in entries.entries:
+        if entry.kind == "directory" and entry.name == stem:
+            return entry
+    return None

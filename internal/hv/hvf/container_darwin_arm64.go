@@ -113,7 +113,10 @@ type ContainerSession struct {
 	transcript  *serialTranscript
 	listener    virtio.VsockListener
 	vsock       *virtio.Vsock
+	rootFS      virtio.ShareMounter
 	sendMu      sync.Mutex
+	shareMu     sync.Mutex
+	shares      map[string]client.ShareMount
 	nextID      atomic.Uint64
 	activeExecs *atomic.Int32
 }
@@ -134,10 +137,59 @@ type serialTranscript struct {
 	buf  bytes.Buffer
 }
 
+type bootEventWriter struct {
+	ch       chan string
+	done     chan struct{}
+	callback func(client.BootEvent) error
+	errMu    sync.Mutex
+	err      error
+}
+
 func newSerialTranscript() *serialTranscript {
 	s := &serialTranscript{}
 	s.cond = sync.NewCond(&s.mu)
 	return s
+}
+
+func newBootEventWriter(callback func(client.BootEvent) error) *bootEventWriter {
+	w := &bootEventWriter{
+		ch:       make(chan string, 128),
+		done:     make(chan struct{}),
+		callback: callback,
+	}
+	go func() {
+		defer close(w.done)
+		for chunk := range w.ch {
+			if w.callback == nil || chunk == "" {
+				continue
+			}
+			if err := w.callback(client.BootEvent{Kind: "serial", Data: chunk}); err != nil {
+				w.errMu.Lock()
+				if w.err == nil {
+					w.err = err
+				}
+				w.errMu.Unlock()
+				return
+			}
+		}
+	}()
+	return w
+}
+
+func (w *bootEventWriter) Write(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	w.ch <- string(append([]byte(nil), data...))
+	return len(data), nil
+}
+
+func (w *bootEventWriter) Close() error {
+	close(w.ch)
+	<-w.done
+	w.errMu.Lock()
+	defer w.errMu.Unlock()
+	return w.err
 }
 
 func (s *serialTranscript) Write(data []byte) (int, error) {
@@ -177,6 +229,23 @@ func (s *serialTranscript) waitFor(ctx context.Context, start int, predicate fun
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+func hasFatalBootText(text string) bool {
+	fatalMarkers := []string{
+		"ccx3-init-fatal:",
+		"Kernel panic",
+		"kernel panic",
+		"panic: ",
+		"not syncing",
+		"reboot: System halted",
+	}
+	for _, marker := range fatalMarkers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseInitDurationMarker(text string) (int, bool) {
@@ -248,8 +317,12 @@ type guestExecRequest struct {
 }
 
 func StartContainer(ctx context.Context, req ContainerRunRequest) (*ContainerSession, error) {
+	return StartContainerStream(ctx, req, nil)
+}
+
+func StartContainerStream(ctx context.Context, req ContainerRunRequest, onEvent func(client.BootEvent) error) (*ContainerSession, error) {
 	if req.Persistent {
-		return startPersistentContainer(ctx, req)
+		return startPersistentContainer(ctx, req, onEvent)
 	}
 	runCtx, cancel := context.WithCancel(context.Background())
 	readyCh := make(chan error, 1)
@@ -284,6 +357,48 @@ func StartContainer(ctx context.Context, req ContainerRunRequest) (*ContainerSes
 func (s *ContainerSession) Wait() error {
 	res := <-s.doneCh
 	return res.err
+}
+
+func (s *ContainerSession) AddShare(ctx context.Context, share client.ShareMount) error {
+	_ = ctx
+	if s.rootFS == nil {
+		return fmt.Errorf("root filesystem does not support runtime shares")
+	}
+	key := strings.TrimSpace(share.Mount)
+	if key == "" {
+		return fmt.Errorf("share mount path is required")
+	}
+	s.shareMu.Lock()
+	if existing, ok := s.shares[key]; ok {
+		s.shareMu.Unlock()
+		if existing.Source == share.Source && existing.Writable == share.Writable {
+			return nil
+		}
+		return fmt.Errorf("share mount %q already exists", key)
+	}
+	s.shareMu.Unlock()
+	_, backend, err := buildShareBackend(0, DirectoryShare{
+		Source:   share.Source,
+		Mount:    share.Mount,
+		Writable: share.Writable,
+	})
+	if err != nil {
+		return err
+	}
+	if err := s.rootFS.AddShare(virtio.ShareMount{
+		GuestPath: share.Mount,
+		Backend:   backend,
+		Writable:  share.Writable,
+	}); err != nil {
+		return err
+	}
+	s.shareMu.Lock()
+	if s.shares == nil {
+		s.shares = make(map[string]client.ShareMount)
+	}
+	s.shares[key] = share
+	s.shareMu.Unlock()
+	return nil
 }
 
 func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
@@ -582,7 +697,7 @@ func (s *ContainerSession) markExecDone() {
 	}
 }
 
-func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*ContainerSession, error) {
+func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEvent func(client.BootEvent) error) (*ContainerSession, error) {
 	start := time.Now()
 	if req.Image == nil && req.RootFS == nil {
 		return nil, fmt.Errorf("image or rootfs backend is required")
@@ -689,10 +804,17 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 	timingLog("hvf.StartContainer MapAnonymousMemory took=%s", time.Since(start))
 
 	serialOut := newSerialTranscript()
+	var serialWriter io.Writer = serialOut
+	var bootWriter *bootEventWriter
+	if onEvent != nil {
+		bootWriter = newBootEventWriter(onEvent)
+		serialWriter = io.MultiWriter(serialOut, bootWriter)
+		defer bootWriter.Close()
+	}
 	var consoleOut bytes.Buffer
 	var fsTrace bytes.Buffer
 	var runTrace bytes.Buffer
-	uart := serial.NewUART8250(bootarm64.DefaultUARTBase, bootarm64.DefaultUARTRegShift, serialOut)
+	uart := serial.NewUART8250(bootarm64.DefaultUARTBase, bootarm64.DefaultUARTRegShift, serialWriter)
 	uart.AttachIRQ(vm, containerUARTSPI)
 	console := virtio.NewConsole(containerConsoleBase, containerConsoleSize, containerConsoleIRQ, &consoleOut)
 	console.Attach(vm, vm)
@@ -704,7 +826,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 	}
 	vsock := virtio.NewVsock(containerVsockBase, containerVsockSize, containerVsockIRQ, containerGuestCID, vsockBackend)
 	vsock.Attach(vm, vm)
-	fsdevs, err := buildFSDevices(req, &fsTrace)
+	fsdevs, rootFS, err := buildFSDevices(req, &fsTrace)
 	if err != nil {
 		_ = listener.Close()
 		vm.Close()
@@ -735,7 +857,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 		Initrd:     initrd,
 		Console:    req.Dmesg,
 		ExtraNodes: appendFSNodes([]fdt.Node{console.DeviceTreeNode(), vsock.DeviceTreeNode()}, fsdevs),
-		Cmdline: strings.Join(bootCmdline, " "),
+		Cmdline:    strings.Join(bootCmdline, " "),
 	})
 	if err != nil {
 		vm.Close()
@@ -775,6 +897,12 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 	controlConnCh := make(chan readyResult, 1)
 	activeExecs := &atomic.Int32{}
 	guestReady := &atomic.Bool{}
+	sendReady := func(err error) {
+		select {
+		case readyCh <- err:
+		default:
+		}
+	}
 
 	go func() {
 		conn, err := listener.Accept()
@@ -792,7 +920,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 		select {
 		case res := <-controlAcceptCh:
 			if res.err != nil {
-				readyCh <- res.err
+				sendReady(res.err)
 				return
 			}
 			text, err := controlTranscript.waitFor(runCtx, 0, func(text string) bool {
@@ -800,7 +928,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 			})
 			if err != nil {
 				_ = res.conn.Close()
-				readyCh <- err
+				sendReady(err)
 				return
 			}
 			if initMS, ok := parseInitDurationMarker(text); ok {
@@ -816,9 +944,26 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 			timingLog("hvf.StartContainer guest ready marker took=%s", time.Since(start))
 			guestReady.Store(true)
 			controlConnCh <- res
-			readyCh <- nil
+			sendReady(nil)
 		case <-runCtx.Done():
-			readyCh <- runCtx.Err()
+			sendReady(runCtx.Err())
+		}
+	}()
+
+	if req.Dmesg {
+		go func() {
+			text, err := serialOut.waitFor(runCtx, 0, hasFatalBootText)
+			if err != nil || guestReady.Load() {
+				return
+			}
+			sendReady(fmt.Errorf("guest reported boot failure\nserial:\n%s", text))
+			cancel()
+		}()
+	}
+
+	go func() {
+		if onEvent != nil {
+			_ = onEvent(client.BootEvent{Kind: "status", Message: "waiting for guest to boot"})
 		}
 	}()
 
@@ -905,6 +1050,9 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 			if res.err != nil {
 				return nil, res.err
 			}
+			if req.Dmesg && serialOut.Len() > 0 {
+				return nil, fmt.Errorf("%w\nserial:\n%s", err, serialOut.String())
+			}
 			return nil, err
 		}
 		res, ok := <-controlConnCh
@@ -922,6 +1070,14 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 		}
 		_ = listener.Close()
 		timingLog("hvf.StartContainer total ready=%s", time.Since(start))
+		shareState := make(map[string]client.ShareMount, len(req.Shares))
+		for _, share := range req.Shares {
+			shareState[strings.TrimSpace(share.Mount)] = client.ShareMount{
+				Source:   share.Source,
+				Mount:    share.Mount,
+				Writable: share.Writable,
+			}
+		}
 		return &ContainerSession{
 			cancel:      cancel,
 			doneCh:      doneCh,
@@ -932,6 +1088,8 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 			control:     res.conn,
 			transcript:  controlTranscript,
 			vsock:       vsock,
+			rootFS:      rootFS,
+			shares:      shareState,
 			activeExecs: activeExecs,
 		}, nil
 	case res := <-doneCh:
@@ -947,6 +1105,9 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest) (*Co
 		res := <-doneCh
 		if res.err != nil {
 			return nil, res.err
+		}
+		if req.Dmesg && serialOut.Len() > 0 {
+			return nil, fmt.Errorf("%w\nserial:\n%s", ctx.Err(), serialOut.String())
 		}
 		return nil, ctx.Err()
 	}
@@ -1099,7 +1260,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	console := virtio.NewConsole(containerConsoleBase, containerConsoleSize, containerConsoleIRQ, &consoleOut)
 	console.Attach(vm, vm)
 	var vsock *virtio.Vsock
-	fsdevs, err := buildFSDevices(req, &fsTrace)
+	fsdevs, _, err := buildFSDevices(req, &fsTrace)
 	if err != nil {
 		return ContainerRunResult{}, err
 	}
@@ -1127,7 +1288,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 		Initrd:     initrd,
 		Console:    req.Dmesg,
 		ExtraNodes: appendFSNodes([]fdt.Node{console.DeviceTreeNode()}, fsdevs),
-		Cmdline: strings.Join(bootCmdline, " "),
+		Cmdline:    strings.Join(bootCmdline, " "),
 	})
 	if err != nil {
 		return ContainerRunResult{}, fmt.Errorf("prepare boot: %w", err)
@@ -1297,29 +1458,28 @@ type runResultVM struct {
 	err  error
 }
 
-func buildFSDevices(req ContainerRunRequest, trace io.Writer) ([]*virtio.FS, error) {
+func buildFSDevices(req ContainerRunRequest, trace io.Writer) ([]*virtio.FS, virtio.ShareMounter, error) {
 	rootFSBackend := req.RootFS
 	if rootFSBackend == nil {
 		if req.Image == nil {
-			return nil, fmt.Errorf("image or rootfs backend is required")
+			return nil, nil, fmt.Errorf("image or rootfs backend is required")
 		}
 		rootFSBackend = virtio.NewImageFS(req.Image.RootFS, req.Image.RootFSDir)
 	}
-	if len(req.Shares) > 0 {
-		shares := make([]virtio.ShareMount, 0, len(req.Shares))
-		for i, share := range req.Shares {
-			_, backend, err := buildShareBackend(i, share)
-			if err != nil {
-				return nil, err
-			}
-			shares = append(shares, virtio.ShareMount{
-				GuestPath: share.Mount,
-				Backend:   backend,
-				Writable:  share.Writable,
-			})
+	shares := make([]virtio.ShareMount, 0, len(req.Shares))
+	for i, share := range req.Shares {
+		_, backend, err := buildShareBackend(i, share)
+		if err != nil {
+			return nil, nil, err
 		}
-		rootFSBackend = virtio.NewMountedFS(rootFSBackend, shares)
+		shares = append(shares, virtio.ShareMount{
+			GuestPath: share.Mount,
+			Backend:   backend,
+			Writable:  share.Writable,
+		})
 	}
+	rootFSBackend = virtio.NewMountedFS(rootFSBackend, shares)
+	rootFS, _ := rootFSBackend.(virtio.ShareMounter)
 	devs := []*virtio.FS{
 		newFSDevice(containerFSBase, containerFSIRQ, containerRootFSTag, rootFSBackend, trace),
 	}
@@ -1327,7 +1487,7 @@ func buildFSDevices(req ContainerRunRequest, trace io.Writer) ([]*virtio.FS, err
 		sourceDir := filepath.Dir(req.AMD64EmulatorPath)
 		devs = append(devs, newFSDevice(containerShareFSBase, containerShareFSIRQ, containerEmulatorTag, virtio.NewImageFS(imagefs.NewHostFS(sourceDir, nil), sourceDir), trace))
 	}
-	return devs, nil
+	return devs, rootFS, nil
 }
 
 func newFSDevice(base uint64, irq uint32, tag string, backend virtio.FSBackend, trace io.Writer) *virtio.FS {

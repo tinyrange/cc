@@ -12,10 +12,12 @@ import (
 
 type Backend interface {
 	Start(context.Context, client.CreateInstanceRequest) (Instance, error)
+	StartStream(context.Context, client.CreateInstanceRequest, func(client.BootEvent) error) (Instance, error)
 	Run(context.Context, client.RunRequest) (client.ExecResponse, error)
 }
 
 type Instance interface {
+	AddShare(context.Context, client.ShareMount) error
 	Exec(context.Context, client.ExecRequest) (client.ExecResponse, error)
 	ExecStream(context.Context, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 	Wait() error
@@ -53,6 +55,10 @@ func Supports() error {
 }
 
 func (m *Manager) Start(ctx context.Context, req client.CreateInstanceRequest) (client.InstanceState, error) {
+	return m.StartStream(ctx, req, nil)
+}
+
+func (m *Manager) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
 	if req.Image == "" {
 		return client.InstanceState{}, fmt.Errorf("image is required")
 	}
@@ -68,7 +74,7 @@ func (m *Manager) Start(ctx context.Context, req client.CreateInstanceRequest) (
 	}
 	m.mu.Unlock()
 
-	inst, err := m.backend.Start(ctx, req)
+	inst, err := m.backend.StartStream(ctx, req, onEvent)
 	if err != nil {
 		return client.InstanceState{}, err
 	}
@@ -114,6 +120,11 @@ func (m *Manager) Run(ctx context.Context, req client.RunRequest) (client.ExecRe
 	if machine != nil {
 		if req.Image != "" && req.Image != machine.image {
 			return client.ExecResponse{}, fmt.Errorf("running instance image is %q, got exec request for %q", machine.image, req.Image)
+		}
+		for _, share := range req.Shares {
+			if err := machine.instance.AddShare(ctx, share); err != nil {
+				return client.ExecResponse{}, err
+			}
 		}
 		return machine.instance.Exec(ctx, client.ExecRequest{
 			Command: append([]string(nil), req.Command...),
@@ -186,8 +197,13 @@ func (m *Manager) watch(machine *Machine) {
 type unsupportedBackend struct{}
 
 func (unsupportedBackend) Start(ctx context.Context, req client.CreateInstanceRequest) (Instance, error) {
+	return unsupportedBackend{}.StartStream(ctx, req, nil)
+}
+
+func (unsupportedBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
 	_ = ctx
 	_ = req
+	_ = onEvent
 	return nil, fmt.Errorf("VM backend is not configured")
 }
 

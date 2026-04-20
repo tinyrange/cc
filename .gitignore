@@ -1,1 +1,11 @@
 /local
+/internal/guestinit/guest-init-linux-arm64
+/pyneurodesk/.git
+/pyneurodesk/.venv
+/pyneurodesk/.pytest_cache
+/pyneurodesk/.ipynb_checkpoints
+/pyneurodesk/notebooks/.ipynb_checkpoints
+/pyneurodesk/**/__pycache__
+/pyneurodesk/**/*.pyc
+/pyneurodesk/**/*.pyo
+/pyneurodesk/.DS_Store

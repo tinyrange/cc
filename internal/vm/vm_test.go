@@ -154,6 +154,47 @@ func TestManagerRunForwardsStdinToRunningInstance(t *testing.T) {
 	}
 }
 
+func TestManagerRunMountsRuntimeSharesBeforeExec(t *testing.T) {
+	inst := &fakeInstance{waitCh: make(chan error, 1)}
+	var mounted []client.ShareMount
+	var got client.ExecRequest
+	inst.addShareFn = func(share client.ShareMount) error {
+		mounted = append(mounted, share)
+		return nil
+	}
+	inst.execFn = func(req client.ExecRequest) (client.ExecResponse, error) {
+		got = req
+		return client.ExecResponse{ExitCode: 0}, nil
+	}
+	mgr := NewManagerWithBackend(fakeBackend{instance: inst})
+	mgr.supports = func() error { return nil }
+
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{Image: "alpine"}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	_, err := mgr.Run(context.Background(), client.RunRequest{
+		Image: "alpine",
+		Shares: []client.ShareMount{{
+			Source: "/host/share",
+			Mount:  "/.share/demo",
+		}},
+		Command: []string{"cat", "/.share/demo/hello.txt"},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(mounted) != 1 {
+		t.Fatalf("mounted shares = %d, want 1", len(mounted))
+	}
+	if mounted[0].Mount != "/.share/demo" {
+		t.Fatalf("mounted share path = %q, want %q", mounted[0].Mount, "/.share/demo")
+	}
+	if len(got.Command) != 2 || got.Command[1] != "/.share/demo/hello.txt" {
+		t.Fatalf("exec command = %q, want guest share path", got.Command)
+	}
+}
+
 func TestLoadAMD64EmulatorReadsQEMU(t *testing.T) {
 	if runtime.GOARCH != "arm64" {
 		t.Skip("amd64 emulation helper is only enabled on arm64 hosts")
@@ -184,8 +225,13 @@ type fakeBackend struct {
 }
 
 func (f fakeBackend) Start(ctx context.Context, req client.CreateInstanceRequest) (Instance, error) {
+	return f.StartStream(ctx, req, nil)
+}
+
+func (f fakeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
 	_ = ctx
 	_ = req
+	_ = onEvent
 	return f.instance, f.err
 }
 
@@ -196,12 +242,21 @@ func (f fakeBackend) Run(ctx context.Context, req client.RunRequest) (client.Exe
 }
 
 type fakeInstance struct {
-	waitCh   chan error
-	closed   int
-	execResp client.ExecResponse
-	execErr  error
-	execFn   func(client.ExecRequest) (client.ExecResponse, error)
-	streamFn func(client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+	waitCh     chan error
+	closed     int
+	execResp   client.ExecResponse
+	execErr    error
+	addShareFn func(client.ShareMount) error
+	execFn     func(client.ExecRequest) (client.ExecResponse, error)
+	streamFn   func(client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+}
+
+func (f *fakeInstance) AddShare(ctx context.Context, share client.ShareMount) error {
+	_ = ctx
+	if f.addShareFn != nil {
+		return f.addShareFn(share)
+	}
+	return nil
 }
 
 func (f *fakeInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {

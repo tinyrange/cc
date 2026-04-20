@@ -5,6 +5,7 @@ package vm
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/guestinit"
 	"j5.nz/cc/internal/hv/hvf"
+	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/oci"
 )
@@ -37,13 +39,17 @@ func NewRuntimeBackend(kernel *alpine.Manager, images *oci.Store, guestInitCache
 }
 
 func (b *runtimeBackend) Start(ctx context.Context, req client.CreateInstanceRequest) (Instance, error) {
+	return b.StartStream(ctx, req, nil)
+}
+
+func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
 	start := time.Now()
 	runReq, err := b.buildStartRequest(ctx, req)
 	if err != nil {
 		return nil, err
 	}
 	timingLog("runtime.Start buildStartRequest took=%s image=%q", time.Since(start), req.Image)
-	session, err := hvf.StartContainer(ctx, runReq)
+	session, err := hvf.StartContainerStream(ctx, runReq, onEvent)
 	if err != nil {
 		return nil, err
 	}
@@ -75,6 +81,7 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	if err != nil {
 		return hvf.ContainerRunRequest{}, err
 	}
+	image = withRuntimeMountDirs(image)
 	timingLog("buildBaseRequest image open took=%s image=%q", time.Since(start), imageName)
 	kernel, err := b.kernel.ReadKernel()
 	if err != nil {
@@ -122,6 +129,19 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 		CPUs:              cpus,
 		Dmesg:             dmesg,
 	}, ctx.Err()
+}
+
+func withRuntimeMountDirs(image *oci.Image) *oci.Image {
+	if image == nil || image.RootFS == nil {
+		return image
+	}
+	overlay := imagefs.NewOverlay(image.RootFS)
+	for _, dir := range []string{"/dev", "/proc", "/sys", "/run", "/tmp"} {
+		_ = overlay.AddDir(dir, fs.ModeDir|0o755)
+	}
+	cloned := *image
+	cloned.RootFS = overlay.Root()
+	return &cloned
 }
 
 func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.CreateInstanceRequest) (hvf.ContainerRunRequest, error) {

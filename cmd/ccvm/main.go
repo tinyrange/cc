@@ -26,6 +26,8 @@ import (
 
 var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
 
+const vmBootTimeout = 30 * time.Second
+
 func timingLog(format string, args ...any) {
 	if !debugTiming {
 		return
@@ -228,6 +230,8 @@ func newMux(srvState *server, httpServer *http.Server) *http.ServeMux {
 	})
 	mux.HandleFunc("POST /vm", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		bootCtx, cancel := context.WithTimeout(r.Context(), vmBootTimeout)
+		defer cancel()
 		var req client.CreateInstanceRequest
 		if err := decodeRequiredJSON(r, &req); err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -235,19 +239,63 @@ func newMux(srvState *server, httpServer *http.Server) *http.ServeMux {
 		}
 		timingLog("POST /vm decode took=%s image=%q", time.Since(start), req.Image)
 		if _, err := srvState.images.Get(req.Image); err != nil {
+			if wantsBootEventStream(r) {
+				writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("image %q is not available", req.Image)})
+				return
+			}
 			writeError(w, http.StatusBadRequest, fmt.Errorf("image %q is not available", req.Image))
 			return
 		}
 		timingLog("POST /vm image lookup took=%s", time.Since(start))
+		if wantsBootEventStream(r) {
+			writeBootEvent(w, client.BootEvent{Kind: "status", Message: fmt.Sprintf("validated image %s", req.Image)})
+		}
 		if srvState.kernel.Status().Status != "downloaded" {
-			if err := srvState.kernel.Ensure(r.Context()); err != nil {
+			if wantsBootEventStream(r) {
+				writeBootEvent(w, client.BootEvent{Kind: "status", Message: "ensuring kernel is available"})
+			}
+			if err := srvState.kernel.Ensure(bootCtx); err != nil {
+				if wantsBootEventStream(r) {
+					if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
+						writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", vmBootTimeout)})
+						return
+					}
+					writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+					return
+				}
+				if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
+					writeError(w, http.StatusGatewayTimeout, fmt.Errorf("vm boot timed out after %s", vmBootTimeout))
+					return
+				}
 				writeError(w, http.StatusInternalServerError, err)
 				return
 			}
 		}
 		timingLog("POST /vm kernel ensure/status took=%s", time.Since(start))
-		state, err := srvState.vms.Start(r.Context(), req)
+		if wantsBootEventStream(r) {
+			writeBootEvent(w, client.BootEvent{Kind: "status", Message: fmt.Sprintf("starting VM for %s", req.Image)})
+			state, err := srvState.vms.StartStream(bootCtx, req, func(event client.BootEvent) error {
+				return writeBootEvent(w, event)
+			})
+			if err != nil {
+				if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
+					_ = writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", vmBootTimeout)})
+					return
+				}
+				_ = writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+				return
+			}
+			timingLog("POST /vm vms.StartStream took=%s", time.Since(start))
+			_ = writeBootEvent(w, client.BootEvent{Kind: "ready", State: state})
+			timingLog("POST /vm total=%s", time.Since(start))
+			return
+		}
+		state, err := srvState.vms.Start(bootCtx, req)
 		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
+				writeError(w, http.StatusGatewayTimeout, fmt.Errorf("vm boot timed out after %s", vmBootTimeout))
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -398,6 +446,13 @@ func wantsExecEventStream(r *http.Request) bool {
 	return r.Header.Get("Accept") == "application/x-ndjson"
 }
 
+func wantsBootEventStream(r *http.Request) bool {
+	if r.URL.Query().Get("stream") == "1" {
+		return true
+	}
+	return r.Header.Get("Accept") == "application/x-ndjson"
+}
+
 func writeExecEventStream(w http.ResponseWriter, resp client.ExecResponse) {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.WriteHeader(http.StatusOK)
@@ -409,6 +464,24 @@ func writeExecEventStream(w http.ResponseWriter, resp client.ExecResponse) {
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
+}
+
+func writeBootEvent(w http.ResponseWriter, event client.BootEvent) error {
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	if event.Kind == "" {
+		event.Kind = "status"
+	}
+	if _, ok := w.(http.Flusher); ok {
+		// WriteHeader is safe to call repeatedly before the first write.
+		w.WriteHeader(http.StatusOK)
+	}
+	if err := json.NewEncoder(w).Encode(event); err != nil {
+		return err
+	}
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return nil
 }
 
 func writeError(w http.ResponseWriter, status int, err error) {

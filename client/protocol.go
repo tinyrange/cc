@@ -15,6 +15,14 @@ type ErrorResponse struct {
 	Error string `json:"error"`
 }
 
+type BootEvent struct {
+	Kind    string        `json:"kind"`
+	Message string        `json:"message,omitempty"`
+	Data    string        `json:"data,omitempty"`
+	Error   string        `json:"error,omitempty"`
+	State   InstanceState `json:"state,omitempty"`
+}
+
 type KernelState struct {
 	Status  string `json:"status"`
 	Error   string `json:"error,omitempty"`

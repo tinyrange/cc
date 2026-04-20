@@ -1,0 +1,27 @@
+[project]
+name = "pyneurodesk"
+version = "0.1.0"
+description = "Python client for the ccx3 Neurodesk-oriented image and VM API"
+readme = "README.md"
+authors = [
+    { name = "Joshua Scarsbrook", email = "jscarsbrook@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+]
+
+[project.scripts]
+pyneurodesk = "pyneurodesk:main"
+
+[build-system]
+requires = ["uv_build>=0.9.24,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

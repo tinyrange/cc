@@ -45,8 +45,13 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 }
 
 func StartContainer(ctx context.Context, req ContainerRunRequest) (*ContainerSession, error) {
+	return StartContainerStream(ctx, req, nil)
+}
+
+func StartContainerStream(ctx context.Context, req ContainerRunRequest, onEvent func(client.BootEvent) error) (*ContainerSession, error) {
 	_ = ctx
 	_ = req
+	_ = onEvent
 	return nil, fmt.Errorf("hvf container runner is unsupported on this host")
 }
 

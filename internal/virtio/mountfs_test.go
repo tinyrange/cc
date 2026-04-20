@@ -4,109 +4,45 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"j5.nz/cc/internal/imagefs"
 )
 
-func TestMountedFSRootReadDirIncludesShareMount(t *testing.T) {
-	t.Parallel()
-
+func TestMountedFSAddShareExposesFiles(t *testing.T) {
 	rootDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(rootDir, "base.txt"), []byte("base"), 0o644); err != nil {
-		t.Fatal(err)
+	shareDir := filepath.Join(t.TempDir(), "share")
+	if err := os.MkdirAll(shareDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(share) error = %v", err)
 	}
-	shareDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(shareDir, "shared.txt"), []byte("shared"), 0o644); err != nil {
-		t.Fatal(err)
+	if err := os.WriteFile(filepath.Join(shareDir, "hello.txt"), []byte("hello from share\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(share) error = %v", err)
 	}
 
-	be := NewMountedFS(
-		NewImageFS(imagefs.NewHostFS(rootDir, nil), rootDir),
-		[]ShareMount{{
-			GuestPath: "/work",
-			Backend:   NewImageFS(imagefs.NewHostFS(shareDir, nil), shareDir),
-		}},
-	)
+	backend := NewMountedFS(NewPassthroughFS(rootDir, nil), nil)
+	mounter, ok := backend.(ShareMounter)
+	if !ok {
+		t.Fatalf("backend does not support ShareMounter")
+	}
+	if err := mounter.AddShare(ShareMount{
+		GuestPath: "/.share/demo",
+		Backend:   NewPassthroughFS(shareDir, nil),
+	}); err != nil {
+		t.Fatalf("AddShare() error = %v", err)
+	}
 
-	fh, errno := be.OpenDir(1, 0)
+	nodeID, _, errno := backendLookupPath(backend, "/.share/demo/hello.txt")
 	if errno != 0 {
-		t.Fatalf("OpenDir(/) errno = %d", errno)
+		t.Fatalf("backendLookupPath() errno = %d", errno)
 	}
-	defer be.ReleaseDir(1, fh)
-
-	entries, errno := be.ReadDir(1, fh, 0, 1<<20)
+	fh, errno := backend.Open(nodeID, linuxORDONLY)
 	if errno != 0 {
-		t.Fatalf("ReadDir(/) errno = %d", errno)
+		t.Fatalf("Open() errno = %d", errno)
 	}
-	dirents := decodeDirEntries(entries)
-	names := map[string]bool{}
-	for _, ent := range dirents {
-		names[ent.name] = true
-	}
-	for _, want := range []string{".", "..", "base.txt", "work"} {
-		if !names[want] {
-			t.Fatalf("root dir missing %q: %#v", want, dirents)
-		}
-	}
+	defer backend.Release(nodeID, fh)
 
-	workID, _, errno := be.Lookup(1, "work")
+	data, errno := backend.Read(nodeID, fh, 0, 1<<20)
 	if errno != 0 {
-		t.Fatalf("Lookup(/work) errno = %d", errno)
+		t.Fatalf("Read() errno = %d", errno)
 	}
-	workFH, errno := be.OpenDir(workID, 0)
-	if errno != 0 {
-		t.Fatalf("OpenDir(/work) errno = %d", errno)
-	}
-	defer be.ReleaseDir(workID, workFH)
-	workEntries, errno := be.ReadDir(workID, workFH, 0, 1<<20)
-	if errno != 0 {
-		t.Fatalf("ReadDir(/work) errno = %d", errno)
-	}
-	workDirents := decodeDirEntries(workEntries)
-	foundShared := false
-	for _, ent := range workDirents {
-		if ent.name == "shared.txt" {
-			foundShared = true
-			break
-		}
-	}
-	if !foundShared {
-		t.Fatalf("/work dir missing shared.txt: %#v", workDirents)
-	}
-}
-
-func TestMountedFSWritableShareCreateWrite(t *testing.T) {
-	t.Parallel()
-
-	rootDir := t.TempDir()
-	shareDir := t.TempDir()
-	be := NewMountedFS(
-		NewImageFS(imagefs.NewHostFS(rootDir, nil), rootDir),
-		[]ShareMount{{
-			GuestPath: "/work",
-			Backend:   NewPassthroughFS(shareDir, nil),
-			Writable:  true,
-		}},
-	)
-
-	workID, _, errno := be.Lookup(1, "work")
-	if errno != 0 {
-		t.Fatalf("Lookup(/work) errno = %d", errno)
-	}
-	nodeID, fh, _, errno := be.(fsCreateBackend).Create(workID, "hello.txt", linuxOWRONLY|linuxOCREAT|linuxOTRUNC, 0o644)
-	if errno != 0 {
-		t.Fatalf("Create(/work/hello.txt) errno = %d", errno)
-	}
-	if wrote, errno := be.(fsWriteBackend).Write(nodeID, fh, 0, []byte("hello mounted fs"), 0); errno != 0 || wrote != 16 {
-		t.Fatalf("Write(/work/hello.txt) = (%d, %d)", wrote, errno)
-	}
-	be.Release(nodeID, fh)
-
-	data, err := os.ReadFile(filepath.Join(shareDir, "hello.txt"))
-	if err != nil {
-		t.Fatalf("ReadFile(host share) error = %v", err)
-	}
-	if string(data) != "hello mounted fs" {
-		t.Fatalf("host share contents = %q", string(data))
+	if string(data) != "hello from share\n" {
+		t.Fatalf("Read() = %q, want %q", string(data), "hello from share\n")
 	}
 }

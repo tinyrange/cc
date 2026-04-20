@@ -1,6 +1,7 @@
 package virtio
 
 import (
+	"fmt"
 	"path"
 	"sort"
 	"strings"
@@ -26,7 +27,7 @@ type mountedFS struct {
 	root   FSBackend
 	mounts []shareMount
 
-	mu         sync.Mutex
+	mu         sync.RWMutex
 	nextNodeID uint64
 	nextHandle uint64
 	nodes      map[uint64]*mountedNode
@@ -85,6 +86,46 @@ func NewMountedFS(root FSBackend, shares []ShareMount) FSBackend {
 		pathToNode: map[string]uint64{"/": 1},
 		handles:    map[uint64]*mountedHandle{},
 	}
+}
+
+type ShareMounter interface {
+	AddShare(ShareMount) error
+}
+
+func (m *mountedFS) AddShare(share ShareMount) error {
+	mountPath := cleanMountPath(share.GuestPath)
+	if mountPath == "/" {
+		return nil
+	}
+	if share.Backend == nil {
+		return nil
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, existing := range m.mounts {
+		if existing.path != mountPath {
+			continue
+		}
+		if existing.writable != share.Writable || existing.backend != share.Backend {
+			return fmt.Errorf("mount path %q is already in use", mountPath)
+		}
+		return nil
+	}
+
+	m.mounts = append(m.mounts, shareMount{
+		path:     mountPath,
+		backend:  share.Backend,
+		writable: share.Writable,
+	})
+	sort.Slice(m.mounts, func(i, j int) bool {
+		if len(m.mounts[i].path) == len(m.mounts[j].path) {
+			return m.mounts[i].path < m.mounts[j].path
+		}
+		return len(m.mounts[i].path) < len(m.mounts[j].path)
+	})
+	return nil
 }
 
 func cleanMountPath(value string) string {
@@ -548,6 +589,8 @@ func (m *mountedFS) resolveBackendNode(guestPath string) (FSBackend, uint64, *sh
 }
 
 func (m *mountedFS) mountForPath(guestPath string) *shareMount {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	var best *shareMount
 	for i := range m.mounts {
 		mount := &m.mounts[i]
@@ -557,10 +600,16 @@ func (m *mountedFS) mountForPath(guestPath string) *shareMount {
 			}
 		}
 	}
-	return best
+	if best == nil {
+		return nil
+	}
+	copy := *best
+	return &copy
 }
 
 func (m *mountedFS) isMountPath(guestPath string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	for i := range m.mounts {
 		if m.mounts[i].path == guestPath {
 			return true
@@ -576,6 +625,8 @@ func (m *mountedFS) isSyntheticPath(guestPath string) bool {
 	if m.isMountPath(guestPath) {
 		return false
 	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	for i := range m.mounts {
 		mount := m.mounts[i].path
 		if strings.HasPrefix(mount, guestPath+"/") {
@@ -587,6 +638,8 @@ func (m *mountedFS) isSyntheticPath(guestPath string) bool {
 
 func (m *mountedFS) mountChildren(parent string) []string {
 	parent = cleanMountPath(parent)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	set := map[string]struct{}{}
 	for _, mount := range m.mounts {
 		if parent == "/" {
@@ -697,8 +750,8 @@ func syntheticDirAttr() FuseAttr {
 }
 
 func (m *mountedFS) node(id uint64) *mountedNode {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.nodes[id]
 }
 
@@ -754,8 +807,8 @@ func (m *mountedFS) storeHandle(backend FSBackend, nodeID uint64, fh uint64, dir
 }
 
 func (m *mountedFS) handle(id uint64, dir bool) *mountedHandle {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	handle := m.handles[id]
 	if handle == nil || handle.dir != dir {
 		return nil
@@ -811,6 +864,7 @@ func readLE64(src []byte) uint64 {
 }
 
 var _ FSBackend = (*mountedFS)(nil)
+var _ ShareMounter = (*mountedFS)(nil)
 var _ fsMkdirBackend = (*mountedFS)(nil)
 var _ fsRmDirBackend = (*mountedFS)(nil)
 var _ fsCreateBackend = (*mountedFS)(nil)

@@ -22,9 +22,10 @@ import (
 )
 
 const configPath = "/etc/ccx3-init.json"
-const guestQEMUPath = "/.pkg/qemu-x86_64"
+const guestQEMUPath = "/run/ccx3/qemu-x86_64"
 const initDurationMarker = "__CCX3_INIT_MS__:"
 const execTimingMarker = "__CCX3_TIMING__:"
+const fatalBootMarker = "ccx3-init-fatal: "
 
 var consoleFD = 2
 var kmsgFD = -1
@@ -135,7 +136,8 @@ func (m *managedExec) resize(cols, rows int) error {
 
 func main() {
 	if err := run(); err != nil {
-		writeConsole("ccx3-init: " + err.Error() + "\n")
+		writeKernel(fatalBootMarker + err.Error())
+		writeConsole(fatalBootMarker + err.Error() + "\n")
 		for {
 			syscall.Pause()
 		}
@@ -238,14 +240,6 @@ func mountRootFS(tag, emulatorTag string) error {
 	if err := syscall.Mount(tag, "/mnt", "virtiofs", 0, ""); err != nil {
 		return fmt.Errorf("mount virtiofs %s: %w", tag, err)
 	}
-	if emulatorTag != "" {
-		if err := os.MkdirAll("/mnt/.pkg", 0o755); err != nil {
-			return fmt.Errorf("mkdir /mnt/.pkg: %w", err)
-		}
-		if err := syscall.Mount(emulatorTag, "/mnt/.pkg", "virtiofs", 0, ""); err != nil {
-			return fmt.Errorf("mount emulator virtiofs %s: %w", emulatorTag, err)
-		}
-	}
 	if err := syscall.Chroot("/mnt"); err != nil {
 		return fmt.Errorf("chroot /mnt: %w", err)
 	}
@@ -253,7 +247,7 @@ func mountRootFS(tag, emulatorTag string) error {
 		return fmt.Errorf("chdir / after chroot: %w", err)
 	}
 
-	for _, dir := range []string{"/proc", "/sys", "/dev", "/tmp", "/dev/pts", "/dev/shm"} {
+	for _, dir := range []string{"/proc", "/sys", "/dev", "/tmp", "/run"} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("mkdir %s: %w", dir, err)
 		}
@@ -262,8 +256,22 @@ func mountRootFS(tag, emulatorTag string) error {
 	_ = syscall.Mount("sysfs", "/sys", "sysfs", 0, "")
 	_ = syscall.Mount("devtmpfs", "/dev", "devtmpfs", 0, "")
 	_ = syscall.Mount("tmpfs", "/tmp", "tmpfs", 0, "mode=1777")
+	_ = syscall.Mount("tmpfs", "/run", "tmpfs", 0, "mode=755")
+	for _, dir := range []string{"/dev/pts", "/dev/shm"} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", dir, err)
+		}
+	}
 	_ = syscall.Mount("devpts", "/dev/pts", "devpts", 0, "")
 	_ = syscall.Mount("tmpfs", "/dev/shm", "tmpfs", 0, "mode=1777")
+	if emulatorTag != "" {
+		if err := os.MkdirAll("/run/ccx3", 0o755); err != nil {
+			return fmt.Errorf("mkdir /run/ccx3: %w", err)
+		}
+		if err := syscall.Mount(emulatorTag, "/run/ccx3", "virtiofs", 0, ""); err != nil {
+			return fmt.Errorf("mount emulator virtiofs %s: %w", emulatorTag, err)
+		}
+	}
 	_ = os.Symlink("/proc/self/fd", "/dev/fd")
 	return nil
 }
