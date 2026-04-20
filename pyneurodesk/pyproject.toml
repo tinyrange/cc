@@ -9,10 +9,13 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "httpx>=0.28.1",
+    "nibabel>=5.3.2",
+    "pyyaml>=6.0.2",
 ]
 
 [project.scripts]
 pyneurodesk = "pyneurodesk:main"
+pyneurodesk-fulltest = "pyneurodesk.fulltest:main"
 
 [build-system]
 requires = ["uv_build>=0.9.24,<0.10.0"]

@@ -263,6 +263,26 @@ def test_create_instance_sends_dmesg_when_requested() -> None:
     assert result.status == "running"
 
 
+def test_create_instance_sends_memory_and_cpu_overrides() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["json"] = request.read().decode()
+        return httpx.Response(200, json={"status": "running", "image": "niimath", "memory_mb": 4096, "cpus": 2})
+
+    client = make_client(httpx.MockTransport(handler))
+    try:
+        result = client.create_instance("niimath", memory_mb=4096, cpus=2)
+    finally:
+        client.close()
+
+    assert seen["path"] == "/vm"
+    assert seen["json"] == '{"image":"niimath","memory_mb":4096,"cpus":2}'
+    assert result.memory_mb == 4096
+    assert result.cpus == 2
+
+
 def test_create_instance_stream_yields_boot_events() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.params.get("stream") == "1"

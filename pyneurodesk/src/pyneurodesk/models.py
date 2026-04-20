@@ -209,6 +209,9 @@ class RunCommandRequest:
     workdir: str | None = None
     user: str | None = None
     stdin: bytes | None = None
+    memory_mb: int | None = None
+    cpus: int | None = None
+    dmesg: bool = False
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -225,6 +228,12 @@ class RunCommandRequest:
             payload["user"] = self.user
         if self.stdin is not None:
             payload["stdin"] = self.stdin.decode("utf-8", errors="surrogateescape")
+        if self.memory_mb is not None:
+            payload["memory_mb"] = self.memory_mb
+        if self.cpus is not None:
+            payload["cpus"] = self.cpus
+        if self.dmesg:
+            payload["dmesg"] = True
         return payload
 
 
