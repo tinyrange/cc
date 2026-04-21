@@ -6,6 +6,7 @@ import posixpath
 import subprocess
 import sys
 import uuid
+import base64
 from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
@@ -13,7 +14,16 @@ from typing import Protocol
 import httpx
 
 from .client import PyNeurodeskClient
-from .models import CVMFSSource, ContainerReference, DaemonState, ImageSource, ImportImageRequest, ShareMount
+from .models import (
+    CVMFSReadRequest,
+    CVMFSSource,
+    ContainerReference,
+    DaemonState,
+    DeployMetadata,
+    ImageSource,
+    ImportImageRequest,
+    ShareMount,
+)
 
 DEFAULT_CVMFS_MIRROR = "https://cvmfs.neurodesk.org"
 DEFAULT_CVMFS_REPO = "neurodesk.ardc.edu.au"
@@ -144,6 +154,7 @@ class NeurodeskContainer:
         self.reference = reference
         self._owned_daemon = owned_daemon
         self._closed = False
+        self._deploy_metadata: DeployMetadata | None = None
 
     @property
     def name(self) -> str:
@@ -165,20 +176,35 @@ class NeurodeskContainer:
     def owns_daemon(self) -> bool:
         return self._owned_daemon is not None
 
+    @property
+    def deploy_metadata(self) -> DeployMetadata:
+        if self._deploy_metadata is None:
+            self._deploy_metadata = load_deploy_metadata(self)
+        return self._deploy_metadata
+
+    @property
+    def commands(self) -> tuple[str, ...]:
+        return self.deploy_metadata.commands
+
+    @property
+    def deploy_env(self) -> tuple[str, ...]:
+        return self.deploy_metadata.deploy_env
+
     def run(self, *args: object) -> str:
         if self._closed:
             raise RuntimeError("container handle is closed")
         command, shares = self._resolve_command(args)
         if not command:
             raise ValueError("at least one command argument is required")
+        deploy_env = self.deploy_env
         try:
-            result = self._client.run(self.reference.image, command, shares=shares)
+            result = self._run_command(command, shares=shares, env=deploy_env)
         except httpx.ConnectError as exc:
             if not self._recover_owned_daemon():
                 raise RuntimeError(
                     f"container daemon at {self.base_url} is no longer reachable; create a new container handle"
                 ) from exc
-            result = self._client.run(self.reference.image, command, shares=shares)
+            result = self._run_command(command, shares=shares, env=deploy_env)
         if result.exit_code != 0:
             raise RuntimeError(
                 f"command {' '.join(command)!r} exited with status {result.exit_code}: {result.output}"
@@ -246,6 +272,20 @@ class NeurodeskContainer:
             mount=directory.guest_path,
             writable=directory.writable,
         )
+
+    def _run_command(
+        self,
+        command: list[str],
+        *,
+        shares: list[ShareMount],
+        env: tuple[str, ...],
+    ) -> object:
+        try:
+            return self._client.run(self.reference.image, command, shares=shares, env=env)
+        except TypeError:
+            if env:
+                raise
+            return self._client.run(self.reference.image, command, shares=shares)
 
     def _recover_owned_daemon(self) -> bool:
         if self._owned_daemon is None or not self._owned_daemon.cache_dir:
@@ -499,6 +539,102 @@ def resolve_container_reference(
     )
 
 
+def load_deploy_metadata(container_handle: NeurodeskContainer) -> DeployMetadata:
+    directory = deploy_directory_for_reference_path(container_handle.reference.path)
+    source = CVMFSSource(
+        mirror=DEFAULT_CVMFS_MIRROR,
+        repo=DEFAULT_CVMFS_REPO,
+        path=directory,
+        cache_dir=container_handle.reference.cache_dir,
+    )
+    try:
+        entries = container_handle._client.cvmfs_list(source)
+    except (AttributeError, httpx.HTTPError):
+        return DeployMetadata()
+    entry_names = {entry.name for entry in entries.entries if entry.kind == "file"}
+    commands_text = read_cvmfs_text(container_handle, f"{directory}/commands.txt", allow_missing=True)
+    commands = tuple(
+        sorted(
+            {
+                line.strip()
+                for line in commands_text.splitlines()
+                if line.strip() in entry_names and is_valid_wrapper_name(line.strip())
+            }
+        )
+    )
+    deploy_env_text = read_cvmfs_text(container_handle, f"{directory}/env.txt", allow_missing=True)
+    deploy_env = tuple(
+        line
+        for line in (
+            normalize_deploy_env_line(line.strip())
+            for line in deploy_env_text.splitlines()
+            if line.strip()
+        )
+        if line is not None
+    )
+    return DeployMetadata(commands=commands, deploy_env=deploy_env)
+
+
+def read_cvmfs_text(
+    container_handle: NeurodeskContainer,
+    path: str,
+    *,
+    allow_missing: bool = False,
+) -> str:
+    try:
+        response = container_handle._client.cvmfs_read(
+            CVMFSReadRequest(
+                mirror=DEFAULT_CVMFS_MIRROR,
+                repo=DEFAULT_CVMFS_REPO,
+                path=path,
+                length=1_000_000,
+                cache_dir=container_handle.reference.cache_dir,
+            )
+        )
+    except (AttributeError, AssertionError, httpx.HTTPError):
+        if allow_missing:
+            return ""
+        raise
+    return decode_cvmfs_text(response.data)
+
+
+def decode_cvmfs_text(raw: bytes) -> str:
+    text = raw.decode("utf-8", errors="replace")
+    stripped = "".join(text.split())
+    if stripped:
+        try:
+            decoded = base64.b64decode(stripped, validate=True)
+        except Exception:
+            return text
+        decoded_text = decoded.decode("utf-8", errors="replace")
+        if decoded_text:
+            return decoded_text
+    return text
+
+
+def deploy_directory_for_reference_path(path: str) -> str:
+    if path.endswith(".simg"):
+        return str(Path(path).parent).replace("\\", "/")
+    return path
+
+
+def normalize_deploy_env_line(line: str) -> str | None:
+    if "=" not in line:
+        return None
+    key, value = line.split("=", 1)
+    key = key.strip()
+    value = value.strip()
+    if not key:
+        return None
+    value = value.replace("BASEPATH/", "/")
+    value = value.replace("BASEPATH", "/")
+    return f"{key}={value}"
+
+
+def is_valid_wrapper_name(command: str) -> bool:
+    return bool(command) and "/" not in command and command not in {".", ".."}
+
+
 def _resolve_release_reference(
     name: str,
     *,
@@ -559,7 +695,11 @@ def start_default_daemon() -> DaemonState:
     if state_path.exists():
         state = DaemonState.from_file(state_path)
         if _health_check(state.base_url):
-            return state
+            if _supports_vm_start(state.base_url):
+                return state
+            _shutdown_daemon_server(state.base_url)
+            state_path.unlink(missing_ok=True)
+            return start_daemon_for_cache_dir(cache_root)
         state_path.unlink(missing_ok=True)
 
     return start_daemon_for_cache_dir(cache_root)
@@ -724,6 +864,23 @@ def _health_check(base_url: str) -> bool:
             return response.status_code == 200
     except httpx.HTTPError:
         return False
+
+
+def _supports_vm_start(base_url: str) -> bool:
+    try:
+        with httpx.Client(base_url=base_url, timeout=2.0) as client:
+            response = client.get("/vm/start")
+            return response.status_code != 404
+    except httpx.HTTPError:
+        return False
+
+
+def _shutdown_daemon_server(base_url: str) -> None:
+    try:
+        with httpx.Client(base_url=base_url, timeout=2.0) as client:
+            client.post("/shutdown")
+    except httpx.HTTPError:
+        return
 
 
 def resolve_base_url(base_url: str | None = None) -> str:

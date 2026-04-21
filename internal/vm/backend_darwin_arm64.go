@@ -17,6 +17,7 @@ import (
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/oci"
+	"j5.nz/cc/internal/virtio"
 )
 
 var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
@@ -42,6 +43,10 @@ func (b *runtimeBackend) Start(ctx context.Context, req client.CreateInstanceReq
 	return b.StartStream(ctx, req, nil)
 }
 
+func (b *runtimeBackend) StartBlank(ctx context.Context, req client.StartInstanceRequest) (Instance, error) {
+	return b.StartBlankStream(ctx, req, nil)
+}
+
 func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
 	start := time.Now()
 	runReq, err := b.buildStartRequest(ctx, req)
@@ -54,6 +59,25 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		return nil, err
 	}
 	timingLog("runtime.Start hvf.StartContainer took=%s image=%q", time.Since(start), req.Image)
+	return session, nil
+}
+
+func (b *runtimeBackend) StartBlankStream(
+	ctx context.Context,
+	req client.StartInstanceRequest,
+	onEvent func(client.BootEvent) error,
+) (Instance, error) {
+	start := time.Now()
+	runReq, err := b.buildBlankStartRequest(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	timingLog("runtime.StartBlank buildBlankStartRequest took=%s", time.Since(start))
+	session, err := hvf.StartContainerStream(ctx, runReq, onEvent)
+	if err != nil {
+		return nil, err
+	}
+	timingLog("runtime.StartBlank hvf.StartContainer took=%s", time.Since(start))
 	return session, nil
 }
 
@@ -204,6 +228,14 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	}, ctx.Err()
 }
 
+func blankRuntimeRootFS() imagefs.Directory {
+	overlay := imagefs.NewOverlay(nil)
+	for _, dir := range []string{"/dev", "/proc", "/sys", "/run", "/tmp", "/.ccx3", "/.ccx3/images"} {
+		_ = overlay.AddDir(dir, fs.ModeDir|0o755)
+	}
+	return overlay.Root()
+}
+
 func withRuntimeMountDirs(image *oci.Image) *oci.Image {
 	if image == nil || image.RootFS == nil {
 		return image
@@ -225,6 +257,46 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 	runReq.Shares = append(runReq.Shares, convertShareMounts(req.Shares)...)
 	runReq.Persistent = true
 	return runReq, nil
+}
+
+func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.StartInstanceRequest) (hvf.ContainerRunRequest, error) {
+	if b.kernel == nil || b.images == nil {
+		return hvf.ContainerRunRequest{}, fmt.Errorf("runtime backend is not configured")
+	}
+	kernel, err := b.kernel.ReadKernel()
+	if err != nil {
+		return hvf.ContainerRunRequest{}, err
+	}
+	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS"}
+	moduleMap := map[string]string{
+		"CONFIG_VIRTIO_MMIO":     "kernel/drivers/virtio/virtio_mmio.ko.gz",
+		"CONFIG_FUSE_FS":         "kernel/fs/fuse/fuse.ko.gz",
+		"CONFIG_VIRTIO_FS":       "kernel/fs/fuse/virtiofs.ko.gz",
+		"CONFIG_VSOCKETS":        "kernel/net/vmw_vsock/vsock.ko.gz",
+		"CONFIG_VIRTIO_VSOCKETS": "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
+	}
+	modules, err := b.kernel.PlanModuleLoad(configVars, moduleMap)
+	if err != nil {
+		return hvf.ContainerRunRequest{}, err
+	}
+	guestInitCache := b.guestInitCache
+	if guestInitCache == "" {
+		guestInitCache = filepath.Join(b.images.Root(), "_guestinit")
+	}
+	initBin, err := guestinit.Build(ctx, guestInitCache)
+	if err != nil {
+		return hvf.ContainerRunRequest{}, err
+	}
+	return hvf.ContainerRunRequest{
+		Kernel:     kernel,
+		Init:       initBin,
+		Modules:    modules,
+		RootFS:     virtio.NewImageFS(blankRuntimeRootFS(), ""),
+		MemoryMB:   req.MemoryMB,
+		CPUs:       req.CPUs,
+		Dmesg:      req.Dmesg,
+		Persistent: true,
+	}, ctx.Err()
 }
 
 func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.RunRequest) (hvf.ContainerRunRequest, error) {

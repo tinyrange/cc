@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import base64
 import json
 import os
 from pathlib import Path
@@ -246,6 +247,28 @@ def test_create_instance_uses_boot_timeout() -> None:
     assert result.status == "running"
 
 
+def test_start_instance_posts_vm_start_and_uses_boot_timeout() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["json"] = request.read().decode()
+        seen["timeout"] = request.extensions.get("timeout")
+        return httpx.Response(200, json={"status": "running"})
+
+    client = make_client(httpx.MockTransport(handler))
+    try:
+        result = client.start_instance(memory_mb=1024, cpus=1)
+    finally:
+        client.close()
+
+    assert seen["path"] == "/vm/start"
+    assert seen["json"] == '{"memory_mb":1024,"cpus":1}'
+    assert seen["timeout"] is not None
+    assert seen["timeout"]["read"] == 30.0
+    assert result.status == "running"
+
+
 def test_container_cold_start_uses_http_timeout_for_preflight_and_boot_timeout_for_vm() -> None:
     seen: list[tuple[str, float | None]] = []
 
@@ -384,6 +407,44 @@ def test_create_instance_stream_yields_boot_events() -> None:
     assert [event["kind"] for event in events] == ["status", "serial", "ready"]
 
 
+def test_start_instance_stream_yields_boot_events() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/vm/start"
+        assert request.url.params.get("stream") == "1"
+        return httpx.Response(
+            200,
+            text='{"kind":"status","message":"starting"}\n{"kind":"ready"}\n',
+            headers={"content-type": "application/x-ndjson"},
+        )
+
+    client = make_client(httpx.MockTransport(handler))
+    try:
+        events = list(client.start_instance_stream())
+    finally:
+        client.close()
+
+    assert [event["kind"] for event in events] == ["status", "ready"]
+
+
+def test_ensure_instance_accepts_running_blank_vm() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.method == "GET" and request.url.path == "/vm/status":
+            return httpx.Response(200, json={"status": "running"})
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    client = make_client(httpx.MockTransport(handler))
+    try:
+        state = client.ensure_instance("niimath")
+    finally:
+        client.close()
+
+    assert state.status == "running"
+    assert seen == ["/vm/status"]
+
+
 def test_resolve_boot_timeout_defaults_to_30_seconds() -> None:
     timeout = resolve_boot_timeout()
     assert timeout.connect == 10.0
@@ -438,6 +499,30 @@ def test_container_lookup_imports_and_runs_notebook_style_api() -> None:
                         ]
                     },
                 )
+            if payload["path"] == "/containers/niimath_1.0.20250804_20251016":
+                return httpx.Response(
+                    200,
+                    json={
+                        "entries": [
+                            {"name": "commands.txt", "path": "", "kind": "file"},
+                            {"name": "niimath", "path": "", "kind": "file"},
+                        ]
+                    },
+                )
+        if request.method == "POST" and request.url.path == "/cvmfs/read":
+            payload = json.loads(body or "{}")
+            if payload["path"] == "/containers/niimath_1.0.20250804_20251016/commands.txt":
+                return httpx.Response(
+                    200,
+                    json={
+                        "path": payload["path"],
+                        "offset": 0,
+                        "data": base64.b64encode(b"niimath\n").decode(),
+                        "eof": True,
+                    },
+                )
+            if payload["path"] == "/containers/niimath_1.0.20250804_20251016/env.txt":
+                return httpx.Response(404, json={"error": "not found"})
         if request.method == "GET" and request.url.path == "/image/niimath":
             return httpx.Response(404, json={"error": "not found"})
         if request.method == "POST" and request.url.path == "/image/niimath":
@@ -490,6 +575,90 @@ def test_container_lookup_imports_and_runs_notebook_style_api() -> None:
     assert paths.index("/image/niimath/qemu/download") < paths.index("/vm")
     assert paths.index("/image/niimath/metadata") < paths.index("/vm")
     assert paths.index("/vm") < paths.index("/vm/run")
+
+
+def test_container_run_uses_cvmfs_deploy_env_and_exposes_commands() -> None:
+    seen: list[tuple[str, str, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.read().decode() or None
+        seen.append((request.method, request.url.path, body))
+
+        if request.method == "POST" and request.url.path == "/cvmfs/list":
+            payload = json.loads(body or "{}")
+            if payload["path"] == "/containers/niimath":
+                return httpx.Response(200, json={"entries": []})
+            if payload["path"] == "/containers":
+                return httpx.Response(
+                    200,
+                    json={
+                        "entries": [
+                            {
+                                "name": "niimath_1.0.20250804_20251016",
+                                "path": "/containers/niimath_1.0.20250804_20251016",
+                                "kind": "directory",
+                            }
+                        ]
+                    },
+                )
+            if payload["path"] == "/containers/niimath_1.0.20250804_20251016":
+                return httpx.Response(
+                    200,
+                    json={
+                        "entries": [
+                            {"name": "commands.txt", "path": "", "kind": "file"},
+                            {"name": "env.txt", "path": "", "kind": "file"},
+                            {"name": "niimath", "path": "", "kind": "file"},
+                            {"name": "bet", "path": "", "kind": "file"},
+                        ]
+                    },
+                )
+        if request.method == "POST" and request.url.path == "/cvmfs/read":
+            payload = json.loads(body or "{}")
+            if payload["path"] == "/containers/niimath_1.0.20250804_20251016/commands.txt":
+                return httpx.Response(
+                    200,
+                    json={
+                        "path": payload["path"],
+                        "offset": 0,
+                        "data": base64.b64encode(b"niimath\nbet\nmissing-wrapper\n").decode(),
+                        "eof": True,
+                    },
+                )
+            if payload["path"] == "/containers/niimath_1.0.20250804_20251016/env.txt":
+                return httpx.Response(
+                    200,
+                    json={
+                        "path": payload["path"],
+                        "offset": 0,
+                        "data": base64.b64encode(b"DEPLOY_ENV_FSLDIR=BASEPATH/opt/fsl\n").decode(),
+                        "eof": True,
+                    },
+                )
+        if request.method == "GET" and request.url.path == "/image/niimath":
+            return httpx.Response(200, json={"name": "niimath", "status": "downloaded", "source_kind": "cvmfs"})
+        if request.method == "GET" and request.url.path == "/vm/status":
+            return httpx.Response(200, json={"status": "running", "image": "niimath"})
+        if request.method == "POST" and request.url.path == "/vm/run":
+            payload = json.loads(body or "{}")
+            assert payload["env"] == ["DEPLOY_ENV_FSLDIR=/opt/fsl"]
+            return httpx.Response(200, json={"exit_code": 0, "output": "ok\n"})
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path} {body!r}")
+
+    client = make_client(httpx.MockTransport(handler))
+    try:
+        handle = nd.container("niimath", client=client, progress=False)
+        assert handle.commands == ("bet", "niimath")
+        assert handle.deploy_env == ("DEPLOY_ENV_FSLDIR=/opt/fsl",)
+        out = handle.niimath("-help")
+    finally:
+        client.close()
+
+    assert out == "ok\n"
+    paths = [path for _, path, _ in seen]
+    assert paths.count("/cvmfs/list") == 3
+    assert paths.count("/cvmfs/read") == 2
+    assert paths[-1] == "/vm/run"
 
 
 def test_container_lookup_accepts_versioned_root_simg() -> None:
@@ -644,6 +813,32 @@ def test_start_default_daemon_writes_state(monkeypatch, tmp_path: Path) -> None:
     assert (cache_root / "ccvm.json").read_text() == '{\n  "addr": "127.0.0.1:3456"\n}'
 
 
+def test_start_default_daemon_restarts_incompatible_running_daemon(monkeypatch, tmp_path: Path) -> None:
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir(parents=True)
+    (cache_root / "ccvm.json").write_text('{"addr":"127.0.0.1:3456"}')
+    calls: list[tuple[str, object]] = []
+
+    monkeypatch.setattr("pyneurodesk.api.default_cache_root", lambda: cache_root)
+    monkeypatch.setattr("pyneurodesk.api._health_check", lambda base_url: calls.append(("health", base_url)) or True)
+    monkeypatch.setattr("pyneurodesk.api._supports_vm_start", lambda base_url: calls.append(("supports", base_url)) or False)
+    monkeypatch.setattr("pyneurodesk.api._shutdown_daemon_server", lambda base_url: calls.append(("shutdown", base_url)))
+    monkeypatch.setattr(
+        "pyneurodesk.api.start_daemon_for_cache_dir",
+        lambda root: calls.append(("restart", root)) or DaemonState(addr="127.0.0.1:4567", cache_dir=str(root)),
+    )
+
+    state = start_default_daemon()
+
+    assert state.base_url == "http://127.0.0.1:4567"
+    assert calls == [
+        ("health", "http://127.0.0.1:3456"),
+        ("supports", "http://127.0.0.1:3456"),
+        ("shutdown", "http://127.0.0.1:3456"),
+        ("restart", cache_root),
+    ]
+
+
 def test_resolve_ccvm_binary_path_prefers_bundled_binary(monkeypatch, tmp_path: Path) -> None:
     bundle_root = tmp_path / "pyneurodesk"
     binary = bundle_root / "bin" / "ccvm"
@@ -702,9 +897,7 @@ def test_container_starts_shared_daemon_and_boots_image(monkeypatch) -> None:
             payload = source.to_payload()
             calls.append(("cvmfs_list", payload["path"]))
             if payload["path"] == "/containers/niimath":
-                return SimpleNamespace(
-                    entries=[]
-                )
+                return SimpleNamespace(entries=[])
             if payload["path"] == "/containers":
                 return SimpleNamespace(
                     entries=[
@@ -715,7 +908,20 @@ def test_container_starts_shared_daemon_and_boots_image(monkeypatch) -> None:
                         )
                     ]
                 )
+            if payload["path"] == "/containers/niimath_1.0.20250804_20251016":
+                return SimpleNamespace(
+                    entries=[
+                        SimpleNamespace(kind="file", name="commands.txt"),
+                        SimpleNamespace(kind="file", name="niimath"),
+                    ]
+                )
             raise AssertionError(payload["path"])
+
+        def cvmfs_read(self, request: object) -> object:
+            calls.append(("cvmfs_read", request.path))
+            if request.path.endswith("/commands.txt"):
+                return SimpleNamespace(data=base64.b64encode(b"niimath\n").decode().encode())
+            raise AssertionError(request.path)
 
         def get_image(self, image: str) -> object | None:
             calls.append(("get_image", image))
@@ -745,8 +951,25 @@ def test_container_starts_shared_daemon_and_boots_image(monkeypatch) -> None:
             calls.append(("create_instance", (image, dmesg)))
             return SimpleNamespace(status="running", image=image)
 
-        def run(self, image: str, command: list[str], *, shares: list[object] = ()) -> object:
-            calls.append(("run", (image, tuple(command), tuple((share.source, share.mount, share.writable) for share in shares))))
+        def run(
+            self,
+            image: str,
+            command: list[str],
+            *,
+            shares: list[object] = (),
+            env: tuple[str, ...] = (),
+        ) -> object:
+            calls.append(
+                (
+                    "run",
+                    (
+                        image,
+                        tuple(command),
+                        tuple((share.source, share.mount, share.writable) for share in shares),
+                        tuple(env),
+                    ),
+                )
+            )
             return SimpleNamespace(exit_code=0, output="ok\n")
 
         def close(self) -> None:
@@ -775,7 +998,7 @@ def test_container_starts_shared_daemon_and_boots_image(monkeypatch) -> None:
     assert ("prepare_image_emulator", "niimath") in calls
     assert ("prepare_image_metadata", "niimath") in calls
     assert ("create_instance", ("niimath", False)) in calls
-    assert ("run", ("niimath", ("niimath",), ())) in calls
+    assert ("run", ("niimath", ("niimath",), (), ())) in calls
     assert container.owns_daemon is False
 
 
@@ -802,9 +1025,21 @@ def test_share_dir_arguments_are_translated_into_guest_paths(monkeypatch, tmp_pa
                             path="/containers/niimath_1.0.20250804_20251016",
                             kind="directory",
                         )
+                        ]
+                    )
+            if payload["path"] == "/containers/niimath_1.0.20250804_20251016":
+                return SimpleNamespace(
+                    entries=[
+                        SimpleNamespace(kind="file", name="commands.txt"),
+                        SimpleNamespace(kind="file", name="niimath"),
                     ]
                 )
             raise AssertionError(payload["path"])
+
+        def cvmfs_read(self, request: object) -> object:
+            if request.path.endswith("/commands.txt"):
+                return SimpleNamespace(data=base64.b64encode(b"niimath\n").decode().encode())
+            raise AssertionError(request.path)
 
         def get_image(self, image: str) -> object | None:
             return SimpleNamespace(name=image, status="downloaded")
@@ -818,7 +1053,14 @@ def test_share_dir_arguments_are_translated_into_guest_paths(monkeypatch, tmp_pa
         def create_instance(self, image: str) -> object:
             raise AssertionError("instance creation should not be needed")
 
-        def run(self, image: str, command: list[str], *, shares: list[object] = ()) -> object:
+        def run(
+            self,
+            image: str,
+            command: list[str],
+            *,
+            shares: list[object] = (),
+            env: tuple[str, ...] = (),
+        ) -> object:
             calls.append(
                 (
                     "run",
@@ -826,6 +1068,7 @@ def test_share_dir_arguments_are_translated_into_guest_paths(monkeypatch, tmp_pa
                         "image": image,
                         "command": tuple(command),
                         "shares": tuple((share.source, share.mount, share.writable) for share in shares),
+                        "env": tuple(env),
                     },
                 )
             )
@@ -871,12 +1114,24 @@ def test_owned_container_recovers_when_daemon_connection_is_refused(monkeypatch)
             self._client = SimpleNamespace(base_url=base_url)
             self._run_calls = 0
 
-        def run(self, image: str, command: list[str], *, shares: list[object] = ()) -> object:
+        def run(
+            self,
+            image: str,
+            command: list[str],
+            *,
+            shares: list[object] = (),
+            env: tuple[str, ...] = (),
+        ) -> object:
             self._run_calls += 1
-            calls.append(("run", (self.base_url, image, tuple(command))))
+            calls.append(("run", (self.base_url, image, tuple(command), tuple(env))))
             if self.base_url.endswith(":4001"):
                 raise httpx.ConnectError("connection refused")
             return SimpleNamespace(exit_code=0, output="ok\n")
+
+        def cvmfs_list(self, source: object) -> object:
+            payload = source.to_payload()
+            calls.append(("cvmfs_list", payload["path"]))
+            return SimpleNamespace(entries=[])
 
         def ensure_image(self, reference: object) -> None:
             calls.append(("ensure_image", reference.image))
@@ -920,7 +1175,7 @@ def test_owned_container_recovers_when_daemon_connection_is_refused(monkeypatch)
     assert ("restart", daemon_a.cache_dir) in calls
     assert ("ensure_image", "niimath") in calls
     assert ("ensure_instance", "niimath") in calls
-    assert ("run", ("http://127.0.0.1:4002", "niimath", ("niimath",))) in calls
+    assert ("run", ("http://127.0.0.1:4002", "niimath", ("niimath",), ())) in calls
 
 
 def test_container_resolution_prefers_direct_directory_probe() -> None:

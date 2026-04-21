@@ -33,7 +33,7 @@ func (m *Manager) ReadPackageFile(ctx context.Context, repo, packageName, innerP
 		if !os.IsNotExist(err) {
 			return nil, fmt.Errorf("stat package file: %w", err)
 		}
-		if err := m.downloadFile(ctx, m.repoPackageURL(repo, filename), apkPath); err != nil {
+		if err := m.downloadFile(ctx, m.repoPackageURL(repo, filename), apkPath, nil); err != nil {
 			return nil, fmt.Errorf("download package %q: %w", packageName, err)
 		}
 	}
@@ -75,6 +75,14 @@ func (m *Manager) ReadPackageFile(ctx context.Context, repo, packageName, innerP
 }
 
 func (m *Manager) ExtractPackageFile(ctx context.Context, repo, packageName, innerPath string) (string, error) {
+	return m.ExtractPackageFileWithProgress(ctx, repo, packageName, innerPath, nil)
+}
+
+func (m *Manager) ExtractPackageFileWithProgress(
+	ctx context.Context,
+	repo, packageName, innerPath string,
+	report progressReporter,
+) (string, error) {
 	entry, err := m.lookupPackageEntry(ctx, repo, packageName)
 	if err != nil {
 		return "", err
@@ -89,7 +97,7 @@ func (m *Manager) ExtractPackageFile(ctx context.Context, repo, packageName, inn
 		if !os.IsNotExist(err) {
 			return "", fmt.Errorf("stat package file: %w", err)
 		}
-		if err := m.downloadFile(ctx, m.repoPackageURL(repo, filename), apkPath); err != nil {
+		if err := m.downloadFile(ctx, m.repoPackageURL(repo, filename), apkPath, report); err != nil {
 			return "", fmt.Errorf("download package %q: %w", packageName, err)
 		}
 	}

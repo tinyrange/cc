@@ -242,6 +242,12 @@ type CreateInstanceRequest struct {
 	Dmesg    bool         `json:"dmesg,omitempty"`
 }
 
+type StartInstanceRequest struct {
+	MemoryMB uint64 `json:"memory_mb,omitempty"`
+	CPUs     int    `json:"cpus,omitempty"`
+	Dmesg    bool   `json:"dmesg,omitempty"`
+}
+
 type InstanceState struct {
 	Status    string `json:"status"`
 	Image     string `json:"image,omitempty"`

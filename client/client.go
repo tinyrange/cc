@@ -147,6 +147,12 @@ func (c *Client) CreateInstance(req CreateInstanceRequest) (InstanceState, error
 	return ret, err
 }
 
+func (c *Client) StartInstance(req StartInstanceRequest) (InstanceState, error) {
+	var ret InstanceState
+	err := c.postJSONExpectOK("/vm/start", req, &ret)
+	return ret, err
+}
+
 func (c *Client) InstanceStatus() (InstanceState, error) {
 	var ret InstanceState
 	resp, err := c.client.Get(c.url + "/vm/status")

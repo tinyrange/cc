@@ -115,6 +115,15 @@ func newMux(srvState *server, httpServer *http.Server) *http.ServeMux {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		if wantsProgressStream(r) {
+			report := func(event client.ProgressEvent) {
+				_ = writeProgressEvent(w, event)
+			}
+			if err := srvState.kernel.EnsureWithProgress(r.Context(), report); err != nil {
+				_ = writeProgressEvent(w, client.ProgressEvent{Status: "error", Error: err.Error()})
+			}
+			return
+		}
 		if err := srvState.kernel.Ensure(r.Context()); err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -139,6 +148,62 @@ func newMux(srvState *server, httpServer *http.Server) *http.ServeMux {
 			return
 		}
 		writeJSON(w, http.StatusOK, state)
+	})
+
+	mux.HandleFunc("POST /image/{image}/metadata", func(w http.ResponseWriter, r *http.Request) {
+		imageName := r.PathValue("image")
+		image, err := srvState.images.Open(imageName)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, client.ImageMetadataState{
+			Name:         image.Name,
+			Status:       "prepared",
+			SourceKind:   image.SourceKind,
+			Architecture: image.Architecture,
+		})
+	})
+
+	mux.HandleFunc("POST /image/{image}/qemu/download", func(w http.ResponseWriter, r *http.Request) {
+		imageName := r.PathValue("image")
+		image, err := srvState.images.Open(imageName)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if !vm.NeedsAMD64Emulation(image) {
+			writeJSON(w, http.StatusOK, client.EmulatorState{Status: "skipped", Required: false})
+			return
+		}
+		if wantsProgressStream(r) {
+			report := func(event client.ProgressEvent) {
+				_ = writeProgressEvent(w, event)
+			}
+			path, err := srvState.kernel.ExtractPackageFileWithProgress(
+				r.Context(),
+				"community",
+				"qemu-x86_64",
+				"usr/bin/qemu-x86_64",
+				report,
+			)
+			if err != nil {
+				_ = writeProgressEvent(w, client.ProgressEvent{Status: "error", Error: err.Error()})
+				return
+			}
+			_ = writeProgressEvent(w, client.ProgressEvent{Status: "downloaded", Artifact: filepath.Base(path)})
+			return
+		}
+		path, err := vm.PrepareAMD64Emulator(r.Context(), image, srvState.kernel.ExtractPackageFile)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, client.EmulatorState{
+			Status:   "downloaded",
+			Path:     path,
+			Required: true,
+		})
 	})
 
 	mux.HandleFunc("POST /image/{image}", func(w http.ResponseWriter, r *http.Request) {
@@ -227,6 +292,69 @@ func newMux(srvState *server, httpServer *http.Server) *http.ServeMux {
 
 	mux.HandleFunc("GET /vm/status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, srvState.vms.Status())
+	})
+	mux.HandleFunc("POST /vm/start", func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		bootCtx, cancel := context.WithTimeout(r.Context(), vmBootTimeout)
+		defer cancel()
+		var req client.StartInstanceRequest
+		if err := decodeOptionalJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		timingLog("POST /vm/start decode took=%s", time.Since(start))
+		if srvState.kernel.Status().Status != "downloaded" {
+			if wantsBootEventStream(r) {
+				writeBootEvent(w, client.BootEvent{Kind: "status", Message: "ensuring kernel is available"})
+			}
+			if err := srvState.kernel.Ensure(bootCtx); err != nil {
+				if wantsBootEventStream(r) {
+					if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
+						writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", vmBootTimeout)})
+						return
+					}
+					writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+					return
+				}
+				if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
+					writeError(w, http.StatusGatewayTimeout, fmt.Errorf("vm boot timed out after %s", vmBootTimeout))
+					return
+				}
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+		}
+		timingLog("POST /vm/start kernel ensure/status took=%s", time.Since(start))
+		if wantsBootEventStream(r) {
+			writeBootEvent(w, client.BootEvent{Kind: "status", Message: "starting VM"})
+			state, err := srvState.vms.StartBlankStream(bootCtx, req, func(event client.BootEvent) error {
+				return writeBootEvent(w, event)
+			})
+			if err != nil {
+				if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
+					_ = writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", vmBootTimeout)})
+					return
+				}
+				_ = writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+				return
+			}
+			timingLog("POST /vm/start vms.StartBlankStream took=%s", time.Since(start))
+			_ = writeBootEvent(w, client.BootEvent{Kind: "ready", State: state})
+			timingLog("POST /vm/start total=%s", time.Since(start))
+			return
+		}
+		state, err := srvState.vms.StartBlank(bootCtx, req)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
+				writeError(w, http.StatusGatewayTimeout, fmt.Errorf("vm boot timed out after %s", vmBootTimeout))
+				return
+			}
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		timingLog("POST /vm/start vms.StartBlank took=%s", time.Since(start))
+		writeJSON(w, http.StatusOK, state)
+		timingLog("POST /vm/start total=%s", time.Since(start))
 	})
 	mux.HandleFunc("POST /vm", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -453,6 +581,13 @@ func wantsBootEventStream(r *http.Request) bool {
 	return r.Header.Get("Accept") == "application/x-ndjson"
 }
 
+func wantsProgressStream(r *http.Request) bool {
+	if r.URL.Query().Get("stream") == "1" {
+		return true
+	}
+	return r.Header.Get("Accept") == "application/x-ndjson"
+}
+
 func writeExecEventStream(w http.ResponseWriter, resp client.ExecResponse) {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.WriteHeader(http.StatusOK)
@@ -473,6 +608,20 @@ func writeBootEvent(w http.ResponseWriter, event client.BootEvent) error {
 	}
 	if _, ok := w.(http.Flusher); ok {
 		// WriteHeader is safe to call repeatedly before the first write.
+		w.WriteHeader(http.StatusOK)
+	}
+	if err := json.NewEncoder(w).Encode(event); err != nil {
+		return err
+	}
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	return nil
+}
+
+func writeProgressEvent(w http.ResponseWriter, event client.ProgressEvent) error {
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	if _, ok := w.(http.Flusher); ok {
 		w.WriteHeader(http.StatusOK)
 	}
 	if err := json.NewEncoder(w).Encode(event); err != nil {

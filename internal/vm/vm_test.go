@@ -120,6 +120,60 @@ func TestManagerRunDelegatesCrossImageExecToBackend(t *testing.T) {
 	}
 }
 
+func TestManagerRunSupportsMultipleImagesOnBlankRunningVM(t *testing.T) {
+	inst := &fakeInstance{waitCh: make(chan error, 1)}
+	var seen []struct {
+		running string
+		image   string
+	}
+	mgr := NewManagerWithBackend(fakeBackend{
+		instance: inst,
+		runInInstanceFn: func(ctx context.Context, inst Instance, runningImage string, req client.RunRequest) (client.ExecResponse, error) {
+			_ = ctx
+			_ = inst
+			seen = append(seen, struct {
+				running string
+				image   string
+			}{
+				running: runningImage,
+				image:   req.Image,
+			})
+			return client.ExecResponse{ExitCode: 0, Output: req.Image}, nil
+		},
+	})
+	mgr.supports = func() error { return nil }
+
+	if _, err := mgr.StartBlank(context.Background(), client.StartInstanceRequest{}); err != nil {
+		t.Fatalf("StartBlank() error = %v", err)
+	}
+
+	for _, image := range []string{"fsl", "niimath"} {
+		resp, err := mgr.Run(context.Background(), client.RunRequest{
+			Image:   image,
+			Command: []string{image},
+		})
+		if err != nil {
+			t.Fatalf("Run(%q) error = %v", image, err)
+		}
+		if resp.Output != image {
+			t.Fatalf("Run(%q).Output = %q, want %q", image, resp.Output, image)
+		}
+	}
+
+	if len(seen) != 2 {
+		t.Fatalf("backend call count = %d, want 2", len(seen))
+	}
+	if seen[0].running != "" || seen[0].image != "fsl" {
+		t.Fatalf("first backend call = %#v", seen[0])
+	}
+	if seen[1].running != "" || seen[1].image != "niimath" {
+		t.Fatalf("second backend call = %#v", seen[1])
+	}
+	if got := mgr.Status().Status; got != "running" {
+		t.Fatalf("Status().Status = %q, want running", got)
+	}
+}
+
 func TestManagerRunAllowsConcurrentExecsOnRunningInstance(t *testing.T) {
 	inst := &fakeInstance{waitCh: make(chan error, 1)}
 	inst.execFn = func(req client.ExecRequest) (client.ExecResponse, error) {
@@ -275,6 +329,17 @@ func (f fakeBackend) Start(ctx context.Context, req client.CreateInstanceRequest
 }
 
 func (f fakeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	_ = ctx
+	_ = req
+	_ = onEvent
+	return f.instance, f.err
+}
+
+func (f fakeBackend) StartBlank(ctx context.Context, req client.StartInstanceRequest) (Instance, error) {
+	return f.StartBlankStream(ctx, req, nil)
+}
+
+func (f fakeBackend) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
 	_ = ctx
 	_ = req
 	_ = onEvent

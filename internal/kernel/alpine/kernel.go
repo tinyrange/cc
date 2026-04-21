@@ -93,6 +93,8 @@ type Module struct {
 	Data []byte
 }
 
+type progressReporter func(client.ProgressEvent)
+
 func NewManager(root string) *Manager {
 	return &Manager{
 		root:         root,
@@ -249,6 +251,10 @@ func (m *Manager) PlanModuleLoad(configVars []string, moduleMap map[string]strin
 }
 
 func (m *Manager) Ensure(ctx context.Context) error {
+	return m.EnsureWithProgress(ctx, nil)
+}
+
+func (m *Manager) EnsureWithProgress(ctx context.Context, report progressReporter) error {
 	m.mu.Lock()
 	if m.downloading {
 		m.mu.Unlock()
@@ -258,7 +264,7 @@ func (m *Manager) Ensure(ctx context.Context) error {
 	m.lastErr = nil
 	m.mu.Unlock()
 
-	err := m.ensureDownloaded(ctx)
+	err := m.ensureDownloaded(ctx, report)
 
 	m.mu.Lock()
 	m.downloading = false
@@ -297,7 +303,7 @@ func (m *Manager) statusLocked() client.KernelState {
 	}
 }
 
-func (m *Manager) ensureDownloaded(ctx context.Context) error {
+func (m *Manager) ensureDownloaded(ctx context.Context, report progressReporter) error {
 	if err := os.MkdirAll(m.root, 0o755); err != nil {
 		return fmt.Errorf("create kernel cache dir: %w", err)
 	}
@@ -320,7 +326,7 @@ func (m *Manager) ensureDownloaded(ctx context.Context) error {
 	apkPath := filepath.Join(destDir, filename)
 	tarPath := filepath.Join(destDir, fmt.Sprintf("%s-%s.tar", entry.Name, entry.Version))
 
-	if err := m.downloadFile(ctx, m.packageURL(filename), apkPath); err != nil {
+	if err := m.downloadFile(ctx, m.packageURL(filename), apkPath, report); err != nil {
 		return err
 	}
 	if err := decompressAPKToTar(apkPath, tarPath); err != nil {
@@ -590,7 +596,7 @@ func (m *Manager) fetchIndexEntry(ctx context.Context) (indexEntry, error) {
 	return entry, nil
 }
 
-func (m *Manager) downloadFile(ctx context.Context, url, destPath string) error {
+func (m *Manager) downloadFile(ctx context.Context, url, destPath string, report progressReporter) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
@@ -610,7 +616,7 @@ func (m *Manager) downloadFile(ctx context.Context, url, destPath string) error 
 	if err != nil {
 		return fmt.Errorf("create kernel package file: %w", err)
 	}
-	if _, err := io.Copy(f, resp.Body); err != nil {
+	if err := copyWithProgress(f, resp.Body, resp.ContentLength, filepath.Base(destPath), report); err != nil {
 		f.Close()
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("write kernel package: %w", err)
@@ -624,6 +630,70 @@ func (m *Manager) downloadFile(ctx context.Context, url, destPath string) error 
 		return fmt.Errorf("finalize kernel package: %w", err)
 	}
 	return nil
+}
+
+func copyWithProgress(dst io.Writer, src io.Reader, total int64, artifact string, report progressReporter) error {
+	if report == nil {
+		_, err := io.Copy(dst, src)
+		return err
+	}
+
+	started := time.Now()
+	lastReported := time.Time{}
+	downloaded := int64(0)
+	buffer := make([]byte, 128*1024)
+	emit := func(status string, force bool) {
+		now := time.Now()
+		if !force && !lastReported.IsZero() && now.Sub(lastReported) < 200*time.Millisecond {
+			return
+		}
+		lastReported = now
+		elapsed := now.Sub(started).Seconds()
+		progress := 0.0
+		if total > 0 {
+			progress = float64(downloaded) / float64(total)
+		}
+		rate := 0.0
+		if elapsed > 0 {
+			rate = float64(downloaded) / elapsed
+		}
+		eta := 0.0
+		if total > 0 && rate > 0 && downloaded < total {
+			eta = float64(total-downloaded) / rate
+		}
+		report(client.ProgressEvent{
+			Status:             status,
+			Artifact:           artifact,
+			Progress:           progress,
+			BytesDownloaded:    downloaded,
+			BytesTotal:         total,
+			RateBytesPerSecond: rate,
+			ETASeconds:         eta,
+		})
+	}
+
+	emit("downloading", true)
+	for {
+		n, readErr := src.Read(buffer)
+		if n > 0 {
+			written, writeErr := dst.Write(buffer[:n])
+			downloaded += int64(written)
+			if writeErr != nil {
+				return writeErr
+			}
+			if written != n {
+				return io.ErrShortWrite
+			}
+			emit("downloading", false)
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				emit("downloaded", true)
+				return nil
+			}
+			return readErr
+		}
+	}
 }
 
 func (m *Manager) ensurePackageIndex() (map[string]tarIndexEntry, string, error) {

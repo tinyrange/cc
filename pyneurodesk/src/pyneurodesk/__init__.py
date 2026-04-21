@@ -7,6 +7,7 @@ from .api import (
     SharedPath,
     connect,
     container,
+    load_deploy_metadata,
     resolve_base_url,
     resolve_container_reference,
     search,
@@ -22,12 +23,17 @@ from .models import (
     CVMFSSource,
     ContainerReference,
     DaemonState,
+    DeployMetadata,
+    EmulatorState,
+    ImageMetadataState,
     ImageSource,
     ImageState,
     ImportImageRequest,
+    KernelState,
     RunCommandRequest,
     ShareMount,
 )
+from .shell import main as shell_main
 
 __all__ = [
     "CommandResult",
@@ -41,9 +47,13 @@ __all__ = [
     "DEFAULT_CVMFS_MIRROR",
     "DEFAULT_CVMFS_REPO",
     "DaemonState",
+    "DeployMetadata",
+    "EmulatorState",
     "ImageSource",
+    "ImageMetadataState",
     "ImageState",
     "ImportImageRequest",
+    "KernelState",
     "NeurodeskContainer",
     "PyNeurodeskClient",
     "RunCommandRequest",
@@ -52,6 +62,7 @@ __all__ = [
     "SharedPath",
     "connect",
     "container",
+    "load_deploy_metadata",
     "main",
     "resolve_base_url",
     "resolve_container_reference",
@@ -61,4 +72,4 @@ __all__ = [
 
 
 def main() -> None:
-    print("pyneurodesk")
+    raise SystemExit(shell_main())

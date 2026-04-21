@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"j5.nz/cc/client"
 )
 
 func TestManagerEnsureDownloadsKernelPackage(t *testing.T) {
@@ -51,6 +53,50 @@ func TestManagerEnsureDownloadsKernelPackage(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "packages", "linux-virt-6.12.1-r0.tar")); err != nil {
 		t.Fatalf("downloaded tar package missing: %v", err)
+	}
+}
+
+func TestManagerEnsureWithProgressReportsBytesAndRate(t *testing.T) {
+	indexBytes := buildAPKIndexArchive(t, "linux-virt", "6.12.1-r0", "aarch64")
+	apkBytes := buildKernelPackage(t, map[string][]byte{
+		"boot/vmlinuz-virt": []byte("fake kernel"),
+	})
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/latest-stable/main/aarch64/APKINDEX.tar.gz":
+			w.Write(indexBytes)
+		case "/latest-stable/main/aarch64/linux-virt-6.12.1-r0.apk":
+			w.Write(apkBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	mgr := NewManager(t.TempDir())
+	mgr.mirror = srv.URL
+	mgr.arch = "aarch64"
+	mgr.httpClient = srv.Client()
+
+	var events []client.ProgressEvent
+	if err := mgr.EnsureWithProgress(context.Background(), func(event client.ProgressEvent) {
+		events = append(events, event)
+	}); err != nil {
+		t.Fatalf("EnsureWithProgress() error = %v", err)
+	}
+	if len(events) == 0 {
+		t.Fatal("progress events = 0, want at least 1")
+	}
+	last := events[len(events)-1]
+	if last.Status != "downloaded" {
+		t.Fatalf("last progress status = %q, want downloaded", last.Status)
+	}
+	if last.Artifact != "linux-virt-6.12.1-r0.apk" {
+		t.Fatalf("last artifact = %q", last.Artifact)
+	}
+	if last.BytesDownloaded <= 0 {
+		t.Fatalf("last bytes_downloaded = %d, want > 0", last.BytesDownloaded)
 	}
 }
 

@@ -467,6 +467,9 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 	}
 	command := append([]string(nil), req.Command...)
 	if !req.SkipResolve {
+		if s.image == nil || s.image.RootFS == nil {
+			return client.ExecResponse{}, fmt.Errorf("running instance does not have a default image root filesystem")
+		}
 		var err error
 		command, err = imagefs.ResolveCommand(s.image.RootFS, req.Command, env)
 		if err != nil {
@@ -767,12 +770,9 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	if req.CPUs > 1 {
 		return nil, fmt.Errorf("only 1 CPU is supported")
 	}
-	if req.Image == nil {
-		return nil, fmt.Errorf("persistent instances require an image")
-	}
 
 	user := strings.TrimSpace(req.User)
-	if user == "" {
+	if user == "" && req.Image != nil {
 		user = strings.TrimSpace(req.Image.Config.User)
 	}
 	if user != "" && user != "root" && user != "0" && user != "0:0" {
@@ -780,7 +780,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	}
 
 	workDir := req.WorkDir
-	if workDir == "" {
+	if workDir == "" && req.Image != nil {
 		workDir = req.Image.Config.WorkingDir
 	}
 	if workDir == "" {
@@ -790,7 +790,10 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		return nil, fmt.Errorf("workdir must be absolute")
 	}
 
-	baseEnv := append([]string(nil), req.Image.Config.Env...)
+	var baseEnv []string
+	if req.Image != nil {
+		baseEnv = append([]string(nil), req.Image.Config.Env...)
+	}
 	if !hasEnvKey(baseEnv, "PATH") {
 		baseEnv = append(baseEnv, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	}
