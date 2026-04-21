@@ -15,12 +15,14 @@ from pathlib import Path
 import httpx
 
 from .api import connect, container, default_cache_root, load_deploy_metadata, start_default_daemon
+from .models import ShareMount
 
 SESSION_ENV = "PYNEURODESK_SHELL_SESSION"
 SESSION_ROOT_ENV = "PYNEURODESK_SHELL_ROOT"
 SESSION_BIN_ENV = "PYNEURODESK_SHELL_BIN"
 BOOTSTRAP_PID_ENV = "PYNEURODESK_SHELL_BOOTSTRAP_PID"
 STATE_VERSION = 1
+HOST_CWD_MOUNT = "/.hostcwd"
 
 
 @dataclass(frozen=True)
@@ -237,13 +239,28 @@ def run_image_command(image: str, command_name: str, args: list[str], *, deploy_
         if not env:
             metadata = load_deploy_metadata(handle)
             env = list(metadata.deploy_env)
-        result = handle._client.run(handle.reference.image, [command_name, *args], env=env)
+        shares, workdir = implicit_cwd_mount()
+        result = handle._client.run(handle.reference.image, [command_name, *args], env=env, shares=shares, workdir=workdir)
     finally:
         handle.close()
     if result.output:
         sys.stdout.write(result.output)
         sys.stdout.flush()
     return int(result.exit_code)
+
+
+def implicit_cwd_mount() -> tuple[list[ShareMount], str]:
+    cwd = Path.cwd().resolve()
+    return (
+        [
+            ShareMount(
+                source=str(cwd),
+                mount=HOST_CWD_MOUNT,
+                writable=True,
+            )
+        ],
+        HOST_CWD_MOUNT,
+    )
 
 
 def normalize_command_args(values: list[str]) -> list[str]:

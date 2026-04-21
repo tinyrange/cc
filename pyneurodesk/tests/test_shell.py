@@ -359,10 +359,19 @@ def test_run_wrapper_invokes_container_command(
     monkeypatch.setenv(shell.SESSION_ENV, "sess-1")
     monkeypatch.setenv(shell.SESSION_ROOT_ENV, str(session_root))
     monkeypatch.setenv(shell.SESSION_BIN_ENV, str(session_root / "bin"))
+    monkeypatch.chdir(tmp_path)
 
     class FakeClient:
-        def run(self, image: str, command: list[str], *, env: list[str] = ()) -> object:
-            calls.append(("run", (image, tuple(command), tuple(env))))
+        def run(
+            self,
+            image: str,
+            command: list[str],
+            *,
+            env: list[str] = (),
+            shares: list[object] = (),
+            workdir: str | None = None,
+        ) -> object:
+            calls.append(("run", (image, tuple(command), tuple(env), tuple(shares), workdir)))
             return SimpleNamespace(exit_code=0, output="hello\n")
 
     class FakeHandle:
@@ -392,7 +401,17 @@ def test_run_wrapper_invokes_container_command(
 
     assert exit_code == 0
     assert capsys.readouterr().out == "hello\n"
+    expected_share = shell.ShareMount(source=str(tmp_path.resolve()), mount=shell.HOST_CWD_MOUNT, writable=True)
     assert calls == [
-        ("run", ("niimath", ("niimath", "-help"), ("DEPLOY_ENV_FSLDIR=/opt/fsl",))),
+        (
+            "run",
+            (
+                "niimath",
+                ("niimath", "-help"),
+                ("DEPLOY_ENV_FSLDIR=/opt/fsl",),
+                (expected_share,),
+                shell.HOST_CWD_MOUNT,
+            ),
+        ),
         ("close", None),
     ]
