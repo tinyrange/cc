@@ -72,6 +72,79 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 	}, nil
 }
 
+func (b *runtimeBackend) RunInInstance(
+	ctx context.Context,
+	inst Instance,
+	runningImage string,
+	req client.RunRequest,
+) (client.ExecResponse, error) {
+	for _, share := range req.Shares {
+		if err := inst.AddShare(ctx, share); err != nil {
+			return client.ExecResponse{}, err
+		}
+	}
+
+	targetImage := strings.TrimSpace(req.Image)
+	if targetImage == "" || targetImage == runningImage {
+		return inst.Exec(ctx, client.ExecRequest{
+			Command:    append([]string(nil), req.Command...),
+			Env:        append([]string(nil), req.Env...),
+			RootDir:    req.RootDir,
+			ReplaceEnv: req.ReplaceEnv,
+			WorkDir:    req.WorkDir,
+			User:       req.User,
+			Stdin:      append([]byte(nil), req.Stdin...),
+			TTY:        req.TTY,
+			Cols:       req.Cols,
+			Rows:       req.Rows,
+		})
+	}
+
+	session, ok := inst.(*hvf.ContainerSession)
+	if !ok {
+		return client.ExecResponse{}, fmt.Errorf("running instance does not support image mounts")
+	}
+
+	image, err := b.images.Open(targetImage)
+	if err != nil {
+		return client.ExecResponse{}, err
+	}
+	image = withRuntimeMountDirs(image)
+	mountPath := imageMountPath(targetImage)
+	if err := session.AddImage(ctx, mountPath, image); err != nil {
+		return client.ExecResponse{}, err
+	}
+
+	env := append([]string(nil), image.Config.Env...)
+	env = mergeRuntimeEnv(env, req.Env)
+	command, err := imagefs.ResolveCommand(image.RootFS, req.Command, env)
+	if err != nil {
+		return client.ExecResponse{}, err
+	}
+
+	workDir := req.WorkDir
+	if workDir == "" {
+		workDir = image.Config.WorkingDir
+	}
+	if workDir == "" {
+		workDir = "/"
+	}
+
+	return inst.Exec(ctx, client.ExecRequest{
+		Command:     command,
+		Env:         env,
+		RootDir:     mountPath,
+		ReplaceEnv:  true,
+		SkipResolve: true,
+		WorkDir:     workDir,
+		User:        req.User,
+		Stdin:       append([]byte(nil), req.Stdin...),
+		TTY:         req.TTY,
+		Cols:        req.Cols,
+		Rows:        req.Rows,
+	})
+}
+
 func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, memoryMB uint64, cpus int, dmesg bool) (hvf.ContainerRunRequest, error) {
 	start := time.Now()
 	if b.kernel == nil || b.images == nil {
@@ -96,7 +169,7 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 		"CONFIG_VSOCKETS":        "kernel/net/vmw_vsock/vsock.ko.gz",
 		"CONFIG_VIRTIO_VSOCKETS": "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
 	}
-	if needsAMD64Emulation(image) {
+	if NeedsAMD64Emulation(image) {
 		configVars = append(configVars, "CONFIG_BINFMT_MISC")
 		moduleMap["CONFIG_BINFMT_MISC"] = "kernel/fs/binfmt_misc.ko.gz"
 	}
@@ -105,7 +178,7 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 		return hvf.ContainerRunRequest{}, err
 	}
 	timingLog("buildBaseRequest PlanModuleLoad took=%s image=%q modules=%d", time.Since(start), imageName, len(modules))
-	qemuX8664, err := loadAMD64Emulator(ctx, image, b.kernel.ExtractPackageFile)
+	qemuX8664, err := PrepareAMD64Emulator(ctx, image, b.kernel.ExtractPackageFile)
 	if err != nil {
 		return hvf.ContainerRunRequest{}, err
 	}
@@ -178,6 +251,40 @@ func convertShareMounts(shares []client.ShareMount) []hvf.DirectoryShare {
 			Mount:    share.Mount,
 			Writable: share.Writable,
 		})
+	}
+	return out
+}
+
+func imageMountPath(image string) string {
+	replacer := strings.NewReplacer("/", "_", ":", "_", "@", "_", " ", "_")
+	return filepath.Join("/.ccx3", "images", replacer.Replace(image))
+}
+
+func mergeRuntimeEnv(base []string, extra []string) []string {
+	if len(extra) == 0 {
+		return append([]string(nil), base...)
+	}
+	index := map[string]int{}
+	out := make([]string, 0, len(base)+len(extra))
+	for _, kv := range base {
+		key, _, ok := strings.Cut(kv, "=")
+		if !ok || key == "" {
+			continue
+		}
+		index[key] = len(out)
+		out = append(out, kv)
+	}
+	for _, kv := range extra {
+		key, _, ok := strings.Cut(kv, "=")
+		if !ok || key == "" {
+			continue
+		}
+		if idx, ok := index[key]; ok {
+			out[idx] = kv
+			continue
+		}
+		index[key] = len(out)
+		out = append(out, kv)
 	}
 	return out
 }

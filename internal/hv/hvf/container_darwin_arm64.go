@@ -117,6 +117,7 @@ type ContainerSession struct {
 	sendMu      sync.Mutex
 	shareMu     sync.Mutex
 	shares      map[string]client.ShareMount
+	imageMounts map[string]string
 	nextID      atomic.Uint64
 	activeExecs *atomic.Int32
 }
@@ -304,16 +305,19 @@ func hasManagedExecFirstByte(text, id string) bool {
 }
 
 type guestExecRequest struct {
-	ID      string   `json:"id"`
-	Command []string `json:"command"`
-	Env     []string `json:"env,omitempty"`
-	WorkDir string   `json:"workdir,omitempty"`
-	Stdin   []byte   `json:"stdin,omitempty"`
-	TTY     bool     `json:"tty,omitempty"`
-	Kind    string   `json:"kind,omitempty"`
-	Signal  string   `json:"signal,omitempty"`
-	Cols    int      `json:"cols,omitempty"`
-	Rows    int      `json:"rows,omitempty"`
+	ID          string   `json:"id"`
+	Command     []string `json:"command"`
+	Env         []string `json:"env,omitempty"`
+	RootDir     string   `json:"root_dir,omitempty"`
+	ReplaceEnv  bool     `json:"replace_env,omitempty"`
+	SkipResolve bool     `json:"skip_resolve,omitempty"`
+	WorkDir     string   `json:"workdir,omitempty"`
+	Stdin       []byte   `json:"stdin,omitempty"`
+	TTY         bool     `json:"tty,omitempty"`
+	Kind        string   `json:"kind,omitempty"`
+	Signal      string   `json:"signal,omitempty"`
+	Cols        int      `json:"cols,omitempty"`
+	Rows        int      `json:"rows,omitempty"`
 }
 
 func StartContainer(ctx context.Context, req ContainerRunRequest) (*ContainerSession, error) {
@@ -401,6 +405,47 @@ func (s *ContainerSession) AddShare(ctx context.Context, share client.ShareMount
 	return nil
 }
 
+func (s *ContainerSession) AddImage(ctx context.Context, mount string, image *oci.Image) error {
+	_ = ctx
+	if s.rootFS == nil {
+		return fmt.Errorf("root filesystem does not support runtime image mounts")
+	}
+	key := strings.TrimSpace(mount)
+	if key == "" {
+		return fmt.Errorf("image mount path is required")
+	}
+	if image == nil || image.RootFS == nil {
+		return fmt.Errorf("image root filesystem is not available")
+	}
+	s.shareMu.Lock()
+	if existing, ok := s.imageMounts[key]; ok {
+		s.shareMu.Unlock()
+		if existing == image.Name {
+			return nil
+		}
+		return fmt.Errorf("image mount %q already exists", key)
+	}
+	if _, ok := s.shares[key]; ok {
+		s.shareMu.Unlock()
+		return fmt.Errorf("mount path %q is already in use", key)
+	}
+	s.shareMu.Unlock()
+	if err := s.rootFS.AddShare(virtio.ShareMount{
+		GuestPath: key,
+		Backend:   virtio.NewImageFS(image.RootFS, image.RootFSDir),
+		Writable:  false,
+	}); err != nil {
+		return err
+	}
+	s.shareMu.Lock()
+	if s.imageMounts == nil {
+		s.imageMounts = make(map[string]string)
+	}
+	s.imageMounts[key] = image.Name
+	s.shareMu.Unlock()
+	return nil
+}
+
 func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
 	startTime := time.Now()
 	if len(req.Command) == 0 {
@@ -413,16 +458,20 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 		return client.ExecResponse{}, fmt.Errorf("only root user is supported")
 	}
 
-	env := mergeEnv(s.baseEnv, req.Env)
+	env := effectiveExecEnv(s.baseEnv, req.Env, req.ReplaceEnv)
 	if !hasEnvKey(env, "PATH") {
 		env = append(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	}
 	if !hasEnvKey(env, "HOME") {
 		env = append(env, "HOME=/root")
 	}
-	command, err := imagefs.ResolveCommand(s.image.RootFS, req.Command, env)
-	if err != nil {
-		return client.ExecResponse{}, err
+	command := append([]string(nil), req.Command...)
+	if !req.SkipResolve {
+		var err error
+		command, err = imagefs.ResolveCommand(s.image.RootFS, req.Command, env)
+		if err != nil {
+			return client.ExecResponse{}, err
+		}
 	}
 	timingLog("session.Exec ResolveCommand took=%s argv=%q", time.Since(startTime), req.Command)
 	workDir := req.WorkDir
@@ -438,15 +487,18 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
 
 	payload, err := json.Marshal(guestExecRequest{
-		Kind:    "exec",
-		ID:      id,
-		Command: command,
-		Env:     env,
-		WorkDir: workDir,
-		Stdin:   append([]byte(nil), req.Stdin...),
-		TTY:     req.TTY,
-		Cols:    req.Cols,
-		Rows:    req.Rows,
+		Kind:        "exec",
+		ID:          id,
+		Command:     command,
+		Env:         env,
+		RootDir:     req.RootDir,
+		ReplaceEnv:  req.ReplaceEnv,
+		SkipResolve: req.SkipResolve,
+		WorkDir:     workDir,
+		Stdin:       append([]byte(nil), req.Stdin...),
+		TTY:         req.TTY,
+		Cols:        req.Cols,
+		Rows:        req.Rows,
 	})
 	if err != nil {
 		return client.ExecResponse{}, fmt.Errorf("marshal exec request: %w", err)
@@ -518,16 +570,20 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 		return fmt.Errorf("only root user is supported")
 	}
 
-	env := mergeEnv(s.baseEnv, req.Env)
+	env := effectiveExecEnv(s.baseEnv, req.Env, req.ReplaceEnv)
 	if !hasEnvKey(env, "PATH") {
 		env = append(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
 	}
 	if !hasEnvKey(env, "HOME") {
 		env = append(env, "HOME=/root")
 	}
-	command, err := imagefs.ResolveCommand(s.image.RootFS, req.Command, env)
-	if err != nil {
-		return err
+	command := append([]string(nil), req.Command...)
+	if !req.SkipResolve {
+		var err error
+		command, err = imagefs.ResolveCommand(s.image.RootFS, req.Command, env)
+		if err != nil {
+			return err
+		}
 	}
 	workDir := req.WorkDir
 	if workDir == "" {
@@ -542,15 +598,18 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
 	payload, err := json.Marshal(guestExecRequest{
-		Kind:    "exec",
-		ID:      id,
-		Command: command,
-		Env:     env,
-		WorkDir: workDir,
-		Stdin:   append([]byte(nil), req.Stdin...),
-		TTY:     req.TTY,
-		Cols:    req.Cols,
-		Rows:    req.Rows,
+		Kind:        "exec",
+		ID:          id,
+		Command:     command,
+		Env:         env,
+		RootDir:     req.RootDir,
+		ReplaceEnv:  req.ReplaceEnv,
+		SkipResolve: req.SkipResolve,
+		WorkDir:     workDir,
+		Stdin:       append([]byte(nil), req.Stdin...),
+		TTY:         req.TTY,
+		Cols:        req.Cols,
+		Rows:        req.Rows,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal exec request: %w", err)
@@ -1926,6 +1985,13 @@ func parseManagedExecEventLine(line, id string) (client.ExecEvent, bool, bool, e
 	default:
 		return client.ExecEvent{}, false, false, nil
 	}
+}
+
+func effectiveExecEnv(base, overrides []string, replace bool) []string {
+	if replace {
+		return append([]string(nil), overrides...)
+	}
+	return mergeEnv(base, overrides)
 }
 
 func mergeEnv(base, overrides []string) []string {

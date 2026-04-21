@@ -14,6 +14,7 @@ type Backend interface {
 	Start(context.Context, client.CreateInstanceRequest) (Instance, error)
 	StartStream(context.Context, client.CreateInstanceRequest, func(client.BootEvent) error) (Instance, error)
 	Run(context.Context, client.RunRequest) (client.ExecResponse, error)
+	RunInInstance(context.Context, Instance, string, client.RunRequest) (client.ExecResponse, error)
 }
 
 type Instance interface {
@@ -118,24 +119,7 @@ func (m *Manager) Run(ctx context.Context, req client.RunRequest) (client.ExecRe
 	machine := m.running
 	m.mu.Unlock()
 	if machine != nil {
-		if req.Image != "" && req.Image != machine.image {
-			return client.ExecResponse{}, fmt.Errorf("running instance image is %q, got exec request for %q", machine.image, req.Image)
-		}
-		for _, share := range req.Shares {
-			if err := machine.instance.AddShare(ctx, share); err != nil {
-				return client.ExecResponse{}, err
-			}
-		}
-		return machine.instance.Exec(ctx, client.ExecRequest{
-			Command: append([]string(nil), req.Command...),
-			Env:     append([]string(nil), req.Env...),
-			WorkDir: req.WorkDir,
-			User:    req.User,
-			Stdin:   append([]byte(nil), req.Stdin...),
-			TTY:     req.TTY,
-			Cols:    req.Cols,
-			Rows:    req.Rows,
-		})
+		return m.backend.RunInInstance(ctx, machine.instance, machine.image, req)
 	}
 	if req.Image == "" {
 		return client.ExecResponse{}, fmt.Errorf("image is required")
@@ -209,6 +193,14 @@ func (unsupportedBackend) StartStream(ctx context.Context, req client.CreateInst
 
 func (unsupportedBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
 	_ = ctx
+	_ = req
+	return client.ExecResponse{}, fmt.Errorf("VM backend is not configured")
+}
+
+func (unsupportedBackend) RunInInstance(ctx context.Context, inst Instance, runningImage string, req client.RunRequest) (client.ExecResponse, error) {
+	_ = ctx
+	_ = inst
+	_ = runningImage
 	_ = req
 	return client.ExecResponse{}, fmt.Errorf("VM backend is not configured")
 }

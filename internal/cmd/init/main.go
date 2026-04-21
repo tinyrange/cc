@@ -58,6 +58,7 @@ type execRequest struct {
 	ID      string   `json:"id"`
 	Command []string `json:"command,omitempty"`
 	Env     []string `json:"env,omitempty"`
+	RootDir string   `json:"root_dir,omitempty"`
 	WorkDir string   `json:"workdir,omitempty"`
 	Stdin   []byte   `json:"stdin,omitempty"`
 	TTY     bool     `json:"tty,omitempty"`
@@ -646,7 +647,7 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 			}
 		}
 
-		go runManagedExec(cfg, control, req.ID, req.Command, env, workDir, stdinR, managed, req.TTY, req.Cols, req.Rows, func() {
+		go runManagedExec(cfg, control, req.ID, req.Command, env, req.RootDir, workDir, stdinR, managed, req.TTY, req.Cols, req.Rows, func() {
 			_ = managed.closeStdin()
 			activeMu.Lock()
 			delete(active, req.ID)
@@ -655,7 +656,7 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 	}
 }
 
-func runManagedExec(cfg config, control io.Writer, id string, argv []string, env []string, workDir string, stdin io.ReadCloser, managed *managedExec, tty bool, cols int, rows int, cleanup func()) {
+func runManagedExec(cfg config, control io.Writer, id string, argv []string, env []string, rootDir string, workDir string, stdin io.ReadCloser, managed *managedExec, tty bool, cols int, rows int, cleanup func()) {
 	defer cleanup()
 	execStart := time.Now()
 	writeExecTiming(control, id, "recv", execStart)
@@ -667,6 +668,21 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = env
+	var rootMounts []string
+	if rootDir != "" {
+		preparedRoot, mounts, err := prepareExecRoot(rootDir)
+		if err != nil {
+			writeKernel("ccx3-init: prepare exec root: " + err.Error())
+			writeExecStderr(cfg, control, id, "ccx3-init: prepare exec root: "+err.Error()+"\n")
+			if cfg.ExitMarkerPrefix != "" {
+				writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
+			}
+			return
+		}
+		rootDir = preparedRoot
+		rootMounts = mounts
+		defer teardownExecRoot(rootMounts)
+	}
 	if workDir != "" {
 		cmd.Dir = workDir
 	}
@@ -706,6 +722,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			Setsid:  true,
 			Setctty: true,
 			Ctty:    0,
+			Chroot:  rootDir,
 		}
 		streams := 1
 		if stdin != nil {
@@ -795,6 +812,9 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			}
 		}()
 	}
+	if rootDir != "" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Chroot: rootDir}
+	}
 
 	startErr := cmd.Start()
 	if startErr != nil {
@@ -852,6 +872,36 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	if cfg.ExitMarkerPrefix != "" {
 		writeExecTiming(control, id, "exit_sent", execStart)
 		writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":"+itoa(exitCode))
+	}
+}
+
+func prepareExecRoot(rootDir string) (string, []string, error) {
+	cleaned := strings.TrimSpace(rootDir)
+	if cleaned == "" {
+		return "", nil, nil
+	}
+	if !strings.HasPrefix(cleaned, "/") {
+		return "", nil, fmt.Errorf("root_dir must be absolute")
+	}
+	mounts := make([]string, 0, 5)
+	for _, dir := range []string{"/proc", "/sys", "/dev", "/run", "/tmp"} {
+		target := cleaned + dir
+		if err := os.MkdirAll(target, 0o755); err != nil {
+			teardownExecRoot(mounts)
+			return "", nil, fmt.Errorf("mkdir %s: %w", target, err)
+		}
+		if err := syscall.Mount(dir, target, "", syscall.MS_BIND, ""); err != nil {
+			teardownExecRoot(mounts)
+			return "", nil, fmt.Errorf("bind mount %s -> %s: %w", dir, target, err)
+		}
+		mounts = append(mounts, target)
+	}
+	return cleaned, mounts, nil
+}
+
+func teardownExecRoot(mounts []string) {
+	for i := len(mounts) - 1; i >= 0; i-- {
+		_ = syscall.Unmount(mounts[i], 0)
 	}
 }
 

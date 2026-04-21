@@ -39,17 +39,28 @@ class StreamProgressReporter:
     def __init__(self, total_steps: int, stream: object | None = None) -> None:
         self.total_steps = max(total_steps, 1)
         self.stream = stream if stream is not None else sys.stdout
+        self._active = False
 
     def update(self, step: int, message: str) -> None:
         current = max(0, min(step, self.total_steps))
         width = 24
         filled = int(width * current / self.total_steps)
         bar = "#" * filled + "-" * (width - filled)
-        print(f"[{bar}] {current}/{self.total_steps} {message}", file=self.stream, flush=True)
+        line = f"[{bar}] {current}/{self.total_steps} {message}"
+        print(f"\r\033[2K{line}", end="", file=self.stream, flush=True)
+        self._active = True
 
     def close(self, message: str | None = None) -> None:
         if message:
-            print(message, file=self.stream, flush=True)
+            if self._active:
+                print(f"\r\033[2K{message}", file=self.stream, flush=True)
+            else:
+                print(message, file=self.stream, flush=True)
+            self._active = False
+            return
+        if self._active:
+            print(file=self.stream, flush=True)
+            self._active = False
 
 
 class NotebookProgressReporter:
@@ -335,13 +346,12 @@ def container(
     progress: bool = True,
     debug: bool = False,
 ) -> NeurodeskContainer:
-    reporter = create_progress_reporter(enabled=progress, total_steps=9)
+    reporter = create_progress_reporter(enabled=progress, total_steps=11)
     reporter.update(1, f"Preparing container {name}")
     try:
         reporter.update(2, f"Checking bundled metadata for {name}")
         reference = _resolve_release_reference(name, mirror=mirror, repo=repo, cache_dir=cache_dir)
 
-        owned_daemon: DaemonState | None = None
         if client is not None:
             reporter.update(3, f"Using existing daemon client for {name}")
             active_client = client
@@ -349,9 +359,9 @@ def container(
             reporter.update(3, f"Connecting to daemon at {base_url.rstrip('/')}")
             active_client = connect(base_url=base_url)
         else:
-            reporter.update(3, f"Starting dedicated daemon for {name}")
-            owned_daemon = start_container_daemon()
-            active_client = PyNeurodeskClient(owned_daemon.base_url)
+            reporter.update(3, "Starting shared daemon")
+            daemon = start_default_daemon()
+            active_client = PyNeurodeskClient(daemon.base_url)
 
         if reference is None:
             reporter.update(4, f"Searching CVMFS for {name}")
@@ -378,21 +388,47 @@ def container(
 
         reporter.update(7, f"Checking VM status for {reference.image}")
         vm_state = active_client.instance_status()
-        if vm_state.status == "running" and vm_state.image == reference.image:
-            reporter.update(8, f"VM for {reference.image} is already running")
+        if vm_state.status == "running":
+            if vm_state.image == reference.image:
+                reporter.update(8, f"VM for {reference.image} is already running")
+            else:
+                reporter.update(8, f"VM is already running with {vm_state.image}; {reference.image} will mount on demand")
         else:
-            if vm_state.status == "running" and vm_state.image not in ("", None, reference.image):
-                reporter.update(8, f"Stopping running VM {vm_state.image} before booting {reference.image}")
-                active_client.shutdown_instance()
+            reporter.update(8, "Downloading required file 1/2: Linux kernel")
+            _report_required_download(
+                reporter,
+                step=8,
+                index=1,
+                total=2,
+                fallback_label="kernel",
+                stream_method=(lambda: active_client.download_kernel_stream())
+                if hasattr(active_client, "download_kernel_stream")
+                else None,
+                request=lambda: active_client.download_kernel(),
+            )
+            reporter.update(9, "Downloading required file 2/2: emulator")
+            _report_required_download(
+                reporter,
+                step=9,
+                index=2,
+                total=2,
+                fallback_label="emulator",
+                stream_method=(lambda: active_client.prepare_image_emulator_stream(reference.image))
+                if hasattr(active_client, "prepare_image_emulator_stream")
+                else None,
+                request=lambda: active_client.prepare_image_emulator(reference.image),
+            )
+            reporter.update(10, f"Preparing image metadata for {reference.image}")
+            active_client.prepare_image_metadata(reference.image)
             boot_message = f"Requesting boot of {reference.image} and waiting for guest ready"
             if debug:
                 boot_message += " with serial console enabled"
-            reporter.update(9, boot_message)
+            reporter.update(11, boot_message)
             if debug:
                 _stream_debug_boot(active_client, reference.image)
             else:
                 active_client.create_instance(reference.image, dmesg=False)
-        container_handle = NeurodeskContainer(active_client, reference, owned_daemon=owned_daemon)
+        container_handle = NeurodeskContainer(active_client, reference)
         reporter.close(f"{reference.image} is ready")
         return container_handle
     except httpx.HTTPStatusError as exc:
@@ -738,6 +774,118 @@ def _escape_html(value: str) -> str:
         .replace(">", "&gt;")
         .replace('"', "&quot;")
     )
+
+
+def _describe_required_download(index: int, total: int, label: str, state: object) -> str:
+    status = getattr(state, "status", None)
+    path = getattr(state, "path", None)
+    source = getattr(state, "source", None)
+    required = getattr(state, "required", None)
+    artifact_name = label
+    if isinstance(path, str) and path:
+        artifact_name = Path(path).name or label
+    elif isinstance(source, str) and source:
+        artifact_name = Path(source).name or label
+    if required is False and status != "downloaded":
+        return f"Required file {index}/{total}: {artifact_name} already available"
+    if status == "downloaded":
+        return f"Downloaded required file {index}/{total}: {artifact_name}"
+    return f"Preparing required file {index}/{total}: {artifact_name}"
+
+
+def _stream_required_download_progress(
+    reporter: ProgressReporter,
+    *,
+    step: int,
+    index: int,
+    total: int,
+    fallback_label: str,
+    events: object,
+) -> None:
+    last_message: str | None = None
+    for event in events:
+        status = getattr(event, "status", None)
+        if status == "error":
+            error = getattr(event, "error", None) or f"required file {index}/{total} failed"
+            raise RuntimeError(error)
+        message = _format_required_download_progress(index, total, fallback_label, event)
+        last_message = message
+        reporter.update(step, message)
+    if last_message is None:
+        reporter.update(step, f"Prepared required file {index}/{total}: {fallback_label}")
+
+
+def _report_required_download(
+    reporter: ProgressReporter,
+    *,
+    step: int,
+    index: int,
+    total: int,
+    fallback_label: str,
+    stream_method: object | None,
+    request: Callable[[], object],
+) -> None:
+    if callable(stream_method):
+        _stream_required_download_progress(
+            reporter,
+            step=step,
+            index=index,
+            total=total,
+            fallback_label=fallback_label,
+            events=stream_method(),
+        )
+        return
+    reporter.update(step, _describe_required_download(index, total, fallback_label, request()))
+
+
+def _format_required_download_progress(index: int, total: int, fallback_label: str, event: object) -> str:
+    artifact = getattr(event, "artifact", None) or fallback_label
+    status = getattr(event, "status", None)
+    downloaded = getattr(event, "bytes_downloaded", None)
+    total_bytes = getattr(event, "bytes_total", None)
+    rate = getattr(event, "rate_bytes_per_second", None)
+    eta = getattr(event, "eta_seconds", None)
+
+    parts = [f"required file {index}/{total}: {artifact}"]
+    if isinstance(downloaded, int) and downloaded >= 0:
+        if isinstance(total_bytes, int) and total_bytes > 0:
+            parts.append(f"{_format_byte_size(downloaded)}/{_format_byte_size(total_bytes)}")
+        else:
+            parts.append(_format_byte_size(downloaded))
+    if isinstance(rate, (int, float)) and rate > 0:
+        parts.append(f"{_format_byte_size(float(rate))}/s")
+    if isinstance(eta, (int, float)) and eta > 0:
+        parts.append(f"ETA {_format_duration(float(eta))}")
+
+    prefix = "Downloading"
+    if status == "downloaded":
+        prefix = "Downloaded"
+    elif status not in ("downloading", None):
+        prefix = "Preparing"
+    return f"{prefix} " + " | ".join(parts)
+
+
+def _format_byte_size(value: float) -> str:
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = float(value)
+    for unit in units:
+        if size < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} TB"
+
+
+def _format_duration(seconds: float) -> str:
+    remaining = max(0, int(round(seconds)))
+    minutes, secs = divmod(remaining, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours}h{minutes:02d}m"
+    if minutes > 0:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
 
 
 def _emit_debug_boot_log(exc: httpx.HTTPStatusError) -> None:

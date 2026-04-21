@@ -10,23 +10,16 @@ import (
 
 type packageFileExtractor func(ctx context.Context, repo, packageName, innerPath string) (string, error)
 
-func needsAMD64Emulation(image *oci.Image) bool {
-	if image == nil {
-		return false
-	}
+func NeedsAMD64Emulation(image *oci.Image) bool {
+	_ = image
 	if runtime.GOARCH != "arm64" {
 		return false
 	}
-	switch image.Architecture {
-	case "amd64", "x86_64":
-		return true
-	default:
-		return false
-	}
+	return true
 }
 
-func loadAMD64Emulator(ctx context.Context, image *oci.Image, extractPackageFile packageFileExtractor) (string, error) {
-	if !needsAMD64Emulation(image) {
+func PrepareAMD64Emulator(ctx context.Context, image *oci.Image, extractPackageFile packageFileExtractor) (string, error) {
+	if !NeedsAMD64Emulation(image) {
 		return "", nil
 	}
 	if extractPackageFile == nil {

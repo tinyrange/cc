@@ -83,6 +83,43 @@ func TestManagerRunDelegatesToRunningInstanceExec(t *testing.T) {
 	}
 }
 
+func TestManagerRunDelegatesCrossImageExecToBackend(t *testing.T) {
+	inst := &fakeInstance{waitCh: make(chan error, 1)}
+	var seen struct {
+		running string
+		image   string
+	}
+	mgr := NewManagerWithBackend(fakeBackend{
+		instance: inst,
+		runInInstanceFn: func(ctx context.Context, inst Instance, runningImage string, req client.RunRequest) (client.ExecResponse, error) {
+			_ = ctx
+			_ = inst
+			seen.running = runningImage
+			seen.image = req.Image
+			return client.ExecResponse{ExitCode: 0, Output: "ok"}, nil
+		},
+	})
+	mgr.supports = func() error { return nil }
+
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{Image: "alpine"}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	resp, err := mgr.Run(context.Background(), client.RunRequest{
+		Image:   "niimath",
+		Command: []string{"niimath"},
+	})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if resp.Output != "ok" {
+		t.Fatalf("Run().Output = %q, want %q", resp.Output, "ok")
+	}
+	if seen.running != "alpine" || seen.image != "niimath" {
+		t.Fatalf("backend saw running=%q image=%q", seen.running, seen.image)
+	}
+}
+
 func TestManagerRunAllowsConcurrentExecsOnRunningInstance(t *testing.T) {
 	inst := &fakeInstance{waitCh: make(chan error, 1)}
 	inst.execFn = func(req client.ExecRequest) (client.ExecResponse, error) {
@@ -203,7 +240,7 @@ func TestLoadAMD64EmulatorReadsQEMU(t *testing.T) {
 		Architecture: "amd64",
 	}
 
-	qemu, err := loadAMD64Emulator(context.Background(), image, func(ctx context.Context, repo, packageName, innerPath string) (string, error) {
+	qemu, err := PrepareAMD64Emulator(context.Background(), image, func(ctx context.Context, repo, packageName, innerPath string) (string, error) {
 		_ = ctx
 		if repo != "community" || packageName != "qemu-x86_64" || innerPath != "usr/bin/qemu-x86_64" {
 			t.Fatalf("unexpected package lookup %q %q %q", repo, packageName, innerPath)
@@ -211,17 +248,26 @@ func TestLoadAMD64EmulatorReadsQEMU(t *testing.T) {
 		return "/tmp/qemu-static", nil
 	})
 	if err != nil {
-		t.Fatalf("loadAMD64Emulator() error = %v", err)
+		t.Fatalf("PrepareAMD64Emulator() error = %v", err)
 	}
 	if qemu != "/tmp/qemu-static" {
 		t.Fatalf("qemu path = %q, want %q", qemu, "/tmp/qemu-static")
 	}
 }
 
+func TestNeedsAMD64EmulationDependsOnHostArchitecture(t *testing.T) {
+	got := NeedsAMD64Emulation(&oci.Image{Architecture: "arm64"})
+	want := runtime.GOARCH == "arm64"
+	if got != want {
+		t.Fatalf("NeedsAMD64Emulation(arm64 image) = %v, want %v", got, want)
+	}
+}
+
 type fakeBackend struct {
-	instance Instance
-	err      error
-	runResp  client.ExecResponse
+	instance        Instance
+	err             error
+	runResp         client.ExecResponse
+	runInInstanceFn func(context.Context, Instance, string, client.RunRequest) (client.ExecResponse, error)
 }
 
 func (f fakeBackend) Start(ctx context.Context, req client.CreateInstanceRequest) (Instance, error) {
@@ -239,6 +285,32 @@ func (f fakeBackend) Run(ctx context.Context, req client.RunRequest) (client.Exe
 	_ = ctx
 	_ = req
 	return f.runResp, f.err
+}
+
+func (f fakeBackend) RunInInstance(ctx context.Context, inst Instance, runningImage string, req client.RunRequest) (client.ExecResponse, error) {
+	if f.runInInstanceFn != nil {
+		return f.runInInstanceFn(ctx, inst, runningImage, req)
+	}
+	_ = ctx
+	_ = runningImage
+	if inst == nil {
+		return client.ExecResponse{}, f.err
+	}
+	for _, share := range req.Shares {
+		if err := inst.AddShare(ctx, share); err != nil {
+			return client.ExecResponse{}, err
+		}
+	}
+	return inst.Exec(ctx, client.ExecRequest{
+		Command: append([]string(nil), req.Command...),
+		Env:     append([]string(nil), req.Env...),
+		WorkDir: req.WorkDir,
+		User:    req.User,
+		Stdin:   append([]byte(nil), req.Stdin...),
+		TTY:     req.TTY,
+		Cols:    req.Cols,
+		Rows:    req.Rows,
+	})
 }
 
 type fakeInstance struct {
