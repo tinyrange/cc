@@ -2,13 +2,11 @@ package amd64vm
 
 import "j5.nz/cc/internal/vmruntime"
 
-const (
-	RootFSTag   = vmruntime.RootFSTag
-	EmulatorTag = vmruntime.EmulatorTag
-	GuestCID    = vmruntime.GuestCID
-	ControlPort = vmruntime.ControlPort
-)
-
+// DirectoryShare describes a host directory exposed inside the guest.
 type DirectoryShare = vmruntime.DirectoryShare
+
+// RunRequest is the backend-neutral request shape for the managed amd64 guest runtime.
 type RunRequest = vmruntime.RunRequest
+
+// RunResult is the backend-neutral result shape for one-shot guest execution.
 type RunResult = vmruntime.RunResult

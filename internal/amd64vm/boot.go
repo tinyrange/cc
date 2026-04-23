@@ -16,8 +16,9 @@ const (
 )
 
 type BootConfig struct {
-	MemoryMB uint64
-	Dmesg    bool
+	MemoryMB     uint64
+	Dmesg        bool
+	ExtraCmdline []string
 }
 
 func MemorySizeBytes(memoryMB uint64) uint64 {
@@ -27,19 +28,24 @@ func MemorySizeBytes(memoryMB uint64) uint64 {
 	return memoryMB << 20
 }
 
-func BootCommandLine(dmesg bool) string {
+func BootCommandLine(dmesg bool, extra ...string) string {
 	args := []string{
+		"console=ttyS0,115200n8",
 		"nokaslr",
 		"panic=-1",
 		"rdinit=/init",
 	}
 	if dmesg {
 		args = append([]string{
-			"console=ttyS0,115200n8",
 			fmt.Sprintf("earlycon=uart8250,io,0x%x,115200n8", COM1Base),
 			"keep_bootcon",
 			"loglevel=8",
 		}, args...)
+	}
+	for _, arg := range extra {
+		if strings.TrimSpace(arg) != "" {
+			args = append(args, arg)
+		}
 	}
 	return strings.Join(args, " ")
 }
@@ -49,6 +55,6 @@ func PrepareBoot(memory []byte, kernel []byte, initrd []byte, cfg BootConfig) (*
 		MemoryBase: MemoryBase,
 		MemorySize: MemorySizeBytes(cfg.MemoryMB),
 		Initrd:     initrd,
-		Cmdline:    BootCommandLine(cfg.Dmesg),
+		Cmdline:    BootCommandLine(cfg.Dmesg, cfg.ExtraCmdline...),
 	})
 }

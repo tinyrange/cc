@@ -68,6 +68,11 @@ type kvmSystemEvent struct {
 	data  [16]uint64
 }
 
+type kvmIRQLevel struct {
+	IRQ   uint32
+	Level uint32
+}
+
 type kvmRegs struct {
 	Rax    uint64
 	Rbx    uint64

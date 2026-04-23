@@ -13,6 +13,7 @@ const (
 	kvmGetVcpuMmapSize     = 0xae04
 	kvmGetSupportedCpuid   = 0xc008ae05
 	kvmSetUserMemoryRegion = 0x4020ae46
+	kvmIrqLine             = 0x4008ae61
 	kvmCreateVCPU          = 0xae41
 	kvmSetTssAddr          = 0xae47
 	kvmCreateIrqchip       = 0xae60
@@ -61,6 +62,15 @@ func createVCPU(fd int, id int) (int, error) {
 
 func setUserMemoryRegion(fd int, region *kvmUserspaceMemoryRegion) error {
 	_, err := ioctlWithRetry(uintptr(fd), uint64(kvmSetUserMemoryRegion), uintptr(unsafe.Pointer(region)))
+	return err
+}
+
+func irqLevel(vmFd int, irq uint32, high bool) error {
+	level := kvmIRQLevel{IRQ: irq}
+	if high {
+		level.Level = 1
+	}
+	_, err := ioctlWithRetry(uintptr(vmFd), uint64(kvmIrqLine), uintptr(unsafe.Pointer(&level)))
 	return err
 }
 

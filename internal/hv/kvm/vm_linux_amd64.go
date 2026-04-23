@@ -180,6 +180,48 @@ func (v *VM) GetPC() (uint64, error) {
 	return regs.Rip, nil
 }
 
+func (v *VM) CompleteMMIORead(value uint64, size uint32) {
+	run := (*kvmRunData)(unsafe.Pointer(&v.run[0]))
+	mmio := (*kvmExitMMIOData)(unsafe.Pointer(&run.anon0[0]))
+	for i := range mmio.data {
+		mmio.data[i] = 0
+	}
+	switch size {
+	case 1:
+		mmio.data[0] = byte(value)
+	case 2:
+		binary.LittleEndian.PutUint16(mmio.data[:2], uint16(value))
+	case 4:
+		binary.LittleEndian.PutUint32(mmio.data[:4], uint32(value))
+	default:
+		binary.LittleEndian.PutUint64(mmio.data[:8], value)
+	}
+}
+
+func (v *VM) ReadIPA(addr uint64, size int) ([]byte, error) {
+	if v == nil {
+		return nil, fmt.Errorf("vm is nil")
+	}
+	if size < 0 {
+		return nil, fmt.Errorf("invalid read size %d", size)
+	}
+	if addr+uint64(size) < addr || addr+uint64(size) > uint64(len(v.mem)) {
+		return nil, fmt.Errorf("read guest memory %#x size %d: unmapped", addr, size)
+	}
+	return append([]byte(nil), v.mem[addr:addr+uint64(size)]...), nil
+}
+
+func (v *VM) WriteIPA(addr uint64, data []byte) error {
+	if v == nil {
+		return fmt.Errorf("vm is nil")
+	}
+	if addr+uint64(len(data)) < addr || addr+uint64(len(data)) > uint64(len(v.mem)) {
+		return fmt.Errorf("write guest memory %#x size %d: unmapped", addr, len(data))
+	}
+	copy(v.mem[addr:addr+uint64(len(data))], data)
+	return nil
+}
+
 func (v *VM) SetLongMode(entry, zeroPage, stack, pagingBase uint64) error {
 	if err := v.setupPageTables(pagingBase, 4); err != nil {
 		return err
@@ -253,7 +295,14 @@ func (v *VM) setupPageTables(pagingBase uint64, giB int) error {
 }
 
 func (v *VM) SetIRQ(line uint32, level bool) error {
-	_ = line
-	_ = level
+	if v == nil {
+		return fmt.Errorf("vm is nil")
+	}
+	if line >= kvmNrInterrupts {
+		return fmt.Errorf("irq %d out of range", line)
+	}
+	if err := irqLevel(v.vmfd, line, level); err != nil {
+		return fmt.Errorf("set irq %d level=%v: %w", line, level, err)
+	}
 	return nil
 }
