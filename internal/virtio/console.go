@@ -67,18 +67,18 @@ type Console struct {
 	IRQ  uint32
 	Out  io.Writer
 
-	mu                sync.Mutex
-	mem               GuestMemory
-	irq               IRQController
-	deviceFeatureSel  uint32
-	driverFeatureSel  uint32
-	driverFeatures    uint64
-	queueSel          uint32
-	status            uint32
-	interruptStatus   uint32
-	irqHigh           bool
-	configGeneration  uint32
-	queues            [2]queue
+	mu               sync.Mutex
+	mem              GuestMemory
+	irq              IRQController
+	deviceFeatureSel uint32
+	driverFeatureSel uint32
+	driverFeatures   uint64
+	queueSel         uint32
+	status           uint32
+	interruptStatus  uint32
+	irqHigh          bool
+	configGeneration uint32
+	queues           [2]queue
 }
 
 type queue struct {

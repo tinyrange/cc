@@ -18,6 +18,7 @@ import (
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/virtio"
+	"j5.nz/cc/internal/vmruntime"
 )
 
 var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
@@ -169,20 +170,20 @@ func (b *runtimeBackend) RunInInstance(
 	})
 }
 
-func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, memoryMB uint64, cpus int, dmesg bool) (hvf.ContainerRunRequest, error) {
+func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, memoryMB uint64, cpus int, dmesg bool) (vmruntime.RunRequest, error) {
 	start := time.Now()
 	if b.kernel == nil || b.images == nil {
-		return hvf.ContainerRunRequest{}, fmt.Errorf("runtime backend is not configured")
+		return vmruntime.RunRequest{}, fmt.Errorf("runtime backend is not configured")
 	}
 	image, err := b.images.Open(imageName)
 	if err != nil {
-		return hvf.ContainerRunRequest{}, err
+		return vmruntime.RunRequest{}, err
 	}
 	image = withRuntimeMountDirs(image)
 	timingLog("buildBaseRequest image open took=%s image=%q", time.Since(start), imageName)
 	kernel, err := b.kernel.ReadKernel()
 	if err != nil {
-		return hvf.ContainerRunRequest{}, err
+		return vmruntime.RunRequest{}, err
 	}
 	timingLog("buildBaseRequest ReadKernel took=%s image=%q", time.Since(start), imageName)
 	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS"}
@@ -199,12 +200,12 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	}
 	modules, err := b.kernel.PlanModuleLoad(configVars, moduleMap)
 	if err != nil {
-		return hvf.ContainerRunRequest{}, err
+		return vmruntime.RunRequest{}, err
 	}
 	timingLog("buildBaseRequest PlanModuleLoad took=%s image=%q modules=%d", time.Since(start), imageName, len(modules))
 	qemuX8664, err := PrepareAMD64Emulator(ctx, image, b.kernel.ExtractPackageFile)
 	if err != nil {
-		return hvf.ContainerRunRequest{}, err
+		return vmruntime.RunRequest{}, err
 	}
 	timingLog("buildBaseRequest loadAMD64Emulator took=%s image=%q emulator_path=%q", time.Since(start), imageName, qemuX8664)
 	guestInitCache := b.guestInitCache
@@ -213,10 +214,10 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	}
 	initBin, err := guestinit.Build(ctx, guestInitCache)
 	if err != nil {
-		return hvf.ContainerRunRequest{}, err
+		return vmruntime.RunRequest{}, err
 	}
 	timingLog("buildBaseRequest guestinit.Build took=%s image=%q init_bytes=%d", time.Since(start), imageName, len(initBin))
-	return hvf.ContainerRunRequest{
+	return vmruntime.RunRequest{
 		Kernel:            kernel,
 		Init:              initBin,
 		AMD64EmulatorPath: qemuX8664,
@@ -249,23 +250,23 @@ func withRuntimeMountDirs(image *oci.Image) *oci.Image {
 	return &cloned
 }
 
-func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.CreateInstanceRequest) (hvf.ContainerRunRequest, error) {
+func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.CreateInstanceRequest) (vmruntime.RunRequest, error) {
 	runReq, err := b.buildBaseRequest(ctx, req.Image, req.MemoryMB, req.CPUs, req.Dmesg)
 	if err != nil {
-		return hvf.ContainerRunRequest{}, err
+		return vmruntime.RunRequest{}, err
 	}
 	runReq.Shares = append(runReq.Shares, convertShareMounts(req.Shares)...)
 	runReq.Persistent = true
 	return runReq, nil
 }
 
-func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.StartInstanceRequest) (hvf.ContainerRunRequest, error) {
+func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.StartInstanceRequest) (vmruntime.RunRequest, error) {
 	if b.kernel == nil || b.images == nil {
-		return hvf.ContainerRunRequest{}, fmt.Errorf("runtime backend is not configured")
+		return vmruntime.RunRequest{}, fmt.Errorf("runtime backend is not configured")
 	}
 	kernel, err := b.kernel.ReadKernel()
 	if err != nil {
-		return hvf.ContainerRunRequest{}, err
+		return vmruntime.RunRequest{}, err
 	}
 	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS"}
 	moduleMap := map[string]string{
@@ -277,7 +278,7 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 	}
 	modules, err := b.kernel.PlanModuleLoad(configVars, moduleMap)
 	if err != nil {
-		return hvf.ContainerRunRequest{}, err
+		return vmruntime.RunRequest{}, err
 	}
 	guestInitCache := b.guestInitCache
 	if guestInitCache == "" {
@@ -285,9 +286,9 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 	}
 	initBin, err := guestinit.Build(ctx, guestInitCache)
 	if err != nil {
-		return hvf.ContainerRunRequest{}, err
+		return vmruntime.RunRequest{}, err
 	}
-	return hvf.ContainerRunRequest{
+	return vmruntime.RunRequest{
 		Kernel:     kernel,
 		Init:       initBin,
 		Modules:    modules,
@@ -299,10 +300,10 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 	}, ctx.Err()
 }
 
-func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.RunRequest) (hvf.ContainerRunRequest, error) {
+func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.RunRequest) (vmruntime.RunRequest, error) {
 	runReq, err := b.buildBaseRequest(ctx, req.Image, req.MemoryMB, req.CPUs, req.Dmesg)
 	if err != nil {
-		return hvf.ContainerRunRequest{}, err
+		return vmruntime.RunRequest{}, err
 	}
 	runReq.Shares = append(runReq.Shares, convertShareMounts(req.Shares)...)
 	runReq.Command = append([]string(nil), req.Command...)
@@ -312,13 +313,13 @@ func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.RunRequ
 	return runReq, nil
 }
 
-func convertShareMounts(shares []client.ShareMount) []hvf.DirectoryShare {
+func convertShareMounts(shares []client.ShareMount) []vmruntime.DirectoryShare {
 	if len(shares) == 0 {
 		return nil
 	}
-	out := make([]hvf.DirectoryShare, 0, len(shares))
+	out := make([]vmruntime.DirectoryShare, 0, len(shares))
 	for _, share := range shares {
-		out = append(out, hvf.DirectoryShare{
+		out = append(out, vmruntime.DirectoryShare{
 			Source:   share.Source,
 			Mount:    share.Mount,
 			Writable: share.Writable,

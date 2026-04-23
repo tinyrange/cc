@@ -753,7 +753,8 @@ def test_resolve_base_url_reads_daemon_state(monkeypatch, tmp_path: Path) -> Non
     monkeypatch.delenv("CCVM_URL", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr("pyneurodesk.api._health_check", lambda base_url: base_url == "http://127.0.0.1:4567")
-    state_path = tmp_path / "Library" / "Caches" / "ccx3" / "ccvm.json"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / ".cache"))
+    state_path = tmp_path / ".cache" / "ccx3" / "ccvm.json"
     state_path.parent.mkdir(parents=True)
     state_path.write_text('{"addr":"127.0.0.1:4567"}')
 

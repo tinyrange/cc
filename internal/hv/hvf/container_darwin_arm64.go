@@ -18,14 +18,13 @@ import (
 	"time"
 
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/arm64vm"
 	"j5.nz/cc/internal/fdt"
 	"j5.nz/cc/internal/imagefs"
-	"j5.nz/cc/internal/kernel/alpine"
-	bootarm64 "j5.nz/cc/internal/linux/boot/arm64"
-	"j5.nz/cc/internal/linux/initramfs"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
+	"j5.nz/cc/internal/vmruntime"
 )
 
 var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
@@ -38,68 +37,31 @@ func timingLog(format string, args ...any) {
 }
 
 const (
-	containerMemoryBase   = 0xa0000000
-	defaultMemorySize     = 512 << 20
-	containerGICDistMin   = 0x08000000
-	containerGICDistMax   = containerGICDistMin + 0x00010000
-	containerGICRedistMin = 0x080a0000
-	containerGICRedistMax = containerGICRedistMin + 0x00020000
-	containerConsoleBase  = 0x0a100000
-	containerConsoleSize  = 0x1000
-	containerConsoleIRQ   = 40
-	containerFSBase       = 0x0a101000
-	containerFSSize       = 0x1000
-	containerFSIRQ        = 41
-	containerVsockBase    = 0x0a102000
-	containerVsockSize    = 0x1000
-	containerVsockIRQ     = 42
-	containerShareFSBase  = 0x0a103000
-	containerShareFSIRQ   = 43
-	containerFSStride     = 0x1000
-	containerUARTSPI      = 33
-	containerRootFSTag    = "rootfs"
-	containerEmulatorTag  = "ccx3"
-	containerGuestCID     = 3
-	containerControlPort  = 10777
-	instanceReadyMarker   = "__CCX3_READY__"
-	initDurationMarker    = "__CCX3_INIT_MS__:"
-	execTimingMarker      = "__CCX3_TIMING__:"
-	commandBeginMarker    = "__CCX3_BEGIN__:"
-	commandOutputMarker   = "__CCX3_OUT__:"
-	commandErrorMarker    = "__CCX3_ERR__:"
-	commandExitMarkerPref = "__CCX3_EXIT__:"
+	instanceReadyMarker   = vmruntime.InstanceReadyMarker
+	initDurationMarker    = vmruntime.InitDurationMarker
+	execTimingMarker      = vmruntime.ExecTimingMarker
+	commandBeginMarker    = vmruntime.CommandBeginMarker
+	commandOutputMarker   = vmruntime.CommandOutputMarker
+	commandErrorMarker    = vmruntime.CommandErrorMarker
+	commandExitMarkerPref = vmruntime.CommandExitMarkerPref
 	arm64VirtualTimerPPI  = 27
 )
 
-type ContainerRunRequest struct {
-	Kernel            []byte
-	Init              []byte
-	AMD64EmulatorPath string
-	Modules           []alpine.Module
-	Image             *oci.Image
-	RootFS            virtio.FSBackend
-	Shares            []DirectoryShare
-	Command           []string
-	Env               []string
-	WorkDir           string
-	User              string
-	MemoryMB          uint64
-	CPUs              int
-	Dmesg             bool
-	Persistent        bool
+type serialTranscript = arm64vm.SerialTranscript
+type bootEventWriter = arm64vm.BootEventWriter
+
+func newSerialTranscript() *serialTranscript { return arm64vm.NewSerialTranscript() }
+func newBootEventWriter(callback func(client.BootEvent) error) *bootEventWriter {
+	return arm64vm.NewBootEventWriter(callback)
+}
+func hasFatalBootText(text string) bool { return arm64vm.HasFatalBootText(text) }
+func parseInitDurationMarker(text string) (int, bool) {
+	return arm64vm.ParseInitDurationMarker(text)
 }
 
-type DirectoryShare struct {
-	Source   string
-	Mount    string
-	Writable bool
-}
-
-type ContainerRunResult struct {
-	ExitCode   int
-	Output     string
-	Transcript string
-}
+type ContainerRunRequest = vmruntime.RunRequest
+type DirectoryShare = vmruntime.DirectoryShare
+type ContainerRunResult = vmruntime.RunResult
 
 type ContainerSession struct {
 	cancel      context.CancelFunc
@@ -110,7 +72,7 @@ type ContainerSession struct {
 	dmesg       bool
 	uart        *serial.UART8250
 	control     virtio.VsockConn
-	transcript  *serialTranscript
+	transcript  *arm64vm.SerialTranscript
 	listener    virtio.VsockListener
 	vsock       *virtio.Vsock
 	rootFS      virtio.ShareMounter
@@ -130,144 +92,6 @@ type readyResult struct {
 type sessionRunResult struct {
 	result ContainerRunResult
 	err    error
-}
-
-type serialTranscript struct {
-	mu   sync.Mutex
-	cond *sync.Cond
-	buf  bytes.Buffer
-}
-
-type bootEventWriter struct {
-	ch       chan string
-	done     chan struct{}
-	callback func(client.BootEvent) error
-	errMu    sync.Mutex
-	err      error
-}
-
-func newSerialTranscript() *serialTranscript {
-	s := &serialTranscript{}
-	s.cond = sync.NewCond(&s.mu)
-	return s
-}
-
-func newBootEventWriter(callback func(client.BootEvent) error) *bootEventWriter {
-	w := &bootEventWriter{
-		ch:       make(chan string, 128),
-		done:     make(chan struct{}),
-		callback: callback,
-	}
-	go func() {
-		defer close(w.done)
-		for chunk := range w.ch {
-			if w.callback == nil || chunk == "" {
-				continue
-			}
-			if err := w.callback(client.BootEvent{Kind: "serial", Data: chunk}); err != nil {
-				w.errMu.Lock()
-				if w.err == nil {
-					w.err = err
-				}
-				w.errMu.Unlock()
-				return
-			}
-		}
-	}()
-	return w
-}
-
-func (w *bootEventWriter) Write(data []byte) (int, error) {
-	if len(data) == 0 {
-		return 0, nil
-	}
-	w.ch <- string(append([]byte(nil), data...))
-	return len(data), nil
-}
-
-func (w *bootEventWriter) Close() error {
-	close(w.ch)
-	<-w.done
-	w.errMu.Lock()
-	defer w.errMu.Unlock()
-	return w.err
-}
-
-func (s *serialTranscript) Write(data []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	n, err := s.buf.Write(data)
-	s.cond.Broadcast()
-	return n, err
-}
-
-func (s *serialTranscript) Len() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.buf.Len()
-}
-
-func (s *serialTranscript) String() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.buf.String()
-}
-
-func (s *serialTranscript) waitFor(ctx context.Context, start int, predicate func(string) bool) (string, error) {
-	for {
-		s.mu.Lock()
-		if start <= s.buf.Len() {
-			text := s.buf.String()[start:]
-			if predicate(text) {
-				s.mu.Unlock()
-				return text, nil
-			}
-		}
-		s.mu.Unlock()
-
-		if ctx.Err() != nil {
-			return "", ctx.Err()
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
-func hasFatalBootText(text string) bool {
-	fatalMarkers := []string{
-		"ccx3-init-fatal:",
-		"Kernel panic",
-		"kernel panic",
-		"panic: ",
-		"not syncing",
-		"reboot: System halted",
-	}
-	for _, marker := range fatalMarkers {
-		if strings.Contains(text, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-func parseInitDurationMarker(text string) (int, bool) {
-	idx := strings.LastIndex(text, initDurationMarker)
-	if idx < 0 {
-		return 0, false
-	}
-	rest := text[idx+len(initDurationMarker):]
-	end := strings.IndexByte(rest, '\n')
-	if end >= 0 {
-		rest = rest[:end]
-	}
-	rest = strings.TrimSpace(rest)
-	if rest == "" {
-		return 0, false
-	}
-	ms, err := strconv.Atoi(rest)
-	if err != nil {
-		return 0, false
-	}
-	return ms, true
 }
 
 func parseExecTimingMarkers(text, id string) map[string]int {
@@ -459,12 +283,6 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 	}
 
 	env := effectiveExecEnv(s.baseEnv, req.Env, req.ReplaceEnv)
-	if !hasEnvKey(env, "PATH") {
-		env = append(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-	}
-	if !hasEnvKey(env, "HOME") {
-		env = append(env, "HOME=/root")
-	}
 	command := append([]string(nil), req.Command...)
 	if !req.SkipResolve {
 		if s.image == nil || s.image.RootFS == nil {
@@ -520,21 +338,21 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 	}
 	timingLog("session.Exec sendStdinClose took=%s argv=%q id=%s", time.Since(startTime), req.Command, id)
 
-	beginSegment, err := s.transcript.waitFor(ctx, start, func(text string) bool {
+	beginSegment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
 		return hasManagedExecBegin(text, id)
 	})
 	if err != nil {
 		return client.ExecResponse{}, err
 	}
 	timingLog("session.Exec waitForBegin took=%s argv=%q id=%s segment_bytes=%d", time.Since(startTime), req.Command, id, len(beginSegment))
-	firstByteSegment, err := s.transcript.waitFor(ctx, start, func(text string) bool {
+	firstByteSegment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
 		return hasManagedExecFirstByte(text, id)
 	})
 	if err != nil {
 		return client.ExecResponse{}, err
 	}
 	timingLog("session.Exec waitForFirstByte took=%s argv=%q id=%s segment_bytes=%d", time.Since(startTime), req.Command, id, len(firstByteSegment))
-	segment, err := s.transcript.waitFor(ctx, start, func(text string) bool {
+	segment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
 		_, _, ok := extractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})
@@ -574,12 +392,6 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 	}
 
 	env := effectiveExecEnv(s.baseEnv, req.Env, req.ReplaceEnv)
-	if !hasEnvKey(env, "PATH") {
-		env = append(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-	}
-	if !hasEnvKey(env, "HOME") {
-		env = append(env, "HOME=/root")
-	}
 	command := append([]string(nil), req.Command...)
 	if !req.SkipResolve {
 		var err error
@@ -794,55 +606,9 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	if req.Image != nil {
 		baseEnv = append([]string(nil), req.Image.Config.Env...)
 	}
-	if !hasEnvKey(baseEnv, "PATH") {
-		baseEnv = append(baseEnv, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-	}
-	if !hasEnvKey(baseEnv, "HOME") {
-		baseEnv = append(baseEnv, "HOME=/root")
-	}
+	baseEnv = vmruntime.WithDefaultEnv(baseEnv)
 
-	configJSON, err := json.Marshal(guestInitConfig{
-		Env:              baseEnv,
-		WorkDir:          workDir,
-		Modules:          moduleConfig(req.Modules),
-		EmulatorTag:      emulatorTagConfig(req.AMD64EmulatorPath),
-		RootFSTag:        containerRootFSTag,
-		VsockPort:        containerControlPort,
-		ReadyMarker:      instanceReadyMarker,
-		BeginMarker:      commandBeginMarker,
-		OutputMarkerPref: commandOutputMarker,
-		ErrorMarkerPref:  commandErrorMarker,
-		ExitMarkerPrefix: commandExitMarkerPref,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("marshal guest init config: %w", err)
-	}
-	timingLog("hvf.StartContainer config marshal took=%s", time.Since(start))
-
-	extraFiles := []initramfs.File{
-		{Path: "/dev", Mode: 0o755, Type: initramfs.TypeDirectory},
-		{Path: "/proc", Mode: 0o755, Type: initramfs.TypeDirectory},
-		{Path: "/sys", Mode: 0o755, Type: initramfs.TypeDirectory},
-		{Path: "/run", Mode: 0o755, Type: initramfs.TypeDirectory},
-		{Path: "/tmp", Mode: 0o1777, Type: initramfs.TypeDirectory},
-		{Path: "/etc", Mode: 0o755, Type: initramfs.TypeDirectory},
-		{Path: "/ccx3", Mode: 0o755, Type: initramfs.TypeDirectory},
-		{Path: "/ccx3/modules", Mode: 0o755, Type: initramfs.TypeDirectory},
-		{Path: "/dev/console", Mode: 0o600, Type: initramfs.TypeCharDevice, DevMajor: 5, DevMinor: 1},
-		{Path: "/dev/null", Mode: 0o666, Type: initramfs.TypeCharDevice, DevMajor: 1, DevMinor: 3},
-		{Path: "/dev/kmsg", Mode: 0o600, Type: initramfs.TypeCharDevice, DevMajor: 1, DevMinor: 11},
-		{Path: "/etc/ccx3-init.json", Mode: 0o600, Data: configJSON, Type: initramfs.TypeRegular},
-		{Path: "/init", Mode: 0o755, Data: req.Init, Type: initramfs.TypeRegular},
-	}
-	for _, mod := range req.Modules {
-		extraFiles = append(extraFiles, initramfs.File{
-			Path: "/ccx3/modules/" + mod.Name + ".ko",
-			Mode: 0o644,
-			Data: mod.Data,
-			Type: initramfs.TypeRegular,
-		})
-	}
-	initrd, err := initramfs.Build(extraFiles)
+	initrd, err := arm64vm.BuildPersistentInitramfs(req, baseEnv, workDir)
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
 	}
@@ -854,11 +620,8 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	}
 	timingLog("hvf.StartContainer NewVM took=%s", time.Since(start))
 
-	memorySize := uint64(defaultMemorySize)
-	if req.MemoryMB != 0 {
-		memorySize = req.MemoryMB << 20
-	}
-	mem, err := vm.MapAnonymousMemory(uintptr(memorySize), IPA(containerMemoryBase), hvMemoryRead|hvMemoryWrite|hvMemoryExec)
+	memorySize := arm64vm.MemorySizeBytes(req.MemoryMB)
+	mem, err := vm.MapAnonymousMemory(uintptr(memorySize), IPA(arm64vm.MemoryBase), hvMemoryRead|hvMemoryWrite|hvMemoryExec)
 	if err != nil {
 		vm.Close()
 		return nil, fmt.Errorf("map guest memory: %w", err)
@@ -876,19 +639,19 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	var consoleOut bytes.Buffer
 	var fsTrace bytes.Buffer
 	var runTrace bytes.Buffer
-	uart := serial.NewUART8250(bootarm64.DefaultUARTBase, bootarm64.DefaultUARTRegShift, serialWriter)
-	uart.AttachIRQ(vm, containerUARTSPI)
-	console := virtio.NewConsole(containerConsoleBase, containerConsoleSize, containerConsoleIRQ, &consoleOut)
+	uart := serial.NewUART8250(arm64vm.DefaultUARTBase, arm64vm.DefaultUARTRegShift, serialWriter)
+	uart.AttachIRQ(vm, arm64vm.UARTSPI)
+	console := virtio.NewConsole(arm64vm.ConsoleBase, arm64vm.ConsoleSize, arm64vm.ConsoleIRQ, &consoleOut)
 	console.Attach(vm, vm)
 	vsockBackend := virtio.NewSimpleVsockBackend()
-	listener, err := vsockBackend.Listen(containerControlPort)
+	listener, err := vsockBackend.Listen(vmruntime.ControlPort)
 	if err != nil {
 		vm.Close()
 		return nil, fmt.Errorf("listen vsock control: %w", err)
 	}
-	vsock := virtio.NewVsock(containerVsockBase, containerVsockSize, containerVsockIRQ, containerGuestCID, vsockBackend)
+	vsock := virtio.NewVsock(arm64vm.VsockBase, arm64vm.VsockSize, arm64vm.VsockIRQ, vmruntime.GuestCID, vsockBackend)
 	vsock.Attach(vm, vm)
-	fsdevs, rootFS, err := buildFSDevices(req, &fsTrace)
+	fsdevs, rootFS, err := arm64vm.BuildFSDevices(req, &fsTrace)
 	if err != nil {
 		_ = listener.Close()
 		vm.Close()
@@ -899,27 +662,10 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	}
 	timingLog("hvf.StartContainer device setup took=%s fsdevs=%d", time.Since(start), len(fsdevs))
 
-	bootCmdline := []string{
-		"nokaslr",
-		"panic=-1",
-		"rdinit=/init",
-	}
-	if req.Dmesg {
-		bootCmdline = append([]string{
-			"console=ttyS0,115200n8",
-			fmt.Sprintf("earlycon=uart8250,mmio,0x%x", bootarm64.DefaultUARTBase),
-			"keep_bootcon",
-			"loglevel=8",
-		}, bootCmdline...)
-	}
-	plan, err := bootarm64.PrepareBoot(mem, req.Kernel, bootarm64.BootOptions{
-		MemoryBase: containerMemoryBase,
-		MemorySize: memorySize,
-		NumCPUs:    1,
-		Initrd:     initrd,
-		Console:    req.Dmesg,
-		ExtraNodes: appendFSNodes([]fdt.Node{console.DeviceTreeNode(), vsock.DeviceTreeNode()}, fsdevs),
-		Cmdline:    strings.Join(bootCmdline, " "),
+	plan, err := arm64vm.PrepareBoot(mem, req.Kernel, initrd, arm64vm.BootConfig{
+		MemoryMB:   req.MemoryMB,
+		Dmesg:      req.Dmesg,
+		ExtraNodes: arm64vm.AppendFSNodes([]fdt.Node{console.DeviceTreeNode(), vsock.DeviceTreeNode()}, fsdevs),
 	})
 	if err != nil {
 		vm.Close()
@@ -931,7 +677,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		vm.Close()
 		return nil, fmt.Errorf("set PC: %w", err)
 	}
-	if err := vm.SetReg(hvRegCPSR, bootarm64.DefaultPStateBits); err != nil {
+	if err := vm.SetReg(hvRegCPSR, arm64vm.DefaultPStateBits); err != nil {
 		vm.Close()
 		return nil, fmt.Errorf("set CPSR: %w", err)
 	}
@@ -985,7 +731,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 				sendReady(res.err)
 				return
 			}
-			text, err := controlTranscript.waitFor(runCtx, 0, func(text string) bool {
+			text, err := controlTranscript.WaitFor(runCtx, 0, func(text string) bool {
 				return strings.Contains(text, instanceReadyMarker)
 			})
 			if err != nil {
@@ -1014,7 +760,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 
 	if req.Dmesg {
 		go func() {
-			text, err := serialOut.waitFor(runCtx, 0, hasFatalBootText)
+			text, err := serialOut.WaitFor(runCtx, 0, hasFatalBootText)
 			if err != nil || guestReady.Load() {
 				return
 			}
@@ -1240,13 +986,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	if req.Image != nil {
 		baseEnv = req.Image.Config.Env
 	}
-	env := mergeEnv(baseEnv, req.Env)
-	if !hasEnvKey(env, "PATH") {
-		env = append(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-	}
-	if !hasEnvKey(env, "HOME") {
-		env = append(env, "HOME=/root")
-	}
+	env := vmruntime.WithDefaultEnv(vmruntime.MergeEnv(baseEnv, req.Env))
 
 	var err error
 	if req.Image != nil {
@@ -1255,45 +995,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 			return ContainerRunResult{}, err
 		}
 	}
-	configJSON, err := json.Marshal(guestInitConfig{
-		Command:          command,
-		Env:              env,
-		WorkDir:          workDir,
-		Modules:          moduleConfig(req.Modules),
-		EmulatorTag:      emulatorTagConfig(req.AMD64EmulatorPath),
-		RootFSTag:        containerRootFSTag,
-		BeginMarker:      commandBeginMarker,
-		ErrorMarkerPref:  commandErrorMarker,
-		ExitMarkerPrefix: commandExitMarkerPref,
-	})
-	if err != nil {
-		return ContainerRunResult{}, fmt.Errorf("marshal guest init config: %w", err)
-	}
-
-	extraFiles := []initramfs.File{
-		{Path: "/dev", Mode: 0o755, Type: initramfs.TypeDirectory},
-		{Path: "/proc", Mode: 0o755, Type: initramfs.TypeDirectory},
-		{Path: "/sys", Mode: 0o755, Type: initramfs.TypeDirectory},
-		{Path: "/run", Mode: 0o755, Type: initramfs.TypeDirectory},
-		{Path: "/tmp", Mode: 0o1777, Type: initramfs.TypeDirectory},
-		{Path: "/etc", Mode: 0o755, Type: initramfs.TypeDirectory},
-		{Path: "/ccx3", Mode: 0o755, Type: initramfs.TypeDirectory},
-		{Path: "/ccx3/modules", Mode: 0o755, Type: initramfs.TypeDirectory},
-		{Path: "/dev/console", Mode: 0o600, Type: initramfs.TypeCharDevice, DevMajor: 5, DevMinor: 1},
-		{Path: "/dev/null", Mode: 0o666, Type: initramfs.TypeCharDevice, DevMajor: 1, DevMinor: 3},
-		{Path: "/dev/kmsg", Mode: 0o600, Type: initramfs.TypeCharDevice, DevMajor: 1, DevMinor: 11},
-		{Path: "/etc/ccx3-init.json", Mode: 0o600, Data: configJSON, Type: initramfs.TypeRegular},
-		{Path: "/init", Mode: 0o755, Data: req.Init, Type: initramfs.TypeRegular},
-	}
-	for _, mod := range req.Modules {
-		extraFiles = append(extraFiles, initramfs.File{
-			Path: "/ccx3/modules/" + mod.Name + ".ko",
-			Mode: 0o644,
-			Data: mod.Data,
-			Type: initramfs.TypeRegular,
-		})
-	}
-	initrd, err := initramfs.Build(extraFiles)
+	initrd, err := arm64vm.BuildExecInitramfs(req, command, env, workDir)
 	if err != nil {
 		return ContainerRunResult{}, fmt.Errorf("build initramfs: %w", err)
 	}
@@ -1304,11 +1006,8 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	}
 	defer vm.Close()
 
-	memorySize := uint64(defaultMemorySize)
-	if req.MemoryMB != 0 {
-		memorySize = req.MemoryMB << 20
-	}
-	mem, err := vm.MapAnonymousMemory(uintptr(memorySize), IPA(containerMemoryBase), hvMemoryRead|hvMemoryWrite|hvMemoryExec)
+	memorySize := arm64vm.MemorySizeBytes(req.MemoryMB)
+	mem, err := vm.MapAnonymousMemory(uintptr(memorySize), IPA(arm64vm.MemoryBase), hvMemoryRead|hvMemoryWrite|hvMemoryExec)
 	if err != nil {
 		return ContainerRunResult{}, fmt.Errorf("map guest memory: %w", err)
 	}
@@ -1317,12 +1016,12 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	var consoleOut bytes.Buffer
 	var fsTrace bytes.Buffer
 	var runTrace bytes.Buffer
-	uart := serial.NewUART8250(bootarm64.DefaultUARTBase, bootarm64.DefaultUARTRegShift, &serialOut)
-	uart.AttachIRQ(vm, containerUARTSPI)
-	console := virtio.NewConsole(containerConsoleBase, containerConsoleSize, containerConsoleIRQ, &consoleOut)
+	uart := serial.NewUART8250(arm64vm.DefaultUARTBase, arm64vm.DefaultUARTRegShift, &serialOut)
+	uart.AttachIRQ(vm, arm64vm.UARTSPI)
+	console := virtio.NewConsole(arm64vm.ConsoleBase, arm64vm.ConsoleSize, arm64vm.ConsoleIRQ, &consoleOut)
 	console.Attach(vm, vm)
 	var vsock *virtio.Vsock
-	fsdevs, _, err := buildFSDevices(req, &fsTrace)
+	fsdevs, _, err := arm64vm.BuildFSDevices(req, &fsTrace)
 	if err != nil {
 		return ContainerRunResult{}, err
 	}
@@ -1330,27 +1029,10 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 		fsdev.Attach(vm, vm)
 	}
 
-	bootCmdline := []string{
-		"nokaslr",
-		"panic=-1",
-		"rdinit=/init",
-	}
-	if req.Dmesg {
-		bootCmdline = append([]string{
-			"console=ttyS0,115200n8",
-			fmt.Sprintf("earlycon=uart8250,mmio,0x%x", bootarm64.DefaultUARTBase),
-			"keep_bootcon",
-			"loglevel=8",
-		}, bootCmdline...)
-	}
-	plan, err := bootarm64.PrepareBoot(mem, req.Kernel, bootarm64.BootOptions{
-		MemoryBase: containerMemoryBase,
-		MemorySize: memorySize,
-		NumCPUs:    1,
-		Initrd:     initrd,
-		Console:    req.Dmesg,
-		ExtraNodes: appendFSNodes([]fdt.Node{console.DeviceTreeNode()}, fsdevs),
-		Cmdline:    strings.Join(bootCmdline, " "),
+	plan, err := arm64vm.PrepareBoot(mem, req.Kernel, initrd, arm64vm.BootConfig{
+		MemoryMB:   req.MemoryMB,
+		Dmesg:      req.Dmesg,
+		ExtraNodes: arm64vm.AppendFSNodes([]fdt.Node{console.DeviceTreeNode()}, fsdevs),
 	})
 	if err != nil {
 		return ContainerRunResult{}, fmt.Errorf("prepare boot: %w", err)
@@ -1359,7 +1041,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	if err := vm.SetReg(hvRegPC, plan.EntryGPA); err != nil {
 		return ContainerRunResult{}, fmt.Errorf("set PC: %w", err)
 	}
-	if err := vm.SetReg(hvRegCPSR, bootarm64.DefaultPStateBits); err != nil {
+	if err := vm.SetReg(hvRegCPSR, arm64vm.DefaultPStateBits); err != nil {
 		return ContainerRunResult{}, fmt.Errorf("set CPSR: %w", err)
 	}
 	if err := vm.SetSysReg(hvSysRegSP_EL1, plan.StackTopGPA); err != nil {
@@ -1520,91 +1202,6 @@ type runResultVM struct {
 	err  error
 }
 
-func buildFSDevices(req ContainerRunRequest, trace io.Writer) ([]*virtio.FS, virtio.ShareMounter, error) {
-	rootFSBackend := req.RootFS
-	if rootFSBackend == nil {
-		if req.Image == nil {
-			return nil, nil, fmt.Errorf("image or rootfs backend is required")
-		}
-		rootFSBackend = virtio.NewImageFS(req.Image.RootFS, req.Image.RootFSDir)
-	}
-	shares := make([]virtio.ShareMount, 0, len(req.Shares))
-	for i, share := range req.Shares {
-		_, backend, err := buildShareBackend(i, share)
-		if err != nil {
-			return nil, nil, err
-		}
-		shares = append(shares, virtio.ShareMount{
-			GuestPath: share.Mount,
-			Backend:   backend,
-			Writable:  share.Writable,
-		})
-	}
-	rootFSBackend = virtio.NewMountedFS(rootFSBackend, shares)
-	rootFS, _ := rootFSBackend.(virtio.ShareMounter)
-	devs := []*virtio.FS{
-		newFSDevice(containerFSBase, containerFSIRQ, containerRootFSTag, rootFSBackend, trace),
-	}
-	if strings.TrimSpace(req.AMD64EmulatorPath) != "" {
-		sourceDir := filepath.Dir(req.AMD64EmulatorPath)
-		devs = append(devs, newFSDevice(containerShareFSBase, containerShareFSIRQ, containerEmulatorTag, virtio.NewImageFS(imagefs.NewHostFS(sourceDir, nil), sourceDir), trace))
-	}
-	return devs, rootFS, nil
-}
-
-func newFSDevice(base uint64, irq uint32, tag string, backend virtio.FSBackend, trace io.Writer) *virtio.FS {
-	fsdev := virtio.NewFS(base, containerFSSize, irq, tag, backend)
-	fsdev.Log = trace
-	fsdev.Strict = true
-	return fsdev
-}
-
-func buildShareBackend(index int, share DirectoryShare) (string, virtio.FSBackend, error) {
-	source := strings.TrimSpace(share.Source)
-	if source == "" {
-		return "", nil, fmt.Errorf("share %d: source is required", index)
-	}
-	mount := strings.TrimSpace(share.Mount)
-	if mount == "" || !strings.HasPrefix(mount, "/") {
-		return "", nil, fmt.Errorf("share %d: mount must be an absolute guest path", index)
-	}
-	info, err := os.Stat(source)
-	if err != nil {
-		return "", nil, fmt.Errorf("share %d: stat source: %w", index, err)
-	}
-	if !info.IsDir() {
-		return "", nil, fmt.Errorf("share %d: source must be a directory", index)
-	}
-	tag := fmt.Sprintf("share%d", index)
-	if share.Writable {
-		return tag, virtio.NewPassthroughFS(source, nil), nil
-	}
-	return tag, virtio.NewImageFS(imagefs.NewHostFS(source, nil), source), nil
-}
-
-func appendFSNodes(nodes []fdt.Node, fsdevs []*virtio.FS) []fdt.Node {
-	out := append([]fdt.Node(nil), nodes...)
-	for _, fsdev := range fsdevs {
-		out = append(out, fsdev.DeviceTreeNode())
-	}
-	return out
-}
-
-func guestShareConfig(shares []DirectoryShare) []guestInitShare {
-	if len(shares) == 0 {
-		return nil
-	}
-	out := make([]guestInitShare, 0, len(shares))
-	for i, share := range shares {
-		out = append(out, guestInitShare{
-			Tag:      fmt.Sprintf("share%d", i),
-			Mount:    share.Mount,
-			Writable: share.Writable,
-		})
-	}
-	return out
-}
-
 func handleContainerDataAbort(vm *VM, uart *serial.UART8250, console *virtio.Console, fsdevs []*virtio.FS, vsock *virtio.Vsock, exitInfo *VcpuExit) error {
 	info, err := DecodeDataAbort(exitInfo.Exception.Syndrome)
 	if err != nil {
@@ -1671,7 +1268,7 @@ func handleContainerDataAbort(vm *VM, uart *serial.UART8250, console *virtio.Con
 				return err
 			}
 		}
-	case mmioInRange(addr, containerGICDistMin, containerGICDistMax) || mmioInRange(addr, containerGICRedistMin, containerGICRedistMax):
+	case mmioInRange(addr, arm64vm.GICDistributorMin, arm64vm.GICDistributorMax) || mmioInRange(addr, arm64vm.GICRedistributorMin, arm64vm.GICRedistributorMax):
 		value, err := handleGICAccess(vm, addr, info)
 		if err != nil {
 			return err
@@ -1804,8 +1401,8 @@ func handleGICAccess(vm *VM, addr uint64, info DataAbortInfo) (uint64, error) {
 	}
 
 	switch {
-	case mmioInRange(addr, containerGICDistMin, containerGICDistMax):
-		reg := GICDistributorReg(addr - containerGICDistMin)
+	case mmioInRange(addr, arm64vm.GICDistributorMin, arm64vm.GICDistributorMax):
+		reg := GICDistributorReg(addr - arm64vm.GICDistributorMin)
 		if info.Write {
 			err := vm.SetGICDistributorReg(reg, value)
 			if err != nil && strings.Contains(err.Error(), "denied") {
@@ -1818,8 +1415,8 @@ func handleGICAccess(vm *VM, addr uint64, info DataAbortInfo) (uint64, error) {
 			return 0x30, nil
 		}
 		return val, err
-	case mmioInRange(addr, containerGICRedistMin, containerGICRedistMax):
-		reg := GICRedistributorReg(addr - containerGICRedistMin)
+	case mmioInRange(addr, arm64vm.GICRedistributorMin, arm64vm.GICRedistributorMax):
+		reg := GICRedistributorReg(addr - arm64vm.GICRedistributorMin)
 		if info.Write {
 			err := vm.SetGICRedistributorReg(reg, value)
 			if err != nil && (strings.Contains(err.Error(), "denied") || strings.Contains(err.Error(), "bad argument")) {
@@ -1992,85 +1589,9 @@ func parseManagedExecEventLine(line, id string) (client.ExecEvent, bool, bool, e
 
 func effectiveExecEnv(base, overrides []string, replace bool) []string {
 	if replace {
-		return append([]string(nil), overrides...)
+		return vmruntime.WithDefaultEnv(overrides)
 	}
-	return mergeEnv(base, overrides)
-}
-
-func mergeEnv(base, overrides []string) []string {
-	index := map[string]int{}
-	out := make([]string, 0, len(base)+len(overrides))
-	for _, kv := range base {
-		key, _, ok := strings.Cut(kv, "=")
-		if !ok || key == "" {
-			continue
-		}
-		index[key] = len(out)
-		out = append(out, kv)
-	}
-	for _, kv := range overrides {
-		key, _, ok := strings.Cut(kv, "=")
-		if !ok || key == "" {
-			continue
-		}
-		if idx, ok := index[key]; ok {
-			out[idx] = kv
-			continue
-		}
-		index[key] = len(out)
-		out = append(out, kv)
-	}
-	return out
-}
-
-func hasEnvKey(env []string, key string) bool {
-	prefix := key + "="
-	for _, kv := range env {
-		if strings.HasPrefix(kv, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-type guestInitConfig struct {
-	Command          []string         `json:"command"`
-	Env              []string         `json:"env"`
-	WorkDir          string           `json:"workdir"`
-	Modules          []string         `json:"modules,omitempty"`
-	EmulatorTag      string           `json:"emulator_tag,omitempty"`
-	RootFSTag        string           `json:"rootfs_tag,omitempty"`
-	Shares           []guestInitShare `json:"shares,omitempty"`
-	VsockPort        uint32           `json:"vsock_port,omitempty"`
-	ReadyMarker      string           `json:"ready_marker,omitempty"`
-	BeginMarker      string           `json:"begin_marker"`
-	OutputMarkerPref string           `json:"output_marker_prefix,omitempty"`
-	ErrorMarkerPref  string           `json:"error_marker_prefix,omitempty"`
-	ExitMarkerPrefix string           `json:"exit_marker_prefix"`
-}
-
-type guestInitShare struct {
-	Tag      string `json:"tag"`
-	Mount    string `json:"mount"`
-	Writable bool   `json:"writable,omitempty"`
-}
-
-func moduleConfig(modules []alpine.Module) []string {
-	if len(modules) == 0 {
-		return nil
-	}
-	out := make([]string, 0, len(modules))
-	for _, mod := range modules {
-		out = append(out, "/ccx3/modules/"+mod.Name+".ko")
-	}
-	return out
-}
-
-func emulatorTagConfig(path string) string {
-	if strings.TrimSpace(path) == "" {
-		return ""
-	}
-	return containerEmulatorTag
+	return vmruntime.WithDefaultEnv(vmruntime.MergeEnv(base, overrides))
 }
 
 func cleanCommandOutput(output string) string {
