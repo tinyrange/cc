@@ -81,6 +81,18 @@ func (c *Client) DownloadKernel(req DownloadRequest) error {
 	return c.postJSONExpectOK("/kernel/download", req, nil)
 }
 
+func (c *Client) PrepareImageMetadata(name string) (ImageMetadataState, error) {
+	var ret ImageMetadataState
+	err := c.postJSONExpectOK("/image/"+name+"/metadata", map[string]any{}, &ret)
+	return ret, err
+}
+
+func (c *Client) PrepareImageEmulator(name string) (EmulatorState, error) {
+	var ret EmulatorState
+	err := c.postJSONExpectOK("/image/"+name+"/qemu/download", map[string]any{}, &ret)
+	return ret, err
+}
+
 func (c *Client) ListImages() ([]ImageState, error) {
 	resp, err := c.client.Get(c.url + "/image")
 	if err != nil {
@@ -135,6 +147,12 @@ func (c *Client) CreateInstance(req CreateInstanceRequest) (InstanceState, error
 	return ret, err
 }
 
+func (c *Client) StartInstance(req StartInstanceRequest) (InstanceState, error) {
+	var ret InstanceState
+	err := c.postJSONExpectOK("/vm/start", req, &ret)
+	return ret, err
+}
+
 func (c *Client) InstanceStatus() (InstanceState, error) {
 	var ret InstanceState
 	resp, err := c.client.Get(c.url + "/vm/status")
@@ -161,14 +179,16 @@ func (c *Client) Run(req RunRequest) (ExecResponse, error) {
 
 func (c *Client) RunEvents(req RunRequest) ([]ExecEvent, error) {
 	return c.ExecEvents(ExecRequest{
-		Command: append([]string(nil), req.Command...),
-		Env:     append([]string(nil), req.Env...),
-		WorkDir: req.WorkDir,
-		User:    req.User,
-		Stdin:   append([]byte(nil), req.Stdin...),
-		TTY:     req.TTY,
-		Cols:    req.Cols,
-		Rows:    req.Rows,
+		Command:    append([]string(nil), req.Command...),
+		Env:        append([]string(nil), req.Env...),
+		RootDir:    req.RootDir,
+		ReplaceEnv: req.ReplaceEnv,
+		WorkDir:    req.WorkDir,
+		User:       req.User,
+		Stdin:      append([]byte(nil), req.Stdin...),
+		TTY:        req.TTY,
+		Cols:       req.Cols,
+		Rows:       req.Rows,
 	})
 }
 

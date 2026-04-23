@@ -6,7 +6,9 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"path/filepath"
 	"strings"
+	"sync"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/arm64vm"
@@ -35,6 +37,10 @@ func (b *runtimeBackend) Start(ctx context.Context, req client.CreateInstanceReq
 	return b.StartStream(ctx, req, nil)
 }
 
+func (b *runtimeBackend) StartBlank(ctx context.Context, req client.StartInstanceRequest) (Instance, error) {
+	return b.StartBlankStream(ctx, req, nil)
+}
+
 func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
 	if b == nil || b.kernel == nil || b.images == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
@@ -55,7 +61,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if err != nil {
 		return nil, err
 	}
-	qemuX8664, err := loadAMD64Emulator(ctx, image, b.kernel.ExtractPackageFile)
+	qemuX8664, err := PrepareAMD64Emulator(ctx, image, b.kernel.ExtractPackageFile)
 	if err != nil {
 		return nil, err
 	}
@@ -100,6 +106,53 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	}, nil
 }
 
+func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	if b == nil || b.kernel == nil || b.images == nil {
+		return nil, fmt.Errorf("runtime backend is not configured")
+	}
+	if req.CPUs > 1 {
+		return nil, fmt.Errorf("linux arm64 runtime currently supports only 1 CPU")
+	}
+	kernel, err := b.kernel.ReadKernel()
+	if err != nil {
+		return nil, err
+	}
+	modules, err := b.kernel.PlanModuleLoad(linuxRuntimeConfigVars(nil), linuxRuntimeModuleMap())
+	if err != nil {
+		return nil, err
+	}
+	rootFSBackend := virtio.NewImageFS(blankLinuxRuntimeRootFS(), "")
+	fsdevs, rootFS, err := arm64vm.BuildFSDevices(vmruntime.RunRequest{
+		RootFS: rootFSBackend,
+	}, nil)
+	if err != nil {
+		return nil, err
+	}
+	initBin, err := guestinit.Build(ctx, b.guestInitCache)
+	if err != nil {
+		return nil, fmt.Errorf("build guest init: %w", err)
+	}
+	initCfg := linuxGuestInitConfig(modules, true)
+	initCfg.RootFSTag = vmruntime.RootFSTag
+	initCfg.Env = vmruntime.WithDefaultEnv(nil)
+	initCfg.WorkDir = "/"
+	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
+	if err != nil {
+		return nil, fmt.Errorf("build initramfs: %w", err)
+	}
+	session, err := kvm.StartManagedSession(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, onEvent)
+	if err != nil {
+		return nil, err
+	}
+	return &linuxInstance{
+		session: session,
+		baseEnv: vmruntime.WithDefaultEnv(nil),
+		workDir: "/",
+		rootFS:  rootFS,
+		dmesg:   req.Dmesg,
+	}, nil
+}
+
 func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
 	if b == nil || b.kernel == nil {
 		return client.ExecResponse{}, fmt.Errorf("runtime backend is not configured")
@@ -134,7 +187,7 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 		if err != nil {
 			return client.ExecResponse{}, err
 		}
-		qemuX8664, err = loadAMD64Emulator(ctx, image, b.kernel.ExtractPackageFile)
+		qemuX8664, err = PrepareAMD64Emulator(ctx, image, b.kernel.ExtractPackageFile)
 		if err != nil {
 			return client.ExecResponse{}, err
 		}
@@ -219,13 +272,83 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 	}, nil
 }
 
+func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runningImage string, req client.RunRequest) (client.ExecResponse, error) {
+	for _, share := range req.Shares {
+		if err := inst.AddShare(ctx, share); err != nil {
+			return client.ExecResponse{}, err
+		}
+	}
+
+	targetImage := strings.TrimSpace(req.Image)
+	if targetImage == "" || targetImage == runningImage {
+		return inst.Exec(ctx, client.ExecRequest{
+			Command:    append([]string(nil), req.Command...),
+			Env:        append([]string(nil), req.Env...),
+			RootDir:    req.RootDir,
+			ReplaceEnv: req.ReplaceEnv,
+			WorkDir:    req.WorkDir,
+			User:       req.User,
+			Stdin:      append([]byte(nil), req.Stdin...),
+			TTY:        req.TTY,
+			Cols:       req.Cols,
+			Rows:       req.Rows,
+		})
+	}
+
+	session, ok := inst.(*linuxInstance)
+	if !ok {
+		return client.ExecResponse{}, fmt.Errorf("running instance does not support image mounts")
+	}
+	if b == nil || b.images == nil {
+		return client.ExecResponse{}, fmt.Errorf("runtime backend is not configured")
+	}
+	image, err := b.images.Open(targetImage)
+	if err != nil {
+		return client.ExecResponse{}, err
+	}
+	image = withLinuxRuntimeMountDirs(image)
+	mountPath := linuxImageMountPath(targetImage)
+	if err := session.AddImage(ctx, mountPath, image); err != nil {
+		return client.ExecResponse{}, err
+	}
+
+	env := vmruntime.WithDefaultEnv(vmruntime.MergeEnv(image.Config.Env, req.Env))
+	command, err := imagefs.ResolveCommand(image.RootFS, req.Command, env)
+	if err != nil {
+		return client.ExecResponse{}, err
+	}
+	workDir := req.WorkDir
+	if workDir == "" {
+		workDir = image.Config.WorkingDir
+	}
+	if workDir == "" {
+		workDir = "/"
+	}
+
+	return inst.Exec(ctx, client.ExecRequest{
+		Command:     command,
+		Env:         env,
+		RootDir:     mountPath,
+		ReplaceEnv:  true,
+		SkipResolve: true,
+		WorkDir:     workDir,
+		User:        req.User,
+		Stdin:       append([]byte(nil), req.Stdin...),
+		TTY:         req.TTY,
+		Cols:        req.Cols,
+		Rows:        req.Rows,
+	})
+}
+
 type linuxInstance struct {
-	session *kvm.ManagedSession
-	image   *oci.Image
-	baseEnv []string
-	workDir string
-	rootFS  virtio.ShareMounter
-	dmesg   bool
+	session     *kvm.ManagedSession
+	image       *oci.Image
+	baseEnv     []string
+	workDir     string
+	rootFS      virtio.ShareMounter
+	dmesg       bool
+	shareMu     sync.Mutex
+	imageMounts map[string]string
 }
 
 func (i *linuxInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
@@ -236,10 +359,17 @@ func (i *linuxInstance) Exec(ctx context.Context, req client.ExecRequest) (clien
 	if user != "" && user != "root" && user != "0" && user != "0:0" {
 		return client.ExecResponse{}, fmt.Errorf("only root user is supported")
 	}
-	env := vmruntime.WithDefaultEnv(vmruntime.MergeEnv(i.baseEnv, req.Env))
-	command, err := imagefs.ResolveCommand(i.image.RootFS, req.Command, env)
-	if err != nil {
-		return client.ExecResponse{}, err
+	env := linuxEffectiveExecEnv(i.baseEnv, req.Env, req.ReplaceEnv)
+	command := append([]string(nil), req.Command...)
+	if !req.SkipResolve {
+		if i.image == nil || i.image.RootFS == nil {
+			return client.ExecResponse{}, fmt.Errorf("running instance does not have a default image root filesystem")
+		}
+		var err error
+		command, err = imagefs.ResolveCommand(i.image.RootFS, req.Command, env)
+		if err != nil {
+			return client.ExecResponse{}, err
+		}
 	}
 	workDir := req.WorkDir
 	if workDir == "" {
@@ -252,13 +382,16 @@ func (i *linuxInstance) Exec(ctx context.Context, req client.ExecRequest) (clien
 		return client.ExecResponse{}, fmt.Errorf("workdir must be absolute")
 	}
 	return i.session.Exec(ctx, client.ExecRequest{
-		Command: command,
-		Env:     env,
-		WorkDir: workDir,
-		Stdin:   append([]byte(nil), req.Stdin...),
-		TTY:     req.TTY,
-		Cols:    req.Cols,
-		Rows:    req.Rows,
+		Command:     command,
+		Env:         env,
+		RootDir:     req.RootDir,
+		ReplaceEnv:  req.ReplaceEnv,
+		SkipResolve: req.SkipResolve,
+		WorkDir:     workDir,
+		Stdin:       append([]byte(nil), req.Stdin...),
+		TTY:         req.TTY,
+		Cols:        req.Cols,
+		Rows:        req.Rows,
 	})
 }
 
@@ -283,6 +416,42 @@ func (i *linuxInstance) AddShare(ctx context.Context, share client.ShareMount) e
 		return err
 	}
 	return i.rootFS.AddShare(mount)
+}
+
+func (i *linuxInstance) AddImage(ctx context.Context, mountPath string, image *oci.Image) error {
+	_ = ctx
+	if i == nil || i.rootFS == nil {
+		return fmt.Errorf("instance rootfs does not support image mounts")
+	}
+	if strings.TrimSpace(mountPath) == "" || !strings.HasPrefix(mountPath, "/") {
+		return fmt.Errorf("image mount path must be absolute")
+	}
+	if image == nil || image.RootFS == nil {
+		return fmt.Errorf("image root filesystem is not available")
+	}
+	i.shareMu.Lock()
+	if existing, ok := i.imageMounts[mountPath]; ok {
+		i.shareMu.Unlock()
+		if existing == image.Name {
+			return nil
+		}
+		return fmt.Errorf("image mount %q already exists", mountPath)
+	}
+	i.shareMu.Unlock()
+	if err := i.rootFS.AddShare(virtio.ShareMount{
+		GuestPath: mountPath,
+		Backend:   virtio.NewImageFS(image.RootFS, image.RootFSDir),
+		Writable:  false,
+	}); err != nil {
+		return err
+	}
+	i.shareMu.Lock()
+	if i.imageMounts == nil {
+		i.imageMounts = make(map[string]string)
+	}
+	i.imageMounts[mountPath] = image.Name
+	i.shareMu.Unlock()
+	return nil
 }
 
 func (i *linuxInstance) Wait() error {
@@ -316,7 +485,7 @@ func linuxGuestInitConfig(modules []alpine.Module, managedExec bool) vmruntime.G
 
 func linuxRuntimeConfigVars(image *oci.Image) []string {
 	vars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS"}
-	if needsAMD64Emulation(image) {
+	if NeedsAMD64Emulation(image) {
 		vars = append(vars, "CONFIG_BINFMT_MISC")
 	}
 	return vars
@@ -344,6 +513,26 @@ func withLinuxRuntimeMountDirs(image *oci.Image) *oci.Image {
 	cloned := *image
 	cloned.RootFS = overlay.Root()
 	return &cloned
+}
+
+func blankLinuxRuntimeRootFS() imagefs.Directory {
+	overlay := imagefs.NewOverlay(nil)
+	for _, dir := range []string{"/dev", "/proc", "/sys", "/run", "/tmp", "/.ccx3", "/.ccx3/images"} {
+		_ = overlay.AddDir(dir, fs.ModeDir|0o755)
+	}
+	return overlay.Root()
+}
+
+func linuxImageMountPath(image string) string {
+	replacer := strings.NewReplacer("/", "_", ":", "_", "@", "_", " ", "_")
+	return filepath.Join("/.ccx3", "images", replacer.Replace(image))
+}
+
+func linuxEffectiveExecEnv(base, overrides []string, replace bool) []string {
+	if replace {
+		return vmruntime.WithDefaultEnv(overrides)
+	}
+	return vmruntime.WithDefaultEnv(vmruntime.MergeEnv(base, overrides))
 }
 
 func convertLinuxShareMounts(shares []client.ShareMount) []vmruntime.DirectoryShare {

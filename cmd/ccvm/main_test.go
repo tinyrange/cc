@@ -37,6 +37,24 @@ func TestWantsExecEventStream(t *testing.T) {
 	}
 }
 
+func TestWantsProgressStream(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/kernel/download?stream=1", nil)
+	if !wantsProgressStream(req) {
+		t.Fatal("wantsProgressStream(query) = false, want true")
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/kernel/download", nil)
+	req.Header.Set("Accept", "application/x-ndjson")
+	if !wantsProgressStream(req) {
+		t.Fatal("wantsProgressStream(accept) = false, want true")
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/kernel/download", nil)
+	if wantsProgressStream(req) {
+		t.Fatal("wantsProgressStream(default) = true, want false")
+	}
+}
+
 func TestWriteExecEventStream(t *testing.T) {
 	rec := httptest.NewRecorder()
 	writeExecEventStream(rec, client.ExecResponse{ExitCode: 7, Output: "hello"})
@@ -64,6 +82,35 @@ func TestWriteExecEventStream(t *testing.T) {
 	}
 	if exitEvent.Kind != "exit" || exitEvent.ExitCode != 7 {
 		t.Fatalf("exit event = %#v, want kind=exit exit_code=7", exitEvent)
+	}
+}
+
+func TestWriteProgressEvent(t *testing.T) {
+	rec := httptest.NewRecorder()
+	if err := writeProgressEvent(rec, client.ProgressEvent{
+		Status:             "downloading",
+		Artifact:           "linux-virt.apk",
+		BytesDownloaded:    1024,
+		BytesTotal:         4096,
+		RateBytesPerSecond: 512,
+		ETASeconds:         6,
+	}); err != nil {
+		t.Fatalf("writeProgressEvent() error = %v", err)
+	}
+
+	if got := rec.Header().Get("Content-Type"); got != "application/x-ndjson" {
+		t.Fatalf("Content-Type = %q, want application/x-ndjson", got)
+	}
+
+	var event client.ProgressEvent
+	if err := json.Unmarshal(bytes.TrimSpace(rec.Body.Bytes()), &event); err != nil {
+		t.Fatalf("Unmarshal(progress event) error = %v", err)
+	}
+	if event.Status != "downloading" || event.Artifact != "linux-virt.apk" {
+		t.Fatalf("progress event = %#v", event)
+	}
+	if event.BytesDownloaded != 1024 || event.BytesTotal != 4096 {
+		t.Fatalf("progress bytes = %#v", event)
 	}
 }
 

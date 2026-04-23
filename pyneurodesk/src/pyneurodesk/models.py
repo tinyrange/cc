@@ -95,6 +95,84 @@ class ImageState:
 
 
 @dataclass(frozen=True)
+class KernelState:
+    status: str
+    error: str | None = None
+    version: str | None = None
+    source: str | None = None
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "KernelState":
+        return cls(
+            status=payload["status"],
+            error=payload.get("error"),
+            version=payload.get("version"),
+            source=payload.get("source"),
+        )
+
+
+@dataclass(frozen=True)
+class DownloadProgress:
+    status: str
+    artifact: str | None = None
+    progress: float | None = None
+    bytes_downloaded: int | None = None
+    bytes_total: int | None = None
+    rate_bytes_per_second: float | None = None
+    eta_seconds: float | None = None
+    error: str | None = None
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "DownloadProgress":
+        return cls(
+            status=payload["status"],
+            artifact=payload.get("artifact"),
+            progress=payload.get("progress"),
+            bytes_downloaded=payload.get("bytes_downloaded"),
+            bytes_total=payload.get("bytes_total"),
+            rate_bytes_per_second=payload.get("rate_bytes_per_second"),
+            eta_seconds=payload.get("eta_seconds"),
+            error=payload.get("error"),
+        )
+
+
+@dataclass(frozen=True)
+class ImageMetadataState:
+    name: str
+    status: str
+    source_kind: str | None = None
+    architecture: str | None = None
+    error: str | None = None
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "ImageMetadataState":
+        return cls(
+            name=payload["name"],
+            status=payload["status"],
+            source_kind=payload.get("source_kind"),
+            architecture=payload.get("architecture"),
+            error=payload.get("error"),
+        )
+
+
+@dataclass(frozen=True)
+class EmulatorState:
+    status: str
+    path: str | None = None
+    required: bool = False
+    error: str | None = None
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "EmulatorState":
+        return cls(
+            status=payload["status"],
+            path=payload.get("path"),
+            required=bool(payload.get("required", False)),
+            error=payload.get("error"),
+        )
+
+
+@dataclass(frozen=True)
 class CVMFSDirectoryEntry:
     name: str
     path: str
@@ -182,6 +260,12 @@ class ContainerReference:
         if self.source.path is None:
             raise ValueError("container source path is not set")
         return self.source.path
+
+
+@dataclass(frozen=True)
+class DeployMetadata:
+    commands: tuple[str, ...] = ()
+    deploy_env: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

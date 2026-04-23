@@ -30,15 +30,35 @@ type KernelState struct {
 	Source  string `json:"source,omitempty"`
 }
 
+type ImageMetadataState struct {
+	Name         string `json:"name"`
+	Status       string `json:"status"`
+	SourceKind   string `json:"source_kind,omitempty"`
+	Architecture string `json:"architecture,omitempty"`
+	Error        string `json:"error,omitempty"`
+}
+
+type EmulatorState struct {
+	Status   string `json:"status"`
+	Path     string `json:"path,omitempty"`
+	Required bool   `json:"required"`
+	Error    string `json:"error,omitempty"`
+}
+
 type DownloadRequest struct {
 	Source string `json:"source,omitempty"`
 }
 
 type ProgressEvent struct {
-	Status   string  `json:"status"`
-	Progress float64 `json:"progress,omitempty"`
-	Blob     string  `json:"blob,omitempty"`
-	Error    string  `json:"error,omitempty"`
+	Status             string  `json:"status"`
+	Artifact           string  `json:"artifact,omitempty"`
+	Progress           float64 `json:"progress,omitempty"`
+	BytesDownloaded    int64   `json:"bytes_downloaded,omitempty"`
+	BytesTotal         int64   `json:"bytes_total,omitempty"`
+	RateBytesPerSecond float64 `json:"rate_bytes_per_second,omitempty"`
+	ETASeconds         float64 `json:"eta_seconds,omitempty"`
+	Blob               string  `json:"blob,omitempty"`
+	Error              string  `json:"error,omitempty"`
 }
 
 type ImageState struct {
@@ -222,6 +242,12 @@ type CreateInstanceRequest struct {
 	Dmesg    bool         `json:"dmesg,omitempty"`
 }
 
+type StartInstanceRequest struct {
+	MemoryMB uint64 `json:"memory_mb,omitempty"`
+	CPUs     int    `json:"cpus,omitempty"`
+	Dmesg    bool   `json:"dmesg,omitempty"`
+}
+
 type InstanceState struct {
 	Status    string `json:"status"`
 	Image     string `json:"image,omitempty"`
@@ -232,19 +258,21 @@ type InstanceState struct {
 }
 
 type RunRequest struct {
-	Image    string       `json:"image"`
-	Shares   []ShareMount `json:"shares,omitempty"`
-	Command  []string     `json:"command,omitempty"`
-	Env      []string     `json:"env,omitempty"`
-	WorkDir  string       `json:"workdir,omitempty"`
-	User     string       `json:"user,omitempty"`
-	Stdin    []byte       `json:"stdin,omitempty"`
-	TTY      bool         `json:"tty,omitempty"`
-	Cols     int          `json:"cols,omitempty"`
-	Rows     int          `json:"rows,omitempty"`
-	MemoryMB uint64       `json:"memory_mb,omitempty"`
-	CPUs     int          `json:"cpus,omitempty"`
-	Dmesg    bool         `json:"dmesg,omitempty"`
+	Image      string       `json:"image"`
+	Shares     []ShareMount `json:"shares,omitempty"`
+	Command    []string     `json:"command,omitempty"`
+	Env        []string     `json:"env,omitempty"`
+	RootDir    string       `json:"root_dir,omitempty"`
+	ReplaceEnv bool         `json:"replace_env,omitempty"`
+	WorkDir    string       `json:"workdir,omitempty"`
+	User       string       `json:"user,omitempty"`
+	Stdin      []byte       `json:"stdin,omitempty"`
+	TTY        bool         `json:"tty,omitempty"`
+	Cols       int          `json:"cols,omitempty"`
+	Rows       int          `json:"rows,omitempty"`
+	MemoryMB   uint64       `json:"memory_mb,omitempty"`
+	CPUs       int          `json:"cpus,omitempty"`
+	Dmesg      bool         `json:"dmesg,omitempty"`
 }
 
 type ExecResponse struct {
@@ -257,14 +285,17 @@ type VMState = InstanceState
 type RunVMResponse = ExecResponse
 
 type ExecRequest struct {
-	Command []string `json:"command"`
-	Env     []string `json:"env,omitempty"`
-	WorkDir string   `json:"workdir,omitempty"`
-	User    string   `json:"user,omitempty"`
-	Stdin   []byte   `json:"stdin,omitempty"`
-	TTY     bool     `json:"tty,omitempty"`
-	Cols    int      `json:"cols,omitempty"`
-	Rows    int      `json:"rows,omitempty"`
+	Command     []string `json:"command"`
+	Env         []string `json:"env,omitempty"`
+	RootDir     string   `json:"root_dir,omitempty"`
+	ReplaceEnv  bool     `json:"replace_env,omitempty"`
+	SkipResolve bool     `json:"skip_resolve,omitempty"`
+	WorkDir     string   `json:"workdir,omitempty"`
+	User        string   `json:"user,omitempty"`
+	Stdin       []byte   `json:"stdin,omitempty"`
+	TTY         bool     `json:"tty,omitempty"`
+	Cols        int      `json:"cols,omitempty"`
+	Rows        int      `json:"rows,omitempty"`
 }
 
 type ExecInput struct {

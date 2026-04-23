@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 pyneurodesk = "pyneurodesk:main"
+neurodesk = "pyneurodesk:main"
 pyneurodesk-fulltest = "pyneurodesk.fulltest:main"
 
 [build-system]

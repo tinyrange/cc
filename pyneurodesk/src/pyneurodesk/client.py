@@ -14,8 +14,12 @@ from .models import (
     CVMFSReadResponse,
     CVMFSSource,
     ContainerReference,
+    DownloadProgress,
+    EmulatorState,
+    ImageMetadataState,
     ImageState,
     ImportImageRequest,
+    KernelState,
     RunCommandRequest,
     ShareMount,
     VMState,
@@ -69,12 +73,66 @@ class PyNeurodeskClient:
             ),
         )
 
+    def kernel_status(self) -> KernelState:
+        response = self._client.get("/kernel")
+        payload = self._decode_json(response)
+        return KernelState.from_payload(payload)
+
+    def download_kernel(self) -> KernelState:
+        response = self._client.post("/kernel/download", json={})
+        payload = self._decode_json(response)
+        return KernelState.from_payload(payload)
+
+    def download_kernel_stream(self) -> Iterable[DownloadProgress]:
+        with self._client.stream(
+            "POST",
+            "/kernel/download",
+            params={"stream": "1"},
+            json={},
+            headers={"Accept": "application/x-ndjson"},
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                event = json.loads(line)
+                if not isinstance(event, dict):
+                    raise TypeError(f"expected download progress object, got {type(event)!r}")
+                yield DownloadProgress.from_payload(event)
+
     def get_image(self, name: str) -> ImageState | None:
         response = self._client.get(f"/image/{name}")
         if response.status_code == 404:
             return None
         payload = self._decode_json(response)
         return ImageState.from_payload(payload)
+
+    def prepare_image_metadata(self, name: str) -> ImageMetadataState:
+        response = self._client.post(f"/image/{name}/metadata", json={})
+        payload = self._decode_json(response)
+        return ImageMetadataState.from_payload(payload)
+
+    def prepare_image_emulator(self, name: str) -> EmulatorState:
+        response = self._client.post(f"/image/{name}/qemu/download", json={})
+        payload = self._decode_json(response)
+        return EmulatorState.from_payload(payload)
+
+    def prepare_image_emulator_stream(self, name: str) -> Iterable[DownloadProgress]:
+        with self._client.stream(
+            "POST",
+            f"/image/{name}/qemu/download",
+            params={"stream": "1"},
+            json={},
+            headers={"Accept": "application/x-ndjson"},
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                event = json.loads(line)
+                if not isinstance(event, dict):
+                    raise TypeError(f"expected download progress object, got {type(event)!r}")
+                yield DownloadProgress.from_payload(event)
 
     def ensure_image(self, reference: ContainerReference) -> ImageState:
         existing = self.get_image(reference.image)
@@ -109,6 +167,57 @@ class PyNeurodeskClient:
         response = self._client.post("/vm", json=payload, timeout=resolve_boot_timeout(timeout))
         payload = self._decode_json(response)
         return VMState.from_payload(payload)
+
+    def start_instance(
+        self,
+        *,
+        timeout: float | httpx.Timeout | None = None,
+        dmesg: bool = False,
+        memory_mb: int | None = None,
+        cpus: int | None = None,
+    ) -> VMState:
+        payload: dict[str, Any] = {}
+        if dmesg:
+            payload["dmesg"] = True
+        if memory_mb is not None:
+            payload["memory_mb"] = memory_mb
+        if cpus is not None:
+            payload["cpus"] = cpus
+        response = self._client.post("/vm/start", json=payload, timeout=resolve_boot_timeout(timeout))
+        payload = self._decode_json(response)
+        return VMState.from_payload(payload)
+
+    def start_instance_stream(
+        self,
+        *,
+        timeout: float | httpx.Timeout | None = None,
+        dmesg: bool = False,
+        memory_mb: int | None = None,
+        cpus: int | None = None,
+    ) -> Iterable[dict[str, Any]]:
+        payload: dict[str, Any] = {}
+        if dmesg:
+            payload["dmesg"] = True
+        if memory_mb is not None:
+            payload["memory_mb"] = memory_mb
+        if cpus is not None:
+            payload["cpus"] = cpus
+        with self._client.stream(
+            "POST",
+            "/vm/start",
+            params={"stream": "1"},
+            json=payload,
+            headers={"Accept": "application/x-ndjson"},
+            timeout=resolve_boot_timeout(timeout),
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                event = json.loads(line)
+                if not isinstance(event, dict):
+                    raise TypeError(f"expected boot event object, got {type(event)!r}")
+                yield event
 
     def create_instance_stream(
         self,
@@ -153,6 +262,8 @@ class PyNeurodeskClient:
     ) -> VMState:
         state = self.instance_status()
         if state.status == "running" and state.image == image:
+            return state
+        if state.status == "running" and state.image in ("", None):
             return state
         if state.status == "running" and state.image not in ("", None, image):
             self.shutdown_instance()
