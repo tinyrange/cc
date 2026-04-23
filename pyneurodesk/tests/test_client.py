@@ -350,6 +350,20 @@ def test_container_does_not_boot_vm_if_preflight_fails() -> None:
     assert "/vm" not in seen_paths
 
 
+def test_client_http_error_includes_response_body() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/vm":
+            return httpx.Response(400, text="boot failed: nested virtualization unavailable")
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    client = make_client(httpx.MockTransport(handler))
+    try:
+        with pytest.raises(httpx.HTTPStatusError, match="nested virtualization unavailable"):
+            client.create_instance("niimath")
+    finally:
+        client.close()
+
+
 def test_create_instance_sends_dmesg_when_requested() -> None:
     seen: dict[str, object] = {}
 
@@ -811,6 +825,7 @@ def test_start_default_daemon_writes_state(monkeypatch, tmp_path: Path) -> None:
     assert state.base_url == "http://127.0.0.1:3456"
     assert state.cache_dir == str(cache_root)
     assert seen["args"] == [str(ccvm_path), "-cache-dir", str(cache_root)]
+    assert seen["kwargs"]["cwd"] == str(Path(__file__).resolve().parents[2])
     assert (cache_root / "ccvm.json").read_text() == '{\n  "addr": "127.0.0.1:3456"\n}'
 
 

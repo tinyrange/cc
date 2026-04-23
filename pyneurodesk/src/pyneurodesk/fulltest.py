@@ -477,7 +477,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def default_recipe_path() -> Path:
-    return Path(__file__).resolve().parents[3] / "local" / "neurocontainers" / "recipes" / "niimath" / "fulltest.yaml"
+    project_root = Path(__file__).resolve().parents[3]
+    local_recipe = project_root / "local" / "neurocontainers" / "recipes" / "niimath" / "fulltest.yaml"
+    if local_recipe.is_file():
+        return local_recipe
+    return project_root / "pyneurodesk" / "fixtures" / "niimath" / "fulltest.yaml"
 
 
 def main() -> None:

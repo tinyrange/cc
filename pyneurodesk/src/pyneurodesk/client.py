@@ -321,7 +321,14 @@ class PyNeurodeskClient:
 
     @staticmethod
     def _decode_json(response: httpx.Response) -> dict[str, Any]:
-        response.raise_for_status()
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = response.text.strip()
+            if detail:
+                message = f"{exc} Response body: {detail}"
+                raise httpx.HTTPStatusError(message, request=exc.request, response=exc.response) from exc
+            raise
         payload = response.json()
         if not isinstance(payload, dict):
             raise TypeError(f"expected JSON object response, got {type(payload)!r}")

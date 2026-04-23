@@ -52,6 +52,9 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if err != nil {
 		return nil, err
 	}
+	if err := ensureLinuxAMD64Image(image); err != nil {
+		return nil, err
+	}
 	image = withLinuxRuntimeMountDirs(image)
 	modules, err := b.kernel.PlanModuleLoad(linuxRuntimeConfigVars(image), linuxRuntimeModuleMap())
 	if err != nil {
@@ -172,6 +175,9 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 		if err != nil {
 			return client.ExecResponse{}, err
 		}
+		if err := ensureLinuxAMD64Image(image); err != nil {
+			return client.ExecResponse{}, err
+		}
 		image = withLinuxRuntimeMountDirs(image)
 		modules, err = b.kernel.PlanModuleLoad(
 			linuxRuntimeConfigVars(image),
@@ -288,6 +294,9 @@ func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runni
 	if err != nil {
 		return client.ExecResponse{}, err
 	}
+	if err := ensureLinuxAMD64Image(image); err != nil {
+		return client.ExecResponse{}, err
+	}
 	image = withLinuxRuntimeMountDirs(image)
 	mountPath := linuxImageMountPath(targetImage)
 	if err := session.AddImage(ctx, mountPath, image); err != nil {
@@ -326,6 +335,21 @@ func linuxAMD64NotImplemented() error {
 	return fmt.Errorf("linux/amd64 VM runtime is not implemented yet")
 }
 
+func ensureLinuxAMD64Image(image *oci.Image) error {
+	if image == nil {
+		return nil
+	}
+	arch := strings.TrimSpace(image.Architecture)
+	if arch == "" || arch == "amd64" {
+		return nil
+	}
+	name := strings.TrimSpace(image.Name)
+	if name == "" {
+		name = "image"
+	}
+	return fmt.Errorf("linux/amd64 runtime supports only amd64 images; %s is %s", name, arch)
+}
+
 type linuxInstance struct {
 	session     *kvm.ManagedSession
 	image       *oci.Image
@@ -334,6 +358,7 @@ type linuxInstance struct {
 	rootFS      virtio.ShareMounter
 	dmesg       bool
 	shareMu     sync.Mutex
+	shares      map[string]client.ShareMount
 	imageMounts map[string]string
 }
 
@@ -403,6 +428,19 @@ func (i *linuxInstance) AddShare(ctx context.Context, share client.ShareMount) e
 	if i == nil || i.rootFS == nil {
 		return fmt.Errorf("instance rootfs does not support shares")
 	}
+	key := strings.TrimSpace(share.Mount)
+	if key == "" {
+		return fmt.Errorf("share mount path is required")
+	}
+	i.shareMu.Lock()
+	if existing, ok := i.shares[key]; ok {
+		i.shareMu.Unlock()
+		if existing.Source == share.Source && existing.Writable == share.Writable {
+			return nil
+		}
+		return fmt.Errorf("share mount %q already exists", key)
+	}
+	i.shareMu.Unlock()
 	mount, err := amd64vm.BuildShareMount(0, vmruntime.DirectoryShare{
 		Source:   share.Source,
 		Mount:    share.Mount,
@@ -411,7 +449,16 @@ func (i *linuxInstance) AddShare(ctx context.Context, share client.ShareMount) e
 	if err != nil {
 		return err
 	}
-	return i.rootFS.AddShare(mount)
+	if err := i.rootFS.AddShare(mount); err != nil {
+		return err
+	}
+	i.shareMu.Lock()
+	if i.shares == nil {
+		i.shares = make(map[string]client.ShareMount)
+	}
+	i.shares[key] = share
+	i.shareMu.Unlock()
+	return nil
 }
 
 func (i *linuxInstance) AddImage(ctx context.Context, mountPath string, image *oci.Image) error {

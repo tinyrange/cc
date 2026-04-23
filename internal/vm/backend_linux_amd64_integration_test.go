@@ -282,3 +282,42 @@ func TestRuntimeBackendRunNiimathFromLocalSIMGPath(t *testing.T) {
 		t.Fatalf("backend output did not contain niimath help\noutput:\n%s", resp.Output)
 	}
 }
+
+func TestRuntimeBackendRunNiimathFromCVMFSPath(t *testing.T) {
+	if os.Getenv("CCX3_KVM_BOOT") == "" {
+		t.Skip("set CCX3_KVM_BOOT=1 to run the linux amd64 KVM boot probe")
+	}
+	if os.Getenv("CCX3_CVMFS_LIVE") == "" {
+		t.Skip("set CCX3_CVMFS_LIVE=1 to run the live Neurodesk CVMFS test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	root := t.TempDir()
+	kernel := alpine.NewManager(filepath.Join(root, "kernel"))
+	if err := kernel.Ensure(ctx); err != nil {
+		t.Fatalf("kernel.Ensure() error = %v", err)
+	}
+	store := oci.NewStore(filepath.Join(root, "images"))
+	source := "https://cvmfs.neurodesk.org/cvmfs/neurodesk.ardc.edu.au/containers/niimath_1.0.20250804_20251016"
+	if _, err := store.Pull(ctx, "niimath-cvmfs", source); err != nil {
+		t.Fatalf("store.Pull() error = %v", err)
+	}
+
+	backend := NewRuntimeBackend(kernel, store, filepath.Join(store.Root(), "_guestinit"))
+	resp, err := backend.Run(ctx, client.RunRequest{
+		Image:    "niimath-cvmfs",
+		Command:  []string{"niimath", "-help"},
+		MemoryMB: 1024,
+	})
+	if err != nil {
+		t.Fatalf("backend.Run() error = %v\noutput:\n%s", err, resp.Output)
+	}
+	if resp.ExitCode == 126 || resp.ExitCode == 127 {
+		t.Fatalf("backend.Run().ExitCode = %d, want niimath to be found in PATH\noutput:\n%s", resp.ExitCode, resp.Output)
+	}
+	if !strings.Contains(strings.ToLower(resp.Output), "usage: niimath") {
+		t.Fatalf("backend output did not contain niimath help\noutput:\n%s", resp.Output)
+	}
+}

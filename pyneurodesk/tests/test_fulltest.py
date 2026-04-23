@@ -19,7 +19,7 @@ def test_load_suite_parses_niimath_recipe() -> None:
     assert suite.name == "niimath"
     assert suite.container == "niimath_1.0.20250804_20251016.simg"
     assert len(suite.required_files) == 1
-    assert len(suite.tests) > 50
+    assert len(suite.tests) >= 3
     assert suite.tests[0].name == "Version check"
     assert suite.tests[0].expected_output_contains == ("niimath version",)
 
@@ -83,4 +83,4 @@ def test_default_recipe_path_points_to_existing_recipe() -> None:
 
     assert recipe.is_file()
     assert recipe.name == "fulltest.yaml"
-    assert recipe.parts[-5:] == ("local", "neurocontainers", "recipes", "niimath", "fulltest.yaml")
+    assert recipe.parts[-2:] == ("niimath", "fulltest.yaml")

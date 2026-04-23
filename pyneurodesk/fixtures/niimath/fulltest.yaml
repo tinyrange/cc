@@ -1,0 +1,27 @@
+name: niimath
+container: niimath_1.0.20250804_20251016.simg
+default_timeout: 120
+required_files:
+  - dataset: ds000000
+    files:
+      - README
+test_data:
+  input: input.nii.gz
+  output: output.nii.gz
+setup:
+  script: ""
+cleanup:
+  script: ""
+tests:
+  - name: Version check
+    command: niimath -help
+    expected_output_contains:
+      - niimath version
+  - name: Help mentions usage
+    command: niimath -help
+    expected_output_contains:
+      - Usage: niimath
+  - name: Shell is available
+    command: sh -lc 'echo shell-ok'
+    expected_output_contains:
+      - shell-ok

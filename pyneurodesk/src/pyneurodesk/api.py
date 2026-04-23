@@ -714,6 +714,7 @@ def start_daemon_for_cache_dir(cache_root: Path) -> DaemonState:
     cache_root.mkdir(parents=True, exist_ok=True)
     state_path = daemon_state_path_for_cache_dir(cache_root)
     ccvm_path = resolve_ccvm_binary_path()
+    working_dir = repo_root() or ccvm_path.parent
     log_path = cache_root / "ccvm-python.log"
     with log_path.open("ab") as log_file:
         proc = subprocess.Popen(
@@ -722,7 +723,7 @@ def start_daemon_for_cache_dir(cache_root: Path) -> DaemonState:
             stderr=log_file,
             text=True,
             start_new_session=True,
-            cwd=str(ccvm_path.parent),
+            cwd=str(working_dir),
         )
         hello_line = ""
         assert proc.stdout is not None
@@ -783,9 +784,9 @@ def pyneurodesk_root() -> Path:
 
 
 def repo_root() -> Path | None:
-    root = pyneurodesk_root().parent.parent
-    if (root / "go.mod").exists() and (root / "cmd" / "ccvm" / "main.go").exists():
-        return root
+    for root in (pyneurodesk_root(), *pyneurodesk_root().parents):
+        if (root / "go.mod").exists() and (root / "cmd" / "ccvm" / "main.go").exists():
+            return root
     return None
 
 
