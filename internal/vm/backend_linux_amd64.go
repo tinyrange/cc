@@ -7,8 +7,11 @@ import (
 	"fmt"
 
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/guestinit"
+	"j5.nz/cc/internal/hv/kvm"
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/oci"
+	"j5.nz/cc/internal/vmruntime"
 )
 
 type runtimeBackend struct {
@@ -44,9 +47,31 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 }
 
 func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
-	_ = ctx
-	_ = req
-	return client.ExecResponse{}, linuxAMD64NotImplemented()
+	if len(req.Command) != 0 || req.Image != "" {
+		return client.ExecResponse{}, linuxAMD64NotImplemented()
+	}
+	if b == nil || b.kernel == nil {
+		return client.ExecResponse{}, fmt.Errorf("runtime backend is not configured")
+	}
+	kernel, err := b.kernel.ReadKernel()
+	if err != nil {
+		return client.ExecResponse{}, err
+	}
+	initBin, err := guestinit.BuildForArch(ctx, b.guestInitCache, "amd64")
+	if err != nil {
+		return client.ExecResponse{}, fmt.Errorf("build guest init: %w", err)
+	}
+	initrd, err := vmruntime.BuildInitramfs(initBin, nil, vmruntime.GuestInitConfig{
+		ReadyMarker: vmruntime.InstanceReadyMarker,
+	})
+	if err != nil {
+		return client.ExecResponse{}, fmt.Errorf("build initramfs: %w", err)
+	}
+	output, err := kvm.BootInitramfsToMarker(ctx, kernel, initrd, req.MemoryMB, true, vmruntime.InstanceReadyMarker)
+	if err != nil {
+		return client.ExecResponse{Output: output}, err
+	}
+	return client.ExecResponse{ExitCode: 0, Output: output}, nil
 }
 
 func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runningImage string, req client.RunRequest) (client.ExecResponse, error) {
