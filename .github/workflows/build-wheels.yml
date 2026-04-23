@@ -1,0 +1,93 @@
+name: Build wheels
+
+"on":
+  workflow_run:
+    workflows:
+      - Unit tests
+    types:
+      - completed
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-wheel:
+    name: ${{ matrix.name }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+            platform-tag: manylinux_2_28_x86_64
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            platform-tag: manylinux_2_28_aarch64
+          - name: macos-arm64
+            runner: macos-14
+            goos: darwin
+            goarch: arm64
+            platform-tag: macosx_14_0_arm64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Python build tooling
+        run: python -m pip install --upgrade pip uv
+
+      - name: Build bundled ccvm
+        env:
+          CCX3_TARGET_GOOS: ${{ matrix.goos }}
+          CCX3_TARGET_GOARCH: ${{ matrix.goarch }}
+        run: ./tools/build.sh
+
+      - name: Build wheel
+        working-directory: pyneurodesk
+        run: uv build --wheel
+
+      - name: Apply platform wheel tag
+        run: python tools/retag_wheel.py pyneurodesk/dist/*.whl --platform-tag "${{ matrix.platform-tag }}"
+
+      - name: Inspect wheel contents
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          wheel = next(Path("pyneurodesk/dist").glob("*.whl"))
+          print(wheel)
+          with ZipFile(wheel) as zf:
+              names = set(zf.namelist())
+              expected = "pyneurodesk/bin/ccvm"
+              if expected not in names:
+                  raise SystemExit(f"{expected} was not included in {wheel.name}")
+              print(zf.read("pyneurodesk-0.1.0.dist-info/WHEEL").decode())
+          PY
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pyneurodesk-wheel-${{ matrix.name }}
+          path: pyneurodesk/dist/*.whl
+          if-no-files-found: error

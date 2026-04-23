@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -205,7 +204,7 @@ func (s *ContainerSession) AddShare(ctx context.Context, share client.ShareMount
 		return fmt.Errorf("share mount %q already exists", key)
 	}
 	s.shareMu.Unlock()
-	_, backend, err := buildShareBackend(0, DirectoryShare{
+	mount, err := arm64vm.BuildShareMount(0, DirectoryShare{
 		Source:   share.Source,
 		Mount:    share.Mount,
 		Writable: share.Writable,
@@ -213,11 +212,7 @@ func (s *ContainerSession) AddShare(ctx context.Context, share client.ShareMount
 	if err != nil {
 		return err
 	}
-	if err := s.rootFS.AddShare(virtio.ShareMount{
-		GuestPath: share.Mount,
-		Backend:   backend,
-		Writable:  share.Writable,
-	}); err != nil {
+	if err := s.rootFS.AddShare(mount); err != nil {
 		return err
 	}
 	s.shareMu.Lock()

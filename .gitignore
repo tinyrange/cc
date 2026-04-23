@@ -1,4 +1,5 @@
 /local
+/build
 /internal/guestinit/guest-init-linux-arm64
 /internal/guestinit/guest-init-linux-amd64
 /pyneurodesk/.git
@@ -10,3 +11,6 @@
 /pyneurodesk/**/*.pyc
 /pyneurodesk/**/*.pyo
 /pyneurodesk/.DS_Store
+/pyneurodesk/dist
+/pyneurodesk/src/pyneurodesk/bin/ccvm
+/pyneurodesk/src/pyneurodesk/bin/ccvm.exe

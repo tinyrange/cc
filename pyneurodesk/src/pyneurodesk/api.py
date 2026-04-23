@@ -8,6 +8,7 @@ import sys
 import uuid
 import base64
 from collections.abc import Callable
+from importlib import resources
 from pathlib import Path
 from typing import Protocol
 
@@ -763,6 +764,10 @@ def resolve_ccvm_binary_path() -> Path:
                 return path
             raise RuntimeError(f"{env_name} points to missing ccvm binary: {path}")
 
+    package_binary = bundled_ccvm_path()
+    if package_binary is not None:
+        return package_binary
+
     project_root = pyneurodesk_root()
     candidates = [
         project_root / "bin" / "ccvm",
@@ -777,6 +782,14 @@ def resolve_ccvm_binary_path() -> Path:
         "unable to find bundled ccvm binary; expected one of "
         + ", ".join(str(candidate) for candidate in candidates)
     )
+
+
+def bundled_ccvm_path() -> Path | None:
+    for name in ("ccvm", "ccvm.exe"):
+        candidate = resources.files("pyneurodesk").joinpath("bin", name)
+        if isinstance(candidate, Path) and candidate.exists():
+            return candidate
+    return None
 
 
 def pyneurodesk_root() -> Path:

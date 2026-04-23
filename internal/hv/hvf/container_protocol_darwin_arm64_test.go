@@ -16,6 +16,7 @@ import (
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/oci"
+	"j5.nz/cc/internal/vmruntime"
 )
 
 func TestExtractManagedExecResultIgnoresOtherExecTraffic(t *testing.T) {
@@ -323,7 +324,7 @@ func (f *fakeVsockConn) LocalPort() uint32 {
 }
 
 func (f *fakeVsockConn) RemotePort() uint32 {
-	return containerControlPort
+	return vmruntime.ControlPort
 }
 
 func (f *fakeVsockConn) commands() []string {
