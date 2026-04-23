@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -22,7 +23,7 @@ SESSION_ROOT_ENV = "PYNEURODESK_SHELL_ROOT"
 SESSION_BIN_ENV = "PYNEURODESK_SHELL_BIN"
 BOOTSTRAP_PID_ENV = "PYNEURODESK_SHELL_BOOTSTRAP_PID"
 STATE_VERSION = 1
-HOST_CWD_MOUNT = "/.hostcwd"
+HOST_CWD_MOUNT_ROOT = "/.hostcwd"
 
 
 @dataclass(frozen=True)
@@ -251,15 +252,17 @@ def run_image_command(image: str, command_name: str, args: list[str], *, deploy_
 
 def implicit_cwd_mount() -> tuple[list[ShareMount], str]:
     cwd = Path.cwd().resolve()
+    digest = hashlib.sha256(str(cwd).encode("utf-8")).hexdigest()[:16]
+    guest_mount = f"{HOST_CWD_MOUNT_ROOT}/{digest}"
     return (
         [
             ShareMount(
                 source=str(cwd),
-                mount=HOST_CWD_MOUNT,
+                mount=guest_mount,
                 writable=True,
             )
         ],
-        HOST_CWD_MOUNT,
+        guest_mount,
     )
 
 

@@ -73,6 +73,25 @@ func TestLinuxInstanceAddShareRejectsConflictingMount(t *testing.T) {
 	}
 }
 
+func TestRebaseRuntimeShares(t *testing.T) {
+	shares := []client.ShareMount{
+		{Source: "/host/work", Mount: "/.hostcwd/abc", Writable: true},
+		{Source: "/host/data", Mount: "/data", Writable: false},
+	}
+
+	got := rebaseRuntimeShares("/.ccx3/images/niimath", shares)
+
+	if got[0].Mount != "/.ccx3/images/niimath/.hostcwd/abc" {
+		t.Fatalf("rebased mount[0] = %q", got[0].Mount)
+	}
+	if got[1].Mount != "/.ccx3/images/niimath/data" {
+		t.Fatalf("rebased mount[1] = %q", got[1].Mount)
+	}
+	if shares[0].Mount != "/.hostcwd/abc" || shares[1].Mount != "/data" {
+		t.Fatalf("original shares were mutated: %#v", shares)
+	}
+}
+
 type recordingShareMounter struct {
 	calls  int
 	mounts map[string]virtio.ShareMount

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -401,7 +402,8 @@ def test_run_wrapper_invokes_container_command(
 
     assert exit_code == 0
     assert capsys.readouterr().out == "hello\n"
-    expected_share = shell.ShareMount(source=str(tmp_path.resolve()), mount=shell.HOST_CWD_MOUNT, writable=True)
+    guest_mount = f"{shell.HOST_CWD_MOUNT_ROOT}/{hashlib.sha256(str(tmp_path.resolve()).encode('utf-8')).hexdigest()[:16]}"
+    expected_share = shell.ShareMount(source=str(tmp_path.resolve()), mount=guest_mount, writable=True)
     assert calls == [
         (
             "run",
@@ -410,7 +412,7 @@ def test_run_wrapper_invokes_container_command(
                 ("niimath", "-help"),
                 ("DEPLOY_ENV_FSLDIR=/opt/fsl",),
                 (expected_share,),
-                shell.HOST_CWD_MOUNT,
+                guest_mount,
             ),
         ),
         ("close", None),

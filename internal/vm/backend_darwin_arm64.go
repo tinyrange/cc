@@ -103,14 +103,11 @@ func (b *runtimeBackend) RunInInstance(
 	runningImage string,
 	req client.RunRequest,
 ) (client.ExecResponse, error) {
-	for _, share := range req.Shares {
-		if err := inst.AddShare(ctx, share); err != nil {
-			return client.ExecResponse{}, err
-		}
-	}
-
 	targetImage := strings.TrimSpace(req.Image)
 	if targetImage == "" || targetImage == runningImage {
+		if err := addRuntimeShares(ctx, inst, req.Shares); err != nil {
+			return client.ExecResponse{}, err
+		}
 		return inst.Exec(ctx, client.ExecRequest{
 			Command:    append([]string(nil), req.Command...),
 			Env:        append([]string(nil), req.Env...),
@@ -137,6 +134,9 @@ func (b *runtimeBackend) RunInInstance(
 	image = withRuntimeMountDirs(image)
 	mountPath := imageMountPath(targetImage)
 	if err := session.AddImage(ctx, mountPath, image); err != nil {
+		return client.ExecResponse{}, err
+	}
+	if err := addRuntimeShares(ctx, inst, rebaseRuntimeShares(mountPath, req.Shares)); err != nil {
 		return client.ExecResponse{}, err
 	}
 

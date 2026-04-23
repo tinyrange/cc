@@ -244,6 +244,72 @@ func TestRuntimeBackendStartBlankThenRunImage(t *testing.T) {
 	}
 }
 
+func TestRuntimeBackendStartBlankThenRunImageWithShareWorkdir(t *testing.T) {
+	if os.Getenv("CCX3_KVM_BOOT") == "" {
+		t.Skip("set CCX3_KVM_BOOT=1 to run the linux amd64 KVM boot probe")
+	}
+	fixture := filepath.Join("..", "..", "local", "alpine.simg")
+	if _, err := os.Stat(fixture); err != nil {
+		t.Skipf("local alpine fixture unavailable: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	root := t.TempDir()
+	shareDir := t.TempDir()
+	kernel := alpine.NewManager(filepath.Join(root, "kernel"))
+	if err := kernel.Ensure(ctx); err != nil {
+		t.Fatalf("kernel.Ensure() error = %v", err)
+	}
+	store := oci.NewStore(filepath.Join(root, "images"))
+	if _, err := store.Pull(ctx, "alpine", fixture); err != nil {
+		t.Fatalf("store.Pull() error = %v", err)
+	}
+
+	mgr := NewManagerWithBackend(NewRuntimeBackend(kernel, store, filepath.Join(store.Root(), "_guestinit")))
+	state, err := mgr.StartBlank(ctx, client.StartInstanceRequest{MemoryMB: 256})
+	if err != nil {
+		t.Fatalf("mgr.StartBlank() error = %v", err)
+	}
+	if state.Status != "running" {
+		t.Fatalf("mgr.StartBlank().Status = %q, want running", state.Status)
+	}
+	defer mgr.Shutdown(context.Background())
+
+	resp, err := mgr.Run(ctx, client.RunRequest{
+		Image:   "alpine",
+		Command: []string{"sh", "-lc", "pwd && echo shell-share-ok > hello.txt && cat hello.txt"},
+		Shares: []client.ShareMount{
+			{Source: shareDir, Mount: "/work", Writable: true},
+		},
+		WorkDir: "/work",
+	})
+	if err != nil {
+		t.Fatalf("mgr.Run() error = %v\noutput:\n%s", err, resp.Output)
+	}
+	if resp.ExitCode != 0 {
+		t.Fatalf("mgr.Run().ExitCode = %d, want 0\noutput:\n%s", resp.ExitCode, resp.Output)
+	}
+	lines := strings.Split(strings.TrimSpace(resp.Output), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("mgr.Run().Output = %q, want pwd and command output", resp.Output)
+	}
+	if strings.TrimSpace(lines[0]) != "/work" {
+		t.Fatalf("pwd = %q, want /work\noutput:\n%s", lines[0], resp.Output)
+	}
+	if strings.TrimSpace(lines[len(lines)-1]) != "shell-share-ok" {
+		t.Fatalf("final output = %q, want shell-share-ok\noutput:\n%s", lines[len(lines)-1], resp.Output)
+	}
+	buf, err := os.ReadFile(filepath.Join(shareDir, "hello.txt"))
+	if err != nil {
+		t.Fatalf("ReadFile(host share) error = %v", err)
+	}
+	if strings.TrimSpace(string(buf)) != "shell-share-ok" {
+		t.Fatalf("host share contents = %q, want shell-share-ok", string(buf))
+	}
+}
+
 func TestRuntimeBackendRunNiimathFromLocalSIMGPath(t *testing.T) {
 	if os.Getenv("CCX3_KVM_BOOT") == "" {
 		t.Skip("set CCX3_KVM_BOOT=1 to run the linux amd64 KVM boot probe")

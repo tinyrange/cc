@@ -36,6 +36,13 @@ nd exec niimath -- sh -lc 'test -f host-marker.txt && printf guest-visible > gue
 
 test -f guest-output.txt
 test "$(cat guest-output.txt)" = "guest-visible"
-test "$(cat guest-pwd.txt)" = "/.hostcwd"
+guest_pwd="$(cat guest-pwd.txt)"
+case "${guest_pwd}" in
+  /.hostcwd/*) ;;
+  *)
+    printf 'unexpected guest cwd: %s\n' "${guest_pwd}" >&2
+    exit 1
+    ;;
+esac
 
 printf 'niimath shell integration checks passed in %s\n' "${workdir}"

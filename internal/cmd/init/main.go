@@ -362,8 +362,45 @@ func appendFileContents(buf *strings.Builder, path string) {
 	}
 }
 
-func collectExecDiagnostics() string {
+func appendStat(buf *strings.Builder, label, path string) {
+	info, err := os.Stat(path)
+	if err != nil {
+		buf.WriteString(label)
+		buf.WriteString(": ")
+		buf.WriteString(path)
+		buf.WriteString(": ")
+		buf.WriteString(err.Error())
+		buf.WriteString("\n")
+		return
+	}
+	buf.WriteString(label)
+	buf.WriteString(": ")
+	buf.WriteString(path)
+	buf.WriteString(" mode=")
+	buf.WriteString(fmt.Sprintf("%#o", info.Mode()&0o777))
+	if info.IsDir() {
+		buf.WriteString(" dir=true")
+	}
+	buf.WriteString("\n")
+}
+
+func collectExecDiagnostics(rootDir string, argv []string, workDir string) string {
 	var buf strings.Builder
+	if rootDir != "" {
+		appendStat(&buf, "root_dir", rootDir)
+	}
+	if len(argv) != 0 {
+		appendStat(&buf, "argv0", argv[0])
+		if rootDir != "" && strings.HasPrefix(argv[0], "/") {
+			appendStat(&buf, "argv0@root", rootDir+argv[0])
+		}
+	}
+	if workDir != "" {
+		appendStat(&buf, "workdir", workDir)
+		if rootDir != "" && strings.HasPrefix(workDir, "/") {
+			appendStat(&buf, "workdir@root", rootDir+workDir)
+		}
+	}
 	if info, err := os.Stat(guestQEMUPath); err != nil {
 		buf.WriteString(guestQEMUPath)
 		buf.WriteString(": ")
@@ -829,7 +866,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			<-done
 		}
 		writeKernel("ccx3-init: exec error: " + startErr.Error())
-		writeExecStderr(cfg, control, id, "ccx3-init: exec error: "+startErr.Error()+"\n"+collectExecDiagnostics())
+		writeExecStderr(cfg, control, id, "ccx3-init: exec error: "+startErr.Error()+"\n"+collectExecDiagnostics(rootDir, argv, workDir))
 		if cfg.ExitMarkerPrefix != "" {
 			writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
 		}

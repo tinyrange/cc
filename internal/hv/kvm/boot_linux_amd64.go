@@ -14,6 +14,23 @@ import (
 	"j5.nz/cc/internal/virtio"
 )
 
+const (
+	hpetBaseAddress          = 0xFED00000
+	hpetAlternateBaseAddress = 0xFED80000
+	hpetMMIOWindowSize       = 0x400
+
+	hpetRegGeneralCapabilities  = 0x000
+	hpetRegGeneralConfiguration = 0x010
+	hpetRegInterruptStatus      = 0x020
+	hpetRegMainCounter          = 0x0F0
+
+	hpetClockPeriodFemtoseconds = 10_000_000
+	hpetVendorID                = 0x8086
+	hpetNumTimers               = 3
+	hpetLegacyReplacementCap    = uint64(1 << 15)
+	hpetCounterSizeCap          = uint64(1 << 13)
+)
+
 func BootKernelToSerial(ctx context.Context, kernel []byte, memoryMB uint64, dmesg bool) (string, error) {
 	return bootToCondition(ctx, kernel, nil, memoryMB, dmesg, func(serial string) bool {
 		return serial != ""
@@ -192,7 +209,42 @@ func handleBootMMIO(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vsock, mmio MMIOE
 		vm.CompleteMMIORead(value, mmio.Len)
 		return nil
 	}
+	if offset, ok := bootHPETOffset(mmio.Addr, mmio.Len); ok {
+		if mmio.Write {
+			return nil
+		}
+		vm.CompleteMMIORead(readBootHPET(offset), mmio.Len)
+		return nil
+	}
 	return fmt.Errorf("unhandled mmio addr=%#x len=%d write=%v", mmio.Addr, mmio.Len, mmio.Write)
+}
+
+func bootHPETOffset(addr uint64, size uint32) (uint64, bool) {
+	if size == 0 {
+		return 0, false
+	}
+	for _, base := range [...]uint64{hpetBaseAddress, hpetAlternateBaseAddress} {
+		end := base + hpetMMIOWindowSize
+		if addr >= base && addr+uint64(size) <= end {
+			return addr - base, true
+		}
+	}
+	return 0, false
+}
+
+func readBootHPET(offset uint64) uint64 {
+	switch offset {
+	case hpetRegGeneralCapabilities:
+		return uint64(hpetClockPeriodFemtoseconds)<<32 |
+			uint64(hpetVendorID)<<16 |
+			hpetCounterSizeCap |
+			(hpetNumTimers - 1) |
+			hpetLegacyReplacementCap
+	case hpetRegGeneralConfiguration, hpetRegInterruptStatus, hpetRegMainCounter:
+		return 0
+	default:
+		return 0
+	}
 }
 
 func mmioValue(mmio MMIOExit) uint64 {
