@@ -11,6 +11,7 @@ type ManagedExecRequest struct {
 	ID      string   `json:"id"`
 	Command []string `json:"command"`
 	Env     []string `json:"env,omitempty"`
+	RootDir string   `json:"root_dir,omitempty"`
 	WorkDir string   `json:"workdir,omitempty"`
 	Stdin   []byte   `json:"stdin,omitempty"`
 	TTY     bool     `json:"tty,omitempty"`
