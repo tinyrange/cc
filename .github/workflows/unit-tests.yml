@@ -61,7 +61,7 @@ jobs:
           cache: true
 
       - name: Compile Linux arm64 packages
-        run: GOOS=linux GOARCH=arm64 go test -run '^$' ./...
+        run: GOOS=linux GOARCH=arm64 go test -run '^$' -exec /bin/true ./...
 
       - name: Compile Darwin arm64 HVF package
         run: GOOS=darwin GOARCH=arm64 go test -c -o /tmp/ccx3-hvf-darwin-arm64.test ./internal/hv/hvf
