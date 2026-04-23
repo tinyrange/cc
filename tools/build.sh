@@ -6,7 +6,8 @@ set -x
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${ROOT_DIR}/build"
 PYNEURODESK_BIN_DIR="${ROOT_DIR}/pyneurodesk/bin"
-GUESTINIT_EMBED_PATH="${ROOT_DIR}/internal/guestinit/guest-init-linux-arm64"
+GUESTINIT_ARM64_EMBED_PATH="${ROOT_DIR}/internal/guestinit/guest-init-linux-arm64"
+GUESTINIT_AMD64_EMBED_PATH="${ROOT_DIR}/internal/guestinit/guest-init-linux-amd64"
 CCVM_OUTPUT="${BUILD_DIR}/ccvm"
 PYNEURODESK_CCVM_OUTPUT="${PYNEURODESK_BIN_DIR}/ccvm"
 
@@ -14,9 +15,13 @@ export CGO_ENABLED=0
 
 mkdir -p "${BUILD_DIR}" "${PYNEURODESK_BIN_DIR}"
 
-GOOS=linux go build -o "${BUILD_DIR}/init" ./internal/cmd/init
-install -m 644 "${BUILD_DIR}/init" "${GUESTINIT_EMBED_PATH}"
-go build -o "${CCVM_OUTPUT}" ./cmd/ccvm
+GOOS=linux GOARCH=arm64 go build -o "${BUILD_DIR}/init-linux-arm64" ./internal/cmd/init
+install -m 644 "${BUILD_DIR}/init-linux-arm64" "${GUESTINIT_ARM64_EMBED_PATH}"
+
+GOOS=linux GOARCH=amd64 go build -o "${BUILD_DIR}/init-linux-amd64" ./internal/cmd/init
+install -m 644 "${BUILD_DIR}/init-linux-amd64" "${GUESTINIT_AMD64_EMBED_PATH}"
+
+go build -tags embed_guestinit -o "${CCVM_OUTPUT}" ./cmd/ccvm
 go build -o "${BUILD_DIR}/cc" ./cmd/cc
 
 install -m 755 "${CCVM_OUTPUT}" "${PYNEURODESK_CCVM_OUTPUT}"

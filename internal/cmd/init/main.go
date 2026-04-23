@@ -914,12 +914,12 @@ type sockaddrVM struct {
 }
 
 func connectVsock(port uint32) (*os.File, error) {
-	fd, err := syscall.Socket(syscall.AF_VSOCK, syscall.SOCK_STREAM, 0)
+	fd, err := syscall.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
 	if err != nil {
 		return nil, err
 	}
 	addr := sockaddrVM{
-		Family: syscall.AF_VSOCK,
+		Family: unix.AF_VSOCK,
 		Port:   port,
 		CID:    2,
 	}

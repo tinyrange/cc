@@ -42,7 +42,7 @@ func TestStorePullExtractsRootFSAndRuntimeConfig(t *testing.T) {
 	})
 
 	configBlob, err := json.Marshal(map[string]any{
-		"architecture": "arm64",
+		"architecture": nativeArch(),
 		"config": map[string]any{
 			"Env":        []string{"PATH=/usr/bin:/bin", "HOME=/root"},
 			"Entrypoint": []string{"/bin/sh", "-c"},
@@ -71,7 +71,7 @@ func TestStorePullExtractsRootFSAndRuntimeConfig(t *testing.T) {
 				"manifests": []map[string]any{{
 					"mediaType": "application/vnd.oci.image.manifest.v1+json",
 					"digest":    manifestDigest,
-					"platform":  map[string]any{"os": "linux", "architecture": "arm64"},
+					"platform":  map[string]any{"os": "linux", "architecture": nativeArch()},
 				}},
 			})
 		case "/v2/library/alpine/manifests/" + manifestDigest:
@@ -165,7 +165,7 @@ func TestStorePullUsesSharedCacheAcrossStores(t *testing.T) {
 		"bin/uname":   {Data: []byte("uname"), Mode: 0o755},
 	})
 	configBlob, err := json.Marshal(map[string]any{
-		"architecture": "arm64",
+		"architecture": nativeArch(),
 		"config": map[string]any{
 			"Env": []string{"PATH=/usr/bin:/bin"},
 			"Cmd": []string{"/bin/uname"},
@@ -192,7 +192,7 @@ func TestStorePullUsesSharedCacheAcrossStores(t *testing.T) {
 				"manifests": []map[string]any{{
 					"mediaType": "application/vnd.oci.image.manifest.v1+json",
 					"digest":    manifestDigest,
-					"platform":  map[string]any{"os": "linux", "architecture": "arm64"},
+					"platform":  map[string]any{"os": "linux", "architecture": nativeArch()},
 				}},
 			})
 		case "/v2/library/alpine/manifests/" + manifestDigest:

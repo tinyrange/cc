@@ -8,7 +8,12 @@ import (
 	"path/filepath"
 )
 
-func buildFromSource(ctx context.Context, cacheDir string) ([]byte, error) {
+func buildFromSource(ctx context.Context, cacheDir, goarch string) ([]byte, error) {
+	switch goarch {
+	case "arm64", "amd64":
+	default:
+		return nil, fmt.Errorf("unsupported guest init architecture %q", goarch)
+	}
 	if cacheDir == "" {
 		cacheDir = filepath.Join(os.TempDir(), "ccx3-guestinit")
 	}
@@ -16,9 +21,9 @@ func buildFromSource(ctx context.Context, cacheDir string) ([]byte, error) {
 		return nil, fmt.Errorf("create guestinit cache dir: %w", err)
 	}
 
-	outPath := filepath.Join(cacheDir, "guest-init-linux-arm64")
+	outPath := filepath.Join(cacheDir, "guest-init-linux-"+goarch)
 	cmd := exec.CommandContext(ctx, "go", "build", "-o", outPath, "./internal/cmd/init")
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH=arm64")
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+goarch)
 	if wd, err := repoRoot(); err == nil {
 		cmd.Dir = wd
 	}
