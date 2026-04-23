@@ -26,12 +26,22 @@ const (
 	DefaultUARTRegShift = 0
 	DefaultUARTBaudRate = 115200
 
-	defaultGICDistributorBase          = 0x08000000
-	defaultGICDistributorSize          = 0x00010000
-	defaultGICRedistributorBase        = 0x080a0000
-	defaultGICRedistributorSize        = 0x00020000
-	defaultGICMaintenanceIntNum        = 9
-	gicDefaultPhandle           uint32 = 1
+	defaultGICDistributorBase           = 0x08000000
+	defaultGICDistributorSize           = 0x00010000
+	defaultGICv2CPUInterfaceBase        = 0x08010000
+	defaultGICv2CPUInterfaceSize        = 0x00002000
+	defaultGICRedistributorBase         = 0x080a0000
+	defaultGICRedistributorSize         = 0x00020000
+	defaultGICMaintenanceIntNum         = 9
+	gicDefaultPhandle            uint32 = 1
+)
+
+type GICVersion int
+
+const (
+	GICVersionDefault GICVersion = iota
+	GICVersionV2
+	GICVersionV3
 )
 
 type BootOptions struct {
@@ -39,6 +49,7 @@ type BootOptions struct {
 	MemorySize uint64
 	Cmdline    string
 	NumCPUs    int
+	GICVersion GICVersion
 	UART       *UARTConfig
 	Console    bool
 	Initrd     []byte
@@ -135,6 +146,7 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 		MemorySize: opts.MemorySize,
 		NumCPUs:    opts.NumCPUs,
 		Cmdline:    opts.Cmdline,
+		GICVersion: opts.GICVersion,
 		UART:       opts.UART,
 		Console:    opts.Console,
 		InitrdGPA:  initrdAddr,
@@ -183,6 +195,7 @@ type deviceTreeConfig struct {
 	MemorySize uint64
 	NumCPUs    int
 	Cmdline    string
+	GICVersion GICVersion
 	UART       *UARTConfig
 	Console    bool
 	InitrdGPA  uint64
@@ -318,14 +331,23 @@ func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
 			"interrupt-controller": {Flag: true},
 			"phandle":              {U32: []uint32{gicDefaultPhandle}},
 			"linux,phandle":        {U32: []uint32{gicDefaultPhandle}},
-			"compatible":           {Strings: []string{"arm,gic-v3"}},
-			"reg": {U64: []uint64{
-				defaultGICDistributorBase, defaultGICDistributorSize,
-				defaultGICRedistributorBase, defaultGICRedistributorSize,
-			}},
-			"interrupts": {U32: []uint32{1, defaultGICMaintenanceIntNum, 0xF04}},
+			"interrupts":           {U32: []uint32{1, defaultGICMaintenanceIntNum, 0xF04}},
 		},
 	})
+	gicProps := root.Children[len(root.Children)-1].Properties
+	if cfg.GICVersion == GICVersionV2 {
+		gicProps["compatible"] = fdt.Property{Strings: []string{"arm,gic-400"}}
+		gicProps["reg"] = fdt.Property{U64: []uint64{
+			defaultGICDistributorBase, defaultGICDistributorSize,
+			defaultGICv2CPUInterfaceBase, defaultGICv2CPUInterfaceSize,
+		}}
+	} else {
+		gicProps["compatible"] = fdt.Property{Strings: []string{"arm,gic-v3"}}
+		gicProps["reg"] = fdt.Property{U64: []uint64{
+			defaultGICDistributorBase, defaultGICDistributorSize,
+			defaultGICRedistributorBase, defaultGICRedistributorSize,
+		}}
+	}
 	root.Children = append(root.Children, cfg.ExtraNodes...)
 
 	return fdt.Build(root)

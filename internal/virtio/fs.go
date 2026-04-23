@@ -1721,12 +1721,9 @@ func (p *passthroughFS) fileAttr(nodeID uint64, info os.FileInfo) FuseAttr {
 		if st.Blksize > 0 {
 			attr.BlkSize = uint32(st.Blksize)
 		}
-		attr.ATimeSec = uint64(st.Atimespec.Sec)
-		attr.MTimeSec = uint64(st.Mtimespec.Sec)
-		attr.CTimeSec = uint64(st.Ctimespec.Sec)
-		attr.ATimeNsec = uint32(st.Atimespec.Nsec)
-		attr.MTimeNsec = uint32(st.Mtimespec.Nsec)
-		attr.CTimeNsec = uint32(st.Ctimespec.Nsec)
+		attr.ATimeSec, attr.ATimeNsec = statTimespecUnix(st, statTimeAccess)
+		attr.MTimeSec, attr.MTimeNsec = statTimespecUnix(st, statTimeModify)
+		attr.CTimeSec, attr.CTimeNsec = statTimespecUnix(st, statTimeChange)
 	}
 	if attr.Blocks == 0 && attr.Size > 0 {
 		attr.Blocks = uint64((attr.Size + 511) / 512)

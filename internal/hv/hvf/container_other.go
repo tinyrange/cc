@@ -7,34 +7,12 @@ import (
 	"fmt"
 
 	"j5.nz/cc/client"
-	"j5.nz/cc/internal/oci"
+	"j5.nz/cc/internal/vmruntime"
 )
 
-type ContainerRunRequest struct {
-	Kernel     []byte
-	Image      *oci.Image
-	Shares     []DirectoryShare
-	Command    []string
-	Env        []string
-	WorkDir    string
-	User       string
-	MemoryMB   uint64
-	CPUs       int
-	Dmesg      bool
-	Persistent bool
-}
-
-type DirectoryShare struct {
-	Source   string
-	Mount    string
-	Writable bool
-}
-
-type ContainerRunResult struct {
-	ExitCode   int
-	Output     string
-	Transcript string
-}
+type ContainerRunRequest = vmruntime.RunRequest
+type DirectoryShare = vmruntime.DirectoryShare
+type ContainerRunResult = vmruntime.RunResult
 
 type ContainerSession struct{}
 
