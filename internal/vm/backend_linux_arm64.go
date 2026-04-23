@@ -397,9 +397,19 @@ func (i *linuxInstance) Exec(ctx context.Context, req client.ExecRequest) (clien
 
 func (i *linuxInstance) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	_ = inputs
-	_ = onEvent
-	_, err := i.Exec(ctx, req)
-	return err
+	resp, err := i.Exec(ctx, req)
+	if err != nil {
+		return err
+	}
+	if onEvent != nil && resp.Output != "" {
+		if err := onEvent(client.ExecEvent{Kind: "stdout", Stream: "stdout", Output: resp.Output, Data: []byte(resp.Output)}); err != nil {
+			return err
+		}
+	}
+	if onEvent != nil {
+		return onEvent(client.ExecEvent{Kind: "exit", ExitCode: resp.ExitCode})
+	}
+	return nil
 }
 
 func (i *linuxInstance) AddShare(ctx context.Context, share client.ShareMount) error {
