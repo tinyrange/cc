@@ -69,7 +69,7 @@ func bootToCondition(ctx context.Context, kernel []byte, initrd []byte, memoryMB
 		}
 		switch exit.Reason {
 		case ExitIO:
-			if err := handleUARTIO(uart, exit.IO); err != nil {
+			if err := handleBootIO(uart, exit.IO); err != nil {
 				return serialOut.String(), err
 			}
 		case ExitHLT, ExitShutdown:
@@ -93,6 +93,13 @@ func BootInitramfsToMarkerWithTimeout(kernel []byte, initrd []byte, memoryMB uin
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	return BootInitramfsToMarker(ctx, kernel, initrd, memoryMB, dmesg, marker)
+}
+
+func handleBootIO(uart *serial.UART8250, ioExit IOExit) error {
+	if ioExit.Port >= amd64vm.COM1Base && ioExit.Port < amd64vm.COM1Base+8 {
+		return handleUARTIO(uart, ioExit)
+	}
+	return handleDefaultIO(ioExit)
 }
 
 func handleUARTIO(uart *serial.UART8250, ioExit IOExit) error {
@@ -123,6 +130,33 @@ func handleUARTIO(uart *serial.UART8250, ioExit IOExit) error {
 				ioExit.Data[off+uint64(j)] = byte(value >> (8 * j))
 			}
 		}
+	}
+	return nil
+}
+
+func handleDefaultIO(ioExit IOExit) error {
+	if ioExit.Write {
+		return nil
+	}
+	fill := byte(0)
+	switch {
+	case ioExit.Port == 0xcfc || ioExit.Port == 0xcfd || ioExit.Port == 0xcfe || ioExit.Port == 0xcff:
+		// No PCI devices are exposed during minimal boot. A config read of all
+		// ones tells Linux the probed bus/device/function is absent.
+		fill = 0xff
+	case ioExit.Port == 0xcf8:
+		fill = 0
+	case ioExit.Port == 0x61:
+		fill = 0
+	case ioExit.Port == 0x70 || ioExit.Port == 0x71:
+		fill = 0
+	case ioExit.Port == 0x60 || ioExit.Port == 0x64:
+		fill = 0
+	default:
+		fill = 0
+	}
+	for i := range ioExit.Data {
+		ioExit.Data[i] = fill
 	}
 	return nil
 }
