@@ -1,6 +1,6 @@
-# ccx3
+# cc
 
-`ccx3` is an experimental microVM runtime for OCI-backed Linux workloads. It
+`cc` is an experimental microVM runtime for OCI-backed Linux workloads. It
 imports OCI, SIMG/SIF, and CVMFS-backed images, boots a managed Linux guest,
 mounts image environments through virtio-fs, and executes commands through a
 local HTTP/WebSocket daemon.
@@ -8,6 +8,9 @@ local HTTP/WebSocket daemon.
 The runtime is workload-centric rather than hypervisor-centric: callers manage
 images, instances, execs, and shares without providing kernels, wiring boot
 devices, or running a privileged helper daemon.
+
+This repository is published at
+[github.com/tinyrange/cc](https://github.com/tinyrange/cc).
 
 ## Status
 
@@ -32,7 +35,7 @@ treated as a future performance optimization rather than an MVP 1 requirement.
 - A supported host architecture
 - Linux KVM hosts: `/dev/kvm`, regular-user permission to open it, and hardware
   virtualization enabled. Some distributions grant this automatically; others
-  require one-time host configuration outside `ccx3`.
+  require one-time host configuration outside `cc`.
 - Network access for kernel downloads, OCI pulls, or CVMFS-backed containers
 
 Quick KVM check:
@@ -44,6 +47,8 @@ test -r /dev/kvm -a -w /dev/kvm && echo "KVM is accessible"
 ## Build
 
 ```sh
+git clone https://github.com/tinyrange/cc.git
+cd cc
 go build ./cmd/cc
 go build ./cmd/ccvm
 ```
