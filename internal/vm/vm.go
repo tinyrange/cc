@@ -3,12 +3,17 @@ package vm
 import (
 	"context"
 	"fmt"
+	"runtime"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/hv"
 )
+
+const DefaultInstanceID = "default"
 
 type Backend interface {
 	Start(context.Context, client.CreateInstanceRequest) (Instance, error)
@@ -28,13 +33,15 @@ type Instance interface {
 }
 
 type Manager struct {
-	mu       sync.Mutex
-	backend  Backend
-	supports func() error
-	running  *Machine
+	mu           sync.Mutex
+	backend      Backend
+	supports     func() error
+	capabilities func() client.CapabilitiesResponse
+	running      map[string]*Machine
 }
 
 type Machine struct {
+	id         string
 	image      string
 	memoryMB   uint64
 	cpus       int
@@ -46,15 +53,52 @@ type Machine struct {
 }
 
 func NewManager() *Manager {
-	return &Manager{backend: unsupportedBackend{}, supports: Supports}
+	return &Manager{backend: unsupportedBackend{}, supports: Supports, capabilities: HostCapabilities}
 }
 
 func NewManagerWithBackend(backend Backend) *Manager {
-	return &Manager{backend: backend, supports: Supports}
+	return &Manager{backend: backend, supports: Supports, capabilities: HostCapabilities}
 }
 
 func Supports() error {
 	return hv.Supports()
+}
+
+func HostCapabilities() client.CapabilitiesResponse {
+	host := runtime.GOOS + "/" + runtime.GOARCH
+	caps := client.CapabilitiesResponse{
+		Host:                   host,
+		Backend:                backendName(),
+		MaxInstances:           64,
+		SnapshotClasses:        []string{},
+		NetworkModes:           []string{},
+		ShareConsistency:       []string{"host-backed"},
+		ResourceLimits:         []string{"memory_mb", "cpus"},
+		SupportsMultiImageExec: true,
+		RequiresPrivilegedCCX3: false,
+	}
+	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
+		caps.MaxInstances = 1
+		caps.Notes = append(caps.Notes, "macOS HVF currently limits ccx3 to one running instance")
+	}
+	if err := Supports(); err != nil {
+		caps.VMSupported = false
+		caps.VMError = err.Error()
+	} else {
+		caps.VMSupported = true
+	}
+	return caps
+}
+
+func backendName() string {
+	switch {
+	case runtime.GOOS == "linux" && (runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64"):
+		return "kvm"
+	case runtime.GOOS == "darwin" && runtime.GOARCH == "arm64":
+		return "hvf"
+	default:
+		return "unsupported"
+	}
 }
 
 func (m *Manager) Start(ctx context.Context, req client.CreateInstanceRequest) (client.InstanceState, error) {
@@ -62,6 +106,12 @@ func (m *Manager) Start(ctx context.Context, req client.CreateInstanceRequest) (
 }
 
 func (m *Manager) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
+	id := instanceID(req.ID)
+	return m.StartInstanceStream(ctx, id, req, onEvent)
+}
+
+func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
+	id = instanceID(id)
 	if req.Image == "" {
 		return client.InstanceState{}, fmt.Errorf("image is required")
 	}
@@ -70,10 +120,17 @@ func (m *Manager) StartStream(ctx context.Context, req client.CreateInstanceRequ
 	}
 
 	m.mu.Lock()
-	if m.running != nil {
-		state := m.statusLocked()
+	if m.running == nil {
+		m.running = make(map[string]*Machine)
+	}
+	if m.running[id] != nil {
+		state := m.statusLocked(id)
 		m.mu.Unlock()
-		return state, fmt.Errorf("a VM is already running")
+		return state, fmt.Errorf("VM %q is already running", id)
+	}
+	if err := m.checkCapacityLocked(); err != nil {
+		m.mu.Unlock()
+		return client.InstanceState{}, err
 	}
 	m.mu.Unlock()
 
@@ -83,6 +140,7 @@ func (m *Manager) StartStream(ctx context.Context, req client.CreateInstanceRequ
 	}
 
 	machine := &Machine{
+		id:         id,
 		image:      req.Image,
 		memoryMB:   req.MemoryMB,
 		cpus:       req.CPUs,
@@ -92,12 +150,15 @@ func (m *Manager) StartStream(ctx context.Context, req client.CreateInstanceRequ
 	}
 
 	m.mu.Lock()
-	m.running = machine
+	if m.running == nil {
+		m.running = make(map[string]*Machine)
+	}
+	m.running[id] = machine
 	m.mu.Unlock()
 
 	go m.watch(machine)
 
-	return m.Status(), nil
+	return m.StatusOf(id), nil
 }
 
 func (m *Manager) StartBlank(ctx context.Context, req client.StartInstanceRequest) (client.InstanceState, error) {
@@ -109,15 +170,33 @@ func (m *Manager) StartBlankStream(
 	req client.StartInstanceRequest,
 	onEvent func(client.BootEvent) error,
 ) (client.InstanceState, error) {
+	id := instanceID(req.ID)
+	return m.StartBlankInstanceStream(ctx, id, req, onEvent)
+}
+
+func (m *Manager) StartBlankInstanceStream(
+	ctx context.Context,
+	id string,
+	req client.StartInstanceRequest,
+	onEvent func(client.BootEvent) error,
+) (client.InstanceState, error) {
+	id = instanceID(id)
 	if err := m.supports(); err != nil {
 		return client.InstanceState{}, err
 	}
 
 	m.mu.Lock()
-	if m.running != nil {
-		state := m.statusLocked()
+	if m.running == nil {
+		m.running = make(map[string]*Machine)
+	}
+	if m.running[id] != nil {
+		state := m.statusLocked(id)
 		m.mu.Unlock()
-		return state, fmt.Errorf("a VM is already running")
+		return state, fmt.Errorf("VM %q is already running", id)
+	}
+	if err := m.checkCapacityLocked(); err != nil {
+		m.mu.Unlock()
+		return client.InstanceState{}, err
 	}
 	m.mu.Unlock()
 
@@ -127,6 +206,7 @@ func (m *Manager) StartBlankStream(
 	}
 
 	machine := &Machine{
+		id:         id,
 		image:      "",
 		memoryMB:   req.MemoryMB,
 		cpus:       req.CPUs,
@@ -136,24 +216,32 @@ func (m *Manager) StartBlankStream(
 	}
 
 	m.mu.Lock()
-	m.running = machine
+	if m.running == nil {
+		m.running = make(map[string]*Machine)
+	}
+	m.running[id] = machine
 	m.mu.Unlock()
 
 	go m.watch(machine)
 
-	return m.Status(), nil
+	return m.StatusOf(id), nil
 }
 
 func (m *Manager) Shutdown(ctx context.Context) error {
+	return m.ShutdownInstance(ctx, DefaultInstanceID)
+}
+
+func (m *Manager) ShutdownInstance(ctx context.Context, id string) error {
 	_ = ctx
+	id = instanceID(id)
 
 	m.mu.Lock()
-	machine := m.running
+	machine := m.running[id]
 	if machine == nil {
 		m.mu.Unlock()
-		return fmt.Errorf("no VM is running")
+		return fmt.Errorf("no VM %q is running", id)
 	}
-	m.running = nil
+	delete(m.running, id)
 	close(machine.shutdownCh)
 	m.mu.Unlock()
 
@@ -161,8 +249,13 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 }
 
 func (m *Manager) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
+	return m.RunIn(ctx, req.ID, req)
+}
+
+func (m *Manager) RunIn(ctx context.Context, id string, req client.RunRequest) (client.ExecResponse, error) {
+	id = instanceID(id)
 	m.mu.Lock()
-	machine := m.running
+	machine := m.running[id]
 	m.mu.Unlock()
 	if machine != nil {
 		return m.backend.RunInInstance(ctx, machine.instance, machine.image, req)
@@ -177,31 +270,69 @@ func (m *Manager) Run(ctx context.Context, req client.RunRequest) (client.ExecRe
 }
 
 func (m *Manager) Stream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	return m.StreamIn(ctx, req.ID, req, inputs, onEvent)
+}
+
+func (m *Manager) StreamIn(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	id = instanceID(id)
 	m.mu.Lock()
-	machine := m.running
+	machine := m.running[id]
 	m.mu.Unlock()
 	if machine == nil {
-		return fmt.Errorf("no VM is running")
+		return fmt.Errorf("no VM %q is running", id)
 	}
 	return machine.instance.ExecStream(ctx, req, inputs, onEvent)
 }
 
 func (m *Manager) Status() client.InstanceState {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.statusLocked()
+	return m.StatusOf(DefaultInstanceID)
 }
 
-func (m *Manager) statusLocked() client.InstanceState {
-	if m.running == nil {
-		return client.InstanceState{Status: "stopped"}
+func (m *Manager) StatusOf(id string) client.InstanceState {
+	id = instanceID(id)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.statusLocked(id)
+}
+
+func (m *Manager) Statuses() []client.InstanceState {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.running) == 0 {
+		return nil
 	}
+	ids := make([]string, 0, len(m.running))
+	for id := range m.running {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]client.InstanceState, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, m.statusLocked(id))
+	}
+	return out
+}
+
+func (m *Manager) Capabilities() client.CapabilitiesResponse {
+	if m.capabilities == nil {
+		return HostCapabilities()
+	}
+	return m.capabilities()
+}
+
+func (m *Manager) statusLocked(id string) client.InstanceState {
+	id = instanceID(id)
+	if m.running == nil || m.running[id] == nil {
+		return client.InstanceState{ID: id, Status: "stopped"}
+	}
+	machine := m.running[id]
 	return client.InstanceState{
+		ID:        id,
 		Status:    "running",
-		Image:     m.running.image,
-		MemoryMB:  m.running.memoryMB,
-		CPUs:      m.running.cpus,
-		StartedAt: m.running.startedAt.Format(time.RFC3339),
+		Image:     machine.image,
+		MemoryMB:  machine.memoryMB,
+		CPUs:      machine.cpus,
+		StartedAt: machine.startedAt.Format(time.RFC3339),
 	}
 }
 
@@ -217,11 +348,27 @@ func (m *Manager) watch(machine *Machine) {
 	default:
 	}
 
-	if m.running == machine {
-		m.running = nil
+	if m.running != nil && m.running[machine.id] == machine {
+		delete(m.running, machine.id)
 	}
 	machine.lastErr = err
 	machine.exitedAt = time.Now().UTC()
+}
+
+func (m *Manager) checkCapacityLocked() error {
+	caps := m.Capabilities()
+	if caps.MaxInstances > 0 && len(m.running) >= caps.MaxInstances {
+		return fmt.Errorf("maximum running VM instances reached: %d", caps.MaxInstances)
+	}
+	return nil
+}
+
+func instanceID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return DefaultInstanceID
+	}
+	return id
 }
 
 type unsupportedBackend struct{}

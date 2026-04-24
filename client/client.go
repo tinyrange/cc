@@ -141,6 +141,20 @@ func (c *Client) VMSupported() (VMSupportedResponse, error) {
 	return ret, err
 }
 
+func (c *Client) Capabilities() (CapabilitiesResponse, error) {
+	var ret CapabilitiesResponse
+	resp, err := c.client.Get(c.url + "/capabilities")
+	if err != nil {
+		return ret, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ret, decodeErrorResponse(resp)
+	}
+	err = json.NewDecoder(resp.Body).Decode(&ret)
+	return ret, err
+}
+
 func (c *Client) CreateInstance(req CreateInstanceRequest) (InstanceState, error) {
 	var ret InstanceState
 	err := c.postJSONExpectOK("/vm", req, &ret)
@@ -179,6 +193,7 @@ func (c *Client) Run(req RunRequest) (ExecResponse, error) {
 
 func (c *Client) RunEvents(req RunRequest) ([]ExecEvent, error) {
 	return c.ExecEvents(ExecRequest{
+		ID:         req.ID,
 		Command:    append([]string(nil), req.Command...),
 		Env:        append([]string(nil), req.Env...),
 		RootDir:    req.RootDir,

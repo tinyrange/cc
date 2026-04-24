@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"strconv"
 	"strings"
+
+	"j5.nz/cc/client"
 )
 
 type ManagedExecRequest struct {
@@ -79,4 +81,36 @@ func ExtractManagedExecResult(serial, id string, dmesg bool) (int, string, bool)
 		}
 	}
 	return 0, "", false
+}
+
+func ParseManagedExecEventLine(line, id string) (client.ExecEvent, bool, bool, error) {
+	beginMarker := CommandBeginMarker + id
+	stdoutPrefix := CommandOutputMarker + id + ":"
+	stderrPrefix := CommandErrorMarker + id + ":"
+	exitPrefix := CommandExitMarkerPref + id + ":"
+
+	switch {
+	case line == beginMarker:
+		return client.ExecEvent{}, false, false, nil
+	case strings.HasPrefix(line, stdoutPrefix):
+		data, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(line, stdoutPrefix))
+		if err != nil {
+			return client.ExecEvent{}, false, false, nil
+		}
+		return client.ExecEvent{Kind: "stdout", Stream: "stdout", Output: string(data), Data: data}, false, true, nil
+	case strings.HasPrefix(line, stderrPrefix):
+		data, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(line, stderrPrefix))
+		if err != nil {
+			return client.ExecEvent{}, false, false, nil
+		}
+		return client.ExecEvent{Kind: "stderr", Stream: "stderr", Output: string(data), Data: data}, false, true, nil
+	case strings.HasPrefix(line, exitPrefix):
+		code, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, exitPrefix)))
+		if err != nil {
+			return client.ExecEvent{}, false, false, err
+		}
+		return client.ExecEvent{Kind: "exit", ExitCode: code}, true, true, nil
+	default:
+		return client.ExecEvent{}, false, false, nil
+	}
 }

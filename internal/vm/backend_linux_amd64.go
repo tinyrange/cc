@@ -407,20 +407,47 @@ func (i *linuxInstance) Exec(ctx context.Context, req client.ExecRequest) (clien
 }
 
 func (i *linuxInstance) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
-	_ = inputs
-	resp, err := i.Exec(ctx, req)
-	if err != nil {
-		return err
+	if i == nil || i.session == nil {
+		return fmt.Errorf("instance is not running")
 	}
-	if onEvent != nil && resp.Output != "" {
-		if err := onEvent(client.ExecEvent{Kind: "stdout", Stream: "stdout", Output: resp.Output, Data: []byte(resp.Output)}); err != nil {
+	user := strings.TrimSpace(req.User)
+	if user != "" && user != "root" && user != "0" && user != "0:0" {
+		return fmt.Errorf("only root user is supported")
+	}
+	env := linuxEffectiveExecEnv(i.baseEnv, req.Env, req.ReplaceEnv)
+	command := append([]string(nil), req.Command...)
+	if !req.SkipResolve {
+		if i.image == nil || i.image.RootFS == nil {
+			return fmt.Errorf("running instance does not have a default image root filesystem")
+		}
+		var err error
+		command, err = imagefs.ResolveCommand(i.image.RootFS, req.Command, env)
+		if err != nil {
 			return err
 		}
 	}
-	if onEvent != nil {
-		return onEvent(client.ExecEvent{Kind: "exit", ExitCode: resp.ExitCode})
+	workDir := req.WorkDir
+	if workDir == "" {
+		workDir = i.workDir
 	}
-	return nil
+	if workDir == "" {
+		workDir = "/"
+	}
+	if !strings.HasPrefix(workDir, "/") {
+		return fmt.Errorf("workdir must be absolute")
+	}
+	return i.session.ExecStream(ctx, client.ExecRequest{
+		Command:     command,
+		Env:         env,
+		RootDir:     req.RootDir,
+		ReplaceEnv:  req.ReplaceEnv,
+		SkipResolve: req.SkipResolve,
+		WorkDir:     workDir,
+		Stdin:       append([]byte(nil), req.Stdin...),
+		TTY:         req.TTY,
+		Cols:        req.Cols,
+		Rows:        req.Rows,
+	}, inputs, onEvent)
 }
 
 func (i *linuxInstance) AddShare(ctx context.Context, share client.ShareMount) error {

@@ -17,6 +17,7 @@ import (
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/oci"
+	"j5.nz/cc/internal/vm"
 )
 
 func TestWantsExecEventStream(t *testing.T) {
@@ -111,6 +112,26 @@ func TestWriteProgressEvent(t *testing.T) {
 	}
 	if event.BytesDownloaded != 1024 || event.BytesTotal != 4096 {
 		t.Fatalf("progress bytes = %#v", event)
+	}
+}
+
+func TestCapabilitiesEndpoint(t *testing.T) {
+	srv := &server{vms: vm.NewManager()}
+	mux := newMux(srv, nil)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/capabilities", nil)
+
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /capabilities status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var caps client.CapabilitiesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &caps); err != nil {
+		t.Fatalf("Unmarshal(capabilities) error = %v", err)
+	}
+	if caps.Host == "" || caps.Backend == "" || caps.MaxInstances == 0 || !caps.SupportsMultiImageExec {
+		t.Fatalf("capabilities = %#v", caps)
 	}
 }
 

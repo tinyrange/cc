@@ -50,7 +50,7 @@ func TestRuntimeBackendRunCommand(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping linux arm64 KVM integration test in short mode")
 	}
-	fixture := filepath.Join("..", "..", "local", "alpine.simg")
+	fixture := filepath.Join("..", "..", "fixtures", "alpine.simg")
 	if _, err := os.Stat(fixture); err != nil {
 		t.Skipf("local alpine fixture unavailable: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestRuntimeBackendStartThenExec(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping linux arm64 KVM integration test in short mode")
 	}
-	fixture := filepath.Join("..", "..", "local", "alpine.simg")
+	fixture := filepath.Join("..", "..", "fixtures", "alpine.simg")
 	if _, err := os.Stat(fixture); err != nil {
 		t.Skipf("local alpine fixture unavailable: %v", err)
 	}

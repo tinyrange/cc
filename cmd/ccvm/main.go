@@ -93,6 +93,10 @@ func newMux(srvState *server, httpServer *http.Server) *http.ServeMux {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
+	mux.HandleFunc("GET /capabilities", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, srvState.vms.Capabilities())
+	})
+
 	mux.HandleFunc("POST /shutdown", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 		go func() {
@@ -291,7 +295,14 @@ func newMux(srvState *server, httpServer *http.Server) *http.ServeMux {
 	})
 
 	mux.HandleFunc("GET /vm/status", func(w http.ResponseWriter, r *http.Request) {
+		if id := strings.TrimSpace(r.URL.Query().Get("id")); id != "" {
+			writeJSON(w, http.StatusOK, srvState.vms.StatusOf(id))
+			return
+		}
 		writeJSON(w, http.StatusOK, srvState.vms.Status())
+	})
+	mux.HandleFunc("GET /vm", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, srvState.vms.Statuses())
 	})
 	mux.HandleFunc("POST /vm/start", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -432,11 +443,12 @@ func newMux(srvState *server, httpServer *http.Server) *http.ServeMux {
 		timingLog("POST /vm total=%s", time.Since(start))
 	})
 	mux.HandleFunc("POST /vm/shutdown", func(w http.ResponseWriter, r *http.Request) {
-		if err := srvState.vms.Shutdown(r.Context()); err != nil {
+		id := strings.TrimSpace(r.URL.Query().Get("id"))
+		if err := srvState.vms.ShutdownInstance(r.Context(), id); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, srvState.vms.Status())
+		writeJSON(w, http.StatusOK, srvState.vms.StatusOf(id))
 	})
 	mux.HandleFunc("POST /vm/run", func(w http.ResponseWriter, r *http.Request) {
 		req, err := decodeRunRequest(r)

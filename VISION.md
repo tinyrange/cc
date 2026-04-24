@@ -2,21 +2,21 @@
 
 `ccx3` is a cross-platform, unprivileged microVM runtime for running OCI-backed Linux workloads behind a simple HTTP API.
 
-The project goal is not to expose raw VM plumbing. The goal is to let callers start from an OCI image, create an isolated execution environment, run many commands inside that environment, attach host-backed shares, manage networking, and snapshot or restore state, without ever having to provide a kernel, assemble a disk image, or rely on elevated host privileges.
+The project goal is not to expose raw VM plumbing. The goal is to let callers start from OCI images, create an isolated execution environment, run many commands inside that environment, attach host-backed shares, and eventually manage networking and snapshot or restore state, without ever having to provide a kernel, assemble a disk image, or run `ccx3` itself with elevated host privileges.
 
 At its core, the system is built around a small set of ideas:
 
 - One managed Linux kernel per running VM.
-- One OCI image environment bound to that VM.
+- One primary OCI image environment bound to that VM, with additional OCI image environments attachable inside the same live VM.
 - Multiple commands may execute inside that live environment over time.
-- Networking, shares, and snapshots are first-class runtime features.
-- The runtime remains entirely unprivileged to implement on Windows, macOS, and Linux hosts.
+- Shares are part of the MVP runtime contract; networking and snapshots are first-class product directions that should be validated and staged deliberately.
+- The runtime should remain unprivileged to install and operate on Windows, macOS, and Linux hosts.
 
 ## Thesis
 
 The thesis of `ccx3` is:
 
-> Run OCI-derived Linux sandboxes in dedicated microVMs, with multi-exec session semantics, runtime-owned networking and shares, and first-class snapshots, through a portable HTTP API and without any privileged host dependencies.
+> Run OCI-derived Linux sandboxes in dedicated microVMs, with multi-exec session semantics, runtime-owned shares, staged networking and snapshot support, through a portable HTTP API and without requiring callers to manage VM plumbing or run privileged helper daemons.
 
 This puts `ccx3` in a different category than both container runtimes and Firecracker-style low-level VMM APIs.
 
@@ -33,7 +33,7 @@ The user-facing model should stay workload-centric rather than hypervisor-centri
 The key resources are:
 
 - `Image`: an OCI-derived execution environment template.
-- `VM` or `Instance`: a live microVM bound to exactly one managed kernel and one image environment.
+- `VM` or `Instance`: a live microVM bound to exactly one managed kernel, one primary image environment, and zero or more additional mounted image environments.
 - `Exec`: a command launched inside that running VM.
 - `Share`: a runtime-managed filesystem attachment backed by a host path or host file provider.
 - `Network`: a runtime-managed virtual network attachment.
@@ -41,17 +41,19 @@ The key resources are:
 
 The current codebase uses `kernel`, `image`, and `vm` terminology. That is a reasonable starting point. Over time, the external API may evolve toward more explicit workload-oriented names if that improves clarity, but the semantics should remain the same.
 
+Instances should be addressable resources, even if some platforms can only run one at a time. The compatibility path may keep a default instance for simple local workflows, but Linux and Windows designs should allow multiple named instances where the host backend supports them.
+
 ## Semantic Model
 
 The fundamental execution model is:
 
-- A caller provides an OCI image reference.
-- The runtime prepares an image-backed Linux environment.
+- A caller provides an OCI image reference for the primary environment.
+- The runtime prepares an image-backed Linux environment and may attach additional OCI image environments on demand.
 - The runtime boots a managed guest kernel inside a microVM.
 - The VM becomes a long-lived execution environment.
-- The caller may launch multiple commands inside that same VM over its lifetime.
+- The caller may launch multiple commands inside that same VM over its lifetime, optionally targeting different attached image environments according to runtime policy.
 
-This is not "one process and the VM dies." It is one VM per image-backed environment, with many exec operations inside it.
+This is not "one process and the VM dies." It is one VM per live session, with a primary image-backed environment, optional additional image mounts, and many exec operations inside it.
 
 That split creates two distinct lifecycles.
 
@@ -87,24 +89,27 @@ Successive execs in the same VM are expected to interact with the same live envi
 - temporary files
 - mounted shares
 - current network attachments
+- attached image environments
 - runtime-created state inside the guest
 
 The default mental model should be:
 
-> An instance is a live, image-backed Linux execution environment in a dedicated microVM. An exec is a process launched inside that environment. A snapshot freezes that environment for fast later restoration.
+> An instance is a live Linux execution environment in a dedicated microVM, rooted in a primary OCI image and able to mount additional OCI images. An exec is a process launched inside one of those environments. A future snapshot freezes that environment for fast later restoration.
 
 This is important because ambiguity here would make snapshots, background processes, and repeated execs hard to reason about.
 
 ## Unprivileged By Design
 
-One of the defining properties of `ccx3` is that it is unprivileged to implement, not just unprivileged to use.
+One of the defining properties of `ccx3` is that it should be unprivileged to install, operate, and integrate.
 
 That means:
 
 - No root or administrator requirement at install time.
 - No privileged helper daemons.
-- No dependence on elevated OS capabilities for instance creation, networking, sharing, snapshotting, or teardown.
+- No requirement that the `ccx3` daemon itself run as root or administrator for instance creation, networking, sharing, snapshotting, or teardown.
 - No hidden escape hatch where a privileged subsystem quietly performs the hard parts.
+
+Some host virtualization APIs may require host-level enablement or device access outside `ccx3` itself. Linux KVM access through `/dev/kvm` is acceptable when the device is available to regular users on that system; it should be reported as a host capability rather than treated as permission for `ccx3` to require a privileged helper.
 
 Every major subsystem should preserve this invariant:
 
@@ -130,10 +135,13 @@ Examples of platform-reported capabilities may include:
 - supported snapshot classes
 - supported network modes
 - share consistency guarantees
+- instance concurrency limits
 - resource limit support
 - performance characteristics
 
 The API contract should remain portable even when a platform ships with a narrower capability set.
+
+Current macOS HVF constraints may limit concurrent running instances. That should be modeled as a platform capability rather than as a global API assumption; Linux and Windows designs should not inherit that limitation unnecessarily.
 
 ## OCI As Ingress, Not Identity
 
@@ -167,7 +175,9 @@ Good top-level operations look like:
 - start a VM
 - exec a command inside a VM
 - inspect VM state
+- inspect host/runtime capabilities
 - attach shares
+- attach or select additional image environments
 - attach or configure networking
 - create a snapshot
 - restore from a snapshot
@@ -206,7 +216,7 @@ The important point is that callers interact with portable runtime objects, not 
 
 ## Snapshots
 
-Snapshots are a first-class part of the product, not an add-on.
+Snapshots are a first-class product direction, but they are not required for MVP 1. They should be introduced when the base session model is stable enough for snapshot correctness to be meaningful.
 
 They should support several distinct use cases:
 
@@ -226,18 +236,19 @@ Users should be able to reason clearly about what a snapshot preserves and under
 
 ## Initial Focus
 
-A strong early version of `ccx3` should stay narrow and prove the core abstraction:
+A strong MVP 1 of `ccx3` should stay narrow and prove the core abstraction:
 
 - Linux guest environment
 - portable HTTP API
 - one managed guest platform
 - OCI pull and prepare
 - create and start VM from image
+- attach or execute against multiple OCI images within one live VM
 - run multiple commands in one live VM
 - stdout, stderr, stdin, signals, and exit status
 - read-only and read-write shares
-- basic runtime networking
-- boot and warm snapshots
+
+Networking should be added when tests show which runtime behavior the MVP needs. Snapshots should be treated initially as a performance optimization and correctness-sensitive roadmap feature, not an MVP 1 blocker.
 
 That is already enough to validate the product thesis without taking on every orchestration problem up front.
 

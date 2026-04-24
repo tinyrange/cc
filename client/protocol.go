@@ -234,7 +234,23 @@ type VMSupportedResponse struct {
 	Error     string `json:"error,omitempty"`
 }
 
+type CapabilitiesResponse struct {
+	Host                   string   `json:"host"`
+	Backend                string   `json:"backend,omitempty"`
+	VMSupported            bool     `json:"vm_supported"`
+	VMError                string   `json:"vm_error,omitempty"`
+	MaxInstances           int      `json:"max_instances,omitempty"`
+	SnapshotClasses        []string `json:"snapshot_classes,omitempty"`
+	NetworkModes           []string `json:"network_modes,omitempty"`
+	ShareConsistency       []string `json:"share_consistency,omitempty"`
+	ResourceLimits         []string `json:"resource_limits,omitempty"`
+	SupportsMultiImageExec bool     `json:"supports_multi_image_exec"`
+	RequiresPrivilegedCCX3 bool     `json:"requires_privileged_ccx3"`
+	Notes                  []string `json:"notes,omitempty"`
+}
+
 type CreateInstanceRequest struct {
+	ID       string       `json:"id,omitempty"`
 	Image    string       `json:"image"`
 	Shares   []ShareMount `json:"shares,omitempty"`
 	MemoryMB uint64       `json:"memory_mb,omitempty"`
@@ -243,12 +259,14 @@ type CreateInstanceRequest struct {
 }
 
 type StartInstanceRequest struct {
+	ID       string `json:"id,omitempty"`
 	MemoryMB uint64 `json:"memory_mb,omitempty"`
 	CPUs     int    `json:"cpus,omitempty"`
 	Dmesg    bool   `json:"dmesg,omitempty"`
 }
 
 type InstanceState struct {
+	ID        string `json:"id,omitempty"`
 	Status    string `json:"status"`
 	Image     string `json:"image,omitempty"`
 	MemoryMB  uint64 `json:"memory_mb,omitempty"`
@@ -258,6 +276,7 @@ type InstanceState struct {
 }
 
 type RunRequest struct {
+	ID         string       `json:"id,omitempty"`
 	Image      string       `json:"image"`
 	Shares     []ShareMount `json:"shares,omitempty"`
 	Command    []string     `json:"command,omitempty"`
@@ -285,6 +304,7 @@ type VMState = InstanceState
 type RunVMResponse = ExecResponse
 
 type ExecRequest struct {
+	ID          string   `json:"id,omitempty"`
 	Command     []string `json:"command"`
 	Env         []string `json:"env,omitempty"`
 	RootDir     string   `json:"root_dir,omitempty"`

@@ -1,9 +1,13 @@
 # ccx3
 
-`ccx3` is an experimental container runtime for Neurodesk-style workloads. It
-imports OCI, SIMG/SIF, and CVMFS-backed containers, boots a small Linux guest,
-mounts the container root filesystem through virtio-fs, and executes commands
-through a local HTTP/WebSocket daemon.
+`ccx3` is an experimental microVM runtime for OCI-backed Linux workloads. It
+imports OCI, SIMG/SIF, and CVMFS-backed images, boots a managed Linux guest,
+mounts image environments through virtio-fs, and executes commands through a
+local HTTP/WebSocket daemon.
+
+The runtime is workload-centric rather than hypervisor-centric: callers manage
+images, instances, execs, and shares without providing kernels, wiring boot
+devices, or running a privileged helper daemon.
 
 ## Status
 
@@ -14,16 +18,21 @@ Supported host backends:
 - `darwin/arm64` via HVF
 
 The `linux/amd64` backend supports native amd64 images, one-shot command
-execution, persistent VMs, writable host shares, local SIMG containers, and
-remote Neurodesk CVMFS containers. Known foreign-architecture images are
-rejected on `linux/amd64`; arm64 guest emulation is not implemented there yet.
+execution, persistent VMs, writable host shares, local SIMG containers, remote
+Neurodesk CVMFS containers, and attaching additional image environments inside a
+running VM. Known foreign-architecture images are rejected on `linux/amd64`;
+arm64 guest emulation is not implemented there yet.
+
+Runtime networking and snapshots are roadmap features. Snapshots are currently
+treated as a future performance optimization rather than an MVP 1 requirement.
 
 ## Requirements
 
 - Go 1.25 or newer, matching `go.mod`
 - A supported host architecture
-- Linux KVM hosts: `/dev/kvm`, user permission to open it, and hardware
-  virtualization enabled
+- Linux KVM hosts: `/dev/kvm`, regular-user permission to open it, and hardware
+  virtualization enabled. Some distributions grant this automatically; others
+  require one-time host configuration outside `ccx3`.
 - Network access for kernel downloads, OCI pulls, or CVMFS-backed containers
 
 Quick KVM check:
@@ -57,11 +66,15 @@ cc -ccvm ./ccvm kernel-download
 cc -ccvm ./ccvm vm-supported
 ```
 
-Run a local SIMG:
+The daemon also exposes a capability summary at `GET /capabilities`, including
+the active host backend, VM support state, instance concurrency, supported share
+semantics, and roadmap feature slots for networking and snapshots.
+
+Run the small tracked Alpine bringup SIMG:
 
 ```sh
-cc -ccvm ./ccvm pull niimath ./local/niimath_1.0.20250804_20251016.simg
-cc -ccvm ./ccvm run niimath niimath -help
+cc -ccvm ./ccvm pull alpine ./fixtures/alpine.simg
+cc -ccvm ./ccvm run alpine sh -lc 'cat /etc/alpine-release'
 ```
 
 Run directly from Neurodesk CVMFS:
@@ -80,6 +93,10 @@ cc -ccvm ./ccvm vm-start niimath-cvmfs
 cc -ccvm ./ccvm run niimath-cvmfs niimath -help
 cc -ccvm ./ccvm vm-stop
 ```
+
+The HTTP API supports named instances through an optional `id` field on VM and
+exec requests. The CLI continues to use the default instance for simple local
+workflows.
 
 ## Python Client
 

@@ -45,7 +45,7 @@ func TestRuntimeBackendRunCommand(t *testing.T) {
 	if os.Getenv("CCX3_KVM_BOOT") == "" {
 		t.Skip("set CCX3_KVM_BOOT=1 to run the linux amd64 KVM boot probe")
 	}
-	fixture := filepath.Join("..", "..", "local", "alpine.simg")
+	fixture := filepath.Join("..", "..", "fixtures", "alpine.simg")
 	if _, err := os.Stat(fixture); err != nil {
 		t.Skipf("local alpine fixture unavailable: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestRuntimeBackendStartThenExec(t *testing.T) {
 	if os.Getenv("CCX3_KVM_BOOT") == "" {
 		t.Skip("set CCX3_KVM_BOOT=1 to run the linux amd64 KVM boot probe")
 	}
-	fixture := filepath.Join("..", "..", "local", "alpine.simg")
+	fixture := filepath.Join("..", "..", "fixtures", "alpine.simg")
 	if _, err := os.Stat(fixture); err != nil {
 		t.Skipf("local alpine fixture unavailable: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestRuntimeBackendStartWithWritableShare(t *testing.T) {
 	if os.Getenv("CCX3_KVM_BOOT") == "" {
 		t.Skip("set CCX3_KVM_BOOT=1 to run the linux amd64 KVM boot probe")
 	}
-	fixture := filepath.Join("..", "..", "local", "alpine.simg")
+	fixture := filepath.Join("..", "..", "fixtures", "alpine.simg")
 	if _, err := os.Stat(fixture); err != nil {
 		t.Skipf("local alpine fixture unavailable: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestRuntimeBackendStartBlankThenRunImage(t *testing.T) {
 	if os.Getenv("CCX3_KVM_BOOT") == "" {
 		t.Skip("set CCX3_KVM_BOOT=1 to run the linux amd64 KVM boot probe")
 	}
-	fixture := filepath.Join("..", "..", "local", "alpine.simg")
+	fixture := filepath.Join("..", "..", "fixtures", "alpine.simg")
 	if _, err := os.Stat(fixture); err != nil {
 		t.Skipf("local alpine fixture unavailable: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestRuntimeBackendStartBlankThenRunImageWithShareWorkdir(t *testing.T) {
 	if os.Getenv("CCX3_KVM_BOOT") == "" {
 		t.Skip("set CCX3_KVM_BOOT=1 to run the linux amd64 KVM boot probe")
 	}
-	fixture := filepath.Join("..", "..", "local", "alpine.simg")
+	fixture := filepath.Join("..", "..", "fixtures", "alpine.simg")
 	if _, err := os.Stat(fixture); err != nil {
 		t.Skipf("local alpine fixture unavailable: %v", err)
 	}

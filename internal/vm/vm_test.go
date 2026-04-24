@@ -174,6 +174,62 @@ func TestManagerRunSupportsMultipleImagesOnBlankRunningVM(t *testing.T) {
 	}
 }
 
+func TestManagerSupportsNamedInstances(t *testing.T) {
+	first := &fakeInstance{waitCh: make(chan error, 1)}
+	second := &fakeInstance{waitCh: make(chan error, 1)}
+	var startCount int
+	mgr := NewManagerWithBackend(fakeBackend{
+		startFn: func(req client.CreateInstanceRequest) (Instance, error) {
+			startCount++
+			if startCount == 1 {
+				return first, nil
+			}
+			return second, nil
+		},
+	})
+	mgr.supports = func() error { return nil }
+	mgr.capabilities = func() client.CapabilitiesResponse {
+		return client.CapabilitiesResponse{MaxInstances: 2}
+	}
+
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{ID: "one", Image: "alpine"}); err != nil {
+		t.Fatalf("Start(one) error = %v", err)
+	}
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{ID: "two", Image: "busybox"}); err != nil {
+		t.Fatalf("Start(two) error = %v", err)
+	}
+
+	if got := mgr.StatusOf("one").Image; got != "alpine" {
+		t.Fatalf("StatusOf(one).Image = %q, want alpine", got)
+	}
+	if got := mgr.StatusOf("two").Image; got != "busybox" {
+		t.Fatalf("StatusOf(two).Image = %q, want busybox", got)
+	}
+	statuses := mgr.Statuses()
+	if len(statuses) != 2 {
+		t.Fatalf("Statuses() len = %d, want 2", len(statuses))
+	}
+	if statuses[0].ID != "one" || statuses[1].ID != "two" {
+		t.Fatalf("Statuses() = %#v, want sorted named instances", statuses)
+	}
+}
+
+func TestManagerEnforcesInstanceCapacity(t *testing.T) {
+	inst := &fakeInstance{waitCh: make(chan error, 1)}
+	mgr := NewManagerWithBackend(fakeBackend{instance: inst})
+	mgr.supports = func() error { return nil }
+	mgr.capabilities = func() client.CapabilitiesResponse {
+		return client.CapabilitiesResponse{MaxInstances: 1}
+	}
+
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{ID: "one", Image: "alpine"}); err != nil {
+		t.Fatalf("Start(one) error = %v", err)
+	}
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{ID: "two", Image: "busybox"}); err == nil {
+		t.Fatal("Start(two) error = nil, want capacity error")
+	}
+}
+
 func TestManagerRunAllowsConcurrentExecsOnRunningInstance(t *testing.T) {
 	inst := &fakeInstance{waitCh: make(chan error, 1)}
 	inst.execFn = func(req client.ExecRequest) (client.ExecResponse, error) {
@@ -321,6 +377,7 @@ type fakeBackend struct {
 	instance        Instance
 	err             error
 	runResp         client.ExecResponse
+	startFn         func(client.CreateInstanceRequest) (Instance, error)
 	runInInstanceFn func(context.Context, Instance, string, client.RunRequest) (client.ExecResponse, error)
 }
 
@@ -330,8 +387,11 @@ func (f fakeBackend) Start(ctx context.Context, req client.CreateInstanceRequest
 
 func (f fakeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
 	_ = ctx
-	_ = req
 	_ = onEvent
+	if f.startFn != nil {
+		return f.startFn(req)
+	}
+	_ = req
 	return f.instance, f.err
 }
 

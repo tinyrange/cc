@@ -342,7 +342,7 @@ func TestStorePullFallsBackToAMD64ManifestOnArm64Hosts(t *testing.T) {
 }
 
 func TestStorePullLocalSIMG(t *testing.T) {
-	fixture := filepath.Join("..", "..", "local", "alpine.simg")
+	fixture := filepath.Join("..", "..", "fixtures", "alpine.simg")
 	if _, err := os.Stat(fixture); err != nil {
 		t.Skipf("fixture missing: %v", err)
 	}
