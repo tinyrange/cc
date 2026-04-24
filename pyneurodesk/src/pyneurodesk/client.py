@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import json
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, Optional, Union
 
 import httpx
 
@@ -33,8 +33,8 @@ class PyNeurodeskClient:
         self,
         base_url: str,
         *,
-        client: httpx.Client | None = None,
-        timeout: float | httpx.Timeout | None = None,
+        client: Optional[httpx.Client] = None,
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
     ) -> None:
         self._owns_client = client is None
         self._client = client or httpx.Client(base_url=base_url, timeout=resolve_http_timeout(timeout))
@@ -61,7 +61,7 @@ class PyNeurodeskClient:
         mirror: str,
         repo: str,
         path: str,
-        cache_dir: str | None = None,
+        cache_dir: Optional[str] = None,
     ) -> ImageState:
         return self.import_image(
             name,
@@ -100,7 +100,7 @@ class PyNeurodeskClient:
                     raise TypeError(f"expected download progress object, got {type(event)!r}")
                 yield DownloadProgress.from_payload(event)
 
-    def get_image(self, name: str) -> ImageState | None:
+    def get_image(self, name: str) -> Optional[ImageState]:
         response = self._client.get(f"/image/{name}")
         if response.status_code == 404:
             return None
@@ -152,10 +152,10 @@ class PyNeurodeskClient:
         self,
         image: str,
         *,
-        timeout: float | httpx.Timeout | None = None,
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
         dmesg: bool = False,
-        memory_mb: int | None = None,
-        cpus: int | None = None,
+        memory_mb: Optional[int] = None,
+        cpus: Optional[int] = None,
     ) -> VMState:
         payload: dict[str, Any] = {"image": image}
         if dmesg:
@@ -171,10 +171,10 @@ class PyNeurodeskClient:
     def start_instance(
         self,
         *,
-        timeout: float | httpx.Timeout | None = None,
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
         dmesg: bool = False,
-        memory_mb: int | None = None,
-        cpus: int | None = None,
+        memory_mb: Optional[int] = None,
+        cpus: Optional[int] = None,
     ) -> VMState:
         payload: dict[str, Any] = {}
         if dmesg:
@@ -190,10 +190,10 @@ class PyNeurodeskClient:
     def start_instance_stream(
         self,
         *,
-        timeout: float | httpx.Timeout | None = None,
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
         dmesg: bool = False,
-        memory_mb: int | None = None,
-        cpus: int | None = None,
+        memory_mb: Optional[int] = None,
+        cpus: Optional[int] = None,
     ) -> Iterable[dict[str, Any]]:
         payload: dict[str, Any] = {}
         if dmesg:
@@ -223,7 +223,7 @@ class PyNeurodeskClient:
         self,
         image: str,
         *,
-        timeout: float | httpx.Timeout | None = None,
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
         dmesg: bool = False,
     ) -> Iterable[dict[str, Any]]:
         payload: dict[str, Any] = {"image": image}
@@ -255,10 +255,10 @@ class PyNeurodeskClient:
         self,
         image: str,
         *,
-        timeout: float | httpx.Timeout | None = None,
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
         dmesg: bool = False,
-        memory_mb: int | None = None,
-        cpus: int | None = None,
+        memory_mb: Optional[int] = None,
+        cpus: Optional[int] = None,
     ) -> VMState:
         state = self.instance_status()
         if state.status == "running" and state.image == image:
@@ -288,7 +288,7 @@ class PyNeurodeskClient:
         self,
         request: RunCommandRequest,
         *,
-        timeout: float | httpx.Timeout | None = None,
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
     ) -> CommandResult:
         response = self._client.post("/vm/run", json=request.to_payload(), timeout=timeout)
         payload = self._decode_json(response)
@@ -301,10 +301,10 @@ class PyNeurodeskClient:
         *,
         shares: Iterable[ShareMount] = (),
         env: Iterable[str] = (),
-        workdir: str | None = None,
-        user: str | None = None,
-        stdin: bytes | None = None,
-        timeout: float | httpx.Timeout | None = None,
+        workdir: Optional[str] = None,
+        user: Optional[str] = None,
+        stdin: Optional[bytes] = None,
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
     ) -> CommandResult:
         return self.run_command(
             RunCommandRequest(
@@ -335,7 +335,7 @@ class PyNeurodeskClient:
         return payload
 
 
-def resolve_http_timeout(timeout: float | httpx.Timeout | None) -> httpx.Timeout:
+def resolve_http_timeout(timeout: Optional[Union[float, httpx.Timeout]]) -> httpx.Timeout:
     if isinstance(timeout, httpx.Timeout):
         return timeout
     if timeout is not None:
@@ -348,7 +348,7 @@ def resolve_http_timeout(timeout: float | httpx.Timeout | None) -> httpx.Timeout
     return httpx.Timeout(connect=10.0, read=300.0, write=300.0, pool=10.0)
 
 
-def resolve_boot_timeout(timeout: float | httpx.Timeout | None = None) -> httpx.Timeout:
+def resolve_boot_timeout(timeout: Optional[Union[float, httpx.Timeout]] = None) -> httpx.Timeout:
     if isinstance(timeout, httpx.Timeout):
         return timeout
     if timeout is not None:

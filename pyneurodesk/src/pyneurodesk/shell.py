@@ -12,6 +12,7 @@ import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import httpx
 
@@ -59,7 +60,7 @@ class SessionState:
         }
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     handler = getattr(args, "handler", None)
@@ -233,7 +234,7 @@ def handle_run_wrapper(args: argparse.Namespace) -> int:
     return run_image_command(str(args.image), str(args.command), wrapper_args, deploy_env=deploy_env)
 
 
-def run_image_command(image: str, command_name: str, args: list[str], *, deploy_env: list[str] | None = None) -> int:
+def run_image_command(image: str, command_name: str, args: list[str], *, deploy_env: Optional[list[str]] = None) -> int:
     handle = container(image, progress=False)
     try:
         env = list(deploy_env or [])

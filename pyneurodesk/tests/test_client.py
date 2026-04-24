@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 
 import httpx
 import pytest
@@ -23,6 +24,7 @@ from pyneurodesk.api import (
     create_container_cache_dir,
     build_release_container_path,
     create_progress_reporter,
+    default_daemon_state_path,
     path_join,
     resolve_ccvm_binary_path,
     resolve_release_index_dir,
@@ -270,7 +272,7 @@ def test_start_instance_posts_vm_start_and_uses_boot_timeout() -> None:
 
 
 def test_container_cold_start_uses_http_timeout_for_preflight_and_boot_timeout_for_vm() -> None:
-    seen: list[tuple[str, float | None]] = []
+    seen: list[tuple[str, Optional[float]]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         timeout = request.extensions.get("timeout")
@@ -490,7 +492,7 @@ def test_non_object_json_response_raises_type_error() -> None:
 
 
 def test_container_lookup_imports_and_runs_notebook_style_api() -> None:
-    seen: list[tuple[str, str, str | None]] = []
+    seen: list[tuple[str, str, Optional[str]]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = request.read().decode() or None
@@ -592,7 +594,7 @@ def test_container_lookup_imports_and_runs_notebook_style_api() -> None:
 
 
 def test_container_run_uses_cvmfs_deploy_env_and_exposes_commands() -> None:
-    seen: list[tuple[str, str, str | None]] = []
+    seen: list[tuple[str, str, Optional[str]]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = request.read().decode() or None
@@ -726,7 +728,7 @@ def test_container_lookup_accepts_versioned_root_simg() -> None:
 
 
 def test_container_switches_running_vm_to_requested_image() -> None:
-    seen: list[tuple[str, str, str | None]] = []
+    seen: list[tuple[str, str, Optional[str]]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = request.read().decode() or None
@@ -768,7 +770,7 @@ def test_resolve_base_url_reads_daemon_state(monkeypatch, tmp_path: Path) -> Non
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr("pyneurodesk.api._health_check", lambda base_url: base_url == "http://127.0.0.1:4567")
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / ".cache"))
-    state_path = tmp_path / ".cache" / "ccx3" / "ccvm.json"
+    state_path = default_daemon_state_path()
     state_path.parent.mkdir(parents=True)
     state_path.write_text('{"addr":"127.0.0.1:4567"}')
 
@@ -953,7 +955,7 @@ def test_container_starts_shared_daemon_and_boots_image(monkeypatch) -> None:
                 return SimpleNamespace(data=base64.b64encode(b"niimath\n").decode().encode())
             raise AssertionError(request.path)
 
-        def get_image(self, image: str) -> object | None:
+        def get_image(self, image: str) -> Optional[object]:
             calls.append(("get_image", image))
             return None
 
@@ -1071,7 +1073,7 @@ def test_share_dir_arguments_are_translated_into_guest_paths(monkeypatch, tmp_pa
                 return SimpleNamespace(data=base64.b64encode(b"niimath\n").decode().encode())
             raise AssertionError(request.path)
 
-        def get_image(self, image: str) -> object | None:
+        def get_image(self, image: str) -> Optional[object]:
             return SimpleNamespace(name=image, status="downloaded")
 
         def import_image(self, image: str, request: object) -> object:
@@ -1487,7 +1489,7 @@ def test_container_progress_reports_required_downloads(monkeypatch, capsys: pyte
                 )
             raise AssertionError(payload["path"])
 
-        def get_image(self, image: str) -> object | None:
+        def get_image(self, image: str) -> Optional[object]:
             return None
 
         def import_image(self, image: str, request: object) -> object:
@@ -1554,7 +1556,7 @@ def test_container_progress_reports_rate_and_eta_from_stream(monkeypatch, capsys
                 )
             raise AssertionError(payload["path"])
 
-        def get_image(self, image: str) -> object | None:
+        def get_image(self, image: str) -> Optional[object]:
             return None
 
         def import_image(self, image: str, request: object) -> object:
@@ -1668,7 +1670,7 @@ def test_container_uses_local_release_metadata_without_cvmfs_listing(monkeypatch
     )
     monkeypatch.setattr("pyneurodesk.api.resolve_release_index_dir", lambda: releases_dir)
 
-    seen: list[tuple[str, str, str | None]] = []
+    seen: list[tuple[str, str, Optional[str]]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = request.read().decode() or None
@@ -1706,7 +1708,7 @@ def test_container_uses_remote_release_metadata_without_cvmfs_listing(monkeypatc
         lambda name: {"1.0.0": "20250617", "1.0.20250804": "20251016"} if name == "niimath" else {},
     )
 
-    seen: list[tuple[str, str, str | None]] = []
+    seen: list[tuple[str, str, Optional[str]]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = request.read().decode() or None

@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 
 import httpx
 import pytest
@@ -370,7 +371,7 @@ def test_run_wrapper_invokes_container_command(
             *,
             env: list[str] = (),
             shares: list[object] = (),
-            workdir: str | None = None,
+            workdir: Optional[str] = None,
         ) -> object:
             calls.append(("run", (image, tuple(command), tuple(env), tuple(shares), workdir)))
             return SimpleNamespace(exit_code=0, output="hello\n")

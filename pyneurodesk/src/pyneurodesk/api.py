@@ -10,7 +10,7 @@ import base64
 from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
-from typing import Protocol
+from typing import Optional, Protocol, Union
 
 import httpx
 
@@ -35,19 +35,19 @@ DEFAULT_RELEASES_API = "https://api.github.com/repos/NeuroDesk/neurocontainers/c
 class ProgressReporter(Protocol):
     def update(self, step: int, message: str) -> None: ...
 
-    def close(self, message: str | None = None) -> None: ...
+    def close(self, message: Optional[str] = None) -> None: ...
 
 
 class NullProgressReporter:
     def update(self, step: int, message: str) -> None:
         return None
 
-    def close(self, message: str | None = None) -> None:
+    def close(self, message: Optional[str] = None) -> None:
         return None
 
 
 class StreamProgressReporter:
-    def __init__(self, total_steps: int, stream: object | None = None) -> None:
+    def __init__(self, total_steps: int, stream: Optional[object] = None) -> None:
         self.total_steps = max(total_steps, 1)
         self.stream = stream if stream is not None else sys.stdout
         self._active = False
@@ -61,7 +61,7 @@ class StreamProgressReporter:
         print(f"\r\033[2K{line}", end="", file=self.stream, flush=True)
         self._active = True
 
-    def close(self, message: str | None = None) -> None:
+    def close(self, message: Optional[str] = None) -> None:
         if message:
             if self._active:
                 print(f"\r\033[2K{message}", file=self.stream, flush=True)
@@ -87,7 +87,7 @@ class NotebookProgressReporter:
         current = max(0, min(step, self.total_steps))
         self._handle.update(self._render(current, message))
 
-    def close(self, message: str | None = None) -> None:
+    def close(self, message: Optional[str] = None) -> None:
         if message:
             self._handle.update(self._render(self.total_steps, message))
 
@@ -107,7 +107,7 @@ class NotebookProgressReporter:
 
 
 class SharedDirectory:
-    def __init__(self, source: str | os.PathLike[str], *, writable: bool = False, share_id: str | None = None) -> None:
+    def __init__(self, source: Union[str, os.PathLike[str]], *, writable: bool = False, share_id: Optional[str] = None) -> None:
         source_path = Path(source).expanduser().resolve(strict=True)
         if not source_path.is_dir():
             raise NotADirectoryError(str(source_path))
@@ -119,7 +119,7 @@ class SharedDirectory:
     def guest_path(self) -> str:
         return f"/.share/{self.share_id}"
 
-    def __truediv__(self, child: str | os.PathLike[str]) -> "SharedPath":
+    def __truediv__(self, child: Union[str, os.PathLike[str]]) -> "SharedPath":
         return SharedPath(self, (str(child),))
 
 
@@ -135,11 +135,11 @@ class SharedPath:
             current = posixpath.join(current, str(part))
         return current
 
-    def __truediv__(self, child: str | os.PathLike[str]) -> "SharedPath":
+    def __truediv__(self, child: Union[str, os.PathLike[str]]) -> "SharedPath":
         return SharedPath(self.directory, self.parts + (str(child),))
 
 
-def share_dir(source: str | os.PathLike[str], *, writable: bool = False) -> SharedDirectory:
+def share_dir(source: Union[str, os.PathLike[str]], *, writable: bool = False) -> SharedDirectory:
     return SharedDirectory(source, writable=writable)
 
 
@@ -149,13 +149,13 @@ class NeurodeskContainer:
         client: PyNeurodeskClient,
         reference: ContainerReference,
         *,
-        owned_daemon: DaemonState | None = None,
+        owned_daemon: Optional[DaemonState] = None,
     ) -> None:
         self._client = client
         self.reference = reference
         self._owned_daemon = owned_daemon
         self._closed = False
-        self._deploy_metadata: DeployMetadata | None = None
+        self._deploy_metadata: Optional[DeployMetadata] = None
 
     @property
     def name(self) -> str:
@@ -303,7 +303,7 @@ class NeurodeskContainer:
         return True
 
 
-def connect(*, base_url: str | None = None) -> PyNeurodeskClient:
+def connect(*, base_url: Optional[str] = None) -> PyNeurodeskClient:
     resolved_base_url = resolve_base_url(base_url)
     return PyNeurodeskClient(resolved_base_url)
 
@@ -311,11 +311,11 @@ def connect(*, base_url: str | None = None) -> PyNeurodeskClient:
 def search(
     name: str,
     *,
-    base_url: str | None = None,
-    client: PyNeurodeskClient | None = None,
+    base_url: Optional[str] = None,
+    client: Optional[PyNeurodeskClient] = None,
     mirror: str = DEFAULT_CVMFS_MIRROR,
     repo: str = DEFAULT_CVMFS_REPO,
-    cache_dir: str | None = None,
+    cache_dir: Optional[str] = None,
 ) -> list[str]:
     local_versions = _search_local_release_versions(name)
     if local_versions:
@@ -341,8 +341,8 @@ def _search_versions(
     *,
     mirror: str,
     repo: str,
-    cache_dir: str | None,
-) -> tuple[list[str], object | None, object]:
+    cache_dir: Optional[str],
+) -> tuple[list[str], Optional[object], object]:
     normalized_name = name.strip()
     if not normalized_name:
         raise ValueError("container name is required")
@@ -379,11 +379,11 @@ def _search_versions(
 def container(
     name: str,
     *,
-    base_url: str | None = None,
-    client: PyNeurodeskClient | None = None,
+    base_url: Optional[str] = None,
+    client: Optional[PyNeurodeskClient] = None,
     mirror: str = DEFAULT_CVMFS_MIRROR,
     repo: str = DEFAULT_CVMFS_REPO,
-    cache_dir: str | None = None,
+    cache_dir: Optional[str] = None,
     progress: bool = True,
     debug: bool = False,
 ) -> NeurodeskContainer:
@@ -483,13 +483,13 @@ def container(
 
 
 def resolve_container_reference(
-    client: PyNeurodeskClient | None,
+    client: Optional[PyNeurodeskClient],
     name: str,
     *,
-    base_url: str | None = None,
+    base_url: Optional[str] = None,
     mirror: str,
     repo: str,
-    cache_dir: str | None = None,
+    cache_dir: Optional[str] = None,
 ) -> ContainerReference:
     normalized_name = name.strip()
     if not normalized_name:
@@ -619,7 +619,7 @@ def deploy_directory_for_reference_path(path: str) -> str:
     return path
 
 
-def normalize_deploy_env_line(line: str) -> str | None:
+def normalize_deploy_env_line(line: str) -> Optional[str]:
     if "=" not in line:
         return None
     key, value = line.split("=", 1)
@@ -641,8 +641,8 @@ def _resolve_release_reference(
     *,
     mirror: str,
     repo: str,
-    cache_dir: str | None,
-) -> ContainerReference | None:
+    cache_dir: Optional[str],
+) -> Optional[ContainerReference]:
     normalized_name = name.strip()
     if not normalized_name:
         raise ValueError("container name is required")
@@ -784,7 +784,7 @@ def resolve_ccvm_binary_path() -> Path:
     )
 
 
-def bundled_ccvm_path() -> Path | None:
+def bundled_ccvm_path() -> Optional[Path]:
     for name in ("ccvm", "ccvm.exe"):
         candidate = resources.files("pyneurodesk").joinpath("bin", name)
         if isinstance(candidate, Path) and candidate.exists():
@@ -796,7 +796,7 @@ def pyneurodesk_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def repo_root() -> Path | None:
+def repo_root() -> Optional[Path]:
     for root in (pyneurodesk_root(), *pyneurodesk_root().parents):
         if (root / "go.mod").exists() and (root / "cmd" / "ccvm" / "main.go").exists():
             return root
@@ -897,7 +897,7 @@ def _shutdown_daemon_server(base_url: str) -> None:
         return
 
 
-def resolve_base_url(base_url: str | None = None) -> str:
+def resolve_base_url(base_url: Optional[str] = None) -> str:
     if base_url is not None and base_url.strip():
         return base_url.rstrip("/")
 
@@ -973,7 +973,7 @@ def _stream_required_download_progress(
     fallback_label: str,
     events: object,
 ) -> None:
-    last_message: str | None = None
+    last_message: Optional[str] = None
     for event in events:
         status = getattr(event, "status", None)
         if status == "error":
@@ -993,7 +993,7 @@ def _report_required_download(
     index: int,
     total: int,
     fallback_label: str,
-    stream_method: object | None,
+    stream_method: Optional[object],
     request: Callable[[], object],
 ) -> None:
     if callable(stream_method):
@@ -1073,7 +1073,7 @@ def _emit_debug_boot_log(exc: httpx.HTTPStatusError) -> None:
 
 
 def _stream_debug_boot(client: PyNeurodeskClient, image: str) -> None:
-    last_error: str | None = None
+    last_error: Optional[str] = None
     for event in client.create_instance_stream(image, dmesg=True):
         kind = str(event.get("kind", ""))
         if kind == "serial":
@@ -1113,8 +1113,8 @@ def _find_prefix_directory(entries: object, name: str):
         return None
     return sorted(matches, key=lambda entry: entry.name)[-1]
 
-def _find_best_container_path(entries: object, name: str) -> str | None:
-    exact_dir: str | None = None
+def _find_best_container_path(entries: object, name: str) -> Optional[str]:
+    exact_dir: Optional[str] = None
     prefix_dirs: list[str] = []
     for entry in entries.entries:
         if entry.kind == "directory":
@@ -1135,7 +1135,7 @@ def _find_simg_in_directory(
     name: str,
     mirror: str,
     repo: str,
-    cache_dir: str | None,
+    cache_dir: Optional[str],
 ) -> str:
     entries = client.cvmfs_list(
         CVMFSSource(
@@ -1157,8 +1157,8 @@ def _try_find_simg_in_directory(
     name: str,
     mirror: str,
     repo: str,
-    cache_dir: str | None,
-) -> str | None:
+    cache_dir: Optional[str],
+) -> Optional[str]:
     try:
         return _find_simg_in_directory(client, directory, name, mirror, repo, cache_dir)
     except (LookupError, httpx.HTTPStatusError):
@@ -1233,7 +1233,7 @@ def _search_remote_release_versions(name: str) -> dict[str, str]:
     return versions
 
 
-def _extract_remote_release_build(download_url: str) -> str | None:
+def _extract_remote_release_build(download_url: str) -> Optional[str]:
     try:
         with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=20.0, write=20.0, pool=5.0)) as client:
             response = client.get(download_url)
@@ -1253,7 +1253,7 @@ def _extract_remote_release_build(download_url: str) -> str | None:
     return build.strip()
 
 
-def resolve_release_index_dir() -> Path | None:
+def resolve_release_index_dir() -> Optional[Path]:
     env = os.environ.get("PYNEURODESK_RELEASES_DIR", "").strip()
     if env:
         path = Path(env).expanduser()
@@ -1265,7 +1265,7 @@ def resolve_release_index_dir() -> Path | None:
     return None
 
 
-def _extract_release_build(path: Path) -> str | None:
+def _extract_release_build(path: Path) -> Optional[str]:
     try:
         payload = json.loads(path.read_text())
     except Exception:
@@ -1303,11 +1303,11 @@ def _resolve_version_path(
     name: str,
     version: str,
     *,
-    direct_entries: object | None,
+    direct_entries: Optional[object],
     root_entries: object,
     mirror: str,
     repo: str,
-    cache_dir: str | None,
+    cache_dir: Optional[str],
 ) -> str:
     if version == name:
         return path_join(DEFAULT_CONTAINERS_PATH, name)

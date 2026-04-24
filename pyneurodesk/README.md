@@ -24,6 +24,14 @@ uv sync
 uv run pytest
 ```
 
+The default package install keeps the client and shell dependencies small. The
+`pyneurodesk-fulltest` helper needs NIfTI and YAML support, so install the
+optional extra when you want to run fulltest recipes:
+
+```sh
+uv sync --extra fulltest
+```
+
 If you want to exercise real VM execution, build the Go daemon first from the
 repository root:
 

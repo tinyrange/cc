@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 
 @dataclass(frozen=True)
@@ -10,7 +10,7 @@ class CVMFSSource:
     mirror: str
     repo: str
     path: str
-    cache_dir: str | None = None
+    cache_dir: Optional[str] = None
 
     def to_payload(self) -> dict[str, str]:
         payload: dict[str, str] = {
@@ -26,10 +26,10 @@ class CVMFSSource:
 @dataclass(frozen=True)
 class ImageSource:
     type: str
-    format: str | None = None
-    mirror: str | None = None
-    repo: str | None = None
-    path: str | None = None
+    format: Optional[str] = None
+    mirror: Optional[str] = None
+    repo: Optional[str] = None
+    path: Optional[str] = None
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"type": self.type}
@@ -47,7 +47,7 @@ class ImageSource:
 @dataclass(frozen=True)
 class ImportImageRequest:
     source: ImageSource
-    cache_dir: str | None = None
+    cache_dir: Optional[str] = None
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"source": self.source.to_payload()}
@@ -62,7 +62,7 @@ class ImportImageRequest:
         mirror: str,
         repo: str,
         path: str,
-        cache_dir: str | None = None,
+        cache_dir: Optional[str] = None,
     ) -> "ImportImageRequest":
         return cls(
             source=ImageSource(
@@ -79,9 +79,9 @@ class ImportImageRequest:
 class ImageState:
     name: str
     status: str
-    source: str | None = None
-    source_kind: str | None = None
-    error: str | None = None
+    source: Optional[str] = None
+    source_kind: Optional[str] = None
+    error: Optional[str] = None
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "ImageState":
@@ -97,9 +97,9 @@ class ImageState:
 @dataclass(frozen=True)
 class KernelState:
     status: str
-    error: str | None = None
-    version: str | None = None
-    source: str | None = None
+    error: Optional[str] = None
+    version: Optional[str] = None
+    source: Optional[str] = None
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "KernelState":
@@ -114,13 +114,13 @@ class KernelState:
 @dataclass(frozen=True)
 class DownloadProgress:
     status: str
-    artifact: str | None = None
-    progress: float | None = None
-    bytes_downloaded: int | None = None
-    bytes_total: int | None = None
-    rate_bytes_per_second: float | None = None
-    eta_seconds: float | None = None
-    error: str | None = None
+    artifact: Optional[str] = None
+    progress: Optional[float] = None
+    bytes_downloaded: Optional[int] = None
+    bytes_total: Optional[int] = None
+    rate_bytes_per_second: Optional[float] = None
+    eta_seconds: Optional[float] = None
+    error: Optional[str] = None
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "DownloadProgress":
@@ -140,9 +140,9 @@ class DownloadProgress:
 class ImageMetadataState:
     name: str
     status: str
-    source_kind: str | None = None
-    architecture: str | None = None
-    error: str | None = None
+    source_kind: Optional[str] = None
+    architecture: Optional[str] = None
+    error: Optional[str] = None
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "ImageMetadataState":
@@ -158,9 +158,9 @@ class ImageMetadataState:
 @dataclass(frozen=True)
 class EmulatorState:
     status: str
-    path: str | None = None
+    path: Optional[str] = None
     required: bool = False
-    error: str | None = None
+    error: Optional[str] = None
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "EmulatorState":
@@ -177,7 +177,7 @@ class CVMFSDirectoryEntry:
     name: str
     path: str
     kind: str
-    size: int | None = None
+    size: Optional[int] = None
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "CVMFSDirectoryEntry":
@@ -209,8 +209,8 @@ class CVMFSReadRequest:
     repo: str
     path: str
     offset: int = 0
-    length: int | None = None
-    cache_dir: str | None = None
+    length: Optional[int] = None
+    cache_dir: Optional[str] = None
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -231,7 +231,7 @@ class CVMFSReadResponse:
     path: str
     offset: int
     data: bytes
-    eof: bool | None = None
+    eof: Optional[bool] = None
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "CVMFSReadResponse":
@@ -253,7 +253,7 @@ class ContainerReference:
     name: str
     image: str
     source: ImageSource
-    cache_dir: str | None = None
+    cache_dir: Optional[str] = None
 
     @property
     def path(self) -> str:
@@ -290,11 +290,11 @@ class RunCommandRequest:
     command: tuple[str, ...]
     shares: tuple[ShareMount, ...] = ()
     env: tuple[str, ...] = ()
-    workdir: str | None = None
-    user: str | None = None
-    stdin: bytes | None = None
-    memory_mb: int | None = None
-    cpus: int | None = None
+    workdir: Optional[str] = None
+    user: Optional[str] = None
+    stdin: Optional[bytes] = None
+    memory_mb: Optional[int] = None
+    cpus: Optional[int] = None
     dmesg: bool = False
 
     def to_payload(self) -> dict[str, Any]:
@@ -337,11 +337,11 @@ class CommandResult:
 @dataclass(frozen=True)
 class VMState:
     status: str
-    image: str | None = None
-    memory_mb: int | None = None
-    cpus: int | None = None
-    started_at: str | None = None
-    error: str | None = None
+    image: Optional[str] = None
+    memory_mb: Optional[int] = None
+    cpus: Optional[int] = None
+    started_at: Optional[str] = None
+    error: Optional[str] = None
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "VMState":
@@ -358,7 +358,7 @@ class VMState:
 @dataclass(frozen=True)
 class DaemonState:
     addr: str
-    cache_dir: str | None = None
+    cache_dir: Optional[str] = None
 
     @property
     def base_url(self) -> str:

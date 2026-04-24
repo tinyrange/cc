@@ -6,12 +6,10 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 import httpx
-import nibabel as nib
-import yaml
 
 from .api import (
     DEFAULT_CVMFS_MIRROR,
@@ -23,6 +21,7 @@ from .models import ContainerReference, ImageSource, ImportImageRequest, ShareMo
 
 
 DEFAULT_OPENNEURO_BASE = "https://s3.amazonaws.com/openneuro.org"
+FULLTEST_EXTRA_MESSAGE = "pyneurodesk fulltest dependencies are not installed; install pyneurodesk[fulltest]"
 
 
 @dataclass(frozen=True)
@@ -64,14 +63,14 @@ class Options:
     recipe: Path
     image_source: str = ""
     image_name: str = ""
-    work_dir: Path | None = None
+    work_dir: Optional[Path] = None
     filter_text: str = ""
     keep_vm: bool = False
     mirror: str = DEFAULT_CVMFS_MIRROR
     repo: str = DEFAULT_CVMFS_REPO
-    cache_dir: str | None = None
-    memory_mb: int | None = None
-    cpus: int | None = None
+    cache_dir: Optional[str] = None
+    memory_mb: Optional[int] = None
+    cpus: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -91,7 +90,7 @@ class RunResult:
 
 
 class FullTestRunner:
-    def __init__(self, *, http_client: httpx.Client | None = None) -> None:
+    def __init__(self, *, http_client: Optional[httpx.Client] = None) -> None:
         self.http = http_client or httpx.Client(follow_redirects=True, timeout=httpx.Timeout(120.0))
         self._owns_http = http_client is None
 
@@ -237,6 +236,7 @@ class FullTestRunner:
 
 
 def load_suite(path: Path) -> Suite:
+    yaml = _import_yaml()
     payload = yaml.safe_load(path.read_text()) or {}
     tests = []
     for item in payload.get("tests", []):
@@ -328,7 +328,7 @@ def build_container_reference(
     image_source: str,
     mirror: str,
     repo: str,
-    cache_dir: str | None,
+    cache_dir: Optional[str],
 ) -> ContainerReference:
     source = image_source.strip()
     if source:
@@ -427,6 +427,7 @@ def validate_test(output: str, exit_code: int, test: TestCase, host_vars: dict[s
                 if not file_path.exists():
                     return f"missing output {file_path}"
             elif kind == "same_dimensions":
+                nib = _import_nibabel()
                 if not isinstance(arg, list) or len(arg) != 2:
                     return "invalid same_dimensions validation"
                 left = Path(substitute_variables(str(arg[0]), host_vars))
@@ -434,10 +435,27 @@ def validate_test(output: str, exit_code: int, test: TestCase, host_vars: dict[s
                 if nib.load(str(left)).shape != nib.load(str(right)).shape:
                     return f"dimension mismatch {left} vs {right}"
             elif kind == "is_3d":
+                nib = _import_nibabel()
                 file_path = Path(substitute_variables(str(arg), host_vars))
                 if len(nib.load(str(file_path)).shape) != 3:
                     return f"{file_path} is not 3D"
     return ""
+
+
+def _import_yaml() -> Any:
+    try:
+        import yaml
+    except ImportError as exc:
+        raise RuntimeError(FULLTEST_EXTRA_MESSAGE) from exc
+    return yaml
+
+
+def _import_nibabel() -> Any:
+    try:
+        import nibabel as nib
+    except ImportError as exc:
+        raise RuntimeError(FULLTEST_EXTRA_MESSAGE) from exc
+    return nib
 
 
 def print_summary(result: RunResult) -> int:
