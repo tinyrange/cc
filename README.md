@@ -105,9 +105,13 @@ workflows.
 
 ## Python Client
 
-The Python package lives in `pyneurodesk/`. It can start or connect to the
-daemon, import Neurodesk containers from CVMFS, and expose container commands
-through Python or shell wrappers.
+The Python package lives in `pyneurodesk/` and is published as `neurodesk`. It
+can start or connect to the daemon, import Neurodesk containers from CVMFS, and
+expose container commands through Python or shell wrappers.
+
+```sh
+pip install neurodesk
+```
 
 ```sh
 cd pyneurodesk

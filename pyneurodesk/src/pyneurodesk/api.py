@@ -756,7 +756,7 @@ def start_daemon_for_cache_dir(cache_root: Path) -> DaemonState:
 
 
 def resolve_ccvm_binary_path() -> Path:
-    for env_name in ("CCX3_CCVM", "CCVM_BINARY"):
+    for env_name in ("PYNEURODESK_CCVM", "CCX3_CCVM", "CCVM_BINARY"):
         value = os.environ.get(env_name, "").strip()
         if value:
             path = Path(value).expanduser()

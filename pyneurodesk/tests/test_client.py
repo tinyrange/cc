@@ -863,8 +863,18 @@ def test_resolve_ccvm_binary_path_prefers_packaged_binary(monkeypatch, tmp_path:
     binary.write_text("")
 
     monkeypatch.setattr("pyneurodesk.api.bundled_ccvm_path", lambda: binary)
+    monkeypatch.delenv("PYNEURODESK_CCVM", raising=False)
     monkeypatch.delenv("CCX3_CCVM", raising=False)
     monkeypatch.delenv("CCVM_BINARY", raising=False)
+
+    assert resolve_ccvm_binary_path() == binary
+
+
+def test_resolve_ccvm_binary_path_prefers_documented_env_var(monkeypatch, tmp_path: Path) -> None:
+    binary = tmp_path / "ccvm"
+    binary.write_text("")
+
+    monkeypatch.setenv("PYNEURODESK_CCVM", str(binary))
 
     assert resolve_ccvm_binary_path() == binary
 
@@ -877,6 +887,7 @@ def test_resolve_ccvm_binary_path_falls_back_to_project_binary(monkeypatch, tmp_
     monkeypatch.setattr("pyneurodesk.api.bundled_ccvm_path", lambda: None)
     monkeypatch.setattr("pyneurodesk.api.pyneurodesk_root", lambda: bundle_root)
     monkeypatch.setattr("pyneurodesk.api.maybe_refresh_bundled_ccvm", lambda path: None)
+    monkeypatch.delenv("PYNEURODESK_CCVM", raising=False)
     monkeypatch.delenv("CCX3_CCVM", raising=False)
     monkeypatch.delenv("CCVM_BINARY", raising=False)
 
@@ -894,6 +905,7 @@ def test_resolve_ccvm_binary_path_rebuilds_stale_bundled_binary(monkeypatch, tmp
     monkeypatch.setattr("pyneurodesk.api.bundled_ccvm_path", lambda: None)
     monkeypatch.setattr("pyneurodesk.api.pyneurodesk_root", lambda: bundle_root)
     monkeypatch.setattr("pyneurodesk.api.maybe_refresh_bundled_ccvm", lambda path: calls.append(path))
+    monkeypatch.delenv("PYNEURODESK_CCVM", raising=False)
     monkeypatch.delenv("CCX3_CCVM", raising=False)
     monkeypatch.delenv("CCVM_BINARY", raising=False)
 

@@ -1,5 +1,5 @@
 [project]
-name = "pyneurodesk"
+name = "neurodesk"
 version = "0.1.0"
 description = "Python client for the ccx3 Neurodesk-oriented image and VM API"
 readme = "README.md"
@@ -24,7 +24,12 @@ pyneurodesk-fulltest = "pyneurodesk.fulltest:main"
 
 [build-system]
 requires = ["uv_build>=0.9.24,<0.10.0"]
-build-backend = "uv_build"
+build-backend = "neurodesk_build_backend"
+backend-path = ["build_backend"]
+
+[tool.uv.build-backend]
+module-name = ["pyneurodesk", "neurodesk"]
+source-include = ["build_backend/**"]
 
 [dependency-groups]
 dev = [

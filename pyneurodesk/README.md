@@ -1,6 +1,6 @@
-# pyneurodesk
+# neurodesk
 
-`pyneurodesk` is a Python client and shell helper for the `ccx3` daemon. It is
+`neurodesk` is a Python client and shell helper for the `ccx3` daemon. It is
 focused on Neurodesk container discovery, CVMFS-backed image import, VM
 lifecycle management, and running container commands from Python, notebooks, or
 normal shell scripts.
@@ -14,9 +14,19 @@ normal shell scripts.
 - Shell activation and command wrappers for `nd load` / `nd exec`
 - Fulltest helpers for running Neurodesk test suites inside containers
 
+## Installation
+
+The package is published as `neurodesk`:
+
+```sh
+pip install neurodesk
+```
+
+Both `import neurodesk` and `import pyneurodesk` are supported.
+
 ## Development Setup
 
-The package uses `uv` and requires Python 3.13 or newer.
+The package uses `uv` and requires Python 3.9 or newer.
 
 ```sh
 cd pyneurodesk
@@ -31,6 +41,28 @@ optional extra when you want to run fulltest recipes:
 ```sh
 uv sync --extra fulltest
 ```
+
+## Publishing
+
+Platform wheels should include the bundled `ccvm` binary so installs do not
+need a Go toolchain at runtime. Use the repository release helper from the repo
+root to cross-compile the currently supported wheels (`linux/amd64`,
+`linux/arm64`, and `darwin/arm64`) with `CGO_ENABLED=0`:
+
+```sh
+UV_PUBLISH_TOKEN=pypi-... tools/publish_neurodesk.sh
+```
+
+By default the helper builds and publishes wheels only. To also publish a
+source-only sdist, run:
+
+```sh
+UV_PUBLISH_TOKEN=pypi-... tools/publish_neurodesk.sh --include-sdist
+```
+
+The sdist intentionally does not contain `ccvm`; installing from it fails during
+wheel build unless `ccvm` is discoverable through `PYNEURODESK_CCVM`,
+`CCX3_CCVM`, `CCVM_BINARY`, or `PATH`.
 
 If you want to exercise real VM execution, build the Go daemon first from the
 repository root:

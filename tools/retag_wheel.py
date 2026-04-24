@@ -32,11 +32,11 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_output = Path(tmp) / output.name
-        with ZipFile(wheel, "r") as src, ZipFile(tmp_output, "w", ZIP_DEFLATED) as dst:
+        with ZipFile(wheel, "r") as src:
             record_name = next(
                 name for name in src.namelist() if name.endswith(".dist-info/RECORD")
             )
-            records: list[tuple[str, str, str]] = []
+            entries: list[tuple[ZipInfo, bytes]] = []
             for info in src.infolist():
                 if info.filename == record_name:
                     continue
@@ -50,10 +50,19 @@ def main() -> None:
                         else:
                             lines.append(line)
                     data = ("\n".join(lines) + "\n").encode("utf-8")
-                dst.writestr(copy_info(info), data)
-                records.append(record_for(info.filename, data))
-            record_data = render_record([*records, (record_name, "", "")])
-            dst.writestr(record_name, record_data)
+                entries.append((copy_info(info), data))
+
+        records = [record_for(info.filename, data) for info, data in entries]
+        records.append((record_name, "", ""))
+        record_info = ZipInfo(record_name)
+        record_info.compress_type = ZIP_DEFLATED
+        entries.append((record_info, render_record(records)))
+
+        with ZipFile(tmp_output, "w", ZIP_DEFLATED) as dst:
+            for info, data in entries:
+                dst.writestr(info, data)
+
+        validate_record(tmp_output)
         shutil.move(str(tmp_output), output)
 
     if output != wheel:
@@ -82,6 +91,35 @@ def render_record(rows: list[tuple[str, str, str]]) -> bytes:
     writer = csv.writer(output, lineterminator="\n")
     writer.writerows(rows)
     return output.getvalue().encode("utf-8")
+
+
+def validate_record(wheel: Path) -> None:
+    with ZipFile(wheel) as zf:
+        names = zf.namelist()
+        if len(names) != len(set(names)):
+            raise SystemExit(f"duplicate filenames in wheel: {wheel}")
+        record_name = next(name for name in names if name.endswith(".dist-info/RECORD"))
+        rows = list(csv.reader(io.StringIO(zf.read(record_name).decode("utf-8"))))
+        recorded = {row[0] for row in rows}
+        if set(names) != recorded:
+            missing = sorted(set(names) - recorded)
+            extra = sorted(recorded - set(names))
+            raise SystemExit(f"RECORD entries do not match wheel contents: missing={missing}, extra={extra}")
+        for path, digest, size in rows:
+            if path == record_name:
+                if digest or size:
+                    raise SystemExit(f"RECORD self-entry must not include hash or size: {wheel}")
+                continue
+            data = zf.read(path)
+            if size and int(size) != len(data):
+                raise SystemExit(f"RECORD size mismatch for {path}: {size} != {len(data)}")
+            if digest:
+                algorithm, expected = digest.split("=", 1)
+                actual = base64.urlsafe_b64encode(
+                    hashlib.new(algorithm, data).digest()
+                ).rstrip(b"=").decode("ascii")
+                if actual != expected:
+                    raise SystemExit(f"RECORD digest mismatch for {path}")
 
 
 if __name__ == "__main__":
