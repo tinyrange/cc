@@ -33,10 +33,9 @@ jobs:
             exit 1
           fi
           sudo chown root:kvm /dev/kvm
-          sudo chmod 0660 /dev/kvm
-          sudo usermod -aG kvm "$USER"
-          sudo setfacl -m "u:${USER}:rw" /dev/kvm || sudo chmod 0666 /dev/kvm
+          sudo chmod 0666 /dev/kvm
           test -r /dev/kvm -a -w /dev/kvm
+          id
           ls -l /dev/kvm
 
       - name: Set up Go
@@ -56,7 +55,10 @@ jobs:
       - name: Run Go unit tests
         env:
           CCX3_KVM_BOOT: "1"
-        run: go test ./...
+        run: |
+          test -r /dev/kvm -a -w /dev/kvm
+          ls -l /dev/kvm
+          go test ./...
 
       - name: Build ccvm for Python integration tests
         run: |
@@ -69,4 +71,7 @@ jobs:
           CCX3_CCVM: ${{ github.workspace }}/build/ccvm
           CCX3_SHELL_INTEGRATION: "1"
         working-directory: pyneurodesk
-        run: uv run pytest
+        run: |
+          test -r /dev/kvm -a -w /dev/kvm
+          ls -l /dev/kvm
+          uv run pytest
