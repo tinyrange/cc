@@ -1,0 +1,163 @@
+name: PyNeurodesk fulltests
+
+"on":
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "Fulltest suite to run: niimath, all, or a comma-separated list"
+        required: true
+        default: "niimath"
+        type: string
+      neurocontainers_ref:
+        description: "Neurocontainers git ref to test"
+        required: false
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Select fulltest suites
+    runs-on: ubuntu-24.04
+    outputs:
+      suites: ${{ steps.plan.outputs.suites }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Check out Neurocontainers recipes
+        uses: actions/checkout@v6
+        with:
+          repository: neurodesk/neurocontainers
+          ref: ${{ github.event.inputs.neurocontainers_ref || 'main' }}
+          path: local/neurocontainers
+
+      - name: Build suite matrix
+        id: plan
+        env:
+          REQUESTED_SUITE: ${{ github.event.inputs.suite || 'niimath' }}
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          recipes = Path("local/neurocontainers/recipes")
+          requested = os.environ["REQUESTED_SUITE"].strip() or "niimath"
+          available = sorted(path.parent.name for path in recipes.glob("*/fulltest.yaml"))
+
+          if not available:
+              print("No fulltest recipes found under local/neurocontainers/recipes", file=sys.stderr)
+              sys.exit(1)
+
+          if requested.lower() == "all":
+              selected = available
+          else:
+              selected = []
+              missing = []
+              for item in requested.replace("\n", ",").split(","):
+                  suite = item.strip()
+                  if not suite:
+                      continue
+                  if suite not in available:
+                      missing.append(suite)
+                  else:
+                      selected.append(suite)
+              if missing:
+                  print(f"Unknown fulltest suite(s): {', '.join(missing)}", file=sys.stderr)
+                  print(f"Available suites: {', '.join(available)}", file=sys.stderr)
+                  sys.exit(1)
+
+          selected = list(dict.fromkeys(selected))
+          if not selected:
+              print("No fulltest suites selected", file=sys.stderr)
+              sys.exit(1)
+          print(f"suites={json.dumps(selected)}")
+          PY
+
+  fulltest:
+    name: ${{ matrix.suite }}
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJson(needs.plan.outputs.suites) }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Check out Neurocontainers recipes
+        uses: actions/checkout@v6
+        with:
+          repository: neurodesk/neurocontainers
+          ref: ${{ github.event.inputs.neurocontainers_ref || 'main' }}
+          path: local/neurocontainers
+
+      - name: Enable runner access to /dev/kvm
+        run: |
+          set -euxo pipefail
+          if [ ! -e /dev/kvm ]; then
+            echo "/dev/kvm is not available on this runner" >&2
+            exit 1
+          fi
+          sudo chown root:kvm /dev/kvm
+          sudo chmod 0666 /dev/kvm
+          test -r /dev/kvm -a -w /dev/kvm
+          ls -l /dev/kvm
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install Python tooling
+        run: python -m pip install --upgrade pip uv
+
+      - name: Build ccvm
+        run: |
+          mkdir -p build
+          go build -o build/ccvm ./cmd/ccvm
+
+      - name: Install pyneurodesk fulltest dependencies
+        working-directory: pyneurodesk
+        env:
+          PYNEURODESK_CCVM: ${{ github.workspace }}/build/ccvm
+        run: uv sync --extra fulltest
+
+      - name: Run fulltest
+        working-directory: pyneurodesk
+        env:
+          PYNEURODESK_CCVM: ${{ github.workspace }}/build/ccvm
+          PYTHONUNBUFFERED: "1"
+          SUITE: ${{ matrix.suite }}
+        run: |
+          set -o pipefail
+          mkdir -p ../fulltest-results
+          recipe="${GITHUB_WORKSPACE}/local/neurocontainers/recipes/${SUITE}/fulltest.yaml"
+          work_dir="${RUNNER_TEMP}/pyneurodesk-fulltest-${SUITE}"
+          uv run pyneurodesk-fulltest \
+            --recipe "$recipe" \
+            --work-dir "$work_dir" \
+            2>&1 | tee "../fulltest-results/${SUITE}.log"
+
+      - name: Upload fulltest log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pyneurodesk-fulltest-${{ matrix.suite }}
+          path: fulltest-results/${{ matrix.suite }}.log
+          if-no-files-found: error
