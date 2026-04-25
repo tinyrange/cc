@@ -54,6 +54,31 @@ class PyNeurodeskClient:
         payload = self._decode_json(response)
         return ImageState.from_payload(payload)
 
+    def import_image_stream(
+        self,
+        name: str,
+        request: ImportImageRequest,
+        *,
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
+    ) -> Iterable[DownloadProgress]:
+        stream_timeout = timeout if timeout is not None else httpx.Timeout(connect=10.0, read=None, write=300.0, pool=10.0)
+        with self._client.stream(
+            "POST",
+            f"/image/{name}",
+            params={"stream": "1"},
+            json=request.to_payload(),
+            headers={"Accept": "application/x-ndjson"},
+            timeout=stream_timeout,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                event = json.loads(line)
+                if not isinstance(event, dict):
+                    raise TypeError(f"expected image import progress object, got {type(event)!r}")
+                yield DownloadProgress.from_payload(event)
+
     def import_cvmfs_container(
         self,
         name: str,
@@ -62,6 +87,8 @@ class PyNeurodeskClient:
         repo: str,
         path: str,
         cache_dir: Optional[str] = None,
+        prefetch: bool = False,
+        prefetch_workers: Optional[int] = None,
     ) -> ImageState:
         return self.import_image(
             name,
@@ -70,7 +97,34 @@ class PyNeurodeskClient:
                 repo=repo,
                 path=path,
                 cache_dir=cache_dir,
+                prefetch=prefetch,
+                prefetch_workers=prefetch_workers,
             ),
+        )
+
+    def import_cvmfs_container_stream(
+        self,
+        name: str,
+        *,
+        mirror: str,
+        repo: str,
+        path: str,
+        cache_dir: Optional[str] = None,
+        prefetch: bool = False,
+        prefetch_workers: Optional[int] = None,
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
+    ) -> Iterable[DownloadProgress]:
+        return self.import_image_stream(
+            name,
+            ImportImageRequest.from_cvmfs_container(
+                mirror=mirror,
+                repo=repo,
+                path=path,
+                cache_dir=cache_dir,
+                prefetch=prefetch,
+                prefetch_workers=prefetch_workers,
+            ),
+            timeout=timeout,
         )
 
     def kernel_status(self) -> KernelState:

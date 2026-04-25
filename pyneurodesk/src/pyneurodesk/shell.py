@@ -93,6 +93,8 @@ def build_parser() -> argparse.ArgumentParser:
     load_parser.add_argument("--mirror", default="https://cvmfs.neurodesk.org")
     load_parser.add_argument("--repo", default="neurodesk.ardc.edu.au")
     load_parser.add_argument("--cache-dir", default="")
+    load_parser.add_argument("--prefetch", action="store_true")
+    load_parser.add_argument("--prefetch-workers", type=int, default=0)
     load_parser.add_argument("--memory-mb", type=int, default=0)
     load_parser.add_argument("--cpus", type=int, default=0)
     load_parser.add_argument("--force", action="store_true")
@@ -158,6 +160,8 @@ def handle_load(args: argparse.Namespace) -> int:
     handle = load_shell_container(
         image,
         reference=reference,
+        prefetch=bool(args.prefetch),
+        prefetch_workers=int(args.prefetch_workers or 0) or None,
         memory_mb=int(args.memory_mb or 0) or None,
         cpus=int(args.cpus or 0) or None,
     )
@@ -204,6 +208,8 @@ def load_shell_container(
     image: str,
     *,
     reference: Optional[ContainerReference],
+    prefetch: bool,
+    prefetch_workers: Optional[int],
     memory_mb: Optional[int],
     cpus: Optional[int],
 ):
@@ -211,7 +217,15 @@ def load_shell_container(
         return container(image, progress=False)
 
     active_client = connect()
-    active_client.import_image(reference.image, ImportImageRequest(source=reference.source, cache_dir=reference.cache_dir))
+    active_client.import_image(
+        reference.image,
+        ImportImageRequest(
+            source=reference.source,
+            cache_dir=reference.cache_dir,
+            prefetch=prefetch,
+            prefetch_workers=prefetch_workers,
+        ),
+    )
     active_client.ensure_instance(reference.image, memory_mb=memory_mb, cpus=cpus)
     return container_handle_for_reference(active_client, reference)
 

@@ -48,20 +48,21 @@ type Store struct {
 }
 
 type metadata struct {
-	Name          string      `json:"name"`
-	Source        string      `json:"source"`
-	SourceKind    string      `json:"source_kind,omitempty"`
-	CVMFSRootHash string      `json:"cvmfs_root_hash,omitempty"`
-	Architecture  string      `json:"architecture,omitempty"`
-	RootFSDir     string      `json:"rootfs_dir"`
-	MetadataPath  string      `json:"metadata_path,omitempty"`
-	IndexPath     string      `json:"index_path,omitempty"`
-	Env           []string    `json:"env,omitempty"`
-	Entrypoint    []string    `json:"entrypoint,omitempty"`
-	Cmd           []string    `json:"cmd,omitempty"`
-	WorkingDir    string      `json:"working_dir,omitempty"`
-	User          string      `json:"user,omitempty"`
-	Labels        []labelPair `json:"labels,omitempty"`
+	Name               string      `json:"name"`
+	Source             string      `json:"source"`
+	SourceKind         string      `json:"source_kind,omitempty"`
+	CVMFSRootHash      string      `json:"cvmfs_root_hash,omitempty"`
+	Architecture       string      `json:"architecture,omitempty"`
+	RootFSDir          string      `json:"rootfs_dir"`
+	MetadataPath       string      `json:"metadata_path,omitempty"`
+	IndexPath          string      `json:"index_path,omitempty"`
+	PackedContentsPath string      `json:"packed_contents_path,omitempty"`
+	Env                []string    `json:"env,omitempty"`
+	Entrypoint         []string    `json:"entrypoint,omitempty"`
+	Cmd                []string    `json:"cmd,omitempty"`
+	WorkingDir         string      `json:"working_dir,omitempty"`
+	User               string      `json:"user,omitempty"`
+	Labels             []labelPair `json:"labels,omitempty"`
 }
 
 type labelPair struct {
@@ -83,6 +84,19 @@ type Image struct {
 type SourceSpec struct {
 	Kind string
 	Raw  string
+}
+
+type PullOptions struct {
+	Prefetch        bool
+	PrefetchWorkers int
+	Report          func(client.ProgressEvent)
+}
+
+func reportPullProgress(report func(client.ProgressEvent), event client.ProgressEvent) {
+	if report == nil {
+		return
+	}
+	report(event)
 }
 
 type RuntimeConfig struct {
@@ -247,7 +261,7 @@ func (s *Store) Open(name string) (*Image, error) {
 				HTTPClient: s.httpClient,
 				CacheDir:   cvmfsCacheDir(s.sharedRoot()),
 			}
-			rootFS, err = buildCVMFSIndexedRootFS(cvmfsClient, index)
+			rootFS, err = buildCVMFSIndexedRootFS(cvmfsClient, meta.PackedContentsPath, index)
 			if err != nil {
 				return nil, fmt.Errorf("build cvmfs rootfs: %w", err)
 			}
@@ -317,7 +331,7 @@ func (s *Store) Open(name string) (*Image, error) {
 	}, nil
 }
 
-func (s *Store) Pull(ctx context.Context, name, source string) (client.ImageState, error) {
+func (s *Store) Pull(ctx context.Context, name, source string, options ...PullOptions) (client.ImageState, error) {
 	if name == "" {
 		return client.ImageState{}, fmt.Errorf("image name is required")
 	}
@@ -328,14 +342,28 @@ func (s *Store) Pull(ctx context.Context, name, source string) (client.ImageStat
 	if err != nil {
 		return client.ImageState{}, err
 	}
+	var opts PullOptions
+	if len(options) > 0 {
+		opts = options[0]
+	}
 	if state, ok, err := s.existingState(name, spec); err != nil {
 		return client.ImageState{}, err
 	} else if ok {
+		reportPullProgress(opts.Report, client.ProgressEvent{Status: "available", Artifact: name})
+		if err := s.maybePrefetchCVMFSImage(ctx, name, spec, opts); err != nil {
+			return client.ImageState{}, err
+		}
+		reportPullProgress(opts.Report, client.ProgressEvent{Status: "downloaded", Artifact: name})
 		return state, nil
 	}
 	if state, ok, err := s.restoreFromSharedCache(name, spec); err != nil {
 		return client.ImageState{}, err
 	} else if ok {
+		reportPullProgress(opts.Report, client.ProgressEvent{Status: "restored", Artifact: name})
+		if err := s.maybePrefetchCVMFSImage(ctx, name, spec, opts); err != nil {
+			return client.ImageState{}, err
+		}
+		reportPullProgress(opts.Report, client.ProgressEvent{Status: "downloaded", Artifact: name})
 		return state, nil
 	}
 
@@ -348,7 +376,7 @@ func (s *Store) Pull(ctx context.Context, name, source string) (client.ImageStat
 	delete(s.lastErr, name)
 	s.mu.Unlock()
 
-	err = s.pull(ctx, name, spec)
+	err = s.pull(ctx, name, spec, opts)
 
 	s.mu.Lock()
 	delete(s.downloading, name)
@@ -362,7 +390,7 @@ func (s *Store) Pull(ctx context.Context, name, source string) (client.ImageStat
 	return state, stateErr
 }
 
-func (s *Store) pull(ctx context.Context, name string, spec SourceSpec) error {
+func (s *Store) pull(ctx context.Context, name string, spec SourceSpec, options PullOptions) error {
 	if err := os.MkdirAll(s.root, 0o755); err != nil {
 		return fmt.Errorf("create image store: %w", err)
 	}
@@ -376,21 +404,21 @@ func (s *Store) pull(ctx context.Context, name string, spec SourceSpec) error {
 	if _, ok, err := shared.existingState(sharedName, spec); err != nil {
 		return err
 	} else if !ok {
-		if err := shared.pullDirect(ctx, sharedName, spec); err != nil {
+		if err := shared.pullDirect(ctx, sharedName, spec, options); err != nil {
 			return err
 		}
 	}
 	return s.cloneFromStore(shared, sharedName, name, spec)
 }
 
-func (s *Store) pullDirect(ctx context.Context, name string, spec SourceSpec) error {
+func (s *Store) pullDirect(ctx context.Context, name string, spec SourceSpec, options PullOptions) error {
 	switch spec.Kind {
 	case SourceKindOCI:
 		return s.pullOCIDirect(ctx, name, spec)
 	case SourceKindSIMG:
 		return s.pullSIMGDirect(ctx, name, spec)
 	case SourceKindCVMFS:
-		return s.pullCVMFSDirect(ctx, name, spec)
+		return s.pullCVMFSDirect(ctx, name, spec, options)
 	default:
 		return fmt.Errorf("unsupported image source kind %q", spec.Kind)
 	}
@@ -412,8 +440,8 @@ func (s *Store) pullSIMGDirect(ctx context.Context, name string, spec SourceSpec
 	return s.finalizeSIMGImage(name, spec, imageDir, tmpDir, simgPath)
 }
 
-func (s *Store) pullCVMFSDirect(ctx context.Context, name string, spec SourceSpec) error {
-	_ = ctx
+func (s *Store) pullCVMFSDirect(ctx context.Context, name string, spec SourceSpec, options PullOptions) error {
+	reportPullProgress(options.Report, client.ProgressEvent{Status: "resolving", Artifact: name, Blob: "cvmfs"})
 	imageDir := s.imageDir(name)
 	tmpDir := imageDir + ".tmp"
 	if err := os.RemoveAll(tmpDir); err != nil {
@@ -438,6 +466,7 @@ func (s *Store) pullCVMFSDirect(ctx context.Context, name string, spec SourceSpe
 	if err != nil {
 		return fmt.Errorf("read cvmfs manifest root hash: %w", err)
 	}
+	reportPullProgress(options.Report, client.ProgressEvent{Status: "indexing", Artifact: name, Blob: rootHash})
 	nodes, entries, arch, ok, err := loadCVMFSDirectoryIndexCache(cvmfsClient.CacheDir, rootHash, rootTarget)
 	if err != nil {
 		return fmt.Errorf("load cached cvmfs rootfs index: %w", err)
@@ -450,6 +479,18 @@ func (s *Store) pullCVMFSDirect(ctx context.Context, name string, spec SourceSpe
 		if err := saveCVMFSDirectoryIndexCache(cvmfsClient.CacheDir, rootHash, rootTarget, nodes, entries, arch); err != nil {
 			return fmt.Errorf("cache cvmfs rootfs index: %w", err)
 		}
+	}
+	if options.Prefetch {
+		workers := options.PrefetchWorkers
+		if workers <= 0 {
+			workers = 4
+		}
+		packedContentsPath := filepath.Join(tmpDir, "rootfs.contents")
+		packedNodes, err := prefetchCVMFSFiles(ctx, cvmfsClient, nodes, workers, packedContentsPath, name, options.Report)
+		if err != nil {
+			return fmt.Errorf("prefetch cvmfs rootfs: %w", err)
+		}
+		nodes = packedNodes
 	}
 	fsMetaBuf, err := json.MarshalIndent(entries, "", "  ")
 	if err != nil {
@@ -466,14 +507,18 @@ func (s *Store) pullCVMFSDirect(ctx context.Context, name string, spec SourceSpe
 		return fmt.Errorf("write fs index: %w", err)
 	}
 	meta := metadata{
-		Name:          name,
-		Source:        spec.Raw,
-		SourceKind:    spec.Kind,
-		CVMFSRootHash: rootHash,
-		Architecture:  arch,
-		RootFSDir:     imageDir,
-		MetadataPath:  filepath.Join(imageDir, "rootfs.metadata.json"),
-		IndexPath:     filepath.Join(imageDir, "rootfs.index.json"),
+		Name:               name,
+		Source:             spec.Raw,
+		SourceKind:         spec.Kind,
+		CVMFSRootHash:      rootHash,
+		Architecture:       arch,
+		RootFSDir:          imageDir,
+		MetadataPath:       filepath.Join(imageDir, "rootfs.metadata.json"),
+		IndexPath:          filepath.Join(imageDir, "rootfs.index.json"),
+		PackedContentsPath: filepath.Join(imageDir, "rootfs.contents"),
+	}
+	if !options.Prefetch {
+		meta.PackedContentsPath = ""
 	}
 	if err := os.RemoveAll(imageDir); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove old image dir: %w", err)
@@ -484,6 +529,7 @@ func (s *Store) pullCVMFSDirect(ctx context.Context, name string, spec SourceSpe
 	if err := s.writeMetadata(name, meta); err != nil {
 		return err
 	}
+	reportPullProgress(options.Report, client.ProgressEvent{Status: "downloaded", Artifact: name})
 	return nil
 }
 
@@ -519,6 +565,49 @@ func (s *Store) finalizeSIMGImage(name string, spec SourceSpec, imageDir, tmpDir
 		return err
 	}
 	return nil
+}
+
+func (s *Store) maybePrefetchCVMFSImage(ctx context.Context, name string, spec SourceSpec, options PullOptions) error {
+	if spec.Kind != SourceKindCVMFS || !options.Prefetch {
+		return nil
+	}
+	meta, err := s.readMetadata(name)
+	if err != nil {
+		return fmt.Errorf("read image metadata for prefetch: %w", err)
+	}
+	if meta.IndexPath == "" {
+		return nil
+	}
+	indexBuf, err := os.ReadFile(meta.IndexPath)
+	if err != nil {
+		return fmt.Errorf("read fs index for prefetch: %w", err)
+	}
+	nodes, err := decodeFSIndex(indexBuf)
+	if err != nil {
+		return fmt.Errorf("decode fs index for prefetch: %w", err)
+	}
+	workers := options.PrefetchWorkers
+	if workers <= 0 {
+		workers = 4
+	}
+	cvmfsClient := &intcvmfs.Client{
+		HTTPClient: s.httpClient,
+		CacheDir:   cvmfsCacheDir(s.sharedRoot()),
+	}
+	packedContentsPath := filepath.Join(meta.RootFSDir, "rootfs.contents")
+	packedNodes, err := prefetchCVMFSFiles(ctx, cvmfsClient, nodes, workers, packedContentsPath, name, options.Report)
+	if err != nil {
+		return err
+	}
+	indexBuf, err = encodeIndexedNodes(packedNodes)
+	if err != nil {
+		return fmt.Errorf("marshal fs index after prefetch: %w", err)
+	}
+	if err := os.WriteFile(meta.IndexPath, indexBuf, 0o644); err != nil {
+		return fmt.Errorf("write fs index after prefetch: %w", err)
+	}
+	meta.PackedContentsPath = packedContentsPath
+	return s.writeMetadata(name, meta)
 }
 
 func normalizeCVMFSSource(source string) string {

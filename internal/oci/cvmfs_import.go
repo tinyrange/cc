@@ -1,17 +1,24 @@
 package oci
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
+	cclient "j5.nz/cc/client"
 	intcvmfs "j5.nz/cc/internal/cvmfs"
 	"j5.nz/cc/internal/fsmeta"
 )
@@ -113,6 +120,241 @@ func buildCVMFSDirectoryIndex(client *intcvmfs.Client, rootTarget string) ([]ind
 		return nil, nil, "", err
 	}
 	return nodes, meta, arch, nil
+}
+
+func prefetchCVMFSFiles(ctx context.Context, client *intcvmfs.Client, nodes []indexedNode, workers int, contentsPath string, imageName string, report func(cclient.ProgressEvent)) ([]indexedNode, error) {
+	type prefetchTarget struct {
+		nodeIndex int
+		target    string
+		size      uint64
+		offset    uint64
+	}
+
+	if workers <= 0 {
+		workers = 4
+	}
+	packedNodes := append([]indexedNode(nil), nodes...)
+	targets := make([]prefetchTarget, 0, len(nodes))
+	var totalBytes uint64
+	for i, node := range packedNodes {
+		if node.Kind != indexedKindFile || strings.TrimSpace(node.CVMFSTarget) == "" {
+			continue
+		}
+		packedNodes[i].Packed = true
+		packedNodes[i].PackedOffset = totalBytes
+		targets = append(targets, prefetchTarget{
+			nodeIndex: i,
+			target:    node.CVMFSTarget,
+			size:      node.Size,
+			offset:    totalBytes,
+		})
+		totalBytes += node.Size
+	}
+	if len(targets) == 0 {
+		return packedNodes, nil
+	}
+	sort.SliceStable(targets, func(i, j int) bool {
+		if targets[i].size == targets[j].size {
+			return targets[i].target < targets[j].target
+		}
+		return targets[i].size > targets[j].size
+	})
+
+	startedAt := time.Now()
+	fmt.Fprintf(os.Stderr, "ccx3-prefetch: starting prefetch of %d files (%s) with %d workers\n", len(targets), formatPrefetchBytes(totalBytes), workers)
+	reportPullProgress(report, cclient.ProgressEvent{
+		Status:          "prefetching",
+		Artifact:        imageName,
+		Blob:            "rootfs.contents",
+		BytesDownloaded: 0,
+		BytesTotal:      int64(totalBytes),
+	})
+	if err := os.MkdirAll(filepath.Dir(contentsPath), 0o755); err != nil {
+		return nil, err
+	}
+	tmpPath := contentsPath + ".tmp"
+	if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	contentsFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = contentsFile.Close()
+		_ = os.Remove(tmpPath)
+	}()
+	if totalBytes > 0 {
+		if err := contentsFile.Truncate(int64(totalBytes)); err != nil {
+			return nil, err
+		}
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	workCh := make(chan prefetchTarget)
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+	var completedFiles atomic.Uint64
+	var completedBytes atomic.Uint64
+
+	progressDone := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		defer close(progressDone)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				logPrefetchProgress(startedAt, len(targets), totalBytes, completedFiles.Load(), completedBytes.Load())
+				reportPrefetchProgress(report, imageName, startedAt, totalBytes, completedBytes.Load())
+			}
+		}
+	}()
+
+	worker := func() {
+		defer wg.Done()
+		for target := range workCh {
+			written, err := client.WriteFileTo(target.target, io.NewOffsetWriter(contentsFile, int64(target.offset)))
+			if err == nil && written != target.size {
+				err = fmt.Errorf("packed %q wrote %d bytes, want %d", target.target, written, target.size)
+			}
+			if err != nil {
+				select {
+				case errCh <- fmt.Errorf("pack %q: %w", target.target, err):
+				default:
+				}
+				cancel()
+				return
+			}
+			completedFiles.Add(1)
+			completedBytes.Add(written)
+		}
+	}
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go worker()
+	}
+
+sendLoop:
+	for _, target := range targets {
+		select {
+		case <-ctx.Done():
+			break sendLoop
+		case workCh <- target:
+		}
+	}
+	close(workCh)
+	wg.Wait()
+	cancel()
+	<-progressDone
+
+	select {
+	case err := <-errCh:
+		logPrefetchProgress(startedAt, len(targets), totalBytes, completedFiles.Load(), completedBytes.Load())
+		reportPrefetchProgress(report, imageName, startedAt, totalBytes, completedBytes.Load())
+		return nil, err
+	default:
+		logPrefetchProgress(startedAt, len(targets), totalBytes, completedFiles.Load(), completedBytes.Load())
+		reportPrefetchProgress(report, imageName, startedAt, totalBytes, completedBytes.Load())
+		fmt.Fprintf(os.Stderr, "ccx3-prefetch: completed in %s\n", time.Since(startedAt).Round(time.Second))
+		if err := contentsFile.Close(); err != nil {
+			return nil, err
+		}
+		if err := os.Rename(tmpPath, contentsPath); err != nil {
+			return nil, err
+		}
+		reportPullProgress(report, cclient.ProgressEvent{
+			Status:          "downloaded",
+			Artifact:        imageName,
+			Blob:            filepath.Base(contentsPath),
+			BytesDownloaded: int64(totalBytes),
+			BytesTotal:      int64(totalBytes),
+			Progress:        1,
+		})
+		return packedNodes, nil
+	}
+}
+
+func reportPrefetchProgress(report func(cclient.ProgressEvent), imageName string, startedAt time.Time, totalBytes, completedBytes uint64) {
+	if report == nil {
+		return
+	}
+	elapsed := time.Since(startedAt)
+	if elapsed <= 0 {
+		elapsed = time.Second
+	}
+	rate := float64(completedBytes) / elapsed.Seconds()
+	remainingBytes := uint64(0)
+	if totalBytes > completedBytes {
+		remainingBytes = totalBytes - completedBytes
+	}
+	etaSeconds := 0.0
+	if remainingBytes > 0 && rate > 0 {
+		etaSeconds = float64(remainingBytes) / rate
+	}
+	progress := 0.0
+	if totalBytes > 0 {
+		progress = float64(completedBytes) / float64(totalBytes)
+	}
+	reportPullProgress(report, cclient.ProgressEvent{
+		Status:             "downloading",
+		Artifact:           imageName,
+		Blob:               "rootfs.contents",
+		Progress:           progress,
+		BytesDownloaded:    int64(completedBytes),
+		BytesTotal:         int64(totalBytes),
+		RateBytesPerSecond: rate,
+		ETASeconds:         etaSeconds,
+	})
+}
+
+func logPrefetchProgress(startedAt time.Time, totalFiles int, totalBytes, completedFiles, completedBytes uint64) {
+	elapsed := time.Since(startedAt)
+	if elapsed <= 0 {
+		elapsed = time.Second
+	}
+
+	rate := float64(completedBytes) / elapsed.Seconds()
+	remainingBytes := uint64(0)
+	if totalBytes > completedBytes {
+		remainingBytes = totalBytes - completedBytes
+	}
+
+	eta := "unknown"
+	if remainingBytes == 0 {
+		eta = "0s"
+	} else if rate > 0 {
+		eta = (time.Duration(float64(remainingBytes)/rate) * time.Second).Round(time.Second).String()
+	}
+
+	fmt.Fprintf(
+		os.Stderr,
+		"ccx3-prefetch: %d/%d files, %s/%s, rate %s/s, eta %s\n",
+		completedFiles,
+		totalFiles,
+		formatPrefetchBytes(completedBytes),
+		formatPrefetchBytes(totalBytes),
+		formatPrefetchBytes(uint64(rate)),
+		eta,
+	)
+}
+
+func formatPrefetchBytes(bytes uint64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := uint64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
 
 func cvmfsIndexCacheKey(rootHash, rootTarget string) string {

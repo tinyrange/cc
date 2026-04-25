@@ -574,6 +574,42 @@ func TestCVMFSDirectoryIndexCacheRoundTrips(t *testing.T) {
 	}
 }
 
+func TestBuildCVMFSIndexedRootFSReadsPackedContents(t *testing.T) {
+	contentsPath := filepath.Join(t.TempDir(), "rootfs.contents")
+	payload := []byte("hello world")
+	if err := os.WriteFile(contentsPath, payload, 0o644); err != nil {
+		t.Fatalf("WriteFile(contents) error = %v", err)
+	}
+	nodes := []indexedNode{
+		{Path: "/", Kind: indexedKindDir, Mode: fsmeta.LinuxModeFromFileMode(fs.ModeDir | 0o755)},
+		{Path: "/bin", Kind: indexedKindDir, Mode: fsmeta.LinuxModeFromFileMode(fs.ModeDir | 0o755)},
+		{
+			Path:         "/bin/sh",
+			Kind:         indexedKindFile,
+			Mode:         fsmeta.LinuxModeFromFileMode(0o755),
+			Size:         uint64(len(payload)),
+			CVMFSTarget:  "https://example.invalid/cvmfs/test.repo/bin/sh",
+			Packed:       true,
+			PackedOffset: 0,
+		},
+	}
+	rootFS, err := buildCVMFSIndexedRootFS(nil, contentsPath, nodes)
+	if err != nil {
+		t.Fatalf("buildCVMFSIndexedRootFS() error = %v", err)
+	}
+	entry, err := imagefs.LookupPath(rootFS, "/bin/sh")
+	if err != nil {
+		t.Fatalf("LookupPath(/bin/sh) error = %v", err)
+	}
+	data, err := entry.File.ReadAt(0, 64)
+	if err != nil {
+		t.Fatalf("ReadAt(/bin/sh) error = %v", err)
+	}
+	if string(data) != string(payload) {
+		t.Fatalf("/bin/sh = %q, want %q", string(data), string(payload))
+	}
+}
+
 func TestStorePullRefreshesDirectoryBackedCVMFSWhenManifestChanges(t *testing.T) {
 	sharedCache := t.TempDir()
 	if err := os.Setenv(sharedCacheEnv, sharedCache); err != nil {

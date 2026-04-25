@@ -224,7 +224,48 @@ func newMux(srvState *server, httpServer *http.Server) *http.ServeMux {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		state, err := srvState.images.Pull(r.Context(), imageName, source)
+		if wantsProgressStream(r) {
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			w.WriteHeader(http.StatusOK)
+			enc := json.NewEncoder(w)
+			flusher, _ := w.(http.Flusher)
+			events := make(chan client.ProgressEvent, 128)
+			go func() {
+				defer close(events)
+				_, err := srvState.images.Pull(r.Context(), imageName, source, oci.PullOptions{
+					Prefetch:        req.Prefetch,
+					PrefetchWorkers: req.PrefetchWorkers,
+					Report: func(event client.ProgressEvent) {
+						if event.Artifact == "" {
+							event.Artifact = imageName
+						}
+						select {
+						case events <- event:
+						case <-r.Context().Done():
+						}
+					},
+				})
+				if err != nil {
+					select {
+					case events <- client.ProgressEvent{Status: "error", Artifact: imageName, Error: err.Error()}:
+					case <-r.Context().Done():
+					}
+				}
+			}()
+			for event := range events {
+				if err := enc.Encode(event); err != nil {
+					return
+				}
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+			return
+		}
+		state, err := srvState.images.Pull(r.Context(), imageName, source, oci.PullOptions{
+			Prefetch:        req.Prefetch,
+			PrefetchWorkers: req.PrefetchWorkers,
+		})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return

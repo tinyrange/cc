@@ -153,6 +153,8 @@ jobs:
           uv run pyneurodesk-fulltest \
             --recipe "$recipe" \
             --work-dir "$work_dir" \
+            --prefetch \
+            --prefetch-workers 4 \
             2>&1 | tee "../fulltest-results/${SUITE}.log"
 
       - name: Upload fulltest log

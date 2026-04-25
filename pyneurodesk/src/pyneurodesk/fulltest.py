@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
@@ -21,7 +21,7 @@ from .api import (
     start_container_daemon,
 )
 from .client import PyNeurodeskClient
-from .models import ContainerReference, ImageSource
+from .models import ContainerReference, ImageSource, ImportImageRequest
 from . import shell as shell_hooks
 
 
@@ -75,6 +75,8 @@ class Options:
     mirror: str = DEFAULT_CVMFS_MIRROR
     repo: str = DEFAULT_CVMFS_REPO
     cache_dir: Optional[str] = None
+    prefetch: bool = False
+    prefetch_workers: Optional[int] = None
     memory_mb: Optional[int] = DEFAULT_FULLTEST_MEMORY_MB
     cpus: Optional[int] = None
 
@@ -138,13 +140,16 @@ class FullTestRunner:
             print(f"[fulltest] suite={suite.name} tests={len(selected_tests)} work_dir={work_dir}", flush=True)
             memory_text = f" memory={options.memory_mb}MiB" if options.memory_mb is not None else ""
             cpu_text = f" cpus={options.cpus}" if options.cpus is not None else ""
+            print(f"[fulltest] importing image={reference.image} source={reference.path}", flush=True)
+            stream_import_image(client, reference, options)
             print(f"[fulltest] activating shell hooks", flush=True)
             shell_session = activate_shell_session(
                 daemon_base_url=daemon.base_url,
                 work_dir=work_dir,
             )
             print(f"[fulltest] loading image={reference.image} source={reference.path}{memory_text}{cpu_text}", flush=True)
-            output, exit_code = shell_session.run(load_command(reference, suite, options), timeout_for(120, suite.default_timeout))
+            load_options = replace(options, prefetch=False, prefetch_workers=None)
+            output, exit_code = shell_session.run(load_command(reference, suite, load_options), timeout_for(120, suite.default_timeout))
             if exit_code != 0:
                 raise RuntimeError(f"shell hook load failed with exit code {exit_code}: {output}")
             print(f"[fulltest] shell hooks ready image={reference.image}{memory_text}{cpu_text}", flush=True)
@@ -489,6 +494,10 @@ def load_command(reference: ContainerReference, suite: Suite, options: Options) 
         words.extend(["--command", command])
     if reference.cache_dir:
         words.extend(["--cache-dir", reference.cache_dir])
+    if options.prefetch:
+        words.append("--prefetch")
+    if options.prefetch_workers is not None:
+        words.extend(["--prefetch-workers", str(options.prefetch_workers)])
     if options.memory_mb is not None:
         words.extend(["--memory-mb", str(options.memory_mb)])
     if options.cpus is not None:
@@ -564,6 +573,74 @@ def _import_nibabel() -> Any:
     return nib
 
 
+def stream_import_image(client: PyNeurodeskClient, reference: ContainerReference, options: Options) -> None:
+    last_line = ""
+    for event in client.import_image_stream(
+        reference.image,
+        ImportImageRequest(
+            source=reference.source,
+            cache_dir=reference.cache_dir,
+            prefetch=options.prefetch,
+            prefetch_workers=options.prefetch_workers,
+        ),
+    ):
+        status = event.status
+        if status == "error":
+            raise RuntimeError(event.error or f"image import failed for {reference.image}")
+        line = format_import_progress_line(reference.image, event)
+        if line and line != last_line:
+            print(line, flush=True)
+            last_line = line
+
+
+def format_import_progress_line(image_name: str, event: Any) -> str:
+    status = getattr(event, "status", "") or "preparing"
+    artifact = getattr(event, "artifact", None) or image_name
+    blob = getattr(event, "blob", None)
+    downloaded = getattr(event, "bytes_downloaded", None)
+    total_bytes = getattr(event, "bytes_total", None)
+    rate = getattr(event, "rate_bytes_per_second", None)
+    eta = getattr(event, "eta_seconds", None)
+
+    parts = [f"[fulltest] pull {artifact}", status]
+    if blob:
+        parts.append(str(blob))
+    if isinstance(downloaded, int) and downloaded >= 0:
+        if isinstance(total_bytes, int) and total_bytes > 0:
+            parts.append(f"{format_byte_size(downloaded)}/{format_byte_size(total_bytes)}")
+        else:
+            parts.append(format_byte_size(downloaded))
+    if isinstance(rate, (int, float)) and rate > 0:
+        parts.append(f"{format_byte_size(float(rate))}/s")
+    if isinstance(eta, (int, float)) and eta > 0:
+        parts.append(f"ETA {format_duration(float(eta))}")
+    return " | ".join(parts)
+
+
+def format_byte_size(value: float) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    size = float(value)
+    unit = units[0]
+    for unit in units:
+        if abs(size) < 1024.0 or unit == units[-1]:
+            break
+        size /= 1024.0
+    if unit == "B":
+        return f"{int(size)} {unit}"
+    return f"{size:.1f} {unit}"
+
+
+def format_duration(seconds: float) -> str:
+    remaining = max(0, int(round(seconds)))
+    minutes, sec = divmod(remaining, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{sec:02d}s"
+    if minutes:
+        return f"{minutes}m{sec:02d}s"
+    return f"{sec}s"
+
+
 def print_summary(result: RunResult) -> int:
     passed = sum(1 for item in result.results if item.passed)
     failed = sum(1 for item in result.results if not item.passed and not item.skipped)
@@ -595,6 +672,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mirror", default=DEFAULT_CVMFS_MIRROR)
     parser.add_argument("--repo", default=DEFAULT_CVMFS_REPO)
     parser.add_argument("--cache-dir", default="")
+    parser.add_argument("--prefetch", action="store_true")
+    parser.add_argument("--prefetch-workers", type=int, default=4)
     parser.add_argument("--memory-mb", type=int, default=DEFAULT_FULLTEST_MEMORY_MB)
     parser.add_argument("--cpus", type=int, default=0)
     return parser
@@ -624,6 +703,8 @@ def main() -> None:
                 mirror=args.mirror,
                 repo=args.repo,
                 cache_dir=args.cache_dir or None,
+                prefetch=bool(args.prefetch),
+                prefetch_workers=(int(args.prefetch_workers or 0) or None) if args.prefetch else None,
                 memory_mb=args.memory_mb or None,
                 cpus=args.cpus or None,
             )

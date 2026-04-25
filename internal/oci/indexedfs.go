@@ -32,18 +32,20 @@ const (
 )
 
 type indexedNode struct {
-	Path        string      `json:"path"`
-	Kind        indexedKind `json:"kind"`
-	Mode        uint32      `json:"mode"`
-	UID         uint32      `json:"uid,omitempty"`
-	GID         uint32      `json:"gid,omitempty"`
-	RDev        uint32      `json:"rdev,omitempty"`
-	Size        uint64      `json:"size,omitempty"`
-	ModTimeNS   int64       `json:"mod_time_ns,omitempty"`
-	LinkTarget  string      `json:"link_target,omitempty"`
-	TarPath     string      `json:"tar_path,omitempty"`
-	TarOffset   uint64      `json:"tar_offset,omitempty"`
-	CVMFSTarget string      `json:"cvmfs_target,omitempty"`
+	Path         string      `json:"path"`
+	Kind         indexedKind `json:"kind"`
+	Mode         uint32      `json:"mode"`
+	UID          uint32      `json:"uid,omitempty"`
+	GID          uint32      `json:"gid,omitempty"`
+	RDev         uint32      `json:"rdev,omitempty"`
+	Size         uint64      `json:"size,omitempty"`
+	ModTimeNS    int64       `json:"mod_time_ns,omitempty"`
+	LinkTarget   string      `json:"link_target,omitempty"`
+	TarPath      string      `json:"tar_path,omitempty"`
+	TarOffset    uint64      `json:"tar_offset,omitempty"`
+	CVMFSTarget  string      `json:"cvmfs_target,omitempty"`
+	Packed       bool        `json:"packed,omitempty"`
+	PackedOffset uint64      `json:"packed_offset,omitempty"`
 }
 
 func encodeFSIndex(nodes map[string]*indexedNode) ([]byte, error) {
@@ -98,7 +100,7 @@ func buildIndexedRootFS(baseDir string, nodes []indexedNode) (imagefs.Directory,
 			parent.entries[name] = imagefs.Entry{Dir: dir}
 			byPath[node.Path] = dir
 		case indexedKindFile:
-			file, err := buildIndexedFile(baseDir, node, modTime, nil)
+			file, err := buildIndexedFile(baseDir, "", node, modTime, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -119,7 +121,7 @@ func buildIndexedRootFS(baseDir string, nodes []indexedNode) (imagefs.Directory,
 	return root, nil
 }
 
-func buildCVMFSIndexedRootFS(client *intcvmfs.Client, nodes []indexedNode) (imagefs.Directory, error) {
+func buildCVMFSIndexedRootFS(client *intcvmfs.Client, packedPath string, nodes []indexedNode) (imagefs.Directory, error) {
 	root := newIndexedDir("/", fs.ModeDir|0o755, 0, 0, 0, time.Unix(0, 0))
 	byPath := map[string]*indexedDir{"/": root}
 	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Path < nodes[j].Path })
@@ -148,7 +150,7 @@ func buildCVMFSIndexedRootFS(client *intcvmfs.Client, nodes []indexedNode) (imag
 			parent.entries[name] = imagefs.Entry{Dir: dir}
 			byPath[node.Path] = dir
 		case indexedKindFile:
-			file, err := buildIndexedFile("", node, modTime, client)
+			file, err := buildIndexedFile("", packedPath, node, modTime, client)
 			if err != nil {
 				return nil, err
 			}
@@ -169,7 +171,22 @@ func buildCVMFSIndexedRootFS(client *intcvmfs.Client, nodes []indexedNode) (imag
 	return root, nil
 }
 
-func buildIndexedFile(baseDir string, node indexedNode, modTime time.Time, cvmfsClient *intcvmfs.Client) (imagefs.File, error) {
+func buildIndexedFile(baseDir string, packedPath string, node indexedNode, modTime time.Time, cvmfsClient *intcvmfs.Client) (imagefs.File, error) {
+	if node.Packed {
+		if packedPath == "" {
+			return nil, fmt.Errorf("packed path is required for %q", node.Path)
+		}
+		return &indexedPackedFile{
+			mode:         imagefsMode(node.Mode, 0o644),
+			uid:          node.UID,
+			gid:          node.GID,
+			rdev:         node.RDev,
+			size:         node.Size,
+			modTime:      modTime,
+			contentsPath: packedPath,
+			offset:       node.PackedOffset,
+		}, nil
+	}
 	if node.CVMFSTarget != "" {
 		if cvmfsClient == nil {
 			return nil, fmt.Errorf("cvmfs client is required for %q", node.Path)
@@ -262,6 +279,17 @@ type indexedFile struct {
 	tarOffset uint64
 }
 
+type indexedPackedFile struct {
+	mode         fs.FileMode
+	uid          uint32
+	gid          uint32
+	rdev         uint32
+	size         uint64
+	modTime      time.Time
+	contentsPath string
+	offset       uint64
+}
+
 type indexedCVMFSFile struct {
 	mode    fs.FileMode
 	uid     uint32
@@ -304,6 +332,38 @@ func (f *indexedFile) ReadAt(off uint64, size uint32) ([]byte, error) {
 	defer file.Close()
 	buf := make([]byte, remaining)
 	n, err := file.ReadAt(buf, int64(f.tarOffset+off))
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	return buf[:n], nil
+}
+
+func (f *indexedPackedFile) Stat() (uint64, fs.FileMode) { return f.size, f.mode }
+func (f *indexedPackedFile) ModTime() time.Time          { return f.modTime }
+func (f *indexedPackedFile) Owner() (uint32, uint32)     { return f.uid, f.gid }
+func (f *indexedPackedFile) RDev() uint32                { return f.rdev }
+func (f *indexedPackedFile) OpenReader() (io.ReaderAt, io.Closer, error) {
+	file, err := os.Open(f.contentsPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	return &offsetReaderAt{reader: file, base: f.offset}, file, nil
+}
+func (f *indexedPackedFile) ReadAt(off uint64, size uint32) ([]byte, error) {
+	if off >= f.size || size == 0 {
+		return nil, nil
+	}
+	remaining := f.size - off
+	if remaining > uint64(size) {
+		remaining = uint64(size)
+	}
+	file, err := os.Open(f.contentsPath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	buf := make([]byte, remaining)
+	n, err := file.ReadAt(buf, int64(f.offset+off))
 	if err != nil && err != io.EOF {
 		return nil, err
 	}

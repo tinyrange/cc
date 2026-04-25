@@ -70,9 +70,11 @@ type ImageState struct {
 }
 
 type PullImageRequest struct {
-	Source    string       `json:"-"`
-	SourceRef *ImageSource `json:"-"`
-	CacheDir  string       `json:"cache_dir,omitempty"`
+	Source          string       `json:"-"`
+	SourceRef       *ImageSource `json:"-"`
+	CacheDir        string       `json:"cache_dir,omitempty"`
+	Prefetch        bool         `json:"prefetch,omitempty"`
+	PrefetchWorkers int          `json:"prefetch_workers,omitempty"`
 }
 
 type ImageSource struct {
@@ -130,13 +132,21 @@ func (r PullImageRequest) MarshalJSON() ([]byte, error) {
 	if r.CacheDir != "" {
 		payload["cache_dir"] = r.CacheDir
 	}
+	if r.Prefetch {
+		payload["prefetch"] = true
+	}
+	if r.PrefetchWorkers > 0 {
+		payload["prefetch_workers"] = r.PrefetchWorkers
+	}
 	return json.Marshal(payload)
 }
 
 func (r *PullImageRequest) UnmarshalJSON(data []byte) error {
 	var raw struct {
-		Source   json.RawMessage `json:"source"`
-		CacheDir string          `json:"cache_dir,omitempty"`
+		Source          json.RawMessage `json:"source"`
+		CacheDir        string          `json:"cache_dir,omitempty"`
+		Prefetch        bool            `json:"prefetch,omitempty"`
+		PrefetchWorkers int             `json:"prefetch_workers,omitempty"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
@@ -144,6 +154,8 @@ func (r *PullImageRequest) UnmarshalJSON(data []byte) error {
 	r.Source = ""
 	r.SourceRef = nil
 	r.CacheDir = raw.CacheDir
+	r.Prefetch = raw.Prefetch
+	r.PrefetchWorkers = raw.PrefetchWorkers
 	if len(raw.Source) == 0 || string(raw.Source) == "null" {
 		return nil
 	}

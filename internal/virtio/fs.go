@@ -37,6 +37,7 @@ const (
 	fuseOpenOutSize    = 16
 	fuseInitOutSize    = 40
 	fuseStatfsOutSize  = 80
+	fuseStatxOutSize   = 288
 	fuseDirentBaseSize = 24
 	fuseWriteOutSize   = 8
 )
@@ -67,9 +68,11 @@ const (
 	fuseAccess     = 34
 	fuseCreate     = 35
 	fuseDestroy    = 38
+	fuseIoctl      = 39
 	fusePoll       = 40
 	fuseLseek      = 46
 	fuseSyncFS     = 50
+	fuseStatx      = 52
 )
 
 const (
@@ -100,6 +103,10 @@ const (
 const (
 	fuseOpenKeepCache = 1 << 1
 	fuseOpenCacheDir  = 1 << 3
+)
+
+const (
+	statxBasicStats = 0x000007ff
 )
 
 const (
@@ -836,10 +843,26 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 		binary.LittleEndian.PutUint32(extra[44:48], uint32(namelen))
 		binary.LittleEndian.PutUint32(extra[48:52], uint32(frsize))
 		return reply(0, extra), nil
+	case fuseStatx:
+		if len(req) < fuseInHeaderSize+24 {
+			return nil, fmt.Errorf("virtio-fs STATX too short")
+		}
+		f.logPathf("statx", nodeID, fmt.Sprintf(" mask=%#x", binary.LittleEndian.Uint32(req[60:64])))
+		attr, errno := f.backend.GetAttr(nodeID)
+		if errno != 0 {
+			return reply(errno, nil), nil
+		}
+		extra := make([]byte, fuseStatxOutSize)
+		binary.LittleEndian.PutUint64(extra[0:8], 1)
+		encodeFuseStatx(extra[32:], attr)
+		return reply(0, extra), nil
 	case fuseSyncFS:
 		return reply(0, nil), nil
 	case fuseDestroy:
 		return reply(0, nil), nil
+	case fuseIoctl:
+		f.logPathf("ioctl", nodeID, "")
+		return reply(-linuxENOTTY, nil), nil
 	case fuseCreate:
 		if len(req) < fuseInHeaderSize+16 {
 			return nil, fmt.Errorf("virtio-fs CREATE too short")
@@ -921,12 +944,16 @@ func fuseOpcodeName(opcode uint32) string {
 		return "CREATE"
 	case fuseDestroy:
 		return "DESTROY"
+	case fuseIoctl:
+		return "IOCTL"
 	case fusePoll:
 		return "POLL"
 	case fuseLseek:
 		return "LSEEK"
 	case fuseSyncFS:
 		return "SYNCFS"
+	case fuseStatx:
+		return "STATX"
 	default:
 		return "UNKNOWN"
 	}
@@ -1057,6 +1084,30 @@ func encodeFuseAttr(dst []byte, attr FuseAttr) {
 	binary.LittleEndian.PutUint32(dst[84:88], attr.Flags)
 }
 
+func encodeFuseStatx(dst []byte, attr FuseAttr) {
+	blkSize := attr.BlkSize
+	if blkSize == 0 {
+		blkSize = 4096
+	}
+	binary.LittleEndian.PutUint32(dst[0:4], statxBasicStats)
+	binary.LittleEndian.PutUint32(dst[4:8], blkSize)
+	binary.LittleEndian.PutUint32(dst[16:20], attr.NLink)
+	binary.LittleEndian.PutUint32(dst[20:24], attr.UID)
+	binary.LittleEndian.PutUint32(dst[24:28], attr.GID)
+	binary.LittleEndian.PutUint16(dst[28:30], uint16(attr.Mode))
+	binary.LittleEndian.PutUint64(dst[32:40], attr.Ino)
+	binary.LittleEndian.PutUint64(dst[40:48], attr.Size)
+	binary.LittleEndian.PutUint64(dst[48:56], attr.Blocks)
+	encodeFuseStatxTime(dst[64:80], attr.ATimeSec, attr.ATimeNsec)
+	encodeFuseStatxTime(dst[96:112], attr.CTimeSec, attr.CTimeNsec)
+	encodeFuseStatxTime(dst[112:128], attr.MTimeSec, attr.MTimeNsec)
+}
+
+func encodeFuseStatxTime(dst []byte, sec uint64, nsec uint32) {
+	binary.LittleEndian.PutUint64(dst[0:8], sec)
+	binary.LittleEndian.PutUint32(dst[8:12], nsec)
+}
+
 func readCStringName(buf []byte) string {
 	if i := bytesIndexByte(buf, 0); i >= 0 {
 		buf = buf[:i]
@@ -1120,6 +1171,7 @@ type imageNode struct {
 	size          uint64
 	symlinkTarget string
 	entries       map[string]uint64
+	entriesDone   bool
 	modTime       time.Time
 	abstractFile  imagefs.File
 	abstractDir   imagefs.Directory
@@ -1915,7 +1967,7 @@ func (p *imageFS) OpenDir(nodeID uint64, _ uint32) (uint64, int32) {
 	if !node.isDir() {
 		return 0, -linuxENOTDIR
 	}
-	if node.abstractDir != nil && len(node.entries) == 0 {
+	if node.abstractDir != nil && !node.entriesDone {
 		if _, errno := p.materializeDirEntriesLocked(node); errno != 0 {
 			return 0, errno
 		}
@@ -2191,6 +2243,7 @@ func (p *imageFS) materializeDirEntriesLocked(node *imageNode) ([]imagefs.DirEnt
 			return nil, errno
 		}
 	}
+	node.entriesDone = true
 	return ents, 0
 }
 
@@ -2224,6 +2277,7 @@ const (
 	linuxENOTDIR   int32 = 20
 	linuxEISDIR    int32 = 21
 	linuxEINVAL    int32 = 22
+	linuxENOTTY    int32 = 25
 	linuxERANGE    int32 = 34
 	linuxENOSYS    int32 = 38
 	linuxENOTEMPTY int32 = 39

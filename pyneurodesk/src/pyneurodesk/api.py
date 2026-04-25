@@ -390,6 +390,8 @@ def container(
     mirror: str = DEFAULT_CVMFS_MIRROR,
     repo: str = DEFAULT_CVMFS_REPO,
     cache_dir: Optional[str] = None,
+    prefetch: bool = False,
+    prefetch_workers: int = 4,
     progress: bool = True,
     debug: bool = False,
 ) -> NeurodeskContainer:
@@ -428,7 +430,12 @@ def container(
             reporter.update(6, f"Importing {Path(reference.path).name}")
             active_client.import_image(
                 reference.image,
-                ImportImageRequest(source=reference.source, cache_dir=reference.cache_dir),
+                ImportImageRequest(
+                    source=reference.source,
+                    cache_dir=reference.cache_dir,
+                    prefetch=prefetch,
+                    prefetch_workers=prefetch_workers if prefetch else None,
+                ),
             )
         else:
             reporter.update(6, f"Image {reference.image} is already cached")

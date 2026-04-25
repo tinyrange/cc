@@ -69,6 +69,9 @@ func VirtioFSCommandLineArgs(fsdevs []*virtio.FS) []string {
 
 func newFSDevice(base uint64, irq uint32, tag string, backend virtio.FSBackend, trace io.Writer) *virtio.FS {
 	fsdev := virtio.NewFS(base, RootFSSize, irq, tag, backend)
+	if trace == nil && strings.TrimSpace(os.Getenv("CCX3_DEBUG_VIRTIOFS")) != "" {
+		trace = os.Stderr
+	}
 	fsdev.Log = trace
 	fsdev.Strict = true
 	return fsdev

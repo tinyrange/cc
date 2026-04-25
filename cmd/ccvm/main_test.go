@@ -310,6 +310,43 @@ func TestPostImageImportsDirectoryBackedCVMFSContainer(t *testing.T) {
 	}
 }
 
+func TestPostImageStreamsProgressForDirectoryBackedCVMFSContainer(t *testing.T) {
+	repoServer := newHTTPDirectoryRepoServer(t)
+	srv := &server{images: oci.NewStore(t.TempDir())}
+	mux := newMux(srv, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/image/niimath?stream=1", strings.NewReader(`{
+		"source": {
+			"type": "cvmfs",
+			"mirror": "`+repoServer.URL+`/cvmfs",
+			"repo": "test.repo",
+			"path": "/containers/niimath_1.0.20250804_20251016"
+		},
+		"prefetch": true,
+		"prefetch_workers": 2
+	}`))
+	req.Header.Set("Accept", "application/x-ndjson")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /image/niimath?stream=1 status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/x-ndjson" {
+		t.Fatalf("Content-Type = %q, want application/x-ndjson", got)
+	}
+	lines := strings.Split(strings.TrimSpace(rec.Body.String()), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("streamed event line count = %d, want at least 2", len(lines))
+	}
+	var last client.ProgressEvent
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &last); err != nil {
+		t.Fatalf("Unmarshal(last progress event) error = %v", err)
+	}
+	if last.Status != "downloaded" {
+		t.Fatalf("last progress event = %#v", last)
+	}
+}
+
 func newHTTPTestRepoServer(t *testing.T) *httptest.Server {
 	t.Helper()
 

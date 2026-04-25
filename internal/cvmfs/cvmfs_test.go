@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -320,6 +321,95 @@ func TestChunkedFileUsesCachedCompressedChunks(t *testing.T) {
 	}
 	if string(data) != "hello chunked world" {
 		t.Fatalf("cached ReadFile(chunked) = %q", string(data))
+	}
+}
+
+func TestPrefetchFilePopulatesFileCacheWithoutDataObjectCache(t *testing.T) {
+	t.Parallel()
+
+	server := newTestRepoServer(t)
+	cacheDir := t.TempDir()
+	client := &Client{
+		HTTPClient: server.Client(),
+		CacheDir:   cacheDir,
+	}
+
+	target := server.URL + "/cvmfs/test.repo/containers/niimath/niimath"
+	size, err := client.PrefetchFile(target)
+	if err != nil {
+		t.Fatalf("PrefetchFile() error = %v", err)
+	}
+	if size != uint64(len("niimath-data")) {
+		t.Fatalf("PrefetchFile() size = %d", size)
+	}
+
+	parsed, err := ParseTarget(target)
+	if err != nil {
+		t.Fatalf("ParseTarget() error = %v", err)
+	}
+	fileCachePath := cvmfsFileCachePath(cacheDir, parsed.Repo, parsed.Path)
+	if _, err := os.Stat(fileCachePath); err != nil {
+		t.Fatalf("Stat(file cache %q) error = %v", fileCachePath, err)
+	}
+
+	fileHash := strings.Repeat("3", 40)
+	if _, err := os.Stat(CVMFSObjectCachePath(cacheDir, fileHash, "")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected no data object cache entry, got err = %v", err)
+	}
+
+	server.Close()
+
+	data, err := client.ReadFile(target)
+	if err != nil {
+		t.Fatalf("ReadFile() using prefetched file cache error = %v", err)
+	}
+	if string(data) != "niimath-data" {
+		t.Fatalf("ReadFile() = %q", string(data))
+	}
+}
+
+func TestPrefetchChunkedFilePopulatesFileCacheWithoutChunkObjectCache(t *testing.T) {
+	t.Parallel()
+
+	server := newTestRepoServer(t)
+	cacheDir := t.TempDir()
+	client := &Client{
+		HTTPClient: server.Client(),
+		CacheDir:   cacheDir,
+	}
+
+	target := server.URL + "/cvmfs/test.repo/chunked.txt"
+	size, err := client.PrefetchFile(target)
+	if err != nil {
+		t.Fatalf("PrefetchFile(chunked) error = %v", err)
+	}
+	if size != uint64(len("hello chunked world")) {
+		t.Fatalf("PrefetchFile(chunked) size = %d", size)
+	}
+
+	parsed, err := ParseTarget(target)
+	if err != nil {
+		t.Fatalf("ParseTarget() error = %v", err)
+	}
+	fileCachePath := cvmfsFileCachePath(cacheDir, parsed.Repo, parsed.Path)
+	if _, err := os.Stat(fileCachePath); err != nil {
+		t.Fatalf("Stat(file cache %q) error = %v", fileCachePath, err)
+	}
+
+	for _, hash := range []string{strings.Repeat("4", 40), strings.Repeat("5", 40)} {
+		if _, err := os.Stat(CVMFSObjectCachePath(cacheDir, hash, "P")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("expected no chunk object cache entry for %s, got err = %v", hash, err)
+		}
+	}
+
+	server.Close()
+
+	data, err := client.ReadFile(target)
+	if err != nil {
+		t.Fatalf("ReadFile(chunked) using prefetched file cache error = %v", err)
+	}
+	if string(data) != "hello chunked world" {
+		t.Fatalf("ReadFile(chunked) = %q", string(data))
 	}
 }
 

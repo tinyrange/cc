@@ -48,11 +48,17 @@ class ImageSource:
 class ImportImageRequest:
     source: ImageSource
     cache_dir: Optional[str] = None
+    prefetch: bool = False
+    prefetch_workers: Optional[int] = None
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {"source": self.source.to_payload()}
         if self.cache_dir is not None:
             payload["cache_dir"] = self.cache_dir
+        if self.prefetch:
+            payload["prefetch"] = True
+        if self.prefetch_workers is not None:
+            payload["prefetch_workers"] = self.prefetch_workers
         return payload
 
     @classmethod
@@ -63,6 +69,8 @@ class ImportImageRequest:
         repo: str,
         path: str,
         cache_dir: Optional[str] = None,
+        prefetch: bool = False,
+        prefetch_workers: Optional[int] = None,
     ) -> "ImportImageRequest":
         return cls(
             source=ImageSource(
@@ -72,6 +80,8 @@ class ImportImageRequest:
                 path=path,
             ),
             cache_dir=cache_dir,
+            prefetch=prefetch,
+            prefetch_workers=prefetch_workers,
         )
 
 
@@ -115,6 +125,7 @@ class KernelState:
 class DownloadProgress:
     status: str
     artifact: Optional[str] = None
+    blob: Optional[str] = None
     progress: Optional[float] = None
     bytes_downloaded: Optional[int] = None
     bytes_total: Optional[int] = None
@@ -127,6 +138,7 @@ class DownloadProgress:
         return cls(
             status=payload["status"],
             artifact=payload.get("artifact"),
+            blob=payload.get("blob"),
             progress=payload.get("progress"),
             bytes_downloaded=payload.get("bytes_downloaded"),
             bytes_total=payload.get("bytes_total"),

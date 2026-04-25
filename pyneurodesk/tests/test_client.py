@@ -1497,6 +1497,47 @@ def test_download_kernel_stream_parses_progress_events() -> None:
     assert events[1].bytes_downloaded == 4096
 
 
+def test_import_image_stream_parses_progress_events() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/image/niimath"
+        assert request.url.params.get("stream") == "1"
+        assert request.headers["Accept"] == "application/x-ndjson"
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/x-ndjson"},
+            content=(
+                b'{"status":"indexing","artifact":"niimath","blob":"abc123"}\n'
+                b'{"status":"downloading","artifact":"niimath","blob":"rootfs.contents","bytes_downloaded":1024,'
+                b'"bytes_total":4096,"rate_bytes_per_second":512,"eta_seconds":6}\n'
+                b'{"status":"downloaded","artifact":"niimath","blob":"rootfs.contents","bytes_downloaded":4096,'
+                b'"bytes_total":4096,"progress":1}\n'
+            ),
+        )
+
+    client = make_client(httpx.MockTransport(handler))
+    try:
+        events = list(
+            client.import_image_stream(
+                "niimath",
+                ImportImageRequest.from_cvmfs_container(
+                    mirror="https://cvmfs.neurodesk.org",
+                    repo="neurodesk.ardc.edu.au",
+                    path="/containers/niimath_1.0.20250804_20251016",
+                    prefetch=True,
+                    prefetch_workers=4,
+                ),
+            )
+        )
+    finally:
+        client.close()
+
+    assert [event.status for event in events] == ["indexing", "downloading", "downloaded"]
+    assert events[0].blob == "abc123"
+    assert events[1].bytes_downloaded == 1024
+    assert events[1].eta_seconds == 6
+    assert events[2].progress == 1
+
+
 def test_stream_progress_reporter_redraws_on_single_terminal_line() -> None:
     stream = io.StringIO()
     reporter = StreamProgressReporter(total_steps=4, stream=stream)

@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -76,6 +77,9 @@ type Client struct {
 	HTTPClient   *http.Client
 	CacheDir     string
 	TraceLogPath string
+
+	mu    sync.Mutex
+	repos map[string]*repository
 }
 
 type traceEvent struct {
@@ -280,6 +284,79 @@ func (c *Client) ReadFile(target string) ([]byte, error) {
 	return data, nil
 }
 
+func (c *Client) PrefetchFile(target string) (uint64, error) {
+	id, started := c.traceStart("PrefetchFile", target, "", "")
+	parsed, err := ParseTarget(target)
+	if err != nil {
+		c.traceDone(id, started, "PrefetchFile", target, "", "", 0, 0, err)
+		return 0, err
+	}
+	if !parsed.Remote {
+		info, err := os.Stat(parsed.LocalPath)
+		if err != nil {
+			c.traceDone(id, started, "PrefetchFile", target, "", parsed.LocalPath, 0, 0, err)
+			return 0, err
+		}
+		if info.IsDir() {
+			err := fmt.Errorf("%q is a directory", parsed.LocalPath)
+			c.traceDone(id, started, "PrefetchFile", target, "", parsed.LocalPath, 0, 0, err)
+			return 0, err
+		}
+		c.traceDone(id, started, "PrefetchFile", target, "", parsed.LocalPath, int(info.Size()), 0, nil)
+		return uint64(info.Size()), nil
+	}
+	cachePath := cvmfsFileCachePath(c.CacheDir, parsed.Repo, parsed.Path)
+	if info, err := os.Stat(cachePath); err == nil {
+		c.traceDone(id, started, "PrefetchFile", target, "", cachePath, int(info.Size()), 0, nil)
+		return uint64(info.Size()), nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		c.traceDone(id, started, "PrefetchFile", target, "", cachePath, 0, 0, err)
+		return 0, err
+	}
+	repo := c.newRepository(parsed)
+	size, err := repo.PrefetchFile(parsed.Path)
+	if err != nil {
+		c.traceDone(id, started, "PrefetchFile", target, "", cachePath, 0, 0, err)
+		return 0, err
+	}
+	c.traceDone(id, started, "PrefetchFile", target, "", cachePath, int(size), 0, nil)
+	return size, nil
+}
+
+func (c *Client) WriteFileTo(target string, dst io.Writer) (uint64, error) {
+	id, started := c.traceStart("WriteFileTo", target, "", "")
+	parsed, err := ParseTarget(target)
+	if err != nil {
+		c.traceDone(id, started, "WriteFileTo", target, "", "", 0, 0, err)
+		return 0, err
+	}
+	if !parsed.Remote {
+		file, err := os.Open(parsed.LocalPath)
+		if err != nil {
+			c.traceDone(id, started, "WriteFileTo", target, "", parsed.LocalPath, 0, 0, err)
+			return 0, err
+		}
+		defer file.Close()
+		n, err := io.Copy(dst, file)
+		c.traceDone(id, started, "WriteFileTo", target, "", parsed.LocalPath, int(n), 0, err)
+		return uint64(n), err
+	}
+	cachePath := cvmfsFileCachePath(c.CacheDir, parsed.Repo, parsed.Path)
+	if file, err := os.Open(cachePath); err == nil {
+		defer file.Close()
+		n, err := io.Copy(dst, file)
+		c.traceDone(id, started, "WriteFileTo", target, "", cachePath, int(n), 0, err)
+		return uint64(n), err
+	} else if !errors.Is(err, os.ErrNotExist) {
+		c.traceDone(id, started, "WriteFileTo", target, "", cachePath, 0, 0, err)
+		return 0, err
+	}
+	repo := c.newRepository(parsed)
+	n, err := repo.WriteFileTo(parsed.Path, dst)
+	c.traceDone(id, started, "WriteFileTo", target, "", cachePath, int(n), 0, err)
+	return n, err
+}
+
 func (c *Client) ReadFileRange(target string, offset, length int64) ([]byte, bool, error) {
 	id, started := c.traceStart("ReadFileRange", target, "", "")
 	if offset < 0 {
@@ -414,16 +491,27 @@ func (c *Client) newRepository(target Target) *repository {
 	if client == nil {
 		client = NewClient()
 	}
-	httpClient := client.HTTPClient
-	if httpClient == nil {
-		httpClient = http.DefaultClient
+	mirror := strings.TrimRight(target.Mirror, "/")
+	key := mirror + "\x00" + target.Repo
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	if client.HTTPClient == nil {
+		client.HTTPClient = http.DefaultClient
 	}
-	return &repository{
-		client:   &Client{HTTPClient: httpClient, CacheDir: client.CacheDir, TraceLogPath: client.TraceLogPath},
-		mirror:   strings.TrimRight(target.Mirror, "/"),
+	if client.repos == nil {
+		client.repos = map[string]*repository{}
+	}
+	if repo := client.repos[key]; repo != nil {
+		return repo
+	}
+	repo := &repository{
+		client:   client,
+		mirror:   mirror,
 		repo:     target.Repo,
 		catalogs: map[string]*catalog{},
 	}
+	client.repos[key] = repo
+	return repo
 }
 
 func readLocalDir(dir string) ([]DirEntry, error) {
@@ -546,6 +634,46 @@ func (r *repository) ReadFile(filePath string) ([]byte, error) {
 	return r.readEntryData(*found)
 }
 
+func (r *repository) PrefetchFile(filePath string) (uint64, error) {
+	filePath = path.Clean("/" + strings.TrimPrefix(filePath, "/"))
+	found, err := r.lookupFileEntry(filePath)
+	if err != nil {
+		return 0, err
+	}
+	cachePath := cvmfsFileCachePath(r.client.CacheDir, r.repo, filePath)
+	if cachePath == "" {
+		data, err := r.readEntryData(*found)
+		if err != nil {
+			return 0, err
+		}
+		return uint64(len(data)), nil
+	}
+	if info, err := os.Stat(cachePath); err == nil {
+		return uint64(info.Size()), nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return 0, err
+	}
+	if err := writeAtomicFile(cachePath, func(dst io.Writer) error {
+		return r.streamEntryData(*found, dst, false)
+	}); err != nil {
+		return 0, err
+	}
+	return uint64(found.Size), nil
+}
+
+func (r *repository) WriteFileTo(filePath string, dst io.Writer) (uint64, error) {
+	filePath = path.Clean("/" + strings.TrimPrefix(filePath, "/"))
+	found, err := r.lookupFileEntry(filePath)
+	if err != nil {
+		return 0, err
+	}
+	counting := &countingWriter{w: dst}
+	if err := r.streamEntryData(*found, counting, false); err != nil {
+		return 0, err
+	}
+	return uint64(counting.n), nil
+}
+
 func (r *repository) Walk(rootPath string, visit func(WalkEntry) error) error {
 	rootPath = path.Clean("/" + strings.TrimPrefix(rootPath, "/"))
 	found := false
@@ -575,24 +703,136 @@ func (r *repository) Walk(rootPath string, visit func(WalkEntry) error) error {
 }
 
 func (r *repository) readEntryData(ent catalogEntry) ([]byte, error) {
+	var buf bytes.Buffer
+	if ent.Size > 0 && ent.Size <= int64(^uint(0)>>1) {
+		buf.Grow(int(ent.Size))
+	}
+	if err := r.streamEntryData(ent, &buf, true); err != nil {
+		return nil, err
+	}
+	data := buf.Bytes()
+	if int64(len(data)) > ent.Size {
+		data = data[:ent.Size]
+	}
+	return data, nil
+}
+
+func (r *repository) streamEntryData(ent catalogEntry, dst io.Writer, cacheCompressed bool) error {
 	if ent.Flags&flagExternalFile == 0 && !ent.isChunked() {
-		return r.fetchDataObject(stringifyHash(ent.Hash), false)
+		return r.streamDataObject(stringifyHash(ent.Hash), false, dst, cacheCompressed)
 	}
 	if len(ent.Chunks) == 0 {
-		return nil, fmt.Errorf("chunk metadata missing for %q", ent.FullPath)
+		return fmt.Errorf("chunk metadata missing for %q", ent.FullPath)
 	}
-	buf := make([]byte, 0, ent.Size)
+	var written int64
 	for _, chunk := range ent.Chunks {
-		data, err := r.fetchDataObject(stringifyHash(chunk.Hash), true)
-		if err != nil {
-			return nil, err
+		remaining := ent.Size - written
+		if remaining <= 0 {
+			break
 		}
-		buf = append(buf, data...)
+		chunkWriter := io.Writer(dst)
+		if chunk.Size > remaining {
+			chunkWriter = &limitedWriter{w: dst, n: remaining}
+		}
+		counting := &countingWriter{w: chunkWriter}
+		if err := r.streamDataObject(stringifyHash(chunk.Hash), true, counting, cacheCompressed); err != nil {
+			return err
+		}
+		written += counting.n
 	}
-	if int64(len(buf)) > ent.Size {
-		buf = buf[:ent.Size]
+	return nil
+}
+
+func (r *repository) streamDataObject(hash string, partial bool, dst io.Writer, cacheCompressed bool) error {
+	suffix := ""
+	if partial {
+		suffix = "P"
 	}
-	return buf, nil
+	if raw, err := r.readCachedObject(hash, suffix); err == nil {
+		zr, err := zlib.NewReader(bytes.NewReader(raw))
+		if err != nil {
+			return err
+		}
+		defer zr.Close()
+		_, err = io.Copy(dst, zr)
+		return err
+	} else if !errors.Is(err, os.ErrNotExist) && !(r.client == nil || strings.TrimSpace(r.client.CacheDir) == "") {
+		return err
+	}
+
+	url := r.objectURL(hash, suffix)
+	id, started := r.client.traceStart("HTTPObject", "", url, "")
+	resp, err := r.client.HTTPClient.Get(url)
+	if err != nil {
+		r.client.traceDone(id, started, "HTTPObject", "", url, "", 0, 0, err)
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		err := fmt.Errorf("fetch object: unexpected status %s", resp.Status)
+		r.client.traceDone(id, started, "HTTPObject", "", url, "", 0, resp.StatusCode, err)
+		return err
+	}
+
+	reader := io.Reader(resp.Body)
+	cachePath := cvmfsObjectCachePath(r.client.CacheDir, hash, suffix)
+	var cacheWriter io.WriteCloser
+	if cacheCompressed && cachePath != "" {
+		cacheFile, err := createAtomicFile(cachePath)
+		if err != nil {
+			r.client.traceDone(id, started, "HTTPObject", "", url, cachePath, 0, resp.StatusCode, err)
+			return err
+		}
+		cacheWriter = cacheFile
+		reader = io.TeeReader(resp.Body, cacheFile)
+	}
+
+	zr, err := zlib.NewReader(reader)
+	if err != nil {
+		r.client.traceDone(id, started, "HTTPObject", "", url, cachePath, 0, resp.StatusCode, err)
+		return err
+	}
+	counting := &countingWriter{w: dst}
+	_, err = io.Copy(counting, zr)
+	closeErr := zr.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if cacheWriter != nil {
+		if err == nil {
+			err = cacheWriter.Close()
+		} else {
+			_ = cacheWriter.Close()
+		}
+		cacheWriter = nil
+	}
+	r.client.traceDone(id, started, "HTTPObject", "", url, cachePath, int(counting.n), resp.StatusCode, err)
+	return err
+}
+
+func (r *repository) lookupFileEntry(filePath string) (*catalogEntry, error) {
+	var found *catalogEntry
+	err := r.walkPrefix(filePath, func(ent catalogEntry) error {
+		if ent.FullPath != filePath {
+			return nil
+		}
+		copy := ent
+		found = &copy
+		return errStopWalk
+	})
+	if err != nil && !errors.Is(err, errStopWalk) {
+		return nil, err
+	}
+	if found == nil {
+		return nil, os.ErrNotExist
+	}
+	if found.isDir() {
+		return nil, fmt.Errorf("%q is a directory", filePath)
+	}
+	if found.isSymlink() {
+		return nil, fmt.Errorf("%q is a symlink", filePath)
+	}
+	return found, nil
 }
 
 func (r *repository) walkPrefix(prefix string, visit func(ent catalogEntry) error) error {
@@ -1250,31 +1490,97 @@ func (c *Client) writeCachedFile(parsed Target, data []byte) error {
 		return nil
 	}
 	cachePath := cvmfsFileCachePath(c.CacheDir, parsed.Repo, parsed.Path)
+	return writeAtomicFile(cachePath, func(dst io.Writer) error {
+		_, err := dst.Write(data)
+		return err
+	})
+}
+
+func writeAtomicFile(cachePath string, write func(dst io.Writer) error) error {
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err != nil {
 		return fmt.Errorf("create cvmfs file cache dir: %w", err)
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(cachePath), "cvmfs-file-*")
+	tmp, err := createAtomicFile(cachePath)
 	if err != nil {
-		return fmt.Errorf("create cvmfs file cache temp file: %w", err)
+		return err
 	}
-	tmpPath := tmp.Name()
-	defer func() {
+	if err := write(tmp); err != nil {
 		_ = tmp.Close()
-		_ = os.Remove(tmpPath)
-	}()
-	if _, err := tmp.Write(data); err != nil {
 		return fmt.Errorf("write cvmfs file cache temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close cvmfs file cache temp file: %w", err)
+		return err
 	}
-	if err := os.Rename(tmpPath, cachePath); err != nil {
+	return nil
+}
+
+type atomicFile struct {
+	file       *os.File
+	targetPath string
+	closed     bool
+}
+
+func createAtomicFile(targetPath string) (*atomicFile, error) {
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		return nil, fmt.Errorf("create cvmfs cache dir: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(targetPath), "cvmfs-cache-*")
+	if err != nil {
+		return nil, fmt.Errorf("create cvmfs cache temp file: %w", err)
+	}
+	return &atomicFile{file: tmp, targetPath: targetPath}, nil
+}
+
+func (a *atomicFile) Write(p []byte) (int, error) {
+	return a.file.Write(p)
+}
+
+func (a *atomicFile) Close() error {
+	if a.closed {
+		return nil
+	}
+	a.closed = true
+	tmpPath := a.file.Name()
+	if err := a.file.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close cvmfs cache temp file: %w", err)
+	}
+	if err := os.Rename(tmpPath, a.targetPath); err != nil {
+		_ = os.Remove(tmpPath)
 		if errors.Is(err, os.ErrExist) {
 			return nil
 		}
-		return fmt.Errorf("commit cvmfs file cache: %w", err)
+		return fmt.Errorf("commit cvmfs cache: %w", err)
 	}
 	return nil
+}
+
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	w.n += int64(n)
+	return n, err
+}
+
+type limitedWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (w *limitedWriter) Write(p []byte) (int, error) {
+	if w.n <= 0 {
+		return 0, nil
+	}
+	if int64(len(p)) > w.n {
+		p = p[:w.n]
+	}
+	n, err := w.w.Write(p)
+	w.n -= int64(n)
+	return n, err
 }
 
 func (ent catalogEntry) pathHash() string {
