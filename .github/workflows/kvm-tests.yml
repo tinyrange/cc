@@ -1,0 +1,72 @@
+name: KVM tests
+
+"on":
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/kvm-tests.yml"
+      - "cmd/**"
+      - "client/**"
+      - "fixtures/**"
+      - "go.mod"
+      - "go.sum"
+      - "internal/**"
+      - "pyneurodesk/**"
+      - "tools/**"
+
+permissions:
+  contents: read
+
+jobs:
+  kvm:
+    name: Go and Python tests with KVM
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Enable runner access to /dev/kvm
+        run: |
+          set -euxo pipefail
+          if [ ! -e /dev/kvm ]; then
+            echo "/dev/kvm is not available on this runner" >&2
+            exit 1
+          fi
+          sudo chown root:kvm /dev/kvm
+          sudo chmod 0660 /dev/kvm
+          sudo usermod -aG kvm "$USER"
+          sudo setfacl -m "u:${USER}:rw" /dev/kvm || sudo chmod 0666 /dev/kvm
+          test -r /dev/kvm -a -w /dev/kvm
+          ls -l /dev/kvm
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Python tooling
+        run: python -m pip install --upgrade pip uv
+
+      - name: Run Go unit tests
+        env:
+          CCX3_KVM_BOOT: "1"
+        run: go test ./...
+
+      - name: Build ccvm for Python integration tests
+        run: |
+          mkdir -p build
+          go build -o build/ccvm ./cmd/ccvm
+
+      - name: Run Python unit tests
+        env:
+          CCX3_KVM_BOOT: "1"
+          CCX3_CCVM: ${{ github.workspace }}/build/ccvm
+          CCX3_SHELL_INTEGRATION: "1"
+        working-directory: pyneurodesk
+        run: uv run pytest
