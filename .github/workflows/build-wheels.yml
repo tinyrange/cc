@@ -82,7 +82,8 @@ jobs:
               expected = "pyneurodesk/bin/ccvm"
               if expected not in names:
                   raise SystemExit(f"{expected} was not included in {wheel.name}")
-              print(zf.read("pyneurodesk-0.1.0.dist-info/WHEEL").decode())
+              wheel_metadata = next(name for name in names if name.endswith(".dist-info/WHEEL"))
+              print(zf.read(wheel_metadata).decode())
           PY
 
       - name: Upload wheel artifact

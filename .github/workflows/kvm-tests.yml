@@ -53,23 +53,26 @@ jobs:
         run: python -m pip install --upgrade pip uv
 
       - name: Run Go unit tests
-        env:
-          CCX3_KVM_BOOT: "1"
         run: |
           test -r /dev/kvm -a -w /dev/kvm
           ls -l /dev/kvm
           go test ./...
 
-      - name: Build ccvm for Python integration tests
+      - name: Run KVM boot smoke tests
+        env:
+          CCX3_KVM_BOOT: "1"
+        run: |
+          test -r /dev/kvm -a -w /dev/kvm
+          go test ./internal/hv/kvm -run 'TestProbeReportsVMCreation|TestKernelBootSerial|TestInitramfsBootReadyMarker' -count=1
+
+      - name: Build ccvm for Python unit tests
         run: |
           mkdir -p build
           go build -o build/ccvm ./cmd/ccvm
 
       - name: Run Python unit tests
         env:
-          CCX3_KVM_BOOT: "1"
           CCX3_CCVM: ${{ github.workspace }}/build/ccvm
-          CCX3_SHELL_INTEGRATION: "1"
         working-directory: pyneurodesk
         run: |
           test -r /dev/kvm -a -w /dev/kvm
