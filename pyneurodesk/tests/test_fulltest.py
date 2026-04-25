@@ -6,8 +6,12 @@ from pyneurodesk.fulltest import (
     build_container_reference,
     cvmfs_path_from_source,
     default_recipe_path,
+    first_shell_command,
     image_cache_name,
+    infer_shell_hook_commands,
+    load_command,
     load_suite,
+    Options,
     substitute_variables,
     timeout_for,
 )
@@ -18,10 +22,11 @@ def test_load_suite_parses_niimath_recipe() -> None:
 
     assert suite.name == "niimath"
     assert suite.container == "niimath_1.0.20250804_20251016.simg"
-    assert len(suite.required_files) == 1
+    assert len(suite.required_files) == 0
     assert len(suite.tests) >= 3
     assert suite.tests[0].name == "Version check"
     assert suite.tests[0].expected_output_contains == ("niimath version",)
+    assert suite.tests[1].expected_output_contains == ("Usage: niimath",)
 
 
 def test_build_container_reference_defaults_to_cvmfs_directory() -> None:
@@ -84,3 +89,47 @@ def test_default_recipe_path_points_to_existing_recipe() -> None:
     assert recipe.is_file()
     assert recipe.name == "fulltest.yaml"
     assert recipe.parts[-2:] == ("niimath", "fulltest.yaml")
+
+
+def test_infer_shell_hook_commands_collects_recipe_entrypoints() -> None:
+    suite = load_suite(default_recipe_path())
+
+    assert infer_shell_hook_commands(suite) == {"niimath", "sh"}
+
+
+def test_first_shell_command_handles_quoted_arguments() -> None:
+    assert first_shell_command("niimath -help") == "niimath"
+    assert first_shell_command("sh -lc 'echo ok'") == "sh"
+    assert first_shell_command("'broken") == ""
+
+
+def test_load_command_uses_nd_load_with_source_and_recipe_commands() -> None:
+    suite = load_suite(default_recipe_path())
+    reference = build_container_reference(
+        suite,
+        image_name="fulltest-image",
+        image_source="/containers/custom container",
+        mirror="https://mirror.example",
+        repo="repo.example",
+        cache_dir="/tmp/cache dir",
+    )
+
+    command = load_command(
+        reference,
+        suite,
+        Options(
+            recipe=default_recipe_path(),
+            mirror="https://mirror.example",
+            repo="repo.example",
+            memory_mb=512,
+            cpus=2,
+        ),
+    )
+
+    assert command.startswith("nd load fulltest-image --source")
+    assert "'/containers/custom container'" in command
+    assert "--command niimath" in command
+    assert "--command sh" in command
+    assert "--cache-dir '/tmp/cache dir'" in command
+    assert "--memory-mb 512" in command
+    assert "--cpus 2" in command

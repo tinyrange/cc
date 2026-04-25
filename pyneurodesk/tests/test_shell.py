@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from pyneurodesk import shell
+from pyneurodesk.models import ContainerReference, ImageSource
 
 
 def test_activate_emits_shell_code_initializes_session_and_bootstraps_by_default(
@@ -196,6 +197,72 @@ def test_shell_load_discovers_commands_writes_wrappers_and_persists_env(
     assert '--command niimath' in wrapper
     assert calls[0] == ("cvmfs_list", "/containers/niimath_1.0.20250804_20251016")
     assert calls[-1] == ("close", None)
+
+
+def test_shell_load_source_stores_reference_and_prepares_image(
+    monkeypatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "session"
+    root.mkdir()
+    monkeypatch.setenv(shell.SESSION_ENV, "sess-1")
+    monkeypatch.setenv(shell.SESSION_ROOT_ENV, str(root))
+    monkeypatch.setenv(shell.SESSION_BIN_ENV, str(root / "bin"))
+    shell.write_state(shell.SessionState(session_id="sess-1", root=root, images={}, wrappers={}))
+    monkeypatch.chdir(tmp_path)
+
+    calls: list[tuple[str, object]] = []
+
+    class FakeClient:
+        def import_image(self, name: str, request: object) -> object:
+            calls.append(("import_image", (name, request.source.path, request.cache_dir)))
+            return object()
+
+        def ensure_instance(self, image: str, *, memory_mb: Optional[int] = None, cpus: Optional[int] = None) -> object:
+            calls.append(("ensure_instance", (image, memory_mb, cpus)))
+            return object()
+
+        def run(self, *args: object, **kwargs: object) -> object:
+            calls.append(("run", (args, kwargs)))
+            return SimpleNamespace(exit_code=0, output="tool ok\n")
+
+        def close(self) -> None:
+            calls.append(("client_close", None))
+
+    monkeypatch.setattr("pyneurodesk.shell.connect", lambda: calls.append(("connect", None)) or FakeClient())
+    monkeypatch.setattr("pyneurodesk.shell.load_deploy_metadata", lambda handle: SimpleNamespace(commands=("tool",), deploy_env=("A=B",)))
+    monkeypatch.setattr("pyneurodesk.shell.resolve_command_name", lambda: "/usr/local/bin/neurodesk")
+
+    exit_code = shell.main(
+        [
+            "shell",
+            "load",
+            "fulltest-image",
+            "--source",
+            "/containers/custom",
+            "--cache-dir",
+            "/tmp/cache",
+            "--memory-mb",
+            "512",
+            "--cpus",
+            "2",
+            "--command",
+            "sh",
+        ]
+    )
+
+    assert exit_code == 0
+    assert "loaded fulltest-image" in capsys.readouterr().out
+    state = shell.read_state(root, session_id="sess-1")
+    assert sorted(state.images["fulltest-image"]["commands"]) == ["fulltest-image", "sh", "tool"]
+    assert state.images["fulltest-image"]["deploy_env"] == ["A=B"]
+    assert state.images["fulltest-image"]["reference"]["source"]["path"] == "/containers/custom"
+    assert calls[:3] == [
+        ("connect", None),
+        ("import_image", ("fulltest-image", "/containers/custom", "/tmp/cache")),
+        ("ensure_instance", ("fulltest-image", 512, 2)),
+    ]
 
 
 def test_shell_load_conflict_requires_force(
@@ -418,3 +485,86 @@ def test_run_wrapper_invokes_container_command(
         ),
         ("close", None),
     ]
+
+
+def test_run_wrapper_uses_session_reference_when_present(
+    monkeypatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[tuple[str, object]] = []
+    reference = ContainerReference(
+        name="suite",
+        image="fulltest-image",
+        source=ImageSource(type="simg", path="/tmp/container.simg"),
+        cache_dir="/tmp/cache",
+    )
+    session_root = tmp_path / "session"
+    session_root.mkdir(parents=True)
+    shell.write_state(
+        shell.SessionState(
+            session_id="sess-1",
+            root=session_root,
+            images={
+                "fulltest-image": {
+                    "deploy_env": ["DEPLOY_ENV_PATH=/opt/tool"],
+                    "reference": shell.container_reference_to_payload(reference),
+                }
+            },
+            wrappers={},
+        )
+    )
+    monkeypatch.setenv(shell.SESSION_ENV, "sess-1")
+    monkeypatch.setenv(shell.SESSION_ROOT_ENV, str(session_root))
+    monkeypatch.setenv(shell.SESSION_BIN_ENV, str(session_root / "bin"))
+    monkeypatch.chdir(tmp_path)
+
+    class FakeClient:
+        def ensure_image(self, ref: ContainerReference) -> object:
+            calls.append(("ensure_image", ref))
+            return object()
+
+        def ensure_instance(self, image: str) -> object:
+            calls.append(("ensure_instance", image))
+            return object()
+
+        def run(
+            self,
+            image: str,
+            command: list[str],
+            *,
+            env: list[str] = (),
+            shares: list[object] = (),
+            workdir: Optional[str] = None,
+        ) -> object:
+            calls.append(("run", (image, tuple(command), tuple(env), tuple(shares), workdir)))
+            return SimpleNamespace(exit_code=0, output="ok\n")
+
+        def close(self) -> None:
+            calls.append(("client_close", None))
+
+    monkeypatch.setattr("pyneurodesk.shell.connect", lambda: calls.append(("connect", None)) or FakeClient())
+
+    exit_code = shell.main(
+        [
+            "shell",
+            "run-wrapper",
+            "--session",
+            "sess-1",
+            "--image",
+            "fulltest-image",
+            "--command",
+            "niimath",
+            "--",
+            "-help",
+        ]
+    )
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == "ok\n"
+    assert calls[0:3] == [
+        ("connect", None),
+        ("ensure_image", reference),
+        ("ensure_instance", "fulltest-image"),
+    ]
+    assert calls[-1] == ("client_close", None)

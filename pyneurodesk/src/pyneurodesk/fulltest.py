@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
+import shlex
+import shutil
+import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
@@ -17,7 +21,8 @@ from .api import (
     start_container_daemon,
 )
 from .client import PyNeurodeskClient
-from .models import ContainerReference, ImageSource, ImportImageRequest, ShareMount
+from .models import ContainerReference, ImageSource
+from . import shell as shell_hooks
 
 
 DEFAULT_OPENNEURO_BASE = "https://s3.amazonaws.com/openneuro.org"
@@ -116,8 +121,8 @@ class FullTestRunner:
 
         daemon = start_container_daemon()
         client = PyNeurodeskClient(daemon.base_url)
-        share = ShareMount(source=str(work_dir), mount="/work", writable=True)
-        guest_vars = build_guest_vars(suite.test_data)
+        shell_session: Optional[ActivatedShellSession] = None
+        guest_vars = build_shell_hook_vars(suite.test_data)
         host_vars = build_host_vars(work_dir, suite.test_data)
         results: list[TestResult] = []
         failed: set[str] = set()
@@ -130,23 +135,22 @@ class FullTestRunner:
 
         try:
             print(f"[fulltest] suite={suite.name} tests={len(selected_tests)} work_dir={work_dir}", flush=True)
-            print(f"[fulltest] importing image={reference.image} source={reference.path}", flush=True)
-            client.import_image(
-                reference.image,
-                ImportImageRequest(source=reference.source, cache_dir=reference.cache_dir),
-            )
             memory_text = f" memory={options.memory_mb}MiB" if options.memory_mb is not None else ""
             cpu_text = f" cpus={options.cpus}" if options.cpus is not None else ""
-            print(f"[fulltest] booting image={reference.image}{memory_text}{cpu_text}", flush=True)
-            client.create_instance(reference.image, memory_mb=options.memory_mb, cpus=options.cpus)
-            print(f"[fulltest] vm ready image={reference.image}{memory_text}{cpu_text}", flush=True)
+            print(f"[fulltest] activating shell hooks", flush=True)
+            shell_session = activate_shell_session(
+                daemon_base_url=daemon.base_url,
+                work_dir=work_dir,
+            )
+            print(f"[fulltest] loading image={reference.image} source={reference.path}{memory_text}{cpu_text}", flush=True)
+            output, exit_code = shell_session.run(load_command(reference, suite, options), timeout_for(120, suite.default_timeout))
+            if exit_code != 0:
+                raise RuntimeError(f"shell hook load failed with exit code {exit_code}: {output}")
+            print(f"[fulltest] shell hooks ready image={reference.image}{memory_text}{cpu_text}", flush=True)
 
             if suite.setup.script.strip():
                 print("[fulltest] setup", flush=True)
-                output, exit_code = run_shell(
-                    client,
-                    reference.image,
-                    share,
+                output, exit_code = shell_session.run(
                     substitute_variables(suite.setup.script, guest_vars),
                     timeout_for(120, suite.default_timeout),
                 )
@@ -165,10 +169,7 @@ class FullTestRunner:
                 output = ""
                 exit_code = -1
                 try:
-                    output, exit_code = run_shell(
-                        client,
-                        reference.image,
-                        share,
+                    output, exit_code = shell_session.run(
                         substitute_variables(test.command, guest_vars),
                         timeout_for(test.timeout, suite.default_timeout),
                     )
@@ -210,10 +211,7 @@ class FullTestRunner:
             if suite.cleanup.script.strip():
                 try:
                     print("[fulltest] cleanup", flush=True)
-                    run_shell(
-                        client,
-                        reference.image,
-                        share,
+                    shell_session.run(
                         substitute_variables(suite.cleanup.script, guest_vars),
                         timeout_for(60, suite.default_timeout),
                     )
@@ -227,6 +225,11 @@ class FullTestRunner:
                     client.shutdown_instance()
                 except Exception:
                     pass
+                if shell_session is not None:
+                    try:
+                        shell_session.close()
+                    except Exception:
+                        pass
             client.close()
             try:
                 with httpx.Client(base_url=daemon.base_url, timeout=2.0) as shutdown_client:
@@ -287,6 +290,10 @@ def build_guest_vars(test_data: dict[str, str]) -> dict[str, str]:
     for key, value in test_data.items():
         out[key] = "/work/" + value.lstrip("/")
     return out
+
+
+def build_shell_hook_vars(test_data: dict[str, str]) -> dict[str, str]:
+    return {key: value.lstrip("/") for key, value in test_data.items()}
 
 
 def build_host_vars(work_dir: Path, test_data: dict[str, str]) -> dict[str, str]:
@@ -397,21 +404,119 @@ def timeout_for(test_timeout: int, default_timeout: int) -> float:
 
 
 def run_shell(
-    client: PyNeurodeskClient,
-    image: str,
-    share: ShareMount,
+    env: dict[str, str],
+    work_dir: Path,
     command: str,
     timeout_seconds: float,
 ) -> tuple[str, int]:
-    result = client.run(
-        image,
-        ["sh", "-lc", command],
-        shares=[share],
-        workdir="/work",
-        stdin=None,
+    proc = subprocess.run(
+        ["bash", "-lc", command],
+        cwd=work_dir,
+        env=env,
+        capture_output=True,
+        text=True,
         timeout=timeout_seconds,
+        check=False,
     )
-    return result.output, result.exit_code
+    return proc.stdout + proc.stderr, proc.returncode
+
+
+@dataclass
+class ActivatedShellSession:
+    work_dir: Path
+    activation_script: Path
+    env: dict[str, str]
+    root: Optional[Path] = None
+
+    def run(self, command: str, timeout_seconds: float) -> tuple[str, int]:
+        return run_shell(
+            self.env,
+            self.work_dir,
+            "source " + shlex.quote(str(self.activation_script)) + "\n" + command,
+            timeout_seconds,
+        )
+
+    def close(self) -> None:
+        try:
+            self.run("neurodesk_deactivate >/dev/null 2>&1 || true", 10.0)
+        finally:
+            if self.root is not None:
+                shutil.rmtree(self.root, ignore_errors=True)
+            self.activation_script.unlink(missing_ok=True)
+
+
+def activate_shell_session(
+    *,
+    daemon_base_url: str,
+    work_dir: Path,
+) -> ActivatedShellSession:
+    env = os.environ.copy()
+    env["CCX3_URL"] = daemon_base_url
+    activation_script = work_dir / ".pyneurodesk-fulltest-activate.sh"
+    proc = subprocess.run(
+        ["neurodesk", "activate", "--shell", "bash", "--no-bootstrap"],
+        cwd=work_dir,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"neurodesk activate failed with exit code {proc.returncode}: {proc.stdout}{proc.stderr}")
+    activation_script.write_text(proc.stdout)
+    session = ActivatedShellSession(work_dir=work_dir, activation_script=activation_script, env=env)
+    root_output, exit_code = session.run("printf '%s' \"${PYNEURODESK_SHELL_ROOT}\"", 10.0)
+    if exit_code == 0 and root_output.strip():
+        session.root = Path(root_output.strip())
+    return session
+
+
+def load_command(reference: ContainerReference, suite: Suite, options: Options) -> str:
+    words = [
+        "nd",
+        "load",
+        reference.image,
+        "--source",
+        reference_source_arg(reference),
+        "--mirror",
+        options.mirror,
+        "--repo",
+        options.repo,
+        "--force",
+    ]
+    for command in sorted(infer_shell_hook_commands(suite)):
+        words.extend(["--command", command])
+    if reference.cache_dir:
+        words.extend(["--cache-dir", reference.cache_dir])
+    if options.memory_mb is not None:
+        words.extend(["--memory-mb", str(options.memory_mb)])
+    if options.cpus is not None:
+        words.extend(["--cpus", str(options.cpus)])
+    return " ".join(shlex.quote(word) for word in words)
+
+
+def reference_source_arg(reference: ContainerReference) -> str:
+    if reference.source.path is None:
+        raise ValueError("container source path is not set")
+    return reference.source.path
+
+
+def infer_shell_hook_commands(suite: Suite) -> set[str]:
+    commands: set[str] = set()
+    scripts = [suite.setup.script, suite.cleanup.script, *(test.command for test in suite.tests)]
+    for script in scripts:
+        command = first_shell_command(script)
+        if command and shell_hooks.is_valid_wrapper_name(command):
+            commands.add(command)
+    return commands
+
+
+def first_shell_command(script: str) -> str:
+    try:
+        words = shlex.split(script, comments=False, posix=True)
+    except ValueError:
+        return ""
+    return words[0] if words else ""
 
 
 def validate_test(output: str, exit_code: int, test: TestCase, host_vars: dict[str, str]) -> str:

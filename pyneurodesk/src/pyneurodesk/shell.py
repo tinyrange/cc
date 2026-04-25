@@ -17,7 +17,7 @@ from typing import Optional
 import httpx
 
 from .api import connect, container, default_cache_root, load_deploy_metadata, start_default_daemon
-from .models import ShareMount
+from .models import ContainerReference, ImageSource, ImportImageRequest, ShareMount
 
 SESSION_ENV = "PYNEURODESK_SHELL_SESSION"
 SESSION_ROOT_ENV = "PYNEURODESK_SHELL_ROOT"
@@ -89,6 +89,12 @@ def build_parser() -> argparse.ArgumentParser:
     load_parser = shell_subparsers.add_parser("load", help="Load an image into the current shell session")
     load_parser.add_argument("image")
     load_parser.add_argument("--command", action="append", dest="commands", default=[])
+    load_parser.add_argument("--source", default="")
+    load_parser.add_argument("--mirror", default="https://cvmfs.neurodesk.org")
+    load_parser.add_argument("--repo", default="neurodesk.ardc.edu.au")
+    load_parser.add_argument("--cache-dir", default="")
+    load_parser.add_argument("--memory-mb", type=int, default=0)
+    load_parser.add_argument("--cpus", type=int, default=0)
     load_parser.add_argument("--force", action="store_true")
     load_parser.set_defaults(handler=handle_load)
 
@@ -148,7 +154,13 @@ def handle_load(args: argparse.Namespace) -> int:
     if not image:
         raise SystemExit("image name is required")
 
-    handle = container(image, progress=False)
+    reference = reference_from_load_args(args)
+    handle = load_shell_container(
+        image,
+        reference=reference,
+        memory_mb=int(args.memory_mb or 0) or None,
+        cpus=int(args.cpus or 0) or None,
+    )
     try:
         metadata = load_deploy_metadata(handle)
         commands = list(dict.fromkeys([*(args.commands or []), *metadata.commands]))
@@ -160,12 +172,66 @@ def handle_load(args: argparse.Namespace) -> int:
     image_record = dict(state.images.get(image, {}))
     image_record["commands"] = commands
     image_record["deploy_env"] = list(metadata.deploy_env)
+    if reference is not None:
+        image_record["reference"] = container_reference_to_payload(reference)
     state.images[image] = image_record
 
     sync_wrappers(state, preferred_images=(image,), force=bool(args.force))
     write_state(state)
     print(f"loaded {image} ({len(commands)} commands)")
     return 0
+
+
+def reference_from_load_args(args: argparse.Namespace) -> Optional[ContainerReference]:
+    source = str(args.source or "").strip()
+    if not source:
+        return None
+    mirror = str(args.mirror)
+    repo = str(args.repo)
+    cache_dir = str(args.cache_dir or "").strip() or None
+    if source.startswith("/containers/"):
+        image_source = ImageSource(type="cvmfs", mirror=mirror, repo=repo, path=source)
+    elif source.startswith("cvmfs://"):
+        image_source = ImageSource(type="cvmfs", mirror=mirror, repo=repo, path=cvmfs_path_from_source(source))
+    elif "/cvmfs/" in source:
+        image_source = ImageSource(type="cvmfs", mirror=mirror, repo=repo, path=cvmfs_path_from_source(source))
+    else:
+        image_source = ImageSource(type="simg", path=source)
+    return ContainerReference(name=str(args.image), image=str(args.image), source=image_source, cache_dir=cache_dir)
+
+
+def load_shell_container(
+    image: str,
+    *,
+    reference: Optional[ContainerReference],
+    memory_mb: Optional[int],
+    cpus: Optional[int],
+):
+    if reference is None:
+        return container(image, progress=False)
+
+    active_client = connect()
+    active_client.import_image(reference.image, ImportImageRequest(source=reference.source, cache_dir=reference.cache_dir))
+    active_client.ensure_instance(reference.image, memory_mb=memory_mb, cpus=cpus)
+    return container_handle_for_reference(active_client, reference)
+
+
+def cvmfs_path_from_source(source: str) -> str:
+    source = source.strip()
+    if source.startswith("cvmfs://"):
+        parsed = source[len("cvmfs://") :]
+        slash = parsed.find("/")
+        if slash == -1:
+            return "/"
+        return "/" + parsed[slash + 1 :].lstrip("/")
+    path = source.split("?", 1)[0]
+    if "/cvmfs/" in path:
+        tail = path.split("/cvmfs/", 1)[1]
+        slash = tail.find("/")
+        if slash == -1:
+            return "/"
+        return "/" + tail[slash + 1 :].lstrip("/")
+    return source
 
 
 def handle_unload(args: argparse.Namespace) -> int:
@@ -235,7 +301,7 @@ def handle_run_wrapper(args: argparse.Namespace) -> int:
 
 
 def run_image_command(image: str, command_name: str, args: list[str], *, deploy_env: Optional[list[str]] = None) -> int:
-    handle = container(image, progress=False)
+    handle = shell_session_container(image)
     try:
         env = list(deploy_env or [])
         if not env:
@@ -249,6 +315,74 @@ def run_image_command(image: str, command_name: str, args: list[str], *, deploy_
         sys.stdout.write(result.output)
         sys.stdout.flush()
     return int(result.exit_code)
+
+
+def shell_session_container(image: str):
+    reference = session_container_reference(image)
+    if reference is None:
+        return container(image, progress=False)
+
+    active_client = connect()
+    active_client.ensure_image(reference)
+    active_client.ensure_instance(reference.image)
+    return container_handle_for_reference(active_client, reference)
+
+
+def container_handle_for_reference(client, reference: ContainerReference):
+    from .api import NeurodeskContainer
+
+    return NeurodeskContainer(client, reference)
+
+
+def session_container_reference(image: str) -> Optional[ContainerReference]:
+    try:
+        state = require_session_state()
+    except SystemExit:
+        return None
+    image_record = state.images.get(image, {})
+    if not isinstance(image_record, dict):
+        return None
+    payload = image_record.get("reference")
+    if not isinstance(payload, dict):
+        return None
+    return container_reference_from_payload(payload)
+
+
+def container_reference_to_payload(reference: ContainerReference) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "name": reference.name,
+        "image": reference.image,
+        "source": reference.source.to_payload(),
+    }
+    if reference.cache_dir is not None:
+        payload["cache_dir"] = reference.cache_dir
+    return payload
+
+
+def container_reference_from_payload(payload: dict[str, object]) -> Optional[ContainerReference]:
+    source_payload = payload.get("source")
+    if not isinstance(source_payload, dict):
+        return None
+    source = ImageSource(
+        type=str(source_payload.get("type", "")),
+        format=str(source_payload["format"]) if source_payload.get("format") is not None else None,
+        mirror=str(source_payload["mirror"]) if source_payload.get("mirror") is not None else None,
+        repo=str(source_payload["repo"]) if source_payload.get("repo") is not None else None,
+        path=str(source_payload["path"]) if source_payload.get("path") is not None else None,
+    )
+    if not source.type:
+        return None
+    name = payload.get("name")
+    image = payload.get("image")
+    if not isinstance(name, str) or not isinstance(image, str):
+        return None
+    cache_dir = payload.get("cache_dir")
+    return ContainerReference(
+        name=name,
+        image=image,
+        source=source,
+        cache_dir=str(cache_dir) if cache_dir is not None else None,
+    )
 
 
 def implicit_cwd_mount() -> tuple[list[ShareMount], str]:
