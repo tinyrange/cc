@@ -8,6 +8,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"j5.nz/cc/internal/amd64vm"
 )
 
 type ExitReason uint32
@@ -45,11 +46,17 @@ type MMIOExit struct {
 }
 
 type VM struct {
-	kvm    *Bootstrap
-	vmfd   int
-	vcpufd int
-	run    []byte
-	mem    []byte
+	kvm     *Bootstrap
+	vmfd    int
+	vcpufd  int
+	run     []byte
+	mem     []byte
+	regions []memoryMapping
+}
+
+type memoryMapping struct {
+	guestPhysAddr uint64
+	mem           []byte
 }
 
 func NewVM() (*VM, error) {
@@ -108,6 +115,12 @@ func (v *VM) Close() error {
 		_ = unix.Munmap(v.mem)
 		v.mem = nil
 	}
+	for _, region := range v.regions {
+		if len(region.mem) != 0 {
+			_ = unix.Munmap(region.mem)
+		}
+	}
+	v.regions = nil
 	if v.kvm != nil {
 		_ = v.kvm.CloseVCPU(v.vcpufd)
 		_ = v.kvm.CloseVM(v.vmfd)
@@ -118,12 +131,16 @@ func (v *VM) Close() error {
 }
 
 func (v *VM) MapAnonymousMemory(size uint64, guestPhysAddr uint64) ([]byte, error) {
+	return v.MapAnonymousMemorySlot(0, size, guestPhysAddr)
+}
+
+func (v *VM) MapAnonymousMemorySlot(slot uint32, size uint64, guestPhysAddr uint64) ([]byte, error) {
 	mem, err := unix.Mmap(-1, 0, int(size), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANONYMOUS|unix.MAP_PRIVATE)
 	if err != nil {
 		return nil, fmt.Errorf("mmap guest memory: %w", err)
 	}
 	region := kvmUserspaceMemoryRegion{
-		Slot:          0,
+		Slot:          slot,
 		GuestPhysAddr: guestPhysAddr,
 		MemorySize:    size,
 		UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[0]))),
@@ -132,7 +149,25 @@ func (v *VM) MapAnonymousMemory(size uint64, guestPhysAddr uint64) ([]byte, erro
 		_ = unix.Munmap(mem)
 		return nil, fmt.Errorf("set user memory region: %w", err)
 	}
-	v.mem = mem
+	if slot == 0 {
+		v.mem = mem
+	} else {
+		v.regions = append(v.regions, memoryMapping{guestPhysAddr: guestPhysAddr, mem: mem})
+	}
+	return mem, nil
+}
+
+func mapAMD64GuestMemory(vm *VM, memoryMB uint64) ([]byte, error) {
+	lowSize := amd64vm.LowMemorySizeBytes(memoryMB)
+	mem, err := vm.MapAnonymousMemorySlot(0, lowSize, amd64vm.MemoryBase)
+	if err != nil {
+		return nil, err
+	}
+	if highSize := amd64vm.HighMemorySizeBytes(memoryMB); highSize > 0 {
+		if _, err := vm.MapAnonymousMemorySlot(1, highSize, amd64vm.HighMemoryBase); err != nil {
+			return nil, err
+		}
+	}
 	return mem, nil
 }
 
@@ -205,21 +240,67 @@ func (v *VM) ReadIPA(addr uint64, size int) ([]byte, error) {
 	if size < 0 {
 		return nil, fmt.Errorf("invalid read size %d", size)
 	}
-	if addr+uint64(size) < addr || addr+uint64(size) > uint64(len(v.mem)) {
+	if size == 0 {
+		return []byte{}, nil
+	}
+	out := make([]byte, size)
+	if err := v.copyFromGuest(addr, out); err != nil {
 		return nil, fmt.Errorf("read guest memory %#x size %d: unmapped", addr, size)
 	}
-	return append([]byte(nil), v.mem[addr:addr+uint64(size)]...), nil
+	return out, nil
 }
 
 func (v *VM) WriteIPA(addr uint64, data []byte) error {
 	if v == nil {
 		return fmt.Errorf("vm is nil")
 	}
-	if addr+uint64(len(data)) < addr || addr+uint64(len(data)) > uint64(len(v.mem)) {
+	if len(data) == 0 {
+		return nil
+	}
+	if err := v.copyToGuest(addr, data); err != nil {
 		return fmt.Errorf("write guest memory %#x size %d: unmapped", addr, len(data))
 	}
-	copy(v.mem[addr:addr+uint64(len(data))], data)
 	return nil
+}
+
+func (v *VM) copyFromGuest(addr uint64, out []byte) error {
+	for len(out) > 0 {
+		region, off, ok := v.findMemoryRegion(addr)
+		if !ok {
+			return fmt.Errorf("unmapped")
+		}
+		n := copy(out, region[off:])
+		out = out[n:]
+		addr += uint64(n)
+	}
+	return nil
+}
+
+func (v *VM) copyToGuest(addr uint64, data []byte) error {
+	for len(data) > 0 {
+		region, off, ok := v.findMemoryRegion(addr)
+		if !ok {
+			return fmt.Errorf("unmapped")
+		}
+		n := copy(region[off:], data)
+		data = data[n:]
+		addr += uint64(n)
+	}
+	return nil
+}
+
+func (v *VM) findMemoryRegion(addr uint64) ([]byte, uint64, bool) {
+	if addr < uint64(len(v.mem)) {
+		return v.mem, addr, true
+	}
+	for _, region := range v.regions {
+		start := region.guestPhysAddr
+		end := start + uint64(len(region.mem))
+		if addr >= start && addr < end {
+			return region.mem, addr - start, true
+		}
+	}
+	return nil, 0, false
 }
 
 func (v *VM) SetLongMode(entry, zeroPage, stack, pagingBase uint64) error {

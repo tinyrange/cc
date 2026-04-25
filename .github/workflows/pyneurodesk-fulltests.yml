@@ -142,6 +142,7 @@ jobs:
         working-directory: pyneurodesk
         env:
           PYNEURODESK_CCVM: ${{ github.workspace }}/build/ccvm
+          CCX3_CVMFS_LOG: ${{ github.workspace }}/fulltest-results/${{ matrix.suite }}-cvmfs.jsonl
           PYTHONUNBUFFERED: "1"
           SUITE: ${{ matrix.suite }}
         run: |
@@ -159,5 +160,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: pyneurodesk-fulltest-${{ matrix.suite }}
-          path: fulltest-results/${{ matrix.suite }}.log
+          path: |
+            fulltest-results/${{ matrix.suite }}.log
+            fulltest-results/${{ matrix.suite }}-cvmfs.jsonl
           if-no-files-found: error

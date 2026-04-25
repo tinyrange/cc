@@ -10,6 +10,8 @@ import (
 const (
 	MemoryBase        = 0
 	DefaultMemorySize = 512 << 20
+	LowMemorySize     = 3 << 30
+	HighMemoryBase    = 4 << 30
 
 	COM1Base = 0x3f8
 	COM1IRQ  = 4
@@ -26,6 +28,22 @@ func MemorySizeBytes(memoryMB uint64) uint64 {
 		return DefaultMemorySize
 	}
 	return memoryMB << 20
+}
+
+func LowMemorySizeBytes(memoryMB uint64) uint64 {
+	total := MemorySizeBytes(memoryMB)
+	if total > LowMemorySize {
+		return LowMemorySize
+	}
+	return total
+}
+
+func HighMemorySizeBytes(memoryMB uint64) uint64 {
+	total := MemorySizeBytes(memoryMB)
+	if total <= LowMemorySize {
+		return 0
+	}
+	return total - LowMemorySize
 }
 
 func BootCommandLine(dmesg bool, extra ...string) string {
@@ -51,10 +69,25 @@ func BootCommandLine(dmesg bool, extra ...string) string {
 }
 
 func PrepareBoot(memory []byte, kernel []byte, initrd []byte, cfg BootConfig) (*bootamd64.BootPlan, error) {
+	memorySize := MemorySizeBytes(cfg.MemoryMB)
 	return bootamd64.PrepareBoot(memory, kernel, bootamd64.BootOptions{
 		MemoryBase: MemoryBase,
-		MemorySize: MemorySizeBytes(cfg.MemoryMB),
+		MemorySize: memorySize,
 		Initrd:     initrd,
 		Cmdline:    BootCommandLine(cfg.Dmesg, cfg.ExtraCmdline...),
+		E820:       E820Map(memorySize),
 	})
+}
+
+func E820Map(memorySize uint64) []bootamd64.E820Entry {
+	if memorySize <= LowMemorySize {
+		return bootamd64.DefaultE820Map(MemoryBase, memorySize)
+	}
+	entries := bootamd64.DefaultE820Map(MemoryBase, LowMemorySize)
+	entries = append(entries, bootamd64.E820Entry{
+		Addr: HighMemoryBase,
+		Size: memorySize - LowMemorySize,
+		Type: 1,
+	})
+	return entries
 }

@@ -51,7 +51,7 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 	}
 	defer vm.Close()
 
-	mem, err := vm.MapAnonymousMemory(amd64vm.MemorySizeBytes(memoryMB), amd64vm.MemoryBase)
+	mem, err := mapAMD64GuestMemory(vm, memoryMB)
 	if err != nil {
 		return client.ExecResponse{}, "", fmt.Errorf("map guest memory: %w", err)
 	}

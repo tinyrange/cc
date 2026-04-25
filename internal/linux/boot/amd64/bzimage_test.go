@@ -41,6 +41,26 @@ func TestPrepareBootPlacesZeroPage(t *testing.T) {
 	}
 }
 
+func TestPrepareBootAcceptsHighMemoryE820(t *testing.T) {
+	mem := make([]byte, 3<<20)
+	plan, err := PrepareBoot(mem, testBzImage(), BootOptions{
+		MemorySize: 8 << 30,
+		Cmdline:    "console=ttyS0 rdinit=/init",
+		E820: []E820Entry{
+			{Addr: 0, Size: 0x9f000, Type: 1},
+			{Addr: 0x9f000, Size: 0x61000, Type: 2},
+			{Addr: 0x100000, Size: (3 << 20) - 0x100000, Type: 1},
+			{Addr: 4 << 30, Size: 5 << 30, Type: 1},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PrepareBoot() error = %v", err)
+	}
+	if plan.EntryGPA == 0 || plan.ZeroPageGPA == 0 || plan.StackTopGPA == 0 {
+		t.Fatalf("plan has zero fields: %+v", plan)
+	}
+}
+
 func testBzImage() []byte {
 	buf := make([]byte, 4096)
 	buf[headerLengthOffset] = 0x80

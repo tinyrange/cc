@@ -27,6 +27,7 @@ from . import shell as shell_hooks
 
 DEFAULT_OPENNEURO_BASE = "https://s3.amazonaws.com/openneuro.org"
 FULLTEST_EXTRA_MESSAGE = "pyneurodesk fulltest dependencies are not installed; install pyneurodesk[fulltest]"
+DEFAULT_FULLTEST_MEMORY_MB = 8192
 
 
 @dataclass(frozen=True)
@@ -74,7 +75,7 @@ class Options:
     mirror: str = DEFAULT_CVMFS_MIRROR
     repo: str = DEFAULT_CVMFS_REPO
     cache_dir: Optional[str] = None
-    memory_mb: Optional[int] = None
+    memory_mb: Optional[int] = DEFAULT_FULLTEST_MEMORY_MB
     cpus: Optional[int] = None
 
 
@@ -594,7 +595,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mirror", default=DEFAULT_CVMFS_MIRROR)
     parser.add_argument("--repo", default=DEFAULT_CVMFS_REPO)
     parser.add_argument("--cache-dir", default="")
-    parser.add_argument("--memory-mb", type=int, default=0)
+    parser.add_argument("--memory-mb", type=int, default=DEFAULT_FULLTEST_MEMORY_MB)
     parser.add_argument("--cpus", type=int, default=0)
     return parser
 

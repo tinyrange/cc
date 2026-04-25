@@ -165,6 +165,10 @@ def test_shell_load_discovers_commands_writes_wrappers_and_persists_env(
                 payload = base64.b64encode(b"niimath\nbet\nmissing-wrapper\n").decode()
             elif request.path.endswith("/env.txt"):
                 payload = base64.b64encode(b"DEPLOY_ENV_FSLDIR=BASEPATH/opt/fsl\n").decode()
+            elif request.path.endswith("/.singularity.d/env/10-docker2singularity.sh"):
+                payload = base64.b64encode(b'export PATH="/usr/local/bin:/usr/bin:/bin:/opt/niimath"\n').decode()
+            elif request.path.endswith("/.singularity.d/env/90-environment.sh"):
+                payload = base64.b64encode(b"").decode()
             else:
                 raise AssertionError(request.path)
             return SimpleNamespace(data=payload.encode())
@@ -190,7 +194,10 @@ def test_shell_load_discovers_commands_writes_wrappers_and_persists_env(
     assert "loaded niimath" in output
     new_state = shell.read_state(root, session_id="sess-1")
     assert sorted(new_state.images["niimath"]["commands"]) == ["bet", "niimath"]
-    assert new_state.images["niimath"]["deploy_env"] == ["DEPLOY_ENV_FSLDIR=/opt/fsl"]
+    assert new_state.images["niimath"]["deploy_env"] == [
+        "PATH=/usr/local/bin:/usr/bin:/bin:/opt/niimath",
+        "DEPLOY_ENV_FSLDIR=/opt/fsl",
+    ]
     wrapper = (root / "bin" / "niimath").read_text()
     assert "/usr/local/bin/neurodesk shell run-wrapper" in wrapper
     assert '--image niimath' in wrapper

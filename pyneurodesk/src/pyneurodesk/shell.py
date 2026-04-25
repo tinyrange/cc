@@ -308,6 +308,24 @@ def run_image_command(image: str, command_name: str, args: list[str], *, deploy_
             metadata = load_deploy_metadata(handle)
             env = list(metadata.deploy_env)
         shares, workdir = implicit_cwd_mount()
+        if hasattr(handle._client, "run_stream"):
+            exit_code = 0
+            for event in handle._client.run_stream(
+                handle.reference.image,
+                [command_name, *args],
+                env=env,
+                shares=shares,
+                workdir=workdir,
+            ):
+                kind = str(event.get("kind", ""))
+                if kind in {"stdout", "stderr", "output"}:
+                    sys.stdout.write(str(event.get("output", "")))
+                    sys.stdout.flush()
+                elif kind == "exit":
+                    exit_code = int(event.get("exit_code", 0) or 0)
+                elif kind == "error":
+                    raise RuntimeError(str(event.get("error", "streamed command failed")))
+            return exit_code
         result = handle._client.run(handle.reference.image, [command_name, *args], env=env, shares=shares, workdir=workdir)
     finally:
         handle.close()

@@ -36,9 +36,10 @@ func timingLog(format string, args ...any) {
 }
 
 type server struct {
-	kernel *alpine.Manager
-	images *oci.Store
-	vms    *vm.Manager
+	kernel        *alpine.Manager
+	images        *oci.Store
+	vms           *vm.Manager
+	cvmfsCacheDir string
 }
 
 func main() {
@@ -61,8 +62,9 @@ func main() {
 	}
 
 	srvState := &server{
-		kernel: alpine.NewManager(filepath.Join(sharedRuntimeRoot(), "kernel")),
-		images: oci.NewStore(filepath.Join(rootCache, "images")),
+		kernel:        alpine.NewManager(filepath.Join(sharedRuntimeRoot(), "kernel")),
+		images:        oci.NewStore(filepath.Join(rootCache, "images")),
+		cvmfsCacheDir: filepath.Join(rootCache, "_cvmfs_cache"),
 	}
 	srvState.vms = vm.NewManagerWithBackend(vm.NewRuntimeBackend(srvState.kernel, srvState.images, filepath.Join(sharedRuntimeRoot(), "guestinit")))
 
@@ -237,7 +239,7 @@ func newMux(srvState *server, httpServer *http.Server) *http.ServeMux {
 			return
 		}
 		cvmfsClient := intcvmfs.NewClient()
-		cvmfsClient.CacheDir = strings.TrimSpace(req.CacheDir)
+		cvmfsClient.CacheDir = cvmfsRequestCacheDir(req.CacheDir, srvState.cvmfsCacheDir)
 		target := cvmfsTarget(req.Mirror, req.Repo, req.Path)
 		entries, err := cvmfsClient.ReadDir(target)
 		if err != nil {
@@ -270,7 +272,7 @@ func newMux(srvState *server, httpServer *http.Server) *http.ServeMux {
 			return
 		}
 		cvmfsClient := intcvmfs.NewClient()
-		cvmfsClient.CacheDir = strings.TrimSpace(req.CacheDir)
+		cvmfsClient.CacheDir = cvmfsRequestCacheDir(req.CacheDir, srvState.cvmfsCacheDir)
 		target := cvmfsTarget(req.Mirror, req.Repo, req.Path)
 		data, eof, err := cvmfsClient.ReadFileRange(target, req.Offset, req.Length)
 		if err != nil {
@@ -468,13 +470,13 @@ func newMux(srvState *server, httpServer *http.Server) *http.ServeMux {
 				return
 			}
 		}
+		if wantsExecEventStream(r) {
+			writeRunEventStream(w, r.Context(), srvState.vms, req)
+			return
+		}
 		resp, err := srvState.vms.Run(r.Context(), req)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		if wantsExecEventStream(r) {
-			writeExecEventStream(w, resp)
 			return
 		}
 		writeJSON(w, http.StatusOK, resp)
@@ -613,6 +615,28 @@ func writeExecEventStream(w http.ResponseWriter, resp client.ExecResponse) {
 	}
 }
 
+func writeRunEventStream(w http.ResponseWriter, ctx context.Context, manager *vm.Manager, req client.RunRequest) {
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.WriteHeader(http.StatusOK)
+	enc := json.NewEncoder(w)
+	flusher, _ := w.(http.Flusher)
+	err := manager.RunStream(ctx, req, nil, func(event client.ExecEvent) error {
+		if err := enc.Encode(event); err != nil {
+			return err
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return nil
+	})
+	if err != nil {
+		_ = enc.Encode(client.ExecEvent{Kind: "error", Error: err.Error()})
+	}
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
 func writeBootEvent(w http.ResponseWriter, event client.BootEvent) error {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	if event.Kind == "" {
@@ -658,6 +682,13 @@ func cvmfsTarget(mirror, repo, innerPath string) string {
 	}
 	mirror = ensureCVMFSMirrorPath(mirror)
 	return fmt.Sprintf("%s/%s%s", mirror, repo, pathValue)
+}
+
+func cvmfsRequestCacheDir(requested string, fallback string) string {
+	if dir := strings.TrimSpace(requested); dir != "" {
+		return dir
+	}
+	return fallback
 }
 
 func pathJoin(base, name string) string {

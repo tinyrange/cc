@@ -24,6 +24,7 @@ from pyneurodesk.api import (
     create_container_cache_dir,
     build_release_container_path,
     create_progress_reporter,
+    parse_singularity_env_exports,
     default_daemon_state_path,
     path_join,
     resolve_ccvm_binary_path,
@@ -651,13 +652,31 @@ def test_container_run_uses_cvmfs_deploy_env_and_exposes_commands() -> None:
                         "eof": True,
                     },
                 )
+            if payload["path"] == (
+                "/containers/niimath_1.0.20250804_20251016/"
+                "niimath_1.0.20250804_20251016.simg/.singularity.d/env/10-docker2singularity.sh"
+            ):
+                return httpx.Response(
+                    200,
+                    json={
+                        "path": payload["path"],
+                        "offset": 0,
+                        "data": base64.b64encode(b'export PATH="/usr/local/bin:/usr/bin:/bin:/opt/niimath"\n').decode(),
+                        "eof": True,
+                    },
+                )
+            if payload["path"].endswith("/.singularity.d/env/90-environment.sh"):
+                return httpx.Response(400, json={"error": "file does not exist"})
         if request.method == "GET" and request.url.path == "/image/niimath":
             return httpx.Response(200, json={"name": "niimath", "status": "downloaded", "source_kind": "cvmfs"})
         if request.method == "GET" and request.url.path == "/vm/status":
             return httpx.Response(200, json={"status": "running", "image": "niimath"})
         if request.method == "POST" and request.url.path == "/vm/run":
             payload = json.loads(body or "{}")
-            assert payload["env"] == ["DEPLOY_ENV_FSLDIR=/opt/fsl"]
+            assert payload["env"] == [
+                "PATH=/usr/local/bin:/usr/bin:/bin:/opt/niimath",
+                "DEPLOY_ENV_FSLDIR=/opt/fsl",
+            ]
             return httpx.Response(200, json={"exit_code": 0, "output": "ok\n"})
         raise AssertionError(f"unexpected request: {request.method} {request.url.path} {body!r}")
 
@@ -665,7 +684,10 @@ def test_container_run_uses_cvmfs_deploy_env_and_exposes_commands() -> None:
     try:
         handle = nd.container("niimath", client=client, progress=False)
         assert handle.commands == ("bet", "niimath")
-        assert handle.deploy_env == ("DEPLOY_ENV_FSLDIR=/opt/fsl",)
+        assert handle.deploy_env == (
+            "PATH=/usr/local/bin:/usr/bin:/bin:/opt/niimath",
+            "DEPLOY_ENV_FSLDIR=/opt/fsl",
+        )
         out = handle.niimath("-help")
     finally:
         client.close()
@@ -673,8 +695,24 @@ def test_container_run_uses_cvmfs_deploy_env_and_exposes_commands() -> None:
     assert out == "ok\n"
     paths = [path for _, path, _ in seen]
     assert paths.count("/cvmfs/list") == 3
-    assert paths.count("/cvmfs/read") == 2
+    assert paths.count("/cvmfs/read") == 4
     assert paths[-1] == "/vm/run"
+
+
+def test_parse_singularity_env_exports_handles_docker_defaults() -> None:
+    assert parse_singularity_env_exports(
+        '\n'.join(
+            [
+                'export PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/abin:~/.local/bin"',
+                'export LANG="${LANG:-"en_US.UTF-8"}"',
+                'export LD_LIBRARY_PATH PS1',
+                'export SKIP="$UNRESOLVED:/opt/bin"',
+            ]
+        )
+    ) == (
+        "PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/abin:~/.local/bin",
+        "LANG=en_US.UTF-8",
+    )
 
 
 def test_container_lookup_accepts_versioned_root_simg() -> None:

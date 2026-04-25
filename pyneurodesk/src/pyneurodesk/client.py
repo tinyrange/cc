@@ -319,6 +319,44 @@ class PyNeurodeskClient:
             timeout=timeout,
         )
 
+    def run_stream(
+        self,
+        image: str,
+        command: Iterable[str],
+        *,
+        shares: Iterable[ShareMount] = (),
+        env: Iterable[str] = (),
+        workdir: Optional[str] = None,
+        user: Optional[str] = None,
+        stdin: Optional[bytes] = None,
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
+    ) -> Iterable[dict[str, Any]]:
+        request = RunCommandRequest(
+            image=image,
+            command=tuple(command),
+            shares=tuple(shares),
+            env=tuple(env),
+            workdir=workdir,
+            user=user,
+            stdin=stdin,
+        )
+        with self._client.stream(
+            "POST",
+            "/vm/run",
+            params={"stream": "1"},
+            json=request.to_payload(),
+            headers={"Accept": "application/x-ndjson"},
+            timeout=timeout,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                event = json.loads(line)
+                if not isinstance(event, dict):
+                    raise TypeError(f"expected exec event object, got {type(event)!r}")
+                yield event
+
     @staticmethod
     def _decode_json(response: httpx.Response) -> dict[str, Any]:
         try:

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import posixpath
+import re
+import shlex
 import subprocess
 import sys
 import uuid
@@ -30,6 +32,10 @@ DEFAULT_CVMFS_MIRROR = "https://cvmfs.neurodesk.org"
 DEFAULT_CVMFS_REPO = "neurodesk.ardc.edu.au"
 DEFAULT_CONTAINERS_PATH = "/containers"
 DEFAULT_RELEASES_API = "https://api.github.com/repos/NeuroDesk/neurocontainers/contents/releases"
+SINGULARITY_ENV_FILES = (
+    "10-docker2singularity.sh",
+    "90-environment.sh",
+)
 
 
 class ProgressReporter(Protocol):
@@ -564,7 +570,7 @@ def load_deploy_metadata(container_handle: NeurodeskContainer) -> DeployMetadata
         )
     )
     deploy_env_text = read_cvmfs_text(container_handle, f"{directory}/env.txt", allow_missing=True)
-    deploy_env = tuple(
+    deploy_env = [
         line
         for line in (
             normalize_deploy_env_line(line.strip())
@@ -572,8 +578,73 @@ def load_deploy_metadata(container_handle: NeurodeskContainer) -> DeployMetadata
             if line.strip()
         )
         if line is not None
-    )
-    return DeployMetadata(commands=commands, deploy_env=deploy_env)
+    ]
+    image_env = load_singularity_env(container_handle, directory)
+    return DeployMetadata(commands=commands, deploy_env=merge_env_entries([*image_env, *deploy_env]))
+
+
+def load_singularity_env(container_handle: NeurodeskContainer, directory: str) -> tuple[str, ...]:
+    image_env_dir = singularity_env_dir_for_deploy_directory(directory)
+    env: list[str] = []
+    for name in SINGULARITY_ENV_FILES:
+        text = read_cvmfs_text(container_handle, f"{image_env_dir}/{name}", allow_missing=True)
+        env.extend(parse_singularity_env_exports(text))
+    return tuple(env)
+
+
+def singularity_env_dir_for_deploy_directory(directory: str) -> str:
+    clean = directory.rstrip("/")
+    image_root = clean if clean.endswith(".simg") else f"{clean}/{posixpath.basename(clean)}.simg"
+    return f"{image_root}/.singularity.d/env"
+
+
+def parse_singularity_env_exports(text: str) -> tuple[str, ...]:
+    env: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("export "):
+            continue
+        assignment = line.removeprefix("export ").strip()
+        if "=" not in assignment:
+            continue
+        key, value = assignment.split("=", 1)
+        key = key.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        parsed = parse_singularity_env_value(value.strip())
+        if parsed is None:
+            continue
+        env.append(f"{key}={parsed}")
+    return merge_env_entries(env)
+
+
+def parse_singularity_env_value(value: str) -> Optional[str]:
+    default_value = value
+    if len(default_value) >= 2 and default_value[0] == default_value[-1] and default_value[0] in {"'", '"'}:
+        default_value = default_value[1:-1]
+    default_match = re.fullmatch(r"""\$\{[A-Za-z_][A-Za-z0-9_]*:-(["'])(.*)\1\}""", default_value)
+    if default_match:
+        return default_match.group(2)
+    try:
+        parts = shlex.split(value, posix=True)
+    except ValueError:
+        return None
+    if len(parts) != 1:
+        return None
+    parsed = parts[0]
+    if "$" in parsed:
+        return None
+    return parsed
+
+
+def merge_env_entries(entries: list[str]) -> tuple[str, ...]:
+    merged: dict[str, str] = {}
+    for entry in entries:
+        if "=" not in entry:
+            continue
+        key, value = entry.split("=", 1)
+        merged[key] = value
+    return tuple(f"{key}={value}" for key, value in merged.items())
 
 
 def read_cvmfs_text(

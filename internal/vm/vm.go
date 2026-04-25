@@ -273,6 +273,41 @@ func (m *Manager) Stream(ctx context.Context, req client.ExecRequest, inputs <-c
 	return m.StreamIn(ctx, req.ID, req, inputs, onEvent)
 }
 
+func (m *Manager) RunStream(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	return m.RunStreamIn(ctx, req.ID, req, inputs, onEvent)
+}
+
+func (m *Manager) RunStreamIn(ctx context.Context, id string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	id = instanceID(id)
+	m.mu.Lock()
+	machine := m.running[id]
+	m.mu.Unlock()
+	if machine == nil {
+		return fmt.Errorf("no VM %q is running", id)
+	}
+	targetImage := strings.TrimSpace(req.Image)
+	if targetImage != "" && targetImage != machine.image {
+		return fmt.Errorf("streaming /vm/run only supports the running image %q, got %q", machine.image, targetImage)
+	}
+	for _, share := range req.Shares {
+		if err := machine.instance.AddShare(ctx, share); err != nil {
+			return err
+		}
+	}
+	return machine.instance.ExecStream(ctx, client.ExecRequest{
+		Command:    append([]string(nil), req.Command...),
+		Env:        append([]string(nil), req.Env...),
+		RootDir:    req.RootDir,
+		ReplaceEnv: req.ReplaceEnv,
+		WorkDir:    req.WorkDir,
+		User:       req.User,
+		Stdin:      append([]byte(nil), req.Stdin...),
+		TTY:        req.TTY,
+		Cols:       req.Cols,
+		Rows:       req.Rows,
+	}, inputs, onEvent)
+}
+
 func (m *Manager) StreamIn(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	id = instanceID(id)
 	m.mu.Lock()

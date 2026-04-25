@@ -61,7 +61,7 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 		vsock.Close()
 		return nil, err
 	}
-	mem, err := vm.MapAnonymousMemory(amd64vm.MemorySizeBytes(memoryMB), amd64vm.MemoryBase)
+	mem, err := mapAMD64GuestMemory(vm, memoryMB)
 	if err != nil {
 		vm.Close()
 		_ = listener.Close()

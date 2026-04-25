@@ -22,11 +22,12 @@ def test_load_suite_parses_niimath_recipe() -> None:
 
     assert suite.name == "niimath"
     assert suite.container == "niimath_1.0.20250804_20251016.simg"
-    assert len(suite.required_files) == 0
+    assert len(suite.required_files) == 1
+    assert suite.required_files[0].dataset == "ds000001"
     assert len(suite.tests) >= 3
     assert suite.tests[0].name == "Version check"
     assert suite.tests[0].expected_output_contains == ("niimath version",)
-    assert suite.tests[1].expected_output_contains == ("Usage: niimath",)
+    assert suite.tests[1].expected_output_contains == ("nifti_type",)
 
 
 def test_build_container_reference_defaults_to_cvmfs_directory() -> None:
@@ -94,7 +95,7 @@ def test_default_recipe_path_points_to_existing_recipe() -> None:
 def test_infer_shell_hook_commands_collects_recipe_entrypoints() -> None:
     suite = load_suite(default_recipe_path())
 
-    assert infer_shell_hook_commands(suite) == {"niimath", "sh"}
+    assert infer_shell_hook_commands(suite) == {"niimath"}
 
 
 def test_first_shell_command_handles_quoted_arguments() -> None:
@@ -129,7 +130,22 @@ def test_load_command_uses_nd_load_with_source_and_recipe_commands() -> None:
     assert command.startswith("nd load fulltest-image --source")
     assert "'/containers/custom container'" in command
     assert "--command niimath" in command
-    assert "--command sh" in command
     assert "--cache-dir '/tmp/cache dir'" in command
     assert "--memory-mb 512" in command
     assert "--cpus 2" in command
+
+
+def test_load_command_defaults_to_8gb_memory() -> None:
+    suite = load_suite(default_recipe_path())
+    reference = build_container_reference(
+        suite,
+        image_name="fulltest-image",
+        image_source="",
+        mirror="https://mirror.example",
+        repo="repo.example",
+        cache_dir=None,
+    )
+
+    command = load_command(reference, suite, Options(recipe=default_recipe_path()))
+
+    assert "--memory-mb 8192" in command

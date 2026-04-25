@@ -66,7 +66,7 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 	}
 	defer vm.Close()
 
-	mem, err := vm.MapAnonymousMemory(amd64vm.MemorySizeBytes(memoryMB), amd64vm.MemoryBase)
+	mem, err := mapAMD64GuestMemory(vm, memoryMB)
 	if err != nil {
 		return "", fmt.Errorf("map guest memory: %w", err)
 	}

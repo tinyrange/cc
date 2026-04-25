@@ -5,6 +5,7 @@ import (
 	"compress/zlib"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	intsqlite "j5.nz/cc/internal/sqlite"
@@ -71,9 +73,26 @@ type WalkEntry struct {
 }
 
 type Client struct {
-	HTTPClient *http.Client
-	CacheDir   string
+	HTTPClient   *http.Client
+	CacheDir     string
+	TraceLogPath string
 }
+
+type traceEvent struct {
+	Time       string  `json:"time"`
+	ID         uint64  `json:"id"`
+	Event      string  `json:"event"`
+	Op         string  `json:"op"`
+	Target     string  `json:"target,omitempty"`
+	URL        string  `json:"url,omitempty"`
+	CachePath  string  `json:"cache_path,omitempty"`
+	Bytes      int     `json:"bytes,omitempty"`
+	StatusCode int     `json:"status_code,omitempty"`
+	DurationMS float64 `json:"duration_ms,omitempty"`
+	Error      string  `json:"error,omitempty"`
+}
+
+var traceID atomic.Uint64
 
 type manifest struct {
 	RootCatalogHash string
@@ -211,67 +230,94 @@ func ParseTarget(raw string) (Target, error) {
 }
 
 func (c *Client) ReadDir(target string) ([]DirEntry, error) {
+	id, started := c.traceStart("ReadDir", target, "", "")
 	parsed, err := ParseTarget(target)
 	if err != nil {
+		c.traceDone(id, started, "ReadDir", target, "", "", 0, 0, err)
 		return nil, err
 	}
 	if !parsed.Remote {
-		return readLocalDir(parsed.LocalPath)
+		entries, err := readLocalDir(parsed.LocalPath)
+		c.traceDone(id, started, "ReadDir", target, "", "", len(entries), 0, err)
+		return entries, err
 	}
 	repo := c.newRepository(parsed)
-	return repo.ReadDir(parsed.Path)
+	entries, err := repo.ReadDir(parsed.Path)
+	c.traceDone(id, started, "ReadDir", target, "", "", len(entries), 0, err)
+	return entries, err
 }
 
 func (c *Client) ReadFile(target string) ([]byte, error) {
+	id, started := c.traceStart("ReadFile", target, "", "")
 	parsed, err := ParseTarget(target)
 	if err != nil {
+		c.traceDone(id, started, "ReadFile", target, "", "", 0, 0, err)
 		return nil, err
 	}
 	if !parsed.Remote {
-		return os.ReadFile(parsed.LocalPath)
+		data, err := os.ReadFile(parsed.LocalPath)
+		c.traceDone(id, started, "ReadFile", target, "", "", len(data), 0, err)
+		return data, err
 	}
 	if data, err := c.readCachedFile(parsed); err == nil {
+		c.traceDone(id, started, "ReadFile", target, "", cvmfsFileCachePath(c.CacheDir, parsed.Repo, parsed.Path), len(data), 0, nil)
 		return data, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
+		c.traceDone(id, started, "ReadFile", target, "", cvmfsFileCachePath(c.CacheDir, parsed.Repo, parsed.Path), 0, 0, err)
 		return nil, err
 	}
 	repo := c.newRepository(parsed)
 	data, err := repo.ReadFile(parsed.Path)
 	if err != nil {
+		c.traceDone(id, started, "ReadFile", target, "", "", 0, 0, err)
 		return nil, err
 	}
 	if err := c.writeCachedFile(parsed, data); err != nil {
+		c.traceDone(id, started, "ReadFile", target, "", cvmfsFileCachePath(c.CacheDir, parsed.Repo, parsed.Path), len(data), 0, err)
 		return nil, err
 	}
+	c.traceDone(id, started, "ReadFile", target, "", cvmfsFileCachePath(c.CacheDir, parsed.Repo, parsed.Path), len(data), 0, nil)
 	return data, nil
 }
 
 func (c *Client) ReadFileRange(target string, offset, length int64) ([]byte, bool, error) {
+	id, started := c.traceStart("ReadFileRange", target, "", "")
 	if offset < 0 {
-		return nil, false, fmt.Errorf("offset must be >= 0")
+		err := fmt.Errorf("offset must be >= 0")
+		c.traceDone(id, started, "ReadFileRange", target, "", "", 0, 0, err)
+		return nil, false, err
 	}
 	if length < 0 {
-		return nil, false, fmt.Errorf("length must be >= 0")
+		err := fmt.Errorf("length must be >= 0")
+		c.traceDone(id, started, "ReadFileRange", target, "", "", 0, 0, err)
+		return nil, false, err
 	}
 	parsed, err := ParseTarget(target)
 	if err != nil {
+		c.traceDone(id, started, "ReadFileRange", target, "", "", 0, 0, err)
 		return nil, false, err
 	}
 	if !parsed.Remote {
 		data, err := os.ReadFile(parsed.LocalPath)
 		if err != nil {
+			c.traceDone(id, started, "ReadFileRange", target, "", "", 0, 0, err)
 			return nil, false, err
 		}
-		return sliceRange(data, offset, length), endOfRange(data, offset, length), nil
+		out := sliceRange(data, offset, length)
+		eof := endOfRange(data, offset, length)
+		c.traceDone(id, started, "ReadFileRange", target, "", "", len(out), 0, nil)
+		return out, eof, nil
 	}
 	cachePath := cvmfsFileCachePath(c.CacheDir, parsed.Repo, parsed.Path)
 	if file, err := os.Open(cachePath); err == nil {
 		defer file.Close()
 		info, statErr := file.Stat()
 		if statErr != nil {
+			c.traceDone(id, started, "ReadFileRange", target, "", cachePath, 0, 0, statErr)
 			return nil, false, statErr
 		}
 		if offset >= info.Size() {
+			c.traceDone(id, started, "ReadFileRange", target, "", cachePath, 0, 0, nil)
 			return []byte{}, true, nil
 		}
 		end := info.Size()
@@ -281,17 +327,24 @@ func (c *Client) ReadFileRange(target string, offset, length int64) ([]byte, boo
 		buf := make([]byte, end-offset)
 		n, readErr := file.ReadAt(buf, offset)
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			c.traceDone(id, started, "ReadFileRange", target, "", cachePath, n, 0, readErr)
 			return nil, false, readErr
 		}
+		c.traceDone(id, started, "ReadFileRange", target, "", cachePath, n, 0, nil)
 		return buf[:n], end == info.Size(), nil
 	} else if !errors.Is(err, os.ErrNotExist) {
+		c.traceDone(id, started, "ReadFileRange", target, "", cachePath, 0, 0, err)
 		return nil, false, err
 	}
 	data, err := c.ReadFile(target)
 	if err != nil {
+		c.traceDone(id, started, "ReadFileRange", target, "", "", 0, 0, err)
 		return nil, false, err
 	}
-	return sliceRange(data, offset, length), endOfRange(data, offset, length), nil
+	out := sliceRange(data, offset, length)
+	eof := endOfRange(data, offset, length)
+	c.traceDone(id, started, "ReadFileRange", target, "", "", len(out), 0, nil)
+	return out, eof, nil
 }
 
 func sliceRange(data []byte, offset, length int64) []byte {
@@ -317,30 +370,42 @@ func endOfRange(data []byte, offset, length int64) bool {
 }
 
 func (c *Client) Walk(target string, visit func(WalkEntry) error) error {
+	id, started := c.traceStart("Walk", target, "", "")
 	parsed, err := ParseTarget(target)
 	if err != nil {
+		c.traceDone(id, started, "Walk", target, "", "", 0, 0, err)
 		return err
 	}
 	if !parsed.Remote {
-		return walkLocal(parsed.LocalPath, visit)
+		err := walkLocal(parsed.LocalPath, visit)
+		c.traceDone(id, started, "Walk", target, "", "", 0, 0, err)
+		return err
 	}
 	repo := c.newRepository(parsed)
-	return repo.Walk(parsed.Path, visit)
+	err = repo.Walk(parsed.Path, visit)
+	c.traceDone(id, started, "Walk", target, "", "", 0, 0, err)
+	return err
 }
 
 func (c *Client) ManifestRootHash(target string) (string, error) {
+	id, started := c.traceStart("ManifestRootHash", target, "", "")
 	parsed, err := ParseTarget(target)
 	if err != nil {
+		c.traceDone(id, started, "ManifestRootHash", target, "", "", 0, 0, err)
 		return "", err
 	}
 	if !parsed.Remote {
-		return "", fmt.Errorf("manifest root hash is only available for remote CVMFS targets")
+		err := fmt.Errorf("manifest root hash is only available for remote CVMFS targets")
+		c.traceDone(id, started, "ManifestRootHash", target, "", "", 0, 0, err)
+		return "", err
 	}
 	repo := c.newRepository(parsed)
 	manifest, err := repo.getManifest()
 	if err != nil {
+		c.traceDone(id, started, "ManifestRootHash", target, "", "", 0, 0, err)
 		return "", err
 	}
+	c.traceDone(id, started, "ManifestRootHash", target, "", "", len(manifest.RootCatalogHash), 0, nil)
 	return manifest.RootCatalogHash, nil
 }
 
@@ -354,7 +419,7 @@ func (c *Client) newRepository(target Target) *repository {
 		httpClient = http.DefaultClient
 	}
 	return &repository{
-		client:   &Client{HTTPClient: httpClient, CacheDir: client.CacheDir},
+		client:   &Client{HTTPClient: httpClient, CacheDir: client.CacheDir, TraceLogPath: client.TraceLogPath},
 		mirror:   strings.TrimRight(target.Mirror, "/"),
 		repo:     target.Repo,
 		catalogs: map[string]*catalog{},
@@ -626,7 +691,9 @@ func (r *repository) getManifest() (*manifest, error) {
 }
 
 func (r *repository) fetchManifest() ([]byte, error) {
-	resp, err := r.client.HTTPClient.Get(r.mirror + "/" + r.repo + "/.cvmfspublished")
+	url := r.mirror + "/" + r.repo + "/.cvmfspublished"
+	id, started := r.client.traceStart("HTTPManifest", "", url, "")
+	resp, err := r.client.HTTPClient.Get(url)
 	if err == nil {
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
@@ -634,14 +701,22 @@ func (r *repository) fetchManifest() ([]byte, error) {
 		} else {
 			body, readErr := io.ReadAll(resp.Body)
 			if readErr != nil {
+				r.client.traceDone(id, started, "HTTPManifest", "", url, "", len(body), resp.StatusCode, readErr)
 				return nil, readErr
 			}
 			if writeErr := r.writeCachedManifest(body); writeErr != nil {
+				r.client.traceDone(id, started, "HTTPManifest", "", url, "", len(body), resp.StatusCode, writeErr)
 				return nil, writeErr
 			}
+			r.client.traceDone(id, started, "HTTPManifest", "", url, "", len(body), resp.StatusCode, nil)
 			return body, nil
 		}
 	}
+	statusCode := 0
+	if resp != nil {
+		statusCode = resp.StatusCode
+	}
+	r.client.traceDone(id, started, "HTTPManifest", "", url, "", 0, statusCode, err)
 	if body, cacheErr := r.readCachedManifest(); cacheErr == nil {
 		return body, nil
 	}
@@ -735,27 +810,43 @@ func (r *repository) fetchDataObject(hash string, partial bool) ([]byte, error) 
 }
 
 func (r *repository) fetchCompressedObject(hash, suffix string) ([]byte, error) {
-	if data, err := r.readCachedObject(hash, suffix); err == nil {
-		return data, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, err
+	cachePath := cvmfsObjectCachePath(r.client.CacheDir, hash, suffix)
+	if cachePath != "" {
+		cacheID, cacheStarted := r.client.traceStart("CacheObject", "", "", cachePath)
+		if data, err := r.readCachedObject(hash, suffix); err == nil {
+			r.client.traceDone(cacheID, cacheStarted, "CacheObject", "", "", cachePath, len(data), 0, nil)
+			return data, nil
+		} else {
+			r.client.traceDone(cacheID, cacheStarted, "CacheObject", "", "", cachePath, 0, 0, err)
+			if !errors.Is(err, os.ErrNotExist) {
+				return nil, err
+			}
+		}
 	}
 
-	resp, err := r.client.HTTPClient.Get(r.objectURL(hash, suffix))
+	url := r.objectURL(hash, suffix)
+	id, started := r.client.traceStart("HTTPObject", "", url, "")
+	resp, err := r.client.HTTPClient.Get(url)
 	if err != nil {
+		r.client.traceDone(id, started, "HTTPObject", "", url, "", 0, 0, err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("fetch object: unexpected status %s", resp.Status)
+		err := fmt.Errorf("fetch object: unexpected status %s", resp.Status)
+		r.client.traceDone(id, started, "HTTPObject", "", url, "", 0, resp.StatusCode, err)
+		return nil, err
 	}
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
+		r.client.traceDone(id, started, "HTTPObject", "", url, "", len(data), resp.StatusCode, err)
 		return nil, err
 	}
 	if err := r.writeCachedObject(hash, suffix, data); err != nil {
+		r.client.traceDone(id, started, "HTTPObject", "", url, cachePath, len(data), resp.StatusCode, err)
 		return nil, err
 	}
+	r.client.traceDone(id, started, "HTTPObject", "", url, cachePath, len(data), resp.StatusCode, nil)
 	return data, nil
 }
 
@@ -800,6 +891,88 @@ func (r *repository) writeCachedObject(hash, suffix string, data []byte) error {
 
 func (r *repository) objectURL(hash, suffix string) string {
 	return fmt.Sprintf("%s/%s/data/%s/%s%s", r.mirror, r.repo, hash[:2], hash[2:], suffix)
+}
+
+func (c *Client) traceStart(op, target, url, cachePath string) (uint64, time.Time) {
+	if c == nil || c.tracePath() == "" {
+		return 0, time.Time{}
+	}
+	id := traceID.Add(1)
+	started := time.Now()
+	c.writeTrace(traceEvent{
+		Time:      started.UTC().Format(time.RFC3339Nano),
+		ID:        id,
+		Event:     "start",
+		Op:        op,
+		Target:    target,
+		URL:       url,
+		CachePath: cachePath,
+	})
+	return id, started
+}
+
+func (c *Client) traceDone(
+	id uint64,
+	started time.Time,
+	op string,
+	target string,
+	url string,
+	cachePath string,
+	bytes int,
+	statusCode int,
+	err error,
+) {
+	if c == nil || id == 0 || c.tracePath() == "" {
+		return
+	}
+	event := traceEvent{
+		Time:       time.Now().UTC().Format(time.RFC3339Nano),
+		ID:         id,
+		Event:      "done",
+		Op:         op,
+		Target:     target,
+		URL:        url,
+		CachePath:  cachePath,
+		Bytes:      bytes,
+		StatusCode: statusCode,
+		DurationMS: float64(time.Since(started).Microseconds()) / 1000.0,
+	}
+	if err != nil {
+		event.Error = err.Error()
+	}
+	c.writeTrace(event)
+}
+
+func (c *Client) tracePath() string {
+	if c == nil {
+		return ""
+	}
+	if path := strings.TrimSpace(c.TraceLogPath); path != "" {
+		return path
+	}
+	if path := strings.TrimSpace(os.Getenv("CCX3_CVMFS_LOG")); path != "" {
+		return path
+	}
+	if cacheDir := strings.TrimSpace(c.CacheDir); cacheDir != "" {
+		return filepath.Join(cacheDir, "requests.log")
+	}
+	return ""
+}
+
+func (c *Client) writeTrace(event traceEvent) {
+	tracePath := c.tracePath()
+	if tracePath == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(tracePath), 0o755); err != nil {
+		return
+	}
+	file, err := os.OpenFile(tracePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	_ = json.NewEncoder(file).Encode(event)
 }
 
 func loadCatalog(db *intsqlite.SQLiteDatabase) (*catalog, error) {
