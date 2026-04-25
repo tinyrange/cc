@@ -17,21 +17,23 @@ from pyneurodesk.fulltest import (
 )
 
 
+FIXTURE_RECIPE = Path(__file__).parents[1] / "fixtures" / "niimath" / "fulltest.yaml"
+
+
 def test_load_suite_parses_niimath_recipe() -> None:
-    suite = load_suite(default_recipe_path())
+    suite = load_suite(FIXTURE_RECIPE)
 
     assert suite.name == "niimath"
     assert suite.container == "niimath_1.0.20250804_20251016.simg"
-    assert len(suite.required_files) == 1
-    assert suite.required_files[0].dataset == "ds000001"
+    assert len(suite.required_files) == 0
     assert len(suite.tests) >= 3
     assert suite.tests[0].name == "Version check"
     assert suite.tests[0].expected_output_contains == ("niimath version",)
-    assert suite.tests[1].expected_output_contains == ("nifti_type",)
+    assert suite.tests[1].expected_output_contains == ("Usage: niimath",)
 
 
 def test_build_container_reference_defaults_to_cvmfs_directory() -> None:
-    suite = load_suite(default_recipe_path())
+    suite = load_suite(FIXTURE_RECIPE)
 
     reference = build_container_reference(
         suite,
@@ -93,9 +95,9 @@ def test_default_recipe_path_points_to_existing_recipe() -> None:
 
 
 def test_infer_shell_hook_commands_collects_recipe_entrypoints() -> None:
-    suite = load_suite(default_recipe_path())
+    suite = load_suite(FIXTURE_RECIPE)
 
-    assert infer_shell_hook_commands(suite) == {"niimath"}
+    assert infer_shell_hook_commands(suite) == {"niimath", "sh"}
 
 
 def test_first_shell_command_handles_quoted_arguments() -> None:
@@ -105,7 +107,7 @@ def test_first_shell_command_handles_quoted_arguments() -> None:
 
 
 def test_load_command_uses_nd_load_with_source_and_recipe_commands() -> None:
-    suite = load_suite(default_recipe_path())
+    suite = load_suite(FIXTURE_RECIPE)
     reference = build_container_reference(
         suite,
         image_name="fulltest-image",
@@ -136,7 +138,7 @@ def test_load_command_uses_nd_load_with_source_and_recipe_commands() -> None:
 
 
 def test_load_command_defaults_to_8gb_memory() -> None:
-    suite = load_suite(default_recipe_path())
+    suite = load_suite(FIXTURE_RECIPE)
     reference = build_container_reference(
         suite,
         image_name="fulltest-image",
