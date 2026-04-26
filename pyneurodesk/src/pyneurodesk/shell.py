@@ -75,12 +75,12 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     activate_parser = subparsers.add_parser("activate", help="Emit shell activation code")
-    activate_parser.add_argument("--shell", choices=("bash", "zsh"), default=None)
+    activate_parser.add_argument("--shell", choices=("bash", "zsh", "powershell", "pwsh"), default=None)
     activate_parser.add_argument("--no-bootstrap", action="store_true")
     activate_parser.set_defaults(handler=handle_activate)
 
     completion_parser = subparsers.add_parser("completion", help="Emit shell completion code")
-    completion_parser.add_argument("--shell", choices=("bash", "zsh"), required=True)
+    completion_parser.add_argument("--shell", choices=("bash", "zsh", "powershell", "pwsh"), required=True)
     completion_parser.set_defaults(handler=handle_completion)
 
     shell_parser = subparsers.add_parser("shell", help="Shell session commands")
@@ -113,7 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     exec_parser.set_defaults(handler=handle_exec)
 
     shell_completion_parser = shell_subparsers.add_parser("completion", help="Emit nd shell completion code")
-    shell_completion_parser.add_argument("--shell", choices=("bash", "zsh"), required=True)
+    shell_completion_parser.add_argument("--shell", choices=("bash", "zsh", "powershell", "pwsh"), required=True)
     shell_completion_parser.set_defaults(handler=handle_completion)
 
     bootstrap_parser = shell_subparsers.add_parser("bootstrap", help=argparse.SUPPRESS)
@@ -135,7 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def handle_activate(args: argparse.Namespace) -> int:
-    shell_name = args.shell or detect_shell()
+    shell_name = normalize_shell_name(args.shell or detect_shell())
     session_id = uuid.uuid4().hex
     root = session_root_for_id(session_id)
     root.mkdir(parents=True, exist_ok=True)
@@ -146,7 +146,7 @@ def handle_activate(args: argparse.Namespace) -> int:
 
 
 def handle_completion(args: argparse.Namespace) -> int:
-    print(render_completion(str(args.shell)))
+    print(render_completion(normalize_shell_name(str(args.shell))))
     return 0
 
 
@@ -284,15 +284,7 @@ def handle_exec(args: argparse.Namespace) -> int:
 
 def handle_bootstrap(args: argparse.Namespace) -> int:
     _ = args
-    daemon = start_default_daemon()
-    with connect(base_url=daemon.base_url) as client:
-        state = client.instance_status()
-        if state.status != "running":
-            try:
-                client.start_instance()
-            except httpx.HTTPStatusError as exc:
-                if exc.response.status_code != 404:
-                    raise
+    start_default_daemon()
     return 0
 
 
@@ -440,13 +432,37 @@ def normalize_command_args(values: list[str]) -> list[str]:
 
 
 def detect_shell() -> str:
+    if is_windows_host():
+        return "powershell"
+    if os.environ.get("PSModulePath") and not os.environ.get("SHELL"):
+        return "powershell"
     shell = Path(os.environ.get("SHELL", "")).name
+    shell = normalize_shell_name(shell)
     if shell in {"bash", "zsh"}:
         return shell
     return "bash"
 
 
+def is_windows_host() -> bool:
+    return os.name == "nt"
+
+
+def normalize_shell_name(shell_name: str) -> str:
+    shell = Path(str(shell_name or "").strip()).name.lower()
+    shell = shell.removesuffix(".exe")
+    if shell in {"pwsh", "powershell", "powershell_ise"}:
+        return "powershell"
+    if shell in {"bash", "zsh"}:
+        return shell
+    return shell
+
+
 def render_activation(shell_name: str, session_id: str, root: Path, *, bootstrap: bool) -> str:
+    shell_name = normalize_shell_name(shell_name)
+    if shell_name == "powershell":
+        return render_powershell_activation(session_id, root, bootstrap=bootstrap)
+    if shell_name not in {"bash", "zsh"}:
+        raise SystemExit(f"unsupported shell for activation: {shell_name}")
     quoted_root = shlex.quote(str(root))
     quoted_bin = shlex.quote(str(root / "bin"))
     quoted_session = shlex.quote(session_id)
@@ -492,7 +508,55 @@ def render_activation(shell_name: str, session_id: str, root: Path, *, bootstrap
     return "\n".join(line for line in lines if line)
 
 
+def render_powershell_activation(session_id: str, root: Path, *, bootstrap: bool) -> str:
+    quoted_root = powershell_quote(str(root))
+    quoted_bin = powershell_quote(str(root / "bin"))
+    quoted_session = powershell_quote(session_id)
+    lines = [
+        "$env:_PYNEURODESK_OLD_PATH = $env:PATH",
+        f"$env:{SESSION_ENV} = {quoted_session}",
+        f"$env:{SESSION_ROOT_ENV} = {quoted_root}",
+        f"$env:{SESSION_BIN_ENV} = {quoted_bin}",
+        f"$env:PATH = \"$env:{SESSION_BIN_ENV};$env:PATH\"",
+        "function global:nd {",
+        "  if ($args.Count -eq 0) {",
+        "    neurodesk shell --help",
+        "  } else {",
+        "    neurodesk shell @args",
+        "  }",
+        "}",
+        render_completion("powershell"),
+    ]
+    if bootstrap:
+        lines.extend(
+            [
+                '$__pyneurodesk_bootstrap = Start-Process -FilePath "neurodesk" -ArgumentList @("shell", "bootstrap") -WindowStyle Hidden -PassThru',
+                f"$env:{BOOTSTRAP_PID_ENV} = [string]$__pyneurodesk_bootstrap.Id",
+                "Remove-Variable __pyneurodesk_bootstrap -ErrorAction SilentlyContinue",
+            ]
+        )
+    lines.extend(
+        [
+            "function global:neurodesk_deactivate {",
+            "  if ($env:_PYNEURODESK_OLD_PATH) {",
+            "    $env:PATH = $env:_PYNEURODESK_OLD_PATH",
+            "  }",
+            "  Remove-Item Env:_PYNEURODESK_OLD_PATH -ErrorAction SilentlyContinue",
+            f"  Remove-Item Env:{SESSION_ENV} -ErrorAction SilentlyContinue",
+            f"  Remove-Item Env:{SESSION_ROOT_ENV} -ErrorAction SilentlyContinue",
+            f"  Remove-Item Env:{SESSION_BIN_ENV} -ErrorAction SilentlyContinue",
+            f"  Remove-Item Env:{BOOTSTRAP_PID_ENV} -ErrorAction SilentlyContinue",
+            render_completion_cleanup("powershell"),
+            "  Remove-Item Function:nd -ErrorAction SilentlyContinue",
+            "  Remove-Item Function:neurodesk_deactivate -ErrorAction SilentlyContinue",
+            "}",
+        ]
+    )
+    return "\n".join(line for line in lines if line)
+
+
 def render_completion(shell_name: str) -> str:
+    shell_name = normalize_shell_name(shell_name)
     if shell_name == "bash":
         return "\n".join(
             [
@@ -528,14 +592,34 @@ def render_completion(shell_name: str) -> str:
                 "fi",
             ]
         )
+    if shell_name == "powershell":
+        return "\n".join(
+            [
+                "Register-ArgumentCompleter -CommandName neurodesk,nd -ScriptBlock {",
+                "  param($commandName, $wordToComplete, $cursorPosition, $commandAst, $fakeBoundParameters)",
+                "  $words = @()",
+                "  foreach ($element in $commandAst.CommandElements) {",
+                "    $words += $element.Extent.Text",
+                "  }",
+                "  $index = [Math]::Max(0, $words.Count - 1)",
+                "  if ($wordToComplete -eq '') { $index = $words.Count }",
+                "  neurodesk shell complete --index $index -- @words | ForEach-Object {",
+                "    [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)",
+                "  }",
+                "}",
+            ]
+        )
     raise SystemExit(f"unsupported shell for completion: {shell_name}")
 
 
 def render_completion_cleanup(shell_name: str) -> str:
+    shell_name = normalize_shell_name(shell_name)
     if shell_name == "bash":
         return "  complete -r neurodesk nd 2>/dev/null"
     if shell_name == "zsh":
         return "  unfunction _neurodesk_complete _nd_complete 2>/dev/null"
+    if shell_name == "powershell":
+        return '  Register-ArgumentCompleter -CommandName neurodesk,nd -ScriptBlock { "" }'
     raise SystemExit(f"unsupported shell for completion cleanup: {shell_name}")
 
 
@@ -567,9 +651,9 @@ def complete_words(words: list[str], *, index: int) -> list[str]:
 
     top = normalized[1]
     if top == "activate":
-        return filter_prefix(["--shell", "--no-bootstrap", "bash", "zsh"])
+        return filter_prefix(["--shell", "--no-bootstrap", "bash", "zsh", "powershell"])
     if top == "completion":
-        return filter_prefix(["--shell", "bash", "zsh"])
+        return filter_prefix(["--shell", "bash", "zsh", "powershell"])
     if top != "shell":
         return []
 
@@ -578,7 +662,7 @@ def complete_words(words: list[str], *, index: int) -> list[str]:
 
     subcommand = normalized[2]
     if subcommand == "completion":
-        return filter_prefix(["--shell", "bash", "zsh"])
+        return filter_prefix(["--shell", "bash", "zsh", "powershell"])
     if subcommand == "load":
         return filter_prefix(["--command", "--force"])
     if subcommand in {"unload", "exec"}:
@@ -606,9 +690,9 @@ def sync_wrappers(
 ) -> None:
     desired = desired_wrappers(state, preferred_images=preferred_images, force=force)
     for command_name, spec in desired.items():
-        write_wrapper(state.bin_dir / command_name, image=spec.image, command=spec.command)
+        write_wrapper(wrapper_path(state.bin_dir, command_name), image=spec.image, command=spec.command)
     for command_name in sorted(set(state.wrappers) - set(desired)):
-        remove_wrapper_file(state.bin_dir / command_name)
+        remove_wrapper_file(wrapper_path(state.bin_dir, command_name))
     state.wrappers = desired
 
 
@@ -700,6 +784,9 @@ def write_state(state: SessionState) -> None:
 
 
 def write_wrapper(path: Path, *, image: str, command: str) -> None:
+    if os.name == "nt":
+        write_cmd_wrapper(path, image=image, command=command)
+        return
     command_path = shlex.quote(resolve_command_name())
     content = "\n".join(
         [
@@ -721,6 +808,40 @@ def write_wrapper(path: Path, *, image: str, command: str) -> None:
     tmp_path.replace(path)
 
 
+def write_cmd_wrapper(path: Path, *, image: str, command: str) -> None:
+    command_path = resolve_command_name()
+    content = "\r\n".join(
+        [
+            "@echo off",
+            "setlocal",
+            f'"{command_path}" shell run-wrapper --session "%{SESSION_ENV}%" '
+            + f"--image {cmd_quote(image)} "
+            + f"--command {cmd_quote(command)} "
+            + "-- %*",
+        ]
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False, newline="") as tmp:
+        tmp.write(content)
+        tmp.write("\r\n")
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(path)
+
+
+def wrapper_path(bin_dir: Path, command_name: str) -> Path:
+    if os.name == "nt":
+        return bin_dir / f"{command_name}.cmd"
+    return bin_dir / command_name
+
+
+def powershell_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def cmd_quote(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
 def resolve_command_name() -> str:
     found = shutil.which("neurodesk")
     if found:
@@ -729,4 +850,4 @@ def resolve_command_name() -> str:
 
 
 def is_valid_wrapper_name(command: str) -> bool:
-    return bool(command) and "/" not in command and command not in {".", ".."}
+    return bool(command) and "/" not in command and "\\" not in command and command not in {".", ".."}
