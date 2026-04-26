@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -12,6 +13,12 @@ import pytest
 
 from pyneurodesk import shell
 from pyneurodesk.models import ContainerReference, ImageSource
+
+
+def test_package_installs_nd_entrypoint() -> None:
+    pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
+
+    assert pyproject["project"]["scripts"]["nd"] == "pyneurodesk:main"
 
 
 def test_activate_emits_shell_code_initializes_session_and_bootstraps_by_default(
@@ -60,76 +67,77 @@ def test_completion_emits_zsh_support(capsys: pytest.CaptureFixture[str]) -> Non
     assert "compdef _nd_complete nd" in output
 
 
+def test_activate_emits_powershell_code_initializes_session(
+    monkeypatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("pyneurodesk.shell.default_cache_root", lambda: tmp_path / "cache")
+
+    exit_code = shell.main(["activate", "--shell", "powershell", "--no-bootstrap"])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "$env:PYNEURODESK_SHELL_SESSION" in output
+    assert "$env:PYNEURODESK_SHELL_ROOT" in output
+    assert "$env:PYNEURODESK_SHELL_BIN" in output
+    assert "$env:PATH = \"$env:PYNEURODESK_SHELL_BIN;$env:PATH\"" in output
+    assert "function global:nd" in output
+    assert "neurodesk shell --help" in output
+    assert "Register-ArgumentCompleter -CommandName neurodesk,nd" in output
+    assert "Start-Process" not in output
+    session_dirs = list((tmp_path / "cache" / "pyneurodesk-shell").iterdir())
+    assert len(session_dirs) == 1
+    state = json.loads((session_dirs[0] / "state.json").read_text())
+    assert state["version"] == 1
+    assert state["images"] == {}
+    assert state["wrappers"] == {}
+
+
+def test_completion_emits_powershell_support(capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = shell.main(["completion", "--shell", "powershell"])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Register-ArgumentCompleter -CommandName neurodesk,nd" in output
+    assert "neurodesk shell complete --index $index -- @words" in output
+    assert "CompletionResult" in output
+
+
+def test_activate_defaults_to_powershell_on_windows(
+    monkeypatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("pyneurodesk.shell.is_windows_host", lambda: True)
+    monkeypatch.setattr("pyneurodesk.shell.default_cache_root", lambda: tmp_path / "cache")
+
+    assert shell.main(["activate", "--no-bootstrap"]) == 0
+
+    output = capsys.readouterr().out
+    assert "$env:PYNEURODESK_SHELL_SESSION" in output
+    assert "Register-ArgumentCompleter -CommandName neurodesk,nd" in output
+
+
+def test_pwsh_alias_uses_powershell_renderer(capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = shell.main(["completion", "--shell", "pwsh"])
+
+    assert exit_code == 0
+    assert "Register-ArgumentCompleter -CommandName neurodesk,nd" in capsys.readouterr().out
+
+
 def test_shell_bootstrap_starts_default_daemon(monkeypatch) -> None:
     calls: list[tuple[str, object]] = []
 
-    class FakeClient:
-        def __enter__(self) -> "FakeClient":
-            return self
-
-        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-            return None
-
-        def instance_status(self) -> object:
-            calls.append(("status", None))
-            return SimpleNamespace(status="stopped")
-
-        def start_instance(self) -> object:
-            calls.append(("start_instance", None))
-            return SimpleNamespace(status="running")
-
     monkeypatch.setattr(
         "pyneurodesk.shell.start_default_daemon",
         lambda: calls.append(("boot", None)) or SimpleNamespace(base_url="http://daemon.test"),
     )
-    monkeypatch.setattr("pyneurodesk.shell.connect", lambda base_url: calls.append(("connect", base_url)) or FakeClient())
 
     exit_code = shell.main(["shell", "bootstrap"])
 
     assert exit_code == 0
-    assert calls == [
-        ("boot", None),
-        ("connect", "http://daemon.test"),
-        ("status", None),
-        ("start_instance", None),
-    ]
-
-
-def test_shell_bootstrap_ignores_missing_vm_start_on_existing_daemon(monkeypatch) -> None:
-    calls: list[tuple[str, object]] = []
-
-    class FakeClient:
-        def __enter__(self) -> "FakeClient":
-            return self
-
-        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-            return None
-
-        def instance_status(self) -> object:
-            calls.append(("status", None))
-            return SimpleNamespace(status="stopped")
-
-        def start_instance(self) -> object:
-            calls.append(("start_instance", None))
-            request = httpx.Request("POST", "http://daemon.test/vm/start")
-            response = httpx.Response(404, request=request)
-            raise httpx.HTTPStatusError("missing", request=request, response=response)
-
-    monkeypatch.setattr(
-        "pyneurodesk.shell.start_default_daemon",
-        lambda: calls.append(("boot", None)) or SimpleNamespace(base_url="http://daemon.test"),
-    )
-    monkeypatch.setattr("pyneurodesk.shell.connect", lambda base_url: calls.append(("connect", base_url)) or FakeClient())
-
-    exit_code = shell.main(["shell", "bootstrap"])
-
-    assert exit_code == 0
-    assert calls == [
-        ("boot", None),
-        ("connect", "http://daemon.test"),
-        ("status", None),
-        ("start_instance", None),
-    ]
+    assert calls == [("boot", None)]
 
 
 def test_shell_load_discovers_commands_writes_wrappers_and_persists_env(
@@ -204,6 +212,27 @@ def test_shell_load_discovers_commands_writes_wrappers_and_persists_env(
     assert '--command niimath' in wrapper
     assert calls[0] == ("cvmfs_list", "/containers/niimath_1.0.20250804_20251016")
     assert calls[-1] == ("close", None)
+
+
+def test_write_cmd_wrapper_generates_windows_native_shim(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("pyneurodesk.shell.resolve_command_name", lambda: r"C:\Program Files\Neurodesk\neurodesk.exe")
+    path = tmp_path / "bin" / "niimath.cmd"
+
+    shell.write_cmd_wrapper(path, image="niimath", command="niimath")
+
+    wrapper = path.read_text()
+    assert wrapper.startswith("@echo off")
+    assert r'"C:\Program Files\Neurodesk\neurodesk.exe" shell run-wrapper' in wrapper
+    assert f'--session "%{shell.SESSION_ENV}%"' in wrapper
+    assert '--image "niimath"' in wrapper
+    assert '--command "niimath"' in wrapper
+    assert "-- %*" in wrapper
+
+
+def test_wrapper_path_uses_cmd_extension_on_windows(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(shell.os, "name", "nt")
+
+    assert shell.wrapper_path(tmp_path, "bet") == tmp_path / "bet.cmd"
 
 
 def test_shell_load_source_stores_reference_and_prepares_image(

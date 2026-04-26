@@ -61,6 +61,13 @@ type Vsock struct {
 	pendingRx        [][]byte
 	closed           chan struct{}
 	wg               sync.WaitGroup
+	mmioReads        uint64
+	mmioWrites       uint64
+	txNotifies       uint64
+	rxNotifies       uint64
+	connectRequests  uint64
+	queuedRxPackets  uint64
+	irqTransitions   uint64
 }
 
 type vsockConnKey struct {
@@ -124,6 +131,7 @@ func (v *Vsock) DeviceTreeNode() fdt.Node {
 func (v *Vsock) Read(addr uint64, size int) (uint64, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	v.mmioReads++
 
 	offset := addr - v.Base
 	switch offset {
@@ -176,6 +184,7 @@ func (v *Vsock) Read(addr uint64, size int) (uint64, error) {
 func (v *Vsock) Write(addr uint64, size int, value uint64) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	v.mmioWrites++
 
 	offset := addr - v.Base
 	switch offset {
@@ -238,8 +247,10 @@ func (v *Vsock) Write(addr uint64, size int, value uint64) error {
 	case regQueueNotify:
 		switch value {
 		case vsockQueueTX:
+			v.txNotifies++
 			return v.processTXLocked()
 		case vsockQueueRX:
+			v.rxNotifies++
 			return v.processRXLocked()
 		case vsockQueueEvent:
 			return nil
@@ -266,6 +277,34 @@ func (v *Vsock) Close() error {
 	v.mu.Unlock()
 	v.wg.Wait()
 	return nil
+}
+
+func (v *Vsock) Summary() string {
+	if v == nil {
+		return "virtio-vsock=<nil>"
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return fmt.Sprintf(
+		"virtio-vsock mmio_reads=%d mmio_writes=%d status=%#x tx_notify=%d rx_notify=%d connect_requests=%d queued_rx=%d pending_rx=%d irq_transitions=%d irq_high=%t interrupt_status=%#x q0_ready=%t q1_ready=%t q2_ready=%t q0_last=%d q1_last=%d q2_last=%d",
+		v.mmioReads,
+		v.mmioWrites,
+		v.status,
+		v.txNotifies,
+		v.rxNotifies,
+		v.connectRequests,
+		v.queuedRxPackets,
+		len(v.pendingRx),
+		v.irqTransitions,
+		v.irqHigh,
+		v.interruptStatus,
+		v.queues[0].ready,
+		v.queues[1].ready,
+		v.queues[2].ready,
+		v.queues[0].lastAvailIdx,
+		v.queues[1].lastAvailIdx,
+		v.queues[2].lastAvailIdx,
+	)
 }
 
 func (v *Vsock) processTXLocked() error {
@@ -336,6 +375,7 @@ func (v *Vsock) handleTXPacketLocked(q *queue, head uint16) (uint32, error) {
 }
 
 func (v *Vsock) handleConnectLocked(hdr vsockHeader) {
+	v.connectRequests++
 	key := vsockConnKey{localPort: hdr.DstPort, remotePort: hdr.SrcPort}
 	if v.backend == nil {
 		v.sendResetLocked(hdr)
@@ -520,6 +560,7 @@ func (v *Vsock) processRXLocked() error {
 
 func (v *Vsock) queueRxPacketLocked(packet []byte) {
 	v.pendingRx = append(v.pendingRx, append([]byte(nil), packet...))
+	v.queuedRxPackets++
 }
 
 func (v *Vsock) sendResponseLocked(hdr vsockHeader) {
@@ -670,6 +711,7 @@ func (v *Vsock) updateIRQLocked() error {
 		return nil
 	}
 	v.irqHigh = level
+	v.irqTransitions++
 	return v.irq.SetIRQ(v.IRQ, level)
 }
 

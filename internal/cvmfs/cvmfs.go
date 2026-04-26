@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"j5.nz/cc/internal/linuxabi"
 	intsqlite "j5.nz/cc/internal/sqlite"
 )
 
@@ -33,15 +34,15 @@ const (
 	flagChunkedFile  = 64
 	flagExternalFile = 128
 
-	linuxSIFMT    = 0o170000
-	linuxSIFSOCK  = 0o140000
-	linuxSIFLNK   = 0o120000
-	linuxSIFREG   = 0o100000
-	linuxSIFBLK   = 0o060000
-	linuxSIFDIR   = 0o040000
-	linuxSIFCHR   = 0o020000
-	linuxSIFIFO   = 0o010000
-	linuxPermMask = 0o7777
+	linuxSIFMT    = linuxabi.SIFMT
+	linuxSIFSOCK  = linuxabi.SIFSOCK
+	linuxSIFLNK   = linuxabi.SIFLNK
+	linuxSIFREG   = linuxabi.SIFREG
+	linuxSIFBLK   = linuxabi.SIFBLK
+	linuxSIFDIR   = linuxabi.SIFDIR
+	linuxSIFCHR   = linuxabi.SIFCHR
+	linuxSIFIFO   = linuxabi.SIFIFO
+	linuxPermMask = linuxabi.PermMask
 )
 
 var errStopWalk = errors.New("stop walk")
@@ -212,7 +213,7 @@ func ParseTarget(raw string) (Target, error) {
 			LocalPath: clean,
 		}, nil
 	}
-	if strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, ".") {
+	if filepath.IsAbs(raw) || strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, ".") {
 		return Target{
 			Raw:       raw,
 			Path:      "/",

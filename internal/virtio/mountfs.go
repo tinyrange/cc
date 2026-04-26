@@ -9,12 +9,13 @@ import (
 	"time"
 
 	"j5.nz/cc/internal/imagefs"
+	"j5.nz/cc/internal/linuxabi"
 )
 
 const (
-	linuxEBUSY int32 = 16
-	linuxEXDEV int32 = 18
-	linuxEROFS int32 = 30
+	linuxEBUSY = linuxabi.EBUSY
+	linuxEXDEV = linuxabi.EXDEV
+	linuxEROFS = linuxabi.EROFS
 )
 
 type ShareMount struct {

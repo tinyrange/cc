@@ -317,9 +317,7 @@ class PyNeurodeskClient:
         state = self.instance_status()
         if state.status == "running" and state.image == image:
             return state
-        if state.status == "running" and state.image in ("", None):
-            return state
-        if state.status == "running" and state.image not in ("", None, image):
+        if state.status == "running" and state.image not in (image,):
             self.shutdown_instance()
             return self.create_instance(image, timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus)
         if state.status == "stopped":

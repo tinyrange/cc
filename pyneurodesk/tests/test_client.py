@@ -443,13 +443,17 @@ def test_start_instance_stream_yields_boot_events() -> None:
     assert [event["kind"] for event in events] == ["status", "ready"]
 
 
-def test_ensure_instance_accepts_running_blank_vm() -> None:
+def test_ensure_instance_replaces_running_blank_vm() -> None:
     seen: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request.url.path)
         if request.method == "GET" and request.url.path == "/vm/status":
             return httpx.Response(200, json={"status": "running"})
+        if request.method == "POST" and request.url.path == "/vm/shutdown":
+            return httpx.Response(200, json={"status": "stopped"})
+        if request.method == "POST" and request.url.path == "/vm":
+            return httpx.Response(200, json={"status": "running", "image": "niimath"})
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
 
     client = make_client(httpx.MockTransport(handler))
@@ -459,7 +463,7 @@ def test_ensure_instance_accepts_running_blank_vm() -> None:
         client.close()
 
     assert state.status == "running"
-    assert seen == ["/vm/status"]
+    assert seen == ["/vm/status", "/vm/shutdown", "/vm"]
 
 
 def test_resolve_boot_timeout_defaults_to_30_seconds() -> None:

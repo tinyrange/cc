@@ -3,6 +3,7 @@ package imagefs
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -18,6 +19,9 @@ func TestResolveCommandAbsoluteAndPATH(t *testing.T) {
 		t.Fatalf("WriteFile(plain) error = %v", err)
 	}
 	if err := os.Symlink("tool", filepath.Join(root, "bin", "tool-link")); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink creation requires privileges on windows: %v", err)
+		}
 		t.Fatalf("Symlink(tool-link) error = %v", err)
 	}
 

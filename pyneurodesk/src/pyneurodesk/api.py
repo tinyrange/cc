@@ -445,9 +445,13 @@ def container(
         if vm_state.status == "running":
             if vm_state.image == reference.image:
                 reporter.update(8, f"VM for {reference.image} is already running")
+            elif vm_state.image in ("", None):
+                reporter.update(8, f"Restarting blank VM for {reference.image}")
+                active_client.shutdown_instance()
+                vm_state = active_client.instance_status()
             else:
                 reporter.update(8, f"VM is already running with {vm_state.image}; {reference.image} will mount on demand")
-        else:
+        if vm_state.status != "running":
             reporter.update(8, "Downloading required file 1/2: Linux kernel")
             _report_required_download(
                 reporter,

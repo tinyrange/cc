@@ -118,6 +118,15 @@ nd load niimath
 niimath -help
 ```
 
+On PowerShell, `neurodesk activate` auto-detects the native shell. The short
+form uses PowerShell's built-in `iex` alias:
+
+```powershell
+nd activate | iex
+nd load niimath
+niimath -help
+```
+
 Run a one-off command through the active VM:
 
 ```sh

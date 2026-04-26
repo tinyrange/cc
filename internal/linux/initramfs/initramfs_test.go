@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -33,6 +34,9 @@ func TestBuildFromDirectoryIncludesSymlink(t *testing.T) {
 		t.Fatalf("WriteFile(busybox) error = %v", err)
 	}
 	if err := os.Symlink("busybox", filepath.Join(root, "bin", "sh")); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink creation requires privileges on windows: %v", err)
+		}
 		t.Fatalf("Symlink(sh) error = %v", err)
 	}
 

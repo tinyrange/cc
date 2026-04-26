@@ -19,6 +19,7 @@ import (
 	intcvmfs "j5.nz/cc/internal/cvmfs"
 	"j5.nz/cc/internal/fsmeta"
 	"j5.nz/cc/internal/imagefs"
+	"j5.nz/cc/internal/linuxabi"
 )
 
 var debugRootFSReads = strings.TrimSpace(os.Getenv("CCX3_DEBUG_ROOTFS_READS")) != ""
@@ -642,15 +643,15 @@ func imagefsMode(mode uint32, fallback fs.FileMode) fs.FileMode {
 }
 
 const (
-	ociLinuxSIFMT    = 0o170000
-	ociLinuxSIFSOCK  = 0o140000
-	ociLinuxSIFLNK   = 0o120000
-	ociLinuxSIFREG   = 0o100000
-	ociLinuxSIFBLK   = 0o060000
-	ociLinuxSIFDIR   = 0o040000
-	ociLinuxSIFCHR   = 0o020000
-	ociLinuxSIFIFO   = 0o010000
-	ociLinuxPermMask = 0o7777
+	ociLinuxSIFMT    = linuxabi.SIFMT
+	ociLinuxSIFSOCK  = linuxabi.SIFSOCK
+	ociLinuxSIFLNK   = linuxabi.SIFLNK
+	ociLinuxSIFREG   = linuxabi.SIFREG
+	ociLinuxSIFBLK   = linuxabi.SIFBLK
+	ociLinuxSIFDIR   = linuxabi.SIFDIR
+	ociLinuxSIFCHR   = linuxabi.SIFCHR
+	ociLinuxSIFIFO   = linuxabi.SIFIFO
+	ociLinuxPermMask = linuxabi.PermMask
 )
 
 func ociLinuxModeToGo(mode uint32) fs.FileMode {
