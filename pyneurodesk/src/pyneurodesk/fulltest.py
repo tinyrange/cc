@@ -152,6 +152,7 @@ class FullTestRunner:
             output, exit_code = shell_session.run(load_command(reference, suite, load_options), timeout_for(120, suite.default_timeout))
             if exit_code != 0:
                 raise RuntimeError(f"shell hook load failed with exit code {exit_code}: {output}")
+            shell_session.image = reference.image
             print(f"[fulltest] shell hooks ready image={reference.image}{memory_text}{cpu_text}", flush=True)
 
             if suite.setup.script.strip():
@@ -432,13 +433,26 @@ class ActivatedShellSession:
     work_dir: Path
     activation_script: Path
     env: dict[str, str]
+    image: Optional[str] = None
     root: Optional[Path] = None
 
     def run(self, command: str, timeout_seconds: float) -> tuple[str, int]:
+        guest_command = guest_shell_command(command)
+        if self.image and guest_command:
+            return self.run_direct_guest(guest_command, timeout_seconds)
         return run_shell(
             self.env,
             self.work_dir,
             "source " + shlex.quote(str(self.activation_script)) + "\n" + command,
+            timeout_seconds,
+        )
+
+    def run_direct_guest(self, command: list[str], timeout_seconds: float) -> tuple[str, int]:
+        words = ["neurodesk", "shell", "exec", str(self.image), "--", *command]
+        return run_shell(
+            self.env,
+            self.work_dir,
+            "source " + shlex.quote(str(self.activation_script)) + "\n" + " ".join(shlex.quote(word) for word in words),
             timeout_seconds,
         )
 
@@ -515,10 +529,26 @@ def infer_shell_hook_commands(suite: Suite) -> set[str]:
     commands: set[str] = set()
     scripts = [suite.setup.script, suite.cleanup.script, *(test.command for test in suite.tests)]
     for script in scripts:
+        if guest_shell_command(script):
+            continue
         command = first_shell_command(script)
         if command and shell_hooks.is_valid_wrapper_name(command):
             commands.add(command)
     return commands
+
+
+def guest_shell_command(script: str) -> Optional[list[str]]:
+    try:
+        words = shlex.split(script, comments=False, posix=True)
+    except ValueError:
+        return None
+    if len(words) < 3 or words[0] not in {"bash", "sh"}:
+        return None
+    if words[1] == "-lc":
+        return words
+    if len(words) >= 4 and words[1] == "-l" and words[2] == "-c":
+        return words
+    return None
 
 
 def first_shell_command(script: str) -> str:

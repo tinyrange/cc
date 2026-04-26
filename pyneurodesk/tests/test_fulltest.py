@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pyneurodesk.fulltest as fulltest
 from pyneurodesk.fulltest import (
+    ActivatedShellSession,
     build_container_reference,
     cvmfs_path_from_source,
     default_recipe_path,
     first_shell_command,
+    guest_shell_command,
     image_cache_name,
     infer_shell_hook_commands,
     load_command,
@@ -97,13 +100,47 @@ def test_default_recipe_path_points_to_existing_recipe() -> None:
 def test_infer_shell_hook_commands_collects_recipe_entrypoints() -> None:
     suite = load_suite(FIXTURE_RECIPE)
 
-    assert infer_shell_hook_commands(suite) == {"niimath", "sh"}
+    assert infer_shell_hook_commands(suite) == {"niimath"}
 
 
 def test_first_shell_command_handles_quoted_arguments() -> None:
     assert first_shell_command("niimath -help") == "niimath"
     assert first_shell_command("sh -lc 'echo ok'") == "sh"
     assert first_shell_command("'broken") == ""
+
+
+def test_guest_shell_command_detects_login_shell_execution() -> None:
+    assert guest_shell_command("bash -lc 'ls /opt/tool'") == ["bash", "-lc", "ls /opt/tool"]
+    assert guest_shell_command("sh -l -c 'ls /opt/tool'") == ["sh", "-l", "-c", "ls /opt/tool"]
+    assert guest_shell_command("bash -c 'ls /opt/tool'") is None
+    assert guest_shell_command("env QT_QPA_PLATFORM=offscreen bash -lc 'tool'") is None
+
+
+def test_activated_shell_session_runs_login_shell_directly_in_guest(monkeypatch, tmp_path: Path) -> None:
+    calls: list[tuple[dict[str, str], Path, str, float]] = []
+
+    def fake_run_shell(env: dict[str, str], work_dir: Path, command: str, timeout_seconds: float) -> tuple[str, int]:
+        calls.append((env, work_dir, command, timeout_seconds))
+        return "ok", 0
+
+    monkeypatch.setattr(fulltest, "run_shell", fake_run_shell)
+    activation_script = tmp_path / "activate.sh"
+    session = ActivatedShellSession(
+        work_dir=tmp_path,
+        activation_script=activation_script,
+        env={"CCX3_URL": "http://example.test"},
+        image="fulltest-image",
+    )
+
+    output, exit_code = session.run("bash -lc 'ls /opt/tool'", 30.0)
+
+    assert (output, exit_code) == ("ok", 0)
+    assert len(calls) == 1
+    assert calls[0][0] == {"CCX3_URL": "http://example.test"}
+    assert calls[0][1] == tmp_path
+    assert calls[0][3] == 30.0
+    assert calls[0][2].startswith("source ")
+    assert "neurodesk shell exec fulltest-image -- bash -lc 'ls /opt/tool'" in calls[0][2]
 
 
 def test_load_command_uses_nd_load_with_source_and_recipe_commands() -> None:
@@ -132,6 +169,7 @@ def test_load_command_uses_nd_load_with_source_and_recipe_commands() -> None:
     assert command.startswith("nd load fulltest-image --source")
     assert "'/containers/custom container'" in command
     assert "--command niimath" in command
+    assert "--command sh" not in command
     assert "--cache-dir '/tmp/cache dir'" in command
     assert "--memory-mb 512" in command
     assert "--cpus 2" in command
