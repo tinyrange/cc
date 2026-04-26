@@ -518,13 +518,7 @@ def render_powershell_activation(session_id: str, root: Path, *, bootstrap: bool
         f"$env:{SESSION_ROOT_ENV} = {quoted_root}",
         f"$env:{SESSION_BIN_ENV} = {quoted_bin}",
         f"$env:PATH = \"$env:{SESSION_BIN_ENV};$env:PATH\"",
-        "function global:nd {",
-        "  if ($args.Count -eq 0) {",
-        "    neurodesk shell --help",
-        "  } else {",
-        "    neurodesk shell @args",
-        "  }",
-        "}",
+        "function global:nd { if ($args.Count -eq 0) { neurodesk shell --help } else { neurodesk shell @args } }",
         render_completion("powershell"),
     ]
     if bootstrap:
@@ -537,18 +531,16 @@ def render_powershell_activation(session_id: str, root: Path, *, bootstrap: bool
         )
     lines.extend(
         [
-            "function global:neurodesk_deactivate {",
-            "  if ($env:_PYNEURODESK_OLD_PATH) {",
-            "    $env:PATH = $env:_PYNEURODESK_OLD_PATH",
-            "  }",
-            "  Remove-Item Env:_PYNEURODESK_OLD_PATH -ErrorAction SilentlyContinue",
-            f"  Remove-Item Env:{SESSION_ENV} -ErrorAction SilentlyContinue",
-            f"  Remove-Item Env:{SESSION_ROOT_ENV} -ErrorAction SilentlyContinue",
-            f"  Remove-Item Env:{SESSION_BIN_ENV} -ErrorAction SilentlyContinue",
-            f"  Remove-Item Env:{BOOTSTRAP_PID_ENV} -ErrorAction SilentlyContinue",
-            render_completion_cleanup("powershell"),
-            "  Remove-Item Function:nd -ErrorAction SilentlyContinue",
-            "  Remove-Item Function:neurodesk_deactivate -ErrorAction SilentlyContinue",
+            "function global:neurodesk_deactivate { "
+            "if ($env:_PYNEURODESK_OLD_PATH) { $env:PATH = $env:_PYNEURODESK_OLD_PATH }; "
+            "Remove-Item Env:_PYNEURODESK_OLD_PATH -ErrorAction SilentlyContinue; "
+            f"Remove-Item Env:{SESSION_ENV} -ErrorAction SilentlyContinue; "
+            f"Remove-Item Env:{SESSION_ROOT_ENV} -ErrorAction SilentlyContinue; "
+            f"Remove-Item Env:{SESSION_BIN_ENV} -ErrorAction SilentlyContinue; "
+            f"Remove-Item Env:{BOOTSTRAP_PID_ENV} -ErrorAction SilentlyContinue; "
+            f"{render_completion_cleanup('powershell')}; "
+            "Remove-Item Function:nd -ErrorAction SilentlyContinue; "
+            "Remove-Item Function:neurodesk_deactivate -ErrorAction SilentlyContinue "
             "}",
         ]
     )
@@ -593,21 +585,17 @@ def render_completion(shell_name: str) -> str:
             ]
         )
     if shell_name == "powershell":
-        return "\n".join(
-            [
-                "Register-ArgumentCompleter -CommandName neurodesk,nd -ScriptBlock {",
-                "  param($commandName, $wordToComplete, $cursorPosition, $commandAst, $fakeBoundParameters)",
-                "  $words = @()",
-                "  foreach ($element in $commandAst.CommandElements) {",
-                "    $words += $element.Extent.Text",
-                "  }",
-                "  $index = [Math]::Max(0, $words.Count - 1)",
-                "  if ($wordToComplete -eq '') { $index = $words.Count }",
-                "  neurodesk shell complete --index $index -- @words | ForEach-Object {",
-                "    [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)",
-                "  }",
-                "}",
-            ]
+        return (
+            "Register-ArgumentCompleter -CommandName neurodesk,nd -ScriptBlock { "
+            "param($commandName, $wordToComplete, $cursorPosition, $commandAst, $fakeBoundParameters); "
+            "$words = @(); "
+            "foreach ($element in $commandAst.CommandElements) { $words += $element.Extent.Text }; "
+            "$index = [Math]::Max(0, $words.Count - 1); "
+            "if ($wordToComplete -eq '') { $index = $words.Count }; "
+            "neurodesk shell complete --index $index -- @words | ForEach-Object { "
+            "[System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) "
+            "} "
+            "}"
         )
     raise SystemExit(f"unsupported shell for completion: {shell_name}")
 
@@ -619,7 +607,7 @@ def render_completion_cleanup(shell_name: str) -> str:
     if shell_name == "zsh":
         return "  unfunction _neurodesk_complete _nd_complete 2>/dev/null"
     if shell_name == "powershell":
-        return '  Register-ArgumentCompleter -CommandName neurodesk,nd -ScriptBlock { "" }'
+        return 'Register-ArgumentCompleter -CommandName neurodesk,nd -ScriptBlock { "" }'
     raise SystemExit(f"unsupported shell for completion cleanup: {shell_name}")
 
 

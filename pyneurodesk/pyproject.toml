@@ -20,6 +20,7 @@ fulltest = [
 [project.scripts]
 pyneurodesk = "pyneurodesk:main"
 neurodesk = "pyneurodesk:main"
+nd = "pyneurodesk:main"
 pyneurodesk-fulltest = "pyneurodesk.fulltest:main"
 
 [build-system]

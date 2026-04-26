@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -12,6 +13,12 @@ import pytest
 
 from pyneurodesk import shell
 from pyneurodesk.models import ContainerReference, ImageSource
+
+
+def test_package_installs_nd_entrypoint() -> None:
+    pyproject = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
+
+    assert pyproject["project"]["scripts"]["nd"] == "pyneurodesk:main"
 
 
 def test_activate_emits_shell_code_initializes_session_and_bootstraps_by_default(
