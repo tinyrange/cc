@@ -72,7 +72,22 @@ func FormatTarget(target Target) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	u.Path = path.Join(u.Path, target.Repo, strings.TrimPrefix(target.Path, "/"))
+	segments := []string{strings.TrimSuffix(u.EscapedPath(), "/"), url.PathEscape(target.Repo)}
+	for _, part := range strings.Split(strings.TrimPrefix(target.Path, "/"), "/") {
+		if part == "" {
+			continue
+		}
+		segments = append(segments, url.PathEscape(part))
+	}
+	escaped := strings.Join(segments, "/")
+	if escaped == "" {
+		escaped = "/"
+	}
+	u.RawPath = escaped
+	u.Path, err = url.PathUnescape(escaped)
+	if err != nil {
+		return "", err
+	}
 	return u.String(), nil
 }
 

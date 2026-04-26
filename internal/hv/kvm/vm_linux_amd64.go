@@ -46,17 +46,19 @@ type MMIOExit struct {
 }
 
 type VM struct {
-	kvm     *Bootstrap
-	vmfd    int
-	vcpufd  int
-	run     []byte
-	mem     []byte
-	regions []memoryMapping
+	kvm         *Bootstrap
+	vmfd        int
+	vcpufd      int
+	run         []byte
+	mem         []byte
+	lowMemLimit uint64
+	regions     []memoryMapping
 }
 
 type memoryMapping struct {
 	guestPhysAddr uint64
 	mem           []byte
+	ownsMapping   bool
 }
 
 func NewVM() (*VM, error) {
@@ -115,8 +117,9 @@ func (v *VM) Close() error {
 		_ = unix.Munmap(v.mem)
 		v.mem = nil
 	}
+	v.lowMemLimit = 0
 	for _, region := range v.regions {
-		if len(region.mem) != 0 {
+		if region.ownsMapping && len(region.mem) != 0 {
 			_ = unix.Munmap(region.mem)
 		}
 	}
@@ -151,22 +154,54 @@ func (v *VM) MapAnonymousMemorySlot(slot uint32, size uint64, guestPhysAddr uint
 	}
 	if slot == 0 {
 		v.mem = mem
+		v.lowMemLimit = uint64(len(mem))
 	} else {
-		v.regions = append(v.regions, memoryMapping{guestPhysAddr: guestPhysAddr, mem: mem})
+		v.regions = append(v.regions, memoryMapping{
+			guestPhysAddr: guestPhysAddr,
+			mem:           mem,
+			ownsMapping:   true,
+		})
 	}
 	return mem, nil
 }
 
 func mapAMD64GuestMemory(vm *VM, memoryMB uint64) ([]byte, error) {
 	lowSize := amd64vm.LowMemorySizeBytes(memoryMB)
-	mem, err := vm.MapAnonymousMemorySlot(0, lowSize, amd64vm.MemoryBase)
+	highSize := amd64vm.HighMemorySizeBytes(memoryMB)
+	totalSize := lowSize + highSize
+	mem, err := unix.Mmap(-1, 0, int(totalSize), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANONYMOUS|unix.MAP_PRIVATE)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("mmap guest memory: %w", err)
 	}
-	if highSize := amd64vm.HighMemorySizeBytes(memoryMB); highSize > 0 {
-		if _, err := vm.MapAnonymousMemorySlot(1, highSize, amd64vm.HighMemoryBase); err != nil {
-			return nil, err
+	lowRegion := kvmUserspaceMemoryRegion{
+		Slot:          0,
+		GuestPhysAddr: amd64vm.MemoryBase,
+		MemorySize:    lowSize,
+		UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[0]))),
+	}
+	if err := setUserMemoryRegion(vm.vmfd, &lowRegion); err != nil {
+		_ = unix.Munmap(mem)
+		return nil, fmt.Errorf("set user memory region: %w", err)
+	}
+	vm.mem = mem
+	vm.lowMemLimit = lowSize
+	if highSize > 0 {
+		highRegion := kvmUserspaceMemoryRegion{
+			Slot:          1,
+			GuestPhysAddr: amd64vm.HighMemoryBase,
+			MemorySize:    highSize,
+			UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[lowSize]))),
 		}
+		if err := setUserMemoryRegion(vm.vmfd, &highRegion); err != nil {
+			_ = unix.Munmap(mem)
+			vm.mem = nil
+			vm.lowMemLimit = 0
+			return nil, fmt.Errorf("set user memory region: %w", err)
+		}
+		vm.regions = append(vm.regions, memoryMapping{
+			guestPhysAddr: amd64vm.HighMemoryBase,
+			mem:           mem[lowSize : lowSize+highSize],
+		})
 	}
 	return mem, nil
 }
@@ -290,7 +325,7 @@ func (v *VM) copyToGuest(addr uint64, data []byte) error {
 }
 
 func (v *VM) findMemoryRegion(addr uint64) ([]byte, uint64, bool) {
-	if addr < uint64(len(v.mem)) {
+	if addr < v.lowMemLimit {
 		return v.mem, addr, true
 	}
 	for _, region := range v.regions {
