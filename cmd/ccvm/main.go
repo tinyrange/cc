@@ -168,6 +168,7 @@ func newMux(srvState *server, httpServer *http.Server) *http.ServeMux {
 			Status:       "prepared",
 			SourceKind:   image.SourceKind,
 			Architecture: image.Architecture,
+			Env:          append([]string(nil), image.Config.Env...),
 		})
 	})
 

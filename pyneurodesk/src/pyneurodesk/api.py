@@ -559,6 +559,8 @@ def resolve_container_reference(
 
 def load_deploy_metadata(container_handle: NeurodeskContainer) -> DeployMetadata:
     directory = deploy_directory_for_reference_path(container_handle.reference.path)
+    if not directory.startswith(DEFAULT_CONTAINERS_PATH):
+        return load_local_deploy_metadata(container_handle)
     source = CVMFSSource(
         mirror=DEFAULT_CVMFS_MIRROR,
         repo=DEFAULT_CVMFS_REPO,
@@ -592,6 +594,21 @@ def load_deploy_metadata(container_handle: NeurodeskContainer) -> DeployMetadata
     ]
     image_env = load_singularity_env(container_handle, directory)
     return DeployMetadata(commands=commands, deploy_env=merge_env_entries([*image_env, *deploy_env]))
+
+
+def load_local_deploy_metadata(container_handle: NeurodeskContainer) -> DeployMetadata:
+    try:
+        metadata = container_handle._client.prepare_image_metadata(container_handle.reference.image)
+    except (AttributeError, httpx.HTTPError):
+        return DeployMetadata()
+    deploy_env = tuple(metadata.env)
+    deploy_bins = []
+    for entry in deploy_env:
+        key, _, value = entry.partition("=")
+        if key != "DEPLOY_BINS":
+            continue
+        deploy_bins.extend(part for part in value.split(":") if is_valid_wrapper_name(part))
+    return DeployMetadata(commands=tuple(sorted(set(deploy_bins))), deploy_env=merge_env_entries(list(deploy_env)))
 
 
 def load_singularity_env(container_handle: NeurodeskContainer, directory: str) -> tuple[str, ...]:

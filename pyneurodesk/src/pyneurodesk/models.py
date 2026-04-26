@@ -154,6 +154,7 @@ class ImageMetadataState:
     status: str
     source_kind: Optional[str] = None
     architecture: Optional[str] = None
+    env: tuple[str, ...] = ()
     error: Optional[str] = None
 
     @classmethod
@@ -163,6 +164,7 @@ class ImageMetadataState:
             status=payload["status"],
             source_kind=payload.get("source_kind"),
             architecture=payload.get("architecture"),
+            env=tuple(str(item) for item in payload.get("env", ()) if isinstance(item, str)),
             error=payload.get("error"),
         )
 

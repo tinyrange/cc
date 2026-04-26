@@ -152,6 +152,49 @@ func TestStorePullExtractsRootFSAndRuntimeConfig(t *testing.T) {
 	}
 }
 
+func TestExtractSIMGDeployMetadataUsesBuildYamlAndSingularityEnv(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "build.yaml"), []byte(`
+name: bart
+deploy:
+  path:
+    - /opt/bart-0.9.00/
+  bins: [bart, bart-view]
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(build.yaml) error = %v", err)
+	}
+	envDir := filepath.Join(root, ".singularity.d", "env")
+	if err := os.MkdirAll(envDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(env) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(envDir, "90-environment.sh"), []byte(`
+export PATH="/usr/local/bin:/usr/bin:/bin"
+export TOOLBOX_PATH="/opt/bart-0.9.00/"
+export SKIP_DYNAMIC="${PATH:-/ignored}"
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(90-environment.sh) error = %v", err)
+	}
+
+	meta := extractSIMGDeployMetadata(imagefs.NewHostFS(root, nil))
+	env := strings.Join(meta.Env, "\n")
+	for _, want := range []string{
+		"DEPLOY_PATH=/opt/bart-0.9.00/",
+		"DEPLOY_BINS=bart:bart-view",
+		"TOOLBOX_PATH=/opt/bart-0.9.00/",
+		"PATH=/opt/bart-0.9.00/:/usr/local/bin:/usr/bin:/bin",
+	} {
+		if !strings.Contains(env, want) {
+			t.Fatalf("deploy env missing %q in:\n%s", want, env)
+		}
+	}
+	if got := strings.Join(meta.DeployPath, ":"); got != "/opt/bart-0.9.00/" {
+		t.Fatalf("DeployPath = %q, want /opt/bart-0.9.00/", got)
+	}
+	if got := strings.Join(meta.DeployBins, ":"); got != "bart:bart-view" {
+		t.Fatalf("DeployBins = %q, want bart:bart-view", got)
+	}
+}
+
 func TestStorePullUsesSharedCacheAcrossStores(t *testing.T) {
 	sharedCache := t.TempDir()
 	if err := os.Setenv(sharedCacheEnv, sharedCache); err != nil {

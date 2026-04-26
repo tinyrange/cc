@@ -31,11 +31,12 @@ type KernelState struct {
 }
 
 type ImageMetadataState struct {
-	Name         string `json:"name"`
-	Status       string `json:"status"`
-	SourceKind   string `json:"source_kind,omitempty"`
-	Architecture string `json:"architecture,omitempty"`
-	Error        string `json:"error,omitempty"`
+	Name         string   `json:"name"`
+	Status       string   `json:"status"`
+	SourceKind   string   `json:"source_kind,omitempty"`
+	Architecture string   `json:"architecture,omitempty"`
+	Env          []string `json:"env,omitempty"`
+	Error        string   `json:"error,omitempty"`
 }
 
 type EmulatorState struct {

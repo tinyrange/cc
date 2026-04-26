@@ -24,6 +24,7 @@ from pyneurodesk.api import (
     create_container_cache_dir,
     build_release_container_path,
     create_progress_reporter,
+    load_deploy_metadata,
     parse_singularity_env_exports,
     default_daemon_state_path,
     path_join,
@@ -701,6 +702,47 @@ def test_container_run_uses_cvmfs_deploy_env_and_exposes_commands() -> None:
     assert paths.count("/cvmfs/list") == 3
     assert paths.count("/cvmfs/read") == 4
     assert paths[-1] == "/vm/run"
+
+
+def test_load_deploy_metadata_uses_local_image_env_and_deploy_bins() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/image/fulltest-image/metadata":
+            return httpx.Response(
+                200,
+                json={
+                    "name": "fulltest-image",
+                    "status": "prepared",
+                    "source_kind": "simg",
+                    "architecture": "amd64",
+                    "env": [
+                        "PATH=/opt/tool:/usr/local/bin:/usr/bin:/bin",
+                        "DEPLOY_PATH=/opt/tool",
+                        "DEPLOY_BINS=tool:tool-helper:/bad/path",
+                    ],
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    client = make_client(httpx.MockTransport(handler))
+    try:
+        handle = SimpleNamespace(
+            _client=client,
+            reference=SimpleNamespace(
+                image="fulltest-image",
+                path="/tmp/neurocontainers-simg/tool.simg",
+                cache_dir=None,
+            ),
+        )
+        metadata = load_deploy_metadata(handle)
+    finally:
+        client.close()
+
+    assert metadata.commands == ("tool", "tool-helper")
+    assert metadata.deploy_env == (
+        "PATH=/opt/tool:/usr/local/bin:/usr/bin:/bin",
+        "DEPLOY_PATH=/opt/tool",
+        "DEPLOY_BINS=tool:tool-helper:/bad/path",
+    )
 
 
 def test_parse_singularity_env_exports_handles_docker_defaults() -> None:

@@ -538,7 +538,7 @@ func (s *Store) finalizeSIMGImage(name string, spec SourceSpec, imageDir, tmpDir
 	if err != nil {
 		return fmt.Errorf("index simg: %w", err)
 	}
-	_ = rootFS
+	deployMetadata := extractSIMGDeployMetadata(rootFS)
 	metadataPath := filepath.Join(imageDir, "rootfs.metadata.json")
 	fsMetaBuf, err := json.MarshalIndent(entries, "", "  ")
 	if err != nil {
@@ -554,6 +554,7 @@ func (s *Store) finalizeSIMGImage(name string, spec SourceSpec, imageDir, tmpDir
 		Architecture: arch,
 		RootFSDir:    imageDir,
 		MetadataPath: metadataPath,
+		Env:          deployMetadata.Env,
 	}
 	if err := os.RemoveAll(imageDir); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove old image dir: %w", err)
