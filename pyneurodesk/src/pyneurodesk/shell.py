@@ -454,16 +454,22 @@ def implicit_home_mount() -> Optional[ShareMount]:
 
 
 def runtime_env_overrides() -> list[str]:
-    if implicit_home_mount() is None:
-        return []
-    return [
-        "HOME=/root",
-        "XDG_CACHE_HOME=/root/.cache",
-        "APPTAINER_CACHEDIR=/root/.apptainer/cache",
-        "APPTAINER_CONFIGDIR=/root/.apptainer",
-        "SINGULARITY_CACHEDIR=/root/.apptainer/cache",
-        "SINGULARITY_CONFIGDIR=/root/.apptainer",
+    overrides = [
+        "NUMBA_CACHE_DIR=/tmp/numba-cache",
     ]
+    if implicit_home_mount() is None:
+        return overrides
+    overrides.extend(
+        [
+            "HOME=/root",
+            "XDG_CACHE_HOME=/root/.cache",
+            "APPTAINER_CACHEDIR=/root/.apptainer/cache",
+            "APPTAINER_CONFIGDIR=/root/.apptainer",
+            "SINGULARITY_CACHEDIR=/root/.apptainer/cache",
+            "SINGULARITY_CONFIGDIR=/root/.apptainer",
+        ]
+    )
+    return overrides
 
 
 def normalize_command_args(values: list[str]) -> list[str]:

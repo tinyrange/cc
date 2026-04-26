@@ -491,6 +491,7 @@ def test_run_wrapper_invokes_container_command(
                 ("niimath", "-help"),
                 (
                     "DEPLOY_ENV_FSLDIR=/opt/fsl",
+                    "NUMBA_CACHE_DIR=/tmp/numba-cache",
                     "HOME=/root",
                     "XDG_CACHE_HOME=/root/.cache",
                     "APPTAINER_CACHEDIR=/root/.apptainer/cache",
@@ -599,6 +600,7 @@ def test_run_wrapper_uses_session_reference_when_present(
             ("niimath", "-help"),
             (
                 "DEPLOY_ENV_PATH=/opt/tool",
+                "NUMBA_CACHE_DIR=/tmp/numba-cache",
                 "HOME=/root",
                 "XDG_CACHE_HOME=/root/.cache",
                 "APPTAINER_CACHEDIR=/root/.apptainer/cache",
