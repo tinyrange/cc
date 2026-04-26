@@ -12,9 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sync"
-	"syscall"
 
-	"golang.org/x/sys/unix"
 	"j5.nz/cc/client"
 )
 
@@ -253,10 +251,7 @@ func streamHostStdin(file *os.File, out chan<- client.ExecInput) error {
 }
 
 func forwardHostControl(out chan<- client.ExecInput, done <-chan struct{}, tty bool, ttyFile *os.File) {
-	signals := []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP}
-	if tty {
-		signals = append(signals, syscall.SIGWINCH)
-	}
+	signals := hostSignals(tty)
 	sigCh := make(chan os.Signal, 8)
 	signal.Notify(sigCh, signals...)
 	defer signal.Stop(sigCh)
@@ -269,7 +264,7 @@ func forwardHostControl(out chan<- client.ExecInput, done <-chan struct{}, tty b
 			if sig == nil {
 				continue
 			}
-			if sig == syscall.SIGWINCH {
+			if isResizeSignal(sig) {
 				if ttyFile == nil {
 					continue
 				}
@@ -302,29 +297,6 @@ func isTerminal(file *os.File) bool {
 		return false
 	}
 	return isTerminalFD(int(file.Fd()))
-}
-
-func terminalSize(file *os.File) (int, int, error) {
-	ws, err := unix.IoctlGetWinsize(int(file.Fd()), unix.TIOCGWINSZ)
-	if err != nil {
-		return 0, 0, err
-	}
-	return int(ws.Col), int(ws.Row), nil
-}
-
-func signalName(sig os.Signal) (string, bool) {
-	switch sig {
-	case os.Interrupt:
-		return "INT", true
-	case syscall.SIGHUP:
-		return "HUP", true
-	case syscall.SIGQUIT:
-		return "QUIT", true
-	case syscall.SIGTERM:
-		return "TERM", true
-	default:
-		return "", false
-	}
 }
 
 func resolveCCVMPath(path string) (string, error) {

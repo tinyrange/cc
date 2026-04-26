@@ -198,7 +198,7 @@ func ParseTarget(raw string) (Target, error) {
 			LocalPath: clean,
 		}, nil
 	}
-	if strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, ".") {
+	if filepath.IsAbs(raw) || strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, ".") {
 		return Target{
 			Raw:       raw,
 			Path:      "/",

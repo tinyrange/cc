@@ -96,6 +96,8 @@ func backendName() string {
 		return "kvm"
 	case runtime.GOOS == "darwin" && runtime.GOARCH == "arm64":
 		return "hvf"
+	case runtime.GOOS == "windows" && runtime.GOARCH == "amd64":
+		return "whp"
 	default:
 		return "unsupported"
 	}

@@ -2,7 +2,6 @@ package main
 
 import (
 	"os"
-	"syscall"
 	"testing"
 
 	"j5.nz/cc/client"
@@ -44,10 +43,7 @@ func TestSignalName(t *testing.T) {
 		ok   bool
 	}{
 		{sig: os.Interrupt, want: "INT", ok: true},
-		{sig: syscall.SIGHUP, want: "HUP", ok: true},
-		{sig: syscall.SIGQUIT, want: "QUIT", ok: true},
-		{sig: syscall.SIGTERM, want: "TERM", ok: true},
-		{sig: syscall.SIGUSR1, want: "", ok: false},
+		{sig: unsupportedSignalForTest(), want: "", ok: false},
 	}
 	for _, tt := range tests {
 		got, ok := signalName(tt.sig)
