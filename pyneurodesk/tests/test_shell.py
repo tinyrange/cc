@@ -436,6 +436,9 @@ def test_run_wrapper_invokes_container_command(
     monkeypatch.setenv(shell.SESSION_ROOT_ENV, str(session_root))
     monkeypatch.setenv(shell.SESSION_BIN_ENV, str(session_root / "bin"))
     monkeypatch.chdir(tmp_path)
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    monkeypatch.setenv("HOME", str(home_dir))
 
     class FakeClient:
         def run(
@@ -479,14 +482,23 @@ def test_run_wrapper_invokes_container_command(
     assert capsys.readouterr().out == "hello\n"
     guest_mount = f"{shell.HOST_CWD_MOUNT_ROOT}/{hashlib.sha256(str(tmp_path.resolve()).encode('utf-8')).hexdigest()[:16]}"
     expected_share = shell.ShareMount(source=str(tmp_path.resolve()), mount=guest_mount, writable=True)
+    expected_home_share = shell.ShareMount(source=str(home_dir.resolve()), mount="/root", writable=True)
     assert calls == [
         (
             "run",
             (
                 "niimath",
                 ("niimath", "-help"),
-                ("DEPLOY_ENV_FSLDIR=/opt/fsl",),
-                (expected_share,),
+                (
+                    "DEPLOY_ENV_FSLDIR=/opt/fsl",
+                    "HOME=/root",
+                    "XDG_CACHE_HOME=/root/.cache",
+                    "APPTAINER_CACHEDIR=/root/.apptainer/cache",
+                    "APPTAINER_CONFIGDIR=/root/.apptainer",
+                    "SINGULARITY_CACHEDIR=/root/.apptainer/cache",
+                    "SINGULARITY_CONFIGDIR=/root/.apptainer",
+                ),
+                (expected_share, expected_home_share),
                 guest_mount,
             ),
         ),
@@ -525,6 +537,9 @@ def test_run_wrapper_uses_session_reference_when_present(
     monkeypatch.setenv(shell.SESSION_ROOT_ENV, str(session_root))
     monkeypatch.setenv(shell.SESSION_BIN_ENV, str(session_root / "bin"))
     monkeypatch.chdir(tmp_path)
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    monkeypatch.setenv("HOME", str(home_dir))
 
     class FakeClient:
         def ensure_image(self, ref: ContainerReference) -> object:
@@ -574,4 +589,25 @@ def test_run_wrapper_uses_session_reference_when_present(
         ("ensure_image", reference),
         ("ensure_instance", "fulltest-image"),
     ]
+    guest_mount = f"{shell.HOST_CWD_MOUNT_ROOT}/{hashlib.sha256(str(tmp_path.resolve()).encode('utf-8')).hexdigest()[:16]}"
+    expected_share = shell.ShareMount(source=str(tmp_path.resolve()), mount=guest_mount, writable=True)
+    expected_home_share = shell.ShareMount(source=str(home_dir.resolve()), mount="/root", writable=True)
+    assert calls[3] == (
+        "run",
+        (
+            "fulltest-image",
+            ("niimath", "-help"),
+            (
+                "DEPLOY_ENV_PATH=/opt/tool",
+                "HOME=/root",
+                "XDG_CACHE_HOME=/root/.cache",
+                "APPTAINER_CACHEDIR=/root/.apptainer/cache",
+                "APPTAINER_CONFIGDIR=/root/.apptainer",
+                "SINGULARITY_CACHEDIR=/root/.apptainer/cache",
+                "SINGULARITY_CONFIGDIR=/root/.apptainer",
+            ),
+            (expected_share, expected_home_share),
+            guest_mount,
+        ),
+    )
     assert calls[-1] == ("client_close", None)

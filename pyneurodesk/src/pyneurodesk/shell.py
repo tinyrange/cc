@@ -321,7 +321,8 @@ def run_image_command(image: str, command_name: str, args: list[str], *, deploy_
         if not env:
             metadata = load_deploy_metadata(handle)
             env = list(metadata.deploy_env)
-        shares, workdir = implicit_cwd_mount()
+        shares, workdir = implicit_runtime_mounts()
+        env.extend(runtime_env_overrides())
         if hasattr(handle._client, "run_stream"):
             exit_code = 0
             for event in handle._client.run_stream(
@@ -431,6 +432,38 @@ def implicit_cwd_mount() -> tuple[list[ShareMount], str]:
         ],
         guest_mount,
     )
+
+
+def implicit_runtime_mounts() -> tuple[list[ShareMount], str]:
+    shares, workdir = implicit_cwd_mount()
+    home_share = implicit_home_mount()
+    if home_share is not None:
+        shares.append(home_share)
+    return shares, workdir
+
+
+def implicit_home_mount() -> Optional[ShareMount]:
+    home = Path(os.path.expanduser("~")).resolve()
+    if not home.exists() or not home.is_dir():
+        return None
+    return ShareMount(
+        source=str(home),
+        mount="/root",
+        writable=True,
+    )
+
+
+def runtime_env_overrides() -> list[str]:
+    if implicit_home_mount() is None:
+        return []
+    return [
+        "HOME=/root",
+        "XDG_CACHE_HOME=/root/.cache",
+        "APPTAINER_CACHEDIR=/root/.apptainer/cache",
+        "APPTAINER_CONFIGDIR=/root/.apptainer",
+        "SINGULARITY_CACHEDIR=/root/.apptainer/cache",
+        "SINGULARITY_CONFIGDIR=/root/.apptainer",
+    ]
 
 
 def normalize_command_args(values: list[str]) -> list[str]:
