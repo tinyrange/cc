@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"j5.nz/cc/internal/fsmeta"
+	"j5.nz/cc/internal/linuxabi"
 )
 
 type File interface {
@@ -260,15 +261,15 @@ func (l *hostSymlink) Owner() (uint32, uint32) { return l.uid, l.gid }
 func (l *hostSymlink) RDev() uint32            { return l.rdev }
 
 const (
-	linuxSIFMT    = 0o170000
-	linuxSIFSOCK  = 0o140000
-	linuxSIFLNK   = 0o120000
-	linuxSIFREG   = 0o100000
-	linuxSIFBLK   = 0o060000
-	linuxSIFDIR   = 0o040000
-	linuxSIFCHR   = 0o020000
-	linuxSIFIFO   = 0o010000
-	linuxPermMask = 0o7777
+	linuxSIFMT    = linuxabi.SIFMT
+	linuxSIFSOCK  = linuxabi.SIFSOCK
+	linuxSIFLNK   = linuxabi.SIFLNK
+	linuxSIFREG   = linuxabi.SIFREG
+	linuxSIFBLK   = linuxabi.SIFBLK
+	linuxSIFDIR   = linuxabi.SIFDIR
+	linuxSIFCHR   = linuxabi.SIFCHR
+	linuxSIFIFO   = linuxabi.SIFIFO
+	linuxPermMask = linuxabi.PermMask
 )
 
 func linuxModeToGo(mode uint32) fs.FileMode {

@@ -11,12 +11,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"j5.nz/cc/internal/fdt"
 	"j5.nz/cc/internal/fsmeta"
 	"j5.nz/cc/internal/imagefs"
+	"j5.nz/cc/internal/linuxabi"
 )
 
 const (
@@ -215,6 +215,12 @@ type FS struct {
 	irqHigh          bool
 	configGeneration uint32
 	queues           [2]queue
+	mmioReads        uint64
+	mmioWrites       uint64
+	queueNotifies    [2]uint64
+	fuseRequests     uint64
+	interruptRaises  uint64
+	irqTransitions   uint64
 }
 
 type fsDesc struct {
@@ -266,6 +272,7 @@ func (f *FS) DeviceTreeNode() fdt.Node {
 func (f *FS) Read(addr uint64, size int) (uint64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.mmioReads++
 
 	offset := addr - f.Base
 	switch offset {
@@ -319,6 +326,7 @@ func (f *FS) Read(addr uint64, size int) (uint64, error) {
 func (f *FS) Write(addr uint64, size int, value uint64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.mmioWrites++
 
 	offset := addr - f.Base
 	switch offset {
@@ -385,6 +393,7 @@ func (f *FS) Write(addr uint64, size int, value uint64) error {
 		}
 	case regQueueNotify:
 		if int(value) < len(f.queues) {
+			f.queueNotifies[value]++
 			if err := f.processQueueLocked(int(value)); err != nil {
 				return err
 			}
@@ -429,6 +438,7 @@ func (f *FS) processQueueLocked(qidx int) error {
 	}
 	if interruptNeeded && (qidx == fsQueueRequest || qidx == fsQueueHiprio) && (availFlags&1) == 0 {
 		f.interruptStatus |= fsInterruptVring
+		f.interruptRaises++
 		f.logf("interrupt-raise status=%#x", f.interruptStatus)
 		return f.updateIRQLocked()
 	}
@@ -500,6 +510,7 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 	opcode := binary.LittleEndian.Uint32(req[4:8])
 	unique := binary.LittleEndian.Uint64(req[8:16])
 	nodeID := binary.LittleEndian.Uint64(req[16:24])
+	f.fuseRequests++
 	f.logf("opcode=%d unique=%d node=%d", opcode, unique, nodeID)
 
 	reply := func(errno int32, extra []byte) []byte {
@@ -1027,8 +1038,36 @@ func (f *FS) updateIRQLocked() error {
 		return nil
 	}
 	f.irqHigh = level
+	f.irqTransitions++
 	f.logf("set-irq irq=%d level=%v", f.IRQ, level)
 	return f.irq.SetIRQ(f.IRQ, level)
+}
+
+func (f *FS) Summary() string {
+	if f == nil {
+		return "virtio-fs=<nil>"
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	tag := strings.TrimRight(string(f.tag[:]), "\x00")
+	return fmt.Sprintf(
+		"virtio-fs tag=%q mmio_reads=%d mmio_writes=%d status=%#x q0_notify=%d q1_notify=%d fuse_requests=%d interrupt_raises=%d irq_transitions=%d irq_high=%t interrupt_status=%#x q0_ready=%t q1_ready=%t q0_last=%d q1_last=%d",
+		tag,
+		f.mmioReads,
+		f.mmioWrites,
+		f.status,
+		f.queueNotifies[0],
+		f.queueNotifies[1],
+		f.fuseRequests,
+		f.interruptRaises,
+		f.irqTransitions,
+		f.irqHigh,
+		f.interruptStatus,
+		f.queues[0].ready,
+		f.queues[1].ready,
+		f.queues[0].lastAvailIdx,
+		f.queues[1].lastAvailIdx,
+	)
 }
 
 func (f *FS) selectedQueueLocked() *queue {
@@ -1649,11 +1688,7 @@ func (p *passthroughFS) StatFS(_ uint64) (uint64, uint64, uint64, uint64, uint64
 	if p.root == "" {
 		return 0, 0, 0, 0, 0, 4096, 4096, 255, 0
 	}
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(p.root, &st); err != nil {
-		return 0, 0, 0, 0, 0, 0, 0, 0, errnoFromError(err)
-	}
-	return st.Blocks, st.Bfree, st.Bavail, st.Files, st.Ffree, uint64(st.Bsize), uint64(st.Bsize), 255, 0
+	return hostStatFS(p.root)
 }
 
 func (p *passthroughFS) hostPath(nodeID uint64) (string, int32) {
@@ -1766,17 +1801,7 @@ func (p *passthroughFS) fileAttr(nodeID uint64, info os.FileInfo) FuseAttr {
 	attr.ATimeNsec = uint32(mod.Nanosecond())
 	attr.MTimeNsec = uint32(mod.Nanosecond())
 	attr.CTimeNsec = uint32(mod.Nanosecond())
-	if st, ok := info.Sys().(*syscall.Stat_t); ok {
-		attr.Size = uint64(st.Size)
-		attr.Blocks = uint64(st.Blocks)
-		attr.NLink = uint32(st.Nlink)
-		if st.Blksize > 0 {
-			attr.BlkSize = uint32(st.Blksize)
-		}
-		attr.ATimeSec, attr.ATimeNsec = statTimespecUnix(st, statTimeAccess)
-		attr.MTimeSec, attr.MTimeNsec = statTimespecUnix(st, statTimeModify)
-		attr.CTimeSec, attr.CTimeNsec = statTimespecUnix(st, statTimeChange)
-	}
+	enrichHostFileAttr(info, &attr)
 	if attr.Blocks == 0 && attr.Size > 0 {
 		attr.Blocks = uint64((attr.Size + 511) / 512)
 	}
@@ -2088,11 +2113,7 @@ func (p *imageFS) StatFS(_ uint64) (uint64, uint64, uint64, uint64, uint64, uint
 	if p.root == "" {
 		return 0, 0, 0, 0, 0, 4096, 4096, 255, 0
 	}
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(p.root, &st); err != nil {
-		return 0, 0, 0, 0, 0, 0, 0, 0, errnoFromError(err)
-	}
-	return st.Blocks, st.Bfree, st.Bavail, st.Files, st.Ffree, uint64(st.Bsize), uint64(st.Bsize), 255, 0
+	return hostStatFS(p.root)
 }
 
 func (p *imageFS) GetXattr(_ uint64, _ string) ([]byte, int32) {
@@ -2256,33 +2277,33 @@ func (n *imageNode) isSymlink() bool {
 }
 
 const (
-	linuxSIFMT    = 0o170000
-	linuxSIFSOCK  = 0o140000
-	linuxSIFLNK   = 0o120000
-	linuxSIFREG   = 0o100000
-	linuxSIFBLK   = 0o060000
-	linuxSIFDIR   = 0o040000
-	linuxSIFCHR   = 0o020000
-	linuxSIFIFO   = 0o010000
-	linuxPermMask = 0o7777
+	linuxSIFMT    = linuxabi.SIFMT
+	linuxSIFSOCK  = linuxabi.SIFSOCK
+	linuxSIFLNK   = linuxabi.SIFLNK
+	linuxSIFREG   = linuxabi.SIFREG
+	linuxSIFBLK   = linuxabi.SIFBLK
+	linuxSIFDIR   = linuxabi.SIFDIR
+	linuxSIFCHR   = linuxabi.SIFCHR
+	linuxSIFIFO   = linuxabi.SIFIFO
+	linuxPermMask = linuxabi.PermMask
 )
 
 const (
-	linuxEPERM     int32 = 1
-	linuxENOENT    int32 = 2
-	linuxENXIO     int32 = 6
-	linuxEIO       int32 = 5
-	linuxEBADF     int32 = 9
-	linuxEEXIST    int32 = 17
-	linuxENOTDIR   int32 = 20
-	linuxEISDIR    int32 = 21
-	linuxEINVAL    int32 = 22
-	linuxENOTTY    int32 = 25
-	linuxERANGE    int32 = 34
-	linuxENOSYS    int32 = 38
-	linuxENOTEMPTY int32 = 39
-	linuxENODATA   int32 = 61
-	linuxETIMEDOUT int32 = 110
+	linuxEPERM     = linuxabi.EPERM
+	linuxENOENT    = linuxabi.ENOENT
+	linuxENXIO     = linuxabi.ENXIO
+	linuxEIO       = linuxabi.EIO
+	linuxEBADF     = linuxabi.EBADF
+	linuxEEXIST    = linuxabi.EEXIST
+	linuxENOTDIR   = linuxabi.ENOTDIR
+	linuxEISDIR    = linuxabi.EISDIR
+	linuxEINVAL    = linuxabi.EINVAL
+	linuxENOTTY    = linuxabi.ENOTTY
+	linuxERANGE    = linuxabi.ERANGE
+	linuxENOSYS    = linuxabi.ENOSYS
+	linuxENOTEMPTY = linuxabi.ENOTEMPTY
+	linuxENODATA   = linuxabi.ENODATA
+	linuxETIMEDOUT = linuxabi.ETIMEDOUT
 )
 
 func goModeToLinux(mode fs.FileMode) fs.FileMode {
@@ -2385,46 +2406,14 @@ func errnoFromError(err error) int32 {
 		return -linuxENOTDIR
 	}
 	if ok := errorAs(err, &pathErr); ok {
-		if errno, ok := pathErr.Err.(syscall.Errno); ok {
-			return -mapHostErrno(errno)
+		if errno, ok := mapHostError(pathErr.Err); ok {
+			return -errno
 		}
 	}
-	if errno, ok := err.(syscall.Errno); ok {
-		return -mapHostErrno(errno)
+	if errno, ok := mapHostError(err); ok {
+		return -errno
 	}
 	return -linuxEIO
-}
-
-func mapHostErrno(errno syscall.Errno) int32 {
-	switch errno {
-	case syscall.ENOENT:
-		return linuxENOENT
-	case syscall.EPERM:
-		return linuxEPERM
-	case syscall.EEXIST:
-		return linuxEEXIST
-	case syscall.ETIMEDOUT:
-		return linuxETIMEDOUT
-	case syscall.EISDIR:
-		return linuxEISDIR
-	case syscall.ENOTDIR:
-		return linuxENOTDIR
-	case syscall.EINVAL:
-		return linuxEINVAL
-	case syscall.EBADF:
-		return linuxEBADF
-	case syscall.ENXIO:
-		return linuxENXIO
-	case syscall.EIO:
-		return linuxEIO
-	case syscall.ERANGE:
-		return linuxERANGE
-	case syscall.ENODATA:
-		return linuxENODATA
-	case syscall.ENOSYS:
-		return linuxENOSYS
-	}
-	return int32(errno)
 }
 
 func errorAs(err error, target any) bool {
