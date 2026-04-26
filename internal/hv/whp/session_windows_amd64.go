@@ -305,7 +305,20 @@ func (s *ManagedSession) streamExecEvents(ctx context.Context, start int, id str
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		time.Sleep(5 * time.Millisecond)
+		select {
+		case vmErr := <-s.doneCh:
+			select {
+			case s.doneCh <- vmErr:
+			default:
+			}
+			if vmErr == nil {
+				return fmt.Errorf("VM exited during exec")
+			}
+			return fmt.Errorf("VM exited during exec: %w", vmErr)
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Millisecond):
+		}
 	}
 }
 

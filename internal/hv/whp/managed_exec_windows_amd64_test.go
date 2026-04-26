@@ -4,6 +4,7 @@ package whp
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -115,6 +116,32 @@ func TestManagedSessionExecStreamForwardsStdin(t *testing.T) {
 	}
 	if output.String() != "stream-input\n" {
 		t.Fatalf("stream output = %q, want stream-input\\n", output.String())
+	}
+}
+
+func TestManagedSessionExecStreamReturnsWhenVMExits(t *testing.T) {
+	session := &ManagedSession{
+		doneCh:     make(chan error, 1),
+		transcript: vmruntime.NewSerialTranscript(),
+		serialOut:  vmruntime.NewSerialTranscript(),
+	}
+	vmErr := errors.New("vm stopped")
+	session.doneCh <- vmErr
+
+	err := session.streamExecEvents(context.Background(), 0, "1", nil)
+	if err == nil {
+		t.Fatal("streamExecEvents() error = nil, want VM exit error")
+	}
+	if !strings.Contains(err.Error(), "VM exited during exec") || !strings.Contains(err.Error(), "vm stopped") {
+		t.Fatalf("streamExecEvents() error = %q", err)
+	}
+	select {
+	case got := <-session.doneCh:
+		if !errors.Is(got, vmErr) {
+			t.Fatalf("doneCh error = %v, want %v", got, vmErr)
+		}
+	default:
+		t.Fatal("streamExecEvents() did not preserve doneCh result")
 	}
 }
 

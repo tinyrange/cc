@@ -6,7 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
-	"path/filepath"
+	"path"
 	"strings"
 	"sync"
 
@@ -453,8 +453,8 @@ func (i *windowsInstance) AddShare(ctx context.Context, share client.ShareMount)
 		return fmt.Errorf("share mount path is required")
 	}
 	i.shareMu.Lock()
+	defer i.shareMu.Unlock()
 	if existing, ok := i.shares[key]; ok {
-		i.shareMu.Unlock()
 		if existing.Source == share.Source && existing.Writable == share.Writable {
 			return nil
 		}
@@ -472,12 +472,10 @@ func (i *windowsInstance) AddShare(ctx context.Context, share client.ShareMount)
 	if err := i.rootFS.AddShare(mount); err != nil {
 		return err
 	}
-	i.shareMu.Lock()
 	if i.shares == nil {
 		i.shares = make(map[string]client.ShareMount)
 	}
 	i.shares[key] = share
-	i.shareMu.Unlock()
 	return nil
 }
 
@@ -493,8 +491,8 @@ func (i *windowsInstance) AddImage(ctx context.Context, mountPath string, image 
 		return fmt.Errorf("image root filesystem is not available")
 	}
 	i.shareMu.Lock()
+	defer i.shareMu.Unlock()
 	if existing, ok := i.imageMounts[mountPath]; ok {
-		i.shareMu.Unlock()
 		if existing == image.Name {
 			return nil
 		}
@@ -508,12 +506,10 @@ func (i *windowsInstance) AddImage(ctx context.Context, mountPath string, image 
 	}); err != nil {
 		return err
 	}
-	i.shareMu.Lock()
 	if i.imageMounts == nil {
 		i.imageMounts = make(map[string]string)
 	}
 	i.imageMounts[mountPath] = image.Name
-	i.shareMu.Unlock()
 	return nil
 }
 
@@ -583,7 +579,7 @@ func blankWindowsRuntimeRootFS() imagefs.Directory {
 
 func windowsImageMountPath(image string) string {
 	replacer := strings.NewReplacer("/", "_", ":", "_", "@", "_", " ", "_")
-	return filepath.Join("/.ccx3", "images", replacer.Replace(image))
+	return path.Join("/.ccx3", "images", replacer.Replace(image))
 }
 
 func windowsEffectiveExecEnv(base, overrides []string, replace bool) []string {

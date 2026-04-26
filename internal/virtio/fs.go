@@ -2294,6 +2294,7 @@ const (
 	linuxENXIO     = linuxabi.ENXIO
 	linuxEIO       = linuxabi.EIO
 	linuxEBADF     = linuxabi.EBADF
+	linuxEPIPE     = linuxabi.EPIPE
 	linuxEEXIST    = linuxabi.EEXIST
 	linuxENOTDIR   = linuxabi.ENOTDIR
 	linuxEISDIR    = linuxabi.EISDIR

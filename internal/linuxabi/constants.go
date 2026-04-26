@@ -26,6 +26,7 @@ const (
 	EINVAL    int32 = 22
 	ENOTTY    int32 = 25
 	EROFS     int32 = 30
+	EPIPE     int32 = 32
 	ERANGE    int32 = 34
 	ENOSYS    int32 = 38
 	ENOTEMPTY int32 = 39

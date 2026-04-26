@@ -52,7 +52,7 @@ func mapHostError(err error) (int32, bool) {
 	case windows.ERROR_INVALID_HANDLE:
 		return linuxabi.EBADF, true
 	case windows.ERROR_BROKEN_PIPE:
-		return linuxabi.ENXIO, true
+		return linuxabi.EPIPE, true
 	case windows.ERROR_NOT_SUPPORTED:
 		return linuxabi.ENOSYS, true
 	default:
