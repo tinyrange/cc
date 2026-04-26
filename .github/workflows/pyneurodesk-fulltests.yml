@@ -138,13 +138,50 @@ jobs:
           PYNEURODESK_CCVM: ${{ github.workspace }}/build/ccvm
         run: uv sync --extra fulltest
 
+      - name: Download Neurodesk Singularity image
+        id: simg
+        working-directory: pyneurodesk
+        env:
+          SUITE: ${{ matrix.suite }}
+          NEUROCONTAINERS_S3: https://neurocontainers.s3.us-east-2.amazonaws.com
+        run: |
+          set -euo pipefail
+          mkdir -p ../fulltest-results "${RUNNER_TEMP}/neurocontainers-simg"
+          recipe="${GITHUB_WORKSPACE}/local/neurocontainers/recipes/${SUITE}/fulltest.yaml"
+          container="$(uv run python - "$recipe" <<'PY'
+          import sys
+
+          import yaml
+
+          with open(sys.argv[1], "r", encoding="utf-8") as handle:
+              recipe = yaml.safe_load(handle) or {}
+          container = str(recipe.get("container", "")).strip()
+          if not container:
+              raise SystemExit("fulltest.yaml does not define a container")
+          if not container.endswith(".simg"):
+              container += ".simg"
+          print(container)
+          PY
+          )"
+          image_path="${RUNNER_TEMP}/neurocontainers-simg/${container}"
+          url="${NEUROCONTAINERS_S3}/${container}"
+          {
+            echo "[fulltest] downloading image=${container} url=${url}"
+            curl --fail --location --retry 5 --retry-all-errors --continue-at - \
+              --output "${image_path}" \
+              "${url}"
+            echo "[fulltest] downloaded image=${image_path}"
+            ls -lh "${image_path}"
+          } 2>&1 | tee "../fulltest-results/${SUITE}-download.log"
+          echo "image_path=${image_path}" >> "$GITHUB_OUTPUT"
+
       - name: Run fulltest
         working-directory: pyneurodesk
         env:
           PYNEURODESK_CCVM: ${{ github.workspace }}/build/ccvm
-          CCX3_CVMFS_LOG: ${{ github.workspace }}/fulltest-results/${{ matrix.suite }}-cvmfs.jsonl
           PYTHONUNBUFFERED: "1"
           SUITE: ${{ matrix.suite }}
+          IMAGE_SOURCE: ${{ steps.simg.outputs.image_path }}
         run: |
           set -o pipefail
           mkdir -p ../fulltest-results
@@ -152,9 +189,8 @@ jobs:
           work_dir="${RUNNER_TEMP}/pyneurodesk-fulltest-${SUITE}"
           uv run pyneurodesk-fulltest \
             --recipe "$recipe" \
+            --image-source "$IMAGE_SOURCE" \
             --work-dir "$work_dir" \
-            --prefetch \
-            --prefetch-workers 4 \
             2>&1 | tee "../fulltest-results/${SUITE}.log"
 
       - name: Upload fulltest log
@@ -163,6 +199,6 @@ jobs:
         with:
           name: pyneurodesk-fulltest-${{ matrix.suite }}
           path: |
+            fulltest-results/${{ matrix.suite }}-download.log
             fulltest-results/${{ matrix.suite }}.log
-            fulltest-results/${{ matrix.suite }}-cvmfs.jsonl
           if-no-files-found: error
