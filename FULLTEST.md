@@ -1,241 +1,194 @@
 # PyNeurodesk Fulltest Status
 
-This document summarizes the current PyNeurodesk fulltest status after the
-latest `main` changes, plus the current root causes and recommended next steps.
+This document summarizes the current fulltest state from the latest manual
+all-suite run on `main`, the root causes visible in the logs, and the best next
+fixes.
 
-## Latest GitHub Actions Status
+## Latest Runs
 
-Commit `30ee23a52ee18c1ddd3f78a471753ad0fe2bb6db` is green for the regular
-push workflows on `main`:
+Current reference commit:
+
+- `12696b37a2cb0629c8d97e6fe0377b6e9d67bc97`
+- commit message: `Improve CVMFS fulltest prefetching and streaming`
+
+Green push runs for that commit:
 
 | Workflow | Run | Result |
 | --- | --- | --- |
-| Unit tests | https://github.com/tinyrange/cc/actions/runs/24927794983 | Success |
-| Build wheels | https://github.com/tinyrange/cc/actions/runs/24927839627 | Success |
-| PyNeurodesk fulltests, default `niimath` | https://github.com/tinyrange/cc/actions/runs/24927794980 | Success |
+| Unit tests | https://github.com/tinyrange/cc/actions/runs/24932220473 | Success |
+| Build wheels | https://github.com/tinyrange/cc/actions/runs/24932233485 | Success |
+| PyNeurodesk fulltests, default `niimath` | https://github.com/tinyrange/cc/actions/runs/24932220475 | Success |
 
-The latest all-container investigation run was manual:
-https://github.com/tinyrange/cc/actions/runs/24927703861.
+Latest all-suite investigation run:
 
-It used commit `0901171d76d00c1f450d3b00c0e0d6cccadc7d0d` and was cancelled
-after the remaining jobs appeared to be hanging. The cancellation was
-intentional.
+- workflow: `PyNeurodesk fulltests`
+- run: https://github.com/tinyrange/cc/actions/runs/24932455460
+- event: `workflow_dispatch`
+- started: `2026-04-25 13:54:09 UTC`
+- finished: `2026-04-26 04:26:26 UTC`
+- duration: `14h 32m 17s`
+- conclusion: `failure`
 
-## All-Container Run Summary
+## All-Suite Summary
 
-Final job conclusions for run `24927703861`:
+Final suite-job conclusions for run `24932455460`:
 
 | Job conclusion | Count |
 | --- | ---: |
-| Success | 6 |
-| Failure | 110 |
-| Cancelled | 13 |
+| Success | 12 |
+| Failure | 101 |
+| Cancelled | 16 |
 
 Succeeded suites:
 
 - `bart`
 - `convert3d`
 - `dcm2niix`
-- `dicomtools`
-- `itksnap`
+- `fatsegnet`
+- `fsqc`
+- `gingerale`
+- `hnncore`
 - `niimath`
+- `pcntoolkit`
+- `spmpython`
+- `synthstrip`
+- `vmtk`
 
-This is an improvement over the earlier baseline run, where only `niimath`
-passed. The old dominant `resolve command ... in PATH` failure dropped from 52
-suite logs to 23 after the image environment/PATH fixes.
+Cancelled suites:
 
-The run also produced much better partial signal before cancellation:
+- `bidsappmrtrix3connectome`
+- `fsl`
+- `hmri`
+- `matlab`
+- `mne`
+- `mrsiproc`
+- `mrtrix3tissue`
+- `neurodock`
+- `nibabies`
+- `nipype`
+- `osprey`
+- `ospreybids`
+- `qsiprep`
+- `samsrfx`
+- `spm12`
+- `tractseg`
 
-- 98 suite logs reached a full summary.
-- 3024 individual tests passed.
-- 5334 individual tests failed.
-- 548 individual tests were skipped.
+Compared with the previous manual all-suite run, the pass count improved from 6
+to 12. The most important positive signal is that the old Python startup
+failures are gone, but the packed-prefetch work introduced a new import-time
+bug that now blocks many suites before the VM even starts.
 
-Notable partial results:
+## Log Coverage
 
-- `ants`: many ANTs commands now run, including registration and transform
-  operations, but the suite still had 120s timeouts and two ANTs command
-  failures before cancellation.
-- `apptainer`: 135 passed, 5 failed. The remaining failures are home/cache/key
-  write behavior.
-- `fsl`: 108 passed, 17 failed, 2 skipped.
-- `relion`: 122 passed, 3 failed.
-- `bidsappmrtrix3connectome`: 117 passed, 4 failed, 3 skipped.
+The run uploaded suite artifacts for 113 jobs. Those are all non-cancelled
+suites. The 16 cancelled suites above did not produce final suite logs.
 
-## Current Root Causes
+Among the 113 completed suite logs:
 
-### Runtime Environment Is Still Incomplete
+- 72 suites reached the final fulltest summary
+- those 72 logs contain:
+  - `3749` passed tests
+  - `2245` failed tests
+  - `339` skipped tests
+- the remaining 41 suite failures happened before the suite summary, mostly
+  during image import or VM startup
 
-The fulltest path imports a `.simg` and asks `ccvm` to run commands directly
-inside it. Neurodesk users normally run commands through CVMFS wrapper scripts
-that invoke Singularity and set up container-specific runtime behavior.
+## What Improved
 
-The PATH portion of that gap is improved, but the direct-exec path still does
-not fully reproduce the Neurodesk/Singularity runtime environment. The remaining
-issues are mostly Python, MATLAB/MCR, Java/GUI, writable home/cache, and
-tool-specific activation behavior.
+### Python startup regression appears fixed
 
-### Python Runtime Environment
+The latest run contains no occurrences of:
 
-42 suite logs contain either `No module named 'encodings'` or
-`Fatal Python error: init_fs_encoding` in the cancelled all-container run.
+- `No module named 'encodings'`
+- `Fatal Python error: init_fs_encoding`
 
-Local `batchheudiconv` root cause: this was not primarily missing
-`PYTHONHOME`/`PYTHONPATH`. Python startup exposed three lower-level virtio-fs
-and CVMFS issues:
+That strongly suggests the earlier virtio-fs and CVMFS fixes are holding in CI.
+This is a real improvement over the earlier full-suite investigations.
 
-- Linux issued `FUSE_STATX`; strict virtio-fs treated the unsupported opcode as
-  a server error, leaving the guest waiting instead of receiving file metadata.
-- Python importlib first probed `/usr/lib/python3.10/os.py`, partially
-  materializing the lazy `/usr/lib/python3.10` directory. A later directory scan
-  saw only the partial entry set, so importlib never found the `encodings`
-  package.
-- Python bytecode reads issued `FUSE_IOCTL`; strict virtio-fs again treated this
-  as an internal error instead of replying with an unsupported-ioctl errno.
+### Direct command discovery is better than before
 
-Fixes made locally:
-
-- Implement `FUSE_STATX` from the existing `GETATTR` data.
-- Track lazy image directory completeness separately from partial lookup state.
-- Reply `ENOTTY` for unsupported `FUSE_IOCTL`.
-
-Local verification:
-
-- `batchheudiconv` filtered `Python` slice: 7 passed, 0 failed.
-- Direct `/usr/bin/python3 -c 'import encodings'` now resolves
-  `/usr/lib/python3.10/encodings/__init__.py`.
-
-Remaining Python-adjacent issue: heavier tools such as `heudiconv --version`
-perform thousands of tiny CVMFS reads. This was slow because each uncached file
-read created a fresh repository view and refetched `.cvmfspublished`. Reusing the
-CVMFS repository/cache state dropped local `Heudiconv version check` from a 120s
-timeout to 9.66s.
-
-Next step: rerun a small manual matrix containing `batchheudiconv,bidsme` to
-confirm the same root causes cover the broader Python failure bucket.
-
-`bidsme` note: a quick local filtered `Python` run after these fixes still
-timed out on `python3 -c "import bidsme"` and was interrupted after the first
-timeout. That no longer disproves the `encodings` fix; it means `bidsme` needs a
-separate focused trace, likely around heavy package import or another runtime
-assumption.
-
-### Local `batchheudiconv` Residuals
-
-After the virtio-fs and CVMFS fixes, the full local `batchheudiconv` suite
-improved to 91 passed, 11 failed, and 5 skipped.
-
-Remaining failures are now narrower:
-
-- `Create study directory structure` still times out at 120s. The help/version
-  commands around it pass, so this is likely a script-specific interactive or
-  filesystem-write behavior rather than command discovery.
-- `nib-ls BOLD with stats` and `Multi-file NIfTI inspection` fail with NumPy
-  `_ArrayMemoryError` trying to allocate 1.18GiB for a large BOLD stats array.
-  This may be an expected test-data size problem or a recipe expectation that is
-  too memory-hungry for the default fulltest VM.
-- Six `nib-diff` tests return exit code 255. These should be reproed as a small
-  group now that Python itself works.
-- `List all batch-heudiconv scripts` expects `/opt/batch-heudiconv/*.sh`, but
-  the container exposes the shell entry points on `PATH`; the glob does not
-  match files in that directory. This looks like a recipe/test expectation
-  mismatch.
-
-Next step: keep `batchheudiconv` as a regression suite for the Python/CVMFS
-fixes, but move the next runtime fix to `bidsme` or `apptainer`.
-
-### Remaining Command Discovery Failures
-
-23 suite logs still contain explicit `resolve command ... in PATH`.
-
-Current suites in this bucket:
+Explicit `resolve command ... in PATH` failures are down to 14 suites:
 
 - `bidstools`
 - `clearswi`
-- `code`
-- `deepretinotopy`
 - `elastix`
 - `hdbet`
 - `laynii`
-- `mgltools`
 - `minc`
 - `mricrogl`
 - `mricron`
 - `mritools`
-- `mrtrix3tissue`
 - `niftyreg`
-- `nipype`
-- `oshyx`
 - `palm`
 - `rabies`
 - `romeo`
-- `sovabids`
 - `tgvqsm`
+
+This is still a real bucket, but it is no longer the dominant failure mode.
+
+## Current Root Causes
+
+### 1. Packed CVMFS Prefetch Has A Path-Escaping Regression
+
+This is the biggest new blocker in the current run.
+
+24 suites failed during image import, before the VM launched, in the new packed
+`rootfs.contents` prefetch path:
+
+- `afni`
+- `bidsappaa`
+- `bidsappbaracus`
+- `bidsappbrainsuite`
+- `bidsapphcppipelines`
+- `bidsappspm`
+- `brainlifecli`
+- `cat12`
+- `code`
+- `deepretinotopy`
+- `dicomtools`
+- `fastcsr`
+- `glmsingle`
+- `halfpipe`
+- `ilastik`
+- `mgltools`
+- `micapipe`
+- `oshyx`
+- `qsirecon`
+- `qsmxt`
+- `sovabids`
+- `spinalcordtoolbox`
 - `vesselvio`
 - `vina`
 
-Likely cause: some commands are wrapper-only, dynamically added by activation
-scripts, or live outside the env files parsed so far.
+There are three clear signatures:
 
-Good minimal repro candidates:
+1. paths containing `#...#` fail with `is a directory`
+2. paths containing `GH#42345.pkl` fail with `file does not exist`
+3. `dicomtools` fails on `%` with `invalid URL escape "%IS"`
 
-- `nipype`
-- `oshyx`
-- `mritools`
+Representative examples from the logs:
 
-Next step: compare the CVMFS wrapper command, image env scripts, and direct image
-filesystem paths. Extend command inference or deploy env loading only where it
-matches wrapper behavior.
+- `afni`: `.../bin/#nu_correct#": ".../bin" is a directory`
+- `spinalcordtoolbox`: `.../empty_frame_v1_2_4-GH#42345.pkl": file does not exist`
+- `dicomtools`: `invalid URL escape "%IS"`
 
-### Writable Home and Cache
+The likely root cause is that the packed-prefetch code is still treating CVMFS
+paths as URL-like data instead of opaque filesystem paths, so `#` and `%` are
+being interpreted instead of preserved literally.
 
-`apptainer` is now mostly working, with 135 passing tests and 5 failures around
-cache/key/remote operations. The failing commands try to write under
-`/root/.apptainer` or `/root/.apptainer/cache`, but the image root is read-only.
+Important consequence: the earlier `afni -ver` hang is not observable in this
+run, because `afni` now dies earlier in packed prefetch.
 
-Likely cause: direct execution does not provide the writable root-home/cache
-layout expected by Singularity/Neurodesk-style execution.
+Recommended next fix:
 
-Next step: run a minimal `apptainer` suite locally and test setting `HOME`,
-`APPTAINER_CACHEDIR`, and related cache/config directories to a writable shared
-work directory.
+- make the packed prefetch/index path handling fully opaque to `#` and `%`
+- rerun a minimal matrix:
+  `afni,dicomtools,spinalcordtoolbox,qsirecon,qsmxt,vina`
 
-### Long Command Hangs and Timeouts
+### 2. CVMFS Metadata / Published Image Mismatches Still Exist
 
-The all-container run was cancelled with these suites still active in
-`Run fulltest`:
-
-- `ants`
-- `dsistudio`
-- `bidsapppymvpa`
-- `bidsapphcppipelines`
-- `connectomeworkbench`
-- `deepretinotopy`
-- `brainlifecli`
-- `ilastik`
-- `linda`
-- `lesymap`
-- `julia`
-- `sigviewer`
-- `root`
-
-Many logs show repeated 120s per-command timeouts before cancellation.
-
-Likely causes are mixed:
-
-- GUI, Java, MATLAB/MCR, and ROOT tools waiting for display, cache, license, or
-  startup state.
-- Workbench and ROOT commands producing little or no output while still running.
-- Python-heavy tools blocked by the Python runtime environment problem.
-
-Next step: add command-level heartbeat/timing to the fulltest runner and rerun
-one representative quiet suite, such as `connectomeworkbench` or `root`, with
-CVMFS tracing enabled.
-
-### CVMFS Release Metadata Mismatches
-
-These suites fail before tests because the expected container directory or
-expected `.simg` entry is missing:
+9 suites failed because the expected image or container directory does not match
+what is published in CVMFS:
 
 - `aslprep`
 - `dicompare`
@@ -247,85 +200,208 @@ expected `.simg` entry is missing:
 - `slicer`
 - `topaz`
 
-Likely cause: recipe container/version metadata does not match what is published
-in CVMFS, or pyneurodesk assumes a single CVMFS directory shape that is not true
-for all recipes.
+Examples:
 
-Next step: inspect `local/neurocontainers/recipes/<suite>/fulltest.yaml` and
-the corresponding CVMFS directory listing. Add fallback image resolution only
-when CVMFS exposes an unambiguous image; otherwise patch or report recipe
-metadata upstream.
+- `dicompare`: container root does not contain `dicompare_0.1.3_20260202.simg`
+- `ezbids`: container root does not contain `ezbids_1.1.0_20260127.simg`
+- `gimp`: `read cvmfs container directory: file does not exist`
 
-### External Test Data
+These are not runtime failures inside the VM. They are image-resolution or
+recipe metadata problems.
 
-`afni` no longer fails because AFNI commands are missing from PATH. In the latest
-all-container run it failed before VM execution while downloading required
-OpenNeuro data:
+Recommended next fix:
 
-```text
-httpx.HTTPStatusError: Server error '500 Internal Server Error' for url
-https://s3.amazonaws.com/openneuro.org/ds000001/sub-01/anat/sub-01_T1w.nii.gz
-```
+- inspect the corresponding `local/neurocontainers/recipes/*/fulltest.yaml`
+- compare that metadata with the actual CVMFS directory layout
+- add fallback resolution only when the published image is unambiguous
 
-Likely cause: transient or changed OpenNeuro/S3 data availability, not an AFNI
-runtime failure in this run.
+### 3. VM Boot / Shell Handshake Timeouts Are Still A Separate Bucket
 
-Next step: add retry/backoff around required-file downloads, or cache required
-test data in the workflow, then rerun `afni`.
+There are now two distinct startup-time timeout modes.
 
-### VM Start Gateway Timeouts
+Explicit VM boot timeout (`504`, `vm boot timed out after 30s`):
 
-`qupath` and `spinalcordtoolbox` hit `504 Gateway Timeout` on `/vm`.
+- `amico`
+- `itksnap`
+- `quickshear`
 
-Likely cause: large image import or boot path exceeds the current HTTP timeout,
-or the VM start path is too quiet for very large images.
+Shell hook load timeout from the client side:
 
-Next step: rerun one of these with CVMFS tracing and a longer boot/import
-timeout. Check whether image import completes and whether the VM reaches boot
-logs.
+- `bidscoin`
+- `dsistudio`
+- `qupath`
 
-### Recipe/Test Expectation Mismatches
+These happen after import is far enough along to attempt VM startup, but before
+the suite can really begin.
 
-Some suites run many commands but fail on missing output fragments, absent files,
-or headless/desktop behavior differences.
+Recommended next fix:
 
-Likely cause: some fulltest expectations may be stale or written for native
-Singularity/desktop behavior rather than direct headless execution.
+- raise the `/vm` startup timeout beyond 30s for large images
+- add startup progress logging around guest boot and shell-hook activation
+- rerun `amico,itksnap,quickshear,qupath`
 
-Next step: defer broad recipe cleanup until the runtime environment gaps are
-fixed. Then classify each remaining mismatch as stale recipe, unsupported GUI
-behavior, or ccvm/pyneurodesk bug.
+### 4. Long Command Timeouts Still Hit Several Suites After Successful Boot
 
-## Fixed or Improved Areas
+A smaller but still important bucket is commands that do run, but exceed the
+fulltest command timeout:
 
-| Area | Status | Evidence | Follow-up |
-| --- | --- | --- | --- |
-| Default fulltest VM memory | Fixed | Push-triggered `niimath` fulltest passes with the 8GB default. Larger suites boot and run substantial workloads. | Keep `8192MiB` as the fulltest default. |
-| amd64 KVM memory mapping above 4GB | Fixed | The earlier `set user memory region: file exists` and high-memory guest-address read failures are no longer present in CI. | Keep regression coverage around high-memory E820 and multi-region guest memory access. |
-| Singularity image PATH/environment discovery | Improved | Explicit `resolve command ... in PATH` failures dropped from 52 suites to 23, and 5 extra suites now pass. | Continue extracting/merging container runtime env. |
-| Buffered command output obscuring long runs | Improved | `POST /vm/run?stream=1` and pyneurodesk streaming are in place. | Add command-level timing/heartbeat output. |
-| CVMFS request observability | Added | Completed suite artifacts include `<suite>-cvmfs.jsonl`; local AFNI repro showed CVMFS requests completed before the command wait. | Summarize slowest CVMFS requests automatically at job end. |
-| Python import over virtio-fs | Fixed locally | `batchheudiconv` Python slice passes 7/7 after `FUSE_STATX`, `FUSE_IOCTL`, and lazy-directory cache fixes. | Rerun `bidsme` and the small manual matrix in Actions. |
-| CVMFS per-command repository reuse | Fixed locally | `batchheudiconv` `Heudiconv version check` now passes locally in 9.66s instead of timing out at 120s. | Add slow-request summaries so regressions are obvious. |
+- `ants`: repeated 120s timeouts in `N4BiasFieldCorrection`, `DenoiseImage`,
+  and `antsAffineInitializer`
+- `root`: many non-interactive `root -b -l -q` and `hadd` commands time out at
+  120s
+- `vesselboost`: multiple inference steps time out at 120-300s
+- `dcm2bids`: several data-creation and `dcm2niix`-driven tests time out at
+  120s
+- `palmettobug`: many tiny Python import or analysis commands time out at 120s
+- `mriqc`, `fmriprep`, `gigaconnectome`, `networkcorrespondancetoolkit` also
+  show timeouts
+
+This bucket is mixed:
+
+- some commands are likely just too slow for the current timeout
+- some are likely hanging on startup, cache, or environment assumptions
+- some Python-heavy containers may still have a deeper import/runtime problem
+
+Recommended next fix:
+
+- add per-command heartbeat/timing output if not already present at the fulltest
+  layer
+- locally trace one representative suite from each subgroup:
+  `ants`, `root`, `palmettobug`, `vesselboost`
+
+### 5. `apptainer` Is Still Mostly A Writable-Home Problem
+
+`apptainer` is close:
+
+- `135` passed
+- `5` failed
+
+The failures are still the same writable-home/cache issue:
+
+- `/root/.apptainer/cache`: read-only file system
+- `/root/.apptainer/keys`: read-only file system
+- remote/keyserver commands also fail because the expected writable config state
+  is missing
+
+This remains a direct execution environment issue, not a command discovery
+problem.
+
+Recommended next fix:
+
+- provide writable `HOME`, `APPTAINER_CACHEDIR`, and key/config directories in
+  the fulltest runtime
+
+### 6. `batchheudiconv` Is No Longer A Python-Boot Failure
+
+`batchheudiconv` now gets much further:
+
+- `91` passed
+- `11` failed
+- `5` skipped
+
+Current failures are narrower:
+
+- `bh01_prep_dir.sh` times out at 120s
+- `numpy._ArrayMemoryError` while allocating about `1.18 GiB`
+- six `nib-diff` expectation mismatches
+- one output-fragment mismatch
+- one script-glob mismatch for `/opt/batch-heudiconv/*.sh`
+
+This is good evidence that the earlier Python-import initialization problem is
+not the main blocker anymore.
+
+Recommended next fix:
+
+- keep `batchheudiconv` as a regression suite for Python and CVMFS changes
+- treat the remaining failures as script-specific timeout, memory, or recipe
+  expectation issues
+
+### 7. `bidsme` Now Looks Like A Data / Recipe Expectation Mismatch
+
+`bidsme` no longer shows Python bootstrap failures. It now fails inside its own
+workflow logic:
+
+- `sub-01: No sessions found in: ds000001/sub-01`
+- `sub-02` through `sub-15`: `Not found in ds000001`
+
+The tests are expecting a broader dataset structure than the downloaded sample
+data provides.
+
+Recommended next fix:
+
+- inspect the `bidsme` recipe expectations against the fetched `ds000001`
+  subset
+- either adjust the test data setup or narrow the test expectations
+
+### 8. Several MATLAB/MCR Suites Look More Like Layout / Wrapper Mismatches Than VM Bugs
+
+This bucket includes:
+
+- `brainager`
+- `brainnetviewer`
+- `brainstorm`
+- `conn`
+- `eeglab`
+- `fastsurfer`
+- `physio`
+- `spm25`
+
+Representative signals:
+
+- `conn` and `spm25` have large numbers of `exit code 127` failures
+- `eeglab` mostly fails on missing expected files, directories, and env
+  fragments under `/opt/MCR/...` or `/opt/eeglab-2020.0/...`
+
+This looks less like a generic VM failure and more like a mismatch between:
+
+- what the fulltests expect from the packaged container layout or wrapper
+  scripts
+- what direct execution through `ccvm` actually exposes
+
+Recommended next fix:
+
+- do not treat this as one bug
+- split it into:
+  - missing wrapper commands / PATH exposure
+  - missing container files or env variables
+  - stale fulltest expectations
+
+## Near-Pass Suites
+
+These are worth revisiting after the packed-prefetch bug because they are
+already close:
+
+- `syncro`: `35` passed, `1` failed
+- `qmrlab`: `48` passed, `2` failed
+- `linda`: `52` passed, `2` failed
+- `lesymap`: `78` passed, `2` failed
+- `relion`: `123` passed, `2` failed
+- `fmriprep`: `84` passed, `3` failed, `1` skipped
+- `heudiconv`: `64` passed, `4` failed
+- `apptainer`: `135` passed, `5` failed
+- `brkraw`: `77` passed, `6` failed
+- `niistat`: `87` passed, `6` failed
 
 ## Recommended Work Order
 
-1. Rerun `bidsme` locally and in the small manual matrix to validate the Python
-   fixes beyond `batchheudiconv`.
-2. Fix writable home/cache semantics with `apptainer`.
-3. Add command heartbeat/timing and use it on `connectomeworkbench` or `root`.
-4. Add robust test-data retry/caching, then rerun `afni`.
-5. Triage CVMFS release metadata mismatches separately from runtime failures.
-6. Re-run a smaller manual matrix:
-   `apptainer,batchheudiconv,bidsme,connectomeworkbench,afni,ants,fsl`.
+1. Fix the packed-prefetch path escaping bug for literal `#` and `%`.
+2. Rerun a small import-focused matrix:
+   `afni,dicomtools,spinalcordtoolbox,qsirecon,qsmxt,vina`.
+3. Fix writable-home handling for `apptainer`.
+4. Raise or instrument VM startup for the boot-timeout bucket:
+   `amico,itksnap,quickshear,qupath`.
+5. Triage one long-running post-boot suite from each family:
+   `ants`, `root`, `palmettobug`, `vesselboost`.
+6. Clean up recipe/CVMFS metadata mismatches separately from runtime work.
+7. Revisit near-pass suites once the import-time regression is gone.
 
-## Notes for Future Runs
+## Notes For Future Runs
 
-- Default push behavior should continue to run only `niimath`.
-- Use manual `workflow_dispatch` with `suite=all` only when runner capacity and
-  long runtime are acceptable.
-- Completed fulltest jobs upload both the human log and CVMFS JSONL trace:
-  `<suite>.log` and `<suite>-cvmfs.jsonl`.
-- For long quiet commands, CVMFS trace can distinguish import/fetch delay from
-  command execution delay, but command heartbeat is still needed to identify
-  process-level hangs.
+- Keep the default push workflow on `niimath`.
+- Use `workflow_dispatch` with `suite=all` only for explicit investigations.
+- The latest all-suite run proves that the current matrix can run for more than
+  14 hours, so the workflow is now giving full end-state signal instead of only
+  early cancellations.
+- Right now the packed-prefetch regression is the main thing distorting the
+  matrix. Fixing that should immediately convert many pre-summary failures into
+  actionable runtime failures.

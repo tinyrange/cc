@@ -55,6 +55,27 @@ type Target struct {
 	Remote    bool
 }
 
+func FormatTarget(target Target) (string, error) {
+	if !target.Remote {
+		if strings.TrimSpace(target.LocalPath) == "" {
+			return "", fmt.Errorf("local CVMFS target is missing LocalPath")
+		}
+		return target.LocalPath, nil
+	}
+	if strings.TrimSpace(target.Mirror) == "" {
+		return "", fmt.Errorf("remote CVMFS target is missing Mirror")
+	}
+	if strings.TrimSpace(target.Repo) == "" {
+		return "", fmt.Errorf("remote CVMFS target is missing Repo")
+	}
+	u, err := url.Parse(target.Mirror)
+	if err != nil {
+		return "", err
+	}
+	u.Path = path.Join(u.Path, target.Repo, strings.TrimPrefix(target.Path, "/"))
+	return u.String(), nil
+}
+
 type DirEntry struct {
 	Name    string
 	Mode    fs.FileMode

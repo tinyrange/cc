@@ -39,7 +39,12 @@ func joinCVMFSTarget(base, rel string) (string, error) {
 		}
 		return filepath.Join(parsed.LocalPath, filepath.FromSlash(strings.TrimPrefix(joinedPath, "/"))), nil
 	}
-	return strings.TrimRight(parsed.Mirror, "/") + "/" + parsed.Repo + joinedPath, nil
+	return intcvmfs.FormatTarget(intcvmfs.Target{
+		Mirror: parsed.Mirror,
+		Repo:   parsed.Repo,
+		Path:   joinedPath,
+		Remote: true,
+	})
 }
 
 func resolveCVMFSRootTarget(client *intcvmfs.Client, source string) (string, bool, error) {

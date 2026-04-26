@@ -62,6 +62,50 @@ func TestParseTarget(t *testing.T) {
 	}
 }
 
+func TestFormatTargetEscapesLiteralPathCharacters(t *testing.T) {
+	t.Parallel()
+
+	raw, err := FormatTarget(Target{
+		Remote: true,
+		Mirror: "https://cvmfs.neurodesk.org/cvmfs",
+		Repo:   "neurodesk.ardc.edu.au",
+		Path:   "/containers/afni/bin/#nu_correct#",
+	})
+	if err != nil {
+		t.Fatalf("FormatTarget(#) error = %v", err)
+	}
+	if !strings.Contains(raw, "%23nu_correct%23") {
+		t.Fatalf("FormatTarget(#) = %q, want escaped fragment markers", raw)
+	}
+	got, err := ParseTarget(raw)
+	if err != nil {
+		t.Fatalf("ParseTarget(FormatTarget(#)) error = %v", err)
+	}
+	if got.Path != "/containers/afni/bin/#nu_correct#" {
+		t.Fatalf("round trip path = %q, want %q", got.Path, "/containers/afni/bin/#nu_correct#")
+	}
+
+	raw, err = FormatTarget(Target{
+		Remote: true,
+		Mirror: "https://cvmfs.neurodesk.org/cvmfs",
+		Repo:   "neurodesk.ardc.edu.au",
+		Path:   "/usr/share/dcmtk/csmapper/ISO-8859/UCS%ISO-8859-2.mps",
+	})
+	if err != nil {
+		t.Fatalf("FormatTarget(%%) error = %v", err)
+	}
+	if !strings.Contains(raw, "UCS%25ISO-8859-2.mps") {
+		t.Fatalf("FormatTarget(%%) = %q, want escaped percent", raw)
+	}
+	got, err = ParseTarget(raw)
+	if err != nil {
+		t.Fatalf("ParseTarget(FormatTarget(%%)) error = %v", err)
+	}
+	if got.Path != "/usr/share/dcmtk/csmapper/ISO-8859/UCS%ISO-8859-2.mps" {
+		t.Fatalf("round trip path = %q, want %q", got.Path, "/usr/share/dcmtk/csmapper/ISO-8859/UCS%ISO-8859-2.mps")
+	}
+}
+
 func TestRemoteReadDirAndFile(t *testing.T) {
 	t.Parallel()
 
