@@ -72,6 +72,7 @@ type managedExec struct {
 	stdin   io.WriteCloser
 	pty     *os.File
 	process *os.Process
+	start   time.Time
 }
 
 func (m *managedExec) writeStdin(data []byte) error {
@@ -621,6 +622,7 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 			if managed == nil {
 				continue
 			}
+			writeExecTiming(control, req.ID, "stdin_close_recv", managed.start)
 			if err := managed.closeStdin(); err != nil {
 				writeKernel("ccx3-init: close stdin: " + err.Error())
 			}
@@ -674,7 +676,7 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 		}
 
 		stdinR, stdinW := io.Pipe()
-		managed := &managedExec{stdin: stdinW}
+		managed := &managedExec{stdin: stdinW, start: time.Now()}
 		activeMu.Lock()
 		active[req.ID] = managed
 		activeMu.Unlock()
@@ -769,9 +771,14 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		go func() {
 			defer func() { done <- struct{}{} }()
 			var buf [256]byte
+			first := true
 			for {
 				n, err := ptyMaster.Read(buf[:])
 				if n > 0 && cfg.OutputMarkerPref != "" {
+					if first {
+						writeExecTiming(control, id, "first_stdout", execStart)
+						first = false
+					}
 					writeProtocolLineTo(control, cfg.OutputMarkerPref+id+":"+base64.StdEncoding.EncodeToString(buf[:n]))
 				}
 				if err != nil {
@@ -824,9 +831,14 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			defer func() { done <- struct{}{} }()
 			defer stdoutR.Close()
 			var buf [256]byte
+			first := true
 			for {
 				n, err := stdoutR.Read(buf[:])
 				if n > 0 && cfg.OutputMarkerPref != "" {
+					if first {
+						writeExecTiming(control, id, "first_stdout", execStart)
+						first = false
+					}
 					writeProtocolLineTo(control, cfg.OutputMarkerPref+id+":"+base64.StdEncoding.EncodeToString(buf[:n]))
 				}
 				if err != nil {
@@ -838,9 +850,14 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			defer func() { done <- struct{}{} }()
 			defer stderrR.Close()
 			var buf [256]byte
+			first := true
 			for {
 				n, err := stderrR.Read(buf[:])
 				if n > 0 && cfg.ErrorMarkerPref != "" {
+					if first {
+						writeExecTiming(control, id, "first_stderr", execStart)
+						first = false
+					}
 					writeProtocolLineTo(control, cfg.ErrorMarkerPref+id+":"+base64.StdEncoding.EncodeToString(buf[:n]))
 				}
 				if err != nil {
@@ -853,6 +870,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		cmd.SysProcAttr = &syscall.SysProcAttr{Chroot: rootDir}
 	}
 
+	writeExecTiming(control, id, "start_call", execStart)
 	startErr := cmd.Start()
 	if startErr != nil {
 		_ = managed.closeStdin()
@@ -879,6 +897,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		ptySlave = nil
 	}
 
+	writeExecTiming(control, id, "wait_begin", execStart)
 	waitErr := cmd.Wait()
 	writeExecTiming(control, id, "wait_done", execStart)
 	if tty {

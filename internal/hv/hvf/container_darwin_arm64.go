@@ -508,33 +508,53 @@ func (s *ContainerSession) sendStdinClose(id string) error {
 }
 
 func (s *ContainerSession) streamExecEvents(ctx context.Context, start int, id string, onEvent func(client.ExecEvent) error) error {
+	totalStart := time.Now()
 	offset := start
 	var pending string
+	var loops, reads, lines, matched, ignored, sleeps int
 	for {
+		loops++
+		readStart := time.Now()
 		text := s.transcript.String()
+		timing.Since(ctx, "exec.stream_events.transcript_string", readStart)
 		if offset < len(text) {
+			reads++
+			appendStart := time.Now()
 			pending += text[offset:]
 			offset = len(text)
+			timing.Since(ctx, "exec.stream_events.append_pending", appendStart)
 			for {
 				lineEnd := strings.IndexByte(pending, '\n')
 				if lineEnd < 0 {
 					break
 				}
+				lines++
+				lineStart := time.Now()
 				line := strings.TrimSpace(pending[:lineEnd])
 				pending = pending[lineEnd+1:]
+				timing.Since(ctx, "exec.stream_events.next_line", lineStart)
+				recordExecTimingLine(ctx, line, id)
+				parseStart := time.Now()
 				event, done, ok, err := parseManagedExecEventLine(line, id)
+				timing.Since(ctx, "exec.stream_events.parse_line", parseStart)
 				if err != nil {
 					return err
 				}
 				if !ok {
+					ignored++
 					continue
 				}
+				matched++
 				if onEvent != nil {
+					callbackStart := time.Now()
 					if err := onEvent(event); err != nil {
 						return err
 					}
+					timing.Since(ctx, "exec.stream_events.callback", callbackStart)
 				}
 				if done {
+					recordExecStreamCounts(ctx, loops, reads, lines, matched, ignored, sleeps)
+					timing.Since(ctx, "exec.stream_events.until_done", totalStart)
 					return nil
 				}
 			}
@@ -543,7 +563,53 @@ func (s *ContainerSession) streamExecEvents(ctx context.Context, start int, id s
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		sleeps++
+		sleepStart := time.Now()
 		time.Sleep(5 * time.Millisecond)
+		timing.Since(ctx, "exec.stream_events.sleep", sleepStart)
+	}
+}
+
+func recordExecTimingLine(ctx context.Context, line, id string) {
+	prefix := execTimingMarker + id + ":"
+	if !strings.HasPrefix(line, prefix) {
+		return
+	}
+	rest := strings.TrimPrefix(line, prefix)
+	parts := strings.SplitN(rest, ":", 2)
+	if len(parts) != 2 {
+		return
+	}
+	ms, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return
+	}
+	phase := strings.TrimSpace(parts[0])
+	if phase == "" {
+		return
+	}
+	timing.Record(ctx, "exec.guest."+phase, time.Duration(ms)*time.Millisecond)
+}
+
+func recordExecStreamCounts(ctx context.Context, loops, reads, lines, matched, ignored, sleeps int) {
+	recorder := timing.FromContext(ctx)
+	if recorder == nil {
+		return
+	}
+	recordCount(recorder, "exec.stream_events.loop", loops)
+	recordCount(recorder, "exec.stream_events.read", reads)
+	recordCount(recorder, "exec.stream_events.line", lines)
+	recordCount(recorder, "exec.stream_events.matched_line", matched)
+	recordCount(recorder, "exec.stream_events.ignored_line", ignored)
+	recordCount(recorder, "exec.stream_events.sleep_count", sleeps)
+}
+
+func recordCount(recorder *timing.Recorder, name string, count int) {
+	if recorder == nil {
+		return
+	}
+	for i := 0; i < count; i++ {
+		recorder.Record(name, 0)
 	}
 }
 
@@ -805,8 +871,18 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		defer close(closeDone)
 		defer vm.Close()
 		for {
-			exitInfo, err, stalled := runWithCancel(runCtx, vm, persistentRunSlice(guestReady.Load(), activeExecs.Load() > 0))
+			active := activeExecs.Load() > 0
+			runSlice := persistentRunSlice(guestReady.Load(), active)
+			runStart := time.Now()
+			exitInfo, err, stalled := runWithCancel(runCtx, vm, runSlice)
+			timing.Since(ctx, "hvf.run_loop.run_with_cancel", runStart)
 			if stalled {
+				if active {
+					recordCount(timing.FromContext(ctx), "hvf.run_loop.stalled_active_exec", 1)
+					timing.Record(ctx, "hvf.run_loop.active_exec_stall_slice", runSlice)
+				} else {
+					recordCount(timing.FromContext(ctx), "hvf.run_loop.stalled_idle", 1)
+				}
 				if runCtx.Err() != nil {
 					doneCh <- sessionRunResult{err: runCtx.Err()}
 					return
@@ -840,7 +916,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			}
 			switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 			case ExceptionClassDataAbortLowerEL:
-				if err := handleContainerDataAbort(vm, uart, console, fsdevs, vsock, exitInfo); err != nil {
+				if err := handleContainerDataAbort(ctx, vm, uart, console, fsdevs, vsock, exitInfo); err != nil {
 					doneCh <- sessionRunResult{err: err}
 					return
 				}
@@ -1149,7 +1225,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 
 		switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 		case ExceptionClassDataAbortLowerEL:
-			if err := handleContainerDataAbort(vm, uart, console, fsdevs, vsock, exitInfo); err != nil {
+			if err := handleContainerDataAbort(ctx, vm, uart, console, fsdevs, vsock, exitInfo); err != nil {
 				return ContainerRunResult{}, err
 			}
 		case ExceptionClassSystemRegister:
@@ -1235,7 +1311,9 @@ type runResultVM struct {
 	err  error
 }
 
-func handleContainerDataAbort(vm *VM, uart *serial.UART8250, console *virtio.Console, fsdevs []*virtio.FS, vsock *virtio.Vsock, exitInfo *VcpuExit) error {
+func handleContainerDataAbort(ctx context.Context, vm *VM, uart *serial.UART8250, console *virtio.Console, fsdevs []*virtio.FS, vsock *virtio.Vsock, exitInfo *VcpuExit) error {
+	totalStart := time.Now()
+	defer timing.Since(ctx, "hvf.data_abort.total", totalStart)
 	info, err := DecodeDataAbort(exitInfo.Exception.Syndrome)
 	if err != nil {
 		return err
@@ -1280,9 +1358,11 @@ func handleContainerDataAbort(vm *VM, uart *serial.UART8250, console *virtio.Con
 			}
 		}
 	case hasFSDevice(fsdevs, addr, info.SizeBytes):
+		start := time.Now()
 		if err := handleFSDataAbort(vm, fsdevs, addr, info); err != nil {
 			return err
 		}
+		timing.Since(ctx, "hvf.data_abort.virtio_fs", start)
 	case vsock != nil && vsock.Contains(addr, info.SizeBytes):
 		if info.Write {
 			value, err := readAbortValue(vm, info)
