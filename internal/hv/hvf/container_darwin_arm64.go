@@ -65,6 +65,7 @@ type ContainerRunResult = vmruntime.RunResult
 type ContainerSession struct {
 	cancel      context.CancelFunc
 	doneCh      chan sessionRunResult
+	closeDone   <-chan struct{}
 	image       *oci.Image
 	baseEnv     []string
 	workDir     string
@@ -183,6 +184,9 @@ func StartContainerStream(ctx context.Context, req ContainerRunRequest, onEvent 
 
 func (s *ContainerSession) Wait() error {
 	res := <-s.doneCh
+	if s.closeDone != nil {
+		<-s.closeDone
+	}
 	return res.err
 }
 
@@ -695,6 +699,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	runCtx, cancel := context.WithCancel(context.Background())
 	readyCh := make(chan error, 1)
 	doneCh := make(chan sessionRunResult, 1)
+	closeDone := make(chan struct{})
 	controlTranscript := newSerialTranscript()
 	controlAcceptCh := make(chan readyResult, 1)
 	controlConnCh := make(chan readyResult, 1)
@@ -771,6 +776,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	}()
 
 	go func() {
+		defer close(closeDone)
 		defer vm.Close()
 		for {
 			exitInfo, err, stalled := runWithCancel(runCtx, vm, persistentRunSlice(guestReady.Load(), activeExecs.Load() > 0))
@@ -850,6 +856,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			cancel()
 			_ = listener.Close()
 			res := <-doneCh
+			<-closeDone
 			if res.err != nil {
 				return nil, res.err
 			}
@@ -863,6 +870,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			cancel()
 			_ = listener.Close()
 			resDone := <-doneCh
+			<-closeDone
 			if resDone.err != nil {
 				return nil, resDone.err
 			}
@@ -884,6 +892,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		return &ContainerSession{
 			cancel:      cancel,
 			doneCh:      doneCh,
+			closeDone:   closeDone,
 			image:       req.Image,
 			baseEnv:     baseEnv,
 			workDir:     workDir,
@@ -898,6 +907,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	case res := <-doneCh:
 		cancel()
 		_ = listener.Close()
+		<-closeDone
 		if res.err != nil {
 			return nil, res.err
 		}
@@ -906,6 +916,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		cancel()
 		_ = listener.Close()
 		res := <-doneCh
+		<-closeDone
 		if res.err != nil {
 			return nil, res.err
 		}
