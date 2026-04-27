@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -49,6 +50,7 @@ class TestCase:
     depends_on: tuple[str, ...] = ()
     expected_output_contains: tuple[str, ...] = ()
     expected_exit_code: int = 0
+    ignore_exit_code: bool = False
     validate: tuple[dict[str, Any], ...] = ()
 
 
@@ -249,18 +251,29 @@ def load_suite(path: Path) -> Suite:
     yaml = _import_yaml()
     payload = yaml.safe_load(path.read_text()) or {}
     tests = []
-    for item in payload.get("tests", []):
+    matlab_runtime = payload.get("matlab_runtime") or {}
+    for index, item in enumerate(payload.get("tests", []), start=1):
         expected_exit_code = item.get("expected_exit_code")
         if expected_exit_code is None:
             expected_exit_code = 0
+        name = str(item["name"])
+        command = test_command_from_item(
+            item,
+            suite_name=str(payload.get("name") or path.stem),
+            test_name=name,
+            test_index=index,
+            test_data={str(key): str(value) for key, value in (payload.get("test_data") or {}).items()},
+            matlab_runtime=matlab_runtime,
+        )
         tests.append(
             TestCase(
-                name=str(item["name"]),
-                command=str(item["command"]),
+                name=name,
+                command=command,
                 timeout=int(item.get("timeout") or 0),
                 depends_on=tuple(to_string_list(item.get("depends_on"))),
                 expected_output_contains=tuple(to_string_list(item.get("expected_output_contains"))),
                 expected_exit_code=int(expected_exit_code),
+                ignore_exit_code=bool(item.get("ignore_exit_code")),
                 validate=tuple(item.get("validate") or ()),
             )
         )
@@ -280,6 +293,76 @@ def load_suite(path: Path) -> Suite:
         tests=tuple(tests),
         default_timeout=int(payload.get("default_timeout") or payload.get("default_timout") or 0),
     )
+
+
+def test_command_from_item(
+    item: dict[str, Any],
+    *,
+    suite_name: str,
+    test_name: str,
+    test_index: int,
+    test_data: dict[str, str],
+    matlab_runtime: Any,
+) -> str:
+    if "command" in item:
+        return str(item["command"])
+    if "script" in item:
+        return matlab_script_command(
+            str(item["script"]),
+            suite_name=suite_name,
+            test_name=test_name,
+            test_index=test_index,
+            scripts_dir=test_data.get("scripts_dir", "test_scripts"),
+            matlab_runtime=matlab_runtime,
+        )
+    raise ValueError(f"test {test_index} {test_name!r} must define either 'command' or 'script'")
+
+
+def matlab_script_command(
+    script: str,
+    *,
+    suite_name: str,
+    test_name: str,
+    test_index: int,
+    scripts_dir: str,
+    matlab_runtime: Any,
+) -> str:
+    if not isinstance(matlab_runtime, dict):
+        raise ValueError(f"test {test_index} {test_name!r} defines 'script' but matlab_runtime is not a mapping")
+    runner = str(matlab_runtime.get("runner") or "").strip()
+    runtime_path = str(matlab_runtime.get("path") or "").strip()
+    if not runner or not runtime_path:
+        raise ValueError(
+            f"test {test_index} {test_name!r} defines 'script' but matlab_runtime.runner/path are not set"
+        )
+
+    script_path = Path(scripts_dir) / f"{slugify_test_script_name(suite_name, test_index, test_name)}.m"
+    quoted_script_path = shlex.quote(script_path.as_posix())
+    quoted_runner = shlex.quote(runner)
+    quoted_runtime_path = shlex.quote(runtime_path)
+    quoted_parent = shlex.quote(script_path.parent.as_posix())
+    return "\n".join(
+        [
+            "bash -lc " + shlex.quote(
+                "\n".join(
+                    [
+                        "set -euo pipefail",
+                        f"mkdir -p {quoted_parent}",
+                        f"cat > {quoted_script_path} <<'PYNEURODESK_FULLTEST_MATLAB'",
+                        script.rstrip(),
+                        "PYNEURODESK_FULLTEST_MATLAB",
+                        f"{quoted_runner} {quoted_runtime_path} {quoted_script_path}",
+                    ]
+                )
+            )
+        ]
+    )
+
+
+def slugify_test_script_name(suite_name: str, test_index: int, test_name: str) -> str:
+    raw = f"{suite_name}-{test_index:03d}-{test_name}".lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+    return slug or f"test-{test_index:03d}"
 
 
 def to_string_list(value: Any) -> list[str]:
@@ -560,7 +643,7 @@ def first_shell_command(script: str) -> str:
 
 
 def validate_test(output: str, exit_code: int, test: TestCase, host_vars: dict[str, str]) -> str:
-    if exit_code != test.expected_exit_code:
+    if not test.ignore_exit_code and exit_code != test.expected_exit_code:
         return f"exit code {exit_code}, want {test.expected_exit_code}\n{output}".strip()
     for fragment in test.expected_output_contains:
         if fragment and fragment not in output:
