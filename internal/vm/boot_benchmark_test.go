@@ -3,6 +3,7 @@ package vm
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -87,7 +88,7 @@ func setupAlpineSIMGWhoamiBenchmark(b *testing.B) alpineSIMGWhoamiBenchmarkSetup
 	defer cancel()
 
 	setupStart := time.Now()
-	root := b.TempDir()
+	root := alpineSIMGWhoamiBenchmarkCacheRoot(b)
 	kernel := alpine.NewManager(filepath.Join(root, "kernel"))
 	kernelStart := time.Now()
 	if err := kernel.Ensure(setupCtx); err != nil {
@@ -106,6 +107,30 @@ func setupAlpineSIMGWhoamiBenchmark(b *testing.B) alpineSIMGWhoamiBenchmarkSetup
 		store:          store,
 		guestInitCache: filepath.Join(root, "guestinit"),
 	}
+}
+
+func alpineSIMGWhoamiBenchmarkCacheRoot(b *testing.B) string {
+	b.Helper()
+	if root := strings.TrimSpace(os.Getenv("CCX3_BENCH_CACHE_DIR")); root != "" {
+		root = filepath.Join(root, "alpine-simg-whoami")
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			b.Fatalf("create benchmark cache dir: %v", err)
+		}
+		return root
+	}
+	cacheRoot, err := os.UserCacheDir()
+	if err != nil || cacheRoot == "" {
+		root := filepath.Join(os.TempDir(), "ccx3", "benchmarks", "alpine-simg-whoami")
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			b.Fatalf("create benchmark cache dir: %v", err)
+		}
+		return root
+	}
+	root := filepath.Join(cacheRoot, "ccx3", "benchmarks", "alpine-simg-whoami")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		b.Fatalf("create benchmark cache dir: %v", err)
+	}
+	return root
 }
 
 func benchmarkExecWhoami(ctx context.Context, inst Instance) (time.Duration, error) {

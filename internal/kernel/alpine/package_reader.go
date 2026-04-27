@@ -2,15 +2,19 @@ package alpine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"j5.nz/cc/internal/timing"
 )
+
+const repoIndexDiskCacheMaxAge = 24 * time.Hour
 
 func (m *Manager) ReadPackageFile(ctx context.Context, repo, packageName, innerPath string) ([]byte, error) {
 	cacheKey := repo + "\x00" + packageName + "\x00" + innerPath
@@ -212,6 +216,39 @@ func (m *Manager) lookupPackageEntry(ctx context.Context, repo, packageName stri
 	timing.Since(ctx, "kernel.lookup_package_entry.cache_miss", start)
 
 	start = time.Now()
+	if entry, ok, err := m.loadPackageEntryCache(repo, packageName); err != nil {
+		timing.Since(ctx, "kernel.lookup_package_entry.entry_disk_cache_error", start)
+	} else if ok {
+		timing.Since(ctx, "kernel.lookup_package_entry.entry_disk_cache_hit", start)
+		return entry, nil
+	} else {
+		timing.Since(ctx, "kernel.lookup_package_entry.entry_disk_cache_miss", start)
+	}
+
+	start = time.Now()
+	if indexData, ok, err := m.loadRepoIndexCache(repo); err != nil {
+		timing.Since(ctx, "kernel.lookup_package_entry.disk_cache_error", start)
+	} else if ok {
+		timing.Since(ctx, "kernel.lookup_package_entry.disk_cache_hit", start)
+		entry, err := m.packageEntryFromIndex(repo, packageName, indexData)
+		if err != nil {
+			return indexEntry{}, err
+		}
+		start = time.Now()
+		if err := m.savePackageEntryCache(repo, packageName, entry); err != nil {
+			timing.Since(ctx, "kernel.lookup_package_entry.save_entry_disk_cache_error", start)
+		} else {
+			timing.Since(ctx, "kernel.lookup_package_entry.save_entry_disk_cache", start)
+		}
+		m.mu.Lock()
+		m.repoIndexes[repo] = indexData
+		m.mu.Unlock()
+		return entry, nil
+	} else {
+		timing.Since(ctx, "kernel.lookup_package_entry.disk_cache_miss", start)
+	}
+
+	start = time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.repoIndexURL(repo), nil)
 	if err != nil {
 		return indexEntry{}, err
@@ -234,18 +271,161 @@ func (m *Manager) lookupPackageEntry(ctx context.Context, repo, packageName stri
 	}
 	timing.Since(ctx, "kernel.lookup_package_entry.read_apk_index", start)
 	start = time.Now()
-	entry, ok := indexData[packageName]
-	if !ok {
-		return indexEntry{}, fmt.Errorf("package %q not found in APKINDEX", packageName)
+	entry, err := m.packageEntryFromIndex(repo, packageName, indexData)
+	if err != nil {
+		return indexEntry{}, err
 	}
-	if entry.Arch != m.arch {
-		return indexEntry{}, fmt.Errorf("package arch %q does not match expected %q", entry.Arch, m.arch)
+	start = time.Now()
+	if err := m.savePackageEntryCache(repo, packageName, entry); err != nil {
+		timing.Since(ctx, "kernel.lookup_package_entry.save_entry_disk_cache_error", start)
+	} else {
+		timing.Since(ctx, "kernel.lookup_package_entry.save_entry_disk_cache", start)
 	}
+	start = time.Now()
+	if err := m.saveRepoIndexCache(repo, indexData); err != nil {
+		timing.Since(ctx, "kernel.lookup_package_entry.save_disk_cache_error", start)
+	} else {
+		timing.Since(ctx, "kernel.lookup_package_entry.save_disk_cache", start)
+	}
+	start = time.Now()
 	m.mu.Lock()
 	m.repoIndexes[repo] = indexData
 	m.mu.Unlock()
 	timing.Since(ctx, "kernel.lookup_package_entry.store_index", start)
 	return entry, nil
+}
+
+func (m *Manager) loadPackageEntryCache(repo, packageName string) (indexEntry, bool, error) {
+	path := m.packageEntryCachePath(repo, packageName)
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return indexEntry{}, false, nil
+		}
+		return indexEntry{}, false, fmt.Errorf("stat package entry cache: %w", err)
+	}
+	if time.Since(info.ModTime()) > repoIndexDiskCacheMaxAge {
+		return indexEntry{}, false, nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return indexEntry{}, false, fmt.Errorf("open package entry cache: %w", err)
+	}
+	defer file.Close()
+	var entry indexEntry
+	if err := json.NewDecoder(file).Decode(&entry); err != nil {
+		return indexEntry{}, false, fmt.Errorf("decode package entry cache: %w", err)
+	}
+	if entry.Name == "" || entry.Version == "" || entry.Arch == "" {
+		return indexEntry{}, false, fmt.Errorf("package entry cache is incomplete")
+	}
+	if entry.Arch != m.arch {
+		return indexEntry{}, false, nil
+	}
+	return entry, true, nil
+}
+
+func (m *Manager) savePackageEntryCache(repo, packageName string, entry indexEntry) error {
+	path := m.packageEntryCachePath(repo, packageName)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create package entry cache dir: %w", err)
+	}
+	tmpPath := path + ".tmp"
+	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("create package entry cache: %w", err)
+	}
+	if err := json.NewEncoder(file).Encode(entry); err != nil {
+		_ = file.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("write package entry cache: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close package entry cache: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("finalize package entry cache: %w", err)
+	}
+	return nil
+}
+
+func (m *Manager) packageEntryFromIndex(repo, packageName string, indexData map[string]indexEntry) (indexEntry, error) {
+	entry, ok := indexData[packageName]
+	if !ok {
+		return indexEntry{}, fmt.Errorf("package %q not found in %s APKINDEX", packageName, repo)
+	}
+	if entry.Arch != m.arch {
+		return indexEntry{}, fmt.Errorf("package arch %q does not match expected %q", entry.Arch, m.arch)
+	}
+	return entry, nil
+}
+
+func (m *Manager) loadRepoIndexCache(repo string) (map[string]indexEntry, bool, error) {
+	path := m.repoIndexCachePath(repo)
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("stat repo index cache: %w", err)
+	}
+	if time.Since(info.ModTime()) > repoIndexDiskCacheMaxAge {
+		return nil, false, nil
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, false, fmt.Errorf("open repo index cache: %w", err)
+	}
+	defer file.Close()
+	var indexData map[string]indexEntry
+	if err := json.NewDecoder(file).Decode(&indexData); err != nil {
+		return nil, false, fmt.Errorf("decode repo index cache: %w", err)
+	}
+	if indexData == nil {
+		return nil, false, fmt.Errorf("repo index cache is empty")
+	}
+	return indexData, true, nil
+}
+
+func (m *Manager) saveRepoIndexCache(repo string, indexData map[string]indexEntry) error {
+	path := m.repoIndexCachePath(repo)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create repo index cache dir: %w", err)
+	}
+	tmpPath := path + ".tmp"
+	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return fmt.Errorf("create repo index cache: %w", err)
+	}
+	enc := json.NewEncoder(file)
+	if err := enc.Encode(indexData); err != nil {
+		_ = file.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("write repo index cache: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("close repo index cache: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("finalize repo index cache: %w", err)
+	}
+	return nil
+}
+
+func (m *Manager) repoIndexCachePath(repo string) string {
+	name := strings.NewReplacer("/", "_", "\\", "_", ":", "_").Replace(repo)
+	return filepath.Join(m.root, "repo-indexes", m.version, m.arch, name+".json")
+}
+
+func (m *Manager) packageEntryCachePath(repo, packageName string) string {
+	replacer := strings.NewReplacer("/", "_", "\\", "_", ":", "_")
+	repo = replacer.Replace(repo)
+	packageName = replacer.Replace(packageName)
+	return filepath.Join(m.root, "repo-indexes", m.version, m.arch, repo, packageName+".json")
 }
 
 func (m *Manager) cachedTarIndex(ctx context.Context, tarPath string) (map[string]tarIndexEntry, error) {

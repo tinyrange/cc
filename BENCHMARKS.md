@@ -13,6 +13,8 @@ go test -v ./internal/vm -run '^$' -bench '^BenchmarkAlpineSIMGWhoamiBoot$' -ben
 On Darwin/arm64 this benchmark is intentionally single-shot because the current
 HVF backend cannot reliably create a second VM in the same test process after a
 cold boot. Use separate `go test` invocations for repeated samples.
+Benchmark setup artifacts are cached under the user cache directory by default;
+set `CCX3_BENCH_CACHE_DIR` to use a different cache root.
 
 ```sh
 go test -v ./internal/vm -run '^$' -bench '^BenchmarkAlpineSIMGWhoamiBootDetailedDarwin$' -benchtime=1x
