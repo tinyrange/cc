@@ -131,6 +131,35 @@ func TestWriteExecEventStream(t *testing.T) {
 	}
 }
 
+func TestSanitizeExecEventForJSONClearsInvalidTextOutput(t *testing.T) {
+	event := sanitizeExecEventForJSON(client.ExecEvent{
+		Kind:   "stdout",
+		Stream: "stdout",
+		Output: string([]byte{0xff, 0x00, 'x'}),
+		Data:   []byte{0xff, 0x00, 'x'},
+	})
+
+	if event.Output != "" {
+		t.Fatalf("Output = %q, want empty for non-UTF-8 binary data", event.Output)
+	}
+	if string(event.Data) != string([]byte{0xff, 0x00, 'x'}) {
+		t.Fatalf("Data = %v, want preserved binary data", event.Data)
+	}
+}
+
+func TestSanitizeExecEventForJSONKeepsTextOutput(t *testing.T) {
+	event := sanitizeExecEventForJSON(client.ExecEvent{
+		Kind:   "stdout",
+		Stream: "stdout",
+		Output: "hello\n",
+		Data:   []byte("hello\n"),
+	})
+
+	if event.Output != "hello\n" {
+		t.Fatalf("Output = %q, want preserved text output", event.Output)
+	}
+}
+
 func TestWriteProgressEvent(t *testing.T) {
 	rec := httptest.NewRecorder()
 	if err := writeProgressEvent(rec, client.ProgressEvent{

@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
@@ -828,6 +829,7 @@ func writeRunEventStream(w http.ResponseWriter, ctx context.Context, manager *vm
 	enc := json.NewEncoder(w)
 	flusher, _ := w.(http.Flusher)
 	err := manager.RunStream(ctx, req, nil, func(event client.ExecEvent) error {
+		event = sanitizeExecEventForJSON(event)
 		if err := enc.Encode(event); err != nil {
 			return err
 		}
@@ -842,6 +844,13 @@ func writeRunEventStream(w http.ResponseWriter, ctx context.Context, manager *vm
 	if flusher != nil {
 		flusher.Flush()
 	}
+}
+
+func sanitizeExecEventForJSON(event client.ExecEvent) client.ExecEvent {
+	if len(event.Data) > 0 && !utf8.Valid(event.Data) {
+		event.Output = ""
+	}
+	return event
 }
 
 func writeBootEvent(w http.ResponseWriter, event client.BootEvent) error {

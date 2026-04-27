@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import textwrap
 from collections.abc import Iterable
 from typing import Any, Optional, Union
 
@@ -424,7 +425,11 @@ class PyNeurodeskClient:
             for line in response.iter_lines():
                 if not line:
                     continue
-                event = json.loads(line)
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    preview = textwrap.shorten(str(line), width=200, placeholder="...")
+                    raise RuntimeError(f"invalid streamed exec event JSON: {preview}") from exc
                 if not isinstance(event, dict):
                     raise TypeError(f"expected exec event object, got {type(event)!r}")
                 yield event

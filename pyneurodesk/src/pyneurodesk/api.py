@@ -612,7 +612,9 @@ def load_deploy_metadata(container_handle: NeurodeskContainer) -> DeployMetadata
         if line is not None
     ]
     image_env = load_singularity_env(container_handle, directory)
-    return DeployMetadata(commands=commands, deploy_env=merge_env_entries([*image_env, *deploy_env]))
+    build_commands, build_env = load_build_deploy_metadata(container_handle, directory, image_env)
+    commands = tuple(sorted({*commands, *build_commands}))
+    return DeployMetadata(commands=commands, deploy_env=merge_env_entries([*image_env, *build_env, *deploy_env]))
 
 
 def load_local_deploy_metadata(container_handle: NeurodeskContainer) -> DeployMetadata:
@@ -635,7 +637,7 @@ def load_singularity_env(container_handle: NeurodeskContainer, directory: str) -
     env: list[str] = []
     for name in SINGULARITY_ENV_FILES:
         text = read_cvmfs_text(container_handle, f"{image_env_dir}/{name}", allow_missing=True)
-        env.extend(parse_singularity_env_exports(text))
+        env.extend(parse_singularity_env_exports(text, env))
     return tuple(env)
 
 
@@ -645,8 +647,9 @@ def singularity_env_dir_for_deploy_directory(directory: str) -> str:
     return f"{image_root}/.singularity.d/env"
 
 
-def parse_singularity_env_exports(text: str) -> tuple[str, ...]:
+def parse_singularity_env_exports(text: str, base_env: list[str] | None = None) -> tuple[str, ...]:
     env: list[str] = []
+    current = list(base_env or [])
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line.startswith("export "):
@@ -661,7 +664,10 @@ def parse_singularity_env_exports(text: str) -> tuple[str, ...]:
         parsed = parse_singularity_env_value(value.strip())
         if parsed is None:
             continue
-        env.append(f"{key}={parsed}")
+        parsed = expand_shell_env_references(parsed, [*current, *env])
+        entry = f"{key}={parsed}"
+        env.append(entry)
+        current = list(merge_env_entries([*current, entry]))
     return merge_env_entries(env)
 
 
@@ -679,9 +685,141 @@ def parse_singularity_env_value(value: str) -> Optional[str]:
     if len(parts) != 1:
         return None
     parsed = parts[0]
-    if "$" in parsed:
-        return None
     return parsed
+
+
+def load_build_deploy_metadata(
+    container_handle: NeurodeskContainer,
+    directory: str,
+    image_env: tuple[str, ...],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    text = read_cvmfs_text(container_handle, f"{directory.rstrip('/')}/build.yaml", allow_missing=True)
+    deploy_path, deploy_bins = parse_top_level_deploy(text)
+    env: list[str] = []
+    if deploy_path and env_value(image_env, "DEPLOY_PATH") == "":
+        env.append("DEPLOY_PATH=" + ":".join(deploy_path))
+    if deploy_bins and env_value(image_env, "DEPLOY_BINS") == "":
+        env.append("DEPLOY_BINS=" + ":".join(deploy_bins))
+    combined = merge_env_entries([*image_env, *env])
+    if deploy_path:
+        env.append("PATH=" + prepend_path_env(combined, deploy_path))
+    commands = tuple(sorted(command for command in deploy_bins if is_valid_wrapper_name(command)))
+    return commands, merge_env_entries(env)
+
+
+def parse_top_level_deploy(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    deploy_path: list[str] = []
+    deploy_bins: list[str] = []
+    in_deploy = False
+    current_list = ""
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip(" \t\r")
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent == 0:
+            in_deploy = stripped.rstrip(":") == "deploy"
+            current_list = ""
+            continue
+        if not in_deploy:
+            continue
+        if indent == 2 and stripped.endswith(":"):
+            key = stripped.rstrip(":")
+            current_list = key if key in {"path", "bins"} else ""
+            continue
+        if indent == 2 and ":" in stripped:
+            key, value = stripped.split(":", 1)
+            key = key.strip()
+            values = parse_inline_yaml_list(value.strip())
+            if key == "path":
+                deploy_path.extend(split_deploy_path_entries(values))
+            elif key == "bins":
+                deploy_bins.extend(values)
+            current_list = key
+            continue
+        if current_list and stripped.startswith("- "):
+            value = normalize_yaml_scalar(stripped[2:].strip())
+            if not value:
+                continue
+            if current_list == "path":
+                deploy_path.extend(split_deploy_path_entries([value]))
+            elif current_list == "bins":
+                deploy_bins.append(value)
+    return tuple(dedupe_non_empty(deploy_path)), tuple(dedupe_non_empty(deploy_bins))
+
+
+def split_deploy_path_entries(entries: list[str]) -> list[str]:
+    out: list[str] = []
+    for entry in entries:
+        out.extend(part.strip() for part in entry.split(",") if part.strip())
+    return out
+
+
+def parse_inline_yaml_list(value: str) -> list[str]:
+    value = value.strip()
+    if not value or value == "[]":
+        return []
+    if value.startswith("[") and value.endswith("]"):
+        inner = value[1:-1].strip()
+        if not inner:
+            return []
+        return [item for part in inner.split(",") if (item := normalize_yaml_scalar(part))]
+    scalar = normalize_yaml_scalar(value)
+    return [scalar] if scalar else []
+
+
+def normalize_yaml_scalar(value: str) -> str:
+    value = value.strip()
+    if " #" in value:
+        value = value.split(" #", 1)[0].strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    if "{{" in value or "}}" in value:
+        return ""
+    return value.strip()
+
+
+def dedupe_non_empty(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def env_value(env: tuple[str, ...] | list[str], key: str) -> str:
+    prefix = key + "="
+    for entry in env:
+        if entry.startswith(prefix):
+            return entry[len(prefix) :]
+    return ""
+
+
+def expand_shell_env_references(value: str, env: tuple[str, ...] | list[str]) -> str:
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name == "PATH":
+            return env_value(env, name) or "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        return env_value(env, name)
+
+    return re.sub(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", replace, value)
+
+
+def prepend_path_env(env: tuple[str, ...], deploy_path: tuple[str, ...]) -> str:
+    existing = env_value(env, "PATH") or "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    parts = existing.split(":")
+    seen = set(parts)
+    prefix: list[str] = []
+    for path in deploy_path:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        prefix.append(path)
+    return ":".join([*prefix, *parts])
 
 
 def merge_env_entries(entries: list[str]) -> tuple[str, ...]:

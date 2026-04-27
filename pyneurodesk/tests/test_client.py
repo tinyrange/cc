@@ -25,6 +25,7 @@ from pyneurodesk.api import (
     build_release_container_path,
     create_progress_reporter,
     load_deploy_metadata,
+    parse_top_level_deploy,
     parse_singularity_env_exports,
     default_daemon_state_path,
     path_join,
@@ -758,7 +759,7 @@ def test_container_run_uses_cvmfs_deploy_env_and_exposes_commands() -> None:
     assert out == "ok\n"
     paths = [path for _, path, _ in seen]
     assert paths.count("/cvmfs/list") == 3
-    assert paths.count("/cvmfs/read") == 4
+    assert paths.count("/cvmfs/read") == 5
     assert paths[-1] == "/vm/run"
 
 
@@ -803,6 +804,21 @@ def test_load_deploy_metadata_uses_local_image_env_and_deploy_bins() -> None:
     )
 
 
+def test_run_stream_reports_invalid_ndjson_event() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/vm/run":
+            return httpx.Response(200, content=b'{"kind":"stdout","output":"unterminated\n')
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    client = make_client(httpx.MockTransport(handler))
+    try:
+        events = client.run_stream("image", ["tool"])
+        with pytest.raises(RuntimeError, match="invalid streamed exec event JSON"):
+            list(events)
+    finally:
+        client.close()
+
+
 def test_parse_singularity_env_exports_handles_docker_defaults() -> None:
     assert parse_singularity_env_exports(
         '\n'.join(
@@ -816,6 +832,94 @@ def test_parse_singularity_env_exports_handles_docker_defaults() -> None:
     ) == (
         "PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/abin:~/.local/bin",
         "LANG=en_US.UTF-8",
+        "SKIP=:/opt/bin",
+    )
+
+
+def test_parse_singularity_env_exports_expands_prior_path() -> None:
+    assert parse_singularity_env_exports(
+        '\n'.join(
+            [
+                'export PATH="/usr/local/bin:/usr/bin:/bin"',
+                'export PATH="/opt/tool:$PATH"',
+            ]
+        )
+    ) == ("PATH=/opt/tool:/usr/local/bin:/usr/bin:/bin",)
+
+
+def test_parse_top_level_deploy_supports_lists_and_skips_templates() -> None:
+    paths, bins = parse_top_level_deploy(
+        """
+deploy:
+  path:
+    - /opt/{{ context.name }}/bin
+    - /opt/tool/bin,/opt/other/bin
+  bins: [tool, tool-view]
+"""
+    )
+
+    assert paths == ("/opt/tool/bin", "/opt/other/bin")
+    assert bins == ("tool", "tool-view")
+
+
+def test_load_deploy_metadata_merges_cvmfs_build_yaml_deploy_metadata() -> None:
+    read_payloads = {
+        "/containers/tool/tool.simg/.singularity.d/env/10-docker2singularity.sh": base64.b64encode(
+            b'export PATH="/usr/local/bin:/usr/bin:/bin"\n'
+        ).decode(),
+        "/containers/tool/tool.simg/.singularity.d/env/90-environment.sh": base64.b64encode(
+            b'export TOOLBOX_PATH="/opt/tool"\n'
+        ).decode(),
+        "/containers/tool/env.txt": base64.b64encode(b"DEPLOY_ENV_CUSTOM=ok\n").decode(),
+        "/containers/tool/build.yaml": base64.b64encode(
+            b"""
+name: tool
+deploy:
+  path:
+    - /opt/tool/bin
+  bins: [tool, tool-helper]
+"""
+        ).decode(),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/cvmfs/list":
+            return httpx.Response(
+                200,
+                json={
+                    "entries": [
+                        {"name": "commands.txt", "path": "", "kind": "file"},
+                        {"name": "env.txt", "path": "", "kind": "file"},
+                    ]
+                },
+            )
+        if request.method == "POST" and request.url.path == "/cvmfs/read":
+            payload = json.loads(request.read())
+            data = read_payloads.get(payload["path"], "")
+            return httpx.Response(200, json={"path": payload["path"], "offset": 0, "data": data, "eof": True})
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    client = make_client(httpx.MockTransport(handler))
+    try:
+        handle = SimpleNamespace(
+            _client=client,
+            reference=SimpleNamespace(
+                image="tool",
+                path="/containers/tool/tool.simg",
+                cache_dir=None,
+            ),
+        )
+        metadata = load_deploy_metadata(handle)
+    finally:
+        client.close()
+
+    assert metadata.commands == ("tool", "tool-helper")
+    assert metadata.deploy_env == (
+        "PATH=/opt/tool/bin:/usr/local/bin:/usr/bin:/bin",
+        "TOOLBOX_PATH=/opt/tool",
+        "DEPLOY_PATH=/opt/tool/bin",
+        "DEPLOY_BINS=tool:tool-helper",
+        "DEPLOY_ENV_CUSTOM=ok",
     )
 
 
