@@ -129,10 +129,16 @@ jobs:
       - name: Install Python tooling
         run: python -m pip install --upgrade pip uv
 
+      - name: Build guest init payloads
+        run: |
+          set -euxo pipefail
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o internal/guestinit/guest-init-linux-amd64 ./internal/cmd/init
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o internal/guestinit/guest-init-linux-arm64 ./internal/cmd/init
+
       - name: Build ccvm
         run: |
           mkdir -p build
-          go build -o build/ccvm ./cmd/ccvm
+          go build -tags embed_guestinit -o build/ccvm ./cmd/ccvm
 
       - name: Install pyneurodesk fulltest dependencies
         working-directory: pyneurodesk
