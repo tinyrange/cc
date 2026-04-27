@@ -880,7 +880,7 @@ def test_resolve_base_url_reads_daemon_state(monkeypatch, tmp_path: Path) -> Non
     monkeypatch.setattr("pyneurodesk.api._health_check", lambda base_url: base_url == "http://127.0.0.1:4567")
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / ".cache"))
     state_path = default_daemon_state_path()
-    state_path.parent.mkdir(parents=True)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text('{"addr":"127.0.0.1:4567"}')
 
     assert resolve_base_url() == "http://127.0.0.1:4567"
@@ -1348,7 +1348,7 @@ def test_owned_container_recovers_when_daemon_connection_is_refused(monkeypatch)
         container.close()
 
     assert out == "ok\n"
-    assert ("restart", daemon_a.cache_dir) in calls
+    assert ("restart", str(Path(daemon_a.cache_dir))) in calls
     assert ("ensure_image", "niimath") in calls
     assert ("ensure_instance", "niimath") in calls
     assert ("run", ("http://127.0.0.1:4002", "niimath", ("niimath",), ())) in calls

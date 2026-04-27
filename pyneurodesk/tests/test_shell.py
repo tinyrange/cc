@@ -206,10 +206,15 @@ def test_shell_load_discovers_commands_writes_wrappers_and_persists_env(
         "PATH=/usr/local/bin:/usr/bin:/bin:/opt/niimath",
         "DEPLOY_ENV_FSLDIR=/opt/fsl",
     ]
-    wrapper = (root / "bin" / "niimath").read_text()
-    assert "/usr/local/bin/neurodesk shell run-wrapper" in wrapper
-    assert '--image niimath' in wrapper
-    assert '--command niimath' in wrapper
+    wrapper = shell.wrapper_path(root / "bin", "niimath").read_text()
+    if shell.os.name == "nt":
+        assert '"/usr/local/bin/neurodesk" shell run-wrapper' in wrapper
+        assert '--image "niimath"' in wrapper
+        assert '--command "niimath"' in wrapper
+    else:
+        assert "/usr/local/bin/neurodesk shell run-wrapper" in wrapper
+        assert '--image niimath' in wrapper
+        assert '--command niimath' in wrapper
     assert calls[0] == ("cvmfs_list", "/containers/niimath_1.0.20250804_20251016")
     assert calls[-1] == ("close", None)
 
@@ -411,7 +416,8 @@ def test_shell_unload_removes_image_wrappers(monkeypatch, tmp_path: Path, capsys
             wrappers={"niimath": shell.WrapperSpec(image="niimath", command="niimath")},
         )
     )
-    shell.write_wrapper(root / "bin" / "niimath", image="niimath", command="niimath")
+    wrapper = shell.wrapper_path(root / "bin", "niimath")
+    shell.write_wrapper(wrapper, image="niimath", command="niimath")
 
     exit_code = shell.main(["shell", "unload", "niimath"])
 
@@ -420,7 +426,7 @@ def test_shell_unload_removes_image_wrappers(monkeypatch, tmp_path: Path, capsys
     new_state = shell.read_state(root, session_id="sess-1")
     assert new_state.images == {}
     assert new_state.wrappers == {}
-    assert not (root / "bin" / "niimath").exists()
+    assert not wrapper.exists()
 
 
 def test_shell_complete_returns_loaded_images_for_exec(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -468,6 +474,7 @@ def test_run_wrapper_invokes_container_command(
     home_dir = tmp_path / "home"
     home_dir.mkdir()
     monkeypatch.setenv("HOME", str(home_dir))
+    monkeypatch.setenv("USERPROFILE", str(home_dir))
 
     class FakeClient:
         def run(
@@ -570,6 +577,7 @@ def test_run_wrapper_uses_session_reference_when_present(
     home_dir = tmp_path / "home"
     home_dir.mkdir()
     monkeypatch.setenv("HOME", str(home_dir))
+    monkeypatch.setenv("USERPROFILE", str(home_dir))
 
     class FakeClient:
         def ensure_image(self, ref: ContainerReference) -> object:
