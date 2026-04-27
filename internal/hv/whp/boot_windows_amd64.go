@@ -116,18 +116,14 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 	}
 	defer vm.Close()
 	rng := virtio.NewRNG(amd64vm.RNGBase, amd64vm.RNGSize, amd64vm.RNGIRQ)
-	if fsdevs != nil || vsock != nil || rng != nil {
-		if err := installBootACPI(vm.Memory()); err != nil {
-			return "", fmt.Errorf("install acpi: %w", err)
-		}
+	if err := installBootACPI(vm.Memory()); err != nil {
+		return "", fmt.Errorf("install acpi: %w", err)
 	}
 
 	extraCmdline := []string{
 		"tsc=reliable",
 		"lpj=10000000",
-	}
-	if fsdevs != nil || vsock != nil || rng != nil {
-		extraCmdline = append(extraCmdline, "no_timer_check")
+		"no_timer_check",
 	}
 	extraCmdline = append(extraCmdline, amd64vm.VirtioFSCommandLineArgs(fsdevs)...)
 	if vsock != nil {

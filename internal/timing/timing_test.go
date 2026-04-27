@@ -26,6 +26,27 @@ func TestRecorderAccumulatesDurations(t *testing.T) {
 	}
 }
 
+func TestRecorderRecordCount(t *testing.T) {
+	recorder := NewRecorder()
+	recorder.RecordCount("events", 4)
+	recorder.RecordCount("events", 3)
+	recorder.RecordCount("ignored", 0)
+
+	snapshots := recorder.Snapshots()
+	if len(snapshots) != 1 {
+		t.Fatalf("Snapshots() length = %d, want 1", len(snapshots))
+	}
+	if snapshots[0].Name != "events" {
+		t.Fatalf("snapshot name = %q, want events", snapshots[0].Name)
+	}
+	if snapshots[0].Duration != 0 {
+		t.Fatalf("snapshot duration = %s, want 0", snapshots[0].Duration)
+	}
+	if snapshots[0].Count != 7 {
+		t.Fatalf("snapshot count = %d, want 7", snapshots[0].Count)
+	}
+}
+
 func TestContextRecorder(t *testing.T) {
 	recorder := NewRecorder()
 	ctx := WithRecorder(context.Background(), recorder)

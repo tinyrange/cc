@@ -187,6 +187,38 @@ func TestRemoteReadFileRangeSingleObjectDoesNotPopulateFileCache(t *testing.T) {
 	}
 }
 
+func TestRemoteReadFileRangePopulatesCompressedObjectCache(t *testing.T) {
+	t.Parallel()
+
+	server := newTestRepoServer(t)
+	cacheDir := t.TempDir()
+	client := &Client{HTTPClient: server.Client(), CacheDir: cacheDir}
+	target := server.URL + "/cvmfs/test.repo/containers/niimath/niimath"
+
+	data, eof, err := client.ReadFileRange(target, 0, 7)
+	if err != nil {
+		t.Fatalf("ReadFileRange(single object) error = %v", err)
+	}
+	if string(data) != "niimath" || eof {
+		t.Fatalf("ReadFileRange(single object) = %q eof=%v, want niimath false", string(data), eof)
+	}
+
+	cachePath := CVMFSObjectCachePath(cacheDir, strings.Repeat("3", 40), "")
+	if _, err := os.Stat(cachePath); err != nil {
+		t.Fatalf("Stat(%q) error = %v", cachePath, err)
+	}
+
+	server.Close()
+
+	data, eof, err = client.ReadFileRange(target, 7, 5)
+	if err != nil {
+		t.Fatalf("cached ReadFileRange(single object) error = %v", err)
+	}
+	if string(data) != "-data" || !eof {
+		t.Fatalf("cached ReadFileRange(single object) = %q eof=%v, want -data true", string(data), eof)
+	}
+}
+
 func TestRemoteWalkReturnsSubtreeMetadata(t *testing.T) {
 	t.Parallel()
 

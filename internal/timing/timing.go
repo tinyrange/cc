@@ -72,6 +72,20 @@ func (r *Recorder) Record(name string, duration time.Duration) {
 	r.counts[name]++
 }
 
+func (r *Recorder) RecordCount(name string, count int) {
+	name = strings.TrimSpace(name)
+	if r == nil || name == "" || count <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.records[name]; !ok {
+		r.order = append(r.order, name)
+		r.records[name] = 0
+	}
+	r.counts[name] += count
+}
+
 func (r *Recorder) Snapshots() []Snapshot {
 	if r == nil {
 		return nil

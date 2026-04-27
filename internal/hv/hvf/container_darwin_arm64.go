@@ -644,12 +644,10 @@ func recordExecStreamCounts(ctx context.Context, loops, reads, lines, matched, i
 }
 
 func recordCount(recorder *timing.Recorder, name string, count int) {
-	if recorder == nil {
+	if recorder == nil || count <= 0 {
 		return
 	}
-	for i := 0; i < count; i++ {
-		recorder.Record(name, 0)
-	}
+	recorder.RecordCount(name, count)
 }
 
 func (s *ContainerSession) Close() error {

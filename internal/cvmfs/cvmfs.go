@@ -954,18 +954,45 @@ func (r *repository) streamDataObjectRange(hash string, partial bool, offset, le
 		return err
 	}
 
-	zr, err := zlib.NewReader(resp.Body)
+	reader := io.Reader(resp.Body)
+	cachePath := cvmfsObjectCachePath(r.client.CacheDir, hash, suffix)
+	var cacheWriter io.WriteCloser
+	if cachePath != "" {
+		cacheFile, err := createAtomicFile(cachePath)
+		if err != nil {
+			r.client.traceDone(id, started, "HTTPObjectRange", "", url, cachePath, 0, resp.StatusCode, err)
+			return err
+		}
+		cacheWriter = cacheFile
+		reader = io.TeeReader(resp.Body, cacheFile)
+	}
+
+	zr, err := zlib.NewReader(reader)
 	if err != nil {
-		r.client.traceDone(id, started, "HTTPObjectRange", "", url, "", 0, resp.StatusCode, err)
+		if cacheWriter != nil {
+			_ = cacheWriter.Close()
+		}
+		r.client.traceDone(id, started, "HTTPObjectRange", "", url, cachePath, 0, resp.StatusCode, err)
 		return err
 	}
 	counting := &countingWriter{w: dst}
 	err = copyCompressedRange(zr, offset, length, counting)
+	if err == nil && cacheWriter != nil {
+		_, err = io.Copy(io.Discard, zr)
+	}
 	closeErr := zr.Close()
 	if err == nil {
 		err = closeErr
 	}
-	r.client.traceDone(id, started, "HTTPObjectRange", "", url, "", int(counting.n), resp.StatusCode, err)
+	if cacheWriter != nil {
+		if err == nil {
+			err = cacheWriter.Close()
+		} else {
+			_ = cacheWriter.Close()
+		}
+		cacheWriter = nil
+	}
+	r.client.traceDone(id, started, "HTTPObjectRange", "", url, cachePath, int(counting.n), resp.StatusCode, err)
 	return err
 }
 
