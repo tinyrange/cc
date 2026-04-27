@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/websocket"
@@ -40,6 +41,71 @@ type server struct {
 	images        *oci.Store
 	vms           *vm.Manager
 	cvmfsCacheDir string
+}
+
+type watchdogController struct {
+	mu        sync.Mutex
+	timeout   time.Duration
+	timer     *time.Timer
+	active    bool
+	onExpired func()
+}
+
+type watchdogRequest struct {
+	TimeoutSeconds float64 `json:"timeout_seconds,omitempty"`
+}
+
+func newWatchdogController(onExpired func()) *watchdogController {
+	return &watchdogController{onExpired: onExpired}
+}
+
+func (w *watchdogController) Create(timeout time.Duration) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.timeout = timeout
+	w.active = true
+	if w.timer == nil {
+		w.timer = time.AfterFunc(timeout, w.expire)
+		return
+	}
+	w.timer.Reset(timeout)
+}
+
+func (w *watchdogController) Feed() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.active || w.timer == nil {
+		return false
+	}
+	if !w.timer.Stop() {
+		return false
+	}
+	w.timer.Reset(w.timeout)
+	return true
+}
+
+func (w *watchdogController) Stop() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.active = false
+	if w.timer != nil {
+		w.timer.Stop()
+	}
+}
+
+func (w *watchdogController) expire() {
+	w.mu.Lock()
+	if !w.active {
+		w.mu.Unlock()
+		return
+	}
+	w.active = false
+	onExpired := w.onExpired
+	w.mu.Unlock()
+
+	if onExpired != nil {
+		onExpired()
+	}
 }
 
 func main() {
@@ -80,7 +146,10 @@ func main() {
 	}
 
 	var httpServer http.Server
-	mux := newMux(srvState, &httpServer)
+	shutdown := newServerShutdown(srvState, &httpServer)
+	watchdog := newWatchdogController(shutdown)
+	defer watchdog.Stop()
+	mux := newMux(srvState, watchdog, shutdown)
 
 	httpServer = http.Server{Handler: mux}
 	if err := httpServer.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -88,7 +157,23 @@ func main() {
 	}
 }
 
-func newMux(srvState *server, httpServer *http.Server) *http.ServeMux {
+func newServerShutdown(srvState *server, httpServer *http.Server) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if srvState != nil && srvState.vms != nil {
+				_ = srvState.vms.ShutdownAll(ctx)
+			}
+			if httpServer != nil {
+				_ = httpServer.Shutdown(ctx)
+			}
+		})
+	}
+}
+
+func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -103,12 +188,48 @@ func newMux(srvState *server, httpServer *http.Server) *http.ServeMux {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 		go func() {
 			time.Sleep(10 * time.Millisecond)
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			if httpServer != nil {
-				_ = httpServer.Shutdown(ctx)
+			if watchdog != nil {
+				watchdog.Stop()
 			}
+			shutdown()
 		}()
+	})
+
+	mux.HandleFunc("POST /watchdog", func(w http.ResponseWriter, r *http.Request) {
+		if watchdog == nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("watchdog is unavailable"))
+			return
+		}
+		var req watchdogRequest
+		if err := decodeOptionalJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		timeout := 30 * time.Second
+		if req.TimeoutSeconds > 0 {
+			timeout = time.Duration(req.TimeoutSeconds * float64(time.Second))
+		}
+		if timeout <= 0 {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("watchdog timeout must be positive"))
+			return
+		}
+		watchdog.Create(timeout)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":          "watching",
+			"timeout_seconds": timeout.Seconds(),
+		})
+	})
+
+	mux.HandleFunc("POST /watchdog/feed", func(w http.ResponseWriter, r *http.Request) {
+		if watchdog == nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("watchdog is unavailable"))
+			return
+		}
+		if !watchdog.Feed() {
+			writeError(w, http.StatusConflict, fmt.Errorf("watchdog has not been created"))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "fed"})
 	})
 
 	mux.HandleFunc("GET /kernel", func(w http.ResponseWriter, r *http.Request) {

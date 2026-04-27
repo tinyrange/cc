@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"j5.nz/cc/internal/fsmeta"
+	"j5.nz/cc/internal/linuxabi"
 )
 
 func TestResolveCommandAbsoluteAndPATH(t *testing.T) {
@@ -25,7 +28,10 @@ func TestResolveCommandAbsoluteAndPATH(t *testing.T) {
 		t.Fatalf("Symlink(tool-link) error = %v", err)
 	}
 
-	fs := NewHostFS(root, nil)
+	fs := NewHostFS(root, map[string]fsmeta.Entry{
+		"/bin/tool":  {Mode: linuxabi.SIFREG | 0o755},
+		"/bin/plain": {Mode: linuxabi.SIFREG | 0o644},
+	})
 
 	got, err := ResolveCommand(fs, []string{"/bin/tool", "arg"}, nil)
 	if err != nil {

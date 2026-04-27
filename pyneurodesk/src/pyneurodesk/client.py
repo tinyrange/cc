@@ -305,6 +305,14 @@ class PyNeurodeskClient:
         payload = self._decode_json(response)
         return VMState.from_payload(payload)
 
+    def create_watchdog(self, *, timeout_seconds: float = 30.0) -> dict[str, Any]:
+        response = self._client.post("/watchdog", json={"timeout_seconds": timeout_seconds})
+        return self._decode_json(response)
+
+    def feed_watchdog(self) -> dict[str, Any]:
+        response = self._client.post("/watchdog/feed")
+        return self._decode_json(response)
+
     def ensure_instance(
         self,
         image: str,

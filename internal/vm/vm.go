@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"runtime"
 	"sort"
@@ -231,6 +232,26 @@ func (m *Manager) StartBlankInstanceStream(
 
 func (m *Manager) Shutdown(ctx context.Context) error {
 	return m.ShutdownInstance(ctx, DefaultInstanceID)
+}
+
+func (m *Manager) ShutdownAll(ctx context.Context) error {
+	_ = ctx
+	m.mu.Lock()
+	running := m.running
+	m.running = nil
+	m.mu.Unlock()
+
+	var errs []error
+	for id, machine := range running {
+		close(machine.shutdownCh)
+		if err := machine.instance.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("shutdown VM %q: %w", id, err))
+		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
 }
 
 func (m *Manager) ShutdownInstance(ctx context.Context, id string) error {

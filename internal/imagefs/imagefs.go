@@ -236,7 +236,7 @@ func (d *hostDir) Lookup(name string) (Entry, error) {
 	if err != nil {
 		return Entry{}, err
 	}
-	guest := fsmeta.Normalize(rel)
+	guest := fsmeta.Normalize(filepath.ToSlash(rel))
 	meta := d.meta[guest]
 	mode := linuxModeToGo(fsmeta.NormalizeLinuxMode(meta.Mode, info.Mode()))
 	modTime := info.ModTime()

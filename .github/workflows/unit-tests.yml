@@ -4,7 +4,6 @@ name: Unit tests
   push:
     branches:
       - main
-      - feature/**
   pull_request:
   workflow_dispatch:
 
@@ -81,3 +80,6 @@ jobs:
 
       - name: Compile Darwin arm64 HVF package
         run: GOOS=darwin GOARCH=arm64 go test -c -o /tmp/ccx3-hvf-darwin-arm64.test ./internal/hv/hvf
+
+      - name: Compile Windows amd64 packages
+        run: GOOS=windows GOARCH=amd64 go test -run '^$' -exec /bin/true ./...
