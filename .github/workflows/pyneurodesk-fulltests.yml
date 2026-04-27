@@ -242,6 +242,7 @@ jobs:
         working-directory: pyneurodesk
         env:
           PYNEURODESK_CCVM: ${{ github.workspace }}/build/ccvm
+          PYNEURODESK_BOOT_TIMEOUT: "300"
           PYTHONUNBUFFERED: "1"
           SUITE: ${{ matrix.suite }}
           IMAGE_SOURCE: ${{ steps.simg.outputs.image_path }}

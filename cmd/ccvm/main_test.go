@@ -56,6 +56,15 @@ func TestWantsProgressStream(t *testing.T) {
 	}
 }
 
+func TestBootTimeoutFromRequest(t *testing.T) {
+	if got := bootTimeoutFromRequest(0); got != vmBootTimeout {
+		t.Fatalf("bootTimeoutFromRequest(0) = %s, want %s", got, vmBootTimeout)
+	}
+	if got := bootTimeoutFromRequest(300); got != 5*time.Minute {
+		t.Fatalf("bootTimeoutFromRequest(300) = %s, want 5m", got)
+	}
+}
+
 func TestWriteExecEventStream(t *testing.T) {
 	rec := httptest.NewRecorder()
 	writeExecEventStream(rec, client.ExecResponse{ExitCode: 7, Output: "hello"})
