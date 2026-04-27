@@ -587,6 +587,11 @@ func (sq *Reader) readFileRange(fi *FileInode, off uint64, size uint32) ([]byte,
 				out = append(out, make([]byte, overlapEnd-overlapStart)...)
 			}
 		} else {
+			if logicalEnd <= off {
+				dataPos += compLen
+				blockStart = logicalEnd
+				continue
+			}
 			raw, err := readAtMost(file, sq.base+int64(dataPos), int(compLen))
 			if err != nil {
 				return nil, err
