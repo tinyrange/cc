@@ -47,7 +47,8 @@ uv sync --extra fulltest
 Platform wheels should include the bundled `ccvm` binary so installs do not
 need a Go toolchain at runtime. Use the repository release helper from the repo
 root to cross-compile the currently supported wheels (`linux/amd64`,
-`linux/arm64`, and `darwin/arm64`) with `CGO_ENABLED=0`:
+`linux/arm64`, `darwin/arm64`, and stable `windows/amd64`) with
+`CGO_ENABLED=0`:
 
 ```sh
 UV_PUBLISH_TOKEN=pypi-... tools/publish_neurodesk.sh
@@ -192,7 +193,8 @@ The shell smoke example does require the Go daemon and host virtualization:
 
 ## Notes
 
-`pyneurodesk` delegates actual container execution to `ccvm`. On `linux/amd64`,
-the daemon currently runs native amd64 containers and rejects known foreign
-architectures. Live execution requires the same KVM setup described in the
-top-level repository README.
+`pyneurodesk` delegates actual container execution to `ccvm`. On stable amd64
+hosts (`linux/amd64` and `windows/amd64`), the daemon currently runs native
+amd64 containers and rejects known foreign architectures. Live execution
+requires the host virtualization setup described in the top-level repository
+README.

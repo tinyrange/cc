@@ -19,12 +19,14 @@ Supported host backends:
 - `linux/amd64` via KVM
 - `linux/arm64` via KVM
 - `darwin/arm64` via HVF
+- `windows/amd64` via Windows Hypervisor Platform
 
-The `linux/amd64` backend supports native amd64 images, one-shot command
-execution, persistent VMs, writable host shares, local SIMG containers, remote
-Neurodesk CVMFS containers, and attaching additional image environments inside a
-running VM. Known foreign-architecture images are rejected on `linux/amd64`;
-arm64 guest emulation is not implemented there yet.
+The stable amd64 backends (`linux/amd64` and `windows/amd64`) support native
+amd64 images, one-shot command execution, persistent VMs, writable host shares,
+local SIMG containers, remote Neurodesk CVMFS containers, and attaching
+additional image environments inside a running VM. Known foreign-architecture
+images are rejected on amd64 hosts; arm64 guest emulation is not implemented
+there yet.
 
 Runtime networking and snapshots are roadmap features. Snapshots are currently
 treated as a future performance optimization rather than an MVP 1 requirement.
@@ -36,6 +38,8 @@ treated as a future performance optimization rather than an MVP 1 requirement.
 - Linux KVM hosts: `/dev/kvm`, regular-user permission to open it, and hardware
   virtualization enabled. Some distributions grant this automatically; others
   require one-time host configuration outside `cc`.
+- Windows amd64 hosts: Windows Hypervisor Platform enabled and hardware
+  virtualization available.
 - Network access for kernel downloads, OCI pulls, or CVMFS-backed containers
 
 Quick KVM check:
