@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import posixpath
@@ -8,8 +10,8 @@ import shlex
 import subprocess
 import sys
 import threading
+import time
 import uuid
-import base64
 from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
@@ -33,6 +35,7 @@ DEFAULT_CVMFS_MIRROR = "https://cvmfs.neurodesk.org"
 DEFAULT_CVMFS_REPO = "neurodesk.ardc.edu.au"
 DEFAULT_CONTAINERS_PATH = "/containers"
 DEFAULT_RELEASES_API = "https://api.github.com/repos/NeuroDesk/neurocontainers/contents/releases"
+DEFAULT_RELEASES_CACHE_TTL_SECONDS = 6 * 60 * 60
 SINGULARITY_ENV_FILES = (
     "10-docker2singularity.sh",
     "90-environment.sh",
@@ -1442,6 +1445,23 @@ def _search_local_release_versions(name: str) -> dict[str, str]:
 
 def _search_remote_release_versions(name: str) -> dict[str, str]:
     api_base = os.environ.get("PYNEURODESK_RELEASES_API", DEFAULT_RELEASES_API).rstrip("/")
+    return search_remote_release_versions(api_base, name)
+
+
+def search_remote_release_versions(api_base: str, name: str) -> dict[str, str]:
+    ttl_seconds = resolve_release_cache_ttl_seconds()
+    if ttl_seconds > 0:
+        cached = read_remote_release_cache(api_base, name, ttl_seconds)
+        if cached is not None:
+            return cached
+
+    versions = fetch_remote_release_versions(api_base, name)
+    if ttl_seconds > 0 and versions:
+        write_remote_release_cache(api_base, name, versions)
+    return versions
+
+
+def fetch_remote_release_versions(api_base: str, name: str) -> dict[str, str]:
     url = f"{api_base}/{name}"
     try:
         with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=20.0, write=20.0, pool=5.0)) as client:
@@ -1470,6 +1490,65 @@ def _search_remote_release_versions(name: str) -> dict[str, str]:
         if build:
             versions[Path(name_value).stem] = build
     return versions
+
+
+def resolve_release_cache_ttl_seconds() -> float:
+    raw = os.environ.get("PYNEURODESK_RELEASES_CACHE_TTL_SECONDS", "").strip()
+    if not raw:
+        return float(DEFAULT_RELEASES_CACHE_TTL_SECONDS)
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return float(DEFAULT_RELEASES_CACHE_TTL_SECONDS)
+
+
+def remote_release_cache_path(api_base: str, name: str) -> Path:
+    key = hashlib.sha256(f"{api_base}\n{name}".encode("utf-8")).hexdigest()
+    return default_cache_root() / "release-search" / f"{key}.json"
+
+
+def read_remote_release_cache(api_base: str, name: str, ttl_seconds: float) -> Optional[dict[str, str]]:
+    path = remote_release_cache_path(api_base, name)
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return None
+    created_at = payload.get("created_at")
+    if not isinstance(created_at, (int, float)):
+        return None
+    if time.time() - float(created_at) > ttl_seconds:
+        return None
+    if payload.get("api_base") != api_base or payload.get("name") != name:
+        return None
+    versions = payload.get("versions")
+    if not isinstance(versions, dict):
+        return None
+    ret: dict[str, str] = {}
+    for version, build in versions.items():
+        if isinstance(version, str) and isinstance(build, str):
+            ret[version] = build
+    return ret
+
+
+def write_remote_release_cache(api_base: str, name: str, versions: dict[str, str]) -> None:
+    path = remote_release_cache_path(api_base, name)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+        tmp.write_text(
+            json.dumps(
+                {
+                    "created_at": time.time(),
+                    "api_base": api_base,
+                    "name": name,
+                    "versions": versions,
+                },
+                sort_keys=True,
+            )
+        )
+        tmp.replace(path)
+    except Exception:
+        return
 
 
 def _extract_remote_release_build(download_url: str) -> Optional[str]:

@@ -1962,6 +1962,44 @@ def test_search_uses_remote_release_metadata(monkeypatch) -> None:
     assert nd.search("niimath") == ["1.0.0", "1.0.20250804"]
 
 
+def test_remote_release_search_uses_fresh_cache(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("pyneurodesk.api.default_cache_root", lambda: tmp_path / "cache")
+    monkeypatch.setattr("pyneurodesk.api.resolve_release_cache_ttl_seconds", lambda: 60.0)
+    monkeypatch.setattr("pyneurodesk.api.fetch_remote_release_versions", lambda api_base, name: pytest.fail("network used"))
+    api.write_remote_release_cache("https://api.example/releases", "niimath", {"1.0.0": "20250617"})
+
+    assert api.search_remote_release_versions("https://api.example/releases", "niimath") == {"1.0.0": "20250617"}
+
+
+def test_remote_release_search_refreshes_stale_cache(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("pyneurodesk.api.default_cache_root", lambda: tmp_path / "cache")
+    monkeypatch.setattr("pyneurodesk.api.resolve_release_cache_ttl_seconds", lambda: 60.0)
+    monkeypatch.setattr("pyneurodesk.api.time.time", lambda: 1_000.0)
+    api.write_remote_release_cache("https://api.example/releases", "niimath", {"1.0.0": "old"})
+    monkeypatch.setattr("pyneurodesk.api.time.time", lambda: 1_061.0)
+    monkeypatch.setattr(
+        "pyneurodesk.api.fetch_remote_release_versions",
+        lambda api_base, name: {"1.0.1": "new"},
+    )
+    assert api.search_remote_release_versions("https://api.example/releases", "niimath") == {"1.0.1": "new"}
+    assert api.read_remote_release_cache("https://api.example/releases", "niimath", 60.0) == {"1.0.1": "new"}
+
+
+def test_remote_release_search_can_disable_cache(monkeypatch, tmp_path: Path) -> None:
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr("pyneurodesk.api.default_cache_root", lambda: tmp_path / "cache")
+    monkeypatch.setattr("pyneurodesk.api.resolve_release_cache_ttl_seconds", lambda: 0.0)
+    api.write_remote_release_cache("https://api.example/releases", "niimath", {"1.0.0": "cached"})
+
+    def fetch(api_base: str, name: str) -> dict[str, str]:
+        calls.append((api_base, name))
+        return {"1.0.1": "fresh"}
+
+    monkeypatch.setattr("pyneurodesk.api.fetch_remote_release_versions", fetch)
+    assert api.search_remote_release_versions("https://api.example/releases", "niimath") == {"1.0.1": "fresh"}
+    assert calls == [("https://api.example/releases", "niimath")]
+
+
 def test_container_uses_local_release_metadata_without_cvmfs_listing(monkeypatch, tmp_path: Path) -> None:
     releases_dir = tmp_path / "releases"
     (releases_dir / "niimath").mkdir(parents=True)

@@ -121,6 +121,11 @@ ignores binary `data` payloads.
 
 ## 9. Python search does an N+1 GitHub metadata crawl
 
+Status: addressed with a remote release lookup cache. Search now caches
+non-empty `{version: build}` results under the ccx3 cache root for six hours by
+default, configurable through `PYNEURODESK_RELEASES_CACHE_TTL_SECONDS`. Setting
+the TTL to `0` disables the cache.
+
 Remote release search lists files, then fetches each JSON metadata file
 separately with no cache.
 
