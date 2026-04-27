@@ -17,10 +17,14 @@ import support exists.
 - Recommended fix: use `import_image_stream()` from `container()` and feed its
   progress into the existing reporter.
 
-## 2. VM boot has a hard 30 second ceiling
+## 2. VM boot timeout needs fast defaults and easy configuration
 
-The daemon wraps VM boot in a fixed timeout, and the Python client mirrors the
-same default.
+Status: addressed by changing the default boot timeout to `5s` and adding the
+daemon-side `CCX3_VM_BOOT_TIMEOUT` environment override. The Python client also
+defaults to `5s` and remains configurable through `PYNEURODESK_BOOT_TIMEOUT`.
+
+The daemon previously wrapped VM boot in a fixed 30 second timeout, and the
+Python client mirrored the same default.
 
 - Evidence: `cmd/ccvm/main.go:535`
 - Python default: `pyneurodesk/src/pyneurodesk/client.py:449`

@@ -305,7 +305,7 @@ def test_create_instance_uses_boot_timeout() -> None:
 
     assert seen["path"] == "/vm"
     assert seen["timeout"] is not None
-    assert seen["timeout"]["read"] == 30.0
+    assert seen["timeout"]["read"] == 5.0
     assert result.status == "running"
 
 
@@ -327,7 +327,7 @@ def test_start_instance_posts_vm_start_and_uses_boot_timeout() -> None:
     assert seen["path"] == "/vm/start"
     assert seen["json"] == '{"memory_mb":1024,"cpus":1}'
     assert seen["timeout"] is not None
-    assert seen["timeout"]["read"] == 30.0
+    assert seen["timeout"]["read"] == 5.0
     assert result.status == "running"
 
 
@@ -377,7 +377,7 @@ def test_container_cold_start_uses_http_timeout_for_preflight_and_boot_timeout_f
     assert timeouts["/kernel/download"] == inherited_timeout
     assert timeouts["/image/niimath/qemu/download"] == inherited_timeout
     assert timeouts["/image/niimath/metadata"] == inherited_timeout
-    assert timeouts["/vm"] == 30.0
+    assert timeouts["/vm"] == 5.0
 
 
 def test_container_does_not_boot_vm_if_preflight_fails() -> None:
@@ -525,11 +525,11 @@ def test_ensure_instance_replaces_running_blank_vm() -> None:
     assert seen == ["/vm/status", "/vm/shutdown", "/vm"]
 
 
-def test_resolve_boot_timeout_defaults_to_30_seconds() -> None:
+def test_resolve_boot_timeout_defaults_to_5_seconds() -> None:
     timeout = resolve_boot_timeout()
     assert timeout.connect == 10.0
-    assert timeout.read == 30.0
-    assert timeout.write == 30.0
+    assert timeout.read == 5.0
+    assert timeout.write == 5.0
     assert timeout.pool == 10.0
 
 

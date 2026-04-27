@@ -185,7 +185,8 @@ The shell smoke example does require the Go daemon and host virtualization:
 - `PYNEURODESK_CCVM`: path to the `ccvm` binary used for automatic startup
 - `PYNEURODESK_CACHE_DIR`: cache root for daemon state and shell sessions
 - `PYNEURODESK_HTTP_TIMEOUT`: default HTTP timeout in seconds
-- `PYNEURODESK_BOOT_TIMEOUT`: VM boot timeout in seconds
+- `PYNEURODESK_BOOT_TIMEOUT`: VM boot timeout in seconds, default `5`
+- `CCX3_VM_BOOT_TIMEOUT`: daemon-side VM boot timeout in seconds, default `5`
 - `PYNEURODESK_RELEASES_DIR`: local Neurodesk release metadata directory
 - `PYNEURODESK_RELEASES_API`: GitHub contents API endpoint for release metadata
 

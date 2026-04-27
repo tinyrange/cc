@@ -25,7 +25,7 @@ from .models import (
     VMState,
 )
 
-DEFAULT_BOOT_TIMEOUT_SECONDS = 30.0
+DEFAULT_BOOT_TIMEOUT_SECONDS = 5.0
 
 
 class PyNeurodeskClient:

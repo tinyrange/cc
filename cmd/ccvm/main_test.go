@@ -56,6 +56,23 @@ func TestWantsProgressStream(t *testing.T) {
 	}
 }
 
+func TestResolveVMBootTimeout(t *testing.T) {
+	t.Setenv("CCX3_VM_BOOT_TIMEOUT", "")
+	if got := resolveVMBootTimeout(); got != 5*time.Second {
+		t.Fatalf("resolveVMBootTimeout(default) = %s, want 5s", got)
+	}
+
+	t.Setenv("CCX3_VM_BOOT_TIMEOUT", "1.5")
+	if got := resolveVMBootTimeout(); got != 1500*time.Millisecond {
+		t.Fatalf("resolveVMBootTimeout(env) = %s, want 1.5s", got)
+	}
+
+	t.Setenv("CCX3_VM_BOOT_TIMEOUT", "nope")
+	if got := resolveVMBootTimeout(); got != 5*time.Second {
+		t.Fatalf("resolveVMBootTimeout(invalid) = %s, want 5s", got)
+	}
+}
+
 func TestWriteExecEventStream(t *testing.T) {
 	rec := httptest.NewRecorder()
 	writeExecEventStream(rec, client.ExecResponse{ExitCode: 7, Output: "hello"})

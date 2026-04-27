@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,13 +28,25 @@ import (
 
 var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
 
-const vmBootTimeout = 30 * time.Second
+const defaultVMBootTimeout = 5 * time.Second
 
 func timingLog(format string, args ...any) {
 	if !debugTiming {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "ccx3 timing: "+format+"\n", args...)
+}
+
+func resolveVMBootTimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("CCX3_VM_BOOT_TIMEOUT"))
+	if raw == "" {
+		return defaultVMBootTimeout
+	}
+	seconds, err := strconv.ParseFloat(raw, 64)
+	if err != nil || seconds <= 0 {
+		return defaultVMBootTimeout
+	}
+	return time.Duration(seconds * float64(time.Second))
 }
 
 type server struct {
@@ -471,7 +484,8 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 	})
 	mux.HandleFunc("POST /vm/start", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		bootCtx, cancel := context.WithTimeout(r.Context(), vmBootTimeout)
+		bootTimeout := resolveVMBootTimeout()
+		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
 		defer cancel()
 		var req client.StartInstanceRequest
 		if err := decodeOptionalJSON(r, &req); err != nil {
@@ -486,14 +500,14 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			if err := srvState.kernel.Ensure(bootCtx); err != nil {
 				if wantsBootEventStream(r) {
 					if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
-						writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", vmBootTimeout)})
+						writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
 						return
 					}
 					writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
 					return
 				}
 				if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
-					writeError(w, http.StatusGatewayTimeout, fmt.Errorf("vm boot timed out after %s", vmBootTimeout))
+					writeError(w, http.StatusGatewayTimeout, fmt.Errorf("vm boot timed out after %s", bootTimeout))
 					return
 				}
 				writeError(w, http.StatusInternalServerError, err)
@@ -508,7 +522,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			})
 			if err != nil {
 				if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
-					_ = writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", vmBootTimeout)})
+					_ = writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
 					return
 				}
 				_ = writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
@@ -522,7 +536,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 		state, err := srvState.vms.StartBlank(bootCtx, req)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
-				writeError(w, http.StatusGatewayTimeout, fmt.Errorf("vm boot timed out after %s", vmBootTimeout))
+				writeError(w, http.StatusGatewayTimeout, fmt.Errorf("vm boot timed out after %s", bootTimeout))
 				return
 			}
 			writeError(w, http.StatusBadRequest, err)
@@ -534,7 +548,8 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 	})
 	mux.HandleFunc("POST /vm", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		bootCtx, cancel := context.WithTimeout(r.Context(), vmBootTimeout)
+		bootTimeout := resolveVMBootTimeout()
+		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
 		defer cancel()
 		var req client.CreateInstanceRequest
 		if err := decodeRequiredJSON(r, &req); err != nil {
@@ -561,14 +576,14 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			if err := srvState.kernel.Ensure(bootCtx); err != nil {
 				if wantsBootEventStream(r) {
 					if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
-						writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", vmBootTimeout)})
+						writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
 						return
 					}
 					writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
 					return
 				}
 				if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
-					writeError(w, http.StatusGatewayTimeout, fmt.Errorf("vm boot timed out after %s", vmBootTimeout))
+					writeError(w, http.StatusGatewayTimeout, fmt.Errorf("vm boot timed out after %s", bootTimeout))
 					return
 				}
 				writeError(w, http.StatusInternalServerError, err)
@@ -583,7 +598,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			})
 			if err != nil {
 				if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
-					_ = writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", vmBootTimeout)})
+					_ = writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
 					return
 				}
 				_ = writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
@@ -597,7 +612,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 		state, err := srvState.vms.Start(bootCtx, req)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
-				writeError(w, http.StatusGatewayTimeout, fmt.Errorf("vm boot timed out after %s", vmBootTimeout))
+				writeError(w, http.StatusGatewayTimeout, fmt.Errorf("vm boot timed out after %s", bootTimeout))
 				return
 			}
 			writeError(w, http.StatusBadRequest, err)
