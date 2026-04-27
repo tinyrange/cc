@@ -3,12 +3,15 @@
 package hvf
 
 import (
+	"context"
 	"fmt"
 	"runtime"
 	"sync"
 	"syscall"
 	"time"
 	"unsafe"
+
+	"j5.nz/cc/internal/timing"
 
 	"github.com/ebitengine/purego"
 )
@@ -253,6 +256,10 @@ type mapping struct {
 }
 
 func NewVM() (*VM, error) {
+	return NewVMWithContext(context.Background())
+}
+
+func NewVMWithContext(ctx context.Context) (*VM, error) {
 	if err := load(); err != nil {
 		return nil, err
 	}
@@ -266,13 +273,18 @@ func NewVM() (*VM, error) {
 
 	errCh := make(chan error, 1)
 	v.threadCh <- func() {
+		start := time.Now()
 		vmCfg := hvVMConfigCreate()
+		timing.Since(ctx, "hvf.new_vm.vm_config_create", start)
+		start = time.Now()
 		ret := createVMWithRetry(vmCfg)
 		if ret != hvSuccess {
 			osRelease(uintptr(vmCfg))
 			errCh <- fmt.Errorf("create vm: %w", ret)
 			return
 		}
+		timing.Since(ctx, "hvf.new_vm.vm_create", start)
+		start = time.Now()
 		osRelease(uintptr(vmCfg))
 
 		if err := createMinimalGIC(); err != nil {
@@ -280,8 +292,12 @@ func NewVM() (*VM, error) {
 			errCh <- err
 			return
 		}
+		timing.Since(ctx, "hvf.new_vm.gic_create", start)
+		start = time.Now()
 
 		vcpuCfg := hvVcpuConfigCreate()
+		timing.Since(ctx, "hvf.new_vm.vcpu_config_create", start)
+		start = time.Now()
 		var id VCPU
 		exitInfo := new(VcpuExit)
 		if ret := hvVcpuCreate(&id, &exitInfo, vcpuCfg); ret != hvSuccess {
@@ -290,6 +306,8 @@ func NewVM() (*VM, error) {
 			errCh <- fmt.Errorf("create vcpu: %w", ret)
 			return
 		}
+		timing.Since(ctx, "hvf.new_vm.vcpu_create", start)
+		start = time.Now()
 		osRelease(uintptr(vcpuCfg))
 
 		v.vcpu = id
@@ -300,19 +318,27 @@ func NewVM() (*VM, error) {
 			errCh <- fmt.Errorf("set MPIDR_EL1: %w", ret)
 			return
 		}
+		timing.Since(ctx, "hvf.new_vm.set_mpidr", start)
+		start = time.Now()
 		if err := sanitizeFeatureRegs(v.vcpu); err != nil {
 			_ = hvVcpuDestroy(v.vcpu)
 			_ = hvVMDestroy()
 			errCh <- err
 			return
 		}
+		timing.Since(ctx, "hvf.new_vm.sanitize_feature_regs", start)
+		start = time.Now()
 		if ret := hvVcpuSetVtimerMask(v.vcpu, false); ret != hvSuccess {
 			_ = hvVcpuDestroy(v.vcpu)
 			_ = hvVMDestroy()
 			errCh <- fmt.Errorf("unmask virtual timer: %w", ret)
 			return
 		}
-		errCh <- initMinimalGICCPUInterface(v)
+		timing.Since(ctx, "hvf.new_vm.unmask_vtimer", start)
+		start = time.Now()
+		err := initMinimalGICCPUInterface(v)
+		timing.Since(ctx, "hvf.new_vm.init_gic_cpu_interface", start)
+		errCh <- err
 	}
 	if err := <-errCh; err != nil {
 		close(v.threadCh)

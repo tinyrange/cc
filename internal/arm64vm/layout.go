@@ -38,8 +38,12 @@ const (
 	VsockSize = 0x1000
 	VsockIRQ  = 42
 
-	ShareFSBase = 0x0a103000
-	ShareFSIRQ  = 43
+	RNGBase = 0x0a103000
+	RNGSize = 0x1000
+	RNGIRQ  = 43
+
+	ShareFSBase = 0x0a104000
+	ShareFSIRQ  = 44
 	FSStride    = 0x1000
 
 	UARTSPI = 33

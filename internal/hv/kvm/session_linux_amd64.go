@@ -42,6 +42,7 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 	}
 
 	vsock := virtio.NewVsock(amd64vm.VsockBase, amd64vm.VsockSize, amd64vm.VsockIRQ, vmruntime.GuestCID, backend)
+	rng := virtio.NewRNG(amd64vm.RNGBase, amd64vm.RNGSize, amd64vm.RNGIRQ)
 	connCh := make(chan virtio.VsockConn, 1)
 	acceptErrCh := make(chan error, 1)
 	controlTranscript := vmruntime.NewSerialTranscript()
@@ -83,9 +84,11 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 		}
 	}
 	vsock.Attach(vm, vm)
+	rng.Attach(vm, vm)
 
 	extraCmdline := amd64vm.VirtioFSCommandLineArgs(fsdevs)
 	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(vsock.Base, vsock.IRQ))
+	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(rng.Base, rng.IRQ))
 	plan, err := amd64vm.PrepareBoot(mem, kernel, initrd, amd64vm.BootConfig{
 		MemoryMB:     memoryMB,
 		Dmesg:        dmesg,
@@ -114,7 +117,7 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 	doneCh := make(chan error, 1)
 	go func() {
 		defer vm.Close()
-		doneCh <- runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, serialOut)
+		doneCh <- runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, serialOut)
 	}()
 
 	var control virtio.VsockConn

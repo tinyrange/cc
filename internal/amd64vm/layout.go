@@ -11,8 +11,12 @@ const (
 	VsockSize = 0x1000
 	VsockIRQ  = 6
 
-	ShareFSBase = 0xd0006000
-	ShareFSIRQ  = 7
+	RNGBase = 0xd0006000
+	RNGSize = 0x1000
+	RNGIRQ  = 7
+
+	ShareFSBase = 0xd0007000
+	ShareFSIRQ  = 8
 	FSStride    = 0x1000
 
 	RootFSTag   = vmruntime.RootFSTag

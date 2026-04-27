@@ -76,6 +76,8 @@ type BootEventWriter struct {
 	ch       chan string
 	done     chan struct{}
 	callback func(client.BootEvent) error
+	closeMu  sync.Mutex
+	closed   bool
 	errMu    sync.Mutex
 	err      error
 }
@@ -109,12 +111,26 @@ func (w *BootEventWriter) Write(data []byte) (int, error) {
 	if len(data) == 0 {
 		return 0, nil
 	}
-	w.ch <- string(append([]byte(nil), data...))
+	w.closeMu.Lock()
+	if w.closed {
+		w.closeMu.Unlock()
+		return len(data), nil
+	}
+	select {
+	case w.ch <- string(append([]byte(nil), data...)):
+	default:
+	}
+	w.closeMu.Unlock()
 	return len(data), nil
 }
 
 func (w *BootEventWriter) Close() error {
-	close(w.ch)
+	w.closeMu.Lock()
+	if !w.closed {
+		w.closed = true
+		close(w.ch)
+	}
+	w.closeMu.Unlock()
 	<-w.done
 	w.errMu.Lock()
 	defer w.errMu.Unlock()

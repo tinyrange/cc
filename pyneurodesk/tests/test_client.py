@@ -3,7 +3,6 @@ from __future__ import annotations
 import io
 import base64
 import json
-import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -31,7 +30,6 @@ from pyneurodesk.api import (
     path_join,
     resolve_ccvm_binary_path,
     resolve_release_index_dir,
-    start_container_daemon,
     start_default_daemon,
 )
 from pyneurodesk.models import DaemonState
@@ -307,7 +305,7 @@ def test_create_instance_uses_boot_timeout() -> None:
 
     assert seen["path"] == "/vm"
     assert seen["timeout"] is not None
-    assert seen["timeout"]["read"] == 30.0
+    assert seen["timeout"]["read"] == 5.0
     assert result.status == "running"
 
 
@@ -327,9 +325,9 @@ def test_start_instance_posts_vm_start_and_uses_boot_timeout() -> None:
         client.close()
 
     assert seen["path"] == "/vm/start"
-    assert seen["json"] == '{"memory_mb":1024,"cpus":1,"timeout_seconds":30.0}'
+    assert seen["json"] == '{"memory_mb":1024,"cpus":1,"timeout_seconds":5.0}'
     assert seen["timeout"] is not None
-    assert seen["timeout"]["read"] == 30.0
+    assert seen["timeout"]["read"] == 5.0
     assert result.status == "running"
 
 
@@ -379,7 +377,7 @@ def test_container_cold_start_uses_http_timeout_for_preflight_and_boot_timeout_f
     assert timeouts["/kernel/download"] == inherited_timeout
     assert timeouts["/image/niimath/qemu/download"] == inherited_timeout
     assert timeouts["/image/niimath/metadata"] == inherited_timeout
-    assert timeouts["/vm"] == 30.0
+    assert timeouts["/vm"] == 5.0
 
 
 def test_container_does_not_boot_vm_if_preflight_fails() -> None:
@@ -443,7 +441,7 @@ def test_create_instance_sends_dmesg_when_requested() -> None:
         client.close()
 
     assert seen["path"] == "/vm"
-    assert seen["json"] == '{"image":"niimath","dmesg":true,"timeout_seconds":30.0}'
+    assert seen["json"] == '{"image":"niimath","dmesg":true,"timeout_seconds":5.0}'
     assert result.status == "running"
 
 
@@ -462,7 +460,7 @@ def test_create_instance_sends_memory_and_cpu_overrides() -> None:
         client.close()
 
     assert seen["path"] == "/vm"
-    assert seen["json"] == '{"image":"niimath","memory_mb":4096,"cpus":2,"timeout_seconds":30.0}'
+    assert seen["json"] == '{"image":"niimath","memory_mb":4096,"cpus":2,"timeout_seconds":5.0}'
     assert result.memory_mb == 4096
     assert result.cpus == 2
 
@@ -527,11 +525,11 @@ def test_ensure_instance_replaces_running_blank_vm() -> None:
     assert seen == ["/vm/status", "/vm/shutdown", "/vm"]
 
 
-def test_resolve_boot_timeout_defaults_to_30_seconds() -> None:
+def test_resolve_boot_timeout_defaults_to_5_seconds() -> None:
     timeout = resolve_boot_timeout()
     assert timeout.connect == 10.0
-    assert timeout.read == 30.0
-    assert timeout.write == 30.0
+    assert timeout.read == 5.0
+    assert timeout.write == 5.0
     assert timeout.pool == 10.0
 
 
@@ -975,6 +973,37 @@ def test_start_default_daemon_writes_state(monkeypatch, tmp_path: Path) -> None:
     assert seen["kwargs"]["cwd"] == str(Path(__file__).resolve().parents[2])
     assert seen["watchdog"] == "http://127.0.0.1:3456"
     assert (cache_root / "ccvm.json").read_text() == '{\n  "addr": "127.0.0.1:3456"\n}'
+
+
+def test_start_default_daemon_reports_structured_startup_error(monkeypatch, tmp_path: Path) -> None:
+    cache_root = tmp_path / "cache"
+    ccvm_path = tmp_path / "bin" / "ccvm"
+    ccvm_path.parent.mkdir(parents=True)
+    ccvm_path.write_text("")
+
+    class FakeStdout:
+        def readline(self) -> str:
+            return '{"kind":"error","error":"ccvm failed to start","detail":"listen on bad: bind failed"}\n'
+
+    class FakeProc:
+        stdout = FakeStdout()
+
+        def kill(self) -> None:
+            return None
+
+        def wait(self) -> int:
+            return 1
+
+    monkeypatch.setattr("pyneurodesk.api.resolve_ccvm_binary_path", lambda: ccvm_path)
+    monkeypatch.setattr("pyneurodesk.api.subprocess.Popen", lambda *args, **kwargs: FakeProc())
+
+    with pytest.raises(RuntimeError) as excinfo:
+        api.start_daemon_for_cache_dir(cache_root)
+
+    message = str(excinfo.value)
+    assert f"ccvm failed to start from {ccvm_path}" in message
+    assert "listen on bad: bind failed" in message
+    assert f"See daemon log at {cache_root / 'ccvm-python.log'}" in message
 
 
 def test_start_default_daemon_feeds_watchdog_for_existing_daemon(monkeypatch, tmp_path: Path) -> None:
@@ -1750,6 +1779,91 @@ def test_container_progress_reports_required_downloads(monkeypatch, capsys: pyte
     assert "Downloaded required file 2/2: qemu-system-x86_64" in captured.out
 
 
+def test_container_uses_streaming_image_import(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    daemon = DaemonState(addr="127.0.0.1:4001", cache_dir="/tmp/daemon-a")
+    calls: list[tuple[str, object]] = []
+
+    def fake_start_default_daemon() -> DaemonState:
+        return daemon
+
+    class FakeClient:
+        def __init__(self, base_url: str) -> None:
+            self._client = SimpleNamespace(base_url=base_url)
+
+        def cvmfs_list(self, source: object) -> object:
+            payload = source.to_payload()
+            if payload["path"] == "/containers/niimath":
+                return SimpleNamespace(entries=[])
+            if payload["path"] == "/containers":
+                return SimpleNamespace(
+                    entries=[
+                        SimpleNamespace(
+                            name="niimath_1.0.20250804_20251016",
+                            path="/containers/niimath_1.0.20250804_20251016",
+                            kind="directory",
+                        )
+                    ]
+                )
+            raise AssertionError(payload["path"])
+
+        def get_image(self, image: str) -> Optional[object]:
+            return None
+
+        def import_image_stream(self, image: str, request: object):
+            calls.append(("import_image_stream", image))
+            yield SimpleNamespace(
+                status="downloading",
+                artifact=image,
+                blob="rootfs.index.json",
+                bytes_downloaded=1024,
+                bytes_total=2048,
+                rate_bytes_per_second=512,
+                eta_seconds=2,
+            )
+            yield SimpleNamespace(
+                status="downloaded",
+                artifact=image,
+                blob="rootfs.index.json",
+                bytes_downloaded=2048,
+                bytes_total=2048,
+                rate_bytes_per_second=1024,
+                eta_seconds=0,
+            )
+
+        def import_image(self, image: str, request: object) -> object:
+            raise AssertionError("blocking import_image should not be used when streaming is available")
+
+        def instance_status(self) -> object:
+            return SimpleNamespace(status="stopped", image=None)
+
+        def download_kernel(self) -> object:
+            return SimpleNamespace(status="downloaded", source="/cache/vmlinuz")
+
+        def prepare_image_emulator(self, image: str) -> object:
+            return SimpleNamespace(status="downloaded", path="/tmp/qemu-system-x86_64", required=True)
+
+        def prepare_image_metadata(self, image: str) -> object:
+            return SimpleNamespace(status="prepared", architecture="amd64")
+
+        def create_instance(self, image: str, *, dmesg: bool = False) -> object:
+            return SimpleNamespace(status="running", image=image)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("pyneurodesk.api._supports_notebook_display", lambda: False)
+    monkeypatch.setattr("pyneurodesk.api.start_default_daemon", fake_start_default_daemon)
+    monkeypatch.setattr("pyneurodesk.api.PyNeurodeskClient", FakeClient)
+
+    container = nd.container("niimath")
+    container.close()
+
+    captured = capsys.readouterr()
+    assert calls == [("import_image_stream", "niimath")]
+    assert "Importing niimath | rootfs.index.json | 1.0 KB/2.0 KB" in captured.out
+    assert "Imported niimath | rootfs.index.json | 2.0 KB/2.0 KB" in captured.out
+
+
 def test_container_progress_reports_rate_and_eta_from_stream(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
     daemon = DaemonState(addr="127.0.0.1:4001", cache_dir="/tmp/daemon-a")
 
@@ -1877,6 +1991,44 @@ def test_search_uses_remote_release_metadata(monkeypatch) -> None:
     )
 
     assert nd.search("niimath") == ["1.0.0", "1.0.20250804"]
+
+
+def test_remote_release_search_uses_fresh_cache(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("pyneurodesk.api.default_cache_root", lambda: tmp_path / "cache")
+    monkeypatch.setattr("pyneurodesk.api.resolve_release_cache_ttl_seconds", lambda: 60.0)
+    monkeypatch.setattr("pyneurodesk.api.fetch_remote_release_versions", lambda api_base, name: pytest.fail("network used"))
+    api.write_remote_release_cache("https://api.example/releases", "niimath", {"1.0.0": "20250617"})
+
+    assert api.search_remote_release_versions("https://api.example/releases", "niimath") == {"1.0.0": "20250617"}
+
+
+def test_remote_release_search_refreshes_stale_cache(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("pyneurodesk.api.default_cache_root", lambda: tmp_path / "cache")
+    monkeypatch.setattr("pyneurodesk.api.resolve_release_cache_ttl_seconds", lambda: 60.0)
+    monkeypatch.setattr("pyneurodesk.api.time.time", lambda: 1_000.0)
+    api.write_remote_release_cache("https://api.example/releases", "niimath", {"1.0.0": "old"})
+    monkeypatch.setattr("pyneurodesk.api.time.time", lambda: 1_061.0)
+    monkeypatch.setattr(
+        "pyneurodesk.api.fetch_remote_release_versions",
+        lambda api_base, name: {"1.0.1": "new"},
+    )
+    assert api.search_remote_release_versions("https://api.example/releases", "niimath") == {"1.0.1": "new"}
+    assert api.read_remote_release_cache("https://api.example/releases", "niimath", 60.0) == {"1.0.1": "new"}
+
+
+def test_remote_release_search_can_disable_cache(monkeypatch, tmp_path: Path) -> None:
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr("pyneurodesk.api.default_cache_root", lambda: tmp_path / "cache")
+    monkeypatch.setattr("pyneurodesk.api.resolve_release_cache_ttl_seconds", lambda: 0.0)
+    api.write_remote_release_cache("https://api.example/releases", "niimath", {"1.0.0": "cached"})
+
+    def fetch(api_base: str, name: str) -> dict[str, str]:
+        calls.append((api_base, name))
+        return {"1.0.1": "fresh"}
+
+    monkeypatch.setattr("pyneurodesk.api.fetch_remote_release_versions", fetch)
+    assert api.search_remote_release_versions("https://api.example/releases", "niimath") == {"1.0.1": "fresh"}
+    assert calls == [("https://api.example/releases", "niimath")]
 
 
 def test_container_uses_local_release_metadata_without_cvmfs_listing(monkeypatch, tmp_path: Path) -> None:

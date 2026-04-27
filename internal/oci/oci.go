@@ -481,12 +481,8 @@ func (s *Store) pullCVMFSDirect(ctx context.Context, name string, spec SourceSpe
 		}
 	}
 	if options.Prefetch {
-		workers := options.PrefetchWorkers
-		if workers <= 0 {
-			workers = 4
-		}
 		packedContentsPath := filepath.Join(tmpDir, "rootfs.contents")
-		packedNodes, err := prefetchCVMFSFiles(ctx, cvmfsClient, nodes, workers, packedContentsPath, name, options.Report)
+		packedNodes, err := prefetchCVMFSFiles(ctx, cvmfsClient, nodes, options.PrefetchWorkers, packedContentsPath, name, options.Report)
 		if err != nil {
 			return fmt.Errorf("prefetch cvmfs rootfs: %w", err)
 		}
@@ -587,16 +583,12 @@ func (s *Store) maybePrefetchCVMFSImage(ctx context.Context, name string, spec S
 	if err != nil {
 		return fmt.Errorf("decode fs index for prefetch: %w", err)
 	}
-	workers := options.PrefetchWorkers
-	if workers <= 0 {
-		workers = 4
-	}
 	cvmfsClient := &intcvmfs.Client{
 		HTTPClient: s.httpClient,
 		CacheDir:   cvmfsCacheDir(s.sharedRoot()),
 	}
 	packedContentsPath := filepath.Join(meta.RootFSDir, "rootfs.contents")
-	packedNodes, err := prefetchCVMFSFiles(ctx, cvmfsClient, nodes, workers, packedContentsPath, name, options.Report)
+	packedNodes, err := prefetchCVMFSFiles(ctx, cvmfsClient, nodes, options.PrefetchWorkers, packedContentsPath, name, options.Report)
 	if err != nil {
 		return err
 	}

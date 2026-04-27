@@ -159,6 +159,8 @@ func prepareManagedVM(kernel []byte, initrd []byte, memoryMB uint64, dmesg bool,
 	if vsock != nil {
 		extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(vsock.Base, vsock.IRQ))
 	}
+	rng := virtio.NewRNG(amd64vm.RNGBase, amd64vm.RNGSize, amd64vm.RNGIRQ)
+	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(rng.Base, rng.IRQ))
 	plan, err := amd64vm.PrepareBoot(vm.Memory(), kernel, initrd, amd64vm.BootConfig{
 		MemoryMB:     memoryMB,
 		Dmesg:        dmesg,
@@ -188,6 +190,7 @@ func prepareManagedVM(kernel []byte, initrd []byte, memoryMB uint64, dmesg bool,
 	if vsock != nil {
 		platform.AttachVsock(vsock)
 	}
+	platform.AttachRNG(rng)
 	if err := vm.EnableEmulation(platform); err != nil {
 		platform.Close()
 		_ = vm.Close()

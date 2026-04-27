@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -45,6 +46,7 @@ type config struct {
 	OutputMarkerPref string   `json:"output_marker_prefix"`
 	ErrorMarkerPref  string   `json:"error_marker_prefix"`
 	ExitMarkerPrefix string   `json:"exit_marker_prefix"`
+	PrecopyAMD64Root bool     `json:"precopy_amd64_root,omitempty"`
 }
 
 type share struct {
@@ -72,6 +74,7 @@ type managedExec struct {
 	stdin   io.WriteCloser
 	pty     *os.File
 	process *os.Process
+	start   time.Time
 }
 
 func (m *managedExec) writeStdin(data []byte) error {
@@ -184,6 +187,13 @@ func run() error {
 			return err
 		}
 		writeStage(bootStart, "rootfs mounted")
+		if cfg.PrecopyAMD64Root {
+			writeStage(bootStart, "precopying amd64 root")
+			if err := precopyAMD64Root(); err != nil {
+				return fmt.Errorf("precopy amd64 root: %w", err)
+			}
+			writeStage(bootStart, "amd64 root precopied")
+		}
 		writeStage(bootStart, "configuring binfmt")
 		if err := configureBinfmt(); err != nil {
 			return fmt.Errorf("configure binfmt: %w", err)
@@ -274,6 +284,58 @@ func mountRootFS(tag, emulatorTag string) error {
 		}
 	}
 	_ = os.Symlink("/proc/self/fd", "/dev/fd")
+	return nil
+}
+
+func precopyAMD64Root() error {
+	for _, path := range []string{
+		"/run/ccx3/qemu-x86_64",
+		"/bin/busybox",
+		"/lib/ld-musl-x86_64.so.1",
+		"/lib/libc.musl-x86_64.so.1",
+	} {
+		if err := copyPath(path, filepath.Join("/run/ccx3-precopy", path)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyPath(src, dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(dst), err)
+	}
+	info, err := os.Lstat(src)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", src, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(src)
+		if err != nil {
+			return fmt.Errorf("readlink %s: %w", src, err)
+		}
+		_ = os.Remove(dst)
+		if err := os.Symlink(target, dst); err != nil {
+			return fmt.Errorf("symlink %s: %w", dst, err)
+		}
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", src, err)
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode().Perm())
+	if err != nil {
+		return fmt.Errorf("create %s: %w", dst, err)
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return fmt.Errorf("copy %s to %s: %w", src, dst, err)
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", dst, err)
+	}
 	return nil
 }
 
@@ -621,6 +683,7 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 			if managed == nil {
 				continue
 			}
+			writeExecTiming(control, req.ID, "stdin_close_recv", managed.start)
 			if err := managed.closeStdin(); err != nil {
 				writeKernel("ccx3-init: close stdin: " + err.Error())
 			}
@@ -674,7 +737,7 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 		}
 
 		stdinR, stdinW := io.Pipe()
-		managed := &managedExec{stdin: stdinW}
+		managed := &managedExec{stdin: stdinW, start: time.Now()}
 		activeMu.Lock()
 		active[req.ID] = managed
 		activeMu.Unlock()
@@ -769,9 +832,14 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		go func() {
 			defer func() { done <- struct{}{} }()
 			var buf [256]byte
+			first := true
 			for {
 				n, err := ptyMaster.Read(buf[:])
 				if n > 0 && cfg.OutputMarkerPref != "" {
+					if first {
+						writeExecTiming(control, id, "first_stdout", execStart)
+						first = false
+					}
 					writeProtocolLineTo(control, cfg.OutputMarkerPref+id+":"+base64.StdEncoding.EncodeToString(buf[:n]))
 				}
 				if err != nil {
@@ -824,9 +892,14 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			defer func() { done <- struct{}{} }()
 			defer stdoutR.Close()
 			var buf [256]byte
+			first := true
 			for {
 				n, err := stdoutR.Read(buf[:])
 				if n > 0 && cfg.OutputMarkerPref != "" {
+					if first {
+						writeExecTiming(control, id, "first_stdout", execStart)
+						first = false
+					}
 					writeProtocolLineTo(control, cfg.OutputMarkerPref+id+":"+base64.StdEncoding.EncodeToString(buf[:n]))
 				}
 				if err != nil {
@@ -838,9 +911,14 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			defer func() { done <- struct{}{} }()
 			defer stderrR.Close()
 			var buf [256]byte
+			first := true
 			for {
 				n, err := stderrR.Read(buf[:])
 				if n > 0 && cfg.ErrorMarkerPref != "" {
+					if first {
+						writeExecTiming(control, id, "first_stderr", execStart)
+						first = false
+					}
 					writeProtocolLineTo(control, cfg.ErrorMarkerPref+id+":"+base64.StdEncoding.EncodeToString(buf[:n]))
 				}
 				if err != nil {
@@ -853,6 +931,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		cmd.SysProcAttr = &syscall.SysProcAttr{Chroot: rootDir}
 	}
 
+	writeExecTiming(control, id, "start_call", execStart)
 	startErr := cmd.Start()
 	if startErr != nil {
 		_ = managed.closeStdin()
@@ -879,6 +958,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		ptySlave = nil
 	}
 
+	writeExecTiming(control, id, "wait_begin", execStart)
 	waitErr := cmd.Wait()
 	writeExecTiming(control, id, "wait_done", execStart)
 	if tty {

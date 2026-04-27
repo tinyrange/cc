@@ -31,6 +31,7 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 
 	vsock := virtio.NewVsock(amd64vm.VsockBase, amd64vm.VsockSize, amd64vm.VsockIRQ, vmruntime.GuestCID, backend)
 	defer vsock.Close()
+	rng := virtio.NewRNG(amd64vm.RNGBase, amd64vm.RNGSize, amd64vm.RNGIRQ)
 
 	connCh := make(chan virtio.VsockConn, 1)
 	acceptErrCh := make(chan error, 1)
@@ -64,9 +65,11 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 		}
 	}
 	vsock.Attach(vm, vm)
+	rng.Attach(vm, vm)
 
 	extraCmdline := amd64vm.VirtioFSCommandLineArgs(fsdevs)
 	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(vsock.Base, vsock.IRQ))
+	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(rng.Base, rng.IRQ))
 	plan, err := amd64vm.PrepareBoot(mem, kernel, initrd, amd64vm.BootConfig{
 		MemoryMB:     memoryMB,
 		Dmesg:        dmesg,
@@ -108,7 +111,7 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 	}
 
 	go func() {
-		setRunErr(runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, serialOut))
+		setRunErr(runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, serialOut))
 	}()
 	go func() {
 		text, err := serialOut.WaitFor(runCtx, 0, vmruntime.HasFatalBootText)
@@ -167,7 +170,7 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 	return client.ExecResponse{ExitCode: code, Output: output}, serialOut.String(), nil
 }
 
-func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, serialOut *vmruntime.SerialTranscript) error {
+func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, serialOut *vmruntime.SerialTranscript) error {
 	for step := 0; ; step++ {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -185,7 +188,7 @@ func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs
 				return err
 			}
 		case ExitMMIO:
-			if err := handleBootMMIO(vm, fsdevs, vsock, exit.MMIO); err != nil {
+			if err := handleBootMMIO(vm, fsdevs, vsock, rng, exit.MMIO); err != nil {
 				return err
 			}
 		case ExitShutdown:

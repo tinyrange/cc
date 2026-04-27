@@ -260,6 +260,21 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 	return client.ExecResponse{ExitCode: 0, Output: output}, nil
 }
 
+func (b *runtimeBackend) RunStream(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	inst, err := b.StartStream(ctx, client.CreateInstanceRequest{
+		Image:    req.Image,
+		Shares:   append([]client.ShareMount(nil), req.Shares...),
+		MemoryMB: req.MemoryMB,
+		CPUs:     req.CPUs,
+		Dmesg:    req.Dmesg,
+	}, nil)
+	if err != nil {
+		return err
+	}
+	defer inst.Close()
+	return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
+}
+
 func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runningImage string, req client.RunRequest) (client.ExecResponse, error) {
 	targetImage := strings.TrimSpace(req.Image)
 	if targetImage == "" || targetImage == runningImage {
@@ -329,6 +344,66 @@ func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runni
 		Cols:        req.Cols,
 		Rows:        req.Rows,
 	})
+}
+
+func (b *runtimeBackend) RunInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	targetImage := strings.TrimSpace(req.Image)
+	if targetImage == "" || targetImage == runningImage {
+		if err := addRuntimeShares(ctx, inst, req.Shares); err != nil {
+			return err
+		}
+		return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
+	}
+
+	session, ok := inst.(*linuxInstance)
+	if !ok {
+		return fmt.Errorf("running instance does not support image mounts")
+	}
+	if b == nil || b.images == nil {
+		return fmt.Errorf("runtime backend is not configured")
+	}
+	image, err := b.images.Open(targetImage)
+	if err != nil {
+		return err
+	}
+	if err := ensureLinuxAMD64Image(image); err != nil {
+		return err
+	}
+	image = withLinuxRuntimeMountDirs(image)
+	mountPath := linuxImageMountPath(targetImage)
+	if err := session.AddImage(ctx, mountPath, image); err != nil {
+		return err
+	}
+	if err := addRuntimeShares(ctx, inst, rebaseRuntimeShares(mountPath, req.Shares)); err != nil {
+		return err
+	}
+
+	env := vmruntime.WithDefaultEnv(vmruntime.MergeEnv(image.Config.Env, req.Env))
+	command, err := imagefs.ResolveCommand(image.RootFS, req.Command, env)
+	if err != nil {
+		return err
+	}
+	workDir := req.WorkDir
+	if workDir == "" {
+		workDir = image.Config.WorkingDir
+	}
+	if workDir == "" {
+		workDir = "/"
+	}
+
+	return inst.ExecStream(ctx, client.ExecRequest{
+		Command:     command,
+		Env:         env,
+		RootDir:     mountPath,
+		ReplaceEnv:  true,
+		SkipResolve: true,
+		WorkDir:     workDir,
+		User:        req.User,
+		Stdin:       append([]byte(nil), req.Stdin...),
+		TTY:         req.TTY,
+		Cols:        req.Cols,
+		Rows:        req.Rows,
+	}, inputs, onEvent)
 }
 
 func linuxAMD64NotImplemented() error {
@@ -554,7 +629,7 @@ func linuxGuestInitConfig(modules []alpine.Module, managedExec bool) vmruntime.G
 }
 
 func linuxRuntimeConfigVars(image *oci.Image) []string {
-	vars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS"}
+	vars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO"}
 	if NeedsAMD64Emulation(image) {
 		vars = append(vars, "CONFIG_BINFMT_MISC")
 	}
@@ -563,12 +638,14 @@ func linuxRuntimeConfigVars(image *oci.Image) []string {
 
 func linuxRuntimeModuleMap() map[string]string {
 	return map[string]string{
-		"CONFIG_VIRTIO_MMIO":     "kernel/drivers/virtio/virtio_mmio.ko.gz",
-		"CONFIG_FUSE_FS":         "kernel/fs/fuse/fuse.ko.gz",
-		"CONFIG_VIRTIO_FS":       "kernel/fs/fuse/virtiofs.ko.gz",
-		"CONFIG_VSOCKETS":        "kernel/net/vmw_vsock/vsock.ko.gz",
-		"CONFIG_VIRTIO_VSOCKETS": "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
-		"CONFIG_BINFMT_MISC":     "kernel/fs/binfmt_misc.ko.gz",
+		"CONFIG_VIRTIO_MMIO":      "kernel/drivers/virtio/virtio_mmio.ko.gz",
+		"CONFIG_FUSE_FS":          "kernel/fs/fuse/fuse.ko.gz",
+		"CONFIG_VIRTIO_FS":        "kernel/fs/fuse/virtiofs.ko.gz",
+		"CONFIG_VSOCKETS":         "kernel/net/vmw_vsock/vsock.ko.gz",
+		"CONFIG_VIRTIO_VSOCKETS":  "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
+		"CONFIG_HW_RANDOM":        "kernel/drivers/char/hw_random/rng-core.ko.gz",
+		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
+		"CONFIG_BINFMT_MISC":      "kernel/fs/binfmt_misc.ko.gz",
 	}
 }
 

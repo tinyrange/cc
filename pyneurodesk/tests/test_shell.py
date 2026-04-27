@@ -8,7 +8,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 
-import httpx
 import pytest
 
 from pyneurodesk import shell
@@ -539,6 +538,58 @@ def test_run_wrapper_invokes_container_command(
                 guest_mount,
             ),
         ),
+        ("close", None),
+    ]
+
+
+def test_run_wrapper_stream_preserves_stdout_stderr_and_binary_data(
+    monkeypatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+) -> None:
+    calls: list[tuple[str, object]] = []
+
+    class FakeClient:
+        def run_stream(
+            self,
+            image: str,
+            command: list[str],
+            *,
+            env: list[str] = (),
+            shares: list[object] = (),
+            workdir: Optional[str] = None,
+        ) -> object:
+            calls.append(("run_stream", (image, tuple(command), tuple(env), tuple(shares), workdir)))
+            return iter(
+                [
+                    {"kind": "stdout", "output": "hello\n"},
+                    {"kind": "stderr", "output": "warn\n"},
+                    {"kind": "stdout", "data": base64.b64encode(b"\x00bin\n").decode()},
+                    {"kind": "output", "stream": "stderr", "data": base64.b64encode(b"rawerr\n").decode()},
+                    {"kind": "exit", "exit_code": 3},
+                ]
+            )
+
+    class FakeHandle:
+        def __init__(self) -> None:
+            self._client = FakeClient()
+            self.reference = SimpleNamespace(image="niimath")
+
+        def close(self) -> None:
+            calls.append(("close", None))
+
+    monkeypatch.setattr("pyneurodesk.shell.shell_session_container", lambda image: FakeHandle())
+    monkeypatch.setattr("pyneurodesk.shell.load_deploy_metadata", lambda handle: SimpleNamespace(deploy_env=()))
+    monkeypatch.setattr("pyneurodesk.shell.implicit_runtime_mounts", lambda: ([], None))
+    monkeypatch.setattr("pyneurodesk.shell.runtime_env_overrides", lambda: [])
+
+    exit_code = shell.run_image_command("niimath", "niimath", ["-help"])
+
+    captured = capsysbinary.readouterr()
+    assert exit_code == 3
+    assert captured.out == b"hello\n\x00bin\n"
+    assert captured.err == b"warn\nrawerr\n"
+    assert calls == [
+        ("run_stream", ("niimath", ("niimath", "-help"), (), (), None)),
         ("close", None),
     ]
 

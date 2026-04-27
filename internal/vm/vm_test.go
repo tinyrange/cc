@@ -342,6 +342,85 @@ func TestManagerRunMountsRuntimeSharesBeforeExec(t *testing.T) {
 	}
 }
 
+func TestManagerRunStreamFallsBackToOneShotRunWhenNoInstance(t *testing.T) {
+	var seen client.RunRequest
+	mgr := NewManagerWithBackend(fakeBackend{
+		runStreamFn: func(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+			_ = ctx
+			_ = inputs
+			seen = req
+			if err := onEvent(client.ExecEvent{Kind: "stdout", Stream: "stdout", Output: "hello", Data: []byte("hello")}); err != nil {
+				return err
+			}
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 7})
+		},
+	})
+	mgr.supports = func() error { return nil }
+
+	var events []client.ExecEvent
+	err := mgr.RunStream(context.Background(), client.RunRequest{
+		Image:   "alpine",
+		Command: []string{"echo", "hello"},
+	}, nil, func(event client.ExecEvent) error {
+		events = append(events, event)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RunStream() error = %v", err)
+	}
+	if seen.Image != "alpine" || len(seen.Command) != 2 {
+		t.Fatalf("backend Run saw %#v", seen)
+	}
+	if len(events) != 2 || events[0].Kind != "stdout" || events[0].Output != "hello" || events[1].Kind != "exit" || events[1].ExitCode != 7 {
+		t.Fatalf("events = %#v", events)
+	}
+}
+
+func TestManagerRunStreamDelegatesCrossImageExecToBackend(t *testing.T) {
+	inst := &fakeInstance{waitCh: make(chan error, 1)}
+	var seen struct {
+		running string
+		image   string
+	}
+	mgr := NewManagerWithBackend(fakeBackend{
+		instance: inst,
+		runInStreamFn: func(ctx context.Context, inst Instance, runningImage string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+			_ = ctx
+			_ = inst
+			_ = inputs
+			seen.running = runningImage
+			seen.image = req.Image
+			if err := onEvent(client.ExecEvent{Kind: "stdout", Stream: "stdout", Output: "ok", Data: []byte("ok")}); err != nil {
+				return err
+			}
+			return onEvent(client.ExecEvent{Kind: "exit"})
+		},
+	})
+	mgr.supports = func() error { return nil }
+
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{Image: "alpine"}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	var events []client.ExecEvent
+	err := mgr.RunStream(context.Background(), client.RunRequest{
+		Image:   "niimath",
+		Command: []string{"niimath"},
+	}, nil, func(event client.ExecEvent) error {
+		events = append(events, event)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RunStream() error = %v", err)
+	}
+	if seen.running != "alpine" || seen.image != "niimath" {
+		t.Fatalf("backend saw running=%q image=%q", seen.running, seen.image)
+	}
+	if len(events) != 2 || events[0].Output != "ok" || events[1].Kind != "exit" {
+		t.Fatalf("events = %#v", events)
+	}
+}
+
 func TestLoadAMD64EmulatorReadsQEMU(t *testing.T) {
 	if runtime.GOARCH != "arm64" {
 		t.Skip("amd64 emulation helper is only enabled on arm64 hosts")
@@ -377,8 +456,11 @@ type fakeBackend struct {
 	instance        Instance
 	err             error
 	runResp         client.ExecResponse
+	runFn           func(client.RunRequest) (client.ExecResponse, error)
+	runStreamFn     func(context.Context, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 	startFn         func(client.CreateInstanceRequest) (Instance, error)
 	runInInstanceFn func(context.Context, Instance, string, client.RunRequest) (client.ExecResponse, error)
+	runInStreamFn   func(context.Context, Instance, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 }
 
 func (f fakeBackend) Start(ctx context.Context, req client.CreateInstanceRequest) (Instance, error) {
@@ -408,8 +490,30 @@ func (f fakeBackend) StartBlankStream(ctx context.Context, req client.StartInsta
 
 func (f fakeBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
 	_ = ctx
+	if f.runFn != nil {
+		return f.runFn(req)
+	}
 	_ = req
 	return f.runResp, f.err
+}
+
+func (f fakeBackend) RunStream(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	if f.runStreamFn != nil {
+		return f.runStreamFn(ctx, req, inputs, onEvent)
+	}
+	resp, err := f.Run(ctx, req)
+	if err != nil {
+		return err
+	}
+	if resp.Output != "" && onEvent != nil {
+		if err := onEvent(client.ExecEvent{Kind: "stdout", Stream: "stdout", Output: resp.Output, Data: []byte(resp.Output)}); err != nil {
+			return err
+		}
+	}
+	if onEvent != nil {
+		return onEvent(client.ExecEvent{Kind: "exit", ExitCode: resp.ExitCode})
+	}
+	return nil
 }
 
 func (f fakeBackend) RunInInstance(ctx context.Context, inst Instance, runningImage string, req client.RunRequest) (client.ExecResponse, error) {
@@ -436,6 +540,21 @@ func (f fakeBackend) RunInInstance(ctx context.Context, inst Instance, runningIm
 		Cols:    req.Cols,
 		Rows:    req.Rows,
 	})
+}
+
+func (f fakeBackend) RunInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	if f.runInStreamFn != nil {
+		return f.runInStreamFn(ctx, inst, runningImage, req, inputs, onEvent)
+	}
+	if inst == nil {
+		return f.err
+	}
+	for _, share := range req.Shares {
+		if err := inst.AddShare(ctx, share); err != nil {
+			return err
+		}
+	}
+	return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
 }
 
 type fakeInstance struct {

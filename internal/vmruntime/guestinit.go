@@ -23,6 +23,7 @@ type GuestInitConfig struct {
 	OutputMarkerPref string           `json:"output_marker_prefix,omitempty"`
 	ErrorMarkerPref  string           `json:"error_marker_prefix,omitempty"`
 	ExitMarkerPrefix string           `json:"exit_marker_prefix"`
+	PrecopyAMD64Root bool             `json:"precopy_amd64_root,omitempty"`
 }
 
 type GuestInitShare struct {

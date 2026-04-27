@@ -22,6 +22,7 @@ import (
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/serial"
+	"j5.nz/cc/internal/timing"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
 )
@@ -65,6 +66,7 @@ type ContainerRunResult = vmruntime.RunResult
 type ContainerSession struct {
 	cancel      context.CancelFunc
 	doneCh      chan sessionRunResult
+	closeDone   <-chan struct{}
 	image       *oci.Image
 	baseEnv     []string
 	workDir     string
@@ -183,6 +185,9 @@ func StartContainerStream(ctx context.Context, req ContainerRunRequest, onEvent 
 
 func (s *ContainerSession) Wait() error {
 	res := <-s.doneCh
+	if s.closeDone != nil {
+		<-s.closeDone
+	}
 	return res.err
 }
 
@@ -376,6 +381,7 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 }
 
 func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	execStart := time.Now()
 	if len(req.Command) == 0 {
 		return fmt.Errorf("exec command is required")
 	}
@@ -388,6 +394,7 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 
 	env := effectiveExecEnv(s.baseEnv, req.Env, req.ReplaceEnv)
 	command := append([]string(nil), req.Command...)
+	start := time.Now()
 	if !req.SkipResolve {
 		var err error
 		command, err = imagefs.ResolveCommand(s.image.RootFS, req.Command, env)
@@ -395,6 +402,7 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 			return err
 		}
 	}
+	timing.Since(ctx, "exec.resolve_command", start)
 	workDir := req.WorkDir
 	if workDir == "" {
 		workDir = s.workDir
@@ -407,6 +415,7 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 	}
 
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
+	start = time.Now()
 	payload, err := json.Marshal(guestExecRequest{
 		Kind:        "exec",
 		ID:          id,
@@ -424,24 +433,33 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 	if err != nil {
 		return fmt.Errorf("marshal exec request: %w", err)
 	}
+	timing.Since(ctx, "exec.marshal_request", start)
 
-	start := s.transcript.Len()
+	transcriptStart := s.transcript.Len()
+	writeStart := time.Now()
 	s.sendMu.Lock()
 	err = s.writeControlPayload(append(payload, '\n'))
 	s.sendMu.Unlock()
 	if err != nil {
 		return err
 	}
+	timing.Since(ctx, "exec.write_control_payload", writeStart)
 
 	if inputs != nil {
 		go s.forwardExecInputs(ctx, id, inputs)
 	} else {
+		stdinStart := time.Now()
 		if err := s.sendStdinClose(id); err != nil {
 			return err
 		}
+		timing.Since(ctx, "exec.send_stdin_close", stdinStart)
 	}
 
-	return s.streamExecEvents(ctx, start, id, onEvent)
+	streamStart := time.Now()
+	err = s.streamExecEvents(ctx, transcriptStart, id, execStart, onEvent)
+	timing.Since(ctx, "exec.stream_events", streamStart)
+	timing.Since(ctx, "exec.total", execStart)
+	return err
 }
 
 func (s *ContainerSession) forwardExecInputs(ctx context.Context, id string, inputs <-chan client.ExecInput) {
@@ -489,34 +507,57 @@ func (s *ContainerSession) sendStdinClose(id string) error {
 	return s.writeControlPayload(append(payload, '\n'))
 }
 
-func (s *ContainerSession) streamExecEvents(ctx context.Context, start int, id string, onEvent func(client.ExecEvent) error) error {
+func (s *ContainerSession) streamExecEvents(ctx context.Context, start int, id string, execStart time.Time, onEvent func(client.ExecEvent) error) error {
+	totalStart := time.Now()
 	offset := start
 	var pending string
+	var loops, reads, lines, matched, ignored, sleeps int
+	guestPhases := map[string]int{}
 	for {
+		loops++
+		readStart := time.Now()
 		text := s.transcript.String()
+		timing.Since(ctx, "exec.stream_events.transcript_string", readStart)
 		if offset < len(text) {
+			reads++
+			appendStart := time.Now()
 			pending += text[offset:]
 			offset = len(text)
+			timing.Since(ctx, "exec.stream_events.append_pending", appendStart)
 			for {
 				lineEnd := strings.IndexByte(pending, '\n')
 				if lineEnd < 0 {
 					break
 				}
+				lines++
+				lineStart := time.Now()
 				line := strings.TrimSpace(pending[:lineEnd])
 				pending = pending[lineEnd+1:]
+				timing.Since(ctx, "exec.stream_events.next_line", lineStart)
+				if phase, ms, ok := recordExecTimingLine(ctx, line, id); ok {
+					recordExecObservedTiming(ctx, phase, ms, execStart, guestPhases)
+				}
+				parseStart := time.Now()
 				event, done, ok, err := parseManagedExecEventLine(line, id)
+				timing.Since(ctx, "exec.stream_events.parse_line", parseStart)
 				if err != nil {
 					return err
 				}
 				if !ok {
+					ignored++
 					continue
 				}
+				matched++
 				if onEvent != nil {
+					callbackStart := time.Now()
 					if err := onEvent(event); err != nil {
 						return err
 					}
+					timing.Since(ctx, "exec.stream_events.callback", callbackStart)
 				}
 				if done {
+					recordExecStreamCounts(ctx, loops, reads, lines, matched, ignored, sleeps)
+					timing.Since(ctx, "exec.stream_events.until_done", totalStart)
 					return nil
 				}
 			}
@@ -525,8 +566,88 @@ func (s *ContainerSession) streamExecEvents(ctx context.Context, start int, id s
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		sleeps++
+		sleepStart := time.Now()
 		time.Sleep(5 * time.Millisecond)
+		timing.Since(ctx, "exec.stream_events.sleep", sleepStart)
 	}
+}
+
+func recordExecTimingLine(ctx context.Context, line, id string) (string, int, bool) {
+	prefix := execTimingMarker + id + ":"
+	if !strings.HasPrefix(line, prefix) {
+		return "", 0, false
+	}
+	rest := strings.TrimPrefix(line, prefix)
+	parts := strings.SplitN(rest, ":", 2)
+	if len(parts) != 2 {
+		return "", 0, false
+	}
+	ms, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return "", 0, false
+	}
+	phase := strings.TrimSpace(parts[0])
+	if phase == "" {
+		return "", 0, false
+	}
+	timing.Record(ctx, "exec.guest."+phase, time.Duration(ms)*time.Millisecond)
+	return phase, ms, true
+}
+
+func recordExecObservedTiming(ctx context.Context, phase string, ms int, execStart time.Time, guestPhases map[string]int) {
+	timing.Since(ctx, "exec.host_observed."+phase, execStart)
+	if prevPhase, ok := previousExecPhase(phase); ok {
+		if prevMS, ok := guestPhases[prevPhase]; ok && ms >= prevMS {
+			timing.Record(ctx, "exec.guest_delta."+prevPhase+"_to_"+phase, time.Duration(ms-prevMS)*time.Millisecond)
+		}
+	}
+	guestPhases[phase] = ms
+}
+
+func previousExecPhase(phase string) (string, bool) {
+	switch phase {
+	case "start_begin":
+		return "recv", true
+	case "start_call":
+		return "start_begin", true
+	case "started":
+		return "start_call", true
+	case "wait_begin":
+		return "started", true
+	case "first_stdout":
+		return "started", true
+	case "first_stderr":
+		return "started", true
+	case "wait_done":
+		return "wait_begin", true
+	case "streams_done":
+		return "wait_done", true
+	case "exit_sent":
+		return "streams_done", true
+	default:
+		return "", false
+	}
+}
+
+func recordExecStreamCounts(ctx context.Context, loops, reads, lines, matched, ignored, sleeps int) {
+	recorder := timing.FromContext(ctx)
+	if recorder == nil {
+		return
+	}
+	recordCount(recorder, "exec.stream_events.loop", loops)
+	recordCount(recorder, "exec.stream_events.read", reads)
+	recordCount(recorder, "exec.stream_events.line", lines)
+	recordCount(recorder, "exec.stream_events.matched_line", matched)
+	recordCount(recorder, "exec.stream_events.ignored_line", ignored)
+	recordCount(recorder, "exec.stream_events.sleep_count", sleeps)
+}
+
+func recordCount(recorder *timing.Recorder, name string, count int) {
+	if recorder == nil || count <= 0 {
+		return
+	}
+	recorder.RecordCount(name, count)
 }
 
 func (s *ContainerSession) Close() error {
@@ -607,13 +728,17 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
 	}
+	timing.Since(ctx, "hvf.build_persistent_initramfs", start)
 	timingLog("hvf.StartContainer initramfs.Build took=%s size=%d", time.Since(start), len(initrd))
+	start = time.Now()
 
-	vm, err := NewVM()
+	vm, err := NewVMWithContext(ctx)
 	if err != nil {
 		return nil, err
 	}
+	timing.Since(ctx, "hvf.new_vm", start)
 	timingLog("hvf.StartContainer NewVM took=%s", time.Since(start))
+	start = time.Now()
 
 	memorySize := arm64vm.MemorySizeBytes(req.MemoryMB)
 	mem, err := vm.MapAnonymousMemory(uintptr(memorySize), IPA(arm64vm.MemoryBase), hvMemoryRead|hvMemoryWrite|hvMemoryExec)
@@ -621,7 +746,9 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		vm.Close()
 		return nil, fmt.Errorf("map guest memory: %w", err)
 	}
+	timing.Since(ctx, "hvf.map_anonymous_memory", start)
 	timingLog("hvf.StartContainer MapAnonymousMemory took=%s", time.Since(start))
+	start = time.Now()
 
 	serialOut := newSerialTranscript()
 	var serialWriter io.Writer = serialOut
@@ -638,6 +765,8 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	uart.AttachIRQ(vm, arm64vm.UARTSPI)
 	console := virtio.NewConsole(arm64vm.ConsoleBase, arm64vm.ConsoleSize, arm64vm.ConsoleIRQ, &consoleOut)
 	console.Attach(vm, vm)
+	rng := virtio.NewRNG(arm64vm.RNGBase, arm64vm.RNGSize, arm64vm.RNGIRQ)
+	rng.Attach(vm, vm)
 	vsockBackend := virtio.NewSimpleVsockBackend()
 	listener, err := vsockBackend.Listen(vmruntime.ControlPort)
 	if err != nil {
@@ -652,21 +781,29 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		vm.Close()
 		return nil, err
 	}
+	attachFSDeviceTiming(ctx, fsdevs)
 	for _, fsdev := range fsdevs {
 		fsdev.Attach(vm, vm)
 	}
+	timing.Since(ctx, "hvf.device_setup", start)
 	timingLog("hvf.StartContainer device setup took=%s fsdevs=%d", time.Since(start), len(fsdevs))
+	start = time.Now()
 
 	plan, err := arm64vm.PrepareBoot(mem, req.Kernel, initrd, arm64vm.BootConfig{
 		MemoryMB:   req.MemoryMB,
 		Dmesg:      req.Dmesg,
-		ExtraNodes: arm64vm.AppendFSNodes([]fdt.Node{console.DeviceTreeNode(), vsock.DeviceTreeNode()}, fsdevs),
+		ExtraNodes: arm64vm.AppendFSNodes([]fdt.Node{console.DeviceTreeNode(), rng.DeviceTreeNode(), vsock.DeviceTreeNode()}, fsdevs),
+		RecordTime: func(name string, duration time.Duration) {
+			timing.Record(ctx, "hvf.prepare_boot."+name, duration)
+		},
 	})
 	if err != nil {
 		vm.Close()
 		return nil, fmt.Errorf("prepare boot: %w", err)
 	}
+	timing.Since(ctx, "hvf.prepare_boot", start)
 	timingLog("hvf.StartContainer PrepareBoot took=%s", time.Since(start))
+	start = time.Now()
 
 	if err := vm.SetReg(hvRegPC, plan.EntryGPA); err != nil {
 		vm.Close()
@@ -690,11 +827,14 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			return nil, fmt.Errorf("clear reg %d: %w", reg, err)
 		}
 	}
+	timing.Since(ctx, "hvf.register_setup", start)
 	timingLog("hvf.StartContainer register setup took=%s", time.Since(start))
+	start = time.Now()
 
 	runCtx, cancel := context.WithCancel(context.Background())
 	readyCh := make(chan error, 1)
 	doneCh := make(chan sessionRunResult, 1)
+	closeDone := make(chan struct{})
 	controlTranscript := newSerialTranscript()
 	controlAcceptCh := make(chan readyResult, 1)
 	controlConnCh := make(chan readyResult, 1)
@@ -771,10 +911,21 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	}()
 
 	go func() {
+		defer close(closeDone)
 		defer vm.Close()
 		for {
-			exitInfo, err, stalled := runWithCancel(runCtx, vm, persistentRunSlice(guestReady.Load(), activeExecs.Load() > 0))
+			active := activeExecs.Load() > 0
+			runSlice := persistentRunSlice(guestReady.Load(), active)
+			runStart := time.Now()
+			exitInfo, err, stalled := runWithCancel(runCtx, vm, runSlice)
+			timing.Since(ctx, "hvf.run_loop.run_with_cancel", runStart)
 			if stalled {
+				if active {
+					recordCount(timing.FromContext(ctx), "hvf.run_loop.stalled_active_exec", 1)
+					timing.Record(ctx, "hvf.run_loop.active_exec_stall_slice", runSlice)
+				} else {
+					recordCount(timing.FromContext(ctx), "hvf.run_loop.stalled_idle", 1)
+				}
 				if runCtx.Err() != nil {
 					doneCh <- sessionRunResult{err: runCtx.Err()}
 					return
@@ -808,7 +959,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			}
 			switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 			case ExceptionClassDataAbortLowerEL:
-				if err := handleContainerDataAbort(vm, uart, console, fsdevs, vsock, exitInfo); err != nil {
+				if err := handleContainerDataAbort(ctx, vm, uart, console, rng, fsdevs, vsock, exitInfo); err != nil {
 					doneCh <- sessionRunResult{err: err}
 					return
 				}
@@ -846,10 +997,12 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 
 	select {
 	case err := <-readyCh:
+		timing.Since(ctx, "hvf.wait_guest_ready", start)
 		if err != nil {
 			cancel()
 			_ = listener.Close()
 			res := <-doneCh
+			<-closeDone
 			if res.err != nil {
 				return nil, res.err
 			}
@@ -863,6 +1016,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			cancel()
 			_ = listener.Close()
 			resDone := <-doneCh
+			<-closeDone
 			if resDone.err != nil {
 				return nil, resDone.err
 			}
@@ -884,6 +1038,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		return &ContainerSession{
 			cancel:      cancel,
 			doneCh:      doneCh,
+			closeDone:   closeDone,
 			image:       req.Image,
 			baseEnv:     baseEnv,
 			workDir:     workDir,
@@ -898,6 +1053,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	case res := <-doneCh:
 		cancel()
 		_ = listener.Close()
+		<-closeDone
 		if res.err != nil {
 			return nil, res.err
 		}
@@ -906,6 +1062,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		cancel()
 		_ = listener.Close()
 		res := <-doneCh
+		<-closeDone
 		if res.err != nil {
 			return nil, res.err
 		}
@@ -1015,11 +1172,14 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	uart.AttachIRQ(vm, arm64vm.UARTSPI)
 	console := virtio.NewConsole(arm64vm.ConsoleBase, arm64vm.ConsoleSize, arm64vm.ConsoleIRQ, &consoleOut)
 	console.Attach(vm, vm)
+	rng := virtio.NewRNG(arm64vm.RNGBase, arm64vm.RNGSize, arm64vm.RNGIRQ)
+	rng.Attach(vm, vm)
 	var vsock *virtio.Vsock
 	fsdevs, _, err := arm64vm.BuildFSDevices(req, &fsTrace)
 	if err != nil {
 		return ContainerRunResult{}, err
 	}
+	attachFSDeviceTiming(ctx, fsdevs)
 	for _, fsdev := range fsdevs {
 		fsdev.Attach(vm, vm)
 	}
@@ -1027,7 +1187,10 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	plan, err := arm64vm.PrepareBoot(mem, req.Kernel, initrd, arm64vm.BootConfig{
 		MemoryMB:   req.MemoryMB,
 		Dmesg:      req.Dmesg,
-		ExtraNodes: arm64vm.AppendFSNodes([]fdt.Node{console.DeviceTreeNode()}, fsdevs),
+		ExtraNodes: arm64vm.AppendFSNodes([]fdt.Node{console.DeviceTreeNode(), rng.DeviceTreeNode()}, fsdevs),
+		RecordTime: func(name string, duration time.Duration) {
+			timing.Record(ctx, "hvf.prepare_boot."+name, duration)
+		},
 	})
 	if err != nil {
 		return ContainerRunResult{}, fmt.Errorf("prepare boot: %w", err)
@@ -1111,7 +1274,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 
 		switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 		case ExceptionClassDataAbortLowerEL:
-			if err := handleContainerDataAbort(vm, uart, console, fsdevs, vsock, exitInfo); err != nil {
+			if err := handleContainerDataAbort(ctx, vm, uart, console, rng, fsdevs, vsock, exitInfo); err != nil {
 				return ContainerRunResult{}, err
 			}
 		case ExceptionClassSystemRegister:
@@ -1197,7 +1360,9 @@ type runResultVM struct {
 	err  error
 }
 
-func handleContainerDataAbort(vm *VM, uart *serial.UART8250, console *virtio.Console, fsdevs []*virtio.FS, vsock *virtio.Vsock, exitInfo *VcpuExit) error {
+func handleContainerDataAbort(ctx context.Context, vm *VM, uart *serial.UART8250, console *virtio.Console, rng *virtio.RNG, fsdevs []*virtio.FS, vsock *virtio.Vsock, exitInfo *VcpuExit) error {
+	totalStart := time.Now()
+	defer timing.Since(ctx, "hvf.data_abort.total", totalStart)
 	info, err := DecodeDataAbort(exitInfo.Exception.Syndrome)
 	if err != nil {
 		return err
@@ -1241,10 +1406,30 @@ func handleContainerDataAbort(vm *VM, uart *serial.UART8250, console *virtio.Con
 				return err
 			}
 		}
+	case rng != nil && rng.Contains(addr, info.SizeBytes):
+		if info.Write {
+			value, err := readAbortValue(vm, info)
+			if err != nil {
+				return err
+			}
+			if err := rng.Write(addr, info.SizeBytes, value); err != nil {
+				return err
+			}
+		} else {
+			value, err := rng.Read(addr, info.SizeBytes)
+			if err != nil {
+				return err
+			}
+			if err := writeAbortValue(vm, info, value); err != nil {
+				return err
+			}
+		}
 	case hasFSDevice(fsdevs, addr, info.SizeBytes):
+		start := time.Now()
 		if err := handleFSDataAbort(vm, fsdevs, addr, info); err != nil {
 			return err
 		}
+		timing.Since(ctx, "hvf.data_abort.virtio_fs", start)
 	case vsock != nil && vsock.Contains(addr, info.SizeBytes):
 		if info.Write {
 			value, err := readAbortValue(vm, info)
@@ -1278,6 +1463,17 @@ func handleContainerDataAbort(vm *VM, uart *serial.UART8250, console *virtio.Con
 	}
 
 	return vm.AdvanceProgramCounter()
+}
+
+func attachFSDeviceTiming(ctx context.Context, fsdevs []*virtio.FS) {
+	for _, fsdev := range fsdevs {
+		if fsdev == nil {
+			continue
+		}
+		fsdev.RecordTiming = func(name string, duration time.Duration) {
+			timing.Record(ctx, name, duration)
+		}
+	}
 }
 
 func hasFSDevice(fsdevs []*virtio.FS, addr uint64, size int) bool {

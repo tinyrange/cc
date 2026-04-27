@@ -219,6 +219,33 @@ deploy:
 	}
 }
 
+func TestResolvePrefetchWorkers(t *testing.T) {
+	cpus := runtime.NumCPU()
+	if cpus < 1 {
+		cpus = 1
+	}
+	defaultWorkers := cpus / 2
+	if defaultWorkers < 1 {
+		defaultWorkers = 1
+	}
+	if defaultWorkers > 4 {
+		defaultWorkers = 4
+	}
+
+	if got := resolvePrefetchWorkers(0); got != defaultWorkers {
+		t.Fatalf("resolvePrefetchWorkers(0) = %d, want %d", got, defaultWorkers)
+	}
+	if got := resolvePrefetchWorkers(-1); got != defaultWorkers {
+		t.Fatalf("resolvePrefetchWorkers(-1) = %d, want %d", got, defaultWorkers)
+	}
+	if got := resolvePrefetchWorkers(1); got != 1 {
+		t.Fatalf("resolvePrefetchWorkers(1) = %d, want 1", got)
+	}
+	if got := resolvePrefetchWorkers(cpus + 100); got != cpus {
+		t.Fatalf("resolvePrefetchWorkers(over cpu) = %d, want %d", got, cpus)
+	}
+}
+
 func TestStorePullUsesSharedCacheAcrossStores(t *testing.T) {
 	sharedCache := t.TempDir()
 	if err := os.Setenv(sharedCacheEnv, sharedCache); err != nil {

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import posixpath
@@ -8,8 +10,8 @@ import shlex
 import subprocess
 import sys
 import threading
+import time
 import uuid
-import base64
 from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
@@ -33,6 +35,7 @@ DEFAULT_CVMFS_MIRROR = "https://cvmfs.neurodesk.org"
 DEFAULT_CVMFS_REPO = "neurodesk.ardc.edu.au"
 DEFAULT_CONTAINERS_PATH = "/containers"
 DEFAULT_RELEASES_API = "https://api.github.com/repos/NeuroDesk/neurocontainers/contents/releases"
+DEFAULT_RELEASES_CACHE_TTL_SECONDS = 6 * 60 * 60
 SINGULARITY_ENV_FILES = (
     "10-docker2singularity.sh",
     "90-environment.sh",
@@ -397,7 +400,7 @@ def container(
     repo: str = DEFAULT_CVMFS_REPO,
     cache_dir: Optional[str] = None,
     prefetch: bool = False,
-    prefetch_workers: int = 4,
+    prefetch_workers: Optional[int] = None,
     progress: bool = True,
     debug: bool = False,
 ) -> NeurodeskContainer:
@@ -434,13 +437,23 @@ def container(
         image_state = active_client.get_image(reference.image)
         if image_state is None:
             reporter.update(6, f"Importing {Path(reference.path).name}")
-            active_client.import_image(
-                reference.image,
-                ImportImageRequest(
-                    source=reference.source,
-                    cache_dir=reference.cache_dir,
-                    prefetch=prefetch,
-                    prefetch_workers=prefetch_workers if prefetch else None,
+            import_request = ImportImageRequest(
+                source=reference.source,
+                cache_dir=reference.cache_dir,
+                prefetch=prefetch,
+                prefetch_workers=prefetch_workers if prefetch else None,
+            )
+            import_events = None
+            if hasattr(active_client, "import_image_stream"):
+                import_events = active_client.import_image_stream(reference.image, import_request)
+            _report_image_import(
+                reporter,
+                step=6,
+                image=reference.image,
+                events=import_events,
+                request=lambda: active_client.import_image(
+                    reference.image,
+                    import_request,
                 ),
             )
         else:
@@ -838,26 +851,41 @@ def start_daemon_for_cache_dir(cache_root: Path) -> DaemonState:
         if not hello_line:
             proc.kill()
             proc.wait()
-            raise RuntimeError(f"failed to start ccvm from {ccvm_path}; see {log_path}")
+            raise RuntimeError(
+                f"failed to start ccvm from {ccvm_path}; no startup banner was received. "
+                f"See daemon log at {log_path}"
+            )
 
     try:
         payload = json.loads(hello_line)
     except json.JSONDecodeError as exc:
         proc.kill()
         proc.wait()
-        raise RuntimeError(f"failed to decode ccvm startup banner: {hello_line!r}") from exc
+        raise RuntimeError(
+            f"failed to decode ccvm startup banner from {ccvm_path}: {hello_line!r}. "
+            f"See daemon log at {log_path}"
+        ) from exc
+
+    if payload.get("kind") == "error" or payload.get("error"):
+        proc.kill()
+        proc.wait()
+        detail = str(payload.get("detail") or payload.get("error") or "unknown startup error")
+        raise RuntimeError(f"ccvm failed to start from {ccvm_path}: {detail}. See daemon log at {log_path}")
 
     addr = str(payload.get("addr", "")).strip()
     if not addr:
         proc.kill()
         proc.wait()
-        raise RuntimeError(f"ccvm startup banner did not include an address: {payload!r}")
+        raise RuntimeError(
+            f"ccvm startup banner from {ccvm_path} did not include an address: {payload!r}. "
+            f"See daemon log at {log_path}"
+        )
 
     state = DaemonState(addr=addr, cache_dir=str(cache_root))
     state_path.write_text(json.dumps({"addr": addr}, indent=2))
     if not _health_check(state.base_url):
         state_path.unlink(missing_ok=True)
-        raise RuntimeError(f"started ccvm at {state.base_url}, but health check failed")
+        raise RuntimeError(f"started ccvm at {state.base_url}, but health check failed. See daemon log at {log_path}")
     _ensure_daemon_watchdog(state.base_url)
     return state
 
@@ -1145,6 +1173,46 @@ def _stream_required_download_progress(
         reporter.update(step, f"Prepared required file {index}/{total}: {fallback_label}")
 
 
+def _stream_image_import_progress(
+    reporter: ProgressReporter,
+    *,
+    step: int,
+    image: str,
+    events: object,
+) -> None:
+    last_message: Optional[str] = None
+    for event in events:
+        status = getattr(event, "status", None)
+        if status == "error":
+            error = getattr(event, "error", None) or f"image import failed for {image}"
+            raise RuntimeError(error)
+        message = _format_image_import_progress(image, event)
+        last_message = message
+        reporter.update(step, message)
+    if last_message is None:
+        reporter.update(step, f"Imported {image}")
+
+
+def _report_image_import(
+    reporter: ProgressReporter,
+    *,
+    step: int,
+    image: str,
+    events: Optional[object],
+    request: Callable[[], object],
+) -> None:
+    if events is not None:
+        _stream_image_import_progress(
+            reporter,
+            step=step,
+            image=image,
+            events=events,
+        )
+        return
+    request()
+    reporter.update(step, f"Imported {image}")
+
+
 def _report_required_download(
     reporter: ProgressReporter,
     *,
@@ -1166,6 +1234,36 @@ def _report_required_download(
         )
         return
     reporter.update(step, _describe_required_download(index, total, fallback_label, request()))
+
+
+def _format_image_import_progress(image: str, event: object) -> str:
+    artifact = getattr(event, "artifact", None) or image
+    blob = getattr(event, "blob", None)
+    status = getattr(event, "status", None)
+    downloaded = getattr(event, "bytes_downloaded", None)
+    total_bytes = getattr(event, "bytes_total", None)
+    rate = getattr(event, "rate_bytes_per_second", None)
+    eta = getattr(event, "eta_seconds", None)
+
+    parts = [str(artifact)]
+    if isinstance(blob, str) and blob and blob != artifact:
+        parts.append(blob)
+    if isinstance(downloaded, int) and downloaded >= 0:
+        if isinstance(total_bytes, int) and total_bytes > 0:
+            parts.append(f"{_format_byte_size(downloaded)}/{_format_byte_size(total_bytes)}")
+        else:
+            parts.append(_format_byte_size(downloaded))
+    if isinstance(rate, (int, float)) and rate > 0:
+        parts.append(f"{_format_byte_size(float(rate))}/s")
+    if isinstance(eta, (int, float)) and eta > 0:
+        parts.append(f"ETA {_format_duration(float(eta))}")
+
+    prefix = "Importing"
+    if status in ("downloaded", "available", "restored"):
+        prefix = "Imported"
+    elif status not in ("downloading", "prefetching", "resolving", None):
+        prefix = "Preparing"
+    return f"{prefix} " + " | ".join(parts)
 
 
 def _format_required_download_progress(index: int, total: int, fallback_label: str, event: object) -> str:
@@ -1362,6 +1460,23 @@ def _search_local_release_versions(name: str) -> dict[str, str]:
 
 def _search_remote_release_versions(name: str) -> dict[str, str]:
     api_base = os.environ.get("PYNEURODESK_RELEASES_API", DEFAULT_RELEASES_API).rstrip("/")
+    return search_remote_release_versions(api_base, name)
+
+
+def search_remote_release_versions(api_base: str, name: str) -> dict[str, str]:
+    ttl_seconds = resolve_release_cache_ttl_seconds()
+    if ttl_seconds > 0:
+        cached = read_remote_release_cache(api_base, name, ttl_seconds)
+        if cached is not None:
+            return cached
+
+    versions = fetch_remote_release_versions(api_base, name)
+    if ttl_seconds > 0 and versions:
+        write_remote_release_cache(api_base, name, versions)
+    return versions
+
+
+def fetch_remote_release_versions(api_base: str, name: str) -> dict[str, str]:
     url = f"{api_base}/{name}"
     try:
         with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=20.0, write=20.0, pool=5.0)) as client:
@@ -1390,6 +1505,65 @@ def _search_remote_release_versions(name: str) -> dict[str, str]:
         if build:
             versions[Path(name_value).stem] = build
     return versions
+
+
+def resolve_release_cache_ttl_seconds() -> float:
+    raw = os.environ.get("PYNEURODESK_RELEASES_CACHE_TTL_SECONDS", "").strip()
+    if not raw:
+        return float(DEFAULT_RELEASES_CACHE_TTL_SECONDS)
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return float(DEFAULT_RELEASES_CACHE_TTL_SECONDS)
+
+
+def remote_release_cache_path(api_base: str, name: str) -> Path:
+    key = hashlib.sha256(f"{api_base}\n{name}".encode("utf-8")).hexdigest()
+    return default_cache_root() / "release-search" / f"{key}.json"
+
+
+def read_remote_release_cache(api_base: str, name: str, ttl_seconds: float) -> Optional[dict[str, str]]:
+    path = remote_release_cache_path(api_base, name)
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return None
+    created_at = payload.get("created_at")
+    if not isinstance(created_at, (int, float)):
+        return None
+    if time.time() - float(created_at) > ttl_seconds:
+        return None
+    if payload.get("api_base") != api_base or payload.get("name") != name:
+        return None
+    versions = payload.get("versions")
+    if not isinstance(versions, dict):
+        return None
+    ret: dict[str, str] = {}
+    for version, build in versions.items():
+        if isinstance(version, str) and isinstance(build, str):
+            ret[version] = build
+    return ret
+
+
+def write_remote_release_cache(api_base: str, name: str, versions: dict[str, str]) -> None:
+    path = remote_release_cache_path(api_base, name)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+        tmp.write_text(
+            json.dumps(
+                {
+                    "created_at": time.time(),
+                    "api_base": api_base,
+                    "name": name,
+                    "versions": versions,
+                },
+                sort_keys=True,
+            )
+        )
+        tmp.replace(path)
+    except Exception:
+        return
 
 
 def _extract_remote_release_build(download_url: str) -> Optional[str]:

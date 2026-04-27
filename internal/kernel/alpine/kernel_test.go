@@ -336,6 +336,55 @@ func TestManagerExtractPackageFileCachesExtractedPath(t *testing.T) {
 	}
 }
 
+func TestManagerExtractPackageFileCachesRepoIndexOnDisk(t *testing.T) {
+	indexBytes := buildAPKIndexArchive(t, "qemu-x86_64", "10.1.3-r1", "aarch64")
+	apkBytes := buildKernelPackage(t, map[string][]byte{
+		"usr/bin/qemu-x86_64": []byte("static qemu"),
+	})
+
+	requests := map[string]int{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests[r.URL.Path]++
+		switch r.URL.Path {
+		case "/latest-stable/community/aarch64/APKINDEX.tar.gz":
+			w.Write(indexBytes)
+		case "/latest-stable/community/aarch64/qemu-x86_64-10.1.3-r1.apk":
+			w.Write(apkBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	root := t.TempDir()
+	first := NewManager(root)
+	first.mirror = srv.URL
+	first.arch = "aarch64"
+	first.httpClient = srv.Client()
+	path, err := first.ExtractPackageFile(context.Background(), "community", "qemu-x86_64", "usr/bin/qemu-x86_64")
+	if err != nil {
+		t.Fatalf("first ExtractPackageFile() error = %v", err)
+	}
+
+	second := NewManager(root)
+	second.mirror = srv.URL
+	second.arch = "aarch64"
+	second.httpClient = srv.Client()
+	got, err := second.ExtractPackageFile(context.Background(), "community", "qemu-x86_64", "usr/bin/qemu-x86_64")
+	if err != nil {
+		t.Fatalf("second ExtractPackageFile() error = %v", err)
+	}
+	if got != path {
+		t.Fatalf("second ExtractPackageFile() = %q, want %q", got, path)
+	}
+	if requests["/latest-stable/community/aarch64/APKINDEX.tar.gz"] != 1 {
+		t.Fatalf("APKINDEX requests = %d, want 1", requests["/latest-stable/community/aarch64/APKINDEX.tar.gz"])
+	}
+	if requests["/latest-stable/community/aarch64/qemu-x86_64-10.1.3-r1.apk"] != 1 {
+		t.Fatalf("APK requests = %d, want 1", requests["/latest-stable/community/aarch64/qemu-x86_64-10.1.3-r1.apk"])
+	}
+}
+
 func TestManagerPackagePathMigratesAPKCacheToTar(t *testing.T) {
 	pkgPath := filepath.Join(t.TempDir(), "linux-virt-test.apk")
 	if err := os.WriteFile(pkgPath, buildKernelPackage(t, map[string][]byte{

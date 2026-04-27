@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,11 +28,11 @@ import (
 
 var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
 
-const vmBootTimeout = 30 * time.Second
+const defaultVMBootTimeout = 5 * time.Second
 
 func bootTimeoutFromRequest(seconds float64) time.Duration {
 	if seconds <= 0 {
-		return vmBootTimeout
+		return resolveVMBootTimeout()
 	}
 	return time.Duration(seconds * float64(time.Second))
 }
@@ -41,6 +42,18 @@ func timingLog(format string, args ...any) {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "ccx3 timing: "+format+"\n", args...)
+}
+
+func resolveVMBootTimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("CCX3_VM_BOOT_TIMEOUT"))
+	if raw == "" {
+		return defaultVMBootTimeout
+	}
+	seconds, err := strconv.ParseFloat(raw, 64)
+	if err != nil || seconds <= 0 {
+		return defaultVMBootTimeout
+	}
+	return time.Duration(seconds * float64(time.Second))
 }
 
 type server struct {
@@ -116,22 +129,34 @@ func (w *watchdogController) expire() {
 }
 
 func main() {
+	started, err := run()
+	if err == nil {
+		return
+	}
+	if !started {
+		_ = writeStartupError(os.Stdout, err)
+	}
+	fmt.Fprintf(os.Stderr, "ccvm startup failed: %v\n", err)
+	os.Exit(1)
+}
+
+func run() (bool, error) {
 	if err := macos.EnsureExecutableIsSigned(); err != nil {
-		panic(err)
+		return false, fmt.Errorf("prepare ccvm executable: %w", err)
 	}
 
-	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
 
 	addr := fs.String("addr", "localhost:0", "Address to listen on")
 	cacheDir := fs.String("cache-dir", "", "Cache directory")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
-		os.Exit(1)
+		return false, fmt.Errorf("parse ccvm flags: %w", err)
 	}
 
 	rootCache, err := resolveCacheDir(*cacheDir)
 	if err != nil {
-		panic(err)
+		return false, fmt.Errorf("resolve cache directory %q: %w", *cacheDir, err)
 	}
 
 	srvState := &server{
@@ -143,13 +168,14 @@ func main() {
 
 	l, err := net.Listen("tcp", *addr)
 	if err != nil {
-		panic(err)
+		return false, fmt.Errorf("listen on %q: %w", *addr, err)
 	}
 
 	if err := json.NewEncoder(os.Stdout).Encode(client.ServerHello{
 		Addr: l.Addr().String(),
 	}); err != nil {
-		panic(err)
+		_ = l.Close()
+		return false, fmt.Errorf("write startup banner: %w", err)
 	}
 
 	var httpServer http.Server
@@ -160,8 +186,17 @@ func main() {
 
 	httpServer = http.Server{Handler: mux}
 	if err := httpServer.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		panic(err)
+		return true, fmt.Errorf("serve daemon API: %w", err)
 	}
+	return true, nil
+}
+
+func writeStartupError(w interface{ Write([]byte) (int, error) }, err error) error {
+	return json.NewEncoder(w).Encode(client.ServerHello{
+		Kind:   "error",
+		Error:  "ccvm failed to start",
+		Detail: err.Error(),
+	})
 }
 
 func newServerShutdown(srvState *server, httpServer *http.Server) func() {

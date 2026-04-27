@@ -5,6 +5,7 @@ import (
 	"compress/zlib"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -56,9 +57,44 @@ func TestWantsProgressStream(t *testing.T) {
 	}
 }
 
+func TestResolveVMBootTimeout(t *testing.T) {
+	t.Setenv("CCX3_VM_BOOT_TIMEOUT", "")
+	if got := resolveVMBootTimeout(); got != 5*time.Second {
+		t.Fatalf("resolveVMBootTimeout(default) = %s, want 5s", got)
+	}
+
+	t.Setenv("CCX3_VM_BOOT_TIMEOUT", "1.5")
+	if got := resolveVMBootTimeout(); got != 1500*time.Millisecond {
+		t.Fatalf("resolveVMBootTimeout(env) = %s, want 1.5s", got)
+	}
+
+	t.Setenv("CCX3_VM_BOOT_TIMEOUT", "nope")
+	if got := resolveVMBootTimeout(); got != 5*time.Second {
+		t.Fatalf("resolveVMBootTimeout(invalid) = %s, want 5s", got)
+	}
+}
+
+func TestWriteStartupError(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writeStartupError(&buf, errors.New("listen on localhost: bind failed")); err != nil {
+		t.Fatalf("writeStartupError() error = %v", err)
+	}
+	var hello client.ServerHello
+	if err := json.Unmarshal(buf.Bytes(), &hello); err != nil {
+		t.Fatalf("Unmarshal(startup error) error = %v", err)
+	}
+	if hello.Kind != "error" || hello.Error != "ccvm failed to start" {
+		t.Fatalf("startup error = %#v", hello)
+	}
+	if !strings.Contains(hello.Detail, "bind failed") {
+		t.Fatalf("startup detail = %q", hello.Detail)
+	}
+}
+
 func TestBootTimeoutFromRequest(t *testing.T) {
-	if got := bootTimeoutFromRequest(0); got != vmBootTimeout {
-		t.Fatalf("bootTimeoutFromRequest(0) = %s, want %s", got, vmBootTimeout)
+	t.Setenv("CCX3_VM_BOOT_TIMEOUT", "2.5")
+	if got := bootTimeoutFromRequest(0); got != 2500*time.Millisecond {
+		t.Fatalf("bootTimeoutFromRequest(0) = %s, want 2.5s", got)
 	}
 	if got := bootTimeoutFromRequest(300); got != 5*time.Minute {
 		t.Fatalf("bootTimeoutFromRequest(300) = %s, want 5m", got)
@@ -284,6 +320,14 @@ func TestCVMFSEndpointsSupportCacheDir(t *testing.T) {
 	}
 	if len(listResp.Entries) != 1 || listResp.Entries[0].Path != "/containers/niimath/niimath" {
 		t.Fatalf("list response = %#v", listResp)
+	}
+
+	fullReadBody := `{"mirror":"` + repoServer.URL + `/cvmfs","repo":"test.repo","path":"/containers/niimath/niimath","cache_dir":"` + cacheDir + `"}`
+	fullReadReq := httptest.NewRequest(http.MethodPost, "/cvmfs/read", strings.NewReader(fullReadBody))
+	fullReadRec := httptest.NewRecorder()
+	mux.ServeHTTP(fullReadRec, fullReadReq)
+	if fullReadRec.Code != http.StatusOK {
+		t.Fatalf("full POST /cvmfs/read status = %d, body = %s", fullReadRec.Code, fullReadRec.Body.String())
 	}
 
 	readBody := `{"mirror":"` + repoServer.URL + `/cvmfs","repo":"test.repo","path":"/containers/niimath/niimath","offset":0,"length":6,"cache_dir":"` + cacheDir + `"}`

@@ -3,6 +3,7 @@ package arm64
 import (
 	"bytes"
 	"testing"
+	"time"
 )
 
 func TestPrepareBootPlacesKernelAndDeviceTree(t *testing.T) {
@@ -28,5 +29,37 @@ func TestPrepareBootPlacesKernelAndDeviceTree(t *testing.T) {
 	}
 	if !bytes.Contains(plan.DeviceTree, []byte("serial0\x00")) {
 		t.Fatal("device tree missing serial alias")
+	}
+}
+
+func TestPrepareBootRecordsTimings(t *testing.T) {
+	memBase := uint64(0x80000000)
+	mem := make([]byte, 32<<20)
+	kernel := buildTestImage()
+	records := map[string]time.Duration{}
+
+	_, err := PrepareBoot(mem, kernel, BootOptions{
+		MemoryBase: memBase,
+		MemorySize: uint64(len(mem)),
+		NumCPUs:    1,
+		RecordTime: func(name string, duration time.Duration) {
+			records[name] += duration
+		},
+	})
+	if err != nil {
+		t.Fatalf("PrepareBoot() error = %v", err)
+	}
+
+	for _, name := range []string{
+		"probe_kernel",
+		"extract_kernel",
+		"copy_kernel",
+		"build_device_tree",
+		"copy_device_tree",
+		"entry_point",
+	} {
+		if _, ok := records[name]; !ok {
+			t.Fatalf("PrepareBoot() did not record %q timing; records=%v", name, records)
+		}
 	}
 }

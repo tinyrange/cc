@@ -33,6 +33,7 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 
 	vsock := virtio.NewVsock(arm64vm.VsockBase, arm64vm.VsockSize, arm64vm.VsockIRQ, vmruntime.GuestCID, backend)
 	defer vsock.Close()
+	rng := virtio.NewRNG(arm64vm.RNGBase, arm64vm.RNGSize, arm64vm.RNGIRQ)
 
 	connCh := make(chan virtio.VsockConn, 1)
 	acceptErrCh := make(chan error, 1)
@@ -47,7 +48,7 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 		_, _ = io.Copy(controlTranscript, conn)
 	}()
 
-	nodes := []fdt.Node{vsock.DeviceTreeNode()}
+	nodes := []fdt.Node{vsock.DeviceTreeNode(), rng.DeviceTreeNode()}
 	for _, fsdev := range fsdevs {
 		if fsdev != nil {
 			nodes = append(nodes, fsdev.DeviceTreeNode())
@@ -74,6 +75,7 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 		}
 	}
 	vsock.Attach(vm, vm)
+	rng.Attach(vm, vm)
 
 	plan, err := arm64vm.PrepareBoot(mem, kernel, initrd, arm64vm.BootConfig{
 		MemoryMB:   memoryMB,
@@ -117,7 +119,7 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 	}
 
 	go func() {
-		setRunErr(runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, serialOut))
+		setRunErr(runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, serialOut))
 	}()
 	go func() {
 		text, err := serialOut.WaitFor(runCtx, 0, vmruntime.HasFatalBootText)
@@ -176,7 +178,7 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 	return client.ExecResponse{ExitCode: code, Output: output}, serialOut.String(), nil
 }
 
-func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, serialOut *vmruntime.SerialTranscript) error {
+func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, serialOut *vmruntime.SerialTranscript) error {
 	for step := 0; ; step++ {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -190,7 +192,7 @@ func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs
 		}
 		switch exit.Reason {
 		case ExitMMIO:
-			if err := handleBootMMIO(vm, uart, fsdevs, vsock, exit.MMIO); err != nil {
+			if err := handleBootMMIO(vm, uart, fsdevs, vsock, rng, exit.MMIO); err != nil {
 				return err
 			}
 		case ExitShutdown:

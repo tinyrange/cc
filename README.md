@@ -75,6 +75,13 @@ The daemon also exposes a capability summary at `GET /capabilities`, including
 the active host backend, VM support state, instance concurrency, supported share
 semantics, and roadmap feature slots for networking and snapshots.
 
+VM boot waits default to 5 seconds. Set `CCX3_VM_BOOT_TIMEOUT` to a positive
+number of seconds when running on slower hosts or diagnosing long boots.
+
+Long-running CLI operations use the daemon's streaming endpoints. Human progress
+for `kernel-download`, `pull`, and `vm-start` is written to stderr when stderr is
+a terminal; stdout remains reserved for command output and JSON responses.
+
 Run the small tracked Alpine bringup SIMG:
 
 ```sh

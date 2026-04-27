@@ -135,6 +135,90 @@ func TestRemoteReadDirAndFile(t *testing.T) {
 	}
 }
 
+func TestRemoteReadFileRangeSkipsUnneededChunks(t *testing.T) {
+	t.Parallel()
+
+	server := newTestRepoServer(t)
+	var requested []string
+	httpClient := server.Client()
+	httpClient.Transport = rewriteTransport{
+		base: server.Client().Transport,
+		onRequest: func(path string) {
+			requested = append(requested, path)
+		},
+	}
+	client := &Client{HTTPClient: httpClient}
+
+	data, eof, err := client.ReadFileRange(server.URL+"/cvmfs/test.repo/chunked.txt", 6, 7)
+	if err != nil {
+		t.Fatalf("ReadFileRange(chunked) error = %v", err)
+	}
+	if string(data) != "chunked" || eof {
+		t.Fatalf("ReadFileRange(chunked) = %q eof=%v, want chunked false", string(data), eof)
+	}
+
+	chunk1 := objectPath(strings.Repeat("4", 40), "P")
+	chunk2 := objectPath(strings.Repeat("5", 40), "P")
+	if slices.Contains(requested, chunk1) {
+		t.Fatalf("ReadFileRange requested non-overlapping chunk %s; requests=%v", chunk1, requested)
+	}
+	if !slices.Contains(requested, chunk2) {
+		t.Fatalf("ReadFileRange did not request overlapping chunk %s; requests=%v", chunk2, requested)
+	}
+}
+
+func TestRemoteReadFileRangeSingleObjectDoesNotPopulateFileCache(t *testing.T) {
+	t.Parallel()
+
+	server := newTestRepoServer(t)
+	cacheDir := t.TempDir()
+	client := &Client{HTTPClient: server.Client(), CacheDir: cacheDir}
+	target := server.URL + "/cvmfs/test.repo/containers/niimath/niimath"
+
+	data, eof, err := client.ReadFileRange(target, 0, 7)
+	if err != nil {
+		t.Fatalf("ReadFileRange(single object) error = %v", err)
+	}
+	if string(data) != "niimath" || eof {
+		t.Fatalf("ReadFileRange(single object) = %q eof=%v, want niimath false", string(data), eof)
+	}
+	if _, err := os.Stat(cvmfsFileCachePath(cacheDir, "test.repo", "/containers/niimath/niimath")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ReadFileRange populated full file cache, stat err = %v", err)
+	}
+}
+
+func TestRemoteReadFileRangePopulatesCompressedObjectCache(t *testing.T) {
+	t.Parallel()
+
+	server := newTestRepoServer(t)
+	cacheDir := t.TempDir()
+	client := &Client{HTTPClient: server.Client(), CacheDir: cacheDir}
+	target := server.URL + "/cvmfs/test.repo/containers/niimath/niimath"
+
+	data, eof, err := client.ReadFileRange(target, 0, 7)
+	if err != nil {
+		t.Fatalf("ReadFileRange(single object) error = %v", err)
+	}
+	if string(data) != "niimath" || eof {
+		t.Fatalf("ReadFileRange(single object) = %q eof=%v, want niimath false", string(data), eof)
+	}
+
+	cachePath := CVMFSObjectCachePath(cacheDir, strings.Repeat("3", 40), "")
+	if _, err := os.Stat(cachePath); err != nil {
+		t.Fatalf("Stat(%q) error = %v", cachePath, err)
+	}
+
+	server.Close()
+
+	data, eof, err = client.ReadFileRange(target, 7, 5)
+	if err != nil {
+		t.Fatalf("cached ReadFileRange(single object) error = %v", err)
+	}
+	if string(data) != "-data" || !eof {
+		t.Fatalf("cached ReadFileRange(single object) = %q eof=%v, want -data true", string(data), eof)
+	}
+}
+
 func TestRemoteWalkReturnsSubtreeMetadata(t *testing.T) {
 	t.Parallel()
 
@@ -540,10 +624,33 @@ func TestLocalReadDirAndFile(t *testing.T) {
 	if string(data) != "hello" {
 		t.Fatalf("ReadFile(local) = %q", string(data))
 	}
+	data, eof, err := client.ReadFileRange(filepath.Join(dir, "hello.txt"), 1, 3)
+	if err != nil {
+		t.Fatalf("ReadFileRange(local) error = %v", err)
+	}
+	if string(data) != "ell" || eof {
+		t.Fatalf("ReadFileRange(local) = %q eof=%v, want ell false", string(data), eof)
+	}
 }
 
 type testRepoServer struct {
 	*httptest.Server
+}
+
+type rewriteTransport struct {
+	base      http.RoundTripper
+	onRequest func(string)
+}
+
+func (t rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if t.onRequest != nil {
+		t.onRequest(req.URL.Path)
+	}
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return base.RoundTrip(req)
 }
 
 func newTestRepoServer(t *testing.T) *testRepoServer {

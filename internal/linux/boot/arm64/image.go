@@ -3,10 +3,12 @@ package arm64
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 )
 
 const (
@@ -14,7 +16,22 @@ const (
 	ImageLoadAlignment   = 2 * 1024 * 1024
 	arm64ImageMagic      = 0x644d5241
 	maxGzipScanBytes     = 1 << 20
+	maxCachedImages      = 4
 )
+
+type imageCacheKey struct {
+	offset int64
+	size   int64
+	sum    [sha256.Size]byte
+}
+
+var extractedImageCache = struct {
+	sync.Mutex
+	entries map[imageCacheKey][]byte
+	order   []imageCacheKey
+}{
+	entries: map[imageCacheKey][]byte{},
+}
 
 type KernelHeader struct {
 	Code0      uint32
@@ -80,8 +97,20 @@ func (p ImageProbe) ExtractImage(reader io.ReaderAt, size int64) ([]byte, error)
 		return data, nil
 	}
 
-	section := io.NewSectionReader(reader, p.CompressedOffset, size-p.CompressedOffset)
-	gz, err := gzip.NewReader(section)
+	compressed, err := readCompressedPayload(reader, p.CompressedOffset, size)
+	if err != nil {
+		return nil, err
+	}
+	key := imageCacheKey{
+		offset: p.CompressedOffset,
+		size:   int64(len(compressed)),
+		sum:    sha256.Sum256(compressed),
+	}
+	if data, ok := cachedExtractedImage(key); ok {
+		return data, nil
+	}
+
+	gz, err := gzip.NewReader(bytes.NewReader(compressed))
 	if err != nil {
 		return nil, fmt.Errorf("open gzip reader: %w", err)
 	}
@@ -92,7 +121,50 @@ func (p ImageProbe) ExtractImage(reader io.ReaderAt, size int64) ([]byte, error)
 	if err != nil {
 		return nil, fmt.Errorf("decompress arm64 image: %w", err)
 	}
+	storeExtractedImage(key, data)
 	return data, nil
+}
+
+func readCompressedPayload(reader io.ReaderAt, offset, size int64) ([]byte, error) {
+	if offset < 0 || offset > size {
+		return nil, fmt.Errorf("invalid gzip payload offset %d for kernel size %d", offset, size)
+	}
+	compressedSize := size - offset
+	if compressedSize > int64(int(compressedSize)) {
+		return nil, fmt.Errorf("gzip payload too large: %d bytes", compressedSize)
+	}
+	data := make([]byte, int(compressedSize))
+	n, err := reader.ReadAt(data, offset)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("read gzip payload: %w", err)
+	}
+	if n != len(data) {
+		return nil, fmt.Errorf("read gzip payload: %w", io.ErrUnexpectedEOF)
+	}
+	return data, nil
+}
+
+func cachedExtractedImage(key imageCacheKey) ([]byte, bool) {
+	extractedImageCache.Lock()
+	defer extractedImageCache.Unlock()
+	data, ok := extractedImageCache.entries[key]
+	return data, ok
+}
+
+func storeExtractedImage(key imageCacheKey, data []byte) {
+	extractedImageCache.Lock()
+	defer extractedImageCache.Unlock()
+	if _, ok := extractedImageCache.entries[key]; ok {
+		return
+	}
+	if len(extractedImageCache.order) >= maxCachedImages {
+		evict := extractedImageCache.order[0]
+		copy(extractedImageCache.order, extractedImageCache.order[1:])
+		extractedImageCache.order = extractedImageCache.order[:len(extractedImageCache.order)-1]
+		delete(extractedImageCache.entries, evict)
+	}
+	extractedImageCache.entries[key] = data
+	extractedImageCache.order = append(extractedImageCache.order, key)
 }
 
 func parseKernelHeader(header []byte) (KernelHeader, error) {

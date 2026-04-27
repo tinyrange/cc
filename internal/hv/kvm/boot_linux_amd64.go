@@ -81,11 +81,14 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 	if vsock != nil {
 		vsock.Attach(vm, vm)
 	}
+	rng := virtio.NewRNG(amd64vm.RNGBase, amd64vm.RNGSize, amd64vm.RNGIRQ)
+	rng.Attach(vm, vm)
 
 	extraCmdline := amd64vm.VirtioFSCommandLineArgs(fsdevs)
 	if vsock != nil {
 		extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(vsock.Base, vsock.IRQ))
 	}
+	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(rng.Base, rng.IRQ))
 	plan, err := amd64vm.PrepareBoot(mem, kernel, initrd, amd64vm.BootConfig{
 		MemoryMB:     memoryMB,
 		Dmesg:        dmesg,
@@ -118,7 +121,7 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 				return serialOut.String(), err
 			}
 		case ExitMMIO:
-			if err := handleBootMMIO(vm, fsdevs, vsock, exit.MMIO); err != nil {
+			if err := handleBootMMIO(vm, fsdevs, vsock, rng, exit.MMIO); err != nil {
 				return serialOut.String(), err
 			}
 		case ExitHLT, ExitShutdown:
@@ -183,7 +186,7 @@ func handleUARTIO(uart *serial.UART8250, ioExit IOExit) error {
 	return nil
 }
 
-func handleBootMMIO(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vsock, mmio MMIOExit) error {
+func handleBootMMIO(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, mmio MMIOExit) error {
 	for _, fsdev := range fsdevs {
 		if fsdev == nil || !fsdev.Contains(mmio.Addr, int(mmio.Len)) {
 			continue
@@ -203,6 +206,17 @@ func handleBootMMIO(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vsock, mmio MMIOE
 			return vsock.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio))
 		}
 		value, err := vsock.Read(mmio.Addr, int(mmio.Len))
+		if err != nil {
+			return err
+		}
+		vm.CompleteMMIORead(value, mmio.Len)
+		return nil
+	}
+	if rng != nil && rng.Contains(mmio.Addr, int(mmio.Len)) {
+		if mmio.Write {
+			return rng.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio))
+		}
+		value, err := rng.Read(mmio.Addr, int(mmio.Len))
 		if err != nil {
 			return err
 		}

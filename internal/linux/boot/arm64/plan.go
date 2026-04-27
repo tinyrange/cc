@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"time"
 
 	"j5.nz/cc/internal/fdt"
 )
@@ -55,6 +56,7 @@ type BootOptions struct {
 	Initrd     []byte
 	InitrdGPA  uint64
 	ExtraNodes []fdt.Node
+	RecordTime func(name string, duration time.Duration)
 }
 
 type UARTConfig struct {
@@ -84,6 +86,11 @@ type BootPlan struct {
 }
 
 func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan, error) {
+	record := func(name string, start time.Time) {
+		if opts.RecordTime != nil {
+			opts.RecordTime(name, time.Since(start))
+		}
+	}
 	if len(memory) == 0 {
 		return nil, errors.New("guest memory is empty")
 	}
@@ -108,11 +115,16 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 	}
 
 	reader := bytes.NewReader(kernelFile)
+	start := time.Now()
 	probe, err := ProbeKernelImage(reader, int64(len(kernelFile)))
+	record("probe_kernel", start)
 	if err != nil {
 		return nil, err
 	}
+
+	start = time.Now()
 	image, err := probe.ExtractImage(reader, int64(len(kernelFile)))
+	record("extract_kernel", start)
 	if err != nil {
 		return nil, err
 	}
@@ -127,7 +139,9 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 	if loadOff+uint64(len(image)) > uint64(len(memory)) {
 		return nil, fmt.Errorf("kernel does not fit in guest RAM")
 	}
+	start = time.Now()
 	copy(memory[loadOff:loadOff+uint64(len(image))], image)
+	record("copy_kernel", start)
 
 	initrdAddr := opts.InitrdGPA
 	if len(opts.Initrd) > 0 {
@@ -138,9 +152,12 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 		if initrdAddr < opts.MemoryBase || initrdOff+uint64(len(opts.Initrd)) > uint64(len(memory)) {
 			return nil, fmt.Errorf("initrd does not fit in guest RAM")
 		}
+		start = time.Now()
 		copy(memory[initrdOff:initrdOff+uint64(len(opts.Initrd))], opts.Initrd)
+		record("copy_initrd", start)
 	}
 
+	start = time.Now()
 	dtb, err := buildDeviceTree(deviceTreeConfig{
 		MemoryBase: opts.MemoryBase,
 		MemorySize: opts.MemorySize,
@@ -153,6 +170,7 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 		InitrdSize: uint64(len(opts.Initrd)),
 		ExtraNodes: append([]fdt.Node(nil), opts.ExtraNodes...),
 	})
+	record("build_device_tree", start)
 	if err != nil {
 		return nil, err
 	}
@@ -166,14 +184,18 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 	if dtbOff+uint64(len(dtb)) > uint64(len(memory)) {
 		return nil, fmt.Errorf("device tree does not fit in guest RAM")
 	}
+	start = time.Now()
 	copy(memory[dtbOff:dtbOff+uint64(len(dtb))], dtb)
+	record("copy_device_tree", start)
 
 	stackTop := alignDown(opts.MemoryBase+opts.MemorySize, 16)
 	if stackTop <= dtbAddr+uint64(len(dtb))+stackGuardBytes {
 		return nil, fmt.Errorf("stack overlaps device tree")
 	}
 
+	start = time.Now()
 	entry, err := probe.Header.EntryPoint(base)
+	record("entry_point", start)
 	if err != nil {
 		return nil, err
 	}

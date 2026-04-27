@@ -22,7 +22,9 @@ type Backend interface {
 	StartBlank(context.Context, client.StartInstanceRequest) (Instance, error)
 	StartBlankStream(context.Context, client.StartInstanceRequest, func(client.BootEvent) error) (Instance, error)
 	Run(context.Context, client.RunRequest) (client.ExecResponse, error)
+	RunStream(context.Context, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 	RunInInstance(context.Context, Instance, string, client.RunRequest) (client.ExecResponse, error)
+	RunInInstanceStream(context.Context, Instance, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 }
 
 type Instance interface {
@@ -306,29 +308,24 @@ func (m *Manager) RunStreamIn(ctx context.Context, id string, req client.RunRequ
 	machine := m.running[id]
 	m.mu.Unlock()
 	if machine == nil {
-		return fmt.Errorf("no VM %q is running", id)
+		if req.Image == "" {
+			return fmt.Errorf("image is required")
+		}
+		if err := m.supports(); err != nil {
+			return err
+		}
+		return m.backend.RunStream(ctx, req, inputs, onEvent)
 	}
 	targetImage := strings.TrimSpace(req.Image)
 	if targetImage != "" && targetImage != machine.image {
-		return fmt.Errorf("streaming /vm/run only supports the running image %q, got %q", machine.image, targetImage)
+		return m.backend.RunInInstanceStream(ctx, machine.instance, machine.image, req, inputs, onEvent)
 	}
 	for _, share := range req.Shares {
 		if err := machine.instance.AddShare(ctx, share); err != nil {
 			return err
 		}
 	}
-	return machine.instance.ExecStream(ctx, client.ExecRequest{
-		Command:    append([]string(nil), req.Command...),
-		Env:        append([]string(nil), req.Env...),
-		RootDir:    req.RootDir,
-		ReplaceEnv: req.ReplaceEnv,
-		WorkDir:    req.WorkDir,
-		User:       req.User,
-		Stdin:      append([]byte(nil), req.Stdin...),
-		TTY:        req.TTY,
-		Cols:       req.Cols,
-		Rows:       req.Rows,
-	}, inputs, onEvent)
+	return machine.instance.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
 }
 
 func (m *Manager) StreamIn(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
@@ -459,10 +456,28 @@ func (unsupportedBackend) Run(ctx context.Context, req client.RunRequest) (clien
 	return client.ExecResponse{}, fmt.Errorf("VM backend is not configured")
 }
 
+func (unsupportedBackend) RunStream(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	_ = ctx
+	_ = req
+	_ = inputs
+	_ = onEvent
+	return fmt.Errorf("VM backend is not configured")
+}
+
 func (unsupportedBackend) RunInInstance(ctx context.Context, inst Instance, runningImage string, req client.RunRequest) (client.ExecResponse, error) {
 	_ = ctx
 	_ = inst
 	_ = runningImage
 	_ = req
 	return client.ExecResponse{}, fmt.Errorf("VM backend is not configured")
+}
+
+func (unsupportedBackend) RunInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	_ = ctx
+	_ = inst
+	_ = runningImage
+	_ = req
+	_ = inputs
+	_ = onEvent
+	return fmt.Errorf("VM backend is not configured")
 }

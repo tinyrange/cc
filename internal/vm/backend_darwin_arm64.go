@@ -17,6 +17,7 @@ import (
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/oci"
+	"j5.nz/cc/internal/timing"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
 )
@@ -97,6 +98,21 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 	}, nil
 }
 
+func (b *runtimeBackend) RunStream(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	inst, err := b.StartStream(ctx, client.CreateInstanceRequest{
+		Image:    req.Image,
+		Shares:   append([]client.ShareMount(nil), req.Shares...),
+		MemoryMB: req.MemoryMB,
+		CPUs:     req.CPUs,
+		Dmesg:    req.Dmesg,
+	}, nil)
+	if err != nil {
+		return err
+	}
+	defer inst.Close()
+	return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
+}
+
 func (b *runtimeBackend) RunInInstance(
 	ctx context.Context,
 	inst Instance,
@@ -170,6 +186,70 @@ func (b *runtimeBackend) RunInInstance(
 	})
 }
 
+func (b *runtimeBackend) RunInInstanceStream(
+	ctx context.Context,
+	inst Instance,
+	runningImage string,
+	req client.RunRequest,
+	inputs <-chan client.ExecInput,
+	onEvent func(client.ExecEvent) error,
+) error {
+	targetImage := strings.TrimSpace(req.Image)
+	if targetImage == "" || targetImage == runningImage {
+		if err := addRuntimeShares(ctx, inst, req.Shares); err != nil {
+			return err
+		}
+		return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
+	}
+
+	session, ok := inst.(*hvf.ContainerSession)
+	if !ok {
+		return fmt.Errorf("running instance does not support image mounts")
+	}
+
+	image, err := b.images.Open(targetImage)
+	if err != nil {
+		return err
+	}
+	image = withRuntimeMountDirs(image)
+	mountPath := imageMountPath(targetImage)
+	if err := session.AddImage(ctx, mountPath, image); err != nil {
+		return err
+	}
+	if err := addRuntimeShares(ctx, inst, rebaseRuntimeShares(mountPath, req.Shares)); err != nil {
+		return err
+	}
+
+	env := append([]string(nil), image.Config.Env...)
+	env = mergeRuntimeEnv(env, req.Env)
+	command, err := imagefs.ResolveCommand(image.RootFS, req.Command, env)
+	if err != nil {
+		return err
+	}
+
+	workDir := req.WorkDir
+	if workDir == "" {
+		workDir = image.Config.WorkingDir
+	}
+	if workDir == "" {
+		workDir = "/"
+	}
+
+	return inst.ExecStream(ctx, client.ExecRequest{
+		Command:     command,
+		Env:         env,
+		RootDir:     mountPath,
+		ReplaceEnv:  true,
+		SkipResolve: true,
+		WorkDir:     workDir,
+		User:        req.User,
+		Stdin:       append([]byte(nil), req.Stdin...),
+		TTY:         req.TTY,
+		Cols:        req.Cols,
+		Rows:        req.Rows,
+	}, inputs, onEvent)
+}
+
 func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, memoryMB uint64, cpus int, dmesg bool) (vmruntime.RunRequest, error) {
 	start := time.Now()
 	if b.kernel == nil || b.images == nil {
@@ -180,19 +260,25 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 		return vmruntime.RunRequest{}, err
 	}
 	image = withRuntimeMountDirs(image)
+	timing.Since(ctx, "backend.image_open", start)
 	timingLog("buildBaseRequest image open took=%s image=%q", time.Since(start), imageName)
+	start = time.Now()
 	kernel, err := b.kernel.ReadKernel()
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
+	timing.Since(ctx, "backend.read_kernel", start)
 	timingLog("buildBaseRequest ReadKernel took=%s image=%q", time.Since(start), imageName)
-	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS"}
+	start = time.Now()
+	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO"}
 	moduleMap := map[string]string{
-		"CONFIG_VIRTIO_MMIO":     "kernel/drivers/virtio/virtio_mmio.ko.gz",
-		"CONFIG_FUSE_FS":         "kernel/fs/fuse/fuse.ko.gz",
-		"CONFIG_VIRTIO_FS":       "kernel/fs/fuse/virtiofs.ko.gz",
-		"CONFIG_VSOCKETS":        "kernel/net/vmw_vsock/vsock.ko.gz",
-		"CONFIG_VIRTIO_VSOCKETS": "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
+		"CONFIG_VIRTIO_MMIO":      "kernel/drivers/virtio/virtio_mmio.ko.gz",
+		"CONFIG_FUSE_FS":          "kernel/fs/fuse/fuse.ko.gz",
+		"CONFIG_VIRTIO_FS":        "kernel/fs/fuse/virtiofs.ko.gz",
+		"CONFIG_VSOCKETS":         "kernel/net/vmw_vsock/vsock.ko.gz",
+		"CONFIG_VIRTIO_VSOCKETS":  "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
+		"CONFIG_HW_RANDOM":        "kernel/drivers/char/hw_random/rng-core.ko.gz",
+		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
 	}
 	if NeedsAMD64Emulation(image) {
 		configVars = append(configVars, "CONFIG_BINFMT_MISC")
@@ -202,12 +288,16 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
+	timing.Since(ctx, "backend.plan_module_load", start)
 	timingLog("buildBaseRequest PlanModuleLoad took=%s image=%q modules=%d", time.Since(start), imageName, len(modules))
+	start = time.Now()
 	qemuX8664, err := PrepareAMD64Emulator(ctx, image, b.kernel.ExtractPackageFile)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
+	timing.Since(ctx, "backend.prepare_amd64_emulator", start)
 	timingLog("buildBaseRequest loadAMD64Emulator took=%s image=%q emulator_path=%q", time.Since(start), imageName, qemuX8664)
+	start = time.Now()
 	guestInitCache := b.guestInitCache
 	if guestInitCache == "" {
 		guestInitCache = filepath.Join(b.images.Root(), "_guestinit")
@@ -216,6 +306,7 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
+	timing.Since(ctx, "backend.guestinit_build", start)
 	timingLog("buildBaseRequest guestinit.Build took=%s image=%q init_bytes=%d", time.Since(start), imageName, len(initBin))
 	return vmruntime.RunRequest{
 		Kernel:            kernel,
@@ -251,12 +342,16 @@ func withRuntimeMountDirs(image *oci.Image) *oci.Image {
 }
 
 func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.CreateInstanceRequest) (vmruntime.RunRequest, error) {
+	start := time.Now()
 	runReq, err := b.buildBaseRequest(ctx, req.Image, req.MemoryMB, req.CPUs, req.Dmesg)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
+	shareStart := time.Now()
 	runReq.Shares = append(runReq.Shares, convertShareMounts(req.Shares)...)
+	timing.Since(ctx, "backend.convert_share_mounts", shareStart)
 	runReq.Persistent = true
+	timing.Since(ctx, "backend.build_start_request", start)
 	return runReq, nil
 }
 
@@ -268,13 +363,15 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
-	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS"}
+	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO"}
 	moduleMap := map[string]string{
-		"CONFIG_VIRTIO_MMIO":     "kernel/drivers/virtio/virtio_mmio.ko.gz",
-		"CONFIG_FUSE_FS":         "kernel/fs/fuse/fuse.ko.gz",
-		"CONFIG_VIRTIO_FS":       "kernel/fs/fuse/virtiofs.ko.gz",
-		"CONFIG_VSOCKETS":        "kernel/net/vmw_vsock/vsock.ko.gz",
-		"CONFIG_VIRTIO_VSOCKETS": "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
+		"CONFIG_VIRTIO_MMIO":      "kernel/drivers/virtio/virtio_mmio.ko.gz",
+		"CONFIG_FUSE_FS":          "kernel/fs/fuse/fuse.ko.gz",
+		"CONFIG_VIRTIO_FS":        "kernel/fs/fuse/virtiofs.ko.gz",
+		"CONFIG_VSOCKETS":         "kernel/net/vmw_vsock/vsock.ko.gz",
+		"CONFIG_VIRTIO_VSOCKETS":  "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
+		"CONFIG_HW_RANDOM":        "kernel/drivers/char/hw_random/rng-core.ko.gz",
+		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
 	}
 	modules, err := b.kernel.PlanModuleLoad(configVars, moduleMap)
 	if err != nil {
