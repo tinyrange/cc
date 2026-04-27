@@ -21,7 +21,7 @@ from .api import (
     DEFAULT_CVMFS_REPO,
     start_container_daemon,
 )
-from .client import PyNeurodeskClient
+from .client import PyNeurodeskClient, resolve_boot_timeout_seconds
 from .models import ContainerReference, ImageSource, ImportImageRequest
 from . import shell as shell_hooks
 
@@ -151,7 +151,7 @@ class FullTestRunner:
             )
             print(f"[fulltest] loading image={reference.image} source={reference.path}{memory_text}{cpu_text}", flush=True)
             load_options = replace(options, prefetch=False, prefetch_workers=None)
-            output, exit_code = shell_session.run(load_command(reference, suite, load_options), timeout_for(120, suite.default_timeout))
+            output, exit_code = shell_session.run(load_command(reference, suite, load_options), load_timeout_for(suite.default_timeout))
             if exit_code != 0:
                 raise RuntimeError(f"shell hook load failed with exit code {exit_code}: {output}")
             shell_session.image = reference.image
@@ -493,22 +493,45 @@ def timeout_for(test_timeout: int, default_timeout: int) -> float:
     return 120.0
 
 
+def load_timeout_for(default_timeout: int) -> float:
+    timeout = float(default_timeout) if default_timeout > 0 else 120.0
+    boot_timeout = resolve_boot_timeout_seconds()
+    if boot_timeout is not None:
+        timeout = max(timeout, boot_timeout + 30.0)
+    return timeout
+
+
 def run_shell(
     env: dict[str, str],
     work_dir: Path,
     command: str,
     timeout_seconds: float,
 ) -> tuple[str, int]:
-    proc = subprocess.run(
-        ["bash", "-lc", command],
-        cwd=work_dir,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=timeout_seconds,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            ["bash", "-lc", command],
+            cwd=work_dir,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = timeout_expired_output(exc)
+        output += f"\n[fulltest] command timed out after {timeout_seconds:.1f}s: {command}\n"
+        return output, 124
     return proc.stdout + proc.stderr, proc.returncode
+
+
+def timeout_expired_output(exc: subprocess.TimeoutExpired) -> str:
+    parts = []
+    for stream in (exc.stdout, exc.stderr):
+        if isinstance(stream, bytes):
+            parts.append(stream.decode("utf-8", errors="replace"))
+        elif isinstance(stream, str):
+            parts.append(stream)
+    return "".join(parts)
 
 
 @dataclass

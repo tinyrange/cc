@@ -131,6 +131,13 @@ target_suffix() {
   esac
 }
 
+target_binary_name() {
+  case "$1" in
+    windows/*) echo "ccvm.exe" ;;
+    *) echo "ccvm" ;;
+  esac
+}
+
 build_guestinit_payloads() {
   mkdir -p "${ROOT_DIR}/build"
   CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
@@ -323,6 +330,29 @@ for raw in sys.argv[1:]:
         raise SystemExit(f"unsupported artifact: {path}")
     print(f"verified {path}")
 PY
+
+for target in "${TARGETS[@]}"; do
+  platform_tag="$(target_platform_tag "${target}")"
+  binary_name="$(target_binary_name "${target}")"
+  wheel_path="$(find "${DIST_DIR}" -maxdepth 1 -name "neurodesk-*-py3-none-${platform_tag}.whl" -type f | sort | head -n 1)"
+  if [[ -z "${wheel_path}" ]]; then
+    echo "missing wheel for ${target} (${platform_tag})" >&2
+    exit 1
+  fi
+  python3 - "${wheel_path}" "${binary_name}" <<'PY'
+from pathlib import Path
+from zipfile import ZipFile
+import sys
+
+wheel = Path(sys.argv[1])
+binary = f"pyneurodesk/bin/{sys.argv[2]}"
+with ZipFile(wheel) as zf:
+    names = set(zf.namelist())
+if binary not in names:
+    raise SystemExit(f"{wheel}: expected bundled binary {binary}")
+print(f"verified {wheel.name} contains {binary}")
+PY
+done
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TMP_DIR}"' EXIT

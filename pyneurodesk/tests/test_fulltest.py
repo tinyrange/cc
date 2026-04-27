@@ -13,6 +13,7 @@ from pyneurodesk.fulltest import (
     image_cache_name,
     infer_shell_hook_commands,
     load_command,
+    load_timeout_for,
     load_suite,
     Options,
     substitute_variables,
@@ -161,6 +162,26 @@ def test_timeout_for_prefers_test_timeout_then_default() -> None:
     assert timeout_for(45, 90) == 45.0
     assert timeout_for(0, 90) == 90.0
     assert timeout_for(0, 0) == 120.0
+
+
+def test_load_timeout_respects_configured_boot_timeout(monkeypatch) -> None:
+    monkeypatch.setenv("PYNEURODESK_BOOT_TIMEOUT", "300")
+
+    assert load_timeout_for(0) == 330.0
+
+
+def test_load_timeout_respects_larger_suite_default(monkeypatch) -> None:
+    monkeypatch.setenv("PYNEURODESK_BOOT_TIMEOUT", "300")
+
+    assert load_timeout_for(600) == 600.0
+
+
+def test_run_shell_reports_timeout_without_traceback(tmp_path: Path) -> None:
+    output, exit_code = fulltest.run_shell({}, tmp_path, "sleep 10", 0.01)
+
+    assert exit_code == 124
+    assert "command timed out after 0.0s" in output
+    assert "sleep 10" in output
 
 
 def test_image_cache_name_is_stable() -> None:
