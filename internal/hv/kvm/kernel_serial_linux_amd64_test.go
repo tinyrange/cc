@@ -58,9 +58,6 @@ func TestInitramfsBootReadyMarker(t *testing.T) {
 	}
 	initBin, err := guestinit.BuildForArch(ctx, t.TempDir(), "amd64")
 	if err != nil {
-		if strings.Contains(err.Error(), "is not embedded") {
-			t.Skip(err)
-		}
 		t.Fatalf("guestinit.BuildForArch() error = %v", err)
 	}
 	initrd, err := vmruntime.BuildInitramfs(initBin, nil, vmruntime.GuestInitConfig{
