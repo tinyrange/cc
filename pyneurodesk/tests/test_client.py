@@ -325,7 +325,7 @@ def test_start_instance_posts_vm_start_and_uses_boot_timeout() -> None:
         client.close()
 
     assert seen["path"] == "/vm/start"
-    assert seen["json"] == '{"memory_mb":1024,"cpus":1,"timeout_seconds":30.0}'
+    assert seen["json"] == '{"memory_mb":1024,"cpus":1,"timeout_seconds":5.0}'
     assert seen["timeout"] is not None
     assert seen["timeout"]["read"] == 5.0
     assert result.status == "running"
@@ -441,7 +441,7 @@ def test_create_instance_sends_dmesg_when_requested() -> None:
         client.close()
 
     assert seen["path"] == "/vm"
-    assert seen["json"] == '{"image":"niimath","dmesg":true,"timeout_seconds":30.0}'
+    assert seen["json"] == '{"image":"niimath","dmesg":true,"timeout_seconds":5.0}'
     assert result.status == "running"
 
 
@@ -460,7 +460,7 @@ def test_create_instance_sends_memory_and_cpu_overrides() -> None:
         client.close()
 
     assert seen["path"] == "/vm"
-    assert seen["json"] == '{"image":"niimath","memory_mb":4096,"cpus":2,"timeout_seconds":30.0}'
+    assert seen["json"] == '{"image":"niimath","memory_mb":4096,"cpus":2,"timeout_seconds":5.0}'
     assert result.memory_mb == 4096
     assert result.cpus == 2
 
