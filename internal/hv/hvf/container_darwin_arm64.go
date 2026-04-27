@@ -742,6 +742,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		vm.Close()
 		return nil, err
 	}
+	attachFSDeviceTiming(ctx, fsdevs)
 	for _, fsdev := range fsdevs {
 		fsdev.Attach(vm, vm)
 	}
@@ -1134,6 +1135,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	if err != nil {
 		return ContainerRunResult{}, err
 	}
+	attachFSDeviceTiming(ctx, fsdevs)
 	for _, fsdev := range fsdevs {
 		fsdev.Attach(vm, vm)
 	}
@@ -1396,6 +1398,17 @@ func handleContainerDataAbort(ctx context.Context, vm *VM, uart *serial.UART8250
 	}
 
 	return vm.AdvanceProgramCounter()
+}
+
+func attachFSDeviceTiming(ctx context.Context, fsdevs []*virtio.FS) {
+	for _, fsdev := range fsdevs {
+		if fsdev == nil {
+			continue
+		}
+		fsdev.RecordTiming = func(name string, duration time.Duration) {
+			timing.Record(ctx, name, duration)
+		}
+	}
 }
 
 func hasFSDevice(fsdevs []*virtio.FS, addr uint64, size int) bool {

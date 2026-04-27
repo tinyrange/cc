@@ -136,9 +136,18 @@ func alpineSIMGWhoamiBenchmarkCacheRoot(b *testing.B) string {
 func benchmarkExecWhoami(ctx context.Context, inst Instance) (time.Duration, error) {
 	var output strings.Builder
 	exitCode := 0
+	command := []string{"sh", "-c", "whoami"}
+	expectedOutput := "root"
+	if raw := strings.TrimSpace(os.Getenv("CCX3_BENCH_COMMAND")); raw != "" {
+		command = strings.Fields(raw)
+		if expected, ok := os.LookupEnv("CCX3_BENCH_EXPECT"); ok {
+			expectedOutput = strings.TrimSpace(expected)
+		}
+	}
 	execBegin := time.Now()
 	err := inst.ExecStream(ctx, client.ExecRequest{
-		Command: []string{"sh", "-c", "whoami"},
+		Command:     command,
+		SkipResolve: strings.TrimSpace(os.Getenv("CCX3_BENCH_SKIP_RESOLVE")) != "",
 	}, nil, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stdout", "output":
@@ -159,7 +168,7 @@ func benchmarkExecWhoami(ctx context.Context, inst Instance) (time.Duration, err
 	if exitCode != 0 {
 		return execDuration, &benchmarkWhoamiError{message: "unexpected exit code", exitCode: exitCode, output: output.String()}
 	}
-	if strings.TrimSpace(output.String()) != "root" {
+	if strings.TrimSpace(output.String()) != expectedOutput {
 		return execDuration, &benchmarkWhoamiError{message: "unexpected output", exitCode: exitCode, output: output.String()}
 	}
 	return execDuration, nil

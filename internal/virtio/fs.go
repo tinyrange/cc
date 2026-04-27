@@ -195,11 +195,12 @@ type FuseAttr struct {
 }
 
 type FS struct {
-	Base   uint64
-	Size   uint64
-	IRQ    uint32
-	Log    io.Writer
-	Strict bool
+	Base         uint64
+	Size         uint64
+	IRQ          uint32
+	Log          io.Writer
+	Strict       bool
+	RecordTiming func(name string, duration time.Duration)
 
 	mu               sync.Mutex
 	mem              GuestMemory
@@ -510,6 +511,8 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 	opcode := binary.LittleEndian.Uint32(req[4:8])
 	unique := binary.LittleEndian.Uint64(req[8:16])
 	nodeID := binary.LittleEndian.Uint64(req[16:24])
+	opStart := time.Now()
+	defer f.recordFUSEDispatchTiming(opcode, opStart)
 	f.fuseRequests++
 	f.logf("opcode=%d unique=%d node=%d", opcode, unique, nodeID)
 
@@ -968,6 +971,21 @@ func fuseOpcodeName(opcode uint32) string {
 	default:
 		return "UNKNOWN"
 	}
+}
+
+func fuseOpcodeMetricName(opcode uint32) string {
+	return strings.ToLower(fuseOpcodeName(opcode))
+}
+
+func (f *FS) recordFUSEDispatchTiming(opcode uint32, start time.Time) {
+	if f.RecordTiming == nil {
+		return
+	}
+	tag := strings.TrimRight(string(f.tag[:]), "\x00")
+	if tag == "" {
+		tag = "unknown"
+	}
+	f.RecordTiming("virtio.fs."+tag+".fuse."+fuseOpcodeMetricName(opcode), time.Since(start))
 }
 
 func (f *FS) logf(format string, args ...any) {
