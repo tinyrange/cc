@@ -92,6 +92,13 @@ write through one packed contents file via offset writers.
 
 ## 7. Streaming exec has worse behavior than non-streaming exec
 
+Status: addressed for daemon-managed `/vm/run?stream=1` parity. Streaming run
+now falls back to the same one-shot and cross-image backend paths as
+non-streaming `Run`, while preserving direct live `ExecStream` for the already
+running same-image case. Fallback output is emitted as stream events after the
+backend command completes, so it matches behavior but is not yet fully live for
+those paths.
+
 Non-streaming `Run` can start one-shot workloads when no VM exists, while
 streaming requires an already running VM and rejects other images.
 

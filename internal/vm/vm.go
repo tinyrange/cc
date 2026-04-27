@@ -306,11 +306,25 @@ func (m *Manager) RunStreamIn(ctx context.Context, id string, req client.RunRequ
 	machine := m.running[id]
 	m.mu.Unlock()
 	if machine == nil {
-		return fmt.Errorf("no VM %q is running", id)
+		if req.Image == "" {
+			return fmt.Errorf("image is required")
+		}
+		if err := m.supports(); err != nil {
+			return err
+		}
+		resp, err := m.backend.Run(ctx, req)
+		if err != nil {
+			return err
+		}
+		return emitExecResponse(resp, onEvent)
 	}
 	targetImage := strings.TrimSpace(req.Image)
 	if targetImage != "" && targetImage != machine.image {
-		return fmt.Errorf("streaming /vm/run only supports the running image %q, got %q", machine.image, targetImage)
+		resp, err := m.backend.RunInInstance(ctx, machine.instance, machine.image, req)
+		if err != nil {
+			return err
+		}
+		return emitExecResponse(resp, onEvent)
 	}
 	for _, share := range req.Shares {
 		if err := machine.instance.AddShare(ctx, share); err != nil {
@@ -329,6 +343,23 @@ func (m *Manager) RunStreamIn(ctx context.Context, id string, req client.RunRequ
 		Cols:       req.Cols,
 		Rows:       req.Rows,
 	}, inputs, onEvent)
+}
+
+func emitExecResponse(resp client.ExecResponse, onEvent func(client.ExecEvent) error) error {
+	if onEvent == nil {
+		return nil
+	}
+	if resp.Output != "" {
+		if err := onEvent(client.ExecEvent{
+			Kind:   "stdout",
+			Stream: "stdout",
+			Output: resp.Output,
+			Data:   []byte(resp.Output),
+		}); err != nil {
+			return err
+		}
+	}
+	return onEvent(client.ExecEvent{Kind: "exit", ExitCode: resp.ExitCode})
 }
 
 func (m *Manager) StreamIn(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
