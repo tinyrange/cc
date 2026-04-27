@@ -30,6 +30,13 @@ var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
 
 const defaultVMBootTimeout = 5 * time.Second
 
+func bootTimeoutFromRequest(seconds float64) time.Duration {
+	if seconds <= 0 {
+		return resolveVMBootTimeout()
+	}
+	return time.Duration(seconds * float64(time.Second))
+}
+
 func timingLog(format string, args ...any) {
 	if !debugTiming {
 		return
@@ -506,14 +513,14 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 	})
 	mux.HandleFunc("POST /vm/start", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		bootTimeout := resolveVMBootTimeout()
-		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
-		defer cancel()
 		var req client.StartInstanceRequest
 		if err := decodeOptionalJSON(r, &req); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		bootTimeout := bootTimeoutFromRequest(req.TimeoutSeconds)
+		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
+		defer cancel()
 		timingLog("POST /vm/start decode took=%s", time.Since(start))
 		if srvState.kernel.Status().Status != "downloaded" {
 			if wantsBootEventStream(r) {
@@ -570,14 +577,14 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 	})
 	mux.HandleFunc("POST /vm", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		bootTimeout := resolveVMBootTimeout()
-		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
-		defer cancel()
 		var req client.CreateInstanceRequest
 		if err := decodeRequiredJSON(r, &req); err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
+		bootTimeout := bootTimeoutFromRequest(req.TimeoutSeconds)
+		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
+		defer cancel()
 		timingLog("POST /vm decode took=%s image=%q", time.Since(start), req.Image)
 		if _, err := srvState.images.Get(req.Image); err != nil {
 			if wantsBootEventStream(r) {

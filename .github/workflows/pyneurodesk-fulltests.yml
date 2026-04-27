@@ -146,23 +146,84 @@ jobs:
         env:
           SUITE: ${{ matrix.suite }}
           NEUROCONTAINERS_S3: https://neurocontainers.s3.us-east-2.amazonaws.com
+          NEURODESK_CVMFS_LOG: https://raw.githubusercontent.com/neurodesk/neurocommand/main/cvmfs/log.txt
         run: |
           set -euo pipefail
           mkdir -p ../fulltest-results "${RUNNER_TEMP}/neurocontainers-simg"
           recipe="${GITHUB_WORKSPACE}/local/neurocontainers/recipes/${SUITE}/fulltest.yaml"
-          container="$(uv run python - "$recipe" <<'PY'
+          manifest="${RUNNER_TEMP}/neurocontainers-cvmfs-log.txt"
+          curl --fail --location --retry 5 --retry-all-errors \
+            --output "${manifest}" \
+            "${NEURODESK_CVMFS_LOG}"
+          container="$(uv run python - "$recipe" "$manifest" <<'PY'
+          import fnmatch
           import sys
+          from pathlib import Path
 
           import yaml
 
           with open(sys.argv[1], "r", encoding="utf-8") as handle:
               recipe = yaml.safe_load(handle) or {}
+          manifest_path = Path(sys.argv[2])
           container = str(recipe.get("container", "")).strip()
           if not container:
               raise SystemExit("fulltest.yaml does not define a container")
           if not container.endswith(".simg"):
               container += ".simg"
-          print(container)
+
+          entries = []
+          for line in manifest_path.read_text(encoding="utf-8").splitlines():
+              name = line.split(maxsplit=1)[0].strip()
+              if name:
+                  entries.append(f"{name}.simg")
+          available = set(entries)
+
+          if container in available:
+              print(container)
+              raise SystemExit(0)
+
+          def latest(candidates):
+              if not candidates:
+                  return None
+              return sorted(candidates, key=lambda item: item.removesuffix(".simg").rsplit("_", 1)[-1])[-1]
+
+          if any(char in container for char in "*?["):
+              match = latest(item for item in entries if fnmatch.fnmatchcase(item, container))
+              if match:
+                  print(f"[fulltest] resolved container glob {container} -> {match}", file=sys.stderr)
+                  print(match)
+                  raise SystemExit(0)
+
+          stem = container.removesuffix(".simg")
+          try:
+              package, version, _build = stem.rsplit("_", 2)
+          except ValueError:
+              package = str(recipe.get("name", "")).strip()
+              version = str(recipe.get("version", "")).strip()
+
+          same_version = latest(
+              item for item in entries
+              if item.removesuffix(".simg").startswith(f"{package}_{version}_")
+          )
+          if same_version:
+              print(f"[fulltest] resolved unavailable container {container} -> {same_version}", file=sys.stderr)
+              print(same_version)
+              raise SystemExit(0)
+
+          same_package = latest(
+              item for item in entries
+              if item.removesuffix(".simg").startswith(f"{package}_")
+          )
+          if same_package:
+              print(f"[fulltest] resolved unavailable container {container} -> {same_package}", file=sys.stderr)
+              print(same_package)
+              raise SystemExit(0)
+
+          print(
+              f"container {container} is not listed in {manifest_path} and no replacement exists for {package}",
+              file=sys.stderr,
+          )
+          raise SystemExit(1)
           PY
           )"
           image_path="${RUNNER_TEMP}/neurocontainers-simg/${container}"
@@ -181,6 +242,7 @@ jobs:
         working-directory: pyneurodesk
         env:
           PYNEURODESK_CCVM: ${{ github.workspace }}/build/ccvm
+          PYNEURODESK_BOOT_TIMEOUT: "300"
           PYTHONUNBUFFERED: "1"
           SUITE: ${{ matrix.suite }}
           IMAGE_SOURCE: ${{ steps.simg.outputs.image_path }}

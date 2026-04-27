@@ -218,6 +218,9 @@ class PyNeurodeskClient:
             payload["memory_mb"] = memory_mb
         if cpus is not None:
             payload["cpus"] = cpus
+        timeout_seconds = resolve_boot_timeout_seconds(timeout)
+        if timeout_seconds is not None:
+            payload["timeout_seconds"] = timeout_seconds
         response = self._client.post("/vm", json=payload, timeout=resolve_boot_timeout(timeout))
         payload = self._decode_json(response)
         return VMState.from_payload(payload)
@@ -237,6 +240,9 @@ class PyNeurodeskClient:
             payload["memory_mb"] = memory_mb
         if cpus is not None:
             payload["cpus"] = cpus
+        timeout_seconds = resolve_boot_timeout_seconds(timeout)
+        if timeout_seconds is not None:
+            payload["timeout_seconds"] = timeout_seconds
         response = self._client.post("/vm/start", json=payload, timeout=resolve_boot_timeout(timeout))
         payload = self._decode_json(response)
         return VMState.from_payload(payload)
@@ -256,6 +262,9 @@ class PyNeurodeskClient:
             payload["memory_mb"] = memory_mb
         if cpus is not None:
             payload["cpus"] = cpus
+        timeout_seconds = resolve_boot_timeout_seconds(timeout)
+        if timeout_seconds is not None:
+            payload["timeout_seconds"] = timeout_seconds
         with self._client.stream(
             "POST",
             "/vm/start",
@@ -283,6 +292,9 @@ class PyNeurodeskClient:
         payload: dict[str, Any] = {"image": image}
         if dmesg:
             payload["dmesg"] = True
+        timeout_seconds = resolve_boot_timeout_seconds(timeout)
+        if timeout_seconds is not None:
+            payload["timeout_seconds"] = timeout_seconds
         with self._client.stream(
             "POST",
             "/vm",
@@ -457,3 +469,16 @@ def resolve_boot_timeout(timeout: Optional[Union[float, httpx.Timeout]] = None) 
         return httpx.Timeout(float(raw))
 
     return httpx.Timeout(connect=10.0, read=DEFAULT_BOOT_TIMEOUT_SECONDS, write=DEFAULT_BOOT_TIMEOUT_SECONDS, pool=10.0)
+
+
+def resolve_boot_timeout_seconds(timeout: Optional[Union[float, httpx.Timeout]] = None) -> Optional[float]:
+    if isinstance(timeout, httpx.Timeout):
+        return None
+    if timeout is not None:
+        return float(timeout)
+
+    raw = os.environ.get("PYNEURODESK_BOOT_TIMEOUT", "").strip()
+    if raw:
+        return float(raw)
+
+    return DEFAULT_BOOT_TIMEOUT_SECONDS

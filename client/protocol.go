@@ -266,19 +266,21 @@ type CapabilitiesResponse struct {
 }
 
 type CreateInstanceRequest struct {
-	ID       string       `json:"id,omitempty"`
-	Image    string       `json:"image"`
-	Shares   []ShareMount `json:"shares,omitempty"`
-	MemoryMB uint64       `json:"memory_mb,omitempty"`
-	CPUs     int          `json:"cpus,omitempty"`
-	Dmesg    bool         `json:"dmesg,omitempty"`
+	ID             string       `json:"id,omitempty"`
+	Image          string       `json:"image"`
+	Shares         []ShareMount `json:"shares,omitempty"`
+	MemoryMB       uint64       `json:"memory_mb,omitempty"`
+	CPUs           int          `json:"cpus,omitempty"`
+	Dmesg          bool         `json:"dmesg,omitempty"`
+	TimeoutSeconds float64      `json:"timeout_seconds,omitempty"`
 }
 
 type StartInstanceRequest struct {
-	ID       string `json:"id,omitempty"`
-	MemoryMB uint64 `json:"memory_mb,omitempty"`
-	CPUs     int    `json:"cpus,omitempty"`
-	Dmesg    bool   `json:"dmesg,omitempty"`
+	ID             string  `json:"id,omitempty"`
+	MemoryMB       uint64  `json:"memory_mb,omitempty"`
+	CPUs           int     `json:"cpus,omitempty"`
+	Dmesg          bool    `json:"dmesg,omitempty"`
+	TimeoutSeconds float64 `json:"timeout_seconds,omitempty"`
 }
 
 type InstanceState struct {
