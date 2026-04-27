@@ -29,7 +29,7 @@ By default this script:
   - uploads wheels with uv publish
 
 Supported default targets:
-  linux/amd64, linux/arm64, darwin/arm64
+  linux/amd64, linux/arm64, darwin/arm64, windows/amd64
 
 Options:
   --include-sdist       Also build and upload a source-only sdist.
@@ -103,7 +103,7 @@ if [[ "${BUILD_CCVM}" -eq 1 ]]; then
 fi
 
 if [[ "${#TARGETS[@]}" -eq 0 ]]; then
-  TARGETS=("linux/amd64" "linux/arm64" "darwin/arm64")
+  TARGETS=("linux/amd64" "linux/arm64" "darwin/arm64" "windows/amd64")
 fi
 
 if [[ "${BUILD_CCVM}" -eq 0 && "${#TARGETS[@]}" -ne 1 ]]; then
@@ -116,6 +116,7 @@ target_platform_tag() {
     linux/amd64) echo "manylinux_2_17_x86_64" ;;
     linux/arm64) echo "manylinux_2_17_aarch64" ;;
     darwin/arm64) echo "macosx_11_0_arm64" ;;
+    windows/amd64) echo "win_amd64" ;;
     *)
       echo "unsupported release target: $1" >&2
       exit 1

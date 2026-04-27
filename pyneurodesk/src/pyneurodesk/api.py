@@ -7,6 +7,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import uuid
 import base64
 from collections.abc import Callable
@@ -36,6 +37,10 @@ SINGULARITY_ENV_FILES = (
     "10-docker2singularity.sh",
     "90-environment.sh",
 )
+WATCHDOG_TIMEOUT_SECONDS = 30.0
+WATCHDOG_FEED_INTERVAL_SECONDS = 10.0
+_WATCHDOG_THREADS: dict[str, tuple[threading.Event, threading.Thread]] = {}
+_WATCHDOG_THREADS_LOCK = threading.Lock()
 
 
 class ProgressReporter(Protocol):
@@ -240,6 +245,7 @@ class NeurodeskContainer:
                 except httpx.HTTPError:
                     pass
                 try:
+                    _stop_daemon_watchdog(self._owned_daemon.base_url)
                     with httpx.Client(base_url=self._owned_daemon.base_url, timeout=2.0) as http_client:
                         http_client.post("/shutdown")
                 except httpx.HTTPError:
@@ -796,6 +802,7 @@ def start_default_daemon() -> DaemonState:
         state = DaemonState.from_file(state_path)
         if _health_check(state.base_url):
             if _supports_vm_start(state.base_url):
+                _ensure_daemon_watchdog(state.base_url)
                 return state
             _shutdown_daemon_server(state.base_url)
             state_path.unlink(missing_ok=True)
@@ -851,6 +858,7 @@ def start_daemon_for_cache_dir(cache_root: Path) -> DaemonState:
     if not _health_check(state.base_url):
         state_path.unlink(missing_ok=True)
         raise RuntimeError(f"started ccvm at {state.base_url}, but health check failed")
+    _ensure_daemon_watchdog(state.base_url)
     return state
 
 
@@ -988,7 +996,59 @@ def _supports_vm_start(base_url: str) -> bool:
         return False
 
 
+def _ensure_daemon_watchdog(base_url: str) -> None:
+    base_url = base_url.rstrip("/")
+    with _WATCHDOG_THREADS_LOCK:
+        existing = _WATCHDOG_THREADS.get(base_url)
+        if existing is not None and existing[1].is_alive():
+            return
+
+    try:
+        with httpx.Client(base_url=base_url, timeout=2.0) as client:
+            response = client.post("/watchdog", json={"timeout_seconds": WATCHDOG_TIMEOUT_SECONDS})
+            response.raise_for_status()
+    except httpx.HTTPError:
+        return
+
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=_feed_daemon_watchdog,
+        args=(base_url, stop),
+        name=f"pyneurodesk-watchdog-{base_url}",
+        daemon=True,
+    )
+    with _WATCHDOG_THREADS_LOCK:
+        existing = _WATCHDOG_THREADS.get(base_url)
+        if existing is not None and existing[1].is_alive():
+            stop.set()
+            return
+        _WATCHDOG_THREADS[base_url] = (stop, thread)
+    thread.start()
+
+
+def _feed_daemon_watchdog(base_url: str, stop: threading.Event) -> None:
+    while not stop.wait(WATCHDOG_FEED_INTERVAL_SECONDS):
+        try:
+            with httpx.Client(base_url=base_url, timeout=2.0) as client:
+                response = client.post("/watchdog/feed")
+                response.raise_for_status()
+        except httpx.HTTPError:
+            break
+    with _WATCHDOG_THREADS_LOCK:
+        existing = _WATCHDOG_THREADS.get(base_url)
+        if existing is not None and existing[0] is stop:
+            _WATCHDOG_THREADS.pop(base_url, None)
+
+
+def _stop_daemon_watchdog(base_url: str) -> None:
+    with _WATCHDOG_THREADS_LOCK:
+        existing = _WATCHDOG_THREADS.pop(base_url.rstrip("/"), None)
+    if existing is not None:
+        existing[0].set()
+
+
 def _shutdown_daemon_server(base_url: str) -> None:
+    _stop_daemon_watchdog(base_url)
     try:
         with httpx.Client(base_url=base_url, timeout=2.0) as client:
             client.post("/shutdown")

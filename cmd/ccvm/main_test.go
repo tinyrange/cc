@@ -117,7 +117,7 @@ func TestWriteProgressEvent(t *testing.T) {
 
 func TestCapabilitiesEndpoint(t *testing.T) {
 	srv := &server{vms: vm.NewManager()}
-	mux := newMux(srv, nil)
+	mux := newMux(srv, nil, func() {})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/capabilities", nil)
 
@@ -132,6 +132,44 @@ func TestCapabilitiesEndpoint(t *testing.T) {
 	}
 	if caps.Host == "" || caps.Backend == "" || caps.MaxInstances == 0 || !caps.SupportsMultiImageExec {
 		t.Fatalf("capabilities = %#v", caps)
+	}
+}
+
+func TestWatchdogEndpointsCreateAndFeed(t *testing.T) {
+	expired := make(chan struct{}, 1)
+	watchdog := newWatchdogController(func() { expired <- struct{}{} })
+	defer watchdog.Stop()
+	mux := newMux(&server{}, watchdog, func() {})
+
+	createReq := httptest.NewRequest(http.MethodPost, "/watchdog", strings.NewReader(`{"timeout_seconds":10}`))
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("POST /watchdog status = %d, body = %s", createRec.Code, createRec.Body.String())
+	}
+
+	feedReq := httptest.NewRequest(http.MethodPost, "/watchdog/feed", nil)
+	feedRec := httptest.NewRecorder()
+	mux.ServeHTTP(feedRec, feedReq)
+	if feedRec.Code != http.StatusOK {
+		t.Fatalf("POST /watchdog/feed status = %d, body = %s", feedRec.Code, feedRec.Body.String())
+	}
+}
+
+func TestWatchdogExpiresWithoutFeed(t *testing.T) {
+	expired := make(chan struct{}, 1)
+	watchdog := newWatchdogController(func() { expired <- struct{}{} })
+	defer watchdog.Stop()
+
+	watchdog.Create(20 * time.Millisecond)
+
+	select {
+	case <-expired:
+	case <-time.After(time.Second):
+		t.Fatal("watchdog did not expire")
+	}
+	if watchdog.Feed() {
+		t.Fatal("Feed() after expiry = true, want false")
 	}
 }
 
@@ -222,7 +260,7 @@ func TestPullImageRequestAcceptsStructuredSource(t *testing.T) {
 func TestCVMFSEndpointsSupportCacheDir(t *testing.T) {
 	repoServer := newHTTPTestRepoServer(t)
 	cacheDir := t.TempDir()
-	mux := newMux(&server{}, nil)
+	mux := newMux(&server{}, nil, func() {})
 
 	listBody := `{"mirror":"` + repoServer.URL + `/cvmfs","repo":"test.repo","path":"/containers/niimath","cache_dir":"` + cacheDir + `"}`
 	listReq := httptest.NewRequest(http.MethodPost, "/cvmfs/list", strings.NewReader(listBody))
@@ -278,7 +316,7 @@ func TestCVMFSEndpointsSupportCacheDir(t *testing.T) {
 func TestPostImageImportsDirectoryBackedCVMFSContainer(t *testing.T) {
 	repoServer := newHTTPDirectoryRepoServer(t)
 	srv := &server{images: oci.NewStore(t.TempDir())}
-	mux := newMux(srv, nil)
+	mux := newMux(srv, nil, func() {})
 
 	req := httptest.NewRequest(http.MethodPost, "/image/niimath", strings.NewReader(`{
 		"source": {
@@ -313,7 +351,7 @@ func TestPostImageImportsDirectoryBackedCVMFSContainer(t *testing.T) {
 func TestPostImageStreamsProgressForDirectoryBackedCVMFSContainer(t *testing.T) {
 	repoServer := newHTTPDirectoryRepoServer(t)
 	srv := &server{images: oci.NewStore(t.TempDir())}
-	mux := newMux(srv, nil)
+	mux := newMux(srv, nil, func() {})
 
 	req := httptest.NewRequest(http.MethodPost, "/image/niimath?stream=1", strings.NewReader(`{
 		"source": {

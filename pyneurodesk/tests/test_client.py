@@ -231,6 +231,31 @@ def test_run_command_request_serializes_runtime_shares() -> None:
     assert result.output == "ok"
 
 
+def test_watchdog_client_endpoints() -> None:
+    seen: list[tuple[str, str, Optional[str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.read().decode() or None
+        seen.append((request.method, request.url.path, body))
+        if request.url.path == "/watchdog":
+            return httpx.Response(200, json={"status": "watching", "timeout_seconds": 30})
+        if request.url.path == "/watchdog/feed":
+            return httpx.Response(200, json={"status": "fed"})
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    client = make_client(httpx.MockTransport(handler))
+    try:
+        assert client.create_watchdog(timeout_seconds=30)["status"] == "watching"
+        assert client.feed_watchdog()["status"] == "fed"
+    finally:
+        client.close()
+
+    assert seen == [
+        ("POST", "/watchdog", '{"timeout_seconds":30}'),
+        ("POST", "/watchdog/feed", None),
+    ]
+
+
 def test_create_instance_uses_boot_timeout() -> None:
     seen: dict[str, object] = {}
 
@@ -904,6 +929,7 @@ def test_start_default_daemon_writes_state(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("pyneurodesk.api.default_cache_root", lambda: cache_root)
     monkeypatch.setattr("pyneurodesk.api.resolve_ccvm_binary_path", lambda: ccvm_path)
     monkeypatch.setattr("pyneurodesk.api._health_check", lambda base_url: base_url == "http://127.0.0.1:3456")
+    monkeypatch.setattr("pyneurodesk.api._ensure_daemon_watchdog", lambda base_url: seen.setdefault("watchdog", base_url))
     monkeypatch.setattr("pyneurodesk.api.subprocess.Popen", fake_popen)
 
     state = start_default_daemon()
@@ -912,7 +938,29 @@ def test_start_default_daemon_writes_state(monkeypatch, tmp_path: Path) -> None:
     assert state.cache_dir == str(cache_root)
     assert seen["args"] == [str(ccvm_path), "-cache-dir", str(cache_root)]
     assert seen["kwargs"]["cwd"] == str(Path(__file__).resolve().parents[2])
+    assert seen["watchdog"] == "http://127.0.0.1:3456"
     assert (cache_root / "ccvm.json").read_text() == '{\n  "addr": "127.0.0.1:3456"\n}'
+
+
+def test_start_default_daemon_feeds_watchdog_for_existing_daemon(monkeypatch, tmp_path: Path) -> None:
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir(parents=True)
+    (cache_root / "ccvm.json").write_text('{"addr":"127.0.0.1:3456"}')
+    calls: list[tuple[str, object]] = []
+
+    monkeypatch.setattr("pyneurodesk.api.default_cache_root", lambda: cache_root)
+    monkeypatch.setattr("pyneurodesk.api._health_check", lambda base_url: calls.append(("health", base_url)) or True)
+    monkeypatch.setattr("pyneurodesk.api._supports_vm_start", lambda base_url: calls.append(("supports", base_url)) or True)
+    monkeypatch.setattr("pyneurodesk.api._ensure_daemon_watchdog", lambda base_url: calls.append(("watchdog", base_url)))
+
+    state = start_default_daemon()
+
+    assert state.base_url == "http://127.0.0.1:3456"
+    assert calls == [
+        ("health", "http://127.0.0.1:3456"),
+        ("supports", "http://127.0.0.1:3456"),
+        ("watchdog", "http://127.0.0.1:3456"),
+    ]
 
 
 def test_start_default_daemon_restarts_incompatible_running_daemon(monkeypatch, tmp_path: Path) -> None:
