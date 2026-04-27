@@ -142,7 +142,7 @@ class FullTestRunner:
             cpu_text = f" cpus={options.cpus}" if options.cpus is not None else ""
             print(f"[fulltest] importing image={reference.image} source={reference.path}", flush=True)
             stream_import_image(client, reference, options)
-            print(f"[fulltest] activating shell hooks", flush=True)
+            print("[fulltest] activating shell hooks", flush=True)
             shell_session = activate_shell_session(
                 daemon_base_url=daemon.base_url,
                 work_dir=work_dir,

@@ -14,8 +14,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-import httpx
-
 from .api import connect, container, default_cache_root, load_deploy_metadata, start_default_daemon
 from .models import ContainerReference, ImageSource, ImportImageRequest, ShareMount
 

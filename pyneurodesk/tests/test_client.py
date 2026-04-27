@@ -3,7 +3,6 @@ from __future__ import annotations
 import io
 import base64
 import json
-import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -31,7 +30,6 @@ from pyneurodesk.api import (
     path_join,
     resolve_ccvm_binary_path,
     resolve_release_index_dir,
-    start_container_daemon,
     start_default_daemon,
 )
 from pyneurodesk.models import DaemonState
@@ -1748,6 +1746,91 @@ def test_container_progress_reports_required_downloads(monkeypatch, capsys: pyte
     assert "Downloaded required file 1/2: vmlinuz" in captured.out
     assert "Downloading required file 2/2: emulator" in captured.out
     assert "Downloaded required file 2/2: qemu-system-x86_64" in captured.out
+
+
+def test_container_uses_streaming_image_import(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    daemon = DaemonState(addr="127.0.0.1:4001", cache_dir="/tmp/daemon-a")
+    calls: list[tuple[str, object]] = []
+
+    def fake_start_default_daemon() -> DaemonState:
+        return daemon
+
+    class FakeClient:
+        def __init__(self, base_url: str) -> None:
+            self._client = SimpleNamespace(base_url=base_url)
+
+        def cvmfs_list(self, source: object) -> object:
+            payload = source.to_payload()
+            if payload["path"] == "/containers/niimath":
+                return SimpleNamespace(entries=[])
+            if payload["path"] == "/containers":
+                return SimpleNamespace(
+                    entries=[
+                        SimpleNamespace(
+                            name="niimath_1.0.20250804_20251016",
+                            path="/containers/niimath_1.0.20250804_20251016",
+                            kind="directory",
+                        )
+                    ]
+                )
+            raise AssertionError(payload["path"])
+
+        def get_image(self, image: str) -> Optional[object]:
+            return None
+
+        def import_image_stream(self, image: str, request: object):
+            calls.append(("import_image_stream", image))
+            yield SimpleNamespace(
+                status="downloading",
+                artifact=image,
+                blob="rootfs.index.json",
+                bytes_downloaded=1024,
+                bytes_total=2048,
+                rate_bytes_per_second=512,
+                eta_seconds=2,
+            )
+            yield SimpleNamespace(
+                status="downloaded",
+                artifact=image,
+                blob="rootfs.index.json",
+                bytes_downloaded=2048,
+                bytes_total=2048,
+                rate_bytes_per_second=1024,
+                eta_seconds=0,
+            )
+
+        def import_image(self, image: str, request: object) -> object:
+            raise AssertionError("blocking import_image should not be used when streaming is available")
+
+        def instance_status(self) -> object:
+            return SimpleNamespace(status="stopped", image=None)
+
+        def download_kernel(self) -> object:
+            return SimpleNamespace(status="downloaded", source="/cache/vmlinuz")
+
+        def prepare_image_emulator(self, image: str) -> object:
+            return SimpleNamespace(status="downloaded", path="/tmp/qemu-system-x86_64", required=True)
+
+        def prepare_image_metadata(self, image: str) -> object:
+            return SimpleNamespace(status="prepared", architecture="amd64")
+
+        def create_instance(self, image: str, *, dmesg: bool = False) -> object:
+            return SimpleNamespace(status="running", image=image)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("pyneurodesk.api._supports_notebook_display", lambda: False)
+    monkeypatch.setattr("pyneurodesk.api.start_default_daemon", fake_start_default_daemon)
+    monkeypatch.setattr("pyneurodesk.api.PyNeurodeskClient", FakeClient)
+
+    container = nd.container("niimath")
+    container.close()
+
+    captured = capsys.readouterr()
+    assert calls == [("import_image_stream", "niimath")]
+    assert "Importing niimath | rootfs.index.json | 1.0 KB/2.0 KB" in captured.out
+    assert "Imported niimath | rootfs.index.json | 2.0 KB/2.0 KB" in captured.out
 
 
 def test_container_progress_reports_rate_and_eta_from_stream(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:

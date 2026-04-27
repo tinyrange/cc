@@ -434,13 +434,23 @@ def container(
         image_state = active_client.get_image(reference.image)
         if image_state is None:
             reporter.update(6, f"Importing {Path(reference.path).name}")
-            active_client.import_image(
-                reference.image,
-                ImportImageRequest(
-                    source=reference.source,
-                    cache_dir=reference.cache_dir,
-                    prefetch=prefetch,
-                    prefetch_workers=prefetch_workers if prefetch else None,
+            import_request = ImportImageRequest(
+                source=reference.source,
+                cache_dir=reference.cache_dir,
+                prefetch=prefetch,
+                prefetch_workers=prefetch_workers if prefetch else None,
+            )
+            import_events = None
+            if hasattr(active_client, "import_image_stream"):
+                import_events = active_client.import_image_stream(reference.image, import_request)
+            _report_image_import(
+                reporter,
+                step=6,
+                image=reference.image,
+                events=import_events,
+                request=lambda: active_client.import_image(
+                    reference.image,
+                    import_request,
                 ),
             )
         else:
@@ -1145,6 +1155,46 @@ def _stream_required_download_progress(
         reporter.update(step, f"Prepared required file {index}/{total}: {fallback_label}")
 
 
+def _stream_image_import_progress(
+    reporter: ProgressReporter,
+    *,
+    step: int,
+    image: str,
+    events: object,
+) -> None:
+    last_message: Optional[str] = None
+    for event in events:
+        status = getattr(event, "status", None)
+        if status == "error":
+            error = getattr(event, "error", None) or f"image import failed for {image}"
+            raise RuntimeError(error)
+        message = _format_image_import_progress(image, event)
+        last_message = message
+        reporter.update(step, message)
+    if last_message is None:
+        reporter.update(step, f"Imported {image}")
+
+
+def _report_image_import(
+    reporter: ProgressReporter,
+    *,
+    step: int,
+    image: str,
+    events: Optional[object],
+    request: Callable[[], object],
+) -> None:
+    if events is not None:
+        _stream_image_import_progress(
+            reporter,
+            step=step,
+            image=image,
+            events=events,
+        )
+        return
+    request()
+    reporter.update(step, f"Imported {image}")
+
+
 def _report_required_download(
     reporter: ProgressReporter,
     *,
@@ -1166,6 +1216,36 @@ def _report_required_download(
         )
         return
     reporter.update(step, _describe_required_download(index, total, fallback_label, request()))
+
+
+def _format_image_import_progress(image: str, event: object) -> str:
+    artifact = getattr(event, "artifact", None) or image
+    blob = getattr(event, "blob", None)
+    status = getattr(event, "status", None)
+    downloaded = getattr(event, "bytes_downloaded", None)
+    total_bytes = getattr(event, "bytes_total", None)
+    rate = getattr(event, "rate_bytes_per_second", None)
+    eta = getattr(event, "eta_seconds", None)
+
+    parts = [str(artifact)]
+    if isinstance(blob, str) and blob and blob != artifact:
+        parts.append(blob)
+    if isinstance(downloaded, int) and downloaded >= 0:
+        if isinstance(total_bytes, int) and total_bytes > 0:
+            parts.append(f"{_format_byte_size(downloaded)}/{_format_byte_size(total_bytes)}")
+        else:
+            parts.append(_format_byte_size(downloaded))
+    if isinstance(rate, (int, float)) and rate > 0:
+        parts.append(f"{_format_byte_size(float(rate))}/s")
+    if isinstance(eta, (int, float)) and eta > 0:
+        parts.append(f"ETA {_format_duration(float(eta))}")
+
+    prefix = "Importing"
+    if status in ("downloaded", "available", "restored"):
+        prefix = "Imported"
+    elif status not in ("downloading", "prefetching", "resolving", None):
+        prefix = "Preparing"
+    return f"{prefix} " + " | ".join(parts)
 
 
 def _format_required_download_progress(index: int, total: int, fallback_label: str, event: object) -> str:

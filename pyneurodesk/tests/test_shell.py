@@ -8,7 +8,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 
-import httpx
 import pytest
 
 from pyneurodesk import shell
