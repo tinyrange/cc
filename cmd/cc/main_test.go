@@ -93,3 +93,27 @@ func TestSignalName(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateServerHelloReportsStartupErrorDetail(t *testing.T) {
+	err := validateServerHello(client.ServerHello{
+		Kind:   "error",
+		Error:  "ccvm failed to start",
+		Detail: "listen on localhost: bind failed",
+	}, "/tmp/cc-cache")
+	if err == nil {
+		t.Fatal("validateServerHello() error = nil, want startup error")
+	}
+	message := err.Error()
+	for _, want := range []string{"ccvm daemon failed to start", "/tmp/cc-cache", "bind failed"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("validateServerHello() = %q, missing %q", message, want)
+		}
+	}
+}
+
+func TestValidateServerHelloRequiresAddress(t *testing.T) {
+	err := validateServerHello(client.ServerHello{}, "/tmp/cc-cache")
+	if err == nil || !strings.Contains(err.Error(), "without an address") {
+		t.Fatalf("validateServerHello() error = %v, want missing address", err)
+	}
+}

@@ -975,6 +975,37 @@ def test_start_default_daemon_writes_state(monkeypatch, tmp_path: Path) -> None:
     assert (cache_root / "ccvm.json").read_text() == '{\n  "addr": "127.0.0.1:3456"\n}'
 
 
+def test_start_default_daemon_reports_structured_startup_error(monkeypatch, tmp_path: Path) -> None:
+    cache_root = tmp_path / "cache"
+    ccvm_path = tmp_path / "bin" / "ccvm"
+    ccvm_path.parent.mkdir(parents=True)
+    ccvm_path.write_text("")
+
+    class FakeStdout:
+        def readline(self) -> str:
+            return '{"kind":"error","error":"ccvm failed to start","detail":"listen on bad: bind failed"}\n'
+
+    class FakeProc:
+        stdout = FakeStdout()
+
+        def kill(self) -> None:
+            return None
+
+        def wait(self) -> int:
+            return 1
+
+    monkeypatch.setattr("pyneurodesk.api.resolve_ccvm_binary_path", lambda: ccvm_path)
+    monkeypatch.setattr("pyneurodesk.api.subprocess.Popen", lambda *args, **kwargs: FakeProc())
+
+    with pytest.raises(RuntimeError) as excinfo:
+        api.start_daemon_for_cache_dir(cache_root)
+
+    message = str(excinfo.value)
+    assert f"ccvm failed to start from {ccvm_path}" in message
+    assert "listen on bad: bind failed" in message
+    assert f"See daemon log at {cache_root / 'ccvm-python.log'}" in message
+
+
 def test_start_default_daemon_feeds_watchdog_for_existing_daemon(monkeypatch, tmp_path: Path) -> None:
     cache_root = tmp_path / "cache"
     cache_root.mkdir(parents=True)

@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -470,21 +471,26 @@ func connectBackend(ccvmPath, cacheDir, statePath string) (*client.Client, error
 
 	stdout, err := proc.StdoutPipe()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("prepare ccvm stdout pipe for %s: %w", ccvmPath, err)
 	}
 	if err := proc.Start(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("start ccvm daemon %s with cache %s: %w", ccvmPath, cacheDir, err)
 	}
 
 	var hello client.ServerHello
 	if err := json.NewDecoder(stdout).Decode(&hello); err != nil {
+		_ = proc.Wait()
+		return nil, fmt.Errorf("ccvm daemon did not send a startup banner from %s: %w", ccvmPath, err)
+	}
+	if err := validateServerHello(hello, cacheDir); err != nil {
+		_ = proc.Process.Kill()
 		_ = proc.Wait()
 		return nil, err
 	}
 	if err := writeDaemonState(statePath, daemonState{Addr: hello.Addr}); err != nil {
 		_ = proc.Process.Kill()
 		_ = proc.Wait()
-		return nil, err
+		return nil, fmt.Errorf("write daemon state %s for %s: %w", statePath, hello.Addr, err)
 	}
 
 	api := newClient(hello.Addr)
@@ -492,9 +498,20 @@ func connectBackend(ccvmPath, cacheDir, statePath string) (*client.Client, error
 		_ = os.Remove(statePath)
 		_ = proc.Process.Kill()
 		_ = proc.Wait()
-		return nil, err
+		return nil, fmt.Errorf("ccvm daemon started at %s but health check failed: %w", hello.Addr, err)
 	}
 	return api, nil
+}
+
+func validateServerHello(hello client.ServerHello, cacheDir string) error {
+	if hello.Error != "" || hello.Kind == "error" {
+		detail := firstNonEmpty(hello.Detail, hello.Error, "unknown startup error")
+		return fmt.Errorf("ccvm daemon failed to start using cache %s: %s", cacheDir, detail)
+	}
+	if strings.TrimSpace(hello.Addr) == "" {
+		return fmt.Errorf("ccvm daemon sent a startup banner without an address: %+v", hello)
+	}
+	return nil
 }
 
 func stopDaemon(statePath string) error {

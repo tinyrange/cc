@@ -8,7 +8,10 @@ import (
 )
 
 type ServerHello struct {
-	Addr string `json:"addr"`
+	Addr   string `json:"addr,omitempty"`
+	Kind   string `json:"kind,omitempty"`
+	Error  string `json:"error,omitempty"`
+	Detail string `json:"detail,omitempty"`
 }
 
 type ErrorResponse struct {

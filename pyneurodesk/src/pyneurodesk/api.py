@@ -851,26 +851,41 @@ def start_daemon_for_cache_dir(cache_root: Path) -> DaemonState:
         if not hello_line:
             proc.kill()
             proc.wait()
-            raise RuntimeError(f"failed to start ccvm from {ccvm_path}; see {log_path}")
+            raise RuntimeError(
+                f"failed to start ccvm from {ccvm_path}; no startup banner was received. "
+                f"See daemon log at {log_path}"
+            )
 
     try:
         payload = json.loads(hello_line)
     except json.JSONDecodeError as exc:
         proc.kill()
         proc.wait()
-        raise RuntimeError(f"failed to decode ccvm startup banner: {hello_line!r}") from exc
+        raise RuntimeError(
+            f"failed to decode ccvm startup banner from {ccvm_path}: {hello_line!r}. "
+            f"See daemon log at {log_path}"
+        ) from exc
+
+    if payload.get("kind") == "error" or payload.get("error"):
+        proc.kill()
+        proc.wait()
+        detail = str(payload.get("detail") or payload.get("error") or "unknown startup error")
+        raise RuntimeError(f"ccvm failed to start from {ccvm_path}: {detail}. See daemon log at {log_path}")
 
     addr = str(payload.get("addr", "")).strip()
     if not addr:
         proc.kill()
         proc.wait()
-        raise RuntimeError(f"ccvm startup banner did not include an address: {payload!r}")
+        raise RuntimeError(
+            f"ccvm startup banner from {ccvm_path} did not include an address: {payload!r}. "
+            f"See daemon log at {log_path}"
+        )
 
     state = DaemonState(addr=addr, cache_dir=str(cache_root))
     state_path.write_text(json.dumps({"addr": addr}, indent=2))
     if not _health_check(state.base_url):
         state_path.unlink(missing_ok=True)
-        raise RuntimeError(f"started ccvm at {state.base_url}, but health check failed")
+        raise RuntimeError(f"started ccvm at {state.base_url}, but health check failed. See daemon log at {log_path}")
     _ensure_daemon_watchdog(state.base_url)
     return state
 

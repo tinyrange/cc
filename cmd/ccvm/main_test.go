@@ -5,6 +5,7 @@ import (
 	"compress/zlib"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -70,6 +71,23 @@ func TestResolveVMBootTimeout(t *testing.T) {
 	t.Setenv("CCX3_VM_BOOT_TIMEOUT", "nope")
 	if got := resolveVMBootTimeout(); got != 5*time.Second {
 		t.Fatalf("resolveVMBootTimeout(invalid) = %s, want 5s", got)
+	}
+}
+
+func TestWriteStartupError(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writeStartupError(&buf, errors.New("listen on localhost: bind failed")); err != nil {
+		t.Fatalf("writeStartupError() error = %v", err)
+	}
+	var hello client.ServerHello
+	if err := json.Unmarshal(buf.Bytes(), &hello); err != nil {
+		t.Fatalf("Unmarshal(startup error) error = %v", err)
+	}
+	if hello.Kind != "error" || hello.Error != "ccvm failed to start" {
+		t.Fatalf("startup error = %#v", hello)
+	}
+	if !strings.Contains(hello.Detail, "bind failed") {
+		t.Fatalf("startup detail = %q", hello.Detail)
 	}
 }
 

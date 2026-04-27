@@ -136,6 +136,11 @@ separately with no cache.
 
 ## 10. Daemon startup failures are too raw for users
 
+Status: addressed by replacing `ccvm` startup panics with wrapped startup
+errors, emitting structured startup failure banners, and teaching the Go and
+Python clients to include the original failure detail plus relevant cache/log
+context in user-visible messages.
+
 `ccvm` still panics on setup failures, while the CLI only waits for a startup
 JSON banner.
 
