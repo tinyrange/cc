@@ -109,6 +109,9 @@ streaming requires an already running VM and rejects other images.
 
 ## 8. Python shell streaming drops output fidelity
 
+Status: addressed by routing stream events to stdout or stderr based on their
+stream metadata and by preserving byte payloads from `data` when present.
+
 The shell wrapper only reads `output`, writes all stream events to stdout, and
 ignores binary `data` payloads.
 

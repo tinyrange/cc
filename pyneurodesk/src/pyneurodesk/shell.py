@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import hashlib
 import json
 import os
@@ -324,8 +326,7 @@ def run_image_command(image: str, command_name: str, args: list[str], *, deploy_
             ):
                 kind = str(event.get("kind", ""))
                 if kind in {"stdout", "stderr", "output"}:
-                    sys.stdout.write(str(event.get("output", "")))
-                    sys.stdout.flush()
+                    write_exec_stream_event(event)
                 elif kind == "exit":
                     exit_code = int(event.get("exit_code", 0) or 0)
                 elif kind == "error":
@@ -338,6 +339,45 @@ def run_image_command(image: str, command_name: str, args: list[str], *, deploy_
         sys.stdout.write(result.output)
         sys.stdout.flush()
     return int(result.exit_code)
+
+
+def write_exec_stream_event(event: dict[str, object]) -> None:
+    kind = str(event.get("kind", ""))
+    stream = str(event.get("stream", "")) or kind
+    target = sys.stderr if stream == "stderr" else sys.stdout
+    data = exec_event_data(event)
+    if data is not None:
+        buffer = getattr(target, "buffer", None)
+        if buffer is not None:
+            buffer.write(data)
+            buffer.flush()
+        else:
+            target.write(data.decode(errors="replace"))
+            target.flush()
+        return
+    target.write(str(event.get("output", "")))
+    target.flush()
+
+
+def exec_event_data(event: dict[str, object]) -> Optional[bytes]:
+    data = event.get("data")
+    if data in (None, ""):
+        return None
+    if isinstance(data, bytes):
+        return data
+    if isinstance(data, bytearray):
+        return bytes(data)
+    if isinstance(data, str):
+        try:
+            return base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError):
+            return data.encode()
+    if isinstance(data, list):
+        try:
+            return bytes(int(value) for value in data)
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def shell_session_container(image: str):
