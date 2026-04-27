@@ -22,6 +22,7 @@ import (
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/serial"
+	"j5.nz/cc/internal/timing"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
 )
@@ -380,6 +381,7 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 }
 
 func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	execStart := time.Now()
 	if len(req.Command) == 0 {
 		return fmt.Errorf("exec command is required")
 	}
@@ -392,6 +394,7 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 
 	env := effectiveExecEnv(s.baseEnv, req.Env, req.ReplaceEnv)
 	command := append([]string(nil), req.Command...)
+	start := time.Now()
 	if !req.SkipResolve {
 		var err error
 		command, err = imagefs.ResolveCommand(s.image.RootFS, req.Command, env)
@@ -399,6 +402,7 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 			return err
 		}
 	}
+	timing.Since(ctx, "exec.resolve_command", start)
 	workDir := req.WorkDir
 	if workDir == "" {
 		workDir = s.workDir
@@ -411,6 +415,7 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 	}
 
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
+	start = time.Now()
 	payload, err := json.Marshal(guestExecRequest{
 		Kind:        "exec",
 		ID:          id,
@@ -428,24 +433,33 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 	if err != nil {
 		return fmt.Errorf("marshal exec request: %w", err)
 	}
+	timing.Since(ctx, "exec.marshal_request", start)
 
-	start := s.transcript.Len()
+	transcriptStart := s.transcript.Len()
+	writeStart := time.Now()
 	s.sendMu.Lock()
 	err = s.writeControlPayload(append(payload, '\n'))
 	s.sendMu.Unlock()
 	if err != nil {
 		return err
 	}
+	timing.Since(ctx, "exec.write_control_payload", writeStart)
 
 	if inputs != nil {
 		go s.forwardExecInputs(ctx, id, inputs)
 	} else {
+		stdinStart := time.Now()
 		if err := s.sendStdinClose(id); err != nil {
 			return err
 		}
+		timing.Since(ctx, "exec.send_stdin_close", stdinStart)
 	}
 
-	return s.streamExecEvents(ctx, start, id, onEvent)
+	streamStart := time.Now()
+	err = s.streamExecEvents(ctx, transcriptStart, id, onEvent)
+	timing.Since(ctx, "exec.stream_events", streamStart)
+	timing.Since(ctx, "exec.total", execStart)
+	return err
 }
 
 func (s *ContainerSession) forwardExecInputs(ctx context.Context, id string, inputs <-chan client.ExecInput) {
@@ -611,13 +625,17 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
 	}
+	timing.Since(ctx, "hvf.build_persistent_initramfs", start)
 	timingLog("hvf.StartContainer initramfs.Build took=%s size=%d", time.Since(start), len(initrd))
+	start = time.Now()
 
-	vm, err := NewVM()
+	vm, err := NewVMWithContext(ctx)
 	if err != nil {
 		return nil, err
 	}
+	timing.Since(ctx, "hvf.new_vm", start)
 	timingLog("hvf.StartContainer NewVM took=%s", time.Since(start))
+	start = time.Now()
 
 	memorySize := arm64vm.MemorySizeBytes(req.MemoryMB)
 	mem, err := vm.MapAnonymousMemory(uintptr(memorySize), IPA(arm64vm.MemoryBase), hvMemoryRead|hvMemoryWrite|hvMemoryExec)
@@ -625,7 +643,9 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		vm.Close()
 		return nil, fmt.Errorf("map guest memory: %w", err)
 	}
+	timing.Since(ctx, "hvf.map_anonymous_memory", start)
 	timingLog("hvf.StartContainer MapAnonymousMemory took=%s", time.Since(start))
+	start = time.Now()
 
 	serialOut := newSerialTranscript()
 	var serialWriter io.Writer = serialOut
@@ -659,7 +679,9 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	for _, fsdev := range fsdevs {
 		fsdev.Attach(vm, vm)
 	}
+	timing.Since(ctx, "hvf.device_setup", start)
 	timingLog("hvf.StartContainer device setup took=%s fsdevs=%d", time.Since(start), len(fsdevs))
+	start = time.Now()
 
 	plan, err := arm64vm.PrepareBoot(mem, req.Kernel, initrd, arm64vm.BootConfig{
 		MemoryMB:   req.MemoryMB,
@@ -670,7 +692,9 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		vm.Close()
 		return nil, fmt.Errorf("prepare boot: %w", err)
 	}
+	timing.Since(ctx, "hvf.prepare_boot", start)
 	timingLog("hvf.StartContainer PrepareBoot took=%s", time.Since(start))
+	start = time.Now()
 
 	if err := vm.SetReg(hvRegPC, plan.EntryGPA); err != nil {
 		vm.Close()
@@ -694,7 +718,9 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			return nil, fmt.Errorf("clear reg %d: %w", reg, err)
 		}
 	}
+	timing.Since(ctx, "hvf.register_setup", start)
 	timingLog("hvf.StartContainer register setup took=%s", time.Since(start))
+	start = time.Now()
 
 	runCtx, cancel := context.WithCancel(context.Background())
 	readyCh := make(chan error, 1)
@@ -852,6 +878,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 
 	select {
 	case err := <-readyCh:
+		timing.Since(ctx, "hvf.wait_guest_ready", start)
 		if err != nil {
 			cancel()
 			_ = listener.Close()

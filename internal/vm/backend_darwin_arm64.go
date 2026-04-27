@@ -17,6 +17,7 @@ import (
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/oci"
+	"j5.nz/cc/internal/timing"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
 )
@@ -259,12 +260,16 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 		return vmruntime.RunRequest{}, err
 	}
 	image = withRuntimeMountDirs(image)
+	timing.Since(ctx, "backend.image_open", start)
 	timingLog("buildBaseRequest image open took=%s image=%q", time.Since(start), imageName)
+	start = time.Now()
 	kernel, err := b.kernel.ReadKernel()
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
+	timing.Since(ctx, "backend.read_kernel", start)
 	timingLog("buildBaseRequest ReadKernel took=%s image=%q", time.Since(start), imageName)
+	start = time.Now()
 	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS"}
 	moduleMap := map[string]string{
 		"CONFIG_VIRTIO_MMIO":     "kernel/drivers/virtio/virtio_mmio.ko.gz",
@@ -281,12 +286,16 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
+	timing.Since(ctx, "backend.plan_module_load", start)
 	timingLog("buildBaseRequest PlanModuleLoad took=%s image=%q modules=%d", time.Since(start), imageName, len(modules))
+	start = time.Now()
 	qemuX8664, err := PrepareAMD64Emulator(ctx, image, b.kernel.ExtractPackageFile)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
+	timing.Since(ctx, "backend.prepare_amd64_emulator", start)
 	timingLog("buildBaseRequest loadAMD64Emulator took=%s image=%q emulator_path=%q", time.Since(start), imageName, qemuX8664)
+	start = time.Now()
 	guestInitCache := b.guestInitCache
 	if guestInitCache == "" {
 		guestInitCache = filepath.Join(b.images.Root(), "_guestinit")
@@ -295,6 +304,7 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
+	timing.Since(ctx, "backend.guestinit_build", start)
 	timingLog("buildBaseRequest guestinit.Build took=%s image=%q init_bytes=%d", time.Since(start), imageName, len(initBin))
 	return vmruntime.RunRequest{
 		Kernel:            kernel,
@@ -330,12 +340,16 @@ func withRuntimeMountDirs(image *oci.Image) *oci.Image {
 }
 
 func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.CreateInstanceRequest) (vmruntime.RunRequest, error) {
+	start := time.Now()
 	runReq, err := b.buildBaseRequest(ctx, req.Image, req.MemoryMB, req.CPUs, req.Dmesg)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
+	shareStart := time.Now()
 	runReq.Shares = append(runReq.Shares, convertShareMounts(req.Shares)...)
+	timing.Since(ctx, "backend.convert_share_mounts", shareStart)
 	runReq.Persistent = true
+	timing.Since(ctx, "backend.build_start_request", start)
 	return runReq, nil
 }
 

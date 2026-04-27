@@ -27,7 +27,15 @@ The benchmark reports additional phase metrics:
 - `total_ms/op`: start plus exec plus close plus teardown wait
 
 On Darwin/arm64, the detailed benchmark splits the start phase into backend
-request construction and the HVF boot wait.
+request construction and the HVF boot wait. It also reports `trace_*_ms/op`
+metrics for individual calls recorded by the backend, HVF setup, and exec path,
+for example:
+
+- `trace_backend_guestinit_build_ms/op`
+- `trace_backend_prepare_amd64_emulator_ms/op`
+- `trace_hvf_prepare_boot_ms/op`
+- `trace_hvf_wait_guest_ready_ms/op`
+- `trace_exec_stream_events_ms/op`
 
 Use `CCX3_DEBUG_TIMING=1` with either command to print the existing lower-level
 timing logs for kernel/module planning, initramfs construction, guest ready, and

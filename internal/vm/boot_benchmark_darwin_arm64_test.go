@@ -4,11 +4,13 @@ package vm
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/hv/hvf"
+	"j5.nz/cc/internal/timing"
 )
 
 func BenchmarkAlpineSIMGWhoamiBootDetailedDarwin(b *testing.B) {
@@ -28,6 +30,8 @@ func BenchmarkAlpineSIMGWhoamiBootDetailedDarwin(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		recorder := timing.NewRecorder()
+		ctx = timing.WithRecorder(ctx, recorder)
 		iterStart := time.Now()
 
 		buildBegin := time.Now()
@@ -68,6 +72,7 @@ func BenchmarkAlpineSIMGWhoamiBootDetailedDarwin(b *testing.B) {
 			b.Fatalf("wait for alpine VM close: %v", waitErr)
 		}
 		totals.add(buildDuration, startDuration, execDuration, closeDuration, waitDuration, iterDuration)
+		totals.addTrace(recorder.Snapshots())
 	}
 	totals.report(b)
 }
@@ -79,6 +84,8 @@ type detailedBootBenchmarkTotals struct {
 	close             time.Duration
 	wait              time.Duration
 	total             time.Duration
+	trace             map[string]time.Duration
+	traceCounts       map[string]int
 }
 
 func (t *detailedBootBenchmarkTotals) add(buildStartRequest, hvfStartContainer, exec, close, wait, total time.Duration) {
@@ -88,6 +95,20 @@ func (t *detailedBootBenchmarkTotals) add(buildStartRequest, hvfStartContainer, 
 	t.close += close
 	t.wait += wait
 	t.total += total
+}
+
+func (t *detailedBootBenchmarkTotals) addTrace(snapshots []timing.Snapshot) {
+	if t.trace == nil {
+		t.trace = map[string]time.Duration{}
+		t.traceCounts = map[string]int{}
+	}
+	for _, snapshot := range snapshots {
+		if snapshot.Count == 0 {
+			continue
+		}
+		t.trace[snapshot.Name] += snapshot.Duration
+		t.traceCounts[snapshot.Name] += snapshot.Count
+	}
 }
 
 func (t *detailedBootBenchmarkTotals) report(b *testing.B) {
@@ -101,4 +122,15 @@ func (t *detailedBootBenchmarkTotals) report(b *testing.B) {
 	reportDurationMetric(b, "close_ms/op", time.Duration(float64(t.close)/n))
 	reportDurationMetric(b, "wait_ms/op", time.Duration(float64(t.wait)/n))
 	reportDurationMetric(b, "total_ms/op", time.Duration(float64(t.total)/n))
+	for name, duration := range t.trace {
+		reportDurationMetric(b, "trace_"+benchmarkMetricName(name)+"_ms/op", time.Duration(float64(duration)/n))
+		if count := t.traceCounts[name]; count > b.N {
+			b.ReportMetric(float64(count)/n, "trace_"+benchmarkMetricName(name)+"_calls/op")
+		}
+	}
+}
+
+func benchmarkMetricName(name string) string {
+	replacer := strings.NewReplacer(".", "_", "-", "_", " ", "_", "/", "_")
+	return replacer.Replace(name)
 }
