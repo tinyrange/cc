@@ -412,15 +412,13 @@ func (c *Client) ReadFileRange(target string, offset, length int64) ([]byte, boo
 		return nil, false, err
 	}
 	if !parsed.Remote {
-		data, err := os.ReadFile(parsed.LocalPath)
+		data, eof, err := readLocalFileRange(parsed.LocalPath, offset, length)
 		if err != nil {
 			c.traceDone(id, started, "ReadFileRange", target, "", "", 0, 0, err)
 			return nil, false, err
 		}
-		out := sliceRange(data, offset, length)
-		eof := endOfRange(data, offset, length)
-		c.traceDone(id, started, "ReadFileRange", target, "", "", len(out), 0, nil)
-		return out, eof, nil
+		c.traceDone(id, started, "ReadFileRange", target, "", parsed.LocalPath, len(data), 0, nil)
+		return data, eof, nil
 	}
 	cachePath := cvmfsFileCachePath(c.CacheDir, parsed.Repo, parsed.Path)
 	if file, err := os.Open(cachePath); err == nil {
@@ -450,37 +448,56 @@ func (c *Client) ReadFileRange(target string, offset, length int64) ([]byte, boo
 		c.traceDone(id, started, "ReadFileRange", target, "", cachePath, 0, 0, err)
 		return nil, false, err
 	}
-	data, err := c.ReadFile(target)
+	if offset == 0 && length == 0 {
+		data, err := c.ReadFile(target)
+		if err != nil {
+			c.traceDone(id, started, "ReadFileRange", target, "", "", 0, 0, err)
+			return nil, false, err
+		}
+		c.traceDone(id, started, "ReadFileRange", target, "", "", len(data), 0, nil)
+		return data, true, nil
+	}
+	repo := c.newRepository(parsed)
+	data, eof, err := repo.ReadFileRange(parsed.Path, offset, length)
 	if err != nil {
 		c.traceDone(id, started, "ReadFileRange", target, "", "", 0, 0, err)
 		return nil, false, err
 	}
-	out := sliceRange(data, offset, length)
-	eof := endOfRange(data, offset, length)
-	c.traceDone(id, started, "ReadFileRange", target, "", "", len(out), 0, nil)
-	return out, eof, nil
+	c.traceDone(id, started, "ReadFileRange", target, "", "", len(data), 0, nil)
+	return data, eof, nil
 }
 
-func sliceRange(data []byte, offset, length int64) []byte {
-	if offset >= int64(len(data)) {
-		return []byte{}
+func readLocalFileRange(path string, offset, length int64) ([]byte, bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, false, err
 	}
-	end := int64(len(data))
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+	start, end, eof := byteRange(info.Size(), offset, length)
+	if start == end {
+		return []byte{}, eof, nil
+	}
+	buf := make([]byte, end-start)
+	n, err := file.ReadAt(buf, start)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, false, err
+	}
+	return buf[:n], eof, nil
+}
+
+func byteRange(size, offset, length int64) (int64, int64, bool) {
+	if offset >= size {
+		return size, size, true
+	}
+	end := size
 	if length > 0 && offset+length < end {
 		end = offset + length
 	}
-	return append([]byte(nil), data[offset:end]...)
-}
-
-func endOfRange(data []byte, offset, length int64) bool {
-	if offset >= int64(len(data)) {
-		return true
-	}
-	end := int64(len(data))
-	if length > 0 && offset+length < end {
-		end = offset + length
-	}
-	return end == int64(len(data))
+	return offset, end, end == size
 }
 
 func (c *Client) Walk(target string, visit func(WalkEntry) error) error {
@@ -671,6 +688,24 @@ func (r *repository) ReadFile(filePath string) ([]byte, error) {
 	return r.readEntryData(*found)
 }
 
+func (r *repository) ReadFileRange(filePath string, offset, length int64) ([]byte, bool, error) {
+	filePath = path.Clean("/" + strings.TrimPrefix(filePath, "/"))
+	found, err := r.lookupFileEntry(filePath)
+	if err != nil {
+		return nil, false, err
+	}
+	start, end, eof := byteRange(found.Size, offset, length)
+	if start == end {
+		return []byte{}, eof, nil
+	}
+	var buf bytes.Buffer
+	buf.Grow(int(end - start))
+	if err := r.streamEntryDataRange(*found, start, end-start, &buf); err != nil {
+		return nil, false, err
+	}
+	return buf.Bytes(), eof, nil
+}
+
 func (r *repository) PrefetchFile(filePath string) (uint64, error) {
 	filePath = path.Clean("/" + strings.TrimPrefix(filePath, "/"))
 	found, err := r.lookupFileEntry(filePath)
@@ -780,6 +815,48 @@ func (r *repository) streamEntryData(ent catalogEntry, dst io.Writer, cacheCompr
 	return nil
 }
 
+func (r *repository) streamEntryDataRange(ent catalogEntry, offset, length int64, dst io.Writer) error {
+	if length <= 0 {
+		return nil
+	}
+	if ent.Flags&flagExternalFile == 0 && !ent.isChunked() {
+		return r.streamDataObjectRange(stringifyHash(ent.Hash), false, offset, length, dst)
+	}
+	if len(ent.Chunks) == 0 {
+		return fmt.Errorf("chunk metadata missing for %q", ent.FullPath)
+	}
+	chunks := append([]catalogChunk(nil), ent.Chunks...)
+	sort.Slice(chunks, func(i, j int) bool {
+		if chunks[i].Offset == chunks[j].Offset {
+			return stringifyHash(chunks[i].Hash) < stringifyHash(chunks[j].Hash)
+		}
+		return chunks[i].Offset < chunks[j].Offset
+	})
+	rangeEnd := offset + length
+	for _, chunk := range chunks {
+		chunkStart := chunk.Offset
+		chunkEnd := chunk.Offset + chunk.Size
+		if chunkEnd <= offset || chunkStart >= rangeEnd {
+			continue
+		}
+		overlapStart := maxInt64(offset, chunkStart)
+		overlapEnd := minInt64(rangeEnd, chunkEnd)
+		if overlapEnd <= overlapStart {
+			continue
+		}
+		if err := r.streamDataObjectRange(
+			stringifyHash(chunk.Hash),
+			true,
+			overlapStart-chunkStart,
+			overlapEnd-overlapStart,
+			dst,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (r *repository) streamDataObject(hash string, partial bool, dst io.Writer, cacheCompressed bool) error {
 	suffix := ""
 	if partial {
@@ -845,6 +922,84 @@ func (r *repository) streamDataObject(hash string, partial bool, dst io.Writer, 
 	}
 	r.client.traceDone(id, started, "HTTPObject", "", url, cachePath, int(counting.n), resp.StatusCode, err)
 	return err
+}
+
+func (r *repository) streamDataObjectRange(hash string, partial bool, offset, length int64, dst io.Writer) error {
+	suffix := ""
+	if partial {
+		suffix = "P"
+	}
+	if raw, err := r.readCachedObject(hash, suffix); err == nil {
+		zr, err := zlib.NewReader(bytes.NewReader(raw))
+		if err != nil {
+			return err
+		}
+		defer zr.Close()
+		return copyCompressedRange(zr, offset, length, dst)
+	} else if !errors.Is(err, os.ErrNotExist) && !(r.client == nil || strings.TrimSpace(r.client.CacheDir) == "") {
+		return err
+	}
+
+	url := r.objectURL(hash, suffix)
+	id, started := r.client.traceStart("HTTPObjectRange", "", url, "")
+	resp, err := r.client.HTTPClient.Get(url)
+	if err != nil {
+		r.client.traceDone(id, started, "HTTPObjectRange", "", url, "", 0, 0, err)
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		err := fmt.Errorf("fetch object: unexpected status %s", resp.Status)
+		r.client.traceDone(id, started, "HTTPObjectRange", "", url, "", 0, resp.StatusCode, err)
+		return err
+	}
+
+	zr, err := zlib.NewReader(resp.Body)
+	if err != nil {
+		r.client.traceDone(id, started, "HTTPObjectRange", "", url, "", 0, resp.StatusCode, err)
+		return err
+	}
+	counting := &countingWriter{w: dst}
+	err = copyCompressedRange(zr, offset, length, counting)
+	closeErr := zr.Close()
+	if err == nil {
+		err = closeErr
+	}
+	r.client.traceDone(id, started, "HTTPObjectRange", "", url, "", int(counting.n), resp.StatusCode, err)
+	return err
+}
+
+func copyCompressedRange(src io.Reader, offset, length int64, dst io.Writer) error {
+	if offset > 0 {
+		if _, err := io.CopyN(io.Discard, src, offset); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+	}
+	if length <= 0 {
+		return nil
+	}
+	_, err := io.CopyN(dst, src, length)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
+}
+
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func (r *repository) lookupFileEntry(filePath string) (*catalogEntry, error) {

@@ -59,6 +59,11 @@ OCI pulls and CVMFS reads are built on clients without bounded request timeouts.
 
 ## 5. CVMFS range reads can download whole files
 
+Status: addressed for local files, cached remote files, uncached remote single
+objects, and uncached remote chunked files. Small range reads now avoid full-file
+allocation; chunked reads fetch only overlapping chunks. Explicit whole-file
+reads still populate the cache.
+
 Local range reads load the full file, and uncached remote range reads fall back
 to `ReadFile()`.
 

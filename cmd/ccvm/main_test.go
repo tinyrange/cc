@@ -294,6 +294,14 @@ func TestCVMFSEndpointsSupportCacheDir(t *testing.T) {
 		t.Fatalf("list response = %#v", listResp)
 	}
 
+	fullReadBody := `{"mirror":"` + repoServer.URL + `/cvmfs","repo":"test.repo","path":"/containers/niimath/niimath","cache_dir":"` + cacheDir + `"}`
+	fullReadReq := httptest.NewRequest(http.MethodPost, "/cvmfs/read", strings.NewReader(fullReadBody))
+	fullReadRec := httptest.NewRecorder()
+	mux.ServeHTTP(fullReadRec, fullReadReq)
+	if fullReadRec.Code != http.StatusOK {
+		t.Fatalf("full POST /cvmfs/read status = %d, body = %s", fullReadRec.Code, fullReadRec.Body.String())
+	}
+
 	readBody := `{"mirror":"` + repoServer.URL + `/cvmfs","repo":"test.repo","path":"/containers/niimath/niimath","offset":0,"length":6,"cache_dir":"` + cacheDir + `"}`
 	readReq := httptest.NewRequest(http.MethodPost, "/cvmfs/read", strings.NewReader(readBody))
 	readRec := httptest.NewRecorder()
