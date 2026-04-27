@@ -270,13 +270,15 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	timing.Since(ctx, "backend.read_kernel", start)
 	timingLog("buildBaseRequest ReadKernel took=%s image=%q", time.Since(start), imageName)
 	start = time.Now()
-	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS"}
+	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO"}
 	moduleMap := map[string]string{
-		"CONFIG_VIRTIO_MMIO":     "kernel/drivers/virtio/virtio_mmio.ko.gz",
-		"CONFIG_FUSE_FS":         "kernel/fs/fuse/fuse.ko.gz",
-		"CONFIG_VIRTIO_FS":       "kernel/fs/fuse/virtiofs.ko.gz",
-		"CONFIG_VSOCKETS":        "kernel/net/vmw_vsock/vsock.ko.gz",
-		"CONFIG_VIRTIO_VSOCKETS": "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
+		"CONFIG_VIRTIO_MMIO":      "kernel/drivers/virtio/virtio_mmio.ko.gz",
+		"CONFIG_FUSE_FS":          "kernel/fs/fuse/fuse.ko.gz",
+		"CONFIG_VIRTIO_FS":        "kernel/fs/fuse/virtiofs.ko.gz",
+		"CONFIG_VSOCKETS":         "kernel/net/vmw_vsock/vsock.ko.gz",
+		"CONFIG_VIRTIO_VSOCKETS":  "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
+		"CONFIG_HW_RANDOM":        "kernel/drivers/char/hw_random/rng-core.ko.gz",
+		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
 	}
 	if NeedsAMD64Emulation(image) {
 		configVars = append(configVars, "CONFIG_BINFMT_MISC")
@@ -361,13 +363,15 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
-	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS"}
+	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO"}
 	moduleMap := map[string]string{
-		"CONFIG_VIRTIO_MMIO":     "kernel/drivers/virtio/virtio_mmio.ko.gz",
-		"CONFIG_FUSE_FS":         "kernel/fs/fuse/fuse.ko.gz",
-		"CONFIG_VIRTIO_FS":       "kernel/fs/fuse/virtiofs.ko.gz",
-		"CONFIG_VSOCKETS":        "kernel/net/vmw_vsock/vsock.ko.gz",
-		"CONFIG_VIRTIO_VSOCKETS": "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
+		"CONFIG_VIRTIO_MMIO":      "kernel/drivers/virtio/virtio_mmio.ko.gz",
+		"CONFIG_FUSE_FS":          "kernel/fs/fuse/fuse.ko.gz",
+		"CONFIG_VIRTIO_FS":        "kernel/fs/fuse/virtiofs.ko.gz",
+		"CONFIG_VSOCKETS":         "kernel/net/vmw_vsock/vsock.ko.gz",
+		"CONFIG_VIRTIO_VSOCKETS":  "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
+		"CONFIG_HW_RANDOM":        "kernel/drivers/char/hw_random/rng-core.ko.gz",
+		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
 	}
 	modules, err := b.kernel.PlanModuleLoad(configVars, moduleMap)
 	if err != nil {

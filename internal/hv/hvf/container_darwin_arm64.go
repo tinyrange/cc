@@ -728,6 +728,8 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	uart.AttachIRQ(vm, arm64vm.UARTSPI)
 	console := virtio.NewConsole(arm64vm.ConsoleBase, arm64vm.ConsoleSize, arm64vm.ConsoleIRQ, &consoleOut)
 	console.Attach(vm, vm)
+	rng := virtio.NewRNG(arm64vm.RNGBase, arm64vm.RNGSize, arm64vm.RNGIRQ)
+	rng.Attach(vm, vm)
 	vsockBackend := virtio.NewSimpleVsockBackend()
 	listener, err := vsockBackend.Listen(vmruntime.ControlPort)
 	if err != nil {
@@ -753,7 +755,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	plan, err := arm64vm.PrepareBoot(mem, req.Kernel, initrd, arm64vm.BootConfig{
 		MemoryMB:   req.MemoryMB,
 		Dmesg:      req.Dmesg,
-		ExtraNodes: arm64vm.AppendFSNodes([]fdt.Node{console.DeviceTreeNode(), vsock.DeviceTreeNode()}, fsdevs),
+		ExtraNodes: arm64vm.AppendFSNodes([]fdt.Node{console.DeviceTreeNode(), rng.DeviceTreeNode(), vsock.DeviceTreeNode()}, fsdevs),
 	})
 	if err != nil {
 		vm.Close()
@@ -917,7 +919,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			}
 			switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 			case ExceptionClassDataAbortLowerEL:
-				if err := handleContainerDataAbort(ctx, vm, uart, console, fsdevs, vsock, exitInfo); err != nil {
+				if err := handleContainerDataAbort(ctx, vm, uart, console, rng, fsdevs, vsock, exitInfo); err != nil {
 					doneCh <- sessionRunResult{err: err}
 					return
 				}
@@ -1130,6 +1132,8 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	uart.AttachIRQ(vm, arm64vm.UARTSPI)
 	console := virtio.NewConsole(arm64vm.ConsoleBase, arm64vm.ConsoleSize, arm64vm.ConsoleIRQ, &consoleOut)
 	console.Attach(vm, vm)
+	rng := virtio.NewRNG(arm64vm.RNGBase, arm64vm.RNGSize, arm64vm.RNGIRQ)
+	rng.Attach(vm, vm)
 	var vsock *virtio.Vsock
 	fsdevs, _, err := arm64vm.BuildFSDevices(req, &fsTrace)
 	if err != nil {
@@ -1143,7 +1147,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	plan, err := arm64vm.PrepareBoot(mem, req.Kernel, initrd, arm64vm.BootConfig{
 		MemoryMB:   req.MemoryMB,
 		Dmesg:      req.Dmesg,
-		ExtraNodes: arm64vm.AppendFSNodes([]fdt.Node{console.DeviceTreeNode()}, fsdevs),
+		ExtraNodes: arm64vm.AppendFSNodes([]fdt.Node{console.DeviceTreeNode(), rng.DeviceTreeNode()}, fsdevs),
 	})
 	if err != nil {
 		return ContainerRunResult{}, fmt.Errorf("prepare boot: %w", err)
@@ -1227,7 +1231,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 
 		switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 		case ExceptionClassDataAbortLowerEL:
-			if err := handleContainerDataAbort(ctx, vm, uart, console, fsdevs, vsock, exitInfo); err != nil {
+			if err := handleContainerDataAbort(ctx, vm, uart, console, rng, fsdevs, vsock, exitInfo); err != nil {
 				return ContainerRunResult{}, err
 			}
 		case ExceptionClassSystemRegister:
@@ -1313,7 +1317,7 @@ type runResultVM struct {
 	err  error
 }
 
-func handleContainerDataAbort(ctx context.Context, vm *VM, uart *serial.UART8250, console *virtio.Console, fsdevs []*virtio.FS, vsock *virtio.Vsock, exitInfo *VcpuExit) error {
+func handleContainerDataAbort(ctx context.Context, vm *VM, uart *serial.UART8250, console *virtio.Console, rng *virtio.RNG, fsdevs []*virtio.FS, vsock *virtio.Vsock, exitInfo *VcpuExit) error {
 	totalStart := time.Now()
 	defer timing.Since(ctx, "hvf.data_abort.total", totalStart)
 	info, err := DecodeDataAbort(exitInfo.Exception.Syndrome)
@@ -1352,6 +1356,24 @@ func handleContainerDataAbort(ctx context.Context, vm *VM, uart *serial.UART8250
 			}
 		} else {
 			value, err := console.Read(addr, info.SizeBytes)
+			if err != nil {
+				return err
+			}
+			if err := writeAbortValue(vm, info, value); err != nil {
+				return err
+			}
+		}
+	case rng != nil && rng.Contains(addr, info.SizeBytes):
+		if info.Write {
+			value, err := readAbortValue(vm, info)
+			if err != nil {
+				return err
+			}
+			if err := rng.Write(addr, info.SizeBytes, value); err != nil {
+				return err
+			}
+		} else {
+			value, err := rng.Read(addr, info.SizeBytes)
 			if err != nil {
 				return err
 			}
