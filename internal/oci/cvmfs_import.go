@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -135,9 +136,7 @@ func prefetchCVMFSFiles(ctx context.Context, client *intcvmfs.Client, nodes []in
 		offset    uint64
 	}
 
-	if workers <= 0 {
-		workers = 4
-	}
+	workers = resolvePrefetchWorkers(workers)
 	packedNodes := append([]indexedNode(nil), nodes...)
 	targets := make([]prefetchTarget, 0, len(nodes))
 	var totalBytes uint64
@@ -283,6 +282,27 @@ sendLoop:
 		})
 		return packedNodes, nil
 	}
+}
+
+func resolvePrefetchWorkers(requested int) int {
+	cpus := runtime.NumCPU()
+	if cpus < 1 {
+		cpus = 1
+	}
+	if requested > 0 {
+		if requested > cpus {
+			return cpus
+		}
+		return requested
+	}
+	defaultWorkers := cpus / 2
+	if defaultWorkers < 1 {
+		defaultWorkers = 1
+	}
+	if defaultWorkers > 4 {
+		defaultWorkers = 4
+	}
+	return defaultWorkers
 }
 
 func reportPrefetchProgress(report func(cclient.ProgressEvent), imageName string, startedAt time.Time, totalBytes, completedBytes uint64) {

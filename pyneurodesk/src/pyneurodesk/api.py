@@ -397,7 +397,7 @@ def container(
     repo: str = DEFAULT_CVMFS_REPO,
     cache_dir: Optional[str] = None,
     prefetch: bool = False,
-    prefetch_workers: int = 4,
+    prefetch_workers: Optional[int] = None,
     progress: bool = True,
     debug: bool = False,
 ) -> NeurodeskContainer:

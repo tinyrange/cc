@@ -75,6 +75,11 @@ to `ReadFile()`.
 
 ## 6. CVMFS prefetch can overload disk or network
 
+Status: addressed by resolving prefetch workers on the Go side. The default is
+half the host CPU count, capped at 4, with a floor of 1. Explicit
+`prefetch_workers` values are clamped to the host CPU count. Python now leaves
+the worker count unset by default so the daemon can apply the host-aware policy.
+
 Prefetch worker count defaults to 4 but is otherwise uncapped, and all workers
 write through one packed contents file via offset writers.
 
