@@ -48,6 +48,7 @@ func BuildPersistentInitramfs(req RunRequest, baseEnv []string, workDir string) 
 		OutputMarkerPref: CommandOutputMarker,
 		ErrorMarkerPref:  CommandErrorMarker,
 		ExitMarkerPrefix: CommandExitMarkerPref,
+		PrecopyAMD64Root: strings.TrimSpace(os.Getenv("CCX3_BENCH_PRECOPY_AMD64_ROOT")) != "",
 	})
 }
 
