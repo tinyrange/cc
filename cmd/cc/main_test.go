@@ -2,10 +2,51 @@ package main
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	"j5.nz/cc/client"
 )
+
+func TestFormatProgressEvent(t *testing.T) {
+	event := client.ProgressEvent{
+		Status:             "downloading",
+		Artifact:           "alpine",
+		Blob:               "rootfs.simg",
+		BytesDownloaded:    1024,
+		BytesTotal:         2048,
+		RateBytesPerSecond: 512,
+		ETASeconds:         2,
+	}
+	got := formatProgressEvent(event, "fallback")
+	for _, want := range []string{"Downloading alpine", "rootfs.simg", "1.0 KB/2.0 KB", "512 B/s", "ETA 2s"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatProgressEvent() = %q, missing %q", got, want)
+		}
+	}
+}
+
+func TestFormatProgressEventError(t *testing.T) {
+	got := formatProgressEvent(client.ProgressEvent{
+		Status: "error",
+		Error:  "boom",
+	}, "alpine")
+	if !strings.Contains(got, "Error alpine") || !strings.Contains(got, "boom") {
+		t.Fatalf("formatProgressEvent(error) = %q", got)
+	}
+}
+
+func TestFormatBootEvent(t *testing.T) {
+	if got := formatBootEvent(client.BootEvent{Kind: "status", Message: "starting VM"}); got != "Boot: starting VM" {
+		t.Fatalf("formatBootEvent(status) = %q", got)
+	}
+	if got := formatBootEvent(client.BootEvent{Kind: "ready", State: client.InstanceState{Image: "alpine"}}); got != "Boot: ready alpine" {
+		t.Fatalf("formatBootEvent(ready) = %q", got)
+	}
+	if got := formatBootEvent(client.BootEvent{Kind: "error", Error: "timeout"}); got != "Boot error: timeout" {
+		t.Fatalf("formatBootEvent(error) = %q", got)
+	}
+}
 
 func TestStreamHostStdinReadsPipedInput(t *testing.T) {
 	r, w, err := os.Pipe()

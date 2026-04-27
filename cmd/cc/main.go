@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"j5.nz/cc/client"
 )
@@ -68,7 +69,7 @@ func run() error {
 		}
 		return printJSON(state)
 	case "kernel-download":
-		return api.DownloadKernel(client.DownloadRequest{})
+		return api.DownloadKernelStream(client.DownloadRequest{}, progressEventReporter(os.Stderr, "kernel"))
 	case "image-list":
 		images, err := api.ListImages()
 		if err != nil {
@@ -88,7 +89,7 @@ func run() error {
 		if len(args) != 3 {
 			return fmt.Errorf("usage: cc pull <name> <source>")
 		}
-		return api.PullImage(args[1], client.PullImageRequest{Source: args[2]})
+		return api.PullImageStream(args[1], client.PullImageRequest{Source: args[2]}, progressEventReporter(os.Stderr, args[1]))
 	case "vm-supported":
 		supported, err := api.VMSupported()
 		if err != nil {
@@ -105,9 +106,9 @@ func run() error {
 		if len(args) != 2 {
 			return fmt.Errorf("usage: cc vm-start <image>")
 		}
-		state, err := api.CreateInstance(client.CreateInstanceRequest{
+		state, err := api.CreateInstanceStream(client.CreateInstanceRequest{
 			Image: args[1],
-		})
+		}, bootEventReporter(os.Stderr))
 		if err != nil {
 			return err
 		}
@@ -209,6 +210,144 @@ func runViaWebsocket(api *client.Client, image string, command []string) error {
 		return fmt.Errorf("guest command exited with status %d", exitCode)
 	}
 	return nil
+}
+
+func progressEventReporter(stream *os.File, fallbackArtifact string) func(client.ProgressEvent) error {
+	if stream == nil || !isTerminal(stream) {
+		return nil
+	}
+	return func(event client.ProgressEvent) error {
+		message := formatProgressEvent(event, fallbackArtifact)
+		if message == "" {
+			return nil
+		}
+		_, _ = fmt.Fprintln(stream, message)
+		return nil
+	}
+}
+
+func bootEventReporter(stream *os.File) func(client.BootEvent) error {
+	if stream == nil || !isTerminal(stream) {
+		return nil
+	}
+	return func(event client.BootEvent) error {
+		message := formatBootEvent(event)
+		if message == "" {
+			return nil
+		}
+		_, _ = fmt.Fprintln(stream, message)
+		return nil
+	}
+}
+
+func formatProgressEvent(event client.ProgressEvent, fallbackArtifact string) string {
+	artifact := firstNonEmpty(event.Artifact, fallbackArtifact)
+	var parts []string
+	if artifact != "" {
+		parts = append(parts, artifact)
+	}
+	if event.Blob != "" && event.Blob != artifact {
+		parts = append(parts, event.Blob)
+	}
+	if event.BytesDownloaded > 0 || event.BytesTotal > 0 {
+		if event.BytesTotal > 0 {
+			parts = append(parts, fmt.Sprintf("%s/%s", formatByteSize(event.BytesDownloaded), formatByteSize(event.BytesTotal)))
+		} else {
+			parts = append(parts, formatByteSize(event.BytesDownloaded))
+		}
+	}
+	if event.RateBytesPerSecond > 0 {
+		parts = append(parts, formatByteSize(int64(event.RateBytesPerSecond))+"/s")
+	}
+	if event.ETASeconds > 0 {
+		parts = append(parts, "ETA "+formatDurationSeconds(event.ETASeconds))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+
+	prefix := "Preparing"
+	switch event.Status {
+	case "downloading", "prefetching":
+		prefix = "Downloading"
+	case "downloaded", "available", "restored":
+		prefix = "Ready"
+	case "resolving":
+		prefix = "Resolving"
+	case "error":
+		prefix = "Error"
+		if event.Error != "" {
+			parts = append(parts, event.Error)
+		}
+	}
+	return prefix + " " + joinProgressParts(parts)
+}
+
+func formatBootEvent(event client.BootEvent) string {
+	switch event.Kind {
+	case "status":
+		if event.Message != "" {
+			return "Boot: " + event.Message
+		}
+	case "ready":
+		if event.State.Image != "" {
+			return "Boot: ready " + event.State.Image
+		}
+		return "Boot: ready"
+	case "error":
+		if event.Error != "" {
+			return "Boot error: " + event.Error
+		}
+		return "Boot error"
+	case "serial":
+		if event.Data != "" {
+			return event.Data
+		}
+	}
+	return ""
+}
+
+func joinProgressParts(parts []string) string {
+	ret := ""
+	for i, part := range parts {
+		if i > 0 {
+			ret += " | "
+		}
+		ret += part
+	}
+	return ret
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func formatByteSize(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	value := float64(bytes)
+	for _, suffix := range []string{"KB", "MB", "GB", "TB", "PB"} {
+		value /= unit
+		if value < unit {
+			return fmt.Sprintf("%.1f %s", value, suffix)
+		}
+	}
+	return fmt.Sprintf("%.1f EB", value/unit)
+}
+
+func formatDurationSeconds(seconds float64) string {
+	if seconds <= 0 {
+		return "0s"
+	}
+	duration := time.Duration(seconds * float64(time.Second)).Round(time.Second)
+	return duration.String()
 }
 
 func streamHostStdin(file *os.File, out chan<- client.ExecInput) error {

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -91,5 +92,95 @@ func TestClientExecStream(t *testing.T) {
 	}
 	if got[0].Kind != "stdout" || string(got[0].Data) != "he" || got[1].Kind != "stderr" || string(got[1].Data) != "llo" || got[2].Kind != "exit" {
 		t.Fatalf("events = %#v", got)
+	}
+}
+
+func TestClientDownloadKernelStream(t *testing.T) {
+	var gotRequest bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRequest = true
+		if r.URL.Path != "/kernel/download" || r.URL.Query().Get("stream") != "1" {
+			t.Fatalf("request URL = %s, want /kernel/download?stream=1", r.URL.String())
+		}
+		if got := r.Header.Get("Accept"); got != "application/x-ndjson" {
+			t.Fatalf("Accept = %q, want application/x-ndjson", got)
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_ = json.NewEncoder(w).Encode(ProgressEvent{Status: "downloading", Artifact: "kernel", BytesDownloaded: 1, BytesTotal: 2})
+		_ = json.NewEncoder(w).Encode(ProgressEvent{Status: "downloaded", Artifact: "kernel", BytesDownloaded: 2, BytesTotal: 2})
+	}))
+	defer ts.Close()
+
+	c := NewClient(ts.URL, nil)
+	c.client = *ts.Client()
+
+	var events []ProgressEvent
+	if err := c.DownloadKernelStream(DownloadRequest{}, func(event ProgressEvent) error {
+		events = append(events, event)
+		return nil
+	}); err != nil {
+		t.Fatalf("DownloadKernelStream() error = %v", err)
+	}
+	if !gotRequest || len(events) != 2 || events[1].Status != "downloaded" {
+		t.Fatalf("events = %#v, gotRequest=%v", events, gotRequest)
+	}
+}
+
+func TestClientPullImageStreamErrorEvent(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_ = json.NewEncoder(w).Encode(ProgressEvent{Status: "error", Artifact: "alpine", Error: "boom"})
+	}))
+	defer ts.Close()
+
+	c := NewClient(ts.URL, nil)
+	c.client = *ts.Client()
+
+	err := c.PullImageStream("alpine", PullImageRequest{Source: "alpine.simg"}, nil)
+	if err == nil || err.Error() != "boom" {
+		t.Fatalf("PullImageStream() error = %v, want boom", err)
+	}
+}
+
+func TestClientCreateInstanceStream(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/vm" || r.URL.Query().Get("stream") != "1" {
+			t.Fatalf("request URL = %s, want /vm?stream=1", r.URL.String())
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_ = json.NewEncoder(w).Encode(BootEvent{Kind: "status", Message: "starting VM"})
+		_ = json.NewEncoder(w).Encode(BootEvent{Kind: "ready", State: InstanceState{Status: "running", Image: "alpine"}})
+	}))
+	defer ts.Close()
+
+	c := NewClient(ts.URL, nil)
+	c.client = *ts.Client()
+
+	var events []BootEvent
+	state, err := c.CreateInstanceStream(CreateInstanceRequest{Image: "alpine"}, func(event BootEvent) error {
+		events = append(events, event)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("CreateInstanceStream() error = %v", err)
+	}
+	if state.Status != "running" || state.Image != "alpine" || len(events) != 2 {
+		t.Fatalf("state = %#v events = %#v", state, events)
+	}
+}
+
+func TestClientCreateInstanceStreamRequiresReadyEvent(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_ = json.NewEncoder(w).Encode(BootEvent{Kind: "status", Message: "starting VM"})
+	}))
+	defer ts.Close()
+
+	c := NewClient(ts.URL, nil)
+	c.client = *ts.Client()
+
+	_, err := c.CreateInstanceStream(CreateInstanceRequest{Image: "alpine"}, nil)
+	if err == nil || err.Error() != "boot stream ended before ready" {
+		t.Fatalf("CreateInstanceStream() error = %v, want ready error", err)
 	}
 }

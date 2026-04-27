@@ -81,6 +81,10 @@ func (c *Client) DownloadKernel(req DownloadRequest) error {
 	return c.postJSONExpectOK("/kernel/download", req, nil)
 }
 
+func (c *Client) DownloadKernelStream(req DownloadRequest, onEvent func(ProgressEvent) error) error {
+	return c.postJSONProgressStream("/kernel/download", req, onEvent)
+}
+
 func (c *Client) PrepareImageMetadata(name string) (ImageMetadataState, error) {
 	var ret ImageMetadataState
 	err := c.postJSONExpectOK("/image/"+name+"/metadata", map[string]any{}, &ret)
@@ -127,6 +131,10 @@ func (c *Client) PullImage(name string, req PullImageRequest) error {
 	return c.postJSONExpectOK("/image/"+name, req, nil)
 }
 
+func (c *Client) PullImageStream(name string, req PullImageRequest, onEvent func(ProgressEvent) error) error {
+	return c.postJSONProgressStream("/image/"+name, req, onEvent)
+}
+
 func (c *Client) VMSupported() (VMSupportedResponse, error) {
 	var ret VMSupportedResponse
 	resp, err := c.client.Get(c.url + "/vm/supported")
@@ -161,10 +169,18 @@ func (c *Client) CreateInstance(req CreateInstanceRequest) (InstanceState, error
 	return ret, err
 }
 
+func (c *Client) CreateInstanceStream(req CreateInstanceRequest, onEvent func(BootEvent) error) (InstanceState, error) {
+	return c.postJSONBootStream("/vm", req, onEvent)
+}
+
 func (c *Client) StartInstance(req StartInstanceRequest) (InstanceState, error) {
 	var ret InstanceState
 	err := c.postJSONExpectOK("/vm/start", req, &ret)
 	return ret, err
+}
+
+func (c *Client) StartInstanceStream(req StartInstanceRequest, onEvent func(BootEvent) error) (InstanceState, error) {
+	return c.postJSONBootStream("/vm/start", req, onEvent)
 }
 
 func (c *Client) InstanceStatus() (InstanceState, error) {
@@ -328,6 +344,103 @@ func (c *Client) postJSONExpectOK(path string, reqBody any, respBody any) error 
 		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(respBody)
+}
+
+func (c *Client) postJSONProgressStream(path string, reqBody any, onEvent func(ProgressEvent) error) error {
+	resp, err := c.postJSONStream(path, reqBody)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var event ProgressEvent
+		if err := dec.Decode(&event); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		if onEvent != nil {
+			if err := onEvent(event); err != nil {
+				return err
+			}
+		}
+		if event.Status == "error" {
+			if event.Error != "" {
+				return fmt.Errorf("%s", event.Error)
+			}
+			return fmt.Errorf("streamed operation failed")
+		}
+	}
+}
+
+func (c *Client) postJSONBootStream(path string, reqBody any, onEvent func(BootEvent) error) (InstanceState, error) {
+	resp, err := c.postJSONStream(path, reqBody)
+	if err != nil {
+		return InstanceState{}, err
+	}
+	defer resp.Body.Close()
+
+	var state InstanceState
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var event BootEvent
+		if err := dec.Decode(&event); err != nil {
+			if err == io.EOF {
+				if state.Status == "" {
+					return state, fmt.Errorf("boot stream ended before ready")
+				}
+				return state, nil
+			}
+			return state, err
+		}
+		if onEvent != nil {
+			if err := onEvent(event); err != nil {
+				return state, err
+			}
+		}
+		if event.Kind == "ready" {
+			state = event.State
+		}
+		if event.Kind == "error" {
+			if event.Error != "" {
+				return state, fmt.Errorf("%s", event.Error)
+			}
+			return state, fmt.Errorf("boot failed")
+		}
+	}
+}
+
+func (c *Client) postJSONStream(path string, reqBody any) (*http.Response, error) {
+	var body io.Reader
+	if reqBody != nil {
+		buf := &bytes.Buffer{}
+		if err := json.NewEncoder(buf).Encode(reqBody); err != nil {
+			return nil, err
+		}
+		body = buf
+	}
+
+	req, err := http.NewRequest(http.MethodPost, c.url+path+"?stream=1", body)
+	if err != nil {
+		return nil, err
+	}
+	if reqBody != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.Header.Set("Accept", "application/x-ndjson")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
+		return nil, decodeErrorResponse(resp)
+	}
+	return resp, nil
 }
 
 func decodeErrorResponse(resp *http.Response) error {

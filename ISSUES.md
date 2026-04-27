@@ -35,6 +35,10 @@ Python client mirrored the same default.
 
 ## 3. CLI long operations do not use available progress streams
 
+Status: addressed for `kernel-download`, `pull`, and `vm-start`. The CLI now
+uses streaming daemon endpoints and writes human progress to stderr only when
+stderr is a terminal, preserving stdout for existing JSON/output behavior.
+
 `cc kernel-download`, `cc pull`, and `cc vm-start` call blocking endpoints even
 though the daemon supports NDJSON progress and boot streams.
 
