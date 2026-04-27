@@ -345,9 +345,14 @@ func TestManagerRunMountsRuntimeSharesBeforeExec(t *testing.T) {
 func TestManagerRunStreamFallsBackToOneShotRunWhenNoInstance(t *testing.T) {
 	var seen client.RunRequest
 	mgr := NewManagerWithBackend(fakeBackend{
-		runFn: func(req client.RunRequest) (client.ExecResponse, error) {
+		runStreamFn: func(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+			_ = ctx
+			_ = inputs
 			seen = req
-			return client.ExecResponse{ExitCode: 7, Output: "hello"}, nil
+			if err := onEvent(client.ExecEvent{Kind: "stdout", Stream: "stdout", Output: "hello", Data: []byte("hello")}); err != nil {
+				return err
+			}
+			return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 7})
 		},
 	})
 	mgr.supports = func() error { return nil }
@@ -379,12 +384,16 @@ func TestManagerRunStreamDelegatesCrossImageExecToBackend(t *testing.T) {
 	}
 	mgr := NewManagerWithBackend(fakeBackend{
 		instance: inst,
-		runInInstanceFn: func(ctx context.Context, inst Instance, runningImage string, req client.RunRequest) (client.ExecResponse, error) {
+		runInStreamFn: func(ctx context.Context, inst Instance, runningImage string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 			_ = ctx
 			_ = inst
+			_ = inputs
 			seen.running = runningImage
 			seen.image = req.Image
-			return client.ExecResponse{ExitCode: 0, Output: "ok"}, nil
+			if err := onEvent(client.ExecEvent{Kind: "stdout", Stream: "stdout", Output: "ok", Data: []byte("ok")}); err != nil {
+				return err
+			}
+			return onEvent(client.ExecEvent{Kind: "exit"})
 		},
 	})
 	mgr.supports = func() error { return nil }
@@ -448,8 +457,10 @@ type fakeBackend struct {
 	err             error
 	runResp         client.ExecResponse
 	runFn           func(client.RunRequest) (client.ExecResponse, error)
+	runStreamFn     func(context.Context, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 	startFn         func(client.CreateInstanceRequest) (Instance, error)
 	runInInstanceFn func(context.Context, Instance, string, client.RunRequest) (client.ExecResponse, error)
+	runInStreamFn   func(context.Context, Instance, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 }
 
 func (f fakeBackend) Start(ctx context.Context, req client.CreateInstanceRequest) (Instance, error) {
@@ -486,6 +497,25 @@ func (f fakeBackend) Run(ctx context.Context, req client.RunRequest) (client.Exe
 	return f.runResp, f.err
 }
 
+func (f fakeBackend) RunStream(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	if f.runStreamFn != nil {
+		return f.runStreamFn(ctx, req, inputs, onEvent)
+	}
+	resp, err := f.Run(ctx, req)
+	if err != nil {
+		return err
+	}
+	if resp.Output != "" && onEvent != nil {
+		if err := onEvent(client.ExecEvent{Kind: "stdout", Stream: "stdout", Output: resp.Output, Data: []byte(resp.Output)}); err != nil {
+			return err
+		}
+	}
+	if onEvent != nil {
+		return onEvent(client.ExecEvent{Kind: "exit", ExitCode: resp.ExitCode})
+	}
+	return nil
+}
+
 func (f fakeBackend) RunInInstance(ctx context.Context, inst Instance, runningImage string, req client.RunRequest) (client.ExecResponse, error) {
 	if f.runInInstanceFn != nil {
 		return f.runInInstanceFn(ctx, inst, runningImage, req)
@@ -510,6 +540,21 @@ func (f fakeBackend) RunInInstance(ctx context.Context, inst Instance, runningIm
 		Cols:    req.Cols,
 		Rows:    req.Rows,
 	})
+}
+
+func (f fakeBackend) RunInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	if f.runInStreamFn != nil {
+		return f.runInStreamFn(ctx, inst, runningImage, req, inputs, onEvent)
+	}
+	if inst == nil {
+		return f.err
+	}
+	for _, share := range req.Shares {
+		if err := inst.AddShare(ctx, share); err != nil {
+			return err
+		}
+	}
+	return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
 }
 
 type fakeInstance struct {

@@ -97,6 +97,21 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 	}, nil
 }
 
+func (b *runtimeBackend) RunStream(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	inst, err := b.StartStream(ctx, client.CreateInstanceRequest{
+		Image:    req.Image,
+		Shares:   append([]client.ShareMount(nil), req.Shares...),
+		MemoryMB: req.MemoryMB,
+		CPUs:     req.CPUs,
+		Dmesg:    req.Dmesg,
+	}, nil)
+	if err != nil {
+		return err
+	}
+	defer inst.Close()
+	return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
+}
+
 func (b *runtimeBackend) RunInInstance(
 	ctx context.Context,
 	inst Instance,
@@ -168,6 +183,70 @@ func (b *runtimeBackend) RunInInstance(
 		Cols:        req.Cols,
 		Rows:        req.Rows,
 	})
+}
+
+func (b *runtimeBackend) RunInInstanceStream(
+	ctx context.Context,
+	inst Instance,
+	runningImage string,
+	req client.RunRequest,
+	inputs <-chan client.ExecInput,
+	onEvent func(client.ExecEvent) error,
+) error {
+	targetImage := strings.TrimSpace(req.Image)
+	if targetImage == "" || targetImage == runningImage {
+		if err := addRuntimeShares(ctx, inst, req.Shares); err != nil {
+			return err
+		}
+		return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
+	}
+
+	session, ok := inst.(*hvf.ContainerSession)
+	if !ok {
+		return fmt.Errorf("running instance does not support image mounts")
+	}
+
+	image, err := b.images.Open(targetImage)
+	if err != nil {
+		return err
+	}
+	image = withRuntimeMountDirs(image)
+	mountPath := imageMountPath(targetImage)
+	if err := session.AddImage(ctx, mountPath, image); err != nil {
+		return err
+	}
+	if err := addRuntimeShares(ctx, inst, rebaseRuntimeShares(mountPath, req.Shares)); err != nil {
+		return err
+	}
+
+	env := append([]string(nil), image.Config.Env...)
+	env = mergeRuntimeEnv(env, req.Env)
+	command, err := imagefs.ResolveCommand(image.RootFS, req.Command, env)
+	if err != nil {
+		return err
+	}
+
+	workDir := req.WorkDir
+	if workDir == "" {
+		workDir = image.Config.WorkingDir
+	}
+	if workDir == "" {
+		workDir = "/"
+	}
+
+	return inst.ExecStream(ctx, client.ExecRequest{
+		Command:     command,
+		Env:         env,
+		RootDir:     mountPath,
+		ReplaceEnv:  true,
+		SkipResolve: true,
+		WorkDir:     workDir,
+		User:        req.User,
+		Stdin:       append([]byte(nil), req.Stdin...),
+		TTY:         req.TTY,
+		Cols:        req.Cols,
+		Rows:        req.Rows,
+	}, inputs, onEvent)
 }
 
 func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, memoryMB uint64, cpus int, dmesg bool) (vmruntime.RunRequest, error) {
