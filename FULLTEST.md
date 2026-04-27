@@ -1,379 +1,514 @@
 # PyNeurodesk Fulltest Status
 
-This document summarizes the current fulltest state after switching the GitHub
-Actions fulltest workflow from CVMFS imports to downloaded Neurocontainers
-`.simg` images.
+This document summarizes the latest all-suite GitHub Actions fulltest run after
+switching fulltests to downloaded Neurocontainers `.simg` files and adding local
+SIMG deploy metadata extraction.
 
 ## Current Reference
 
-Current local `main` after pulling from GitHub:
+Latest all-suite run analyzed:
 
-- commit: `d1fd2b523ef9f90c3318d6eb5fd9100bb591d7ec`
-- commit message: `Merge pull request #2 from tinyrange/feature/windows_amd64`
+- workflow: `PyNeurodesk fulltests`
+- run: https://github.com/tinyrange/cc/actions/runs/24959155154
+- event: `workflow_dispatch`
+- branch: `main`
+- commit: `2eeead69b74be495361aa407d686afdddf8fe2b6`
+- commit message: `Load deploy metadata from local simg images`
+- started: `2026-04-26 14:35:56 UTC`
+- completed: `2026-04-26 22:18:43 UTC`
+- conclusion: `failure`
 
-Green push runs for that commit:
+Green runs for the same commit:
 
 | Workflow | Run | Result |
 | --- | --- | --- |
-| Unit tests | https://github.com/tinyrange/cc/actions/runs/24955610041 | Success |
-| Build wheels | https://github.com/tinyrange/cc/actions/runs/24955713778 | Success |
-| PyNeurodesk fulltests, default `niimath` | https://github.com/tinyrange/cc/actions/runs/24955610042 | Success |
+| Unit tests | https://github.com/tinyrange/cc/actions/runs/24958940485 | Success |
+| Build wheels | https://github.com/tinyrange/cc/actions/runs/24958955813 | Success |
+| PyNeurodesk fulltests, default `niimath` | https://github.com/tinyrange/cc/actions/runs/24958940488 | Success |
 
-Latest all-suite investigation run:
+Local downloaded artifacts for the all-suite run:
 
-- workflow: `PyNeurodesk fulltests`
-- run: https://github.com/tinyrange/cc/actions/runs/24954907956
-- event: `workflow_dispatch`
-- commit under test: `81ad4c63c43e869665cd15554aec881990f3b6b1`
-- started: `2026-04-26 10:55:54 UTC`
-- cancelled: `2026-04-26 13:10:44 UTC`
-- conclusion: `cancelled`
-- reason for cancellation: manual cancellation after enough useful signal was collected
+- `.tmp-fullsuite-24959155154/artifacts`
+- `.tmp-fullsuite-24959155154/run.json`
 
-The downloaded artifacts from this run are available locally at:
+## Suite Summary
 
-- `.tmp-fullsuite-24954907956/artifacts`
-- `.tmp-fullsuite-24954907956/run.json`
-
-## All-Suite Summary
-
-Job conclusions from run `24954907956`:
-
-| Job conclusion | Count |
-| --- | ---: |
-| Success | 7 |
-| Failure | 111 |
-| Cancelled | 12 |
-
-The success count includes the matrix planning job. Suite-level results:
+The workflow selected 129 suites.
 
 | Suite result | Count |
 | --- | ---: |
-| Passed | 6 |
-| Failed | 111 |
-| Cancelled by manual run cancellation | 12 |
+| Passed | 16 |
+| Failed | 112 |
+| Cancelled | 1 |
 
 Passed suites:
 
+- `afni`
+- `amico`
+- `apptainer`
+- `bidsappbrainsuite`
 - `bidsapppymvpa`
+- `convert3d`
+- `dcm2niix`
+- `dicomtools`
 - `fatsegnet`
+- `fsqc`
 - `gingerale`
 - `hnncore`
-- `niimath`
+- `nighres`
+- `spmpython`
 - `surfice`
+- `vmtk`
 
-Cancelled suites:
+Cancelled suite:
 
-- `apptainer`
-- `brainlifecli`
-- `connectomeworkbench`
-- `conn`
-- `hmri`
-- `lesymap`
-- `mne`
-- `qmrlab`
-- `root`
-- `spm12`
-- `spm25`
 - `synthstrip`
 
-The cancelled suites are not conclusive failures. They were still in progress
-when the run was cancelled.
+The `synthstrip` job ran for about 6 hours and ended as `cancelled`. It did not
+upload a suite artifact, so there is no useful suite-level failure signal yet.
 
 ## Log Coverage
 
-The run uploaded artifacts for all 129 selected suites:
+Artifacts downloaded from run `24959155154` contain:
 
-- 129 download logs
-- 120 suite logs
-- 9 suites failed during `.simg` download and therefore did not produce suite
-  logs
+- 128 download logs
+- 119 suite logs
+- 9 suites failed before producing suite logs because their `.simg` download
+  returned HTTP 403
+- 109 suite logs reached the final `Suite:` summary block
 
-Among the 120 suite logs:
+Summed across the 109 logs with final summaries:
 
-- 94 reached the final fulltest summary
-- 26 failed or were cancelled before a final summary
-- total summarized test counts:
-  - passed: `3017`
-  - failed: `4796`
-  - skipped: `618`
+| Test result | Count |
+| --- | ---: |
+| Passed | 5545 |
+| Failed | 3759 |
+| Skipped | 549 |
 
-## What Changed
+## What Improved
 
-The S3 `.simg` workflow removed the previous CVMFS packed-prefetch bottleneck.
-The run no longer spends hours walking and packing tiny CVMFS files, and the
-download step is straightforward to reason about:
+The local SIMG deploy metadata fix had a clear effect.
 
-- 120 suites downloaded a `.simg` successfully.
-- 9 suites failed during `.simg` download.
-- Large images such as `afni` and `qsirecon` moved past acquisition and into
-  import or test execution.
-
-This is a cleaner signal than the CVMFS-backed all-suite runs. Most remaining
-failures are now in local `.simg` metadata/environment handling, VM startup, or
-the fulltest recipes themselves.
-
-## Current Root Causes
-
-### 1. Local `.simg` Imports Do Not Populate Neurodesk Deploy Metadata
-
-This is the dominant new failure mode.
-
-Many suites load the local `.simg` image successfully, activate shell hooks, and
-then fail because wrapper commands cannot resolve tools inside the guest PATH:
-
-- representative `afni` error:
-  - `RuntimeError: resolve command "3dinfo" in PATH`
-- representative `bart` error:
-  - `RuntimeError: resolve command "bart" in PATH`
-- representative `fsl` error:
-  - `RuntimeError: resolve command "fslmaths" in PATH`
-- representative `qsirecon` error:
-  - `RuntimeError: resolve command "python" in PATH`
-
-Observed in at least 60 suites:
+Suites that previously failed at command resolution now execute real tools and
+pass, including:
 
 - `afni`
 - `amico`
+- `convert3d`
+- `dcm2niix`
+- `fsqc`
+- `spmpython`
+
+Representative improvement:
+
+- `afni` now passes all `113` tests.
+- The previous `RuntimeError: resolve command "3dinfo" in PATH` is gone.
+- Large command output such as `afni -ver` is no longer the blocker for this
+  suite.
+
+The remaining failures are now more meaningful: they are mostly real tool
+timeouts, incomplete deploy metadata for some images, recipe path assumptions,
+or missing upstream `.simg` objects.
+
+## Failure Categories
+
+The categories below are primary buckets based on the dominant symptom in each
+suite log. Some suites show secondary issues too, but each suite is counted once
+here so the totals sum to the 112 failed suites.
+
+| Category | Count |
+| --- | ---: |
+| Per-test command timeout or heavy startup | 35 |
+| Remaining deploy `PATH` / `DEPLOY_BINS` issue | 21 |
+| Recipe absolute path or missing file assumption | 20 |
+| Download 403 / missing S3 image | 9 |
+| Recipe assertion or tool behavior mismatch | 8 |
+| VM boot timeout | 6 |
+| External runtime, license, GUI, or service dependency | 6 |
+| Host API read timeout | 3 |
+| Runtime/application error | 3 |
+| SIMG import/index EOF | 1 |
+
+## Current Root Causes
+
+### 1. Per-Test Command Timeout Or Heavy Startup
+
+These suites import and load, but many individual commands hit the fulltest
+per-command timeout, usually `120.0 seconds`.
+
+Affected suites:
+
 - `ants`
 - `bart`
 - `batchheudiconv`
-- `bidsappbaracus`
-- `bidsapphcppipelines`
+- `bidsappspm`
 - `bidscoin`
-- `bidstools`
 - `brainager`
-- `clearswi`
-- `code`
-- `convert3d`
+- `brainlifecli`
+- `brainstorm`
+- `connectomeworkbench`
 - `dcm2bids`
-- `dcm2niix`
-- `deepretinotopy`
-- `elastix`
+- `fastcsr`
 - `fastsurfer`
-- `fmriprep`
-- `fsl`
-- `fsqc`
-- `globus`
-- `halfpipe`
-- `hdbet`
+- `gigaconnectome`
 - `heudiconv`
+- `hmri`
 - `ilastik`
 - `itksnap`
 - `julia`
+- `lesymap`
+- `linda`
+- `mriqc`
+- `mrsiproc`
+- `networkcorrespondancetoolkit`
+- `neurodock`
+- `palmettobug`
+- `pcntoolkit`
+- `qmrlab`
+- `qsirecon`
+- `root`
+- `samsrfx`
+- `sigviewer`
+- `spm12`
+- `syncro`
+- `vesselboost`
+- `xnat`
+
+Representative errors:
+
+- `bart version` timed out after `120.0 seconds`.
+- `bl version` and most `brainlifecli` help commands timed out after
+  `120.0 seconds`.
+- many `root -b -l -q ...` invocations timed out after `120.0 seconds`.
+- several SPM/MATLAB Runtime commands timed out or ran long enough that
+  downstream tests failed.
+
+Interpretation:
+
+- The wrapper and image import path are mostly working for these suites.
+- The next thing to root cause is whether commands are genuinely too slow,
+  blocked on first-run initialization, waiting for input, writing excessive
+  output, or stuck behind VM/runtime startup overhead.
+- Do not simply raise the timeout globally without inspecting representative
+  commands locally.
+
+Recommended next tests:
+
+- `bart`: run only `bart version` and `bart bitmask 0 1 2`.
+- `brainlifecli`: run only `bl version` and `bl --help`.
+- `root`: run only `root --version` and a one-line batch command.
+- `spm12`: run one `run_spm12.sh` version/help command.
+
+### 2. Remaining Deploy `PATH` / `DEPLOY_BINS` Issues
+
+These suites still fail with `RuntimeError: resolve command "..." in PATH`.
+
+Affected suites:
+
+- `clearswi`
+- `code`
+- `deepretinotopy`
+- `elastix`
+- `hdbet`
 - `laynii`
 - `mgltools`
-- `micapipe`
 - `minc`
 - `mricrogl`
 - `mricron`
-- `mriqc`
 - `mrtrix3tissue`
-- `networkcorrespondancetoolkit`
-- `neurodock`
-- `nftsim`
 - `niftyreg`
 - `nipype`
 - `oshyx`
-- `ospreybids`
 - `palm`
-- `palmettobug`
-- `qsiprep`
-- `qsirecon`
-- `qsmxt`
-- `quickshear`
-- `qupath`
 - `rabies`
-- `relion`
 - `romeo`
 - `sovabids`
-- `spmpython`
-- `syncro`
 - `tgvqsm`
-- `tractseg`
-- `vesselboost`
 - `vesselvio`
-
-Likely root cause:
-
-- CVMFS-backed containers expose `commands.txt`, `env.txt`, and
-  `.singularity.d/env/*` through the CVMFS directory layout.
-- The local `.simg` import path indexes the SquashFS image but does not produce
-  equivalent deploy metadata for pyneurodesk shell wrappers.
-- `pyneurodesk.api.load_deploy_metadata` currently reads metadata through CVMFS
-  APIs. For local `.simg` references this can fall back to empty deploy env.
-- Fulltest still creates shell wrapper commands through `--command`, but many
-  wrapper invocations run without the image's Singularity environment, so the
-  actual tool is absent from PATH.
-
-Recommended next fix:
-
-- teach local `.simg` imports or pyneurodesk metadata loading to read
-  `.singularity.d/env/*` directly from the indexed SIMG filesystem
-- expose equivalent deploy env for both CVMFS and local `.simg` sources
-- consider storing deploy metadata in cc image metadata at import time so shell
-  wrappers do not need to rediscover it through source-specific APIs
-- validate with a small matrix:
-  `afni,bart,fsl,qsirecon,spmpython`
-
-### 2. Some Neurocontainers S3 `.simg` URLs Are Missing Or Inaccessible
-
-9 suites failed during the new download step:
-
-| Suite | HTTP result | URL |
-| --- | ---: | --- |
-| `aslprep` | 403 | `https://neurocontainers.s3.us-east-2.amazonaws.com/aslprep_0.7.5_20250206.simg` |
-| `dicompare` | 403 | `https://neurocontainers.s3.us-east-2.amazonaws.com/dicompare_0.1.3_20260202.simg` |
-| `ezbids` | 403 | `https://neurocontainers.s3.us-east-2.amazonaws.com/ezbids_1.1.0_20260127.simg` |
-| `freesurfer` | 403 | `https://neurocontainers.s3.us-east-2.amazonaws.com/freesurfer_8.1.0_20250812.simg` |
-| `gimp` | 403 | `https://neurocontainers.s3.us-east-2.amazonaws.com/gimp_2.10.18_*.simg` |
-| `pydeface` | 404 | `https://neurocontainers.s3.us-east-2.amazonaws.com/pydeface_2.0.2_20250206.simg` |
-| `rstudio` | 403 | `https://neurocontainers.s3.us-east-2.amazonaws.com/rstudio_2023.12.1_20260127.simg` |
-| `slicer` | 403 | `https://neurocontainers.s3.us-east-2.amazonaws.com/slicer_5.10.0_20251110.simg` |
-| `topaz` | 403 | `https://neurocontainers.s3.us-east-2.amazonaws.com/topaz_0.2.5a_20211006.simg` |
-
-Likely root causes:
-
-- most of these objects are absent or not publicly readable in S3
-- `gimp` has a wildcard in the recipe container value, which the workflow turns
-  into a literal S3 object name
-- some recipes may point at future or unpublished image versions
-
-Recommended next fix:
-
-- decide whether the workflow should support S3 object discovery for wildcard
-  container values
-- for non-wildcard misses, update Neurocontainers recipes or skip these suites
-  until their images are published
-- keep download failures distinct from runtime failures in the workflow summary
-
-### 3. HTTP Read Timeouts Still Hide Long-Running Operations
-
-10 suites failed with `httpx.ReadTimeout` before a final fulltest summary:
-
-- `bidsappaa`
-- `bidsappspm`
-- `dicomtools`
-- `mfcsc`
-- `nibabies`
-- `nighres`
-- `osprey`
-- `pcntoolkit`
-- `spm25`
 - `vina`
 
-Additional cancelled or failed suites also show command-level timeout behavior:
+Representative errors:
 
-- `brainlifecli`
-- `connectomeworkbench`
-- `hmri`
-- `lesymap`
-- `mne`
-- `qmrlab`
-- `root`
-- `spm12`
-- `synthstrip`
-- `xnat`
+- `clearswi`: `RuntimeError: resolve command "julia" in PATH`
+- `mgltools`: command resolution failures for tools expected by the recipe
+- `vina`: command resolution failures for `vina`
 
-Likely root cause:
+Interpretation:
 
-- `run_stream` uses the client's default HTTP timeout when no explicit timeout
-  is passed.
-- The default read timeout is currently finite, while some commands are quiet
-  for several minutes.
-- When no streamed event arrives before the read timeout, the client reports
-  `httpx.ReadTimeout` even if the guest command may still be doing useful work.
+- The general SIMG metadata fix works, because many former PATH failures now
+  pass.
+- These remaining images likely have incomplete top-level `deploy.path`,
+  incomplete `deploy.bins`, environment setup in non-standard files, or recipes
+  that call secondary tools not present in `DEPLOY_BINS`.
+- Some recipes have only `deploy.bins` and no useful `deploy.path`, which is
+  not enough for command resolution inside cc.
 
 Recommended next fix:
 
-- make streamed VM command calls use a no-read-timeout HTTP stream, like image
-  import streaming already does
-- keep the fulltest command timeout as the authoritative timeout
-- emit periodic heartbeat/progress events from long-running VM commands so CI
-  logs distinguish "quiet but alive" from "stuck"
-- validate with a small matrix:
-  `dicomtools,pcntoolkit,spm25,vina`
+- inspect each affected recipe `build.yaml`
+- compare top-level `deploy.path` / `deploy.bins` against the commands used in
+  `fulltest.yaml`
+- update recipes where the image metadata is incomplete
+- if metadata is present in another image file, extend SIMG metadata extraction
+  to read it rather than hard-coding per-suite behavior
 
-### 4. VM Boot Timeout Remains A Smaller Separate Bucket
+### 3. Recipe Absolute Path Or Missing File Assumptions
 
-3 suites reported VM boot timeout:
+These suites run commands but fail because expected files, directories, or
+absolute paths are missing.
 
+Affected suites:
+
+- `aidamri`
+- `ashs`
+- `bidsappaa`
+- `bidsappbaracus`
+- `bidsapphcppipelines`
 - `bidsappmrtrix3connectome`
-- `hmri`
-- `vmtk`
+- `bidsme`
+- `fmriprep`
+- `lashis`
+- `mfcsc`
+- `micapipe`
+- `mitkdiffusion`
+- `mne`
+- `mritools`
+- `nftsim`
+- `nibabies`
+- `osprey`
+- `qsiprep`
+- `slicersalt`
+- `tractseg`
+
+Representative errors:
+
+- `ashs`: `/../ashs-fastashs_beta/ext/Linux/bin/greedy: No such file or directory`
+- `ashs`: `/../ashs-fastashs_beta/ext/Linux/bin/c3d: No such file or directory`
+- `aidamri`: missing Allen Brain Atlas files and missing FSL-derived outputs
+- `bidsapphcppipelines`: missing expected `FREESURFER_HOME`,
+  `HCPPIPEDIR`, and `CARET7DIR` fragments
+- `qsiprep`: MRtrix command tests return `127`
+
+Interpretation:
+
+- These are probably recipe/test issues rather than core cc failures.
+- Many are absolute paths that made assumptions about the Neurodesk shell
+  environment or container filesystem layout.
+- The fix should be in the relevant Neurocontainers `fulltest.yaml` or recipe
+  metadata after verifying the exact installed paths in the image.
+
+### 4. Download 403 / Missing S3 Image
+
+These suites failed during the download step and did not produce suite logs.
+
+Affected suites:
+
+- `aslprep`
+- `dicompare`
+- `ezbids`
+- `freesurfer`
+- `gimp`
+- `pydeface`
+- `rstudio`
+- `slicer`
+- `topaz`
 
 Representative error:
 
-- `vm boot timed out after 30s`
+- `curl: (22) The requested URL returned error: 403`
 
-Likely root cause:
+Interpretation:
 
-- these local `.simg` images are large enough, or their metadata/rootfs setup is
-  heavy enough, that first boot can exceed the current 30 second boot timeout
-- this is distinct from test command timeouts and from S3 download failures
+- The workflow constructed an S3 `.simg` URL, but the object is missing,
+  private, or blocked.
+- These failures are outside cc runtime behavior until the artifacts are
+  available.
 
 Recommended next fix:
 
-- inspect boot timing locally for these exact images
-- add boot progress logging before increasing the timeout
-- if they are consistently booting slowly but successfully, raise the boot
-  timeout only for fulltest/CI or make it configurable in the workflow
+- verify generated S3 URLs for these containers
+- compare Neurodesk release metadata against actual object names
+- either publish/fix the `.simg` objects or skip these suites with an explicit
+  reason until images are available
 
-### 5. One Local `.simg` Indexing Failure
+### 5. VM Boot Timeout
 
-`spinalcordtoolbox` failed during local `.simg` import:
+These suites include a `504 Gateway Timeout` from `/vm` with
+`vm boot timed out after 30s`.
+
+Affected suites:
+
+- `fsl`
+- `niimath`
+- `ospreybids`
+- `physio`
+- `qupath`
+- `spm25`
+
+Representative error:
+
+- `httpx.HTTPStatusError: Server error '504 Gateway Timeout' for url ... /vm`
+- response body: `{"error":"vm boot timed out after 30s"}`
+
+Interpretation:
+
+- This is now separate from the earlier KVM/platform issue. The VM can boot for
+  many suites, but these jobs hit the daemon's 30 second boot readiness limit at
+  least once.
+- `qupath` also has many command-level 120 second timeouts after it gets far
+  enough to run tests, so some suites may have mixed boot and runtime slowness.
+
+Recommended next fix:
+
+- locally reproduce with one of the smallest affected suites, likely `niimath`
+  or `fsl`
+- capture serial/dmesg boot timing
+- determine whether the 30 second server-side VM boot timeout is too low for
+  large local SIMG images or whether the guest is stuck doing avoidable work
+
+### 6. Host API Read Timeout
+
+These suites failed through the Python HTTP client waiting on the cc daemon.
+
+Affected suites:
+
+- `bidstools`
+- `qsmxt`
+- `quickshear`
+
+Representative error:
+
+- `httpx.ReadTimeout: timed out`
+
+Interpretation:
+
+- This is different from individual test subprocess timeouts.
+- The client waited too long for a daemon response. That may mean the daemon is
+  still running a command without streaming enough progress, or the server-side
+  timeout path is not reporting a structured command failure promptly.
+
+Recommended next fix:
+
+- reproduce one small command from `quickshear` or `bidstools`
+- check daemon-side `run_stream` behavior when the guest command runs long or
+  produces little output
+- make sure long-running commands continuously stream progress or fail with a
+  clear timeout event
+
+### 7. External Runtime, License, GUI, Or Service Dependency
+
+These suites fail in ways that look tied to external runtime prerequisites,
+GUI/headless behavior, service setup, or license-style assumptions.
+
+Affected suites:
+
+- `brainnetviewer`
+- `dsistudio`
+- `eeglab`
+- `globus`
+- `lcmodel`
+- `matlab`
+
+Representative symptoms:
+
+- `brainnetviewer`: `DEPLOY_BINS` mismatch and binary size expectation mismatch
+- MATLAB/MCR-related suites: commands time out or fail during runtime startup
+- GUI-oriented tools: help/version checks do not produce expected output in the
+  headless CI environment
+
+Interpretation:
+
+- Some of these may be fixable with recipe environment changes such as
+  `QT_QPA_PLATFORM=offscreen`, MCR cache/home setup, or corrected deploy bins.
+- Others may need tests to avoid license/service-dependent behavior.
+
+### 8. Runtime/Application Error
+
+These suites are not obviously metadata, download, or boot failures. The tool
+starts far enough to return application-level errors.
+
+Affected suites:
+
+- `brkraw`
+- `fieldtrip`
+- `vesselapp`
+
+Representative symptoms:
+
+- `brkraw`: `nib-conform` commands return exit code `1`
+- `vesselapp`: Python package/version checks fail and expected executable paths
+  do not match
+
+Interpretation:
+
+- Treat these as recipe/tool-specific root causes.
+- Confirm installed versions and entrypoint paths inside the image before
+  changing cc.
+
+### 9. Recipe Assertion Or Tool Behavior Mismatch
+
+These suites have failures that look like expected-output mismatches, command
+exit codes from the underlying tool, or overly broad fulltest expectations.
+
+Affected suites:
+
+- `cat12`
+- `conn`
+- `diffusiontoolkit`
+- `glmsingle`
+- `halfpipe`
+- `niistat`
+- `relion`
+- `trackvis`
+
+Representative symptoms:
+
+- `conn`: many commands exit `126`
+- `cat12`: batch preparation and segmentation tests fail
+- `relion`: `CTFFIND version info` exits `255`
+
+Interpretation:
+
+- These need suite-by-suite inspection.
+- They are lower priority than the common infrastructure buckets because the
+  failures are less obviously shared.
+
+### 10. SIMG Import/Index EOF
+
+Affected suite:
+
+- `spinalcordtoolbox`
+
+Representative error:
 
 - `RuntimeError: index simg: EOF`
 
-This means the S3 download completed, but the SIMG/SquashFS reader hit EOF while
-indexing the image.
+Interpretation:
 
-Possible causes:
-
-- the downloaded `.simg` is truncated or otherwise corrupt in S3
-- the local SquashFS reader has a bug exposed by this image
-- the workflow download resumed or completed incorrectly for a very large image
+- The download step completed, but SquashFS/SIMG indexing failed.
+- This may be a truncated/corrupt `.simg`, an unsupported SquashFS layout, or a
+  bug in the SIMG reader.
 
 Recommended next fix:
 
-- reproduce locally by downloading
-  `spinalcordtoolbox_7.2_20251211.simg`
-- compare file size and checksum across repeated downloads
-- run the SIMG indexer directly against the file
+- download the exact `spinalcordtoolbox` image locally
+- verify file size/checksum if upstream metadata is available
+- run the SIMG indexer locally with focused logging
 
-### 6. Recipe/Test Issues Still Exist Under The Cleaner Runtime
+## Recommended Next Work
 
-Some failures look like real fulltest recipe or image-content issues rather than
-cc runtime failures:
+Highest leverage order:
 
-- `fieldtrip`: `KeyError: 'command'`
-- `slicersalt`: setup cannot find
-  `/opt/SlicerSALT-3.0.0-linux-amd64/share/SlicerSALT-4.11/OrientationMarkers/Human.vtp`
-- multiple suites fail expected-output assertions after a command runs but does
-  not print the expected text
-- several suites fail with normal non-zero exit-code mismatches
-
-These should be triaged after the local `.simg` environment issue is fixed,
-because missing deploy env can cause misleading secondary failures.
-
-## Next Steps
-
-Recommended order:
-
-1. Fix local `.simg` deploy metadata/environment loading.
-2. Re-run a small matrix: `afni,bart,fsl,qsirecon,spmpython`.
-3. Fix `run_stream` HTTP read timeout/heartbeat behavior.
-4. Re-run `dicomtools,pcntoolkit,spm25,vina`.
-5. Investigate `spinalcordtoolbox` SIMG indexing EOF.
-6. Decide how the workflow should handle missing/private S3 objects and wildcard
-   recipe container values.
-7. Only after those infrastructure issues are resolved, triage individual
-   recipe assertion failures.
-
-## Current Interpretation
-
-The S3 `.simg` workflow is the right direction. It avoids the CVMFS prefetch
-tail and gives faster, clearer failures. The main regression it exposed is that
-local `.simg` sources are not equivalent to CVMFS sources for pyneurodesk deploy
-metadata. Fixing that should convert many of the current command-resolution
-failures into either passing suites or genuine recipe/test failures.
+1. Fix the remaining deploy metadata gaps for the 21 suites still failing with
+   `resolve command ... in PATH`. This is the clearest shared infrastructure
+   issue left after the SIMG metadata change.
+2. Root cause one small per-command timeout suite locally, preferably `bart`,
+   before changing timeouts. If `bart version` hangs locally, inspect guest
+   process state and stdout/stderr behavior.
+3. Investigate the `vm boot timed out after 30s` failures with `niimath` or
+   `fsl`, capturing serial output to distinguish slow-but-healthy boot from a
+   stuck guest.
+4. Fix or skip the 9 S3 403 image downloads once the expected object names are
+   verified.
+5. Continue moving recipe absolute path fixes into Neurocontainers once each
+   path mismatch is confirmed inside the relevant image.

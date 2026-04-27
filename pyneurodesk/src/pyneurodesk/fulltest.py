@@ -300,7 +300,7 @@ def build_guest_vars(test_data: dict[str, str]) -> dict[str, str]:
 
 
 def build_shell_hook_vars(test_data: dict[str, str]) -> dict[str, str]:
-    return {key: value.lstrip("/") for key, value in test_data.items()}
+    return dict(test_data)
 
 
 def build_host_vars(work_dir: Path, test_data: dict[str, str]) -> dict[str, str]:

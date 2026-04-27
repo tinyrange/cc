@@ -2,6 +2,7 @@ package oci
 
 import (
 	"regexp"
+	"sort"
 	"strings"
 
 	"j5.nz/cc/internal/imagefs"
@@ -10,6 +11,7 @@ import (
 const maxSIMGMetadataFileSize = 1_000_000
 
 var envNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+var shellEnvReferencePattern = regexp.MustCompile(`\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?`)
 
 type simgDeployMetadata struct {
 	Env        []string
@@ -19,10 +21,7 @@ type simgDeployMetadata struct {
 
 func extractSIMGDeployMetadata(root imagefs.Directory) simgDeployMetadata {
 	var env []string
-	for _, name := range []string{
-		"/.singularity.d/env/10-docker2singularity.sh",
-		"/.singularity.d/env/90-environment.sh",
-	} {
+	for _, name := range singularityEnvFiles(root) {
 		env = mergeEnvEntries(env, parseSingularityEnvExports(readImageText(root, name)))
 	}
 
@@ -41,6 +40,28 @@ func extractSIMGDeployMetadata(root imagefs.Directory) simgDeployMetadata {
 		Env:        env,
 		DeployPath: deployPath,
 		DeployBins: deployBins,
+	}
+}
+
+func singularityEnvFiles(root imagefs.Directory) []string {
+	entry, err := imagefs.LookupPath(root, "/.singularity.d/env")
+	if err == nil && entry.Dir != nil {
+		dirents, err := entry.Dir.ReadDir()
+		if err == nil {
+			var files []string
+			for _, dirent := range dirents {
+				if strings.HasSuffix(dirent.Name, ".sh") {
+					files = append(files, "/.singularity.d/env/"+dirent.Name)
+				}
+			}
+			sort.Strings(files)
+			return files
+		}
+	}
+	return []string{
+		"/.singularity.d/env/10-docker.sh",
+		"/.singularity.d/env/10-docker2singularity.sh",
+		"/.singularity.d/env/90-environment.sh",
 	}
 }
 
@@ -76,7 +97,7 @@ func parseSingularityEnvExports(text string) []string {
 		if !envNamePattern.MatchString(key) {
 			continue
 		}
-		parsed, ok := parseSingularityEnvValue(strings.TrimSpace(value))
+		parsed, ok := parseSingularityEnvValue(strings.TrimSpace(value), env)
 		if !ok {
 			continue
 		}
@@ -85,7 +106,7 @@ func parseSingularityEnvExports(text string) []string {
 	return mergeEnvEntries(nil, env)
 }
 
-func parseSingularityEnvValue(value string) (string, bool) {
+func parseSingularityEnvValue(value string, env []string) (string, bool) {
 	if unquoted, ok := stripMatchingQuotes(value); ok {
 		value = unquoted
 	}
@@ -96,16 +117,13 @@ func parseSingularityEnvValue(value string) (string, bool) {
 			if unquoted, quoted := stripMatchingQuotes(fallback); quoted {
 				return unquoted, true
 			}
-			if !strings.Contains(fallback, "$") {
-				return fallback, true
-			}
-			return "", false
+			return expandShellEnvReferences(fallback, env), true
 		}
 	}
-	if strings.Contains(value, "$") || strings.ContainsAny(value, "`\n") {
+	if strings.ContainsAny(value, "`\n") {
 		return "", false
 	}
-	return value, true
+	return expandShellEnvReferences(value, env), true
 }
 
 func stripMatchingQuotes(value string) (string, bool) {
@@ -153,7 +171,7 @@ func parseTopLevelDeploy(text string) ([]string, []string) {
 			key = strings.TrimSpace(key)
 			value = strings.TrimSpace(value)
 			if key == "path" {
-				deployPath = append(deployPath, parseInlineYAMLList(value)...)
+				deployPath = append(deployPath, splitDeployPathEntries(parseInlineYAMLList(value))...)
 			}
 			if key == "bins" {
 				deployBins = append(deployBins, parseInlineYAMLList(value)...)
@@ -170,12 +188,25 @@ func parseTopLevelDeploy(text string) ([]string, []string) {
 		}
 		switch currentList {
 		case "path":
-			deployPath = append(deployPath, value)
+			deployPath = append(deployPath, splitDeployPathEntries([]string{value})...)
 		case "bins":
 			deployBins = append(deployBins, value)
 		}
 	}
 	return dedupeNonEmpty(deployPath), dedupeNonEmpty(deployBins)
+}
+
+func splitDeployPathEntries(entries []string) []string {
+	var out []string
+	for _, entry := range entries {
+		for _, part := range strings.Split(entry, ",") {
+			part = strings.TrimSpace(part)
+			if part != "" {
+				out = append(out, part)
+			}
+		}
+	}
+	return out
 }
 
 func parseInlineYAMLList(value string) []string {
@@ -211,7 +242,25 @@ func normalizeYAMLScalar(value string) string {
 	if unquoted, ok := stripMatchingQuotes(value); ok {
 		value = unquoted
 	}
+	if strings.Contains(value, "{{") || strings.Contains(value, "}}") {
+		return ""
+	}
 	return strings.TrimSpace(value)
+}
+
+func expandShellEnvReferences(value string, env []string) string {
+	return shellEnvReferencePattern.ReplaceAllStringFunc(value, func(match string) string {
+		name := strings.TrimPrefix(match, "$")
+		name = strings.TrimPrefix(name, "{")
+		name = strings.TrimSuffix(name, "}")
+		if name == "PATH" {
+			if current := envValue(env, name); current != "" {
+				return current
+			}
+			return "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+		}
+		return envValue(env, name)
+	})
 }
 
 func prependPathEnv(env []string, deployPath []string) []string {

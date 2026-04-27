@@ -167,10 +167,16 @@ deploy:
 	if err := os.MkdirAll(envDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll(env) error = %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(envDir, "10-docker.sh"), []byte(`
+export PATH="$PATH:/opt/docker-bin"
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(10-docker.sh) error = %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(envDir, "90-environment.sh"), []byte(`
 export PATH="/usr/local/bin:/usr/bin:/bin"
+export PATH="/opt/conda/bin:$PATH"
 export TOOLBOX_PATH="/opt/bart-0.9.00/"
-export SKIP_DYNAMIC="${PATH:-/ignored}"
+export EMPTY_SUFFIX="$UNSET_VAR:/opt/empty"
 `), 0o644); err != nil {
 		t.Fatalf("WriteFile(90-environment.sh) error = %v", err)
 	}
@@ -181,7 +187,8 @@ export SKIP_DYNAMIC="${PATH:-/ignored}"
 		"DEPLOY_PATH=/opt/bart-0.9.00/",
 		"DEPLOY_BINS=bart:bart-view",
 		"TOOLBOX_PATH=/opt/bart-0.9.00/",
-		"PATH=/opt/bart-0.9.00/:/usr/local/bin:/usr/bin:/bin",
+		"PATH=/opt/bart-0.9.00/:/opt/conda/bin:/usr/local/bin:/usr/bin:/bin",
+		"EMPTY_SUFFIX=:/opt/empty",
 	} {
 		if !strings.Contains(env, want) {
 			t.Fatalf("deploy env missing %q in:\n%s", want, env)
@@ -192,6 +199,23 @@ export SKIP_DYNAMIC="${PATH:-/ignored}"
 	}
 	if got := strings.Join(meta.DeployBins, ":"); got != "bart:bart-view" {
 		t.Fatalf("DeployBins = %q, want bart:bart-view", got)
+	}
+}
+
+func TestParseTopLevelDeploySkipsUnrenderedTemplatePaths(t *testing.T) {
+	paths, bins := parseTopLevelDeploy(`
+deploy:
+  path:
+    - /opt/{{ context.name }}-{{ context.version }}/bin
+    - /opt/tool/bin,/opt/other/bin
+  bins:
+    - tool
+`)
+	if got := strings.Join(paths, ":"); got != "/opt/tool/bin:/opt/other/bin" {
+		t.Fatalf("paths = %q, want /opt/tool/bin:/opt/other/bin", got)
+	}
+	if got := strings.Join(bins, ":"); got != "tool" {
+		t.Fatalf("bins = %q, want tool", got)
 	}
 }
 

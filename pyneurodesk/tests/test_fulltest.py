@@ -78,6 +78,13 @@ def test_substitute_variables_replaces_braced_and_unbraced_names() -> None:
     assert substitute_variables(text, variables) == "cp /work/in.nii.gz /work/out.nii.gz"
 
 
+def test_build_shell_hook_vars_preserves_guest_absolute_paths() -> None:
+    assert fulltest.build_shell_hook_vars({"tool_data": "/opt/tool/data.nii", "relative": "ds000001/file.nii"}) == {
+        "tool_data": "/opt/tool/data.nii",
+        "relative": "ds000001/file.nii",
+    }
+
+
 def test_timeout_for_prefers_test_timeout_then_default() -> None:
     assert timeout_for(45, 90) == 45.0
     assert timeout_for(0, 90) == 90.0
