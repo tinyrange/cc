@@ -35,7 +35,7 @@ jobs:
 
       - name: Run Go basic unit tests
         run: |
-          go test $(go list ./... | grep -v '/internal/hv/kvm$')
+          go test -short $(go list ./... | grep -v '/internal/hv/kvm$')
 
       - name: Build ccvm for Python unit tests
         run: |

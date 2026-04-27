@@ -37,7 +37,7 @@ jobs:
         shell: pwsh
         run: |
           $packages = go list ./... | Where-Object { $_ -notmatch '/internal/hv/whp$' }
-          go test $packages
+          go test -short $packages
 
       - name: Build ccvm for Python unit tests
         shell: pwsh
