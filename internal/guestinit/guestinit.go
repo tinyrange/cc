@@ -2,6 +2,7 @@ package guestinit
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 )
 
@@ -10,9 +11,10 @@ func Build(ctx context.Context, cacheDir string) ([]byte, error) {
 }
 
 func BuildForArch(ctx context.Context, cacheDir, goarch string) ([]byte, error) {
+	_, _ = ctx, cacheDir
 	payload := embeddedPayload(goarch)
 	if len(payload) == 0 {
-		return buildFromSource(ctx, cacheDir, goarch)
+		return nil, fmt.Errorf("guest init payload for %q is not embedded", goarch)
 	}
 	return append([]byte(nil), payload...), nil
 }

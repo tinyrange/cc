@@ -1,5 +1,3 @@
-//go:build embed_guestinit
-
 package guestinit
 
 import _ "embed"
