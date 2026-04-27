@@ -12,6 +12,7 @@ import httpx
 import pytest
 
 import neurodesk as nd
+import pyneurodesk.api as api
 from pyneurodesk import (
     CVMFSReadRequest,
     CVMFSSource,
@@ -254,6 +255,40 @@ def test_watchdog_client_endpoints() -> None:
         ("POST", "/watchdog", '{"timeout_seconds":30}'),
         ("POST", "/watchdog/feed", None),
     ]
+
+
+def test_watchdog_feed_loop_continues_after_transient_http_error(monkeypatch) -> None:
+    stop = api.threading.Event()
+    calls: list[str] = []
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeHTTPClient:
+        def __init__(self, *, base_url: str, timeout: float) -> None:
+            self.base_url = base_url
+            self.timeout = timeout
+
+        def __enter__(self) -> "FakeHTTPClient":
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        def post(self, path: str) -> FakeResponse:
+            calls.append(path)
+            if len(calls) == 1:
+                raise httpx.ConnectTimeout("transient timeout")
+            stop.set()
+            return FakeResponse()
+
+    monkeypatch.setattr(api, "WATCHDOG_FEED_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(api.httpx, "Client", FakeHTTPClient)
+
+    api._feed_daemon_watchdog("http://127.0.0.1:4567", stop)
+
+    assert calls == ["/watchdog/feed", "/watchdog/feed"]
 
 
 def test_create_instance_uses_boot_timeout() -> None:

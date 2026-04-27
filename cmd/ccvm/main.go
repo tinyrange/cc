@@ -77,6 +77,9 @@ func (w *watchdogController) Feed() bool {
 	if !w.active || w.timer == nil {
 		return false
 	}
+	if !w.timer.Stop() {
+		return false
+	}
 	w.timer.Reset(w.timeout)
 	return true
 }

@@ -1033,7 +1033,7 @@ def _feed_daemon_watchdog(base_url: str, stop: threading.Event) -> None:
                 response = client.post("/watchdog/feed")
                 response.raise_for_status()
         except httpx.HTTPError:
-            break
+            continue
     with _WATCHDOG_THREADS_LOCK:
         existing = _WATCHDOG_THREADS.get(base_url)
         if existing is not None and existing[0] is stop:
