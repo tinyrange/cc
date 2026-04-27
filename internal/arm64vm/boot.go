@@ -3,6 +3,7 @@ package arm64vm
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"j5.nz/cc/internal/fdt"
 	bootarm64 "j5.nz/cc/internal/linux/boot/arm64"
@@ -13,6 +14,7 @@ type BootConfig struct {
 	GICVersion bootarm64.GICVersion
 	Dmesg      bool
 	ExtraNodes []fdt.Node
+	RecordTime func(name string, duration time.Duration)
 }
 
 func MemorySizeBytes(memoryMB uint64) uint64 {
@@ -48,6 +50,7 @@ func PrepareBoot(memory []byte, kernel []byte, initrd []byte, cfg BootConfig) (*
 		Initrd:     initrd,
 		Console:    cfg.Dmesg,
 		ExtraNodes: append([]fdt.Node(nil), cfg.ExtraNodes...),
+		RecordTime: cfg.RecordTime,
 		Cmdline:    BootCommandLine(cfg.Dmesg),
 	})
 }

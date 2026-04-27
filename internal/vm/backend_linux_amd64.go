@@ -629,7 +629,7 @@ func linuxGuestInitConfig(modules []alpine.Module, managedExec bool) vmruntime.G
 }
 
 func linuxRuntimeConfigVars(image *oci.Image) []string {
-	vars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS"}
+	vars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO"}
 	if NeedsAMD64Emulation(image) {
 		vars = append(vars, "CONFIG_BINFMT_MISC")
 	}
@@ -638,12 +638,14 @@ func linuxRuntimeConfigVars(image *oci.Image) []string {
 
 func linuxRuntimeModuleMap() map[string]string {
 	return map[string]string{
-		"CONFIG_VIRTIO_MMIO":     "kernel/drivers/virtio/virtio_mmio.ko.gz",
-		"CONFIG_FUSE_FS":         "kernel/fs/fuse/fuse.ko.gz",
-		"CONFIG_VIRTIO_FS":       "kernel/fs/fuse/virtiofs.ko.gz",
-		"CONFIG_VSOCKETS":        "kernel/net/vmw_vsock/vsock.ko.gz",
-		"CONFIG_VIRTIO_VSOCKETS": "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
-		"CONFIG_BINFMT_MISC":     "kernel/fs/binfmt_misc.ko.gz",
+		"CONFIG_VIRTIO_MMIO":      "kernel/drivers/virtio/virtio_mmio.ko.gz",
+		"CONFIG_FUSE_FS":          "kernel/fs/fuse/fuse.ko.gz",
+		"CONFIG_VIRTIO_FS":        "kernel/fs/fuse/virtiofs.ko.gz",
+		"CONFIG_VSOCKETS":         "kernel/net/vmw_vsock/vsock.ko.gz",
+		"CONFIG_VIRTIO_VSOCKETS":  "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
+		"CONFIG_HW_RANDOM":        "kernel/drivers/char/hw_random/rng-core.ko.gz",
+		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
+		"CONFIG_BINFMT_MISC":      "kernel/fs/binfmt_misc.ko.gz",
 	}
 }
 

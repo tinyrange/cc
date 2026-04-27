@@ -41,6 +41,7 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 	}
 
 	vsock := virtio.NewVsock(arm64vm.VsockBase, arm64vm.VsockSize, arm64vm.VsockIRQ, vmruntime.GuestCID, backend)
+	rng := virtio.NewRNG(arm64vm.RNGBase, arm64vm.RNGSize, arm64vm.RNGIRQ)
 	connCh := make(chan virtio.VsockConn, 1)
 	acceptErrCh := make(chan error, 1)
 	controlTranscript := vmruntime.NewSerialTranscript()
@@ -54,7 +55,7 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 		_, _ = io.Copy(controlTranscript, conn)
 	}()
 
-	nodes := []fdt.Node{vsock.DeviceTreeNode()}
+	nodes := []fdt.Node{vsock.DeviceTreeNode(), rng.DeviceTreeNode()}
 	for _, fsdev := range fsdevs {
 		if fsdev != nil {
 			nodes = append(nodes, fsdev.DeviceTreeNode())
@@ -90,6 +91,7 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 		}
 	}
 	vsock.Attach(vm, vm)
+	rng.Attach(vm, vm)
 
 	plan, err := arm64vm.PrepareBoot(mem, kernel, initrd, arm64vm.BootConfig{
 		MemoryMB:   memoryMB,
@@ -120,7 +122,7 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 	doneCh := make(chan error, 1)
 	go func() {
 		defer vm.Close()
-		doneCh <- runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, serialOut)
+		doneCh <- runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, serialOut)
 	}()
 
 	var control virtio.VsockConn

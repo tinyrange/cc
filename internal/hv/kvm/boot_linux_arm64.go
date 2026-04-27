@@ -79,15 +79,16 @@ func BootInitramfsToVsockMarkerWithFS(ctx context.Context, kernel []byte, initrd
 
 	vsock := virtio.NewVsock(arm64vm.VsockBase, arm64vm.VsockSize, arm64vm.VsockIRQ, vmruntime.GuestCID, backend)
 	defer vsock.Close()
+	rng := virtio.NewRNG(arm64vm.RNGBase, arm64vm.RNGSize, arm64vm.RNGIRQ)
 
-	nodes := []fdt.Node{vsock.DeviceTreeNode()}
+	nodes := []fdt.Node{vsock.DeviceTreeNode(), rng.DeviceTreeNode()}
 	for _, fsdev := range fsdevs {
 		if fsdev != nil {
 			nodes = append(nodes, fsdev.DeviceTreeNode())
 		}
 	}
 
-	serial, err := bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, vsock, nodes, func(serial string) bool {
+	serial, err := bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, vsock, rng, nodes, func(serial string) bool {
 		return strings.Contains(controlOut.String(), marker)
 	})
 	select {
@@ -102,10 +103,10 @@ func BootInitramfsToVsockMarkerWithFS(ctx context.Context, kernel []byte, initrd
 }
 
 func bootToCondition(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, extraNodes []fdt.Node, done func(string) bool) (string, error) {
-	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, extraNodes, done)
+	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, nil, extraNodes, done)
 }
 
-func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, extraNodes []fdt.Node, done func(string) bool) (string, error) {
+func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, extraNodes []fdt.Node, done func(string) bool) (string, error) {
 	vm, err := NewVM()
 	if err != nil {
 		return "", err
@@ -127,6 +128,9 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 	}
 	if vsock != nil {
 		vsock.Attach(vm, vm)
+	}
+	if rng != nil {
+		rng.Attach(vm, vm)
 	}
 
 	plan, err := arm64vm.PrepareBoot(mem, kernel, initrd, arm64vm.BootConfig{
@@ -178,7 +182,7 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 
 		switch exit.Reason {
 		case ExitMMIO:
-			if err := handleBootMMIO(vm, uart, fsdevs, vsock, exit.MMIO); err != nil {
+			if err := handleBootMMIO(vm, uart, fsdevs, vsock, rng, exit.MMIO); err != nil {
 				return serialOut.String(), err
 			}
 		case ExitShutdown:
@@ -219,7 +223,7 @@ func handleUARTExit(vm *VM, uart *serial.UART8250, mmio MMIOExit) error {
 	return nil
 }
 
-func handleBootMMIO(vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, mmio MMIOExit) error {
+func handleBootMMIO(vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, mmio MMIOExit) error {
 	if uart.Contains(mmio.Addr, int(mmio.Len)) {
 		return handleUARTExit(vm, uart, mmio)
 	}
@@ -242,6 +246,17 @@ func handleBootMMIO(vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *v
 			return vsock.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio))
 		}
 		value, err := vsock.Read(mmio.Addr, int(mmio.Len))
+		if err != nil {
+			return err
+		}
+		vm.CompleteMMIORead(value, mmio.Len)
+		return nil
+	}
+	if rng != nil && rng.Contains(mmio.Addr, int(mmio.Len)) {
+		if mmio.Write {
+			return rng.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio))
+		}
+		value, err := rng.Read(mmio.Addr, int(mmio.Len))
 		if err != nil {
 			return err
 		}

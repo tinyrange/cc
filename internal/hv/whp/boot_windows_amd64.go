@@ -115,7 +115,8 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 		return "", err
 	}
 	defer vm.Close()
-	if fsdevs != nil || vsock != nil {
+	rng := virtio.NewRNG(amd64vm.RNGBase, amd64vm.RNGSize, amd64vm.RNGIRQ)
+	if fsdevs != nil || vsock != nil || rng != nil {
 		if err := installBootACPI(vm.Memory()); err != nil {
 			return "", fmt.Errorf("install acpi: %w", err)
 		}
@@ -125,13 +126,14 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 		"tsc=reliable",
 		"lpj=10000000",
 	}
-	if fsdevs != nil || vsock != nil {
+	if fsdevs != nil || vsock != nil || rng != nil {
 		extraCmdline = append(extraCmdline, "no_timer_check")
 	}
 	extraCmdline = append(extraCmdline, amd64vm.VirtioFSCommandLineArgs(fsdevs)...)
 	if vsock != nil {
 		extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(vsock.Base, vsock.IRQ))
 	}
+	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(rng.Base, rng.IRQ))
 	plan, err := amd64vm.PrepareBoot(vm.Memory(), kernel, initrd, amd64vm.BootConfig{
 		MemoryMB:     memoryMB,
 		Dmesg:        dmesg,
@@ -155,6 +157,7 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 	if vsock != nil {
 		platform.AttachVsock(vsock)
 	}
+	platform.AttachRNG(rng)
 	if err := vm.EnableEmulation(platform); err != nil {
 		return out.String(), fmt.Errorf("enable emulation: %w", err)
 	}
@@ -218,6 +221,7 @@ type bootPlatform struct {
 	hpet          bootHPET
 	fsdevs        []*virtio.FS
 	vsock         *virtio.Vsock
+	rng           *virtio.RNG
 	start         time.Time
 	irqAttempts   uint64
 	irqDelivered  uint64
@@ -256,6 +260,11 @@ func (p *bootPlatform) AttachFS(fsdev *virtio.FS) {
 func (p *bootPlatform) AttachVsock(vsock *virtio.Vsock) {
 	p.vsock = vsock
 	vsock.Attach(p.vm, p)
+}
+
+func (p *bootPlatform) AttachRNG(rng *virtio.RNG) {
+	p.rng = rng
+	rng.Attach(p.vm, p)
 }
 
 func (p *bootPlatform) ReadIO(port uint16, data []byte) error {
@@ -324,6 +333,14 @@ func (p *bootPlatform) ReadMMIO(addr uint64, data []byte) error {
 		putUint64(data, value)
 		return nil
 	}
+	if p.rng != nil && p.rng.Contains(addr, len(data)) {
+		value, err := p.rng.Read(addr, len(data))
+		if err != nil {
+			return err
+		}
+		putUint64(data, value)
+		return nil
+	}
 	if p.ioapic.Read(addr, data) {
 		return nil
 	}
@@ -345,6 +362,9 @@ func (p *bootPlatform) WriteMMIO(addr uint64, data []byte) error {
 	}
 	if p.vsock != nil && p.vsock.Contains(addr, len(data)) {
 		return p.vsock.Write(addr, len(data), readUint64(data))
+	}
+	if p.rng != nil && p.rng.Contains(addr, len(data)) {
+		return p.rng.Write(addr, len(data), readUint64(data))
 	}
 	if p.ioapic.Write(addr, data) {
 		return nil

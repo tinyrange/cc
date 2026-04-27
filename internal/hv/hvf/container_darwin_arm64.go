@@ -456,7 +456,7 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 	}
 
 	streamStart := time.Now()
-	err = s.streamExecEvents(ctx, transcriptStart, id, onEvent)
+	err = s.streamExecEvents(ctx, transcriptStart, id, execStart, onEvent)
 	timing.Since(ctx, "exec.stream_events", streamStart)
 	timing.Since(ctx, "exec.total", execStart)
 	return err
@@ -507,11 +507,12 @@ func (s *ContainerSession) sendStdinClose(id string) error {
 	return s.writeControlPayload(append(payload, '\n'))
 }
 
-func (s *ContainerSession) streamExecEvents(ctx context.Context, start int, id string, onEvent func(client.ExecEvent) error) error {
+func (s *ContainerSession) streamExecEvents(ctx context.Context, start int, id string, execStart time.Time, onEvent func(client.ExecEvent) error) error {
 	totalStart := time.Now()
 	offset := start
 	var pending string
 	var loops, reads, lines, matched, ignored, sleeps int
+	guestPhases := map[string]int{}
 	for {
 		loops++
 		readStart := time.Now()
@@ -533,7 +534,9 @@ func (s *ContainerSession) streamExecEvents(ctx context.Context, start int, id s
 				line := strings.TrimSpace(pending[:lineEnd])
 				pending = pending[lineEnd+1:]
 				timing.Since(ctx, "exec.stream_events.next_line", lineStart)
-				recordExecTimingLine(ctx, line, id)
+				if phase, ms, ok := recordExecTimingLine(ctx, line, id); ok {
+					recordExecObservedTiming(ctx, phase, ms, execStart, guestPhases)
+				}
 				parseStart := time.Now()
 				event, done, ok, err := parseManagedExecEventLine(line, id)
 				timing.Since(ctx, "exec.stream_events.parse_line", parseStart)
@@ -570,25 +573,61 @@ func (s *ContainerSession) streamExecEvents(ctx context.Context, start int, id s
 	}
 }
 
-func recordExecTimingLine(ctx context.Context, line, id string) {
+func recordExecTimingLine(ctx context.Context, line, id string) (string, int, bool) {
 	prefix := execTimingMarker + id + ":"
 	if !strings.HasPrefix(line, prefix) {
-		return
+		return "", 0, false
 	}
 	rest := strings.TrimPrefix(line, prefix)
 	parts := strings.SplitN(rest, ":", 2)
 	if len(parts) != 2 {
-		return
+		return "", 0, false
 	}
 	ms, err := strconv.Atoi(strings.TrimSpace(parts[1]))
 	if err != nil {
-		return
+		return "", 0, false
 	}
 	phase := strings.TrimSpace(parts[0])
 	if phase == "" {
-		return
+		return "", 0, false
 	}
 	timing.Record(ctx, "exec.guest."+phase, time.Duration(ms)*time.Millisecond)
+	return phase, ms, true
+}
+
+func recordExecObservedTiming(ctx context.Context, phase string, ms int, execStart time.Time, guestPhases map[string]int) {
+	timing.Since(ctx, "exec.host_observed."+phase, execStart)
+	if prevPhase, ok := previousExecPhase(phase); ok {
+		if prevMS, ok := guestPhases[prevPhase]; ok && ms >= prevMS {
+			timing.Record(ctx, "exec.guest_delta."+prevPhase+"_to_"+phase, time.Duration(ms-prevMS)*time.Millisecond)
+		}
+	}
+	guestPhases[phase] = ms
+}
+
+func previousExecPhase(phase string) (string, bool) {
+	switch phase {
+	case "start_begin":
+		return "recv", true
+	case "start_call":
+		return "start_begin", true
+	case "started":
+		return "start_call", true
+	case "wait_begin":
+		return "started", true
+	case "first_stdout":
+		return "started", true
+	case "first_stderr":
+		return "started", true
+	case "wait_done":
+		return "wait_begin", true
+	case "streams_done":
+		return "wait_done", true
+	case "exit_sent":
+		return "streams_done", true
+	default:
+		return "", false
+	}
 }
 
 func recordExecStreamCounts(ctx context.Context, loops, reads, lines, matched, ignored, sleeps int) {
@@ -756,6 +795,9 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 		MemoryMB:   req.MemoryMB,
 		Dmesg:      req.Dmesg,
 		ExtraNodes: arm64vm.AppendFSNodes([]fdt.Node{console.DeviceTreeNode(), rng.DeviceTreeNode(), vsock.DeviceTreeNode()}, fsdevs),
+		RecordTime: func(name string, duration time.Duration) {
+			timing.Record(ctx, "hvf.prepare_boot."+name, duration)
+		},
 	})
 	if err != nil {
 		vm.Close()
@@ -1148,6 +1190,9 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 		MemoryMB:   req.MemoryMB,
 		Dmesg:      req.Dmesg,
 		ExtraNodes: arm64vm.AppendFSNodes([]fdt.Node{console.DeviceTreeNode(), rng.DeviceTreeNode()}, fsdevs),
+		RecordTime: func(name string, duration time.Duration) {
+			timing.Record(ctx, "hvf.prepare_boot."+name, duration)
+		},
 	})
 	if err != nil {
 		return ContainerRunResult{}, fmt.Errorf("prepare boot: %w", err)
