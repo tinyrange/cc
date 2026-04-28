@@ -105,7 +105,6 @@ const (
 
 const (
 	fuseCapPosixLocks = 1 << 1
-	fuseCapPosixACL   = 1 << 20
 )
 
 const (
@@ -2071,7 +2070,7 @@ func NewImageFS(root imagefs.Directory, statfsPath string) FSBackend {
 }
 
 func (p *passthroughFS) Init() (uint32, uint32) {
-	return 128 << 10, fuseCapPosixACL | fuseCapPosixLocks
+	return 128 << 10, fuseCapPosixLocks
 }
 
 func (p *passthroughFS) GetAttr(nodeID uint64) (FuseAttr, int32) {
@@ -2516,9 +2515,9 @@ func (p *passthroughFS) hostPath(nodeID uint64) (string, int32) {
 }
 
 func (p *passthroughFS) hostAndGuestPath(nodeID uint64) (string, string, int32) {
-	p.mu.Lock()
+	p.mu.RLock()
 	guest, ok := p.nodes[nodeID]
-	p.mu.Unlock()
+	p.mu.RUnlock()
 	if !ok {
 		return "", "", -linuxENOENT
 	}
@@ -2550,8 +2549,8 @@ func joinGuestChild(parentGuest, rel string) string {
 }
 
 func (p *passthroughFS) DebugPath(nodeID uint64) string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return p.nodes[nodeID]
 }
 
@@ -2681,7 +2680,7 @@ func (p *imageFS) pathForNode(id uint64) string {
 }
 
 func (p *imageFS) Init() (uint32, uint32) {
-	return 128 << 10, fuseCapPosixACL | fuseCapPosixLocks
+	return 128 << 10, fuseCapPosixLocks
 }
 
 func (p *imageFS) GetAttr(nodeID uint64) (FuseAttr, int32) {

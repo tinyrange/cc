@@ -474,6 +474,24 @@ func TestStrictFUSEIoctlReturnsENOTTY(t *testing.T) {
 	}
 }
 
+func TestFUSEInitAdvertisesImplementedCapabilities(t *testing.T) {
+	t.Parallel()
+
+	backends := []struct {
+		name    string
+		backend FSBackend
+	}{
+		{name: "passthrough", backend: NewPassthroughFS(t.TempDir(), nil)},
+		{name: "image", backend: NewImageFS(imagefs.NewHostFS(t.TempDir(), nil), "")},
+	}
+	for _, tc := range backends {
+		_, flags := tc.backend.Init()
+		if flags != fuseCapPosixLocks {
+			t.Fatalf("%s Init flags = %#x, want %#x", tc.name, flags, fuseCapPosixLocks)
+		}
+	}
+}
+
 func TestFUSECachePolicyEncodesTTLAndOpenFlags(t *testing.T) {
 	t.Setenv("CCX3_VIRTIOFS_CACHE", "aggressive")
 
