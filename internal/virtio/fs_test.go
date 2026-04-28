@@ -492,6 +492,41 @@ func TestFUSEInitAdvertisesImplementedCapabilities(t *testing.T) {
 	}
 }
 
+func TestFUSEInitEnablesLargeWrites(t *testing.T) {
+	t.Parallel()
+
+	fsdev := NewFS(0, 0, 0, "root", NewPassthroughFS(t.TempDir(), nil))
+
+	const unique = uint64(44)
+	req := make([]byte, fuseInHeaderSize+16)
+	binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
+	binary.LittleEndian.PutUint32(req[4:8], fuseInit)
+	binary.LittleEndian.PutUint64(req[8:16], unique)
+	binary.LittleEndian.PutUint32(req[40:44], 7)
+	binary.LittleEndian.PutUint32(req[44:48], 31)
+
+	reply, err := fsdev.dispatchFUSELocked(req)
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(INIT) error = %v", err)
+	}
+	if got := int32(binary.LittleEndian.Uint32(reply[4:8])); got != 0 {
+		t.Fatalf("INIT errno = %d, want 0", got)
+	}
+	extra := reply[fuseOutHeaderSize:]
+	flags := binary.LittleEndian.Uint32(extra[12:16])
+	for _, flag := range []uint32{fuseCapBigWrites, fuseCapMaxPages} {
+		if flags&flag == 0 {
+			t.Fatalf("INIT flags = %#x, missing %#x", flags, flag)
+		}
+	}
+	if got := binary.LittleEndian.Uint32(extra[20:24]); got != 128<<10 {
+		t.Fatalf("INIT max_write = %d, want %d", got, 128<<10)
+	}
+	if got := binary.LittleEndian.Uint16(extra[28:30]); got != 32 {
+		t.Fatalf("INIT max_pages = %d, want 32", got)
+	}
+}
+
 func TestFUSECachePolicyEncodesTTLAndOpenFlags(t *testing.T) {
 	t.Setenv("CCX3_VIRTIOFS_CACHE", "aggressive")
 

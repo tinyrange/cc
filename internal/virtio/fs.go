@@ -105,6 +105,8 @@ const (
 
 const (
 	fuseCapPosixLocks = 1 << 1
+	fuseCapBigWrites  = 1 << 5
+	fuseCapMaxPages   = 1 << 22
 )
 
 const (
@@ -1000,6 +1002,16 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		if maxWrite == 0 {
 			maxWrite = 128 << 10
 		}
+		if maxWrite > 4096 {
+			flags |= fuseCapBigWrites | fuseCapMaxPages
+		}
+		maxPages := (maxWrite + 4095) / 4096
+		if maxPages == 0 {
+			maxPages = 1
+		}
+		if maxPages > 0xffff {
+			maxPages = 0xffff
+		}
 		extra := make([]byte, fuseInitOutSize)
 		replyMajor := uint32(7)
 		replyMinor := uint32(31)
@@ -1017,6 +1029,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		binary.LittleEndian.PutUint16(extra[18:20], 32)
 		binary.LittleEndian.PutUint32(extra[20:24], maxWrite)
 		binary.LittleEndian.PutUint32(extra[24:28], 1)
+		binary.LittleEndian.PutUint16(extra[28:30], uint16(maxPages))
 		f.logf("init-reply major=%d minor=%d max_write=%d", replyMajor, replyMinor, maxWrite)
 		return reply(0, extra), nil
 	case fuseGetAttr:
