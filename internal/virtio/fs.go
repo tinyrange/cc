@@ -496,19 +496,17 @@ func (f *FS) Write(addr uint64, size int, value uint64) error {
 	case regQueueNotify:
 		if int(value) < len(f.queues) {
 			f.queueNotifies[int(value)]++
-			if f.Async {
-				works, err := f.processQueueAsyncLocked(int(value))
-				if err != nil {
-					f.mu.Unlock()
-					return err
-				}
+			works, err := f.processQueueAsyncLocked(int(value))
+			if err != nil {
 				f.mu.Unlock()
+				return err
+			}
+			f.mu.Unlock()
+			if f.Async {
 				f.enqueueWorks(works)
 				return nil
 			}
-			err := f.processQueueLocked(int(value))
-			f.mu.Unlock()
-			return err
+			return f.processWorksInline(works)
 		}
 	}
 	f.mu.Unlock()
@@ -729,6 +727,22 @@ func (f *FS) enqueueWorks(works []fsWork) {
 	for _, work := range works {
 		f.workCh <- work
 	}
+}
+
+func (f *FS) processWorksInline(works []fsWork) error {
+	for _, work := range works {
+		reply, err := f.dispatchFUSE(work.req)
+		putFSReqBuffer(work.req, work.pooledReq)
+		work.req = nil
+		work.pooledReq = false
+		if err != nil {
+			return err
+		}
+		if err := f.completeWork(work, reply, nil); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (f *FS) startWorkers() {

@@ -323,6 +323,18 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Write a Go CPU profile from ccvm while the guest benchmark runs",
     )
+    parser.add_argument(
+        "--pprof-mutex-profile",
+        type=Path,
+        default=None,
+        help="Write a Go mutex profile from ccvm after the guest benchmark runs",
+    )
+    parser.add_argument(
+        "--pprof-block-profile",
+        type=Path,
+        default=None,
+        help="Write a Go block profile from ccvm after the guest benchmark runs",
+    )
     parser.add_argument("--pprof-seconds", type=int, default=35, help="CPU profile duration in seconds")
     parser.add_argument("--keep-work-dir", action="store_true")
     parser.add_argument("--output", type=Path, default=REPO_ROOT / "fs_benchmark_results.json")
@@ -389,6 +401,13 @@ def start_cpu_profile(base_url: str, output: Path, seconds: int) -> threading.Th
     thread = threading.Thread(target=worker, name="ccvm-pprof-cpu", daemon=True)
     thread.start()
     return thread
+
+
+def fetch_pprof_profile(base_url: str, profile_name: str, output: Path) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    url = f"{base_url.rstrip('/')}/debug/pprof/{profile_name}?debug=0"
+    with urllib.request.urlopen(url, timeout=30) as response:
+        output.write_bytes(response.read())
 
 
 def fetch_virtiofs_stats(base_url: str) -> Any:
@@ -486,7 +505,11 @@ def run_guest(args: argparse.Namespace) -> dict[str, Any]:
     guest_script_path = f"{mount}/fsbench_guest.py"
     guest_work = f"{mount}/bench"
 
-    if args.pprof_cpu_profile is not None:
+    if (
+        args.pprof_cpu_profile is not None
+        or args.pprof_mutex_profile is not None
+        or args.pprof_block_profile is not None
+    ):
         os.environ["CCX3_PPROF"] = "1"
     print(f"[fsbench] starting ccvm daemon with cache {args.cache_dir}", file=sys.stderr)
     state = start_daemon_for_cache_dir(args.cache_dir)
@@ -531,6 +554,12 @@ def run_guest(args: argparse.Namespace) -> dict[str, Any]:
             profile_thread.join(timeout=args.pprof_seconds + 20)
         if result.exit_code != 0:
             raise RuntimeError(f"guest benchmark failed with exit {result.exit_code}:\n{result.output}")
+        if args.pprof_mutex_profile is not None:
+            print(f"[fsbench] collecting ccvm mutex profile -> {args.pprof_mutex_profile}", file=sys.stderr)
+            fetch_pprof_profile(str(client._client.base_url), "mutex", args.pprof_mutex_profile)
+        if args.pprof_block_profile is not None:
+            print(f"[fsbench] collecting ccvm block profile -> {args.pprof_block_profile}", file=sys.stderr)
+            fetch_pprof_profile(str(client._client.base_url), "block", args.pprof_block_profile)
         payload = json.loads(result.output)
         stats_after = fetch_virtiofs_stats(str(client._client.base_url))
         payload["virtiofs_stats_before"] = stats_before

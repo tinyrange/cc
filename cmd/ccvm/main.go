@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -221,6 +222,8 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 	mux := http.NewServeMux()
 
 	if strings.TrimSpace(os.Getenv("CCX3_PPROF")) != "" {
+		runtime.SetMutexProfileFraction(1)
+		runtime.SetBlockProfileRate(1)
 		mux.HandleFunc("GET /debug/pprof/", pprof.Index)
 		mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
 		mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
