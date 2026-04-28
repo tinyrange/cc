@@ -143,14 +143,14 @@ jobs:
             $written = 0
             $capabilityResult = [WhpProbe]::WHvGetCapability(0, $buffer, $buffer.Length, [ref] $written)
             $hypervisorPresent = [BitConverter]::ToInt32($buffer, 0)
-            $probeLines.Add("WHvGetCapability(HypervisorPresent) HRESULT=0x{0:X8} written={1} present={2}" -f $capabilityResult, $written, $hypervisorPresent)
+            $probeLines.Add(("WHvGetCapability(HypervisorPresent) HRESULT=0x{0:X8} written={1} present={2}" -f $capabilityResult, $written, $hypervisorPresent))
 
             $partition = [IntPtr]::Zero
             $createResult = [WhpProbe]::WHvCreatePartition([ref] $partition)
-            $probeLines.Add("WHvCreatePartition HRESULT=0x{0:X8} handle={1}" -f $createResult, $partition)
+            $probeLines.Add(("WHvCreatePartition HRESULT=0x{0:X8} handle={1}" -f $createResult, $partition))
             if ($partition -ne [IntPtr]::Zero) {
               $deleteResult = [WhpProbe]::WHvDeletePartition($partition)
-              $probeLines.Add("WHvDeletePartition HRESULT=0x{0:X8}" -f $deleteResult)
+              $probeLines.Add(("WHvDeletePartition HRESULT=0x{0:X8}" -f $deleteResult))
             }
 
             $supported = ($capabilityResult -eq 0 -and $hypervisorPresent -ne 0 -and $createResult -eq 0)
