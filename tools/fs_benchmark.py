@@ -441,7 +441,13 @@ def diff_virtiofs_stats(before: Any, after: Any) -> Any:
                 after_item.get("queue_notifies", []),
             ),
             "fuse_ops": [],
+            "stages": [],
         }
+        delta["stages"] = diff_timing_stats(
+            before_item.get("stages", []),
+            after_item.get("stages", []),
+            "name",
+        )
         before_ops = {
             op.get("opcode"): op
             for op in before_item.get("fuse_ops", [])
@@ -465,6 +471,34 @@ def diff_virtiofs_stats(before: Any, after: Any) -> Any:
             })
         delta["fuse_ops"].sort(key=lambda op: op["count"], reverse=True)
         out.append(delta)
+    return out
+
+
+def diff_timing_stats(before_items: Any, after_items: Any, key_name: str) -> list[dict[str, Any]]:
+    if not isinstance(before_items, list) or not isinstance(after_items, list):
+        return []
+    before_by_key = {
+        item.get(key_name): item
+        for item in before_items
+        if isinstance(item, dict)
+    }
+    out = []
+    for after_item in after_items:
+        if not isinstance(after_item, dict):
+            continue
+        key = after_item.get(key_name)
+        before_item = before_by_key.get(key, {})
+        count = int(after_item.get("count", 0)) - int(before_item.get("count", 0))
+        total_nanos = int(after_item.get("total_nanos", 0)) - int(before_item.get("total_nanos", 0))
+        item = {
+            key_name: key,
+            "count": count,
+            "total_nanos": total_nanos,
+            "average_nanos": total_nanos // count if count else 0,
+            "max_nanos_after": int(after_item.get("max_nanos", 0)),
+        }
+        out.append(item)
+    out.sort(key=lambda item: item["total_nanos"], reverse=True)
     return out
 
 

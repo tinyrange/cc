@@ -255,12 +255,21 @@ type FS struct {
 	nextCompleteSeq  []uint64
 	completions      map[fsCompletionKey]fsCompletion
 	fuseOpStats      [fuseStatsSlots]fuseOpStat
+	stageStats       [fsStageCount]timingStat
 }
 
 const fuseStatsSlots = 64
+const fsStageCount = 4
 const fsWorkerCount = 1
 const fsInlineRespDescs = 32
 const fsPooledReqSize = 4096
+
+const (
+	fsStageQueueHarvest = iota
+	fsStageInlineDispatch
+	fsStageInlineComplete
+	fsStageAsyncComplete
+)
 
 type fsWork struct {
 	qidx              int
@@ -312,6 +321,7 @@ type FSStats struct {
 	QueueReady      []bool        `json:"queue_ready"`
 	QueueLastAvail  []uint16      `json:"queue_last_avail"`
 	FUSEOps         []FUSEOpStats `json:"fuse_ops"`
+	Stages          []TimingStats `json:"stages"`
 }
 
 type FUSEOpStats struct {
@@ -324,6 +334,18 @@ type FUSEOpStats struct {
 }
 
 type fuseOpStat struct {
+	timingStat
+}
+
+type TimingStats struct {
+	Name         string `json:"name"`
+	Count        uint64 `json:"count"`
+	TotalNanos   int64  `json:"total_nanos"`
+	MaxNanos     int64  `json:"max_nanos"`
+	AverageNanos int64  `json:"average_nanos"`
+}
+
+type timingStat struct {
 	count      atomic.Uint64
 	totalNanos atomic.Int64
 	maxNanos   atomic.Int64
@@ -525,7 +547,9 @@ func (f *FS) Write(addr uint64, size int, value uint64) error {
 	case regQueueNotify:
 		if int(value) < len(f.queues) {
 			f.queueNotifies[int(value)]++
+			harvestStart := time.Now()
 			works, err := f.processQueueAsyncLocked(int(value))
+			f.recordStageDuration(fsStageQueueHarvest, time.Since(harvestStart))
 			if err != nil {
 				f.mu.Unlock()
 				return err
@@ -763,6 +787,7 @@ func (f *FS) processWorksInline(works []fsWork) error {
 		return nil
 	}
 	completions := make([]fsInlineCompletion, 0, len(works))
+	dispatchStart := time.Now()
 	for _, work := range works {
 		reply, err := f.dispatchFUSE(work.req)
 		putFSReqBuffer(work.req, work.pooledReq)
@@ -773,6 +798,7 @@ func (f *FS) processWorksInline(works []fsWork) error {
 		}
 		completions = append(completions, fsInlineCompletion{work: work, reply: reply})
 	}
+	f.recordStageDuration(fsStageInlineDispatch, time.Since(dispatchStart))
 	return f.completeWorksInline(completions)
 }
 
@@ -800,6 +826,7 @@ func (f *FS) runWorker() {
 }
 
 func (f *FS) completeWork(work fsWork, reply []byte, workErr error) error {
+	defer f.recordStageTiming(fsStageAsyncComplete, time.Now())
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if work.generation != f.configGeneration || work.qidx < 0 || work.qidx >= len(f.queues) {
@@ -816,6 +843,7 @@ func (f *FS) completeWorksInline(completions []fsInlineCompletion) error {
 	if len(completions) == 0 {
 		return nil
 	}
+	defer f.recordStageTiming(fsStageInlineComplete, time.Now())
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for index := 0; index < len(completions); {
@@ -1445,16 +1473,7 @@ func (f *FS) recordFUSEDispatchTiming(opcode uint32, start time.Time) {
 	duration := time.Since(start)
 	f.fuseRequests.Add(1)
 	if opcode < uint32(len(f.fuseOpStats)) {
-		opStats := &f.fuseOpStats[opcode]
-		nanos := duration.Nanoseconds()
-		opStats.count.Add(1)
-		opStats.totalNanos.Add(nanos)
-		for {
-			oldMax := opStats.maxNanos.Load()
-			if nanos <= oldMax || opStats.maxNanos.CompareAndSwap(oldMax, nanos) {
-				break
-			}
-		}
+		recordTimingStat(&f.fuseOpStats[opcode].timingStat, duration)
 	}
 	if f.RecordTiming == nil {
 		return
@@ -1464,6 +1483,52 @@ func (f *FS) recordFUSEDispatchTiming(opcode uint32, start time.Time) {
 		tag = "unknown"
 	}
 	f.RecordTiming("virtio.fs."+tag+".fuse."+fuseOpcodeMetricName(opcode), duration)
+}
+
+func (f *FS) recordStageTiming(stage int, start time.Time) {
+	f.recordStageDuration(stage, time.Since(start))
+}
+
+func (f *FS) recordStageDuration(stage int, duration time.Duration) {
+	if stage < 0 || stage >= len(f.stageStats) {
+		return
+	}
+	recordTimingStat(&f.stageStats[stage], duration)
+	if f.RecordTiming == nil {
+		return
+	}
+	tag := strings.TrimRight(string(f.tag[:]), "\x00")
+	if tag == "" {
+		tag = "unknown"
+	}
+	f.RecordTiming("virtio.fs."+tag+".stage."+fsStageName(stage), duration)
+}
+
+func recordTimingStat(stat *timingStat, duration time.Duration) {
+	nanos := duration.Nanoseconds()
+	stat.count.Add(1)
+	stat.totalNanos.Add(nanos)
+	for {
+		oldMax := stat.maxNanos.Load()
+		if nanos <= oldMax || stat.maxNanos.CompareAndSwap(oldMax, nanos) {
+			break
+		}
+	}
+}
+
+func fsStageName(stage int) string {
+	switch stage {
+	case fsStageQueueHarvest:
+		return "queue_harvest"
+	case fsStageInlineDispatch:
+		return "inline_dispatch"
+	case fsStageInlineComplete:
+		return "inline_complete"
+	case fsStageAsyncComplete:
+		return "async_complete"
+	default:
+		return "unknown"
+	}
 }
 
 func fuseReply(unique uint64, errno int32, extra []byte) []byte {
@@ -1675,11 +1740,11 @@ func (f *FS) Stats() FSStats {
 	tag := strings.TrimRight(string(f.tag[:]), "\x00")
 	ops := make([]FUSEOpStats, 0, len(f.fuseOpStats))
 	for opcode, stat := range f.fuseOpStats {
-		count := stat.count.Load()
+		count := stat.timingStat.count.Load()
 		if count == 0 {
 			continue
 		}
-		totalNanos := stat.totalNanos.Load()
+		totalNanos := stat.timingStat.totalNanos.Load()
 		avg := int64(0)
 		if count != 0 {
 			avg = totalNanos / int64(count)
@@ -1690,7 +1755,7 @@ func (f *FS) Stats() FSStats {
 			Name:         fuseOpcodeName(opcodeValue),
 			Count:        count,
 			TotalNanos:   totalNanos,
-			MaxNanos:     stat.maxNanos.Load(),
+			MaxNanos:     stat.timingStat.maxNanos.Load(),
 			AverageNanos: avg,
 		})
 	}
@@ -1700,6 +1765,12 @@ func (f *FS) Stats() FSStats {
 		}
 		return ops[i].Count > ops[j].Count
 	})
+	stages := make([]TimingStats, 0, len(f.stageStats))
+	for stage, stat := range f.stageStats {
+		if stats, ok := timingStatsSnapshot(fsStageName(stage), &stat); ok {
+			stages = append(stages, stats)
+		}
+	}
 	return FSStats{
 		Tag:             tag,
 		MMIOReads:       f.mmioReads,
@@ -1713,7 +1784,27 @@ func (f *FS) Stats() FSStats {
 		QueueReady:      f.queueReadySnapshotLocked(),
 		QueueLastAvail:  f.queueLastAvailSnapshotLocked(),
 		FUSEOps:         ops,
+		Stages:          stages,
 	}
+}
+
+func timingStatsSnapshot(name string, stat *timingStat) (TimingStats, bool) {
+	count := stat.count.Load()
+	if count == 0 {
+		return TimingStats{}, false
+	}
+	totalNanos := stat.totalNanos.Load()
+	avg := int64(0)
+	if count != 0 {
+		avg = totalNanos / int64(count)
+	}
+	return TimingStats{
+		Name:         name,
+		Count:        count,
+		TotalNanos:   totalNanos,
+		MaxNanos:     stat.maxNanos.Load(),
+		AverageNanos: avg,
+	}, true
 }
 
 func (f *FS) queueReadySnapshotLocked() []bool {
