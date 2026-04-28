@@ -43,8 +43,11 @@ type shareMount struct {
 }
 
 type mountedNode struct {
-	id   uint64
-	path string
+	id              uint64
+	path            string
+	backend         FSBackend
+	backendNodeID   uint64
+	backendResolved bool
 }
 
 type mountedHandle struct {
@@ -176,11 +179,21 @@ func (m *mountedFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32)
 	}
 
 	childPath := path.Join(parentNode.path, name)
-	attr, errno := m.resolveAttr(childPath)
+	if m.isSyntheticPath(childPath) {
+		attr := syntheticDirAttr()
+		id := m.ensureNode(childPath)
+		attr.Ino = id
+		return id, attr, 0
+	}
+	backend, backendNodeID, _, errno := m.resolveBackendNode(childPath)
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
 	}
-	id := m.ensureNode(childPath)
+	attr, errno := backend.GetAttr(backendNodeID)
+	if errno != 0 {
+		return 0, FuseAttr{}, errno
+	}
+	id := m.ensureResolvedNode(childPath, backend, backendNodeID)
 	attr.Ino = id
 	return id, attr, 0
 }
@@ -294,7 +307,7 @@ func (m *mountedFS) ReadDir(nodeID uint64, fh uint64, off uint64, maxBytes uint3
 				continue
 			}
 			childPath := path.Join(node.path, child.name)
-			childID := m.ensureNode(childPath)
+			childID := m.ensureResolvedNode(childPath, handle.backend, child.ino)
 			child.ino = childID
 			names[child.name] = child
 		}
@@ -367,8 +380,7 @@ func (m *mountedFS) Mkdir(parent uint64, name string, mode uint32) (uint64, Fuse
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
 	}
-	_ = nodeID
-	id := m.ensureNode(childPath)
+	id := m.ensureResolvedNode(childPath, backend, nodeID)
 	attr.Ino = id
 	return id, attr, 0
 }
@@ -428,7 +440,7 @@ func (m *mountedFS) Create(parent uint64, name string, flags uint32, mode uint32
 	if errno != 0 {
 		return 0, 0, FuseAttr{}, errno
 	}
-	id := m.ensureNode(childPath)
+	id := m.ensureResolvedNode(childPath, backend, backendNodeID)
 	attr.Ino = id
 	return id, m.storeHandle(backend, backendNodeID, fh, false), attr, 0
 }
@@ -605,6 +617,9 @@ func (m *mountedFS) resolveBackendNode(guestPath string) (FSBackend, uint64, *sh
 		return m.root, 1, nil, 0
 	}
 	mount := m.mountForPath(guestPath)
+	if node := m.nodeForPath(guestPath); node != nil && node.backendResolved {
+		return node.backend, node.backendNodeID, mount, 0
+	}
 	if mount == nil {
 		nodeID, _, errno := backendLookupPath(m.root, guestPath)
 		return m.root, nodeID, nil, errno
@@ -785,17 +800,39 @@ func (m *mountedFS) node(id uint64) *mountedNode {
 }
 
 func (m *mountedFS) ensureNode(guestPath string) uint64 {
+	return m.ensureResolvedNode(guestPath, nil, 0)
+}
+
+func (m *mountedFS) ensureResolvedNode(guestPath string, backend FSBackend, backendNodeID uint64) uint64 {
 	guestPath = cleanMountPath(guestPath)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if id, ok := m.pathToNode[guestPath]; ok {
+		if node := m.nodes[id]; node != nil && backend != nil {
+			node.backend = backend
+			node.backendNodeID = backendNodeID
+			node.backendResolved = true
+		}
 		return id
 	}
 	id := m.nextNodeID
 	m.nextNodeID++
-	m.nodes[id] = &mountedNode{id: id, path: guestPath}
+	m.nodes[id] = &mountedNode{
+		id:              id,
+		path:            guestPath,
+		backend:         backend,
+		backendNodeID:   backendNodeID,
+		backendResolved: backend != nil,
+	}
 	m.pathToNode[guestPath] = id
 	return id
+}
+
+func (m *mountedFS) nodeForPath(guestPath string) *mountedNode {
+	guestPath = cleanMountPath(guestPath)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.nodes[m.pathToNode[guestPath]]
 }
 
 func (m *mountedFS) removeNode(guestPath string) {

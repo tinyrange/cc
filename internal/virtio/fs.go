@@ -2089,7 +2089,7 @@ func (p *passthroughFS) GetAttr(nodeID uint64) (FuseAttr, int32) {
 
 func (p *passthroughFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32) {
 	p.logNode("lookup-parent", parent)
-	hostParent, errno := p.hostPath(parent)
+	hostParent, guestParent, errno := p.hostAndGuestPath(parent)
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
 	}
@@ -2103,7 +2103,7 @@ func (p *passthroughFS) Lookup(parent uint64, name string) (uint64, FuseAttr, in
 	if err != nil {
 		return 0, FuseAttr{}, errnoFromError(err)
 	}
-	guestPath := p.guestPathForHost(host)
+	guestPath := joinGuestChild(guestParent, rel)
 	if p.root != "" {
 		p.logf("lookup name=%q guest=%q host=%q", name, guestPath, host)
 	}
@@ -2113,7 +2113,7 @@ func (p *passthroughFS) Lookup(parent uint64, name string) (uint64, FuseAttr, in
 
 func (p *passthroughFS) Mkdir(parent uint64, name string, mode uint32) (uint64, FuseAttr, int32) {
 	p.logNode("mkdir-parent", parent)
-	hostParent, errno := p.hostPath(parent)
+	hostParent, guestParent, errno := p.hostAndGuestPath(parent)
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
 	}
@@ -2129,7 +2129,7 @@ func (p *passthroughFS) Mkdir(parent uint64, name string, mode uint32) (uint64, 
 	if err != nil {
 		return 0, FuseAttr{}, errnoFromError(err)
 	}
-	guestPath := p.guestPathForHost(host)
+	guestPath := joinGuestChild(guestParent, rel)
 	if p.meta != nil {
 		p.mu.Lock()
 		if _, ok := p.meta[guestPath]; !ok {
@@ -2147,7 +2147,7 @@ func (p *passthroughFS) Mkdir(parent uint64, name string, mode uint32) (uint64, 
 
 func (p *passthroughFS) Create(parent uint64, name string, flags uint32, mode uint32) (uint64, uint64, FuseAttr, int32) {
 	p.logNode("create-parent", parent)
-	hostParent, errno := p.hostPath(parent)
+	hostParent, guestParent, errno := p.hostAndGuestPath(parent)
 	if errno != 0 {
 		return 0, 0, FuseAttr{}, errno
 	}
@@ -2165,7 +2165,7 @@ func (p *passthroughFS) Create(parent uint64, name string, flags uint32, mode ui
 		_ = file.Close()
 		return 0, 0, FuseAttr{}, errnoFromError(err)
 	}
-	guestPath := p.guestPathForHost(host)
+	guestPath := joinGuestChild(guestParent, rel)
 	nodeID := p.ensureNode(guestPath)
 	p.mu.Lock()
 	handle := p.nextHandle
@@ -2244,7 +2244,7 @@ func (p *passthroughFS) FsyncDir(_ uint64, fh uint64, _ uint32) int32 {
 }
 
 func (p *passthroughFS) Read(nodeID uint64, fh uint64, off uint64, size uint32) ([]byte, int32) {
-	p.logf("read node=%d path=%q fh=%d off=%d size=%d", nodeID, p.DebugPath(nodeID), fh, off, size)
+	p.logf("read node=%d fh=%d off=%d size=%d", nodeID, fh, off, size)
 	p.mu.RLock()
 	handle, ok := p.handles[fh]
 	p.mu.RUnlock()
@@ -2296,7 +2296,7 @@ func (p *passthroughFS) Lseek(nodeID uint64, fh uint64, offset uint64, whence ui
 
 func (p *passthroughFS) OpenDir(nodeID uint64, _ uint32) (uint64, int32) {
 	p.logNode("opendir", nodeID)
-	host, errno := p.hostPath(nodeID)
+	host, guest, errno := p.hostAndGuestPath(nodeID)
 	if errno != 0 {
 		return 0, errno
 	}
@@ -2309,7 +2309,7 @@ func (p *passthroughFS) OpenDir(nodeID uint64, _ uint32) (uint64, int32) {
 		{name: "..", typ: dirTypeDir, ino: nodeID},
 	}
 	for _, entry := range entries {
-		childPath := p.guestPathForHost(filepath.Join(host, entry.Name()))
+		childPath := joinGuestChild(guest, entry.Name())
 		childID := p.ensureNode(childPath)
 		dirEntries = append(dirEntries, dirEntry{
 			name: entry.Name(),
@@ -2386,7 +2386,7 @@ func (p *passthroughFS) Readlink(nodeID uint64) (string, int32) {
 
 func (p *passthroughFS) RmDir(parent uint64, name string) int32 {
 	p.logNode("rmdir-parent", parent)
-	hostParent, errno := p.hostPath(parent)
+	hostParent, guestParent, errno := p.hostAndGuestPath(parent)
 	if errno != 0 {
 		return errno
 	}
@@ -2399,7 +2399,7 @@ func (p *passthroughFS) RmDir(parent uint64, name string) int32 {
 	if err := os.Remove(host); err != nil {
 		return errnoFromError(err)
 	}
-	guestPath := p.guestPathForHost(host)
+	guestPath := joinGuestChild(guestParent, rel)
 	p.mu.Lock()
 	delete(p.meta, guestPath)
 	delete(p.pathToNode, guestPath)
@@ -2414,7 +2414,7 @@ func (p *passthroughFS) RmDir(parent uint64, name string) int32 {
 }
 
 func (p *passthroughFS) Unlink(parent uint64, name string) int32 {
-	hostParent, errno := p.hostPath(parent)
+	hostParent, guestParent, errno := p.hostAndGuestPath(parent)
 	if errno != 0 {
 		return errno
 	}
@@ -2426,25 +2426,27 @@ func (p *passthroughFS) Unlink(parent uint64, name string) int32 {
 	if err := os.Remove(host); err != nil {
 		return errnoFromError(err)
 	}
-	p.removeNodeForGuestPath(p.guestPathForHost(host))
+	p.removeNodeForGuestPath(joinGuestChild(guestParent, strings.TrimPrefix(clean, "/")))
 	return 0
 }
 
 func (p *passthroughFS) Rename(parent uint64, name string, newParent uint64, newName string, _ uint32) int32 {
-	oldParent, errno := p.hostPath(parent)
+	oldParent, oldGuestParent, errno := p.hostAndGuestPath(parent)
 	if errno != 0 {
 		return errno
 	}
-	newParentPath, errno := p.hostPath(newParent)
+	newParentPath, newGuestParent, errno := p.hostAndGuestPath(newParent)
 	if errno != 0 {
 		return errno
 	}
-	oldHost := filepath.Join(oldParent, filepath.FromSlash(strings.TrimPrefix(path.Clean("/"+name), "/")))
-	newHost := filepath.Join(newParentPath, filepath.FromSlash(strings.TrimPrefix(path.Clean("/"+newName), "/")))
+	oldRel := strings.TrimPrefix(path.Clean("/"+name), "/")
+	newRel := strings.TrimPrefix(path.Clean("/"+newName), "/")
+	oldHost := filepath.Join(oldParent, filepath.FromSlash(oldRel))
+	newHost := filepath.Join(newParentPath, filepath.FromSlash(newRel))
 	if err := os.Rename(oldHost, newHost); err != nil {
 		return errnoFromError(err)
 	}
-	p.renameNodeGuestPath(p.guestPathForHost(oldHost), p.guestPathForHost(newHost))
+	p.renameNodeGuestPath(joinGuestChild(oldGuestParent, oldRel), joinGuestChild(newGuestParent, newRel))
 	return 0
 }
 
@@ -2509,19 +2511,24 @@ func (p *passthroughFS) StatFS(_ uint64) (uint64, uint64, uint64, uint64, uint64
 }
 
 func (p *passthroughFS) hostPath(nodeID uint64) (string, int32) {
+	host, _, errno := p.hostAndGuestPath(nodeID)
+	return host, errno
+}
+
+func (p *passthroughFS) hostAndGuestPath(nodeID uint64) (string, string, int32) {
 	p.mu.Lock()
 	guest, ok := p.nodes[nodeID]
 	p.mu.Unlock()
 	if !ok {
-		return "", -linuxENOENT
+		return "", "", -linuxENOENT
 	}
 	if p.root == "" {
-		return "", -linuxENOENT
+		return "", "", -linuxENOENT
 	}
 	if guest == "/" {
-		return p.root, 0
+		return p.root, guest, 0
 	}
-	return filepath.Join(p.root, filepath.FromSlash(strings.TrimPrefix(guest, "/"))), 0
+	return filepath.Join(p.root, filepath.FromSlash(strings.TrimPrefix(guest, "/"))), guest, 0
 }
 
 func (p *passthroughFS) guestPathForHost(host string) string {
@@ -2535,6 +2542,13 @@ func (p *passthroughFS) guestPathForHost(host string) string {
 	return "/" + filepath.ToSlash(rel)
 }
 
+func joinGuestChild(parentGuest, rel string) string {
+	if rel == "" {
+		return path.Clean(parentGuest)
+	}
+	return path.Join(parentGuest, filepath.ToSlash(rel))
+}
+
 func (p *passthroughFS) DebugPath(nodeID uint64) string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -2542,7 +2556,7 @@ func (p *passthroughFS) DebugPath(nodeID uint64) string {
 }
 
 func (p *passthroughFS) GetXattr(nodeID uint64, name string) ([]byte, int32) {
-	p.logf("getxattr-backend node=%d path=%q name=%q", nodeID, p.DebugPath(nodeID), name)
+	p.logf("getxattr-backend node=%d name=%q", nodeID, name)
 	return nil, -linuxENODATA
 }
 
@@ -2552,7 +2566,7 @@ func (p *passthroughFS) ListXattr(nodeID uint64) ([]byte, int32) {
 }
 
 func (p *passthroughFS) logNode(op string, nodeID uint64) {
-	p.logf("%s node=%d path=%q", op, nodeID, p.DebugPath(nodeID))
+	p.logf("%s node=%d", op, nodeID)
 }
 
 func (p *passthroughFS) logf(format string, args ...any) {
@@ -2625,14 +2639,20 @@ func (p *passthroughFS) fileAttr(nodeID uint64, info os.FileInfo) FuseAttr {
 	if attr.BlkSize == 0 {
 		attr.BlkSize = 4096
 	}
-	if meta, ok := p.meta[p.DebugPath(nodeID)]; ok {
-		attr.UID = meta.UID
-		attr.GID = meta.GID
-		if meta.RDev != 0 {
-			attr.RDev = meta.RDev
-		}
-		if meta.Mode != 0 {
-			attr.Mode = fsmeta.NormalizeLinuxMode(meta.Mode, info.Mode())
+	if p.meta != nil {
+		p.mu.RLock()
+		guestPath := p.nodes[nodeID]
+		meta, ok := p.meta[guestPath]
+		p.mu.RUnlock()
+		if ok {
+			attr.UID = meta.UID
+			attr.GID = meta.GID
+			if meta.RDev != 0 {
+				attr.RDev = meta.RDev
+			}
+			if meta.Mode != 0 {
+				attr.Mode = fsmeta.NormalizeLinuxMode(meta.Mode, info.Mode())
+			}
 		}
 	}
 	if info.IsDir() {
