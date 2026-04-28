@@ -25,8 +25,9 @@ type ShareMount struct {
 }
 
 type mountedFS struct {
-	root   FSBackend
-	mounts []shareMount
+	root           FSBackend
+	mounts         []shareMount
+	writebackCache bool
 
 	mu         sync.RWMutex
 	nextNodeID uint64
@@ -104,6 +105,12 @@ func (m *mountedFS) AddShare(share ShareMount) error {
 	if share.Backend == nil {
 		return nil
 	}
+	m.mu.RLock()
+	writebackCache := m.writebackCache
+	m.mu.RUnlock()
+	if be, ok := share.Backend.(fsWritebackCacheBackend); ok {
+		be.SetWritebackCache(writebackCache)
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -130,6 +137,26 @@ func (m *mountedFS) AddShare(share ShareMount) error {
 		return len(m.mounts[i].path) < len(m.mounts[j].path)
 	})
 	return nil
+}
+
+func (m *mountedFS) SetWritebackCache(enabled bool) {
+	m.mu.Lock()
+	m.writebackCache = enabled
+	root := m.root
+	backends := make([]FSBackend, 0, len(m.mounts))
+	for _, mount := range m.mounts {
+		backends = append(backends, mount.backend)
+	}
+	m.mu.Unlock()
+
+	if be, ok := root.(fsWritebackCacheBackend); ok {
+		be.SetWritebackCache(enabled)
+	}
+	for _, backend := range backends {
+		if be, ok := backend.(fsWritebackCacheBackend); ok {
+			be.SetWritebackCache(enabled)
+		}
+	}
 }
 
 func cleanMountPath(value string) string {

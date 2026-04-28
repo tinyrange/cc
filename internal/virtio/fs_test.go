@@ -527,6 +527,85 @@ func TestFUSEInitEnablesLargeWrites(t *testing.T) {
 	}
 }
 
+func TestFUSEInitExplicitWritebackCache(t *testing.T) {
+	t.Setenv("CCX3_VIRTIOFS_WRITEBACK", "1")
+
+	fsdev := NewFS(0, 0, 0, "root", NewPassthroughFS(t.TempDir(), nil))
+
+	const unique = uint64(45)
+	req := make([]byte, fuseInHeaderSize+16)
+	binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
+	binary.LittleEndian.PutUint32(req[4:8], fuseInit)
+	binary.LittleEndian.PutUint64(req[8:16], unique)
+	binary.LittleEndian.PutUint32(req[40:44], 7)
+	binary.LittleEndian.PutUint32(req[44:48], 31)
+
+	reply, err := fsdev.dispatchFUSELocked(req)
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(INIT) error = %v", err)
+	}
+	extra := reply[fuseOutHeaderSize:]
+	flags := binary.LittleEndian.Uint32(extra[12:16])
+	if flags&fuseCapWritebackCache == 0 {
+		t.Fatalf("INIT flags = %#x, missing WRITEBACK_CACHE", flags)
+	}
+	if got := binary.LittleEndian.Uint16(extra[16:18]); got != 256 {
+		t.Fatalf("INIT max_background = %d, want 256", got)
+	}
+	if got := binary.LittleEndian.Uint16(extra[18:20]); got != 192 {
+		t.Fatalf("INIT congestion_threshold = %d, want 192", got)
+	}
+}
+
+func TestFUSEGetXattrMissing(t *testing.T) {
+	t.Parallel()
+
+	fsdev := NewFS(0, 0, 0, "root", NewPassthroughFS(t.TempDir(), nil))
+
+	const unique = uint64(46)
+	req := make([]byte, fuseInHeaderSize+8+len("security.capability")+1)
+	binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
+	binary.LittleEndian.PutUint32(req[4:8], fuseGetXattr)
+	binary.LittleEndian.PutUint64(req[8:16], unique)
+	binary.LittleEndian.PutUint64(req[16:24], 1)
+	copy(req[fuseInHeaderSize+8:], "security.capability")
+
+	reply, err := fsdev.dispatchFUSELocked(req)
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(GETXATTR) error = %v", err)
+	}
+	if got := int32(binary.LittleEndian.Uint32(reply[4:8])); got != -linuxENODATA {
+		t.Fatalf("GETXATTR errno = %d, want %d", got, -linuxENODATA)
+	}
+}
+
+func TestPassthroughWritebackWriteOnlyHandleAllowsRead(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "data.bin"), []byte("abcdef"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	be := NewPassthroughFS(root, nil).(*passthroughFS)
+	be.SetWritebackCache(true)
+	nodeID, _, errno := be.Lookup(1, "data.bin")
+	if errno != 0 {
+		t.Fatalf("Lookup() errno = %d", errno)
+	}
+	fh, errno := be.Open(nodeID, linuxOWRONLY)
+	if errno != 0 {
+		t.Fatalf("Open(O_WRONLY) errno = %d", errno)
+	}
+	defer be.Release(nodeID, fh)
+	got, errno := be.Read(nodeID, fh, 1, 3)
+	if errno != 0 {
+		t.Fatalf("Read() errno = %d", errno)
+	}
+	if string(got) != "bcd" {
+		t.Fatalf("Read() = %q, want bcd", got)
+	}
+}
+
 func TestFUSECachePolicyEncodesTTLAndOpenFlags(t *testing.T) {
 	t.Setenv("CCX3_VIRTIOFS_CACHE", "aggressive")
 

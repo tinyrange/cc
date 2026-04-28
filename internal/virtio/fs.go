@@ -104,9 +104,10 @@ const (
 )
 
 const (
-	fuseCapPosixLocks = 1 << 1
-	fuseCapBigWrites  = 1 << 5
-	fuseCapMaxPages   = 1 << 22
+	fuseCapPosixLocks     = 1 << 1
+	fuseCapBigWrites      = 1 << 5
+	fuseCapWritebackCache = 1 << 16
+	fuseCapMaxPages       = 1 << 22
 )
 
 const (
@@ -199,6 +200,10 @@ type fsRenameBackend interface {
 	Rename(parent uint64, name string, newParent uint64, newName string, flags uint32) int32
 }
 
+type fsWritebackCacheBackend interface {
+	SetWritebackCache(enabled bool)
+}
+
 type FuseAttr struct {
 	Ino       uint64
 	Size      uint64
@@ -219,16 +224,17 @@ type FuseAttr struct {
 }
 
 type FS struct {
-	Base         uint64
-	Size         uint64
-	IRQ          uint32
-	Log          io.Writer
-	Strict       bool
-	Async        bool
-	RecordTiming func(name string, duration time.Duration)
-	cacheMode    string
-	entryTTL     time.Duration
-	attrTTL      time.Duration
+	Base           uint64
+	Size           uint64
+	IRQ            uint32
+	Log            io.Writer
+	Strict         bool
+	Async          bool
+	RecordTiming   func(name string, duration time.Duration)
+	cacheMode      string
+	writebackCache bool
+	entryTTL       time.Duration
+	attrTTL        time.Duration
 
 	mu               sync.Mutex
 	workerOnce       sync.Once
@@ -363,20 +369,24 @@ type fsDesc struct {
 func NewFS(base, size uint64, irq uint32, tag string, backend FSBackend) *FS {
 	cacheMode, entryTTL, attrTTL := resolveFSCachePolicy()
 	fs := &FS{
-		Base:        base,
-		Size:        size,
-		IRQ:         irq,
-		backend:     backend,
-		Async:       strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_ASYNC")) != "",
-		cacheMode:   cacheMode,
-		entryTTL:    entryTTL,
-		attrTTL:     attrTTL,
-		workCh:      make(chan fsWork, 1024),
-		completions: make(map[fsCompletionKey]fsCompletion),
+		Base:           base,
+		Size:           size,
+		IRQ:            irq,
+		backend:        backend,
+		Async:          strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_ASYNC")) != "",
+		cacheMode:      cacheMode,
+		writebackCache: strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_WRITEBACK")) != "",
+		entryTTL:       entryTTL,
+		attrTTL:        attrTTL,
+		workCh:         make(chan fsWork, 1024),
+		completions:    make(map[fsCompletionKey]fsCompletion),
 	}
 	fs.resetQueueStateLocked()
 	if fs.backend == nil {
 		fs.backend = NewPassthroughFS("", nil)
+	}
+	if be, ok := fs.backend.(fsWritebackCacheBackend); ok {
+		be.SetWritebackCache(fs.writebackCache)
 	}
 	copy(fs.tag[:], []byte(tag))
 	fs.resetLocked()
@@ -1005,6 +1015,9 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		if maxWrite > 4096 {
 			flags |= fuseCapBigWrites | fuseCapMaxPages
 		}
+		if f.writebackCache {
+			flags |= fuseCapWritebackCache
+		}
 		maxPages := (maxWrite + 4095) / 4096
 		if maxPages == 0 {
 			maxPages = 1
@@ -1025,8 +1038,14 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		binary.LittleEndian.PutUint32(extra[4:8], replyMinor)
 		binary.LittleEndian.PutUint32(extra[8:12], 128<<10)
 		binary.LittleEndian.PutUint32(extra[12:16], flags)
-		binary.LittleEndian.PutUint16(extra[16:18], 16)
-		binary.LittleEndian.PutUint16(extra[18:20], 32)
+		maxBackground := uint16(16)
+		congestionThreshold := uint16(32)
+		if f.writebackCache {
+			maxBackground = 256
+			congestionThreshold = 192
+		}
+		binary.LittleEndian.PutUint16(extra[16:18], maxBackground)
+		binary.LittleEndian.PutUint16(extra[18:20], congestionThreshold)
 		binary.LittleEndian.PutUint32(extra[20:24], maxWrite)
 		binary.LittleEndian.PutUint32(extra[24:28], 1)
 		binary.LittleEndian.PutUint16(extra[28:30], uint16(maxPages))
@@ -1975,8 +1994,9 @@ func bytesIndexByte(buf []byte, want byte) int {
 }
 
 type passthroughFS struct {
-	root string
-	meta map[string]fsmeta.Entry
+	root           string
+	meta           map[string]fsmeta.Entry
+	writebackCache bool
 
 	mu         sync.RWMutex
 	nextNodeID uint64
@@ -2086,6 +2106,12 @@ func (p *passthroughFS) Init() (uint32, uint32) {
 	return 128 << 10, fuseCapPosixLocks
 }
 
+func (p *passthroughFS) SetWritebackCache(enabled bool) {
+	p.mu.Lock()
+	p.writebackCache = enabled
+	p.mu.Unlock()
+}
+
 func (p *passthroughFS) GetAttr(nodeID uint64) (FuseAttr, int32) {
 	p.logNode("getattr", nodeID)
 	host, errno := p.hostPath(nodeID)
@@ -2168,7 +2194,7 @@ func (p *passthroughFS) Create(parent uint64, name string, flags uint32, mode ui
 		return 0, 0, FuseAttr{}, -linuxEINVAL
 	}
 	host := filepath.Join(hostParent, filepath.FromSlash(rel))
-	file, err := os.OpenFile(host, translateLinuxOpenFlags(flags)|os.O_CREATE, fs.FileMode(mode&linuxPermMask))
+	file, err := os.OpenFile(host, p.translateOpenFlags(flags)|os.O_CREATE, fs.FileMode(mode&linuxPermMask))
 	if err != nil {
 		return 0, 0, FuseAttr{}, errnoFromError(err)
 	}
@@ -2200,7 +2226,7 @@ func (p *passthroughFS) Open(nodeID uint64, flags uint32) (uint64, int32) {
 	if info.IsDir() {
 		return 0, -linuxEISDIR
 	}
-	file, err := os.OpenFile(host, translateLinuxOpenFlags(flags), 0)
+	file, err := os.OpenFile(host, p.translateOpenFlags(flags), 0)
 	if err != nil {
 		return 0, errnoFromError(err)
 	}
@@ -2525,6 +2551,13 @@ func (p *passthroughFS) StatFS(_ uint64) (uint64, uint64, uint64, uint64, uint64
 func (p *passthroughFS) hostPath(nodeID uint64) (string, int32) {
 	host, _, errno := p.hostAndGuestPath(nodeID)
 	return host, errno
+}
+
+func (p *passthroughFS) translateOpenFlags(flags uint32) int {
+	p.mu.RLock()
+	writebackCache := p.writebackCache
+	p.mu.RUnlock()
+	return translateLinuxOpenFlags(flags, writebackCache)
 }
 
 func (p *passthroughFS) hostAndGuestPath(nodeID uint64) (string, string, int32) {
@@ -3285,11 +3318,15 @@ func errorAs(err error, target any) bool {
 	return false
 }
 
-func translateLinuxOpenFlags(flags uint32) int {
+func translateLinuxOpenFlags(flags uint32, writebackCache bool) int {
 	openFlags := 0
 	switch flags & 0x3 {
 	case linuxOWRONLY:
-		openFlags |= os.O_WRONLY
+		if writebackCache {
+			openFlags |= os.O_RDWR
+		} else {
+			openFlags |= os.O_WRONLY
+		}
 	case linuxORDWR:
 		openFlags |= os.O_RDWR
 	default:
