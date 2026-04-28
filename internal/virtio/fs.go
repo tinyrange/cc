@@ -279,6 +279,12 @@ type fsCompletion struct {
 	err   error
 }
 
+type fsInlineCompletion struct {
+	work  fsWork
+	reply []byte
+	err   error
+}
+
 var fsReqPool = sync.Pool{
 	New: func() any {
 		return make([]byte, fsPooledReqSize)
@@ -730,6 +736,10 @@ func (f *FS) enqueueWorks(works []fsWork) {
 }
 
 func (f *FS) processWorksInline(works []fsWork) error {
+	if len(works) == 0 {
+		return nil
+	}
+	completions := make([]fsInlineCompletion, 0, len(works))
 	for _, work := range works {
 		reply, err := f.dispatchFUSE(work.req)
 		putFSReqBuffer(work.req, work.pooledReq)
@@ -738,11 +748,9 @@ func (f *FS) processWorksInline(works []fsWork) error {
 		if err != nil {
 			return err
 		}
-		if err := f.completeWork(work, reply, nil); err != nil {
-			return err
-		}
+		completions = append(completions, fsInlineCompletion{work: work, reply: reply})
 	}
-	return nil
+	return f.completeWorksInline(completions)
 }
 
 func (f *FS) startWorkers() {
@@ -781,6 +789,63 @@ func (f *FS) completeWork(work fsWork, reply []byte, workErr error) error {
 	return f.drainCompletionsLocked(work.qidx)
 }
 
+func (f *FS) completeWorksInline(completions []fsInlineCompletion) error {
+	if len(completions) == 0 {
+		return nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for index := 0; index < len(completions); {
+		qidx := completions[index].work.qidx
+		if qidx < 0 || qidx >= len(f.queues) {
+			index++
+			continue
+		}
+		q := &f.queues[qidx]
+		oldUsedIdx := q.usedIdx
+		wroteCompletion := false
+		interruptSuppressed := true
+		for index < len(completions) && completions[index].work.qidx == qidx {
+			completion := completions[index]
+			index++
+			if completion.work.generation != f.configGeneration {
+				continue
+			}
+			if completion.err != nil {
+				return completion.err
+			}
+			if completion.reply == nil {
+				continue
+			}
+			if err := f.writeCompletionUsedLocked(q, completion.work, completion.reply); err != nil {
+				return err
+			}
+			wroteCompletion = true
+			if !completion.work.suppressInterrupt {
+				interruptSuppressed = false
+			}
+		}
+		if !wroteCompletion || !f.isCompletingQueue(qidx) {
+			continue
+		}
+		shouldInterrupt := false
+		if f.driverFeatures&featureRingEventIdx != 0 {
+			shouldInterrupt = f.shouldInterruptLocked(q, oldUsedIdx, q.usedIdx, 0)
+		} else {
+			shouldInterrupt = !interruptSuppressed
+		}
+		if shouldInterrupt {
+			f.interruptStatus |= fsInterruptVring
+			f.interruptRaises++
+			f.logf("interrupt-raise status=%#x", f.interruptStatus)
+			if err := f.updateIRQLocked(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (f *FS) drainCompletionsLocked(qidx int) error {
 	q := &f.queues[qidx]
 	for {
@@ -805,6 +870,22 @@ func (f *FS) drainCompletionsLocked(qidx int) error {
 }
 
 func (f *FS) writeCompletionLocked(q *queue, work fsWork, reply []byte) error {
+	if err := f.writeCompletionUsedLocked(q, work, reply); err != nil {
+		return err
+	}
+	if (f.driverFeatures&featureRingEventIdx != 0 || !work.suppressInterrupt) && f.isCompletingQueue(work.qidx) {
+		if f.driverFeatures&featureRingEventIdx != 0 && !f.shouldInterruptLocked(q, q.usedIdx-1, q.usedIdx, 0) {
+			return nil
+		}
+		f.interruptStatus |= fsInterruptVring
+		f.interruptRaises++
+		f.logf("interrupt-raise status=%#x", f.interruptStatus)
+		return f.updateIRQLocked()
+	}
+	return nil
+}
+
+func (f *FS) writeCompletionUsedLocked(q *queue, work fsWork, reply []byte) error {
 	offset := 0
 	for i := 0; i < work.respCount; i++ {
 		d := work.responseDesc(i)
@@ -827,15 +908,6 @@ func (f *FS) writeCompletionLocked(q *queue, work fsWork, reply []byte) error {
 		return err
 	}
 	f.logf("used-ring q=%d head=%d len=%d", work.qidx, work.head, len(reply))
-	if (f.driverFeatures&featureRingEventIdx != 0 || !work.suppressInterrupt) && f.isCompletingQueue(work.qidx) {
-		if f.driverFeatures&featureRingEventIdx != 0 && !f.shouldInterruptLocked(q, q.usedIdx-1, q.usedIdx, 0) {
-			return nil
-		}
-		f.interruptStatus |= fsInterruptVring
-		f.interruptRaises++
-		f.logf("interrupt-raise status=%#x", f.interruptStatus)
-		return f.updateIRQLocked()
-	}
 	return nil
 }
 
