@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"j5.nz/cc/internal/fdt"
@@ -222,7 +223,6 @@ type FS struct {
 
 	mu               sync.Mutex
 	workerOnce       sync.Once
-	statsMu          sync.Mutex
 	mem              GuestMemory
 	irq              IRQController
 	backend          FSBackend
@@ -239,7 +239,7 @@ type FS struct {
 	mmioReads        uint64
 	mmioWrites       uint64
 	queueNotifies    []uint64
-	fuseRequests     uint64
+	fuseRequests     atomic.Uint64
 	interruptRaises  uint64
 	irqTransitions   uint64
 	workCh           chan fsWork
@@ -310,9 +310,9 @@ type FUSEOpStats struct {
 }
 
 type fuseOpStat struct {
-	count      uint64
-	totalNanos int64
-	maxNanos   int64
+	count      atomic.Uint64
+	totalNanos atomic.Int64
+	maxNanos   atomic.Int64
 }
 
 type fsDesc struct {
@@ -1339,15 +1339,17 @@ func fuseOpcodeMetricName(opcode uint32) string {
 
 func (f *FS) recordFUSEDispatchTiming(opcode uint32, start time.Time) {
 	duration := time.Since(start)
-	f.statsMu.Lock()
-	defer f.statsMu.Unlock()
-	f.fuseRequests++
+	f.fuseRequests.Add(1)
 	if opcode < uint32(len(f.fuseOpStats)) {
 		opStats := &f.fuseOpStats[opcode]
-		opStats.count++
-		opStats.totalNanos += duration.Nanoseconds()
-		if duration.Nanoseconds() > opStats.maxNanos {
-			opStats.maxNanos = duration.Nanoseconds()
+		nanos := duration.Nanoseconds()
+		opStats.count.Add(1)
+		opStats.totalNanos.Add(nanos)
+		for {
+			oldMax := opStats.maxNanos.Load()
+			if nanos <= oldMax || opStats.maxNanos.CompareAndSwap(oldMax, nanos) {
+				break
+			}
 		}
 	}
 	if f.RecordTiming == nil {
@@ -1504,8 +1506,6 @@ func (f *FS) Summary() string {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.statsMu.Lock()
-	defer f.statsMu.Unlock()
 	tag := strings.TrimRight(string(f.tag[:]), "\x00")
 	queueNotifies := append([]uint64(nil), f.queueNotifies...)
 	queueReady := f.queueReadySnapshotLocked()
@@ -1517,7 +1517,7 @@ func (f *FS) Summary() string {
 		f.mmioWrites,
 		f.status,
 		queueNotifies,
-		f.fuseRequests,
+		f.fuseRequests.Load(),
 		f.interruptRaises,
 		f.irqTransitions,
 		f.irqHigh,
@@ -1533,25 +1533,25 @@ func (f *FS) Stats() FSStats {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.statsMu.Lock()
-	defer f.statsMu.Unlock()
 	tag := strings.TrimRight(string(f.tag[:]), "\x00")
 	ops := make([]FUSEOpStats, 0, len(f.fuseOpStats))
 	for opcode, stat := range f.fuseOpStats {
-		if stat.count == 0 {
+		count := stat.count.Load()
+		if count == 0 {
 			continue
 		}
+		totalNanos := stat.totalNanos.Load()
 		avg := int64(0)
-		if stat.count != 0 {
-			avg = stat.totalNanos / int64(stat.count)
+		if count != 0 {
+			avg = totalNanos / int64(count)
 		}
 		opcodeValue := uint32(opcode)
 		ops = append(ops, FUSEOpStats{
 			Opcode:       opcodeValue,
 			Name:         fuseOpcodeName(opcodeValue),
-			Count:        stat.count,
-			TotalNanos:   stat.totalNanos,
-			MaxNanos:     stat.maxNanos,
+			Count:        count,
+			TotalNanos:   totalNanos,
+			MaxNanos:     stat.maxNanos.Load(),
 			AverageNanos: avg,
 		})
 	}
@@ -1566,7 +1566,7 @@ func (f *FS) Stats() FSStats {
 		MMIOReads:       f.mmioReads,
 		MMIOWrites:      f.mmioWrites,
 		QueueNotifies:   append([]uint64(nil), f.queueNotifies...),
-		FUSERequests:    f.fuseRequests,
+		FUSERequests:    f.fuseRequests.Load(),
 		InterruptRaises: f.interruptRaises,
 		IRQTransitions:  f.irqTransitions,
 		IRQHigh:         f.irqHigh,
