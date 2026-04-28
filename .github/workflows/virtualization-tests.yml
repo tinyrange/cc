@@ -1,0 +1,155 @@
+name: Virtualization tests
+
+"on":
+  workflow_dispatch:
+    inputs:
+      fulltest_filter:
+        description: "Fulltest case filter"
+        required: true
+        default: "Shell is available"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: ${{ matrix.name }}
+    runs-on: ${{ fromJson(matrix.runs_on) }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux amd64 KVM smoke
+            os: linux
+            arch: amd64
+            runs_on: '["ubuntu-24.04"]'
+            ccvm_path: build/ccvm
+          - name: Linux arm64 KVM smoke
+            os: linux
+            arch: arm64
+            runs_on: '["self-hosted","Linux","ARM64","pi5","kvm"]'
+            ccvm_path: build/ccvm
+          - name: Windows amd64 WHP smoke
+            os: windows
+            arch: amd64
+            runs_on: '["windows-2025"]'
+            ccvm_path: build/ccvm.exe
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Enable KVM access
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ ! -e /dev/kvm ]; then
+            echo "/dev/kvm is not available on this runner" >&2
+            exit 1
+          fi
+          if ! test -r /dev/kvm -a -w /dev/kvm; then
+            sudo -n chmod 0666 /dev/kvm
+          fi
+          test -r /dev/kvm -a -w /dev/kvm
+          id
+          ls -l /dev/kvm
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install Python tooling
+        run: python -m pip install --upgrade pip uv
+
+      - name: Build guest init payloads
+        shell: bash
+        run: |
+          set -euxo pipefail
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o internal/guestinit/guest-init-linux-amd64 ./internal/cmd/init
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o internal/guestinit/guest-init-linux-arm64 ./internal/cmd/init
+
+      - name: Build ccvm
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p build
+          go build -tags embed_guestinit -o "${{ matrix.ccvm_path }}" ./cmd/ccvm
+
+      - name: Install pyneurodesk fulltest dependencies
+        working-directory: pyneurodesk
+        run: uv sync --extra fulltest
+
+      - name: Write virtualization smoke recipe
+        id: recipe
+        shell: python
+        run: |
+          import os
+          import textwrap
+          from pathlib import Path
+
+          recipe = Path(os.environ["RUNNER_TEMP"]) / "virtualization-smoke-fulltest.yaml"
+          recipe.write_text(textwrap.dedent(
+              """
+              name: virtualization-smoke
+              container: alpine.simg
+              default_timeout: 60
+              test_data: {}
+              setup:
+                script: ""
+              cleanup:
+                script: ""
+              tests:
+                - name: Shell is available
+                  command: sh -lc 'echo virtualization-smoke-ok && uname -m'
+                  expected_output_contains:
+                    - virtualization-smoke-ok
+                - name: Working directory is mounted
+                  command: sh -lc 'pwd && test -d /work && echo workdir-ok'
+                  expected_output_contains:
+                    - workdir-ok
+              """),
+              encoding="utf-8",
+          )
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"recipe={recipe}", file=output)
+
+      - name: Run virtualization fulltest smoke
+        working-directory: pyneurodesk
+        env:
+          PYNEURODESK_CCVM: ${{ github.workspace }}/${{ matrix.ccvm_path }}
+          PYNEURODESK_BOOT_TIMEOUT: "60"
+          PYTHONUNBUFFERED: "1"
+          FULLTEST_FILTER: ${{ github.event.inputs.fulltest_filter || 'Shell is available' }}
+          IMAGE_SOURCE: ${{ github.workspace }}/fixtures/alpine.simg
+          RECIPE: ${{ steps.recipe.outputs.recipe }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p ../fulltest-results
+          uv run pyneurodesk-fulltest \
+            --recipe "$RECIPE" \
+            --image-source "$IMAGE_SOURCE" \
+            --work-dir "${RUNNER_TEMP}/pyneurodesk-virtualization-smoke-${{ matrix.os }}-${{ matrix.arch }}" \
+            --filter "$FULLTEST_FILTER" \
+            --memory-mb 1024 \
+            --cpus 1 \
+            2>&1 | tee "../fulltest-results/virtualization-${{ matrix.os }}-${{ matrix.arch }}.log"
+
+      - name: Upload virtualization fulltest log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: virtualization-fulltest-${{ matrix.os }}-${{ matrix.arch }}
+          path: fulltest-results/virtualization-${{ matrix.os }}-${{ matrix.arch }}.log
+          if-no-files-found: error
