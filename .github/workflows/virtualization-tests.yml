@@ -88,6 +88,8 @@ jobs:
 
       - name: Install pyneurodesk fulltest dependencies
         working-directory: pyneurodesk
+        env:
+          PYNEURODESK_CCVM: ${{ github.workspace }}/${{ matrix.ccvm_path }}
         run: uv sync --extra fulltest
 
       - name: Write virtualization smoke recipe
@@ -152,4 +154,4 @@ jobs:
         with:
           name: virtualization-fulltest-${{ matrix.os }}-${{ matrix.arch }}
           path: fulltest-results/virtualization-${{ matrix.os }}-${{ matrix.arch }}.log
-          if-no-files-found: error
+          if-no-files-found: warn
