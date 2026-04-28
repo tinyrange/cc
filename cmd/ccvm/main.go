@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -219,12 +220,25 @@ func newServerShutdown(srvState *server, httpServer *http.Server) func() {
 func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *http.ServeMux {
 	mux := http.NewServeMux()
 
+	if strings.TrimSpace(os.Getenv("CCX3_PPROF")) != "" {
+		mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+		mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+	}
+
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
 	mux.HandleFunc("GET /capabilities", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, srvState.vms.Capabilities())
+	})
+
+	mux.HandleFunc("GET /debug/virtiofs", func(w http.ResponseWriter, r *http.Request) {
+		id := r.URL.Query().Get("id")
+		writeJSON(w, http.StatusOK, srvState.vms.VirtioFSStats(id))
 	})
 
 	mux.HandleFunc("POST /shutdown", func(w http.ResponseWriter, r *http.Request) {

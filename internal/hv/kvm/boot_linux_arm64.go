@@ -161,6 +161,7 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 		}
 	}
 
+	var exit Exit
 	for step := 0; ; step++ {
 		if err := ctx.Err(); err != nil {
 			if done(serialOut.String()) {
@@ -169,12 +170,8 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 			return "", err
 		}
 
-		exit, err := vm.Run()
-		if err != nil {
+		if err := vm.Run(&exit); err != nil {
 			return serialOut.String(), fmt.Errorf("run step %d: %w", step, err)
-		}
-		if exit == nil {
-			return serialOut.String(), fmt.Errorf("run step %d: nil exit", step)
 		}
 		if done(serialOut.String()) {
 			return serialOut.String(), nil

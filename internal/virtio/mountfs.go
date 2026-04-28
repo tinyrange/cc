@@ -405,7 +405,11 @@ func (m *mountedFS) Create(parent uint64, name string, flags uint32, mode uint32
 	if parentNode == nil {
 		return 0, 0, FuseAttr{}, -linuxENOENT
 	}
-	childPath := path.Join(parentNode.path, path.Base(path.Clean("/"+name)))
+	childName, ok := cleanChildName(name)
+	if !ok {
+		return 0, 0, FuseAttr{}, -linuxEINVAL
+	}
+	childPath := path.Join(parentNode.path, path.Base(childName))
 	if m.isMountPath(childPath) || m.isSyntheticPath(childPath) {
 		return 0, 0, FuseAttr{}, -linuxEEXIST
 	}
@@ -420,7 +424,7 @@ func (m *mountedFS) Create(parent uint64, name string, flags uint32, mode uint32
 	if !ok {
 		return 0, 0, FuseAttr{}, -linuxEROFS
 	}
-	backendNodeID, fh, attr, errno := createBackend.Create(backendParent, name, flags, mode)
+	backendNodeID, fh, attr, errno := createBackend.Create(backendParent, childName, flags, mode)
 	if errno != 0 {
 		return 0, 0, FuseAttr{}, errno
 	}

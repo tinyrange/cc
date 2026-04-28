@@ -171,16 +171,13 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 }
 
 func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, serialOut *vmruntime.SerialTranscript) error {
+	var exit Exit
 	for step := 0; ; step++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		exit, err := vm.Run()
-		if err != nil {
+		if err := vm.Run(&exit); err != nil {
 			return fmt.Errorf("run step %d: %w", step, err)
-		}
-		if exit == nil {
-			return fmt.Errorf("run step %d: nil exit", step)
 		}
 		switch exit.Reason {
 		case ExitIO:

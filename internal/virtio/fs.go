@@ -105,6 +105,7 @@ const (
 const (
 	fuseOpenKeepCache = 1 << 1
 	fuseOpenCacheDir  = 1 << 3
+	fuseOpenNoFlush   = 1 << 5
 )
 
 const (
@@ -232,6 +233,39 @@ type FS struct {
 	fuseRequests     uint64
 	interruptRaises  uint64
 	irqTransitions   uint64
+	fuseOpStats      [fuseStatsSlots]fuseOpStat
+}
+
+const fuseStatsSlots = 64
+
+type FSStats struct {
+	Tag             string        `json:"tag"`
+	MMIOReads       uint64        `json:"mmio_reads"`
+	MMIOWrites      uint64        `json:"mmio_writes"`
+	QueueNotifies   [2]uint64     `json:"queue_notifies"`
+	FUSERequests    uint64        `json:"fuse_requests"`
+	InterruptRaises uint64        `json:"interrupt_raises"`
+	IRQTransitions  uint64        `json:"irq_transitions"`
+	IRQHigh         bool          `json:"irq_high"`
+	InterruptStatus uint32        `json:"interrupt_status"`
+	QueueReady      [2]bool       `json:"queue_ready"`
+	QueueLastAvail  [2]uint16     `json:"queue_last_avail"`
+	FUSEOps         []FUSEOpStats `json:"fuse_ops"`
+}
+
+type FUSEOpStats struct {
+	Opcode       uint32 `json:"opcode"`
+	Name         string `json:"name"`
+	Count        uint64 `json:"count"`
+	TotalNanos   int64  `json:"total_nanos"`
+	MaxNanos     int64  `json:"max_nanos"`
+	AverageNanos int64  `json:"average_nanos"`
+}
+
+type fuseOpStat struct {
+	count      uint64
+	totalNanos int64
+	maxNanos   int64
 }
 
 type fsDesc struct {
@@ -419,8 +453,8 @@ func (f *FS) processQueueLocked(qidx int) error {
 		return nil
 	}
 
-	header, err := f.mem.ReadIPA(q.availAddr, 4)
-	if err != nil {
+	var header [4]byte
+	if err := f.readIPAInto(q.availAddr, header[:]); err != nil {
 		return err
 	}
 	availFlags := binary.LittleEndian.Uint16(header[0:2])
@@ -428,11 +462,11 @@ func (f *FS) processQueueLocked(qidx int) error {
 	interruptNeeded := false
 	for q.lastAvailIdx != availIdx {
 		slot := q.lastAvailIdx % q.size
-		entry, err := f.mem.ReadIPA(q.availAddr+4+uint64(slot)*2, 2)
-		if err != nil {
+		var entry [2]byte
+		if err := f.readIPAInto(q.availAddr+4+uint64(slot)*2, entry[:]); err != nil {
 			return err
 		}
-		head := binary.LittleEndian.Uint16(entry)
+		head := binary.LittleEndian.Uint16(entry[:])
 		f.logf("queue-notify q=%d head=%d", qidx, head)
 		usedLen, reply, err := f.handleRequestLocked(q, head)
 		if err != nil {
@@ -457,11 +491,15 @@ func (f *FS) processQueueLocked(qidx int) error {
 }
 
 func (f *FS) handleRequestLocked(q *queue, head uint16) (uint32, bool, error) {
-	descs, err := f.readDescriptorChainLocked(q, head)
+	var descScratch [8]fsDesc
+	descs, err := f.readDescriptorChainLocked(q, head, descScratch[:0])
 	if err != nil {
 		return 0, false, err
 	}
-	var reqDescs, respDescs []fsDesc
+	var reqScratch [4]fsDesc
+	var respScratch [4]fsDesc
+	reqDescs := reqScratch[:0]
+	respDescs := respScratch[:0]
 	for _, d := range descs {
 		if d.write {
 			respDescs = append(respDescs, d)
@@ -479,13 +517,19 @@ func (f *FS) handleRequestLocked(q *queue, head uint16) (uint32, bool, error) {
 	for _, d := range reqDescs {
 		reqLen += int(d.length)
 	}
-	req := make([]byte, 0, reqLen)
+	var reqStack [4096]byte
+	var req []byte
+	if reqLen <= len(reqStack) {
+		req = reqStack[:reqLen]
+	} else {
+		req = make([]byte, reqLen)
+	}
+	reqOff := 0
 	for _, d := range reqDescs {
-		chunk, err := f.mem.ReadIPA(d.addr, int(d.length))
-		if err != nil {
+		if err := f.readIPAInto(d.addr, req[reqOff:reqOff+int(d.length)]); err != nil {
 			return 0, false, err
 		}
-		req = append(req, chunk...)
+		reqOff += int(d.length)
 	}
 	reply, err := f.dispatchFUSELocked(req)
 	if err != nil {
@@ -652,6 +696,7 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 		}
 		extra := make([]byte, fuseOpenOutSize)
 		binary.LittleEndian.PutUint64(extra[0:8], fh)
+		binary.LittleEndian.PutUint32(extra[8:12], fuseOpenNoFlush)
 		return reply(0, extra), nil
 	case fuseRead:
 		if len(req) < fuseInHeaderSize+24 {
@@ -933,6 +978,7 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 			binary.LittleEndian.PutUint64(extra[24:32], 1)
 			encodeFuseAttr(extra[40:], attr)
 			binary.LittleEndian.PutUint64(extra[fuseEntryOutSize:fuseEntryOutSize+8], fh)
+			binary.LittleEndian.PutUint32(extra[fuseEntryOutSize+8:fuseEntryOutSize+12], fuseOpenNoFlush)
 			return reply(0, extra), nil
 		}
 		return reply(-linuxENOSYS, nil), nil
@@ -1020,6 +1066,15 @@ func fuseOpcodeMetricName(opcode uint32) string {
 }
 
 func (f *FS) recordFUSEDispatchTiming(opcode uint32, start time.Time) {
+	duration := time.Since(start)
+	if opcode < uint32(len(f.fuseOpStats)) {
+		opStats := &f.fuseOpStats[opcode]
+		opStats.count++
+		opStats.totalNanos += duration.Nanoseconds()
+		if duration.Nanoseconds() > opStats.maxNanos {
+			opStats.maxNanos = duration.Nanoseconds()
+		}
+	}
 	if f.RecordTiming == nil {
 		return
 	}
@@ -1027,7 +1082,7 @@ func (f *FS) recordFUSEDispatchTiming(opcode uint32, start time.Time) {
 	if tag == "" {
 		tag = "unknown"
 	}
-	f.RecordTiming("virtio.fs."+tag+".fuse."+fuseOpcodeMetricName(opcode), time.Since(start))
+	f.RecordTiming("virtio.fs."+tag+".fuse."+fuseOpcodeMetricName(opcode), duration)
 }
 
 func (f *FS) logf(format string, args ...any) {
@@ -1048,15 +1103,26 @@ func (f *FS) logPathf(op string, nodeID uint64, suffix string) {
 	_, _ = fmt.Fprintf(f.Log, "%s node=%d%s\n", op, nodeID, suffix)
 }
 
-func (f *FS) readDescriptorChainLocked(q *queue, head uint16) ([]fsDesc, error) {
-	var out []fsDesc
+func (f *FS) readIPAInto(addr uint64, dst []byte) error {
+	if reader, ok := f.mem.(guestMemoryReaderInto); ok {
+		return reader.ReadIPAInto(addr, dst)
+	}
+	buf, err := f.mem.ReadIPA(addr, len(dst))
+	if err != nil {
+		return err
+	}
+	copy(dst, buf)
+	return nil
+}
+
+func (f *FS) readDescriptorChainLocked(q *queue, head uint16, out []fsDesc) ([]fsDesc, error) {
 	index := head
 	for i := uint16(0); i < q.size; i++ {
 		if index >= q.size {
 			return nil, fmt.Errorf("virtio-fs descriptor index %d out of range", index)
 		}
-		buf, err := f.mem.ReadIPA(q.descAddr+uint64(index)*16, 16)
-		if err != nil {
+		var buf [16]byte
+		if err := f.readIPAInto(q.descAddr+uint64(index)*16, buf[:]); err != nil {
 			return nil, err
 		}
 		desc := fsDesc{
@@ -1077,16 +1143,16 @@ func (f *FS) readDescriptorChainLocked(q *queue, head uint16) ([]fsDesc, error) 
 
 func (f *FS) writeUsedLocked(q *queue, head uint16, usedLen uint32) error {
 	slot := q.usedIdx % q.size
-	elem := make([]byte, 8)
+	var elem [8]byte
 	binary.LittleEndian.PutUint32(elem[0:4], uint32(head))
 	binary.LittleEndian.PutUint32(elem[4:8], usedLen)
-	if err := f.mem.WriteIPA(q.usedAddr+4+uint64(slot)*8, elem); err != nil {
+	if err := f.mem.WriteIPA(q.usedAddr+4+uint64(slot)*8, elem[:]); err != nil {
 		return err
 	}
 	q.usedIdx++
-	idx := make([]byte, 2)
-	binary.LittleEndian.PutUint16(idx, q.usedIdx)
-	return f.mem.WriteIPA(q.usedAddr+2, idx)
+	var idx [2]byte
+	binary.LittleEndian.PutUint16(idx[:], q.usedIdx)
+	return f.mem.WriteIPA(q.usedAddr+2, idx[:])
 }
 
 func (f *FS) updateIRQLocked() error {
@@ -1128,6 +1194,60 @@ func (f *FS) Summary() string {
 		f.queues[0].lastAvailIdx,
 		f.queues[1].lastAvailIdx,
 	)
+}
+
+func (f *FS) Stats() FSStats {
+	if f == nil {
+		return FSStats{}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	tag := strings.TrimRight(string(f.tag[:]), "\x00")
+	ops := make([]FUSEOpStats, 0, len(f.fuseOpStats))
+	for opcode, stat := range f.fuseOpStats {
+		if stat.count == 0 {
+			continue
+		}
+		avg := int64(0)
+		if stat.count != 0 {
+			avg = stat.totalNanos / int64(stat.count)
+		}
+		opcodeValue := uint32(opcode)
+		ops = append(ops, FUSEOpStats{
+			Opcode:       opcodeValue,
+			Name:         fuseOpcodeName(opcodeValue),
+			Count:        stat.count,
+			TotalNanos:   stat.totalNanos,
+			MaxNanos:     stat.maxNanos,
+			AverageNanos: avg,
+		})
+	}
+	sort.Slice(ops, func(i, j int) bool {
+		if ops[i].Count == ops[j].Count {
+			return ops[i].Opcode < ops[j].Opcode
+		}
+		return ops[i].Count > ops[j].Count
+	})
+	return FSStats{
+		Tag:             tag,
+		MMIOReads:       f.mmioReads,
+		MMIOWrites:      f.mmioWrites,
+		QueueNotifies:   f.queueNotifies,
+		FUSERequests:    f.fuseRequests,
+		InterruptRaises: f.interruptRaises,
+		IRQTransitions:  f.irqTransitions,
+		IRQHigh:         f.irqHigh,
+		InterruptStatus: f.interruptStatus,
+		QueueReady: [2]bool{
+			f.queues[0].ready,
+			f.queues[1].ready,
+		},
+		QueueLastAvail: [2]uint16{
+			f.queues[0].lastAvailIdx,
+			f.queues[1].lastAvailIdx,
+		},
+		FUSEOps: ops,
+	}
 }
 
 func (f *FS) selectedQueueLocked() *queue {
@@ -1214,6 +1334,20 @@ func readCStringName(buf []byte) string {
 	return string(buf)
 }
 
+func cleanChildName(name string) (string, bool) {
+	if name == "" {
+		return "", false
+	}
+	if !strings.Contains(name, "/") && name != "." && name != ".." {
+		return name, true
+	}
+	clean := path.Clean("/" + name)
+	if clean == "/" {
+		return "", false
+	}
+	return strings.TrimPrefix(clean, "/"), true
+}
+
 func bytesIndexByte(buf []byte, want byte) int {
 	for i, b := range buf {
 		if b == want {
@@ -1227,7 +1361,7 @@ type passthroughFS struct {
 	root string
 	meta map[string]fsmeta.Entry
 
-	mu         sync.Mutex
+	mu         sync.RWMutex
 	nextNodeID uint64
 	nextHandle uint64
 	nodes      map[uint64]string
@@ -1354,12 +1488,11 @@ func (p *passthroughFS) Lookup(parent uint64, name string) (uint64, FuseAttr, in
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
 	}
-	clean := path.Clean("/" + name)
-	if clean == "/" {
+	rel, ok := cleanChildName(name)
+	if !ok {
 		attr, errno := p.GetAttr(parent)
 		return parent, attr, errno
 	}
-	rel := strings.TrimPrefix(clean, "/")
 	host := filepath.Join(hostParent, filepath.FromSlash(rel))
 	info, err := os.Lstat(host)
 	if err != nil {
@@ -1379,11 +1512,10 @@ func (p *passthroughFS) Mkdir(parent uint64, name string, mode uint32) (uint64, 
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
 	}
-	clean := path.Clean("/" + name)
-	if clean == "/" {
+	rel, ok := cleanChildName(name)
+	if !ok {
 		return 0, FuseAttr{}, -linuxEINVAL
 	}
-	rel := strings.TrimPrefix(clean, "/")
 	host := filepath.Join(hostParent, filepath.FromSlash(rel))
 	if err := os.Mkdir(host, fs.FileMode(mode&linuxPermMask)); err != nil {
 		return 0, FuseAttr{}, errnoFromError(err)
@@ -1414,11 +1546,11 @@ func (p *passthroughFS) Create(parent uint64, name string, flags uint32, mode ui
 	if errno != 0 {
 		return 0, 0, FuseAttr{}, errno
 	}
-	clean := path.Clean("/" + name)
-	if clean == "/" {
+	rel, ok := cleanChildName(name)
+	if !ok {
 		return 0, 0, FuseAttr{}, -linuxEINVAL
 	}
-	host := filepath.Join(hostParent, filepath.FromSlash(strings.TrimPrefix(clean, "/")))
+	host := filepath.Join(hostParent, filepath.FromSlash(rel))
 	file, err := os.OpenFile(host, translateLinuxOpenFlags(flags)|os.O_CREATE, fs.FileMode(mode&linuxPermMask))
 	if err != nil {
 		return 0, 0, FuseAttr{}, errnoFromError(err)
@@ -1474,9 +1606,9 @@ func (p *passthroughFS) Release(_ uint64, fh uint64) {
 }
 
 func (p *passthroughFS) Flush(_ uint64, fh uint64, _ uint64) int32 {
-	p.mu.Lock()
+	p.mu.RLock()
 	handle := p.handles[fh]
-	p.mu.Unlock()
+	p.mu.RUnlock()
 	if handle == nil || handle.file == nil {
 		return -linuxEBADF
 	}
@@ -1484,9 +1616,9 @@ func (p *passthroughFS) Flush(_ uint64, fh uint64, _ uint64) int32 {
 }
 
 func (p *passthroughFS) Fsync(_ uint64, fh uint64, _ uint32) int32 {
-	p.mu.Lock()
+	p.mu.RLock()
 	handle := p.handles[fh]
-	p.mu.Unlock()
+	p.mu.RUnlock()
 	if handle == nil || handle.file == nil {
 		return -linuxEBADF
 	}
@@ -1497,9 +1629,9 @@ func (p *passthroughFS) Fsync(_ uint64, fh uint64, _ uint32) int32 {
 }
 
 func (p *passthroughFS) FsyncDir(_ uint64, fh uint64, _ uint32) int32 {
-	p.mu.Lock()
+	p.mu.RLock()
 	_, ok := p.dirHandles[fh]
-	p.mu.Unlock()
+	p.mu.RUnlock()
 	if !ok {
 		return -linuxEBADF
 	}
@@ -1508,9 +1640,9 @@ func (p *passthroughFS) FsyncDir(_ uint64, fh uint64, _ uint32) int32 {
 
 func (p *passthroughFS) Read(nodeID uint64, fh uint64, off uint64, size uint32) ([]byte, int32) {
 	p.logf("read node=%d path=%q fh=%d off=%d size=%d", nodeID, p.DebugPath(nodeID), fh, off, size)
-	p.mu.Lock()
+	p.mu.RLock()
 	handle, ok := p.handles[fh]
-	p.mu.Unlock()
+	p.mu.RUnlock()
 	if !ok || handle == nil || handle.nodeID != nodeID || handle.file == nil {
 		return nil, -linuxEBADF
 	}
@@ -1523,9 +1655,9 @@ func (p *passthroughFS) Read(nodeID uint64, fh uint64, off uint64, size uint32) 
 }
 
 func (p *passthroughFS) Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32) (uint64, int32) {
-	p.mu.Lock()
+	p.mu.RLock()
 	handle, ok := p.handles[fh]
-	p.mu.Unlock()
+	p.mu.RUnlock()
 	if !ok || handle == nil || handle.nodeID != nodeID {
 		return 0, -linuxEBADF
 	}
@@ -1589,9 +1721,9 @@ func (p *passthroughFS) OpenDir(nodeID uint64, _ uint32) (uint64, int32) {
 }
 
 func (p *passthroughFS) Write(nodeID uint64, fh uint64, off uint64, data []byte, _ uint32) (uint32, int32) {
-	p.mu.Lock()
+	p.mu.RLock()
 	handle := p.handles[fh]
-	p.mu.Unlock()
+	p.mu.RUnlock()
 	if handle == nil || handle.nodeID != nodeID || handle.file == nil {
 		return 0, -linuxEBADF
 	}

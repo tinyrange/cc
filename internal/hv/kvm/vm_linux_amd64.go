@@ -206,40 +206,40 @@ func mapAMD64GuestMemory(vm *VM, memoryMB uint64) ([]byte, error) {
 	return mem, nil
 }
 
-func (v *VM) Run() (*Exit, error) {
+func (v *VM) Run(exit *Exit) error {
+	if exit == nil {
+		return fmt.Errorf("exit is nil")
+	}
 	run := (*kvmRunData)(unsafe.Pointer(&v.run[0]))
 	run.immediateExit = 0
 	if _, err := ioctlWithRetry(uintptr(v.vcpufd), uint64(kvmRun), 0); err != nil {
-		return nil, fmt.Errorf("run vcpu: %w", err)
+		return fmt.Errorf("run vcpu: %w", err)
 	}
 	reason := ExitReason(run.exitReason)
+	*exit = Exit{Reason: reason}
 	switch reason {
 	case ExitIO:
 		ioData := (*kvmExitIoData)(unsafe.Pointer(&run.anon0[0]))
 		dataLen := uint64(ioData.size) * uint64(ioData.count)
 		data := v.run[ioData.dataOffset : ioData.dataOffset+dataLen]
-		return &Exit{
-			Reason: reason,
-			IO: IOExit{
-				Port:  ioData.port,
-				Data:  data,
-				Size:  ioData.size,
-				Count: ioData.count,
-				Write: ioData.direction != 0,
-			},
-		}, nil
+		exit.IO = IOExit{
+			Port:  ioData.port,
+			Data:  data,
+			Size:  ioData.size,
+			Count: ioData.count,
+			Write: ioData.direction != 0,
+		}
 	case ExitMMIO:
 		mmio := (*kvmExitMMIOData)(unsafe.Pointer(&run.anon0[0]))
-		return &Exit{Reason: reason, MMIO: MMIOExit{Addr: mmio.physAddr, Data: mmio.data, Len: mmio.len, Write: mmio.isWrite != 0}}, nil
+		exit.MMIO = MMIOExit{Addr: mmio.physAddr, Data: mmio.data, Len: mmio.len, Write: mmio.isWrite != 0}
 	case ExitInternal:
 		ie := (*internalError)(unsafe.Pointer(&run.anon0[0]))
-		return nil, fmt.Errorf("internal error: %d", ie.Suberror)
+		return fmt.Errorf("internal error: %d", ie.Suberror)
 	case ExitSystemEvent:
 		system := (*kvmSystemEvent)(unsafe.Pointer(&run.anon0[0]))
-		return &Exit{Reason: reason, SystemEvent: system.typ}, nil
-	default:
-		return &Exit{Reason: reason}, nil
+		exit.SystemEvent = system.typ
 	}
+	return nil
 }
 
 func (v *VM) GetPC() (uint64, error) {
@@ -279,10 +279,23 @@ func (v *VM) ReadIPA(addr uint64, size int) ([]byte, error) {
 		return []byte{}, nil
 	}
 	out := make([]byte, size)
-	if err := v.copyFromGuest(addr, out); err != nil {
-		return nil, fmt.Errorf("read guest memory %#x size %d: unmapped", addr, size)
+	if err := v.ReadIPAInto(addr, out); err != nil {
+		return nil, err
 	}
 	return out, nil
+}
+
+func (v *VM) ReadIPAInto(addr uint64, dst []byte) error {
+	if v == nil {
+		return fmt.Errorf("vm is nil")
+	}
+	if len(dst) == 0 {
+		return nil
+	}
+	if err := v.copyFromGuest(addr, dst); err != nil {
+		return fmt.Errorf("read guest memory %#x size %d: unmapped", addr, len(dst))
+	}
+	return nil
 }
 
 func (v *VM) WriteIPA(addr uint64, data []byte) error {

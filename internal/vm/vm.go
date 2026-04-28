@@ -12,6 +12,7 @@ import (
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/hv"
+	"j5.nz/cc/internal/virtio"
 )
 
 const DefaultInstanceID = "default"
@@ -33,6 +34,10 @@ type Instance interface {
 	ExecStream(context.Context, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 	Wait() error
 	Close() error
+}
+
+type virtioFSStatsProvider interface {
+	VirtioFSStats() []virtio.FSStats
 }
 
 type Manager struct {
@@ -348,6 +353,20 @@ func (m *Manager) StatusOf(id string) client.InstanceState {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.statusLocked(id)
+}
+
+func (m *Manager) VirtioFSStats(id string) []virtio.FSStats {
+	id = instanceID(id)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.running == nil || m.running[id] == nil || m.running[id].instance == nil {
+		return nil
+	}
+	provider, ok := m.running[id].instance.(virtioFSStatsProvider)
+	if !ok {
+		return nil
+	}
+	return provider.VirtioFSStats()
 }
 
 func (m *Manager) Statuses() []client.InstanceState {

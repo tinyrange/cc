@@ -93,6 +93,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		baseEnv: vmruntime.WithDefaultEnv(image.Config.Env),
 		workDir: workDir,
 		rootFS:  rootFS,
+		fsdevs:  fsdevs,
 		dmesg:   req.Dmesg,
 	}, nil
 }
@@ -144,6 +145,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 		baseEnv: vmruntime.WithDefaultEnv(nil),
 		workDir: "/",
 		rootFS:  rootFS,
+		fsdevs:  fsdevs,
 		dmesg:   req.Dmesg,
 	}, nil
 }
@@ -431,10 +433,25 @@ type linuxInstance struct {
 	baseEnv     []string
 	workDir     string
 	rootFS      virtio.ShareMounter
+	fsdevs      []*virtio.FS
 	dmesg       bool
 	shareMu     sync.Mutex
 	shares      map[string]client.ShareMount
 	imageMounts map[string]string
+}
+
+func (i *linuxInstance) VirtioFSStats() []virtio.FSStats {
+	if i == nil || len(i.fsdevs) == 0 {
+		return nil
+	}
+	out := make([]virtio.FSStats, 0, len(i.fsdevs))
+	for _, fsdev := range i.fsdevs {
+		if fsdev == nil {
+			continue
+		}
+		out = append(out, fsdev.Stats())
+	}
+	return out
 }
 
 func (i *linuxInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
