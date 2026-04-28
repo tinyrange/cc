@@ -88,6 +88,7 @@ jobs:
             verdict="not supported"
             echo "::warning::KVM probe failed on ${{ matrix.runner }}"
           fi
+          printf '%s\n' "${probe_output}"
 
           {
             echo "### ${{ matrix.name }}"
@@ -160,6 +161,7 @@ jobs:
           if (-not $supported) {
             Write-Warning "Windows Hypervisor Platform probe failed on ${{ matrix.runner }}"
           }
+          $probeLines | ForEach-Object { Write-Host $_ }
 
           $actualArch = (Get-CimInstance Win32_OperatingSystem).OSArchitecture
           $verdict = if ($supported) { "supported" } else { "not supported" }
@@ -193,11 +195,16 @@ jobs:
           sysctl -n kern.hv_support 2>/dev/null || true
 
           cat > /tmp/hv_probe.c <<'EOF'
-          #include <Hypervisor/hv.h>
+          #include <Hypervisor/Hypervisor.h>
           #include <stdio.h>
 
           int main(void) {
-            hv_return_t create = hv_vm_create(HV_VM_DEFAULT);
+            hv_return_t create;
+          #if defined(__arm64__)
+            create = hv_vm_create(NULL);
+          #else
+            create = hv_vm_create(0);
+          #endif
             printf("hv_vm_create=%d\n", create);
             if (create == HV_SUCCESS) {
               hv_return_t destroy = hv_vm_destroy();
@@ -219,6 +226,7 @@ jobs:
             verdict="not supported"
             echo "::warning::Hypervisor.framework probe failed on ${{ matrix.runner }}"
           fi
+          printf '%s\n' "${probe_output}"
 
           {
             echo "### ${{ matrix.name }}"
