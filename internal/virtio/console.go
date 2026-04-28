@@ -57,6 +57,10 @@ type GuestMemory interface {
 	WriteIPA(addr uint64, data []byte) error
 }
 
+type guestMemoryReaderInto interface {
+	ReadIPAInto(addr uint64, dst []byte) error
+}
+
 type IRQController interface {
 	SetIRQ(irq uint32, level bool) error
 }

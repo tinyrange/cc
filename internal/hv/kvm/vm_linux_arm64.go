@@ -187,40 +187,39 @@ func (v *VM) GetPC() (uint64, error) {
 	return value, nil
 }
 
-func (v *VM) Run() (*Exit, error) {
+func (v *VM) Run(exit *Exit) error {
+	if exit == nil {
+		return fmt.Errorf("exit is nil")
+	}
 	run := (*kvmRunData)(unsafe.Pointer(&v.run[0]))
 	run.immediateExit = 0
 	if _, err := ioctlWithRetry(uintptr(v.vcpufd), uint64(kvmRun), 0); err != nil {
-		return nil, fmt.Errorf("run vcpu: %w", err)
+		return fmt.Errorf("run vcpu: %w", err)
 	}
 	reason := ExitReason(run.exitReason)
+	*exit = Exit{Reason: reason}
 	switch reason {
 	case ExitMMIO:
 		mmio := (*kvmExitMMIOData)(unsafe.Pointer(&run.anon0[0]))
-		return &Exit{
-			Reason: reason,
-			MMIO: MMIOExit{
-				Addr:  mmio.physAddr,
-				Data:  mmio.data,
-				Len:   mmio.len,
-				Write: mmio.isWrite != 0,
-			},
-		}, nil
+		exit.MMIO = MMIOExit{
+			Addr:  mmio.physAddr,
+			Data:  mmio.data,
+			Len:   mmio.len,
+			Write: mmio.isWrite != 0,
+		}
 	case ExitSystemEvent:
 		system := (*kvmSystemEvent)(unsafe.Pointer(&run.anon0[0]))
-		return &Exit{Reason: reason, SystemEvent: system.typ}, nil
+		exit.SystemEvent = system.typ
 	case ExitShutdown:
-		return &Exit{Reason: reason}, nil
 	case ExitException:
 		// KVM arm64 MMIO should normally be surfaced as KVM_EXIT_MMIO.
-		return &Exit{Reason: reason}, nil
 	default:
 		if reason == 17 {
 			ie := (*internalError)(unsafe.Pointer(&run.anon0[0]))
-			return nil, fmt.Errorf("internal error: %d", ie.Suberror)
+			return fmt.Errorf("internal error: %d", ie.Suberror)
 		}
-		return &Exit{Reason: reason}, nil
 	}
+	return nil
 }
 
 func (v *VM) CancelRun() error {
@@ -271,13 +270,31 @@ func (v *VM) ReadIPA(addr uint64, size int) ([]byte, error) {
 	if size < 0 {
 		return nil, fmt.Errorf("invalid read size %d", size)
 	}
+	if size == 0 {
+		return []byte{}, nil
+	}
+	out := make([]byte, size)
+	if err := v.ReadIPAInto(addr, out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (v *VM) ReadIPAInto(addr uint64, dst []byte) error {
+	if v == nil {
+		return fmt.Errorf("vm is nil")
+	}
+	if len(dst) == 0 {
+		return nil
+	}
 	start := v.memRegion.GuestPhysAddr
 	end := start + v.memRegion.MemorySize
-	if addr < start || addr+uint64(size) > end {
-		return nil, fmt.Errorf("read guest memory %#x size %d: unmapped", addr, size)
+	if addr < start || addr+uint64(len(dst)) > end {
+		return fmt.Errorf("read guest memory %#x size %d: unmapped", addr, len(dst))
 	}
 	off := addr - start
-	return append([]byte(nil), v.mem[off:off+uint64(size)]...), nil
+	copy(dst, v.mem[off:off+uint64(len(dst))])
+	return nil
 }
 
 func (v *VM) WriteIPA(addr uint64, data []byte) error {

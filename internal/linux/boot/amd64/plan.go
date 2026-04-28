@@ -18,6 +18,7 @@ type E820Entry struct {
 type BootOptions struct {
 	MemoryBase  uint64
 	MemorySize  uint64
+	NumCPUs     int
 	Cmdline     string
 	LoadAddr    uint64
 	Initrd      []byte
@@ -46,6 +47,9 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 	}
 	if opts.MemorySize == 0 {
 		opts.MemorySize = uint64(len(memory))
+	}
+	if opts.NumCPUs <= 0 {
+		opts.NumCPUs = 1
 	}
 	if opts.ZeroPageGPA == 0 {
 		opts.ZeroPageGPA = 0x00090000
@@ -111,6 +115,11 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 	if err := img.buildZeroPage(memory, memStart, loadAddr, opts.Cmdline, opts.CmdlineGPA, initrdAddr, uint32(len(opts.Initrd)), opts.ZeroPageGPA, e820); err != nil {
 		return nil, err
 	}
+	if opts.NumCPUs > 1 {
+		if err := writeMPTable(memory, memStart, opts.NumCPUs); err != nil {
+			return nil, err
+		}
+	}
 
 	stack := opts.StackTopGPA
 	if stack == 0 {
@@ -131,6 +140,102 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 		StackTopGPA: stack,
 		PagingBase:  opts.PagingBase,
 	}, nil
+}
+
+func writeMPTable(memory []byte, memStart uint64, numCPUs int) error {
+	const (
+		fpGPA       = 0x000f0000
+		tableGPA    = 0x000f0100
+		lapicAddr   = 0xfee00000
+		ioapicAddr  = 0xfec00000
+		entryCPU    = 0
+		entryBus    = 1
+		entryIOAPIC = 2
+		entryIOInt  = 3
+		entryLInt   = 4
+	)
+	if numCPUs < 1 {
+		numCPUs = 1
+	}
+	if numCPUs > 255 {
+		numCPUs = 255
+	}
+	entryCount := numCPUs + 1 + 1 + 16 + 2
+	tableLen := 44 + numCPUs*20 + 8 + 8 + 16*8 + 2*8
+	table := make([]byte, tableLen)
+	copy(table[0:4], "PCMP")
+	binary.LittleEndian.PutUint16(table[4:6], uint16(tableLen))
+	table[6] = 4
+	copy(table[8:16], []byte("CC      "))
+	copy(table[16:28], []byte("CC SMP      "))
+	binary.LittleEndian.PutUint16(table[34:36], uint16(entryCount))
+	binary.LittleEndian.PutUint32(table[36:40], lapicAddr)
+	off := 44
+	for cpu := 0; cpu < numCPUs; cpu++ {
+		table[off] = entryCPU
+		table[off+1] = byte(cpu)
+		table[off+2] = 0x14
+		table[off+3] = 1
+		if cpu == 0 {
+			table[off+3] |= 2
+		}
+		binary.LittleEndian.PutUint32(table[off+4:off+8], 0x600)
+		binary.LittleEndian.PutUint32(table[off+8:off+12], 0x201)
+		off += 20
+	}
+	table[off] = entryBus
+	table[off+1] = 0
+	copy(table[off+2:off+8], []byte("ISA   "))
+	off += 8
+	table[off] = entryIOAPIC
+	table[off+1] = byte(numCPUs)
+	table[off+2] = 0x11
+	table[off+3] = 1
+	binary.LittleEndian.PutUint32(table[off+4:off+8], ioapicAddr)
+	off += 8
+	for irq := 0; irq < 16; irq++ {
+		table[off] = entryIOInt
+		table[off+1] = 0
+		binary.LittleEndian.PutUint16(table[off+2:off+4], 0)
+		table[off+4] = 0
+		table[off+5] = byte(irq)
+		table[off+6] = byte(numCPUs)
+		table[off+7] = byte(irq)
+		off += 8
+	}
+	for lint := 0; lint < 2; lint++ {
+		table[off] = entryLInt
+		table[off+1] = byte(lint)
+		binary.LittleEndian.PutUint16(table[off+2:off+4], 0)
+		table[off+4] = 0
+		table[off+5] = 0
+		table[off+6] = 0xff
+		table[off+7] = byte(lint)
+		off += 8
+	}
+	table[7] = checksum(table)
+	if err := writeAt(memory, memStart, tableGPA, table); err != nil {
+		return fmt.Errorf("write MP config table: %w", err)
+	}
+
+	fp := make([]byte, 16)
+	copy(fp[0:4], "_MP_")
+	binary.LittleEndian.PutUint32(fp[4:8], tableGPA)
+	fp[8] = 1
+	fp[9] = 4
+	fp[10] = checksum(fp)
+	if err := writeAt(memory, memStart, fpGPA, fp); err != nil {
+		return fmt.Errorf("write MP floating pointer: %w", err)
+	}
+	return nil
+}
+
+func checksum(buf []byte) byte {
+	var sum byte
+	for _, b := range buf {
+		sum += b
+	}
+	return -sum
 }
 
 func (k *KernelImage) buildZeroPage(memory []byte, memStart, loadAddr uint64, cmdline string, cmdlineGPA, initrdGPA uint64, initrdSize uint32, zeroPageGPA uint64, e820 []E820Entry) error {

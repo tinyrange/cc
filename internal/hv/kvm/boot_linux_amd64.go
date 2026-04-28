@@ -101,6 +101,7 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 		return "", fmt.Errorf("set long mode: %w", err)
 	}
 
+	var exit Exit
 	for step := 0; ; step++ {
 		if err := ctx.Err(); err != nil {
 			if done(serialOut.String()) {
@@ -108,8 +109,7 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 			}
 			return serialOut.String(), err
 		}
-		exit, err := vm.Run()
-		if err != nil {
+		if err := vm.Run(&exit); err != nil {
 			return serialOut.String(), fmt.Errorf("run step %d: %w", step, err)
 		}
 		if done(serialOut.String()) {
@@ -187,6 +187,10 @@ func handleUARTIO(uart *serial.UART8250, ioExit IOExit) error {
 }
 
 func handleBootMMIO(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, mmio MMIOExit) error {
+	return handleBootMMIOForVCPU(vm, 0, fsdevs, vsock, rng, mmio)
+}
+
+func handleBootMMIOForVCPU(vm *VM, vcpuIndex int, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, mmio MMIOExit) error {
 	for _, fsdev := range fsdevs {
 		if fsdev == nil || !fsdev.Contains(mmio.Addr, int(mmio.Len)) {
 			continue
@@ -198,7 +202,7 @@ func handleBootMMIO(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virti
 		if err != nil {
 			return err
 		}
-		vm.CompleteMMIORead(value, mmio.Len)
+		vm.CompleteVCPUMMIORead(vcpuIndex, value, mmio.Len)
 		return nil
 	}
 	if vsock != nil && vsock.Contains(mmio.Addr, int(mmio.Len)) {
@@ -209,7 +213,7 @@ func handleBootMMIO(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virti
 		if err != nil {
 			return err
 		}
-		vm.CompleteMMIORead(value, mmio.Len)
+		vm.CompleteVCPUMMIORead(vcpuIndex, value, mmio.Len)
 		return nil
 	}
 	if rng != nil && rng.Contains(mmio.Addr, int(mmio.Len)) {
@@ -220,14 +224,14 @@ func handleBootMMIO(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virti
 		if err != nil {
 			return err
 		}
-		vm.CompleteMMIORead(value, mmio.Len)
+		vm.CompleteVCPUMMIORead(vcpuIndex, value, mmio.Len)
 		return nil
 	}
 	if offset, ok := bootHPETOffset(mmio.Addr, mmio.Len); ok {
 		if mmio.Write {
 			return nil
 		}
-		vm.CompleteMMIORead(readBootHPET(offset), mmio.Len)
+		vm.CompleteVCPUMMIORead(vcpuIndex, readBootHPET(offset), mmio.Len)
 		return nil
 	}
 	return fmt.Errorf("unhandled mmio addr=%#x len=%d write=%v", mmio.Addr, mmio.Len, mmio.Write)

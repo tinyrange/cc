@@ -49,10 +49,16 @@ type VM struct {
 	kvm         *Bootstrap
 	vmfd        int
 	vcpufd      int
-	run         []byte
+	vcpus       []*VCPU
 	mem         []byte
 	lowMemLimit uint64
 	regions     []memoryMapping
+}
+
+type VCPU struct {
+	id  int
+	fd  int
+	run []byte
 }
 
 type memoryMapping struct {
@@ -62,6 +68,13 @@ type memoryMapping struct {
 }
 
 func NewVM() (*VM, error) {
+	return NewVMWithCPUs(1)
+}
+
+func NewVMWithCPUs(cpus int) (*VM, error) {
+	if cpus <= 0 {
+		cpus = 1
+	}
 	k, err := Open()
 	if err != nil {
 		return nil, err
@@ -76,43 +89,56 @@ func NewVM() (*VM, error) {
 		_ = k.Close()
 		return nil, fmt.Errorf("init vm: %w", err)
 	}
-	vcpufd, err := k.CreateVCPU(vmfd, 0)
-	if err != nil {
-		_ = k.CloseVM(vmfd)
-		_ = k.Close()
-		return nil, fmt.Errorf("create vcpu: %w", err)
-	}
-	if err := k.InitVCPU(vmfd, vcpufd); err != nil {
-		_ = k.CloseVCPU(vcpufd)
-		_ = k.CloseVM(vmfd)
-		_ = k.Close()
-		return nil, fmt.Errorf("init vcpu: %w", err)
-	}
 	mmapSize, err := k.VcpuMmapSize()
 	if err != nil {
-		_ = k.CloseVCPU(vcpufd)
 		_ = k.CloseVM(vmfd)
 		_ = k.Close()
 		return nil, fmt.Errorf("get kvm_run mmap size: %w", err)
 	}
-	run, err := unix.Mmap(vcpufd, 0, mmapSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
-	if err != nil {
-		_ = k.CloseVCPU(vcpufd)
-		_ = k.CloseVM(vmfd)
-		_ = k.Close()
-		return nil, fmt.Errorf("mmap kvm_run: %w", err)
+	vm := &VM{kvm: k, vmfd: vmfd}
+	for id := 0; id < cpus; id++ {
+		vcpufd, err := k.CreateVCPU(vmfd, id)
+		if err != nil {
+			_ = vm.Close()
+			return nil, fmt.Errorf("create vcpu %d: %w", id, err)
+		}
+		if err := k.InitVCPUWithTopology(vmfd, vcpufd, id, cpus); err != nil {
+			_ = k.CloseVCPU(vcpufd)
+			_ = vm.Close()
+			return nil, fmt.Errorf("init vcpu %d: %w", id, err)
+		}
+		run, err := unix.Mmap(vcpufd, 0, mmapSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
+		if err != nil {
+			_ = k.CloseVCPU(vcpufd)
+			_ = vm.Close()
+			return nil, fmt.Errorf("mmap kvm_run vcpu %d: %w", id, err)
+		}
+		vm.vcpus = append(vm.vcpus, &VCPU{id: id, fd: vcpufd, run: run})
+		if id == 0 {
+			vm.vcpufd = vcpufd
+		}
 	}
-	return &VM{kvm: k, vmfd: vmfd, vcpufd: vcpufd, run: run}, nil
+	return vm, nil
 }
 
 func (v *VM) Close() error {
 	if v == nil {
 		return nil
 	}
-	if len(v.run) != 0 {
-		_ = unix.Munmap(v.run)
-		v.run = nil
+	for _, vcpu := range v.vcpus {
+		if vcpu == nil {
+			continue
+		}
+		if len(vcpu.run) != 0 {
+			_ = unix.Munmap(vcpu.run)
+			vcpu.run = nil
+		}
+		if vcpu.fd >= 0 && v.kvm != nil {
+			_ = v.kvm.CloseVCPU(vcpu.fd)
+			vcpu.fd = -1
+		}
 	}
+	v.vcpus = nil
 	if len(v.mem) != 0 {
 		_ = unix.Munmap(v.mem)
 		v.mem = nil
@@ -125,7 +151,6 @@ func (v *VM) Close() error {
 	}
 	v.regions = nil
 	if v.kvm != nil {
-		_ = v.kvm.CloseVCPU(v.vcpufd)
 		_ = v.kvm.CloseVM(v.vmfd)
 		_ = v.kvm.Close()
 		v.kvm = nil
@@ -206,44 +231,76 @@ func mapAMD64GuestMemory(vm *VM, memoryMB uint64) ([]byte, error) {
 	return mem, nil
 }
 
-func (v *VM) Run() (*Exit, error) {
-	run := (*kvmRunData)(unsafe.Pointer(&v.run[0]))
+func (v *VM) Run(exit *Exit) error {
+	return v.RunVCPU(0, exit)
+}
+
+func (v *VM) RunVCPU(index int, exit *Exit) error {
+	if v == nil || index < 0 || index >= len(v.vcpus) {
+		return fmt.Errorf("vcpu %d out of range", index)
+	}
+	return v.vcpus[index].Run(exit)
+}
+
+func (c *VCPU) Run(exit *Exit) error {
+	if exit == nil {
+		return fmt.Errorf("exit is nil")
+	}
+	run := (*kvmRunData)(unsafe.Pointer(&c.run[0]))
 	run.immediateExit = 0
-	if _, err := ioctlWithRetry(uintptr(v.vcpufd), uint64(kvmRun), 0); err != nil {
-		return nil, fmt.Errorf("run vcpu: %w", err)
+	if _, err := ioctlRunVCPU(uintptr(c.fd)); err != nil {
+		return fmt.Errorf("run vcpu: %w", err)
 	}
 	reason := ExitReason(run.exitReason)
+	*exit = Exit{Reason: reason}
 	switch reason {
 	case ExitIO:
 		ioData := (*kvmExitIoData)(unsafe.Pointer(&run.anon0[0]))
 		dataLen := uint64(ioData.size) * uint64(ioData.count)
-		data := v.run[ioData.dataOffset : ioData.dataOffset+dataLen]
-		return &Exit{
-			Reason: reason,
-			IO: IOExit{
-				Port:  ioData.port,
-				Data:  data,
-				Size:  ioData.size,
-				Count: ioData.count,
-				Write: ioData.direction != 0,
-			},
-		}, nil
+		data := c.run[ioData.dataOffset : ioData.dataOffset+dataLen]
+		exit.IO = IOExit{
+			Port:  ioData.port,
+			Data:  data,
+			Size:  ioData.size,
+			Count: ioData.count,
+			Write: ioData.direction != 0,
+		}
 	case ExitMMIO:
 		mmio := (*kvmExitMMIOData)(unsafe.Pointer(&run.anon0[0]))
-		return &Exit{Reason: reason, MMIO: MMIOExit{Addr: mmio.physAddr, Data: mmio.data, Len: mmio.len, Write: mmio.isWrite != 0}}, nil
+		exit.MMIO = MMIOExit{Addr: mmio.physAddr, Data: mmio.data, Len: mmio.len, Write: mmio.isWrite != 0}
 	case ExitInternal:
 		ie := (*internalError)(unsafe.Pointer(&run.anon0[0]))
-		return nil, fmt.Errorf("internal error: %d", ie.Suberror)
+		return fmt.Errorf("internal error: %d", ie.Suberror)
 	case ExitSystemEvent:
 		system := (*kvmSystemEvent)(unsafe.Pointer(&run.anon0[0]))
-		return &Exit{Reason: reason, SystemEvent: system.typ}, nil
-	default:
-		return &Exit{Reason: reason}, nil
+		exit.SystemEvent = system.typ
 	}
+	return nil
+}
+
+func (v *VM) CancelRun() error {
+	if v == nil {
+		return nil
+	}
+	for _, vcpu := range v.vcpus {
+		if vcpu == nil || len(vcpu.run) == 0 {
+			continue
+		}
+		run := (*kvmRunData)(unsafe.Pointer(&vcpu.run[0]))
+		run.immediateExit = 1
+	}
+	return nil
 }
 
 func (v *VM) GetPC() (uint64, error) {
-	regs, err := getRegs(v.vcpufd)
+	return v.GetVCPUPC(0)
+}
+
+func (v *VM) GetVCPUPC(index int) (uint64, error) {
+	if v == nil || index < 0 || index >= len(v.vcpus) {
+		return 0, fmt.Errorf("vcpu %d out of range", index)
+	}
+	regs, err := getRegs(v.vcpus[index].fd)
 	if err != nil {
 		return 0, err
 	}
@@ -251,7 +308,18 @@ func (v *VM) GetPC() (uint64, error) {
 }
 
 func (v *VM) CompleteMMIORead(value uint64, size uint32) {
-	run := (*kvmRunData)(unsafe.Pointer(&v.run[0]))
+	v.CompleteVCPUMMIORead(0, value, size)
+}
+
+func (v *VM) CompleteVCPUMMIORead(index int, value uint64, size uint32) {
+	if v == nil || index < 0 || index >= len(v.vcpus) {
+		return
+	}
+	v.vcpus[index].CompleteMMIORead(value, size)
+}
+
+func (c *VCPU) CompleteMMIORead(value uint64, size uint32) {
+	run := (*kvmRunData)(unsafe.Pointer(&c.run[0]))
 	mmio := (*kvmExitMMIOData)(unsafe.Pointer(&run.anon0[0]))
 	for i := range mmio.data {
 		mmio.data[i] = 0
@@ -279,10 +347,23 @@ func (v *VM) ReadIPA(addr uint64, size int) ([]byte, error) {
 		return []byte{}, nil
 	}
 	out := make([]byte, size)
-	if err := v.copyFromGuest(addr, out); err != nil {
-		return nil, fmt.Errorf("read guest memory %#x size %d: unmapped", addr, size)
+	if err := v.ReadIPAInto(addr, out); err != nil {
+		return nil, err
 	}
 	return out, nil
+}
+
+func (v *VM) ReadIPAInto(addr uint64, dst []byte) error {
+	if v == nil {
+		return fmt.Errorf("vm is nil")
+	}
+	if len(dst) == 0 {
+		return nil
+	}
+	if err := v.copyFromGuest(addr, dst); err != nil {
+		return fmt.Errorf("read guest memory %#x size %d: unmapped", addr, len(dst))
+	}
+	return nil
 }
 
 func (v *VM) WriteIPA(addr uint64, data []byte) error {
@@ -339,10 +420,14 @@ func (v *VM) findMemoryRegion(addr uint64) ([]byte, uint64, bool) {
 }
 
 func (v *VM) SetLongMode(entry, zeroPage, stack, pagingBase uint64) error {
+	if v == nil || len(v.vcpus) == 0 {
+		return fmt.Errorf("missing bootstrap vcpu")
+	}
 	if err := v.setupPageTables(pagingBase, 4); err != nil {
 		return err
 	}
-	sregs, err := getSRegs(v.vcpufd)
+	bsp := v.vcpus[0]
+	sregs, err := getSRegs(bsp.fd)
 	if err != nil {
 		return err
 	}
@@ -371,10 +456,10 @@ func (v *VM) SetLongMode(entry, zeroPage, stack, pagingBase uint64) error {
 	sregs.Fs = data
 	sregs.Gs = data
 	sregs.Ss = data
-	if err := setSRegs(v.vcpufd, &sregs); err != nil {
+	if err := setSRegs(bsp.fd, &sregs); err != nil {
 		return err
 	}
-	return setRegs(v.vcpufd, &kvmRegs{
+	return setRegs(bsp.fd, &kvmRegs{
 		Rip:    entry,
 		Rsi:    zeroPage,
 		Rsp:    stack,

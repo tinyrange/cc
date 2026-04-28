@@ -3,6 +3,7 @@
 package kvm
 
 import (
+	"math/bits"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -38,6 +39,16 @@ func ioctlWithRetry(fd uintptr, request uint64, arg uintptr) (uintptr, error) {
 	for {
 		v1, err := ioctl(fd, request, arg)
 		if err == unix.EINTR {
+			continue
+		}
+		return v1, err
+	}
+}
+
+func ioctlRunVCPU(fd uintptr) (uintptr, error) {
+	for {
+		v1, err := ioctl(fd, uint64(kvmRun), 0)
+		if err == unix.EINTR || err == unix.EAGAIN {
 			continue
 		}
 		return v1, err
@@ -104,6 +115,55 @@ func getSupportedCPUID(kvmFd int) (*kvmCPUID2, error) {
 func setVCPUID(vcpuFd int, cpuid *kvmCPUID2) error {
 	_, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmSetCpuid2), uintptr(unsafe.Pointer(cpuid)))
 	return err
+}
+
+func setCPUIDTopology(cpuid *kvmCPUID2, id, cpus int) {
+	if cpuid == nil {
+		return
+	}
+	if cpus < 1 {
+		cpus = 1
+	}
+	if cpus > 255 {
+		cpus = 255
+	}
+	entries := unsafe.Slice(
+		(*kvmCPUIDEntry2)(unsafe.Pointer(uintptr(unsafe.Pointer(cpuid))+unsafe.Sizeof(*cpuid))),
+		cpuid.Nr,
+	)
+	logical := uint32(1)
+	if cpus > 1 {
+		logical = uint32(1 << bits.Len(uint(cpus-1)))
+	}
+	for i := range entries {
+		e := &entries[i]
+		switch e.Function {
+		case 1:
+			e.Ebx = (e.Ebx &^ (uint32(0xffff) << 16)) | (uint32(cpus) << 16) | (uint32(id&0xff) << 24)
+			if cpus > 1 {
+				e.Edx |= 1 << 28
+			}
+		case 4:
+			e.Eax = (e.Eax &^ (uint32(0x3f) << 26)) | (uint32(cpus-1) << 26)
+		case 0xb:
+			switch e.Index {
+			case 0:
+				e.Eax = 0
+				e.Ebx = 1
+				e.Ecx = (1 << 8) | e.Index
+				e.Edx = uint32(id)
+			case 1:
+				e.Eax = uint32(bits.Len(uint(logical - 1)))
+				e.Ebx = uint32(cpus)
+				e.Ecx = (2 << 8) | e.Index
+				e.Edx = uint32(id)
+			default:
+				e.Eax, e.Ebx, e.Ecx, e.Edx = 0, 0, e.Index, uint32(id)
+			}
+		case 0x1f:
+			e.Eax, e.Ebx, e.Ecx, e.Edx = 0, 0, e.Index, uint32(id)
+		}
+	}
 }
 
 func getRegs(vcpuFd int) (kvmRegs, error) {

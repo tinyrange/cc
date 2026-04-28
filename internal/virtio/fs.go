@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"j5.nz/cc/internal/fdt"
@@ -22,24 +23,28 @@ import (
 const (
 	mmioDeviceIDFS = 26
 
-	fsQueueHiprio  = 0
-	fsQueueRequest = 1
+	fsQueueHiprio       = 0
+	fsControlQueueCount = 1
+	fsQueueRequest      = fsQueueHiprio + fsControlQueueCount
+	fsRequestQueueCount = 4
+	fsQueueCount        = fsControlQueueCount + fsRequestQueueCount
 
-	fsCfgTagSize       = 36
-	fsCfgNumQueueOff   = fsCfgTagSize
-	fsCfgTotalSize     = fsCfgTagSize + 4
-	fsInterruptVring   = 0x1
-	fuseInHeaderSize   = 40
-	fuseOutHeaderSize  = 16
-	fuseAttrSize       = 88
-	fuseEntryOutSize   = 40 + fuseAttrSize
-	fuseAttrOutSize    = 16 + fuseAttrSize
-	fuseOpenOutSize    = 16
-	fuseInitOutSize    = 40
-	fuseStatfsOutSize  = 80
-	fuseStatxOutSize   = 288
-	fuseDirentBaseSize = 24
-	fuseWriteOutSize   = 8
+	fsCfgTagSize        = 36
+	fsCfgNumQueueOff    = fsCfgTagSize
+	fsCfgTotalSize      = fsCfgTagSize + 4
+	fsInterruptVring    = 0x1
+	featureRingEventIdx = uint64(1) << 29
+	fuseInHeaderSize    = 40
+	fuseOutHeaderSize   = 16
+	fuseAttrSize        = 88
+	fuseEntryOutSize    = 40 + fuseAttrSize
+	fuseAttrOutSize     = 16 + fuseAttrSize
+	fuseOpenOutSize     = 16
+	fuseInitOutSize     = 40
+	fuseStatfsOutSize   = 80
+	fuseStatxOutSize    = 288
+	fuseDirentBaseSize  = 24
+	fuseWriteOutSize    = 8
 )
 
 const (
@@ -58,6 +63,7 @@ const (
 	fuseWrite      = 16
 	fuseStatfs     = 17
 	fuseRelease    = 18
+	fuseFsync      = 20
 	fuseGetXattr   = 22
 	fuseListXattr  = 23
 	fuseFlush      = 25
@@ -65,6 +71,7 @@ const (
 	fuseOpenDir    = 27
 	fuseReadDir    = 28
 	fuseReleaseDir = 29
+	fuseFsyncDir   = 30
 	fuseAccess     = 34
 	fuseCreate     = 35
 	fuseDestroy    = 38
@@ -86,23 +93,33 @@ const (
 )
 
 const (
-	linuxORDONLY = 0
-	linuxOWRONLY = 1
-	linuxORDWR   = 2
-	linuxOCREAT  = 0x40
-	linuxOEXCL   = 0x80
-	linuxOTRUNC  = 0x200
-	linuxOAPPEND = 0x400
+	linuxOACCMODE = 3
+	linuxORDONLY  = 0
+	linuxOWRONLY  = 1
+	linuxORDWR    = 2
+	linuxOCREAT   = 0x40
+	linuxOEXCL    = 0x80
+	linuxOTRUNC   = 0x200
+	linuxOAPPEND  = 0x400
 )
 
 const (
-	fuseCapPosixLocks = 1 << 1
-	fuseCapPosixACL   = 1 << 20
+	fuseCapPosixLocks     = 1 << 1
+	fuseCapBigWrites      = 1 << 5
+	fuseCapWritebackCache = 1 << 16
+	fuseCapMaxPages       = 1 << 22
 )
 
 const (
 	fuseOpenKeepCache = 1 << 1
 	fuseOpenCacheDir  = 1 << 3
+	fuseOpenNoFlush   = 1 << 5
+)
+
+const (
+	fsCacheStrict     = "strict"
+	fsCacheNormal     = "normal"
+	fsCacheAggressive = "aggressive"
 )
 
 const (
@@ -143,6 +160,14 @@ type fsFlushBackend interface {
 	Flush(nodeID uint64, fh uint64, lockOwner uint64) int32
 }
 
+type fsFsyncBackend interface {
+	Fsync(nodeID uint64, fh uint64, flags uint32) int32
+}
+
+type fsFsyncDirBackend interface {
+	FsyncDir(nodeID uint64, fh uint64, flags uint32) int32
+}
+
 type fsLseekBackend interface {
 	Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32) (uint64, int32)
 }
@@ -175,6 +200,10 @@ type fsRenameBackend interface {
 	Rename(parent uint64, name string, newParent uint64, newName string, flags uint32) int32
 }
 
+type fsWritebackCacheBackend interface {
+	SetWritebackCache(enabled bool)
+}
+
 type FuseAttr struct {
 	Ino       uint64
 	Size      uint64
@@ -195,14 +224,20 @@ type FuseAttr struct {
 }
 
 type FS struct {
-	Base         uint64
-	Size         uint64
-	IRQ          uint32
-	Log          io.Writer
-	Strict       bool
-	RecordTiming func(name string, duration time.Duration)
+	Base           uint64
+	Size           uint64
+	IRQ            uint32
+	Log            io.Writer
+	Strict         bool
+	Async          bool
+	RecordTiming   func(name string, duration time.Duration)
+	cacheMode      string
+	writebackCache bool
+	entryTTL       time.Duration
+	attrTTL        time.Duration
 
 	mu               sync.Mutex
+	workerOnce       sync.Once
 	mem              GuestMemory
 	irq              IRQController
 	backend          FSBackend
@@ -215,13 +250,112 @@ type FS struct {
 	interruptStatus  uint32
 	irqHigh          bool
 	configGeneration uint32
-	queues           [2]queue
+	queues           []queue
 	mmioReads        uint64
 	mmioWrites       uint64
-	queueNotifies    [2]uint64
-	fuseRequests     uint64
+	queueNotifies    []uint64
+	fuseRequests     atomic.Uint64
 	interruptRaises  uint64
 	irqTransitions   uint64
+	workCh           chan fsWork
+	nextWorkSeq      []uint64
+	nextCompleteSeq  []uint64
+	completions      map[fsCompletionKey]fsCompletion
+	fuseOpStats      [fuseStatsSlots]fuseOpStat
+	stageStats       [fsStageCount]timingStat
+}
+
+const fuseStatsSlots = 64
+const fsStageCount = 4
+const fsWorkerCount = 1
+const fsInlineRespDescs = 32
+const fsPooledReqSize = 4096
+
+const (
+	fsStageQueueHarvest = iota
+	fsStageInlineDispatch
+	fsStageInlineComplete
+	fsStageAsyncComplete
+)
+
+type fsWork struct {
+	qidx              int
+	head              uint16
+	seq               uint64
+	generation        uint32
+	unique            uint64
+	req               []byte
+	pooledReq         bool
+	suppressInterrupt bool
+	respCount         int
+	respDescs         [fsInlineRespDescs]fsDesc
+	respExtra         []fsDesc
+}
+
+type fsCompletionKey struct {
+	qidx int
+	seq  uint64
+}
+
+type fsCompletion struct {
+	work  fsWork
+	reply []byte
+	err   error
+}
+
+type fsInlineCompletion struct {
+	work  fsWork
+	reply []byte
+	err   error
+}
+
+var fsReqPool = sync.Pool{
+	New: func() any {
+		return make([]byte, fsPooledReqSize)
+	},
+}
+
+type FSStats struct {
+	Tag             string        `json:"tag"`
+	MMIOReads       uint64        `json:"mmio_reads"`
+	MMIOWrites      uint64        `json:"mmio_writes"`
+	QueueNotifies   []uint64      `json:"queue_notifies"`
+	FUSERequests    uint64        `json:"fuse_requests"`
+	InterruptRaises uint64        `json:"interrupt_raises"`
+	IRQTransitions  uint64        `json:"irq_transitions"`
+	IRQHigh         bool          `json:"irq_high"`
+	InterruptStatus uint32        `json:"interrupt_status"`
+	QueueReady      []bool        `json:"queue_ready"`
+	QueueLastAvail  []uint16      `json:"queue_last_avail"`
+	FUSEOps         []FUSEOpStats `json:"fuse_ops"`
+	Stages          []TimingStats `json:"stages"`
+}
+
+type FUSEOpStats struct {
+	Opcode       uint32 `json:"opcode"`
+	Name         string `json:"name"`
+	Count        uint64 `json:"count"`
+	TotalNanos   int64  `json:"total_nanos"`
+	MaxNanos     int64  `json:"max_nanos"`
+	AverageNanos int64  `json:"average_nanos"`
+}
+
+type fuseOpStat struct {
+	timingStat
+}
+
+type TimingStats struct {
+	Name         string `json:"name"`
+	Count        uint64 `json:"count"`
+	TotalNanos   int64  `json:"total_nanos"`
+	MaxNanos     int64  `json:"max_nanos"`
+	AverageNanos int64  `json:"average_nanos"`
+}
+
+type timingStat struct {
+	count      atomic.Uint64
+	totalNanos atomic.Int64
+	maxNanos   atomic.Int64
 }
 
 type fsDesc struct {
@@ -233,18 +367,41 @@ type fsDesc struct {
 }
 
 func NewFS(base, size uint64, irq uint32, tag string, backend FSBackend) *FS {
+	cacheMode, entryTTL, attrTTL := resolveFSCachePolicy()
 	fs := &FS{
-		Base:    base,
-		Size:    size,
-		IRQ:     irq,
-		backend: backend,
+		Base:           base,
+		Size:           size,
+		IRQ:            irq,
+		backend:        backend,
+		Async:          strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_ASYNC")) != "",
+		cacheMode:      cacheMode,
+		writebackCache: strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_WRITEBACK")) != "",
+		entryTTL:       entryTTL,
+		attrTTL:        attrTTL,
+		workCh:         make(chan fsWork, 1024),
+		completions:    make(map[fsCompletionKey]fsCompletion),
 	}
+	fs.resetQueueStateLocked()
 	if fs.backend == nil {
 		fs.backend = NewPassthroughFS("", nil)
+	}
+	if be, ok := fs.backend.(fsWritebackCacheBackend); ok {
+		be.SetWritebackCache(fs.writebackCache)
 	}
 	copy(fs.tag[:], []byte(tag))
 	fs.resetLocked()
 	return fs
+}
+
+func resolveFSCachePolicy() (string, time.Duration, time.Duration) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_CACHE"))) {
+	case fsCacheStrict:
+		return fsCacheStrict, 0, 0
+	case fsCacheAggressive:
+		return fsCacheAggressive, 60 * time.Second, 60 * time.Second
+	default:
+		return fsCacheNormal, time.Second, time.Second
+	}
 }
 
 func (f *FS) Attach(mem GuestMemory, irq IRQController) {
@@ -287,7 +444,7 @@ func (f *FS) Read(addr uint64, size int) (uint64, error) {
 		return truncateValue(mmioVendorID, size), nil
 	case regDeviceFeatures:
 		if f.deviceFeatureSel == 0 {
-			return truncateValue(0, size), nil
+			return truncateValue(featureRingEventIdx, size), nil
 		}
 		if f.deviceFeatureSel == 1 {
 			return truncateValue(1, size), nil
@@ -326,7 +483,6 @@ func (f *FS) Read(addr uint64, size int) (uint64, error) {
 
 func (f *FS) Write(addr uint64, size int, value uint64) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.mmioWrites++
 
 	offset := addr - f.Base
@@ -357,6 +513,11 @@ func (f *FS) Write(addr uint64, size int, value uint64) error {
 			if value == 0 {
 				q.lastAvailIdx = 0
 				q.usedIdx = 0
+			} else if f.driverFeatures&featureRingEventIdx != 0 {
+				if err := f.writeAvailEventLocked(q); err != nil {
+					f.mu.Unlock()
+					return err
+				}
 			}
 		}
 	case regQueueDescLow:
@@ -386,7 +547,9 @@ func (f *FS) Write(addr uint64, size int, value uint64) error {
 	case regInterruptAck:
 		f.logf("interrupt-ack value=%#x", value)
 		f.interruptStatus &^= uint32(value)
-		return f.updateIRQLocked()
+		err := f.updateIRQLocked()
+		f.mu.Unlock()
+		return err
 	case regStatus:
 		f.status = uint32(value)
 		if f.status == 0 {
@@ -394,12 +557,23 @@ func (f *FS) Write(addr uint64, size int, value uint64) error {
 		}
 	case regQueueNotify:
 		if int(value) < len(f.queues) {
-			f.queueNotifies[value]++
-			if err := f.processQueueLocked(int(value)); err != nil {
+			f.queueNotifies[int(value)]++
+			harvestStart := time.Now()
+			works, err := f.processQueueAsyncLocked(int(value))
+			f.recordStageDuration(fsStageQueueHarvest, time.Since(harvestStart))
+			if err != nil {
+				f.mu.Unlock()
 				return err
 			}
+			f.mu.Unlock()
+			if f.Async {
+				f.enqueueWorks(works)
+				return nil
+			}
+			return f.processWorksInline(works)
 		}
 	}
+	f.mu.Unlock()
 	return nil
 }
 
@@ -409,20 +583,21 @@ func (f *FS) processQueueLocked(qidx int) error {
 		return nil
 	}
 
-	header, err := f.mem.ReadIPA(q.availAddr, 4)
-	if err != nil {
+	var header [4]byte
+	if err := f.readIPAInto(q.availAddr, header[:]); err != nil {
 		return err
 	}
 	availFlags := binary.LittleEndian.Uint16(header[0:2])
 	availIdx := binary.LittleEndian.Uint16(header[2:4])
+	oldUsedIdx := q.usedIdx
 	interruptNeeded := false
 	for q.lastAvailIdx != availIdx {
 		slot := q.lastAvailIdx % q.size
-		entry, err := f.mem.ReadIPA(q.availAddr+4+uint64(slot)*2, 2)
-		if err != nil {
+		var entry [2]byte
+		if err := f.readIPAInto(q.availAddr+4+uint64(slot)*2, entry[:]); err != nil {
 			return err
 		}
-		head := binary.LittleEndian.Uint16(entry)
+		head := binary.LittleEndian.Uint16(entry[:])
 		f.logf("queue-notify q=%d head=%d", qidx, head)
 		usedLen, reply, err := f.handleRequestLocked(q, head)
 		if err != nil {
@@ -437,7 +612,12 @@ func (f *FS) processQueueLocked(qidx int) error {
 		}
 		q.lastAvailIdx++
 	}
-	if interruptNeeded && (qidx == fsQueueRequest || qidx == fsQueueHiprio) && (availFlags&1) == 0 {
+	if f.driverFeatures&featureRingEventIdx != 0 {
+		if err := f.writeAvailEventLocked(q); err != nil {
+			return err
+		}
+	}
+	if interruptNeeded && f.isCompletingQueue(qidx) && f.shouldInterruptLocked(q, oldUsedIdx, q.usedIdx, availFlags) {
 		f.interruptStatus |= fsInterruptVring
 		f.interruptRaises++
 		f.logf("interrupt-raise status=%#x", f.interruptStatus)
@@ -446,12 +626,52 @@ func (f *FS) processQueueLocked(qidx int) error {
 	return nil
 }
 
+func (f *FS) processQueueAsyncLocked(qidx int) ([]fsWork, error) {
+	q := &f.queues[qidx]
+	if !q.ready || q.size == 0 || f.mem == nil {
+		return nil, nil
+	}
+
+	var header [4]byte
+	if err := f.readIPAInto(q.availAddr, header[:]); err != nil {
+		return nil, err
+	}
+	suppressInterrupt := binary.LittleEndian.Uint16(header[0:2])&1 != 0
+	availIdx := binary.LittleEndian.Uint16(header[2:4])
+	var works []fsWork
+	for q.lastAvailIdx != availIdx {
+		slot := q.lastAvailIdx % q.size
+		var entry [2]byte
+		if err := f.readIPAInto(q.availAddr+4+uint64(slot)*2, entry[:]); err != nil {
+			return nil, err
+		}
+		head := binary.LittleEndian.Uint16(entry[:])
+		f.logf("queue-notify q=%d head=%d", qidx, head)
+		work, err := f.prepareRequestLocked(qidx, q, head, suppressInterrupt)
+		if err != nil {
+			return nil, err
+		}
+		works = append(works, work)
+		q.lastAvailIdx++
+	}
+	if f.driverFeatures&featureRingEventIdx != 0 {
+		if err := f.writeAvailEventLocked(q); err != nil {
+			return nil, err
+		}
+	}
+	return works, nil
+}
+
 func (f *FS) handleRequestLocked(q *queue, head uint16) (uint32, bool, error) {
-	descs, err := f.readDescriptorChainLocked(q, head)
+	var descScratch [8]fsDesc
+	descs, err := f.readDescriptorChainLocked(q, head, descScratch[:0])
 	if err != nil {
 		return 0, false, err
 	}
-	var reqDescs, respDescs []fsDesc
+	var reqScratch [4]fsDesc
+	var respScratch [4]fsDesc
+	reqDescs := reqScratch[:0]
+	respDescs := respScratch[:0]
 	for _, d := range descs {
 		if d.write {
 			respDescs = append(respDescs, d)
@@ -469,13 +689,19 @@ func (f *FS) handleRequestLocked(q *queue, head uint16) (uint32, bool, error) {
 	for _, d := range reqDescs {
 		reqLen += int(d.length)
 	}
-	req := make([]byte, 0, reqLen)
+	var reqStack [4096]byte
+	var req []byte
+	if reqLen <= len(reqStack) {
+		req = reqStack[:reqLen]
+	} else {
+		req = make([]byte, reqLen)
+	}
+	reqOff := 0
 	for _, d := range reqDescs {
-		chunk, err := f.mem.ReadIPA(d.addr, int(d.length))
-		if err != nil {
+		if err := f.readIPAInto(d.addr, req[reqOff:reqOff+int(d.length)]); err != nil {
 			return 0, false, err
 		}
-		req = append(req, chunk...)
+		reqOff += int(d.length)
 	}
 	reply, err := f.dispatchFUSELocked(req)
 	if err != nil {
@@ -504,7 +730,261 @@ func (f *FS) handleRequestLocked(q *queue, head uint16) (uint32, bool, error) {
 	return uint32(len(reply)), true, nil
 }
 
+func (f *FS) prepareRequestLocked(qidx int, q *queue, head uint16, suppressInterrupt bool) (fsWork, error) {
+	seq := f.nextWorkSeq[qidx]
+	f.nextWorkSeq[qidx]++
+	work := fsWork{qidx: qidx, head: head, seq: seq, generation: f.configGeneration, suppressInterrupt: suppressInterrupt}
+	var descScratch [8]fsDesc
+	descs, err := f.readDescriptorChainLocked(q, head, descScratch[:0])
+	if err != nil {
+		return work, err
+	}
+	var reqScratch [4]fsDesc
+	var respScratch [4]fsDesc
+	reqDescs := reqScratch[:0]
+	respDescs := respScratch[:0]
+	for _, d := range descs {
+		if d.write {
+			respDescs = append(respDescs, d)
+			continue
+		}
+		if len(respDescs) != 0 {
+			return work, fmt.Errorf("virtio-fs descriptor order invalid")
+		}
+		reqDescs = append(reqDescs, d)
+	}
+	if len(reqDescs) == 0 {
+		return work, fmt.Errorf("virtio-fs missing request descriptors")
+	}
+	reqLen := 0
+	for _, d := range reqDescs {
+		reqLen += int(d.length)
+	}
+	req, pooledReq := takeFSReqBuffer(reqLen)
+	reqOff := 0
+	for _, d := range reqDescs {
+		if err := f.readIPAInto(d.addr, req[reqOff:reqOff+int(d.length)]); err != nil {
+			putFSReqBuffer(req, pooledReq)
+			return work, err
+		}
+		reqOff += int(d.length)
+	}
+	if len(req) >= 16 {
+		work.unique = binary.LittleEndian.Uint64(req[8:16])
+	}
+	work.req = req
+	work.pooledReq = pooledReq
+	work.respCount = len(respDescs)
+	if len(respDescs) <= len(work.respDescs) {
+		copy(work.respDescs[:], respDescs)
+	} else {
+		work.respExtra = append([]fsDesc(nil), respDescs...)
+	}
+	return work, nil
+}
+
+func (f *FS) enqueueWorks(works []fsWork) {
+	if len(works) == 0 {
+		return
+	}
+	f.workerOnce.Do(f.startWorkers)
+	for _, work := range works {
+		f.workCh <- work
+	}
+}
+
+func (f *FS) processWorksInline(works []fsWork) error {
+	if len(works) == 0 {
+		return nil
+	}
+	completions := make([]fsInlineCompletion, 0, len(works))
+	dispatchStart := time.Now()
+	for _, work := range works {
+		reply, err := f.dispatchFUSE(work.req)
+		putFSReqBuffer(work.req, work.pooledReq)
+		work.req = nil
+		work.pooledReq = false
+		if err != nil {
+			return err
+		}
+		completions = append(completions, fsInlineCompletion{work: work, reply: reply})
+	}
+	f.recordStageDuration(fsStageInlineDispatch, time.Since(dispatchStart))
+	return f.completeWorksInline(completions)
+}
+
+func (f *FS) startWorkers() {
+	for i := 0; i < fsWorkerCount; i++ {
+		go f.runWorker()
+	}
+}
+
+func (f *FS) runWorker() {
+	for work := range f.workCh {
+		reply, err := f.dispatchFUSE(work.req)
+		putFSReqBuffer(work.req, work.pooledReq)
+		work.req = nil
+		work.pooledReq = false
+		if err != nil {
+			f.logf("async-fuse-error q=%d head=%d: %v", work.qidx, work.head, err)
+			reply = fuseReply(work.unique, -linuxEIO, nil)
+			err = nil
+		}
+		if err := f.completeWork(work, reply, err); err != nil {
+			f.logf("async-complete-error q=%d head=%d: %v", work.qidx, work.head, err)
+		}
+	}
+}
+
+func (f *FS) completeWork(work fsWork, reply []byte, workErr error) error {
+	defer f.recordStageTiming(fsStageAsyncComplete, time.Now())
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if work.generation != f.configGeneration || work.qidx < 0 || work.qidx >= len(f.queues) {
+		return nil
+	}
+	if f.completions == nil {
+		f.completions = make(map[fsCompletionKey]fsCompletion)
+	}
+	f.completions[fsCompletionKey{qidx: work.qidx, seq: work.seq}] = fsCompletion{work: work, reply: reply, err: workErr}
+	return f.drainCompletionsLocked(work.qidx)
+}
+
+func (f *FS) completeWorksInline(completions []fsInlineCompletion) error {
+	if len(completions) == 0 {
+		return nil
+	}
+	defer f.recordStageTiming(fsStageInlineComplete, time.Now())
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for index := 0; index < len(completions); {
+		qidx := completions[index].work.qidx
+		if qidx < 0 || qidx >= len(f.queues) {
+			index++
+			continue
+		}
+		q := &f.queues[qidx]
+		oldUsedIdx := q.usedIdx
+		wroteCompletion := false
+		interruptSuppressed := true
+		for index < len(completions) && completions[index].work.qidx == qidx {
+			completion := completions[index]
+			index++
+			if completion.work.generation != f.configGeneration {
+				continue
+			}
+			if completion.err != nil {
+				return completion.err
+			}
+			if completion.reply == nil {
+				continue
+			}
+			if err := f.writeCompletionUsedLocked(q, completion.work, completion.reply); err != nil {
+				return err
+			}
+			wroteCompletion = true
+			if !completion.work.suppressInterrupt {
+				interruptSuppressed = false
+			}
+		}
+		if !wroteCompletion || !f.isCompletingQueue(qidx) {
+			continue
+		}
+		shouldInterrupt := false
+		if f.driverFeatures&featureRingEventIdx != 0 {
+			shouldInterrupt = f.shouldInterruptLocked(q, oldUsedIdx, q.usedIdx, 0)
+		} else {
+			shouldInterrupt = !interruptSuppressed
+		}
+		if shouldInterrupt {
+			f.interruptStatus |= fsInterruptVring
+			f.interruptRaises++
+			f.logf("interrupt-raise status=%#x", f.interruptStatus)
+			if err := f.updateIRQLocked(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (f *FS) drainCompletionsLocked(qidx int) error {
+	q := &f.queues[qidx]
+	for {
+		seq := f.nextCompleteSeq[qidx]
+		key := fsCompletionKey{qidx: qidx, seq: seq}
+		completion, ok := f.completions[key]
+		if !ok {
+			return nil
+		}
+		delete(f.completions, key)
+		f.nextCompleteSeq[qidx]++
+		if completion.err != nil {
+			return completion.err
+		}
+		if completion.reply == nil {
+			continue
+		}
+		if err := f.writeCompletionLocked(q, completion.work, completion.reply); err != nil {
+			return err
+		}
+	}
+}
+
+func (f *FS) writeCompletionLocked(q *queue, work fsWork, reply []byte) error {
+	if err := f.writeCompletionUsedLocked(q, work, reply); err != nil {
+		return err
+	}
+	if (f.driverFeatures&featureRingEventIdx != 0 || !work.suppressInterrupt) && f.isCompletingQueue(work.qidx) {
+		if f.driverFeatures&featureRingEventIdx != 0 && !f.shouldInterruptLocked(q, q.usedIdx-1, q.usedIdx, 0) {
+			return nil
+		}
+		f.interruptStatus |= fsInterruptVring
+		f.interruptRaises++
+		f.logf("interrupt-raise status=%#x", f.interruptStatus)
+		return f.updateIRQLocked()
+	}
+	return nil
+}
+
+func (f *FS) writeCompletionUsedLocked(q *queue, work fsWork, reply []byte) error {
+	offset := 0
+	for i := 0; i < work.respCount; i++ {
+		d := work.responseDesc(i)
+		if offset >= len(reply) {
+			break
+		}
+		chunk := len(reply) - offset
+		if chunk > int(d.length) {
+			chunk = int(d.length)
+		}
+		if err := f.mem.WriteIPA(d.addr, reply[offset:offset+chunk]); err != nil {
+			return err
+		}
+		offset += chunk
+	}
+	if offset < len(reply) {
+		return fmt.Errorf("virtio-fs response truncated: need %d have %d", len(reply), offset)
+	}
+	if err := f.writeUsedLocked(q, work.head, uint32(len(reply))); err != nil {
+		return err
+	}
+	f.logf("used-ring q=%d head=%d len=%d", work.qidx, work.head, len(reply))
+	return nil
+}
+
+func (w *fsWork) responseDesc(index int) fsDesc {
+	if w.respExtra != nil {
+		return w.respExtra[index]
+	}
+	return w.respDescs[index]
+}
+
 func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
+	return f.dispatchFUSE(req)
+}
+
+func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 	if len(req) < fuseInHeaderSize {
 		return nil, fmt.Errorf("virtio-fs short request: %d", len(req))
 	}
@@ -513,16 +993,10 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 	nodeID := binary.LittleEndian.Uint64(req[16:24])
 	opStart := time.Now()
 	defer f.recordFUSEDispatchTiming(opcode, opStart)
-	f.fuseRequests++
 	f.logf("opcode=%d unique=%d node=%d", opcode, unique, nodeID)
 
 	reply := func(errno int32, extra []byte) []byte {
-		out := make([]byte, fuseOutHeaderSize+len(extra))
-		binary.LittleEndian.PutUint32(out[0:4], uint32(len(out)))
-		binary.LittleEndian.PutUint32(out[4:8], uint32(errno))
-		binary.LittleEndian.PutUint64(out[8:16], unique)
-		copy(out[16:], extra)
-		return out
+		return fuseReply(unique, errno, extra)
 	}
 
 	switch opcode {
@@ -538,6 +1012,19 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 		if maxWrite == 0 {
 			maxWrite = 128 << 10
 		}
+		if maxWrite > 4096 {
+			flags |= fuseCapBigWrites | fuseCapMaxPages
+		}
+		if f.writebackCache {
+			flags |= fuseCapWritebackCache
+		}
+		maxPages := (maxWrite + 4095) / 4096
+		if maxPages == 0 {
+			maxPages = 1
+		}
+		if maxPages > 0xffff {
+			maxPages = 0xffff
+		}
 		extra := make([]byte, fuseInitOutSize)
 		replyMajor := uint32(7)
 		replyMinor := uint32(31)
@@ -551,10 +1038,17 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 		binary.LittleEndian.PutUint32(extra[4:8], replyMinor)
 		binary.LittleEndian.PutUint32(extra[8:12], 128<<10)
 		binary.LittleEndian.PutUint32(extra[12:16], flags)
-		binary.LittleEndian.PutUint16(extra[16:18], 16)
-		binary.LittleEndian.PutUint16(extra[18:20], 32)
+		maxBackground := uint16(16)
+		congestionThreshold := uint16(32)
+		if f.writebackCache {
+			maxBackground = 256
+			congestionThreshold = 192
+		}
+		binary.LittleEndian.PutUint16(extra[16:18], maxBackground)
+		binary.LittleEndian.PutUint16(extra[18:20], congestionThreshold)
 		binary.LittleEndian.PutUint32(extra[20:24], maxWrite)
 		binary.LittleEndian.PutUint32(extra[24:28], 1)
+		binary.LittleEndian.PutUint16(extra[28:30], uint16(maxPages))
 		f.logf("init-reply major=%d minor=%d max_write=%d", replyMajor, replyMinor, maxWrite)
 		return reply(0, extra), nil
 	case fuseGetAttr:
@@ -564,7 +1058,7 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 			return reply(errno, nil), nil
 		}
 		extra := make([]byte, fuseAttrOutSize)
-		binary.LittleEndian.PutUint64(extra[0:8], 1)
+		encodeFuseAttrTTL(extra[0:16], f.attrTTL)
 		encodeFuseAttr(extra[16:], attr)
 		return reply(0, extra), nil
 	case fuseSetAttr:
@@ -585,7 +1079,7 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 				return reply(errno, nil), nil
 			}
 			extra := make([]byte, fuseAttrOutSize)
-			binary.LittleEndian.PutUint64(extra[0:8], 1)
+			encodeFuseAttrTTL(extra[0:16], f.attrTTL)
 			encodeFuseAttr(extra[16:], attr)
 			return reply(0, extra), nil
 		}
@@ -599,9 +1093,7 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 		}
 		f.logPathf("lookup-child", childID, "")
 		extra := make([]byte, fuseEntryOutSize)
-		binary.LittleEndian.PutUint64(extra[0:8], childID)
-		binary.LittleEndian.PutUint64(extra[16:24], 1)
-		binary.LittleEndian.PutUint64(extra[24:32], 1)
+		f.encodeFuseEntryOut(extra, childID)
 		encodeFuseAttr(extra[40:], attr)
 		return reply(0, extra), nil
 	case fuseMkdir:
@@ -617,9 +1109,7 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 				return reply(errno, nil), nil
 			}
 			extra := make([]byte, fuseEntryOutSize)
-			binary.LittleEndian.PutUint64(extra[0:8], childID)
-			binary.LittleEndian.PutUint64(extra[16:24], 1)
-			binary.LittleEndian.PutUint64(extra[24:32], 1)
+			f.encodeFuseEntryOut(extra, childID)
 			encodeFuseAttr(extra[40:], attr)
 			return reply(0, extra), nil
 		}
@@ -642,6 +1132,7 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 		}
 		extra := make([]byte, fuseOpenOutSize)
 		binary.LittleEndian.PutUint64(extra[0:8], fh)
+		binary.LittleEndian.PutUint32(extra[8:12], f.openResponseFlags(flags, false))
 		return reply(0, extra), nil
 	case fuseRead:
 		if len(req) < fuseInHeaderSize+24 {
@@ -685,6 +1176,20 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 		f.logPathf("release", nodeID, fmt.Sprintf(" fh=%d", binary.LittleEndian.Uint64(req[40:48])))
 		f.backend.Release(nodeID, binary.LittleEndian.Uint64(req[40:48]))
 		return reply(0, nil), nil
+	case fuseFsync:
+		if len(req) < fuseInHeaderSize+16 {
+			return nil, fmt.Errorf("virtio-fs FSYNC too short")
+		}
+		fh := binary.LittleEndian.Uint64(req[40:48])
+		flags := binary.LittleEndian.Uint32(req[48:52])
+		f.logPathf("fsync", nodeID, fmt.Sprintf(" fh=%d flags=%#x", fh, flags))
+		if be, ok := f.backend.(fsFsyncBackend); ok {
+			return reply(be.Fsync(nodeID, fh, flags), nil), nil
+		}
+		if f.Strict {
+			return nil, fmt.Errorf("virtio-fs missing fsync backend for FSYNC node=%d fh=%d", nodeID, fh)
+		}
+		return reply(0, nil), nil
 	case fuseOpenDir:
 		if len(req) < fuseInHeaderSize+8 {
 			return nil, fmt.Errorf("virtio-fs OPENDIR too short")
@@ -697,6 +1202,7 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 		}
 		extra := make([]byte, fuseOpenOutSize)
 		binary.LittleEndian.PutUint64(extra[0:8], fh)
+		binary.LittleEndian.PutUint32(extra[8:12], f.openResponseFlags(flags, true))
 		return reply(0, extra), nil
 	case fuseReadDir:
 		if len(req) < fuseInHeaderSize+24 {
@@ -717,6 +1223,20 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 		}
 		f.logPathf("releasedir", nodeID, fmt.Sprintf(" fh=%d", binary.LittleEndian.Uint64(req[40:48])))
 		f.backend.ReleaseDir(nodeID, binary.LittleEndian.Uint64(req[40:48]))
+		return reply(0, nil), nil
+	case fuseFsyncDir:
+		if len(req) < fuseInHeaderSize+16 {
+			return nil, fmt.Errorf("virtio-fs FSYNCDIR too short")
+		}
+		fh := binary.LittleEndian.Uint64(req[40:48])
+		flags := binary.LittleEndian.Uint32(req[48:52])
+		f.logPathf("fsyncdir", nodeID, fmt.Sprintf(" fh=%d flags=%#x", fh, flags))
+		if be, ok := f.backend.(fsFsyncDirBackend); ok {
+			return reply(be.FsyncDir(nodeID, fh, flags), nil), nil
+		}
+		if f.Strict {
+			return nil, fmt.Errorf("virtio-fs missing fsyncdir backend for FSYNCDIR node=%d fh=%d", nodeID, fh)
+		}
 		return reply(0, nil), nil
 	case fuseRmDir:
 		name := readCStringName(req[fuseInHeaderSize:])
@@ -867,7 +1387,7 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 			return reply(errno, nil), nil
 		}
 		extra := make([]byte, fuseStatxOutSize)
-		binary.LittleEndian.PutUint64(extra[0:8], 1)
+		encodeFuseAttrTTL(extra[0:16], f.attrTTL)
 		encodeFuseStatx(extra[32:], attr)
 		return reply(0, extra), nil
 	case fuseSyncFS:
@@ -890,11 +1410,10 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 				return reply(errno, nil), nil
 			}
 			extra := make([]byte, fuseEntryOutSize+fuseOpenOutSize)
-			binary.LittleEndian.PutUint64(extra[0:8], childID)
-			binary.LittleEndian.PutUint64(extra[16:24], 1)
-			binary.LittleEndian.PutUint64(extra[24:32], 1)
+			f.encodeFuseEntryOut(extra[:fuseEntryOutSize], childID)
 			encodeFuseAttr(extra[40:], attr)
 			binary.LittleEndian.PutUint64(extra[fuseEntryOutSize:fuseEntryOutSize+8], fh)
+			binary.LittleEndian.PutUint32(extra[fuseEntryOutSize+8:fuseEntryOutSize+12], f.openResponseFlags(flags, false))
 			return reply(0, extra), nil
 		}
 		return reply(-linuxENOSYS, nil), nil
@@ -938,6 +1457,8 @@ func fuseOpcodeName(opcode uint32) string {
 		return "STATFS"
 	case fuseRelease:
 		return "RELEASE"
+	case fuseFsync:
+		return "FSYNC"
 	case fuseGetXattr:
 		return "GETXATTR"
 	case fuseListXattr:
@@ -952,6 +1473,8 @@ func fuseOpcodeName(opcode uint32) string {
 		return "READDIR"
 	case fuseReleaseDir:
 		return "RELEASEDIR"
+	case fuseFsyncDir:
+		return "FSYNCDIR"
 	case fuseAccess:
 		return "ACCESS"
 	case fuseCreate:
@@ -978,6 +1501,11 @@ func fuseOpcodeMetricName(opcode uint32) string {
 }
 
 func (f *FS) recordFUSEDispatchTiming(opcode uint32, start time.Time) {
+	duration := time.Since(start)
+	f.fuseRequests.Add(1)
+	if opcode < uint32(len(f.fuseOpStats)) {
+		recordTimingStat(&f.fuseOpStats[opcode].timingStat, duration)
+	}
 	if f.RecordTiming == nil {
 		return
 	}
@@ -985,7 +1513,113 @@ func (f *FS) recordFUSEDispatchTiming(opcode uint32, start time.Time) {
 	if tag == "" {
 		tag = "unknown"
 	}
-	f.RecordTiming("virtio.fs."+tag+".fuse."+fuseOpcodeMetricName(opcode), time.Since(start))
+	f.RecordTiming("virtio.fs."+tag+".fuse."+fuseOpcodeMetricName(opcode), duration)
+}
+
+func (f *FS) recordStageTiming(stage int, start time.Time) {
+	f.recordStageDuration(stage, time.Since(start))
+}
+
+func (f *FS) recordStageDuration(stage int, duration time.Duration) {
+	if stage < 0 || stage >= len(f.stageStats) {
+		return
+	}
+	recordTimingStat(&f.stageStats[stage], duration)
+	if f.RecordTiming == nil {
+		return
+	}
+	tag := strings.TrimRight(string(f.tag[:]), "\x00")
+	if tag == "" {
+		tag = "unknown"
+	}
+	f.RecordTiming("virtio.fs."+tag+".stage."+fsStageName(stage), duration)
+}
+
+func recordTimingStat(stat *timingStat, duration time.Duration) {
+	nanos := duration.Nanoseconds()
+	stat.count.Add(1)
+	stat.totalNanos.Add(nanos)
+	for {
+		oldMax := stat.maxNanos.Load()
+		if nanos <= oldMax || stat.maxNanos.CompareAndSwap(oldMax, nanos) {
+			break
+		}
+	}
+}
+
+func fsStageName(stage int) string {
+	switch stage {
+	case fsStageQueueHarvest:
+		return "queue_harvest"
+	case fsStageInlineDispatch:
+		return "inline_dispatch"
+	case fsStageInlineComplete:
+		return "inline_complete"
+	case fsStageAsyncComplete:
+		return "async_complete"
+	default:
+		return "unknown"
+	}
+}
+
+func fuseReply(unique uint64, errno int32, extra []byte) []byte {
+	out := make([]byte, fuseOutHeaderSize+len(extra))
+	binary.LittleEndian.PutUint32(out[0:4], uint32(len(out)))
+	binary.LittleEndian.PutUint32(out[4:8], uint32(errno))
+	binary.LittleEndian.PutUint64(out[8:16], unique)
+	copy(out[16:], extra)
+	return out
+}
+
+func (f *FS) encodeFuseEntryOut(dst []byte, nodeID uint64) {
+	binary.LittleEndian.PutUint64(dst[0:8], nodeID)
+	binary.LittleEndian.PutUint64(dst[8:16], 1)
+	encodeFuseTTL(dst[16:24], dst[32:36], f.entryTTL)
+	encodeFuseTTL(dst[24:32], dst[36:40], f.attrTTL)
+}
+
+func encodeFuseAttrTTL(dst []byte, ttl time.Duration) {
+	encodeFuseTTL(dst[0:8], dst[8:12], ttl)
+}
+
+func encodeFuseTTL(secDst []byte, nsecDst []byte, ttl time.Duration) {
+	if ttl < 0 {
+		ttl = 0
+	}
+	sec := ttl / time.Second
+	nsec := ttl % time.Second
+	binary.LittleEndian.PutUint64(secDst, uint64(sec))
+	binary.LittleEndian.PutUint32(nsecDst, uint32(nsec))
+}
+
+func (f *FS) openResponseFlags(openFlags uint32, dir bool) uint32 {
+	flags := uint32(fuseOpenNoFlush)
+	if f.cacheMode == fsCacheStrict {
+		return flags
+	}
+	if dir {
+		return flags | fuseOpenCacheDir
+	}
+	if openFlags&linuxOACCMODE == linuxORDONLY {
+		flags |= fuseOpenKeepCache
+	}
+	return flags
+}
+
+func takeFSReqBuffer(size int) ([]byte, bool) {
+	if size > fsPooledReqSize {
+		return make([]byte, size), false
+	}
+	buf := fsReqPool.Get().([]byte)
+	return buf[:size], true
+}
+
+func putFSReqBuffer(buf []byte, pooled bool) {
+	if !pooled {
+		return
+	}
+	buf = buf[:fsPooledReqSize]
+	fsReqPool.Put(buf)
 }
 
 func (f *FS) logf(format string, args ...any) {
@@ -1006,15 +1640,26 @@ func (f *FS) logPathf(op string, nodeID uint64, suffix string) {
 	_, _ = fmt.Fprintf(f.Log, "%s node=%d%s\n", op, nodeID, suffix)
 }
 
-func (f *FS) readDescriptorChainLocked(q *queue, head uint16) ([]fsDesc, error) {
-	var out []fsDesc
+func (f *FS) readIPAInto(addr uint64, dst []byte) error {
+	if reader, ok := f.mem.(guestMemoryReaderInto); ok {
+		return reader.ReadIPAInto(addr, dst)
+	}
+	buf, err := f.mem.ReadIPA(addr, len(dst))
+	if err != nil {
+		return err
+	}
+	copy(dst, buf)
+	return nil
+}
+
+func (f *FS) readDescriptorChainLocked(q *queue, head uint16, out []fsDesc) ([]fsDesc, error) {
 	index := head
 	for i := uint16(0); i < q.size; i++ {
 		if index >= q.size {
 			return nil, fmt.Errorf("virtio-fs descriptor index %d out of range", index)
 		}
-		buf, err := f.mem.ReadIPA(q.descAddr+uint64(index)*16, 16)
-		if err != nil {
+		var buf [16]byte
+		if err := f.readIPAInto(q.descAddr+uint64(index)*16, buf[:]); err != nil {
 			return nil, err
 		}
 		desc := fsDesc{
@@ -1035,16 +1680,45 @@ func (f *FS) readDescriptorChainLocked(q *queue, head uint16) ([]fsDesc, error) 
 
 func (f *FS) writeUsedLocked(q *queue, head uint16, usedLen uint32) error {
 	slot := q.usedIdx % q.size
-	elem := make([]byte, 8)
+	var elem [8]byte
 	binary.LittleEndian.PutUint32(elem[0:4], uint32(head))
 	binary.LittleEndian.PutUint32(elem[4:8], usedLen)
-	if err := f.mem.WriteIPA(q.usedAddr+4+uint64(slot)*8, elem); err != nil {
+	if err := f.mem.WriteIPA(q.usedAddr+4+uint64(slot)*8, elem[:]); err != nil {
 		return err
 	}
 	q.usedIdx++
-	idx := make([]byte, 2)
-	binary.LittleEndian.PutUint16(idx, q.usedIdx)
-	return f.mem.WriteIPA(q.usedAddr+2, idx)
+	var idx [2]byte
+	binary.LittleEndian.PutUint16(idx[:], q.usedIdx)
+	return f.mem.WriteIPA(q.usedAddr+2, idx[:])
+}
+
+func (f *FS) shouldInterruptLocked(q *queue, oldUsedIdx, newUsedIdx, availFlags uint16) bool {
+	if oldUsedIdx == newUsedIdx {
+		return false
+	}
+	if f.driverFeatures&featureRingEventIdx == 0 {
+		return availFlags&1 == 0
+	}
+	var buf [2]byte
+	if err := f.readIPAInto(q.availAddr+4+uint64(q.size)*2, buf[:]); err != nil {
+		f.logf("used-event-read-error: %v", err)
+		return true
+	}
+	usedEvent := binary.LittleEndian.Uint16(buf[:])
+	return vringNeedEvent(usedEvent, newUsedIdx, oldUsedIdx)
+}
+
+func (f *FS) writeAvailEventLocked(q *queue) error {
+	if q.size == 0 || q.usedAddr == 0 {
+		return nil
+	}
+	var buf [2]byte
+	binary.LittleEndian.PutUint16(buf[:], q.lastAvailIdx)
+	return f.mem.WriteIPA(q.usedAddr+4+uint64(q.size)*8, buf[:])
+}
+
+func vringNeedEvent(eventIdx, newIdx, oldIdx uint16) bool {
+	return uint16(newIdx-eventIdx-1) < uint16(newIdx-oldIdx)
 }
 
 func (f *FS) updateIRQLocked() error {
@@ -1068,24 +1742,120 @@ func (f *FS) Summary() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	tag := strings.TrimRight(string(f.tag[:]), "\x00")
+	queueNotifies := append([]uint64(nil), f.queueNotifies...)
+	queueReady := f.queueReadySnapshotLocked()
+	queueLastAvail := f.queueLastAvailSnapshotLocked()
 	return fmt.Sprintf(
-		"virtio-fs tag=%q mmio_reads=%d mmio_writes=%d status=%#x q0_notify=%d q1_notify=%d fuse_requests=%d interrupt_raises=%d irq_transitions=%d irq_high=%t interrupt_status=%#x q0_ready=%t q1_ready=%t q0_last=%d q1_last=%d",
+		"virtio-fs tag=%q mmio_reads=%d mmio_writes=%d status=%#x queue_notifies=%v fuse_requests=%d interrupt_raises=%d irq_transitions=%d irq_high=%t interrupt_status=%#x queue_ready=%v queue_last=%v",
 		tag,
 		f.mmioReads,
 		f.mmioWrites,
 		f.status,
-		f.queueNotifies[0],
-		f.queueNotifies[1],
-		f.fuseRequests,
+		queueNotifies,
+		f.fuseRequests.Load(),
 		f.interruptRaises,
 		f.irqTransitions,
 		f.irqHigh,
 		f.interruptStatus,
-		f.queues[0].ready,
-		f.queues[1].ready,
-		f.queues[0].lastAvailIdx,
-		f.queues[1].lastAvailIdx,
+		queueReady,
+		queueLastAvail,
 	)
+}
+
+func (f *FS) Stats() FSStats {
+	if f == nil {
+		return FSStats{}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	tag := strings.TrimRight(string(f.tag[:]), "\x00")
+	ops := make([]FUSEOpStats, 0, len(f.fuseOpStats))
+	for opcode, stat := range f.fuseOpStats {
+		count := stat.timingStat.count.Load()
+		if count == 0 {
+			continue
+		}
+		totalNanos := stat.timingStat.totalNanos.Load()
+		avg := int64(0)
+		if count != 0 {
+			avg = totalNanos / int64(count)
+		}
+		opcodeValue := uint32(opcode)
+		ops = append(ops, FUSEOpStats{
+			Opcode:       opcodeValue,
+			Name:         fuseOpcodeName(opcodeValue),
+			Count:        count,
+			TotalNanos:   totalNanos,
+			MaxNanos:     stat.timingStat.maxNanos.Load(),
+			AverageNanos: avg,
+		})
+	}
+	sort.Slice(ops, func(i, j int) bool {
+		if ops[i].Count == ops[j].Count {
+			return ops[i].Opcode < ops[j].Opcode
+		}
+		return ops[i].Count > ops[j].Count
+	})
+	stages := make([]TimingStats, 0, len(f.stageStats))
+	for stage, stat := range f.stageStats {
+		if stats, ok := timingStatsSnapshot(fsStageName(stage), &stat); ok {
+			stages = append(stages, stats)
+		}
+	}
+	return FSStats{
+		Tag:             tag,
+		MMIOReads:       f.mmioReads,
+		MMIOWrites:      f.mmioWrites,
+		QueueNotifies:   append([]uint64(nil), f.queueNotifies...),
+		FUSERequests:    f.fuseRequests.Load(),
+		InterruptRaises: f.interruptRaises,
+		IRQTransitions:  f.irqTransitions,
+		IRQHigh:         f.irqHigh,
+		InterruptStatus: f.interruptStatus,
+		QueueReady:      f.queueReadySnapshotLocked(),
+		QueueLastAvail:  f.queueLastAvailSnapshotLocked(),
+		FUSEOps:         ops,
+		Stages:          stages,
+	}
+}
+
+func timingStatsSnapshot(name string, stat *timingStat) (TimingStats, bool) {
+	count := stat.count.Load()
+	if count == 0 {
+		return TimingStats{}, false
+	}
+	totalNanos := stat.totalNanos.Load()
+	avg := int64(0)
+	if count != 0 {
+		avg = totalNanos / int64(count)
+	}
+	return TimingStats{
+		Name:         name,
+		Count:        count,
+		TotalNanos:   totalNanos,
+		MaxNanos:     stat.maxNanos.Load(),
+		AverageNanos: avg,
+	}, true
+}
+
+func (f *FS) queueReadySnapshotLocked() []bool {
+	ready := make([]bool, len(f.queues))
+	for i := range f.queues {
+		ready[i] = f.queues[i].ready
+	}
+	return ready
+}
+
+func (f *FS) queueLastAvailSnapshotLocked() []uint16 {
+	last := make([]uint16, len(f.queues))
+	for i := range f.queues {
+		last[i] = f.queues[i].lastAvailIdx
+	}
+	return last
+}
+
+func (f *FS) isCompletingQueue(qidx int) bool {
+	return qidx >= 0 && qidx < len(f.queues)
 }
 
 func (f *FS) selectedQueueLocked() *queue {
@@ -1112,14 +1882,42 @@ func (f *FS) resetLocked() {
 	f.interruptStatus = 0
 	f.irqHigh = false
 	f.configGeneration++
-	f.queues = [2]queue{}
+	f.resetQueueStateLocked()
 }
 
 func (f *FS) configBytesLocked() []byte {
 	cfg := make([]byte, fsCfgTotalSize)
 	copy(cfg[:fsCfgTagSize], f.tag[:])
-	binary.LittleEndian.PutUint32(cfg[fsCfgNumQueueOff:fsCfgNumQueueOff+4], 1)
+	binary.LittleEndian.PutUint32(cfg[fsCfgNumQueueOff:fsCfgNumQueueOff+4], fsRequestQueueCount)
 	return cfg
+}
+
+func (f *FS) resetQueueStateLocked() {
+	queueCount := fsQueueCount
+	if cap(f.queues) < queueCount {
+		f.queues = make([]queue, queueCount)
+	} else {
+		f.queues = f.queues[:queueCount]
+		clear(f.queues)
+	}
+	if len(f.queueNotifies) != queueCount {
+		old := f.queueNotifies
+		f.queueNotifies = make([]uint64, queueCount)
+		copy(f.queueNotifies, old)
+	}
+	if cap(f.nextWorkSeq) < queueCount {
+		f.nextWorkSeq = make([]uint64, queueCount)
+	} else {
+		f.nextWorkSeq = f.nextWorkSeq[:queueCount]
+		clear(f.nextWorkSeq)
+	}
+	if cap(f.nextCompleteSeq) < queueCount {
+		f.nextCompleteSeq = make([]uint64, queueCount)
+	} else {
+		f.nextCompleteSeq = f.nextCompleteSeq[:queueCount]
+		clear(f.nextCompleteSeq)
+	}
+	f.completions = make(map[fsCompletionKey]fsCompletion)
 }
 
 func encodeFuseAttr(dst []byte, attr FuseAttr) {
@@ -1172,6 +1970,20 @@ func readCStringName(buf []byte) string {
 	return string(buf)
 }
 
+func cleanChildName(name string) (string, bool) {
+	if name == "" {
+		return "", false
+	}
+	if !strings.Contains(name, "/") && name != "." && name != ".." {
+		return name, true
+	}
+	clean := path.Clean("/" + name)
+	if clean == "/" {
+		return "", false
+	}
+	return strings.TrimPrefix(clean, "/"), true
+}
+
 func bytesIndexByte(buf []byte, want byte) int {
 	for i, b := range buf {
 		if b == want {
@@ -1182,10 +1994,11 @@ func bytesIndexByte(buf []byte, want byte) int {
 }
 
 type passthroughFS struct {
-	root string
-	meta map[string]fsmeta.Entry
+	root           string
+	meta           map[string]fsmeta.Entry
+	writebackCache bool
 
-	mu         sync.Mutex
+	mu         sync.RWMutex
 	nextNodeID uint64
 	nextHandle uint64
 	nodes      map[uint64]string
@@ -1290,7 +2103,13 @@ func NewImageFS(root imagefs.Directory, statfsPath string) FSBackend {
 }
 
 func (p *passthroughFS) Init() (uint32, uint32) {
-	return 128 << 10, fuseCapPosixACL | fuseCapPosixLocks
+	return 128 << 10, fuseCapPosixLocks
+}
+
+func (p *passthroughFS) SetWritebackCache(enabled bool) {
+	p.mu.Lock()
+	p.writebackCache = enabled
+	p.mu.Unlock()
 }
 
 func (p *passthroughFS) GetAttr(nodeID uint64) (FuseAttr, int32) {
@@ -1308,22 +2127,21 @@ func (p *passthroughFS) GetAttr(nodeID uint64) (FuseAttr, int32) {
 
 func (p *passthroughFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32) {
 	p.logNode("lookup-parent", parent)
-	hostParent, errno := p.hostPath(parent)
+	hostParent, guestParent, errno := p.hostAndGuestPath(parent)
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
 	}
-	clean := path.Clean("/" + name)
-	if clean == "/" {
+	rel, ok := cleanChildName(name)
+	if !ok {
 		attr, errno := p.GetAttr(parent)
 		return parent, attr, errno
 	}
-	rel := strings.TrimPrefix(clean, "/")
 	host := filepath.Join(hostParent, filepath.FromSlash(rel))
 	info, err := os.Lstat(host)
 	if err != nil {
 		return 0, FuseAttr{}, errnoFromError(err)
 	}
-	guestPath := p.guestPathForHost(host)
+	guestPath := joinGuestChild(guestParent, rel)
 	if p.root != "" {
 		p.logf("lookup name=%q guest=%q host=%q", name, guestPath, host)
 	}
@@ -1333,15 +2151,14 @@ func (p *passthroughFS) Lookup(parent uint64, name string) (uint64, FuseAttr, in
 
 func (p *passthroughFS) Mkdir(parent uint64, name string, mode uint32) (uint64, FuseAttr, int32) {
 	p.logNode("mkdir-parent", parent)
-	hostParent, errno := p.hostPath(parent)
+	hostParent, guestParent, errno := p.hostAndGuestPath(parent)
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
 	}
-	clean := path.Clean("/" + name)
-	if clean == "/" {
+	rel, ok := cleanChildName(name)
+	if !ok {
 		return 0, FuseAttr{}, -linuxEINVAL
 	}
-	rel := strings.TrimPrefix(clean, "/")
 	host := filepath.Join(hostParent, filepath.FromSlash(rel))
 	if err := os.Mkdir(host, fs.FileMode(mode&linuxPermMask)); err != nil {
 		return 0, FuseAttr{}, errnoFromError(err)
@@ -1350,7 +2167,7 @@ func (p *passthroughFS) Mkdir(parent uint64, name string, mode uint32) (uint64, 
 	if err != nil {
 		return 0, FuseAttr{}, errnoFromError(err)
 	}
-	guestPath := p.guestPathForHost(host)
+	guestPath := joinGuestChild(guestParent, rel)
 	if p.meta != nil {
 		p.mu.Lock()
 		if _, ok := p.meta[guestPath]; !ok {
@@ -1368,16 +2185,16 @@ func (p *passthroughFS) Mkdir(parent uint64, name string, mode uint32) (uint64, 
 
 func (p *passthroughFS) Create(parent uint64, name string, flags uint32, mode uint32) (uint64, uint64, FuseAttr, int32) {
 	p.logNode("create-parent", parent)
-	hostParent, errno := p.hostPath(parent)
+	hostParent, guestParent, errno := p.hostAndGuestPath(parent)
 	if errno != 0 {
 		return 0, 0, FuseAttr{}, errno
 	}
-	clean := path.Clean("/" + name)
-	if clean == "/" {
+	rel, ok := cleanChildName(name)
+	if !ok {
 		return 0, 0, FuseAttr{}, -linuxEINVAL
 	}
-	host := filepath.Join(hostParent, filepath.FromSlash(strings.TrimPrefix(clean, "/")))
-	file, err := os.OpenFile(host, translateLinuxOpenFlags(flags)|os.O_CREATE, fs.FileMode(mode&linuxPermMask))
+	host := filepath.Join(hostParent, filepath.FromSlash(rel))
+	file, err := os.OpenFile(host, p.translateOpenFlags(flags)|os.O_CREATE, fs.FileMode(mode&linuxPermMask))
 	if err != nil {
 		return 0, 0, FuseAttr{}, errnoFromError(err)
 	}
@@ -1386,7 +2203,7 @@ func (p *passthroughFS) Create(parent uint64, name string, flags uint32, mode ui
 		_ = file.Close()
 		return 0, 0, FuseAttr{}, errnoFromError(err)
 	}
-	guestPath := p.guestPathForHost(host)
+	guestPath := joinGuestChild(guestParent, rel)
 	nodeID := p.ensureNode(guestPath)
 	p.mu.Lock()
 	handle := p.nextHandle
@@ -1409,7 +2226,7 @@ func (p *passthroughFS) Open(nodeID uint64, flags uint32) (uint64, int32) {
 	if info.IsDir() {
 		return 0, -linuxEISDIR
 	}
-	file, err := os.OpenFile(host, translateLinuxOpenFlags(flags), 0)
+	file, err := os.OpenFile(host, p.translateOpenFlags(flags), 0)
 	if err != nil {
 		return 0, errnoFromError(err)
 	}
@@ -1432,9 +2249,19 @@ func (p *passthroughFS) Release(_ uint64, fh uint64) {
 }
 
 func (p *passthroughFS) Flush(_ uint64, fh uint64, _ uint64) int32 {
-	p.mu.Lock()
+	p.mu.RLock()
 	handle := p.handles[fh]
-	p.mu.Unlock()
+	p.mu.RUnlock()
+	if handle == nil || handle.file == nil {
+		return -linuxEBADF
+	}
+	return 0
+}
+
+func (p *passthroughFS) Fsync(_ uint64, fh uint64, _ uint32) int32 {
+	p.mu.RLock()
+	handle := p.handles[fh]
+	p.mu.RUnlock()
 	if handle == nil || handle.file == nil {
 		return -linuxEBADF
 	}
@@ -1444,11 +2271,21 @@ func (p *passthroughFS) Flush(_ uint64, fh uint64, _ uint64) int32 {
 	return 0
 }
 
+func (p *passthroughFS) FsyncDir(_ uint64, fh uint64, _ uint32) int32 {
+	p.mu.RLock()
+	_, ok := p.dirHandles[fh]
+	p.mu.RUnlock()
+	if !ok {
+		return -linuxEBADF
+	}
+	return 0
+}
+
 func (p *passthroughFS) Read(nodeID uint64, fh uint64, off uint64, size uint32) ([]byte, int32) {
-	p.logf("read node=%d path=%q fh=%d off=%d size=%d", nodeID, p.DebugPath(nodeID), fh, off, size)
-	p.mu.Lock()
+	p.logf("read node=%d fh=%d off=%d size=%d", nodeID, fh, off, size)
+	p.mu.RLock()
 	handle, ok := p.handles[fh]
-	p.mu.Unlock()
+	p.mu.RUnlock()
 	if !ok || handle == nil || handle.nodeID != nodeID || handle.file == nil {
 		return nil, -linuxEBADF
 	}
@@ -1461,9 +2298,9 @@ func (p *passthroughFS) Read(nodeID uint64, fh uint64, off uint64, size uint32) 
 }
 
 func (p *passthroughFS) Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32) (uint64, int32) {
-	p.mu.Lock()
+	p.mu.RLock()
 	handle, ok := p.handles[fh]
-	p.mu.Unlock()
+	p.mu.RUnlock()
 	if !ok || handle == nil || handle.nodeID != nodeID {
 		return 0, -linuxEBADF
 	}
@@ -1497,7 +2334,7 @@ func (p *passthroughFS) Lseek(nodeID uint64, fh uint64, offset uint64, whence ui
 
 func (p *passthroughFS) OpenDir(nodeID uint64, _ uint32) (uint64, int32) {
 	p.logNode("opendir", nodeID)
-	host, errno := p.hostPath(nodeID)
+	host, guest, errno := p.hostAndGuestPath(nodeID)
 	if errno != 0 {
 		return 0, errno
 	}
@@ -1510,7 +2347,7 @@ func (p *passthroughFS) OpenDir(nodeID uint64, _ uint32) (uint64, int32) {
 		{name: "..", typ: dirTypeDir, ino: nodeID},
 	}
 	for _, entry := range entries {
-		childPath := p.guestPathForHost(filepath.Join(host, entry.Name()))
+		childPath := joinGuestChild(guest, entry.Name())
 		childID := p.ensureNode(childPath)
 		dirEntries = append(dirEntries, dirEntry{
 			name: entry.Name(),
@@ -1527,9 +2364,9 @@ func (p *passthroughFS) OpenDir(nodeID uint64, _ uint32) (uint64, int32) {
 }
 
 func (p *passthroughFS) Write(nodeID uint64, fh uint64, off uint64, data []byte, _ uint32) (uint32, int32) {
-	p.mu.Lock()
+	p.mu.RLock()
 	handle := p.handles[fh]
-	p.mu.Unlock()
+	p.mu.RUnlock()
 	if handle == nil || handle.nodeID != nodeID || handle.file == nil {
 		return 0, -linuxEBADF
 	}
@@ -1587,7 +2424,7 @@ func (p *passthroughFS) Readlink(nodeID uint64) (string, int32) {
 
 func (p *passthroughFS) RmDir(parent uint64, name string) int32 {
 	p.logNode("rmdir-parent", parent)
-	hostParent, errno := p.hostPath(parent)
+	hostParent, guestParent, errno := p.hostAndGuestPath(parent)
 	if errno != 0 {
 		return errno
 	}
@@ -1600,7 +2437,7 @@ func (p *passthroughFS) RmDir(parent uint64, name string) int32 {
 	if err := os.Remove(host); err != nil {
 		return errnoFromError(err)
 	}
-	guestPath := p.guestPathForHost(host)
+	guestPath := joinGuestChild(guestParent, rel)
 	p.mu.Lock()
 	delete(p.meta, guestPath)
 	delete(p.pathToNode, guestPath)
@@ -1615,7 +2452,7 @@ func (p *passthroughFS) RmDir(parent uint64, name string) int32 {
 }
 
 func (p *passthroughFS) Unlink(parent uint64, name string) int32 {
-	hostParent, errno := p.hostPath(parent)
+	hostParent, guestParent, errno := p.hostAndGuestPath(parent)
 	if errno != 0 {
 		return errno
 	}
@@ -1627,25 +2464,27 @@ func (p *passthroughFS) Unlink(parent uint64, name string) int32 {
 	if err := os.Remove(host); err != nil {
 		return errnoFromError(err)
 	}
-	p.removeNodeForGuestPath(p.guestPathForHost(host))
+	p.removeNodeForGuestPath(joinGuestChild(guestParent, strings.TrimPrefix(clean, "/")))
 	return 0
 }
 
 func (p *passthroughFS) Rename(parent uint64, name string, newParent uint64, newName string, _ uint32) int32 {
-	oldParent, errno := p.hostPath(parent)
+	oldParent, oldGuestParent, errno := p.hostAndGuestPath(parent)
 	if errno != 0 {
 		return errno
 	}
-	newParentPath, errno := p.hostPath(newParent)
+	newParentPath, newGuestParent, errno := p.hostAndGuestPath(newParent)
 	if errno != 0 {
 		return errno
 	}
-	oldHost := filepath.Join(oldParent, filepath.FromSlash(strings.TrimPrefix(path.Clean("/"+name), "/")))
-	newHost := filepath.Join(newParentPath, filepath.FromSlash(strings.TrimPrefix(path.Clean("/"+newName), "/")))
+	oldRel := strings.TrimPrefix(path.Clean("/"+name), "/")
+	newRel := strings.TrimPrefix(path.Clean("/"+newName), "/")
+	oldHost := filepath.Join(oldParent, filepath.FromSlash(oldRel))
+	newHost := filepath.Join(newParentPath, filepath.FromSlash(newRel))
 	if err := os.Rename(oldHost, newHost); err != nil {
 		return errnoFromError(err)
 	}
-	p.renameNodeGuestPath(p.guestPathForHost(oldHost), p.guestPathForHost(newHost))
+	p.renameNodeGuestPath(joinGuestChild(oldGuestParent, oldRel), joinGuestChild(newGuestParent, newRel))
 	return 0
 }
 
@@ -1710,19 +2549,31 @@ func (p *passthroughFS) StatFS(_ uint64) (uint64, uint64, uint64, uint64, uint64
 }
 
 func (p *passthroughFS) hostPath(nodeID uint64) (string, int32) {
-	p.mu.Lock()
+	host, _, errno := p.hostAndGuestPath(nodeID)
+	return host, errno
+}
+
+func (p *passthroughFS) translateOpenFlags(flags uint32) int {
+	p.mu.RLock()
+	writebackCache := p.writebackCache
+	p.mu.RUnlock()
+	return translateLinuxOpenFlags(flags, writebackCache)
+}
+
+func (p *passthroughFS) hostAndGuestPath(nodeID uint64) (string, string, int32) {
+	p.mu.RLock()
 	guest, ok := p.nodes[nodeID]
-	p.mu.Unlock()
+	p.mu.RUnlock()
 	if !ok {
-		return "", -linuxENOENT
+		return "", "", -linuxENOENT
 	}
 	if p.root == "" {
-		return "", -linuxENOENT
+		return "", "", -linuxENOENT
 	}
 	if guest == "/" {
-		return p.root, 0
+		return p.root, guest, 0
 	}
-	return filepath.Join(p.root, filepath.FromSlash(strings.TrimPrefix(guest, "/"))), 0
+	return filepath.Join(p.root, filepath.FromSlash(strings.TrimPrefix(guest, "/"))), guest, 0
 }
 
 func (p *passthroughFS) guestPathForHost(host string) string {
@@ -1736,14 +2587,21 @@ func (p *passthroughFS) guestPathForHost(host string) string {
 	return "/" + filepath.ToSlash(rel)
 }
 
+func joinGuestChild(parentGuest, rel string) string {
+	if rel == "" {
+		return path.Clean(parentGuest)
+	}
+	return path.Join(parentGuest, filepath.ToSlash(rel))
+}
+
 func (p *passthroughFS) DebugPath(nodeID uint64) string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return p.nodes[nodeID]
 }
 
 func (p *passthroughFS) GetXattr(nodeID uint64, name string) ([]byte, int32) {
-	p.logf("getxattr-backend node=%d path=%q name=%q", nodeID, p.DebugPath(nodeID), name)
+	p.logf("getxattr-backend node=%d name=%q", nodeID, name)
 	return nil, -linuxENODATA
 }
 
@@ -1753,7 +2611,7 @@ func (p *passthroughFS) ListXattr(nodeID uint64) ([]byte, int32) {
 }
 
 func (p *passthroughFS) logNode(op string, nodeID uint64) {
-	p.logf("%s node=%d path=%q", op, nodeID, p.DebugPath(nodeID))
+	p.logf("%s node=%d", op, nodeID)
 }
 
 func (p *passthroughFS) logf(format string, args ...any) {
@@ -1826,14 +2684,20 @@ func (p *passthroughFS) fileAttr(nodeID uint64, info os.FileInfo) FuseAttr {
 	if attr.BlkSize == 0 {
 		attr.BlkSize = 4096
 	}
-	if meta, ok := p.meta[p.DebugPath(nodeID)]; ok {
-		attr.UID = meta.UID
-		attr.GID = meta.GID
-		if meta.RDev != 0 {
-			attr.RDev = meta.RDev
-		}
-		if meta.Mode != 0 {
-			attr.Mode = fsmeta.NormalizeLinuxMode(meta.Mode, info.Mode())
+	if p.meta != nil {
+		p.mu.RLock()
+		guestPath := p.nodes[nodeID]
+		meta, ok := p.meta[guestPath]
+		p.mu.RUnlock()
+		if ok {
+			attr.UID = meta.UID
+			attr.GID = meta.GID
+			if meta.RDev != 0 {
+				attr.RDev = meta.RDev
+			}
+			if meta.Mode != 0 {
+				attr.Mode = fsmeta.NormalizeLinuxMode(meta.Mode, info.Mode())
+			}
 		}
 	}
 	if info.IsDir() {
@@ -1862,7 +2726,7 @@ func (p *imageFS) pathForNode(id uint64) string {
 }
 
 func (p *imageFS) Init() (uint32, uint32) {
-	return 128 << 10, fuseCapPosixACL | fuseCapPosixLocks
+	return 128 << 10, fuseCapPosixLocks
 }
 
 func (p *imageFS) GetAttr(nodeID uint64) (FuseAttr, int32) {
@@ -1944,6 +2808,14 @@ func (p *imageFS) Release(_ uint64, fh uint64) {
 }
 
 func (p *imageFS) Flush(_ uint64, _ uint64, _ uint64) int32 {
+	return 0
+}
+
+func (p *imageFS) Fsync(_ uint64, _ uint64, _ uint32) int32 {
+	return 0
+}
+
+func (p *imageFS) FsyncDir(_ uint64, _ uint64, _ uint32) int32 {
 	return 0
 }
 
@@ -2446,11 +3318,15 @@ func errorAs(err error, target any) bool {
 	return false
 }
 
-func translateLinuxOpenFlags(flags uint32) int {
+func translateLinuxOpenFlags(flags uint32, writebackCache bool) int {
 	openFlags := 0
 	switch flags & 0x3 {
 	case linuxOWRONLY:
-		openFlags |= os.O_WRONLY
+		if writebackCache {
+			openFlags |= os.O_RDWR
+		} else {
+			openFlags |= os.O_WRONLY
+		}
 	case linuxORDWR:
 		openFlags |= os.O_RDWR
 	default:
