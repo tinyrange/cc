@@ -232,6 +232,7 @@ func runManagedExecVMMulti(ctx context.Context, vm *VM, uart *serial.UART8250, f
 	}
 	defer func() {
 		cancel()
+		_ = vm.CancelRun()
 		wg.Wait()
 	}()
 

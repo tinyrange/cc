@@ -56,10 +56,9 @@ type VM struct {
 }
 
 type VCPU struct {
-	id   int
-	fd   int
-	run  []byte
-	once bool
+	id  int
+	fd  int
+	run []byte
 }
 
 type memoryMapping struct {
@@ -275,6 +274,20 @@ func (c *VCPU) Run(exit *Exit) error {
 	case ExitSystemEvent:
 		system := (*kvmSystemEvent)(unsafe.Pointer(&run.anon0[0]))
 		exit.SystemEvent = system.typ
+	}
+	return nil
+}
+
+func (v *VM) CancelRun() error {
+	if v == nil {
+		return nil
+	}
+	for _, vcpu := range v.vcpus {
+		if vcpu == nil || len(vcpu.run) == 0 {
+			continue
+		}
+		run := (*kvmRunData)(unsafe.Pointer(&vcpu.run[0]))
+		run.immediateExit = 1
 	}
 	return nil
 }

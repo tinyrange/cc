@@ -176,7 +176,7 @@ func TestFSConfigReportsMultipleRequestQueues(t *testing.T) {
 	if got := binary.LittleEndian.Uint32(cfg[fsCfgNumQueueOff : fsCfgNumQueueOff+4]); got != fsRequestQueueCount {
 		t.Fatalf("num_request_queues = %d, want %d", got, fsRequestQueueCount)
 	}
-	for qidx := 0; qidx < fsTotalQueueCount(); qidx++ {
+	for qidx := 0; qidx < fsQueueCount; qidx++ {
 		if err := fsdev.Write(0x1000+regQueueSel, 4, uint64(qidx)); err != nil {
 			t.Fatalf("Write(queue-sel %d) error = %v", qidx, err)
 		}
@@ -188,7 +188,7 @@ func TestFSConfigReportsMultipleRequestQueues(t *testing.T) {
 			t.Fatalf("queue %d num max = %d, want 128", qidx, got)
 		}
 	}
-	if err := fsdev.Write(0x1000+regQueueSel, 4, uint64(fsTotalQueueCount())); err != nil {
+	if err := fsdev.Write(0x1000+regQueueSel, 4, uint64(fsQueueCount)); err != nil {
 		t.Fatalf("Write(queue-sel out of range) error = %v", err)
 	}
 	got, err := fsdev.Read(0x1000+regQueueNumMax, 4)
@@ -522,6 +522,7 @@ func TestFUSECachePolicyEncodesTTLAndOpenFlags(t *testing.T) {
 	if openFlags&fuseOpenNoFlush == 0 {
 		t.Fatalf("OPEN flags = %#x, want NO_FLUSH", openFlags)
 	}
+	fsdev.backend.Release(nodeID, binary.LittleEndian.Uint64(openReply[fuseOutHeaderSize:fuseOutHeaderSize+8]))
 }
 
 func TestFUSEStrictCachePolicyDisablesTTLAndKeepCache(t *testing.T) {
@@ -569,6 +570,7 @@ func TestFUSEStrictCachePolicyDisablesTTLAndKeepCache(t *testing.T) {
 	if openFlags&fuseOpenNoFlush == 0 {
 		t.Fatalf("OPEN flags = %#x, want NO_FLUSH", openFlags)
 	}
+	fsdev.backend.Release(nodeID, binary.LittleEndian.Uint64(openReply[fuseOutHeaderSize:fuseOutHeaderSize+8]))
 }
 
 func containsFuseDirent(data []byte, name string) bool {

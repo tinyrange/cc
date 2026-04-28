@@ -24,8 +24,10 @@ const (
 	mmioDeviceIDFS = 26
 
 	fsQueueHiprio       = 0
-	fsQueueRequest      = 1
+	fsControlQueueCount = 1
+	fsQueueRequest      = fsQueueHiprio + fsControlQueueCount
 	fsRequestQueueCount = 4
+	fsQueueCount        = fsControlQueueCount + fsRequestQueueCount
 
 	fsCfgTagSize        = 36
 	fsCfgNumQueueOff    = fsCfgTagSize
@@ -44,10 +46,6 @@ const (
 	fuseDirentBaseSize  = 24
 	fuseWriteOutSize    = 8
 )
-
-func fsTotalQueueCount() int {
-	return fsQueueRequest + fsRequestQueueCount
-}
 
 const (
 	fuseLookup     = 1
@@ -1773,7 +1771,7 @@ func (f *FS) configBytesLocked() []byte {
 }
 
 func (f *FS) resetQueueStateLocked() {
-	queueCount := fsTotalQueueCount()
+	queueCount := fsQueueCount
 	if cap(f.queues) < queueCount {
 		f.queues = make([]queue, queueCount)
 	} else {
