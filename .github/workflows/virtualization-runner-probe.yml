@@ -1,0 +1,237 @@
+name: Virtualization runner probe
+
+"on":
+  pull_request:
+    paths:
+      - ".github/workflows/virtualization-runner-probe.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux amd64 KVM probe
+            os: linux
+            arch: amd64
+            runner: ubuntu-24.04
+          - name: Linux arm64 KVM probe
+            os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+          - name: Windows amd64 WHP probe
+            os: windows
+            arch: amd64
+            runner: windows-2025
+          - name: Windows arm64 WHP probe
+            os: windows
+            arch: arm64
+            runner: windows-11-arm
+          - name: macOS amd64 Hypervisor.framework probe
+            os: macos
+            arch: amd64
+            runner: macos-15-intel
+          - name: macOS arm64 Hypervisor.framework probe
+            os: macos
+            arch: arm64
+            runner: macos-15
+
+    steps:
+      - name: Probe Linux KVM
+        if: matrix.os == 'linux'
+        shell: bash
+        run: |
+          set -u
+
+          echo "Runner label: ${{ matrix.runner }}"
+          uname -a
+          lscpu || true
+          ls -l /dev/kvm || true
+          id
+
+          if [[ -e /dev/kvm ]]; then
+            sudo chmod 0666 /dev/kvm || true
+          fi
+
+          set +e
+          probe_output="$(python3 - <<'PY' 2>&1
+          import fcntl
+          import os
+          import sys
+
+          KVM_GET_API_VERSION = 0xAE00
+          KVM_CREATE_VM = 0xAE01
+
+          fd = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC)
+          try:
+              api_version = fcntl.ioctl(fd, KVM_GET_API_VERSION, 0)
+              print(f"KVM_GET_API_VERSION={api_version}")
+              vm_fd = fcntl.ioctl(fd, KVM_CREATE_VM, 0)
+              print(f"KVM_CREATE_VM fd={vm_fd}")
+              os.close(vm_fd)
+          finally:
+              os.close(fd)
+          PY
+          )"
+          probe_status=$?
+          set -e
+
+          if [[ "${probe_status}" -eq 0 ]]; then
+            verdict="supported"
+          else
+            verdict="not supported"
+            echo "::warning::KVM probe failed on ${{ matrix.runner }}"
+          fi
+
+          {
+            echo "### ${{ matrix.name }}"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Runner | \`${{ matrix.runner }}\` |"
+            echo "| Expected architecture | \`${{ matrix.arch }}\` |"
+            echo "| Actual architecture | \`$(uname -m)\` |"
+            echo "| Virtualization API | KVM |"
+            echo "| Result | ${verdict} |"
+            echo
+            echo "\`\`\`text"
+            printf '%s\n' "${probe_output}"
+            echo "\`\`\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Probe Windows Hypervisor Platform
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host "Runner label: ${{ matrix.runner }}"
+          Get-ComputerInfo -Property OsName,OsArchitecture,CsSystemType,HyperVisorPresent | Format-List
+          systeminfo | Select-String -Pattern "Hyper-V Requirements|Virtualization Enabled|Second Level Address Translation|VM Monitor Mode Extensions|Hypervisor has been detected" -Context 0,4
+
+          $source = @"
+          using System;
+          using System.Runtime.InteropServices;
+
+          public static class WhpProbe
+          {
+              [DllImport("WinHvPlatform.dll")]
+              public static extern int WHvGetCapability(int capabilityCode, byte[] capabilityBuffer, int capabilityBufferSizeInBytes, out int writtenSizeInBytes);
+
+              [DllImport("WinHvPlatform.dll")]
+              public static extern int WHvCreatePartition(out IntPtr partition);
+
+              [DllImport("WinHvPlatform.dll")]
+              public static extern int WHvDeletePartition(IntPtr partition);
+          }
+          "@
+
+          $probeLines = New-Object System.Collections.Generic.List[string]
+          $supported = $false
+
+          try {
+            Add-Type -TypeDefinition $source
+
+            $buffer = New-Object byte[] 16
+            $written = 0
+            $capabilityResult = [WhpProbe]::WHvGetCapability(0, $buffer, $buffer.Length, [ref] $written)
+            $hypervisorPresent = [BitConverter]::ToInt32($buffer, 0)
+            $probeLines.Add("WHvGetCapability(HypervisorPresent) HRESULT=0x{0:X8} written={1} present={2}" -f $capabilityResult, $written, $hypervisorPresent)
+
+            $partition = [IntPtr]::Zero
+            $createResult = [WhpProbe]::WHvCreatePartition([ref] $partition)
+            $probeLines.Add("WHvCreatePartition HRESULT=0x{0:X8} handle={1}" -f $createResult, $partition)
+            if ($partition -ne [IntPtr]::Zero) {
+              $deleteResult = [WhpProbe]::WHvDeletePartition($partition)
+              $probeLines.Add("WHvDeletePartition HRESULT=0x{0:X8}" -f $deleteResult)
+            }
+
+            $supported = ($capabilityResult -eq 0 -and $hypervisorPresent -ne 0 -and $createResult -eq 0)
+          } catch {
+            $probeLines.Add($_.Exception.ToString())
+          }
+
+          if (-not $supported) {
+            Write-Warning "Windows Hypervisor Platform probe failed on ${{ matrix.runner }}"
+          }
+
+          $actualArch = (Get-CimInstance Win32_OperatingSystem).OSArchitecture
+          $verdict = if ($supported) { "supported" } else { "not supported" }
+
+          @(
+            "### ${{ matrix.name }}"
+            ""
+            "| Field | Value |"
+            "| --- | --- |"
+            "| Runner | ``${{ matrix.runner }}`` |"
+            "| Expected architecture | ``${{ matrix.arch }}`` |"
+            "| Actual architecture | ``$actualArch`` |"
+            "| Virtualization API | Windows Hypervisor Platform |"
+            "| Result | $verdict |"
+            ""
+            "````text"
+            ($probeLines -join [Environment]::NewLine)
+            "````"
+          ) -join [Environment]::NewLine | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Probe macOS Hypervisor.framework
+        if: matrix.os == 'macos'
+        shell: bash
+        run: |
+          set -u
+
+          echo "Runner label: ${{ matrix.runner }}"
+          sw_vers
+          uname -a
+          sysctl -n hw.optional.arm64 2>/dev/null || true
+          sysctl -n kern.hv_support 2>/dev/null || true
+
+          cat > /tmp/hv_probe.c <<'EOF'
+          #include <Hypervisor/hv.h>
+          #include <stdio.h>
+
+          int main(void) {
+            hv_return_t create = hv_vm_create(HV_VM_DEFAULT);
+            printf("hv_vm_create=%d\n", create);
+            if (create == HV_SUCCESS) {
+              hv_return_t destroy = hv_vm_destroy();
+              printf("hv_vm_destroy=%d\n", destroy);
+              return destroy == HV_SUCCESS ? 0 : 1;
+            }
+            return 1;
+          }
+          EOF
+
+          set +e
+          probe_output="$(clang /tmp/hv_probe.c -framework Hypervisor -o /tmp/hv_probe && /tmp/hv_probe 2>&1)"
+          probe_status=$?
+          set -e
+
+          if [[ "${probe_status}" -eq 0 ]]; then
+            verdict="supported"
+          else
+            verdict="not supported"
+            echo "::warning::Hypervisor.framework probe failed on ${{ matrix.runner }}"
+          fi
+
+          {
+            echo "### ${{ matrix.name }}"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Runner | \`${{ matrix.runner }}\` |"
+            echo "| Expected architecture | \`${{ matrix.arch }}\` |"
+            echo "| Actual architecture | \`$(uname -m)\` |"
+            echo "| Virtualization API | Hypervisor.framework |"
+            echo "| Result | ${verdict} |"
+            echo
+            echo "\`\`\`text"
+            printf '%s\n' "${probe_output}"
+            echo "\`\`\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
