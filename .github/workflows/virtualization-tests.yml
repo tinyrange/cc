@@ -26,16 +26,19 @@ jobs:
             arch: amd64
             runs_on: '["ubuntu-24.04"]'
             ccvm_path: build/ccvm
+            boot_timeout: "120"
           - name: Linux arm64 KVM smoke
             os: linux
             arch: arm64
             runs_on: '["self-hosted","Linux","ARM64","pi5","kvm"]'
             ccvm_path: build/ccvm
+            boot_timeout: "60"
           - name: Windows amd64 WHP smoke
             os: windows
             arch: amd64
             runs_on: '["windows-2025"]'
             ccvm_path: build/ccvm.exe
+            boot_timeout: "60"
 
     steps:
       - name: Check out repository
@@ -134,7 +137,7 @@ jobs:
         working-directory: pyneurodesk
         env:
           PYNEURODESK_CCVM: ${{ github.workspace }}/${{ matrix.ccvm_path }}
-          PYNEURODESK_BOOT_TIMEOUT: "60"
+          PYNEURODESK_BOOT_TIMEOUT: ${{ matrix.boot_timeout }}
           PYTHONUNBUFFERED: "1"
           FULLTEST_FILTER: ${{ github.event.inputs.fulltest_filter || 'Shell is available' }}
           IMAGE_SOURCE: ${{ github.workspace }}/fixtures/alpine.simg
