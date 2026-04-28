@@ -95,13 +95,14 @@ const (
 )
 
 const (
-	linuxORDONLY = 0
-	linuxOWRONLY = 1
-	linuxORDWR   = 2
-	linuxOCREAT  = 0x40
-	linuxOEXCL   = 0x80
-	linuxOTRUNC  = 0x200
-	linuxOAPPEND = 0x400
+	linuxOACCMODE = 3
+	linuxORDONLY  = 0
+	linuxOWRONLY  = 1
+	linuxORDWR    = 2
+	linuxOCREAT   = 0x40
+	linuxOEXCL    = 0x80
+	linuxOTRUNC   = 0x200
+	linuxOAPPEND  = 0x400
 )
 
 const (
@@ -113,6 +114,12 @@ const (
 	fuseOpenKeepCache = 1 << 1
 	fuseOpenCacheDir  = 1 << 3
 	fuseOpenNoFlush   = 1 << 5
+)
+
+const (
+	fsCacheStrict     = "strict"
+	fsCacheNormal     = "normal"
+	fsCacheAggressive = "aggressive"
 )
 
 const (
@@ -220,6 +227,9 @@ type FS struct {
 	Strict       bool
 	Async        bool
 	RecordTiming func(name string, duration time.Duration)
+	cacheMode    string
+	entryTTL     time.Duration
+	attrTTL      time.Duration
 
 	mu               sync.Mutex
 	workerOnce       sync.Once
@@ -330,12 +340,16 @@ type fsDesc struct {
 }
 
 func NewFS(base, size uint64, irq uint32, tag string, backend FSBackend) *FS {
+	cacheMode, entryTTL, attrTTL := resolveFSCachePolicy()
 	fs := &FS{
 		Base:        base,
 		Size:        size,
 		IRQ:         irq,
 		backend:     backend,
 		Async:       strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_ASYNC")) != "",
+		cacheMode:   cacheMode,
+		entryTTL:    entryTTL,
+		attrTTL:     attrTTL,
 		workCh:      make(chan fsWork, 1024),
 		completions: make(map[fsCompletionKey]fsCompletion),
 	}
@@ -346,6 +360,17 @@ func NewFS(base, size uint64, irq uint32, tag string, backend FSBackend) *FS {
 	copy(fs.tag[:], []byte(tag))
 	fs.resetLocked()
 	return fs
+}
+
+func resolveFSCachePolicy() (string, time.Duration, time.Duration) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_CACHE"))) {
+	case fsCacheStrict:
+		return fsCacheStrict, 0, 0
+	case fsCacheAggressive:
+		return fsCacheAggressive, 60 * time.Second, 60 * time.Second
+	default:
+		return fsCacheNormal, time.Second, time.Second
+	}
 }
 
 func (f *FS) Attach(mem GuestMemory, irq IRQController) {
@@ -976,7 +1001,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 			return reply(errno, nil), nil
 		}
 		extra := make([]byte, fuseAttrOutSize)
-		binary.LittleEndian.PutUint64(extra[0:8], 1)
+		encodeFuseAttrTTL(extra[0:16], f.attrTTL)
 		encodeFuseAttr(extra[16:], attr)
 		return reply(0, extra), nil
 	case fuseSetAttr:
@@ -997,7 +1022,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 				return reply(errno, nil), nil
 			}
 			extra := make([]byte, fuseAttrOutSize)
-			binary.LittleEndian.PutUint64(extra[0:8], 1)
+			encodeFuseAttrTTL(extra[0:16], f.attrTTL)
 			encodeFuseAttr(extra[16:], attr)
 			return reply(0, extra), nil
 		}
@@ -1011,9 +1036,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		}
 		f.logPathf("lookup-child", childID, "")
 		extra := make([]byte, fuseEntryOutSize)
-		binary.LittleEndian.PutUint64(extra[0:8], childID)
-		binary.LittleEndian.PutUint64(extra[16:24], 1)
-		binary.LittleEndian.PutUint64(extra[24:32], 1)
+		f.encodeFuseEntryOut(extra, childID)
 		encodeFuseAttr(extra[40:], attr)
 		return reply(0, extra), nil
 	case fuseMkdir:
@@ -1029,9 +1052,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 				return reply(errno, nil), nil
 			}
 			extra := make([]byte, fuseEntryOutSize)
-			binary.LittleEndian.PutUint64(extra[0:8], childID)
-			binary.LittleEndian.PutUint64(extra[16:24], 1)
-			binary.LittleEndian.PutUint64(extra[24:32], 1)
+			f.encodeFuseEntryOut(extra, childID)
 			encodeFuseAttr(extra[40:], attr)
 			return reply(0, extra), nil
 		}
@@ -1054,7 +1075,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		}
 		extra := make([]byte, fuseOpenOutSize)
 		binary.LittleEndian.PutUint64(extra[0:8], fh)
-		binary.LittleEndian.PutUint32(extra[8:12], fuseOpenNoFlush)
+		binary.LittleEndian.PutUint32(extra[8:12], f.openResponseFlags(flags, false))
 		return reply(0, extra), nil
 	case fuseRead:
 		if len(req) < fuseInHeaderSize+24 {
@@ -1124,6 +1145,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		}
 		extra := make([]byte, fuseOpenOutSize)
 		binary.LittleEndian.PutUint64(extra[0:8], fh)
+		binary.LittleEndian.PutUint32(extra[8:12], f.openResponseFlags(flags, true))
 		return reply(0, extra), nil
 	case fuseReadDir:
 		if len(req) < fuseInHeaderSize+24 {
@@ -1308,7 +1330,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 			return reply(errno, nil), nil
 		}
 		extra := make([]byte, fuseStatxOutSize)
-		binary.LittleEndian.PutUint64(extra[0:8], 1)
+		encodeFuseAttrTTL(extra[0:16], f.attrTTL)
 		encodeFuseStatx(extra[32:], attr)
 		return reply(0, extra), nil
 	case fuseSyncFS:
@@ -1331,12 +1353,10 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 				return reply(errno, nil), nil
 			}
 			extra := make([]byte, fuseEntryOutSize+fuseOpenOutSize)
-			binary.LittleEndian.PutUint64(extra[0:8], childID)
-			binary.LittleEndian.PutUint64(extra[16:24], 1)
-			binary.LittleEndian.PutUint64(extra[24:32], 1)
+			f.encodeFuseEntryOut(extra[:fuseEntryOutSize], childID)
 			encodeFuseAttr(extra[40:], attr)
 			binary.LittleEndian.PutUint64(extra[fuseEntryOutSize:fuseEntryOutSize+8], fh)
-			binary.LittleEndian.PutUint32(extra[fuseEntryOutSize+8:fuseEntryOutSize+12], fuseOpenNoFlush)
+			binary.LittleEndian.PutUint32(extra[fuseEntryOutSize+8:fuseEntryOutSize+12], f.openResponseFlags(flags, false))
 			return reply(0, extra), nil
 		}
 		return reply(-linuxENOSYS, nil), nil
@@ -1455,6 +1475,41 @@ func fuseReply(unique uint64, errno int32, extra []byte) []byte {
 	binary.LittleEndian.PutUint64(out[8:16], unique)
 	copy(out[16:], extra)
 	return out
+}
+
+func (f *FS) encodeFuseEntryOut(dst []byte, nodeID uint64) {
+	binary.LittleEndian.PutUint64(dst[0:8], nodeID)
+	binary.LittleEndian.PutUint64(dst[8:16], 1)
+	encodeFuseTTL(dst[16:24], dst[32:36], f.entryTTL)
+	encodeFuseTTL(dst[24:32], dst[36:40], f.attrTTL)
+}
+
+func encodeFuseAttrTTL(dst []byte, ttl time.Duration) {
+	encodeFuseTTL(dst[0:8], dst[8:12], ttl)
+}
+
+func encodeFuseTTL(secDst []byte, nsecDst []byte, ttl time.Duration) {
+	if ttl < 0 {
+		ttl = 0
+	}
+	sec := ttl / time.Second
+	nsec := ttl % time.Second
+	binary.LittleEndian.PutUint64(secDst, uint64(sec))
+	binary.LittleEndian.PutUint32(nsecDst, uint32(nsec))
+}
+
+func (f *FS) openResponseFlags(openFlags uint32, dir bool) uint32 {
+	flags := uint32(fuseOpenNoFlush)
+	if f.cacheMode == fsCacheStrict {
+		return flags
+	}
+	if dir {
+		return flags | fuseOpenCacheDir
+	}
+	if openFlags&linuxOACCMODE == linuxORDONLY {
+		flags |= fuseOpenKeepCache
+	}
+	return flags
 }
 
 func takeFSReqBuffer(size int) ([]byte, bool) {

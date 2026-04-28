@@ -474,6 +474,103 @@ func TestStrictFUSEIoctlReturnsENOTTY(t *testing.T) {
 	}
 }
 
+func TestFUSECachePolicyEncodesTTLAndOpenFlags(t *testing.T) {
+	t.Setenv("CCX3_VIRTIOFS_CACHE", "aggressive")
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "data.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fsdev := NewFS(0, 0, 0, "root", NewPassthroughFS(root, nil))
+
+	lookupReq := make([]byte, fuseInHeaderSize+len("data.txt")+1)
+	binary.LittleEndian.PutUint32(lookupReq[0:4], uint32(len(lookupReq)))
+	binary.LittleEndian.PutUint32(lookupReq[4:8], fuseLookup)
+	binary.LittleEndian.PutUint64(lookupReq[8:16], 1)
+	binary.LittleEndian.PutUint64(lookupReq[16:24], 1)
+	copy(lookupReq[fuseInHeaderSize:], "data.txt")
+	lookupReply, err := fsdev.dispatchFUSELocked(lookupReq)
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(LOOKUP) error = %v", err)
+	}
+	if got := int32(binary.LittleEndian.Uint32(lookupReply[4:8])); got != 0 {
+		t.Fatalf("LOOKUP errno = %d, want 0", got)
+	}
+	extra := lookupReply[fuseOutHeaderSize:]
+	if got := binary.LittleEndian.Uint64(extra[16:24]); got != 60 {
+		t.Fatalf("LOOKUP entry TTL seconds = %d, want 60", got)
+	}
+	if got := binary.LittleEndian.Uint64(extra[24:32]); got != 60 {
+		t.Fatalf("LOOKUP attr TTL seconds = %d, want 60", got)
+	}
+	nodeID := binary.LittleEndian.Uint64(extra[0:8])
+
+	openReq := make([]byte, fuseInHeaderSize+8)
+	binary.LittleEndian.PutUint32(openReq[0:4], uint32(len(openReq)))
+	binary.LittleEndian.PutUint32(openReq[4:8], fuseOpen)
+	binary.LittleEndian.PutUint64(openReq[8:16], 2)
+	binary.LittleEndian.PutUint64(openReq[16:24], nodeID)
+	binary.LittleEndian.PutUint32(openReq[40:44], linuxORDONLY)
+	openReply, err := fsdev.dispatchFUSELocked(openReq)
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(OPEN) error = %v", err)
+	}
+	openFlags := binary.LittleEndian.Uint32(openReply[fuseOutHeaderSize+8 : fuseOutHeaderSize+12])
+	if openFlags&fuseOpenKeepCache == 0 {
+		t.Fatalf("OPEN flags = %#x, want KEEP_CACHE", openFlags)
+	}
+	if openFlags&fuseOpenNoFlush == 0 {
+		t.Fatalf("OPEN flags = %#x, want NO_FLUSH", openFlags)
+	}
+}
+
+func TestFUSEStrictCachePolicyDisablesTTLAndKeepCache(t *testing.T) {
+	t.Setenv("CCX3_VIRTIOFS_CACHE", "strict")
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "data.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fsdev := NewFS(0, 0, 0, "root", NewPassthroughFS(root, nil))
+
+	lookupReq := make([]byte, fuseInHeaderSize+len("data.txt")+1)
+	binary.LittleEndian.PutUint32(lookupReq[0:4], uint32(len(lookupReq)))
+	binary.LittleEndian.PutUint32(lookupReq[4:8], fuseLookup)
+	binary.LittleEndian.PutUint64(lookupReq[8:16], 1)
+	binary.LittleEndian.PutUint64(lookupReq[16:24], 1)
+	copy(lookupReq[fuseInHeaderSize:], "data.txt")
+	lookupReply, err := fsdev.dispatchFUSELocked(lookupReq)
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(LOOKUP) error = %v", err)
+	}
+	extra := lookupReply[fuseOutHeaderSize:]
+	if got := binary.LittleEndian.Uint64(extra[16:24]); got != 0 {
+		t.Fatalf("LOOKUP entry TTL seconds = %d, want 0", got)
+	}
+	if got := binary.LittleEndian.Uint64(extra[24:32]); got != 0 {
+		t.Fatalf("LOOKUP attr TTL seconds = %d, want 0", got)
+	}
+	nodeID := binary.LittleEndian.Uint64(extra[0:8])
+
+	openReq := make([]byte, fuseInHeaderSize+8)
+	binary.LittleEndian.PutUint32(openReq[0:4], uint32(len(openReq)))
+	binary.LittleEndian.PutUint32(openReq[4:8], fuseOpen)
+	binary.LittleEndian.PutUint64(openReq[8:16], 2)
+	binary.LittleEndian.PutUint64(openReq[16:24], nodeID)
+	binary.LittleEndian.PutUint32(openReq[40:44], linuxORDONLY)
+	openReply, err := fsdev.dispatchFUSELocked(openReq)
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(OPEN) error = %v", err)
+	}
+	openFlags := binary.LittleEndian.Uint32(openReply[fuseOutHeaderSize+8 : fuseOutHeaderSize+12])
+	if openFlags&fuseOpenKeepCache != 0 {
+		t.Fatalf("OPEN flags = %#x, want no KEEP_CACHE", openFlags)
+	}
+	if openFlags&fuseOpenNoFlush == 0 {
+		t.Fatalf("OPEN flags = %#x, want NO_FLUSH", openFlags)
+	}
+}
+
 func containsFuseDirent(data []byte, name string) bool {
 	for off := 0; off+fuseDirentBaseSize <= len(data); {
 		nameLen := int(binary.LittleEndian.Uint32(data[off+16 : off+20]))
