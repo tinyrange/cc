@@ -420,13 +420,13 @@ func (m *mountedFS) Create(parent uint64, name string, flags uint32, mode uint32
 	if !ok {
 		return 0, 0, FuseAttr{}, -linuxEROFS
 	}
-	_, fh, attr, errno := createBackend.Create(backendParent, name, flags, mode)
+	backendNodeID, fh, attr, errno := createBackend.Create(backendParent, name, flags, mode)
 	if errno != 0 {
 		return 0, 0, FuseAttr{}, errno
 	}
 	id := m.ensureNode(childPath)
 	attr.Ino = id
-	return id, m.storeHandle(backend, m.mustResolveNodeID(childPath), fh, false), attr, 0
+	return id, m.storeHandle(backend, backendNodeID, fh, false), attr, 0
 }
 
 func (m *mountedFS) Write(nodeID uint64, fh uint64, off uint64, data []byte, flags uint32) (uint32, int32) {
@@ -850,14 +850,6 @@ func (m *mountedFS) takeHandle(id uint64, dir bool) *mountedHandle {
 	}
 	delete(m.handles, id)
 	return handle
-}
-
-func (m *mountedFS) mustResolveNodeID(guestPath string) uint64 {
-	backend, nodeID, _, errno := m.resolveBackendNode(guestPath)
-	if errno != 0 || backend == nil {
-		return 0
-	}
-	return nodeID
 }
 
 func parentPath(guestPath string) string {
