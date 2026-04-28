@@ -30,6 +30,9 @@ func TestPassthroughFSCreateWriteRenameUnlink(t *testing.T) {
 	if errno := be.Flush(nodeID, fh, 0); errno != 0 {
 		t.Fatalf("Flush() errno = %d", errno)
 	}
+	if errno := be.Fsync(nodeID, fh, 0); errno != 0 {
+		t.Fatalf("Fsync() errno = %d", errno)
+	}
 	be.Release(nodeID, fh)
 
 	data, err := os.ReadFile(filepath.Join(root, "hello.txt"))
@@ -51,6 +54,41 @@ func TestPassthroughFSCreateWriteRenameUnlink(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "renamed.txt")); !os.IsNotExist(err) {
 		t.Fatalf("Stat(after unlink) error = %v, want not exist", err)
+	}
+}
+
+func TestStrictFUSEFsyncUsesBackendHandle(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	backend := NewPassthroughFS(root, nil)
+	be := backend.(*passthroughFS)
+	nodeID, fh, _, errno := be.Create(1, "data.txt", linuxOWRONLY|linuxOCREAT|linuxOTRUNC, 0o644)
+	if errno != 0 {
+		t.Fatalf("Create() errno = %d", errno)
+	}
+	defer be.Release(nodeID, fh)
+
+	fsdev := NewFS(0, 0, 0, "root", backend)
+	fsdev.Strict = true
+
+	const unique = uint64(44)
+	req := make([]byte, fuseInHeaderSize+16)
+	binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
+	binary.LittleEndian.PutUint32(req[4:8], fuseFsync)
+	binary.LittleEndian.PutUint64(req[8:16], unique)
+	binary.LittleEndian.PutUint64(req[16:24], nodeID)
+	binary.LittleEndian.PutUint64(req[40:48], fh)
+
+	reply, err := fsdev.dispatchFUSELocked(req)
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(FSYNC) error = %v", err)
+	}
+	if got := int32(binary.LittleEndian.Uint32(reply[4:8])); got != 0 {
+		t.Fatalf("FSYNC errno = %d, want 0", got)
+	}
+	if got := binary.LittleEndian.Uint64(reply[8:16]); got != unique {
+		t.Fatalf("FSYNC unique = %d, want %d", got, unique)
 	}
 }
 

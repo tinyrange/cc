@@ -545,6 +545,30 @@ func (m *mountedFS) Flush(nodeID uint64, fh uint64, lockOwner uint64) int32 {
 	return flushBackend.Flush(handle.nodeID, handle.fh, lockOwner)
 }
 
+func (m *mountedFS) Fsync(nodeID uint64, fh uint64, flags uint32) int32 {
+	handle := m.handle(fh, false)
+	if handle == nil {
+		return -linuxEBADF
+	}
+	fsyncBackend, ok := handle.backend.(fsFsyncBackend)
+	if !ok {
+		return 0
+	}
+	return fsyncBackend.Fsync(handle.nodeID, handle.fh, flags)
+}
+
+func (m *mountedFS) FsyncDir(nodeID uint64, fh uint64, flags uint32) int32 {
+	handle := m.handle(fh, true)
+	if handle == nil {
+		return -linuxEBADF
+	}
+	fsyncBackend, ok := handle.backend.(fsFsyncDirBackend)
+	if !ok {
+		return 0
+	}
+	return fsyncBackend.FsyncDir(handle.nodeID, handle.fh, flags)
+}
+
 func (m *mountedFS) Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32) (uint64, int32) {
 	handle := m.handle(fh, false)
 	if handle == nil {
@@ -874,4 +898,6 @@ var _ fsSetAttrBackend = (*mountedFS)(nil)
 var _ fsUnlinkBackend = (*mountedFS)(nil)
 var _ fsRenameBackend = (*mountedFS)(nil)
 var _ fsFlushBackend = (*mountedFS)(nil)
+var _ fsFsyncBackend = (*mountedFS)(nil)
+var _ fsFsyncDirBackend = (*mountedFS)(nil)
 var _ fsLseekBackend = (*mountedFS)(nil)

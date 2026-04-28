@@ -58,6 +58,7 @@ const (
 	fuseWrite      = 16
 	fuseStatfs     = 17
 	fuseRelease    = 18
+	fuseFsync      = 20
 	fuseGetXattr   = 22
 	fuseListXattr  = 23
 	fuseFlush      = 25
@@ -65,6 +66,7 @@ const (
 	fuseOpenDir    = 27
 	fuseReadDir    = 28
 	fuseReleaseDir = 29
+	fuseFsyncDir   = 30
 	fuseAccess     = 34
 	fuseCreate     = 35
 	fuseDestroy    = 38
@@ -141,6 +143,14 @@ type fsXattrBackend interface {
 
 type fsFlushBackend interface {
 	Flush(nodeID uint64, fh uint64, lockOwner uint64) int32
+}
+
+type fsFsyncBackend interface {
+	Fsync(nodeID uint64, fh uint64, flags uint32) int32
+}
+
+type fsFsyncDirBackend interface {
+	FsyncDir(nodeID uint64, fh uint64, flags uint32) int32
 }
 
 type fsLseekBackend interface {
@@ -685,6 +695,20 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 		f.logPathf("release", nodeID, fmt.Sprintf(" fh=%d", binary.LittleEndian.Uint64(req[40:48])))
 		f.backend.Release(nodeID, binary.LittleEndian.Uint64(req[40:48]))
 		return reply(0, nil), nil
+	case fuseFsync:
+		if len(req) < fuseInHeaderSize+16 {
+			return nil, fmt.Errorf("virtio-fs FSYNC too short")
+		}
+		fh := binary.LittleEndian.Uint64(req[40:48])
+		flags := binary.LittleEndian.Uint32(req[48:52])
+		f.logPathf("fsync", nodeID, fmt.Sprintf(" fh=%d flags=%#x", fh, flags))
+		if be, ok := f.backend.(fsFsyncBackend); ok {
+			return reply(be.Fsync(nodeID, fh, flags), nil), nil
+		}
+		if f.Strict {
+			return nil, fmt.Errorf("virtio-fs missing fsync backend for FSYNC node=%d fh=%d", nodeID, fh)
+		}
+		return reply(0, nil), nil
 	case fuseOpenDir:
 		if len(req) < fuseInHeaderSize+8 {
 			return nil, fmt.Errorf("virtio-fs OPENDIR too short")
@@ -717,6 +741,20 @@ func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
 		}
 		f.logPathf("releasedir", nodeID, fmt.Sprintf(" fh=%d", binary.LittleEndian.Uint64(req[40:48])))
 		f.backend.ReleaseDir(nodeID, binary.LittleEndian.Uint64(req[40:48]))
+		return reply(0, nil), nil
+	case fuseFsyncDir:
+		if len(req) < fuseInHeaderSize+16 {
+			return nil, fmt.Errorf("virtio-fs FSYNCDIR too short")
+		}
+		fh := binary.LittleEndian.Uint64(req[40:48])
+		flags := binary.LittleEndian.Uint32(req[48:52])
+		f.logPathf("fsyncdir", nodeID, fmt.Sprintf(" fh=%d flags=%#x", fh, flags))
+		if be, ok := f.backend.(fsFsyncDirBackend); ok {
+			return reply(be.FsyncDir(nodeID, fh, flags), nil), nil
+		}
+		if f.Strict {
+			return nil, fmt.Errorf("virtio-fs missing fsyncdir backend for FSYNCDIR node=%d fh=%d", nodeID, fh)
+		}
 		return reply(0, nil), nil
 	case fuseRmDir:
 		name := readCStringName(req[fuseInHeaderSize:])
@@ -938,6 +976,8 @@ func fuseOpcodeName(opcode uint32) string {
 		return "STATFS"
 	case fuseRelease:
 		return "RELEASE"
+	case fuseFsync:
+		return "FSYNC"
 	case fuseGetXattr:
 		return "GETXATTR"
 	case fuseListXattr:
@@ -952,6 +992,8 @@ func fuseOpcodeName(opcode uint32) string {
 		return "READDIR"
 	case fuseReleaseDir:
 		return "RELEASEDIR"
+	case fuseFsyncDir:
+		return "FSYNCDIR"
 	case fuseAccess:
 		return "ACCESS"
 	case fuseCreate:
@@ -1438,8 +1480,28 @@ func (p *passthroughFS) Flush(_ uint64, fh uint64, _ uint64) int32 {
 	if handle == nil || handle.file == nil {
 		return -linuxEBADF
 	}
+	return 0
+}
+
+func (p *passthroughFS) Fsync(_ uint64, fh uint64, _ uint32) int32 {
+	p.mu.Lock()
+	handle := p.handles[fh]
+	p.mu.Unlock()
+	if handle == nil || handle.file == nil {
+		return -linuxEBADF
+	}
 	if err := handle.file.Sync(); err != nil {
 		return errnoFromError(err)
+	}
+	return 0
+}
+
+func (p *passthroughFS) FsyncDir(_ uint64, fh uint64, _ uint32) int32 {
+	p.mu.Lock()
+	_, ok := p.dirHandles[fh]
+	p.mu.Unlock()
+	if !ok {
+		return -linuxEBADF
 	}
 	return 0
 }
@@ -1944,6 +2006,14 @@ func (p *imageFS) Release(_ uint64, fh uint64) {
 }
 
 func (p *imageFS) Flush(_ uint64, _ uint64, _ uint64) int32 {
+	return 0
+}
+
+func (p *imageFS) Fsync(_ uint64, _ uint64, _ uint32) int32 {
+	return 0
+}
+
+func (p *imageFS) FsyncDir(_ uint64, _ uint64, _ uint32) int32 {
 	return 0
 }
 
