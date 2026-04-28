@@ -169,6 +169,185 @@ func TestFSAsyncQueueCompletesLongResponseChain(t *testing.T) {
 	}
 }
 
+func TestFSConfigReportsMultipleRequestQueues(t *testing.T) {
+	fsdev := NewFS(0x1000, 0x1000, 44, "root", NewPassthroughFS(t.TempDir(), nil))
+
+	cfg := fsdev.configBytesLocked()
+	if got := binary.LittleEndian.Uint32(cfg[fsCfgNumQueueOff : fsCfgNumQueueOff+4]); got != fsRequestQueueCount {
+		t.Fatalf("num_request_queues = %d, want %d", got, fsRequestQueueCount)
+	}
+	for qidx := 0; qidx < fsTotalQueueCount(); qidx++ {
+		if err := fsdev.Write(0x1000+regQueueSel, 4, uint64(qidx)); err != nil {
+			t.Fatalf("Write(queue-sel %d) error = %v", qidx, err)
+		}
+		got, err := fsdev.Read(0x1000+regQueueNumMax, 4)
+		if err != nil {
+			t.Fatalf("Read(queue-num-max %d) error = %v", qidx, err)
+		}
+		if got != 128 {
+			t.Fatalf("queue %d num max = %d, want 128", qidx, got)
+		}
+	}
+	if err := fsdev.Write(0x1000+regQueueSel, 4, uint64(fsTotalQueueCount())); err != nil {
+		t.Fatalf("Write(queue-sel out of range) error = %v", err)
+	}
+	got, err := fsdev.Read(0x1000+regQueueNumMax, 4)
+	if err != nil {
+		t.Fatalf("Read(queue-num-max out of range) error = %v", err)
+	}
+	if got != 0 {
+		t.Fatalf("out of range queue num max = %d, want 0", got)
+	}
+}
+
+func TestFSSyncSecondaryRequestQueueCompletes(t *testing.T) {
+	mem := &testGuestMemory{data: make([]byte, 0x8000)}
+	irq := &testIRQController{}
+
+	fsdev := NewFS(0x1000, 0x1000, 44, "root", NewPassthroughFS(t.TempDir(), nil))
+	fsdev.Strict = true
+	fsdev.Attach(mem, irq)
+
+	const (
+		qidx      = fsQueueRequest + 1
+		descAddr  = 0x2000
+		availAddr = 0x3000
+		usedAddr  = 0x3100
+		reqAddr   = 0x3200
+		respAddr  = 0x3300
+		queueSize = 8
+	)
+	req := make([]byte, fuseInHeaderSize+16)
+	binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
+	binary.LittleEndian.PutUint32(req[4:8], fuseInit)
+	binary.LittleEndian.PutUint64(req[8:16], 202)
+	binary.LittleEndian.PutUint32(req[40:44], 7)
+	binary.LittleEndian.PutUint32(req[44:48], 31)
+	copy(mem.data[reqAddr:], req)
+
+	binary.LittleEndian.PutUint64(mem.data[descAddr:descAddr+8], reqAddr)
+	binary.LittleEndian.PutUint32(mem.data[descAddr+8:descAddr+12], uint32(len(req)))
+	binary.LittleEndian.PutUint16(mem.data[descAddr+12:descAddr+14], descFNext)
+	binary.LittleEndian.PutUint16(mem.data[descAddr+14:descAddr+16], 1)
+	binary.LittleEndian.PutUint64(mem.data[descAddr+16:descAddr+24], respAddr)
+	binary.LittleEndian.PutUint32(mem.data[descAddr+24:descAddr+28], fuseOutHeaderSize+fuseInitOutSize)
+	binary.LittleEndian.PutUint16(mem.data[descAddr+28:descAddr+30], descFWrite)
+
+	binary.LittleEndian.PutUint16(mem.data[availAddr+2:availAddr+4], 1)
+	binary.LittleEndian.PutUint16(mem.data[availAddr+4:availAddr+6], 0)
+
+	for _, write := range []struct {
+		reg   uint64
+		value uint64
+	}{
+		{regQueueSel, qidx},
+		{regQueueNum, queueSize},
+		{regQueueDescLow, descAddr},
+		{regQueueAvailLow, availAddr},
+		{regQueueUsedLow, usedAddr},
+		{regQueueReady, 1},
+		{regQueueNotify, qidx},
+	} {
+		if err := fsdev.Write(0x1000+write.reg, 4, write.value); err != nil {
+			t.Fatalf("Write(reg=%#x) error = %v", write.reg, err)
+		}
+	}
+
+	if usedIdx := binary.LittleEndian.Uint16(mem.data[usedAddr+2 : usedAddr+4]); usedIdx != 1 {
+		t.Fatalf("used idx = %d, want 1", usedIdx)
+	}
+	if irq.calls == 0 || !irq.level || irq.irq != 44 {
+		t.Fatalf("irq state = irq=%d level=%v calls=%d, want irq=44 asserted", irq.irq, irq.level, irq.calls)
+	}
+	if got := binary.LittleEndian.Uint64(mem.data[respAddr+8 : respAddr+16]); got != 202 {
+		t.Fatalf("reply unique = %d, want 202", got)
+	}
+}
+
+func TestFSSyncQueueHonorsUsedEventIdx(t *testing.T) {
+	mem := &testGuestMemory{data: make([]byte, 0x8000)}
+	irq := &testIRQController{}
+
+	fsdev := NewFS(0x1000, 0x1000, 44, "root", NewPassthroughFS(t.TempDir(), nil))
+	fsdev.Strict = true
+	fsdev.driverFeatures = featureRingEventIdx
+	fsdev.Attach(mem, irq)
+
+	const (
+		descAddr  = 0x2000
+		availAddr = 0x3000
+		usedAddr  = 0x3100
+		reqAddr   = 0x3200
+		respAddr  = 0x3300
+		queueSize = 8
+	)
+	req := make([]byte, fuseInHeaderSize+16)
+	binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
+	binary.LittleEndian.PutUint32(req[4:8], fuseInit)
+	binary.LittleEndian.PutUint64(req[8:16], 101)
+	binary.LittleEndian.PutUint32(req[40:44], 7)
+	binary.LittleEndian.PutUint32(req[44:48], 31)
+	copy(mem.data[reqAddr:], req)
+
+	binary.LittleEndian.PutUint64(mem.data[descAddr:descAddr+8], reqAddr)
+	binary.LittleEndian.PutUint32(mem.data[descAddr+8:descAddr+12], uint32(len(req)))
+	binary.LittleEndian.PutUint16(mem.data[descAddr+12:descAddr+14], descFNext)
+	binary.LittleEndian.PutUint16(mem.data[descAddr+14:descAddr+16], 1)
+	binary.LittleEndian.PutUint64(mem.data[descAddr+16:descAddr+24], respAddr)
+	binary.LittleEndian.PutUint32(mem.data[descAddr+24:descAddr+28], fuseOutHeaderSize+fuseInitOutSize)
+	binary.LittleEndian.PutUint16(mem.data[descAddr+28:descAddr+30], descFWrite)
+
+	binary.LittleEndian.PutUint16(mem.data[availAddr+2:availAddr+4], 1)
+	binary.LittleEndian.PutUint16(mem.data[availAddr+4:availAddr+6], 0)
+	binary.LittleEndian.PutUint16(mem.data[availAddr+4+queueSize*2:availAddr+6+queueSize*2], 1)
+
+	for _, write := range []struct {
+		reg   uint64
+		value uint64
+	}{
+		{regQueueSel, fsQueueRequest},
+		{regQueueNum, queueSize},
+		{regQueueDescLow, descAddr},
+		{regQueueAvailLow, availAddr},
+		{regQueueUsedLow, usedAddr},
+		{regQueueReady, 1},
+		{regQueueNotify, fsQueueRequest},
+	} {
+		if err := fsdev.Write(0x1000+write.reg, 4, write.value); err != nil {
+			t.Fatalf("Write(reg=%#x) error = %v", write.reg, err)
+		}
+	}
+
+	if usedIdx := binary.LittleEndian.Uint16(mem.data[usedAddr+2 : usedAddr+4]); usedIdx != 1 {
+		t.Fatalf("used idx = %d, want 1", usedIdx)
+	}
+	if irq.calls != 0 {
+		t.Fatalf("irq calls = %d, want 0", irq.calls)
+	}
+}
+
+func TestVringNeedEvent(t *testing.T) {
+	tests := []struct {
+		name  string
+		event uint16
+		new   uint16
+		old   uint16
+		want  bool
+	}{
+		{name: "next completion requested", event: 0, new: 1, old: 0, want: true},
+		{name: "future completion suppresses", event: 1, new: 1, old: 0, want: false},
+		{name: "wrap requested", event: 0xffff, new: 0, old: 0xffff, want: true},
+		{name: "wrap future suppresses", event: 0, new: 0, old: 0xffff, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := vringNeedEvent(tt.event, tt.new, tt.old); got != tt.want {
+				t.Fatalf("vringNeedEvent(%d, %d, %d) = %v, want %v", tt.event, tt.new, tt.old, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestPassthroughFSSetAttrTruncate(t *testing.T) {
 	t.Parallel()
 

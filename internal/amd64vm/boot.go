@@ -19,6 +19,7 @@ const (
 
 type BootConfig struct {
 	MemoryMB     uint64
+	NumCPUs      int
 	Dmesg        bool
 	ExtraCmdline []string
 }
@@ -73,6 +74,7 @@ func PrepareBoot(memory []byte, kernel []byte, initrd []byte, cfg BootConfig) (*
 	return bootamd64.PrepareBoot(memory, kernel, bootamd64.BootOptions{
 		MemoryBase: MemoryBase,
 		MemorySize: memorySize,
+		NumCPUs:    cfg.NumCPUs,
 		Initrd:     initrd,
 		Cmdline:    BootCommandLine(cfg.Dmesg, cfg.ExtraCmdline...),
 		E820:       E820Map(memorySize),

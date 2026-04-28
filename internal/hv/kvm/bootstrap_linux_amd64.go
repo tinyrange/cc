@@ -137,11 +137,16 @@ func (b *Bootstrap) InitVM(vmfd int) error {
 }
 
 func (b *Bootstrap) InitVCPU(vmfd, vcpufd int) error {
+	return b.InitVCPUWithTopology(vmfd, vcpufd, 0, 1)
+}
+
+func (b *Bootstrap) InitVCPUWithTopology(vmfd, vcpufd, id, cpus int) error {
 	_ = vmfd
 	cpuid, err := getSupportedCPUID(b.fd)
 	if err != nil {
 		return err
 	}
+	setCPUIDTopology(cpuid, id, cpus)
 	return setVCPUID(vcpufd, cpuid)
 }
 

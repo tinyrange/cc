@@ -41,9 +41,6 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if b == nil || b.kernel == nil || b.images == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
 	}
-	if req.CPUs > 1 {
-		return nil, fmt.Errorf("linux amd64 runtime currently supports only 1 CPU")
-	}
 	kernel, err := b.kernel.ReadKernel()
 	if err != nil {
 		return nil, err
@@ -83,7 +80,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
 	}
-	session, err := kvm.StartManagedSession(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, onEvent)
+	session, err := kvm.StartManagedSession(ctx, kernel, initrd, req.MemoryMB, req.CPUs, req.Dmesg, fsdevs, onEvent)
 	if err != nil {
 		return nil, err
 	}
@@ -105,9 +102,6 @@ func (b *runtimeBackend) StartBlank(ctx context.Context, req client.StartInstanc
 func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
 	if b == nil || b.kernel == nil || b.images == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
-	}
-	if req.CPUs > 1 {
-		return nil, fmt.Errorf("linux amd64 runtime currently supports only 1 CPU")
 	}
 	kernel, err := b.kernel.ReadKernel()
 	if err != nil {
@@ -136,7 +130,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
 	}
-	session, err := kvm.StartManagedSession(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, onEvent)
+	session, err := kvm.StartManagedSession(ctx, kernel, initrd, req.MemoryMB, req.CPUs, req.Dmesg, fsdevs, onEvent)
 	if err != nil {
 		return nil, err
 	}
@@ -153,9 +147,6 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
 	if b == nil || b.kernel == nil {
 		return client.ExecResponse{}, fmt.Errorf("runtime backend is not configured")
-	}
-	if req.CPUs > 1 {
-		return client.ExecResponse{}, fmt.Errorf("linux amd64 runtime currently supports only 1 CPU")
 	}
 	kernel, err := b.kernel.ReadKernel()
 	if err != nil {
@@ -243,7 +234,7 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 			Cols:    req.Cols,
 			Rows:    req.Rows,
 		}
-		resp, serial, err := kvm.RunManagedExecWithFS(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, execReq)
+		resp, serial, err := kvm.RunManagedExecWithFS(ctx, kernel, initrd, req.MemoryMB, req.CPUs, req.Dmesg, fsdevs, execReq)
 		if err != nil && resp.Output == "" {
 			resp.Output = serial
 		}

@@ -34,7 +34,7 @@ type ManagedSession struct {
 	dmesg      bool
 }
 
-func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, cpus int, dmesg bool, fsdevs []*virtio.FS, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
 	backend := virtio.NewSimpleVsockBackend()
 	listener, err := backend.Listen(vmruntime.ControlPort)
 	if err != nil {
@@ -56,7 +56,7 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 		_, _ = io.Copy(controlTranscript, conn)
 	}()
 
-	vm, err := NewVM()
+	vm, err := NewVMWithCPUs(cpus)
 	if err != nil {
 		_ = listener.Close()
 		vsock.Close()
@@ -91,6 +91,7 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(rng.Base, rng.IRQ))
 	plan, err := amd64vm.PrepareBoot(mem, kernel, initrd, amd64vm.BootConfig{
 		MemoryMB:     memoryMB,
+		NumCPUs:      cpus,
 		Dmesg:        dmesg,
 		ExtraCmdline: extraCmdline,
 	})

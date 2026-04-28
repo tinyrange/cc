@@ -14,6 +14,7 @@ many small files, metadata-heavy loops, sequential large-file I/O, and random
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import platform
@@ -38,6 +39,7 @@ BENCHMARK_PROGRAM = r'''
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import platform
@@ -63,6 +65,19 @@ def timed(name: str, fn):
     if extra:
         result.update(extra)
     return result
+
+
+def partition(items, parts: int):
+    parts = max(1, parts)
+    return [items[index::parts] for index in range(parts)]
+
+
+def run_parallel(items, workers: int, fn):
+    chunks = [chunk for chunk in partition(items, workers) if chunk]
+    if len(chunks) <= 1:
+        return [fn(chunks[0] if chunks else [])]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(chunks)) as executor:
+        return list(executor.map(fn, chunks))
 
 
 def write_all(path: Path, data: bytes) -> None:
@@ -95,6 +110,7 @@ def main() -> None:
     parser.add_argument("--block-kb", type=int, required=True)
     parser.add_argument("--random-ops", type=int, required=True)
     parser.add_argument("--random-block-kb", type=int, required=True)
+    parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--fsync", action="store_true")
     parser.add_argument(
         "--only",
@@ -123,6 +139,7 @@ def main() -> None:
     small_dir.mkdir()
     small_payload = b"x" * args.small_size
     small_paths = [small_dir / f"file-{index:06d}.bin" for index in range(args.small_files)]
+    threads = max(1, args.threads)
 
     results = []
     only = set(args.only or [])
@@ -131,34 +148,52 @@ def main() -> None:
         return not only or name in only
 
     if wants("small_create"):
-        results.append(timed("small_create", lambda: (
-        [write_all(path, small_payload) for path in small_paths],
-        {"files": args.small_files, "bytes": args.small_files * args.small_size},
-    )[1]))
+        def small_create() -> dict[str, int]:
+            def worker(paths):
+                for path in paths:
+                    write_all(path, small_payload)
+            run_parallel(small_paths, threads, worker)
+            return {"files": args.small_files, "bytes": args.small_files * args.small_size, "threads": threads}
+
+        results.append(timed("small_create", small_create))
 
     if args.fsync and small_paths and wants("small_fsync_each"):
-        results.append(timed("small_fsync_each", lambda: (
-            [fsync_file(path) for path in small_paths],
-            {"files": args.small_files},
-        )[1]))
+        def small_fsync_each() -> dict[str, int]:
+            def worker(paths):
+                for path in paths:
+                    fsync_file(path)
+            run_parallel(small_paths, threads, worker)
+            return {"files": args.small_files, "threads": threads}
+
+        results.append(timed("small_fsync_each", small_fsync_each))
 
     if wants("small_stat"):
-        results.append(timed("small_stat", lambda: {
-        "files": args.small_files,
-        "bytes": sum(path.stat().st_size for path in small_paths),
-    }))
+        def small_stat() -> dict[str, int]:
+            def worker(paths):
+                return sum(path.stat().st_size for path in paths)
+            total = sum(run_parallel(small_paths, threads, worker))
+            return {"files": args.small_files, "bytes": total, "threads": threads}
+
+        results.append(timed("small_stat", small_stat))
 
     if wants("small_read"):
-        results.append(timed("small_read", lambda: {
-        "files": args.small_files,
-        "bytes": sum(len(path.read_bytes()) for path in small_paths),
-    }))
+        def small_read() -> dict[str, int]:
+            def worker(paths):
+                return sum(len(path.read_bytes()) for path in paths)
+            total = sum(run_parallel(small_paths, threads, worker))
+            return {"files": args.small_files, "bytes": total, "threads": threads}
+
+        results.append(timed("small_read", small_read))
 
     if wants("small_delete"):
-        results.append(timed("small_delete", lambda: (
-        [path.unlink() for path in small_paths],
-        {"files": args.small_files},
-    )[1]))
+        def small_delete() -> dict[str, int]:
+            def worker(paths):
+                for path in paths:
+                    path.unlink()
+            run_parallel(small_paths, threads, worker)
+            return {"files": args.small_files, "threads": threads}
+
+        results.append(timed("small_delete", small_delete))
 
     large_path = root / "large.bin"
     large_bytes = args.large_mb * 1024 * 1024
@@ -192,21 +227,26 @@ def main() -> None:
     ]
 
     def random_reads() -> dict[str, int]:
-        total = 0
-        with large_path.open("rb", buffering=0) as handle:
-            fd = handle.fileno()
-            for offset in offsets:
-                total += len(os.pread(fd, len(random_block), offset))
-        return {"ops": args.random_ops, "bytes": total}
+        def worker(chunk):
+            total = 0
+            with large_path.open("rb", buffering=0) as handle:
+                fd = handle.fileno()
+                for offset in chunk:
+                    total += len(os.pread(fd, len(random_block), offset))
+            return total
+        total = sum(run_parallel(offsets, threads, worker))
+        return {"ops": args.random_ops, "bytes": total, "threads": threads}
 
     def random_writes() -> dict[str, int]:
-        with large_path.open("r+b", buffering=0) as handle:
-            fd = handle.fileno()
-            for offset in offsets:
-                os.pwrite(fd, random_block, offset)
-            if args.fsync:
-                os.fsync(fd)
-        return {"ops": args.random_ops, "bytes": args.random_ops * len(random_block)}
+        def worker(chunk):
+            with large_path.open("r+b", buffering=0) as handle:
+                fd = handle.fileno()
+                for offset in chunk:
+                    os.pwrite(fd, random_block, offset)
+                if args.fsync:
+                    os.fsync(fd)
+        run_parallel(offsets, threads, worker)
+        return {"ops": args.random_ops, "bytes": args.random_ops * len(random_block), "threads": threads}
 
     if wants("large_random_read"):
         results.append(timed("large_random_read", random_reads))
@@ -234,6 +274,7 @@ def main() -> None:
             "block_kb": args.block_kb,
             "random_ops": args.random_ops,
             "random_block_kb": args.random_block_kb,
+            "threads": threads,
             "fsync": args.fsync,
             "only": sorted(only),
         },
@@ -269,6 +310,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--block-kb", type=int, default=1024)
     parser.add_argument("--random-ops", type=int, default=8192)
     parser.add_argument("--random-block-kb", type=int, default=4)
+    parser.add_argument("--threads", type=int, default=1, help="Filesystem worker threads inside each benchmark process")
     parser.add_argument("--fsync", action="store_true", help="Call fsync during write tests")
     parser.add_argument(
         "--only",
@@ -327,6 +369,7 @@ def benchmark_args(label: str, work_dir: str, args: argparse.Namespace) -> list[
         "--block-kb", str(args.block_kb),
         "--random-ops", str(args.random_ops),
         "--random-block-kb", str(args.random_block_kb),
+        "--threads", str(args.threads),
     ]
     if args.fsync:
         command.append("--fsync")
@@ -374,10 +417,10 @@ def diff_virtiofs_stats(before: Any, after: Any) -> Any:
             "fuse_requests": int(after_item.get("fuse_requests", 0)) - int(before_item.get("fuse_requests", 0)),
             "interrupt_raises": int(after_item.get("interrupt_raises", 0)) - int(before_item.get("interrupt_raises", 0)),
             "irq_transitions": int(after_item.get("irq_transitions", 0)) - int(before_item.get("irq_transitions", 0)),
-            "queue_notifies": [
-                int(after_item.get("queue_notifies", [0, 0])[0]) - int(before_item.get("queue_notifies", [0, 0])[0]),
-                int(after_item.get("queue_notifies", [0, 0])[1]) - int(before_item.get("queue_notifies", [0, 0])[1]),
-            ],
+            "queue_notifies": diff_numeric_list(
+                before_item.get("queue_notifies", []),
+                after_item.get("queue_notifies", []),
+            ),
             "fuse_ops": [],
         }
         before_ops = {
@@ -404,6 +447,18 @@ def diff_virtiofs_stats(before: Any, after: Any) -> Any:
         delta["fuse_ops"].sort(key=lambda op: op["count"], reverse=True)
         out.append(delta)
     return out
+
+
+def diff_numeric_list(before: Any, after: Any) -> list[int]:
+    if not isinstance(before, list):
+        before = []
+    if not isinstance(after, list):
+        after = []
+    count = max(len(before), len(after))
+    return [
+        int(after[index] if index < len(after) else 0) - int(before[index] if index < len(before) else 0)
+        for index in range(count)
+    ]
 
 
 def run_host(args: argparse.Namespace) -> dict[str, Any]:

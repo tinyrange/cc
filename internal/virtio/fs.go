@@ -22,25 +22,31 @@ import (
 const (
 	mmioDeviceIDFS = 26
 
-	fsQueueHiprio  = 0
-	fsQueueRequest = 1
+	fsQueueHiprio       = 0
+	fsQueueRequest      = 1
+	fsRequestQueueCount = 4
 
-	fsCfgTagSize       = 36
-	fsCfgNumQueueOff   = fsCfgTagSize
-	fsCfgTotalSize     = fsCfgTagSize + 4
-	fsInterruptVring   = 0x1
-	fuseInHeaderSize   = 40
-	fuseOutHeaderSize  = 16
-	fuseAttrSize       = 88
-	fuseEntryOutSize   = 40 + fuseAttrSize
-	fuseAttrOutSize    = 16 + fuseAttrSize
-	fuseOpenOutSize    = 16
-	fuseInitOutSize    = 40
-	fuseStatfsOutSize  = 80
-	fuseStatxOutSize   = 288
-	fuseDirentBaseSize = 24
-	fuseWriteOutSize   = 8
+	fsCfgTagSize        = 36
+	fsCfgNumQueueOff    = fsCfgTagSize
+	fsCfgTotalSize      = fsCfgTagSize + 4
+	fsInterruptVring    = 0x1
+	featureRingEventIdx = uint64(1) << 29
+	fuseInHeaderSize    = 40
+	fuseOutHeaderSize   = 16
+	fuseAttrSize        = 88
+	fuseEntryOutSize    = 40 + fuseAttrSize
+	fuseAttrOutSize     = 16 + fuseAttrSize
+	fuseOpenOutSize     = 16
+	fuseInitOutSize     = 40
+	fuseStatfsOutSize   = 80
+	fuseStatxOutSize    = 288
+	fuseDirentBaseSize  = 24
+	fuseWriteOutSize    = 8
 )
+
+func fsTotalQueueCount() int {
+	return fsQueueRequest + fsRequestQueueCount
+}
 
 const (
 	fuseLookup     = 1
@@ -229,16 +235,16 @@ type FS struct {
 	interruptStatus  uint32
 	irqHigh          bool
 	configGeneration uint32
-	queues           [2]queue
+	queues           []queue
 	mmioReads        uint64
 	mmioWrites       uint64
-	queueNotifies    [2]uint64
+	queueNotifies    []uint64
 	fuseRequests     uint64
 	interruptRaises  uint64
 	irqTransitions   uint64
 	workCh           chan fsWork
-	nextWorkSeq      [2]uint64
-	nextCompleteSeq  [2]uint64
+	nextWorkSeq      []uint64
+	nextCompleteSeq  []uint64
 	completions      map[fsCompletionKey]fsCompletion
 	fuseOpStats      [fuseStatsSlots]fuseOpStat
 }
@@ -283,14 +289,14 @@ type FSStats struct {
 	Tag             string        `json:"tag"`
 	MMIOReads       uint64        `json:"mmio_reads"`
 	MMIOWrites      uint64        `json:"mmio_writes"`
-	QueueNotifies   [2]uint64     `json:"queue_notifies"`
+	QueueNotifies   []uint64      `json:"queue_notifies"`
 	FUSERequests    uint64        `json:"fuse_requests"`
 	InterruptRaises uint64        `json:"interrupt_raises"`
 	IRQTransitions  uint64        `json:"irq_transitions"`
 	IRQHigh         bool          `json:"irq_high"`
 	InterruptStatus uint32        `json:"interrupt_status"`
-	QueueReady      [2]bool       `json:"queue_ready"`
-	QueueLastAvail  [2]uint16     `json:"queue_last_avail"`
+	QueueReady      []bool        `json:"queue_ready"`
+	QueueLastAvail  []uint16      `json:"queue_last_avail"`
 	FUSEOps         []FUSEOpStats `json:"fuse_ops"`
 }
 
@@ -327,6 +333,7 @@ func NewFS(base, size uint64, irq uint32, tag string, backend FSBackend) *FS {
 		workCh:      make(chan fsWork, 1024),
 		completions: make(map[fsCompletionKey]fsCompletion),
 	}
+	fs.resetQueueStateLocked()
 	if fs.backend == nil {
 		fs.backend = NewPassthroughFS("", nil)
 	}
@@ -375,7 +382,7 @@ func (f *FS) Read(addr uint64, size int) (uint64, error) {
 		return truncateValue(mmioVendorID, size), nil
 	case regDeviceFeatures:
 		if f.deviceFeatureSel == 0 {
-			return truncateValue(0, size), nil
+			return truncateValue(featureRingEventIdx, size), nil
 		}
 		if f.deviceFeatureSel == 1 {
 			return truncateValue(1, size), nil
@@ -444,6 +451,11 @@ func (f *FS) Write(addr uint64, size int, value uint64) error {
 			if value == 0 {
 				q.lastAvailIdx = 0
 				q.usedIdx = 0
+			} else if f.driverFeatures&featureRingEventIdx != 0 {
+				if err := f.writeAvailEventLocked(q); err != nil {
+					f.mu.Unlock()
+					return err
+				}
 			}
 		}
 	case regQueueDescLow:
@@ -483,7 +495,7 @@ func (f *FS) Write(addr uint64, size int, value uint64) error {
 		}
 	case regQueueNotify:
 		if int(value) < len(f.queues) {
-			f.queueNotifies[value]++
+			f.queueNotifies[int(value)]++
 			if f.Async {
 				works, err := f.processQueueAsyncLocked(int(value))
 				if err != nil {
@@ -515,6 +527,7 @@ func (f *FS) processQueueLocked(qidx int) error {
 	}
 	availFlags := binary.LittleEndian.Uint16(header[0:2])
 	availIdx := binary.LittleEndian.Uint16(header[2:4])
+	oldUsedIdx := q.usedIdx
 	interruptNeeded := false
 	for q.lastAvailIdx != availIdx {
 		slot := q.lastAvailIdx % q.size
@@ -537,7 +550,12 @@ func (f *FS) processQueueLocked(qidx int) error {
 		}
 		q.lastAvailIdx++
 	}
-	if interruptNeeded && (qidx == fsQueueRequest || qidx == fsQueueHiprio) && (availFlags&1) == 0 {
+	if f.driverFeatures&featureRingEventIdx != 0 {
+		if err := f.writeAvailEventLocked(q); err != nil {
+			return err
+		}
+	}
+	if interruptNeeded && f.isCompletingQueue(qidx) && f.shouldInterruptLocked(q, oldUsedIdx, q.usedIdx, availFlags) {
 		f.interruptStatus |= fsInterruptVring
 		f.interruptRaises++
 		f.logf("interrupt-raise status=%#x", f.interruptStatus)
@@ -573,6 +591,11 @@ func (f *FS) processQueueAsyncLocked(qidx int) ([]fsWork, error) {
 		}
 		works = append(works, work)
 		q.lastAvailIdx++
+	}
+	if f.driverFeatures&featureRingEventIdx != 0 {
+		if err := f.writeAvailEventLocked(q); err != nil {
+			return nil, err
+		}
 	}
 	return works, nil
 }
@@ -790,7 +813,10 @@ func (f *FS) writeCompletionLocked(q *queue, work fsWork, reply []byte) error {
 		return err
 	}
 	f.logf("used-ring q=%d head=%d len=%d", work.qidx, work.head, len(reply))
-	if !work.suppressInterrupt && (work.qidx == fsQueueRequest || work.qidx == fsQueueHiprio) {
+	if (f.driverFeatures&featureRingEventIdx != 0 || !work.suppressInterrupt) && f.isCompletingQueue(work.qidx) {
+		if f.driverFeatures&featureRingEventIdx != 0 && !f.shouldInterruptLocked(q, q.usedIdx-1, q.usedIdx, 0) {
+			return nil
+		}
 		f.interruptStatus |= fsInterruptVring
 		f.interruptRaises++
 		f.logf("interrupt-raise status=%#x", f.interruptStatus)
@@ -1429,6 +1455,35 @@ func (f *FS) writeUsedLocked(q *queue, head uint16, usedLen uint32) error {
 	return f.mem.WriteIPA(q.usedAddr+2, idx[:])
 }
 
+func (f *FS) shouldInterruptLocked(q *queue, oldUsedIdx, newUsedIdx, availFlags uint16) bool {
+	if oldUsedIdx == newUsedIdx {
+		return false
+	}
+	if f.driverFeatures&featureRingEventIdx == 0 {
+		return availFlags&1 == 0
+	}
+	var buf [2]byte
+	if err := f.readIPAInto(q.availAddr+4+uint64(q.size)*2, buf[:]); err != nil {
+		f.logf("used-event-read-error: %v", err)
+		return true
+	}
+	usedEvent := binary.LittleEndian.Uint16(buf[:])
+	return vringNeedEvent(usedEvent, newUsedIdx, oldUsedIdx)
+}
+
+func (f *FS) writeAvailEventLocked(q *queue) error {
+	if q.size == 0 || q.usedAddr == 0 {
+		return nil
+	}
+	var buf [2]byte
+	binary.LittleEndian.PutUint16(buf[:], q.lastAvailIdx)
+	return f.mem.WriteIPA(q.usedAddr+4+uint64(q.size)*8, buf[:])
+}
+
+func vringNeedEvent(eventIdx, newIdx, oldIdx uint16) bool {
+	return uint16(newIdx-eventIdx-1) < uint16(newIdx-oldIdx)
+}
+
 func (f *FS) updateIRQLocked() error {
 	if f.irq == nil {
 		return nil
@@ -1452,23 +1507,23 @@ func (f *FS) Summary() string {
 	f.statsMu.Lock()
 	defer f.statsMu.Unlock()
 	tag := strings.TrimRight(string(f.tag[:]), "\x00")
+	queueNotifies := append([]uint64(nil), f.queueNotifies...)
+	queueReady := f.queueReadySnapshotLocked()
+	queueLastAvail := f.queueLastAvailSnapshotLocked()
 	return fmt.Sprintf(
-		"virtio-fs tag=%q mmio_reads=%d mmio_writes=%d status=%#x q0_notify=%d q1_notify=%d fuse_requests=%d interrupt_raises=%d irq_transitions=%d irq_high=%t interrupt_status=%#x q0_ready=%t q1_ready=%t q0_last=%d q1_last=%d",
+		"virtio-fs tag=%q mmio_reads=%d mmio_writes=%d status=%#x queue_notifies=%v fuse_requests=%d interrupt_raises=%d irq_transitions=%d irq_high=%t interrupt_status=%#x queue_ready=%v queue_last=%v",
 		tag,
 		f.mmioReads,
 		f.mmioWrites,
 		f.status,
-		f.queueNotifies[0],
-		f.queueNotifies[1],
+		queueNotifies,
 		f.fuseRequests,
 		f.interruptRaises,
 		f.irqTransitions,
 		f.irqHigh,
 		f.interruptStatus,
-		f.queues[0].ready,
-		f.queues[1].ready,
-		f.queues[0].lastAvailIdx,
-		f.queues[1].lastAvailIdx,
+		queueReady,
+		queueLastAvail,
 	)
 }
 
@@ -1510,22 +1565,36 @@ func (f *FS) Stats() FSStats {
 		Tag:             tag,
 		MMIOReads:       f.mmioReads,
 		MMIOWrites:      f.mmioWrites,
-		QueueNotifies:   f.queueNotifies,
+		QueueNotifies:   append([]uint64(nil), f.queueNotifies...),
 		FUSERequests:    f.fuseRequests,
 		InterruptRaises: f.interruptRaises,
 		IRQTransitions:  f.irqTransitions,
 		IRQHigh:         f.irqHigh,
 		InterruptStatus: f.interruptStatus,
-		QueueReady: [2]bool{
-			f.queues[0].ready,
-			f.queues[1].ready,
-		},
-		QueueLastAvail: [2]uint16{
-			f.queues[0].lastAvailIdx,
-			f.queues[1].lastAvailIdx,
-		},
-		FUSEOps: ops,
+		QueueReady:      f.queueReadySnapshotLocked(),
+		QueueLastAvail:  f.queueLastAvailSnapshotLocked(),
+		FUSEOps:         ops,
 	}
+}
+
+func (f *FS) queueReadySnapshotLocked() []bool {
+	ready := make([]bool, len(f.queues))
+	for i := range f.queues {
+		ready[i] = f.queues[i].ready
+	}
+	return ready
+}
+
+func (f *FS) queueLastAvailSnapshotLocked() []uint16 {
+	last := make([]uint16, len(f.queues))
+	for i := range f.queues {
+		last[i] = f.queues[i].lastAvailIdx
+	}
+	return last
+}
+
+func (f *FS) isCompletingQueue(qidx int) bool {
+	return qidx >= 0 && qidx < len(f.queues)
 }
 
 func (f *FS) selectedQueueLocked() *queue {
@@ -1552,17 +1621,42 @@ func (f *FS) resetLocked() {
 	f.interruptStatus = 0
 	f.irqHigh = false
 	f.configGeneration++
-	f.queues = [2]queue{}
-	f.nextWorkSeq = [2]uint64{}
-	f.nextCompleteSeq = [2]uint64{}
-	f.completions = make(map[fsCompletionKey]fsCompletion)
+	f.resetQueueStateLocked()
 }
 
 func (f *FS) configBytesLocked() []byte {
 	cfg := make([]byte, fsCfgTotalSize)
 	copy(cfg[:fsCfgTagSize], f.tag[:])
-	binary.LittleEndian.PutUint32(cfg[fsCfgNumQueueOff:fsCfgNumQueueOff+4], 1)
+	binary.LittleEndian.PutUint32(cfg[fsCfgNumQueueOff:fsCfgNumQueueOff+4], fsRequestQueueCount)
 	return cfg
+}
+
+func (f *FS) resetQueueStateLocked() {
+	queueCount := fsTotalQueueCount()
+	if cap(f.queues) < queueCount {
+		f.queues = make([]queue, queueCount)
+	} else {
+		f.queues = f.queues[:queueCount]
+		clear(f.queues)
+	}
+	if len(f.queueNotifies) != queueCount {
+		old := f.queueNotifies
+		f.queueNotifies = make([]uint64, queueCount)
+		copy(f.queueNotifies, old)
+	}
+	if cap(f.nextWorkSeq) < queueCount {
+		f.nextWorkSeq = make([]uint64, queueCount)
+	} else {
+		f.nextWorkSeq = f.nextWorkSeq[:queueCount]
+		clear(f.nextWorkSeq)
+	}
+	if cap(f.nextCompleteSeq) < queueCount {
+		f.nextCompleteSeq = make([]uint64, queueCount)
+	} else {
+		f.nextCompleteSeq = f.nextCompleteSeq[:queueCount]
+		clear(f.nextCompleteSeq)
+	}
+	f.completions = make(map[fsCompletionKey]fsCompletion)
 }
 
 func encodeFuseAttr(dst []byte, attr FuseAttr) {
