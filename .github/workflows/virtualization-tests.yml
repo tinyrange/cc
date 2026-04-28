@@ -61,15 +61,16 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-          cache: true
-          cache-dependency-path: go.sum
+          cache: false
 
       - name: Set up Python
+        if: matrix.os == 'linux'
         uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
       - name: Install Python tooling
+        if: matrix.os == 'linux'
         run: python -m pip install --upgrade pip uv
 
       - name: Build guest init payloads
@@ -87,12 +88,14 @@ jobs:
           go build -tags embed_guestinit -o "${{ matrix.ccvm_path }}" ./cmd/ccvm
 
       - name: Install pyneurodesk fulltest dependencies
+        if: matrix.os == 'linux'
         working-directory: pyneurodesk
         env:
           PYNEURODESK_CCVM: ${{ github.workspace }}/${{ matrix.ccvm_path }}
         run: uv sync --extra fulltest
 
       - name: Write virtualization smoke recipe
+        if: matrix.os == 'linux'
         id: recipe
         shell: python
         run: |
@@ -127,6 +130,7 @@ jobs:
               print(f"recipe={recipe}", file=output)
 
       - name: Run virtualization fulltest smoke
+        if: matrix.os == 'linux'
         working-directory: pyneurodesk
         env:
           PYNEURODESK_CCVM: ${{ github.workspace }}/${{ matrix.ccvm_path }}
@@ -147,6 +151,14 @@ jobs:
             --memory-mb 1024 \
             --cpus 1 \
             2>&1 | tee "../fulltest-results/virtualization-${{ matrix.os }}-${{ matrix.arch }}.log"
+
+      - name: Run Windows WHP smoke
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force fulltest-results | Out-Null
+          go test ./internal/hv/whp -run TestSingleInstructionHLT -count=1 -v 2>&1 |
+            Tee-Object -FilePath fulltest-results/virtualization-${{ matrix.os }}-${{ matrix.arch }}.log
 
       - name: Upload virtualization fulltest log
         if: always()
