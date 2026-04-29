@@ -30,7 +30,7 @@ import (
 
 const defaultRegistry = "https://registry-1.docker.io/v2"
 const sharedCacheEnv = "CCX3_OCI_SHARED_CACHE_DIR"
-const sharedCacheSchemaVersion = "2"
+const sharedCacheSchemaVersion = "3"
 
 const (
 	SourceKindOCI   = "oci"
@@ -502,6 +502,10 @@ func (s *Store) pullCVMFSDirect(ctx context.Context, name string, spec SourceSpe
 	if err := os.WriteFile(filepath.Join(tmpDir, "rootfs.index.json"), indexBuf, 0o644); err != nil {
 		return fmt.Errorf("write fs index: %w", err)
 	}
+	deployMetadata, err := extractCVMFSDeployMetadata(cvmfsClient, filepath.Join(tmpDir, "rootfs.contents"), nodes)
+	if err != nil {
+		return fmt.Errorf("extract cvmfs deploy metadata: %w", err)
+	}
 	meta := metadata{
 		Name:               name,
 		Source:             spec.Raw,
@@ -512,6 +516,7 @@ func (s *Store) pullCVMFSDirect(ctx context.Context, name string, spec SourceSpe
 		MetadataPath:       filepath.Join(imageDir, "rootfs.metadata.json"),
 		IndexPath:          filepath.Join(imageDir, "rootfs.index.json"),
 		PackedContentsPath: filepath.Join(imageDir, "rootfs.contents"),
+		Env:                deployMetadata.Env,
 	}
 	if !options.Prefetch {
 		meta.PackedContentsPath = ""
@@ -527,6 +532,68 @@ func (s *Store) pullCVMFSDirect(ctx context.Context, name string, spec SourceSpe
 	}
 	reportPullProgress(options.Report, client.ProgressEvent{Status: "downloaded", Artifact: name})
 	return nil
+}
+
+func extractCVMFSDeployMetadata(client *intcvmfs.Client, packedPath string, nodes []indexedNode) (simgDeployMetadata, error) {
+	var envTexts []string
+	var buildYAML string
+	sorted := append([]indexedNode(nil), nodes...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Path < sorted[j].Path })
+	for _, node := range sorted {
+		if node.Kind != indexedKindFile {
+			continue
+		}
+		isEnvFile := strings.HasPrefix(node.Path, "/.singularity.d/env/") && strings.HasSuffix(node.Path, ".sh")
+		if !isEnvFile && node.Path != "/build.yaml" {
+			continue
+		}
+		text, err := readCVMFSIndexedNodeText(client, packedPath, node)
+		if err != nil {
+			return simgDeployMetadata{}, err
+		}
+		if isEnvFile {
+			envTexts = append(envTexts, text)
+			continue
+		}
+		buildYAML = text
+	}
+	return extractDeployMetadataTexts(envTexts, buildYAML), nil
+}
+
+func readCVMFSIndexedNodeText(client *intcvmfs.Client, packedPath string, node indexedNode) (string, error) {
+	if node.Size > maxSIMGMetadataFileSize {
+		node.Size = maxSIMGMetadataFileSize
+	}
+	if node.Packed {
+		if packedPath == "" {
+			return "", fmt.Errorf("packed path is required for %q", node.Path)
+		}
+		file, err := os.Open(packedPath)
+		if err != nil {
+			return "", err
+		}
+		defer file.Close()
+		buf := make([]byte, node.Size)
+		n, err := file.ReadAt(buf, int64(node.PackedOffset))
+		if err != nil && err != io.EOF {
+			return "", err
+		}
+		return string(buf[:n]), nil
+	}
+	if node.CVMFSTarget == "" {
+		return "", nil
+	}
+	if client == nil {
+		return "", fmt.Errorf("cvmfs client is required for %q", node.Path)
+	}
+	data, err := client.ReadFile(node.CVMFSTarget)
+	if err != nil {
+		return "", err
+	}
+	if len(data) > maxSIMGMetadataFileSize {
+		data = data[:maxSIMGMetadataFileSize]
+	}
+	return string(data), nil
 }
 
 func (s *Store) finalizeSIMGImage(name string, spec SourceSpec, imageDir, tmpDir, simgPath string) error {

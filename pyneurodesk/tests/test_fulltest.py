@@ -16,6 +16,7 @@ from pyneurodesk.fulltest import (
     load_timeout_for,
     load_suite,
     Options,
+    apply_env_setup,
     substitute_variables,
     timeout_for,
     validate_test,
@@ -106,6 +107,71 @@ tests:
 
     assert suite.tests[0].ignore_exit_code is True
     assert validate_test("Usage: tool", 2, suite.tests[0], {}) == ""
+
+
+def test_load_suite_parses_host_setup_and_cleanup(tmp_path: Path) -> None:
+    recipe = tmp_path / "fulltest.yaml"
+    recipe.write_text(
+        """
+name: host-script-suite
+container: tool.simg
+setup:
+  host_script: |
+    echo "$input" > generated.txt
+  script: echo guest setup
+cleanup:
+  host_script: rm -f generated.txt
+  script: echo guest cleanup
+tests:
+  - name: Smoke
+    command: tool --help
+""".lstrip()
+    )
+
+    suite = load_suite(recipe)
+
+    assert suite.setup.host_script.strip() == 'echo "$input" > generated.txt'
+    assert suite.setup.script.strip() == "echo guest setup"
+    assert suite.cleanup.host_script.strip() == "rm -f generated.txt"
+    assert suite.cleanup.script.strip() == "echo guest cleanup"
+
+
+def test_load_suite_parses_env_setup(tmp_path: Path) -> None:
+    recipe = tmp_path / "fulltest.yaml"
+    recipe.write_text(
+        """
+name: env-setup-suite
+container: tool.simg
+env_setup: source /opt/conda/etc/profile.d/conda.sh && conda activate tool
+tests:
+  - name: Smoke
+    command: python -c "import tool"
+""".lstrip()
+    )
+
+    suite = load_suite(recipe)
+
+    assert suite.env_setup == "source /opt/conda/etc/profile.d/conda.sh && conda activate tool"
+
+
+def test_apply_env_setup_prepends_setup_command() -> None:
+    assert apply_env_setup("python -c 'import tool'", "conda activate tool") == (
+        "conda activate tool\npython -c 'import tool'"
+    )
+    assert apply_env_setup("python -c 'import tool'", "") == "python -c 'import tool'"
+
+
+def test_run_host_script_uses_work_dir_and_host_variables(tmp_path: Path) -> None:
+    output, exit_code = fulltest.run_host_script(
+        "printf '%s' '${input}' > generated.txt",
+        tmp_path,
+        {"input": "host-value"},
+        10.0,
+    )
+
+    assert output == ""
+    assert exit_code == 0
+    assert (tmp_path / "generated.txt").read_text() == "host-value"
 
 
 def test_build_container_reference_defaults_to_cvmfs_directory() -> None:
@@ -224,6 +290,7 @@ def test_activated_shell_session_runs_login_shell_directly_in_guest(monkeypatch,
         return "ok", 0
 
     monkeypatch.setattr(fulltest, "run_shell", fake_run_shell)
+    monkeypatch.setattr(fulltest, "resolve_neurodesk_command", lambda: "neurodesk")
     activation_script = tmp_path / "activate.sh"
     session = ActivatedShellSession(
         work_dir=tmp_path,
@@ -241,6 +308,34 @@ def test_activated_shell_session_runs_login_shell_directly_in_guest(monkeypatch,
     assert calls[0][3] == 30.0
     assert calls[0][2].startswith("source ")
     assert "neurodesk shell exec fulltest-image -- bash -lc 'ls /opt/tool'" in calls[0][2]
+
+
+def test_activated_shell_session_runs_recipe_shell_in_guest(monkeypatch, tmp_path: Path) -> None:
+    calls: list[tuple[dict[str, str], Path, str, float]] = []
+
+    def fake_run_shell(env: dict[str, str], work_dir: Path, command: str, timeout_seconds: float) -> tuple[str, int]:
+        calls.append((env, work_dir, command, timeout_seconds))
+        return "ok", 0
+
+    monkeypatch.setattr(fulltest, "run_shell", fake_run_shell)
+    monkeypatch.setattr(fulltest, "resolve_neurodesk_command", lambda: "neurodesk")
+    activation_script = tmp_path / "activate.sh"
+    session = ActivatedShellSession(
+        work_dir=tmp_path,
+        activation_script=activation_script,
+        env={"CCX3_URL": "http://example.test"},
+        image="fulltest-image",
+    )
+
+    output, exit_code = session.run("$ASHS_ROOT/bin/ashs_main.sh -h 2>&1 | head -20", 30.0)
+
+    assert (output, exit_code) == ("ok", 0)
+    assert len(calls) == 1
+    assert calls[0][2].startswith("source ")
+    assert (
+        "neurodesk shell exec fulltest-image -- bash -lc "
+        "'$ASHS_ROOT/bin/ashs_main.sh -h 2>&1 | head -20'"
+    ) in calls[0][2]
 
 
 def test_load_command_uses_nd_load_with_source_and_recipe_commands() -> None:

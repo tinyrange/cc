@@ -6,7 +6,6 @@ import json
 import os
 import posixpath
 import re
-import shlex
 import subprocess
 import sys
 import threading
@@ -36,10 +35,6 @@ DEFAULT_CVMFS_REPO = "neurodesk.ardc.edu.au"
 DEFAULT_CONTAINERS_PATH = "/containers"
 DEFAULT_RELEASES_API = "https://api.github.com/repos/NeuroDesk/neurocontainers/contents/releases"
 DEFAULT_RELEASES_CACHE_TTL_SECONDS = 6 * 60 * 60
-SINGULARITY_ENV_FILES = (
-    "10-docker2singularity.sh",
-    "90-environment.sh",
-)
 WATCHDOG_TIMEOUT_SECONDS = 30.0
 WATCHDOG_FEED_INTERVAL_SECONDS = 10.0
 _WATCHDOG_THREADS: dict[str, tuple[threading.Event, threading.Thread]] = {}
@@ -211,7 +206,7 @@ class NeurodeskContainer:
         command, shares = self._resolve_command(args)
         if not command:
             raise ValueError("at least one command argument is required")
-        deploy_env = self.deploy_env
+        deploy_env = runtime_deploy_env_entries(self.deploy_env)
         try:
             result = self._run_command(command, shares=shares, env=deploy_env)
         except httpx.ConnectError as exc:
@@ -611,18 +606,14 @@ def load_deploy_metadata(container_handle: NeurodeskContainer) -> DeployMetadata
         )
         if line is not None
     ]
-    image_env = load_singularity_env(container_handle, directory)
+    image_env = load_image_metadata_env(container_handle)
     build_commands, build_env = load_build_deploy_metadata(container_handle, directory, image_env)
     commands = tuple(sorted({*commands, *build_commands}))
     return DeployMetadata(commands=commands, deploy_env=merge_env_entries([*image_env, *build_env, *deploy_env]))
 
 
 def load_local_deploy_metadata(container_handle: NeurodeskContainer) -> DeployMetadata:
-    try:
-        metadata = container_handle._client.prepare_image_metadata(container_handle.reference.image)
-    except (AttributeError, httpx.HTTPError):
-        return DeployMetadata()
-    deploy_env = tuple(metadata.env)
+    deploy_env = load_image_metadata_env(container_handle)
     deploy_bins = []
     for entry in deploy_env:
         key, _, value = entry.partition("=")
@@ -632,60 +623,15 @@ def load_local_deploy_metadata(container_handle: NeurodeskContainer) -> DeployMe
     return DeployMetadata(commands=tuple(sorted(set(deploy_bins))), deploy_env=merge_env_entries(list(deploy_env)))
 
 
-def load_singularity_env(container_handle: NeurodeskContainer, directory: str) -> tuple[str, ...]:
-    image_env_dir = singularity_env_dir_for_deploy_directory(directory)
-    env: list[str] = []
-    for name in SINGULARITY_ENV_FILES:
-        text = read_cvmfs_text(container_handle, f"{image_env_dir}/{name}", allow_missing=True)
-        env.extend(parse_singularity_env_exports(text, env))
-    return tuple(env)
-
-
-def singularity_env_dir_for_deploy_directory(directory: str) -> str:
-    clean = directory.rstrip("/")
-    image_root = clean if clean.endswith(".simg") else f"{clean}/{posixpath.basename(clean)}.simg"
-    return f"{image_root}/.singularity.d/env"
-
-
-def parse_singularity_env_exports(text: str, base_env: list[str] | None = None) -> tuple[str, ...]:
-    env: list[str] = []
-    current = list(base_env or [])
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line.startswith("export "):
-            continue
-        assignment = line.removeprefix("export ").strip()
-        if "=" not in assignment:
-            continue
-        key, value = assignment.split("=", 1)
-        key = key.strip()
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
-            continue
-        parsed = parse_singularity_env_value(value.strip())
-        if parsed is None:
-            continue
-        parsed = expand_shell_env_references(parsed, [*current, *env])
-        entry = f"{key}={parsed}"
-        env.append(entry)
-        current = list(merge_env_entries([*current, entry]))
-    return merge_env_entries(env)
-
-
-def parse_singularity_env_value(value: str) -> Optional[str]:
-    default_value = value
-    if len(default_value) >= 2 and default_value[0] == default_value[-1] and default_value[0] in {"'", '"'}:
-        default_value = default_value[1:-1]
-    default_match = re.fullmatch(r"""\$\{[A-Za-z_][A-Za-z0-9_]*:-(["'])(.*)\1\}""", default_value)
-    if default_match:
-        return default_match.group(2)
+def load_image_metadata_env(container_handle: NeurodeskContainer) -> tuple[str, ...]:
     try:
-        parts = shlex.split(value, posix=True)
-    except ValueError:
-        return None
-    if len(parts) != 1:
-        return None
-    parsed = parts[0]
-    return parsed
+        metadata = container_handle._client.prepare_image_metadata(container_handle.reference.image)
+    except (AttributeError, httpx.HTTPError):
+        return ()
+    env = getattr(metadata, "env", ())
+    if not isinstance(env, (list, tuple)):
+        return ()
+    return merge_env_entries(list(env))
 
 
 def load_build_deploy_metadata(
@@ -830,6 +776,17 @@ def merge_env_entries(entries: list[str]) -> tuple[str, ...]:
         key, value = entry.split("=", 1)
         merged[key] = value
     return tuple(f"{key}={value}" for key, value in merged.items())
+
+
+def runtime_deploy_env_entries(entries: tuple[str, ...] | list[str]) -> tuple[str, ...]:
+    runtime_entries = list(entries)
+    for entry in entries:
+        if "=" not in entry:
+            continue
+        key, value = entry.split("=", 1)
+        if key.startswith("DEPLOY_ENV_") and len(key) > len("DEPLOY_ENV_"):
+            runtime_entries.append(f"{key.removeprefix('DEPLOY_ENV_')}={value}")
+    return merge_env_entries(runtime_entries)
 
 
 def read_cvmfs_text(

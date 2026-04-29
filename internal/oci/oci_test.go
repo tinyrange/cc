@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	intcvmfs "j5.nz/cc/internal/cvmfs"
 	"j5.nz/cc/internal/fsmeta"
 	"j5.nz/cc/internal/imagefs"
 )
@@ -180,6 +181,11 @@ export EMPTY_SUFFIX="$UNSET_VAR:/opt/empty"
 `), 0o644); err != nil {
 		t.Fatalf("WriteFile(90-environment.sh) error = %v", err)
 	}
+	if err := os.WriteFile(filepath.Join(envDir, "99-micromamba-startup.sh"), []byte(`
+export MAMBA_ROOT_PREFIX="/opt/conda"
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(99-micromamba-startup.sh) error = %v", err)
+	}
 
 	meta := extractSIMGDeployMetadata(imagefs.NewHostFS(root, nil))
 	env := strings.Join(meta.Env, "\n")
@@ -187,6 +193,7 @@ export EMPTY_SUFFIX="$UNSET_VAR:/opt/empty"
 		"DEPLOY_PATH=/opt/bart-0.9.00/",
 		"DEPLOY_BINS=bart:bart-view",
 		"TOOLBOX_PATH=/opt/bart-0.9.00/",
+		"MAMBA_ROOT_PREFIX=/opt/conda",
 		"PATH=/opt/bart-0.9.00/:/opt/conda/bin:/usr/local/bin:/usr/bin:/bin",
 		"EMPTY_SUFFIX=:/opt/empty",
 	} {
@@ -199,6 +206,73 @@ export EMPTY_SUFFIX="$UNSET_VAR:/opt/empty"
 	}
 	if got := strings.Join(meta.DeployBins, ":"); got != "bart:bart-view" {
 		t.Fatalf("DeployBins = %q, want bart:bart-view", got)
+	}
+}
+
+func TestExtractCVMFSDeployMetadataUsesSingularityEnv(t *testing.T) {
+	packedPath := filepath.Join(t.TempDir(), "rootfs.contents")
+	envData := []byte("export PATH=\"$PATH:/opt/palm-alpha119\"\n")
+	if err := os.WriteFile(packedPath, envData, 0o644); err != nil {
+		t.Fatalf("WriteFile(rootfs.contents) error = %v", err)
+	}
+
+	nodes := []indexedNode{
+		{Path: "/", Kind: indexedKindDir, Mode: fsmeta.LinuxModeFromFileMode(fs.ModeDir | 0o755)},
+		{Path: "/.singularity.d", Kind: indexedKindDir, Mode: fsmeta.LinuxModeFromFileMode(fs.ModeDir | 0o755)},
+		{Path: "/.singularity.d/env", Kind: indexedKindDir, Mode: fsmeta.LinuxModeFromFileMode(fs.ModeDir | 0o755)},
+		{
+			Path:         "/.singularity.d/env/90-environment.sh",
+			Kind:         indexedKindFile,
+			Mode:         0o644,
+			Size:         uint64(len(envData)),
+			Packed:       true,
+			PackedOffset: 0,
+		},
+	}
+
+	meta, err := extractCVMFSDeployMetadata(nil, packedPath, nodes)
+	if err != nil {
+		t.Fatalf("extractCVMFSDeployMetadata() error = %v", err)
+	}
+	env := strings.Join(meta.Env, "\n")
+	if !strings.Contains(env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/palm-alpha119") {
+		t.Fatalf("deploy env missing CVMFS Singularity PATH in:\n%s", env)
+	}
+}
+
+func TestExtractCVMFSDeployMetadataReadsTargetEnv(t *testing.T) {
+	root := t.TempDir()
+	envPath := filepath.Join(root, "10-docker.sh")
+	envData := []byte("export PATH=\"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/palm-alpha119\"\nexport DEPLOY_BINS=\"palm:octave\"\n")
+	if err := os.WriteFile(envPath, envData, 0o644); err != nil {
+		t.Fatalf("WriteFile(10-docker.sh) error = %v", err)
+	}
+
+	nodes := []indexedNode{
+		{Path: "/", Kind: indexedKindDir, Mode: fsmeta.LinuxModeFromFileMode(fs.ModeDir | 0o755)},
+		{Path: "/.singularity.d", Kind: indexedKindDir, Mode: fsmeta.LinuxModeFromFileMode(fs.ModeDir | 0o755)},
+		{Path: "/.singularity.d/env", Kind: indexedKindDir, Mode: fsmeta.LinuxModeFromFileMode(fs.ModeDir | 0o755)},
+		{
+			Path:        "/.singularity.d/env/10-docker.sh",
+			Kind:        indexedKindFile,
+			Mode:        0o644,
+			Size:        uint64(len(envData)),
+			CVMFSTarget: envPath,
+		},
+	}
+
+	meta, err := extractCVMFSDeployMetadata(&intcvmfs.Client{}, "", nodes)
+	if err != nil {
+		t.Fatalf("extractCVMFSDeployMetadata() error = %v", err)
+	}
+	env := strings.Join(meta.Env, "\n")
+	for _, want := range []string{
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/palm-alpha119",
+		"DEPLOY_BINS=palm:octave",
+	} {
+		if !strings.Contains(env, want) {
+			t.Fatalf("deploy env missing %q in:\n%s", want, env)
+		}
 	}
 }
 
@@ -717,7 +791,6 @@ func TestStorePullRefreshesDirectoryBackedCVMFSWhenManifestChanges(t *testing.T)
 	commandsHash := strings.Repeat("c", 40)
 	releaseHash := strings.Repeat("d", 40)
 	shHash := strings.Repeat("e", 40)
-
 	rootCatalog := createOCITestCatalogDB(t, []string{
 		`CREATE TABLE catalog (md5path_1 INTEGER, md5path_2 INTEGER, parent_1 INTEGER, parent_2 INTEGER, hardlinks INTEGER, hash BLOB, size INTEGER, mode INTEGER, mtime INTEGER, mtimens INTEGER, flags INTEGER, name TEXT, symlink TEXT, uid INTEGER, gid INTEGER, xattr BLOB);`,
 		`CREATE TABLE nested_catalogs (path TEXT, sha1 TEXT, size INTEGER);`,

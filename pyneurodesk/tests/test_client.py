@@ -26,7 +26,6 @@ from pyneurodesk.api import (
     create_progress_reporter,
     load_deploy_metadata,
     parse_top_level_deploy,
-    parse_singularity_env_exports,
     default_daemon_state_path,
     path_join,
     resolve_ccvm_binary_path,
@@ -716,23 +715,28 @@ def test_container_run_uses_cvmfs_deploy_env_and_exposes_commands() -> None:
                         "eof": True,
                     },
                 )
-            if payload["path"] == (
-                "/containers/niimath_1.0.20250804_20251016/"
-                "niimath_1.0.20250804_20251016.simg/.singularity.d/env/10-docker2singularity.sh"
-            ):
+            if payload["path"] == "/containers/niimath_1.0.20250804_20251016/build.yaml":
                 return httpx.Response(
                     200,
                     json={
                         "path": payload["path"],
                         "offset": 0,
-                        "data": base64.b64encode(b'export PATH="/usr/local/bin:/usr/bin:/bin:/opt/niimath"\n').decode(),
+                        "data": "",
                         "eof": True,
                     },
                 )
-            if payload["path"].endswith("/.singularity.d/env/90-environment.sh"):
-                return httpx.Response(400, json={"error": "file does not exist"})
         if request.method == "GET" and request.url.path == "/image/niimath":
             return httpx.Response(200, json={"name": "niimath", "status": "downloaded", "source_kind": "cvmfs"})
+        if request.method == "POST" and request.url.path == "/image/niimath/metadata":
+            return httpx.Response(
+                200,
+                json={
+                    "name": "niimath",
+                    "status": "prepared",
+                    "source_kind": "cvmfs",
+                    "env": ["PATH=/usr/local/bin:/usr/bin:/bin:/opt/niimath"],
+                },
+            )
         if request.method == "GET" and request.url.path == "/vm/status":
             return httpx.Response(200, json={"status": "running", "image": "niimath"})
         if request.method == "POST" and request.url.path == "/vm/run":
@@ -740,6 +744,7 @@ def test_container_run_uses_cvmfs_deploy_env_and_exposes_commands() -> None:
             assert payload["env"] == [
                 "PATH=/usr/local/bin:/usr/bin:/bin:/opt/niimath",
                 "DEPLOY_ENV_FSLDIR=/opt/fsl",
+                "FSLDIR=/opt/fsl",
             ]
             return httpx.Response(200, json={"exit_code": 0, "output": "ok\n"})
         raise AssertionError(f"unexpected request: {request.method} {request.url.path} {body!r}")
@@ -759,7 +764,7 @@ def test_container_run_uses_cvmfs_deploy_env_and_exposes_commands() -> None:
     assert out == "ok\n"
     paths = [path for _, path, _ in seen]
     assert paths.count("/cvmfs/list") == 3
-    assert paths.count("/cvmfs/read") == 5
+    assert paths.count("/cvmfs/read") == 3
     assert paths[-1] == "/vm/run"
 
 
@@ -819,34 +824,6 @@ def test_run_stream_reports_invalid_ndjson_event() -> None:
         client.close()
 
 
-def test_parse_singularity_env_exports_handles_docker_defaults() -> None:
-    assert parse_singularity_env_exports(
-        '\n'.join(
-            [
-                'export PATH="/usr/local/bin:/usr/bin:/bin:/usr/local/abin:~/.local/bin"',
-                'export LANG="${LANG:-"en_US.UTF-8"}"',
-                'export LD_LIBRARY_PATH PS1',
-                'export SKIP="$UNRESOLVED:/opt/bin"',
-            ]
-        )
-    ) == (
-        "PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/abin:~/.local/bin",
-        "LANG=en_US.UTF-8",
-        "SKIP=:/opt/bin",
-    )
-
-
-def test_parse_singularity_env_exports_expands_prior_path() -> None:
-    assert parse_singularity_env_exports(
-        '\n'.join(
-            [
-                'export PATH="/usr/local/bin:/usr/bin:/bin"',
-                'export PATH="/opt/tool:$PATH"',
-            ]
-        )
-    ) == ("PATH=/opt/tool:/usr/local/bin:/usr/bin:/bin",)
-
-
 def test_parse_top_level_deploy_supports_lists_and_skips_templates() -> None:
     paths, bins = parse_top_level_deploy(
         """
@@ -864,12 +841,6 @@ deploy:
 
 def test_load_deploy_metadata_merges_cvmfs_build_yaml_deploy_metadata() -> None:
     read_payloads = {
-        "/containers/tool/tool.simg/.singularity.d/env/10-docker2singularity.sh": base64.b64encode(
-            b'export PATH="/usr/local/bin:/usr/bin:/bin"\n'
-        ).decode(),
-        "/containers/tool/tool.simg/.singularity.d/env/90-environment.sh": base64.b64encode(
-            b'export TOOLBOX_PATH="/opt/tool"\n'
-        ).decode(),
         "/containers/tool/env.txt": base64.b64encode(b"DEPLOY_ENV_CUSTOM=ok\n").decode(),
         "/containers/tool/build.yaml": base64.b64encode(
             b"""
@@ -883,6 +854,19 @@ deploy:
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/image/tool/metadata":
+            return httpx.Response(
+                200,
+                json={
+                    "name": "tool",
+                    "status": "prepared",
+                    "source_kind": "cvmfs",
+                    "env": [
+                        "PATH=/usr/local/bin:/usr/bin:/bin",
+                        "TOOLBOX_PATH=/opt/tool",
+                    ],
+                },
+            )
         if request.method == "POST" and request.url.path == "/cvmfs/list":
             return httpx.Response(
                 200,

@@ -3,8 +3,12 @@
 /PLAN.md
 /TODO.md
 /.env.local
+/.tmp-actions-logs
 /internal/guestinit/guest-init-linux-arm64
 /internal/guestinit/guest-init-linux-amd64
+/tools/__pycache__
+/tools/*.pyc
+/tools/*.pyo
 /pyneurodesk/.git
 /pyneurodesk/.venv
 /pyneurodesk/.pytest_cache

@@ -30,6 +30,7 @@ import (
 )
 
 var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
+var debugPprof = strings.TrimSpace(os.Getenv("CCX3_DEBUG_PPROF")) != ""
 
 const defaultVMBootTimeout = 5 * time.Second
 
@@ -220,6 +221,11 @@ func newServerShutdown(srvState *server, httpServer *http.Server) func() {
 
 func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *http.ServeMux {
 	mux := http.NewServeMux()
+	if debugPprof {
+		runtime.SetBlockProfileRate(1)
+		runtime.SetMutexProfileFraction(1)
+		registerPprofHandlers(mux)
+	}
 
 	if strings.TrimSpace(os.Getenv("CCX3_PPROF")) != "" {
 		runtime.SetMutexProfileFraction(1)
@@ -727,6 +733,20 @@ func resolveCacheDir(arg string) (string, error) {
 	}
 	dir := filepath.Join(userCacheDir, "ccx3")
 	return dir, os.MkdirAll(dir, 0o755)
+}
+
+func registerPprofHandlers(mux *http.ServeMux) {
+	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+	mux.Handle("GET /debug/pprof/allocs", pprof.Handler("allocs"))
+	mux.Handle("GET /debug/pprof/block", pprof.Handler("block"))
+	mux.Handle("GET /debug/pprof/goroutine", pprof.Handler("goroutine"))
+	mux.Handle("GET /debug/pprof/heap", pprof.Handler("heap"))
+	mux.Handle("GET /debug/pprof/mutex", pprof.Handler("mutex"))
+	mux.Handle("GET /debug/pprof/threadcreate", pprof.Handler("threadcreate"))
 }
 
 func sharedRuntimeRoot() string {

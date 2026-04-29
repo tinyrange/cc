@@ -20,12 +20,20 @@ type simgDeployMetadata struct {
 }
 
 func extractSIMGDeployMetadata(root imagefs.Directory) simgDeployMetadata {
-	var env []string
+	var envTexts []string
 	for _, name := range singularityEnvFiles(root) {
-		env = mergeEnvEntries(env, parseSingularityEnvExports(readImageText(root, name)))
+		envTexts = append(envTexts, readImageText(root, name))
+	}
+	return extractDeployMetadataTexts(envTexts, readImageText(root, "/build.yaml"))
+}
+
+func extractDeployMetadataTexts(envTexts []string, buildYAML string) simgDeployMetadata {
+	var env []string
+	for _, text := range envTexts {
+		env = mergeEnvEntries(env, parseSingularityEnvExports(text))
 	}
 
-	deployPath, deployBins := parseTopLevelDeploy(readImageText(root, "/build.yaml"))
+	deployPath, deployBins := parseTopLevelDeploy(buildYAML)
 	if len(deployPath) > 0 && envValue(env, "DEPLOY_PATH") == "" {
 		env = mergeEnvEntries(env, []string{"DEPLOY_PATH=" + strings.Join(deployPath, ":")})
 	}

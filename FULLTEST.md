@@ -1,243 +1,231 @@
 # PyNeurodesk Fulltest Status
 
-This document reflects the current all-suite GitHub Actions evidence after
-`22f649f455aefdbb2c8f58631637624ea3cb2157` (`Speed up SIMG offset reads`).
+This document reflects the latest completed-suite evidence from the in-progress
+GitHub Actions run after `1e7cd2a76b7ccd72a6429fd42b8e9a16a4b6ad88`.
 
 ## Current Reference
 
 - Workflow: `PyNeurodesk fulltests`
-- Run: https://github.com/tinyrange/cc/actions/runs/24980229332
-- Requested job reviewed: `spm25`
-  https://github.com/tinyrange/cc/actions/runs/24980229332/job/73140579417
+- Run: https://github.com/tinyrange/cc/actions/runs/24991386248
+- Requested job URL: https://github.com/tinyrange/cc/actions/runs/24991386248/job/73177580603
+- Requested job name: `spm25`
 - Event: `workflow_dispatch`
 - Branch: `main`
-- Commit: `22f649f455aefdbb2c8f58631637624ea3cb2157`
-- Started: `2026-04-27T06:36:13Z`
-- Completed: `2026-04-27T08:40:42Z`
-- Run conclusion: `cancelled`
-- Local artifacts: `.tmp-fullsuite-24980229332/`
+- Commit: `1e7cd2a76b7ccd72a6429fd42b8e9a16a4b6ad88`
+- Run status at collection time: `in_progress`
+- Local artifacts: `.tmp-fullsuite-24991386248/`
+
+## Scope
+
+The workflow selected 129 suites. This snapshot excludes the six jobs that were
+still not finished when the logs were pulled:
+
+`conn`, `hmri`, `mitkdiffusion`, `qupath`, `spm25`, `syncro`.
+
+That means the linked `spm25` job is not included in the failure breakdown yet.
 
 ## Suite Summary
 
-The workflow selected 129 suites.
+| Result | Previous report | Current completed snapshot |
+| --- | ---: | ---: |
+| Passed suites | 34 | 41 |
+| Failed suites | 92 | 82 |
+| Cancelled / unfinished suites | 3 cancelled | 6 in progress |
 
-| Result | Count |
-| --- | ---: |
-| Passed | 34 |
-| Failed | 92 |
-| Cancelled | 3 |
+The current artifact set contains 122 suite artifact directories and 244
+download/fulltest log files. The only completed suite without an uploaded
+artifact is `topaz`; its raw GitHub job log was pulled separately.
 
-The artifact set is complete for the selected matrix: 129 suite artifacts were
-downloaded, containing 248 log files. Of those, 111 suite logs reached a final
-pytest-style summary. Across those summarized logs the totals were:
+Of the 123 completed suite jobs, 109 reached a final pytest-style suite summary.
+Across those summarized logs the totals are:
 
-| Test result | Count |
-| --- | ---: |
-| Passed tests | 8546 |
-| Failed tests | 1358 |
-| Skipped tests | 274 |
+| Test result | Previous report | Current completed snapshot |
+| --- | ---: | ---: |
+| Passed tests | 8546 | 8724 |
+| Failed tests | 1358 | 871 |
+| Skipped tests | 274 | 252 |
 
 ## Passing Suites
 
-These suites passed in the current run:
+These suites passed in the current completed snapshot:
 
 `afni`, `amico`, `apptainer`, `bart`, `bidsappbrainsuite`,
-`bidsapppymvpa`, `clearswi`, `convert3d`, `dcm2niix`, `dicomtools`,
-`elastix`, `fastcsr`, `fatsegnet`, `fsqc`, `gingerale`, `hnncore`,
-`itksnap`, `julia`, `mne`, `mricrogl`, `niftyreg`, `nighres`, `niimath`,
-`nipype`, `palmettobug`, `pcntoolkit`, `quickshear`, `slicersalt`,
-`spmpython`, `surfice`, `synthstrip`, `vesselvio`, `vmtk`, `xnat`.
+`bidsapppymvpa`, `bidsme`, `bidstools`, `brainlifecli`, `brkraw`,
+`clearswi`, `convert3d`, `dcm2niix`, `dicomtools`, `elastix`, `fastcsr`,
+`fatsegnet`, `fieldtrip`, `fsqc`, `gingerale`, `heudiconv`, `hnncore`,
+`julia`, `mne`, `mricrogl`, `niftyreg`, `nighres`, `niimath`, `nipype`,
+`palmettobug`, `pcntoolkit`, `quickshear`, `relion`, `slicersalt`,
+`spmpython`, `surfice`, `synthstrip`, `tgvqsm`, `vesselvio`, `vmtk`,
+`xnat`.
 
-## Important Change
+Changes from the previous report:
 
-The apptainer offset-read issue is fixed in this run.
+- Newly passing: `bidsme`, `bidstools`, `brainlifecli`, `brkraw`,
+  `fieldtrip`, `heudiconv`, `relion`, `tgvqsm`.
+- Regressed from pass to failure: `itksnap`.
+- Still passing and still important: `apptainer`.
 
-Before `22f649f`, the apptainer suite could pass but took about 3 hours and
-15 minutes because many reads from the `.simg` image were pathologically slow.
-In this run, the apptainer job still passed but completed in about 3 minutes
-and 34 seconds, with the `Run fulltest` step taking about 3 minutes and
-2 seconds. Local checks before the commit showed `/usr/bin/apptainer` reads
-dropping from roughly 47 seconds to 0.64 seconds, and `apptainer --version`
-dropping from roughly 66-68 seconds to 0.72 seconds.
+## Important Changes
 
-That means the remaining failures are no longer explained by the old global
-SIMG offset-read problem. The current failures are mostly download availability,
-tool-specific timeouts, VM boot/API timeouts, recipe command/path assumptions,
-and a small number of harness/import problems.
+The old global SIMG offset-read issue remains fixed. `apptainer` passed again
+and completed in about 3 minutes and 51 seconds, with the `Run fulltest` step
+taking about 3 minutes and 17 seconds.
 
-## Cancelled Suites
+The previous report's 403/404 download bucket is no longer reproduced in the
+completed artifacts. Former download-only failures such as `brainlifecli` now
+run far enough to pass, and several other previously download-blocked suites
+now fail later in normal test execution.
 
-The run was cancelled after enough signal had been collected.
+The current dominant failure shape is no longer image access. It is mostly
+command timeouts, command/path resolution errors, missing expected environment
+or output fragments, and a smaller number of image/harness failures.
 
-- `hmri`: cancelled after about 2 hours and 4 minutes. The log had already hit
-  a `504 Gateway Timeout` while trying to run a later shell command.
-- `qupath`: cancelled after about 1 hour and 22 minutes. The suite repeatedly
-  timed out `QuPath script` commands at the 120 second command timeout.
-- `spm25`: this is the job linked in the request. It was cancelled after about
-  1 hour and 30 minutes. The log shows repeated `run_spm25.sh` command timeouts
-  at 120 seconds, followed later by a VM boot/API timeout.
+## Unfinished Suites
+
+The run was still active when this report was generated. These suites are
+excluded from counts and categories:
+
+- `conn`: still running.
+- `hmri`: still running.
+- `mitkdiffusion`: still running.
+- `qupath`: still running.
+- `spm25`: still running; this is the job linked in the request.
+- `syncro`: still running.
 
 ## Current Failure Categories
 
 The categories below are not mutually exclusive. A suite can appear in more
 than one bucket when it has multiple symptoms.
 
-### Download 403/404 Before Fulltest Starts
-
-Ten suites produced only download logs and no suite log. These failures happen
-before the fulltest harness gets a usable image.
-
-- `aslprep`: `.simg` download returns HTTP 403.
-- `brainlifecli`: `.simg` download returns HTTP 404.
-- `dicompare`: `.simg` download returns HTTP 403.
-- `ezbids`: `.simg` image is unavailable from the download location.
-- `freesurfer`: `.simg` image is unavailable from the download location.
-- `gimp`: `.simg` image is unavailable from the download location.
-- `pydeface`: `.simg` download returns HTTP 403.
-- `rstudio`: `.simg` download returns HTTP 403.
-- `slicer`: `.simg` download returns HTTP 403.
-- `topaz`: `.simg` download returns HTTP 403.
-
-Root cause: these are image publication or access problems, not guest runtime
-failures. The next useful check is to validate the generated Neurodesk
-singularity URL for each suite against the expected S3/object path and confirm
-whether the object exists and is public.
-
 ### Command Timeout / Heavy Tool Startup
 
-Thirty-two suites contain commands timing out, usually at the current 120
-second command timeout:
+Thirty-seven completed suites contain command timeouts or related timeout
+symptoms:
 
-`ants`, `batchheudiconv`, `bidsappspm`, `bidscoin`, `cat12`, `conn`,
-`dcm2bids`, `dsistudio`, `fastsurfer`, `fmriprep`, `fsl`, `gigaconnectome`,
-`hmri`, `ilastik`, `lesymap`, `mgltools`, `micapipe`, `mriqc`, `mrsiproc`,
-`networkcorrespondancetoolkit`, `neurodock`, `nftsim`, `nibabies`, `osprey`,
-`ospreybids`, `qsirecon`, `qsmxt`, `qupath`, `root`, `sigviewer`, `spm25`,
-`vesselboost`.
+`ants`, `batchheudiconv`, `bidsappaa`, `bidsappbaracus`, `bidsappspm`,
+`bidscoin`, `cat12`, `code`, `dcm2bids`, `dsistudio`, `ezbids`, `fmriprep`,
+`fsl`, `gigaconnectome`, `gimp`, `glmsingle`, `ilastik`, `itksnap`,
+`mgltools`, `micapipe`, `mriqc`, `mrsiproc`,
+`networkcorrespondancetoolkit`, `neurodock`, `nftsim`, `nibabies`,
+`osprey`, `ospreybids`, `physio`, `qsirecon`, `qsmxt`, `root`, `rstudio`,
+`sigviewer`, `slicer`, `vesselboost`, `vina`.
 
-Known examples:
+Representative examples:
 
-- `spm25` repeatedly times out `run_spm25.sh`.
-- `qupath` repeatedly times out `QuPath script`.
-- `afni` is no longer failing; its slow `afni -ver` path is covered by the
-  streaming/prefetch work and passed in this run.
-
-Root cause: this bucket needs per-suite triage. Some commands are genuinely
-large first-run startup paths, while others may be blocked on missing data,
-interactive startup, bad paths, or the VM becoming unavailable. The next fix
-should not simply raise the timeout globally; each representative command
-should be reproduced locally with the smallest possible invocation and with
-guest/server logs enabled.
+- `ants`: `N4BiasFieldCorrection` and `DenoiseImage` commands time out at
+  120 seconds.
+- `dsistudio`: atlas track commands time out, including one 300 second timeout.
+- `ilastik`: `run_ilastik.sh --version` and `--help` time out at 120 seconds.
+- `root`: batch ROOT commands for histogram/tree creation and `hadd` time out.
 
 ### VM Boot / Host API Timeout
 
-Seven suites report `vm boot timed out after 30s`:
+Only one completed suite currently shows a VM/API timeout signature:
 
-`conn`, `fastsurfer`, `hmri`, `ilastik`, `lesymap`, `mrsiproc`, `spm25`.
+`bidsappspm`.
 
-Five suites also contain host API read timeouts:
+This is a major reduction from the previous report, which had seven VM boot
+timeouts and five host API read timeouts. The unfinished suites may still add
+back some of this signal, especially `conn`, `hmri`, `qupath`, and `spm25`.
 
-`brainstorm`, `conn`, `hmri`, `mrsiproc`, `networkcorrespondancetoolkit`.
+### Command Resolution / PATH Issues
 
-Representative symptoms include:
+Five completed suites contain explicit command-resolution failures:
 
-- `httpx.ReadTimeout` while calling `/vm` during `ensure_instance()`.
-- `504 Gateway Timeout` with `vm boot timed out after 30s` during shell command
-  execution.
+`deepretinotopy`, `freesurfer`, `minc`, `rabies`, `sovabids`.
 
-Likely root cause: the shell wrapper sometimes has to re-enter VM creation or
-startup for the same image after a previous command, and the server does not
-return from `/vm` within 30 seconds. This may mean the prior VM exited, the
-server is blocked on a large image/startup path, or the guest is slow to become
-ready after heavy tool execution. This should be investigated with local
-minimal repros before changing the timeout.
+Examples:
 
-### Command Resolution / Deploy Metadata / PATH Issues
+- `deepretinotopy`: cannot resolve `recon-all` and `mri_info`.
+- `freesurfer`: cannot resolve `mri_info` and `mri_convert`.
+- `rabies`: cannot resolve `fslmaths` and `python`.
+- `sovabids`: cannot resolve `sovaconvert` and `sovapply`.
 
-Four suites contain explicit `resolve command` failures:
+Twelve completed suites also contain `exit code 127`, usually command not
+found or missing interpreter/helper paths:
 
-`deepretinotopy`, `minc`, `rabies`, `sovabids`.
-
-Twelve suites contain `exit code 127`, which usually indicates command not
-found or a missing interpreter/helper:
-
-`ashs`, `bidsappaa`, `bidsappmrtrix3connectome`, `fmriprep`, `fsl`,
-`laynii`, `micapipe`, `nibabies`, `oshyx`, `qsiprep`, `rabies`, `tractseg`.
-
-Root cause: these are likely remaining recipe/deploy metadata mismatches, path
-assumptions in the fulltest recipes, or missing wrapper binaries inside the
-downloaded `.simg` images. The deploy path/deploy bin metadata should be used
-to determine the intended executable path rather than assuming host-visible
-absolute paths.
+`ashs`, `aslprep`, `bidsappmrtrix3connectome`, `fmriprep`, `fsl`, `laynii`,
+`micapipe`, `nibabies`, `oshyx`, `qsiprep`, `rabies`, `tractseg`.
 
 ### Missing Files / Recipe Path Assumptions
 
-Four suites contain direct `No such file or directory` failures:
+Five completed suites contain direct missing-file or missing-command messages:
 
-`ashs`, `bidsappaa`, `mfcsc`, `mritools`.
+`aidamri`, `ashs`, `mfcsc`, `mritools`, `pydeface`.
 
-Thirty-eight suites mention missing output fragments, missing expected output,
-or similar post-command assertion failures:
+Representative examples:
 
-`ashs`, `batchheudiconv`, `bidsappaa`, `bidsappbaracus`,
-`bidsapphcppipelines`, `bidsappspm`, `bidscoin`, `brainager`,
-`brainnetviewer`, `cat12`, `code`, `deepretinotopy`, `diffusiontoolkit`,
-`eeglab`, `fsl`, `gigaconnectome`, `glmsingle`, `globus`, `halfpipe`,
-`lashis`, `lcmodel`, `linda`, `matlab`, `minc`,
-`networkcorrespondancetoolkit`, `nftsim`, `nibabies`, `niistat`, `oshyx`,
-`ospreybids`, `qmrlab`, `qsmxt`, `qupath`, `rabies`, `samsrfx`,
-`sigviewer`, `spm12`, `vesselapp`.
+- `ashs`: many recipe paths point at `/../ashs-fastashs_beta/...` and fail
+  with `No such file or directory`.
+- `aidamri`: Nipype cannot find FSL commands such as `bet`, `flirt`, and
+  `mcflirt` from inside its Python interfaces.
+- `mfcsc` and `mritools`: expected input/test files are not present.
+- `pydeface`: default template and facemask checks fail with missing paths.
 
-Root cause: this bucket mixes genuine command failures with recipe assertions
-that still expect files, paths, or output text from a different execution
-environment. The earlier bash-wrapper and deploy-metadata work reduced this
-class, but current logs show more recipe-level cleanup is still needed.
+### Missing Output / Environment Assertions
 
-### Exec Permission / Architecture Helper Issue
+Thirty-nine completed suites have missing output fragments or missing expected
+environment text:
 
-Two suites contain `exit code 126`:
+`ashs`, `batchheudiconv`, `bidsapphcppipelines`, `bidsappspm`, `bidscoin`,
+`brainager`, `brainnetviewer`, `brainstorm`, `deepretinotopy`, `dicompare`,
+`diffusiontoolkit`, `eeglab`, `fastsurfer`, `freesurfer`, `fsl`,
+`gigaconnectome`, `globus`, `halfpipe`, `lashis`, `lcmodel`, `lesymap`,
+`linda`, `matlab`, `minc`, `mricron`, `networkcorrespondancetoolkit`,
+`nftsim`, `nibabies`, `niistat`, `oshyx`, `ospreybids`, `qmrlab`, `qsmxt`,
+`rabies`, `rstudio`, `samsrfx`, `sigviewer`, `spm12`, `vesselapp`.
 
-`bidsappbaracus`, `conn`.
+This remains the broadest category. It mixes real tool failures with recipe
+assertions that still expect different install paths, environment variables,
+or output banners.
 
-`bidsappbaracus` includes an architecture/helper failure:
+### Image / Import / Harness Failures
 
-```text
-/run/ccx3/qemu-x86_64: stat /run/ccx3/qemu-x86_64: no such file or directory
-/proc/sys/fs/binfmt_misc/status: open /proc/sys/fs/binfmt_misc/status: no such file or directory
-```
+Three completed suites failed outside ordinary recipe assertion failures:
 
-Root cause: at least one recipe or command path assumes a QEMU/binfmt setup
-inside the guest that is not present in the current CI runtime. This needs a
-minimal local repro before deciding whether the fix belongs in cc, the test
-recipe, or the image metadata.
-
-### Harness / Image Import Failures
-
-Two suites failed before normal test execution could complete:
-
-- `fieldtrip`: the fulltest loader raises `KeyError: 'command'` while reading
-  a test item. Root cause: the recipe contains at least one item without a
-  `command` field, and the harness currently reports this as a Python exception
-  instead of a clear recipe validation error.
 - `spinalcordtoolbox`: image import fails with `RuntimeError: index simg: EOF`
-  for `spinalcordtoolbox_7.2_20251211.simg`. Root cause is likely a truncated,
-  corrupt, or otherwise unsupported `.simg` image. The next check is to
-  redownload that exact file locally, verify size/checksum, and inspect it with
-  `apptainer sif list` or equivalent.
+  for the downloaded `.simg`; this still looks like a corrupt, truncated, or
+  unsupported image.
+- `topaz`: the download-resolution Python snippet fails before writing
+  `topaz-download.log` with `IndexError: list index out of range`; the upload
+  step then also fails because no artifact files exist.
+- `sigviewer`: logs include a `binfmt_misc` / helper availability signature,
+  indicating an architecture/helper assumption in the runtime or recipe.
+
+The previous `fieldtrip` harness failure is fixed in this snapshot; `fieldtrip`
+now passes.
+
+## Failed Completed Suites
+
+The following 82 completed suites failed:
+
+`aidamri`, `ants`, `ashs`, `aslprep`, `batchheudiconv`, `bidsappaa`,
+`bidsappbaracus`, `bidsapphcppipelines`, `bidsappmrtrix3connectome`,
+`bidsappspm`, `bidscoin`, `brainager`, `brainnetviewer`, `brainstorm`,
+`cat12`, `code`, `connectomeworkbench`, `dcm2bids`, `deepretinotopy`,
+`dicompare`, `diffusiontoolkit`, `dsistudio`, `eeglab`, `ezbids`,
+`fastsurfer`, `fmriprep`, `freesurfer`, `fsl`, `gigaconnectome`, `gimp`,
+`glmsingle`, `globus`, `halfpipe`, `hdbet`, `ilastik`, `itksnap`, `lashis`,
+`laynii`, `lcmodel`, `lesymap`, `linda`, `matlab`, `mfcsc`, `mgltools`,
+`micapipe`, `minc`, `mricron`, `mriqc`, `mritools`, `mrsiproc`,
+`mrtrix3tissue`, `networkcorrespondancetoolkit`, `neurodock`, `nftsim`,
+`nibabies`, `niistat`, `oshyx`, `osprey`, `ospreybids`, `palm`, `physio`,
+`pydeface`, `qmrlab`, `qsiprep`, `qsirecon`, `qsmxt`, `rabies`, `romeo`,
+`root`, `rstudio`, `samsrfx`, `sigviewer`, `slicer`, `sovabids`,
+`spinalcordtoolbox`, `spm12`, `topaz`, `trackvis`, `tractseg`, `vesselapp`,
+`vesselboost`, `vina`.
 
 ## Best Next Fixes
 
-1. Root-cause the VM boot/API timeout bucket with a small local reproduction.
-   Good candidates are `fastsurfer`, `lesymap`, or `brainstorm` because they
-   fail before producing long recipe-level noise. Capture server logs around
-   `/vm`, VM lifetime, and any guest exit.
-2. Fix or improve diagnostics for `fieldtrip`. This is a small harness/schema
-   issue and should be easy to confirm locally without a long container run.
-3. Validate the unavailable `.simg` URLs. This can be separated from runtime
-   work by checking generated URLs and object availability directly.
-4. Investigate `spinalcordtoolbox_7.2_20251211.simg` as a possible corrupt or
-   unsupported image. If the image is bad, classify it with the download/image
-   publication failures.
-5. Continue deploy metadata and recipe path cleanup for the command-resolution
-   and `exit code 127` buckets. Use minimal command reproductions and the
-   recipe `deploy_path`/`deploy_bins` metadata to identify exact fixes.
+1. Investigate the common command-timeout path with one heavy representative
+   suite, such as `ants`, `ilastik`, or `root`, and capture guest/server logs
+   around command execution.
+2. Fix command resolution by checking deploy metadata and shell hook PATH
+   construction for `deepretinotopy`, `freesurfer`, `minc`, `rabies`, and
+   `sovabids`.
+3. Fix the `topaz` selector/download-resolution edge case so it reports a
+   clear missing-container error and always uploads logs.
+4. Recheck `spinalcordtoolbox_7.2_20251211.simg` by validating the downloaded
+   object size/checksum and inspecting it with an external SIF/SIMG tool.
+5. Let the six unfinished suites complete or be cancelled, then refresh this
+   document once their artifacts are available.

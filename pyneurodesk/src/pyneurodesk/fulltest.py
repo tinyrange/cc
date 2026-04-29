@@ -40,6 +40,7 @@ class RequiredDataset:
 @dataclass(frozen=True)
 class SuiteScript:
     script: str = ""
+    host_script: str = ""
 
 
 @dataclass(frozen=True)
@@ -58,6 +59,7 @@ class TestCase:
 class Suite:
     name: str
     container: str
+    env_setup: str
     required_files: tuple[RequiredDataset, ...]
     test_data: dict[str, str]
     setup: SuiteScript
@@ -157,10 +159,21 @@ class FullTestRunner:
             shell_session.image = reference.image
             print(f"[fulltest] shell hooks ready image={reference.image}{memory_text}{cpu_text}", flush=True)
 
+            if suite.setup.host_script.strip():
+                print("[fulltest] host setup", flush=True)
+                output, exit_code = run_host_script(
+                    suite.setup.host_script,
+                    work_dir,
+                    host_vars,
+                    timeout_for(120, suite.default_timeout),
+                )
+                if exit_code != 0:
+                    raise RuntimeError(f"host setup failed with exit code {exit_code}: {output}")
+
             if suite.setup.script.strip():
                 print("[fulltest] setup", flush=True)
                 output, exit_code = shell_session.run(
-                    substitute_variables(suite.setup.script, guest_vars),
+                    apply_env_setup(substitute_variables(suite.setup.script, guest_vars), suite.env_setup),
                     timeout_for(120, suite.default_timeout),
                 )
                 if exit_code != 0:
@@ -179,7 +192,7 @@ class FullTestRunner:
                 exit_code = -1
                 try:
                     output, exit_code = shell_session.run(
-                        substitute_variables(test.command, guest_vars),
+                        apply_env_setup(substitute_variables(test.command, guest_vars), suite.env_setup),
                         timeout_for(test.timeout, suite.default_timeout),
                     )
                     message = validate_test(output, exit_code, test, host_vars)
@@ -221,7 +234,19 @@ class FullTestRunner:
                 try:
                     print("[fulltest] cleanup", flush=True)
                     shell_session.run(
-                        substitute_variables(suite.cleanup.script, guest_vars),
+                        apply_env_setup(substitute_variables(suite.cleanup.script, guest_vars), suite.env_setup),
+                        timeout_for(60, suite.default_timeout),
+                    )
+                except Exception:
+                    pass
+
+            if suite.cleanup.host_script.strip():
+                try:
+                    print("[fulltest] host cleanup", flush=True)
+                    run_host_script(
+                        suite.cleanup.host_script,
+                        work_dir,
+                        host_vars,
                         timeout_for(60, suite.default_timeout),
                     )
                 except Exception:
@@ -280,6 +305,7 @@ def load_suite(path: Path) -> Suite:
     return Suite(
         name=str(payload.get("name") or path.stem),
         container=str(payload["container"]),
+        env_setup=str(payload.get("env_setup") or ""),
         required_files=tuple(
             RequiredDataset(
                 dataset=str(entry["dataset"]),
@@ -288,10 +314,19 @@ def load_suite(path: Path) -> Suite:
             for entry in payload.get("required_files", [])
         ),
         test_data={str(key): str(value) for key, value in (payload.get("test_data") or {}).items()},
-        setup=SuiteScript(script=str((payload.get("setup") or {}).get("script", ""))),
-        cleanup=SuiteScript(script=str((payload.get("cleanup") or {}).get("script", ""))),
+        setup=load_suite_script(payload.get("setup")),
+        cleanup=load_suite_script(payload.get("cleanup")),
         tests=tuple(tests),
         default_timeout=int(payload.get("default_timeout") or payload.get("default_timout") or 0),
+    )
+
+
+def load_suite_script(value: Any) -> SuiteScript:
+    if not isinstance(value, dict):
+        return SuiteScript()
+    return SuiteScript(
+        script=str(value.get("script") or ""),
+        host_script=str(value.get("host_script") or ""),
     )
 
 
@@ -396,6 +431,16 @@ def substitute_variables(text: str, variables: dict[str, str]) -> str:
         result = result.replace("${" + key + "}", variables[key])
         result = result.replace("$" + key, variables[key])
     return result
+
+
+def apply_env_setup(command: str, env_setup: str) -> str:
+    setup = env_setup.strip()
+    if not setup:
+        return command
+    command = command.strip("\n")
+    if not command:
+        return setup
+    return setup + "\n" + command
 
 
 def prepare_required_files(http: httpx.Client, work_dir: Path, required: tuple[RequiredDataset, ...]) -> None:
@@ -534,6 +579,20 @@ def timeout_expired_output(exc: subprocess.TimeoutExpired) -> str:
     return "".join(parts)
 
 
+def run_host_script(
+    script: str,
+    work_dir: Path,
+    variables: dict[str, str],
+    timeout_seconds: float,
+) -> tuple[str, int]:
+    return run_shell(
+        os.environ.copy(),
+        work_dir,
+        substitute_variables(script, variables),
+        timeout_seconds,
+    )
+
+
 @dataclass
 class ActivatedShellSession:
     work_dir: Path
@@ -544,8 +603,10 @@ class ActivatedShellSession:
 
     def run(self, command: str, timeout_seconds: float) -> tuple[str, int]:
         guest_command = guest_shell_command(command)
-        if self.image and guest_command:
-            return self.run_direct_guest(guest_command, timeout_seconds)
+        if self.image:
+            if guest_command:
+                return self.run_direct_guest(guest_command, timeout_seconds)
+            return self.run_guest_script(command, timeout_seconds)
         return run_shell(
             self.env,
             self.work_dir,
@@ -554,13 +615,16 @@ class ActivatedShellSession:
         )
 
     def run_direct_guest(self, command: list[str], timeout_seconds: float) -> tuple[str, int]:
-        words = ["neurodesk", "shell", "exec", str(self.image), "--", *command]
+        words = [resolve_neurodesk_command(), "shell", "exec", str(self.image), "--", *command]
         return run_shell(
             self.env,
             self.work_dir,
             "source " + shlex.quote(str(self.activation_script)) + "\n" + " ".join(shlex.quote(word) for word in words),
             timeout_seconds,
         )
+
+    def run_guest_script(self, command: str, timeout_seconds: float) -> tuple[str, int]:
+        return self.run_direct_guest(["bash", "-lc", command], timeout_seconds)
 
     def close(self) -> None:
         try:
@@ -595,6 +659,10 @@ def activate_shell_session(
     if exit_code == 0 and root_output.strip():
         session.root = Path(root_output.strip())
     return session
+
+
+def resolve_neurodesk_command() -> str:
+    return shutil.which("neurodesk") or "neurodesk"
 
 
 def load_command(reference: ContainerReference, suite: Suite, options: Options) -> str:
