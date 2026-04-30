@@ -549,6 +549,30 @@ def test_run_wrapper_invokes_container_command(
     ]
 
 
+def test_shell_command_with_runtime_env_exports_into_login_shell() -> None:
+    command = shell.shell_command_with_runtime_env(
+        ["bash", "-lc", "command -v vina"],
+        [
+            "DEPLOY_PATH=/opt/vina",
+            "PATH=/opt/vina:/usr/bin:/bin",
+            "INVALID-NAME=skip",
+        ],
+    )
+
+    assert command == [
+        "bash",
+        "-lc",
+        "export DEPLOY_PATH=/opt/vina\nexport PATH=/opt/vina:/usr/bin:/bin\ncommand -v vina",
+    ]
+
+
+def test_shell_command_with_runtime_env_leaves_direct_command_unchanged() -> None:
+    assert shell.shell_command_with_runtime_env(
+        ["vina", "--version"],
+        ["PATH=/opt/vina:/usr/bin:/bin"],
+    ) == ["vina", "--version"]
+
+
 def test_run_wrapper_stream_preserves_stdout_stderr_and_binary_data(
     monkeypatch,
     capsysbinary: pytest.CaptureFixture[bytes],
@@ -621,7 +645,7 @@ def test_run_wrapper_uses_session_reference_when_present(
             root=session_root,
             images={
                 "fulltest-image": {
-                    "deploy_env": ["DEPLOY_ENV_PATH=/opt/tool"],
+                    "deploy_env": ["DEPLOY_ENV_PATH=/opt/base", "DEPLOY_PATH=/opt/tool:/opt/base"],
                     "reference": shell.container_reference_to_payload(reference),
                 }
             },
@@ -694,8 +718,9 @@ def test_run_wrapper_uses_session_reference_when_present(
             "fulltest-image",
             ("niimath", "-help"),
             (
-                "DEPLOY_ENV_PATH=/opt/tool",
-                "PATH=/opt/tool",
+                "DEPLOY_ENV_PATH=/opt/base",
+                "DEPLOY_PATH=/opt/tool:/opt/base",
+                "PATH=/opt/tool:/opt/base",
                 "NUMBA_CACHE_DIR=/tmp/numba-cache",
                 "HOME=/root",
                 "XDG_CACHE_HOME=/root/.cache",

@@ -319,11 +319,12 @@ def run_image_command(image: str, command_name: str, args: list[str], *, deploy_
         env = list(runtime_deploy_env_entries(env))
         shares, workdir = implicit_runtime_mounts()
         env.extend(runtime_env_overrides())
+        command = shell_command_with_runtime_env([command_name, *args], env)
         if hasattr(handle._client, "run_stream"):
             exit_code = 0
             for event in handle._client.run_stream(
                 handle.reference.image,
-                [command_name, *args],
+                command,
                 env=env,
                 shares=shares,
                 workdir=workdir,
@@ -336,13 +337,55 @@ def run_image_command(image: str, command_name: str, args: list[str], *, deploy_
                 elif kind == "error":
                     raise RuntimeError(str(event.get("error", "streamed command failed")))
             return exit_code
-        result = handle._client.run(handle.reference.image, [command_name, *args], env=env, shares=shares, workdir=workdir)
+        result = handle._client.run(handle.reference.image, command, env=env, shares=shares, workdir=workdir)
     finally:
         handle.close()
     if result.output:
         sys.stdout.write(result.output)
         sys.stdout.flush()
     return int(result.exit_code)
+
+
+def shell_command_with_runtime_env(command: list[str], env: list[str]) -> list[str]:
+    if len(command) < 3:
+        return command
+    shell_name = Path(command[0]).name
+    if shell_name not in {"bash", "sh"}:
+        return command
+    command_index = shell_command_string_index(command)
+    if command_index is None:
+        return command
+    exports = runtime_shell_exports(env)
+    if not exports:
+        return command
+    updated = list(command)
+    updated[command_index] = "\n".join([*exports, updated[command_index]])
+    return updated
+
+
+def shell_command_string_index(command: list[str]) -> Optional[int]:
+    for index, arg in enumerate(command[1:], start=1):
+        if not arg.startswith("-"):
+            continue
+        if "c" not in arg:
+            continue
+        next_index = index + 1
+        if next_index < len(command):
+            return next_index
+        return None
+    return None
+
+
+def runtime_shell_exports(env: list[str]) -> list[str]:
+    exports: list[str] = []
+    for entry in env:
+        if "=" not in entry:
+            continue
+        key, value = entry.split("=", 1)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            continue
+        exports.append(f"export {key}={shlex.quote(value)}")
+    return exports
 
 
 def write_exec_stream_event(event: dict[str, object]) -> None:
