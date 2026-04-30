@@ -786,10 +786,6 @@ def runtime_deploy_env_entries(entries: tuple[str, ...] | list[str]) -> tuple[st
         key, value = entry.split("=", 1)
         if key.startswith("DEPLOY_ENV_") and len(key) > len("DEPLOY_ENV_"):
             runtime_entries.append(f"{key.removeprefix('DEPLOY_ENV_')}={value}")
-    merged = merge_env_entries(runtime_entries)
-    deploy_path = tuple(part for part in env_value(merged, "DEPLOY_PATH").split(":") if part)
-    if deploy_path:
-        runtime_entries.append("PATH=" + prepend_path_env(merged, deploy_path))
     return merge_env_entries(runtime_entries)
 
 

@@ -30,7 +30,6 @@ from pyneurodesk.api import (
     path_join,
     resolve_ccvm_binary_path,
     resolve_release_index_dir,
-    runtime_deploy_env_entries,
     start_default_daemon,
 )
 from pyneurodesk.models import DaemonState
@@ -807,31 +806,6 @@ def test_load_deploy_metadata_uses_local_image_env_and_deploy_bins() -> None:
         "PATH=/opt/tool:/usr/local/bin:/usr/bin:/bin",
         "DEPLOY_PATH=/opt/tool",
         "DEPLOY_BINS=tool:tool-helper:/bad/path",
-    )
-
-
-def test_runtime_deploy_env_entries_prepends_deploy_path_to_path() -> None:
-    assert runtime_deploy_env_entries(
-        (
-            "PATH=/usr/local/bin:/usr/bin:/bin",
-            "DEPLOY_PATH=/opt/tool:/opt/helper",
-        )
-    ) == (
-        "PATH=/opt/tool:/opt/helper:/usr/local/bin:/usr/bin:/bin",
-        "DEPLOY_PATH=/opt/tool:/opt/helper",
-    )
-
-
-def test_runtime_deploy_env_entries_combines_deploy_env_path_and_deploy_path() -> None:
-    assert runtime_deploy_env_entries(
-        (
-            "DEPLOY_ENV_PATH=/opt/base",
-            "DEPLOY_PATH=/opt/tool:/opt/base",
-        )
-    ) == (
-        "DEPLOY_ENV_PATH=/opt/base",
-        "DEPLOY_PATH=/opt/tool:/opt/base",
-        "PATH=/opt/tool:/opt/base",
     )
 
 

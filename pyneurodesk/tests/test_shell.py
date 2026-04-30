@@ -645,7 +645,7 @@ def test_run_wrapper_uses_session_reference_when_present(
             root=session_root,
             images={
                 "fulltest-image": {
-                    "deploy_env": ["DEPLOY_ENV_PATH=/opt/base", "DEPLOY_PATH=/opt/tool:/opt/base"],
+                    "deploy_env": ["PATH=/opt/tool:/opt/base"],
                     "reference": shell.container_reference_to_payload(reference),
                 }
             },
@@ -718,8 +718,6 @@ def test_run_wrapper_uses_session_reference_when_present(
             "fulltest-image",
             ("niimath", "-help"),
             (
-                "DEPLOY_ENV_PATH=/opt/base",
-                "DEPLOY_PATH=/opt/tool:/opt/base",
                 "PATH=/opt/tool:/opt/base",
                 "NUMBA_CACHE_DIR=/tmp/numba-cache",
                 "HOME=/root",
