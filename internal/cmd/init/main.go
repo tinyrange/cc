@@ -768,6 +768,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = env
+	cmd.WaitDelay = 2 * time.Second
 	var rootMounts []string
 	if rootDir != "" {
 		preparedRoot, mounts, err := prepareExecRoot(rootDir)
@@ -976,6 +977,11 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	writeExecTiming(control, id, "streams_done", execStart)
 
 	exitCode := 0
+	if waitErr != nil {
+		if errors.Is(waitErr, exec.ErrWaitDelay) {
+			waitErr = nil
+		}
+	}
 	if waitErr != nil {
 		var exitErr *exec.ExitError
 		if errors.As(waitErr, &exitErr) {

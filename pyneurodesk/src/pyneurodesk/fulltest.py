@@ -28,7 +28,7 @@ from . import shell as shell_hooks
 
 DEFAULT_OPENNEURO_BASE = "https://s3.amazonaws.com/openneuro.org"
 FULLTEST_EXTRA_MESSAGE = "pyneurodesk fulltest dependencies are not installed; install pyneurodesk[fulltest]"
-DEFAULT_FULLTEST_MEMORY_MB = 8192
+DEFAULT_FULLTEST_MEMORY_MB = 12288
 
 
 @dataclass(frozen=True)
@@ -173,7 +173,11 @@ class FullTestRunner:
             if suite.setup.script.strip():
                 print("[fulltest] setup", flush=True)
                 output, exit_code = shell_session.run(
-                    apply_env_setup(substitute_variables(suite.setup.script, guest_vars), suite.env_setup),
+                    apply_env_setup(
+                        substitute_variables(suite.setup.script, guest_vars),
+                        suite.env_setup,
+                        include_fulltest_defaults=True,
+                    ),
                     timeout_for(120, suite.default_timeout),
                 )
                 if exit_code != 0:
@@ -192,7 +196,11 @@ class FullTestRunner:
                 exit_code = -1
                 try:
                     output, exit_code = shell_session.run(
-                        apply_env_setup(substitute_variables(test.command, guest_vars), suite.env_setup),
+                        apply_env_setup(
+                            substitute_variables(test.command, guest_vars),
+                            suite.env_setup,
+                            include_fulltest_defaults=True,
+                        ),
                         timeout_for(test.timeout, suite.default_timeout),
                     )
                     message = validate_test(output, exit_code, test, host_vars)
@@ -234,7 +242,11 @@ class FullTestRunner:
                 try:
                     print("[fulltest] cleanup", flush=True)
                     shell_session.run(
-                        apply_env_setup(substitute_variables(suite.cleanup.script, guest_vars), suite.env_setup),
+                        apply_env_setup(
+                            substitute_variables(suite.cleanup.script, guest_vars),
+                            suite.env_setup,
+                            include_fulltest_defaults=True,
+                        ),
                         timeout_for(60, suite.default_timeout),
                     )
                 except Exception:
@@ -433,14 +445,32 @@ def substitute_variables(text: str, variables: dict[str, str]) -> str:
     return result
 
 
-def apply_env_setup(command: str, env_setup: str) -> str:
-    setup = env_setup.strip()
+def apply_env_setup(command: str, env_setup: str, *, include_fulltest_defaults: bool = False) -> str:
+    setup_parts: list[str] = []
+    if include_fulltest_defaults:
+        setup_parts.append(default_fulltest_env_setup())
+    if env_setup.strip():
+        setup_parts.append(env_setup.strip())
+    setup = "\n".join(part for part in setup_parts if part)
     if not setup:
         return command
     command = command.strip("\n")
     if not command:
         return setup
     return setup + "\n" + command
+
+
+def default_fulltest_env_setup() -> str:
+    return "\n".join(
+        [
+            'export MPLBACKEND="${MPLBACKEND:-agg}"',
+            'export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"',
+            'export NO_AT_BRIDGE="${NO_AT_BRIDGE:-1}"',
+            'export MCR_CACHE_ROOT="${MCR_CACHE_ROOT:-/tmp/pyneurodesk-mcr-cache}"',
+            'export MATLAB_PREFDIR="${MATLAB_PREFDIR:-/tmp/pyneurodesk-matlab-prefdir}"',
+            'mkdir -p "$MCR_CACHE_ROOT" "$MATLAB_PREFDIR" 2>/dev/null || true',
+        ]
+    )
 
 
 def prepare_required_files(http: httpx.Client, work_dir: Path, required: tuple[RequiredDataset, ...]) -> None:

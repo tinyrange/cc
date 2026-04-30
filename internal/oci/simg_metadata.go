@@ -24,7 +24,9 @@ func extractSIMGDeployMetadata(root imagefs.Directory) simgDeployMetadata {
 	for _, name := range singularityEnvFiles(root) {
 		envTexts = append(envTexts, readImageText(root, name))
 	}
-	return extractDeployMetadataTexts(envTexts, readImageText(root, "/build.yaml"))
+	meta := extractDeployMetadataTexts(envTexts, readImageText(root, "/build.yaml"))
+	meta.Env = applySIMGProfileEnv(root, meta.Env, envTexts)
+	return meta
 }
 
 func extractDeployMetadataTexts(envTexts []string, buildYAML string) simgDeployMetadata {
@@ -87,6 +89,73 @@ func readImageText(root imagefs.Directory, guestPath string) string {
 		return ""
 	}
 	return string(data)
+}
+
+func applySIMGProfileEnv(root imagefs.Directory, env []string, envTexts []string) []string {
+	if !singularityEnvSourcesMicromamba(envTexts) {
+		return env
+	}
+	rootPrefix := findMicromambaRoot(root, env)
+	if rootPrefix == "" {
+		return env
+	}
+	updates := []string{}
+	if envValue(env, "MAMBA_ROOT_PREFIX") == "" {
+		updates = append(updates, "MAMBA_ROOT_PREFIX="+rootPrefix)
+	}
+	if envValue(env, "CONDA_PREFIX") == "" {
+		updates = append(updates, "CONDA_PREFIX="+rootPrefix)
+	}
+	env = mergeEnvEntries(env, updates)
+	return prependPathEnv(env, micromambaPathEntries(root, rootPrefix))
+}
+
+func singularityEnvSourcesMicromamba(envTexts []string) bool {
+	for _, text := range envTexts {
+		for _, rawLine := range strings.Split(text, "\n") {
+			line := strings.TrimSpace(rawLine)
+			if strings.HasPrefix(line, "#") {
+				continue
+			}
+			if strings.Contains(line, "micromamba.sh") || strings.Contains(line, "micromamba activate") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func findMicromambaRoot(root imagefs.Directory, env []string) string {
+	candidates := []string{
+		envValue(env, "MAMBA_ROOT_PREFIX"),
+		envValue(env, "CONDA_PREFIX"),
+	}
+	if xdgDataHome := envValue(env, "XDG_DATA_HOME"); xdgDataHome != "" {
+		candidates = append(candidates, strings.TrimRight(xdgDataHome, "/")+"/mamba")
+	}
+	candidates = append(candidates, "/opt/conda", "/opt/mamba")
+	for _, candidate := range dedupeNonEmpty(candidates) {
+		if imagePathIsDirectory(root, candidate+"/bin") {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func micromambaPathEntries(root imagefs.Directory, rootPrefix string) []string {
+	candidates := []string{rootPrefix + "/bin", rootPrefix + "/condabin"}
+	var out []string
+	for _, candidate := range candidates {
+		if imagePathIsDirectory(root, candidate) {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
+
+func imagePathIsDirectory(root imagefs.Directory, guestPath string) bool {
+	entry, err := imagefs.LookupPath(root, guestPath)
+	return err == nil && entry.Dir != nil
 }
 
 func parseSingularityEnvExports(text string) []string {

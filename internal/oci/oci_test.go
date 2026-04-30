@@ -209,6 +209,43 @@ export MAMBA_ROOT_PREFIX="/opt/conda"
 	}
 }
 
+func TestExtractSIMGDeployMetadataSourcesMicromambaStartup(t *testing.T) {
+	root := t.TempDir()
+	envDir := filepath.Join(root, ".singularity.d", "env")
+	if err := os.MkdirAll(envDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(env) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "opt", "tool", "share", "mamba", "bin"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(mamba/bin) error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "opt", "tool", "share", "mamba", "condabin"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(mamba/condabin) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(envDir, "10-docker2singularity.sh"), []byte(`
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export XDG_DATA_HOME="/opt/tool/share"
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(10-docker2singularity.sh) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(envDir, "99-micromamba-startup.sh"), []byte(`
+source /etc/profile.d/micromamba.sh
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile(99-micromamba-startup.sh) error = %v", err)
+	}
+
+	meta := extractSIMGDeployMetadata(imagefs.NewHostFS(root, nil))
+	env := strings.Join(meta.Env, "\n")
+	for _, want := range []string{
+		"MAMBA_ROOT_PREFIX=/opt/tool/share/mamba",
+		"CONDA_PREFIX=/opt/tool/share/mamba",
+		"PATH=/opt/tool/share/mamba/bin:/opt/tool/share/mamba/condabin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+	} {
+		if !strings.Contains(env, want) {
+			t.Fatalf("deploy env missing %q in:\n%s", want, env)
+		}
+	}
+}
+
 func TestExtractCVMFSDeployMetadataUsesSingularityEnv(t *testing.T) {
 	packedPath := filepath.Join(t.TempDir(), "rootfs.contents")
 	envData := []byte("export PATH=\"$PATH:/opt/palm-alpha119\"\n")

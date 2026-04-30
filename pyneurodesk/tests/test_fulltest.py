@@ -161,6 +161,14 @@ def test_apply_env_setup_prepends_setup_command() -> None:
         "conda activate tool\npython -c 'import tool'"
     )
     assert apply_env_setup("python -c 'import tool'", "") == "python -c 'import tool'"
+    fulltest_command = apply_env_setup(
+        "python -c 'import tool'",
+        "conda activate tool",
+        include_fulltest_defaults=True,
+    )
+    assert "export QT_QPA_PLATFORM=" in fulltest_command
+    assert "export MCR_CACHE_ROOT=" in fulltest_command
+    assert fulltest_command.endswith("conda activate tool\npython -c 'import tool'")
 
 
 def test_run_host_script_uses_work_dir_and_host_variables(tmp_path: Path) -> None:
@@ -373,7 +381,7 @@ def test_load_command_uses_nd_load_with_source_and_recipe_commands() -> None:
     assert "--cpus 2" in command
 
 
-def test_load_command_defaults_to_8gb_memory() -> None:
+def test_load_command_defaults_to_12gb_memory() -> None:
     suite = load_suite(FIXTURE_RECIPE)
     reference = build_container_reference(
         suite,
@@ -386,4 +394,4 @@ def test_load_command_defaults_to_8gb_memory() -> None:
 
     command = load_command(reference, suite, Options(recipe=default_recipe_path()))
 
-    assert "--memory-mb 8192" in command
+    assert "--memory-mb 12288" in command
