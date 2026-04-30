@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
 import pyneurodesk.fulltest as fulltest
@@ -163,7 +165,7 @@ def test_apply_env_setup_prepends_setup_command() -> None:
 
 def test_run_host_script_uses_work_dir_and_host_variables(tmp_path: Path) -> None:
     output, exit_code = fulltest.run_host_script(
-        "printf '%s' '${input}' > generated.txt",
+        "echo ${input}> generated.txt",
         tmp_path,
         {"input": "host-value"},
         10.0,
@@ -171,7 +173,7 @@ def test_run_host_script_uses_work_dir_and_host_variables(tmp_path: Path) -> Non
 
     assert output == ""
     assert exit_code == 0
-    assert (tmp_path / "generated.txt").read_text() == "host-value"
+    assert (tmp_path / "generated.txt").read_text().strip() == "host-value"
 
 
 def test_build_container_reference_defaults_to_cvmfs_directory() -> None:
@@ -243,11 +245,12 @@ def test_load_timeout_respects_larger_suite_default(monkeypatch) -> None:
 
 
 def test_run_shell_reports_timeout_without_traceback(tmp_path: Path) -> None:
-    output, exit_code = fulltest.run_shell({}, tmp_path, "sleep 10", 0.01)
+    command = f'{sys.executable} -c "import time; time.sleep(10)"'
+    output, exit_code = fulltest.run_shell(os.environ.copy(), tmp_path, command, 0.01)
 
     assert exit_code == 124
     assert "command timed out after 0.0s" in output
-    assert "sleep 10" in output
+    assert command in output
 
 
 def test_image_cache_name_is_stable() -> None:

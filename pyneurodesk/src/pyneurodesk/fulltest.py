@@ -552,9 +552,12 @@ def run_shell(
     command: str,
     timeout_seconds: float,
 ) -> tuple[str, int]:
+    shell_command = ["bash", "-lc", command]
+    if os.name == "nt":
+        shell_command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", command]
     try:
         proc = subprocess.run(
-            ["bash", "-lc", command],
+            shell_command,
             cwd=work_dir,
             env=env,
             capture_output=True,
