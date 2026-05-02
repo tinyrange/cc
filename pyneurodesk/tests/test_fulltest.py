@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 import pyneurodesk.fulltest as fulltest
@@ -167,6 +168,7 @@ def test_apply_env_setup_prepends_setup_command() -> None:
         include_fulltest_defaults=True,
     )
     assert "export QT_QPA_PLATFORM=" in fulltest_command
+    assert "export KMP_AFFINITY=" in fulltest_command
     assert "export MCR_CACHE_ROOT=" in fulltest_command
     assert fulltest_command.endswith("conda activate tool\npython -c 'import tool'")
 
@@ -259,6 +261,21 @@ def test_run_shell_reports_timeout_without_traceback(tmp_path: Path) -> None:
     assert exit_code == 124
     assert "command timed out after 0.0s" in output
     assert command in output
+
+
+def test_run_shell_timeout_terminates_child_processes(tmp_path: Path) -> None:
+    marker = tmp_path / "child-finished"
+    command = (
+        f'{sys.executable} -c "import pathlib, time; '
+        f"time.sleep(5); pathlib.Path({str(marker)!r}).write_text('done')" + '" & wait'
+    )
+
+    output, exit_code = fulltest.run_shell(os.environ.copy(), tmp_path, command, 0.1)
+    time.sleep(0.2)
+
+    assert exit_code == 124
+    assert "command timed out" in output
+    assert not marker.exists()
 
 
 def test_image_cache_name_is_stable() -> None:

@@ -74,6 +74,7 @@ type managedExec struct {
 	stdin   io.WriteCloser
 	pty     *os.File
 	process *os.Process
+	group   bool
 	start   time.Time
 }
 
@@ -98,10 +99,11 @@ func (m *managedExec) closeStdin() error {
 	return err
 }
 
-func (m *managedExec) setProcess(proc *os.Process) {
+func (m *managedExec) setProcess(proc *os.Process, group bool) {
 	m.stdinMu.Lock()
 	defer m.stdinMu.Unlock()
 	m.process = proc
+	m.group = group
 }
 
 func (m *managedExec) setPTY(pty *os.File) {
@@ -119,6 +121,15 @@ func (m *managedExec) signal(name string) error {
 	defer m.stdinMu.Unlock()
 	if m.process == nil {
 		return fmt.Errorf("process is not started")
+	}
+	if m.group && m.process.Pid > 0 {
+		err := syscall.Kill(-m.process.Pid, sig)
+		if err == nil {
+			return nil
+		}
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
 	}
 	return m.process.Signal(sig)
 }
@@ -769,6 +780,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = env
 	cmd.WaitDelay = 2 * time.Second
+	signalGroup := true
 	var rootMounts []string
 	if rootDir != "" {
 		preparedRoot, mounts, err := prepareExecRoot(rootDir)
@@ -823,7 +835,6 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			Setsid:  true,
 			Setctty: true,
 			Ctty:    0,
-			Chroot:  rootDir,
 		}
 		streams := 1
 		if stdin != nil {
@@ -928,8 +939,11 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			}
 		}()
 	}
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
 	if rootDir != "" {
-		cmd.SysProcAttr = &syscall.SysProcAttr{Chroot: rootDir}
+		cmd.SysProcAttr.Chroot = rootDir
 	}
 
 	writeExecTiming(control, id, "start_call", execStart)
@@ -953,7 +967,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		return
 	}
 	writeExecTiming(control, id, "started", execStart)
-	managed.setProcess(cmd.Process)
+	managed.setProcess(cmd.Process, signalGroup)
 	if ptySlave != nil {
 		_ = ptySlave.Close()
 		ptySlave = nil

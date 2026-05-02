@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -466,6 +467,7 @@ def default_fulltest_env_setup() -> str:
             'export MPLBACKEND="${MPLBACKEND:-agg}"',
             'export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-offscreen}"',
             'export NO_AT_BRIDGE="${NO_AT_BRIDGE:-1}"',
+            'export KMP_AFFINITY="${KMP_AFFINITY:-disabled}"',
             'export MCR_CACHE_ROOT="${MCR_CACHE_ROOT:-/tmp/pyneurodesk-mcr-cache}"',
             'export MATLAB_PREFDIR="${MATLAB_PREFDIR:-/tmp/pyneurodesk-matlab-prefdir}"',
             'mkdir -p "$MCR_CACHE_ROOT" "$MATLAB_PREFDIR" 2>/dev/null || true',
@@ -585,21 +587,51 @@ def run_shell(
     shell_command = ["bash", "-lc", command]
     if os.name == "nt":
         shell_command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", command]
+        try:
+            proc = subprocess.run(
+                shell_command,
+                cwd=work_dir,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            output = timeout_expired_output(exc)
+            output += f"\n[fulltest] command timed out after {timeout_seconds:.1f}s: {command}\n"
+            return output, 124
+        return proc.stdout + proc.stderr, proc.returncode
+
+    proc = subprocess.Popen(
+        shell_command,
+        cwd=work_dir,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
     try:
-        proc = subprocess.run(
-            shell_command,
-            cwd=work_dir,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        output = timeout_expired_output(exc)
+        stdout, stderr = proc.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, stderr = proc.communicate(timeout=5.0)
+            output = stdout + stderr
+        except subprocess.TimeoutExpired as exc:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = proc.communicate()
+            output = timeout_expired_output(exc) or (stdout + stderr)
         output += f"\n[fulltest] command timed out after {timeout_seconds:.1f}s: {command}\n"
         return output, 124
-    return proc.stdout + proc.stderr, proc.returncode
+    return stdout + stderr, proc.returncode
 
 
 def timeout_expired_output(exc: subprocess.TimeoutExpired) -> str:

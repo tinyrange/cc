@@ -344,10 +344,17 @@ func (s *ManagedSession) streamExecEvents(ctx context.Context, start int, id str
 			continue
 		}
 		if ctx.Err() != nil {
+			s.terminateExec(id)
 			return ctx.Err()
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+}
+
+func (s *ManagedSession) terminateExec(id string) {
+	_ = s.sendExecInput(id, client.ExecInput{Kind: "signal", Signal: "TERM"})
+	time.Sleep(500 * time.Millisecond)
+	_ = s.sendExecInput(id, client.ExecInput{Kind: "signal", Signal: "KILL"})
 }
 
 func (s *ManagedSession) Wait() error {
