@@ -778,12 +778,18 @@ def merge_env_entries(entries: list[str]) -> tuple[str, ...]:
     return tuple(f"{key}={value}" for key, value in merged.items())
 
 
+INTERNAL_DEPLOY_ENV_KEYS = {"DEPLOY_PATH", "DEPLOY_BINS"}
+
+
 def runtime_deploy_env_entries(entries: tuple[str, ...] | list[str]) -> tuple[str, ...]:
-    runtime_entries = list(entries)
+    runtime_entries: list[str] = []
     for entry in entries:
         if "=" not in entry:
             continue
         key, value = entry.split("=", 1)
+        if key in INTERNAL_DEPLOY_ENV_KEYS:
+            continue
+        runtime_entries.append(entry)
         if key.startswith("DEPLOY_ENV_") and len(key) > len("DEPLOY_ENV_"):
             runtime_entries.append(f"{key.removeprefix('DEPLOY_ENV_')}={value}")
     return merge_env_entries(runtime_entries)

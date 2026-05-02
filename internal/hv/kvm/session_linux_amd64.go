@@ -204,6 +204,9 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 		return ok
 	})
 	if err != nil {
+		if ctx.Err() != nil {
+			s.terminateExec(id)
+		}
 		return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
 	code, output, ok := vmruntime.ExtractManagedExecResult(segment, id, s.dmesg)

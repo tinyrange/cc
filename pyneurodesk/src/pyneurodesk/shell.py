@@ -159,13 +159,15 @@ def handle_load(args: argparse.Namespace) -> int:
         raise SystemExit("image name is required")
 
     reference = reference_from_load_args(args)
+    memory_mb = int(args.memory_mb or 0) or None
+    cpus = int(args.cpus or 0) or None
     handle = load_shell_container(
         image,
         reference=reference,
         prefetch=bool(args.prefetch),
         prefetch_workers=int(args.prefetch_workers or 0) or None,
-        memory_mb=int(args.memory_mb or 0) or None,
-        cpus=int(args.cpus or 0) or None,
+        memory_mb=memory_mb,
+        cpus=cpus,
     )
     try:
         metadata = load_deploy_metadata(handle)
@@ -178,6 +180,14 @@ def handle_load(args: argparse.Namespace) -> int:
     image_record = dict(state.images.get(image, {}))
     image_record["commands"] = commands
     image_record["deploy_env"] = list(metadata.deploy_env)
+    if memory_mb is not None:
+        image_record["memory_mb"] = memory_mb
+    else:
+        image_record.pop("memory_mb", None)
+    if cpus is not None:
+        image_record["cpus"] = cpus
+    else:
+        image_record.pop("cpus", None)
     if reference is not None:
         image_record["reference"] = container_reference_to_payload(reference)
     state.images[image] = image_record
@@ -320,7 +330,7 @@ def run_image_command(image: str, command_name: str, args: list[str], *, deploy_
         shares, workdir = implicit_runtime_mounts()
         env.extend(runtime_env_overrides())
         command = shell_command_with_runtime_env([command_name, *args], env)
-        if hasattr(handle._client, "run_stream"):
+        if should_stream_exec() and hasattr(handle._client, "run_stream"):
             exit_code = 0
             for event in handle._client.run_stream(
                 handle.reference.image,
@@ -344,6 +354,10 @@ def run_image_command(image: str, command_name: str, args: list[str], *, deploy_
         sys.stdout.write(result.output)
         sys.stdout.flush()
     return int(result.exit_code)
+
+
+def should_stream_exec() -> bool:
+    return os.environ.get("PYNEURODESK_EXEC_STREAM", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def shell_command_with_runtime_env(command: list[str], env: list[str]) -> list[str]:
@@ -432,10 +446,24 @@ def shell_session_container(image: str):
     if reference is None:
         return container(image, progress=False)
 
+    image_record = session_image_record(image)
+    memory_mb = int(image_record.get("memory_mb") or 0) or None
+    cpus = int(image_record.get("cpus") or 0) or None
     active_client = connect()
     active_client.ensure_image(reference)
-    active_client.ensure_instance(reference.image)
+    active_client.ensure_instance(reference.image, memory_mb=memory_mb, cpus=cpus)
     return container_handle_for_reference(active_client, reference)
+
+
+def session_image_record(image: str) -> dict[str, object]:
+    try:
+        state = require_session_state()
+    except SystemExit:
+        return {}
+    image_record = state.images.get(image, {})
+    if not isinstance(image_record, dict):
+        return {}
+    return image_record
 
 
 def container_handle_for_reference(client, reference: ContainerReference):
@@ -520,6 +548,8 @@ def implicit_runtime_mounts() -> tuple[list[ShareMount], str]:
 
 
 def implicit_home_mount() -> Optional[ShareMount]:
+    if os.environ.get("PYNEURODESK_MOUNT_HOME", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return None
     home = Path(os.path.expanduser("~")).resolve()
     if not home.exists() or not home.is_dir():
         return None
@@ -531,22 +561,15 @@ def implicit_home_mount() -> Optional[ShareMount]:
 
 
 def runtime_env_overrides() -> list[str]:
-    overrides = [
+    return [
+        "HOME=/tmp",
+        "XDG_CACHE_HOME=/tmp",
         "NUMBA_CACHE_DIR=/tmp/numba-cache",
+        "APPTAINER_CACHEDIR=/tmp/.apptainer/cache",
+        "APPTAINER_CONFIGDIR=/tmp/.apptainer",
+        "SINGULARITY_CACHEDIR=/tmp/.apptainer/cache",
+        "SINGULARITY_CONFIGDIR=/tmp/.apptainer",
     ]
-    if implicit_home_mount() is None:
-        return overrides
-    overrides.extend(
-        [
-            "HOME=/root",
-            "XDG_CACHE_HOME=/root/.cache",
-            "APPTAINER_CACHEDIR=/root/.apptainer/cache",
-            "APPTAINER_CONFIGDIR=/root/.apptainer",
-            "SINGULARITY_CACHEDIR=/root/.apptainer/cache",
-            "SINGULARITY_CONFIGDIR=/root/.apptainer",
-        ]
-    )
-    return overrides
 
 
 def normalize_command_args(values: list[str]) -> list[str]:

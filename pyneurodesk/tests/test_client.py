@@ -26,6 +26,7 @@ from pyneurodesk.api import (
     create_progress_reporter,
     load_deploy_metadata,
     parse_top_level_deploy,
+    runtime_deploy_env_entries,
     default_daemon_state_path,
     path_join,
     resolve_ccvm_binary_path,
@@ -806,6 +807,21 @@ def test_load_deploy_metadata_uses_local_image_env_and_deploy_bins() -> None:
         "PATH=/opt/tool:/usr/local/bin:/usr/bin:/bin",
         "DEPLOY_PATH=/opt/tool",
         "DEPLOY_BINS=tool:tool-helper:/bad/path",
+    )
+
+
+def test_runtime_deploy_env_skips_internal_deploy_metadata() -> None:
+    assert runtime_deploy_env_entries(
+        [
+            "PATH=/opt/tool:/usr/bin:/bin",
+            "DEPLOY_PATH=/opt/tool",
+            "DEPLOY_BINS=tool:tool-helper",
+            "DEPLOY_ENV_CUSTOM=ok",
+        ]
+    ) == (
+        "PATH=/opt/tool:/usr/bin:/bin",
+        "DEPLOY_ENV_CUSTOM=ok",
+        "CUSTOM=ok",
     )
 
 

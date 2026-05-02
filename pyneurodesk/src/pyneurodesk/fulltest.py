@@ -30,6 +30,7 @@ from . import shell as shell_hooks
 DEFAULT_OPENNEURO_BASE = "https://s3.amazonaws.com/openneuro.org"
 FULLTEST_EXTRA_MESSAGE = "pyneurodesk fulltest dependencies are not installed; install pyneurodesk[fulltest]"
 DEFAULT_FULLTEST_MEMORY_MB = 12288
+DEFAULT_FULLTEST_CPUS = min(os.cpu_count() or 1, 8)
 
 
 @dataclass(frozen=True)
@@ -83,7 +84,7 @@ class Options:
     prefetch: bool = False
     prefetch_workers: Optional[int] = None
     memory_mb: Optional[int] = DEFAULT_FULLTEST_MEMORY_MB
-    cpus: Optional[int] = None
+    cpus: Optional[int] = DEFAULT_FULLTEST_CPUS
 
 
 @dataclass(frozen=True)
@@ -944,7 +945,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefetch", action="store_true")
     parser.add_argument("--prefetch-workers", type=int, default=4)
     parser.add_argument("--memory-mb", type=int, default=DEFAULT_FULLTEST_MEMORY_MB)
-    parser.add_argument("--cpus", type=int, default=0)
+    parser.add_argument("--cpus", type=int, default=DEFAULT_FULLTEST_CPUS)
     return parser
 
 

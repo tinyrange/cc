@@ -193,6 +193,64 @@ func TestManagedSessionExecStreamTerminatesGuestExecOnContextCancel(t *testing.T
 	}
 }
 
+func TestManagedSessionExecTerminatesGuestExecOnContextCancel(t *testing.T) {
+	transcript := vmruntime.NewSerialTranscript()
+	writes := make(chan vmruntime.ManagedExecRequest, 4)
+	conn := &fakeVsockConn{
+		writeFn: func(data []byte) (int, error) {
+			var req vmruntime.ManagedExecRequest
+			if err := json.Unmarshal(data, &req); err != nil {
+				t.Errorf("decode control write: %v", err)
+				return len(data), nil
+			}
+			writes <- req
+			return len(data), nil
+		},
+	}
+	session := &ManagedSession{
+		control:    conn,
+		transcript: transcript,
+		serialOut:  vmruntime.NewSerialTranscript(),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := session.Exec(ctx, client.ExecRequest{Command: []string{"sleep", "999"}})
+		errCh <- err
+	}()
+
+	var execID string
+	for deadline := time.After(time.Second); execID == ""; {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for exec request")
+		default:
+			for _, req := range drainExecRequests(writes) {
+				if req.Kind == "exec" {
+					execID = req.ID
+				}
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+
+	cancel()
+	if err := <-errCh; err == nil {
+		t.Fatal("Exec() error = nil, want context cancellation")
+	}
+	got := drainExecRequests(writes)
+	var signals []string
+	for _, req := range got {
+		if req.Kind == "signal" && req.ID == execID {
+			signals = append(signals, req.Signal)
+		}
+	}
+	if len(signals) != 2 || signals[0] != "TERM" || signals[1] != "KILL" {
+		t.Fatalf("signals after cancel = %#v, want TERM then KILL", signals)
+	}
+}
+
 func drainExecRequests(ch <-chan vmruntime.ManagedExecRequest) []vmruntime.ManagedExecRequest {
 	var out []vmruntime.ManagedExecRequest
 	for {
