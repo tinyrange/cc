@@ -208,6 +208,7 @@ func runManagedExecVMMulti(ctx context.Context, vm *VM, uart *serial.UART8250, f
 	defer cancel()
 	errCh := make(chan error, len(vm.vcpus))
 	var wg sync.WaitGroup
+	var exitMu sync.Mutex
 	for index := range vm.vcpus {
 		wg.Add(1)
 		go func(index int) {
@@ -222,7 +223,9 @@ func runManagedExecVMMulti(ctx context.Context, vm *VM, uart *serial.UART8250, f
 					reportRunErr(errCh, cancel, fmt.Errorf("run vcpu %d: %w", index, err))
 					return
 				}
+				exitMu.Lock()
 				err = handleManagedExit(vm, index, uart, fsdevs, vsock, rng, serialOut, exit)
+				exitMu.Unlock()
 				if err != nil {
 					reportRunErr(errCh, cancel, err)
 					return

@@ -34,6 +34,11 @@ type ManagedSession struct {
 	dmesg      bool
 }
 
+const (
+	execTerminateGrace = 500 * time.Millisecond
+	execKillWait       = 2 * time.Second
+)
+
 func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, cpus int, dmesg bool, fsdevs []*virtio.FS, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
 	backend := virtio.NewSimpleVsockBackend()
 	listener, err := backend.Listen(vmruntime.ControlPort)
@@ -205,7 +210,7 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 	})
 	if err != nil {
 		if ctx.Err() != nil {
-			s.terminateExec(id)
+			s.terminateExecAndWait(id, start)
 		}
 		return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
@@ -337,6 +342,7 @@ func (s *ManagedSession) streamExecEvents(ctx context.Context, start int, id str
 				}
 				if onEvent != nil {
 					if err := onEvent(event); err != nil {
+						s.terminateExecAndWait(id, start)
 						return err
 					}
 				}
@@ -347,17 +353,30 @@ func (s *ManagedSession) streamExecEvents(ctx context.Context, start int, id str
 			continue
 		}
 		if ctx.Err() != nil {
-			s.terminateExec(id)
+			s.terminateExecAndWait(id, start)
 			return ctx.Err()
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 }
 
-func (s *ManagedSession) terminateExec(id string) {
+func (s *ManagedSession) terminateExecAndWait(id string, start int) {
 	_ = s.sendExecInput(id, client.ExecInput{Kind: "signal", Signal: "TERM"})
-	time.Sleep(500 * time.Millisecond)
+	if s.waitForExecExit(id, start, execTerminateGrace) {
+		return
+	}
 	_ = s.sendExecInput(id, client.ExecInput{Kind: "signal", Signal: "KILL"})
+	_ = s.waitForExecExit(id, start, execKillWait)
+}
+
+func (s *ManagedSession) waitForExecExit(id string, start int, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	_, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+		_, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
+		return ok
+	})
+	return err == nil
 }
 
 func (s *ManagedSession) Wait() error {

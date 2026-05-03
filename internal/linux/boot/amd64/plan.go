@@ -171,6 +171,10 @@ func writeMPTable(memory []byte, memStart uint64, numCPUs int) error {
 	binary.LittleEndian.PutUint16(table[34:36], uint16(entryCount))
 	binary.LittleEndian.PutUint32(table[36:40], lapicAddr)
 	off := 44
+	cpuFeatureFlags := uint32(0x201)
+	if numCPUs > 1 {
+		cpuFeatureFlags |= 1 << 28
+	}
 	for cpu := 0; cpu < numCPUs; cpu++ {
 		table[off] = entryCPU
 		table[off+1] = byte(cpu)
@@ -180,7 +184,7 @@ func writeMPTable(memory []byte, memStart uint64, numCPUs int) error {
 			table[off+3] |= 2
 		}
 		binary.LittleEndian.PutUint32(table[off+4:off+8], 0x600)
-		binary.LittleEndian.PutUint32(table[off+8:off+12], 0x201)
+		binary.LittleEndian.PutUint32(table[off+8:off+12], cpuFeatureFlags)
 		off += 20
 	}
 	table[off] = entryBus

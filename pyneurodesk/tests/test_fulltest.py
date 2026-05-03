@@ -41,6 +41,11 @@ def test_load_suite_parses_niimath_recipe() -> None:
     assert suite.tests[1].expected_output_contains == ("Usage: niimath",)
 
 
+def test_default_fulltest_cpus_support_hpc_sized_cc_vms() -> None:
+    assert fulltest.DEFAULT_FULLTEST_CPUS <= 16
+    assert fulltest.build_parser().parse_args([]).cpus == fulltest.DEFAULT_FULLTEST_CPUS
+
+
 def test_load_suite_converts_matlab_script_tests(tmp_path: Path) -> None:
     recipe = tmp_path / "fulltest.yaml"
     recipe.write_text(

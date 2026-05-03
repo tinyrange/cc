@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"sync"
 	"testing"
@@ -147,6 +148,9 @@ func TestManagedSessionExecStreamTerminatesGuestExecOnContextCancel(t *testing.T
 				return len(data), nil
 			}
 			writes <- req
+			if req.Kind == "signal" && req.Signal == "KILL" {
+				transcript.Write([]byte(vmruntime.CommandExitMarkerPref + req.ID + ":137\n"))
+			}
 			return len(data), nil
 		},
 	}
@@ -193,6 +197,67 @@ func TestManagedSessionExecStreamTerminatesGuestExecOnContextCancel(t *testing.T
 	}
 }
 
+func TestManagedSessionExecStreamTerminatesGuestExecOnEventCallbackError(t *testing.T) {
+	transcript := vmruntime.NewSerialTranscript()
+	writes := make(chan vmruntime.ManagedExecRequest, 8)
+	conn := &fakeVsockConn{
+		writeFn: func(data []byte) (int, error) {
+			var req vmruntime.ManagedExecRequest
+			if err := json.Unmarshal(data, &req); err != nil {
+				t.Errorf("decode control write: %v", err)
+				return len(data), nil
+			}
+			writes <- req
+			switch req.Kind {
+			case "stdin_close":
+				transcript.Write([]byte(vmruntime.CommandBeginMarker + req.ID + "\n"))
+				transcript.Write([]byte(vmruntime.CommandOutputMarker + req.ID + ":" + base64.StdEncoding.EncodeToString([]byte("out")) + "\n"))
+			case "signal":
+				if req.Signal == "KILL" {
+					transcript.Write([]byte(vmruntime.CommandExitMarkerPref + req.ID + ":137\n"))
+				}
+			}
+			return len(data), nil
+		},
+	}
+	session := &ManagedSession{
+		control:    conn,
+		transcript: transcript,
+		serialOut:  vmruntime.NewSerialTranscript(),
+	}
+
+	callbackErr := errors.New("client stream closed")
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := session.ExecStream(ctx, client.ExecRequest{Command: []string{"sleep", "999"}}, nil, func(event client.ExecEvent) error {
+		if event.Kind == "stdout" {
+			return callbackErr
+		}
+		return nil
+	})
+	if !errors.Is(err, callbackErr) {
+		t.Fatalf("ExecStream() error = %v, want %v", err, callbackErr)
+	}
+
+	got := drainExecRequests(writes)
+	var execID string
+	for _, req := range got {
+		if req.Kind == "exec" {
+			execID = req.ID
+			break
+		}
+	}
+	var signals []string
+	for _, req := range got {
+		if req.Kind == "signal" && req.ID == execID {
+			signals = append(signals, req.Signal)
+		}
+	}
+	if len(signals) != 2 || signals[0] != "TERM" || signals[1] != "KILL" {
+		t.Fatalf("signals after callback error = %#v, want TERM then KILL", signals)
+	}
+}
+
 func TestManagedSessionExecTerminatesGuestExecOnContextCancel(t *testing.T) {
 	transcript := vmruntime.NewSerialTranscript()
 	writes := make(chan vmruntime.ManagedExecRequest, 4)
@@ -204,6 +269,9 @@ func TestManagedSessionExecTerminatesGuestExecOnContextCancel(t *testing.T) {
 				return len(data), nil
 			}
 			writes <- req
+			if req.Kind == "signal" && req.Signal == "KILL" {
+				transcript.Write([]byte(vmruntime.CommandExitMarkerPref + req.ID + ":137\n"))
+			}
 			return len(data), nil
 		},
 	}

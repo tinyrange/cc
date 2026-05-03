@@ -30,7 +30,7 @@ from . import shell as shell_hooks
 DEFAULT_OPENNEURO_BASE = "https://s3.amazonaws.com/openneuro.org"
 FULLTEST_EXTRA_MESSAGE = "pyneurodesk fulltest dependencies are not installed; install pyneurodesk[fulltest]"
 DEFAULT_FULLTEST_MEMORY_MB = 12288
-DEFAULT_FULLTEST_CPUS = min(os.cpu_count() or 1, 8)
+DEFAULT_FULLTEST_CPUS = min(os.cpu_count() or 1, 16)
 
 
 @dataclass(frozen=True)
