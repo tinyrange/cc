@@ -803,6 +803,7 @@ func serveRunWebSocket(ws *websocket.Conn, runner func(context.Context, client.E
 
 	go func() {
 		defer close(inputs)
+		defer cancel()
 		for {
 			var input client.ExecInput
 			if err := websocket.JSON.Receive(ws, &input); err != nil {

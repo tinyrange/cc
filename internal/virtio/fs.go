@@ -45,6 +45,9 @@ const (
 	fuseStatxOutSize    = 288
 	fuseDirentBaseSize  = 24
 	fuseWriteOutSize    = 8
+	fuseLKInSize        = 48
+	fuseLKOutSize       = 24
+	linuxFUnlck         = 2
 )
 
 const (
@@ -53,6 +56,7 @@ const (
 	fuseGetAttr    = 3
 	fuseSetAttr    = 4
 	fuseReadlink   = 5
+	fuseSymlink    = 6
 	fuseMknod      = 8
 	fuseMkdir      = 9
 	fuseUnlink     = 10
@@ -72,6 +76,9 @@ const (
 	fuseReadDir    = 28
 	fuseReleaseDir = 29
 	fuseFsyncDir   = 30
+	fuseGetLK      = 31
+	fuseSetLK      = 32
+	fuseSetLKW     = 33
 	fuseAccess     = 34
 	fuseCreate     = 35
 	fuseDestroy    = 38
@@ -174,6 +181,10 @@ type fsLseekBackend interface {
 
 type fsMkdirBackend interface {
 	Mkdir(parent uint64, name string, mode uint32) (nodeID uint64, attr FuseAttr, errno int32)
+}
+
+type fsSymlinkBackend interface {
+	Symlink(parent uint64, name string, target string) (nodeID uint64, attr FuseAttr, errno int32)
 }
 
 type fsRmDirBackend interface {
@@ -1114,6 +1125,23 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 			return reply(0, extra), nil
 		}
 		return nil, fmt.Errorf("virtio-fs missing mkdir backend for parent=%d name=%q", nodeID, name)
+	case fuseSymlink:
+		name, target, ok := readTwoCStringNames(req[fuseInHeaderSize:])
+		if !ok {
+			return nil, fmt.Errorf("virtio-fs SYMLINK malformed payload")
+		}
+		f.logPathf("symlink-parent", nodeID, fmt.Sprintf(" name=%q target=%q", name, target))
+		if be, ok := f.backend.(fsSymlinkBackend); ok {
+			childID, attr, errno := be.Symlink(nodeID, path.Clean(name), target)
+			if errno != 0 {
+				return reply(errno, nil), nil
+			}
+			extra := make([]byte, fuseEntryOutSize)
+			f.encodeFuseEntryOut(extra, childID)
+			encodeFuseAttr(extra[40:], attr)
+			return reply(0, extra), nil
+		}
+		return reply(-linuxENOSYS, nil), nil
 	case fuseUnlink:
 		name := readCStringName(req[fuseInHeaderSize:])
 		if be, ok := f.backend.(fsUnlinkBackend); ok {
@@ -1237,6 +1265,23 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		if f.Strict {
 			return nil, fmt.Errorf("virtio-fs missing fsyncdir backend for FSYNCDIR node=%d fh=%d", nodeID, fh)
 		}
+		return reply(0, nil), nil
+	case fuseGetLK:
+		if len(req) < fuseInHeaderSize+fuseLKInSize {
+			return nil, fmt.Errorf("virtio-fs GETLK too short")
+		}
+		fh := binary.LittleEndian.Uint64(req[40:48])
+		f.logPathf("getlk", nodeID, fmt.Sprintf(" fh=%d", fh))
+		extra := make([]byte, fuseLKOutSize)
+		binary.LittleEndian.PutUint32(extra[16:20], linuxFUnlck)
+		return reply(0, extra), nil
+	case fuseSetLK, fuseSetLKW:
+		if len(req) < fuseInHeaderSize+fuseLKInSize {
+			return nil, fmt.Errorf("virtio-fs %s too short", fuseOpcodeName(opcode))
+		}
+		fh := binary.LittleEndian.Uint64(req[40:48])
+		lockType := binary.LittleEndian.Uint32(req[72:76])
+		f.logPathf(strings.ToLower(fuseOpcodeName(opcode)), nodeID, fmt.Sprintf(" fh=%d type=%d", fh, lockType))
 		return reply(0, nil), nil
 	case fuseRmDir:
 		name := readCStringName(req[fuseInHeaderSize:])
@@ -1437,6 +1482,8 @@ func fuseOpcodeName(opcode uint32) string {
 		return "SETATTR"
 	case fuseReadlink:
 		return "READLINK"
+	case fuseSymlink:
+		return "SYMLINK"
 	case fuseMknod:
 		return "MKNOD"
 	case fuseMkdir:
@@ -1475,6 +1522,12 @@ func fuseOpcodeName(opcode uint32) string {
 		return "RELEASEDIR"
 	case fuseFsyncDir:
 		return "FSYNCDIR"
+	case fuseGetLK:
+		return "GETLK"
+	case fuseSetLK:
+		return "SETLK"
+	case fuseSetLKW:
+		return "SETLKW"
 	case fuseAccess:
 		return "ACCESS"
 	case fuseCreate:
@@ -1970,6 +2023,19 @@ func readCStringName(buf []byte) string {
 	return string(buf)
 }
 
+func readTwoCStringNames(buf []byte) (string, string, bool) {
+	firstEnd := bytesIndexByte(buf, 0)
+	if firstEnd < 0 {
+		return "", "", false
+	}
+	second := buf[firstEnd+1:]
+	secondEnd := bytesIndexByte(second, 0)
+	if secondEnd < 0 {
+		return "", "", false
+	}
+	return string(buf[:firstEnd]), string(second[:secondEnd]), true
+}
+
 func cleanChildName(name string) (string, bool) {
 	if name == "" {
 		return "", false
@@ -2179,6 +2245,28 @@ func (p *passthroughFS) Mkdir(parent uint64, name string, mode uint32) (uint64, 
 		}
 		p.mu.Unlock()
 	}
+	nodeID := p.ensureNode(guestPath)
+	return nodeID, p.fileAttr(nodeID, info), 0
+}
+
+func (p *passthroughFS) Symlink(parent uint64, name string, target string) (uint64, FuseAttr, int32) {
+	hostParent, guestParent, errno := p.hostAndGuestPath(parent)
+	if errno != 0 {
+		return 0, FuseAttr{}, errno
+	}
+	rel, ok := cleanChildName(name)
+	if !ok {
+		return 0, FuseAttr{}, -linuxEINVAL
+	}
+	host := filepath.Join(hostParent, filepath.FromSlash(rel))
+	if err := os.Symlink(target, host); err != nil {
+		return 0, FuseAttr{}, errnoFromError(err)
+	}
+	info, err := os.Lstat(host)
+	if err != nil {
+		return 0, FuseAttr{}, errnoFromError(err)
+	}
+	guestPath := joinGuestChild(guestParent, rel)
 	nodeID := p.ensureNode(guestPath)
 	return nodeID, p.fileAttr(nodeID, info), 0
 }

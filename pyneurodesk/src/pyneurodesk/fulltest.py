@@ -31,6 +31,7 @@ DEFAULT_OPENNEURO_BASE = "https://s3.amazonaws.com/openneuro.org"
 FULLTEST_EXTRA_MESSAGE = "pyneurodesk fulltest dependencies are not installed; install pyneurodesk[fulltest]"
 DEFAULT_FULLTEST_MEMORY_MB = 12288
 DEFAULT_FULLTEST_CPUS = min(os.cpu_count() or 1, 16)
+DEFAULT_MAX_CONSECUTIVE_TIMEOUTS = 3
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,7 @@ class Options:
     prefetch_workers: Optional[int] = None
     memory_mb: Optional[int] = DEFAULT_FULLTEST_MEMORY_MB
     cpus: Optional[int] = DEFAULT_FULLTEST_CPUS
+    max_consecutive_timeouts: int = DEFAULT_MAX_CONSECUTIVE_TIMEOUTS
 
 
 @dataclass(frozen=True)
@@ -135,6 +137,7 @@ class FullTestRunner:
         host_vars = build_host_vars(work_dir, suite.test_data)
         results: list[TestResult] = []
         failed: set[str] = set()
+        consecutive_timeouts = 0
         keep_vm = options.keep_vm
         selected_tests = [
             test
@@ -217,6 +220,18 @@ class FullTestRunner:
                             )
                         )
                         print(f"[fulltest] failed {test.name} ({duration:.2f}s): {message}", flush=True)
+                        if is_timeout_result(output, exit_code):
+                            consecutive_timeouts += 1
+                            if should_abort_after_timeouts(options.max_consecutive_timeouts, consecutive_timeouts):
+                                skip_remaining_after_timeout_abort(
+                                    results,
+                                    failed,
+                                    selected_tests[index:],
+                                    options.max_consecutive_timeouts,
+                                )
+                                break
+                        else:
+                            consecutive_timeouts = 0
                         continue
                     duration = time.perf_counter() - start
                     results.append(
@@ -228,8 +243,10 @@ class FullTestRunner:
                         )
                     )
                     print(f"[fulltest] passed {test.name} ({duration:.2f}s)", flush=True)
+                    consecutive_timeouts = 0
                 except Exception as exc:
                     failed.add(test.name)
+                    consecutive_timeouts = 0
                     duration = time.perf_counter() - start
                     results.append(
                         TestResult(
@@ -569,6 +586,28 @@ def timeout_for(test_timeout: int, default_timeout: int) -> float:
     if default_timeout > 0:
         return float(default_timeout)
     return 120.0
+
+
+def is_timeout_result(output: str, exit_code: int) -> bool:
+    return exit_code == 124 and "[fulltest] command timed out after" in output
+
+
+def should_abort_after_timeouts(max_consecutive_timeouts: int, consecutive_timeouts: int) -> bool:
+    return max_consecutive_timeouts > 0 and consecutive_timeouts >= max_consecutive_timeouts
+
+
+def skip_remaining_after_timeout_abort(
+    results: list[TestResult],
+    failed: set[str],
+    remaining: list[TestCase],
+    max_consecutive_timeouts: int,
+) -> None:
+    message = f"aborted after {max_consecutive_timeouts} consecutive command timeouts"
+    print(f"[fulltest] {message}", flush=True)
+    for test in remaining:
+        results.append(TestResult(name=test.name, skipped=True, message=message))
+        failed.add(test.name)
+        print(f"[fulltest] skipped {test.name}: {message}", flush=True)
 
 
 def load_timeout_for(default_timeout: int) -> float:
@@ -946,6 +985,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefetch-workers", type=int, default=4)
     parser.add_argument("--memory-mb", type=int, default=DEFAULT_FULLTEST_MEMORY_MB)
     parser.add_argument("--cpus", type=int, default=DEFAULT_FULLTEST_CPUS)
+    parser.add_argument(
+        "--max-consecutive-timeouts",
+        type=int,
+        default=DEFAULT_MAX_CONSECUTIVE_TIMEOUTS,
+        help="Abort the suite after this many consecutive command timeouts; use 0 to disable.",
+    )
     return parser
 
 
@@ -977,6 +1022,7 @@ def main() -> None:
                 prefetch_workers=(int(args.prefetch_workers or 0) or None) if args.prefetch else None,
                 memory_mb=args.memory_mb or None,
                 cpus=args.cpus or None,
+                max_consecutive_timeouts=max(0, int(args.max_consecutive_timeouts)),
             )
         )
     finally:

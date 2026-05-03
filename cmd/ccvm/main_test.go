@@ -304,6 +304,54 @@ func TestServeRunWebSocket(t *testing.T) {
 	}
 }
 
+func TestServeRunWebSocketCancelsRunnerOnClientDisconnect(t *testing.T) {
+	cancelled := make(chan struct{}, 1)
+	runnerDone := make(chan struct{}, 1)
+	ts := httptest.NewServer(websocket.Server{
+		Handshake: func(*websocket.Config, *http.Request) error { return nil },
+		Handler: func(ws *websocket.Conn) {
+			serveRunWebSocket(ws, func(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+				_ = req
+				_ = inputs
+				_ = onEvent
+				defer func() { runnerDone <- struct{}{} }()
+				select {
+				case <-ctx.Done():
+					cancelled <- struct{}{}
+					return ctx.Err()
+				case <-time.After(time.Second):
+					t.Error("runner context was not cancelled")
+					return nil
+				}
+			})
+		},
+	})
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http")
+	ws, err := websocket.Dial(wsURL, "", ts.URL)
+	if err != nil {
+		t.Fatalf("websocket.Dial() error = %v", err)
+	}
+	if err := websocket.JSON.Send(ws, client.ExecRequest{Command: []string{"sleep", "1000"}}); err != nil {
+		t.Fatalf("JSON.Send(req) error = %v", err)
+	}
+	if err := ws.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("runner context was not cancelled after client disconnect")
+	}
+	select {
+	case <-runnerDone:
+	case <-time.After(time.Second):
+		t.Fatal("runner did not return after client disconnect")
+	}
+}
+
 func TestPullImageRequestAcceptsStructuredSource(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/image/niimath", strings.NewReader(`{
 		"source": {

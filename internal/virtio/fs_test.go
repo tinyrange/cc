@@ -92,6 +92,90 @@ func TestStrictFUSEFsyncUsesBackendHandle(t *testing.T) {
 	}
 }
 
+func TestStrictFUSESymlinkCreatesHostSymlink(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	backend := NewPassthroughFS(root, nil)
+	fsdev := NewFS(0, 0, 0, "root", backend)
+	fsdev.Strict = true
+
+	const unique = uint64(45)
+	payload := []byte("linked.txt\x00target.txt\x00")
+	req := make([]byte, fuseInHeaderSize+len(payload))
+	binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
+	binary.LittleEndian.PutUint32(req[4:8], fuseSymlink)
+	binary.LittleEndian.PutUint64(req[8:16], unique)
+	binary.LittleEndian.PutUint64(req[16:24], 1)
+	copy(req[fuseInHeaderSize:], payload)
+
+	reply, err := fsdev.dispatchFUSELocked(req)
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(SYMLINK) error = %v", err)
+	}
+	if got := int32(binary.LittleEndian.Uint32(reply[4:8])); got != 0 {
+		t.Fatalf("SYMLINK errno = %d, want 0", got)
+	}
+	if got := binary.LittleEndian.Uint64(reply[8:16]); got != unique {
+		t.Fatalf("SYMLINK unique = %d, want %d", got, unique)
+	}
+	target, err := os.Readlink(filepath.Join(root, "linked.txt"))
+	if err != nil {
+		t.Fatalf("Readlink() error = %v", err)
+	}
+	if target != "target.txt" {
+		t.Fatalf("Readlink() = %q, want target.txt", target)
+	}
+}
+
+func TestStrictFUSESetLKAndGetLK(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	backend := NewPassthroughFS(root, nil)
+	be := backend.(*passthroughFS)
+	nodeID, fh, _, errno := be.Create(1, "locked.sqlite", linuxORDWR|linuxOCREAT, 0o644)
+	if errno != 0 {
+		t.Fatalf("Create() errno = %d", errno)
+	}
+	defer be.Release(nodeID, fh)
+
+	fsdev := NewFS(0, 0, 0, "root", backend)
+	fsdev.Strict = true
+
+	setReq := make([]byte, fuseInHeaderSize+fuseLKInSize)
+	binary.LittleEndian.PutUint32(setReq[0:4], uint32(len(setReq)))
+	binary.LittleEndian.PutUint32(setReq[4:8], fuseSetLK)
+	binary.LittleEndian.PutUint64(setReq[8:16], 46)
+	binary.LittleEndian.PutUint64(setReq[16:24], nodeID)
+	binary.LittleEndian.PutUint64(setReq[40:48], fh)
+	binary.LittleEndian.PutUint32(setReq[72:76], 1)
+	reply, err := fsdev.dispatchFUSELocked(setReq)
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(SETLK) error = %v", err)
+	}
+	if got := int32(binary.LittleEndian.Uint32(reply[4:8])); got != 0 {
+		t.Fatalf("SETLK errno = %d, want 0", got)
+	}
+
+	getReq := make([]byte, fuseInHeaderSize+fuseLKInSize)
+	binary.LittleEndian.PutUint32(getReq[0:4], uint32(len(getReq)))
+	binary.LittleEndian.PutUint32(getReq[4:8], fuseGetLK)
+	binary.LittleEndian.PutUint64(getReq[8:16], 47)
+	binary.LittleEndian.PutUint64(getReq[16:24], nodeID)
+	binary.LittleEndian.PutUint64(getReq[40:48], fh)
+	reply, err = fsdev.dispatchFUSELocked(getReq)
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(GETLK) error = %v", err)
+	}
+	if got := int32(binary.LittleEndian.Uint32(reply[4:8])); got != 0 {
+		t.Fatalf("GETLK errno = %d, want 0", got)
+	}
+	if got := binary.LittleEndian.Uint32(reply[fuseOutHeaderSize+16 : fuseOutHeaderSize+20]); got != linuxFUnlck {
+		t.Fatalf("GETLK type = %d, want F_UNLCK", got)
+	}
+}
+
 func TestFSAsyncQueueCompletesLongResponseChain(t *testing.T) {
 	mem := &testGuestMemory{data: make([]byte, 0x8000)}
 	irq := &testIRQController{}

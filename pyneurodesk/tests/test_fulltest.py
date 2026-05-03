@@ -15,11 +15,14 @@ from pyneurodesk.fulltest import (
     guest_shell_command,
     image_cache_name,
     infer_shell_hook_commands,
+    is_timeout_result,
     load_command,
     load_timeout_for,
     load_suite,
     Options,
     apply_env_setup,
+    should_abort_after_timeouts,
+    skip_remaining_after_timeout_abort,
     substitute_variables,
     timeout_for,
     validate_test,
@@ -245,6 +248,36 @@ def test_timeout_for_prefers_test_timeout_then_default() -> None:
     assert timeout_for(45, 90) == 45.0
     assert timeout_for(0, 90) == 90.0
     assert timeout_for(0, 0) == 120.0
+
+
+def test_timeout_result_requires_timeout_marker_and_exit_124() -> None:
+    assert is_timeout_result("[fulltest] command timed out after 120.0s: tool", 124)
+    assert not is_timeout_result("exit code 124 from tool", 124)
+    assert not is_timeout_result("[fulltest] command timed out after 120.0s: tool", 1)
+
+
+def test_consecutive_timeout_abort_can_be_disabled() -> None:
+    assert should_abort_after_timeouts(3, 3)
+    assert not should_abort_after_timeouts(3, 2)
+    assert not should_abort_after_timeouts(0, 99)
+
+
+def test_skip_remaining_after_timeout_abort_marks_tests_skipped(capsys) -> None:
+    results: list[fulltest.TestResult] = []
+    failed: set[str] = set()
+    remaining = [
+        fulltest.TestCase(name="later one", command="one"),
+        fulltest.TestCase(name="later two", command="two"),
+    ]
+
+    skip_remaining_after_timeout_abort(results, failed, remaining, 3)
+
+    assert [item.name for item in results] == ["later one", "later two"]
+    assert all(item.skipped for item in results)
+    assert {item.message for item in results} == {"aborted after 3 consecutive command timeouts"}
+    assert failed == {"later one", "later two"}
+    out = capsys.readouterr().out
+    assert "[fulltest] aborted after 3 consecutive command timeouts" in out
 
 
 def test_load_timeout_respects_configured_boot_timeout(monkeypatch) -> None:
