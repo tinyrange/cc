@@ -307,8 +307,15 @@ def test_run_shell_timeout_terminates_child_processes(tmp_path: Path) -> None:
     marker = tmp_path / "child-finished"
     child_code = f"import pathlib, time; time.sleep(5); pathlib.Path({str(marker)!r}).write_text('done')"
     if os.name == "nt":
-        parent_code = f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {child_code!r}]); time.sleep(5)"
-        command = subprocess.list2cmdline([sys.executable, "-c", parent_code])
+        child_script = tmp_path / "child.py"
+        child_script.write_text(child_code)
+        parent_script = tmp_path / "parent.py"
+        parent_script.write_text(
+            "import subprocess, sys, time\n"
+            f"subprocess.Popen([sys.executable, {str(child_script)!r}])\n"
+            "time.sleep(5)\n"
+        )
+        command = subprocess.list2cmdline([sys.executable, str(parent_script)])
     else:
         command = f'{shlex.quote(sys.executable)} -c {shlex.quote(child_code)} & wait'
 
