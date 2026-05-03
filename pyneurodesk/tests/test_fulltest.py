@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import shlex
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -303,10 +305,12 @@ def test_run_shell_reports_timeout_without_traceback(tmp_path: Path) -> None:
 
 def test_run_shell_timeout_terminates_child_processes(tmp_path: Path) -> None:
     marker = tmp_path / "child-finished"
-    command = (
-        f'{sys.executable} -c "import pathlib, time; '
-        f"time.sleep(5); pathlib.Path({str(marker)!r}).write_text('done')" + '" & wait'
-    )
+    child_code = f"import pathlib, time; time.sleep(5); pathlib.Path({str(marker)!r}).write_text('done')"
+    if os.name == "nt":
+        parent_code = f"import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', {child_code!r}]); time.sleep(5)"
+        command = subprocess.list2cmdline([sys.executable, "-c", parent_code])
+    else:
+        command = f'{shlex.quote(sys.executable)} -c {shlex.quote(child_code)} & wait'
 
     output, exit_code = fulltest.run_shell(os.environ.copy(), tmp_path, command, 0.1)
     time.sleep(0.2)

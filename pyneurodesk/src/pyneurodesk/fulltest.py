@@ -627,21 +627,34 @@ def run_shell(
     shell_command = ["bash", "-lc", command]
     if os.name == "nt":
         shell_command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", command]
+        proc = subprocess.Popen(
+            shell_command,
+            cwd=work_dir,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+        )
         try:
-            proc = subprocess.run(
-                shell_command,
-                cwd=work_dir,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
+            stdout, stderr = proc.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 check=False,
             )
-        except subprocess.TimeoutExpired as exc:
-            output = timeout_expired_output(exc)
+            try:
+                stdout, stderr = proc.communicate(timeout=5.0)
+                output = stdout + stderr
+            except subprocess.TimeoutExpired as exc:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+                output = timeout_expired_output(exc) or (stdout + stderr)
             output += f"\n[fulltest] command timed out after {timeout_seconds:.1f}s: {command}\n"
             return output, 124
-        return proc.stdout + proc.stderr, proc.returncode
+        return stdout + stderr, proc.returncode
 
     proc = subprocess.Popen(
         shell_command,
