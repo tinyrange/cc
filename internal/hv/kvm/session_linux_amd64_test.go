@@ -53,6 +53,7 @@ func TestManagedSessionExecStreamForwardsInputsAndStreamsEvents(t *testing.T) {
 	var events []client.ExecEvent
 	err := session.ExecStream(ctx, client.ExecRequest{
 		Command: []string{"/bin/sh"},
+		User:    "1001:1002",
 		TTY:     true,
 		Cols:    100,
 		Rows:    30,
@@ -69,7 +70,7 @@ func TestManagedSessionExecStreamForwardsInputsAndStreamsEvents(t *testing.T) {
 		t.Fatalf("control write count = %d, want 5: %#v", len(got), got)
 	}
 	execID := got[0].ID
-	if got[0].Kind != "exec" || !got[0].TTY || got[0].Cols != 100 || got[0].Rows != 30 {
+	if got[0].Kind != "exec" || got[0].User != "1001:1002" || !got[0].TTY || got[0].Cols != 100 || got[0].Rows != 30 {
 		t.Fatalf("exec request = %#v", got[0])
 	}
 	if got[1].Kind != "stdin" || got[1].ID != execID || string(got[1].Stdin) != "hello\n" {

@@ -13,6 +13,8 @@ type GuestInitConfig struct {
 	Command          []string         `json:"command"`
 	Env              []string         `json:"env"`
 	WorkDir          string           `json:"workdir"`
+	User             string           `json:"user,omitempty"`
+	Hostname         string           `json:"hostname,omitempty"`
 	Modules          []string         `json:"modules,omitempty"`
 	EmulatorTag      string           `json:"emulator_tag,omitempty"`
 	RootFSTag        string           `json:"rootfs_tag,omitempty"`
@@ -77,6 +79,14 @@ func WithDefaultEnv(env []string) []string {
 		out = append(out, "HOME=/root")
 	}
 	return out
+}
+
+func DefaultHostname(hostname string) string {
+	hostname = strings.TrimSpace(hostname)
+	if hostname == "" || hostname == "(none)" {
+		return "ccx3"
+	}
+	return hostname
 }
 
 func ModulePaths(modules []alpine.Module) []string {

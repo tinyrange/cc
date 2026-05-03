@@ -36,6 +36,8 @@ type config struct {
 	Command          []string `json:"command"`
 	Env              []string `json:"env"`
 	WorkDir          string   `json:"workdir"`
+	User             string   `json:"user,omitempty"`
+	Hostname         string   `json:"hostname,omitempty"`
 	Modules          []string `json:"modules"`
 	EmulatorTag      string   `json:"emulator_tag,omitempty"`
 	RootFSTag        string   `json:"rootfs_tag"`
@@ -62,6 +64,7 @@ type execRequest struct {
 	Env     []string `json:"env,omitempty"`
 	RootDir string   `json:"root_dir,omitempty"`
 	WorkDir string   `json:"workdir,omitempty"`
+	User    string   `json:"user,omitempty"`
 	Stdin   []byte   `json:"stdin,omitempty"`
 	TTY     bool     `json:"tty,omitempty"`
 	Signal  string   `json:"signal,omitempty"`
@@ -183,6 +186,9 @@ func run() error {
 	if cfg.WorkDir == "" {
 		cfg.WorkDir = "/"
 	}
+	if cfg.Hostname == "" || cfg.Hostname == "(none)" {
+		cfg.Hostname = "ccx3"
+	}
 
 	_ = syscall.Mount("proc", "/proc", "proc", 0, "")
 	_ = syscall.Mount("sysfs", "/sys", "sysfs", 0, "")
@@ -198,6 +204,9 @@ func run() error {
 			return err
 		}
 		writeStage(bootStart, "rootfs mounted")
+		if err := configureHostname(cfg.Hostname); err != nil {
+			return fmt.Errorf("configure hostname: %w", err)
+		}
 		if cfg.PrecopyAMD64Root {
 			writeStage(bootStart, "precopying amd64 root")
 			if err := precopyAMD64Root(); err != nil {
@@ -612,7 +621,7 @@ func execCommand(cfg config) error {
 		writeKernel("ccx3-init: stat mode for " + cfg.Command[0] + " is " + fmt.Sprintf("%#o", info.Mode()&0o777))
 	}
 
-	exitCode, err := execCommandGo(cfg.Command, cfg.Env, cfg.WorkDir)
+	exitCode, err := execCommandGo(cfg.Command, cfg.Env, cfg.WorkDir, cfg.User)
 	if err != nil {
 		return fmt.Errorf("run %s: %w", cfg.Command[0], err)
 	}
@@ -626,7 +635,7 @@ func execCommand(cfg config) error {
 	}
 }
 
-func execCommandGo(argv []string, env []string, workDir string) (int, error) {
+func execCommandGo(argv []string, env []string, workDir string, user string) (int, error) {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Env = env
 	if workDir != "" {
@@ -636,6 +645,11 @@ func execCommandGo(argv []string, env []string, workDir string) (int, error) {
 	cmd.Stdin = console
 	cmd.Stdout = console
 	cmd.Stderr = console
+	if cred, err := credentialForUser(user); err != nil {
+		return 0, err
+	} else if cred != nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
+	}
 
 	err := cmd.Run()
 	if err == nil {
@@ -746,6 +760,10 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 		if len(env) == 0 {
 			env = cfg.Env
 		}
+		user := req.User
+		if user == "" {
+			user = cfg.User
+		}
 
 		stdinR, stdinW := io.Pipe()
 		managed := &managedExec{stdin: stdinW, start: time.Now()}
@@ -758,7 +776,7 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 			}
 		}
 
-		go runManagedExec(cfg, control, req.ID, req.Command, env, req.RootDir, workDir, stdinR, managed, req.TTY, req.Cols, req.Rows, func() {
+		go runManagedExec(cfg, control, req.ID, req.Command, env, req.RootDir, workDir, user, stdinR, managed, req.TTY, req.Cols, req.Rows, func() {
 			_ = managed.closeStdin()
 			activeMu.Lock()
 			delete(active, req.ID)
@@ -767,7 +785,7 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 	}
 }
 
-func runManagedExec(cfg config, control io.Writer, id string, argv []string, env []string, rootDir string, workDir string, stdin io.ReadCloser, managed *managedExec, tty bool, cols int, rows int, cleanup func()) {
+func runManagedExec(cfg config, control io.Writer, id string, argv []string, env []string, rootDir string, workDir string, user string, stdin io.ReadCloser, managed *managedExec, tty bool, cols int, rows int, cleanup func()) {
 	defer cleanup()
 	execStart := time.Now()
 	writeExecTiming(control, id, "recv", execStart)
@@ -942,6 +960,16 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	}
+	if cred, err := credentialForUser(user); err != nil {
+		writeKernel("ccx3-init: resolve user: " + err.Error())
+		writeExecStderr(cfg, control, id, "ccx3-init: resolve user: "+err.Error()+"\n")
+		if cfg.ExitMarkerPrefix != "" {
+			writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
+		}
+		return
+	} else if cred != nil {
+		cmd.SysProcAttr.Credential = cred
+	}
 	if rootDir != "" {
 		cmd.SysProcAttr.Chroot = rootDir
 	}
@@ -1010,6 +1038,66 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		writeExecTiming(control, id, "exit_sent", execStart)
 		writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":"+itoa(exitCode))
 	}
+}
+
+func configureHostname(hostname string) error {
+	hostname = strings.TrimSpace(hostname)
+	if hostname == "" || hostname == "(none)" {
+		hostname = "ccx3"
+	}
+	if err := syscall.Sethostname([]byte(hostname)); err != nil {
+		return fmt.Errorf("set hostname %q: %w", hostname, err)
+	}
+	if err := os.MkdirAll("/etc", 0o755); err != nil {
+		return fmt.Errorf("mkdir /etc: %w", err)
+	}
+	_ = os.WriteFile("/etc/hostname", []byte(hostname+"\n"), 0o644)
+	hosts := "127.0.0.1\tlocalhost " + hostname + "\n::1\tlocalhost ip6-localhost ip6-loopback " + hostname + "\n"
+	_ = os.WriteFile("/etc/hosts", []byte(hosts), 0o644)
+	return nil
+}
+
+func credentialForUser(user string) (*syscall.Credential, error) {
+	user = strings.TrimSpace(user)
+	if user == "" {
+		return nil, nil
+	}
+	if user == "root" || user == "0" || user == "0:0" {
+		return &syscall.Credential{Uid: 0, Gid: 0}, nil
+	}
+	uidPart, gidPart, hasGID := strings.Cut(user, ":")
+	if uidPart == "" {
+		return nil, fmt.Errorf("invalid user %q", user)
+	}
+	uid, err := parseUint32(uidPart)
+	if err != nil {
+		return nil, fmt.Errorf("invalid uid %q", uidPart)
+	}
+	gid := uid
+	if hasGID {
+		if gidPart == "" {
+			return nil, fmt.Errorf("invalid gid in user %q", user)
+		}
+		gid, err = parseUint32(gidPart)
+		if err != nil {
+			return nil, fmt.Errorf("invalid gid %q", gidPart)
+		}
+	}
+	return &syscall.Credential{Uid: uid, Gid: gid}, nil
+}
+
+func parseUint32(value string) (uint32, error) {
+	n := uint64(0)
+	for _, ch := range value {
+		if ch < '0' || ch > '9' {
+			return 0, fmt.Errorf("not numeric")
+		}
+		n = n*10 + uint64(ch-'0')
+		if n > uint64(^uint32(0)) {
+			return 0, fmt.Errorf("out of range")
+		}
+	}
+	return uint32(n), nil
 }
 
 func prepareExecRoot(rootDir string) (string, []string, error) {

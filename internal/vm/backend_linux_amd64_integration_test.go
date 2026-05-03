@@ -4,6 +4,7 @@ package vm
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -77,6 +78,46 @@ func TestRuntimeBackendRunCommand(t *testing.T) {
 	}
 	if strings.TrimSpace(resp.Output) != "linux-amd64-ok" {
 		t.Fatalf("backend.Run().Output = %q, want linux-amd64-ok", resp.Output)
+	}
+}
+
+func TestRuntimeBackendRunCommandDefaultsToHostUserAndResolvableHostname(t *testing.T) {
+	if os.Getenv("CCX3_KVM_BOOT") == "" {
+		t.Skip("set CCX3_KVM_BOOT=1 to run the linux amd64 KVM boot probe")
+	}
+	fixture := filepath.Join("..", "..", "fixtures", "alpine.simg")
+	if _, err := os.Stat(fixture); err != nil {
+		t.Skipf("local alpine fixture unavailable: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	root := t.TempDir()
+	kernel := alpine.NewManager(filepath.Join(root, "kernel"))
+	if err := kernel.Ensure(ctx); err != nil {
+		t.Fatalf("kernel.Ensure() error = %v", err)
+	}
+	store := oci.NewStore(filepath.Join(root, "images"))
+	if _, err := store.Pull(ctx, "alpine", fixture); err != nil {
+		t.Fatalf("store.Pull() error = %v", err)
+	}
+
+	backend := NewRuntimeBackend(kernel, store, filepath.Join(root, "guestinit"))
+	resp, err := backend.Run(ctx, client.RunRequest{
+		Image:    "alpine",
+		Command:  []string{"sh", "-c", "printf 'uid=%s gid=%s hostname=%s hosts=%s\\n' \"$(id -u)\" \"$(id -g)\" \"$(cat /etc/hostname)\" \"$(grep ccx3 /etc/hosts | wc -l)\""},
+		MemoryMB: 256,
+	})
+	if err != nil {
+		t.Fatalf("backend.Run() error = %v\noutput:\n%s", err, resp.Output)
+	}
+	if resp.ExitCode != 0 {
+		t.Fatalf("backend.Run().ExitCode = %d, want 0\noutput:\n%s", resp.ExitCode, resp.Output)
+	}
+	want := fmt.Sprintf("uid=%d gid=%d hostname=ccx3 hosts=2", os.Getuid(), os.Getgid())
+	if strings.TrimSpace(resp.Output) != want {
+		t.Fatalf("backend.Run().Output = %q, want %q", resp.Output, want)
 	}
 }
 

@@ -31,6 +31,8 @@ func enrichHostFileAttr(info os.FileInfo, attr *FuseAttr) {
 	attr.ATimeSec, attr.ATimeNsec = uint64(st.Atim.Sec), uint32(st.Atim.Nsec)
 	attr.MTimeSec, attr.MTimeNsec = uint64(st.Mtim.Sec), uint32(st.Mtim.Nsec)
 	attr.CTimeSec, attr.CTimeNsec = uint64(st.Ctim.Sec), uint32(st.Ctim.Nsec)
+	attr.UID = st.Uid
+	attr.GID = st.Gid
 }
 
 func mapHostError(err error) (int32, bool) {
