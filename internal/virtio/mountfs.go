@@ -396,7 +396,7 @@ func (m *mountedFS) Mkdir(parent uint64, name string, mode uint32) (uint64, Fuse
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
 	}
-	if mount == nil || !mount.writable {
+	if !isRootOrWritableMount(mount) {
 		return 0, FuseAttr{}, -linuxEROFS
 	}
 	mkdirBackend, ok := backend.(fsMkdirBackend)
@@ -429,7 +429,7 @@ func (m *mountedFS) Symlink(parent uint64, name string, target string) (uint64, 
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
 	}
-	if mount == nil || !mount.writable {
+	if !isRootOrWritableMount(mount) {
 		return 0, FuseAttr{}, -linuxEROFS
 	}
 	symlinkBackend, ok := backend.(fsSymlinkBackend)
@@ -458,7 +458,7 @@ func (m *mountedFS) RmDir(parent uint64, name string) int32 {
 	if errno != 0 {
 		return errno
 	}
-	if mount == nil || !mount.writable {
+	if !isRootOrWritableMount(mount) {
 		return -linuxEROFS
 	}
 	rmBackend, ok := backend.(fsRmDirBackend)
@@ -489,7 +489,7 @@ func (m *mountedFS) Create(parent uint64, name string, flags uint32, mode uint32
 	if errno != 0 {
 		return 0, 0, FuseAttr{}, errno
 	}
-	if mount == nil || !mount.writable {
+	if !isRootOrWritableMount(mount) {
 		return 0, 0, FuseAttr{}, -linuxEROFS
 	}
 	createBackend, ok := backend.(fsCreateBackend)
@@ -526,7 +526,7 @@ func (m *mountedFS) SetAttr(nodeID uint64, valid uint32, fh uint64, size uint64,
 	if errno != 0 {
 		return FuseAttr{}, errno
 	}
-	if mount == nil || !mount.writable {
+	if !isRootOrWritableMount(mount) {
 		return FuseAttr{}, -linuxEROFS
 	}
 	setAttrBackend, ok := backend.(fsSetAttrBackend)
@@ -562,7 +562,7 @@ func (m *mountedFS) Unlink(parent uint64, name string) int32 {
 	if errno != 0 {
 		return errno
 	}
-	if mount == nil || !mount.writable {
+	if !isRootOrWritableMount(mount) {
 		return -linuxEROFS
 	}
 	unlinkBackend, ok := backend.(fsUnlinkBackend)
@@ -595,7 +595,7 @@ func (m *mountedFS) Rename(parent uint64, name string, newParent uint64, newName
 	if errno != 0 {
 		return errno
 	}
-	if oldMount == nil || !oldMount.writable || newMount == nil || !newMount.writable || oldMount.path != newMount.path || oldBackend != newBackend {
+	if !sameWritableMount(oldMount, newMount) || oldBackend != newBackend {
 		return -linuxEXDEV
 	}
 	renameBackend, ok := oldBackend.(fsRenameBackend)
@@ -619,6 +619,17 @@ func (m *mountedFS) Flush(nodeID uint64, fh uint64, lockOwner uint64) int32 {
 		return 0
 	}
 	return flushBackend.Flush(handle.nodeID, handle.fh, lockOwner)
+}
+
+func isRootOrWritableMount(mount *shareMount) bool {
+	return mount == nil || mount.writable
+}
+
+func sameWritableMount(a, b *shareMount) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.writable && b.writable && a.path == b.path
 }
 
 func (m *mountedFS) Fsync(nodeID uint64, fh uint64, flags uint32) int32 {

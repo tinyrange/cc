@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"j5.nz/cc/internal/imagefs"
 )
 
 func TestMountedFSAddShareExposesFiles(t *testing.T) {
@@ -76,6 +78,46 @@ func TestMountedFSCreateUsesReturnedBackendNodeID(t *testing.T) {
 	}
 	if wrote, errno := backend.(fsWriteBackend).Write(nodeID, fh, 0, []byte("ok"), 0); errno != 0 || wrote != 2 {
 		t.Fatalf("Write() = (%d, %d), want (2, 0)", wrote, errno)
+	}
+}
+
+func TestMountedFSAllowsEphemeralRootImageWrites(t *testing.T) {
+	t.Parallel()
+
+	overlay := imagefs.NewOverlay(nil)
+	if err := overlay.AddDir("/opt/tool", 0o755); err != nil {
+		t.Fatalf("AddDir() error = %v", err)
+	}
+	backend := NewMountedFS(NewImageFS(overlay.Root(), ""), nil)
+
+	optID, _, errno := backendLookupPath(backend, "/opt/tool")
+	if errno != 0 {
+		t.Fatalf("backendLookupPath(/opt/tool) errno = %d", errno)
+	}
+	nodeID, fh, _, errno := backend.(fsCreateBackend).Create(optID, ".license", linuxOWRONLY|linuxOCREAT, 0o644)
+	if errno != 0 {
+		t.Fatalf("Create(.license) errno = %d", errno)
+	}
+	if wrote, errno := backend.(fsWriteBackend).Write(nodeID, fh, 0, []byte("license\n"), 0); errno != 0 || wrote != 8 {
+		t.Fatalf("Write() = (%d, %d), want (8, 0)", wrote, errno)
+	}
+	backend.Release(nodeID, fh)
+
+	nodeID, _, errno = backendLookupPath(backend, "/opt/tool/.license")
+	if errno != 0 {
+		t.Fatalf("backendLookupPath(.license) errno = %d", errno)
+	}
+	fh, errno = backend.Open(nodeID, linuxORDONLY)
+	if errno != 0 {
+		t.Fatalf("Open(.license) errno = %d", errno)
+	}
+	defer backend.Release(nodeID, fh)
+	data, errno := backend.Read(nodeID, fh, 0, 1<<20)
+	if errno != 0 {
+		t.Fatalf("Read(.license) errno = %d", errno)
+	}
+	if string(data) != "license\n" {
+		t.Fatalf("Read(.license) = %q, want %q", data, "license\n")
 	}
 }
 

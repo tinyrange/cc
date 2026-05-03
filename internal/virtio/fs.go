@@ -2105,6 +2105,7 @@ type imageNode struct {
 	gid           uint32
 	rdev          uint32
 	size          uint64
+	data          []byte
 	symlinkTarget string
 	entries       map[string]uint64
 	entriesDone   bool
@@ -2916,7 +2917,14 @@ func (p *imageFS) Read(nodeID uint64, fh uint64, off uint64, size uint32) ([]byt
 		return nil, -linuxEBADF
 	}
 	if node.abstractFile == nil {
-		return nil, -linuxEIO
+		end := off + uint64(size)
+		if off >= node.size || size == 0 {
+			return []byte{}, 0
+		}
+		if end > node.size {
+			end = node.size
+		}
+		return append([]byte(nil), node.data[off:end]...), 0
 	}
 	if handle.reader != nil {
 		buf := make([]byte, size)
@@ -3063,6 +3071,32 @@ func (p *imageFS) Mkdir(parent uint64, name string, mode uint32) (uint64, FuseAt
 	return node.id, p.attr(node), 0
 }
 
+func (p *imageFS) Symlink(parent uint64, name string, target string) (uint64, FuseAttr, int32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	parentNode := p.nodes[parent]
+	if parentNode == nil {
+		return 0, FuseAttr{}, -linuxENOENT
+	}
+	name = path.Base(path.Clean("/" + name))
+	if _, exists := parentNode.entries[name]; exists {
+		return 0, FuseAttr{}, -linuxEEXIST
+	}
+	node := &imageNode{
+		id:            p.nextNodeID,
+		parent:        parent,
+		name:          name,
+		mode:          fs.ModeSymlink | 0o777,
+		size:          uint64(len(target)),
+		symlinkTarget: target,
+		modTime:       time.Now(),
+	}
+	p.nextNodeID++
+	p.nodes[node.id] = node
+	parentNode.entries[name] = node.id
+	return node.id, p.attr(node), 0
+}
+
 func (p *imageFS) RmDir(parent uint64, name string) int32 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -3081,6 +3115,122 @@ func (p *imageFS) RmDir(parent uint64, name string) int32 {
 	}
 	if len(child.entries) != 0 {
 		return -linuxENOTEMPTY
+	}
+	delete(parentNode.entries, name)
+	delete(p.nodes, childID)
+	return 0
+}
+
+func (p *imageFS) Create(parent uint64, name string, _ uint32, mode uint32) (uint64, uint64, FuseAttr, int32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	parentNode := p.nodes[parent]
+	if parentNode == nil {
+		return 0, 0, FuseAttr{}, -linuxENOENT
+	}
+	name = path.Base(path.Clean("/" + name))
+	if _, exists := parentNode.entries[name]; exists {
+		return 0, 0, FuseAttr{}, -linuxEEXIST
+	}
+	node := &imageNode{
+		id:      p.nextNodeID,
+		parent:  parent,
+		name:    name,
+		mode:    fs.FileMode(mode & linuxPermMask),
+		modTime: time.Now(),
+	}
+	p.nextNodeID++
+	p.nodes[node.id] = node
+	parentNode.entries[name] = node.id
+	fh := p.nextHandle
+	p.nextHandle++
+	p.handles[fh] = &imageHandle{nodeID: node.id}
+	return node.id, fh, p.attr(node), 0
+}
+
+func (p *imageFS) Write(nodeID uint64, fh uint64, off uint64, data []byte, _ uint32) (uint32, int32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	handle := p.handles[fh]
+	node := p.nodes[nodeID]
+	if handle == nil || handle.nodeID != nodeID || node == nil {
+		return 0, -linuxEBADF
+	}
+	if node.abstractFile != nil || node.abstractDir != nil || node.abstractLink != nil {
+		return 0, -linuxEROFS
+	}
+	end := off + uint64(len(data))
+	if end > uint64(len(node.data)) {
+		grown := make([]byte, end)
+		copy(grown, node.data)
+		node.data = grown
+	}
+	copy(node.data[off:end], data)
+	if end > node.size {
+		node.size = end
+	}
+	node.modTime = time.Now()
+	return uint32(len(data)), 0
+}
+
+func (p *imageFS) SetAttr(nodeID uint64, valid uint32, _ uint64, size uint64, mode uint32, uid uint32, gid uint32, _ time.Time, mtime time.Time) (FuseAttr, int32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	node := p.nodes[nodeID]
+	if node == nil {
+		return FuseAttr{}, -linuxENOENT
+	}
+	if node.abstractFile != nil || node.abstractDir != nil || node.abstractLink != nil {
+		return FuseAttr{}, -linuxEROFS
+	}
+	if valid&fattrMode != 0 {
+		node.mode = fs.FileMode(mode & linuxPermMask)
+	}
+	if valid&fattrUID != 0 {
+		node.uid = uid
+	}
+	if valid&fattrGID != 0 {
+		node.gid = gid
+	}
+	if valid&fattrSize != 0 {
+		if size < uint64(len(node.data)) {
+			node.data = node.data[:size]
+		} else if size > uint64(len(node.data)) {
+			grown := make([]byte, size)
+			copy(grown, node.data)
+			node.data = grown
+		}
+		node.size = size
+	}
+	if valid&fattrMTime != 0 && !mtime.IsZero() {
+		node.modTime = mtime
+	} else {
+		node.modTime = time.Now()
+	}
+	return p.attr(node), 0
+}
+
+func (p *imageFS) Unlink(parent uint64, name string) int32 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	parentNode := p.nodes[parent]
+	if parentNode == nil {
+		return -linuxENOENT
+	}
+	name = path.Base(path.Clean("/" + name))
+	childID, ok := parentNode.entries[name]
+	if !ok {
+		return -linuxENOENT
+	}
+	child := p.nodes[childID]
+	if child == nil {
+		return -linuxENOENT
+	}
+	if child.isDir() {
+		return -linuxEISDIR
+	}
+	if child.abstractFile != nil || child.abstractLink != nil {
+		return -linuxEROFS
 	}
 	delete(parentNode.entries, name)
 	delete(p.nodes, childID)
@@ -3127,6 +3277,10 @@ func (p *imageFS) attr(node *imageNode) FuseAttr {
 	}
 	switch {
 	case node.isDir():
+		// Image roots are served as an ephemeral writable layer, similar to
+		// Apptainer's writable-tmpfs mode. Preserve read-only semantics for
+		// explicit non-writable mounts in mountedFS.
+		node.mode |= 0o222
 		mode = linuxSIFDIR | linuxModeBits(node.mode)
 	case node.isSymlink():
 		mode = linuxSIFLNK | linuxModeBits(node.mode)

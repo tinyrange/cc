@@ -192,6 +192,7 @@ func run() error {
 
 	_ = syscall.Mount("proc", "/proc", "proc", 0, "")
 	_ = syscall.Mount("sysfs", "/sys", "sysfs", 0, "")
+	configureMemoryOvercommit("/proc")
 
 	writeStage(bootStart, "loading modules")
 	if err := loadModules(cfg.Modules); err != nil {
@@ -285,6 +286,7 @@ func mountRootFS(tag, emulatorTag string) error {
 	}
 	_ = syscall.Mount("proc", "/proc", "proc", 0, "")
 	_ = syscall.Mount("sysfs", "/sys", "sysfs", 0, "")
+	configureMemoryOvercommit("/proc")
 	_ = syscall.Mount("devtmpfs", "/dev", "devtmpfs", 0, "")
 	_ = syscall.Mount("tmpfs", "/tmp", "tmpfs", 0, "mode=1777")
 	_ = syscall.Mount("tmpfs", "/run", "tmpfs", 0, "mode=755")
@@ -357,6 +359,11 @@ func copyPath(src, dst string) error {
 		return fmt.Errorf("close %s: %w", dst, err)
 	}
 	return nil
+}
+
+func configureMemoryOvercommit(procRoot string) {
+	path := filepath.Join(procRoot, "sys/vm/overcommit_memory")
+	_ = os.WriteFile(path, []byte("1\n"), 0o644)
 }
 
 func configureBinfmt() error {
