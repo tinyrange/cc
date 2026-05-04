@@ -299,10 +299,53 @@ class ShareMount:
 
 
 @dataclass(frozen=True)
+class PortForward:
+    host_port: int
+    guest_port: int
+    protocol: str = "tcp"
+    host_addr: Optional[str] = None
+    guest_addr: Optional[str] = None
+
+    def to_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "protocol": self.protocol,
+            "guest_port": self.guest_port,
+        }
+        if self.host_port is not None:
+            payload["host_port"] = self.host_port
+        if self.host_addr:
+            payload["host_addr"] = self.host_addr
+        if self.guest_addr:
+            payload["guest_addr"] = self.guest_addr
+        return payload
+
+
+@dataclass(frozen=True)
+class NetworkConfig:
+    enabled: bool = False
+    allow_internet: bool = False
+    host_dns_name: Optional[str] = None
+    port_forwards: tuple[PortForward, ...] = ()
+
+    def to_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if self.enabled or self.port_forwards:
+            payload["enabled"] = True
+        if self.allow_internet:
+            payload["allow_internet"] = True
+        if self.host_dns_name:
+            payload["host_dns_name"] = self.host_dns_name
+        if self.port_forwards:
+            payload["port_forwards"] = [forward.to_payload() for forward in self.port_forwards]
+        return payload
+
+
+@dataclass(frozen=True)
 class RunCommandRequest:
     image: str
     command: tuple[str, ...]
     shares: tuple[ShareMount, ...] = ()
+    network: Optional[NetworkConfig] = None
     env: tuple[str, ...] = ()
     workdir: Optional[str] = None
     user: Optional[str] = None
@@ -319,6 +362,10 @@ class RunCommandRequest:
         }
         if self.shares:
             payload["shares"] = [share.to_payload() for share in self.shares]
+        if self.network is not None:
+            network_payload = self.network.to_payload()
+            if network_payload:
+                payload["network"] = network_payload
         if self.env:
             payload["env"] = list(self.env)
         if self.workdir is not None:

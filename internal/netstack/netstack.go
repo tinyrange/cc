@@ -551,29 +551,27 @@ func (nic *NetworkInterface) AttachVirtioBackend(handler func(frame []byte) erro
 
 // DeliverGuestPacket is called by the hypervisor when the guest transmits.
 //
-// packet is borrowed from the caller. If release is non-nil, packet storage may
+// packet is borrowed from the caller. If needsCopy is true, packet storage may
 // be invalid as soon as DeliverGuestPacket returns; handlers that need payloads
 // after return must retain them explicitly.
 func (nic *NetworkInterface) DeliverGuestPacket(
 	packet []byte,
-	release func(),
+	needsCopy bool,
 ) error {
-	needsCopy := release != nil
-	if release != nil {
-		defer release()
-	}
 	if len(packet) < ethernetHeaderLen {
 		tracef("netstack.DeliverGuestPacket drop tooShort", "len=%d", len(packet))
 		return fmt.Errorf("packet too short: %d", len(packet))
 	}
 	eth := etherType(binary.BigEndian.Uint16(packet[12:14]))
-	tracef("netstack.DeliverGuestPacket", "len=%d needsCopy=%t src=%s dst=%s ethertype=%s payloadLen=%d",
-		len(packet), needsCopy,
-		net.HardwareAddr(packet[6:12]).String(),
-		net.HardwareAddr(packet[:6]).String(),
-		eth.String(),
-		len(packet)-ethernetHeaderLen,
-	)
+	if netstackTraceEnabled {
+		tracef("netstack.DeliverGuestPacket", "len=%d needsCopy=%t src=%s dst=%s ethertype=%s payloadLen=%d",
+			len(packet), needsCopy,
+			net.HardwareAddr(packet[6:12]).String(),
+			net.HardwareAddr(packet[:6]).String(),
+			eth.String(),
+			len(packet)-ethernetHeaderLen,
+		)
+	}
 	nic.stack.writePacketCapture(packet)
 	return nic.stack.handleEthernetFrameWithReuse(packet, needsCopy)
 }
@@ -584,7 +582,7 @@ func (nic *NetworkInterface) sendFrame(frame []byte) error {
 		tracef("netstack.sendFrame(nic) drop backend=nil", "len=%d", len(frame))
 		return fmt.Errorf("virtio backend not attached")
 	}
-	if len(frame) >= ethernetHeaderLen {
+	if netstackTraceEnabled && len(frame) >= ethernetHeaderLen {
 		eth := etherType(binary.BigEndian.Uint16(frame[12:14]))
 		tracef("netstack.sendFrame(nic)", "len=%d src=%s dst=%s ethertype=%s payloadLen=%d",
 			len(frame),
@@ -593,7 +591,7 @@ func (nic *NetworkInterface) sendFrame(frame []byte) error {
 			eth.String(),
 			len(frame)-ethernetHeaderLen,
 		)
-	} else {
+	} else if netstackTraceEnabled {
 		tracef("netstack.sendFrame(nic) too short", "len=%d", len(frame))
 	}
 	nic.stack.writePacketCapture(frame)
@@ -639,8 +637,10 @@ func (ns *NetStack) handleEthernetFrameWithReuse(frame []byte, releaseUnsafe boo
 	etherType := etherType(binary.BigEndian.Uint16(frame[12:14]))
 	payload := frame[14:]
 
-	tracef("netstack.handleEthernetFrame", "src=%s dst=%s ethertype=%s payloadLen=%d releaseUnsafe=%t",
-		src.String(), dst.String(), etherType.String(), len(payload), releaseUnsafe)
+	if netstackTraceEnabled {
+		tracef("netstack.handleEthernetFrame", "src=%s dst=%s ethertype=%s payloadLen=%d releaseUnsafe=%t",
+			src.String(), dst.String(), etherType.String(), len(payload), releaseUnsafe)
+	}
 
 	ns.recordGuestMAC(src)
 
@@ -1014,8 +1014,10 @@ func (ns *NetStack) handleIPv4Internal(srcMAC net.HardwareAddr, payload []byte, 
 		tracef("netstack.handleIPv4 parse error", "error=%v", err)
 		return err
 	}
-	tracef("netstack.handleIPv4", "srcMAC=%s srcIP=%s dstIP=%s proto=%s payloadLen=%d releaseUnsafe=%t",
-		srcMAC.String(), hdr.src.String(), hdr.dst.String(), hdr.protocol.String(), len(hdr.payload), releaseUnsafe)
+	if netstackTraceEnabled {
+		tracef("netstack.handleIPv4", "srcMAC=%s srcIP=%s dstIP=%s proto=%s payloadLen=%d releaseUnsafe=%t",
+			srcMAC.String(), hdr.src.String(), hdr.dst.String(), hdr.protocol.String(), len(hdr.payload), releaseUnsafe)
+	}
 
 	// Validate IPv4 header checksum before processing.
 	// A correct checksum will result in 0 when computed over the entire header.
@@ -1564,6 +1566,7 @@ type tcpConn struct {
 	key           tcpFourTuple
 	onEstablished func(*tcpConn)
 	dialDone      chan error
+	dialClosed    chan struct{}
 	dialOnce      sync.Once
 	localIPv4     [4]byte
 
@@ -1621,6 +1624,8 @@ const sendBufCapacity = 256 * 1024
 // Max out-of-order segments to buffer.
 const maxOOOSegments = 16
 
+const activeOpenSynRTO = 100 * time.Millisecond
+
 func newTCPConn(
 	stack *NetStack,
 	listener *tcpListener,
@@ -1675,6 +1680,7 @@ func (c *tcpConn) completeDial(err error) {
 	c.dialOnce.Do(func() {
 		c.dialDone <- err
 		close(c.dialDone)
+		close(c.dialClosed)
 	})
 }
 
@@ -1693,8 +1699,10 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 		tracef("netstack.handleTCP parse error", "error=%v", err)
 		return err
 	}
-	tracef("netstack.handleTCP segment", "src=%s:%d dst=%s:%d flags=0x%02x seq=%d ack=%d win=%d payloadLen=%d optLen=%d",
-		h.src.String(), hdr.srcPort, h.dst.String(), hdr.dstPort, hdr.flags, hdr.seq, hdr.ack, hdr.window, len(hdr.payload), len(hdr.options))
+	if netstackTraceEnabled {
+		tracef("netstack.handleTCP segment", "src=%s:%d dst=%s:%d flags=0x%02x seq=%d ack=%d win=%d payloadLen=%d optLen=%d",
+			h.src.String(), hdr.srcPort, h.dst.String(), hdr.dstPort, hdr.flags, hdr.seq, hdr.ack, hdr.window, len(hdr.payload), len(hdr.options))
+	}
 
 	key := tcpFourTuple{
 		srcPort: hdr.srcPort,
@@ -1728,7 +1736,9 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 		}
 
 		dstIP := h.dst.To4()
-		tracef("netstack.handleTCP connection attempt", "src=%s dst=%s", h.src.String(), h.dst.String())
+		if netstackTraceEnabled {
+			tracef("netstack.handleTCP connection attempt", "src=%s dst=%s", h.src.String(), h.dst.String())
+		}
 
 		// Proxy service connections to 127.0.0.1:dstPort if enabled.
 		if ns.shouldProxyService(dstIP) {
@@ -1793,10 +1803,12 @@ func (c *tcpConn) handleSegment(h ipv4Header, hdr tcpHeader) error {
 		c.mu.Unlock()
 		return net.ErrClosed
 	}
-	tracef("netstack.tcpConn segment",
-		"state=%d flags=0x%02x seq=%d ack=%d win=%d payloadLen=%d optLen=%d expectSeq=%d",
-		c.state, hdr.flags, hdr.seq, hdr.ack, hdr.window, len(hdr.payload), len(hdr.options), c.guestSeq,
-	)
+	if netstackTraceEnabled {
+		tracef("netstack.tcpConn segment",
+			"state=%d flags=0x%02x seq=%d ack=%d win=%d payloadLen=%d optLen=%d expectSeq=%d",
+			c.state, hdr.flags, hdr.seq, hdr.ack, hdr.window, len(hdr.payload), len(hdr.options), c.guestSeq,
+		)
+	}
 
 	// Track ack of our sent data.
 	if hdr.flags&tcpFlagACK != 0 {
@@ -2055,6 +2067,19 @@ func (c *tcpConn) sendSyn() error {
 	return c.stack.sendTCPPacketWithOptions(c.localIPv4, c.key, seq, 0, tcpFlagSYN, nil, options)
 }
 
+func (c *tcpConn) retransmitSyn() error {
+	c.mu.Lock()
+	if c.closed || c.state != tcpStateSynSent {
+		c.mu.Unlock()
+		return net.ErrClosed
+	}
+	seq := c.hostSeq - 1
+	c.mu.Unlock()
+
+	options := buildSynAckOptions(defaultMSS, 7, true)
+	return c.stack.sendTCPPacketWithOptions(c.localIPv4, c.key, seq, 0, tcpFlagSYN, nil, options)
+}
+
 func (c *tcpConn) sendSynAck() {
 	c.mu.Lock()
 	seq := c.hostSeq
@@ -2196,6 +2221,85 @@ func (c *tcpConn) Read(b []byte) (int, error) {
 		return n, nil
 	case <-timeout:
 		return 0, &net.OpError{Op: "read", Net: "tcp", Err: tcpTimeoutError{}}
+	}
+}
+
+// WriteTo lets io.Copy stream queued guest payloads straight into the host
+// socket. That avoids copying each TCP payload into io.Copy's intermediate
+// buffer before the kernel write.
+func (c *tcpConn) WriteTo(w io.Writer) (int64, error) {
+	var written int64
+	for {
+		data, owned, err := c.nextReadPayload()
+		if err != nil {
+			if err == io.EOF {
+				return written, nil
+			}
+			return written, err
+		}
+		remaining := data
+		for len(remaining) > 0 {
+			n, writeErr := w.Write(remaining)
+			if n > 0 {
+				written += int64(n)
+				remaining = remaining[n:]
+			}
+			if writeErr != nil {
+				releasePayload(owned)
+				return written, writeErr
+			}
+			if n == 0 {
+				releasePayload(owned)
+				return written, io.ErrShortWrite
+			}
+		}
+		releasePayload(owned)
+	}
+}
+
+func (c *tcpConn) nextReadPayload() ([]byte, []byte, error) {
+	var timeout <-chan time.Time
+	var timer *time.Timer
+	c.mu.Lock()
+	if len(c.readPending) > 0 {
+		data := c.readPending
+		owned := c.readPendingBuf
+		c.readPending = nil
+		c.readPendingBuf = nil
+		c.mu.Unlock()
+		return data, owned, nil
+	}
+	if !c.readDeadline.IsZero() {
+		until := time.Until(c.readDeadline)
+		if until <= 0 {
+			c.mu.Unlock()
+			return nil, nil, &net.OpError{Op: "read", Net: "tcp", Err: tcpTimeoutError{}}
+		}
+		timer = time.NewTimer(until)
+		timeout = timer.C
+		defer func() {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+		}()
+	}
+	buf := c.recvBuf
+	c.mu.Unlock()
+
+	select {
+	case data, ok := <-buf:
+		if !ok {
+			return nil, nil, net.ErrClosed
+		}
+		if data == nil {
+			return nil, nil, io.EOF
+		}
+		return data, data, nil
+	case <-timeout:
+		return nil, nil, &net.OpError{Op: "read", Net: "tcp", Err: tcpTimeoutError{}}
 	}
 }
 
@@ -2657,10 +2761,12 @@ func (ns *NetStack) sendTCPPacketWithOptions(
 	payload []byte,
 	options []byte,
 ) error {
-	tracef("netstack.sendTCPPacket", "src=%v:%d dst=%v:%d seq=%d ack=%d flags=0x%02x payloadLen=%d optLen=%d",
-		net.IP(localIPv4[:]).String(), key.dstPort,
-		net.IP(key.srcIP[:]).String(), key.srcPort,
-		seq, ack, flags, len(payload), len(options))
+	if netstackTraceEnabled {
+		tracef("netstack.sendTCPPacket", "src=%v:%d dst=%v:%d seq=%d ack=%d flags=0x%02x payloadLen=%d optLen=%d",
+			net.IP(localIPv4[:]).String(), key.dstPort,
+			net.IP(key.srcIP[:]).String(), key.srcPort,
+			seq, ack, flags, len(payload), len(options))
+	}
 	srcIP := net.IP(localIPv4[:])
 	dstIP := net.IP(key.srcIP[:])
 	srcPort := key.dstPort
@@ -2951,6 +3057,7 @@ func (ns *NetStack) DialInternalContext(
 	conn.state = tcpStateSynSent
 	conn.guestSeq = 0
 	conn.dialDone = make(chan error, 1)
+	conn.dialClosed = make(chan struct{})
 	ns.tcpConns[key] = conn
 	ns.tcpMu.Unlock()
 
@@ -2958,6 +3065,7 @@ func (ns *NetStack) DialInternalContext(
 		_ = conn.Close()
 		return nil, err
 	}
+	go conn.retransmitSynUntilDone(ctx)
 
 	select {
 	case err := <-conn.dialDone:
@@ -2968,6 +3076,24 @@ func (ns *NetStack) DialInternalContext(
 	case <-ctx.Done():
 		_ = conn.Close()
 		return nil, ctx.Err()
+	}
+}
+
+func (c *tcpConn) retransmitSynUntilDone(ctx context.Context) {
+	timer := time.NewTimer(activeOpenSynRTO)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.dialClosed:
+			return
+		case <-timer.C:
+			if err := c.retransmitSyn(); err != nil {
+				return
+			}
+			timer.Reset(activeOpenSynRTO)
+		}
 	}
 }
 
@@ -3305,6 +3431,8 @@ func tcpChecksum(src, dst net.IP, payload []byte) uint16 {
 func itoa(v int) string {
 	return strconv.Itoa(v)
 }
+
+const netstackTraceEnabled = false
 
 func tracef(_ string, _ string, _ ...any) {}
 

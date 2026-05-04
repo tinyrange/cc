@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from .api import connect, container, default_cache_root, load_deploy_metadata, runtime_deploy_env_entries, start_default_daemon
-from .models import ContainerReference, ImageSource, ImportImageRequest, ShareMount
+from .models import ContainerReference, ImageSource, ImportImageRequest, NetworkConfig, PortForward, ShareMount
 
 SESSION_ENV = "PYNEURODESK_SHELL_SESSION"
 SESSION_ROOT_ENV = "PYNEURODESK_SHELL_ROOT"
@@ -41,6 +41,7 @@ class SessionState:
     root: Path
     images: dict[str, dict[str, object]]
     wrappers: dict[str, WrapperSpec]
+    network: dict[str, object] | None = None
 
     @property
     def bin_dir(self) -> Path:
@@ -55,6 +56,7 @@ class SessionState:
             "version": STATE_VERSION,
             "session_id": self.session_id,
             "images": self.images,
+            "network": self.network or {},
             "wrappers": {
                 name: {"image": spec.image, "command": spec.command}
                 for name, spec in sorted(self.wrappers.items())
@@ -79,6 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     activate_parser = subparsers.add_parser("activate", help="Emit shell activation code")
     activate_parser.add_argument("--shell", choices=("bash", "zsh", "powershell", "pwsh"), default=None)
     activate_parser.add_argument("--no-bootstrap", action="store_true")
+    activate_parser.add_argument("--with-network", action="store_true")
     activate_parser.set_defaults(handler=handle_activate)
 
     completion_parser = subparsers.add_parser("completion", help="Emit shell completion code")
@@ -108,6 +111,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     list_parser = shell_subparsers.add_parser("list", help="List loaded images for the current shell session")
     list_parser.set_defaults(handler=handle_list)
+
+    forward_parser = shell_subparsers.add_parser("forward", help="Forward a host TCP port to the active VM")
+    forward_parser.add_argument("spec", help="HOST_PORT:GUEST_PORT")
+    forward_parser.add_argument("--host-addr", default="127.0.0.1")
+    forward_parser.add_argument("--guest-addr", default="10.42.0.2")
+    forward_parser.set_defaults(handler=handle_forward)
 
     exec_parser = shell_subparsers.add_parser("exec", help="Run a command inside an image through the shared VM")
     exec_parser.add_argument("image")
@@ -142,7 +151,8 @@ def handle_activate(args: argparse.Namespace) -> int:
     root = session_root_for_id(session_id)
     root.mkdir(parents=True, exist_ok=True)
     (root / "bin").mkdir(parents=True, exist_ok=True)
-    write_state(SessionState(session_id=session_id, root=root, images={}, wrappers={}))
+    network = {"enabled": True} if bool(args.with_network) else {}
+    write_state(SessionState(session_id=session_id, root=root, images={}, wrappers={}, network=network))
     print(render_activation(shell_name, session_id, root, bootstrap=not bool(args.no_bootstrap)))
     return 0
 
@@ -168,6 +178,7 @@ def handle_load(args: argparse.Namespace) -> int:
         prefetch_workers=int(args.prefetch_workers or 0) or None,
         memory_mb=memory_mb,
         cpus=cpus,
+        network=session_network_config(state),
     )
     try:
         metadata = load_deploy_metadata(handle)
@@ -225,8 +236,11 @@ def load_shell_container(
     prefetch_workers: Optional[int],
     memory_mb: Optional[int],
     cpus: Optional[int],
+    network: Optional[NetworkConfig] = None,
 ):
     if reference is None:
+        if network is not None and network.enabled:
+            return container(image, progress=False, with_network=True)
         return container(image, progress=False)
 
     active_client = connect()
@@ -239,7 +253,11 @@ def load_shell_container(
             prefetch_workers=prefetch_workers,
         ),
     )
-    active_client.ensure_instance(reference.image, memory_mb=memory_mb, cpus=cpus)
+    if network is not None:
+        active_client.ensure_instance(reference.image, memory_mb=memory_mb, cpus=cpus, network=network)
+    else:
+        active_client.ensure_instance(reference.image, memory_mb=memory_mb, cpus=cpus)
+    apply_port_forwards(active_client, network)
     return container_handle_for_reference(active_client, reference)
 
 
@@ -284,6 +302,32 @@ def handle_list(args: argparse.Namespace) -> int:
             print(f"{image}\t{len(commands)} commands")
         else:
             print(image)
+    return 0
+
+
+def handle_forward(args: argparse.Namespace) -> int:
+    state = require_session_state()
+    forward = parse_forward_spec(str(args.spec), host_addr=str(args.host_addr), guest_addr=str(args.guest_addr))
+    network = dict(state.network or {})
+    network["enabled"] = True
+    forwards = list(network.get("port_forwards", []))
+    payload = forward.to_payload()
+    if payload not in forwards:
+        forwards.append(payload)
+    network["port_forwards"] = forwards
+    state.network = network
+    write_state(state)
+
+    client = connect()
+    try:
+        status = client.instance_status()
+        if status.status == "running":
+            client.add_port_forward(forward)
+            print(f"forwarded {forward.host_addr or '127.0.0.1'}:{forward.host_port} -> guest:{forward.guest_port}")
+        else:
+            print(f"queued forward {forward.host_addr or '127.0.0.1'}:{forward.host_port} -> guest:{forward.guest_port}")
+    finally:
+        client.close()
     return 0
 
 
@@ -474,9 +518,14 @@ def shell_session_container(image: str):
     image_record = session_image_record(image)
     memory_mb = int(image_record.get("memory_mb") or 0) or None
     cpus = int(image_record.get("cpus") or 0) or None
+    network = session_network_config()
     active_client = connect()
     active_client.ensure_image(reference)
-    active_client.ensure_instance(reference.image, memory_mb=memory_mb, cpus=cpus)
+    if network is not None:
+        active_client.ensure_instance(reference.image, memory_mb=memory_mb, cpus=cpus, network=network)
+    else:
+        active_client.ensure_instance(reference.image, memory_mb=memory_mb, cpus=cpus)
+    apply_port_forwards(active_client, network)
     return container_handle_for_reference(active_client, reference)
 
 
@@ -489,6 +538,64 @@ def session_image_record(image: str) -> dict[str, object]:
     if not isinstance(image_record, dict):
         return {}
     return image_record
+
+
+def session_network_config(state: Optional[SessionState] = None) -> Optional[NetworkConfig]:
+    if state is None:
+        try:
+            state = require_session_state()
+        except SystemExit:
+            return None
+    payload = state.network or {}
+    if not isinstance(payload, dict) or not payload:
+        return None
+    forwards: list[PortForward] = []
+    raw_forwards = payload.get("port_forwards", [])
+    if isinstance(raw_forwards, list):
+        for item in raw_forwards:
+            if isinstance(item, dict):
+                forwards.append(port_forward_from_payload(item))
+    return NetworkConfig(
+        enabled=bool(payload.get("enabled", False) or forwards),
+        allow_internet=bool(payload.get("allow_internet", False)),
+        host_dns_name=str(payload["host_dns_name"]) if payload.get("host_dns_name") is not None else None,
+        port_forwards=tuple(forwards),
+    )
+
+
+def apply_port_forwards(client: object, network: Optional[NetworkConfig]) -> None:
+    if network is None:
+        return
+    add = getattr(client, "add_port_forward", None)
+    if add is None:
+        return
+    for forward in network.port_forwards:
+        add(forward)
+
+
+def parse_forward_spec(spec: str, *, host_addr: str = "127.0.0.1", guest_addr: str = "10.42.0.2") -> PortForward:
+    text = spec.strip()
+    if ":" not in text:
+        raise SystemExit("forward must be HOST_PORT:GUEST_PORT")
+    host_text, guest_text = text.split(":", 1)
+    try:
+        host_port = int(host_text)
+        guest_port = int(guest_text)
+    except ValueError as exc:
+        raise SystemExit("forward ports must be integers") from exc
+    if not (1 <= host_port <= 65535 and 1 <= guest_port <= 65535):
+        raise SystemExit("forward ports must be between 1 and 65535")
+    return PortForward(host_port=host_port, guest_port=guest_port, host_addr=host_addr, guest_addr=guest_addr)
+
+
+def port_forward_from_payload(payload: dict[str, object]) -> PortForward:
+    return PortForward(
+        host_port=int(payload.get("host_port", 0) or 0),
+        guest_port=int(payload.get("guest_port", 0) or 0),
+        protocol=str(payload.get("protocol", "tcp") or "tcp"),
+        host_addr=str(payload["host_addr"]) if payload.get("host_addr") is not None else None,
+        guest_addr=str(payload["guest_addr"]) if payload.get("guest_addr") is not None else None,
+    )
 
 
 def container_handle_for_reference(client, reference: ContainerReference):
@@ -870,20 +977,22 @@ def complete_words(words: list[str], *, index: int) -> list[str]:
 
     top = normalized[1]
     if top == "activate":
-        return filter_prefix(["--shell", "--no-bootstrap", "bash", "zsh", "powershell"])
+        return filter_prefix(["--shell", "--no-bootstrap", "--with-network", "bash", "zsh", "powershell"])
     if top == "completion":
         return filter_prefix(["--shell", "bash", "zsh", "powershell"])
     if top != "shell":
         return []
 
     if index == 2:
-        return filter_prefix(["load", "unload", "list", "exec", "completion"])
+        return filter_prefix(["load", "unload", "list", "forward", "exec", "completion"])
 
     subcommand = normalized[2]
     if subcommand == "completion":
         return filter_prefix(["--shell", "bash", "zsh", "powershell"])
     if subcommand == "load":
         return filter_prefix(["--command", "--force"])
+    if subcommand == "forward":
+        return filter_prefix(["--host-addr", "--guest-addr"])
     if subcommand in {"unload", "exec"}:
         return filter_prefix(loaded_images())
     return []
@@ -988,6 +1097,7 @@ def read_state(root: Path, *, session_id: str) -> SessionState:
         root=root,
         images=images if isinstance(images, dict) else {},
         wrappers=wrappers,
+        network=payload.get("network") if isinstance(payload.get("network"), dict) else {},
     )
 
 

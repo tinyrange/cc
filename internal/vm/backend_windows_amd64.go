@@ -554,6 +554,11 @@ func (i *windowsInstance) AddShare(ctx context.Context, share client.ShareMount)
 	return nil
 }
 
+func (i *windowsInstance) AddPortForward(ctx context.Context, forward client.PortForward) error {
+	_, _ = ctx, forward
+	return fmt.Errorf("instance network port forwarding is not supported on windows/amd64")
+}
+
 func (i *windowsInstance) AddImage(ctx context.Context, mountPath string, image *oci.Image) error {
 	_ = ctx
 	if i == nil || i.rootFS == nil {

@@ -16,6 +16,7 @@ from pyneurodesk import (
     CVMFSReadRequest,
     CVMFSSource,
     ImportImageRequest,
+    PortForward,
     PyNeurodeskClient,
     resolve_base_url,
 )
@@ -481,6 +482,53 @@ def test_create_instance_sends_memory_and_cpu_overrides() -> None:
     assert seen["json"] == '{"image":"niimath","memory_mb":4096,"cpus":2,"timeout_seconds":5.0}'
     assert result.memory_mb == 4096
     assert result.cpus == 2
+
+
+def test_create_instance_can_opt_into_network() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["json"] = request.read().decode()
+        return httpx.Response(200, json={"status": "running", "image": "niimath"})
+
+    client = make_client(httpx.MockTransport(handler))
+    try:
+        client.create_instance("niimath", with_network=True)
+    finally:
+        client.close()
+
+    assert seen["path"] == "/vm"
+    assert seen["json"] == '{"image":"niimath","network":{"enabled":true},"timeout_seconds":5.0}'
+
+
+def test_add_port_forward_posts_dynamic_forward() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["json"] = request.read().decode()
+        return httpx.Response(
+            200,
+            json={
+                "protocol": "tcp",
+                "host_addr": "127.0.0.1",
+                "host_port": 8080,
+                "guest_addr": "10.42.0.2",
+                "guest_port": 8080,
+            },
+        )
+
+    client = make_client(httpx.MockTransport(handler))
+    try:
+        forward = client.add_port_forward(PortForward(host_port=8080, guest_port=8080))
+    finally:
+        client.close()
+
+    assert seen["path"] == "/vm/forward"
+    assert seen["json"] == '{"protocol":"tcp","guest_port":8080,"host_port":8080}'
+    assert forward.host_port == 8080
+    assert forward.guest_port == 8080
 
 
 def test_create_instance_stream_yields_boot_events() -> None:

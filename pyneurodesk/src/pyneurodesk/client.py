@@ -21,6 +21,8 @@ from .models import (
     ImageState,
     ImportImageRequest,
     KernelState,
+    NetworkConfig,
+    PortForward,
     RunCommandRequest,
     ShareMount,
     VMState,
@@ -207,12 +209,18 @@ class PyNeurodeskClient:
         self,
         image: str,
         *,
+        network: Optional[NetworkConfig] = None,
+        with_network: bool = False,
+        port_forwards: Iterable[PortForward] = (),
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         dmesg: bool = False,
         memory_mb: Optional[int] = None,
         cpus: Optional[int] = None,
     ) -> VMState:
         payload: dict[str, Any] = {"image": image}
+        network_payload = network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)
+        if network_payload:
+            payload["network"] = network_payload
         if dmesg:
             payload["dmesg"] = True
         if memory_mb is not None:
@@ -229,12 +237,18 @@ class PyNeurodeskClient:
     def start_instance(
         self,
         *,
+        network: Optional[NetworkConfig] = None,
+        with_network: bool = False,
+        port_forwards: Iterable[PortForward] = (),
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         dmesg: bool = False,
         memory_mb: Optional[int] = None,
         cpus: Optional[int] = None,
     ) -> VMState:
         payload: dict[str, Any] = {}
+        network_payload = network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)
+        if network_payload:
+            payload["network"] = network_payload
         if dmesg:
             payload["dmesg"] = True
         if memory_mb is not None:
@@ -251,12 +265,18 @@ class PyNeurodeskClient:
     def start_instance_stream(
         self,
         *,
+        network: Optional[NetworkConfig] = None,
+        with_network: bool = False,
+        port_forwards: Iterable[PortForward] = (),
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         dmesg: bool = False,
         memory_mb: Optional[int] = None,
         cpus: Optional[int] = None,
     ) -> Iterable[dict[str, Any]]:
         payload: dict[str, Any] = {}
+        network_payload = network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)
+        if network_payload:
+            payload["network"] = network_payload
         if dmesg:
             payload["dmesg"] = True
         if memory_mb is not None:
@@ -287,10 +307,16 @@ class PyNeurodeskClient:
         self,
         image: str,
         *,
+        network: Optional[NetworkConfig] = None,
+        with_network: bool = False,
+        port_forwards: Iterable[PortForward] = (),
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         dmesg: bool = False,
     ) -> Iterable[dict[str, Any]]:
         payload: dict[str, Any] = {"image": image}
+        network_payload = network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)
+        if network_payload:
+            payload["network"] = network_payload
         if dmesg:
             payload["dmesg"] = True
         timeout_seconds = resolve_boot_timeout_seconds(timeout)
@@ -326,26 +352,36 @@ class PyNeurodeskClient:
         response = self._client.post("/watchdog/feed")
         return self._decode_json(response)
 
+    def add_port_forward(self, forward: PortForward, *, vm_id: Optional[str] = None) -> PortForward:
+        params = {"id": vm_id} if vm_id else None
+        response = self._client.post("/vm/forward", params=params, json=forward.to_payload())
+        payload = self._decode_json(response)
+        return port_forward_from_payload(payload)
+
     def ensure_instance(
         self,
         image: str,
         *,
+        network: Optional[NetworkConfig] = None,
+        with_network: bool = False,
+        port_forwards: Iterable[PortForward] = (),
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         dmesg: bool = False,
         memory_mb: Optional[int] = None,
         cpus: Optional[int] = None,
     ) -> VMState:
         state = self.instance_status()
+        network_payload = network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)
         if state.status == "running" and state.image == image:
             return state
         if state.status == "running" and state.image not in (image,):
             self.shutdown_instance()
-            return self.create_instance(image, timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus)
+            return self.create_instance(image, network=network_from_payload(network_payload), timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus)
         if state.status == "stopped":
-            return self.create_instance(image, timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus)
+            return self.create_instance(image, network=network_from_payload(network_payload), timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus)
         if state.status == "running":
-            return self.create_instance(image, timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus)
-        return self.create_instance(image, timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus)
+            return self.create_instance(image, network=network_from_payload(network_payload), timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus)
+        return self.create_instance(image, network=network_from_payload(network_payload), timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus)
 
     def cvmfs_list(self, source: CVMFSSource) -> CVMFSListResponse:
         response = self._client.post("/cvmfs/list", json=source.to_payload())
@@ -373,6 +409,9 @@ class PyNeurodeskClient:
         command: Iterable[str],
         *,
         shares: Iterable[ShareMount] = (),
+        network: Optional[NetworkConfig] = None,
+        with_network: bool = False,
+        port_forwards: Iterable[PortForward] = (),
         env: Iterable[str] = (),
         workdir: Optional[str] = None,
         user: Optional[str] = None,
@@ -385,6 +424,7 @@ class PyNeurodeskClient:
                 image=image,
                 command=tuple(command),
                 shares=tuple(shares),
+                network=network_from_payload(network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)),
                 env=tuple(env),
                 workdir=workdir,
                 user=user,
@@ -400,6 +440,9 @@ class PyNeurodeskClient:
         command: Iterable[str],
         *,
         shares: Iterable[ShareMount] = (),
+        network: Optional[NetworkConfig] = None,
+        with_network: bool = False,
+        port_forwards: Iterable[PortForward] = (),
         env: Iterable[str] = (),
         workdir: Optional[str] = None,
         user: Optional[str] = None,
@@ -411,6 +454,7 @@ class PyNeurodeskClient:
             image=image,
             command=tuple(command),
             shares=tuple(shares),
+            network=network_from_payload(network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)),
             env=tuple(env),
             workdir=workdir,
             user=user,
@@ -491,3 +535,58 @@ def resolve_boot_timeout_seconds(timeout: Optional[Union[float, httpx.Timeout]] 
         return float(raw)
 
     return DEFAULT_BOOT_TIMEOUT_SECONDS
+
+
+def network_payload_from_options(
+    network: Optional[NetworkConfig],
+    *,
+    with_network: bool = False,
+    port_forwards: Iterable[PortForward] = (),
+) -> dict[str, Any]:
+    forwards = tuple(port_forwards)
+    if network is None:
+        if not with_network and not forwards:
+            return {}
+        network = NetworkConfig(enabled=bool(with_network or forwards), port_forwards=forwards)
+    elif forwards:
+        network = NetworkConfig(
+            enabled=bool(network.enabled or with_network or forwards),
+            allow_internet=network.allow_internet,
+            host_dns_name=network.host_dns_name,
+            port_forwards=(*network.port_forwards, *forwards),
+        )
+    elif with_network and not network.enabled:
+        network = NetworkConfig(
+            enabled=True,
+            allow_internet=network.allow_internet,
+            host_dns_name=network.host_dns_name,
+            port_forwards=network.port_forwards,
+        )
+    return network.to_payload()
+
+
+def network_from_payload(payload: dict[str, Any]) -> Optional[NetworkConfig]:
+    if not payload:
+        return None
+    forwards_raw = payload.get("port_forwards", ())
+    forwards: list[PortForward] = []
+    if isinstance(forwards_raw, list):
+        for item in forwards_raw:
+            if isinstance(item, dict):
+                forwards.append(port_forward_from_payload(item))
+    return NetworkConfig(
+        enabled=bool(payload.get("enabled", False)),
+        allow_internet=bool(payload.get("allow_internet", False)),
+        host_dns_name=str(payload["host_dns_name"]) if payload.get("host_dns_name") is not None else None,
+        port_forwards=tuple(forwards),
+    )
+
+
+def port_forward_from_payload(payload: dict[str, Any]) -> PortForward:
+    return PortForward(
+        host_port=int(payload.get("host_port", 0) or 0),
+        guest_port=int(payload.get("guest_port", 0) or 0),
+        protocol=str(payload.get("protocol", "tcp") or "tcp"),
+        host_addr=str(payload["host_addr"]) if payload.get("host_addr") is not None else None,
+        guest_addr=str(payload["guest_addr"]) if payload.get("guest_addr") is not None else None,
+    )

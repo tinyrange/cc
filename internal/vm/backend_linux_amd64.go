@@ -618,6 +618,14 @@ func (i *linuxInstance) AddShare(ctx context.Context, share client.ShareMount) e
 	return nil
 }
 
+func (i *linuxInstance) AddPortForward(ctx context.Context, forward client.PortForward) error {
+	_ = ctx
+	if i == nil || i.network == nil {
+		return fmt.Errorf("instance network is not enabled")
+	}
+	return i.network.AddPortForward(forward)
+}
+
 func (i *linuxInstance) AddImage(ctx context.Context, mountPath string, image *oci.Image) error {
 	_ = ctx
 	if i == nil || i.rootFS == nil {

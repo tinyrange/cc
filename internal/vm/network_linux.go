@@ -22,7 +22,9 @@ import (
 type linuxNetworkRuntime struct {
 	stack     *netstack.NetStack
 	dev       *virtio.Net
+	mu        sync.Mutex
 	listeners []net.Listener
+	forwards  map[string]client.PortForward
 	wg        sync.WaitGroup
 }
 
@@ -30,8 +32,8 @@ type netstackVirtioBackend struct {
 	iface *netstack.NetworkInterface
 }
 
-func (b *netstackVirtioBackend) HandleTxPacket(packet []byte, release func()) error {
-	return b.iface.DeliverGuestPacket(packet, release)
+func (b *netstackVirtioBackend) HandleTxPacket(packet []byte) error {
+	return b.iface.DeliverGuestPacket(packet, true)
 }
 
 func newLinuxAMD64NetworkRuntime(cfg *client.NetworkConfig) (*linuxNetworkRuntime, error) {
@@ -61,14 +63,14 @@ func newLinuxAMD64NetworkRuntime(cfg *client.NetworkConfig) (*linuxNetworkRuntim
 	iface.AttachVirtioBackend(func(frame []byte) error {
 		copied := append([]byte(nil), frame...)
 		go func() {
-			_ = dev.EnqueueRxPacket(copied)
+			_ = dev.EnqueueRxPacketOwned(copied)
 		}()
 		return nil
 	})
 
 	runtime := &linuxNetworkRuntime{stack: stack, dev: dev}
 	for _, forward := range cfg.PortForwards {
-		if err := runtime.startPortForward(forward); err != nil {
+		if err := runtime.AddPortForward(forward); err != nil {
 			_ = runtime.Close()
 			return nil, err
 		}
@@ -82,7 +84,11 @@ func (n *linuxNetworkRuntime) Close() error {
 		return nil
 	}
 	var err error
-	for _, ln := range n.listeners {
+	n.mu.Lock()
+	listeners := append([]net.Listener(nil), n.listeners...)
+	n.listeners = nil
+	n.mu.Unlock()
+	for _, ln := range listeners {
 		if closeErr := ln.Close(); closeErr != nil && err == nil {
 			err = closeErr
 		}
@@ -103,7 +109,10 @@ func networkDevice(n *linuxNetworkRuntime) *virtio.Net {
 	return n.dev
 }
 
-func (n *linuxNetworkRuntime) startPortForward(forward client.PortForward) error {
+func (n *linuxNetworkRuntime) AddPortForward(forward client.PortForward) error {
+	if n == nil || n.stack == nil {
+		return fmt.Errorf("network is not enabled")
+	}
 	protocol := strings.ToLower(strings.TrimSpace(forward.Protocol))
 	if protocol == "" {
 		protocol = "tcp"
@@ -111,7 +120,7 @@ func (n *linuxNetworkRuntime) startPortForward(forward client.PortForward) error
 	if protocol != "tcp" && protocol != "tcp4" {
 		return fmt.Errorf("port forward protocol %q is not supported", forward.Protocol)
 	}
-	if forward.HostPort < 0 || forward.HostPort > 65535 {
+	if forward.HostPort <= 0 || forward.HostPort > 65535 {
 		return fmt.Errorf("host port %d out of range", forward.HostPort)
 	}
 	if forward.GuestPort <= 0 || forward.GuestPort > 65535 {
@@ -125,13 +134,33 @@ func (n *linuxNetworkRuntime) startPortForward(forward client.PortForward) error
 	if guestAddr == "" {
 		guestAddr = "10.42.0.2"
 	}
+	forward.Protocol = protocol
+	forward.HostAddr = hostAddr
+	forward.GuestAddr = guestAddr
+	key := strings.Join([]string{protocol, hostAddr, strconv.Itoa(forward.HostPort), guestAddr, strconv.Itoa(forward.GuestPort)}, "\x00")
+
+	n.mu.Lock()
+	if existing, ok := n.forwards[key]; ok {
+		n.mu.Unlock()
+		if existing == forward {
+			return nil
+		}
+		return fmt.Errorf("port forward already exists")
+	}
+	n.mu.Unlock()
 
 	ln, err := net.Listen("tcp", net.JoinHostPort(hostAddr, strconv.Itoa(forward.HostPort)))
 	if err != nil {
 		return fmt.Errorf("listen port forward %s:%d: %w", hostAddr, forward.HostPort, err)
 	}
+	n.mu.Lock()
+	if n.forwards == nil {
+		n.forwards = make(map[string]client.PortForward)
+	}
+	n.forwards[key] = forward
 	n.listeners = append(n.listeners, ln)
 	n.wg.Add(1)
+	n.mu.Unlock()
 	go n.acceptPortForward(ln, net.JoinHostPort(guestAddr, strconv.Itoa(forward.GuestPort)))
 	return nil
 }

@@ -59,6 +59,16 @@ def test_activate_supports_no_bootstrap(monkeypatch, tmp_path: Path, capsys: pyt
     assert "PYNEURODESK_SHELL_BOOTSTRAP_PID" in output
 
 
+def test_activate_with_network_persists_session_network(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("pyneurodesk.shell.default_cache_root", lambda: tmp_path / "cache")
+
+    assert shell.main(["activate", "--shell", "bash", "--no-bootstrap", "--with-network"]) == 0
+
+    session_dirs = list((tmp_path / "cache" / "pyneurodesk-shell").iterdir())
+    state = json.loads((session_dirs[0] / "state.json").read_text())
+    assert state["network"] == {"enabled": True}
+
+
 def test_completion_emits_zsh_support(capsys: pytest.CaptureFixture[str]) -> None:
     exit_code = shell.main(["completion", "--shell", "zsh"])
 
@@ -455,6 +465,56 @@ def test_shell_complete_returns_loaded_images_for_exec(monkeypatch, tmp_path: Pa
 
     assert exit_code == 0
     assert capsys.readouterr().out.splitlines() == ["fsl", "niimath"]
+
+
+def test_shell_forward_updates_running_vm_dynamically(
+    monkeypatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[tuple[str, object]] = []
+    root = tmp_path / "session"
+    root.mkdir()
+    monkeypatch.setenv(shell.SESSION_ENV, "sess-1")
+    monkeypatch.setenv(shell.SESSION_ROOT_ENV, str(root))
+    monkeypatch.setenv(shell.SESSION_BIN_ENV, str(root / "bin"))
+    shell.write_state(shell.SessionState(session_id="sess-1", root=root, images={}, wrappers={}))
+
+    class FakeClient:
+        def instance_status(self) -> object:
+            calls.append(("status", None))
+            return SimpleNamespace(status="running")
+
+        def add_port_forward(self, forward: object) -> object:
+            calls.append(("forward", forward))
+            return forward
+
+        def close(self) -> None:
+            calls.append(("close", None))
+
+    monkeypatch.setattr("pyneurodesk.shell.connect", lambda: FakeClient())
+
+    assert shell.main(["shell", "forward", "8080:8080"]) == 0
+
+    state = shell.read_state(root, session_id="sess-1")
+    assert state.network == {
+        "enabled": True,
+        "port_forwards": [
+            {
+                "protocol": "tcp",
+                "guest_port": 8080,
+                "host_port": 8080,
+                "host_addr": "127.0.0.1",
+                "guest_addr": "10.42.0.2",
+            }
+        ],
+    }
+    assert calls[0] == ("status", None)
+    assert calls[1][0] == "forward"
+    forward = calls[1][1]
+    assert forward.host_port == 8080
+    assert forward.guest_port == 8080
+    assert "forwarded 127.0.0.1:8080 -> guest:8080" in capsys.readouterr().out
 
 
 def test_run_wrapper_invokes_container_command(

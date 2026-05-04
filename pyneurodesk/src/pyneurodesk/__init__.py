@@ -30,6 +30,8 @@ from .models import (
     ImageState,
     ImportImageRequest,
     KernelState,
+    NetworkConfig,
+    PortForward,
     RunCommandRequest,
     ShareMount,
 )
@@ -54,7 +56,9 @@ __all__ = [
     "ImageState",
     "ImportImageRequest",
     "KernelState",
+    "NetworkConfig",
     "NeurodeskContainer",
+    "PortForward",
     "PyNeurodeskClient",
     "RunCommandRequest",
     "ShareMount",

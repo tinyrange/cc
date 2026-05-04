@@ -27,6 +27,7 @@ from .models import (
     DeployMetadata,
     ImageSource,
     ImportImageRequest,
+    PortForward,
     ShareMount,
 )
 
@@ -221,6 +222,24 @@ class NeurodeskContainer:
             )
         return result.output
 
+    def forward(
+        self,
+        host_port: int,
+        guest_port: int,
+        *,
+        host_addr: str = "127.0.0.1",
+        guest_addr: str = "10.42.0.2",
+        protocol: str = "tcp",
+    ) -> PortForward:
+        forward = PortForward(
+            host_port=host_port,
+            guest_port=guest_port,
+            protocol=protocol,
+            host_addr=host_addr,
+            guest_addr=guest_addr,
+        )
+        return self._client.add_port_forward(forward)
+
     def shell(self, *args: object) -> str:
         return self.run(*args)
 
@@ -398,6 +417,7 @@ def container(
     prefetch_workers: Optional[int] = None,
     progress: bool = True,
     debug: bool = False,
+    with_network: bool = False,
 ) -> NeurodeskContainer:
     reporter = create_progress_reporter(enabled=progress, total_steps=11)
     reporter.update(1, f"Preparing container {name}")
@@ -499,7 +519,10 @@ def container(
             if debug:
                 _stream_debug_boot(active_client, reference.image)
             else:
-                active_client.create_instance(reference.image, dmesg=False)
+                if with_network:
+                    active_client.create_instance(reference.image, dmesg=False, with_network=True)
+                else:
+                    active_client.create_instance(reference.image, dmesg=False)
         container_handle = NeurodeskContainer(active_client, reference)
         reporter.close(f"{reference.image} is ready")
         return container_handle

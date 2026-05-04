@@ -30,6 +30,7 @@ type Backend interface {
 
 type Instance interface {
 	AddShare(context.Context, client.ShareMount) error
+	AddPortForward(context.Context, client.PortForward) error
 	Exec(context.Context, client.ExecRequest) (client.ExecResponse, error)
 	ExecStream(context.Context, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 	Wait() error
@@ -347,6 +348,21 @@ func (m *Manager) StreamIn(ctx context.Context, id string, req client.ExecReques
 	return machine.instance.ExecStream(ctx, req, inputs, onEvent)
 }
 
+func (m *Manager) AddPortForward(ctx context.Context, forward client.PortForward) error {
+	return m.AddPortForwardTo(ctx, DefaultInstanceID, forward)
+}
+
+func (m *Manager) AddPortForwardTo(ctx context.Context, id string, forward client.PortForward) error {
+	id = instanceID(id)
+	m.mu.Lock()
+	machine := m.running[id]
+	m.mu.Unlock()
+	if machine == nil {
+		return fmt.Errorf("no VM %q is running", id)
+	}
+	return machine.instance.AddPortForward(ctx, forward)
+}
+
 func (m *Manager) Status() client.InstanceState {
 	return m.StatusOf(DefaultInstanceID)
 }
@@ -501,5 +517,10 @@ func (unsupportedBackend) RunInInstanceStream(ctx context.Context, inst Instance
 	_ = req
 	_ = inputs
 	_ = onEvent
+	return fmt.Errorf("VM backend is not configured")
+}
+
+func (unsupportedBackend) AddPortForward(ctx context.Context, forward client.PortForward) error {
+	_, _ = ctx, forward
 	return fmt.Errorf("VM backend is not configured")
 }

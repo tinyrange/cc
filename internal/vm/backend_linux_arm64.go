@@ -523,6 +523,11 @@ func (i *linuxInstance) AddShare(ctx context.Context, share client.ShareMount) e
 	return nil
 }
 
+func (i *linuxInstance) AddPortForward(ctx context.Context, forward client.PortForward) error {
+	_, _ = ctx, forward
+	return fmt.Errorf("instance network port forwarding is not supported on linux/arm64")
+}
+
 func (i *linuxInstance) AddImage(ctx context.Context, mountPath string, image *oci.Image) error {
 	_ = ctx
 	if i == nil || i.rootFS == nil {

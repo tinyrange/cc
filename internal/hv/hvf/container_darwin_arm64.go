@@ -229,6 +229,11 @@ func (s *ContainerSession) AddShare(ctx context.Context, share client.ShareMount
 	return nil
 }
 
+func (s *ContainerSession) AddPortForward(ctx context.Context, forward client.PortForward) error {
+	_, _ = ctx, forward
+	return fmt.Errorf("instance network port forwarding is not supported on darwin/arm64")
+}
+
 func (s *ContainerSession) AddImage(ctx context.Context, mount string, image *oci.Image) error {
 	_ = ctx
 	if s.rootFS == nil {

@@ -11,11 +11,8 @@ type testNetBackend struct {
 	packets [][]byte
 }
 
-func (b *testNetBackend) HandleTxPacket(packet []byte, release func()) error {
+func (b *testNetBackend) HandleTxPacket(packet []byte) error {
 	b.packets = append(b.packets, append([]byte(nil), packet...))
-	if release != nil {
-		release()
-	}
 	return nil
 }
 

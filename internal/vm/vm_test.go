@@ -342,6 +342,32 @@ func TestManagerRunMountsRuntimeSharesBeforeExec(t *testing.T) {
 	}
 }
 
+func TestManagerAddPortForwardUpdatesRunningInstance(t *testing.T) {
+	forward := client.PortForward{HostPort: 8080, GuestPort: 8080}
+	inst := &fakeInstance{}
+	var seen client.PortForward
+	inst.forwardFn = func(f client.PortForward) error {
+		seen = f
+		return nil
+	}
+	mgr := NewManagerWithBackend(fakeBackend{
+		startFn: func(req client.CreateInstanceRequest) (Instance, error) {
+			return inst, nil
+		},
+	})
+	mgr.supports = func() error { return nil }
+
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{Image: "alpine"}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if err := mgr.AddPortForward(context.Background(), forward); err != nil {
+		t.Fatalf("AddPortForward() error = %v", err)
+	}
+	if seen != forward {
+		t.Fatalf("forward = %#v, want %#v", seen, forward)
+	}
+}
+
 func TestManagerRunStreamFallsBackToOneShotRunWhenNoInstance(t *testing.T) {
 	var seen client.RunRequest
 	mgr := NewManagerWithBackend(fakeBackend{
@@ -563,6 +589,7 @@ type fakeInstance struct {
 	execResp   client.ExecResponse
 	execErr    error
 	addShareFn func(client.ShareMount) error
+	forwardFn  func(client.PortForward) error
 	execFn     func(client.ExecRequest) (client.ExecResponse, error)
 	streamFn   func(client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 }
@@ -571,6 +598,14 @@ func (f *fakeInstance) AddShare(ctx context.Context, share client.ShareMount) er
 	_ = ctx
 	if f.addShareFn != nil {
 		return f.addShareFn(share)
+	}
+	return nil
+}
+
+func (f *fakeInstance) AddPortForward(ctx context.Context, forward client.PortForward) error {
+	_ = ctx
+	if f.forwardFn != nil {
+		return f.forwardFn(forward)
 	}
 	return nil
 }

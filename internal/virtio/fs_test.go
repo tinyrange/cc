@@ -594,6 +594,28 @@ func TestStrictFUSEIoctlReturnsENOTTY(t *testing.T) {
 	}
 }
 
+func TestStrictFUSETmpfileReturnsENOSYS(t *testing.T) {
+	t.Parallel()
+
+	fsdev := NewFS(0, 0, 0, "root", NewPassthroughFS(t.TempDir(), nil))
+	fsdev.Strict = true
+
+	const unique = uint64(44)
+	req := make([]byte, fuseInHeaderSize+16)
+	binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
+	binary.LittleEndian.PutUint32(req[4:8], fuseTmpfile)
+	binary.LittleEndian.PutUint64(req[8:16], unique)
+	binary.LittleEndian.PutUint64(req[16:24], 1)
+
+	reply, err := fsdev.dispatchFUSELocked(req)
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(TMPFILE) error = %v", err)
+	}
+	if got := int32(binary.LittleEndian.Uint32(reply[4:8])); got != -linuxENOSYS {
+		t.Fatalf("TMPFILE errno = %d, want %d", got, -linuxENOSYS)
+	}
+}
+
 func TestFUSEInitAdvertisesImplementedCapabilities(t *testing.T) {
 	t.Parallel()
 
@@ -609,6 +631,128 @@ func TestFUSEInitAdvertisesImplementedCapabilities(t *testing.T) {
 		if flags != fuseCapPosixLocks {
 			t.Fatalf("%s Init flags = %#x, want %#x", tc.name, flags, fuseCapPosixLocks)
 		}
+	}
+}
+
+func TestImageFSCopyUpExistingFileOnWrite(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "usr", "bin"), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "usr", "bin", "tool"), []byte("base"), 0o755); err != nil {
+		t.Fatalf("WriteFile(base) error = %v", err)
+	}
+	be := NewImageFS(imagefs.NewHostFS(root, nil), root).(*imageFS)
+
+	usrID, _, errno := be.Lookup(1, "usr")
+	if errno != 0 {
+		t.Fatalf("Lookup(usr) errno = %d", errno)
+	}
+	binID, _, errno := be.Lookup(usrID, "bin")
+	if errno != 0 {
+		t.Fatalf("Lookup(bin) errno = %d", errno)
+	}
+	toolID, _, errno := be.Lookup(binID, "tool")
+	if errno != 0 {
+		t.Fatalf("Lookup(tool) errno = %d", errno)
+	}
+	fh, errno := be.Open(toolID, linuxOWRONLY|linuxOTRUNC)
+	if errno != 0 {
+		t.Fatalf("Open(tool O_TRUNC) errno = %d", errno)
+	}
+	if wrote, errno := be.Write(toolID, fh, 0, []byte("overlay"), 0); errno != 0 || wrote != 7 {
+		t.Fatalf("Write(tool) = (%d, %d), want (7, 0)", wrote, errno)
+	}
+	be.Release(toolID, fh)
+
+	fh, errno = be.Open(toolID, linuxORDONLY)
+	if errno != 0 {
+		t.Fatalf("Open(tool read) errno = %d", errno)
+	}
+	data, errno := be.Read(toolID, fh, 0, 32)
+	if errno != 0 {
+		t.Fatalf("Read(tool) errno = %d", errno)
+	}
+	if string(data) != "overlay" {
+		t.Fatalf("overlay data = %q, want overlay", data)
+	}
+	if base, err := os.ReadFile(filepath.Join(root, "usr", "bin", "tool")); err != nil || string(base) != "base" {
+		t.Fatalf("base file = %q, %v; want base unchanged", base, err)
+	}
+}
+
+func TestImageFSUnlinkWhiteoutsLowerFile(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc", "motd"), []byte("base"), 0o644); err != nil {
+		t.Fatalf("WriteFile(base) error = %v", err)
+	}
+	be := NewImageFS(imagefs.NewHostFS(root, nil), root).(*imageFS)
+	etcID, _, errno := be.Lookup(1, "etc")
+	if errno != 0 {
+		t.Fatalf("Lookup(etc) errno = %d", errno)
+	}
+	if _, _, errno := be.Lookup(etcID, "motd"); errno != 0 {
+		t.Fatalf("Lookup(motd) errno = %d", errno)
+	}
+	if errno := be.Unlink(etcID, "motd"); errno != 0 {
+		t.Fatalf("Unlink(motd) errno = %d", errno)
+	}
+	if _, _, errno := be.Lookup(etcID, "motd"); errno != -linuxENOENT {
+		t.Fatalf("Lookup(motd after unlink) errno = %d, want ENOENT", errno)
+	}
+}
+
+func TestImageFSRenameReplacesLowerFileInOverlay(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "usr", "bin"), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "usr", "bin", "tool"), []byte("base"), 0o755); err != nil {
+		t.Fatalf("WriteFile(base) error = %v", err)
+	}
+	be := NewImageFS(imagefs.NewHostFS(root, nil), root).(*imageFS)
+	usrID, _, errno := be.Lookup(1, "usr")
+	if errno != 0 {
+		t.Fatalf("Lookup(usr) errno = %d", errno)
+	}
+	binID, _, errno := be.Lookup(usrID, "bin")
+	if errno != 0 {
+		t.Fatalf("Lookup(bin) errno = %d", errno)
+	}
+	tmpID, fh, _, errno := be.Create(binID, ".apk-new", linuxOWRONLY|linuxOCREAT, 0o755)
+	if errno != 0 {
+		t.Fatalf("Create(.apk-new) errno = %d", errno)
+	}
+	if wrote, errno := be.Write(tmpID, fh, 0, []byte("new"), 0); errno != 0 || wrote != 3 {
+		t.Fatalf("Write(.apk-new) = (%d, %d), want (3, 0)", wrote, errno)
+	}
+	be.Release(tmpID, fh)
+	if errno := be.Rename(binID, ".apk-new", binID, "tool", 0); errno != 0 {
+		t.Fatalf("Rename(.apk-new -> tool) errno = %d", errno)
+	}
+	toolID, _, errno := be.Lookup(binID, "tool")
+	if errno != 0 {
+		t.Fatalf("Lookup(tool) errno = %d", errno)
+	}
+	fh, errno = be.Open(toolID, linuxORDONLY)
+	if errno != 0 {
+		t.Fatalf("Open(tool) errno = %d", errno)
+	}
+	data, errno := be.Read(toolID, fh, 0, 32)
+	if errno != 0 {
+		t.Fatalf("Read(tool) errno = %d", errno)
+	}
+	if string(data) != "new" {
+		t.Fatalf("renamed data = %q, want new", data)
 	}
 }
 

@@ -22,12 +22,25 @@ const (
 	netFeatureMergeRX       = uint64(1) << 15
 	netHdrFlagNeedsChecksum = 1
 
-	netStatusLinkUp = 1
-	netHeaderLen    = 12
+	netStatusLinkUp      = 1
+	netHeaderLen         = 12
+	maxNetPacketPoolSize = 256 * 1024
 )
 
+var netPacketPool = sync.Pool{
+	New: func() any {
+		return make([]byte, 0, 2048)
+	},
+}
+
+var netTXPacketBatchPool = sync.Pool{
+	New: func() any {
+		return new([netQueueSize]netTXPacket)
+	},
+}
+
 type NetBackend interface {
-	HandleTxPacket(packet []byte, release func()) error
+	HandleTxPacket(packet []byte) error
 }
 
 type Net struct {
@@ -50,6 +63,11 @@ type Net struct {
 	configGeneration uint32
 	queues           [2]queue
 	pendingRx        [][]byte
+}
+
+type netTXPacket struct {
+	packet []byte
+	buffer []byte
 }
 
 func NewNet(base, size uint64, irq uint32, mac net.HardwareAddr, backend NetBackend) *Net {
@@ -145,7 +163,6 @@ func (n *Net) Read(addr uint64, size int) (uint64, error) {
 
 func (n *Net) Write(addr uint64, size int, value uint64) error {
 	n.mu.Lock()
-	defer n.mu.Unlock()
 
 	offset := addr - n.Base
 	switch offset {
@@ -199,7 +216,9 @@ func (n *Net) Write(addr uint64, size int, value uint64) error {
 		}
 	case regInterruptAck:
 		n.interruptStatus &^= uint32(value)
-		return n.updateIRQLocked()
+		err := n.updateIRQLocked()
+		n.mu.Unlock()
+		return err
 	case regStatus:
 		n.status = uint32(value)
 		if n.status == 0 {
@@ -208,60 +227,158 @@ func (n *Net) Write(addr uint64, size int, value uint64) error {
 	case regQueueNotify:
 		switch value {
 		case netQueueTX:
-			return n.processTXLocked()
+			packetBatch := getNetTXPacketBatch()
+			packets, err := n.processTXLocked(packetBatch[:0])
+			n.mu.Unlock()
+			if err != nil {
+				releaseNetTXPackets(packets)
+				releaseNetTXPacketBatch(packetBatch)
+				return err
+			}
+			err = n.deliverTXPackets(packets)
+			releaseNetTXPacketBatch(packetBatch)
+			return err
 		case netQueueRX:
-			return n.processRXLocked()
+			err := n.processRXLocked()
+			n.mu.Unlock()
+			return err
 		}
 	}
+	n.mu.Unlock()
 	return nil
 }
 
 func (n *Net) EnqueueRxPacket(packet []byte) error {
+	return n.enqueueRxPacket(packet, false)
+}
+
+func (n *Net) EnqueueRxPacketOwned(packet []byte) error {
+	return n.enqueueRxPacket(packet, true)
+}
+
+func (n *Net) enqueueRxPacket(packet []byte, owned bool) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.pendingRx = append(n.pendingRx, append([]byte(nil), packet...))
+	if !owned {
+		packet = append([]byte(nil), packet...)
+	}
+	n.pendingRx = append(n.pendingRx, packet)
 	return n.processRXLocked()
 }
 
-func (n *Net) processTXLocked() error {
+func getNetPacketBuffer() []byte {
+	return netPacketPool.Get().([]byte)[:0]
+}
+
+func releaseNetPacketBuffer(buf []byte) {
+	if buf == nil || cap(buf) > maxNetPacketPoolSize {
+		return
+	}
+	netPacketPool.Put(buf[:0])
+}
+
+func getNetTXPacketBatch() *[netQueueSize]netTXPacket {
+	return netTXPacketBatchPool.Get().(*[netQueueSize]netTXPacket)
+}
+
+func releaseNetTXPacketBatch(batch *[netQueueSize]netTXPacket) {
+	if batch == nil {
+		return
+	}
+	clear(batch[:])
+	netTXPacketBatchPool.Put(batch)
+}
+
+func readGuestMemoryInto(mem GuestMemory, addr uint64, dst []byte) error {
+	if reader, ok := mem.(guestMemoryReaderInto); ok {
+		return reader.ReadIPAInto(addr, dst)
+	}
+	buf, err := mem.ReadIPA(addr, len(dst))
+	if err != nil {
+		return err
+	}
+	copy(dst, buf)
+	return nil
+}
+
+func (n *Net) processTXLocked(packets []netTXPacket) ([]netTXPacket, error) {
 	q := &n.queues[netQueueTX]
 	if !q.ready || q.size == 0 || n.mem == nil {
-		return nil
+		return nil, nil
 	}
 	header, err := n.mem.ReadIPA(q.availAddr, 4)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	availIdx := binary.LittleEndian.Uint16(header[2:4])
 	for q.lastAvailIdx != availIdx {
 		slot := q.lastAvailIdx % q.size
 		entry, err := n.mem.ReadIPA(q.availAddr+4+uint64(slot)*2, 2)
 		if err != nil {
-			return err
+			releaseNetTXPackets(packets)
+			return nil, err
 		}
 		head := binary.LittleEndian.Uint16(entry)
 		data, err := n.readChainLocked(q, head, false)
 		if err != nil {
-			return err
+			releaseNetTXPackets(packets)
+			return nil, err
 		}
+		releaseData := data
 		if len(data) >= netHeaderLen {
 			if err := fixTXChecksum(data); err != nil {
-				return err
+				releaseNetPacketBuffer(releaseData)
+				releaseNetTXPackets(packets)
+				return nil, err
 			}
 			packet := data[netHeaderLen:]
 			if n.backend != nil {
-				if err := n.backend.HandleTxPacket(packet, nil); err != nil {
-					return err
+				if len(packets) == cap(packets) {
+					releaseNetPacketBuffer(releaseData)
+					releaseNetTXPackets(packets)
+					return nil, fmt.Errorf("virtio-net tx batch full")
 				}
+				packets = append(packets, netTXPacket{
+					packet: packet,
+					buffer: releaseData,
+				})
+				releaseData = nil
 			}
 		}
+		releaseNetPacketBuffer(releaseData)
 		if err := n.writeUsedLocked(q, head, 0); err != nil {
-			return err
+			releaseNetTXPackets(packets)
+			return nil, err
 		}
 		q.lastAvailIdx++
 	}
 	n.interruptStatus |= intVring
-	return n.updateIRQLocked()
+	if err := n.updateIRQLocked(); err != nil {
+		releaseNetTXPackets(packets)
+		return nil, err
+	}
+	return packets, nil
+}
+
+func (n *Net) deliverTXPackets(packets []netTXPacket) error {
+	for _, packet := range packets {
+		if n.backend == nil {
+			releaseNetPacketBuffer(packet.buffer)
+			continue
+		}
+		err := n.backend.HandleTxPacket(packet.packet)
+		releaseNetPacketBuffer(packet.buffer)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func releaseNetTXPackets(packets []netTXPacket) {
+	for _, packet := range packets {
+		releaseNetPacketBuffer(packet.buffer)
+	}
 }
 
 func (n *Net) processRXLocked() error {
@@ -302,26 +419,36 @@ func (n *Net) processRXLocked() error {
 }
 
 func (n *Net) readChainLocked(q *queue, head uint16, writable bool) ([]byte, error) {
-	var out []byte
+	out := getNetPacketBuffer()
 	index := head
 	for i := uint16(0); i < q.size; i++ {
 		desc, err := n.readDescriptorLocked(q, index)
 		if err != nil {
+			releaseNetPacketBuffer(out)
 			return nil, err
 		}
 		isWrite := desc.flags&descFWrite != 0
 		if isWrite == writable && desc.length > 0 {
-			chunk, err := n.mem.ReadIPA(desc.addr, int(desc.length))
-			if err != nil {
+			oldLen := len(out)
+			newLen := oldLen + int(desc.length)
+			if newLen > cap(out) {
+				grown := make([]byte, newLen)
+				copy(grown, out)
+				releaseNetPacketBuffer(out)
+				out = grown[:oldLen]
+			}
+			out = out[:newLen]
+			if err := readGuestMemoryInto(n.mem, desc.addr, out[oldLen:newLen]); err != nil {
+				releaseNetPacketBuffer(out)
 				return nil, err
 			}
-			out = append(out, chunk...)
 		}
 		if desc.flags&descFNext == 0 {
 			return out, nil
 		}
 		index = desc.next
 	}
+	releaseNetPacketBuffer(out)
 	return nil, fmt.Errorf("virtio-net descriptor chain loop")
 }
 
@@ -355,31 +482,39 @@ func (n *Net) writeRXPacketLocked(q *queue, head uint16, packet []byte) (uint32,
 }
 
 func (n *Net) writeRXChunk(addr uint64, size int, hdr, packet []byte, offset int) (int, error) {
-	buf := make([]byte, 0, size)
+	written := 0
 	if offset < len(hdr) {
 		h := hdr[offset:]
 		if len(h) > size {
 			h = h[:size]
 		}
-		buf = append(buf, h...)
+		if len(h) > 0 {
+			if err := n.mem.WriteIPA(addr, h); err != nil {
+				return written, err
+			}
+			addr += uint64(len(h))
+			written += len(h)
+		}
 	}
-	if len(buf) < size {
+	if written < size {
 		packetOffset := offset - len(hdr)
 		if packetOffset < 0 {
 			packetOffset = 0
 		}
 		if packetOffset < len(packet) {
 			p := packet[packetOffset:]
-			if len(p) > size-len(buf) {
-				p = p[:size-len(buf)]
+			if len(p) > size-written {
+				p = p[:size-written]
 			}
-			buf = append(buf, p...)
+			if len(p) > 0 {
+				if err := n.mem.WriteIPA(addr, p); err != nil {
+					return written, err
+				}
+				written += len(p)
+			}
 		}
 	}
-	if len(buf) == 0 {
-		return 0, nil
-	}
-	return len(buf), n.mem.WriteIPA(addr, buf)
+	return written, nil
 }
 
 func (n *Net) readDescriptorLocked(q *queue, index uint16) (descriptor, error) {

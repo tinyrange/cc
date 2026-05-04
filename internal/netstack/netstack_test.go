@@ -7,9 +7,11 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -62,13 +64,18 @@ func newTestNetStack(tb testing.TB, frameBufferSize int) (*NetStack, *NetworkInt
 
 func awaitFrame(t testing.TB, frames <-chan []byte) []byte {
 	t.Helper()
+	return awaitFrameWithin(t, frames, time.Second)
+}
+
+func awaitFrameWithin(t testing.TB, frames <-chan []byte, timeout time.Duration) []byte {
+	t.Helper()
 	select {
 	case frame, ok := <-frames:
 		if !ok {
 			t.Fatalf("frame channel closed")
 		}
 		return frame
-	case <-time.After(time.Second):
+	case <-time.After(timeout):
 		t.Fatalf("timeout waiting for frame")
 		return nil
 	}
@@ -266,7 +273,7 @@ func establishTCPFromGuest(
 
 	guestSeq = 100
 	syn := buildTCPFrame(dstIP, guestIP, dstPort, guestPort, guestSeq, 0, tcpFlagSYN, nil)
-	if err := nic.DeliverGuestPacket(syn, nil); err != nil {
+	if err := nic.DeliverGuestPacket(syn, false); err != nil {
 		t.Fatalf("deliver syn: %v", err)
 	}
 
@@ -289,7 +296,7 @@ func establishTCPFromGuest(
 
 	hostSeq = tcpHdr.seq + 1
 	ack := buildTCPFrame(dstIP, guestIP, dstPort, guestPort, guestSeq+1, hostSeq, tcpFlagACK, nil)
-	if err := nic.DeliverGuestPacket(ack, nil); err != nil {
+	if err := nic.DeliverGuestPacket(ack, false); err != nil {
 		t.Fatalf("deliver ack: %v", err)
 	}
 	return guestSeq + 1, hostSeq
@@ -302,7 +309,7 @@ func TestARPReply(t *testing.T) {
 	guestIP := guestIP4(stack)
 
 	req := buildARPRequest(guestIP, hostIP)
-	if err := nic.DeliverGuestPacket(req, nil); err != nil {
+	if err := nic.DeliverGuestPacket(req, false); err != nil {
 		t.Fatalf("deliver arp request: %v", err)
 	}
 
@@ -334,7 +341,7 @@ func TestICMPEchoReply(t *testing.T) {
 	guestIP := guestIP4(stack)
 
 	req := buildICMPEchoRequest(hostIP, guestIP)
-	if err := nic.DeliverGuestPacket(req, nil); err != nil {
+	if err := nic.DeliverGuestPacket(req, false); err != nil {
 		t.Fatalf("deliver icmp request: %v", err)
 	}
 
@@ -392,7 +399,7 @@ func TestUDPInboundAndOutbound(t *testing.T) {
 
 	payload := []byte("dns?")
 	frame := buildUDPFrame(hostIP, guestIP, 1053, 5353, payload)
-	if err := nic.DeliverGuestPacket(frame, nil); err != nil {
+	if err := nic.DeliverGuestPacket(frame, false); err != nil {
 		t.Fatalf("deliver udp packet: %v", err)
 	}
 
@@ -455,17 +462,11 @@ func TestUDPPayloadSurvivesReleasedGuestBuffer(t *testing.T) {
 	defer pc.Close()
 
 	frame := buildUDPFrame(hostIP, guestIP, 1053, 5353, []byte("stable"))
-	released := false
-	if err := nic.DeliverGuestPacket(frame, func() {
-		released = true
-		for i := range frame {
-			frame[i] = 0xee
-		}
-	}); err != nil {
+	if err := nic.DeliverGuestPacket(frame, true); err != nil {
 		t.Fatalf("deliver udp packet: %v", err)
 	}
-	if !released {
-		t.Fatalf("release callback was not called")
+	for i := range frame {
+		frame[i] = 0xee
 	}
 
 	buf := make([]byte, 32)
@@ -492,7 +493,7 @@ func TestDNSServerHostNameAndInternetDisabled(t *testing.T) {
 
 	query := buildDNSQuery(0x1234, "host.containers.internal")
 	frame := buildUDPFrame(hostIP, guestIP, 53, 53000, query)
-	if err := nic.DeliverGuestPacket(frame, nil); err != nil {
+	if err := nic.DeliverGuestPacket(frame, false); err != nil {
 		t.Fatalf("deliver dns query: %v", err)
 	}
 
@@ -521,7 +522,7 @@ func TestDNSServerHostNameAndInternetDisabled(t *testing.T) {
 
 	query = buildDNSQuery(0x1235, "example.com")
 	frame = buildUDPFrame(hostIP, guestIP, 53, 53001, query)
-	if err := nic.DeliverGuestPacket(frame, nil); err != nil {
+	if err := nic.DeliverGuestPacket(frame, false); err != nil {
 		t.Fatalf("deliver external dns query: %v", err)
 	}
 	respFrame = awaitFrame(t, frames)
@@ -589,7 +590,7 @@ func TestOutboundTCPProxy(t *testing.T) {
 	}
 	hostSeq = tcpHdr.seq + uint32(len(tcpHdr.payload))
 	ack := buildTCPFrame(remoteIP, guestIP, remotePort, guestPort, guestSeq, hostSeq, tcpFlagACK, nil)
-	if err := nic.DeliverGuestPacket(ack, nil); err != nil {
+	if err := nic.DeliverGuestPacket(ack, false); err != nil {
 		t.Fatalf("deliver proxy ack: %v", err)
 	}
 	select {
@@ -616,7 +617,7 @@ func TestOutboundTCPProxy(t *testing.T) {
 
 	guestData := []byte("from-guest")
 	dataFrame := buildTCPFrame(remoteIP, guestIP, remotePort, guestPort, guestSeq, hostSeq, tcpFlagACK|tcpFlagPSH, guestData)
-	if err := nic.DeliverGuestPacket(dataFrame, nil); err != nil {
+	if err := nic.DeliverGuestPacket(dataFrame, false); err != nil {
 		t.Fatalf("deliver proxy data: %v", err)
 	}
 	_ = awaitFrame(t, frames) // ACK for guest data.
@@ -663,7 +664,7 @@ func TestTCPHandshakeDataAndClose(t *testing.T) {
 	)
 
 	syn := buildTCPFrame(hostIP, guestIP, hostPort, guestPort, guestSeq, 0, tcpFlagSYN, nil)
-	if err := nic.DeliverGuestPacket(syn, nil); err != nil {
+	if err := nic.DeliverGuestPacket(syn, false); err != nil {
 		t.Fatalf("deliver syn: %v", err)
 	}
 
@@ -687,7 +688,7 @@ func TestTCPHandshakeDataAndClose(t *testing.T) {
 	hostSeq := tcpHdr.seq + 1
 
 	ack := buildTCPFrame(hostIP, guestIP, hostPort, guestPort, guestSeq+1, hostSeq, tcpFlagACK, nil)
-	if err := nic.DeliverGuestPacket(ack, nil); err != nil {
+	if err := nic.DeliverGuestPacket(ack, false); err != nil {
 		t.Fatalf("deliver ack: %v", err)
 	}
 
@@ -705,7 +706,7 @@ func TestTCPHandshakeDataAndClose(t *testing.T) {
 
 	data := []byte("hello")
 	dataFrame := buildTCPFrame(hostIP, guestIP, hostPort, guestPort, guestSeq+1, hostSeq, tcpFlagACK|tcpFlagPSH, data)
-	if err := nic.DeliverGuestPacket(dataFrame, nil); err != nil {
+	if err := nic.DeliverGuestPacket(dataFrame, false); err != nil {
 		t.Fatalf("deliver data: %v", err)
 	}
 
@@ -759,7 +760,7 @@ func TestTCPHandshakeDataAndClose(t *testing.T) {
 
 	finSeq := guestSeq + 1 + uint32(len(data))
 	fin := buildTCPFrame(hostIP, guestIP, hostPort, guestPort, finSeq, hostSeq, tcpFlagFIN|tcpFlagACK, nil)
-	if err := nic.DeliverGuestPacket(fin, nil); err != nil {
+	if err := nic.DeliverGuestPacket(fin, false); err != nil {
 		t.Fatalf("deliver fin: %v", err)
 	}
 
@@ -792,7 +793,7 @@ func TestTCPHandshakeDataAndClose(t *testing.T) {
 	}
 
 	finalAck := buildTCPFrame(hostIP, guestIP, hostPort, guestPort, finSeq+1, tcpHdr.seq+1, tcpFlagACK, nil)
-	if err := nic.DeliverGuestPacket(finalAck, nil); err != nil {
+	if err := nic.DeliverGuestPacket(finalAck, false); err != nil {
 		t.Fatalf("deliver final ack: %v", err)
 	}
 
@@ -840,7 +841,7 @@ func TestTCPDialInternalActiveOpen(t *testing.T) {
 
 	guestSeq := uint32(700)
 	synAck := buildTCPFrame(hostIP, guestIP, tcpHdr.srcPort, guestPort, guestSeq, tcpHdr.seq+1, tcpFlagSYN|tcpFlagACK, nil)
-	if err := nic.DeliverGuestPacket(synAck, nil); err != nil {
+	if err := nic.DeliverGuestPacket(synAck, false); err != nil {
 		t.Fatalf("deliver synack: %v", err)
 	}
 
@@ -888,6 +889,202 @@ func TestTCPDialInternalActiveOpen(t *testing.T) {
 	}
 }
 
+func TestTCPDialInternalRetransmitsDroppedSYN(t *testing.T) {
+	stack, nic, frames := newTestNetStack(t, 1024)
+
+	hostIP := hostIP4(stack)
+	guestIP := guestIP4(stack)
+	const guestPort = 8080
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	dialCh := make(chan dialResult, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go func() {
+		conn, err := stack.DialInternalContext(ctx, "tcp", "10.42.0.2:8080")
+		dialCh <- dialResult{conn: conn, err: err}
+	}()
+
+	firstSyn := awaitFrame(t, frames)
+	_, _, _, payload := parseEthernet(firstSyn)
+	ipHdr, err := parseIPv4Header(payload)
+	if err != nil {
+		t.Fatalf("parse first syn ip: %v", err)
+	}
+	firstHdr, err := parseTCPHeader(ipHdr.payload)
+	if err != nil {
+		t.Fatalf("parse first syn tcp: %v", err)
+	}
+	if firstHdr.flags&tcpFlagSYN == 0 || firstHdr.flags&tcpFlagACK != 0 {
+		t.Fatalf("expected first syn, got flags %#x", firstHdr.flags)
+	}
+
+	secondSyn := awaitFrameWithin(t, frames, 500*time.Millisecond)
+	_, _, _, payload = parseEthernet(secondSyn)
+	ipHdr, err = parseIPv4Header(payload)
+	if err != nil {
+		t.Fatalf("parse second syn ip: %v", err)
+	}
+	secondHdr, err := parseTCPHeader(ipHdr.payload)
+	if err != nil {
+		t.Fatalf("parse second syn tcp: %v", err)
+	}
+	if secondHdr.flags != tcpFlagSYN {
+		t.Fatalf("expected retransmitted syn, got flags %#x", secondHdr.flags)
+	}
+	if secondHdr.seq != firstHdr.seq || secondHdr.srcPort != firstHdr.srcPort {
+		t.Fatalf("retransmitted syn changed seq/port: first seq=%d port=%d second seq=%d port=%d", firstHdr.seq, firstHdr.srcPort, secondHdr.seq, secondHdr.srcPort)
+	}
+
+	guestSeq := uint32(700)
+	synAck := buildTCPFrame(hostIP, guestIP, secondHdr.srcPort, guestPort, guestSeq, secondHdr.seq+1, tcpFlagSYN|tcpFlagACK, nil)
+	if err := nic.DeliverGuestPacket(synAck, false); err != nil {
+		t.Fatalf("deliver synack: %v", err)
+	}
+	ackFrame := awaitFrame(t, frames)
+	_, _, _, payload = parseEthernet(ackFrame)
+	ipHdr, err = parseIPv4Header(payload)
+	if err != nil {
+		t.Fatalf("parse ack ip: %v", err)
+	}
+	ackHdr, err := parseTCPHeader(ipHdr.payload)
+	if err != nil {
+		t.Fatalf("parse ack tcp: %v", err)
+	}
+	if ackHdr.flags != tcpFlagACK {
+		t.Fatalf("expected final ack, got flags %#x", ackHdr.flags)
+	}
+
+	select {
+	case res := <-dialCh:
+		if res.err != nil {
+			t.Fatalf("dial failed: %v", res.err)
+		}
+		res.conn.Close()
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for dial")
+	}
+}
+
+func TestTCPDialInternalConcurrentActiveOpens(t *testing.T) {
+	stack, nic, frames := newTestNetStack(t, 4096)
+
+	hostIP := hostIP4(stack)
+	guestIP := guestIP4(stack)
+	const (
+		dialCount = 64
+		guestPort = 8080
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	dialCh := make(chan dialResult, dialCount)
+	for i := 0; i < dialCount; i++ {
+		go func() {
+			conn, err := stack.DialInternalContext(ctx, "tcp", "10.42.0.2:8080")
+			dialCh <- dialResult{conn: conn, err: err}
+		}()
+	}
+
+	seenSyn := make(map[uint16]uint32, dialCount)
+	acks := make(map[uint16]bool, dialCount)
+	for len(acks) < dialCount {
+		frame := awaitFrameWithin(t, frames, 2*time.Second)
+		_, _, _, payload := parseEthernet(frame)
+		ipHdr, err := parseIPv4Header(payload)
+		if err != nil {
+			t.Fatalf("parse ip: %v", err)
+		}
+		tcpHdr, err := parseTCPHeader(ipHdr.payload)
+		if err != nil {
+			t.Fatalf("parse tcp: %v", err)
+		}
+		if tcpHdr.dstPort != guestPort {
+			t.Fatalf("unexpected destination port %d", tcpHdr.dstPort)
+		}
+		switch {
+		case tcpHdr.flags == tcpFlagSYN:
+			if seq, ok := seenSyn[tcpHdr.srcPort]; ok && seq != tcpHdr.seq {
+				t.Fatalf("source port %d reused with different syn seq %d != %d", tcpHdr.srcPort, tcpHdr.seq, seq)
+			}
+			if len(seenSyn) == dialCount {
+				t.Fatalf("extra syn from source port %d after all dials were seen", tcpHdr.srcPort)
+			}
+			seenSyn[tcpHdr.srcPort] = tcpHdr.seq
+			guestSeq := uint32(1000 + len(seenSyn))
+			synAck := buildTCPFrame(hostIP, guestIP, tcpHdr.srcPort, guestPort, guestSeq, tcpHdr.seq+1, tcpFlagSYN|tcpFlagACK, nil)
+			if err := nic.DeliverGuestPacket(synAck, false); err != nil {
+				t.Fatalf("deliver synack: %v", err)
+			}
+		case tcpHdr.flags == tcpFlagACK:
+			if _, ok := seenSyn[tcpHdr.srcPort]; !ok {
+				t.Fatalf("ack from unseen source port %d", tcpHdr.srcPort)
+			}
+			acks[tcpHdr.srcPort] = true
+		default:
+			t.Fatalf("unexpected tcp flags %#x", tcpHdr.flags)
+		}
+	}
+	if len(seenSyn) != dialCount {
+		t.Fatalf("seen syn count = %d, want %d", len(seenSyn), dialCount)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < dialCount; i++ {
+		select {
+		case res := <-dialCh:
+			if res.err != nil {
+				t.Fatalf("dial %d failed: %v", i, res.err)
+			}
+			wg.Add(1)
+			go func(conn net.Conn) {
+				defer wg.Done()
+				_ = conn.Close()
+			}(res.conn)
+		case <-time.After(time.Second):
+			t.Fatalf("timeout waiting for dial %d", i)
+		}
+	}
+	wg.Wait()
+}
+
+func TestTCPDialInternalContextTimeoutCleansConnection(t *testing.T) {
+	stack, _, frames := newTestNetStack(t, 1024)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Millisecond)
+	defer cancel()
+	_, err := stack.DialInternalContext(ctx, "tcp", "10.42.0.2:8080")
+	if err == nil {
+		t.Fatalf("expected dial timeout")
+	}
+	if !strings.Contains(err.Error(), "deadline exceeded") {
+		t.Fatalf("expected deadline exceeded, got %v", err)
+	}
+
+	// The initial SYN and possibly one retransmit may be queued, but the failed
+	// active open must not leave a live TCP connection behind.
+	for {
+		select {
+		case <-frames:
+		default:
+			stack.tcpMu.Lock()
+			defer stack.tcpMu.Unlock()
+			if len(stack.tcpConns) != 0 {
+				t.Fatalf("tcpConns len = %d, want 0 after timeout", len(stack.tcpConns))
+			}
+			return
+		}
+	}
+}
+
 func TestTCPWriteDeadlineWhileSendWindowClosed(t *testing.T) {
 	stack, nic, frames := newTestNetStack(t, 1024)
 
@@ -921,7 +1118,7 @@ func TestTCPWriteDeadlineWhileSendWindowClosed(t *testing.T) {
 	defer conn.Close()
 
 	zeroWindow := buildTCPFrameWithWindow(hostIP, guestIP, hostPort, guestPort, guestSeq, hostSeq, tcpFlagACK, 0, nil)
-	if err := nic.DeliverGuestPacket(zeroWindow, nil); err != nil {
+	if err := nic.DeliverGuestPacket(zeroWindow, false); err != nil {
 		t.Fatalf("deliver zero-window ack: %v", err)
 	}
 
@@ -931,6 +1128,27 @@ func TestTCPWriteDeadlineWhileSendWindowClosed(t *testing.T) {
 	_, err = conn.Write([]byte("blocked"))
 	if !isTimeout(err) {
 		t.Fatalf("expected write timeout, got %v", err)
+	}
+}
+
+func TestDeliverGuestPacketMalformedFramesDoNotPanic(t *testing.T) {
+	_, nic, _ := newTestNetStack(t, 1024)
+
+	rng := rand.New(rand.NewSource(1))
+	for i := 0; i < 512; i++ {
+		packet := make([]byte, rng.Intn(128))
+		if _, err := rng.Read(packet); err != nil {
+			t.Fatalf("rng read: %v", err)
+		}
+
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					t.Fatalf("DeliverGuestPacket panicked for len=%d: %v", len(packet), recovered)
+				}
+			}()
+			_ = nic.DeliverGuestPacket(packet, false)
+		}()
 	}
 }
 

@@ -41,6 +41,11 @@ func (s *ContainerSession) Close() error {
 	return nil
 }
 
+func (s *ContainerSession) AddPortForward(ctx context.Context, forward client.PortForward) error {
+	_, _ = ctx, forward
+	return fmt.Errorf("hvf container runner is unsupported on this host")
+}
+
 func RunContainer(ctx context.Context, req ContainerRunRequest) (ContainerRunResult, error) {
 	_ = ctx
 	_ = req

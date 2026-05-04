@@ -86,6 +86,7 @@ const (
 	fusePoll       = 40
 	fuseLseek      = 46
 	fuseSyncFS     = 50
+	fuseTmpfile    = 51
 	fuseStatx      = 52
 )
 
@@ -1437,6 +1438,9 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		return reply(0, extra), nil
 	case fuseSyncFS:
 		return reply(0, nil), nil
+	case fuseTmpfile:
+		f.logPathf("tmpfile", nodeID, "")
+		return reply(-linuxENOSYS, nil), nil
 	case fuseDestroy:
 		return reply(0, nil), nil
 	case fuseIoctl:
@@ -1542,6 +1546,8 @@ func fuseOpcodeName(opcode uint32) string {
 		return "LSEEK"
 	case fuseSyncFS:
 		return "SYNCFS"
+	case fuseTmpfile:
+		return "TMPFILE"
 	case fuseStatx:
 		return "STATX"
 	default:
@@ -2111,6 +2117,7 @@ type imageNode struct {
 	data          []byte
 	symlinkTarget string
 	entries       map[string]uint64
+	whiteouts     map[string]bool
 	entriesDone   bool
 	modTime       time.Time
 	abstractFile  imagefs.File
@@ -2855,6 +2862,9 @@ func (p *imageFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32) {
 	}
 	childID, ok := parentNode.entries[name]
 	if !ok {
+		if parentNode.whiteouts[name] {
+			return 0, FuseAttr{}, -linuxENOENT
+		}
 		if parentNode.abstractDir == nil {
 			return 0, FuseAttr{}, -linuxENOENT
 		}
@@ -2875,7 +2885,7 @@ func (p *imageFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32) {
 	return child.id, p.attr(child), 0
 }
 
-func (p *imageFS) Open(nodeID uint64, _ uint32) (uint64, int32) {
+func (p *imageFS) Open(nodeID uint64, flags uint32) (uint64, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	node := p.nodes[nodeID]
@@ -2884,6 +2894,16 @@ func (p *imageFS) Open(nodeID uint64, _ uint32) (uint64, int32) {
 	}
 	if node.isDir() {
 		return 0, -linuxEISDIR
+	}
+	if flags&linuxOACCMODE != linuxORDONLY {
+		if errno := p.copyUpFileLocked(node); errno != 0 {
+			return 0, errno
+		}
+		if flags&linuxOTRUNC != 0 {
+			node.data = nil
+			node.size = 0
+			node.modTime = time.Now()
+		}
 	}
 	fh := p.nextHandle
 	p.nextHandle++
@@ -3131,6 +3151,12 @@ func (p *imageFS) RmDir(parent uint64, name string) int32 {
 		return -linuxENOTEMPTY
 	}
 	delete(parentNode.entries, name)
+	if parentNode.abstractDir != nil {
+		if parentNode.whiteouts == nil {
+			parentNode.whiteouts = map[string]bool{}
+		}
+		parentNode.whiteouts[name] = true
+	}
 	delete(p.nodes, childID)
 	return 0
 }
@@ -3145,6 +3171,9 @@ func (p *imageFS) Create(parent uint64, name string, _ uint32, mode uint32) (uin
 	name = path.Base(path.Clean("/" + name))
 	if _, exists := parentNode.entries[name]; exists {
 		return 0, 0, FuseAttr{}, -linuxEEXIST
+	}
+	if parentNode.whiteouts != nil {
+		delete(parentNode.whiteouts, name)
 	}
 	node := &imageNode{
 		id:      p.nextNodeID,
@@ -3170,8 +3199,8 @@ func (p *imageFS) Write(nodeID uint64, fh uint64, off uint64, data []byte, _ uin
 	if handle == nil || handle.nodeID != nodeID || node == nil {
 		return 0, -linuxEBADF
 	}
-	if node.abstractFile != nil || node.abstractDir != nil || node.abstractLink != nil {
-		return 0, -linuxEROFS
+	if errno := p.copyUpFileLocked(node); errno != 0 {
+		return 0, errno
 	}
 	end := off + uint64(len(data))
 	if end > uint64(len(node.data)) {
@@ -3194,8 +3223,10 @@ func (p *imageFS) SetAttr(nodeID uint64, valid uint32, _ uint64, size uint64, mo
 	if node == nil {
 		return FuseAttr{}, -linuxENOENT
 	}
-	if node.abstractFile != nil || node.abstractDir != nil || node.abstractLink != nil {
-		return FuseAttr{}, -linuxEROFS
+	if !node.isDir() {
+		if errno := p.copyUpFileLocked(node); errno != 0 {
+			return FuseAttr{}, errno
+		}
 	}
 	if valid&fattrMode != 0 {
 		node.mode = fs.FileMode(mode & linuxPermMask)
@@ -3243,11 +3274,59 @@ func (p *imageFS) Unlink(parent uint64, name string) int32 {
 	if child.isDir() {
 		return -linuxEISDIR
 	}
-	if child.abstractFile != nil || child.abstractLink != nil {
-		return -linuxEROFS
+	delete(parentNode.entries, name)
+	if parentNode.abstractDir != nil {
+		if parentNode.whiteouts == nil {
+			parentNode.whiteouts = map[string]bool{}
+		}
+		parentNode.whiteouts[name] = true
+	}
+	delete(p.nodes, childID)
+	return 0
+}
+
+func (p *imageFS) Rename(parent uint64, name string, newParent uint64, newName string, _ uint32) int32 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	parentNode := p.nodes[parent]
+	newParentNode := p.nodes[newParent]
+	if parentNode == nil || newParentNode == nil {
+		return -linuxENOENT
+	}
+	name = path.Base(path.Clean("/" + name))
+	newName = path.Base(path.Clean("/" + newName))
+	childID, ok := parentNode.entries[name]
+	if !ok {
+		return -linuxENOENT
+	}
+	child := p.nodes[childID]
+	if child == nil {
+		return -linuxENOENT
+	}
+	if existingID, exists := newParentNode.entries[newName]; exists && existingID != childID {
+		existing := p.nodes[existingID]
+		if existing != nil && existing.isDir() && !child.isDir() {
+			return -linuxEISDIR
+		}
+		if existing != nil && !existing.isDir() && child.isDir() {
+			return -linuxENOTDIR
+		}
+		delete(p.nodes, existingID)
 	}
 	delete(parentNode.entries, name)
-	delete(p.nodes, childID)
+	if parentNode.abstractDir != nil {
+		if parentNode.whiteouts == nil {
+			parentNode.whiteouts = map[string]bool{}
+		}
+		parentNode.whiteouts[name] = true
+	}
+	if newParentNode.whiteouts != nil {
+		delete(newParentNode.whiteouts, newName)
+	}
+	newParentNode.entries[newName] = childID
+	child.parent = newParent
+	child.name = newName
+	child.modTime = time.Now()
 	return 0
 }
 
@@ -3350,6 +3429,9 @@ func (p *imageFS) dirType(node *imageNode) uint32 {
 }
 
 func (p *imageFS) createAbstractNode(parent *imageNode, name string, entry imagefs.Entry) (*imageNode, int32) {
+	if parent.whiteouts[name] {
+		return nil, -linuxENOENT
+	}
 	node := &imageNode{
 		id:      p.nextNodeID,
 		parent:  parent.id,
@@ -3403,6 +3485,9 @@ func (p *imageFS) materializeDirEntriesLocked(node *imageNode) ([]imagefs.DirEnt
 		if ent.Name == "." || ent.Name == ".." {
 			continue
 		}
+		if node.whiteouts[ent.Name] {
+			continue
+		}
 		if _, ok := node.entries[ent.Name]; ok {
 			continue
 		}
@@ -3416,6 +3501,34 @@ func (p *imageFS) materializeDirEntriesLocked(node *imageNode) ([]imagefs.DirEnt
 	}
 	node.entriesDone = true
 	return ents, 0
+}
+
+func (p *imageFS) copyUpFileLocked(node *imageNode) int32 {
+	if node == nil {
+		return -linuxENOENT
+	}
+	if node.abstractDir != nil {
+		return -linuxEISDIR
+	}
+	if node.abstractLink != nil {
+		return -linuxEINVAL
+	}
+	if node.abstractFile == nil {
+		return 0
+	}
+	size, mode := node.abstractFile.Stat()
+	data, err := node.abstractFile.ReadAt(0, uint32(size))
+	if err != nil {
+		return errnoFromError(err)
+	}
+	node.data = append(node.data[:0], data...)
+	node.size = uint64(len(node.data))
+	node.mode = mode
+	node.abstractFile = nil
+	if node.modTime.IsZero() {
+		node.modTime = time.Now()
+	}
+	return 0
 }
 
 func (n *imageNode) isDir() bool {

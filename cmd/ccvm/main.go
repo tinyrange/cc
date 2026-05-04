@@ -683,6 +683,19 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 		}
 		writeJSON(w, http.StatusOK, srvState.vms.StatusOf(id))
 	})
+	mux.HandleFunc("POST /vm/forward", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimSpace(r.URL.Query().Get("id"))
+		var req client.PortForward
+		if err := decodeRequiredJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := srvState.vms.AddPortForwardTo(r.Context(), id, req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, req)
+	})
 	mux.HandleFunc("POST /vm/run", func(w http.ResponseWriter, r *http.Request) {
 		req, err := decodeRunRequest(r)
 		if err != nil {
