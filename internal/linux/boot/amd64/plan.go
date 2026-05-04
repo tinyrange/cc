@@ -112,7 +112,11 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 	if len(e820) == 0 {
 		e820 = DefaultE820Map(memStart, memEnd)
 	}
-	if err := img.buildZeroPage(memory, memStart, loadAddr, opts.Cmdline, opts.CmdlineGPA, initrdAddr, uint32(len(opts.Initrd)), opts.ZeroPageGPA, e820); err != nil {
+	acpiRSDP, err := installBootACPI(memory, memStart, opts.NumCPUs)
+	if err != nil {
+		return nil, err
+	}
+	if err := img.buildZeroPage(memory, memStart, loadAddr, opts.Cmdline, opts.CmdlineGPA, initrdAddr, uint32(len(opts.Initrd)), opts.ZeroPageGPA, acpiRSDP, e820); err != nil {
 		return nil, err
 	}
 	if opts.NumCPUs > 1 {
@@ -242,7 +246,7 @@ func checksum(buf []byte) byte {
 	return -sum
 }
 
-func (k *KernelImage) buildZeroPage(memory []byte, memStart, loadAddr uint64, cmdline string, cmdlineGPA, initrdGPA uint64, initrdSize uint32, zeroPageGPA uint64, e820 []E820Entry) error {
+func (k *KernelImage) buildZeroPage(memory []byte, memStart, loadAddr uint64, cmdline string, cmdlineGPA, initrdGPA uint64, initrdSize uint32, zeroPageGPA, acpiRSDP uint64, e820 []E820Entry) error {
 	zp := make([]byte, zeroPageSize)
 	if len(k.HeaderBytes) > zeroPageSize-setupHeaderOffset {
 		return errors.New("setup header larger than zero page space")
@@ -257,6 +261,7 @@ func (k *KernelImage) buildZeroPage(memory []byte, memStart, loadAddr uint64, cm
 	binary.LittleEndian.PutUint32(zp[code32StartOffset:], uint32(loadAddr))
 	binary.LittleEndian.PutUint32(zp[cmdLinePtrOffset:], uint32(cmdlineGPA))
 	binary.LittleEndian.PutUint32(zp[zeroPageExtCmdLinePtr:], uint32(cmdlineGPA>>32))
+	binary.LittleEndian.PutUint64(zp[zeroPageACPIRSDPAddr:], acpiRSDP)
 	binary.LittleEndian.PutUint32(zp[initrdAddrMaxOffset:], k.Header.InitrdAddrMax)
 	binary.LittleEndian.PutUint32(zp[kernelAlignmentOffset:], k.Header.KernelAlignment)
 	zp[relocatableKernelOffset] = k.Header.RelocatableKernel

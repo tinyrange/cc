@@ -1222,6 +1222,8 @@ def resolve_base_url(base_url: Optional[str] = None) -> str:
     if state_path.exists():
         state = DaemonState.from_file(state_path)
         if _health_check(state.base_url):
+            if _supports_vm_start(state.base_url):
+                _ensure_daemon_watchdog(state.base_url)
             return state.base_url
         state_path.unlink(missing_ok=True)
 

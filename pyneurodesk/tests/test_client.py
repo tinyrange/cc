@@ -1079,13 +1079,20 @@ def test_resolve_base_url_reads_daemon_state(monkeypatch, tmp_path: Path) -> Non
     monkeypatch.delenv("CCX3_URL", raising=False)
     monkeypatch.delenv("CCVM_URL", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
+    calls: list[tuple[str, str]] = []
     monkeypatch.setattr("pyneurodesk.api._health_check", lambda base_url: base_url == "http://127.0.0.1:4567")
+    monkeypatch.setattr("pyneurodesk.api._supports_vm_start", lambda base_url: calls.append(("supports", base_url)) or True)
+    monkeypatch.setattr("pyneurodesk.api._ensure_daemon_watchdog", lambda base_url: calls.append(("watchdog", base_url)))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / ".cache"))
     state_path = default_daemon_state_path()
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text('{"addr":"127.0.0.1:4567"}')
 
     assert resolve_base_url() == "http://127.0.0.1:4567"
+    assert calls == [
+        ("supports", "http://127.0.0.1:4567"),
+        ("watchdog", "http://127.0.0.1:4567"),
+    ]
 
 
 def test_resolve_base_url_starts_daemon_when_state_missing(monkeypatch) -> None:

@@ -317,13 +317,17 @@ func (s *ManagedSession) sendStdinClose(id string) error {
 }
 
 func (s *ManagedSession) sendExecMessage(msg vmruntime.ManagedExecRequest) error {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	return sendManagedExecMessage(s.control, msg)
+}
+
+func sendManagedExecMessage(control virtio.VsockConn, msg vmruntime.ManagedExecRequest) error {
 	payload, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("marshal exec request: %w", err)
 	}
-	s.sendMu.Lock()
-	defer s.sendMu.Unlock()
-	if _, err := s.control.Write(append(payload, '\n')); err != nil {
+	if _, err := control.Write(append(payload, '\n')); err != nil {
 		return fmt.Errorf("write exec request: %w", err)
 	}
 	return nil

@@ -73,6 +73,18 @@ type kvmIRQLevel struct {
 	Level uint32
 }
 
+type kvmMSREntry struct {
+	Index    uint32
+	Reserved uint32
+	Data     uint64
+}
+
+type kvmMSRs1 struct {
+	NMSRs uint32
+	Pad   uint32
+	Entry kvmMSREntry
+}
+
 type kvmRegs struct {
 	Rax    uint64
 	Rbx    uint64

@@ -5,11 +5,16 @@ package kvm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
+	"time"
 
+	"golang.org/x/sys/unix"
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/amd64vm"
 	"j5.nz/cc/internal/serial"
@@ -121,8 +126,15 @@ func RunManagedExecWithFSAndNet(ctx context.Context, kernel []byte, initrd []byt
 		return fmt.Errorf("%w\nserial:\n%s\ncontrol:\n%s", err, serialOut.String(), controlTranscript.String())
 	}
 
+	runDone := make(chan struct{})
 	go func() {
+		defer close(runDone)
 		setRunErr(runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, netdev, serialOut))
+	}()
+	defer func() {
+		cancel()
+		_ = vm.CancelRun()
+		<-runDone
 	}()
 	go func() {
 		text, err := serialOut.WaitFor(runCtx, 0, vmruntime.HasFatalBootText)
@@ -216,6 +228,8 @@ func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs
 func runManagedExecVMMulti(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, serialOut *vmruntime.SerialTranscript) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	sampler := startKVMRegisterSampler(runCtx, vm)
+	defer sampler.Close()
 	errCh := make(chan error, len(vm.vcpus))
 	var wg sync.WaitGroup
 	var exitMu sync.Mutex
@@ -223,13 +237,25 @@ func runManagedExecVMMulti(ctx context.Context, vm *VM, uart *serial.UART8250, f
 		wg.Add(1)
 		go func(index int) {
 			defer wg.Done()
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+			vm.SetVCPUTID(index, unix.Gettid())
 			var exit Exit
 			for {
 				if err := runCtx.Err(); err != nil {
 					return
 				}
-				err := vm.RunVCPU(index, &exit)
+				err := error(nil)
+				if sampler.Enabled() {
+					err = vm.RunVCPUInterruptible(index, &exit)
+				} else {
+					err = vm.RunVCPU(index, &exit)
+				}
 				if err != nil {
+					if sampler.Enabled() && errors.Is(err, unix.EINTR) {
+						sampler.Record(vm.VCPURegisters(index))
+						continue
+					}
 					reportRunErr(errCh, cancel, fmt.Errorf("run vcpu %d: %w", index, err))
 					return
 				}
@@ -239,6 +265,9 @@ func runManagedExecVMMulti(ctx context.Context, vm *VM, uart *serial.UART8250, f
 				if err != nil {
 					reportRunErr(errCh, cancel, err)
 					return
+				}
+				if exit.Reason == ExitHLT {
+					time.Sleep(100 * time.Microsecond)
 				}
 			}
 		}(index)
@@ -255,6 +284,68 @@ func runManagedExecVMMulti(ctx context.Context, vm *VM, uart *serial.UART8250, f
 	case <-runCtx.Done():
 		return runCtx.Err()
 	}
+}
+
+type kvmRegisterSampler struct {
+	file *os.File
+	mu   sync.Mutex
+}
+
+func startKVMRegisterSampler(ctx context.Context, vm *VM) *kvmRegisterSampler {
+	path := strings.TrimSpace(os.Getenv("CCX3_KVM_REGISTER_SAMPLE"))
+	if path == "" || vm == nil {
+		return &kvmRegisterSampler{}
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ccx3: open KVM register sample file %q: %v\n", path, err)
+		return &kvmRegisterSampler{}
+	}
+	s := &kvmRegisterSampler{file: file}
+	go func() {
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				vm.RequestImmediateExit()
+			}
+		}
+	}()
+	return s
+}
+
+func (s *kvmRegisterSampler) Enabled() bool {
+	return s != nil && s.file != nil
+}
+
+func (s *kvmRegisterSampler) Record(regs map[string]any) {
+	if !s.Enabled() {
+		return
+	}
+	payload := map[string]any{
+		"time": time.Now().Format(time.RFC3339Nano),
+		"regs": regs,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, _ = s.file.Write(append(data, '\n'))
+}
+
+func (s *kvmRegisterSampler) Close() {
+	if s == nil || s.file == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_ = s.file.Close()
+	s.file = nil
 }
 
 func reportRunErr(errCh chan<- error, cancel context.CancelFunc, err error) {

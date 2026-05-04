@@ -58,6 +58,43 @@ func TestPassthroughFSCreateWriteRenameUnlink(t *testing.T) {
 	}
 }
 
+func TestPassthroughFSAppendWritesAppendInsteadOfWriteAt(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	fs := NewPassthroughFS(root, nil)
+	be, ok := fs.(*passthroughFS)
+	if !ok {
+		t.Fatalf("backend type = %T", fs)
+	}
+
+	nodeID, fh, _, errno := be.Create(1, "append.txt", linuxOWRONLY|linuxOCREAT|linuxOTRUNC, 0o644)
+	if errno != 0 {
+		t.Fatalf("Create() errno = %d", errno)
+	}
+	if wrote, errno := be.Write(nodeID, fh, 0, []byte("base"), 0); errno != 0 || wrote != 4 {
+		t.Fatalf("initial Write() = (%d, %d)", wrote, errno)
+	}
+	be.Release(nodeID, fh)
+
+	fh, errno = be.Open(nodeID, linuxOWRONLY|linuxOAPPEND)
+	if errno != 0 {
+		t.Fatalf("Open(O_APPEND) errno = %d", errno)
+	}
+	if wrote, errno := be.Write(nodeID, fh, 0, []byte("+tail"), 0); errno != 0 || wrote != 5 {
+		t.Fatalf("append Write() = (%d, %d)", wrote, errno)
+	}
+	be.Release(nodeID, fh)
+
+	data, err := os.ReadFile(filepath.Join(root, "append.txt"))
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(data) != "base+tail" {
+		t.Fatalf("ReadFile() = %q", data)
+	}
+}
+
 func TestStrictFUSEFsyncUsesBackendHandle(t *testing.T) {
 	t.Parallel()
 

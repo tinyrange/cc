@@ -138,6 +138,53 @@ func TestManagedSessionExecStreamClosesStdinWhenNoInputStream(t *testing.T) {
 	}
 }
 
+func TestManagedSessionExecClosesStdinAfterInitialPayload(t *testing.T) {
+	transcript := vmruntime.NewSerialTranscript()
+	writes := make(chan vmruntime.ManagedExecRequest, 4)
+	conn := &fakeVsockConn{
+		writeFn: func(data []byte) (int, error) {
+			var req vmruntime.ManagedExecRequest
+			if err := json.Unmarshal(data, &req); err != nil {
+				t.Errorf("decode control write: %v", err)
+				return len(data), nil
+			}
+			writes <- req
+			if req.Kind == "stdin_close" {
+				transcript.Write([]byte(vmruntime.CommandBeginMarker + req.ID + "\n"))
+				transcript.Write([]byte(vmruntime.CommandOutputMarker + req.ID + ":" + base64.StdEncoding.EncodeToString([]byte("done")) + "\n"))
+				transcript.Write([]byte(vmruntime.CommandExitMarkerPref + req.ID + ":0\n"))
+			}
+			return len(data), nil
+		},
+	}
+	session := &ManagedSession{
+		control:    conn,
+		transcript: transcript,
+		serialOut:  vmruntime.NewSerialTranscript(),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	res, err := session.Exec(ctx, client.ExecRequest{Command: []string{"cat"}, Stdin: []byte("input")})
+	if err != nil {
+		t.Fatalf("Exec() error = %v", err)
+	}
+	if res.ExitCode != 0 || res.Output != "done" {
+		t.Fatalf("Exec() response = %#v", res)
+	}
+
+	got := drainExecRequests(writes)
+	if len(got) != 2 {
+		t.Fatalf("control write count = %d, want 2: %#v", len(got), got)
+	}
+	if got[0].Kind != "exec" || got[1].Kind != "stdin_close" || got[0].ID != got[1].ID {
+		t.Fatalf("control writes = %#v", got)
+	}
+	if string(got[0].Stdin) != "input" {
+		t.Fatalf("initial stdin = %q", got[0].Stdin)
+	}
+}
+
 func TestManagedSessionExecStreamTerminatesGuestExecOnContextCancel(t *testing.T) {
 	transcript := vmruntime.NewSerialTranscript()
 	writes := make(chan vmruntime.ManagedExecRequest, 4)

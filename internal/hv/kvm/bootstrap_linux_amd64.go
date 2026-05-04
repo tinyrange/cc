@@ -147,6 +147,7 @@ func (b *Bootstrap) InitVCPUWithTopology(vmfd, vcpufd, id, cpus int) error {
 		return err
 	}
 	setCPUIDTopology(cpuid, id, cpus)
+	setCPUIDBrandString(cpuid, hostCPUBrandString())
 	return setVCPUID(vcpufd, cpuid)
 }
 

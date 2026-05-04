@@ -5,6 +5,7 @@ package kvm
 import (
 	"encoding/binary"
 	"fmt"
+	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -59,6 +60,7 @@ type VCPU struct {
 	id  int
 	fd  int
 	run []byte
+	tid atomic.Int32
 }
 
 type memoryMapping struct {
@@ -117,6 +119,14 @@ func NewVMWithCPUs(cpus int) (*VM, error) {
 		if id == 0 {
 			vm.vcpufd = vcpufd
 		}
+	}
+	if err := vm.SetMiscEnable(); err != nil {
+		vm.Close()
+		return nil, fmt.Errorf("set vcpu misc enable: %w", err)
+	}
+	if err := vm.SetMicrocodeSignature(0xffffffff); err != nil {
+		vm.Close()
+		return nil, fmt.Errorf("set vcpu microcode signature: %w", err)
 	}
 	return vm, nil
 }
@@ -242,13 +252,34 @@ func (v *VM) RunVCPU(index int, exit *Exit) error {
 	return v.vcpus[index].Run(exit)
 }
 
+func (v *VM) RunVCPUInterruptible(index int, exit *Exit) error {
+	if v == nil || index < 0 || index >= len(v.vcpus) {
+		return fmt.Errorf("vcpu %d out of range", index)
+	}
+	return v.vcpus[index].RunInterruptible(exit)
+}
+
 func (c *VCPU) Run(exit *Exit) error {
+	return c.execute(exit, false)
+}
+
+func (c *VCPU) RunInterruptible(exit *Exit) error {
+	return c.execute(exit, true)
+}
+
+func (c *VCPU) execute(exit *Exit, interruptible bool) error {
 	if exit == nil {
 		return fmt.Errorf("exit is nil")
 	}
 	run := (*kvmRunData)(unsafe.Pointer(&c.run[0]))
 	run.immediateExit = 0
-	if _, err := ioctlRunVCPU(uintptr(c.fd)); err != nil {
+	var err error
+	if interruptible {
+		_, err = ioctlRunVCPUInterruptible(uintptr(c.fd))
+	} else {
+		_, err = ioctlRunVCPU(uintptr(c.fd))
+	}
+	if err != nil {
 		return fmt.Errorf("run vcpu: %w", err)
 	}
 	reason := ExitReason(run.exitReason)
@@ -278,6 +309,30 @@ func (c *VCPU) Run(exit *Exit) error {
 	return nil
 }
 
+func (v *VM) RequestImmediateExit() {
+	if v == nil {
+		return
+	}
+	pid := unix.Getpid()
+	for _, vcpu := range v.vcpus {
+		if vcpu == nil || len(vcpu.run) == 0 {
+			continue
+		}
+		run := (*kvmRunData)(unsafe.Pointer(&vcpu.run[0]))
+		run.immediateExit = 1
+		if tid := vcpu.tid.Load(); tid > 0 {
+			_ = unix.Tgkill(pid, int(tid), unix.SIGURG)
+		}
+	}
+}
+
+func (v *VM) SetVCPUTID(index int, tid int) {
+	if v == nil || index < 0 || index >= len(v.vcpus) || v.vcpus[index] == nil {
+		return
+	}
+	v.vcpus[index].tid.Store(int32(tid))
+}
+
 func (v *VM) CancelRun() error {
 	if v == nil {
 		return nil
@@ -288,6 +343,63 @@ func (v *VM) CancelRun() error {
 		}
 		run := (*kvmRunData)(unsafe.Pointer(&vcpu.run[0]))
 		run.immediateExit = 1
+	}
+	return nil
+}
+
+func (v *VM) SetTSC(value uint64) error {
+	if v == nil {
+		return nil
+	}
+	for index, vcpu := range v.vcpus {
+		if vcpu == nil || vcpu.fd < 0 {
+			continue
+		}
+		if err := setVCPUMSR(vcpu.fd, ia32TSCMSR, value); err != nil {
+			return fmt.Errorf("set tsc vcpu %d: %w", index, err)
+		}
+	}
+	return nil
+}
+
+func (v *VM) SetTSCAux() error {
+	if v == nil {
+		return nil
+	}
+	for index, vcpu := range v.vcpus {
+		if vcpu == nil || vcpu.fd < 0 {
+			continue
+		}
+		if err := setVCPUMSR(vcpu.fd, ia32TSCAuxMSR, uint64(index)); err != nil {
+			return fmt.Errorf("set tsc aux vcpu %d: %w", index, err)
+		}
+	}
+	return nil
+}
+
+func (v *VM) SetMicrocodeSignature(signature uint32) error {
+	for index, vcpu := range v.vcpus {
+		if vcpu == nil {
+			continue
+		}
+		if err := setVCPUMSR(vcpu.fd, ia32BIOSSignIDMSR, uint64(signature)<<32); err != nil {
+			return fmt.Errorf("set vcpu %d microcode signature: %w", index, err)
+		}
+	}
+	return nil
+}
+
+func (v *VM) SetMiscEnable() error {
+	if v == nil {
+		return nil
+	}
+	for index, vcpu := range v.vcpus {
+		if vcpu == nil || vcpu.fd < 0 {
+			continue
+		}
+		if err := setVCPUMSR(vcpu.fd, ia32MiscEnableMSR, ia32MiscEnableDefault); err != nil {
+			return fmt.Errorf("set misc enable vcpu %d: %w", index, err)
+		}
 	}
 	return nil
 }
@@ -305,6 +417,35 @@ func (v *VM) GetVCPUPC(index int) (uint64, error) {
 		return 0, err
 	}
 	return regs.Rip, nil
+}
+
+func (v *VM) VCPURegisters(index int) map[string]any {
+	snapshot := map[string]any{"vcpu": index}
+	if v == nil || index < 0 || index >= len(v.vcpus) {
+		snapshot["error"] = fmt.Sprintf("vcpu %d out of range", index)
+		return snapshot
+	}
+	vcpu := v.vcpus[index]
+	if vcpu == nil || vcpu.fd < 0 {
+		snapshot["error"] = "vcpu is closed"
+		return snapshot
+	}
+	regs, err := getRegs(vcpu.fd)
+	if err != nil {
+		snapshot["error"] = err.Error()
+		return snapshot
+	}
+	snapshot["rip"] = regs.Rip
+	snapshot["rsp"] = regs.Rsp
+	snapshot["rbp"] = regs.Rbp
+	snapshot["rax"] = regs.Rax
+	snapshot["rbx"] = regs.Rbx
+	snapshot["rcx"] = regs.Rcx
+	snapshot["rdx"] = regs.Rdx
+	snapshot["rsi"] = regs.Rsi
+	snapshot["rdi"] = regs.Rdi
+	snapshot["rflags"] = regs.Rflags
+	return snapshot
 }
 
 func (v *VM) CompleteMMIORead(value uint64, size uint32) {

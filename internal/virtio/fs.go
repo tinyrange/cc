@@ -2082,6 +2082,7 @@ type passthroughFS struct {
 type passthroughHandle struct {
 	nodeID uint64
 	file   *os.File
+	append bool
 }
 
 type imageFS struct {
@@ -2318,7 +2319,7 @@ func (p *passthroughFS) Create(parent uint64, name string, flags uint32, mode ui
 	p.mu.Lock()
 	handle := p.nextHandle
 	p.nextHandle++
-	p.handles[handle] = &passthroughHandle{nodeID: nodeID, file: file}
+	p.handles[handle] = &passthroughHandle{nodeID: nodeID, file: file, append: flags&linuxOAPPEND != 0}
 	p.mu.Unlock()
 	return nodeID, handle, p.fileAttr(nodeID, info), 0
 }
@@ -2344,7 +2345,7 @@ func (p *passthroughFS) Open(nodeID uint64, flags uint32) (uint64, int32) {
 	defer p.mu.Unlock()
 	handle := p.nextHandle
 	p.nextHandle++
-	p.handles[handle] = &passthroughHandle{nodeID: nodeID, file: file}
+	p.handles[handle] = &passthroughHandle{nodeID: nodeID, file: file, append: flags&linuxOAPPEND != 0}
 	return handle, 0
 }
 
@@ -2480,7 +2481,15 @@ func (p *passthroughFS) Write(nodeID uint64, fh uint64, off uint64, data []byte,
 	if handle == nil || handle.nodeID != nodeID || handle.file == nil {
 		return 0, -linuxEBADF
 	}
-	n, err := handle.file.WriteAt(data, int64(off))
+	var (
+		n   int
+		err error
+	)
+	if handle.append {
+		n, err = handle.file.Write(data)
+	} else {
+		n, err = handle.file.WriteAt(data, int64(off))
+	}
 	if err != nil {
 		return uint32(n), errnoFromError(err)
 	}

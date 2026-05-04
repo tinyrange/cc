@@ -24,6 +24,7 @@ func TestPrepareBootPlacesZeroPage(t *testing.T) {
 	initrd := []byte("initrd")
 	plan, err := PrepareBoot(mem, testBzImage(), BootOptions{
 		MemorySize: uint64(len(mem)),
+		NumCPUs:    5,
 		Cmdline:    "console=ttyS0 rdinit=/init",
 		Initrd:     initrd,
 	})
@@ -38,6 +39,37 @@ func TestPrepareBootPlacesZeroPage(t *testing.T) {
 	}
 	if got := binary.LittleEndian.Uint16(mem[0x90000+setupHeaderBootFlagOffset:]); got != 0xaa55 {
 		t.Fatalf("boot flag = %#x", got)
+	}
+	if got := binary.LittleEndian.Uint64(mem[0x90000+zeroPageACPIRSDPAddr:]); got != acpiRSDPAddress {
+		t.Fatalf("ACPI RSDP boot param = %#x, want %#x", got, acpiRSDPAddress)
+	}
+	if got := string(mem[acpiRSDPAddress : acpiRSDPAddress+8]); got != "RSD PTR " {
+		t.Fatalf("RSDP signature = %q", got)
+	}
+	if got := string(mem[acpiTableAddress : acpiTableAddress+4]); got != "FACS" {
+		t.Fatalf("FACS signature = %q", got)
+	}
+	if got := string(mem[acpiTableAddress+0x40 : acpiTableAddress+0x44]); got != "DSDT" {
+		t.Fatalf("DSDT signature = %q", got)
+	}
+	if got := string(mem[acpiTableAddress+0x70 : acpiTableAddress+0x74]); got != "FACP" {
+		t.Fatalf("FADT signature = %q", got)
+	}
+	fadtBody := mem[acpiTableAddress+0x70+36:]
+	if got := binary.LittleEndian.Uint32(fadtBody[20:]); got != 0x400 {
+		t.Fatalf("FADT PM1a event block = %#x, want 0x400", got)
+	}
+	if got := binary.LittleEndian.Uint32(fadtBody[28:]); got != 0x404 {
+		t.Fatalf("FADT PM1a control block = %#x, want 0x404", got)
+	}
+	if got := fadtBody[52]; got != 4 {
+		t.Fatalf("FADT PM1 event length = %d, want 4", got)
+	}
+	if got := fadtBody[53]; got != 2 {
+		t.Fatalf("FADT PM1 control length = %d, want 2", got)
+	}
+	if got := string(mem[0x000f0000 : 0x000f0000+4]); got != "_MP_" {
+		t.Fatalf("MP floating pointer signature = %q", got)
 	}
 }
 

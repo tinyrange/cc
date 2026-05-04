@@ -8,6 +8,7 @@ const (
 	zeroPageExtRamDiskImage = 192
 	zeroPageExtRamDiskSize  = 196
 	zeroPageExtCmdLinePtr   = 200
+	zeroPageACPIRSDPAddr    = 112
 	zeroPageE820Entries     = 488
 	zeroPageE820Table       = 720
 

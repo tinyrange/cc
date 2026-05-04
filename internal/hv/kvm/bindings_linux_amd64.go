@@ -4,6 +4,8 @@ package kvm
 
 import (
 	"math/bits"
+	"os"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -28,8 +30,18 @@ const (
 	kvmSetRegs             = 0x4090ae82
 	kvmGetSregs            = 0x8138ae83
 	kvmSetSregs            = 0x4138ae84
+	kvmSetMSRS             = 0x4008ae89
 	kvmSetCpuid2           = 0x4008ae90
 )
+
+const (
+	ia32TSCMSR        = 0x00000010
+	ia32BIOSSignIDMSR = 0x0000008b
+	ia32MiscEnableMSR = 0x000001a0
+	ia32TSCAuxMSR     = 0xc0000103
+)
+
+const ia32MiscEnableDefault = (1 << 0) | (1 << 3) | (1 << 11) | (1 << 12) | (1 << 16) | (1 << 18) | (1 << 23)
 
 func ioctl(fd uintptr, request uint64, arg uintptr) (uintptr, error) {
 	v1, _, err := unix.Syscall(unix.SYS_IOCTL, fd, uintptr(request), arg)
@@ -53,6 +65,16 @@ func ioctlRunVCPU(fd uintptr) (uintptr, error) {
 	for {
 		v1, err := ioctl(fd, uint64(kvmRun), 0)
 		if err == unix.EINTR || err == unix.EAGAIN {
+			continue
+		}
+		return v1, err
+	}
+}
+
+func ioctlRunVCPUInterruptible(fd uintptr) (uintptr, error) {
+	for {
+		v1, err := ioctl(fd, uint64(kvmRun), 0)
+		if err == unix.EAGAIN {
 			continue
 		}
 		return v1, err
@@ -121,6 +143,24 @@ func setVCPUID(vcpuFd int, cpuid *kvmCPUID2) error {
 	return err
 }
 
+func setVCPUMSR(vcpuFd int, index uint32, value uint64) error {
+	msrs := kvmMSRs1{
+		NMSRs: 1,
+		Entry: kvmMSREntry{
+			Index: index,
+			Data:  value,
+		},
+	}
+	ret, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmSetMSRS), uintptr(unsafe.Pointer(&msrs)))
+	if err != nil {
+		return err
+	}
+	if ret != 1 {
+		return unix.EIO
+	}
+	return nil
+}
+
 func setCPUIDTopology(cpuid *kvmCPUID2, id, cpus int) {
 	if cpuid == nil {
 		return
@@ -131,16 +171,15 @@ func setCPUIDTopology(cpuid *kvmCPUID2, id, cpus int) {
 	if cpus > 255 {
 		cpus = 255
 	}
-	logical := uint32(1)
+	logicalCount := uint32(cpus)
+	apicIDSpace := uint32(1)
 	if cpus > 1 {
-		logical = uint32(1 << bits.Len(uint(cpus-1)))
+		apicIDSpace = uint32(1 << bits.Len(uint(cpus-1)))
 	}
+	apicIDShift := uint32(bits.Len(uint(apicIDSpace - 1)))
 	ensureCPUIDEntry(cpuid, 0xb, 0)
 	ensureCPUIDEntry(cpuid, 0xb, 1)
 	ensureCPUIDEntry(cpuid, 0xb, 2)
-	ensureCPUIDEntry(cpuid, 0x1f, 0)
-	ensureCPUIDEntry(cpuid, 0x1f, 1)
-	ensureCPUIDEntry(cpuid, 0x1f, 2)
 	configureExtendedTopology := func(e *kvmCPUIDEntry2) {
 		switch e.Index {
 		case 0:
@@ -149,8 +188,8 @@ func setCPUIDTopology(cpuid *kvmCPUID2, id, cpus int) {
 			e.Ecx = (1 << 8) | e.Index
 			e.Edx = uint32(id)
 		case 1:
-			e.Eax = uint32(bits.Len(uint(logical - 1)))
-			e.Ebx = uint32(cpus)
+			e.Eax = apicIDShift
+			e.Ebx = logicalCount
 			e.Ecx = (2 << 8) | e.Index
 			e.Edx = uint32(id)
 		default:
@@ -161,23 +200,89 @@ func setCPUIDTopology(cpuid *kvmCPUID2, id, cpus int) {
 	for i := range entries {
 		e := &entries[i]
 		switch e.Function {
+		case 7:
+			switch e.Index {
+			case 0:
+				if e.Eax > 1 {
+					e.Eax = 1
+				}
+				e.Ebx &^= (uint32(1) << 6) | (uint32(1) << 13)
+			case 2:
+				e.Eax, e.Ebx, e.Ecx, e.Edx = 0, 0, 0, 0
+			}
 		case 1:
-			e.Ebx = (e.Ebx &^ (uint32(0xffff) << 16)) | (logical << 16) | (uint32(id&0xff) << 24)
+			e.Ebx = (e.Ebx &^ (uint32(0xffff) << 16)) | (logicalCount << 16) | (uint32(id&0xff) << 24)
 			if cpus > 1 {
 				e.Edx |= 1 << 28
 			}
 		case 0:
-			if cpus > 1 && e.Eax < 0x1f {
-				e.Eax = 0x1f
+			if cpus > 1 && e.Eax < 0xb {
+				e.Eax = 0xb
 			}
 		case 4:
-			e.Eax = (e.Eax &^ (uint32(0x3f) << 26)) | (uint32(cpus-1) << 26)
+			sharing := uint32(0)
+			cacheLevel := (e.Eax >> 5) & 0x7
+			if cacheLevel >= 3 {
+				sharing = logicalCount - 1
+			}
+			e.Eax = (e.Eax &^ ((uint32(0xfff) << 14) | (uint32(0x3f) << 26))) |
+				(sharing << 14) |
+				((logicalCount - 1) << 26)
 		case 0xb:
 			configureExtendedTopology(e)
 		case 0x1f:
-			configureExtendedTopology(e)
+			e.Eax, e.Ebx, e.Ecx, e.Edx = 0, 0, e.Index, 0
 		}
 	}
+}
+
+func setCPUIDBrandString(cpuid *kvmCPUID2, brand string) {
+	if cpuid == nil {
+		return
+	}
+	brand = strings.TrimSpace(brand)
+	if brand == "" {
+		return
+	}
+
+	maxExtended := ensureCPUIDEntry(cpuid, 0x80000000, 0)
+	if maxExtended == nil {
+		return
+	}
+	maxExtended.Flags &^= kvmCPUIDFlagSignificantIndex
+	if maxExtended.Eax < 0x80000004 {
+		maxExtended.Eax = 0x80000004
+	}
+
+	var encoded [48]byte
+	copy(encoded[:], []byte(brand))
+	for leaf := uint32(0); leaf < 3; leaf++ {
+		entry := ensureCPUIDEntry(cpuid, 0x80000002+leaf, 0)
+		if entry == nil {
+			return
+		}
+		entry.Flags &^= kvmCPUIDFlagSignificantIndex
+		off := leaf * 16
+		entry.Eax = le32(encoded[off:])
+		entry.Ebx = le32(encoded[off+4:])
+		entry.Ecx = le32(encoded[off+8:])
+		entry.Edx = le32(encoded[off+12:])
+	}
+}
+
+func hostCPUBrandString() string {
+	data, err := os.ReadFile("/proc/cpuinfo")
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		key, value, ok := strings.Cut(line, ":")
+		if !ok || strings.TrimSpace(key) != "model name" {
+			continue
+		}
+		return strings.TrimSpace(value)
+	}
+	return ""
 }
 
 func cpuidEntries(cpuid *kvmCPUID2) []kvmCPUIDEntry2 {
@@ -217,6 +322,10 @@ func ensureCPUIDEntry(cpuid *kvmCPUID2, function, index uint32) *kvmCPUIDEntry2 
 	}
 	cpuid.Nr++
 	return entry
+}
+
+func le32(data []byte) uint32 {
+	return uint32(data[0]) | uint32(data[1])<<8 | uint32(data[2])<<16 | uint32(data[3])<<24
 }
 
 func getRegs(vcpuFd int) (kvmRegs, error) {
