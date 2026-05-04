@@ -254,8 +254,10 @@ def test_timeout_for_prefers_test_timeout_then_default() -> None:
 
 def test_timeout_result_requires_timeout_marker_and_exit_124() -> None:
     assert is_timeout_result("[fulltest] command timed out after 120.0s: tool", 124)
+    assert is_timeout_result("[ccvm] command timed out after 120.0s", 124)
     assert not is_timeout_result("exit code 124 from tool", 124)
     assert not is_timeout_result("[fulltest] command timed out after 120.0s: tool", 1)
+    assert not is_timeout_result("[ccvm] command timed out after 120.0s", 1)
 
 
 def test_consecutive_timeout_abort_can_be_disabled() -> None:

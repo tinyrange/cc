@@ -589,7 +589,10 @@ def timeout_for(test_timeout: int, default_timeout: int) -> float:
 
 
 def is_timeout_result(output: str, exit_code: int) -> bool:
-    return exit_code == 124 and "[fulltest] command timed out after" in output
+    return exit_code == 124 and (
+        "[fulltest] command timed out after" in output
+        or "[ccvm] command timed out after" in output
+    )
 
 
 def should_abort_after_timeouts(max_consecutive_timeouts: int, consecutive_timeouts: int) -> bool:
