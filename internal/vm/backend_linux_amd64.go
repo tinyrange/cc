@@ -672,6 +672,7 @@ func withLinuxRuntimeMountDirs(image *oci.Image) *oci.Image {
 	for _, dir := range []string{"/dev", "/proc", "/sys", "/run", "/tmp", "/etc"} {
 		_ = overlay.AddDir(dir, fs.ModeDir|0o755)
 	}
+	addLinuxRuntimeIdentityFiles(overlay, os.Getuid(), os.Getgid())
 	addLinuxRuntimeHostnameFiles(overlay)
 	cloned := *image
 	cloned.RootFS = overlay.Root()
@@ -683,8 +684,113 @@ func blankLinuxRuntimeRootFS() imagefs.Directory {
 	for _, dir := range []string{"/dev", "/proc", "/sys", "/run", "/tmp", "/etc", "/.ccx3", "/.ccx3/images"} {
 		_ = overlay.AddDir(dir, fs.ModeDir|0o755)
 	}
+	addLinuxRuntimeIdentityFiles(overlay, os.Getuid(), os.Getgid())
 	addLinuxRuntimeHostnameFiles(overlay)
 	return overlay.Root()
+}
+
+func addLinuxRuntimeIdentityFiles(overlay *imagefs.Overlay, uid, gid int) {
+	if overlay == nil {
+		return
+	}
+	passwd := readLinuxRuntimeTextFile(overlay.Root(), "/etc/passwd")
+	group := readLinuxRuntimeTextFile(overlay.Root(), "/etc/group")
+
+	if strings.TrimSpace(passwd) == "" {
+		passwd = "root:x:0:0:root:/root:/bin/sh\n"
+	}
+	if strings.TrimSpace(group) == "" {
+		group = "root:x:0:\n"
+	}
+	if uid <= 0 {
+		_ = overlay.AddFile("/etc/passwd", 0o644, []byte(ensureTrailingNewline(passwd)))
+		_ = overlay.AddFile("/etc/group", 0o644, []byte(ensureTrailingNewline(group)))
+		return
+	}
+
+	uidText := strconv.Itoa(uid)
+	gidText := strconv.Itoa(gid)
+	name := linuxRuntimeUnusedName(passwd, "ccx3", uidText)
+	groupName := linuxRuntimeUnusedName(group, name, gidText)
+
+	if !linuxRuntimePasswdHasUID(passwd, uidText) {
+		passwd = ensureTrailingNewline(passwd) + fmt.Sprintf("%s:x:%s:%s:ccx3 user:/home/%s:/bin/sh\n", name, uidText, gidText, name)
+	}
+	if !linuxRuntimeGroupHasGID(group, gidText) {
+		group = ensureTrailingNewline(group) + fmt.Sprintf("%s:x:%s:\n", groupName, gidText)
+	}
+
+	_ = overlay.AddFile("/etc/passwd", 0o644, []byte(passwd))
+	_ = overlay.AddFile("/etc/group", 0o644, []byte(group))
+}
+
+func readLinuxRuntimeTextFile(root imagefs.Directory, guestPath string) string {
+	entry, err := imagefs.LookupPath(root, guestPath)
+	if err != nil || entry.File == nil {
+		return ""
+	}
+	size, _ := entry.File.Stat()
+	if size == 0 {
+		return ""
+	}
+	data, err := entry.File.ReadAt(0, uint32(size))
+	if err != nil && len(data) == 0 {
+		return ""
+	}
+	return string(data)
+}
+
+func linuxRuntimePasswdHasUID(passwd, uid string) bool {
+	for _, line := range strings.Split(passwd, "\n") {
+		fields := strings.Split(line, ":")
+		if len(fields) >= 3 && fields[2] == uid {
+			return true
+		}
+	}
+	return false
+}
+
+func linuxRuntimeGroupHasGID(group, gid string) bool {
+	for _, line := range strings.Split(group, "\n") {
+		fields := strings.Split(line, ":")
+		if len(fields) >= 3 && fields[2] == gid {
+			return true
+		}
+	}
+	return false
+}
+
+func linuxRuntimeUnusedName(contents, base, numericSuffix string) string {
+	if !linuxRuntimeNameExists(contents, base) {
+		return base
+	}
+	name := base + "-" + numericSuffix
+	if !linuxRuntimeNameExists(contents, name) {
+		return name
+	}
+	for n := 2; ; n++ {
+		candidate := fmt.Sprintf("%s-%s-%d", base, numericSuffix, n)
+		if !linuxRuntimeNameExists(contents, candidate) {
+			return candidate
+		}
+	}
+}
+
+func linuxRuntimeNameExists(contents, name string) bool {
+	for _, line := range strings.Split(contents, "\n") {
+		fields := strings.Split(line, ":")
+		if len(fields) > 0 && fields[0] == name {
+			return true
+		}
+	}
+	return false
+}
+
+func ensureTrailingNewline(value string) string {
+	if value == "" || strings.HasSuffix(value, "\n") {
+		return value
+	}
+	return value + "\n"
 }
 
 func addLinuxRuntimeHostnameFiles(overlay *imagefs.Overlay) {

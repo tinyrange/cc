@@ -106,7 +106,7 @@ func TestRuntimeBackendRunCommandDefaultsToHostUserAndResolvableHostname(t *test
 	backend := NewRuntimeBackend(kernel, store, filepath.Join(root, "guestinit"))
 	resp, err := backend.Run(ctx, client.RunRequest{
 		Image:    "alpine",
-		Command:  []string{"sh", "-c", "printf 'uid=%s gid=%s hostname=%s hosts=%s\\n' \"$(id -u)\" \"$(id -g)\" \"$(cat /etc/hostname)\" \"$(grep ccx3 /etc/hosts | wc -l)\""},
+		Command:  []string{"sh", "-c", "uid=$(id -u); gid=$(id -g); passwd=$(awk -F: -v uid=\"$uid\" '$3==uid { found=1 } END { print found+0 }' /etc/passwd); group=$(awk -F: -v gid=\"$gid\" '$3==gid { found=1 } END { print found+0 }' /etc/group); printf 'uid=%s gid=%s passwd=%s group=%s hostname=%s hosts=%s\\n' \"$uid\" \"$gid\" \"$passwd\" \"$group\" \"$(cat /etc/hostname)\" \"$(grep ccx3 /etc/hosts | wc -l)\""},
 		MemoryMB: 256,
 	})
 	if err != nil {
@@ -115,7 +115,7 @@ func TestRuntimeBackendRunCommandDefaultsToHostUserAndResolvableHostname(t *test
 	if resp.ExitCode != 0 {
 		t.Fatalf("backend.Run().ExitCode = %d, want 0\noutput:\n%s", resp.ExitCode, resp.Output)
 	}
-	want := fmt.Sprintf("uid=%d gid=%d hostname=ccx3 hosts=2", os.Getuid(), os.Getgid())
+	want := fmt.Sprintf("uid=%d gid=%d passwd=1 group=1 hostname=ccx3 hosts=2", os.Getuid(), os.Getgid())
 	if strings.TrimSpace(resp.Output) != want {
 		t.Fatalf("backend.Run().Output = %q, want %q", resp.Output, want)
 	}

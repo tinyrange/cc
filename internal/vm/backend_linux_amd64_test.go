@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -49,6 +51,64 @@ func TestLinuxRuntimeMountDirsProvidesResolvableHostname(t *testing.T) {
 	}
 	if !strings.Contains(hosts, "127.0.0.1\tlocalhost "+want) {
 		t.Fatalf("/etc/hosts does not map hostname to localhost: %q", hosts)
+	}
+}
+
+func TestLinuxRuntimeMountDirsInjectsDefaultUserLookupFiles(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(etc) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc", "passwd"), []byte("root:x:0:0:root:/root:/bin/sh\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(passwd) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc", "group"), []byte("root:x:0:\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(group) error = %v", err)
+	}
+
+	overlay := imagefs.NewOverlay(imagefs.NewHostFS(root, nil))
+	if err := overlay.AddDir("/etc", 0o755); err != nil {
+		t.Fatalf("AddDir(/etc) error = %v", err)
+	}
+	addLinuxRuntimeIdentityFiles(overlay, 1001, 1002)
+
+	passwd := readImageFile(t, overlay.Root(), "/etc/passwd")
+	group := readImageFile(t, overlay.Root(), "/etc/group")
+	if !strings.Contains(passwd, "ccx3:x:1001:1002:ccx3 user:/home/ccx3:/bin/sh\n") {
+		t.Fatalf("/etc/passwd missing injected user entry:\n%s", passwd)
+	}
+	if !strings.Contains(group, "ccx3:x:1002:\n") {
+		t.Fatalf("/etc/group missing injected group entry:\n%s", group)
+	}
+}
+
+func TestLinuxRuntimeMountDirsPreservesExistingUserLookupEntries(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(etc) error = %v", err)
+	}
+	passwdData := "root:x:0:0:root:/root:/bin/sh\nrunner:x:1001:1002:runner:/home/runner:/bin/bash\n"
+	groupData := "root:x:0:\nrunner:x:1002:\n"
+	if err := os.WriteFile(filepath.Join(root, "etc", "passwd"), []byte(passwdData), 0o644); err != nil {
+		t.Fatalf("WriteFile(passwd) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc", "group"), []byte(groupData), 0o644); err != nil {
+		t.Fatalf("WriteFile(group) error = %v", err)
+	}
+
+	overlay := imagefs.NewOverlay(imagefs.NewHostFS(root, nil))
+	if err := overlay.AddDir("/etc", 0o755); err != nil {
+		t.Fatalf("AddDir(/etc) error = %v", err)
+	}
+	addLinuxRuntimeIdentityFiles(overlay, 1001, 1002)
+
+	passwd := readImageFile(t, overlay.Root(), "/etc/passwd")
+	group := readImageFile(t, overlay.Root(), "/etc/group")
+	if passwd != passwdData {
+		t.Fatalf("/etc/passwd changed:\n%s", passwd)
+	}
+	if group != groupData {
+		t.Fatalf("/etc/group changed:\n%s", group)
 	}
 }
 
