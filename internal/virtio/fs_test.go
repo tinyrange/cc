@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"j5.nz/cc/internal/fsmeta"
 	"j5.nz/cc/internal/imagefs"
 )
 
@@ -533,6 +534,41 @@ func TestImageFSReadDirCompletesPartiallyMaterializedDirectory(t *testing.T) {
 	}
 	if !containsFuseDirent(entries, "encodings") {
 		t.Fatalf("ReadDir(lib) missing encodings entry in %q", string(entries))
+	}
+}
+
+func TestImageFSWithOwnerMapsAttributes(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "tool"), []byte("tool"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	be := NewImageFSWithOwner(imagefs.NewHostFS(root, map[string]fsmeta.Entry{
+		"/":     {UID: 1000, GID: 1000, Mode: linuxSIFDIR | 0o700},
+		"/tool": {UID: 1000, GID: 1000, Mode: linuxSIFREG | 0o600},
+	}), root, 1001, 1002).(*imageFS)
+
+	rootAttr, errno := be.GetAttr(1)
+	if errno != 0 {
+		t.Fatalf("GetAttr(root) errno = %d", errno)
+	}
+	if rootAttr.UID != 1001 || rootAttr.GID != 1002 {
+		t.Fatalf("root owner = %d:%d, want 1001:1002", rootAttr.UID, rootAttr.GID)
+	}
+	toolID, toolAttr, errno := be.Lookup(1, "tool")
+	if errno != 0 {
+		t.Fatalf("Lookup(tool) errno = %d", errno)
+	}
+	if toolAttr.UID != 1001 || toolAttr.GID != 1002 {
+		t.Fatalf("tool lookup owner = %d:%d, want 1001:1002", toolAttr.UID, toolAttr.GID)
+	}
+	toolAttr, errno = be.GetAttr(toolID)
+	if errno != 0 {
+		t.Fatalf("GetAttr(tool) errno = %d", errno)
+	}
+	if toolAttr.UID != 1001 || toolAttr.GID != 1002 {
+		t.Fatalf("tool getattr owner = %d:%d, want 1001:1002", toolAttr.UID, toolAttr.GID)
 	}
 }
 

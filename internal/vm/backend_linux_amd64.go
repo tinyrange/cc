@@ -61,7 +61,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		return nil, err
 	}
 	fsdevs, rootFS, err := amd64vm.BuildFSDevices(vmruntime.RunRequest{
-		Image:  image,
+		RootFS: linuxRuntimeImageFS(image),
 		Shares: convertLinuxShareMounts(req.Shares),
 	}, nil)
 	if err != nil {
@@ -183,7 +183,7 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 			return client.ExecResponse{}, err
 		}
 		devs, _, err := amd64vm.BuildFSDevices(vmruntime.RunRequest{
-			Image:  image,
+			RootFS: linuxRuntimeImageFS(image),
 			Shares: convertLinuxShareMounts(req.Shares),
 		}, nil)
 		if err != nil {
@@ -600,7 +600,7 @@ func (i *linuxInstance) AddImage(ctx context.Context, mountPath string, image *o
 	i.shareMu.Unlock()
 	if err := i.rootFS.AddShare(virtio.ShareMount{
 		GuestPath: mountPath,
-		Backend:   virtio.NewImageFS(image.RootFS, image.RootFSDir),
+		Backend:   linuxRuntimeImageFS(image),
 		Writable:  false,
 	}); err != nil {
 		return err
@@ -642,6 +642,17 @@ func linuxGuestInitConfig(modules []alpine.Module, managedExec bool) vmruntime.G
 		cfg.VsockPort = vmruntime.ControlPort
 	}
 	return cfg
+}
+
+func linuxRuntimeImageFS(image *oci.Image) virtio.FSBackend {
+	if image == nil {
+		return nil
+	}
+	uid, gid := os.Getuid(), os.Getgid()
+	if uid < 0 || gid < 0 {
+		return virtio.NewImageFS(image.RootFS, image.RootFSDir)
+	}
+	return virtio.NewImageFSWithOwner(image.RootFS, image.RootFSDir, uint32(uid), uint32(gid))
 }
 
 func linuxRuntimeConfigVars(image *oci.Image) []string {

@@ -2079,7 +2079,10 @@ type passthroughHandle struct {
 }
 
 type imageFS struct {
-	root string
+	root     string
+	ownerUID uint32
+	ownerGID uint32
+	mapOwner bool
 
 	mu         sync.Mutex
 	nextNodeID uint64
@@ -2136,8 +2139,19 @@ func NewPassthroughFS(root string, meta map[string]fsmeta.Entry) FSBackend {
 }
 
 func NewImageFS(root imagefs.Directory, statfsPath string) FSBackend {
+	return newImageFS(root, statfsPath, 0, 0, false)
+}
+
+func NewImageFSWithOwner(root imagefs.Directory, statfsPath string, uid, gid uint32) FSBackend {
+	return newImageFS(root, statfsPath, uid, gid, true)
+}
+
+func newImageFS(root imagefs.Directory, statfsPath string, uid, gid uint32, mapOwner bool) FSBackend {
 	imgFS := &imageFS{
 		root:       statfsPath,
+		ownerUID:   uid,
+		ownerGID:   gid,
+		mapOwner:   mapOwner,
 		nextNodeID: 2,
 		nextHandle: 1,
 		nodes:      map[uint64]*imageNode{},
@@ -3293,6 +3307,10 @@ func (p *imageFS) attr(node *imageNode) FuseAttr {
 	if node.isDir() {
 		nlink = maxU32(2, 2+uint32(len(node.entries)))
 	}
+	attrUID, attrGID := node.uid, node.gid
+	if p.mapOwner {
+		attrUID, attrGID = p.ownerUID, p.ownerGID
+	}
 	return FuseAttr{
 		Ino:       node.id,
 		Size:      size,
@@ -3305,8 +3323,8 @@ func (p *imageFS) attr(node *imageNode) FuseAttr {
 		CTimeNsec: uint32(modTime.Nanosecond()),
 		Mode:      mode,
 		NLink:     nlink,
-		UID:       node.uid,
-		GID:       node.gid,
+		UID:       attrUID,
+		GID:       attrGID,
 		RDev:      node.rdev,
 		BlkSize:   4096,
 	}
