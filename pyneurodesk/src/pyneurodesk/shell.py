@@ -330,6 +330,10 @@ def run_image_command(image: str, command_name: str, args: list[str], *, deploy_
         shares, workdir = implicit_runtime_mounts()
         env.extend(runtime_env_overrides())
         command = shell_command_with_runtime_env([command_name, *args], env)
+        timeout_seconds = runtime_exec_timeout_seconds()
+        timeout_kwargs: dict[str, float] = {}
+        if timeout_seconds is not None:
+            timeout_kwargs["timeout_seconds"] = timeout_seconds
         if should_stream_exec() and hasattr(handle._client, "run_stream"):
             exit_code = 0
             for event in handle._client.run_stream(
@@ -338,6 +342,7 @@ def run_image_command(image: str, command_name: str, args: list[str], *, deploy_
                 env=env,
                 shares=shares,
                 workdir=workdir,
+                **timeout_kwargs,
             ):
                 kind = str(event.get("kind", ""))
                 if kind in {"stdout", "stderr", "output"}:
@@ -347,7 +352,14 @@ def run_image_command(image: str, command_name: str, args: list[str], *, deploy_
                 elif kind == "error":
                     raise RuntimeError(str(event.get("error", "streamed command failed")))
             return exit_code
-        result = handle._client.run(handle.reference.image, command, env=env, shares=shares, workdir=workdir)
+        result = handle._client.run(
+            handle.reference.image,
+            command,
+            env=env,
+            shares=shares,
+            workdir=workdir,
+            **timeout_kwargs,
+        )
     finally:
         handle.close()
     if result.output:
@@ -358,6 +370,19 @@ def run_image_command(image: str, command_name: str, args: list[str], *, deploy_
 
 def should_stream_exec() -> bool:
     return os.environ.get("PYNEURODESK_EXEC_STREAM", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def runtime_exec_timeout_seconds() -> Optional[float]:
+    raw = os.environ.get("PYNEURODESK_EXEC_TIMEOUT_SECONDS", "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return value
 
 
 def shell_command_with_runtime_env(command: list[str], env: list[str]) -> list[str]:

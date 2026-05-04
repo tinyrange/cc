@@ -701,12 +701,20 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 				return
 			}
 		}
+		runCtx, cancelRun := runRequestContext(r.Context(), req)
+		defer cancelRun()
 		if wantsExecEventStream(r) {
-			writeRunEventStream(w, r.Context(), srvState.vms, req)
+			writeRunEventStream(w, runCtx, srvState.vms, req)
 			return
 		}
-		resp, err := srvState.vms.Run(r.Context(), req)
+		resp, err := srvState.vms.Run(runCtx, req)
 		if err != nil {
+			if req.TimeoutSeconds > 0 && errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+				resp.ExitCode = 124
+				resp.Output += fmt.Sprintf("\n[ccvm] command timed out after %.1fs\n", req.TimeoutSeconds)
+				writeJSON(w, http.StatusOK, resp)
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -786,6 +794,13 @@ func decodeRunRequest(r *http.Request) (client.RunRequest, error) {
 		return req, err
 	}
 	return req, nil
+}
+
+func runRequestContext(parent context.Context, req client.RunRequest) (context.Context, context.CancelFunc) {
+	if req.TimeoutSeconds <= 0 {
+		return parent, func() {}
+	}
+	return context.WithTimeout(context.Background(), time.Duration(req.TimeoutSeconds*float64(time.Second)))
 }
 
 func serveRunWebSocket(ws *websocket.Conn, runner func(context.Context, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error) {
@@ -877,6 +892,14 @@ func writeRunEventStream(w http.ResponseWriter, ctx context.Context, manager *vm
 		return nil
 	})
 	if err != nil {
+		if req.TimeoutSeconds > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			_ = enc.Encode(client.ExecEvent{Kind: "stderr", Output: fmt.Sprintf("\n[ccvm] command timed out after %.1fs\n", req.TimeoutSeconds)})
+			_ = enc.Encode(client.ExecEvent{Kind: "exit", ExitCode: 124})
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return
+		}
 		_ = enc.Encode(client.ExecEvent{Kind: "error", Error: err.Error()})
 	}
 	if flusher != nil {

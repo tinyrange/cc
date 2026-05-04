@@ -1002,6 +1002,7 @@ def resolve_ccvm_binary_path() -> Path:
 
     package_binary = bundled_ccvm_path()
     if package_binary is not None:
+        maybe_refresh_bundled_ccvm(package_binary)
         return package_binary
 
     project_root = pyneurodesk_root()
@@ -1071,7 +1072,7 @@ def _should_rebuild_ccvm(binary_path: Path, root: Path) -> bool:
 def _build_ccvm_binary(binary_path: Path, root: Path) -> None:
     binary_path.parent.mkdir(parents=True, exist_ok=True)
     proc = subprocess.run(
-        ["go", "build", "-o", str(binary_path), "./cmd/ccvm"],
+        ["go", "build", "-tags", "embed_guestinit", "-o", str(binary_path), "./cmd/ccvm"],
         cwd=root,
         capture_output=True,
         text=True,

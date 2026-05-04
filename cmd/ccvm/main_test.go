@@ -101,6 +101,19 @@ func TestBootTimeoutFromRequest(t *testing.T) {
 	}
 }
 
+func TestRunRequestContextUsesRequestTimeout(t *testing.T) {
+	ctx, cancel := runRequestContext(context.Background(), client.RunRequest{TimeoutSeconds: 0.01})
+	defer cancel()
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("run request context did not time out")
+	}
+	if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		t.Fatalf("run request context error = %v, want deadline exceeded", ctx.Err())
+	}
+}
+
 func TestWriteExecEventStream(t *testing.T) {
 	rec := httptest.NewRecorder()
 	writeExecEventStream(rec, client.ExecResponse{ExitCode: 7, Output: "hello"})

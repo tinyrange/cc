@@ -294,22 +294,23 @@ type InstanceState struct {
 }
 
 type RunRequest struct {
-	ID         string       `json:"id,omitempty"`
-	Image      string       `json:"image"`
-	Shares     []ShareMount `json:"shares,omitempty"`
-	Command    []string     `json:"command,omitempty"`
-	Env        []string     `json:"env,omitempty"`
-	RootDir    string       `json:"root_dir,omitempty"`
-	ReplaceEnv bool         `json:"replace_env,omitempty"`
-	WorkDir    string       `json:"workdir,omitempty"`
-	User       string       `json:"user,omitempty"`
-	Stdin      []byte       `json:"stdin,omitempty"`
-	TTY        bool         `json:"tty,omitempty"`
-	Cols       int          `json:"cols,omitempty"`
-	Rows       int          `json:"rows,omitempty"`
-	MemoryMB   uint64       `json:"memory_mb,omitempty"`
-	CPUs       int          `json:"cpus,omitempty"`
-	Dmesg      bool         `json:"dmesg,omitempty"`
+	ID             string       `json:"id,omitempty"`
+	Image          string       `json:"image"`
+	Shares         []ShareMount `json:"shares,omitempty"`
+	Command        []string     `json:"command,omitempty"`
+	Env            []string     `json:"env,omitempty"`
+	RootDir        string       `json:"root_dir,omitempty"`
+	ReplaceEnv     bool         `json:"replace_env,omitempty"`
+	WorkDir        string       `json:"workdir,omitempty"`
+	User           string       `json:"user,omitempty"`
+	Stdin          []byte       `json:"stdin,omitempty"`
+	TTY            bool         `json:"tty,omitempty"`
+	Cols           int          `json:"cols,omitempty"`
+	Rows           int          `json:"rows,omitempty"`
+	MemoryMB       uint64       `json:"memory_mb,omitempty"`
+	CPUs           int          `json:"cpus,omitempty"`
+	Dmesg          bool         `json:"dmesg,omitempty"`
+	TimeoutSeconds float64      `json:"timeout_seconds,omitempty"`
 }
 
 type ExecResponse struct {

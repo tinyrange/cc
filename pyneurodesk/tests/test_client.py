@@ -231,6 +231,23 @@ def test_run_command_request_serializes_runtime_shares() -> None:
     assert result.output == "ok"
 
 
+def test_run_command_request_serializes_timeout_seconds() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["json"] = request.read().decode()
+        return httpx.Response(200, json={"exit_code": 124, "output": "timed out"})
+
+    client = make_client(httpx.MockTransport(handler))
+    try:
+        result = client.run("niimath", ["sleep", "30"], timeout_seconds=2.5)
+    finally:
+        client.close()
+
+    assert seen["json"] == '{"image":"niimath","command":["sleep","30"],"timeout_seconds":2.5}'
+    assert result.exit_code == 124
+
+
 def test_watchdog_client_endpoints() -> None:
     seen: list[tuple[str, str, Optional[str]]] = []
 
@@ -1163,11 +1180,14 @@ def test_resolve_ccvm_binary_path_prefers_packaged_binary(monkeypatch, tmp_path:
     binary.write_text("")
 
     monkeypatch.setattr("pyneurodesk.api.bundled_ccvm_path", lambda: binary)
+    calls: list[Path] = []
+    monkeypatch.setattr("pyneurodesk.api.maybe_refresh_bundled_ccvm", lambda path: calls.append(path))
     monkeypatch.delenv("PYNEURODESK_CCVM", raising=False)
     monkeypatch.delenv("CCX3_CCVM", raising=False)
     monkeypatch.delenv("CCVM_BINARY", raising=False)
 
     assert resolve_ccvm_binary_path() == binary
+    assert calls == [binary]
 
 
 def test_resolve_ccvm_binary_path_prefers_documented_env_var(monkeypatch, tmp_path: Path) -> None:

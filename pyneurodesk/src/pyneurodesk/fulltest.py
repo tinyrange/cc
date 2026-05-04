@@ -734,11 +734,13 @@ class ActivatedShellSession:
 
     def run_direct_guest(self, command: list[str], timeout_seconds: float) -> tuple[str, int]:
         words = [resolve_neurodesk_command(), "shell", "exec", str(self.image), "--", *command]
+        env = dict(self.env)
+        env["PYNEURODESK_EXEC_TIMEOUT_SECONDS"] = f"{timeout_seconds:.3f}"
         return run_shell(
-            self.env,
+            env,
             self.work_dir,
             "source " + shlex.quote(str(self.activation_script)) + "\n" + " ".join(shlex.quote(word) for word in words),
-            timeout_seconds,
+            timeout_seconds + 10.0,
         )
 
     def run_guest_script(self, command: str, timeout_seconds: float) -> tuple[str, int]:

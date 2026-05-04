@@ -377,6 +377,7 @@ class PyNeurodeskClient:
         workdir: Optional[str] = None,
         user: Optional[str] = None,
         stdin: Optional[bytes] = None,
+        timeout_seconds: Optional[float] = None,
         timeout: Optional[Union[float, httpx.Timeout]] = None,
     ) -> CommandResult:
         return self.run_command(
@@ -388,6 +389,7 @@ class PyNeurodeskClient:
                 workdir=workdir,
                 user=user,
                 stdin=stdin,
+                timeout_seconds=timeout_seconds,
             ),
             timeout=timeout,
         )
@@ -402,6 +404,7 @@ class PyNeurodeskClient:
         workdir: Optional[str] = None,
         user: Optional[str] = None,
         stdin: Optional[bytes] = None,
+        timeout_seconds: Optional[float] = None,
         timeout: Optional[Union[float, httpx.Timeout]] = None,
     ) -> Iterable[dict[str, Any]]:
         request = RunCommandRequest(
@@ -412,6 +415,7 @@ class PyNeurodeskClient:
             workdir=workdir,
             user=user,
             stdin=stdin,
+            timeout_seconds=timeout_seconds,
         )
         with self._client.stream(
             "POST",

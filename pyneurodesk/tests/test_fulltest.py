@@ -380,9 +380,12 @@ def test_activated_shell_session_runs_login_shell_directly_in_guest(monkeypatch,
 
     assert (output, exit_code) == ("ok", 0)
     assert len(calls) == 1
-    assert calls[0][0] == {"CCX3_URL": "http://example.test"}
+    assert calls[0][0] == {
+        "CCX3_URL": "http://example.test",
+        "PYNEURODESK_EXEC_TIMEOUT_SECONDS": "30.000",
+    }
     assert calls[0][1] == tmp_path
-    assert calls[0][3] == 30.0
+    assert calls[0][3] == 40.0
     assert calls[0][2].startswith("source ")
     assert "neurodesk shell exec fulltest-image -- bash -lc 'ls /opt/tool'" in calls[0][2]
 

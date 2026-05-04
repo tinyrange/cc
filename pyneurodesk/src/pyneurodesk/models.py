@@ -310,6 +310,7 @@ class RunCommandRequest:
     memory_mb: Optional[int] = None
     cpus: Optional[int] = None
     dmesg: bool = False
+    timeout_seconds: Optional[float] = None
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -332,6 +333,8 @@ class RunCommandRequest:
             payload["cpus"] = self.cpus
         if self.dmesg:
             payload["dmesg"] = True
+        if self.timeout_seconds is not None and self.timeout_seconds > 0:
+            payload["timeout_seconds"] = self.timeout_seconds
         return payload
 
 
