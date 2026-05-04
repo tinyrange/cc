@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	osuser "os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -693,6 +694,100 @@ func addLinuxRuntimeIdentityFiles(overlay *imagefs.Overlay, uid, gid int) {
 	if overlay == nil {
 		return
 	}
+	identity := linuxRuntimeHostIdentity(uid, gid)
+	addLinuxRuntimeIdentityFilesForUser(overlay, identity)
+}
+
+type linuxRuntimeIdentity struct {
+	Name   string
+	UID    int
+	GID    int
+	Gecos  string
+	Home   string
+	Shell  string
+	Groups []linuxRuntimeGroup
+}
+
+type linuxRuntimeGroup struct {
+	Name string
+	GID  int
+}
+
+func linuxRuntimeHostIdentity(uid, gid int) linuxRuntimeIdentity {
+	name := "ccx3"
+	home := "/home/ccx3"
+	gecos := "ccx3 user"
+	shell := "/bin/sh"
+	if u, err := osuser.LookupId(strconv.Itoa(uid)); err == nil {
+		if u.Username != "" {
+			name = u.Username
+		}
+		if u.Name != "" {
+			gecos = u.Name
+		}
+		if u.HomeDir != "" {
+			home = u.HomeDir
+		}
+		if parsed := linuxRuntimeHostPasswdIdentity(uid); parsed.Shell != "" {
+			shell = parsed.Shell
+			if parsed.Gecos != "" {
+				gecos = parsed.Gecos
+			}
+		}
+	}
+	groups := []linuxRuntimeGroup{linuxRuntimeHostGroup(gid, name)}
+	for _, groupID := range linuxRuntimeHostGroups() {
+		if groupID == gid {
+			continue
+		}
+		groups = append(groups, linuxRuntimeHostGroup(groupID, name))
+	}
+	return linuxRuntimeIdentity{
+		Name:   name,
+		UID:    uid,
+		GID:    gid,
+		Gecos:  gecos,
+		Home:   home,
+		Shell:  shell,
+		Groups: groups,
+	}
+}
+
+func linuxRuntimeHostPasswdIdentity(uid int) linuxRuntimeIdentity {
+	passwd, err := os.ReadFile("/etc/passwd")
+	if err != nil {
+		return linuxRuntimeIdentity{}
+	}
+	uidText := strconv.Itoa(uid)
+	for _, line := range strings.Split(string(passwd), "\n") {
+		fields := strings.Split(line, ":")
+		if len(fields) >= 7 && fields[2] == uidText {
+			return linuxRuntimeIdentity{Gecos: fields[4], Shell: fields[6]}
+		}
+	}
+	return linuxRuntimeIdentity{}
+}
+
+func linuxRuntimeHostGroups() []int {
+	groupIDs, err := os.Getgroups()
+	if err != nil {
+		return nil
+	}
+	return groupIDs
+}
+
+func linuxRuntimeHostGroup(gid int, fallbackName string) linuxRuntimeGroup {
+	name := fallbackName
+	if g, err := osuser.LookupGroupId(strconv.Itoa(gid)); err == nil && g.Name != "" {
+		name = g.Name
+	}
+	return linuxRuntimeGroup{Name: name, GID: gid}
+}
+
+func addLinuxRuntimeIdentityFilesForUser(overlay *imagefs.Overlay, identity linuxRuntimeIdentity) {
+	if overlay == nil {
+		return
+	}
 	passwd := readLinuxRuntimeTextFile(overlay.Root(), "/etc/passwd")
 	group := readLinuxRuntimeTextFile(overlay.Root(), "/etc/group")
 
@@ -702,26 +797,9 @@ func addLinuxRuntimeIdentityFiles(overlay *imagefs.Overlay, uid, gid int) {
 	if strings.TrimSpace(group) == "" {
 		group = "root:x:0:\n"
 	}
-	if uid <= 0 {
-		_ = overlay.AddFile("/etc/passwd", 0o644, []byte(ensureTrailingNewline(passwd)))
-		_ = overlay.AddFile("/etc/group", 0o644, []byte(ensureTrailingNewline(group)))
-		return
-	}
 
-	uidText := strconv.Itoa(uid)
-	gidText := strconv.Itoa(gid)
-	name := linuxRuntimeUnusedName(passwd, "ccx3", uidText)
-	groupName := linuxRuntimeUnusedName(group, name, gidText)
-
-	if !linuxRuntimePasswdHasUID(passwd, uidText) {
-		passwd = ensureTrailingNewline(passwd) + fmt.Sprintf("%s:x:%s:%s:ccx3 user:/home/%s:/bin/sh\n", name, uidText, gidText, name)
-	}
-	if !linuxRuntimeGroupHasGID(group, gidText) {
-		group = ensureTrailingNewline(group) + fmt.Sprintf("%s:x:%s:\n", groupName, gidText)
-	}
-
-	_ = overlay.AddFile("/etc/passwd", 0o644, []byte(passwd))
-	_ = overlay.AddFile("/etc/group", 0o644, []byte(group))
+	_ = overlay.AddFile("/etc/passwd", 0o644, []byte(linuxRuntimePasswdContent(passwd, identity)))
+	_ = overlay.AddFile("/etc/group", 0o644, []byte(linuxRuntimeGroupContent(group, identity)))
 }
 
 func readLinuxRuntimeTextFile(root imagefs.Directory, guestPath string) string {
@@ -740,50 +818,45 @@ func readLinuxRuntimeTextFile(root imagefs.Directory, guestPath string) string {
 	return string(data)
 }
 
-func linuxRuntimePasswdHasUID(passwd, uid string) bool {
-	for _, line := range strings.Split(passwd, "\n") {
+func linuxRuntimePasswdContent(passwd string, identity linuxRuntimeIdentity) string {
+	lines := strings.Split(strings.TrimSuffix(passwd, "\n"), "\n")
+	uidText := strconv.Itoa(identity.UID)
+	for i, line := range lines {
+		if line == "" {
+			continue
+		}
 		fields := strings.Split(line, ":")
-		if len(fields) >= 3 && fields[2] == uid {
-			return true
+		if len(fields) >= 7 && fields[2] == uidText {
+			lines[i] = strings.Join([]string{
+				identity.Name,
+				"x",
+				uidText,
+				fields[3],
+				identity.Gecos,
+				identity.Home,
+				fields[6],
+			}, ":")
+			return strings.Join(append(lines, ""), "\n")
 		}
 	}
-	return false
+	return ensureTrailingNewline(passwd) + linuxRuntimePasswdLine(identity)
 }
 
-func linuxRuntimeGroupHasGID(group, gid string) bool {
-	for _, line := range strings.Split(group, "\n") {
-		fields := strings.Split(line, ":")
-		if len(fields) >= 3 && fields[2] == gid {
-			return true
-		}
-	}
-	return false
+func linuxRuntimePasswdLine(identity linuxRuntimeIdentity) string {
+	return fmt.Sprintf("%s:x:%d:%d:%s:%s:%s\n", identity.Name, identity.UID, identity.GID, identity.Gecos, identity.Home, identity.Shell)
 }
 
-func linuxRuntimeUnusedName(contents, base, numericSuffix string) string {
-	if !linuxRuntimeNameExists(contents, base) {
-		return base
-	}
-	name := base + "-" + numericSuffix
-	if !linuxRuntimeNameExists(contents, name) {
-		return name
-	}
-	for n := 2; ; n++ {
-		candidate := fmt.Sprintf("%s-%s-%d", base, numericSuffix, n)
-		if !linuxRuntimeNameExists(contents, candidate) {
-			return candidate
+func linuxRuntimeGroupContent(group string, identity linuxRuntimeIdentity) string {
+	group = ensureTrailingNewline(group)
+	seen := map[string]bool{}
+	for _, hostGroup := range identity.Groups {
+		line := fmt.Sprintf("%s:x:%d:%s\n", hostGroup.Name, hostGroup.GID, identity.Name)
+		if !seen[line] {
+			seen[line] = true
+			group += line
 		}
 	}
-}
-
-func linuxRuntimeNameExists(contents, name string) bool {
-	for _, line := range strings.Split(contents, "\n") {
-		fields := strings.Split(line, ":")
-		if len(fields) > 0 && fields[0] == name {
-			return true
-		}
-	}
-	return false
+	return group
 }
 
 func ensureTrailingNewline(value string) string {

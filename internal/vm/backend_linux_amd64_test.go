@@ -70,25 +70,41 @@ func TestLinuxRuntimeMountDirsInjectsDefaultUserLookupFiles(t *testing.T) {
 	if err := overlay.AddDir("/etc", 0o755); err != nil {
 		t.Fatalf("AddDir(/etc) error = %v", err)
 	}
-	addLinuxRuntimeIdentityFiles(overlay, 1001, 1002)
+	addLinuxRuntimeIdentityFilesForUser(overlay, linuxRuntimeIdentity{
+		Name:  "runner",
+		UID:   1001,
+		GID:   1002,
+		Gecos: "Runner User",
+		Home:  "/home/runner",
+		Shell: "/bin/bash",
+		Groups: []linuxRuntimeGroup{
+			{Name: "runner", GID: 1002},
+			{Name: "docker", GID: 121},
+		},
+	})
 
 	passwd := readImageFile(t, overlay.Root(), "/etc/passwd")
 	group := readImageFile(t, overlay.Root(), "/etc/group")
-	if !strings.Contains(passwd, "ccx3:x:1001:1002:ccx3 user:/home/ccx3:/bin/sh\n") {
+	if !strings.Contains(passwd, "runner:x:1001:1002:Runner User:/home/runner:/bin/bash\n") {
 		t.Fatalf("/etc/passwd missing injected user entry:\n%s", passwd)
 	}
-	if !strings.Contains(group, "ccx3:x:1002:\n") {
-		t.Fatalf("/etc/group missing injected group entry:\n%s", group)
+	for _, want := range []string{
+		"runner:x:1002:runner\n",
+		"docker:x:121:runner\n",
+	} {
+		if !strings.Contains(group, want) {
+			t.Fatalf("/etc/group missing injected group entry %q:\n%s", want, group)
+		}
 	}
 }
 
-func TestLinuxRuntimeMountDirsPreservesExistingUserLookupEntries(t *testing.T) {
+func TestLinuxRuntimeMountDirsRewritesExistingUserLookupEntries(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
 		t.Fatalf("MkdirAll(etc) error = %v", err)
 	}
-	passwdData := "root:x:0:0:root:/root:/bin/sh\nrunner:x:1001:1002:runner:/home/runner:/bin/bash\n"
-	groupData := "root:x:0:\nrunner:x:1002:\n"
+	passwdData := "root:x:0:0:root:/root:/bin/sh\ncontainer:x:1001:42:container:/old-home:/bin/zsh\n"
+	groupData := "root:x:0:\ncontainer:x:42:\n"
 	if err := os.WriteFile(filepath.Join(root, "etc", "passwd"), []byte(passwdData), 0o644); err != nil {
 		t.Fatalf("WriteFile(passwd) error = %v", err)
 	}
@@ -100,15 +116,25 @@ func TestLinuxRuntimeMountDirsPreservesExistingUserLookupEntries(t *testing.T) {
 	if err := overlay.AddDir("/etc", 0o755); err != nil {
 		t.Fatalf("AddDir(/etc) error = %v", err)
 	}
-	addLinuxRuntimeIdentityFiles(overlay, 1001, 1002)
+	addLinuxRuntimeIdentityFilesForUser(overlay, linuxRuntimeIdentity{
+		Name:  "runner",
+		UID:   1001,
+		GID:   1002,
+		Gecos: "Runner User",
+		Home:  "/home/runner",
+		Shell: "/bin/bash",
+		Groups: []linuxRuntimeGroup{
+			{Name: "runner", GID: 1002},
+		},
+	})
 
 	passwd := readImageFile(t, overlay.Root(), "/etc/passwd")
 	group := readImageFile(t, overlay.Root(), "/etc/group")
-	if passwd != passwdData {
-		t.Fatalf("/etc/passwd changed:\n%s", passwd)
+	if !strings.Contains(passwd, "runner:x:1001:42:Runner User:/home/runner:/bin/zsh\n") {
+		t.Fatalf("/etc/passwd did not rewrite existing uid with host identity while preserving container gid/shell:\n%s", passwd)
 	}
-	if group != groupData {
-		t.Fatalf("/etc/group changed:\n%s", group)
+	if !strings.Contains(group, groupData) || !strings.Contains(group, "runner:x:1002:runner\n") {
+		t.Fatalf("/etc/group did not preserve content and append host group:\n%s", group)
 	}
 }
 
