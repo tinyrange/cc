@@ -40,6 +40,10 @@ const (
 )
 
 func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, cpus int, dmesg bool, fsdevs []*virtio.FS, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	return StartManagedSessionWithNet(ctx, kernel, initrd, memoryMB, cpus, dmesg, fsdevs, nil, onEvent)
+}
+
+func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, cpus int, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
 	backend := virtio.NewSimpleVsockBackend()
 	listener, err := backend.Listen(vmruntime.ControlPort)
 	if err != nil {
@@ -90,10 +94,16 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 	}
 	vsock.Attach(vm, vm)
 	rng.Attach(vm, vm)
+	if netdev != nil {
+		netdev.Attach(vm, vm)
+	}
 
 	extraCmdline := amd64vm.VirtioFSCommandLineArgs(fsdevs)
 	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(vsock.Base, vsock.IRQ))
 	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(rng.Base, rng.IRQ))
+	if netdev != nil {
+		extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(netdev.Base, netdev.IRQ))
+	}
 	plan, err := amd64vm.PrepareBoot(mem, kernel, initrd, amd64vm.BootConfig{
 		MemoryMB:     memoryMB,
 		NumCPUs:      cpus,
@@ -123,7 +133,7 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 	doneCh := make(chan error, 1)
 	go func() {
 		defer vm.Close()
-		doneCh <- runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, serialOut)
+		doneCh <- runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, netdev, serialOut)
 	}()
 
 	var control virtio.VsockConn

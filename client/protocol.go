@@ -245,6 +245,21 @@ type ShareMount struct {
 	Writable bool   `json:"writable,omitempty"`
 }
 
+type NetworkConfig struct {
+	Enabled       bool          `json:"enabled,omitempty"`
+	AllowInternet bool          `json:"allow_internet,omitempty"`
+	HostDNSName   string        `json:"host_dns_name,omitempty"`
+	PortForwards  []PortForward `json:"port_forwards,omitempty"`
+}
+
+type PortForward struct {
+	Protocol  string `json:"protocol,omitempty"`
+	HostAddr  string `json:"host_addr,omitempty"`
+	HostPort  int    `json:"host_port,omitempty"`
+	GuestAddr string `json:"guest_addr,omitempty"`
+	GuestPort int    `json:"guest_port,omitempty"`
+}
+
 type VMSupportedResponse struct {
 	Supported bool   `json:"supported"`
 	Error     string `json:"error,omitempty"`
@@ -266,21 +281,23 @@ type CapabilitiesResponse struct {
 }
 
 type CreateInstanceRequest struct {
-	ID             string       `json:"id,omitempty"`
-	Image          string       `json:"image"`
-	Shares         []ShareMount `json:"shares,omitempty"`
-	MemoryMB       uint64       `json:"memory_mb,omitempty"`
-	CPUs           int          `json:"cpus,omitempty"`
-	Dmesg          bool         `json:"dmesg,omitempty"`
-	TimeoutSeconds float64      `json:"timeout_seconds,omitempty"`
+	ID             string         `json:"id,omitempty"`
+	Image          string         `json:"image"`
+	Shares         []ShareMount   `json:"shares,omitempty"`
+	Network        *NetworkConfig `json:"network,omitempty"`
+	MemoryMB       uint64         `json:"memory_mb,omitempty"`
+	CPUs           int            `json:"cpus,omitempty"`
+	Dmesg          bool           `json:"dmesg,omitempty"`
+	TimeoutSeconds float64        `json:"timeout_seconds,omitempty"`
 }
 
 type StartInstanceRequest struct {
-	ID             string  `json:"id,omitempty"`
-	MemoryMB       uint64  `json:"memory_mb,omitempty"`
-	CPUs           int     `json:"cpus,omitempty"`
-	Dmesg          bool    `json:"dmesg,omitempty"`
-	TimeoutSeconds float64 `json:"timeout_seconds,omitempty"`
+	ID             string         `json:"id,omitempty"`
+	Network        *NetworkConfig `json:"network,omitempty"`
+	MemoryMB       uint64         `json:"memory_mb,omitempty"`
+	CPUs           int            `json:"cpus,omitempty"`
+	Dmesg          bool           `json:"dmesg,omitempty"`
+	TimeoutSeconds float64        `json:"timeout_seconds,omitempty"`
 }
 
 type InstanceState struct {
@@ -294,23 +311,24 @@ type InstanceState struct {
 }
 
 type RunRequest struct {
-	ID             string       `json:"id,omitempty"`
-	Image          string       `json:"image"`
-	Shares         []ShareMount `json:"shares,omitempty"`
-	Command        []string     `json:"command,omitempty"`
-	Env            []string     `json:"env,omitempty"`
-	RootDir        string       `json:"root_dir,omitempty"`
-	ReplaceEnv     bool         `json:"replace_env,omitempty"`
-	WorkDir        string       `json:"workdir,omitempty"`
-	User           string       `json:"user,omitempty"`
-	Stdin          []byte       `json:"stdin,omitempty"`
-	TTY            bool         `json:"tty,omitempty"`
-	Cols           int          `json:"cols,omitempty"`
-	Rows           int          `json:"rows,omitempty"`
-	MemoryMB       uint64       `json:"memory_mb,omitempty"`
-	CPUs           int          `json:"cpus,omitempty"`
-	Dmesg          bool         `json:"dmesg,omitempty"`
-	TimeoutSeconds float64      `json:"timeout_seconds,omitempty"`
+	ID             string         `json:"id,omitempty"`
+	Image          string         `json:"image"`
+	Shares         []ShareMount   `json:"shares,omitempty"`
+	Network        *NetworkConfig `json:"network,omitempty"`
+	Command        []string       `json:"command,omitempty"`
+	Env            []string       `json:"env,omitempty"`
+	RootDir        string         `json:"root_dir,omitempty"`
+	ReplaceEnv     bool           `json:"replace_env,omitempty"`
+	WorkDir        string         `json:"workdir,omitempty"`
+	User           string         `json:"user,omitempty"`
+	Stdin          []byte         `json:"stdin,omitempty"`
+	TTY            bool           `json:"tty,omitempty"`
+	Cols           int            `json:"cols,omitempty"`
+	Rows           int            `json:"rows,omitempty"`
+	MemoryMB       uint64         `json:"memory_mb,omitempty"`
+	CPUs           int            `json:"cpus,omitempty"`
+	Dmesg          bool           `json:"dmesg,omitempty"`
+	TimeoutSeconds float64        `json:"timeout_seconds,omitempty"`
 }
 
 type ExecResponse struct {

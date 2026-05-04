@@ -60,6 +60,17 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if err != nil {
 		return nil, err
 	}
+	network, err := newLinuxAMD64NetworkRuntime(req.Network)
+	if err != nil {
+		return nil, err
+	}
+	if network != nil {
+		defer func() {
+			if err != nil {
+				_ = network.Close()
+			}
+		}()
+	}
 	fsdevs, rootFS, err := amd64vm.BuildFSDevices(vmruntime.RunRequest{
 		RootFS: linuxRuntimeImageFS(image),
 		Shares: convertLinuxShareMounts(req.Shares),
@@ -75,7 +86,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if workDir == "" {
 		workDir = "/"
 	}
-	initCfg := linuxGuestInitConfig(modules, true)
+	initCfg := linuxGuestInitConfig(modules, true, req.Network)
 	initCfg.RootFSTag = vmruntime.RootFSTag
 	initCfg.Env = vmruntime.WithDefaultEnv(image.Config.Env)
 	initCfg.WorkDir = workDir
@@ -83,7 +94,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
 	}
-	session, err := kvm.StartManagedSession(ctx, kernel, initrd, req.MemoryMB, req.CPUs, req.Dmesg, fsdevs, onEvent)
+	session, err := kvm.StartManagedSessionWithNet(ctx, kernel, initrd, req.MemoryMB, req.CPUs, req.Dmesg, fsdevs, networkDevice(network), onEvent)
 	if err != nil {
 		return nil, err
 	}
@@ -94,6 +105,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		workDir: workDir,
 		rootFS:  rootFS,
 		fsdevs:  fsdevs,
+		network: network,
 		dmesg:   req.Dmesg,
 	}, nil
 }
@@ -114,6 +126,17 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if err != nil {
 		return nil, err
 	}
+	network, err := newLinuxAMD64NetworkRuntime(req.Network)
+	if err != nil {
+		return nil, err
+	}
+	if network != nil {
+		defer func() {
+			if err != nil {
+				_ = network.Close()
+			}
+		}()
+	}
 	rootFSBackend := virtio.NewImageFS(blankLinuxRuntimeRootFS(), "")
 	fsdevs, rootFS, err := amd64vm.BuildFSDevices(vmruntime.RunRequest{
 		RootFS: rootFSBackend,
@@ -125,7 +148,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if err != nil {
 		return nil, fmt.Errorf("build guest init: %w", err)
 	}
-	initCfg := linuxGuestInitConfig(modules, true)
+	initCfg := linuxGuestInitConfig(modules, true, req.Network)
 	initCfg.RootFSTag = vmruntime.RootFSTag
 	initCfg.Env = vmruntime.WithDefaultEnv(nil)
 	initCfg.WorkDir = "/"
@@ -133,7 +156,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
 	}
-	session, err := kvm.StartManagedSession(ctx, kernel, initrd, req.MemoryMB, req.CPUs, req.Dmesg, fsdevs, onEvent)
+	session, err := kvm.StartManagedSessionWithNet(ctx, kernel, initrd, req.MemoryMB, req.CPUs, req.Dmesg, fsdevs, networkDevice(network), onEvent)
 	if err != nil {
 		return nil, err
 	}
@@ -143,6 +166,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 		workDir: "/",
 		rootFS:  rootFS,
 		fsdevs:  fsdevs,
+		network: network,
 		dmesg:   req.Dmesg,
 	}, nil
 }
@@ -204,7 +228,7 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 	if err != nil {
 		return client.ExecResponse{}, fmt.Errorf("build guest init: %w", err)
 	}
-	initCfg := linuxGuestInitConfig(modules, len(req.Command) != 0)
+	initCfg := linuxGuestInitConfig(modules, len(req.Command) != 0, req.Network)
 	if len(fsdevs) != 0 {
 		initCfg.RootFSTag = vmruntime.RootFSTag
 	}
@@ -239,7 +263,14 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 			Cols:    req.Cols,
 			Rows:    req.Rows,
 		}
-		resp, serial, err := kvm.RunManagedExecWithFS(ctx, kernel, initrd, req.MemoryMB, req.CPUs, req.Dmesg, fsdevs, execReq)
+		network, err := newLinuxAMD64NetworkRuntime(req.Network)
+		if err != nil {
+			return client.ExecResponse{}, err
+		}
+		if network != nil {
+			defer network.Close()
+		}
+		resp, serial, err := kvm.RunManagedExecWithFSAndNet(ctx, kernel, initrd, req.MemoryMB, req.CPUs, req.Dmesg, fsdevs, networkDevice(network), execReq)
 		if err != nil && resp.Output == "" {
 			resp.Output = serial
 		}
@@ -247,8 +278,15 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 	}
 
 	var output string
+	network, err := newLinuxAMD64NetworkRuntime(req.Network)
+	if err != nil {
+		return client.ExecResponse{}, err
+	}
+	if network != nil {
+		defer network.Close()
+	}
 	if len(fsdevs) != 0 {
-		output, err = kvm.BootInitramfsToMarkerWithFS(ctx, kernel, initrd, req.MemoryMB, true, linuxInitReadyMarker, fsdevs)
+		output, err = kvm.BootInitramfsToMarkerWithFSAndNet(ctx, kernel, initrd, req.MemoryMB, true, linuxInitReadyMarker, fsdevs, networkDevice(network))
 	} else {
 		output, err = kvm.BootInitramfsToMarker(ctx, kernel, initrd, req.MemoryMB, true, linuxInitReadyMarker)
 	}
@@ -262,6 +300,7 @@ func (b *runtimeBackend) RunStream(ctx context.Context, req client.RunRequest, i
 	inst, err := b.StartStream(ctx, client.CreateInstanceRequest{
 		Image:    req.Image,
 		Shares:   append([]client.ShareMount(nil), req.Shares...),
+		Network:  req.Network,
 		MemoryMB: req.MemoryMB,
 		CPUs:     req.CPUs,
 		Dmesg:    req.Dmesg,
@@ -430,6 +469,7 @@ type linuxInstance struct {
 	workDir     string
 	rootFS      virtio.ShareMounter
 	fsdevs      []*virtio.FS
+	network     *linuxNetworkRuntime
 	dmesg       bool
 	shareMu     sync.Mutex
 	shares      map[string]client.ShareMount
@@ -625,10 +665,14 @@ func (i *linuxInstance) Close() error {
 	if i == nil || i.session == nil {
 		return nil
 	}
-	return i.session.Close()
+	err := i.session.Close()
+	if netErr := i.network.Close(); err == nil {
+		err = netErr
+	}
+	return err
 }
 
-func linuxGuestInitConfig(modules []alpine.Module, managedExec bool) vmruntime.GuestInitConfig {
+func linuxGuestInitConfig(modules []alpine.Module, managedExec bool, network *client.NetworkConfig) vmruntime.GuestInitConfig {
 	cfg := vmruntime.GuestInitConfig{
 		Hostname:         vmruntime.DefaultHostname(""),
 		Modules:          vmruntime.ModulePaths(modules),
@@ -640,6 +684,14 @@ func linuxGuestInitConfig(modules []alpine.Module, managedExec bool) vmruntime.G
 	}
 	if managedExec {
 		cfg.VsockPort = vmruntime.ControlPort
+	}
+	if network != nil && network.Enabled {
+		cfg.Network = &vmruntime.GuestNetworkConfig{
+			Interface: "eth0",
+			Address:   "10.42.0.2/24",
+			Gateway:   "10.42.0.1",
+			DNS:       "10.42.0.1",
+		}
 	}
 	return cfg
 }
@@ -656,7 +708,7 @@ func linuxRuntimeImageFS(image *oci.Image) virtio.FSBackend {
 }
 
 func linuxRuntimeConfigVars(image *oci.Image) []string {
-	vars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO"}
+	vars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO", "CONFIG_VIRTIO_NET"}
 	if NeedsAMD64Emulation(image) {
 		vars = append(vars, "CONFIG_BINFMT_MISC")
 	}
@@ -672,6 +724,7 @@ func linuxRuntimeModuleMap() map[string]string {
 		"CONFIG_VIRTIO_VSOCKETS":  "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
 		"CONFIG_HW_RANDOM":        "kernel/drivers/char/hw_random/rng-core.ko.gz",
 		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
+		"CONFIG_VIRTIO_NET":       "kernel/drivers/net/virtio_net.ko.gz",
 		"CONFIG_BINFMT_MISC":      "kernel/fs/binfmt_misc.ko.gz",
 	}
 }

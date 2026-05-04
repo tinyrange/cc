@@ -10,22 +10,30 @@ import (
 )
 
 type GuestInitConfig struct {
-	Command          []string         `json:"command"`
-	Env              []string         `json:"env"`
-	WorkDir          string           `json:"workdir"`
-	User             string           `json:"user,omitempty"`
-	Hostname         string           `json:"hostname,omitempty"`
-	Modules          []string         `json:"modules,omitempty"`
-	EmulatorTag      string           `json:"emulator_tag,omitempty"`
-	RootFSTag        string           `json:"rootfs_tag,omitempty"`
-	Shares           []GuestInitShare `json:"shares,omitempty"`
-	VsockPort        uint32           `json:"vsock_port,omitempty"`
-	ReadyMarker      string           `json:"ready_marker,omitempty"`
-	BeginMarker      string           `json:"begin_marker"`
-	OutputMarkerPref string           `json:"output_marker_prefix,omitempty"`
-	ErrorMarkerPref  string           `json:"error_marker_prefix,omitempty"`
-	ExitMarkerPrefix string           `json:"exit_marker_prefix"`
-	PrecopyAMD64Root bool             `json:"precopy_amd64_root,omitempty"`
+	Command          []string            `json:"command"`
+	Env              []string            `json:"env"`
+	WorkDir          string              `json:"workdir"`
+	User             string              `json:"user,omitempty"`
+	Hostname         string              `json:"hostname,omitempty"`
+	Modules          []string            `json:"modules,omitempty"`
+	EmulatorTag      string              `json:"emulator_tag,omitempty"`
+	RootFSTag        string              `json:"rootfs_tag,omitempty"`
+	Shares           []GuestInitShare    `json:"shares,omitempty"`
+	VsockPort        uint32              `json:"vsock_port,omitempty"`
+	ReadyMarker      string              `json:"ready_marker,omitempty"`
+	BeginMarker      string              `json:"begin_marker"`
+	OutputMarkerPref string              `json:"output_marker_prefix,omitempty"`
+	ErrorMarkerPref  string              `json:"error_marker_prefix,omitempty"`
+	ExitMarkerPrefix string              `json:"exit_marker_prefix"`
+	PrecopyAMD64Root bool                `json:"precopy_amd64_root,omitempty"`
+	Network          *GuestNetworkConfig `json:"network,omitempty"`
+}
+
+type GuestNetworkConfig struct {
+	Interface string `json:"interface,omitempty"`
+	Address   string `json:"address,omitempty"`
+	Gateway   string `json:"gateway,omitempty"`
+	DNS       string `json:"dns,omitempty"`
 }
 
 type GuestInitShare struct {

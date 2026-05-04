@@ -5,6 +5,9 @@ package vm
 import (
 	"context"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -79,6 +82,139 @@ func TestRuntimeBackendRunCommand(t *testing.T) {
 	if strings.TrimSpace(resp.Output) != "linux-amd64-ok" {
 		t.Fatalf("backend.Run().Output = %q, want linux-amd64-ok", resp.Output)
 	}
+}
+
+func TestRuntimeBackendRunCommandWithNetworkDevice(t *testing.T) {
+	if os.Getenv("CCX3_KVM_BOOT") == "" {
+		t.Skip("set CCX3_KVM_BOOT=1 to run the linux amd64 KVM boot probe")
+	}
+	fixture := filepath.Join("..", "..", "fixtures", "alpine.simg")
+	if _, err := os.Stat(fixture); err != nil {
+		t.Skipf("local alpine fixture unavailable: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	root := t.TempDir()
+	kernel := alpine.NewManager(filepath.Join(root, "kernel"))
+	if err := kernel.Ensure(ctx); err != nil {
+		t.Fatalf("kernel.Ensure() error = %v", err)
+	}
+	store := oci.NewStore(filepath.Join(root, "images"))
+	if _, err := store.Pull(ctx, "alpine", fixture); err != nil {
+		t.Fatalf("store.Pull() error = %v", err)
+	}
+
+	backend := NewRuntimeBackend(kernel, store, filepath.Join(root, "guestinit"))
+	resp, err := backend.Run(ctx, client.RunRequest{
+		Image:    "alpine",
+		Network:  &client.NetworkConfig{Enabled: true},
+		Command:  []string{"sh", "-c", "ls /sys/class/net && test -d /sys/class/net/eth0 && ip addr show eth0 && ip route && cat /etc/resolv.conf && ping -c 1 -W 1 10.42.0.1 && nslookup host.containers.internal 10.42.0.1 && echo network-device-ok"},
+		MemoryMB: 256,
+		User:     "0:0",
+	})
+	if err != nil {
+		t.Fatalf("backend.Run() error = %v\noutput:\n%s", err, resp.Output)
+	}
+	if resp.ExitCode != 0 {
+		t.Fatalf("backend.Run().ExitCode = %d, want 0\noutput:\n%s", resp.ExitCode, resp.Output)
+	}
+	if !strings.Contains(resp.Output, "network-device-ok") {
+		t.Fatalf("output missing network success marker:\n%s", resp.Output)
+	}
+}
+
+func TestRuntimeBackendPortForwardToGuestWebServer(t *testing.T) {
+	if os.Getenv("CCX3_KVM_BOOT") == "" {
+		t.Skip("set CCX3_KVM_BOOT=1 to run the linux amd64 KVM boot probe")
+	}
+	fixture := filepath.Join("..", "..", "fixtures", "alpine.simg")
+	if _, err := os.Stat(fixture); err != nil {
+		t.Skipf("local alpine fixture unavailable: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	hostPort := reserveLocalTCPPort(t)
+	root := t.TempDir()
+	kernel := alpine.NewManager(filepath.Join(root, "kernel"))
+	if err := kernel.Ensure(ctx); err != nil {
+		t.Fatalf("kernel.Ensure() error = %v", err)
+	}
+	store := oci.NewStore(filepath.Join(root, "images"))
+	if _, err := store.Pull(ctx, "alpine", fixture); err != nil {
+		t.Fatalf("store.Pull() error = %v", err)
+	}
+
+	backend := NewRuntimeBackend(kernel, store, filepath.Join(root, "guestinit"))
+	inst, err := backend.Start(ctx, client.CreateInstanceRequest{
+		Image: "alpine",
+		Network: &client.NetworkConfig{
+			Enabled: true,
+			PortForwards: []client.PortForward{
+				{Protocol: "tcp", HostAddr: "127.0.0.1", HostPort: hostPort, GuestPort: 8080},
+			},
+		},
+		MemoryMB: 256,
+	})
+	if err != nil {
+		t.Fatalf("backend.Start() error = %v", err)
+	}
+	defer inst.Close()
+
+	resp, err := inst.Exec(ctx, client.ExecRequest{
+		Command: []string{"sh", "-c", "while true; do printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 13\\r\\nConnection: close\\r\\n\\r\\nguest-web-ok\\n' | nc -l -p 8080; done >/tmp/cc-port-forward.log 2>&1 & echo server-ready"},
+	})
+	if err != nil {
+		t.Fatalf("start guest web server error = %v\noutput:\n%s", err, resp.Output)
+	}
+	if resp.ExitCode != 0 || !strings.Contains(resp.Output, "server-ready") {
+		t.Fatalf("start guest web server exit=%d output:\n%s", resp.ExitCode, resp.Output)
+	}
+
+	body := fetchWithRetry(t, fmt.Sprintf("http://127.0.0.1:%d/", hostPort), 5*time.Second)
+	if strings.TrimSpace(body) != "guest-web-ok" {
+		t.Fatalf("unexpected forwarded response %q", body)
+	}
+}
+
+func reserveLocalTCPPort(t testing.TB) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve local tcp port: %v", err)
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+func fetchWithRetry(t testing.TB, url string, timeout time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	client := http.Client{Timeout: time.Second}
+	var lastErr error
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(url)
+		if err == nil {
+			body, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if readErr == nil && resp.StatusCode == http.StatusOK {
+				return string(body)
+			}
+			if readErr != nil {
+				lastErr = readErr
+			} else {
+				lastErr = fmt.Errorf("status %s", resp.Status)
+			}
+		} else {
+			lastErr = err
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("fetch %s failed: %v", url, lastErr)
+	return ""
 }
 
 func TestRuntimeBackendRunCommandDefaultsToHostUserAndResolvableHostname(t *testing.T) {

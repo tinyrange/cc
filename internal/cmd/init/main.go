@@ -49,6 +49,14 @@ type config struct {
 	ErrorMarkerPref  string   `json:"error_marker_prefix"`
 	ExitMarkerPrefix string   `json:"exit_marker_prefix"`
 	PrecopyAMD64Root bool     `json:"precopy_amd64_root,omitempty"`
+	Network          *network `json:"network,omitempty"`
+}
+
+type network struct {
+	Interface string `json:"interface,omitempty"`
+	Address   string `json:"address,omitempty"`
+	Gateway   string `json:"gateway,omitempty"`
+	DNS       string `json:"dns,omitempty"`
 }
 
 type share struct {
@@ -221,6 +229,13 @@ func run() error {
 		}
 		writeStage(bootStart, "binfmt configured")
 	}
+	if cfg.Network != nil {
+		writeStage(bootStart, "configuring network")
+		if err := configureNetwork(cfg.Network); err != nil {
+			return fmt.Errorf("configure network: %w", err)
+		}
+		writeStage(bootStart, "network configured")
+	}
 	writeStage(bootStart, "changing workdir")
 	if err := os.Chdir(cfg.WorkDir); err != nil {
 		return fmt.Errorf("chdir %s: %w", cfg.WorkDir, err)
@@ -319,6 +334,68 @@ func precopyAMD64Root() error {
 		if err := copyPath(path, filepath.Join("/run/ccx3-precopy", path)); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func configureNetwork(cfg *network) error {
+	if cfg == nil {
+		return nil
+	}
+	iface := strings.TrimSpace(cfg.Interface)
+	if iface == "" {
+		iface = "eth0"
+	}
+	address := strings.TrimSpace(cfg.Address)
+	if address == "" {
+		address = "10.42.0.2/24"
+	}
+	gateway := strings.TrimSpace(cfg.Gateway)
+	if gateway == "" {
+		gateway = "10.42.0.1"
+	}
+	dns := strings.TrimSpace(cfg.DNS)
+	if dns == "" {
+		dns = gateway
+	}
+	ip, err := findIPCommand()
+	if err != nil {
+		return err
+	}
+	_ = runCommand(ip, "link", "set", iface, "up")
+	_ = runCommand(ip, "addr", "flush", "dev", iface)
+	if err := runCommand(ip, "addr", "add", address, "dev", iface); err != nil {
+		return err
+	}
+	_ = runCommand(ip, "route", "del", "default")
+	if err := runCommand(ip, "route", "add", "default", "via", gateway, "dev", iface); err != nil {
+		return err
+	}
+	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver "+dns+"\n"), 0o644); err != nil {
+		return fmt.Errorf("write /etc/resolv.conf: %w", err)
+	}
+	return nil
+}
+
+func findIPCommand() (string, error) {
+	for _, path := range []string{"/sbin/ip", "/bin/ip", "/usr/sbin/ip", "/usr/bin/ip"} {
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		}
+	}
+	return "", fmt.Errorf("ip command not found")
+}
+
+func runCommand(name string, args ...string) error {
+	cmd := exec.Command(name, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("%s %s: %s", name, strings.Join(args, " "), msg)
 	}
 	return nil
 }

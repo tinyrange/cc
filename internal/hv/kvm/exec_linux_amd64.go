@@ -18,6 +18,10 @@ import (
 )
 
 func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, cpus int, dmesg bool, fsdevs []*virtio.FS, req client.ExecRequest) (client.ExecResponse, string, error) {
+	return RunManagedExecWithFSAndNet(ctx, kernel, initrd, memoryMB, cpus, dmesg, fsdevs, nil, req)
+}
+
+func RunManagedExecWithFSAndNet(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, cpus int, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, req client.ExecRequest) (client.ExecResponse, string, error) {
 	if len(req.Command) == 0 {
 		return client.ExecResponse{}, "", fmt.Errorf("exec command is required")
 	}
@@ -66,10 +70,16 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 	}
 	vsock.Attach(vm, vm)
 	rng.Attach(vm, vm)
+	if netdev != nil {
+		netdev.Attach(vm, vm)
+	}
 
 	extraCmdline := amd64vm.VirtioFSCommandLineArgs(fsdevs)
 	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(vsock.Base, vsock.IRQ))
 	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(rng.Base, rng.IRQ))
+	if netdev != nil {
+		extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(netdev.Base, netdev.IRQ))
+	}
 	plan, err := amd64vm.PrepareBoot(mem, kernel, initrd, amd64vm.BootConfig{
 		MemoryMB:     memoryMB,
 		NumCPUs:      cpus,
@@ -112,7 +122,7 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 	}
 
 	go func() {
-		setRunErr(runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, serialOut))
+		setRunErr(runManagedExecVM(runCtx, vm, uart, fsdevs, vsock, rng, netdev, serialOut))
 	}()
 	go func() {
 		text, err := serialOut.WaitFor(runCtx, 0, vmruntime.HasFatalBootText)
@@ -171,9 +181,9 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 	return client.ExecResponse{ExitCode: code, Output: output}, serialOut.String(), nil
 }
 
-func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, serialOut *vmruntime.SerialTranscript) error {
+func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, serialOut *vmruntime.SerialTranscript) error {
 	if vm != nil && len(vm.vcpus) > 1 {
-		return runManagedExecVMMulti(ctx, vm, uart, fsdevs, vsock, rng, serialOut)
+		return runManagedExecVMMulti(ctx, vm, uart, fsdevs, vsock, rng, netdev, serialOut)
 	}
 	var exit Exit
 	for step := 0; ; step++ {
@@ -189,7 +199,7 @@ func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs
 				return err
 			}
 		case ExitMMIO:
-			if err := handleBootMMIO(vm, fsdevs, vsock, rng, exit.MMIO); err != nil {
+			if err := handleBootMMIO(vm, fsdevs, vsock, rng, netdev, exit.MMIO); err != nil {
 				return err
 			}
 		case ExitShutdown:
@@ -203,7 +213,7 @@ func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs
 	}
 }
 
-func runManagedExecVMMulti(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, serialOut *vmruntime.SerialTranscript) error {
+func runManagedExecVMMulti(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, serialOut *vmruntime.SerialTranscript) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	errCh := make(chan error, len(vm.vcpus))
@@ -224,7 +234,7 @@ func runManagedExecVMMulti(ctx context.Context, vm *VM, uart *serial.UART8250, f
 					return
 				}
 				exitMu.Lock()
-				err = handleManagedExit(vm, index, uart, fsdevs, vsock, rng, serialOut, exit)
+				err = handleManagedExit(vm, index, uart, fsdevs, vsock, rng, netdev, serialOut, exit)
 				exitMu.Unlock()
 				if err != nil {
 					reportRunErr(errCh, cancel, err)
@@ -255,14 +265,14 @@ func reportRunErr(errCh chan<- error, cancel context.CancelFunc, err error) {
 	}
 }
 
-func handleManagedExit(vm *VM, vcpuIndex int, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, serialOut *vmruntime.SerialTranscript, exit Exit) error {
+func handleManagedExit(vm *VM, vcpuIndex int, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, serialOut *vmruntime.SerialTranscript, exit Exit) error {
 	switch exit.Reason {
 	case ExitIO:
 		if err := handleBootIO(uart, exit.IO); err != nil {
 			return err
 		}
 	case ExitMMIO:
-		if err := handleBootMMIOForVCPU(vm, vcpuIndex, fsdevs, vsock, rng, exit.MMIO); err != nil {
+		if err := handleBootMMIOForVCPU(vm, vcpuIndex, fsdevs, vsock, rng, netdev, exit.MMIO); err != nil {
 			return err
 		}
 	case ExitHLT:

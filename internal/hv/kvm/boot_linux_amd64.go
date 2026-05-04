@@ -50,16 +50,25 @@ func BootInitramfsToMarkerWithFS(ctx context.Context, kernel []byte, initrd []by
 	if strings.TrimSpace(marker) == "" {
 		return "", fmt.Errorf("boot marker is required")
 	}
-	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, func(serial string) bool {
+	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, nil, func(serial string) bool {
+		return strings.Contains(serial, marker)
+	})
+}
+
+func BootInitramfsToMarkerWithFSAndNet(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, marker string, fsdevs []*virtio.FS, netdev *virtio.Net) (string, error) {
+	if strings.TrimSpace(marker) == "" {
+		return "", fmt.Errorf("boot marker is required")
+	}
+	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, netdev, func(serial string) bool {
 		return strings.Contains(serial, marker)
 	})
 }
 
 func bootToCondition(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, done func(string) bool) (string, error) {
-	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, nil, done)
+	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, nil, nil, done)
 }
 
-func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, done func(string) bool) (string, error) {
+func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, done func(string) bool) (string, error) {
 	vm, err := NewVM()
 	if err != nil {
 		return "", err
@@ -81,12 +90,18 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 	if vsock != nil {
 		vsock.Attach(vm, vm)
 	}
+	if netdev != nil {
+		netdev.Attach(vm, vm)
+	}
 	rng := virtio.NewRNG(amd64vm.RNGBase, amd64vm.RNGSize, amd64vm.RNGIRQ)
 	rng.Attach(vm, vm)
 
 	extraCmdline := amd64vm.VirtioFSCommandLineArgs(fsdevs)
 	if vsock != nil {
 		extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(vsock.Base, vsock.IRQ))
+	}
+	if netdev != nil {
+		extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(netdev.Base, netdev.IRQ))
 	}
 	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(rng.Base, rng.IRQ))
 	plan, err := amd64vm.PrepareBoot(mem, kernel, initrd, amd64vm.BootConfig{
@@ -121,7 +136,7 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 				return serialOut.String(), err
 			}
 		case ExitMMIO:
-			if err := handleBootMMIO(vm, fsdevs, vsock, rng, exit.MMIO); err != nil {
+			if err := handleBootMMIO(vm, fsdevs, vsock, rng, netdev, exit.MMIO); err != nil {
 				return serialOut.String(), err
 			}
 		case ExitHLT, ExitShutdown:
@@ -186,11 +201,11 @@ func handleUARTIO(uart *serial.UART8250, ioExit IOExit) error {
 	return nil
 }
 
-func handleBootMMIO(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, mmio MMIOExit) error {
-	return handleBootMMIOForVCPU(vm, 0, fsdevs, vsock, rng, mmio)
+func handleBootMMIO(vm *VM, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, mmio MMIOExit) error {
+	return handleBootMMIOForVCPU(vm, 0, fsdevs, vsock, rng, netdev, mmio)
 }
 
-func handleBootMMIOForVCPU(vm *VM, vcpuIndex int, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, mmio MMIOExit) error {
+func handleBootMMIOForVCPU(vm *VM, vcpuIndex int, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, netdev *virtio.Net, mmio MMIOExit) error {
 	for _, fsdev := range fsdevs {
 		if fsdev == nil || !fsdev.Contains(mmio.Addr, int(mmio.Len)) {
 			continue
@@ -221,6 +236,17 @@ func handleBootMMIOForVCPU(vm *VM, vcpuIndex int, fsdevs []*virtio.FS, vsock *vi
 			return rng.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio))
 		}
 		value, err := rng.Read(mmio.Addr, int(mmio.Len))
+		if err != nil {
+			return err
+		}
+		vm.CompleteVCPUMMIORead(vcpuIndex, value, mmio.Len)
+		return nil
+	}
+	if netdev != nil && netdev.Contains(mmio.Addr, int(mmio.Len)) {
+		if mmio.Write {
+			return netdev.Write(mmio.Addr, int(mmio.Len), mmioValue(mmio))
+		}
+		value, err := netdev.Read(mmio.Addr, int(mmio.Len))
 		if err != nil {
 			return err
 		}

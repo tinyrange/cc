@@ -1,0 +1,1337 @@
+package netstack
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	"j5.nz/cc/internal/pcap"
+)
+
+var (
+	testGuestMAC = net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x02}
+	testHostMAC  = net.HardwareAddr{0x0a, 0x42, 0x00, 0x00, 0x00, 0x01}
+)
+
+func newTestNetStack(tb testing.TB, frameBufferSize int) (*NetStack, *NetworkInterface, chan []byte) {
+	tb.Helper()
+
+	stack := New(slog.Default())
+	if err := stack.SetGuestMAC(testGuestMAC); err != nil {
+		tb.Fatalf("set guest mac: %v", err)
+	}
+
+	iface, err := stack.AttachNetworkInterface()
+	if err != nil {
+		tb.Fatalf("attach network interface: %v", err)
+	}
+
+	nic := iface
+	if val, ok := macToUint64(testHostMAC); ok {
+		stack.hostMAC.Store(uint64(val))
+	} else {
+		tb.Fatalf("invalid test host mac: %v", testHostMAC)
+	}
+
+	frames := make(chan []byte, frameBufferSize)
+	nic.AttachVirtioBackend(func(frame []byte) error {
+		out := append([]byte(nil), frame...)
+		select {
+		case frames <- out:
+		default:
+			tb.Fatalf("virtio backend channel full")
+		}
+		return nil
+	})
+
+	tb.Cleanup(func() {
+		close(frames)
+		_ = stack.Close()
+	})
+
+	return stack, nic, frames
+}
+
+func awaitFrame(t testing.TB, frames <-chan []byte) []byte {
+	t.Helper()
+	select {
+	case frame, ok := <-frames:
+		if !ok {
+			t.Fatalf("frame channel closed")
+		}
+		return frame
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for frame")
+		return nil
+	}
+}
+
+func parseEthernet(frame []byte) (net.HardwareAddr, net.HardwareAddr, uint16, []byte) {
+	dst := net.HardwareAddr(frame[0:6])
+	src := net.HardwareAddr(frame[6:12])
+	etherType := binary.BigEndian.Uint16(frame[12:14])
+	return dst, src, etherType, frame[14:]
+}
+
+func buildARPRequest(guestIP, targetIP net.IP) []byte {
+	frame := make([]byte, 14+28)
+	copy(frame[0:6], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
+	copy(frame[6:12], testGuestMAC)
+	binary.BigEndian.PutUint16(frame[12:14], uint16(etherTypeARP))
+
+	payload := frame[14:]
+	binary.BigEndian.PutUint16(payload[0:2], arpHardwareEthernet)
+	binary.BigEndian.PutUint16(payload[2:4], arpProtoIPv4)
+	payload[4] = 6
+	payload[5] = 4
+	binary.BigEndian.PutUint16(payload[6:8], 1)
+	copy(payload[8:14], testGuestMAC)
+	copy(payload[14:18], guestIP.To4())
+	copy(payload[18:24], []byte{0, 0, 0, 0, 0, 0})
+	copy(payload[24:28], targetIP.To4())
+	return frame
+}
+
+func buildICMPEchoRequest(hostIP, guestIP net.IP) []byte {
+	payload := []byte("payload")
+	icmp := make([]byte, 8+len(payload))
+	icmp[0] = 8 // echo request
+	icmp[1] = 0
+	copy(icmp[8:], payload)
+	binary.BigEndian.PutUint16(icmp[2:4], 0)
+	binary.BigEndian.PutUint16(icmp[4:6], 0x1234)
+	binary.BigEndian.PutUint16(icmp[6:8], 1)
+	sum := checksum(icmp)
+	binary.BigEndian.PutUint16(icmp[2:4], sum)
+
+	ip := buildIPv4Packet(guestIP, hostIP, icmpProtocol, icmp)
+	frame := make([]byte, 14+len(ip))
+	copy(frame[0:6], testHostMAC)
+	copy(frame[6:12], testGuestMAC)
+	binary.BigEndian.PutUint16(frame[12:14], uint16(etherTypeIPv4))
+	copy(frame[14:], ip)
+	return frame
+}
+
+func buildUDPFrame(hostIP, guestIP net.IP, hostPort, guestPort uint16, payload []byte) []byte {
+	udp := make([]byte, 8+len(payload))
+	binary.BigEndian.PutUint16(udp[0:2], guestPort)
+	binary.BigEndian.PutUint16(udp[2:4], hostPort)
+	binary.BigEndian.PutUint16(udp[4:6], uint16(len(udp)))
+	copy(udp[8:], payload)
+	// No checksum (optional for IPv4).
+
+	ip := buildIPv4Packet(guestIP, hostIP, udpProtocolNumber, udp)
+	frame := make([]byte, 14+len(ip))
+	copy(frame[0:6], testHostMAC)
+	copy(frame[6:12], testGuestMAC)
+	binary.BigEndian.PutUint16(frame[12:14], uint16(etherTypeIPv4))
+	copy(frame[14:], ip)
+	return frame
+}
+
+func buildDNSQuery(id uint16, name string) []byte {
+	msg := make([]byte, 12, 64)
+	binary.BigEndian.PutUint16(msg[0:2], id)
+	binary.BigEndian.PutUint16(msg[2:4], 0x0100)
+	binary.BigEndian.PutUint16(msg[4:6], 1)
+	for _, label := range strings.Split(name, ".") {
+		msg = append(msg, byte(len(label)))
+		msg = append(msg, label...)
+	}
+	msg = append(msg, 0, 0, dnsTypeA, 0, dnsClassIN)
+	return msg
+}
+
+func parseDNSAResponse(msg []byte) (net.IP, int, error) {
+	if len(msg) < 12 {
+		return nil, 0, io.ErrUnexpectedEOF
+	}
+	rcode := int(msg[3] & 0x0f)
+	qdCount := int(binary.BigEndian.Uint16(msg[4:6]))
+	anCount := int(binary.BigEndian.Uint16(msg[6:8]))
+	off := 12
+	for i := 0; i < qdCount; i++ {
+		for {
+			if off >= len(msg) {
+				return nil, rcode, io.ErrUnexpectedEOF
+			}
+			labelLen := int(msg[off])
+			off++
+			if labelLen == 0 {
+				break
+			}
+			off += labelLen
+			if off > len(msg) {
+				return nil, rcode, io.ErrUnexpectedEOF
+			}
+		}
+		off += 4
+		if off > len(msg) {
+			return nil, rcode, io.ErrUnexpectedEOF
+		}
+	}
+	for i := 0; i < anCount; i++ {
+		if off+12 > len(msg) {
+			return nil, rcode, io.ErrUnexpectedEOF
+		}
+		if msg[off]&0xc0 == 0xc0 {
+			off += 2
+		} else {
+			for {
+				if off >= len(msg) {
+					return nil, rcode, io.ErrUnexpectedEOF
+				}
+				labelLen := int(msg[off])
+				off++
+				if labelLen == 0 {
+					break
+				}
+				off += labelLen
+				if off > len(msg) {
+					return nil, rcode, io.ErrUnexpectedEOF
+				}
+			}
+		}
+		typ := binary.BigEndian.Uint16(msg[off : off+2])
+		class := binary.BigEndian.Uint16(msg[off+2 : off+4])
+		rdLen := int(binary.BigEndian.Uint16(msg[off+8 : off+10]))
+		off += 10
+		if off+rdLen > len(msg) {
+			return nil, rcode, io.ErrUnexpectedEOF
+		}
+		if typ == dnsTypeA && class == dnsClassIN && rdLen == 4 {
+			return net.IPv4(msg[off], msg[off+1], msg[off+2], msg[off+3]), rcode, nil
+		}
+		off += rdLen
+	}
+	return nil, rcode, nil
+}
+
+func buildTCPFrame(hostIP, guestIP net.IP, hostPort, guestPort uint16, seq, ack uint32, flags uint16, payload []byte) []byte {
+	return buildTCPFrameWithWindow(hostIP, guestIP, hostPort, guestPort, seq, ack, flags, 0x6000, payload)
+}
+
+func buildTCPFrameWithWindow(hostIP, guestIP net.IP, hostPort, guestPort uint16, seq, ack uint32, flags uint16, window uint16, payload []byte) []byte {
+	headerLen := 20
+	packet := make([]byte, headerLen+len(payload))
+	binary.BigEndian.PutUint16(packet[0:2], guestPort)
+	binary.BigEndian.PutUint16(packet[2:4], hostPort)
+	binary.BigEndian.PutUint32(packet[4:8], seq)
+	binary.BigEndian.PutUint32(packet[8:12], ack)
+	packet[12] = (uint8(headerLen/4) << 4)
+	packet[13] = uint8(flags)
+	binary.BigEndian.PutUint16(packet[14:16], window)
+	copy(packet[20:], payload)
+
+	binary.BigEndian.PutUint16(packet[16:18], 0)
+	check := tcpChecksum(guestIP, hostIP, packet)
+	binary.BigEndian.PutUint16(packet[16:18], check)
+
+	ip := buildIPv4Packet(guestIP, hostIP, tcpProtocolNumber, packet)
+	frame := make([]byte, 14+len(ip))
+	copy(frame[0:6], testHostMAC)
+	copy(frame[6:12], testGuestMAC)
+	binary.BigEndian.PutUint16(frame[12:14], uint16(etherTypeIPv4))
+	copy(frame[14:], ip)
+	return frame
+}
+
+func hostIP4(ns *NetStack) net.IP {
+	ip := ns.hostIPv4
+	return net.IPv4(ip[0], ip[1], ip[2], ip[3])
+}
+
+func guestIP4(ns *NetStack) net.IP {
+	ip := ns.guestIPv4
+	return net.IPv4(ip[0], ip[1], ip[2], ip[3])
+}
+
+func establishTCPFromGuest(
+	t testing.TB,
+	nic *NetworkInterface,
+	frames <-chan []byte,
+	dstIP, guestIP net.IP,
+	dstPort, guestPort uint16,
+) (guestSeq uint32, hostSeq uint32) {
+	t.Helper()
+
+	guestSeq = 100
+	syn := buildTCPFrame(dstIP, guestIP, dstPort, guestPort, guestSeq, 0, tcpFlagSYN, nil)
+	if err := nic.DeliverGuestPacket(syn, nil); err != nil {
+		t.Fatalf("deliver syn: %v", err)
+	}
+
+	synAckFrame := awaitFrame(t, frames)
+	_, _, _, payload := parseEthernet(synAckFrame)
+	ipHdr, err := parseIPv4Header(payload)
+	if err != nil {
+		t.Fatalf("parse ipv4 synack: %v", err)
+	}
+	tcpHdr, err := parseTCPHeader(ipHdr.payload)
+	if err != nil {
+		t.Fatalf("parse tcp synack: %v", err)
+	}
+	if tcpHdr.flags&(tcpFlagSYN|tcpFlagACK) != (tcpFlagSYN | tcpFlagACK) {
+		t.Fatalf("expected syn+ack, got flags %#x", tcpHdr.flags)
+	}
+	if tcpHdr.ack != guestSeq+1 {
+		t.Fatalf("unexpected ack number %d", tcpHdr.ack)
+	}
+
+	hostSeq = tcpHdr.seq + 1
+	ack := buildTCPFrame(dstIP, guestIP, dstPort, guestPort, guestSeq+1, hostSeq, tcpFlagACK, nil)
+	if err := nic.DeliverGuestPacket(ack, nil); err != nil {
+		t.Fatalf("deliver ack: %v", err)
+	}
+	return guestSeq + 1, hostSeq
+}
+
+func TestARPReply(t *testing.T) {
+	stack, nic, frames := newTestNetStack(t, 1024)
+
+	hostIP := hostIP4(stack)
+	guestIP := guestIP4(stack)
+
+	req := buildARPRequest(guestIP, hostIP)
+	if err := nic.DeliverGuestPacket(req, nil); err != nil {
+		t.Fatalf("deliver arp request: %v", err)
+	}
+
+	frame := awaitFrame(t, frames)
+	dst, src, ethType, payload := parseEthernet(frame)
+
+	if !bytes.Equal(dst, testGuestMAC) {
+		t.Fatalf("unexpected dst mac %s", dst)
+	}
+	if !bytes.Equal(src, testHostMAC) {
+		t.Fatalf("unexpected src mac %s", src)
+	}
+	if etherType(ethType) != etherTypeARP {
+		t.Fatalf("unexpected ethertype %#04x", ethType)
+	}
+	op := binary.BigEndian.Uint16(payload[6:8])
+	if op != 2 {
+		t.Fatalf("expected arp reply opcode 2, got %d", op)
+	}
+	if got := net.IP(payload[14:18]); !got.Equal(hostIP) {
+		t.Fatalf("unexpected sender ip %s", got)
+	}
+}
+
+func TestICMPEchoReply(t *testing.T) {
+	stack, nic, frames := newTestNetStack(t, 1024)
+
+	hostIP := hostIP4(stack)
+	guestIP := guestIP4(stack)
+
+	req := buildICMPEchoRequest(hostIP, guestIP)
+	if err := nic.DeliverGuestPacket(req, nil); err != nil {
+		t.Fatalf("deliver icmp request: %v", err)
+	}
+
+	frame := awaitFrame(t, frames)
+	_, src, ethType, payload := parseEthernet(frame)
+	if !bytes.Equal(src, testHostMAC) {
+		t.Fatalf("unexpected src mac %s", src)
+	}
+	if etherType(ethType) != etherTypeIPv4 {
+		t.Fatalf("unexpected ethertype %#04x", ethType)
+	}
+	ipHdr, err := parseIPv4Header(payload)
+	if err != nil {
+		t.Fatalf("parse ipv4: %v", err)
+	}
+	if ipHdr.protocol != icmpProtocol {
+		t.Fatalf("unexpected protocol %d", ipHdr.protocol)
+	}
+	resp := ipHdr.payload
+	if resp[0] != 0 {
+		t.Fatalf("expected icmp echo reply, got type %d", resp[0])
+	}
+	if binary.BigEndian.Uint16(resp[4:6]) != 0x1234 {
+		t.Fatalf("unexpected identifier %x", binary.BigEndian.Uint16(resp[4:6]))
+	}
+}
+
+func TestUDPInboundAndOutbound(t *testing.T) {
+	stack, nic, frames := newTestNetStack(t, 1024)
+
+	hostIP := hostIP4(stack)
+	guestIP := guestIP4(stack)
+
+	pc, err := stack.ListenPacketInternal("udp", ":1053")
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	defer pc.Close()
+
+	readDone := make(chan struct{})
+	var recvPayload []byte
+	var recvAddr net.Addr
+	go func() {
+		buf := make([]byte, 64)
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			t.Errorf("read from udp: %v", err)
+			close(readDone)
+			return
+		}
+		recvPayload = append([]byte(nil), buf[:n]...)
+		recvAddr = addr
+		close(readDone)
+	}()
+
+	payload := []byte("dns?")
+	frame := buildUDPFrame(hostIP, guestIP, 1053, 5353, payload)
+	if err := nic.DeliverGuestPacket(frame, nil); err != nil {
+		t.Fatalf("deliver udp packet: %v", err)
+	}
+
+	select {
+	case <-readDone:
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for udp read")
+	}
+	if string(recvPayload) != "dns?" {
+		t.Fatalf("unexpected udp payload %q", string(recvPayload))
+	}
+	uaddr, ok := recvAddr.(*net.UDPAddr)
+	if !ok {
+		t.Fatalf("unexpected addr type %T", recvAddr)
+	}
+	if !uaddr.IP.Equal(guestIP) {
+		t.Fatalf("unexpected udp source ip %s", uaddr.IP)
+	}
+	if uaddr.Port != 5353 {
+		t.Fatalf("unexpected udp source port %d", uaddr.Port)
+	}
+
+	response := []byte("ok!")
+	if _, err := pc.WriteTo(response, &net.UDPAddr{IP: guestIP, Port: 5353}); err != nil {
+		t.Fatalf("write udp: %v", err)
+	}
+
+	respFrame := awaitFrame(t, frames)
+	dst, src, ethType, payloadBytes := parseEthernet(respFrame)
+	if !bytes.Equal(dst, testGuestMAC) || !bytes.Equal(src, testHostMAC) {
+		t.Fatalf("unexpected macs dst=%s src=%s", dst, src)
+	}
+	if etherType(ethType) != etherTypeIPv4 {
+		t.Fatalf("unexpected ethertype %#04x", ethType)
+	}
+
+	ipHdr, err := parseIPv4Header(payloadBytes)
+	if err != nil {
+		t.Fatalf("parse ipv4: %v", err)
+	}
+	if ipHdr.protocol != udpProtocolNumber {
+		t.Fatalf("unexpected protocol %d", ipHdr.protocol)
+	}
+	udpPayload := ipHdr.payload[8:]
+	if string(udpPayload) != "ok!" {
+		t.Fatalf("unexpected udp response %q", string(udpPayload))
+	}
+}
+
+func TestUDPPayloadSurvivesReleasedGuestBuffer(t *testing.T) {
+	stack, nic, _ := newTestNetStack(t, 1024)
+
+	hostIP := hostIP4(stack)
+	guestIP := guestIP4(stack)
+
+	pc, err := stack.ListenPacketInternal("udp", ":1053")
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	defer pc.Close()
+
+	frame := buildUDPFrame(hostIP, guestIP, 1053, 5353, []byte("stable"))
+	released := false
+	if err := nic.DeliverGuestPacket(frame, func() {
+		released = true
+		for i := range frame {
+			frame[i] = 0xee
+		}
+	}); err != nil {
+		t.Fatalf("deliver udp packet: %v", err)
+	}
+	if !released {
+		t.Fatalf("release callback was not called")
+	}
+
+	buf := make([]byte, 32)
+	_ = pc.SetReadDeadline(time.Now().Add(time.Second))
+	n, _, err := pc.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("read udp: %v", err)
+	}
+	if string(buf[:n]) != "stable" {
+		t.Fatalf("payload retained guest buffer contents after release: %q", string(buf[:n]))
+	}
+}
+
+func TestDNSServerHostNameAndInternetDisabled(t *testing.T) {
+	stack, nic, frames := newTestNetStack(t, 1024)
+	stack.SetInternetAccessEnabled(false)
+	stack.SetHostDNSName("host.containers.internal")
+	if err := stack.StartDNSServer(); err != nil {
+		t.Fatalf("start dns: %v", err)
+	}
+
+	hostIP := hostIP4(stack)
+	guestIP := guestIP4(stack)
+
+	query := buildDNSQuery(0x1234, "host.containers.internal")
+	frame := buildUDPFrame(hostIP, guestIP, 53, 53000, query)
+	if err := nic.DeliverGuestPacket(frame, nil); err != nil {
+		t.Fatalf("deliver dns query: %v", err)
+	}
+
+	respFrame := awaitFrame(t, frames)
+	_, _, ethType, payloadBytes := parseEthernet(respFrame)
+	if etherType(ethType) != etherTypeIPv4 {
+		t.Fatalf("unexpected ethertype %#04x", ethType)
+	}
+	ipHdr, err := parseIPv4Header(payloadBytes)
+	if err != nil {
+		t.Fatalf("parse ipv4: %v", err)
+	}
+	if ipHdr.protocol != udpProtocolNumber {
+		t.Fatalf("unexpected protocol %d", ipHdr.protocol)
+	}
+	gotIP, rcode, err := parseDNSAResponse(ipHdr.payload[8:])
+	if err != nil {
+		t.Fatalf("parse dns response: %v", err)
+	}
+	if rcode != 0 {
+		t.Fatalf("expected successful dns response, got rcode %d", rcode)
+	}
+	if !gotIP.Equal(hostIP) {
+		t.Fatalf("expected host ip %s, got %s", hostIP, gotIP)
+	}
+
+	query = buildDNSQuery(0x1235, "example.com")
+	frame = buildUDPFrame(hostIP, guestIP, 53, 53001, query)
+	if err := nic.DeliverGuestPacket(frame, nil); err != nil {
+		t.Fatalf("deliver external dns query: %v", err)
+	}
+	respFrame = awaitFrame(t, frames)
+	_, _, _, payloadBytes = parseEthernet(respFrame)
+	ipHdr, err = parseIPv4Header(payloadBytes)
+	if err != nil {
+		t.Fatalf("parse external ipv4: %v", err)
+	}
+	_, rcode, err = parseDNSAResponse(ipHdr.payload[8:])
+	if err != nil {
+		t.Fatalf("parse external dns response: %v", err)
+	}
+	if rcode != dnsRCodeNameError {
+		t.Fatalf("expected nxdomain for external name with internet disabled, got rcode %d", rcode)
+	}
+}
+
+func TestOutboundTCPProxy(t *testing.T) {
+	stack, nic, frames := newTestNetStack(t, 1024)
+	stack.SetInternetAccessEnabled(true)
+
+	hostEnd, remoteEnd := net.Pipe()
+	defer remoteEnd.Close()
+	dialed := make(chan string, 1)
+	stack.SetOutboundTCPDialer(func(_ context.Context, addr *net.TCPAddr) (net.Conn, error) {
+		dialed <- addr.String()
+		return hostEnd, nil
+	})
+
+	remoteIP := net.IPv4(192, 0, 2, 10)
+	guestIP := guestIP4(stack)
+	const (
+		remotePort = 8080
+		guestPort  = 40001
+	)
+	guestSeq, hostSeq := establishTCPFromGuest(t, nic, frames, remoteIP, guestIP, remotePort, guestPort)
+
+	select {
+	case got := <-dialed:
+		if got != "192.0.2.10:8080" {
+			t.Fatalf("unexpected dial addr %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for outbound dial")
+	}
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := remoteEnd.Write([]byte("from-host"))
+		writeDone <- err
+	}()
+
+	respFrame := awaitFrame(t, frames)
+	_, _, _, payload := parseEthernet(respFrame)
+	ipHdr, err := parseIPv4Header(payload)
+	if err != nil {
+		t.Fatalf("parse ipv4 proxy response: %v", err)
+	}
+	tcpHdr, err := parseTCPHeader(ipHdr.payload)
+	if err != nil {
+		t.Fatalf("parse tcp proxy response: %v", err)
+	}
+	if string(tcpHdr.payload) != "from-host" {
+		t.Fatalf("unexpected proxy payload %q", string(tcpHdr.payload))
+	}
+	hostSeq = tcpHdr.seq + uint32(len(tcpHdr.payload))
+	ack := buildTCPFrame(remoteIP, guestIP, remotePort, guestPort, guestSeq, hostSeq, tcpFlagACK, nil)
+	if err := nic.DeliverGuestPacket(ack, nil); err != nil {
+		t.Fatalf("deliver proxy ack: %v", err)
+	}
+	select {
+	case err := <-writeDone:
+		if err != nil {
+			t.Fatalf("remote write: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for remote write")
+	}
+
+	readDone := make(chan struct {
+		payload string
+		err     error
+	}, 1)
+	go func() {
+		buf := make([]byte, 64)
+		n, err := remoteEnd.Read(buf)
+		readDone <- struct {
+			payload string
+			err     error
+		}{payload: string(buf[:n]), err: err}
+	}()
+
+	guestData := []byte("from-guest")
+	dataFrame := buildTCPFrame(remoteIP, guestIP, remotePort, guestPort, guestSeq, hostSeq, tcpFlagACK|tcpFlagPSH, guestData)
+	if err := nic.DeliverGuestPacket(dataFrame, nil); err != nil {
+		t.Fatalf("deliver proxy data: %v", err)
+	}
+	_ = awaitFrame(t, frames) // ACK for guest data.
+
+	select {
+	case res := <-readDone:
+		if res.err != nil {
+			t.Fatalf("remote read: %v", res.err)
+		}
+		if res.payload != "from-guest" {
+			t.Fatalf("unexpected remote read payload %q", res.payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for remote read")
+	}
+}
+
+func TestTCPHandshakeDataAndClose(t *testing.T) {
+	stack, nic, frames := newTestNetStack(t, 1024)
+
+	hostIP := hostIP4(stack)
+	guestIP := guestIP4(stack)
+
+	ln, err := stack.ListenInternal("tcp", ":8080")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	defer ln.Close()
+
+	type acceptResult struct {
+		conn net.Conn
+		err  error
+	}
+	acceptCh := make(chan acceptResult, 1)
+	go func() {
+		conn, err := ln.Accept()
+		acceptCh <- acceptResult{conn: conn, err: err}
+	}()
+
+	const (
+		guestSeq  = 100
+		guestPort = 40000
+		hostPort  = 8080
+	)
+
+	syn := buildTCPFrame(hostIP, guestIP, hostPort, guestPort, guestSeq, 0, tcpFlagSYN, nil)
+	if err := nic.DeliverGuestPacket(syn, nil); err != nil {
+		t.Fatalf("deliver syn: %v", err)
+	}
+
+	synAckFrame := awaitFrame(t, frames)
+	_, _, _, payload := parseEthernet(synAckFrame)
+	ipHdr, err := parseIPv4Header(payload)
+	if err != nil {
+		t.Fatalf("parse ipv4 synack: %v", err)
+	}
+	tcpHdr, err := parseTCPHeader(ipHdr.payload)
+	if err != nil {
+		t.Fatalf("parse tcp synack: %v", err)
+	}
+	if tcpHdr.flags&(tcpFlagSYN|tcpFlagACK) != (tcpFlagSYN | tcpFlagACK) {
+		t.Fatalf("expected syn+ack, got flags %#x", tcpHdr.flags)
+	}
+	if tcpHdr.ack != guestSeq+1 {
+		t.Fatalf("unexpected ack number %d", tcpHdr.ack)
+	}
+
+	hostSeq := tcpHdr.seq + 1
+
+	ack := buildTCPFrame(hostIP, guestIP, hostPort, guestPort, guestSeq+1, hostSeq, tcpFlagACK, nil)
+	if err := nic.DeliverGuestPacket(ack, nil); err != nil {
+		t.Fatalf("deliver ack: %v", err)
+	}
+
+	var serverConn net.Conn
+	select {
+	case res := <-acceptCh:
+		if res.err != nil {
+			t.Fatalf("accept failed: %v", res.err)
+		}
+		serverConn = res.conn
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for accept")
+	}
+	defer serverConn.Close()
+
+	data := []byte("hello")
+	dataFrame := buildTCPFrame(hostIP, guestIP, hostPort, guestPort, guestSeq+1, hostSeq, tcpFlagACK|tcpFlagPSH, data)
+	if err := nic.DeliverGuestPacket(dataFrame, nil); err != nil {
+		t.Fatalf("deliver data: %v", err)
+	}
+
+	dataAckFrame := awaitFrame(t, frames)
+	_, _, _, payload = parseEthernet(dataAckFrame)
+	ipHdr, err = parseIPv4Header(payload)
+	if err != nil {
+		t.Fatalf("parse ipv4 data ack: %v", err)
+	}
+	tcpHdr, err = parseTCPHeader(ipHdr.payload)
+	if err != nil {
+		t.Fatalf("parse tcp data ack: %v", err)
+	}
+	if tcpHdr.flags&tcpFlagACK == 0 {
+		t.Fatalf("expected ack flag, got %#x", tcpHdr.flags)
+	}
+	if tcpHdr.ack != guestSeq+1+uint32(len(data)) {
+		t.Fatalf("unexpected ack number %d", tcpHdr.ack)
+	}
+
+	readBuf := make([]byte, 16)
+	n, err := serverConn.Read(readBuf)
+	if err != nil {
+		t.Fatalf("server read: %v", err)
+	}
+	if string(readBuf[:n]) != "hello" {
+		t.Fatalf("unexpected server payload %q", string(readBuf[:n]))
+	}
+
+	if _, err := serverConn.Write([]byte("ok")); err != nil {
+		t.Fatalf("server write: %v", err)
+	}
+
+	respFrame := awaitFrame(t, frames)
+	_, _, _, payload = parseEthernet(respFrame)
+	ipHdr, err = parseIPv4Header(payload)
+	if err != nil {
+		t.Fatalf("parse ipv4 resp: %v", err)
+	}
+	tcpHdr, err = parseTCPHeader(ipHdr.payload)
+	if err != nil {
+		t.Fatalf("parse tcp resp: %v", err)
+	}
+	if tcpHdr.flags&(tcpFlagACK|tcpFlagPSH) != (tcpFlagACK | tcpFlagPSH) {
+		t.Fatalf("unexpected response flags %#x", tcpHdr.flags)
+	}
+	if string(tcpHdr.payload) != "ok" {
+		t.Fatalf("unexpected response payload %q", string(tcpHdr.payload))
+	}
+	hostSeq = tcpHdr.seq + uint32(len(tcpHdr.payload))
+
+	finSeq := guestSeq + 1 + uint32(len(data))
+	fin := buildTCPFrame(hostIP, guestIP, hostPort, guestPort, finSeq, hostSeq, tcpFlagFIN|tcpFlagACK, nil)
+	if err := nic.DeliverGuestPacket(fin, nil); err != nil {
+		t.Fatalf("deliver fin: %v", err)
+	}
+
+	finAckFrame := awaitFrame(t, frames)
+	_, _, _, payload = parseEthernet(finAckFrame)
+	ipHdr, err = parseIPv4Header(payload)
+	if err != nil {
+		t.Fatalf("parse ipv4 fin ack: %v", err)
+	}
+	tcpHdr, err = parseTCPHeader(ipHdr.payload)
+	if err != nil {
+		t.Fatalf("parse tcp fin ack: %v", err)
+	}
+	if tcpHdr.ack != finSeq+1 {
+		t.Fatalf("unexpected fin ack number %d", tcpHdr.ack)
+	}
+
+	hostFinFrame := awaitFrame(t, frames)
+	_, _, _, payload = parseEthernet(hostFinFrame)
+	ipHdr, err = parseIPv4Header(payload)
+	if err != nil {
+		t.Fatalf("parse ipv4 host fin: %v", err)
+	}
+	tcpHdr, err = parseTCPHeader(ipHdr.payload)
+	if err != nil {
+		t.Fatalf("parse tcp host fin: %v", err)
+	}
+	if tcpHdr.flags&(tcpFlagFIN|tcpFlagACK) != (tcpFlagFIN | tcpFlagACK) {
+		t.Fatalf("unexpected host fin flags %#x", tcpHdr.flags)
+	}
+
+	finalAck := buildTCPFrame(hostIP, guestIP, hostPort, guestPort, finSeq+1, tcpHdr.seq+1, tcpFlagACK, nil)
+	if err := nic.DeliverGuestPacket(finalAck, nil); err != nil {
+		t.Fatalf("deliver final ack: %v", err)
+	}
+
+	_ = serverConn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	buf := make([]byte, 1)
+	_, err = serverConn.Read(buf)
+	if err != io.EOF && !isTimeout(err) {
+		t.Fatalf("expected eof or timeout, got %v", err)
+	}
+}
+
+func TestTCPDialInternalActiveOpen(t *testing.T) {
+	stack, nic, frames := newTestNetStack(t, 1024)
+
+	hostIP := hostIP4(stack)
+	guestIP := guestIP4(stack)
+	const guestPort = 8080
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	dialCh := make(chan dialResult, 1)
+	go func() {
+		conn, err := stack.DialInternalContext(context.Background(), "tcp", "10.42.0.2:8080")
+		dialCh <- dialResult{conn: conn, err: err}
+	}()
+
+	synFrame := awaitFrame(t, frames)
+	_, _, _, payload := parseEthernet(synFrame)
+	ipHdr, err := parseIPv4Header(payload)
+	if err != nil {
+		t.Fatalf("parse ipv4 syn: %v", err)
+	}
+	tcpHdr, err := parseTCPHeader(ipHdr.payload)
+	if err != nil {
+		t.Fatalf("parse tcp syn: %v", err)
+	}
+	if tcpHdr.flags&tcpFlagSYN == 0 || tcpHdr.flags&tcpFlagACK != 0 {
+		t.Fatalf("expected syn, got flags %#x", tcpHdr.flags)
+	}
+	if tcpHdr.srcPort < 49152 || tcpHdr.dstPort != guestPort {
+		t.Fatalf("unexpected ports src=%d dst=%d", tcpHdr.srcPort, tcpHdr.dstPort)
+	}
+
+	guestSeq := uint32(700)
+	synAck := buildTCPFrame(hostIP, guestIP, tcpHdr.srcPort, guestPort, guestSeq, tcpHdr.seq+1, tcpFlagSYN|tcpFlagACK, nil)
+	if err := nic.DeliverGuestPacket(synAck, nil); err != nil {
+		t.Fatalf("deliver synack: %v", err)
+	}
+
+	ackFrame := awaitFrame(t, frames)
+	_, _, _, payload = parseEthernet(ackFrame)
+	ipHdr, err = parseIPv4Header(payload)
+	if err != nil {
+		t.Fatalf("parse ipv4 ack: %v", err)
+	}
+	tcpHdr, err = parseTCPHeader(ipHdr.payload)
+	if err != nil {
+		t.Fatalf("parse tcp ack: %v", err)
+	}
+	if tcpHdr.flags != tcpFlagACK || tcpHdr.ack != guestSeq+1 {
+		t.Fatalf("unexpected final ack flags=%#x ack=%d", tcpHdr.flags, tcpHdr.ack)
+	}
+
+	var conn net.Conn
+	select {
+	case res := <-dialCh:
+		if res.err != nil {
+			t.Fatalf("dial failed: %v", res.err)
+		}
+		conn = res.conn
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for dial")
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("GET / HTTP/1.0\r\n\r\n")); err != nil {
+		t.Fatalf("conn write: %v", err)
+	}
+	dataFrame := awaitFrame(t, frames)
+	_, _, _, payload = parseEthernet(dataFrame)
+	ipHdr, err = parseIPv4Header(payload)
+	if err != nil {
+		t.Fatalf("parse ipv4 data: %v", err)
+	}
+	tcpHdr, err = parseTCPHeader(ipHdr.payload)
+	if err != nil {
+		t.Fatalf("parse tcp data: %v", err)
+	}
+	if !bytes.Contains(tcpHdr.payload, []byte("GET / HTTP/1.0")) {
+		t.Fatalf("unexpected tcp payload %q", string(tcpHdr.payload))
+	}
+}
+
+func TestTCPWriteDeadlineWhileSendWindowClosed(t *testing.T) {
+	stack, nic, frames := newTestNetStack(t, 1024)
+
+	hostIP := hostIP4(stack)
+	guestIP := guestIP4(stack)
+
+	ln, err := stack.ListenInternal("tcp", ":8081")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+	defer ln.Close()
+
+	acceptCh := make(chan net.Conn, 1)
+	go func() {
+		conn, _ := ln.Accept()
+		acceptCh <- conn
+	}()
+
+	const (
+		guestPort = 40002
+		hostPort  = 8081
+	)
+	guestSeq, hostSeq := establishTCPFromGuest(t, nic, frames, hostIP, guestIP, hostPort, guestPort)
+
+	var conn net.Conn
+	select {
+	case conn = <-acceptCh:
+	case <-time.After(time.Second):
+		t.Fatalf("timeout waiting for accept")
+	}
+	defer conn.Close()
+
+	zeroWindow := buildTCPFrameWithWindow(hostIP, guestIP, hostPort, guestPort, guestSeq, hostSeq, tcpFlagACK, 0, nil)
+	if err := nic.DeliverGuestPacket(zeroWindow, nil); err != nil {
+		t.Fatalf("deliver zero-window ack: %v", err)
+	}
+
+	if err := conn.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatalf("set write deadline: %v", err)
+	}
+	_, err = conn.Write([]byte("blocked"))
+	if !isTimeout(err) {
+		t.Fatalf("expected write timeout, got %v", err)
+	}
+}
+
+func TestDebugHTTP(t *testing.T) {
+	stack, _, _ := newTestNetStack(t, 1024)
+
+	if err := stack.EnableDebugHTTP("127.0.0.1:0"); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "operation not permitted") {
+			t.Skip("debug http listener requires network permissions")
+		}
+		t.Fatalf("enable debug http: %v", err)
+	}
+
+	addr := stack.DebugHTTPAddr()
+	if addr == "" {
+		t.Fatalf("debug addr not set")
+	}
+
+	var (
+		resp *http.Response
+		err  error
+	)
+	for i := 0; i < 20; i++ {
+		resp, err = http.Get("http://" + addr + "/status")
+		if err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("GET /status: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status %d", resp.StatusCode)
+	}
+
+	var payload debugStatus
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+
+	if payload.HostIPv4 != "10.42.0.1" {
+		t.Fatalf("unexpected host ipv4 %q", payload.HostIPv4)
+	}
+	if payload.Interfaces != 1 {
+		t.Fatalf("expected one interface, got %d", payload.Interfaces)
+	}
+	if payload.DebugAddr != addr {
+		t.Fatalf("unexpected debug addr %q", payload.DebugAddr)
+	}
+}
+
+func TestOpenPacketCaptureEmitsRecords(t *testing.T) {
+	stack, _, _ := newTestNetStack(t, 0)
+	var buf bytes.Buffer
+
+	if err := stack.OpenPacketCapture(&buf); err != nil {
+		t.Fatalf("open capture: %v", err)
+	}
+
+	frame1 := []byte{
+		0, 1, 2, 3, 4, 5,
+		6, 7, 8, 9, 10, 11,
+		0x08, 0x00,
+		1, 2, 3, 4,
+	}
+	frame2 := []byte{
+		1, 1, 1, 1, 1, 1,
+		2, 2, 2, 2, 2, 2,
+		0x08, 0x06,
+		9, 8, 7, 6, 5,
+	}
+	stack.writePacketCapture(frame1)
+	stack.writePacketCapture(frame2)
+
+	raw := buf.Bytes()
+	wantLen := 24 + (16 + len(frame1)) + (16 + len(frame2))
+	if len(raw) != wantLen {
+		t.Fatalf("expected %d bytes, got %d", wantLen, len(raw))
+	}
+
+	global := raw[:24]
+	if magic := binary.LittleEndian.Uint32(global[0:4]); magic != 0xa1b2c3d4 {
+		t.Fatalf("unexpected magic %#x", magic)
+	}
+	if snap := binary.LittleEndian.Uint32(global[16:20]); snap != 8192 {
+		t.Fatalf("unexpected snaplen %d", snap)
+	}
+	if link := binary.LittleEndian.Uint32(global[20:24]); link != pcap.LinkTypeEthernet {
+		t.Fatalf("unexpected link type %d", link)
+	}
+
+	off := 24
+	record := raw[off : off+16]
+	if capLen := binary.LittleEndian.Uint32(record[8:12]); capLen != uint32(len(frame1)) {
+		t.Fatalf("unexpected caplen %d", capLen)
+	}
+	if origLen := binary.LittleEndian.Uint32(record[12:16]); origLen != uint32(len(frame1)) {
+		t.Fatalf("unexpected origlen %d", origLen)
+	}
+
+	payload := raw[off+16 : off+16+len(frame1)]
+	if !bytes.Equal(payload, frame1) {
+		t.Fatalf("frame1 payload mismatch")
+	}
+	off += 16 + len(frame1)
+
+	record = raw[off : off+16]
+	if capLen := binary.LittleEndian.Uint32(record[8:12]); capLen != uint32(len(frame2)) {
+		t.Fatalf("unexpected caplen %d", capLen)
+	}
+	if origLen := binary.LittleEndian.Uint32(record[12:16]); origLen != uint32(len(frame2)) {
+		t.Fatalf("unexpected origlen %d", origLen)
+	}
+
+	payload = raw[off+16 : off+16+len(frame2)]
+	if !bytes.Equal(payload, frame2) {
+		t.Fatalf("frame2 payload mismatch")
+	}
+}
+
+func isTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	nErr, ok := err.(net.Error)
+	return ok && nErr.Timeout()
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// TCP feature tests
+////////////////////////////////////////////////////////////////////////////////
+
+func TestParseTCPOptions(t *testing.T) {
+	tests := []struct {
+		name       string
+		options    []byte
+		wantMSS    uint16
+		wantHasMSS bool
+		wantWS     uint8
+		wantHasWS  bool
+	}{
+		{
+			name:    "empty options",
+			options: nil,
+		},
+		{
+			name:       "MSS only",
+			options:    []byte{2, 4, 0x05, 0xb4}, // MSS = 1460
+			wantMSS:    1460,
+			wantHasMSS: true,
+		},
+		{
+			name:      "Window Scale only",
+			options:   []byte{1, 3, 3, 7}, // NOP + WS = 7
+			wantWS:    7,
+			wantHasWS: true,
+		},
+		{
+			name:       "MSS and Window Scale",
+			options:    []byte{2, 4, 0x05, 0xb4, 1, 3, 3, 7}, // MSS=1460, NOP, WS=7
+			wantMSS:    1460,
+			wantHasMSS: true,
+			wantWS:     7,
+			wantHasWS:  true,
+		},
+		{
+			name:    "End of options",
+			options: []byte{0, 2, 4, 0x05, 0xb4}, // EOL followed by MSS (should stop at EOL)
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := parseTCPOptions(tc.options)
+			if opts.hasMSS != tc.wantHasMSS {
+				t.Errorf("hasMSS: got %v, want %v", opts.hasMSS, tc.wantHasMSS)
+			}
+			if opts.hasMSS && opts.mss != tc.wantMSS {
+				t.Errorf("mss: got %d, want %d", opts.mss, tc.wantMSS)
+			}
+			if opts.hasWndScale != tc.wantHasWS {
+				t.Errorf("hasWndScale: got %v, want %v", opts.hasWndScale, tc.wantHasWS)
+			}
+			if opts.hasWndScale && opts.wndScale != tc.wantWS {
+				t.Errorf("wndScale: got %d, want %d", opts.wndScale, tc.wantWS)
+			}
+		})
+	}
+}
+
+func TestBuildSynAckOptions(t *testing.T) {
+	// Without window scale
+	opts := buildSynAckOptions(1460, 0, false)
+	if len(opts) != 4 {
+		t.Fatalf("expected 4 bytes, got %d", len(opts))
+	}
+	if opts[0] != 2 || opts[1] != 4 {
+		t.Fatalf("expected MSS option header, got %v", opts[:2])
+	}
+	mss := binary.BigEndian.Uint16(opts[2:4])
+	if mss != 1460 {
+		t.Fatalf("expected MSS 1460, got %d", mss)
+	}
+
+	// With window scale
+	opts = buildSynAckOptions(1460, 7, true)
+	if len(opts) != 8 {
+		t.Fatalf("expected 8 bytes, got %d", len(opts))
+	}
+	// Check WS option at end
+	if opts[5] != 3 || opts[6] != 3 || opts[7] != 7 {
+		t.Fatalf("expected WS option, got %v", opts[4:8])
+	}
+}
+
+func TestTCPSendBuffer(t *testing.T) {
+	sb := newTCPSendBuffer(1024)
+
+	// Test append
+	seg1 := tcpSendSegment{
+		seqStart: 100,
+		seqEnd:   200,
+		payload:  make([]byte, 100),
+		sentAt:   time.Now(),
+	}
+	if !sb.append(seg1) {
+		t.Fatal("append should succeed")
+	}
+	if sb.len() != 1 {
+		t.Fatalf("expected 1 segment, got %d", sb.len())
+	}
+	if sb.inFlight() != 100 {
+		t.Fatalf("expected 100 in flight, got %d", sb.inFlight())
+	}
+
+	// Test oldest
+	oldest, ok := sb.oldest()
+	if !ok {
+		t.Fatal("oldest should return segment")
+	}
+	if oldest.seqStart != 100 {
+		t.Fatalf("expected seqStart 100, got %d", oldest.seqStart)
+	}
+
+	// Test ack
+	bytesAcked, _, _ := sb.ack(200)
+	if bytesAcked != 100 {
+		t.Fatalf("expected 100 bytes acked, got %d", bytesAcked)
+	}
+	if sb.len() != 0 {
+		t.Fatalf("expected 0 segments after ack, got %d", sb.len())
+	}
+
+	// Test capacity limit
+	for i := 0; i < 15; i++ {
+		seg := tcpSendSegment{
+			seqStart: uint32(i * 100),
+			seqEnd:   uint32((i + 1) * 100),
+			payload:  make([]byte, 100),
+			sentAt:   time.Now(),
+		}
+		if !sb.append(seg) {
+			// Should fail around 1024/100 = 10 segments
+			if i < 10 {
+				t.Fatalf("append should succeed for segment %d", i)
+			}
+			break
+		}
+	}
+}
+
+func TestTCPRecvBuffer(t *testing.T) {
+	rb := newTCPRecvBuffer(8)
+
+	// Insert out of order segments
+	seg2 := tcpOOOSegment{seqStart: 200, seqEnd: 300, payload: []byte("seg2")}
+	seg3 := tcpOOOSegment{seqStart: 300, seqEnd: 400, payload: []byte("seg3")}
+
+	if !rb.insert(seg2) {
+		t.Fatal("insert seg2 should succeed")
+	}
+	if !rb.insert(seg3) {
+		t.Fatal("insert seg3 should succeed")
+	}
+	if rb.len() != 2 {
+		t.Fatalf("expected 2 segments, got %d", rb.len())
+	}
+
+	// Collect should return nothing yet (gap at start)
+	nextSeq := uint32(100)
+	collected := rb.collectContiguous(&nextSeq)
+	if len(collected) != 0 {
+		t.Fatalf("expected 0 collected, got %d", len(collected))
+	}
+	if nextSeq != 100 {
+		t.Fatalf("nextSeq should be unchanged")
+	}
+
+	// Now "receive" seg1 and collect
+	nextSeq = 200
+	collected = rb.collectContiguous(&nextSeq)
+	if len(collected) != 2 {
+		t.Fatalf("expected 2 collected, got %d", len(collected))
+	}
+	if nextSeq != 400 {
+		t.Fatalf("expected nextSeq 400, got %d", nextSeq)
+	}
+	if rb.len() != 0 {
+		t.Fatalf("expected 0 segments after collect, got %d", rb.len())
+	}
+}
+
+func TestTCPRTTEstimator(t *testing.T) {
+	rtt := newTCPRTTEstimator()
+
+	// Initial RTO should be 500ms
+	if rtt.getRTO() != initialRTO {
+		t.Fatalf("expected initial RTO %v, got %v", initialRTO, rtt.getRTO())
+	}
+
+	// First measurement
+	rtt.update(100 * time.Millisecond)
+	if rtt.srtt != 100*time.Millisecond {
+		t.Fatalf("expected SRTT 100ms, got %v", rtt.srtt)
+	}
+
+	// RTO should be bounded by minRTO
+	if rtt.getRTO() < minRTO {
+		t.Fatalf("RTO %v should be >= minRTO %v", rtt.getRTO(), minRTO)
+	}
+
+	// Backoff should apply 1.5x multiplier
+	prevRTO := rtt.getRTO()
+	rtt.backoff()
+	expectedRTO := (prevRTO * 3) / 2
+	if rtt.getRTO() != expectedRTO {
+		t.Fatalf("expected RTO %v after backoff, got %v", expectedRTO, rtt.getRTO())
+	}
+
+	// Test resetBackoff
+	rtt.resetBackoff()
+	if rtt.backoffCount != 0 {
+		t.Fatalf("expected backoffCount 0 after reset, got %d", rtt.backoffCount)
+	}
+}
+
+func TestTCPCongestionControl(t *testing.T) {
+	cc := newTCPCongestionControl(1460)
+
+	// Initial cwnd should be 10 * MSS
+	expectedCwnd := uint32(10 * 1460)
+	if cc.getCwnd() != expectedCwnd {
+		t.Fatalf("expected initial cwnd %d, got %d", expectedCwnd, cc.getCwnd())
+	}
+
+	// Slow start: cwnd should increase by bytes acked
+	cc.onAck(1460)
+	if cc.getCwnd() != expectedCwnd+1460 {
+		t.Fatalf("expected cwnd %d after ack, got %d", expectedCwnd+1460, cc.getCwnd())
+	}
+
+	// Test duplicate ACK handling - fast retransmit threshold is 2
+	cc.dupAcks = 0
+	if cc.onDupAck() {
+		t.Fatal("should not trigger fast retransmit on dup ack 1")
+	}
+	// Second dup ack should trigger fast retransmit (threshold is 2)
+	if !cc.onDupAck() {
+		t.Fatal("should trigger fast retransmit on 2nd dup ack")
+	}
+
+	// Test timeout
+	cc.onTimeout()
+	if cc.getCwnd() != uint32(cc.mss) {
+		t.Fatalf("expected cwnd reset to MSS after timeout, got %d", cc.getCwnd())
+	}
+}
+
+func TestSeqNumberHelpers(t *testing.T) {
+	// Test wraparound handling
+	if !seqLT(0xFFFFFFFF, 0) {
+		t.Error("seqLT should handle wraparound: 0xFFFFFFFF < 0")
+	}
+	if !seqGT(0, 0xFFFFFFFF) {
+		t.Error("seqGT should handle wraparound: 0 > 0xFFFFFFFF")
+	}
+	if !seqLTE(100, 100) {
+		t.Error("seqLTE should return true for equal values")
+	}
+	if !seqGTE(100, 100) {
+		t.Error("seqGTE should return true for equal values")
+	}
+
+	// Test overlap detection
+	if !seqOverlap(100, 200, 150, 250) {
+		t.Error("seqOverlap should detect overlapping ranges")
+	}
+	if seqOverlap(100, 200, 200, 300) {
+		t.Error("seqOverlap should not detect adjacent ranges as overlapping")
+	}
+}
