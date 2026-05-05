@@ -226,7 +226,7 @@ type bootPlatform struct {
 	irqDelivered  uint64
 	irqFailed     uint64
 	irqSuppressed uint64
-	irqLine       [16]uint64
+	irqLine       [256]uint64
 	irqMu         sync.Mutex
 	irqAsserted   [256]bool
 	irqPumpOnce   sync.Once
