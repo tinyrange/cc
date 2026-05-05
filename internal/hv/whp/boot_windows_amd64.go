@@ -229,12 +229,10 @@ type bootPlatform struct {
 	irqLine       [16]uint64
 	irqMu         sync.Mutex
 	irqAsserted   [256]bool
-	irqPumpOnce   sync.Once
-	irqPumpDone   chan struct{}
 }
 
 func newBootPlatform(vm *VM, uart *serial.UART8250) *bootPlatform {
-	p := &bootPlatform{vm: vm, uart: uart, start: time.Now(), irqPumpDone: make(chan struct{})}
+	p := &bootPlatform{vm: vm, uart: uart, start: time.Now()}
 	p.pic.master.vectorBase = 0x20
 	p.pic.slave.vectorBase = 0x28
 	p.pic.master.mask = 0xff
@@ -243,16 +241,10 @@ func newBootPlatform(vm *VM, uart *serial.UART8250) *bootPlatform {
 	p.pit = newBootPIT(func() {
 		p.raiseTimerIRQ()
 	})
-	go p.pumpAssertedIRQs()
 	return p
 }
 
 func (p *bootPlatform) Close() {
-	if p != nil {
-		p.irqPumpOnce.Do(func() {
-			close(p.irqPumpDone)
-		})
-	}
 	if p != nil && p.pit != nil {
 		p.pit.Close()
 	}
@@ -400,26 +392,6 @@ func (p *bootPlatform) SetIRQ(irq uint32, level bool) error {
 }
 
 func (p *bootPlatform) PumpIRQs() {
-	lines := p.assertedIRQLines()
-	for _, line := range lines {
-		p.raiseIRQ(line)
-	}
-}
-
-func (p *bootPlatform) pumpAssertedIRQs() {
-	ticker := time.NewTicker(time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			p.PumpIRQs()
-		case <-p.irqPumpDone:
-			return
-		}
-	}
-}
-
-func (p *bootPlatform) assertedIRQLines() []uint8 {
 	p.irqMu.Lock()
 	lines := make([]uint8, 0, len(p.irqAsserted))
 	for line, asserted := range p.irqAsserted {
@@ -428,7 +400,9 @@ func (p *bootPlatform) assertedIRQLines() []uint8 {
 		}
 	}
 	p.irqMu.Unlock()
-	return lines
+	for _, line := range lines {
+		p.raiseIRQ(line)
+	}
 }
 
 func (p *bootPlatform) raiseTimerIRQ() {
