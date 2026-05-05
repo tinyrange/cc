@@ -462,6 +462,7 @@ jobs:
             --recipe $recipe `
             --image-source $env:IMAGE_SOURCE `
             --work-dir $workDir `
+            --cpus 1 `
             2>&1 | Tee-Object -FilePath (Join-Path $results "$env:SUITE-windows-amd64.log")
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
