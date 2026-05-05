@@ -288,6 +288,17 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
+      - name: Build guest init payloads
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:CGO_ENABLED = "0"
+          $env:GOOS = "linux"
+          $env:GOARCH = "amd64"
+          go build -o internal/guestinit/guest-init-linux-amd64 ./internal/cmd/init
+          $env:GOARCH = "arm64"
+          go build -o internal/guestinit/guest-init-linux-arm64 ./internal/cmd/init
+
       - name: Run WHP boot tests
         shell: pwsh
         env:
@@ -297,6 +308,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force fulltest-results | Out-Null
           go test ./internal/hv/whp ./internal/vm `
+            -tags embed_guestinit `
             -run "Test(KernelBootFirstSerialByte|InitramfsBootReadyMarker|GuestInitRunsCommandFromAlpineRootFS|RunManagedExecWithAlpineRootFS|ManagedSessionExecWithAlpineRootFS|ManagedSessionExecStreamForwardsStdin|WindowsRuntimeBackendRunCommand|WindowsRuntimeBackendStartThenExec|WindowsRuntimeBackendRunStreamForwardsStdin|WindowsRuntimeBackendStartWithWritableShare)$" `
             -count=1 `
             -timeout=8m `
