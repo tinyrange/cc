@@ -362,6 +362,7 @@ func configureNetwork(cfg *network) error {
 	if err != nil {
 		return err
 	}
+	_ = runCommand(ip, "link", "set", "lo", "up")
 	_ = runCommand(ip, "link", "set", iface, "up")
 	_ = runCommand(ip, "addr", "flush", "dev", iface)
 	if err := runCommand(ip, "addr", "add", address, "dev", iface); err != nil {

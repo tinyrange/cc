@@ -25,6 +25,7 @@ const (
 	EISDIR    int32 = 21
 	EINVAL    int32 = 22
 	ENOTTY    int32 = 25
+	EFBIG     int32 = 27
 	EROFS     int32 = 30
 	EPIPE     int32 = 32
 	ERANGE    int32 = 34

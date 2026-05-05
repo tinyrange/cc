@@ -517,6 +517,99 @@ def test_shell_forward_updates_running_vm_dynamically(
     assert "forwarded 127.0.0.1:8080 -> guest:8080" in capsys.readouterr().out
 
 
+def test_neurodesktop_starts_vm_with_network_and_jupyter_forward(
+    monkeypatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    image_path = tmp_path / "neurodesktop.sif"
+    image_path.write_bytes(b"sif")
+    calls: list[tuple[str, object]] = []
+    launched: dict[str, object] = {}
+
+    class FakeClient:
+        def get_image(self, image: str) -> object:
+            calls.append(("get_image", image))
+            return None
+
+        def import_image(self, image: str, request: object) -> object:
+            calls.append(("import_image", (image, request)))
+            return SimpleNamespace(name=image)
+
+        def download_kernel(self) -> object:
+            calls.append(("download_kernel", None))
+            return SimpleNamespace(status="available")
+
+        def prepare_image_emulator(self, image: str) -> object:
+            calls.append(("prepare_emulator", image))
+            return SimpleNamespace(status="available")
+
+        def prepare_image_metadata(self, image: str) -> object:
+            calls.append(("prepare_metadata", image))
+            return SimpleNamespace(status="available")
+
+        def ensure_instance(self, image: str, **kwargs: object) -> object:
+            calls.append(("ensure_instance", (image, kwargs)))
+            return SimpleNamespace(status="running", image=image)
+
+        def add_port_forward(self, forward: object) -> object:
+            calls.append(("forward", forward))
+            return forward
+
+        def close(self) -> None:
+            calls.append(("close", None))
+
+    monkeypatch.setattr(
+        "pyneurodesk.shell.start_default_daemon",
+        lambda: SimpleNamespace(base_url="http://127.0.0.1:1234", cache_dir=str(tmp_path / "cache")),
+    )
+    monkeypatch.setattr("pyneurodesk.shell.connect", lambda base_url=None: FakeClient())
+    monkeypatch.setattr("pyneurodesk.shell.reserve_tcp_port", lambda host: 4567)
+    monkeypatch.setattr("pyneurodesk.shell.wait_for_jupyter", lambda url, timeout_seconds: True)
+    monkeypatch.setattr(
+        "pyneurodesk.shell.start_neurodesktop_jupyter_process",
+        lambda base_url, image, log_path: launched.update(
+            {"base_url": base_url, "image": image, "log_path": log_path}
+        )
+        or SimpleNamespace(pid=99),
+    )
+
+    assert shell.main(["neurodesktop", "--image-path", str(image_path), "--startup-timeout", "1"]) == 0
+
+    ensure_call = next(value for name, value in calls if name == "ensure_instance")
+    assert ensure_call[0] == "neurodesktop"
+    network = ensure_call[1]["network"]
+    assert network.enabled is True
+    assert network.allow_internet is True
+    assert network.port_forwards[0].host_port == 4567
+    assert network.port_forwards[0].guest_port == 8888
+    assert ("forward", network.port_forwards[0]) in calls
+    assert launched["image"] == "neurodesktop"
+    output = capsys.readouterr().out
+    assert "http://127.0.0.1:4567/lab" in output
+    assert "jupyter pid: 99" in output
+
+
+def test_shell_exec_passes_user_override(monkeypatch) -> None:
+    calls: list[tuple[str, object]] = []
+
+    def fake_run_image_command(
+        image: str,
+        command_name: str,
+        args: list[str],
+        *,
+        deploy_env: object = None,
+        user: Optional[str] = None,
+    ) -> int:
+        calls.append(("run", (image, command_name, args, deploy_env, user)))
+        return 7
+
+    monkeypatch.setattr("pyneurodesk.shell.run_image_command", fake_run_image_command)
+
+    assert shell.main(["shell", "exec", "--user", "root", "neurodesktop", "--", "id"]) == 7
+    assert calls == [("run", ("neurodesktop", "id", [], None, "root"))]
+
+
 def test_run_wrapper_invokes_container_command(
     monkeypatch,
     tmp_path: Path,
@@ -650,8 +743,9 @@ def test_run_wrapper_stream_preserves_stdout_stderr_and_binary_data(
             env: list[str] = (),
             shares: list[object] = (),
             workdir: Optional[str] = None,
+            user: Optional[str] = None,
         ) -> object:
-            calls.append(("run_stream", (image, tuple(command), tuple(env), tuple(shares), workdir)))
+            calls.append(("run_stream", (image, tuple(command), tuple(env), tuple(shares), workdir, user)))
             return iter(
                 [
                     {"kind": "stdout", "output": "hello\n"},
@@ -682,7 +776,7 @@ def test_run_wrapper_stream_preserves_stdout_stderr_and_binary_data(
     assert captured.out == b"hello\n\x00bin\n"
     assert captured.err == b"warn\nrawerr\n"
     assert calls == [
-        ("run_stream", ("niimath", ("niimath", "-help"), (), (), None)),
+        ("run_stream", ("niimath", ("niimath", "-help"), (), (), None, None)),
         ("close", None),
     ]
 

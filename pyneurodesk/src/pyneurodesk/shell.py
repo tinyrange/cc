@@ -9,15 +9,29 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import stat
+import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .api import connect, container, default_cache_root, load_deploy_metadata, runtime_deploy_env_entries, start_default_daemon
+import httpx
+
+from .api import (
+    _ensure_daemon_watchdog,
+    connect,
+    container,
+    default_cache_root,
+    load_deploy_metadata,
+    runtime_deploy_env_entries,
+    start_daemon_for_cache_dir,
+    start_default_daemon,
+)
 from .models import ContainerReference, ImageSource, ImportImageRequest, NetworkConfig, PortForward, ShareMount
 
 SESSION_ENV = "PYNEURODESK_SHELL_SESSION"
@@ -88,6 +102,19 @@ def build_parser() -> argparse.ArgumentParser:
     completion_parser.add_argument("--shell", choices=("bash", "zsh", "powershell", "pwsh"), required=True)
     completion_parser.set_defaults(handler=handle_completion)
 
+    neurodesktop_parser = subparsers.add_parser("neurodesktop", help="Start Neurodesktop JupyterLab through cc")
+    neurodesktop_parser.add_argument("--image", default="neurodesktop")
+    neurodesktop_parser.add_argument("--image-path", default="")
+    neurodesktop_parser.add_argument("--host", default="127.0.0.1")
+    neurodesktop_parser.add_argument("--port", type=int, default=0, help="Host port for JupyterLab; 0 chooses a free port")
+    neurodesktop_parser.add_argument("--guest-port", type=int, default=8888)
+    neurodesktop_parser.add_argument("--memory-mb", type=int, default=8192)
+    neurodesktop_parser.add_argument("--cpus", type=int, default=4)
+    neurodesktop_parser.add_argument("--cache-dir", default="")
+    neurodesktop_parser.add_argument("--no-internet", action="store_true", help="Disable guest internet forwarding")
+    neurodesktop_parser.add_argument("--startup-timeout", type=float, default=180.0)
+    neurodesktop_parser.set_defaults(handler=handle_neurodesktop)
+
     shell_parser = subparsers.add_parser("shell", help="Shell session commands")
     shell_subparsers = shell_parser.add_subparsers(dest="shell_command")
 
@@ -119,6 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
     forward_parser.set_defaults(handler=handle_forward)
 
     exec_parser = shell_subparsers.add_parser("exec", help="Run a command inside an image through the shared VM")
+    exec_parser.add_argument("--user", default="", help="Guest user override, e.g. root")
     exec_parser.add_argument("image")
     exec_parser.add_argument("command", nargs=argparse.REMAINDER)
     exec_parser.set_defaults(handler=handle_exec)
@@ -129,6 +157,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     bootstrap_parser = shell_subparsers.add_parser("bootstrap", help=argparse.SUPPRESS)
     bootstrap_parser.set_defaults(handler=handle_bootstrap)
+
+    neurodesktop_server_parser = shell_subparsers.add_parser("neurodesktop-server", help=argparse.SUPPRESS)
+    neurodesktop_server_parser.add_argument("--base-url", required=True)
+    neurodesktop_server_parser.add_argument("--image", required=True)
+    neurodesktop_server_parser.add_argument("--log", required=True)
+    neurodesktop_server_parser.set_defaults(handler=handle_neurodesktop_server)
 
     complete_parser = shell_subparsers.add_parser("complete", help=argparse.SUPPRESS)
     complete_parser.add_argument("--index", type=int, required=True)
@@ -160,6 +194,151 @@ def handle_activate(args: argparse.Namespace) -> int:
 def handle_completion(args: argparse.Namespace) -> int:
     print(render_completion(normalize_shell_name(str(args.shell))))
     return 0
+
+
+def handle_neurodesktop(args: argparse.Namespace) -> int:
+    image = str(args.image or "neurodesktop").strip()
+    if not image:
+        raise SystemExit("image name is required")
+    image_path = resolve_neurodesktop_image_path(str(args.image_path or ""))
+    host = str(args.host or "127.0.0.1").strip() or "127.0.0.1"
+    host_port = int(args.port or 0)
+    if host_port == 0:
+        host_port = reserve_tcp_port(host)
+    if not (1 <= host_port <= 65535):
+        raise SystemExit("host port must be between 1 and 65535")
+    guest_port = int(args.guest_port or 8888)
+    if not (1 <= guest_port <= 65535):
+        raise SystemExit("guest port must be between 1 and 65535")
+
+    daemon = (
+        start_daemon_for_cache_dir(Path(str(args.cache_dir)).expanduser())
+        if str(args.cache_dir or "").strip()
+        else start_default_daemon()
+    )
+    client = connect(base_url=daemon.base_url)
+    log_path = neurodesktop_log_path(Path(daemon.cache_dir))
+    try:
+        if client.get_image(image) is None:
+            client.import_image(
+                image,
+                ImportImageRequest(source=ImageSource(type="simg", path=str(image_path))),
+            )
+        client.download_kernel()
+        client.prepare_image_emulator(image)
+        client.prepare_image_metadata(image)
+        network = NetworkConfig(
+            enabled=True,
+            allow_internet=not bool(args.no_internet),
+            port_forwards=(
+                PortForward(
+                    host_port=host_port,
+                    guest_port=guest_port,
+                    host_addr=host,
+                    guest_addr="10.42.0.2",
+                ),
+            ),
+        )
+        client.ensure_instance(
+            image,
+            network=network,
+            memory_mb=int(args.memory_mb or 0) or None,
+            cpus=int(args.cpus or 0) or None,
+            timeout=max(float(args.startup_timeout or 180.0), 1.0),
+        )
+        apply_port_forwards(client, network)
+    finally:
+        client.close()
+
+    proc = start_neurodesktop_jupyter_process(
+        daemon.base_url,
+        image=image,
+        log_path=log_path,
+    )
+    url = f"http://{host}:{host_port}/lab"
+    status_url = f"http://{host}:{host_port}/api/status"
+    if not wait_for_jupyter(status_url, timeout_seconds=float(args.startup_timeout or 180.0)):
+        raise SystemExit(
+            f"neurodesktop JupyterLab did not become ready at {url}; "
+            f"launcher pid={proc.pid}, log={log_path}"
+        )
+    print(url)
+    print(f"ccvm: {daemon.base_url}")
+    print(f"jupyter pid: {proc.pid}")
+    print(f"log: {log_path}")
+    return 0
+
+
+def resolve_neurodesktop_image_path(raw: str) -> Path:
+    candidates: list[Path] = []
+    if raw.strip():
+        candidates.append(Path(raw).expanduser())
+    else:
+        candidates.extend(
+            [
+                Path.cwd() / "local" / "neurodesktop_20260428.sif",
+                Path(__file__).resolve().parents[3] / "local" / "neurodesktop_20260428.sif",
+            ]
+        )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    rendered = ", ".join(str(candidate) for candidate in candidates)
+    raise SystemExit(f"neurodesktop image not found; checked {rendered}")
+
+
+def reserve_tcp_port(host: str) -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
+        return int(sock.getsockname()[1])
+
+
+def neurodesktop_log_path(cache_dir: Path) -> Path:
+    log_dir = cache_dir / "neurodesktop"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir / "jupyter.log"
+
+
+def start_neurodesktop_jupyter_process(base_url: str, *, image: str, log_path: Path) -> subprocess.Popen[bytes]:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = log_path.open("ab")
+    cmd = [
+        sys.executable,
+        "-c",
+        "from pyneurodesk.shell import main; raise SystemExit(main())",
+        "shell",
+        "neurodesktop-server",
+        "--base-url",
+        base_url,
+        "--image",
+        image,
+        "--log",
+        str(log_path),
+    ]
+    try:
+        return subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    finally:
+        log_file.close()
+
+
+def wait_for_jupyter(status_url: str, *, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    with httpx.Client(timeout=2.0) as client:
+        while time.monotonic() < deadline:
+            try:
+                response = client.get(status_url)
+                if response.status_code == 200:
+                    return True
+            except httpx.HTTPError:
+                pass
+            time.sleep(0.5)
+    return False
 
 
 def handle_load(args: argparse.Namespace) -> int:
@@ -336,12 +515,47 @@ def handle_exec(args: argparse.Namespace) -> int:
     command = normalize_command_args(args.command)
     if not command:
         raise SystemExit("command is required")
-    return run_image_command(image, command[0], command[1:])
+    user = str(args.user or "").strip() or None
+    return run_image_command(image, command[0], command[1:], user=user)
 
 
 def handle_bootstrap(args: argparse.Namespace) -> int:
     _ = args
     start_default_daemon()
+    return 0
+
+
+def handle_neurodesktop_server(args: argparse.Namespace) -> int:
+    _ensure_daemon_watchdog(str(args.base_url))
+    client = connect(base_url=str(args.base_url))
+    log_path = Path(str(args.log)).expanduser()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        "bash",
+        "-lc",
+        "export JUPYTER_TOKEN=; export JUPYTER_PASSWORD=; exec start-neurodesktop-jupyterlab",
+    ]
+    try:
+        with log_path.open("ab") as log:
+            for event in client.run_stream(
+                str(args.image),
+                command,
+                with_network=True,
+                timeout_seconds=None,
+                timeout=httpx.Timeout(connect=10.0, read=None, write=60.0, pool=10.0),
+            ):
+                data = exec_event_data(event)
+                if data is not None:
+                    log.write(data)
+                else:
+                    output = event.get("output")
+                    if output is not None:
+                        log.write(str(output).encode())
+                    else:
+                        log.write((json.dumps(event, sort_keys=True) + "\n").encode())
+                log.flush()
+    finally:
+        client.close()
     return 0
 
 
@@ -363,7 +577,14 @@ def handle_run_wrapper(args: argparse.Namespace) -> int:
     return run_image_command(str(args.image), str(args.command), wrapper_args, deploy_env=deploy_env)
 
 
-def run_image_command(image: str, command_name: str, args: list[str], *, deploy_env: Optional[list[str]] = None) -> int:
+def run_image_command(
+    image: str,
+    command_name: str,
+    args: list[str],
+    *,
+    deploy_env: Optional[list[str]] = None,
+    user: Optional[str] = None,
+) -> int:
     handle = shell_session_container(image)
     try:
         env = list(deploy_env or [])
@@ -378,6 +599,9 @@ def run_image_command(image: str, command_name: str, args: list[str], *, deploy_
         timeout_kwargs: dict[str, float] = {}
         if timeout_seconds is not None:
             timeout_kwargs["timeout_seconds"] = timeout_seconds
+        user_kwargs: dict[str, str] = {}
+        if user:
+            user_kwargs["user"] = user
         if should_stream_exec() and hasattr(handle._client, "run_stream"):
             exit_code = 0
             for event in handle._client.run_stream(
@@ -386,6 +610,7 @@ def run_image_command(image: str, command_name: str, args: list[str], *, deploy_
                 env=env,
                 shares=shares,
                 workdir=workdir,
+                **user_kwargs,
                 **timeout_kwargs,
             ):
                 kind = str(event.get("kind", ""))
@@ -402,6 +627,7 @@ def run_image_command(image: str, command_name: str, args: list[str], *, deploy_
             env=env,
             shares=shares,
             workdir=workdir,
+            **user_kwargs,
             **timeout_kwargs,
         )
     finally:
@@ -954,7 +1180,7 @@ def complete_words(words: list[str], *, index: int) -> list[str]:
     if normalized and normalized[0] == "nd":
         normalized = ["neurodesk", "shell", *normalized[1:]]
     if not normalized:
-        return ["activate", "completion", "shell"]
+        return ["activate", "completion", "neurodesktop", "shell"]
     if normalized[0] != "neurodesk":
         normalized = ["neurodesk", *normalized]
 
@@ -973,7 +1199,7 @@ def complete_words(words: list[str], *, index: int) -> list[str]:
         return filtered
 
     if index <= 1:
-        return filter_prefix(["activate", "completion", "shell"])
+        return filter_prefix(["activate", "completion", "neurodesktop", "shell"])
 
     top = normalized[1]
     if top == "activate":

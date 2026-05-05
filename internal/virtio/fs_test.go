@@ -95,6 +95,70 @@ func TestPassthroughFSAppendWritesAppendInsteadOfWriteAt(t *testing.T) {
 	}
 }
 
+func TestImageFSSequentialWritesGrowAmortized(t *testing.T) {
+	t.Parallel()
+
+	backend := NewImageFS(imagefs.NewHostFS(t.TempDir(), nil), "")
+	be, ok := backend.(*imageFS)
+	if !ok {
+		t.Fatalf("backend type = %T", backend)
+	}
+	nodeID, fh, _, errno := be.Create(1, "large.bin", linuxOWRONLY|linuxOCREAT|linuxOTRUNC, 0o644)
+	if errno != 0 {
+		t.Fatalf("Create() errno = %d", errno)
+	}
+	defer be.Release(nodeID, fh)
+
+	chunk := make([]byte, 64<<10)
+	for i := range chunk {
+		chunk[i] = byte(i)
+	}
+	const chunks = 7
+	for i := 0; i < chunks; i++ {
+		if wrote, errno := be.Write(nodeID, fh, uint64(i*len(chunk)), chunk, 0); errno != 0 || wrote != uint32(len(chunk)) {
+			t.Fatalf("Write(%d) = (%d, %d)", i, wrote, errno)
+		}
+	}
+
+	be.mu.Lock()
+	node := be.nodes[nodeID]
+	size, dataLen, dataCap := node.size, len(node.data), cap(node.data)
+	be.mu.Unlock()
+	if size != uint64(chunks*len(chunk)) || dataLen != int(size) {
+		t.Fatalf("written size=%d len=%d, want %d", size, dataLen, chunks*len(chunk))
+	}
+	if dataCap <= dataLen {
+		t.Fatalf("data cap=%d, len=%d; want spare capacity for sequential writes", dataCap, dataLen)
+	}
+}
+
+func TestImageFSSetAttrPreservesDirectoryType(t *testing.T) {
+	t.Parallel()
+
+	backend := NewImageFS(imagefs.NewHostFS(t.TempDir(), nil), "")
+	be := backend.(*imageFS)
+	nodeID, _, errno := be.Mkdir(1, "runtime", 0o755)
+	if errno != 0 {
+		t.Fatalf("Mkdir() errno = %d", errno)
+	}
+	if _, errno := be.SetAttr(nodeID, fattrMode, 0, 0, 0o700, 0, 0, time.Time{}, time.Time{}); errno != 0 {
+		t.Fatalf("SetAttr(chmod) errno = %d", errno)
+	}
+	attr, errno := be.GetAttr(nodeID)
+	if errno != 0 {
+		t.Fatalf("GetAttr() errno = %d", errno)
+	}
+	if attr.Mode&linuxSIFMT != linuxSIFDIR {
+		t.Fatalf("mode after chmod = %#o, want directory", attr.Mode)
+	}
+	be.mu.Lock()
+	nodeMode := be.nodes[nodeID].mode
+	be.mu.Unlock()
+	if nodeMode.Perm() != 0o700 {
+		t.Fatalf("stored permissions after chmod = %#o, want 0700", nodeMode.Perm())
+	}
+}
+
 func TestStrictFUSEFsyncUsesBackendHandle(t *testing.T) {
 	t.Parallel()
 
@@ -650,6 +714,31 @@ func TestStrictFUSETmpfileReturnsENOSYS(t *testing.T) {
 	}
 	if got := int32(binary.LittleEndian.Uint32(reply[4:8])); got != -linuxENOSYS {
 		t.Fatalf("TMPFILE errno = %d, want %d", got, -linuxENOSYS)
+	}
+}
+
+func TestStrictFUSEUnknownOpcodeReturnsENOSYS(t *testing.T) {
+	t.Parallel()
+
+	fsdev := NewFS(0, 0, 0, "root", NewPassthroughFS(t.TempDir(), nil))
+	fsdev.Strict = true
+
+	const unique = uint64(45)
+	req := make([]byte, fuseInHeaderSize)
+	binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
+	binary.LittleEndian.PutUint32(req[4:8], 53)
+	binary.LittleEndian.PutUint64(req[8:16], unique)
+	binary.LittleEndian.PutUint64(req[16:24], 1)
+
+	reply, err := fsdev.dispatchFUSELocked(req)
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(unknown opcode) error = %v", err)
+	}
+	if got := int32(binary.LittleEndian.Uint32(reply[4:8])); got != -linuxENOSYS {
+		t.Fatalf("unknown opcode errno = %d, want %d", got, -linuxENOSYS)
+	}
+	if got := binary.LittleEndian.Uint64(reply[8:16]); got != unique {
+		t.Fatalf("unknown opcode unique = %d, want %d", got, unique)
 	}
 }
 

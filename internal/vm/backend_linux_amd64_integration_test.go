@@ -110,7 +110,7 @@ func TestRuntimeBackendRunCommandWithNetworkDevice(t *testing.T) {
 	resp, err := backend.Run(ctx, client.RunRequest{
 		Image:    "alpine",
 		Network:  &client.NetworkConfig{Enabled: true},
-		Command:  []string{"sh", "-c", "ls /sys/class/net && test -d /sys/class/net/eth0 && ip addr show eth0 && ip route && cat /etc/resolv.conf && ping -c 1 -W 1 10.42.0.1 && nslookup host.containers.internal 10.42.0.1 && echo network-device-ok"},
+		Command:  []string{"sh", "-c", "ls /sys/class/net && test -d /sys/class/net/eth0 && ip addr show lo && ip addr show eth0 && ping -c 1 -W 1 127.0.0.1 && ip route && cat /etc/resolv.conf && ping -c 1 -W 1 10.42.0.1 && nslookup host.containers.internal 10.42.0.1 && echo network-device-ok"},
 		MemoryMB: 256,
 		User:     "0:0",
 	})

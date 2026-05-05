@@ -1467,9 +1467,6 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		}
 		return reply(-linuxENOSYS, nil), nil
 	default:
-		if f.Strict {
-			return nil, fmt.Errorf("virtio-fs unsupported opcode %s(%d) node=%d", fuseOpcodeName(opcode), opcode, nodeID)
-		}
 		return reply(-linuxENOSYS, nil), nil
 	}
 }
@@ -3212,10 +3209,11 @@ func (p *imageFS) Write(nodeID uint64, fh uint64, off uint64, data []byte, _ uin
 		return 0, errno
 	}
 	end := off + uint64(len(data))
-	if end > uint64(len(node.data)) {
-		grown := make([]byte, end)
-		copy(grown, node.data)
-		node.data = grown
+	if end < off || end > uint64(^uint(0)>>1) {
+		return 0, -linuxEFBIG
+	}
+	if errno := growImageNodeData(node, end); errno != 0 {
+		return 0, errno
 	}
 	copy(node.data[off:end], data)
 	if end > node.size {
@@ -3223,6 +3221,35 @@ func (p *imageFS) Write(nodeID uint64, fh uint64, off uint64, data []byte, _ uin
 	}
 	node.modTime = time.Now()
 	return uint32(len(data)), 0
+}
+
+func growImageNodeData(node *imageNode, size uint64) int32 {
+	if size <= uint64(len(node.data)) {
+		return 0
+	}
+	if size > uint64(^uint(0)>>1) {
+		return -linuxEFBIG
+	}
+	wantLen := int(size)
+	if size <= uint64(cap(node.data)) {
+		node.data = node.data[:wantLen]
+		return 0
+	}
+	newCap := cap(node.data)
+	if newCap < 4096 {
+		newCap = 4096
+	}
+	for newCap < wantLen {
+		if newCap > int(^uint(0)>>1)/2 {
+			newCap = wantLen
+			break
+		}
+		newCap *= 2
+	}
+	grown := make([]byte, wantLen, newCap)
+	copy(grown, node.data)
+	node.data = grown
+	return 0
 }
 
 func (p *imageFS) SetAttr(nodeID uint64, valid uint32, _ uint64, size uint64, mode uint32, uid uint32, gid uint32, _ time.Time, mtime time.Time) (FuseAttr, int32) {
@@ -3238,7 +3265,11 @@ func (p *imageFS) SetAttr(nodeID uint64, valid uint32, _ uint64, size uint64, mo
 		}
 	}
 	if valid&fattrMode != 0 {
-		node.mode = fs.FileMode(mode & linuxPermMask)
+		if mode&linuxSIFMT != 0 {
+			node.mode = linuxModeToGo(mode)
+		} else {
+			node.mode = (node.mode &^ fs.FileMode(linuxPermMask)) | fs.FileMode(mode&linuxPermMask)
+		}
 	}
 	if valid&fattrUID != 0 {
 		node.uid = uid
@@ -3250,9 +3281,9 @@ func (p *imageFS) SetAttr(nodeID uint64, valid uint32, _ uint64, size uint64, mo
 		if size < uint64(len(node.data)) {
 			node.data = node.data[:size]
 		} else if size > uint64(len(node.data)) {
-			grown := make([]byte, size)
-			copy(grown, node.data)
-			node.data = grown
+			if errno := growImageNodeData(node, size); errno != 0 {
+				return FuseAttr{}, errno
+			}
 		}
 		node.size = size
 	}
@@ -3358,19 +3389,20 @@ func (p *imageFS) attr(node *imageNode) FuseAttr {
 	var mode uint32
 	size := node.size
 	modTime := node.modTime
+	nodeMode := node.mode
 	switch {
 	case node.abstractFile != nil:
-		size, node.mode = node.abstractFile.Stat()
+		size, nodeMode = node.abstractFile.Stat()
 		if mt := node.abstractFile.ModTime(); !mt.IsZero() {
 			modTime = mt
 		}
 	case node.abstractDir != nil:
-		node.mode = fs.ModeDir | node.abstractDir.Stat()
+		nodeMode = fs.ModeDir | node.abstractDir.Stat()
 		if mt := node.abstractDir.ModTime(); !mt.IsZero() {
 			modTime = mt
 		}
 	case node.abstractLink != nil:
-		node.mode = fs.ModeSymlink | node.abstractLink.Stat().Perm()
+		nodeMode = fs.ModeSymlink | node.abstractLink.Stat().Perm()
 		node.symlinkTarget = node.abstractLink.Target()
 		size = uint64(len(node.symlinkTarget))
 		if mt := node.abstractLink.ModTime(); !mt.IsZero() {
@@ -3382,14 +3414,13 @@ func (p *imageFS) attr(node *imageNode) FuseAttr {
 		// Image roots are served as an ephemeral writable layer, similar to
 		// Apptainer's writable-tmpfs mode. Preserve read-only semantics for
 		// explicit non-writable mounts in mountedFS.
-		node.mode |= 0o222
-		mode = linuxSIFDIR | linuxModeBits(node.mode)
+		mode = linuxSIFDIR | linuxModeBits(nodeMode|0o222)
 	case node.isSymlink():
-		mode = linuxSIFLNK | linuxModeBits(node.mode)
+		mode = linuxSIFLNK | linuxModeBits(nodeMode)
 	case node.rawMode != 0:
-		mode = (node.rawMode &^ linuxPermMask) | linuxModeBits(node.mode)
+		mode = (node.rawMode &^ linuxPermMask) | linuxModeBits(nodeMode)
 	default:
-		mode = linuxSIFREG | linuxModeBits(node.mode)
+		mode = linuxSIFREG | linuxModeBits(nodeMode)
 	}
 	nlink := uint32(1)
 	if node.isDir() {
@@ -3572,6 +3603,7 @@ const (
 	linuxEISDIR    = linuxabi.EISDIR
 	linuxEINVAL    = linuxabi.EINVAL
 	linuxENOTTY    = linuxabi.ENOTTY
+	linuxEFBIG     = linuxabi.EFBIG
 	linuxERANGE    = linuxabi.ERANGE
 	linuxENOSYS    = linuxabi.ENOSYS
 	linuxENOTEMPTY = linuxabi.ENOTEMPTY
