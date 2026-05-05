@@ -339,6 +339,10 @@ def test_windows_host_shell_can_be_forced_to_bash(monkeypatch) -> None:
         "-lc",
         "echo ok",
     ]
+    assert fulltest.windows_host_shell_command(
+        {"PYNEURODESK_FULLTEST_HOST_SHELL": r"C:\Program Files\Git\bin\bash.exe"},
+        "echo ok",
+    ) == [r"C:\Program Files\Git\bin\bash.exe", "-lc", "echo ok"]
 
 
 def test_windows_bash_source_path_converts_drive_path(monkeypatch) -> None:

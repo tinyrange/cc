@@ -691,14 +691,25 @@ def run_shell(
 
 
 def windows_host_shell_command(env: dict[str, str], command: str) -> list[str]:
-    if use_windows_bash_host_shell(env):
-        return ["bash", "-lc", command]
+    bash = windows_bash_host_shell(env)
+    if bash is not None:
+        return [bash, "-lc", command]
     return [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", command]
 
 
 def use_windows_bash_host_shell(env: dict[str, str]) -> bool:
+    return windows_bash_host_shell(env) is not None
+
+
+def windows_bash_host_shell(env: dict[str, str]) -> Optional[str]:
     raw = env.get("PYNEURODESK_FULLTEST_HOST_SHELL") or os.environ.get("PYNEURODESK_FULLTEST_HOST_SHELL", "")
-    return raw.strip().lower() in {"bash", "git-bash", "msys", "msys2"}
+    value = raw.strip()
+    lowered = value.lower()
+    if lowered in {"bash", "git-bash", "msys", "msys2"}:
+        return "bash"
+    if lowered.endswith(("bash", "bash.exe")):
+        return value
+    return None
 
 
 def bash_source_path(path: Path, env: dict[str, str]) -> str:

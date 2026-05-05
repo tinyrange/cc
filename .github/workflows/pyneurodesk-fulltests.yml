@@ -310,7 +310,7 @@ jobs:
 
       - name: Check Bash availability
         shell: pwsh
-        run: bash --version
+        run: '& "C:\Program Files\Git\bin\bash.exe" --version'
 
       - name: Build guest init payloads
         shell: pwsh
@@ -448,7 +448,7 @@ jobs:
         env:
           PYNEURODESK_CCVM: ${{ github.workspace }}\build\ccvm.exe
           PYNEURODESK_BOOT_TIMEOUT: "300"
-          PYNEURODESK_FULLTEST_HOST_SHELL: bash
+          PYNEURODESK_FULLTEST_HOST_SHELL: C:\Program Files\Git\bin\bash.exe
           PYTHONUNBUFFERED: "1"
           SUITE: ${{ matrix.suite }}
           IMAGE_SOURCE: ${{ steps.simg.outputs.image_path }}
