@@ -122,6 +122,7 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 
 	extraCmdline := []string{
 		"tsc=reliable",
+		"tsc_early_khz=3000000",
 		"lpj=10000000",
 		"no_timer_check",
 	}

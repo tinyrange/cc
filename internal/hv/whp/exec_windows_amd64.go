@@ -152,6 +152,7 @@ func prepareManagedVM(kernel []byte, initrd []byte, memoryMB uint64, dmesg bool,
 
 	extraCmdline := []string{
 		"tsc=reliable",
+		"tsc_early_khz=3000000",
 		"lpj=10000000",
 		"no_timer_check",
 	}
