@@ -629,7 +629,7 @@ def run_shell(
 ) -> tuple[str, int]:
     shell_command = ["bash", "-lc", command]
     if os.name == "nt":
-        shell_command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", command]
+        shell_command = windows_host_shell_command(env, command)
         proc = subprocess.Popen(
             shell_command,
             cwd=work_dir,
@@ -690,6 +690,31 @@ def run_shell(
     return stdout + stderr, proc.returncode
 
 
+def windows_host_shell_command(env: dict[str, str], command: str) -> list[str]:
+    if use_windows_bash_host_shell(env):
+        return ["bash", "-lc", command]
+    return [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", command]
+
+
+def use_windows_bash_host_shell(env: dict[str, str]) -> bool:
+    raw = env.get("PYNEURODESK_FULLTEST_HOST_SHELL") or os.environ.get("PYNEURODESK_FULLTEST_HOST_SHELL", "")
+    return raw.strip().lower() in {"bash", "git-bash", "msys", "msys2"}
+
+
+def bash_source_path(path: Path, env: dict[str, str]) -> str:
+    raw = str(path)
+    if os.name != "nt" or not use_windows_bash_host_shell(env):
+        return raw
+    normalized = raw.replace("\\", "/")
+    if len(normalized) >= 2 and normalized[1] == ":" and normalized[0].isalpha():
+        return f"/{normalized[0].lower()}{normalized[2:]}"
+    return normalized
+
+
+def source_activation_command(path: Path, env: dict[str, str]) -> str:
+    return "source " + shlex.quote(bash_source_path(path, env))
+
+
 def timeout_expired_output(exc: subprocess.TimeoutExpired) -> str:
     parts = []
     for stream in (exc.stdout, exc.stderr):
@@ -731,7 +756,7 @@ class ActivatedShellSession:
         return run_shell(
             self.env,
             self.work_dir,
-            "source " + shlex.quote(str(self.activation_script)) + "\n" + command,
+            source_activation_command(self.activation_script, self.env) + "\n" + command,
             timeout_seconds,
         )
 
@@ -742,7 +767,7 @@ class ActivatedShellSession:
         return run_shell(
             env,
             self.work_dir,
-            "source " + shlex.quote(str(self.activation_script)) + "\n" + " ".join(shlex.quote(word) for word in words),
+            source_activation_command(self.activation_script, env) + "\n" + " ".join(shlex.quote(word) for word in words),
             timeout_seconds + 10.0,
         )
 

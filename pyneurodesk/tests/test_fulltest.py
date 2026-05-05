@@ -329,6 +329,25 @@ def test_run_shell_timeout_terminates_child_processes(tmp_path: Path) -> None:
     assert not marker.exists()
 
 
+def test_windows_host_shell_can_be_forced_to_bash(monkeypatch) -> None:
+    monkeypatch.setattr(fulltest.os, "name", "nt")
+    monkeypatch.setenv("COMSPEC", "cmd.exe")
+
+    assert fulltest.windows_host_shell_command({}, "echo ok") == ["cmd.exe", "/d", "/c", "echo ok"]
+    assert fulltest.windows_host_shell_command({"PYNEURODESK_FULLTEST_HOST_SHELL": "bash"}, "echo ok") == [
+        "bash",
+        "-lc",
+        "echo ok",
+    ]
+
+
+def test_windows_bash_source_path_converts_drive_path(monkeypatch) -> None:
+    monkeypatch.setattr(fulltest.os, "name", "nt")
+    env = {"PYNEURODESK_FULLTEST_HOST_SHELL": "bash"}
+
+    assert fulltest.bash_source_path(Path("C:/Users/runner/work/activate.sh"), env) == "/c/Users/runner/work/activate.sh"
+
+
 def test_image_cache_name_is_stable() -> None:
     assert image_cache_name("niimath") == image_cache_name("niimath")
     assert image_cache_name("niimath") != image_cache_name("other")

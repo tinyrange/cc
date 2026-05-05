@@ -272,3 +272,207 @@ jobs:
             fulltest-results/${{ matrix.suite }}-download.log
             fulltest-results/${{ matrix.suite }}.log
           if-no-files-found: error
+
+  fulltest-windows-amd64:
+    name: windows-amd64 / ${{ matrix.suite }}
+    needs: plan
+    runs-on: windows-2025
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJson(needs.plan.outputs.suites) }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Check out Neurocontainers recipes
+        uses: actions/checkout@v6
+        with:
+          repository: neurodesk/neurocontainers
+          ref: ${{ github.event.inputs.neurocontainers_ref || 'main' }}
+          path: local/neurocontainers
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install Python tooling
+        run: python -m pip install --upgrade pip uv
+
+      - name: Check Bash availability
+        shell: pwsh
+        run: bash --version
+
+      - name: Build guest init payloads
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:CGO_ENABLED = "0"
+          $env:GOOS = "linux"
+          $env:GOARCH = "amd64"
+          go build -o internal/guestinit/guest-init-linux-amd64 ./internal/cmd/init
+          $env:GOARCH = "arm64"
+          go build -o internal/guestinit/guest-init-linux-arm64 ./internal/cmd/init
+
+      - name: Build ccvm
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force build | Out-Null
+          go build -tags embed_guestinit -o build/ccvm.exe ./cmd/ccvm
+
+      - name: Install pyneurodesk fulltest dependencies
+        working-directory: pyneurodesk
+        env:
+          PYNEURODESK_CCVM: ${{ github.workspace }}\build\ccvm.exe
+        run: uv sync --extra fulltest
+
+      - name: Download Neurodesk Singularity image
+        id: simg
+        working-directory: pyneurodesk
+        shell: pwsh
+        env:
+          SUITE: ${{ matrix.suite }}
+          NEUROCONTAINERS_S3: https://neurocontainers.s3.us-east-2.amazonaws.com
+          NEURODESK_CVMFS_LOG: https://raw.githubusercontent.com/neurodesk/neurocommand/main/cvmfs/log.txt
+        run: |
+          $ErrorActionPreference = "Stop"
+          $results = Join-Path $env:GITHUB_WORKSPACE "fulltest-results"
+          $imageDir = Join-Path $env:RUNNER_TEMP "neurocontainers-simg"
+          New-Item -ItemType Directory -Force $results, $imageDir | Out-Null
+          $recipe = Join-Path $env:GITHUB_WORKSPACE "local/neurocontainers/recipes/$env:SUITE/fulltest.yaml"
+          $manifest = Join-Path $env:RUNNER_TEMP "neurocontainers-cvmfs-log.txt"
+          $downloadLog = Join-Path $results "$env:SUITE-windows-amd64-download.log"
+
+          curl.exe --fail --location --retry 5 --retry-all-errors --output $manifest $env:NEURODESK_CVMFS_LOG
+
+          $containerOutput = @'
+          import fnmatch
+          import sys
+          from pathlib import Path
+
+          import yaml
+
+          with open(sys.argv[1], "r", encoding="utf-8") as handle:
+              recipe = yaml.safe_load(handle) or {}
+          manifest_path = Path(sys.argv[2])
+          container = str(recipe.get("container", "")).strip()
+          if not container:
+              raise SystemExit("fulltest.yaml does not define a container")
+          if not container.endswith(".simg"):
+              container += ".simg"
+
+          entries = []
+          for line in manifest_path.read_text(encoding="utf-8").splitlines():
+              name = line.split(maxsplit=1)[0].strip()
+              if name:
+                  entries.append(f"{name}.simg")
+          available = set(entries)
+
+          if container in available:
+              print(container)
+              raise SystemExit(0)
+
+          def latest(candidates):
+              if not candidates:
+                  return None
+              return sorted(candidates, key=lambda item: item.removesuffix(".simg").rsplit("_", 1)[-1])[-1]
+
+          if any(char in container for char in "*?["):
+              match = latest(item for item in entries if fnmatch.fnmatchcase(item, container))
+              if match:
+                  print(f"[fulltest] resolved container glob {container} -> {match}", file=sys.stderr)
+                  print(match)
+                  raise SystemExit(0)
+
+          stem = container.removesuffix(".simg")
+          try:
+              package, version, _build = stem.rsplit("_", 2)
+          except ValueError:
+              package = str(recipe.get("name", "")).strip()
+              version = str(recipe.get("version", "")).strip()
+
+          same_version = latest(
+              item for item in entries
+              if item.removesuffix(".simg").startswith(f"{package}_{version}_")
+          )
+          if same_version:
+              print(f"[fulltest] resolved unavailable container {container} -> {same_version}", file=sys.stderr)
+              print(same_version)
+              raise SystemExit(0)
+
+          same_package = latest(
+              item for item in entries
+              if item.removesuffix(".simg").startswith(f"{package}_")
+          )
+          if same_package:
+              print(f"[fulltest] resolved unavailable container {container} -> {same_package}", file=sys.stderr)
+              print(same_package)
+              raise SystemExit(0)
+
+          print(
+              f"container {container} is not listed in {manifest_path} and no replacement exists for {package}",
+              file=sys.stderr,
+          )
+          raise SystemExit(1)
+          '@ | uv run python - $recipe $manifest
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $container = ($containerOutput | Select-Object -Last 1).Trim()
+          $imagePath = Join-Path $imageDir $container
+          $url = "$env:NEUROCONTAINERS_S3/$container"
+
+          "[fulltest] downloading image=$container url=$url" | Tee-Object -FilePath $downloadLog
+          curl.exe --fail --location --retry 5 --retry-all-errors --continue-at - --output $imagePath $url 2>&1 |
+            Tee-Object -FilePath $downloadLog -Append
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          "[fulltest] downloaded image=$imagePath" | Tee-Object -FilePath $downloadLog -Append
+          Get-Item $imagePath | Format-List FullName,Length | Out-String | Tee-Object -FilePath $downloadLog -Append
+          "image_path=$imagePath" >> $env:GITHUB_OUTPUT
+
+      - name: Run fulltest
+        working-directory: pyneurodesk
+        shell: pwsh
+        env:
+          PYNEURODESK_CCVM: ${{ github.workspace }}\build\ccvm.exe
+          PYNEURODESK_BOOT_TIMEOUT: "300"
+          PYNEURODESK_FULLTEST_HOST_SHELL: bash
+          PYTHONUNBUFFERED: "1"
+          SUITE: ${{ matrix.suite }}
+          IMAGE_SOURCE: ${{ steps.simg.outputs.image_path }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $results = Join-Path $env:GITHUB_WORKSPACE "fulltest-results"
+          New-Item -ItemType Directory -Force $results | Out-Null
+          $recipe = Join-Path $env:GITHUB_WORKSPACE "local/neurocontainers/recipes/$env:SUITE/fulltest.yaml"
+          $workDir = Join-Path $env:RUNNER_TEMP "pyneurodesk-fulltest-windows-amd64-$env:SUITE"
+          uv run pyneurodesk-fulltest `
+            --recipe $recipe `
+            --image-source $env:IMAGE_SOURCE `
+            --work-dir $workDir `
+            2>&1 | Tee-Object -FilePath (Join-Path $results "$env:SUITE-windows-amd64.log")
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Upload fulltest log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pyneurodesk-fulltest-windows-amd64-${{ matrix.suite }}
+          path: |
+            fulltest-results/${{ matrix.suite }}-windows-amd64-download.log
+            fulltest-results/${{ matrix.suite }}-windows-amd64.log
+          if-no-files-found: warn
