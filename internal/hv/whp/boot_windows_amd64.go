@@ -511,8 +511,9 @@ func (h *bootHPET) read(offset uint64) uint64 {
 		return uint64(hpetClockPeriodFemtoseconds)<<32 |
 			uint64(hpetVendorID)<<16 |
 			hpetCounterSizeCap |
-			(hpetNumTimers - 1) |
-			hpetLegacyReplacementCap
+			hpetLegacyReplacementCap |
+			uint64(hpetNumTimers-1)<<8 |
+			1
 	case hpetRegGeneralConfiguration:
 		return h.config
 	case hpetRegInterruptStatus:
