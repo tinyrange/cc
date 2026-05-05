@@ -1,6 +1,6 @@
 [project]
 name = "neurodesk"
-version = "0.2.0"
+version = "0.3.0"
 description = "Python client for the ccx3 Neurodesk-oriented image and VM API"
 readme = "README.md"
 authors = [
