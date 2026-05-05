@@ -417,7 +417,7 @@ func (p *bootPlatform) raiseIRQ(line uint8) {
 				atomic.AddUint64(&p.irqSuppressed, 1)
 				return
 			}
-			if err := p.vm.RequestInterrupt(uint32(vector)); err != nil {
+			if err := p.vm.RequestInterruptWithTrigger(uint32(vector), interruptTriggerLevel); err != nil {
 				atomic.AddUint64(&p.irqFailed, 1)
 				p.ioapic.endInterrupt(vector)
 			} else {
@@ -441,12 +441,13 @@ func (p *bootPlatform) HandleEOI(vector uint32) {
 
 func (p *bootPlatform) Summary() string {
 	summary := fmt.Sprintf(
-		"whp platform irq_attempts=%d irq_delivered=%d irq_failed=%d irq_suppressed=%d irq_lines=%s",
+		"whp platform irq_attempts=%d irq_delivered=%d irq_failed=%d irq_suppressed=%d irq_lines=%s %s",
 		atomic.LoadUint64(&p.irqAttempts),
 		atomic.LoadUint64(&p.irqDelivered),
 		atomic.LoadUint64(&p.irqFailed),
 		atomic.LoadUint64(&p.irqSuppressed),
 		p.irqLineSummary(),
+		p.ioapic.summaryForLines(p.activeIRQLines()),
 	)
 	if p.vsock != nil {
 		summary += " " + p.vsock.Summary()
@@ -476,6 +477,16 @@ func (p *bootPlatform) irqLineSummary() string {
 	}
 	b.WriteByte(']')
 	return b.String()
+}
+
+func (p *bootPlatform) activeIRQLines() []uint8 {
+	lines := make([]uint8, 0, len(p.irqLine))
+	for line := range p.irqLine {
+		if atomic.LoadUint64(&p.irqLine[line]) != 0 {
+			lines = append(lines, uint8(line))
+		}
+	}
+	return lines
 }
 
 func defaultIOReadByte(port uint16) byte {

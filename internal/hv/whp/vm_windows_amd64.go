@@ -334,7 +334,11 @@ func (v *VM) GetRIP() (uint64, error) {
 }
 
 func (v *VM) RequestInterrupt(vector uint32) error {
-	return requestInterrupt(v.part, vector)
+	return v.RequestInterruptWithTrigger(vector, interruptTriggerEdge)
+}
+
+func (v *VM) RequestInterruptWithTrigger(vector uint32, trigger interruptTriggerMode) error {
+	return requestInterrupt(v.part, vector, trigger)
 }
 
 func segmentAttributes(typ, s, dpl, present, avl, long, db, gran uint16) uint16 {

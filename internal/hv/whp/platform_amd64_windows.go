@@ -4,6 +4,8 @@ package whp
 
 import (
 	"encoding/binary"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -415,6 +417,33 @@ func (a *bootIOAPIC) endInterrupt(vector uint8) {
 	a.mu.Lock()
 	a.inFlight[vector] = false
 	a.mu.Unlock()
+}
+
+func (a *bootIOAPIC) summaryForLines(lines []uint8) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(lines) == 0 {
+		return "ioapic=[]"
+	}
+	var b strings.Builder
+	b.WriteString("ioapic=[")
+	for i, line := range lines {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		if int(line) >= len(a.redir) {
+			fmt.Fprintf(&b, "%d:<out-of-range>", line)
+			continue
+		}
+		entry := a.redir[line]
+		trigger := "edge"
+		if entry&(1<<15) != 0 {
+			trigger = "level"
+		}
+		fmt.Fprintf(&b, "%d:vec=%#x,mask=%t,trig=%s,irr=%t", line, uint8(entry), entry&(1<<16) != 0, trigger, a.inFlight[uint8(entry)])
+	}
+	b.WriteByte(']')
+	return b.String()
 }
 
 func (a *bootIOAPIC) readRegister(index uint32) uint32 {

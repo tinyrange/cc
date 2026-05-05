@@ -90,7 +90,10 @@ const interruptDestinationPhysical interruptDestinationMode = 0
 
 type interruptTriggerMode uint32
 
-const interruptTriggerEdge interruptTriggerMode = 0
+const (
+	interruptTriggerEdge  interruptTriggerMode = 0
+	interruptTriggerLevel interruptTriggerMode = 1
+)
 
 type interruptControl struct {
 	Control     uint64
@@ -473,9 +476,9 @@ func cancelRunVirtualProcessor(part partitionHandle, vpIndex uint32) error {
 	return callHRESULT(procWHvCancelRunVirtualProcessor, uintptr(part), uintptr(vpIndex), 0)
 }
 
-func requestInterrupt(part partitionHandle, vector uint32) error {
+func requestInterrupt(part partitionHandle, vector uint32, trigger interruptTriggerMode) error {
 	control := interruptControl{
-		Control:     uint64(interruptTypeFixed) | uint64(interruptDestinationPhysical)<<8 | uint64(interruptTriggerEdge)<<12,
+		Control:     uint64(interruptTypeFixed) | uint64(interruptDestinationPhysical)<<8 | uint64(trigger)<<12,
 		Destination: 0,
 		Vector:      vector,
 	}
