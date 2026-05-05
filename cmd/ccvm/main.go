@@ -589,6 +589,10 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 		state, err := srvState.vms.StartBlank(bootCtx, req)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
+				if req.Dmesg {
+					writeError(w, http.StatusGatewayTimeout, fmt.Errorf("vm boot timed out after %s: %w", bootTimeout, err))
+					return
+				}
 				writeError(w, http.StatusGatewayTimeout, fmt.Errorf("vm boot timed out after %s", bootTimeout))
 				return
 			}
@@ -665,6 +669,10 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 		state, err := srvState.vms.Start(bootCtx, req)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
+				if req.Dmesg {
+					writeError(w, http.StatusGatewayTimeout, fmt.Errorf("vm boot timed out after %s: %w", bootTimeout, err))
+					return
+				}
 				writeError(w, http.StatusGatewayTimeout, fmt.Errorf("vm boot timed out after %s", bootTimeout))
 				return
 			}

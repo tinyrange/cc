@@ -463,6 +463,7 @@ def test_load_command_uses_nd_load_with_source_and_recipe_commands() -> None:
             repo="repo.example",
             memory_mb=512,
             cpus=2,
+            dmesg=True,
         ),
     )
 
@@ -473,6 +474,7 @@ def test_load_command_uses_nd_load_with_source_and_recipe_commands() -> None:
     assert "--cache-dir '/tmp/cache dir'" in command
     assert "--memory-mb 512" in command
     assert "--cpus 2" in command
+    assert "--dmesg" in command
 
 
 def test_load_command_defaults_to_12gb_memory() -> None:

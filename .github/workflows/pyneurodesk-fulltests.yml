@@ -273,6 +273,47 @@ jobs:
             fulltest-results/${{ matrix.suite }}.log
           if-no-files-found: error
 
+  whp-smoke-windows-amd64:
+    name: windows-amd64 / WHP smoke
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Run WHP boot tests
+        shell: pwsh
+        env:
+          CCX3_WHP_BOOT: "1"
+          CCX3_DEBUG_TIMING: "1"
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force fulltest-results | Out-Null
+          go test ./internal/hv/whp ./internal/vm `
+            -run "Test(KernelBootFirstSerialByte|InitramfsBootReadyMarker|GuestInitRunsCommandFromAlpineRootFS|RunManagedExecWithAlpineRootFS|ManagedSessionExecWithAlpineRootFS|ManagedSessionExecStreamForwardsStdin|WindowsRuntimeBackendRunCommand|WindowsRuntimeBackendStartThenExec|WindowsRuntimeBackendRunStreamForwardsStdin|WindowsRuntimeBackendStartWithWritableShare)$" `
+            -count=1 `
+            -timeout=8m `
+            -v `
+            2>&1 | Tee-Object -FilePath fulltest-results/whp-smoke-windows-amd64.log
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Upload WHP smoke log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: whp-smoke-windows-amd64
+          path: fulltest-results/whp-smoke-windows-amd64.log
+          if-no-files-found: warn
+
   fulltest-windows-amd64:
     name: windows-amd64 / ${{ matrix.suite }}
     needs: plan
@@ -449,6 +490,7 @@ jobs:
           PYNEURODESK_CCVM: ${{ github.workspace }}\build\ccvm.exe
           PYNEURODESK_BOOT_TIMEOUT: "600"
           PYNEURODESK_FULLTEST_HOST_SHELL: C:\Program Files\Git\bin\bash.exe
+          CCX3_DEBUG_TIMING: "1"
           PYTHONUNBUFFERED: "1"
           SUITE: ${{ matrix.suite }}
           IMAGE_SOURCE: ${{ steps.simg.outputs.image_path }}
@@ -464,6 +506,7 @@ jobs:
             --work-dir $workDir `
             --memory-mb 4096 `
             --cpus 1 `
+            --dmesg `
             2>&1 | Tee-Object -FilePath (Join-Path $results "$env:SUITE-windows-amd64.log")
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE

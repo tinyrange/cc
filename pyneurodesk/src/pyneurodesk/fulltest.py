@@ -86,6 +86,7 @@ class Options:
     prefetch_workers: Optional[int] = None
     memory_mb: Optional[int] = DEFAULT_FULLTEST_MEMORY_MB
     cpus: Optional[int] = DEFAULT_FULLTEST_CPUS
+    dmesg: bool = False
     max_consecutive_timeouts: int = DEFAULT_MAX_CONSECUTIVE_TIMEOUTS
 
 
@@ -849,6 +850,8 @@ def load_command(reference: ContainerReference, suite: Suite, options: Options) 
         words.extend(["--memory-mb", str(options.memory_mb)])
     if options.cpus is not None:
         words.extend(["--cpus", str(options.cpus)])
+    if options.dmesg:
+        words.append("--dmesg")
     return " ".join(shlex.quote(word) for word in words)
 
 
@@ -1039,6 +1042,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prefetch-workers", type=int, default=4)
     parser.add_argument("--memory-mb", type=int, default=DEFAULT_FULLTEST_MEMORY_MB)
     parser.add_argument("--cpus", type=int, default=DEFAULT_FULLTEST_CPUS)
+    parser.add_argument("--dmesg", action="store_true")
     parser.add_argument(
         "--max-consecutive-timeouts",
         type=int,
@@ -1076,6 +1080,7 @@ def main() -> None:
                 prefetch_workers=(int(args.prefetch_workers or 0) or None) if args.prefetch else None,
                 memory_mb=args.memory_mb or None,
                 cpus=args.cpus or None,
+                dmesg=bool(args.dmesg),
                 max_consecutive_timeouts=max(0, int(args.max_consecutive_timeouts)),
             )
         )

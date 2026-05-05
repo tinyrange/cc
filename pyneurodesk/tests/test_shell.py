@@ -274,8 +274,15 @@ def test_shell_load_source_stores_reference_and_prepares_image(
             calls.append(("import_image", (name, request.source.path, request.cache_dir)))
             return object()
 
-        def ensure_instance(self, image: str, *, memory_mb: Optional[int] = None, cpus: Optional[int] = None) -> object:
-            calls.append(("ensure_instance", (image, memory_mb, cpus)))
+        def ensure_instance(
+            self,
+            image: str,
+            *,
+            memory_mb: Optional[int] = None,
+            cpus: Optional[int] = None,
+            dmesg: bool = False,
+        ) -> object:
+            calls.append(("ensure_instance", (image, memory_mb, cpus, dmesg)))
             return object()
 
         def run(self, *args: object, **kwargs: object) -> object:
@@ -319,7 +326,7 @@ def test_shell_load_source_stores_reference_and_prepares_image(
     assert calls[:3] == [
         ("connect", None),
         ("import_image", ("fulltest-image", "/containers/custom", "/tmp/cache")),
-        ("ensure_instance", ("fulltest-image", 512, 2)),
+        ("ensure_instance", ("fulltest-image", 512, 2, False)),
     ]
 
 
@@ -824,7 +831,7 @@ def test_run_wrapper_uses_session_reference_when_present(
             calls.append(("ensure_image", ref))
             return object()
 
-        def ensure_instance(self, image: str, *, memory_mb: Optional[int] = None, cpus: Optional[int] = None) -> object:
+        def ensure_instance(self, image: str, *, memory_mb: Optional[int] = None, cpus: Optional[int] = None, **kwargs: object) -> object:
             calls.append(("ensure_instance", (image, memory_mb, cpus)))
             return object()
 

@@ -129,6 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
     load_parser.add_argument("--prefetch-workers", type=int, default=0)
     load_parser.add_argument("--memory-mb", type=int, default=0)
     load_parser.add_argument("--cpus", type=int, default=0)
+    load_parser.add_argument("--dmesg", action="store_true")
     load_parser.add_argument("--force", action="store_true")
     load_parser.set_defaults(handler=handle_load)
 
@@ -357,6 +358,7 @@ def handle_load(args: argparse.Namespace) -> int:
         prefetch_workers=int(args.prefetch_workers or 0) or None,
         memory_mb=memory_mb,
         cpus=cpus,
+        dmesg=bool(args.dmesg),
         network=session_network_config(state),
     )
     try:
@@ -415,6 +417,7 @@ def load_shell_container(
     prefetch_workers: Optional[int],
     memory_mb: Optional[int],
     cpus: Optional[int],
+    dmesg: bool = False,
     network: Optional[NetworkConfig] = None,
 ):
     if reference is None:
@@ -433,9 +436,9 @@ def load_shell_container(
         ),
     )
     if network is not None:
-        active_client.ensure_instance(reference.image, memory_mb=memory_mb, cpus=cpus, network=network)
+        active_client.ensure_instance(reference.image, memory_mb=memory_mb, cpus=cpus, dmesg=dmesg, network=network)
     else:
-        active_client.ensure_instance(reference.image, memory_mb=memory_mb, cpus=cpus)
+        active_client.ensure_instance(reference.image, memory_mb=memory_mb, cpus=cpus, dmesg=dmesg)
     apply_port_forwards(active_client, network)
     return container_handle_for_reference(active_client, reference)
 
