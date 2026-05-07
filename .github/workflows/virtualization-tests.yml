@@ -160,6 +160,7 @@ jobs:
         shell: pwsh
         env:
           CCX3_WHP_BOOT: "1"
+          CCX3_WHP_BOOT_TIMEOUT_SECONDS: "90"
           CCX3_DEBUG_TIMING: "1"
         run: |
           New-Item -ItemType Directory -Force fulltest-results | Out-Null

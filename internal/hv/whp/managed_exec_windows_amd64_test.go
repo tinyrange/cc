@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/amd64vm"
@@ -23,7 +22,7 @@ import (
 func TestRunManagedExecWithAlpineRootFS(t *testing.T) {
 	kernelFile, initrd, fsdevs := prepareManagedAlpineRootFS(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), whpBootTestTimeout(t))
 	defer cancel()
 	resp, serial, err := RunManagedExecWithFS(ctx, kernelFile, initrd, 256, false, fsdevs, client.ExecRequest{
 		Command: []string{"/bin/sh", "-c", "whoami; uname -a"},
@@ -47,7 +46,7 @@ func TestRunManagedExecWithAlpineRootFS(t *testing.T) {
 func TestManagedSessionExecWithAlpineRootFS(t *testing.T) {
 	kernelFile, initrd, fsdevs := prepareManagedAlpineRootFS(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), whpBootTestTimeout(t))
 	defer cancel()
 	session, err := StartManagedSession(ctx, kernelFile, initrd, 256, false, fsdevs, nil)
 	if err != nil {
@@ -74,7 +73,7 @@ func TestManagedSessionExecWithAlpineRootFS(t *testing.T) {
 func TestManagedSessionExecStreamForwardsStdin(t *testing.T) {
 	kernelFile, initrd, fsdevs := prepareManagedAlpineRootFS(t)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), whpBootTestTimeout(t))
 	defer cancel()
 	session, err := StartManagedSession(ctx, kernelFile, initrd, 256, false, fsdevs, nil)
 	if err != nil {
@@ -155,7 +154,7 @@ func prepareManagedAlpineRootFS(t *testing.T) ([]byte, []byte, []*virtio.FS) {
 		t.Skipf("local alpine fixture unavailable: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), whpBootTestTimeout(t))
 	defer cancel()
 
 	root := t.TempDir()

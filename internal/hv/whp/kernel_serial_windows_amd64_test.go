@@ -7,7 +7,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"j5.nz/cc/internal/guestinit"
 	"j5.nz/cc/internal/kernel/alpine"
@@ -18,7 +17,7 @@ func TestKernelBootFirstSerialByte(t *testing.T) {
 	if os.Getenv("CCX3_WHP_BOOT") == "" {
 		t.Skip("set CCX3_WHP_BOOT=1 to run the windows amd64 WHP boot probe")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), whpBootTestTimeout(t))
 	defer cancel()
 	manager := alpine.NewManager(t.TempDir())
 	if err := manager.Ensure(ctx); err != nil {
@@ -28,7 +27,7 @@ func TestKernelBootFirstSerialByte(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadKernel() error = %v", err)
 	}
-	serial, err := BootKernelToSerialWithTimeout(kernelFile, 256, true, 20*time.Second)
+	serial, err := BootKernelToSerialWithTimeout(kernelFile, 256, true, whpBootTestTimeout(t))
 	if err != nil {
 		t.Fatalf("BootKernelToSerialWithTimeout() error = %v\nserial:\n%s", err, serial)
 	}
@@ -42,7 +41,7 @@ func TestInitramfsBootReadyMarker(t *testing.T) {
 	if os.Getenv("CCX3_WHP_BOOT") == "" {
 		t.Skip("set CCX3_WHP_BOOT=1 to run the windows amd64 WHP boot probe")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), whpBootTestTimeout(t))
 	defer cancel()
 	manager := alpine.NewManager(t.TempDir())
 	if err := manager.Ensure(ctx); err != nil {
