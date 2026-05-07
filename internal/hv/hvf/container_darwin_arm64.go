@@ -1093,7 +1093,7 @@ func RunContainer(ctx context.Context, req ContainerRunRequest) (ContainerRunRes
 	return runContainer(ctx, req, nil)
 }
 
-func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- error) (ContainerRunResult, error) {
+func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- error) (ret ContainerRunResult, retErr error) {
 	if req.Image == nil && req.RootFS == nil {
 		return ContainerRunResult{}, fmt.Errorf("image or rootfs backend is required")
 	}
@@ -1161,7 +1161,11 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	if err != nil {
 		return ContainerRunResult{}, err
 	}
-	defer vm.Close()
+	defer func() {
+		if err := vm.Close(); err != nil && retErr == nil {
+			retErr = err
+		}
+	}()
 
 	memorySize := arm64vm.MemorySizeBytes(req.MemoryMB)
 	mem, err := vm.MapAnonymousMemory(uintptr(memorySize), IPA(arm64vm.MemoryBase), hvMemoryRead|hvMemoryWrite|hvMemoryExec)
@@ -1191,7 +1195,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 
 	plan, err := arm64vm.PrepareBoot(mem, req.Kernel, initrd, arm64vm.BootConfig{
 		MemoryMB:   req.MemoryMB,
-		Dmesg:      req.Dmesg,
+		Dmesg:      true,
 		ExtraNodes: arm64vm.AppendFSNodes([]fdt.Node{console.DeviceTreeNode(), rng.DeviceTreeNode()}, fsdevs),
 		RecordTime: func(name string, duration time.Duration) {
 			timing.Record(ctx, "hvf.prepare_boot."+name, duration)
@@ -1223,6 +1227,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	stallSamples := 0
 	var lastSamplePC uint64
 	var lastSampleCPSR uint64
+	var pendingResult *ContainerRunResult
 	includeTraceOnExit := os.Getenv("CCX3_DEBUG_VIRTIOFS") != ""
 	for {
 		exitInfo, err, stalled := runWithCancel(ctx, vm, 5*time.Second)
@@ -1244,7 +1249,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 			return ContainerRunResult{}, fmt.Errorf("%w\nrun:\n%sserial:\n%s\nvirtio-fs:\n%s", err, runTrace.String(), serialOut.String(), fsTrace.String())
 		}
 
-		transcript := serialOut.String()
+		transcript := commandTranscript(req.Dmesg, &serialOut, &consoleOut)
 		if !readySent && strings.Contains(transcript, commandBeginMarker) {
 			readySent = true
 			if readyCh != nil {
@@ -1253,15 +1258,24 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 				readyCh = nil
 			}
 		}
-		if exitCode, output, ok := extractCommandResult(transcript, req.Dmesg); ok {
+		if pendingResult == nil {
+			if exitCode, output, ok := extractCommandResult(transcript, req.Dmesg); ok {
+				resultTranscript := transcript
+				if includeTraceOnExit {
+					resultTranscript = resultTranscript + "\n[virtio-fs trace]\n" + fsTrace.String()
+				}
+				pendingResult = &ContainerRunResult{
+					ExitCode:   exitCode,
+					Output:     output,
+					Transcript: resultTranscript,
+				}
+			}
+		}
+		if pendingResult != nil && ctx.Err() != nil {
 			if includeTraceOnExit {
 				transcript = transcript + "\n[virtio-fs trace]\n" + fsTrace.String()
 			}
-			return ContainerRunResult{
-				ExitCode:   exitCode,
-				Output:     output,
-				Transcript: transcript,
-			}, nil
+			return *pendingResult, nil
 		}
 
 		if exitInfo == nil {
@@ -1299,18 +1313,10 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 				return ContainerRunResult{}, err
 			}
 			if halt {
-				if exitCode, output, ok := extractCommandResult(serialOut.String(), req.Dmesg); ok {
-					transcript := serialOut.String()
-					if includeTraceOnExit {
-						transcript = transcript + "\n[virtio-fs trace]\n" + fsTrace.String()
-					}
-					return ContainerRunResult{
-						ExitCode:   exitCode,
-						Output:     output,
-						Transcript: transcript,
-					}, nil
+				if pendingResult != nil {
+					return *pendingResult, nil
 				}
-				return ContainerRunResult{}, fmt.Errorf("guest halted before command completed\nserial:\n%s\nvirtio-fs:\n%s", serialOut.String(), fsTrace.String())
+				return ContainerRunResult{}, fmt.Errorf("guest halted before command completed\nserial:\n%s\nconsole:\n%s\nvirtio-fs:\n%s", serialOut.String(), consoleOut.String(), fsTrace.String())
 			}
 		default:
 			pc, _ := vm.GetProgramCounter()
@@ -1665,6 +1671,13 @@ func injectVirtualTimerPPI(vm *VM) error {
 	return vm.SetGICRedistributorReg(gicrISPENDR0, timerMask)
 }
 
+func commandTranscript(dmesg bool, serialOut, consoleOut fmt.Stringer) string {
+	if dmesg || serialOut.String() != "" {
+		return serialOut.String()
+	}
+	return consoleOut.String()
+}
+
 func extractCommandResult(serial string, dmesg bool) (int, string, bool) {
 	begin := strings.Index(serial, strings.TrimSuffix(commandBeginMarker, ":"))
 	exit := strings.Index(serial, commandExitMarkerPref)
@@ -1801,7 +1814,7 @@ func cleanCommandOutput(output string) string {
 			}
 		}
 		line = strings.TrimSpace(lines[i])
-		if line == "" || line == commandBeginMarker || strings.HasPrefix(line, commandExitMarkerPref) {
+		if line == "" || line == commandBeginMarker || strings.HasPrefix(line, commandExitMarkerPref) || strings.HasPrefix(line, "ccx3-init:") || strings.HasPrefix(line, "reboot:") {
 			continue
 		}
 		if line == last {

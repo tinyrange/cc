@@ -238,14 +238,15 @@ func load() error {
 }
 
 type VM struct {
-	vcpu     VCPU
-	exitInfo *VcpuExit
-	mappings []mapping
-	threadCh chan func()
-	dit      bool
-	mdscrEL1 uint64
-	osdlrEL1 uint64
-	osLock   bool
+	vcpu        VCPU
+	vcpuCreated bool
+	exitInfo    *VcpuExit
+	mappings    []mapping
+	threadCh    chan func()
+	dit         bool
+	mdscrEL1    uint64
+	osdlrEL1    uint64
+	osLock      bool
 }
 
 type mapping struct {
@@ -311,6 +312,7 @@ func NewVMWithContext(ctx context.Context) (*VM, error) {
 		osRelease(uintptr(vcpuCfg))
 
 		v.vcpu = id
+		v.vcpuCreated = true
 		v.exitInfo = exitInfo
 		if ret := hvVcpuSetSysReg(v.vcpu, hvSysRegMPIDR_EL1, uint64(v.vcpu)); ret != hvSuccess {
 			_ = hvVcpuDestroy(v.vcpu)
@@ -355,6 +357,21 @@ func createVMWithRetry(cfg VMConfig) Return {
 	)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		ret := hvVMCreate(cfg)
+		if ret != hvBusy {
+			return ret
+		}
+		time.Sleep(retryDelay)
+	}
+	return hvBusy
+}
+
+func destroyVMWithRetry() Return {
+	const (
+		maxAttempts = 400
+		retryDelay  = 50 * time.Millisecond
+	)
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		ret := hvVMDestroy()
 		if ret != hvBusy {
 			return ret
 		}
@@ -780,7 +797,7 @@ func (v *VM) threadMain() {
 func (v *VM) Close() error {
 	var firstErr error
 	defer vmLifecycleMu.Unlock()
-	if v.vcpu != 0 {
+	if v.vcpuCreated {
 		errCh := make(chan error, 1)
 		v.threadCh <- func() {
 			if ret := hvVcpuDestroy(v.vcpu); ret != hvSuccess {
@@ -792,6 +809,7 @@ func (v *VM) Close() error {
 		if err := <-errCh; err != nil && firstErr == nil {
 			firstErr = err
 		}
+		v.vcpuCreated = false
 		v.vcpu = 0
 	}
 	for _, m := range v.mappings {
@@ -816,7 +834,7 @@ func (v *VM) Close() error {
 	v.mappings = nil
 	errCh := make(chan error, 1)
 	v.threadCh <- func() {
-		if ret := hvVMDestroy(); ret != hvSuccess {
+		if ret := destroyVMWithRetry(); ret != hvSuccess {
 			errCh <- fmt.Errorf("destroy vm: %w", ret)
 			return
 		}

@@ -711,7 +711,9 @@ func execCommand(cfg config) error {
 		return fmt.Errorf("run %s: %w", cfg.Command[0], err)
 	}
 	if cfg.ExitMarkerPrefix != "" {
-		writeKernel(cfg.ExitMarkerPrefix + itoa(exitCode))
+		exitMarker := cfg.ExitMarkerPrefix + itoa(exitCode)
+		writeKernel(exitMarker)
+		writeProtocolLine(exitMarker)
 	}
 	syscall.Sync()
 	_ = syscall.Reboot(syscall.LINUX_REBOOT_CMD_POWER_OFF)

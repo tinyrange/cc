@@ -52,6 +52,25 @@ func TestExtractManagedExecResultIgnoresOtherExecTraffic(t *testing.T) {
 	}
 }
 
+func TestExtractCommandResultFromConsoleExitMarker(t *testing.T) {
+	serial := "" +
+		"[    0.100000] " + commandBeginMarker + "\n" +
+		"hello\n" +
+		"[    0.200000] " + commandExitMarkerPref + "0\n" +
+		"reboot: Power down\n"
+
+	exitCode, output, ok := extractCommandResult(serial, false)
+	if !ok {
+		t.Fatal("extractCommandResult(...) = not ready, want result")
+	}
+	if exitCode != 0 {
+		t.Fatalf("exitCode = %d, want 0", exitCode)
+	}
+	if output != "hello" {
+		t.Fatalf("output = %q, want %q", output, "hello")
+	}
+}
+
 func TestContainerSessionExecAllowsConcurrentCommands(t *testing.T) {
 	rootfs := t.TempDir()
 	for _, name := range []string{"one", "two"} {
