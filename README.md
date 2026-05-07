@@ -71,8 +71,8 @@ go build -o "$tmp/ccvm" ./cmd/ccvm
 next to each other, pass the daemon path explicitly:
 
 ```sh
-cc -ccvm ./ccvm kernel-download
-cc -ccvm ./ccvm vm-supported
+cc -ccvm ./ccvm doctor
+cc -ccvm ./ccvm status
 ```
 
 The daemon also exposes a capability summary at `GET /capabilities`, including
@@ -83,14 +83,14 @@ VM boot waits default to 5 seconds. Set `CCX3_VM_BOOT_TIMEOUT` to a positive
 number of seconds when running on slower hosts or diagnosing long boots.
 
 Long-running CLI operations use the daemon's streaming endpoints. Human progress
-for `kernel-download`, `pull`, and `vm-start` is written to stderr when stderr is
-a terminal; stdout remains reserved for command output and JSON responses.
+for `doctor`, `pull`, and `start` is written to stderr when stderr is a terminal;
+stdout remains reserved for command output and JSON responses.
 
 Run the small tracked Alpine bringup SIMG:
 
 ```sh
 cc -ccvm ./ccvm pull alpine ./fixtures/alpine.simg
-cc -ccvm ./ccvm run alpine sh -lc 'cat /etc/alpine-release'
+cc -ccvm ./ccvm run alpine -- sh -lc 'cat /etc/alpine-release'
 ```
 
 Run directly from Neurodesk CVMFS:
@@ -99,15 +99,15 @@ Run directly from Neurodesk CVMFS:
 cc -ccvm ./ccvm pull niimath-cvmfs \
   https://cvmfs.neurodesk.org/cvmfs/neurodesk.ardc.edu.au/containers/niimath_1.0.20250804_20251016
 
-cc -ccvm ./ccvm run niimath-cvmfs niimath -help
+cc -ccvm ./ccvm run niimath-cvmfs -- niimath -help
 ```
 
 Persistent VM flow:
 
 ```sh
-cc -ccvm ./ccvm vm-start niimath-cvmfs
-cc -ccvm ./ccvm run niimath-cvmfs niimath -help
-cc -ccvm ./ccvm vm-stop
+cc -ccvm ./ccvm start niimath-cvmfs
+cc -ccvm ./ccvm run niimath-cvmfs -- niimath -help
+cc -ccvm ./ccvm stop
 ```
 
 The HTTP API supports named instances through an optional `id` field on VM and
