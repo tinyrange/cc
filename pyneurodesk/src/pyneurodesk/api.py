@@ -31,7 +31,7 @@ from .models import (
     ShareMount,
 )
 
-DEFAULT_CVMFS_MIRROR = "https://cvmfs.neurodesk.org"
+DEFAULT_CVMFS_MIRROR = "http://cvmfs.neurodesk.org"
 DEFAULT_CVMFS_REPO = "neurodesk.ardc.edu.au"
 DEFAULT_CONTAINERS_PATH = "/containers"
 DEFAULT_RELEASES_API = "https://api.github.com/repos/NeuroDesk/neurocontainers/contents/releases"

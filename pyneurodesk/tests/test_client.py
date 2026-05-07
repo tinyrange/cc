@@ -73,7 +73,7 @@ def test_import_cvmfs_container_posts_structured_source_payload() -> None:
     try:
         result = client.import_cvmfs_container(
             "niimath",
-            mirror="https://cvmfs.neurodesk.org",
+            mirror="http://cvmfs.neurodesk.org",
             repo="neurodesk.ardc.edu.au",
             path="/containers/niimath_1.0.20250804_20251016",
         )
@@ -83,7 +83,7 @@ def test_import_cvmfs_container_posts_structured_source_payload() -> None:
     assert seen["method"] == "POST"
     assert seen["path"] == "/image/niimath"
     assert seen["json"] == (
-        '{"source":{"type":"cvmfs","mirror":"https://cvmfs.neurodesk.org",'
+        '{"source":{"type":"cvmfs","mirror":"http://cvmfs.neurodesk.org",'
         '"repo":"neurodesk.ardc.edu.au","path":"/containers/niimath_1.0.20250804_20251016"}}'
     )
     assert result.name == "niimath"
@@ -93,7 +93,7 @@ def test_import_cvmfs_container_posts_structured_source_payload() -> None:
 
 def test_import_image_request_from_cvmfs_container_serializes_expected_shape() -> None:
     request = ImportImageRequest.from_cvmfs_container(
-        mirror="https://cvmfs.neurodesk.org",
+        mirror="http://cvmfs.neurodesk.org",
         repo="neurodesk.ardc.edu.au",
         path="/containers/niimath_1.0.20250804_20251016",
         cache_dir="/tmp/cvmfs-cache",
@@ -102,7 +102,7 @@ def test_import_image_request_from_cvmfs_container_serializes_expected_shape() -
     assert request.to_payload() == {
         "source": {
             "type": "cvmfs",
-            "mirror": "https://cvmfs.neurodesk.org",
+            "mirror": "http://cvmfs.neurodesk.org",
             "repo": "neurodesk.ardc.edu.au",
             "path": "/containers/niimath_1.0.20250804_20251016",
         },
@@ -139,7 +139,7 @@ def test_cvmfs_list_posts_source_and_parses_entries() -> None:
     try:
         result = client.cvmfs_list(
             CVMFSSource(
-                mirror="https://cvmfs.neurodesk.org",
+                mirror="http://cvmfs.neurodesk.org",
                 repo="neurodesk.ardc.edu.au",
                 path="/containers",
                 cache_dir="/tmp/cvmfs-cache",
@@ -150,7 +150,7 @@ def test_cvmfs_list_posts_source_and_parses_entries() -> None:
 
     assert seen["path"] == "/cvmfs/list"
     assert seen["json"] == (
-        '{"mirror":"https://cvmfs.neurodesk.org","repo":"neurodesk.ardc.edu.au",'
+        '{"mirror":"http://cvmfs.neurodesk.org","repo":"neurodesk.ardc.edu.au",'
         '"path":"/containers","cache_dir":"/tmp/cvmfs-cache"}'
     )
     assert len(result.entries) == 2
@@ -178,7 +178,7 @@ def test_cvmfs_read_posts_offset_and_length() -> None:
     try:
         result = client.cvmfs_read(
             CVMFSReadRequest(
-                mirror="https://cvmfs.neurodesk.org",
+                mirror="http://cvmfs.neurodesk.org",
                 repo="neurodesk.ardc.edu.au",
                 path="/containers/niimath/niimath.simg",
                 offset=4096,
@@ -191,7 +191,7 @@ def test_cvmfs_read_posts_offset_and_length() -> None:
 
     assert seen["path"] == "/cvmfs/read"
     assert seen["json"] == (
-        '{"mirror":"https://cvmfs.neurodesk.org","repo":"neurodesk.ardc.edu.au",'
+        '{"mirror":"http://cvmfs.neurodesk.org","repo":"neurodesk.ardc.edu.au",'
         '"path":"/containers/niimath/niimath.simg","offset":4096,"length":8192,'
         '"cache_dir":"/tmp/cvmfs-cache"}'
     )
@@ -608,7 +608,7 @@ def test_non_object_json_response_raises_type_error() -> None:
         try:
             client.cvmfs_list(
                 CVMFSSource(
-                    mirror="https://cvmfs.neurodesk.org",
+                    mirror="http://cvmfs.neurodesk.org",
                     repo="neurodesk.ardc.edu.au",
                     path="/containers",
                 )
@@ -1857,7 +1857,7 @@ def test_import_image_stream_parses_progress_events() -> None:
             client.import_image_stream(
                 "niimath",
                 ImportImageRequest.from_cvmfs_container(
-                    mirror="https://cvmfs.neurodesk.org",
+                    mirror="http://cvmfs.neurodesk.org",
                     repo="neurodesk.ardc.edu.au",
                     path="/containers/niimath_1.0.20250804_20251016",
                     prefetch=True,

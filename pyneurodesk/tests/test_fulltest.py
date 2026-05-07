@@ -203,7 +203,7 @@ def test_build_container_reference_defaults_to_cvmfs_directory() -> None:
         suite,
         image_name="niimath",
         image_source="",
-        mirror="https://cvmfs.neurodesk.org",
+        mirror="http://cvmfs.neurodesk.org",
         repo="neurodesk.ardc.edu.au",
         cache_dir="/tmp/cvmfs-cache",
     )
@@ -226,7 +226,7 @@ def test_cvmfs_path_from_source_supports_cvmfs_uri() -> None:
 def test_cvmfs_path_from_source_supports_http_mount_path() -> None:
     assert (
         cvmfs_path_from_source(
-            "https://cvmfs.neurodesk.org/cvmfs/neurodesk.ardc.edu.au/containers/niimath_1.0.20250804_20251016"
+            "http://cvmfs.neurodesk.org/cvmfs/neurodesk.ardc.edu.au/containers/niimath_1.0.20250804_20251016"
         )
         == "/containers/niimath_1.0.20250804_20251016"
     )
