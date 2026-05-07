@@ -39,7 +39,7 @@ func run() error {
 	}
 	args := fs.Args()
 	if len(args) == 0 {
-		return fmt.Errorf("usage: cc [flags] <command>\ncommands: daemon-stop, kernel-status, kernel-download, image-list, image-get <name>, pull <name> <source>, vm-supported, vm-status, vm-start <image>, vm-stop, run <image> <cmd...>")
+		return fmt.Errorf("usage: cc [flags] <command>\ncommands: doctor, images [name], pull <name> <source>, start <image>, stop, status, run <image> -- <cmd...>")
 	}
 
 	rootCache, err := resolveCacheDir(*cacheDir)
@@ -53,59 +53,49 @@ func run() error {
 		return err
 	}
 
-	if args[0] == "daemon-stop" {
-		return stopDaemon(statePath)
-	}
-
 	api, err := connectBackend(ccvmBinary, rootCache, statePath)
 	if err != nil {
 		return err
 	}
 
 	switch args[0] {
-	case "kernel-status":
-		state, err := api.KernelStatus()
-		if err != nil {
+	case "doctor":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: cc doctor")
+		}
+		if err := api.DownloadKernelStream(client.DownloadRequest{}, progressEventReporter(os.Stderr, "kernel")); err != nil {
 			return err
 		}
-		return printJSON(state)
-	case "kernel-download":
-		return api.DownloadKernelStream(client.DownloadRequest{}, progressEventReporter(os.Stderr, "kernel"))
-	case "image-list":
-		images, err := api.ListImages()
-		if err != nil {
-			return err
-		}
-		return printJSON(images)
-	case "image-get":
-		if len(args) != 2 {
-			return fmt.Errorf("usage: cc image-get <name>")
-		}
-		image, err := api.GetImage(args[1])
-		if err != nil {
-			return err
-		}
-		return printJSON(image)
-	case "pull":
-		if len(args) != 3 {
-			return fmt.Errorf("usage: cc pull <name> <source>")
-		}
-		return api.PullImageStream(args[1], client.PullImageRequest{Source: args[2]}, progressEventReporter(os.Stderr, args[1]))
-	case "vm-supported":
 		supported, err := api.VMSupported()
 		if err != nil {
 			return err
 		}
 		return printJSON(supported)
-	case "vm-status":
-		state, err := api.InstanceStatus()
-		if err != nil {
-			return err
+	case "images":
+		switch len(args) {
+		case 1:
+			images, err := api.ListImages()
+			if err != nil {
+				return err
+			}
+			return printJSON(images)
+		case 2:
+			image, err := api.GetImage(args[1])
+			if err != nil {
+				return err
+			}
+			return printJSON(image)
+		default:
+			return fmt.Errorf("usage: cc images [name]")
 		}
-		return printJSON(state)
-	case "vm-start":
+	case "pull":
+		if len(args) != 3 {
+			return fmt.Errorf("usage: cc pull <name> <source>")
+		}
+		return api.PullImageStream(args[1], client.PullImageRequest{Source: args[2]}, progressEventReporter(os.Stderr, args[1]))
+	case "start":
 		if len(args) != 2 {
-			return fmt.Errorf("usage: cc vm-start <image>")
+			return fmt.Errorf("usage: cc start <image>")
 		}
 		state, err := api.CreateInstanceStream(client.CreateInstanceRequest{
 			Image: args[1],
@@ -114,13 +104,37 @@ func run() error {
 			return err
 		}
 		return printJSON(state)
-	case "vm-stop":
-		return api.ShutdownInstance()
-	case "run":
-		if len(args) < 3 {
-			return fmt.Errorf("usage: cc run <image> <cmd...>")
+	case "stop":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: cc stop")
 		}
-		return runViaWebsocket(api, args[1], args[2:])
+		return api.ShutdownInstance()
+	case "status":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: cc status")
+		}
+		kernel, err := api.KernelStatus()
+		if err != nil {
+			return err
+		}
+		supported, err := api.VMSupported()
+		if err != nil {
+			return err
+		}
+		vm, err := api.InstanceStatus()
+		if err != nil {
+			return err
+		}
+		return printJSON(map[string]any{
+			"kernel":       kernel,
+			"vm_supported": supported,
+			"vm":           vm,
+		})
+	case "run":
+		if len(args) < 4 || args[2] != "--" {
+			return fmt.Errorf("usage: cc run <image> -- <cmd...>")
+		}
+		return runViaWebsocket(api, args[1], args[3:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
