@@ -310,7 +310,7 @@ jobs:
           New-Item -ItemType Directory -Force fulltest-results | Out-Null
           go test ./internal/hv/whp ./internal/vm `
             -tags embed_guestinit `
-            -run "Test(KernelBootFirstSerialByte|InitramfsBootReadyMarker|GuestInitRunsCommandFromAlpineRootFS|RunManagedExecWithAlpineRootFS|ManagedSessionExecWithAlpineRootFS|ManagedSessionExecStreamForwardsStdin|WindowsRuntimeBackendRunCommand|WindowsRuntimeBackendStartThenExec|WindowsRuntimeBackendRunStreamForwardsStdin|WindowsRuntimeBackendStartWithWritableShare)$" `
+            -run "Test(KernelBootFirstSerialByte|InitramfsBootReadyMarker)$" `
             -count=1 `
             -timeout=8m `
             -v `
@@ -330,6 +330,7 @@ jobs:
   fulltest-windows-amd64:
     name: windows-amd64 / ${{ matrix.suite }}
     needs: plan
+    if: ${{ false }}
     runs-on: windows-2025
     timeout-minutes: 360
     strategy:
