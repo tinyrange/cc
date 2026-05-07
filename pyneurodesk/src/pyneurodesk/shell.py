@@ -23,11 +23,14 @@ from typing import Optional
 import httpx
 
 from .api import (
+    DEFAULT_CVMFS_MIRROR,
+    DEFAULT_CVMFS_REPO,
     _ensure_daemon_watchdog,
     connect,
     container,
     default_cache_root,
     load_deploy_metadata,
+    resolve_container_reference,
     runtime_deploy_env_entries,
     start_daemon_for_cache_dir,
     start_default_daemon,
@@ -201,7 +204,7 @@ def handle_neurodesktop(args: argparse.Namespace) -> int:
     image = str(args.image or "neurodesktop").strip()
     if not image:
         raise SystemExit("image name is required")
-    image_path = resolve_neurodesktop_image_path(str(args.image_path or ""))
+    image_path = str(args.image_path or "").strip()
     host = str(args.host or "127.0.0.1").strip() or "127.0.0.1"
     host_port = int(args.port or 0)
     if host_port == 0:
@@ -221,9 +224,22 @@ def handle_neurodesktop(args: argparse.Namespace) -> int:
     log_path = neurodesktop_log_path(Path(daemon.cache_dir))
     try:
         if client.get_image(image) is None:
+            if image_path:
+                reference = ContainerReference(
+                    name=image,
+                    image=image,
+                    source=ImageSource(type="simg", path=str(resolve_neurodesktop_image_path(image_path))),
+                )
+            else:
+                reference = resolve_container_reference(
+                    client,
+                    image,
+                    mirror=DEFAULT_CVMFS_MIRROR,
+                    repo=DEFAULT_CVMFS_REPO,
+                )
             client.import_image(
                 image,
-                ImportImageRequest(source=ImageSource(type="simg", path=str(image_path))),
+                ImportImageRequest(source=reference.source, cache_dir=reference.cache_dir),
             )
         client.download_kernel()
         client.prepare_image_emulator(image)
@@ -271,16 +287,9 @@ def handle_neurodesktop(args: argparse.Namespace) -> int:
 
 
 def resolve_neurodesktop_image_path(raw: str) -> Path:
-    candidates: list[Path] = []
-    if raw.strip():
-        candidates.append(Path(raw).expanduser())
-    else:
-        candidates.extend(
-            [
-                Path.cwd() / "local" / "neurodesktop_20260428.sif",
-                Path(__file__).resolve().parents[3] / "local" / "neurodesktop_20260428.sif",
-            ]
-        )
+    if not raw.strip():
+        raise SystemExit("neurodesktop image path is required")
+    candidates = [Path(raw).expanduser()]
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -307,6 +316,7 @@ def start_neurodesktop_jupyter_process(base_url: str, *, image: str, log_path: P
         sys.executable,
         "-c",
         "from pyneurodesk.shell import main; raise SystemExit(main())",
+        "pyneurodesk",
         "shell",
         "neurodesktop-server",
         "--base-url",

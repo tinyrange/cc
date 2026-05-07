@@ -597,6 +597,82 @@ def test_neurodesktop_starts_vm_with_network_and_jupyter_forward(
     assert "jupyter pid: 99" in output
 
 
+def test_neurodesktop_defaults_to_cvmfs_source(monkeypatch, tmp_path: Path) -> None:
+    calls: list[tuple[str, object]] = []
+
+    class FakeClient:
+        def get_image(self, image: str) -> object:
+            calls.append(("get_image", image))
+            return None
+
+        def import_image(self, image: str, request: object) -> object:
+            calls.append(("import_image", (image, request)))
+            return SimpleNamespace(name=image)
+
+        def download_kernel(self) -> object:
+            calls.append(("download_kernel", None))
+            return SimpleNamespace(status="available")
+
+        def prepare_image_emulator(self, image: str) -> object:
+            calls.append(("prepare_emulator", image))
+            return SimpleNamespace(status="available")
+
+        def prepare_image_metadata(self, image: str) -> object:
+            calls.append(("prepare_metadata", image))
+            return SimpleNamespace(status="available")
+
+        def ensure_instance(self, image: str, **kwargs: object) -> object:
+            calls.append(("ensure_instance", (image, kwargs)))
+            return SimpleNamespace(status="running", image=image)
+
+        def add_port_forward(self, forward: object) -> object:
+            calls.append(("forward", forward))
+            return forward
+
+        def close(self) -> None:
+            calls.append(("close", None))
+
+    monkeypatch.setattr(
+        "pyneurodesk.shell.start_default_daemon",
+        lambda: SimpleNamespace(base_url="http://127.0.0.1:1234", cache_dir=str(tmp_path / "cache")),
+    )
+    monkeypatch.setattr("pyneurodesk.shell.connect", lambda base_url=None: FakeClient())
+    monkeypatch.setattr("pyneurodesk.shell.reserve_tcp_port", lambda host: 4567)
+    monkeypatch.setattr("pyneurodesk.shell.wait_for_jupyter", lambda url, timeout_seconds: True)
+    monkeypatch.setattr(
+        "pyneurodesk.shell.start_neurodesktop_jupyter_process",
+        lambda base_url, image, log_path: SimpleNamespace(pid=99),
+    )
+    monkeypatch.setattr(
+        "pyneurodesk.shell.resolve_container_reference",
+        lambda client, name, mirror, repo: ContainerReference(
+            name=name,
+            image=name,
+            source=ImageSource(
+                type="cvmfs",
+                mirror=mirror,
+                repo=repo,
+                path="/containers/neurodesktop_20260428/neurodesktop_20260428.simg",
+            ),
+        ),
+    )
+
+    assert shell.main(["neurodesktop", "--startup-timeout", "1"]) == 0
+
+    import_call = next(value for name, value in calls if name == "import_image")
+    assert import_call[0] == "neurodesktop"
+    request = import_call[1]
+    assert request.source.type == "cvmfs"
+    assert request.source.path == "/containers/neurodesktop_20260428/neurodesktop_20260428.simg"
+
+
+def test_resolve_neurodesktop_image_path_uses_explicit_local_image(tmp_path: Path) -> None:
+    image_path = tmp_path / "neurodesktop.sif"
+    image_path.write_bytes(b"sif")
+
+    assert shell.resolve_neurodesktop_image_path(str(image_path)) == image_path
+
+
 def test_shell_exec_passes_user_override(monkeypatch) -> None:
     calls: list[tuple[str, object]] = []
 
@@ -615,6 +691,41 @@ def test_shell_exec_passes_user_override(monkeypatch) -> None:
 
     assert shell.main(["shell", "exec", "--user", "root", "neurodesktop", "--", "id"]) == 7
     assert calls == [("run", ("neurodesktop", "id", [], None, "root"))]
+
+
+def test_neurodesktop_jupyter_process_preserves_shell_subcommand(monkeypatch, tmp_path: Path) -> None:
+    seen: dict[str, object] = {}
+
+    class FakePopen:
+        pid = 123
+
+    def fake_popen(cmd: list[str], **kwargs: object) -> FakePopen:
+        seen["cmd"] = cmd
+        seen["kwargs"] = kwargs
+        return FakePopen()
+
+    monkeypatch.setattr("pyneurodesk.shell.subprocess.Popen", fake_popen)
+
+    proc = shell.start_neurodesktop_jupyter_process(
+        "http://127.0.0.1:1234",
+        image="neurodesktop",
+        log_path=tmp_path / "jupyter.log",
+    )
+
+    assert proc.pid == 123
+    cmd = seen["cmd"]
+    assert cmd[0] == shell.sys.executable
+    assert cmd[1] == "-c"
+    assert cmd[3:5] == ["pyneurodesk", "shell"]
+    assert cmd[5:] == [
+        "neurodesktop-server",
+        "--base-url",
+        "http://127.0.0.1:1234",
+        "--image",
+        "neurodesktop",
+        "--log",
+        str(tmp_path / "jupyter.log"),
+    ]
 
 
 def test_run_wrapper_invokes_container_command(
