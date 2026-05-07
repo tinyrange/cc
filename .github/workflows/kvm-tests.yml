@@ -25,6 +25,13 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v6
 
+      - name: Print runner CPU
+        run: |
+          set -euxo pipefail
+          uname -a
+          lscpu
+          grep -m1 -E 'vendor_id|model name' /proc/cpuinfo
+
       - name: Enable runner access to /dev/kvm
         run: |
           set -euxo pipefail
