@@ -119,7 +119,10 @@ def build_parser() -> argparse.ArgumentParser:
     neurodesktop_parser.set_defaults(handler=handle_neurodesktop)
 
     shell_parser = subparsers.add_parser("shell", help="Shell session commands")
-    shell_subparsers = shell_parser.add_subparsers(dest="shell_command")
+    shell_subparsers = shell_parser.add_subparsers(
+        dest="shell_command",
+        metavar="{load,unload,list,forward,exec,completion}",
+    )
 
     load_parser = shell_subparsers.add_parser("load", help="Load an image into the current shell session")
     load_parser.add_argument("image")
@@ -159,27 +162,33 @@ def build_parser() -> argparse.ArgumentParser:
     shell_completion_parser.add_argument("--shell", choices=("bash", "zsh", "powershell", "pwsh"), required=True)
     shell_completion_parser.set_defaults(handler=handle_completion)
 
-    bootstrap_parser = shell_subparsers.add_parser("bootstrap", help=argparse.SUPPRESS)
+    bootstrap_parser = add_hidden_subparser(shell_subparsers, "bootstrap")
     bootstrap_parser.set_defaults(handler=handle_bootstrap)
 
-    neurodesktop_server_parser = shell_subparsers.add_parser("neurodesktop-server", help=argparse.SUPPRESS)
+    neurodesktop_server_parser = add_hidden_subparser(shell_subparsers, "neurodesktop-server")
     neurodesktop_server_parser.add_argument("--base-url", required=True)
     neurodesktop_server_parser.add_argument("--image", required=True)
     neurodesktop_server_parser.add_argument("--log", required=True)
     neurodesktop_server_parser.set_defaults(handler=handle_neurodesktop_server)
 
-    complete_parser = shell_subparsers.add_parser("complete", help=argparse.SUPPRESS)
+    complete_parser = add_hidden_subparser(shell_subparsers, "complete")
     complete_parser.add_argument("--index", type=int, required=True)
     complete_parser.add_argument("words", nargs=argparse.REMAINDER)
     complete_parser.set_defaults(handler=handle_complete)
 
-    wrapper_parser = shell_subparsers.add_parser("run-wrapper", help=argparse.SUPPRESS)
+    wrapper_parser = add_hidden_subparser(shell_subparsers, "run-wrapper")
     wrapper_parser.add_argument("--session", required=True)
     wrapper_parser.add_argument("--image", required=True)
     wrapper_parser.add_argument("--command", required=True)
     wrapper_parser.add_argument("args", nargs=argparse.REMAINDER)
     wrapper_parser.set_defaults(handler=handle_run_wrapper)
 
+    return parser
+
+
+def add_hidden_subparser(subparsers: argparse._SubParsersAction, name: str) -> argparse.ArgumentParser:
+    parser = subparsers.add_parser(name, help=argparse.SUPPRESS)
+    subparsers._choices_actions = [action for action in subparsers._choices_actions if action.dest != name]
     return parser
 
 
