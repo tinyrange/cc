@@ -233,6 +233,7 @@ func runManagedExecVM(ctx context.Context, vm *VM, platform *bootPlatform, seria
 		default:
 			return fmt.Errorf("unexpected exit %s at rip=%#x\nserial:\n%s\n%s", exit.Reason, exit.RIP, serialOut.String(), platform.Summary())
 		}
+		platform.ReassertIRQs()
 	}
 }
 
