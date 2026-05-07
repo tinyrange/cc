@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -195,7 +194,6 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 		default:
 			return out.String(), fmt.Errorf("unexpected exit %s at rip=%#x", exit.Reason, exit.RIP)
 		}
-		platform.ReassertIRQs()
 	}
 }
 
@@ -227,9 +225,6 @@ type bootPlatform struct {
 	irqFailed     uint64
 	irqSuppressed uint64
 	irqLine       [16]uint64
-	irqMu         sync.Mutex
-	irqAsserted   [16]bool
-	lastReassert  time.Time
 }
 
 func newBootPlatform(vm *VM, uart *serial.UART8250) *bootPlatform {
@@ -379,16 +374,11 @@ func (p *bootPlatform) WriteMMIO(addr uint64, data []byte) error {
 }
 
 func (p *bootPlatform) SetIRQ(irq uint32, level bool) error {
-	if irq > 0xff {
-		return fmt.Errorf("irq line %d out of range", irq)
-	}
-	if irq < uint32(len(p.irqAsserted)) {
-		p.irqMu.Lock()
-		p.irqAsserted[irq] = level
-		p.irqMu.Unlock()
-	}
 	if !level {
 		return nil
+	}
+	if irq > 0xff {
+		return fmt.Errorf("irq line %d out of range", irq)
 	}
 	p.raiseIRQ(uint8(irq))
 	return nil
@@ -447,29 +437,6 @@ func (p *bootPlatform) raiseIRQ(line uint8) {
 
 func (p *bootPlatform) HandleEOI(vector uint32) {
 	p.ioapic.endInterrupt(uint8(vector))
-}
-
-func (p *bootPlatform) ReassertIRQs() {
-	if p == nil {
-		return
-	}
-	now := time.Now()
-	p.irqMu.Lock()
-	if !p.lastReassert.IsZero() && now.Sub(p.lastReassert) < 2*time.Millisecond {
-		p.irqMu.Unlock()
-		return
-	}
-	p.lastReassert = now
-	var lines []uint8
-	for line, asserted := range p.irqAsserted {
-		if asserted {
-			lines = append(lines, uint8(line))
-		}
-	}
-	p.irqMu.Unlock()
-	for _, line := range lines {
-		p.raiseIRQ(line)
-	}
 }
 
 func (p *bootPlatform) Summary() string {
