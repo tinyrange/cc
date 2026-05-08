@@ -115,6 +115,18 @@ def test_completion_emits_powershell_support(capsys: pytest.CaptureFixture[str])
     assert "CompletionResult" in output
 
 
+def test_shell_help_hides_internal_commands(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc:
+        shell.main(["shell", "--help"])
+
+    assert exc.value.code == 0
+    output = capsys.readouterr().out
+    for command in ("load", "unload", "list", "forward", "exec", "completion"):
+        assert command in output
+    for command in ("bootstrap", "neurodesktop-server", "complete", "run-wrapper", "==SUPPRESS=="):
+        assert command not in output
+
+
 def test_activate_defaults_to_powershell_on_windows(
     monkeypatch,
     tmp_path: Path,

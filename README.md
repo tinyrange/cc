@@ -97,7 +97,7 @@ Run directly from Neurodesk CVMFS:
 
 ```sh
 cc -ccvm ./ccvm pull niimath-cvmfs \
-  https://cvmfs.neurodesk.org/cvmfs/neurodesk.ardc.edu.au/containers/niimath_1.0.20250804_20251016
+  http://cvmfs.neurodesk.org/cvmfs/neurodesk.ardc.edu.au/containers/niimath_1.0.20250804_20251016
 
 cc -ccvm ./ccvm run niimath-cvmfs -- niimath -help
 ```

@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"j5.nz/cc/internal/amd64vm"
 	"j5.nz/cc/internal/guestinit"
@@ -26,7 +25,7 @@ func TestGuestInitRunsCommandFromAlpineRootFS(t *testing.T) {
 		t.Skipf("local alpine fixture unavailable: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), whpBootTestTimeout(t))
 	defer cancel()
 
 	root := t.TempDir()

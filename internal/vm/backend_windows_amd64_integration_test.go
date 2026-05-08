@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/kernel/alpine"
@@ -20,7 +19,7 @@ func TestWindowsRuntimeBackendRunCommand(t *testing.T) {
 		t.Skip("set CCX3_WHP_BOOT=1 to run the windows amd64 WHP boot probe")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), windowsBootTestTimeout(t))
 	defer cancel()
 	backend := newWindowsRuntimeBackendForTest(t, ctx)
 
@@ -45,7 +44,7 @@ func TestWindowsRuntimeBackendStartThenExec(t *testing.T) {
 		t.Skip("set CCX3_WHP_BOOT=1 to run the windows amd64 WHP boot probe")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), windowsBootTestTimeout(t))
 	defer cancel()
 	backend := newWindowsRuntimeBackendForTest(t, ctx)
 	mgr := NewManagerWithBackend(backend)
@@ -82,7 +81,7 @@ func TestWindowsRuntimeBackendRunStreamForwardsStdin(t *testing.T) {
 		t.Skip("set CCX3_WHP_BOOT=1 to run the windows amd64 WHP boot probe")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), windowsBootTestTimeout(t))
 	defer cancel()
 	backend := newWindowsRuntimeBackendForTest(t, ctx)
 	mgr := NewManagerWithBackend(backend)
@@ -140,7 +139,7 @@ func TestWindowsRuntimeBackendStartWithWritableShare(t *testing.T) {
 		t.Skip("set CCX3_WHP_BOOT=1 to run the windows amd64 WHP boot probe")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), windowsBootTestTimeout(t))
 	defer cancel()
 	root := t.TempDir()
 	shareDir := filepath.Join(root, "share")

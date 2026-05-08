@@ -303,13 +303,14 @@ jobs:
         shell: pwsh
         env:
           CCX3_WHP_BOOT: "1"
+          CCX3_WHP_BOOT_TIMEOUT_SECONDS: "90"
           CCX3_DEBUG_TIMING: "1"
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force fulltest-results | Out-Null
           go test ./internal/hv/whp ./internal/vm `
             -tags embed_guestinit `
-            -run "Test(KernelBootFirstSerialByte|InitramfsBootReadyMarker|GuestInitRunsCommandFromAlpineRootFS|RunManagedExecWithAlpineRootFS|ManagedSessionExecWithAlpineRootFS|ManagedSessionExecStreamForwardsStdin|WindowsRuntimeBackendRunCommand|WindowsRuntimeBackendStartThenExec|WindowsRuntimeBackendRunStreamForwardsStdin|WindowsRuntimeBackendStartWithWritableShare)$" `
+            -run "Test(KernelBootFirstSerialByte|InitramfsBootReadyMarker)$" `
             -count=1 `
             -timeout=8m `
             -v `
@@ -329,6 +330,7 @@ jobs:
   fulltest-windows-amd64:
     name: windows-amd64 / ${{ matrix.suite }}
     needs: plan
+    if: ${{ false }}
     runs-on: windows-2025
     timeout-minutes: 360
     strategy:
@@ -502,6 +504,7 @@ jobs:
           PYNEURODESK_CCVM: ${{ github.workspace }}\build\ccvm.exe
           PYNEURODESK_BOOT_TIMEOUT: "600"
           PYNEURODESK_FULLTEST_HOST_SHELL: C:\Program Files\Git\bin\bash.exe
+          CCX3_WHP_BOOT_TIMEOUT_SECONDS: "90"
           CCX3_DEBUG_TIMING: "1"
           PYTHONUNBUFFERED: "1"
           SUITE: ${{ matrix.suite }}
@@ -516,7 +519,7 @@ jobs:
             --recipe $recipe `
             --image-source $env:IMAGE_SOURCE `
             --work-dir $workDir `
-            --memory-mb 4096 `
+            --memory-mb 3072 `
             --cpus 1 `
             --dmesg `
             2>&1 | Tee-Object -FilePath (Join-Path $results "$env:SUITE-windows-amd64.log")

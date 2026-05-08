@@ -3,10 +3,14 @@
 package vm
 
 import (
+	"context"
+	"fmt"
 	"strings"
 	"testing"
 
+	"j5.nz/cc/client"
 	"j5.nz/cc/internal/oci"
+	"j5.nz/cc/internal/virtio"
 )
 
 func TestEnsureWindowsAMD64ImageRejectsKnownForeignArchitecture(t *testing.T) {
@@ -40,4 +44,59 @@ func TestWindowsImageMountPathUsesLinuxGuestSeparators(t *testing.T) {
 	if strings.Contains(got, `\`) {
 		t.Fatalf("windowsImageMountPath() used host separators: %q", got)
 	}
+}
+
+func TestWindowsInstanceAddShareIsIdempotent(t *testing.T) {
+	rootFS := &recordingShareMounter{}
+	inst := &windowsInstance{rootFS: rootFS}
+	source := t.TempDir()
+	share := client.ShareMount{Source: source, Mount: "/work", Writable: true}
+
+	if err := inst.AddShare(context.Background(), share); err != nil {
+		t.Fatalf("AddShare() error = %v", err)
+	}
+	if err := inst.AddShare(context.Background(), share); err != nil {
+		t.Fatalf("AddShare() repeat error = %v", err)
+	}
+	if rootFS.calls != 1 {
+		t.Fatalf("rootFS.AddShare() calls = %d, want 1", rootFS.calls)
+	}
+}
+
+func TestWindowsInstanceAddShareRejectsConflictingMount(t *testing.T) {
+	rootFS := &recordingShareMounter{}
+	inst := &windowsInstance{rootFS: rootFS}
+	first := client.ShareMount{Source: t.TempDir(), Mount: "/work", Writable: true}
+	second := client.ShareMount{Source: t.TempDir(), Mount: "/work", Writable: true}
+
+	if err := inst.AddShare(context.Background(), first); err != nil {
+		t.Fatalf("AddShare() error = %v", err)
+	}
+	err := inst.AddShare(context.Background(), second)
+	if err == nil {
+		t.Fatal("AddShare() conflicting error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), `share mount "/work" already exists`) {
+		t.Fatalf("AddShare() conflicting error = %q", err)
+	}
+	if rootFS.calls != 1 {
+		t.Fatalf("rootFS.AddShare() calls = %d, want 1", rootFS.calls)
+	}
+}
+
+type recordingShareMounter struct {
+	calls  int
+	mounts map[string]virtio.ShareMount
+}
+
+func (m *recordingShareMounter) AddShare(share virtio.ShareMount) error {
+	if m.mounts == nil {
+		m.mounts = make(map[string]virtio.ShareMount)
+	}
+	if _, ok := m.mounts[share.GuestPath]; ok {
+		return fmt.Errorf("duplicate mount")
+	}
+	m.calls++
+	m.mounts[share.GuestPath] = share
+	return nil
 }

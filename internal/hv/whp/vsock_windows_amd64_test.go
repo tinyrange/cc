@@ -7,7 +7,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"j5.nz/cc/internal/guestinit"
 	"j5.nz/cc/internal/kernel/alpine"
@@ -19,7 +18,7 @@ func TestGuestInitReadyMarkerOverVsock(t *testing.T) {
 		t.Skip("set CCX3_WHP_BOOT=1 to run the windows amd64 WHP vsock probe")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), whpBootTestTimeout(t))
 	defer cancel()
 
 	manager := alpine.NewManager(t.TempDir())

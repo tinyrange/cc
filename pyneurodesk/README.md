@@ -155,7 +155,7 @@ from pyneurodesk.models import CVMFSSource, ImportImageRequest
 
 client = nd.connect()
 source = CVMFSSource(
-    mirror="https://cvmfs.neurodesk.org",
+    mirror="http://cvmfs.neurodesk.org",
     repo="neurodesk.ardc.edu.au",
     path="/containers/niimath_1.0.20250804_20251016",
 )

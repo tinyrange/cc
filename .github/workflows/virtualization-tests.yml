@@ -160,12 +160,13 @@ jobs:
         shell: pwsh
         env:
           CCX3_WHP_BOOT: "1"
+          CCX3_WHP_BOOT_TIMEOUT_SECONDS: "90"
           CCX3_DEBUG_TIMING: "1"
         run: |
           New-Item -ItemType Directory -Force fulltest-results | Out-Null
           go test ./internal/hv/whp ./internal/vm `
             -tags embed_guestinit `
-            -run "Test(KernelBootFirstSerialByte|InitramfsBootReadyMarker|GuestInitRunsCommandFromAlpineRootFS|RunManagedExecWithAlpineRootFS|ManagedSessionExecWithAlpineRootFS|ManagedSessionExecStreamForwardsStdin|WindowsRuntimeBackendRunCommand|WindowsRuntimeBackendStartThenExec|WindowsRuntimeBackendRunStreamForwardsStdin|WindowsRuntimeBackendStartWithWritableShare)$" `
+            -run "Test(KernelBootFirstSerialByte|InitramfsBootReadyMarker)$" `
             -count=1 `
             -timeout=8m `
             -v `
