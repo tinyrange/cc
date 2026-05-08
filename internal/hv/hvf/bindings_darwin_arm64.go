@@ -5,8 +5,10 @@ package hvf
 import (
 	"context"
 	"fmt"
+	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -141,6 +143,7 @@ var (
 	loadOnce      sync.Once
 	loadErr       error
 	vmLifecycleMu sync.Mutex
+	activeVM      atomic.Pointer[VM]
 	hvLib         uintptr
 	sysLib        uintptr
 
@@ -347,6 +350,7 @@ func NewVMWithContext(ctx context.Context) (*VM, error) {
 		vmLifecycleMu.Unlock()
 		return nil, err
 	}
+	activeVM.Store(v)
 	return v, nil
 }
 
@@ -360,9 +364,22 @@ func createVMWithRetry(cfg VMConfig) Return {
 		if ret != hvBusy {
 			return ret
 		}
+		if recoverStaleVMOnBusy() {
+			continue
+		}
 		time.Sleep(retryDelay)
 	}
 	return hvBusy
+}
+
+func recoverStaleVMOnBusy() bool {
+	if os.Getenv("CCX3_HVF_DESTROY_STALE_VM_ON_BUSY") != "1" {
+		return false
+	}
+	if activeVM.Load() != nil {
+		return false
+	}
+	return destroyVMWithRetry() == hvSuccess
 }
 
 func destroyVMWithRetry() Return {
@@ -796,7 +813,10 @@ func (v *VM) threadMain() {
 
 func (v *VM) Close() error {
 	var firstErr error
-	defer vmLifecycleMu.Unlock()
+	defer func() {
+		activeVM.CompareAndSwap(v, nil)
+		vmLifecycleMu.Unlock()
+	}()
 	if v.vcpuCreated {
 		errCh := make(chan error, 1)
 		v.threadCh <- func() {

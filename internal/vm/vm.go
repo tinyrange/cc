@@ -47,6 +47,7 @@ type Manager struct {
 	supports     func() error
 	capabilities func() client.CapabilitiesResponse
 	running      map[string]*Machine
+	starting     map[string]struct{}
 }
 
 type Machine struct {
@@ -137,19 +138,29 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 	if m.running == nil {
 		m.running = make(map[string]*Machine)
 	}
+	if m.starting == nil {
+		m.starting = make(map[string]struct{})
+	}
 	if m.running[id] != nil {
 		state := m.statusLocked(id)
 		m.mu.Unlock()
 		return state, fmt.Errorf("VM %q is already running", id)
 	}
+	if _, ok := m.starting[id]; ok {
+		state := m.statusLocked(id)
+		m.mu.Unlock()
+		return state, fmt.Errorf("VM %q is already starting", id)
+	}
 	if err := m.checkCapacityLocked(); err != nil {
 		m.mu.Unlock()
 		return client.InstanceState{}, err
 	}
+	m.starting[id] = struct{}{}
 	m.mu.Unlock()
 
 	inst, err := m.backend.StartStream(ctx, req, onEvent)
 	if err != nil {
+		m.clearStarting(id)
 		return client.InstanceState{}, err
 	}
 
@@ -167,6 +178,7 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 	if m.running == nil {
 		m.running = make(map[string]*Machine)
 	}
+	delete(m.starting, id)
 	m.running[id] = machine
 	m.mu.Unlock()
 
@@ -203,19 +215,29 @@ func (m *Manager) StartBlankInstanceStream(
 	if m.running == nil {
 		m.running = make(map[string]*Machine)
 	}
+	if m.starting == nil {
+		m.starting = make(map[string]struct{})
+	}
 	if m.running[id] != nil {
 		state := m.statusLocked(id)
 		m.mu.Unlock()
 		return state, fmt.Errorf("VM %q is already running", id)
 	}
+	if _, ok := m.starting[id]; ok {
+		state := m.statusLocked(id)
+		m.mu.Unlock()
+		return state, fmt.Errorf("VM %q is already starting", id)
+	}
 	if err := m.checkCapacityLocked(); err != nil {
 		m.mu.Unlock()
 		return client.InstanceState{}, err
 	}
+	m.starting[id] = struct{}{}
 	m.mu.Unlock()
 
 	inst, err := m.backend.StartBlankStream(ctx, req, onEvent)
 	if err != nil {
+		m.clearStarting(id)
 		return client.InstanceState{}, err
 	}
 
@@ -233,6 +255,7 @@ func (m *Manager) StartBlankInstanceStream(
 	if m.running == nil {
 		m.running = make(map[string]*Machine)
 	}
+	delete(m.starting, id)
 	m.running[id] = machine
 	m.mu.Unlock()
 
@@ -250,6 +273,7 @@ func (m *Manager) ShutdownAll(ctx context.Context) error {
 	m.mu.Lock()
 	running := m.running
 	m.running = nil
+	m.starting = nil
 	m.mu.Unlock()
 
 	var errs []error
@@ -416,6 +440,11 @@ func (m *Manager) Capabilities() client.CapabilitiesResponse {
 func (m *Manager) statusLocked(id string) client.InstanceState {
 	id = instanceID(id)
 	if m.running == nil || m.running[id] == nil {
+		if m.starting != nil {
+			if _, ok := m.starting[id]; ok {
+				return client.InstanceState{ID: id, Status: "starting"}
+			}
+		}
 		return client.InstanceState{ID: id, Status: "stopped"}
 	}
 	machine := m.running[id]
@@ -450,10 +479,16 @@ func (m *Manager) watch(machine *Machine) {
 
 func (m *Manager) checkCapacityLocked() error {
 	caps := m.Capabilities()
-	if caps.MaxInstances > 0 && len(m.running) >= caps.MaxInstances {
+	if caps.MaxInstances > 0 && len(m.running)+len(m.starting) >= caps.MaxInstances {
 		return fmt.Errorf("maximum running VM instances reached: %d", caps.MaxInstances)
 	}
 	return nil
+}
+
+func (m *Manager) clearStarting(id string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.starting, id)
 }
 
 func instanceID(id string) string {

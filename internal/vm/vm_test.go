@@ -230,6 +230,74 @@ func TestManagerEnforcesInstanceCapacity(t *testing.T) {
 	}
 }
 
+func TestManagerReservesCapacityWhileStartIsInFlight(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	inst := &fakeInstance{waitCh: make(chan error, 1)}
+	mgr := NewManagerWithBackend(fakeBackend{
+		startFn: func(req client.CreateInstanceRequest) (Instance, error) {
+			close(started)
+			<-release
+			return inst, nil
+		},
+	})
+	mgr.supports = func() error { return nil }
+	mgr.capabilities = func() client.CapabilitiesResponse {
+		return client.CapabilitiesResponse{MaxInstances: 1}
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := mgr.Start(context.Background(), client.CreateInstanceRequest{ID: "one", Image: "alpine"})
+		firstDone <- err
+	}()
+	<-started
+
+	if got := mgr.StatusOf("one").Status; got != "starting" {
+		t.Fatalf("StatusOf(one).Status = %q, want starting", got)
+	}
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{ID: "two", Image: "busybox"}); err == nil {
+		t.Fatal("Start(two) error = nil, want capacity error while first start is in flight")
+	}
+
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first Start() error = %v", err)
+	}
+	if got := mgr.StatusOf("one").Status; got != "running" {
+		t.Fatalf("StatusOf(one).Status = %q, want running", got)
+	}
+}
+
+func TestManagerClearsStartReservationAfterBackendError(t *testing.T) {
+	attempts := 0
+	inst := &fakeInstance{waitCh: make(chan error, 1)}
+	mgr := NewManagerWithBackend(fakeBackend{
+		startFn: func(req client.CreateInstanceRequest) (Instance, error) {
+			attempts++
+			if attempts == 1 {
+				return nil, fmt.Errorf("boom")
+			}
+			return inst, nil
+		},
+	})
+	mgr.supports = func() error { return nil }
+	mgr.capabilities = func() client.CapabilitiesResponse {
+		return client.CapabilitiesResponse{MaxInstances: 1}
+	}
+
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{Image: "alpine"}); err == nil {
+		t.Fatal("first Start() error = nil, want backend error")
+	}
+	state, err := mgr.Start(context.Background(), client.CreateInstanceRequest{Image: "alpine"})
+	if err != nil {
+		t.Fatalf("second Start() error = %v", err)
+	}
+	if state.Status != "running" {
+		t.Fatalf("second Start().Status = %q, want running", state.Status)
+	}
+}
+
 func TestManagerRunAllowsConcurrentExecsOnRunningInstance(t *testing.T) {
 	inst := &fakeInstance{waitCh: make(chan error, 1)}
 	inst.execFn = func(req client.ExecRequest) (client.ExecResponse, error) {
