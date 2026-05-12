@@ -184,3 +184,104 @@ func TestClientCreateInstanceStreamRequiresReadyEvent(t *testing.T) {
 		t.Fatalf("CreateInstanceStream() error = %v, want ready error", err)
 	}
 }
+
+func TestClientNamedInstanceHTTPHelpers(t *testing.T) {
+	var sawStatus, sawList, sawShutdown, sawForward, sawCreate bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/vm/status":
+			sawStatus = true
+			if got := r.URL.Query().Get("id"); got != "alpha beta" {
+				t.Fatalf("status id = %q, want alpha beta", got)
+			}
+			_ = json.NewEncoder(w).Encode(InstanceState{ID: "alpha beta", Status: "running"})
+		case "/vm":
+			if r.Method == http.MethodGet {
+				sawList = true
+				_ = json.NewEncoder(w).Encode([]InstanceState{{ID: "alpha", Status: "running"}})
+				return
+			}
+			sawCreate = true
+			var req CreateInstanceRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode create request: %v", err)
+			}
+			if req.ID != "alpha" || req.Image != "alpine" {
+				t.Fatalf("create request = %#v, want id alpha image alpine", req)
+			}
+			_ = json.NewEncoder(w).Encode(InstanceState{ID: "alpha", Status: "running", Image: "alpine"})
+		case "/vm/shutdown":
+			sawShutdown = true
+			if got := r.URL.Query().Get("id"); got != "alpha" {
+				t.Fatalf("shutdown id = %q, want alpha", got)
+			}
+			_ = json.NewEncoder(w).Encode(InstanceState{ID: "alpha", Status: "stopped"})
+		case "/vm/forward":
+			sawForward = true
+			if got := r.URL.Query().Get("id"); got != "alpha" {
+				t.Fatalf("forward id = %q, want alpha", got)
+			}
+			var forward PortForward
+			if err := json.NewDecoder(r.Body).Decode(&forward); err != nil {
+				t.Fatalf("decode forward request: %v", err)
+			}
+			if forward.HostPort != 8080 || forward.GuestPort != 80 {
+				t.Fatalf("forward = %#v, want 8080:80", forward)
+			}
+			_ = json.NewEncoder(w).Encode(forward)
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	c := NewClient(ts.URL, nil)
+	c.client = *ts.Client()
+
+	if state, err := c.InstanceStatusOf("alpha beta"); err != nil || state.ID != "alpha beta" {
+		t.Fatalf("InstanceStatusOf() = %#v, %v", state, err)
+	}
+	if statuses, err := c.InstanceStatuses(); err != nil || len(statuses) != 1 || statuses[0].ID != "alpha" {
+		t.Fatalf("InstanceStatuses() = %#v, %v", statuses, err)
+	}
+	if state, err := c.CreateInstanceWithID("alpha", CreateInstanceRequest{Image: "alpine"}); err != nil || state.ID != "alpha" {
+		t.Fatalf("CreateInstanceWithID() = %#v, %v", state, err)
+	}
+	if err := c.ShutdownInstanceWithID("alpha"); err != nil {
+		t.Fatalf("ShutdownInstanceWithID() error = %v", err)
+	}
+	if err := c.AddPortForwardTo("alpha", PortForward{HostPort: 8080, GuestPort: 80}); err != nil {
+		t.Fatalf("AddPortForwardTo() error = %v", err)
+	}
+	if !sawStatus || !sawList || !sawCreate || !sawShutdown || !sawForward {
+		t.Fatalf("missing requests: status=%v list=%v create=%v shutdown=%v forward=%v", sawStatus, sawList, sawCreate, sawShutdown, sawForward)
+	}
+}
+
+func TestClientExecStreamInSendsID(t *testing.T) {
+	ts := httptest.NewServer(websocket.Server{
+		Handshake: func(*websocket.Config, *http.Request) error { return nil },
+		Handler: func(ws *websocket.Conn) {
+			var req ExecRequest
+			if err := websocket.JSON.Receive(ws, &req); err != nil {
+				t.Fatalf("JSON.Receive(req) error = %v", err)
+			}
+			if req.ID != "alpha" || len(req.Command) != 1 || req.Command[0] != "true" {
+				t.Fatalf("req = %#v, want id alpha command true", req)
+			}
+			if err := websocket.JSON.Send(ws, ExecEvent{Kind: "exit", ExitCode: 0}); err != nil {
+				t.Fatalf("JSON.Send(exit) error = %v", err)
+			}
+		},
+	})
+	defer ts.Close()
+
+	c := NewClient(ts.URL, func() (net.Conn, error) {
+		return nil, nil
+	})
+	c.client = *ts.Client()
+
+	if err := c.ExecStreamIn("alpha", ExecRequest{Command: []string{"true"}}, nil, nil); err != nil {
+		t.Fatalf("ExecStreamIn() error = %v", err)
+	}
+}

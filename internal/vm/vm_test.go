@@ -214,6 +214,81 @@ func TestManagerSupportsNamedInstances(t *testing.T) {
 	}
 }
 
+func TestManagerRoutesActionsToNamedInstances(t *testing.T) {
+	first := &fakeInstance{
+		waitCh:   make(chan error, 1),
+		execResp: client.ExecResponse{ExitCode: 0, Output: "one"},
+	}
+	second := &fakeInstance{
+		waitCh:   make(chan error, 1),
+		execResp: client.ExecResponse{ExitCode: 0, Output: "two"},
+	}
+	var started int
+	mgr := NewManagerWithBackend(fakeBackend{
+		startFn: func(req client.CreateInstanceRequest) (Instance, error) {
+			started++
+			if started == 1 {
+				return first, nil
+			}
+			return second, nil
+		},
+	})
+	mgr.supports = func() error { return nil }
+	mgr.capabilities = func() client.CapabilitiesResponse {
+		return client.CapabilitiesResponse{MaxInstances: 2}
+	}
+
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{ID: "one", Image: "alpine"}); err != nil {
+		t.Fatalf("Start(one) error = %v", err)
+	}
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{ID: "two", Image: "busybox"}); err != nil {
+		t.Fatalf("Start(two) error = %v", err)
+	}
+
+	resp, err := mgr.Run(context.Background(), client.RunRequest{ID: "two", Command: []string{"hostname"}})
+	if err != nil {
+		t.Fatalf("Run(two) error = %v", err)
+	}
+	if resp.Output != "two" {
+		t.Fatalf("Run(two).Output = %q, want two", resp.Output)
+	}
+
+	var streamEvents []client.ExecEvent
+	if err := mgr.Stream(context.Background(), client.ExecRequest{ID: "one", Command: []string{"hostname"}}, nil, func(event client.ExecEvent) error {
+		streamEvents = append(streamEvents, event)
+		return nil
+	}); err != nil {
+		t.Fatalf("Stream(one) error = %v", err)
+	}
+	if len(streamEvents) != 2 || streamEvents[0].Output != "one" || streamEvents[1].Kind != "exit" {
+		t.Fatalf("Stream(one) events = %#v, want output one then exit", streamEvents)
+	}
+
+	var forwarded client.PortForward
+	second.forwardFn = func(forward client.PortForward) error {
+		forwarded = forward
+		return nil
+	}
+	wantForward := client.PortForward{HostPort: 8080, GuestPort: 80}
+	if err := mgr.AddPortForwardTo(context.Background(), "two", wantForward); err != nil {
+		t.Fatalf("AddPortForwardTo(two) error = %v", err)
+	}
+	if forwarded != wantForward {
+		t.Fatalf("forwarded = %#v, want %#v", forwarded, wantForward)
+	}
+
+	if err := mgr.ShutdownInstance(context.Background(), "one"); err != nil {
+		t.Fatalf("ShutdownInstance(one) error = %v", err)
+	}
+	resp, err = mgr.Run(context.Background(), client.RunRequest{ID: "two", Command: []string{"hostname"}})
+	if err != nil {
+		t.Fatalf("Run(two after one shutdown) error = %v", err)
+	}
+	if resp.Output != "two" {
+		t.Fatalf("Run(two after one shutdown).Output = %q, want two", resp.Output)
+	}
+}
+
 func TestManagerEnforcesInstanceCapacity(t *testing.T) {
 	inst := &fakeInstance{waitCh: make(chan error, 1)}
 	mgr := NewManagerWithBackend(fakeBackend{instance: inst})

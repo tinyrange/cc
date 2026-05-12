@@ -440,6 +440,17 @@ func (ns *NetStack) SetGuestMAC(mac net.HardwareAddr) error {
 	return nil
 }
 
+// SetGuestIPv4 sets the guest IPv4 address expected by synthetic host-side
+// connections such as port forwards.
+func (ns *NetStack) SetGuestIPv4(ip net.IP) error {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return fmt.Errorf("guest ip %q is not an ipv4 address", ip.String())
+	}
+	copy(ns.guestIPv4[:], ip4)
+	return nil
+}
+
 // SetServiceProxyEnabled toggles the localhost proxy feature for TCP flows
 // addressed to serviceIPv4.
 func (ns *NetStack) SetServiceProxyEnabled(enabled bool) {

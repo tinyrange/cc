@@ -180,6 +180,220 @@ func TestRuntimeBackendPortForwardToGuestWebServer(t *testing.T) {
 	}
 }
 
+func TestRuntimeBackendRunsTwoNamedVMsConcurrently(t *testing.T) {
+	if os.Getenv("CCX3_KVM_BOOT") == "" {
+		t.Skip("set CCX3_KVM_BOOT=1 to run the linux amd64 KVM boot probe")
+	}
+	fixture := filepath.Join("..", "..", "fixtures", "alpine.simg")
+	if _, err := os.Stat(fixture); err != nil {
+		t.Skipf("local alpine fixture unavailable: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	defer cancel()
+
+	hostPortOne := reserveLocalTCPPort(t)
+	hostPortTwo := reserveLocalTCPPort(t)
+	root := t.TempDir()
+	t.Setenv("CCX3_OCI_SHARED_CACHE_DIR", filepath.Join(root, "shared-oci-cache"))
+	shareDir := filepath.Join(root, "share-one")
+	if err := os.MkdirAll(shareDir, 0o755); err != nil {
+		t.Fatalf("create share dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(shareDir, "secret.txt"), []byte("one-share\n"), 0o644); err != nil {
+		t.Fatalf("write share file: %v", err)
+	}
+
+	kernel := alpine.NewManager(filepath.Join(root, "kernel"))
+	if err := kernel.Ensure(ctx); err != nil {
+		t.Fatalf("kernel.Ensure() error = %v", err)
+	}
+	store := oci.NewStore(filepath.Join(root, "images"))
+	for _, image := range []string{"alpine-one", "alpine-two"} {
+		if _, err := store.Pull(ctx, image, fixture); err != nil {
+			t.Fatalf("store.Pull(%s) error = %v", image, err)
+		}
+	}
+
+	mgr := NewManagerWithBackend(NewRuntimeBackend(kernel, store, filepath.Join(root, "guestinit")))
+	defer mgr.ShutdownAll(context.Background())
+
+	for _, tc := range []struct {
+		id       string
+		image    string
+		hostPort int
+	}{
+		{id: "one", image: "alpine-one", hostPort: hostPortOne},
+		{id: "two", image: "alpine-two", hostPort: hostPortTwo},
+	} {
+		state, err := mgr.Start(ctx, client.CreateInstanceRequest{
+			ID:    tc.id,
+			Image: tc.image,
+			Network: &client.NetworkConfig{
+				Enabled: true,
+				PortForwards: []client.PortForward{{
+					Protocol:  "tcp",
+					HostAddr:  "127.0.0.1",
+					HostPort:  tc.hostPort,
+					GuestPort: 8080,
+				}},
+			},
+			MemoryMB: 256,
+		})
+		if err != nil {
+			t.Fatalf("Start(%s) error = %v", tc.id, err)
+		}
+		if state.ID != tc.id || state.Image != tc.image || state.Status != "running" {
+			t.Fatalf("Start(%s) state = %#v, want running with matching id and image", tc.id, state)
+		}
+	}
+
+	respOne, err := mgr.RunIn(ctx, "one", client.RunRequest{
+		Shares:  []client.ShareMount{{Source: shareDir, Mount: "/.share/one"}},
+		Command: []string{"sh", "-c", "printf one: && cat /.share/one/secret.txt"},
+	})
+	if err != nil {
+		t.Fatalf("RunIn(one share) error = %v\noutput:\n%s", err, respOne.Output)
+	}
+	if strings.TrimSpace(respOne.Output) != "one:one-share" {
+		t.Fatalf("RunIn(one share) output = %q, want one:one-share", respOne.Output)
+	}
+
+	respTwo, err := mgr.RunIn(ctx, "two", client.RunRequest{
+		Command: []string{"sh", "-c", "test ! -e /.share/one/secret.txt && echo two-isolated"},
+	})
+	if err != nil {
+		t.Fatalf("RunIn(two isolation) error = %v\noutput:\n%s", err, respTwo.Output)
+	}
+	if strings.TrimSpace(respTwo.Output) != "two-isolated" {
+		t.Fatalf("RunIn(two isolation) output = %q, want two-isolated", respTwo.Output)
+	}
+
+	for _, tc := range []struct {
+		id          string
+		hostPort    int
+		bodyLiteral string
+	}{
+		{id: "one", hostPort: hostPortOne, bodyLiteral: "one-ok\\n"},
+		{id: "two", hostPort: hostPortTwo, bodyLiteral: "two-ok\\n"},
+	} {
+		command := fmt.Sprintf("while true; do printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 7\\r\\nConnection: close\\r\\n\\r\\n%s' | nc -l -p 8080; done >/tmp/cc-port-forward.log 2>&1 & echo server-ready", tc.bodyLiteral)
+		resp, err := mgr.RunIn(ctx, tc.id, client.RunRequest{Command: []string{"sh", "-c", command}})
+		if err != nil {
+			t.Fatalf("RunIn(%s web server) error = %v\noutput:\n%s", tc.id, err, resp.Output)
+		}
+		if resp.ExitCode != 0 || !strings.Contains(resp.Output, "server-ready") {
+			t.Fatalf("RunIn(%s web server) exit=%d output:\n%s", tc.id, resp.ExitCode, resp.Output)
+		}
+	}
+
+	if body := fetchWithRetry(t, fmt.Sprintf("http://127.0.0.1:%d/", hostPortOne), 5*time.Second); body != "one-ok\n" {
+		t.Fatalf("forward one response = %q, want one-ok", body)
+	}
+	if body := fetchWithRetry(t, fmt.Sprintf("http://127.0.0.1:%d/", hostPortTwo), 5*time.Second); body != "two-ok\n" {
+		t.Fatalf("forward two response = %q, want two-ok", body)
+	}
+
+	err = mgr.AddPortForwardTo(ctx, "two", client.PortForward{
+		Protocol:  "tcp",
+		HostAddr:  "127.0.0.1",
+		HostPort:  hostPortOne,
+		GuestPort: 8081,
+	})
+	if err == nil || !strings.Contains(err.Error(), "listen port forward") {
+		t.Fatalf("duplicate host forward error = %v, want listen port forward error", err)
+	}
+
+	if err := mgr.ShutdownInstance(ctx, "one"); err != nil {
+		t.Fatalf("ShutdownInstance(one) error = %v", err)
+	}
+	respTwo, err = mgr.RunIn(ctx, "two", client.RunRequest{Command: []string{"sh", "-c", "echo two-still-running"}})
+	if err != nil {
+		t.Fatalf("RunIn(two after one shutdown) error = %v\noutput:\n%s", err, respTwo.Output)
+	}
+	if strings.TrimSpace(respTwo.Output) != "two-still-running" {
+		t.Fatalf("RunIn(two after one shutdown) output = %q, want two-still-running", respTwo.Output)
+	}
+}
+
+func TestRuntimeBackendVMToVMNginxCurl(t *testing.T) {
+	if os.Getenv("CCX3_KVM_BOOT") == "" {
+		t.Skip("set CCX3_KVM_BOOT=1 to run the linux amd64 KVM boot probe")
+	}
+	fixture := filepath.Join("..", "..", "fixtures", "alpine.simg")
+	if _, err := os.Stat(fixture); err != nil {
+		t.Skipf("local alpine fixture unavailable: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+
+	root := t.TempDir()
+	t.Setenv("CCX3_OCI_SHARED_CACHE_DIR", filepath.Join(root, "shared-oci-cache"))
+	kernel := alpine.NewManager(filepath.Join(root, "kernel"))
+	if err := kernel.Ensure(ctx); err != nil {
+		t.Fatalf("kernel.Ensure() error = %v", err)
+	}
+	store := oci.NewStore(filepath.Join(root, "images"))
+	for _, image := range []string{"alpine-nginx", "alpine-curl"} {
+		if _, err := store.Pull(ctx, image, fixture); err != nil {
+			t.Fatalf("store.Pull(%s) error = %v", image, err)
+		}
+	}
+
+	mgr := NewManagerWithBackend(NewRuntimeBackend(kernel, store, filepath.Join(root, "guestinit")))
+	defer mgr.ShutdownAll(context.Background())
+
+	network := &client.NetworkConfig{Enabled: true, AllowInternet: true}
+	serverState, err := mgr.Start(ctx, client.CreateInstanceRequest{
+		ID:       "nginx",
+		Image:    "alpine-nginx",
+		Network:  network,
+		MemoryMB: 256,
+	})
+	if err != nil {
+		t.Fatalf("Start(nginx) error = %v", err)
+	}
+	if serverState.NetworkIPv4 == "" {
+		t.Fatalf("Start(nginx) state missing network IPv4: %#v", serverState)
+	}
+
+	clientState, err := mgr.Start(ctx, client.CreateInstanceRequest{
+		ID:       "curl",
+		Image:    "alpine-curl",
+		Network:  network,
+		MemoryMB: 256,
+	})
+	if err != nil {
+		t.Fatalf("Start(curl) error = %v", err)
+	}
+	if clientState.NetworkIPv4 == "" || clientState.NetworkIPv4 == serverState.NetworkIPv4 {
+		t.Fatalf("Start(curl) network IPv4 = %q, server IPv4 = %q", clientState.NetworkIPv4, serverState.NetworkIPv4)
+	}
+
+	resp, err := mgr.RunIn(ctx, "nginx", client.RunRequest{
+		Command: []string{"sh", "-c", "set -e; if ! command -v nginx >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then apk add --no-cache nginx curl >/tmp/cc-apk-nginx.log; fi; mkdir -p /run/nginx /tmp/cc-nginx; printf 'vm-nginx-ok\\n' >/tmp/cc-nginx/index.html; printf 'server { listen 80 default_server; root /tmp/cc-nginx; location / { try_files $uri /index.html; } }\\n' >/etc/nginx/http.d/default.conf; nginx -g 'daemon off;' >/tmp/cc-nginx.log 2>&1 & for i in $(seq 1 100); do if curl -fsS http://127.0.0.1/ | grep -q vm-nginx-ok; then echo nginx-ready; exit 0; fi; sleep 0.1; done; cat /tmp/cc-nginx.log; exit 1"},
+		User:    "0:0",
+	})
+	if err != nil {
+		t.Fatalf("RunIn(nginx) error = %v\noutput:\n%s", err, resp.Output)
+	}
+	if resp.ExitCode != 0 || !strings.Contains(resp.Output, "nginx-ready") {
+		t.Fatalf("RunIn(nginx) exit=%d output:\n%s", resp.ExitCode, resp.Output)
+	}
+
+	resp, err = mgr.RunIn(ctx, "curl", client.RunRequest{
+		Command: []string{"sh", "-c", fmt.Sprintf("set -e; if ! command -v curl >/dev/null 2>&1; then apk add --no-cache curl >/tmp/cc-apk-curl.log; fi; curl -fsS --connect-timeout 2 http://%s/", serverState.NetworkIPv4)},
+		User:    "0:0",
+	})
+	if err != nil {
+		t.Fatalf("RunIn(curl) error = %v\noutput:\n%s", err, resp.Output)
+	}
+	if strings.TrimSpace(resp.Output) != "vm-nginx-ok" {
+		t.Fatalf("curl output = %q, want vm-nginx-ok", resp.Output)
+	}
+}
+
 func reserveLocalTCPPort(t testing.TB) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

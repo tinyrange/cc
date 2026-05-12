@@ -344,6 +344,7 @@ class NetworkConfig:
 class RunCommandRequest:
     image: str
     command: tuple[str, ...]
+    vm_id: Optional[str] = None
     shares: tuple[ShareMount, ...] = ()
     network: Optional[NetworkConfig] = None
     env: tuple[str, ...] = ()
@@ -360,6 +361,8 @@ class RunCommandRequest:
             "image": self.image,
             "command": list(self.command),
         }
+        if self.vm_id:
+            payload["id"] = self.vm_id
         if self.shares:
             payload["shares"] = [share.to_payload() for share in self.shares]
         if self.network is not None:
@@ -401,20 +404,24 @@ class CommandResult:
 @dataclass(frozen=True)
 class VMState:
     status: str
+    id: Optional[str] = None
     image: Optional[str] = None
     memory_mb: Optional[int] = None
     cpus: Optional[int] = None
     started_at: Optional[str] = None
+    network_ipv4: Optional[str] = None
     error: Optional[str] = None
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "VMState":
         return cls(
             status=payload["status"],
+            id=payload.get("id"),
             image=payload.get("image"),
             memory_mb=payload.get("memory_mb"),
             cpus=payload.get("cpus"),
             started_at=payload.get("started_at"),
+            network_ipv4=payload.get("network_ipv4"),
             error=payload.get("error"),
         )
 

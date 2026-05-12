@@ -11,7 +11,7 @@ import (
 )
 
 func TestLinuxNetworkRuntimeAddPortForwardValidation(t *testing.T) {
-	runtime, err := newLinuxAMD64NetworkRuntime(&client.NetworkConfig{Enabled: true})
+	runtime, err := newLinuxAMD64NetworkRuntime("test-validation", &client.NetworkConfig{Enabled: true})
 	if err != nil {
 		t.Fatalf("new network runtime: %v", err)
 	}
@@ -29,7 +29,7 @@ func TestLinuxNetworkRuntimeAddPortForwardValidation(t *testing.T) {
 }
 
 func TestLinuxNetworkRuntimeAddPortForwardIsIdempotent(t *testing.T) {
-	runtime, err := newLinuxAMD64NetworkRuntime(&client.NetworkConfig{Enabled: true})
+	runtime, err := newLinuxAMD64NetworkRuntime("test-idempotent", &client.NetworkConfig{Enabled: true})
 	if err != nil {
 		t.Fatalf("new network runtime: %v", err)
 	}

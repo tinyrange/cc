@@ -169,8 +169,18 @@ func (c *Client) CreateInstance(req CreateInstanceRequest) (InstanceState, error
 	return ret, err
 }
 
+func (c *Client) CreateInstanceWithID(id string, req CreateInstanceRequest) (InstanceState, error) {
+	req.ID = id
+	return c.CreateInstance(req)
+}
+
 func (c *Client) CreateInstanceStream(req CreateInstanceRequest, onEvent func(BootEvent) error) (InstanceState, error) {
 	return c.postJSONBootStream("/vm", req, onEvent)
+}
+
+func (c *Client) CreateInstanceStreamWithID(id string, req CreateInstanceRequest, onEvent func(BootEvent) error) (InstanceState, error) {
+	req.ID = id
+	return c.CreateInstanceStream(req, onEvent)
 }
 
 func (c *Client) StartInstance(req StartInstanceRequest) (InstanceState, error) {
@@ -179,8 +189,18 @@ func (c *Client) StartInstance(req StartInstanceRequest) (InstanceState, error) 
 	return ret, err
 }
 
+func (c *Client) StartInstanceWithID(id string, req StartInstanceRequest) (InstanceState, error) {
+	req.ID = id
+	return c.StartInstance(req)
+}
+
 func (c *Client) StartInstanceStream(req StartInstanceRequest, onEvent func(BootEvent) error) (InstanceState, error) {
 	return c.postJSONBootStream("/vm/start", req, onEvent)
+}
+
+func (c *Client) StartInstanceStreamWithID(id string, req StartInstanceRequest, onEvent func(BootEvent) error) (InstanceState, error) {
+	req.ID = id
+	return c.StartInstanceStream(req, onEvent)
 }
 
 func (c *Client) InstanceStatus() (InstanceState, error) {
@@ -197,14 +217,57 @@ func (c *Client) InstanceStatus() (InstanceState, error) {
 	return ret, err
 }
 
+func (c *Client) InstanceStatuses() ([]InstanceState, error) {
+	resp, err := c.client.Get(c.url + "/vm")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, decodeErrorResponse(resp)
+	}
+	var ret []InstanceState
+	if err := json.NewDecoder(resp.Body).Decode(&ret); err != nil {
+		return nil, err
+	}
+	return ret, nil
+}
+
+func (c *Client) InstanceStatusOf(id string) (InstanceState, error) {
+	var ret InstanceState
+	resp, err := c.client.Get(c.url + "/vm/status" + idQuery(id))
+	if err != nil {
+		return ret, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ret, decodeErrorResponse(resp)
+	}
+	err = json.NewDecoder(resp.Body).Decode(&ret)
+	return ret, err
+}
+
 func (c *Client) ShutdownInstance() error {
 	return c.postJSONExpectOK("/vm/shutdown", nil, nil)
+}
+
+func (c *Client) ShutdownInstanceWithID(id string) error {
+	return c.postJSONExpectOK("/vm/shutdown"+idQuery(id), nil, nil)
+}
+
+func (c *Client) AddPortForwardTo(id string, forward PortForward) error {
+	return c.postJSONExpectOK("/vm/forward"+idQuery(id), forward, nil)
 }
 
 func (c *Client) Run(req RunRequest) (ExecResponse, error) {
 	var ret ExecResponse
 	err := c.postJSONExpectOK("/vm/run", req, &ret)
 	return ret, err
+}
+
+func (c *Client) RunIn(id string, req RunRequest) (ExecResponse, error) {
+	req.ID = id
+	return c.Run(req)
 }
 
 func (c *Client) RunEvents(req RunRequest) ([]ExecEvent, error) {
@@ -223,6 +286,11 @@ func (c *Client) RunEvents(req RunRequest) ([]ExecEvent, error) {
 	})
 }
 
+func (c *Client) RunEventsIn(id string, req RunRequest) ([]ExecEvent, error) {
+	req.ID = id
+	return c.RunEvents(req)
+}
+
 func (c *Client) ExecEvents(req ExecRequest) ([]ExecEvent, error) {
 	var events []ExecEvent
 	err := c.ExecStream(req, nil, func(event ExecEvent) error {
@@ -230,6 +298,11 @@ func (c *Client) ExecEvents(req ExecRequest) ([]ExecEvent, error) {
 		return nil
 	})
 	return events, err
+}
+
+func (c *Client) ExecEventsIn(id string, req ExecRequest) ([]ExecEvent, error) {
+	req.ID = id
+	return c.ExecEvents(req)
 }
 
 func (c *Client) ExecStream(req ExecRequest, inputs <-chan ExecInput, onEvent func(ExecEvent) error) error {
@@ -281,6 +354,11 @@ func (c *Client) ExecStream(req ExecRequest, inputs <-chan ExecInput, onEvent fu
 	return nil
 }
 
+func (c *Client) ExecStreamIn(id string, req ExecRequest, inputs <-chan ExecInput, onEvent func(ExecEvent) error) error {
+	req.ID = id
+	return c.ExecStream(req, inputs, onEvent)
+}
+
 func websocketURL(baseURL, path string) (string, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil {
@@ -298,6 +376,14 @@ func websocketURL(baseURL, path string) (string, error) {
 	u.RawQuery = ""
 	u.Fragment = ""
 	return u.String(), nil
+}
+
+func idQuery(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	return "?id=" + url.QueryEscape(id)
 }
 
 func (c *Client) StartVM(req StartVMRequest) (VMState, error) { return c.CreateInstance(req) }

@@ -200,8 +200,8 @@ class PyNeurodeskClient:
             ImportImageRequest(source=reference.source, cache_dir=reference.cache_dir),
         )
 
-    def instance_status(self) -> VMState:
-        response = self._client.get("/vm/status")
+    def instance_status(self, *, vm_id: Optional[str] = None) -> VMState:
+        response = self._client.get("/vm/status", params=id_params(vm_id))
         payload = self._decode_json(response)
         return VMState.from_payload(payload)
 
@@ -216,8 +216,11 @@ class PyNeurodeskClient:
         dmesg: bool = False,
         memory_mb: Optional[int] = None,
         cpus: Optional[int] = None,
+        vm_id: Optional[str] = None,
     ) -> VMState:
         payload: dict[str, Any] = {"image": image}
+        if vm_id:
+            payload["id"] = vm_id
         network_payload = network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)
         if network_payload:
             payload["network"] = network_payload
@@ -244,8 +247,11 @@ class PyNeurodeskClient:
         dmesg: bool = False,
         memory_mb: Optional[int] = None,
         cpus: Optional[int] = None,
+        vm_id: Optional[str] = None,
     ) -> VMState:
         payload: dict[str, Any] = {}
+        if vm_id:
+            payload["id"] = vm_id
         network_payload = network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)
         if network_payload:
             payload["network"] = network_payload
@@ -272,8 +278,11 @@ class PyNeurodeskClient:
         dmesg: bool = False,
         memory_mb: Optional[int] = None,
         cpus: Optional[int] = None,
+        vm_id: Optional[str] = None,
     ) -> Iterable[dict[str, Any]]:
         payload: dict[str, Any] = {}
+        if vm_id:
+            payload["id"] = vm_id
         network_payload = network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)
         if network_payload:
             payload["network"] = network_payload
@@ -312,8 +321,11 @@ class PyNeurodeskClient:
         port_forwards: Iterable[PortForward] = (),
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         dmesg: bool = False,
+        vm_id: Optional[str] = None,
     ) -> Iterable[dict[str, Any]]:
         payload: dict[str, Any] = {"image": image}
+        if vm_id:
+            payload["id"] = vm_id
         network_payload = network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)
         if network_payload:
             payload["network"] = network_payload
@@ -339,8 +351,8 @@ class PyNeurodeskClient:
                     raise TypeError(f"expected boot event object, got {type(event)!r}")
                 yield event
 
-    def shutdown_instance(self) -> VMState:
-        response = self._client.post("/vm/shutdown")
+    def shutdown_instance(self, *, vm_id: Optional[str] = None) -> VMState:
+        response = self._client.post("/vm/shutdown", params=id_params(vm_id))
         payload = self._decode_json(response)
         return VMState.from_payload(payload)
 
@@ -369,19 +381,20 @@ class PyNeurodeskClient:
         dmesg: bool = False,
         memory_mb: Optional[int] = None,
         cpus: Optional[int] = None,
+        vm_id: Optional[str] = None,
     ) -> VMState:
-        state = self.instance_status()
+        state = self.instance_status(vm_id=vm_id)
         network_payload = network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)
         if state.status == "running" and state.image == image:
             return state
         if state.status == "running" and state.image not in (image,):
-            self.shutdown_instance()
-            return self.create_instance(image, network=network_from_payload(network_payload), timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus)
+            self.shutdown_instance(vm_id=vm_id)
+            return self.create_instance(image, network=network_from_payload(network_payload), timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus, vm_id=vm_id)
         if state.status == "stopped":
-            return self.create_instance(image, network=network_from_payload(network_payload), timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus)
+            return self.create_instance(image, network=network_from_payload(network_payload), timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus, vm_id=vm_id)
         if state.status == "running":
-            return self.create_instance(image, network=network_from_payload(network_payload), timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus)
-        return self.create_instance(image, network=network_from_payload(network_payload), timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus)
+            return self.create_instance(image, network=network_from_payload(network_payload), timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus, vm_id=vm_id)
+        return self.create_instance(image, network=network_from_payload(network_payload), timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus, vm_id=vm_id)
 
     def cvmfs_list(self, source: CVMFSSource) -> CVMFSListResponse:
         response = self._client.post("/cvmfs/list", json=source.to_payload())
@@ -418,11 +431,13 @@ class PyNeurodeskClient:
         stdin: Optional[bytes] = None,
         timeout_seconds: Optional[float] = None,
         timeout: Optional[Union[float, httpx.Timeout]] = None,
+        vm_id: Optional[str] = None,
     ) -> CommandResult:
         return self.run_command(
             RunCommandRequest(
                 image=image,
                 command=tuple(command),
+                vm_id=vm_id,
                 shares=tuple(shares),
                 network=network_from_payload(network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)),
                 env=tuple(env),
@@ -449,10 +464,12 @@ class PyNeurodeskClient:
         stdin: Optional[bytes] = None,
         timeout_seconds: Optional[float] = None,
         timeout: Optional[Union[float, httpx.Timeout]] = None,
+        vm_id: Optional[str] = None,
     ) -> Iterable[dict[str, Any]]:
         request = RunCommandRequest(
             image=image,
             command=tuple(command),
+            vm_id=vm_id,
             shares=tuple(shares),
             network=network_from_payload(network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)),
             env=tuple(env),
@@ -535,6 +552,13 @@ def resolve_boot_timeout_seconds(timeout: Optional[Union[float, httpx.Timeout]] 
         return float(raw)
 
     return DEFAULT_BOOT_TIMEOUT_SECONDS
+
+
+def id_params(vm_id: Optional[str]) -> Optional[dict[str, str]]:
+    value = (vm_id or "").strip()
+    if not value:
+        return None
+    return {"id": value}
 
 
 def network_payload_from_options(

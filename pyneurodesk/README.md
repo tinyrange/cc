@@ -134,6 +134,22 @@ Run a one-off command through the active VM:
 nd exec niimath -- niimath -help
 ```
 
+Bind a shell session to a named `cc` VM when you want separate parallel
+sessions:
+
+```sh
+source <(uv run neurodesk activate --shell bash --vm analysis)
+nd load niimath
+nd exec niimath -- niimath -help
+```
+
+You can also target one command explicitly:
+
+```sh
+nd load niimath --vm analysis
+nd exec --vm analysis niimath -- niimath -help
+```
+
 The shell integration creates wrapper scripts in a session directory under the
 user cache directory and reuses the shared daemon/VM where possible.
 

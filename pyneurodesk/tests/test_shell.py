@@ -69,6 +69,16 @@ def test_activate_with_network_persists_session_network(monkeypatch, tmp_path: P
     assert state["network"] == {"enabled": True}
 
 
+def test_activate_with_vm_persists_session_vm(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("pyneurodesk.shell.default_cache_root", lambda: tmp_path / "cache")
+
+    assert shell.main(["activate", "--shell", "bash", "--no-bootstrap", "--vm", "analysis"]) == 0
+
+    session_dirs = list((tmp_path / "cache" / "pyneurodesk-shell").iterdir())
+    state = json.loads((session_dirs[0] / "state.json").read_text())
+    assert state["vm_id"] == "analysis"
+
+
 def test_completion_emits_zsh_support(capsys: pytest.CaptureFixture[str]) -> None:
     exit_code = shell.main(["completion", "--shell", "zsh"])
 
@@ -1018,4 +1028,74 @@ def test_run_wrapper_uses_session_reference_when_present(
             guest_mount,
         ),
     )
+
+
+def test_run_wrapper_uses_session_vm_id(
+    monkeypatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[tuple[str, object]] = []
+    reference = ContainerReference(
+        name="suite",
+        image="fulltest-image",
+        source=ImageSource(type="simg", path="/tmp/container.simg"),
+    )
+    session_root = tmp_path / "session"
+    session_root.mkdir(parents=True)
+    shell.write_state(
+        shell.SessionState(
+            session_id="sess-1",
+            root=session_root,
+            images={"fulltest-image": {"reference": shell.container_reference_to_payload(reference)}},
+            wrappers={},
+            vm_id="analysis",
+        )
+    )
+    monkeypatch.setenv(shell.SESSION_ENV, "sess-1")
+    monkeypatch.setenv(shell.SESSION_ROOT_ENV, str(session_root))
+    monkeypatch.setenv(shell.SESSION_BIN_ENV, str(session_root / "bin"))
+    monkeypatch.chdir(tmp_path)
+
+    class FakeClient:
+        def ensure_image(self, ref: ContainerReference) -> object:
+            calls.append(("ensure_image", ref))
+            return object()
+
+        def ensure_instance(self, image: str, **kwargs: object) -> object:
+            calls.append(("ensure_instance", (image, kwargs)))
+            return object()
+
+        def run(self, image: str, command: list[str], **kwargs: object) -> object:
+            calls.append(("run", (image, tuple(command), kwargs)))
+            return SimpleNamespace(exit_code=0, output="ok\n")
+
+        def close(self) -> None:
+            calls.append(("client_close", None))
+
+    monkeypatch.setattr("pyneurodesk.shell.connect", lambda: calls.append(("connect", None)) or FakeClient())
+    monkeypatch.setattr("pyneurodesk.shell.load_deploy_metadata", lambda handle: SimpleNamespace(deploy_env=()))
+    monkeypatch.setattr("pyneurodesk.shell.runtime_env_overrides", lambda: [])
+
+    exit_code = shell.main(
+        [
+            "shell",
+            "run-wrapper",
+            "--session",
+            "sess-1",
+            "--image",
+            "fulltest-image",
+            "--command",
+            "niimath",
+            "--",
+            "-help",
+        ]
+    )
+
+    assert exit_code == 0
+    assert capsys.readouterr().out == "ok\n"
+    ensure_call = next(value for name, value in calls if name == "ensure_instance")
+    assert ensure_call[1]["vm_id"] == "analysis"
+    run_call = next(value for name, value in calls if name == "run")
+    assert run_call[2]["vm_id"] == "analysis"
     assert calls[-1] == ("client_close", None)

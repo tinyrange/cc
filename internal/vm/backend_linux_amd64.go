@@ -60,7 +60,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if err != nil {
 		return nil, err
 	}
-	network, err := newLinuxAMD64NetworkRuntime(req.Network)
+	network, err := newLinuxAMD64NetworkRuntime(req.ID, req.Network)
 	if err != nil {
 		return nil, err
 	}
@@ -86,7 +86,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if workDir == "" {
 		workDir = "/"
 	}
-	initCfg := linuxGuestInitConfig(modules, true, req.Network)
+	initCfg := linuxGuestInitConfig(modules, true, req.Network, network)
 	initCfg.RootFSTag = vmruntime.RootFSTag
 	initCfg.Env = vmruntime.WithDefaultEnv(image.Config.Env)
 	initCfg.WorkDir = workDir
@@ -126,7 +126,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if err != nil {
 		return nil, err
 	}
-	network, err := newLinuxAMD64NetworkRuntime(req.Network)
+	network, err := newLinuxAMD64NetworkRuntime(req.ID, req.Network)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +148,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if err != nil {
 		return nil, fmt.Errorf("build guest init: %w", err)
 	}
-	initCfg := linuxGuestInitConfig(modules, true, req.Network)
+	initCfg := linuxGuestInitConfig(modules, true, req.Network, network)
 	initCfg.RootFSTag = vmruntime.RootFSTag
 	initCfg.Env = vmruntime.WithDefaultEnv(nil)
 	initCfg.WorkDir = "/"
@@ -228,7 +228,14 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 	if err != nil {
 		return client.ExecResponse{}, fmt.Errorf("build guest init: %w", err)
 	}
-	initCfg := linuxGuestInitConfig(modules, len(req.Command) != 0, req.Network)
+	network, err := newLinuxAMD64NetworkRuntime(req.ID, req.Network)
+	if err != nil {
+		return client.ExecResponse{}, err
+	}
+	if network != nil {
+		defer network.Close()
+	}
+	initCfg := linuxGuestInitConfig(modules, len(req.Command) != 0, req.Network, network)
 	if len(fsdevs) != 0 {
 		initCfg.RootFSTag = vmruntime.RootFSTag
 	}
@@ -263,13 +270,6 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 			Cols:    req.Cols,
 			Rows:    req.Rows,
 		}
-		network, err := newLinuxAMD64NetworkRuntime(req.Network)
-		if err != nil {
-			return client.ExecResponse{}, err
-		}
-		if network != nil {
-			defer network.Close()
-		}
 		resp, serial, err := kvm.RunManagedExecWithFSAndNet(ctx, kernel, initrd, req.MemoryMB, req.CPUs, req.Dmesg, fsdevs, networkDevice(network), execReq)
 		if err != nil && resp.Output == "" {
 			resp.Output = serial
@@ -278,13 +278,6 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 	}
 
 	var output string
-	network, err := newLinuxAMD64NetworkRuntime(req.Network)
-	if err != nil {
-		return client.ExecResponse{}, err
-	}
-	if network != nil {
-		defer network.Close()
-	}
 	if len(fsdevs) != 0 {
 		output, err = kvm.BootInitramfsToMarkerWithFSAndNet(ctx, kernel, initrd, req.MemoryMB, true, linuxInitReadyMarker, fsdevs, networkDevice(network))
 	} else {
@@ -298,6 +291,7 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 
 func (b *runtimeBackend) RunStream(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	inst, err := b.StartStream(ctx, client.CreateInstanceRequest{
+		ID:       req.ID,
 		Image:    req.Image,
 		Shares:   append([]client.ShareMount(nil), req.Shares...),
 		Network:  req.Network,
@@ -626,6 +620,13 @@ func (i *linuxInstance) AddPortForward(ctx context.Context, forward client.PortF
 	return i.network.AddPortForward(forward)
 }
 
+func (i *linuxInstance) NetworkIPv4() string {
+	if i == nil || i.network == nil {
+		return ""
+	}
+	return networkGuestAddress(i.network)
+}
+
 func (i *linuxInstance) AddImage(ctx context.Context, mountPath string, image *oci.Image) error {
 	_ = ctx
 	if i == nil || i.rootFS == nil {
@@ -680,7 +681,7 @@ func (i *linuxInstance) Close() error {
 	return err
 }
 
-func linuxGuestInitConfig(modules []alpine.Module, managedExec bool, network *client.NetworkConfig) vmruntime.GuestInitConfig {
+func linuxGuestInitConfig(modules []alpine.Module, managedExec bool, network *client.NetworkConfig, runtime *linuxNetworkRuntime) vmruntime.GuestInitConfig {
 	cfg := vmruntime.GuestInitConfig{
 		Hostname:         vmruntime.DefaultHostname(""),
 		Modules:          vmruntime.ModulePaths(modules),
@@ -696,7 +697,7 @@ func linuxGuestInitConfig(modules []alpine.Module, managedExec bool, network *cl
 	if network != nil && network.Enabled {
 		cfg.Network = &vmruntime.GuestNetworkConfig{
 			Interface: "eth0",
-			Address:   "10.42.0.2/24",
+			Address:   networkGuestCIDR(runtime),
 			Gateway:   "10.42.0.1",
 			DNS:       "10.42.0.1",
 		}

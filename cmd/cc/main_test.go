@@ -117,3 +117,161 @@ func TestValidateServerHelloRequiresAddress(t *testing.T) {
 		t.Fatalf("validateServerHello() error = %v, want missing address", err)
 	}
 }
+
+func TestParsePortForwardSpec(t *testing.T) {
+	forward, err := parsePortForwardSpec("8080:80")
+	if err != nil {
+		t.Fatalf("parsePortForwardSpec() error = %v", err)
+	}
+	if forward.Protocol != "tcp" || forward.HostAddr != "127.0.0.1" || forward.HostPort != 8080 || forward.GuestPort != 80 {
+		t.Fatalf("forward = %#v, want tcp 127.0.0.1:8080 -> 80", forward)
+	}
+
+	if _, err := parsePortForwardSpec("8080"); err == nil {
+		t.Fatal("parsePortForwardSpec(invalid) error = nil, want error")
+	}
+	if _, err := parsePortForwardSpec("0:80"); err == nil {
+		t.Fatal("parsePortForwardSpec(out of range) error = nil, want error")
+	}
+}
+
+func TestHandleVMCommandDispatch(t *testing.T) {
+	api := &fakeCCAPI{
+		statuses: []client.InstanceState{{ID: "alpha", Status: "running"}},
+		status:   client.InstanceState{ID: "alpha", Status: "running"},
+	}
+
+	if err := handleCommand(api, []string{"vm", "list"}); err != nil {
+		t.Fatalf("vm list error = %v", err)
+	}
+	if !api.listCalled {
+		t.Fatal("vm list did not call InstanceStatuses")
+	}
+
+	if err := handleCommand(api, []string{"vm", "status", "alpha"}); err != nil {
+		t.Fatalf("vm status error = %v", err)
+	}
+	if api.statusID != "alpha" {
+		t.Fatalf("status id = %q, want alpha", api.statusID)
+	}
+
+	if err := handleCommand(api, []string{"vm", "start", "alpha", "alpine"}); err != nil {
+		t.Fatalf("vm start error = %v", err)
+	}
+	if api.startID != "alpha" || api.startReq.Image != "alpine" {
+		t.Fatalf("start id=%q req=%#v, want alpha/alpine", api.startID, api.startReq)
+	}
+
+	if err := handleCommand(api, []string{"vm", "forward", "alpha", "8080:80"}); err != nil {
+		t.Fatalf("vm forward error = %v", err)
+	}
+	if api.forwardID != "alpha" || api.forward.HostPort != 8080 || api.forward.GuestPort != 80 {
+		t.Fatalf("forward id=%q forward=%#v, want alpha 8080:80", api.forwardID, api.forward)
+	}
+
+	if err := handleCommand(api, []string{"vm", "stop", "alpha"}); err != nil {
+		t.Fatalf("vm stop error = %v", err)
+	}
+	if api.shutdownID != "alpha" {
+		t.Fatalf("shutdown id = %q, want alpha", api.shutdownID)
+	}
+}
+
+func TestHandleVMRunRequiresRunningInstance(t *testing.T) {
+	api := &fakeCCAPI{status: client.InstanceState{ID: "alpha", Status: "stopped"}}
+	err := handleCommand(api, []string{"vm", "run", "alpha", "--", "true"})
+	if err == nil || !strings.Contains(err.Error(), `VM "alpha" is not running`) {
+		t.Fatalf("vm run error = %v, want not running", err)
+	}
+	if api.statusID != "alpha" {
+		t.Fatalf("status id = %q, want alpha", api.statusID)
+	}
+}
+
+type fakeCCAPI struct {
+	statuses []client.InstanceState
+	status   client.InstanceState
+
+	listCalled bool
+	statusID   string
+	startID    string
+	startReq   client.CreateInstanceRequest
+	shutdownID string
+	forwardID  string
+	forward    client.PortForward
+}
+
+func (f *fakeCCAPI) DownloadKernelStream(client.DownloadRequest, func(client.ProgressEvent) error) error {
+	return nil
+}
+
+func (f *fakeCCAPI) VMSupported() (client.VMSupportedResponse, error) {
+	return client.VMSupportedResponse{}, nil
+}
+
+func (f *fakeCCAPI) ListImages() ([]client.ImageState, error) {
+	return nil, nil
+}
+
+func (f *fakeCCAPI) GetImage(string) (client.ImageState, error) {
+	return client.ImageState{}, nil
+}
+
+func (f *fakeCCAPI) PullImageStream(string, client.PullImageRequest, func(client.ProgressEvent) error) error {
+	return nil
+}
+
+func (f *fakeCCAPI) CreateInstance(req client.CreateInstanceRequest) (client.InstanceState, error) {
+	return client.InstanceState{Status: "running", Image: req.Image}, nil
+}
+
+func (f *fakeCCAPI) CreateInstanceStream(req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
+	return client.InstanceState{Status: "running", Image: req.Image}, nil
+}
+
+func (f *fakeCCAPI) CreateInstanceStreamWithID(id string, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
+	f.startID = id
+	f.startReq = req
+	return client.InstanceState{ID: id, Status: "running", Image: req.Image}, nil
+}
+
+func (f *fakeCCAPI) KernelStatus() (client.KernelState, error) {
+	return client.KernelState{}, nil
+}
+
+func (f *fakeCCAPI) InstanceStatus() (client.InstanceState, error) {
+	return f.status, nil
+}
+
+func (f *fakeCCAPI) InstanceStatusOf(id string) (client.InstanceState, error) {
+	f.statusID = id
+	return f.status, nil
+}
+
+func (f *fakeCCAPI) InstanceStatuses() ([]client.InstanceState, error) {
+	f.listCalled = true
+	return f.statuses, nil
+}
+
+func (f *fakeCCAPI) ShutdownInstance() error {
+	return nil
+}
+
+func (f *fakeCCAPI) ShutdownInstanceWithID(id string) error {
+	f.shutdownID = id
+	return nil
+}
+
+func (f *fakeCCAPI) AddPortForwardTo(id string, forward client.PortForward) error {
+	f.forwardID = id
+	f.forward = forward
+	return nil
+}
+
+func (f *fakeCCAPI) ExecStream(client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error {
+	return nil
+}
+
+func (f *fakeCCAPI) ExecStreamIn(string, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error {
+	return nil
+}

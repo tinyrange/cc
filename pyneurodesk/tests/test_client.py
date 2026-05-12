@@ -249,6 +249,43 @@ def test_run_command_request_serializes_timeout_seconds() -> None:
     assert result.exit_code == 124
 
 
+def test_named_vm_client_methods_send_id() -> None:
+    seen: list[tuple[str, str, str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.read().decode()
+        seen.append((request.method, request.url.path, str(request.url.query.decode()), body))
+        if request.method == "GET" and request.url.path == "/vm/status":
+            return httpx.Response(200, json={"id": request.url.params.get("id"), "status": "stopped"})
+        if request.method == "POST" and request.url.path == "/vm":
+            return httpx.Response(200, json={"id": "analysis", "status": "running", "image": "niimath"})
+        if request.method == "POST" and request.url.path == "/vm/run":
+            return httpx.Response(200, json={"exit_code": 0, "output": "ok"})
+        if request.method == "POST" and request.url.path == "/vm/shutdown":
+            return httpx.Response(200, json={"id": request.url.params.get("id"), "status": "stopped"})
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    client = make_client(httpx.MockTransport(handler))
+    try:
+        status = client.instance_status(vm_id="analysis")
+        created = client.create_instance("niimath", vm_id="analysis")
+        result = client.run("niimath", ["true"], vm_id="analysis")
+        stopped = client.shutdown_instance(vm_id="analysis")
+    finally:
+        client.close()
+
+    assert status.id == "analysis"
+    assert created.id == "analysis"
+    assert result.output == "ok"
+    assert stopped.id == "analysis"
+    assert seen == [
+        ("GET", "/vm/status", "id=analysis", ""),
+        ("POST", "/vm", "", '{"image":"niimath","id":"analysis","timeout_seconds":5.0}'),
+        ("POST", "/vm/run", "", '{"image":"niimath","command":["true"],"id":"analysis"}'),
+        ("POST", "/vm/shutdown", "id=analysis", ""),
+    ]
+
+
 def test_watchdog_client_endpoints() -> None:
     seen: list[tuple[str, str, Optional[str]]] = []
 

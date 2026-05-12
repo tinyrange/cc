@@ -301,13 +301,14 @@ type StartInstanceRequest struct {
 }
 
 type InstanceState struct {
-	ID        string `json:"id,omitempty"`
-	Status    string `json:"status"`
-	Image     string `json:"image,omitempty"`
-	MemoryMB  uint64 `json:"memory_mb,omitempty"`
-	CPUs      int    `json:"cpus,omitempty"`
-	StartedAt string `json:"started_at,omitempty"`
-	Error     string `json:"error,omitempty"`
+	ID          string `json:"id,omitempty"`
+	Status      string `json:"status"`
+	Image       string `json:"image,omitempty"`
+	MemoryMB    uint64 `json:"memory_mb,omitempty"`
+	CPUs        int    `json:"cpus,omitempty"`
+	StartedAt   string `json:"started_at,omitempty"`
+	NetworkIPv4 string `json:"network_ipv4,omitempty"`
+	Error       string `json:"error,omitempty"`
 }
 
 type RunRequest struct {

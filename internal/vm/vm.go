@@ -41,6 +41,10 @@ type virtioFSStatsProvider interface {
 	VirtioFSStats() []virtio.FSStats
 }
 
+type networkIPv4Provider interface {
+	NetworkIPv4() string
+}
+
 type Manager struct {
 	mu           sync.Mutex
 	backend      Backend
@@ -127,6 +131,7 @@ func (m *Manager) StartStream(ctx context.Context, req client.CreateInstanceRequ
 
 func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
 	id = instanceID(id)
+	req.ID = id
 	if req.Image == "" {
 		return client.InstanceState{}, fmt.Errorf("image is required")
 	}
@@ -207,6 +212,7 @@ func (m *Manager) StartBlankInstanceStream(
 	onEvent func(client.BootEvent) error,
 ) (client.InstanceState, error) {
 	id = instanceID(id)
+	req.ID = id
 	if err := m.supports(); err != nil {
 		return client.InstanceState{}, err
 	}
@@ -448,7 +454,7 @@ func (m *Manager) statusLocked(id string) client.InstanceState {
 		return client.InstanceState{ID: id, Status: "stopped"}
 	}
 	machine := m.running[id]
-	return client.InstanceState{
+	state := client.InstanceState{
 		ID:        id,
 		Status:    "running",
 		Image:     machine.image,
@@ -456,6 +462,10 @@ func (m *Manager) statusLocked(id string) client.InstanceState {
 		CPUs:      machine.cpus,
 		StartedAt: machine.startedAt.Format(time.RFC3339),
 	}
+	if provider, ok := machine.instance.(networkIPv4Provider); ok {
+		state.NetworkIPv4 = provider.NetworkIPv4()
+	}
+	return state
 }
 
 func (m *Manager) watch(machine *Machine) {

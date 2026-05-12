@@ -59,6 +59,7 @@ class SessionState:
     images: dict[str, dict[str, object]]
     wrappers: dict[str, WrapperSpec]
     network: dict[str, object] | None = None
+    vm_id: str | None = None
 
     @property
     def bin_dir(self) -> Path:
@@ -72,6 +73,7 @@ class SessionState:
         return {
             "version": STATE_VERSION,
             "session_id": self.session_id,
+            "vm_id": self.vm_id or "",
             "images": self.images,
             "network": self.network or {},
             "wrappers": {
@@ -99,6 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
     activate_parser.add_argument("--shell", choices=("bash", "zsh", "powershell", "pwsh"), default=None)
     activate_parser.add_argument("--no-bootstrap", action="store_true")
     activate_parser.add_argument("--with-network", action="store_true")
+    activate_parser.add_argument("--vm", default="", help="Bind this shell session to a named cc VM")
     activate_parser.set_defaults(handler=handle_activate)
 
     completion_parser = subparsers.add_parser("completion", help="Emit shell completion code")
@@ -137,6 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
     load_parser.add_argument("--cpus", type=int, default=0)
     load_parser.add_argument("--dmesg", action="store_true")
     load_parser.add_argument("--force", action="store_true")
+    load_parser.add_argument("--vm", default="", help="Use a named cc VM for this load")
     load_parser.set_defaults(handler=handle_load)
 
     unload_parser = shell_subparsers.add_parser("unload", help="Unload an image from the current shell session")
@@ -150,10 +154,12 @@ def build_parser() -> argparse.ArgumentParser:
     forward_parser.add_argument("spec", help="HOST_PORT:GUEST_PORT")
     forward_parser.add_argument("--host-addr", default="127.0.0.1")
     forward_parser.add_argument("--guest-addr", default="10.42.0.2")
+    forward_parser.add_argument("--vm", default="", help="Forward to a named cc VM")
     forward_parser.set_defaults(handler=handle_forward)
 
     exec_parser = shell_subparsers.add_parser("exec", help="Run a command inside an image through the shared VM")
     exec_parser.add_argument("--user", default="", help="Guest user override, e.g. root")
+    exec_parser.add_argument("--vm", default="", help="Run through a named cc VM")
     exec_parser.add_argument("image")
     exec_parser.add_argument("command", nargs=argparse.REMAINDER)
     exec_parser.set_defaults(handler=handle_exec)
@@ -199,7 +205,8 @@ def handle_activate(args: argparse.Namespace) -> int:
     root.mkdir(parents=True, exist_ok=True)
     (root / "bin").mkdir(parents=True, exist_ok=True)
     network = {"enabled": True} if bool(args.with_network) else {}
-    write_state(SessionState(session_id=session_id, root=root, images={}, wrappers={}, network=network))
+    vm_id = str(args.vm or "").strip() or None
+    write_state(SessionState(session_id=session_id, root=root, images={}, wrappers={}, network=network, vm_id=vm_id))
     print(render_activation(shell_name, session_id, root, bootstrap=not bool(args.no_bootstrap)))
     return 0
 
@@ -370,6 +377,10 @@ def handle_load(args: argparse.Namespace) -> int:
     reference = reference_from_load_args(args)
     memory_mb = int(args.memory_mb or 0) or None
     cpus = int(args.cpus or 0) or None
+    vm_arg = str(args.vm or "").strip()
+    vm_id = vm_arg or state.vm_id
+    if vm_arg:
+        state.vm_id = vm_arg
     handle = load_shell_container(
         image,
         reference=reference,
@@ -379,6 +390,7 @@ def handle_load(args: argparse.Namespace) -> int:
         cpus=cpus,
         dmesg=bool(args.dmesg),
         network=session_network_config(state),
+        vm_id=vm_id,
     )
     try:
         metadata = load_deploy_metadata(handle)
@@ -438,6 +450,7 @@ def load_shell_container(
     cpus: Optional[int],
     dmesg: bool = False,
     network: Optional[NetworkConfig] = None,
+    vm_id: Optional[str] = None,
 ):
     if reference is None:
         if network is not None and network.enabled:
@@ -455,10 +468,10 @@ def load_shell_container(
         ),
     )
     if network is not None:
-        active_client.ensure_instance(reference.image, memory_mb=memory_mb, cpus=cpus, dmesg=dmesg, network=network)
+        ensure_instance(active_client, reference.image, memory_mb=memory_mb, cpus=cpus, dmesg=dmesg, network=network, vm_id=vm_id)
     else:
-        active_client.ensure_instance(reference.image, memory_mb=memory_mb, cpus=cpus, dmesg=dmesg)
-    apply_port_forwards(active_client, network)
+        ensure_instance(active_client, reference.image, memory_mb=memory_mb, cpus=cpus, dmesg=dmesg, vm_id=vm_id)
+    apply_port_forwards(active_client, network, vm_id=vm_id)
     return container_handle_for_reference(active_client, reference)
 
 
@@ -509,6 +522,7 @@ def handle_list(args: argparse.Namespace) -> int:
 def handle_forward(args: argparse.Namespace) -> int:
     state = require_session_state()
     forward = parse_forward_spec(str(args.spec), host_addr=str(args.host_addr), guest_addr=str(args.guest_addr))
+    vm_id = str(args.vm or "").strip() or state.vm_id
     network = dict(state.network or {})
     network["enabled"] = True
     forwards = list(network.get("port_forwards", []))
@@ -521,9 +535,9 @@ def handle_forward(args: argparse.Namespace) -> int:
 
     client = connect()
     try:
-        status = client.instance_status()
+        status = instance_status(client, vm_id=vm_id)
         if status.status == "running":
-            client.add_port_forward(forward)
+            add_port_forward(client, forward, vm_id=vm_id)
             print(f"forwarded {forward.host_addr or '127.0.0.1'}:{forward.host_port} -> guest:{forward.guest_port}")
         else:
             print(f"queued forward {forward.host_addr or '127.0.0.1'}:{forward.host_port} -> guest:{forward.guest_port}")
@@ -538,7 +552,11 @@ def handle_exec(args: argparse.Namespace) -> int:
     if not command:
         raise SystemExit("command is required")
     user = str(args.user or "").strip() or None
-    return run_image_command(image, command[0], command[1:], user=user)
+    vm_id = str(args.vm or "").strip() or None
+    kwargs: dict[str, object] = {"user": user}
+    if vm_id:
+        kwargs["vm_id"] = vm_id
+    return run_image_command(image, command[0], command[1:], **kwargs)
 
 
 def handle_bootstrap(args: argparse.Namespace) -> int:
@@ -596,7 +614,7 @@ def handle_run_wrapper(args: argparse.Namespace) -> int:
     deploy_env = image_record.get("deploy_env", [])
     if not isinstance(deploy_env, list):
         deploy_env = []
-    return run_image_command(str(args.image), str(args.command), wrapper_args, deploy_env=deploy_env)
+    return run_image_command(str(args.image), str(args.command), wrapper_args, deploy_env=deploy_env, vm_id=state.vm_id)
 
 
 def run_image_command(
@@ -606,8 +624,14 @@ def run_image_command(
     *,
     deploy_env: Optional[list[str]] = None,
     user: Optional[str] = None,
+    vm_id: Optional[str] = None,
 ) -> int:
-    handle = shell_session_container(image)
+    if not vm_id:
+        try:
+            vm_id = require_session_state().vm_id
+        except SystemExit:
+            vm_id = None
+    handle = shell_session_container(image, vm_id=vm_id) if vm_id else shell_session_container(image)
     try:
         env = list(deploy_env or [])
         if not env:
@@ -632,6 +656,7 @@ def run_image_command(
                 env=env,
                 shares=shares,
                 workdir=workdir,
+                **vm_id_kwargs(vm_id),
                 **user_kwargs,
                 **timeout_kwargs,
             ):
@@ -649,6 +674,7 @@ def run_image_command(
             env=env,
             shares=shares,
             workdir=workdir,
+            **vm_id_kwargs(vm_id),
             **user_kwargs,
             **timeout_kwargs,
         )
@@ -758,11 +784,17 @@ def exec_event_data(event: dict[str, object]) -> Optional[bytes]:
     return None
 
 
-def shell_session_container(image: str):
+def shell_session_container(image: str, *, vm_id: Optional[str] = None):
     reference = session_container_reference(image)
     if reference is None:
         return container(image, progress=False)
 
+    state_vm_id = vm_id
+    if not state_vm_id:
+        try:
+            state_vm_id = require_session_state().vm_id
+        except SystemExit:
+            state_vm_id = None
     image_record = session_image_record(image)
     memory_mb = int(image_record.get("memory_mb") or 0) or None
     cpus = int(image_record.get("cpus") or 0) or None
@@ -770,10 +802,10 @@ def shell_session_container(image: str):
     active_client = connect()
     active_client.ensure_image(reference)
     if network is not None:
-        active_client.ensure_instance(reference.image, memory_mb=memory_mb, cpus=cpus, network=network)
+        ensure_instance(active_client, reference.image, memory_mb=memory_mb, cpus=cpus, network=network, vm_id=state_vm_id)
     else:
-        active_client.ensure_instance(reference.image, memory_mb=memory_mb, cpus=cpus)
-    apply_port_forwards(active_client, network)
+        ensure_instance(active_client, reference.image, memory_mb=memory_mb, cpus=cpus, vm_id=state_vm_id)
+    apply_port_forwards(active_client, network, vm_id=state_vm_id)
     return container_handle_for_reference(active_client, reference)
 
 
@@ -811,14 +843,52 @@ def session_network_config(state: Optional[SessionState] = None) -> Optional[Net
     )
 
 
-def apply_port_forwards(client: object, network: Optional[NetworkConfig]) -> None:
+def apply_port_forwards(client: object, network: Optional[NetworkConfig], *, vm_id: Optional[str] = None) -> None:
     if network is None:
         return
     add = getattr(client, "add_port_forward", None)
     if add is None:
         return
     for forward in network.port_forwards:
-        add(forward)
+        add_port_forward(client, forward, vm_id=vm_id)
+
+
+def vm_id_kwargs(vm_id: Optional[str]) -> dict[str, str]:
+    value = (vm_id or "").strip()
+    if not value:
+        return {}
+    return {"vm_id": value}
+
+
+def ensure_instance(client: object, image: str, **kwargs: object) -> object:
+    vm_id = kwargs.pop("vm_id", None)
+    ensure = getattr(client, "ensure_instance")
+    if vm_id:
+        try:
+            return ensure(image, vm_id=vm_id, **kwargs)
+        except TypeError:
+            pass
+    return ensure(image, **kwargs)
+
+
+def instance_status(client: object, *, vm_id: Optional[str] = None) -> object:
+    status = getattr(client, "instance_status")
+    if vm_id:
+        try:
+            return status(vm_id=vm_id)
+        except TypeError:
+            pass
+    return status()
+
+
+def add_port_forward(client: object, forward: PortForward, *, vm_id: Optional[str] = None) -> object:
+    add = getattr(client, "add_port_forward")
+    if vm_id:
+        try:
+            return add(forward, vm_id=vm_id)
+        except TypeError:
+            pass
+    return add(forward)
 
 
 def parse_forward_spec(spec: str, *, host_addr: str = "127.0.0.1", guest_addr: str = "10.42.0.2") -> PortForward:
@@ -1346,6 +1416,7 @@ def read_state(root: Path, *, session_id: str) -> SessionState:
         images=images if isinstance(images, dict) else {},
         wrappers=wrappers,
         network=payload.get("network") if isinstance(payload.get("network"), dict) else {},
+        vm_id=str(payload["vm_id"]).strip() if payload.get("vm_id") else None,
     )
 
 

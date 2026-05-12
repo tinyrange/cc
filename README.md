@@ -110,9 +110,30 @@ cc -ccvm ./ccvm run niimath-cvmfs -- niimath -help
 cc -ccvm ./ccvm stop
 ```
 
-The HTTP API supports named instances through an optional `id` field on VM and
-exec requests. The CLI continues to use the default instance for simple local
-workflows.
+Named VM flow:
+
+```sh
+cc -ccvm ./ccvm vm start work-a alpine
+cc -ccvm ./ccvm vm start work-b niimath-cvmfs
+cc -ccvm ./ccvm vm list
+cc -ccvm ./ccvm vm run work-a -- sh -lc 'cat /etc/alpine-release'
+cc -ccvm ./ccvm vm status work-b
+cc -ccvm ./ccvm vm stop work-a
+cc -ccvm ./ccvm vm stop work-b
+```
+
+Port forwarding is available for named VMs with a `HOST_PORT:GUEST_PORT`
+mapping:
+
+```sh
+cc -ccvm ./ccvm vm forward work-a 8080:80
+```
+
+The simple `start`, `stop`, `status`, and `run` commands continue to operate on
+the default VM. The daemon also supports named instances through `id` fields on
+VM and exec requests and through `GET /vm` for listing. Reported
+`max_instances` is a daemon concurrency limit, not a guarantee that the host has
+enough free memory or CPU for that many guests.
 
 ## Python Client
 

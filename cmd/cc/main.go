@@ -22,6 +22,26 @@ type daemonState struct {
 	Addr string `json:"addr"`
 }
 
+type ccAPI interface {
+	DownloadKernelStream(client.DownloadRequest, func(client.ProgressEvent) error) error
+	VMSupported() (client.VMSupportedResponse, error)
+	ListImages() ([]client.ImageState, error)
+	GetImage(string) (client.ImageState, error)
+	PullImageStream(string, client.PullImageRequest, func(client.ProgressEvent) error) error
+	CreateInstance(client.CreateInstanceRequest) (client.InstanceState, error)
+	CreateInstanceStream(client.CreateInstanceRequest, func(client.BootEvent) error) (client.InstanceState, error)
+	CreateInstanceStreamWithID(string, client.CreateInstanceRequest, func(client.BootEvent) error) (client.InstanceState, error)
+	KernelStatus() (client.KernelState, error)
+	InstanceStatus() (client.InstanceState, error)
+	InstanceStatusOf(string) (client.InstanceState, error)
+	InstanceStatuses() ([]client.InstanceState, error)
+	ShutdownInstance() error
+	ShutdownInstanceWithID(string) error
+	AddPortForwardTo(string, client.PortForward) error
+	ExecStream(client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+	ExecStreamIn(string, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+}
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "cc:", err)
@@ -39,7 +59,7 @@ func run() error {
 	}
 	args := fs.Args()
 	if len(args) == 0 {
-		return fmt.Errorf("usage: cc [flags] <command>\ncommands: doctor, images [name], pull <name> <source>, start <image>, stop, status, run <image> -- <cmd...>")
+		return fmt.Errorf("usage: cc [flags] <command>\ncommands: doctor, images [name], pull <name> <source>, start <image>, stop, status, run <image> -- <cmd...>, vm <subcommand>")
 	}
 
 	rootCache, err := resolveCacheDir(*cacheDir)
@@ -58,6 +78,10 @@ func run() error {
 		return err
 	}
 
+	return handleCommand(api, args)
+}
+
+func handleCommand(api ccAPI, args []string) error {
 	switch args[0] {
 	case "doctor":
 		if len(args) != 1 {
@@ -135,12 +159,72 @@ func run() error {
 			return fmt.Errorf("usage: cc run <image> -- <cmd...>")
 		}
 		return runViaWebsocket(api, args[1], args[3:])
+	case "vm":
+		return handleVMCommand(api, args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
 }
 
-func runViaWebsocket(api *client.Client, image string, command []string) error {
+func handleVMCommand(api ccAPI, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: cc vm <list|start|stop|status|run|forward> ...")
+	}
+	switch args[0] {
+	case "list":
+		if len(args) != 1 {
+			return fmt.Errorf("usage: cc vm list")
+		}
+		statuses, err := api.InstanceStatuses()
+		if err != nil {
+			return err
+		}
+		return printJSON(statuses)
+	case "start":
+		if len(args) != 3 {
+			return fmt.Errorf("usage: cc vm start <name> <image>")
+		}
+		state, err := api.CreateInstanceStreamWithID(args[1], client.CreateInstanceRequest{
+			Image: args[2],
+		}, bootEventReporter(os.Stderr))
+		if err != nil {
+			return err
+		}
+		return printJSON(state)
+	case "stop":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: cc vm stop <name>")
+		}
+		return api.ShutdownInstanceWithID(args[1])
+	case "status":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: cc vm status <name>")
+		}
+		state, err := api.InstanceStatusOf(args[1])
+		if err != nil {
+			return err
+		}
+		return printJSON(state)
+	case "run":
+		if len(args) < 4 || args[2] != "--" {
+			return fmt.Errorf("usage: cc vm run <name> -- <cmd...>")
+		}
+		return runInVMViaWebsocket(api, args[1], args[3:])
+	case "forward":
+		if len(args) != 3 {
+			return fmt.Errorf("usage: cc vm forward <name> <HOST_PORT:GUEST_PORT>")
+		}
+		forward, err := parsePortForwardSpec(args[2])
+		if err != nil {
+			return err
+		}
+		return api.AddPortForwardTo(args[1], forward)
+	default:
+		return fmt.Errorf("unknown vm command %q", args[0])
+	}
+}
+
+func runViaWebsocket(api ccAPI, image string, command []string) error {
 	state, err := api.InstanceStatus()
 	if err != nil {
 		return err
@@ -165,6 +249,21 @@ func runViaWebsocket(api *client.Client, image string, command []string) error {
 		defer api.ShutdownInstance()
 	}
 
+	return execViaWebsocket(api, "", command)
+}
+
+func runInVMViaWebsocket(api ccAPI, id string, command []string) error {
+	state, err := api.InstanceStatusOf(id)
+	if err != nil {
+		return err
+	}
+	if state.Status != "running" {
+		return fmt.Errorf("VM %q is not running", id)
+	}
+	return execViaWebsocket(api, id, command)
+}
+
+func execViaWebsocket(api ccAPI, id string, command []string) error {
 	ttyMode := isTerminal(os.Stdin) && isTerminal(os.Stdout)
 	req := client.ExecRequest{
 		Command: append([]string(nil), command...),
@@ -196,7 +295,13 @@ func runViaWebsocket(api *client.Client, image string, command []string) error {
 		close(inputs)
 	}()
 
-	if err := api.ExecStream(req, inputs, func(event client.ExecEvent) error {
+	stream := api.ExecStream
+	if strings.TrimSpace(id) != "" {
+		stream = func(req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+			return api.ExecStreamIn(id, req, inputs, onEvent)
+		}
+	}
+	if err := stream(req, inputs, func(event client.ExecEvent) error {
 		switch event.Kind {
 		case "stdout":
 			if len(event.Data) > 0 {
@@ -225,6 +330,42 @@ func runViaWebsocket(api *client.Client, image string, command []string) error {
 		return fmt.Errorf("guest command exited with status %d", exitCode)
 	}
 	return nil
+}
+
+func parsePortForwardSpec(spec string) (client.PortForward, error) {
+	parts := strings.Split(spec, ":")
+	if len(parts) != 2 {
+		return client.PortForward{}, fmt.Errorf("port forward must be HOST_PORT:GUEST_PORT")
+	}
+	hostPort, err := parseTCPPort(parts[0], "host")
+	if err != nil {
+		return client.PortForward{}, err
+	}
+	guestPort, err := parseTCPPort(parts[1], "guest")
+	if err != nil {
+		return client.PortForward{}, err
+	}
+	return client.PortForward{
+		Protocol:  "tcp",
+		HostAddr:  "127.0.0.1",
+		HostPort:  hostPort,
+		GuestPort: guestPort,
+	}, nil
+}
+
+func parseTCPPort(value, label string) (int, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, fmt.Errorf("%s port is required", label)
+	}
+	port, err := net.LookupPort("tcp", value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s port %q", label, value)
+	}
+	if port <= 0 || port > 65535 {
+		return 0, fmt.Errorf("%s port %d out of range", label, port)
+	}
+	return port, nil
 }
 
 func progressEventReporter(stream *os.File, fallbackArtifact string) func(client.ProgressEvent) error {
