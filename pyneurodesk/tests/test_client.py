@@ -482,6 +482,32 @@ def test_client_http_error_includes_response_body() -> None:
         client.close()
 
 
+def test_client_http_error_prefers_json_error_detail() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/vm":
+            return httpx.Response(
+                503,
+                json={
+                    "error": (
+                        "kvm unavailable: /dev/kvm does not exist; hardware virtualization "
+                        "is not available to this host"
+                    )
+                },
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    client = make_client(httpx.MockTransport(handler))
+    try:
+        with pytest.raises(httpx.HTTPStatusError) as excinfo:
+            client.create_instance("niimath")
+    finally:
+        client.close()
+
+    message = str(excinfo.value)
+    assert "Response body: kvm unavailable: /dev/kvm does not exist" in message
+    assert '{"error"' not in message
+
+
 def test_create_instance_sends_dmesg_when_requested() -> None:
     seen: dict[str, object] = {}
 

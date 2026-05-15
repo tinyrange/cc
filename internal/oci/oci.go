@@ -1222,6 +1222,8 @@ func ParseSource(source string) (SourceSpec, error) {
 		return SourceSpec{Kind: SourceKindCVMFS, Raw: source}, nil
 	case strings.HasPrefix(lower, "cvmfs://"):
 		return SourceSpec{Kind: SourceKindCVMFS, Raw: source}, nil
+	case strings.HasPrefix(lower, "/cvmfs/"):
+		return SourceSpec{Kind: SourceKindCVMFS, Raw: source}, nil
 	case (strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")) && strings.Contains(lower, "/cvmfs/"):
 		return SourceSpec{Kind: SourceKindCVMFS, Raw: source}, nil
 	case strings.HasSuffix(lower, ".simg"), strings.HasSuffix(lower, ".sif"):

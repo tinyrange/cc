@@ -26,6 +26,7 @@ from .models import (
     RunCommandRequest,
     ShareMount,
     VMState,
+    VMSupportedState,
 )
 
 DEFAULT_BOOT_TIMEOUT_SECONDS = 5.0
@@ -134,6 +135,11 @@ class PyNeurodeskClient:
         response = self._client.get("/kernel")
         payload = self._decode_json(response)
         return KernelState.from_payload(payload)
+
+    def vm_supported(self) -> VMSupportedState:
+        response = self._client.get("/vm/supported")
+        payload = self._decode_json(response)
+        return VMSupportedState.from_payload(payload)
 
     def download_kernel(self) -> KernelState:
         response = self._client.post("/kernel/download", json={})
@@ -506,6 +512,12 @@ class PyNeurodeskClient:
         except httpx.HTTPStatusError as exc:
             detail = response.text.strip()
             if detail:
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = None
+                if isinstance(payload, dict) and isinstance(payload.get("error"), str):
+                    detail = payload["error"]
                 message = f"{exc} Response body: {detail}"
                 raise httpx.HTTPStatusError(message, request=exc.request, response=exc.response) from exc
             raise

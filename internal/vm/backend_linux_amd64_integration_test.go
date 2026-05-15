@@ -752,6 +752,7 @@ func TestRuntimeBackendRunNiimathFromCVMFSPath(t *testing.T) {
 	defer cancel()
 
 	root := t.TempDir()
+	t.Setenv("CCX3_OCI_SHARED_CACHE_DIR", filepath.Join(root, "oci-shared-cache"))
 	kernel := alpine.NewManager(filepath.Join(root, "kernel"))
 	if err := kernel.Ensure(ctx); err != nil {
 		t.Fatalf("kernel.Ensure() error = %v", err)

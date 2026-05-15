@@ -66,8 +66,9 @@ func resolveCVMFSRootTarget(client *intcvmfs.Client, source string) (string, boo
 			return rootTarget, true, nil
 		}
 		return "", false, fmt.Errorf("resolve cvmfs container root: %q does not contain %q", source, base+".simg")
+	} else {
+		return "", false, fmt.Errorf("read cvmfs container directory: %w", err)
 	}
-	return "", false, fmt.Errorf("read cvmfs container directory: %w", os.ErrNotExist)
 }
 
 func buildCVMFSDirectoryIndex(client *intcvmfs.Client, rootTarget string) ([]indexedNode, map[string]fsmeta.Entry, string, error) {

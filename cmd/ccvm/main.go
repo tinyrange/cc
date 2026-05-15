@@ -546,6 +546,14 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
 		defer cancel()
 		timingLog("POST /vm/start decode took=%s", time.Since(start))
+		if err := vm.Supports(); err != nil {
+			if wantsBootEventStream(r) {
+				writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+				return
+			}
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
+		}
 		if srvState.kernel.Status().Status != "downloaded" {
 			if wantsBootEventStream(r) {
 				writeBootEvent(w, client.BootEvent{Kind: "status", Message: "ensuring kernel is available"})
@@ -625,6 +633,14 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 		timingLog("POST /vm image lookup took=%s", time.Since(start))
 		if wantsBootEventStream(r) {
 			writeBootEvent(w, client.BootEvent{Kind: "status", Message: fmt.Sprintf("validated image %s", req.Image)})
+		}
+		if err := vm.Supports(); err != nil {
+			if wantsBootEventStream(r) {
+				writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+				return
+			}
+			writeError(w, http.StatusServiceUnavailable, err)
+			return
 		}
 		if srvState.kernel.Status().Status != "downloaded" {
 			if wantsBootEventStream(r) {

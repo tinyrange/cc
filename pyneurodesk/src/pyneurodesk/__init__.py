@@ -34,6 +34,7 @@ from .models import (
     PortForward,
     RunCommandRequest,
     ShareMount,
+    VMSupportedState,
 )
 from .shell import main as shell_main
 
@@ -64,6 +65,7 @@ __all__ = [
     "ShareMount",
     "SharedDirectory",
     "SharedPath",
+    "VMSupportedState",
     "connect",
     "container",
     "load_deploy_metadata",

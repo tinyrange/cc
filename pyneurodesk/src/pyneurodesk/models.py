@@ -427,6 +427,19 @@ class VMState:
 
 
 @dataclass(frozen=True)
+class VMSupportedState:
+    supported: bool
+    error: Optional[str] = None
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "VMSupportedState":
+        return cls(
+            supported=bool(payload.get("supported", False)),
+            error=payload.get("error"),
+        )
+
+
+@dataclass(frozen=True)
 class DaemonState:
     addr: str
     cache_dir: Optional[str] = None

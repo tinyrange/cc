@@ -72,6 +72,15 @@ jobs:
           test -r /dev/kvm -a -w /dev/kvm
           go test -tags embed_guestinit ./internal/hv/kvm -run 'TestProbeReportsVMCreation|TestKernelBootSerial|TestInitramfsBootReadyMarker' -count=1
 
+      - name: Run live Neurodesk CVMFS KVM test
+        timeout-minutes: 10
+        env:
+          CCX3_KVM_BOOT: "1"
+          CCX3_CVMFS_LIVE: "1"
+        run: |
+          test -r /dev/kvm -a -w /dev/kvm
+          go test -tags embed_guestinit ./internal/vm -run '^TestRuntimeBackendRunNiimathFromCVMFSPath$' -count=1 -v
+
       - name: Build ccvm for Python unit tests
         run: |
           mkdir -p build

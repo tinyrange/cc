@@ -659,7 +659,7 @@ func TestStorePullReportsUnsupportedSourceKinds(t *testing.T) {
 		want   string
 	}{
 		{source: "/tmp/tool.simg", want: "stat simg source:"},
-		{source: "http+cvmfs://cvmfs.neurodesk.org/cvmfs/neurodesk.ardc.edu.au?path=containers/tool", want: "read cvmfs container directory: file does not exist"},
+		{source: "/cvmfs/test.repo/containers/tool", want: "read cvmfs container directory: open /cvmfs/test.repo/containers/tool: no such file or directory"},
 	}
 	for _, tt := range tests {
 		_, err := store.Pull(context.Background(), "test", tt.source)
@@ -677,7 +677,7 @@ func TestStorePullReportsUnsupportedSourceKinds(t *testing.T) {
 
 func TestStorePullImportsDirectoryBackedCVMFSContainer(t *testing.T) {
 	server := newOCICVMFSDirectoryRepoServer(t)
-	store := NewStore(t.TempDir())
+	store, sharedCache := newStoreWithTempSharedCache(t)
 	store.httpClient = server.Client()
 
 	source := server.URL + "/cvmfs/test.repo/containers/niimath_1.0.20250804_20251016"
@@ -688,6 +688,7 @@ func TestStorePullImportsDirectoryBackedCVMFSContainer(t *testing.T) {
 	if state.SourceKind != SourceKindCVMFS {
 		t.Fatalf("Pull().SourceKind = %q, want %q", state.SourceKind, SourceKindCVMFS)
 	}
+	assertCVMFSCachePopulated(t, sharedCache)
 
 	img, err := store.Open("niimath")
 	if err != nil {
@@ -709,9 +710,33 @@ func TestStorePullImportsDirectoryBackedCVMFSContainer(t *testing.T) {
 	}
 }
 
+func TestStorePullCVMFSUsesFreshTemporaryCache(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "mirror unavailable", http.StatusBadGateway)
+	}))
+	defer server.Close()
+
+	store, sharedCache := newStoreWithTempSharedCache(t)
+	store.httpClient = server.Client()
+
+	source := server.URL + "/cvmfs/test.repo/containers/niimath_1.0.20250804_20251016"
+	_, err := store.Pull(context.Background(), "niimath", source)
+	if err == nil {
+		t.Fatal("Pull() error = nil, want temporary-cache miss to surface mirror failure")
+	}
+	if !strings.Contains(err.Error(), "read cvmfs container directory: fetch manifest: unexpected status 502 Bad Gateway") {
+		t.Fatalf("Pull() error = %q, want fresh-cache mirror failure", err.Error())
+	}
+
+	manifestPath := filepath.Join(cvmfsCacheDir(sharedCache), "state", "test.repo", "manifest")
+	if _, statErr := os.Stat(manifestPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("unexpected manifest cache at %q after failed pull: %v", manifestPath, statErr)
+	}
+}
+
 func TestStorePullImportsInnerSIMGDirectoryBackedCVMFSContainer(t *testing.T) {
 	server := newOCICVMFSDirectoryRepoServer(t)
-	store := NewStore(t.TempDir())
+	store, sharedCache := newStoreWithTempSharedCache(t)
 	store.httpClient = server.Client()
 
 	source := server.URL + "/cvmfs/test.repo/containers/niimath_1.0.20250804_20251016/niimath_1.0.20250804_20251016.simg"
@@ -722,6 +747,7 @@ func TestStorePullImportsInnerSIMGDirectoryBackedCVMFSContainer(t *testing.T) {
 	if state.SourceKind != SourceKindCVMFS {
 		t.Fatalf("Pull().SourceKind = %q, want %q", state.SourceKind, SourceKindCVMFS)
 	}
+	assertCVMFSCachePopulated(t, sharedCache)
 
 	img, err := store.Open("niimath")
 	if err != nil {
@@ -816,12 +842,6 @@ func TestBuildCVMFSIndexedRootFSReadsPackedContents(t *testing.T) {
 }
 
 func TestStorePullRefreshesDirectoryBackedCVMFSWhenManifestChanges(t *testing.T) {
-	sharedCache := t.TempDir()
-	if err := os.Setenv(sharedCacheEnv, sharedCache); err != nil {
-		t.Fatalf("Setenv(%s) error = %v", sharedCacheEnv, err)
-	}
-	defer os.Unsetenv(sharedCacheEnv)
-
 	rootCatalogHashA := strings.Repeat("a", 40)
 	rootCatalogHashB := strings.Repeat("f", 40)
 	nestedCatalogHash := strings.Repeat("b", 40)
@@ -875,7 +895,7 @@ func TestStorePullRefreshesDirectoryBackedCVMFSWhenManifestChanges(t *testing.T)
 	}))
 	defer server.Close()
 
-	store := NewStore(t.TempDir())
+	store, sharedCache := newStoreWithTempSharedCache(t)
 	store.httpClient = server.Client()
 	source := server.URL + "/cvmfs/test.repo/containers/niimath_1.0.20250804_20251016"
 
@@ -889,6 +909,7 @@ func TestStorePullRefreshesDirectoryBackedCVMFSWhenManifestChanges(t *testing.T)
 	if meta.CVMFSRootHash != rootCatalogHashA {
 		t.Fatalf("first CVMFSRootHash = %q, want %q", meta.CVMFSRootHash, rootCatalogHashA)
 	}
+	assertCVMFSCachePopulated(t, sharedCache)
 
 	currentRootHash.Store(rootCatalogHashB)
 	if _, err := store.Pull(context.Background(), "niimath", source); err != nil {
@@ -992,6 +1013,32 @@ func createOCITestCatalogDB(t *testing.T, statements []string) []byte {
 		t.Fatal(err)
 	}
 	return data
+}
+
+func newStoreWithTempSharedCache(t *testing.T) (*Store, string) {
+	t.Helper()
+
+	sharedCache := t.TempDir()
+	t.Setenv(sharedCacheEnv, sharedCache)
+	return NewStore(t.TempDir()), sharedCache
+}
+
+func assertCVMFSCachePopulated(t *testing.T, sharedCache string) {
+	t.Helper()
+
+	cvmfsCache := cvmfsCacheDir(sharedCache)
+	manifestPath := filepath.Join(cvmfsCache, "state", "test.repo", "manifest")
+	if _, err := os.Stat(manifestPath); err != nil {
+		t.Fatalf("CVMFS manifest cache was not written under temp cache %q: %v", cvmfsCache, err)
+	}
+	objectsPath := filepath.Join(cvmfsCache, "objects")
+	entries, err := os.ReadDir(objectsPath)
+	if err != nil {
+		t.Fatalf("CVMFS object cache was not written under temp cache %q: %v", cvmfsCache, err)
+	}
+	if len(entries) == 0 {
+		t.Fatalf("CVMFS object cache %q is empty", objectsPath)
+	}
 }
 
 func itoa(v int) string {
