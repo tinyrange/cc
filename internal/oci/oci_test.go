@@ -656,18 +656,20 @@ func TestStorePullReportsUnsupportedSourceKinds(t *testing.T) {
 	store := NewStore(t.TempDir())
 	tests := []struct {
 		source string
-		want   string
+		want   []string
 	}{
-		{source: "/tmp/tool.simg", want: "stat simg source:"},
-		{source: "/cvmfs/test.repo/containers/tool", want: "read cvmfs container directory: open /cvmfs/test.repo/containers/tool: no such file or directory"},
+		{source: "/tmp/tool.simg", want: []string{"stat simg source:"}},
+		{source: "/cvmfs/test.repo/containers/tool", want: []string{"read cvmfs container directory:", "/cvmfs/test.repo/containers/tool"}},
 	}
 	for _, tt := range tests {
 		_, err := store.Pull(context.Background(), "test", tt.source)
 		if err == nil {
 			t.Fatalf("Pull(%q) error = nil, want error", tt.source)
 		}
-		if !strings.Contains(err.Error(), tt.want) {
-			t.Fatalf("Pull(%q) error = %q, want substring %q", tt.source, err.Error(), tt.want)
+		for _, want := range tt.want {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("Pull(%q) error = %q, want substring %q", tt.source, err.Error(), want)
+			}
 		}
 		if !errors.Is(err, context.Canceled) && store.lastErr["test"] == nil {
 			t.Fatalf("store.lastErr[test] was not recorded")

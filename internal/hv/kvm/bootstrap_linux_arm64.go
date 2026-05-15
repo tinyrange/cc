@@ -36,7 +36,7 @@ func Open() (*Bootstrap, error) {
 		case errors.Is(err, unix.ENOENT):
 			return nil, fmt.Errorf("kvm unavailable: /dev/kvm does not exist; hardware virtualization is not available to this host or the KVM kernel module is not loaded")
 		case errors.Is(err, unix.EACCES), errors.Is(err, unix.EPERM):
-			return nil, fmt.Errorf("kvm unavailable: cannot open /dev/kvm read/write: %w; give the current user access to /dev/kvm, usually by adding the user to the kvm group or adjusting device permissions")
+			return nil, fmt.Errorf("kvm unavailable: cannot open /dev/kvm read/write: %w; give the current user access to /dev/kvm, usually by adding the user to the kvm group or adjusting device permissions", err)
 		default:
 			return nil, fmt.Errorf("kvm unavailable: open /dev/kvm: %w", err)
 		}
