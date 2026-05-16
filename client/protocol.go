@@ -209,6 +209,11 @@ func (r PullImageRequest) SourceString() (string, error) {
 			return "", fmt.Errorf("oci path is required")
 		}
 		return r.SourceRef.Path, nil
+	case "docker-archive":
+		if strings.TrimSpace(r.SourceRef.Path) == "" {
+			return "", fmt.Errorf("docker archive path is required")
+		}
+		return "docker-archive:" + r.SourceRef.Path, nil
 	default:
 		return "", fmt.Errorf("unsupported source type %q", r.SourceRef.Type)
 	}

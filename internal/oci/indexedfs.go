@@ -2,6 +2,7 @@ package oci
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
@@ -455,6 +456,10 @@ func (l *indexedSymlink) Owner() (uint32, uint32) { return l.uid, l.gid }
 func (l *indexedSymlink) RDev() uint32            { return l.rdev }
 
 func writeLayerTar(dstPath, mediaType string, blob []byte) error {
+	return writeLayerTarFromReader(dstPath, mediaType, bytes.NewReader(blob))
+}
+
+func writeLayerTarFromReader(dstPath, mediaType string, body io.Reader) error {
 	if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
 		return err
 	}
@@ -463,8 +468,15 @@ func writeLayerTar(dstPath, mediaType string, blob []byte) error {
 		return err
 	}
 	defer dst.Close()
-	var src io.Reader = bytes.NewReader(blob)
-	if isGzipMediaType(mediaType, blob) {
+	buffered := bufio.NewReader(body)
+	var src io.Reader = buffered
+	gzipLayer := strings.Contains(mediaType, "gzip")
+	if !gzipLayer {
+		if magic, err := buffered.Peek(2); err == nil {
+			gzipLayer = magic[0] == 0x1f && magic[1] == 0x8b
+		}
+	}
+	if gzipLayer {
 		gzr, err := gzip.NewReader(src)
 		if err != nil {
 			return fmt.Errorf("open gzip layer: %w", err)
@@ -505,6 +517,9 @@ func applyIndexedLayer(tarPath string, tarRef string, merged map[string]*indexed
 		}
 		if err != nil {
 			return fmt.Errorf("read layer tar: %w", err)
+		}
+		if path.Clean(strings.TrimPrefix(hdr.Name, "/")) == "." {
+			continue
 		}
 		name, err := sanitizeArchivePath(hdr.Name)
 		if err != nil {

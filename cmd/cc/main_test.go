@@ -268,6 +268,10 @@ func (f *fakeCCAPI) AddPortForwardTo(id string, forward client.PortForward) erro
 	return nil
 }
 
+func (f *fakeCCAPI) RunIn(string, client.RunRequest) (client.ExecResponse, error) {
+	return client.ExecResponse{}, nil
+}
+
 func (f *fakeCCAPI) ExecStream(client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error {
 	return nil
 }

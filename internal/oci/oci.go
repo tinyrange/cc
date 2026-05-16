@@ -33,9 +33,10 @@ const sharedCacheEnv = "CCX3_OCI_SHARED_CACHE_DIR"
 const sharedCacheSchemaVersion = "3"
 
 const (
-	SourceKindOCI   = "oci"
-	SourceKindSIMG  = "simg"
-	SourceKindCVMFS = "cvmfs"
+	SourceKindOCI           = "oci"
+	SourceKindSIMG          = "simg"
+	SourceKindCVMFS         = "cvmfs"
+	SourceKindDockerArchive = "docker-archive"
 )
 
 type Store struct {
@@ -419,6 +420,8 @@ func (s *Store) pullDirect(ctx context.Context, name string, spec SourceSpec, op
 		return s.pullSIMGDirect(ctx, name, spec)
 	case SourceKindCVMFS:
 		return s.pullCVMFSDirect(ctx, name, spec, options)
+	case SourceKindDockerArchive:
+		return s.pullDockerArchiveDirect(ctx, name, spec)
 	default:
 		return fmt.Errorf("unsupported image source kind %q", spec.Kind)
 	}
@@ -767,35 +770,47 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec)
 		return fmt.Errorf("decode image config: %w", err)
 	}
 
-	fsEntries := map[string]fsmeta.Entry{
-		"/": {UID: 0, GID: 0, Mode: fsmeta.LinuxModeFromFileMode(os.ModeDir | 0o755)},
-	}
-	merged := map[string]*indexedNode{
-		"/": {
-			Path: "/",
-			Kind: indexedKindDir,
-			Mode: fsEntries["/"].Mode,
-			UID:  0,
-			GID:  0,
-		},
-	}
+	build := newIndexedBuildState()
 	for _, layer := range mani.Layers {
-		layerBlob, err := s.fetchBlob(ctx, reg, imageName, layer.Digest)
-		if err != nil {
-			return fmt.Errorf("fetch layer %s: %w", layer.Digest, err)
-		}
 		layerTarRel := filepath.Join("layers", digestToFileName(layer.Digest)+".tar")
 		layerTarPath := filepath.Join(tmpDir, layerTarRel)
-		if err := writeLayerTar(layerTarPath, layer.MediaType, layerBlob); err != nil {
+		if err := s.fetchLayerTar(ctx, reg, imageName, layer, layerTarPath); err != nil {
 			return fmt.Errorf("cache layer %s: %w", layer.Digest, err)
 		}
-		if err := applyIndexedLayer(layerTarPath, layerTarRel, merged, fsEntries); err != nil {
+		if err := applyIndexedLayer(layerTarPath, layerTarRel, build.merged, build.fsEntries); err != nil {
 			return fmt.Errorf("index layer %s: %w", layer.Digest, err)
 		}
 	}
-	ensureIndexedParents(merged, fsEntries)
+	return s.finalizeIndexedImage(name, spec, imageDir, tmpDir, cfg, build)
+}
+
+type indexedBuildState struct {
+	merged    map[string]*indexedNode
+	fsEntries map[string]fsmeta.Entry
+}
+
+func newIndexedBuildState() indexedBuildState {
+	fsEntries := map[string]fsmeta.Entry{
+		"/": {UID: 0, GID: 0, Mode: fsmeta.LinuxModeFromFileMode(os.ModeDir | 0o755)},
+	}
+	return indexedBuildState{
+		fsEntries: fsEntries,
+		merged: map[string]*indexedNode{
+			"/": {
+				Path: "/",
+				Kind: indexedKindDir,
+				Mode: fsEntries["/"].Mode,
+				UID:  0,
+				GID:  0,
+			},
+		},
+	}
+}
+
+func (s *Store) finalizeIndexedImage(name string, spec SourceSpec, imageDir, tmpDir string, cfg imageConfig, build indexedBuildState) error {
+	ensureIndexedParents(build.merged, build.fsEntries)
 	indexPath := filepath.Join(imageDir, "rootfs.index.json")
-	indexBuf, err := encodeFSIndex(merged)
+	indexBuf, err := encodeFSIndex(build.merged)
 	if err != nil {
 		return fmt.Errorf("marshal fs index: %w", err)
 	}
@@ -803,7 +818,7 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec)
 		return fmt.Errorf("write fs index: %w", err)
 	}
 	metadataPath := filepath.Join(imageDir, "rootfs.metadata.json")
-	fsMetaBuf, err := json.MarshalIndent(fsEntries, "", "  ")
+	fsMetaBuf, err := json.MarshalIndent(build.fsEntries, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal fs metadata: %w", err)
 	}
@@ -1021,6 +1036,21 @@ func (s *Store) fetchBlob(ctx context.Context, reg *registryContext, imageName, 
 	return data, nil
 }
 
+func (s *Store) fetchLayerTar(ctx context.Context, reg *registryContext, imageName string, layer descriptor, dstPath string) error {
+	blobPath := filepath.Join(s.root, "_blobs", digestToFileName(layer.Digest))
+	if file, err := os.Open(blobPath); err == nil {
+		defer file.Close()
+		return writeLayerTarFromReader(dstPath, layer.MediaType, file)
+	}
+
+	resp, err := reg.do(ctx, "/"+imageName+"/blobs/"+layer.Digest, nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return writeLayerTarFromReader(dstPath, layer.MediaType, resp.Body)
+}
+
 func (s *Store) getJSONBlob(ctx context.Context, reg *registryContext, path string, accept []string) ([]byte, string, error) {
 	resp, err := reg.do(ctx, path, accept)
 	if err != nil {
@@ -1218,6 +1248,8 @@ func ParseSource(source string) (SourceSpec, error) {
 	}
 	lower := strings.ToLower(source)
 	switch {
+	case strings.HasPrefix(lower, "docker-archive:"):
+		return SourceSpec{Kind: SourceKindDockerArchive, Raw: source}, nil
 	case strings.HasPrefix(lower, "http+cvmfs://"):
 		return SourceSpec{Kind: SourceKindCVMFS, Raw: source}, nil
 	case strings.HasPrefix(lower, "cvmfs://"):

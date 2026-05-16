@@ -6,6 +6,8 @@ import (
 	"compress/gzip"
 	"compress/zlib"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -150,6 +152,287 @@ func TestStorePullExtractsRootFSAndRuntimeConfig(t *testing.T) {
 	target := entry.Symlink.Target()
 	if target != "busybox" {
 		t.Fatalf("bin/sh target = %q, want busybox", target)
+	}
+}
+
+func TestStorePullDockerArchiveImportsIndexedLayers(t *testing.T) {
+	layer1 := plainTar(t, map[string]tarEntry{
+		"bin/":           {Typeflag: tar.TypeDir, Mode: 0o755},
+		"bin/tool":       {Data: []byte("tool"), Mode: 0o755},
+		"bin/tool-link":  {Typeflag: tar.TypeSymlink, Linkname: "tool", Mode: 0o777},
+		"etc/":           {Typeflag: tar.TypeDir, Mode: 0o755},
+		"etc/obsolete":   {Data: []byte("old"), Mode: 0o644},
+		"etc/os-release": {Data: []byte("NAME=Archive"), Mode: 0o644},
+	})
+	layer2 := plainTar(t, map[string]tarEntry{
+		"etc/.wh.obsolete": {Data: nil, Mode: 0o000},
+		"etc/hostname":     {Data: []byte("archive-host"), Mode: 0o644},
+	})
+	configBlob, err := json.Marshal(map[string]any{
+		"architecture": nativeArch(),
+		"config": map[string]any{
+			"Env":        []string{"PATH=/bin", "HOME=/root"},
+			"Entrypoint": []string{"/bin/tool"},
+			"Cmd":        []string{"--help"},
+			"WorkingDir": "/work",
+			"User":       "1000",
+			"Labels":     map[string]string{"archive": "true"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Marshal(config) error = %v", err)
+	}
+	archivePath := dockerArchive(t, []dockerArchiveFixtureImage{{
+		ConfigName: "config.json",
+		Config:     configBlob,
+		RepoTags:   []string{"example/tool:latest"},
+		Layers: []dockerArchiveFixtureLayer{
+			{Name: "111/layer.tar", Data: layer1},
+			{Name: "222/layer.tar", Data: layer2},
+		},
+	}})
+
+	store := NewStore(t.TempDir())
+	state, err := store.Pull(context.Background(), "tool", "docker-archive:"+archivePath)
+	if err != nil {
+		t.Fatalf("Pull() error = %v", err)
+	}
+	if state.SourceKind != SourceKindDockerArchive {
+		t.Fatalf("Pull().SourceKind = %q, want %q", state.SourceKind, SourceKindDockerArchive)
+	}
+	img, err := store.Open("tool")
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if img.SourceKind != SourceKindDockerArchive {
+		t.Fatalf("img.SourceKind = %q, want %q", img.SourceKind, SourceKindDockerArchive)
+	}
+	if got := img.Command(nil); len(got) != 2 || got[0] != "/bin/tool" || got[1] != "--help" {
+		t.Fatalf("img.Command(nil) = %v, want entrypoint plus cmd", got)
+	}
+	if img.Config.WorkingDir != "/work" || img.Config.User != "1000" || img.Config.Labels["archive"] != "true" {
+		t.Fatalf("runtime config not preserved: %#v", img.Config)
+	}
+	if _, err := imagefs.LookupPath(img.RootFS, "/etc/obsolete"); err == nil {
+		t.Fatal("LookupPath(/etc/obsolete) error = nil, want whiteout removal")
+	}
+	entry, err := imagefs.LookupPath(img.RootFS, "/etc/hostname")
+	if err != nil {
+		t.Fatalf("LookupPath(/etc/hostname) error = %v", err)
+	}
+	data, err := entry.File.ReadAt(0, 64)
+	if err != nil {
+		t.Fatalf("hostname.ReadAt() error = %v", err)
+	}
+	if string(data) != "archive-host" {
+		t.Fatalf("hostname = %q, want archive-host", string(data))
+	}
+	link, err := imagefs.LookupPath(img.RootFS, "/bin/tool-link")
+	if err != nil {
+		t.Fatalf("LookupPath(/bin/tool-link) error = %v", err)
+	}
+	if link.Symlink.Target() != "tool" {
+		t.Fatalf("tool-link target = %q, want tool", link.Symlink.Target())
+	}
+	layerMatches, err := filepath.Glob(filepath.Join(store.imageDir("tool"), "layers", "*.tar"))
+	if err != nil {
+		t.Fatalf("Glob(layers) error = %v", err)
+	}
+	if len(layerMatches) != 2 {
+		t.Fatalf("stored layers = %d, want 2 (%v)", len(layerMatches), layerMatches)
+	}
+	if _, err := os.Stat(filepath.Join(store.imageDir("tool"), "manifest.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("manifest.json stat error = %v, want not exist", err)
+	}
+}
+
+func TestStorePullDockerArchiveSelectsRepoTag(t *testing.T) {
+	firstConfig := dockerImageConfigBlob(t, "first")
+	secondConfig := dockerImageConfigBlob(t, "second")
+	firstLayer := plainTar(t, map[string]tarEntry{"first.txt": {Data: []byte("first"), Mode: 0o644}})
+	secondLayer := plainTar(t, map[string]tarEntry{"second.txt": {Data: []byte("second"), Mode: 0o644}})
+	archivePath := dockerArchive(t, []dockerArchiveFixtureImage{
+		{
+			ConfigName: "first.json",
+			Config:     firstConfig,
+			RepoTags:   []string{"example/first:latest"},
+			Layers:     []dockerArchiveFixtureLayer{{Name: "first/layer.tar", Data: firstLayer}},
+		},
+		{
+			ConfigName: "second.json",
+			Config:     secondConfig,
+			RepoTags:   []string{"example/second:latest"},
+			Layers:     []dockerArchiveFixtureLayer{{Name: "second/layer.tar", Data: secondLayer}},
+		},
+	})
+
+	store := NewStore(t.TempDir())
+	if _, err := store.Pull(context.Background(), "selected", "docker-archive:"+archivePath+"#example/second:latest"); err != nil {
+		t.Fatalf("Pull() error = %v", err)
+	}
+	img, err := store.Open("selected")
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if _, err := imagefs.LookupPath(img.RootFS, "/first.txt"); err == nil {
+		t.Fatal("LookupPath(/first.txt) error = nil, want selected image only")
+	}
+	entry, err := imagefs.LookupPath(img.RootFS, "/second.txt")
+	if err != nil {
+		t.Fatalf("LookupPath(/second.txt) error = %v", err)
+	}
+	data, err := entry.File.ReadAt(0, 64)
+	if err != nil {
+		t.Fatalf("second.ReadAt() error = %v", err)
+	}
+	if string(data) != "second" {
+		t.Fatalf("second.txt = %q, want second", string(data))
+	}
+}
+
+func TestStorePullDockerArchiveRequiresSelectorForMultipleImages(t *testing.T) {
+	archivePath := dockerArchive(t, []dockerArchiveFixtureImage{
+		{
+			ConfigName: "first.json",
+			Config:     dockerImageConfigBlob(t, "first"),
+			RepoTags:   []string{"example/first:latest"},
+			Layers:     []dockerArchiveFixtureLayer{{Name: "first/layer.tar", Data: plainTar(t, map[string]tarEntry{"first.txt": {Data: []byte("first"), Mode: 0o644}})}},
+		},
+		{
+			ConfigName: "second.json",
+			Config:     dockerImageConfigBlob(t, "second"),
+			RepoTags:   []string{"example/second:latest"},
+			Layers:     []dockerArchiveFixtureLayer{{Name: "second/layer.tar", Data: plainTar(t, map[string]tarEntry{"second.txt": {Data: []byte("second"), Mode: 0o644}})}},
+		},
+	})
+
+	store := NewStore(t.TempDir())
+	_, err := store.Pull(context.Background(), "ambiguous", "docker-archive:"+archivePath)
+	if err == nil || !strings.Contains(err.Error(), "select one") {
+		t.Fatalf("Pull() error = %v, want selector error", err)
+	}
+}
+
+func BenchmarkStorePullOCIIndexedLayers(b *testing.B) {
+	layers := make([][]byte, 0, 4)
+	layerDescs := make([]map[string]any, 0, 4)
+	layerBlobs := map[string][]byte{}
+	for layerIndex := range 4 {
+		entries := make(map[string]tarEntry, 256)
+		for fileIndex := range 256 {
+			name := "opt/bench/layer" + strconv.Itoa(layerIndex) + "/file" + strconv.Itoa(fileIndex) + ".txt"
+			entries[name] = tarEntry{
+				Data: []byte(strings.Repeat("benchmark-data-"+strconv.Itoa(layerIndex)+"-"+strconv.Itoa(fileIndex)+"\n", 16)),
+				Mode: 0o644,
+			}
+		}
+		layer := gzipTar(b, entries)
+		digest := digestBytes(layer)
+		layers = append(layers, layer)
+		layerDescs = append(layerDescs, map[string]any{
+			"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+			"digest":    digest,
+		})
+		layerBlobs[digest] = layer
+	}
+	configBlob, err := json.Marshal(map[string]any{
+		"architecture": nativeArch(),
+		"config": map[string]any{
+			"Env":        []string{"PATH=/usr/bin:/bin"},
+			"Cmd":        []string{"/bin/sh"},
+			"WorkingDir": "/",
+		},
+	})
+	if err != nil {
+		b.Fatalf("Marshal(config) error = %v", err)
+	}
+	configDigest := digestBytes(configBlob)
+	manifestBlob, err := json.Marshal(map[string]any{
+		"schemaVersion": 2,
+		"mediaType":     "application/vnd.oci.image.manifest.v1+json",
+		"config":        map[string]any{"mediaType": "application/vnd.oci.image.config.v1+json", "digest": configDigest},
+		"layers":        layerDescs,
+	})
+	if err != nil {
+		b.Fatalf("Marshal(manifest) error = %v", err)
+	}
+	manifestDigest := digestBytes(manifestBlob)
+	_ = layers
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v2/library/bench/manifests/latest":
+			w.Header().Set("Content-Type", "application/vnd.oci.image.index.v1+json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"schemaVersion": 2,
+				"mediaType":     "application/vnd.oci.image.index.v1+json",
+				"manifests": []map[string]any{{
+					"mediaType": "application/vnd.oci.image.manifest.v1+json",
+					"digest":    manifestDigest,
+					"platform":  map[string]any{"os": "linux", "architecture": nativeArch()},
+				}},
+			})
+		case "/v2/library/bench/manifests/" + manifestDigest:
+			w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+			_, _ = w.Write(manifestBlob)
+		case "/v2/library/bench/blobs/" + configDigest:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(configBlob)
+		default:
+			if blob, ok := layerBlobs[strings.TrimPrefix(r.URL.Path, "/v2/library/bench/blobs/")]; ok {
+				w.Header().Set("Content-Type", "application/vnd.oci.image.layer.v1.tar+gzip")
+				_, _ = w.Write(blob)
+				return
+			}
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	source := server.Listener.Addr().String() + "/library/bench:latest"
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		store := NewStore(b.TempDir())
+		store.httpClient = server.Client()
+		spec := SourceSpec{Kind: SourceKindOCI, Raw: source}
+		if err := store.pullDirect(context.Background(), "bench", spec, PullOptions{}); err != nil {
+			b.Fatalf("pullDirect() error = %v", err)
+		}
+	}
+}
+
+func BenchmarkStorePullDockerArchiveIndexedLayers(b *testing.B) {
+	layers := make([]dockerArchiveFixtureLayer, 0, 4)
+	for layerIndex := range 4 {
+		entries := make(map[string]tarEntry, 256)
+		for fileIndex := range 256 {
+			name := "opt/bench/layer" + strconv.Itoa(layerIndex) + "/file" + strconv.Itoa(fileIndex) + ".txt"
+			entries[name] = tarEntry{
+				Data: []byte(strings.Repeat("archive-data-"+strconv.Itoa(layerIndex)+"-"+strconv.Itoa(fileIndex)+"\n", 16)),
+				Mode: 0o644,
+			}
+		}
+		layers = append(layers, dockerArchiveFixtureLayer{
+			Name: strconv.Itoa(layerIndex) + "/layer.tar",
+			Data: plainTar(b, entries),
+		})
+	}
+	archivePath := dockerArchive(b, []dockerArchiveFixtureImage{{
+		ConfigName: "config.json",
+		Config:     dockerImageConfigBlob(b, "bench"),
+		RepoTags:   []string{"example/bench:latest"},
+		Layers:     layers,
+	}})
+	spec := SourceSpec{Kind: SourceKindDockerArchive, Raw: "docker-archive:" + archivePath}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		store := NewStore(b.TempDir())
+		if err := store.pullDirect(context.Background(), "bench", spec, PullOptions{}); err != nil {
+			b.Fatalf("pullDirect() error = %v", err)
+		}
 	}
 }
 
@@ -596,6 +879,7 @@ func TestParseSource(t *testing.T) {
 		{source: "https://cvmfs.neurodesk.org/cvmfs/neurodesk.ardc.edu.au/containers/tool/tool.simg", wantKind: SourceKindCVMFS},
 		{source: "http+cvmfs://cvmfs.neurodesk.org/cvmfs/neurodesk.ardc.edu.au?path=containers/tool", wantKind: SourceKindCVMFS},
 		{source: "cvmfs://neurodesk.ardc.edu.au?path=containers/tool", wantKind: SourceKindCVMFS},
+		{source: "docker-archive:/tmp/tool.tar#example/tool:latest", wantKind: SourceKindDockerArchive},
 		{source: "", wantErr: true},
 	}
 	for _, tt := range tests {
@@ -1054,7 +1338,13 @@ type tarEntry struct {
 	Mode     int64
 }
 
-func gzipTar(t *testing.T, entries map[string]tarEntry) []byte {
+type fataler interface {
+	Helper()
+	Fatalf(string, ...any)
+	TempDir() string
+}
+
+func gzipTar(t fataler, entries map[string]tarEntry) []byte {
 	t.Helper()
 
 	var buf bytes.Buffer
@@ -1088,4 +1378,128 @@ func gzipTar(t *testing.T, entries map[string]tarEntry) []byte {
 		t.Fatalf("gzip Close() error = %v", err)
 	}
 	return buf.Bytes()
+}
+
+func digestBytes(data []byte) string {
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func plainTar(t fataler, entries map[string]tarEntry) []byte {
+	t.Helper()
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for name, entry := range entries {
+		typeflag := entry.Typeflag
+		if typeflag == 0 {
+			typeflag = tar.TypeReg
+		}
+		hdr := &tar.Header{
+			Name:     name,
+			Typeflag: typeflag,
+			Linkname: entry.Linkname,
+			Mode:     entry.Mode,
+			Size:     int64(len(entry.Data)),
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("WriteHeader(%s) error = %v", name, err)
+		}
+		if len(entry.Data) > 0 {
+			if _, err := tw.Write(entry.Data); err != nil {
+				t.Fatalf("Write(%s) error = %v", name, err)
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar Close() error = %v", err)
+	}
+	return buf.Bytes()
+}
+
+type dockerArchiveFixtureImage struct {
+	ConfigName string
+	Config     []byte
+	RepoTags   []string
+	Layers     []dockerArchiveFixtureLayer
+}
+
+type dockerArchiveFixtureLayer struct {
+	Name string
+	Data []byte
+}
+
+func dockerArchive(t fataler, images []dockerArchiveFixtureImage) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "image.tar")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("Create(image.tar) error = %v", err)
+	}
+	tw := tar.NewWriter(file)
+	var manifest []map[string]any
+	for _, image := range images {
+		layerNames := make([]string, 0, len(image.Layers))
+		for _, layer := range image.Layers {
+			layerNames = append(layerNames, layer.Name)
+		}
+		manifest = append(manifest, map[string]any{
+			"Config":   image.ConfigName,
+			"RepoTags": image.RepoTags,
+			"Layers":   layerNames,
+		})
+	}
+	manifestBlob, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatalf("Marshal(docker manifest) error = %v", err)
+	}
+	writeTarFile(t, tw, "manifest.json", manifestBlob)
+	for _, image := range images {
+		writeTarFile(t, tw, image.ConfigName, image.Config)
+		for _, layer := range image.Layers {
+			writeTarFile(t, tw, layer.Name, layer.Data)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("docker archive tar Close() error = %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("docker archive file Close() error = %v", err)
+	}
+	return path
+}
+
+func writeTarFile(t fataler, tw *tar.Writer, name string, data []byte) {
+	t.Helper()
+
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     name,
+		Typeflag: tar.TypeReg,
+		Mode:     0o644,
+		Size:     int64(len(data)),
+	}); err != nil {
+		t.Fatalf("WriteHeader(%s) error = %v", name, err)
+	}
+	if len(data) > 0 {
+		if _, err := tw.Write(data); err != nil {
+			t.Fatalf("Write(%s) error = %v", name, err)
+		}
+	}
+}
+
+func dockerImageConfigBlob(t fataler, cmd string) []byte {
+	t.Helper()
+
+	blob, err := json.Marshal(map[string]any{
+		"architecture": nativeArch(),
+		"config": map[string]any{
+			"Env": []string{"PATH=/usr/bin:/bin"},
+			"Cmd": []string{cmd},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Marshal(config) error = %v", err)
+	}
+	return blob
 }

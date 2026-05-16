@@ -53,6 +53,22 @@ func TestClientRunEvents(t *testing.T) {
 	}
 }
 
+func TestPullImageRequestSourceStringDockerArchive(t *testing.T) {
+	req := PullImageRequest{
+		SourceRef: &ImageSource{
+			Type: "docker-archive",
+			Path: "C:/tmp/tool.tar#example/tool:latest",
+		},
+	}
+	source, err := req.SourceString()
+	if err != nil {
+		t.Fatalf("SourceString() error = %v", err)
+	}
+	if source != "docker-archive:C:/tmp/tool.tar#example/tool:latest" {
+		t.Fatalf("SourceString() = %q", source)
+	}
+}
+
 func TestClientExecStream(t *testing.T) {
 	ts := httptest.NewServer(websocket.Server{
 		Handshake: func(*websocket.Config, *http.Request) error { return nil },

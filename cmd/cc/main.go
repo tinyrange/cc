@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/fulltest"
 )
 
 type daemonState struct {
@@ -38,6 +40,7 @@ type ccAPI interface {
 	ShutdownInstance() error
 	ShutdownInstanceWithID(string) error
 	AddPortForwardTo(string, client.PortForward) error
+	RunIn(string, client.RunRequest) (client.ExecResponse, error)
 	ExecStream(client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 	ExecStreamIn(string, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 }
@@ -59,7 +62,7 @@ func run() error {
 	}
 	args := fs.Args()
 	if len(args) == 0 {
-		return fmt.Errorf("usage: cc [flags] <command>\ncommands: doctor, images [name], pull <name> <source>, start <image>, stop, status, run <image> -- <cmd...>, vm <subcommand>")
+		return fmt.Errorf("usage: cc [flags] <command>\ncommands: doctor, images [name], pull <name> <source>, start <image>, stop, status, run <image> -- <cmd...>, fulltest [flags], vm <subcommand>")
 	}
 
 	rootCache, err := resolveCacheDir(*cacheDir)
@@ -159,11 +162,71 @@ func handleCommand(api ccAPI, args []string) error {
 			return fmt.Errorf("usage: cc run <image> -- <cmd...>")
 		}
 		return runViaWebsocket(api, args[1], args[3:])
+	case "fulltest":
+		return handleFullTestCommand(api, args[1:])
 	case "vm":
 		return handleVMCommand(api, args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func handleFullTestCommand(api ccAPI, args []string) error {
+	fs := flag.NewFlagSet("cc fulltest", flag.ExitOnError)
+	recipe := fs.String("recipe", filepath.Join("suites", "shell", "fulltest.yaml"), "Fulltest YAML recipe")
+	imageSource := fs.String("image-source", "", "Image source override")
+	imageName := fs.String("image-name", "", "Image cache name")
+	workDir := fs.String("work-dir", "", "Host work directory mounted at /work")
+	filter := fs.String("filter", "", "Run tests whose names contain this text")
+	keepVM := fs.Bool("keep-vm", false, "Leave the fulltest VM running")
+	mirror := fs.String("mirror", fulltest.DefaultCVMFSMirror, "CVMFS mirror")
+	repo := fs.String("repo", fulltest.DefaultCVMFSRepo, "CVMFS repository")
+	cacheDir := fs.String("image-cache-dir", "", "CVMFS image cache directory")
+	prefetch := fs.Bool("prefetch", false, "Prefetch CVMFS image contents")
+	prefetchWorkers := fs.Int("prefetch-workers", 4, "CVMFS prefetch workers")
+	memoryMB := fs.Uint64("memory-mb", fulltest.DefaultMemoryMB, "VM memory in MiB")
+	cpus := fs.Int("cpus", fulltest.DefaultCPUs(), "VM CPUs")
+	dmesg := fs.Bool("dmesg", false, "Include VM dmesg output")
+	maxTimeouts := fs.Int("max-consecutive-timeouts", fulltest.DefaultMaxConsecutiveTimeout, "Abort after this many consecutive command timeouts; use 0 to disable")
+	dockerfile := fs.String("dockerfile", "", "Build this Dockerfile and run the suite against it")
+	dockerContext := fs.String("docker-context", "", "Docker build context; defaults to Dockerfile directory")
+	dockerTag := fs.String("docker-tag", "", "Docker image tag to build/save")
+	dockerBinary := fs.String("docker-binary", "docker", "Docker-compatible CLI")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("usage: cc fulltest [flags]")
+	}
+	result, err := fulltest.Run(context.Background(), api, fulltest.Options{
+		Recipe:                 *recipe,
+		ImageSource:            *imageSource,
+		ImageName:              *imageName,
+		WorkDir:                *workDir,
+		Filter:                 *filter,
+		KeepVM:                 *keepVM,
+		Mirror:                 *mirror,
+		Repo:                   *repo,
+		CacheDir:               *cacheDir,
+		Prefetch:               *prefetch,
+		PrefetchWorkers:        *prefetchWorkers,
+		MemoryMB:               *memoryMB,
+		CPUs:                   *cpus,
+		Dmesg:                  *dmesg,
+		MaxConsecutiveTimeouts: *maxTimeouts,
+		Dockerfile:             *dockerfile,
+		DockerContext:          *dockerContext,
+		DockerTag:              *dockerTag,
+		DockerBinary:           *dockerBinary,
+		Progress:               os.Stderr,
+	})
+	if err != nil {
+		return err
+	}
+	if code := fulltest.Summary(result, os.Stdout); code != 0 {
+		return fmt.Errorf("fulltest failed")
+	}
+	return nil
 }
 
 func handleVMCommand(api ccAPI, args []string) error {
