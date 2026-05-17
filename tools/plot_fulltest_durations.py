@@ -122,7 +122,7 @@ def load_fulltest_report(path: Path) -> DurationMap:
         if item.get("passed") is True:
             item_suite = item.get("suite") or suite
             name = item.get("name") or ""
-            duration = item.get("duration_seconds") or item.get("usage", {}).get("wall_seconds") or 0
+            duration = item.get("usage", {}).get("wall_seconds") or item.get("duration_seconds") or 0
             durations[(item_suite, name)] = float(duration)
     return durations
 
