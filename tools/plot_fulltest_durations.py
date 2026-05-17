@@ -29,14 +29,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--neurocontainers-root",
         type=Path,
-        required=True,
+        required=False,
         help="Directory containing fulltest-results-* artifact directories.",
     )
     parser.add_argument(
         "--tinyrange-root",
         type=Path,
-        required=True,
+        required=False,
         help="Directory containing pyneurodesk-fulltest-* artifact directories.",
+    )
+    parser.add_argument(
+        "--left-report",
+        type=Path,
+        help="Fulltest JSON report for the x-axis. Used instead of --neurocontainers-root when provided.",
+    )
+    parser.add_argument(
+        "--right-report",
+        type=Path,
+        help="Fulltest JSON report for the y-axis. Used instead of --tinyrange-root when provided.",
+    )
+    parser.add_argument(
+        "--left-label",
+        default="Neurocontainers / Apptainer",
+        help="Label for the x-axis dataset.",
+    )
+    parser.add_argument(
+        "--right-label",
+        default="Tinyrange",
+        help="Label for the y-axis dataset.",
     )
     parser.add_argument(
         "--output",
@@ -94,6 +114,18 @@ def load_tinyrange(root: Path) -> DurationMap:
     return durations
 
 
+def load_fulltest_report(path: Path) -> DurationMap:
+    report = json.loads(path.read_text())
+    suite = report.get("suite") or path.stem
+    durations: DurationMap = {}
+    for item in report.get("results", []):
+        if item.get("passed") is True:
+            name = item.get("name") or ""
+            duration = item.get("duration_seconds") or item.get("usage", {}).get("wall_seconds") or 0
+            durations[(suite, name)] = float(duration)
+    return durations
+
+
 def matched_points(neurocontainers: DurationMap, tinyrange: DurationMap) -> list[tuple[float, float, str, str]]:
     common = sorted(set(neurocontainers) & set(tinyrange))
     points = [
@@ -120,7 +152,13 @@ def axis_bounds(points: list[tuple[float, float, str, str]]) -> tuple[float, flo
     return max(0.03, lowest * 0.75), highest * 1.35
 
 
-def summary_text(points: list[tuple[float, float, str, str]], ratio: float, include_suites: bool = False) -> str:
+def summary_text(
+    points: list[tuple[float, float, str, str]],
+    ratio: float,
+    left_label: str,
+    right_label: str,
+    include_suites: bool = False,
+) -> str:
     x_values = [point[0] for point in points]
     y_values = [point[1] for point in points]
     lines = [f"Common passing tests: {len(points):,}"]
@@ -128,8 +166,8 @@ def summary_text(points: list[tuple[float, float, str, str]], ratio: float, incl
         lines.append(f"Suites: {len({point[2] for point in points})}")
     lines.extend(
         [
-            f"Neurocontainers total: {sum(x_values):,.0f}s",
-            f"Tinyrange total: {sum(y_values):,.0f}s",
+            f"{left_label} total: {sum(x_values):,.0f}s",
+            f"{right_label} total: {sum(y_values):,.0f}s",
             f"Weighted overhead: {(ratio - 1) * 100:.1f}%",
         ]
     )
@@ -158,7 +196,7 @@ def setup_matplotlib():
     return plt, Line2D
 
 
-def decorate_axes(ax, points: list[tuple[float, float, str, str]], ratio: float, title: str) -> None:
+def decorate_axes(ax, points: list[tuple[float, float, str, str]], ratio: float, title: str, left_label: str, right_label: str) -> None:
     low, high = axis_bounds(points)
     line = [low, high]
     ax.plot(line, line, color="#111827", lw=1.4, linestyle="--", label="equal time")
@@ -170,11 +208,11 @@ def decorate_axes(ax, points: list[tuple[float, float, str, str]], ratio: float,
     ax.grid(True, which="major", color="#d1d5db", linewidth=0.7, alpha=0.8)
     ax.grid(True, which="minor", color="#e5e7eb", linewidth=0.4, alpha=0.55)
     ax.set_title(title)
-    ax.set_xlabel("Neurocontainers / Apptainer duration (seconds, log scale)")
-    ax.set_ylabel("Tinyrange duration (seconds, log scale)")
+    ax.set_xlabel(f"{left_label} duration (seconds, log scale)")
+    ax.set_ylabel(f"{right_label} duration (seconds, log scale)")
 
 
-def plot_plain(points: list[tuple[float, float, str, str]], output: Path, title: str) -> None:
+def plot_plain(points: list[tuple[float, float, str, str]], output: Path, title: str, left_label: str, right_label: str) -> None:
     plt, _ = setup_matplotlib()
     x_values = [point[0] for point in points]
     y_values = [point[1] for point in points]
@@ -190,12 +228,12 @@ def plot_plain(points: list[tuple[float, float, str, str]], output: Path, title:
         edgecolors="none",
         label=f"{len(points):,} tests passed in both",
     )
-    decorate_axes(ax, points, ratio, title)
+    decorate_axes(ax, points, ratio, title, left_label, right_label)
     ax.legend(loc="upper left", frameon=True, facecolor="white", edgecolor="#d1d5db")
     ax.text(
         0.98,
         0.04,
-        summary_text(points, ratio),
+        summary_text(points, ratio, left_label, right_label),
         transform=ax.transAxes,
         ha="right",
         va="bottom",
@@ -206,7 +244,7 @@ def plot_plain(points: list[tuple[float, float, str, str]], output: Path, title:
     fig.savefig(output)
 
 
-def plot_by_suite(points: list[tuple[float, float, str, str]], output: Path, title: str) -> None:
+def plot_by_suite(points: list[tuple[float, float, str, str]], output: Path, title: str, left_label: str, right_label: str) -> None:
     plt, line_2d = setup_matplotlib()
     x_values = [point[0] for point in points]
     y_values = [point[1] for point in points]
@@ -220,11 +258,11 @@ def plot_by_suite(points: list[tuple[float, float, str, str]], output: Path, tit
         suite_y = [point[1] for point in points if point[2] == suite]
         ax.scatter(suite_x, suite_y, s=13, alpha=0.62, c=[colors[suite]], edgecolors="none")
 
-    decorate_axes(ax, points, ratio, title)
+    decorate_axes(ax, points, ratio, title, left_label, right_label)
     ax.text(
         0.98,
         0.04,
-        summary_text(points, ratio, include_suites=True),
+        summary_text(points, ratio, left_label, right_label, include_suites=True),
         transform=ax.transAxes,
         ha="right",
         va="bottom",
@@ -266,18 +304,29 @@ def plot_by_suite(points: list[tuple[float, float, str, str]], output: Path, tit
 
 def main() -> None:
     args = parse_args()
-    neurocontainers = load_neurocontainers(args.neurocontainers_root)
-    tinyrange = load_tinyrange(args.tinyrange_root)
+    if args.left_report:
+        neurocontainers = load_fulltest_report(args.left_report)
+    elif args.neurocontainers_root:
+        neurocontainers = load_neurocontainers(args.neurocontainers_root)
+    else:
+        raise SystemExit("provide --neurocontainers-root or --left-report")
+
+    if args.right_report:
+        tinyrange = load_fulltest_report(args.right_report)
+    elif args.tinyrange_root:
+        tinyrange = load_tinyrange(args.tinyrange_root)
+    else:
+        raise SystemExit("provide --tinyrange-root or --right-report")
     points = matched_points(neurocontainers, tinyrange)
     x_values = [point[0] for point in points]
     y_values = [point[1] for point in points]
     ratio = sum(y_values) / sum(x_values)
 
-    plot_plain(points, args.output, args.title)
+    plot_plain(points, args.output, args.title, args.left_label, args.right_label)
     print(args.output.resolve())
 
     if args.by_suite_output:
-        plot_by_suite(points, args.by_suite_output, args.suite_title)
+        plot_by_suite(points, args.by_suite_output, args.suite_title, args.left_label, args.right_label)
         print(args.by_suite_output.resolve())
 
     print(
