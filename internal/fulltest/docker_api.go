@@ -4,12 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"j5.nz/cc/client"
@@ -179,26 +177,22 @@ func (d *DockerAPI) RunIn(id string, req client.RunRequest) (client.ExecResponse
 	} else {
 		args = append(args, req.Command...)
 	}
-	before := d.readContainerUsage(id)
-	start := time.Now()
 	cmd := exec.CommandContext(ctx, d.binary, args...)
 	output, err := cmd.CombinedOutput()
-	usage := dockerCommandUsage(cmd.ProcessState, time.Since(start), before, d.readContainerUsage(id))
 	if ctx.Err() != nil {
 		return client.ExecResponse{
 			ExitCode: 124,
 			Output:   string(output) + fmt.Sprintf("\n[fulltest] command timed out after %.1fs: %s\n", timeout, strings.Join(req.Command, " ")),
-			Usage:    usage,
 		}, nil
 	}
 	if err == nil {
-		return client.ExecResponse{ExitCode: 0, Output: string(output), Usage: usage}, nil
+		return client.ExecResponse{ExitCode: 0, Output: string(output)}, nil
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		return client.ExecResponse{ExitCode: exitErr.ExitCode(), Output: string(output), Usage: usage}, nil
+		return client.ExecResponse{ExitCode: exitErr.ExitCode(), Output: string(output)}, nil
 	}
-	return client.ExecResponse{ExitCode: 1, Output: string(output) + err.Error(), Usage: usage}, err
+	return client.ExecResponse{ExitCode: 1, Output: string(output) + err.Error()}, err
 }
 
 func (d *DockerAPI) ShutdownInstanceWithID(id string) error {
@@ -263,71 +257,6 @@ func (d *DockerAPI) runProgress(onEvent func(client.ProgressEvent) error, artifa
 
 func (d *DockerAPI) command(args ...string) *exec.Cmd {
 	return exec.CommandContext(d.ctx, d.binary, args...)
-}
-
-type dockerCgroupUsage struct {
-	CPUUsec     uint64
-	MemoryBytes uint64
-	PeakBytes   uint64
-}
-
-func (d *DockerAPI) readContainerUsage(id string) dockerCgroupUsage {
-	cmd := d.command("exec", id, "sh", "-c", "cat /sys/fs/cgroup/cpu.stat 2>/dev/null; printf 'memory.current '; cat /sys/fs/cgroup/memory.current 2>/dev/null || true; printf 'memory.peak '; cat /sys/fs/cgroup/memory.peak 2>/dev/null || true")
-	output, err := cmd.Output()
-	if err != nil {
-		return dockerCgroupUsage{}
-	}
-	return parseDockerCgroupUsage(string(output))
-}
-
-func parseDockerCgroupUsage(text string) dockerCgroupUsage {
-	var usage dockerCgroupUsage
-	lines := strings.Split(text, "\n")
-	for _, line := range lines {
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
-			continue
-		}
-		value, err := strconv.ParseUint(fields[1], 10, 64)
-		if err != nil {
-			continue
-		}
-		switch fields[0] {
-		case "usage_usec":
-			usage.CPUUsec = value
-		case "memory.current":
-			usage.MemoryBytes = value
-		case "memory.peak":
-			usage.PeakBytes = value
-		}
-	}
-	return usage
-}
-
-func dockerCommandUsage(state *os.ProcessState, wall time.Duration, before, after dockerCgroupUsage) *client.ResourceUsage {
-	usage := &client.ResourceUsage{WallSeconds: wall.Seconds()}
-	if after.CPUUsec >= before.CPUUsec && after.CPUUsec > 0 {
-		usage.CPUSeconds = float64(after.CPUUsec-before.CPUUsec) / 1_000_000
-	}
-	if after.PeakBytes > 0 {
-		usage.MaxRSSBytes = after.PeakBytes
-	}
-	if after.MemoryBytes > 0 {
-		usage.MemoryBytes = after.MemoryBytes
-	}
-	if state != nil {
-		if usage.CPUSeconds == 0 {
-			usage.UserSeconds = state.UserTime().Seconds()
-			usage.SystemSeconds = state.SystemTime().Seconds()
-			usage.CPUSeconds = usage.UserSeconds + usage.SystemSeconds
-		}
-		if usage.MaxRSSBytes == 0 {
-			if raw, ok := state.SysUsage().(*syscall.Rusage); ok && raw != nil && raw.Maxrss > 0 {
-				usage.MaxRSSBytes = uint64(raw.Maxrss) * 1024
-			}
-		}
-	}
-	return usage
 }
 
 func dockerSourceString(req client.PullImageRequest) (string, error) {

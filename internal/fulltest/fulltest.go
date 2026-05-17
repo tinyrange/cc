@@ -3,6 +3,7 @@ package fulltest
 import (
 	"context"
 	"crypto/sha1"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -134,6 +135,7 @@ type TestResult struct {
 	Passed          bool                   `json:"passed,omitempty"`
 	Skipped         bool                   `json:"skipped,omitempty"`
 	DurationSeconds float64                `json:"duration_seconds,omitempty"`
+	RunnerSeconds   float64                `json:"runner_seconds,omitempty"`
 	CPUSeconds      float64                `json:"cpu_seconds,omitempty"`
 	UserSeconds     float64                `json:"user_seconds,omitempty"`
 	SystemSeconds   float64                `json:"system_seconds,omitempty"`
@@ -494,7 +496,7 @@ func Run(ctx context.Context, api API, opts Options) (RunResult, error) {
 			continue
 		}
 		start := time.Now()
-		output, code, commands, usage, err := runTestCommands(ctx, api, suite, test, guestVars)
+		output, code, commands, usage, err := runTestCommands(ctx, api, suite, test, guestVars, strings.TrimSpace(opts.ReportPath) != "")
 		duration := time.Since(start).Seconds()
 		message := ""
 		if err != nil {
@@ -503,7 +505,7 @@ func Run(ctx context.Context, api API, opts Options) (RunResult, error) {
 			message = validateTest(output, code, test, hostVars)
 		}
 		if message != "" {
-			results = append(results, TestResult{Name: test.Name, DurationSeconds: duration, Message: message, Commands: commands, Usage: usageFromAggregate(usage), CPUSeconds: usage.CPUSeconds, UserSeconds: usage.UserSeconds, SystemSeconds: usage.SystemSeconds, MaxRSSBytes: usage.MaxRSSBytes, MemoryBytes: usage.MemoryBytes})
+			results = append(results, measuredTestResult(test.Name, false, duration, message, commands, usage))
 			failed[test.Name] = true
 			progressf(opts.Progress, "[fulltest] failed %s (%.2fs): %s\n", test.Name, duration, message)
 			if isTimeoutResult(output, code) {
@@ -523,7 +525,7 @@ func Run(ctx context.Context, api API, opts Options) (RunResult, error) {
 			continue
 		}
 		consecutiveTimeouts = 0
-		results = append(results, TestResult{Name: test.Name, Passed: true, DurationSeconds: duration, Message: "ok", Commands: commands, Usage: usageFromAggregate(usage), CPUSeconds: usage.CPUSeconds, UserSeconds: usage.UserSeconds, SystemSeconds: usage.SystemSeconds, MaxRSSBytes: usage.MaxRSSBytes, MemoryBytes: usage.MemoryBytes})
+		results = append(results, measuredTestResult(test.Name, true, duration, "ok", commands, usage))
 		progressf(opts.Progress, "[fulltest] passed %s (%.2fs)\n", test.Name, duration)
 	}
 
@@ -563,7 +565,7 @@ func vmIDFor(suiteName, vmKey string) string {
 	return "fulltest-" + suiteName + "-" + vmKey
 }
 
-func runTestCommands(ctx context.Context, api API, suite Suite, test TestCase, vars map[string]string) (string, int, []CommandResult, aggregateUsage, error) {
+func runTestCommands(ctx context.Context, api API, suite Suite, test TestCase, vars map[string]string, measure bool) (string, int, []CommandResult, aggregateUsage, error) {
 	var combined strings.Builder
 	lastCode := 0
 	results := make([]CommandResult, 0, len(test.Commands))
@@ -576,7 +578,7 @@ func runTestCommands(ctx context.Context, api API, suite Suite, test TestCase, v
 		}
 		vmID := vmIDFor(suite.Name, firstNonEmpty(step.VM, "default"))
 		start := time.Now()
-		output, code, usage, err := runGuestRequest(ctx, api, vmID, command, timeoutFor(timeout, suite.DefaultTimeout), step.User, firstNonEmpty(step.WorkDir, "/work"))
+		output, code, usage, err := runGuestRequest(ctx, api, vmID, command, timeoutFor(timeout, suite.DefaultTimeout), step.User, firstNonEmpty(step.WorkDir, "/work"), measure)
 		duration := time.Since(start).Seconds()
 		if output != "" {
 			if combined.Len() > 0 {
@@ -740,23 +742,29 @@ func applyEnvSetup(command, envSetup string) string {
 }
 
 func runGuest(ctx context.Context, api API, vmID, command string, timeoutSeconds float64) (string, int, error) {
-	output, code, _, err := runGuestRequest(ctx, api, vmID, command, timeoutSeconds, "", "/work")
+	output, code, _, err := runGuestRequest(ctx, api, vmID, command, timeoutSeconds, "", "/work", false)
 	return output, code, err
 }
 
-func runGuestRequest(ctx context.Context, api API, vmID, command string, timeoutSeconds float64, user string, workDir string) (string, int, *client.ResourceUsage, error) {
+func runGuestRequest(ctx context.Context, api API, vmID, command string, timeoutSeconds float64, user string, workDir string, measure bool) (string, int, *client.ResourceUsage, error) {
+	requestCommand := command
+	if measure {
+		requestCommand = measuredGuestCommand(command)
+	}
 	req := client.RunRequest{
 		ID:             vmID,
-		Command:        []string{"bash", "-lc", command},
+		Command:        []string{"bash", "-lc", requestCommand},
 		WorkDir:        firstNonEmpty(workDir, "/work"),
 		User:           user,
 		TimeoutSeconds: timeoutSeconds,
 	}
 	resp, err := api.RunIn(vmID, req)
+	output, measuredUsage := parseMeasuredGuestUsage(resp.Output)
+	usage := mergeMeasuredUsage(measuredUsage, resp.Usage)
 	if err != nil {
-		return resp.Output, resp.ExitCode, resp.Usage, err
+		return output, resp.ExitCode, usage, err
 	}
-	return resp.Output, resp.ExitCode, resp.Usage, nil
+	return output, resp.ExitCode, usage, nil
 }
 
 func runHostScript(ctx context.Context, script, workDir string, vars map[string]string, timeoutSeconds float64, extra time.Duration) (string, int) {
@@ -785,6 +793,81 @@ func runHostScript(ctx context.Context, script, workDir string, vars map[string]
 		return string(output), exitErr.ExitCode()
 	}
 	return string(output) + err.Error(), 1
+}
+
+const measuredUsageMarker = "__CC_FULLTEST_USAGE__:"
+
+func measuredGuestCommand(command string) string {
+	delimiter := "__CC_FULLTEST_COMMAND_" + imageCacheName(command)[len("fulltest-"):] + "__"
+	return strings.Join([]string{
+		`set +e`,
+		`__cc_fulltest_cmd="$(mktemp "${TMPDIR:-/tmp}/cc-fulltest-command.XXXXXX")" || exit 126`,
+		`cat >"$__cc_fulltest_cmd" <<'` + delimiter + `'`,
+		command,
+		delimiter,
+		`__cc_ft_num() { case "$1" in ''|*[!0-9]*) printf '0' ;; *) printf '%s' "$1" ;; esac; }`,
+		`__cc_ft_ns() { __v="$(date +%s%N 2>/dev/null)"; __cc_ft_num "$__v"; }`,
+		`__cc_ft_cpu() { if [ -r /sys/fs/cgroup/cpu.stat ]; then awk '$1=="usage_usec"{print $2; found=1} END{if(!found)print 0}' /sys/fs/cgroup/cpu.stat 2>/dev/null; else printf '0'; fi; }`,
+		`__cc_ft_read() { if [ -r "$1" ]; then __cc_ft_num "$(cat "$1" 2>/dev/null)"; else printf '0'; fi; }`,
+		`__cc_ft_start_ns="$(__cc_ft_ns)"`,
+		`__cc_ft_start_cpu="$(__cc_ft_cpu)"`,
+		`/bin/bash "$__cc_fulltest_cmd"`,
+		`__cc_ft_code="$?"`,
+		`__cc_ft_end_ns="$(__cc_ft_ns)"`,
+		`__cc_ft_end_cpu="$(__cc_ft_cpu)"`,
+		`__cc_ft_mem="$(__cc_ft_read /sys/fs/cgroup/memory.current)"`,
+		`__cc_ft_peak="$(__cc_ft_read /sys/fs/cgroup/memory.peak)"`,
+		`__cc_ft_json="$(awk -v start_ns="$__cc_ft_start_ns" -v end_ns="$__cc_ft_end_ns" -v start_cpu="$__cc_ft_start_cpu" -v end_cpu="$__cc_ft_end_cpu" -v mem="$__cc_ft_mem" -v peak="$__cc_ft_peak" 'BEGIN { wall=0; cpu=0; if (end_ns >= start_ns) wall=(end_ns-start_ns)/1000000000; if (end_cpu >= start_cpu) cpu=(end_cpu-start_cpu)/1000000; printf("{\"wall_seconds\":%.9f,\"cpu_seconds\":%.9f,\"max_rss_bytes\":%0.f,\"memory_bytes\":%0.f}", wall, cpu, peak, mem) }')"`,
+		`printf '\n` + measuredUsageMarker + `%s\n' "$(printf '%s' "$__cc_ft_json" | base64 | tr -d '\n')"`,
+		`rm -f "$__cc_fulltest_cmd"`,
+		`exit "$__cc_ft_code"`,
+	}, "\n")
+}
+
+func parseMeasuredGuestUsage(output string) (string, *client.ResourceUsage) {
+	lines := strings.SplitAfter(output, "\n")
+	var cleaned strings.Builder
+	var usage *client.ResourceUsage
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, measuredUsageMarker) {
+			encoded := strings.TrimSpace(strings.TrimPrefix(trimmed, measuredUsageMarker))
+			if decoded, err := base64.StdEncoding.DecodeString(encoded); err == nil {
+				var parsed client.ResourceUsage
+				if err := json.Unmarshal(decoded, &parsed); err == nil {
+					usage = &parsed
+				}
+			}
+			continue
+		}
+		cleaned.WriteString(line)
+	}
+	return strings.TrimRight(cleaned.String(), "\n"), usage
+}
+
+func mergeMeasuredUsage(measured, backend *client.ResourceUsage) *client.ResourceUsage {
+	if measured == nil {
+		return backend
+	}
+	if backend == nil {
+		return measured
+	}
+	if measured.UserSeconds == 0 {
+		measured.UserSeconds = backend.UserSeconds
+	}
+	if measured.SystemSeconds == 0 {
+		measured.SystemSeconds = backend.SystemSeconds
+	}
+	if measured.CPUSeconds == 0 {
+		measured.CPUSeconds = firstPositiveFloat(backend.CPUSeconds, backend.UserSeconds+backend.SystemSeconds)
+	}
+	if measured.MaxRSSBytes == 0 {
+		measured.MaxRSSBytes = backend.MaxRSSBytes
+	}
+	if measured.MemoryBytes == 0 {
+		measured.MemoryBytes = backend.MemoryBytes
+	}
+	return measured
 }
 
 type aggregateUsage struct {
@@ -824,6 +907,28 @@ func commandResult(index int, vm string, code int, duration float64, usage *clie
 		result.MemoryBytes = usage.MemoryBytes
 	}
 	return result
+}
+
+func measuredTestResult(name string, passed bool, runnerDuration float64, message string, commands []CommandResult, usage aggregateUsage) TestResult {
+	usageValue := usageFromAggregate(usage)
+	duration := runnerDuration
+	if usageValue != nil && usageValue.WallSeconds > 0 {
+		duration = usageValue.WallSeconds
+	}
+	return TestResult{
+		Name:            name,
+		Passed:          passed,
+		DurationSeconds: duration,
+		RunnerSeconds:   runnerDuration,
+		Message:         message,
+		Commands:        commands,
+		Usage:           usageValue,
+		CPUSeconds:      usage.CPUSeconds,
+		UserSeconds:     usage.UserSeconds,
+		SystemSeconds:   usage.SystemSeconds,
+		MaxRSSBytes:     usage.MaxRSSBytes,
+		MemoryBytes:     usage.MemoryBytes,
+	}
 }
 
 func usageFromAggregate(usage aggregateUsage) *client.ResourceUsage {

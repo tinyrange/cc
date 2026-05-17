@@ -2,6 +2,7 @@ package fulltest
 
 import (
 	"context"
+	"encoding/base64"
 	"os"
 	"path/filepath"
 	"strings"
@@ -175,13 +176,6 @@ func TestDockerPublishArg(t *testing.T) {
 	}
 }
 
-func TestParseDockerCgroupUsage(t *testing.T) {
-	usage := parseDockerCgroupUsage("usage_usec 120000\nuser_usec 70000\nsystem_usec 50000\nmemory.current 4096\nmemory.peak 8192\n")
-	if usage.CPUUsec != 120000 || usage.MemoryBytes != 4096 || usage.PeakBytes != 8192 {
-		t.Fatalf("usage = %#v", usage)
-	}
-}
-
 func TestRunSupportsMultipleVMCommandSteps(t *testing.T) {
 	recipe := writeRecipe(t, `
 name: net
@@ -268,6 +262,17 @@ tests:
 	}
 	if !strings.Contains(string(buf), `"cpu_seconds": 0.15`) || !strings.Contains(string(buf), `"max_rss_bytes": 1234`) {
 		t.Fatalf("report missing usage:\n%s", string(buf))
+	}
+}
+
+func TestParseMeasuredGuestUsageStripsMarker(t *testing.T) {
+	payload := `{"wall_seconds":1.25,"cpu_seconds":0.5,"max_rss_bytes":4096,"memory_bytes":2048}`
+	output, usage := parseMeasuredGuestUsage("hello\n" + measuredUsageMarker + base64.StdEncoding.EncodeToString([]byte(payload)) + "\n")
+	if output != "hello" {
+		t.Fatalf("output = %q", output)
+	}
+	if usage == nil || usage.WallSeconds != 1.25 || usage.CPUSeconds != 0.5 || usage.MaxRSSBytes != 4096 || usage.MemoryBytes != 2048 {
+		t.Fatalf("usage = %#v", usage)
 	}
 }
 
