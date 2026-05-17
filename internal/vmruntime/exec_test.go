@@ -2,8 +2,11 @@ package vmruntime
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"testing"
+
+	"j5.nz/cc/client"
 )
 
 func TestExtractManagedExecResult(t *testing.T) {
@@ -17,7 +20,7 @@ func TestExtractManagedExecResult(t *testing.T) {
 		"",
 	}, "\n")
 
-	code, output, ok := ExtractManagedExecResult(text, id, false)
+	code, output, _, ok := ExtractManagedExecResult(text, id, false)
 	if !ok {
 		t.Fatal("ExtractManagedExecResult() ok = false")
 	}
@@ -26,6 +29,26 @@ func TestExtractManagedExecResult(t *testing.T) {
 	}
 	if output != "hello\nwarn" {
 		t.Fatalf("output = %q, want combined stdout/stderr", output)
+	}
+}
+
+func TestExtractManagedExecResultParsesUsage(t *testing.T) {
+	id := "9"
+	payload, err := json.Marshal(client.ResourceUsage{WallSeconds: 1.2, CPUSeconds: 0.8, MaxRSSBytes: 4096})
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	text := strings.Join([]string{
+		CommandBeginMarker + id,
+		CommandUsageMarker + id + ":" + base64.StdEncoding.EncodeToString(payload),
+		CommandExitMarkerPref + id + ":0",
+	}, "\n")
+	_, _, usage, ok := ExtractManagedExecResult(text, id, false)
+	if !ok {
+		t.Fatal("ExtractManagedExecResult() ok = false")
+	}
+	if usage == nil || usage.WallSeconds != 1.2 || usage.CPUSeconds != 0.8 || usage.MaxRSSBytes != 4096 {
+		t.Fatalf("usage = %#v", usage)
 	}
 }
 
@@ -39,7 +62,7 @@ func TestExtractManagedExecResultDmesgReturnsProtocolSegment(t *testing.T) {
 		"",
 	}, "\n")
 
-	code, output, ok := ExtractManagedExecResult(text, id, true)
+	code, output, _, ok := ExtractManagedExecResult(text, id, true)
 	if !ok {
 		t.Fatal("ExtractManagedExecResult() ok = false")
 	}

@@ -689,6 +689,7 @@ func linuxGuestInitConfig(modules []alpine.Module, managedExec bool, network *cl
 		BeginMarker:      vmruntime.CommandBeginMarker,
 		OutputMarkerPref: vmruntime.CommandOutputMarker,
 		ErrorMarkerPref:  vmruntime.CommandErrorMarker,
+		UsageMarkerPref:  vmruntime.CommandUsageMarker,
 		ExitMarkerPrefix: vmruntime.CommandExitMarkerPref,
 	}
 	if managedExec {

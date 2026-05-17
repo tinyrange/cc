@@ -215,7 +215,7 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 		return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
 	segment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
-		_, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
+		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})
 	if err != nil {
@@ -224,14 +224,14 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 		}
 		return client.ExecResponse{}, transcriptError(err, s.serialOut.String(), s.transcript.String())
 	}
-	code, output, ok := vmruntime.ExtractManagedExecResult(segment, id, s.dmesg)
+	code, output, usage, ok := vmruntime.ExtractManagedExecResult(segment, id, s.dmesg)
 	if !ok {
 		return client.ExecResponse{}, transcriptError(fmt.Errorf("exec did not produce a complete result"), s.serialOut.String(), s.transcript.String())
 	}
 	if s.dmesg {
 		output = s.serialOut.String() + "\n[control]\n" + output
 	}
-	return client.ExecResponse{ExitCode: code, Output: output}, nil
+	return client.ExecResponse{ExitCode: code, Output: output, Usage: usage}, nil
 }
 
 func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
@@ -388,7 +388,7 @@ func (s *ManagedSession) waitForExecExit(id string, start int, timeout time.Dura
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	_, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
-		_, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
+		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
 		return ok
 	})
 	return err == nil

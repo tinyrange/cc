@@ -47,6 +47,7 @@ type config struct {
 	BeginMarker      string   `json:"begin_marker"`
 	OutputMarkerPref string   `json:"output_marker_prefix"`
 	ErrorMarkerPref  string   `json:"error_marker_prefix"`
+	UsageMarkerPref  string   `json:"usage_marker_prefix"`
 	ExitMarkerPrefix string   `json:"exit_marker_prefix"`
 	PrecopyAMD64Root bool     `json:"precopy_amd64_root,omitempty"`
 	Network          *network `json:"network,omitempty"`
@@ -723,9 +724,14 @@ func execCommand(cfg config) error {
 		writeKernel("ccx3-init: stat mode for " + cfg.Command[0] + " is " + fmt.Sprintf("%#o", info.Mode()&0o777))
 	}
 
-	exitCode, err := execCommandGo(cfg.Command, cfg.Env, cfg.WorkDir, cfg.User)
+	exitCode, usage, err := execCommandGo(cfg.Command, cfg.Env, cfg.WorkDir, cfg.User)
 	if err != nil {
 		return fmt.Errorf("run %s: %w", cfg.Command[0], err)
+	}
+	if cfg.UsageMarkerPref != "" && usage != nil {
+		usageMarker := cfg.UsageMarkerPref + encodeExecUsage(usage)
+		writeKernel(usageMarker)
+		writeProtocolLine(usageMarker)
 	}
 	if cfg.ExitMarkerPrefix != "" {
 		exitMarker := cfg.ExitMarkerPrefix + itoa(exitCode)
@@ -739,8 +745,9 @@ func execCommand(cfg config) error {
 	}
 }
 
-func execCommandGo(argv []string, env []string, workDir string, user string) (int, error) {
+func execCommandGo(argv []string, env []string, workDir string, user string) (int, *execUsage, error) {
 	cmd := exec.Command(argv[0], argv[1:]...)
+	start := time.Now()
 	cmd.Env = env
 	if workDir != "" {
 		cmd.Dir = workDir
@@ -750,20 +757,21 @@ func execCommandGo(argv []string, env []string, workDir string, user string) (in
 	cmd.Stdout = console
 	cmd.Stderr = console
 	if cred, err := credentialForUser(user); err != nil {
-		return 0, err
+		return 0, nil, err
 	} else if cred != nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
 	}
 
 	err := cmd.Run()
+	usage := usageFromProcessState(cmd.ProcessState, time.Since(start))
 	if err == nil {
-		return 0, nil
+		return 0, usage, nil
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		return exitErr.ExitCode(), nil
+		return exitErr.ExitCode(), usage, nil
 	}
-	return 0, err
+	return 0, usage, err
 }
 
 func commandLoop(cfg config, control io.ReadWriter) error {
@@ -1107,6 +1115,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 
 	writeExecTiming(control, id, "wait_begin", execStart)
 	waitErr := cmd.Wait()
+	usage := usageFromProcessState(cmd.ProcessState, time.Since(execStart))
 	writeExecTiming(control, id, "wait_done", execStart)
 	if tty {
 		_ = managed.closeStdin()
@@ -1138,10 +1147,47 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			exitCode = 126
 		}
 	}
+	if cfg.UsageMarkerPref != "" && usage != nil {
+		writeProtocolLineTo(control, cfg.UsageMarkerPref+id+":"+encodeExecUsage(usage))
+	}
 	if cfg.ExitMarkerPrefix != "" {
 		writeExecTiming(control, id, "exit_sent", execStart)
 		writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":"+itoa(exitCode))
 	}
+}
+
+type execUsage struct {
+	WallSeconds   float64 `json:"wall_seconds,omitempty"`
+	UserSeconds   float64 `json:"user_seconds,omitempty"`
+	SystemSeconds float64 `json:"system_seconds,omitempty"`
+	CPUSeconds    float64 `json:"cpu_seconds,omitempty"`
+	MaxRSSBytes   uint64  `json:"max_rss_bytes,omitempty"`
+}
+
+func usageFromProcessState(state *os.ProcessState, wall time.Duration) *execUsage {
+	usage := &execUsage{WallSeconds: wall.Seconds()}
+	if state == nil {
+		return usage
+	}
+	if state.UserTime() > 0 {
+		usage.UserSeconds = state.UserTime().Seconds()
+	}
+	if state.SystemTime() > 0 {
+		usage.SystemSeconds = state.SystemTime().Seconds()
+	}
+	usage.CPUSeconds = usage.UserSeconds + usage.SystemSeconds
+	if raw, ok := state.SysUsage().(*syscall.Rusage); ok && raw != nil && raw.Maxrss > 0 {
+		usage.MaxRSSBytes = uint64(raw.Maxrss) * 1024
+	}
+	return usage
+}
+
+func encodeExecUsage(usage *execUsage) string {
+	buf, err := json.Marshal(usage)
+	if err != nil {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(buf)
 }
 
 func configureHostname(hostname string) error {

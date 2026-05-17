@@ -195,6 +195,7 @@ func handleFullTestCommand(api ccAPI, args []string) error {
 	dockerTag := fs.String("docker-tag", "", "Docker image tag to build/save")
 	dockerBinary := fs.String("docker-binary", "docker", "Docker-compatible CLI")
 	backend := fs.String("backend", "ccvm", "Execution backend: ccvm or docker")
+	jsonReport := fs.String("json-report", "", "Write a JSON report with per-test timing and resource usage")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -235,6 +236,7 @@ func handleFullTestCommand(api ccAPI, args []string) error {
 		DockerTag:              *dockerTag,
 		DockerBinary:           *dockerBinary,
 		DockerDirect:           dockerDirect,
+		ReportPath:             *jsonReport,
 		Progress:               os.Stderr,
 	})
 	if err != nil {

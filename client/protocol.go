@@ -341,8 +341,18 @@ type RunRequest struct {
 }
 
 type ExecResponse struct {
-	ExitCode int    `json:"exit_code"`
-	Output   string `json:"output,omitempty"`
+	ExitCode int            `json:"exit_code"`
+	Output   string         `json:"output,omitempty"`
+	Usage    *ResourceUsage `json:"usage,omitempty"`
+}
+
+type ResourceUsage struct {
+	WallSeconds   float64 `json:"wall_seconds,omitempty"`
+	UserSeconds   float64 `json:"user_seconds,omitempty"`
+	SystemSeconds float64 `json:"system_seconds,omitempty"`
+	CPUSeconds    float64 `json:"cpu_seconds,omitempty"`
+	MaxRSSBytes   uint64  `json:"max_rss_bytes,omitempty"`
+	MemoryBytes   uint64  `json:"memory_bytes,omitempty"`
 }
 
 type StartVMRequest = CreateInstanceRequest

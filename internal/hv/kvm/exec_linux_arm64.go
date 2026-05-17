@@ -158,7 +158,7 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 		return client.ExecResponse{Output: serialOut.String()}, serialOut.String(), withTranscripts(err)
 	}
 	segment, err := controlTranscript.WaitFor(runCtx, 0, func(text string) bool {
-		_, _, ok := vmruntime.ExtractManagedExecResult(text, execID, dmesg)
+		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, execID, dmesg)
 		return ok
 	})
 	if err != nil {
@@ -167,7 +167,7 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 		}
 		return client.ExecResponse{Output: serialOut.String()}, serialOut.String(), withTranscripts(err)
 	}
-	code, output, ok := vmruntime.ExtractManagedExecResult(segment, execID, dmesg)
+	code, output, usage, ok := vmruntime.ExtractManagedExecResult(segment, execID, dmesg)
 	if !ok {
 		return client.ExecResponse{Output: serialOut.String()}, serialOut.String(), withTranscripts(fmt.Errorf("exec did not produce a complete result"))
 	}
@@ -175,7 +175,7 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 		output = serialOut.String() + "\n[control]\n" + output
 	}
 	cancel()
-	return client.ExecResponse{ExitCode: code, Output: output}, serialOut.String(), nil
+	return client.ExecResponse{ExitCode: code, Output: output, Usage: usage}, serialOut.String(), nil
 }
 
 func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs []*virtio.FS, vsock *virtio.Vsock, rng *virtio.RNG, serialOut *vmruntime.SerialTranscript) error {

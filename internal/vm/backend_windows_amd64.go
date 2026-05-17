@@ -618,6 +618,7 @@ func windowsGuestInitConfig(modules []alpine.Module, managedExec bool) vmruntime
 		BeginMarker:      vmruntime.CommandBeginMarker,
 		OutputMarkerPref: vmruntime.CommandOutputMarker,
 		ErrorMarkerPref:  vmruntime.CommandErrorMarker,
+		UsageMarkerPref:  vmruntime.CommandUsageMarker,
 		ExitMarkerPrefix: vmruntime.CommandExitMarkerPref,
 	}
 	if managedExec {

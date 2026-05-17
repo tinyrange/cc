@@ -175,6 +175,13 @@ func TestDockerPublishArg(t *testing.T) {
 	}
 }
 
+func TestParseDockerCgroupUsage(t *testing.T) {
+	usage := parseDockerCgroupUsage("usage_usec 120000\nuser_usec 70000\nsystem_usec 50000\nmemory.current 4096\nmemory.peak 8192\n")
+	if usage.CPUUsec != 120000 || usage.MemoryBytes != 4096 || usage.PeakBytes != 8192 {
+		t.Fatalf("usage = %#v", usage)
+	}
+}
+
 func TestRunSupportsMultipleVMCommandSteps(t *testing.T) {
 	recipe := writeRecipe(t, `
 name: net
@@ -222,6 +229,45 @@ tests:
 	}
 	if len(result.Results) != 1 || !result.Results[0].Passed {
 		t.Fatalf("results = %#v", result.Results)
+	}
+}
+
+func TestRunWritesJSONReportWithUsage(t *testing.T) {
+	recipe := writeRecipe(t, `
+name: report
+container: report.simg
+tests:
+  - name: measured
+    command: echo ok
+`)
+	report := filepath.Join(t.TempDir(), "report.json")
+	api := &fakeAPI{run: func(req client.RunRequest) client.ExecResponse {
+		return client.ExecResponse{
+			ExitCode: 0,
+			Output:   "ok",
+			Usage: &client.ResourceUsage{
+				WallSeconds:   0.25,
+				UserSeconds:   0.10,
+				SystemSeconds: 0.05,
+				CPUSeconds:    0.15,
+				MaxRSSBytes:   1234,
+				MemoryBytes:   2345,
+			},
+		}
+	}}
+	result, err := Run(context.Background(), api, Options{Recipe: recipe, WorkDir: t.TempDir(), ReportPath: report, MemoryMB: 512, CPUs: 1})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(result.Results) != 1 || result.Results[0].CPUSeconds != 0.15 || result.Results[0].MaxRSSBytes != 1234 {
+		t.Fatalf("result usage = %#v", result.Results)
+	}
+	buf, err := os.ReadFile(report)
+	if err != nil {
+		t.Fatalf("ReadFile(report) error = %v", err)
+	}
+	if !strings.Contains(string(buf), `"cpu_seconds": 0.15`) || !strings.Contains(string(buf), `"max_rss_bytes": 1234`) {
+		t.Fatalf("report missing usage:\n%s", string(buf))
 	}
 }
 

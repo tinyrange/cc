@@ -357,6 +357,7 @@ func buildManagedExecProbeInitramfs(initPayload, probePayload []byte, modules []
 		BeginMarker:      vmruntime.CommandBeginMarker,
 		OutputMarkerPref: vmruntime.CommandOutputMarker,
 		ErrorMarkerPref:  vmruntime.CommandErrorMarker,
+		UsageMarkerPref:  vmruntime.CommandUsageMarker,
 		ExitMarkerPrefix: vmruntime.CommandExitMarkerPref,
 	})
 	if err != nil {

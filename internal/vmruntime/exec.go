@@ -3,6 +3,7 @@ package vmruntime
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"strconv"
 	"strings"
 
@@ -34,18 +35,20 @@ func HasManagedExecFirstByte(text, id string) bool {
 		strings.Contains(text, CommandExitMarkerPref+id+":")
 }
 
-func ExtractManagedExecResult(serial, id string, dmesg bool) (int, string, bool) {
+func ExtractManagedExecResult(serial, id string, dmesg bool) (int, string, *client.ResourceUsage, bool) {
 	beginMarker := CommandBeginMarker + id
 	outputPrefix := CommandOutputMarker + id + ":"
 	errorPrefix := CommandErrorMarker + id + ":"
+	usagePrefix := CommandUsageMarker + id + ":"
 	exitPrefix := CommandExitMarkerPref + id + ":"
 
 	begin := strings.Index(serial, beginMarker)
 	if begin == -1 {
-		return 0, "", false
+		return 0, "", nil, false
 	}
 
 	var output bytes.Buffer
+	var usage *client.ResourceUsage
 	lines := strings.Split(serial[begin:], "\n")
 	for _, raw := range lines {
 		line := strings.TrimSpace(raw)
@@ -70,18 +73,30 @@ func ExtractManagedExecResult(serial, id string, dmesg bool) (int, string, bool)
 			output.Write(data)
 			continue
 		}
+		if idx := strings.Index(line, usagePrefix); idx >= 0 {
+			encoded := line[idx+len(usagePrefix):]
+			data, err := base64.StdEncoding.DecodeString(encoded)
+			if err != nil {
+				continue
+			}
+			var parsed client.ResourceUsage
+			if err := json.Unmarshal(data, &parsed); err == nil {
+				usage = &parsed
+			}
+			continue
+		}
 		if idx := strings.Index(line, exitPrefix); idx >= 0 {
 			code, err := strconv.Atoi(strings.TrimSpace(line[idx+len(exitPrefix):]))
 			if err != nil {
-				return 0, "", false
+				return 0, "", nil, false
 			}
 			if dmesg {
-				return code, strings.TrimRight(serial[begin:], "\r\n"), true
+				return code, strings.TrimRight(serial[begin:], "\r\n"), usage, true
 			}
-			return code, strings.TrimRight(output.String(), "\r\n"), true
+			return code, strings.TrimRight(output.String(), "\r\n"), usage, true
 		}
 	}
-	return 0, "", false
+	return 0, "", nil, false
 }
 
 func ParseManagedExecEventLine(line, id string) (client.ExecEvent, bool, bool, error) {

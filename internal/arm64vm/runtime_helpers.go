@@ -47,6 +47,7 @@ func BuildPersistentInitramfs(req RunRequest, baseEnv []string, workDir string) 
 		BeginMarker:      CommandBeginMarker,
 		OutputMarkerPref: CommandOutputMarker,
 		ErrorMarkerPref:  CommandErrorMarker,
+		UsageMarkerPref:  vmruntime.CommandUsageMarker,
 		ExitMarkerPrefix: CommandExitMarkerPref,
 		PrecopyAMD64Root: strings.TrimSpace(os.Getenv("CCX3_BENCH_PRECOPY_AMD64_ROOT")) != "",
 	})
@@ -62,6 +63,7 @@ func BuildExecInitramfs(req RunRequest, command []string, env []string, workDir 
 		RootFSTag:        RootFSTag,
 		BeginMarker:      CommandBeginMarker,
 		ErrorMarkerPref:  CommandErrorMarker,
+		UsageMarkerPref:  vmruntime.CommandUsageMarker,
 		ExitMarkerPrefix: CommandExitMarkerPref,
 	})
 }

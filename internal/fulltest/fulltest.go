@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -124,15 +125,37 @@ type Options struct {
 	DockerDirect            bool
 	Network                 *client.NetworkConfig
 	Progress                io.Writer
+	ReportPath              string
 	HostCommandTimeoutExtra time.Duration
 }
 
 type TestResult struct {
-	Name            string  `json:"name"`
-	Passed          bool    `json:"passed,omitempty"`
-	Skipped         bool    `json:"skipped,omitempty"`
-	DurationSeconds float64 `json:"duration_seconds,omitempty"`
-	Message         string  `json:"message,omitempty"`
+	Name            string                 `json:"name"`
+	Passed          bool                   `json:"passed,omitempty"`
+	Skipped         bool                   `json:"skipped,omitempty"`
+	DurationSeconds float64                `json:"duration_seconds,omitempty"`
+	CPUSeconds      float64                `json:"cpu_seconds,omitempty"`
+	UserSeconds     float64                `json:"user_seconds,omitempty"`
+	SystemSeconds   float64                `json:"system_seconds,omitempty"`
+	MaxRSSBytes     uint64                 `json:"max_rss_bytes,omitempty"`
+	MemoryBytes     uint64                 `json:"memory_bytes,omitempty"`
+	Message         string                 `json:"message,omitempty"`
+	Commands        []CommandResult        `json:"commands,omitempty"`
+	Usage           *client.ResourceUsage  `json:"usage,omitempty"`
+	Metadata        map[string]interface{} `json:"metadata,omitempty"`
+}
+
+type CommandResult struct {
+	Index           int                   `json:"index"`
+	VM              string                `json:"vm"`
+	ExitCode        int                   `json:"exit_code"`
+	DurationSeconds float64               `json:"duration_seconds,omitempty"`
+	CPUSeconds      float64               `json:"cpu_seconds,omitempty"`
+	UserSeconds     float64               `json:"user_seconds,omitempty"`
+	SystemSeconds   float64               `json:"system_seconds,omitempty"`
+	MaxRSSBytes     uint64                `json:"max_rss_bytes,omitempty"`
+	MemoryBytes     uint64                `json:"memory_bytes,omitempty"`
+	Usage           *client.ResourceUsage `json:"usage,omitempty"`
 }
 
 type RunResult struct {
@@ -471,7 +494,7 @@ func Run(ctx context.Context, api API, opts Options) (RunResult, error) {
 			continue
 		}
 		start := time.Now()
-		output, code, err := runTestCommands(ctx, api, suite, test, guestVars)
+		output, code, commands, usage, err := runTestCommands(ctx, api, suite, test, guestVars)
 		duration := time.Since(start).Seconds()
 		message := ""
 		if err != nil {
@@ -480,7 +503,7 @@ func Run(ctx context.Context, api API, opts Options) (RunResult, error) {
 			message = validateTest(output, code, test, hostVars)
 		}
 		if message != "" {
-			results = append(results, TestResult{Name: test.Name, DurationSeconds: duration, Message: message})
+			results = append(results, TestResult{Name: test.Name, DurationSeconds: duration, Message: message, Commands: commands, Usage: usageFromAggregate(usage), CPUSeconds: usage.CPUSeconds, UserSeconds: usage.UserSeconds, SystemSeconds: usage.SystemSeconds, MaxRSSBytes: usage.MaxRSSBytes, MemoryBytes: usage.MemoryBytes})
 			failed[test.Name] = true
 			progressf(opts.Progress, "[fulltest] failed %s (%.2fs): %s\n", test.Name, duration, message)
 			if isTimeoutResult(output, code) {
@@ -500,7 +523,7 @@ func Run(ctx context.Context, api API, opts Options) (RunResult, error) {
 			continue
 		}
 		consecutiveTimeouts = 0
-		results = append(results, TestResult{Name: test.Name, Passed: true, DurationSeconds: duration, Message: "ok"})
+		results = append(results, TestResult{Name: test.Name, Passed: true, DurationSeconds: duration, Message: "ok", Commands: commands, Usage: usageFromAggregate(usage), CPUSeconds: usage.CPUSeconds, UserSeconds: usage.UserSeconds, SystemSeconds: usage.SystemSeconds, MaxRSSBytes: usage.MaxRSSBytes, MemoryBytes: usage.MemoryBytes})
 		progressf(opts.Progress, "[fulltest] passed %s (%.2fs)\n", test.Name, duration)
 	}
 
@@ -513,7 +536,13 @@ func Run(ctx context.Context, api API, opts Options) (RunResult, error) {
 		_, _ = runHostScript(ctx, suite.Cleanup.HostScript, workDir, hostVars, timeoutFor(60, suite.DefaultTimeout), opts.HostCommandTimeoutExtra)
 	}
 
-	return RunResult{Suite: suite.Name, WorkDir: workDir, Results: results}, nil
+	result := RunResult{Suite: suite.Name, WorkDir: workDir, Results: results}
+	if strings.TrimSpace(opts.ReportPath) != "" {
+		if err := writeJSONReport(opts.ReportPath, result); err != nil {
+			return RunResult{}, err
+		}
+	}
+	return result, nil
 }
 
 func selectTests(tests []TestCase, filter string) []TestCase {
@@ -534,9 +563,11 @@ func vmIDFor(suiteName, vmKey string) string {
 	return "fulltest-" + suiteName + "-" + vmKey
 }
 
-func runTestCommands(ctx context.Context, api API, suite Suite, test TestCase, vars map[string]string) (string, int, error) {
+func runTestCommands(ctx context.Context, api API, suite Suite, test TestCase, vars map[string]string) (string, int, []CommandResult, aggregateUsage, error) {
 	var combined strings.Builder
 	lastCode := 0
+	results := make([]CommandResult, 0, len(test.Commands))
+	var total aggregateUsage
 	for index, step := range test.Commands {
 		command := applyEnvSetup(substitute(step.Command, vars), suite.EnvSetup)
 		timeout := step.Timeout
@@ -544,7 +575,9 @@ func runTestCommands(ctx context.Context, api API, suite Suite, test TestCase, v
 			timeout = test.Timeout
 		}
 		vmID := vmIDFor(suite.Name, firstNonEmpty(step.VM, "default"))
-		output, code, err := runGuestRequest(ctx, api, vmID, command, timeoutFor(timeout, suite.DefaultTimeout), step.User, firstNonEmpty(step.WorkDir, "/work"))
+		start := time.Now()
+		output, code, usage, err := runGuestRequest(ctx, api, vmID, command, timeoutFor(timeout, suite.DefaultTimeout), step.User, firstNonEmpty(step.WorkDir, "/work"))
+		duration := time.Since(start).Seconds()
 		if output != "" {
 			if combined.Len() > 0 {
 				combined.WriteString("\n")
@@ -552,8 +585,11 @@ func runTestCommands(ctx context.Context, api API, suite Suite, test TestCase, v
 			combined.WriteString(output)
 		}
 		lastCode = code
+		item := commandResult(index+1, firstNonEmpty(step.VM, "default"), code, duration, usage)
+		results = append(results, item)
+		total.add(usage, duration)
 		if err != nil {
-			return combined.String(), code, err
+			return combined.String(), code, results, total, err
 		}
 		stepTest := TestCase{
 			Name:                   fmt.Sprintf("%s command %d", test.Name, index+1),
@@ -562,10 +598,10 @@ func runTestCommands(ctx context.Context, api API, suite Suite, test TestCase, v
 			IgnoreExitCode:         step.IgnoreExitCode,
 		}
 		if message := validateTest(output, code, stepTest, nil); message != "" {
-			return combined.String(), code, errors.New(message)
+			return combined.String(), code, results, total, errors.New(message)
 		}
 	}
-	return combined.String(), lastCode, nil
+	return combined.String(), lastCode, results, total, nil
 }
 
 func resolveImageSource(ctx context.Context, workDir, key string, spec ImageSpec, opts Options) (string, error) {
@@ -704,10 +740,11 @@ func applyEnvSetup(command, envSetup string) string {
 }
 
 func runGuest(ctx context.Context, api API, vmID, command string, timeoutSeconds float64) (string, int, error) {
-	return runGuestRequest(ctx, api, vmID, command, timeoutSeconds, "", "/work")
+	output, code, _, err := runGuestRequest(ctx, api, vmID, command, timeoutSeconds, "", "/work")
+	return output, code, err
 }
 
-func runGuestRequest(ctx context.Context, api API, vmID, command string, timeoutSeconds float64, user string, workDir string) (string, int, error) {
+func runGuestRequest(ctx context.Context, api API, vmID, command string, timeoutSeconds float64, user string, workDir string) (string, int, *client.ResourceUsage, error) {
 	req := client.RunRequest{
 		ID:             vmID,
 		Command:        []string{"bash", "-lc", command},
@@ -717,9 +754,9 @@ func runGuestRequest(ctx context.Context, api API, vmID, command string, timeout
 	}
 	resp, err := api.RunIn(vmID, req)
 	if err != nil {
-		return resp.Output, resp.ExitCode, err
+		return resp.Output, resp.ExitCode, resp.Usage, err
 	}
-	return resp.Output, resp.ExitCode, nil
+	return resp.Output, resp.ExitCode, resp.Usage, nil
 }
 
 func runHostScript(ctx context.Context, script, workDir string, vars map[string]string, timeoutSeconds float64, extra time.Duration) (string, int) {
@@ -748,6 +785,90 @@ func runHostScript(ctx context.Context, script, workDir string, vars map[string]
 		return string(output), exitErr.ExitCode()
 	}
 	return string(output) + err.Error(), 1
+}
+
+type aggregateUsage struct {
+	WallSeconds   float64
+	UserSeconds   float64
+	SystemSeconds float64
+	CPUSeconds    float64
+	MaxRSSBytes   uint64
+	MemoryBytes   uint64
+}
+
+func (a *aggregateUsage) add(usage *client.ResourceUsage, fallbackWall float64) {
+	if usage == nil {
+		a.WallSeconds += fallbackWall
+		return
+	}
+	a.WallSeconds += firstPositiveFloat(usage.WallSeconds, fallbackWall)
+	a.UserSeconds += usage.UserSeconds
+	a.SystemSeconds += usage.SystemSeconds
+	a.CPUSeconds += firstPositiveFloat(usage.CPUSeconds, usage.UserSeconds+usage.SystemSeconds)
+	if usage.MaxRSSBytes > a.MaxRSSBytes {
+		a.MaxRSSBytes = usage.MaxRSSBytes
+	}
+	if usage.MemoryBytes > a.MemoryBytes {
+		a.MemoryBytes = usage.MemoryBytes
+	}
+}
+
+func commandResult(index int, vm string, code int, duration float64, usage *client.ResourceUsage) CommandResult {
+	result := CommandResult{Index: index, VM: vm, ExitCode: code, DurationSeconds: duration, Usage: usage}
+	if usage != nil {
+		result.DurationSeconds = firstPositiveFloat(usage.WallSeconds, duration)
+		result.UserSeconds = usage.UserSeconds
+		result.SystemSeconds = usage.SystemSeconds
+		result.CPUSeconds = firstPositiveFloat(usage.CPUSeconds, usage.UserSeconds+usage.SystemSeconds)
+		result.MaxRSSBytes = usage.MaxRSSBytes
+		result.MemoryBytes = usage.MemoryBytes
+	}
+	return result
+}
+
+func usageFromAggregate(usage aggregateUsage) *client.ResourceUsage {
+	if usage.WallSeconds == 0 && usage.CPUSeconds == 0 && usage.MaxRSSBytes == 0 && usage.MemoryBytes == 0 {
+		return nil
+	}
+	return &client.ResourceUsage{
+		WallSeconds:   usage.WallSeconds,
+		UserSeconds:   usage.UserSeconds,
+		SystemSeconds: usage.SystemSeconds,
+		CPUSeconds:    usage.CPUSeconds,
+		MaxRSSBytes:   usage.MaxRSSBytes,
+		MemoryBytes:   usage.MemoryBytes,
+	}
+}
+
+func writeJSONReport(path string, result RunResult) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(file)
+	enc.SetIndent("", "  ")
+	err = enc.Encode(result)
+	closeErr := file.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Rename(tmp, path)
+}
+
+func firstPositiveFloat(values ...float64) float64 {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 func timeoutFor(testTimeout, defaultTimeout int) float64 {
