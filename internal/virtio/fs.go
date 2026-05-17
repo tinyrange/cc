@@ -184,6 +184,10 @@ type fsMkdirBackend interface {
 	Mkdir(parent uint64, name string, mode uint32) (nodeID uint64, attr FuseAttr, errno int32)
 }
 
+type fsMknodBackend interface {
+	Mknod(parent uint64, name string, mode uint32, rdev uint32) (nodeID uint64, attr FuseAttr, errno int32)
+}
+
 type fsSymlinkBackend interface {
 	Symlink(parent uint64, name string, target string) (nodeID uint64, attr FuseAttr, errno int32)
 }
@@ -1126,6 +1130,25 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 			return reply(0, extra), nil
 		}
 		return nil, fmt.Errorf("virtio-fs missing mkdir backend for parent=%d name=%q", nodeID, name)
+	case fuseMknod:
+		if len(req) < fuseInHeaderSize+16 {
+			return nil, fmt.Errorf("virtio-fs MKNOD too short")
+		}
+		name := readCStringName(req[fuseInHeaderSize+16:])
+		mode := binary.LittleEndian.Uint32(req[40:44])
+		rdev := binary.LittleEndian.Uint32(req[44:48])
+		f.logPathf("mknod-parent", nodeID, fmt.Sprintf(" name=%q mode=%#o rdev=%#x", name, mode, rdev))
+		if be, ok := f.backend.(fsMknodBackend); ok {
+			childID, attr, errno := be.Mknod(nodeID, path.Clean(name), mode, rdev)
+			if errno != 0 {
+				return reply(errno, nil), nil
+			}
+			extra := make([]byte, fuseEntryOutSize)
+			f.encodeFuseEntryOut(extra, childID)
+			encodeFuseAttr(extra[40:], attr)
+			return reply(0, extra), nil
+		}
+		return reply(-linuxENOSYS, nil), nil
 	case fuseSymlink:
 		name, target, ok := readTwoCStringNames(req[fuseInHeaderSize:])
 		if !ok {
@@ -3104,6 +3127,41 @@ func (p *imageFS) Mkdir(parent uint64, name string, mode uint32) (uint64, FuseAt
 		name:    name,
 		mode:    fs.ModeDir | fs.FileMode(mode&linuxPermMask),
 		entries: map[string]uint64{},
+	}
+	p.nextNodeID++
+	p.nodes[node.id] = node
+	parentNode.entries[name] = node.id
+	return node.id, p.attr(node), 0
+}
+
+func (p *imageFS) Mknod(parent uint64, name string, mode uint32, rdev uint32) (uint64, FuseAttr, int32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	parentNode := p.nodes[parent]
+	if parentNode == nil {
+		return 0, FuseAttr{}, -linuxENOENT
+	}
+	name = path.Base(path.Clean("/" + name))
+	if _, exists := parentNode.entries[name]; exists {
+		return 0, FuseAttr{}, -linuxEEXIST
+	}
+	fileType := mode & linuxSIFMT
+	switch fileType {
+	case linuxSIFREG, linuxSIFCHR, linuxSIFBLK, linuxSIFIFO, linuxSIFSOCK:
+	default:
+		return 0, FuseAttr{}, -linuxEINVAL
+	}
+	if parentNode.whiteouts != nil {
+		delete(parentNode.whiteouts, name)
+	}
+	node := &imageNode{
+		id:      p.nextNodeID,
+		parent:  parent,
+		name:    name,
+		mode:    linuxModeToGo(fileType | (mode & linuxPermMask)),
+		rawMode: fileType | (mode & linuxPermMask),
+		rdev:    rdev,
+		modTime: time.Now(),
 	}
 	p.nextNodeID++
 	p.nodes[node.id] = node

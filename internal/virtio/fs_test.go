@@ -159,6 +159,88 @@ func TestImageFSSetAttrPreservesDirectoryType(t *testing.T) {
 	}
 }
 
+func TestImageFSMknodCreatesSocketNode(t *testing.T) {
+	t.Parallel()
+
+	backend := NewImageFS(imagefs.NewHostFS(t.TempDir(), nil), "")
+	be := backend.(*imageFS)
+	nodeID, attr, errno := be.Mknod(1, "kubelet.sock", linuxSIFSOCK|0o600, 0)
+	if errno != 0 {
+		t.Fatalf("Mknod() errno = %d", errno)
+	}
+	if attr.Mode&linuxSIFMT != linuxSIFSOCK {
+		t.Fatalf("Mknod() mode = %#o, want socket", attr.Mode)
+	}
+	if attr.Mode&linuxPermMask != 0o600 {
+		t.Fatalf("Mknod() permissions = %#o, want 0600", attr.Mode&linuxPermMask)
+	}
+	if got, _, errno := be.Lookup(1, "kubelet.sock"); errno != 0 || got != nodeID {
+		t.Fatalf("Lookup() = (%d, %d), want node %d", got, errno, nodeID)
+	}
+	fh, errno := be.OpenDir(1, 0)
+	if errno != 0 {
+		t.Fatalf("OpenDir() errno = %d", errno)
+	}
+	defer be.ReleaseDir(1, fh)
+	entries, errno := be.ReadDir(1, fh, 0, 4096)
+	if errno != 0 {
+		t.Fatalf("ReadDir() errno = %d", errno)
+	}
+	if !direntHasType(entries, "kubelet.sock", dirTypeSocket) {
+		t.Fatalf("ReadDir() missing socket dirent for kubelet.sock")
+	}
+}
+
+func TestStrictFUSEMknodCreatesImageSocket(t *testing.T) {
+	t.Parallel()
+
+	backend := NewImageFS(imagefs.NewHostFS(t.TempDir(), nil), "")
+	fsdev := NewFS(0, 0, 0, "root", backend)
+	fsdev.Strict = true
+
+	const unique = uint64(48)
+	payload := make([]byte, 16+len("pod-resources.sock")+1)
+	binary.LittleEndian.PutUint32(payload[0:4], linuxSIFSOCK|0o600)
+	copy(payload[16:], "pod-resources.sock\x00")
+	req := make([]byte, fuseInHeaderSize+len(payload))
+	binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
+	binary.LittleEndian.PutUint32(req[4:8], fuseMknod)
+	binary.LittleEndian.PutUint64(req[8:16], unique)
+	binary.LittleEndian.PutUint64(req[16:24], 1)
+	copy(req[fuseInHeaderSize:], payload)
+
+	reply, err := fsdev.dispatchFUSELocked(req)
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(MKNOD) error = %v", err)
+	}
+	if got := int32(binary.LittleEndian.Uint32(reply[4:8])); got != 0 {
+		t.Fatalf("MKNOD errno = %d, want 0", got)
+	}
+	if got := binary.LittleEndian.Uint64(reply[8:16]); got != unique {
+		t.Fatalf("MKNOD unique = %d, want %d", got, unique)
+	}
+	attrMode := binary.LittleEndian.Uint32(reply[fuseOutHeaderSize+40+60 : fuseOutHeaderSize+40+64])
+	if attrMode&linuxSIFMT != linuxSIFSOCK {
+		t.Fatalf("MKNOD attr mode = %#o, want socket", attrMode)
+	}
+}
+
+func direntHasType(entries []byte, name string, typ uint32) bool {
+	for off := 0; off+fuseDirentBaseSize <= len(entries); {
+		nameLen := int(binary.LittleEndian.Uint32(entries[off+16 : off+20]))
+		entryType := binary.LittleEndian.Uint32(entries[off+20 : off+24])
+		reclen := align8(fuseDirentBaseSize + nameLen)
+		if off+reclen > len(entries) || off+fuseDirentBaseSize+nameLen > len(entries) {
+			return false
+		}
+		if string(entries[off+fuseDirentBaseSize:off+fuseDirentBaseSize+nameLen]) == name && entryType == typ {
+			return true
+		}
+		off += reclen
+	}
+	return false
+}
+
 func TestStrictFUSEFsyncUsesBackendHandle(t *testing.T) {
 	t.Parallel()
 

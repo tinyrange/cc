@@ -665,20 +665,37 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 		}
 		timingLog("POST /vm kernel ensure/status took=%s", time.Since(start))
 		if wantsBootEventStream(r) {
-			writeBootEvent(w, client.BootEvent{Kind: "status", Message: fmt.Sprintf("starting VM for %s", req.Image)})
-			state, err := srvState.vms.StartStream(bootCtx, req, func(event client.BootEvent) error {
+			var streamMu sync.Mutex
+			streamOpen := true
+			writeStreamEvent := func(event client.BootEvent) error {
+				streamMu.Lock()
+				defer streamMu.Unlock()
+				if !streamOpen {
+					return nil
+				}
 				return writeBootEvent(w, event)
+			}
+			closeStream := func() {
+				streamMu.Lock()
+				streamOpen = false
+				streamMu.Unlock()
+			}
+			defer closeStream()
+
+			writeStreamEvent(client.BootEvent{Kind: "status", Message: fmt.Sprintf("starting VM for %s", req.Image)})
+			state, err := srvState.vms.StartStream(bootCtx, req, func(event client.BootEvent) error {
+				return writeStreamEvent(event)
 			})
 			if err != nil {
 				if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
-					_ = writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
+					_ = writeStreamEvent(client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
 					return
 				}
-				_ = writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+				_ = writeStreamEvent(client.BootEvent{Kind: "error", Error: err.Error()})
 				return
 			}
 			timingLog("POST /vm vms.StartStream took=%s", time.Since(start))
-			_ = writeBootEvent(w, client.BootEvent{Kind: "ready", State: state})
+			_ = writeStreamEvent(client.BootEvent{Kind: "ready", State: state})
 			timingLog("POST /vm total=%s", time.Since(start))
 			return
 		}
@@ -955,10 +972,6 @@ func writeBootEvent(w http.ResponseWriter, event client.BootEvent) error {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	if event.Kind == "" {
 		event.Kind = "status"
-	}
-	if _, ok := w.(http.Flusher); ok {
-		// WriteHeader is safe to call repeatedly before the first write.
-		w.WriteHeader(http.StatusOK)
 	}
 	if err := json.NewEncoder(w).Encode(event); err != nil {
 		return err

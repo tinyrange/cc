@@ -200,6 +200,7 @@ func run() error {
 
 	_ = syscall.Mount("proc", "/proc", "proc", 0, "")
 	_ = syscall.Mount("sysfs", "/sys", "sysfs", 0, "")
+	mountCgroupFS("/sys/fs/cgroup")
 	configureMemoryOvercommit("/proc")
 
 	writeStage(bootStart, "loading modules")
@@ -301,6 +302,7 @@ func mountRootFS(tag, emulatorTag string) error {
 	}
 	_ = syscall.Mount("proc", "/proc", "proc", 0, "")
 	_ = syscall.Mount("sysfs", "/sys", "sysfs", 0, "")
+	mountCgroupFS("/sys/fs/cgroup")
 	configureMemoryOvercommit("/proc")
 	_ = syscall.Mount("devtmpfs", "/dev", "devtmpfs", 0, "")
 	_ = syscall.Mount("tmpfs", "/tmp", "tmpfs", 0, "mode=1777")
@@ -322,6 +324,21 @@ func mountRootFS(tag, emulatorTag string) error {
 	}
 	_ = os.Symlink("/proc/self/fd", "/dev/fd")
 	return nil
+}
+
+func mountCgroupFS(path string) {
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		writeKernel("ccx3-init: mkdir cgroup mountpoint: " + err.Error())
+		return
+	}
+	if err := syscall.Mount("none", path, "cgroup2", 0, ""); err == nil || errors.Is(err, syscall.EBUSY) {
+		return
+	}
+	// Older or custom kernels may only expose cgroup v1. Mounting cgroup2 is
+	// best-effort so ordinary containers continue to boot on those kernels.
+	if err := syscall.Mount("cgroup", path, "cgroup", 0, ""); err != nil && !errors.Is(err, syscall.EBUSY) {
+		writeKernel("ccx3-init: mount cgroup filesystem: " + err.Error())
+	}
 }
 
 func precopyAMD64Root() error {

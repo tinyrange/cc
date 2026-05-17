@@ -45,6 +45,7 @@ type SuiteScript struct {
 type TestCase struct {
 	Name                   string
 	Command                string
+	Commands               []CommandStep
 	Timeout                int
 	DependsOn              []string
 	ExpectedOutputContains []string
@@ -53,9 +54,42 @@ type TestCase struct {
 	Validate               []map[string]any
 }
 
+type CommandStep struct {
+	VM                     string   `yaml:"vm"`
+	Command                string   `yaml:"command"`
+	Timeout                int      `yaml:"timeout"`
+	User                   string   `yaml:"user"`
+	WorkDir                string   `yaml:"workdir"`
+	ExpectedOutputContains []string `yaml:"expected_output_contains"`
+	ExpectedExitCode       int      `yaml:"expected_exit_code"`
+	IgnoreExitCode         bool     `yaml:"ignore_exit_code"`
+}
+
+type ImageSpec struct {
+	Source           string `yaml:"source"`
+	Dockerfile       string `yaml:"dockerfile"`
+	DockerfileInline string `yaml:"dockerfile_inline"`
+	DockerContext    string `yaml:"docker_context"`
+	DockerTag        string `yaml:"docker_tag"`
+	DockerBinary     string `yaml:"docker_binary"`
+	ImageName        string `yaml:"image_name"`
+}
+
+type VMSpec struct {
+	Image         string                `yaml:"image"`
+	MemoryMB      uint64                `yaml:"memory_mb"`
+	CPUs          int                   `yaml:"cpus"`
+	Dmesg         bool                  `yaml:"dmesg"`
+	Network       *client.NetworkConfig `yaml:"network"`
+	AllowInternet bool                  `yaml:"allow_internet"`
+	KernelModules []string              `yaml:"kernel_modules"`
+}
+
 type Suite struct {
 	Name            string
 	Container       string
+	Images          map[string]ImageSpec
+	VMs             map[string]VMSpec
 	EnvSetup        string
 	RequiredFiles   []RequiredDataset
 	TestData        map[string]string
@@ -130,16 +164,19 @@ func LoadSuite(recipe string) (Suite, error) {
 		return Suite{}, err
 	}
 	var raw struct {
-		Name          string            `yaml:"name"`
-		Container     string            `yaml:"container"`
-		EnvSetup      string            `yaml:"env_setup"`
-		RequiredFiles []RequiredDataset `yaml:"required_files"`
-		TestData      map[string]string `yaml:"test_data"`
-		Setup         SuiteScript       `yaml:"setup"`
-		Cleanup       SuiteScript       `yaml:"cleanup"`
+		Name          string               `yaml:"name"`
+		Container     string               `yaml:"container"`
+		Images        map[string]ImageSpec `yaml:"images"`
+		VMs           map[string]VMSpec    `yaml:"vms"`
+		EnvSetup      string               `yaml:"env_setup"`
+		RequiredFiles []RequiredDataset    `yaml:"required_files"`
+		TestData      map[string]string    `yaml:"test_data"`
+		Setup         SuiteScript          `yaml:"setup"`
+		Cleanup       SuiteScript          `yaml:"cleanup"`
 		Tests         []struct {
 			Name                   string           `yaml:"name"`
 			Command                string           `yaml:"command"`
+			Commands               []CommandStep    `yaml:"commands"`
 			Script                 string           `yaml:"script"`
 			Timeout                int              `yaml:"timeout"`
 			DependsOn              stringList       `yaml:"depends_on"`
@@ -154,7 +191,7 @@ func LoadSuite(recipe string) (Suite, error) {
 	if err := yaml.Unmarshal(buf, &raw); err != nil {
 		return Suite{}, err
 	}
-	if strings.TrimSpace(raw.Container) == "" {
+	if strings.TrimSpace(raw.Container) == "" && len(raw.Images) == 0 {
 		return Suite{}, fmt.Errorf("suite container is required")
 	}
 	suiteName := strings.TrimSpace(raw.Name)
@@ -168,11 +205,22 @@ func LoadSuite(recipe string) (Suite, error) {
 			return Suite{}, fmt.Errorf("test %d is missing name", i+1)
 		}
 		command := item.Command
-		if command == "" && item.Script != "" {
+		if command == "" && len(item.Commands) == 0 && item.Script != "" {
 			return Suite{}, fmt.Errorf("test %d %q uses matlab script; Go fulltest requires command", i+1, name)
 		}
-		if command == "" {
-			return Suite{}, fmt.Errorf("test %d %q must define command", i+1, name)
+		if command == "" && len(item.Commands) == 0 {
+			return Suite{}, fmt.Errorf("test %d %q must define command or commands", i+1, name)
+		}
+		commands := normalizeCommandSteps(item.Commands)
+		if command != "" {
+			commands = append([]CommandStep{{
+				VM:                     "default",
+				Command:                command,
+				ExpectedExitCode:       expectedExitCodeValue(item.ExpectedExitCode),
+				ExpectedOutputContains: []string(item.ExpectedOutputContains),
+				IgnoreExitCode:         item.IgnoreExitCode,
+				Timeout:                item.Timeout,
+			}}, commands...)
 		}
 		expectedExit := 0
 		if item.ExpectedExitCode != nil {
@@ -181,6 +229,7 @@ func LoadSuite(recipe string) (Suite, error) {
 		tests = append(tests, TestCase{
 			Name:                   name,
 			Command:                command,
+			Commands:               commands,
 			Timeout:                item.Timeout,
 			DependsOn:              []string(item.DependsOn),
 			ExpectedOutputContains: []string(item.ExpectedOutputContains),
@@ -199,6 +248,8 @@ func LoadSuite(recipe string) (Suite, error) {
 	return Suite{
 		Name:            suiteName,
 		Container:       raw.Container,
+		Images:          raw.Images,
+		VMs:             raw.VMs,
 		EnvSetup:        raw.EnvSetup,
 		RequiredFiles:   raw.RequiredFiles,
 		TestData:        raw.TestData,
@@ -234,6 +285,24 @@ func (s *stringList) UnmarshalYAML(value *yaml.Node) error {
 	default:
 		return fmt.Errorf("expected string or list")
 	}
+}
+
+func expectedExitCodeValue(value *int) int {
+	if value == nil {
+		return 0
+	}
+	return *value
+}
+
+func normalizeCommandSteps(steps []CommandStep) []CommandStep {
+	out := make([]CommandStep, 0, len(steps))
+	for _, step := range steps {
+		if strings.TrimSpace(step.VM) == "" {
+			step.VM = "default"
+		}
+		out = append(out, step)
+	}
+	return out
 }
 
 func Run(ctx context.Context, api API, opts Options) (RunResult, error) {
@@ -273,44 +342,102 @@ func Run(ctx context.Context, api API, opts Options) (RunResult, error) {
 		return RunResult{}, err
 	}
 
-	imageSource := strings.TrimSpace(opts.ImageSource)
-	if strings.TrimSpace(opts.Dockerfile) != "" {
-		archive, tag, err := buildDockerArchive(ctx, workDir, opts)
+	images := suite.Images
+	if len(images) == 0 {
+		images = map[string]ImageSpec{"default": {Source: firstNonEmpty(opts.ImageSource, suite.Container)}}
+	}
+	if strings.TrimSpace(opts.Dockerfile) != "" || strings.TrimSpace(opts.ImageSource) != "" || strings.TrimSpace(opts.ImageName) != "" {
+		images["default"] = ImageSpec{
+			Source:        opts.ImageSource,
+			Dockerfile:    opts.Dockerfile,
+			DockerContext: opts.DockerContext,
+			DockerTag:     opts.DockerTag,
+			DockerBinary:  opts.DockerBinary,
+			ImageName:     opts.ImageName,
+		}
+	}
+	imageNames := map[string]string{}
+	progressf(opts.Progress, "[fulltest] suite=%s tests=%d work_dir=%s\n", suite.Name, len(selectTests(suite.Tests, opts.Filter)), workDir)
+	for _, imageKey := range sortedMapKeys(images) {
+		spec := images[imageKey]
+		source, err := resolveImageSource(ctx, workDir, imageKey, spec, opts)
 		if err != nil {
 			return RunResult{}, err
 		}
-		imageSource = "docker-archive:" + archive + "#" + tag
-	}
-	imageName := opts.ImageName
-	if strings.TrimSpace(imageName) == "" {
-		imageName = imageCacheName(firstNonEmpty(imageSource, suite.Container))
-	}
-	pullReq := buildPullRequest(suite, imageSource, opts)
-	progressf(opts.Progress, "[fulltest] suite=%s tests=%d work_dir=%s\n", suite.Name, len(selectTests(suite.Tests, opts.Filter)), workDir)
-	progressf(opts.Progress, "[fulltest] importing image=%s source=%s\n", imageName, pullSourceText(pullReq))
-	if err := api.PullImageStream(imageName, pullReq, progressReporter(opts.Progress, imageName)); err != nil {
-		return RunResult{}, err
+		imageName := spec.ImageName
+		if strings.TrimSpace(imageName) == "" {
+			imageName = imageCacheName(firstNonEmpty(source, suite.Container, imageKey))
+		}
+		imageNames[imageKey] = imageName
+		pullReq := buildPullRequest(suite, source, opts)
+		progressf(opts.Progress, "[fulltest] importing image=%s source=%s\n", imageName, pullSourceText(pullReq))
+		if err := api.PullImageStream(imageName, pullReq, progressReporter(opts.Progress, imageName)); err != nil {
+			return RunResult{}, err
+		}
 	}
 
-	vmID := "fulltest-" + imageCacheName(imageName)[:16]
-	progressf(opts.Progress, "[fulltest] loading image=%s memory=%dMiB cpus=%d\n", imageName, opts.MemoryMB, opts.CPUs)
-	_, err = api.CreateInstanceStreamWithID(vmID, client.CreateInstanceRequest{
-		ID:       vmID,
-		Image:    imageName,
-		Shares:   []client.ShareMount{{Source: workDir, Mount: "/work", Writable: true}},
-		Network:  opts.Network,
-		MemoryMB: opts.MemoryMB,
-		CPUs:     opts.CPUs,
-		Dmesg:    opts.Dmesg,
-	}, bootReporter(opts.Progress))
-	if err != nil {
-		return RunResult{}, err
+	vms := suite.VMs
+	if len(vms) == 0 {
+		imageKey := "default"
+		if _, ok := imageNames[imageKey]; !ok && len(imageNames) == 1 {
+			for key := range imageNames {
+				imageKey = key
+			}
+		}
+		vms = map[string]VMSpec{"default": {Image: imageKey}}
 	}
-	if !opts.KeepVM {
-		defer api.ShutdownInstanceWithID(vmID)
+	started := map[string]client.InstanceState{}
+	for _, vmKey := range sortedMapKeys(vms) {
+		spec := vms[vmKey]
+		imageKey := firstNonEmpty(spec.Image, "default")
+		imageName := imageNames[imageKey]
+		if imageName == "" {
+			return RunResult{}, fmt.Errorf("vm %q references unknown image %q", vmKey, imageKey)
+		}
+		memoryMB := spec.MemoryMB
+		if memoryMB == 0 {
+			memoryMB = opts.MemoryMB
+		}
+		cpus := spec.CPUs
+		if cpus == 0 {
+			cpus = opts.CPUs
+		}
+		network := spec.Network
+		if network == nil {
+			network = opts.Network
+		}
+		if network == nil && spec.AllowInternet {
+			network = &client.NetworkConfig{Enabled: true, AllowInternet: true}
+		}
+		vmID := "fulltest-" + suite.Name + "-" + vmKey
+		progressf(opts.Progress, "[fulltest] loading vm=%s image=%s memory=%dMiB cpus=%d\n", vmKey, imageName, memoryMB, cpus)
+		state, err := api.CreateInstanceStreamWithID(vmID, client.CreateInstanceRequest{
+			ID:             vmID,
+			Image:          imageName,
+			Shares:         []client.ShareMount{{Source: workDir, Mount: "/work", Writable: true}},
+			Network:        network,
+			KernelModules:  append([]string(nil), spec.KernelModules...),
+			MemoryMB:       memoryMB,
+			CPUs:           cpus,
+			Dmesg:          opts.Dmesg || spec.Dmesg,
+			TimeoutSeconds: timeoutFor(0, suite.DefaultTimeout),
+		}, bootReporter(opts.Progress))
+		if err != nil {
+			return RunResult{}, err
+		}
+		started[vmKey] = state
+		if !opts.KeepVM {
+			defer api.ShutdownInstanceWithID(vmID)
+		}
 	}
 
 	guestVars := buildGuestVars(suite.TestData)
+	for vmKey, state := range started {
+		if state.NetworkIPv4 != "" {
+			guestVars[vmKey+"_ip"] = state.NetworkIPv4
+			guestVars[vmKey+".ip"] = state.NetworkIPv4
+		}
+	}
 	hostVars := buildHostVars(workDir, suite.TestData)
 	results := make([]TestResult, 0, len(suite.Tests))
 	failed := map[string]bool{}
@@ -325,7 +452,7 @@ func Run(ctx context.Context, api API, opts Options) (RunResult, error) {
 	}
 	if strings.TrimSpace(suite.Setup.Script) != "" {
 		progressf(opts.Progress, "[fulltest] setup\n")
-		output, code, err := runGuest(ctx, api, vmID, applyEnvSetup(substitute(suite.Setup.Script, guestVars), suite.EnvSetup), timeoutFor(120, suite.DefaultTimeout))
+		output, code, err := runGuest(ctx, api, vmIDFor(suite.Name, "default"), applyEnvSetup(substitute(suite.Setup.Script, guestVars), suite.EnvSetup), timeoutFor(120, suite.DefaultTimeout))
 		if err != nil {
 			return RunResult{}, err
 		}
@@ -343,8 +470,7 @@ func Run(ctx context.Context, api API, opts Options) (RunResult, error) {
 			continue
 		}
 		start := time.Now()
-		command := applyEnvSetup(substitute(test.Command, guestVars), suite.EnvSetup)
-		output, code, err := runGuest(ctx, api, vmID, command, timeoutFor(test.Timeout, suite.DefaultTimeout))
+		output, code, err := runTestCommands(ctx, api, suite, test, guestVars)
 		duration := time.Since(start).Seconds()
 		message := ""
 		if err != nil {
@@ -379,7 +505,7 @@ func Run(ctx context.Context, api API, opts Options) (RunResult, error) {
 
 	if strings.TrimSpace(suite.Cleanup.Script) != "" {
 		progressf(opts.Progress, "[fulltest] cleanup\n")
-		_, _, _ = runGuest(ctx, api, vmID, applyEnvSetup(substitute(suite.Cleanup.Script, guestVars), suite.EnvSetup), timeoutFor(60, suite.DefaultTimeout))
+		_, _, _ = runGuest(ctx, api, vmIDFor(suite.Name, "default"), applyEnvSetup(substitute(suite.Cleanup.Script, guestVars), suite.EnvSetup), timeoutFor(60, suite.DefaultTimeout))
 	}
 	if strings.TrimSpace(suite.Cleanup.HostScript) != "" {
 		progressf(opts.Progress, "[fulltest] host cleanup\n")
@@ -401,6 +527,72 @@ func selectTests(tests []TestCase, filter string) []TestCase {
 		}
 	}
 	return out
+}
+
+func vmIDFor(suiteName, vmKey string) string {
+	return "fulltest-" + suiteName + "-" + vmKey
+}
+
+func runTestCommands(ctx context.Context, api API, suite Suite, test TestCase, vars map[string]string) (string, int, error) {
+	var combined strings.Builder
+	lastCode := 0
+	for index, step := range test.Commands {
+		command := applyEnvSetup(substitute(step.Command, vars), suite.EnvSetup)
+		timeout := step.Timeout
+		if timeout == 0 {
+			timeout = test.Timeout
+		}
+		vmID := vmIDFor(suite.Name, firstNonEmpty(step.VM, "default"))
+		output, code, err := runGuestRequest(ctx, api, vmID, command, timeoutFor(timeout, suite.DefaultTimeout), step.User, firstNonEmpty(step.WorkDir, "/work"))
+		if output != "" {
+			if combined.Len() > 0 {
+				combined.WriteString("\n")
+			}
+			combined.WriteString(output)
+		}
+		lastCode = code
+		if err != nil {
+			return combined.String(), code, err
+		}
+		stepTest := TestCase{
+			Name:                   fmt.Sprintf("%s command %d", test.Name, index+1),
+			ExpectedOutputContains: step.ExpectedOutputContains,
+			ExpectedExitCode:       step.ExpectedExitCode,
+			IgnoreExitCode:         step.IgnoreExitCode,
+		}
+		if message := validateTest(output, code, stepTest, nil); message != "" {
+			return combined.String(), code, errors.New(message)
+		}
+	}
+	return combined.String(), lastCode, nil
+}
+
+func resolveImageSource(ctx context.Context, workDir, key string, spec ImageSpec, opts Options) (string, error) {
+	if strings.TrimSpace(spec.Dockerfile) == "" && strings.TrimSpace(spec.DockerfileInline) == "" {
+		return strings.TrimSpace(spec.Source), nil
+	}
+	dockerfile := spec.Dockerfile
+	if strings.TrimSpace(spec.DockerfileInline) != "" {
+		dir := filepath.Join(workDir, ".fulltest-dockerfiles", key)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return "", err
+		}
+		dockerfile = filepath.Join(dir, "Dockerfile")
+		if err := os.WriteFile(dockerfile, []byte(spec.DockerfileInline), 0o644); err != nil {
+			return "", err
+		}
+	}
+	archive, tag, err := buildDockerArchive(ctx, workDir, Options{
+		Dockerfile:    dockerfile,
+		DockerContext: spec.DockerContext,
+		DockerTag:     spec.DockerTag,
+		DockerBinary:  firstNonEmpty(spec.DockerBinary, opts.DockerBinary),
+		Progress:      opts.Progress,
+	})
+	if err != nil {
+		return "", err
+	}
+	return "docker-archive:" + archive + "#" + tag, nil
 }
 
 func buildPullRequest(suite Suite, imageSource string, opts Options) client.PullImageRequest {
@@ -498,10 +690,15 @@ func applyEnvSetup(command, envSetup string) string {
 }
 
 func runGuest(ctx context.Context, api API, vmID, command string, timeoutSeconds float64) (string, int, error) {
+	return runGuestRequest(ctx, api, vmID, command, timeoutSeconds, "", "/work")
+}
+
+func runGuestRequest(ctx context.Context, api API, vmID, command string, timeoutSeconds float64, user string, workDir string) (string, int, error) {
 	req := client.RunRequest{
 		ID:             vmID,
 		Command:        []string{"bash", "-lc", command},
-		WorkDir:        "/work",
+		WorkDir:        firstNonEmpty(workDir, "/work"),
+		User:           user,
 		TimeoutSeconds: timeoutSeconds,
 	}
 	resp, err := api.RunIn(vmID, req)
@@ -717,6 +914,15 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func sortedMapKeys[V any](items map[string]V) []string {
+	keys := make([]string, 0, len(items))
+	for key := range items {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func progressReporter(w io.Writer, imageName string) func(client.ProgressEvent) error {

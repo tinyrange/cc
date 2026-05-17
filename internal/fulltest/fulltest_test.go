@@ -158,6 +158,56 @@ func TestBuildPullRequestSupportsDockerArchive(t *testing.T) {
 	}
 }
 
+func TestRunSupportsMultipleVMCommandSteps(t *testing.T) {
+	recipe := writeRecipe(t, `
+name: net
+images:
+  server:
+    source: server.simg
+  client:
+    source: client.simg
+vms:
+  server:
+    image: server
+    memory_mb: 256
+    allow_internet: true
+  client:
+    image: client
+    memory_mb: 256
+    allow_internet: true
+tests:
+  - name: cross vm
+    commands:
+      - vm: server
+        command: echo server ${server_ip}
+        expected_output_contains:
+          - server 10.0.0.10
+      - vm: client
+        command: echo client sees ${server.ip}
+        expected_output_contains:
+          - client sees 10.0.0.10
+`)
+	api := &fakeAPI{run: func(req client.RunRequest) client.ExecResponse {
+		return client.ExecResponse{ExitCode: 0, Output: strings.Join(req.Command, " ")}
+	}}
+	result, err := Run(context.Background(), api, Options{Recipe: recipe, WorkDir: t.TempDir(), MemoryMB: 512, CPUs: 1})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(api.pulls) != 2 {
+		t.Fatalf("pulls = %#v", api.pulls)
+	}
+	if len(api.starts) != 2 {
+		t.Fatalf("starts = %#v", api.starts)
+	}
+	if !api.starts["server"].Network.AllowInternet || !api.starts["client"].Network.AllowInternet {
+		t.Fatalf("networks = %#v", api.starts)
+	}
+	if len(result.Results) != 1 || !result.Results[0].Passed {
+		t.Fatalf("results = %#v", result.Results)
+	}
+}
+
 func writeRecipe(t *testing.T, body string) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -171,8 +221,10 @@ func writeRecipe(t *testing.T, body string) string {
 type fakeAPI struct {
 	pullName   string
 	pullReq    client.PullImageRequest
+	pulls      map[string]client.PullImageRequest
 	startID    string
 	startReq   client.CreateInstanceRequest
+	starts     map[string]client.CreateInstanceRequest
 	shutdownID string
 	runCount   int
 	run        func(client.RunRequest) client.ExecResponse
@@ -181,13 +233,29 @@ type fakeAPI struct {
 func (f *fakeAPI) PullImageStream(name string, req client.PullImageRequest, _ func(client.ProgressEvent) error) error {
 	f.pullName = name
 	f.pullReq = req
+	if f.pulls == nil {
+		f.pulls = map[string]client.PullImageRequest{}
+	}
+	f.pulls[name] = req
 	return nil
 }
 
 func (f *fakeAPI) CreateInstanceStreamWithID(id string, req client.CreateInstanceRequest, _ func(client.BootEvent) error) (client.InstanceState, error) {
 	f.startID = id
 	f.startReq = req
-	return client.InstanceState{ID: id, Status: "running", Image: req.Image}, nil
+	key := strings.TrimPrefix(id, "fulltest-net-")
+	key = strings.TrimPrefix(key, "fulltest-demo-")
+	if f.starts == nil {
+		f.starts = map[string]client.CreateInstanceRequest{}
+	}
+	f.starts[key] = req
+	ip := ""
+	if key == "server" {
+		ip = "10.0.0.10"
+	} else if key == "client" {
+		ip = "10.0.0.11"
+	}
+	return client.InstanceState{ID: id, Status: "running", Image: req.Image, NetworkIPv4: ip}, nil
 }
 
 func (f *fakeAPI) RunIn(_ string, req client.RunRequest) (client.ExecResponse, error) {

@@ -227,6 +227,16 @@ func (m *Manager) PlanModuleLoad(configVars []string, moduleMap map[string]strin
 	}
 
 	for _, configVar := range configVars {
+		if strings.HasPrefix(configVar, "MODULE:") {
+			moduleName, ok := moduleMap[configVar]
+			if !ok {
+				return nil, fmt.Errorf("no module mapping for %q", configVar)
+			}
+			if err := loadModule(moduleName); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		state, ok := config[configVar]
 		if !ok {
 			return nil, fmt.Errorf("kernel config %q not found", configVar)

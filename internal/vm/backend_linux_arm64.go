@@ -57,7 +57,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		return nil, err
 	}
 	image = withLinuxRuntimeMountDirs(image)
-	modules, err := b.kernel.PlanModuleLoad(linuxRuntimeConfigVars(image), linuxRuntimeModuleMap())
+	modules, err := b.kernel.PlanModuleLoad(linuxRuntimeConfigVars(image, req.KernelModules...), linuxRuntimeModuleMap())
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +117,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if err != nil {
 		return nil, err
 	}
-	modules, err := b.kernel.PlanModuleLoad(linuxRuntimeConfigVars(nil), linuxRuntimeModuleMap())
+	modules, err := b.kernel.PlanModuleLoad(linuxRuntimeConfigVars(nil, req.KernelModules...), linuxRuntimeModuleMap())
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +181,7 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 		}
 		image = withLinuxRuntimeMountDirs(image)
 		modules, err = b.kernel.PlanModuleLoad(
-			linuxRuntimeConfigVars(image),
+			linuxRuntimeConfigVars(image, req.KernelModules...),
 			linuxRuntimeModuleMap(),
 		)
 		if err != nil {
@@ -593,24 +593,94 @@ func linuxGuestInitConfig(modules []alpine.Module, managedExec bool) vmruntime.G
 	return cfg
 }
 
-func linuxRuntimeConfigVars(image *oci.Image) []string {
-	vars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO"}
+func linuxRuntimeConfigVars(image *oci.Image, extraModules ...string) []string {
+	vars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO", "CONFIG_OVERLAY_FS"}
+	vars = append(vars, linuxRuntimeExtraConfigVars(extraModules)...)
 	if NeedsAMD64Emulation(image) {
 		vars = append(vars, "CONFIG_BINFMT_MISC")
 	}
 	return vars
 }
 
+func linuxRuntimeExtraConfigVars(names []string) []string {
+	aliases := map[string]string{
+		"bridge":        "CONFIG_BRIDGE",
+		"br_netfilter":  "CONFIG_BRIDGE_NETFILTER",
+		"veth":          "CONFIG_VETH",
+		"vxlan":         "CONFIG_VXLAN",
+		"nf_conntrack":  "CONFIG_NF_CONNTRACK",
+		"nf_nat":        "CONFIG_NF_NAT",
+		"nf_tables":     "CONFIG_NF_TABLES",
+		"nft_compat":    "CONFIG_NFT_COMPAT",
+		"nft_ct":        "CONFIG_NFT_CT",
+		"nft_masq":      "CONFIG_NFT_MASQ",
+		"nft_nat":       "CONFIG_NFT_NAT",
+		"nft_chain_nat": "MODULE:nft_chain_nat",
+		"x_tables":      "CONFIG_NETFILTER_XTABLES",
+		"xt_addrtype":   "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE",
+		"xt_comment":    "CONFIG_NETFILTER_XT_MATCH_COMMENT",
+		"xt_conntrack":  "CONFIG_NETFILTER_XT_MATCH_CONNTRACK",
+		"xt_mark":       "CONFIG_NETFILTER_XT_TARGET_MARK",
+		"xt_multiport":  "CONFIG_NETFILTER_XT_MATCH_MULTIPORT",
+		"xt_masquerade": "CONFIG_NETFILTER_XT_TARGET_MASQUERADE",
+		"xt_nat":        "CONFIG_NETFILTER_XT_NAT",
+		"xt_tcpudp":     "MODULE:xt_tcpudp",
+		"ipt_reject":    "CONFIG_IP_NF_TARGET_REJECT",
+		"ip6t_reject":   "CONFIG_IP6_NF_TARGET_REJECT",
+	}
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if strings.HasPrefix(name, "CONFIG_") {
+			out = append(out, name)
+			continue
+		}
+		if configVar, ok := aliases[strings.ToLower(name)]; ok {
+			out = append(out, configVar)
+			continue
+		}
+		out = append(out, "CONFIG_"+strings.ToUpper(strings.NewReplacer("-", "_", ".", "_").Replace(name)))
+	}
+	return out
+}
+
 func linuxRuntimeModuleMap() map[string]string {
 	return map[string]string{
-		"CONFIG_VIRTIO_MMIO":      "kernel/drivers/virtio/virtio_mmio.ko.gz",
-		"CONFIG_FUSE_FS":          "kernel/fs/fuse/fuse.ko.gz",
-		"CONFIG_VIRTIO_FS":        "kernel/fs/fuse/virtiofs.ko.gz",
-		"CONFIG_VSOCKETS":         "kernel/net/vmw_vsock/vsock.ko.gz",
-		"CONFIG_VIRTIO_VSOCKETS":  "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
-		"CONFIG_HW_RANDOM":        "kernel/drivers/char/hw_random/rng-core.ko.gz",
-		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
-		"CONFIG_BINFMT_MISC":      "kernel/fs/binfmt_misc.ko.gz",
+		"CONFIG_VIRTIO_MMIO":                    "kernel/drivers/virtio/virtio_mmio.ko.gz",
+		"CONFIG_FUSE_FS":                        "kernel/fs/fuse/fuse.ko.gz",
+		"CONFIG_VIRTIO_FS":                      "kernel/fs/fuse/virtiofs.ko.gz",
+		"CONFIG_VSOCKETS":                       "kernel/net/vmw_vsock/vsock.ko.gz",
+		"CONFIG_VIRTIO_VSOCKETS":                "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
+		"CONFIG_HW_RANDOM":                      "kernel/drivers/char/hw_random/rng-core.ko.gz",
+		"CONFIG_HW_RANDOM_VIRTIO":               "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
+		"CONFIG_BINFMT_MISC":                    "kernel/fs/binfmt_misc.ko.gz",
+		"CONFIG_OVERLAY_FS":                     "kernel/fs/overlayfs/overlay.ko.gz",
+		"CONFIG_BRIDGE":                         "kernel/net/bridge/bridge.ko.gz",
+		"CONFIG_BRIDGE_NETFILTER":               "kernel/net/bridge/br_netfilter.ko.gz",
+		"CONFIG_VETH":                           "kernel/drivers/net/veth.ko.gz",
+		"CONFIG_VXLAN":                          "kernel/drivers/net/vxlan/vxlan.ko.gz",
+		"CONFIG_NF_CONNTRACK":                   "kernel/net/netfilter/nf_conntrack.ko.gz",
+		"CONFIG_NF_NAT":                         "kernel/net/netfilter/nf_nat.ko.gz",
+		"CONFIG_NF_TABLES":                      "kernel/net/netfilter/nf_tables.ko.gz",
+		"CONFIG_NFT_COMPAT":                     "kernel/net/netfilter/nft_compat.ko.gz",
+		"CONFIG_NFT_CT":                         "kernel/net/netfilter/nft_ct.ko.gz",
+		"CONFIG_NFT_MASQ":                       "kernel/net/netfilter/nft_masq.ko.gz",
+		"CONFIG_NFT_NAT":                        "kernel/net/netfilter/nft_nat.ko.gz",
+		"MODULE:nft_chain_nat":                  "kernel/net/netfilter/nft_chain_nat.ko.gz",
+		"CONFIG_NETFILTER_XTABLES":              "kernel/net/netfilter/x_tables.ko.gz",
+		"CONFIG_NETFILTER_XT_MATCH_ADDRTYPE":    "kernel/net/netfilter/xt_addrtype.ko.gz",
+		"CONFIG_NETFILTER_XT_MATCH_COMMENT":     "kernel/net/netfilter/xt_comment.ko.gz",
+		"CONFIG_NETFILTER_XT_MATCH_CONNTRACK":   "kernel/net/netfilter/xt_conntrack.ko.gz",
+		"CONFIG_NETFILTER_XT_TARGET_MARK":       "kernel/net/netfilter/xt_mark.ko.gz",
+		"CONFIG_NETFILTER_XT_MATCH_MULTIPORT":   "kernel/net/netfilter/xt_multiport.ko.gz",
+		"CONFIG_NETFILTER_XT_TARGET_MASQUERADE": "kernel/net/netfilter/xt_MASQUERADE.ko.gz",
+		"CONFIG_NETFILTER_XT_NAT":               "kernel/net/netfilter/xt_nat.ko.gz",
+		"MODULE:xt_tcpudp":                      "kernel/net/netfilter/xt_tcpudp.ko.gz",
+		"CONFIG_IP_NF_TARGET_REJECT":            "kernel/net/ipv4/netfilter/ipt_REJECT.ko.gz",
+		"CONFIG_IP6_NF_TARGET_REJECT":           "kernel/net/ipv6/netfilter/ip6t_REJECT.ko.gz",
 	}
 }
 

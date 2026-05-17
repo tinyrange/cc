@@ -412,6 +412,39 @@ func (m *mountedFS) Mkdir(parent uint64, name string, mode uint32) (uint64, Fuse
 	return id, attr, 0
 }
 
+func (m *mountedFS) Mknod(parent uint64, name string, mode uint32, rdev uint32) (uint64, FuseAttr, int32) {
+	parentNode := m.node(parent)
+	if parentNode == nil {
+		return 0, FuseAttr{}, -linuxENOENT
+	}
+	childName, ok := cleanChildName(name)
+	if !ok {
+		return 0, FuseAttr{}, -linuxEINVAL
+	}
+	childPath := path.Join(parentNode.path, path.Base(childName))
+	if m.isMountPath(childPath) || m.isSyntheticPath(childPath) {
+		return 0, FuseAttr{}, -linuxEEXIST
+	}
+	backend, backendParent, mount, errno := m.resolveBackendNode(parentNode.path)
+	if errno != 0 {
+		return 0, FuseAttr{}, errno
+	}
+	if !isRootOrWritableMount(mount) {
+		return 0, FuseAttr{}, -linuxEROFS
+	}
+	mknodBackend, ok := backend.(fsMknodBackend)
+	if !ok {
+		return 0, FuseAttr{}, -linuxEROFS
+	}
+	backendNodeID, attr, errno := mknodBackend.Mknod(backendParent, childName, mode, rdev)
+	if errno != 0 {
+		return 0, FuseAttr{}, errno
+	}
+	id := m.ensureResolvedNode(childPath, backend, backendNodeID)
+	attr.Ino = id
+	return id, attr, 0
+}
+
 func (m *mountedFS) Symlink(parent uint64, name string, target string) (uint64, FuseAttr, int32) {
 	parentNode := m.node(parent)
 	if parentNode == nil {

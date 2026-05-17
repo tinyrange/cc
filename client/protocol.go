@@ -290,6 +290,7 @@ type CreateInstanceRequest struct {
 	Image          string         `json:"image"`
 	Shares         []ShareMount   `json:"shares,omitempty"`
 	Network        *NetworkConfig `json:"network,omitempty"`
+	KernelModules  []string       `json:"kernel_modules,omitempty"`
 	MemoryMB       uint64         `json:"memory_mb,omitempty"`
 	CPUs           int            `json:"cpus,omitempty"`
 	Dmesg          bool           `json:"dmesg,omitempty"`
@@ -299,6 +300,7 @@ type CreateInstanceRequest struct {
 type StartInstanceRequest struct {
 	ID             string         `json:"id,omitempty"`
 	Network        *NetworkConfig `json:"network,omitempty"`
+	KernelModules  []string       `json:"kernel_modules,omitempty"`
 	MemoryMB       uint64         `json:"memory_mb,omitempty"`
 	CPUs           int            `json:"cpus,omitempty"`
 	Dmesg          bool           `json:"dmesg,omitempty"`
@@ -321,6 +323,7 @@ type RunRequest struct {
 	Image          string         `json:"image"`
 	Shares         []ShareMount   `json:"shares,omitempty"`
 	Network        *NetworkConfig `json:"network,omitempty"`
+	KernelModules  []string       `json:"kernel_modules,omitempty"`
 	Command        []string       `json:"command,omitempty"`
 	Env            []string       `json:"env,omitempty"`
 	RootDir        string         `json:"root_dir,omitempty"`
