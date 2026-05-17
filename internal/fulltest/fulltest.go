@@ -121,6 +121,7 @@ type Options struct {
 	DockerContext           string
 	DockerTag               string
 	DockerBinary            string
+	DockerDirect            bool
 	Network                 *client.NetworkConfig
 	Progress                io.Writer
 	HostCommandTimeoutExtra time.Duration
@@ -582,6 +583,19 @@ func resolveImageSource(ctx context.Context, workDir, key string, spec ImageSpec
 			return "", err
 		}
 	}
+	if opts.DockerDirect {
+		tag, err := buildDockerImage(ctx, Options{
+			Dockerfile:    dockerfile,
+			DockerContext: spec.DockerContext,
+			DockerTag:     spec.DockerTag,
+			DockerBinary:  firstNonEmpty(spec.DockerBinary, opts.DockerBinary),
+			Progress:      opts.Progress,
+		})
+		if err != nil {
+			return "", err
+		}
+		return "docker-image:" + tag, nil
+	}
 	archive, tag, err := buildDockerArchive(ctx, workDir, Options{
 		Dockerfile:    dockerfile,
 		DockerContext: spec.DockerContext,
@@ -869,9 +883,25 @@ func prepareRequiredFiles(ctx context.Context, workDir string, required []Requir
 }
 
 func buildDockerArchive(ctx context.Context, workDir string, opts Options) (string, string, error) {
-	dockerfile, err := filepath.Abs(opts.Dockerfile)
+	tag, err := buildDockerImage(ctx, opts)
 	if err != nil {
 		return "", "", err
+	}
+	archive := filepath.Join(workDir, strings.ReplaceAll(imageCacheName(tag), ":", "-")+".docker.tar")
+	binary := firstNonEmpty(strings.TrimSpace(opts.DockerBinary), "docker")
+	save := exec.CommandContext(ctx, binary, "save", "-o", archive, tag)
+	save.Stdout = opts.Progress
+	save.Stderr = opts.Progress
+	if err := save.Run(); err != nil {
+		return "", "", fmt.Errorf("docker save: %w", err)
+	}
+	return archive, tag, nil
+}
+
+func buildDockerImage(ctx context.Context, opts Options) (string, error) {
+	dockerfile, err := filepath.Abs(opts.Dockerfile)
+	if err != nil {
+		return "", err
 	}
 	contextDir := opts.DockerContext
 	if strings.TrimSpace(contextDir) == "" {
@@ -879,7 +909,7 @@ func buildDockerArchive(ctx context.Context, workDir string, opts Options) (stri
 	}
 	contextDir, err = filepath.Abs(contextDir)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	tag := strings.TrimSpace(opts.DockerTag)
 	if tag == "" {
@@ -890,16 +920,9 @@ func buildDockerArchive(ctx context.Context, workDir string, opts Options) (stri
 	build.Stdout = opts.Progress
 	build.Stderr = opts.Progress
 	if err := build.Run(); err != nil {
-		return "", "", fmt.Errorf("docker build: %w", err)
+		return "", fmt.Errorf("docker build: %w", err)
 	}
-	archive := filepath.Join(workDir, strings.ReplaceAll(imageCacheName(tag), ":", "-")+".docker.tar")
-	save := exec.CommandContext(ctx, binary, "save", "-o", archive, tag)
-	save.Stdout = opts.Progress
-	save.Stderr = opts.Progress
-	if err := save.Run(); err != nil {
-		return "", "", fmt.Errorf("docker save: %w", err)
-	}
-	return archive, tag, nil
+	return tag, nil
 }
 
 func imageCacheName(seed string) string {

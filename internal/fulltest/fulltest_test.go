@@ -158,6 +158,23 @@ func TestBuildPullRequestSupportsDockerArchive(t *testing.T) {
 	}
 }
 
+func TestSplitDockerArchiveSourceKeepsWindowsDriveColon(t *testing.T) {
+	archive, tag := splitDockerArchiveSource("docker-archive:C:/tmp/tool.tar#tool:latest")
+	if archive != "C:/tmp/tool.tar" || tag != "tool:latest" {
+		t.Fatalf("archive=%q tag=%q", archive, tag)
+	}
+}
+
+func TestDockerPublishArg(t *testing.T) {
+	got, err := dockerPublishArg(client.PortForward{HostAddr: "127.0.0.1", HostPort: 8080, GuestPort: 80})
+	if err != nil {
+		t.Fatalf("dockerPublishArg() error = %v", err)
+	}
+	if got != "127.0.0.1:8080:80/tcp" {
+		t.Fatalf("publish = %q", got)
+	}
+}
+
 func TestRunSupportsMultipleVMCommandSteps(t *testing.T) {
 	recipe := writeRecipe(t, `
 name: net

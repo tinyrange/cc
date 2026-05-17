@@ -26,6 +26,18 @@ func TestFormatProgressEvent(t *testing.T) {
 	}
 }
 
+func TestFulltestBackendFromArgs(t *testing.T) {
+	if got := fulltestBackendFromArgs([]string{"-recipe", "suite.yaml"}); got != "ccvm" {
+		t.Fatalf("default backend = %q", got)
+	}
+	if got := fulltestBackendFromArgs([]string{"--backend=docker"}); got != "docker" {
+		t.Fatalf("equals backend = %q", got)
+	}
+	if got := fulltestBackendFromArgs([]string{"-backend", "docker"}); got != "docker" {
+		t.Fatalf("split backend = %q", got)
+	}
+}
+
 func TestFormatProgressEventError(t *testing.T) {
 	got := formatProgressEvent(client.ProgressEvent{
 		Status: "error",

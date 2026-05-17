@@ -71,16 +71,18 @@ func run() error {
 	}
 	statePath := filepath.Join(rootCache, "ccvm.json")
 
+	if args[0] == "fulltest" && fulltestBackendFromArgs(args[1:]) == "docker" {
+		return handleCommand(nil, args)
+	}
+
 	ccvmBinary, err := resolveCCVMPath(*ccvmPath)
 	if err != nil {
 		return err
 	}
-
 	api, err := connectBackend(ccvmBinary, rootCache, statePath)
 	if err != nil {
 		return err
 	}
-
 	return handleCommand(api, args)
 }
 
@@ -192,13 +194,27 @@ func handleFullTestCommand(api ccAPI, args []string) error {
 	dockerContext := fs.String("docker-context", "", "Docker build context; defaults to Dockerfile directory")
 	dockerTag := fs.String("docker-tag", "", "Docker image tag to build/save")
 	dockerBinary := fs.String("docker-binary", "docker", "Docker-compatible CLI")
+	backend := fs.String("backend", "ccvm", "Execution backend: ccvm or docker")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() != 0 {
 		return fmt.Errorf("usage: cc fulltest [flags]")
 	}
-	result, err := fulltest.Run(context.Background(), api, fulltest.Options{
+	fulltestAPI := fulltest.API(api)
+	dockerDirect := false
+	switch strings.ToLower(strings.TrimSpace(*backend)) {
+	case "", "ccvm":
+		if api == nil {
+			return fmt.Errorf("ccvm backend is not configured")
+		}
+	case "docker":
+		fulltestAPI = fulltest.NewDockerAPI(context.Background(), *dockerBinary)
+		dockerDirect = true
+	default:
+		return fmt.Errorf("unsupported fulltest backend %q", *backend)
+	}
+	result, err := fulltest.Run(context.Background(), fulltestAPI, fulltest.Options{
 		Recipe:                 *recipe,
 		ImageSource:            *imageSource,
 		ImageName:              *imageName,
@@ -218,6 +234,7 @@ func handleFullTestCommand(api ccAPI, args []string) error {
 		DockerContext:          *dockerContext,
 		DockerTag:              *dockerTag,
 		DockerBinary:           *dockerBinary,
+		DockerDirect:           dockerDirect,
 		Progress:               os.Stderr,
 	})
 	if err != nil {
@@ -227,6 +244,27 @@ func handleFullTestCommand(api ccAPI, args []string) error {
 		return fmt.Errorf("fulltest failed")
 	}
 	return nil
+}
+
+func fulltestBackendFromArgs(args []string) string {
+	for i, arg := range args {
+		if arg == "--" {
+			break
+		}
+		if arg == "-backend" || arg == "--backend" {
+			if i+1 < len(args) {
+				return strings.ToLower(strings.TrimSpace(args[i+1]))
+			}
+			return ""
+		}
+		if strings.HasPrefix(arg, "-backend=") {
+			return strings.ToLower(strings.TrimSpace(strings.TrimPrefix(arg, "-backend=")))
+		}
+		if strings.HasPrefix(arg, "--backend=") {
+			return strings.ToLower(strings.TrimSpace(strings.TrimPrefix(arg, "--backend=")))
+		}
+	}
+	return "ccvm"
 }
 
 func handleVMCommand(api ccAPI, args []string) error {
