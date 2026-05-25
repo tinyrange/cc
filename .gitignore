@@ -21,3 +21,5 @@
 /pyneurodesk/dist
 /pyneurodesk/src/pyneurodesk/bin/ccvm
 /pyneurodesk/src/pyneurodesk/bin/ccvm.exe
+
+*.simg
