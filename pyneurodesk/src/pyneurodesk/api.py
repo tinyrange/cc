@@ -32,6 +32,24 @@ from .models import (
 )
 
 DEFAULT_CVMFS_MIRROR = "http://cvmfs.neurodesk.org"
+DEFAULT_CVMFS_MIRRORS = (
+    "http://cvmfs-geoproximity.neurodesk.org",
+    "http://cvmfs.neurodesk.org",
+    "http://s1brisbane-cvmfs.openhtc.io",
+    "http://s1sydney-cvmfs.openhtc.io",
+    "http://s1melbourne-cvmfs.openhtc.io",
+    "http://s1perth-cvmfs.openhtc.io",
+    "http://s1fnal-cvmfs.openhtc.io:8080",
+    "http://s1osggoc-cvmfs.openhtc.io:8080",
+    "http://s1bnl-cvmfs.openhtc.io:8080",
+    "http://s1ral-cvmfs.openhtc.io:8080",
+    "http://s1nikhef-cvmfs.openhtc.io:8080",
+    "http://cvmfs-frankfurt.neurodesk.org",
+    "http://cvmfs-jetstream.neurodesk.org",
+    "http://cvmfs1.neurodesk.org",
+    "http://cvmfs2.neurodesk.org",
+    "http://cvmfs3.neurodesk.org",
+)
 DEFAULT_CVMFS_REPO = "neurodesk.ardc.edu.au"
 DEFAULT_CONTAINERS_PATH = "/containers"
 DEFAULT_RELEASES_API = "https://api.github.com/repos/NeuroDesk/neurocontainers/contents/releases"
@@ -56,32 +74,46 @@ class NullProgressReporter:
         return None
 
 
+def cvmfs_mirrors_for(mirror: str) -> tuple[str, ...]:
+    normalized = mirror.rstrip("/")
+    if normalized in {
+        DEFAULT_CVMFS_MIRROR,
+        "https://cvmfs.neurodesk.org",
+        "http://cvmfs-geoproximity.neurodesk.org",
+    }:
+        return DEFAULT_CVMFS_MIRRORS
+    return ()
+
+
 class StreamProgressReporter:
     def __init__(self, total_steps: int, stream: Optional[object] = None) -> None:
         self.total_steps = max(total_steps, 1)
         self.stream = stream if stream is not None else sys.stdout
         self._active = False
+        self._lock = threading.Lock()
 
     def update(self, step: int, message: str) -> None:
-        current = max(0, min(step, self.total_steps))
-        width = 24
-        filled = int(width * current / self.total_steps)
-        bar = "#" * filled + "-" * (width - filled)
-        line = f"[{bar}] {current}/{self.total_steps} {message}"
-        print(f"\r\033[2K{line}", end="", file=self.stream, flush=True)
-        self._active = True
+        with self._lock:
+            current = max(0, min(step, self.total_steps))
+            width = 24
+            filled = int(width * current / self.total_steps)
+            bar = "#" * filled + "-" * (width - filled)
+            line = f"[{bar}] {current}/{self.total_steps} {message}"
+            print(f"\r\033[2K{line}", end="", file=self.stream, flush=True)
+            self._active = True
 
     def close(self, message: Optional[str] = None) -> None:
-        if message:
+        with self._lock:
+            if message:
+                if self._active:
+                    print(f"\r\033[2K{message}", file=self.stream, flush=True)
+                else:
+                    print(message, file=self.stream, flush=True)
+                self._active = False
+                return
             if self._active:
-                print(f"\r\033[2K{message}", file=self.stream, flush=True)
-            else:
-                print(message, file=self.stream, flush=True)
-            self._active = False
-            return
-        if self._active:
-            print(file=self.stream, flush=True)
-            self._active = False
+                print(file=self.stream, flush=True)
+                self._active = False
 
 
 class NotebookProgressReporter:
@@ -383,6 +415,7 @@ def _search_versions(
         direct_entries = client.cvmfs_list(
             CVMFSSource(
                 mirror=mirror,
+                mirrors=cvmfs_mirrors_for(mirror),
                 repo=repo,
                 path=direct_directory,
                 cache_dir=cache_dir,
@@ -396,6 +429,7 @@ def _search_versions(
     root_entries = client.cvmfs_list(
         CVMFSSource(
             mirror=mirror,
+            mirrors=cvmfs_mirrors_for(mirror),
             repo=repo,
             path=DEFAULT_CONTAINERS_PATH,
             cache_dir=cache_dir,
@@ -587,6 +621,7 @@ def resolve_container_reference(
         source=ImageSource(
             type="cvmfs",
             mirror=mirror,
+            mirrors=cvmfs_mirrors_for(mirror),
             repo=repo,
             path=selected_path,
         ),
@@ -600,6 +635,7 @@ def load_deploy_metadata(container_handle: NeurodeskContainer) -> DeployMetadata
         return load_local_deploy_metadata(container_handle)
     source = CVMFSSource(
         mirror=DEFAULT_CVMFS_MIRROR,
+        mirrors=cvmfs_mirrors_for(DEFAULT_CVMFS_MIRROR),
         repo=DEFAULT_CVMFS_REPO,
         path=directory,
         cache_dir=container_handle.reference.cache_dir,
@@ -828,6 +864,7 @@ def read_cvmfs_text(
         response = container_handle._client.cvmfs_read(
             CVMFSReadRequest(
                 mirror=DEFAULT_CVMFS_MIRROR,
+                mirrors=cvmfs_mirrors_for(DEFAULT_CVMFS_MIRROR),
                 repo=DEFAULT_CVMFS_REPO,
                 path=path,
                 length=1_000_000,
@@ -903,6 +940,7 @@ def _resolve_release_reference(
             source=ImageSource(
                 type="cvmfs",
                 mirror=mirror,
+                mirrors=cvmfs_mirrors_for(mirror),
                 repo=repo,
                 path=selected_path,
             ),
@@ -923,6 +961,7 @@ def _resolve_release_reference(
             source=ImageSource(
                 type="cvmfs",
                 mirror=mirror,
+                mirrors=cvmfs_mirrors_for(mirror),
                 repo=repo,
                 path=selected_path,
             ),
@@ -971,25 +1010,29 @@ def start_daemon_for_cache_dir(cache_root: Path) -> DaemonState:
         )
         hello_line = ""
         assert proc.stdout is not None
-        hello_line = proc.stdout.readline()
-        if not hello_line:
-            proc.kill()
-            proc.wait()
-            raise RuntimeError(
-                f"failed to start ccvm from {ccvm_path}; no startup banner was received. "
-                f"See daemon log at {log_path}"
-            )
+        payload = None
+        startup_lines = []
+        while True:
+            hello_line = proc.stdout.readline()
+            if not hello_line:
+                proc.kill()
+                proc.wait()
+                detail = ""
+                if startup_lines:
+                    detail = " Startup output: " + "".join(startup_lines).strip()
+                raise RuntimeError(
+                    f"failed to start ccvm from {ccvm_path}; no startup banner was received. "
+                    f"See daemon log at {log_path}.{detail}"
+                )
+            try:
+                payload = json.loads(hello_line)
+                break
+            except json.JSONDecodeError:
+                startup_lines.append(hello_line)
+                log_file.write(hello_line.encode("utf-8", errors="replace"))
+                log_file.flush()
 
-    try:
-        payload = json.loads(hello_line)
-    except json.JSONDecodeError as exc:
-        proc.kill()
-        proc.wait()
-        raise RuntimeError(
-            f"failed to decode ccvm startup banner from {ccvm_path}: {hello_line!r}. "
-            f"See daemon log at {log_path}"
-        ) from exc
-
+    assert payload is not None
     if payload.get("kind") == "error" or payload.get("error"):
         proc.kill()
         proc.wait()
@@ -1106,6 +1149,35 @@ def _build_ccvm_binary(binary_path: Path, root: Path) -> None:
         stdout = proc.stdout.strip()
         detail = stderr or stdout or f"exit status {proc.returncode}"
         raise RuntimeError(f"failed to build bundled ccvm binary: {detail}")
+    _sign_ccvm_binary_if_needed(binary_path, root)
+
+
+def _sign_ccvm_binary_if_needed(binary_path: Path, root: Path) -> None:
+    if sys.platform != "darwin":
+        return
+    entitlements = root / "tools" / "entitlements.xml"
+    if not entitlements.exists():
+        return
+    proc = subprocess.run(
+        [
+            "codesign",
+            "-f",
+            "-s",
+            "-",
+            "--entitlements",
+            str(entitlements),
+            str(binary_path),
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip()
+        stdout = proc.stdout.strip()
+        detail = stderr or stdout or f"exit status {proc.returncode}"
+        raise RuntimeError(f"failed to sign bundled ccvm binary: {detail}")
 
 
 def default_cache_root() -> Path:
@@ -1144,6 +1216,9 @@ def _supports_vm_start(base_url: str) -> bool:
     try:
         with httpx.Client(base_url=base_url, timeout=2.0) as client:
             response = client.get("/vm/start")
+            if response.status_code == 404:
+                return False
+            response = client.get("/watchdog/activity")
             return response.status_code != 404
     except httpx.HTTPError:
         return False
@@ -1524,6 +1599,7 @@ def _find_simg_in_directory(
     entries = client.cvmfs_list(
         CVMFSSource(
             mirror=mirror,
+            mirrors=cvmfs_mirrors_for(mirror),
             repo=repo,
             path=directory,
             cache_dir=cache_dir,

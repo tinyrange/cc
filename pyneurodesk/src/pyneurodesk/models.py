@@ -11,15 +11,18 @@ class CVMFSSource:
     repo: str
     path: str
     cache_dir: Optional[str] = None
+    mirrors: tuple[str, ...] = ()
 
-    def to_payload(self) -> dict[str, str]:
-        payload: dict[str, str] = {
+    def to_payload(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
             "mirror": self.mirror,
             "repo": self.repo,
             "path": self.path,
         }
         if self.cache_dir is not None:
             payload["cache_dir"] = self.cache_dir
+        if self.mirrors:
+            payload["mirrors"] = list(self.mirrors)
         return payload
 
 
@@ -28,6 +31,7 @@ class ImageSource:
     type: str
     format: Optional[str] = None
     mirror: Optional[str] = None
+    mirrors: tuple[str, ...] = ()
     repo: Optional[str] = None
     path: Optional[str] = None
 
@@ -37,6 +41,8 @@ class ImageSource:
             payload["format"] = self.format
         if self.mirror is not None:
             payload["mirror"] = self.mirror
+        if self.mirrors:
+            payload["mirrors"] = list(self.mirrors)
         if self.repo is not None:
             payload["repo"] = self.repo
         if self.path is not None:
@@ -69,6 +75,7 @@ class ImportImageRequest:
         repo: str,
         path: str,
         cache_dir: Optional[str] = None,
+        mirrors: tuple[str, ...] = (),
         prefetch: bool = False,
         prefetch_workers: Optional[int] = None,
     ) -> "ImportImageRequest":
@@ -76,6 +83,7 @@ class ImportImageRequest:
             source=ImageSource(
                 type="cvmfs",
                 mirror=mirror,
+                mirrors=mirrors,
                 repo=repo,
                 path=path,
             ),
@@ -129,6 +137,8 @@ class DownloadProgress:
     progress: Optional[float] = None
     bytes_downloaded: Optional[int] = None
     bytes_total: Optional[int] = None
+    files_downloaded: Optional[int] = None
+    files_total: Optional[int] = None
     rate_bytes_per_second: Optional[float] = None
     eta_seconds: Optional[float] = None
     error: Optional[str] = None
@@ -142,6 +152,8 @@ class DownloadProgress:
             progress=payload.get("progress"),
             bytes_downloaded=payload.get("bytes_downloaded"),
             bytes_total=payload.get("bytes_total"),
+            files_downloaded=payload.get("files_downloaded"),
+            files_total=payload.get("files_total"),
             rate_bytes_per_second=payload.get("rate_bytes_per_second"),
             eta_seconds=payload.get("eta_seconds"),
             error=payload.get("error"),
@@ -225,6 +237,7 @@ class CVMFSReadRequest:
     offset: int = 0
     length: Optional[int] = None
     cache_dir: Optional[str] = None
+    mirrors: tuple[str, ...] = ()
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -237,6 +250,8 @@ class CVMFSReadRequest:
             payload["length"] = self.length
         if self.cache_dir is not None:
             payload["cache_dir"] = self.cache_dir
+        if self.mirrors:
+            payload["mirrors"] = list(self.mirrors)
         return payload
 
 

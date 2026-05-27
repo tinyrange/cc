@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -129,34 +128,42 @@ func buildCVMFSDirectoryIndex(client *intcvmfs.Client, rootTarget string) ([]ind
 	return nodes, meta, arch, nil
 }
 
-func prefetchCVMFSFiles(ctx context.Context, client *intcvmfs.Client, nodes []indexedNode, workers int, contentsPath string, imageName string, report func(cclient.ProgressEvent)) ([]indexedNode, error) {
-	type prefetchTarget struct {
-		nodeIndex int
-		target    string
-		size      uint64
-		offset    uint64
-	}
+type prefetchTarget struct {
+	nodeIndex int
+	target    string
+	size      uint64
+}
 
+func prefetchCVMFSFiles(ctx context.Context, client *intcvmfs.Client, nodes []indexedNode, workers int, imageName string, report func(cclient.ProgressEvent)) ([]indexedNode, error) {
 	workers = resolvePrefetchWorkers(workers)
-	packedNodes := append([]indexedNode(nil), nodes...)
-	targets := make([]prefetchTarget, 0, len(nodes))
-	var totalBytes uint64
-	for i, node := range packedNodes {
+	cachedNodes := normalizeCVMFSIndexedNodes(nodes)
+	candidates := make([]prefetchTarget, 0, len(nodes))
+	for i, node := range cachedNodes {
 		if node.Kind != indexedKindFile || strings.TrimSpace(node.CVMFSTarget) == "" {
 			continue
 		}
-		packedNodes[i].Packed = true
-		packedNodes[i].PackedOffset = totalBytes
-		targets = append(targets, prefetchTarget{
+		candidates = append(candidates, prefetchTarget{
 			nodeIndex: i,
 			target:    node.CVMFSTarget,
 			size:      node.Size,
-			offset:    totalBytes,
 		})
-		totalBytes += node.Size
+	}
+	targets, totalBytes, err := cvmfsMissingPrefetchTargets(client, candidates)
+	if err != nil {
+		return nil, err
 	}
 	if len(targets) == 0 {
-		return packedNodes, nil
+		reportPullProgress(report, cclient.ProgressEvent{
+			Status:          "downloaded",
+			Artifact:        imageName,
+			Blob:            "cvmfs cache",
+			BytesDownloaded: 0,
+			BytesTotal:      0,
+			FilesDownloaded: 0,
+			FilesTotal:      0,
+			Progress:        1,
+		})
+		return cachedNodes, nil
 	}
 	sort.SliceStable(targets, func(i, j int) bool {
 		if targets[i].size == targets[j].size {
@@ -166,34 +173,16 @@ func prefetchCVMFSFiles(ctx context.Context, client *intcvmfs.Client, nodes []in
 	})
 
 	startedAt := time.Now()
-	fmt.Fprintf(os.Stderr, "ccx3-prefetch: starting prefetch of %d files (%s) with %d workers\n", len(targets), formatPrefetchBytes(totalBytes), workers)
+	fmt.Fprintf(os.Stderr, "ccx3-prefetch: filling CVMFS cache with %d files (%s) using %d workers\n", len(targets), formatPrefetchBytes(totalBytes), workers)
 	reportPullProgress(report, cclient.ProgressEvent{
 		Status:          "prefetching",
 		Artifact:        imageName,
-		Blob:            "rootfs.contents",
+		Blob:            "cvmfs cache",
 		BytesDownloaded: 0,
 		BytesTotal:      int64(totalBytes),
+		FilesDownloaded: 0,
+		FilesTotal:      int64(len(targets)),
 	})
-	if err := os.MkdirAll(filepath.Dir(contentsPath), 0o755); err != nil {
-		return nil, err
-	}
-	tmpPath := contentsPath + ".tmp"
-	if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
-		return nil, err
-	}
-	contentsFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o644)
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		_ = contentsFile.Close()
-		_ = os.Remove(tmpPath)
-	}()
-	if totalBytes > 0 {
-		if err := contentsFile.Truncate(int64(totalBytes)); err != nil {
-			return nil, err
-		}
-	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -206,7 +195,7 @@ func prefetchCVMFSFiles(ctx context.Context, client *intcvmfs.Client, nodes []in
 
 	progressDone := make(chan struct{})
 	go func() {
-		ticker := time.NewTicker(5 * time.Second)
+		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		defer close(progressDone)
 		for {
@@ -215,7 +204,7 @@ func prefetchCVMFSFiles(ctx context.Context, client *intcvmfs.Client, nodes []in
 				return
 			case <-ticker.C:
 				logPrefetchProgress(startedAt, len(targets), totalBytes, completedFiles.Load(), completedBytes.Load())
-				reportPrefetchProgress(report, imageName, startedAt, totalBytes, completedBytes.Load())
+				reportPrefetchProgress(report, imageName, startedAt, len(targets), totalBytes, completedFiles.Load(), completedBytes.Load())
 			}
 		}
 	}()
@@ -223,13 +212,13 @@ func prefetchCVMFSFiles(ctx context.Context, client *intcvmfs.Client, nodes []in
 	worker := func() {
 		defer wg.Done()
 		for target := range workCh {
-			written, err := client.WriteFileTo(target.target, io.NewOffsetWriter(contentsFile, int64(target.offset)))
+			written, err := client.PrefetchFile(target.target)
 			if err == nil && written != target.size {
-				err = fmt.Errorf("packed %q wrote %d bytes, want %d", target.target, written, target.size)
+				err = fmt.Errorf("cached %q has %d bytes, want %d", target.target, written, target.size)
 			}
 			if err != nil {
 				select {
-				case errCh <- fmt.Errorf("pack %q: %w", target.target, err):
+				case errCh <- fmt.Errorf("prefetch %q: %w", target.target, err):
 				default:
 				}
 				cancel()
@@ -261,28 +250,53 @@ sendLoop:
 	select {
 	case err := <-errCh:
 		logPrefetchProgress(startedAt, len(targets), totalBytes, completedFiles.Load(), completedBytes.Load())
-		reportPrefetchProgress(report, imageName, startedAt, totalBytes, completedBytes.Load())
+		reportPrefetchProgress(report, imageName, startedAt, len(targets), totalBytes, completedFiles.Load(), completedBytes.Load())
 		return nil, err
 	default:
 		logPrefetchProgress(startedAt, len(targets), totalBytes, completedFiles.Load(), completedBytes.Load())
-		reportPrefetchProgress(report, imageName, startedAt, totalBytes, completedBytes.Load())
+		reportPrefetchProgress(report, imageName, startedAt, len(targets), totalBytes, completedFiles.Load(), completedBytes.Load())
 		fmt.Fprintf(os.Stderr, "ccx3-prefetch: completed in %s\n", time.Since(startedAt).Round(time.Second))
-		if err := contentsFile.Close(); err != nil {
-			return nil, err
-		}
-		if err := os.Rename(tmpPath, contentsPath); err != nil {
-			return nil, err
-		}
 		reportPullProgress(report, cclient.ProgressEvent{
 			Status:          "downloaded",
 			Artifact:        imageName,
-			Blob:            filepath.Base(contentsPath),
+			Blob:            "cvmfs cache",
 			BytesDownloaded: int64(totalBytes),
 			BytesTotal:      int64(totalBytes),
+			FilesDownloaded: int64(len(targets)),
+			FilesTotal:      int64(len(targets)),
 			Progress:        1,
 		})
-		return packedNodes, nil
+		return cachedNodes, nil
 	}
+}
+
+func normalizeCVMFSIndexedNodes(nodes []indexedNode) []indexedNode {
+	out := append([]indexedNode(nil), nodes...)
+	for i := range out {
+		out[i].Packed = false
+		out[i].PackedOffset = 0
+	}
+	return out
+}
+
+func cvmfsMissingPrefetchTargets(client *intcvmfs.Client, candidates []prefetchTarget) ([]prefetchTarget, uint64, error) {
+	targets := make([]prefetchTarget, 0, len(candidates))
+	var totalBytes uint64
+	for _, target := range candidates {
+		size, ok, err := client.CachedFileSize(target.target)
+		if err != nil {
+			return nil, 0, fmt.Errorf("check cached %q: %w", target.target, err)
+		}
+		if ok {
+			if size != target.size {
+				return nil, 0, fmt.Errorf("cached %q has %d bytes, want %d", target.target, size, target.size)
+			}
+			continue
+		}
+		targets = append(targets, target)
+		totalBytes += target.size
+	}
+	return targets, totalBytes, nil
 }
 
 func resolvePrefetchWorkers(requested int) int {
@@ -296,17 +310,17 @@ func resolvePrefetchWorkers(requested int) int {
 		}
 		return requested
 	}
-	defaultWorkers := cpus / 2
+	defaultWorkers := cpus
 	if defaultWorkers < 1 {
 		defaultWorkers = 1
 	}
-	if defaultWorkers > 4 {
-		defaultWorkers = 4
+	if defaultWorkers > 8 {
+		defaultWorkers = 8
 	}
 	return defaultWorkers
 }
 
-func reportPrefetchProgress(report func(cclient.ProgressEvent), imageName string, startedAt time.Time, totalBytes, completedBytes uint64) {
+func reportPrefetchProgress(report func(cclient.ProgressEvent), imageName string, startedAt time.Time, totalFiles int, totalBytes, completedFiles, completedBytes uint64) {
 	if report == nil {
 		return
 	}
@@ -328,12 +342,14 @@ func reportPrefetchProgress(report func(cclient.ProgressEvent), imageName string
 		progress = float64(completedBytes) / float64(totalBytes)
 	}
 	reportPullProgress(report, cclient.ProgressEvent{
-		Status:             "downloading",
+		Status:             "prefetching",
 		Artifact:           imageName,
-		Blob:               "rootfs.contents",
+		Blob:               "cvmfs cache",
 		Progress:           progress,
 		BytesDownloaded:    int64(completedBytes),
 		BytesTotal:         int64(totalBytes),
+		FilesDownloaded:    int64(completedFiles),
+		FilesTotal:         int64(totalFiles),
 		RateBytesPerSecond: rate,
 		ETASeconds:         etaSeconds,
 	})

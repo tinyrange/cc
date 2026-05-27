@@ -41,7 +41,9 @@ class PyNeurodeskClient:
         timeout: Optional[Union[float, httpx.Timeout]] = None,
     ) -> None:
         self._owns_client = client is None
-        self._client = client or httpx.Client(base_url=base_url, timeout=resolve_http_timeout(timeout))
+        self._client = client or httpx.Client(
+            base_url=base_url, timeout=resolve_http_timeout(timeout)
+        )
 
     def close(self) -> None:
         if self._owns_client:
@@ -65,7 +67,11 @@ class PyNeurodeskClient:
         *,
         timeout: Optional[Union[float, httpx.Timeout]] = None,
     ) -> Iterable[DownloadProgress]:
-        stream_timeout = timeout if timeout is not None else httpx.Timeout(connect=10.0, read=None, write=300.0, pool=10.0)
+        stream_timeout = (
+            timeout
+            if timeout is not None
+            else httpx.Timeout(connect=10.0, read=None, write=300.0, pool=10.0)
+        )
         with self._client.stream(
             "POST",
             f"/image/{name}",
@@ -80,7 +86,9 @@ class PyNeurodeskClient:
                     continue
                 event = json.loads(line)
                 if not isinstance(event, dict):
-                    raise TypeError(f"expected image import progress object, got {type(event)!r}")
+                    raise TypeError(
+                        f"expected image import progress object, got {type(event)!r}"
+                    )
                 yield DownloadProgress.from_payload(event)
 
     def import_cvmfs_container(
@@ -160,7 +168,9 @@ class PyNeurodeskClient:
                     continue
                 event = json.loads(line)
                 if not isinstance(event, dict):
-                    raise TypeError(f"expected download progress object, got {type(event)!r}")
+                    raise TypeError(
+                        f"expected download progress object, got {type(event)!r}"
+                    )
                 yield DownloadProgress.from_payload(event)
 
     def get_image(self, name: str) -> Optional[ImageState]:
@@ -194,7 +204,9 @@ class PyNeurodeskClient:
                     continue
                 event = json.loads(line)
                 if not isinstance(event, dict):
-                    raise TypeError(f"expected download progress object, got {type(event)!r}")
+                    raise TypeError(
+                        f"expected download progress object, got {type(event)!r}"
+                    )
                 yield DownloadProgress.from_payload(event)
 
     def ensure_image(self, reference: ContainerReference) -> ImageState:
@@ -227,7 +239,9 @@ class PyNeurodeskClient:
         payload: dict[str, Any] = {"image": image}
         if vm_id:
             payload["id"] = vm_id
-        network_payload = network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)
+        network_payload = network_payload_from_options(
+            network, with_network=with_network, port_forwards=port_forwards
+        )
         if network_payload:
             payload["network"] = network_payload
         if dmesg:
@@ -239,7 +253,9 @@ class PyNeurodeskClient:
         timeout_seconds = resolve_boot_timeout_seconds(timeout)
         if timeout_seconds is not None:
             payload["timeout_seconds"] = timeout_seconds
-        response = self._client.post("/vm", json=payload, timeout=resolve_boot_timeout(timeout))
+        response = self._client.post(
+            "/vm", json=payload, timeout=resolve_boot_timeout(timeout)
+        )
         payload = self._decode_json(response)
         return VMState.from_payload(payload)
 
@@ -258,7 +274,9 @@ class PyNeurodeskClient:
         payload: dict[str, Any] = {}
         if vm_id:
             payload["id"] = vm_id
-        network_payload = network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)
+        network_payload = network_payload_from_options(
+            network, with_network=with_network, port_forwards=port_forwards
+        )
         if network_payload:
             payload["network"] = network_payload
         if dmesg:
@@ -270,7 +288,9 @@ class PyNeurodeskClient:
         timeout_seconds = resolve_boot_timeout_seconds(timeout)
         if timeout_seconds is not None:
             payload["timeout_seconds"] = timeout_seconds
-        response = self._client.post("/vm/start", json=payload, timeout=resolve_boot_timeout(timeout))
+        response = self._client.post(
+            "/vm/start", json=payload, timeout=resolve_boot_timeout(timeout)
+        )
         payload = self._decode_json(response)
         return VMState.from_payload(payload)
 
@@ -289,7 +309,9 @@ class PyNeurodeskClient:
         payload: dict[str, Any] = {}
         if vm_id:
             payload["id"] = vm_id
-        network_payload = network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)
+        network_payload = network_payload_from_options(
+            network, with_network=with_network, port_forwards=port_forwards
+        )
         if network_payload:
             payload["network"] = network_payload
         if dmesg:
@@ -327,16 +349,24 @@ class PyNeurodeskClient:
         port_forwards: Iterable[PortForward] = (),
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         dmesg: bool = False,
+        memory_mb: Optional[int] = None,
+        cpus: Optional[int] = None,
         vm_id: Optional[str] = None,
     ) -> Iterable[dict[str, Any]]:
         payload: dict[str, Any] = {"image": image}
         if vm_id:
             payload["id"] = vm_id
-        network_payload = network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)
+        network_payload = network_payload_from_options(
+            network, with_network=with_network, port_forwards=port_forwards
+        )
         if network_payload:
             payload["network"] = network_payload
         if dmesg:
             payload["dmesg"] = True
+        if memory_mb is not None:
+            payload["memory_mb"] = memory_mb
+        if cpus is not None:
+            payload["cpus"] = cpus
         timeout_seconds = resolve_boot_timeout_seconds(timeout)
         if timeout_seconds is not None:
             payload["timeout_seconds"] = timeout_seconds
@@ -363,16 +393,26 @@ class PyNeurodeskClient:
         return VMState.from_payload(payload)
 
     def create_watchdog(self, *, timeout_seconds: float = 30.0) -> dict[str, Any]:
-        response = self._client.post("/watchdog", json={"timeout_seconds": timeout_seconds})
+        response = self._client.post(
+            "/watchdog", json={"timeout_seconds": timeout_seconds}
+        )
         return self._decode_json(response)
 
     def feed_watchdog(self) -> dict[str, Any]:
         response = self._client.post("/watchdog/feed")
         return self._decode_json(response)
 
-    def add_port_forward(self, forward: PortForward, *, vm_id: Optional[str] = None) -> PortForward:
+    def watchdog_activity(self) -> dict[str, Any]:
+        response = self._client.get("/watchdog/activity")
+        return self._decode_json(response)
+
+    def add_port_forward(
+        self, forward: PortForward, *, vm_id: Optional[str] = None
+    ) -> PortForward:
         params = {"id": vm_id} if vm_id else None
-        response = self._client.post("/vm/forward", params=params, json=forward.to_payload())
+        response = self._client.post(
+            "/vm/forward", params=params, json=forward.to_payload()
+        )
         payload = self._decode_json(response)
         return port_forward_from_payload(payload)
 
@@ -390,17 +430,51 @@ class PyNeurodeskClient:
         vm_id: Optional[str] = None,
     ) -> VMState:
         state = self.instance_status(vm_id=vm_id)
-        network_payload = network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)
+        network_payload = network_payload_from_options(
+            network, with_network=with_network, port_forwards=port_forwards
+        )
         if state.status == "running" and state.image == image:
             return state
         if state.status == "running" and state.image not in (image,):
             self.shutdown_instance(vm_id=vm_id)
-            return self.create_instance(image, network=network_from_payload(network_payload), timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus, vm_id=vm_id)
+            return self.create_instance(
+                image,
+                network=network_from_payload(network_payload),
+                timeout=timeout,
+                dmesg=dmesg,
+                memory_mb=memory_mb,
+                cpus=cpus,
+                vm_id=vm_id,
+            )
         if state.status == "stopped":
-            return self.create_instance(image, network=network_from_payload(network_payload), timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus, vm_id=vm_id)
+            return self.create_instance(
+                image,
+                network=network_from_payload(network_payload),
+                timeout=timeout,
+                dmesg=dmesg,
+                memory_mb=memory_mb,
+                cpus=cpus,
+                vm_id=vm_id,
+            )
         if state.status == "running":
-            return self.create_instance(image, network=network_from_payload(network_payload), timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus, vm_id=vm_id)
-        return self.create_instance(image, network=network_from_payload(network_payload), timeout=timeout, dmesg=dmesg, memory_mb=memory_mb, cpus=cpus, vm_id=vm_id)
+            return self.create_instance(
+                image,
+                network=network_from_payload(network_payload),
+                timeout=timeout,
+                dmesg=dmesg,
+                memory_mb=memory_mb,
+                cpus=cpus,
+                vm_id=vm_id,
+            )
+        return self.create_instance(
+            image,
+            network=network_from_payload(network_payload),
+            timeout=timeout,
+            dmesg=dmesg,
+            memory_mb=memory_mb,
+            cpus=cpus,
+            vm_id=vm_id,
+        )
 
     def cvmfs_list(self, source: CVMFSSource) -> CVMFSListResponse:
         response = self._client.post("/cvmfs/list", json=source.to_payload())
@@ -418,7 +492,9 @@ class PyNeurodeskClient:
         *,
         timeout: Optional[Union[float, httpx.Timeout]] = None,
     ) -> CommandResult:
-        response = self._client.post("/vm/run", json=request.to_payload(), timeout=timeout)
+        response = self._client.post(
+            "/vm/run", json=request.to_payload(), timeout=timeout
+        )
         payload = self._decode_json(response)
         return CommandResult.from_payload(payload)
 
@@ -445,7 +521,11 @@ class PyNeurodeskClient:
                 command=tuple(command),
                 vm_id=vm_id,
                 shares=tuple(shares),
-                network=network_from_payload(network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)),
+                network=network_from_payload(
+                    network_payload_from_options(
+                        network, with_network=with_network, port_forwards=port_forwards
+                    )
+                ),
                 env=tuple(env),
                 workdir=workdir,
                 user=user,
@@ -477,7 +557,11 @@ class PyNeurodeskClient:
             command=tuple(command),
             vm_id=vm_id,
             shares=tuple(shares),
-            network=network_from_payload(network_payload_from_options(network, with_network=with_network, port_forwards=port_forwards)),
+            network=network_from_payload(
+                network_payload_from_options(
+                    network, with_network=with_network, port_forwards=port_forwards
+                )
+            ),
             env=tuple(env),
             workdir=workdir,
             user=user,
@@ -500,7 +584,9 @@ class PyNeurodeskClient:
                     event = json.loads(line)
                 except json.JSONDecodeError as exc:
                     preview = textwrap.shorten(str(line), width=200, placeholder="...")
-                    raise RuntimeError(f"invalid streamed exec event JSON: {preview}") from exc
+                    raise RuntimeError(
+                        f"invalid streamed exec event JSON: {preview}"
+                    ) from exc
                 if not isinstance(event, dict):
                     raise TypeError(f"expected exec event object, got {type(event)!r}")
                 yield event
@@ -519,7 +605,9 @@ class PyNeurodeskClient:
                 if isinstance(payload, dict) and isinstance(payload.get("error"), str):
                     detail = payload["error"]
                 message = f"{exc} Response body: {detail}"
-                raise httpx.HTTPStatusError(message, request=exc.request, response=exc.response) from exc
+                raise httpx.HTTPStatusError(
+                    message, request=exc.request, response=exc.response
+                ) from exc
             raise
         payload = response.json()
         if not isinstance(payload, dict):
@@ -527,7 +615,9 @@ class PyNeurodeskClient:
         return payload
 
 
-def resolve_http_timeout(timeout: Optional[Union[float, httpx.Timeout]]) -> httpx.Timeout:
+def resolve_http_timeout(
+    timeout: Optional[Union[float, httpx.Timeout]],
+) -> httpx.Timeout:
     if isinstance(timeout, httpx.Timeout):
         return timeout
     if timeout is not None:
@@ -540,7 +630,9 @@ def resolve_http_timeout(timeout: Optional[Union[float, httpx.Timeout]]) -> http
     return httpx.Timeout(connect=10.0, read=300.0, write=300.0, pool=10.0)
 
 
-def resolve_boot_timeout(timeout: Optional[Union[float, httpx.Timeout]] = None) -> httpx.Timeout:
+def resolve_boot_timeout(
+    timeout: Optional[Union[float, httpx.Timeout]] = None,
+) -> httpx.Timeout:
     if isinstance(timeout, httpx.Timeout):
         return timeout
     if timeout is not None:
@@ -550,10 +642,17 @@ def resolve_boot_timeout(timeout: Optional[Union[float, httpx.Timeout]] = None) 
     if raw:
         return httpx.Timeout(float(raw))
 
-    return httpx.Timeout(connect=10.0, read=DEFAULT_BOOT_TIMEOUT_SECONDS, write=DEFAULT_BOOT_TIMEOUT_SECONDS, pool=10.0)
+    return httpx.Timeout(
+        connect=10.0,
+        read=DEFAULT_BOOT_TIMEOUT_SECONDS,
+        write=DEFAULT_BOOT_TIMEOUT_SECONDS,
+        pool=10.0,
+    )
 
 
-def resolve_boot_timeout_seconds(timeout: Optional[Union[float, httpx.Timeout]] = None) -> Optional[float]:
+def resolve_boot_timeout_seconds(
+    timeout: Optional[Union[float, httpx.Timeout]] = None,
+) -> Optional[float]:
     if isinstance(timeout, httpx.Timeout):
         return None
     if timeout is not None:
@@ -583,7 +682,9 @@ def network_payload_from_options(
     if network is None:
         if not with_network and not forwards:
             return {}
-        network = NetworkConfig(enabled=bool(with_network or forwards), port_forwards=forwards)
+        network = NetworkConfig(
+            enabled=bool(with_network or forwards), port_forwards=forwards
+        )
     elif forwards:
         network = NetworkConfig(
             enabled=bool(network.enabled or with_network or forwards),
@@ -613,7 +714,9 @@ def network_from_payload(payload: dict[str, Any]) -> Optional[NetworkConfig]:
     return NetworkConfig(
         enabled=bool(payload.get("enabled", False)),
         allow_internet=bool(payload.get("allow_internet", False)),
-        host_dns_name=str(payload["host_dns_name"]) if payload.get("host_dns_name") is not None else None,
+        host_dns_name=str(payload["host_dns_name"])
+        if payload.get("host_dns_name") is not None
+        else None,
         port_forwards=tuple(forwards),
     )
 
@@ -623,6 +726,10 @@ def port_forward_from_payload(payload: dict[str, Any]) -> PortForward:
         host_port=int(payload.get("host_port", 0) or 0),
         guest_port=int(payload.get("guest_port", 0) or 0),
         protocol=str(payload.get("protocol", "tcp") or "tcp"),
-        host_addr=str(payload["host_addr"]) if payload.get("host_addr") is not None else None,
-        guest_addr=str(payload["guest_addr"]) if payload.get("guest_addr") is not None else None,
+        host_addr=str(payload["host_addr"])
+        if payload.get("host_addr") is not None
+        else None,
+        guest_addr=str(payload["guest_addr"])
+        if payload.get("guest_addr") is not None
+        else None,
     )

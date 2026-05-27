@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	intsqlite "j5.nz/cc/internal/sqlite"
@@ -132,6 +133,33 @@ func TestRemoteReadDirAndFile(t *testing.T) {
 	}
 	if string(chunked) != "hello chunked world" {
 		t.Fatalf("ReadFile(chunked) = %q", string(chunked))
+	}
+}
+
+func TestRemoteReadFileFallsBackAcrossMirrors(t *testing.T) {
+	t.Parallel()
+
+	good := newTestRepoServer(t)
+	var badHits atomic.Int32
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		badHits.Add(1)
+		http.Error(w, "mirror unavailable", http.StatusBadGateway)
+	}))
+	t.Cleanup(bad.Close)
+	client := &Client{
+		HTTPClient: good.Client(),
+		Mirrors:    []string{good.URL + "/cvmfs"},
+	}
+
+	data, err := client.ReadFile(bad.URL + "/cvmfs/test.repo/containers/niimath/niimath")
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(data) != "niimath-data" {
+		t.Fatalf("ReadFile() = %q, want niimath-data", string(data))
+	}
+	if badHits.Load() == 0 {
+		t.Fatal("ReadFile did not try the primary mirror before falling back")
 	}
 }
 
@@ -478,6 +506,13 @@ func TestPrefetchFilePopulatesFileCacheWithoutDataObjectCache(t *testing.T) {
 	fileCachePath := cvmfsFileCachePath(cacheDir, parsed.Repo, parsed.Path)
 	if _, err := os.Stat(fileCachePath); err != nil {
 		t.Fatalf("Stat(file cache %q) error = %v", fileCachePath, err)
+	}
+	cachedSize, cached, err := client.CachedFileSize(target)
+	if err != nil {
+		t.Fatalf("CachedFileSize() error = %v", err)
+	}
+	if !cached || cachedSize != uint64(len("niimath-data")) {
+		t.Fatalf("CachedFileSize() = %d, %v; want %d, true", cachedSize, cached, len("niimath-data"))
 	}
 
 	fileHash := strings.Repeat("3", 40)

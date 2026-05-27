@@ -66,7 +66,7 @@ func TestMountedFSCreateUsesReturnedBackendNodeID(t *testing.T) {
 	if errno != 0 {
 		t.Fatalf("Lookup(work) errno = %d", errno)
 	}
-	nodeID, fh, _, errno := backend.(fsCreateBackend).Create(workID, "created.txt", linuxOWRONLY|linuxOCREAT, 0o644)
+	nodeID, fh, _, errno := backend.(fsCreateBackend).Create(workID, "created.txt", linuxOWRONLY|linuxOCREAT, 0o644, 0, 0)
 	if errno != 0 {
 		t.Fatalf("Create() errno = %d", errno)
 	}
@@ -94,7 +94,7 @@ func TestMountedFSAllowsEphemeralRootImageWrites(t *testing.T) {
 	if errno != 0 {
 		t.Fatalf("backendLookupPath(/opt/tool) errno = %d", errno)
 	}
-	nodeID, fh, _, errno := backend.(fsCreateBackend).Create(optID, ".license", linuxOWRONLY|linuxOCREAT, 0o644)
+	nodeID, fh, _, errno := backend.(fsCreateBackend).Create(optID, ".license", linuxOWRONLY|linuxOCREAT, 0o644, 0, 0)
 	if errno != 0 {
 		t.Fatalf("Create(.license) errno = %d", errno)
 	}
@@ -166,7 +166,7 @@ func (f *createOnlyFS) StatFS(nodeID uint64) (blocks, bfree, bavail, files, ffre
 	return 0, 0, 0, 0, 0, 4096, 4096, 255, 0
 }
 
-func (f *createOnlyFS) Create(parent uint64, name string, flags uint32, mode uint32) (uint64, uint64, FuseAttr, int32) {
+func (f *createOnlyFS) Create(parent uint64, name string, flags uint32, mode uint32, uid uint32, gid uint32) (uint64, uint64, FuseAttr, int32) {
 	return f.backendNodeID, f.backendFH, FuseAttr{Ino: f.backendNodeID, Mode: linuxSIFREG | mode, NLink: 1}, 0
 }
 

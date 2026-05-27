@@ -1,6 +1,7 @@
 from .api import (
     DEFAULT_CONTAINERS_PATH,
     DEFAULT_CVMFS_MIRROR,
+    DEFAULT_CVMFS_MIRRORS,
     DEFAULT_CVMFS_REPO,
     NeurodeskContainer,
     SharedDirectory,
@@ -48,6 +49,7 @@ __all__ = [
     "ContainerReference",
     "DEFAULT_CONTAINERS_PATH",
     "DEFAULT_CVMFS_MIRROR",
+    "DEFAULT_CVMFS_MIRRORS",
     "DEFAULT_CVMFS_REPO",
     "DaemonState",
     "DeployMetadata",

@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"j5.nz/cc/client"
 	intcvmfs "j5.nz/cc/internal/cvmfs"
 	"j5.nz/cc/internal/fsmeta"
 	"j5.nz/cc/internal/imagefs"
@@ -618,12 +619,12 @@ func TestResolvePrefetchWorkers(t *testing.T) {
 	if cpus < 1 {
 		cpus = 1
 	}
-	defaultWorkers := cpus / 2
+	defaultWorkers := cpus
 	if defaultWorkers < 1 {
 		defaultWorkers = 1
 	}
-	if defaultWorkers > 4 {
-		defaultWorkers = 4
+	if defaultWorkers > 8 {
+		defaultWorkers = 8
 	}
 
 	if got := resolvePrefetchWorkers(0); got != defaultWorkers {
@@ -993,6 +994,102 @@ func TestStorePullImportsDirectoryBackedCVMFSContainer(t *testing.T) {
 	}
 	if string(data) != "3.20.0\n" {
 		t.Fatalf("/etc/alpine-release = %q, want %q", string(data), "3.20.0\n")
+	}
+}
+
+func TestStorePullPrefetchesDirectoryBackedCVMFSIntoFileCache(t *testing.T) {
+	server := newOCICVMFSDirectoryRepoServer(t)
+	store, sharedCache := newStoreWithTempSharedCache(t)
+	store.httpClient = server.Client()
+	var events []client.ProgressEvent
+
+	source := server.URL + "/cvmfs/test.repo/containers/niimath_1.0.20250804_20251016"
+	_, err := store.Pull(context.Background(), "niimath", source, PullOptions{
+		Prefetch:        true,
+		PrefetchWorkers: 2,
+		Report: func(event client.ProgressEvent) {
+			events = append(events, event)
+		},
+	})
+	if err != nil {
+		t.Fatalf("Pull() error = %v", err)
+	}
+
+	meta, err := store.readMetadata("niimath")
+	if err != nil {
+		t.Fatalf("readMetadata() error = %v", err)
+	}
+	if meta.PackedContentsPath != "" {
+		t.Fatalf("PackedContentsPath = %q, want empty", meta.PackedContentsPath)
+	}
+	if _, err := os.Stat(filepath.Join(meta.RootFSDir, "rootfs.contents")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("rootfs.contents exists after cache prefetch: %v", err)
+	}
+	indexBuf, err := os.ReadFile(meta.IndexPath)
+	if err != nil {
+		t.Fatalf("ReadFile(index) error = %v", err)
+	}
+	nodes, err := decodeFSIndex(indexBuf)
+	if err != nil {
+		t.Fatalf("decodeFSIndex() error = %v", err)
+	}
+	for _, node := range nodes {
+		if node.Packed || node.PackedOffset != 0 {
+			t.Fatalf("node %q was packed after cache prefetch: %#v", node.Path, node)
+		}
+	}
+
+	var cachedFiles int
+	cacheRoot := filepath.Join(cvmfsCacheDir(sharedCache), "files", "test.repo")
+	if err := filepath.WalkDir(cacheRoot, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() {
+			cachedFiles++
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("WalkDir(%q) error = %v", cacheRoot, err)
+	}
+	if cachedFiles == 0 {
+		t.Fatal("prefetch did not populate CVMFS file cache")
+	}
+
+	var sawCacheProgress bool
+	for _, event := range events {
+		if event.Blob == "cvmfs cache" && event.FilesTotal > 0 && event.BytesTotal > 0 {
+			sawCacheProgress = true
+			break
+		}
+	}
+	if !sawCacheProgress {
+		t.Fatalf("prefetch progress did not describe CVMFS cache fill: %#v", events)
+	}
+
+	events = nil
+	_, err = store.Pull(context.Background(), "niimath", source, PullOptions{
+		Prefetch:        true,
+		PrefetchWorkers: 2,
+		Report: func(event client.ProgressEvent) {
+			events = append(events, event)
+		},
+	})
+	if err != nil {
+		t.Fatalf("second Pull() error = %v", err)
+	}
+	if len(events) == 0 {
+		t.Fatal("second prefetch did not report completion")
+	}
+	var sawNoMissing bool
+	for _, event := range events {
+		if event.Blob == "cvmfs cache" && event.FilesTotal == 0 && event.BytesTotal == 0 {
+			sawNoMissing = true
+			break
+		}
+	}
+	if !sawNoMissing {
+		t.Fatalf("second prefetch progress = %#v, want no missing files", events)
 	}
 }
 

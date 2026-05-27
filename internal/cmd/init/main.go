@@ -24,6 +24,7 @@ import (
 
 const configPath = "/etc/ccx3-init.json"
 const guestQEMUPath = "/run/ccx3/qemu-x86_64"
+const guestQEMUBinfmtPath = "/run/ccx3-qemu-x86_64"
 const initDurationMarker = "__CCX3_INIT_MS__:"
 const execTimingMarker = "__CCX3_TIMING__:"
 const fatalBootMarker = "ccx3-init-fatal: "
@@ -31,6 +32,7 @@ const fatalBootMarker = "ccx3-init-fatal: "
 var consoleFD = 2
 var kmsgFD = -1
 var protocolMu sync.Mutex
+var setTimeOfDay = unix.Settimeofday
 
 type config struct {
 	Command          []string `json:"command"`
@@ -51,6 +53,7 @@ type config struct {
 	ExitMarkerPrefix string   `json:"exit_marker_prefix"`
 	PrecopyAMD64Root bool     `json:"precopy_amd64_root,omitempty"`
 	Network          *network `json:"network,omitempty"`
+	UnixTime         int64    `json:"unix_time,omitempty"`
 }
 
 type network struct {
@@ -172,7 +175,6 @@ func main() {
 }
 
 func run() error {
-	bootStart := time.Now()
 	fd, err := syscall.Open("/dev/console", syscall.O_RDWR, 0)
 	if err == nil {
 		consoleFD = fd
@@ -198,6 +200,10 @@ func run() error {
 	if cfg.Hostname == "" || cfg.Hostname == "(none)" {
 		cfg.Hostname = "ccx3"
 	}
+	if err := configureClock(cfg.UnixTime); err != nil {
+		return err
+	}
+	bootStart := time.Now()
 
 	_ = syscall.Mount("proc", "/proc", "proc", 0, "")
 	_ = syscall.Mount("sysfs", "/sys", "sysfs", 0, "")
@@ -280,6 +286,17 @@ func writeStage(start time.Time, stage string) {
 	line := fmt.Sprintf("ccx3-init: +%dms %s", time.Since(start).Milliseconds(), stage)
 	writeKernel(line)
 	writeConsole(line + "\n")
+}
+
+func configureClock(unixTime int64) error {
+	if unixTime <= 0 {
+		return nil
+	}
+	tv := unix.NsecToTimeval(unixTime * int64(time.Second))
+	if err := setTimeOfDay(&tv); err != nil {
+		return fmt.Errorf("set guest clock: %w", err)
+	}
+	return nil
 }
 
 func mountRootFS(tag, emulatorTag string) error {
@@ -469,6 +486,12 @@ func configureBinfmt() error {
 		}
 		return err
 	}
+	if err := copyPath(guestQEMUPath, guestQEMUBinfmtPath); err != nil {
+		return fmt.Errorf("copy qemu-x86_64 for binfmt: %w", err)
+	}
+	if err := os.Chmod(guestQEMUBinfmtPath, 0o755); err != nil {
+		return fmt.Errorf("chmod %s: %w", guestQEMUBinfmtPath, err)
+	}
 	if err := os.MkdirAll("/proc/sys/fs/binfmt_misc", 0o755); err != nil {
 		return fmt.Errorf("mkdir binfmt_misc: %w", err)
 	}
@@ -480,7 +503,7 @@ func configureBinfmt() error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("stat qemu-x86_64 registration: %w", err)
 	}
-	const qemuX8664Registration = ":qemu-x86_64:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00:\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:" + guestQEMUPath + ":OCF"
+	const qemuX8664Registration = ":qemu-x86_64:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00:\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:" + guestQEMUBinfmtPath + ":"
 	if err := os.WriteFile("/proc/sys/fs/binfmt_misc/register", []byte(qemuX8664Registration), 0o644); err != nil {
 		return fmt.Errorf("register qemu-x86_64: %w", err)
 	}
@@ -586,6 +609,9 @@ func collectExecDiagnostics(rootDir string, argv []string, workDir string) strin
 			appendStat(&buf, "workdir@root", rootDir+workDir)
 		}
 	}
+	appendStat(&buf, "/run", "/run")
+	appendStat(&buf, "/run/ccx3", "/run/ccx3")
+	appendStat(&buf, guestQEMUBinfmtPath, guestQEMUBinfmtPath)
 	if info, err := os.Stat(guestQEMUPath); err != nil {
 		buf.WriteString(guestQEMUPath)
 		buf.WriteString(": ")

@@ -28,6 +28,7 @@ type GuestInitConfig struct {
 	ExitMarkerPrefix string              `json:"exit_marker_prefix"`
 	PrecopyAMD64Root bool                `json:"precopy_amd64_root,omitempty"`
 	Network          *GuestNetworkConfig `json:"network,omitempty"`
+	UnixTime         int64               `json:"unix_time,omitempty"`
 }
 
 type GuestNetworkConfig struct {

@@ -21,7 +21,7 @@ func TestPassthroughFSCreateWriteRenameUnlink(t *testing.T) {
 		t.Fatalf("backend type = %T", fs)
 	}
 
-	nodeID, fh, _, errno := be.Create(1, "hello.txt", linuxOWRONLY|linuxOCREAT|linuxOTRUNC, 0o644)
+	nodeID, fh, _, errno := be.Create(1, "hello.txt", linuxOWRONLY|linuxOCREAT|linuxOTRUNC, 0o644, 0, 0)
 	if errno != 0 {
 		t.Fatalf("Create() errno = %d", errno)
 	}
@@ -68,7 +68,7 @@ func TestPassthroughFSAppendWritesAppendInsteadOfWriteAt(t *testing.T) {
 		t.Fatalf("backend type = %T", fs)
 	}
 
-	nodeID, fh, _, errno := be.Create(1, "append.txt", linuxOWRONLY|linuxOCREAT|linuxOTRUNC, 0o644)
+	nodeID, fh, _, errno := be.Create(1, "append.txt", linuxOWRONLY|linuxOCREAT|linuxOTRUNC, 0o644, 0, 0)
 	if errno != 0 {
 		t.Fatalf("Create() errno = %d", errno)
 	}
@@ -103,7 +103,7 @@ func TestImageFSSequentialWritesGrowAmortized(t *testing.T) {
 	if !ok {
 		t.Fatalf("backend type = %T", backend)
 	}
-	nodeID, fh, _, errno := be.Create(1, "large.bin", linuxOWRONLY|linuxOCREAT|linuxOTRUNC, 0o644)
+	nodeID, fh, _, errno := be.Create(1, "large.bin", linuxOWRONLY|linuxOCREAT|linuxOTRUNC, 0o644, 0, 0)
 	if errno != 0 {
 		t.Fatalf("Create() errno = %d", errno)
 	}
@@ -137,7 +137,7 @@ func TestImageFSSetAttrPreservesDirectoryType(t *testing.T) {
 
 	backend := NewImageFS(imagefs.NewHostFS(t.TempDir(), nil), "")
 	be := backend.(*imageFS)
-	nodeID, _, errno := be.Mkdir(1, "runtime", 0o755)
+	nodeID, _, errno := be.Mkdir(1, "runtime", 0o755, 0, 0)
 	if errno != 0 {
 		t.Fatalf("Mkdir() errno = %d", errno)
 	}
@@ -159,12 +159,83 @@ func TestImageFSSetAttrPreservesDirectoryType(t *testing.T) {
 	}
 }
 
+func TestFUSESetAttrParsesUIDAndGID(t *testing.T) {
+	t.Parallel()
+
+	backend := NewImageFS(imagefs.NewHostFS(t.TempDir(), nil), "")
+	be := backend.(*imageFS)
+	nodeID, _, errno := be.Mkdir(1, "home", 0o755, 0, 0)
+	if errno != 0 {
+		t.Fatalf("Mkdir() errno = %d", errno)
+	}
+	fsdev := NewFS(0, 0, 0, "root", backend)
+
+	req := make([]byte, fuseInHeaderSize+88)
+	binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
+	binary.LittleEndian.PutUint32(req[4:8], fuseSetAttr)
+	binary.LittleEndian.PutUint64(req[8:16], 99)
+	binary.LittleEndian.PutUint64(req[16:24], nodeID)
+	binary.LittleEndian.PutUint32(req[40:44], fattrUID|fattrGID)
+	binary.LittleEndian.PutUint32(req[116:120], 1000)
+	binary.LittleEndian.PutUint32(req[120:124], 100)
+
+	reply, err := fsdev.dispatchFUSELocked(req)
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(SETATTR) error = %v", err)
+	}
+	if got := int32(binary.LittleEndian.Uint32(reply[4:8])); got != 0 {
+		t.Fatalf("SETATTR errno = %d, want 0", got)
+	}
+	attr, errno := be.GetAttr(nodeID)
+	if errno != 0 {
+		t.Fatalf("GetAttr() errno = %d", errno)
+	}
+	if attr.UID != 1000 || attr.GID != 100 {
+		t.Fatalf("owner = %d:%d, want 1000:100", attr.UID, attr.GID)
+	}
+}
+
+func TestFUSECreateUsesCallerUIDAndGID(t *testing.T) {
+	t.Parallel()
+
+	backend := NewImageFS(imagefs.NewHostFS(t.TempDir(), nil), "")
+	fsdev := NewFS(0, 0, 0, "root", backend)
+
+	name := "created-by-user.txt"
+	req := make([]byte, fuseInHeaderSize+16+len(name)+1)
+	binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
+	binary.LittleEndian.PutUint32(req[4:8], fuseCreate)
+	binary.LittleEndian.PutUint64(req[8:16], 100)
+	binary.LittleEndian.PutUint64(req[16:24], 1)
+	binary.LittleEndian.PutUint32(req[24:28], 1000)
+	binary.LittleEndian.PutUint32(req[28:32], 100)
+	binary.LittleEndian.PutUint32(req[40:44], linuxOWRONLY|linuxOCREAT)
+	binary.LittleEndian.PutUint32(req[44:48], 0o644)
+	copy(req[fuseInHeaderSize+16:], name)
+
+	reply, err := fsdev.dispatchFUSELocked(req)
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(CREATE) error = %v", err)
+	}
+	if got := int32(binary.LittleEndian.Uint32(reply[4:8])); got != 0 {
+		t.Fatalf("CREATE errno = %d, want 0", got)
+	}
+	childID := binary.LittleEndian.Uint64(reply[fuseOutHeaderSize : fuseOutHeaderSize+8])
+	attr, errno := backend.GetAttr(childID)
+	if errno != 0 {
+		t.Fatalf("GetAttr(created) errno = %d", errno)
+	}
+	if attr.UID != 1000 || attr.GID != 100 {
+		t.Fatalf("created owner = %d:%d, want 1000:100", attr.UID, attr.GID)
+	}
+}
+
 func TestImageFSMknodCreatesSocketNode(t *testing.T) {
 	t.Parallel()
 
 	backend := NewImageFS(imagefs.NewHostFS(t.TempDir(), nil), "")
 	be := backend.(*imageFS)
-	nodeID, attr, errno := be.Mknod(1, "kubelet.sock", linuxSIFSOCK|0o600, 0)
+	nodeID, attr, errno := be.Mknod(1, "kubelet.sock", linuxSIFSOCK|0o600, 0, 0, 0)
 	if errno != 0 {
 		t.Fatalf("Mknod() errno = %d", errno)
 	}
@@ -247,7 +318,7 @@ func TestStrictFUSEFsyncUsesBackendHandle(t *testing.T) {
 	root := t.TempDir()
 	backend := NewPassthroughFS(root, nil)
 	be := backend.(*passthroughFS)
-	nodeID, fh, _, errno := be.Create(1, "data.txt", linuxOWRONLY|linuxOCREAT|linuxOTRUNC, 0o644)
+	nodeID, fh, _, errno := be.Create(1, "data.txt", linuxOWRONLY|linuxOCREAT|linuxOTRUNC, 0o644, 0, 0)
 	if errno != 0 {
 		t.Fatalf("Create() errno = %d", errno)
 	}
@@ -318,7 +389,7 @@ func TestStrictFUSESetLKAndGetLK(t *testing.T) {
 	root := t.TempDir()
 	backend := NewPassthroughFS(root, nil)
 	be := backend.(*passthroughFS)
-	nodeID, fh, _, errno := be.Create(1, "locked.sqlite", linuxORDWR|linuxOCREAT, 0o644)
+	nodeID, fh, _, errno := be.Create(1, "locked.sqlite", linuxORDWR|linuxOCREAT, 0o644, 0, 0)
 	if errno != 0 {
 		t.Fatalf("Create() errno = %d", errno)
 	}
@@ -936,7 +1007,7 @@ func TestImageFSRenameReplacesLowerFileInOverlay(t *testing.T) {
 	if errno != 0 {
 		t.Fatalf("Lookup(bin) errno = %d", errno)
 	}
-	tmpID, fh, _, errno := be.Create(binID, ".apk-new", linuxOWRONLY|linuxOCREAT, 0o755)
+	tmpID, fh, _, errno := be.Create(binID, ".apk-new", linuxOWRONLY|linuxOCREAT, 0o755, 0, 0)
 	if errno != 0 {
 		t.Fatalf("Create(.apk-new) errno = %d", errno)
 	}

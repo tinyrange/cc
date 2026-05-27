@@ -46,6 +46,10 @@ const (
 	ShareFSIRQ  = 44
 	FSStride    = 0x1000
 
+	NetBase = 0x0a105000
+	NetSize = 0x1000
+	NetIRQ  = 45
+
 	UARTSPI = 33
 
 	RootFSTag   = vmruntime.RootFSTag

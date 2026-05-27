@@ -221,6 +221,63 @@ func TestContainerSessionExecIncludesStdin(t *testing.T) {
 	}
 }
 
+func TestContainerSessionExecIncludesNumericUser(t *testing.T) {
+	rootfs := t.TempDir()
+	path := filepath.Join(rootfs, "bin", "id")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v", path, err)
+	}
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v", path, err)
+	}
+
+	transcript := newSerialTranscript()
+	var got guestExecRequest
+	control := &fakeVsockConn{
+		writeFn: func(data []byte) (int, error) {
+			if err := json.Unmarshal(data[:len(data)-1], &got); err != nil {
+				return 0, err
+			}
+			go func() {
+				_, _ = transcript.Write([]byte(commandBeginMarker + got.ID + "\n"))
+				_, _ = transcript.Write([]byte(commandExitMarkerPref + got.ID + ":0\n"))
+			}()
+			return len(data), nil
+		},
+	}
+
+	session := &ContainerSession{
+		image: &oci.Image{
+			RootFSDir: rootfs,
+			RootFS:    imagefs.NewHostFS(rootfs, nil),
+			Config: oci.RuntimeConfig{
+				Env: []string{"PATH=/bin"},
+			},
+		},
+		baseEnv:    []string{"PATH=/bin"},
+		workDir:    "/",
+		control:    control,
+		transcript: transcript,
+	}
+
+	_, err := session.Exec(context.Background(), client.ExecRequest{
+		Command: []string{"/bin/id"},
+		User:    "1000:100",
+	})
+	if err != nil {
+		t.Fatalf("Exec() error = %v", err)
+	}
+	if got.User != "1000:100" {
+		t.Fatalf("serialized user = %q, want 1000:100", got.User)
+	}
+}
+
+func TestValidateGuestUserRejectsNames(t *testing.T) {
+	if err := validateGuestUser("jovyan"); err == nil {
+		t.Fatal("validateGuestUser(jovyan) error = nil, want error")
+	}
+}
+
 func TestContainerSessionExecStreamForwardsTTYControl(t *testing.T) {
 	rootfs := t.TempDir()
 	path := filepath.Join(rootfs, "bin", "sh")

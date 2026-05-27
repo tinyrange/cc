@@ -93,6 +93,7 @@ func HostCapabilities() client.CapabilitiesResponse {
 	}
 	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
 		caps.MaxInstances = 1
+		caps.NetworkModes = []string{"user"}
 		caps.Notes = append(caps.Notes, "macOS HVF currently limits ccx3 to one running instance")
 	}
 	if runtime.GOOS == "linux" && runtime.GOARCH == "amd64" {

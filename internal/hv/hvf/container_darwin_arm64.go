@@ -129,6 +129,35 @@ func hasManagedExecFirstByte(text, id string) bool {
 		strings.Contains(text, commandExitMarkerPref+id+":")
 }
 
+func validateGuestUser(user string) error {
+	user = strings.TrimSpace(user)
+	if user == "" || user == "root" || user == "0" || user == "0:0" {
+		return nil
+	}
+	uidPart, gidPart, hasGID := strings.Cut(user, ":")
+	if uidPart == "" || !isUint32String(uidPart) {
+		return fmt.Errorf("user must be root or a numeric uid[:gid]")
+	}
+	if hasGID && (gidPart == "" || !isUint32String(gidPart)) {
+		return fmt.Errorf("user must be root or a numeric uid[:gid]")
+	}
+	return nil
+}
+
+func isUint32String(value string) bool {
+	n := uint64(0)
+	for _, ch := range value {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+		n = n*10 + uint64(ch-'0')
+		if n > uint64(^uint32(0)) {
+			return false
+		}
+	}
+	return value != ""
+}
+
 type guestExecRequest struct {
 	ID          string   `json:"id"`
 	Command     []string `json:"command"`
@@ -137,6 +166,7 @@ type guestExecRequest struct {
 	ReplaceEnv  bool     `json:"replace_env,omitempty"`
 	SkipResolve bool     `json:"skip_resolve,omitempty"`
 	WorkDir     string   `json:"workdir,omitempty"`
+	User        string   `json:"user,omitempty"`
 	Stdin       []byte   `json:"stdin,omitempty"`
 	TTY         bool     `json:"tty,omitempty"`
 	Kind        string   `json:"kind,omitempty"`
@@ -283,8 +313,8 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 	s.markExecActive()
 	defer s.markExecDone()
 	user := strings.TrimSpace(req.User)
-	if user != "" && user != "root" && user != "0" && user != "0:0" {
-		return client.ExecResponse{}, fmt.Errorf("only root user is supported")
+	if err := validateGuestUser(user); err != nil {
+		return client.ExecResponse{}, err
 	}
 
 	env := effectiveExecEnv(s.baseEnv, req.Env, req.ReplaceEnv)
@@ -321,6 +351,7 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 		ReplaceEnv:  req.ReplaceEnv,
 		SkipResolve: req.SkipResolve,
 		WorkDir:     workDir,
+		User:        user,
 		Stdin:       append([]byte(nil), req.Stdin...),
 		TTY:         req.TTY,
 		Cols:        req.Cols,
@@ -393,8 +424,8 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 	s.markExecActive()
 	defer s.markExecDone()
 	user := strings.TrimSpace(req.User)
-	if user != "" && user != "root" && user != "0" && user != "0:0" {
-		return fmt.Errorf("only root user is supported")
+	if err := validateGuestUser(user); err != nil {
+		return err
 	}
 
 	env := effectiveExecEnv(s.baseEnv, req.Env, req.ReplaceEnv)
@@ -430,6 +461,7 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 		ReplaceEnv:  req.ReplaceEnv,
 		SkipResolve: req.SkipResolve,
 		WorkDir:     workDir,
+		User:        user,
 		Stdin:       append([]byte(nil), req.Stdin...),
 		TTY:         req.TTY,
 		Cols:        req.Cols,
@@ -708,8 +740,8 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	if user == "" && req.Image != nil {
 		user = strings.TrimSpace(req.Image.Config.User)
 	}
-	if user != "" && user != "root" && user != "0" && user != "0:0" {
-		return nil, fmt.Errorf("only root user is supported")
+	if err := validateGuestUser(user); err != nil {
+		return nil, err
 	}
 
 	workDir := req.WorkDir
@@ -772,6 +804,11 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	console.Attach(vm, vm)
 	rng := virtio.NewRNG(arm64vm.RNGBase, arm64vm.RNGSize, arm64vm.RNGIRQ)
 	rng.Attach(vm, vm)
+	var netdev *virtio.Net
+	if req.NetDevice != nil {
+		netdev = req.NetDevice
+		netdev.Attach(vm, vm)
+	}
 	vsockBackend := virtio.NewSimpleVsockBackend()
 	listener, err := vsockBackend.Listen(vmruntime.ControlPort)
 	if err != nil {
@@ -797,7 +834,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	plan, err := arm64vm.PrepareBoot(mem, req.Kernel, initrd, arm64vm.BootConfig{
 		MemoryMB:   req.MemoryMB,
 		Dmesg:      req.Dmesg,
-		ExtraNodes: arm64vm.AppendFSNodes([]fdt.Node{console.DeviceTreeNode(), rng.DeviceTreeNode(), vsock.DeviceTreeNode()}, fsdevs),
+		ExtraNodes: arm64vm.AppendFSNodes(appendContainerDeviceNodes(console, rng, vsock, netdev), fsdevs),
 		RecordTime: func(name string, duration time.Duration) {
 			timing.Record(ctx, "hvf.prepare_boot."+name, duration)
 		},
@@ -964,7 +1001,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			}
 			switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 			case ExceptionClassDataAbortLowerEL:
-				if err := handleContainerDataAbort(ctx, vm, uart, console, rng, fsdevs, vsock, exitInfo); err != nil {
+				if err := handleContainerDataAbort(ctx, vm, uart, console, rng, fsdevs, vsock, netdev, exitInfo); err != nil {
 					doneCh <- sessionRunResult{err: err}
 					return
 				}
@@ -1089,6 +1126,17 @@ func persistentRunSlice(ready bool, active bool) time.Duration {
 	}
 }
 
+func appendContainerDeviceNodes(console *virtio.Console, rng *virtio.RNG, vsock *virtio.Vsock, netdev *virtio.Net) []fdt.Node {
+	nodes := []fdt.Node{console.DeviceTreeNode(), rng.DeviceTreeNode()}
+	if vsock != nil {
+		nodes = append(nodes, vsock.DeviceTreeNode())
+	}
+	if netdev != nil {
+		nodes = append(nodes, netdev.DeviceTreeNode())
+	}
+	return nodes
+}
+
 func RunContainer(ctx context.Context, req ContainerRunRequest) (ContainerRunResult, error) {
 	return runContainer(ctx, req, nil)
 }
@@ -1107,8 +1155,8 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	if user == "" && req.Image != nil {
 		user = strings.TrimSpace(req.Image.Config.User)
 	}
-	if user != "" && user != "root" && user != "0" && user != "0:0" {
-		return ContainerRunResult{}, fmt.Errorf("only root user is supported")
+	if err := validateGuestUser(user); err != nil {
+		return ContainerRunResult{}, err
 	}
 
 	var command []string
@@ -1183,6 +1231,11 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	console.Attach(vm, vm)
 	rng := virtio.NewRNG(arm64vm.RNGBase, arm64vm.RNGSize, arm64vm.RNGIRQ)
 	rng.Attach(vm, vm)
+	var netdev *virtio.Net
+	if req.NetDevice != nil {
+		netdev = req.NetDevice
+		netdev.Attach(vm, vm)
+	}
 	var vsock *virtio.Vsock
 	fsdevs, _, err := arm64vm.BuildFSDevices(req, &fsTrace)
 	if err != nil {
@@ -1196,7 +1249,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	plan, err := arm64vm.PrepareBoot(mem, req.Kernel, initrd, arm64vm.BootConfig{
 		MemoryMB:   req.MemoryMB,
 		Dmesg:      true,
-		ExtraNodes: arm64vm.AppendFSNodes([]fdt.Node{console.DeviceTreeNode(), rng.DeviceTreeNode()}, fsdevs),
+		ExtraNodes: arm64vm.AppendFSNodes(appendContainerDeviceNodes(console, rng, vsock, netdev), fsdevs),
 		RecordTime: func(name string, duration time.Duration) {
 			timing.Record(ctx, "hvf.prepare_boot."+name, duration)
 		},
@@ -1293,7 +1346,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 
 		switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 		case ExceptionClassDataAbortLowerEL:
-			if err := handleContainerDataAbort(ctx, vm, uart, console, rng, fsdevs, vsock, exitInfo); err != nil {
+			if err := handleContainerDataAbort(ctx, vm, uart, console, rng, fsdevs, vsock, netdev, exitInfo); err != nil {
 				return ContainerRunResult{}, err
 			}
 		case ExceptionClassSystemRegister:
@@ -1371,7 +1424,7 @@ type runResultVM struct {
 	err  error
 }
 
-func handleContainerDataAbort(ctx context.Context, vm *VM, uart *serial.UART8250, console *virtio.Console, rng *virtio.RNG, fsdevs []*virtio.FS, vsock *virtio.Vsock, exitInfo *VcpuExit) error {
+func handleContainerDataAbort(ctx context.Context, vm *VM, uart *serial.UART8250, console *virtio.Console, rng *virtio.RNG, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, exitInfo *VcpuExit) error {
 	totalStart := time.Now()
 	defer timing.Since(ctx, "hvf.data_abort.total", totalStart)
 	info, err := DecodeDataAbort(exitInfo.Exception.Syndrome)
@@ -1452,6 +1505,24 @@ func handleContainerDataAbort(ctx context.Context, vm *VM, uart *serial.UART8250
 			}
 		} else {
 			value, err := vsock.Read(addr, info.SizeBytes)
+			if err != nil {
+				return err
+			}
+			if err := writeAbortValue(vm, info, value); err != nil {
+				return err
+			}
+		}
+	case netdev != nil && netdev.Contains(addr, info.SizeBytes):
+		if info.Write {
+			value, err := readAbortValue(vm, info)
+			if err != nil {
+				return err
+			}
+			if err := netdev.Write(addr, info.SizeBytes, value); err != nil {
+				return err
+			}
+		} else {
+			value, err := netdev.Read(addr, info.SizeBytes)
 			if err != nil {
 				return err
 			}

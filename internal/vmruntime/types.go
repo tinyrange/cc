@@ -37,6 +37,9 @@ type RunRequest struct {
 	CPUs              int
 	Dmesg             bool
 	Persistent        bool
+	Network           *GuestNetworkConfig
+	NetDevice         *virtio.Net
+	UnixTime          int64
 }
 
 // RunResult is the backend-neutral result shape for one-shot guest execution.

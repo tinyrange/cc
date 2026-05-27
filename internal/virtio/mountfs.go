@@ -386,7 +386,7 @@ func (m *mountedFS) StatFS(nodeID uint64) (uint64, uint64, uint64, uint64, uint6
 	return backend.StatFS(backendNodeID)
 }
 
-func (m *mountedFS) Mkdir(parent uint64, name string, mode uint32) (uint64, FuseAttr, int32) {
+func (m *mountedFS) Mkdir(parent uint64, name string, mode uint32, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
 	parentNode := m.node(parent)
 	if parentNode == nil {
 		return 0, FuseAttr{}, -linuxENOENT
@@ -403,7 +403,7 @@ func (m *mountedFS) Mkdir(parent uint64, name string, mode uint32) (uint64, Fuse
 	if !ok {
 		return 0, FuseAttr{}, -linuxEROFS
 	}
-	nodeID, attr, errno := mkdirBackend.Mkdir(backendParent, name, mode)
+	nodeID, attr, errno := mkdirBackend.Mkdir(backendParent, name, mode, uid, gid)
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
 	}
@@ -412,7 +412,7 @@ func (m *mountedFS) Mkdir(parent uint64, name string, mode uint32) (uint64, Fuse
 	return id, attr, 0
 }
 
-func (m *mountedFS) Mknod(parent uint64, name string, mode uint32, rdev uint32) (uint64, FuseAttr, int32) {
+func (m *mountedFS) Mknod(parent uint64, name string, mode uint32, rdev uint32, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
 	parentNode := m.node(parent)
 	if parentNode == nil {
 		return 0, FuseAttr{}, -linuxENOENT
@@ -436,7 +436,7 @@ func (m *mountedFS) Mknod(parent uint64, name string, mode uint32, rdev uint32) 
 	if !ok {
 		return 0, FuseAttr{}, -linuxEROFS
 	}
-	backendNodeID, attr, errno := mknodBackend.Mknod(backendParent, childName, mode, rdev)
+	backendNodeID, attr, errno := mknodBackend.Mknod(backendParent, childName, mode, rdev, uid, gid)
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
 	}
@@ -445,7 +445,7 @@ func (m *mountedFS) Mknod(parent uint64, name string, mode uint32, rdev uint32) 
 	return id, attr, 0
 }
 
-func (m *mountedFS) Symlink(parent uint64, name string, target string) (uint64, FuseAttr, int32) {
+func (m *mountedFS) Symlink(parent uint64, name string, target string, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
 	parentNode := m.node(parent)
 	if parentNode == nil {
 		return 0, FuseAttr{}, -linuxENOENT
@@ -469,7 +469,7 @@ func (m *mountedFS) Symlink(parent uint64, name string, target string) (uint64, 
 	if !ok {
 		return 0, FuseAttr{}, -linuxEROFS
 	}
-	backendNodeID, attr, errno := symlinkBackend.Symlink(backendParent, childName, target)
+	backendNodeID, attr, errno := symlinkBackend.Symlink(backendParent, childName, target, uid, gid)
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
 	}
@@ -505,7 +505,7 @@ func (m *mountedFS) RmDir(parent uint64, name string) int32 {
 	return 0
 }
 
-func (m *mountedFS) Create(parent uint64, name string, flags uint32, mode uint32) (uint64, uint64, FuseAttr, int32) {
+func (m *mountedFS) Create(parent uint64, name string, flags uint32, mode uint32, uid uint32, gid uint32) (uint64, uint64, FuseAttr, int32) {
 	parentNode := m.node(parent)
 	if parentNode == nil {
 		return 0, 0, FuseAttr{}, -linuxENOENT
@@ -529,7 +529,7 @@ func (m *mountedFS) Create(parent uint64, name string, flags uint32, mode uint32
 	if !ok {
 		return 0, 0, FuseAttr{}, -linuxEROFS
 	}
-	backendNodeID, fh, attr, errno := createBackend.Create(backendParent, childName, flags, mode)
+	backendNodeID, fh, attr, errno := createBackend.Create(backendParent, childName, flags, mode, uid, gid)
 	if errno != 0 {
 		return 0, 0, FuseAttr{}, errno
 	}

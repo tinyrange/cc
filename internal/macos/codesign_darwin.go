@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -77,8 +78,14 @@ func signWithHypervisorEntitlement(exePath string) error {
 	}
 
 	cmd := exec.Command("codesign", "-f", "-s", "-", "--entitlements", tmpFile.Name(), exePath)
-	cmd.Stderr = os.Stderr
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
 	if err := cmd.Run(); err != nil {
+		detail := strings.TrimSpace(output.String())
+		if detail != "" {
+			return fmt.Errorf("codesign failed: %w: %s", err, detail)
+		}
 		return fmt.Errorf("codesign failed: %w", err)
 	}
 	return nil

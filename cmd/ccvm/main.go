@@ -68,11 +68,14 @@ type server struct {
 }
 
 type watchdogController struct {
-	mu        sync.Mutex
-	timeout   time.Duration
-	timer     *time.Timer
-	active    bool
-	onExpired func()
+	mu          sync.Mutex
+	timeout     time.Duration
+	timer       *time.Timer
+	active      bool
+	onExpired   func()
+	cvmfsEvents uint64
+	cvmfsBytes  int64
+	cvmfsLast   time.Time
 }
 
 type watchdogRequest struct {
@@ -98,12 +101,39 @@ func (w *watchdogController) Create(timeout time.Duration) {
 func (w *watchdogController) Feed() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	return w.feedLocked()
+}
+
+func (w *watchdogController) RecordCVMFSActivity(bytes int) {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.cvmfsEvents++
+	w.cvmfsBytes += int64(bytes)
+	w.cvmfsLast = time.Now()
+}
+
+func (w *watchdogController) ActivityState() client.WatchdogActivityState {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	cvmfs := client.WatchdogActivityCounter{
+		Events: w.cvmfsEvents,
+		Bytes:  w.cvmfsBytes,
+	}
+	if !w.cvmfsLast.IsZero() {
+		cvmfs.LastActivityUnix = w.cvmfsLast.Unix()
+		cvmfs.SecondsSinceLast = time.Since(w.cvmfsLast).Seconds()
+	}
+	return client.WatchdogActivityState{CVMFS: cvmfs}
+}
+
+func (w *watchdogController) feedLocked() bool {
 	if !w.active || w.timer == nil {
 		return false
 	}
-	if !w.timer.Stop() {
-		return false
-	}
+	w.timer.Stop()
 	w.timer.Reset(w.timeout)
 	return true
 }
@@ -186,6 +216,7 @@ func run() (bool, error) {
 	shutdown := newServerShutdown(srvState, &httpServer)
 	watchdog := newWatchdogController(shutdown)
 	defer watchdog.Stop()
+	srvState.images.CVMFSActivity = watchdog.RecordCVMFSActivity
 	mux := newMux(srvState, watchdog, shutdown)
 
 	httpServer = http.Server{Handler: mux}
@@ -296,6 +327,14 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "fed"})
+	})
+
+	mux.HandleFunc("GET /watchdog/activity", func(w http.ResponseWriter, r *http.Request) {
+		if watchdog == nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("watchdog is unavailable"))
+			return
+		}
+		writeJSON(w, http.StatusOK, watchdog.ActivityState())
 	})
 
 	mux.HandleFunc("GET /kernel", func(w http.ResponseWriter, r *http.Request) {
@@ -423,6 +462,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 				_, err := srvState.images.Pull(r.Context(), imageName, source, oci.PullOptions{
 					Prefetch:        req.Prefetch,
 					PrefetchWorkers: req.PrefetchWorkers,
+					CVMFSMirrors:    cvmfsSourceMirrors(req.SourceRef),
 					Report: func(event client.ProgressEvent) {
 						if event.Artifact == "" {
 							event.Artifact = imageName
@@ -453,6 +493,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 		state, err := srvState.images.Pull(r.Context(), imageName, source, oci.PullOptions{
 			Prefetch:        req.Prefetch,
 			PrefetchWorkers: req.PrefetchWorkers,
+			CVMFSMirrors:    cvmfsSourceMirrors(req.SourceRef),
 		})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
@@ -469,6 +510,12 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 		}
 		cvmfsClient := intcvmfs.NewClient()
 		cvmfsClient.CacheDir = cvmfsRequestCacheDir(req.CacheDir, srvState.cvmfsCacheDir)
+		cvmfsClient.Mirrors = req.Mirrors
+		if watchdog != nil {
+			cvmfsClient.OnActivity = func(event intcvmfs.ActivityEvent) {
+				watchdog.RecordCVMFSActivity(event.Bytes)
+			}
+		}
 		target := cvmfsTarget(req.Mirror, req.Repo, req.Path)
 		entries, err := cvmfsClient.ReadDir(target)
 		if err != nil {
@@ -502,6 +549,12 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 		}
 		cvmfsClient := intcvmfs.NewClient()
 		cvmfsClient.CacheDir = cvmfsRequestCacheDir(req.CacheDir, srvState.cvmfsCacheDir)
+		cvmfsClient.Mirrors = req.Mirrors
+		if watchdog != nil {
+			cvmfsClient.OnActivity = func(event intcvmfs.ActivityEvent) {
+				watchdog.RecordCVMFSActivity(event.Bytes)
+			}
+		}
 		target := cvmfsTarget(req.Mirror, req.Repo, req.Path)
 		data, eof, err := cvmfsClient.ReadFileRange(target, req.Offset, req.Length)
 		if err != nil {
@@ -1009,6 +1062,13 @@ func cvmfsTarget(mirror, repo, innerPath string) string {
 	}
 	mirror = ensureCVMFSMirrorPath(mirror)
 	return fmt.Sprintf("%s/%s%s", mirror, repo, pathValue)
+}
+
+func cvmfsSourceMirrors(source *client.ImageSource) []string {
+	if source == nil || strings.ToLower(strings.TrimSpace(source.Type)) != "cvmfs" {
+		return nil
+	}
+	return source.Mirrors
 }
 
 func cvmfsRequestCacheDir(requested string, fallback string) string {

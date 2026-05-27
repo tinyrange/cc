@@ -114,9 +114,22 @@ type Client struct {
 	HTTPClient   *http.Client
 	CacheDir     string
 	TraceLogPath string
+	OnActivity   func(ActivityEvent)
+	Mirrors      []string
 
-	mu    sync.Mutex
-	repos map[string]*repository
+	mu           sync.Mutex
+	repos        map[string]*repository
+	mirrorStats  map[string]*mirrorStat
+	mirrorCursor uint64
+}
+
+type ActivityEvent struct {
+	Time      time.Time
+	Op        string
+	Bytes     int
+	Target    string
+	URL       string
+	CachePath string
 }
 
 type traceEvent struct {
@@ -141,10 +154,17 @@ type manifest struct {
 
 type repository struct {
 	client   *Client
-	mirror   string
+	mirrors  []string
 	repo     string
 	manifest *manifest
 	catalogs map[string]*catalog
+}
+
+type mirrorStat struct {
+	successes int
+	failures  int
+	ewma      time.Duration
+	lastUsed  time.Time
 }
 
 type catalog struct {
@@ -360,6 +380,41 @@ func (c *Client) PrefetchFile(target string) (uint64, error) {
 	return size, nil
 }
 
+func (c *Client) CachedFileSize(target string) (uint64, bool, error) {
+	parsed, err := ParseTarget(target)
+	if err != nil {
+		return 0, false, err
+	}
+	if !parsed.Remote {
+		info, err := os.Stat(parsed.LocalPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return 0, false, nil
+			}
+			return 0, false, err
+		}
+		if info.IsDir() {
+			return 0, false, fmt.Errorf("%q is a directory", parsed.LocalPath)
+		}
+		return uint64(info.Size()), true, nil
+	}
+	cachePath := cvmfsFileCachePath(c.CacheDir, parsed.Repo, parsed.Path)
+	if cachePath == "" {
+		return 0, false, nil
+	}
+	info, err := os.Stat(cachePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	if info.IsDir() {
+		return 0, false, fmt.Errorf("%q is a directory", cachePath)
+	}
+	return uint64(info.Size()), true, nil
+}
+
 func (c *Client) WriteFileTo(target string, dst io.Writer) (uint64, error) {
 	id, started := c.traceStart("WriteFileTo", target, "", "")
 	parsed, err := ParseTarget(target)
@@ -545,8 +600,8 @@ func (c *Client) newRepository(target Target) *repository {
 	if client == nil {
 		client = NewClient()
 	}
-	mirror := strings.TrimRight(target.Mirror, "/")
-	key := mirror + "\x00" + target.Repo
+	mirrors := client.candidateMirrors(target.Mirror)
+	key := strings.Join(mirrors, "\x00") + "\x00" + target.Repo
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	if client.HTTPClient == nil {
@@ -560,12 +615,46 @@ func (c *Client) newRepository(target Target) *repository {
 	}
 	repo := &repository{
 		client:   client,
-		mirror:   mirror,
+		mirrors:  mirrors,
 		repo:     target.Repo,
 		catalogs: map[string]*catalog{},
 	}
 	client.repos[key] = repo
 	return repo
+}
+
+func (c *Client) candidateMirrors(primary string) []string {
+	seen := map[string]bool{}
+	candidates := make([]string, 0, len(c.Mirrors)+1)
+	for _, raw := range append([]string{primary}, c.Mirrors...) {
+		mirror := normalizeMirror(raw)
+		if mirror == "" || seen[mirror] {
+			continue
+		}
+		seen[mirror] = true
+		candidates = append(candidates, mirror)
+	}
+	if len(candidates) == 0 {
+		return []string{normalizeMirror(DefaultMirror)}
+	}
+	return candidates
+}
+
+func normalizeMirror(raw string) string {
+	raw = strings.TrimSpace(strings.TrimRight(raw, "/"))
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return raw
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	if !strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/cvmfs") {
+		u.Path = strings.TrimRight(u.Path, "/") + "/cvmfs"
+	}
+	return strings.TrimRight(u.String(), "/")
 }
 
 func readLocalDir(dir string) ([]DirEntry, error) {
@@ -746,6 +835,130 @@ func (r *repository) WriteFileTo(filePath string, dst io.Writer) (uint64, error)
 	return uint64(counting.n), nil
 }
 
+func (r *repository) orderedMirrors() []string {
+	if len(r.mirrors) <= 1 {
+		return append([]string(nil), r.mirrors...)
+	}
+	r.client.mu.Lock()
+	defer r.client.mu.Unlock()
+	if r.client.mirrorStats == nil {
+		r.client.mirrorStats = map[string]*mirrorStat{}
+	}
+	cursor := r.client.mirrorCursor
+	r.client.mirrorCursor++
+	type rankedMirror struct {
+		mirror string
+		index  int
+		score  time.Duration
+		known  bool
+	}
+	ranked := make([]rankedMirror, 0, len(r.mirrors))
+	for i, mirror := range r.mirrors {
+		stat := r.client.mirrorStats[mirror]
+		if stat == nil || stat.successes == 0 {
+			ranked = append(ranked, rankedMirror{
+				mirror: mirror,
+				index:  int((uint64(i) + cursor) % uint64(len(r.mirrors))),
+			})
+			continue
+		}
+		score := stat.ewma + time.Duration(stat.failures)*2*time.Second
+		if !stat.lastUsed.IsZero() && time.Since(stat.lastUsed) < 3*time.Second {
+			score += 250 * time.Millisecond
+		}
+		ranked = append(ranked, rankedMirror{
+			mirror: mirror,
+			index:  int((uint64(i) + cursor) % uint64(len(r.mirrors))),
+			score:  score,
+			known:  true,
+		})
+	}
+	sort.SliceStable(ranked, func(i, j int) bool {
+		left := ranked[i]
+		right := ranked[j]
+		if left.known != right.known {
+			return !left.known
+		}
+		if left.score != right.score {
+			return left.score < right.score
+		}
+		return left.index < right.index
+	})
+	out := make([]string, 0, len(ranked))
+	for _, item := range ranked {
+		out = append(out, item.mirror)
+	}
+	return out
+}
+
+func (c *Client) recordMirrorResult(mirror string, duration time.Duration, err error, statusCode int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.mirrorStats == nil {
+		c.mirrorStats = map[string]*mirrorStat{}
+	}
+	stat := c.mirrorStats[mirror]
+	if stat == nil {
+		stat = &mirrorStat{}
+		c.mirrorStats[mirror] = stat
+	}
+	stat.lastUsed = time.Now()
+	if err != nil || statusCode >= 500 || statusCode == http.StatusTooManyRequests {
+		stat.failures++
+		return
+	}
+	stat.successes++
+	if stat.ewma == 0 {
+		stat.ewma = duration
+	} else {
+		stat.ewma = (stat.ewma*7 + duration) / 8
+	}
+	if stat.failures > 0 {
+		stat.failures--
+	}
+}
+
+func (r *repository) getFromMirrors(op string, urlFor func(string) string, handle func(url string, resp *http.Response, id uint64, started time.Time) error) error {
+	var lastErr error
+	for _, mirror := range r.orderedMirrors() {
+		url := urlFor(mirror)
+		id, started := r.client.traceStart(op, "", url, "")
+		resp, err := r.client.HTTPClient.Get(url)
+		if err != nil {
+			r.client.traceDone(id, started, op, "", url, "", 0, 0, err)
+			r.client.recordMirrorResult(mirror, time.Since(started), err, 0)
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			what := "fetch object"
+			if op == "HTTPManifest" {
+				what = "fetch manifest"
+			}
+			err := fmt.Errorf("%s: unexpected status %s", what, resp.Status)
+			_ = resp.Body.Close()
+			r.client.traceDone(id, started, op, "", url, "", 0, resp.StatusCode, err)
+			r.client.recordMirrorResult(mirror, time.Since(started), err, resp.StatusCode)
+			lastErr = err
+			continue
+		}
+		err = handle(url, resp, id, started)
+		closeErr := resp.Body.Close()
+		if err == nil {
+			err = closeErr
+		}
+		r.client.recordMirrorResult(mirror, time.Since(started), err, resp.StatusCode)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no CVMFS mirrors configured for %s", r.repo)
+	}
+	return lastErr
+}
+
 func (r *repository) Walk(rootPath string, visit func(WalkEntry) error) error {
 	rootPath = path.Clean("/" + strings.TrimPrefix(rootPath, "/"))
 	found := false
@@ -874,54 +1087,44 @@ func (r *repository) streamDataObject(hash string, partial bool, dst io.Writer, 
 		return err
 	}
 
-	url := r.objectURL(hash, suffix)
-	id, started := r.client.traceStart("HTTPObject", "", url, "")
-	resp, err := r.client.HTTPClient.Get(url)
-	if err != nil {
-		r.client.traceDone(id, started, "HTTPObject", "", url, "", 0, 0, err)
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		err := fmt.Errorf("fetch object: unexpected status %s", resp.Status)
-		r.client.traceDone(id, started, "HTTPObject", "", url, "", 0, resp.StatusCode, err)
-		return err
-	}
-
-	reader := io.Reader(resp.Body)
 	cachePath := cvmfsObjectCachePath(r.client.CacheDir, hash, suffix)
-	var cacheWriter io.WriteCloser
-	if cacheCompressed && cachePath != "" {
-		cacheFile, err := createAtomicFile(cachePath)
+	return r.getFromMirrors("HTTPObject", func(mirror string) string {
+		return r.objectURL(mirror, hash, suffix)
+	}, func(url string, resp *http.Response, id uint64, started time.Time) error {
+		reader := r.client.activityReader("HTTPObject", "", url, cachePath, resp.Body)
+		var cacheWriter io.WriteCloser
+		if cacheCompressed && cachePath != "" {
+			cacheFile, err := createAtomicFile(cachePath)
+			if err != nil {
+				r.client.traceDone(id, started, "HTTPObject", "", url, cachePath, 0, resp.StatusCode, err)
+				return err
+			}
+			cacheWriter = cacheFile
+			reader = io.TeeReader(reader, cacheFile)
+		}
+
+		zr, err := zlib.NewReader(reader)
 		if err != nil {
 			r.client.traceDone(id, started, "HTTPObject", "", url, cachePath, 0, resp.StatusCode, err)
 			return err
 		}
-		cacheWriter = cacheFile
-		reader = io.TeeReader(resp.Body, cacheFile)
-	}
-
-	zr, err := zlib.NewReader(reader)
-	if err != nil {
-		r.client.traceDone(id, started, "HTTPObject", "", url, cachePath, 0, resp.StatusCode, err)
-		return err
-	}
-	counting := &countingWriter{w: dst}
-	_, err = io.Copy(counting, zr)
-	closeErr := zr.Close()
-	if err == nil {
-		err = closeErr
-	}
-	if cacheWriter != nil {
+		counting := &countingWriter{w: dst}
+		_, err = io.Copy(counting, zr)
+		closeErr := zr.Close()
 		if err == nil {
-			err = cacheWriter.Close()
-		} else {
-			_ = cacheWriter.Close()
+			err = closeErr
 		}
-		cacheWriter = nil
-	}
-	r.client.traceDone(id, started, "HTTPObject", "", url, cachePath, int(counting.n), resp.StatusCode, err)
-	return err
+		if cacheWriter != nil {
+			if err == nil {
+				err = cacheWriter.Close()
+			} else {
+				_ = cacheWriter.Close()
+			}
+			cacheWriter = nil
+		}
+		r.client.traceDone(id, started, "HTTPObject", "", url, cachePath, int(counting.n), resp.StatusCode, err)
+		return err
+	})
 }
 
 func (r *repository) streamDataObjectRange(hash string, partial bool, offset, length int64, dst io.Writer) error {
@@ -940,60 +1143,50 @@ func (r *repository) streamDataObjectRange(hash string, partial bool, offset, le
 		return err
 	}
 
-	url := r.objectURL(hash, suffix)
-	id, started := r.client.traceStart("HTTPObjectRange", "", url, "")
-	resp, err := r.client.HTTPClient.Get(url)
-	if err != nil {
-		r.client.traceDone(id, started, "HTTPObjectRange", "", url, "", 0, 0, err)
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		err := fmt.Errorf("fetch object: unexpected status %s", resp.Status)
-		r.client.traceDone(id, started, "HTTPObjectRange", "", url, "", 0, resp.StatusCode, err)
-		return err
-	}
-
-	reader := io.Reader(resp.Body)
 	cachePath := cvmfsObjectCachePath(r.client.CacheDir, hash, suffix)
-	var cacheWriter io.WriteCloser
-	if cachePath != "" {
-		cacheFile, err := createAtomicFile(cachePath)
+	return r.getFromMirrors("HTTPObjectRange", func(mirror string) string {
+		return r.objectURL(mirror, hash, suffix)
+	}, func(url string, resp *http.Response, id uint64, started time.Time) error {
+		reader := r.client.activityReader("HTTPObjectRange", "", url, cachePath, resp.Body)
+		var cacheWriter io.WriteCloser
+		if cachePath != "" {
+			cacheFile, err := createAtomicFile(cachePath)
+			if err != nil {
+				r.client.traceDone(id, started, "HTTPObjectRange", "", url, cachePath, 0, resp.StatusCode, err)
+				return err
+			}
+			cacheWriter = cacheFile
+			reader = io.TeeReader(reader, cacheFile)
+		}
+
+		zr, err := zlib.NewReader(reader)
 		if err != nil {
+			if cacheWriter != nil {
+				_ = cacheWriter.Close()
+			}
 			r.client.traceDone(id, started, "HTTPObjectRange", "", url, cachePath, 0, resp.StatusCode, err)
 			return err
 		}
-		cacheWriter = cacheFile
-		reader = io.TeeReader(resp.Body, cacheFile)
-	}
-
-	zr, err := zlib.NewReader(reader)
-	if err != nil {
-		if cacheWriter != nil {
-			_ = cacheWriter.Close()
+		counting := &countingWriter{w: dst}
+		err = copyCompressedRange(zr, offset, length, counting)
+		if err == nil && cacheWriter != nil {
+			_, err = io.Copy(io.Discard, zr)
 		}
-		r.client.traceDone(id, started, "HTTPObjectRange", "", url, cachePath, 0, resp.StatusCode, err)
-		return err
-	}
-	counting := &countingWriter{w: dst}
-	err = copyCompressedRange(zr, offset, length, counting)
-	if err == nil && cacheWriter != nil {
-		_, err = io.Copy(io.Discard, zr)
-	}
-	closeErr := zr.Close()
-	if err == nil {
-		err = closeErr
-	}
-	if cacheWriter != nil {
+		closeErr := zr.Close()
 		if err == nil {
-			err = cacheWriter.Close()
-		} else {
-			_ = cacheWriter.Close()
+			err = closeErr
 		}
-		cacheWriter = nil
-	}
-	r.client.traceDone(id, started, "HTTPObjectRange", "", url, cachePath, int(counting.n), resp.StatusCode, err)
-	return err
+		if cacheWriter != nil {
+			if err == nil {
+				err = cacheWriter.Close()
+			} else {
+				_ = cacheWriter.Close()
+			}
+			cacheWriter = nil
+		}
+		r.client.traceDone(id, started, "HTTPObjectRange", "", url, cachePath, int(counting.n), resp.StatusCode, err)
+		return err
+	})
 }
 
 func copyCompressedRange(src io.Reader, offset, length int64, dst io.Writer) error {
@@ -1150,32 +1343,26 @@ func (r *repository) getManifest() (*manifest, error) {
 }
 
 func (r *repository) fetchManifest() ([]byte, error) {
-	url := r.mirror + "/" + r.repo + "/.cvmfspublished"
-	id, started := r.client.traceStart("HTTPManifest", "", url, "")
-	resp, err := r.client.HTTPClient.Get(url)
-	if err == nil {
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			err = fmt.Errorf("fetch manifest: unexpected status %s", resp.Status)
-		} else {
-			body, readErr := io.ReadAll(resp.Body)
-			if readErr != nil {
-				r.client.traceDone(id, started, "HTTPManifest", "", url, "", len(body), resp.StatusCode, readErr)
-				return nil, readErr
-			}
-			if writeErr := r.writeCachedManifest(body); writeErr != nil {
-				r.client.traceDone(id, started, "HTTPManifest", "", url, "", len(body), resp.StatusCode, writeErr)
-				return nil, writeErr
-			}
-			r.client.traceDone(id, started, "HTTPManifest", "", url, "", len(body), resp.StatusCode, nil)
-			return body, nil
+	var body []byte
+	err := r.getFromMirrors("HTTPManifest", func(mirror string) string {
+		return fmt.Sprintf("%s/%s/.cvmfspublished", mirror, r.repo)
+	}, func(url string, resp *http.Response, id uint64, started time.Time) error {
+		data, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			r.client.traceDone(id, started, "HTTPManifest", "", url, "", len(data), resp.StatusCode, readErr)
+			return readErr
 		}
+		if writeErr := r.writeCachedManifest(data); writeErr != nil {
+			r.client.traceDone(id, started, "HTTPManifest", "", url, "", len(data), resp.StatusCode, writeErr)
+			return writeErr
+		}
+		body = data
+		r.client.traceDone(id, started, "HTTPManifest", "", url, "", len(data), resp.StatusCode, nil)
+		return nil
+	})
+	if err == nil {
+		return body, nil
 	}
-	statusCode := 0
-	if resp != nil {
-		statusCode = resp.StatusCode
-	}
-	r.client.traceDone(id, started, "HTTPManifest", "", url, "", 0, statusCode, err)
 	if body, cacheErr := r.readCachedManifest(); cacheErr == nil {
 		return body, nil
 	}
@@ -1283,30 +1470,29 @@ func (r *repository) fetchCompressedObject(hash, suffix string) ([]byte, error) 
 		}
 	}
 
-	url := r.objectURL(hash, suffix)
-	id, started := r.client.traceStart("HTTPObject", "", url, "")
-	resp, err := r.client.HTTPClient.Get(url)
+	var buf bytes.Buffer
+	err := r.getFromMirrors("HTTPObject", func(mirror string) string {
+		return r.objectURL(mirror, hash, suffix)
+	}, func(url string, resp *http.Response, id uint64, started time.Time) error {
+		buf.Reset()
+		reader := r.client.activityReader("HTTPObject", "", url, cachePath, resp.Body)
+		_, err := io.Copy(&buf, reader)
+		data := buf.Bytes()
+		if err != nil {
+			r.client.traceDone(id, started, "HTTPObject", "", url, "", len(data), resp.StatusCode, err)
+			return err
+		}
+		if err := r.writeCachedObject(hash, suffix, data); err != nil {
+			r.client.traceDone(id, started, "HTTPObject", "", url, cachePath, len(data), resp.StatusCode, err)
+			return err
+		}
+		r.client.traceDone(id, started, "HTTPObject", "", url, cachePath, len(data), resp.StatusCode, nil)
+		return nil
+	})
 	if err != nil {
-		r.client.traceDone(id, started, "HTTPObject", "", url, "", 0, 0, err)
 		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		err := fmt.Errorf("fetch object: unexpected status %s", resp.Status)
-		r.client.traceDone(id, started, "HTTPObject", "", url, "", 0, resp.StatusCode, err)
-		return nil, err
-	}
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		r.client.traceDone(id, started, "HTTPObject", "", url, "", len(data), resp.StatusCode, err)
-		return nil, err
-	}
-	if err := r.writeCachedObject(hash, suffix, data); err != nil {
-		r.client.traceDone(id, started, "HTTPObject", "", url, cachePath, len(data), resp.StatusCode, err)
-		return nil, err
-	}
-	r.client.traceDone(id, started, "HTTPObject", "", url, cachePath, len(data), resp.StatusCode, nil)
-	return data, nil
+	return append([]byte(nil), buf.Bytes()...), nil
 }
 
 func (r *repository) readCachedObject(hash, suffix string) ([]byte, error) {
@@ -1348,8 +1534,8 @@ func (r *repository) writeCachedObject(hash, suffix string, data []byte) error {
 	return nil
 }
 
-func (r *repository) objectURL(hash, suffix string) string {
-	return fmt.Sprintf("%s/%s/data/%s/%s%s", r.mirror, r.repo, hash[:2], hash[2:], suffix)
+func (r *repository) objectURL(mirror, hash, suffix string) string {
+	return fmt.Sprintf("%s/%s/data/%s/%s%s", mirror, r.repo, hash[:2], hash[2:], suffix)
 }
 
 func (c *Client) traceStart(op, target, url, cachePath string) (uint64, time.Time) {
@@ -1368,6 +1554,45 @@ func (c *Client) traceStart(op, target, url, cachePath string) (uint64, time.Tim
 		CachePath: cachePath,
 	})
 	return id, started
+}
+
+func (c *Client) reportActivity(op string, bytes int, target string, url string, cachePath string) {
+	if c == nil || c.OnActivity == nil {
+		return
+	}
+	c.OnActivity(ActivityEvent{
+		Time:      time.Now(),
+		Op:        op,
+		Bytes:     bytes,
+		Target:    target,
+		URL:       url,
+		CachePath: cachePath,
+	})
+}
+
+func (c *Client) activityReader(op string, target string, url string, cachePath string, reader io.Reader) io.Reader {
+	if c == nil || c.OnActivity == nil {
+		return reader
+	}
+	return &activityReader{
+		reader: reader,
+		onRead: func(n int) {
+			c.reportActivity(op, n, target, url, cachePath)
+		},
+	}
+}
+
+type activityReader struct {
+	reader io.Reader
+	onRead func(int)
+}
+
+func (r *activityReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if n > 0 && r.onRead != nil {
+		r.onRead(n)
+	}
+	return n, err
 }
 
 func (c *Client) traceDone(
@@ -1775,13 +2000,17 @@ func (a *atomicFile) Close() error {
 }
 
 type countingWriter struct {
-	w io.Writer
-	n int64
+	w       io.Writer
+	n       int64
+	onWrite func(int)
 }
 
 func (w *countingWriter) Write(p []byte) (int, error) {
 	n, err := w.w.Write(p)
 	w.n += int64(n)
+	if n > 0 && w.onWrite != nil {
+		w.onWrite(n)
+	}
 	return n, err
 }
 

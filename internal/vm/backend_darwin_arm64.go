@@ -51,7 +51,18 @@ func (b *runtimeBackend) StartBlank(ctx context.Context, req client.StartInstanc
 
 func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
 	start := time.Now()
-	runReq, err := b.buildStartRequest(ctx, req)
+	network, err := newDarwinARM64NetworkRuntime(req.Network)
+	if err != nil {
+		return nil, err
+	}
+	if network != nil {
+		defer func() {
+			if err != nil {
+				_ = network.Close()
+			}
+		}()
+	}
+	runReq, err := b.buildStartRequest(ctx, req, network)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +72,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		return nil, err
 	}
 	timingLog("runtime.Start hvf.StartContainer took=%s image=%q", time.Since(start), req.Image)
-	return session, nil
+	return &darwinInstance{session: session, network: network}, nil
 }
 
 func (b *runtimeBackend) StartBlankStream(
@@ -70,7 +81,18 @@ func (b *runtimeBackend) StartBlankStream(
 	onEvent func(client.BootEvent) error,
 ) (Instance, error) {
 	start := time.Now()
-	runReq, err := b.buildBlankStartRequest(ctx, req)
+	network, err := newDarwinARM64NetworkRuntime(req.Network)
+	if err != nil {
+		return nil, err
+	}
+	if network != nil {
+		defer func() {
+			if err != nil {
+				_ = network.Close()
+			}
+		}()
+	}
+	runReq, err := b.buildBlankStartRequest(ctx, req, network)
 	if err != nil {
 		return nil, err
 	}
@@ -80,7 +102,7 @@ func (b *runtimeBackend) StartBlankStream(
 		return nil, err
 	}
 	timingLog("runtime.StartBlank hvf.StartContainer took=%s", time.Since(start))
-	return session, nil
+	return &darwinInstance{session: session, network: network}, nil
 }
 
 func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
@@ -138,7 +160,7 @@ func (b *runtimeBackend) RunInInstance(
 		})
 	}
 
-	session, ok := inst.(*hvf.ContainerSession)
+	session, ok := darwinContainerSession(inst)
 	if !ok {
 		return client.ExecResponse{}, fmt.Errorf("running instance does not support image mounts")
 	}
@@ -202,7 +224,7 @@ func (b *runtimeBackend) RunInInstanceStream(
 		return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
 	}
 
-	session, ok := inst.(*hvf.ContainerSession)
+	session, ok := darwinContainerSession(inst)
 	if !ok {
 		return fmt.Errorf("running instance does not support image mounts")
 	}
@@ -250,7 +272,7 @@ func (b *runtimeBackend) RunInInstanceStream(
 	}, inputs, onEvent)
 }
 
-func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, memoryMB uint64, cpus int, dmesg bool) (vmruntime.RunRequest, error) {
+func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, memoryMB uint64, cpus int, dmesg bool, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
 	start := time.Now()
 	if b.kernel == nil || b.images == nil {
 		return vmruntime.RunRequest{}, fmt.Errorf("runtime backend is not configured")
@@ -271,6 +293,9 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	timingLog("buildBaseRequest ReadKernel took=%s image=%q", time.Since(start), imageName)
 	start = time.Now()
 	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO"}
+	if network != nil {
+		configVars = append(configVars, "CONFIG_VIRTIO_NET")
+	}
 	moduleMap := map[string]string{
 		"CONFIG_VIRTIO_MMIO":      "kernel/drivers/virtio/virtio_mmio.ko.gz",
 		"CONFIG_FUSE_FS":          "kernel/fs/fuse/fuse.ko.gz",
@@ -279,6 +304,7 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 		"CONFIG_VIRTIO_VSOCKETS":  "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
 		"CONFIG_HW_RANDOM":        "kernel/drivers/char/hw_random/rng-core.ko.gz",
 		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
+		"CONFIG_VIRTIO_NET":       "kernel/drivers/net/virtio_net.ko.gz",
 	}
 	if NeedsAMD64Emulation(image) {
 		configVars = append(configVars, "CONFIG_BINFMT_MISC")
@@ -317,6 +343,9 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 		MemoryMB:          memoryMB,
 		CPUs:              cpus,
 		Dmesg:             dmesg,
+		Network:           network.guestInitConfig(),
+		NetDevice:         networkDeviceDarwin(network),
+		UnixTime:          time.Now().Unix(),
 	}, ctx.Err()
 }
 
@@ -341,9 +370,13 @@ func withRuntimeMountDirs(image *oci.Image) *oci.Image {
 	return &cloned
 }
 
-func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.CreateInstanceRequest) (vmruntime.RunRequest, error) {
+func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.CreateInstanceRequest, networks ...*darwinNetworkRuntime) (vmruntime.RunRequest, error) {
 	start := time.Now()
-	runReq, err := b.buildBaseRequest(ctx, req.Image, req.MemoryMB, req.CPUs, req.Dmesg)
+	var network *darwinNetworkRuntime
+	if len(networks) > 0 {
+		network = networks[0]
+	}
+	runReq, err := b.buildBaseRequest(ctx, req.Image, req.MemoryMB, req.CPUs, req.Dmesg, network)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
@@ -355,7 +388,7 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 	return runReq, nil
 }
 
-func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.StartInstanceRequest) (vmruntime.RunRequest, error) {
+func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.StartInstanceRequest, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
 	if b.kernel == nil || b.images == nil {
 		return vmruntime.RunRequest{}, fmt.Errorf("runtime backend is not configured")
 	}
@@ -364,6 +397,9 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		return vmruntime.RunRequest{}, err
 	}
 	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO"}
+	if network != nil {
+		configVars = append(configVars, "CONFIG_VIRTIO_NET")
+	}
 	moduleMap := map[string]string{
 		"CONFIG_VIRTIO_MMIO":      "kernel/drivers/virtio/virtio_mmio.ko.gz",
 		"CONFIG_FUSE_FS":          "kernel/fs/fuse/fuse.ko.gz",
@@ -372,6 +408,7 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		"CONFIG_VIRTIO_VSOCKETS":  "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
 		"CONFIG_HW_RANDOM":        "kernel/drivers/char/hw_random/rng-core.ko.gz",
 		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
+		"CONFIG_VIRTIO_NET":       "kernel/drivers/net/virtio_net.ko.gz",
 	}
 	modules, err := b.kernel.PlanModuleLoad(configVars, moduleMap)
 	if err != nil {
@@ -394,11 +431,14 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		CPUs:       req.CPUs,
 		Dmesg:      req.Dmesg,
 		Persistent: true,
+		Network:    network.guestInitConfig(),
+		NetDevice:  networkDeviceDarwin(network),
+		UnixTime:   time.Now().Unix(),
 	}, ctx.Err()
 }
 
 func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.RunRequest) (vmruntime.RunRequest, error) {
-	runReq, err := b.buildBaseRequest(ctx, req.Image, req.MemoryMB, req.CPUs, req.Dmesg)
+	runReq, err := b.buildBaseRequest(ctx, req.Image, req.MemoryMB, req.CPUs, req.Dmesg, nil)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}

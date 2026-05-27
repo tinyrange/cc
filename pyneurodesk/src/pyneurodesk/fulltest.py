@@ -20,6 +20,7 @@ import httpx
 from .api import (
     DEFAULT_CVMFS_MIRROR,
     DEFAULT_CVMFS_REPO,
+    cvmfs_mirrors_for,
     start_container_daemon,
 )
 from .client import PyNeurodeskClient, resolve_boot_timeout_seconds
@@ -524,12 +525,15 @@ def build_container_reference(
     cache_dir: Optional[str],
 ) -> ContainerReference:
     source = image_source.strip()
+    mirrors = cvmfs_mirrors_for(mirror)
     if source:
         if source.startswith("/containers/"):
             return ContainerReference(
                 name=suite.name,
                 image=image_name,
-                source=ImageSource(type="cvmfs", mirror=mirror, repo=repo, path=source),
+                source=ImageSource(
+                    type="cvmfs", mirror=mirror, mirrors=mirrors, repo=repo, path=source
+                ),
                 cache_dir=cache_dir,
             )
         if source.startswith("cvmfs://") or "/cvmfs/" in source:
@@ -537,7 +541,9 @@ def build_container_reference(
             return ContainerReference(
                 name=suite.name,
                 image=image_name,
-                source=ImageSource(type="cvmfs", mirror=mirror, repo=repo, path=path),
+                source=ImageSource(
+                    type="cvmfs", mirror=mirror, mirrors=mirrors, repo=repo, path=path
+                ),
                 cache_dir=cache_dir,
             )
         return ContainerReference(
@@ -553,7 +559,13 @@ def build_container_reference(
     return ContainerReference(
         name=suite.name,
         image=image_name,
-        source=ImageSource(type="cvmfs", mirror=mirror, repo=repo, path=f"/containers/{container_name}"),
+        source=ImageSource(
+            type="cvmfs",
+            mirror=mirror,
+            mirrors=mirrors,
+            repo=repo,
+            path=f"/containers/{container_name}",
+        ),
         cache_dir=cache_dir,
     )
 

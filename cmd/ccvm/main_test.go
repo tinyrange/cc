@@ -180,6 +180,8 @@ func TestWriteProgressEvent(t *testing.T) {
 		Artifact:           "linux-virt.apk",
 		BytesDownloaded:    1024,
 		BytesTotal:         4096,
+		FilesDownloaded:    3,
+		FilesTotal:         8,
 		RateBytesPerSecond: 512,
 		ETASeconds:         6,
 	}); err != nil {
@@ -199,6 +201,9 @@ func TestWriteProgressEvent(t *testing.T) {
 	}
 	if event.BytesDownloaded != 1024 || event.BytesTotal != 4096 {
 		t.Fatalf("progress bytes = %#v", event)
+	}
+	if event.FilesDownloaded != 3 || event.FilesTotal != 8 {
+		t.Fatalf("progress files = %#v", event)
 	}
 }
 
@@ -257,6 +262,25 @@ func TestWatchdogExpiresWithoutFeed(t *testing.T) {
 	}
 	if watchdog.Feed() {
 		t.Fatal("Feed() after expiry = true, want false")
+	}
+}
+
+func TestWatchdogCVMFSActivityDoesNotFeedTimer(t *testing.T) {
+	expired := make(chan struct{}, 1)
+	watchdog := newWatchdogController(func() { expired <- struct{}{} })
+	defer watchdog.Stop()
+
+	watchdog.Create(50 * time.Millisecond)
+	watchdog.RecordCVMFSActivity(512)
+	select {
+	case <-expired:
+	case <-time.After(time.Second):
+		t.Fatal("watchdog did not expire")
+	}
+
+	state := watchdog.ActivityState()
+	if state.CVMFS.Events != 1 || state.CVMFS.Bytes != 512 {
+		t.Fatalf("CVMFS activity = %#v, want 1 event and 512 bytes", state.CVMFS)
 	}
 }
 
@@ -395,7 +419,9 @@ func TestPullImageRequestAcceptsStructuredSource(t *testing.T) {
 func TestCVMFSEndpointsSupportCacheDir(t *testing.T) {
 	repoServer := newHTTPTestRepoServer(t)
 	cacheDir := t.TempDir()
-	mux := newMux(&server{}, nil, func() {})
+	watchdog := newWatchdogController(nil)
+	defer watchdog.Stop()
+	mux := newMux(&server{}, watchdog, func() {})
 
 	listBody := `{"mirror":"` + repoServer.URL + `/cvmfs","repo":"test.repo","path":"/containers/niimath","cache_dir":"` + cacheDir + `"}`
 	listReq := httptest.NewRequest(http.MethodPost, "/cvmfs/list", strings.NewReader(listBody))
@@ -433,6 +459,9 @@ func TestCVMFSEndpointsSupportCacheDir(t *testing.T) {
 	}
 	if string(readResp.Data) != "niimat" {
 		t.Fatalf("read data = %q, want %q", string(readResp.Data), "niimat")
+	}
+	if watchdog.ActivityState().CVMFS.Events == 0 {
+		t.Fatal("CVMFS read did not record watchdog activity")
 	}
 
 	if _, err := os.Stat(filepath.Join(cacheDir, "state", "test.repo", "manifest")); err != nil {
@@ -519,12 +548,23 @@ func TestPostImageStreamsProgressForDirectoryBackedCVMFSContainer(t *testing.T) 
 	if len(lines) < 2 {
 		t.Fatalf("streamed event line count = %d, want at least 2", len(lines))
 	}
+	var sawCacheProgress bool
 	var last client.ProgressEvent
-	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &last); err != nil {
-		t.Fatalf("Unmarshal(last progress event) error = %v", err)
+	for _, line := range lines {
+		var event client.ProgressEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("Unmarshal(progress event) error = %v", err)
+		}
+		last = event
+		if event.Blob == "cvmfs cache" {
+			sawCacheProgress = true
+		}
 	}
 	if last.Status != "downloaded" {
 		t.Fatalf("last progress event = %#v", last)
+	}
+	if !sawCacheProgress {
+		t.Fatalf("streamed progress did not include CVMFS cache progress: %s", rec.Body.String())
 	}
 }
 

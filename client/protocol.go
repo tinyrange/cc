@@ -18,6 +18,17 @@ type ErrorResponse struct {
 	Error string `json:"error"`
 }
 
+type WatchdogActivityState struct {
+	CVMFS WatchdogActivityCounter `json:"cvmfs"`
+}
+
+type WatchdogActivityCounter struct {
+	Events           uint64  `json:"events"`
+	Bytes            int64   `json:"bytes"`
+	LastActivityUnix int64   `json:"last_activity_unix,omitempty"`
+	SecondsSinceLast float64 `json:"seconds_since_last,omitempty"`
+}
+
 type BootEvent struct {
 	Kind    string        `json:"kind"`
 	Message string        `json:"message,omitempty"`
@@ -59,6 +70,8 @@ type ProgressEvent struct {
 	Progress           float64 `json:"progress,omitempty"`
 	BytesDownloaded    int64   `json:"bytes_downloaded,omitempty"`
 	BytesTotal         int64   `json:"bytes_total,omitempty"`
+	FilesDownloaded    int64   `json:"files_downloaded,omitempty"`
+	FilesTotal         int64   `json:"files_total,omitempty"`
 	RateBytesPerSecond float64 `json:"rate_bytes_per_second,omitempty"`
 	ETASeconds         float64 `json:"eta_seconds,omitempty"`
 	Blob               string  `json:"blob,omitempty"`
@@ -82,18 +95,20 @@ type PullImageRequest struct {
 }
 
 type ImageSource struct {
-	Type   string `json:"type"`
-	Format string `json:"format,omitempty"`
-	Mirror string `json:"mirror,omitempty"`
-	Repo   string `json:"repo,omitempty"`
-	Path   string `json:"path,omitempty"`
+	Type    string   `json:"type"`
+	Format  string   `json:"format,omitempty"`
+	Mirror  string   `json:"mirror,omitempty"`
+	Mirrors []string `json:"mirrors,omitempty"`
+	Repo    string   `json:"repo,omitempty"`
+	Path    string   `json:"path,omitempty"`
 }
 
 type CVMFSListRequest struct {
-	Mirror   string `json:"mirror,omitempty"`
-	Repo     string `json:"repo"`
-	Path     string `json:"path,omitempty"`
-	CacheDir string `json:"cache_dir,omitempty"`
+	Mirror   string   `json:"mirror,omitempty"`
+	Mirrors  []string `json:"mirrors,omitempty"`
+	Repo     string   `json:"repo"`
+	Path     string   `json:"path,omitempty"`
+	CacheDir string   `json:"cache_dir,omitempty"`
 }
 
 type CVMFSDirectoryEntry struct {
@@ -108,12 +123,13 @@ type CVMFSListResponse struct {
 }
 
 type CVMFSReadRequest struct {
-	Mirror   string `json:"mirror,omitempty"`
-	Repo     string `json:"repo"`
-	Path     string `json:"path"`
-	Offset   int64  `json:"offset,omitempty"`
-	Length   int64  `json:"length,omitempty"`
-	CacheDir string `json:"cache_dir,omitempty"`
+	Mirror   string   `json:"mirror,omitempty"`
+	Mirrors  []string `json:"mirrors,omitempty"`
+	Repo     string   `json:"repo"`
+	Path     string   `json:"path"`
+	Offset   int64    `json:"offset,omitempty"`
+	Length   int64    `json:"length,omitempty"`
+	CacheDir string   `json:"cache_dir,omitempty"`
 }
 
 type CVMFSReadResponse struct {

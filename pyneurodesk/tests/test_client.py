@@ -42,7 +42,9 @@ from pyneurodesk.client import resolve_boot_timeout
 @pytest.fixture(autouse=True)
 def disable_local_release_index(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("pyneurodesk.api.resolve_release_index_dir", lambda: None)
-    monkeypatch.setattr("pyneurodesk.api._search_remote_release_versions", lambda name: {})
+    monkeypatch.setattr(
+        "pyneurodesk.api._search_remote_release_versions", lambda name: {}
+    )
 
 
 def make_client(handler: httpx.MockTransport) -> PyNeurodeskClient:
@@ -108,6 +110,20 @@ def test_import_image_request_from_cvmfs_container_serializes_expected_shape() -
         },
         "cache_dir": "/tmp/cvmfs-cache",
     }
+
+
+def test_import_image_request_serializes_cvmfs_mirrors() -> None:
+    request = ImportImageRequest.from_cvmfs_container(
+        mirror="http://primary.example",
+        mirrors=("http://mirror-a.example", "http://mirror-b.example"),
+        repo="neurodesk.ardc.edu.au",
+        path="/containers/niimath",
+    )
+
+    assert request.to_payload()["source"]["mirrors"] == [
+        "http://mirror-a.example",
+        "http://mirror-b.example",
+    ]
 
 
 def test_cvmfs_list_posts_source_and_parses_entries() -> None:
@@ -245,7 +261,10 @@ def test_run_command_request_serializes_timeout_seconds() -> None:
     finally:
         client.close()
 
-    assert seen["json"] == '{"image":"niimath","command":["sleep","30"],"timeout_seconds":2.5}'
+    assert (
+        seen["json"]
+        == '{"image":"niimath","command":["sleep","30"],"timeout_seconds":2.5}'
+    )
     assert result.exit_code == 124
 
 
@@ -254,15 +273,23 @@ def test_named_vm_client_methods_send_id() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = request.read().decode()
-        seen.append((request.method, request.url.path, str(request.url.query.decode()), body))
+        seen.append(
+            (request.method, request.url.path, str(request.url.query.decode()), body)
+        )
         if request.method == "GET" and request.url.path == "/vm/status":
-            return httpx.Response(200, json={"id": request.url.params.get("id"), "status": "stopped"})
+            return httpx.Response(
+                200, json={"id": request.url.params.get("id"), "status": "stopped"}
+            )
         if request.method == "POST" and request.url.path == "/vm":
-            return httpx.Response(200, json={"id": "analysis", "status": "running", "image": "niimath"})
+            return httpx.Response(
+                200, json={"id": "analysis", "status": "running", "image": "niimath"}
+            )
         if request.method == "POST" and request.url.path == "/vm/run":
             return httpx.Response(200, json={"exit_code": 0, "output": "ok"})
         if request.method == "POST" and request.url.path == "/vm/shutdown":
-            return httpx.Response(200, json={"id": request.url.params.get("id"), "status": "stopped"})
+            return httpx.Response(
+                200, json={"id": request.url.params.get("id"), "status": "stopped"}
+            )
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
 
     client = make_client(httpx.MockTransport(handler))
@@ -280,8 +307,18 @@ def test_named_vm_client_methods_send_id() -> None:
     assert stopped.id == "analysis"
     assert seen == [
         ("GET", "/vm/status", "id=analysis", ""),
-        ("POST", "/vm", "", '{"image":"niimath","id":"analysis","timeout_seconds":5.0}'),
-        ("POST", "/vm/run", "", '{"image":"niimath","command":["true"],"id":"analysis"}'),
+        (
+            "POST",
+            "/vm",
+            "",
+            '{"image":"niimath","id":"analysis","timeout_seconds":5.0}',
+        ),
+        (
+            "POST",
+            "/vm/run",
+            "",
+            '{"image":"niimath","command":["true"],"id":"analysis"}',
+        ),
         ("POST", "/vm/shutdown", "id=analysis", ""),
     ]
 
@@ -293,7 +330,9 @@ def test_watchdog_client_endpoints() -> None:
         body = request.read().decode() or None
         seen.append((request.method, request.url.path, body))
         if request.url.path == "/watchdog":
-            return httpx.Response(200, json={"status": "watching", "timeout_seconds": 30})
+            return httpx.Response(
+                200, json={"status": "watching", "timeout_seconds": 30}
+            )
         if request.url.path == "/watchdog/feed":
             return httpx.Response(200, json={"status": "fed"})
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
@@ -387,7 +426,9 @@ def test_start_instance_posts_vm_start_and_uses_boot_timeout() -> None:
     assert result.status == "running"
 
 
-def test_container_cold_start_uses_http_timeout_for_preflight_and_boot_timeout_for_vm() -> None:
+def test_container_cold_start_uses_http_timeout_for_preflight_and_boot_timeout_for_vm() -> (
+    None
+):
     seen: list[tuple[str, Optional[float]]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -402,20 +443,46 @@ def test_container_cold_start_uses_http_timeout_for_preflight_and_boot_timeout_f
             if payload["path"] == "/containers":
                 return httpx.Response(
                     200,
-                    json={"entries": [{"name": "niimath", "path": "/containers/niimath", "kind": "directory"}]},
+                    json={
+                        "entries": [
+                            {
+                                "name": "niimath",
+                                "path": "/containers/niimath",
+                                "kind": "directory",
+                            }
+                        ]
+                    },
                 )
         if request.method == "GET" and request.url.path == "/image/niimath":
-            return httpx.Response(200, json={"name": "niimath", "status": "downloaded", "source_kind": "cvmfs"})
+            return httpx.Response(
+                200,
+                json={
+                    "name": "niimath",
+                    "status": "downloaded",
+                    "source_kind": "cvmfs",
+                },
+            )
         if request.method == "GET" and request.url.path == "/vm/status":
             return httpx.Response(200, json={"status": "stopped"})
         if request.method == "POST" and request.url.path == "/kernel/download":
             return httpx.Response(200, json={"status": "downloaded"})
-        if request.method == "POST" and request.url.path == "/image/niimath/qemu/download":
-            return httpx.Response(200, json={"status": "downloaded", "path": "/tmp/qemu", "required": True})
+        if (
+            request.method == "POST"
+            and request.url.path == "/image/niimath/qemu/download"
+        ):
+            return httpx.Response(
+                200,
+                json={"status": "downloaded", "path": "/tmp/qemu", "required": True},
+            )
         if request.method == "POST" and request.url.path == "/image/niimath/metadata":
             return httpx.Response(
                 200,
-                json={"name": "niimath", "status": "prepared", "source_kind": "cvmfs", "architecture": "amd64"},
+                json={
+                    "name": "niimath",
+                    "status": "prepared",
+                    "source_kind": "cvmfs",
+                    "architecture": "amd64",
+                },
             )
         if request.method == "POST" and request.url.path == "/vm":
             return httpx.Response(200, json={"status": "running", "image": "niimath"})
@@ -448,10 +515,25 @@ def test_container_does_not_boot_vm_if_preflight_fails() -> None:
             if payload["path"] == "/containers":
                 return httpx.Response(
                     200,
-                    json={"entries": [{"name": "niimath", "path": "/containers/niimath", "kind": "directory"}]},
+                    json={
+                        "entries": [
+                            {
+                                "name": "niimath",
+                                "path": "/containers/niimath",
+                                "kind": "directory",
+                            }
+                        ]
+                    },
                 )
         if request.method == "GET" and request.url.path == "/image/niimath":
-            return httpx.Response(200, json={"name": "niimath", "status": "downloaded", "source_kind": "cvmfs"})
+            return httpx.Response(
+                200,
+                json={
+                    "name": "niimath",
+                    "status": "downloaded",
+                    "source_kind": "cvmfs",
+                },
+            )
         if request.method == "GET" and request.url.path == "/vm/status":
             return httpx.Response(200, json={"status": "stopped"})
         if request.method == "POST" and request.url.path == "/kernel/download":
@@ -471,12 +553,16 @@ def test_container_does_not_boot_vm_if_preflight_fails() -> None:
 def test_client_http_error_includes_response_body() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST" and request.url.path == "/vm":
-            return httpx.Response(400, text="boot failed: nested virtualization unavailable")
+            return httpx.Response(
+                400, text="boot failed: nested virtualization unavailable"
+            )
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
 
     client = make_client(httpx.MockTransport(handler))
     try:
-        with pytest.raises(httpx.HTTPStatusError, match="nested virtualization unavailable"):
+        with pytest.raises(
+            httpx.HTTPStatusError, match="nested virtualization unavailable"
+        ):
             client.create_instance("niimath")
     finally:
         client.close()
@@ -533,7 +619,15 @@ def test_create_instance_sends_memory_and_cpu_overrides() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         seen["path"] = request.url.path
         seen["json"] = request.read().decode()
-        return httpx.Response(200, json={"status": "running", "image": "niimath", "memory_mb": 4096, "cpus": 2})
+        return httpx.Response(
+            200,
+            json={
+                "status": "running",
+                "image": "niimath",
+                "memory_mb": 4096,
+                "cpus": 2,
+            },
+        )
 
     client = make_client(httpx.MockTransport(handler))
     try:
@@ -542,7 +636,10 @@ def test_create_instance_sends_memory_and_cpu_overrides() -> None:
         client.close()
 
     assert seen["path"] == "/vm"
-    assert seen["json"] == '{"image":"niimath","memory_mb":4096,"cpus":2,"timeout_seconds":5.0}'
+    assert (
+        seen["json"]
+        == '{"image":"niimath","memory_mb":4096,"cpus":2,"timeout_seconds":5.0}'
+    )
     assert result.memory_mb == 4096
     assert result.cpus == 2
 
@@ -562,7 +659,10 @@ def test_create_instance_can_opt_into_network() -> None:
         client.close()
 
     assert seen["path"] == "/vm"
-    assert seen["json"] == '{"image":"niimath","network":{"enabled":true},"timeout_seconds":5.0}'
+    assert (
+        seen["json"]
+        == '{"image":"niimath","network":{"enabled":true},"timeout_seconds":5.0}'
+    )
 
 
 def test_add_port_forward_posts_dynamic_forward() -> None:
@@ -595,7 +695,10 @@ def test_add_port_forward_posts_dynamic_forward() -> None:
 
 
 def test_create_instance_stream_yields_boot_events() -> None:
+    seen: dict[str, object] = {}
+
     def handler(request: httpx.Request) -> httpx.Response:
+        seen["json"] = request.content.decode()
         assert request.url.params.get("stream") == "1"
         return httpx.Response(
             200,
@@ -605,10 +708,16 @@ def test_create_instance_stream_yields_boot_events() -> None:
 
     client = make_client(httpx.MockTransport(handler))
     try:
-        events = list(client.create_instance_stream("niimath", dmesg=True))
+        events = list(
+            client.create_instance_stream("niimath", dmesg=True, memory_mb=8192, cpus=4)
+        )
     finally:
         client.close()
 
+    assert (
+        seen["json"]
+        == '{"image":"niimath","dmesg":true,"memory_mb":8192,"cpus":4,"timeout_seconds":5.0}'
+    )
     assert [event["kind"] for event in events] == ["status", "serial", "ready"]
 
 
@@ -720,7 +829,10 @@ def test_container_lookup_imports_and_runs_notebook_style_api() -> None:
                 )
         if request.method == "POST" and request.url.path == "/cvmfs/read":
             payload = json.loads(body or "{}")
-            if payload["path"] == "/containers/niimath_1.0.20250804_20251016/commands.txt":
+            if (
+                payload["path"]
+                == "/containers/niimath_1.0.20250804_20251016/commands.txt"
+            ):
                 return httpx.Response(
                     200,
                     json={
@@ -747,12 +859,23 @@ def test_container_lookup_imports_and_runs_notebook_style_api() -> None:
             return httpx.Response(200, json={"status": "stopped"})
         if request.method == "POST" and request.url.path == "/kernel/download":
             return httpx.Response(200, json={"status": "downloaded"})
-        if request.method == "POST" and request.url.path == "/image/niimath/qemu/download":
-            return httpx.Response(200, json={"status": "downloaded", "path": "/tmp/qemu", "required": True})
+        if (
+            request.method == "POST"
+            and request.url.path == "/image/niimath/qemu/download"
+        ):
+            return httpx.Response(
+                200,
+                json={"status": "downloaded", "path": "/tmp/qemu", "required": True},
+            )
         if request.method == "POST" and request.url.path == "/image/niimath/metadata":
             return httpx.Response(
                 200,
-                json={"name": "niimath", "status": "prepared", "source_kind": "cvmfs", "architecture": "amd64"},
+                json={
+                    "name": "niimath",
+                    "status": "prepared",
+                    "source_kind": "cvmfs",
+                    "architecture": "amd64",
+                },
             )
         if request.method == "POST" and request.url.path == "/vm":
             return httpx.Response(200, json={"status": "running", "image": "niimath"})
@@ -764,7 +887,9 @@ def test_container_lookup_imports_and_runs_notebook_style_api() -> None:
                     "output": "niimath version 1.0\n",
                 },
             )
-        raise AssertionError(f"unexpected request: {request.method} {request.url.path} {body!r}")
+        raise AssertionError(
+            f"unexpected request: {request.method} {request.url.path} {body!r}"
+        )
 
     client = make_client(httpx.MockTransport(handler))
     try:
@@ -824,13 +949,18 @@ def test_container_run_uses_cvmfs_deploy_env_and_exposes_commands() -> None:
                 )
         if request.method == "POST" and request.url.path == "/cvmfs/read":
             payload = json.loads(body or "{}")
-            if payload["path"] == "/containers/niimath_1.0.20250804_20251016/commands.txt":
+            if (
+                payload["path"]
+                == "/containers/niimath_1.0.20250804_20251016/commands.txt"
+            ):
                 return httpx.Response(
                     200,
                     json={
                         "path": payload["path"],
                         "offset": 0,
-                        "data": base64.b64encode(b"niimath\nbet\nmissing-wrapper\n").decode(),
+                        "data": base64.b64encode(
+                            b"niimath\nbet\nmissing-wrapper\n"
+                        ).decode(),
                         "eof": True,
                     },
                 )
@@ -840,11 +970,16 @@ def test_container_run_uses_cvmfs_deploy_env_and_exposes_commands() -> None:
                     json={
                         "path": payload["path"],
                         "offset": 0,
-                        "data": base64.b64encode(b"DEPLOY_ENV_FSLDIR=BASEPATH/opt/fsl\n").decode(),
+                        "data": base64.b64encode(
+                            b"DEPLOY_ENV_FSLDIR=BASEPATH/opt/fsl\n"
+                        ).decode(),
                         "eof": True,
                     },
                 )
-            if payload["path"] == "/containers/niimath_1.0.20250804_20251016/build.yaml":
+            if (
+                payload["path"]
+                == "/containers/niimath_1.0.20250804_20251016/build.yaml"
+            ):
                 return httpx.Response(
                     200,
                     json={
@@ -855,7 +990,14 @@ def test_container_run_uses_cvmfs_deploy_env_and_exposes_commands() -> None:
                     },
                 )
         if request.method == "GET" and request.url.path == "/image/niimath":
-            return httpx.Response(200, json={"name": "niimath", "status": "downloaded", "source_kind": "cvmfs"})
+            return httpx.Response(
+                200,
+                json={
+                    "name": "niimath",
+                    "status": "downloaded",
+                    "source_kind": "cvmfs",
+                },
+            )
         if request.method == "POST" and request.url.path == "/image/niimath/metadata":
             return httpx.Response(
                 200,
@@ -876,7 +1018,9 @@ def test_container_run_uses_cvmfs_deploy_env_and_exposes_commands() -> None:
                 "FSLDIR=/opt/fsl",
             ]
             return httpx.Response(200, json={"exit_code": 0, "output": "ok\n"})
-        raise AssertionError(f"unexpected request: {request.method} {request.url.path} {body!r}")
+        raise AssertionError(
+            f"unexpected request: {request.method} {request.url.path} {body!r}"
+        )
 
     client = make_client(httpx.MockTransport(handler))
     try:
@@ -899,7 +1043,10 @@ def test_container_run_uses_cvmfs_deploy_env_and_exposes_commands() -> None:
 
 def test_load_deploy_metadata_uses_local_image_env_and_deploy_bins() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "POST" and request.url.path == "/image/fulltest-image/metadata":
+        if (
+            request.method == "POST"
+            and request.url.path == "/image/fulltest-image/metadata"
+        ):
             return httpx.Response(
                 200,
                 json={
@@ -956,7 +1103,9 @@ def test_runtime_deploy_env_skips_internal_deploy_metadata() -> None:
 def test_run_stream_reports_invalid_ndjson_event() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST" and request.url.path == "/vm/run":
-            return httpx.Response(200, content=b'{"kind":"stdout","output":"unterminated\n')
+            return httpx.Response(
+                200, content=b'{"kind":"stdout","output":"unterminated\n'
+            )
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
 
     client = make_client(httpx.MockTransport(handler))
@@ -985,7 +1134,9 @@ deploy:
 
 def test_load_deploy_metadata_merges_cvmfs_build_yaml_deploy_metadata() -> None:
     read_payloads = {
-        "/containers/tool/env.txt": base64.b64encode(b"DEPLOY_ENV_CUSTOM=ok\n").decode(),
+        "/containers/tool/env.txt": base64.b64encode(
+            b"DEPLOY_ENV_CUSTOM=ok\n"
+        ).decode(),
         "/containers/tool/build.yaml": base64.b64encode(
             b"""
 name: tool
@@ -1024,7 +1175,10 @@ deploy:
         if request.method == "POST" and request.url.path == "/cvmfs/read":
             payload = json.loads(request.read())
             data = read_payloads.get(payload["path"], "")
-            return httpx.Response(200, json={"path": payload["path"], "offset": 0, "data": data, "eof": True})
+            return httpx.Response(
+                200,
+                json={"path": payload["path"], "offset": 0, "data": data, "eof": True},
+            )
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
 
     client = make_client(httpx.MockTransport(handler))
@@ -1079,12 +1233,23 @@ def test_container_lookup_accepts_versioned_root_simg() -> None:
             return httpx.Response(200, json={"status": "stopped"})
         if request.method == "POST" and request.url.path == "/kernel/download":
             return httpx.Response(200, json={"status": "downloaded"})
-        if request.method == "POST" and request.url.path == "/image/niimath/qemu/download":
-            return httpx.Response(200, json={"status": "downloaded", "path": "/tmp/qemu", "required": True})
+        if (
+            request.method == "POST"
+            and request.url.path == "/image/niimath/qemu/download"
+        ):
+            return httpx.Response(
+                200,
+                json={"status": "downloaded", "path": "/tmp/qemu", "required": True},
+            )
         if request.method == "POST" and request.url.path == "/image/niimath/metadata":
             return httpx.Response(
                 200,
-                json={"name": "niimath", "status": "prepared", "source_kind": "cvmfs", "architecture": "amd64"},
+                json={
+                    "name": "niimath",
+                    "status": "prepared",
+                    "source_kind": "cvmfs",
+                    "architecture": "amd64",
+                },
             )
         if request.method == "POST" and request.url.path == "/vm":
             return httpx.Response(200, json={"status": "running", "image": "niimath"})
@@ -1112,15 +1277,32 @@ def test_container_switches_running_vm_to_requested_image() -> None:
             if payload["path"] == "/containers":
                 return httpx.Response(
                     200,
-                    json={"entries": [{"name": "niimath", "path": "/containers/niimath", "kind": "directory"}]},
+                    json={
+                        "entries": [
+                            {
+                                "name": "niimath",
+                                "path": "/containers/niimath",
+                                "kind": "directory",
+                            }
+                        ]
+                    },
                 )
             if payload["path"] == "/containers/niimath":
                 return httpx.Response(200, json={"entries": []})
         if request.method == "GET" and request.url.path == "/image/niimath":
-            return httpx.Response(200, json={"name": "niimath", "status": "downloaded", "source_kind": "cvmfs"})
+            return httpx.Response(
+                200,
+                json={
+                    "name": "niimath",
+                    "status": "downloaded",
+                    "source_kind": "cvmfs",
+                },
+            )
         if request.method == "GET" and request.url.path == "/vm/status":
             return httpx.Response(200, json={"status": "running", "image": "other"})
-        raise AssertionError(f"unexpected request: {request.method} {request.url.path} {body!r}")
+        raise AssertionError(
+            f"unexpected request: {request.method} {request.url.path} {body!r}"
+        )
 
     client = make_client(httpx.MockTransport(handler))
     try:
@@ -1143,9 +1325,18 @@ def test_resolve_base_url_reads_daemon_state(monkeypatch, tmp_path: Path) -> Non
     monkeypatch.delenv("CCVM_URL", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     calls: list[tuple[str, str]] = []
-    monkeypatch.setattr("pyneurodesk.api._health_check", lambda base_url: base_url == "http://127.0.0.1:4567")
-    monkeypatch.setattr("pyneurodesk.api._supports_vm_start", lambda base_url: calls.append(("supports", base_url)) or True)
-    monkeypatch.setattr("pyneurodesk.api._ensure_daemon_watchdog", lambda base_url: calls.append(("watchdog", base_url)))
+    monkeypatch.setattr(
+        "pyneurodesk.api._health_check",
+        lambda base_url: base_url == "http://127.0.0.1:4567",
+    )
+    monkeypatch.setattr(
+        "pyneurodesk.api._supports_vm_start",
+        lambda base_url: calls.append(("supports", base_url)) or True,
+    )
+    monkeypatch.setattr(
+        "pyneurodesk.api._ensure_daemon_watchdog",
+        lambda base_url: calls.append(("watchdog", base_url)),
+    )
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / ".cache"))
     state_path = default_daemon_state_path()
     state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1161,7 +1352,9 @@ def test_resolve_base_url_reads_daemon_state(monkeypatch, tmp_path: Path) -> Non
 def test_resolve_base_url_starts_daemon_when_state_missing(monkeypatch) -> None:
     monkeypatch.delenv("CCX3_URL", raising=False)
     monkeypatch.delenv("CCVM_URL", raising=False)
-    monkeypatch.setattr("pyneurodesk.api.default_daemon_state_path", lambda: Path("/tmp/does-not-exist"))
+    monkeypatch.setattr(
+        "pyneurodesk.api.default_daemon_state_path", lambda: Path("/tmp/does-not-exist")
+    )
     monkeypatch.setattr(
         "pyneurodesk.api.start_default_daemon",
         lambda: SimpleNamespace(base_url="http://127.0.0.1:9999"),
@@ -1200,8 +1393,14 @@ def test_start_default_daemon_writes_state(monkeypatch, tmp_path: Path) -> None:
 
     monkeypatch.setattr("pyneurodesk.api.default_cache_root", lambda: cache_root)
     monkeypatch.setattr("pyneurodesk.api.resolve_ccvm_binary_path", lambda: ccvm_path)
-    monkeypatch.setattr("pyneurodesk.api._health_check", lambda base_url: base_url == "http://127.0.0.1:3456")
-    monkeypatch.setattr("pyneurodesk.api._ensure_daemon_watchdog", lambda base_url: seen.setdefault("watchdog", base_url))
+    monkeypatch.setattr(
+        "pyneurodesk.api._health_check",
+        lambda base_url: base_url == "http://127.0.0.1:3456",
+    )
+    monkeypatch.setattr(
+        "pyneurodesk.api._ensure_daemon_watchdog",
+        lambda base_url: seen.setdefault("watchdog", base_url),
+    )
     monkeypatch.setattr("pyneurodesk.api.subprocess.Popen", fake_popen)
 
     state = start_default_daemon()
@@ -1214,7 +1413,57 @@ def test_start_default_daemon_writes_state(monkeypatch, tmp_path: Path) -> None:
     assert (cache_root / "ccvm.json").read_text() == '{\n  "addr": "127.0.0.1:3456"\n}'
 
 
-def test_start_default_daemon_reports_structured_startup_error(monkeypatch, tmp_path: Path) -> None:
+def test_start_default_daemon_skips_startup_noise(monkeypatch, tmp_path: Path) -> None:
+    cache_root = tmp_path / "cache"
+    ccvm_path = tmp_path / "bin" / "ccvm"
+    ccvm_path.parent.mkdir(parents=True)
+    ccvm_path.write_text("")
+
+    class FakeStdout:
+        def __init__(self) -> None:
+            self.lines = iter(
+                [
+                    f"{ccvm_path}: replacing existing signature\n",
+                    '{"addr":"127.0.0.1:3456"}\n',
+                ]
+            )
+
+        def readline(self) -> str:
+            return next(self.lines, "")
+
+    class FakeProc:
+        stdout = FakeStdout()
+
+        def kill(self) -> None:
+            return None
+
+        def wait(self) -> int:
+            return 0
+
+    monkeypatch.setattr("pyneurodesk.api.resolve_ccvm_binary_path", lambda: ccvm_path)
+    monkeypatch.setattr(
+        "pyneurodesk.api._health_check",
+        lambda base_url: base_url == "http://127.0.0.1:3456",
+    )
+    monkeypatch.setattr(
+        "pyneurodesk.api._ensure_daemon_watchdog",
+        lambda base_url: None,
+    )
+    monkeypatch.setattr(
+        "pyneurodesk.api.subprocess.Popen", lambda *args, **kwargs: FakeProc()
+    )
+
+    state = api.start_daemon_for_cache_dir(cache_root)
+
+    assert state.base_url == "http://127.0.0.1:3456"
+    assert "replacing existing signature" in (
+        cache_root / "ccvm-python.log"
+    ).read_text()
+
+
+def test_start_default_daemon_reports_structured_startup_error(
+    monkeypatch, tmp_path: Path
+) -> None:
     cache_root = tmp_path / "cache"
     ccvm_path = tmp_path / "bin" / "ccvm"
     ccvm_path.parent.mkdir(parents=True)
@@ -1234,7 +1483,9 @@ def test_start_default_daemon_reports_structured_startup_error(monkeypatch, tmp_
             return 1
 
     monkeypatch.setattr("pyneurodesk.api.resolve_ccvm_binary_path", lambda: ccvm_path)
-    monkeypatch.setattr("pyneurodesk.api.subprocess.Popen", lambda *args, **kwargs: FakeProc())
+    monkeypatch.setattr(
+        "pyneurodesk.api.subprocess.Popen", lambda *args, **kwargs: FakeProc()
+    )
 
     with pytest.raises(RuntimeError) as excinfo:
         api.start_daemon_for_cache_dir(cache_root)
@@ -1245,16 +1496,27 @@ def test_start_default_daemon_reports_structured_startup_error(monkeypatch, tmp_
     assert f"See daemon log at {cache_root / 'ccvm-python.log'}" in message
 
 
-def test_start_default_daemon_feeds_watchdog_for_existing_daemon(monkeypatch, tmp_path: Path) -> None:
+def test_start_default_daemon_feeds_watchdog_for_existing_daemon(
+    monkeypatch, tmp_path: Path
+) -> None:
     cache_root = tmp_path / "cache"
     cache_root.mkdir(parents=True)
     (cache_root / "ccvm.json").write_text('{"addr":"127.0.0.1:3456"}')
     calls: list[tuple[str, object]] = []
 
     monkeypatch.setattr("pyneurodesk.api.default_cache_root", lambda: cache_root)
-    monkeypatch.setattr("pyneurodesk.api._health_check", lambda base_url: calls.append(("health", base_url)) or True)
-    monkeypatch.setattr("pyneurodesk.api._supports_vm_start", lambda base_url: calls.append(("supports", base_url)) or True)
-    monkeypatch.setattr("pyneurodesk.api._ensure_daemon_watchdog", lambda base_url: calls.append(("watchdog", base_url)))
+    monkeypatch.setattr(
+        "pyneurodesk.api._health_check",
+        lambda base_url: calls.append(("health", base_url)) or True,
+    )
+    monkeypatch.setattr(
+        "pyneurodesk.api._supports_vm_start",
+        lambda base_url: calls.append(("supports", base_url)) or True,
+    )
+    monkeypatch.setattr(
+        "pyneurodesk.api._ensure_daemon_watchdog",
+        lambda base_url: calls.append(("watchdog", base_url)),
+    )
 
     state = start_default_daemon()
 
@@ -1266,19 +1528,33 @@ def test_start_default_daemon_feeds_watchdog_for_existing_daemon(monkeypatch, tm
     ]
 
 
-def test_start_default_daemon_restarts_incompatible_running_daemon(monkeypatch, tmp_path: Path) -> None:
+def test_start_default_daemon_restarts_incompatible_running_daemon(
+    monkeypatch, tmp_path: Path
+) -> None:
     cache_root = tmp_path / "cache"
     cache_root.mkdir(parents=True)
     (cache_root / "ccvm.json").write_text('{"addr":"127.0.0.1:3456"}')
     calls: list[tuple[str, object]] = []
 
     monkeypatch.setattr("pyneurodesk.api.default_cache_root", lambda: cache_root)
-    monkeypatch.setattr("pyneurodesk.api._health_check", lambda base_url: calls.append(("health", base_url)) or True)
-    monkeypatch.setattr("pyneurodesk.api._supports_vm_start", lambda base_url: calls.append(("supports", base_url)) or False)
-    monkeypatch.setattr("pyneurodesk.api._shutdown_daemon_server", lambda base_url: calls.append(("shutdown", base_url)))
+    monkeypatch.setattr(
+        "pyneurodesk.api._health_check",
+        lambda base_url: calls.append(("health", base_url)) or True,
+    )
+    monkeypatch.setattr(
+        "pyneurodesk.api._supports_vm_start",
+        lambda base_url: calls.append(("supports", base_url)) or False,
+    )
+    monkeypatch.setattr(
+        "pyneurodesk.api._shutdown_daemon_server",
+        lambda base_url: calls.append(("shutdown", base_url)),
+    )
     monkeypatch.setattr(
         "pyneurodesk.api.start_daemon_for_cache_dir",
-        lambda root: calls.append(("restart", root)) or DaemonState(addr="127.0.0.1:4567", cache_dir=str(root)),
+        lambda root: (
+            calls.append(("restart", root))
+            or DaemonState(addr="127.0.0.1:4567", cache_dir=str(root))
+        ),
     )
 
     state = start_default_daemon()
@@ -1292,14 +1568,18 @@ def test_start_default_daemon_restarts_incompatible_running_daemon(monkeypatch, 
     ]
 
 
-def test_resolve_ccvm_binary_path_prefers_packaged_binary(monkeypatch, tmp_path: Path) -> None:
+def test_resolve_ccvm_binary_path_prefers_packaged_binary(
+    monkeypatch, tmp_path: Path
+) -> None:
     binary = tmp_path / "site-packages" / "pyneurodesk" / "bin" / "ccvm"
     binary.parent.mkdir(parents=True)
     binary.write_text("")
 
     monkeypatch.setattr("pyneurodesk.api.bundled_ccvm_path", lambda: binary)
     calls: list[Path] = []
-    monkeypatch.setattr("pyneurodesk.api.maybe_refresh_bundled_ccvm", lambda path: calls.append(path))
+    monkeypatch.setattr(
+        "pyneurodesk.api.maybe_refresh_bundled_ccvm", lambda path: calls.append(path)
+    )
     monkeypatch.delenv("PYNEURODESK_CCVM", raising=False)
     monkeypatch.delenv("CCX3_CCVM", raising=False)
     monkeypatch.delenv("CCVM_BINARY", raising=False)
@@ -1308,7 +1588,9 @@ def test_resolve_ccvm_binary_path_prefers_packaged_binary(monkeypatch, tmp_path:
     assert calls == [binary]
 
 
-def test_resolve_ccvm_binary_path_prefers_documented_env_var(monkeypatch, tmp_path: Path) -> None:
+def test_resolve_ccvm_binary_path_prefers_documented_env_var(
+    monkeypatch, tmp_path: Path
+) -> None:
     binary = tmp_path / "ccvm"
     binary.write_text("")
 
@@ -1317,7 +1599,9 @@ def test_resolve_ccvm_binary_path_prefers_documented_env_var(monkeypatch, tmp_pa
     assert resolve_ccvm_binary_path() == binary
 
 
-def test_resolve_ccvm_binary_path_falls_back_to_project_binary(monkeypatch, tmp_path: Path) -> None:
+def test_resolve_ccvm_binary_path_falls_back_to_project_binary(
+    monkeypatch, tmp_path: Path
+) -> None:
     bundle_root = tmp_path / "pyneurodesk"
     binary = bundle_root / "bin" / "ccvm"
     binary.parent.mkdir(parents=True)
@@ -1332,7 +1616,9 @@ def test_resolve_ccvm_binary_path_falls_back_to_project_binary(monkeypatch, tmp_
     assert resolve_ccvm_binary_path() == binary
 
 
-def test_resolve_ccvm_binary_path_rebuilds_stale_bundled_binary(monkeypatch, tmp_path: Path) -> None:
+def test_resolve_ccvm_binary_path_rebuilds_stale_bundled_binary(
+    monkeypatch, tmp_path: Path
+) -> None:
     bundle_root = tmp_path / "local" / "pyneurodesk"
     binary = bundle_root / "bin" / "ccvm"
     binary.parent.mkdir(parents=True)
@@ -1342,7 +1628,9 @@ def test_resolve_ccvm_binary_path_rebuilds_stale_bundled_binary(monkeypatch, tmp
 
     monkeypatch.setattr("pyneurodesk.api.bundled_ccvm_path", lambda: None)
     monkeypatch.setattr("pyneurodesk.api.pyneurodesk_root", lambda: bundle_root)
-    monkeypatch.setattr("pyneurodesk.api.maybe_refresh_bundled_ccvm", lambda path: calls.append(path))
+    monkeypatch.setattr(
+        "pyneurodesk.api.maybe_refresh_bundled_ccvm", lambda path: calls.append(path)
+    )
     monkeypatch.delenv("PYNEURODESK_CCVM", raising=False)
     monkeypatch.delenv("CCX3_CCVM", raising=False)
     monkeypatch.delenv("CCVM_BINARY", raising=False)
@@ -1351,8 +1639,41 @@ def test_resolve_ccvm_binary_path_rebuilds_stale_bundled_binary(monkeypatch, tmp
     assert calls == [binary]
 
 
+def test_sign_ccvm_binary_on_darwin_uses_entitlements(monkeypatch, tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    binary = tmp_path / "ccvm"
+    entitlements = root / "tools" / "entitlements.xml"
+    entitlements.parent.mkdir(parents=True)
+    entitlements.write_text("<plist/>")
+    binary.write_text("")
+    calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: object) -> object:
+        calls.append(args)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(api.sys, "platform", "darwin")
+    monkeypatch.setattr(api.subprocess, "run", fake_run)
+
+    api._sign_ccvm_binary_if_needed(binary, root)
+
+    assert calls == [
+        [
+            "codesign",
+            "-f",
+            "-s",
+            "-",
+            "--entitlements",
+            str(entitlements),
+            str(binary),
+        ]
+    ]
+
+
 def test_create_container_cache_dir_is_isolated(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr("pyneurodesk.api.default_cache_root", lambda: tmp_path / "cache")
+    monkeypatch.setattr(
+        "pyneurodesk.api.default_cache_root", lambda: tmp_path / "cache"
+    )
 
     one = create_container_cache_dir()
     two = create_container_cache_dir()
@@ -1402,7 +1723,9 @@ def test_container_starts_shared_daemon_and_boots_image(monkeypatch) -> None:
         def cvmfs_read(self, request: object) -> object:
             calls.append(("cvmfs_read", request.path))
             if request.path.endswith("/commands.txt"):
-                return SimpleNamespace(data=base64.b64encode(b"niimath\n").decode().encode())
+                return SimpleNamespace(
+                    data=base64.b64encode(b"niimath\n").decode().encode()
+                )
             raise AssertionError(request.path)
 
         def get_image(self, image: str) -> Optional[object]:
@@ -1447,7 +1770,10 @@ def test_container_starts_shared_daemon_and_boots_image(monkeypatch) -> None:
                     (
                         image,
                         tuple(command),
-                        tuple((share.source, share.mount, share.writable) for share in shares),
+                        tuple(
+                            (share.source, share.mount, share.writable)
+                            for share in shares
+                        ),
                         tuple(env),
                     ),
                 )
@@ -1457,7 +1783,9 @@ def test_container_starts_shared_daemon_and_boots_image(monkeypatch) -> None:
         def close(self) -> None:
             calls.append(("close_client", None))
 
-    monkeypatch.setattr("pyneurodesk.api.start_default_daemon", fake_start_default_daemon)
+    monkeypatch.setattr(
+        "pyneurodesk.api.start_default_daemon", fake_start_default_daemon
+    )
     monkeypatch.setattr("pyneurodesk.api.PyNeurodeskClient", FakeClient)
 
     container = nd.container("niimath")
@@ -1484,7 +1812,9 @@ def test_container_starts_shared_daemon_and_boots_image(monkeypatch) -> None:
     assert container.owns_daemon is False
 
 
-def test_share_dir_arguments_are_translated_into_guest_paths(monkeypatch, tmp_path: Path) -> None:
+def test_share_dir_arguments_are_translated_into_guest_paths(
+    monkeypatch, tmp_path: Path
+) -> None:
     daemon = DaemonState(addr="127.0.0.1:4001", cache_dir="/tmp/daemon-a")
     calls: list[tuple[str, object]] = []
 
@@ -1507,8 +1837,8 @@ def test_share_dir_arguments_are_translated_into_guest_paths(monkeypatch, tmp_pa
                             path="/containers/niimath_1.0.20250804_20251016",
                             kind="directory",
                         )
-                        ]
-                    )
+                    ]
+                )
             if payload["path"] == "/containers/niimath_1.0.20250804_20251016":
                 return SimpleNamespace(
                     entries=[
@@ -1520,7 +1850,9 @@ def test_share_dir_arguments_are_translated_into_guest_paths(monkeypatch, tmp_pa
 
         def cvmfs_read(self, request: object) -> object:
             if request.path.endswith("/commands.txt"):
-                return SimpleNamespace(data=base64.b64encode(b"niimath\n").decode().encode())
+                return SimpleNamespace(
+                    data=base64.b64encode(b"niimath\n").decode().encode()
+                )
             raise AssertionError(request.path)
 
         def get_image(self, image: str) -> Optional[object]:
@@ -1549,7 +1881,10 @@ def test_share_dir_arguments_are_translated_into_guest_paths(monkeypatch, tmp_pa
                     {
                         "image": image,
                         "command": tuple(command),
-                        "shares": tuple((share.source, share.mount, share.writable) for share in shares),
+                        "shares": tuple(
+                            (share.source, share.mount, share.writable)
+                            for share in shares
+                        ),
                         "env": tuple(env),
                     },
                 )
@@ -1562,7 +1897,9 @@ def test_share_dir_arguments_are_translated_into_guest_paths(monkeypatch, tmp_pa
         def close(self) -> None:
             return None
 
-    monkeypatch.setattr("pyneurodesk.api.start_default_daemon", fake_start_default_daemon)
+    monkeypatch.setattr(
+        "pyneurodesk.api.start_default_daemon", fake_start_default_daemon
+    )
     monkeypatch.setattr("pyneurodesk.api.PyNeurodeskClient", FakeClient)
 
     share_root = tmp_path / "share"
@@ -1581,10 +1918,14 @@ def test_share_dir_arguments_are_translated_into_guest_paths(monkeypatch, tmp_pa
     assert run_call["command"][0] == "cat"
     assert run_call["command"][1].endswith("/hello.txt")
     assert run_call["command"][1].startswith("/.share/")
-    assert run_call["shares"] == ((str(share_root), run_call["command"][1].rsplit("/", 1)[0], False),)
+    assert run_call["shares"] == (
+        (str(share_root), run_call["command"][1].rsplit("/", 1)[0], False),
+    )
 
 
-def test_owned_container_recovers_when_daemon_connection_is_refused(monkeypatch) -> None:
+def test_owned_container_recovers_when_daemon_connection_is_refused(
+    monkeypatch,
+) -> None:
     daemon_a = DaemonState(addr="127.0.0.1:4001", cache_dir="/tmp/daemon-a")
     daemon_b = DaemonState(addr="127.0.0.1:4002", cache_dir="/tmp/daemon-a")
     calls: list[tuple[str, object]] = []
@@ -1673,11 +2014,26 @@ def test_container_resolution_prefers_direct_directory_probe() -> None:
             if payload["path"] == "/containers":
                 return httpx.Response(
                     200,
-                    json={"entries": [{"name": "niimath", "path": "/containers/niimath", "kind": "directory"}]},
+                    json={
+                        "entries": [
+                            {
+                                "name": "niimath",
+                                "path": "/containers/niimath",
+                                "kind": "directory",
+                            }
+                        ]
+                    },
                 )
             raise AssertionError(f"unexpected CVMFS path probe: {payload['path']}")
         if request.method == "GET" and request.url.path == "/image/niimath":
-            return httpx.Response(200, json={"name": "niimath", "status": "downloaded", "source_kind": "cvmfs"})
+            return httpx.Response(
+                200,
+                json={
+                    "name": "niimath",
+                    "status": "downloaded",
+                    "source_kind": "cvmfs",
+                },
+            )
         if request.method == "GET" and request.url.path == "/vm/status":
             return httpx.Response(200, json={"status": "running", "image": "niimath"})
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
@@ -1722,7 +2078,14 @@ def test_container_resolution_prefers_latest_version_from_search() -> None:
                 )
             raise AssertionError(f"unexpected CVMFS path probe: {payload['path']}")
         if request.method == "GET" and request.url.path == "/image/niimath":
-            return httpx.Response(200, json={"name": "niimath", "status": "downloaded", "source_kind": "cvmfs"})
+            return httpx.Response(
+                200,
+                json={
+                    "name": "niimath",
+                    "status": "downloaded",
+                    "source_kind": "cvmfs",
+                },
+            )
         if request.method == "GET" and request.url.path == "/vm/status":
             return httpx.Response(200, json={"status": "running", "image": "niimath"})
         raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
@@ -1743,7 +2106,9 @@ def test_search_returns_versions_for_container_name() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = request.read().decode() or "{}"
         if request.method != "POST" or request.url.path != "/cvmfs/list":
-            raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+            raise AssertionError(
+                f"unexpected request: {request.method} {request.url.path}"
+            )
         payload = json.loads(body)
         seen_paths.append(payload["path"])
         if payload["path"] == "/containers/niimath":
@@ -1763,7 +2128,11 @@ def test_search_returns_versions_for_container_name() -> None:
                             "path": "/containers/niimath_1.0.20250804_20251016",
                             "kind": "directory",
                         },
-                        {"name": "othertool_9.9.9_20250101", "path": "/containers/othertool_9.9.9_20250101", "kind": "directory"},
+                        {
+                            "name": "othertool_9.9.9_20250101",
+                            "path": "/containers/othertool_9.9.9_20250101",
+                            "kind": "directory",
+                        },
                     ]
                 },
             )
@@ -1784,7 +2153,9 @@ def test_search_handles_missing_direct_directory() -> None:
         body = request.read().decode() or "{}"
         payload = json.loads(body)
         if request.method != "POST" or request.url.path != "/cvmfs/list":
-            raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+            raise AssertionError(
+                f"unexpected request: {request.method} {request.url.path}"
+            )
         if payload["path"] == "/containers/niimath":
             return httpx.Response(404, json={"error": "not found"})
         if payload["path"] == "/containers":
@@ -1811,7 +2182,9 @@ def test_search_handles_missing_direct_directory() -> None:
     assert versions == ["1.0.20250804_20251016"]
 
 
-def test_container_debug_boot_prints_live_stream_and_error(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+def test_container_debug_boot_prints_live_stream_and_error(
+    monkeypatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = request.read().decode() or "{}"
         if request.method == "POST" and request.url.path == "/cvmfs/list":
@@ -1821,20 +2194,46 @@ def test_container_debug_boot_prints_live_stream_and_error(monkeypatch, capsys: 
             if payload["path"] == "/containers":
                 return httpx.Response(
                     200,
-                    json={"entries": [{"name": "niimath", "path": "/containers/niimath", "kind": "directory"}]},
+                    json={
+                        "entries": [
+                            {
+                                "name": "niimath",
+                                "path": "/containers/niimath",
+                                "kind": "directory",
+                            }
+                        ]
+                    },
                 )
         if request.method == "GET" and request.url.path == "/image/niimath":
-            return httpx.Response(200, json={"name": "niimath", "status": "downloaded", "source_kind": "cvmfs"})
+            return httpx.Response(
+                200,
+                json={
+                    "name": "niimath",
+                    "status": "downloaded",
+                    "source_kind": "cvmfs",
+                },
+            )
         if request.method == "GET" and request.url.path == "/vm/status":
             return httpx.Response(200, json={"status": "stopped"})
         if request.method == "POST" and request.url.path == "/kernel/download":
             return httpx.Response(200, json={"status": "downloaded"})
-        if request.method == "POST" and request.url.path == "/image/niimath/qemu/download":
-            return httpx.Response(200, json={"status": "downloaded", "path": "/tmp/qemu", "required": True})
+        if (
+            request.method == "POST"
+            and request.url.path == "/image/niimath/qemu/download"
+        ):
+            return httpx.Response(
+                200,
+                json={"status": "downloaded", "path": "/tmp/qemu", "required": True},
+            )
         if request.method == "POST" and request.url.path == "/image/niimath/metadata":
             return httpx.Response(
                 200,
-                json={"name": "niimath", "status": "prepared", "source_kind": "cvmfs", "architecture": "amd64"},
+                json={
+                    "name": "niimath",
+                    "status": "prepared",
+                    "source_kind": "cvmfs",
+                    "architecture": "amd64",
+                },
             )
         if request.method == "POST" and request.url.path == "/vm":
             payload = json.loads(body)
@@ -1908,9 +2307,10 @@ def test_import_image_stream_parses_progress_events() -> None:
             content=(
                 b'{"status":"indexing","artifact":"niimath","blob":"abc123"}\n'
                 b'{"status":"downloading","artifact":"niimath","blob":"rootfs.contents","bytes_downloaded":1024,'
-                b'"bytes_total":4096,"rate_bytes_per_second":512,"eta_seconds":6}\n'
+                b'"bytes_total":4096,"files_downloaded":2,"files_total":8,'
+                b'"rate_bytes_per_second":512,"eta_seconds":6}\n'
                 b'{"status":"downloaded","artifact":"niimath","blob":"rootfs.contents","bytes_downloaded":4096,'
-                b'"bytes_total":4096,"progress":1}\n'
+                b'"bytes_total":4096,"files_downloaded":8,"files_total":8,"progress":1}\n'
             ),
         )
 
@@ -1931,9 +2331,15 @@ def test_import_image_stream_parses_progress_events() -> None:
     finally:
         client.close()
 
-    assert [event.status for event in events] == ["indexing", "downloading", "downloaded"]
+    assert [event.status for event in events] == [
+        "indexing",
+        "downloading",
+        "downloaded",
+    ]
     assert events[0].blob == "abc123"
     assert events[1].bytes_downloaded == 1024
+    assert events[1].files_downloaded == 2
+    assert events[1].files_total == 8
     assert events[1].eta_seconds == 6
     assert events[2].progress == 1
 
@@ -1954,7 +2360,9 @@ def test_stream_progress_reporter_redraws_on_single_terminal_line() -> None:
     assert output.endswith("\r\033[2KReady\n")
 
 
-def test_container_progress_reports_required_downloads(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+def test_container_progress_reports_required_downloads(
+    monkeypatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     daemon = DaemonState(addr="127.0.0.1:4001", cache_dir="/tmp/daemon-a")
 
     def fake_start_default_daemon() -> DaemonState:
@@ -1993,7 +2401,9 @@ def test_container_progress_reports_required_downloads(monkeypatch, capsys: pyte
             return SimpleNamespace(status="downloaded", source="/cache/vmlinuz")
 
         def prepare_image_emulator(self, image: str) -> object:
-            return SimpleNamespace(status="downloaded", path="/tmp/qemu-system-x86_64", required=True)
+            return SimpleNamespace(
+                status="downloaded", path="/tmp/qemu-system-x86_64", required=True
+            )
 
         def prepare_image_metadata(self, image: str) -> object:
             return SimpleNamespace(status="prepared", architecture="amd64")
@@ -2008,7 +2418,9 @@ def test_container_progress_reports_required_downloads(monkeypatch, capsys: pyte
             return None
 
     monkeypatch.setattr("pyneurodesk.api._supports_notebook_display", lambda: False)
-    monkeypatch.setattr("pyneurodesk.api.start_default_daemon", fake_start_default_daemon)
+    monkeypatch.setattr(
+        "pyneurodesk.api.start_default_daemon", fake_start_default_daemon
+    )
     monkeypatch.setattr("pyneurodesk.api.PyNeurodeskClient", FakeClient)
 
     container = nd.container("niimath")
@@ -2021,7 +2433,9 @@ def test_container_progress_reports_required_downloads(monkeypatch, capsys: pyte
     assert "Downloaded required file 2/2: qemu-system-x86_64" in captured.out
 
 
-def test_container_uses_streaming_image_import(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+def test_container_uses_streaming_image_import(
+    monkeypatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     daemon = DaemonState(addr="127.0.0.1:4001", cache_dir="/tmp/daemon-a")
     calls: list[tuple[str, object]] = []
 
@@ -2073,7 +2487,9 @@ def test_container_uses_streaming_image_import(monkeypatch, capsys: pytest.Captu
             )
 
         def import_image(self, image: str, request: object) -> object:
-            raise AssertionError("blocking import_image should not be used when streaming is available")
+            raise AssertionError(
+                "blocking import_image should not be used when streaming is available"
+            )
 
         def instance_status(self) -> object:
             return SimpleNamespace(status="stopped", image=None)
@@ -2082,7 +2498,9 @@ def test_container_uses_streaming_image_import(monkeypatch, capsys: pytest.Captu
             return SimpleNamespace(status="downloaded", source="/cache/vmlinuz")
 
         def prepare_image_emulator(self, image: str) -> object:
-            return SimpleNamespace(status="downloaded", path="/tmp/qemu-system-x86_64", required=True)
+            return SimpleNamespace(
+                status="downloaded", path="/tmp/qemu-system-x86_64", required=True
+            )
 
         def prepare_image_metadata(self, image: str) -> object:
             return SimpleNamespace(status="prepared", architecture="amd64")
@@ -2094,7 +2512,9 @@ def test_container_uses_streaming_image_import(monkeypatch, capsys: pytest.Captu
             return None
 
     monkeypatch.setattr("pyneurodesk.api._supports_notebook_display", lambda: False)
-    monkeypatch.setattr("pyneurodesk.api.start_default_daemon", fake_start_default_daemon)
+    monkeypatch.setattr(
+        "pyneurodesk.api.start_default_daemon", fake_start_default_daemon
+    )
     monkeypatch.setattr("pyneurodesk.api.PyNeurodeskClient", FakeClient)
 
     container = nd.container("niimath")
@@ -2106,7 +2526,9 @@ def test_container_uses_streaming_image_import(monkeypatch, capsys: pytest.Captu
     assert "Imported niimath | rootfs.index.json | 2.0 KB/2.0 KB" in captured.out
 
 
-def test_container_progress_reports_rate_and_eta_from_stream(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+def test_container_progress_reports_rate_and_eta_from_stream(
+    monkeypatch, capsys: pytest.CaptureFixture[str]
+) -> None:
     daemon = DaemonState(addr="127.0.0.1:4001", cache_dir="/tmp/daemon-a")
 
     def fake_start_default_daemon() -> DaemonState:
@@ -2190,7 +2612,9 @@ def test_container_progress_reports_rate_and_eta_from_stream(monkeypatch, capsys
             return None
 
     monkeypatch.setattr("pyneurodesk.api._supports_notebook_display", lambda: False)
-    monkeypatch.setattr("pyneurodesk.api.start_default_daemon", fake_start_default_daemon)
+    monkeypatch.setattr(
+        "pyneurodesk.api.start_default_daemon", fake_start_default_daemon
+    )
     monkeypatch.setattr("pyneurodesk.api.PyNeurodeskClient", FakeClient)
 
     container = nd.container("niimath")
@@ -2221,7 +2645,9 @@ def test_search_uses_local_release_metadata(monkeypatch, tmp_path: Path) -> None
     (releases_dir / "niimath" / "1.0.20250804.json").write_text(
         '{"apps":{"niimath 1.0.20250804":{"version":"20251016","exec":""}}}'
     )
-    monkeypatch.setattr("pyneurodesk.api.resolve_release_index_dir", lambda: releases_dir)
+    monkeypatch.setattr(
+        "pyneurodesk.api.resolve_release_index_dir", lambda: releases_dir
+    )
 
     assert nd.search("niimath") == ["1.0.0", "1.0.20250804"]
 
@@ -2229,51 +2655,88 @@ def test_search_uses_local_release_metadata(monkeypatch, tmp_path: Path) -> None
 def test_search_uses_remote_release_metadata(monkeypatch) -> None:
     monkeypatch.setattr(
         "pyneurodesk.api._search_remote_release_versions",
-        lambda name: {"1.0.0": "20250617", "1.0.20250804": "20251016"} if name == "niimath" else {},
+        lambda name: (
+            {"1.0.0": "20250617", "1.0.20250804": "20251016"}
+            if name == "niimath"
+            else {}
+        ),
     )
 
     assert nd.search("niimath") == ["1.0.0", "1.0.20250804"]
 
 
 def test_remote_release_search_uses_fresh_cache(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr("pyneurodesk.api.default_cache_root", lambda: tmp_path / "cache")
-    monkeypatch.setattr("pyneurodesk.api.resolve_release_cache_ttl_seconds", lambda: 60.0)
-    monkeypatch.setattr("pyneurodesk.api.fetch_remote_release_versions", lambda api_base, name: pytest.fail("network used"))
-    api.write_remote_release_cache("https://api.example/releases", "niimath", {"1.0.0": "20250617"})
+    monkeypatch.setattr(
+        "pyneurodesk.api.default_cache_root", lambda: tmp_path / "cache"
+    )
+    monkeypatch.setattr(
+        "pyneurodesk.api.resolve_release_cache_ttl_seconds", lambda: 60.0
+    )
+    monkeypatch.setattr(
+        "pyneurodesk.api.fetch_remote_release_versions",
+        lambda api_base, name: pytest.fail("network used"),
+    )
+    api.write_remote_release_cache(
+        "https://api.example/releases", "niimath", {"1.0.0": "20250617"}
+    )
 
-    assert api.search_remote_release_versions("https://api.example/releases", "niimath") == {"1.0.0": "20250617"}
+    assert api.search_remote_release_versions(
+        "https://api.example/releases", "niimath"
+    ) == {"1.0.0": "20250617"}
 
 
-def test_remote_release_search_refreshes_stale_cache(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr("pyneurodesk.api.default_cache_root", lambda: tmp_path / "cache")
-    monkeypatch.setattr("pyneurodesk.api.resolve_release_cache_ttl_seconds", lambda: 60.0)
+def test_remote_release_search_refreshes_stale_cache(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        "pyneurodesk.api.default_cache_root", lambda: tmp_path / "cache"
+    )
+    monkeypatch.setattr(
+        "pyneurodesk.api.resolve_release_cache_ttl_seconds", lambda: 60.0
+    )
     monkeypatch.setattr("pyneurodesk.api.time.time", lambda: 1_000.0)
-    api.write_remote_release_cache("https://api.example/releases", "niimath", {"1.0.0": "old"})
+    api.write_remote_release_cache(
+        "https://api.example/releases", "niimath", {"1.0.0": "old"}
+    )
     monkeypatch.setattr("pyneurodesk.api.time.time", lambda: 1_061.0)
     monkeypatch.setattr(
         "pyneurodesk.api.fetch_remote_release_versions",
         lambda api_base, name: {"1.0.1": "new"},
     )
-    assert api.search_remote_release_versions("https://api.example/releases", "niimath") == {"1.0.1": "new"}
-    assert api.read_remote_release_cache("https://api.example/releases", "niimath", 60.0) == {"1.0.1": "new"}
+    assert api.search_remote_release_versions(
+        "https://api.example/releases", "niimath"
+    ) == {"1.0.1": "new"}
+    assert api.read_remote_release_cache(
+        "https://api.example/releases", "niimath", 60.0
+    ) == {"1.0.1": "new"}
 
 
 def test_remote_release_search_can_disable_cache(monkeypatch, tmp_path: Path) -> None:
     calls: list[tuple[str, str]] = []
-    monkeypatch.setattr("pyneurodesk.api.default_cache_root", lambda: tmp_path / "cache")
-    monkeypatch.setattr("pyneurodesk.api.resolve_release_cache_ttl_seconds", lambda: 0.0)
-    api.write_remote_release_cache("https://api.example/releases", "niimath", {"1.0.0": "cached"})
+    monkeypatch.setattr(
+        "pyneurodesk.api.default_cache_root", lambda: tmp_path / "cache"
+    )
+    monkeypatch.setattr(
+        "pyneurodesk.api.resolve_release_cache_ttl_seconds", lambda: 0.0
+    )
+    api.write_remote_release_cache(
+        "https://api.example/releases", "niimath", {"1.0.0": "cached"}
+    )
 
     def fetch(api_base: str, name: str) -> dict[str, str]:
         calls.append((api_base, name))
         return {"1.0.1": "fresh"}
 
     monkeypatch.setattr("pyneurodesk.api.fetch_remote_release_versions", fetch)
-    assert api.search_remote_release_versions("https://api.example/releases", "niimath") == {"1.0.1": "fresh"}
+    assert api.search_remote_release_versions(
+        "https://api.example/releases", "niimath"
+    ) == {"1.0.1": "fresh"}
     assert calls == [("https://api.example/releases", "niimath")]
 
 
-def test_container_uses_local_release_metadata_without_cvmfs_listing(monkeypatch, tmp_path: Path) -> None:
+def test_container_uses_local_release_metadata_without_cvmfs_listing(
+    monkeypatch, tmp_path: Path
+) -> None:
     releases_dir = tmp_path / "releases"
     (releases_dir / "niimath").mkdir(parents=True)
     (releases_dir / "niimath" / "1.0.0.json").write_text(
@@ -2282,44 +2745,8 @@ def test_container_uses_local_release_metadata_without_cvmfs_listing(monkeypatch
     (releases_dir / "niimath" / "1.0.20250804.json").write_text(
         '{"apps":{"niimath 1.0.20250804":{"version":"20251016","exec":""}}}'
     )
-    monkeypatch.setattr("pyneurodesk.api.resolve_release_index_dir", lambda: releases_dir)
-
-    seen: list[tuple[str, str, Optional[str]]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = request.read().decode() or None
-        seen.append((request.method, request.url.path, body))
-        if request.method == "GET" and request.url.path == "/image/niimath":
-            return httpx.Response(200, json={"name": "niimath", "status": "downloaded", "source_kind": "cvmfs"})
-        if request.method == "GET" and request.url.path == "/vm/status":
-            return httpx.Response(200, json={"status": "stopped"})
-        if request.method == "POST" and request.url.path == "/kernel/download":
-            return httpx.Response(200, json={"status": "downloaded"})
-        if request.method == "POST" and request.url.path == "/image/niimath/qemu/download":
-            return httpx.Response(200, json={"status": "downloaded", "path": "/tmp/qemu", "required": True})
-        if request.method == "POST" and request.url.path == "/image/niimath/metadata":
-            return httpx.Response(
-                200,
-                json={"name": "niimath", "status": "prepared", "source_kind": "cvmfs", "architecture": "amd64"},
-            )
-        if request.method == "POST" and request.url.path == "/vm":
-            return httpx.Response(200, json={"status": "running", "image": "niimath"})
-        raise AssertionError(f"unexpected request: {request.method} {request.url.path} {body!r}")
-
-    client = make_client(httpx.MockTransport(handler))
-    try:
-        container = nd.container("niimath", client=client, progress=False)
-    finally:
-        client.close()
-
-    assert container.path == build_release_container_path("niimath", "1.0.20250804", "20251016")
-    assert all(path != "/cvmfs/list" for _, path, _ in seen)
-
-
-def test_container_uses_remote_release_metadata_without_cvmfs_listing(monkeypatch) -> None:
     monkeypatch.setattr(
-        "pyneurodesk.api._search_remote_release_versions",
-        lambda name: {"1.0.0": "20250617", "1.0.20250804": "20251016"} if name == "niimath" else {},
+        "pyneurodesk.api.resolve_release_index_dir", lambda: releases_dir
     )
 
     seen: list[tuple[str, str, Optional[str]]] = []
@@ -2328,21 +2755,41 @@ def test_container_uses_remote_release_metadata_without_cvmfs_listing(monkeypatc
         body = request.read().decode() or None
         seen.append((request.method, request.url.path, body))
         if request.method == "GET" and request.url.path == "/image/niimath":
-            return httpx.Response(200, json={"name": "niimath", "status": "downloaded", "source_kind": "cvmfs"})
+            return httpx.Response(
+                200,
+                json={
+                    "name": "niimath",
+                    "status": "downloaded",
+                    "source_kind": "cvmfs",
+                },
+            )
         if request.method == "GET" and request.url.path == "/vm/status":
             return httpx.Response(200, json={"status": "stopped"})
         if request.method == "POST" and request.url.path == "/kernel/download":
             return httpx.Response(200, json={"status": "downloaded"})
-        if request.method == "POST" and request.url.path == "/image/niimath/qemu/download":
-            return httpx.Response(200, json={"status": "downloaded", "path": "/tmp/qemu", "required": True})
+        if (
+            request.method == "POST"
+            and request.url.path == "/image/niimath/qemu/download"
+        ):
+            return httpx.Response(
+                200,
+                json={"status": "downloaded", "path": "/tmp/qemu", "required": True},
+            )
         if request.method == "POST" and request.url.path == "/image/niimath/metadata":
             return httpx.Response(
                 200,
-                json={"name": "niimath", "status": "prepared", "source_kind": "cvmfs", "architecture": "amd64"},
+                json={
+                    "name": "niimath",
+                    "status": "prepared",
+                    "source_kind": "cvmfs",
+                    "architecture": "amd64",
+                },
             )
         if request.method == "POST" and request.url.path == "/vm":
             return httpx.Response(200, json={"status": "running", "image": "niimath"})
-        raise AssertionError(f"unexpected request: {request.method} {request.url.path} {body!r}")
+        raise AssertionError(
+            f"unexpected request: {request.method} {request.url.path} {body!r}"
+        )
 
     client = make_client(httpx.MockTransport(handler))
     try:
@@ -2350,7 +2797,75 @@ def test_container_uses_remote_release_metadata_without_cvmfs_listing(monkeypatc
     finally:
         client.close()
 
-    assert container.path == build_release_container_path("niimath", "1.0.20250804", "20251016")
+    assert container.path == build_release_container_path(
+        "niimath", "1.0.20250804", "20251016"
+    )
+    assert all(path != "/cvmfs/list" for _, path, _ in seen)
+
+
+def test_container_uses_remote_release_metadata_without_cvmfs_listing(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "pyneurodesk.api._search_remote_release_versions",
+        lambda name: (
+            {"1.0.0": "20250617", "1.0.20250804": "20251016"}
+            if name == "niimath"
+            else {}
+        ),
+    )
+
+    seen: list[tuple[str, str, Optional[str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.read().decode() or None
+        seen.append((request.method, request.url.path, body))
+        if request.method == "GET" and request.url.path == "/image/niimath":
+            return httpx.Response(
+                200,
+                json={
+                    "name": "niimath",
+                    "status": "downloaded",
+                    "source_kind": "cvmfs",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/vm/status":
+            return httpx.Response(200, json={"status": "stopped"})
+        if request.method == "POST" and request.url.path == "/kernel/download":
+            return httpx.Response(200, json={"status": "downloaded"})
+        if (
+            request.method == "POST"
+            and request.url.path == "/image/niimath/qemu/download"
+        ):
+            return httpx.Response(
+                200,
+                json={"status": "downloaded", "path": "/tmp/qemu", "required": True},
+            )
+        if request.method == "POST" and request.url.path == "/image/niimath/metadata":
+            return httpx.Response(
+                200,
+                json={
+                    "name": "niimath",
+                    "status": "prepared",
+                    "source_kind": "cvmfs",
+                    "architecture": "amd64",
+                },
+            )
+        if request.method == "POST" and request.url.path == "/vm":
+            return httpx.Response(200, json={"status": "running", "image": "niimath"})
+        raise AssertionError(
+            f"unexpected request: {request.method} {request.url.path} {body!r}"
+        )
+
+    client = make_client(httpx.MockTransport(handler))
+    try:
+        container = nd.container("niimath", client=client, progress=False)
+    finally:
+        client.close()
+
+    assert container.path == build_release_container_path(
+        "niimath", "1.0.20250804", "20251016"
+    )
     assert all(path != "/cvmfs/list" for _, path, _ in seen)
 
 

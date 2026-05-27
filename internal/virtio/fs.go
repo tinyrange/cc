@@ -181,15 +181,15 @@ type fsLseekBackend interface {
 }
 
 type fsMkdirBackend interface {
-	Mkdir(parent uint64, name string, mode uint32) (nodeID uint64, attr FuseAttr, errno int32)
+	Mkdir(parent uint64, name string, mode uint32, uid uint32, gid uint32) (nodeID uint64, attr FuseAttr, errno int32)
 }
 
 type fsMknodBackend interface {
-	Mknod(parent uint64, name string, mode uint32, rdev uint32) (nodeID uint64, attr FuseAttr, errno int32)
+	Mknod(parent uint64, name string, mode uint32, rdev uint32, uid uint32, gid uint32) (nodeID uint64, attr FuseAttr, errno int32)
 }
 
 type fsSymlinkBackend interface {
-	Symlink(parent uint64, name string, target string) (nodeID uint64, attr FuseAttr, errno int32)
+	Symlink(parent uint64, name string, target string, uid uint32, gid uint32) (nodeID uint64, attr FuseAttr, errno int32)
 }
 
 type fsRmDirBackend interface {
@@ -197,7 +197,7 @@ type fsRmDirBackend interface {
 }
 
 type fsCreateBackend interface {
-	Create(parent uint64, name string, flags uint32, mode uint32) (nodeID uint64, fh uint64, attr FuseAttr, errno int32)
+	Create(parent uint64, name string, flags uint32, mode uint32, uid uint32, gid uint32) (nodeID uint64, fh uint64, attr FuseAttr, errno int32)
 }
 
 type fsWriteBackend interface {
@@ -1007,6 +1007,8 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 	opcode := binary.LittleEndian.Uint32(req[4:8])
 	unique := binary.LittleEndian.Uint64(req[8:16])
 	nodeID := binary.LittleEndian.Uint64(req[16:24])
+	callerUID := binary.LittleEndian.Uint32(req[24:28])
+	callerGID := binary.LittleEndian.Uint32(req[28:32])
 	opStart := time.Now()
 	defer f.recordFUSEDispatchTiming(opcode, opStart)
 	f.logf("opcode=%d unique=%d node=%d", opcode, unique, nodeID)
@@ -1078,7 +1080,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		encodeFuseAttr(extra[16:], attr)
 		return reply(0, extra), nil
 	case fuseSetAttr:
-		if len(req) < fuseInHeaderSize+72 {
+		if len(req) < fuseInHeaderSize+88 {
 			return nil, fmt.Errorf("virtio-fs SETATTR too short")
 		}
 		if be, ok := f.backend.(fsSetAttrBackend); ok {
@@ -1088,8 +1090,8 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 			atime := time.Unix(int64(binary.LittleEndian.Uint64(req[72:80])), int64(binary.LittleEndian.Uint32(req[96:100])))
 			mtime := time.Unix(int64(binary.LittleEndian.Uint64(req[80:88])), int64(binary.LittleEndian.Uint32(req[100:104])))
 			mode := binary.LittleEndian.Uint32(req[108:112])
-			uid := binary.LittleEndian.Uint32(req[112:116])
-			gid := binary.LittleEndian.Uint32(req[116:120])
+			uid := binary.LittleEndian.Uint32(req[116:120])
+			gid := binary.LittleEndian.Uint32(req[120:124])
 			attr, errno := be.SetAttr(nodeID, valid, fh, size, mode, uid, gid, atime, mtime)
 			if errno != 0 {
 				return reply(errno, nil), nil
@@ -1120,7 +1122,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		mode := binary.LittleEndian.Uint32(req[40:44])
 		f.logPathf("mkdir-parent", nodeID, fmt.Sprintf(" name=%q mode=%#o", name, mode))
 		if be, ok := f.backend.(fsMkdirBackend); ok {
-			childID, attr, errno := be.Mkdir(nodeID, path.Clean(name), mode)
+			childID, attr, errno := be.Mkdir(nodeID, path.Clean(name), mode, callerUID, callerGID)
 			if errno != 0 {
 				return reply(errno, nil), nil
 			}
@@ -1139,7 +1141,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		rdev := binary.LittleEndian.Uint32(req[44:48])
 		f.logPathf("mknod-parent", nodeID, fmt.Sprintf(" name=%q mode=%#o rdev=%#x", name, mode, rdev))
 		if be, ok := f.backend.(fsMknodBackend); ok {
-			childID, attr, errno := be.Mknod(nodeID, path.Clean(name), mode, rdev)
+			childID, attr, errno := be.Mknod(nodeID, path.Clean(name), mode, rdev, callerUID, callerGID)
 			if errno != 0 {
 				return reply(errno, nil), nil
 			}
@@ -1156,7 +1158,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		}
 		f.logPathf("symlink-parent", nodeID, fmt.Sprintf(" name=%q target=%q", name, target))
 		if be, ok := f.backend.(fsSymlinkBackend); ok {
-			childID, attr, errno := be.Symlink(nodeID, path.Clean(name), target)
+			childID, attr, errno := be.Symlink(nodeID, path.Clean(name), target, callerUID, callerGID)
 			if errno != 0 {
 				return reply(errno, nil), nil
 			}
@@ -1477,7 +1479,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 			flags := binary.LittleEndian.Uint32(req[40:44])
 			mode := binary.LittleEndian.Uint32(req[44:48])
 			name := readCStringName(req[fuseInHeaderSize+16:])
-			childID, fh, attr, errno := be.Create(nodeID, path.Clean(name), flags, mode)
+			childID, fh, attr, errno := be.Create(nodeID, path.Clean(name), flags, mode, callerUID, callerGID)
 			if errno != 0 {
 				return reply(errno, nil), nil
 			}
@@ -2258,7 +2260,7 @@ func (p *passthroughFS) Lookup(parent uint64, name string) (uint64, FuseAttr, in
 	return nodeID, p.fileAttr(nodeID, info), 0
 }
 
-func (p *passthroughFS) Mkdir(parent uint64, name string, mode uint32) (uint64, FuseAttr, int32) {
+func (p *passthroughFS) Mkdir(parent uint64, name string, mode uint32, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
 	p.logNode("mkdir-parent", parent)
 	hostParent, guestParent, errno := p.hostAndGuestPath(parent)
 	if errno != 0 {
@@ -2281,8 +2283,8 @@ func (p *passthroughFS) Mkdir(parent uint64, name string, mode uint32) (uint64, 
 		p.mu.Lock()
 		if _, ok := p.meta[guestPath]; !ok {
 			p.meta[guestPath] = fsmeta.Entry{
-				UID:  0,
-				GID:  0,
+				UID:  uid,
+				GID:  gid,
 				Mode: uint32(linuxSIFDIR) | (mode & linuxPermMask),
 			}
 		}
@@ -2292,7 +2294,7 @@ func (p *passthroughFS) Mkdir(parent uint64, name string, mode uint32) (uint64, 
 	return nodeID, p.fileAttr(nodeID, info), 0
 }
 
-func (p *passthroughFS) Symlink(parent uint64, name string, target string) (uint64, FuseAttr, int32) {
+func (p *passthroughFS) Symlink(parent uint64, name string, target string, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
 	hostParent, guestParent, errno := p.hostAndGuestPath(parent)
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
@@ -2310,11 +2312,22 @@ func (p *passthroughFS) Symlink(parent uint64, name string, target string) (uint
 		return 0, FuseAttr{}, errnoFromError(err)
 	}
 	guestPath := joinGuestChild(guestParent, rel)
+	if p.meta != nil {
+		p.mu.Lock()
+		if _, ok := p.meta[guestPath]; !ok {
+			p.meta[guestPath] = fsmeta.Entry{
+				UID:  uid,
+				GID:  gid,
+				Mode: uint32(linuxSIFLNK) | 0o777,
+			}
+		}
+		p.mu.Unlock()
+	}
 	nodeID := p.ensureNode(guestPath)
 	return nodeID, p.fileAttr(nodeID, info), 0
 }
 
-func (p *passthroughFS) Create(parent uint64, name string, flags uint32, mode uint32) (uint64, uint64, FuseAttr, int32) {
+func (p *passthroughFS) Create(parent uint64, name string, flags uint32, mode uint32, uid uint32, gid uint32) (uint64, uint64, FuseAttr, int32) {
 	p.logNode("create-parent", parent)
 	hostParent, guestParent, errno := p.hostAndGuestPath(parent)
 	if errno != 0 {
@@ -2337,6 +2350,15 @@ func (p *passthroughFS) Create(parent uint64, name string, flags uint32, mode ui
 	guestPath := joinGuestChild(guestParent, rel)
 	nodeID := p.ensureNode(guestPath)
 	p.mu.Lock()
+	if p.meta != nil {
+		if _, ok := p.meta[guestPath]; !ok {
+			p.meta[guestPath] = fsmeta.Entry{
+				UID:  uid,
+				GID:  gid,
+				Mode: uint32(linuxSIFREG) | (mode & linuxPermMask),
+			}
+		}
+	}
 	handle := p.nextHandle
 	p.nextHandle++
 	p.handles[handle] = &passthroughHandle{nodeID: nodeID, file: file, append: flags&linuxOAPPEND != 0}
@@ -3110,7 +3132,7 @@ func (p *imageFS) Readlink(nodeID uint64) (string, int32) {
 	return node.symlinkTarget, 0
 }
 
-func (p *imageFS) Mkdir(parent uint64, name string, mode uint32) (uint64, FuseAttr, int32) {
+func (p *imageFS) Mkdir(parent uint64, name string, mode uint32, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	parentNode := p.nodes[parent]
@@ -3126,6 +3148,8 @@ func (p *imageFS) Mkdir(parent uint64, name string, mode uint32) (uint64, FuseAt
 		parent:  parent,
 		name:    name,
 		mode:    fs.ModeDir | fs.FileMode(mode&linuxPermMask),
+		uid:     uid,
+		gid:     gid,
 		entries: map[string]uint64{},
 	}
 	p.nextNodeID++
@@ -3134,7 +3158,7 @@ func (p *imageFS) Mkdir(parent uint64, name string, mode uint32) (uint64, FuseAt
 	return node.id, p.attr(node), 0
 }
 
-func (p *imageFS) Mknod(parent uint64, name string, mode uint32, rdev uint32) (uint64, FuseAttr, int32) {
+func (p *imageFS) Mknod(parent uint64, name string, mode uint32, rdev uint32, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	parentNode := p.nodes[parent]
@@ -3160,6 +3184,8 @@ func (p *imageFS) Mknod(parent uint64, name string, mode uint32, rdev uint32) (u
 		name:    name,
 		mode:    linuxModeToGo(fileType | (mode & linuxPermMask)),
 		rawMode: fileType | (mode & linuxPermMask),
+		uid:     uid,
+		gid:     gid,
 		rdev:    rdev,
 		modTime: time.Now(),
 	}
@@ -3169,7 +3195,7 @@ func (p *imageFS) Mknod(parent uint64, name string, mode uint32, rdev uint32) (u
 	return node.id, p.attr(node), 0
 }
 
-func (p *imageFS) Symlink(parent uint64, name string, target string) (uint64, FuseAttr, int32) {
+func (p *imageFS) Symlink(parent uint64, name string, target string, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	parentNode := p.nodes[parent]
@@ -3185,6 +3211,8 @@ func (p *imageFS) Symlink(parent uint64, name string, target string) (uint64, Fu
 		parent:        parent,
 		name:          name,
 		mode:          fs.ModeSymlink | 0o777,
+		uid:           uid,
+		gid:           gid,
 		size:          uint64(len(target)),
 		symlinkTarget: target,
 		modTime:       time.Now(),
@@ -3225,7 +3253,7 @@ func (p *imageFS) RmDir(parent uint64, name string) int32 {
 	return 0
 }
 
-func (p *imageFS) Create(parent uint64, name string, _ uint32, mode uint32) (uint64, uint64, FuseAttr, int32) {
+func (p *imageFS) Create(parent uint64, name string, _ uint32, mode uint32, uid uint32, gid uint32) (uint64, uint64, FuseAttr, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	parentNode := p.nodes[parent]
@@ -3244,6 +3272,8 @@ func (p *imageFS) Create(parent uint64, name string, _ uint32, mode uint32) (uin
 		parent:  parent,
 		name:    name,
 		mode:    fs.FileMode(mode & linuxPermMask),
+		uid:     uid,
+		gid:     gid,
 		modTime: time.Now(),
 	}
 	p.nextNodeID++

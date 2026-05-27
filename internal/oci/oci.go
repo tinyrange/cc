@@ -40,8 +40,9 @@ const (
 )
 
 type Store struct {
-	root       string
-	httpClient *http.Client
+	root          string
+	httpClient    *http.Client
+	CVMFSActivity func(int)
 
 	mu          sync.Mutex
 	downloading map[string]bool
@@ -53,6 +54,7 @@ type metadata struct {
 	Source             string      `json:"source"`
 	SourceKind         string      `json:"source_kind,omitempty"`
 	CVMFSRootHash      string      `json:"cvmfs_root_hash,omitempty"`
+	CVMFSMirrors       []string    `json:"cvmfs_mirrors,omitempty"`
 	Architecture       string      `json:"architecture,omitempty"`
 	RootFSDir          string      `json:"rootfs_dir"`
 	MetadataPath       string      `json:"metadata_path,omitempty"`
@@ -90,6 +92,7 @@ type SourceSpec struct {
 type PullOptions struct {
 	Prefetch        bool
 	PrefetchWorkers int
+	CVMFSMirrors    []string
 	Report          func(client.ProgressEvent)
 }
 
@@ -98,6 +101,20 @@ func reportPullProgress(report func(client.ProgressEvent), event client.Progress
 		return
 	}
 	report(event)
+}
+
+func normalizedMirrors(mirrors []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(mirrors))
+	for _, mirror := range mirrors {
+		mirror = strings.TrimRight(strings.TrimSpace(mirror), "/")
+		if mirror == "" || seen[mirror] {
+			continue
+		}
+		seen[mirror] = true
+		out = append(out, mirror)
+	}
+	return out
 }
 
 type RuntimeConfig struct {
@@ -261,6 +278,8 @@ func (s *Store) Open(name string) (*Image, error) {
 			cvmfsClient := &intcvmfs.Client{
 				HTTPClient: s.httpClient,
 				CacheDir:   cvmfsCacheDir(s.sharedRoot()),
+				OnActivity: s.cvmfsActivity,
+				Mirrors:    meta.CVMFSMirrors,
 			}
 			rootFS, err = buildCVMFSIndexedRootFS(cvmfsClient, meta.PackedContentsPath, index)
 			if err != nil {
@@ -456,6 +475,8 @@ func (s *Store) pullCVMFSDirect(ctx context.Context, name string, spec SourceSpe
 	cvmfsClient := &intcvmfs.Client{
 		HTTPClient: s.httpClient,
 		CacheDir:   cvmfsCacheDir(s.sharedRoot()),
+		OnActivity: s.cvmfsActivity,
+		Mirrors:    options.CVMFSMirrors,
 	}
 	normalizedSource := normalizeCVMFSSource(spec.Raw)
 	rootTarget, isDir, err := resolveCVMFSRootTarget(cvmfsClient, normalizedSource)
@@ -484,12 +505,11 @@ func (s *Store) pullCVMFSDirect(ctx context.Context, name string, spec SourceSpe
 		}
 	}
 	if options.Prefetch {
-		packedContentsPath := filepath.Join(tmpDir, "rootfs.contents")
-		packedNodes, err := prefetchCVMFSFiles(ctx, cvmfsClient, nodes, options.PrefetchWorkers, packedContentsPath, name, options.Report)
+		cachedNodes, err := prefetchCVMFSFiles(ctx, cvmfsClient, nodes, options.PrefetchWorkers, name, options.Report)
 		if err != nil {
 			return fmt.Errorf("prefetch cvmfs rootfs: %w", err)
 		}
-		nodes = packedNodes
+		nodes = cachedNodes
 	}
 	fsMetaBuf, err := json.MarshalIndent(entries, "", "  ")
 	if err != nil {
@@ -505,24 +525,21 @@ func (s *Store) pullCVMFSDirect(ctx context.Context, name string, spec SourceSpe
 	if err := os.WriteFile(filepath.Join(tmpDir, "rootfs.index.json"), indexBuf, 0o644); err != nil {
 		return fmt.Errorf("write fs index: %w", err)
 	}
-	deployMetadata, err := extractCVMFSDeployMetadata(cvmfsClient, filepath.Join(tmpDir, "rootfs.contents"), nodes)
+	deployMetadata, err := extractCVMFSDeployMetadata(cvmfsClient, "", nodes)
 	if err != nil {
 		return fmt.Errorf("extract cvmfs deploy metadata: %w", err)
 	}
 	meta := metadata{
-		Name:               name,
-		Source:             spec.Raw,
-		SourceKind:         spec.Kind,
-		CVMFSRootHash:      rootHash,
-		Architecture:       arch,
-		RootFSDir:          imageDir,
-		MetadataPath:       filepath.Join(imageDir, "rootfs.metadata.json"),
-		IndexPath:          filepath.Join(imageDir, "rootfs.index.json"),
-		PackedContentsPath: filepath.Join(imageDir, "rootfs.contents"),
-		Env:                deployMetadata.Env,
-	}
-	if !options.Prefetch {
-		meta.PackedContentsPath = ""
+		Name:          name,
+		Source:        spec.Raw,
+		SourceKind:    spec.Kind,
+		CVMFSRootHash: rootHash,
+		CVMFSMirrors:  normalizedMirrors(options.CVMFSMirrors),
+		Architecture:  arch,
+		RootFSDir:     imageDir,
+		MetadataPath:  filepath.Join(imageDir, "rootfs.metadata.json"),
+		IndexPath:     filepath.Join(imageDir, "rootfs.index.json"),
+		Env:           deployMetadata.Env,
 	}
 	if err := os.RemoveAll(imageDir); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove old image dir: %w", err)
@@ -656,20 +673,24 @@ func (s *Store) maybePrefetchCVMFSImage(ctx context.Context, name string, spec S
 	cvmfsClient := &intcvmfs.Client{
 		HTTPClient: s.httpClient,
 		CacheDir:   cvmfsCacheDir(s.sharedRoot()),
+		OnActivity: s.cvmfsActivity,
+		Mirrors:    options.CVMFSMirrors,
 	}
-	packedContentsPath := filepath.Join(meta.RootFSDir, "rootfs.contents")
-	packedNodes, err := prefetchCVMFSFiles(ctx, cvmfsClient, nodes, options.PrefetchWorkers, packedContentsPath, name, options.Report)
+	cachedNodes, err := prefetchCVMFSFiles(ctx, cvmfsClient, nodes, options.PrefetchWorkers, name, options.Report)
 	if err != nil {
 		return err
 	}
-	indexBuf, err = encodeIndexedNodes(packedNodes)
+	indexBuf, err = encodeIndexedNodes(cachedNodes)
 	if err != nil {
 		return fmt.Errorf("marshal fs index after prefetch: %w", err)
 	}
 	if err := os.WriteFile(meta.IndexPath, indexBuf, 0o644); err != nil {
 		return fmt.Errorf("write fs index after prefetch: %w", err)
 	}
-	meta.PackedContentsPath = packedContentsPath
+	if meta.PackedContentsPath != "" {
+		_ = os.Remove(meta.PackedContentsPath)
+		meta.PackedContentsPath = ""
+	}
 	return s.writeMetadata(name, meta)
 }
 
@@ -869,7 +890,7 @@ func (s *Store) existingState(name string, spec SourceSpec) (client.ImageState, 
 		if meta.CVMFSRootHash == "" {
 			return client.ImageState{}, false, nil
 		}
-		currentHash, err := s.currentCVMFSRootHash(spec)
+		currentHash, err := s.currentCVMFSRootHash(spec, meta.CVMFSMirrors)
 		if err != nil {
 			return client.ImageState{}, false, err
 		}
@@ -900,7 +921,7 @@ func (s *Store) restoreFromSharedCache(name string, spec SourceSpec) (client.Ima
 		if meta.CVMFSRootHash == "" {
 			return client.ImageState{}, false, nil
 		}
-		currentHash, err := s.currentCVMFSRootHash(spec)
+		currentHash, err := s.currentCVMFSRootHash(spec, meta.CVMFSMirrors)
 		if err != nil {
 			return client.ImageState{}, false, err
 		}
@@ -917,12 +938,21 @@ func (s *Store) restoreFromSharedCache(name string, spec SourceSpec) (client.Ima
 	return client.ImageState{Name: name, Source: spec.Raw, SourceKind: spec.Kind, Status: "downloaded"}, true, nil
 }
 
-func (s *Store) currentCVMFSRootHash(spec SourceSpec) (string, error) {
+func (s *Store) currentCVMFSRootHash(spec SourceSpec, mirrors []string) (string, error) {
 	cvmfsClient := &intcvmfs.Client{
 		HTTPClient: s.httpClient,
 		CacheDir:   cvmfsCacheDir(s.sharedRoot()),
+		OnActivity: s.cvmfsActivity,
+		Mirrors:    mirrors,
 	}
 	return cvmfsClient.ManifestRootHash(normalizeCVMFSSource(spec.Raw))
+}
+
+func (s *Store) cvmfsActivity(event intcvmfs.ActivityEvent) {
+	if s == nil || s.CVMFSActivity == nil {
+		return
+	}
+	s.CVMFSActivity(event.Bytes)
 }
 
 func (s *Store) cloneFromStore(src *Store, srcName, dstName string, spec SourceSpec) error {
