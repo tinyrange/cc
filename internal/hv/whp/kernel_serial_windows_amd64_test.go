@@ -56,16 +56,17 @@ func TestInitramfsBootReadyMarker(t *testing.T) {
 		t.Fatalf("guestinit.BuildForArch() error = %v", err)
 	}
 	initrd, err := vmruntime.BuildInitramfs(initBin, nil, vmruntime.GuestInitConfig{
+		VsockPort:   1024,
 		ReadyMarker: vmruntime.InstanceReadyMarker,
 	})
 	if err != nil {
 		t.Fatalf("BuildInitramfs() error = %v", err)
 	}
-	serial, err := BootInitramfsToMarker(ctx, kernelFile, initrd, 256, true, vmruntime.InstanceReadyMarker)
+	serial, control, err := BootInitramfsToVsockMarker(ctx, kernelFile, initrd, 256, true, 1024, vmruntime.InstanceReadyMarker)
 	if err != nil {
-		t.Fatalf("BootInitramfsToMarker() error = %v\nserial:\n%s", err, serial)
+		t.Fatalf("BootInitramfsToVsockMarker() error = %v\nserial:\n%s\ncontrol:\n%s", err, serial, control)
 	}
-	if !strings.Contains(serial, vmruntime.InstanceReadyMarker) {
-		t.Fatalf("serial missing ready marker %q:\n%s", vmruntime.InstanceReadyMarker, serial)
+	if !strings.Contains(control, vmruntime.InstanceReadyMarker) {
+		t.Fatalf("control missing ready marker %q:\nserial:\n%s\ncontrol:\n%s", vmruntime.InstanceReadyMarker, serial, control)
 	}
 }
