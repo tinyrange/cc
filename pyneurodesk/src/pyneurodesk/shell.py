@@ -842,7 +842,8 @@ def emit_log_since(
     except FileNotFoundError:
         return offset
     if data:
-        text = filter_internal_exec_log_events(data.decode("utf-8", errors="replace"))
+        text = data.decode("utf-8", errors="replace").replace("\r\n", "\n")
+        text = filter_internal_exec_log_events(text)
         if text:
             print(text, end="", file=output, flush=True)
     return next_offset

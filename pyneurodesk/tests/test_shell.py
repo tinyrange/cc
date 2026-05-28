@@ -1239,14 +1239,14 @@ def test_emit_log_since_prints_new_log_bytes(
     log_path.write_text("first\n")
 
     offset = shell.emit_log_since(log_path, 0)
-    assert offset == len("first\n")
+    assert offset == log_path.stat().st_size
     assert capsys.readouterr().out == "first\n"
 
     with log_path.open("a") as log:
         log.write("second\n")
 
     offset = shell.emit_log_since(log_path, offset)
-    assert offset == len("first\nsecond\n")
+    assert offset == log_path.stat().st_size
     assert capsys.readouterr().out == "second\n"
 
 
