@@ -234,6 +234,9 @@ func newBootPlatform(vm *VM, uart *serial.UART8250) *bootPlatform {
 	p.pic.master.mask = 0xff
 	p.pic.slave.mask = 0xff
 	p.ioapic.init()
+	if uart != nil {
+		uart.AttachIRQ(p, amd64vm.COM1IRQ)
+	}
 	p.pit = newBootPIT(func() {
 		p.raiseTimerIRQ()
 	})
