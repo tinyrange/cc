@@ -176,8 +176,9 @@ func main() {
 }
 
 func run() error {
-	fd, err := syscall.Open("/dev/console", syscall.O_RDWR, 0)
+	fd, err := syscall.Open("/dev/console", syscall.O_RDWR|syscall.O_NONBLOCK, 0)
 	if err == nil {
+		_ = syscall.SetNonblock(fd, false)
 		consoleFD = fd
 		for _, target := range []int{0, 1, 2} {
 			_ = syscall.Dup3(fd, target, 0)
