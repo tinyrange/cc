@@ -1139,8 +1139,12 @@ func TestParsePortForwardSpec(t *testing.T) {
 
 func TestResolveCCVMPathHonorsExplicitPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "custom-ccvm")
-	if got, err := resolveCCVMPath(path); err != nil || got != path {
-		t.Fatalf("resolveCCVMPath(explicit) = %q, %v; want %q, nil", got, err, path)
+	got, err := resolveCCVMPath(path)
+	if err != nil {
+		t.Fatalf("resolveCCVMPath(explicit) error = %v", err)
+	}
+	if got.Path != path || len(got.Args) != 0 {
+		t.Fatalf("resolveCCVMPath(explicit) = %#v; want path %q with no args", got, path)
 	}
 }
 

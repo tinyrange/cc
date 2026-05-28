@@ -18,6 +18,11 @@ GUESTINIT_AMD64_EMBED_PATH="${ROOT_DIR}/internal/guestinit/guest-init-linux-amd6
 
 mkdir -p "${BUILD_DIR}"
 
+if [[ "${CCX3_VSH_SINGLE:-0}" == "1" ]]; then
+  VSH_OUTPUT="$("${ROOT_DIR}/tools/build_vsh_single.sh")"
+  exec "${VSH_OUTPUT}" "$@"
+fi
+
 (
   cd "${ROOT_DIR}"
   GOOS=linux GOARCH=arm64 go build -o "${BUILD_DIR}/init-linux-arm64" ./internal/cmd/init

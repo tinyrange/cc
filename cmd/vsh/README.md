@@ -111,3 +111,26 @@ Use `--` when a command begins with something that looks like a `vsh` option:
 
 Guest commands run as UID `1000` by default. Use `@ --sudo <cmd>` or
 `@sudo <cmd>` to run a command as root in the current VM.
+
+## Building
+
+For local development, `tools/run_vsh.sh` builds `ccvm` and `vsh` separately
+and runs `vsh -ccvm build/vsh/ccvm`.
+
+For a self-contained test build, use:
+
+```sh
+tools/build_vsh_single.sh
+```
+
+That produces `build/vsh/vsh-<goos>-<goarch>` with the `ccvm` daemon and Linux
+guest init payloads compiled in. At runtime, `vsh` re-execs itself with a
+private daemon flag when it needs to launch the backend.
+
+Cross builds can set:
+
+```sh
+CCX3_TARGET_GOOS=windows CCX3_TARGET_GOARCH=amd64 tools/build_vsh_single.sh
+```
+
+`tools/run_vsh.sh` can also exercise this path with `CCX3_VSH_SINGLE=1`.

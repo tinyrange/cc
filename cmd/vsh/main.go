@@ -24,6 +24,7 @@ import (
 
 	"github.com/creack/pty"
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/ccvmd"
 )
 
 const guestHostMount = "/host"
@@ -40,6 +41,11 @@ const (
 
 type daemonState struct {
 	Addr string `json:"addr"`
+}
+
+type ccvmLaunch struct {
+	Path string
+	Args []string
 }
 
 type shellMode string
@@ -523,6 +529,10 @@ type shellToken struct {
 }
 
 func main() {
+	if len(os.Args) >= 2 && os.Args[1] == "--vsh-internal-ccvm" {
+		ccvmd.Main(os.Args[2:])
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "vsh:", err)
 		os.Exit(1)
@@ -549,11 +559,11 @@ func run() error {
 		return err
 	}
 	statePath := filepath.Join(rootCache, "ccvm.json")
-	ccvmBinary, err := resolveCCVMPath(*ccvmPath)
+	ccvmLaunch, err := resolveCCVMPath(*ccvmPath)
 	if err != nil {
 		return err
 	}
-	api, err := connectBackend(ccvmBinary, rootCache, statePath)
+	api, err := connectBackend(ccvmLaunch, rootCache, statePath)
 	if err != nil {
 		return err
 	}
@@ -2747,13 +2757,13 @@ func formatBootEvent(event client.BootEvent) string {
 	return ""
 }
 
-func resolveCCVMPath(path string) (string, error) {
+func resolveCCVMPath(path string) (ccvmLaunch, error) {
 	if path != "" {
-		return path, nil
+		return ccvmLaunch{Path: path}, nil
 	}
 	exePath, err := os.Executable()
 	if err != nil {
-		return "", err
+		return ccvmLaunch{}, err
 	}
 	candidates := []string{
 		filepath.Join(filepath.Dir(exePath), "ccvm"),
@@ -2761,16 +2771,26 @@ func resolveCCVMPath(path string) (string, error) {
 	}
 	for _, candidate := range candidates {
 		if _, err := os.Stat(candidate); err == nil {
-			return candidate, nil
+			return ccvmLaunch{Path: candidate}, nil
 		}
 	}
-	if found, err := exec.LookPath("ccvm"); err == nil {
-		return found, nil
+	if bundledCCVMAvailable() {
+		return ccvmLaunch{Path: exePath, Args: []string{"--vsh-internal-ccvm"}}, nil
 	}
-	return "", fmt.Errorf("ccvm binary not found next to %s or on PATH; pass -ccvm", exePath)
+	if found, err := exec.LookPath("ccvm"); err == nil {
+		return ccvmLaunch{Path: found}, nil
+	}
+	return ccvmLaunch{}, fmt.Errorf("ccvm binary not found next to %s, bundled in vsh, or on PATH; pass -ccvm", exePath)
 }
 
-func connectBackend(ccvmPath, cacheDir, statePath string) (*client.Client, error) {
+func ccvmLaunchName(launch ccvmLaunch) string {
+	if len(launch.Args) == 0 {
+		return launch.Path
+	}
+	return launch.Path + " " + strings.Join(launch.Args, " ")
+}
+
+func connectBackend(launch ccvmLaunch, cacheDir, statePath string) (*client.Client, error) {
 	if state, err := readDaemonState(statePath); err == nil {
 		api := newClient(state.Addr)
 		if err := api.HealthCheck(); err == nil {
@@ -2779,21 +2799,23 @@ func connectBackend(ccvmPath, cacheDir, statePath string) (*client.Client, error
 		_ = os.Remove(statePath)
 	}
 
-	proc := exec.Command(ccvmPath, "-cache-dir", cacheDir)
+	args := append([]string{}, launch.Args...)
+	args = append(args, "-cache-dir", cacheDir)
+	proc := exec.Command(launch.Path, args...)
 	proc.Stderr = os.Stderr
 	detachDaemonCommand(proc)
 	stdout, err := proc.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("prepare ccvm stdout pipe for %s: %w", ccvmPath, err)
+		return nil, fmt.Errorf("prepare ccvm stdout pipe for %s: %w", ccvmLaunchName(launch), err)
 	}
 	if err := proc.Start(); err != nil {
-		return nil, fmt.Errorf("start ccvm daemon %s with cache %s: %w", ccvmPath, cacheDir, err)
+		return nil, fmt.Errorf("start ccvm daemon %s with cache %s: %w", ccvmLaunchName(launch), cacheDir, err)
 	}
 
 	var hello client.ServerHello
 	if err := json.NewDecoder(stdout).Decode(&hello); err != nil {
 		_ = proc.Wait()
-		return nil, fmt.Errorf("ccvm daemon did not send a startup banner from %s: %w", ccvmPath, err)
+		return nil, fmt.Errorf("ccvm daemon did not send a startup banner from %s: %w", ccvmLaunchName(launch), err)
 	}
 	if err := validateServerHello(hello, cacheDir); err != nil {
 		_ = proc.Process.Kill()
