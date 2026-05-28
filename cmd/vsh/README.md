@@ -2,7 +2,7 @@
 
 `vsh` is a proof-of-concept shell frontend for `ccvm`. Ordinary lines run in the current context. Lines that begin with `@` are handled by `vsh` itself.
 
-`vsh` must be run from an interactive terminal. Interactive sessions use readline-style editing, persistent history stored in the `ccvm` cache directory, and early autocomplete support for `@` builtins, cached image names, `vsh` options, command names, and host paths.
+`vsh` must be run from an interactive terminal. Interactive sessions use the native `vsh` line editor, persistent history stored in the `ccvm` cache directory, and autocomplete support for `@` builtins, cached image names, `vsh` options, command names, and host paths.
 
 Guest commands receive a TTY, terminal dimensions, and terminal color environment. `vsh` keeps command execution non-interactive and adds a small color prelude for common commands such as `ls`.
 

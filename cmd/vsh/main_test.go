@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/creack/pty"
 	"j5.nz/cc/client"
 )
 
@@ -639,6 +641,125 @@ func TestCompleterSortsPathsBeforePaging(t *testing.T) {
 	got, _ := completer.Do([]rune("cat "), 4)
 	if len(got) < 2 || string(got[0]) != "bin/" || string(got[1]) != "src/" {
 		t.Fatalf("path ordering = %#v, want directories first", got)
+	}
+}
+
+func TestLineEditorReadsBasicLine(t *testing.T) {
+	master, tty, err := pty.Open()
+	if err != nil {
+		t.Skipf("open pty: %v", err)
+	}
+	defer master.Close()
+	defer tty.Close()
+
+	editor := newLineEditor(tty, io.Discard, "", nil)
+	done := make(chan struct {
+		line string
+		err  error
+	}, 1)
+	go func() {
+		line, err := editor.ReadLine("vsh> ")
+		done <- struct {
+			line string
+			err  error
+		}{line: line, err: err}
+	}()
+	time.Sleep(25 * time.Millisecond)
+	if _, err := master.Write([]byte("echo hi\r")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("ReadLine() error = %v", got.err)
+		}
+		if got.line != "echo hi" {
+			t.Fatalf("ReadLine() = %q, want echo hi", got.line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ReadLine() timed out")
+	}
+}
+
+func TestLineEditorAcceptsCompletionSelection(t *testing.T) {
+	master, tty, err := pty.Open()
+	if err != nil {
+		t.Skipf("open pty: %v", err)
+	}
+	defer master.Close()
+	defer tty.Close()
+
+	dir := t.TempDir()
+	for _, name := range []string{"aa", "beta"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sh := &shellState{hostCWD: dir}
+	editor := newLineEditor(tty, io.Discard, "", newVSHCompleter(sh))
+	done := make(chan struct {
+		line string
+		err  error
+	}, 1)
+	go func() {
+		line, err := editor.ReadLine("vsh> ")
+		done <- struct {
+			line string
+			err  error
+		}{line: line, err: err}
+	}()
+	time.Sleep(25 * time.Millisecond)
+	if _, err := master.Write([]byte("cat \t\r\r")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("ReadLine() error = %v", got.err)
+		}
+		if got.line != "cat aa" {
+			t.Fatalf("ReadLine() = %q, want cat aa", got.line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ReadLine() timed out")
+	}
+}
+
+func TestLineEditorInsertsCompletionSuffix(t *testing.T) {
+	master, tty, err := pty.Open()
+	if err != nil {
+		t.Skipf("open pty: %v", err)
+	}
+	defer master.Close()
+	defer tty.Close()
+
+	sh := &shellState{hostCWD: t.TempDir()}
+	editor := newLineEditor(tty, io.Discard, "", newVSHCompleter(sh))
+	done := make(chan struct {
+		line string
+		err  error
+	}, 1)
+	go func() {
+		line, err := editor.ReadLine("vsh> ")
+		done <- struct {
+			line string
+			err  error
+		}{line: line, err: err}
+	}()
+	time.Sleep(25 * time.Millisecond)
+	if _, err := master.Write([]byte("ec\t\r\r")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("ReadLine() error = %v", got.err)
+		}
+		if got.line != "echo" {
+			t.Fatalf("ReadLine() = %q, want echo", got.line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ReadLine() timed out")
 	}
 }
 

@@ -22,7 +22,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/chzyer/readline"
 	"github.com/creack/pty"
 	"j5.nz/cc/client"
 )
@@ -122,6 +121,11 @@ func newVSHCompleter(shell *shellState) *vshCompleter {
 }
 
 func (c *vshCompleter) Do(line []rune, pos int) ([][]rune, int) {
+	candidates, replacementLen := c.Complete(line, pos)
+	return pagedStringCompletions(candidates, replacementLen)
+}
+
+func (c *vshCompleter) Complete(line []rune, pos int) ([]string, int) {
 	prefix := string(line[:pos])
 	tokenStart := lastCompletionTokenStart(prefix)
 	token := prefix[tokenStart:]
@@ -133,21 +137,28 @@ func (c *vshCompleter) Do(line []rune, pos int) ([][]rune, int) {
 				candidates = append(candidates, word[len(token):])
 			}
 		}
-		return pagedStringCompletions(candidates, len([]rune(token)))
+		return candidates, len([]rune(token))
 	}
 	if strings.HasPrefix(prefix, "@") && strings.HasPrefix(token, "--") {
 		candidates = suffixCompletions(vshOptionWords(), token)
-		return pagedStringCompletions(candidates, len([]rune(token)))
+		return candidates, len([]rune(token))
 	}
 	if c.shouldCompleteCommand(prefix, tokenStart, isFirstToken, token) {
 		candidates = c.commandCandidates(token)
-		return pagedStringCompletions(candidates, len([]rune(token)))
+		return candidates, len([]rune(token))
 	}
 	if !isFirstToken || token == "" || strings.Contains(token, "/") || token == "." || token == ".." || strings.HasPrefix(token, "~") {
 		candidates = c.pathCandidates(token)
-		return pagedStringCompletions(candidates, len([]rune(filepath.Base(token))))
+		return candidates, pathCompletionReplaceLen(token)
 	}
 	return nil, 0
+}
+
+func pathCompletionReplaceLen(token string) int {
+	if token == "" {
+		return 0
+	}
+	return len([]rune(filepath.Base(token)))
 }
 
 func (c *vshCompleter) atTargetWords() []string {
@@ -630,45 +641,28 @@ func (s *shellState) loop(in io.Reader, stdout, stderr io.Writer) error {
 	}
 	inCloser, ok := in.(io.ReadCloser)
 	if !ok {
-		return fmt.Errorf("vsh stdin does not support interactive readline")
+		return fmt.Errorf("vsh stdin does not support interactive editing")
 	}
-	return s.evalReadline(inCloser, stdout, stderr)
+	inFile, ok := inCloser.(*os.File)
+	if !ok {
+		return fmt.Errorf("vsh stdin does not support terminal editing")
+	}
+	return s.evalLineEditor(inFile, stdout, stderr)
 }
 
-func (s *shellState) evalReadline(in io.ReadCloser, stdout, stderr io.Writer) error {
-	rl, err := readline.NewEx(&readline.Config{
-		Prompt:                 s.prompt(),
-		HistoryFile:            s.history,
-		HistoryLimit:           1000,
-		HistorySearchFold:      true,
-		DisableAutoSaveHistory: true,
-		AutoComplete:           s.completion,
-		InterruptPrompt:        "^C",
-		EOFPrompt:              "",
-		Stdin:                  in,
-		Stdout:                 stdout,
-		Stderr:                 stderr,
-	})
-	if err != nil {
-		return err
-	}
-	defer rl.Close()
-
+func (s *shellState) evalLineEditor(in *os.File, stdout, stderr io.Writer) error {
+	editor := newLineEditor(in, stdout, s.history, s.completion)
 	for {
-		rl.SetPrompt(s.prompt())
 		s.drawPromptStatus(stdout)
-		line, err := rl.Readline()
+		line, err := editor.ReadLine(s.prompt())
 		s.statusSeq.Add(1)
 		switch {
-		case errors.Is(err, readline.ErrInterrupt):
+		case errors.Is(err, errLineInterrupted):
 			continue
 		case errors.Is(err, io.EOF):
 			return nil
 		case err != nil:
 			return err
-		}
-		if shouldSaveHistory(line) {
-			_ = rl.SaveHistory(line)
 		}
 		if err := s.eval(line, stdout, stderr); err != nil {
 			if errors.Is(err, io.EOF) {
