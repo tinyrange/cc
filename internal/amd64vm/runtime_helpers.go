@@ -95,7 +95,13 @@ func buildShareBackend(index int, share DirectoryShare) (string, virtio.FSBacken
 	}
 	tag := fmt.Sprintf("share%d", index)
 	if share.Writable {
+		if share.MapOwner {
+			return tag, virtio.NewPassthroughFSWithOwner(source, nil, share.OwnerUID, share.OwnerGID), nil
+		}
 		return tag, virtio.NewPassthroughFS(source, nil), nil
+	}
+	if share.MapOwner {
+		return tag, virtio.NewImageFSWithOwner(imagefs.NewHostFS(source, nil), source, share.OwnerUID, share.OwnerGID), nil
 	}
 	return tag, virtio.NewImageFS(imagefs.NewHostFS(source, nil), source), nil
 }

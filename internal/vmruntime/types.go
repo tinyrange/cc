@@ -18,6 +18,9 @@ type DirectoryShare struct {
 	Source   string
 	Mount    string
 	Writable bool
+	MapOwner bool
+	OwnerUID uint32
+	OwnerGID uint32
 }
 
 // RunRequest is the backend-neutral request shape for the managed guest runtime.

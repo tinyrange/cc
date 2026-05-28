@@ -540,6 +540,9 @@ func (i *windowsInstance) AddShare(ctx context.Context, share client.ShareMount)
 		Source:   share.Source,
 		Mount:    share.Mount,
 		Writable: share.Writable,
+		MapOwner: share.MapOwner,
+		OwnerUID: share.OwnerUID,
+		OwnerGID: share.OwnerGID,
 	})
 	if err != nil {
 		return err
@@ -687,6 +690,9 @@ func convertWindowsShareMounts(shares []client.ShareMount) []vmruntime.Directory
 			Source:   share.Source,
 			Mount:    share.Mount,
 			Writable: share.Writable,
+			MapOwner: share.MapOwner,
+			OwnerUID: share.OwnerUID,
+			OwnerGID: share.OwnerGID,
 		})
 	}
 	return out

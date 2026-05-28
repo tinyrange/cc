@@ -2091,6 +2091,9 @@ type passthroughFS struct {
 	root           string
 	meta           map[string]fsmeta.Entry
 	writebackCache bool
+	ownerUID       uint32
+	ownerGID       uint32
+	mapOwner       bool
 
 	mu         sync.RWMutex
 	nextNodeID uint64
@@ -2155,9 +2158,20 @@ type dirEntry struct {
 }
 
 func NewPassthroughFS(root string, meta map[string]fsmeta.Entry) FSBackend {
+	return newPassthroughFS(root, meta, 0, 0, false)
+}
+
+func NewPassthroughFSWithOwner(root string, meta map[string]fsmeta.Entry, uid, gid uint32) FSBackend {
+	return newPassthroughFS(root, meta, uid, gid, true)
+}
+
+func newPassthroughFS(root string, meta map[string]fsmeta.Entry, uid, gid uint32, mapOwner bool) FSBackend {
 	fs := &passthroughFS{
 		root:       root,
 		meta:       meta,
+		ownerUID:   uid,
+		ownerGID:   gid,
+		mapOwner:   mapOwner,
 		nextNodeID: 2,
 		nextHandle: 1,
 		nodes:      map[uint64]string{1: "/"},
@@ -2839,6 +2853,10 @@ func (p *passthroughFS) fileAttr(nodeID uint64, info os.FileInfo) FuseAttr {
 	attr.MTimeNsec = uint32(mod.Nanosecond())
 	attr.CTimeNsec = uint32(mod.Nanosecond())
 	enrichHostFileAttr(info, &attr)
+	if p.mapOwner {
+		attr.UID = p.ownerUID
+		attr.GID = p.ownerGID
+	}
 	if attr.Blocks == 0 && attr.Size > 0 {
 		attr.Blocks = uint64((attr.Size + 511) / 512)
 	}
@@ -3499,10 +3517,7 @@ func (p *imageFS) attr(node *imageNode) FuseAttr {
 	}
 	switch {
 	case node.isDir():
-		// Image roots are served as an ephemeral writable layer, similar to
-		// Apptainer's writable-tmpfs mode. Preserve read-only semantics for
-		// explicit non-writable mounts in mountedFS.
-		mode = linuxSIFDIR | linuxModeBits(nodeMode|0o222)
+		mode = linuxSIFDIR | linuxModeBits(nodeMode)
 	case node.isSymlink():
 		mode = linuxSIFLNK | linuxModeBits(nodeMode)
 	case node.rawMode != 0:

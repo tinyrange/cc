@@ -596,6 +596,9 @@ func (i *linuxInstance) AddShare(ctx context.Context, share client.ShareMount) e
 		Source:   share.Source,
 		Mount:    share.Mount,
 		Writable: share.Writable,
+		MapOwner: share.MapOwner,
+		OwnerUID: share.OwnerUID,
+		OwnerGID: share.OwnerGID,
 	})
 	if err != nil {
 		return err
@@ -1071,6 +1074,9 @@ func convertLinuxShareMounts(shares []client.ShareMount) []vmruntime.DirectorySh
 			Source:   share.Source,
 			Mount:    share.Mount,
 			Writable: share.Writable,
+			MapOwner: share.MapOwner,
+			OwnerUID: share.OwnerUID,
+			OwnerGID: share.OwnerGID,
 		})
 	}
 	return out

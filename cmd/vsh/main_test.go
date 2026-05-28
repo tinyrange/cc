@@ -159,6 +159,9 @@ echo hello --flag
 	if run.req.Shares[0].Source != string(filepath.Separator) || run.req.Shares[0].Mount != guestHostMount {
 		t.Fatalf("host share = %#v, want root at /host", run.req.Shares[0])
 	}
+	if !run.req.Shares[0].MapOwner || run.req.Shares[0].OwnerUID != defaultGuestUID || run.req.Shares[0].OwnerGID != defaultGuestGID {
+		t.Fatalf("host share owner = %#v, want mapped default guest user", run.req.Shares[0])
+	}
 	wantWorkDir := path.Join(guestHostMount, strings.TrimPrefix(filepath.ToSlash(dir), "/"))
 	if run.req.WorkDir != wantWorkDir {
 		t.Fatalf("workdir = %q, want %q", run.req.WorkDir, wantWorkDir)

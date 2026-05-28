@@ -274,6 +274,9 @@ type ShareMount struct {
 	Source   string `json:"source"`
 	Mount    string `json:"mount"`
 	Writable bool   `json:"writable,omitempty"`
+	MapOwner bool   `json:"map_owner,omitempty"`
+	OwnerUID uint32 `json:"owner_uid,omitempty"`
+	OwnerGID uint32 `json:"owner_gid,omitempty"`
 }
 
 type NetworkConfig struct {

@@ -826,6 +826,47 @@ func TestImageFSWithOwnerMapsAttributes(t *testing.T) {
 	}
 }
 
+func TestImageFSPreservesDirectoryPermissions(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "private"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	be := NewImageFS(imagefs.NewHostFS(root, nil), root)
+	_, attr, errno := be.Lookup(1, "private")
+	if errno != 0 {
+		t.Fatalf("Lookup(private) errno = %d", errno)
+	}
+	if attr.Mode&linuxPermMask != 0o700 {
+		t.Fatalf("private mode = %#o, want 0700", attr.Mode&linuxPermMask)
+	}
+}
+
+func TestPassthroughFSWithOwnerMapsAttributes(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "private"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	be := NewPassthroughFSWithOwner(root, nil, 1001, 1002)
+	rootAttr, errno := be.GetAttr(1)
+	if errno != 0 {
+		t.Fatalf("GetAttr(root) errno = %d", errno)
+	}
+	if rootAttr.UID != 1001 || rootAttr.GID != 1002 {
+		t.Fatalf("root owner = %d:%d, want 1001:1002", rootAttr.UID, rootAttr.GID)
+	}
+	_, attr, errno := be.Lookup(1, "private")
+	if errno != 0 {
+		t.Fatalf("Lookup(private) errno = %d", errno)
+	}
+	if attr.UID != 1001 || attr.GID != 1002 {
+		t.Fatalf("private owner = %d:%d, want 1001:1002", attr.UID, attr.GID)
+	}
+}
+
 func TestStrictFUSEIoctlReturnsENOTTY(t *testing.T) {
 	t.Parallel()
 

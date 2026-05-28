@@ -243,6 +243,9 @@ func (s *ContainerSession) AddShare(ctx context.Context, share client.ShareMount
 		Source:   share.Source,
 		Mount:    share.Mount,
 		Writable: share.Writable,
+		MapOwner: share.MapOwner,
+		OwnerUID: share.OwnerUID,
+		OwnerGID: share.OwnerGID,
 	})
 	if err != nil {
 		return err
@@ -1075,6 +1078,9 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 				Source:   share.Source,
 				Mount:    share.Mount,
 				Writable: share.Writable,
+				MapOwner: share.MapOwner,
+				OwnerUID: share.OwnerUID,
+				OwnerGID: share.OwnerGID,
 			}
 		}
 		return &ContainerSession{

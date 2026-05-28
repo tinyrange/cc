@@ -26,7 +26,7 @@ import (
 )
 
 const guestHostMount = "/host"
-const defaultGuestUser = "1000:0"
+const defaultGuestUser = "1000:1000"
 
 const (
 	colorReset   = "\x1b[0m"
@@ -509,6 +509,9 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 			Source:   hostRoot,
 			Mount:    guestHostMount,
 			Writable: true,
+			MapOwner: true,
+			OwnerUID: defaultGuestUID,
+			OwnerGID: defaultGuestGID,
 		}},
 		WorkDir:  workDir,
 		User:     guestRunUser(ctx),
@@ -1234,6 +1237,11 @@ func (c commandContext) withOptions(opts commandOptions) commandContext {
 	}
 	return c
 }
+
+const (
+	defaultGuestUID = 1000
+	defaultGuestGID = 1000
+)
 
 func guestRunUser(ctx commandContext) string {
 	if strings.TrimSpace(ctx.User) != "" {
