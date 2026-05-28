@@ -4,12 +4,13 @@ package whp
 
 import (
 	"context"
+	"encoding/binary"
 	"os"
 	"strings"
 	"testing"
 
-	"j5.nz/cc/internal/guestinit"
 	"j5.nz/cc/internal/kernel/alpine"
+	"j5.nz/cc/internal/linux/initramfs"
 	"j5.nz/cc/internal/vmruntime"
 )
 
@@ -51,22 +52,64 @@ func TestInitramfsBootReadyMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadKernel() error = %v", err)
 	}
-	initBin, err := guestinit.BuildForArch(ctx, t.TempDir(), "amd64")
-	if err != nil {
-		t.Fatalf("guestinit.BuildForArch() error = %v", err)
-	}
-	initrd, err := vmruntime.BuildInitramfs(initBin, nil, vmruntime.GuestInitConfig{
-		VsockPort:   1024,
-		ReadyMarker: vmruntime.InstanceReadyMarker,
+	initrd, err := initramfs.Build([]initramfs.File{
+		{Path: "/dev", Mode: 0o755, Type: initramfs.TypeDirectory},
+		{Path: "/dev/console", Mode: 0o600, Type: initramfs.TypeCharDevice, DevMajor: 5, DevMinor: 1},
+		{Path: "/init", Mode: 0o755, Data: tinyAMD64InitELF(vmruntime.InstanceReadyMarker + "\n"), Type: initramfs.TypeRegular},
 	})
 	if err != nil {
-		t.Fatalf("BuildInitramfs() error = %v", err)
+		t.Fatalf("build tiny initramfs: %v", err)
 	}
-	serial, control, err := BootInitramfsToVsockMarker(ctx, kernelFile, initrd, 256, true, 1024, vmruntime.InstanceReadyMarker)
+	serial, err := BootInitramfsToMarker(ctx, kernelFile, initrd, 256, true, vmruntime.InstanceReadyMarker)
 	if err != nil {
-		t.Fatalf("BootInitramfsToVsockMarker() error = %v\nserial:\n%s\ncontrol:\n%s", err, serial, control)
+		t.Fatalf("BootInitramfsToMarker() error = %v\nserial:\n%s", err, serial)
 	}
-	if !strings.Contains(control, vmruntime.InstanceReadyMarker) {
-		t.Fatalf("control missing ready marker %q:\nserial:\n%s\ncontrol:\n%s", vmruntime.InstanceReadyMarker, serial, control)
+	if !strings.Contains(serial, vmruntime.InstanceReadyMarker) {
+		t.Fatalf("serial missing ready marker %q:\n%s", vmruntime.InstanceReadyMarker, serial)
 	}
+}
+
+func tinyAMD64InitELF(message string) []byte {
+	const (
+		base      = uint64(0x400000)
+		headerLen = 64 + 56
+	)
+	msg := []byte(message)
+	code := []byte{
+		0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, SYS_write
+		0xbf, 0x01, 0x00, 0x00, 0x00, // mov edi, STDOUT_FILENO
+		0x48, 0x8d, 0x35, 0, 0, 0, 0, // lea rsi, [rip+msg]
+		0xba, byte(len(msg)), byte(len(msg) >> 8), byte(len(msg) >> 16), byte(len(msg) >> 24), // mov edx, len
+		0x0f, 0x05, // syscall
+		0xf3, 0x90, // pause
+		0xeb, 0xfc, // jmp pause
+	}
+	msgOffset := headerLen + len(code)
+	leaNext := headerLen + 17
+	binary.LittleEndian.PutUint32(code[13:17], uint32(msgOffset-leaNext))
+
+	filesz := uint64(headerLen + len(code) + len(msg))
+	elf := make([]byte, filesz)
+	copy(elf[0:16], []byte{0x7f, 'E', 'L', 'F', 2, 1, 1})
+	binary.LittleEndian.PutUint16(elf[16:18], 2)    // ET_EXEC
+	binary.LittleEndian.PutUint16(elf[18:20], 0x3e) // EM_X86_64
+	binary.LittleEndian.PutUint32(elf[20:24], 1)    // EV_CURRENT
+	binary.LittleEndian.PutUint64(elf[24:32], base+headerLen)
+	binary.LittleEndian.PutUint64(elf[32:40], 64) // program header offset
+	binary.LittleEndian.PutUint16(elf[52:54], 64)
+	binary.LittleEndian.PutUint16(elf[54:56], 56)
+	binary.LittleEndian.PutUint16(elf[56:58], 1)
+
+	ph := elf[64 : 64+56]
+	binary.LittleEndian.PutUint32(ph[0:4], 1) // PT_LOAD
+	binary.LittleEndian.PutUint32(ph[4:8], 5) // PF_R | PF_X
+	binary.LittleEndian.PutUint64(ph[16:24], base)
+	binary.LittleEndian.PutUint64(ph[24:32], base)
+	binary.LittleEndian.PutUint64(ph[32:40], filesz)
+	binary.LittleEndian.PutUint64(ph[40:48], filesz)
+	binary.LittleEndian.PutUint64(ph[48:56], 0x1000)
+
+	copy(elf[headerLen:], code)
+	copy(elf[msgOffset:], msg)
+	return elf
 }
