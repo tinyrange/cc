@@ -958,27 +958,9 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	timingLog("hvf.StartContainer PrepareBoot took=%s", time.Since(start))
 	start = time.Now()
 
-	if err := vm.SetReg(hvRegPC, plan.EntryGPA); err != nil {
+	if err := vm.ConfigureLinuxBootState(plan.EntryGPA, plan.StackTopGPA, plan.DeviceTreeGPA); err != nil {
 		vm.Close()
-		return nil, fmt.Errorf("set PC: %w", err)
-	}
-	if err := vm.SetReg(hvRegCPSR, arm64vm.DefaultPStateBits); err != nil {
-		vm.Close()
-		return nil, fmt.Errorf("set CPSR: %w", err)
-	}
-	if err := vm.SetSysReg(hvSysRegSP_EL1, plan.StackTopGPA); err != nil {
-		vm.Close()
-		return nil, fmt.Errorf("set SP_EL1: %w", err)
-	}
-	if err := vm.SetReg(hvRegX0, plan.DeviceTreeGPA); err != nil {
-		vm.Close()
-		return nil, fmt.Errorf("set X0: %w", err)
-	}
-	for _, reg := range []Reg{hvRegX1, hvRegX2, hvRegX3} {
-		if err := vm.SetReg(reg, 0); err != nil {
-			vm.Close()
-			return nil, fmt.Errorf("clear reg %d: %w", reg, err)
-		}
+		return nil, err
 	}
 	timing.Since(ctx, "hvf.register_setup", start)
 	timingLog("hvf.StartContainer register setup took=%s", time.Since(start))
@@ -1388,22 +1370,8 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 		return ContainerRunResult{}, fmt.Errorf("prepare boot: %w", err)
 	}
 
-	if err := vm.SetReg(hvRegPC, plan.EntryGPA); err != nil {
-		return ContainerRunResult{}, fmt.Errorf("set PC: %w", err)
-	}
-	if err := vm.SetReg(hvRegCPSR, arm64vm.DefaultPStateBits); err != nil {
-		return ContainerRunResult{}, fmt.Errorf("set CPSR: %w", err)
-	}
-	if err := vm.SetSysReg(hvSysRegSP_EL1, plan.StackTopGPA); err != nil {
-		return ContainerRunResult{}, fmt.Errorf("set SP_EL1: %w", err)
-	}
-	if err := vm.SetReg(hvRegX0, plan.DeviceTreeGPA); err != nil {
-		return ContainerRunResult{}, fmt.Errorf("set X0: %w", err)
-	}
-	for _, reg := range []Reg{hvRegX1, hvRegX2, hvRegX3} {
-		if err := vm.SetReg(reg, 0); err != nil {
-			return ContainerRunResult{}, fmt.Errorf("clear reg %d: %w", reg, err)
-		}
+	if err := vm.ConfigureLinuxBootState(plan.EntryGPA, plan.StackTopGPA, plan.DeviceTreeGPA); err != nil {
+		return ContainerRunResult{}, err
 	}
 
 	readySent := false

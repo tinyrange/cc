@@ -3,6 +3,7 @@
 package hvf
 
 import (
+	"context"
 	"encoding/binary"
 	"os"
 	"runtime"
@@ -23,6 +24,52 @@ func TestMain(m *testing.M) {
 func TestNestedVirtualizationSupportedProbe(t *testing.T) {
 	if _, err := NestedVirtualizationSupported(); err != nil {
 		t.Fatalf("NestedVirtualizationSupported() error = %v", err)
+	}
+}
+
+func TestNestedVMEntersEL2(t *testing.T) {
+	supported, err := NestedVirtualizationSupported()
+	if err != nil {
+		t.Fatalf("NestedVirtualizationSupported() error = %v", err)
+	}
+	if !supported {
+		t.Skip("nested virtualization is not supported on this host")
+	}
+
+	vm, err := NewVMWithOptions(context.Background(), VMOptions{NestedVirt: true})
+	if err != nil {
+		t.Fatalf("NewVMWithOptions(nested) error = %v", err)
+	}
+	defer func() {
+		if err := vm.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+	}()
+
+	const guestAddr IPA = 0x80000000
+	mem, err := vm.MapAnonymousMemory(uintptr(os.Getpagesize()), guestAddr, hvMemoryRead|hvMemoryWrite|hvMemoryExec)
+	if err != nil {
+		t.Fatalf("MapAnonymousMemory() error = %v", err)
+	}
+	binary.LittleEndian.PutUint32(mem[0:4], 0xd4200000) // brk #0
+
+	if err := vm.ConfigureLinuxBootState(uint64(guestAddr), uint64(guestAddr)+uint64(os.Getpagesize()), 0); err != nil {
+		t.Fatalf("ConfigureLinuxBootState() error = %v", err)
+	}
+	cpsr, err := vm.GetReg(hvRegCPSR)
+	if err != nil {
+		t.Fatalf("GetReg(CPSR) error = %v", err)
+	}
+	if cpsr&0xf != 0x9 {
+		t.Fatalf("CPSR mode = %#x, want EL2h", cpsr&0xf)
+	}
+
+	exitInfo, err := vm.Run()
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if exitInfo == nil || exitInfo.Reason != hvExitReasonException {
+		t.Fatalf("Run() exit = %#v, want exception", exitInfo)
 	}
 }
 

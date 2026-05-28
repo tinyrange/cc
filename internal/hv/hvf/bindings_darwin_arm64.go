@@ -131,6 +131,11 @@ const (
 	hvSysRegID_AA64ZFR0_EL1  SysReg = 0xc024
 	hvSysRegID_AA64SMFR0_EL1 SysReg = 0xc025
 	hvSysRegVBAR_EL1         SysReg = 0xc600
+	hvSysRegCNTHCTL_EL2      SysReg = 0xe708
+	hvSysRegCNTVOFF_EL2      SysReg = 0xe703
+	hvSysRegCPTR_EL2         SysReg = 0xe08a
+	hvSysRegHCR_EL2          SysReg = 0xe088
+	hvSysRegSP_EL2           SysReg = 0xf208
 
 	hvGICICCRegPMR_EL1     GICICCReg = 0xc230
 	hvGICICCRegCTLR_EL1    GICICCReg = 0xc664
@@ -270,6 +275,7 @@ type VM struct {
 	dit         bool
 	mdscrEL1    uint64
 	osdlrEL1    uint64
+	nestedVirt  bool
 	osLock      bool
 }
 
@@ -334,8 +340,9 @@ func NewVMWithOptions(ctx context.Context, opts VMOptions) (*VM, error) {
 	vmLifecycleMu.Lock()
 
 	v := &VM{
-		osLock: true,
-		vcpus:  make([]*hvfVCPU, cpus),
+		osLock:     true,
+		nestedVirt: opts.NestedVirt,
+		vcpus:      make([]*hvfVCPU, cpus),
 	}
 	for i := range v.vcpus {
 		cpu := &hvfVCPU{
@@ -1109,8 +1116,13 @@ func (v *VM) StartVCPUByMPIDR(mpidr uint64, entry uint64, contextID uint64) erro
 	if err := v.SetRegForVCPU(cpu.index, hvRegPC, entry); err != nil {
 		return err
 	}
-	if err := v.SetRegForVCPU(cpu.index, hvRegCPSR, DefaultPStateEL1h()); err != nil {
+	if err := v.SetRegForVCPU(cpu.index, hvRegCPSR, v.defaultPState()); err != nil {
 		return err
+	}
+	if v.nestedVirt {
+		if err := v.configureNestedEL2ForVCPU(cpu.index); err != nil {
+			return err
+		}
 	}
 	if err := v.SetRegForVCPU(cpu.index, hvRegX0, contextID); err != nil {
 		return err
@@ -1124,15 +1136,78 @@ func (v *VM) StartVCPUByMPIDR(mpidr uint64, entry uint64, contextID uint64) erro
 	return nil
 }
 
-func DefaultPStateEL1h() uint64 {
+func (v *VM) ConfigureLinuxBootState(entry, stackTop, deviceTree uint64) error {
+	if err := v.SetReg(hvRegPC, entry); err != nil {
+		return fmt.Errorf("set PC: %w", err)
+	}
+	if err := v.SetReg(hvRegCPSR, v.defaultPState()); err != nil {
+		return fmt.Errorf("set CPSR: %w", err)
+	}
+	if v.nestedVirt {
+		if err := v.configureNestedEL2ForVCPU(0); err != nil {
+			return err
+		}
+		if err := v.SetSysReg(hvSysRegSP_EL2, stackTop); err != nil {
+			return fmt.Errorf("set SP_EL2: %w", err)
+		}
+	} else if err := v.SetSysReg(hvSysRegSP_EL1, stackTop); err != nil {
+		return fmt.Errorf("set SP_EL1: %w", err)
+	}
+	if err := v.SetReg(hvRegX0, deviceTree); err != nil {
+		return fmt.Errorf("set X0: %w", err)
+	}
+	for _, reg := range []Reg{hvRegX1, hvRegX2, hvRegX3} {
+		if err := v.SetReg(reg, 0); err != nil {
+			return fmt.Errorf("clear reg %d: %w", reg, err)
+		}
+	}
+	return nil
+}
+
+func (v *VM) configureNestedEL2ForVCPU(index int) error {
 	const (
-		pstateModeEL1h = 0x5
-		pstateDF       = 0x200
-		pstateAF       = 0x100
-		pstateIF       = 0x80
-		pstateFF       = 0x40
+		hcrEL2RW        = 1 << 31
+		cnthctlEL1PCEN  = 1 << 1
+		cnthctlEL1PCTEN = 1 << 0
 	)
-	return pstateModeEL1h | pstateDF | pstateAF | pstateIF | pstateFF
+	if err := v.SetSysRegForVCPU(index, hvSysRegHCR_EL2, hcrEL2RW); err != nil {
+		return fmt.Errorf("set HCR_EL2: %w", err)
+	}
+	if err := v.SetSysRegForVCPU(index, hvSysRegCNTHCTL_EL2, cnthctlEL1PCEN|cnthctlEL1PCTEN); err != nil {
+		return fmt.Errorf("set CNTHCTL_EL2: %w", err)
+	}
+	if err := v.SetSysRegForVCPU(index, hvSysRegCNTVOFF_EL2, 0); err != nil {
+		return fmt.Errorf("set CNTVOFF_EL2: %w", err)
+	}
+	if err := v.SetSysRegForVCPU(index, hvSysRegCPTR_EL2, 0); err != nil {
+		return fmt.Errorf("set CPTR_EL2: %w", err)
+	}
+	return nil
+}
+
+func DefaultPStateEL1h() uint64 {
+	return defaultPState(0x5)
+}
+
+func DefaultPStateEL2h() uint64 {
+	return defaultPState(0x9)
+}
+
+func (v *VM) defaultPState() uint64 {
+	if v.nestedVirt {
+		return DefaultPStateEL2h()
+	}
+	return DefaultPStateEL1h()
+}
+
+func defaultPState(mode uint64) uint64 {
+	const (
+		pstateDF = 0x200
+		pstateAF = 0x100
+		pstateIF = 0x80
+		pstateFF = 0x40
+	)
+	return mode | pstateDF | pstateAF | pstateIF | pstateFF
 }
 
 func (v *VM) Close() error {
