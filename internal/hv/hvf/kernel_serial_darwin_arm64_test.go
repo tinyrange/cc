@@ -211,26 +211,8 @@ func bootKernelProbeWithInitrd(t *testing.T, vm *VM, memoryBase uint64, mode boo
 		return bootProbeResult{}, fmt.Errorf("PrepareBoot() error = %w", err)
 	}
 
-	if err := vm.SetReg(hvRegPC, plan.EntryGPA); err != nil {
-		return bootProbeResult{}, fmt.Errorf("SetReg(PC) error = %w", err)
-	}
-	if err := vm.SetReg(hvRegCPSR, bootarm64.DefaultPStateBits); err != nil {
-		return bootProbeResult{}, fmt.Errorf("SetReg(CPSR) error = %w", err)
-	}
-	if err := vm.SetSysReg(hvSysRegSP_EL1, plan.StackTopGPA); err != nil {
-		return bootProbeResult{}, fmt.Errorf("SetSysReg(SP_EL1) error = %w", err)
-	}
-	if err := vm.SetReg(hvRegX0, plan.DeviceTreeGPA); err != nil {
-		return bootProbeResult{}, fmt.Errorf("SetReg(X0) error = %w", err)
-	}
-	if err := vm.SetReg(hvRegX1, 0); err != nil {
-		return bootProbeResult{}, fmt.Errorf("SetReg(X1) error = %w", err)
-	}
-	if err := vm.SetReg(hvRegX2, 0); err != nil {
-		return bootProbeResult{}, fmt.Errorf("SetReg(X2) error = %w", err)
-	}
-	if err := vm.SetReg(hvRegX3, 0); err != nil {
-		return bootProbeResult{}, fmt.Errorf("SetReg(X3) error = %w", err)
+	if err := vm.ConfigureLinuxBootState(plan.EntryGPA, plan.StackTopGPA, plan.DeviceTreeGPA); err != nil {
+		return bootProbeResult{}, fmt.Errorf("ConfigureLinuxBootState() error = %w", err)
 	}
 
 	result := bootProbeResult{}
@@ -273,6 +255,9 @@ func bootKernelProbeWithInitrd(t *testing.T, vm *VM, memoryBase uint64, mode boo
 		if mode == bootProbeFirstSerial && serialOut.Len() > 0 {
 			result.Serial = serialOut.String()
 			return result, nil
+		}
+		if exitInfo.Reason == hvExitReasonCanceled {
+			continue
 		}
 		if exitInfo.Reason != hvExitReasonException {
 			result.Serial = serialOut.String()

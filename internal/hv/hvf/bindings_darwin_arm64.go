@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -128,6 +129,7 @@ const (
 	hvSysRegID_AA64PFR1_EL1  SysReg = 0xc021
 	hvSysRegID_AA64ISAR1_EL1 SysReg = 0xc031
 	hvSysRegID_AA64ISAR2_EL1 SysReg = 0xc032
+	hvSysRegID_AA64MMFR1_EL1 SysReg = 0xc039
 	hvSysRegID_AA64ZFR0_EL1  SysReg = 0xc024
 	hvSysRegID_AA64SMFR0_EL1 SysReg = 0xc025
 	hvSysRegVBAR_EL1         SysReg = 0xc600
@@ -524,6 +526,7 @@ func sanitizeFeatureRegs(vcpu VCPU) error {
 		idAA64ISAR1APAShift  = 4
 		idAA64ISAR2GPA3Shift = 8
 		idAA64ISAR2APA3Shift = 12
+		idAA64MMFR1LORShift  = 16
 		idAA64FieldMask      = uint64(0xf)
 	)
 
@@ -543,6 +546,10 @@ func sanitizeFeatureRegs(vcpu VCPU) error {
 	if ret != hvSuccess {
 		isar2 = 0
 	}
+	mmfr1, ret := getSysRegRaw(vcpu, hvSysRegID_AA64MMFR1_EL1)
+	if ret != hvSuccess {
+		return fmt.Errorf("read ID_AA64MMFR1_EL1: %w", ret)
+	}
 
 	sanitizedPFR0 := pfr0 &^ (idAA64FieldMask << idAA64PFR0SVEShift)
 	sanitizedPFR1 := pfr1 &
@@ -557,6 +564,7 @@ func sanitizeFeatureRegs(vcpu VCPU) error {
 	sanitizedISAR2 := isar2 &
 		^((idAA64FieldMask << idAA64ISAR2GPA3Shift) |
 			(idAA64FieldMask << idAA64ISAR2APA3Shift))
+	sanitizedMMFR1 := mmfr1 &^ (idAA64FieldMask << idAA64MMFR1LORShift)
 
 	if ret := hvVcpuSetSysReg(vcpu, hvSysRegID_AA64PFR0_EL1, sanitizedPFR0); ret != hvSuccess {
 		return fmt.Errorf("set ID_AA64PFR0_EL1: %w", ret)
@@ -571,6 +579,9 @@ func sanitizeFeatureRegs(vcpu VCPU) error {
 		if ret := hvVcpuSetSysReg(vcpu, hvSysRegID_AA64ISAR2_EL1, sanitizedISAR2); ret != hvSuccess {
 			return fmt.Errorf("set ID_AA64ISAR2_EL1: %w", ret)
 		}
+	}
+	if ret := hvVcpuSetSysReg(vcpu, hvSysRegID_AA64MMFR1_EL1, sanitizedMMFR1); ret != hvSuccess {
+		return fmt.Errorf("set ID_AA64MMFR1_EL1: %w", ret)
 	}
 	if ret := hvVcpuSetSysReg(vcpu, hvSysRegID_AA64ZFR0_EL1, 0); ret != hvSuccess {
 		return fmt.Errorf("set ID_AA64ZFR0_EL1: %w", ret)
@@ -1529,11 +1540,63 @@ func (v *VM) HandleSystemInstructionForVCPU(index int, syndrome uint64) (bool, e
 				return false, err
 			}
 		}
+	case v.nestedVirt && info.IsEL2SystemRegisterAccess():
+		handled, err := v.handleNestedEL2SystemRegisterForVCPU(index, info)
+		if err != nil || !handled {
+			return handled, err
+		}
 	default:
 		return false, nil
 	}
 
 	return true, v.AdvanceProgramCounterForVCPU(index)
+}
+
+func (s SystemInstructionInfo) IsEL2SystemRegisterAccess() bool {
+	return s.Op0 == 0x3 && s.Op1 == 0x4
+}
+
+func (s SystemInstructionInfo) SysReg() SysReg {
+	return SysReg(uint16(s.Op0)<<14 |
+		uint16(s.Op1)<<11 |
+		uint16(s.CRn)<<7 |
+		uint16(s.CRm)<<3 |
+		uint16(s.Op2))
+}
+
+func (v *VM) handleNestedEL2SystemRegisterForVCPU(index int, info SystemInstructionInfo) (bool, error) {
+	reg := info.SysReg()
+	if info.Read {
+		value, err := v.GetSysRegForVCPU(index, reg)
+		if err != nil {
+			if strings.Contains(err.Error(), "unsupported") {
+				return false, nil
+			}
+			return false, err
+		}
+		if info.Rt != hvRegXZR {
+			if err := v.SetRegForVCPU(index, info.Rt, value); err != nil {
+				return false, err
+			}
+		}
+		return true, nil
+	}
+
+	var value uint64
+	if info.Rt != hvRegXZR {
+		var err error
+		value, err = v.GetRegForVCPU(index, info.Rt)
+		if err != nil {
+			return false, err
+		}
+	}
+	if err := v.SetSysRegForVCPU(index, reg, value); err != nil {
+		if strings.Contains(err.Error(), "unsupported") {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 func (v *VM) AdvanceProgramCounter() error {
