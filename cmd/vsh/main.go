@@ -625,7 +625,7 @@ func (s *shellState) warmHostShell(stdout, stderr io.Writer) {
 	if !tty {
 		return
 	}
-	env := mergedEnv(mergedEnv(os.Environ(), shellEnv(s.env)), terminalEnv(cols, rows))
+	env := hostCommandEnv(s.env, terminalEnv(cols, rows))
 	_, _ = s.hostPersistentShell(env, cols, rows, stderr)
 }
 
@@ -957,7 +957,7 @@ func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {
 	tty, cols, rows := terminalRequestSize(stdout)
 	env := []string(nil)
 	if tty {
-		env = mergedEnv(mergedEnv(os.Environ(), shellEnv(s.env)), terminalEnv(cols, rows))
+		env = hostCommandEnv(s.env, terminalEnv(cols, rows))
 	} else if len(s.env) > 0 {
 		env = mergedEnv(os.Environ(), shellEnv(s.env))
 	}
@@ -1310,6 +1310,14 @@ func shellEnv(vars map[string]string) []string {
 	return env
 }
 
+func hostCommandEnv(vars map[string]string, terminal []string) []string {
+	return mergedEnv(mergedEnv(os.Environ(), terminal), shellEnv(vars))
+}
+
+func guestCommandEnv(ctx commandContext, vars map[string]string, terminal []string) []string {
+	return mergedEnv(mergedEnv(guestShellEnv(ctx), terminal), shellEnv(vars))
+}
+
 func guestShellEnv(ctx commandContext) []string {
 	user := strings.TrimSpace(guestRunUser(ctx))
 	switch {
@@ -1385,10 +1393,11 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 		req.Cols = cols
 		req.Rows = rows
 	}
-	req.Env = mergedEnv(guestShellEnv(ctx), shellEnv(s.env))
+	terminal := []string(nil)
 	if tty {
-		req.Env = mergedEnv(req.Env, terminalEnv(cols, rows))
+		terminal = terminalEnv(cols, rows)
 	}
+	req.Env = guestCommandEnv(ctx, s.env, terminal)
 	if ctx.Network {
 		req.Network = defaultNetworkConfig()
 	}

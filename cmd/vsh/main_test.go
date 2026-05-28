@@ -935,6 +935,20 @@ func TestMergedEnvOverridesValues(t *testing.T) {
 	}
 }
 
+func TestGuestCommandEnvPrefersExplicitExportsOverTerminalEnv(t *testing.T) {
+	ctx := commandContext{Image: "ubuntu"}
+	got := guestCommandEnv(ctx, map[string]string{"TERM": "xterm"}, []string{"TERM=xterm-ghostty", "COLUMNS=183", "LINES=50"})
+	joined := strings.Join(got, "\n")
+	for _, want := range []string{"TERM=xterm", "COLUMNS=183", "LINES=50", "HOME=/home/ubuntu"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("guestCommandEnv() = %#v, missing %q", got, want)
+		}
+	}
+	if strings.Contains(joined, "TERM=xterm-ghostty") {
+		t.Fatalf("guestCommandEnv() = %#v, terminal TERM overrode export", got)
+	}
+}
+
 func envContains(env []string, want string) bool {
 	for _, entry := range env {
 		if entry == want {
