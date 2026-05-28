@@ -27,6 +27,13 @@ func (i *darwinInstance) AddPortForward(ctx context.Context, forward client.Port
 	return i.network.AddPortForward(forward)
 }
 
+func (i *darwinInstance) VirtioFSStats() []virtio.FSStats {
+	if i == nil || i.session == nil {
+		return nil
+	}
+	return i.session.VirtioFSStats()
+}
+
 func (i *darwinInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
 	return i.session.Exec(ctx, req)
 }

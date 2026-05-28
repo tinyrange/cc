@@ -313,6 +313,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threads", type=int, default=1, help="Filesystem worker threads inside each benchmark process")
     parser.add_argument("--fsync", action="store_true", help="Call fsync during write tests")
     parser.add_argument(
+        "--virtiofs-async",
+        choices=["on", "off"],
+        default="on",
+        help="Enable or disable asynchronous virtiofs dispatch in ccvm",
+    )
+    parser.add_argument(
+        "--virtiofs-workers",
+        type=int,
+        default=None,
+        help="Set CCX3_VIRTIOFS_WORKERS for the guest benchmark",
+    )
+    parser.add_argument(
+        "--virtiofs-cache",
+        choices=["normal", "strict", "aggressive"],
+        default=None,
+        help="Set CCX3_VIRTIOFS_CACHE for the guest benchmark",
+    )
+    parser.add_argument(
+        "--virtiofs-writeback",
+        action="store_true",
+        help="Enable CCX3_VIRTIOFS_WRITEBACK for the guest benchmark",
+    )
+    parser.add_argument(
         "--only",
         action="append",
         help="Run only the named benchmark section. Can be repeated. Example: --only small_create",
@@ -417,6 +440,28 @@ def fetch_virtiofs_stats(base_url: str) -> Any:
             return json.loads(response.read().decode("utf-8"))
     except Exception as exc:
         return {"error": str(exc)}
+
+
+def apply_virtiofs_env(args: argparse.Namespace) -> dict[str, Any]:
+    os.environ["CCX3_VIRTIOFS_ASYNC"] = "1" if args.virtiofs_async == "on" else "0"
+    if args.virtiofs_workers is not None:
+        os.environ["CCX3_VIRTIOFS_WORKERS"] = str(args.virtiofs_workers)
+    else:
+        os.environ.pop("CCX3_VIRTIOFS_WORKERS", None)
+    if args.virtiofs_cache is not None:
+        os.environ["CCX3_VIRTIOFS_CACHE"] = args.virtiofs_cache
+    else:
+        os.environ.pop("CCX3_VIRTIOFS_CACHE", None)
+    if args.virtiofs_writeback:
+        os.environ["CCX3_VIRTIOFS_WRITEBACK"] = "1"
+    else:
+        os.environ.pop("CCX3_VIRTIOFS_WRITEBACK", None)
+    return {
+        "async": args.virtiofs_async,
+        "workers": args.virtiofs_workers,
+        "cache": args.virtiofs_cache or "normal",
+        "writeback": args.virtiofs_writeback,
+    }
 
 
 def diff_virtiofs_stats(before: Any, after: Any) -> Any:
@@ -545,6 +590,7 @@ def run_guest(args: argparse.Namespace) -> dict[str, Any]:
         or args.pprof_block_profile is not None
     ):
         os.environ["CCX3_PPROF"] = "1"
+    virtiofs_config = apply_virtiofs_env(args)
     print(f"[fsbench] starting ccvm daemon with cache {args.cache_dir}", file=sys.stderr)
     state = start_daemon_for_cache_dir(args.cache_dir)
     client = PyNeurodeskClient(state.base_url)
@@ -599,6 +645,7 @@ def run_guest(args: argparse.Namespace) -> dict[str, Any]:
         payload["virtiofs_stats_before"] = stats_before
         payload["virtiofs_stats_after"] = stats_after
         payload["virtiofs_stats_delta"] = diff_virtiofs_stats(stats_before, stats_after)
+        payload["virtiofs_config"] = virtiofs_config
         return payload
     finally:
         client.close()
@@ -644,6 +691,39 @@ def print_summary(summary: list[dict[str, Any]]) -> None:
         )
 
 
+def print_virtiofs_summary(guest: dict[str, Any]) -> None:
+    delta = guest.get("virtiofs_stats_delta")
+    if not isinstance(delta, list):
+        return
+    print()
+    print("Virtiofs summary")
+    print("----------------")
+    config = guest.get("virtiofs_config", {})
+    if isinstance(config, dict):
+        print(
+            "config: "
+            f"async={config.get('async')} "
+            f"workers={config.get('workers') or 'default'} "
+            f"cache={config.get('cache')} "
+            f"writeback={config.get('writeback')}"
+        )
+    for item in delta:
+        if not isinstance(item, dict):
+            continue
+        print(
+            f"{item.get('tag', '<unknown>')}: "
+            f"requests={item.get('fuse_requests', 0)} "
+            f"queues={item.get('queue_notifies', [])}"
+        )
+        ops = [
+            op for op in item.get("fuse_ops", [])
+            if isinstance(op, dict) and int(op.get("count", 0)) > 0
+        ][:8]
+        for op in ops:
+            avg_us = int(op.get("average_nanos", 0)) / 1000.0
+            print(f"  {op.get('name'):<10} {op.get('count'):>8} avg={avg_us:>8.1f}us")
+
+
 def main() -> None:
     args = parse_args()
     args.cache_dir = args.cache_dir.expanduser().resolve()
@@ -666,6 +746,7 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     print_summary(summary)
+    print_virtiofs_summary(guest)
     print(f"\nwrote {args.output}")
 
     if not args.keep_work_dir:

@@ -77,6 +77,7 @@ type ContainerSession struct {
 	listener    virtio.VsockListener
 	vsock       *virtio.Vsock
 	rootFS      virtio.ShareMounter
+	fsdevs      []*virtio.FS
 	sendMu      sync.Mutex
 	shareMu     sync.Mutex
 	shares      map[string]client.ShareMount
@@ -260,6 +261,20 @@ func (s *ContainerSession) AddShare(ctx context.Context, share client.ShareMount
 	s.shares[key] = share
 	s.shareMu.Unlock()
 	return nil
+}
+
+func (s *ContainerSession) VirtioFSStats() []virtio.FSStats {
+	if s == nil || len(s.fsdevs) == 0 {
+		return nil
+	}
+	out := make([]virtio.FSStats, 0, len(s.fsdevs))
+	for _, fsdev := range s.fsdevs {
+		if fsdev == nil {
+			continue
+		}
+		out = append(out, fsdev.Stats())
+	}
+	return out
 }
 
 func (s *ContainerSession) AddPortForward(ctx context.Context, forward client.PortForward) error {
@@ -1095,6 +1110,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			transcript:  controlTranscript,
 			vsock:       vsock,
 			rootFS:      rootFS,
+			fsdevs:      fsdevs,
 			shares:      shareState,
 			activeExecs: activeExecs,
 		}, nil
@@ -1344,6 +1360,9 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 			if err := injectVirtualTimerPPI(vm); err != nil {
 				return ContainerRunResult{}, fmt.Errorf("inject virtual timer ppi: %w", err)
 			}
+			continue
+		}
+		if exitInfo.Reason == hvExitReasonCanceled {
 			continue
 		}
 		if exitInfo.Reason != hvExitReasonException {

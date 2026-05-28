@@ -14,17 +14,24 @@ import (
 
 var errLineInterrupted = errors.New("line interrupted")
 
+const (
+	completionMenuMinItemWidth = 8
+	completionMenuMaxItemWidth = 24
+	completionMenuCellPadding  = 2
+	commandCompletionAskLimit  = 100
+)
+
 type lineEditor struct {
 	in        *os.File
 	out       io.Writer
 	history   *lineHistory
 	completer *vshCompleter
 	width     int
-	pageSize  int
 	prompt    string
 	buf       []rune
 	cursor    int
 	menu      completionMenu
+	confirm   completionConfirm
 }
 
 type lineHistory struct {
@@ -40,7 +47,13 @@ type completionMenu struct {
 	token      string
 	selected   int
 	page       int
-	pageSize   int
+}
+
+type completionConfirm struct {
+	active     bool
+	items      []string
+	replaceLen int
+	token      string
 }
 
 type editorKey int
@@ -85,7 +98,6 @@ func newLineEditor(in *os.File, out io.Writer, historyPath string, completer *vs
 		history:   loadLineHistory(historyPath, 1000),
 		completer: completer,
 		width:     width,
-		pageSize:  completionPageSize(),
 	}
 }
 
@@ -135,6 +147,7 @@ func (e *lineEditor) ReadLine(prompt string) (string, error) {
 	e.buf = nil
 	e.cursor = 0
 	e.menu = completionMenu{}
+	e.confirm = completionConfirm{}
 	historyPos := len(e.historyItems())
 	draft := ""
 	e.refresh()
@@ -146,6 +159,11 @@ func (e *lineEditor) ReadLine(prompt string) (string, error) {
 				return "", io.EOF
 			}
 			return "", err
+		}
+		if e.confirm.active {
+			e.handleCompletionConfirm(ev)
+			e.refresh()
+			continue
 		}
 		switch ev.key {
 		case keyRune:
@@ -193,11 +211,19 @@ func (e *lineEditor) ReadLine(prompt string) (string, error) {
 			historyPos = len(e.historyItems())
 			draft = string(e.buf)
 		case keyLeft:
+			if e.menu.active {
+				e.moveCompletion(-1)
+				break
+			}
 			e.menu.active = false
 			if e.cursor > 0 {
 				e.cursor--
 			}
 		case keyRight:
+			if e.menu.active {
+				e.moveCompletion(1)
+				break
+			}
 			e.menu.active = false
 			if e.cursor < len(e.buf) {
 				e.cursor++
@@ -223,6 +249,8 @@ func (e *lineEditor) ReadLine(prompt string) (string, error) {
 		case keyTab:
 			if e.menu.active {
 				e.moveCompletion(1)
+			} else if onlyTabs(e.buf) {
+				e.insertRune('\t')
 			} else {
 				e.startCompletion()
 			}
@@ -231,13 +259,7 @@ func (e *lineEditor) ReadLine(prompt string) (string, error) {
 				e.moveCompletion(-1)
 			}
 		case keyPageUp:
-			if e.menu.active {
-				e.pageCompletion(-1)
-			}
 		case keyPageDown:
-			if e.menu.active {
-				e.pageCompletion(1)
-			}
 		case keyEscape:
 			e.menu.active = false
 		case keyUnknown:
@@ -286,6 +308,15 @@ func (e *lineEditor) insertRune(r rune) {
 	e.cursor++
 }
 
+func onlyTabs(buf []rune) bool {
+	for _, r := range buf {
+		if r != '\t' {
+			return false
+		}
+	}
+	return true
+}
+
 func (e *lineEditor) deleteLeft() {
 	e.menu.active = false
 	if e.cursor == 0 {
@@ -309,7 +340,7 @@ func (e *lineEditor) startCompletion() {
 	if e.completer == nil {
 		return
 	}
-	items, replaceLen := e.completer.Complete(e.buf, e.cursor)
+	items, replaceLen, kind := e.completer.CompleteWithKind(e.buf, e.cursor)
 	if len(items) == 0 {
 		e.bell()
 		return
@@ -326,13 +357,46 @@ func (e *lineEditor) startCompletion() {
 	if tokenStart < 0 {
 		tokenStart = 0
 	}
+	if kind == completionCommand && len(items) > commandCompletionAskLimit {
+		e.confirm = completionConfirm{
+			active:     true,
+			items:      items,
+			replaceLen: replaceLen,
+			token:      string(e.buf[tokenStart:e.cursor]),
+		}
+		return
+	}
+	e.openCompletionMenu(items, replaceLen, string(e.buf[tokenStart:e.cursor]))
+}
+
+func (e *lineEditor) openCompletionMenu(items []string, replaceLen int, token string) {
 	e.menu = completionMenu{
 		active:     true,
 		items:      items,
 		replaceLen: replaceLen,
-		token:      string(e.buf[tokenStart:e.cursor]),
+		token:      token,
 		selected:   0,
-		pageSize:   e.pageSize,
+	}
+	e.confirm = completionConfirm{}
+}
+
+func (e *lineEditor) handleCompletionConfirm(ev keyEvent) {
+	switch ev.key {
+	case keyRune:
+		switch ev.r {
+		case 'y', 'Y':
+			confirm := e.confirm
+			e.openCompletionMenu(confirm.items, confirm.replaceLen, confirm.token)
+		case 'n', 'N':
+			e.confirm = completionConfirm{}
+		default:
+			e.confirm = completionConfirm{}
+			e.insertRune(ev.r)
+		}
+	case keyEnter, keyEscape, keyCtrlC:
+		e.confirm = completionConfirm{}
+	default:
+		e.bell()
 	}
 }
 
@@ -372,69 +436,39 @@ func (e *lineEditor) moveCompletion(delta int) {
 	if e.menu.selected >= len(e.menu.items) {
 		e.menu.selected = 0
 	}
-	e.menu.page = e.menu.selected / e.effectivePageSize()
-}
-
-func (e *lineEditor) pageCompletion(delta int) {
-	if !e.menu.active || len(e.menu.items) == 0 {
-		return
-	}
-	pageSize := e.effectivePageSize()
-	pages := (len(e.menu.items) + pageSize - 1) / pageSize
-	e.menu.page += delta
-	if e.menu.page < 0 {
-		e.menu.page = pages - 1
-	}
-	if e.menu.page >= pages {
-		e.menu.page = 0
-	}
-	e.menu.selected = e.menu.page * pageSize
-	if e.menu.selected >= len(e.menu.items) {
-		e.menu.selected = len(e.menu.items) - 1
-	}
-}
-
-func (e *lineEditor) effectivePageSize() int {
-	if e.menu.pageSize > 0 {
-		return e.menu.pageSize
-	}
-	if e.pageSize > 0 {
-		return e.pageSize
-	}
-	return defaultCompletionPageSize
 }
 
 func (e *lineEditor) menuColumns() int {
-	page := e.menuPageItems()
-	if len(page) == 0 {
+	if !e.menu.active || len(e.menu.items) == 0 {
 		return 1
 	}
-	width := maxCompletionDisplayWidth(page, e.menu.token) + 2
-	if width < 8 {
-		width = 8
+	return e.completionColumns(e.menu.items, e.menu.token)
+}
+
+func (e *lineEditor) completionColumns(items []string, token string) int {
+	if len(items) == 0 {
+		return 1
 	}
-	cols := e.width / width
+	cols := e.width / e.completionItemWidth(items, token)
 	if cols < 1 {
 		return 1
 	}
 	return cols
 }
 
-func (e *lineEditor) menuPageItems() []string {
-	if !e.menu.active {
-		return nil
+func (e *lineEditor) menuItemWidth(items []string) int {
+	return e.completionItemWidth(items, e.menu.token)
+}
+
+func (e *lineEditor) completionItemWidth(items []string, token string) int {
+	width := maxCompletionDisplayWidth(items, token) + completionMenuCellPadding
+	if width < completionMenuMinItemWidth {
+		return completionMenuMinItemWidth
 	}
-	pageSize := e.effectivePageSize()
-	start := e.menu.page * pageSize
-	if start >= len(e.menu.items) {
-		start = 0
-		e.menu.page = 0
+	if width > completionMenuMaxItemWidth {
+		return completionMenuMaxItemWidth
 	}
-	end := start + pageSize
-	if end > len(e.menu.items) {
-		end = len(e.menu.items)
-	}
-	return e.menu.items[start:end]
+	return width
 }
 
 func (e *lineEditor) refresh() {
@@ -448,48 +482,45 @@ func (e *lineEditor) refresh() {
 	if e.menu.active {
 		e.renderMenu()
 	}
+	if e.confirm.active {
+		e.renderCompletionConfirm()
+	}
 	fmt.Fprint(e.out, "\x1b8")
 }
 
 func (e *lineEditor) renderMenu() {
-	page := e.menuPageItems()
-	if len(page) == 0 {
+	if !e.menu.active || len(e.menu.items) == 0 {
 		return
 	}
 	cols := e.menuColumns()
-	width := maxCompletionDisplayWidth(page, e.menu.token) + 2
-	if width < 8 {
-		width = 8
+	width := e.menuItemWidth(e.menu.items)
+	displayWidth := width - completionMenuCellPadding
+	if displayWidth < 1 {
+		displayWidth = 1
 	}
-	start := e.menu.page * e.effectivePageSize()
-	for i, item := range page {
+	for i, item := range e.menu.items {
 		if i%cols == 0 {
 			fmt.Fprint(e.out, "\r\n")
 		}
-		idx := start + i
-		text := e.completionDisplayText(item)
-		if idx == e.menu.selected {
+		text := truncateCompletionDisplay(e.completionDisplayText(item), displayWidth)
+		if i == e.menu.selected {
 			fmt.Fprint(e.out, "\x1b[30;47m")
 		}
 		fmt.Fprint(e.out, padRight(text, width))
-		if idx == e.menu.selected {
+		if i == e.menu.selected {
 			fmt.Fprint(e.out, colorReset)
 		}
 	}
-	total := len(e.menu.items)
-	pageSize := e.effectivePageSize()
-	if total > pageSize {
-		pages := (total + pageSize - 1) / pageSize
-		fmt.Fprintf(e.out, "\r\n%s%d-%d of %d, page %d/%d%s",
-			colorYellow,
-			start+1,
-			start+len(page),
-			total,
-			e.menu.page+1,
-			pages,
-			colorReset,
-		)
-	}
+}
+
+func (e *lineEditor) renderCompletionConfirm() {
+	lineCount := completionDisplayLines(len(e.confirm.items), e.completionColumns(e.confirm.items, e.confirm.token))
+	fmt.Fprintf(e.out, "\r\n%sdo you wish to see all %d possibilities (%d lines)?%s",
+		colorYellow,
+		len(e.confirm.items),
+		lineCount,
+		colorReset,
+	)
 }
 
 func (e *lineEditor) completionDisplayText(item string) string {
@@ -681,10 +712,31 @@ func maxCompletionDisplayWidth(items []string, token string) int {
 	return max
 }
 
+func completionDisplayLines(items, cols int) int {
+	if cols < 1 {
+		cols = 1
+	}
+	if items <= 0 {
+		return 0
+	}
+	return (items + cols - 1) / cols
+}
+
 func padRight(value string, width int) string {
 	padding := width - len([]rune(value))
 	if padding <= 0 {
 		return value
 	}
 	return value + strings.Repeat(" ", padding)
+}
+
+func truncateCompletionDisplay(value string, width int) string {
+	runes := []rune(value)
+	if width <= 0 || len(runes) <= width {
+		return value
+	}
+	if width == 1 {
+		return "~"
+	}
+	return string(runes[:width-1]) + "~"
 }

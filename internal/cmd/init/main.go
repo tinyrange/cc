@@ -225,6 +225,9 @@ func run() error {
 		if err := configureHostname(cfg.Hostname); err != nil {
 			return fmt.Errorf("configure hostname: %w", err)
 		}
+		if err := configurePackageManagers(""); err != nil {
+			return fmt.Errorf("configure package managers: %w", err)
+		}
 		if cfg.PrecopyAMD64Root {
 			writeStage(bootStart, "precopying amd64 root")
 			if err := precopyAMD64Root(); err != nil {
@@ -1404,6 +1407,31 @@ func configureHostname(hostname string) error {
 	return nil
 }
 
+func configurePackageManagers(rootDir string) error {
+	aptDir := rootPath(rootDir, "/etc/apt/apt.conf.d")
+	if !pathExists(rootPath(rootDir, "/usr/bin/apt")) && !pathExists(rootPath(rootDir, "/bin/apt")) {
+		return nil
+	}
+	if err := os.MkdirAll(aptDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", aptDir, err)
+	}
+	conf := strings.Join([]string{
+		`Acquire::Queue-Mode "access";`,
+		`Acquire::http::Pipeline-Depth "0";`,
+		`Acquire::https::Pipeline-Depth "0";`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(aptDir, "99ccvm-netstack"), []byte(conf), 0o644); err != nil {
+		return fmt.Errorf("write apt netstack config: %w", err)
+	}
+	return nil
+}
+
+func pathExists(name string) bool {
+	_, err := os.Stat(name)
+	return err == nil
+}
+
 func ensureCredentialUser(rootDir string, cred *syscall.Credential) error {
 	if cred == nil || cred.Uid == 0 {
 		return nil
@@ -1559,7 +1587,7 @@ func credentialForUser(user string) (*syscall.Credential, error) {
 		return nil, nil
 	}
 	if user == "root" || user == "0" || user == "0:0" {
-		return &syscall.Credential{Uid: 0, Gid: 0}, nil
+		return nil, nil
 	}
 	uidPart, gidPart, hasGID := strings.Cut(user, ":")
 	if uidPart == "" {
@@ -1611,7 +1639,11 @@ func prepareExecRoot(rootDir string) (string, []string, error) {
 			teardownExecRoot(mounts)
 			return "", nil, fmt.Errorf("mkdir %s: %w", target, err)
 		}
-		if err := syscall.Mount(dir, target, "", syscall.MS_BIND, ""); err != nil {
+		flags := uintptr(syscall.MS_BIND)
+		if dir == "/dev" {
+			flags |= syscall.MS_REC
+		}
+		if err := syscall.Mount(dir, target, "", flags, ""); err != nil {
 			teardownExecRoot(mounts)
 			return "", nil, fmt.Errorf("bind mount %s -> %s: %w", dir, target, err)
 		}

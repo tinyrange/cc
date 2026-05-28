@@ -245,6 +245,7 @@ type VM struct {
 	vcpuCreated bool
 	exitInfo    *VcpuExit
 	mappings    []mapping
+	mappingsMu  sync.RWMutex
 	threadCh    chan func()
 	threadMu    sync.Mutex
 	closed      bool
@@ -540,7 +541,9 @@ func (v *VM) MapMemory(mem []byte, ipa IPA, flags MemoryFlags) error {
 			errCh <- fmt.Errorf("map memory: %w", ret)
 			return
 		}
+		v.mappingsMu.Lock()
 		v.mappings = append(v.mappings, mapping{ipa: ipa, size: uintptr(len(mem)), mem: mem})
+		v.mappingsMu.Unlock()
 		errCh <- nil
 	}
 	return <-errCh
@@ -557,9 +560,11 @@ func (v *VM) MapAnonymousMemory(size uintptr, ipa IPA, flags MemoryFlags) ([]byt
 	}
 	done := make(chan struct{}, 1)
 	v.threadCh <- func() {
+		v.mappingsMu.Lock()
 		if len(v.mappings) > 0 {
 			v.mappings[len(v.mappings)-1].anonymous = true
 		}
+		v.mappingsMu.Unlock()
 		done <- struct{}{}
 	}
 	<-done
@@ -854,7 +859,11 @@ func (v *VM) Close() error {
 		v.vcpuCreated = false
 		v.vcpu = 0
 	}
-	for _, m := range v.mappings {
+	v.mappingsMu.Lock()
+	mappings := append([]mapping(nil), v.mappings...)
+	v.mappings = nil
+	v.mappingsMu.Unlock()
+	for _, m := range mappings {
 		m := m
 		errCh := make(chan error, 1)
 		v.threadCh <- func() {
@@ -873,7 +882,6 @@ func (v *VM) Close() error {
 			}
 		}
 	}
-	v.mappings = nil
 	errCh := make(chan error, 1)
 	v.threadCh <- func() {
 		if ret := destroyVMWithRetry(); ret != hvSuccess {
@@ -1146,55 +1154,43 @@ func (v *VM) ReadIPA(addr uint64, size int) ([]byte, error) {
 	if size < 0 {
 		return nil, fmt.Errorf("invalid read size %d", size)
 	}
-	respCh := make(chan struct {
-		data []byte
-		err  error
-	}, 1)
-	if err := v.callOnThread(func() {
-		for _, m := range v.mappings {
-			start := uint64(m.ipa)
-			end := start + uint64(m.size)
-			if addr < start || addr+uint64(size) > end {
-				continue
-			}
-			off := addr - start
-			data := append([]byte(nil), m.mem[off:off+uint64(size)]...)
-			respCh <- struct {
-				data []byte
-				err  error
-			}{data: data}
-			return
-		}
-		respCh <- struct {
-			data []byte
-			err  error
-		}{err: fmt.Errorf("read guest memory %#x size %d: unmapped", addr, size)}
-	}); err != nil {
+	data := make([]byte, size)
+	if err := v.ReadIPAInto(addr, data); err != nil {
 		return nil, err
 	}
-	res := <-respCh
-	return res.data, res.err
+	return data, nil
+}
+
+func (v *VM) ReadIPAInto(addr uint64, dst []byte) error {
+	v.mappingsMu.RLock()
+	defer v.mappingsMu.RUnlock()
+	for _, m := range v.mappings {
+		start := uint64(m.ipa)
+		end := start + uint64(m.size)
+		if addr < start || addr+uint64(len(dst)) > end {
+			continue
+		}
+		off := addr - start
+		copy(dst, m.mem[off:off+uint64(len(dst))])
+		return nil
+	}
+	return fmt.Errorf("read guest memory %#x size %d: unmapped", addr, len(dst))
 }
 
 func (v *VM) WriteIPA(addr uint64, data []byte) error {
-	errCh := make(chan error, 1)
-	if err := v.callOnThread(func() {
-		for _, m := range v.mappings {
-			start := uint64(m.ipa)
-			end := start + uint64(m.size)
-			if addr < start || addr+uint64(len(data)) > end {
-				continue
-			}
-			off := addr - start
-			copy(m.mem[off:off+uint64(len(data))], data)
-			errCh <- nil
-			return
+	v.mappingsMu.RLock()
+	defer v.mappingsMu.RUnlock()
+	for _, m := range v.mappings {
+		start := uint64(m.ipa)
+		end := start + uint64(m.size)
+		if addr < start || addr+uint64(len(data)) > end {
+			continue
 		}
-		errCh <- fmt.Errorf("write guest memory %#x size %d: unmapped", addr, len(data))
-	}); err != nil {
-		return err
+		off := addr - start
+		copy(m.mem[off:off+uint64(len(data))], data)
+		return nil
 	}
-	return <-errCh
+	return fmt.Errorf("write guest memory %#x size %d: unmapped", addr, len(data))
 }
 
 const gicSPIBase = 32
@@ -1204,6 +1200,9 @@ func (v *VM) SetIRQ(irq uint32, level bool) error {
 		return fmt.Errorf("irq %d out of range", irq)
 	}
 	intid := irq + gicSPIBase
+	if level {
+		_ = v.CancelRun()
+	}
 	errCh := make(chan error, 1)
 	if err := v.callOnThread(func() {
 		if ret := hvGICSetSPI(intid, level); ret != hvSuccess {

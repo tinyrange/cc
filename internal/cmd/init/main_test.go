@@ -126,6 +126,45 @@ func TestEnsureCredentialUserCreatesPasswdGroupAndHome(t *testing.T) {
 	}
 }
 
+func TestCredentialForRootPreservesInitCredentials(t *testing.T) {
+	for _, user := range []string{"root", "0", "0:0"} {
+		cred, err := credentialForUser(user)
+		if err != nil {
+			t.Fatalf("credentialForUser(%q) error = %v", user, err)
+		}
+		if cred != nil {
+			t.Fatalf("credentialForUser(%q) = %#v, want nil", user, cred)
+		}
+	}
+}
+
+func TestConfigurePackageManagersWritesAptNetstackConfig(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "usr", "bin"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(/usr/bin) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "usr", "bin", "apt"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile(apt) error = %v", err)
+	}
+	if err := configurePackageManagers(root); err != nil {
+		t.Fatalf("configurePackageManagers() error = %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "etc", "apt", "apt.conf.d", "99ccvm-netstack"))
+	if err != nil {
+		t.Fatalf("ReadFile(apt config) error = %v", err)
+	}
+	text := string(got)
+	for _, want := range []string{
+		`Acquire::Queue-Mode "access";`,
+		`Acquire::http::Pipeline-Depth "0";`,
+		`Acquire::https::Pipeline-Depth "0";`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("apt config = %q, want %q", text, want)
+		}
+	}
+}
+
 func fmtUint32(v uint32) string {
 	return itoa(int(v))
 }

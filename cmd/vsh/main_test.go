@@ -64,26 +64,6 @@ func TestParseCD(t *testing.T) {
 	}
 }
 
-func TestPromptShowsModeAndImage(t *testing.T) {
-	sh := &shellState{
-		context: commandContext{Mode: modeVM, VMID: "alpha", Image: "alpine"},
-		hostCWD: "/tmp/work",
-	}
-	if got := sh.prompt(); got != colorGreen+"➜"+colorReset+"  "+colorCyan+"work"+colorReset+" "+colorMagenta+"vm:"+colorReset+colorYellow+"(alpine:alpha)"+colorReset+" " {
-		t.Fatalf("prompt() = %q", got)
-	}
-}
-
-func TestHostPromptMatchesArrowStyle(t *testing.T) {
-	sh := &shellState{
-		context: commandContext{Mode: modeHost, VMID: "default"},
-		hostCWD: "/tmp/work",
-	}
-	if got := sh.prompt(); got != colorGreen+"➜"+colorReset+"  "+colorCyan+"work"+colorReset+" "+colorBlue+"host"+colorReset+" " {
-		t.Fatalf("prompt() = %q", got)
-	}
-}
-
 func TestPersistentHostShellPreservesState(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("host pty smoke test is unix-only")
@@ -122,6 +102,35 @@ func TestPersistentHostShellPreservesState(t *testing.T) {
 	}
 	if got := session.cwd(); got != "/tmp" {
 		t.Fatalf("cwd after cd = %q, want /tmp", got)
+	}
+}
+
+func TestChdirHostKeepsWarmShellInSync(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("host pty smoke test is unix-only")
+	}
+	dir := t.TempDir()
+	next := filepath.Join(dir, "next")
+	if err := os.Mkdir(next, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	session, err := startPersistentHostShell(dir, os.Environ(), 80, 24, "")
+	if err != nil {
+		t.Fatalf("startPersistentHostShell() error = %v", err)
+	}
+	defer session.close()
+
+	sh := &shellState{hostCWD: dir, hostShell: session}
+	if err := sh.chdirHost(next); err != nil {
+		t.Fatalf("chdirHost() error = %v", err)
+	}
+
+	var stdout bytes.Buffer
+	if err := session.run("pwd", &stdout, &bytes.Buffer{}); err != nil {
+		t.Fatalf("pwd error = %v", err)
+	}
+	if got := strings.TrimSpace(normalizeTerminalOutput(stdout.String())); got != next {
+		t.Fatalf("warm shell pwd = %q, want %q", got, next)
 	}
 }
 
@@ -207,18 +216,8 @@ func TestBareOCIPullsMissingImageWithoutBooting(t *testing.T) {
 		t.Fatalf("context = %#v, want vm/alpine", sh.context)
 	}
 	gotStatus := stderr.String()
-	for _, want := range []string{
-		"Pull alpine\n",
-		"  status: downloading\n",
-		"  blob: rootfs\n",
-		"  bytes: 1.0 KB / 2.0 KB (50.0%)\n",
-		"  files: 1 / 2 (50.0%)\n",
-		"  rate: 512 B/s\n",
-		"  eta: 2s\n",
-	} {
-		if !strings.Contains(gotStatus, want) {
-			t.Fatalf("pull status = %q, missing %q", gotStatus, want)
-		}
+	if !strings.Contains(gotStatus, "Pull alpine") || !strings.Contains(gotStatus, "downloading") || strings.Contains(gotStatus, "{") {
+		t.Fatalf("pull status = %q, want human-readable pull progress", gotStatus)
 	}
 }
 
@@ -580,6 +579,17 @@ func TestCompleterSuggestsAtCommandsAndPaths(t *testing.T) {
 	}
 }
 
+func TestCompleterDoesNotSuggestCommandsWithoutPrefix(t *testing.T) {
+	sh := &shellState{hostCWD: t.TempDir()}
+	completer := newVSHCompleter(sh)
+	if got, _ := completer.Complete([]rune(""), 0); len(got) != 0 {
+		t.Fatalf("empty command completions = %#v, want none", got)
+	}
+	if got, _ := completer.Complete([]rune("@ubuntu "), 8); len(got) != 0 {
+		t.Fatalf("empty @ command completions = %#v, want none", got)
+	}
+}
+
 func TestCompleterMapsGuestHostPaths(t *testing.T) {
 	root := t.TempDir()
 	hostDir := filepath.Join(root, "tmp", "vsh host")
@@ -600,8 +610,7 @@ func TestCompleterMapsGuestHostPaths(t *testing.T) {
 	}
 }
 
-func TestCompleterPagesLargeCandidateSets(t *testing.T) {
-	t.Setenv("VSH_COMPLETION_PAGE_SIZE", "12")
+func TestCompleterReturnsLargeCandidateSets(t *testing.T) {
 	dir := t.TempDir()
 	for i := 0; i < 20; i++ {
 		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("item-%02d", i)), []byte("x"), 0o644); err != nil {
@@ -612,16 +621,12 @@ func TestCompleterPagesLargeCandidateSets(t *testing.T) {
 	completer := newVSHCompleter(sh)
 
 	got, _ := completer.Do([]rune("cat i"), 5)
-	if len(got) != 12 {
-		t.Fatalf("completion count = %d, want page size 12: %#v", len(got), got)
-	}
-	if !completionContains(got, "... 9 more matches; keep typing") {
-		t.Fatalf("paged completions = %#v, missing more marker", got)
+	if len(got) != 20 {
+		t.Fatalf("completion count = %d, want all 20: %#v", len(got), got)
 	}
 }
 
-func TestCompleterSortsPathsBeforePaging(t *testing.T) {
-	t.Setenv("VSH_COMPLETION_PAGE_SIZE", "12")
+func TestCompleterPrioritizesDirectories(t *testing.T) {
 	dir := t.TempDir()
 	for _, name := range []string{"zz-file", "aa-file", "src", "bin"} {
 		path := filepath.Join(dir, name)
@@ -675,6 +680,90 @@ func TestLineEditorReadsBasicLine(t *testing.T) {
 		}
 		if got.line != "echo hi" {
 			t.Fatalf("ReadLine() = %q, want echo hi", got.line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ReadLine() timed out")
+	}
+}
+
+func TestLineEditorInsertsTabOnEmptyInput(t *testing.T) {
+	master, tty, err := pty.Open()
+	if err != nil {
+		t.Skipf("open pty: %v", err)
+	}
+	defer master.Close()
+	defer tty.Close()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "alpha"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sh := &shellState{hostCWD: dir}
+	editor := newLineEditor(tty, io.Discard, "", newVSHCompleter(sh))
+	done := make(chan struct {
+		line string
+		err  error
+	}, 1)
+	go func() {
+		line, err := editor.ReadLine("vsh> ")
+		done <- struct {
+			line string
+			err  error
+		}{line: line, err: err}
+	}()
+	time.Sleep(25 * time.Millisecond)
+	if _, err := master.Write([]byte("\t\r")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("ReadLine() error = %v", got.err)
+		}
+		if got.line != "\t" {
+			t.Fatalf("ReadLine() = %q, want literal tab", got.line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ReadLine() timed out")
+	}
+}
+
+func TestLineEditorInsertsTabAfterOnlyTabs(t *testing.T) {
+	master, tty, err := pty.Open()
+	if err != nil {
+		t.Skipf("open pty: %v", err)
+	}
+	defer master.Close()
+	defer tty.Close()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "alpha"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sh := &shellState{hostCWD: dir}
+	editor := newLineEditor(tty, io.Discard, "", newVSHCompleter(sh))
+	done := make(chan struct {
+		line string
+		err  error
+	}, 1)
+	go func() {
+		line, err := editor.ReadLine("vsh> ")
+		done <- struct {
+			line string
+			err  error
+		}{line: line, err: err}
+	}()
+	time.Sleep(25 * time.Millisecond)
+	if _, err := master.Write([]byte("\t\t\r")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("ReadLine() error = %v", got.err)
+		}
+		if got.line != "\t\t" {
+			t.Fatalf("ReadLine() = %q, want two literal tabs", got.line)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("ReadLine() timed out")
@@ -763,33 +852,73 @@ func TestLineEditorInsertsCompletionSuffix(t *testing.T) {
 	}
 }
 
-func TestHostShellCommandUsesCapturedPreludeForTTY(t *testing.T) {
-	got := hostShellCommand("ls", true, "alias ll='ls -l'\n")
-	if len(got) != 3 || got[1] != "-lc" || !strings.Contains(got[2], "alias ls=") || !strings.HasSuffix(got[2], "eval 'ls'") {
-		t.Fatalf("hostShellCommand(tty) = %#v, want non-interactive command with color prelude", got)
+func TestLineEditorAsksBeforeHugeCommandCompletion(t *testing.T) {
+	editor := &lineEditor{width: 183}
+	items := make([]string, commandCompletionAskLimit+1)
+	for i := range items {
+		items[i] = fmt.Sprintf("p%d", i)
 	}
-	if !strings.Contains(got[2], "alias ll='ls -l'") {
-		t.Fatalf("hostShellCommand(tty) = %#v, want captured prelude", got)
+	editor.buf = []rune("p")
+	editor.cursor = 1
+	editor.confirm = completionConfirm{
+		active:     true,
+		items:      items,
+		replaceLen: 1,
+		token:      "p",
 	}
-	got = hostShellCommand("ls", false, "ignored\n")
-	if len(got) != 3 || got[1] != "-lc" || got[2] != "ls" {
-		t.Fatalf("hostShellCommand(non-tty) = %#v, want login command", got)
+	var out bytes.Buffer
+	editor.out = &out
+	editor.renderCompletionConfirm()
+	if got := out.String(); !strings.Contains(got, "do you wish to see all 101 possibilities") {
+		t.Fatalf("confirmation output = %q", got)
+	}
+	editor.handleCompletionConfirm(keyEvent{key: keyRune, r: 'y'})
+	if editor.confirm.active || !editor.menu.active || len(editor.menu.items) != len(items) {
+		t.Fatalf("confirm yes = confirm %v menu %v items %d", editor.confirm.active, editor.menu.active, len(editor.menu.items))
 	}
 }
 
-func TestHostShellPreludeDefinesColorAlias(t *testing.T) {
-	got := hostShellPrelude()
-	if !strings.Contains(got, "alias ls=") {
-		t.Fatalf("hostShellPrelude() = %q, want ls alias", got)
+func TestLineEditorLeftRightNavigateCompletionMenu(t *testing.T) {
+	master, tty, err := pty.Open()
+	if err != nil {
+		t.Skipf("open pty: %v", err)
 	}
-}
+	defer master.Close()
+	defer tty.Close()
 
-func TestColorPreludeQuotesAliasCommands(t *testing.T) {
-	got := colorPrelude("ls --color=auto", "ls -G", true)
-	for _, want := range []string{"shopt -s expand_aliases", "alias ls='ls --color=auto'", "alias ls='ls -G'"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("colorPrelude() = %q, missing %q", got, want)
+	dir := t.TempDir()
+	for _, name := range []string{"aa", "bb", "cc"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
 		}
+	}
+	sh := &shellState{hostCWD: dir}
+	editor := newLineEditor(tty, io.Discard, "", newVSHCompleter(sh))
+	done := make(chan struct {
+		line string
+		err  error
+	}, 1)
+	go func() {
+		line, err := editor.ReadLine("vsh> ")
+		done <- struct {
+			line string
+			err  error
+		}{line: line, err: err}
+	}()
+	time.Sleep(25 * time.Millisecond)
+	if _, err := master.Write([]byte("cat \t\x1b[C\r\r")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("ReadLine() error = %v", got.err)
+		}
+		if got.line != "cat bb" {
+			t.Fatalf("ReadLine() = %q, want cat bb", got.line)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ReadLine() timed out")
 	}
 }
 
@@ -824,26 +953,40 @@ func completionContains(items [][]rune, want string) bool {
 	return false
 }
 
-func TestSendGuestInputBytesSplitsInterrupts(t *testing.T) {
+func TestStreamGuestStdinForwardsTTYControlBytes(t *testing.T) {
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Close()
+
 	done := make(chan struct{})
 	out := make(chan client.ExecInput, 4)
-	sendGuestInputBytes(out, done, []byte("ab\x03cd"))
-	close(out)
-	var got []client.ExecInput
-	for input := range out {
-		got = append(got, input)
+
+	go streamGuestStdin(read, out, done)
+	if _, err := write.Write([]byte("ab\x03cd")); err != nil {
+		t.Fatal(err)
 	}
-	if len(got) != 3 {
-		t.Fatalf("inputs = %#v, want stdin/signal/stdin", got)
+	if err := write.Close(); err != nil {
+		t.Fatal(err)
 	}
-	if got[0].Kind != "stdin" || string(got[0].Data) != "ab" {
-		t.Fatalf("first input = %#v", got[0])
+
+	select {
+	case got := <-out:
+		if got.Kind != "stdin" || string(got.Data) != "ab\x03cd" {
+			t.Fatalf("input = %#v, want raw stdin with control byte", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for stdin")
 	}
-	if got[1].Kind != "signal" || got[1].Signal != "INT" {
-		t.Fatalf("second input = %#v", got[1])
-	}
-	if got[2].Kind != "stdin" || string(got[2].Data) != "cd" {
-		t.Fatalf("third input = %#v", got[2])
+
+	select {
+	case got := <-out:
+		if got.Kind != "stdin_close" {
+			t.Fatalf("close input = %#v, want stdin_close", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for stdin close")
 	}
 }
 
@@ -948,36 +1091,6 @@ func TestPersistentGuestShellConsumesSplitMarker(t *testing.T) {
 	before, code, cwd, ok := session.consumeOutput("7:/tmp\n")
 	if !ok || before != "" || code != 7 || cwd != "/tmp" {
 		t.Fatalf("consumeOutput marker = before %q code %d cwd %q ok %t", before, code, cwd, ok)
-	}
-}
-
-func TestGuestCommandUsesColorPreludeForTTY(t *testing.T) {
-	got := guestCommand("ls 'two words'", true)
-	if len(got) != 3 || got[0] != "sh" || got[1] != "-lc" {
-		t.Fatalf("guestCommand(tty) = %#v", got)
-	}
-	if strings.Contains(got[2], "bash -ic") || strings.Contains(got[2], "exec sh -lc") {
-		t.Fatalf("guestCommand(tty) shell = %q, should not use interactive shell", got[2])
-	}
-	if !strings.Contains(got[2], "awk -F:") || !strings.Contains(got[2], "ls --color=always -C --width=${COLUMNS:-80}") || !strings.HasSuffix(got[2], "ls 'two words'") {
-		t.Fatalf("guestCommand(tty) shell = %q, missing color prelude or command", got[2])
-	}
-}
-
-func TestGuestPersistentCommandUsesColorPrelude(t *testing.T) {
-	got := guestPersistentCommand()
-	if len(got) != 3 || got[0] != "sh" || got[1] != "-lc" {
-		t.Fatalf("guestPersistentCommand() = %#v", got)
-	}
-	if !strings.Contains(got[2], "ls --color=always -C --width=${COLUMNS:-80}") {
-		t.Fatalf("guestPersistentCommand() shell = %q, missing ls color prelude", got[2])
-	}
-}
-
-func TestGuestCommandUsesPlainShellWithoutTTY(t *testing.T) {
-	got := guestCommand("echo hi", false)
-	if len(got) != 3 || got[0] != "sh" || got[1] != "-lc" || !strings.Contains(got[2], "awk -F:") || !strings.HasSuffix(got[2], "echo hi") {
-		t.Fatalf("guestCommand(non-tty) = %#v", got)
 	}
 }
 

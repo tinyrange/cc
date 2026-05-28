@@ -8,7 +8,9 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -62,6 +64,7 @@ const (
 	fuseUnlink     = 10
 	fuseRmDir      = 11
 	fuseRename     = 12
+	fuseLink       = 13
 	fuseOpen       = 14
 	fuseRead       = 15
 	fuseWrite      = 16
@@ -84,6 +87,7 @@ const (
 	fuseDestroy    = 38
 	fuseIoctl      = 39
 	fusePoll       = 40
+	fuseRename2    = 45
 	fuseLseek      = 46
 	fuseSyncFS     = 50
 	fuseTmpfile    = 51
@@ -192,6 +196,10 @@ type fsSymlinkBackend interface {
 	Symlink(parent uint64, name string, target string, uid uint32, gid uint32) (nodeID uint64, attr FuseAttr, errno int32)
 }
 
+type fsLinkBackend interface {
+	Link(nodeID uint64, newParent uint64, newName string) (newNodeID uint64, attr FuseAttr, errno int32)
+}
+
 type fsRmDirBackend interface {
 	RmDir(parent uint64, name string) int32
 }
@@ -249,6 +257,7 @@ type FS struct {
 	RecordTiming   func(name string, duration time.Duration)
 	cacheMode      string
 	writebackCache bool
+	workerCount    int
 	entryTTL       time.Duration
 	attrTTL        time.Duration
 
@@ -283,7 +292,6 @@ type FS struct {
 
 const fuseStatsSlots = 64
 const fsStageCount = 4
-const fsWorkerCount = 1
 const fsInlineRespDescs = 32
 const fsPooledReqSize = 4096
 
@@ -315,13 +323,13 @@ type fsCompletionKey struct {
 
 type fsCompletion struct {
 	work  fsWork
-	reply []byte
+	reply fsReply
 	err   error
 }
 
 type fsInlineCompletion struct {
 	work  fsWork
-	reply []byte
+	reply fsReply
 	err   error
 }
 
@@ -333,6 +341,10 @@ var fsReqPool = sync.Pool{
 
 type FSStats struct {
 	Tag             string        `json:"tag"`
+	Async           bool          `json:"async"`
+	WorkerCount     int           `json:"worker_count"`
+	CacheMode       string        `json:"cache_mode"`
+	WritebackCache  bool          `json:"writeback_cache"`
 	MMIOReads       uint64        `json:"mmio_reads"`
 	MMIOWrites      uint64        `json:"mmio_writes"`
 	QueueNotifies   []uint64      `json:"queue_notifies"`
@@ -389,9 +401,10 @@ func NewFS(base, size uint64, irq uint32, tag string, backend FSBackend) *FS {
 		Size:           size,
 		IRQ:            irq,
 		backend:        backend,
-		Async:          strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_ASYNC")) != "",
+		Async:          resolveVirtioFSAsync(),
 		cacheMode:      cacheMode,
 		writebackCache: strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_WRITEBACK")) != "",
+		workerCount:    resolveVirtioFSWorkerCount(),
 		entryTTL:       entryTTL,
 		attrTTL:        attrTTL,
 		workCh:         make(chan fsWork, 1024),
@@ -409,6 +422,37 @@ func NewFS(base, size uint64, irq uint32, tag string, backend FSBackend) *FS {
 	return fs
 }
 
+func resolveVirtioFSAsync() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_ASYNC"))) {
+	case "", "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+func resolveVirtioFSWorkerCount() int {
+	const maxWorkers = 64
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = 1
+	}
+	if value := strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_WORKERS")); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil {
+			workers = parsed
+		}
+	}
+	if workers < 1 {
+		return 1
+	}
+	if workers > maxWorkers {
+		return maxWorkers
+	}
+	return workers
+}
+
 func resolveFSCachePolicy() (string, time.Duration, time.Duration) {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_CACHE"))) {
 	case fsCacheStrict:
@@ -416,7 +460,7 @@ func resolveFSCachePolicy() (string, time.Duration, time.Duration) {
 	case fsCacheAggressive:
 		return fsCacheAggressive, 60 * time.Second, 60 * time.Second
 	default:
-		return fsCacheNormal, time.Second, time.Second
+		return fsCacheNormal, 0, 0
 	}
 }
 
@@ -719,31 +763,24 @@ func (f *FS) handleRequestLocked(q *queue, head uint16) (uint32, bool, error) {
 		}
 		reqOff += int(d.length)
 	}
-	reply, err := f.dispatchFUSELocked(req)
+	reply, err := f.dispatchFUSEReplyLocked(req)
 	if err != nil {
 		return 0, false, err
 	}
-	if reply == nil {
+	if !reply.ok {
 		return 0, false, nil
 	}
-	offset := 0
-	for _, d := range respDescs {
-		if offset >= len(reply) {
-			break
-		}
-		chunk := len(reply) - offset
-		if chunk > int(d.length) {
-			chunk = int(d.length)
-		}
-		if err := f.mem.WriteIPA(d.addr, reply[offset:offset+chunk]); err != nil {
-			return 0, false, err
-		}
-		offset += chunk
+	var work fsWork
+	work.respCount = len(respDescs)
+	if len(respDescs) <= len(work.respDescs) {
+		copy(work.respDescs[:], respDescs)
+	} else {
+		work.respExtra = append([]fsDesc(nil), respDescs...)
 	}
-	if offset < len(reply) {
-		return 0, false, fmt.Errorf("virtio-fs response truncated: need %d have %d", len(reply), offset)
+	if err := f.writeReplyToResponseDescsLocked(work, reply); err != nil {
+		return 0, false, err
 	}
-	return uint32(len(reply)), true, nil
+	return uint32(reply.Len()), true, nil
 }
 
 func (f *FS) prepareRequestLocked(qidx int, q *queue, head uint16, suppressInterrupt bool) (fsWork, error) {
@@ -830,7 +867,11 @@ func (f *FS) processWorksInline(works []fsWork) error {
 }
 
 func (f *FS) startWorkers() {
-	for i := 0; i < fsWorkerCount; i++ {
+	count := f.workerCount
+	if count < 1 {
+		count = 1
+	}
+	for i := 0; i < count; i++ {
 		go f.runWorker()
 	}
 }
@@ -852,7 +893,7 @@ func (f *FS) runWorker() {
 	}
 }
 
-func (f *FS) completeWork(work fsWork, reply []byte, workErr error) error {
+func (f *FS) completeWork(work fsWork, reply fsReply, workErr error) error {
 	defer f.recordStageTiming(fsStageAsyncComplete, time.Now())
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -892,7 +933,7 @@ func (f *FS) completeWorksInline(completions []fsInlineCompletion) error {
 			if completion.err != nil {
 				return completion.err
 			}
-			if completion.reply == nil {
+			if !completion.reply.ok {
 				continue
 			}
 			if err := f.writeCompletionUsedLocked(q, completion.work, completion.reply); err != nil {
@@ -938,7 +979,7 @@ func (f *FS) drainCompletionsLocked(qidx int) error {
 		if completion.err != nil {
 			return completion.err
 		}
-		if completion.reply == nil {
+		if !completion.reply.ok {
 			continue
 		}
 		if err := f.writeCompletionLocked(q, completion.work, completion.reply); err != nil {
@@ -947,12 +988,13 @@ func (f *FS) drainCompletionsLocked(qidx int) error {
 	}
 }
 
-func (f *FS) writeCompletionLocked(q *queue, work fsWork, reply []byte) error {
+func (f *FS) writeCompletionLocked(q *queue, work fsWork, reply fsReply) error {
+	oldUsedIdx := q.usedIdx
 	if err := f.writeCompletionUsedLocked(q, work, reply); err != nil {
 		return err
 	}
 	if (f.driverFeatures&featureRingEventIdx != 0 || !work.suppressInterrupt) && f.isCompletingQueue(work.qidx) {
-		if f.driverFeatures&featureRingEventIdx != 0 && !f.shouldInterruptLocked(q, q.usedIdx-1, q.usedIdx, 0) {
+		if f.driverFeatures&featureRingEventIdx != 0 && !f.shouldInterruptLocked(q, oldUsedIdx, q.usedIdx, 0) {
 			return nil
 		}
 		f.interruptStatus |= fsInterruptVring
@@ -963,29 +1005,51 @@ func (f *FS) writeCompletionLocked(q *queue, work fsWork, reply []byte) error {
 	return nil
 }
 
-func (f *FS) writeCompletionUsedLocked(q *queue, work fsWork, reply []byte) error {
-	offset := 0
-	for i := 0; i < work.respCount; i++ {
-		d := work.responseDesc(i)
-		if offset >= len(reply) {
-			break
-		}
-		chunk := len(reply) - offset
-		if chunk > int(d.length) {
-			chunk = int(d.length)
-		}
-		if err := f.mem.WriteIPA(d.addr, reply[offset:offset+chunk]); err != nil {
-			return err
-		}
-		offset += chunk
-	}
-	if offset < len(reply) {
-		return fmt.Errorf("virtio-fs response truncated: need %d have %d", len(reply), offset)
-	}
-	if err := f.writeUsedLocked(q, work.head, uint32(len(reply))); err != nil {
+func (f *FS) writeCompletionUsedLocked(q *queue, work fsWork, reply fsReply) error {
+	if err := f.writeReplyToResponseDescsLocked(work, reply); err != nil {
 		return err
 	}
-	f.logf("used-ring q=%d head=%d len=%d", work.qidx, work.head, len(reply))
+	if err := f.writeUsedLocked(q, work.head, uint32(reply.Len())); err != nil {
+		return err
+	}
+	f.logf("used-ring q=%d head=%d len=%d", work.qidx, work.head, reply.Len())
+	return nil
+}
+
+func (f *FS) writeReplyToResponseDescsLocked(work fsWork, reply fsReply) error {
+	if !reply.ok {
+		return nil
+	}
+	var header [fuseOutHeaderSize]byte
+	reply.EncodeHeader(header[:])
+	segments := [2][]byte{header[:], reply.extra}
+	descIndex := 0
+	descOffset := uint32(0)
+	written := 0
+	for _, segment := range segments {
+		for len(segment) != 0 {
+			if descIndex >= work.respCount {
+				return fmt.Errorf("virtio-fs response truncated: need %d have %d", reply.Len(), written)
+			}
+			desc := work.responseDesc(descIndex)
+			if descOffset >= desc.length {
+				descIndex++
+				descOffset = 0
+				continue
+			}
+			chunk := len(segment)
+			space := int(desc.length - descOffset)
+			if chunk > space {
+				chunk = space
+			}
+			if err := f.mem.WriteIPA(desc.addr+uint64(descOffset), segment[:chunk]); err != nil {
+				return err
+			}
+			segment = segment[chunk:]
+			descOffset += uint32(chunk)
+			written += chunk
+		}
+	}
 	return nil
 }
 
@@ -997,12 +1061,20 @@ func (w *fsWork) responseDesc(index int) fsDesc {
 }
 
 func (f *FS) dispatchFUSELocked(req []byte) ([]byte, error) {
+	reply, err := f.dispatchFUSEReplyLocked(req)
+	if err != nil || !reply.ok {
+		return nil, err
+	}
+	return reply.Bytes(), nil
+}
+
+func (f *FS) dispatchFUSEReplyLocked(req []byte) (fsReply, error) {
 	return f.dispatchFUSE(req)
 }
 
-func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
+func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 	if len(req) < fuseInHeaderSize {
-		return nil, fmt.Errorf("virtio-fs short request: %d", len(req))
+		return fsReply{}, fmt.Errorf("virtio-fs short request: %d", len(req))
 	}
 	opcode := binary.LittleEndian.Uint32(req[4:8])
 	unique := binary.LittleEndian.Uint64(req[8:16])
@@ -1013,16 +1085,16 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 	defer f.recordFUSEDispatchTiming(opcode, opStart)
 	f.logf("opcode=%d unique=%d node=%d", opcode, unique, nodeID)
 
-	reply := func(errno int32, extra []byte) []byte {
+	reply := func(errno int32, extra []byte) fsReply {
 		return fuseReply(unique, errno, extra)
 	}
 
 	switch opcode {
 	case fuseForget:
-		return nil, nil
+		return fsReply{}, nil
 	case fuseInit:
 		if len(req) < fuseInHeaderSize+16 {
-			return nil, fmt.Errorf("virtio-fs INIT too short")
+			return fsReply{}, fmt.Errorf("virtio-fs INIT too short")
 		}
 		reqMajor := binary.LittleEndian.Uint32(req[40:44])
 		reqMinor := binary.LittleEndian.Uint32(req[44:48])
@@ -1081,7 +1153,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		return reply(0, extra), nil
 	case fuseSetAttr:
 		if len(req) < fuseInHeaderSize+88 {
-			return nil, fmt.Errorf("virtio-fs SETATTR too short")
+			return fsReply{}, fmt.Errorf("virtio-fs SETATTR too short")
 		}
 		if be, ok := f.backend.(fsSetAttrBackend); ok {
 			valid := binary.LittleEndian.Uint32(req[40:44])
@@ -1116,7 +1188,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		return reply(0, extra), nil
 	case fuseMkdir:
 		if len(req) < fuseInHeaderSize+8 {
-			return nil, fmt.Errorf("virtio-fs MKDIR too short")
+			return fsReply{}, fmt.Errorf("virtio-fs MKDIR too short")
 		}
 		name := readCStringName(req[fuseInHeaderSize+8:])
 		mode := binary.LittleEndian.Uint32(req[40:44])
@@ -1131,10 +1203,10 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 			encodeFuseAttr(extra[40:], attr)
 			return reply(0, extra), nil
 		}
-		return nil, fmt.Errorf("virtio-fs missing mkdir backend for parent=%d name=%q", nodeID, name)
+		return fsReply{}, fmt.Errorf("virtio-fs missing mkdir backend for parent=%d name=%q", nodeID, name)
 	case fuseMknod:
 		if len(req) < fuseInHeaderSize+16 {
-			return nil, fmt.Errorf("virtio-fs MKNOD too short")
+			return fsReply{}, fmt.Errorf("virtio-fs MKNOD too short")
 		}
 		name := readCStringName(req[fuseInHeaderSize+16:])
 		mode := binary.LittleEndian.Uint32(req[40:44])
@@ -1154,7 +1226,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 	case fuseSymlink:
 		name, target, ok := readTwoCStringNames(req[fuseInHeaderSize:])
 		if !ok {
-			return nil, fmt.Errorf("virtio-fs SYMLINK malformed payload")
+			return fsReply{}, fmt.Errorf("virtio-fs SYMLINK malformed payload")
 		}
 		f.logPathf("symlink-parent", nodeID, fmt.Sprintf(" name=%q target=%q", name, target))
 		if be, ok := f.backend.(fsSymlinkBackend); ok {
@@ -1176,7 +1248,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		return reply(-linuxENOSYS, nil), nil
 	case fuseOpen:
 		if len(req) < fuseInHeaderSize+8 {
-			return nil, fmt.Errorf("virtio-fs OPEN too short")
+			return fsReply{}, fmt.Errorf("virtio-fs OPEN too short")
 		}
 		flags := binary.LittleEndian.Uint32(req[40:44])
 		f.logPathf("open", nodeID, fmt.Sprintf(" flags=%#x", flags))
@@ -1190,7 +1262,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		return reply(0, extra), nil
 	case fuseRead:
 		if len(req) < fuseInHeaderSize+24 {
-			return nil, fmt.Errorf("virtio-fs READ too short")
+			return fsReply{}, fmt.Errorf("virtio-fs READ too short")
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		off := binary.LittleEndian.Uint64(req[48:56])
@@ -1203,7 +1275,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		return reply(0, data), nil
 	case fuseWrite:
 		if len(req) < fuseInHeaderSize+40 {
-			return nil, fmt.Errorf("virtio-fs WRITE too short")
+			return fsReply{}, fmt.Errorf("virtio-fs WRITE too short")
 		}
 		if be, ok := f.backend.(fsWriteBackend); ok {
 			fh := binary.LittleEndian.Uint64(req[40:48])
@@ -1212,7 +1284,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 			writeFlags := binary.LittleEndian.Uint32(req[60:64])
 			dataStart := fuseInHeaderSize + 40
 			if len(req) < dataStart+int(size) {
-				return nil, fmt.Errorf("virtio-fs WRITE short payload")
+				return fsReply{}, fmt.Errorf("virtio-fs WRITE short payload")
 			}
 			count, errno := be.Write(nodeID, fh, off, req[dataStart:dataStart+int(size)], writeFlags)
 			if errno != 0 {
@@ -1225,14 +1297,14 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		return reply(-linuxENOSYS, nil), nil
 	case fuseRelease:
 		if len(req) < fuseInHeaderSize+24 {
-			return nil, fmt.Errorf("virtio-fs RELEASE too short")
+			return fsReply{}, fmt.Errorf("virtio-fs RELEASE too short")
 		}
 		f.logPathf("release", nodeID, fmt.Sprintf(" fh=%d", binary.LittleEndian.Uint64(req[40:48])))
 		f.backend.Release(nodeID, binary.LittleEndian.Uint64(req[40:48]))
 		return reply(0, nil), nil
 	case fuseFsync:
 		if len(req) < fuseInHeaderSize+16 {
-			return nil, fmt.Errorf("virtio-fs FSYNC too short")
+			return fsReply{}, fmt.Errorf("virtio-fs FSYNC too short")
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		flags := binary.LittleEndian.Uint32(req[48:52])
@@ -1241,12 +1313,12 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 			return reply(be.Fsync(nodeID, fh, flags), nil), nil
 		}
 		if f.Strict {
-			return nil, fmt.Errorf("virtio-fs missing fsync backend for FSYNC node=%d fh=%d", nodeID, fh)
+			return fsReply{}, fmt.Errorf("virtio-fs missing fsync backend for FSYNC node=%d fh=%d", nodeID, fh)
 		}
 		return reply(0, nil), nil
 	case fuseOpenDir:
 		if len(req) < fuseInHeaderSize+8 {
-			return nil, fmt.Errorf("virtio-fs OPENDIR too short")
+			return fsReply{}, fmt.Errorf("virtio-fs OPENDIR too short")
 		}
 		flags := binary.LittleEndian.Uint32(req[40:44])
 		f.logPathf("opendir", nodeID, fmt.Sprintf(" flags=%#x", flags))
@@ -1260,7 +1332,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		return reply(0, extra), nil
 	case fuseReadDir:
 		if len(req) < fuseInHeaderSize+24 {
-			return nil, fmt.Errorf("virtio-fs READDIR too short")
+			return fsReply{}, fmt.Errorf("virtio-fs READDIR too short")
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		off := binary.LittleEndian.Uint64(req[48:56])
@@ -1273,14 +1345,14 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		return reply(0, data), nil
 	case fuseReleaseDir:
 		if len(req) < fuseInHeaderSize+24 {
-			return nil, fmt.Errorf("virtio-fs RELEASEDIR too short")
+			return fsReply{}, fmt.Errorf("virtio-fs RELEASEDIR too short")
 		}
 		f.logPathf("releasedir", nodeID, fmt.Sprintf(" fh=%d", binary.LittleEndian.Uint64(req[40:48])))
 		f.backend.ReleaseDir(nodeID, binary.LittleEndian.Uint64(req[40:48]))
 		return reply(0, nil), nil
 	case fuseFsyncDir:
 		if len(req) < fuseInHeaderSize+16 {
-			return nil, fmt.Errorf("virtio-fs FSYNCDIR too short")
+			return fsReply{}, fmt.Errorf("virtio-fs FSYNCDIR too short")
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		flags := binary.LittleEndian.Uint32(req[48:52])
@@ -1289,12 +1361,12 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 			return reply(be.FsyncDir(nodeID, fh, flags), nil), nil
 		}
 		if f.Strict {
-			return nil, fmt.Errorf("virtio-fs missing fsyncdir backend for FSYNCDIR node=%d fh=%d", nodeID, fh)
+			return fsReply{}, fmt.Errorf("virtio-fs missing fsyncdir backend for FSYNCDIR node=%d fh=%d", nodeID, fh)
 		}
 		return reply(0, nil), nil
 	case fuseGetLK:
 		if len(req) < fuseInHeaderSize+fuseLKInSize {
-			return nil, fmt.Errorf("virtio-fs GETLK too short")
+			return fsReply{}, fmt.Errorf("virtio-fs GETLK too short")
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		f.logPathf("getlk", nodeID, fmt.Sprintf(" fh=%d", fh))
@@ -1303,7 +1375,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		return reply(0, extra), nil
 	case fuseSetLK, fuseSetLKW:
 		if len(req) < fuseInHeaderSize+fuseLKInSize {
-			return nil, fmt.Errorf("virtio-fs %s too short", fuseOpcodeName(opcode))
+			return fsReply{}, fmt.Errorf("virtio-fs %s too short", fuseOpcodeName(opcode))
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		lockType := binary.LittleEndian.Uint32(req[72:76])
@@ -1316,21 +1388,56 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 			errno := be.RmDir(nodeID, path.Clean(name))
 			return reply(errno, nil), nil
 		}
-		return nil, fmt.Errorf("virtio-fs missing rmdir backend for parent=%d name=%q", nodeID, name)
+		return fsReply{}, fmt.Errorf("virtio-fs missing rmdir backend for parent=%d name=%q", nodeID, name)
 	case fuseRename:
 		if len(req) < fuseInHeaderSize+8 {
-			return nil, fmt.Errorf("virtio-fs RENAME too short")
+			return fsReply{}, fmt.Errorf("virtio-fs RENAME too short")
 		}
 		if be, ok := f.backend.(fsRenameBackend); ok {
 			newParent := binary.LittleEndian.Uint64(req[40:48])
 			names := req[fuseInHeaderSize+8:]
 			split := bytesIndexByte(names, 0)
 			if split < 0 {
-				return nil, fmt.Errorf("virtio-fs RENAME missing old name")
+				return fsReply{}, fmt.Errorf("virtio-fs RENAME missing old name")
 			}
 			oldName := string(names[:split])
 			newName := readCStringName(names[split+1:])
 			return reply(be.Rename(nodeID, path.Clean(oldName), newParent, path.Clean(newName), 0), nil), nil
+		}
+		return reply(-linuxENOSYS, nil), nil
+	case fuseRename2:
+		if len(req) < fuseInHeaderSize+16 {
+			return fsReply{}, fmt.Errorf("virtio-fs RENAME2 too short")
+		}
+		if be, ok := f.backend.(fsRenameBackend); ok {
+			newParent := binary.LittleEndian.Uint64(req[40:48])
+			flags := binary.LittleEndian.Uint32(req[48:52])
+			names := req[fuseInHeaderSize+16:]
+			split := bytesIndexByte(names, 0)
+			if split < 0 {
+				return fsReply{}, fmt.Errorf("virtio-fs RENAME2 missing old name")
+			}
+			oldName := string(names[:split])
+			newName := readCStringName(names[split+1:])
+			return reply(be.Rename(nodeID, path.Clean(oldName), newParent, path.Clean(newName), flags), nil), nil
+		}
+		return reply(-linuxENOSYS, nil), nil
+	case fuseLink:
+		if len(req) < fuseInHeaderSize+8 {
+			return fsReply{}, fmt.Errorf("virtio-fs LINK too short")
+		}
+		if be, ok := f.backend.(fsLinkBackend); ok {
+			oldNodeID := binary.LittleEndian.Uint64(req[40:48])
+			newParent := nodeID
+			newName := readCStringName(req[fuseInHeaderSize+8:])
+			childID, attr, errno := be.Link(oldNodeID, newParent, path.Clean(newName))
+			if errno != 0 {
+				return reply(errno, nil), nil
+			}
+			extra := make([]byte, fuseEntryOutSize)
+			f.encodeFuseEntryOut(extra, childID)
+			encodeFuseAttr(extra[40:], attr)
+			return reply(0, extra), nil
 		}
 		return reply(-linuxENOSYS, nil), nil
 	case fuseReadlink:
@@ -1342,7 +1449,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		return reply(0, []byte(target)), nil
 	case fuseGetXattr:
 		if len(req) < fuseInHeaderSize+8 {
-			return nil, fmt.Errorf("virtio-fs GETXATTR too short")
+			return fsReply{}, fmt.Errorf("virtio-fs GETXATTR too short")
 		}
 		size := binary.LittleEndian.Uint32(req[40:44])
 		name := readCStringName(req[fuseInHeaderSize+8:])
@@ -1363,12 +1470,12 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 			return reply(0, value), nil
 		}
 		if f.Strict {
-			return nil, fmt.Errorf("virtio-fs missing xattr backend for GETXATTR node=%d", nodeID)
+			return fsReply{}, fmt.Errorf("virtio-fs missing xattr backend for GETXATTR node=%d", nodeID)
 		}
 		return reply(-linuxENODATA, nil), nil
 	case fuseListXattr:
 		if len(req) < fuseInHeaderSize+8 {
-			return nil, fmt.Errorf("virtio-fs LISTXATTR too short")
+			return fsReply{}, fmt.Errorf("virtio-fs LISTXATTR too short")
 		}
 		f.logPathf("listxattr", nodeID, "")
 		if be, ok := f.backend.(fsXattrBackend); ok {
@@ -1388,12 +1495,12 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 			return reply(0, value), nil
 		}
 		if f.Strict {
-			return nil, fmt.Errorf("virtio-fs missing xattr backend for LISTXATTR node=%d", nodeID)
+			return fsReply{}, fmt.Errorf("virtio-fs missing xattr backend for LISTXATTR node=%d", nodeID)
 		}
 		return reply(0, nil), nil
 	case fuseFlush:
 		if len(req) < fuseInHeaderSize+24 {
-			return nil, fmt.Errorf("virtio-fs FLUSH too short")
+			return fsReply{}, fmt.Errorf("virtio-fs FLUSH too short")
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		lockOwner := binary.LittleEndian.Uint64(req[56:64])
@@ -1402,19 +1509,19 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 			return reply(be.Flush(nodeID, fh, lockOwner), nil), nil
 		}
 		if f.Strict {
-			return nil, fmt.Errorf("virtio-fs missing flush backend for FLUSH node=%d fh=%d", nodeID, fh)
+			return fsReply{}, fmt.Errorf("virtio-fs missing flush backend for FLUSH node=%d fh=%d", nodeID, fh)
 		}
 		return reply(0, nil), nil
 	case fuseAccess:
 		if f.Strict {
-			return nil, fmt.Errorf("virtio-fs unsupported opcode %s node=%d", fuseOpcodeName(opcode), nodeID)
+			return fsReply{}, fmt.Errorf("virtio-fs unsupported opcode %s node=%d", fuseOpcodeName(opcode), nodeID)
 		}
 		return reply(-linuxENOSYS, nil), nil
 	case fusePoll:
 		return reply(0, make([]byte, 8)), nil
 	case fuseLseek:
 		if len(req) < fuseInHeaderSize+24 {
-			return nil, fmt.Errorf("virtio-fs LSEEK too short")
+			return fsReply{}, fmt.Errorf("virtio-fs LSEEK too short")
 		}
 		if be, ok := f.backend.(fsLseekBackend); ok {
 			fh := binary.LittleEndian.Uint64(req[40:48])
@@ -1430,7 +1537,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 			return reply(0, extra), nil
 		}
 		if f.Strict {
-			return nil, fmt.Errorf("virtio-fs missing lseek backend for LSEEK node=%d", nodeID)
+			return fsReply{}, fmt.Errorf("virtio-fs missing lseek backend for LSEEK node=%d", nodeID)
 		}
 		return reply(-linuxENOSYS, nil), nil
 	case fuseStatfs:
@@ -1450,7 +1557,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		return reply(0, extra), nil
 	case fuseStatx:
 		if len(req) < fuseInHeaderSize+24 {
-			return nil, fmt.Errorf("virtio-fs STATX too short")
+			return fsReply{}, fmt.Errorf("virtio-fs STATX too short")
 		}
 		f.logPathf("statx", nodeID, fmt.Sprintf(" mask=%#x", binary.LittleEndian.Uint32(req[60:64])))
 		attr, errno := f.backend.GetAttr(nodeID)
@@ -1473,7 +1580,7 @@ func (f *FS) dispatchFUSE(req []byte) ([]byte, error) {
 		return reply(-linuxENOTTY, nil), nil
 	case fuseCreate:
 		if len(req) < fuseInHeaderSize+16 {
-			return nil, fmt.Errorf("virtio-fs CREATE too short")
+			return fsReply{}, fmt.Errorf("virtio-fs CREATE too short")
 		}
 		if be, ok := f.backend.(fsCreateBackend); ok {
 			flags := binary.LittleEndian.Uint32(req[40:44])
@@ -1520,6 +1627,10 @@ func fuseOpcodeName(opcode uint32) string {
 		return "RMDIR"
 	case fuseRename:
 		return "RENAME"
+	case fuseRename2:
+		return "RENAME2"
+	case fuseLink:
+		return "LINK"
 	case fuseOpen:
 		return "OPEN"
 	case fuseRead:
@@ -1643,12 +1754,37 @@ func fsStageName(stage int) string {
 	}
 }
 
-func fuseReply(unique uint64, errno int32, extra []byte) []byte {
-	out := make([]byte, fuseOutHeaderSize+len(extra))
-	binary.LittleEndian.PutUint32(out[0:4], uint32(len(out)))
-	binary.LittleEndian.PutUint32(out[4:8], uint32(errno))
-	binary.LittleEndian.PutUint64(out[8:16], unique)
-	copy(out[16:], extra)
+type fsReply struct {
+	unique uint64
+	errno  int32
+	extra  []byte
+	ok     bool
+}
+
+func fuseReply(unique uint64, errno int32, extra []byte) fsReply {
+	return fsReply{unique: unique, errno: errno, extra: extra, ok: true}
+}
+
+func (r fsReply) Len() int {
+	if !r.ok {
+		return 0
+	}
+	return fuseOutHeaderSize + len(r.extra)
+}
+
+func (r fsReply) EncodeHeader(dst []byte) {
+	binary.LittleEndian.PutUint32(dst[0:4], uint32(r.Len()))
+	binary.LittleEndian.PutUint32(dst[4:8], uint32(r.errno))
+	binary.LittleEndian.PutUint64(dst[8:16], r.unique)
+}
+
+func (r fsReply) Bytes() []byte {
+	if !r.ok {
+		return nil
+	}
+	out := make([]byte, r.Len())
+	r.EncodeHeader(out[:fuseOutHeaderSize])
+	copy(out[fuseOutHeaderSize:], r.extra)
 	return out
 }
 
@@ -1885,6 +2021,10 @@ func (f *FS) Stats() FSStats {
 	}
 	return FSStats{
 		Tag:             tag,
+		Async:           f.Async,
+		WorkerCount:     f.workerCount,
+		CacheMode:       f.cacheMode,
+		WritebackCache:  f.writebackCache,
 		MMIOReads:       f.mmioReads,
 		MMIOWrites:      f.mmioWrites,
 		QueueNotifies:   append([]uint64(nil), f.queueNotifies...),
@@ -2111,10 +2251,12 @@ type passthroughHandle struct {
 }
 
 type imageFS struct {
-	root     string
-	ownerUID uint32
-	ownerGID uint32
-	mapOwner bool
+	root       string
+	ownerUID   uint32
+	ownerGID   uint32
+	mapOwner   bool
+	debugPaths []string
+	debugLog   io.Writer
 
 	mu         sync.Mutex
 	nextNodeID uint64
@@ -2196,6 +2338,8 @@ func newImageFS(root imagefs.Directory, statfsPath string, uid, gid uint32, mapO
 		ownerUID:   uid,
 		ownerGID:   gid,
 		mapOwner:   mapOwner,
+		debugPaths: virtioFSDebugPathsFromEnv(),
+		debugLog:   os.Stderr,
 		nextNodeID: 2,
 		nextHandle: 1,
 		nodes:      map[uint64]*imageNode{},
@@ -2339,6 +2483,32 @@ func (p *passthroughFS) Symlink(parent uint64, name string, target string, uid u
 	}
 	nodeID := p.ensureNode(guestPath)
 	return nodeID, p.fileAttr(nodeID, info), 0
+}
+
+func (p *passthroughFS) Link(nodeID uint64, newParent uint64, newName string) (uint64, FuseAttr, int32) {
+	host, errno := p.hostPath(nodeID)
+	if errno != 0 {
+		return 0, FuseAttr{}, errno
+	}
+	hostParent, guestParent, errno := p.hostAndGuestPath(newParent)
+	if errno != 0 {
+		return 0, FuseAttr{}, errno
+	}
+	rel, ok := cleanChildName(newName)
+	if !ok {
+		return 0, FuseAttr{}, -linuxEINVAL
+	}
+	dst := filepath.Join(hostParent, filepath.FromSlash(rel))
+	if err := os.Link(host, dst); err != nil {
+		return 0, FuseAttr{}, errnoFromError(err)
+	}
+	info, err := os.Lstat(dst)
+	if err != nil {
+		return 0, FuseAttr{}, errnoFromError(err)
+	}
+	guestPath := joinGuestChild(guestParent, rel)
+	newNodeID := p.ensureNode(guestPath)
+	return newNodeID, p.fileAttr(newNodeID, info), 0
 }
 
 func (p *passthroughFS) Create(parent uint64, name string, flags uint32, mode uint32, uid uint32, gid uint32) (uint64, uint64, FuseAttr, int32) {
@@ -2904,6 +3074,80 @@ func (p *imageFS) pathForNode(id uint64) string {
 	return "/" + strings.Join(parts, "/")
 }
 
+func (p *imageFS) DebugPath(nodeID uint64) string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.pathForNode(nodeID)
+}
+
+func virtioFSDebugPathsFromEnv() []string {
+	raw := strings.TrimSpace(os.Getenv("CCX3_DEBUG_VIRTIOFS_PATHS"))
+	if raw == "" {
+		raw = strings.TrimSpace(os.Getenv("CCX3_DEBUG_VIRTIOFS_PATH"))
+	}
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	paths := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if !strings.HasPrefix(part, "/") {
+			part = "/" + part
+		}
+		paths = append(paths, path.Clean(part))
+	}
+	return paths
+}
+
+func (p *imageFS) debugPathMatchLocked(guestPath string) bool {
+	if len(p.debugPaths) == 0 || guestPath == "" {
+		return false
+	}
+	guestPath = path.Clean(guestPath)
+	for _, prefix := range p.debugPaths {
+		if guestPath == prefix || strings.HasPrefix(guestPath, strings.TrimSuffix(prefix, "/")+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *imageFS) debugfLocked(format string, args ...any) {
+	if p.debugLog == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(p.debugLog, "virtiofs:image "+format+"\n", args...)
+}
+
+func (p *imageFS) debugNodefLocked(op string, nodeID uint64, format string, args ...any) {
+	guestPath := p.pathForNode(nodeID)
+	if !p.debugPathMatchLocked(guestPath) {
+		return
+	}
+	msg := fmt.Sprintf(format, args...)
+	if msg != "" {
+		msg = " " + msg
+	}
+	p.debugfLocked("%s path=%q node=%d%s", op, guestPath, nodeID, msg)
+}
+
+func (p *imageFS) debugChildfLocked(op string, parent uint64, name string, format string, args ...any) {
+	parentPath := p.pathForNode(parent)
+	childPath := path.Join(parentPath, path.Base(path.Clean("/"+name)))
+	if !p.debugPathMatchLocked(childPath) && !p.debugPathMatchLocked(parentPath) {
+		return
+	}
+	msg := fmt.Sprintf(format, args...)
+	if msg != "" {
+		msg = " " + msg
+	}
+	p.debugfLocked("%s parent=%q name=%q child=%q%s", op, parentPath, name, childPath, msg)
+}
+
 func (p *imageFS) Init() (uint32, uint32) {
 	return 128 << 10, fuseCapPosixLocks
 }
@@ -2929,28 +3173,36 @@ func (p *imageFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32) {
 	if name == "." {
 		return parentNode.id, p.attr(parentNode), 0
 	}
+	p.debugChildfLocked("lookup", parent, name, "")
 	childID, ok := parentNode.entries[name]
 	if !ok {
 		if parentNode.whiteouts[name] {
+			p.debugChildfLocked("lookup-whiteout", parent, name, "errno=%d", -linuxENOENT)
 			return 0, FuseAttr{}, -linuxENOENT
 		}
 		if parentNode.abstractDir == nil {
+			p.debugChildfLocked("lookup-miss", parent, name, "errno=%d", -linuxENOENT)
 			return 0, FuseAttr{}, -linuxENOENT
 		}
 		entry, err := parentNode.abstractDir.Lookup(name)
 		if err != nil {
+			p.debugChildfLocked("lookup-lower-miss", parent, name, "errno=%d", -linuxENOENT)
 			return 0, FuseAttr{}, -linuxENOENT
 		}
 		child, errno := p.createAbstractNode(parentNode, name, entry)
 		if errno != 0 {
+			p.debugChildfLocked("lookup-lower-error", parent, name, "errno=%d", errno)
 			return 0, FuseAttr{}, errno
 		}
+		p.debugChildfLocked("lookup-lower-hit", parent, name, "node=%d mode=%#o", child.id, p.attr(child).Mode)
 		return child.id, p.attr(child), 0
 	}
 	child := p.nodes[childID]
 	if child == nil {
+		p.debugChildfLocked("lookup-stale-node", parent, name, "node=%d errno=%d", childID, -linuxENOENT)
 		return 0, FuseAttr{}, -linuxENOENT
 	}
+	p.debugChildfLocked("lookup-hit", parent, name, "node=%d mode=%#o", child.id, p.attr(child).Mode)
 	return child.id, p.attr(child), 0
 }
 
@@ -2961,6 +3213,7 @@ func (p *imageFS) Open(nodeID uint64, flags uint32) (uint64, int32) {
 	if node == nil {
 		return 0, -linuxENOENT
 	}
+	p.debugNodefLocked("open", nodeID, "flags=%#x", flags)
 	if node.isDir() {
 		return 0, -linuxEISDIR
 	}
@@ -3158,7 +3411,9 @@ func (p *imageFS) Mkdir(parent uint64, name string, mode uint32, uid uint32, gid
 		return 0, FuseAttr{}, -linuxENOENT
 	}
 	name = path.Base(path.Clean("/" + name))
+	p.debugChildfLocked("mkdir", parent, name, "mode=%#o uid=%d gid=%d", mode, uid, gid)
 	if _, exists := parentNode.entries[name]; exists {
+		p.debugChildfLocked("mkdir-exists", parent, name, "errno=%d", -linuxEEXIST)
 		return 0, FuseAttr{}, -linuxEEXIST
 	}
 	node := &imageNode{
@@ -3184,14 +3439,22 @@ func (p *imageFS) Mknod(parent uint64, name string, mode uint32, rdev uint32, ui
 		return 0, FuseAttr{}, -linuxENOENT
 	}
 	name = path.Base(path.Clean("/" + name))
-	if _, exists := parentNode.entries[name]; exists {
-		return 0, FuseAttr{}, -linuxEEXIST
-	}
 	fileType := mode & linuxSIFMT
+	p.debugChildfLocked("mknod", parent, name, "mode=%#o type=%#o rdev=%d uid=%d gid=%d", mode, fileType, rdev, uid, gid)
 	switch fileType {
 	case linuxSIFREG, linuxSIFCHR, linuxSIFBLK, linuxSIFIFO, linuxSIFSOCK:
 	default:
+		p.debugChildfLocked("mknod-invalid-type", parent, name, "mode=%#o errno=%d", mode, -linuxEINVAL)
 		return 0, FuseAttr{}, -linuxEINVAL
+	}
+	if existingID, exists := parentNode.entries[name]; exists {
+		existing := p.nodes[existingID]
+		if existing == nil {
+			p.debugChildfLocked("mknod-stale-existing", parent, name, "existing=%d errno=%d", existingID, -linuxENOENT)
+			return 0, FuseAttr{}, -linuxENOENT
+		}
+		p.debugChildfLocked("mknod-exists", parent, name, "existing=%d existing_dir=%v errno=%d", existingID, existing.isDir(), -linuxEEXIST)
+		return 0, FuseAttr{}, -linuxEEXIST
 	}
 	if parentNode.whiteouts != nil {
 		delete(parentNode.whiteouts, name)
@@ -3221,7 +3484,9 @@ func (p *imageFS) Symlink(parent uint64, name string, target string, uid uint32,
 		return 0, FuseAttr{}, -linuxENOENT
 	}
 	name = path.Base(path.Clean("/" + name))
+	p.debugChildfLocked("symlink", parent, name, "target=%q uid=%d gid=%d", target, uid, gid)
 	if _, exists := parentNode.entries[name]; exists {
+		p.debugChildfLocked("symlink-exists", parent, name, "errno=%d", -linuxEEXIST)
 		return 0, FuseAttr{}, -linuxEEXIST
 	}
 	node := &imageNode{
@@ -3241,6 +3506,54 @@ func (p *imageFS) Symlink(parent uint64, name string, target string, uid uint32,
 	return node.id, p.attr(node), 0
 }
 
+func (p *imageFS) Link(nodeID uint64, newParent uint64, newName string) (uint64, FuseAttr, int32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	node := p.nodes[nodeID]
+	parentNode := p.nodes[newParent]
+	if node == nil || parentNode == nil {
+		return 0, FuseAttr{}, -linuxENOENT
+	}
+	if node.isDir() {
+		return 0, FuseAttr{}, -linuxEPERM
+	}
+	name := path.Base(path.Clean("/" + newName))
+	p.debugChildfLocked("link", newParent, name, "old_path=%q old_node=%d", p.pathForNode(nodeID), nodeID)
+	if _, exists := parentNode.entries[name]; exists {
+		p.debugChildfLocked("link-exists", newParent, name, "errno=%d", -linuxEEXIST)
+		return 0, FuseAttr{}, -linuxEEXIST
+	}
+	if parentNode.whiteouts != nil {
+		delete(parentNode.whiteouts, name)
+	}
+	if node.abstractFile != nil {
+		if errno := p.copyUpFileLocked(node); errno != 0 {
+			return 0, FuseAttr{}, errno
+		}
+	}
+	linked := &imageNode{
+		id:            p.nextNodeID,
+		parent:        newParent,
+		name:          name,
+		mode:          node.mode,
+		rawMode:       node.rawMode,
+		uid:           node.uid,
+		gid:           node.gid,
+		rdev:          node.rdev,
+		size:          node.size,
+		data:          append([]byte(nil), node.data...),
+		symlinkTarget: node.symlinkTarget,
+		modTime:       node.modTime,
+	}
+	if node.isSymlink() {
+		linked.mode = fs.ModeSymlink | node.mode.Perm()
+	}
+	p.nextNodeID++
+	p.nodes[linked.id] = linked
+	parentNode.entries[name] = linked.id
+	return linked.id, p.attr(linked), 0
+}
+
 func (p *imageFS) RmDir(parent uint64, name string) int32 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -3249,8 +3562,10 @@ func (p *imageFS) RmDir(parent uint64, name string) int32 {
 		return -linuxENOENT
 	}
 	name = path.Base(path.Clean("/" + name))
+	p.debugChildfLocked("rmdir", parent, name, "")
 	childID, ok := parentNode.entries[name]
 	if !ok {
+		p.debugChildfLocked("rmdir-miss", parent, name, "errno=%d", -linuxENOENT)
 		return -linuxENOENT
 	}
 	child := p.nodes[childID]
@@ -3258,6 +3573,7 @@ func (p *imageFS) RmDir(parent uint64, name string) int32 {
 		return -linuxENOENT
 	}
 	if len(child.entries) != 0 {
+		p.debugChildfLocked("rmdir-not-empty", parent, name, "node=%d entries=%d errno=%d", childID, len(child.entries), -linuxENOTEMPTY)
 		return -linuxENOTEMPTY
 	}
 	delete(parentNode.entries, name)
@@ -3271,7 +3587,7 @@ func (p *imageFS) RmDir(parent uint64, name string) int32 {
 	return 0
 }
 
-func (p *imageFS) Create(parent uint64, name string, _ uint32, mode uint32, uid uint32, gid uint32) (uint64, uint64, FuseAttr, int32) {
+func (p *imageFS) Create(parent uint64, name string, flags uint32, mode uint32, uid uint32, gid uint32) (uint64, uint64, FuseAttr, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	parentNode := p.nodes[parent]
@@ -3279,8 +3595,38 @@ func (p *imageFS) Create(parent uint64, name string, _ uint32, mode uint32, uid 
 		return 0, 0, FuseAttr{}, -linuxENOENT
 	}
 	name = path.Base(path.Clean("/" + name))
-	if _, exists := parentNode.entries[name]; exists {
-		return 0, 0, FuseAttr{}, -linuxEEXIST
+	p.debugChildfLocked("create", parent, name, "flags=%#x mode=%#o uid=%d gid=%d", flags, mode, uid, gid)
+	if existingID, exists := parentNode.entries[name]; exists {
+		if flags&linuxOEXCL != 0 {
+			p.debugChildfLocked("create-excl-exists", parent, name, "existing=%d errno=%d", existingID, -linuxEEXIST)
+			return 0, 0, FuseAttr{}, -linuxEEXIST
+		}
+		node := p.nodes[existingID]
+		if node == nil {
+			p.debugChildfLocked("create-stale-existing", parent, name, "existing=%d errno=%d", existingID, -linuxENOENT)
+			return 0, 0, FuseAttr{}, -linuxENOENT
+		}
+		if node.isDir() {
+			p.debugChildfLocked("create-existing-dir", parent, name, "existing=%d errno=%d", existingID, -linuxEISDIR)
+			return 0, 0, FuseAttr{}, -linuxEISDIR
+		}
+		p.debugChildfLocked("create-open-existing", parent, name, "existing=%d flags=%#x", existingID, flags)
+		if flags&linuxOACCMODE != linuxORDONLY {
+			if errno := p.copyUpFileLocked(node); errno != 0 {
+				p.debugChildfLocked("create-copyup-error", parent, name, "existing=%d errno=%d", existingID, errno)
+				return 0, 0, FuseAttr{}, errno
+			}
+			if flags&linuxOTRUNC != 0 {
+				p.debugChildfLocked("create-truncate-existing", parent, name, "existing=%d", existingID)
+				node.data = nil
+				node.size = 0
+				node.modTime = time.Now()
+			}
+		}
+		fh := p.nextHandle
+		p.nextHandle++
+		p.handles[fh] = &imageHandle{nodeID: node.id}
+		return node.id, fh, p.attr(node), 0
 	}
 	if parentNode.whiteouts != nil {
 		delete(parentNode.whiteouts, name)
@@ -3411,15 +3757,19 @@ func (p *imageFS) Unlink(parent uint64, name string) int32 {
 	name = path.Base(path.Clean("/" + name))
 	childID, ok := parentNode.entries[name]
 	if !ok {
+		p.debugChildfLocked("unlink-miss", parent, name, "errno=%d", -linuxENOENT)
 		return -linuxENOENT
 	}
 	child := p.nodes[childID]
 	if child == nil {
+		p.debugChildfLocked("unlink-stale-node", parent, name, "node=%d errno=%d", childID, -linuxENOENT)
 		return -linuxENOENT
 	}
 	if child.isDir() {
+		p.debugChildfLocked("unlink-dir", parent, name, "node=%d errno=%d", childID, -linuxEISDIR)
 		return -linuxEISDIR
 	}
+	p.debugChildfLocked("unlink", parent, name, "node=%d", childID)
 	delete(parentNode.entries, name)
 	if parentNode.abstractDir != nil {
 		if parentNode.whiteouts == nil {
@@ -3431,7 +3781,7 @@ func (p *imageFS) Unlink(parent uint64, name string) int32 {
 	return 0
 }
 
-func (p *imageFS) Rename(parent uint64, name string, newParent uint64, newName string, _ uint32) int32 {
+func (p *imageFS) Rename(parent uint64, name string, newParent uint64, newName string, flags uint32) int32 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	parentNode := p.nodes[parent]
@@ -3441,22 +3791,29 @@ func (p *imageFS) Rename(parent uint64, name string, newParent uint64, newName s
 	}
 	name = path.Base(path.Clean("/" + name))
 	newName = path.Base(path.Clean("/" + newName))
+	p.debugChildfLocked("rename-old", parent, name, "new_parent=%q new_name=%q flags=%#x", p.pathForNode(newParent), newName, flags)
+	p.debugChildfLocked("rename-new", newParent, newName, "old_parent=%q old_name=%q flags=%#x", p.pathForNode(parent), name, flags)
 	childID, ok := parentNode.entries[name]
 	if !ok {
+		p.debugChildfLocked("rename-miss", parent, name, "new_parent=%q new_name=%q errno=%d", p.pathForNode(newParent), newName, -linuxENOENT)
 		return -linuxENOENT
 	}
 	child := p.nodes[childID]
 	if child == nil {
+		p.debugChildfLocked("rename-stale-node", parent, name, "node=%d errno=%d", childID, -linuxENOENT)
 		return -linuxENOENT
 	}
 	if existingID, exists := newParentNode.entries[newName]; exists && existingID != childID {
 		existing := p.nodes[existingID]
 		if existing != nil && existing.isDir() && !child.isDir() {
+			p.debugChildfLocked("rename-target-dir", newParent, newName, "existing=%d errno=%d", existingID, -linuxEISDIR)
 			return -linuxEISDIR
 		}
 		if existing != nil && !existing.isDir() && child.isDir() {
+			p.debugChildfLocked("rename-target-not-dir", newParent, newName, "existing=%d errno=%d", existingID, -linuxENOTDIR)
 			return -linuxENOTDIR
 		}
+		p.debugChildfLocked("rename-replace-target", newParent, newName, "existing=%d", existingID)
 		delete(p.nodes, existingID)
 	}
 	delete(parentNode.entries, name)

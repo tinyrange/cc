@@ -298,7 +298,7 @@ func (m *memFS) Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32) (u
 		return 0, -testLinuxEINVAL
 	}
 }
-func (m *memFS) Mkdir(parent uint64, name string, mode uint32) (uint64, virtio.FuseAttr, int32) {
+func (m *memFS) Mkdir(parent uint64, name string, mode uint32, _ uint32, _ uint32) (uint64, virtio.FuseAttr, int32) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	p := m.nodes[parent]

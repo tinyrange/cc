@@ -58,6 +58,36 @@ func TestPassthroughFSCreateWriteRenameUnlink(t *testing.T) {
 	}
 }
 
+func TestVirtioFSAsyncIsDefaultAndCanBeDisabled(t *testing.T) {
+	t.Setenv("CCX3_VIRTIOFS_ASYNC", "")
+	if !resolveVirtioFSAsync() {
+		t.Fatal("resolveVirtioFSAsync() default = false, want true")
+	}
+	t.Setenv("CCX3_VIRTIOFS_ASYNC", "1")
+	if !resolveVirtioFSAsync() {
+		t.Fatal("resolveVirtioFSAsync() with 1 = false, want true")
+	}
+	t.Setenv("CCX3_VIRTIOFS_ASYNC", "0")
+	if resolveVirtioFSAsync() {
+		t.Fatal("resolveVirtioFSAsync() with 0 = true, want false")
+	}
+	t.Setenv("CCX3_VIRTIOFS_ASYNC", "off")
+	if resolveVirtioFSAsync() {
+		t.Fatal("resolveVirtioFSAsync() with off = true, want false")
+	}
+}
+
+func TestVirtioFSWorkerCountIsClamped(t *testing.T) {
+	t.Setenv("CCX3_VIRTIOFS_WORKERS", "0")
+	if got := resolveVirtioFSWorkerCount(); got != 1 {
+		t.Fatalf("resolveVirtioFSWorkerCount() with 0 = %d, want 1", got)
+	}
+	t.Setenv("CCX3_VIRTIOFS_WORKERS", "128")
+	if got := resolveVirtioFSWorkerCount(); got != 64 {
+		t.Fatalf("resolveVirtioFSWorkerCount() with 128 = %d, want 64", got)
+	}
+}
+
 func TestPassthroughFSAppendWritesAppendInsteadOfWriteAt(t *testing.T) {
 	t.Parallel()
 
@@ -545,6 +575,7 @@ func TestFSSyncSecondaryRequestQueueCompletes(t *testing.T) {
 
 	fsdev := NewFS(0x1000, 0x1000, 44, "root", NewPassthroughFS(t.TempDir(), nil))
 	fsdev.Strict = true
+	fsdev.Async = false
 	fsdev.Attach(mem, irq)
 
 	const (
@@ -609,6 +640,7 @@ func TestFSSyncQueueHonorsUsedEventIdx(t *testing.T) {
 
 	fsdev := NewFS(0x1000, 0x1000, 44, "root", NewPassthroughFS(t.TempDir(), nil))
 	fsdev.Strict = true
+	fsdev.Async = false
 	fsdev.driverFeatures = featureRingEventIdx
 	fsdev.Attach(mem, irq)
 
@@ -1076,6 +1108,278 @@ func TestImageFSRenameReplacesLowerFileInOverlay(t *testing.T) {
 	}
 }
 
+func TestImageFSLinksLowerFileIntoOverlay(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "var", "lib", "dpkg"), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "var", "lib", "dpkg", "status"), []byte("base-status"), 0o644); err != nil {
+		t.Fatalf("WriteFile(status) error = %v", err)
+	}
+	be := NewImageFS(imagefs.NewHostFS(root, nil), root).(*imageFS)
+	varID, _, errno := be.Lookup(1, "var")
+	if errno != 0 {
+		t.Fatalf("Lookup(var) errno = %d", errno)
+	}
+	libID, _, errno := be.Lookup(varID, "lib")
+	if errno != 0 {
+		t.Fatalf("Lookup(lib) errno = %d", errno)
+	}
+	dpkgID, _, errno := be.Lookup(libID, "dpkg")
+	if errno != 0 {
+		t.Fatalf("Lookup(dpkg) errno = %d", errno)
+	}
+	statusID, _, errno := be.Lookup(dpkgID, "status")
+	if errno != 0 {
+		t.Fatalf("Lookup(status) errno = %d", errno)
+	}
+	backupID, _, errno := be.Link(statusID, dpkgID, "status-old")
+	if errno != 0 {
+		t.Fatalf("Link(status -> status-old) errno = %d", errno)
+	}
+	fh, errno := be.Open(backupID, linuxORDONLY)
+	if errno != 0 {
+		t.Fatalf("Open(status-old) errno = %d", errno)
+	}
+	data, errno := be.Read(backupID, fh, 0, 64)
+	if errno != 0 {
+		t.Fatalf("Read(status-old) errno = %d", errno)
+	}
+	if string(data) != "base-status" {
+		t.Fatalf("status-old data = %q, want base-status", data)
+	}
+}
+
+func TestImageFSCreateExistingFileHonorsTruncateAndExclusive(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "md5sums"), []byte("old-control"), 0o644); err != nil {
+		t.Fatalf("WriteFile(md5sums) error = %v", err)
+	}
+	be := NewImageFS(imagefs.NewHostFS(root, nil), root).(*imageFS)
+	nodeID, _, errno := be.Lookup(1, "md5sums")
+	if errno != 0 {
+		t.Fatalf("Lookup(md5sums) errno = %d", errno)
+	}
+	if _, _, _, errno := be.Create(1, "md5sums", linuxOWRONLY|linuxOCREAT|linuxOEXCL, 0o644, 0, 0); errno != -linuxEEXIST {
+		t.Fatalf("Create(O_EXCL existing) errno = %d, want EEXIST", errno)
+	}
+	gotID, fh, _, errno := be.Create(1, "md5sums", linuxOWRONLY|linuxOCREAT|linuxOTRUNC, 0o644, 0, 0)
+	if errno != 0 {
+		t.Fatalf("Create(O_TRUNC existing) errno = %d", errno)
+	}
+	if gotID != nodeID {
+		t.Fatalf("Create(O_TRUNC existing) node = %d, want %d", gotID, nodeID)
+	}
+	if wrote, errno := be.Write(gotID, fh, 0, []byte("new-control"), 0); errno != 0 || wrote != 11 {
+		t.Fatalf("Write() = (%d, %d), want (11, 0)", wrote, errno)
+	}
+	be.Release(gotID, fh)
+	fh, errno = be.Open(gotID, linuxORDONLY)
+	if errno != 0 {
+		t.Fatalf("Open() errno = %d", errno)
+	}
+	data, errno := be.Read(gotID, fh, 0, 64)
+	if errno != 0 {
+		t.Fatalf("Read() errno = %d", errno)
+	}
+	if string(data) != "new-control" {
+		t.Fatalf("data = %q, want new-control", data)
+	}
+}
+
+func TestMountedFSDelegatesLinks(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "var", "lib", "dpkg"), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "var", "lib", "dpkg", "status"), []byte("base-status"), 0o644); err != nil {
+		t.Fatalf("WriteFile(status) error = %v", err)
+	}
+	be := NewMountedFS(NewImageFS(imagefs.NewHostFS(root, nil), root), nil)
+	varID, _, errno := be.Lookup(1, "var")
+	if errno != 0 {
+		t.Fatalf("Lookup(var) errno = %d", errno)
+	}
+	libID, _, errno := be.Lookup(varID, "lib")
+	if errno != 0 {
+		t.Fatalf("Lookup(lib) errno = %d", errno)
+	}
+	dpkgID, _, errno := be.Lookup(libID, "dpkg")
+	if errno != 0 {
+		t.Fatalf("Lookup(dpkg) errno = %d", errno)
+	}
+	statusID, _, errno := be.Lookup(dpkgID, "status")
+	if errno != 0 {
+		t.Fatalf("Lookup(status) errno = %d", errno)
+	}
+	linkBackend, ok := be.(fsLinkBackend)
+	if !ok {
+		t.Fatal("mounted fs does not implement links")
+	}
+	if _, _, errno := linkBackend.Link(statusID, dpkgID, "status-old"); errno != 0 {
+		t.Fatalf("Link(status -> status-old) errno = %d", errno)
+	}
+	if _, _, errno := be.Lookup(dpkgID, "status-old"); errno != 0 {
+		t.Fatalf("Lookup(status-old) errno = %d", errno)
+	}
+}
+
+func TestMountedFSRenameUpdatesCachedDescendants(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	be := NewMountedFS(NewImageFS(imagefs.NewHostFS(root, nil), root), nil)
+	mounted, ok := be.(*mountedFS)
+	if !ok {
+		t.Fatalf("backend type = %T", be)
+	}
+	tmpID, _, errno := be.(fsMkdirBackend).Mkdir(1, "tmp.ci", 0o755, 0, 0)
+	if errno != 0 {
+		t.Fatalf("Mkdir(tmp.ci) errno = %d", errno)
+	}
+	md5ID, fh, _, errno := be.(fsCreateBackend).Create(tmpID, "md5sums", linuxOWRONLY|linuxOCREAT, 0o644, 0, 0)
+	if errno != 0 {
+		t.Fatalf("Create(tmp.ci/md5sums) errno = %d", errno)
+	}
+	be.Release(md5ID, fh)
+	if errno := be.(fsRenameBackend).Rename(1, "tmp.ci", 1, "tmp.ci.old", 0); errno != 0 {
+		t.Fatalf("Rename(tmp.ci) errno = %d", errno)
+	}
+	if got := mounted.DebugPath(md5ID); got != "/tmp.ci.old/md5sums" {
+		t.Fatalf("DebugPath(md5sums) = %q, want /tmp.ci.old/md5sums", got)
+	}
+	if _, _, errno := be.Lookup(tmpID, "md5sums"); errno != 0 {
+		t.Fatalf("Lookup(renamed child by open parent node) errno = %d", errno)
+	}
+}
+
+func TestFUSELinkUsesHeaderNodeAsDestinationParent(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "var", "lib", "dpkg"), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "var", "lib", "dpkg", "status"), []byte("base-status"), 0o644); err != nil {
+		t.Fatalf("WriteFile(status) error = %v", err)
+	}
+	be := NewImageFS(imagefs.NewHostFS(root, nil), root).(*imageFS)
+	fsdev := NewFS(0, 0, 0, "root", be)
+	varID, _, errno := be.Lookup(1, "var")
+	if errno != 0 {
+		t.Fatalf("Lookup(var) errno = %d", errno)
+	}
+	libID, _, errno := be.Lookup(varID, "lib")
+	if errno != 0 {
+		t.Fatalf("Lookup(lib) errno = %d", errno)
+	}
+	dpkgID, _, errno := be.Lookup(libID, "dpkg")
+	if errno != 0 {
+		t.Fatalf("Lookup(dpkg) errno = %d", errno)
+	}
+	statusID, _, errno := be.Lookup(dpkgID, "status")
+	if errno != 0 {
+		t.Fatalf("Lookup(status) errno = %d", errno)
+	}
+
+	req := make([]byte, fuseInHeaderSize+8+len("status-old")+1)
+	binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
+	binary.LittleEndian.PutUint32(req[4:8], fuseLink)
+	binary.LittleEndian.PutUint64(req[8:16], 1)
+	binary.LittleEndian.PutUint64(req[16:24], dpkgID)
+	binary.LittleEndian.PutUint64(req[40:48], statusID)
+	copy(req[fuseInHeaderSize+8:], "status-old")
+	reply, err := fsdev.dispatchFUSELocked(req)
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(LINK) error = %v", err)
+	}
+	if got := int32(binary.LittleEndian.Uint32(reply[4:8])); got != 0 {
+		t.Fatalf("LINK errno = %d, want 0", got)
+	}
+	backupID, _, errno := be.Lookup(dpkgID, "status-old")
+	if errno != 0 {
+		t.Fatalf("Lookup(status-old) errno = %d", errno)
+	}
+	fh, errno := be.Open(backupID, linuxORDONLY)
+	if errno != 0 {
+		t.Fatalf("Open(status-old) errno = %d", errno)
+	}
+	data, errno := be.Read(backupID, fh, 0, 64)
+	if errno != 0 {
+		t.Fatalf("Read(status-old) errno = %d", errno)
+	}
+	if string(data) != "base-status" {
+		t.Fatalf("status-old data = %q, want base-status", data)
+	}
+}
+
+func TestFUSERename2DispatchesToRenameBackend(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "var", "lib", "dpkg", "tmp.ci"), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "var", "lib", "dpkg", "info"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(info) error = %v", err)
+	}
+	be := NewImageFS(imagefs.NewHostFS(root, nil), root).(*imageFS)
+	fsdev := NewFS(0, 0, 0, "root", be)
+	varID, _, errno := be.Lookup(1, "var")
+	if errno != 0 {
+		t.Fatalf("Lookup(var) errno = %d", errno)
+	}
+	libID, _, errno := be.Lookup(varID, "lib")
+	if errno != 0 {
+		t.Fatalf("Lookup(lib) errno = %d", errno)
+	}
+	dpkgID, _, errno := be.Lookup(libID, "dpkg")
+	if errno != 0 {
+		t.Fatalf("Lookup(dpkg) errno = %d", errno)
+	}
+	tmpID, _, errno := be.Lookup(dpkgID, "tmp.ci")
+	if errno != 0 {
+		t.Fatalf("Lookup(tmp.ci) errno = %d", errno)
+	}
+	infoID, _, errno := be.Lookup(dpkgID, "info")
+	if errno != 0 {
+		t.Fatalf("Lookup(info) errno = %d", errno)
+	}
+	if _, fh, _, errno := be.Create(tmpID, "md5sums", linuxOWRONLY|linuxOCREAT, 0o644, 0, 0); errno != 0 {
+		t.Fatalf("Create(md5sums) errno = %d", errno)
+	} else {
+		be.Release(0, fh)
+	}
+
+	names := append([]byte("md5sums\x00libexpat1.md5sums\x00"), 0)
+	req := make([]byte, fuseInHeaderSize+16+len(names))
+	binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
+	binary.LittleEndian.PutUint32(req[4:8], fuseRename2)
+	binary.LittleEndian.PutUint64(req[8:16], 1)
+	binary.LittleEndian.PutUint64(req[16:24], tmpID)
+	binary.LittleEndian.PutUint64(req[40:48], infoID)
+	copy(req[fuseInHeaderSize+16:], names)
+	reply, err := fsdev.dispatchFUSELocked(req)
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(RENAME2) error = %v", err)
+	}
+	if got := int32(binary.LittleEndian.Uint32(reply[4:8])); got != 0 {
+		t.Fatalf("RENAME2 errno = %d, want 0", got)
+	}
+	if _, _, errno := be.Lookup(infoID, "libexpat1.md5sums"); errno != 0 {
+		t.Fatalf("Lookup(renamed md5sums) errno = %d", errno)
+	}
+	if _, _, errno := be.Lookup(tmpID, "md5sums"); errno != -linuxENOENT {
+		t.Fatalf("Lookup(old md5sums) errno = %d, want ENOENT", errno)
+	}
+}
+
 func TestFUSEInitEnablesLargeWrites(t *testing.T) {
 	t.Parallel()
 
@@ -1239,6 +1543,34 @@ func TestFUSECachePolicyEncodesTTLAndOpenFlags(t *testing.T) {
 		t.Fatalf("OPEN flags = %#x, want NO_FLUSH", openFlags)
 	}
 	fsdev.backend.Release(nodeID, binary.LittleEndian.Uint64(openReply[fuseOutHeaderSize:fuseOutHeaderSize+8]))
+}
+
+func TestFUSENormalCachePolicyDisablesLookupTTL(t *testing.T) {
+	t.Setenv("CCX3_VIRTIOFS_CACHE", "")
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "data.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fsdev := NewFS(0, 0, 0, "root", NewPassthroughFS(root, nil))
+
+	lookupReq := make([]byte, fuseInHeaderSize+len("data.txt")+1)
+	binary.LittleEndian.PutUint32(lookupReq[0:4], uint32(len(lookupReq)))
+	binary.LittleEndian.PutUint32(lookupReq[4:8], fuseLookup)
+	binary.LittleEndian.PutUint64(lookupReq[8:16], 1)
+	binary.LittleEndian.PutUint64(lookupReq[16:24], 1)
+	copy(lookupReq[fuseInHeaderSize:], "data.txt")
+	lookupReply, err := fsdev.dispatchFUSELocked(lookupReq)
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(LOOKUP) error = %v", err)
+	}
+	extra := lookupReply[fuseOutHeaderSize:]
+	if got := binary.LittleEndian.Uint64(extra[16:24]); got != 0 {
+		t.Fatalf("LOOKUP entry TTL seconds = %d, want 0", got)
+	}
+	if got := binary.LittleEndian.Uint64(extra[24:32]); got != 0 {
+		t.Fatalf("LOOKUP attr TTL seconds = %d, want 0", got)
+	}
 }
 
 func TestFUSEStrictCachePolicyDisablesTTLAndKeepCache(t *testing.T) {

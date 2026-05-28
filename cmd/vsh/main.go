@@ -38,12 +38,6 @@ const (
 	colorYellow  = "\x1b[33m"
 )
 
-const (
-	defaultCompletionPageSize = 40
-	minCompletionPageSize     = 12
-	maxCompletionPageSize     = 80
-)
-
 type daemonState struct {
 	Addr string `json:"addr"`
 }
@@ -116,16 +110,31 @@ type vshCompleter struct {
 	shell *shellState
 }
 
+type completionKind string
+
+const (
+	completionNone    completionKind = ""
+	completionAt      completionKind = "at"
+	completionOption  completionKind = "option"
+	completionCommand completionKind = "command"
+	completionPath    completionKind = "path"
+)
+
 func newVSHCompleter(shell *shellState) *vshCompleter {
 	return &vshCompleter{shell: shell}
 }
 
 func (c *vshCompleter) Do(line []rune, pos int) ([][]rune, int) {
-	candidates, replacementLen := c.Complete(line, pos)
-	return pagedStringCompletions(candidates, replacementLen)
+	candidates, replacementLen, _ := c.CompleteWithKind(line, pos)
+	return stringCompletions(candidates), replacementLen
 }
 
 func (c *vshCompleter) Complete(line []rune, pos int) ([]string, int) {
+	candidates, replacementLen, _ := c.CompleteWithKind(line, pos)
+	return candidates, replacementLen
+}
+
+func (c *vshCompleter) CompleteWithKind(line []rune, pos int) ([]string, int, completionKind) {
 	prefix := string(line[:pos])
 	tokenStart := lastCompletionTokenStart(prefix)
 	token := prefix[tokenStart:]
@@ -137,21 +146,21 @@ func (c *vshCompleter) Complete(line []rune, pos int) ([]string, int) {
 				candidates = append(candidates, word[len(token):])
 			}
 		}
-		return candidates, len([]rune(token))
+		return candidates, len([]rune(token)), completionAt
 	}
 	if strings.HasPrefix(prefix, "@") && strings.HasPrefix(token, "--") {
 		candidates = suffixCompletions(vshOptionWords(), token)
-		return candidates, len([]rune(token))
+		return candidates, len([]rune(token)), completionOption
 	}
 	if c.shouldCompleteCommand(prefix, tokenStart, isFirstToken, token) {
 		candidates = c.commandCandidates(token)
-		return candidates, len([]rune(token))
+		return candidates, len([]rune(token)), completionCommand
 	}
 	if !isFirstToken || token == "" || strings.Contains(token, "/") || token == "." || token == ".." || strings.HasPrefix(token, "~") {
 		candidates = c.pathCandidates(token)
-		return candidates, pathCompletionReplaceLen(token)
+		return candidates, pathCompletionReplaceLen(token), completionPath
 	}
-	return nil, 0
+	return nil, 0, completionNone
 }
 
 func pathCompletionReplaceLen(token string) int {
@@ -220,6 +229,9 @@ func suffixCompletions(words []string, token string) []string {
 
 func (c *vshCompleter) shouldCompleteCommand(prefix string, tokenStart int, isFirstToken bool, token string) bool {
 	if strings.Contains(token, "/") || strings.HasPrefix(token, "~") || token == "." || token == ".." {
+		return false
+	}
+	if token == "" {
 		return false
 	}
 	if isFirstToken {
@@ -429,49 +441,6 @@ func stringCompletions(items []string) [][]rune {
 	return out
 }
 
-func pagedStringCompletions(items []string, replacementLen int) ([][]rune, int) {
-	return stringCompletions(pageCompletionItems(items)), replacementLen
-}
-
-func pageCompletionItems(items []string) []string {
-	limit := completionPageSize()
-	if len(items) <= limit {
-		return items
-	}
-	if limit < 2 {
-		limit = 2
-	}
-	visible := limit - 1
-	out := append([]string(nil), items[:visible]...)
-	out = append(out, fmt.Sprintf("... %d more matches; keep typing", len(items)-visible))
-	return out
-}
-
-func completionPageSize() int {
-	if raw := strings.TrimSpace(os.Getenv("VSH_COMPLETION_PAGE_SIZE")); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil {
-			return clampCompletionPageSize(n)
-		}
-	}
-	if raw := strings.TrimSpace(os.Getenv("LINES")); raw != "" {
-		if lines, err := strconv.Atoi(raw); err == nil && lines > 0 {
-			return clampCompletionPageSize(lines - 6)
-		}
-	}
-	return defaultCompletionPageSize
-}
-
-func clampCompletionPageSize(n int) int {
-	switch {
-	case n < minCompletionPageSize:
-		return minCompletionPageSize
-	case n > maxCompletionPageSize:
-		return maxCompletionPageSize
-	default:
-		return n
-	}
-}
-
 func sortCompletionItems(items []string) {
 	sort.Slice(items, func(i, j int) bool {
 		iDir := strings.HasSuffix(items[i], string(filepath.Separator))
@@ -647,7 +616,17 @@ func (s *shellState) loop(in io.Reader, stdout, stderr io.Writer) error {
 	if !ok {
 		return fmt.Errorf("vsh stdin does not support terminal editing")
 	}
+	s.warmHostShell(stdout, stderr)
 	return s.evalLineEditor(inFile, stdout, stderr)
+}
+
+func (s *shellState) warmHostShell(stdout, stderr io.Writer) {
+	tty, cols, rows := terminalRequestSize(stdout)
+	if !tty {
+		return
+	}
+	env := mergedEnv(mergedEnv(os.Environ(), shellEnv(s.env)), terminalEnv(cols, rows))
+	_, _ = s.hostPersistentShell(env, cols, rows, stderr)
 }
 
 func (s *shellState) evalLineEditor(in *os.File, stdout, stderr io.Writer) error {
@@ -1098,8 +1077,10 @@ func persistentHostShellScript() string {
 		"shopt -s expand_aliases 2>/dev/null || true",
 		"printf '__VSH_READY__:%s\\n' \"$PWD\"",
 		"while IFS= read -r __vsh_line; do",
+		"  stty echo 2>/dev/null || true",
 		"  eval \"$__vsh_line\"",
 		"  __vsh_status=$?",
+		"  stty -echo 2>/dev/null || true",
 		"  printf '__VSH_DONE__:%s:%s\\n' \"$__vsh_status\" \"$PWD\"",
 		"done",
 	}, "\n")
@@ -1413,6 +1394,11 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 	if tty && persistentGuestCommandAllowed(line) {
 		session, err := s.guestPersistentShell(ctx, req)
 		if err == nil {
+			stopForwarding, err := s.startGuestInputForwarding(req.TTY, session.inputs, stdout, stderr)
+			if err != nil {
+				return err
+			}
+			defer stopForwarding()
 			err = session.run(line, stdout, stderr)
 			s.lastCode = sessionLastCode(err)
 			if session.cwd() != "" {
@@ -1479,8 +1465,10 @@ func guestPersistentCommand() []string {
 		colorPrelude("ls --color=always -C --width=${COLUMNS:-80}", "ls -G -C", false),
 		"printf '__VSH_READY__:%s\\n' \"$PWD\"",
 		"while IFS= read -r __vsh_line; do",
+		"  stty echo 2>/dev/null || true",
 		"  eval \"$__vsh_line\"",
 		"  __vsh_status=$?",
+		"  stty -echo 2>/dev/null || true",
 		"  printf '__VSH_DONE__:%s:%s\\n' \"$__vsh_status\" \"$PWD\"",
 		"done",
 	}, "\n")}
@@ -1646,16 +1634,12 @@ func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, st
 	}
 
 	inputs := make(chan client.ExecInput, 8)
-	done := make(chan struct{})
-	var producers sync.WaitGroup
-	restoreTerminal, err := s.startGuestInputForwarding(req.TTY, inputs, done, stdout, stderr, &producers)
+	stopForwarding, err := s.startGuestInputForwarding(req.TTY, inputs, stdout, stderr)
 	if err != nil {
 		return err
 	}
-	defer restoreTerminal()
 	defer func() {
-		close(done)
-		producers.Wait()
+		stopForwarding()
 		close(inputs)
 	}()
 
@@ -1683,8 +1667,10 @@ func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, st
 	return nil
 }
 
-func (s *shellState) startGuestInputForwarding(tty bool, inputs chan<- client.ExecInput, done <-chan struct{}, stdout, stderr io.Writer, producers *sync.WaitGroup) (func(), error) {
+func (s *shellState) startGuestInputForwarding(tty bool, inputs chan<- client.ExecInput, stdout, stderr io.Writer) (func(), error) {
 	restore := func() {}
+	done := make(chan struct{})
+	var producers sync.WaitGroup
 	if tty {
 		file, ok := stdout.(*os.File)
 		if ok && isTerminalFD(int(file.Fd())) && isTerminalFD(int(os.Stdin.Fd())) {
@@ -1706,7 +1692,11 @@ func (s *shellState) startGuestInputForwarding(tty bool, inputs chan<- client.Ex
 		defer producers.Done()
 		forwardGuestSignals(inputs, done, tty, stdout, stderr)
 	}()
-	return restore, nil
+	return func() {
+		restore()
+		close(done)
+		producers.Wait()
+	}, nil
 }
 
 func streamGuestStdin(file *os.File, out chan<- client.ExecInput, done <-chan struct{}) {
@@ -1719,7 +1709,7 @@ func streamGuestStdin(file *os.File, out chan<- client.ExecInput, done <-chan st
 		}
 		n, err := file.Read(buf[:])
 		if n > 0 {
-			sendGuestInputBytes(out, done, buf[:n])
+			sendGuestInput(out, done, client.ExecInput{Kind: "stdin", Data: append([]byte(nil), buf[:n]...)})
 		}
 		if err != nil {
 			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
@@ -1731,23 +1721,6 @@ func streamGuestStdin(file *os.File, out chan<- client.ExecInput, done <-chan st
 			}
 			return
 		}
-	}
-}
-
-func sendGuestInputBytes(out chan<- client.ExecInput, done <-chan struct{}, data []byte) {
-	start := 0
-	for i, b := range data {
-		if b != 3 {
-			continue
-		}
-		if i > start {
-			sendGuestInput(out, done, client.ExecInput{Kind: "stdin", Data: append([]byte(nil), data[start:i]...)})
-		}
-		sendGuestInput(out, done, client.ExecInput{Kind: "signal", Signal: "INT"})
-		start = i + 1
-	}
-	if start < len(data) {
-		sendGuestInput(out, done, client.ExecInput{Kind: "stdin", Data: append([]byte(nil), data[start:]...)})
 	}
 }
 
@@ -2088,7 +2061,20 @@ func (s *shellState) chdirHost(target string) error {
 		return fmt.Errorf("%s is not a directory", target)
 	}
 	s.hostCWD = target
-	return os.Chdir(target)
+	if err := os.Chdir(target); err != nil {
+		return err
+	}
+	if s.hostShell != nil {
+		if err := s.hostShell.run("cd "+shellQuote(target), io.Discard, io.Discard); err != nil {
+			s.hostShell.close()
+			s.hostShell = nil
+			return nil
+		}
+		if cwd := s.hostShell.cwd(); cwd != "" {
+			s.hostCWD = cwd
+		}
+	}
+	return nil
 }
 
 func (s *shellState) chdirGuest(target string) error {

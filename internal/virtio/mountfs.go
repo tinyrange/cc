@@ -2,6 +2,8 @@ package virtio
 
 import (
 	"fmt"
+	"io"
+	"os"
 	"path"
 	"sort"
 	"strings"
@@ -28,6 +30,8 @@ type mountedFS struct {
 	root           FSBackend
 	mounts         []shareMount
 	writebackCache bool
+	debugPaths     []string
+	debugLog       io.Writer
 
 	mu         sync.RWMutex
 	nextNodeID uint64
@@ -83,6 +87,8 @@ func NewMountedFS(root FSBackend, shares []ShareMount) FSBackend {
 	return &mountedFS{
 		root:       root,
 		mounts:     mounts,
+		debugPaths: virtioFSDebugPathsFromEnv(),
+		debugLog:   os.Stderr,
 		nextNodeID: 2,
 		nextHandle: 1,
 		nodes: map[uint64]*mountedNode{
@@ -478,27 +484,71 @@ func (m *mountedFS) Symlink(parent uint64, name string, target string, uid uint3
 	return id, attr, 0
 }
 
+func (m *mountedFS) Link(nodeID uint64, newParent uint64, newName string) (uint64, FuseAttr, int32) {
+	node := m.node(nodeID)
+	parentNode := m.node(newParent)
+	if node == nil || parentNode == nil {
+		return 0, FuseAttr{}, -linuxENOENT
+	}
+	childName, ok := cleanChildName(newName)
+	if !ok {
+		return 0, FuseAttr{}, -linuxEINVAL
+	}
+	childPath := path.Join(parentNode.path, path.Base(childName))
+	if m.isMountPath(childPath) || m.isSyntheticPath(childPath) {
+		return 0, FuseAttr{}, -linuxEEXIST
+	}
+	backend, backendNodeID, mount, errno := m.resolveBackendNode(node.path)
+	if errno != 0 {
+		return 0, FuseAttr{}, errno
+	}
+	newBackend, newParentID, newMount, errno := m.resolveBackendNode(parentNode.path)
+	if errno != 0 {
+		return 0, FuseAttr{}, errno
+	}
+	if !sameWritableMount(mount, newMount) || backend != newBackend {
+		return 0, FuseAttr{}, -linuxEXDEV
+	}
+	linkBackend, ok := backend.(fsLinkBackend)
+	if !ok {
+		return 0, FuseAttr{}, -linuxEROFS
+	}
+	backendLinkedID, attr, errno := linkBackend.Link(backendNodeID, newParentID, childName)
+	if errno != 0 {
+		return 0, FuseAttr{}, errno
+	}
+	id := m.ensureResolvedNode(childPath, backend, backendLinkedID)
+	attr.Ino = id
+	return id, attr, 0
+}
+
 func (m *mountedFS) RmDir(parent uint64, name string) int32 {
 	parentNode := m.node(parent)
 	if parentNode == nil {
 		return -linuxENOENT
 	}
 	childPath := path.Join(parentNode.path, path.Base(path.Clean("/"+name)))
+	m.debugPathf("rmdir", childPath, "parent=%q", parentNode.path)
 	if m.isMountPath(childPath) || m.isSyntheticPath(childPath) {
+		m.debugPathf("rmdir-error", childPath, "errno=%d", -linuxEBUSY)
 		return -linuxEBUSY
 	}
 	backend, backendParent, mount, errno := m.resolveBackendNode(parentNode.path)
 	if errno != 0 {
+		m.debugPathf("rmdir-error", childPath, "resolve_parent_errno=%d", errno)
 		return errno
 	}
 	if !isRootOrWritableMount(mount) {
+		m.debugPathf("rmdir-error", childPath, "errno=%d", -linuxEROFS)
 		return -linuxEROFS
 	}
 	rmBackend, ok := backend.(fsRmDirBackend)
 	if !ok {
+		m.debugPathf("rmdir-error", childPath, "errno=%d", -linuxEROFS)
 		return -linuxEROFS
 	}
 	if errno := rmBackend.RmDir(backendParent, name); errno != 0 {
+		m.debugPathf("rmdir-error", childPath, "backend_errno=%d", errno)
 		return errno
 	}
 	m.removeNode(childPath)
@@ -515,22 +565,28 @@ func (m *mountedFS) Create(parent uint64, name string, flags uint32, mode uint32
 		return 0, 0, FuseAttr{}, -linuxEINVAL
 	}
 	childPath := path.Join(parentNode.path, path.Base(childName))
+	m.debugPathf("create", childPath, "parent=%q flags=%#x mode=%#o uid=%d gid=%d", parentNode.path, flags, mode, uid, gid)
 	if m.isMountPath(childPath) || m.isSyntheticPath(childPath) {
+		m.debugPathf("create-error", childPath, "errno=%d", -linuxEEXIST)
 		return 0, 0, FuseAttr{}, -linuxEEXIST
 	}
 	backend, backendParent, mount, errno := m.resolveBackendNode(parentNode.path)
 	if errno != 0 {
+		m.debugPathf("create-error", childPath, "resolve_parent_errno=%d", errno)
 		return 0, 0, FuseAttr{}, errno
 	}
 	if !isRootOrWritableMount(mount) {
+		m.debugPathf("create-error", childPath, "errno=%d", -linuxEROFS)
 		return 0, 0, FuseAttr{}, -linuxEROFS
 	}
 	createBackend, ok := backend.(fsCreateBackend)
 	if !ok {
+		m.debugPathf("create-error", childPath, "errno=%d", -linuxEROFS)
 		return 0, 0, FuseAttr{}, -linuxEROFS
 	}
 	backendNodeID, fh, attr, errno := createBackend.Create(backendParent, childName, flags, mode, uid, gid)
 	if errno != 0 {
+		m.debugPathf("create-error", childPath, "backend_errno=%d", errno)
 		return 0, 0, FuseAttr{}, errno
 	}
 	id := m.ensureResolvedNode(childPath, backend, backendNodeID)
@@ -588,21 +644,27 @@ func (m *mountedFS) Unlink(parent uint64, name string) int32 {
 		return -linuxENOENT
 	}
 	childPath := path.Join(parentNode.path, path.Base(path.Clean("/"+name)))
+	m.debugPathf("unlink", childPath, "parent=%q", parentNode.path)
 	if m.isMountPath(childPath) || m.isSyntheticPath(childPath) {
+		m.debugPathf("unlink-error", childPath, "errno=%d", -linuxEBUSY)
 		return -linuxEBUSY
 	}
 	backend, backendParent, mount, errno := m.resolveBackendNode(parentNode.path)
 	if errno != 0 {
+		m.debugPathf("unlink-error", childPath, "resolve_parent_errno=%d", errno)
 		return errno
 	}
 	if !isRootOrWritableMount(mount) {
+		m.debugPathf("unlink-error", childPath, "errno=%d", -linuxEROFS)
 		return -linuxEROFS
 	}
 	unlinkBackend, ok := backend.(fsUnlinkBackend)
 	if !ok {
+		m.debugPathf("unlink-error", childPath, "errno=%d", -linuxEROFS)
 		return -linuxEROFS
 	}
 	if errno := unlinkBackend.Unlink(backendParent, name); errno != 0 {
+		m.debugPathf("unlink-error", childPath, "backend_errno=%d", errno)
 		return errno
 	}
 	m.removeNode(childPath)
@@ -617,25 +679,33 @@ func (m *mountedFS) Rename(parent uint64, name string, newParent uint64, newName
 	}
 	oldPath := path.Join(oldParentNode.path, path.Base(path.Clean("/"+name)))
 	newPath := path.Join(newParentNode.path, path.Base(path.Clean("/"+newName)))
+	m.debugPathf("rename", oldPath, "new=%q flags=%#x", newPath, flags)
+	m.debugPathf("rename-target", newPath, "old=%q flags=%#x", oldPath, flags)
 	if m.isMountPath(oldPath) || m.isSyntheticPath(oldPath) || m.isMountPath(newPath) || m.isSyntheticPath(newPath) {
+		m.debugPathf("rename-error", oldPath, "new=%q errno=%d", newPath, -linuxEBUSY)
 		return -linuxEBUSY
 	}
 	oldBackend, oldParentID, oldMount, errno := m.resolveBackendNode(oldParentNode.path)
 	if errno != 0 {
+		m.debugPathf("rename-error", oldPath, "resolve_old_parent_errno=%d", errno)
 		return errno
 	}
 	newBackend, newParentID, newMount, errno := m.resolveBackendNode(newParentNode.path)
 	if errno != 0 {
+		m.debugPathf("rename-error", newPath, "resolve_new_parent_errno=%d", errno)
 		return errno
 	}
 	if !sameWritableMount(oldMount, newMount) || oldBackend != newBackend {
+		m.debugPathf("rename-error", oldPath, "new=%q errno=%d", newPath, -linuxEXDEV)
 		return -linuxEXDEV
 	}
 	renameBackend, ok := oldBackend.(fsRenameBackend)
 	if !ok {
+		m.debugPathf("rename-error", oldPath, "new=%q errno=%d", newPath, -linuxEROFS)
 		return -linuxEROFS
 	}
 	if errno := renameBackend.Rename(oldParentID, name, newParentID, newName, flags); errno != 0 {
+		m.debugPathf("rename-error", oldPath, "new=%q backend_errno=%d", newPath, errno)
 		return errno
 	}
 	m.renameNode(oldPath, newPath)
@@ -953,29 +1023,39 @@ func (m *mountedFS) nodeForPath(guestPath string) *mountedNode {
 
 func (m *mountedFS) removeNode(guestPath string) {
 	guestPath = cleanMountPath(guestPath)
+	m.debugPathf("cache-remove", guestPath, "")
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	id, ok := m.pathToNode[guestPath]
-	if !ok {
-		return
+	for existingPath, id := range m.pathToNode {
+		if existingPath != guestPath && !strings.HasPrefix(existingPath, strings.TrimSuffix(guestPath, "/")+"/") {
+			continue
+		}
+		delete(m.pathToNode, existingPath)
+		delete(m.nodes, id)
 	}
-	delete(m.pathToNode, guestPath)
-	delete(m.nodes, id)
 }
 
 func (m *mountedFS) renameNode(oldPath, newPath string) {
 	oldPath = cleanMountPath(oldPath)
 	newPath = cleanMountPath(newPath)
+	m.debugPathf("cache-rename", oldPath, "new=%q", newPath)
+	m.debugPathf("cache-rename-target", newPath, "old=%q", oldPath)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	id, ok := m.pathToNode[oldPath]
-	if !ok {
-		return
+	updates := map[string]uint64{}
+	for existingPath, id := range m.pathToNode {
+		if existingPath != oldPath && !strings.HasPrefix(existingPath, strings.TrimSuffix(oldPath, "/")+"/") {
+			continue
+		}
+		suffix := strings.TrimPrefix(existingPath, oldPath)
+		updates[cleanMountPath(newPath+suffix)] = id
+		delete(m.pathToNode, existingPath)
 	}
-	delete(m.pathToNode, oldPath)
-	m.pathToNode[newPath] = id
-	if node := m.nodes[id]; node != nil {
-		node.path = newPath
+	for updatedPath, id := range updates {
+		m.pathToNode[updatedPath] = id
+		if node := m.nodes[id]; node != nil {
+			node.path = updatedPath
+		}
 	}
 }
 
@@ -1007,6 +1087,39 @@ func (m *mountedFS) takeHandle(id uint64, dir bool) *mountedHandle {
 	}
 	delete(m.handles, id)
 	return handle
+}
+
+func (m *mountedFS) DebugPath(nodeID uint64) string {
+	node := m.node(nodeID)
+	if node == nil {
+		return ""
+	}
+	return node.path
+}
+
+func (m *mountedFS) debugPathMatch(guestPath string) bool {
+	if len(m.debugPaths) == 0 || guestPath == "" {
+		return false
+	}
+	guestPath = cleanMountPath(guestPath)
+	for _, prefix := range m.debugPaths {
+		prefix = cleanMountPath(prefix)
+		if guestPath == prefix || strings.HasPrefix(guestPath, strings.TrimSuffix(prefix, "/")+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *mountedFS) debugPathf(op string, guestPath string, format string, args ...any) {
+	if m.debugLog == nil || !m.debugPathMatch(guestPath) {
+		return
+	}
+	msg := fmt.Sprintf(format, args...)
+	if msg != "" {
+		msg = " " + msg
+	}
+	_, _ = fmt.Fprintf(m.debugLog, "virtiofs:mount %s path=%q%s\n", op, cleanMountPath(guestPath), msg)
 }
 
 func parentPath(guestPath string) string {
