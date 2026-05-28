@@ -120,7 +120,7 @@ and runs `vsh -ccvm build/vsh/ccvm`.
 For a self-contained test build, use:
 
 ```sh
-tools/build_vsh_single.sh
+go run ./cmd/build-vsh-single
 ```
 
 That produces `build/vsh/vsh-<goos>-<goarch>` with the `ccvm` daemon and Linux
@@ -130,7 +130,8 @@ private daemon flag when it needs to launch the backend.
 Cross builds can set:
 
 ```sh
-CCX3_TARGET_GOOS=windows CCX3_TARGET_GOARCH=amd64 tools/build_vsh_single.sh
+CCX3_TARGET_GOOS=windows CCX3_TARGET_GOARCH=amd64 go run ./cmd/build-vsh-single
 ```
 
+`tools/build_vsh_single.sh` is a Unix convenience wrapper around the Go builder.
 `tools/run_vsh.sh` can also exercise this path with `CCX3_VSH_SINGLE=1`.

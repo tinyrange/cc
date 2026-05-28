@@ -53,6 +53,10 @@ func makeRawTerminal(file *os.File) (func(), error) {
 	}, nil
 }
 
+func prepareTerminalOutput(*os.File) func() {
+	return func() {}
+}
+
 func hostSignals(tty bool) []os.Signal {
 	signals := []os.Signal{os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP}
 	if tty {

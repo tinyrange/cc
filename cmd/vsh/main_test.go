@@ -1127,6 +1127,17 @@ func TestGuestHostPaths(t *testing.T) {
 	}
 }
 
+func TestGuestHostPathToHostPreservesMountedRoot(t *testing.T) {
+	hostCWD := filepath.Join(string(filepath.Separator), "Users", "me", "src")
+	got, ok := guestHostPathToHost(hostCWD, "/host/Users/me/src")
+	if !ok {
+		t.Fatalf("guestHostPathToHost() ok=false")
+	}
+	if want := hostCWD; got != want {
+		t.Fatalf("guestHostPathToHost() = %q, want %q", got, want)
+	}
+}
+
 func TestParsePortForwardSpec(t *testing.T) {
 	forward, err := parsePortForwardSpec("8080:80")
 	if err != nil {

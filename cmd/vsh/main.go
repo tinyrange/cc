@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -413,8 +414,10 @@ func (c *vshCompleter) hostCompletionDir(dirPart string) string {
 
 func (c *vshCompleter) guestHostCompletionDir(dirPart string) (string, bool) {
 	if dirPart == guestHostMount || strings.HasPrefix(dirPart, guestHostMount+"/") {
-		rel := strings.TrimPrefix(dirPart, guestHostMount)
-		return filepath.Join(string(filepath.Separator), filepath.FromSlash(strings.TrimPrefix(rel, "/"))), true
+		if c.shell == nil {
+			return "", false
+		}
+		return guestHostPathToHost(c.shell.hostCWD, dirPart)
 	}
 	if !strings.HasPrefix(dirPart, "/") {
 		current := c.shell.context.CWD
@@ -423,8 +426,7 @@ func (c *vshCompleter) guestHostCompletionDir(dirPart string) (string, bool) {
 		}
 		guestDir := path.Clean(path.Join(current, filepath.ToSlash(dirPart)))
 		if guestDir == guestHostMount || strings.HasPrefix(guestDir, guestHostMount+"/") {
-			rel := strings.TrimPrefix(guestDir, guestHostMount)
-			return filepath.Join(string(filepath.Separator), filepath.FromSlash(strings.TrimPrefix(rel, "/"))), true
+			return guestHostPathToHost(c.shell.hostCWD, guestDir)
 		}
 	}
 	return "", false
@@ -617,6 +619,10 @@ func defaultContext(vmID, image string) commandContext {
 func (s *shellState) loop(in io.Reader, stdout, stderr io.Writer) error {
 	if !readerIsTerminal(in) || !writerIsTerminal(stdout) {
 		return fmt.Errorf("vsh requires an interactive terminal")
+	}
+	if outFile, ok := stdout.(*os.File); ok {
+		restoreOutput := prepareTerminalOutput(outFile)
+		defer restoreOutput()
 	}
 	inCloser, ok := in.(io.ReadCloser)
 	if !ok {
@@ -1017,6 +1023,9 @@ func (e persistentShellExit) Error() string {
 }
 
 func persistentHostCommandAllowed(line string) bool {
+	if runtime.GOOS == "windows" {
+		return false
+	}
 	fields, err := splitShellFields(line)
 	if err != nil || len(fields) == 0 {
 		return false
@@ -1195,6 +1204,9 @@ func (p *persistentHostShell) close() {
 }
 
 func (s *shellState) hostCommandPrelude(tty bool) string {
+	if runtime.GOOS == "windows" {
+		return ""
+	}
 	if !tty {
 		return ""
 	}
@@ -1211,6 +1223,9 @@ func (s *shellState) hostCommandPrelude(tty bool) string {
 }
 
 func hostShellCommand(line string, tty bool, prelude string) []string {
+	if runtime.GOOS == "windows" {
+		return []string{hostShell(), "/D", "/S", "/C", line}
+	}
 	command := line
 	if tty {
 		command = prelude + hostShellPrelude() + "eval " + shellQuote(line)
@@ -2121,12 +2136,10 @@ func (s *shellState) chdirGuest(target string) error {
 	}
 	target = path.Clean(target)
 	if strings.HasPrefix(target, guestHostMount+"/") || target == guestHostMount {
-		hostRoot, _, err := guestHostPaths(s.hostCWD)
-		if err != nil {
-			return err
+		hostPath, ok := guestHostPathToHost(s.hostCWD, target)
+		if !ok {
+			return fmt.Errorf("cannot map guest host path %q", target)
 		}
-		rel := strings.TrimPrefix(target, guestHostMount)
-		hostPath := filepath.Join(hostRoot, filepath.FromSlash(strings.TrimPrefix(rel, "/")))
 		if err := s.chdirHost(hostPath); err != nil {
 			return err
 		}
@@ -2135,6 +2148,21 @@ func (s *shellState) chdirGuest(target string) error {
 	}
 	s.context.CWD = target
 	return nil
+}
+
+func guestHostPathToHost(hostCWD, guestPath string) (string, bool) {
+	if guestPath != guestHostMount && !strings.HasPrefix(guestPath, guestHostMount+"/") {
+		return "", false
+	}
+	hostRoot, _, err := guestHostPaths(hostCWD)
+	if err != nil {
+		return "", false
+	}
+	rel := strings.TrimPrefix(guestPath, guestHostMount)
+	if rel == "" || rel == "/" {
+		return hostRoot, true
+	}
+	return filepath.Join(hostRoot, filepath.FromSlash(strings.TrimPrefix(rel, "/"))), true
 }
 
 func (s *shellState) prompt() string {
@@ -2606,6 +2634,12 @@ func lexShellTokens(input string) ([]shellToken, error) {
 }
 
 func hostShell() string {
+	if runtime.GOOS == "windows" {
+		if shell := strings.TrimSpace(os.Getenv("COMSPEC")); shell != "" {
+			return shell
+		}
+		return "cmd.exe"
+	}
 	if shell := strings.TrimSpace(os.Getenv("SHELL")); shell != "" {
 		return shell
 	}

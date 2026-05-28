@@ -3,34 +3,5 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${ROOT_DIR}/build/vsh"
-GUESTINIT_ARM64_EMBED_PATH="${ROOT_DIR}/internal/guestinit/guest-init-linux-arm64"
-GUESTINIT_AMD64_EMBED_PATH="${ROOT_DIR}/internal/guestinit/guest-init-linux-amd64"
-TARGET_GOOS="${CCX3_TARGET_GOOS:-$(go env GOOS)}"
-TARGET_GOARCH="${CCX3_TARGET_GOARCH:-$(go env GOARCH)}"
-TARGET_SUFFIX=""
-if [[ "${TARGET_GOOS}" == "windows" ]]; then
-  TARGET_SUFFIX=".exe"
-fi
-
-VSH_OUTPUT="${BUILD_DIR}/vsh-${TARGET_GOOS}-${TARGET_GOARCH}${TARGET_SUFFIX}"
-
-mkdir -p "${BUILD_DIR}"
-
-(
-  cd "${ROOT_DIR}"
-
-  GOOS=linux GOARCH=arm64 go build -o "${BUILD_DIR}/init-linux-arm64" ./internal/cmd/init
-  install -m 644 "${BUILD_DIR}/init-linux-arm64" "${GUESTINIT_ARM64_EMBED_PATH}"
-
-  GOOS=linux GOARCH=amd64 go build -o "${BUILD_DIR}/init-linux-amd64" ./internal/cmd/init
-  install -m 644 "${BUILD_DIR}/init-linux-amd64" "${GUESTINIT_AMD64_EMBED_PATH}"
-
-  GOOS="${TARGET_GOOS}" GOARCH="${TARGET_GOARCH}" go build -tags embed_guestinit -o "${VSH_OUTPUT}" ./cmd/vsh
-)
-
-if [[ "${TARGET_GOOS}" == "darwin" && "$(uname -s)" == "Darwin" ]]; then
-  codesign -f -s - --entitlements "${ROOT_DIR}/tools/entitlements.xml" "${VSH_OUTPUT}"
-fi
-
-printf '%s\n' "${VSH_OUTPUT}"
+cd "${ROOT_DIR}"
+exec go run ./cmd/build-vsh-single "$@"
