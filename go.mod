@@ -4,6 +4,7 @@ go 1.25.5
 
 require (
 	github.com/chzyer/readline v1.5.1
+	github.com/creack/pty v1.1.24
 	github.com/ebitengine/purego v0.10.0
 )
 

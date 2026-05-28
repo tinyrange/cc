@@ -246,6 +246,8 @@ type VM struct {
 	exitInfo    *VcpuExit
 	mappings    []mapping
 	threadCh    chan func()
+	threadMu    sync.Mutex
+	closed      bool
 	dit         bool
 	mdscrEL1    uint64
 	osdlrEL1    uint64
@@ -346,7 +348,7 @@ func NewVMWithContext(ctx context.Context) (*VM, error) {
 		errCh <- err
 	}
 	if err := <-errCh; err != nil {
-		close(v.threadCh)
+		v.closeThread()
 		vmLifecycleMu.Unlock()
 		return nil, err
 	}
@@ -811,6 +813,26 @@ func (v *VM) threadMain() {
 	}
 }
 
+func (v *VM) callOnThread(fn func()) error {
+	v.threadMu.Lock()
+	defer v.threadMu.Unlock()
+	if v.closed {
+		return fmt.Errorf("vm is closed")
+	}
+	v.threadCh <- fn
+	return nil
+}
+
+func (v *VM) closeThread() {
+	v.threadMu.Lock()
+	defer v.threadMu.Unlock()
+	if v.closed {
+		return
+	}
+	v.closed = true
+	close(v.threadCh)
+}
+
 func (v *VM) Close() error {
 	var firstErr error
 	defer func() {
@@ -863,7 +885,7 @@ func (v *VM) Close() error {
 	if err := <-errCh; err != nil && firstErr == nil {
 		firstErr = err
 	}
-	close(v.threadCh)
+	v.closeThread()
 	return firstErr
 }
 
@@ -1128,7 +1150,7 @@ func (v *VM) ReadIPA(addr uint64, size int) ([]byte, error) {
 		data []byte
 		err  error
 	}, 1)
-	v.threadCh <- func() {
+	if err := v.callOnThread(func() {
 		for _, m := range v.mappings {
 			start := uint64(m.ipa)
 			end := start + uint64(m.size)
@@ -1147,6 +1169,8 @@ func (v *VM) ReadIPA(addr uint64, size int) ([]byte, error) {
 			data []byte
 			err  error
 		}{err: fmt.Errorf("read guest memory %#x size %d: unmapped", addr, size)}
+	}); err != nil {
+		return nil, err
 	}
 	res := <-respCh
 	return res.data, res.err
@@ -1154,7 +1178,7 @@ func (v *VM) ReadIPA(addr uint64, size int) ([]byte, error) {
 
 func (v *VM) WriteIPA(addr uint64, data []byte) error {
 	errCh := make(chan error, 1)
-	v.threadCh <- func() {
+	if err := v.callOnThread(func() {
 		for _, m := range v.mappings {
 			start := uint64(m.ipa)
 			end := start + uint64(m.size)
@@ -1167,6 +1191,8 @@ func (v *VM) WriteIPA(addr uint64, data []byte) error {
 			return
 		}
 		errCh <- fmt.Errorf("write guest memory %#x size %d: unmapped", addr, len(data))
+	}); err != nil {
+		return err
 	}
 	return <-errCh
 }
@@ -1179,12 +1205,14 @@ func (v *VM) SetIRQ(irq uint32, level bool) error {
 	}
 	intid := irq + gicSPIBase
 	errCh := make(chan error, 1)
-	v.threadCh <- func() {
+	if err := v.callOnThread(func() {
 		if ret := hvGICSetSPI(intid, level); ret != hvSuccess {
 			errCh <- fmt.Errorf("set gic spi %d level=%v: %w", intid, level, ret)
 			return
 		}
 		errCh <- nil
+	}); err != nil {
+		return err
 	}
 	return <-errCh
 }

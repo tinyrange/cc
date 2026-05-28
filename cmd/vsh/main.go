@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/chzyer/readline"
+	"github.com/creack/pty"
 	"j5.nz/cc/client"
 )
 
@@ -37,6 +39,12 @@ const (
 	colorYellow  = "\x1b[33m"
 )
 
+const (
+	defaultCompletionPageSize = 40
+	minCompletionPageSize     = 12
+	maxCompletionPageSize     = 80
+)
+
 type daemonState struct {
 	Addr string `json:"addr"`
 }
@@ -49,13 +57,438 @@ const (
 )
 
 type shellState struct {
-	api       vshAPI
-	context   commandContext
-	hostCWD   string
-	lastCode  int
-	promptOut io.Writer
-	history   string
-	statusSeq atomic.Uint64
+	api        vshAPI
+	context    commandContext
+	hostCWD    string
+	rootCache  string
+	imageCache map[string]bool
+	vmRunning  map[string]bool
+	hostInit   hostShellInit
+	hostShell  *persistentHostShell
+	guestShell *persistentGuestShell
+	lastCode   int
+	promptOut  io.Writer
+	history    string
+	env        map[string]string
+	jobs       []shellJob
+	nextJobID  int
+	jobsMu     sync.Mutex
+	statusSeq  atomic.Uint64
+	completion *vshCompleter
+}
+
+type shellJob struct {
+	ID      int
+	Context commandContext
+	Command string
+	Done    bool
+	Code    int
+	Err     string
+}
+
+type hostShellInit struct {
+	once     sync.Once
+	prelude  string
+	fallback bool
+}
+
+type persistentHostShell struct {
+	mu      sync.Mutex
+	cmd     *exec.Cmd
+	stdin   io.WriteCloser
+	stdout  *bufio.Reader
+	seq     uint64
+	lastCWD string
+	pending string
+	done    chan error
+}
+
+type persistentGuestShell struct {
+	mu      sync.Mutex
+	key     string
+	inputs  chan client.ExecInput
+	events  chan client.ExecEvent
+	done    chan error
+	lastCWD string
+	pending string
+}
+
+type vshCompleter struct {
+	shell *shellState
+}
+
+func newVSHCompleter(shell *shellState) *vshCompleter {
+	return &vshCompleter{shell: shell}
+}
+
+func (c *vshCompleter) Do(line []rune, pos int) ([][]rune, int) {
+	prefix := string(line[:pos])
+	tokenStart := lastCompletionTokenStart(prefix)
+	token := prefix[tokenStart:]
+	isFirstToken := strings.TrimSpace(prefix[:tokenStart]) == ""
+	var candidates []string
+	if strings.HasPrefix(prefix, "@") && isFirstToken {
+		for _, word := range c.atTargetWords() {
+			if strings.HasPrefix(word, token) {
+				candidates = append(candidates, word[len(token):])
+			}
+		}
+		return pagedStringCompletions(candidates, len([]rune(token)))
+	}
+	if strings.HasPrefix(prefix, "@") && strings.HasPrefix(token, "--") {
+		candidates = suffixCompletions(vshOptionWords(), token)
+		return pagedStringCompletions(candidates, len([]rune(token)))
+	}
+	if c.shouldCompleteCommand(prefix, tokenStart, isFirstToken, token) {
+		candidates = c.commandCandidates(token)
+		return pagedStringCompletions(candidates, len([]rune(token)))
+	}
+	if !isFirstToken || token == "" || strings.Contains(token, "/") || token == "." || token == ".." || strings.HasPrefix(token, "~") {
+		candidates = c.pathCandidates(token)
+		return pagedStringCompletions(candidates, len([]rune(filepath.Base(token))))
+	}
+	return nil, 0
+}
+
+func (c *vshCompleter) atTargetWords() []string {
+	words := []string{"@help", "@host", "@jobs", "@ps", "@status", "@start", "@stop", "@forward", "@sudo"}
+	for _, image := range c.cachedImageNames() {
+		words = append(words, "@"+image)
+	}
+	sort.Strings(words)
+	return uniqueStrings(words)
+}
+
+func (c *vshCompleter) cachedImageNames() []string {
+	if c.shell == nil || c.shell.rootCache == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(filepath.Join(c.shell.rootCache, "images"))
+	if err != nil {
+		return nil
+	}
+	var images []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if name == "blobs" || name == "layers" {
+			continue
+		}
+		images = append(images, name)
+	}
+	sort.Strings(images)
+	return images
+}
+
+func vshOptionWords() []string {
+	return []string{
+		"--vm",
+		"--cwd",
+		"--user",
+		"--sudo",
+		"--memory",
+		"--memory-mb",
+		"--cpus",
+		"--network",
+		"--no-network",
+	}
+}
+
+func suffixCompletions(words []string, token string) []string {
+	var out []string
+	for _, word := range words {
+		if strings.HasPrefix(word, token) {
+			out = append(out, word[len(token):])
+		}
+	}
+	sort.Strings(out)
+	return uniqueStrings(out)
+}
+
+func (c *vshCompleter) shouldCompleteCommand(prefix string, tokenStart int, isFirstToken bool, token string) bool {
+	if strings.Contains(token, "/") || strings.HasPrefix(token, "~") || token == "." || token == ".." {
+		return false
+	}
+	if isFirstToken {
+		return !strings.HasPrefix(prefix, "@")
+	}
+	if !strings.HasPrefix(prefix, "@") {
+		return false
+	}
+	words := completedShellWords(prefix[:tokenStart])
+	seenTarget := false
+	for i, word := range words {
+		if i == 0 {
+			if !strings.HasPrefix(word, "@") {
+				return false
+			}
+			seenTarget = strings.TrimPrefix(word, "@") != ""
+			continue
+		}
+		if strings.HasPrefix(word, "--") {
+			continue
+		}
+		if !seenTarget && word != "" {
+			seenTarget = true
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func completedShellWords(line string) []string {
+	tokens, err := lexShellTokens(line)
+	if err != nil {
+		return strings.Fields(line)
+	}
+	words := make([]string, 0, len(tokens))
+	for _, token := range tokens {
+		words = append(words, token.Value)
+	}
+	return words
+}
+
+func (c *vshCompleter) commandCandidates(token string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(name string) {
+		if name == "" || seen[name] || !strings.HasPrefix(name, token) {
+			return
+		}
+		seen[name] = true
+		out = append(out, shellEscapeCompletion(name[len(token):]))
+	}
+	for _, name := range []string{"cd", "exit", "export", "pwd", "echo", "env", "ls", "cat", "grep", "find", "git", "make", "go", "python", "python3", "sh"} {
+		add(name)
+	}
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil || info.Mode()&0o111 == 0 {
+				continue
+			}
+			add(entry.Name())
+		}
+	}
+	sortCompletionItems(out)
+	return out
+}
+
+func lastCompletionTokenStart(line string) int {
+	last := 0
+	escaped := false
+	var quote rune
+	for i, r := range line {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+		if quote != 0 {
+			if r == quote {
+				quote = 0
+			}
+			continue
+		}
+		if r == '\'' || r == '"' {
+			quote = r
+			continue
+		}
+		if r == ' ' || r == '\t' {
+			last = i + len(string(r))
+		}
+	}
+	return last
+}
+
+func (c *vshCompleter) pathCandidates(token string) []string {
+	dirPart, base := filepath.Split(token)
+	hostDir := dirPart
+	if hostDir == "" {
+		if c.shell != nil {
+			hostDir = c.shell.hostCWD
+		}
+		if c.shell != nil && c.shell.context.Mode == modeVM {
+			current := c.shell.context.CWD
+			if current == "" {
+				_, current, _ = guestHostPaths(c.shell.hostCWD)
+			}
+			if hostPath, ok := c.guestHostCompletionDir(current); ok {
+				hostDir = hostPath
+			}
+		}
+	} else {
+		hostDir = c.hostCompletionDir(hostDir)
+	}
+	entries, err := os.ReadDir(hostDir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") && !strings.HasPrefix(base, ".") {
+			continue
+		}
+		if !strings.HasPrefix(name, base) {
+			continue
+		}
+		suffix := name[len(base):]
+		if entry.IsDir() {
+			suffix += string(filepath.Separator)
+		}
+		out = append(out, shellEscapeCompletion(suffix))
+	}
+	sortCompletionItems(out)
+	return out
+}
+
+func (c *vshCompleter) hostCompletionDir(dirPart string) string {
+	hostDir := os.ExpandEnv(dirPart)
+	if c.shell != nil && c.shell.context.Mode == modeVM {
+		if hostPath, ok := c.guestHostCompletionDir(hostDir); ok {
+			return hostPath
+		}
+	}
+	if strings.HasPrefix(hostDir, "~/") || hostDir == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			if hostDir == "~" {
+				hostDir = home
+			} else {
+				hostDir = filepath.Join(home, hostDir[2:])
+			}
+		}
+	}
+	if !filepath.IsAbs(hostDir) {
+		cwd := "."
+		if c.shell != nil && c.shell.hostCWD != "" {
+			cwd = c.shell.hostCWD
+		}
+		hostDir = filepath.Join(cwd, hostDir)
+	}
+	return hostDir
+}
+
+func (c *vshCompleter) guestHostCompletionDir(dirPart string) (string, bool) {
+	if dirPart == guestHostMount || strings.HasPrefix(dirPart, guestHostMount+"/") {
+		rel := strings.TrimPrefix(dirPart, guestHostMount)
+		return filepath.Join(string(filepath.Separator), filepath.FromSlash(strings.TrimPrefix(rel, "/"))), true
+	}
+	if !strings.HasPrefix(dirPart, "/") {
+		current := c.shell.context.CWD
+		if current == "" {
+			_, current, _ = guestHostPaths(c.shell.hostCWD)
+		}
+		guestDir := path.Clean(path.Join(current, filepath.ToSlash(dirPart)))
+		if guestDir == guestHostMount || strings.HasPrefix(guestDir, guestHostMount+"/") {
+			rel := strings.TrimPrefix(guestDir, guestHostMount)
+			return filepath.Join(string(filepath.Separator), filepath.FromSlash(strings.TrimPrefix(rel, "/"))), true
+		}
+	}
+	return "", false
+}
+
+func shellEscapeCompletion(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, " ", `\ `)
+	return value
+}
+
+func stringCompletions(items []string) [][]rune {
+	if len(items) == 0 {
+		return nil
+	}
+	out := make([][]rune, 0, len(items))
+	for _, item := range items {
+		out = append(out, []rune(item))
+	}
+	return out
+}
+
+func pagedStringCompletions(items []string, replacementLen int) ([][]rune, int) {
+	return stringCompletions(pageCompletionItems(items)), replacementLen
+}
+
+func pageCompletionItems(items []string) []string {
+	limit := completionPageSize()
+	if len(items) <= limit {
+		return items
+	}
+	if limit < 2 {
+		limit = 2
+	}
+	visible := limit - 1
+	out := append([]string(nil), items[:visible]...)
+	out = append(out, fmt.Sprintf("... %d more matches; keep typing", len(items)-visible))
+	return out
+}
+
+func completionPageSize() int {
+	if raw := strings.TrimSpace(os.Getenv("VSH_COMPLETION_PAGE_SIZE")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			return clampCompletionPageSize(n)
+		}
+	}
+	if raw := strings.TrimSpace(os.Getenv("LINES")); raw != "" {
+		if lines, err := strconv.Atoi(raw); err == nil && lines > 0 {
+			return clampCompletionPageSize(lines - 6)
+		}
+	}
+	return defaultCompletionPageSize
+}
+
+func clampCompletionPageSize(n int) int {
+	switch {
+	case n < minCompletionPageSize:
+		return minCompletionPageSize
+	case n > maxCompletionPageSize:
+		return maxCompletionPageSize
+	default:
+		return n
+	}
+}
+
+func sortCompletionItems(items []string) {
+	sort.Slice(items, func(i, j int) bool {
+		iDir := strings.HasSuffix(items[i], string(filepath.Separator))
+		jDir := strings.HasSuffix(items[j], string(filepath.Separator))
+		if iDir != jDir {
+			return iDir
+		}
+		if len(items[i]) != len(items[j]) {
+			return len(items[i]) < len(items[j])
+		}
+		return items[i] < items[j]
+	})
+}
+
+func uniqueStrings(items []string) []string {
+	if len(items) < 2 {
+		return items
+	}
+	out := items[:0]
+	var prev string
+	for i, item := range items {
+		if i > 0 && item == prev {
+			continue
+		}
+		out = append(out, item)
+		prev = item
+	}
+	return out
 }
 
 type vshAPI interface {
@@ -154,12 +587,18 @@ func run() error {
 		return err
 	}
 	sh := &shellState{
-		api:       api,
-		context:   defaultContext(strings.TrimSpace(*vmID), strings.TrimSpace(*image)),
-		hostCWD:   cwd,
-		promptOut: os.Stdout,
-		history:   filepath.Join(rootCache, "vsh_history"),
+		api:        api,
+		context:    defaultContext(strings.TrimSpace(*vmID), strings.TrimSpace(*image)),
+		hostCWD:    cwd,
+		rootCache:  rootCache,
+		imageCache: map[string]bool{},
+		vmRunning:  map[string]bool{},
+		promptOut:  os.Stdout,
+		history:    filepath.Join(rootCache, "vsh_history"),
+		env:        map[string]string{},
 	}
+	sh.completion = newVSHCompleter(sh)
+	defer sh.closeSessions()
 	if *startVM {
 		if err := sh.startVM(sh.context.VMID, sh.context); err != nil {
 			return err
@@ -203,6 +642,7 @@ func (s *shellState) evalReadline(in io.ReadCloser, stdout, stderr io.Writer) er
 		HistoryLimit:           1000,
 		HistorySearchFold:      true,
 		DisableAutoSaveHistory: true,
+		AutoComplete:           s.completion,
 		InterruptPrompt:        "^C",
 		EOFPrompt:              "",
 		Stdin:                  in,
@@ -285,11 +725,23 @@ func (s *shellState) eval(line string, stdout, stderr io.Writer) error {
 	if isExitCommand(line) {
 		return io.EOF
 	}
+	if ok, err := s.evalExport(line); ok || err != nil {
+		return err
+	}
 	if cd, ok, err := parseCD(line); ok || err != nil {
 		if err != nil {
 			return err
 		}
-		return s.chdir(cd)
+		if s.context.Mode == modeVM && s.guestShell != nil {
+			return s.runInContext(s.context, line, stdout, stderr)
+		}
+		return s.chdirContext(cd)
+	}
+	if command, ok, err := stripBackground(line); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return s.startBackgroundJob(s.context, command, stdout, stderr)
 	}
 	return s.runInContext(s.context, line, stdout, stderr)
 }
@@ -303,6 +755,114 @@ func (s *shellState) runInContext(ctx commandContext, line string, stdout, stder
 	default:
 		return fmt.Errorf("unknown shell mode %q", ctx.Mode)
 	}
+}
+
+func (s *shellState) runMaybeBackground(ctx commandContext, line string, stdout, stderr io.Writer) error {
+	if command, ok, err := stripBackground(line); ok || err != nil {
+		if err != nil {
+			return err
+		}
+		return s.startBackgroundJob(ctx, command, stdout, stderr)
+	}
+	return s.runInContext(ctx, line, stdout, stderr)
+}
+
+func (s *shellState) evalExport(line string) (bool, error) {
+	fields, err := splitShellFields(line)
+	if err != nil {
+		return false, nil
+	}
+	if len(fields) == 0 || fields[0] != "export" {
+		return false, nil
+	}
+	if s.env == nil {
+		s.env = map[string]string{}
+	}
+	for _, field := range fields[1:] {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok {
+			value = os.Getenv(field)
+		}
+		if !isShellName(key) {
+			return true, fmt.Errorf("export: invalid name %q", key)
+		}
+		s.env[key] = value
+	}
+	s.closeSessions()
+	return true, nil
+}
+
+func isShellName(value string) bool {
+	if value == "" {
+		return false
+	}
+	for i, r := range value {
+		switch {
+		case r == '_':
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case i > 0 && r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func stripBackground(line string) (string, bool, error) {
+	tokens, err := lexShellTokens(line)
+	if err != nil {
+		return "", false, err
+	}
+	if len(tokens) == 0 || tokens[len(tokens)-1].Value != "&" {
+		return "", false, nil
+	}
+	command := strings.TrimSpace(line[:tokens[len(tokens)-1].Start])
+	if command == "" {
+		return "", true, fmt.Errorf("background command is empty")
+	}
+	return command, true, nil
+}
+
+func (s *shellState) startBackgroundJob(ctx commandContext, line string, stdout, stderr io.Writer) error {
+	bgShell := &shellState{
+		api:       s.api,
+		context:   ctx,
+		hostCWD:   s.hostCWD,
+		promptOut: s.promptOut,
+		env:       cloneEnv(s.env),
+	}
+	s.jobsMu.Lock()
+	s.nextJobID++
+	id := s.nextJobID
+	s.jobs = append(s.jobs, shellJob{ID: id, Context: ctx, Command: line})
+	idx := len(s.jobs) - 1
+	s.jobsMu.Unlock()
+	fmt.Fprintf(stdout, "[%d] running %s\n", id, line)
+	go func() {
+		err := bgShell.runInContext(ctx, line, io.Discard, io.Discard)
+		code := bgShell.lastCode
+		s.jobsMu.Lock()
+		s.jobs[idx].Done = true
+		s.jobs[idx].Code = code
+		if err != nil {
+			s.jobs[idx].Err = err.Error()
+		}
+		s.jobsMu.Unlock()
+		_ = stderr
+	}()
+	return nil
+}
+
+func cloneEnv(env map[string]string) map[string]string {
+	if len(env) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(env))
+	for key, value := range env {
+		out[key] = value
+	}
+	return out
 }
 
 func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
@@ -326,7 +886,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			s.context = ctx
 			return nil
 		}
-		return s.runInContext(ctx, at.Command, stdout, stderr)
+		return s.runMaybeBackground(ctx, at.Command, stdout, stderr)
 	}
 
 	switch at.Target {
@@ -345,12 +905,17 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			s.context = ctx
 			return nil
 		}
-		return s.runInContext(ctx, at.Command, stdout, stderr)
+		return s.runMaybeBackground(ctx, at.Command, stdout, stderr)
 	case "ps":
 		if at.Command != "" || len(at.Options.OptionFields) != 0 {
 			return fmt.Errorf("usage: @ps")
 		}
 		return s.printVMs(stdout)
+	case "jobs":
+		if at.Command != "" || len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @jobs")
+		}
+		return s.printJobs(stdout)
 	case "status", "where":
 		if at.Command != "" || len(at.Options.OptionFields) != 0 {
 			return fmt.Errorf("usage: @%s", at.Target)
@@ -363,7 +928,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		if at.Command == "" {
 			return fmt.Errorf("usage: @sudo <cmd>")
 		}
-		return s.runInContext(ctx, at.Command, stdout, stderr)
+		return s.runMaybeBackground(ctx, at.Command, stdout, stderr)
 	case "start":
 		if at.Command != "" {
 			return fmt.Errorf("usage: @start [--vm id]")
@@ -405,24 +970,45 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			if at.Options.Sudo {
 				return fmt.Errorf("usage: @%s --sudo <cmd>", at.Target)
 			}
+			if err := s.ensureImageAvailable(ctx.Image, stderr); err != nil {
+				return err
+			}
 			s.context = ctx
 			return nil
 		}
-		return s.runInContext(ctx, at.Command, stdout, stderr)
+		return s.runMaybeBackground(ctx, at.Command, stdout, stderr)
 	}
 }
 
 func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {
 	tty, cols, rows := terminalRequestSize(stdout)
-	args := hostShellCommand(line, tty)
+	env := []string(nil)
+	if tty {
+		env = mergedEnv(mergedEnv(os.Environ(), shellEnv(s.env)), terminalEnv(cols, rows))
+	} else if len(s.env) > 0 {
+		env = mergedEnv(os.Environ(), shellEnv(s.env))
+	}
+	if persistentHostCommandAllowed(line) {
+		session, err := s.hostPersistentShell(env, cols, rows, stderr)
+		if err == nil {
+			err = session.run(line, stdout, stderr)
+			s.lastCode = sessionLastCode(err)
+			if err == nil || s.lastCode >= 0 {
+				if session.cwd() != "" {
+					s.hostCWD = session.cwd()
+					_ = os.Chdir(s.hostCWD)
+				}
+				return nil
+			}
+		}
+	}
+	args := hostShellCommand(line, tty, s.hostCommandPrelude(tty))
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Dir = s.hostCWD
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	if tty {
-		cmd.Env = mergedEnv(os.Environ(), terminalEnv(cols, rows))
-	}
+	cmd.Env = env
 	err := cmd.Run()
 	s.lastCode = exitCode(err)
 	if err != nil && s.lastCode < 0 {
@@ -431,12 +1017,263 @@ func (s *shellState) runHost(line string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-func hostShellCommand(line string, tty bool) []string {
+func sessionLastCode(err error) int {
+	var exit persistentShellExit
+	if errors.As(err, &exit) {
+		return exit.code
+	}
+	return exitCode(err)
+}
+
+type persistentShellExit struct {
+	code int
+}
+
+func (e persistentShellExit) Error() string {
+	return fmt.Sprintf("exit status %d", e.code)
+}
+
+func persistentHostCommandAllowed(line string) bool {
+	fields, err := splitShellFields(line)
+	if err != nil || len(fields) == 0 {
+		return false
+	}
+	switch fields[0] {
+	case "vi", "vim", "nvim", "nano", "emacs", "less", "more", "man", "ssh", "top", "htop", "watch", "fg", "bg", "jobs":
+		return false
+	case "cat", "python", "python3", "node", "ruby", "irb", "php", "sqlite3", "mysql", "psql":
+		return len(fields) > 1
+	default:
+		return true
+	}
+}
+
+func (s *shellState) hostPersistentShell(env []string, cols, rows int, stderr io.Writer) (*persistentHostShell, error) {
+	if s.hostShell != nil {
+		return s.hostShell, nil
+	}
+	session, err := startPersistentHostShell(s.hostCWD, env, cols, rows, s.hostCommandPrelude(true))
+	if err != nil {
+		return nil, err
+	}
+	s.hostShell = session
+	return session, nil
+}
+
+func startPersistentHostShell(cwd string, env []string, cols, rows int, prelude string) (*persistentHostShell, error) {
+	script := prelude + persistentHostShellScript()
+	cmd := exec.Command(hostShell(), "-lc", script)
+	cmd.Dir = cwd
+	if env != nil {
+		cmd.Env = env
+	}
+	if cols <= 0 {
+		cols = 80
+	}
+	if rows <= 0 {
+		rows = 24
+	}
+	tty, err := pty.StartWithSize(cmd, &pty.Winsize{
+		Cols: uint16(cols),
+		Rows: uint16(rows),
+	})
+	if err != nil {
+		return nil, err
+	}
+	session := &persistentHostShell{
+		cmd:     cmd,
+		stdin:   tty,
+		stdout:  bufio.NewReader(tty),
+		lastCWD: cwd,
+		done:    make(chan error, 1),
+	}
+	go func() {
+		session.done <- cmd.Wait()
+	}()
+	if err := session.waitReady(); err != nil {
+		session.close()
+		return nil, err
+	}
+	return session, nil
+}
+
+func persistentHostShellScript() string {
+	return strings.Join([]string{
+		"set +m 2>/dev/null || true",
+		"stty -echo 2>/dev/null || true",
+		"shopt -s expand_aliases 2>/dev/null || true",
+		"printf '__VSH_READY__:%s\\n' \"$PWD\"",
+		"while IFS= read -r __vsh_line; do",
+		"  eval \"$__vsh_line\"",
+		"  __vsh_status=$?",
+		"  printf '__VSH_DONE__:%s:%s\\n' \"$__vsh_status\" \"$PWD\"",
+		"done",
+	}, "\n")
+}
+
+func (p *persistentHostShell) waitReady() error {
+	for {
+		text, err := p.stdout.ReadString('\n')
+		if text != "" {
+			if cwd, ok := parsePersistentReady(text); ok {
+				p.lastCWD = cwd
+				return nil
+			}
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (p *persistentHostShell) run(line string, stdout, stderr io.Writer) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, err := fmt.Fprintln(p.stdin, line); err != nil {
+		return err
+	}
+	for {
+		text, err := p.stdout.ReadString('\n')
+		if text != "" {
+			if before, code, cwd, ok := p.consumeOutput(text); ok {
+				if before != "" {
+					_, _ = io.WriteString(stdout, before)
+				}
+				p.lastCWD = cwd
+				if code != 0 {
+					return persistentShellExit{code: code}
+				}
+				return nil
+			}
+			_, _ = io.WriteString(stdout, text)
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func (p *persistentHostShell) consumeOutput(text string) (string, int, string, bool) {
+	p.pending += text
+	idx := strings.Index(p.pending, "__VSH_DONE__:")
+	if idx < 0 {
+		out := p.pending
+		p.pending = ""
+		return out, 0, "", false
+	}
+	newline := strings.IndexAny(p.pending[idx:], "\r\n")
+	if newline < 0 {
+		if idx > 0 {
+			out := p.pending[:idx]
+			p.pending = p.pending[idx:]
+			return out, 0, "", false
+		}
+		return "", 0, "", false
+	}
+	lineEnd := idx + newline
+	before := p.pending[:idx]
+	marker := p.pending[idx:lineEnd]
+	p.pending = strings.TrimLeft(p.pending[lineEnd:], "\r\n")
+	code, cwd, ok := parsePersistentMarker(marker)
+	return before, code, cwd, ok
+}
+
+func (p *persistentHostShell) cwd() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastCWD
+}
+
+func (s *shellState) closeSessions() {
+	if s.guestShell != nil {
+		s.guestShell.close()
+		s.guestShell = nil
+	}
+	if s.hostShell != nil {
+		s.hostShell.close()
+		s.hostShell = nil
+	}
+}
+
+func (p *persistentHostShell) close() {
+	if p.stdin != nil {
+		_ = p.stdin.Close()
+	}
+	select {
+	case <-p.done:
+	case <-time.After(2 * time.Second):
+		if p.cmd != nil && p.cmd.Process != nil {
+			_ = p.cmd.Process.Kill()
+			<-p.done
+		}
+	}
+}
+
+func (s *shellState) hostCommandPrelude(tty bool) string {
+	if !tty {
+		return ""
+	}
+	s.hostInit.once.Do(func() {
+		prelude, err := captureHostShellPrelude()
+		if err != nil || strings.TrimSpace(prelude) == "" {
+			s.hostInit.prelude = hostShellHookPrelude()
+			s.hostInit.fallback = true
+			return
+		}
+		s.hostInit.prelude = prelude
+	})
+	return s.hostInit.prelude
+}
+
+func hostShellCommand(line string, tty bool, prelude string) []string {
 	command := line
 	if tty {
-		command = hostShellPrelude() + line
+		command = prelude + hostShellPrelude() + "eval " + shellQuote(line)
 	}
 	return []string{hostShell(), "-lc", command}
+}
+
+func captureHostShellPrelude() (string, error) {
+	const begin = "__VSH_HOST_INIT_BEGIN__"
+	const end = "__VSH_HOST_INIT_END__"
+	var script string
+	switch filepath.Base(hostShell()) {
+	case "bash":
+		script = "printf '%s\\n' " + shellQuote(begin) + "; alias -p; declare -pf; printf '%s\\n' " + shellQuote(end)
+	case "zsh":
+		script = "print -r -- " + shellQuote(begin) + "; alias -L; functions; print -r -- " + shellQuote(end)
+	default:
+		return "", fmt.Errorf("host shell init snapshot is unsupported for %s", hostShell())
+	}
+	cmd := exec.Command(hostShell(), "-ic", script)
+	cmd.Stdin = nil
+	cmd.Stderr = io.Discard
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	text := string(out)
+	start := strings.Index(text, begin)
+	stop := strings.LastIndex(text, end)
+	if start < 0 || stop < 0 || stop < start {
+		return "", fmt.Errorf("host shell init markers not found")
+	}
+	body := strings.TrimSpace(text[start+len(begin) : stop])
+	if body == "" {
+		return "", nil
+	}
+	return body + "\n", nil
+}
+
+func hostShellHookPrelude() string {
+	switch filepath.Base(hostShell()) {
+	case "bash":
+		return "if [ -r \"$HOME/.bashrc\" ]; then . \"$HOME/.bashrc\"; fi\n"
+	case "zsh":
+		return "if [ -r \"${ZDOTDIR:-$HOME}/.zshrc\" ]; then . \"${ZDOTDIR:-$HOME}/.zshrc\"; fi\n"
+	default:
+		return ""
+	}
 }
 
 func hostShellPrelude() string {
@@ -455,7 +1292,7 @@ func colorPrelude(primaryLS, fallbackLS string, bash bool) string {
 	if bash {
 		b.WriteString("shopt -s expand_aliases 2>/dev/null || true\n")
 	}
-	b.WriteString("alias ls=")
+	b.WriteString("alias ls >/dev/null 2>&1 || alias ls=")
 	b.WriteString(shellQuote(primaryLS))
 	b.WriteString(" 2>/dev/null || alias ls=")
 	b.WriteString(shellQuote(fallbackLS))
@@ -484,6 +1321,55 @@ func mergedEnv(base, overrides []string) []string {
 		out = append(out, entry)
 	}
 	return out
+}
+
+func shellEnv(vars map[string]string) []string {
+	if len(vars) == 0 {
+		return nil
+	}
+	keys := sortedMapKeys(vars)
+	env := make([]string, 0, len(keys))
+	for _, key := range keys {
+		env = append(env, key+"="+vars[key])
+	}
+	return env
+}
+
+func guestShellEnv(ctx commandContext) []string {
+	user := strings.TrimSpace(guestRunUser(ctx))
+	switch {
+	case user == "root" || strings.HasPrefix(user, "0:"):
+		return []string{"HOME=/root", "USER=root", "LOGNAME=root"}
+	case user == defaultGuestUser || user == strconv.Itoa(defaultGuestUID) || strings.HasPrefix(user, strconv.Itoa(defaultGuestUID)+":"):
+		name := defaultGuestUserName(ctx)
+		return []string{"HOME=" + guestHomeDir(ctx), "USER=" + name, "LOGNAME=" + name}
+	case user != "" && !strings.ContainsAny(user, ":0123456789"):
+		return []string{"HOME=/home/" + user, "USER=" + user, "LOGNAME=" + user}
+	default:
+		return nil
+	}
+}
+
+func guestHomeDir(ctx commandContext) string {
+	user := strings.TrimSpace(guestRunUser(ctx))
+	switch {
+	case user == "root" || strings.HasPrefix(user, "0:"):
+		return "/root"
+	case user == defaultGuestUser || user == strconv.Itoa(defaultGuestUID) || strings.HasPrefix(user, strconv.Itoa(defaultGuestUID)+":"):
+		return "/home/" + defaultGuestUserName(ctx)
+	case user != "" && !strings.ContainsAny(user, ":0123456789"):
+		return "/home/" + user
+	default:
+		return "/"
+	}
+}
+
+func defaultGuestUserName(ctx commandContext) string {
+	image := strings.ToLower(strings.TrimSpace(ctx.Image))
+	if image == "ubuntu" || strings.HasPrefix(image, "ubuntu:") || strings.HasSuffix(image, "/ubuntu") || strings.Contains(image, "/ubuntu:") {
+		return "ubuntu"
+	}
+	return "cc"
 }
 
 func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io.Writer) error {
@@ -523,13 +1409,220 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 		req.Cols = cols
 		req.Rows = rows
 	}
+	req.Env = mergedEnv(guestShellEnv(ctx), shellEnv(s.env))
 	if tty {
-		req.Env = terminalEnv(cols, rows)
+		req.Env = mergedEnv(req.Env, terminalEnv(cols, rows))
 	}
 	if ctx.Network {
 		req.Network = defaultNetworkConfig()
 	}
+	if tty && persistentGuestCommandAllowed(line) {
+		session, err := s.guestPersistentShell(ctx, req)
+		if err == nil {
+			err = session.run(line, stdout, stderr)
+			s.lastCode = sessionLastCode(err)
+			if session.cwd() != "" {
+				s.context.CWD = session.cwd()
+			}
+			if err == nil || s.lastCode >= 0 {
+				return nil
+			}
+		}
+	}
 	return s.streamGuestRun(ctx.VMID, req, stdout, stderr)
+}
+
+func persistentGuestCommandAllowed(line string) bool {
+	return persistentHostCommandAllowed(line)
+}
+
+func (s *shellState) guestPersistentShell(ctx commandContext, req client.RunRequest) (*persistentGuestShell, error) {
+	key := strings.Join([]string{ctx.VMID, ctx.Image, req.User}, "\x00")
+	if s.guestShell != nil && s.guestShell.key == key {
+		return s.guestShell, nil
+	}
+	if s.guestShell != nil {
+		s.guestShell.close()
+		s.guestShell = nil
+	}
+	req.Command = guestPersistentCommand()
+	req.TTY = true
+	if req.Cols == 0 {
+		req.Cols = 80
+	}
+	if req.Rows == 0 {
+		req.Rows = 24
+	}
+	inputs := make(chan client.ExecInput, 8)
+	events := make(chan client.ExecEvent, 32)
+	done := make(chan error, 1)
+	session := &persistentGuestShell{
+		key:     key,
+		inputs:  inputs,
+		events:  events,
+		done:    done,
+		lastCWD: req.WorkDir,
+	}
+	go func() {
+		err := s.api.RunInteractiveStreamIn(ctx.VMID, req, inputs, func(event client.ExecEvent) error {
+			events <- event
+			return nil
+		})
+		close(events)
+		done <- err
+	}()
+	if err := session.waitReady(); err != nil {
+		session.close()
+		return nil, err
+	}
+	s.guestShell = session
+	return session, nil
+}
+
+func guestPersistentCommand() []string {
+	return []string{"sh", "-lc", guestShellPrelude() + strings.Join([]string{
+		"stty -echo 2>/dev/null || true",
+		colorPrelude("ls --color=always -C --width=${COLUMNS:-80}", "ls -G -C", false),
+		"printf '__VSH_READY__:%s\\n' \"$PWD\"",
+		"while IFS= read -r __vsh_line; do",
+		"  eval \"$__vsh_line\"",
+		"  __vsh_status=$?",
+		"  printf '__VSH_DONE__:%s:%s\\n' \"$__vsh_status\" \"$PWD\"",
+		"done",
+	}, "\n")}
+}
+
+func (p *persistentGuestShell) waitReady() error {
+	for event := range p.events {
+		switch event.Kind {
+		case "stdout", "output":
+			text := execEventText(event)
+			if cwd, ok := parsePersistentReady(text); ok {
+				p.lastCWD = cwd
+				return nil
+			}
+		case "exit":
+			return fmt.Errorf("persistent guest shell exited before ready")
+		case "error":
+			if event.Error != "" {
+				return fmt.Errorf("%s", event.Error)
+			}
+			return fmt.Errorf("persistent guest shell failed before ready")
+		}
+	}
+	return fmt.Errorf("persistent guest shell closed before ready")
+}
+
+func parsePersistentReady(text string) (string, bool) {
+	idx := strings.Index(text, "__VSH_READY__:")
+	if idx < 0 {
+		return "", false
+	}
+	rest := text[idx+len("__VSH_READY__:"):]
+	if end := strings.IndexAny(rest, "\r\n"); end >= 0 {
+		rest = rest[:end]
+	}
+	return rest, true
+}
+
+func (p *persistentGuestShell) run(line string, stdout, stderr io.Writer) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.inputs <- client.ExecInput{Kind: "stdin", Data: []byte(line + "\n")}
+	for event := range p.events {
+		switch event.Kind {
+		case "stdout", "output":
+			text := execEventText(event)
+			if before, code, cwd, ok := p.consumeOutput(text); ok {
+				if before != "" {
+					_, _ = io.WriteString(stdout, before)
+				}
+				p.lastCWD = cwd
+				if code != 0 {
+					return persistentShellExit{code: code}
+				}
+				return nil
+			}
+			writeExecEventOutput(stdout, event)
+		case "stderr":
+			writeExecEventOutput(stderr, event)
+		case "exit":
+			return fmt.Errorf("persistent guest shell exited")
+		case "error":
+			if event.Error != "" {
+				return fmt.Errorf("%s", event.Error)
+			}
+			return fmt.Errorf("persistent guest shell failed")
+		}
+	}
+	return fmt.Errorf("persistent guest shell closed")
+}
+
+func (p *persistentGuestShell) consumeOutput(text string) (string, int, string, bool) {
+	p.pending += text
+	idx := strings.Index(p.pending, "__VSH_DONE__:")
+	if idx < 0 {
+		out := p.pending
+		p.pending = ""
+		return out, 0, "", false
+	}
+	newline := strings.IndexAny(p.pending[idx:], "\r\n")
+	if newline < 0 {
+		if idx > 0 {
+			out := p.pending[:idx]
+			p.pending = p.pending[idx:]
+			return out, 0, "", false
+		}
+		return "", 0, "", false
+	}
+	lineEnd := idx + newline
+	before := p.pending[:idx]
+	marker := p.pending[idx:lineEnd]
+	p.pending = strings.TrimLeft(p.pending[lineEnd:], "\r\n")
+	code, cwd, ok := parsePersistentMarker(marker)
+	return before, code, cwd, ok
+}
+
+func parsePersistentMarker(line string) (int, string, bool) {
+	line = strings.TrimRight(line, "\r\n")
+	if !strings.HasPrefix(line, "__VSH_DONE__:") {
+		return 0, "", false
+	}
+	rest := strings.TrimPrefix(line, "__VSH_DONE__:")
+	codeText, cwd, ok := strings.Cut(rest, ":")
+	if !ok {
+		return 0, "", false
+	}
+	code, err := strconv.Atoi(codeText)
+	if err != nil {
+		return 0, "", false
+	}
+	return code, cwd, true
+}
+
+func execEventText(event client.ExecEvent) string {
+	if len(event.Data) > 0 {
+		return string(event.Data)
+	}
+	return event.Output
+}
+
+func (p *persistentGuestShell) cwd() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastCWD
+}
+
+func (p *persistentGuestShell) close() {
+	select {
+	case p.inputs <- client.ExecInput{Kind: "stdin_close"}:
+	default:
+	}
+	close(p.inputs)
+	select {
+	case <-p.done:
+	case <-time.After(2 * time.Second):
+	}
 }
 
 func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, stderr io.Writer) error {
@@ -728,10 +1821,24 @@ func writeExecEventOutput(w io.Writer, event client.ExecEvent) {
 }
 
 func guestCommand(line string, tty bool) []string {
+	prelude := guestShellPrelude()
 	if !tty {
-		return []string{"sh", "-lc", line}
+		return []string{"sh", "-lc", prelude + line}
 	}
-	return []string{"sh", "-lc", colorPrelude("ls --color=always -C --width=${COLUMNS:-80}", "ls -G -C", false) + line}
+	return []string{"sh", "-lc", prelude + colorPrelude("ls --color=always -C --width=${COLUMNS:-80}", "ls -G -C", false) + line}
+}
+
+func guestShellPrelude() string {
+	return `__vsh_uid="$(id -u 2>/dev/null || printf '')"
+__vsh_passwd="$(awk -F: -v u="$__vsh_uid" '$3 == u { print $1 ":" $6; exit }' /etc/passwd 2>/dev/null || true)"
+if [ -n "$__vsh_passwd" ]; then
+  USER="${__vsh_passwd%%:*}"
+  LOGNAME="$USER"
+  HOME="${__vsh_passwd#*:}"
+  export USER LOGNAME HOME
+fi
+unset __vsh_uid __vsh_passwd
+`
 }
 
 func shellQuote(value string) string {
@@ -742,17 +1849,31 @@ func shellQuote(value string) string {
 }
 
 func (s *shellState) ensureImageAvailable(image string, stderr io.Writer) error {
+	if s.imageCache != nil && s.imageCache[image] {
+		return nil
+	}
 	if _, err := s.api.GetImage(image); err == nil {
+		if s.imageCache == nil {
+			s.imageCache = map[string]bool{}
+		}
+		s.imageCache[image] = true
 		return nil
 	}
 	report := func(event client.ProgressEvent) error {
-		message := formatProgressEvent(event, image)
+		message := formatDetailedProgressEvent(event, image)
 		if message != "" {
 			fmt.Fprintln(stderr, message)
 		}
 		return nil
 	}
-	return s.api.PullImageStream(image, client.PullImageRequest{Source: image}, report)
+	if err := s.api.PullImageStream(image, client.PullImageRequest{Source: image}, report); err != nil {
+		return err
+	}
+	if s.imageCache == nil {
+		s.imageCache = map[string]bool{}
+	}
+	s.imageCache[image] = true
+	return nil
 }
 
 func guestHostPaths(hostCWD string) (hostRoot, guestCWD string, err error) {
@@ -778,11 +1899,18 @@ func guestHostPaths(hostCWD string) (hostRoot, guestCWD string, err error) {
 
 func (s *shellState) ensureVMRunning(ctx commandContext) error {
 	id := ctx.VMID
+	if s.vmRunning != nil && s.vmRunning[id] {
+		return nil
+	}
 	state, err := s.api.InstanceStatusOf(id)
 	if err != nil {
 		return err
 	}
 	if state.Status == "running" {
+		if s.vmRunning == nil {
+			s.vmRunning = map[string]bool{}
+		}
+		s.vmRunning[id] = true
 		return nil
 	}
 	return s.startVM(id, ctx)
@@ -810,6 +1938,10 @@ func (s *shellState) startVM(id string, ctx commandContext) error {
 		return err
 	}
 	s.context.VMID = firstNonEmpty(state.ID, id)
+	if s.vmRunning == nil {
+		s.vmRunning = map[string]bool{}
+	}
+	s.vmRunning[s.context.VMID] = true
 	return nil
 }
 
@@ -913,10 +2045,21 @@ func (s *shellState) stopVM(id string) error {
 	if id == "" {
 		return fmt.Errorf("vm id is required")
 	}
-	return s.api.ShutdownInstanceWithID(id)
+	if err := s.api.ShutdownInstanceWithID(id); err != nil {
+		return err
+	}
+	delete(s.vmRunning, id)
+	return nil
 }
 
-func (s *shellState) chdir(target string) error {
+func (s *shellState) chdirContext(target string) error {
+	if s.context.Mode == modeVM {
+		return s.chdirGuest(target)
+	}
+	return s.chdirHost(target)
+}
+
+func (s *shellState) chdirHost(target string) error {
 	if target == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -954,10 +2097,54 @@ func (s *shellState) chdir(target string) error {
 	return os.Chdir(target)
 }
 
+func (s *shellState) chdirGuest(target string) error {
+	if s.guestShell != nil {
+		s.guestShell.close()
+		s.guestShell = nil
+	}
+	current := s.context.CWD
+	if current == "" {
+		_, current, _ = guestHostPaths(s.hostCWD)
+	}
+	home := guestHomeDir(s.context)
+	if target == "" || target == "~" {
+		target = home
+	}
+	if strings.HasPrefix(target, "~/") {
+		target = path.Join(home, target[2:])
+	}
+	if strings.HasPrefix(target, "~") {
+		return fmt.Errorf("guest user home expansion is only supported for ~ and ~/ paths")
+	}
+	if !strings.HasPrefix(target, "/") {
+		target = path.Join(current, target)
+	}
+	target = path.Clean(target)
+	if strings.HasPrefix(target, guestHostMount+"/") || target == guestHostMount {
+		hostRoot, _, err := guestHostPaths(s.hostCWD)
+		if err != nil {
+			return err
+		}
+		rel := strings.TrimPrefix(target, guestHostMount)
+		hostPath := filepath.Join(hostRoot, filepath.FromSlash(strings.TrimPrefix(rel, "/")))
+		if err := s.chdirHost(hostPath); err != nil {
+			return err
+		}
+		s.context.CWD = ""
+		return nil
+	}
+	s.context.CWD = target
+	return nil
+}
+
 func (s *shellState) prompt() string {
-	leaf := filepath.Base(s.hostCWD)
+	promptCWD := s.hostCWD
+	if s.context.Mode == modeVM && s.context.CWD != "" {
+		promptCWD = s.context.CWD
+	}
+	leaf := filepath.Base(promptCWD)
 	if leaf == "." || leaf == string(filepath.Separator) {
-		leaf = s.hostCWD
+		leaf = promptCWD
 	}
 	base := colorGreen + "➜" + colorReset + "  " + colorCyan + leaf + colorReset
 	if s.context.Mode == modeVM {
@@ -1054,11 +2241,17 @@ func (s *shellState) printStatus(w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	return printJSON(w, map[string]any{
-		"context":  s.context,
-		"host_cwd": s.hostCWD,
-		"state":    state,
-	})
+	_, err = fmt.Fprintf(w, "context: %s\nimage: %s\nvm: %s\nhost cwd: %s\nvm status: %s\n",
+		s.context.Mode,
+		emptyText(s.context.Image, "-"),
+		emptyText(s.context.VMID, "-"),
+		s.hostCWD,
+		emptyText(state.Status, "unknown"),
+	)
+	if state.NetworkIPv4 != "" {
+		_, err = fmt.Fprintf(w, "vm address: %s\n", state.NetworkIPv4)
+	}
+	return err
 }
 
 func (s *shellState) printVMs(w io.Writer) error {
@@ -1066,7 +2259,51 @@ func (s *shellState) printVMs(w io.Writer) error {
 	if err != nil {
 		return err
 	}
-	return printJSON(w, states)
+	if len(states) == 0 {
+		_, err = fmt.Fprintln(w, "No VMs")
+		return err
+	}
+	for _, state := range states {
+		parts := []string{emptyText(state.ID, "default"), emptyText(state.Status, "unknown")}
+		if state.Image != "" {
+			parts = append(parts, "image="+state.Image)
+		}
+		if state.NetworkIPv4 != "" {
+			parts = append(parts, "addr="+state.NetworkIPv4)
+		}
+		if _, err := fmt.Fprintln(w, strings.Join(parts, " ")); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *shellState) printJobs(w io.Writer) error {
+	s.jobsMu.Lock()
+	defer s.jobsMu.Unlock()
+	if len(s.jobs) == 0 {
+		_, err := fmt.Fprintln(w, "No jobs")
+		return err
+	}
+	for _, job := range s.jobs {
+		status := "running"
+		if job.Done {
+			status = "done"
+			if job.Err != "" {
+				status = "error"
+			}
+		}
+		if job.Done {
+			if _, err := fmt.Fprintf(w, "[%d] %s exit=%d %s\n", job.ID, status, job.Code, job.Command); err != nil {
+				return err
+			}
+		} else {
+			if _, err := fmt.Fprintf(w, "[%d] %s %s\n", job.ID, status, job.Command); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (s *shellState) help(w io.Writer) error {
@@ -1076,12 +2313,13 @@ func (s *shellState) help(w io.Writer) error {
 @ [opts] [cmd]           update or use the current context
 @sudo <cmd>              run cmd as root in the current VM
 @ps                      list VMs
+@jobs                    list background jobs
 @status                  show vsh and selected VM state
 @start [--vm id]         start a blank VM
 @stop [--vm id]          stop a VM
 @forward H:G             forward host port H to guest port G
 opts: --vm id --cwd path --user user --sudo --memory-mb n --memory n[m|g] --cpus n --network --no-network
-cd <dir>                 change host directory; VM commands run under the mirrored /host path
+cd <dir>                 change the current host or VM working directory
 exit                     leave vsh
 `))
 	return err
@@ -1421,43 +2659,56 @@ func parseTCPPort(value, label string) (int, error) {
 	return port, nil
 }
 
-func formatProgressEvent(event client.ProgressEvent, fallbackArtifact string) string {
+func formatDetailedProgressEvent(event client.ProgressEvent, fallbackArtifact string) string {
 	artifact := firstNonEmpty(event.Artifact, fallbackArtifact)
-	var parts []string
-	if artifact != "" {
-		parts = append(parts, artifact)
-	}
-	if event.Blob != "" && event.Blob != artifact {
-		parts = append(parts, event.Blob)
-	}
-	if event.BytesDownloaded > 0 || event.BytesTotal > 0 {
-		if event.BytesTotal > 0 {
-			parts = append(parts, fmt.Sprintf("%s/%s", formatByteSize(event.BytesDownloaded), formatByteSize(event.BytesTotal)))
-		} else {
-			parts = append(parts, formatByteSize(event.BytesDownloaded))
-		}
-	}
-	if event.RateBytesPerSecond > 0 {
-		parts = append(parts, formatByteSize(int64(event.RateBytesPerSecond))+"/s")
-	}
-	if len(parts) == 0 {
+	if artifact == "" && event.Status == "" && event.Blob == "" && event.Error == "" {
 		return ""
 	}
-	prefix := "Preparing"
-	switch event.Status {
-	case "downloading", "prefetching":
-		prefix = "Downloading"
-	case "downloaded", "available", "restored":
-		prefix = "Ready"
-	case "resolving":
-		prefix = "Resolving"
-	case "error":
-		prefix = "Error"
-		if event.Error != "" {
-			parts = append(parts, event.Error)
-		}
+	title := "Pull"
+	if artifact != "" {
+		title += " " + artifact
 	}
-	return prefix + " " + strings.Join(parts, " | ")
+	lines := []string{title}
+	lines = append(lines, "  status: "+firstNonEmpty(event.Status, "preparing"))
+	if event.Artifact != "" && event.Artifact != artifact {
+		lines = append(lines, "  artifact: "+event.Artifact)
+	}
+	if event.Blob != "" {
+		lines = append(lines, "  blob: "+event.Blob)
+	}
+	if event.Progress > 0 {
+		lines = append(lines, fmt.Sprintf("  progress: %.1f%%", event.Progress*100))
+	}
+	if event.BytesDownloaded > 0 || event.BytesTotal > 0 {
+		value := formatByteSize(event.BytesDownloaded)
+		if event.BytesTotal > 0 {
+			value += " / " + formatByteSize(event.BytesTotal)
+			if event.BytesDownloaded > 0 {
+				value += fmt.Sprintf(" (%.1f%%)", float64(event.BytesDownloaded)*100/float64(event.BytesTotal))
+			}
+		}
+		lines = append(lines, "  bytes: "+value)
+	}
+	if event.FilesDownloaded > 0 || event.FilesTotal > 0 {
+		value := strconv.FormatInt(event.FilesDownloaded, 10)
+		if event.FilesTotal > 0 {
+			value += " / " + strconv.FormatInt(event.FilesTotal, 10)
+			if event.FilesDownloaded > 0 {
+				value += fmt.Sprintf(" (%.1f%%)", float64(event.FilesDownloaded)*100/float64(event.FilesTotal))
+			}
+		}
+		lines = append(lines, "  files: "+value)
+	}
+	if event.RateBytesPerSecond > 0 {
+		lines = append(lines, "  rate: "+formatByteSize(int64(event.RateBytesPerSecond))+"/s")
+	}
+	if event.ETASeconds > 0 {
+		lines = append(lines, "  eta: "+formatDurationSeconds(event.ETASeconds))
+	}
+	if event.Error != "" {
+		lines = append(lines, "  error: "+event.Error)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func formatByteSize(bytes int64) string {
@@ -1473,6 +2724,13 @@ func formatByteSize(bytes int64) string {
 		}
 	}
 	return fmt.Sprintf("%.1f EB", value/unit)
+}
+
+func formatDurationSeconds(seconds float64) string {
+	if seconds <= 0 {
+		return "0s"
+	}
+	return time.Duration(seconds * float64(time.Second)).Round(time.Second).String()
 }
 
 func formatBootEvent(event client.BootEvent) string {
@@ -1647,12 +2905,6 @@ func resolveCacheDir(arg string) (string, error) {
 	return dir, os.MkdirAll(dir, 0o755)
 }
 
-func printJSON(w io.Writer, v any) error {
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	return enc.Encode(v)
-}
-
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if value != "" {
@@ -1660,6 +2912,22 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func emptyText(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
+func sortedMapKeys[V any](items map[string]V) []string {
+	keys := make([]string, 0, len(items))
+	for key := range items {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func readerIsTerminal(r io.Reader) bool {

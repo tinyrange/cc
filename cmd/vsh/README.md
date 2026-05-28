@@ -2,9 +2,11 @@
 
 `vsh` is a proof-of-concept shell frontend for `ccvm`. Ordinary lines run in the current context. Lines that begin with `@` are handled by `vsh` itself.
 
-`vsh` must be run from an interactive terminal. Interactive sessions use readline-style editing with persistent history stored in the `ccvm` cache directory.
+`vsh` must be run from an interactive terminal. Interactive sessions use readline-style editing, persistent history stored in the `ccvm` cache directory, and early autocomplete support for `@` builtins, cached image names, `vsh` options, command names, and host paths.
 
 Guest commands receive a TTY, terminal dimensions, and terminal color environment. `vsh` keeps command execution non-interactive and adds a small color prelude for common commands such as `ls`.
+
+Interactive host and guest commands run through persistent shell sessions when possible, so shell state such as aliases, functions, `cd`, and exported variables can survive across commands. Commands that need full foreground terminal control fall back to a one-shot shell path.
 
 The core syntax is:
 
@@ -36,6 +38,9 @@ Bare targets update the current context:
 @alpine
 ```
 
+Switching to an image checks the local image state and downloads it if needed.
+The VM itself still starts lazily on the first guest command.
+
 Commands after a target are one-shot:
 
 ```sh
@@ -54,7 +59,16 @@ Options followed by a command apply to that command:
 @ --cpus 2 pytest -q
 ```
 
-The host root is mounted writable into guest commands at `/host`, and the guest workdir defaults to the mirrored host cwd, such as `/host/Users/alice/project`. `cd` changes the host directory; the next guest command runs from the new mirrored `/host/...` path.
+The host root is mounted writable into guest commands at `/host`, and the guest workdir defaults to the mirrored host cwd, such as `/host/Users/alice/project`. In host mode, `cd` changes the host directory. In VM mode, `cd /tmp` changes the guest workdir, while `cd /host/...` moves the host directory and returns guest commands to the mirrored host path.
+
+`export NAME=value` is tracked by `vsh` and applied to later host and guest commands.
+
+Background commands can be started with a trailing `&` and inspected with `@jobs`:
+
+```sh
+sleep 10 &
+@jobs
+```
 
 ## Builtins
 
@@ -63,6 +77,7 @@ These attention words are reserved:
 ```sh
 @help
 @host [command...]
+@jobs
 @ps
 @status
 @start [--vm id]
