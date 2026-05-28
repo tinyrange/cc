@@ -271,6 +271,9 @@ func run() error {
 		}
 		if cfg.ReadyMarker != "" {
 			writeKernel(cfg.ReadyMarker)
+			if kmsgFD >= 0 {
+				writeConsole(cfg.ReadyMarker + "\n")
+			}
 		}
 		return commandLoop(cfg, os.Stdin)
 	}

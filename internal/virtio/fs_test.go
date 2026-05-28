@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -1007,6 +1008,9 @@ func TestImageFSWithOwnerMapsAttributes(t *testing.T) {
 
 func TestImageFSPreservesDirectoryPermissions(t *testing.T) {
 	t.Parallel()
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows host filesystems do not expose POSIX directory permissions")
+	}
 
 	root := t.TempDir()
 	if err := os.Mkdir(filepath.Join(root, "private"), 0o700); err != nil {

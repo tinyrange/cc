@@ -231,20 +231,20 @@ func load() error {
 		purego.RegisterLibFunc(&hvVcpuGetVtimerOffset, hvLib, "hv_vcpu_get_vtimer_offset")
 		purego.RegisterLibFunc(&hvVcpuSetVtimerOffset, hvLib, "hv_vcpu_set_vtimer_offset")
 
-		purego.RegisterLibFunc(&hvGICConfigCreate, hvLib, "hv_gic_config_create")
-		purego.RegisterLibFunc(&hvGICGetDistributorReg, hvLib, "hv_gic_get_distributor_reg")
-		purego.RegisterLibFunc(&hvGICSetDistributorReg, hvLib, "hv_gic_set_distributor_reg")
-		purego.RegisterLibFunc(&hvGICGetRedistributorBase, hvLib, "hv_gic_get_redistributor_base")
-		purego.RegisterLibFunc(&hvGICGetRedistributorReg, hvLib, "hv_gic_get_redistributor_reg")
-		purego.RegisterLibFunc(&hvGICSetRedistributorReg, hvLib, "hv_gic_set_redistributor_reg")
-		purego.RegisterLibFunc(&hvGICGetICCReg, hvLib, "hv_gic_get_icc_reg")
-		purego.RegisterLibFunc(&hvGICSetICCReg, hvLib, "hv_gic_set_icc_reg")
-		purego.RegisterLibFunc(&hvGICSetSPI, hvLib, "hv_gic_set_spi")
-		purego.RegisterLibFunc(&hvGICConfigSetDistributorBase, hvLib, "hv_gic_config_set_distributor_base")
-		purego.RegisterLibFunc(&hvGICConfigSetRedistributorBase, hvLib, "hv_gic_config_set_redistributor_base")
-		purego.RegisterLibFunc(&hvGICGetDistributorBaseAlignment, hvLib, "hv_gic_get_distributor_base_alignment")
-		purego.RegisterLibFunc(&hvGICGetRedistributorBaseAlignment, hvLib, "hv_gic_get_redistributor_base_alignment")
-		purego.RegisterLibFunc(&hvGICCreate, hvLib, "hv_gic_create")
+		registerOptionalLibFunc(&hvGICConfigCreate, hvLib, "hv_gic_config_create")
+		registerOptionalLibFunc(&hvGICGetDistributorReg, hvLib, "hv_gic_get_distributor_reg")
+		registerOptionalLibFunc(&hvGICSetDistributorReg, hvLib, "hv_gic_set_distributor_reg")
+		registerOptionalLibFunc(&hvGICGetRedistributorBase, hvLib, "hv_gic_get_redistributor_base")
+		registerOptionalLibFunc(&hvGICGetRedistributorReg, hvLib, "hv_gic_get_redistributor_reg")
+		registerOptionalLibFunc(&hvGICSetRedistributorReg, hvLib, "hv_gic_set_redistributor_reg")
+		registerOptionalLibFunc(&hvGICGetICCReg, hvLib, "hv_gic_get_icc_reg")
+		registerOptionalLibFunc(&hvGICSetICCReg, hvLib, "hv_gic_set_icc_reg")
+		registerOptionalLibFunc(&hvGICSetSPI, hvLib, "hv_gic_set_spi")
+		registerOptionalLibFunc(&hvGICConfigSetDistributorBase, hvLib, "hv_gic_config_set_distributor_base")
+		registerOptionalLibFunc(&hvGICConfigSetRedistributorBase, hvLib, "hv_gic_config_set_redistributor_base")
+		registerOptionalLibFunc(&hvGICGetDistributorBaseAlignment, hvLib, "hv_gic_get_distributor_base_alignment")
+		registerOptionalLibFunc(&hvGICGetRedistributorBaseAlignment, hvLib, "hv_gic_get_redistributor_base_alignment")
+		registerOptionalLibFunc(&hvGICCreate, hvLib, "hv_gic_create")
 
 		purego.RegisterLibFunc(&osRelease, sysLib, "os_release")
 	})
@@ -599,6 +599,15 @@ func getSysRegRaw(vcpu VCPU, reg SysReg) (uint64, Return) {
 }
 
 func createMinimalGIC() error {
+	if hvGICConfigCreate == nil ||
+		hvGICGetDistributorBaseAlignment == nil ||
+		hvGICGetRedistributorBaseAlignment == nil ||
+		hvGICConfigSetDistributorBase == nil ||
+		hvGICConfigSetRedistributorBase == nil ||
+		hvGICCreate == nil {
+		return fmt.Errorf("create gic: Hypervisor.framework GIC support is unavailable")
+	}
+
 	var distAlign uintptr
 	if ret := hvGICGetDistributorBaseAlignment(&distAlign); ret != hvSuccess {
 		return fmt.Errorf("get gic distributor alignment: %w", ret)

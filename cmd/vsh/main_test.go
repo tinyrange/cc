@@ -261,13 +261,16 @@ echo hello --flag
 	if len(run.req.Shares) != 1 {
 		t.Fatalf("shares = %#v", run.req.Shares)
 	}
-	if run.req.Shares[0].Source != string(filepath.Separator) || run.req.Shares[0].Mount != guestHostMount {
+	wantHostRoot, wantWorkDir, err := guestHostPaths(dir)
+	if err != nil {
+		t.Fatalf("guestHostPaths() error = %v", err)
+	}
+	if run.req.Shares[0].Source != wantHostRoot || run.req.Shares[0].Mount != guestHostMount {
 		t.Fatalf("host share = %#v, want root at /host", run.req.Shares[0])
 	}
 	if !run.req.Shares[0].MapOwner || run.req.Shares[0].OwnerUID != defaultGuestUID || run.req.Shares[0].OwnerGID != defaultGuestGID {
 		t.Fatalf("host share owner = %#v, want mapped default guest user", run.req.Shares[0])
 	}
-	wantWorkDir := path.Join(guestHostMount, strings.TrimPrefix(filepath.ToSlash(dir), "/"))
 	if run.req.WorkDir != wantWorkDir {
 		t.Fatalf("workdir = %q, want %q", run.req.WorkDir, wantWorkDir)
 	}
@@ -618,11 +621,15 @@ func TestCompleterMapsGuestHostPaths(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(hostDir, "project one"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	_, guestCWD, err := guestHostPaths(hostDir)
+	if err != nil {
+		t.Fatalf("guestHostPaths() error = %v", err)
+	}
 	sh := &shellState{
 		hostCWD: root,
 		context: commandContext{
 			Mode: modeVM,
-			CWD:  guestHostMount + filepath.ToSlash(hostDir),
+			CWD:  guestCWD,
 		},
 	}
 	completer := newVSHCompleter(sh)
@@ -1137,25 +1144,46 @@ func TestShellQuote(t *testing.T) {
 }
 
 func TestGuestHostPaths(t *testing.T) {
-	hostRoot, guestCWD, err := guestHostPaths(filepath.Join(string(filepath.Separator), "Users", "me", "src"))
+	hostCWD := filepath.Join(string(filepath.Separator), "Users", "me", "src")
+	abs, err := filepath.Abs(hostCWD)
+	if err != nil {
+		t.Fatalf("Abs() error = %v", err)
+	}
+	hostRoot, guestCWD, err := guestHostPaths(hostCWD)
 	if err != nil {
 		t.Fatalf("guestHostPaths() error = %v", err)
 	}
-	if hostRoot != string(filepath.Separator) {
+	wantRoot := string(filepath.Separator)
+	if volume := filepath.VolumeName(abs); volume != "" {
+		wantRoot = volume + string(filepath.Separator)
+	}
+	rel, err := filepath.Rel(wantRoot, abs)
+	if err != nil {
+		t.Fatalf("Rel() error = %v", err)
+	}
+	if hostRoot != wantRoot {
 		t.Fatalf("hostRoot = %q", hostRoot)
 	}
-	if guestCWD != "/host/Users/me/src" {
+	if want := path.Join(guestHostMount, filepath.ToSlash(rel)); guestCWD != want {
 		t.Fatalf("guestCWD = %q", guestCWD)
 	}
 }
 
 func TestGuestHostPathToHostPreservesMountedRoot(t *testing.T) {
 	hostCWD := filepath.Join(string(filepath.Separator), "Users", "me", "src")
-	got, ok := guestHostPathToHost(hostCWD, "/host/Users/me/src")
+	_, guestCWD, err := guestHostPaths(hostCWD)
+	if err != nil {
+		t.Fatalf("guestHostPaths() error = %v", err)
+	}
+	got, ok := guestHostPathToHost(hostCWD, guestCWD)
 	if !ok {
 		t.Fatalf("guestHostPathToHost() ok=false")
 	}
-	if want := hostCWD; got != want {
+	want, err := filepath.Abs(hostCWD)
+	if err != nil {
+		t.Fatalf("Abs() error = %v", err)
+	}
+	if got != want {
 		t.Fatalf("guestHostPathToHost() = %q, want %q", got, want)
 	}
 }

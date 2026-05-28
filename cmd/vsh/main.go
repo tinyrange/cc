@@ -380,7 +380,7 @@ func (c *vshCompleter) pathCandidates(token string) []string {
 		}
 		suffix := name[len(base):]
 		if entry.IsDir() {
-			suffix += string(filepath.Separator)
+			suffix += "/"
 		}
 		out = append(out, shellEscapeCompletion(suffix))
 	}
@@ -453,8 +453,8 @@ func stringCompletions(items []string) [][]rune {
 
 func sortCompletionItems(items []string) {
 	sort.Slice(items, func(i, j int) bool {
-		iDir := strings.HasSuffix(items[i], string(filepath.Separator))
-		jDir := strings.HasSuffix(items[j], string(filepath.Separator))
+		iDir := strings.HasSuffix(items[i], "/")
+		jDir := strings.HasSuffix(items[j], "/")
 		if iDir != jDir {
 			return iDir
 		}
