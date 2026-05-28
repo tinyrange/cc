@@ -934,6 +934,9 @@ func execCommandGo(argv []string, env []string, workDir string, user string) (in
 	if cred, err := credentialForUser(user); err != nil {
 		return 0, nil, err
 	} else if cred != nil {
+		if err := ensureCredentialUser("", cred); err != nil {
+			return 0, nil, err
+		}
 		cmd.SysProcAttr = &syscall.SysProcAttr{Credential: cred}
 	}
 
@@ -1255,6 +1258,14 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		}
 		return
 	} else if cred != nil {
+		if err := ensureCredentialUser(rootDir, cred); err != nil {
+			writeKernel("ccx3-init: ensure user: " + err.Error())
+			writeExecStderr(cfg, control, id, "ccx3-init: ensure user: "+err.Error()+"\n")
+			if cfg.ExitMarkerPrefix != "" {
+				writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
+			}
+			return
+		}
 		cmd.SysProcAttr.Credential = cred
 	}
 	if rootDir != "" {
@@ -1390,6 +1401,155 @@ func configureHostname(hostname string) error {
 	_ = os.WriteFile("/etc/hostname", []byte(hostname+"\n"), 0o644)
 	hosts := "127.0.0.1\tlocalhost " + hostname + "\n::1\tlocalhost ip6-localhost ip6-loopback " + hostname + "\n"
 	_ = os.WriteFile("/etc/hosts", []byte(hosts), 0o644)
+	return nil
+}
+
+func ensureCredentialUser(rootDir string, cred *syscall.Credential) error {
+	if cred == nil || cred.Uid == 0 {
+		return nil
+	}
+	rootDir = strings.TrimRight(rootDir, "/")
+	uid := fmt.Sprintf("%d", cred.Uid)
+	gid := fmt.Sprintf("%d", cred.Gid)
+	name := usernameForUID(rootDir, uid)
+	if name == "" {
+		name = availableUserName(rootDir, "cc")
+	}
+	group := groupNameForGID(rootDir, gid)
+	if group == "" {
+		group = availableGroupName(rootDir, name)
+		if err := appendGroupEntry(rootDir, group, gid); err != nil {
+			return err
+		}
+	}
+	if name != "" && passwdHasUID(rootDir, uid) {
+		return nil
+	}
+	if err := appendPasswdEntry(rootDir, name, uid, gid, "/home/"+name, "/bin/sh"); err != nil {
+		return err
+	}
+	home := rootPath(rootDir, "/home/"+name)
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", home, err)
+	}
+	if err := os.Chown(home, int(cred.Uid), int(cred.Gid)); err != nil {
+		return fmt.Errorf("chown %s: %w", home, err)
+	}
+	return nil
+}
+
+func rootPath(rootDir, name string) string {
+	if rootDir == "" {
+		return name
+	}
+	return filepath.Join(rootDir, strings.TrimPrefix(name, "/"))
+}
+
+func usernameForUID(rootDir, uid string) string {
+	for _, line := range colonFileLines(rootPath(rootDir, "/etc/passwd")) {
+		fields := strings.Split(line, ":")
+		if len(fields) >= 3 && fields[2] == uid {
+			return fields[0]
+		}
+	}
+	return ""
+}
+
+func groupNameForGID(rootDir, gid string) string {
+	for _, line := range colonFileLines(rootPath(rootDir, "/etc/group")) {
+		fields := strings.Split(line, ":")
+		if len(fields) >= 3 && fields[2] == gid {
+			return fields[0]
+		}
+	}
+	return ""
+}
+
+func passwdHasUID(rootDir, uid string) bool {
+	return usernameForUID(rootDir, uid) != ""
+}
+
+func colonFileLines(path string) []string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	lines := strings.Split(string(data), "\n")
+	out := lines[:0]
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+func availableUserName(rootDir, base string) string {
+	if !nameExists(rootPath(rootDir, "/etc/passwd"), base) {
+		return base
+	}
+	for i := 1000; ; i++ {
+		name := base + itoa(i)
+		if !nameExists(rootPath(rootDir, "/etc/passwd"), name) {
+			return name
+		}
+	}
+}
+
+func availableGroupName(rootDir, base string) string {
+	if !nameExists(rootPath(rootDir, "/etc/group"), base) {
+		return base
+	}
+	for i := 1000; ; i++ {
+		name := base + itoa(i)
+		if !nameExists(rootPath(rootDir, "/etc/group"), name) {
+			return name
+		}
+	}
+}
+
+func nameExists(path, name string) bool {
+	for _, line := range colonFileLines(path) {
+		fields := strings.Split(line, ":")
+		if len(fields) > 0 && fields[0] == name {
+			return true
+		}
+	}
+	return false
+}
+
+func appendGroupEntry(rootDir, name, gid string) error {
+	path := rootPath(rootDir, "/etc/group")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
+	}
+	return appendLine(path, name+":x:"+gid+":")
+}
+
+func appendPasswdEntry(rootDir, name, uid, gid, home, shell string) error {
+	path := rootPath(rootDir, "/etc/passwd")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(path), err)
+	}
+	return appendLine(path, strings.Join([]string{name, "x", uid, gid, "ccvm user", home, shell}, ":"))
+}
+
+func appendLine(path, line string) error {
+	existing, _ := os.ReadFile(path)
+	prefix := ""
+	if len(existing) > 0 && existing[len(existing)-1] != '\n' {
+		prefix = "\n"
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("open %s: %w", path, err)
+	}
+	defer f.Close()
+	if _, err := io.WriteString(f, prefix+line+"\n"); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
 	return nil
 }
 

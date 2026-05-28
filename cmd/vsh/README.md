@@ -80,6 +80,7 @@ These attention words are reserved:
 --vm <id>
 --cwd <guest-path>
 --user <user>
+--sudo
 --memory <n|nM|nG>
 --memory-mb <n>
 --cpus <n>
@@ -92,3 +93,6 @@ Use `--` when a command begins with something that looks like a `vsh` option:
 ```sh
 @alpine -- --help
 ```
+
+Guest commands run as UID `1000` by default. Use `@ --sudo <cmd>` or
+`@sudo <cmd>` to run a command as root in the current VM.

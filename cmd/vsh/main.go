@@ -26,6 +26,7 @@ import (
 )
 
 const guestHostMount = "/host"
+const defaultGuestUser = "1000:0"
 
 const (
 	colorReset   = "\x1b[0m"
@@ -95,6 +96,7 @@ type commandOptions struct {
 	VMID         string
 	CWD          string
 	User         string
+	Sudo         bool
 	MemoryMB     uint64
 	CPUs         int
 	Network      *bool
@@ -313,7 +315,14 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 	}
 	if at.Target == "" {
 		ctx := s.context.withOptions(at.Options)
+		if at.Options.Sudo {
+			ctx.Mode = modeVM
+			ctx.User = "root"
+		}
 		if at.Command == "" {
+			if at.Options.Sudo {
+				return fmt.Errorf("usage: @ --sudo <cmd>")
+			}
 			s.context = ctx
 			return nil
 		}
@@ -329,6 +338,9 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 	case "host":
 		ctx := s.context.withOptions(at.Options)
 		ctx.Mode = modeHost
+		if at.Options.Sudo {
+			return fmt.Errorf("usage: @host [cmd]")
+		}
 		if at.Command == "" {
 			s.context = ctx
 			return nil
@@ -344,6 +356,14 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("usage: @%s", at.Target)
 		}
 		return s.printStatus(stdout)
+	case "sudo":
+		ctx := s.context.withOptions(at.Options)
+		ctx.Mode = modeVM
+		ctx.User = "root"
+		if at.Command == "" {
+			return fmt.Errorf("usage: @sudo <cmd>")
+		}
+		return s.runInContext(ctx, at.Command, stdout, stderr)
 	case "start":
 		if at.Command != "" {
 			return fmt.Errorf("usage: @start [--vm id]")
@@ -378,7 +398,13 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		ctx := s.context.withOptions(at.Options)
 		ctx.Mode = modeVM
 		ctx.Image = at.Target
+		if at.Options.Sudo {
+			ctx.User = "root"
+		}
 		if at.Command == "" {
+			if at.Options.Sudo {
+				return fmt.Errorf("usage: @%s --sudo <cmd>", at.Target)
+			}
 			s.context = ctx
 			return nil
 		}
@@ -485,7 +511,7 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 			Writable: true,
 		}},
 		WorkDir:  workDir,
-		User:     ctx.User,
+		User:     guestRunUser(ctx),
 		MemoryMB: ctx.MemoryMB,
 		CPUs:     ctx.CPUs,
 	}
@@ -504,6 +530,31 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 }
 
 func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, stderr io.Writer) error {
+	if !req.TTY {
+		exitCode := 0
+		if err := s.api.RunStreamInContext(context.Background(), id, req, func(event client.ExecEvent) error {
+			switch event.Kind {
+			case "stdout", "output":
+				writeExecEventOutput(stdout, event)
+			case "stderr":
+				writeExecEventOutput(stderr, event)
+			case "exit":
+				exitCode = event.ExitCode
+			case "error":
+				if event.Error != "" {
+					return fmt.Errorf("%s", event.Error)
+				}
+				return fmt.Errorf("guest command failed")
+			}
+			return nil
+		}); err != nil {
+			s.lastCode = 1
+			return err
+		}
+		s.lastCode = exitCode
+		return nil
+	}
+
 	inputs := make(chan client.ExecInput, 8)
 	done := make(chan struct{})
 	var producers sync.WaitGroup
@@ -1020,12 +1071,13 @@ func (s *shellState) help(w io.Writer) error {
 @<oci-tag> [opts] [cmd]  run cmd in an OCI image, or make it current if cmd is omitted
 @host [cmd]              run cmd on the host, or make host current if cmd is omitted
 @ [opts] [cmd]           update or use the current context
+@sudo <cmd>              run cmd as root in the current VM
 @ps                      list VMs
 @status                  show vsh and selected VM state
 @start [--vm id]         start a blank VM
 @stop [--vm id]          stop a VM
 @forward H:G             forward host port H to guest port G
-opts: --vm id --cwd path --user user --memory-mb n --memory n[m|g] --cpus n --network --no-network
+opts: --vm id --cwd path --user user --sudo --memory-mb n --memory n[m|g] --cpus n --network --no-network
 cd <dir>                 change host directory; VM commands run under the mirrored /host path
 exit                     leave vsh
 `))
@@ -1103,6 +1155,11 @@ func parseCommandOptions(tokens []shellToken, start int) (commandOptions, int, e
 				return opts, i, err
 			}
 			opts.User = v
+		case "--sudo":
+			if hasInlineValue {
+				return opts, i, fmt.Errorf("--sudo does not take a value")
+			}
+			opts.Sudo = true
 		case "--memory-mb":
 			v, err := readValue()
 			if err != nil {
@@ -1163,6 +1220,9 @@ func (c commandContext) withOptions(opts commandOptions) commandContext {
 	if opts.User != "" {
 		c.User = opts.User
 	}
+	if opts.Sudo {
+		c.User = "root"
+	}
 	if opts.MemoryMB != 0 {
 		c.MemoryMB = opts.MemoryMB
 	}
@@ -1173,6 +1233,13 @@ func (c commandContext) withOptions(opts commandOptions) commandContext {
 		c.Network = *opts.Network
 	}
 	return c
+}
+
+func guestRunUser(ctx commandContext) string {
+	if strings.TrimSpace(ctx.User) != "" {
+		return ctx.User
+	}
+	return defaultGuestUser
 }
 
 func parseMemoryMB(value string) (uint64, error) {

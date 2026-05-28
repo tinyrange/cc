@@ -103,6 +103,16 @@ func TestParseAtLineCurrentContextOptions(t *testing.T) {
 	}
 }
 
+func TestParseAtLineSudoOption(t *testing.T) {
+	got, err := parseAtLine(`@ --sudo apt update`)
+	if err != nil {
+		t.Fatalf("parseAtLine() error = %v", err)
+	}
+	if !got.Options.Sudo || got.Command != "apt update" {
+		t.Fatalf("parseAtLine() = %#v", got)
+	}
+}
+
 func TestBareOCISelectsCurrentContext(t *testing.T) {
 	api := &fakeVSHAPI{status: client.InstanceState{ID: "default", Status: "stopped"}}
 	sh := &shellState{api: api, context: defaultContext("default", ""), hostCWD: t.TempDir()}
@@ -137,6 +147,9 @@ echo hello --flag
 	if run.req.Network == nil || !run.req.Network.Enabled || !run.req.Network.AllowInternet {
 		t.Fatalf("network = %#v, want enabled internet", run.req.Network)
 	}
+	if run.req.User != defaultGuestUser {
+		t.Fatalf("user = %q, want %q", run.req.User, defaultGuestUser)
+	}
 	if strings.Join(run.req.Command, " ") != "sh -lc echo hello --flag" {
 		t.Fatalf("command = %#v", run.req.Command)
 	}
@@ -152,6 +165,23 @@ echo hello --flag
 	}
 	if sh.context.Mode != modeHost {
 		t.Fatalf("mode = %q, want host", sh.context.Mode)
+	}
+}
+
+func TestGuestRunsAsRootWithSudoOption(t *testing.T) {
+	dir := t.TempDir()
+	api := &fakeVSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
+	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Network: true}, hostCWD: dir}
+	if err := sh.runScript(strings.NewReader("@ --sudo id -u\n@sudo id -u\n"), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("runScript() error = %v", err)
+	}
+	if len(api.streams) != 2 {
+		t.Fatalf("streams = %d, want 2", len(api.streams))
+	}
+	for _, run := range api.streams {
+		if run.req.User != "root" {
+			t.Fatalf("user = %q, want root", run.req.User)
+		}
 	}
 }
 
