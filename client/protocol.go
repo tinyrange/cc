@@ -29,6 +29,16 @@ type WatchdogActivityCounter struct {
 	SecondsSinceLast float64 `json:"seconds_since_last,omitempty"`
 }
 
+type WatchdogLeaseRequest struct {
+	LeaseID        string  `json:"lease_id,omitempty"`
+	TimeoutSeconds float64 `json:"timeout_seconds,omitempty"`
+}
+
+type WatchdogLeaseResponse struct {
+	LeaseID        string  `json:"lease_id"`
+	TimeoutSeconds float64 `json:"timeout_seconds"`
+}
+
 type BootEvent struct {
 	Kind    string        `json:"kind"`
 	Message string        `json:"message,omitempty"`

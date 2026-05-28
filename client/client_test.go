@@ -111,6 +111,55 @@ func TestClientExecStream(t *testing.T) {
 	}
 }
 
+func TestClientRunStream(t *testing.T) {
+	var gotRequest bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotRequest = true
+		if r.URL.Path != "/vm/run" || r.URL.Query().Get("stream") != "1" {
+			t.Fatalf("request URL = %s, want /vm/run?stream=1", r.URL.String())
+		}
+		if r.Header.Get("Accept") != "application/x-ndjson" {
+			t.Fatalf("Accept = %q, want application/x-ndjson", r.Header.Get("Accept"))
+		}
+		var req RunRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("Decode(req) error = %v", err)
+		}
+		if req.ID != "work" || req.Image != "ubuntu" || !req.TTY || req.Cols != 120 || req.Rows != 40 {
+			t.Fatalf("req = %#v", req)
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		enc := json.NewEncoder(w)
+		_ = enc.Encode(ExecEvent{Kind: "stdout", Output: "Linux\n", Data: []byte("Linux\n")})
+		_ = enc.Encode(ExecEvent{Kind: "exit", ExitCode: 0})
+	}))
+	defer ts.Close()
+
+	c := NewClient(ts.URL, func() (net.Conn, error) { return nil, nil })
+	c.client = *ts.Client()
+
+	var events []ExecEvent
+	err := c.RunStreamIn("work", RunRequest{
+		Image:   "ubuntu",
+		Command: []string{"uname", "-a"},
+		TTY:     true,
+		Cols:    120,
+		Rows:    40,
+	}, func(event ExecEvent) error {
+		events = append(events, event)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RunStreamIn() error = %v", err)
+	}
+	if !gotRequest {
+		t.Fatal("server did not receive request")
+	}
+	if len(events) != 2 || events[0].Output != "Linux\n" || events[1].Kind != "exit" {
+		t.Fatalf("events = %#v", events)
+	}
+}
+
 func TestClientDownloadKernelStream(t *testing.T) {
 	var gotRequest bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -163,6 +164,20 @@ func (c *Client) Capabilities() (CapabilitiesResponse, error) {
 	return ret, err
 }
 
+func (c *Client) CreateWatchdogLease(req WatchdogLeaseRequest) (WatchdogLeaseResponse, error) {
+	var ret WatchdogLeaseResponse
+	err := c.postJSONExpectOK("/watchdog/lease", req, &ret)
+	return ret, err
+}
+
+func (c *Client) FeedWatchdogLease(id string) error {
+	return c.postJSONExpectOK("/watchdog/lease/feed", WatchdogLeaseRequest{LeaseID: id}, nil)
+}
+
+func (c *Client) ReleaseWatchdogLease(id string) error {
+	return c.postJSONExpectOK("/watchdog/lease/release", WatchdogLeaseRequest{LeaseID: id}, nil)
+}
+
 func (c *Client) CreateInstance(req CreateInstanceRequest) (InstanceState, error) {
 	var ret InstanceState
 	err := c.postJSONExpectOK("/vm", req, &ret)
@@ -268,6 +283,76 @@ func (c *Client) Run(req RunRequest) (ExecResponse, error) {
 func (c *Client) RunIn(id string, req RunRequest) (ExecResponse, error) {
 	req.ID = id
 	return c.Run(req)
+}
+
+func (c *Client) RunStream(req RunRequest, onEvent func(ExecEvent) error) error {
+	return c.RunStreamContext(context.Background(), req, onEvent)
+}
+
+func (c *Client) RunStreamContext(ctx context.Context, req RunRequest, onEvent func(ExecEvent) error) error {
+	return c.postJSONExecStream(ctx, "/vm/run", req, onEvent)
+}
+
+func (c *Client) RunStreamIn(id string, req RunRequest, onEvent func(ExecEvent) error) error {
+	return c.RunStreamInContext(context.Background(), id, req, onEvent)
+}
+
+func (c *Client) RunStreamInContext(ctx context.Context, id string, req RunRequest, onEvent func(ExecEvent) error) error {
+	req.ID = id
+	return c.RunStreamContext(ctx, req, onEvent)
+}
+
+func (c *Client) RunInteractiveStreamIn(id string, req RunRequest, inputs <-chan ExecInput, onEvent func(ExecEvent) error) error {
+	req.ID = id
+	return c.RunInteractiveStream(req, inputs, onEvent)
+}
+
+func (c *Client) RunInteractiveStream(req RunRequest, inputs <-chan ExecInput, onEvent func(ExecEvent) error) error {
+	wsURL, err := websocketURL(c.url, "/vm/run/stream")
+	if err != nil {
+		return err
+	}
+	cfg, err := websocket.NewConfig(wsURL, c.url)
+	if err != nil {
+		return err
+	}
+	if c.dialer != nil {
+		cfg.Dialer = &net.Dialer{}
+	}
+	ws, err := websocket.DialConfig(cfg)
+	if err != nil {
+		return err
+	}
+	defer ws.Close()
+
+	if err := websocket.JSON.Send(ws, req); err != nil {
+		return err
+	}
+	if inputs != nil {
+		go func() {
+			for input := range inputs {
+				_ = websocket.JSON.Send(ws, input)
+			}
+		}()
+	}
+	for {
+		var event ExecEvent
+		if err := websocket.JSON.Receive(ws, &event); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return err
+		}
+		if onEvent != nil {
+			if err := onEvent(event); err != nil {
+				return err
+			}
+		}
+		if event.Kind == "exit" || event.Kind == "error" {
+			break
+		}
+	}
+	return nil
 }
 
 func (c *Client) RunEvents(req RunRequest) ([]ExecEvent, error) {
@@ -499,7 +584,44 @@ func (c *Client) postJSONBootStream(path string, reqBody any, onEvent func(BootE
 	}
 }
 
+func (c *Client) postJSONExecStream(ctx context.Context, path string, reqBody any, onEvent func(ExecEvent) error) error {
+	resp, err := c.postJSONStreamContext(ctx, path, reqBody)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	dec := json.NewDecoder(resp.Body)
+	for {
+		var event ExecEvent
+		if err := dec.Decode(&event); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		if onEvent != nil {
+			if err := onEvent(event); err != nil {
+				return err
+			}
+		}
+		if event.Kind == "error" {
+			if event.Error != "" {
+				return fmt.Errorf("%s", event.Error)
+			}
+			return fmt.Errorf("streamed exec failed")
+		}
+		if event.Kind == "exit" {
+			return nil
+		}
+	}
+}
+
 func (c *Client) postJSONStream(path string, reqBody any) (*http.Response, error) {
+	return c.postJSONStreamContext(context.Background(), path, reqBody)
+}
+
+func (c *Client) postJSONStreamContext(ctx context.Context, path string, reqBody any) (*http.Response, error) {
 	var body io.Reader
 	if reqBody != nil {
 		buf := &bytes.Buffer{}
@@ -509,7 +631,7 @@ func (c *Client) postJSONStream(path string, reqBody any) (*http.Response, error
 		body = buf
 	}
 
-	req, err := http.NewRequest(http.MethodPost, c.url+path+"?stream=1", body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url+path+"?stream=1", body)
 	if err != nil {
 		return nil, err
 	}

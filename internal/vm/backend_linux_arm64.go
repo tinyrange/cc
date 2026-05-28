@@ -551,7 +551,7 @@ func (i *linuxInstance) AddImage(ctx context.Context, mountPath string, image *o
 	if err := i.rootFS.AddShare(virtio.ShareMount{
 		GuestPath: mountPath,
 		Backend:   virtio.NewImageFS(image.RootFS, image.RootFSDir),
-		Writable:  false,
+		Writable:  true,
 	}); err != nil {
 		return err
 	}

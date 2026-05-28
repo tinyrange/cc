@@ -292,7 +292,7 @@ func (s *ContainerSession) AddImage(ctx context.Context, mount string, image *oc
 	if err := s.rootFS.AddShare(virtio.ShareMount{
 		GuestPath: key,
 		Backend:   virtio.NewImageFS(image.RootFS, image.RootFSDir),
-		Writable:  false,
+		Writable:  true,
 	}); err != nil {
 		return err
 	}

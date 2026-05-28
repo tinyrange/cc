@@ -265,6 +265,62 @@ func TestWatchdogExpiresWithoutFeed(t *testing.T) {
 	}
 }
 
+func TestWatchdogLeasesExpireAfterLastShellLeaves(t *testing.T) {
+	expired := make(chan struct{}, 1)
+	watchdog := newWatchdogController(func() { expired <- struct{}{} })
+	defer watchdog.Stop()
+
+	first, err := watchdog.CreateLease(200 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("CreateLease(first) error = %v", err)
+	}
+	second, err := watchdog.CreateLease(200 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("CreateLease(second) error = %v", err)
+	}
+	if !watchdog.ReleaseLease(first) {
+		t.Fatal("ReleaseLease(first) = false, want true")
+	}
+	select {
+	case <-expired:
+		t.Fatal("watchdog expired with one lease still active")
+	default:
+	}
+	if !watchdog.ReleaseLease(second) {
+		t.Fatal("ReleaseLease(second) = false, want true")
+	}
+	select {
+	case <-expired:
+	case <-time.After(time.Second):
+		t.Fatal("watchdog did not expire after last lease release")
+	}
+}
+
+func TestWatchdogLeaseFeedKeepsDaemonAliveUntilStale(t *testing.T) {
+	expired := make(chan struct{}, 1)
+	watchdog := newWatchdogController(func() { expired <- struct{}{} })
+	defer watchdog.Stop()
+
+	lease, err := watchdog.CreateLease(40 * time.Millisecond)
+	if err != nil {
+		t.Fatalf("CreateLease() error = %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if !watchdog.FeedLease(lease, 80*time.Millisecond) {
+		t.Fatal("FeedLease() = false, want true")
+	}
+	select {
+	case <-expired:
+		t.Fatal("watchdog expired before fed lease deadline")
+	case <-time.After(35 * time.Millisecond):
+	}
+	select {
+	case <-expired:
+	case <-time.After(time.Second):
+		t.Fatal("watchdog did not expire after fed lease deadline")
+	}
+}
+
 func TestWatchdogCVMFSActivityDoesNotFeedTimer(t *testing.T) {
 	expired := make(chan struct{}, 1)
 	watchdog := newWatchdogController(func() { expired <- struct{}{} })

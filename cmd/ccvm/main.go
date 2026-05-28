@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -70,8 +72,10 @@ type server struct {
 type watchdogController struct {
 	mu          sync.Mutex
 	timeout     time.Duration
+	deadline    time.Time
 	timer       *time.Timer
 	active      bool
+	leases      map[string]time.Time
 	onExpired   func()
 	cvmfsEvents uint64
 	cvmfsBytes  int64
@@ -90,12 +94,13 @@ func (w *watchdogController) Create(timeout time.Duration) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.timeout = timeout
+	w.deadline = time.Now().Add(timeout)
 	w.active = true
 	if w.timer == nil {
 		w.timer = time.AfterFunc(timeout, w.expire)
 		return
 	}
-	w.timer.Reset(timeout)
+	w.resetTimerLocked(time.Now())
 }
 
 func (w *watchdogController) Feed() bool {
@@ -129,12 +134,73 @@ func (w *watchdogController) ActivityState() client.WatchdogActivityState {
 	return client.WatchdogActivityState{CVMFS: cvmfs}
 }
 
+func (w *watchdogController) CreateLease(timeout time.Duration) (string, error) {
+	if timeout <= 0 {
+		return "", fmt.Errorf("watchdog lease timeout must be positive")
+	}
+	id, err := newWatchdogLeaseID()
+	if err != nil {
+		return "", err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.leases == nil {
+		w.leases = map[string]time.Time{}
+	}
+	now := time.Now()
+	w.leases[id] = now.Add(timeout)
+	w.resetTimerLocked(now)
+	return id, nil
+}
+
+func (w *watchdogController) FeedLease(id string, timeout time.Duration) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.leases == nil {
+		return false
+	}
+	if _, ok := w.leases[id]; !ok {
+		return false
+	}
+	now := time.Now()
+	w.leases[id] = now.Add(timeout)
+	w.resetTimerLocked(now)
+	return true
+}
+
+func (w *watchdogController) ReleaseLease(id string) bool {
+	var onExpired func()
+	w.mu.Lock()
+	if w.leases == nil {
+		w.mu.Unlock()
+		return false
+	}
+	if _, ok := w.leases[id]; !ok {
+		w.mu.Unlock()
+		return false
+	}
+	delete(w.leases, id)
+	if len(w.leases) == 0 && !w.active {
+		if w.timer != nil {
+			w.timer.Stop()
+		}
+		onExpired = w.onExpired
+	} else {
+		w.resetTimerLocked(time.Now())
+	}
+	w.mu.Unlock()
+	if onExpired != nil {
+		go onExpired()
+	}
+	return true
+}
+
 func (w *watchdogController) feedLocked() bool {
 	if !w.active || w.timer == nil {
 		return false
 	}
-	w.timer.Stop()
-	w.timer.Reset(w.timeout)
+	w.deadline = time.Now().Add(w.timeout)
+	w.resetTimerLocked(time.Now())
 	return true
 }
 
@@ -148,18 +214,69 @@ func (w *watchdogController) Stop() {
 }
 
 func (w *watchdogController) expire() {
+	var onExpired func()
 	w.mu.Lock()
-	if !w.active {
+	now := time.Now()
+	for id, deadline := range w.leases {
+		if !deadline.After(now) {
+			delete(w.leases, id)
+		}
+	}
+	if len(w.leases) > 0 {
+		w.resetTimerLocked(now)
 		w.mu.Unlock()
 		return
 	}
-	w.active = false
-	onExpired := w.onExpired
+	if w.active && w.deadline.After(now) {
+		w.resetTimerLocked(now)
+		w.mu.Unlock()
+		return
+	}
+	if w.active || w.leases != nil {
+		w.active = false
+		onExpired = w.onExpired
+	}
 	w.mu.Unlock()
 
 	if onExpired != nil {
 		onExpired()
 	}
+}
+
+func (w *watchdogController) resetTimerLocked(now time.Time) {
+	var next time.Time
+	if w.active && !w.deadline.IsZero() {
+		next = w.deadline
+	}
+	for _, deadline := range w.leases {
+		if next.IsZero() || deadline.Before(next) {
+			next = deadline
+		}
+	}
+	if next.IsZero() {
+		if w.timer != nil {
+			w.timer.Stop()
+		}
+		return
+	}
+	delay := next.Sub(now)
+	if delay <= 0 {
+		delay = time.Millisecond
+	}
+	if w.timer == nil {
+		w.timer = time.AfterFunc(delay, w.expire)
+		return
+	}
+	w.timer.Stop()
+	w.timer.Reset(delay)
+}
+
+func newWatchdogLeaseID() (string, error) {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf[:]), nil
 }
 
 func main() {
@@ -327,6 +444,67 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "fed"})
+	})
+
+	mux.HandleFunc("POST /watchdog/lease", func(w http.ResponseWriter, r *http.Request) {
+		if watchdog == nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("watchdog is unavailable"))
+			return
+		}
+		var req client.WatchdogLeaseRequest
+		if err := decodeRequiredJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		timeout := time.Duration(req.TimeoutSeconds * float64(time.Second))
+		if timeout <= 0 {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("watchdog lease timeout must be positive"))
+			return
+		}
+		id, err := watchdog.CreateLease(timeout)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, client.WatchdogLeaseResponse{LeaseID: id, TimeoutSeconds: req.TimeoutSeconds})
+	})
+
+	mux.HandleFunc("POST /watchdog/lease/feed", func(w http.ResponseWriter, r *http.Request) {
+		if watchdog == nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("watchdog is unavailable"))
+			return
+		}
+		var req client.WatchdogLeaseRequest
+		if err := decodeRequiredJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		timeout := time.Duration(req.TimeoutSeconds * float64(time.Second))
+		if timeout <= 0 {
+			timeout = 10 * time.Second
+		}
+		if !watchdog.FeedLease(req.LeaseID, timeout) {
+			writeError(w, http.StatusConflict, fmt.Errorf("watchdog lease is not active"))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "fed"})
+	})
+
+	mux.HandleFunc("POST /watchdog/lease/release", func(w http.ResponseWriter, r *http.Request) {
+		if watchdog == nil {
+			writeError(w, http.StatusInternalServerError, fmt.Errorf("watchdog is unavailable"))
+			return
+		}
+		var req client.WatchdogLeaseRequest
+		if err := decodeRequiredJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if !watchdog.ReleaseLease(req.LeaseID) {
+			writeError(w, http.StatusConflict, fmt.Errorf("watchdog lease is not active"))
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "released"})
 	})
 
 	mux.HandleFunc("GET /watchdog/activity", func(w http.ResponseWriter, r *http.Request) {
@@ -835,6 +1013,25 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			})
 		},
 	})
+	mux.Handle("/vm/run/stream", websocket.Server{
+		Handshake: func(*websocket.Config, *http.Request) error { return nil },
+		Handler: func(ws *websocket.Conn) {
+			serveRunRequestWebSocket(ws, func(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+				runCtx, cancel := runRequestContext(ctx, req)
+				defer cancel()
+				if err := srvState.vms.RunStream(runCtx, req, inputs, onEvent); err != nil {
+					if req.TimeoutSeconds > 0 && errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+						if eventErr := onEvent(client.ExecEvent{Kind: "stderr", Output: fmt.Sprintf("\n[ccvm] command timed out after %.1fs\n", req.TimeoutSeconds)}); eventErr != nil {
+							return eventErr
+						}
+						return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 124})
+					}
+					return err
+				}
+				return nil
+			})
+		},
+	})
 	return mux
 }
 
@@ -907,7 +1104,7 @@ func runRequestContext(parent context.Context, req client.RunRequest) (context.C
 	if req.TimeoutSeconds <= 0 {
 		return parent, func() {}
 	}
-	return context.WithTimeout(context.Background(), time.Duration(req.TimeoutSeconds*float64(time.Second)))
+	return context.WithTimeout(parent, time.Duration(req.TimeoutSeconds*float64(time.Second)))
 }
 
 func serveRunWebSocket(ws *websocket.Conn, runner func(context.Context, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error) {
@@ -936,6 +1133,40 @@ func serveRunWebSocket(ws *websocket.Conn, runner func(context.Context, client.E
 	}()
 
 	err := runner(ctx, req, inputs, func(event client.ExecEvent) error {
+		return websocket.JSON.Send(ws, event)
+	})
+	if err != nil {
+		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "error", Error: err.Error()})
+	}
+}
+
+func serveRunRequestWebSocket(ws *websocket.Conn, runner func(context.Context, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error) {
+	defer ws.Close()
+
+	var req client.RunRequest
+	if err := websocket.JSON.Receive(ws, &req); err != nil {
+		_ = websocket.JSON.Send(ws, client.ExecEvent{Kind: "error", Error: fmt.Sprintf("decode run request: %v", err)})
+		return
+	}
+
+	inputs := make(chan client.ExecInput, 16)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		defer close(inputs)
+		defer cancel()
+		for {
+			var input client.ExecInput
+			if err := websocket.JSON.Receive(ws, &input); err != nil {
+				return
+			}
+			inputs <- input
+		}
+	}()
+
+	err := runner(ctx, req, inputs, func(event client.ExecEvent) error {
+		event = sanitizeExecEventForJSON(event)
 		return websocket.JSON.Send(ws, event)
 	})
 	if err != nil {

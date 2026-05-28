@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -393,18 +394,16 @@ func configureNetwork(cfg *network) error {
 	if dns == "" {
 		dns = gateway
 	}
-	ip, err := findIPCommand()
-	if err != nil {
+	if err := configureNetworkLink("lo"); err != nil {
+		writeKernel("ccx3-init: configure lo: " + err.Error())
+	}
+	if err := configureNetworkLink(iface); err != nil {
 		return err
 	}
-	_ = runCommand(ip, "link", "set", "lo", "up")
-	_ = runCommand(ip, "link", "set", iface, "up")
-	_ = runCommand(ip, "addr", "flush", "dev", iface)
-	if err := runCommand(ip, "addr", "add", address, "dev", iface); err != nil {
+	if err := configureNetworkAddress(iface, address); err != nil {
 		return err
 	}
-	_ = runCommand(ip, "route", "del", "default")
-	if err := runCommand(ip, "route", "add", "default", "via", gateway, "dev", iface); err != nil {
+	if err := configureNetworkDefaultRoute(iface, gateway); err != nil {
 		return err
 	}
 	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver "+dns+"\n"), 0o644); err != nil {
@@ -413,13 +412,163 @@ func configureNetwork(cfg *network) error {
 	return nil
 }
 
-func findIPCommand() (string, error) {
-	for _, path := range []string{"/sbin/ip", "/bin/ip", "/usr/sbin/ip", "/usr/bin/ip"} {
-		if _, err := os.Stat(path); err == nil {
-			return path, nil
+func configureNetworkLink(name string) error {
+	iface, err := net.InterfaceByName(name)
+	if err != nil {
+		return fmt.Errorf("find interface %s: %w", name, err)
+	}
+	msg := unix.IfInfomsg{
+		Family: unix.AF_UNSPEC,
+		Index:  int32(iface.Index),
+		Flags:  unix.IFF_UP,
+		Change: unix.IFF_UP,
+	}
+	if err := netlinkRequest(unix.RTM_NEWLINK, 0, structBytes(&msg), false); err != nil {
+		return fmt.Errorf("set link %s up: %w", name, err)
+	}
+	return nil
+}
+
+func configureNetworkAddress(ifaceName, address string) error {
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return fmt.Errorf("find interface %s: %w", ifaceName, err)
+	}
+	ip, ipNet, err := net.ParseCIDR(address)
+	if err != nil {
+		return fmt.Errorf("parse address %s: %w", address, err)
+	}
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return fmt.Errorf("address %s is not IPv4", address)
+	}
+	ones, _ := ipNet.Mask.Size()
+	msg := unix.IfAddrmsg{
+		Family:    unix.AF_INET,
+		Prefixlen: uint8(ones),
+		Scope:     unix.RT_SCOPE_UNIVERSE,
+		Index:     uint32(iface.Index),
+	}
+	payload := structBytes(&msg)
+	payload = appendRtAttr(payload, unix.IFA_LOCAL, ip4)
+	payload = appendRtAttr(payload, unix.IFA_ADDRESS, ip4)
+	if err := netlinkRequest(unix.RTM_NEWADDR, unix.NLM_F_CREATE|unix.NLM_F_REPLACE, payload, true); err != nil {
+		return fmt.Errorf("add address %s to %s: %w", address, ifaceName, err)
+	}
+	return nil
+}
+
+func configureNetworkDefaultRoute(ifaceName, gateway string) error {
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return fmt.Errorf("find interface %s: %w", ifaceName, err)
+	}
+	gw := net.ParseIP(gateway).To4()
+	if gw == nil {
+		return fmt.Errorf("gateway %s is not IPv4", gateway)
+	}
+	msg := unix.RtMsg{
+		Family:   unix.AF_INET,
+		Table:    unix.RT_TABLE_MAIN,
+		Protocol: unix.RTPROT_STATIC,
+		Scope:    unix.RT_SCOPE_UNIVERSE,
+		Type:     unix.RTN_UNICAST,
+	}
+	payload := structBytes(&msg)
+	payload = appendRtAttr(payload, unix.RTA_GATEWAY, gw)
+	oif := uint32(iface.Index)
+	payload = appendRtAttr(payload, unix.RTA_OIF, structBytes(&oif))
+	if err := netlinkRequest(unix.RTM_NEWROUTE, unix.NLM_F_CREATE|unix.NLM_F_REPLACE, payload, true); err != nil {
+		return fmt.Errorf("add default route via %s dev %s: %w", gateway, ifaceName, err)
+	}
+	return nil
+}
+
+func netlinkRequest(msgType uint16, flags uint16, payload []byte, ignoreExists bool) error {
+	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_ROUTE)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	if err := unix.Bind(fd, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
+		return err
+	}
+	seq := uint32(time.Now().UnixNano())
+	hdr := unix.NlMsghdr{
+		Len:   uint32(unix.NLMSG_HDRLEN + len(payload)),
+		Type:  msgType,
+		Flags: unix.NLM_F_REQUEST | unix.NLM_F_ACK | flags,
+		Seq:   seq,
+	}
+	msg := append(structBytes(&hdr), payload...)
+	if err := unix.Sendto(fd, msg, 0, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
+		return err
+	}
+	return readNetlinkAck(fd, seq, ignoreExists)
+}
+
+func readNetlinkAck(fd int, seq uint32, ignoreExists bool) error {
+	buf := make([]byte, 8192)
+	for {
+		n, _, err := unix.Recvfrom(fd, buf, 0)
+		if err != nil {
+			return err
+		}
+		for off := 0; off+unix.NLMSG_HDRLEN <= n; {
+			hdr := (*unix.NlMsghdr)(unsafe.Pointer(&buf[off]))
+			if hdr.Len < unix.NLMSG_HDRLEN || off+int(hdr.Len) > n {
+				return fmt.Errorf("short netlink response")
+			}
+			next := off + nlmsgAlign(int(hdr.Len))
+			if hdr.Seq != seq {
+				off = next
+				continue
+			}
+			switch hdr.Type {
+			case unix.NLMSG_ERROR:
+				if int(hdr.Len) < unix.NLMSG_HDRLEN+int(unsafe.Sizeof(unix.NlMsgerr{})) {
+					return fmt.Errorf("short netlink error response")
+				}
+				msgErr := (*unix.NlMsgerr)(unsafe.Pointer(&buf[off+unix.NLMSG_HDRLEN]))
+				if msgErr.Error == 0 {
+					return nil
+				}
+				errno := syscall.Errno(-msgErr.Error)
+				if ignoreExists && errno == syscall.EEXIST {
+					return nil
+				}
+				return errno
+			case unix.NLMSG_DONE:
+				return nil
+			}
+			off = next
 		}
 	}
-	return "", fmt.Errorf("ip command not found")
+}
+
+func appendRtAttr(buf []byte, attrType uint16, data []byte) []byte {
+	attr := unix.RtAttr{
+		Len:  uint16(unsafe.Sizeof(unix.RtAttr{}) + uintptr(len(data))),
+		Type: attrType,
+	}
+	buf = append(buf, structBytes(&attr)...)
+	buf = append(buf, data...)
+	for len(buf)%unix.NLMSG_ALIGNTO != 0 {
+		buf = append(buf, 0)
+	}
+	return buf
+}
+
+func nlmsgAlign(n int) int {
+	return (n + unix.NLMSG_ALIGNTO - 1) & ^(unix.NLMSG_ALIGNTO - 1)
+}
+
+func structBytes[T any](value *T) []byte {
+	size := int(unsafe.Sizeof(*value))
+	data := unsafe.Slice((*byte)(unsafe.Pointer(value)), size)
+	out := make([]byte, size)
+	copy(out, data)
+	return out
 }
 
 func runCommand(name string, args ...string) error {
@@ -795,7 +944,7 @@ func execCommandGo(argv []string, env []string, workDir string, user string) (in
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		return exitErr.ExitCode(), usage, nil
+		return processExitCode(cmd.ProcessState, exitErr.ExitCode()), usage, nil
 	}
 	return 0, usage, err
 }
@@ -1166,7 +1315,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	if waitErr != nil {
 		var exitErr *exec.ExitError
 		if errors.As(waitErr, &exitErr) {
-			exitCode = exitErr.ExitCode()
+			exitCode = processExitCode(cmd.ProcessState, exitErr.ExitCode())
 		} else {
 			writeKernel("ccx3-init: exec error: " + waitErr.Error())
 			writeExecStderr(cfg, control, id, "ccx3-init: exec error: "+waitErr.Error()+"\n")
@@ -1180,6 +1329,17 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		writeExecTiming(control, id, "exit_sent", execStart)
 		writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":"+itoa(exitCode))
 	}
+}
+
+func processExitCode(state *os.ProcessState, fallback int) int {
+	if state == nil {
+		return fallback
+	}
+	status, ok := state.Sys().(syscall.WaitStatus)
+	if !ok || !status.Signaled() {
+		return fallback
+	}
+	return 128 + int(status.Signal())
 }
 
 type execUsage struct {
@@ -1297,7 +1457,32 @@ func prepareExecRoot(rootDir string) (string, []string, error) {
 		}
 		mounts = append(mounts, target)
 	}
+	if err := copyExecRootNetworkFiles(cleaned); err != nil {
+		teardownExecRoot(mounts)
+		return "", nil, err
+	}
 	return cleaned, mounts, nil
+}
+
+func copyExecRootNetworkFiles(rootDir string) error {
+	for _, name := range []string{"resolv.conf", "hosts", "hostname"} {
+		src := filepath.Join("/etc", name)
+		data, err := os.ReadFile(src)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("read %s: %w", src, err)
+		}
+		dst := filepath.Join(rootDir, "etc", name)
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", filepath.Dir(dst), err)
+		}
+		if err := os.WriteFile(dst, data, 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", dst, err)
+		}
+	}
+	return nil
 }
 
 func teardownExecRoot(mounts []string) {
