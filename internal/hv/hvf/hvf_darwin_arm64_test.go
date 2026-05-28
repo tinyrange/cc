@@ -20,6 +20,12 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+func TestNestedVirtualizationSupportedProbe(t *testing.T) {
+	if _, err := NestedVirtualizationSupported(); err != nil {
+		t.Fatalf("NestedVirtualizationSupported() error = %v", err)
+	}
+}
+
 func TestHVFBringupStages(t *testing.T) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()

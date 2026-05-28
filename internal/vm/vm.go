@@ -59,6 +59,7 @@ type Machine struct {
 	image      string
 	memoryMB   uint64
 	cpus       int
+	nestedVirt bool
 	startedAt  time.Time
 	instance   Instance
 	lastErr    error
@@ -95,6 +96,10 @@ func HostCapabilities() client.CapabilitiesResponse {
 		caps.MaxInstances = 1
 		caps.NetworkModes = []string{"user"}
 		caps.Notes = append(caps.Notes, "macOS HVF currently limits ccx3 to one running instance")
+	}
+	if supported, err := hv.NestedVirtualizationSupported(); err == nil && supported {
+		caps.SupportsNestedVirt = true
+		caps.ResourceLimits = append(caps.ResourceLimits, "nested_virtualization")
 	}
 	if runtime.GOOS == "linux" && runtime.GOARCH == "amd64" {
 		caps.NetworkModes = []string{"user"}
@@ -175,6 +180,7 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 		image:      req.Image,
 		memoryMB:   req.MemoryMB,
 		cpus:       req.CPUs,
+		nestedVirt: req.NestedVirt,
 		startedAt:  time.Now().UTC(),
 		instance:   inst,
 		shutdownCh: make(chan struct{}),
@@ -253,6 +259,7 @@ func (m *Manager) StartBlankInstanceStream(
 		image:      "",
 		memoryMB:   req.MemoryMB,
 		cpus:       req.CPUs,
+		nestedVirt: req.NestedVirt,
 		startedAt:  time.Now().UTC(),
 		instance:   inst,
 		shutdownCh: make(chan struct{}),
@@ -456,12 +463,13 @@ func (m *Manager) statusLocked(id string) client.InstanceState {
 	}
 	machine := m.running[id]
 	state := client.InstanceState{
-		ID:        id,
-		Status:    "running",
-		Image:     machine.image,
-		MemoryMB:  machine.memoryMB,
-		CPUs:      machine.cpus,
-		StartedAt: machine.startedAt.Format(time.RFC3339),
+		ID:         id,
+		Status:     "running",
+		Image:      machine.image,
+		MemoryMB:   machine.memoryMB,
+		CPUs:       machine.cpus,
+		NestedVirt: machine.nestedVirt,
+		StartedAt:  machine.startedAt.Format(time.RFC3339),
 	}
 	if provider, ok := machine.instance.(networkIPv4Provider); ok {
 		state.NetworkIPv4 = provider.NetworkIPv4()

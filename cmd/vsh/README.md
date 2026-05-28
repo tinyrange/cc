@@ -101,6 +101,8 @@ These attention words are reserved:
 --cpus <n>
 --network
 --no-network
+--nested
+--no-nested
 ```
 
 Use `--` when a command begins with something that looks like a `vsh` option:
@@ -111,6 +113,10 @@ Use `--` when a command begins with something that looks like a `vsh` option:
 
 Guest commands run as UID `1000` by default. Use `@ --sudo <cmd>` or
 `@sudo <cmd>` to run a command as root in the current VM.
+
+If the daemon reports nested virtualization support, `vsh` enables it by
+default for VM contexts. Use `@ --no-nested` to disable it for the current
+context or a one-shot command.
 
 ## Building
 

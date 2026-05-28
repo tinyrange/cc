@@ -10,3 +10,7 @@ func Supports() error {
 	_, err := kvm.Probe()
 	return err
 }
+
+func NestedVirtualizationSupported() (bool, error) {
+	return false, nil
+}

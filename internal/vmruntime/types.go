@@ -39,6 +39,7 @@ type RunRequest struct {
 	User              string
 	MemoryMB          uint64
 	CPUs              int
+	NestedVirt        bool
 	Dmesg             bool
 	Persistent        bool
 	Network           *GuestNetworkConfig

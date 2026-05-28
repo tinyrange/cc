@@ -10,3 +10,7 @@ import (
 func Supports() error {
 	return fmt.Errorf("unsupported host: %s/%s", runtime.GOOS, runtime.GOARCH)
 }
+
+func NestedVirtualizationSupported() (bool, error) {
+	return false, nil
+}

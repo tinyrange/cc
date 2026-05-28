@@ -173,7 +173,7 @@ func TestParseAtLineSudoOption(t *testing.T) {
 
 func TestBareOCISelectsCurrentContextAndPreparesImage(t *testing.T) {
 	api := &fakeVSHAPI{status: client.InstanceState{ID: "default", Status: "stopped"}}
-	sh := &shellState{api: api, context: defaultContext("default", ""), hostCWD: t.TempDir()}
+	sh := &shellState{api: api, context: defaultContext("default", "", false), hostCWD: t.TempDir()}
 	if err := sh.eval(`@alpine`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("eval(@alpine) error = %v", err)
 	}
@@ -201,7 +201,7 @@ func TestBareOCIPullsMissingImageWithoutBooting(t *testing.T) {
 			ETASeconds:         2,
 		}},
 	}
-	sh := &shellState{api: api, context: defaultContext("default", ""), hostCWD: t.TempDir()}
+	sh := &shellState{api: api, context: defaultContext("default", "", false), hostCWD: t.TempDir()}
 	var stderr bytes.Buffer
 	if err := sh.eval(`@alpine`, &bytes.Buffer{}, &stderr); err != nil {
 		t.Fatalf("eval(@alpine) error = %v", err)
@@ -224,7 +224,7 @@ func TestBareOCIPullsMissingImageWithoutBooting(t *testing.T) {
 func TestScriptSendsLinesThroughCurrentContext(t *testing.T) {
 	dir := t.TempDir()
 	api := &fakeVSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
-	sh := &shellState{api: api, context: defaultContext("default", ""), hostCWD: dir}
+	sh := &shellState{api: api, context: defaultContext("default", "", false), hostCWD: dir}
 	script := strings.NewReader(`
 # ignored
 @alpine --vm work --memory 512
@@ -240,6 +240,9 @@ echo hello --flag
 	run := api.streams[0]
 	if run.id != "work" || run.req.Image != "alpine" || run.req.MemoryMB != 512 {
 		t.Fatalf("run = %#v", run)
+	}
+	if run.req.NestedVirt {
+		t.Fatalf("nested virtualization = true, want default false without capability")
 	}
 	if run.req.Network == nil || !run.req.Network.Enabled || !run.req.Network.AllowInternet {
 		t.Fatalf("network = %#v, want enabled internet", run.req.Network)
@@ -342,6 +345,25 @@ func TestGuestBootUsesContextNetwork(t *testing.T) {
 	}
 }
 
+func TestGuestBootAndRunUseNestedVirtualizationContext(t *testing.T) {
+	dir := t.TempDir()
+	api := &fakeVSHAPI{status: client.InstanceState{ID: "work", Status: "stopped"}}
+	sh := &shellState{
+		api:     api,
+		context: commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Network: true, NestedVirt: true},
+		hostCWD: dir,
+	}
+	if err := sh.runScript(strings.NewReader("echo hi\n"), &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("runScript() error = %v", err)
+	}
+	if len(api.starts) != 1 || !api.starts[0].req.NestedVirt {
+		t.Fatalf("starts = %#v, want nested virtualization enabled", api.starts)
+	}
+	if len(api.streams) != 1 || !api.streams[0].req.NestedVirt {
+		t.Fatalf("streams = %#v, want nested virtualization enabled", api.streams)
+	}
+}
+
 func TestStreamGuestRunWritesEventsAndExit(t *testing.T) {
 	api := &fakeVSHAPI{
 		streamEvents: []client.ExecEvent{
@@ -380,7 +402,7 @@ func TestStreamGuestRunRecordsNonzeroExitWithoutLog(t *testing.T) {
 
 func TestScriptStopsOnErrors(t *testing.T) {
 	api := &fakeVSHAPI{status: client.InstanceState{ID: "default", Status: "running"}}
-	sh := &shellState{api: api, context: defaultContext("default", ""), hostCWD: t.TempDir()}
+	sh := &shellState{api: api, context: defaultContext("default", "", false), hostCWD: t.TempDir()}
 	err := sh.runScript(strings.NewReader("@ --bogus\n@alpine echo nope\n"), &bytes.Buffer{}, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "unknown vsh option") {
 		t.Fatalf("runScript() error = %v, want unknown option", err)
@@ -391,7 +413,7 @@ func TestScriptStopsOnErrors(t *testing.T) {
 }
 
 func TestLoopRequiresInteractiveTerminal(t *testing.T) {
-	sh := &shellState{context: defaultContext("default", ""), hostCWD: t.TempDir()}
+	sh := &shellState{context: defaultContext("default", "", false), hostCWD: t.TempDir()}
 	err := sh.loop(strings.NewReader("echo nope\n"), &bytes.Buffer{}, &bytes.Buffer{})
 	if err == nil || !strings.Contains(err.Error(), "requires an interactive terminal") {
 		t.Fatalf("loop() error = %v, want interactive terminal error", err)
@@ -1009,7 +1031,7 @@ func TestGuestCommandPullsMissingImageBeforeRun(t *testing.T) {
 		status:      client.InstanceState{ID: "default", Status: "running"},
 		missingImgs: map[string]bool{"ubuntu": true},
 	}
-	sh := &shellState{api: api, context: defaultContext("default", ""), hostCWD: t.TempDir()}
+	sh := &shellState{api: api, context: defaultContext("default", "", false), hostCWD: t.TempDir()}
 	if err := sh.eval("@ubuntu echo hi", &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("eval() error = %v", err)
 	}
@@ -1205,6 +1227,10 @@ type fakePull struct {
 }
 
 func (f *fakeVSHAPI) HealthCheck() error { return nil }
+
+func (f *fakeVSHAPI) Capabilities() (client.CapabilitiesResponse, error) {
+	return client.CapabilitiesResponse{}, nil
+}
 
 func (f *fakeVSHAPI) GetImage(name string) (client.ImageState, error) {
 	f.imageGets++

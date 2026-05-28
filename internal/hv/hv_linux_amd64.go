@@ -37,3 +37,7 @@ func Supports() error {
 	}
 	return nil
 }
+
+func NestedVirtualizationSupported() (bool, error) {
+	return false, nil
+}

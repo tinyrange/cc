@@ -879,7 +879,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	timingLog("hvf.StartContainer initramfs.Build took=%s size=%d", time.Since(start), len(initrd))
 	start = time.Now()
 
-	vm, err := NewVMWithCPUs(ctx, req.CPUs)
+	vm, err := NewVMWithOptions(ctx, VMOptions{CPUs: req.CPUs, NestedVirt: req.NestedVirt})
 	if err != nil {
 		return nil, err
 	}
@@ -1334,7 +1334,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 		return ContainerRunResult{}, fmt.Errorf("build initramfs: %w", err)
 	}
 
-	vm, err := NewVMWithCPUs(ctx, req.CPUs)
+	vm, err := NewVMWithOptions(ctx, VMOptions{CPUs: req.CPUs, NestedVirt: req.NestedVirt})
 	if err != nil {
 		return ContainerRunResult{}, err
 	}

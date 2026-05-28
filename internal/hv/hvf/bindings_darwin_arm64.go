@@ -147,11 +147,13 @@ var (
 	hvLib         uintptr
 	sysLib        uintptr
 
-	hvVMConfigCreate func() VMConfig
-	hvVMCreate       func(config VMConfig) Return
-	hvVMDestroy      func() Return
-	hvVMMap          func(addr unsafe.Pointer, ipa IPA, size uintptr, flags MemoryFlags) Return
-	hvVMUnmap        func(ipa IPA, size uintptr) Return
+	hvVMConfigCreate          func() VMConfig
+	hvVMConfigGetEL2Supported func(el2Supported *bool) Return
+	hvVMConfigSetEL2Enabled   func(config VMConfig, el2Enabled bool) Return
+	hvVMCreate                func(config VMConfig) Return
+	hvVMDestroy               func() Return
+	hvVMMap                   func(addr unsafe.Pointer, ipa IPA, size uintptr, flags MemoryFlags) Return
+	hvVMUnmap                 func(ipa IPA, size uintptr) Return
 
 	hvVcpuConfigCreate    func() VcpuConfig
 	hvVcpuCreate          func(vcpu *VCPU, exit **VcpuExit, config VcpuConfig) Return
@@ -201,6 +203,8 @@ func load() error {
 		}
 
 		purego.RegisterLibFunc(&hvVMConfigCreate, hvLib, "hv_vm_config_create")
+		registerOptionalLibFunc(&hvVMConfigGetEL2Supported, hvLib, "hv_vm_config_get_el2_supported")
+		registerOptionalLibFunc(&hvVMConfigSetEL2Enabled, hvLib, "hv_vm_config_set_el2_enabled")
 		purego.RegisterLibFunc(&hvVMCreate, hvLib, "hv_vm_create")
 		purego.RegisterLibFunc(&hvVMDestroy, hvLib, "hv_vm_destroy")
 		purego.RegisterLibFunc(&hvVMMap, hvLib, "hv_vm_map")
@@ -238,6 +242,15 @@ func load() error {
 		purego.RegisterLibFunc(&osRelease, sysLib, "os_release")
 	})
 	return loadErr
+}
+
+func registerOptionalLibFunc(fptr any, handle uintptr, name string) bool {
+	sym, err := purego.Dlsym(handle, name)
+	if err != nil || sym == 0 {
+		return false
+	}
+	purego.RegisterFunc(fptr, sym)
+	return true
 }
 
 type VM struct {
@@ -288,9 +301,33 @@ func NewVMWithContext(ctx context.Context) (*VM, error) {
 }
 
 func NewVMWithCPUs(ctx context.Context, cpus int) (*VM, error) {
+	return NewVMWithOptions(ctx, VMOptions{CPUs: cpus})
+}
+
+type VMOptions struct {
+	CPUs       int
+	NestedVirt bool
+}
+
+func NestedVirtualizationSupported() (bool, error) {
+	if err := load(); err != nil {
+		return false, err
+	}
+	if hvVMConfigGetEL2Supported == nil {
+		return false, nil
+	}
+	var supported bool
+	if ret := hvVMConfigGetEL2Supported(&supported); ret != hvSuccess {
+		return false, ret
+	}
+	return supported, nil
+}
+
+func NewVMWithOptions(ctx context.Context, opts VMOptions) (*VM, error) {
 	if err := load(); err != nil {
 		return nil, err
 	}
+	cpus := opts.CPUs
 	if cpus <= 0 {
 		cpus = 1
 	}
@@ -316,6 +353,28 @@ func NewVMWithCPUs(ctx context.Context, cpus int) (*VM, error) {
 		start := time.Now()
 		vmCfg := hvVMConfigCreate()
 		timing.Since(ctx, "hvf.new_vm.vm_config_create", start)
+		start = time.Now()
+		if opts.NestedVirt {
+			if hvVMConfigSetEL2Enabled == nil {
+				osRelease(uintptr(vmCfg))
+				errCh <- fmt.Errorf("enable nested virtualization: EL2 is not available in this Hypervisor.framework")
+				return
+			}
+			if supported, err := NestedVirtualizationSupported(); err != nil {
+				osRelease(uintptr(vmCfg))
+				errCh <- fmt.Errorf("check nested virtualization support: %w", err)
+				return
+			} else if !supported {
+				osRelease(uintptr(vmCfg))
+				errCh <- fmt.Errorf("nested virtualization is not supported on this Mac")
+				return
+			}
+			if ret := hvVMConfigSetEL2Enabled(vmCfg, true); ret != hvSuccess {
+				osRelease(uintptr(vmCfg))
+				errCh <- fmt.Errorf("enable nested virtualization: %w", ret)
+				return
+			}
+		}
 		start = time.Now()
 		ret := createVMWithRetry(vmCfg)
 		if ret != hvSuccess {

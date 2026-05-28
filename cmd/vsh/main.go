@@ -220,6 +220,8 @@ func vshOptionWords() []string {
 		"--cpus",
 		"--network",
 		"--no-network",
+		"--nested",
+		"--no-nested",
 	}
 }
 
@@ -481,6 +483,7 @@ func uniqueStrings(items []string) []string {
 
 type vshAPI interface {
 	HealthCheck() error
+	Capabilities() (client.CapabilitiesResponse, error)
 	GetImage(string) (client.ImageState, error)
 	PullImageStream(string, client.PullImageRequest, func(client.ProgressEvent) error) error
 	StartInstanceStreamWithID(string, client.StartInstanceRequest, func(client.BootEvent) error) (client.InstanceState, error)
@@ -497,14 +500,15 @@ type vshAPI interface {
 }
 
 type commandContext struct {
-	Mode     shellMode `json:"mode"`
-	Image    string    `json:"image,omitempty"`
-	VMID     string    `json:"vm,omitempty"`
-	CWD      string    `json:"cwd,omitempty"`
-	User     string    `json:"user,omitempty"`
-	MemoryMB uint64    `json:"memory_mb,omitempty"`
-	CPUs     int       `json:"cpus,omitempty"`
-	Network  bool      `json:"network,omitempty"`
+	Mode       shellMode `json:"mode"`
+	Image      string    `json:"image,omitempty"`
+	VMID       string    `json:"vm,omitempty"`
+	CWD        string    `json:"cwd,omitempty"`
+	User       string    `json:"user,omitempty"`
+	MemoryMB   uint64    `json:"memory_mb,omitempty"`
+	CPUs       int       `json:"cpus,omitempty"`
+	Network    bool      `json:"network,omitempty"`
+	NestedVirt bool      `json:"nested_virtualization,omitempty"`
 }
 
 type atLine struct {
@@ -521,6 +525,7 @@ type commandOptions struct {
 	MemoryMB     uint64
 	CPUs         int
 	Network      *bool
+	NestedVirt   *bool
 	OptionFields []string
 }
 
@@ -569,6 +574,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	caps, _ := api.Capabilities()
 	stopLease, err := startDaemonLease(api)
 	if err != nil {
 		return err
@@ -580,7 +586,7 @@ func run() error {
 	}
 	sh := &shellState{
 		api:        api,
-		context:    defaultContext(strings.TrimSpace(*vmID), strings.TrimSpace(*image)),
+		context:    defaultContext(strings.TrimSpace(*vmID), strings.TrimSpace(*image), caps.SupportsNestedVirt),
 		hostCWD:    cwd,
 		rootCache:  rootCache,
 		imageCache: map[string]bool{},
@@ -607,12 +613,13 @@ func run() error {
 	return sh.loop(os.Stdin, os.Stdout, os.Stderr)
 }
 
-func defaultContext(vmID, image string) commandContext {
+func defaultContext(vmID, image string, nestedVirt bool) commandContext {
 	return commandContext{
-		Mode:    modeHost,
-		VMID:    firstNonEmpty(vmID, "default"),
-		Image:   image,
-		Network: true,
+		Mode:       modeHost,
+		VMID:       firstNonEmpty(vmID, "default"),
+		Image:      image,
+		Network:    true,
+		NestedVirt: nestedVirt,
 	}
 }
 
@@ -1408,10 +1415,11 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 			OwnerGID: defaultGuestGID,
 			Cache:    "strict",
 		}},
-		WorkDir:  workDir,
-		User:     guestRunUser(ctx),
-		MemoryMB: ctx.MemoryMB,
-		CPUs:     ctx.CPUs,
+		WorkDir:    workDir,
+		User:       guestRunUser(ctx),
+		MemoryMB:   ctx.MemoryMB,
+		CPUs:       ctx.CPUs,
+		NestedVirt: ctx.NestedVirt,
 	}
 	if tty {
 		req.TTY = true
@@ -1924,8 +1932,9 @@ func (s *shellState) startVM(id string, ctx commandContext) error {
 		return fmt.Errorf("vm id is required")
 	}
 	req := client.StartInstanceRequest{
-		MemoryMB: ctx.MemoryMB,
-		CPUs:     ctx.CPUs,
+		MemoryMB:   ctx.MemoryMB,
+		CPUs:       ctx.CPUs,
+		NestedVirt: ctx.NestedVirt,
 	}
 	if ctx.Network {
 		req.Network = defaultNetworkConfig()
@@ -2346,7 +2355,7 @@ func (s *shellState) help(w io.Writer) error {
 @start [--vm id]         start a blank VM
 @stop [--vm id]          stop a VM
 @forward H:G             forward host port H to guest port G
-opts: --vm id --cwd path --user user --sudo --memory-mb n --memory n[m|g] --cpus n --network --no-network
+opts: --vm id --cwd path --user user --sudo --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested
 cd <dir>                 change the current host or VM working directory
 exit                     leave vsh
 `))
@@ -2471,6 +2480,18 @@ func parseCommandOptions(tokens []shellToken, start int) (commandOptions, int, e
 			}
 			enabled := false
 			opts.Network = &enabled
+		case "--nested":
+			if hasInlineValue {
+				return opts, i, fmt.Errorf("--nested does not take a value")
+			}
+			enabled := true
+			opts.NestedVirt = &enabled
+		case "--no-nested":
+			if hasInlineValue {
+				return opts, i, fmt.Errorf("--no-nested does not take a value")
+			}
+			enabled := false
+			opts.NestedVirt = &enabled
 		default:
 			return opts, i, fmt.Errorf("unknown vsh option %q", name)
 		}
@@ -2500,6 +2521,9 @@ func (c commandContext) withOptions(opts commandOptions) commandContext {
 	}
 	if opts.Network != nil {
 		c.Network = *opts.Network
+	}
+	if opts.NestedVirt != nil {
+		c.NestedVirt = *opts.NestedVirt
 	}
 	return c
 }

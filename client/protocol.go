@@ -311,6 +311,7 @@ type CapabilitiesResponse struct {
 	ShareConsistency       []string `json:"share_consistency,omitempty"`
 	ResourceLimits         []string `json:"resource_limits,omitempty"`
 	SupportsMultiImageExec bool     `json:"supports_multi_image_exec"`
+	SupportsNestedVirt     bool     `json:"supports_nested_virtualization"`
 	RequiresPrivilegedCCX3 bool     `json:"requires_privileged_ccx3"`
 	Notes                  []string `json:"notes,omitempty"`
 }
@@ -323,6 +324,7 @@ type CreateInstanceRequest struct {
 	KernelModules  []string       `json:"kernel_modules,omitempty"`
 	MemoryMB       uint64         `json:"memory_mb,omitempty"`
 	CPUs           int            `json:"cpus,omitempty"`
+	NestedVirt     bool           `json:"nested_virtualization,omitempty"`
 	Dmesg          bool           `json:"dmesg,omitempty"`
 	TimeoutSeconds float64        `json:"timeout_seconds,omitempty"`
 }
@@ -333,6 +335,7 @@ type StartInstanceRequest struct {
 	KernelModules  []string       `json:"kernel_modules,omitempty"`
 	MemoryMB       uint64         `json:"memory_mb,omitempty"`
 	CPUs           int            `json:"cpus,omitempty"`
+	NestedVirt     bool           `json:"nested_virtualization,omitempty"`
 	Dmesg          bool           `json:"dmesg,omitempty"`
 	TimeoutSeconds float64        `json:"timeout_seconds,omitempty"`
 }
@@ -343,6 +346,7 @@ type InstanceState struct {
 	Image       string `json:"image,omitempty"`
 	MemoryMB    uint64 `json:"memory_mb,omitempty"`
 	CPUs        int    `json:"cpus,omitempty"`
+	NestedVirt  bool   `json:"nested_virtualization,omitempty"`
 	StartedAt   string `json:"started_at,omitempty"`
 	NetworkIPv4 string `json:"network_ipv4,omitempty"`
 	Error       string `json:"error,omitempty"`
@@ -366,6 +370,7 @@ type RunRequest struct {
 	Rows           int            `json:"rows,omitempty"`
 	MemoryMB       uint64         `json:"memory_mb,omitempty"`
 	CPUs           int            `json:"cpus,omitempty"`
+	NestedVirt     bool           `json:"nested_virtualization,omitempty"`
 	Dmesg          bool           `json:"dmesg,omitempty"`
 	TimeoutSeconds float64        `json:"timeout_seconds,omitempty"`
 }

@@ -122,11 +122,12 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 
 func (b *runtimeBackend) RunStream(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	inst, err := b.StartStream(ctx, client.CreateInstanceRequest{
-		Image:    req.Image,
-		Shares:   append([]client.ShareMount(nil), req.Shares...),
-		MemoryMB: req.MemoryMB,
-		CPUs:     req.CPUs,
-		Dmesg:    req.Dmesg,
+		Image:      req.Image,
+		Shares:     append([]client.ShareMount(nil), req.Shares...),
+		MemoryMB:   req.MemoryMB,
+		CPUs:       req.CPUs,
+		NestedVirt: req.NestedVirt,
+		Dmesg:      req.Dmesg,
 	}, nil)
 	if err != nil {
 		return err
@@ -272,7 +273,7 @@ func (b *runtimeBackend) RunInInstanceStream(
 	}, inputs, onEvent)
 }
 
-func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, memoryMB uint64, cpus int, dmesg bool, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
+func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, memoryMB uint64, cpus int, nestedVirt bool, dmesg bool, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
 	start := time.Now()
 	if b.kernel == nil || b.images == nil {
 		return vmruntime.RunRequest{}, fmt.Errorf("runtime backend is not configured")
@@ -342,6 +343,7 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 		Image:             image,
 		MemoryMB:          memoryMB,
 		CPUs:              cpus,
+		NestedVirt:        nestedVirt,
 		Dmesg:             dmesg,
 		Network:           network.guestInitConfig(),
 		NetDevice:         networkDeviceDarwin(network),
@@ -376,7 +378,7 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 	if len(networks) > 0 {
 		network = networks[0]
 	}
-	runReq, err := b.buildBaseRequest(ctx, req.Image, req.MemoryMB, req.CPUs, req.Dmesg, network)
+	runReq, err := b.buildBaseRequest(ctx, req.Image, req.MemoryMB, req.CPUs, req.NestedVirt, req.Dmesg, network)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
@@ -429,6 +431,7 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		RootFS:     virtio.NewImageFS(blankRuntimeRootFS(), ""),
 		MemoryMB:   req.MemoryMB,
 		CPUs:       req.CPUs,
+		NestedVirt: req.NestedVirt,
 		Dmesg:      req.Dmesg,
 		Persistent: true,
 		Network:    network.guestInitConfig(),
@@ -438,7 +441,7 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 }
 
 func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.RunRequest) (vmruntime.RunRequest, error) {
-	runReq, err := b.buildBaseRequest(ctx, req.Image, req.MemoryMB, req.CPUs, req.Dmesg, nil)
+	runReq, err := b.buildBaseRequest(ctx, req.Image, req.MemoryMB, req.CPUs, req.NestedVirt, req.Dmesg, nil)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
