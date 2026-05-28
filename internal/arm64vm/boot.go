@@ -11,6 +11,7 @@ import (
 
 type BootConfig struct {
 	MemoryMB   uint64
+	NumCPUs    int
 	GICVersion bootarm64.GICVersion
 	Dmesg      bool
 	ExtraNodes []fdt.Node
@@ -45,7 +46,7 @@ func PrepareBoot(memory []byte, kernel []byte, initrd []byte, cfg BootConfig) (*
 	return bootarm64.PrepareBoot(memory, kernel, bootarm64.BootOptions{
 		MemoryBase: MemoryBase,
 		MemorySize: MemorySizeBytes(cfg.MemoryMB),
-		NumCPUs:    1,
+		NumCPUs:    cfg.NumCPUs,
 		GICVersion: cfg.GICVersion,
 		Initrd:     initrd,
 		Console:    cfg.Dmesg,

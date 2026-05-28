@@ -21,6 +21,7 @@ type DirectoryShare struct {
 	MapOwner bool
 	OwnerUID uint32
 	OwnerGID uint32
+	Cache    string
 }
 
 // RunRequest is the backend-neutral request shape for the managed guest runtime.

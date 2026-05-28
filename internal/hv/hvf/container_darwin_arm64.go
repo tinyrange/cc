@@ -28,12 +28,97 @@ import (
 )
 
 var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
+var exitTiming = newExitTiming()
 
 func timingLog(format string, args ...any) {
 	if !debugTiming {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "ccx3 timing: "+format+"\n", args...)
+}
+
+type exitTimingStats struct {
+	mu       sync.Mutex
+	dumpOnce sync.Once
+	enabled  bool
+	buckets  map[string]*exitTimingBucket
+}
+
+type exitTimingBucket struct {
+	Count      int64 `json:"count"`
+	TotalNanos int64 `json:"total_nanos"`
+	MaxNanos   int64 `json:"max_nanos"`
+}
+
+func newExitTiming() *exitTimingStats {
+	return &exitTimingStats{
+		enabled: strings.TrimSpace(os.Getenv("CCX3_EXIT_TIMING")) != "",
+		buckets: map[string]*exitTimingBucket{},
+	}
+}
+
+func (s *exitTimingStats) Record(bucket string, start time.Time) {
+	s.RecordDuration(bucket, time.Since(start))
+}
+
+func (s *exitTimingStats) Enabled() bool {
+	return s != nil && s.enabled
+}
+
+func (s *exitTimingStats) RecordDuration(bucket string, elapsed time.Duration) {
+	if s == nil || !s.enabled || bucket == "" {
+		return
+	}
+	nanos := elapsed.Nanoseconds()
+	s.mu.Lock()
+	stat := s.buckets[bucket]
+	if stat == nil {
+		stat = &exitTimingBucket{}
+		s.buckets[bucket] = stat
+	}
+	stat.Count++
+	stat.TotalNanos += nanos
+	if nanos > stat.MaxNanos {
+		stat.MaxNanos = nanos
+	}
+	s.mu.Unlock()
+}
+
+func (s *exitTimingStats) Dump() {
+	if s == nil || !s.enabled {
+		return
+	}
+	s.dumpOnce.Do(s.dump)
+}
+
+func ExitTimingSnapshot() map[string]exitTimingBucket {
+	if exitTiming == nil {
+		return nil
+	}
+	return exitTiming.Snapshot()
+}
+
+func (s *exitTimingStats) Snapshot() map[string]exitTimingBucket {
+	if s == nil || !s.enabled {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snapshot := make(map[string]exitTimingBucket, len(s.buckets))
+	for name, stat := range s.buckets {
+		snapshot[name] = *stat
+	}
+	return snapshot
+}
+
+func (s *exitTimingStats) dump() {
+	snapshot := s.Snapshot()
+	payload, err := json.Marshal(snapshot)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ccx3 exit timing: marshal: %v\n", err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "ccx3 exit timing: %s\n", payload)
 }
 
 const (
@@ -234,7 +319,7 @@ func (s *ContainerSession) AddShare(ctx context.Context, share client.ShareMount
 	s.shareMu.Lock()
 	if existing, ok := s.shares[key]; ok {
 		s.shareMu.Unlock()
-		if existing.Source == share.Source && existing.Writable == share.Writable {
+		if existing.Source == share.Source && existing.Writable == share.Writable && existing.Cache == share.Cache {
 			return nil
 		}
 		return fmt.Errorf("share mount %q already exists", key)
@@ -247,6 +332,7 @@ func (s *ContainerSession) AddShare(ctx context.Context, share client.ShareMount
 		MapOwner: share.MapOwner,
 		OwnerUID: share.OwnerUID,
 		OwnerGID: share.OwnerGID,
+		Cache:    share.Cache,
 	})
 	if err != nil {
 		return err
@@ -311,6 +397,7 @@ func (s *ContainerSession) AddImage(ctx context.Context, mount string, image *oc
 		GuestPath: key,
 		Backend:   virtio.NewImageFS(image.RootFS, image.RootFSDir),
 		Writable:  true,
+		CacheMode: "aggressive",
 	}); err != nil {
 		return err
 	}
@@ -716,6 +803,11 @@ func (s *ContainerSession) Close() error {
 		_ = s.vsock.Close()
 	}
 	s.cancel()
+	select {
+	case <-s.closeDone:
+	case <-time.After(2 * time.Second):
+	}
+	exitTiming.Dump()
 	return nil
 }
 
@@ -750,8 +842,8 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	if len(req.Kernel) == 0 {
 		return nil, fmt.Errorf("kernel is required")
 	}
-	if req.CPUs > 1 {
-		return nil, fmt.Errorf("only 1 CPU is supported")
+	if req.CPUs <= 0 {
+		req.CPUs = 1
 	}
 
 	user := strings.TrimSpace(req.User)
@@ -787,7 +879,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	timingLog("hvf.StartContainer initramfs.Build took=%s size=%d", time.Since(start), len(initrd))
 	start = time.Now()
 
-	vm, err := NewVMWithContext(ctx)
+	vm, err := NewVMWithCPUs(ctx, req.CPUs)
 	if err != nil {
 		return nil, err
 	}
@@ -851,6 +943,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 
 	plan, err := arm64vm.PrepareBoot(mem, req.Kernel, initrd, arm64vm.BootConfig{
 		MemoryMB:   req.MemoryMB,
+		NumCPUs:    req.CPUs,
 		Dmesg:      req.Dmesg,
 		ExtraNodes: arm64vm.AppendFSNodes(appendContainerDeviceNodes(console, rng, vsock, netdev), fsdevs),
 		RecordTime: func(name string, duration time.Duration) {
@@ -972,12 +1065,16 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 
 	go func() {
 		defer close(closeDone)
-		defer vm.Close()
+		defer func() {
+			_ = vm.Close()
+			exitTiming.Dump()
+		}()
+		runner := newVMRunManager(vm)
 		for {
 			active := activeExecs.Load() > 0
 			runSlice := persistentRunSlice(guestReady.Load(), active)
 			runStart := time.Now()
-			exitInfo, err, stalled := runWithCancel(runCtx, vm, runSlice)
+			runRes, err, stalled := runner.Run(runCtx, runSlice)
 			timing.Since(ctx, "hvf.run_loop.run_with_cancel", runStart)
 			if stalled {
 				if active {
@@ -996,18 +1093,23 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 				doneCh <- sessionRunResult{err: fmt.Errorf("%w\nrun:\n%sserial:\n%s\nvirtio-fs:\n%s", err, runTrace.String(), serialOut.String(), fsTrace.String())}
 				return
 			}
-			if exitInfo == nil {
+			if runRes == nil || runRes.exit == nil {
 				doneCh <- sessionRunResult{err: fmt.Errorf("vcpu returned nil exit info")}
 				return
 			}
+			exitInfo := runRes.exit
+			vcpuIndex := runRes.index
 			if exitInfo.Reason == hvExitReasonVTimerActivated {
-				if err := injectVirtualTimerPPI(vm); err != nil {
+				start := time.Now()
+				if err := injectVirtualTimerPPI(vm, vcpuIndex); err != nil {
 					doneCh <- sessionRunResult{err: fmt.Errorf("inject virtual timer ppi: %w", err)}
 					return
 				}
+				exitTiming.Record("vtimer.inject_ppi", start)
 				continue
 			}
 			if exitInfo.Reason == hvExitReasonCanceled {
+				exitTiming.Record("cancelled", time.Now())
 				// HVF can occasionally surface a canceled run even when we did not
 				// explicitly cancel the vCPU slice. Treat it like a retry instead of
 				// tearing down the persistent guest during startup.
@@ -1019,25 +1121,29 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			}
 			switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 			case ExceptionClassDataAbortLowerEL:
-				if err := handleContainerDataAbort(ctx, vm, uart, console, rng, fsdevs, vsock, netdev, exitInfo); err != nil {
+				if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, console, rng, fsdevs, vsock, netdev, exitInfo); err != nil {
 					doneCh <- sessionRunResult{err: err}
 					return
 				}
 			case ExceptionClassSystemRegister:
-				handled, err := vm.HandleSystemInstruction(exitInfo.Exception.Syndrome)
+				start := time.Now()
+				handled, err := vm.HandleSystemInstructionForVCPU(vcpuIndex, exitInfo.Exception.Syndrome)
+				exitTiming.Record("system_register", start)
 				if err != nil {
 					doneCh <- sessionRunResult{err: err}
 					return
 				}
 				if !handled {
-					pc, _ := vm.GetProgramCounter()
+					pc, _ := vm.GetProgramCounterForVCPU(vcpuIndex)
 					info, _ := DecodeSystemInstruction(exitInfo.Exception.Syndrome)
 					doneCh <- sessionRunResult{err: fmt.Errorf("unsupported system instruction trap pc=%#x syndrome=%#x op0=%d op1=%d op2=%d crn=%d crm=%d rt=%d read=%t\nserial:\n%s\nvirtio-fs:\n%s",
 						pc, exitInfo.Exception.Syndrome, info.Op0, info.Op1, info.Op2, info.CRn, info.CRm, info.RawRt, info.Read, serialOut.String(), fsTrace.String())}
 					return
 				}
 			case ExceptionClassHVC64:
-				halt, err := handleContainerHVC(vm)
+				start := time.Now()
+				halt, err := handleContainerHVC(vm, vcpuIndex)
+				exitTiming.Record("hvc.psci", start)
 				if err != nil {
 					doneCh <- sessionRunResult{err: err}
 					return
@@ -1047,7 +1153,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 					return
 				}
 			default:
-				pc, _ := vm.GetProgramCounter()
+				pc, _ := vm.GetProgramCounterForVCPU(vcpuIndex)
 				doneCh <- sessionRunResult{err: fmt.Errorf("unexpected exception class %#x pc=%#x syndrome=%#x physical=%#x\nserial:\n%s\nvirtio-fs:\n%s",
 					DecodeExceptionClass(exitInfo.Exception.Syndrome), pc, exitInfo.Exception.Syndrome, uint64(exitInfo.Exception.PhysicalAddress), serialOut.String(), fsTrace.String())}
 				return
@@ -1096,6 +1202,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 				MapOwner: share.MapOwner,
 				OwnerUID: share.OwnerUID,
 				OwnerGID: share.OwnerGID,
+				Cache:    share.Cache,
 			}
 		}
 		return &ContainerSession{
@@ -1170,8 +1277,8 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	if len(req.Kernel) == 0 {
 		return ContainerRunResult{}, fmt.Errorf("kernel is required")
 	}
-	if req.CPUs > 1 {
-		return ContainerRunResult{}, fmt.Errorf("only 1 CPU is supported")
+	if req.CPUs <= 0 {
+		req.CPUs = 1
 	}
 	user := strings.TrimSpace(req.User)
 	if user == "" && req.Image != nil {
@@ -1227,7 +1334,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 		return ContainerRunResult{}, fmt.Errorf("build initramfs: %w", err)
 	}
 
-	vm, err := NewVM()
+	vm, err := NewVMWithCPUs(ctx, req.CPUs)
 	if err != nil {
 		return ContainerRunResult{}, err
 	}
@@ -1270,6 +1377,7 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 
 	plan, err := arm64vm.PrepareBoot(mem, req.Kernel, initrd, arm64vm.BootConfig{
 		MemoryMB:   req.MemoryMB,
+		NumCPUs:    req.CPUs,
 		Dmesg:      true,
 		ExtraNodes: arm64vm.AppendFSNodes(appendContainerDeviceNodes(console, rng, vsock, netdev), fsdevs),
 		RecordTime: func(name string, duration time.Duration) {
@@ -1304,8 +1412,9 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 	var lastSampleCPSR uint64
 	var pendingResult *ContainerRunResult
 	includeTraceOnExit := os.Getenv("CCX3_DEBUG_VIRTIOFS") != ""
+	runner := newVMRunManager(vm)
 	for {
-		exitInfo, err, stalled := runWithCancel(ctx, vm, 5*time.Second)
+		runRes, err, stalled := runner.Run(ctx, 5*time.Second)
 		if stalled {
 			pc, _ := vm.GetReg(hvRegPC)
 			cpsr, _ := vm.GetReg(hvRegCPSR)
@@ -1353,16 +1462,21 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 			return *pendingResult, nil
 		}
 
-		if exitInfo == nil {
+		if runRes == nil || runRes.exit == nil {
 			return ContainerRunResult{}, fmt.Errorf("vcpu returned nil exit info")
 		}
+		exitInfo := runRes.exit
+		vcpuIndex := runRes.index
 		if exitInfo.Reason == hvExitReasonVTimerActivated {
-			if err := injectVirtualTimerPPI(vm); err != nil {
+			start := time.Now()
+			if err := injectVirtualTimerPPI(vm, vcpuIndex); err != nil {
 				return ContainerRunResult{}, fmt.Errorf("inject virtual timer ppi: %w", err)
 			}
+			exitTiming.Record("vtimer.inject_ppi", start)
 			continue
 		}
 		if exitInfo.Reason == hvExitReasonCanceled {
+			exitTiming.Record("cancelled", time.Now())
 			continue
 		}
 		if exitInfo.Reason != hvExitReasonException {
@@ -1371,22 +1485,26 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 
 		switch DecodeExceptionClass(exitInfo.Exception.Syndrome) {
 		case ExceptionClassDataAbortLowerEL:
-			if err := handleContainerDataAbort(ctx, vm, uart, console, rng, fsdevs, vsock, netdev, exitInfo); err != nil {
+			if err := handleContainerDataAbort(ctx, vm, vcpuIndex, uart, console, rng, fsdevs, vsock, netdev, exitInfo); err != nil {
 				return ContainerRunResult{}, err
 			}
 		case ExceptionClassSystemRegister:
-			handled, err := vm.HandleSystemInstruction(exitInfo.Exception.Syndrome)
+			start := time.Now()
+			handled, err := vm.HandleSystemInstructionForVCPU(vcpuIndex, exitInfo.Exception.Syndrome)
+			exitTiming.Record("system_register", start)
 			if err != nil {
 				return ContainerRunResult{}, err
 			}
 			if !handled {
-				pc, _ := vm.GetProgramCounter()
+				pc, _ := vm.GetProgramCounterForVCPU(vcpuIndex)
 				info, _ := DecodeSystemInstruction(exitInfo.Exception.Syndrome)
 				return ContainerRunResult{}, fmt.Errorf("unsupported system instruction trap pc=%#x syndrome=%#x op0=%d op1=%d op2=%d crn=%d crm=%d rt=%d read=%t\nrun:\n%sserial:\n%s\nvirtio-fs:\n%s",
 					pc, exitInfo.Exception.Syndrome, info.Op0, info.Op1, info.Op2, info.CRn, info.CRm, info.RawRt, info.Read, runTrace.String(), serialOut.String(), fsTrace.String())
 			}
 		case ExceptionClassHVC64:
-			halt, err := handleContainerHVC(vm)
+			start := time.Now()
+			halt, err := handleContainerHVC(vm, vcpuIndex)
+			exitTiming.Record("hvc.psci", start)
 			if err != nil {
 				return ContainerRunResult{}, err
 			}
@@ -1397,71 +1515,101 @@ func runContainer(ctx context.Context, req ContainerRunRequest, readyCh chan<- e
 				return ContainerRunResult{}, fmt.Errorf("guest halted before command completed\nserial:\n%s\nconsole:\n%s\nvirtio-fs:\n%s", serialOut.String(), consoleOut.String(), fsTrace.String())
 			}
 		default:
-			pc, _ := vm.GetProgramCounter()
+			pc, _ := vm.GetProgramCounterForVCPU(vcpuIndex)
 			return ContainerRunResult{}, fmt.Errorf("unexpected exception class %#x pc=%#x syndrome=%#x physical=%#x\nrun:\n%sserial:\n%s\nvirtio-fs:\n%s",
 				DecodeExceptionClass(exitInfo.Exception.Syndrome), pc, exitInfo.Exception.Syndrome, uint64(exitInfo.Exception.PhysicalAddress), runTrace.String(), serialOut.String(), fsTrace.String())
 		}
 	}
 }
 
-func runWithCancel(ctx context.Context, vm *VM, timeout time.Duration) (*VcpuExit, error, bool) {
-	resCh := make(chan runResultVM, 1)
-	go func() {
-		exitInfo, err := vm.Run()
-		resCh <- runResultVM{exit: exitInfo, err: err}
-	}()
+type vmRunManager struct {
+	vm      *VM
+	resCh   chan runResultVM
+	mu      sync.Mutex
+	running map[int]bool
+}
+
+func newVMRunManager(vm *VM) *vmRunManager {
+	return &vmRunManager{
+		vm:      vm,
+		resCh:   make(chan runResultVM, len(vm.vcpus)*2),
+		running: make(map[int]bool),
+	}
+}
+
+func (r *vmRunManager) Run(ctx context.Context, timeout time.Duration) (*runResultVM, error, bool) {
+	r.startRunnableVCPUs()
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
 	select {
-	case res := <-resCh:
-		return res.exit, res.err, false
+	case res := <-r.resCh:
+		r.markStopped(res.index)
+		return &res, res.err, false
 	case <-ctx.Done():
-		if err := vm.CancelRun(); err != nil {
+		if err := r.vm.CancelRun(); err != nil {
 			return nil, err, false
-		}
-		res := <-resCh
-		if res.err != nil {
-			return nil, res.err, false
 		}
 		return nil, ctx.Err(), false
 	case <-timer.C:
-		if err := vm.CancelRun(); err != nil {
+		if err := r.vm.CancelRun(); err != nil {
 			return nil, err, false
-		}
-		res := <-resCh
-		if res.err != nil {
-			return nil, res.err, false
-		}
-		if res.exit == nil {
-			return nil, fmt.Errorf("cancelled run returned nil exit"), false
-		}
-		if res.exit.Reason != hvExitReasonCanceled {
-			return res.exit, nil, false
 		}
 		return nil, nil, true
 	}
 }
 
-type runResultVM struct {
-	exit *VcpuExit
-	err  error
+func (r *vmRunManager) startRunnableVCPUs() {
+	for _, index := range r.vm.activeVCPUIndexes() {
+		r.mu.Lock()
+		if r.running[index] {
+			r.mu.Unlock()
+			continue
+		}
+		r.running[index] = true
+		r.mu.Unlock()
+		go func(index int) {
+			exitInfo, err := r.vm.RunVCPU(index)
+			r.resCh <- runResultVM{index: index, exit: exitInfo, err: err}
+		}(index)
+	}
 }
 
-func handleContainerDataAbort(ctx context.Context, vm *VM, uart *serial.UART8250, console *virtio.Console, rng *virtio.RNG, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, exitInfo *VcpuExit) error {
-	totalStart := time.Now()
-	defer timing.Since(ctx, "hvf.data_abort.total", totalStart)
+func (r *vmRunManager) markStopped(index int) {
+	r.mu.Lock()
+	delete(r.running, index)
+	r.mu.Unlock()
+}
+
+type runResultVM struct {
+	index int
+	exit  *VcpuExit
+	err   error
+}
+
+func handleContainerDataAbort(ctx context.Context, vm *VM, vcpuIndex int, uart *serial.UART8250, console *virtio.Console, rng *virtio.RNG, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, exitInfo *VcpuExit) error {
+	recorder := timing.FromContext(ctx)
+	if recorder != nil {
+		totalStart := time.Now()
+		defer recorder.Record("hvf.data_abort.total", time.Since(totalStart))
+	}
 	info, err := DecodeDataAbort(exitInfo.Exception.Syndrome)
 	if err != nil {
 		return err
 	}
 	addr := uint64(exitInfo.Exception.PhysicalAddress)
+	fsdev := findFSDevice(fsdevs, addr, info.SizeBytes)
+	exitTimingEnabled := exitTiming.Enabled()
 
 	switch {
 	case uart != nil && uart.Contains(addr, info.SizeBytes):
 		if info.Write {
-			value, err := readAbortValue(vm, info)
+			if exitTimingEnabled {
+				start := time.Now()
+				defer exitTiming.Record("data_abort.uart.write", start)
+			}
+			value, err := readAbortValue(vm, vcpuIndex, info)
 			if err != nil {
 				return err
 			}
@@ -1469,17 +1617,25 @@ func handleContainerDataAbort(ctx context.Context, vm *VM, uart *serial.UART8250
 				return err
 			}
 		} else {
+			if exitTimingEnabled {
+				start := time.Now()
+				defer exitTiming.Record("data_abort.uart.read", start)
+			}
 			value, err := uart.ReadValue(addr, info.SizeBytes)
 			if err != nil {
 				return err
 			}
-			if err := writeAbortValue(vm, info, value); err != nil {
+			if err := writeAbortValue(vm, vcpuIndex, info, value); err != nil {
 				return err
 			}
 		}
 	case console != nil && console.Contains(addr, info.SizeBytes):
 		if info.Write {
-			value, err := readAbortValue(vm, info)
+			if exitTimingEnabled {
+				start := time.Now()
+				defer exitTiming.Record("data_abort.virtio_console.write", start)
+			}
+			value, err := readAbortValue(vm, vcpuIndex, info)
 			if err != nil {
 				return err
 			}
@@ -1487,17 +1643,25 @@ func handleContainerDataAbort(ctx context.Context, vm *VM, uart *serial.UART8250
 				return err
 			}
 		} else {
+			if exitTimingEnabled {
+				start := time.Now()
+				defer exitTiming.Record("data_abort.virtio_console.read", start)
+			}
 			value, err := console.Read(addr, info.SizeBytes)
 			if err != nil {
 				return err
 			}
-			if err := writeAbortValue(vm, info, value); err != nil {
+			if err := writeAbortValue(vm, vcpuIndex, info, value); err != nil {
 				return err
 			}
 		}
 	case rng != nil && rng.Contains(addr, info.SizeBytes):
 		if info.Write {
-			value, err := readAbortValue(vm, info)
+			if exitTimingEnabled {
+				start := time.Now()
+				defer exitTiming.Record("data_abort.virtio_rng.write", start)
+			}
+			value, err := readAbortValue(vm, vcpuIndex, info)
 			if err != nil {
 				return err
 			}
@@ -1505,23 +1669,44 @@ func handleContainerDataAbort(ctx context.Context, vm *VM, uart *serial.UART8250
 				return err
 			}
 		} else {
+			if exitTimingEnabled {
+				start := time.Now()
+				defer exitTiming.Record("data_abort.virtio_rng.read", start)
+			}
 			value, err := rng.Read(addr, info.SizeBytes)
 			if err != nil {
 				return err
 			}
-			if err := writeAbortValue(vm, info, value); err != nil {
+			if err := writeAbortValue(vm, vcpuIndex, info, value); err != nil {
 				return err
 			}
 		}
-	case hasFSDevice(fsdevs, addr, info.SizeBytes):
-		start := time.Now()
-		if err := handleFSDataAbort(vm, fsdevs, addr, info); err != nil {
+	case fsdev != nil:
+		var fsStart time.Time
+		if recorder != nil {
+			fsStart = time.Now()
+		}
+		if exitTimingEnabled {
+			start := time.Now()
+			if info.Write {
+				defer exitTiming.Record("data_abort.virtiofs.write", start)
+			} else {
+				defer exitTiming.Record("data_abort.virtiofs.read", start)
+			}
+		}
+		if err := handleFSDataAbort(vm, vcpuIndex, fsdev, addr, info); err != nil {
 			return err
 		}
-		timing.Since(ctx, "hvf.data_abort.virtio_fs", start)
+		if recorder != nil {
+			recorder.Record("hvf.data_abort.virtio_fs", time.Since(fsStart))
+		}
 	case vsock != nil && vsock.Contains(addr, info.SizeBytes):
 		if info.Write {
-			value, err := readAbortValue(vm, info)
+			if exitTimingEnabled {
+				start := time.Now()
+				defer exitTiming.Record("data_abort.virtio_vsock.write", start)
+			}
+			value, err := readAbortValue(vm, vcpuIndex, info)
 			if err != nil {
 				return err
 			}
@@ -1529,17 +1714,25 @@ func handleContainerDataAbort(ctx context.Context, vm *VM, uart *serial.UART8250
 				return err
 			}
 		} else {
+			if exitTimingEnabled {
+				start := time.Now()
+				defer exitTiming.Record("data_abort.virtio_vsock.read", start)
+			}
 			value, err := vsock.Read(addr, info.SizeBytes)
 			if err != nil {
 				return err
 			}
-			if err := writeAbortValue(vm, info, value); err != nil {
+			if err := writeAbortValue(vm, vcpuIndex, info, value); err != nil {
 				return err
 			}
 		}
 	case netdev != nil && netdev.Contains(addr, info.SizeBytes):
 		if info.Write {
-			value, err := readAbortValue(vm, info)
+			if exitTimingEnabled {
+				start := time.Now()
+				defer exitTiming.Record("data_abort.virtio_net.write", start)
+			}
+			value, err := readAbortValue(vm, vcpuIndex, info)
 			if err != nil {
 				return err
 			}
@@ -1547,21 +1740,33 @@ func handleContainerDataAbort(ctx context.Context, vm *VM, uart *serial.UART8250
 				return err
 			}
 		} else {
+			if exitTimingEnabled {
+				start := time.Now()
+				defer exitTiming.Record("data_abort.virtio_net.read", start)
+			}
 			value, err := netdev.Read(addr, info.SizeBytes)
 			if err != nil {
 				return err
 			}
-			if err := writeAbortValue(vm, info, value); err != nil {
+			if err := writeAbortValue(vm, vcpuIndex, info, value); err != nil {
 				return err
 			}
 		}
 	case mmioInRange(addr, arm64vm.GICDistributorMin, arm64vm.GICDistributorMax) || mmioInRange(addr, arm64vm.GICRedistributorMin, arm64vm.GICRedistributorMax):
-		value, err := handleGICAccess(vm, addr, info)
+		if exitTimingEnabled {
+			start := time.Now()
+			if info.Write {
+				defer exitTiming.Record("data_abort.gic.write", start)
+			} else {
+				defer exitTiming.Record("data_abort.gic.read", start)
+			}
+		}
+		value, err := handleGICAccess(vm, vcpuIndex, addr, info)
 		if err != nil {
 			return err
 		}
 		if !info.Write {
-			if err := writeAbortValue(vm, info, value); err != nil {
+			if err := writeAbortValue(vm, vcpuIndex, info, value); err != nil {
 				return err
 			}
 		}
@@ -1569,52 +1774,53 @@ func handleContainerDataAbort(ctx context.Context, vm *VM, uart *serial.UART8250
 		return fmt.Errorf("unhandled MMIO access addr=%#x size=%d write=%v", addr, info.SizeBytes, info.Write)
 	}
 
-	return vm.AdvanceProgramCounter()
+	return vm.AdvanceProgramCounterForVCPU(vcpuIndex)
 }
 
 func attachFSDeviceTiming(ctx context.Context, fsdevs []*virtio.FS) {
+	recorder := timing.FromContext(ctx)
+	if recorder == nil && !exitTiming.Enabled() {
+		return
+	}
 	for _, fsdev := range fsdevs {
 		if fsdev == nil {
 			continue
 		}
 		fsdev.RecordTiming = func(name string, duration time.Duration) {
-			timing.Record(ctx, name, duration)
+			if recorder != nil {
+				recorder.Record(name, duration)
+			}
+			exitTiming.RecordDuration(name, duration)
 		}
 	}
 }
 
-func hasFSDevice(fsdevs []*virtio.FS, addr uint64, size int) bool {
+func findFSDevice(fsdevs []*virtio.FS, addr uint64, size int) *virtio.FS {
 	for _, fsdev := range fsdevs {
 		if fsdev != nil && fsdev.Contains(addr, size) {
-			return true
+			return fsdev
 		}
 	}
-	return false
+	return nil
 }
 
-func handleFSDataAbort(vm *VM, fsdevs []*virtio.FS, addr uint64, info DataAbortInfo) error {
-	for _, fsdev := range fsdevs {
-		if fsdev == nil || !fsdev.Contains(addr, info.SizeBytes) {
-			continue
-		}
-		if info.Write {
-			value, err := readAbortValue(vm, info)
-			if err != nil {
-				return err
-			}
-			return fsdev.Write(addr, info.SizeBytes, value)
-		}
-		value, err := fsdev.Read(addr, info.SizeBytes)
+func handleFSDataAbort(vm *VM, vcpuIndex int, fsdev *virtio.FS, addr uint64, info DataAbortInfo) error {
+	if info.Write {
+		value, err := readAbortValue(vm, vcpuIndex, info)
 		if err != nil {
 			return err
 		}
-		return writeAbortValue(vm, info, value)
+		return fsdev.Write(addr, info.SizeBytes, value)
 	}
-	return fmt.Errorf("unhandled virtio-fs access addr=%#x size=%d", addr, info.SizeBytes)
+	value, err := fsdev.Read(addr, info.SizeBytes)
+	if err != nil {
+		return err
+	}
+	return writeAbortValue(vm, vcpuIndex, info, value)
 }
 
-func handleContainerHVC(vm *VM) (bool, error) {
-	x0, err := vm.GetReg(hvRegX0)
+func handleContainerHVC(vm *VM, vcpuIndex int) (bool, error) {
+	x0, err := vm.GetRegForVCPU(vcpuIndex, hvRegX0)
 	if err != nil {
 		return false, err
 	}
@@ -1625,6 +1831,8 @@ func handleContainerHVC(vm *VM) (bool, error) {
 		psciCpuOff          = 0x84000002
 		psciCpuOn           = 0x84000003
 		psciAffinityInfo    = 0x84000004
+		psciCpuOn64         = 0xc4000003
+		psciAffinityInfo64  = 0xc4000004
 		psciMigrateInfoType = 0x84000006
 		psciSystemOff       = 0x84000008
 		psciSystemReset     = 0x84000009
@@ -1632,7 +1840,9 @@ func handleContainerHVC(vm *VM) (bool, error) {
 		psciSuccess         = 0
 		psciNotSupported    = 0xffffffff
 		psciInvalidParams   = 0xfffffffe
+		psciAlreadyOn       = 0xfffffffc
 		psciTosNotPresent   = 2
+		psciAffinityOff     = 1
 	)
 
 	var ret uint64
@@ -1647,24 +1857,53 @@ func handleContainerHVC(vm *VM) (bool, error) {
 		ret = psciNotSupported
 	case psciCpuOff:
 		ret = psciSuccess
-	case psciAffinityInfo:
-		ret = psciInvalidParams
-	case psciCpuOn:
-		ret = psciInvalidParams
+	case psciAffinityInfo, psciAffinityInfo64:
+		target, err := vm.GetRegForVCPU(vcpuIndex, hvRegX1)
+		if err != nil {
+			return false, err
+		}
+		on, err := vm.IsVCPUOnMPIDR(target)
+		if err != nil {
+			ret = psciInvalidParams
+		} else if on {
+			ret = psciSuccess
+		} else {
+			ret = psciAffinityOff
+		}
+	case psciCpuOn, psciCpuOn64:
+		target, err := vm.GetRegForVCPU(vcpuIndex, hvRegX1)
+		if err != nil {
+			return false, err
+		}
+		entry, err := vm.GetRegForVCPU(vcpuIndex, hvRegX2)
+		if err != nil {
+			return false, err
+		}
+		contextID, err := vm.GetRegForVCPU(vcpuIndex, hvRegX3)
+		if err != nil {
+			return false, err
+		}
+		if on, err := vm.IsVCPUOnMPIDR(target); err == nil && on {
+			ret = psciAlreadyOn
+		} else if err := vm.StartVCPUByMPIDR(target, entry, contextID); err != nil {
+			ret = psciInvalidParams
+		} else {
+			ret = psciSuccess
+		}
 	case psciSystemOff, psciSystemReset:
 		return true, nil
 	default:
 		return false, fmt.Errorf("unsupported PSCI call %#x", x0)
 	}
 
-	return false, vm.SetReg(hvRegX0, ret)
+	return false, vm.SetRegForVCPU(vcpuIndex, hvRegX0, ret)
 }
 
-func readAbortValue(vm *VM, info DataAbortInfo) (uint64, error) {
+func readAbortValue(vm *VM, vcpuIndex int, info DataAbortInfo) (uint64, error) {
 	if info.Target == hvRegXZR {
 		return 0, nil
 	}
-	value, err := vm.GetReg(info.Target)
+	value, err := vm.GetRegForVCPU(vcpuIndex, info.Target)
 	if err != nil {
 		return 0, err
 	}
@@ -1674,24 +1913,24 @@ func readAbortValue(vm *VM, info DataAbortInfo) (uint64, error) {
 	return value & ((uint64(1) << (8 * info.SizeBytes)) - 1), nil
 }
 
-func writeAbortValue(vm *VM, info DataAbortInfo, value uint64) error {
+func writeAbortValue(vm *VM, vcpuIndex int, info DataAbortInfo, value uint64) error {
 	if info.Target == hvRegXZR {
 		return nil
 	}
 	if info.SizeBytes < 8 {
 		value &= (uint64(1) << (8 * info.SizeBytes)) - 1
 	}
-	return vm.SetReg(info.Target, value)
+	return vm.SetRegForVCPU(vcpuIndex, info.Target, value)
 }
 
 func mmioInRange(addr, start, end uint64) bool {
 	return addr >= start && addr < end
 }
 
-func handleGICAccess(vm *VM, addr uint64, info DataAbortInfo) (uint64, error) {
+func handleGICAccess(vm *VM, vcpuIndex int, addr uint64, info DataAbortInfo) (uint64, error) {
 	var value uint64
 	if info.Write {
-		v, err := readAbortValue(vm, info)
+		v, err := readAbortValue(vm, vcpuIndex, info)
 		if err != nil {
 			return 0, err
 		}
@@ -1714,15 +1953,17 @@ func handleGICAccess(vm *VM, addr uint64, info DataAbortInfo) (uint64, error) {
 		}
 		return val, err
 	case mmioInRange(addr, arm64vm.GICRedistributorMin, arm64vm.GICRedistributorMax):
-		reg := GICRedistributorReg(addr - arm64vm.GICRedistributorMin)
+		const redistStride = 0x20000
+		redistIndex := int((addr - arm64vm.GICRedistributorMin) / redistStride)
+		reg := GICRedistributorReg((addr - arm64vm.GICRedistributorMin) % redistStride)
 		if info.Write {
-			err := vm.SetGICRedistributorReg(reg, value)
+			err := vm.SetGICRedistributorRegForVCPU(redistIndex, reg, value)
 			if err != nil && (strings.Contains(err.Error(), "denied") || strings.Contains(err.Error(), "bad argument")) {
 				return 0, nil
 			}
 			return 0, err
 		}
-		val, err := vm.GetGICRedistributorReg(reg)
+		val, err := vm.GetGICRedistributorRegForVCPU(redistIndex, reg)
 		if err != nil && (strings.Contains(err.Error(), "denied") || strings.Contains(err.Error(), "bad argument")) {
 			switch reg {
 			case 0x0:
@@ -1743,28 +1984,28 @@ func handleGICAccess(vm *VM, addr uint64, info DataAbortInfo) (uint64, error) {
 	}
 }
 
-func injectVirtualTimerPPI(vm *VM) error {
+func injectVirtualTimerPPI(vm *VM, vcpuIndex int) error {
 	const (
 		gicrISENABLER0 = GICRedistributorReg(0x10100)
 		gicrISPENDR0   = GICRedistributorReg(0x10200)
 		timerMask      = uint64(1) << arm64VirtualTimerPPI
 	)
 
-	enabled, err := vm.GetGICRedistributorReg(gicrISENABLER0)
+	enabled, err := vm.GetGICRedistributorRegForVCPU(vcpuIndex, gicrISENABLER0)
 	if err == nil && enabled&timerMask == 0 {
-		if err := vm.SetGICRedistributorReg(gicrISENABLER0, enabled|timerMask); err != nil {
+		if err := vm.SetGICRedistributorRegForVCPU(vcpuIndex, gicrISENABLER0, enabled|timerMask); err != nil {
 			return err
 		}
 	}
 
-	pending, err := vm.GetGICRedistributorReg(gicrISPENDR0)
+	pending, err := vm.GetGICRedistributorRegForVCPU(vcpuIndex, gicrISPENDR0)
 	if err != nil {
 		return err
 	}
 	if pending&timerMask != 0 {
 		return nil
 	}
-	return vm.SetGICRedistributorReg(gicrISPENDR0, timerMask)
+	return vm.SetGICRedistributorRegForVCPU(vcpuIndex, gicrISPENDR0, timerMask)
 }
 
 func commandTranscript(dmesg bool, serialOut, consoleOut fmt.Stringer) string {

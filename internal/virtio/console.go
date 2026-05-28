@@ -93,6 +93,16 @@ type queue struct {
 	usedAddr     uint64
 	lastAvailIdx uint16
 	usedIdx      uint16
+	noNotify     bool
+	descMem      []byte
+	availMem     []byte
+	usedMem      []byte
+}
+
+func (q *queue) clearCache() {
+	q.descMem = nil
+	q.availMem = nil
+	q.usedMem = nil
 }
 
 type descriptor struct {

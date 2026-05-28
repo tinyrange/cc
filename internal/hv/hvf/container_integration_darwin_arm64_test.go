@@ -441,6 +441,72 @@ func TestRunAlpineUname(t *testing.T) {
 	}
 }
 
+func TestRunAlpineSMPNproc(t *testing.T) {
+	if os.Getenv("CCX3_RUN_ALPINE") == "" {
+		t.Skip("set CCX3_RUN_ALPINE=1 to run the live alpine container boot test")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), liveTestTimeout())
+	defer cancel()
+
+	root := t.TempDir()
+	kernel := alpine.NewManager(filepath.Join(root, "kernel"))
+	if err := kernel.Ensure(ctx); err != nil {
+		t.Fatalf("kernel.Ensure() error = %v", err)
+	}
+	kernelBytes, err := kernel.ReadKernel()
+	if err != nil {
+		t.Fatalf("kernel.ReadKernel() error = %v", err)
+	}
+	modules, err := kernel.PlanModuleLoad(
+		[]string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS"},
+		map[string]string{
+			"CONFIG_VIRTIO_MMIO": "kernel/drivers/virtio/virtio_mmio.ko.gz",
+			"CONFIG_FUSE_FS":     "kernel/fs/fuse/fuse.ko.gz",
+			"CONFIG_VIRTIO_FS":   "kernel/fs/fuse/virtiofs.ko.gz",
+		},
+	)
+	if err != nil {
+		t.Fatalf("kernel.PlanModuleLoad() error = %v", err)
+	}
+	store := oci.NewStore(filepath.Join(root, "images"))
+	if _, err := store.Pull(ctx, "alpine", "alpine:latest"); err != nil {
+		t.Fatalf("store.Pull() error = %v", err)
+	}
+	image, err := store.Open("alpine")
+	if err != nil {
+		t.Fatalf("store.Open() error = %v", err)
+	}
+	initBin, err := guestinit.Build(ctx, filepath.Join(root, "guestinit"))
+	if err != nil {
+		t.Fatalf("guestinit.Build() error = %v", err)
+	}
+
+	for _, cpus := range []int{2, 4, 8} {
+		t.Run(fmt.Sprintf("%dcpus", cpus), func(t *testing.T) {
+			online := fmt.Sprintf("0-%d", cpus-1)
+			result, err := RunContainer(ctx, ContainerRunRequest{
+				Kernel:  kernelBytes,
+				Init:    initBin,
+				Modules: modules,
+				Image:   image,
+				Command: []string{"sh", "-c", "nproc && cat /sys/devices/system/cpu/online"},
+				CPUs:    cpus,
+				Dmesg:   true,
+			})
+			if err != nil {
+				t.Fatalf("RunContainer() error = %v\ntranscript:\n%s", err, result.Transcript)
+			}
+			if result.ExitCode != 0 {
+				t.Fatalf("RunContainer().ExitCode = %d, want 0\ntranscript:\n%s", result.ExitCode, result.Transcript)
+			}
+			if !strings.Contains(result.Output, fmt.Sprintf("%d", cpus)) || !strings.Contains(result.Output, online) {
+				t.Fatalf("guest did not report %d CPUs\noutput:\n%s\ntranscript:\n%s", cpus, result.Output, result.Transcript)
+			}
+		})
+	}
+}
+
 func TestRunAlpineShowsLoadedVirtioFSModules(t *testing.T) {
 	if os.Getenv("CCX3_RUN_ALPINE") == "" {
 		t.Skip("set CCX3_RUN_ALPINE=1 to run the live alpine container boot test")

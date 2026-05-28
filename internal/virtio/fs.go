@@ -228,6 +228,16 @@ type fsWritebackCacheBackend interface {
 	SetWritebackCache(enabled bool)
 }
 
+type fsCachePolicyBackend interface {
+	CachePolicy(nodeID uint64) FSCachePolicy
+}
+
+type FSCachePolicy struct {
+	Mode     string
+	EntryTTL time.Duration
+	AttrTTL  time.Duration
+}
+
 type FuseAttr struct {
 	Ino       uint64
 	Size      uint64
@@ -257,6 +267,11 @@ type FS struct {
 	RecordTiming   func(name string, duration time.Duration)
 	cacheMode      string
 	writebackCache bool
+	directMemory   bool
+	kickPoll       bool
+	kickPollIdle   time.Duration
+	kickPollSleep  time.Duration
+	kickPollActive bool
 	workerCount    int
 	entryTTL       time.Duration
 	attrTTL        time.Duration
@@ -279,6 +294,10 @@ type FS struct {
 	mmioReads        uint64
 	mmioWrites       uint64
 	queueNotifies    []uint64
+	kickPollLoops    uint64
+	kickPollHits     uint64
+	kickPollMisses   uint64
+	kickPollWorks    uint64
 	fuseRequests     atomic.Uint64
 	interruptRaises  uint64
 	irqTransitions   uint64
@@ -288,6 +307,10 @@ type FS struct {
 	completions      map[fsCompletionKey]fsCompletion
 	fuseOpStats      [fuseStatsSlots]fuseOpStat
 	stageStats       [fsStageCount]timingStat
+	scratch16        [16]byte
+	scratch8         [8]byte
+	scratch4         [4]byte
+	scratch2         [2]byte
 }
 
 const fuseStatsSlots = 64
@@ -308,6 +331,7 @@ type fsWork struct {
 	seq               uint64
 	generation        uint32
 	unique            uint64
+	opcode            uint32
 	req               []byte
 	pooledReq         bool
 	suppressInterrupt bool
@@ -348,6 +372,10 @@ type FSStats struct {
 	MMIOReads       uint64        `json:"mmio_reads"`
 	MMIOWrites      uint64        `json:"mmio_writes"`
 	QueueNotifies   []uint64      `json:"queue_notifies"`
+	KickPollLoops   uint64        `json:"kick_poll_loops"`
+	KickPollHits    uint64        `json:"kick_poll_hits"`
+	KickPollMisses  uint64        `json:"kick_poll_misses"`
+	KickPollWorks   uint64        `json:"kick_poll_works"`
 	FUSERequests    uint64        `json:"fuse_requests"`
 	InterruptRaises uint64        `json:"interrupt_raises"`
 	IRQTransitions  uint64        `json:"irq_transitions"`
@@ -355,6 +383,9 @@ type FSStats struct {
 	InterruptStatus uint32        `json:"interrupt_status"`
 	QueueReady      []bool        `json:"queue_ready"`
 	QueueLastAvail  []uint16      `json:"queue_last_avail"`
+	QueueAvailIdx   []uint16      `json:"queue_avail_idx"`
+	QueueUsedIdx    []uint16      `json:"queue_used_idx"`
+	QueueNoNotify   []bool        `json:"queue_no_notify"`
 	FUSEOps         []FUSEOpStats `json:"fuse_ops"`
 	Stages          []TimingStats `json:"stages"`
 }
@@ -394,6 +425,10 @@ type fsDesc struct {
 	write  bool
 }
 
+type guestMemorySlicer interface {
+	SliceIPA(addr uint64, size int) ([]byte, error)
+}
+
 func NewFS(base, size uint64, irq uint32, tag string, backend FSBackend) *FS {
 	cacheMode, entryTTL, attrTTL := resolveFSCachePolicy()
 	fs := &FS{
@@ -404,6 +439,10 @@ func NewFS(base, size uint64, irq uint32, tag string, backend FSBackend) *FS {
 		Async:          resolveVirtioFSAsync(),
 		cacheMode:      cacheMode,
 		writebackCache: strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_WRITEBACK")) != "",
+		directMemory:   resolveVirtioFSDirectMemory(),
+		kickPoll:       resolveVirtioFSKickPoll(),
+		kickPollIdle:   resolveVirtioFSKickPollDuration("CCX3_VIRTIOFS_KICK_POLL_IDLE", 500*time.Microsecond),
+		kickPollSleep:  resolveVirtioFSKickPollDuration("CCX3_VIRTIOFS_KICK_POLL_SLEEP", 5*time.Microsecond),
 		workerCount:    resolveVirtioFSWorkerCount(),
 		entryTTL:       entryTTL,
 		attrTTL:        attrTTL,
@@ -420,6 +459,40 @@ func NewFS(base, size uint64, irq uint32, tag string, backend FSBackend) *FS {
 	copy(fs.tag[:], []byte(tag))
 	fs.resetLocked()
 	return fs
+}
+
+func resolveVirtioFSKickPoll() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_KICK_POLL"))) {
+	case "1", "true", "yes", "on":
+		return true
+	case "", "0", "false", "no", "off":
+		return false
+	default:
+		return false
+	}
+}
+
+func resolveVirtioFSKickPollDuration(name string, fallback time.Duration) time.Duration {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed < 0 {
+		return fallback
+	}
+	return parsed
+}
+
+func resolveVirtioFSDirectMemory() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_DIRECT_MEMORY"))) {
+	case "", "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
 }
 
 func resolveVirtioFSAsync() bool {
@@ -464,6 +537,27 @@ func resolveFSCachePolicy() (string, time.Duration, time.Duration) {
 	}
 }
 
+func cachePolicyForMode(mode string) FSCachePolicy {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case fsCacheStrict:
+		return FSCachePolicy{Mode: fsCacheStrict}
+	case fsCacheAggressive:
+		return FSCachePolicy{Mode: fsCacheAggressive, EntryTTL: 60 * time.Second, AttrTTL: 60 * time.Second}
+	default:
+		return FSCachePolicy{Mode: fsCacheNormal}
+	}
+}
+
+func (f *FS) cachePolicy(nodeID uint64) FSCachePolicy {
+	if be, ok := f.backend.(fsCachePolicyBackend); ok {
+		policy := be.CachePolicy(nodeID)
+		if policy.Mode != "" {
+			return policy
+		}
+	}
+	return FSCachePolicy{Mode: f.cacheMode, EntryTTL: f.entryTTL, AttrTTL: f.attrTTL}
+}
+
 func (f *FS) Attach(mem GuestMemory, irq IRQController) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -504,7 +598,11 @@ func (f *FS) Read(addr uint64, size int) (uint64, error) {
 		return truncateValue(mmioVendorID, size), nil
 	case regDeviceFeatures:
 		if f.deviceFeatureSel == 0 {
-			return truncateValue(featureRingEventIdx, size), nil
+			features := uint64(0)
+			if !f.kickPoll {
+				features |= featureRingEventIdx
+			}
+			return truncateValue(features, size), nil
 		}
 		if f.deviceFeatureSel == 1 {
 			return truncateValue(1, size), nil
@@ -526,10 +624,14 @@ func (f *FS) Read(addr uint64, size int) (uint64, error) {
 		}
 		return 0, nil
 	case regInterruptStatus:
-		f.logf("mmio-read interrupt-status size=%d value=%#x", size, f.interruptStatus)
+		if f.Log != nil {
+			f.logf("mmio-read interrupt-status size=%d value=%#x", size, f.interruptStatus)
+		}
 		return truncateValue(uint64(f.interruptStatus), size), nil
 	case regStatus:
-		f.logf("mmio-read status size=%d value=%#x", size, f.status)
+		if f.Log != nil {
+			f.logf("mmio-read status size=%d value=%#x", size, f.status)
+		}
 		return truncateValue(uint64(f.status), size), nil
 	case regConfigGen:
 		return truncateValue(uint64(f.configGeneration), size), nil
@@ -546,9 +648,11 @@ func (f *FS) Write(addr uint64, size int, value uint64) error {
 	f.mmioWrites++
 
 	offset := addr - f.Base
-	switch offset {
-	case regQueueSel, regQueueNum, regQueueReady, regQueueNotify, regInterruptAck, regStatus:
-		f.logf("mmio-write off=%#x size=%d value=%#x", offset, size, value)
+	if f.Log != nil {
+		switch offset {
+		case regQueueSel, regQueueNum, regQueueReady, regInterruptAck, regStatus:
+			f.logf("mmio-write off=%#x size=%d value=%#x", offset, size, value)
+		}
 	}
 	switch offset {
 	case regDeviceFeatSel:
@@ -566,6 +670,7 @@ func (f *FS) Write(addr uint64, size int, value uint64) error {
 	case regQueueNum:
 		if q := f.selectedQueueLocked(); q != nil {
 			q.size = uint16(value)
+			q.clearCache()
 		}
 	case regQueueReady:
 		if q := f.selectedQueueLocked(); q != nil {
@@ -573,7 +678,13 @@ func (f *FS) Write(addr uint64, size int, value uint64) error {
 			if value == 0 {
 				q.lastAvailIdx = 0
 				q.usedIdx = 0
+				q.noNotify = false
+				q.clearCache()
 			} else if f.driverFeatures&featureRingEventIdx != 0 {
+				if err := f.ensureQueueCacheLocked(q); err != nil {
+					f.mu.Unlock()
+					return err
+				}
 				if err := f.writeAvailEventLocked(q); err != nil {
 					f.mu.Unlock()
 					return err
@@ -583,29 +694,37 @@ func (f *FS) Write(addr uint64, size int, value uint64) error {
 	case regQueueDescLow:
 		if q := f.selectedQueueLocked(); q != nil {
 			f.setQueueAddr(&q.descAddr, uint32(value), true)
+			q.clearCache()
 		}
 	case regQueueDescHigh:
 		if q := f.selectedQueueLocked(); q != nil {
 			f.setQueueAddr(&q.descAddr, uint32(value), false)
+			q.clearCache()
 		}
 	case regQueueAvailLow:
 		if q := f.selectedQueueLocked(); q != nil {
 			f.setQueueAddr(&q.availAddr, uint32(value), true)
+			q.clearCache()
 		}
 	case regQueueAvailHigh:
 		if q := f.selectedQueueLocked(); q != nil {
 			f.setQueueAddr(&q.availAddr, uint32(value), false)
+			q.clearCache()
 		}
 	case regQueueUsedLow:
 		if q := f.selectedQueueLocked(); q != nil {
 			f.setQueueAddr(&q.usedAddr, uint32(value), true)
+			q.clearCache()
 		}
 	case regQueueUsedHigh:
 		if q := f.selectedQueueLocked(); q != nil {
 			f.setQueueAddr(&q.usedAddr, uint32(value), false)
+			q.clearCache()
 		}
 	case regInterruptAck:
-		f.logf("interrupt-ack value=%#x", value)
+		if f.Log != nil {
+			f.logf("interrupt-ack value=%#x", value)
+		}
 		f.interruptStatus &^= uint32(value)
 		err := f.updateIRQLocked()
 		f.mu.Unlock()
@@ -619,11 +738,19 @@ func (f *FS) Write(addr uint64, size int, value uint64) error {
 		if int(value) < len(f.queues) {
 			f.queueNotifies[int(value)]++
 			harvestStart := time.Now()
-			works, err := f.processQueueAsyncLocked(int(value))
+			var workScratch [16]fsWork
+			works, err := f.processQueueAsyncLocked(int(value), workScratch[:0])
 			f.recordStageDuration(fsStageQueueHarvest, time.Since(harvestStart))
 			if err != nil {
 				f.mu.Unlock()
 				return err
+			}
+			if f.Async && f.kickPoll && f.driverFeatures&featureRingEventIdx == 0 {
+				if err := f.setRequestQueueNoNotifyLocked(true); err != nil {
+					f.mu.Unlock()
+					return err
+				}
+				f.startKickPollerLocked()
 			}
 			f.mu.Unlock()
 			if f.Async {
@@ -643,22 +770,21 @@ func (f *FS) processQueueLocked(qidx int) error {
 		return nil
 	}
 
-	var header [4]byte
-	if err := f.readIPAInto(q.availAddr, header[:]); err != nil {
+	availFlags, availIdx, err := f.readAvailHeaderLocked(q)
+	if err != nil {
 		return err
 	}
-	availFlags := binary.LittleEndian.Uint16(header[0:2])
-	availIdx := binary.LittleEndian.Uint16(header[2:4])
 	oldUsedIdx := q.usedIdx
 	interruptNeeded := false
 	for q.lastAvailIdx != availIdx {
 		slot := q.lastAvailIdx % q.size
-		var entry [2]byte
-		if err := f.readIPAInto(q.availAddr+4+uint64(slot)*2, entry[:]); err != nil {
+		head, err := f.readAvailRingEntryLocked(q, slot)
+		if err != nil {
 			return err
 		}
-		head := binary.LittleEndian.Uint16(entry[:])
-		f.logf("queue-notify q=%d head=%d", qidx, head)
+		if f.Log != nil {
+			f.logf("queue-notify q=%d head=%d", qidx, head)
+		}
 		usedLen, reply, err := f.handleRequestLocked(q, head)
 		if err != nil {
 			return err
@@ -667,7 +793,9 @@ func (f *FS) processQueueLocked(qidx int) error {
 			if err := f.writeUsedLocked(q, head, usedLen); err != nil {
 				return err
 			}
-			f.logf("used-ring q=%d head=%d len=%d", qidx, head, usedLen)
+			if f.Log != nil {
+				f.logf("used-ring q=%d head=%d len=%d", qidx, head, usedLen)
+			}
 			interruptNeeded = true
 		}
 		q.lastAvailIdx++
@@ -680,33 +808,34 @@ func (f *FS) processQueueLocked(qidx int) error {
 	if interruptNeeded && f.isCompletingQueue(qidx) && f.shouldInterruptLocked(q, oldUsedIdx, q.usedIdx, availFlags) {
 		f.interruptStatus |= fsInterruptVring
 		f.interruptRaises++
-		f.logf("interrupt-raise status=%#x", f.interruptStatus)
+		if f.Log != nil {
+			f.logf("interrupt-raise status=%#x", f.interruptStatus)
+		}
 		return f.updateIRQLocked()
 	}
 	return nil
 }
 
-func (f *FS) processQueueAsyncLocked(qidx int) ([]fsWork, error) {
+func (f *FS) processQueueAsyncLocked(qidx int, works []fsWork) ([]fsWork, error) {
 	q := &f.queues[qidx]
 	if !q.ready || q.size == 0 || f.mem == nil {
 		return nil, nil
 	}
 
-	var header [4]byte
-	if err := f.readIPAInto(q.availAddr, header[:]); err != nil {
+	availFlags, availIdx, err := f.readAvailHeaderLocked(q)
+	if err != nil {
 		return nil, err
 	}
-	suppressInterrupt := binary.LittleEndian.Uint16(header[0:2])&1 != 0
-	availIdx := binary.LittleEndian.Uint16(header[2:4])
-	var works []fsWork
+	suppressInterrupt := availFlags&1 != 0
 	for q.lastAvailIdx != availIdx {
 		slot := q.lastAvailIdx % q.size
-		var entry [2]byte
-		if err := f.readIPAInto(q.availAddr+4+uint64(slot)*2, entry[:]); err != nil {
+		head, err := f.readAvailRingEntryLocked(q, slot)
+		if err != nil {
 			return nil, err
 		}
-		head := binary.LittleEndian.Uint16(entry[:])
-		f.logf("queue-notify q=%d head=%d", qidx, head)
+		if f.Log != nil {
+			f.logf("queue-notify q=%d head=%d", qidx, head)
+		}
 		work, err := f.prepareRequestLocked(qidx, q, head, suppressInterrupt)
 		if err != nil {
 			return nil, err
@@ -784,6 +913,10 @@ func (f *FS) handleRequestLocked(q *queue, head uint16) (uint32, bool, error) {
 }
 
 func (f *FS) prepareRequestLocked(qidx int, q *queue, head uint16, suppressInterrupt bool) (fsWork, error) {
+	var prepareStart time.Time
+	if f.RecordTiming != nil {
+		prepareStart = time.Now()
+	}
 	seq := f.nextWorkSeq[qidx]
 	f.nextWorkSeq[qidx]++
 	work := fsWork{qidx: qidx, head: head, seq: seq, generation: f.configGeneration, suppressInterrupt: suppressInterrupt}
@@ -823,6 +956,7 @@ func (f *FS) prepareRequestLocked(qidx int, q *queue, head uint16, suppressInter
 		reqOff += int(d.length)
 	}
 	if len(req) >= 16 {
+		work.opcode = binary.LittleEndian.Uint32(req[4:8])
 		work.unique = binary.LittleEndian.Uint64(req[8:16])
 	}
 	work.req = req
@@ -832,6 +966,9 @@ func (f *FS) prepareRequestLocked(qidx int, q *queue, head uint16, suppressInter
 		copy(work.respDescs[:], respDescs)
 	} else {
 		work.respExtra = append([]fsDesc(nil), respDescs...)
+	}
+	if !prepareStart.IsZero() {
+		f.recordOpcodeTiming("prepare", work.opcode, time.Since(prepareStart))
 	}
 	return work, nil
 }
@@ -843,6 +980,70 @@ func (f *FS) enqueueWorks(works []fsWork) {
 	f.workerOnce.Do(f.startWorkers)
 	for _, work := range works {
 		f.workCh <- work
+	}
+}
+
+func (f *FS) startKickPollerLocked() {
+	if f.kickPollActive {
+		return
+	}
+	f.kickPollActive = true
+	generation := f.configGeneration
+	go f.runKickPoller(generation)
+}
+
+func (f *FS) runKickPoller(generation uint32) {
+	idleUntil := time.Now().Add(f.kickPollIdle)
+	for {
+		var allWorks []fsWork
+		processed := 0
+		stop := false
+
+		f.mu.Lock()
+		if generation != f.configGeneration || !f.kickPoll {
+			f.kickPollActive = false
+			f.mu.Unlock()
+			return
+		}
+		f.kickPollLoops++
+		for qidx := fsQueueRequest; qidx < fsQueueRequest+fsRequestQueueCount && qidx < len(f.queues); qidx++ {
+			var workScratch [16]fsWork
+			works, err := f.processQueueAsyncLocked(qidx, workScratch[:0])
+			if err != nil {
+				f.logf("kick-poll q=%d: %v", qidx, err)
+				continue
+			}
+			if len(works) == 0 {
+				continue
+			}
+			processed += len(works)
+			allWorks = append(allWorks, works...)
+		}
+		if processed != 0 {
+			f.kickPollHits++
+			f.kickPollWorks += uint64(processed)
+			idleUntil = time.Now().Add(f.kickPollIdle)
+		} else if !time.Now().Before(idleUntil) {
+			f.kickPollMisses++
+			if err := f.setRequestQueueNoNotifyLocked(false); err != nil {
+				f.logf("kick-poll clear no-notify: %v", err)
+			}
+			f.kickPollActive = false
+			stop = true
+		} else {
+			f.kickPollMisses++
+		}
+		f.mu.Unlock()
+
+		f.enqueueWorks(allWorks)
+		if stop {
+			return
+		}
+		if processed == 0 && f.kickPollSleep > 0 {
+			time.Sleep(f.kickPollSleep)
+		} else {
+			runtime.Gosched()
+		}
 	}
 }
 
@@ -956,7 +1157,9 @@ func (f *FS) completeWorksInline(completions []fsInlineCompletion) error {
 		if shouldInterrupt {
 			f.interruptStatus |= fsInterruptVring
 			f.interruptRaises++
-			f.logf("interrupt-raise status=%#x", f.interruptStatus)
+			if f.Log != nil {
+				f.logf("interrupt-raise status=%#x", f.interruptStatus)
+			}
 			if err := f.updateIRQLocked(); err != nil {
 				return err
 			}
@@ -999,20 +1202,31 @@ func (f *FS) writeCompletionLocked(q *queue, work fsWork, reply fsReply) error {
 		}
 		f.interruptStatus |= fsInterruptVring
 		f.interruptRaises++
-		f.logf("interrupt-raise status=%#x", f.interruptStatus)
+		if f.Log != nil {
+			f.logf("interrupt-raise status=%#x", f.interruptStatus)
+		}
 		return f.updateIRQLocked()
 	}
 	return nil
 }
 
 func (f *FS) writeCompletionUsedLocked(q *queue, work fsWork, reply fsReply) error {
+	var completeStart time.Time
+	if f.RecordTiming != nil {
+		completeStart = time.Now()
+	}
 	if err := f.writeReplyToResponseDescsLocked(work, reply); err != nil {
 		return err
 	}
 	if err := f.writeUsedLocked(q, work.head, uint32(reply.Len())); err != nil {
 		return err
 	}
-	f.logf("used-ring q=%d head=%d len=%d", work.qidx, work.head, reply.Len())
+	if f.Log != nil {
+		f.logf("used-ring q=%d head=%d len=%d", work.qidx, work.head, reply.Len())
+	}
+	if !completeStart.IsZero() {
+		f.recordOpcodeTiming("complete", work.opcode, time.Since(completeStart))
+	}
 	return nil
 }
 
@@ -1020,9 +1234,8 @@ func (f *FS) writeReplyToResponseDescsLocked(work fsWork, reply fsReply) error {
 	if !reply.ok {
 		return nil
 	}
-	var header [fuseOutHeaderSize]byte
-	reply.EncodeHeader(header[:])
-	segments := [2][]byte{header[:], reply.extra}
+	reply.EncodeHeader(f.scratch16[:])
+	segments := [2][]byte{f.scratch16[:], reply.extra}
 	descIndex := 0
 	descOffset := uint32(0)
 	written := 0
@@ -1042,7 +1255,7 @@ func (f *FS) writeReplyToResponseDescsLocked(work fsWork, reply fsReply) error {
 			if chunk > space {
 				chunk = space
 			}
-			if err := f.mem.WriteIPA(desc.addr+uint64(descOffset), segment[:chunk]); err != nil {
+			if err := f.writeIPAFrom(desc.addr+uint64(descOffset), segment[:chunk]); err != nil {
 				return err
 			}
 			segment = segment[chunk:]
@@ -1083,7 +1296,10 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 	callerGID := binary.LittleEndian.Uint32(req[28:32])
 	opStart := time.Now()
 	defer f.recordFUSEDispatchTiming(opcode, opStart)
-	f.logf("opcode=%d unique=%d node=%d", opcode, unique, nodeID)
+	logEnabled := f.Log != nil
+	if logEnabled {
+		f.logf("opcode=%d unique=%d node=%d", opcode, unique, nodeID)
+	}
 
 	reply := func(errno int32, extra []byte) fsReply {
 		return fuseReply(unique, errno, extra)
@@ -1139,16 +1355,20 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		binary.LittleEndian.PutUint32(extra[20:24], maxWrite)
 		binary.LittleEndian.PutUint32(extra[24:28], 1)
 		binary.LittleEndian.PutUint16(extra[28:30], uint16(maxPages))
-		f.logf("init-reply major=%d minor=%d max_write=%d", replyMajor, replyMinor, maxWrite)
+		if logEnabled {
+			f.logf("init-reply major=%d minor=%d max_write=%d", replyMajor, replyMinor, maxWrite)
+		}
 		return reply(0, extra), nil
 	case fuseGetAttr:
-		f.logPathf("getattr", nodeID, "")
+		if logEnabled {
+			f.logPathf("getattr", nodeID, "")
+		}
 		attr, errno := f.backend.GetAttr(nodeID)
 		if errno != 0 {
 			return reply(errno, nil), nil
 		}
 		extra := make([]byte, fuseAttrOutSize)
-		encodeFuseAttrTTL(extra[0:16], f.attrTTL)
+		encodeFuseAttrTTL(extra[0:16], f.cachePolicy(nodeID).AttrTTL)
 		encodeFuseAttr(extra[16:], attr)
 		return reply(0, extra), nil
 	case fuseSetAttr:
@@ -1169,19 +1389,23 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 				return reply(errno, nil), nil
 			}
 			extra := make([]byte, fuseAttrOutSize)
-			encodeFuseAttrTTL(extra[0:16], f.attrTTL)
+			encodeFuseAttrTTL(extra[0:16], f.cachePolicy(nodeID).AttrTTL)
 			encodeFuseAttr(extra[16:], attr)
 			return reply(0, extra), nil
 		}
 		return reply(-linuxENOSYS, nil), nil
 	case fuseLookup:
 		name := readCStringName(req[fuseInHeaderSize:])
-		f.logPathf("lookup-parent", nodeID, fmt.Sprintf(" name=%q", name))
+		if logEnabled {
+			f.logPathf("lookup-parent", nodeID, fmt.Sprintf(" name=%q", name))
+		}
 		childID, attr, errno := f.backend.Lookup(nodeID, path.Clean(name))
 		if errno != 0 {
 			return reply(errno, nil), nil
 		}
-		f.logPathf("lookup-child", childID, "")
+		if logEnabled {
+			f.logPathf("lookup-child", childID, "")
+		}
 		extra := make([]byte, fuseEntryOutSize)
 		f.encodeFuseEntryOut(extra, childID)
 		encodeFuseAttr(extra[40:], attr)
@@ -1192,7 +1416,9 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		}
 		name := readCStringName(req[fuseInHeaderSize+8:])
 		mode := binary.LittleEndian.Uint32(req[40:44])
-		f.logPathf("mkdir-parent", nodeID, fmt.Sprintf(" name=%q mode=%#o", name, mode))
+		if logEnabled {
+			f.logPathf("mkdir-parent", nodeID, fmt.Sprintf(" name=%q mode=%#o", name, mode))
+		}
 		if be, ok := f.backend.(fsMkdirBackend); ok {
 			childID, attr, errno := be.Mkdir(nodeID, path.Clean(name), mode, callerUID, callerGID)
 			if errno != 0 {
@@ -1211,7 +1437,9 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		name := readCStringName(req[fuseInHeaderSize+16:])
 		mode := binary.LittleEndian.Uint32(req[40:44])
 		rdev := binary.LittleEndian.Uint32(req[44:48])
-		f.logPathf("mknod-parent", nodeID, fmt.Sprintf(" name=%q mode=%#o rdev=%#x", name, mode, rdev))
+		if logEnabled {
+			f.logPathf("mknod-parent", nodeID, fmt.Sprintf(" name=%q mode=%#o rdev=%#x", name, mode, rdev))
+		}
 		if be, ok := f.backend.(fsMknodBackend); ok {
 			childID, attr, errno := be.Mknod(nodeID, path.Clean(name), mode, rdev, callerUID, callerGID)
 			if errno != 0 {
@@ -1228,7 +1456,9 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		if !ok {
 			return fsReply{}, fmt.Errorf("virtio-fs SYMLINK malformed payload")
 		}
-		f.logPathf("symlink-parent", nodeID, fmt.Sprintf(" name=%q target=%q", name, target))
+		if logEnabled {
+			f.logPathf("symlink-parent", nodeID, fmt.Sprintf(" name=%q target=%q", name, target))
+		}
 		if be, ok := f.backend.(fsSymlinkBackend); ok {
 			childID, attr, errno := be.Symlink(nodeID, path.Clean(name), target, callerUID, callerGID)
 			if errno != 0 {
@@ -1251,14 +1481,16 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 			return fsReply{}, fmt.Errorf("virtio-fs OPEN too short")
 		}
 		flags := binary.LittleEndian.Uint32(req[40:44])
-		f.logPathf("open", nodeID, fmt.Sprintf(" flags=%#x", flags))
+		if logEnabled {
+			f.logPathf("open", nodeID, fmt.Sprintf(" flags=%#x", flags))
+		}
 		fh, errno := f.backend.Open(nodeID, flags)
 		if errno != 0 {
 			return reply(errno, nil), nil
 		}
 		extra := make([]byte, fuseOpenOutSize)
 		binary.LittleEndian.PutUint64(extra[0:8], fh)
-		binary.LittleEndian.PutUint32(extra[8:12], f.openResponseFlags(flags, false))
+		binary.LittleEndian.PutUint32(extra[8:12], f.openResponseFlags(nodeID, flags, false))
 		return reply(0, extra), nil
 	case fuseRead:
 		if len(req) < fuseInHeaderSize+24 {
@@ -1267,7 +1499,9 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		off := binary.LittleEndian.Uint64(req[48:56])
 		size := binary.LittleEndian.Uint32(req[56:60])
-		f.logPathf("read", nodeID, fmt.Sprintf(" fh=%d off=%d size=%d", fh, off, size))
+		if logEnabled {
+			f.logPathf("read", nodeID, fmt.Sprintf(" fh=%d off=%d size=%d", fh, off, size))
+		}
 		data, errno := f.backend.Read(nodeID, fh, off, size)
 		if errno != 0 {
 			return reply(errno, nil), nil
@@ -1299,7 +1533,9 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		if len(req) < fuseInHeaderSize+24 {
 			return fsReply{}, fmt.Errorf("virtio-fs RELEASE too short")
 		}
-		f.logPathf("release", nodeID, fmt.Sprintf(" fh=%d", binary.LittleEndian.Uint64(req[40:48])))
+		if logEnabled {
+			f.logPathf("release", nodeID, fmt.Sprintf(" fh=%d", binary.LittleEndian.Uint64(req[40:48])))
+		}
 		f.backend.Release(nodeID, binary.LittleEndian.Uint64(req[40:48]))
 		return reply(0, nil), nil
 	case fuseFsync:
@@ -1308,7 +1544,9 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		flags := binary.LittleEndian.Uint32(req[48:52])
-		f.logPathf("fsync", nodeID, fmt.Sprintf(" fh=%d flags=%#x", fh, flags))
+		if logEnabled {
+			f.logPathf("fsync", nodeID, fmt.Sprintf(" fh=%d flags=%#x", fh, flags))
+		}
 		if be, ok := f.backend.(fsFsyncBackend); ok {
 			return reply(be.Fsync(nodeID, fh, flags), nil), nil
 		}
@@ -1321,14 +1559,16 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 			return fsReply{}, fmt.Errorf("virtio-fs OPENDIR too short")
 		}
 		flags := binary.LittleEndian.Uint32(req[40:44])
-		f.logPathf("opendir", nodeID, fmt.Sprintf(" flags=%#x", flags))
+		if logEnabled {
+			f.logPathf("opendir", nodeID, fmt.Sprintf(" flags=%#x", flags))
+		}
 		fh, errno := f.backend.OpenDir(nodeID, flags)
 		if errno != 0 {
 			return reply(errno, nil), nil
 		}
 		extra := make([]byte, fuseOpenOutSize)
 		binary.LittleEndian.PutUint64(extra[0:8], fh)
-		binary.LittleEndian.PutUint32(extra[8:12], f.openResponseFlags(flags, true))
+		binary.LittleEndian.PutUint32(extra[8:12], f.openResponseFlags(nodeID, flags, true))
 		return reply(0, extra), nil
 	case fuseReadDir:
 		if len(req) < fuseInHeaderSize+24 {
@@ -1337,7 +1577,9 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		off := binary.LittleEndian.Uint64(req[48:56])
 		size := binary.LittleEndian.Uint32(req[56:60])
-		f.logPathf("readdir", nodeID, fmt.Sprintf(" fh=%d off=%d size=%d", fh, off, size))
+		if logEnabled {
+			f.logPathf("readdir", nodeID, fmt.Sprintf(" fh=%d off=%d size=%d", fh, off, size))
+		}
 		data, errno := f.backend.ReadDir(nodeID, fh, off, size)
 		if errno != 0 {
 			return reply(errno, nil), nil
@@ -1347,7 +1589,9 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		if len(req) < fuseInHeaderSize+24 {
 			return fsReply{}, fmt.Errorf("virtio-fs RELEASEDIR too short")
 		}
-		f.logPathf("releasedir", nodeID, fmt.Sprintf(" fh=%d", binary.LittleEndian.Uint64(req[40:48])))
+		if logEnabled {
+			f.logPathf("releasedir", nodeID, fmt.Sprintf(" fh=%d", binary.LittleEndian.Uint64(req[40:48])))
+		}
 		f.backend.ReleaseDir(nodeID, binary.LittleEndian.Uint64(req[40:48]))
 		return reply(0, nil), nil
 	case fuseFsyncDir:
@@ -1356,7 +1600,9 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		flags := binary.LittleEndian.Uint32(req[48:52])
-		f.logPathf("fsyncdir", nodeID, fmt.Sprintf(" fh=%d flags=%#x", fh, flags))
+		if logEnabled {
+			f.logPathf("fsyncdir", nodeID, fmt.Sprintf(" fh=%d flags=%#x", fh, flags))
+		}
 		if be, ok := f.backend.(fsFsyncDirBackend); ok {
 			return reply(be.FsyncDir(nodeID, fh, flags), nil), nil
 		}
@@ -1369,7 +1615,9 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 			return fsReply{}, fmt.Errorf("virtio-fs GETLK too short")
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
-		f.logPathf("getlk", nodeID, fmt.Sprintf(" fh=%d", fh))
+		if logEnabled {
+			f.logPathf("getlk", nodeID, fmt.Sprintf(" fh=%d", fh))
+		}
 		extra := make([]byte, fuseLKOutSize)
 		binary.LittleEndian.PutUint32(extra[16:20], linuxFUnlck)
 		return reply(0, extra), nil
@@ -1379,11 +1627,15 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		lockType := binary.LittleEndian.Uint32(req[72:76])
-		f.logPathf(strings.ToLower(fuseOpcodeName(opcode)), nodeID, fmt.Sprintf(" fh=%d type=%d", fh, lockType))
+		if logEnabled {
+			f.logPathf(strings.ToLower(fuseOpcodeName(opcode)), nodeID, fmt.Sprintf(" fh=%d type=%d", fh, lockType))
+		}
 		return reply(0, nil), nil
 	case fuseRmDir:
 		name := readCStringName(req[fuseInHeaderSize:])
-		f.logPathf("rmdir-parent", nodeID, fmt.Sprintf(" name=%q", name))
+		if logEnabled {
+			f.logPathf("rmdir-parent", nodeID, fmt.Sprintf(" name=%q", name))
+		}
 		if be, ok := f.backend.(fsRmDirBackend); ok {
 			errno := be.RmDir(nodeID, path.Clean(name))
 			return reply(errno, nil), nil
@@ -1441,7 +1693,9 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		}
 		return reply(-linuxENOSYS, nil), nil
 	case fuseReadlink:
-		f.logPathf("readlink", nodeID, "")
+		if logEnabled {
+			f.logPathf("readlink", nodeID, "")
+		}
 		target, errno := f.backend.Readlink(nodeID)
 		if errno != 0 {
 			return reply(errno, nil), nil
@@ -1453,7 +1707,9 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		}
 		size := binary.LittleEndian.Uint32(req[40:44])
 		name := readCStringName(req[fuseInHeaderSize+8:])
-		f.logPathf("getxattr", nodeID, fmt.Sprintf(" name=%q size=%d", name, size))
+		if logEnabled {
+			f.logPathf("getxattr", nodeID, fmt.Sprintf(" name=%q size=%d", name, size))
+		}
 		if be, ok := f.backend.(fsXattrBackend); ok {
 			value, errno := be.GetXattr(nodeID, name)
 			if errno != 0 {
@@ -1477,7 +1733,9 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		if len(req) < fuseInHeaderSize+8 {
 			return fsReply{}, fmt.Errorf("virtio-fs LISTXATTR too short")
 		}
-		f.logPathf("listxattr", nodeID, "")
+		if logEnabled {
+			f.logPathf("listxattr", nodeID, "")
+		}
 		if be, ok := f.backend.(fsXattrBackend); ok {
 			value, errno := be.ListXattr(nodeID)
 			if errno != 0 {
@@ -1504,7 +1762,9 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		}
 		fh := binary.LittleEndian.Uint64(req[40:48])
 		lockOwner := binary.LittleEndian.Uint64(req[56:64])
-		f.logPathf("flush", nodeID, fmt.Sprintf(" fh=%d lockOwner=%d", fh, lockOwner))
+		if logEnabled {
+			f.logPathf("flush", nodeID, fmt.Sprintf(" fh=%d lockOwner=%d", fh, lockOwner))
+		}
 		if be, ok := f.backend.(fsFlushBackend); ok {
 			return reply(be.Flush(nodeID, fh, lockOwner), nil), nil
 		}
@@ -1527,7 +1787,9 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 			fh := binary.LittleEndian.Uint64(req[40:48])
 			offset := binary.LittleEndian.Uint64(req[48:56])
 			whence := binary.LittleEndian.Uint32(req[56:60])
-			f.logPathf("lseek", nodeID, fmt.Sprintf(" fh=%d off=%d whence=%d", fh, offset, whence))
+			if logEnabled {
+				f.logPathf("lseek", nodeID, fmt.Sprintf(" fh=%d off=%d whence=%d", fh, offset, whence))
+			}
 			newOff, errno := be.Lseek(nodeID, fh, offset, whence)
 			if errno != 0 {
 				return reply(errno, nil), nil
@@ -1559,24 +1821,30 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		if len(req) < fuseInHeaderSize+24 {
 			return fsReply{}, fmt.Errorf("virtio-fs STATX too short")
 		}
-		f.logPathf("statx", nodeID, fmt.Sprintf(" mask=%#x", binary.LittleEndian.Uint32(req[60:64])))
+		if logEnabled {
+			f.logPathf("statx", nodeID, fmt.Sprintf(" mask=%#x", binary.LittleEndian.Uint32(req[60:64])))
+		}
 		attr, errno := f.backend.GetAttr(nodeID)
 		if errno != 0 {
 			return reply(errno, nil), nil
 		}
 		extra := make([]byte, fuseStatxOutSize)
-		encodeFuseAttrTTL(extra[0:16], f.attrTTL)
+		encodeFuseAttrTTL(extra[0:16], f.cachePolicy(nodeID).AttrTTL)
 		encodeFuseStatx(extra[32:], attr)
 		return reply(0, extra), nil
 	case fuseSyncFS:
 		return reply(0, nil), nil
 	case fuseTmpfile:
-		f.logPathf("tmpfile", nodeID, "")
+		if logEnabled {
+			f.logPathf("tmpfile", nodeID, "")
+		}
 		return reply(-linuxENOSYS, nil), nil
 	case fuseDestroy:
 		return reply(0, nil), nil
 	case fuseIoctl:
-		f.logPathf("ioctl", nodeID, "")
+		if logEnabled {
+			f.logPathf("ioctl", nodeID, "")
+		}
 		return reply(-linuxENOTTY, nil), nil
 	case fuseCreate:
 		if len(req) < fuseInHeaderSize+16 {
@@ -1594,7 +1862,7 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 			f.encodeFuseEntryOut(extra[:fuseEntryOutSize], childID)
 			encodeFuseAttr(extra[40:], attr)
 			binary.LittleEndian.PutUint64(extra[fuseEntryOutSize:fuseEntryOutSize+8], fh)
-			binary.LittleEndian.PutUint32(extra[fuseEntryOutSize+8:fuseEntryOutSize+12], f.openResponseFlags(flags, false))
+			binary.LittleEndian.PutUint32(extra[fuseEntryOutSize+8:fuseEntryOutSize+12], f.openResponseFlags(childID, flags, false))
 			return reply(0, extra), nil
 		}
 		return reply(-linuxENOSYS, nil), nil
@@ -1698,6 +1966,10 @@ func (f *FS) recordFUSEDispatchTiming(opcode uint32, start time.Time) {
 	if opcode < uint32(len(f.fuseOpStats)) {
 		recordTimingStat(&f.fuseOpStats[opcode].timingStat, duration)
 	}
+	f.recordOpcodeTiming("fuse", opcode, duration)
+}
+
+func (f *FS) recordOpcodeTiming(stage string, opcode uint32, duration time.Duration) {
 	if f.RecordTiming == nil {
 		return
 	}
@@ -1705,7 +1977,7 @@ func (f *FS) recordFUSEDispatchTiming(opcode uint32, start time.Time) {
 	if tag == "" {
 		tag = "unknown"
 	}
-	f.RecordTiming("virtio.fs."+tag+".fuse."+fuseOpcodeMetricName(opcode), duration)
+	f.RecordTiming("virtio.fs."+tag+"."+stage+"."+fuseOpcodeMetricName(opcode), duration)
 }
 
 func (f *FS) recordStageTiming(stage int, start time.Time) {
@@ -1789,10 +2061,11 @@ func (r fsReply) Bytes() []byte {
 }
 
 func (f *FS) encodeFuseEntryOut(dst []byte, nodeID uint64) {
+	policy := f.cachePolicy(nodeID)
 	binary.LittleEndian.PutUint64(dst[0:8], nodeID)
 	binary.LittleEndian.PutUint64(dst[8:16], 1)
-	encodeFuseTTL(dst[16:24], dst[32:36], f.entryTTL)
-	encodeFuseTTL(dst[24:32], dst[36:40], f.attrTTL)
+	encodeFuseTTL(dst[16:24], dst[32:36], policy.EntryTTL)
+	encodeFuseTTL(dst[24:32], dst[36:40], policy.AttrTTL)
 }
 
 func encodeFuseAttrTTL(dst []byte, ttl time.Duration) {
@@ -1809,9 +2082,10 @@ func encodeFuseTTL(secDst []byte, nsecDst []byte, ttl time.Duration) {
 	binary.LittleEndian.PutUint32(nsecDst, uint32(nsec))
 }
 
-func (f *FS) openResponseFlags(openFlags uint32, dir bool) uint32 {
+func (f *FS) openResponseFlags(nodeID uint64, openFlags uint32, dir bool) uint32 {
+	policy := f.cachePolicy(nodeID)
 	flags := uint32(fuseOpenNoFlush)
-	if f.cacheMode == fsCacheStrict {
+	if policy.Mode == fsCacheStrict {
 		return flags
 	}
 	if dir {
@@ -1869,21 +2143,96 @@ func (f *FS) readIPAInto(addr uint64, dst []byte) error {
 	return nil
 }
 
+func (f *FS) writeIPAFrom(addr uint64, src []byte) error {
+	if len(src) == 0 {
+		return nil
+	}
+	return f.mem.WriteIPA(addr, src)
+}
+
+func (f *FS) ensureQueueCacheLocked(q *queue) error {
+	if q.size == 0 || q.descAddr == 0 || q.availAddr == 0 || q.usedAddr == 0 {
+		return nil
+	}
+	if q.descMem != nil && q.availMem != nil && q.usedMem != nil {
+		return nil
+	}
+	if !f.directMemory {
+		return nil
+	}
+	slicer, ok := f.mem.(guestMemorySlicer)
+	if !ok {
+		return nil
+	}
+	descLen := int(q.size) * 16
+	availLen := 4 + int(q.size)*2 + 2
+	usedLen := 4 + int(q.size)*8 + 2
+	descMem, err := slicer.SliceIPA(q.descAddr, descLen)
+	if err != nil {
+		return err
+	}
+	availMem, err := slicer.SliceIPA(q.availAddr, availLen)
+	if err != nil {
+		return err
+	}
+	usedMem, err := slicer.SliceIPA(q.usedAddr, usedLen)
+	if err != nil {
+		return err
+	}
+	q.descMem = descMem
+	q.availMem = availMem
+	q.usedMem = usedMem
+	return nil
+}
+
+func (f *FS) readAvailHeaderLocked(q *queue) (flags uint16, idx uint16, err error) {
+	if err := f.ensureQueueCacheLocked(q); err != nil {
+		return 0, 0, err
+	}
+	if len(q.availMem) >= 4 {
+		return binary.LittleEndian.Uint16(q.availMem[0:2]), binary.LittleEndian.Uint16(q.availMem[2:4]), nil
+	}
+	if err := f.readIPAInto(q.availAddr, f.scratch4[:]); err != nil {
+		return 0, 0, err
+	}
+	return binary.LittleEndian.Uint16(f.scratch4[0:2]), binary.LittleEndian.Uint16(f.scratch4[2:4]), nil
+}
+
+func (f *FS) readAvailRingEntryLocked(q *queue, slot uint16) (uint16, error) {
+	offset := 4 + int(slot)*2
+	if len(q.availMem) >= offset+2 {
+		return binary.LittleEndian.Uint16(q.availMem[offset : offset+2]), nil
+	}
+	if err := f.readIPAInto(q.availAddr+uint64(offset), f.scratch2[:]); err != nil {
+		return 0, err
+	}
+	return binary.LittleEndian.Uint16(f.scratch2[:]), nil
+}
+
 func (f *FS) readDescriptorChainLocked(q *queue, head uint16, out []fsDesc) ([]fsDesc, error) {
+	if err := f.ensureQueueCacheLocked(q); err != nil {
+		return nil, err
+	}
 	index := head
 	for i := uint16(0); i < q.size; i++ {
 		if index >= q.size {
 			return nil, fmt.Errorf("virtio-fs descriptor index %d out of range", index)
 		}
-		var buf [16]byte
-		if err := f.readIPAInto(q.descAddr+uint64(index)*16, buf[:]); err != nil {
-			return nil, err
+		var raw []byte
+		offset := int(index) * 16
+		if len(q.descMem) >= offset+16 {
+			raw = q.descMem[offset : offset+16]
+		} else {
+			if err := f.readIPAInto(q.descAddr+uint64(offset), f.scratch16[:]); err != nil {
+				return nil, err
+			}
+			raw = f.scratch16[:]
 		}
 		desc := fsDesc{
-			addr:   binary.LittleEndian.Uint64(buf[0:8]),
-			length: binary.LittleEndian.Uint32(buf[8:12]),
-			flags:  binary.LittleEndian.Uint16(buf[12:14]),
-			next:   binary.LittleEndian.Uint16(buf[14:16]),
+			addr:   binary.LittleEndian.Uint64(raw[0:8]),
+			length: binary.LittleEndian.Uint32(raw[8:12]),
+			flags:  binary.LittleEndian.Uint16(raw[12:14]),
+			next:   binary.LittleEndian.Uint16(raw[14:16]),
 		}
 		desc.write = desc.flags&descFWrite != 0
 		out = append(out, desc)
@@ -1897,16 +2246,27 @@ func (f *FS) readDescriptorChainLocked(q *queue, head uint16, out []fsDesc) ([]f
 
 func (f *FS) writeUsedLocked(q *queue, head uint16, usedLen uint32) error {
 	slot := q.usedIdx % q.size
-	var elem [8]byte
-	binary.LittleEndian.PutUint32(elem[0:4], uint32(head))
-	binary.LittleEndian.PutUint32(elem[4:8], usedLen)
-	if err := f.mem.WriteIPA(q.usedAddr+4+uint64(slot)*8, elem[:]); err != nil {
+	if err := f.ensureQueueCacheLocked(q); err != nil {
 		return err
 	}
+	offset := 4 + int(slot)*8
+	if len(q.usedMem) >= offset+8 {
+		binary.LittleEndian.PutUint32(q.usedMem[offset:offset+4], uint32(head))
+		binary.LittleEndian.PutUint32(q.usedMem[offset+4:offset+8], usedLen)
+	} else {
+		binary.LittleEndian.PutUint32(f.scratch8[0:4], uint32(head))
+		binary.LittleEndian.PutUint32(f.scratch8[4:8], usedLen)
+		if err := f.writeIPAFrom(q.usedAddr+4+uint64(slot)*8, f.scratch8[:]); err != nil {
+			return err
+		}
+	}
 	q.usedIdx++
-	var idx [2]byte
-	binary.LittleEndian.PutUint16(idx[:], q.usedIdx)
-	return f.mem.WriteIPA(q.usedAddr+2, idx[:])
+	if len(q.usedMem) >= 4 {
+		binary.LittleEndian.PutUint16(q.usedMem[2:4], q.usedIdx)
+		return nil
+	}
+	binary.LittleEndian.PutUint16(f.scratch2[:], q.usedIdx)
+	return f.writeIPAFrom(q.usedAddr+2, f.scratch2[:])
 }
 
 func (f *FS) shouldInterruptLocked(q *queue, oldUsedIdx, newUsedIdx, availFlags uint16) bool {
@@ -1916,22 +2276,71 @@ func (f *FS) shouldInterruptLocked(q *queue, oldUsedIdx, newUsedIdx, availFlags 
 	if f.driverFeatures&featureRingEventIdx == 0 {
 		return availFlags&1 == 0
 	}
-	var buf [2]byte
-	if err := f.readIPAInto(q.availAddr+4+uint64(q.size)*2, buf[:]); err != nil {
-		f.logf("used-event-read-error: %v", err)
+	offset := 4 + int(q.size)*2
+	if len(q.availMem) >= offset+2 {
+		usedEvent := binary.LittleEndian.Uint16(q.availMem[offset : offset+2])
+		return vringNeedEvent(usedEvent, newUsedIdx, oldUsedIdx)
+	}
+	if err := f.readIPAInto(q.availAddr+uint64(offset), f.scratch2[:]); err != nil {
+		if f.Log != nil {
+			f.logf("used-event-read-error: %v", err)
+		}
 		return true
 	}
-	usedEvent := binary.LittleEndian.Uint16(buf[:])
+	usedEvent := binary.LittleEndian.Uint16(f.scratch2[:])
 	return vringNeedEvent(usedEvent, newUsedIdx, oldUsedIdx)
+}
+
+func (f *FS) setRequestQueueNoNotifyLocked(suppress bool) error {
+	for qidx := fsQueueRequest; qidx < fsQueueRequest+fsRequestQueueCount && qidx < len(f.queues); qidx++ {
+		q := &f.queues[qidx]
+		if !q.ready || q.size == 0 {
+			continue
+		}
+		if err := f.setQueueNoNotifyLocked(q, suppress); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *FS) setQueueNoNotifyLocked(q *queue, suppress bool) error {
+	if q.size == 0 || q.usedAddr == 0 || q.noNotify == suppress {
+		return nil
+	}
+	if err := f.ensureQueueCacheLocked(q); err != nil {
+		return err
+	}
+	flags := uint16(0)
+	if suppress {
+		flags = 1
+	}
+	if len(q.usedMem) >= 2 {
+		binary.LittleEndian.PutUint16(q.usedMem[0:2], flags)
+	} else {
+		binary.LittleEndian.PutUint16(f.scratch2[:], flags)
+		if err := f.writeIPAFrom(q.usedAddr, f.scratch2[:]); err != nil {
+			return err
+		}
+	}
+	q.noNotify = suppress
+	return nil
 }
 
 func (f *FS) writeAvailEventLocked(q *queue) error {
 	if q.size == 0 || q.usedAddr == 0 {
 		return nil
 	}
-	var buf [2]byte
-	binary.LittleEndian.PutUint16(buf[:], q.lastAvailIdx)
-	return f.mem.WriteIPA(q.usedAddr+4+uint64(q.size)*8, buf[:])
+	if err := f.ensureQueueCacheLocked(q); err != nil {
+		return err
+	}
+	offset := 4 + int(q.size)*8
+	if len(q.usedMem) >= offset+2 {
+		binary.LittleEndian.PutUint16(q.usedMem[offset:offset+2], q.lastAvailIdx)
+		return nil
+	}
+	binary.LittleEndian.PutUint16(f.scratch2[:], q.lastAvailIdx)
+	return f.writeIPAFrom(q.usedAddr+uint64(offset), f.scratch2[:])
 }
 
 func vringNeedEvent(eventIdx, newIdx, oldIdx uint16) bool {
@@ -1948,7 +2357,9 @@ func (f *FS) updateIRQLocked() error {
 	}
 	f.irqHigh = level
 	f.irqTransitions++
-	f.logf("set-irq irq=%d level=%v", f.IRQ, level)
+	if f.Log != nil {
+		f.logf("set-irq irq=%d level=%v", f.IRQ, level)
+	}
 	return f.irq.SetIRQ(f.IRQ, level)
 }
 
@@ -2028,6 +2439,10 @@ func (f *FS) Stats() FSStats {
 		MMIOReads:       f.mmioReads,
 		MMIOWrites:      f.mmioWrites,
 		QueueNotifies:   append([]uint64(nil), f.queueNotifies...),
+		KickPollLoops:   f.kickPollLoops,
+		KickPollHits:    f.kickPollHits,
+		KickPollMisses:  f.kickPollMisses,
+		KickPollWorks:   f.kickPollWorks,
 		FUSERequests:    f.fuseRequests.Load(),
 		InterruptRaises: f.interruptRaises,
 		IRQTransitions:  f.irqTransitions,
@@ -2035,6 +2450,9 @@ func (f *FS) Stats() FSStats {
 		InterruptStatus: f.interruptStatus,
 		QueueReady:      f.queueReadySnapshotLocked(),
 		QueueLastAvail:  f.queueLastAvailSnapshotLocked(),
+		QueueAvailIdx:   f.queueAvailIdxSnapshotLocked(),
+		QueueUsedIdx:    f.queueUsedIdxSnapshotLocked(),
+		QueueNoNotify:   f.queueNoNotifySnapshotLocked(),
 		FUSEOps:         ops,
 		Stages:          stages,
 	}
@@ -2075,6 +2493,36 @@ func (f *FS) queueLastAvailSnapshotLocked() []uint16 {
 	return last
 }
 
+func (f *FS) queueAvailIdxSnapshotLocked() []uint16 {
+	idxs := make([]uint16, len(f.queues))
+	for i := range f.queues {
+		if !f.queues[i].ready || f.queues[i].size == 0 {
+			continue
+		}
+		_, idx, err := f.readAvailHeaderLocked(&f.queues[i])
+		if err == nil {
+			idxs[i] = idx
+		}
+	}
+	return idxs
+}
+
+func (f *FS) queueUsedIdxSnapshotLocked() []uint16 {
+	idxs := make([]uint16, len(f.queues))
+	for i := range f.queues {
+		idxs[i] = f.queues[i].usedIdx
+	}
+	return idxs
+}
+
+func (f *FS) queueNoNotifySnapshotLocked() []bool {
+	flags := make([]bool, len(f.queues))
+	for i := range f.queues {
+		flags[i] = f.queues[i].noNotify
+	}
+	return flags
+}
+
 func (f *FS) isCompletingQueue(qidx int) bool {
 	return qidx >= 0 && qidx < len(f.queues)
 }
@@ -2103,6 +2551,7 @@ func (f *FS) resetLocked() {
 	f.interruptStatus = 0
 	f.irqHigh = false
 	f.configGeneration++
+	f.kickPollActive = false
 	f.resetQueueStateLocked()
 }
 

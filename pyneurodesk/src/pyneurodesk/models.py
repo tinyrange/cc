@@ -302,6 +302,7 @@ class ShareMount:
     source: str
     mount: str
     writable: bool = False
+    cache: Optional[str] = None
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -310,6 +311,8 @@ class ShareMount:
         }
         if self.writable:
             payload["writable"] = True
+        if self.cache:
+            payload["cache"] = self.cache
         return payload
 
 

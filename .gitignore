@@ -4,6 +4,11 @@
 /TODO.md
 /.env.local
 /.tmp-actions-logs
+/.tmp-cache-policy
+/.tmp-fs-benchmark
+/.tmp-kickpoll-debug
+/.tmp-vsh-vim-bench
+/.tmp-virtiofs-exit-sweep
 /internal/guestinit/guest-init-linux-arm64
 /internal/guestinit/guest-init-linux-amd64
 /tools/__pycache__

@@ -25,6 +25,7 @@ import (
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
 	intcvmfs "j5.nz/cc/internal/cvmfs"
+	"j5.nz/cc/internal/hv/hvf"
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/macos"
 	"j5.nz/cc/internal/oci"
@@ -396,6 +397,10 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 	mux.HandleFunc("GET /debug/virtiofs", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
 		writeJSON(w, http.StatusOK, srvState.vms.VirtioFSStats(id))
+	})
+
+	mux.HandleFunc("GET /debug/exits", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, hvf.ExitTimingSnapshot())
 	})
 
 	mux.HandleFunc("POST /shutdown", func(w http.ResponseWriter, r *http.Request) {

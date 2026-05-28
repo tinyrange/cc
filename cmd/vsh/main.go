@@ -1373,6 +1373,7 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 			MapOwner: true,
 			OwnerUID: defaultGuestUID,
 			OwnerGID: defaultGuestGID,
+			Cache:    "strict",
 		}},
 		WorkDir:  workDir,
 		User:     guestRunUser(ctx),

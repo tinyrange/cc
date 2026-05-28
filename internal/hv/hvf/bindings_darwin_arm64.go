@@ -244,8 +244,13 @@ type VM struct {
 	vcpu        VCPU
 	vcpuCreated bool
 	exitInfo    *VcpuExit
+	vcpus       []*hvfVCPU
 	mappings    []mapping
 	mappingsMu  sync.RWMutex
+	fastMem     []byte
+	fastMemBase uint64
+	fastMemEnd  uint64
+	gicMu       sync.Mutex
 	threadCh    chan func()
 	threadMu    sync.Mutex
 	closed      bool
@@ -253,6 +258,18 @@ type VM struct {
 	mdscrEL1    uint64
 	osdlrEL1    uint64
 	osLock      bool
+}
+
+type hvfVCPU struct {
+	index       int
+	mpidr       uint64
+	vcpu        VCPU
+	vcpuCreated bool
+	exitInfo    *VcpuExit
+	threadCh    chan func()
+	threadMu    sync.Mutex
+	closed      bool
+	on          atomic.Bool
 }
 
 type mapping struct {
@@ -267,16 +284,32 @@ func NewVM() (*VM, error) {
 }
 
 func NewVMWithContext(ctx context.Context) (*VM, error) {
+	return NewVMWithCPUs(ctx, 1)
+}
+
+func NewVMWithCPUs(ctx context.Context, cpus int) (*VM, error) {
 	if err := load(); err != nil {
 		return nil, err
+	}
+	if cpus <= 0 {
+		cpus = 1
 	}
 	vmLifecycleMu.Lock()
 
 	v := &VM{
-		threadCh: make(chan func()),
-		osLock:   true,
+		osLock: true,
+		vcpus:  make([]*hvfVCPU, cpus),
 	}
-	go v.threadMain()
+	for i := range v.vcpus {
+		cpu := &hvfVCPU{
+			index:    i,
+			mpidr:    uint64(i),
+			threadCh: make(chan func()),
+		}
+		v.vcpus[i] = cpu
+		go cpu.threadMain()
+	}
+	v.threadCh = v.vcpus[0].threadCh
 
 	errCh := make(chan error, 1)
 	v.threadCh <- func() {
@@ -300,58 +333,71 @@ func NewVMWithContext(ctx context.Context) (*VM, error) {
 			return
 		}
 		timing.Since(ctx, "hvf.new_vm.gic_create", start)
-		start = time.Now()
-
-		vcpuCfg := hvVcpuConfigCreate()
-		timing.Since(ctx, "hvf.new_vm.vcpu_config_create", start)
-		start = time.Now()
-		var id VCPU
-		exitInfo := new(VcpuExit)
-		if ret := hvVcpuCreate(&id, &exitInfo, vcpuCfg); ret != hvSuccess {
-			osRelease(uintptr(vcpuCfg))
-			_ = hvVMDestroy()
-			errCh <- fmt.Errorf("create vcpu: %w", ret)
-			return
-		}
-		timing.Since(ctx, "hvf.new_vm.vcpu_create", start)
-		start = time.Now()
-		osRelease(uintptr(vcpuCfg))
-
-		v.vcpu = id
-		v.vcpuCreated = true
-		v.exitInfo = exitInfo
-		if ret := hvVcpuSetSysReg(v.vcpu, hvSysRegMPIDR_EL1, uint64(v.vcpu)); ret != hvSuccess {
-			_ = hvVcpuDestroy(v.vcpu)
-			_ = hvVMDestroy()
-			errCh <- fmt.Errorf("set MPIDR_EL1: %w", ret)
-			return
-		}
-		timing.Since(ctx, "hvf.new_vm.set_mpidr", start)
-		start = time.Now()
-		if err := sanitizeFeatureRegs(v.vcpu); err != nil {
-			_ = hvVcpuDestroy(v.vcpu)
-			_ = hvVMDestroy()
-			errCh <- err
-			return
-		}
-		timing.Since(ctx, "hvf.new_vm.sanitize_feature_regs", start)
-		start = time.Now()
-		if ret := hvVcpuSetVtimerMask(v.vcpu, false); ret != hvSuccess {
-			_ = hvVcpuDestroy(v.vcpu)
-			_ = hvVMDestroy()
-			errCh <- fmt.Errorf("unmask virtual timer: %w", ret)
-			return
-		}
-		timing.Since(ctx, "hvf.new_vm.unmask_vtimer", start)
-		start = time.Now()
-		err := initMinimalGICCPUInterface(v)
-		timing.Since(ctx, "hvf.new_vm.init_gic_cpu_interface", start)
-		errCh <- err
+		errCh <- nil
 	}
 	if err := <-errCh; err != nil {
-		v.closeThread()
+		v.closeThreads()
 		vmLifecycleMu.Unlock()
 		return nil, err
+	}
+
+	for _, cpu := range v.vcpus {
+		cpu := cpu
+		errCh := make(chan error, 1)
+		cpu.threadCh <- func() {
+			start := time.Now()
+			vcpuCfg := hvVcpuConfigCreate()
+			timing.Since(ctx, "hvf.new_vm.vcpu_config_create", start)
+			start = time.Now()
+			var id VCPU
+			exitInfo := new(VcpuExit)
+			if ret := hvVcpuCreate(&id, &exitInfo, vcpuCfg); ret != hvSuccess {
+				osRelease(uintptr(vcpuCfg))
+				errCh <- fmt.Errorf("create vcpu: %w", ret)
+				return
+			}
+			timing.Since(ctx, "hvf.new_vm.vcpu_create", start)
+			start = time.Now()
+			osRelease(uintptr(vcpuCfg))
+
+			cpu.vcpu = id
+			cpu.vcpuCreated = true
+			cpu.exitInfo = exitInfo
+			if cpu.index == 0 {
+				v.vcpu = id
+				v.vcpuCreated = true
+				v.exitInfo = exitInfo
+				cpu.on.Store(true)
+			}
+			if ret := hvVcpuSetSysReg(cpu.vcpu, hvSysRegMPIDR_EL1, cpu.mpidr); ret != hvSuccess {
+				_ = hvVcpuDestroy(cpu.vcpu)
+				errCh <- fmt.Errorf("set MPIDR_EL1: %w", ret)
+				return
+			}
+			timing.Since(ctx, "hvf.new_vm.set_mpidr", start)
+			start = time.Now()
+			if err := sanitizeFeatureRegs(cpu.vcpu); err != nil {
+				_ = hvVcpuDestroy(cpu.vcpu)
+				errCh <- err
+				return
+			}
+			timing.Since(ctx, "hvf.new_vm.sanitize_feature_regs", start)
+			start = time.Now()
+			if ret := hvVcpuSetVtimerMask(cpu.vcpu, false); ret != hvSuccess {
+				_ = hvVcpuDestroy(cpu.vcpu)
+				errCh <- fmt.Errorf("unmask virtual timer: %w", ret)
+				return
+			}
+			timing.Since(ctx, "hvf.new_vm.unmask_vtimer", start)
+			start = time.Now()
+			err := v.initMinimalGICCPUInterfaceFor(cpu)
+			timing.Since(ctx, "hvf.new_vm.init_gic_cpu_interface", start)
+			errCh <- err
+		}
+		if err := <-errCh; err != nil {
+			_ = v.Close()
+			return nil, err
+		}
 	}
 	activeVM.Store(v)
 	return v, nil
@@ -513,19 +559,23 @@ func createMinimalGIC() error {
 }
 
 func initMinimalGICCPUInterface(v *VM) error {
-	if err := v.setGICICCRegOnOwnerThread(hvGICICCRegSRE_EL1, 0x1); err != nil {
+	return v.initMinimalGICCPUInterfaceFor(v.vcpus[0])
+}
+
+func (v *VM) initMinimalGICCPUInterfaceFor(cpu *hvfVCPU) error {
+	if err := v.setGICICCRegOnOwnerThread(cpu, hvGICICCRegSRE_EL1, 0x1); err != nil {
 		return err
 	}
-	if err := v.setGICICCRegOnOwnerThread(hvGICICCRegPMR_EL1, 0xff); err != nil {
+	if err := v.setGICICCRegOnOwnerThread(cpu, hvGICICCRegPMR_EL1, 0xff); err != nil {
 		return err
 	}
-	if err := v.setGICICCRegOnOwnerThread(hvGICICCRegCTLR_EL1, 0x0); err != nil {
+	if err := v.setGICICCRegOnOwnerThread(cpu, hvGICICCRegCTLR_EL1, 0x0); err != nil {
 		return err
 	}
-	if err := v.setGICICCRegOnOwnerThread(hvGICICCRegIGRPEN0_EL1, 0x1); err != nil {
+	if err := v.setGICICCRegOnOwnerThread(cpu, hvGICICCRegIGRPEN0_EL1, 0x1); err != nil {
 		return err
 	}
-	if err := v.setGICICCRegOnOwnerThread(hvGICICCRegIGRPEN1_EL1, 0x1); err != nil {
+	if err := v.setGICICCRegOnOwnerThread(cpu, hvGICICCRegIGRPEN1_EL1, 0x1); err != nil {
 		return err
 	}
 	return nil
@@ -543,6 +593,11 @@ func (v *VM) MapMemory(mem []byte, ipa IPA, flags MemoryFlags) error {
 		}
 		v.mappingsMu.Lock()
 		v.mappings = append(v.mappings, mapping{ipa: ipa, size: uintptr(len(mem)), mem: mem})
+		if len(v.mappings) == 1 {
+			v.fastMem = mem
+			v.fastMemBase = uint64(ipa)
+			v.fastMemEnd = uint64(ipa) + uint64(len(mem))
+		}
 		v.mappingsMu.Unlock()
 		errCh <- nil
 	}
@@ -572,25 +627,43 @@ func (v *VM) MapAnonymousMemory(size uintptr, ipa IPA, flags MemoryFlags) ([]byt
 }
 
 func (v *VM) SetReg(reg Reg, value uint64) error {
+	return v.SetRegForVCPU(0, reg, value)
+}
+
+func (v *VM) SetRegForVCPU(index int, reg Reg, value uint64) error {
+	cpu, err := v.vcpuByIndex(index)
+	if err != nil {
+		return err
+	}
 	errCh := make(chan error, 1)
-	v.threadCh <- func() {
-		if ret := hvVcpuSetReg(v.vcpu, reg, value); ret != hvSuccess {
+	if err := cpu.call(func() {
+		if ret := hvVcpuSetReg(cpu.vcpu, reg, value); ret != hvSuccess {
 			errCh <- fmt.Errorf("set reg %d: %w", reg, ret)
 			return
 		}
 		errCh <- nil
+	}); err != nil {
+		return err
 	}
 	return <-errCh
 }
 
 func (v *VM) GetReg(reg Reg) (uint64, error) {
+	return v.GetRegForVCPU(0, reg)
+}
+
+func (v *VM) GetRegForVCPU(index int, reg Reg) (uint64, error) {
+	cpu, err := v.vcpuByIndex(index)
+	if err != nil {
+		return 0, err
+	}
 	respCh := make(chan struct {
 		val uint64
 		err error
 	}, 1)
-	v.threadCh <- func() {
+	if err := cpu.call(func() {
 		var value uint64
-		if ret := hvVcpuGetReg(v.vcpu, reg, &value); ret != hvSuccess {
+		if ret := hvVcpuGetReg(cpu.vcpu, reg, &value); ret != hvSuccess {
 			respCh <- struct {
 				val uint64
 				err error
@@ -601,19 +674,29 @@ func (v *VM) GetReg(reg Reg) (uint64, error) {
 			val uint64
 			err error
 		}{val: value}
+	}); err != nil {
+		return 0, err
 	}
 	res := <-respCh
 	return res.val, res.err
 }
 
 func (v *VM) GetSysReg(reg SysReg) (uint64, error) {
+	return v.GetSysRegForVCPU(0, reg)
+}
+
+func (v *VM) GetSysRegForVCPU(index int, reg SysReg) (uint64, error) {
+	cpu, err := v.vcpuByIndex(index)
+	if err != nil {
+		return 0, err
+	}
 	respCh := make(chan struct {
 		val uint64
 		err error
 	}, 1)
-	v.threadCh <- func() {
+	if err := cpu.call(func() {
 		var value uint64
-		if ret := hvVcpuGetSysReg(v.vcpu, reg, &value); ret != hvSuccess {
+		if ret := hvVcpuGetSysReg(cpu.vcpu, reg, &value); ret != hvSuccess {
 			respCh <- struct {
 				val uint64
 				err error
@@ -624,6 +707,8 @@ func (v *VM) GetSysReg(reg SysReg) (uint64, error) {
 			val uint64
 			err error
 		}{val: value}
+	}); err != nil {
+		return 0, err
 	}
 	res := <-respCh
 	return res.val, res.err
@@ -665,48 +750,40 @@ func (v *VM) SetVTimerMask(masked bool) error {
 }
 
 func (v *VM) GetGICDistributorReg(reg GICDistributorReg) (uint64, error) {
-	respCh := make(chan struct {
-		val uint64
-		err error
-	}, 1)
-	v.threadCh <- func() {
-		var value uint64
-		if ret := hvGICGetDistributorReg(reg, &value); ret != hvSuccess {
-			respCh <- struct {
-				val uint64
-				err error
-			}{err: fmt.Errorf("get gic distributor reg %#x: %w", reg, ret)}
-			return
-		}
-		respCh <- struct {
-			val uint64
-			err error
-		}{val: value}
+	v.gicMu.Lock()
+	defer v.gicMu.Unlock()
+	var value uint64
+	if ret := hvGICGetDistributorReg(reg, &value); ret != hvSuccess {
+		return 0, fmt.Errorf("get gic distributor reg %#x: %w", reg, ret)
 	}
-	res := <-respCh
-	return res.val, res.err
+	return value, nil
 }
 
 func (v *VM) SetGICDistributorReg(reg GICDistributorReg, value uint64) error {
-	errCh := make(chan error, 1)
-	v.threadCh <- func() {
-		if ret := hvGICSetDistributorReg(reg, value); ret != hvSuccess {
-			errCh <- fmt.Errorf("set gic distributor reg %#x: %w", reg, ret)
-			return
-		}
-		errCh <- nil
+	v.gicMu.Lock()
+	defer v.gicMu.Unlock()
+	if ret := hvGICSetDistributorReg(reg, value); ret != hvSuccess {
+		return fmt.Errorf("set gic distributor reg %#x: %w", reg, ret)
 	}
-	return <-errCh
+	return nil
 }
 
 func (v *VM) GetGICRedistributorReg(reg GICRedistributorReg) (uint64, error) {
+	return v.GetGICRedistributorRegForVCPU(0, reg)
+}
+
+func (v *VM) GetGICRedistributorRegForVCPU(index int, reg GICRedistributorReg) (uint64, error) {
+	cpu, err := v.vcpuByIndex(index)
+	if err != nil {
+		return 0, err
+	}
 	respCh := make(chan struct {
 		val uint64
 		err error
 	}, 1)
-	v.threadCh <- func() {
+	if err := cpu.call(func() {
 		var value uint64
-		if ret := hvGICGetRedistributorReg(v.vcpu, reg, &value); ret != hvSuccess {
+		if ret := hvGICGetRedistributorReg(cpu.vcpu, reg, &value); ret != hvSuccess {
 			respCh <- struct {
 				val uint64
 				err error
@@ -717,125 +794,286 @@ func (v *VM) GetGICRedistributorReg(reg GICRedistributorReg) (uint64, error) {
 			val uint64
 			err error
 		}{val: value}
+	}); err != nil {
+		return 0, err
 	}
 	res := <-respCh
 	return res.val, res.err
 }
 
 func (v *VM) SetGICRedistributorReg(reg GICRedistributorReg, value uint64) error {
+	return v.SetGICRedistributorRegForVCPU(0, reg, value)
+}
+
+func (v *VM) SetGICRedistributorRegForVCPU(index int, reg GICRedistributorReg, value uint64) error {
+	cpu, err := v.vcpuByIndex(index)
+	if err != nil {
+		return err
+	}
 	errCh := make(chan error, 1)
-	v.threadCh <- func() {
-		if ret := hvGICSetRedistributorReg(v.vcpu, reg, value); ret != hvSuccess {
+	if err := cpu.call(func() {
+		if ret := hvGICSetRedistributorReg(cpu.vcpu, reg, value); ret != hvSuccess {
 			errCh <- fmt.Errorf("set gic redistributor reg %#x: %w", reg, ret)
 			return
 		}
 		errCh <- nil
+	}); err != nil {
+		return err
 	}
 	return <-errCh
 }
 
 func (v *VM) GetGICICCReg(reg GICICCReg) (uint64, error) {
+	return v.GetGICICCRegForVCPU(0, reg)
+}
+
+func (v *VM) GetGICICCRegForVCPU(index int, reg GICICCReg) (uint64, error) {
+	cpu, err := v.vcpuByIndex(index)
+	if err != nil {
+		return 0, err
+	}
 	respCh := make(chan struct {
 		val uint64
 		err error
 	}, 1)
-	v.threadCh <- func() {
-		value, err := v.getGICICCRegOnOwnerThread(reg)
+	if err := cpu.call(func() {
+		value, err := v.getGICICCRegOnOwnerThread(cpu, reg)
 		respCh <- struct {
 			val uint64
 			err error
 		}{val: value, err: err}
+	}); err != nil {
+		return 0, err
 	}
 	res := <-respCh
 	return res.val, res.err
 }
 
-func (v *VM) getGICICCRegOnOwnerThread(reg GICICCReg) (uint64, error) {
+func (v *VM) getGICICCRegOnOwnerThread(cpu *hvfVCPU, reg GICICCReg) (uint64, error) {
 	var value uint64
-	if ret := hvGICGetICCReg(v.vcpu, reg, &value); ret != hvSuccess {
+	if ret := hvGICGetICCReg(cpu.vcpu, reg, &value); ret != hvSuccess {
 		return 0, fmt.Errorf("get gic icc reg %#x: %w", reg, ret)
 	}
 	return value, nil
 }
 
 func (v *VM) SetGICICCReg(reg GICICCReg, value uint64) error {
+	return v.SetGICICCRegForVCPU(0, reg, value)
+}
+
+func (v *VM) SetGICICCRegForVCPU(index int, reg GICICCReg, value uint64) error {
+	cpu, err := v.vcpuByIndex(index)
+	if err != nil {
+		return err
+	}
 	errCh := make(chan error, 1)
-	v.threadCh <- func() {
-		errCh <- v.setGICICCRegOnOwnerThread(reg, value)
+	if err := cpu.call(func() {
+		errCh <- v.setGICICCRegOnOwnerThread(cpu, reg, value)
+	}); err != nil {
+		return err
 	}
 	return <-errCh
 }
 
-func (v *VM) setGICICCRegOnOwnerThread(reg GICICCReg, value uint64) error {
-	if ret := hvGICSetICCReg(v.vcpu, reg, value); ret != hvSuccess {
+func (v *VM) setGICICCRegOnOwnerThread(cpu *hvfVCPU, reg GICICCReg, value uint64) error {
+	if ret := hvGICSetICCReg(cpu.vcpu, reg, value); ret != hvSuccess {
 		return fmt.Errorf("set gic icc reg %#x: %w", reg, ret)
 	}
 	return nil
 }
 
 func (v *VM) SetSysReg(reg SysReg, value uint64) error {
+	return v.SetSysRegForVCPU(0, reg, value)
+}
+
+func (v *VM) SetSysRegForVCPU(index int, reg SysReg, value uint64) error {
+	cpu, err := v.vcpuByIndex(index)
+	if err != nil {
+		return err
+	}
 	errCh := make(chan error, 1)
-	v.threadCh <- func() {
-		if ret := hvVcpuSetSysReg(v.vcpu, reg, value); ret != hvSuccess {
+	if err := cpu.call(func() {
+		if ret := hvVcpuSetSysReg(cpu.vcpu, reg, value); ret != hvSuccess {
 			errCh <- fmt.Errorf("set sys reg %d: %w", reg, ret)
 			return
 		}
 		errCh <- nil
+	}); err != nil {
+		return err
 	}
 	return <-errCh
 }
 
 func (v *VM) Run() (*VcpuExit, error) {
+	return v.RunVCPU(0)
+}
+
+func (v *VM) RunVCPU(index int) (*VcpuExit, error) {
+	cpu, err := v.vcpuByIndex(index)
+	if err != nil {
+		return nil, err
+	}
+	if !cpu.on.Load() {
+		return nil, fmt.Errorf("vcpu %d is off", index)
+	}
 	type result struct {
 		exit *VcpuExit
 		err  error
 	}
 	resCh := make(chan result, 1)
-	v.threadCh <- func() {
-		if ret := hvVcpuRun(v.vcpu); ret != hvSuccess {
-			resCh <- result{err: fmt.Errorf("run vcpu: %w", ret)}
+	if err := cpu.call(func() {
+		if ret := hvVcpuRun(cpu.vcpu); ret != hvSuccess {
+			resCh <- result{err: fmt.Errorf("run vcpu %d: %w", index, ret)}
 			return
 		}
-		resCh <- result{exit: v.exitInfo}
+		resCh <- result{exit: cpu.exitInfo}
+	}); err != nil {
+		return nil, err
 	}
 	res := <-resCh
 	return res.exit, res.err
 }
 
 func (v *VM) CancelRun() error {
-	vcpu := v.vcpu
-	if ret := hvVcpusExit(&vcpu, 1); ret != hvSuccess {
-		return fmt.Errorf("cancel vcpu run: %w", ret)
+	var firstErr error
+	for _, cpu := range v.vcpus {
+		if !cpu.vcpuCreated {
+			continue
+		}
+		vcpu := cpu.vcpu
+		if ret := hvVcpusExit(&vcpu, 1); ret != hvSuccess && firstErr == nil {
+			firstErr = fmt.Errorf("cancel vcpu %d run: %w", cpu.index, ret)
+		}
 	}
-	return nil
+	return firstErr
 }
 
-func (v *VM) threadMain() {
+func (cpu *hvfVCPU) threadMain() {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	for fn := range v.threadCh {
+	for fn := range cpu.threadCh {
 		fn()
 	}
 }
 
 func (v *VM) callOnThread(fn func()) error {
-	v.threadMu.Lock()
-	defer v.threadMu.Unlock()
-	if v.closed {
-		return fmt.Errorf("vm is closed")
+	return v.vcpus[0].call(fn)
+}
+
+func (cpu *hvfVCPU) call(fn func()) error {
+	return cpu.callWithTimeout(0, fn)
+}
+
+func (cpu *hvfVCPU) callWithTimeout(timeout time.Duration, fn func()) error {
+	cpu.threadMu.Lock()
+	defer cpu.threadMu.Unlock()
+	if cpu.closed {
+		return fmt.Errorf("vcpu %d is closed", cpu.index)
 	}
-	v.threadCh <- fn
+	if timeout <= 0 {
+		cpu.threadCh <- fn
+		return nil
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case cpu.threadCh <- fn:
+	case <-timer.C:
+		return fmt.Errorf("vcpu %d owner thread did not accept call within %s", cpu.index, timeout)
+	}
 	return nil
 }
 
-func (v *VM) closeThread() {
-	v.threadMu.Lock()
-	defer v.threadMu.Unlock()
-	if v.closed {
+func (cpu *hvfVCPU) closeThread() {
+	cpu.threadMu.Lock()
+	defer cpu.threadMu.Unlock()
+	if cpu.closed {
 		return
 	}
+	cpu.closed = true
+	close(cpu.threadCh)
+}
+
+func (v *VM) closeThreads() {
+	for _, cpu := range v.vcpus {
+		cpu.closeThread()
+	}
 	v.closed = true
-	close(v.threadCh)
+}
+
+func (v *VM) vcpuByIndex(index int) (*hvfVCPU, error) {
+	if index < 0 || index >= len(v.vcpus) || v.vcpus[index] == nil {
+		return nil, fmt.Errorf("vcpu %d out of range", index)
+	}
+	return v.vcpus[index], nil
+}
+
+func (v *VM) activeVCPUIndexes() []int {
+	var indexes []int
+	for _, cpu := range v.vcpus {
+		if cpu != nil && cpu.on.Load() {
+			indexes = append(indexes, cpu.index)
+		}
+	}
+	return indexes
+}
+
+func (v *VM) vcpuByMPIDR(mpidr uint64) (*hvfVCPU, error) {
+	affinity := mpidr & 0xff00ffffff
+	for _, cpu := range v.vcpus {
+		if cpu != nil && cpu.mpidr == affinity {
+			return cpu, nil
+		}
+	}
+	return nil, fmt.Errorf("vcpu mpidr %#x out of range", mpidr)
+}
+
+func (v *VM) IsVCPUOnMPIDR(mpidr uint64) (bool, error) {
+	cpu, err := v.vcpuByMPIDR(mpidr)
+	if err != nil {
+		return false, err
+	}
+	return cpu.on.Load(), nil
+}
+
+func (v *VM) StartVCPUByMPIDR(mpidr uint64, entry uint64, contextID uint64) error {
+	cpu, err := v.vcpuByMPIDR(mpidr)
+	if err != nil {
+		return err
+	}
+	if cpu.index == 0 {
+		return fmt.Errorf("vcpu 0 is already boot cpu")
+	}
+	if cpu.on.Load() {
+		return fmt.Errorf("vcpu %d already on", cpu.index)
+	}
+	if err := v.SetRegForVCPU(cpu.index, hvRegPC, entry); err != nil {
+		return err
+	}
+	if err := v.SetRegForVCPU(cpu.index, hvRegCPSR, DefaultPStateEL1h()); err != nil {
+		return err
+	}
+	if err := v.SetRegForVCPU(cpu.index, hvRegX0, contextID); err != nil {
+		return err
+	}
+	for _, reg := range []Reg{hvRegX1, hvRegX2, hvRegX3} {
+		if err := v.SetRegForVCPU(cpu.index, reg, 0); err != nil {
+			return err
+		}
+	}
+	cpu.on.Store(true)
+	return nil
+}
+
+func DefaultPStateEL1h() uint64 {
+	const (
+		pstateModeEL1h = 0x5
+		pstateDF       = 0x200
+		pstateAF       = 0x100
+		pstateIF       = 0x80
+		pstateFF       = 0x40
+	)
+	return pstateModeEL1h | pstateDF | pstateAF | pstateIF | pstateFF
 }
 
 func (v *VM) Close() error {
@@ -844,20 +1082,34 @@ func (v *VM) Close() error {
 		activeVM.CompareAndSwap(v, nil)
 		vmLifecycleMu.Unlock()
 	}()
-	if v.vcpuCreated {
+	if err := v.CancelRun(); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	for _, cpu := range v.vcpus {
+		if !cpu.vcpuCreated {
+			continue
+		}
 		errCh := make(chan error, 1)
-		v.threadCh <- func() {
-			if ret := hvVcpuDestroy(v.vcpu); ret != hvSuccess {
-				errCh <- fmt.Errorf("destroy vcpu: %w", ret)
+		err := cpu.callWithTimeout(500*time.Millisecond, func() {
+			if ret := hvVcpuDestroy(cpu.vcpu); ret != hvSuccess {
+				errCh <- fmt.Errorf("destroy vcpu %d: %w", cpu.index, ret)
 				return
 			}
 			errCh <- nil
+		})
+		if err != nil && firstErr == nil {
+			firstErr = err
+			continue
 		}
 		if err := <-errCh; err != nil && firstErr == nil {
 			firstErr = err
 		}
-		v.vcpuCreated = false
-		v.vcpu = 0
+		cpu.vcpuCreated = false
+		cpu.vcpu = 0
+		if cpu.index == 0 {
+			v.vcpuCreated = false
+			v.vcpu = 0
+		}
 	}
 	v.mappingsMu.Lock()
 	mappings := append([]mapping(nil), v.mappings...)
@@ -893,7 +1145,7 @@ func (v *VM) Close() error {
 	if err := <-errCh; err != nil && firstErr == nil {
 		firstErr = err
 	}
-	v.closeThread()
+	v.closeThreads()
 	return firstErr
 }
 
@@ -1039,10 +1291,18 @@ func (s SystemInstructionInfo) IsOSLSREL1Access() bool {
 }
 
 func (v *VM) GetProgramCounter() (uint64, error) {
-	return v.GetReg(hvRegPC)
+	return v.GetProgramCounterForVCPU(0)
+}
+
+func (v *VM) GetProgramCounterForVCPU(index int) (uint64, error) {
+	return v.GetRegForVCPU(index, hvRegPC)
 }
 
 func (v *VM) HandleSystemInstruction(syndrome uint64) (bool, error) {
+	return v.HandleSystemInstructionForVCPU(0, syndrome)
+}
+
+func (v *VM) HandleSystemInstructionForVCPU(index int, syndrome uint64) (bool, error) {
 	info, err := DecodeSystemInstruction(syndrome)
 	if err != nil {
 		return false, err
@@ -1056,14 +1316,14 @@ func (v *VM) HandleSystemInstruction(syndrome uint64) (bool, error) {
 				value = 1 << 24
 			}
 			if info.Rt != hvRegXZR {
-				if err := v.SetReg(info.Rt, value); err != nil {
+				if err := v.SetRegForVCPU(index, info.Rt, value); err != nil {
 					return false, err
 				}
 			}
 		} else {
 			var value uint64
 			if info.Rt != hvRegXZR {
-				value, err = v.GetReg(info.Rt)
+				value, err = v.GetRegForVCPU(index, info.Rt)
 				if err != nil {
 					return false, err
 				}
@@ -1075,7 +1335,7 @@ func (v *VM) HandleSystemInstruction(syndrome uint64) (bool, error) {
 	case info.IsMDSCREL1Access():
 		if info.Read {
 			if info.Rt != hvRegXZR {
-				if err := v.SetReg(info.Rt, v.mdscrEL1); err != nil {
+				if err := v.SetRegForVCPU(index, info.Rt, v.mdscrEL1); err != nil {
 					return false, err
 				}
 			}
@@ -1083,7 +1343,7 @@ func (v *VM) HandleSystemInstruction(syndrome uint64) (bool, error) {
 			if info.Rt == hvRegXZR {
 				v.mdscrEL1 = 0
 			} else {
-				value, err := v.GetReg(info.Rt)
+				value, err := v.GetRegForVCPU(index, info.Rt)
 				if err != nil {
 					return false, err
 				}
@@ -1093,7 +1353,7 @@ func (v *VM) HandleSystemInstruction(syndrome uint64) (bool, error) {
 	case info.IsOSDLREL1Access():
 		if info.Read {
 			if info.Rt != hvRegXZR {
-				if err := v.SetReg(info.Rt, v.osdlrEL1); err != nil {
+				if err := v.SetRegForVCPU(index, info.Rt, v.osdlrEL1); err != nil {
 					return false, err
 				}
 			}
@@ -1101,7 +1361,7 @@ func (v *VM) HandleSystemInstruction(syndrome uint64) (bool, error) {
 			if info.Rt == hvRegXZR {
 				v.osdlrEL1 = 0
 			} else {
-				value, err := v.GetReg(info.Rt)
+				value, err := v.GetRegForVCPU(index, info.Rt)
 				if err != nil {
 					return false, err
 				}
@@ -1111,14 +1371,14 @@ func (v *VM) HandleSystemInstruction(syndrome uint64) (bool, error) {
 	case info.IsOSLAREL1Access():
 		if info.Read {
 			if info.Rt != hvRegXZR {
-				if err := v.SetReg(info.Rt, 0); err != nil {
+				if err := v.SetRegForVCPU(index, info.Rt, 0); err != nil {
 					return false, err
 				}
 			}
 		} else {
 			var value uint64
 			if info.Rt != hvRegXZR {
-				value, err = v.GetReg(info.Rt)
+				value, err = v.GetRegForVCPU(index, info.Rt)
 				if err != nil {
 					return false, err
 				}
@@ -1131,7 +1391,7 @@ func (v *VM) HandleSystemInstruction(syndrome uint64) (bool, error) {
 			value |= 0x2
 		}
 		if info.Rt != hvRegXZR {
-			if err := v.SetReg(info.Rt, value); err != nil {
+			if err := v.SetRegForVCPU(index, info.Rt, value); err != nil {
 				return false, err
 			}
 		}
@@ -1139,15 +1399,19 @@ func (v *VM) HandleSystemInstruction(syndrome uint64) (bool, error) {
 		return false, nil
 	}
 
-	return true, v.AdvanceProgramCounter()
+	return true, v.AdvanceProgramCounterForVCPU(index)
 }
 
 func (v *VM) AdvanceProgramCounter() error {
-	pc, err := v.GetReg(hvRegPC)
+	return v.AdvanceProgramCounterForVCPU(0)
+}
+
+func (v *VM) AdvanceProgramCounterForVCPU(index int) error {
+	pc, err := v.GetRegForVCPU(index, hvRegPC)
 	if err != nil {
 		return err
 	}
-	return v.SetReg(hvRegPC, pc+4)
+	return v.SetRegForVCPU(index, hvRegPC, pc+4)
 }
 
 func (v *VM) ReadIPA(addr uint64, size int) ([]byte, error) {
@@ -1162,6 +1426,11 @@ func (v *VM) ReadIPA(addr uint64, size int) ([]byte, error) {
 }
 
 func (v *VM) ReadIPAInto(addr uint64, dst []byte) error {
+	if v.fastMem != nil && addr >= v.fastMemBase && addr+uint64(len(dst)) <= v.fastMemEnd {
+		off := addr - v.fastMemBase
+		copy(dst, v.fastMem[off:off+uint64(len(dst))])
+		return nil
+	}
 	v.mappingsMu.RLock()
 	defer v.mappingsMu.RUnlock()
 	for _, m := range v.mappings {
@@ -1177,7 +1446,34 @@ func (v *VM) ReadIPAInto(addr uint64, dst []byte) error {
 	return fmt.Errorf("read guest memory %#x size %d: unmapped", addr, len(dst))
 }
 
+func (v *VM) SliceIPA(addr uint64, size int) ([]byte, error) {
+	if size < 0 {
+		return nil, fmt.Errorf("invalid slice size %d", size)
+	}
+	if v.fastMem != nil && addr >= v.fastMemBase && addr+uint64(size) <= v.fastMemEnd {
+		off := addr - v.fastMemBase
+		return v.fastMem[off : off+uint64(size)], nil
+	}
+	v.mappingsMu.RLock()
+	defer v.mappingsMu.RUnlock()
+	for _, m := range v.mappings {
+		start := uint64(m.ipa)
+		end := start + uint64(m.size)
+		if addr < start || addr+uint64(size) > end {
+			continue
+		}
+		off := addr - start
+		return m.mem[off : off+uint64(size)], nil
+	}
+	return nil, fmt.Errorf("slice guest memory %#x size %d: unmapped", addr, size)
+}
+
 func (v *VM) WriteIPA(addr uint64, data []byte) error {
+	if v.fastMem != nil && addr >= v.fastMemBase && addr+uint64(len(data)) <= v.fastMemEnd {
+		off := addr - v.fastMemBase
+		copy(v.fastMem[off:off+uint64(len(data))], data)
+		return nil
+	}
 	v.mappingsMu.RLock()
 	defer v.mappingsMu.RUnlock()
 	for _, m := range v.mappings {
@@ -1203,15 +1499,10 @@ func (v *VM) SetIRQ(irq uint32, level bool) error {
 	if level {
 		_ = v.CancelRun()
 	}
-	errCh := make(chan error, 1)
-	if err := v.callOnThread(func() {
-		if ret := hvGICSetSPI(intid, level); ret != hvSuccess {
-			errCh <- fmt.Errorf("set gic spi %d level=%v: %w", intid, level, ret)
-			return
-		}
-		errCh <- nil
-	}); err != nil {
-		return err
+	v.gicMu.Lock()
+	defer v.gicMu.Unlock()
+	if ret := hvGICSetSPI(intid, level); ret != hvSuccess {
+		return fmt.Errorf("set gic spi %d level=%v: %w", intid, level, ret)
 	}
-	return <-errCh
+	return nil
 }

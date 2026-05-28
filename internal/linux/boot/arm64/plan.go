@@ -364,10 +364,11 @@ func buildDeviceTree(cfg deviceTreeConfig) ([]byte, error) {
 			defaultGICv2CPUInterfaceBase, defaultGICv2CPUInterfaceSize,
 		}}
 	} else {
+		redistributorSize := uint64(defaultGICRedistributorSize) * uint64(cfg.NumCPUs)
 		gicProps["compatible"] = fdt.Property{Strings: []string{"arm,gic-v3"}}
 		gicProps["reg"] = fdt.Property{U64: []uint64{
 			defaultGICDistributorBase, defaultGICDistributorSize,
-			defaultGICRedistributorBase, defaultGICRedistributorSize,
+			defaultGICRedistributorBase, redistributorSize,
 		}}
 	}
 	root.Children = append(root.Children, cfg.ExtraNodes...)

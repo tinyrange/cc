@@ -463,6 +463,7 @@ func convertShareMounts(shares []client.ShareMount) []vmruntime.DirectoryShare {
 			MapOwner: share.MapOwner,
 			OwnerUID: share.OwnerUID,
 			OwnerGID: share.OwnerGID,
+			Cache:    share.Cache,
 		})
 	}
 	return out

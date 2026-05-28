@@ -586,7 +586,7 @@ func (i *linuxInstance) AddShare(ctx context.Context, share client.ShareMount) e
 	i.shareMu.Lock()
 	if existing, ok := i.shares[key]; ok {
 		i.shareMu.Unlock()
-		if existing.Source == share.Source && existing.Writable == share.Writable {
+		if existing.Source == share.Source && existing.Writable == share.Writable && existing.Cache == share.Cache {
 			return nil
 		}
 		return fmt.Errorf("share mount %q already exists", key)
@@ -599,6 +599,7 @@ func (i *linuxInstance) AddShare(ctx context.Context, share client.ShareMount) e
 		MapOwner: share.MapOwner,
 		OwnerUID: share.OwnerUID,
 		OwnerGID: share.OwnerGID,
+		Cache:    share.Cache,
 	})
 	if err != nil {
 		return err
@@ -654,6 +655,7 @@ func (i *linuxInstance) AddImage(ctx context.Context, mountPath string, image *o
 		GuestPath: mountPath,
 		Backend:   linuxRuntimeImageFS(image),
 		Writable:  true,
+		CacheMode: "aggressive",
 	}); err != nil {
 		return err
 	}
@@ -1077,6 +1079,7 @@ func convertLinuxShareMounts(shares []client.ShareMount) []vmruntime.DirectorySh
 			MapOwner: share.MapOwner,
 			OwnerUID: share.OwnerUID,
 			OwnerGID: share.OwnerGID,
+			Cache:    share.Cache,
 		})
 	}
 	return out

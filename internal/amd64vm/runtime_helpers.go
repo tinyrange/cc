@@ -49,6 +49,7 @@ func BuildShareMount(index int, share DirectoryShare) (virtio.ShareMount, error)
 		GuestPath: share.Mount,
 		Backend:   backend,
 		Writable:  share.Writable,
+		CacheMode: share.Cache,
 	}, nil
 }
 

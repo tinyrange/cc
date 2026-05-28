@@ -119,6 +119,7 @@ def main() -> None:
             "small_stat",
             "small_read",
             "small_delete",
+            "metadata_probe",
             "large_sequential_write",
             "large_sequential_read",
             "large_random_read",
@@ -128,6 +129,7 @@ def main() -> None:
         help="Run only the named benchmark section. Can be repeated.",
     )
     parser.add_argument("--label", required=True)
+    parser.add_argument("--metadata-rounds", type=int, default=5)
     args = parser.parse_args()
 
     root = Path(args.work_dir).resolve()
@@ -184,6 +186,32 @@ def main() -> None:
             return {"files": args.small_files, "bytes": total, "threads": threads}
 
         results.append(timed("small_read", small_read))
+
+    if wants("metadata_probe"):
+        if not all(path.exists() for path in small_paths):
+            def worker(paths):
+                for path in paths:
+                    write_all(path, small_payload)
+            run_parallel(small_paths, threads, worker)
+
+        def metadata_probe() -> dict[str, int]:
+            ops = 0
+            for _ in range(args.metadata_rounds):
+                names = sorted(path.name for path in small_dir.iterdir())
+                ops += len(names)
+
+                def worker(paths):
+                    total = 0
+                    for path in paths:
+                        total += path.stat().st_size
+                    return total
+                total = sum(run_parallel(small_paths, threads, worker))
+                if total != args.small_files * args.small_size:
+                    raise RuntimeError(f"metadata total mismatch: {total}")
+                ops += len(small_paths)
+            return {"files": args.small_files, "ops": ops, "threads": threads, "rounds": args.metadata_rounds}
+
+        results.append(timed("metadata_probe", metadata_probe))
 
     if wants("small_delete"):
         def small_delete() -> dict[str, int]:
@@ -277,6 +305,7 @@ def main() -> None:
             "threads": threads,
             "fsync": args.fsync,
             "only": sorted(only),
+            "metadata_rounds": args.metadata_rounds,
         },
         "results": results,
     }, sort_keys=True))
@@ -311,6 +340,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random-ops", type=int, default=8192)
     parser.add_argument("--random-block-kb", type=int, default=4)
     parser.add_argument("--threads", type=int, default=1, help="Filesystem worker threads inside each benchmark process")
+    parser.add_argument("--metadata-rounds", type=int, default=5)
     parser.add_argument("--fsync", action="store_true", help="Call fsync during write tests")
     parser.add_argument(
         "--virtiofs-async",
@@ -336,6 +366,26 @@ def parse_args() -> argparse.Namespace:
         help="Enable CCX3_VIRTIOFS_WRITEBACK for the guest benchmark",
     )
     parser.add_argument(
+        "--virtiofs-kick-poll",
+        choices=["on", "off", "default"],
+        default="default",
+        help="Set CCX3_VIRTIOFS_KICK_POLL for the guest benchmark",
+    )
+    parser.add_argument("--virtiofs-kick-poll-idle", default=None)
+    parser.add_argument("--virtiofs-kick-poll-sleep", default=None)
+    parser.add_argument(
+        "--virtiofs-direct-memory",
+        choices=["on", "off", "default"],
+        default="default",
+        help="Set CCX3_VIRTIOFS_DIRECT_MEMORY for the guest benchmark",
+    )
+    parser.add_argument(
+        "--share-cache",
+        choices=["strict", "normal", "aggressive"],
+        default="strict",
+        help="Cache policy for the benchmark share mount",
+    )
+    parser.add_argument(
         "--only",
         action="append",
         help="Run only the named benchmark section. Can be repeated. Example: --only small_create",
@@ -359,6 +409,7 @@ def parse_args() -> argparse.Namespace:
         help="Write a Go block profile from ccvm after the guest benchmark runs",
     )
     parser.add_argument("--pprof-seconds", type=int, default=35, help="CPU profile duration in seconds")
+    parser.add_argument("--shutdown-daemon", action="store_true", help="Stop the ccvm daemon after the guest run")
     parser.add_argument("--keep-work-dir", action="store_true")
     parser.add_argument("--output", type=Path, default=REPO_ROOT / "fs_benchmark_results.json")
     return parser.parse_args()
@@ -405,6 +456,7 @@ def benchmark_args(label: str, work_dir: str, args: argparse.Namespace) -> list[
         "--random-ops", str(args.random_ops),
         "--random-block-kb", str(args.random_block_kb),
         "--threads", str(args.threads),
+        "--metadata-rounds", str(args.metadata_rounds),
     ]
     if args.fsync:
         command.append("--fsync")
@@ -442,6 +494,15 @@ def fetch_virtiofs_stats(base_url: str) -> Any:
         return {"error": str(exc)}
 
 
+def fetch_exit_stats(base_url: str) -> Any:
+    url = f"{base_url.rstrip('/')}/debug/exits"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 def apply_virtiofs_env(args: argparse.Namespace) -> dict[str, Any]:
     os.environ["CCX3_VIRTIOFS_ASYNC"] = "1" if args.virtiofs_async == "on" else "0"
     if args.virtiofs_workers is not None:
@@ -456,11 +517,32 @@ def apply_virtiofs_env(args: argparse.Namespace) -> dict[str, Any]:
         os.environ["CCX3_VIRTIOFS_WRITEBACK"] = "1"
     else:
         os.environ.pop("CCX3_VIRTIOFS_WRITEBACK", None)
+    if args.virtiofs_kick_poll == "default":
+        os.environ.pop("CCX3_VIRTIOFS_KICK_POLL", None)
+    else:
+        os.environ["CCX3_VIRTIOFS_KICK_POLL"] = "1" if args.virtiofs_kick_poll == "on" else "0"
+    if args.virtiofs_kick_poll_idle:
+        os.environ["CCX3_VIRTIOFS_KICK_POLL_IDLE"] = args.virtiofs_kick_poll_idle
+    else:
+        os.environ.pop("CCX3_VIRTIOFS_KICK_POLL_IDLE", None)
+    if args.virtiofs_kick_poll_sleep:
+        os.environ["CCX3_VIRTIOFS_KICK_POLL_SLEEP"] = args.virtiofs_kick_poll_sleep
+    else:
+        os.environ.pop("CCX3_VIRTIOFS_KICK_POLL_SLEEP", None)
+    if args.virtiofs_direct_memory == "default":
+        os.environ.pop("CCX3_VIRTIOFS_DIRECT_MEMORY", None)
+    else:
+        os.environ["CCX3_VIRTIOFS_DIRECT_MEMORY"] = "1" if args.virtiofs_direct_memory == "on" else "0"
     return {
         "async": args.virtiofs_async,
         "workers": args.virtiofs_workers,
         "cache": args.virtiofs_cache or "normal",
+        "share_cache": args.share_cache,
         "writeback": args.virtiofs_writeback,
+        "kick_poll": args.virtiofs_kick_poll,
+        "kick_poll_idle": args.virtiofs_kick_poll_idle,
+        "kick_poll_sleep": args.virtiofs_kick_poll_sleep,
+        "direct_memory": args.virtiofs_direct_memory,
     }
 
 
@@ -485,6 +567,10 @@ def diff_virtiofs_stats(before: Any, after: Any) -> Any:
                 before_item.get("queue_notifies", []),
                 after_item.get("queue_notifies", []),
             ),
+            "kick_poll_loops": int(after_item.get("kick_poll_loops", 0)) - int(before_item.get("kick_poll_loops", 0)),
+            "kick_poll_hits": int(after_item.get("kick_poll_hits", 0)) - int(before_item.get("kick_poll_hits", 0)),
+            "kick_poll_misses": int(after_item.get("kick_poll_misses", 0)) - int(before_item.get("kick_poll_misses", 0)),
+            "kick_poll_works": int(after_item.get("kick_poll_works", 0)) - int(before_item.get("kick_poll_works", 0)),
             "fuse_ops": [],
             "stages": [],
         }
@@ -559,6 +645,29 @@ def diff_numeric_list(before: Any, after: Any) -> list[int]:
     ]
 
 
+def diff_exit_stats(before: Any, after: Any) -> list[dict[str, Any]]:
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return []
+    out = []
+    for name, after_item in after.items():
+        if not isinstance(after_item, dict):
+            continue
+        before_item = before.get(name, {})
+        if not isinstance(before_item, dict):
+            before_item = {}
+        count = int(after_item.get("count", 0)) - int(before_item.get("count", 0))
+        total_nanos = int(after_item.get("total_nanos", 0)) - int(before_item.get("total_nanos", 0))
+        out.append({
+            "name": name,
+            "count": count,
+            "total_nanos": total_nanos,
+            "average_nanos": total_nanos // count if count else 0,
+            "max_nanos_after": int(after_item.get("max_nanos", 0)),
+        })
+    out.sort(key=lambda item: item["total_nanos"], reverse=True)
+    return out
+
+
 def run_host(args: argparse.Namespace) -> dict[str, Any]:
     host_root = args.work_dir / "host"
     print(f"[fsbench] running host benchmark in {host_root}", file=sys.stderr)
@@ -590,6 +699,7 @@ def run_guest(args: argparse.Namespace) -> dict[str, Any]:
         or args.pprof_block_profile is not None
     ):
         os.environ["CCX3_PPROF"] = "1"
+    os.environ["CCX3_EXIT_TIMING"] = "1"
     virtiofs_config = apply_virtiofs_env(args)
     print(f"[fsbench] starting ccvm daemon with cache {args.cache_dir}", file=sys.stderr)
     state = start_daemon_for_cache_dir(args.cache_dir)
@@ -615,6 +725,7 @@ def run_guest(args: argparse.Namespace) -> dict[str, Any]:
             cpus=args.cpus,
         )
         stats_before = fetch_virtiofs_stats(str(client._client.base_url))
+        exits_before = fetch_exit_stats(str(client._client.base_url))
         print(f"[fsbench] running guest benchmark in {guest_work}", file=sys.stderr)
         profile_thread = None
         if args.pprof_cpu_profile is not None:
@@ -627,7 +738,7 @@ def run_guest(args: argparse.Namespace) -> dict[str, Any]:
         result = client.run(
             args.image_name,
             ["python3", guest_script_path, *benchmark_args("crumblecracker", guest_work, args)],
-            shares=[ShareMount(source=str(guest_host_root.resolve()), mount=mount, writable=True)],
+            shares=[ShareMount(source=str(guest_host_root.resolve()), mount=mount, writable=True, cache=args.share_cache)],
             timeout=None,
         )
         if profile_thread is not None:
@@ -642,12 +753,29 @@ def run_guest(args: argparse.Namespace) -> dict[str, Any]:
             fetch_pprof_profile(str(client._client.base_url), "block", args.pprof_block_profile)
         payload = json.loads(result.output)
         stats_after = fetch_virtiofs_stats(str(client._client.base_url))
+        exits_after = fetch_exit_stats(str(client._client.base_url))
         payload["virtiofs_stats_before"] = stats_before
         payload["virtiofs_stats_after"] = stats_after
         payload["virtiofs_stats_delta"] = diff_virtiofs_stats(stats_before, stats_after)
+        payload["exit_stats_before"] = exits_before
+        payload["exit_stats_after"] = exits_after
+        payload["exit_stats_delta"] = diff_exit_stats(exits_before, exits_after)
         payload["virtiofs_config"] = virtiofs_config
         return payload
     finally:
+        if args.shutdown_daemon:
+            try:
+                urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"{str(client._client.base_url).rstrip('/')}/shutdown",
+                        method="POST",
+                        data=b"{}",
+                        headers={"Content-Type": "application/json"},
+                    ),
+                    timeout=5,
+                ).read()
+            except Exception:
+                pass
         client.close()
 
 
@@ -705,7 +833,10 @@ def print_virtiofs_summary(guest: dict[str, Any]) -> None:
             f"async={config.get('async')} "
             f"workers={config.get('workers') or 'default'} "
             f"cache={config.get('cache')} "
-            f"writeback={config.get('writeback')}"
+            f"share_cache={config.get('share_cache')} "
+            f"writeback={config.get('writeback')} "
+            f"kick_poll={config.get('kick_poll')} "
+            f"direct_memory={config.get('direct_memory')}"
         )
     for item in delta:
         if not isinstance(item, dict):
@@ -715,6 +846,14 @@ def print_virtiofs_summary(guest: dict[str, Any]) -> None:
             f"requests={item.get('fuse_requests', 0)} "
             f"queues={item.get('queue_notifies', [])}"
         )
+        if item.get("kick_poll_loops"):
+            print(
+                "  kick-poll "
+                f"loops={item.get('kick_poll_loops', 0)} "
+                f"hits={item.get('kick_poll_hits', 0)} "
+                f"misses={item.get('kick_poll_misses', 0)} "
+                f"works={item.get('kick_poll_works', 0)}"
+            )
         ops = [
             op for op in item.get("fuse_ops", [])
             if isinstance(op, dict) and int(op.get("count", 0)) > 0
@@ -722,6 +861,18 @@ def print_virtiofs_summary(guest: dict[str, Any]) -> None:
         for op in ops:
             avg_us = int(op.get("average_nanos", 0)) / 1000.0
             print(f"  {op.get('name'):<10} {op.get('count'):>8} avg={avg_us:>8.1f}us")
+    exits = [
+        item for item in guest.get("exit_stats_delta", [])
+        if isinstance(item, dict) and int(item.get("count", 0)) > 0
+    ][:8]
+    if exits:
+        print()
+        print("Exit summary")
+        print("------------")
+        for item in exits:
+            avg_us = int(item.get("average_nanos", 0)) / 1000.0
+            total_ms = int(item.get("total_nanos", 0)) / 1_000_000.0
+            print(f"{item.get('name'):<36} {item.get('count'):>9} avg={avg_us:>7.1f}us total={total_ms:>8.1f}ms")
 
 
 def main() -> None:

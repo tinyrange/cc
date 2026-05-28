@@ -569,6 +569,75 @@ func TestFSConfigReportsMultipleRequestQueues(t *testing.T) {
 	}
 }
 
+func TestFSKickPollSuppressesQueueNotifyDuringBurst(t *testing.T) {
+	mem := &testGuestMemory{data: make([]byte, 0x8000)}
+	irq := &testIRQController{}
+
+	fsdev := NewFS(0x1000, 0x1000, 44, "root", NewPassthroughFS(t.TempDir(), nil))
+	fsdev.Strict = true
+	fsdev.Async = true
+	fsdev.kickPoll = true
+	fsdev.kickPollIdle = time.Millisecond
+	fsdev.kickPollSleep = 100 * time.Microsecond
+	fsdev.Attach(mem, irq)
+
+	const (
+		descAddr  = 0x2000
+		availAddr = 0x3000
+		usedAddr  = 0x3100
+		reqAddr   = 0x3200
+		respAddr  = 0x3300
+		queueSize = 8
+	)
+	req := make([]byte, fuseInHeaderSize+16)
+	binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
+	binary.LittleEndian.PutUint32(req[4:8], fuseInit)
+	binary.LittleEndian.PutUint64(req[8:16], 404)
+	binary.LittleEndian.PutUint32(req[40:44], 7)
+	binary.LittleEndian.PutUint32(req[44:48], 31)
+	copy(mem.data[reqAddr:], req)
+
+	binary.LittleEndian.PutUint64(mem.data[descAddr:descAddr+8], reqAddr)
+	binary.LittleEndian.PutUint32(mem.data[descAddr+8:descAddr+12], uint32(len(req)))
+	binary.LittleEndian.PutUint16(mem.data[descAddr+12:descAddr+14], descFNext)
+	binary.LittleEndian.PutUint16(mem.data[descAddr+14:descAddr+16], 1)
+	binary.LittleEndian.PutUint64(mem.data[descAddr+16:descAddr+24], respAddr)
+	binary.LittleEndian.PutUint32(mem.data[descAddr+24:descAddr+28], fuseOutHeaderSize+fuseInitOutSize)
+	binary.LittleEndian.PutUint16(mem.data[descAddr+28:descAddr+30], descFWrite)
+
+	binary.LittleEndian.PutUint16(mem.data[availAddr+2:availAddr+4], 1)
+	binary.LittleEndian.PutUint16(mem.data[availAddr+4:availAddr+6], 0)
+
+	for _, write := range []struct {
+		reg   uint64
+		value uint64
+	}{
+		{regQueueSel, fsQueueRequest},
+		{regQueueNum, queueSize},
+		{regQueueDescLow, descAddr},
+		{regQueueAvailLow, availAddr},
+		{regQueueUsedLow, usedAddr},
+		{regQueueReady, 1},
+		{regQueueNotify, fsQueueRequest},
+	} {
+		if err := fsdev.Write(0x1000+write.reg, 4, write.value); err != nil {
+			t.Fatalf("Write(reg=%#x) error = %v", write.reg, err)
+		}
+	}
+
+	if flags := binary.LittleEndian.Uint16(mem.data[usedAddr : usedAddr+2]); flags&1 == 0 {
+		t.Fatalf("used flags = %#x, want NO_NOTIFY set", flags)
+	}
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if flags := binary.LittleEndian.Uint16(mem.data[usedAddr : usedAddr+2]); flags&1 == 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("used flags still %#x, want NO_NOTIFY cleared", binary.LittleEndian.Uint16(mem.data[usedAddr:usedAddr+2]))
+}
+
 func TestFSSyncSecondaryRequestQueueCompletes(t *testing.T) {
 	mem := &testGuestMemory{data: make([]byte, 0x8000)}
 	irq := &testIRQController{}
@@ -631,6 +700,84 @@ func TestFSSyncSecondaryRequestQueueCompletes(t *testing.T) {
 	}
 	if got := binary.LittleEndian.Uint64(mem.data[respAddr+8 : respAddr+16]); got != 202 {
 		t.Fatalf("reply unique = %d, want 202", got)
+	}
+}
+
+type slicingTestGuestMemory struct {
+	testGuestMemory
+	slices int
+}
+
+func (m *slicingTestGuestMemory) SliceIPA(addr uint64, size int) ([]byte, error) {
+	m.slices++
+	return m.data[addr : addr+uint64(size)], nil
+}
+
+func TestFSQueueUsesDirectGuestMemorySlices(t *testing.T) {
+	mem := &slicingTestGuestMemory{testGuestMemory: testGuestMemory{data: make([]byte, 0x8000)}}
+	irq := &testIRQController{}
+
+	fsdev := NewFS(0x1000, 0x1000, 44, "root", NewPassthroughFS(t.TempDir(), nil))
+	fsdev.Strict = true
+	fsdev.Async = false
+	fsdev.Attach(mem, irq)
+
+	const (
+		descAddr  = 0x2000
+		availAddr = 0x3000
+		usedAddr  = 0x3100
+		reqAddr   = 0x3200
+		respAddr  = 0x3300
+		queueSize = 8
+	)
+	req := make([]byte, fuseInHeaderSize+16)
+	binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
+	binary.LittleEndian.PutUint32(req[4:8], fuseInit)
+	binary.LittleEndian.PutUint64(req[8:16], 303)
+	binary.LittleEndian.PutUint32(req[40:44], 7)
+	binary.LittleEndian.PutUint32(req[44:48], 31)
+	copy(mem.data[reqAddr:], req)
+
+	binary.LittleEndian.PutUint64(mem.data[descAddr:descAddr+8], reqAddr)
+	binary.LittleEndian.PutUint32(mem.data[descAddr+8:descAddr+12], uint32(len(req)))
+	binary.LittleEndian.PutUint16(mem.data[descAddr+12:descAddr+14], descFNext)
+	binary.LittleEndian.PutUint16(mem.data[descAddr+14:descAddr+16], 1)
+	binary.LittleEndian.PutUint64(mem.data[descAddr+16:descAddr+24], respAddr)
+	binary.LittleEndian.PutUint32(mem.data[descAddr+24:descAddr+28], fuseOutHeaderSize+fuseInitOutSize)
+	binary.LittleEndian.PutUint16(mem.data[descAddr+28:descAddr+30], descFWrite)
+
+	binary.LittleEndian.PutUint16(mem.data[availAddr+2:availAddr+4], 1)
+	binary.LittleEndian.PutUint16(mem.data[availAddr+4:availAddr+6], 0)
+
+	for _, write := range []struct {
+		reg   uint64
+		value uint64
+	}{
+		{regQueueSel, fsQueueRequest},
+		{regQueueNum, queueSize},
+		{regQueueDescLow, descAddr},
+		{regQueueAvailLow, availAddr},
+		{regQueueUsedLow, usedAddr},
+		{regQueueReady, 1},
+		{regQueueNotify, fsQueueRequest},
+	} {
+		if err := fsdev.Write(0x1000+write.reg, 4, write.value); err != nil {
+			t.Fatalf("Write(reg=%#x) error = %v", write.reg, err)
+		}
+	}
+
+	q := &fsdev.queues[fsQueueRequest]
+	if q.descMem == nil || q.availMem == nil || q.usedMem == nil {
+		t.Fatalf("queue cache not populated: desc=%v avail=%v used=%v", q.descMem != nil, q.availMem != nil, q.usedMem != nil)
+	}
+	if mem.slices == 0 {
+		t.Fatal("SliceIPA was not used")
+	}
+	if usedIdx := binary.LittleEndian.Uint16(mem.data[usedAddr+2 : usedAddr+4]); usedIdx != 1 {
+		t.Fatalf("used idx = %d, want 1", usedIdx)
+	}
+	if got := binary.LittleEndian.Uint64(mem.data[respAddr+8 : respAddr+16]); got != 303 {
+		t.Fatalf("reply unique = %d, want 303", got)
 	}
 }
 
@@ -1543,6 +1690,69 @@ func TestFUSECachePolicyEncodesTTLAndOpenFlags(t *testing.T) {
 		t.Fatalf("OPEN flags = %#x, want NO_FLUSH", openFlags)
 	}
 	fsdev.backend.Release(nodeID, binary.LittleEndian.Uint64(openReply[fuseOutHeaderSize:fuseOutHeaderSize+8]))
+}
+
+func TestMountedFSCachePolicyKeepsSharesStrict(t *testing.T) {
+	t.Setenv("CCX3_VIRTIOFS_CACHE", "")
+
+	root := t.TempDir()
+	host := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "root.txt"), []byte("root"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(host, "host.txt"), []byte("host"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	be := NewMountedFS(NewImageFS(imagefs.NewHostFS(root, nil), root), []ShareMount{{
+		GuestPath: "/host",
+		Backend:   NewPassthroughFS(host, nil),
+		Writable:  true,
+	}})
+	fsdev := NewFS(0, 0, 0, "root", be)
+
+	rootReply, err := fsdev.dispatchFUSELocked(lookupRequest(1, "root.txt"))
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(root LOOKUP) error = %v", err)
+	}
+	rootExtra := rootReply[fuseOutHeaderSize:]
+	if got := binary.LittleEndian.Uint64(rootExtra[16:24]); got != 60 {
+		t.Fatalf("root entry TTL seconds = %d, want 60", got)
+	}
+	if got := binary.LittleEndian.Uint64(rootExtra[24:32]); got != 60 {
+		t.Fatalf("root attr TTL seconds = %d, want 60", got)
+	}
+
+	hostMountReply, err := fsdev.dispatchFUSELocked(lookupRequest(1, "host"))
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(host LOOKUP) error = %v", err)
+	}
+	hostMountExtra := hostMountReply[fuseOutHeaderSize:]
+	if got := binary.LittleEndian.Uint64(hostMountExtra[16:24]); got != 0 {
+		t.Fatalf("/host entry TTL seconds = %d, want 0", got)
+	}
+	hostNodeID := binary.LittleEndian.Uint64(hostMountExtra[0:8])
+
+	hostFileReply, err := fsdev.dispatchFUSELocked(lookupRequest(hostNodeID, "host.txt"))
+	if err != nil {
+		t.Fatalf("dispatchFUSELocked(/host file LOOKUP) error = %v", err)
+	}
+	hostFileExtra := hostFileReply[fuseOutHeaderSize:]
+	if got := binary.LittleEndian.Uint64(hostFileExtra[16:24]); got != 0 {
+		t.Fatalf("/host file entry TTL seconds = %d, want 0", got)
+	}
+	if got := binary.LittleEndian.Uint64(hostFileExtra[24:32]); got != 0 {
+		t.Fatalf("/host file attr TTL seconds = %d, want 0", got)
+	}
+}
+
+func lookupRequest(parent uint64, name string) []byte {
+	req := make([]byte, fuseInHeaderSize+len(name)+1)
+	binary.LittleEndian.PutUint32(req[0:4], uint32(len(req)))
+	binary.LittleEndian.PutUint32(req[4:8], fuseLookup)
+	binary.LittleEndian.PutUint64(req[8:16], 1)
+	binary.LittleEndian.PutUint64(req[16:24], parent)
+	copy(req[fuseInHeaderSize:], name)
+	return req
 }
 
 func TestFUSENormalCachePolicyDisablesLookupTTL(t *testing.T) {

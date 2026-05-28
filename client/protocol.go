@@ -277,6 +277,7 @@ type ShareMount struct {
 	MapOwner bool   `json:"map_owner,omitempty"`
 	OwnerUID uint32 `json:"owner_uid,omitempty"`
 	OwnerGID uint32 `json:"owner_gid,omitempty"`
+	Cache    string `json:"cache,omitempty"`
 }
 
 type NetworkConfig struct {

@@ -14,6 +14,12 @@ type ContainerRunRequest = vmruntime.RunRequest
 type DirectoryShare = vmruntime.DirectoryShare
 type ContainerRunResult = vmruntime.RunResult
 
+type exitTimingBucket struct {
+	Count      int64 `json:"count"`
+	TotalNanos int64 `json:"total_nanos"`
+	MaxNanos   int64 `json:"max_nanos"`
+}
+
 type ContainerSession struct{}
 
 func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
@@ -50,4 +56,8 @@ func RunContainer(ctx context.Context, req ContainerRunRequest) (ContainerRunRes
 	_ = ctx
 	_ = req
 	return ContainerRunResult{}, fmt.Errorf("hvf container runner is unsupported on this host")
+}
+
+func ExitTimingSnapshot() map[string]exitTimingBucket {
+	return nil
 }

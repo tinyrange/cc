@@ -24,6 +24,7 @@ type ShareMount struct {
 	GuestPath string
 	Backend   FSBackend
 	Writable  bool
+	CacheMode string
 }
 
 type mountedFS struct {
@@ -45,6 +46,7 @@ type shareMount struct {
 	path     string
 	backend  FSBackend
 	writable bool
+	cache    string
 }
 
 type mountedNode struct {
@@ -76,6 +78,7 @@ func NewMountedFS(root FSBackend, shares []ShareMount) FSBackend {
 			path:     mountPath,
 			backend:  share.Backend,
 			writable: share.Writable,
+			cache:    normalizeMountCacheMode(share.CacheMode),
 		})
 	}
 	sort.Slice(mounts, func(i, j int) bool {
@@ -125,7 +128,7 @@ func (m *mountedFS) AddShare(share ShareMount) error {
 		if existing.path != mountPath {
 			continue
 		}
-		if existing.writable != share.Writable || existing.backend != share.Backend {
+		if existing.writable != share.Writable || existing.backend != share.Backend || existing.cache != normalizeMountCacheMode(share.CacheMode) {
 			return fmt.Errorf("mount path %q is already in use", mountPath)
 		}
 		return nil
@@ -135,6 +138,7 @@ func (m *mountedFS) AddShare(share ShareMount) error {
 		path:     mountPath,
 		backend:  share.Backend,
 		writable: share.Writable,
+		cache:    normalizeMountCacheMode(share.CacheMode),
 	})
 	sort.Slice(m.mounts, func(i, j int) bool {
 		if len(m.mounts[i].path) == len(m.mounts[j].path) {
@@ -143,6 +147,19 @@ func (m *mountedFS) AddShare(share ShareMount) error {
 		return len(m.mounts[i].path) < len(m.mounts[j].path)
 	})
 	return nil
+}
+
+func normalizeMountCacheMode(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case fsCacheAggressive:
+		return fsCacheAggressive
+	case fsCacheNormal:
+		return fsCacheNormal
+	case fsCacheStrict, "":
+		return fsCacheStrict
+	default:
+		return fsCacheStrict
+	}
 }
 
 func (m *mountedFS) SetWritebackCache(enabled bool) {
@@ -163,6 +180,17 @@ func (m *mountedFS) SetWritebackCache(enabled bool) {
 			be.SetWritebackCache(enabled)
 		}
 	}
+}
+
+func (m *mountedFS) CachePolicy(nodeID uint64) FSCachePolicy {
+	node := m.node(nodeID)
+	if node == nil {
+		return cachePolicyForMode(fsCacheStrict)
+	}
+	if mount := m.mountForPath(node.path); mount != nil {
+		return cachePolicyForMode(mount.cache)
+	}
+	return cachePolicyForMode(fsCacheAggressive)
 }
 
 func cleanMountPath(value string) string {
