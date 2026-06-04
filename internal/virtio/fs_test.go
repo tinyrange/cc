@@ -1212,6 +1212,93 @@ func TestImageFSUnlinkWhiteoutsLowerFile(t *testing.T) {
 	}
 }
 
+func TestImageFSRootSnapshotIncludesOverlayChanges(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "etc"), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc", "base"), []byte("base"), 0o644); err != nil {
+		t.Fatalf("WriteFile(base) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "etc", "delete"), []byte("delete"), 0o644); err != nil {
+		t.Fatalf("WriteFile(delete) error = %v", err)
+	}
+	be := NewImageFS(imagefs.NewHostFS(root, nil), root).(*imageFS)
+
+	etcID, _, errno := be.Lookup(1, "etc")
+	if errno != 0 {
+		t.Fatalf("Lookup(etc) errno = %d", errno)
+	}
+	baseID, _, errno := be.Lookup(etcID, "base")
+	if errno != 0 {
+		t.Fatalf("Lookup(base) errno = %d", errno)
+	}
+	fh, errno := be.Open(baseID, linuxOWRONLY|linuxOTRUNC)
+	if errno != 0 {
+		t.Fatalf("Open(base) errno = %d", errno)
+	}
+	if wrote, errno := be.Write(baseID, fh, 0, []byte("changed"), 0); errno != 0 || wrote != 7 {
+		t.Fatalf("Write(base) = (%d, %d), want (7, 0)", wrote, errno)
+	}
+	be.Release(baseID, fh)
+	newID, newFH, _, errno := be.Create(etcID, "new", linuxOWRONLY|linuxOCREAT|linuxOTRUNC, 0o644, 0, 0)
+	if errno != 0 {
+		t.Fatalf("Create(new) errno = %d", errno)
+	}
+	if wrote, errno := be.Write(newID, newFH, 0, []byte("new"), 0); errno != 0 || wrote != 3 {
+		t.Fatalf("Write(new) = (%d, %d), want (3, 0)", wrote, errno)
+	}
+	be.Release(newID, newFH)
+	if _, _, errno := be.Symlink(etcID, "base-link", "base", 0, 0); errno != 0 {
+		t.Fatalf("Symlink(base-link) errno = %d", errno)
+	}
+	if _, _, errno := be.Lookup(etcID, "delete"); errno != 0 {
+		t.Fatalf("Lookup(delete) errno = %d", errno)
+	}
+	if errno := be.Unlink(etcID, "delete"); errno != 0 {
+		t.Fatalf("Unlink(delete) errno = %d", errno)
+	}
+
+	snapshot, err := be.RootSnapshot()
+	if err != nil {
+		t.Fatalf("RootSnapshot() error = %v", err)
+	}
+	base, err := imagefs.LookupPath(snapshot, "/etc/base")
+	if err != nil {
+		t.Fatalf("LookupPath(/etc/base) error = %v", err)
+	}
+	data, err := base.File.ReadAt(0, 32)
+	if err != nil {
+		t.Fatalf("ReadAt(/etc/base) error = %v", err)
+	}
+	if string(data) != "changed" {
+		t.Fatalf("/etc/base = %q, want changed", data)
+	}
+	newFile, err := imagefs.LookupPath(snapshot, "/etc/new")
+	if err != nil {
+		t.Fatalf("LookupPath(/etc/new) error = %v", err)
+	}
+	newData, err := newFile.File.ReadAt(0, 32)
+	if err != nil {
+		t.Fatalf("ReadAt(/etc/new) error = %v", err)
+	}
+	if string(newData) != "new" {
+		t.Fatalf("/etc/new = %q, want new", newData)
+	}
+	link, err := imagefs.LookupPath(snapshot, "/etc/base-link")
+	if err != nil {
+		t.Fatalf("LookupPath(/etc/base-link) error = %v", err)
+	}
+	if link.Symlink == nil || link.Symlink.Target() != "base" {
+		t.Fatalf("/etc/base-link = %#v, want symlink to base", link)
+	}
+	if _, err := imagefs.LookupPath(snapshot, "/etc/delete"); err == nil {
+		t.Fatalf("LookupPath(/etc/delete) succeeded, want whiteout")
+	}
+}
+
 func TestImageFSRenameReplacesLowerFileInOverlay(t *testing.T) {
 	t.Parallel()
 

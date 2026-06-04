@@ -37,6 +37,7 @@ const (
 	SourceKindSIMG          = "simg"
 	SourceKindCVMFS         = "cvmfs"
 	SourceKindDockerArchive = "docker-archive"
+	SourceKindSaved         = "saved"
 )
 
 type Store struct {
@@ -95,6 +96,12 @@ type PullOptions struct {
 	PrefetchWorkers int
 	CVMFSMirrors    []string
 	Report          func(client.ProgressEvent)
+}
+
+type SaveOptions struct {
+	Source       string
+	Architecture string
+	Config       RuntimeConfig
 }
 
 func reportPullProgress(report func(client.ProgressEvent), event client.ProgressEvent) {

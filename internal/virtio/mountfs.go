@@ -106,6 +106,15 @@ type ShareMounter interface {
 	AddShare(ShareMount) error
 }
 
+func (m *mountedFS) RootSnapshot() (imagefs.Directory, error) {
+	if snap, ok := m.root.(interface {
+		RootSnapshot() (imagefs.Directory, error)
+	}); ok {
+		return snap.RootSnapshot()
+	}
+	return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+}
+
 func (m *mountedFS) AddShare(share ShareMount) error {
 	mountPath := cleanMountPath(share.GuestPath)
 	if mountPath == "/" {

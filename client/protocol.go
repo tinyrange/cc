@@ -96,6 +96,10 @@ type ImageState struct {
 	Error      string `json:"error,omitempty"`
 }
 
+type SaveImageRequest struct {
+	Name string `json:"name"`
+}
+
 type PullImageRequest struct {
 	Source          string       `json:"-"`
 	SourceRef       *ImageSource `json:"-"`

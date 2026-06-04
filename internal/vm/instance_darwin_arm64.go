@@ -4,9 +4,11 @@ package vm
 
 import (
 	"context"
+	"fmt"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/hv/hvf"
+	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/virtio"
 )
 
@@ -45,6 +47,20 @@ func (i *darwinInstance) ExecStream(
 	onEvent func(client.ExecEvent) error,
 ) error {
 	return i.session.ExecStream(ctx, req, inputs, onEvent)
+}
+
+func (i *darwinInstance) Flush(ctx context.Context) error {
+	if i == nil || i.session == nil {
+		return fmt.Errorf("instance is not running")
+	}
+	return i.session.Flush(ctx)
+}
+
+func (i *darwinInstance) RootSnapshot() (imagefs.Directory, error) {
+	if i == nil || i.session == nil {
+		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+	}
+	return i.session.RootSnapshot()
 }
 
 func (i *darwinInstance) Wait() error {

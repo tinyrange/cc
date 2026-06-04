@@ -951,6 +951,91 @@ func TestStoreReadMetadataBackfillsSourceKind(t *testing.T) {
 	}
 }
 
+func TestStoreSaveRootFSPersistsImageAndExcludesRuntimePaths(t *testing.T) {
+	rootDir := t.TempDir()
+	for _, dir := range []string{"etc", "bin", "tmp", "proc", "host", ".ccx3"} {
+		if err := os.MkdirAll(filepath.Join(rootDir, dir), 0o755); err != nil {
+			t.Fatalf("MkdirAll(%s) error = %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "etc", "motd"), []byte("hello saved image"), 0o644); err != nil {
+		t.Fatalf("WriteFile(motd) error = %v", err)
+	}
+	if err := os.Symlink("../etc/motd", filepath.Join(rootDir, "bin", "motd")); err != nil {
+		t.Fatalf("Symlink(bin/motd) error = %v", err)
+	}
+	for _, file := range []string{"tmp/drop", "proc/drop", "host/drop", ".ccx3/drop"} {
+		if err := os.WriteFile(filepath.Join(rootDir, filepath.FromSlash(file)), []byte("runtime"), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s) error = %v", file, err)
+		}
+	}
+
+	store := NewStore(t.TempDir())
+	state, err := store.SaveRootFS(context.Background(), "saved", imagefs.NewHostFS(rootDir, nil), SaveOptions{
+		Source:       "vm:work from ubuntu",
+		Architecture: "amd64",
+		Config: RuntimeConfig{
+			Env:        []string{"A=B"},
+			Entrypoint: []string{"/bin/sh"},
+			Cmd:        []string{"-l"},
+			WorkingDir: "/work",
+			User:       "root",
+			Labels:     map[string]string{"saved": "true"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("SaveRootFS() error = %v", err)
+	}
+	if state.Name != "saved" || state.SourceKind != SourceKindSaved {
+		t.Fatalf("state = %#v, want saved image state", state)
+	}
+
+	img, err := store.Open("saved")
+	if err != nil {
+		t.Fatalf("Open(saved) error = %v", err)
+	}
+	if img.SourceKind != SourceKindSaved || img.Source != "vm:work from ubuntu" || img.Architecture != "amd64" {
+		t.Fatalf("image metadata = %#v", img)
+	}
+	if len(img.Config.Env) != 1 || img.Config.Env[0] != "A=B" || img.Config.WorkingDir != "/work" || img.Config.User != "root" {
+		t.Fatalf("runtime config = %#v, want inherited config", img.Config)
+	}
+
+	entry, err := imagefs.LookupPath(img.RootFS, "/etc/motd")
+	if err != nil {
+		t.Fatalf("LookupPath(/etc/motd) error = %v", err)
+	}
+	data, err := entry.File.ReadAt(0, 64)
+	if err != nil {
+		t.Fatalf("ReadAt(/etc/motd) error = %v", err)
+	}
+	if string(data) != "hello saved image" {
+		t.Fatalf("/etc/motd = %q, want saved contents", data)
+	}
+	link, err := imagefs.LookupPath(img.RootFS, "/bin/motd")
+	if err != nil {
+		t.Fatalf("LookupPath(/bin/motd) error = %v", err)
+	}
+	if link.Symlink == nil || link.Symlink.Target() != "../etc/motd" {
+		t.Fatalf("/bin/motd = %#v, want symlink to ../etc/motd", link)
+	}
+	for _, excluded := range []string{"/tmp/drop", "/proc/drop", "/host/drop", "/.ccx3/drop"} {
+		if _, err := imagefs.LookupPath(img.RootFS, excluded); err == nil {
+			t.Fatalf("LookupPath(%s) succeeded, want excluded", excluded)
+		}
+	}
+}
+
+func TestStoreSaveRootFSRejectsPathTraversalName(t *testing.T) {
+	store := NewStore(t.TempDir())
+	root := imagefs.NewHostFS(t.TempDir(), nil)
+	for _, name := range []string{"../escape", "/escape", "nested/../escape"} {
+		if _, err := store.SaveRootFS(context.Background(), name, root, SaveOptions{}); err == nil {
+			t.Fatalf("SaveRootFS(%q) error = nil, want rejection", name)
+		}
+	}
+}
+
 func TestStorePullReportsUnsupportedSourceKinds(t *testing.T) {
 	store := NewStore(t.TempDir())
 	tests := []struct {

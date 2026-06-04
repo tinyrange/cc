@@ -136,6 +136,12 @@ func (c *Client) PullImageStream(name string, req PullImageRequest, onEvent func
 	return c.postJSONProgressStream("/image/"+imagePathName(name), req, onEvent)
 }
 
+func (c *Client) SaveInstanceImage(id string, req SaveImageRequest) (ImageState, error) {
+	var ret ImageState
+	err := c.postJSONExpectOK("/vm/"+imagePathName(id)+"/save", req, &ret)
+	return ret, err
+}
+
 func imagePathName(name string) string {
 	return url.PathEscape(name)
 }

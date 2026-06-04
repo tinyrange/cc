@@ -986,6 +986,13 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 		}
 		switch req.Kind {
 		case "exec":
+		case "sync":
+			if req.ID == "" {
+				writeKernel("ccx3-init: sync request missing id")
+				continue
+			}
+			go runSyncRequest(cfg, control, req.ID)
+			continue
 		case "stdin":
 			activeMu.Lock()
 			managed := active[req.ID]
@@ -1079,6 +1086,16 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 			delete(active, req.ID)
 			activeMu.Unlock()
 		})
+	}
+}
+
+func runSyncRequest(cfg config, control io.Writer, id string) {
+	if cfg.BeginMarker != "" {
+		writeProtocolLineTo(control, cfg.BeginMarker+id)
+	}
+	syscall.Sync()
+	if cfg.ExitMarkerPrefix != "" {
+		writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":0")
 	}
 }
 

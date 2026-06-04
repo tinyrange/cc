@@ -521,6 +521,49 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 	return client.ExecResponse{ExitCode: exitCode, Output: output}, nil
 }
 
+func (s *ContainerSession) Flush(ctx context.Context) error {
+	id := strconv.FormatUint(s.nextID.Add(1), 10)
+	payload, err := json.Marshal(guestExecRequest{Kind: "sync", ID: id})
+	if err != nil {
+		return fmt.Errorf("marshal sync request: %w", err)
+	}
+	start := s.transcript.Len()
+	s.sendMu.Lock()
+	err = s.writeControlPayload(append(payload, '\n'))
+	s.sendMu.Unlock()
+	if err != nil {
+		return err
+	}
+	segment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+		_, _, ok := extractManagedExecResult(text, id, s.dmesg)
+		return ok
+	})
+	if err != nil {
+		return err
+	}
+	code, output, ok := extractManagedExecResult(segment, id, s.dmesg)
+	if !ok {
+		return fmt.Errorf("sync did not produce a complete result")
+	}
+	if code != 0 {
+		return fmt.Errorf("sync exited with status %d: %s", code, output)
+	}
+	return nil
+}
+
+func (s *ContainerSession) RootSnapshot() (imagefs.Directory, error) {
+	if s == nil || s.rootFS == nil {
+		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+	}
+	snapshotter, ok := s.rootFS.(interface {
+		RootSnapshot() (imagefs.Directory, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+	}
+	return snapshotter.RootSnapshot()
+}
+
 func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	execStart := time.Now()
 	if len(req.Command) == 0 {

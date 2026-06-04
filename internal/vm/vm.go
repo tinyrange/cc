@@ -12,6 +12,7 @@ import (
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/hv"
+	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/virtio"
 )
 
@@ -43,6 +44,14 @@ type virtioFSStatsProvider interface {
 
 type networkIPv4Provider interface {
 	NetworkIPv4() string
+}
+
+type instanceFlushProvider interface {
+	Flush(context.Context) error
+}
+
+type rootSnapshotProvider interface {
+	RootSnapshot() (imagefs.Directory, error)
 }
 
 type Manager struct {
@@ -399,6 +408,30 @@ func (m *Manager) AddPortForwardTo(ctx context.Context, id string, forward clien
 		return fmt.Errorf("no VM %q is running", id)
 	}
 	return machine.instance.AddPortForward(ctx, forward)
+}
+
+func (m *Manager) SnapshotRootFS(ctx context.Context, id string) (imagefs.Directory, string, error) {
+	id = instanceID(id)
+	m.mu.Lock()
+	machine := m.running[id]
+	m.mu.Unlock()
+	if machine == nil {
+		return nil, "", fmt.Errorf("no VM %q is running", id)
+	}
+	if flusher, ok := machine.instance.(instanceFlushProvider); ok {
+		if err := flusher.Flush(ctx); err != nil {
+			return nil, "", err
+		}
+	}
+	snapshotter, ok := machine.instance.(rootSnapshotProvider)
+	if !ok {
+		return nil, "", fmt.Errorf("VM %q root filesystem cannot be snapshotted", id)
+	}
+	root, err := snapshotter.RootSnapshot()
+	if err != nil {
+		return nil, "", err
+	}
+	return root, machine.image, nil
 }
 
 func (m *Manager) Status() client.InstanceState {

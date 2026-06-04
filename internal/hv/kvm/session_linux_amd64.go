@@ -234,6 +234,29 @@ func (s *ManagedSession) Exec(ctx context.Context, req client.ExecRequest) (clie
 	return client.ExecResponse{ExitCode: code, Output: output, Usage: usage}, nil
 }
 
+func (s *ManagedSession) Flush(ctx context.Context) error {
+	id := strconv.FormatUint(s.nextID.Add(1), 10)
+	start := s.transcript.Len()
+	if err := s.sendExecMessage(vmruntime.ManagedExecRequest{Kind: "sync", ID: id}); err != nil {
+		return transcriptError(err, s.serialOut.String(), s.transcript.String())
+	}
+	segment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+		_, _, _, ok := vmruntime.ExtractManagedExecResult(text, id, s.dmesg)
+		return ok
+	})
+	if err != nil {
+		return transcriptError(err, s.serialOut.String(), s.transcript.String())
+	}
+	code, output, _, ok := vmruntime.ExtractManagedExecResult(segment, id, s.dmesg)
+	if !ok {
+		return transcriptError(fmt.Errorf("sync did not produce a complete result"), s.serialOut.String(), s.transcript.String())
+	}
+	if code != 0 {
+		return transcriptError(fmt.Errorf("sync exited with status %d: %s", code, output), s.serialOut.String(), s.transcript.String())
+	}
+	return nil
+}
+
 func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	if len(req.Command) == 0 {
 		return fmt.Errorf("exec command is required")

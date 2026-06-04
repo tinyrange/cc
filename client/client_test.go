@@ -302,7 +302,7 @@ func TestClientCreateInstanceStreamRequiresReadyEvent(t *testing.T) {
 }
 
 func TestClientNamedInstanceHTTPHelpers(t *testing.T) {
-	var sawStatus, sawList, sawShutdown, sawForward, sawCreate bool
+	var sawStatus, sawList, sawShutdown, sawForward, sawCreate, sawSave bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/vm/status":
@@ -345,6 +345,16 @@ func TestClientNamedInstanceHTTPHelpers(t *testing.T) {
 				t.Fatalf("forward = %#v, want 8080:80", forward)
 			}
 			_ = json.NewEncoder(w).Encode(forward)
+		case "/vm/alpha beta/save":
+			sawSave = true
+			var req SaveImageRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode save request: %v", err)
+			}
+			if req.Name != "saved tag" {
+				t.Fatalf("save request = %#v, want saved tag", req)
+			}
+			_ = json.NewEncoder(w).Encode(ImageState{Name: req.Name, Status: "downloaded"})
 		default:
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -369,8 +379,11 @@ func TestClientNamedInstanceHTTPHelpers(t *testing.T) {
 	if err := c.AddPortForwardTo("alpha", PortForward{HostPort: 8080, GuestPort: 80}); err != nil {
 		t.Fatalf("AddPortForwardTo() error = %v", err)
 	}
-	if !sawStatus || !sawList || !sawCreate || !sawShutdown || !sawForward {
-		t.Fatalf("missing requests: status=%v list=%v create=%v shutdown=%v forward=%v", sawStatus, sawList, sawCreate, sawShutdown, sawForward)
+	if state, err := c.SaveInstanceImage("alpha beta", SaveImageRequest{Name: "saved tag"}); err != nil || state.Name != "saved tag" {
+		t.Fatalf("SaveInstanceImage() = %#v, %v", state, err)
+	}
+	if !sawStatus || !sawList || !sawCreate || !sawShutdown || !sawForward || !sawSave {
+		t.Fatalf("missing requests: status=%v list=%v create=%v shutdown=%v forward=%v save=%v", sawStatus, sawList, sawCreate, sawShutdown, sawForward, sawSave)
 	}
 }
 

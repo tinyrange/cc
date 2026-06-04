@@ -774,6 +774,40 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 	mux.HandleFunc("GET /vm", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, srvState.vms.Statuses())
 	})
+	mux.HandleFunc("POST /vm/{id}/save", func(w http.ResponseWriter, r *http.Request) {
+		var req client.SaveImageRequest
+		if err := decodeRequiredJSON(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		name := strings.TrimSpace(req.Name)
+		if name == "" {
+			writeError(w, http.StatusBadRequest, fmt.Errorf("image name is required"))
+			return
+		}
+		id := strings.TrimSpace(r.PathValue("id"))
+		root, sourceImage, err := srvState.vms.SnapshotRootFS(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		var opts oci.SaveOptions
+		if sourceImage != "" {
+			opts.Source = "vm:" + id + " from " + sourceImage
+			if image, err := srvState.images.Open(sourceImage); err == nil {
+				opts.Architecture = image.Architecture
+				opts.Config = image.Config
+			}
+		} else {
+			opts.Source = "vm:" + id
+		}
+		state, err := srvState.images.SaveRootFS(r.Context(), name, root, opts)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, state)
+	})
 	mux.HandleFunc("POST /vm/start", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		var req client.StartInstanceRequest
