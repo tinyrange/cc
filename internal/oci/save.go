@@ -95,7 +95,7 @@ func (s *Store) SaveRootFS(ctx context.Context, name string, root imagefs.Direct
 }
 
 func validateSavedImageName(name string) error {
-	if filepath.IsAbs(name) {
+	if filepath.IsAbs(name) || strings.HasPrefix(name, "/") || strings.HasPrefix(name, "\\") {
 		return fmt.Errorf("image name %q must be relative", name)
 	}
 	clean := filepath.Clean(name)

@@ -1016,7 +1016,7 @@ func TestStoreSaveRootFSPersistsImageAndExcludesRuntimePaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LookupPath(/bin/motd) error = %v", err)
 	}
-	if link.Symlink == nil || link.Symlink.Target() != "../etc/motd" {
+	if link.Symlink == nil || filepath.ToSlash(link.Symlink.Target()) != "../etc/motd" {
 		t.Fatalf("/bin/motd = %#v, want symlink to ../etc/motd", link)
 	}
 	for _, excluded := range []string{"/tmp/drop", "/proc/drop", "/host/drop", "/.ccx3/drop"} {
