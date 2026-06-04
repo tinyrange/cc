@@ -34,6 +34,7 @@ import (
 
 var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
 var debugPprof = strings.TrimSpace(os.Getenv("CCX3_DEBUG_PPROF")) != ""
+var bootEventWriteMu sync.Mutex
 
 const defaultVMBootTimeout = 5 * time.Second
 
@@ -1314,7 +1315,14 @@ func sanitizeExecEventForJSON(event client.ExecEvent) client.ExecEvent {
 	return event
 }
 
-func writeBootEvent(w http.ResponseWriter, event client.BootEvent) error {
+func writeBootEvent(w http.ResponseWriter, event client.BootEvent) (err error) {
+	bootEventWriteMu.Lock()
+	defer bootEventWriteMu.Unlock()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("write boot event: %v", recovered)
+		}
+	}()
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	if event.Kind == "" {
 		event.Kind = "status"

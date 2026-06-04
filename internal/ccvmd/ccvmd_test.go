@@ -57,6 +57,42 @@ func TestWantsProgressStream(t *testing.T) {
 	}
 }
 
+func TestWriteBootEventTurnsFlushPanicIntoError(t *testing.T) {
+	w := &panicFlushResponseWriter{header: make(http.Header)}
+	err := writeBootEvent(w, client.BootEvent{Kind: "status", Message: "starting"})
+	if err == nil {
+		t.Fatal("writeBootEvent() error = nil, want flush panic error")
+	}
+	if !strings.Contains(err.Error(), "flush panic") {
+		t.Fatalf("writeBootEvent() error = %v, want flush panic", err)
+	}
+	if w.header.Get("Content-Type") != "application/x-ndjson" {
+		t.Fatalf("Content-Type = %q", w.header.Get("Content-Type"))
+	}
+	if !strings.Contains(w.body.String(), `"starting"`) {
+		t.Fatalf("body = %q, want encoded boot event", w.body.String())
+	}
+}
+
+type panicFlushResponseWriter struct {
+	header http.Header
+	body   bytes.Buffer
+}
+
+func (w *panicFlushResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *panicFlushResponseWriter) Write(data []byte) (int, error) {
+	return w.body.Write(data)
+}
+
+func (w *panicFlushResponseWriter) WriteHeader(int) {}
+
+func (w *panicFlushResponseWriter) Flush() {
+	panic("flush panic")
+}
+
 func TestResolveVMBootTimeout(t *testing.T) {
 	t.Setenv("CCX3_VM_BOOT_TIMEOUT", "")
 	if got := resolveVMBootTimeout(); got != 5*time.Second {
