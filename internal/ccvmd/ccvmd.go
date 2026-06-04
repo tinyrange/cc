@@ -786,12 +786,16 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			return
 		}
 		id := strings.TrimSpace(r.PathValue("id"))
-		root, sourceImage, err := srvState.vms.SnapshotRootFS(r.Context(), id)
+		requestedImage := strings.TrimSpace(req.Image)
+		root, sourceImage, err := srvState.vms.SnapshotRootFS(r.Context(), id, requestedImage)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
 		var opts oci.SaveOptions
+		if sourceImage == "" {
+			sourceImage = requestedImage
+		}
 		if sourceImage != "" {
 			opts.Source = "vm:" + id + " from " + sourceImage
 			if image, err := srvState.images.Open(sourceImage); err == nil {

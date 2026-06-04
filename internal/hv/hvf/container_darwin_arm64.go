@@ -552,16 +552,32 @@ func (s *ContainerSession) Flush(ctx context.Context) error {
 }
 
 func (s *ContainerSession) RootSnapshot() (imagefs.Directory, error) {
+	return s.RootSnapshotAt("/")
+}
+
+func (s *ContainerSession) RootSnapshotAt(guestPath string) (imagefs.Directory, error) {
 	if s == nil || s.rootFS == nil {
 		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
 	}
+	if strings.TrimSpace(guestPath) == "" {
+		guestPath = "/"
+	}
+	if guestPath == "/" {
+		snapshotter, ok := s.rootFS.(interface {
+			RootSnapshot() (imagefs.Directory, error)
+		})
+		if !ok {
+			return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+		}
+		return snapshotter.RootSnapshot()
+	}
 	snapshotter, ok := s.rootFS.(interface {
-		RootSnapshot() (imagefs.Directory, error)
+		RootSnapshotAt(string) (imagefs.Directory, error)
 	})
 	if !ok {
-		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+		return nil, fmt.Errorf("mount %q cannot be snapshotted", guestPath)
 	}
-	return snapshotter.RootSnapshot()
+	return snapshotter.RootSnapshotAt(guestPath)
 }
 
 func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {

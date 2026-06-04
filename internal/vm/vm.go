@@ -54,6 +54,10 @@ type rootSnapshotProvider interface {
 	RootSnapshot() (imagefs.Directory, error)
 }
 
+type imageSnapshotProvider interface {
+	SnapshotImage(string) (imagefs.Directory, error)
+}
+
 type Manager struct {
 	mu           sync.Mutex
 	backend      Backend
@@ -410,8 +414,9 @@ func (m *Manager) AddPortForwardTo(ctx context.Context, id string, forward clien
 	return machine.instance.AddPortForward(ctx, forward)
 }
 
-func (m *Manager) SnapshotRootFS(ctx context.Context, id string) (imagefs.Directory, string, error) {
+func (m *Manager) SnapshotRootFS(ctx context.Context, id string, imageName string) (imagefs.Directory, string, error) {
 	id = instanceID(id)
+	imageName = strings.TrimSpace(imageName)
 	m.mu.Lock()
 	machine := m.running[id]
 	m.mu.Unlock()
@@ -422,6 +427,16 @@ func (m *Manager) SnapshotRootFS(ctx context.Context, id string) (imagefs.Direct
 		if err := flusher.Flush(ctx); err != nil {
 			return nil, "", err
 		}
+	}
+	if imageName != "" {
+		if snapshotter, ok := machine.instance.(imageSnapshotProvider); ok {
+			root, err := snapshotter.SnapshotImage(imageName)
+			if err != nil {
+				return nil, "", err
+			}
+			return root, imageName, nil
+		}
+		return nil, "", fmt.Errorf("VM %q image %q cannot be snapshotted", id, imageName)
 	}
 	snapshotter, ok := machine.instance.(rootSnapshotProvider)
 	if !ok {

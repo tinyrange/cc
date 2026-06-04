@@ -28,3 +28,19 @@ func (i *windowsInstance) RootSnapshot() (imagefs.Directory, error) {
 	}
 	return snapshotter.RootSnapshot()
 }
+
+func (i *windowsInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
+	if i == nil || i.rootFS == nil {
+		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+	}
+	if i.image != nil && i.image.Name == imageName {
+		return i.RootSnapshot()
+	}
+	snapshotter, ok := i.rootFS.(interface {
+		RootSnapshotAt(string) (imagefs.Directory, error)
+	})
+	if !ok {
+		return nil, fmt.Errorf("image mount %q cannot be snapshotted", imageName)
+	}
+	return snapshotter.RootSnapshotAt(windowsImageMountPath(imageName))
+}

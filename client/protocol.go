@@ -97,7 +97,8 @@ type ImageState struct {
 }
 
 type SaveImageRequest struct {
-	Name string `json:"name"`
+	Name  string `json:"name"`
+	Image string `json:"image,omitempty"`
 }
 
 type PullImageRequest struct {

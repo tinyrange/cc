@@ -49,6 +49,45 @@ func TestMountedFSAddShareExposesFiles(t *testing.T) {
 	}
 }
 
+func TestMountedFSRootSnapshotAtSnapshotsMountBackend(t *testing.T) {
+	rootDir := t.TempDir()
+	mountDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(rootDir, "root.txt"), []byte("root"), 0o644); err != nil {
+		t.Fatalf("WriteFile(root) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mountDir, "mounted.txt"), []byte("mounted"), 0o644); err != nil {
+		t.Fatalf("WriteFile(mounted) error = %v", err)
+	}
+	backend := NewMountedFS(NewImageFS(imagefs.NewHostFS(rootDir, nil), rootDir), []ShareMount{{
+		GuestPath: "/.ccx3/images/alpine",
+		Backend:   NewImageFS(imagefs.NewHostFS(mountDir, nil), mountDir),
+		Writable:  true,
+	}})
+	mounted, ok := backend.(*mountedFS)
+	if !ok {
+		t.Fatalf("backend type = %T, want *mountedFS", backend)
+	}
+
+	snapshot, err := mounted.RootSnapshotAt("/.ccx3/images/alpine")
+	if err != nil {
+		t.Fatalf("RootSnapshotAt(image) error = %v", err)
+	}
+	entry, err := imagefs.LookupPath(snapshot, "/mounted.txt")
+	if err != nil {
+		t.Fatalf("LookupPath(/mounted.txt) error = %v", err)
+	}
+	data, err := entry.File.ReadAt(0, 32)
+	if err != nil {
+		t.Fatalf("ReadAt(/mounted.txt) error = %v", err)
+	}
+	if string(data) != "mounted" {
+		t.Fatalf("mounted snapshot data = %q, want mounted", data)
+	}
+	if _, err := imagefs.LookupPath(snapshot, "/root.txt"); err == nil {
+		t.Fatalf("mounted snapshot included root backend file")
+	}
+}
+
 func TestMountedFSCreateUsesReturnedBackendNodeID(t *testing.T) {
 	t.Parallel()
 

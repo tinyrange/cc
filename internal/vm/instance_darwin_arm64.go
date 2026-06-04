@@ -5,6 +5,7 @@ package vm
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/hv/hvf"
@@ -13,8 +14,9 @@ import (
 )
 
 type darwinInstance struct {
-	session *hvf.ContainerSession
-	network *darwinNetworkRuntime
+	session   *hvf.ContainerSession
+	network   *darwinNetworkRuntime
+	imageName string
 }
 
 func (i *darwinInstance) AddShare(ctx context.Context, share client.ShareMount) error {
@@ -61,6 +63,16 @@ func (i *darwinInstance) RootSnapshot() (imagefs.Directory, error) {
 		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
 	}
 	return i.session.RootSnapshot()
+}
+
+func (i *darwinInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
+	if i == nil || i.session == nil {
+		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+	}
+	if strings.TrimSpace(i.imageName) == imageName {
+		return i.RootSnapshot()
+	}
+	return i.session.RootSnapshotAt(imageMountPath(imageName))
 }
 
 func (i *darwinInstance) Wait() error {

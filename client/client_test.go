@@ -351,8 +351,8 @@ func TestClientNamedInstanceHTTPHelpers(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				t.Fatalf("decode save request: %v", err)
 			}
-			if req.Name != "saved tag" {
-				t.Fatalf("save request = %#v, want saved tag", req)
+			if req.Name != "saved tag" || req.Image != "alpine" {
+				t.Fatalf("save request = %#v, want saved tag from alpine", req)
 			}
 			_ = json.NewEncoder(w).Encode(ImageState{Name: req.Name, Status: "downloaded"})
 		default:
@@ -379,7 +379,7 @@ func TestClientNamedInstanceHTTPHelpers(t *testing.T) {
 	if err := c.AddPortForwardTo("alpha", PortForward{HostPort: 8080, GuestPort: 80}); err != nil {
 		t.Fatalf("AddPortForwardTo() error = %v", err)
 	}
-	if state, err := c.SaveInstanceImage("alpha beta", SaveImageRequest{Name: "saved tag"}); err != nil || state.Name != "saved tag" {
+	if state, err := c.SaveInstanceImage("alpha beta", SaveImageRequest{Name: "saved tag", Image: "alpine"}); err != nil || state.Name != "saved tag" {
 		t.Fatalf("SaveInstanceImage() = %#v, %v", state, err)
 	}
 	if !sawStatus || !sawList || !sawCreate || !sawShutdown || !sawForward || !sawSave {

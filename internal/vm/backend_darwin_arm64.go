@@ -72,7 +72,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		return nil, err
 	}
 	timingLog("runtime.Start hvf.StartContainer took=%s image=%q", time.Since(start), req.Image)
-	return &darwinInstance{session: session, network: network}, nil
+	return &darwinInstance{session: session, network: network, imageName: strings.TrimSpace(req.Image)}, nil
 }
 
 func (b *runtimeBackend) StartBlankStream(
