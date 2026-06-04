@@ -201,10 +201,22 @@ func TestBareOCIPullsMissingImageWithoutBooting(t *testing.T) {
 			ETASeconds:         2,
 		}},
 	}
-	sh := &shellState{api: api, context: defaultContext("default", "", false), hostCWD: t.TempDir()}
+	var prompts []string
+	sh := &shellState{
+		api:     api,
+		context: defaultContext("default", "", false),
+		hostCWD: t.TempDir(),
+		confirmPull: func(source string, stderr io.Writer) (bool, error) {
+			prompts = append(prompts, source)
+			return true, nil
+		},
+	}
 	var stderr bytes.Buffer
 	if err := sh.eval(`@alpine`, &bytes.Buffer{}, &stderr); err != nil {
 		t.Fatalf("eval(@alpine) error = %v", err)
+	}
+	if len(prompts) != 1 || prompts[0] != "docker.io/library/alpine:latest" {
+		t.Fatalf("prompts = %#v, want normalized alpine source", prompts)
 	}
 	if len(api.pulls) != 1 || api.pulls[0].name != "alpine" {
 		t.Fatalf("pulls = %#v, want alpine", api.pulls)
@@ -218,6 +230,187 @@ func TestBareOCIPullsMissingImageWithoutBooting(t *testing.T) {
 	gotStatus := stderr.String()
 	if !strings.Contains(gotStatus, "Pull alpine") || !strings.Contains(gotStatus, "downloading") || strings.Contains(gotStatus, "{") {
 		t.Fatalf("pull status = %q, want human-readable pull progress", gotStatus)
+	}
+}
+
+func TestBareOCIPullCanBeCancelled(t *testing.T) {
+	api := &fakeVSHAPI{
+		status:      client.InstanceState{ID: "default", Status: "stopped"},
+		missingImgs: map[string]bool{"ubuntu": true},
+	}
+	sh := &shellState{
+		api:     api,
+		context: defaultContext("default", "", false),
+		hostCWD: t.TempDir(),
+		confirmPull: func(source string, stderr io.Writer) (bool, error) {
+			if source != "docker.io/library/ubuntu:latest" {
+				t.Fatalf("source = %q, want normalized ubuntu source", source)
+			}
+			return false, nil
+		},
+	}
+	err := sh.eval(`@ubuntu`, &bytes.Buffer{}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "image pull cancelled") {
+		t.Fatalf("eval(@ubuntu) error = %v, want cancelled pull", err)
+	}
+	if len(api.pulls) != 0 {
+		t.Fatalf("pulls = %#v, want none after cancellation", api.pulls)
+	}
+}
+
+func TestDisplayPullSourceNormalizesCommonOCIRefs(t *testing.T) {
+	tests := []struct {
+		source string
+		want   string
+	}{
+		{source: "ubuntu", want: "docker.io/library/ubuntu:latest"},
+		{source: "ubuntu:24.04", want: "docker.io/library/ubuntu:24.04"},
+		{source: "j5.nz/tool", want: "j5.nz/tool:latest"},
+		{source: "ghcr.io/acme/tool:v1", want: "ghcr.io/acme/tool:v1"},
+	}
+	for _, tt := range tests {
+		if got := displayPullSource(tt.source); got != tt.want {
+			t.Fatalf("displayPullSource(%q) = %q, want %q", tt.source, got, tt.want)
+		}
+	}
+}
+
+func TestAliasExpandsBeforeCommandDispatch(t *testing.T) {
+	sh := &shellState{hostCWD: t.TempDir()}
+	if err := sh.eval(`@alias say=@host printf alias-ok`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("set alias error = %v", err)
+	}
+	var stdout bytes.Buffer
+	if err := sh.eval(`say`, &stdout, &bytes.Buffer{}); err != nil {
+		t.Fatalf("eval(alias) error = %v", err)
+	}
+	if stdout.String() != "alias-ok" {
+		t.Fatalf("stdout = %q, want alias-ok", stdout.String())
+	}
+}
+
+func TestAliasCanPointToHostClearCommand(t *testing.T) {
+	sh := &shellState{}
+	if err := sh.eval(`@alias clear=@host clear`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("set alias error = %v", err)
+	}
+	got, err := sh.expandAliasLine("clear")
+	if err != nil {
+		t.Fatalf("expandAliasLine() error = %v", err)
+	}
+	if got != "@host clear" {
+		t.Fatalf("expanded clear = %q, want @host clear", got)
+	}
+}
+
+func TestAliasPreservesCommandArguments(t *testing.T) {
+	api := &fakeVSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
+	sh := &shellState{api: api, context: commandContext{Mode: modeHost, VMID: "work", Network: true}, hostCWD: t.TempDir()}
+	if err := sh.eval(`@alias u=@ubuntu echo`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("set alias error = %v", err)
+	}
+	if err := sh.eval(`u hello --flag`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("eval(alias) error = %v", err)
+	}
+	if len(api.streams) != 1 || api.streams[0].req.Image != "ubuntu" {
+		t.Fatalf("streams = %#v, want ubuntu run", api.streams)
+	}
+	if got := strings.Join(api.streams[0].req.Command, " "); !strings.Contains(got, "echo hello --flag") {
+		t.Fatalf("command = %#v, want appended alias arguments", api.streams[0].req.Command)
+	}
+}
+
+func TestAliasListsAndDeletesAliases(t *testing.T) {
+	sh := &shellState{}
+	if err := sh.eval(`@alias b=@host echo b`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("set b error = %v", err)
+	}
+	if err := sh.eval(`@alias a=@host echo a`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("set a error = %v", err)
+	}
+	var out bytes.Buffer
+	if err := sh.eval(`@alias`, &out, &bytes.Buffer{}); err != nil {
+		t.Fatalf("list aliases error = %v", err)
+	}
+	if out.String() != "a=@host echo a\nb=@host echo b\n" {
+		t.Fatalf("aliases = %q", out.String())
+	}
+	if err := sh.eval(`@alias -d a`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("delete alias error = %v", err)
+	}
+	out.Reset()
+	if err := sh.eval(`@alias`, &out, &bytes.Buffer{}); err != nil {
+		t.Fatalf("list aliases error = %v", err)
+	}
+	if out.String() != "b=@host echo b\n" {
+		t.Fatalf("aliases after delete = %q", out.String())
+	}
+}
+
+func TestAliasExpansionRejectsRecursiveAliases(t *testing.T) {
+	sh := &shellState{}
+	if err := sh.eval(`@alias a=b`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("set a error = %v", err)
+	}
+	if err := sh.eval(`@alias b=a`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("set b error = %v", err)
+	}
+	err := sh.eval(`a`, &bytes.Buffer{}, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "alias expansion exceeded") {
+		t.Fatalf("recursive alias error = %v, want expansion limit", err)
+	}
+}
+
+func TestVSHRCAcceptsCommentsAndAliases(t *testing.T) {
+	sh := &shellState{}
+	rc := strings.NewReader(`
+# personal vsh aliases
+sudo=@sudo
+@alias clear=@host clear
+`)
+	if err := sh.evalVSHRCLines(".vshrc", rc); err != nil {
+		t.Fatalf("evalVSHRCLines() error = %v", err)
+	}
+	if got := sh.aliases["sudo"]; got != "@sudo" {
+		t.Fatalf("sudo alias = %q, want @sudo", got)
+	}
+	if got := sh.aliases["clear"]; got != "@host clear" {
+		t.Fatalf("clear alias = %q, want @host clear", got)
+	}
+}
+
+func TestVSHRCRejectsCommands(t *testing.T) {
+	sh := &shellState{}
+	err := sh.evalVSHRCLines(".vshrc", strings.NewReader("echo nope\n"))
+	if err == nil || !strings.Contains(err.Error(), ".vshrc:1") || !strings.Contains(err.Error(), "only supports aliases") {
+		t.Fatalf("evalVSHRCLines() error = %v, want rc subset error", err)
+	}
+}
+
+func TestLoadVSHRCIgnoresMissingFile(t *testing.T) {
+	sh := &shellState{}
+	if err := sh.loadVSHRC(filepath.Join(t.TempDir(), ".vshrc")); err != nil {
+		t.Fatalf("loadVSHRC(missing) error = %v", err)
+	}
+}
+
+func TestStartVMReportsBootProgressToStderr(t *testing.T) {
+	api := &fakeVSHAPI{
+		status: client.InstanceState{ID: "work", Status: "stopped"},
+		bootEvents: []client.BootEvent{
+			{Kind: "status", Message: "preparing kernel"},
+			{Kind: "status", Message: "starting VM"},
+			{Kind: "ready", State: client.InstanceState{ID: "work", Status: "running", Image: "alpine"}},
+		},
+	}
+	sh := &shellState{api: api, context: commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Network: true}, hostCWD: t.TempDir()}
+	var stderr bytes.Buffer
+	if err := sh.eval(`@start --vm work`, &bytes.Buffer{}, &stderr); err != nil {
+		t.Fatalf("eval(@start) error = %v", err)
+	}
+	got := stderr.String()
+	if !strings.Contains(got, "Boot: preparing kernel") || !strings.Contains(got, "Boot: starting VM") || !strings.Contains(got, "Boot: ready alpine") {
+		t.Fatalf("boot status = %q, want detailed boot progress", got)
 	}
 }
 
@@ -301,6 +494,20 @@ func TestGuestRunsAsRootWithSudoOption(t *testing.T) {
 	}
 }
 
+func TestAtSudoUsesHostSudoWhenHostSelected(t *testing.T) {
+	ctx, command := sudoCommandContext(commandContext{Mode: modeHost, VMID: "work", Network: true}, "whoami")
+	if ctx.Mode != modeHost || command != "sudo whoami" {
+		t.Fatalf("sudoCommandContext(host) = %#v, %q; want host sudo command", ctx, command)
+	}
+}
+
+func TestAtSudoUsesGuestRootWhenVMSelected(t *testing.T) {
+	ctx, command := sudoCommandContext(commandContext{Mode: modeVM, VMID: "work", Image: "alpine", Network: true}, "whoami")
+	if ctx.Mode != modeVM || ctx.User != "root" || command != "whoami" {
+		t.Fatalf("sudoCommandContext(vm) = %#v, %q; want guest root command", ctx, command)
+	}
+}
+
 func TestGuestRunRequestsUseStreamingPath(t *testing.T) {
 	dir := t.TempDir()
 	api := &fakeVSHAPI{status: client.InstanceState{ID: "work", Status: "running"}}
@@ -315,6 +522,16 @@ func TestGuestRunRequestsUseStreamingPath(t *testing.T) {
 		if run.id != "work" || run.req.Image != "alpine" {
 			t.Fatalf("stream = %#v", run)
 		}
+	}
+}
+
+func TestGuestTTYLSAliasUsesBusyBoxWidthFlag(t *testing.T) {
+	command := strings.Join(guestCommand("ls", true), " ")
+	if strings.Contains(command, "--width=") {
+		t.Fatalf("guest tty command contains GNU-only --width flag: %s", command)
+	}
+	if !strings.Contains(command, "-w ${COLUMNS:-80}") {
+		t.Fatalf("guest tty command = %s, want BusyBox-compatible -w width flag", command)
 	}
 }
 
@@ -636,6 +853,57 @@ func TestCompleterMapsGuestHostPaths(t *testing.T) {
 	got, _ := completer.Do([]rune("cd pro"), 6)
 	if !completionContains(got, `ject\ one/`) {
 		t.Fatalf("guest /host path completions = %#v", got)
+	}
+}
+
+func TestCompleterCompletesGuestAbsolutePathsWithoutFind(t *testing.T) {
+	api := &fakeVSHAPI{
+		status:       client.InstanceState{ID: "work", Status: "running"},
+		streamEvents: []client.ExecEvent{{Kind: "stdout", Data: []byte("-release\n")}, {Kind: "exit", ExitCode: 0}},
+	}
+	sh := &shellState{
+		api:     api,
+		hostCWD: t.TempDir(),
+		context: commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Network: true},
+	}
+	completer := newVSHCompleter(sh)
+	got, _ := completer.Do([]rune("cat /etc/os"), 11)
+	if !completionContains(got, "-release") {
+		t.Fatalf("guest path completions = %#v, want -release", got)
+	}
+	if len(api.streams) != 1 {
+		t.Fatalf("guest completion streams = %d, want 1", len(api.streams))
+	}
+	run := api.streams[0]
+	if run.id != "work" || run.req.Image != "ubuntu" || run.req.Command[0] != "sh" || strings.Contains(strings.Join(run.req.Command, " "), "find ") {
+		t.Fatalf("guest completion run = %#v, want sh glob completion without find", run)
+	}
+	if run.req.WorkDir != "/etc" {
+		t.Fatalf("guest completion workdir = %q, want /etc", run.req.WorkDir)
+	}
+}
+
+func TestCompleterExpandsAliasesBeforePathCompletion(t *testing.T) {
+	api := &fakeVSHAPI{
+		status:       client.InstanceState{ID: "work", Status: "running"},
+		streamEvents: []client.ExecEvent{{Kind: "stdout", Data: []byte("-release\n")}, {Kind: "exit", ExitCode: 0}},
+	}
+	sh := &shellState{
+		api:     api,
+		aliases: map[string]string{"c": "@ubuntu cat"},
+		hostCWD: t.TempDir(),
+		context: commandContext{Mode: modeHost, VMID: "work", Network: true},
+	}
+	completer := newVSHCompleter(sh)
+	got, replacementLen := completer.Do([]rune("c /etc/os"), 9)
+	if !completionContains(got, "-release") {
+		t.Fatalf("alias guest path completions = %#v, want -release", got)
+	}
+	if replacementLen != len("os") {
+		t.Fatalf("replacement length = %d, want %d", replacementLen, len("os"))
+	}
+	if len(api.streams) != 1 || api.streams[0].req.Image != "ubuntu" {
+		t.Fatalf("guest completion streams = %#v, want ubuntu completion", api.streams)
 	}
 }
 
@@ -1038,7 +1306,14 @@ func TestGuestCommandPullsMissingImageBeforeRun(t *testing.T) {
 		status:      client.InstanceState{ID: "default", Status: "running"},
 		missingImgs: map[string]bool{"ubuntu": true},
 	}
-	sh := &shellState{api: api, context: defaultContext("default", "", false), hostCWD: t.TempDir()}
+	sh := &shellState{
+		api:     api,
+		context: defaultContext("default", "", false),
+		hostCWD: t.TempDir(),
+		confirmPull: func(source string, stderr io.Writer) (bool, error) {
+			return true, nil
+		},
+	}
 	if err := sh.eval("@ubuntu echo hi", &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("eval() error = %v", err)
 	}
@@ -1232,6 +1507,7 @@ type fakeVSHAPI struct {
 	streams      []fakeRun
 	starts       []fakeStart
 	streamEvents []client.ExecEvent
+	bootEvents   []client.BootEvent
 	pullEvents   []client.ProgressEvent
 	pulls        []fakePull
 	missingImgs  map[string]bool
@@ -1294,6 +1570,13 @@ func (f *fakeVSHAPI) PullImageStream(name string, req client.PullImageRequest, o
 func (f *fakeVSHAPI) StartInstanceStreamWithID(id string, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
 	f.starts = append(f.starts, fakeStart{id: id, req: req})
 	f.status = client.InstanceState{ID: id, Status: "running"}
+	if onEvent != nil {
+		for _, event := range f.bootEvents {
+			if err := onEvent(event); err != nil {
+				return client.InstanceState{}, err
+			}
+		}
+	}
 	return f.status, nil
 }
 

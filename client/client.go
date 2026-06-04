@@ -88,13 +88,13 @@ func (c *Client) DownloadKernelStream(req DownloadRequest, onEvent func(Progress
 
 func (c *Client) PrepareImageMetadata(name string) (ImageMetadataState, error) {
 	var ret ImageMetadataState
-	err := c.postJSONExpectOK("/image/"+name+"/metadata", map[string]any{}, &ret)
+	err := c.postJSONExpectOK("/image/"+imagePathName(name)+"/metadata", map[string]any{}, &ret)
 	return ret, err
 }
 
 func (c *Client) PrepareImageEmulator(name string) (EmulatorState, error) {
 	var ret EmulatorState
-	err := c.postJSONExpectOK("/image/"+name+"/qemu/download", map[string]any{}, &ret)
+	err := c.postJSONExpectOK("/image/"+imagePathName(name)+"/qemu/download", map[string]any{}, &ret)
 	return ret, err
 }
 
@@ -116,7 +116,7 @@ func (c *Client) ListImages() ([]ImageState, error) {
 
 func (c *Client) GetImage(name string) (ImageState, error) {
 	var ret ImageState
-	resp, err := c.client.Get(c.url + "/image/" + name)
+	resp, err := c.client.Get(c.url + "/image/" + imagePathName(name))
 	if err != nil {
 		return ret, err
 	}
@@ -129,11 +129,15 @@ func (c *Client) GetImage(name string) (ImageState, error) {
 }
 
 func (c *Client) PullImage(name string, req PullImageRequest) error {
-	return c.postJSONExpectOK("/image/"+name, req, nil)
+	return c.postJSONExpectOK("/image/"+imagePathName(name), req, nil)
 }
 
 func (c *Client) PullImageStream(name string, req PullImageRequest, onEvent func(ProgressEvent) error) error {
-	return c.postJSONProgressStream("/image/"+name, req, onEvent)
+	return c.postJSONProgressStream("/image/"+imagePathName(name), req, onEvent)
+}
+
+func imagePathName(name string) string {
+	return url.PathEscape(name)
 }
 
 func (c *Client) VMSupported() (VMSupportedResponse, error) {

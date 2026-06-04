@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"golang.org/x/net/websocket"
@@ -66,6 +67,38 @@ func TestPullImageRequestSourceStringDockerArchive(t *testing.T) {
 	}
 	if source != "docker-archive:C:/tmp/tool.tar#example/tool:latest" {
 		t.Fatalf("SourceString() = %q", source)
+	}
+}
+
+func TestClientEscapesImageNamesInPath(t *testing.T) {
+	mux := http.NewServeMux()
+	var got []string
+	mux.HandleFunc("GET /image/{image}", func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, "get:"+r.PathValue("image"))
+		_ = json.NewEncoder(w).Encode(ImageState{Name: r.PathValue("image"), Status: "available"})
+	})
+	mux.HandleFunc("POST /image/{image}", func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, "post:"+r.PathValue("image"))
+		_ = json.NewEncoder(w).Encode(ProgressEvent{Status: "downloaded", Artifact: r.PathValue("image")})
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	c := NewClient(ts.URL, func() (net.Conn, error) {
+		return nil, nil
+	})
+	c.client = *ts.Client()
+
+	image := "kalilinux/kali-rolling"
+	if _, err := c.GetImage(image); err != nil {
+		t.Fatalf("GetImage(%q) error = %v", image, err)
+	}
+	if err := c.PullImageStream(image, PullImageRequest{Source: image}, func(ProgressEvent) error { return nil }); err != nil {
+		t.Fatalf("PullImageStream(%q) error = %v", image, err)
+	}
+	want := strings.Join([]string{"get:" + image, "post:" + image}, "\n")
+	if strings.Join(got, "\n") != want {
+		t.Fatalf("requests = %#v, want %s", got, want)
 	}
 }
 

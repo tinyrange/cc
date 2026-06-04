@@ -57,24 +57,26 @@ const (
 )
 
 type shellState struct {
-	api        vshAPI
-	context    commandContext
-	hostCWD    string
-	rootCache  string
-	imageCache map[string]bool
-	vmRunning  map[string]bool
-	hostInit   hostShellInit
-	hostShell  *persistentHostShell
-	guestShell *persistentGuestShell
-	lastCode   int
-	promptOut  io.Writer
-	history    string
-	env        map[string]string
-	jobs       []shellJob
-	nextJobID  int
-	jobsMu     sync.Mutex
-	statusSeq  atomic.Uint64
-	completion *vshCompleter
+	api         vshAPI
+	context     commandContext
+	hostCWD     string
+	rootCache   string
+	imageCache  map[string]bool
+	vmRunning   map[string]bool
+	hostInit    hostShellInit
+	hostShell   *persistentHostShell
+	guestShell  *persistentGuestShell
+	lastCode    int
+	promptOut   io.Writer
+	history     string
+	env         map[string]string
+	aliases     map[string]string
+	confirmPull func(string, io.Writer) (bool, error)
+	jobs        []shellJob
+	nextJobID   int
+	jobsMu      sync.Mutex
+	statusSeq   atomic.Uint64
+	completion  *vshCompleter
 }
 
 type shellJob struct {
@@ -143,6 +145,11 @@ func (c *vshCompleter) Complete(line []rune, pos int) ([]string, int) {
 
 func (c *vshCompleter) CompleteWithKind(line []rune, pos int) ([]string, int, completionKind) {
 	prefix := string(line[:pos])
+	typedTokenStart := lastCompletionTokenStart(prefix)
+	typedToken := prefix[typedTokenStart:]
+	effectivePrefix := c.effectiveCompletionPrefix(prefix)
+	completionCtx := c.completionContext(effectivePrefix)
+	prefix = effectivePrefix
 	tokenStart := lastCompletionTokenStart(prefix)
 	token := prefix[tokenStart:]
 	isFirstToken := strings.TrimSpace(prefix[:tokenStart]) == ""
@@ -161,13 +168,55 @@ func (c *vshCompleter) CompleteWithKind(line []rune, pos int) ([]string, int, co
 	}
 	if c.shouldCompleteCommand(prefix, tokenStart, isFirstToken, token) {
 		candidates = c.commandCandidates(token)
-		return candidates, len([]rune(token)), completionCommand
+		return candidates, len([]rune(typedToken)), completionCommand
 	}
 	if !isFirstToken || token == "" || strings.Contains(token, "/") || token == "." || token == ".." || strings.HasPrefix(token, "~") {
-		candidates = c.pathCandidates(token)
-		return candidates, pathCompletionReplaceLen(token), completionPath
+		candidates = c.pathCandidates(token, completionCtx)
+		return candidates, pathCompletionReplaceLen(typedToken), completionPath
 	}
 	return nil, 0, completionNone
+}
+
+func (c *vshCompleter) effectiveCompletionPrefix(prefix string) string {
+	if c.shell == nil || isAliasCommandLine(strings.TrimSpace(prefix)) {
+		return prefix
+	}
+	expanded, err := c.shell.expandAliasCompletionPrefix(prefix)
+	if err != nil {
+		return prefix
+	}
+	return expanded
+}
+
+func (c *vshCompleter) completionContext(prefix string) commandContext {
+	var ctx commandContext
+	if c.shell != nil {
+		ctx = c.shell.context
+	}
+	if !strings.HasPrefix(strings.TrimSpace(prefix), "@") {
+		return ctx
+	}
+	at, err := parseAtLine(prefix)
+	if err != nil {
+		return ctx
+	}
+	switch at.Target {
+	case "", "sudo":
+		ctx = ctx.withOptions(at.Options)
+		if at.Target == "sudo" || at.Options.Sudo {
+			ctx.Mode = modeVM
+			ctx.User = "root"
+		}
+	case "host":
+		ctx = ctx.withOptions(at.Options)
+		ctx.Mode = modeHost
+	case "help", "ps", "jobs", "alias", "status", "where", "start", "stop", "forward":
+	default:
+		ctx = ctx.withOptions(at.Options)
+		ctx.Mode = modeVM
+		ctx.Image = at.Target
+	}
+	return ctx
 }
 
 func pathCompletionReplaceLen(token string) int {
@@ -178,7 +227,7 @@ func pathCompletionReplaceLen(token string) int {
 }
 
 func (c *vshCompleter) atTargetWords() []string {
-	words := []string{"@help", "@host", "@jobs", "@ps", "@status", "@start", "@stop", "@forward", "@sudo"}
+	words := []string{"@alias", "@help", "@host", "@jobs", "@ps", "@status", "@start", "@stop", "@forward", "@sudo"}
 	for _, image := range c.cachedImageNames() {
 		words = append(words, "@"+image)
 	}
@@ -346,15 +395,24 @@ func lastCompletionTokenStart(line string) int {
 	return last
 }
 
-func (c *vshCompleter) pathCandidates(token string) []string {
+func (c *vshCompleter) pathCandidates(token string, ctx commandContext) []string {
+	if ctx.Mode == modeVM {
+		if out, ok := c.guestPathCandidates(token, ctx); ok {
+			return out
+		}
+	}
+	return c.hostPathCandidates(token, ctx)
+}
+
+func (c *vshCompleter) hostPathCandidates(token string, ctx commandContext) []string {
 	dirPart, base := filepath.Split(token)
 	hostDir := dirPart
 	if hostDir == "" {
 		if c.shell != nil {
 			hostDir = c.shell.hostCWD
 		}
-		if c.shell != nil && c.shell.context.Mode == modeVM {
-			current := c.shell.context.CWD
+		if c.shell != nil && ctx.Mode == modeVM {
+			current := ctx.CWD
 			if current == "" {
 				_, current, _ = guestHostPaths(c.shell.hostCWD)
 			}
@@ -363,7 +421,7 @@ func (c *vshCompleter) pathCandidates(token string) []string {
 			}
 		}
 	} else {
-		hostDir = c.hostCompletionDir(hostDir)
+		hostDir = c.hostCompletionDir(hostDir, ctx)
 	}
 	entries, err := os.ReadDir(hostDir)
 	if err != nil {
@@ -388,9 +446,96 @@ func (c *vshCompleter) pathCandidates(token string) []string {
 	return out
 }
 
-func (c *vshCompleter) hostCompletionDir(dirPart string) string {
+func (c *vshCompleter) guestPathCandidates(token string, ctx commandContext) ([]string, bool) {
+	if c.shell == nil || c.shell.api == nil || ctx.VMID == "" || ctx.Image == "" {
+		return nil, false
+	}
+	dirPart, base := path.Split(filepath.ToSlash(token))
+	current := ctx.CWD
+	if current == "" {
+		_, current, _ = guestHostPaths(c.shell.hostCWD)
+	}
+	var guestDir string
+	switch {
+	case dirPart == "":
+		guestDir = current
+	case dirPart == "~" || strings.HasPrefix(dirPart, "~/"):
+		guestDir = path.Join(guestHomeDir(ctx), strings.TrimPrefix(strings.TrimSuffix(dirPart, "/"), "~"))
+	case strings.HasPrefix(dirPart, "/"):
+		guestDir = path.Clean(dirPart)
+	default:
+		guestDir = path.Clean(path.Join(current, dirPart))
+	}
+	if guestDir == guestHostMount || strings.HasPrefix(guestDir, guestHostMount+"/") {
+		return nil, false
+	}
+	out, err := c.guestPathCandidatesInDir(ctx, guestDir, base)
+	if err != nil {
+		return nil, true
+	}
+	return out, true
+}
+
+func (c *vshCompleter) guestPathCandidatesInDir(ctx commandContext, guestDir, base string) ([]string, error) {
+	status, err := c.shell.api.InstanceStatusOf(ctx.VMID)
+	if err != nil || status.Status != "running" {
+		return nil, err
+	}
+	script := guestCompletionScript(guestDir, base)
+	req := client.RunRequest{
+		Image:   ctx.Image,
+		Command: []string{"sh", "-lc", script},
+		WorkDir: guestDir,
+		User:    guestRunUser(ctx),
+	}
+	var stdout strings.Builder
+	runCtx, cancel := context.WithTimeout(context.Background(), 750*time.Millisecond)
+	defer cancel()
+	err = c.shell.api.RunStreamInContext(runCtx, ctx.VMID, req, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "stdout", "output":
+			stdout.WriteString(execEventText(event))
+		case "error":
+			if event.Error != "" {
+				return fmt.Errorf("%s", event.Error)
+			}
+			return fmt.Errorf("guest completion failed")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		out = append(out, shellEscapeCompletion(line))
+	}
+	sortCompletionItems(out)
+	return out, nil
+}
+
+func guestCompletionScript(guestDir, base string) string {
+	return strings.Join([]string{
+		"dir=" + shellQuote(guestDir),
+		"base=" + shellQuote(base),
+		`case "$base" in .*) include_hidden=1 ;; *) include_hidden=0 ;; esac`,
+		`for p in "$dir"/"$base"*; do`,
+		`  [ -e "$p" ] || [ -L "$p" ] || continue`,
+		`  name=${p##*/}`,
+		`  [ "$include_hidden" = 1 ] || case "$name" in .*) continue ;; esac`,
+		`  suffix=${name#"$base"}`,
+		`  if [ -d "$p" ]; then printf '%s/\n' "$suffix"; else printf '%s\n' "$suffix"; fi`,
+		`done`,
+	}, "\n")
+}
+
+func (c *vshCompleter) hostCompletionDir(dirPart string, ctx commandContext) string {
 	hostDir := os.ExpandEnv(dirPart)
-	if c.shell != nil && c.shell.context.Mode == modeVM {
+	if c.shell != nil && ctx.Mode == modeVM {
 		if hostPath, ok := c.guestHostCompletionDir(hostDir); ok {
 			return hostPath
 		}
@@ -594,11 +739,18 @@ func run() error {
 		promptOut:  os.Stdout,
 		history:    filepath.Join(rootCache, "vsh_history"),
 		env:        map[string]string{},
+		aliases:    map[string]string{},
+		confirmPull: func(source string, stderr io.Writer) (bool, error) {
+			return promptPullConfirmation(os.Stdin, stderr, source)
+		},
 	}
 	sh.completion = newVSHCompleter(sh)
 	defer sh.closeSessions()
+	if err := sh.loadVSHRC(defaultVSHRCPath()); err != nil {
+		return err
+	}
 	if *startVM {
-		if err := sh.startVM(sh.context.VMID, sh.context); err != nil {
+		if err := sh.startVM(sh.context.VMID, sh.context, os.Stderr); err != nil {
 			return err
 		}
 	}
@@ -680,6 +832,65 @@ func (s *shellState) runScript(in io.Reader, stdout, stderr io.Writer) error {
 	return s.evalScriptLines(in, stdout, stderr)
 }
 
+func defaultVSHRCPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".vshrc")
+}
+
+func (s *shellState) loadVSHRC(path string) error {
+	if path == "" {
+		return nil
+	}
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read %s: %w", path, err)
+	}
+	defer f.Close()
+	return s.evalVSHRCLines(path, f)
+}
+
+func (s *shellState) evalVSHRCLines(source string, in io.Reader) error {
+	scanner := bufio.NewScanner(in)
+	scanner.Buffer(make([]byte, 0, 4096), 1024*1024)
+	lineNo := 0
+	for scanner.Scan() {
+		lineNo++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if strings.HasPrefix(line, "@") {
+			at, err := parseAtLine(line)
+			if err != nil {
+				return fmt.Errorf("%s:%d: %w", source, lineNo, err)
+			}
+			if at.Target != "alias" || len(at.Options.OptionFields) != 0 {
+				return fmt.Errorf("%s:%d: .vshrc only supports aliases", source, lineNo)
+			}
+			if err := s.evalAlias(at.Command, io.Discard); err != nil {
+				return fmt.Errorf("%s:%d: %w", source, lineNo, err)
+			}
+			continue
+		}
+		if _, _, ok := parseAliasAssignment(line); !ok {
+			return fmt.Errorf("%s:%d: .vshrc only supports aliases", source, lineNo)
+		}
+		if err := s.evalAlias(line, io.Discard); err != nil {
+			return fmt.Errorf("%s:%d: %w", source, lineNo, err)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read %s: %w", source, err)
+	}
+	return nil
+}
+
 func (s *shellState) evalScriptLines(in io.Reader, stdout, stderr io.Writer) error {
 	scanner := bufio.NewScanner(in)
 	scanner.Buffer(make([]byte, 0, 4096), 1024*1024)
@@ -715,6 +926,13 @@ func (s *shellState) eval(line string, stdout, stderr io.Writer) error {
 	if line == "" {
 		return nil
 	}
+	if !isAliasCommandLine(line) {
+		expanded, err := s.expandAliasLine(line)
+		if err != nil {
+			return err
+		}
+		line = expanded
+	}
 	if strings.HasPrefix(line, "@") {
 		return s.evalAt(line, stdout, stderr)
 	}
@@ -740,6 +958,88 @@ func (s *shellState) eval(line string, stdout, stderr io.Writer) error {
 		return s.startBackgroundJob(s.context, command, stdout, stderr)
 	}
 	return s.runInContext(s.context, line, stdout, stderr)
+}
+
+func isAliasCommandLine(line string) bool {
+	return line == "@alias" || strings.HasPrefix(line, "@alias ") || strings.HasPrefix(line, "@alias\t")
+}
+
+func (s *shellState) expandAliasLine(line string) (string, error) {
+	const maxAliasExpansionDepth = 16
+	line = strings.TrimSpace(line)
+	for depth := 0; depth < maxAliasExpansionDepth; depth++ {
+		expanded, changed, err := s.expandAliasLineOnce(line)
+		if err != nil || !changed {
+			return expanded, err
+		}
+		line = strings.TrimSpace(expanded)
+		if isAliasCommandLine(line) {
+			return line, nil
+		}
+	}
+	return "", fmt.Errorf("alias expansion exceeded %d levels", maxAliasExpansionDepth)
+}
+
+func (s *shellState) expandAliasLineOnce(line string) (string, bool, error) {
+	if len(s.aliases) == 0 {
+		return line, false, nil
+	}
+	tokens, err := lexShellTokens(line)
+	if err != nil {
+		return line, false, err
+	}
+	if len(tokens) == 0 {
+		return line, false, nil
+	}
+	first := tokens[0]
+	replacement, ok := s.aliases[first.Value]
+	if !ok {
+		return line, false, nil
+	}
+	rest := strings.TrimLeft(line[first.End:], " \t")
+	if rest == "" {
+		return replacement, true, nil
+	}
+	return strings.TrimRight(replacement, " \t") + " " + rest, true, nil
+}
+
+func (s *shellState) expandAliasCompletionPrefix(prefix string) (string, error) {
+	const maxAliasExpansionDepth = 16
+	line := prefix
+	for depth := 0; depth < maxAliasExpansionDepth; depth++ {
+		expanded, changed, err := s.expandAliasCompletionPrefixOnce(line)
+		if err != nil || !changed {
+			return expanded, err
+		}
+		line = expanded
+		if isAliasCommandLine(strings.TrimSpace(line)) {
+			return line, nil
+		}
+	}
+	return "", fmt.Errorf("alias expansion exceeded %d levels", maxAliasExpansionDepth)
+}
+
+func (s *shellState) expandAliasCompletionPrefixOnce(line string) (string, bool, error) {
+	if len(s.aliases) == 0 {
+		return line, false, nil
+	}
+	tokens, err := lexShellTokens(line)
+	if err != nil {
+		return line, false, err
+	}
+	if len(tokens) == 0 {
+		return line, false, nil
+	}
+	first := tokens[0]
+	replacement, ok := s.aliases[first.Value]
+	if !ok {
+		return line, false, nil
+	}
+	rest := line[first.End:]
+	if rest == "" {
+		return replacement, true, nil
+	}
+	return strings.TrimRight(replacement, " \t") + rest, true, nil
 }
 
 func (s *shellState) runInContext(ctx commandContext, line string, stdout, stderr io.Writer) error {
@@ -786,6 +1086,86 @@ func (s *shellState) evalExport(line string) (bool, error) {
 	}
 	s.closeSessions()
 	return true, nil
+}
+
+func (s *shellState) evalAlias(command string, stdout io.Writer) error {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return s.printAliases(stdout)
+	}
+	fields, err := splitShellFields(command)
+	if err != nil {
+		return err
+	}
+	if len(fields) == 2 && (fields[0] == "-d" || fields[0] == "--delete") {
+		delete(s.aliases, fields[1])
+		return nil
+	}
+	name, value, ok := parseAliasAssignment(command)
+	if !ok {
+		return fmt.Errorf("usage: @alias [name=value] | @alias -d name")
+	}
+	if !isAliasName(name) {
+		return fmt.Errorf("alias: invalid name %q", name)
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		delete(s.aliases, name)
+		return nil
+	}
+	if s.aliases == nil {
+		s.aliases = map[string]string{}
+	}
+	s.aliases[name] = value
+	return nil
+}
+
+func (s *shellState) printAliases(w io.Writer) error {
+	if len(s.aliases) == 0 {
+		_, err := fmt.Fprintln(w, "No aliases")
+		return err
+	}
+	names := make([]string, 0, len(s.aliases))
+	for name := range s.aliases {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if _, err := fmt.Fprintf(w, "%s=%s\n", name, s.aliases[name]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func parseAliasAssignment(command string) (string, string, bool) {
+	tokens, err := lexShellTokens(command)
+	if err != nil || len(tokens) == 0 {
+		return "", "", false
+	}
+	first := tokens[0]
+	eq := strings.Index(first.Value, "=")
+	if eq <= 0 {
+		return "", "", false
+	}
+	name := first.Value[:eq]
+	if strings.TrimSpace(command[first.End:]) == "" {
+		return name, strings.TrimSpace(first.Value[eq+1:]), true
+	}
+	rawFirst := command[first.Start:first.End]
+	rawEq := strings.Index(rawFirst, "=")
+	if rawEq < 0 {
+		return "", "", false
+	}
+	valueStart := first.Start + rawEq + 1
+	return name, strings.TrimSpace(command[valueStart:]), true
+}
+
+func isAliasName(name string) bool {
+	if name == "" || strings.HasPrefix(name, "@") {
+		return false
+	}
+	return isShellName(name)
 }
 
 func isShellName(value string) bool {
@@ -912,6 +1292,11 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			return fmt.Errorf("usage: @jobs")
 		}
 		return s.printJobs(stdout)
+	case "alias":
+		if len(at.Options.OptionFields) != 0 {
+			return fmt.Errorf("usage: @alias [name=value] | @alias -d name")
+		}
+		return s.evalAlias(at.Command, stdout)
 	case "status", "where":
 		if at.Command != "" || len(at.Options.OptionFields) != 0 {
 			return fmt.Errorf("usage: @%s", at.Target)
@@ -919,19 +1304,18 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		return s.printStatus(stdout)
 	case "sudo":
 		ctx := s.context.withOptions(at.Options)
-		ctx.Mode = modeVM
-		ctx.User = "root"
 		if at.Command == "" {
 			return fmt.Errorf("usage: @sudo <cmd>")
 		}
-		return s.runMaybeBackground(ctx, at.Command, stdout, stderr)
+		ctx, command := sudoCommandContext(ctx, at.Command)
+		return s.runMaybeBackground(ctx, command, stdout, stderr)
 	case "start":
 		if at.Command != "" {
 			return fmt.Errorf("usage: @start [--vm id]")
 		}
 		ctx := s.context.withOptions(at.Options)
 		id := firstNonEmpty(ctx.VMID, s.context.VMID)
-		return s.startVM(id, ctx)
+		return s.startVM(id, ctx, stderr)
 	case "stop":
 		if at.Command != "" {
 			return fmt.Errorf("usage: @stop [--vm id]")
@@ -1299,12 +1683,20 @@ func colorPrelude(primaryLS, fallbackLS string, bash bool) string {
 	if bash {
 		b.WriteString("shopt -s expand_aliases 2>/dev/null || true\n")
 	}
-	b.WriteString("alias ls >/dev/null 2>&1 || alias ls=")
+	b.WriteString("alias ls >/dev/null 2>&1 || { ")
+	b.WriteString(shellQuoteCommandProbe(primaryLS))
+	b.WriteString(" && alias ls=")
 	b.WriteString(shellQuote(primaryLS))
-	b.WriteString(" 2>/dev/null || alias ls=")
+	b.WriteString("; } || { ")
+	b.WriteString(shellQuoteCommandProbe(fallbackLS))
+	b.WriteString(" && alias ls=")
 	b.WriteString(shellQuote(fallbackLS))
-	b.WriteString(" 2>/dev/null || true\n")
+	b.WriteString("; } || true\n")
 	return b.String()
+}
+
+func shellQuoteCommandProbe(command string) string {
+	return command + " >/dev/null 2>&1"
 }
 
 func mergedEnv(base, overrides []string) []string {
@@ -1394,7 +1786,7 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 	if err := s.ensureImageAvailable(ctx.Image, stderr); err != nil {
 		return err
 	}
-	if err := s.ensureVMRunning(ctx); err != nil {
+	if err := s.ensureVMRunning(ctx, stderr); err != nil {
 		return err
 	}
 	hostRoot, hostGuestCWD, err := guestHostPaths(s.hostCWD)
@@ -1505,7 +1897,7 @@ func (s *shellState) guestPersistentShell(ctx commandContext, req client.RunRequ
 func guestPersistentCommand() []string {
 	return []string{"sh", "-lc", guestShellPrelude() + strings.Join([]string{
 		"stty -echo 2>/dev/null || true",
-		colorPrelude("ls --color=always -C --width=${COLUMNS:-80}", "ls -G -C", false),
+		colorPrelude("ls --color=always -C -w ${COLUMNS:-80}", "ls -G -C", false),
 		"printf '__VSH_READY__:%s\\n' \"$PWD\"",
 		"while IFS= read -r __vsh_line; do",
 		"  stty echo 2>/dev/null || true",
@@ -1835,7 +2227,7 @@ func guestCommand(line string, tty bool) []string {
 	if !tty {
 		return []string{"sh", "-lc", prelude + line}
 	}
-	return []string{"sh", "-lc", prelude + colorPrelude("ls --color=always -C --width=${COLUMNS:-80}", "ls -G -C", false) + line}
+	return []string{"sh", "-lc", prelude + colorPrelude("ls --color=always -C -w ${COLUMNS:-80}", "ls -G -C", false) + line}
 }
 
 func guestShellPrelude() string {
@@ -1858,6 +2250,55 @@ func shellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
 }
 
+func promptPullConfirmation(in *os.File, stderr io.Writer, source string) (bool, error) {
+	if in == nil || !isTerminalFD(int(in.Fd())) {
+		return false, nil
+	}
+	fmt.Fprintf(stderr, "do you want to pull %s (y/n) [n]: ", source)
+	reader := bufio.NewReader(in)
+	answer, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, err
+	}
+	answer = strings.ToLower(strings.TrimSpace(answer))
+	return answer == "y" || answer == "yes", nil
+}
+
+func displayPullSource(source string) string {
+	source = strings.TrimSpace(source)
+	if source == "" {
+		return source
+	}
+	lower := strings.ToLower(source)
+	if strings.HasPrefix(lower, "cvmfs:") || strings.HasPrefix(lower, "docker-archive:") || strings.Contains(source, "://") {
+		return source
+	}
+	name := source
+	tag := ""
+	if at := strings.Index(name, "@"); at >= 0 {
+		return source
+	}
+	lastSlash := strings.LastIndex(name, "/")
+	lastColon := strings.LastIndex(name, ":")
+	if lastColon > lastSlash {
+		tag = name[lastColon+1:]
+		name = name[:lastColon]
+	}
+	parts := strings.Split(name, "/")
+	first := parts[0]
+	hasRegistry := strings.Contains(first, ".") || strings.Contains(first, ":") || first == "localhost"
+	if !hasRegistry {
+		if len(parts) == 1 {
+			name = "library/" + name
+		}
+		name = "docker.io/" + name
+	}
+	if tag == "" {
+		tag = "latest"
+	}
+	return name + ":" + tag
+}
+
 func (s *shellState) ensureImageAvailable(image string, stderr io.Writer) error {
 	if s.imageCache != nil && s.imageCache[image] {
 		return nil
@@ -1869,10 +2310,27 @@ func (s *shellState) ensureImageAvailable(image string, stderr io.Writer) error 
 		s.imageCache[image] = true
 		return nil
 	}
+	source := displayPullSource(image)
+	if s.confirmPull == nil {
+		return fmt.Errorf("image %s is not locally cached", source)
+	}
+	ok, err := s.confirmPull(source, stderr)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("image pull cancelled for %s", source)
+	}
+	progress := newTerminalHoldStatus(stderr, "Pull "+image+": preparing")
+	defer progress.Close()
 	report := func(event client.ProgressEvent) error {
 		message := formatDetailedProgressEvent(event, image)
 		if message != "" {
-			fmt.Fprintln(stderr, message)
+			if event.Error != "" {
+				progress.finishWith(message)
+				return nil
+			}
+			progress.Update(message)
 		}
 		return nil
 	}
@@ -1907,7 +2365,7 @@ func guestHostPaths(hostCWD string) (hostRoot, guestCWD string, err error) {
 	return hostRoot, guestCWD, nil
 }
 
-func (s *shellState) ensureVMRunning(ctx commandContext) error {
+func (s *shellState) ensureVMRunning(ctx commandContext, stderr io.Writer) error {
 	id := ctx.VMID
 	if s.vmRunning != nil && s.vmRunning[id] {
 		return nil
@@ -1923,10 +2381,10 @@ func (s *shellState) ensureVMRunning(ctx commandContext) error {
 		s.vmRunning[id] = true
 		return nil
 	}
-	return s.startVM(id, ctx)
+	return s.startVM(id, ctx, stderr)
 }
 
-func (s *shellState) startVM(id string, ctx commandContext) error {
+func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
 		return fmt.Errorf("vm id is required")
@@ -1939,7 +2397,7 @@ func (s *shellState) startVM(id string, ctx commandContext) error {
 	if ctx.Network {
 		req.Network = defaultNetworkConfig()
 	}
-	boot := newBootStatus(os.Stderr)
+	boot := newBootStatus(stderr)
 	defer boot.Close()
 	state, err := s.api.StartInstanceStreamWithID(id, req, func(event client.BootEvent) error {
 		boot.Update(event)
@@ -1957,20 +2415,49 @@ func (s *shellState) startVM(id string, ctx commandContext) error {
 }
 
 type bootStatus struct {
+	*terminalHoldStatus
+}
+
+func newBootStatus(w io.Writer) *bootStatus {
+	return &bootStatus{terminalHoldStatus: newTerminalHoldStatus(w, "Boot: starting VM")}
+}
+
+func (b *bootStatus) Update(event client.BootEvent) {
+	msg := formatBootEvent(event)
+	if msg == "" {
+		return
+	}
+	if !b.tty {
+		b.terminalHoldStatus.Update(msg)
+		return
+	}
+	switch event.Kind {
+	case "ready":
+		b.Close()
+	case "error":
+		b.finishWith(msg)
+	default:
+		b.terminalHoldStatus.Update(msg)
+	}
+}
+
+type terminalHoldStatus struct {
 	w        io.Writer
 	tty      bool
 	done     chan struct{}
 	finished chan struct{}
 	mu       sync.Mutex
 	message  string
+	fallback string
 	active   bool
 }
 
-func newBootStatus(w io.Writer) *bootStatus {
-	b := &bootStatus{
+func newTerminalHoldStatus(w io.Writer, fallback string) *terminalHoldStatus {
+	b := &terminalHoldStatus{
 		w:        w,
 		done:     make(chan struct{}),
 		finished: make(chan struct{}),
+		fallback: fallback,
 	}
 	if file, ok := w.(*os.File); ok && isTerminalFD(int(file.Fd())) {
 		b.tty = true
@@ -1982,28 +2469,20 @@ func newBootStatus(w io.Writer) *bootStatus {
 	return b
 }
 
-func (b *bootStatus) Update(event client.BootEvent) {
-	msg := formatBootEvent(event)
-	if msg == "" {
+func (b *terminalHoldStatus) Update(message string) {
+	if b == nil || message == "" {
 		return
 	}
 	if !b.tty {
-		fmt.Fprintln(b.w, msg)
+		fmt.Fprintln(b.w, message)
 		return
 	}
-	switch event.Kind {
-	case "ready":
-		b.Close()
-	case "error":
-		b.finishWith(msg)
-	default:
-		b.mu.Lock()
-		b.message = msg
-		b.mu.Unlock()
-	}
+	b.mu.Lock()
+	b.message = message
+	b.mu.Unlock()
 }
 
-func (b *bootStatus) Close() {
+func (b *terminalHoldStatus) Close() {
 	if b == nil || !b.tty {
 		return
 	}
@@ -2019,12 +2498,12 @@ func (b *bootStatus) Close() {
 	fmt.Fprint(b.w, "\r\033[2K")
 }
 
-func (b *bootStatus) finishWith(message string) {
+func (b *terminalHoldStatus) finishWith(message string) {
 	b.Close()
 	fmt.Fprintln(b.w, message)
 }
 
-func (b *bootStatus) spin() {
+func (b *terminalHoldStatus) spin() {
 	defer close(b.finished)
 	frames := []string{"-", "\\", "|", "/"}
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -2039,12 +2518,29 @@ func (b *bootStatus) spin() {
 			msg := b.message
 			b.mu.Unlock()
 			if msg == "" {
-				msg = "Boot: starting VM"
+				msg = b.fallback
 			}
+			msg = compactStatusMessage(msg)
 			fmt.Fprintf(b.w, "\r\033[2K%s %s", frames[i%len(frames)], msg)
 			i++
 		}
 	}
+}
+
+func compactStatusMessage(message string) string {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return ""
+	}
+	lines := strings.Split(message, "\n")
+	compact := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			compact = append(compact, line)
+		}
+	}
+	return strings.Join(compact, " | ")
 }
 
 func defaultNetworkConfig() *client.NetworkConfig {
@@ -2349,6 +2845,8 @@ func (s *shellState) help(w io.Writer) error {
 @host [cmd]              run cmd on the host, or make host current if cmd is omitted
 @ [opts] [cmd]           update or use the current context
 @sudo <cmd>              run cmd as root in the current VM
+@alias [name=value]      list aliases, or set one (example: @alias clear=@host clear)
+@alias -d name           delete an alias
 @ps                      list VMs
 @jobs                    list background jobs
 @status                  show vsh and selected VM state
@@ -2526,6 +3024,15 @@ func (c commandContext) withOptions(opts commandOptions) commandContext {
 		c.NestedVirt = *opts.NestedVirt
 	}
 	return c
+}
+
+func sudoCommandContext(ctx commandContext, command string) (commandContext, string) {
+	if ctx.Mode == modeHost {
+		return ctx, "sudo " + command
+	}
+	ctx.Mode = modeVM
+	ctx.User = "root"
+	return ctx, command
 }
 
 const (
