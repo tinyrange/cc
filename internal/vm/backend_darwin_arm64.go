@@ -394,6 +394,15 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 	if b.kernel == nil || b.images == nil {
 		return vmruntime.RunRequest{}, fmt.Errorf("runtime backend is not configured")
 	}
+	var image *oci.Image
+	imageName := strings.TrimSpace(req.Image)
+	if imageName != "" {
+		var err error
+		image, err = b.images.Open(imageName)
+		if err != nil {
+			return vmruntime.RunRequest{}, err
+		}
+	}
 	kernel, err := b.kernel.ReadKernel()
 	if err != nil {
 		return vmruntime.RunRequest{}, err
@@ -412,7 +421,15 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
 		"CONFIG_VIRTIO_NET":       "kernel/drivers/net/virtio_net.ko.gz",
 	}
+	if NeedsAMD64Emulation(image) {
+		configVars = append(configVars, "CONFIG_BINFMT_MISC")
+		moduleMap["CONFIG_BINFMT_MISC"] = "kernel/fs/binfmt_misc.ko.gz"
+	}
 	modules, err := b.kernel.PlanModuleLoad(configVars, moduleMap)
+	if err != nil {
+		return vmruntime.RunRequest{}, err
+	}
+	qemuX8664, err := PrepareAMD64Emulator(ctx, image, b.kernel.ExtractPackageFile)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
@@ -425,18 +442,19 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		return vmruntime.RunRequest{}, err
 	}
 	return vmruntime.RunRequest{
-		Kernel:     kernel,
-		Init:       initBin,
-		Modules:    modules,
-		RootFS:     virtio.NewImageFS(blankRuntimeRootFS(), ""),
-		MemoryMB:   req.MemoryMB,
-		CPUs:       req.CPUs,
-		NestedVirt: req.NestedVirt,
-		Dmesg:      req.Dmesg,
-		Persistent: true,
-		Network:    network.guestInitConfig(),
-		NetDevice:  networkDeviceDarwin(network),
-		UnixTime:   time.Now().Unix(),
+		Kernel:            kernel,
+		Init:              initBin,
+		AMD64EmulatorPath: qemuX8664,
+		Modules:           modules,
+		RootFS:            virtio.NewImageFS(blankRuntimeRootFS(), ""),
+		MemoryMB:          req.MemoryMB,
+		CPUs:              req.CPUs,
+		NestedVirt:        req.NestedVirt,
+		Dmesg:             req.Dmesg,
+		Persistent:        true,
+		Network:           network.guestInitConfig(),
+		NetDevice:         networkDeviceDarwin(network),
+		UnixTime:          time.Now().Unix(),
 	}, ctx.Err()
 }
 

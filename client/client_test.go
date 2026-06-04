@@ -70,6 +70,24 @@ func TestPullImageRequestSourceStringDockerArchive(t *testing.T) {
 	}
 }
 
+func TestPullImageRequestJSONIncludesArchitecture(t *testing.T) {
+	req := PullImageRequest{Source: "ubuntu", Architecture: "amd64"}
+	buf, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("Marshal(PullImageRequest) error = %v", err)
+	}
+	if !strings.Contains(string(buf), `"architecture":"amd64"`) {
+		t.Fatalf("PullImageRequest JSON = %s, want architecture", string(buf))
+	}
+	var got PullImageRequest
+	if err := json.Unmarshal(buf, &got); err != nil {
+		t.Fatalf("Unmarshal(PullImageRequest) error = %v", err)
+	}
+	if got.Source != "ubuntu" || got.Architecture != "amd64" {
+		t.Fatalf("PullImageRequest = %#v, want source ubuntu arch amd64", got)
+	}
+}
+
 func TestClientEscapesImageNamesInPath(t *testing.T) {
 	mux := http.NewServeMux()
 	var got []string

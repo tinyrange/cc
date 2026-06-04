@@ -171,6 +171,16 @@ func TestParseAtLineSudoOption(t *testing.T) {
 	}
 }
 
+func TestParseAtLineArchOption(t *testing.T) {
+	got, err := parseAtLine(`@ubuntu --arch x86_64 uname -m`)
+	if err != nil {
+		t.Fatalf("parseAtLine() error = %v", err)
+	}
+	if got.Options.Arch != "amd64" || got.Command != "uname -m" {
+		t.Fatalf("parseAtLine() = %#v, want arch amd64 command", got)
+	}
+}
+
 func TestBareOCISelectsCurrentContextAndPreparesImage(t *testing.T) {
 	api := &fakeVSHAPI{status: client.InstanceState{ID: "default", Status: "stopped"}}
 	sh := &shellState{api: api, context: defaultContext("default", "", false), hostCWD: t.TempDir()}
@@ -317,6 +327,36 @@ func TestAliasPreservesCommandArguments(t *testing.T) {
 	}
 	if got := strings.Join(api.streams[0].req.Command, " "); !strings.Contains(got, "echo hello --flag") {
 		t.Fatalf("command = %#v, want appended alias arguments", api.streams[0].req.Command)
+	}
+}
+
+func TestGuestCommandUsesArchitectureSpecificImage(t *testing.T) {
+	api := &fakeVSHAPI{
+		status:      client.InstanceState{ID: "work", Status: "stopped"},
+		missingImgs: map[string]bool{"ubuntu@amd64": true},
+	}
+	sh := &shellState{
+		api:     api,
+		context: commandContext{Mode: modeHost, VMID: "work", Network: true},
+		hostCWD: t.TempDir(),
+		confirmPull: func(source string, stderr io.Writer) (bool, error) {
+			if source != "docker.io/library/ubuntu:latest (amd64)" {
+				t.Fatalf("pull prompt source = %q", source)
+			}
+			return true, nil
+		},
+	}
+	if err := sh.eval(`@ubuntu --arch amd64 uname -m`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+		t.Fatalf("eval() error = %v", err)
+	}
+	if len(api.pulls) != 1 || api.pulls[0].name != "ubuntu@amd64" || api.pulls[0].source != "ubuntu" || api.pulls[0].arch != "amd64" {
+		t.Fatalf("pulls = %#v, want ubuntu@amd64 from ubuntu arch amd64", api.pulls)
+	}
+	if len(api.starts) != 1 || api.starts[0].req.Image != "ubuntu@amd64" {
+		t.Fatalf("starts = %#v, want boot image ubuntu@amd64", api.starts)
+	}
+	if len(api.streams) != 1 || api.streams[0].req.Image != "ubuntu@amd64" {
+		t.Fatalf("streams = %#v, want run image ubuntu@amd64", api.streams)
 	}
 }
 
@@ -562,6 +602,12 @@ func TestGuestBootUsesContextNetwork(t *testing.T) {
 	}
 	if api.starts[0].req.Network == nil || !api.starts[0].req.Network.Enabled || !api.starts[0].req.Network.AllowInternet {
 		t.Fatalf("start network = %#v, want enabled internet", api.starts[0].req.Network)
+	}
+	if api.starts[0].req.Image != "alpine" {
+		t.Fatalf("start image = %q, want alpine", api.starts[0].req.Image)
+	}
+	if api.starts[0].req.TimeoutSeconds != vshBootTimeoutSeconds {
+		t.Fatalf("start timeout = %.1f, want %.1f", api.starts[0].req.TimeoutSeconds, float64(vshBootTimeoutSeconds))
 	}
 }
 
@@ -880,6 +926,26 @@ func TestCompleterCompletesGuestAbsolutePathsWithoutFind(t *testing.T) {
 	}
 	if run.req.WorkDir != "/etc" {
 		t.Fatalf("guest completion workdir = %q, want /etc", run.req.WorkDir)
+	}
+}
+
+func TestCompleterUsesArchitectureSpecificGuestImage(t *testing.T) {
+	api := &fakeVSHAPI{
+		status:       client.InstanceState{ID: "work", Status: "running"},
+		streamEvents: []client.ExecEvent{{Kind: "stdout", Data: []byte("-release\n")}, {Kind: "exit", ExitCode: 0}},
+	}
+	sh := &shellState{
+		api:     api,
+		hostCWD: t.TempDir(),
+		context: commandContext{Mode: modeVM, VMID: "work", Image: "ubuntu", Arch: "amd64", Network: true},
+	}
+	completer := newVSHCompleter(sh)
+	got, _ := completer.Do([]rune("cat /etc/os"), 11)
+	if !completionContains(got, "-release") {
+		t.Fatalf("guest path completions = %#v, want -release", got)
+	}
+	if len(api.streams) != 1 || api.streams[0].req.Image != "ubuntu@amd64" {
+		t.Fatalf("guest completion streams = %#v, want ubuntu@amd64 completion", api.streams)
 	}
 }
 
@@ -1397,6 +1463,30 @@ func TestPersistentGuestShellPreservesState(t *testing.T) {
 	}
 }
 
+func TestPersistentGuestShellKeyIncludesArchitecture(t *testing.T) {
+	api := &fakeVSHAPI{
+		streamEvents: []client.ExecEvent{{Kind: "stdout", Data: []byte("__VSH_READY__:/work\n")}},
+	}
+	sh := &shellState{api: api}
+	req := client.RunRequest{Image: "ubuntu", User: defaultGuestUser, WorkDir: "/work"}
+	ctx := commandContext{VMID: "work", Image: "ubuntu"}
+	if _, err := sh.guestPersistentShell(ctx, req); err != nil {
+		t.Fatalf("guestPersistentShell(native) error = %v", err)
+	}
+	req.Image = "ubuntu@amd64"
+	ctx.Arch = "amd64"
+	if _, err := sh.guestPersistentShell(ctx, req); err != nil {
+		t.Fatalf("guestPersistentShell(amd64) error = %v", err)
+	}
+	sh.closeSessions()
+	if len(api.streams) != 2 {
+		t.Fatalf("streams = %d, want separate native and amd64 shells", len(api.streams))
+	}
+	if api.streams[0].req.Image != "ubuntu" || api.streams[1].req.Image != "ubuntu@amd64" {
+		t.Fatalf("stream images = %q, %q; want ubuntu and ubuntu@amd64", api.streams[0].req.Image, api.streams[1].req.Image)
+	}
+}
+
 func TestPersistentGuestShellConsumesSplitMarker(t *testing.T) {
 	session := &persistentGuestShell{}
 	before, _, _, ok := session.consumeOutput("hello\n__VSH_DONE__:")
@@ -1528,6 +1618,7 @@ type fakeStart struct {
 type fakePull struct {
 	name   string
 	source string
+	arch   string
 }
 
 func (f *fakeVSHAPI) HealthCheck() error { return nil }
@@ -1549,7 +1640,7 @@ func (f *fakeVSHAPI) PullImageStream(name string, req client.PullImageRequest, o
 	if err != nil {
 		return err
 	}
-	f.pulls = append(f.pulls, fakePull{name: name, source: source})
+	f.pulls = append(f.pulls, fakePull{name: name, source: source, arch: req.Architecture})
 	if f.missingImgs != nil {
 		f.missingImgs[name] = false
 	}

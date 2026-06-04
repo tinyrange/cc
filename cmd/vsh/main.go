@@ -30,6 +30,7 @@ import (
 
 const guestHostMount = "/host"
 const defaultGuestUser = "1000:1000"
+const vshBootTimeoutSeconds = 60
 
 const (
 	colorReset   = "\x1b[0m"
@@ -201,9 +202,15 @@ func (c *vshCompleter) completionContext(prefix string) commandContext {
 		return ctx
 	}
 	switch at.Target {
-	case "", "sudo":
+	case "":
 		ctx = ctx.withOptions(at.Options)
-		if at.Target == "sudo" || at.Options.Sudo {
+		if at.Options.Sudo {
+			ctx.Mode = modeVM
+			ctx.User = "root"
+		}
+	case "sudo":
+		ctx = ctx.withOptions(at.Options)
+		if ctx.Mode != modeHost {
 			ctx.Mode = modeVM
 			ctx.User = "root"
 		}
@@ -267,6 +274,7 @@ func vshOptionWords() []string {
 		"--memory",
 		"--memory-mb",
 		"--cpus",
+		"--arch",
 		"--network",
 		"--no-network",
 		"--nested",
@@ -483,7 +491,7 @@ func (c *vshCompleter) guestPathCandidatesInDir(ctx commandContext, guestDir, ba
 	}
 	script := guestCompletionScript(guestDir, base)
 	req := client.RunRequest{
-		Image:   ctx.Image,
+		Image:   localImageName(ctx.Image, ctx.Arch),
 		Command: []string{"sh", "-lc", script},
 		WorkDir: guestDir,
 		User:    guestRunUser(ctx),
@@ -647,6 +655,7 @@ type vshAPI interface {
 type commandContext struct {
 	Mode       shellMode `json:"mode"`
 	Image      string    `json:"image,omitempty"`
+	Arch       string    `json:"arch,omitempty"`
 	VMID       string    `json:"vm,omitempty"`
 	CWD        string    `json:"cwd,omitempty"`
 	User       string    `json:"user,omitempty"`
@@ -666,6 +675,7 @@ type commandOptions struct {
 	VMID         string
 	CWD          string
 	User         string
+	Arch         string
 	Sudo         bool
 	MemoryMB     uint64
 	CPUs         int
@@ -1202,11 +1212,13 @@ func stripBackground(line string) (string, bool, error) {
 
 func (s *shellState) startBackgroundJob(ctx commandContext, line string, stdout, stderr io.Writer) error {
 	bgShell := &shellState{
-		api:       s.api,
-		context:   ctx,
-		hostCWD:   s.hostCWD,
-		promptOut: s.promptOut,
-		env:       cloneEnv(s.env),
+		api:         s.api,
+		context:     ctx,
+		hostCWD:     s.hostCWD,
+		promptOut:   s.promptOut,
+		env:         cloneEnv(s.env),
+		aliases:     cloneEnv(s.aliases),
+		confirmPull: s.confirmPull,
 	}
 	s.jobsMu.Lock()
 	s.nextJobID++
@@ -1350,7 +1362,7 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 			if at.Options.Sudo {
 				return fmt.Errorf("usage: @%s --sudo <cmd>", at.Target)
 			}
-			if err := s.ensureImageAvailable(ctx.Image, stderr); err != nil {
+			if err := s.ensureImageAvailable(ctx, stderr); err != nil {
 				return err
 			}
 			s.context = ctx
@@ -1783,7 +1795,7 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 	if ctx.Image == "" {
 		return fmt.Errorf("no guest image selected; run @<oci-tag> or set one with @<oci-tag>")
 	}
-	if err := s.ensureImageAvailable(ctx.Image, stderr); err != nil {
+	if err := s.ensureImageAvailable(ctx, stderr); err != nil {
 		return err
 	}
 	if err := s.ensureVMRunning(ctx, stderr); err != nil {
@@ -1796,7 +1808,7 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 	workDir := firstNonEmpty(ctx.CWD, hostGuestCWD)
 	tty, cols, rows := terminalRequestSize(stdout)
 	req := client.RunRequest{
-		Image:   ctx.Image,
+		Image:   localImageName(ctx.Image, ctx.Arch),
 		Command: guestCommand(line, tty),
 		Shares: []client.ShareMount{{
 			Source:   hostRoot,
@@ -1852,7 +1864,7 @@ func persistentGuestCommandAllowed(line string) bool {
 }
 
 func (s *shellState) guestPersistentShell(ctx commandContext, req client.RunRequest) (*persistentGuestShell, error) {
-	key := strings.Join([]string{ctx.VMID, ctx.Image, req.User}, "\x00")
+	key := strings.Join([]string{ctx.VMID, localImageName(ctx.Image, ctx.Arch), req.User}, "\x00")
 	if s.guestShell != nil && s.guestShell.key == key {
 		return s.guestShell, nil
 	}
@@ -2299,7 +2311,29 @@ func displayPullSource(source string) string {
 	return name + ":" + tag
 }
 
-func (s *shellState) ensureImageAvailable(image string, stderr io.Writer) error {
+func normalizeVSHArchitecture(architecture string) string {
+	switch strings.ToLower(strings.TrimSpace(architecture)) {
+	case "", "native":
+		return ""
+	case "amd64", "x86_64", "x64":
+		return "amd64"
+	case "arm64", "aarch64":
+		return "arm64"
+	default:
+		return ""
+	}
+}
+
+func localImageName(image, architecture string) string {
+	arch := normalizeVSHArchitecture(architecture)
+	if arch == "" {
+		return image
+	}
+	return image + "@" + arch
+}
+
+func (s *shellState) ensureImageAvailable(ctx commandContext, stderr io.Writer) error {
+	image := localImageName(ctx.Image, ctx.Arch)
 	if s.imageCache != nil && s.imageCache[image] {
 		return nil
 	}
@@ -2310,7 +2344,10 @@ func (s *shellState) ensureImageAvailable(image string, stderr io.Writer) error 
 		s.imageCache[image] = true
 		return nil
 	}
-	source := displayPullSource(image)
+	source := displayPullSource(ctx.Image)
+	if ctx.Arch != "" {
+		source += " (" + ctx.Arch + ")"
+	}
 	if s.confirmPull == nil {
 		return fmt.Errorf("image %s is not locally cached", source)
 	}
@@ -2334,7 +2371,7 @@ func (s *shellState) ensureImageAvailable(image string, stderr io.Writer) error 
 		}
 		return nil
 	}
-	if err := s.api.PullImageStream(image, client.PullImageRequest{Source: image}, report); err != nil {
+	if err := s.api.PullImageStream(image, client.PullImageRequest{Source: ctx.Image, Architecture: ctx.Arch}, report); err != nil {
 		return err
 	}
 	if s.imageCache == nil {
@@ -2390,9 +2427,11 @@ func (s *shellState) startVM(id string, ctx commandContext, stderr io.Writer) er
 		return fmt.Errorf("vm id is required")
 	}
 	req := client.StartInstanceRequest{
-		MemoryMB:   ctx.MemoryMB,
-		CPUs:       ctx.CPUs,
-		NestedVirt: ctx.NestedVirt,
+		Image:          localImageName(ctx.Image, ctx.Arch),
+		MemoryMB:       ctx.MemoryMB,
+		CPUs:           ctx.CPUs,
+		NestedVirt:     ctx.NestedVirt,
+		TimeoutSeconds: vshBootTimeoutSeconds,
 	}
 	if ctx.Network {
 		req.Network = defaultNetworkConfig()
@@ -2681,7 +2720,7 @@ func (s *shellState) prompt() string {
 	}
 	base := colorGreen + "➜" + colorReset + "  " + colorCyan + leaf + colorReset
 	if s.context.Mode == modeVM {
-		target := "(" + s.context.Image
+		target := "(" + contextImageText(s.context)
 		if s.context.VMID != "" && s.context.VMID != "default" {
 			target += ":" + s.context.VMID
 		}
@@ -2689,6 +2728,13 @@ func (s *shellState) prompt() string {
 		return base + " " + colorMagenta + "vm:" + colorReset + colorYellow + target + colorReset + " "
 	}
 	return base + " " + colorBlue + "host" + colorReset + " "
+}
+
+func contextImageText(ctx commandContext) string {
+	if ctx.Image == "" || ctx.Arch == "" {
+		return ctx.Image
+	}
+	return ctx.Image + "@" + ctx.Arch
 }
 
 func terminalRequestSize(stdout io.Writer) (bool, int, int) {
@@ -2776,7 +2822,7 @@ func (s *shellState) printStatus(w io.Writer) error {
 	}
 	_, err = fmt.Fprintf(w, "context: %s\nimage: %s\nvm: %s\nhost cwd: %s\nvm status: %s\n",
 		s.context.Mode,
-		emptyText(s.context.Image, "-"),
+		emptyText(contextImageText(s.context), "-"),
 		emptyText(s.context.VMID, "-"),
 		s.hostCWD,
 		emptyText(state.Status, "unknown"),
@@ -2931,6 +2977,16 @@ func parseCommandOptions(tokens []shellToken, start int) (commandOptions, int, e
 				return opts, i, err
 			}
 			opts.User = v
+		case "--arch":
+			v, err := readValue()
+			if err != nil {
+				return opts, i, err
+			}
+			arch := normalizeVSHArchitecture(v)
+			if arch == "" {
+				return opts, i, fmt.Errorf("invalid --arch value %q", v)
+			}
+			opts.Arch = arch
 		case "--sudo":
 			if hasInlineValue {
 				return opts, i, fmt.Errorf("--sudo does not take a value")
@@ -3007,6 +3063,9 @@ func (c commandContext) withOptions(opts commandOptions) commandContext {
 	}
 	if opts.User != "" {
 		c.User = opts.User
+	}
+	if opts.Arch != "" {
+		c.Arch = opts.Arch
 	}
 	if opts.Sudo {
 		c.User = "root"

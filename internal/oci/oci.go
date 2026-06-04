@@ -90,6 +90,7 @@ type SourceSpec struct {
 }
 
 type PullOptions struct {
+	Architecture    string
 	Prefetch        bool
 	PrefetchWorkers int
 	CVMFSMirrors    []string
@@ -366,7 +367,7 @@ func (s *Store) Pull(ctx context.Context, name, source string, options ...PullOp
 	if len(options) > 0 {
 		opts = options[0]
 	}
-	if state, ok, err := s.existingState(name, spec); err != nil {
+	if state, ok, err := s.existingState(name, spec, opts.Architecture); err != nil {
 		return client.ImageState{}, err
 	} else if ok {
 		reportPullProgress(opts.Report, client.ProgressEvent{Status: "available", Artifact: name})
@@ -376,7 +377,7 @@ func (s *Store) Pull(ctx context.Context, name, source string, options ...PullOp
 		reportPullProgress(opts.Report, client.ProgressEvent{Status: "downloaded", Artifact: name})
 		return state, nil
 	}
-	if state, ok, err := s.restoreFromSharedCache(name, spec); err != nil {
+	if state, ok, err := s.restoreFromSharedCache(name, spec, opts.Architecture); err != nil {
 		return client.ImageState{}, err
 	} else if ok {
 		reportPullProgress(opts.Report, client.ProgressEvent{Status: "restored", Artifact: name})
@@ -418,10 +419,10 @@ func (s *Store) pull(ctx context.Context, name string, spec SourceSpec, options 
 		return fmt.Errorf("create shared image store: %w", err)
 	}
 
-	sharedName := sharedImageKey(spec)
+	sharedName := sharedImageKey(spec, options.Architecture)
 	shared := NewStore(s.sharedRoot())
 	shared.httpClient = s.httpClient
-	if _, ok, err := shared.existingState(sharedName, spec); err != nil {
+	if _, ok, err := shared.existingState(sharedName, spec, options.Architecture); err != nil {
 		return err
 	} else if !ok {
 		if err := shared.pullDirect(ctx, sharedName, spec, options); err != nil {
@@ -434,7 +435,7 @@ func (s *Store) pull(ctx context.Context, name string, spec SourceSpec, options 
 func (s *Store) pullDirect(ctx context.Context, name string, spec SourceSpec, options PullOptions) error {
 	switch spec.Kind {
 	case SourceKindOCI:
-		return s.pullOCIDirect(ctx, name, spec)
+		return s.pullOCIDirect(ctx, name, spec, options)
 	case SourceKindSIMG:
 		return s.pullSIMGDirect(ctx, name, spec)
 	case SourceKindCVMFS:
@@ -758,7 +759,7 @@ func (s *Store) fetchSIMG(ctx context.Context, source, destPath string) error {
 	return os.Rename(tmpPath, destPath)
 }
 
-func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec) error {
+func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec, options PullOptions) error {
 	registry, imageName, tag, err := ParseImageRef(spec.Raw)
 	if err != nil {
 		return err
@@ -777,7 +778,7 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec)
 		return fmt.Errorf("create layers dir: %w", err)
 	}
 
-	mani, err := s.fetchManifest(ctx, reg, imageName, tag, preferredManifestArchitectures()...)
+	mani, err := s.fetchManifest(ctx, reg, imageName, tag, preferredManifestArchitectures(options.Architecture)...)
 	if err != nil {
 		return err
 	}
@@ -875,7 +876,7 @@ func (s *Store) finalizeIndexedImage(name string, spec SourceSpec, imageDir, tmp
 	return nil
 }
 
-func (s *Store) existingState(name string, spec SourceSpec) (client.ImageState, bool, error) {
+func (s *Store) existingState(name string, spec SourceSpec, architecture string) (client.ImageState, bool, error) {
 	meta, err := s.readMetadata(name)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -884,6 +885,9 @@ func (s *Store) existingState(name string, spec SourceSpec) (client.ImageState, 
 		return client.ImageState{}, false, err
 	}
 	if meta.Source != spec.Raw || meta.SourceKind != spec.Kind {
+		return client.ImageState{}, false, nil
+	}
+	if arch := normalizeArchitecture(architecture); arch != "" && meta.Architecture != arch {
 		return client.ImageState{}, false, nil
 	}
 	if spec.Kind == SourceKindCVMFS {
@@ -904,9 +908,9 @@ func (s *Store) existingState(name string, spec SourceSpec) (client.ImageState, 
 	return client.ImageState{Name: meta.Name, Source: meta.Source, SourceKind: meta.SourceKind, Status: "downloaded"}, true, nil
 }
 
-func (s *Store) restoreFromSharedCache(name string, spec SourceSpec) (client.ImageState, bool, error) {
+func (s *Store) restoreFromSharedCache(name string, spec SourceSpec, architecture string) (client.ImageState, bool, error) {
 	shared := NewStore(s.sharedRoot())
-	sharedName := sharedImageKey(spec)
+	sharedName := sharedImageKey(spec, architecture)
 	meta, err := shared.readMetadata(sharedName)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -915,6 +919,9 @@ func (s *Store) restoreFromSharedCache(name string, spec SourceSpec) (client.Ima
 		return client.ImageState{}, false, err
 	}
 	if meta.Source != spec.Raw || meta.SourceKind != spec.Kind || !dirExists(meta.RootFSDir) {
+		return client.ImageState{}, false, nil
+	}
+	if arch := normalizeArchitecture(architecture); arch != "" && meta.Architecture != arch {
 		return client.ImageState{}, false, nil
 	}
 	if spec.Kind == SourceKindCVMFS {
@@ -1497,9 +1504,26 @@ func digestToFileName(digest string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func sharedImageKey(spec SourceSpec) string {
-	sum := sha256.Sum256([]byte(sharedCacheSchemaVersion + "\n" + nativeArch() + "\n" + spec.Kind + "\n" + spec.Raw))
+func sharedImageKey(spec SourceSpec, architecture string) string {
+	arch := normalizeArchitecture(architecture)
+	if arch == "" {
+		arch = nativeArch()
+	}
+	sum := sha256.Sum256([]byte(sharedCacheSchemaVersion + "\n" + arch + "\n" + spec.Kind + "\n" + spec.Raw))
 	return hex.EncodeToString(sum[:16])
+}
+
+func normalizeArchitecture(architecture string) string {
+	switch strings.ToLower(strings.TrimSpace(architecture)) {
+	case "", "native":
+		return ""
+	case "x86_64", "x64":
+		return "amd64"
+	case "aarch64":
+		return "arm64"
+	default:
+		return strings.ToLower(strings.TrimSpace(architecture))
+	}
 }
 
 func dirExists(path string) bool {
@@ -1566,7 +1590,10 @@ func nativeArch() string {
 	}
 }
 
-func preferredManifestArchitectures() []string {
+func preferredManifestArchitectures(architecture string) []string {
+	if arch := normalizeArchitecture(architecture); arch != "" {
+		return []string{arch}
+	}
 	out := []string{nativeArch()}
 	if nativeArch() == "arm64" {
 		out = append(out, "amd64")

@@ -614,10 +614,19 @@ func TestLoadAMD64EmulatorReadsQEMU(t *testing.T) {
 }
 
 func TestNeedsAMD64EmulationDependsOnHostArchitecture(t *testing.T) {
-	got := NeedsAMD64Emulation(&oci.Image{Architecture: "arm64"})
-	want := runtime.GOARCH == "arm64"
-	if got != want {
-		t.Fatalf("NeedsAMD64Emulation(arm64 image) = %v, want %v", got, want)
+	tests := []struct {
+		name  string
+		image *oci.Image
+		want  bool
+	}{
+		{name: "amd64", image: &oci.Image{Architecture: "amd64"}, want: runtime.GOARCH == "arm64"},
+		{name: "arm64", image: &oci.Image{Architecture: "arm64"}, want: false},
+		{name: "nil", image: nil, want: false},
+	}
+	for _, tt := range tests {
+		if got := NeedsAMD64Emulation(tt.image); got != tt.want {
+			t.Fatalf("NeedsAMD64Emulation(%s) = %v, want %v", tt.name, got, tt.want)
+		}
 	}
 }
 

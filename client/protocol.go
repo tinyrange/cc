@@ -99,6 +99,7 @@ type ImageState struct {
 type PullImageRequest struct {
 	Source          string       `json:"-"`
 	SourceRef       *ImageSource `json:"-"`
+	Architecture    string       `json:"architecture,omitempty"`
 	CacheDir        string       `json:"cache_dir,omitempty"`
 	Prefetch        bool         `json:"prefetch,omitempty"`
 	PrefetchWorkers int          `json:"prefetch_workers,omitempty"`
@@ -162,6 +163,9 @@ func (r PullImageRequest) MarshalJSON() ([]byte, error) {
 	if r.CacheDir != "" {
 		payload["cache_dir"] = r.CacheDir
 	}
+	if r.Architecture != "" {
+		payload["architecture"] = r.Architecture
+	}
 	if r.Prefetch {
 		payload["prefetch"] = true
 	}
@@ -174,6 +178,7 @@ func (r PullImageRequest) MarshalJSON() ([]byte, error) {
 func (r *PullImageRequest) UnmarshalJSON(data []byte) error {
 	var raw struct {
 		Source          json.RawMessage `json:"source"`
+		Architecture    string          `json:"architecture,omitempty"`
 		CacheDir        string          `json:"cache_dir,omitempty"`
 		Prefetch        bool            `json:"prefetch,omitempty"`
 		PrefetchWorkers int             `json:"prefetch_workers,omitempty"`
@@ -183,6 +188,7 @@ func (r *PullImageRequest) UnmarshalJSON(data []byte) error {
 	}
 	r.Source = ""
 	r.SourceRef = nil
+	r.Architecture = raw.Architecture
 	r.CacheDir = raw.CacheDir
 	r.Prefetch = raw.Prefetch
 	r.PrefetchWorkers = raw.PrefetchWorkers
@@ -331,6 +337,7 @@ type CreateInstanceRequest struct {
 
 type StartInstanceRequest struct {
 	ID             string         `json:"id,omitempty"`
+	Image          string         `json:"image,omitempty"`
 	Network        *NetworkConfig `json:"network,omitempty"`
 	KernelModules  []string       `json:"kernel_modules,omitempty"`
 	MemoryMB       uint64         `json:"memory_mb,omitempty"`

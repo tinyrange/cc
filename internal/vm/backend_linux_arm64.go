@@ -117,13 +117,26 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if err != nil {
 		return nil, err
 	}
-	modules, err := b.kernel.PlanModuleLoad(linuxRuntimeConfigVars(nil, req.KernelModules...), linuxRuntimeModuleMap())
+	var image *oci.Image
+	imageName := strings.TrimSpace(req.Image)
+	if imageName != "" {
+		image, err = b.images.Open(imageName)
+		if err != nil {
+			return nil, err
+		}
+	}
+	modules, err := b.kernel.PlanModuleLoad(linuxRuntimeConfigVars(image, req.KernelModules...), linuxRuntimeModuleMap())
+	if err != nil {
+		return nil, err
+	}
+	qemuX8664, err := PrepareAMD64Emulator(ctx, image, b.kernel.ExtractPackageFile)
 	if err != nil {
 		return nil, err
 	}
 	rootFSBackend := virtio.NewImageFS(blankLinuxRuntimeRootFS(), "")
 	fsdevs, rootFS, err := arm64vm.BuildFSDevices(vmruntime.RunRequest{
-		RootFS: rootFSBackend,
+		RootFS:            rootFSBackend,
+		AMD64EmulatorPath: qemuX8664,
 	}, nil)
 	if err != nil {
 		return nil, err
@@ -134,6 +147,9 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	}
 	initCfg := linuxGuestInitConfig(modules, true)
 	initCfg.RootFSTag = vmruntime.RootFSTag
+	if qemuX8664 != "" {
+		initCfg.EmulatorTag = vmruntime.EmulatorTag
+	}
 	initCfg.Env = vmruntime.WithDefaultEnv(nil)
 	initCfg.WorkDir = "/"
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)

@@ -643,6 +643,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			go func() {
 				defer close(events)
 				_, err := srvState.images.Pull(r.Context(), imageName, source, oci.PullOptions{
+					Architecture:    req.Architecture,
 					Prefetch:        req.Prefetch,
 					PrefetchWorkers: req.PrefetchWorkers,
 					CVMFSMirrors:    cvmfsSourceMirrors(req.SourceRef),
@@ -674,6 +675,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			return
 		}
 		state, err := srvState.images.Pull(r.Context(), imageName, source, oci.PullOptions{
+			Architecture:    req.Architecture,
 			Prefetch:        req.Prefetch,
 			PrefetchWorkers: req.PrefetchWorkers,
 			CVMFSMirrors:    cvmfsSourceMirrors(req.SourceRef),
@@ -782,6 +784,32 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
 		defer cancel()
 		timingLog("POST /vm/start decode took=%s", time.Since(start))
+		var startImage *oci.Image
+		if imageName := strings.TrimSpace(req.Image); imageName != "" {
+			if _, err := srvState.images.Get(imageName); err != nil {
+				msg := fmt.Sprintf("image %q is not available", imageName)
+				if wantsBootEventStream(r) {
+					writeBootEvent(w, client.BootEvent{Kind: "error", Error: msg})
+					return
+				}
+				writeError(w, http.StatusBadRequest, fmt.Errorf("%s", msg))
+				return
+			}
+			image, err := srvState.images.Open(imageName)
+			if err != nil {
+				msg := fmt.Sprintf("image %q is not available: %s", imageName, err)
+				if wantsBootEventStream(r) {
+					writeBootEvent(w, client.BootEvent{Kind: "error", Error: msg})
+					return
+				}
+				writeError(w, http.StatusBadRequest, fmt.Errorf("%s", msg))
+				return
+			}
+			startImage = image
+			if wantsBootEventStream(r) {
+				writeBootEvent(w, client.BootEvent{Kind: "status", Message: fmt.Sprintf("validated image %s", imageName)})
+			}
+		}
 		if err := vm.Supports(); err != nil {
 			if wantsBootEventStream(r) {
 				writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
@@ -812,6 +840,35 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			}
 		}
 		timingLog("POST /vm/start kernel ensure/status took=%s", time.Since(start))
+		if vm.NeedsAMD64Emulation(startImage) {
+			if wantsBootEventStream(r) {
+				writeBootEvent(w, client.BootEvent{Kind: "status", Message: "preparing amd64 emulator"})
+				_, err := srvState.kernel.ExtractPackageFileWithProgress(
+					bootCtx,
+					"community",
+					"qemu-x86_64",
+					"usr/bin/qemu-x86_64",
+					func(event client.ProgressEvent) {
+						_ = writeBootEvent(w, client.BootEvent{Kind: "status", Message: bootProgressMessage("preparing amd64 emulator", event)})
+					},
+				)
+				if err != nil {
+					if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
+						writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("vm boot timed out after %s", bootTimeout)})
+						return
+					}
+					writeBootEvent(w, client.BootEvent{Kind: "error", Error: err.Error()})
+					return
+				}
+			} else if _, err := vm.PrepareAMD64Emulator(bootCtx, startImage, srvState.kernel.ExtractPackageFile); err != nil {
+				if errors.Is(err, context.DeadlineExceeded) || errors.Is(bootCtx.Err(), context.DeadlineExceeded) {
+					writeError(w, http.StatusGatewayTimeout, fmt.Errorf("vm boot timed out after %s", bootTimeout))
+					return
+				}
+				writeError(w, http.StatusInternalServerError, err)
+				return
+			}
+		}
 		if wantsBootEventStream(r) {
 			writeBootEvent(w, client.BootEvent{Kind: "status", Message: "starting VM"})
 			state, err := srvState.vms.StartBlankStream(bootCtx, req, func(event client.BootEvent) error {
@@ -1269,6 +1326,37 @@ func writeBootEvent(w http.ResponseWriter, event client.BootEvent) error {
 		flusher.Flush()
 	}
 	return nil
+}
+
+func bootProgressMessage(prefix string, event client.ProgressEvent) string {
+	parts := []string{prefix}
+	if event.Artifact != "" {
+		parts = append(parts, event.Artifact)
+	}
+	if event.Blob != "" {
+		parts = append(parts, event.Blob)
+	}
+	if event.Status != "" {
+		parts = append(parts, event.Status)
+	}
+	if event.BytesDownloaded > 0 || event.BytesTotal > 0 {
+		if event.BytesTotal > 0 {
+			parts = append(parts, fmt.Sprintf("%d/%d bytes", event.BytesDownloaded, event.BytesTotal))
+		} else {
+			parts = append(parts, fmt.Sprintf("%d bytes", event.BytesDownloaded))
+		}
+	}
+	if event.FilesDownloaded > 0 || event.FilesTotal > 0 {
+		if event.FilesTotal > 0 {
+			parts = append(parts, fmt.Sprintf("%d/%d files", event.FilesDownloaded, event.FilesTotal))
+		} else {
+			parts = append(parts, fmt.Sprintf("%d files", event.FilesDownloaded))
+		}
+	}
+	if event.Error != "" {
+		parts = append(parts, event.Error)
+	}
+	return strings.Join(parts, ": ")
 }
 
 func writeProgressEvent(w http.ResponseWriter, event client.ProgressEvent) error {

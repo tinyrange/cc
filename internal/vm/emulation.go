@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"strings"
 	"time"
 
 	"j5.nz/cc/internal/oci"
@@ -13,11 +14,10 @@ import (
 type packageFileExtractor func(ctx context.Context, repo, packageName, innerPath string) (string, error)
 
 func NeedsAMD64Emulation(image *oci.Image) bool {
-	_ = image
-	if runtime.GOARCH != "arm64" {
+	if runtime.GOARCH != "arm64" || image == nil {
 		return false
 	}
-	return true
+	return strings.TrimSpace(image.Architecture) == "amd64"
 }
 
 func PrepareAMD64Emulator(ctx context.Context, image *oci.Image, extractPackageFile packageFileExtractor) (string, error) {

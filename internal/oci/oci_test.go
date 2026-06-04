@@ -903,6 +903,20 @@ func TestParseSource(t *testing.T) {
 	}
 }
 
+func TestPreferredManifestArchitecturesHonorsRequestedArch(t *testing.T) {
+	got := preferredManifestArchitectures("x86_64")
+	if len(got) != 1 || got[0] != "amd64" {
+		t.Fatalf("preferredManifestArchitectures(x86_64) = %#v, want amd64 only", got)
+	}
+}
+
+func TestSharedImageKeyIncludesRequestedArchitecture(t *testing.T) {
+	spec := SourceSpec{Kind: SourceKindOCI, Raw: "ubuntu"}
+	if sharedImageKey(spec, "amd64") == sharedImageKey(spec, "arm64") {
+		t.Fatal("shared image key should differ by requested architecture")
+	}
+}
+
 func TestStoreReadMetadataBackfillsSourceKind(t *testing.T) {
 	store := NewStore(t.TempDir())
 	imageDir := filepath.Join(store.Root(), "legacy")
