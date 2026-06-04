@@ -6,7 +6,9 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -246,9 +248,9 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 		if image == nil {
 			return client.ExecResponse{}, fmt.Errorf("linux arm64 runtime command execution requires an image store and image")
 		}
-		user := strings.TrimSpace(req.User)
-		if user != "" && user != "root" && user != "0" && user != "0:0" {
-			return client.ExecResponse{}, fmt.Errorf("only root user is supported")
+		user, err := linuxResolveExecUser(req.User)
+		if err != nil {
+			return client.ExecResponse{}, err
 		}
 		if !strings.HasPrefix(workDir, "/") {
 			return client.ExecResponse{}, fmt.Errorf("workdir must be absolute")
@@ -261,6 +263,7 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 			Command: command,
 			Env:     env,
 			WorkDir: workDir,
+			User:    user,
 			Stdin:   append([]byte(nil), req.Stdin...),
 			TTY:     req.TTY,
 			Cols:    req.Cols,
@@ -444,9 +447,9 @@ func (i *linuxInstance) Exec(ctx context.Context, req client.ExecRequest) (clien
 	if i == nil || i.session == nil {
 		return client.ExecResponse{}, fmt.Errorf("instance is not running")
 	}
-	user := strings.TrimSpace(req.User)
-	if user != "" && user != "root" && user != "0" && user != "0:0" {
-		return client.ExecResponse{}, fmt.Errorf("only root user is supported")
+	user, err := linuxResolveExecUser(req.User)
+	if err != nil {
+		return client.ExecResponse{}, err
 	}
 	env := linuxEffectiveExecEnv(i.baseEnv, req.Env, req.ReplaceEnv)
 	command := append([]string(nil), req.Command...)
@@ -477,6 +480,7 @@ func (i *linuxInstance) Exec(ctx context.Context, req client.ExecRequest) (clien
 		ReplaceEnv:  req.ReplaceEnv,
 		SkipResolve: req.SkipResolve,
 		WorkDir:     workDir,
+		User:        user,
 		Stdin:       append([]byte(nil), req.Stdin...),
 		TTY:         req.TTY,
 		Cols:        req.Cols,
@@ -711,9 +715,11 @@ func withLinuxRuntimeMountDirs(image *oci.Image) *oci.Image {
 		return image
 	}
 	overlay := imagefs.NewOverlay(image.RootFS)
-	for _, dir := range []string{"/dev", "/proc", "/sys", "/run", "/tmp"} {
+	for _, dir := range []string{"/dev", "/proc", "/sys", "/run", "/tmp", "/etc"} {
 		_ = overlay.AddDir(dir, fs.ModeDir|0o755)
 	}
+	addLinuxRuntimeIdentityFiles(overlay, os.Getuid(), os.Getgid())
+	addLinuxRuntimeHostnameFiles(overlay)
 	cloned := *image
 	cloned.RootFS = overlay.Root()
 	return &cloned
@@ -724,6 +730,8 @@ func blankLinuxRuntimeRootFS() imagefs.Directory {
 	for _, dir := range []string{"/dev", "/proc", "/sys", "/run", "/tmp", "/.ccx3", "/.ccx3/images"} {
 		_ = overlay.AddDir(dir, fs.ModeDir|0o755)
 	}
+	addLinuxRuntimeIdentityFiles(overlay, os.Getuid(), os.Getgid())
+	addLinuxRuntimeHostnameFiles(overlay)
 	return overlay.Root()
 }
 
@@ -737,6 +745,38 @@ func linuxEffectiveExecEnv(base, overrides []string, replace bool) []string {
 		return vmruntime.WithDefaultEnv(overrides)
 	}
 	return vmruntime.WithDefaultEnv(vmruntime.MergeEnv(base, overrides))
+}
+
+func linuxResolveExecUser(user string) (string, error) {
+	user = strings.TrimSpace(user)
+	if user == "" {
+		uid := os.Getuid()
+		gid := os.Getgid()
+		if uid <= 0 {
+			return "0:0", nil
+		}
+		return strconv.Itoa(uid) + ":" + strconv.Itoa(gid), nil
+	}
+	if user == "root" || user == "0" || user == "0:0" {
+		return "0:0", nil
+	}
+	uidPart, gidPart, hasGID := strings.Cut(user, ":")
+	if uidPart == "" {
+		return "", fmt.Errorf("invalid user %q", user)
+	}
+	if _, err := strconv.ParseUint(uidPart, 10, 32); err != nil {
+		return "", fmt.Errorf("linux arm64 runtime supports numeric users only: %q", user)
+	}
+	if hasGID {
+		if gidPart == "" {
+			return "", fmt.Errorf("invalid user %q", user)
+		}
+		if _, err := strconv.ParseUint(gidPart, 10, 32); err != nil {
+			return "", fmt.Errorf("linux arm64 runtime supports numeric users only: %q", user)
+		}
+		return uidPart + ":" + gidPart, nil
+	}
+	return uidPart + ":" + uidPart, nil
 }
 
 func convertLinuxShareMounts(shares []client.ShareMount) []vmruntime.DirectoryShare {
