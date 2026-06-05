@@ -2,6 +2,7 @@ package virtio
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -4601,6 +4602,7 @@ func dirTypeForMode(mode os.FileMode) uint32 {
 
 func errnoFromError(err error) int32 {
 	var pathErr *os.PathError
+	var linkErr *os.LinkError
 	if os.IsNotExist(err) {
 		return -linuxENOENT
 	}
@@ -4621,6 +4623,11 @@ func errnoFromError(err error) int32 {
 	}
 	if ok := errorAs(err, &pathErr); ok {
 		if errno, ok := mapHostError(pathErr.Err); ok {
+			return -errno
+		}
+	}
+	if errors.As(err, &linkErr) {
+		if errno, ok := mapHostError(linkErr.Err); ok {
 			return -errno
 		}
 	}

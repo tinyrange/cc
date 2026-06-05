@@ -287,14 +287,14 @@ func TestDisplayPullSourceNormalizesCommonOCIRefs(t *testing.T) {
 
 func TestAliasExpandsBeforeCommandDispatch(t *testing.T) {
 	sh := &shellState{hostCWD: t.TempDir()}
-	if err := sh.eval(`@alias say=@host printf alias-ok`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
+	if err := sh.eval(`@alias say=@host echo alias-ok`, &bytes.Buffer{}, &bytes.Buffer{}); err != nil {
 		t.Fatalf("set alias error = %v", err)
 	}
 	var stdout bytes.Buffer
 	if err := sh.eval(`say`, &stdout, &bytes.Buffer{}); err != nil {
 		t.Fatalf("eval(alias) error = %v", err)
 	}
-	if stdout.String() != "alias-ok" {
+	if strings.TrimSpace(stdout.String()) != "alias-ok" {
 		t.Fatalf("stdout = %q, want alias-ok", stdout.String())
 	}
 }
@@ -1178,6 +1178,8 @@ func TestLineEditorAcceptsCompletionSelection(t *testing.T) {
 }
 
 func TestLineEditorInsertsCompletionSuffix(t *testing.T) {
+	t.Setenv("PATH", "")
+
 	master, tty, err := pty.Open()
 	if err != nil {
 		t.Skipf("open pty: %v", err)

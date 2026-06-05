@@ -37,6 +37,32 @@ func TestManagerStartShutdownLifecycle(t *testing.T) {
 	}
 }
 
+func TestHostCapabilityHelpersMatchBackendLimits(t *testing.T) {
+	tests := []struct {
+		name         string
+		goos         string
+		goarch       string
+		wantLimits   []string
+		wantNetworks []string
+	}{
+		{name: "linux amd64", goos: "linux", goarch: "amd64", wantLimits: []string{"memory_mb", "cpus"}, wantNetworks: []string{"user"}},
+		{name: "linux arm64", goos: "linux", goarch: "arm64", wantLimits: []string{"memory_mb"}, wantNetworks: []string{}},
+		{name: "darwin arm64", goos: "darwin", goarch: "arm64", wantLimits: []string{"memory_mb", "cpus"}, wantNetworks: []string{"user"}},
+		{name: "windows amd64", goos: "windows", goarch: "amd64", wantLimits: []string{"memory_mb"}, wantNetworks: []string{"user"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := fmt.Sprint(resourceLimitsForHost(tt.goos, tt.goarch)); got != fmt.Sprint(tt.wantLimits) {
+				t.Fatalf("resourceLimitsForHost() = %v, want %v", got, tt.wantLimits)
+			}
+			if got := fmt.Sprint(networkModesForHost(tt.goos, tt.goarch)); got != fmt.Sprint(tt.wantNetworks) {
+				t.Fatalf("networkModesForHost() = %v, want %v", got, tt.wantNetworks)
+			}
+		})
+	}
+}
+
 func TestManagerClearsRunningStateWhenInstanceExits(t *testing.T) {
 	inst := &fakeInstance{waitCh: make(chan error, 1)}
 	mgr := NewManagerWithBackend(fakeBackend{instance: inst})

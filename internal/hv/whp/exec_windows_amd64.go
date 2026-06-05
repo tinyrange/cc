@@ -18,6 +18,10 @@ import (
 )
 
 func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, req client.ExecRequest) (client.ExecResponse, string, error) {
+	return RunManagedExecWithFSAndNet(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, req)
+}
+
+func RunManagedExecWithFSAndNet(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, req client.ExecRequest) (client.ExecResponse, string, error) {
 	if len(req.Command) == 0 {
 		return client.ExecResponse{}, "", fmt.Errorf("exec command is required")
 	}
@@ -45,7 +49,7 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 		_, _ = io.Copy(controlTranscript, conn)
 	}()
 
-	vm, platform, serialOut, err := prepareManagedVM(kernel, initrd, memoryMB, dmesg, fsdevs, vsock, nil)
+	vm, platform, serialOut, err := prepareManagedVM(kernel, initrd, memoryMB, dmesg, fsdevs, vsock, netdev, nil)
 	if err != nil {
 		return client.ExecResponse{}, "", err
 	}
@@ -140,7 +144,7 @@ func RunManagedExecWithFS(ctx context.Context, kernel []byte, initrd []byte, mem
 	return client.ExecResponse{ExitCode: code, Output: output, Usage: usage}, serialOut.String(), nil
 }
 
-func prepareManagedVM(kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, serialWriter io.Writer) (*VM, *bootPlatform, *vmruntime.SerialTranscript, error) {
+func prepareManagedVM(kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, serialWriter io.Writer) (*VM, *bootPlatform, *vmruntime.SerialTranscript, error) {
 	vm, err := newBootVM(amd64vm.MemorySizeBytes(memoryMB))
 	if err != nil {
 		return nil, nil, nil, err
@@ -159,6 +163,9 @@ func prepareManagedVM(kernel []byte, initrd []byte, memoryMB uint64, dmesg bool,
 	extraCmdline = append(extraCmdline, amd64vm.VirtioFSCommandLineArgs(fsdevs)...)
 	if vsock != nil {
 		extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(vsock.Base, vsock.IRQ))
+	}
+	if netdev != nil {
+		extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(netdev.Base, netdev.IRQ))
 	}
 	rng := virtio.NewRNG(amd64vm.RNGBase, amd64vm.RNGSize, amd64vm.RNGIRQ)
 	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(rng.Base, rng.IRQ))
@@ -190,6 +197,9 @@ func prepareManagedVM(kernel []byte, initrd []byte, memoryMB uint64, dmesg bool,
 	}
 	if vsock != nil {
 		platform.AttachVsock(vsock)
+	}
+	if netdev != nil {
+		platform.AttachNet(netdev)
 	}
 	platform.AttachRNG(rng)
 	if err := vm.EnableEmulation(platform); err != nil {

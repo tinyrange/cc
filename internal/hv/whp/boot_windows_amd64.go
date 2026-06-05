@@ -55,16 +55,20 @@ func BootInitramfsToMarker(ctx context.Context, kernel []byte, initrd []byte, me
 }
 
 func BootInitramfsToMarkerWithFS(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, marker string, fsdevs []*virtio.FS) (string, error) {
+	return BootInitramfsToMarkerWithFSAndNet(ctx, kernel, initrd, memoryMB, dmesg, marker, fsdevs, nil)
+}
+
+func BootInitramfsToMarkerWithFSAndNet(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, marker string, fsdevs []*virtio.FS, netdev *virtio.Net) (string, error) {
 	if strings.TrimSpace(marker) == "" {
 		return "", fmt.Errorf("boot marker is required")
 	}
-	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, func(serial string) bool {
+	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, netdev, func(serial string) bool {
 		return strings.Contains(serial, marker)
 	})
 }
 
 func bootToCondition(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, done func(string) bool) (string, error) {
-	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, nil, done)
+	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, nil, nil, done)
 }
 
 func BootInitramfsToVsockMarker(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, port uint32, marker string) (string, string, error) {
@@ -95,7 +99,7 @@ func BootInitramfsToVsockMarker(ctx context.Context, kernel []byte, initrd []byt
 	vsock := virtio.NewVsock(amd64vm.VsockBase, amd64vm.VsockSize, amd64vm.VsockIRQ, vmruntime.GuestCID, backend)
 	defer vsock.Close()
 
-	serial, err := bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, vsock, func(string) bool {
+	serial, err := bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, vsock, nil, func(string) bool {
 		return strings.Contains(controlOut.String(), marker)
 	})
 	select {
@@ -109,7 +113,7 @@ func BootInitramfsToVsockMarker(ctx context.Context, kernel []byte, initrd []byt
 	return serial, controlOut.String(), nil
 }
 
-func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, done func(string) bool) (string, error) {
+func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, done func(string) bool) (string, error) {
 	vm, err := newBootVM(amd64vm.MemorySizeBytes(memoryMB))
 	if err != nil {
 		return "", err
@@ -129,6 +133,9 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 	extraCmdline = append(extraCmdline, amd64vm.VirtioFSCommandLineArgs(fsdevs)...)
 	if vsock != nil {
 		extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(vsock.Base, vsock.IRQ))
+	}
+	if netdev != nil {
+		extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(netdev.Base, netdev.IRQ))
 	}
 	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(rng.Base, rng.IRQ))
 	plan, err := amd64vm.PrepareBoot(vm.Memory(), kernel, initrd, amd64vm.BootConfig{
@@ -153,6 +160,9 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 	}
 	if vsock != nil {
 		platform.AttachVsock(vsock)
+	}
+	if netdev != nil {
+		platform.AttachNet(netdev)
 	}
 	platform.AttachRNG(rng)
 	if err := vm.EnableEmulation(platform); err != nil {
@@ -219,6 +229,7 @@ type bootPlatform struct {
 	fsdevs        []*virtio.FS
 	vsock         *virtio.Vsock
 	rng           *virtio.RNG
+	netdev        *virtio.Net
 	start         time.Time
 	irqAttempts   uint64
 	irqDelivered  uint64
@@ -265,6 +276,11 @@ func (p *bootPlatform) AttachVsock(vsock *virtio.Vsock) {
 func (p *bootPlatform) AttachRNG(rng *virtio.RNG) {
 	p.rng = rng
 	rng.Attach(p.vm, p)
+}
+
+func (p *bootPlatform) AttachNet(netdev *virtio.Net) {
+	p.netdev = netdev
+	netdev.Attach(p.vm, p)
 }
 
 func (p *bootPlatform) ReadIO(port uint16, data []byte) error {
@@ -341,6 +357,14 @@ func (p *bootPlatform) ReadMMIO(addr uint64, data []byte) error {
 		putUint64(data, value)
 		return nil
 	}
+	if p.netdev != nil && p.netdev.Contains(addr, len(data)) {
+		value, err := p.netdev.Read(addr, len(data))
+		if err != nil {
+			return err
+		}
+		putUint64(data, value)
+		return nil
+	}
 	if p.ioapic.Read(addr, data) {
 		return nil
 	}
@@ -365,6 +389,9 @@ func (p *bootPlatform) WriteMMIO(addr uint64, data []byte) error {
 	}
 	if p.rng != nil && p.rng.Contains(addr, len(data)) {
 		return p.rng.Write(addr, len(data), readUint64(data))
+	}
+	if p.netdev != nil && p.netdev.Contains(addr, len(data)) {
+		return p.netdev.Write(addr, len(data), readUint64(data))
 	}
 	if p.ioapic.Write(addr, data) {
 		return nil

@@ -962,6 +962,9 @@ func TestStoreSaveRootFSPersistsImageAndExcludesRuntimePaths(t *testing.T) {
 		t.Fatalf("WriteFile(motd) error = %v", err)
 	}
 	if err := os.Symlink("../etc/motd", filepath.Join(rootDir, "bin", "motd")); err != nil {
+		if runtime.GOOS == "windows" && (os.IsPermission(err) || strings.Contains(strings.ToLower(err.Error()), "privilege")) {
+			t.Skipf("creating symlinks requires Windows developer mode or SeCreateSymbolicLinkPrivilege: %v", err)
+		}
 		t.Fatalf("Symlink(bin/motd) error = %v", err)
 	}
 	for _, file := range []string{"tmp/drop", "proc/drop", "host/drop", ".ccx3/drop"} {

@@ -99,23 +99,22 @@ func HostCapabilities() client.CapabilitiesResponse {
 		Backend:                backendName(),
 		MaxInstances:           64,
 		SnapshotClasses:        []string{},
-		NetworkModes:           []string{},
+		NetworkModes:           networkModesForHost(runtime.GOOS, runtime.GOARCH),
 		ShareConsistency:       []string{"host-backed"},
-		ResourceLimits:         []string{"memory_mb", "cpus"},
+		ResourceLimits:         resourceLimitsForHost(runtime.GOOS, runtime.GOARCH),
 		SupportsMultiImageExec: true,
 		RequiresPrivilegedCCX3: false,
 	}
 	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
 		caps.MaxInstances = 1
-		caps.NetworkModes = []string{"user"}
 		caps.Notes = append(caps.Notes, "macOS HVF currently limits ccx3 to one running instance")
+	}
+	if runtime.GOOS == "windows" && runtime.GOARCH == "amd64" {
+		caps.Notes = append(caps.Notes, "Windows WHP currently supports one vCPU per instance")
 	}
 	if supported, err := hv.NestedVirtualizationSupported(); err == nil && supported {
 		caps.SupportsNestedVirt = true
 		caps.ResourceLimits = append(caps.ResourceLimits, "nested_virtualization")
-	}
-	if runtime.GOOS == "linux" && runtime.GOARCH == "amd64" {
-		caps.NetworkModes = []string{"user"}
 	}
 	if err := Supports(); err != nil {
 		caps.VMSupported = false
@@ -124,6 +123,30 @@ func HostCapabilities() client.CapabilitiesResponse {
 		caps.VMSupported = true
 	}
 	return caps
+}
+
+func resourceLimitsForHost(goos, goarch string) []string {
+	limits := []string{"memory_mb"}
+	switch {
+	case goos == "linux" && goarch == "amd64":
+		limits = append(limits, "cpus")
+	case goos == "darwin" && goarch == "arm64":
+		limits = append(limits, "cpus")
+	}
+	return limits
+}
+
+func networkModesForHost(goos, goarch string) []string {
+	switch {
+	case goos == "linux" && goarch == "amd64":
+		return []string{"user"}
+	case goos == "darwin" && goarch == "arm64":
+		return []string{"user"}
+	case goos == "windows" && goarch == "amd64":
+		return []string{"user"}
+	default:
+		return []string{}
+	}
 }
 
 func backendName() string {

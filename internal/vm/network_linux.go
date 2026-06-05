@@ -3,49 +3,19 @@
 package vm
 
 import (
-	"context"
 	"encoding/binary"
-	"fmt"
-	"io"
-	"log/slog"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/amd64vm"
-	"j5.nz/cc/internal/netstack"
 	"j5.nz/cc/internal/virtio"
 )
 
 type linuxNetworkRuntime struct {
-	id        string
-	ip        net.IP
-	mac       net.HardwareAddr
-	stack     *netstack.NetStack
-	iface     *netstack.NetworkInterface
-	dev       *virtio.Net
+	*networkRuntime
 	switchNet *linuxVirtualSwitch
-	mu        sync.Mutex
-	listeners []net.Listener
-	forwards  map[string]client.PortForward
-	wg        sync.WaitGroup
-}
-
-type netstackVirtioBackend struct {
-	runtime *linuxNetworkRuntime
-}
-
-func (b *netstackVirtioBackend) HandleTxPacket(packet []byte) error {
-	if b == nil || b.runtime == nil || b.runtime.stack == nil {
-		return fmt.Errorf("network runtime is not attached")
-	}
-	if b.runtime.switchNet != nil {
-		b.runtime.switchNet.Forward(b.runtime, packet)
-	}
-	return b.runtime.ifaceDeliver(packet)
 }
 
 func newLinuxAMD64NetworkRuntime(id string, cfg *client.NetworkConfig) (*linuxNetworkRuntime, error) {
@@ -53,66 +23,28 @@ func newLinuxAMD64NetworkRuntime(id string, cfg *client.NetworkConfig) (*linuxNe
 		return nil, nil
 	}
 	lease := defaultLinuxVirtualSwitch.Register(id)
-	stack := netstack.New(slog.Default())
-	stack.SetInternetAccessEnabled(cfg.AllowInternet)
-	stack.SetHostDNSName(cfg.HostDNSName)
-
-	if err := stack.SetGuestMAC(lease.mac); err != nil {
-		defaultLinuxVirtualSwitch.Unregister(lease.id)
-		_ = stack.Close()
-		return nil, err
-	}
-	if err := stack.SetGuestIPv4(lease.ip); err != nil {
-		defaultLinuxVirtualSwitch.Unregister(lease.id)
-		_ = stack.Close()
-		return nil, err
-	}
-	iface, err := stack.AttachNetworkInterface()
-	if err != nil {
-		defaultLinuxVirtualSwitch.Unregister(lease.id)
-		_ = stack.Close()
-		return nil, err
-	}
-	if err := stack.StartDNSServer(); err != nil {
-		defaultLinuxVirtualSwitch.Unregister(lease.id)
-		_ = stack.Close()
-		return nil, fmt.Errorf("start guest dns server: %w", err)
-	}
-
-	runtime := &linuxNetworkRuntime{
-		id:        lease.id,
-		ip:        lease.ip,
-		mac:       lease.mac,
-		stack:     stack,
-		iface:     iface,
-		switchNet: defaultLinuxVirtualSwitch,
-	}
-	defaultLinuxVirtualSwitch.Attach(runtime)
-	dev := virtio.NewNet(amd64vm.NetBase, amd64vm.NetSize, amd64vm.NetIRQ, lease.mac, &netstackVirtioBackend{runtime: runtime})
-	runtime.dev = dev
-	iface.AttachVirtioBackend(func(frame []byte) error {
-		copied := append([]byte(nil), frame...)
-		go func() {
-			_ = dev.EnqueueRxPacketOwned(copied)
-		}()
-		return nil
+	runtime := &linuxNetworkRuntime{switchNet: defaultLinuxVirtualSwitch}
+	common, err := newNetworkRuntime(networkDeviceConfig{
+		ID:     lease.id,
+		Config: cfg,
+		IP:     lease.ip,
+		MAC:    lease.mac,
+		Base:   amd64vm.NetBase,
+		Size:   amd64vm.NetSize,
+		IRQ:    amd64vm.NetIRQ,
+		TXHook: func(packet []byte) {
+			defaultLinuxVirtualSwitch.Forward(runtime, packet)
+		},
+		Cleanup: func() {
+			defaultLinuxVirtualSwitch.Unregister(lease.id)
+		},
 	})
-
-	for _, forward := range cfg.PortForwards {
-		if err := runtime.AddPortForward(forward); err != nil {
-			_ = runtime.Close()
-			return nil, err
-		}
+	if err != nil {
+		return nil, err
 	}
-
+	runtime.networkRuntime = common
+	defaultLinuxVirtualSwitch.Attach(runtime)
 	return runtime, nil
-}
-
-func (n *linuxNetworkRuntime) ifaceDeliver(packet []byte) error {
-	if n == nil || n.iface == nil {
-		return fmt.Errorf("network interface detached")
-	}
-	return n.iface.DeliverGuestPacket(packet, true)
 }
 
 func (n *linuxNetworkRuntime) Close() error {
@@ -123,41 +55,31 @@ func (n *linuxNetworkRuntime) Close() error {
 		n.switchNet.Unregister(n.id)
 		n.switchNet = nil
 	}
-	var err error
-	n.mu.Lock()
-	listeners := append([]net.Listener(nil), n.listeners...)
-	n.listeners = nil
-	n.mu.Unlock()
-	for _, ln := range listeners {
-		if closeErr := ln.Close(); closeErr != nil && err == nil {
-			err = closeErr
-		}
+	if n.networkRuntime == nil {
+		return nil
 	}
-	n.wg.Wait()
-	if n.stack != nil {
-		if stackErr := n.stack.Close(); stackErr != nil && err == nil {
-			err = stackErr
-		}
-	}
-	return err
+	return n.networkRuntime.Close()
 }
 
 func networkDevice(n *linuxNetworkRuntime) *virtio.Net {
 	if n == nil {
 		return nil
 	}
-	return n.dev
+	return n.Device()
 }
 
 func networkGuestAddress(n *linuxNetworkRuntime) string {
-	if n == nil || n.ip == nil {
-		return "10.42.0.2"
+	if n == nil {
+		return (&networkRuntime{}).GuestAddress()
 	}
-	return n.ip.String()
+	return n.GuestAddress()
 }
 
 func networkGuestCIDR(n *linuxNetworkRuntime) string {
-	return networkGuestAddress(n) + "/24"
+	if n == nil {
+		return (&networkRuntime{}).GuestCIDR()
+	}
+	return n.GuestCIDR()
 }
 
 type linuxVirtualSwitch struct {
@@ -197,9 +119,8 @@ func (s *linuxVirtualSwitch) Register(id string) linuxNetworkLease {
 		}
 	}
 	for _, endpoint := range s.endpoints {
-		if len(endpoint.ip) >= net.IPv4len {
-			ip4 := endpoint.ip.To4()
-			if ip4 != nil {
+		if endpoint != nil && endpoint.ip != nil {
+			if ip4 := endpoint.ip.To4(); ip4 != nil {
 				used[ip4[3]] = true
 			}
 		}
@@ -373,96 +294,4 @@ func bytesEqualMAC(a, b net.HardwareAddr) bool {
 		}
 	}
 	return true
-}
-
-func (n *linuxNetworkRuntime) AddPortForward(forward client.PortForward) error {
-	if n == nil || n.stack == nil {
-		return fmt.Errorf("network is not enabled")
-	}
-	protocol := strings.ToLower(strings.TrimSpace(forward.Protocol))
-	if protocol == "" {
-		protocol = "tcp"
-	}
-	if protocol != "tcp" && protocol != "tcp4" {
-		return fmt.Errorf("port forward protocol %q is not supported", forward.Protocol)
-	}
-	if forward.HostPort <= 0 || forward.HostPort > 65535 {
-		return fmt.Errorf("host port %d out of range", forward.HostPort)
-	}
-	if forward.GuestPort <= 0 || forward.GuestPort > 65535 {
-		return fmt.Errorf("guest port %d out of range", forward.GuestPort)
-	}
-	hostAddr := strings.TrimSpace(forward.HostAddr)
-	if hostAddr == "" {
-		hostAddr = "127.0.0.1"
-	}
-	guestAddr := strings.TrimSpace(forward.GuestAddr)
-	if guestAddr == "" {
-		guestAddr = networkGuestAddress(n)
-	}
-	forward.Protocol = protocol
-	forward.HostAddr = hostAddr
-	forward.GuestAddr = guestAddr
-	key := strings.Join([]string{protocol, hostAddr, strconv.Itoa(forward.HostPort), guestAddr, strconv.Itoa(forward.GuestPort)}, "\x00")
-
-	n.mu.Lock()
-	if existing, ok := n.forwards[key]; ok {
-		n.mu.Unlock()
-		if existing == forward {
-			return nil
-		}
-		return fmt.Errorf("port forward already exists")
-	}
-	n.mu.Unlock()
-
-	ln, err := net.Listen("tcp", net.JoinHostPort(hostAddr, strconv.Itoa(forward.HostPort)))
-	if err != nil {
-		return fmt.Errorf("listen port forward %s:%d: %w", hostAddr, forward.HostPort, err)
-	}
-	n.mu.Lock()
-	if n.forwards == nil {
-		n.forwards = make(map[string]client.PortForward)
-	}
-	n.forwards[key] = forward
-	n.listeners = append(n.listeners, ln)
-	n.wg.Add(1)
-	n.mu.Unlock()
-	go n.acceptPortForward(ln, net.JoinHostPort(guestAddr, strconv.Itoa(forward.GuestPort)))
-	return nil
-}
-
-func (n *linuxNetworkRuntime) acceptPortForward(ln net.Listener, guestAddress string) {
-	defer n.wg.Done()
-	for {
-		hostConn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		n.wg.Add(1)
-		go n.handlePortForwardConn(hostConn, guestAddress)
-	}
-}
-
-func (n *linuxNetworkRuntime) handlePortForwardConn(hostConn net.Conn, guestAddress string) {
-	defer n.wg.Done()
-	defer hostConn.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	guestConn, err := n.stack.DialInternalContext(ctx, "tcp", guestAddress)
-	if err != nil {
-		return
-	}
-	defer guestConn.Close()
-
-	errCh := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(guestConn, hostConn)
-		errCh <- err
-	}()
-	go func() {
-		_, err := io.Copy(hostConn, guestConn)
-		errCh <- err
-	}()
-	<-errCh
 }

@@ -60,6 +60,17 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	if err != nil {
 		return nil, err
 	}
+	network, err := newWindowsAMD64NetworkRuntime(req.Network)
+	if err != nil {
+		return nil, err
+	}
+	if network != nil {
+		defer func() {
+			if err != nil {
+				_ = network.Close()
+			}
+		}()
+	}
 	fsdevs, rootFS, err := amd64vm.BuildFSDevices(vmruntime.RunRequest{
 		Image:  image,
 		Shares: convertWindowsShareMounts(req.Shares),
@@ -79,11 +90,12 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 	initCfg.RootFSTag = vmruntime.RootFSTag
 	initCfg.Env = vmruntime.WithDefaultEnv(image.Config.Env)
 	initCfg.WorkDir = workDir
+	initCfg.Network = windowsNetworkGuestInitConfig(network)
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
 	}
-	session, err := whp.StartManagedSession(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, onEvent)
+	session, err := whp.StartManagedSessionWithNet(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, windowsNetworkDevice(network), onEvent)
 	if err != nil {
 		return nil, err
 	}
@@ -93,6 +105,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		baseEnv: vmruntime.WithDefaultEnv(image.Config.Env),
 		workDir: workDir,
 		rootFS:  rootFS,
+		network: network,
 		dmesg:   req.Dmesg,
 	}, nil
 }
@@ -116,6 +129,17 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if err != nil {
 		return nil, err
 	}
+	network, err := newWindowsAMD64NetworkRuntime(req.Network)
+	if err != nil {
+		return nil, err
+	}
+	if network != nil {
+		defer func() {
+			if err != nil {
+				_ = network.Close()
+			}
+		}()
+	}
 	rootFSBackend := virtio.NewImageFS(blankWindowsRuntimeRootFS(), "")
 	fsdevs, rootFS, err := amd64vm.BuildFSDevices(vmruntime.RunRequest{
 		RootFS: rootFSBackend,
@@ -131,11 +155,12 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	initCfg.RootFSTag = vmruntime.RootFSTag
 	initCfg.Env = vmruntime.WithDefaultEnv(nil)
 	initCfg.WorkDir = "/"
+	initCfg.Network = windowsNetworkGuestInitConfig(network)
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	if err != nil {
 		return nil, fmt.Errorf("build initramfs: %w", err)
 	}
-	session, err := whp.StartManagedSession(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, onEvent)
+	session, err := whp.StartManagedSessionWithNet(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, windowsNetworkDevice(network), onEvent)
 	if err != nil {
 		return nil, err
 	}
@@ -144,6 +169,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 		baseEnv: vmruntime.WithDefaultEnv(nil),
 		workDir: "/",
 		rootFS:  rootFS,
+		network: network,
 		dmesg:   req.Dmesg,
 	}, nil
 }
@@ -205,10 +231,18 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 	if err != nil {
 		return client.ExecResponse{}, fmt.Errorf("build guest init: %w", err)
 	}
+	network, err := newWindowsAMD64NetworkRuntime(req.Network)
+	if err != nil {
+		return client.ExecResponse{}, err
+	}
+	if network != nil {
+		defer network.Close()
+	}
 	initCfg := windowsGuestInitConfig(modules, len(req.Command) != 0)
 	if len(fsdevs) != 0 {
 		initCfg.RootFSTag = vmruntime.RootFSTag
 	}
+	initCfg.Network = windowsNetworkGuestInitConfig(network)
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	if err != nil {
 		return client.ExecResponse{}, fmt.Errorf("build initramfs: %w", err)
@@ -238,7 +272,7 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 			Cols:    req.Cols,
 			Rows:    req.Rows,
 		}
-		resp, serial, err := whp.RunManagedExecWithFS(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, execReq)
+		resp, serial, err := whp.RunManagedExecWithFSAndNet(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, windowsNetworkDevice(network), execReq)
 		if err != nil && resp.Output == "" {
 			resp.Output = serial
 		}
@@ -246,8 +280,8 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 	}
 
 	var output string
-	if len(fsdevs) != 0 {
-		output, err = whp.BootInitramfsToMarkerWithFS(ctx, kernel, initrd, req.MemoryMB, true, windowsInitReadyMarker, fsdevs)
+	if len(fsdevs) != 0 || network != nil {
+		output, err = whp.BootInitramfsToMarkerWithFSAndNet(ctx, kernel, initrd, req.MemoryMB, true, windowsInitReadyMarker, fsdevs, windowsNetworkDevice(network))
 	} else {
 		output, err = whp.BootInitramfsToMarker(ctx, kernel, initrd, req.MemoryMB, true, windowsInitReadyMarker)
 	}
@@ -425,6 +459,7 @@ type windowsInstance struct {
 	workDir     string
 	rootFS      virtio.ShareMounter
 	dmesg       bool
+	network     *windowsNetworkRuntime
 	shareMu     sync.Mutex
 	shares      map[string]client.ShareMount
 	imageMounts map[string]string
@@ -561,8 +596,11 @@ func (i *windowsInstance) AddShare(ctx context.Context, share client.ShareMount)
 }
 
 func (i *windowsInstance) AddPortForward(ctx context.Context, forward client.PortForward) error {
-	_, _ = ctx, forward
-	return fmt.Errorf("instance network port forwarding is not supported on windows/amd64")
+	_ = ctx
+	if i == nil || i.network == nil {
+		return fmt.Errorf("instance network is not enabled")
+	}
+	return i.network.AddPortForward(forward)
 }
 
 func (i *windowsInstance) AddImage(ctx context.Context, mountPath string, image *oci.Image) error {
@@ -613,7 +651,20 @@ func (i *windowsInstance) Close() error {
 	if i == nil || i.session == nil {
 		return nil
 	}
-	return i.session.Close()
+	err := i.session.Close()
+	if i.network != nil {
+		if netErr := i.network.Close(); err == nil {
+			err = netErr
+		}
+	}
+	return err
+}
+
+func (i *windowsInstance) NetworkIPv4() string {
+	if i == nil || i.network == nil {
+		return ""
+	}
+	return windowsNetworkGuestAddress(i.network)
 }
 
 func windowsGuestInitConfig(modules []alpine.Module, managedExec bool) vmruntime.GuestInitConfig {
@@ -633,7 +684,7 @@ func windowsGuestInitConfig(modules []alpine.Module, managedExec bool) vmruntime
 }
 
 func windowsRuntimeConfigVars() []string {
-	return []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO", "CONFIG_OVERLAY_FS"}
+	return []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO", "CONFIG_VIRTIO_NET", "CONFIG_OVERLAY_FS"}
 }
 
 func windowsRuntimeModuleMap() map[string]string {
@@ -645,6 +696,7 @@ func windowsRuntimeModuleMap() map[string]string {
 		"CONFIG_VIRTIO_VSOCKETS":  "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
 		"CONFIG_HW_RANDOM":        "kernel/drivers/char/hw_random/rng-core.ko.gz",
 		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
+		"CONFIG_VIRTIO_NET":       "kernel/drivers/net/virtio_net.ko.gz",
 		"CONFIG_OVERLAY_FS":       "kernel/fs/overlayfs/overlay.ko.gz",
 	}
 }

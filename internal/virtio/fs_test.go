@@ -400,6 +400,9 @@ func TestStrictFUSESymlinkCreatesHostSymlink(t *testing.T) {
 		t.Fatalf("dispatchFUSELocked(SYMLINK) error = %v", err)
 	}
 	if got := int32(binary.LittleEndian.Uint32(reply[4:8])); got != 0 {
+		if runtime.GOOS == "windows" && got == -linuxEPERM {
+			t.Skip("creating symlinks requires Windows developer mode or SeCreateSymbolicLinkPrivilege")
+		}
 		t.Fatalf("SYMLINK errno = %d, want 0", got)
 	}
 	if got := binary.LittleEndian.Uint64(reply[8:16]); got != unique {

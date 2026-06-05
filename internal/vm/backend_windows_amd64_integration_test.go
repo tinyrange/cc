@@ -4,10 +4,15 @@ package vm
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/kernel/alpine"
@@ -36,6 +41,50 @@ func TestWindowsRuntimeBackendRunCommand(t *testing.T) {
 	}
 	if strings.TrimSpace(resp.Output) != "windows-amd64-ok" {
 		t.Fatalf("backend.Run().Output = %q, want windows-amd64-ok", resp.Output)
+	}
+}
+
+func TestWindowsRuntimeBackendPortForwardToGuestWebServer(t *testing.T) {
+	if os.Getenv("CCX3_WHP_BOOT") == "" {
+		t.Skip("set CCX3_WHP_BOOT=1 to run the windows amd64 WHP boot probe")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), windowsBootTestTimeout(t))
+	defer cancel()
+	backend := newWindowsRuntimeBackendForTest(t, ctx)
+	hostPort := reserveWindowsRuntimeForwardPort(t)
+
+	inst, err := backend.Start(ctx, client.CreateInstanceRequest{
+		Image: "alpine",
+		Network: &client.NetworkConfig{
+			Enabled: true,
+			PortForwards: []client.PortForward{{
+				Protocol:  "tcp",
+				HostAddr:  "127.0.0.1",
+				HostPort:  hostPort,
+				GuestPort: 8080,
+			}},
+		},
+		MemoryMB: 256,
+	})
+	if err != nil {
+		t.Fatalf("backend.Start() error = %v", err)
+	}
+	defer inst.Close()
+
+	resp, err := inst.Exec(ctx, client.ExecRequest{
+		Command: []string{"sh", "-c", "while true; do printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 21\\r\\nConnection: close\\r\\n\\r\\nwindows-portforward-ok\\n' | nc -l -p 8080; done >/tmp/cc-port-forward.log 2>&1 & echo server-ready"},
+	})
+	if err != nil {
+		t.Fatalf("start guest web server error = %v\noutput:\n%s", err, resp.Output)
+	}
+	if resp.ExitCode != 0 || !strings.Contains(resp.Output, "server-ready") {
+		t.Fatalf("start guest web server exit=%d output:\n%s", resp.ExitCode, resp.Output)
+	}
+
+	body := fetchWindowsRuntimeURL(t, fmt.Sprintf("http://127.0.0.1:%d/", hostPort), 5*time.Second)
+	if strings.TrimSpace(body) != "windows-portforward-ok" {
+		t.Fatalf("unexpected forwarded response %q", body)
 	}
 }
 
@@ -205,4 +254,43 @@ func newWindowsRuntimeBackendForTest(t *testing.T, ctx context.Context) Backend 
 		t.Fatalf("store.Pull() error = %v", err)
 	}
 	return NewRuntimeBackend(kernel, store, filepath.Join(root, "guestinit"))
+}
+
+func reserveWindowsRuntimeForwardPort(t testing.TB) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve local tcp port: %v", err)
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+func fetchWindowsRuntimeURL(t testing.TB, url string, timeout time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		resp, err := http.Get(url)
+		if err == nil {
+			body, readErr := io.ReadAll(resp.Body)
+			closeErr := resp.Body.Close()
+			if readErr == nil {
+				readErr = closeErr
+			}
+			if readErr == nil && resp.StatusCode == http.StatusOK {
+				return string(body)
+			}
+			if readErr != nil {
+				lastErr = readErr
+			} else {
+				lastErr = fmt.Errorf("status %s body %q", resp.Status, string(body))
+			}
+		} else {
+			lastErr = err
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("fetch %s did not succeed within %s: %v", url, timeout, lastErr)
+	return ""
 }

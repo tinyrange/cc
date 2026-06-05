@@ -35,6 +35,10 @@ type ManagedSession struct {
 }
 
 func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
+	return StartManagedSessionWithNet(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, onEvent)
+}
+
+func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, netdev *virtio.Net, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
 	backend := virtio.NewSimpleVsockBackend()
 	listener, err := backend.Listen(vmruntime.ControlPort)
 	if err != nil {
@@ -61,7 +65,7 @@ func StartManagedSession(ctx context.Context, kernel []byte, initrd []byte, memo
 		bootWriter = vmruntime.NewBootEventWriter(onEvent)
 		serialWriter = bootWriter
 	}
-	vm, platform, serialOut, err := prepareManagedVM(kernel, initrd, memoryMB, dmesg, fsdevs, vsock, serialWriter)
+	vm, platform, serialOut, err := prepareManagedVM(kernel, initrd, memoryMB, dmesg, fsdevs, vsock, netdev, serialWriter)
 	if err != nil {
 		_ = listener.Close()
 		vsock.Close()
