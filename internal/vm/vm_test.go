@@ -100,6 +100,143 @@ func TestManagerCanUseInjectedVMHost(t *testing.T) {
 	}
 }
 
+func TestPlacementVMHostReportsCombinedCapabilities(t *testing.T) {
+	host := newPlacementVMHost(
+		&fakeVMHost{caps: VMHostCapabilities{Backend: "one", MaxVMs: 1, SupportsL2: true}},
+		&fakeVMHost{caps: VMHostCapabilities{Backend: "two", MaxVMs: 2, SupportsFSRPC: true}},
+	)
+
+	caps := host.HostCapabilities(context.Background())
+	if caps.Backend != "placement" || caps.Locality != "mixed" || caps.MaxVMs != 3 || !caps.SupportsL2 || !caps.SupportsFSRPC {
+		t.Fatalf("HostCapabilities() = %#v, want combined placement capabilities", caps)
+	}
+
+	unlimited := newPlacementVMHost(
+		&fakeVMHost{caps: VMHostCapabilities{Backend: "one", MaxVMs: 1}},
+		&fakeVMHost{caps: VMHostCapabilities{Backend: "two", MaxVMs: 0}},
+	)
+	if got := unlimited.HostCapabilities(context.Background()).MaxVMs; got != 0 {
+		t.Fatalf("unlimited HostCapabilities().MaxVMs = %d, want 0", got)
+	}
+}
+
+func TestPlacementVMHostStartsAcrossHostCapacity(t *testing.T) {
+	firstInst := &fakeInstance{waitCh: make(chan error, 1)}
+	secondInst := &fakeInstance{waitCh: make(chan error, 1)}
+	var firstStarts, secondStarts int
+	first := &fakeVMHost{
+		Backend: fakeBackend{startFn: func(req client.CreateInstanceRequest) (Instance, error) {
+			firstStarts++
+			return firstInst, nil
+		}},
+		caps: VMHostCapabilities{Backend: "first", MaxVMs: 1},
+	}
+	second := &fakeVMHost{
+		Backend: fakeBackend{startFn: func(req client.CreateInstanceRequest) (Instance, error) {
+			secondStarts++
+			return secondInst, nil
+		}},
+		caps: VMHostCapabilities{Backend: "second", MaxVMs: 1},
+	}
+	mgr := NewManagerWithHosts(first, second)
+	mgr.supports = func() error { return nil }
+
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{ID: "one", Image: "alpine"}); err != nil {
+		t.Fatalf("Start(one) error = %v", err)
+	}
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{ID: "two", Image: "busybox"}); err != nil {
+		t.Fatalf("Start(two) error = %v", err)
+	}
+	if firstStarts != 1 || secondStarts != 1 {
+		t.Fatalf("start counts first=%d second=%d, want 1 each", firstStarts, secondStarts)
+	}
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{ID: "three", Image: "ubuntu"}); err == nil {
+		t.Fatal("Start(three) error = nil, want capacity error")
+	}
+}
+
+func TestPlacementVMHostReleasesCapacityOnClose(t *testing.T) {
+	firstInst := &fakeInstance{waitCh: make(chan error, 1)}
+	secondInst := &fakeInstance{waitCh: make(chan error, 1)}
+	starts := 0
+	host := &fakeVMHost{
+		Backend: fakeBackend{startFn: func(req client.CreateInstanceRequest) (Instance, error) {
+			starts++
+			if starts == 1 {
+				return firstInst, nil
+			}
+			return secondInst, nil
+		}},
+		caps: VMHostCapabilities{Backend: "single", MaxVMs: 1},
+	}
+	mgr := NewManagerWithHosts(host)
+	mgr.supports = func() error { return nil }
+
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{ID: "one", Image: "alpine"}); err != nil {
+		t.Fatalf("Start(one) error = %v", err)
+	}
+	if err := mgr.ShutdownInstance(context.Background(), "one"); err != nil {
+		t.Fatalf("ShutdownInstance(one) error = %v", err)
+	}
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{ID: "two", Image: "busybox"}); err != nil {
+		t.Fatalf("Start(two) after shutdown error = %v", err)
+	}
+	if starts != 2 {
+		t.Fatalf("start count = %d, want 2", starts)
+	}
+}
+
+func TestPlacementVMHostRoutesExecToOwningHost(t *testing.T) {
+	firstInst := &fakeInstance{waitCh: make(chan error, 1)}
+	secondInst := &fakeInstance{waitCh: make(chan error, 1)}
+	var firstExecs, secondExecs int
+	first := &fakeVMHost{
+		Backend: fakeBackend{
+			instance: firstInst,
+			runInInstanceFn: func(ctx context.Context, inst Instance, runningImage string, req client.RunRequest) (client.ExecResponse, error) {
+				_ = ctx
+				_ = inst
+				_ = runningImage
+				_ = req
+				firstExecs++
+				return client.ExecResponse{ExitCode: 0, Output: "first"}, nil
+			},
+		},
+		caps: VMHostCapabilities{Backend: "first", MaxVMs: 1},
+	}
+	second := &fakeVMHost{
+		Backend: fakeBackend{
+			instance: secondInst,
+			runInInstanceFn: func(ctx context.Context, inst Instance, runningImage string, req client.RunRequest) (client.ExecResponse, error) {
+				_ = ctx
+				_ = inst
+				_ = runningImage
+				_ = req
+				secondExecs++
+				return client.ExecResponse{ExitCode: 0, Output: "second"}, nil
+			},
+		},
+		caps: VMHostCapabilities{Backend: "second", MaxVMs: 1},
+	}
+	mgr := NewManagerWithHosts(first, second)
+	mgr.supports = func() error { return nil }
+
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{ID: "one", Image: "alpine"}); err != nil {
+		t.Fatalf("Start(one) error = %v", err)
+	}
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{ID: "two", Image: "busybox"}); err != nil {
+		t.Fatalf("Start(two) error = %v", err)
+	}
+
+	resp, err := mgr.Run(context.Background(), client.RunRequest{ID: "two", Image: "ubuntu", Command: []string{"true"}})
+	if err != nil {
+		t.Fatalf("Run(two) error = %v", err)
+	}
+	if resp.Output != "second" || firstExecs != 0 || secondExecs != 1 {
+		t.Fatalf("exec routed output=%q first=%d second=%d, want second host", resp.Output, firstExecs, secondExecs)
+	}
+}
+
 func TestManagerClearsRunningStateWhenInstanceExits(t *testing.T) {
 	inst := &fakeInstance{waitCh: make(chan error, 1)}
 	mgr := NewManagerWithBackend(fakeBackend{instance: inst})

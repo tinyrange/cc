@@ -117,6 +117,10 @@ func NewManagerWithHost(host VMHost) *Manager {
 	return &Manager{host: host, supports: Supports, capabilities: HostCapabilities}
 }
 
+func NewManagerWithHosts(hosts ...VMHost) *Manager {
+	return NewManagerWithHost(newPlacementVMHost(hosts...))
+}
+
 func Supports() error {
 	return hv.Supports()
 }
@@ -251,6 +255,181 @@ func (h *inProcessVMHost) RunInInstance(ctx context.Context, inst Instance, runn
 
 func (h *inProcessVMHost) RunInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	return h.backend.RunInInstanceStream(ctx, inst, runningImage, req, inputs, onEvent)
+}
+
+type placementVMHost struct {
+	mu      sync.Mutex
+	hosts   []VMHost
+	running map[VMHost]int
+}
+
+func newPlacementVMHost(hosts ...VMHost) VMHost {
+	filtered := make([]VMHost, 0, len(hosts))
+	for _, host := range hosts {
+		if host != nil {
+			filtered = append(filtered, host)
+		}
+	}
+	if len(filtered) == 0 {
+		filtered = append(filtered, newInProcessVMHost(unsupportedBackend{}, HostCapabilities))
+	}
+	return &placementVMHost{hosts: filtered, running: map[VMHost]int{}}
+}
+
+func (h *placementVMHost) HostCapabilities(ctx context.Context) VMHostCapabilities {
+	caps := VMHostCapabilities{
+		Backend:  "placement",
+		Locality: "mixed",
+	}
+	allLimited := true
+	for _, host := range h.hosts {
+		hostCaps := host.HostCapabilities(ctx)
+		if hostCaps.MaxVMs <= 0 {
+			allLimited = false
+		} else if allLimited {
+			caps.MaxVMs += hostCaps.MaxVMs
+		}
+		caps.SupportsFSRPC = caps.SupportsFSRPC || hostCaps.SupportsFSRPC
+		caps.SupportsL2 = caps.SupportsL2 || hostCaps.SupportsL2
+	}
+	if !allLimited {
+		caps.MaxVMs = 0
+	}
+	return caps
+}
+
+func (h *placementVMHost) Close() error {
+	var errs []error
+	for _, host := range h.hosts {
+		if err := host.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (h *placementVMHost) Start(ctx context.Context, req client.CreateInstanceRequest) (Instance, error) {
+	return h.StartStream(ctx, req, nil)
+}
+
+func (h *placementVMHost) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	host, err := h.reserveHost(ctx)
+	if err != nil {
+		return nil, err
+	}
+	inst, err := host.StartStream(ctx, req, onEvent)
+	if err != nil {
+		h.releaseHost(host)
+		return nil, err
+	}
+	return &hostedInstance{Instance: inst, host: host, release: func() { h.releaseHost(host) }}, nil
+}
+
+func (h *placementVMHost) StartBlank(ctx context.Context, req client.StartInstanceRequest) (Instance, error) {
+	return h.StartBlankStream(ctx, req, nil)
+}
+
+func (h *placementVMHost) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	host, err := h.reserveHost(ctx)
+	if err != nil {
+		return nil, err
+	}
+	inst, err := host.StartBlankStream(ctx, req, onEvent)
+	if err != nil {
+		h.releaseHost(host)
+		return nil, err
+	}
+	return &hostedInstance{Instance: inst, host: host, release: func() { h.releaseHost(host) }}, nil
+}
+
+func (h *placementVMHost) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
+	host, err := h.firstHost(ctx)
+	if err != nil {
+		return client.ExecResponse{}, err
+	}
+	return host.Run(ctx, req)
+}
+
+func (h *placementVMHost) RunStream(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	host, err := h.firstHost(ctx)
+	if err != nil {
+		return err
+	}
+	return host.RunStream(ctx, req, inputs, onEvent)
+}
+
+func (h *placementVMHost) RunInInstance(ctx context.Context, inst Instance, runningImage string, req client.RunRequest) (client.ExecResponse, error) {
+	host, inner, err := h.instanceHost(ctx, inst)
+	if err != nil {
+		return client.ExecResponse{}, err
+	}
+	return host.RunInInstance(ctx, inner, runningImage, req)
+}
+
+func (h *placementVMHost) RunInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	host, inner, err := h.instanceHost(ctx, inst)
+	if err != nil {
+		return err
+	}
+	return host.RunInInstanceStream(ctx, inner, runningImage, req, inputs, onEvent)
+}
+
+func (h *placementVMHost) reserveHost(ctx context.Context) (VMHost, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, host := range h.hosts {
+		caps := host.HostCapabilities(ctx)
+		if caps.MaxVMs <= 0 || h.running[host] < caps.MaxVMs {
+			h.running[host]++
+			return host, nil
+		}
+	}
+	return nil, fmt.Errorf("no VM host capacity available")
+}
+
+func (h *placementVMHost) releaseHost(host VMHost) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.running[host] > 0 {
+		h.running[host]--
+	}
+}
+
+func (h *placementVMHost) firstHost(context.Context) (VMHost, error) {
+	if len(h.hosts) == 0 {
+		return nil, fmt.Errorf("no VM hosts configured")
+	}
+	return h.hosts[0], nil
+}
+
+type hostedInstance struct {
+	Instance
+	host    VMHost
+	release func()
+	once    sync.Once
+}
+
+func (i *hostedInstance) Wait() error {
+	err := i.Instance.Wait()
+	i.once.Do(i.release)
+	return err
+}
+
+func (i *hostedInstance) Close() error {
+	err := i.Instance.Close()
+	i.once.Do(i.release)
+	return err
+}
+
+func (h *placementVMHost) instanceHost(ctx context.Context, inst Instance) (VMHost, Instance, error) {
+	if hosted, ok := inst.(*hostedInstance); ok {
+		return hosted.host, hosted.Instance, nil
+	}
+	host, err := h.firstHost(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return host, inst, nil
 }
 
 func (m *Manager) Start(ctx context.Context, req client.CreateInstanceRequest) (client.InstanceState, error) {
