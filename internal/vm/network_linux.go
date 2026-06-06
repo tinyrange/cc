@@ -84,7 +84,6 @@ func networkGuestCIDR(n *linuxNetworkRuntime) string {
 
 type linuxVirtualSwitch struct {
 	mu        sync.Mutex
-	nextHost  byte
 	leases    map[string]linuxNetworkLease
 	endpoints map[string]*linuxNetworkRuntime
 }
@@ -96,7 +95,6 @@ type linuxNetworkLease struct {
 }
 
 var defaultLinuxVirtualSwitch = &linuxVirtualSwitch{
-	nextHost:  2,
 	leases:    make(map[string]linuxNetworkLease),
 	endpoints: make(map[string]*linuxNetworkRuntime),
 }
@@ -125,17 +123,12 @@ func (s *linuxVirtualSwitch) Register(id string) linuxNetworkLease {
 			}
 		}
 	}
-	host := s.nextHost
-	for i := 0; i < 253; i++ {
-		if host < 2 || host > 254 {
-			host = 2
-		}
+	host := byte(2)
+	for ; host <= 254; host++ {
 		if !used[host] {
 			break
 		}
-		host++
 	}
-	s.nextHost = host + 1
 	lease := linuxNetworkLease{
 		id:  id,
 		ip:  net.IPv4(10, 42, 0, host),

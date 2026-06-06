@@ -31,6 +31,7 @@ import (
 const guestHostMount = "/host"
 const defaultGuestUser = "1000:1000"
 const vshBootTimeoutSeconds = 60
+const defaultGuestShellReadyTimeout = 5 * time.Second
 
 const (
 	colorReset   = "\x1b[0m"
@@ -58,26 +59,27 @@ const (
 )
 
 type shellState struct {
-	api         vshAPI
-	context     commandContext
-	hostCWD     string
-	rootCache   string
-	imageCache  map[string]bool
-	vmRunning   map[string]bool
-	hostInit    hostShellInit
-	hostShell   *persistentHostShell
-	guestShell  *persistentGuestShell
-	lastCode    int
-	promptOut   io.Writer
-	history     string
-	env         map[string]string
-	aliases     map[string]string
-	confirmPull func(string, io.Writer) (bool, error)
-	jobs        []shellJob
-	nextJobID   int
-	jobsMu      sync.Mutex
-	statusSeq   atomic.Uint64
-	completion  *vshCompleter
+	api              vshAPI
+	context          commandContext
+	hostCWD          string
+	rootCache        string
+	imageCache       map[string]bool
+	vmRunning        map[string]bool
+	hostInit         hostShellInit
+	hostShell        *persistentHostShell
+	guestShell       *persistentGuestShell
+	lastCode         int
+	promptOut        io.Writer
+	history          string
+	env              map[string]string
+	aliases          map[string]string
+	confirmPull      func(string, io.Writer) (bool, error)
+	confirmVMRestart func(string, io.Writer) (bool, error)
+	jobs             []shellJob
+	nextJobID        int
+	jobsMu           sync.Mutex
+	statusSeq        atomic.Uint64
+	completion       *vshCompleter
 }
 
 type shellJob struct {
@@ -217,7 +219,7 @@ func (c *vshCompleter) completionContext(prefix string) commandContext {
 	case "host":
 		ctx = ctx.withOptions(at.Options)
 		ctx.Mode = modeHost
-	case "help", "ps", "jobs", "alias", "status", "where", "start", "stop", "forward":
+	case "help", "ps", "jobs", "alias", "status", "where", "start", "stop", "restart", "forward":
 	default:
 		ctx = ctx.withOptions(at.Options)
 		ctx.Mode = modeVM
@@ -234,7 +236,7 @@ func pathCompletionReplaceLen(token string) int {
 }
 
 func (c *vshCompleter) atTargetWords() []string {
-	words := []string{"@alias", "@help", "@host", "@jobs", "@ps", "@status", "@start", "@stop", "@forward", "@sudo"}
+	words := []string{"@alias", "@help", "@host", "@jobs", "@ps", "@restart", "@status", "@start", "@stop", "@forward", "@sudo"}
 	for _, image := range c.cachedImageNames() {
 		words = append(words, "@"+image)
 	}
@@ -754,6 +756,9 @@ func run() error {
 		confirmPull: func(source string, stderr io.Writer) (bool, error) {
 			return promptPullConfirmation(os.Stdin, stderr, source)
 		},
+		confirmVMRestart: func(id string, stderr io.Writer) (bool, error) {
+			return promptVMRestartConfirmation(os.Stdin, stderr, id)
+		},
 	}
 	sh.completion = newVSHCompleter(sh)
 	defer sh.closeSessions()
@@ -1213,13 +1218,14 @@ func stripBackground(line string) (string, bool, error) {
 
 func (s *shellState) startBackgroundJob(ctx commandContext, line string, stdout, stderr io.Writer) error {
 	bgShell := &shellState{
-		api:         s.api,
-		context:     ctx,
-		hostCWD:     s.hostCWD,
-		promptOut:   s.promptOut,
-		env:         cloneEnv(s.env),
-		aliases:     cloneEnv(s.aliases),
-		confirmPull: s.confirmPull,
+		api:              s.api,
+		context:          ctx,
+		hostCWD:          s.hostCWD,
+		promptOut:        s.promptOut,
+		env:              cloneEnv(s.env),
+		aliases:          cloneEnv(s.aliases),
+		confirmPull:      s.confirmPull,
+		confirmVMRestart: s.confirmVMRestart,
 	}
 	s.jobsMu.Lock()
 	s.nextJobID++
@@ -1335,6 +1341,13 @@ func (s *shellState) evalAt(line string, stdout, stderr io.Writer) error {
 		}
 		id := firstNonEmpty(at.Options.VMID, s.context.VMID)
 		return s.stopVM(id)
+	case "restart":
+		if at.Command != "" {
+			return fmt.Errorf("usage: @restart [--vm id]")
+		}
+		ctx := s.context.withOptions(at.Options)
+		id := firstNonEmpty(ctx.VMID, s.context.VMID)
+		return s.restartVM(id, ctx, stderr)
 	case "forward":
 		if at.Command == "" {
 			return fmt.Errorf("usage: @forward <host-port:guest-port>")
@@ -1417,6 +1430,11 @@ func sessionLastCode(err error) int {
 	}
 	return exitCode(err)
 }
+
+var (
+	errPersistentGuestShellExited = errors.New("persistent guest shell exited")
+	errPersistentGuestShellClosed = errors.New("persistent guest shell closed")
+)
 
 type persistentShellExit struct {
 	code int
@@ -1842,12 +1860,21 @@ func (s *shellState) runGuest(ctx commandContext, line string, stdout, stderr io
 	if tty && persistentGuestCommandAllowed(line) {
 		session, err := s.guestPersistentShell(ctx, req)
 		if err == nil {
-			stopForwarding, err := s.startGuestInputForwarding(req.TTY, session.inputs, stdout, stderr)
+			var interrupted atomic.Bool
+			stopForwarding, err := s.startGuestInputForwarding(req.TTY, session.inputs, stdout, stderr, func(name string) {
+				if name == "INT" {
+					interrupted.Store(true)
+				}
+			})
 			if err != nil {
 				return err
 			}
 			defer stopForwarding()
 			err = session.run(line, stdout, stderr)
+			if interrupted.Load() && persistentGuestShellEnded(err) {
+				s.guestShell = nil
+				err = persistentShellExit{code: 130}
+			}
 			s.lastCode = sessionLastCode(err)
 			if session.cwd() != "" {
 				s.context.CWD = session.cwd()
@@ -1923,24 +1950,38 @@ func guestPersistentCommand() []string {
 }
 
 func (p *persistentGuestShell) waitReady() error {
-	for event := range p.events {
-		switch event.Kind {
-		case "stdout", "output":
-			text := execEventText(event)
-			if cwd, ok := parsePersistentReady(text); ok {
-				p.lastCWD = cwd
-				return nil
+	timer := time.NewTimer(defaultGuestShellReadyTimeout)
+	defer timer.Stop()
+	for {
+		select {
+		case event, ok := <-p.events:
+			if !ok {
+				return fmt.Errorf("persistent guest shell closed before ready")
 			}
-		case "exit":
+			switch event.Kind {
+			case "stdout", "output":
+				text := execEventText(event)
+				if cwd, ok := parsePersistentReady(text); ok {
+					p.lastCWD = cwd
+					return nil
+				}
+			case "exit":
+				return fmt.Errorf("persistent guest shell exited before ready")
+			case "error":
+				if event.Error != "" {
+					return fmt.Errorf("%s", event.Error)
+				}
+				return fmt.Errorf("persistent guest shell failed before ready")
+			}
+		case err := <-p.done:
+			if err != nil {
+				return err
+			}
 			return fmt.Errorf("persistent guest shell exited before ready")
-		case "error":
-			if event.Error != "" {
-				return fmt.Errorf("%s", event.Error)
-			}
-			return fmt.Errorf("persistent guest shell failed before ready")
+		case <-timer.C:
+			return fmt.Errorf("persistent guest shell did not become ready")
 		}
 	}
-	return fmt.Errorf("persistent guest shell closed before ready")
 }
 
 func parsePersistentReady(text string) (string, bool) {
@@ -1977,7 +2018,7 @@ func (p *persistentGuestShell) run(line string, stdout, stderr io.Writer) error 
 		case "stderr":
 			writeExecEventOutput(stderr, event)
 		case "exit":
-			return fmt.Errorf("persistent guest shell exited")
+			return errPersistentGuestShellExited
 		case "error":
 			if event.Error != "" {
 				return fmt.Errorf("%s", event.Error)
@@ -1985,7 +2026,11 @@ func (p *persistentGuestShell) run(line string, stdout, stderr io.Writer) error 
 			return fmt.Errorf("persistent guest shell failed")
 		}
 	}
-	return fmt.Errorf("persistent guest shell closed")
+	return errPersistentGuestShellClosed
+}
+
+func persistentGuestShellEnded(err error) bool {
+	return errors.Is(err, errPersistentGuestShellExited) || errors.Is(err, errPersistentGuestShellClosed)
 }
 
 func (p *persistentGuestShell) consumeOutput(text string) (string, int, string, bool) {
@@ -2115,7 +2160,7 @@ func (s *shellState) streamGuestRun(id string, req client.RunRequest, stdout, st
 	return nil
 }
 
-func (s *shellState) startGuestInputForwarding(tty bool, inputs chan<- client.ExecInput, stdout, stderr io.Writer) (func(), error) {
+func (s *shellState) startGuestInputForwarding(tty bool, inputs chan<- client.ExecInput, stdout, stderr io.Writer, onSignal ...func(string)) (func(), error) {
 	restore := func() {}
 	done := make(chan struct{})
 	var producers sync.WaitGroup
@@ -2138,7 +2183,7 @@ func (s *shellState) startGuestInputForwarding(tty bool, inputs chan<- client.Ex
 	producers.Add(1)
 	go func() {
 		defer producers.Done()
-		forwardGuestSignals(inputs, done, tty, stdout, stderr)
+		forwardGuestSignals(inputs, done, tty, stdout, stderr, onSignal...)
 	}()
 	return func() {
 		restore()
@@ -2172,7 +2217,7 @@ func streamGuestStdin(file *os.File, out chan<- client.ExecInput, done <-chan st
 	}
 }
 
-func forwardGuestSignals(out chan<- client.ExecInput, done <-chan struct{}, tty bool, stdout, stderr io.Writer) {
+func forwardGuestSignals(out chan<- client.ExecInput, done <-chan struct{}, tty bool, stdout, stderr io.Writer, onSignal ...func(string)) {
 	signals := hostSignals(tty)
 	sigCh := make(chan os.Signal, 8)
 	signal.Notify(sigCh, signals...)
@@ -2200,6 +2245,11 @@ func forwardGuestSignals(out chan<- client.ExecInput, done <-chan struct{}, tty 
 			name, ok := signalName(sig)
 			if !ok {
 				continue
+			}
+			for _, fn := range onSignal {
+				if fn != nil {
+					fn(name)
+				}
 			}
 			if name == "INT" {
 				fmt.Fprintln(stderr)
@@ -2268,6 +2318,20 @@ func promptPullConfirmation(in *os.File, stderr io.Writer, source string) (bool,
 		return false, nil
 	}
 	fmt.Fprintf(stderr, "do you want to pull %s (y/n) [n]: ", source)
+	reader := bufio.NewReader(in)
+	answer, err := reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return false, err
+	}
+	answer = strings.ToLower(strings.TrimSpace(answer))
+	return answer == "y" || answer == "yes", nil
+}
+
+func promptVMRestartConfirmation(in *os.File, stderr io.Writer, id string) (bool, error) {
+	if in == nil || !isTerminalFD(int(in.Fd())) {
+		return false, nil
+	}
+	fmt.Fprintf(stderr, "restart VM %s (y/n) [n]: ", emptyText(id, "default"))
 	reader := bufio.NewReader(in)
 	answer, err := reader.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
@@ -2599,6 +2663,56 @@ func (s *shellState) stopVM(id string) error {
 	return nil
 }
 
+func (s *shellState) restartVM(id string, ctx commandContext, stderr io.Writer) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fmt.Errorf("vm id is required")
+	}
+	if s.confirmVMRestart == nil {
+		return fmt.Errorf("restart cancelled for VM %s", id)
+	}
+	ok, err := s.confirmVMRestart(id, stderr)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("restart cancelled for VM %s", id)
+	}
+	state, err := s.api.InstanceStatusOf(id)
+	if err != nil {
+		return err
+	}
+	ctx = restartContextFromState(ctx, state)
+	if s.guestShell != nil {
+		s.guestShell.close()
+		s.guestShell = nil
+	}
+	if err := s.stopVM(id); err != nil {
+		return err
+	}
+	ctx.VMID = id
+	return s.startVM(id, ctx, stderr)
+}
+
+func restartContextFromState(ctx commandContext, state client.InstanceState) commandContext {
+	if strings.TrimSpace(ctx.Image) == "" {
+		ctx.Image = state.Image
+	}
+	if ctx.MemoryMB == 0 {
+		ctx.MemoryMB = state.MemoryMB
+	}
+	if ctx.CPUs == 0 {
+		ctx.CPUs = state.CPUs
+	}
+	if !ctx.NestedVirt {
+		ctx.NestedVirt = state.NestedVirt
+	}
+	if !ctx.Network && strings.TrimSpace(state.NetworkIPv4) != "" {
+		ctx.Network = true
+	}
+	return ctx
+}
+
 func (s *shellState) chdirContext(target string) error {
 	if s.context.Mode == modeVM {
 		return s.chdirGuest(target)
@@ -2899,6 +3013,7 @@ func (s *shellState) help(w io.Writer) error {
 @status                  show vsh and selected VM state
 @start [--vm id]         start a blank VM
 @stop [--vm id]          stop a VM
+@restart [--vm id]       restart a VM after confirmation
 @forward H:G             forward host port H to guest port G
 opts: --vm id --cwd path --user user --sudo --memory-mb n --memory n[m|g] --cpus n --network --no-network --nested --no-nested
 cd <dir>                 change the current host or VM working directory

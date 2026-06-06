@@ -50,6 +50,29 @@ func TestLinuxNetworkRuntimeAddPortForwardIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestLinuxVirtualSwitchReusesLowestFreeAddress(t *testing.T) {
+	sw := &linuxVirtualSwitch{
+		leases:    make(map[string]linuxNetworkLease),
+		endpoints: make(map[string]*linuxNetworkRuntime),
+	}
+	one := sw.Register("one")
+	sw.Attach(&linuxNetworkRuntime{networkRuntime: &networkRuntime{id: one.id, ip: one.ip}})
+	two := sw.Register("two")
+	sw.Attach(&linuxNetworkRuntime{networkRuntime: &networkRuntime{id: two.id, ip: two.ip}})
+	three := sw.Register("three")
+	sw.Attach(&linuxNetworkRuntime{networkRuntime: &networkRuntime{id: three.id, ip: three.ip}})
+
+	if one.ip.String() != "10.42.0.2" || two.ip.String() != "10.42.0.3" || three.ip.String() != "10.42.0.4" {
+		t.Fatalf("initial leases = %s %s %s, want .2 .3 .4", one.ip, two.ip, three.ip)
+	}
+
+	sw.Unregister("two")
+	four := sw.Register("four")
+	if four.ip.String() != "10.42.0.3" {
+		t.Fatalf("reused lease = %s, want 10.42.0.3", four.ip)
+	}
+}
+
 func reserveRuntimeForwardPort(t testing.TB) int {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")

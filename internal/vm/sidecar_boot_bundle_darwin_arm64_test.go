@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"j5.nz/cc/client"
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/oci"
 )
@@ -94,6 +95,50 @@ func TestWorkerBootBundleAbsent(t *testing.T) {
 	}
 	if got != nil {
 		t.Fatalf("workerBootBundle() = %#v, want nil", got)
+	}
+}
+
+func TestSidecarRuntimeShareMountMapsOwner(t *testing.T) {
+	mount, err := sidecarRuntimeShareMount(client.ShareMount{
+		Source:   t.TempDir(),
+		Mount:    "/host",
+		Writable: true,
+		MapOwner: true,
+		OwnerUID: 1000,
+		OwnerGID: 1000,
+	})
+	if err != nil {
+		t.Fatalf("sidecarRuntimeShareMount() error = %v", err)
+	}
+	attr, errno := mount.Backend.GetAttr(1)
+	if errno != 0 {
+		t.Fatalf("GetAttr(root) errno = %d", errno)
+	}
+	if attr.UID != 1000 || attr.GID != 1000 {
+		t.Fatalf("mapped share owner = %d:%d, want 1000:1000", attr.UID, attr.GID)
+	}
+}
+
+func TestDarwinSidecarSwitchReusesLowestFreeAddress(t *testing.T) {
+	sw := &darwinSidecarSwitch{
+		leases:    make(map[string]darwinSidecarLease),
+		endpoints: make(map[string]darwinSidecarEndpoint),
+	}
+	one := sw.Register("one")
+	sw.Attach(darwinSidecarEndpoint{id: one.id, ip: one.ip, mac: one.mac})
+	two := sw.Register("two")
+	sw.Attach(darwinSidecarEndpoint{id: two.id, ip: two.ip, mac: two.mac})
+	three := sw.Register("three")
+	sw.Attach(darwinSidecarEndpoint{id: three.id, ip: three.ip, mac: three.mac})
+
+	if one.ip.String() != "10.42.0.2" || two.ip.String() != "10.42.0.3" || three.ip.String() != "10.42.0.4" {
+		t.Fatalf("initial leases = %s %s %s, want .2 .3 .4", one.ip, two.ip, three.ip)
+	}
+
+	sw.Unregister("two")
+	four := sw.Register("four")
+	if four.ip.String() != "10.42.0.3" {
+		t.Fatalf("reused lease = %s, want 10.42.0.3", four.ip)
 	}
 }
 

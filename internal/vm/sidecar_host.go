@@ -112,7 +112,7 @@ func (h *sidecarVMHost) StartStream(ctx context.Context, req client.CreateInstan
 		_ = sidecar.Close()
 		return nil, err
 	}
-	return &sidecarInstance{id: DefaultInstanceID, sidecar: sidecar, rootFS: resources.rootFS, imageName: req.Image, resolver: resources.resolver, imageMounts: map[string]virtio.FSBackend{}, networkIPv4: resources.networkIPv4, network: resources.network}, nil
+	return &sidecarInstance{id: DefaultInstanceID, sidecar: sidecar, rootFS: resources.rootFS, imageName: req.Image, resolver: resources.resolver, shares: map[string]client.ShareMount{}, imageMounts: map[string]virtio.FSBackend{}, networkIPv4: resources.networkIPv4, network: resources.network}, nil
 }
 
 func (h *sidecarVMHost) StartBlank(ctx context.Context, req client.StartInstanceRequest) (Instance, error) {
@@ -135,7 +135,7 @@ func (h *sidecarVMHost) StartBlankStream(ctx context.Context, req client.StartIn
 		_ = sidecar.Close()
 		return nil, err
 	}
-	return &sidecarInstance{id: DefaultInstanceID, sidecar: sidecar, rootFS: resources.rootFS, imageName: req.Image, resolver: resources.resolver, imageMounts: map[string]virtio.FSBackend{}, networkIPv4: resources.networkIPv4, network: resources.network}, nil
+	return &sidecarInstance{id: DefaultInstanceID, sidecar: sidecar, rootFS: resources.rootFS, imageName: req.Image, resolver: resources.resolver, shares: map[string]client.ShareMount{}, imageMounts: map[string]virtio.FSBackend{}, networkIPv4: resources.networkIPv4, network: resources.network}, nil
 }
 
 func (h *sidecarVMHost) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
@@ -405,6 +405,8 @@ type sidecarInstance struct {
 	imageName   string
 	resolver    *sidecarCommandResolver
 	imageMu     sync.Mutex
+	shareMu     sync.Mutex
+	shares      map[string]client.ShareMount
 	imageMounts map[string]virtio.FSBackend
 	networkIPv4 string
 	network     *networkRuntime
@@ -477,11 +479,33 @@ func (i *sidecarInstance) addCoordinatorShare(share client.ShareMount) error {
 	if !ok {
 		return fmt.Errorf("instance rootfs does not support runtime shares")
 	}
+	key := strings.TrimSpace(share.Mount)
+	if key == "" {
+		return fmt.Errorf("share mount path is required")
+	}
+	i.shareMu.Lock()
+	if existing, ok := i.shares[key]; ok {
+		i.shareMu.Unlock()
+		if existing.Source == share.Source && existing.Writable == share.Writable && existing.Cache == share.Cache {
+			return nil
+		}
+		return fmt.Errorf("share mount %q already exists", key)
+	}
+	i.shareMu.Unlock()
 	mount, err := sidecarRuntimeShareMount(share)
 	if err != nil {
 		return err
 	}
-	return mounter.AddShare(mount)
+	if err := mounter.AddShare(mount); err != nil {
+		return err
+	}
+	i.shareMu.Lock()
+	if i.shares == nil {
+		i.shares = make(map[string]client.ShareMount)
+	}
+	i.shares[key] = share
+	i.shareMu.Unlock()
+	return nil
 }
 
 func (i *sidecarInstance) AddShare(ctx context.Context, share client.ShareMount) error {
@@ -505,17 +529,23 @@ func (i *sidecarInstance) addCoordinatorImageMount(mountPath string, backend vir
 		i.imageMounts = make(map[string]virtio.FSBackend)
 	}
 	if existing := i.imageMounts[mountPath]; existing != nil {
-		backend = existing
-	} else {
-		i.imageMounts[mountPath] = backend
+		i.imageMu.Unlock()
+		return nil
 	}
+	i.imageMounts[mountPath] = backend
 	i.imageMu.Unlock()
-	return mounter.AddShare(virtio.ShareMount{
+	if err := mounter.AddShare(virtio.ShareMount{
 		GuestPath: mountPath,
 		Backend:   backend,
 		Writable:  true,
 		CacheMode: "aggressive",
-	})
+	}); err != nil {
+		if strings.Contains(err.Error(), fmt.Sprintf("mount path %q is already in use", mountPath)) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func (i *sidecarInstance) AddPortForward(ctx context.Context, forward client.PortForward) error {

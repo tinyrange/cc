@@ -14,6 +14,7 @@ import (
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/oci"
+	"j5.nz/cc/internal/virtio"
 )
 
 func TestManagerStartShutdownLifecycle(t *testing.T) {
@@ -954,6 +955,45 @@ func TestCleanupStaleSidecarSocketsOnlyRemovesSocketFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(keep); err != nil {
 		t.Fatalf("keep stat error = %v", err)
+	}
+}
+
+func TestSidecarInstanceAddShareIsIdempotent(t *testing.T) {
+	root := t.TempDir()
+	rootFS, ok := virtio.NewMountedFS(virtio.NewPassthroughFS(root, nil), nil).(sidecarRootFS)
+	if !ok {
+		t.Fatalf("mounted FS does not implement sidecarRootFS")
+	}
+	inst := &sidecarInstance{rootFS: rootFS}
+	share := client.ShareMount{Source: t.TempDir(), Mount: "/host", Writable: true, Cache: "strict"}
+
+	if err := inst.AddShare(context.Background(), share); err != nil {
+		t.Fatalf("AddShare() error = %v", err)
+	}
+	if err := inst.AddShare(context.Background(), share); err != nil {
+		t.Fatalf("AddShare() repeat error = %v", err)
+	}
+}
+
+func TestSidecarInstanceAddShareRejectsConflictingMount(t *testing.T) {
+	root := t.TempDir()
+	rootFS, ok := virtio.NewMountedFS(virtio.NewPassthroughFS(root, nil), nil).(sidecarRootFS)
+	if !ok {
+		t.Fatalf("mounted FS does not implement sidecarRootFS")
+	}
+	inst := &sidecarInstance{rootFS: rootFS}
+	first := client.ShareMount{Source: t.TempDir(), Mount: "/host", Writable: true, Cache: "strict"}
+	second := client.ShareMount{Source: t.TempDir(), Mount: "/host", Writable: true, Cache: "strict"}
+
+	if err := inst.AddShare(context.Background(), first); err != nil {
+		t.Fatalf("AddShare() error = %v", err)
+	}
+	err := inst.AddShare(context.Background(), second)
+	if err == nil {
+		t.Fatal("AddShare() conflicting error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), `share mount "/host" already exists`) {
+		t.Fatalf("AddShare() conflicting error = %q", err)
 	}
 }
 

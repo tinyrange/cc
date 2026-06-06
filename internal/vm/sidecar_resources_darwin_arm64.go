@@ -470,7 +470,6 @@ func prepareSidecarNetResources(cacheDir, id string, cfg *client.NetworkConfig) 
 
 type darwinSidecarSwitch struct {
 	mu        sync.Mutex
-	nextHost  byte
 	leases    map[string]darwinSidecarLease
 	endpoints map[string]darwinSidecarEndpoint
 }
@@ -489,7 +488,6 @@ type darwinSidecarEndpoint struct {
 }
 
 var defaultDarwinSidecarSwitch = &darwinSidecarSwitch{
-	nextHost:  2,
 	leases:    make(map[string]darwinSidecarLease),
 	endpoints: make(map[string]darwinSidecarEndpoint),
 }
@@ -512,17 +510,12 @@ func (s *darwinSidecarSwitch) Register(id string) darwinSidecarLease {
 			used[ip4[3]] = true
 		}
 	}
-	host := s.nextHost
-	for i := 0; i < 253; i++ {
-		if host < 2 || host > 254 {
-			host = 2
-		}
+	host := byte(2)
+	for ; host <= 254; host++ {
 		if !used[host] {
 			break
 		}
-		host++
 	}
-	s.nextHost = host + 1
 	lease := darwinSidecarLease{
 		id:  id,
 		ip:  net.IPv4(10, 42, 0, host),
@@ -694,7 +687,13 @@ func buildDarwinShareBackend(share vmruntime.DirectoryShare) (string, virtio.FSB
 		return "", nil, fmt.Errorf("share source must be a directory")
 	}
 	if share.Writable {
+		if share.MapOwner {
+			return "", virtio.NewPassthroughFSWithOwner(source, nil, share.OwnerUID, share.OwnerGID), nil
+		}
 		return "", virtio.NewPassthroughFS(source, nil), nil
+	}
+	if share.MapOwner {
+		return "", virtio.NewImageFSWithOwner(imagefs.NewHostFS(source, nil), source, share.OwnerUID, share.OwnerGID), nil
 	}
 	return "", virtio.NewImageFS(imagefs.NewHostFS(source, nil), source), nil
 }
