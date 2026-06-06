@@ -29,6 +29,24 @@ type Backend interface {
 	RunInInstanceStream(context.Context, Instance, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 }
 
+type VMHost interface {
+	Backend
+	HostCapabilities(context.Context) VMHostCapabilities
+	Close() error
+}
+
+type VMHostCapabilities struct {
+	Backend       string
+	MaxVMs        int
+	Locality      string
+	SupportsFSRPC bool
+	SupportsL2    bool
+}
+
+type VMHandle interface {
+	Instance
+}
+
 type Instance interface {
 	AddShare(context.Context, client.ShareMount) error
 	AddPortForward(context.Context, client.PortForward) error
@@ -60,7 +78,7 @@ type imageSnapshotProvider interface {
 
 type Manager struct {
 	mu           sync.Mutex
-	backend      Backend
+	host         VMHost
 	supports     func() error
 	capabilities func() client.CapabilitiesResponse
 	running      map[string]*Machine
@@ -81,11 +99,22 @@ type Machine struct {
 }
 
 func NewManager() *Manager {
-	return &Manager{backend: unsupportedBackend{}, supports: Supports, capabilities: HostCapabilities}
+	return NewManagerWithBackend(unsupportedBackend{})
 }
 
 func NewManagerWithBackend(backend Backend) *Manager {
-	return &Manager{backend: backend, supports: Supports, capabilities: HostCapabilities}
+	m := &Manager{supports: Supports, capabilities: HostCapabilities}
+	m.host = newInProcessVMHost(backend, func() client.CapabilitiesResponse {
+		return m.Capabilities()
+	})
+	return m
+}
+
+func NewManagerWithHost(host VMHost) *Manager {
+	if host == nil {
+		host = newInProcessVMHost(unsupportedBackend{}, HostCapabilities)
+	}
+	return &Manager{host: host, supports: Supports, capabilities: HostCapabilities}
 }
 
 func Supports() error {
@@ -162,6 +191,68 @@ func backendName() string {
 	}
 }
 
+type inProcessVMHost struct {
+	backend      Backend
+	capabilities func() client.CapabilitiesResponse
+}
+
+func newInProcessVMHost(backend Backend, capabilities func() client.CapabilitiesResponse) VMHost {
+	if backend == nil {
+		backend = unsupportedBackend{}
+	}
+	return &inProcessVMHost{backend: backend, capabilities: capabilities}
+}
+
+func (h *inProcessVMHost) HostCapabilities(context.Context) VMHostCapabilities {
+	caps := client.CapabilitiesResponse{}
+	if h.capabilities != nil {
+		caps = h.capabilities()
+	}
+	return VMHostCapabilities{
+		Backend:       caps.Backend,
+		MaxVMs:        caps.MaxInstances,
+		Locality:      "in-process",
+		SupportsFSRPC: false,
+		SupportsL2:    len(caps.NetworkModes) > 0,
+	}
+}
+
+func (h *inProcessVMHost) Close() error {
+	return nil
+}
+
+func (h *inProcessVMHost) Start(ctx context.Context, req client.CreateInstanceRequest) (Instance, error) {
+	return h.backend.Start(ctx, req)
+}
+
+func (h *inProcessVMHost) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	return h.backend.StartStream(ctx, req, onEvent)
+}
+
+func (h *inProcessVMHost) StartBlank(ctx context.Context, req client.StartInstanceRequest) (Instance, error) {
+	return h.backend.StartBlank(ctx, req)
+}
+
+func (h *inProcessVMHost) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	return h.backend.StartBlankStream(ctx, req, onEvent)
+}
+
+func (h *inProcessVMHost) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
+	return h.backend.Run(ctx, req)
+}
+
+func (h *inProcessVMHost) RunStream(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	return h.backend.RunStream(ctx, req, inputs, onEvent)
+}
+
+func (h *inProcessVMHost) RunInInstance(ctx context.Context, inst Instance, runningImage string, req client.RunRequest) (client.ExecResponse, error) {
+	return h.backend.RunInInstance(ctx, inst, runningImage, req)
+}
+
+func (h *inProcessVMHost) RunInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	return h.backend.RunInInstanceStream(ctx, inst, runningImage, req, inputs, onEvent)
+}
+
 func (m *Manager) Start(ctx context.Context, req client.CreateInstanceRequest) (client.InstanceState, error) {
 	return m.StartStream(ctx, req, nil)
 }
@@ -205,7 +296,7 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 	m.starting[id] = struct{}{}
 	m.mu.Unlock()
 
-	inst, err := m.backend.StartStream(ctx, req, onEvent)
+	inst, err := m.host.StartStream(ctx, req, onEvent)
 	if err != nil {
 		m.clearStarting(id)
 		return client.InstanceState{}, err
@@ -284,7 +375,7 @@ func (m *Manager) StartBlankInstanceStream(
 	m.starting[id] = struct{}{}
 	m.mu.Unlock()
 
-	inst, err := m.backend.StartBlankStream(ctx, req, onEvent)
+	inst, err := m.host.StartBlankStream(ctx, req, onEvent)
 	if err != nil {
 		m.clearStarting(id)
 		return client.InstanceState{}, err
@@ -366,7 +457,7 @@ func (m *Manager) RunIn(ctx context.Context, id string, req client.RunRequest) (
 	machine := m.running[id]
 	m.mu.Unlock()
 	if machine != nil {
-		return m.backend.RunInInstance(ctx, machine.instance, machine.image, req)
+		return m.host.RunInInstance(ctx, machine.instance, machine.image, req)
 	}
 	if req.Image == "" {
 		return client.ExecResponse{}, fmt.Errorf("image is required")
@@ -374,7 +465,7 @@ func (m *Manager) RunIn(ctx context.Context, id string, req client.RunRequest) (
 	if err := m.supports(); err != nil {
 		return client.ExecResponse{}, err
 	}
-	return m.backend.Run(ctx, req)
+	return m.host.Run(ctx, req)
 }
 
 func (m *Manager) Stream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
@@ -397,11 +488,11 @@ func (m *Manager) RunStreamIn(ctx context.Context, id string, req client.RunRequ
 		if err := m.supports(); err != nil {
 			return err
 		}
-		return m.backend.RunStream(ctx, req, inputs, onEvent)
+		return m.host.RunStream(ctx, req, inputs, onEvent)
 	}
 	targetImage := strings.TrimSpace(req.Image)
 	if targetImage != "" && targetImage != machine.image {
-		return m.backend.RunInInstanceStream(ctx, machine.instance, machine.image, req, inputs, onEvent)
+		return m.host.RunInInstanceStream(ctx, machine.instance, machine.image, req, inputs, onEvent)
 	}
 	for _, share := range req.Shares {
 		if err := machine.instance.AddShare(ctx, share); err != nil {
@@ -568,9 +659,9 @@ func (m *Manager) watch(machine *Machine) {
 }
 
 func (m *Manager) checkCapacityLocked() error {
-	caps := m.Capabilities()
-	if caps.MaxInstances > 0 && len(m.running)+len(m.starting) >= caps.MaxInstances {
-		return fmt.Errorf("maximum running VM instances reached: %d", caps.MaxInstances)
+	caps := m.host.HostCapabilities(context.Background())
+	if caps.MaxVMs > 0 && len(m.running)+len(m.starting) >= caps.MaxVMs {
+		return fmt.Errorf("maximum running VM instances reached: %d", caps.MaxVMs)
 	}
 	return nil
 }

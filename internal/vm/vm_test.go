@@ -63,6 +63,43 @@ func TestHostCapabilityHelpersMatchBackendLimits(t *testing.T) {
 	}
 }
 
+func TestInProcessVMHostReportsDynamicCapabilities(t *testing.T) {
+	maxInstances := 2
+	host := newInProcessVMHost(fakeBackend{}, func() client.CapabilitiesResponse {
+		return client.CapabilitiesResponse{
+			Backend:      "kvm",
+			MaxInstances: maxInstances,
+			NetworkModes: []string{"user"},
+		}
+	})
+
+	caps := host.HostCapabilities(context.Background())
+	if caps.Backend != "kvm" || caps.MaxVMs != 2 || caps.Locality != "in-process" || !caps.SupportsL2 {
+		t.Fatalf("HostCapabilities() = %#v, want in-process kvm with L2 and max 2", caps)
+	}
+	maxInstances = 4
+	if got := host.HostCapabilities(context.Background()).MaxVMs; got != 4 {
+		t.Fatalf("HostCapabilities().MaxVMs after update = %d, want 4", got)
+	}
+}
+
+func TestManagerCanUseInjectedVMHost(t *testing.T) {
+	inst := &fakeInstance{waitCh: make(chan error, 1)}
+	host := &fakeVMHost{
+		Backend: fakeBackend{instance: inst},
+		caps:    VMHostCapabilities{Backend: "test", MaxVMs: 1, Locality: "sidecar"},
+	}
+	mgr := NewManagerWithHost(host)
+	mgr.supports = func() error { return nil }
+
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{Image: "alpine"}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{ID: "two", Image: "busybox"}); err == nil {
+		t.Fatal("Start(two) error = nil, want injected host capacity error")
+	}
+}
+
 func TestManagerClearsRunningStateWhenInstanceExits(t *testing.T) {
 	inst := &fakeInstance{waitCh: make(chan error, 1)}
 	mgr := NewManagerWithBackend(fakeBackend{instance: inst})
@@ -665,6 +702,19 @@ type fakeBackend struct {
 	startFn         func(client.CreateInstanceRequest) (Instance, error)
 	runInInstanceFn func(context.Context, Instance, string, client.RunRequest) (client.ExecResponse, error)
 	runInStreamFn   func(context.Context, Instance, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+}
+
+type fakeVMHost struct {
+	Backend
+	caps VMHostCapabilities
+}
+
+func (f *fakeVMHost) HostCapabilities(context.Context) VMHostCapabilities {
+	return f.caps
+}
+
+func (f *fakeVMHost) Close() error {
+	return nil
 }
 
 func (f fakeBackend) Start(ctx context.Context, req client.CreateInstanceRequest) (Instance, error) {
