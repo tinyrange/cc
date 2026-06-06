@@ -91,12 +91,6 @@ func TestSidecarLaunchArgs(t *testing.T) {
 		t.Fatalf("sidecarLaunchArgs() = %v, want empty args", got)
 	}
 
-	t.Setenv(sidecarModeEnv, "vsh-internal")
-	got := sidecarLaunchArgs()
-	if len(got) != 1 || got[0] != "--vsh-internal-ccvm" {
-		t.Fatalf("sidecarLaunchArgs() = %v, want vsh internal ccvm args", got)
-	}
-
 	t.Setenv(sidecarModeEnv, "vmsh-internal")
 	if got := sidecarLaunchArgs(); len(got) != 0 {
 		t.Fatalf("sidecarLaunchArgs() = %v, want vmsh internal ccvm env-only launch", got)

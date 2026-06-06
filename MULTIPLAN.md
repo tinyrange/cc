@@ -25,8 +25,8 @@ The current sidecar path implements the local multi-process placement model on
 
 - the coordinator uses the in-process HVF backend for the first VM
 - additional VMs are placed in local `ccvmd -worker` sidecar processes
-- sidecars are launched from the same `ccvm` executable, including embedded
-  `vsh --vsh-internal-ccvm` mode
+- sidecars are launched from the same embedded daemon executable; frontends
+  such as `vmsh` set `CCX3_CCVM_SIDECAR_MODE` when they need env-only re-exec
 - named VM start, status, shutdown, flush, port forward, and exec routing work
   through the coordinator API
 - coordinator-to-worker lifecycle, status, flush, exec, exec input, and exec

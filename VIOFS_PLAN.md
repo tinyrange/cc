@@ -2,9 +2,9 @@
 
 ## Goal
 
-Make the virtiofs path fast enough that it can stay the default host/guest filesystem boundary for vsh, with virtual block/rootfs work reserved for cases where native guest filesystem semantics are the right tradeoff.
+Make the virtiofs path fast enough that it can stay the default host/guest filesystem boundary for VM shell frontends, with virtual block/rootfs work reserved for cases where native guest filesystem semantics are the right tradeoff.
 
-The target is not just "less slow". We want enough measurement discipline to keep pushing until our virtiofs implementation can beat comparable QEMU setups on the workloads that matter for vsh, while defining Firecracker comparisons carefully because upstream Firecracker is not a direct virtiofs baseline.
+The target is not just "less slow". We want enough measurement discipline to keep pushing until our virtiofs implementation can beat comparable QEMU setups on the workloads that matter for interactive VM shells, while defining Firecracker comparisons carefully because upstream Firecracker is not a direct virtiofs baseline.
 
 ## Model
 
@@ -16,7 +16,7 @@ The target is not just "less slow". We want enough measurement discipline to kee
 
 ## Workloads
 
-Microbenchmarks should cover the vsh cases that will make or break the shell:
+Microbenchmarks should cover the host/guest shell cases that will make or break the experience:
 
 - prompt-time metadata: `stat`, `readdir`, path lookup, git status, autocomplete
 - source tree scans: `rg`, `find`, Python/Go/Rust/Node dependency walks

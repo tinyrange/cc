@@ -3,7 +3,8 @@
 
 This is intentionally a developer benchmark. It keeps the guest workload small
 enough to finish quickly once the VM is warm, but it stresses the operations
-that currently dominate vsh usage: metadata walks plus one sequential read.
+that currently dominate interactive VM shell usage: metadata walks plus one
+sequential read.
 """
 
 from __future__ import annotations
