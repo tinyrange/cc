@@ -46,8 +46,10 @@ The first concrete piece of that ownership boundary is now present:
 - a worker can construct `virtio.NewFS(..., NewFSRemoteBackend(conn))`
 - the coordinator can serve the real `FSBackend` over the same connection
 - tests cover lookup/read and create/write/flush crossing the RPC boundary
+- `internal/virtio` also has a length-prefixed virtio-net packet codec and
+  remote backend so worker TX frames and coordinator RX frames can cross IPC
 
-This is not yet wired into sidecar startup.
+These primitives are not yet wired into sidecar startup.
 
 Linux/KVM and Windows/WHP should continue to run multiple VMs in-process when
 that is the best local placement. macOS/HVF should use one in-process VM if
