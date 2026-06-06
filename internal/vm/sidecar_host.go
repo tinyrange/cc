@@ -346,6 +346,8 @@ func sidecarControlCleanup(address string) func() {
 
 func sidecarLaunchArgs() []string {
 	switch strings.TrimSpace(os.Getenv(sidecarModeEnv)) {
+	case "vmsh-internal":
+		return nil
 	case "vsh-internal":
 		return []string{"--vsh-internal-ccvm"}
 	default:
