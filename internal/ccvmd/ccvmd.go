@@ -302,6 +302,7 @@ func run(args []string) (bool, error) {
 
 	addr := fs.String("addr", "localhost:0", "Address to listen on")
 	cacheDir := fs.String("cache-dir", "", "Cache directory")
+	worker := fs.Bool("worker", false, "Run as a single-process VM worker")
 
 	if err := fs.Parse(args); err != nil {
 		return false, fmt.Errorf("parse ccvm flags: %w", err)
@@ -317,7 +318,13 @@ func run(args []string) (bool, error) {
 		images:        oci.NewStore(filepath.Join(rootCache, "images")),
 		cvmfsCacheDir: filepath.Join(rootCache, "_cvmfs_cache"),
 	}
-	srvState.vms = vm.NewManagerWithBackend(vm.NewRuntimeBackend(srvState.kernel, srvState.images, filepath.Join(sharedRuntimeRoot(), "guestinit")))
+	srvState.vms = vm.NewRuntimeManager(
+		srvState.kernel,
+		srvState.images,
+		filepath.Join(sharedRuntimeRoot(), "guestinit"),
+		rootCache,
+		*worker,
+	)
 
 	l, err := net.Listen("tcp", *addr)
 	if err != nil {

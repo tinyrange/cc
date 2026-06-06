@@ -237,6 +237,55 @@ func TestPlacementVMHostRoutesExecToOwningHost(t *testing.T) {
 	}
 }
 
+func TestManagerRunStreamRoutesHostedInstanceToHost(t *testing.T) {
+	inst := &fakeInstance{waitCh: make(chan error, 1)}
+	var routed bool
+	var host *fakeVMHost
+	host = &fakeVMHost{
+		Backend: fakeBackend{
+			startFn: func(req client.CreateInstanceRequest) (Instance, error) {
+				return &hostedInstance{Instance: inst, host: host, release: func() {}}, nil
+			},
+			runInStreamFn: func(ctx context.Context, inst Instance, runningImage string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+				_ = ctx
+				_ = inst
+				_ = runningImage
+				_ = req
+				_ = inputs
+				routed = true
+				if onEvent != nil {
+					if err := onEvent(client.ExecEvent{Kind: "stdout", Output: "host"}); err != nil {
+						return err
+					}
+					return onEvent(client.ExecEvent{Kind: "exit"})
+				}
+				return nil
+			},
+		},
+		caps: VMHostCapabilities{Backend: "hosted", MaxVMs: 1},
+	}
+	mgr := NewManagerWithHost(host)
+	mgr.supports = func() error { return nil }
+
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{Image: "alpine"}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+
+	var events []client.ExecEvent
+	if err := mgr.RunStream(context.Background(), client.RunRequest{Image: "alpine", Command: []string{"true"}}, nil, func(event client.ExecEvent) error {
+		events = append(events, event)
+		return nil
+	}); err != nil {
+		t.Fatalf("RunStream() error = %v", err)
+	}
+	if !routed {
+		t.Fatal("RunStream() was not routed through the owning host")
+	}
+	if len(events) != 2 || events[0].Output != "host" || events[1].Kind != "exit" {
+		t.Fatalf("events = %#v, want host output then exit", events)
+	}
+}
+
 func TestManagerClearsRunningStateWhenInstanceExits(t *testing.T) {
 	inst := &fakeInstance{waitCh: make(chan error, 1)}
 	mgr := NewManagerWithBackend(fakeBackend{instance: inst})

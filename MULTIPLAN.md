@@ -18,6 +18,25 @@ The target architecture is:
 - coordinator-owned image, filesystem, and network services
 - worker-owned hypervisor state and virtio frontends
 
+## Implementation Status
+
+The first functional sidecar path is implemented for `darwin/arm64`:
+
+- the coordinator uses the in-process HVF backend for the first VM
+- additional VMs are placed in local `ccvmd -worker` sidecar processes
+- sidecars are launched from the same `ccvm` executable, including embedded
+  `vsh --vsh-internal-ccvm` mode
+- named VM start, status, shutdown, port forward, and exec routing work through
+  the existing daemon API
+
+Verified locally on macOS arm64 by starting two named Alpine VMs at the same
+time and running `uname -m` in both.
+
+The current sidecar path still shares the on-disk image store directly. The
+next deeper architecture step is moving virtio-fs and virtio-net backends behind
+coordinator-owned IPC services so save/snapshot and L2 networking are fully
+coordinator-owned across sidecars.
+
 Linux/KVM and Windows/WHP should continue to run multiple VMs in-process when
 that is the best local placement. macOS/HVF should use one in-process VM if
 available, then launch sidecar workers for additional VMs.
@@ -333,4 +352,3 @@ CI should keep the current platform split:
   macOS can start with one worker per VM.
 - Should sidecar workers be exposed in capabilities for debugging?
 - What authentication is enough for local Unix sockets before remote hosts exist?
-

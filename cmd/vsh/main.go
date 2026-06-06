@@ -692,6 +692,7 @@ type shellToken struct {
 
 func main() {
 	if len(os.Args) >= 2 && os.Args[1] == "--vsh-internal-ccvm" {
+		_ = os.Setenv("CCX3_CCVM_SIDECAR_MODE", "vsh-internal")
 		ccvmd.Main(os.Args[2:])
 		return
 	}

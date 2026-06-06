@@ -85,6 +85,19 @@ func TestWorkerCodecRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSidecarLaunchArgs(t *testing.T) {
+	t.Setenv(sidecarModeEnv, "")
+	if got := sidecarLaunchArgs(); len(got) != 0 {
+		t.Fatalf("sidecarLaunchArgs() = %v, want empty args", got)
+	}
+
+	t.Setenv(sidecarModeEnv, "vsh-internal")
+	got := sidecarLaunchArgs()
+	if len(got) != 1 || got[0] != "--vsh-internal-ccvm" {
+		t.Fatalf("sidecarLaunchArgs() = %v, want vsh internal ccvm args", got)
+	}
+}
+
 func TestPlacementVMHostReleasesCapacityWhenInstanceExits(t *testing.T) {
 	firstInst := &fakeInstance{waitCh: make(chan error, 1)}
 	secondInst := &fakeInstance{waitCh: make(chan error, 1)}
