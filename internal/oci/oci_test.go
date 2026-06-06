@@ -1029,12 +1029,38 @@ func TestStoreSaveRootFSPersistsImageAndExcludesRuntimePaths(t *testing.T) {
 	}
 }
 
+func TestStoreDeleteRemovesImage(t *testing.T) {
+	store := NewStore(t.TempDir())
+	root := imagefs.NewHostFS(t.TempDir(), nil)
+	if _, err := store.SaveRootFS(context.Background(), "saved", root, SaveOptions{Source: "vm:work"}); err != nil {
+		t.Fatalf("SaveRootFS() error = %v", err)
+	}
+	if _, err := store.Get("saved"); err != nil {
+		t.Fatalf("Get(saved) before delete error = %v", err)
+	}
+	if err := store.Delete("saved"); err != nil {
+		t.Fatalf("Delete(saved) error = %v", err)
+	}
+	if _, err := store.Get("saved"); err == nil {
+		t.Fatal("Get(saved) after delete error = nil, want missing image")
+	}
+}
+
 func TestStoreSaveRootFSRejectsPathTraversalName(t *testing.T) {
 	store := NewStore(t.TempDir())
 	root := imagefs.NewHostFS(t.TempDir(), nil)
 	for _, name := range []string{"../escape", "/escape", "nested/../escape"} {
 		if _, err := store.SaveRootFS(context.Background(), name, root, SaveOptions{}); err == nil {
 			t.Fatalf("SaveRootFS(%q) error = nil, want rejection", name)
+		}
+	}
+}
+
+func TestStoreDeleteRejectsPathTraversalName(t *testing.T) {
+	store := NewStore(t.TempDir())
+	for _, name := range []string{"../escape", "/escape", "nested/../escape"} {
+		if err := store.Delete(name); err == nil {
+			t.Fatalf("Delete(%q) error = nil, want rejection", name)
 		}
 	}
 }

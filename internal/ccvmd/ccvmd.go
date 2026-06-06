@@ -688,6 +688,15 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 		writeJSON(w, http.StatusOK, state)
 	})
 
+	mux.HandleFunc("DELETE /image/{image}", func(w http.ResponseWriter, r *http.Request) {
+		imageName := r.PathValue("image")
+		if err := srvState.images.Delete(imageName); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted", "image": imageName})
+	})
+
 	mux.HandleFunc("POST /cvmfs/list", func(w http.ResponseWriter, r *http.Request) {
 		var req client.CVMFSListRequest
 		if err := decodeRequiredJSON(r, &req); err != nil {

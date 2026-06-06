@@ -95,21 +95,7 @@ func (s *Store) SaveRootFS(ctx context.Context, name string, root imagefs.Direct
 }
 
 func validateSavedImageName(name string) error {
-	if filepath.IsAbs(name) || strings.HasPrefix(name, "/") || strings.HasPrefix(name, "\\") {
-		return fmt.Errorf("image name %q must be relative", name)
-	}
-	clean := filepath.Clean(name)
-	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return fmt.Errorf("image name %q escapes the image store", name)
-	}
-	for _, part := range strings.FieldsFunc(name, func(r rune) bool {
-		return r == '/' || r == '\\'
-	}) {
-		if part == "" || part == "." || part == ".." {
-			return fmt.Errorf("image name %q contains an invalid path component", name)
-		}
-	}
-	return nil
+	return validateImageStoreName(name)
 }
 
 func exportImageDirectory(ctx context.Context, dir imagefs.Directory, guestPath, hostPath string, entries map[string]fsmeta.Entry) error {

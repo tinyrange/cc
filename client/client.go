@@ -136,6 +136,22 @@ func (c *Client) PullImageStream(name string, req PullImageRequest, onEvent func
 	return c.postJSONProgressStream("/image/"+imagePathName(name), req, onEvent)
 }
 
+func (c *Client) DeleteImage(name string) error {
+	req, err := http.NewRequest(http.MethodDelete, c.url+"/image/"+imagePathName(name), nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return decodeErrorResponse(resp)
+	}
+	return nil
+}
+
 func (c *Client) SaveInstanceImage(id string, req SaveImageRequest) (ImageState, error) {
 	var ret ImageState
 	err := c.postJSONExpectOK("/vm/"+imagePathName(id)+"/save", req, &ret)

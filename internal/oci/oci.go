@@ -255,6 +255,29 @@ func (s *Store) Get(name string) (client.ImageState, error) {
 	return s.getLocked(name)
 }
 
+func (s *Store) Delete(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("image name is required")
+	}
+	if err := validateImageStoreName(name); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.downloading[name] {
+		return fmt.Errorf("image %q download already in progress", name)
+	}
+	if _, err := s.getLocked(name); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(s.imageDir(name)); err != nil {
+		return fmt.Errorf("remove image %q: %w", name, err)
+	}
+	delete(s.lastErr, name)
+	return nil
+}
+
 func (s *Store) Open(name string) (*Image, error) {
 	meta, err := s.readMetadata(name)
 	if err != nil {
@@ -1255,6 +1278,24 @@ func (s *Store) readMetadata(name string) (metadata, error) {
 
 func (s *Store) imageDir(name string) string {
 	return filepath.Join(s.root, name)
+}
+
+func validateImageStoreName(name string) error {
+	if filepath.IsAbs(name) || strings.HasPrefix(name, "/") || strings.HasPrefix(name, "\\") {
+		return fmt.Errorf("image name %q must be relative", name)
+	}
+	clean := filepath.Clean(name)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("image name %q escapes the image store", name)
+	}
+	for _, part := range strings.FieldsFunc(name, func(r rune) bool {
+		return r == '/' || r == '\\'
+	}) {
+		if part == "" || part == "." || part == ".." {
+			return fmt.Errorf("image name %q contains an invalid path component", name)
+		}
+	}
+	return nil
 }
 
 func (s *Store) sharedRoot() string {
