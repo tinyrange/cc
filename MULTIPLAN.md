@@ -18,9 +18,10 @@ The target architecture is:
 - coordinator-owned image, filesystem, and network services
 - worker-owned hypervisor state and virtio frontends
 
-## Implementation Status
+## Transitional Prototype Status
 
-The first functional sidecar path is implemented for `darwin/arm64`:
+The current sidecar path proves only the process-placement part on
+`darwin/arm64`:
 
 - the coordinator uses the in-process HVF backend for the first VM
 - additional VMs are placed in local `ccvmd -worker` sidecar processes
@@ -32,10 +33,21 @@ The first functional sidecar path is implemented for `darwin/arm64`:
 Verified locally on macOS arm64 by starting two named Alpine VMs at the same
 time and running `uname -m` in both.
 
-The current sidecar path still shares the on-disk image store directly. The
-next deeper architecture step is moving virtio-fs and virtio-net backends behind
-coordinator-owned IPC services so save/snapshot and L2 networking are fully
+This is not the completed architecture. The current worker daemon still opens
+the shared on-disk image store directly and owns its own virtio-fs and virtio-net
+backends. That violates the intended ownership boundary below. The next required
+implementation step is moving virtio-fs and virtio-net backends behind
+coordinator-owned IPC services so save/snapshot and L2 networking are
 coordinator-owned across sidecars.
+
+The first concrete piece of that ownership boundary is now present:
+
+- `internal/virtio` has an `FSBackend` RPC proxy/server
+- a worker can construct `virtio.NewFS(..., NewFSRemoteBackend(conn))`
+- the coordinator can serve the real `FSBackend` over the same connection
+- tests cover lookup/read and create/write/flush crossing the RPC boundary
+
+This is not yet wired into sidecar startup.
 
 Linux/KVM and Windows/WHP should continue to run multiple VMs in-process when
 that is the best local placement. macOS/HVF should use one in-process VM if
