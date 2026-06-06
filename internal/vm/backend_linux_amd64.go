@@ -573,6 +573,13 @@ func (i *linuxInstance) ExecStream(ctx context.Context, req client.ExecRequest, 
 	}, inputs, onEvent)
 }
 
+func (i *linuxInstance) ConsoleHistory(ctx context.Context) (string, error) {
+	if i == nil || i.session == nil {
+		return "", nil
+	}
+	return i.session.ConsoleHistory(ctx)
+}
+
 func (i *linuxInstance) AddShare(ctx context.Context, share client.ShareMount) error {
 	_ = ctx
 	if i == nil || i.rootFS == nil {

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/net/websocket"
 )
@@ -258,6 +259,47 @@ func TestClientPullImageStreamErrorEvent(t *testing.T) {
 	}
 }
 
+func TestClientExecStreamSendsStdinCloseWhenInputsClose(t *testing.T) {
+	stdinClosed := make(chan struct{}, 1)
+	ts := httptest.NewServer(websocket.Server{
+		Handshake: func(*websocket.Config, *http.Request) error { return nil },
+		Handler: func(ws *websocket.Conn) {
+			var req ExecRequest
+			if err := websocket.JSON.Receive(ws, &req); err != nil {
+				t.Fatalf("JSON.Receive(req) error = %v", err)
+			}
+			var input ExecInput
+			if err := websocket.JSON.Receive(ws, &input); err != nil {
+				t.Fatalf("JSON.Receive(input) error = %v", err)
+			}
+			if input.Kind != "stdin_close" {
+				t.Fatalf("input = %#v, want stdin_close", input)
+			}
+			stdinClosed <- struct{}{}
+			if err := websocket.JSON.Send(ws, ExecEvent{Kind: "exit", ExitCode: 0}); err != nil {
+				t.Fatalf("JSON.Send(exit) error = %v", err)
+			}
+		},
+	})
+	defer ts.Close()
+
+	c := NewClient(ts.URL, func() (net.Conn, error) {
+		return nil, nil
+	})
+	c.client = *ts.Client()
+
+	inputs := make(chan ExecInput)
+	close(inputs)
+	if err := c.ExecStream(ExecRequest{Command: []string{"true"}}, inputs, nil); err != nil {
+		t.Fatalf("ExecStream() error = %v", err)
+	}
+	select {
+	case <-stdinClosed:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for stdin_close")
+	}
+}
+
 func TestClientCreateInstanceStream(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/vm" || r.URL.Query().Get("stream") != "1" {
@@ -302,7 +344,7 @@ func TestClientCreateInstanceStreamRequiresReadyEvent(t *testing.T) {
 }
 
 func TestClientNamedInstanceHTTPHelpers(t *testing.T) {
-	var sawStatus, sawList, sawShutdown, sawForward, sawCreate, sawSave, sawDelete bool
+	var sawStatus, sawList, sawShutdown, sawForward, sawCreate, sawFlush, sawConsole, sawSave, sawDelete bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/vm/status":
@@ -355,6 +397,15 @@ func TestClientNamedInstanceHTTPHelpers(t *testing.T) {
 				t.Fatalf("save request = %#v, want saved tag from alpine", req)
 			}
 			_ = json.NewEncoder(w).Encode(ImageState{Name: req.Name, Status: "downloaded"})
+		case "/vm/alpha beta/flush":
+			sawFlush = true
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "flushed"})
+		case "/vm/console":
+			if r.URL.Query().Get("id") != "alpha beta" {
+				t.Fatalf("console id = %q", r.URL.Query().Get("id"))
+			}
+			sawConsole = true
+			_ = json.NewEncoder(w).Encode(ConsoleHistoryResponse{History: "serial ok\n"})
 		case "/image/saved tag":
 			if r.Method != http.MethodDelete {
 				t.Fatalf("delete method = %s, want DELETE", r.Method)
@@ -388,11 +439,17 @@ func TestClientNamedInstanceHTTPHelpers(t *testing.T) {
 	if state, err := c.SaveInstanceImage("alpha beta", SaveImageRequest{Name: "saved tag", Image: "alpine"}); err != nil || state.Name != "saved tag" {
 		t.Fatalf("SaveInstanceImage() = %#v, %v", state, err)
 	}
+	if err := c.FlushInstance("alpha beta"); err != nil {
+		t.Fatalf("FlushInstance() error = %v", err)
+	}
+	if history, err := c.ConsoleHistory("alpha beta"); err != nil || history != "serial ok\n" {
+		t.Fatalf("ConsoleHistory() = %q, %v", history, err)
+	}
 	if err := c.DeleteImage("saved tag"); err != nil {
 		t.Fatalf("DeleteImage() error = %v", err)
 	}
-	if !sawStatus || !sawList || !sawCreate || !sawShutdown || !sawForward || !sawSave || !sawDelete {
-		t.Fatalf("missing requests: status=%v list=%v create=%v shutdown=%v forward=%v save=%v delete=%v", sawStatus, sawList, sawCreate, sawShutdown, sawForward, sawSave, sawDelete)
+	if !sawStatus || !sawList || !sawCreate || !sawShutdown || !sawForward || !sawFlush || !sawConsole || !sawSave || !sawDelete {
+		t.Fatalf("missing requests: status=%v list=%v create=%v shutdown=%v forward=%v flush=%v console=%v save=%v delete=%v", sawStatus, sawList, sawCreate, sawShutdown, sawForward, sawFlush, sawConsole, sawSave, sawDelete)
 	}
 }
 

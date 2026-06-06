@@ -364,6 +364,10 @@ type InstanceState struct {
 	Error       string `json:"error,omitempty"`
 }
 
+type ConsoleHistoryResponse struct {
+	History string `json:"history"`
+}
+
 type RunRequest struct {
 	ID             string         `json:"id,omitempty"`
 	Image          string         `json:"image"`

@@ -110,6 +110,35 @@ func TestResolveVMBootTimeout(t *testing.T) {
 	}
 }
 
+func TestWorkerControlListenEndpointUnix(t *testing.T) {
+	socketPath := filepath.Join(t.TempDir(), "worker.sock")
+	network, address, cleanup, err := workerControlListenEndpoint(socketPath)
+	if err != nil {
+		t.Fatalf("workerControlListenEndpoint() error = %v", err)
+	}
+	defer cleanup()
+	if network != "unix" || address != socketPath {
+		t.Fatalf("workerControlListenEndpoint() = %q, %q; want unix %q", network, address, socketPath)
+	}
+	if got := workerControlDialEndpoint(network, address); got != socketPath {
+		t.Fatalf("workerControlDialEndpoint() = %q, want %q", got, socketPath)
+	}
+}
+
+func TestWorkerControlListenEndpointTCP(t *testing.T) {
+	network, address, cleanup, err := workerControlListenEndpoint("tcp://127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("workerControlListenEndpoint(tcp) error = %v", err)
+	}
+	defer cleanup()
+	if network != "tcp" || address != "127.0.0.1:0" {
+		t.Fatalf("workerControlListenEndpoint(tcp) = %q, %q; want tcp loopback", network, address)
+	}
+	if got := workerControlDialEndpoint(network, "127.0.0.1:1234"); got != "tcp://127.0.0.1:1234" {
+		t.Fatalf("workerControlDialEndpoint(tcp) = %q", got)
+	}
+}
+
 func TestWriteStartupError(t *testing.T) {
 	var buf bytes.Buffer
 	if err := writeStartupError(&buf, errors.New("listen on localhost: bind failed")); err != nil {

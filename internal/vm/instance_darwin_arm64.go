@@ -58,6 +58,13 @@ func (i *darwinInstance) Flush(ctx context.Context) error {
 	return i.session.Flush(ctx)
 }
 
+func (i *darwinInstance) ConsoleHistory(ctx context.Context) (string, error) {
+	if i == nil || i.session == nil {
+		return "", nil
+	}
+	return i.session.ConsoleHistory(ctx)
+}
+
 func (i *darwinInstance) RootSnapshot() (imagefs.Directory, error) {
 	if i == nil || i.session == nil {
 		return nil, fmt.Errorf("root filesystem cannot be snapshotted")

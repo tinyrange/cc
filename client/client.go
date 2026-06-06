@@ -158,6 +158,10 @@ func (c *Client) SaveInstanceImage(id string, req SaveImageRequest) (ImageState,
 	return ret, err
 }
 
+func (c *Client) FlushInstance(id string) error {
+	return c.postJSONExpectOK("/vm/"+imagePathName(id)+"/flush", map[string]any{}, nil)
+}
+
 func imagePathName(name string) string {
 	return url.PathEscape(name)
 }
@@ -288,6 +292,22 @@ func (c *Client) InstanceStatusOf(id string) (InstanceState, error) {
 	return ret, err
 }
 
+func (c *Client) ConsoleHistory(id string) (string, error) {
+	var ret ConsoleHistoryResponse
+	resp, err := c.client.Get(c.url + "/vm/console" + idQuery(id))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", decodeErrorResponse(resp)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&ret); err != nil {
+		return "", err
+	}
+	return ret.History, nil
+}
+
 func (c *Client) ShutdownInstance() error {
 	return c.postJSONExpectOK("/vm/shutdown", nil, nil)
 }
@@ -355,10 +375,25 @@ func (c *Client) RunInteractiveStream(req RunRequest, inputs <-chan ExecInput, o
 		return err
 	}
 	if inputs != nil {
+		select {
+		case input, ok := <-inputs:
+			if !ok {
+				if err := websocket.JSON.Send(ws, ExecInput{Kind: "stdin_close"}); err != nil {
+					return err
+				}
+				inputs = nil
+			} else if err := websocket.JSON.Send(ws, input); err != nil {
+				return err
+			}
+		default:
+		}
+	}
+	if inputs != nil {
 		go func() {
 			for input := range inputs {
 				_ = websocket.JSON.Send(ws, input)
 			}
+			_ = websocket.JSON.Send(ws, ExecInput{Kind: "stdin_close"})
 		}()
 	}
 	for {
@@ -438,10 +473,25 @@ func (c *Client) ExecStream(req ExecRequest, inputs <-chan ExecInput, onEvent fu
 		return err
 	}
 	if inputs != nil {
+		select {
+		case input, ok := <-inputs:
+			if !ok {
+				if err := websocket.JSON.Send(ws, ExecInput{Kind: "stdin_close"}); err != nil {
+					return err
+				}
+				inputs = nil
+			} else if err := websocket.JSON.Send(ws, input); err != nil {
+				return err
+			}
+		default:
+		}
+	}
+	if inputs != nil {
 		go func() {
 			for input := range inputs {
 				_ = websocket.JSON.Send(ws, input)
 			}
+			_ = websocket.JSON.Send(ws, ExecInput{Kind: "stdin_close"})
 		}()
 	}
 

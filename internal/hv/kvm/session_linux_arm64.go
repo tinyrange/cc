@@ -247,6 +247,13 @@ func (s *ManagedSession) Flush(ctx context.Context) error {
 	return nil
 }
 
+func (s *ManagedSession) ConsoleHistory(context.Context) (string, error) {
+	if s == nil || s.serialOut == nil {
+		return "", nil
+	}
+	return s.serialOut.String(), nil
+}
+
 func (s *ManagedSession) Wait() error {
 	if s == nil || s.doneCh == nil {
 		return nil

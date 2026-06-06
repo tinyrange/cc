@@ -44,6 +44,7 @@ type networkDeviceConfig struct {
 	Size    uint64
 	IRQ     uint32
 	TXHook  func([]byte)
+	RXHook  func([]byte) error
 	Cleanup func()
 }
 
@@ -99,12 +100,18 @@ func newNetworkRuntime(cfg networkDeviceConfig) (_ *networkRuntime, retErr error
 	}
 	dev := virtio.NewNet(cfg.Base, cfg.Size, cfg.IRQ, cfg.MAC, &netstackVirtioBackend{runtime: runtime})
 	runtime.dev = dev
+	rxHook := cfg.RXHook
+	if rxHook == nil {
+		rxHook = func(frame []byte) error {
+			copied := append([]byte(nil), frame...)
+			go func() {
+				_ = dev.EnqueueRxPacketOwned(copied)
+			}()
+			return nil
+		}
+	}
 	iface.AttachVirtioBackend(func(frame []byte) error {
-		copied := append([]byte(nil), frame...)
-		go func() {
-			_ = dev.EnqueueRxPacketOwned(copied)
-		}()
-		return nil
+		return rxHook(frame)
 	})
 
 	for _, forward := range cfg.Config.PortForwards {

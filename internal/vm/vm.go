@@ -68,6 +68,10 @@ type instanceFlushProvider interface {
 	Flush(context.Context) error
 }
 
+type consoleHistoryProvider interface {
+	ConsoleHistory(context.Context) (string, error)
+}
+
 type rootSnapshotProvider interface {
 	RootSnapshot() (imagefs.Directory, error)
 }
@@ -313,7 +317,7 @@ func (h *placementVMHost) Start(ctx context.Context, req client.CreateInstanceRe
 }
 
 func (h *placementVMHost) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
-	host, err := h.reserveHost(ctx)
+	host, err := h.reserveHost(ctx, placementRequirements{requiresL2: networkEnabled(req.Network)})
 	if err != nil {
 		return nil, err
 	}
@@ -330,7 +334,7 @@ func (h *placementVMHost) StartBlank(ctx context.Context, req client.StartInstan
 }
 
 func (h *placementVMHost) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
-	host, err := h.reserveHost(ctx)
+	host, err := h.reserveHost(ctx, placementRequirements{requiresL2: networkEnabled(req.Network)})
 	if err != nil {
 		return nil, err
 	}
@@ -374,17 +378,33 @@ func (h *placementVMHost) RunInInstanceStream(ctx context.Context, inst Instance
 	return host.RunInInstanceStream(ctx, inner, runningImage, req, inputs, onEvent)
 }
 
-func (h *placementVMHost) reserveHost(ctx context.Context) (VMHost, error) {
+type placementRequirements struct {
+	requiresL2 bool
+}
+
+func (h *placementVMHost) reserveHost(ctx context.Context, req placementRequirements) (VMHost, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	var skipped []string
 	for _, host := range h.hosts {
 		caps := host.HostCapabilities(ctx)
+		if req.requiresL2 && !caps.SupportsL2 {
+			skipped = append(skipped, firstNonEmpty(caps.Locality, caps.Backend, "unknown"))
+			continue
+		}
 		if caps.MaxVMs <= 0 || h.running[host] < caps.MaxVMs {
 			h.running[host]++
 			return host, nil
 		}
 	}
+	if req.requiresL2 && len(skipped) != 0 {
+		return nil, fmt.Errorf("no VM host with coordinator L2 capacity available")
+	}
 	return nil, fmt.Errorf("no VM host capacity available")
+}
+
+func networkEnabled(cfg *client.NetworkConfig) bool {
+	return cfg != nil && cfg.Enabled
 }
 
 func (h *placementVMHost) releaseHost(host VMHost) {
@@ -419,6 +439,54 @@ func (i *hostedInstance) Close() error {
 	err := i.Instance.Close()
 	i.once.Do(i.release)
 	return err
+}
+
+func (i *hostedInstance) Flush(ctx context.Context) error {
+	flusher, ok := i.Instance.(instanceFlushProvider)
+	if !ok {
+		return fmt.Errorf("root filesystem cannot be flushed")
+	}
+	return flusher.Flush(ctx)
+}
+
+func (i *hostedInstance) ConsoleHistory(ctx context.Context) (string, error) {
+	provider, ok := i.Instance.(consoleHistoryProvider)
+	if !ok {
+		return "", fmt.Errorf("console history is not available")
+	}
+	return provider.ConsoleHistory(ctx)
+}
+
+func (i *hostedInstance) RootSnapshot() (imagefs.Directory, error) {
+	snapshotter, ok := i.Instance.(rootSnapshotProvider)
+	if !ok {
+		return nil, fmt.Errorf("root filesystem cannot be snapshotted")
+	}
+	return snapshotter.RootSnapshot()
+}
+
+func (i *hostedInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
+	snapshotter, ok := i.Instance.(imageSnapshotProvider)
+	if !ok {
+		return nil, fmt.Errorf("image %q cannot be snapshotted", imageName)
+	}
+	return snapshotter.SnapshotImage(imageName)
+}
+
+func (i *hostedInstance) NetworkIPv4() string {
+	provider, ok := i.Instance.(networkIPv4Provider)
+	if !ok {
+		return ""
+	}
+	return provider.NetworkIPv4()
+}
+
+func (i *hostedInstance) VirtioFSStats() []virtio.FSStats {
+	provider, ok := i.Instance.(virtioFSStatsProvider)
+	if !ok {
+		return nil
+	}
+	return provider.VirtioFSStats()
 }
 
 func (h *placementVMHost) instanceHost(ctx context.Context, inst Instance) (VMHost, Instance, error) {
@@ -707,6 +775,36 @@ func (m *Manager) AddPortForwardTo(ctx context.Context, id string, forward clien
 	return machine.instance.AddPortForward(ctx, forward)
 }
 
+func (m *Manager) FlushInstance(ctx context.Context, id string) error {
+	id = instanceID(id)
+	m.mu.Lock()
+	machine := m.running[id]
+	m.mu.Unlock()
+	if machine == nil {
+		return fmt.Errorf("no VM %q is running", id)
+	}
+	flusher, ok := machine.instance.(instanceFlushProvider)
+	if !ok {
+		return fmt.Errorf("VM %q root filesystem cannot be flushed", id)
+	}
+	return flusher.Flush(ctx)
+}
+
+func (m *Manager) ConsoleHistory(ctx context.Context, id string) (string, error) {
+	id = instanceID(id)
+	m.mu.Lock()
+	machine := m.running[id]
+	m.mu.Unlock()
+	if machine == nil {
+		return "", fmt.Errorf("no VM %q is running", id)
+	}
+	provider, ok := machine.instance.(consoleHistoryProvider)
+	if !ok {
+		return "", fmt.Errorf("VM %q console history is not available", id)
+	}
+	return provider.ConsoleHistory(ctx)
+}
+
 func (m *Manager) SnapshotRootFS(ctx context.Context, id string, imageName string) (imagefs.Directory, string, error) {
 	id = instanceID(id)
 	imageName = strings.TrimSpace(imageName)
@@ -716,10 +814,8 @@ func (m *Manager) SnapshotRootFS(ctx context.Context, id string, imageName strin
 	if machine == nil {
 		return nil, "", fmt.Errorf("no VM %q is running", id)
 	}
-	if flusher, ok := machine.instance.(instanceFlushProvider); ok {
-		if err := flusher.Flush(ctx); err != nil {
-			return nil, "", err
-		}
+	if err := m.FlushInstance(ctx, id); err != nil {
+		return nil, "", err
 	}
 	if imageName != "" {
 		if snapshotter, ok := machine.instance.(imageSnapshotProvider); ok {

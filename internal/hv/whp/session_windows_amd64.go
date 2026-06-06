@@ -202,6 +202,13 @@ func (s *ManagedSession) Flush(ctx context.Context) error {
 	return nil
 }
 
+func (s *ManagedSession) ConsoleHistory(context.Context) (string, error) {
+	if s == nil || s.serialOut == nil {
+		return "", nil
+	}
+	return s.serialOut.String(), nil
+}
+
 func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	if len(req.Command) == 0 {
 		return fmt.Errorf("exec command is required")

@@ -43,6 +43,10 @@ func (s *ContainerSession) Wait() error {
 	return fmt.Errorf("hvf container runner is unsupported on this host")
 }
 
+func (s *ContainerSession) ConsoleHistory(context.Context) (string, error) {
+	return "", nil
+}
+
 func (s *ContainerSession) Close() error {
 	return nil
 }

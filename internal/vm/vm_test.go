@@ -3,12 +3,16 @@ package vm
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/oci"
 )
 
@@ -34,6 +38,23 @@ func TestManagerStartShutdownLifecycle(t *testing.T) {
 	}
 	if inst.closed != 1 {
 		t.Fatalf("instance Close() count = %d, want 1", inst.closed)
+	}
+}
+
+func TestManagerConsoleHistoryUsesRunningInstance(t *testing.T) {
+	inst := &fakeInstance{waitCh: make(chan error, 1), console: "serial boot ok\n"}
+	mgr := NewManagerWithBackend(fakeBackend{instance: inst})
+	mgr.supports = func() error { return nil }
+
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{Image: "alpine"}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	history, err := mgr.ConsoleHistory(context.Background(), DefaultInstanceID)
+	if err != nil {
+		t.Fatalf("ConsoleHistory() error = %v", err)
+	}
+	if history != "serial boot ok\n" {
+		t.Fatalf("ConsoleHistory() = %q, want serial boot ok", history)
 	}
 }
 
@@ -152,6 +173,90 @@ func TestPlacementVMHostStartsAcrossHostCapacity(t *testing.T) {
 	}
 	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{ID: "three", Image: "ubuntu"}); err == nil {
 		t.Fatal("Start(three) error = nil, want capacity error")
+	}
+}
+
+func TestPlacementVMHostRoutesNetworkedStartsToL2Host(t *testing.T) {
+	firstInst := &fakeInstance{waitCh: make(chan error, 1)}
+	secondInst := &fakeInstance{waitCh: make(chan error, 1)}
+	var firstStarts, secondStarts int
+	first := &fakeVMHost{
+		Backend: fakeBackend{startFn: func(req client.CreateInstanceRequest) (Instance, error) {
+			firstStarts++
+			return firstInst, nil
+		}},
+		caps: VMHostCapabilities{Backend: "first", MaxVMs: 1, Locality: "in-process", SupportsL2: false},
+	}
+	second := &fakeVMHost{
+		Backend: fakeBackend{startFn: func(req client.CreateInstanceRequest) (Instance, error) {
+			secondStarts++
+			return secondInst, nil
+		}},
+		caps: VMHostCapabilities{Backend: "second", MaxVMs: 1, Locality: "sidecar", SupportsL2: true},
+	}
+	mgr := NewManagerWithHosts(first, second)
+	mgr.supports = func() error { return nil }
+
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{
+		ID:      "net",
+		Image:   "alpine",
+		Network: &client.NetworkConfig{Enabled: true},
+	}); err != nil {
+		t.Fatalf("Start(networked) error = %v", err)
+	}
+	if firstStarts != 0 || secondStarts != 1 {
+		t.Fatalf("start counts first=%d second=%d, want 0/1", firstStarts, secondStarts)
+	}
+}
+
+func TestPlacementVMHostRoutesNetworkedBlankStartsToL2Host(t *testing.T) {
+	firstInst := &fakeInstance{waitCh: make(chan error, 1)}
+	secondInst := &fakeInstance{waitCh: make(chan error, 1)}
+	var firstStarts, secondStarts int
+	first := &fakeVMHost{
+		Backend: fakeBackend{startBlankFn: func(req client.StartInstanceRequest) (Instance, error) {
+			firstStarts++
+			return firstInst, nil
+		}},
+		caps: VMHostCapabilities{Backend: "first", MaxVMs: 1, Locality: "in-process", SupportsL2: false},
+	}
+	second := &fakeVMHost{
+		Backend: fakeBackend{startBlankFn: func(req client.StartInstanceRequest) (Instance, error) {
+			secondStarts++
+			return secondInst, nil
+		}},
+		caps: VMHostCapabilities{Backend: "second", MaxVMs: 1, Locality: "sidecar", SupportsL2: true},
+	}
+	mgr := NewManagerWithHosts(first, second)
+	mgr.supports = func() error { return nil }
+
+	if _, err := mgr.StartBlank(context.Background(), client.StartInstanceRequest{
+		ID:      "net",
+		Image:   "alpine",
+		Network: &client.NetworkConfig{Enabled: true},
+	}); err != nil {
+		t.Fatalf("StartBlank(networked) error = %v", err)
+	}
+	if firstStarts != 0 || secondStarts != 1 {
+		t.Fatalf("blank start counts first=%d second=%d, want 0/1", firstStarts, secondStarts)
+	}
+}
+
+func TestPlacementVMHostFailsNetworkedStartWithoutL2Host(t *testing.T) {
+	host := &fakeVMHost{
+		Backend: fakeBackend{instance: &fakeInstance{waitCh: make(chan error, 1)}},
+		caps:    VMHostCapabilities{Backend: "first", MaxVMs: 1, SupportsL2: false},
+	}
+	mgr := NewManagerWithHosts(host)
+	mgr.supports = func() error { return nil }
+
+	_, err := mgr.Start(context.Background(), client.CreateInstanceRequest{
+		ID:      "net",
+		Image:   "alpine",
+		Network: &client.NetworkConfig{Enabled: true},
+	})
+	if err == nil || !strings.Contains(err.Error(), "coordinator L2") {
+		t.Fatalf("Start(networked) error = %v, want coordinator L2 capacity error", err)
 	}
 }
 
@@ -760,6 +865,98 @@ func TestManagerAddPortForwardUpdatesRunningInstance(t *testing.T) {
 	}
 }
 
+func TestManagerSnapshotRootFSFlushesBeforeSnapshot(t *testing.T) {
+	overlay := imagefs.NewOverlay(nil)
+	if err := overlay.AddFile("/etc/motd", 0o644, []byte("saved")); err != nil {
+		t.Fatalf("AddFile() error = %v", err)
+	}
+	var calls []string
+	inst := &fakeInstance{
+		waitCh: make(chan error, 1),
+		flushFn: func(context.Context) error {
+			calls = append(calls, "flush")
+			return nil
+		},
+		snapshotFn: func() (imagefs.Directory, error) {
+			calls = append(calls, "snapshot")
+			return overlay.Root(), nil
+		},
+	}
+	mgr := NewManagerWithBackend(fakeBackend{instance: inst})
+	mgr.supports = func() error { return nil }
+
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{Image: "alpine"}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	root, source, err := mgr.SnapshotRootFS(context.Background(), "default", "")
+	if err != nil {
+		t.Fatalf("SnapshotRootFS() error = %v", err)
+	}
+	if root == nil || source != "alpine" {
+		t.Fatalf("SnapshotRootFS() = root %v source %q, want root and alpine", root, source)
+	}
+	if got := fmt.Sprint(calls); got != "[flush snapshot]" {
+		t.Fatalf("call order = %s, want [flush snapshot]", got)
+	}
+}
+
+func TestSidecarCommandResolverResolvesBeforeWorkerExec(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "opt", "bin"), 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "opt", "bin", "tool"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	resolver := newSidecarCommandResolver(&oci.Image{
+		RootFS: imagefs.NewHostFS(root, nil),
+		Config: oci.RuntimeConfig{
+			Env: []string{"PATH=/opt/bin"},
+		},
+	})
+
+	got, err := resolver.resolve(client.ExecRequest{
+		Command: []string{"tool", "arg"},
+	})
+	if err != nil {
+		t.Fatalf("resolve() error = %v", err)
+	}
+	if !got.SkipResolve {
+		t.Fatal("resolve() SkipResolve = false, want true")
+	}
+	if want := "/opt/bin/tool"; got.Command[0] != want {
+		t.Fatalf("resolve() command[0] = %q, want %q", got.Command[0], want)
+	}
+	if got.Command[1] != "arg" {
+		t.Fatalf("resolve() command args = %#v", got.Command)
+	}
+}
+
+func TestCleanupStaleSidecarSocketsOnlyRemovesSocketFiles(t *testing.T) {
+	root := t.TempDir()
+	socketDir := filepath.Join(root, "_worker-sockets")
+	if err := os.MkdirAll(socketDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	stale := filepath.Join(socketDir, "fs-stale.sock")
+	keep := filepath.Join(socketDir, "state.json")
+	if err := os.WriteFile(stale, []byte("stale"), 0o644); err != nil {
+		t.Fatalf("WriteFile(stale) error = %v", err)
+	}
+	if err := os.WriteFile(keep, []byte("keep"), 0o644); err != nil {
+		t.Fatalf("WriteFile(keep) error = %v", err)
+	}
+
+	cleanupStaleSidecarSockets(root)
+
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale socket stat error = %v, want not exist", err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("keep stat error = %v", err)
+	}
+}
+
 func TestManagerRunStreamFallsBackToOneShotRunWhenNoInstance(t *testing.T) {
 	var seen client.RunRequest
 	mgr := NewManagerWithBackend(fakeBackend{
@@ -886,6 +1083,7 @@ type fakeBackend struct {
 	runFn           func(client.RunRequest) (client.ExecResponse, error)
 	runStreamFn     func(context.Context, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 	startFn         func(client.CreateInstanceRequest) (Instance, error)
+	startBlankFn    func(client.StartInstanceRequest) (Instance, error)
 	runInInstanceFn func(context.Context, Instance, string, client.RunRequest) (client.ExecResponse, error)
 	runInStreamFn   func(context.Context, Instance, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 }
@@ -923,8 +1121,11 @@ func (f fakeBackend) StartBlank(ctx context.Context, req client.StartInstanceReq
 
 func (f fakeBackend) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
 	_ = ctx
-	_ = req
 	_ = onEvent
+	if f.startBlankFn != nil {
+		return f.startBlankFn(req)
+	}
+	_ = req
 	return f.instance, f.err
 }
 
@@ -1006,6 +1207,10 @@ type fakeInstance struct {
 	forwardFn  func(client.PortForward) error
 	execFn     func(client.ExecRequest) (client.ExecResponse, error)
 	streamFn   func(client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+	flushFn    func(context.Context) error
+	snapshotFn func() (imagefs.Directory, error)
+	imageFn    func(string) (imagefs.Directory, error)
+	console    string
 }
 
 func (f *fakeInstance) AddShare(ctx context.Context, share client.ShareMount) error {
@@ -1050,6 +1255,31 @@ func (f *fakeInstance) ExecStream(ctx context.Context, req client.ExecRequest, i
 		return onEvent(client.ExecEvent{Kind: "exit", ExitCode: resp.ExitCode})
 	}
 	return nil
+}
+
+func (f *fakeInstance) Flush(ctx context.Context) error {
+	if f.flushFn != nil {
+		return f.flushFn(ctx)
+	}
+	return nil
+}
+
+func (f *fakeInstance) ConsoleHistory(context.Context) (string, error) {
+	return f.console, nil
+}
+
+func (f *fakeInstance) RootSnapshot() (imagefs.Directory, error) {
+	if f.snapshotFn != nil {
+		return f.snapshotFn()
+	}
+	return imagefs.NewOverlay(nil).Root(), nil
+}
+
+func (f *fakeInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
+	if f.imageFn != nil {
+		return f.imageFn(imageName)
+	}
+	return f.RootSnapshot()
 }
 
 func (f *fakeInstance) Wait() error {

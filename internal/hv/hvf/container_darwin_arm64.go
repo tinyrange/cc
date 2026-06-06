@@ -159,6 +159,7 @@ type ContainerSession struct {
 	uart        *serial.UART8250
 	control     virtio.VsockConn
 	transcript  *arm64vm.SerialTranscript
+	serialOut   *arm64vm.SerialTranscript
 	listener    virtio.VsockListener
 	vsock       *virtio.Vsock
 	rootFS      virtio.ShareMounter
@@ -305,6 +306,13 @@ func (s *ContainerSession) Wait() error {
 		<-s.closeDone
 	}
 	return res.err
+}
+
+func (s *ContainerSession) ConsoleHistory(context.Context) (string, error) {
+	if s == nil || s.serialOut == nil {
+		return "", nil
+	}
+	return s.serialOut.String(), nil
 }
 
 func (s *ContainerSession) AddShare(ctx context.Context, share client.ShareMount) error {
@@ -596,6 +604,9 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 	command := append([]string(nil), req.Command...)
 	start := time.Now()
 	if !req.SkipResolve {
+		if s.image == nil || s.image.RootFS == nil {
+			return fmt.Errorf("running instance does not have a default image root filesystem")
+		}
 		var err error
 		command, err = imagefs.ResolveCommand(s.image.RootFS, req.Command, env)
 		if err != nil {
@@ -1256,6 +1267,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 			dmesg:       req.Dmesg,
 			control:     res.conn,
 			transcript:  controlTranscript,
+			serialOut:   serialOut,
 			vsock:       vsock,
 			rootFS:      rootFS,
 			fsdevs:      fsdevs,

@@ -98,6 +98,126 @@ func TestSidecarLaunchArgs(t *testing.T) {
 	}
 }
 
+func TestSidecarWorkerClientWaitPollsStatus(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+
+	workerClient := &sidecarWorkerClient{conn: left, codec: NewWorkerCodec(left)}
+	workerCodec := NewWorkerCodec(right)
+
+	waitDone := make(chan error, 1)
+	go func() {
+		waitDone <- workerClient.Wait(context.Background(), "alpha")
+	}()
+
+	frame, err := workerCodec.Receive()
+	if err != nil {
+		t.Fatalf("worker Receive() error = %v", err)
+	}
+	if frame.Type != WorkerFrameStatus {
+		t.Fatalf("frame.Type = %q, want status", frame.Type)
+	}
+	var req WorkerStatusRequest
+	if err := frame.DecodePayload(&req); err != nil {
+		t.Fatalf("DecodePayload() error = %v", err)
+	}
+	if req.ID != "alpha" {
+		t.Fatalf("status ID = %q, want alpha", req.ID)
+	}
+	done, err := NewWorkerFrame(frame.ID, WorkerServiceControl, WorkerFrameDone, WorkerStatusResponse{State: client.InstanceState{ID: "alpha", Status: "stopped"}})
+	if err != nil {
+		t.Fatalf("NewWorkerFrame(done) error = %v", err)
+	}
+	if err := workerCodec.Send(done); err != nil {
+		t.Fatalf("worker Send(done) error = %v", err)
+	}
+	if err := <-waitDone; err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+}
+
+func TestSidecarWorkerClientConsoleHistoryRoundTrip(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+
+	workerClient := &sidecarWorkerClient{conn: left, codec: NewWorkerCodec(left)}
+	workerCodec := NewWorkerCodec(right)
+
+	historyDone := make(chan struct {
+		history string
+		err     error
+	}, 1)
+	go func() {
+		history, err := workerClient.ConsoleHistory(context.Background(), "alpha")
+		historyDone <- struct {
+			history string
+			err     error
+		}{history: history, err: err}
+	}()
+
+	frame, err := workerCodec.Receive()
+	if err != nil {
+		t.Fatalf("worker Receive() error = %v", err)
+	}
+	if frame.Type != WorkerFrameConsole {
+		t.Fatalf("frame.Type = %q, want console", frame.Type)
+	}
+	var req WorkerConsoleRequest
+	if err := frame.DecodePayload(&req); err != nil {
+		t.Fatalf("DecodePayload() error = %v", err)
+	}
+	if req.ID != "alpha" {
+		t.Fatalf("console ID = %q, want alpha", req.ID)
+	}
+	done, err := NewWorkerFrame(frame.ID, WorkerServiceControl, WorkerFrameDone, WorkerConsoleResponse{History: "boot ok\n"})
+	if err != nil {
+		t.Fatalf("NewWorkerFrame(done) error = %v", err)
+	}
+	if err := workerCodec.Send(done); err != nil {
+		t.Fatalf("worker Send(done) error = %v", err)
+	}
+	got := <-historyDone
+	if got.err != nil {
+		t.Fatalf("ConsoleHistory() error = %v", got.err)
+	}
+	if got.history != "boot ok\n" {
+		t.Fatalf("ConsoleHistory() = %q, want boot ok", got.history)
+	}
+}
+
+func TestSidecarWorkerClientExecStreamReturnsOnContextCancel(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+
+	workerClient := &sidecarWorkerClient{conn: left, codec: NewWorkerCodec(left)}
+	workerCodec := NewWorkerCodec(right)
+	ctx, cancel := context.WithCancel(context.Background())
+	execDone := make(chan error, 1)
+	go func() {
+		execDone <- workerClient.ExecStream(ctx, "alpha", client.ExecRequest{Command: []string{"sleep", "100"}}, nil, nil)
+	}()
+
+	frame, err := workerCodec.Receive()
+	if err != nil {
+		t.Fatalf("worker Receive() error = %v", err)
+	}
+	if frame.Type != WorkerFrameExec {
+		t.Fatalf("frame.Type = %q, want exec", frame.Type)
+	}
+	cancel()
+	select {
+	case err := <-execDone:
+		if err == nil || !strings.Contains(err.Error(), "context canceled") {
+			t.Fatalf("ExecStream() error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ExecStream() did not return after context cancel")
+	}
+}
+
 func TestPlacementVMHostReleasesCapacityWhenInstanceExits(t *testing.T) {
 	firstInst := &fakeInstance{waitCh: make(chan error, 1)}
 	secondInst := &fakeInstance{waitCh: make(chan error, 1)}

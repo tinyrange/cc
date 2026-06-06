@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
@@ -326,6 +327,12 @@ func run(args []string) (bool, error) {
 		*worker,
 	)
 
+	if *worker {
+		if socketPath := strings.TrimSpace(os.Getenv("CCX3_WORKER_CONTROL_SOCKET")); socketPath != "" {
+			return runWorkerControlSocket(socketPath, srvState)
+		}
+	}
+
 	l, err := net.Listen("tcp", *addr)
 	if err != nil {
 		return false, fmt.Errorf("listen on %q: %w", *addr, err)
@@ -358,6 +365,274 @@ func writeStartupError(w interface{ Write([]byte) (int, error) }, err error) err
 		Error:  "ccvm failed to start",
 		Detail: err.Error(),
 	})
+}
+
+func runWorkerControlSocket(socketPath string, srvState *server) (bool, error) {
+	listenNetwork, listenAddress, cleanup, err := workerControlListenEndpoint(socketPath)
+	if err != nil {
+		return false, err
+	}
+	defer cleanup()
+	l, err := net.Listen(listenNetwork, listenAddress)
+	if err != nil {
+		return false, fmt.Errorf("listen worker control socket: %w", err)
+	}
+	defer l.Close()
+	if err := json.NewEncoder(os.Stdout).Encode(client.ServerHello{Kind: "worker", Addr: workerControlDialEndpoint(listenNetwork, l.Addr().String())}); err != nil {
+		return false, fmt.Errorf("write worker startup banner: %w", err)
+	}
+	conn, err := l.Accept()
+	if err != nil {
+		return true, fmt.Errorf("accept worker control connection: %w", err)
+	}
+	defer conn.Close()
+	codec := vm.NewWorkerCodec(conn)
+	hello, err := vm.NewWorkerFrame(0, vm.WorkerServiceControl, vm.WorkerFrameHello, vm.WorkerHello{
+		Version:  vm.WorkerProtocolVersion,
+		WorkerID: "local-sidecar",
+		Backend:  "worker",
+		Capabilities: vm.VMHostCapabilities{
+			Backend:       "worker",
+			MaxVMs:        1,
+			Locality:      "sidecar",
+			SupportsFSRPC: true,
+			SupportsL2:    true,
+		},
+	})
+	if err != nil {
+		return true, err
+	}
+	if err := codec.Send(hello); err != nil {
+		return true, fmt.Errorf("send worker hello: %w", err)
+	}
+	return true, serveWorkerControl(codec, srvState)
+}
+
+func workerControlListenEndpoint(address string) (network string, listenAddress string, cleanup func(), err error) {
+	cleanup = func() {}
+	if strings.HasPrefix(address, "tcp://") {
+		return "tcp", strings.TrimPrefix(address, "tcp://"), cleanup, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(address), 0o700); err != nil {
+		return "", "", cleanup, fmt.Errorf("prepare worker control socket dir: %w", err)
+	}
+	_ = os.Remove(address)
+	return "unix", address, func() { _ = os.Remove(address) }, nil
+}
+
+func workerControlDialEndpoint(network string, address string) string {
+	if network == "tcp" {
+		return "tcp://" + address
+	}
+	return address
+}
+
+type workerActiveExec struct {
+	cancel context.CancelFunc
+	inputs chan client.ExecInput
+	mu     sync.Mutex
+	closed bool
+	once   sync.Once
+}
+
+func (e *workerActiveExec) closeInputs() {
+	if e == nil || e.inputs == nil {
+		return
+	}
+	e.once.Do(func() {
+		e.mu.Lock()
+		e.closed = true
+		e.mu.Unlock()
+		close(e.inputs)
+	})
+}
+
+func (e *workerActiveExec) sendInput(input client.ExecInput) bool {
+	if e == nil || e.inputs == nil {
+		return false
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return false
+	}
+	select {
+	case e.inputs <- input:
+		return true
+	default:
+		return false
+	}
+}
+
+func serveWorkerControl(codec *vm.WorkerCodec, srvState *server) error {
+	var activeMu sync.Mutex
+	activeExecs := make(map[uint64]*workerActiveExec)
+
+	for {
+		frame, err := codec.Receive()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		switch frame.Type {
+		case vm.WorkerFrameStart:
+			var req client.CreateInstanceRequest
+			if err := frame.DecodePayload(&req); err != nil {
+				_ = sendWorkerError(codec, frame.ID, err)
+				continue
+			}
+			state, err := srvState.vms.StartStream(context.Background(), req, func(event client.BootEvent) error {
+				return sendWorkerPayload(codec, frame.ID, vm.WorkerFrameEvent, event)
+			})
+			if err != nil {
+				_ = sendWorkerError(codec, frame.ID, err)
+				continue
+			}
+			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStartResponse{State: state})
+		case vm.WorkerFrameStartBlank:
+			var req client.StartInstanceRequest
+			if err := frame.DecodePayload(&req); err != nil {
+				_ = sendWorkerError(codec, frame.ID, err)
+				continue
+			}
+			state, err := srvState.vms.StartBlankStream(context.Background(), req, func(event client.BootEvent) error {
+				return sendWorkerPayload(codec, frame.ID, vm.WorkerFrameEvent, event)
+			})
+			if err != nil {
+				_ = sendWorkerError(codec, frame.ID, err)
+				continue
+			}
+			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStartResponse{State: state})
+		case vm.WorkerFrameStatus:
+			var req vm.WorkerStatusRequest
+			_ = frame.DecodePayload(&req)
+			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStatusResponse{State: srvState.vms.StatusOf(req.ID)})
+		case vm.WorkerFrameStop:
+			var req vm.WorkerStopRequest
+			_ = frame.DecodePayload(&req)
+			if err := srvState.vms.ShutdownInstance(context.Background(), req.ID); err != nil {
+				_ = sendWorkerError(codec, frame.ID, err)
+				continue
+			}
+			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerStatusResponse{State: srvState.vms.StatusOf(req.ID)})
+		case vm.WorkerFrameWait:
+			var req vm.WorkerWaitRequest
+			_ = frame.DecodePayload(&req)
+			go serveWorkerWait(codec, srvState, frame.ID, req.ID)
+		case vm.WorkerFrameFlush:
+			var req vm.WorkerFlushRequest
+			_ = frame.DecodePayload(&req)
+			if err := srvState.vms.FlushInstance(context.Background(), req.ID); err != nil {
+				_ = sendWorkerError(codec, frame.ID, err)
+				continue
+			}
+			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, map[string]string{"status": "flushed"})
+		case vm.WorkerFrameConsole:
+			var req vm.WorkerConsoleRequest
+			_ = frame.DecodePayload(&req)
+			history, err := srvState.vms.ConsoleHistory(context.Background(), req.ID)
+			if err != nil {
+				_ = sendWorkerError(codec, frame.ID, err)
+				continue
+			}
+			_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, vm.WorkerConsoleResponse{History: history})
+		case vm.WorkerFrameExec:
+			if err := serveWorkerExec(codec, srvState, frame, &activeMu, activeExecs); err != nil {
+				_ = sendWorkerError(codec, frame.ID, err)
+			}
+		case vm.WorkerFrameExecInput:
+			var req vm.WorkerExecInput
+			if err := frame.DecodePayload(&req); err != nil {
+				_ = sendWorkerError(codec, frame.ID, err)
+				continue
+			}
+			activeMu.Lock()
+			exec := activeExecs[frame.ID]
+			activeMu.Unlock()
+			if exec == nil || exec.inputs == nil {
+				continue
+			}
+			if req.Closed {
+				exec.closeInputs()
+				continue
+			}
+			if !exec.sendInput(req.Input) {
+				_ = sendWorkerError(codec, frame.ID, fmt.Errorf("worker exec input queue is full"))
+			}
+		case vm.WorkerFrameCancel:
+			activeMu.Lock()
+			exec := activeExecs[frame.ID]
+			activeMu.Unlock()
+			if exec != nil {
+				exec.cancel()
+				exec.closeInputs()
+			}
+		default:
+			_ = sendWorkerError(codec, frame.ID, fmt.Errorf("unsupported worker frame %q", frame.Type))
+		}
+	}
+}
+
+func serveWorkerWait(codec *vm.WorkerCodec, srvState *server, frameID uint64, id string) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		state := srvState.vms.StatusOf(id)
+		if state.Status != "running" && state.Status != "starting" {
+			_ = sendWorkerPayload(codec, frameID, vm.WorkerFrameDone, vm.WorkerStatusResponse{State: state})
+			return
+		}
+		<-ticker.C
+	}
+}
+
+func serveWorkerExec(codec *vm.WorkerCodec, srvState *server, frame vm.WorkerFrame, activeMu *sync.Mutex, activeExecs map[uint64]*workerActiveExec) error {
+	var req vm.WorkerExecRequest
+	if err := frame.DecodePayload(&req); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	exec := &workerActiveExec{cancel: cancel}
+	if req.InputStream {
+		exec.inputs = make(chan client.ExecInput, 16)
+	}
+	activeMu.Lock()
+	activeExecs[frame.ID] = exec
+	activeMu.Unlock()
+
+	go func() {
+		defer cancel()
+		defer exec.closeInputs()
+		defer func() {
+			activeMu.Lock()
+			delete(activeExecs, frame.ID)
+			activeMu.Unlock()
+		}()
+
+		err := srvState.vms.StreamIn(ctx, req.ID, req.Request, exec.inputs, func(event client.ExecEvent) error {
+			return sendWorkerPayload(codec, frame.ID, vm.WorkerFrameEvent, event)
+		})
+		if err != nil {
+			_ = sendWorkerError(codec, frame.ID, err)
+			return
+		}
+		_ = sendWorkerPayload(codec, frame.ID, vm.WorkerFrameDone, map[string]string{"status": "done"})
+	}()
+	return nil
+}
+
+func sendWorkerPayload(codec *vm.WorkerCodec, id uint64, frameType string, payload any) error {
+	frame, err := vm.NewWorkerFrame(id, vm.WorkerServiceControl, frameType, payload)
+	if err != nil {
+		return err
+	}
+	return codec.Send(frame)
+}
+
+func sendWorkerError(codec *vm.WorkerCodec, id uint64, err error) error {
+	return sendWorkerPayload(codec, id, vm.WorkerFrameError, vm.WorkerError{Error: err.Error()})
 }
 
 func newServerShutdown(srvState *server, httpServer *http.Server) func() {
@@ -790,6 +1065,14 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 	mux.HandleFunc("GET /vm", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, srvState.vms.Statuses())
 	})
+	mux.HandleFunc("POST /vm/{id}/flush", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimSpace(r.PathValue("id"))
+		if err := srvState.vms.FlushInstance(r.Context(), id); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "flushed"})
+	})
 	mux.HandleFunc("POST /vm/{id}/save", func(w http.ResponseWriter, r *http.Request) {
 		var req client.SaveImageRequest
 		if err := decodeRequiredJSON(r, &req); err != nil {
@@ -1071,6 +1354,15 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			return
 		}
 		writeJSON(w, http.StatusOK, srvState.vms.StatusOf(id))
+	})
+	mux.HandleFunc("GET /vm/console", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimSpace(r.URL.Query().Get("id"))
+		history, err := srvState.vms.ConsoleHistory(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, client.ConsoleHistoryResponse{History: history})
 	})
 	mux.HandleFunc("POST /vm/forward", func(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimSpace(r.URL.Query().Get("id"))

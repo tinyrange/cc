@@ -22,10 +22,16 @@ const (
 const (
 	WorkerFrameHello        = "hello"
 	WorkerFrameStart        = "start"
+	WorkerFrameStartBlank   = "start_blank"
 	WorkerFrameStop         = "stop"
 	WorkerFrameWait         = "wait"
 	WorkerFrameStatus       = "status"
 	WorkerFrameExec         = "exec"
+	WorkerFrameExecInput    = "exec_input"
+	WorkerFrameCancel       = "cancel"
+	WorkerFrameFlush        = "flush"
+	WorkerFrameConsole      = "console"
+	WorkerFrameDone         = "done"
 	WorkerFrameEvent        = "event"
 	WorkerFramePacket       = "packet"
 	WorkerFrameFilesystemOp = "fsop"
@@ -48,6 +54,57 @@ type WorkerStartRequest struct {
 	AuthToken         string                        `json:"auth_token"`
 	Create            *client.CreateInstanceRequest `json:"create,omitempty"`
 	Blank             *client.StartInstanceRequest  `json:"blank,omitempty"`
+}
+
+type WorkerStartResponse struct {
+	State client.InstanceState `json:"state"`
+}
+
+type WorkerStatusRequest struct {
+	ID string `json:"id,omitempty"`
+}
+
+type WorkerStatusResponse struct {
+	State client.InstanceState `json:"state"`
+}
+
+type WorkerStopRequest struct {
+	ID string `json:"id,omitempty"`
+}
+
+type WorkerWaitRequest struct {
+	ID string `json:"id,omitempty"`
+}
+
+type WorkerFlushRequest struct {
+	ID string `json:"id,omitempty"`
+}
+
+type WorkerConsoleRequest struct {
+	ID string `json:"id,omitempty"`
+}
+
+type WorkerConsoleResponse struct {
+	History string `json:"history"`
+}
+
+type WorkerExecRequest struct {
+	ID          string             `json:"id,omitempty"`
+	Request     client.ExecRequest `json:"request"`
+	InputStream bool               `json:"input_stream,omitempty"`
+}
+
+type WorkerExecInput struct {
+	Input  client.ExecInput `json:"input,omitempty"`
+	Closed bool             `json:"closed,omitempty"`
+}
+
+type WorkerCancelRequest struct {
+	ID string `json:"id,omitempty"`
+}
+
+type WorkerError struct {
+	Error string `json:"error"`
 }
 
 func (r WorkerStartRequest) Validate() error {

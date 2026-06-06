@@ -18,29 +18,34 @@ The target architecture is:
 - coordinator-owned image, filesystem, and network services
 - worker-owned hypervisor state and virtio frontends
 
-## Transitional Prototype Status
+## Current Implementation Status
 
-The current sidecar path proves only the process-placement part on
+The current sidecar path implements the local multi-process placement model on
 `darwin/arm64`:
 
 - the coordinator uses the in-process HVF backend for the first VM
 - additional VMs are placed in local `ccvmd -worker` sidecar processes
 - sidecars are launched from the same `ccvm` executable, including embedded
   `vsh --vsh-internal-ccvm` mode
-- named VM start, status, shutdown, port forward, and exec routing work through
-  the existing daemon API
+- named VM start, status, shutdown, flush, port forward, and exec routing work
+  through the coordinator API
+- coordinator-to-worker lifecycle, status, flush, exec, exec input, and exec
+  cancellation use the Unix worker control socket
+- sidecar rootfs, image mounts, host shares, save snapshots, boot metadata, and
+  network packet switching are coordinator-owned
 
-Verified locally on macOS arm64 by starting two named Alpine VMs at the same
-time and running `uname -m` in both.
+Verified locally on macOS arm64 by:
 
-This is not the completed architecture. The current worker daemon still opens
-the shared on-disk image store directly and owns its own virtio-fs and virtio-net
-backends. That violates the intended ownership boundary below. The next required
-implementation step is moving virtio-fs and virtio-net backends behind
-coordinator-owned IPC services so save/snapshot and L2 networking are
-coordinator-owned across sidecars.
+- starting two sidecar-backed Alpine VMs at the same time, then running
+  commands in a sidecar VM
+- cancelling a long-running sidecar exec and successfully running another
+  command on the same VM
+- saving a sidecar-backed VM through the coordinator-owned rootfs backend,
+  booting the saved image, and reading the saved marker file
+- starting two networked sidecar-backed VMs and pinging one sidecar VM from the
+  other over the coordinator L2 switch
 
-The first concrete piece of that ownership boundary is now present:
+The concrete pieces of the ownership boundary now present are:
 
 - `internal/virtio` has an `FSBackend` RPC proxy/server
 - a worker can construct `virtio.NewFS(..., NewFSRemoteBackend(conn))`
@@ -48,12 +53,50 @@ The first concrete piece of that ownership boundary is now present:
 - tests cover lookup/read and create/write/flush crossing the RPC boundary
 - `internal/virtio` also has a length-prefixed virtio-net packet codec and
   remote backend so worker TX frames and coordinator RX frames can cross IPC
+- macOS sidecar startup wires rootfs virtio-fs through a coordinator-owned Unix
+  socket backend
+- sidecar-backed `@save` flushes the guest through the owning worker, then
+  snapshots and publishes through coordinator-owned rootfs state
+- macOS sidecar startup wires virtio-net through a coordinator-owned Unix socket
+  packet backend
+- the coordinator assigns sidecar IP/MAC leases, reports sidecar IPv4 status,
+  forwards sidecar L2 frames, and owns sidecar port forwards
+- sidecar exec and cross-image exec resolve commands and add image mounts in
+  the coordinator before the request crosses into the worker
+- sidecar startup gets a coordinator-prepared boot bundle containing kernel,
+  init, module plan, emulator path, and image config metadata
+- sidecar host startup removes stale local worker socket files
+- local worker control uses a Unix socket rather than the worker's HTTP daemon
+  API for start, start-blank, status, stop, flush, exec, exec input, and cancel
+- networked Darwin/HVF starts are placed on sidecar workers so they use the
+  coordinator-owned L2 switch; the in-process Darwin host remains available for
+  non-networked first-VM placement
 
-These primitives are not yet wired into sidecar startup.
+The local macOS multi-VM architecture described in this plan is implemented.
+Local sidecar placement is also available as an opt-in on other platforms:
+
+- set `CCX3_ENABLE_SIDECARS=1` to add local sidecar workers to Linux and
+  Windows placement
+- in-process placement remains the default while capacity is available
+- worker mode and `CCX3_DISABLE_SIDECARS=1` force the manager back to the
+  in-process backend
+- Linux/macOS local workers use Unix sockets for control; Windows local workers
+  use a loopback TCP control endpoint
+- non-Darwin sidecars do not advertise coordinator-owned FS or L2 until those
+  platform resource services are implemented
+
+The remaining work is future expansion beyond local sidecar placement:
+
+- add authenticated network transports for remote or nested VM hosts
+- implement coordinator-owned FS/L2 sidecar resource services on Linux and
+  Windows if those platforms need sidecars to participate in save/L2 semantics
+- add an interactive live console stream if retained console history is not
+  enough for debugging worker failures
 
 Linux/KVM and Windows/WHP should continue to run multiple VMs in-process when
 that is the best local placement. macOS/HVF should use one in-process VM if
-available, then launch sidecar workers for additional VMs.
+available for non-networked starts, use sidecar workers for networked starts,
+then launch sidecar workers for additional VMs.
 
 ## Current Shape
 
@@ -205,17 +248,22 @@ type VMHostCapabilities struct {
 Initial placement policy:
 
 1. Prefer in-process host while it has capacity.
-2. If capacity is full and the platform supports sidecars, launch a local
+2. If a request requires coordinator L2, choose a host that advertises
+   `SupportsL2`.
+3. If capacity is full and the platform supports sidecars, launch a local
    worker host.
-3. Later, consider remote hosts or nested hosts.
+4. Later, consider remote hosts or nested hosts.
 
 Expected capacities:
 
 - Linux/KVM: in-process capacity remains high; sidecars are optional.
 - Windows/WHP: in-process capacity remains high if stable; sidecars are
   optional.
-- macOS/HVF: in-process capacity is one; sidecars are required for additional
-  VMs.
+- macOS/HVF: in-process capacity is one for non-networked starts; sidecars are
+  required for networked starts and additional VMs.
+
+Non-Darwin sidecars are opt-in with `CCX3_ENABLE_SIDECARS=1`; default placement
+remains in-process.
 
 `client.CapabilitiesResponse.MaxInstances` should become the coordinator's
 placement capacity, not the capacity of a single in-process backend. It should
@@ -229,20 +277,37 @@ Do not use stdio as the main transport. We need bidirectional control streams,
 exec streams, filesystem RPC, network packet streams, and boot events. Stdio
 would turn into a fragile custom multiplexer.
 
-First worker socket services:
+Implemented worker socket services:
 
-- `Start` or one-shot worker startup handshake
+- worker startup handshake
+- `Start`
+- `StartBlank`
 - `Stop`
 - `Wait`
 - `Status`
+- `Flush`
 - `ExecStream`
-- `ConsoleStream`
-- `VirtioFSChannel`
-- `VirtioNetChannel`
+- exec input forwarding
+- exec cancellation
+- `ConsoleHistory`, a retained serial-console snapshot for debugging sidecar
+  workers without claiming an interactive live console stream
+
+Implemented dedicated service channels:
+
+- `VirtioFSChannel` uses a coordinator-owned Unix socket carrying the
+  `virtio.FSBackend` RPC protocol
+- `VirtioNetChannel` uses a coordinator-owned Unix socket carrying
+  length-prefixed virtio-net packet messages
 
 The protocol should be transport-neutral at the interface level. Unix sockets
 are the first transport. TCP/QUIC with authentication can be added later for
 remote VM hosts.
+
+Current local transports:
+
+- Unix sockets on Linux and macOS
+- loopback TCP on Windows, because Windows does not provide the same Unix socket
+  behavior as Linux/macOS for this use case
 
 Local worker startup should include:
 
@@ -253,9 +318,8 @@ Local worker startup should include:
 - auth token
 - host backend request
 
-Workers should exit when their VM exits or when the coordinator closes the
-control channel. Coordinator startup should clean stale worker sockets and
-state files.
+Workers exit when their VM exits or when the coordinator closes the control
+channel. Coordinator startup cleans stale local worker sockets.
 
 ## Filesystem RPC Notes
 
@@ -309,12 +373,20 @@ addresses.
 - Worker may initially own all devices locally to prove lifecycle and HVF
   multi-process startup.
 
+Status: implemented for local worker handshake, start/start-blank, status,
+stop, wait, flush, boot events, exec stream, exec input, exec cancellation,
+virtio-fs service sockets, and virtio-net service sockets. Console streaming
+remains planned protocol surface.
+
 ### Phase 3: Remote Virtio-FS
 
 - Move filesystem backend ownership to coordinator for sidecar workers.
 - Worker keeps virtio frontend and queue handling.
 - Coordinator handles rootfs/image/share backend operations.
 - Ensure `@save` snapshots through coordinator-owned state.
+
+Status: implemented for macOS sidecar workers, including coordinator-owned
+rootfs, image mounts, runtime host shares, and save snapshots.
 
 ### Phase 4: Remote Virtio-Net And L2 Switch
 
@@ -323,11 +395,19 @@ addresses.
 - Add coordinator-owned DHCP/IPAM.
 - Rehome port forwarding through coordinator network state.
 
+Status: implemented for macOS sidecar workers. Darwin placement routes
+networked starts to sidecar workers so they use this switch.
+
 ### Phase 5: General Sidecar Placement
 
 - Allow sidecars on Linux and Windows behind a capability flag.
 - Keep in-process placement as the default while capacity is available.
 - Add tests that start more VMs than one host slot can hold.
+
+Status: implemented for local sidecar placement. Non-Darwin sidecars are
+enabled by `CCX3_ENABLE_SIDECARS=1`, keep in-process placement first, and use
+the worker control transport appropriate for the host. Unit tests cover the
+opt-in manager construction and request-aware placement.
 
 ### Phase 6: Remote Hosts
 
@@ -341,27 +421,30 @@ addresses.
 
 Required early tests:
 
-- unit tests for placement capacity and fallback to sidecar hosts
-- worker handshake and stale socket cleanup
+- unit tests for placement capacity, request-aware L2 placement, and fallback
+  to sidecar hosts
+- worker handshake and stale socket cleanup tests
+- filesystem RPC tests covering lookup/read and create/write/flush over the RPC
+  boundary
+- virtio-net packet codec tests
 - macOS live test: start two HVF workers in separate processes
-- filesystem RPC golden tests using existing `virtio` request fixtures where
-  possible
-- L2 switch tests for unicast, broadcast, and VM removal
-- integration test: two VMs on macOS ping or TCP connect over coordinator L2
-- save test from a sidecar-backed VM
+- macOS live test: two sidecar VMs ping over coordinator L2
+- macOS live test: save a sidecar-backed VM and restore the saved marker
+- non-Darwin tests for opt-in sidecar manager construction and worker control
+  endpoint selection
 
 CI should keep the current platform split:
 
 - Linux/amd64 KVM live smoke
 - Windows/amd64 WHP live smoke when enabled
 - macOS/arm64 unit and compile checks
-- macOS live multi-HVF test where a runner is available
+- macOS/arm64 live sidecar L2 and save smoke
 
 ## Open Questions
 
 - Should the coordinator ever allow workers to cache immutable image reads
   locally, or should all filesystem data remain coordinator-served at first?
-- How much console history should the coordinator retain?
+- How much console history should the coordinator retain before truncating?
 - Should worker processes be long-lived host slots or one process per VM?
   macOS can start with one worker per VM.
 - Should sidecar workers be exposed in capabilities for debugging?

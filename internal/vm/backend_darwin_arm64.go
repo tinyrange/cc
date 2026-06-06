@@ -4,8 +4,12 @@ package vm
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -275,6 +279,24 @@ func (b *runtimeBackend) RunInInstanceStream(
 
 func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, memoryMB uint64, cpus int, nestedVirt bool, dmesg bool, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
 	start := time.Now()
+	if bundle, err := workerBootBundle(); err != nil {
+		return vmruntime.RunRequest{}, err
+	} else if bundle != nil {
+		return vmruntime.RunRequest{
+			Kernel:            append([]byte(nil), bundle.Kernel...),
+			Init:              append([]byte(nil), bundle.Init...),
+			AMD64EmulatorPath: bundle.AMD64EmulatorPath,
+			Modules:           append([]alpine.Module(nil), bundle.Modules...),
+			Image:             sidecarBundleImage(bundle),
+			MemoryMB:          memoryMB,
+			CPUs:              cpus,
+			NestedVirt:        nestedVirt,
+			Dmesg:             dmesg,
+			Network:           network.guestInitConfig(),
+			NetDevice:         networkDeviceDarwin(network),
+			UnixTime:          time.Now().Unix(),
+		}, ctx.Err()
+	}
 	if b.kernel == nil || b.images == nil {
 		return vmruntime.RunRequest{}, fmt.Errorf("runtime backend is not configured")
 	}
@@ -382,8 +404,16 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
+	if remoteRoot, err := workerRemoteRootFS(); err != nil {
+		return vmruntime.RunRequest{}, err
+	} else if remoteRoot != nil {
+		runReq.RootFS = remoteRoot
+		runReq.Shares = nil
+	}
 	shareStart := time.Now()
-	runReq.Shares = append(runReq.Shares, convertShareMounts(req.Shares)...)
+	if runReq.RootFS == nil {
+		runReq.Shares = append(runReq.Shares, convertShareMounts(req.Shares)...)
+	}
 	timing.Since(ctx, "backend.convert_share_mounts", shareStart)
 	runReq.Persistent = true
 	timing.Since(ctx, "backend.build_start_request", start)
@@ -391,6 +421,33 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 }
 
 func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.StartInstanceRequest, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
+	if bundle, err := workerBootBundle(); err != nil {
+		return vmruntime.RunRequest{}, err
+	} else if bundle != nil {
+		rootFS, err := workerRemoteRootFS()
+		if err != nil {
+			return vmruntime.RunRequest{}, err
+		}
+		if rootFS == nil {
+			rootFS = virtio.NewImageFS(blankRuntimeRootFS(), "")
+		}
+		return vmruntime.RunRequest{
+			Kernel:            append([]byte(nil), bundle.Kernel...),
+			Init:              append([]byte(nil), bundle.Init...),
+			AMD64EmulatorPath: bundle.AMD64EmulatorPath,
+			Modules:           append([]alpine.Module(nil), bundle.Modules...),
+			Image:             sidecarBundleImage(bundle),
+			RootFS:            rootFS,
+			MemoryMB:          req.MemoryMB,
+			CPUs:              req.CPUs,
+			NestedVirt:        req.NestedVirt,
+			Dmesg:             req.Dmesg,
+			Persistent:        true,
+			Network:           network.guestInitConfig(),
+			NetDevice:         networkDeviceDarwin(network),
+			UnixTime:          time.Now().Unix(),
+		}, ctx.Err()
+	}
 	if b.kernel == nil || b.images == nil {
 		return vmruntime.RunRequest{}, fmt.Errorf("runtime backend is not configured")
 	}
@@ -441,12 +498,19 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
+	rootFS, err := workerRemoteRootFS()
+	if err != nil {
+		return vmruntime.RunRequest{}, err
+	}
+	if rootFS == nil {
+		rootFS = virtio.NewImageFS(blankRuntimeRootFS(), "")
+	}
 	return vmruntime.RunRequest{
 		Kernel:            kernel,
 		Init:              initBin,
 		AMD64EmulatorPath: qemuX8664,
 		Modules:           modules,
-		RootFS:            virtio.NewImageFS(blankRuntimeRootFS(), ""),
+		RootFS:            rootFS,
 		MemoryMB:          req.MemoryMB,
 		CPUs:              req.CPUs,
 		NestedVirt:        req.NestedVirt,
@@ -456,6 +520,111 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		NetDevice:         networkDeviceDarwin(network),
 		UnixTime:          time.Now().Unix(),
 	}, ctx.Err()
+}
+
+func workerRemoteRootFS() (virtio.FSBackend, error) {
+	socketPath := strings.TrimSpace(os.Getenv(sidecarFSSocketEnv))
+	if socketPath == "" {
+		return nil, nil
+	}
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("dial coordinator fs backend: %w", err)
+	}
+	return virtio.NewFSRemoteBackend(conn), nil
+}
+
+func workerBootBundle() (*sidecarBootBundle, error) {
+	socketPath := strings.TrimSpace(os.Getenv(sidecarBootSocketEnv))
+	if socketPath == "" {
+		return nil, nil
+	}
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("dial coordinator boot bundle: %w", err)
+	}
+	defer conn.Close()
+	bundle, err := readSidecarBootBundle(conn)
+	if err != nil {
+		return nil, fmt.Errorf("decode coordinator boot bundle: %w", err)
+	}
+	return bundle, nil
+}
+
+func readSidecarBootBundle(r io.Reader) (*sidecarBootBundle, error) {
+	var metadata *sidecarBootBundleMetadata
+	var bundle sidecarBootBundle
+	var modules [][]byte
+	for {
+		typ, data, err := readSidecarBootTLV(r)
+		if err != nil {
+			return nil, err
+		}
+		switch typ {
+		case sidecarBootTLVEnd:
+			if metadata == nil {
+				return nil, fmt.Errorf("boot bundle metadata missing")
+			}
+			if len(modules) != len(metadata.ModuleNames) {
+				return nil, fmt.Errorf("boot bundle has %d module payloads for %d module names", len(modules), len(metadata.ModuleNames))
+			}
+			bundle.ImageName = metadata.ImageName
+			bundle.Architecture = metadata.Architecture
+			bundle.Config = metadata.Config
+			bundle.AMD64EmulatorPath = metadata.AMD64EmulatorPath
+			bundle.NeedsAMD64Emulator = metadata.NeedsAMD64Emulator
+			bundle.Modules = make([]alpine.Module, 0, len(modules))
+			for i, data := range modules {
+				bundle.Modules = append(bundle.Modules, alpine.Module{Name: metadata.ModuleNames[i], Data: data})
+			}
+			return &bundle, nil
+		case sidecarBootTLVMetadata:
+			var meta sidecarBootBundleMetadata
+			if err := json.Unmarshal(data, &meta); err != nil {
+				return nil, fmt.Errorf("decode boot bundle metadata: %w", err)
+			}
+			metadata = &meta
+		case sidecarBootTLVKernel:
+			bundle.Kernel = append(bundle.Kernel[:0], data...)
+		case sidecarBootTLVInit:
+			bundle.Init = append(bundle.Init[:0], data...)
+		case sidecarBootTLVModule:
+			modules = append(modules, data)
+		default:
+			return nil, fmt.Errorf("unknown boot bundle TLV type %d", typ)
+		}
+	}
+}
+
+func readSidecarBootTLV(r io.Reader) (uint16, []byte, error) {
+	var header [10]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return 0, nil, err
+	}
+	typ := binary.BigEndian.Uint16(header[:2])
+	size := binary.BigEndian.Uint64(header[2:])
+	if size > 512*1024*1024 {
+		return 0, nil, fmt.Errorf("boot bundle TLV type %d too large: %d bytes", typ, size)
+	}
+	if size == 0 {
+		return typ, nil, nil
+	}
+	data := make([]byte, int(size))
+	if _, err := io.ReadFull(r, data); err != nil {
+		return 0, nil, err
+	}
+	return typ, data, nil
+}
+
+func sidecarBundleImage(bundle *sidecarBootBundle) *oci.Image {
+	if bundle == nil || strings.TrimSpace(bundle.ImageName) == "" {
+		return nil
+	}
+	return &oci.Image{
+		Name:         bundle.ImageName,
+		Architecture: bundle.Architecture,
+		Config:       bundle.Config,
+	}
 }
 
 func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.RunRequest) (vmruntime.RunRequest, error) {
