@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/fsmeta"
 	"j5.nz/cc/internal/imagefs"
+	"j5.nz/cc/internal/linuxabi"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/virtio"
 )
@@ -910,7 +912,9 @@ func TestSidecarCommandResolverResolvesBeforeWorkerExec(t *testing.T) {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 	resolver := newSidecarCommandResolver(&oci.Image{
-		RootFS: imagefs.NewHostFS(root, nil),
+		RootFS: imagefs.NewHostFS(root, map[string]fsmeta.Entry{
+			"/opt/bin/tool": {Mode: linuxabi.SIFREG | 0o755},
+		}),
 		Config: oci.RuntimeConfig{
 			Env: []string{"PATH=/opt/bin"},
 		},
@@ -959,6 +963,8 @@ func TestCleanupStaleSidecarSocketsOnlyRemovesSocketFiles(t *testing.T) {
 }
 
 func TestSidecarInstanceAddShareIsIdempotent(t *testing.T) {
+	requireSidecarRuntimeShares(t)
+
 	root := t.TempDir()
 	rootFS, ok := virtio.NewMountedFS(virtio.NewPassthroughFS(root, nil), nil).(sidecarRootFS)
 	if !ok {
@@ -976,6 +982,8 @@ func TestSidecarInstanceAddShareIsIdempotent(t *testing.T) {
 }
 
 func TestSidecarInstanceAddShareRejectsConflictingMount(t *testing.T) {
+	requireSidecarRuntimeShares(t)
+
 	root := t.TempDir()
 	rootFS, ok := virtio.NewMountedFS(virtio.NewPassthroughFS(root, nil), nil).(sidecarRootFS)
 	if !ok {
@@ -994,6 +1002,13 @@ func TestSidecarInstanceAddShareRejectsConflictingMount(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), `share mount "/host" already exists`) {
 		t.Fatalf("AddShare() conflicting error = %q", err)
+	}
+}
+
+func requireSidecarRuntimeShares(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skip("sidecar runtime shares are only supported on darwin/arm64")
 	}
 }
 
