@@ -1137,9 +1137,13 @@ def _should_rebuild_ccvm(binary_path: Path, root: Path) -> bool:
 
 def _build_ccvm_binary(binary_path: Path, root: Path) -> None:
     binary_path.parent.mkdir(parents=True, exist_ok=True)
+    _build_guestinit_payloads(root)
+    env = os.environ.copy()
+    env["CGO_ENABLED"] = "0"
     proc = subprocess.run(
         ["go", "build", "-tags", "embed_guestinit", "-o", str(binary_path), "./cmd/ccvm"],
         cwd=root,
+        env=env,
         capture_output=True,
         text=True,
         check=False,
@@ -1150,6 +1154,28 @@ def _build_ccvm_binary(binary_path: Path, root: Path) -> None:
         detail = stderr or stdout or f"exit status {proc.returncode}"
         raise RuntimeError(f"failed to build bundled ccvm binary: {detail}")
     _sign_ccvm_binary_if_needed(binary_path, root)
+
+
+def _build_guestinit_payloads(root: Path) -> None:
+    build_dir = root / "build"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    for goarch in ("arm64", "amd64"):
+        out = build_dir / f"init-linux-{goarch}"
+        embed = root / "internal" / "guestinit" / f"guest-init-linux-{goarch}"
+        env = os.environ.copy()
+        env.update({"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": goarch})
+        proc = subprocess.run(
+            ["go", "build", "-o", str(out), "./internal/cmd/init"],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            detail = proc.stderr.strip() or proc.stdout.strip() or f"exit status {proc.returncode}"
+            raise RuntimeError(f"failed to build linux/{goarch} guest init payload: {detail}")
+        embed.write_bytes(out.read_bytes())
 
 
 def _sign_ccvm_binary_if_needed(binary_path: Path, root: Path) -> None:

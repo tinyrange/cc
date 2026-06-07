@@ -61,3 +61,19 @@ func TestBuildForArchRejectsUnsupportedArch(t *testing.T) {
 		t.Fatal("BuildForArch() error = nil, want unsupported architecture error")
 	}
 }
+
+func TestRequireEmbedded(t *testing.T) {
+	err := RequireEmbedded()
+	if len(embeddedPayload("arm64")) == 0 || len(embeddedPayload("amd64")) == 0 {
+		if err == nil {
+			t.Fatal("RequireEmbedded() error = nil, want missing embedded payload error")
+		}
+		if !strings.Contains(err.Error(), "build ccvm with -tags embed_guestinit") {
+			t.Fatalf("RequireEmbedded() error = %q, want build tag guidance", err)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("RequireEmbedded() error = %v", err)
+	}
+}

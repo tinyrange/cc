@@ -440,9 +440,24 @@ def ensure_ccvm(args: argparse.Namespace) -> Path | None:
     out = REPO_ROOT / ".tmp-fs-benchmark" / "bin" / ("ccvm.exe" if os.name == "nt" else "ccvm")
     out.parent.mkdir(parents=True, exist_ok=True)
     print(f"[fsbench] building ccvm -> {out}", file=sys.stderr)
-    subprocess.run(["go", "build", "-tags", "embed_guestinit", "-o", str(out), "./cmd/ccvm"], cwd=REPO_ROOT, check=True)
+    build_guestinit_payloads()
+    env = os.environ.copy()
+    env["CGO_ENABLED"] = "0"
+    subprocess.run(["go", "build", "-tags", "embed_guestinit", "-o", str(out), "./cmd/ccvm"], cwd=REPO_ROOT, env=env, check=True)
     os.environ["PYNEURODESK_CCVM"] = str(out)
     return out
+
+
+def build_guestinit_payloads() -> None:
+    build_dir = REPO_ROOT / "build"
+    build_dir.mkdir(parents=True, exist_ok=True)
+    for goarch in ("arm64", "amd64"):
+        out = build_dir / f"init-linux-{goarch}"
+        embed = REPO_ROOT / "internal" / "guestinit" / f"guest-init-linux-{goarch}"
+        env = os.environ.copy()
+        env.update({"CGO_ENABLED": "0", "GOOS": "linux", "GOARCH": goarch})
+        subprocess.run(["go", "build", "-o", str(out), "./internal/cmd/init"], cwd=REPO_ROOT, env=env, check=True)
+        embed.write_bytes(out.read_bytes())
 
 
 def benchmark_args(label: str, work_dir: str, args: argparse.Namespace) -> list[str]:
