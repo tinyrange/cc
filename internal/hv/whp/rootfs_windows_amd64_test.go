@@ -91,7 +91,7 @@ func TestGuestInitRunsCommandFromAlpineRootFS(t *testing.T) {
 	if !strings.Contains(serial, "WHOWHO:") || !strings.Contains(serial, "root") {
 		t.Fatalf("serial output missing whoami output\nserial:\n%s", serial)
 	}
-	if !strings.Contains(serial, "UNAMEUNAME:") || !strings.Contains(serial, "Linux (none) ") || !strings.Contains(serial, "x86_64 Linux") {
+	if !strings.Contains(serial, "UNAMEUNAME:") || !strings.Contains(serial, "Linux ccx3 ") || !strings.Contains(serial, "x86_64 Linux") {
 		t.Fatalf("serial output missing uname output\nserial:\n%s", serial)
 	}
 }

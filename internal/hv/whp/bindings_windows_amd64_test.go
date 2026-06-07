@@ -19,6 +19,7 @@ func TestBindingLayouts(t *testing.T) {
 		{"runVPExitContext", unsafe.Sizeof(runVPExitContext{}), 224},
 		{"memoryAccessContext", unsafe.Sizeof(memoryAccessContext{}), 40},
 		{"x64IOPortAccessContext", unsafe.Sizeof(x64IOPortAccessContext{}), 96},
+		{"interruptControl", unsafe.Sizeof(interruptControl{}), 16},
 		{"emulatorCallbacks", unsafe.Sizeof(emulatorCallbacks{}), 48},
 		{"emulatorMemoryAccessInfo", unsafe.Sizeof(emulatorMemoryAccessInfo{}), 24},
 		{"emulatorIOAccessInfo", unsafe.Sizeof(emulatorIOAccessInfo{}), 12},

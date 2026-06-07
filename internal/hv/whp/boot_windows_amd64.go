@@ -393,7 +393,10 @@ func (p *bootPlatform) WriteMMIO(addr uint64, data []byte) error {
 	if p.netdev != nil && p.netdev.Contains(addr, len(data)) {
 		return p.netdev.Write(addr, len(data), readUint64(data))
 	}
-	if p.ioapic.Write(addr, data) {
+	if handled, route, pending := p.ioapic.Write(addr, data); handled {
+		if pending {
+			p.injectIOAPIC(route)
+		}
 		return nil
 	}
 	if off, ok := hpetOffset(addr, len(data)); ok {
@@ -404,13 +407,29 @@ func (p *bootPlatform) WriteMMIO(addr uint64, data []byte) error {
 }
 
 func (p *bootPlatform) SetIRQ(irq uint32, level bool) error {
-	if !level {
-		return nil
-	}
 	if irq > 0xff {
 		return fmt.Errorf("irq line %d out of range", irq)
 	}
-	p.raiseIRQ(uint8(irq))
+	line := uint8(irq)
+	if level {
+		p.recordIRQAttempt(line)
+	}
+	if int(line) < ioapicRedirEntries {
+		ioapicEnabled := p.ioapic.enabled(line)
+		if route, pending := p.ioapic.assert(line, level); pending {
+			p.injectIOAPIC(route)
+			return nil
+		}
+		if !level || ioapicEnabled {
+			if level {
+				atomic.AddUint64(&p.irqSuppressed, 1)
+			}
+			return nil
+		}
+	}
+	if level {
+		p.injectPIC(line)
+	}
 	return nil
 }
 
@@ -428,10 +447,7 @@ func (p *bootPlatform) raiseTimerIRQ() {
 }
 
 func (p *bootPlatform) raiseIRQ(line uint8) {
-	atomic.AddUint64(&p.irqAttempts, 1)
-	if int(line) < len(p.irqLine) {
-		atomic.AddUint64(&p.irqLine[line], 1)
-	}
+	p.recordIRQAttempt(line)
 	if p.ioapic.enabled(line) {
 		vector := p.ioapic.vector(line)
 		if vector >= 0x10 {
@@ -456,6 +472,35 @@ func (p *bootPlatform) raiseIRQ(line uint8) {
 			return
 		}
 	}
+	p.injectPIC(line)
+}
+
+func (p *bootPlatform) recordIRQAttempt(line uint8) {
+	atomic.AddUint64(&p.irqAttempts, 1)
+	if int(line) < len(p.irqLine) {
+		atomic.AddUint64(&p.irqLine[line], 1)
+	}
+}
+
+func (p *bootPlatform) injectIOAPIC(route bootIOAPICRoute) {
+	if route.vector < 0x10 {
+		atomic.AddUint64(&p.irqSuppressed, 1)
+		p.ioapic.cancel(route)
+		return
+	}
+	trigger := interruptTriggerEdge
+	if route.level {
+		trigger = interruptTriggerLevel
+	}
+	if err := p.vm.RequestInterruptWithTrigger(uint32(route.vector), trigger); err != nil {
+		atomic.AddUint64(&p.irqFailed, 1)
+		p.ioapic.cancel(route)
+		return
+	}
+	atomic.AddUint64(&p.irqDelivered, 1)
+}
+
+func (p *bootPlatform) injectPIC(line uint8) {
 	if vector, ok := p.pic.Acknowledge(line); ok {
 		if err := p.vm.RequestInterrupt(uint32(vector)); err != nil {
 			atomic.AddUint64(&p.irqFailed, 1)
@@ -466,7 +511,10 @@ func (p *bootPlatform) raiseIRQ(line uint8) {
 }
 
 func (p *bootPlatform) HandleEOI(vector uint32) {
-	p.ioapic.endInterrupt(uint8(vector))
+	if route, pending := p.ioapic.handleEOI(vector); pending {
+		atomic.AddUint64(&p.irqAttempts, 1)
+		p.injectIOAPIC(route)
+	}
 }
 
 func (p *bootPlatform) Summary() string {

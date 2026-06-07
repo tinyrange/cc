@@ -331,6 +331,13 @@ type bootIOAPIC struct {
 	redir    [ioapicRedirEntries]uint64
 	version  uint32
 	inFlight [256]bool
+	lineHigh [ioapicRedirEntries]bool
+}
+
+type bootIOAPICRoute struct {
+	line   uint8
+	vector uint8
+	level  bool
 }
 
 func (a *bootIOAPIC) init() {
@@ -359,21 +366,23 @@ func (a *bootIOAPIC) Read(addr uint64, data []byte) bool {
 	return true
 }
 
-func (a *bootIOAPIC) Write(addr uint64, data []byte) bool {
+func (a *bootIOAPIC) Write(addr uint64, data []byte) (bool, bootIOAPICRoute, bool) {
 	if len(data) != 4 || addr < ioapicBaseAddress || addr+uint64(len(data)) > ioapicBaseAddress+ioapicMMIOSize {
-		return false
+		return false, bootIOAPICRoute{}, false
 	}
 	value := binary.LittleEndian.Uint32(data)
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	var route bootIOAPICRoute
+	var pending bool
 	switch addr - ioapicBaseAddress {
 	case 0x00:
 		a.index = value & 0xff
 	case 0x10:
-		a.writeRegister(a.index, value)
+		route, pending = a.writeRegister(a.index, value)
 	default:
 	}
-	return true
+	return true, route, pending
 }
 
 func (a *bootIOAPIC) enabled(line uint8) bool {
@@ -419,6 +428,50 @@ func (a *bootIOAPIC) endInterrupt(vector uint8) {
 	a.mu.Unlock()
 }
 
+func (a *bootIOAPIC) assert(line uint8, high bool) (bootIOAPICRoute, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if int(line) >= len(a.redir) {
+		return bootIOAPICRoute{}, false
+	}
+	asserted := high
+	if a.redir[line]&(1<<13) != 0 {
+		asserted = !high
+	}
+	if asserted {
+		edge := !a.lineHigh[line]
+		a.lineHigh[line] = true
+		return a.evaluateLocked(line, edge)
+	}
+	a.lineHigh[line] = false
+	if a.redir[line]&(1<<15) != 0 {
+		a.inFlight[uint8(a.redir[line])] = false
+	}
+	return bootIOAPICRoute{}, false
+}
+
+func (a *bootIOAPIC) handleEOI(vector uint32) (bootIOAPICRoute, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.inFlight[uint8(vector)] = false
+	for line := range a.redir {
+		if uint8(a.redir[line]) != uint8(vector) {
+			continue
+		}
+		if route, ok := a.evaluateLocked(uint8(line), false); ok {
+			return route, true
+		}
+	}
+	return bootIOAPICRoute{}, false
+}
+
+func (a *bootIOAPIC) cancel(route bootIOAPICRoute) {
+	if !route.level {
+		return
+	}
+	a.endInterrupt(route.vector)
+}
+
 func (a *bootIOAPIC) summaryForLines(lines []uint8) string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -440,7 +493,7 @@ func (a *bootIOAPIC) summaryForLines(lines []uint8) string {
 		if entry&(1<<15) != 0 {
 			trigger = "level"
 		}
-		fmt.Fprintf(&b, "%d:vec=%#x,mask=%t,trig=%s,irr=%t", line, uint8(entry), entry&(1<<16) != 0, trigger, a.inFlight[uint8(entry)])
+		fmt.Fprintf(&b, "%d:vec=%#x,mask=%t,trig=%s,level=%t,irr=%t", line, uint8(entry), entry&(1<<16) != 0, trigger, a.lineHigh[line], a.inFlight[uint8(entry)])
 	}
 	b.WriteByte(']')
 	return b.String()
@@ -463,14 +516,49 @@ func (a *bootIOAPIC) readRegister(index uint32) uint32 {
 	}
 }
 
-func (a *bootIOAPIC) writeRegister(index uint32, value uint32) {
+func (a *bootIOAPIC) writeRegister(index uint32, value uint32) (bootIOAPICRoute, bool) {
 	if index < 0x10 || index >= 0x10+uint32(len(a.redir))*2 {
-		return
+		return bootIOAPICRoute{}, false
 	}
-	entry := &a.redir[(index-0x10)/2]
+	entryIndex := (index - 0x10) / 2
+	entry := &a.redir[entryIndex]
+	wasMasked := *entry&(1<<16) != 0
 	if index&1 == 0 {
 		*entry = (*entry & 0xffffffff00000000) | uint64(value)
 	} else {
 		*entry = (*entry & 0x00000000ffffffff) | uint64(value)<<32
 	}
+	if wasMasked && *entry&(1<<16) == 0 && a.lineHigh[entryIndex] {
+		return a.evaluateLocked(uint8(entryIndex), true)
+	}
+	return bootIOAPICRoute{}, false
+}
+
+func (a *bootIOAPIC) evaluateLocked(line uint8, edge bool) (bootIOAPICRoute, bool) {
+	if int(line) >= len(a.redir) {
+		return bootIOAPICRoute{}, false
+	}
+	entry := a.redir[line]
+	if entry&(1<<16) != 0 {
+		return bootIOAPICRoute{}, false
+	}
+	vector := uint8(entry)
+	level := entry&(1<<15) != 0
+	if entry&(1<<13) != 0 && !level {
+		edge = !edge
+	}
+	switch {
+	case level && (!a.lineHigh[line] || a.inFlight[vector]):
+		return bootIOAPICRoute{}, false
+	case !level && !edge:
+		return bootIOAPICRoute{}, false
+	}
+	if level {
+		a.inFlight[vector] = true
+	}
+	return bootIOAPICRoute{
+		line:   line,
+		vector: vector,
+		level:  level,
+	}, true
 }
