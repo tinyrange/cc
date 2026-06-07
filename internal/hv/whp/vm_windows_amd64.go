@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
@@ -19,6 +21,7 @@ type VM struct {
 	emuCallbacks emulatorCallbacks
 	emuContext   *emulatorContext
 	emuErr       error
+	running      atomic.Bool
 }
 
 type Exit struct {
@@ -122,6 +125,7 @@ func (v *VM) Close() error {
 			first = err
 		}
 		v.part = 0
+		time.Sleep(3 * time.Second)
 	}
 	return first
 }
@@ -310,7 +314,9 @@ func (v *VM) runWithCancel(ctx context.Context, raw *runVPExitContext) (Exit, er
 		case <-done:
 		}
 	}()
+	v.running.Store(true)
 	exit, err := v.runWithContext(raw)
+	v.running.Store(false)
 	close(done)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -339,6 +345,52 @@ func (v *VM) RequestInterrupt(vector uint32) error {
 
 func (v *VM) RequestInterruptWithTrigger(vector uint32, trigger interruptTriggerMode) error {
 	return requestInterrupt(v.part, vector, trigger)
+}
+
+func (v *VM) NotifyInterruptWindow() error {
+	if v == nil || v.part == 0 {
+		return nil
+	}
+	const value = uint64(1 << 1)
+	names := []registerName{registerDeliverabilityNotifications}
+	values := []registerValue{uint64RegisterValue(value)}
+	return setVirtualProcessorRegisters(v.part, 0, names, values)
+}
+
+func (v *VM) SetPendingInterruption(vector uint8) error {
+	if v == nil || v.part == 0 {
+		return nil
+	}
+	const interruptionPending = uint64(1)
+	value := interruptionPending | uint64(vector)<<16
+	names := []registerName{registerPendingInterruption}
+	values := []registerValue{uint64RegisterValue(value)}
+	return setVirtualProcessorRegisters(v.part, 0, names, values)
+}
+
+func (v *VM) kickOutOfHLT() error {
+	if v == nil || v.part == 0 {
+		return nil
+	}
+	names := []registerName{registerInternalActivityState}
+	values := make([]registerValue, 1)
+	if err := getVirtualProcessorRegisters(v.part, 0, names, values); err != nil {
+		return err
+	}
+	const haltSuspend = uint64(1 << 1)
+	raw := values[0].uint64()
+	if raw&haltSuspend == 0 {
+		return nil
+	}
+	values[0] = uint64RegisterValue(raw &^ haltSuspend)
+	return setVirtualProcessorRegisters(v.part, 0, names, values)
+}
+
+func (v *VM) kickIfRunning() {
+	if v == nil || !v.running.Load() {
+		return
+	}
+	_ = cancelRunVirtualProcessor(v.part, 0)
 }
 
 func segmentAttributes(typ, s, dpl, present, avl, long, db, gran uint16) uint16 {

@@ -48,10 +48,11 @@ func TestGuestInitReadyMarkerOverVsock(t *testing.T) {
 	}
 	const readyMarker = "__CCX3_WHP_VSOCK_READY__"
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, vmruntime.GuestInitConfig{
-		Modules:     vmruntime.ModulePaths(modules),
-		VsockPort:   vmruntime.ControlPort,
-		ReadyMarker: readyMarker,
-		BeginMarker: vmruntime.CommandBeginMarker,
+		Modules:            vmruntime.ModulePaths(modules),
+		VsockPort:          vmruntime.ControlPort,
+		ReadyMarker:        readyMarker,
+		BeginMarker:        vmruntime.CommandBeginMarker,
+		DisableCgroupMount: true,
 	})
 	if err != nil {
 		t.Fatalf("BuildInitramfs() error = %v", err)

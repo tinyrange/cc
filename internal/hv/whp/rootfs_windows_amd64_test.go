@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"j5.nz/cc/internal/amd64vm"
 	"j5.nz/cc/internal/guestinit"
@@ -70,20 +71,21 @@ func TestGuestInitRunsCommandFromAlpineRootFS(t *testing.T) {
 	const commandMarker = "whp-virtiofs-command-ok"
 	const exitMarker = "__CCX3_WHP_VIRTIOFS_EXIT__:"
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, vmruntime.GuestInitConfig{
-		Command:          []string{"/bin/sh", "-c", "{ printf 'WHOWHO:'; whoami; printf 'UNAMEUNAME:'; uname -a; printf 'whp-virtiofs-%s\\n' command-ok; } > /dev/kmsg"},
-		Env:              vmruntime.WithDefaultEnv(nil),
-		Modules:          vmruntime.ModulePaths(modules),
-		RootFSTag:        vmruntime.RootFSTag,
-		BeginMarker:      vmruntime.CommandBeginMarker,
-		ExitMarkerPrefix: exitMarker,
+		Command:            []string{"/bin/sh", "-c", "{ printf 'WHOWHO:'; whoami; printf 'UNAMEUNAME:'; uname -a; printf 'whp-virtiofs-%s\\n' command-ok; } > /dev/kmsg"},
+		Env:                vmruntime.WithDefaultEnv(nil),
+		Modules:            vmruntime.ModulePaths(modules),
+		RootFSTag:          vmruntime.RootFSTag,
+		BeginMarker:        vmruntime.CommandBeginMarker,
+		ExitMarkerPrefix:   exitMarker,
+		DisableCgroupMount: true,
 	})
 	if err != nil {
 		t.Fatalf("BuildInitramfs() error = %v", err)
 	}
 
-	serial, err := BootInitramfsToMarkerWithFS(ctx, kernelFile, initrd, 256, true, commandMarker, fsdevs)
+	serial, err := BootInitramfsToMarkerWithFSAndSettle(ctx, kernelFile, initrd, 256, true, "System halted instead", fsdevs, time.Second)
 	if err != nil {
-		t.Fatalf("BootInitramfsToMarkerWithFS() error = %v\nserial:\n%s", err, serial)
+		t.Fatalf("BootInitramfsToMarkerWithFSAndSettle() error = %v\nserial:\n%s", err, serial)
 	}
 	if !strings.Contains(serial, commandMarker) {
 		t.Fatalf("serial output missing command output\nserial:\n%s", serial)

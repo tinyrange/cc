@@ -73,6 +73,18 @@ func TestPrepareBootPlacesZeroPage(t *testing.T) {
 	}
 }
 
+func TestBuildBootMADTLeavesVirtioLegacyGSIsEdgeTriggered(t *testing.T) {
+	overrides := madtInterruptOverrides(t, buildBootMADT(1))
+	if override, ok := overrides[0]; !ok || override.gsi != 2 {
+		t.Fatalf("IRQ0 override = %+v, ok=%t, want GSI 2", override, ok)
+	}
+	for _, irq := range []byte{5, 6, 7, 8, 9} {
+		if override, ok := overrides[irq]; ok {
+			t.Fatalf("unexpected override for IRQ %d: %+v", irq, override)
+		}
+	}
+}
+
 func TestPrepareBootAcceptsHighMemoryE820(t *testing.T) {
 	mem := make([]byte, 3<<20)
 	plan, err := PrepareBoot(mem, testBzImage(), BootOptions{
@@ -91,6 +103,39 @@ func TestPrepareBootAcceptsHighMemoryE820(t *testing.T) {
 	if plan.EntryGPA == 0 || plan.ZeroPageGPA == 0 || plan.StackTopGPA == 0 {
 		t.Fatalf("plan has zero fields: %+v", plan)
 	}
+}
+
+type madtInterruptOverride struct {
+	gsi   uint32
+	flags uint16
+}
+
+func madtInterruptOverrides(t *testing.T, body []byte) map[byte]madtInterruptOverride {
+	t.Helper()
+	const madtHeaderBodySize = 8
+	overrides := map[byte]madtInterruptOverride{}
+	for off := madtHeaderBodySize; off < len(body); {
+		if off+2 > len(body) {
+			t.Fatalf("truncated MADT entry header at offset %d", off)
+		}
+		entryType := body[off]
+		entryLen := int(body[off+1])
+		if entryLen < 2 || off+entryLen > len(body) {
+			t.Fatalf("invalid MADT entry length %d at offset %d", entryLen, off)
+		}
+		if entryType == 2 {
+			if entryLen != 10 {
+				t.Fatalf("interrupt override entry length = %d, want 10", entryLen)
+			}
+			irq := body[off+3]
+			overrides[irq] = madtInterruptOverride{
+				gsi:   binary.LittleEndian.Uint32(body[off+4 : off+8]),
+				flags: binary.LittleEndian.Uint16(body[off+8 : off+10]),
+			}
+		}
+		off += entryLen
+	}
+	return overrides
 }
 
 func testBzImage() []byte {

@@ -142,6 +142,10 @@ const (
 	registerCr3    registerName = 0x0000001e
 	registerCr4    registerName = 0x0000001f
 	registerEfer   registerName = 0x00002001
+
+	registerPendingInterruption         registerName = 0x80000000
+	registerDeliverabilityNotifications registerName = 0x80000004
+	registerInternalActivityState       registerName = 0x80000005
 )
 
 type uint128 struct {
@@ -180,6 +184,14 @@ type x64VPExecutionState struct {
 	AsUint16 uint16
 }
 
+func (s x64VPExecutionState) interruptionPending() bool {
+	return s.AsUint16&(1<<6) != 0
+}
+
+func (s x64VPExecutionState) interruptShadow() bool {
+	return s.AsUint16&(1<<12) != 0
+}
+
 type vpExitContext struct {
 	ExecutionState       x64VPExecutionState
 	InstructionLengthCr8 uint8
@@ -188,6 +200,10 @@ type vpExitContext struct {
 	Cs                   x64SegmentRegister
 	Rip                  uint64
 	Rflags               uint64
+}
+
+func (c vpExitContext) cr8() uint8 {
+	return c.InstructionLengthCr8 >> 4
 }
 
 type runVPExitReason uint32
@@ -442,16 +458,24 @@ func getVirtualProcessorRegisters(part partitionHandle, vpIndex uint32, names []
 	if len(values) < len(names) {
 		return fmt.Errorf("register values slice too small")
 	}
+	if len(names) == 0 {
+		return nil
+	}
+	aligned, backing := alignedRegisterValues(len(names))
 	err := callHRESULT(
 		procWHvGetVirtualProcessorRegisters,
 		uintptr(part),
 		uintptr(vpIndex),
 		uintptr(unsafe.Pointer(&names[0])),
 		uintptr(len(names)),
-		uintptr(unsafe.Pointer(&values[0])),
+		uintptr(unsafe.Pointer(&aligned[0])),
 	)
+	if err == nil {
+		copy(values, aligned)
+	}
 	runtime.KeepAlive(names)
 	runtime.KeepAlive(values)
+	runtime.KeepAlive(backing)
 	return err
 }
 
@@ -459,17 +483,35 @@ func setVirtualProcessorRegisters(part partitionHandle, vpIndex uint32, names []
 	if len(values) < len(names) {
 		return fmt.Errorf("register values slice too small")
 	}
+	if len(names) == 0 {
+		return nil
+	}
+	aligned, backing := alignedRegisterValues(len(names))
+	copy(aligned, values[:len(names)])
 	err := callHRESULT(
 		procWHvSetVirtualProcessorRegisters,
 		uintptr(part),
 		uintptr(vpIndex),
 		uintptr(unsafe.Pointer(&names[0])),
 		uintptr(len(names)),
-		uintptr(unsafe.Pointer(&values[0])),
+		uintptr(unsafe.Pointer(&aligned[0])),
 	)
 	runtime.KeepAlive(names)
 	runtime.KeepAlive(values)
+	runtime.KeepAlive(backing)
 	return err
+}
+
+func alignedRegisterValues(count int) ([]registerValue, []byte) {
+	const registerValueAlign = uintptr(16)
+	if count == 0 {
+		return nil, nil
+	}
+	size := unsafe.Sizeof(registerValue{})
+	backing := make([]byte, uintptr(count)*size+registerValueAlign-1)
+	addr := uintptr(unsafe.Pointer(&backing[0]))
+	aligned := (addr + registerValueAlign - 1) &^ (registerValueAlign - 1)
+	return unsafe.Slice((*registerValue)(unsafe.Pointer(aligned)), count), backing
 }
 
 func cancelRunVirtualProcessor(part partitionHandle, vpIndex uint32) error {

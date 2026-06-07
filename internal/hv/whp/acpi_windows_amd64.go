@@ -8,20 +8,33 @@ import (
 )
 
 const (
-	acpiRSDPAddress  = 0x000e0000
-	acpiTableAddress = 0x000f0000
+	whpACPIRSDPAddress  = 0x000e0000
+	whpACPITableAddress = 0x000f0000
+	whpZeroPageRSDPAddr = 112
 )
 
 func installBootACPI(memory []byte) error {
-	if len(memory) < acpiTableAddress+0x10000 {
+	if len(memory) < whpACPITableAddress+0x10000 {
 		return fmt.Errorf("guest memory too small for ACPI tables")
 	}
-	writer := acpiTableWriter{base: acpiTableAddress}
+	writer := acpiTableWriter{base: whpACPITableAddress}
 	madt := writer.append("APIC", 1, "CCWHPAPC", buildBootMADT())
 	hpet := writer.append("HPET", 1, "CCWHPHPT", buildBootHPET())
 	xsdt := writer.append("XSDT", 1, "CCWHPXSD", buildBootXSDT([]uint64{madt, hpet}))
-	copy(memory[acpiTableAddress:], writer.data)
-	copy(memory[acpiRSDPAddress:], buildBootRSDP(xsdt))
+	copy(memory[whpACPITableAddress:], writer.data)
+	copy(memory[whpACPIRSDPAddress:], buildBootRSDP(xsdt))
+	return nil
+}
+
+func installBootACPIForZeroPage(memory []byte, zeroPageGPA uint64) error {
+	if err := installBootACPI(memory); err != nil {
+		return err
+	}
+	rsdpOff := zeroPageGPA + whpZeroPageRSDPAddr
+	if rsdpOff+8 > uint64(len(memory)) {
+		return fmt.Errorf("zero page ACPI RSDP field %#x outside guest memory", rsdpOff)
+	}
+	binary.LittleEndian.PutUint64(memory[rsdpOff:], whpACPIRSDPAddress)
 	return nil
 }
 
@@ -76,6 +89,9 @@ func buildBootMADT() []byte {
 	body = binary.LittleEndian.AppendUint32(body, 0)
 
 	body = appendMADTInterruptOverride(body, 0, 2, 0)
+	for _, irq := range []byte{5, 6, 7, 8, 9} {
+		body = appendMADTInterruptOverride(body, irq, uint32(irq), 0x000d)
+	}
 	return body
 }
 

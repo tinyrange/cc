@@ -302,6 +302,10 @@ type FS struct {
 	fuseRequests     atomic.Uint64
 	interruptRaises  uint64
 	irqTransitions   uint64
+	closeOnce        sync.Once
+	closed           chan struct{}
+	workerWG         sync.WaitGroup
+	kickPollWG       sync.WaitGroup
 	workCh           chan fsWork
 	nextWorkSeq      []uint64
 	nextCompleteSeq  []uint64
@@ -447,6 +451,7 @@ func NewFS(base, size uint64, irq uint32, tag string, backend FSBackend) *FS {
 		workerCount:    resolveVirtioFSWorkerCount(),
 		entryTTL:       entryTTL,
 		attrTTL:        attrTTL,
+		closed:         make(chan struct{}),
 		workCh:         make(chan fsWork, 1024),
 		completions:    make(map[fsCompletionKey]fsCompletion),
 	}
@@ -460,6 +465,44 @@ func NewFS(base, size uint64, irq uint32, tag string, backend FSBackend) *FS {
 	copy(fs.tag[:], []byte(tag))
 	fs.resetLocked()
 	return fs
+}
+
+func (f *FS) Close() error {
+	if f == nil {
+		return nil
+	}
+	closedNow := false
+	f.closeOnce.Do(func() {
+		close(f.closed)
+		closedNow = true
+	})
+	if closedNow {
+		f.mu.Lock()
+		f.kickPoll = false
+		f.kickPollActive = false
+		f.configGeneration++
+		f.mu.Unlock()
+	}
+	f.workerWG.Wait()
+	f.kickPollWG.Wait()
+	for {
+		select {
+		case work := <-f.workCh:
+			putFSReqBuffer(work.req, work.pooledReq)
+		default:
+			f.mu.Lock()
+			irq := f.irq
+			f.irq = nil
+			f.mem = nil
+			f.interruptStatus = 0
+			f.irqHigh = false
+			f.mu.Unlock()
+			if irq != nil {
+				_ = irq.SetIRQ(f.IRQ, false)
+			}
+			return nil
+		}
+	}
 }
 
 func resolveVirtioFSKickPoll() bool {
@@ -980,7 +1023,11 @@ func (f *FS) enqueueWorks(works []fsWork) {
 	}
 	f.workerOnce.Do(f.startWorkers)
 	for _, work := range works {
-		f.workCh <- work
+		select {
+		case <-f.closed:
+			putFSReqBuffer(work.req, work.pooledReq)
+		case f.workCh <- work:
+		}
 	}
 }
 
@@ -990,12 +1037,24 @@ func (f *FS) startKickPollerLocked() {
 	}
 	f.kickPollActive = true
 	generation := f.configGeneration
+	f.kickPollWG.Add(1)
 	go f.runKickPoller(generation)
 }
 
 func (f *FS) runKickPoller(generation uint32) {
+	defer f.kickPollWG.Done()
 	idleUntil := time.Now().Add(f.kickPollIdle)
 	for {
+		select {
+		case <-f.closed:
+			f.mu.Lock()
+			if generation == f.configGeneration {
+				f.kickPollActive = false
+			}
+			f.mu.Unlock()
+			return
+		default:
+		}
 		var allWorks []fsWork
 		processed := 0
 		stop := false
@@ -1041,7 +1100,18 @@ func (f *FS) runKickPoller(generation uint32) {
 			return
 		}
 		if processed == 0 && f.kickPollSleep > 0 {
-			time.Sleep(f.kickPollSleep)
+			timer := time.NewTimer(f.kickPollSleep)
+			select {
+			case <-f.closed:
+				timer.Stop()
+				f.mu.Lock()
+				if generation == f.configGeneration {
+					f.kickPollActive = false
+				}
+				f.mu.Unlock()
+				return
+			case <-timer.C:
+			}
 		} else {
 			runtime.Gosched()
 		}
@@ -1074,12 +1144,20 @@ func (f *FS) startWorkers() {
 		count = 1
 	}
 	for i := 0; i < count; i++ {
+		f.workerWG.Add(1)
 		go f.runWorker()
 	}
 }
 
 func (f *FS) runWorker() {
-	for work := range f.workCh {
+	defer f.workerWG.Done()
+	for {
+		var work fsWork
+		select {
+		case <-f.closed:
+			return
+		case work = <-f.workCh:
+		}
 		reply, err := f.dispatchFUSE(work.req)
 		putFSReqBuffer(work.req, work.pooledReq)
 		work.req = nil
@@ -1088,6 +1166,11 @@ func (f *FS) runWorker() {
 			f.logf("async-fuse-error q=%d head=%d: %v", work.qidx, work.head, err)
 			reply = fuseReply(work.unique, -linuxEIO, nil)
 			err = nil
+		}
+		select {
+		case <-f.closed:
+			return
+		default:
 		}
 		if err := f.completeWork(work, reply, err); err != nil {
 			f.logf("async-complete-error q=%d head=%d: %v", work.qidx, work.head, err)
@@ -1099,6 +1182,11 @@ func (f *FS) completeWork(work fsWork, reply fsReply, workErr error) error {
 	defer f.recordStageTiming(fsStageAsyncComplete, time.Now())
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	select {
+	case <-f.closed:
+		return nil
+	default:
+	}
 	if work.generation != f.configGeneration || work.qidx < 0 || work.qidx >= len(f.queues) {
 		return nil
 	}

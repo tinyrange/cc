@@ -30,3 +30,23 @@ func TestBindingLayouts(t *testing.T) {
 		}
 	}
 }
+
+func TestAlignedRegisterValues(t *testing.T) {
+	values, backing := alignedRegisterValues(3)
+	if len(values) != 3 {
+		t.Fatalf("len(values) = %d, want 3", len(values))
+	}
+	if len(backing) == 0 {
+		t.Fatal("backing buffer is empty")
+	}
+	if addr := uintptr(unsafe.Pointer(&values[0])); addr%16 != 0 {
+		t.Fatalf("values address %#x is not 16-byte aligned", addr)
+	}
+	for i := 1; i < len(values); i++ {
+		prev := uintptr(unsafe.Pointer(&values[i-1]))
+		next := uintptr(unsafe.Pointer(&values[i]))
+		if next-prev != unsafe.Sizeof(registerValue{}) {
+			t.Fatalf("values[%d] stride = %d, want %d", i, next-prev, unsafe.Sizeof(registerValue{}))
+		}
+	}
+}

@@ -5,6 +5,7 @@ package whp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -104,7 +105,7 @@ func RunManagedExecWithFSAndNet(ctx context.Context, kernel []byte, initrd []byt
 	case <-runCtx.Done():
 		err := currentRunErr()
 		if err == nil {
-			err = runCtx.Err()
+			err = fmt.Errorf("%w (%s)", runCtx.Err(), platform.Summary())
 		}
 		return client.ExecResponse{Output: serialOut.String()}, serialOut.String(), withTranscripts(err)
 	}
@@ -114,6 +115,9 @@ func RunManagedExecWithFSAndNet(ctx context.Context, kernel []byte, initrd []byt
 	}); err != nil {
 		if runErr := currentRunErr(); runErr != nil {
 			return client.ExecResponse{Output: serialOut.String()}, serialOut.String(), withTranscripts(runErr)
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			err = fmt.Errorf("%w (%s)", err, platform.Summary())
 		}
 		return client.ExecResponse{Output: serialOut.String()}, serialOut.String(), withTranscripts(err)
 	}
@@ -130,6 +134,9 @@ func RunManagedExecWithFSAndNet(ctx context.Context, kernel []byte, initrd []byt
 	if err != nil {
 		if runErr := currentRunErr(); runErr != nil {
 			return client.ExecResponse{Output: serialOut.String()}, serialOut.String(), withTranscripts(runErr)
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			err = fmt.Errorf("%w (%s)", err, platform.Summary())
 		}
 		return client.ExecResponse{Output: serialOut.String()}, serialOut.String(), withTranscripts(err)
 	}
@@ -148,10 +155,6 @@ func prepareManagedVM(kernel []byte, initrd []byte, memoryMB uint64, dmesg bool,
 	vm, err := newBootVM(amd64vm.MemorySizeBytes(memoryMB))
 	if err != nil {
 		return nil, nil, nil, err
-	}
-	if err := installBootACPI(vm.Memory()); err != nil {
-		_ = vm.Close()
-		return nil, nil, nil, fmt.Errorf("install acpi: %w", err)
 	}
 
 	extraCmdline := []string{
@@ -177,6 +180,10 @@ func prepareManagedVM(kernel []byte, initrd []byte, memoryMB uint64, dmesg bool,
 	if err != nil {
 		_ = vm.Close()
 		return nil, nil, nil, fmt.Errorf("prepare boot: %w", err)
+	}
+	if err := installBootACPIForZeroPage(vm.Memory(), plan.ZeroPageGPA); err != nil {
+		_ = vm.Close()
+		return nil, nil, nil, fmt.Errorf("install acpi: %w", err)
 	}
 	if err := vm.SetLongMode(plan.EntryGPA, plan.ZeroPageGPA, plan.StackTopGPA, plan.PagingBase); err != nil {
 		_ = vm.Close()
@@ -213,16 +220,20 @@ func prepareManagedVM(kernel []byte, initrd []byte, memoryMB uint64, dmesg bool,
 func runManagedExecVM(ctx context.Context, vm *VM, platform *bootPlatform, serialOut *vmruntime.SerialTranscript) error {
 	for step := 0; ; step++ {
 		if err := ctx.Err(); err != nil {
-			return err
+			return fmt.Errorf("%w (%s)", err, platform.Summary())
+		}
+		if err := platform.armPendingIRQWindow(); err != nil {
+			return fmt.Errorf("arm pending irq window: %w", err)
 		}
 		var raw runVPExitContext
 		exit, err := vm.runWithCancel(ctx, &raw)
 		if err != nil {
 			if ctx.Err() != nil {
-				return ctx.Err()
+				return fmt.Errorf("%w (%s)", ctx.Err(), platform.Summary())
 			}
 			return fmt.Errorf("run step %d: %w", step, err)
 		}
+		platform.recordExit(exit, &raw)
 		switch exit.Reason {
 		case runVPExitReasonX64IoPortAccess:
 			if err := vm.emulateIO(&raw); err != nil {
@@ -235,13 +246,20 @@ func runManagedExecVM(ctx context.Context, vm *VM, platform *bootPlatform, seria
 				return fmt.Errorf("emulate mmio at rip=%#x gpa=%#x gva=%#x access=%d insn_len=%d insn=% x: %w", exit.RIP, uint64(mem.GPA), mem.GVA, mem.AccessInfo.accessType(), mem.InstructionByteCount, mem.InstructionBytes[:mem.InstructionByteCount], err)
 			}
 		case runVPExitReasonX64Halt:
-			return fmt.Errorf("guest halted before exec completed\nserial:\n%s\n%s", serialOut.String(), platform.Summary())
+			if !platform.hasPendingIRQ() {
+				return fmt.Errorf("guest halted before exec completed\nserial:\n%s\n%s", serialOut.String(), platform.Summary())
+			}
 		case runVPExitReasonX64ApicEoi:
 			platform.HandleEOI(raw.apicEoi().InterruptVector)
+		case runVPExitReasonX64InterruptWindow:
 		case runVPExitReasonCanceled:
-			continue
 		default:
 			return fmt.Errorf("unexpected exit %s at rip=%#x\nserial:\n%s\n%s", exit.Reason, exit.RIP, serialOut.String(), platform.Summary())
+		}
+		if flushed, err := platform.flushPendingIRQ(&raw); err != nil {
+			return fmt.Errorf("flush pending irq after %s at rip=%#x: %w", exit.Reason, exit.RIP, err)
+		} else if exit.Reason == runVPExitReasonX64Halt && !flushed {
+			return fmt.Errorf("guest halted with pending irq blocked\nserial:\n%s\n%s", serialOut.String(), platform.Summary())
 		}
 	}
 }

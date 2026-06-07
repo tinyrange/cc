@@ -73,7 +73,7 @@ func TestWindowsRuntimeBackendPortForwardToGuestWebServer(t *testing.T) {
 	defer inst.Close()
 
 	resp, err := inst.Exec(ctx, client.ExecRequest{
-		Command: []string{"sh", "-c", "while true; do printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 21\\r\\nConnection: close\\r\\n\\r\\nwindows-portforward-ok\\n' | nc -l -p 8080; done >/tmp/cc-port-forward.log 2>&1 & echo server-ready"},
+		Command: []string{"sh", "-c", "while true; do printf 'HTTP/1.1 200 OK\\r\\nContent-Length: 23\\r\\nConnection: close\\r\\n\\r\\nwindows-portforward-ok\\n' | nc -l -p 8080; done >/tmp/cc-port-forward.log 2>&1 & echo server-ready"},
 	})
 	if err != nil {
 		t.Fatalf("start guest web server error = %v\noutput:\n%s", err, resp.Output)

@@ -137,13 +137,15 @@ func (c *bootPICChip) writeData(value byte) {
 }
 
 type bootPIT struct {
-	mu       sync.Mutex
-	onIRQ0   func()
-	ticker   *time.Ticker
-	stop     chan struct{}
-	channels [3]bootPITChannel
-	selected uint8
-	port61   byte
+	mu         sync.Mutex
+	onIRQ0     func()
+	ticker     *time.Ticker
+	tickerStop chan struct{}
+	tickerWG   sync.WaitGroup
+	stop       chan struct{}
+	channels   [3]bootPITChannel
+	selected   uint8
+	port61     byte
 }
 
 func newBootPIT(onIRQ0 func()) *bootPIT {
@@ -166,16 +168,14 @@ type bootPITChannel struct {
 
 func (p *bootPIT) Close() {
 	p.mu.Lock()
-	if p.ticker != nil {
-		p.ticker.Stop()
-		p.ticker = nil
-	}
+	p.stopTickerLocked()
 	select {
 	case <-p.stop:
 	default:
 		close(p.stop)
 	}
 	p.mu.Unlock()
+	p.tickerWG.Wait()
 }
 
 func (p *bootPIT) Read(port uint16, data []byte) bool {
@@ -300,9 +300,7 @@ func (p *bootPIT) writePort61(value byte) {
 }
 
 func (p *bootPIT) armChannel0Locked() {
-	if p.ticker != nil {
-		p.ticker.Stop()
-	}
+	p.stopTickerLocked()
 	reload := p.channels[0].reload
 	if reload == 0 {
 		reload = 0xffff
@@ -313,16 +311,33 @@ func (p *bootPIT) armChannel0Locked() {
 	}
 	p.ticker = time.NewTicker(period)
 	ticker := p.ticker
+	tickerStop := make(chan struct{})
+	p.tickerStop = tickerStop
+	p.tickerWG.Add(1)
 	go func() {
+		defer p.tickerWG.Done()
 		for {
 			select {
 			case <-ticker.C:
 				p.onIRQ0()
+			case <-tickerStop:
+				return
 			case <-p.stop:
 				return
 			}
 		}
 	}()
+}
+
+func (p *bootPIT) stopTickerLocked() {
+	if p.ticker != nil {
+		p.ticker.Stop()
+		p.ticker = nil
+	}
+	if p.tickerStop != nil {
+		close(p.tickerStop)
+		p.tickerStop = nil
+	}
 }
 
 type bootIOAPIC struct {
@@ -465,6 +480,28 @@ func (a *bootIOAPIC) handleEOI(vector uint32) (bootIOAPICRoute, bool) {
 	return bootIOAPICRoute{}, false
 }
 
+func (a *bootIOAPIC) deviceHighRoute(line uint8) (bootIOAPICRoute, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if int(line) >= len(a.redir) || !a.lineHigh[line] {
+		return bootIOAPICRoute{}, false
+	}
+	entry := a.redir[line]
+	if entry&(1<<16) != 0 {
+		return bootIOAPICRoute{}, false
+	}
+	vector := uint8(entry)
+	if vector < 0x10 {
+		return bootIOAPICRoute{}, false
+	}
+	level := entry&(1<<15) != 0
+	return bootIOAPICRoute{
+		line:   line,
+		vector: vector,
+		level:  level,
+	}, true
+}
+
 func (a *bootIOAPIC) cancel(route bootIOAPICRoute) {
 	if !route.level {
 		return
@@ -552,9 +589,6 @@ func (a *bootIOAPIC) evaluateLocked(line uint8, edge bool) (bootIOAPICRoute, boo
 		return bootIOAPICRoute{}, false
 	case !level && !edge:
 		return bootIOAPICRoute{}, false
-	}
-	if level {
-		a.inFlight[vector] = true
 	}
 	return bootIOAPICRoute{
 		line:   line,

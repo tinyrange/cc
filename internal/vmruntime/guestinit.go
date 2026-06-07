@@ -10,25 +10,26 @@ import (
 )
 
 type GuestInitConfig struct {
-	Command          []string            `json:"command"`
-	Env              []string            `json:"env"`
-	WorkDir          string              `json:"workdir"`
-	User             string              `json:"user,omitempty"`
-	Hostname         string              `json:"hostname,omitempty"`
-	Modules          []string            `json:"modules,omitempty"`
-	EmulatorTag      string              `json:"emulator_tag,omitempty"`
-	RootFSTag        string              `json:"rootfs_tag,omitempty"`
-	Shares           []GuestInitShare    `json:"shares,omitempty"`
-	VsockPort        uint32              `json:"vsock_port,omitempty"`
-	ReadyMarker      string              `json:"ready_marker,omitempty"`
-	BeginMarker      string              `json:"begin_marker"`
-	OutputMarkerPref string              `json:"output_marker_prefix,omitempty"`
-	ErrorMarkerPref  string              `json:"error_marker_prefix,omitempty"`
-	UsageMarkerPref  string              `json:"usage_marker_prefix,omitempty"`
-	ExitMarkerPrefix string              `json:"exit_marker_prefix"`
-	PrecopyAMD64Root bool                `json:"precopy_amd64_root,omitempty"`
-	Network          *GuestNetworkConfig `json:"network,omitempty"`
-	UnixTime         int64               `json:"unix_time,omitempty"`
+	Command            []string            `json:"command"`
+	Env                []string            `json:"env"`
+	WorkDir            string              `json:"workdir"`
+	User               string              `json:"user,omitempty"`
+	Hostname           string              `json:"hostname,omitempty"`
+	Modules            []string            `json:"modules,omitempty"`
+	EmulatorTag        string              `json:"emulator_tag,omitempty"`
+	RootFSTag          string              `json:"rootfs_tag,omitempty"`
+	Shares             []GuestInitShare    `json:"shares,omitempty"`
+	VsockPort          uint32              `json:"vsock_port,omitempty"`
+	ReadyMarker        string              `json:"ready_marker,omitempty"`
+	BeginMarker        string              `json:"begin_marker"`
+	OutputMarkerPref   string              `json:"output_marker_prefix,omitempty"`
+	ErrorMarkerPref    string              `json:"error_marker_prefix,omitempty"`
+	UsageMarkerPref    string              `json:"usage_marker_prefix,omitempty"`
+	ExitMarkerPrefix   string              `json:"exit_marker_prefix"`
+	PrecopyAMD64Root   bool                `json:"precopy_amd64_root,omitempty"`
+	DisableCgroupMount bool                `json:"disable_cgroup_mount,omitempty"`
+	Network            *GuestNetworkConfig `json:"network,omitempty"`
+	UnixTime           int64               `json:"unix_time,omitempty"`
 }
 
 type GuestNetworkConfig struct {

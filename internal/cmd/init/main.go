@@ -36,25 +36,26 @@ var protocolMu sync.Mutex
 var setTimeOfDay = unix.Settimeofday
 
 type config struct {
-	Command          []string `json:"command"`
-	Env              []string `json:"env"`
-	WorkDir          string   `json:"workdir"`
-	User             string   `json:"user,omitempty"`
-	Hostname         string   `json:"hostname,omitempty"`
-	Modules          []string `json:"modules"`
-	EmulatorTag      string   `json:"emulator_tag,omitempty"`
-	RootFSTag        string   `json:"rootfs_tag"`
-	Shares           []share  `json:"shares,omitempty"`
-	VsockPort        uint32   `json:"vsock_port,omitempty"`
-	ReadyMarker      string   `json:"ready_marker"`
-	BeginMarker      string   `json:"begin_marker"`
-	OutputMarkerPref string   `json:"output_marker_prefix"`
-	ErrorMarkerPref  string   `json:"error_marker_prefix"`
-	UsageMarkerPref  string   `json:"usage_marker_prefix"`
-	ExitMarkerPrefix string   `json:"exit_marker_prefix"`
-	PrecopyAMD64Root bool     `json:"precopy_amd64_root,omitempty"`
-	Network          *network `json:"network,omitempty"`
-	UnixTime         int64    `json:"unix_time,omitempty"`
+	Command            []string `json:"command"`
+	Env                []string `json:"env"`
+	WorkDir            string   `json:"workdir"`
+	User               string   `json:"user,omitempty"`
+	Hostname           string   `json:"hostname,omitempty"`
+	Modules            []string `json:"modules"`
+	EmulatorTag        string   `json:"emulator_tag,omitempty"`
+	RootFSTag          string   `json:"rootfs_tag"`
+	Shares             []share  `json:"shares,omitempty"`
+	VsockPort          uint32   `json:"vsock_port,omitempty"`
+	ReadyMarker        string   `json:"ready_marker"`
+	BeginMarker        string   `json:"begin_marker"`
+	OutputMarkerPref   string   `json:"output_marker_prefix"`
+	ErrorMarkerPref    string   `json:"error_marker_prefix"`
+	UsageMarkerPref    string   `json:"usage_marker_prefix"`
+	ExitMarkerPrefix   string   `json:"exit_marker_prefix"`
+	PrecopyAMD64Root   bool     `json:"precopy_amd64_root,omitempty"`
+	DisableCgroupMount bool     `json:"disable_cgroup_mount,omitempty"`
+	Network            *network `json:"network,omitempty"`
+	UnixTime           int64    `json:"unix_time,omitempty"`
 }
 
 type network struct {
@@ -184,7 +185,7 @@ func run() error {
 			_ = syscall.Dup3(fd, target, 0)
 		}
 	}
-	if fd, err := syscall.Open("/dev/kmsg", syscall.O_WRONLY, 0); err == nil {
+	if fd, err := syscall.Open("/dev/kmsg", syscall.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
 		kmsgFD = fd
 	}
 
@@ -209,7 +210,9 @@ func run() error {
 
 	_ = syscall.Mount("proc", "/proc", "proc", 0, "")
 	_ = syscall.Mount("sysfs", "/sys", "sysfs", 0, "")
-	mountCgroupFS("/sys/fs/cgroup")
+	if !cfg.DisableCgroupMount {
+		mountCgroupFS("/sys/fs/cgroup")
+	}
 	configureMemoryOvercommit("/proc")
 
 	writeStage(bootStart, "loading modules")
@@ -219,7 +222,7 @@ func run() error {
 	writeStage(bootStart, "modules loaded")
 	if cfg.RootFSTag != "" {
 		writeStage(bootStart, "mounting rootfs")
-		if err := mountRootFS(cfg.RootFSTag, cfg.EmulatorTag); err != nil {
+		if err := mountRootFS(cfg.RootFSTag, cfg.EmulatorTag, cfg.DisableCgroupMount); err != nil {
 			return err
 		}
 		writeStage(bootStart, "rootfs mounted")
@@ -307,7 +310,7 @@ func configureClock(unixTime int64) error {
 	return nil
 }
 
-func mountRootFS(tag, emulatorTag string) error {
+func mountRootFS(tag, emulatorTag string, disableCgroup bool) error {
 	if err := os.MkdirAll("/mnt", 0o755); err != nil {
 		return fmt.Errorf("mkdir /mnt: %w", err)
 	}
@@ -328,7 +331,9 @@ func mountRootFS(tag, emulatorTag string) error {
 	}
 	_ = syscall.Mount("proc", "/proc", "proc", 0, "")
 	_ = syscall.Mount("sysfs", "/sys", "sysfs", 0, "")
-	mountCgroupFS("/sys/fs/cgroup")
+	if !disableCgroup {
+		mountCgroupFS("/sys/fs/cgroup")
+	}
 	configureMemoryOvercommit("/proc")
 	_ = syscall.Mount("devtmpfs", "/dev", "devtmpfs", 0, "")
 	_ = syscall.Mount("tmpfs", "/tmp", "tmpfs", 0, "mode=1777")

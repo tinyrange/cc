@@ -125,6 +125,60 @@ func TestVsockConnectGuestToHostAndExchangeData(t *testing.T) {
 	}
 }
 
+func TestVsockConnectIRQAfterTXAndRXUsedRingsAreVisible(t *testing.T) {
+	mem := &testGuestMemory{data: make([]byte, 0x10000)}
+	backend := NewSimpleVsockBackend()
+	listener, err := backend.Listen(1024)
+	if err != nil {
+		t.Fatalf("Listen() error = %v", err)
+	}
+	defer listener.Close()
+
+	irq := &vsockIRQProbe{
+		onSet: func(irq uint32, level bool) {
+			if !level {
+				return
+			}
+			txUsedIdx := binary.LittleEndian.Uint16(mem.data[0x2200+2 : 0x2200+4])
+			if txUsedIdx != 1 {
+				t.Fatalf("TX used index at IRQ raise = %d, want 1", txUsedIdx)
+			}
+			rxUsedIdx := binary.LittleEndian.Uint16(mem.data[0x3200+2 : 0x3200+4])
+			if rxUsedIdx != 1 {
+				t.Fatalf("RX used index at IRQ raise = %d, want 1", rxUsedIdx)
+			}
+		},
+	}
+
+	v := NewVsock(0x1000, 0x1000, 42, 3, backend)
+	defer v.Close()
+	v.Attach(mem, irq)
+
+	setupVsockQueue(t, v, vsockQueueTX, 8, 0x2000, 0x2100, 0x2200)
+	setupVsockQueue(t, v, vsockQueueRX, 8, 0x3000, 0x3100, 0x3200)
+
+	connect := encodeVsockHeader(vsockHeader{
+		SrcCID:   3,
+		DstCID:   VSockCIDHost,
+		SrcPort:  5555,
+		DstPort:  1024,
+		Type:     vsockTypeStream,
+		Op:       vsockOpRequest,
+		BufAlloc: vsockDefaultBufSize,
+	})
+	writeReadableDescriptor(mem, 0x2000, 0x2300, connect)
+	writeWritableDescriptor(mem, 0x3000, 0x3300, 4096)
+	setAvail(mem, 0x2100, 0, 0)
+	setAvail(mem, 0x3100, 0, 0)
+
+	if err := v.Write(0x1000+regQueueNotify, 4, vsockQueueTX); err != nil {
+		t.Fatalf("Write(queue_notify tx connect) error = %v", err)
+	}
+	if irq.calls == 0 {
+		t.Fatalf("connect response did not raise IRQ")
+	}
+}
+
 func setupVsockQueue(t *testing.T, v *Vsock, queueID uint64, size uint16, descAddr, availAddr, usedAddr uint64) {
 	t.Helper()
 	for _, write := range []struct {
@@ -142,6 +196,19 @@ func setupVsockQueue(t *testing.T, v *Vsock, queueID uint64, size uint16, descAd
 			t.Fatalf("setup queue %d reg=%#x error = %v", queueID, write.reg, err)
 		}
 	}
+}
+
+type vsockIRQProbe struct {
+	calls int
+	onSet func(irq uint32, level bool)
+}
+
+func (p *vsockIRQProbe) SetIRQ(irq uint32, level bool) error {
+	p.calls++
+	if p.onSet != nil {
+		p.onSet(irq, level)
+	}
+	return nil
 }
 
 func writeReadableDescriptor(mem *testGuestMemory, descAddr, dataAddr uint64, payload []byte) {

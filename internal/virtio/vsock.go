@@ -333,6 +333,9 @@ func (v *Vsock) processTXLocked() error {
 		}
 		q.lastAvailIdx++
 	}
+	if err := v.processRXLocked(); err != nil {
+		return err
+	}
 	v.interruptStatus |= vsockInterruptVring
 	return v.updateIRQLocked()
 }
@@ -573,7 +576,6 @@ func (v *Vsock) sendResponseLocked(hdr vsockHeader) {
 		Op:       vsockOpResponse,
 		BufAlloc: vsockDefaultBufSize,
 	}))
-	_ = v.processRXLocked()
 }
 
 func (v *Vsock) sendResetLocked(hdr vsockHeader) {
@@ -585,7 +587,6 @@ func (v *Vsock) sendResetLocked(hdr vsockHeader) {
 		Type:    vsockTypeStream,
 		Op:      vsockOpRST,
 	}))
-	_ = v.processRXLocked()
 }
 
 func (v *Vsock) sendCreditUpdateLocked(conn *vsockConnection) {
@@ -599,7 +600,6 @@ func (v *Vsock) sendCreditUpdateLocked(conn *vsockConnection) {
 		BufAlloc: vsockDefaultBufSize,
 		FwdCnt:   conn.rxCnt,
 	}))
-	_ = v.processRXLocked()
 }
 
 func (v *Vsock) sendDataLocked(conn *vsockConnection, data []byte) {
@@ -617,7 +617,6 @@ func (v *Vsock) sendDataLocked(conn *vsockConnection, data []byte) {
 	})
 	packet := append(hdr, data...)
 	v.queueRxPacketLocked(packet)
-	_ = v.processRXLocked()
 }
 
 func (v *Vsock) readChainLocked(q *queue, head uint16) ([]byte, error) {

@@ -110,7 +110,7 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 		if bootWriter != nil {
 			_ = bootWriter.Close()
 		}
-		return nil, transcriptError(ctx.Err(), serialOut.String(), controlTranscript.String())
+		return nil, transcriptError(fmt.Errorf("%w (%s)", ctx.Err(), platform.Summary()), serialOut.String(), controlTranscript.String())
 	}
 
 	if _, err := controlTranscript.WaitFor(ctx, 0, func(text string) bool {
@@ -122,6 +122,9 @@ func StartManagedSessionWithNet(ctx context.Context, kernel []byte, initrd []byt
 		vsock.Close()
 		if bootWriter != nil {
 			_ = bootWriter.Close()
+		}
+		if ctx.Err() != nil {
+			err = fmt.Errorf("%w (%s)", err, platform.Summary())
 		}
 		return nil, transcriptError(err, serialOut.String(), controlTranscript.String())
 	}

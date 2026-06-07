@@ -676,13 +676,14 @@ func (i *windowsInstance) NetworkIPv4() string {
 
 func windowsGuestInitConfig(modules []alpine.Module, managedExec bool) vmruntime.GuestInitConfig {
 	cfg := vmruntime.GuestInitConfig{
-		Modules:          vmruntime.ModulePaths(modules),
-		ReadyMarker:      windowsInitReadyMarker,
-		BeginMarker:      vmruntime.CommandBeginMarker,
-		OutputMarkerPref: vmruntime.CommandOutputMarker,
-		ErrorMarkerPref:  vmruntime.CommandErrorMarker,
-		UsageMarkerPref:  vmruntime.CommandUsageMarker,
-		ExitMarkerPrefix: vmruntime.CommandExitMarkerPref,
+		Modules:            vmruntime.ModulePaths(modules),
+		ReadyMarker:        windowsInitReadyMarker,
+		BeginMarker:        vmruntime.CommandBeginMarker,
+		OutputMarkerPref:   vmruntime.CommandOutputMarker,
+		ErrorMarkerPref:    vmruntime.CommandErrorMarker,
+		UsageMarkerPref:    vmruntime.CommandUsageMarker,
+		ExitMarkerPrefix:   vmruntime.CommandExitMarkerPref,
+		DisableCgroupMount: true,
 	}
 	if managedExec {
 		cfg.VsockPort = vmruntime.ControlPort

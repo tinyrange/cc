@@ -198,16 +198,17 @@ func prepareManagedAlpineRootFS(t *testing.T) ([]byte, []byte, []*virtio.FS) {
 		t.Fatalf("guestinit.BuildForArch() error = %v", err)
 	}
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, vmruntime.GuestInitConfig{
-		Env:              vmruntime.WithDefaultEnv(nil),
-		Modules:          vmruntime.ModulePaths(modules),
-		RootFSTag:        vmruntime.RootFSTag,
-		VsockPort:        vmruntime.ControlPort,
-		ReadyMarker:      vmruntime.InstanceReadyMarker,
-		BeginMarker:      vmruntime.CommandBeginMarker,
-		OutputMarkerPref: vmruntime.CommandOutputMarker,
-		ErrorMarkerPref:  vmruntime.CommandErrorMarker,
-		UsageMarkerPref:  vmruntime.CommandUsageMarker,
-		ExitMarkerPrefix: vmruntime.CommandExitMarkerPref,
+		Env:                vmruntime.WithDefaultEnv(nil),
+		Modules:            vmruntime.ModulePaths(modules),
+		RootFSTag:          vmruntime.RootFSTag,
+		VsockPort:          vmruntime.ControlPort,
+		ReadyMarker:        vmruntime.InstanceReadyMarker,
+		BeginMarker:        vmruntime.CommandBeginMarker,
+		OutputMarkerPref:   vmruntime.CommandOutputMarker,
+		ErrorMarkerPref:    vmruntime.CommandErrorMarker,
+		UsageMarkerPref:    vmruntime.CommandUsageMarker,
+		ExitMarkerPrefix:   vmruntime.CommandExitMarkerPref,
+		DisableCgroupMount: true,
 	})
 	if err != nil {
 		t.Fatalf("BuildInitramfs() error = %v", err)
