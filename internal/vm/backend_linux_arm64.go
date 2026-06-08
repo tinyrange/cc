@@ -432,6 +432,32 @@ func (b *runtimeBackend) RunInInstanceStream(ctx context.Context, inst Instance,
 	}, inputs, onEvent)
 }
 
+func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	targetImage := strings.TrimSpace(req.Image)
+	req.Image = ""
+	if targetImage == "" || targetImage == runningImage {
+		return inst.ExecStream(ctx, req, inputs, onEvent)
+	}
+	session, ok := inst.(*linuxInstance)
+	if !ok {
+		return fmt.Errorf("running instance does not support image mounts")
+	}
+	if b == nil || b.images == nil {
+		return fmt.Errorf("runtime backend is not configured")
+	}
+	image, err := b.images.Open(targetImage)
+	if err != nil {
+		return err
+	}
+	image = withLinuxRuntimeMountDirs(image)
+	mountPath := linuxImageMountPath(targetImage)
+	if err := session.AddImage(ctx, mountPath, image); err != nil {
+		return err
+	}
+	req.RootDir = rootDirWithinMount(mountPath, req.RootDir)
+	return inst.ExecStream(ctx, req, inputs, onEvent)
+}
+
 type linuxInstance struct {
 	session     *kvm.ManagedSession
 	image       *oci.Image
@@ -490,7 +516,22 @@ func (i *linuxInstance) Exec(ctx context.Context, req client.ExecRequest) (clien
 }
 
 func (i *linuxInstance) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
-	_ = inputs
+	if i == nil || i.session == nil {
+		return fmt.Errorf("instance is not running")
+	}
+	if req.Kind != "" && req.Kind != "exec" {
+		workDir := req.WorkDir
+		if workDir == "" {
+			workDir = i.workDir
+		}
+		return i.session.ExecStream(ctx, client.ExecRequest{
+			Kind:      req.Kind,
+			Path:      req.Path,
+			Directory: req.Directory,
+			WorkDir:   workDir,
+			User:      req.User,
+		}, inputs, onEvent)
+	}
 	resp, err := i.Exec(ctx, req)
 	if err != nil {
 		return err

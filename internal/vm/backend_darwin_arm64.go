@@ -277,6 +277,33 @@ func (b *runtimeBackend) RunInInstanceStream(
 	}, inputs, onEvent)
 }
 
+func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	targetImage := strings.TrimSpace(req.Image)
+	req.Image = ""
+	if targetImage == "" || targetImage == runningImage {
+		return inst.ExecStream(ctx, req, inputs, onEvent)
+	}
+
+	session, ok := darwinContainerSession(inst)
+	if !ok {
+		return fmt.Errorf("running instance does not support image mounts")
+	}
+	if b == nil || b.images == nil {
+		return fmt.Errorf("runtime backend is not configured")
+	}
+	image, err := b.images.Open(targetImage)
+	if err != nil {
+		return err
+	}
+	image = withRuntimeMountDirs(image)
+	mountPath := imageMountPath(targetImage)
+	if err := session.AddImage(ctx, mountPath, image); err != nil {
+		return err
+	}
+	req.RootDir = rootDirWithinMount(mountPath, req.RootDir)
+	return inst.ExecStream(ctx, req, inputs, onEvent)
+}
+
 func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, memoryMB uint64, cpus int, nestedVirt bool, dmesg bool, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
 	start := time.Now()
 	if bundle, err := workerBootBundle(); err != nil {

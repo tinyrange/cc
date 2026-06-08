@@ -954,6 +954,50 @@ func TestStoreReadMetadataBackfillsSourceKind(t *testing.T) {
 	}
 }
 
+func TestStoreMaterializesInternalScratch(t *testing.T) {
+	store := NewStore(t.TempDir())
+	state, err := store.Get("scratch")
+	if err != nil {
+		t.Fatalf("Get(scratch) error = %v", err)
+	}
+	if state.Name != "scratch" || state.Source != "scratch" || state.SourceKind != SourceKindInternal || state.Status != "downloaded" {
+		t.Fatalf("scratch state = %#v", state)
+	}
+
+	img, err := store.Open("scratch")
+	if err != nil {
+		t.Fatalf("Open(scratch) error = %v", err)
+	}
+	if img.SourceKind != SourceKindInternal || img.Config.WorkingDir != "/" {
+		t.Fatalf("scratch image = %#v", img)
+	}
+	if _, err := imagefs.LookupPath(img.RootFS, "/go.mod"); err == nil {
+		t.Fatal("scratch unexpectedly contains /go.mod")
+	}
+	if _, err := os.Stat(filepath.Join(store.Root(), "scratch", "rootfs")); err != nil {
+		t.Fatalf("scratch rootfs missing: %v", err)
+	}
+}
+
+func TestStorePullCanonicalizesDockerScratchToInternal(t *testing.T) {
+	store := NewStore(t.TempDir())
+	state, err := store.Pull(context.Background(), "scratch", "docker.io/library/scratch:latest", PullOptions{Architecture: "arm64"})
+	if err != nil {
+		t.Fatalf("Pull(scratch) error = %v", err)
+	}
+	if state.Source != "scratch" || state.SourceKind != SourceKindInternal {
+		t.Fatalf("scratch pull state = %#v", state)
+	}
+
+	img, err := store.Open("scratch")
+	if err != nil {
+		t.Fatalf("Open(scratch) error = %v", err)
+	}
+	if img.Architecture != "arm64" {
+		t.Fatalf("scratch architecture = %q, want arm64", img.Architecture)
+	}
+}
+
 func TestStoreSaveRootFSPersistsImageAndExcludesRuntimePaths(t *testing.T) {
 	rootDir := t.TempDir()
 	for _, dir := range []string{"etc", "bin", "tmp", "proc", "host", ".ccx3"} {

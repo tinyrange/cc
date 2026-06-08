@@ -265,7 +265,7 @@ func (s *ManagedSession) ConsoleHistory(context.Context) (string, error) {
 }
 
 func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
-	if len(req.Command) == 0 {
+	if (req.Kind == "" || req.Kind == "exec") && len(req.Command) == 0 {
 		return fmt.Errorf("exec command is required")
 	}
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
@@ -283,17 +283,19 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 
 func (s *ManagedSession) sendExecStart(id string, req client.ExecRequest) error {
 	payload, err := json.Marshal(vmruntime.ManagedExecRequest{
-		Kind:    "exec",
-		ID:      id,
-		Command: append([]string(nil), req.Command...),
-		Env:     append([]string(nil), req.Env...),
-		RootDir: req.RootDir,
-		WorkDir: req.WorkDir,
-		User:    req.User,
-		Stdin:   append([]byte(nil), req.Stdin...),
-		TTY:     req.TTY,
-		Cols:    req.Cols,
-		Rows:    req.Rows,
+		Kind:      execRequestKind(req.Kind),
+		ID:        id,
+		Command:   append([]string(nil), req.Command...),
+		Env:       append([]string(nil), req.Env...),
+		RootDir:   req.RootDir,
+		Path:      req.Path,
+		Directory: req.Directory,
+		WorkDir:   req.WorkDir,
+		User:      req.User,
+		Stdin:     append([]byte(nil), req.Stdin...),
+		TTY:       req.TTY,
+		Cols:      req.Cols,
+		Rows:      req.Rows,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal exec request: %w", err)

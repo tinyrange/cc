@@ -250,6 +250,8 @@ type guestExecRequest struct {
 	Command     []string `json:"command"`
 	Env         []string `json:"env,omitempty"`
 	RootDir     string   `json:"root_dir,omitempty"`
+	Path        string   `json:"path,omitempty"`
+	Directory   bool     `json:"directory,omitempty"`
 	ReplaceEnv  bool     `json:"replace_env,omitempty"`
 	SkipResolve bool     `json:"skip_resolve,omitempty"`
 	WorkDir     string   `json:"workdir,omitempty"`
@@ -590,7 +592,7 @@ func (s *ContainerSession) RootSnapshotAt(guestPath string) (imagefs.Directory, 
 
 func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	execStart := time.Now()
-	if len(req.Command) == 0 {
+	if (req.Kind == "" || req.Kind == "exec") && len(req.Command) == 0 {
 		return fmt.Errorf("exec command is required")
 	}
 	s.markExecActive()
@@ -602,8 +604,12 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 
 	env := effectiveExecEnv(s.baseEnv, req.Env, req.ReplaceEnv)
 	command := append([]string(nil), req.Command...)
+	kind := req.Kind
+	if kind == "" {
+		kind = "exec"
+	}
 	start := time.Now()
-	if !req.SkipResolve {
+	if kind == "exec" && !req.SkipResolve {
 		if s.image == nil || s.image.RootFS == nil {
 			return fmt.Errorf("running instance does not have a default image root filesystem")
 		}
@@ -628,11 +634,13 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 	id := strconv.FormatUint(s.nextID.Add(1), 10)
 	start = time.Now()
 	payload, err := json.Marshal(guestExecRequest{
-		Kind:        "exec",
+		Kind:        kind,
 		ID:          id,
 		Command:     command,
 		Env:         env,
 		RootDir:     req.RootDir,
+		Path:        req.Path,
+		Directory:   req.Directory,
 		ReplaceEnv:  req.ReplaceEnv,
 		SkipResolve: req.SkipResolve,
 		WorkDir:     workDir,

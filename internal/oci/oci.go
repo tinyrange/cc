@@ -38,7 +38,10 @@ const (
 	SourceKindCVMFS         = "cvmfs"
 	SourceKindDockerArchive = "docker-archive"
 	SourceKindSaved         = "saved"
+	SourceKindInternal      = "internal"
 )
+
+const internalScratchSource = "scratch"
 
 type Store struct {
 	root          string
@@ -250,6 +253,11 @@ func (s *Store) List() ([]client.ImageState, error) {
 }
 
 func (s *Store) Get(name string) (client.ImageState, error) {
+	if isScratchImageName(name) {
+		if err := s.EnsureInternalScratch(context.Background(), name, ""); err != nil {
+			return client.ImageState{}, err
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.getLocked(name)
@@ -279,6 +287,11 @@ func (s *Store) Delete(name string) error {
 }
 
 func (s *Store) Open(name string) (*Image, error) {
+	if isScratchImageName(name) {
+		if err := s.EnsureInternalScratch(context.Background(), name, ""); err != nil {
+			return nil, err
+		}
+	}
 	meta, err := s.readMetadata(name)
 	if err != nil {
 		return nil, err
@@ -397,6 +410,14 @@ func (s *Store) Pull(ctx context.Context, name, source string, options ...PullOp
 	if len(options) > 0 {
 		opts = options[0]
 	}
+	if spec.Kind == SourceKindInternal && spec.Raw == internalScratchSource {
+		if err := s.EnsureInternalScratch(ctx, name, opts.Architecture); err != nil {
+			return client.ImageState{}, err
+		}
+		reportPullProgress(opts.Report, client.ProgressEvent{Status: "available", Artifact: name})
+		reportPullProgress(opts.Report, client.ProgressEvent{Status: "downloaded", Artifact: name})
+		return s.Get(name)
+	}
 	if state, ok, err := s.existingState(name, spec, opts.Architecture); err != nil {
 		return client.ImageState{}, err
 	} else if ok {
@@ -472,6 +493,11 @@ func (s *Store) pullDirect(ctx context.Context, name string, spec SourceSpec, op
 		return s.pullCVMFSDirect(ctx, name, spec, options)
 	case SourceKindDockerArchive:
 		return s.pullDockerArchiveDirect(ctx, name, spec)
+	case SourceKindInternal:
+		if spec.Raw == internalScratchSource {
+			return s.ensureInternalScratch(ctx, name, options.Architecture)
+		}
+		return fmt.Errorf("unsupported internal image source %q", spec.Raw)
 	default:
 		return fmt.Errorf("unsupported image source kind %q", spec.Kind)
 	}
@@ -1010,7 +1036,11 @@ func (s *Store) cloneFromStore(src *Store, srcName, dstName string, spec SourceS
 	meta.Name = dstName
 	meta.Source = spec.Raw
 	meta.SourceKind = spec.Kind
-	meta.RootFSDir = dstDir
+	if rel, err := filepath.Rel(srcDir, srcMeta.RootFSDir); err == nil && rel != "." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".." {
+		meta.RootFSDir = filepath.Join(dstDir, rel)
+	} else {
+		meta.RootFSDir = dstDir
+	}
 	if meta.MetadataPath != "" {
 		meta.MetadataPath = filepath.Join(dstDir, "rootfs.metadata.json")
 	}
@@ -1331,6 +1361,9 @@ func ParseSource(source string) (SourceSpec, error) {
 	if source == "" {
 		return SourceSpec{}, fmt.Errorf("image source is required")
 	}
+	if isScratchSource(source) {
+		return SourceSpec{Kind: SourceKindInternal, Raw: internalScratchSource}, nil
+	}
 	lower := strings.ToLower(source)
 	switch {
 	case strings.HasPrefix(lower, "docker-archive:"):
@@ -1351,6 +1384,23 @@ func ParseSource(source string) (SourceSpec, error) {
 		}
 		return SourceSpec{}, fmt.Errorf("unsupported image source %q", source)
 	}
+}
+
+func isScratchSource(source string) bool {
+	registry, image, tag, err := ParseImageRef(strings.TrimSpace(source))
+	if err != nil {
+		return false
+	}
+	return registry == defaultRegistry && image == "library/scratch" && tag == "latest"
+}
+
+func isScratchImageName(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	base, _, _ := strings.Cut(name, "@")
+	return base == "scratch"
 }
 
 func ParseImageRef(imageRef string) (registry string, image string, tag string, err error) {

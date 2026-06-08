@@ -411,10 +411,14 @@ type VMState = InstanceState
 type RunVMResponse = ExecResponse
 
 type ExecRequest struct {
+	Kind        string   `json:"kind,omitempty"`
 	ID          string   `json:"id,omitempty"`
+	Image       string   `json:"image,omitempty"`
 	Command     []string `json:"command"`
 	Env         []string `json:"env,omitempty"`
 	RootDir     string   `json:"root_dir,omitempty"`
+	Path        string   `json:"path,omitempty"`
+	Directory   bool     `json:"directory,omitempty"`
 	ReplaceEnv  bool     `json:"replace_env,omitempty"`
 	SkipResolve bool     `json:"skip_resolve,omitempty"`
 	WorkDir     string   `json:"workdir,omitempty"`

@@ -369,6 +369,51 @@ func TestContainerSessionExecStreamForwardsTTYControl(t *testing.T) {
 	}
 }
 
+func TestContainerSessionExecStreamAllowsFSExtractWithoutCommand(t *testing.T) {
+	transcript := newSerialTranscript()
+	requests := make(chan guestExecRequest, 4)
+	control := &fakeVsockConn{
+		writeFn: func(data []byte) (int, error) {
+			var req guestExecRequest
+			if err := json.Unmarshal(data[:len(data)-1], &req); err != nil {
+				return 0, err
+			}
+			requests <- req
+			if req.Kind == "fs_extract" {
+				go func(id string) {
+					_, _ = transcript.Write([]byte(commandBeginMarker + id + "\n"))
+					_, _ = transcript.Write([]byte(commandExitMarkerPref + id + ":0\n"))
+				}(req.ID)
+			}
+			return len(data), nil
+		},
+	}
+	session := &ContainerSession{
+		workDir:    "/",
+		control:    control,
+		transcript: transcript,
+	}
+
+	if err := session.ExecStream(context.Background(), client.ExecRequest{
+		Kind:      "fs_extract",
+		Path:      "/home/cc",
+		Directory: true,
+		User:      "1000:1000",
+	}, nil, nil); err != nil {
+		t.Fatalf("ExecStream(fs_extract) error = %v", err)
+	}
+
+	var got guestExecRequest
+	select {
+	case got = <-requests:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for fs_extract request")
+	}
+	if got.Kind != "fs_extract" || got.Path != "/home/cc" || !got.Directory || len(got.Command) != 0 {
+		t.Fatalf("request = %#v, want fs_extract /home/cc directory without command", got)
+	}
+}
+
 type fakeVsockConn struct {
 	mu      sync.Mutex
 	writes  [][]byte

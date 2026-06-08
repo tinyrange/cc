@@ -477,6 +477,47 @@ func TestManagerRunDelegatesCrossImageExecToBackend(t *testing.T) {
 	}
 }
 
+func TestManagerStreamDelegatesImageScopedExecToBackend(t *testing.T) {
+	inst := &fakeInstance{waitCh: make(chan error, 1)}
+	var seen struct {
+		running string
+		image   string
+		kind    string
+		path    string
+	}
+	mgr := NewManagerWithBackend(fakeBackend{
+		instance: inst,
+		execInStreamFn: func(ctx context.Context, inst Instance, runningImage string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+			_ = ctx
+			_ = inst
+			_ = inputs
+			seen.running = runningImage
+			seen.image = req.Image
+			seen.kind = req.Kind
+			seen.path = req.Path
+			if onEvent != nil {
+				return onEvent(client.ExecEvent{Kind: "exit", ExitCode: 0})
+			}
+			return nil
+		},
+	})
+	mgr.supports = func() error { return nil }
+
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{Image: "alpine"}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if err := mgr.Stream(context.Background(), client.ExecRequest{
+		Image: "alpine",
+		Kind:  "fs_write",
+		Path:  "/home/cc/go.mod",
+	}, nil, nil); err != nil {
+		t.Fatalf("Stream() error = %v", err)
+	}
+	if seen.running != "alpine" || seen.image != "alpine" || seen.kind != "fs_write" || seen.path != "/home/cc/go.mod" {
+		t.Fatalf("backend saw %#v", seen)
+	}
+}
+
 func TestManagerRunSupportsMultipleImagesOnBlankRunningVM(t *testing.T) {
 	inst := &fakeInstance{waitCh: make(chan error, 1)}
 	var seen []struct {
@@ -1005,6 +1046,23 @@ func TestSidecarInstanceAddShareRejectsConflictingMount(t *testing.T) {
 	}
 }
 
+func TestSidecarCommandResolverSkipsFSRequests(t *testing.T) {
+	root := t.TempDir()
+	resolver := &sidecarCommandResolver{root: imagefs.NewHostFS(root, nil)}
+	req := client.ExecRequest{
+		Kind:      "fs_extract",
+		Path:      "/home/cc",
+		Directory: true,
+	}
+	got, err := resolver.resolve(req)
+	if err != nil {
+		t.Fatalf("resolve(fs_extract) error = %v", err)
+	}
+	if got.Kind != req.Kind || got.Path != req.Path || got.Directory != req.Directory || got.RootDir != "" || len(got.Command) != 0 {
+		t.Fatalf("resolved request = %#v, want fs request passed through unchanged", got)
+	}
+}
+
 func requireSidecarRuntimeShares(t *testing.T) {
 	t.Helper()
 	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
@@ -1141,6 +1199,7 @@ type fakeBackend struct {
 	startBlankFn    func(client.StartInstanceRequest) (Instance, error)
 	runInInstanceFn func(context.Context, Instance, string, client.RunRequest) (client.ExecResponse, error)
 	runInStreamFn   func(context.Context, Instance, string, client.RunRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
+	execInStreamFn  func(context.Context, Instance, string, client.ExecRequest, <-chan client.ExecInput, func(client.ExecEvent) error) error
 }
 
 type fakeVMHost struct {
@@ -1251,6 +1310,16 @@ func (f fakeBackend) RunInInstanceStream(ctx context.Context, inst Instance, run
 		}
 	}
 	return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
+}
+
+func (f fakeBackend) ExecInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	if f.execInStreamFn != nil {
+		return f.execInStreamFn(ctx, inst, runningImage, req, inputs, onEvent)
+	}
+	if inst == nil {
+		return f.err
+	}
+	return inst.ExecStream(ctx, req, inputs, onEvent)
 }
 
 type fakeInstance struct {

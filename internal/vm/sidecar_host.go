@@ -180,6 +180,48 @@ func (h *sidecarVMHost) RunInInstanceStream(ctx context.Context, inst Instance, 
 	return sidecarInst.ExecStream(ctx, execReq, inputs, onEvent)
 }
 
+func (h *sidecarVMHost) ExecInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	sidecarInst, ok := inst.(*sidecarInstance)
+	if !ok {
+		return fmt.Errorf("instance is not owned by a sidecar host")
+	}
+	execReq, err := h.prepareExecInInstance(ctx, sidecarInst, runningImage, req)
+	if err != nil {
+		return err
+	}
+	execReq.Image = ""
+	return sidecarInst.ExecStream(ctx, execReq, inputs, onEvent)
+}
+
+func (h *sidecarVMHost) prepareExecInInstance(ctx context.Context, inst *sidecarInstance, runningImage string, req client.ExecRequest) (client.ExecRequest, error) {
+	targetImage := strings.TrimSpace(req.Image)
+	if targetImage == "" || targetImage == runningImage {
+		return req, nil
+	}
+	if h.images == nil {
+		return client.ExecRequest{}, fmt.Errorf("sidecar image store is not configured")
+	}
+	image, err := h.images.Open(targetImage)
+	if err != nil {
+		return client.ExecRequest{}, err
+	}
+	image = sidecarWithRuntimeMountDirs(image)
+	mountPath := sidecarImageMountPath(targetImage)
+	if err := inst.addCoordinatorImageMount(mountPath, virtio.NewImageFS(image.RootFS, image.RootFSDir)); err != nil {
+		return client.ExecRequest{}, err
+	}
+	req.RootDir = rootDirWithinMount(mountPath, req.RootDir)
+	return req, nil
+}
+
+func rootDirWithinMount(mountPath, rootDir string) string {
+	rootDir = strings.TrimSpace(rootDir)
+	if rootDir == "" || rootDir == "/" {
+		return mountPath
+	}
+	return filepath.Join(mountPath, strings.TrimPrefix(rootDir, "/"))
+}
+
 func (h *sidecarVMHost) prepareRunInInstanceExec(ctx context.Context, inst *sidecarInstance, runningImage string, req client.RunRequest) (client.ExecRequest, error) {
 	targetImage := strings.TrimSpace(req.Image)
 	if targetImage == "" || targetImage == runningImage {
@@ -436,6 +478,9 @@ func newSidecarCommandResolver(image *oci.Image) *sidecarCommandResolver {
 }
 
 func (r *sidecarCommandResolver) resolve(req client.ExecRequest) (client.ExecRequest, error) {
+	if req.Kind != "" && req.Kind != "exec" {
+		return req, nil
+	}
 	if r == nil || req.SkipResolve {
 		return req, nil
 	}

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
 	"encoding/base64"
@@ -77,6 +78,8 @@ type execRequest struct {
 	Command []string `json:"command,omitempty"`
 	Env     []string `json:"env,omitempty"`
 	RootDir string   `json:"root_dir,omitempty"`
+	Path    string   `json:"path,omitempty"`
+	Dir     bool     `json:"directory,omitempty"`
 	WorkDir string   `json:"workdir,omitempty"`
 	User    string   `json:"user,omitempty"`
 	Stdin   []byte   `json:"stdin,omitempty"`
@@ -707,6 +710,13 @@ func writeExecStderr(cfg config, control io.Writer, id, value string) {
 	writeProtocolLineTo(control, cfg.ErrorMarkerPref+id+":"+base64.StdEncoding.EncodeToString([]byte(value)))
 }
 
+func writeExecStdoutBytes(cfg config, control io.Writer, id string, data []byte) {
+	if cfg.OutputMarkerPref == "" || len(data) == 0 {
+		return
+	}
+	writeProtocolLineTo(control, cfg.OutputMarkerPref+id+":"+base64.StdEncoding.EncodeToString(data))
+}
+
 func writeExecTiming(control io.Writer, id, phase string, start time.Time) {
 	if id == "" || phase == "" {
 		return
@@ -998,6 +1008,48 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 			}
 			go runSyncRequest(cfg, control, req.ID)
 			continue
+		case "fs_archive":
+			if req.ID == "" {
+				writeKernel("ccx3-init: fs_archive request missing id")
+				continue
+			}
+			go runFSArchiveRequest(cfg, control, req.ID, req.RootDir, req.Path)
+			continue
+		case "fs_mkdir":
+			if req.ID == "" {
+				writeKernel("ccx3-init: fs_mkdir request missing id")
+				continue
+			}
+			go runFSMkdirRequest(cfg, control, req.ID, req.RootDir, req.Path, firstNonEmpty(req.User, cfg.User))
+			continue
+		case "fs_write":
+			if req.ID == "" {
+				writeKernel("ccx3-init: fs_write request missing id")
+				continue
+			}
+			go runFSWriteRequest(cfg, control, req.ID, req.RootDir, req.Path, firstNonEmpty(req.User, cfg.User), io.NopCloser(bytes.NewReader(req.Stdin)))
+			continue
+		case "fs_extract":
+			if req.ID == "" {
+				writeKernel("ccx3-init: fs_extract request missing id")
+				continue
+			}
+			if len(req.Stdin) > 0 {
+				go runFSExtractRequest(cfg, control, req.ID, req.RootDir, req.Path, req.Dir, req.User, io.NopCloser(bytes.NewReader(req.Stdin)), func() {})
+				continue
+			}
+			stdinR, stdinW := io.Pipe()
+			managed := &managedExec{stdin: stdinW, start: time.Now()}
+			activeMu.Lock()
+			active[req.ID] = managed
+			activeMu.Unlock()
+			go runFSExtractRequest(cfg, control, req.ID, req.RootDir, req.Path, req.Dir, req.User, stdinR, func() {
+				_ = managed.closeStdin()
+				activeMu.Lock()
+				delete(active, req.ID)
+				activeMu.Unlock()
+			})
+			continue
 		case "stdin":
 			activeMu.Lock()
 			managed := active[req.ID]
@@ -1079,18 +1131,23 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 		activeMu.Lock()
 		active[req.ID] = managed
 		activeMu.Unlock()
-		if len(req.Stdin) > 0 {
-			if err := managed.writeStdin(req.Stdin); err != nil {
-				writeKernel("ccx3-init: write initial stdin: " + err.Error())
-			}
-		}
-
 		go runManagedExec(cfg, control, req.ID, req.Command, env, req.RootDir, workDir, user, stdinR, managed, req.TTY, req.Cols, req.Rows, func() {
 			_ = managed.closeStdin()
 			activeMu.Lock()
 			delete(active, req.ID)
 			activeMu.Unlock()
 		})
+		if len(req.Stdin) > 0 {
+			initialStdin := append([]byte(nil), req.Stdin...)
+			go func(id string, managed *managedExec) {
+				if err := managed.writeStdin(initialStdin); err != nil {
+					writeKernel("ccx3-init: write initial stdin: " + err.Error())
+				}
+				if err := managed.closeStdin(); err != nil {
+					writeKernel("ccx3-init: close initial stdin: " + err.Error())
+				}
+			}(req.ID, managed)
+		}
 	}
 }
 
@@ -1102,6 +1159,244 @@ func runSyncRequest(cfg config, control io.Writer, id string) {
 	if cfg.ExitMarkerPrefix != "" {
 		writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":0")
 	}
+}
+
+func runFSArchiveRequest(cfg config, control io.Writer, id, rootDir, src string) {
+	if cfg.BeginMarker != "" {
+		writeProtocolLineTo(control, cfg.BeginMarker+id)
+	}
+	exitCode := 0
+	if err := archivePathToControl(cfg, control, id, rootDir, src); err != nil {
+		exitCode = 1
+		writeExecStderr(cfg, control, id, "ccx3-init: fs archive: "+err.Error()+"\n")
+	}
+	if cfg.ExitMarkerPrefix != "" {
+		writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":"+itoa(exitCode))
+	}
+}
+
+func archivePathToControl(cfg config, control io.Writer, id, rootDir, src string) error {
+	if strings.TrimSpace(src) == "" {
+		return fmt.Errorf("source path is required")
+	}
+	src = rootPath(rootDir, filepath.Clean(src))
+	info, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+	pr, pw := io.Pipe()
+	go func() {
+		err := writePathTar(pw, src, filepath.Base(src), info)
+		_ = pw.CloseWithError(err)
+	}()
+	var buf [32 * 1024]byte
+	for {
+		n, err := pr.Read(buf[:])
+		if n > 0 {
+			writeExecStdoutBytes(cfg, control, id, buf[:n])
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+func runFSExtractRequest(cfg config, control io.Writer, id, rootDir, dst string, dstDir bool, user string, stdin io.ReadCloser, cleanup func()) {
+	defer cleanup()
+	if cfg.BeginMarker != "" {
+		writeProtocolLineTo(control, cfg.BeginMarker+id)
+	}
+	exitCode := 0
+	if err := extractTarToPath(stdin, rootDir, dst, dstDir); err != nil {
+		exitCode = 1
+		writeExecStderr(cfg, control, id, "ccx3-init: fs extract: "+err.Error()+"\n")
+	}
+	if cfg.ExitMarkerPrefix != "" {
+		writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":"+itoa(exitCode))
+	}
+}
+
+func runFSMkdirRequest(cfg config, control io.Writer, id, rootDir, dir, user string) {
+	if strings.TrimSpace(dir) == "" {
+		dir = "."
+	}
+	exitCode := 0
+	if cfg.BeginMarker != "" {
+		writeProtocolLineTo(control, cfg.BeginMarker+id)
+	}
+	target := rootPath(rootDir, filepath.Clean(dir))
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		exitCode = 1
+		writeExecStderr(cfg, control, id, "ccx3-init: fs mkdir: "+err.Error()+"\n")
+	} else if err := chownPathForUser(target, user); err != nil {
+		exitCode = 1
+		writeExecStderr(cfg, control, id, "ccx3-init: fs mkdir: "+err.Error()+"\n")
+	}
+	if cfg.ExitMarkerPrefix != "" {
+		writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":"+itoa(exitCode))
+	}
+}
+
+func runFSWriteRequest(cfg config, control io.Writer, id, rootDir, dst, user string, stdin io.ReadCloser) {
+	defer stdin.Close()
+	exitCode := 0
+	if cfg.BeginMarker != "" {
+		writeProtocolLineTo(control, cfg.BeginMarker+id)
+	}
+	if strings.TrimSpace(dst) == "" {
+		writeExecStderr(cfg, control, id, "ccx3-init: fs write: destination path is required\n")
+		exitCode = 1
+		if cfg.ExitMarkerPrefix != "" {
+			writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":"+itoa(exitCode))
+		}
+		return
+	}
+	target := rootPath(rootDir, filepath.Clean(dst))
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		writeExecStderr(cfg, control, id, "ccx3-init: fs write: "+err.Error()+"\n")
+		exitCode = 1
+	} else if err := writeStreamToPath(stdin, target, 0o644); err != nil {
+		writeExecStderr(cfg, control, id, "ccx3-init: fs write: "+err.Error()+"\n")
+		exitCode = 1
+	} else if err := chownPathForUser(target, user); err != nil {
+		writeExecStderr(cfg, control, id, "ccx3-init: fs write: "+err.Error()+"\n")
+		exitCode = 1
+	}
+	if cfg.ExitMarkerPrefix != "" {
+		writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":"+itoa(exitCode))
+	}
+}
+
+func writeStreamToPath(r io.Reader, target string, mode os.FileMode) error {
+	file, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(file, r)
+	closeErr := file.Close()
+	return errors.Join(copyErr, closeErr)
+}
+
+func chownPathForUser(target, user string) error {
+	cred, err := credentialForUser(user)
+	if err != nil || cred == nil {
+		return err
+	}
+	return os.Chown(target, int(cred.Uid), int(cred.Gid))
+}
+
+func writePathTar(w io.Writer, src, rootName string, rootInfo os.FileInfo) error {
+	tw := tar.NewWriter(w)
+	defer tw.Close()
+	return filepath.WalkDir(src, func(filePath string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(filepath.Dir(src), filePath)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			rel = rootName
+			info = rootInfo
+		}
+		header, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+		header.Name = filepath.ToSlash(rel)
+		if err := tw.WriteHeader(header); err != nil {
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		file, err := os.Open(filePath)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(tw, file)
+		closeErr := file.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	})
+}
+
+func extractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
+	if strings.TrimSpace(dst) == "" {
+		return fmt.Errorf("destination path is required")
+	}
+	dst = rootPath(rootDir, filepath.Clean(dst))
+	if info, err := os.Stat(dst); err == nil && info.IsDir() {
+		dstDir = true
+	}
+	tr := tar.NewReader(r)
+	sawEntry := false
+	for {
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			if !sawEntry {
+				return fmt.Errorf("archive is empty")
+			}
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		sawEntry = true
+		target, err := guestTarTarget(dst, dstDir, header.Name)
+		if err != nil {
+			return err
+		}
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, os.FileMode(header.Mode).Perm()); err != nil {
+				return err
+			}
+		case tar.TypeReg, tar.TypeRegA:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			file, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(header.Mode).Perm())
+			if err != nil {
+				return err
+			}
+			_, copyErr := io.Copy(file, tr)
+			closeErr := file.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+		default:
+			continue
+		}
+	}
+}
+
+func guestTarTarget(dst string, dstDir bool, name string) (string, error) {
+	cleanName := filepath.Clean(filepath.FromSlash(strings.TrimPrefix(name, "/")))
+	if cleanName == "." || cleanName == ".." || strings.HasPrefix(cleanName, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("unsafe tar path %q", name)
+	}
+	if dstDir {
+		return filepath.Join(dst, cleanName), nil
+	}
+	parts := strings.SplitN(cleanName, string(filepath.Separator), 2)
+	if len(parts) == 1 {
+		return dst, nil
+	}
+	return filepath.Join(dst, parts[1]), nil
 }
 
 func runManagedExec(cfg config, control io.Writer, id string, argv []string, env []string, rootDir string, workDir string, user string, stdin io.ReadCloser, managed *managedExec, tty bool, cols int, rows int, cleanup func()) {
@@ -1505,6 +1800,15 @@ func rootPath(rootDir, name string) string {
 		return name
 	}
 	return filepath.Join(rootDir, strings.TrimPrefix(name, "/"))
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func usernameForUID(rootDir, uid string) string {
