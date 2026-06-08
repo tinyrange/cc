@@ -64,6 +64,9 @@ func TestDarwinSidecarLiveL2AndSave(t *testing.T) {
 		TimeoutSeconds: 30,
 	}, nil)
 	if err != nil {
+		if strings.Contains(err.Error(), "unsupported") {
+			t.Skipf("sidecar VM creation is unsupported on this runner: %v", err)
+		}
 		t.Fatalf("CreateInstance(one) error = %v", err)
 	}
 	t.Logf("started one at %s", one.NetworkIPv4)
