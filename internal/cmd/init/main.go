@@ -1305,6 +1305,14 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	startErr := cmd.Start()
 	if startErr != nil {
 		_ = managed.closeStdin()
+		if ptySlave != nil {
+			_ = ptySlave.Close()
+			ptySlave = nil
+		}
+		if ptyMaster != nil {
+			_ = ptyMaster.Close()
+			ptyMaster = nil
+		}
 		if stdoutW != nil {
 			_ = stdoutW.Close()
 		}

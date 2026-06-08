@@ -3,12 +3,15 @@
 package main
 
 import (
+	"bytes"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -81,6 +84,32 @@ func TestConfigureClockReportsSettimeofdayError(t *testing.T) {
 	err := configureClock(1_700_000_123)
 	if !errors.Is(err, want) {
 		t.Fatalf("configureClock() error = %v, want wrapping %v", err, want)
+	}
+}
+
+func TestRunManagedExecTTYStartErrorDoesNotHang(t *testing.T) {
+	stdinR, stdinW := io.Pipe()
+	managed := &managedExec{stdin: stdinW}
+	var control bytes.Buffer
+	done := make(chan struct{})
+
+	go func() {
+		runManagedExec(config{
+			BeginMarker:      "__BEGIN__:",
+			OutputMarkerPref: "__OUT__:",
+			ErrorMarkerPref:  "__ERR__:",
+			ExitMarkerPrefix: "__EXIT__:",
+		}, &control, "exec-1", []string{"/no/such/vmsh-command"}, nil, "", "/", "", stdinR, managed, true, 80, 24, func() {})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runManagedExec() hung after tty command start error")
+	}
+	if !strings.Contains(control.String(), "__EXIT__:exec-1:126") {
+		t.Fatalf("control output = %q, want exit marker 126", control.String())
 	}
 }
 
