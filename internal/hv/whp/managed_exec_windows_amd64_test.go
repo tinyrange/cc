@@ -3,8 +3,11 @@
 package whp
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +21,35 @@ import (
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
 )
+
+func TestSendManagedExecIncludesUser(t *testing.T) {
+	conn := &recordingVsockConn{}
+	if err := sendManagedExec(conn, "exec-1", client.ExecRequest{
+		Command: []string{"/bin/sh", "-c", "whoami"},
+		User:    "1000:1000",
+	}); err != nil {
+		t.Fatalf("sendManagedExec() error = %v", err)
+	}
+	msg := decodeManagedExecRequest(t, conn.String())
+	if msg.User != "1000:1000" {
+		t.Fatalf("user = %q, want 1000:1000", msg.User)
+	}
+}
+
+func TestManagedSessionExecStreamStartIncludesUser(t *testing.T) {
+	conn := &recordingVsockConn{}
+	session := &ManagedSession{control: conn}
+	if err := session.sendExecStart("exec-1", client.ExecRequest{
+		Command: []string{"/bin/sh", "-c", "whoami"},
+		User:    "1000:1000",
+	}); err != nil {
+		t.Fatalf("sendExecStart() error = %v", err)
+	}
+	msg := decodeManagedExecRequest(t, conn.String())
+	if msg.User != "1000:1000" {
+		t.Fatalf("user = %q, want 1000:1000", msg.User)
+	}
+}
 
 func TestRunManagedExecWithAlpineRootFS(t *testing.T) {
 	kernelFile, initrd, fsdevs := prepareManagedAlpineRootFS(t)
@@ -41,6 +73,27 @@ func TestRunManagedExecWithAlpineRootFS(t *testing.T) {
 	if !strings.Contains(resp.Output, "Linux ") || !strings.Contains(resp.Output, "x86_64 Linux") {
 		t.Fatalf("managed exec output missing uname output:\n%s", resp.Output)
 	}
+}
+
+type recordingVsockConn struct {
+	bytes.Buffer
+}
+
+func (c *recordingVsockConn) Close() error      { return nil }
+func (c *recordingVsockConn) LocalPort() uint32 { return 1 }
+func (c *recordingVsockConn) Read([]byte) (int, error) {
+	return 0, io.EOF
+}
+func (c *recordingVsockConn) RemotePort() uint32 { return 2 }
+
+func decodeManagedExecRequest(t *testing.T, payload string) vmruntime.ManagedExecRequest {
+	t.Helper()
+	payload = strings.TrimSpace(payload)
+	var msg vmruntime.ManagedExecRequest
+	if err := json.Unmarshal([]byte(payload), &msg); err != nil {
+		t.Fatalf("unmarshal managed exec request %q: %v", payload, err)
+	}
+	return msg
 }
 
 func TestManagedSessionExecWithAlpineRootFS(t *testing.T) {

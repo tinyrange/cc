@@ -252,10 +252,6 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 		if image == nil {
 			return client.ExecResponse{}, fmt.Errorf("windows amd64 runtime command execution requires an image store and image")
 		}
-		user := strings.TrimSpace(req.User)
-		if user != "" && user != "root" && user != "0" && user != "0:0" {
-			return client.ExecResponse{}, fmt.Errorf("only root user is supported")
-		}
 		if !strings.HasPrefix(workDir, "/") {
 			return client.ExecResponse{}, fmt.Errorf("workdir must be absolute")
 		}
@@ -267,6 +263,7 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 			Command: command,
 			Env:     env,
 			WorkDir: workDir,
+			User:    req.User,
 			Stdin:   append([]byte(nil), req.Stdin...),
 			TTY:     req.TTY,
 			Cols:    req.Cols,
@@ -469,10 +466,6 @@ func (i *windowsInstance) Exec(ctx context.Context, req client.ExecRequest) (cli
 	if i == nil || i.session == nil {
 		return client.ExecResponse{}, fmt.Errorf("instance is not running")
 	}
-	user := strings.TrimSpace(req.User)
-	if user != "" && user != "root" && user != "0" && user != "0:0" {
-		return client.ExecResponse{}, fmt.Errorf("only root user is supported")
-	}
 	env := windowsEffectiveExecEnv(i.baseEnv, req.Env, req.ReplaceEnv)
 	command := append([]string(nil), req.Command...)
 	if !req.SkipResolve {
@@ -502,6 +495,7 @@ func (i *windowsInstance) Exec(ctx context.Context, req client.ExecRequest) (cli
 		ReplaceEnv:  req.ReplaceEnv,
 		SkipResolve: req.SkipResolve,
 		WorkDir:     workDir,
+		User:        req.User,
 		Stdin:       append([]byte(nil), req.Stdin...),
 		TTY:         req.TTY,
 		Cols:        req.Cols,
@@ -512,10 +506,6 @@ func (i *windowsInstance) Exec(ctx context.Context, req client.ExecRequest) (cli
 func (i *windowsInstance) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	if i == nil || i.session == nil {
 		return fmt.Errorf("instance is not running")
-	}
-	user := strings.TrimSpace(req.User)
-	if user != "" && user != "root" && user != "0" && user != "0:0" {
-		return fmt.Errorf("only root user is supported")
 	}
 	env := windowsEffectiveExecEnv(i.baseEnv, req.Env, req.ReplaceEnv)
 	command := append([]string(nil), req.Command...)
@@ -546,6 +536,7 @@ func (i *windowsInstance) ExecStream(ctx context.Context, req client.ExecRequest
 		ReplaceEnv:  req.ReplaceEnv,
 		SkipResolve: req.SkipResolve,
 		WorkDir:     workDir,
+		User:        req.User,
 		Stdin:       append([]byte(nil), req.Stdin...),
 		TTY:         req.TTY,
 		Cols:        req.Cols,
