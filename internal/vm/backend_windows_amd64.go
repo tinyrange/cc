@@ -9,6 +9,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"time"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/amd64vm"
@@ -675,6 +676,7 @@ func windowsGuestInitConfig(modules []alpine.Module, managedExec bool) vmruntime
 		UsageMarkerPref:    vmruntime.CommandUsageMarker,
 		ExitMarkerPrefix:   vmruntime.CommandExitMarkerPref,
 		DisableCgroupMount: true,
+		UnixTime:           time.Now().Unix(),
 	}
 	if managedExec {
 		cfg.VsockPort = vmruntime.ControlPort

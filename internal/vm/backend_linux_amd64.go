@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/amd64vm"
@@ -702,6 +703,7 @@ func linuxGuestInitConfig(modules []alpine.Module, managedExec bool, network *cl
 		ErrorMarkerPref:  vmruntime.CommandErrorMarker,
 		UsageMarkerPref:  vmruntime.CommandUsageMarker,
 		ExitMarkerPrefix: vmruntime.CommandExitMarkerPref,
+		UnixTime:         time.Now().Unix(),
 	}
 	if managedExec {
 		cfg.VsockPort = vmruntime.ControlPort

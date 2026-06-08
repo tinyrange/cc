@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/oci"
@@ -43,6 +44,16 @@ func TestWindowsImageMountPathUsesLinuxGuestSeparators(t *testing.T) {
 	}
 	if strings.Contains(got, `\`) {
 		t.Fatalf("windowsImageMountPath() used host separators: %q", got)
+	}
+}
+
+func TestWindowsGuestInitConfigIncludesUnixTime(t *testing.T) {
+	before := time.Now().Unix()
+	got := windowsGuestInitConfig(nil, true)
+	after := time.Now().Unix()
+
+	if got.UnixTime < before || got.UnixTime > after {
+		t.Fatalf("UnixTime = %d, want between %d and %d", got.UnixTime, before, after)
 	}
 }
 
