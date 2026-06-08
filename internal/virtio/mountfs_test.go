@@ -49,6 +49,48 @@ func TestMountedFSAddShareExposesFiles(t *testing.T) {
 	}
 }
 
+func TestMountedFSAddShareInvalidatesExistingPathNodes(t *testing.T) {
+	rootDir := t.TempDir()
+	staleDir := filepath.Join(rootDir, ".ccx3", "images", "curl")
+	if err := os.MkdirAll(staleDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(stale) error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(staleDir, "stale.txt"), []byte("stale"), 0o644); err != nil {
+		t.Fatalf("WriteFile(stale) error = %v", err)
+	}
+	shareDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(shareDir, "mounted.txt"), []byte("mounted"), 0o644); err != nil {
+		t.Fatalf("WriteFile(share) error = %v", err)
+	}
+
+	backend := NewMountedFS(NewPassthroughFS(rootDir, nil), nil)
+	curlID, _, errno := backendLookupPath(backend, "/.ccx3/images/curl")
+	if errno != 0 {
+		t.Fatalf("backendLookupPath(stale curl) errno = %d", errno)
+	}
+	if _, _, errno := backend.Lookup(curlID, "stale.txt"); errno != 0 {
+		t.Fatalf("Lookup(stale.txt) errno = %d", errno)
+	}
+
+	mounter, ok := backend.(ShareMounter)
+	if !ok {
+		t.Fatalf("backend does not support ShareMounter")
+	}
+	if err := mounter.AddShare(ShareMount{
+		GuestPath: "/.ccx3/images/curl",
+		Backend:   NewPassthroughFS(shareDir, nil),
+	}); err != nil {
+		t.Fatalf("AddShare() error = %v", err)
+	}
+
+	if _, _, errno := backendLookupPath(backend, "/.ccx3/images/curl/mounted.txt"); errno != 0 {
+		t.Fatalf("backendLookupPath(mounted.txt) errno = %d", errno)
+	}
+	if _, _, errno := backendLookupPath(backend, "/.ccx3/images/curl/stale.txt"); errno != -linuxENOENT {
+		t.Fatalf("backendLookupPath(stale.txt) errno = %d, want ENOENT", errno)
+	}
+}
+
 func TestMountedFSRootSnapshotAtSnapshotsMountBackend(t *testing.T) {
 	rootDir := t.TempDir()
 	mountDir := t.TempDir()

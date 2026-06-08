@@ -112,14 +112,20 @@ func ResolveCommand(root Directory, command []string, env []string) ([]string, e
 		return nil, fmt.Errorf("command is empty")
 	}
 	if strings.Contains(command[0], "/") {
-		entry, err := LookupPath(root, command[0])
+		resolved, entry, err := ResolvePath(root, command[0])
 		if err != nil {
 			return nil, fmt.Errorf("resolve command %q: %w", command[0], err)
 		}
 		if entry.Dir != nil {
 			return nil, fmt.Errorf("command %q is a directory", command[0])
 		}
-		return append([]string(nil), command...), nil
+		if entry.File != nil {
+			_, mode := entry.File.Stat()
+			if mode&0o111 == 0 {
+				return nil, fmt.Errorf("command %q is not executable", command[0])
+			}
+		}
+		return resolvedCommand(resolved, command[0], command[1:]), nil
 	}
 	pathEnv := "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 	for _, kv := range env {
@@ -133,21 +139,49 @@ func ResolveCommand(root Directory, command []string, env []string) ([]string, e
 			continue
 		}
 		guestPath := filepath.ToSlash(filepath.Join(dir, command[0]))
-		entry, err := LookupPath(root, guestPath)
+		resolved, entry, err := ResolvePath(root, guestPath)
 		if err != nil || entry.Dir != nil {
 			continue
 		}
-		switch {
-		case entry.Symlink != nil:
-			return append([]string{guestPath}, command[1:]...), nil
-		case entry.File != nil:
+		if entry.File != nil {
 			_, mode := entry.File.Stat()
 			if mode&0o111 != 0 {
-				return append([]string{guestPath}, command[1:]...), nil
+				return resolvedCommand(resolved, guestPath, command[1:]), nil
 			}
 		}
 	}
 	return nil, fmt.Errorf("resolve command %q in PATH", command[0])
+}
+
+func resolvedCommand(resolved, original string, args []string) []string {
+	out := []string{resolved}
+	if path.Base(resolved) == "busybox" && path.Base(original) != "busybox" {
+		out = append(out, path.Base(original))
+	}
+	return append(out, args...)
+}
+
+func ResolvePath(root Directory, guestPath string) (string, Entry, error) {
+	clean := path.Clean("/" + strings.TrimPrefix(strings.TrimSpace(guestPath), "/"))
+	for depth := 0; depth < 40; depth++ {
+		entry, err := LookupPath(root, clean)
+		if err != nil {
+			return "", Entry{}, err
+		}
+		if entry.Symlink == nil {
+			return clean, entry, nil
+		}
+		target := strings.ReplaceAll(strings.TrimSpace(entry.Symlink.Target()), "\\", "/")
+		if target == "" {
+			return "", Entry{}, fmt.Errorf("%q symlink target is empty", clean)
+		}
+		if strings.HasPrefix(target, "/") {
+			clean = path.Clean(target)
+		} else {
+			clean = path.Clean(path.Join(path.Dir(clean), target))
+		}
+	}
+	return "", Entry{}, fmt.Errorf("%q has too many symlink levels", guestPath)
 }
 
 type hostFile struct {

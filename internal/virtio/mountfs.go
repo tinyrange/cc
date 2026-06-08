@@ -177,6 +177,13 @@ func (m *mountedFS) AddShare(share ShareMount) error {
 		}
 		return len(m.mounts[i].path) < len(m.mounts[j].path)
 	})
+	for existingPath, id := range m.pathToNode {
+		if existingPath != mountPath && !strings.HasPrefix(existingPath, strings.TrimSuffix(mountPath, "/")+"/") {
+			continue
+		}
+		delete(m.pathToNode, existingPath)
+		delete(m.nodes, id)
+	}
 	return nil
 }
 
