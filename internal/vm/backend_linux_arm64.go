@@ -519,19 +519,6 @@ func (i *linuxInstance) ExecStream(ctx context.Context, req client.ExecRequest, 
 	if i == nil || i.session == nil {
 		return fmt.Errorf("instance is not running")
 	}
-	if req.Kind != "" && req.Kind != "exec" {
-		workDir := req.WorkDir
-		if workDir == "" {
-			workDir = i.workDir
-		}
-		return i.session.ExecStream(ctx, client.ExecRequest{
-			Kind:      req.Kind,
-			Path:      req.Path,
-			Directory: req.Directory,
-			WorkDir:   workDir,
-			User:      req.User,
-		}, inputs, onEvent)
-	}
 	resp, err := i.Exec(ctx, req)
 	if err != nil {
 		return err

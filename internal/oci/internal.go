@@ -27,9 +27,6 @@ func (s *Store) ensureInternalScratch(ctx context.Context, name, architecture st
 		return err
 	}
 	architecture = normalizeArchitecture(architecture)
-	if architecture == "" {
-		architecture = runtime.GOARCH
-	}
 
 	if meta, err := s.readMetadata(name); err == nil && meta.SourceKind == SourceKindInternal && meta.Source == internalScratchSource {
 		if architecture == "" || meta.Architecture == "" || meta.Architecture == architecture {
@@ -37,6 +34,9 @@ func (s *Store) ensureInternalScratch(ctx context.Context, name, architecture st
 		}
 	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
+	}
+	if architecture == "" {
+		architecture = runtime.GOARCH
 	}
 
 	if err := os.MkdirAll(s.root, 0o755); err != nil {
