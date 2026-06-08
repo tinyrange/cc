@@ -88,9 +88,8 @@ func (c *recordingVsockConn) RemotePort() uint32 { return 2 }
 
 func decodeManagedExecRequest(t *testing.T, payload string) vmruntime.ManagedExecRequest {
 	t.Helper()
-	payload = strings.TrimSpace(payload)
 	var msg vmruntime.ManagedExecRequest
-	if err := json.Unmarshal([]byte(payload), &msg); err != nil {
+	if err := json.NewDecoder(strings.NewReader(payload)).Decode(&msg); err != nil {
 		t.Fatalf("unmarshal managed exec request %q: %v", payload, err)
 	}
 	return msg
