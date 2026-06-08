@@ -154,6 +154,9 @@ func TestStorePullExtractsRootFSAndRuntimeConfig(t *testing.T) {
 	if target != "busybox" {
 		t.Fatalf("bin/sh target = %q, want busybox", target)
 	}
+	if img.FSMetadata["/bin/sh"].LinkTarget != "busybox" {
+		t.Fatalf("bin/sh metadata link target = %q, want busybox", img.FSMetadata["/bin/sh"].LinkTarget)
+	}
 }
 
 func TestStorePullDockerArchiveImportsIndexedLayers(t *testing.T) {
@@ -1021,6 +1024,9 @@ func TestStoreSaveRootFSPersistsImageAndExcludesRuntimePaths(t *testing.T) {
 	}
 	if link.Symlink == nil || filepath.ToSlash(link.Symlink.Target()) != "../etc/motd" {
 		t.Fatalf("/bin/motd = %#v, want symlink to ../etc/motd", link)
+	}
+	if img.FSMetadata["/bin/motd"].LinkTarget != "../etc/motd" {
+		t.Fatalf("/bin/motd metadata link target = %q, want ../etc/motd", img.FSMetadata["/bin/motd"].LinkTarget)
 	}
 	for _, excluded := range []string{"/tmp/drop", "/proc/drop", "/host/drop", "/.ccx3/drop"} {
 		if _, err := imagefs.LookupPath(img.RootFS, excluded); err == nil {

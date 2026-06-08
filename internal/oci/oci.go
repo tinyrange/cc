@@ -1485,7 +1485,8 @@ func applyLayer(rootfsDir, mediaType string, blob []byte, entries map[string]fsm
 				return err
 			}
 		case tar.TypeSymlink:
-			if err := os.Symlink(hdr.Linkname, hostPath); err != nil {
+			target := fsmeta.NormalizeSymlinkTarget(hdr.Linkname)
+			if err := os.Symlink(target, hostPath); err != nil {
 				return err
 			}
 		case tar.TypeLink:
@@ -1500,11 +1501,15 @@ func applyLayer(rootfsDir, mediaType string, blob []byte, entries map[string]fsm
 		default:
 			return fmt.Errorf("unsupported layer entry type %d for %s", hdr.Typeflag, name)
 		}
-		entries[fsmeta.Normalize(name)] = fsmeta.Entry{
+		meta := fsmeta.Entry{
 			UID:  uint32(hdr.Uid),
 			GID:  uint32(hdr.Gid),
 			Mode: fsmeta.LinuxModeFromTarHeader(hdr),
 		}
+		if hdr.Typeflag == tar.TypeSymlink {
+			meta.LinkTarget = fsmeta.NormalizeSymlinkTarget(hdr.Linkname)
+		}
+		entries[fsmeta.Normalize(name)] = meta
 	}
 }
 

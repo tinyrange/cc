@@ -112,7 +112,7 @@ func ResolveCommand(root Directory, command []string, env []string) ([]string, e
 		return nil, fmt.Errorf("command is empty")
 	}
 	if strings.Contains(command[0], "/") {
-		resolved, entry, err := ResolvePath(root, command[0])
+		_, entry, err := ResolvePath(root, command[0])
 		if err != nil {
 			return nil, fmt.Errorf("resolve command %q: %w", command[0], err)
 		}
@@ -125,7 +125,9 @@ func ResolveCommand(root Directory, command []string, env []string) ([]string, e
 				return nil, fmt.Errorf("command %q is not executable", command[0])
 			}
 		}
-		return resolvedCommand(resolved, command[0], command[1:]), nil
+		out := append([]string(nil), command...)
+		out[0] = command[0]
+		return out, nil
 	}
 	pathEnv := "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 	for _, kv := range env {
@@ -138,27 +140,19 @@ func ResolveCommand(root Directory, command []string, env []string) ([]string, e
 		if dir == "" {
 			continue
 		}
-		guestPath := filepath.ToSlash(filepath.Join(dir, command[0]))
-		resolved, entry, err := ResolvePath(root, guestPath)
+		guestPath := path.Join(dir, command[0])
+		_, entry, err := ResolvePath(root, guestPath)
 		if err != nil || entry.Dir != nil {
 			continue
 		}
 		if entry.File != nil {
 			_, mode := entry.File.Stat()
 			if mode&0o111 != 0 {
-				return resolvedCommand(resolved, guestPath, command[1:]), nil
+				return append([]string{guestPath}, command[1:]...), nil
 			}
 		}
 	}
 	return nil, fmt.Errorf("resolve command %q in PATH", command[0])
-}
-
-func resolvedCommand(resolved, original string, args []string) []string {
-	out := []string{resolved}
-	if path.Base(resolved) == "busybox" && path.Base(original) != "busybox" {
-		out = append(out, path.Base(original))
-	}
-	return append(out, args...)
 }
 
 func ResolvePath(root Directory, guestPath string) (string, Entry, error) {
@@ -171,7 +165,7 @@ func ResolvePath(root Directory, guestPath string) (string, Entry, error) {
 		if entry.Symlink == nil {
 			return clean, entry, nil
 		}
-		target := strings.ReplaceAll(strings.TrimSpace(entry.Symlink.Target()), "\\", "/")
+		target := fsmeta.NormalizeSymlinkTarget(strings.TrimSpace(entry.Symlink.Target()))
 		if target == "" {
 			return "", Entry{}, fmt.Errorf("%q symlink target is empty", clean)
 		}
@@ -280,6 +274,10 @@ func (d *hostDir) Lookup(name string) (Entry, error) {
 		if err != nil {
 			return Entry{}, err
 		}
+		if meta.LinkTarget != "" {
+			target = meta.LinkTarget
+		}
+		target = fsmeta.NormalizeSymlinkTarget(target)
 		return Entry{Symlink: &hostSymlink{hostPath: host, mode: mode, uid: meta.UID, gid: meta.GID, rdev: meta.RDev, target: target, modTime: modTime}}, nil
 	case info.IsDir():
 		return Entry{Dir: &hostDir{rootPath: d.rootPath, hostPath: host, mode: mode, uid: meta.UID, gid: meta.GID, rdev: meta.RDev, modTime: modTime, meta: d.meta}}, nil

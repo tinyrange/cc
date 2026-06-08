@@ -63,25 +63,25 @@ func TestResolveCommandAbsoluteAndPATH(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveCommand(symlink) error = %v", err)
 	}
-	if got[0] != "/bin/tool" {
-		t.Fatalf("ResolveCommand(symlink)[0] = %q, want /bin/tool", got[0])
+	if got[0] != "/bin/tool-link" {
+		t.Fatalf("ResolveCommand(symlink)[0] = %q, want /bin/tool-link", got[0])
 	}
 
 	got, err = ResolveCommand(fs, []string{"/bin/tool-link"}, nil)
 	if err != nil {
 		t.Fatalf("ResolveCommand(abs symlink) error = %v", err)
 	}
-	if got[0] != "/bin/tool" {
-		t.Fatalf("ResolveCommand(abs symlink)[0] = %q, want /bin/tool", got[0])
+	if got[0] != "/bin/tool-link" {
+		t.Fatalf("ResolveCommand(abs symlink)[0] = %q, want /bin/tool-link", got[0])
 	}
 
 	got, err = ResolveCommand(fs, []string{"sh", "-lc", "true"}, []string{"PATH=/bin"})
 	if err != nil {
-		t.Fatalf("ResolveCommand(busybox applet) error = %v", err)
+		t.Fatalf("ResolveCommand(symlink command) error = %v", err)
 	}
-	want := []string{"/bin/busybox", "sh", "-lc", "true"}
+	want := []string{"/bin/sh", "-lc", "true"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
-		t.Fatalf("ResolveCommand(busybox applet) = %q, want %q", got, want)
+		t.Fatalf("ResolveCommand(symlink command) = %q, want %q", got, want)
 	}
 
 	if _, err := ResolveCommand(fs, []string{"plain"}, []string{"PATH=/bin"}); err == nil {
@@ -101,7 +101,7 @@ func TestResolveCommandNormalizesWindowsSymlinkTarget(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveCommand(sh) error = %v", err)
 	}
-	want := []string{"/bin/busybox", "sh", "-lc", "true"}
+	want := []string{"/bin/sh", "-lc", "true"}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("ResolveCommand(sh) = %q, want %q", got, want)
 	}

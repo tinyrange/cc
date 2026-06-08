@@ -45,3 +45,12 @@ func TestLinuxModeFromTarHeaderUsesTarFileType(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeSymlinkTargetUsesUnixSeparators(t *testing.T) {
+	if got := NormalizeSymlinkTarget(`\bin\busybox`); got != "/bin/busybox" {
+		t.Fatalf("NormalizeSymlinkTarget() = %q, want /bin/busybox", got)
+	}
+	if got := NormalizeSymlinkTarget(`..\etc\motd`); got != "../etc/motd" {
+		t.Fatalf("NormalizeSymlinkTarget(relative) = %q, want ../etc/motd", got)
+	}
+}

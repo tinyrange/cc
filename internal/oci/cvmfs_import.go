@@ -103,7 +103,7 @@ func buildCVMFSDirectoryIndex(client *intcvmfs.Client, rootTarget string) ([]ind
 			node.Kind = indexedKindDir
 		case entry.Mode&fs.ModeSymlink != 0:
 			node.Kind = indexedKindSymlink
-			node.LinkTarget = entry.Symlink
+			node.LinkTarget = fsmeta.NormalizeSymlinkTarget(entry.Symlink)
 		default:
 			node.Kind = indexedKindFile
 			node.Size = uint64(entry.Size)

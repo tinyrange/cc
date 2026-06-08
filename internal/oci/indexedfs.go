@@ -566,7 +566,7 @@ func applyIndexedLayer(tarPath string, tarRef string, merged map[string]*indexed
 			node.Kind = indexedKindFile
 		case tar.TypeSymlink:
 			node.Kind = indexedKindSymlink
-			node.LinkTarget = hdr.Linkname
+			node.LinkTarget = fsmeta.NormalizeSymlinkTarget(hdr.Linkname)
 			node.Size = uint64(len(hdr.Linkname))
 			node.TarPath = ""
 			node.TarOffset = 0
@@ -594,12 +594,16 @@ func applyIndexedLayer(tarPath string, tarRef string, merged map[string]*indexed
 		}
 		merged[node.Path] = node
 		layerEntries[node.Path] = node
-		entries[node.Path] = fsmeta.Entry{
+		meta := fsmeta.Entry{
 			UID:  node.UID,
 			GID:  node.GID,
 			Mode: node.Mode,
 			RDev: node.RDev,
 		}
+		if node.Kind == indexedKindSymlink {
+			meta.LinkTarget = node.LinkTarget
+		}
+		entries[node.Path] = meta
 	}
 }
 

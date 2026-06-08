@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"io/fs"
 	"path"
+	"strings"
 
 	"j5.nz/cc/internal/linuxabi"
 )
@@ -21,10 +22,11 @@ const (
 )
 
 type Entry struct {
-	UID  uint32 `json:"uid"`
-	GID  uint32 `json:"gid"`
-	Mode uint32 `json:"mode,omitempty"`
-	RDev uint32 `json:"rdev,omitempty"`
+	UID        uint32 `json:"uid"`
+	GID        uint32 `json:"gid"`
+	Mode       uint32 `json:"mode,omitempty"`
+	RDev       uint32 `json:"rdev,omitempty"`
+	LinkTarget string `json:"link_target,omitempty"`
 }
 
 func Normalize(name string) string {
@@ -33,6 +35,10 @@ func Normalize(name string) string {
 		return "/"
 	}
 	return clean
+}
+
+func NormalizeSymlinkTarget(target string) string {
+	return strings.ReplaceAll(target, "\\", "/")
 }
 
 func LinuxModeFromTarHeader(hdr *tar.Header) uint32 {

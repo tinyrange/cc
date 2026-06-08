@@ -151,13 +151,15 @@ func exportImageEntry(ctx context.Context, entry imagefs.Entry, guestPath, hostP
 	case entry.Symlink != nil:
 		mode := fs.ModeSymlink | entry.Symlink.Stat()
 		uid, gid := entry.Symlink.Owner()
+		target := fsmeta.NormalizeSymlinkTarget(entry.Symlink.Target())
 		entries[fsmeta.Normalize(guestPath)] = fsmeta.Entry{
-			UID:  uid,
-			GID:  gid,
-			Mode: fsmeta.LinuxModeFromFileMode(mode),
-			RDev: entry.Symlink.RDev(),
+			UID:        uid,
+			GID:        gid,
+			Mode:       fsmeta.LinuxModeFromFileMode(mode),
+			RDev:       entry.Symlink.RDev(),
+			LinkTarget: target,
 		}
-		if err := os.Symlink(entry.Symlink.Target(), hostPath); err != nil {
+		if err := os.Symlink(target, hostPath); err != nil {
 			return fmt.Errorf("symlink %s: %w", guestPath, err)
 		}
 		return nil
