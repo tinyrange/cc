@@ -38,5 +38,5 @@ func TestInitramfsBootReadyMarker(t *testing.T) {
 	if os.Getenv("CCX3_WHP_BOOT") == "" {
 		t.Skip("set CCX3_WHP_BOOT=1 to run the windows amd64 WHP boot probe")
 	}
-	t.Skip("WHP currently reaches /init on GitHub Windows runners but does not make reliable observable user-mode progress")
+	t.Skip("serial ready-marker probing is superseded by the WHP vsock and managed exec live tests")
 }
