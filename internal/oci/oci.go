@@ -105,6 +105,7 @@ type SaveOptions struct {
 	Source       string
 	Architecture string
 	Config       RuntimeConfig
+	Report       func(client.ProgressEvent)
 }
 
 func reportPullProgress(report func(client.ProgressEvent), event client.ProgressEvent) {

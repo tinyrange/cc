@@ -81,6 +81,8 @@ type imageSnapshotProvider interface {
 	SnapshotImage(string) (imagefs.Directory, error)
 }
 
+type SnapshotProgress func(client.ProgressEvent)
+
 type Manager struct {
 	mu           sync.Mutex
 	host         VMHost
@@ -823,6 +825,10 @@ func (m *Manager) ConsoleHistory(ctx context.Context, id string) (string, error)
 }
 
 func (m *Manager) SnapshotRootFS(ctx context.Context, id string, imageName string) (imagefs.Directory, string, error) {
+	return m.SnapshotRootFSWithProgress(ctx, id, imageName, nil)
+}
+
+func (m *Manager) SnapshotRootFSWithProgress(ctx context.Context, id string, imageName string, report SnapshotProgress) (imagefs.Directory, string, error) {
 	id = instanceID(id)
 	imageName = strings.TrimSpace(imageName)
 	m.mu.Lock()
@@ -831,8 +837,14 @@ func (m *Manager) SnapshotRootFS(ctx context.Context, id string, imageName strin
 	if machine == nil {
 		return nil, "", fmt.Errorf("no VM %q is running", id)
 	}
+	if report != nil {
+		report(client.ProgressEvent{Status: "flushing", Blob: id})
+	}
 	if err := m.FlushInstance(ctx, id); err != nil {
 		return nil, "", err
+	}
+	if report != nil {
+		report(client.ProgressEvent{Status: "snapshotting", Blob: id})
 	}
 	if imageName != "" {
 		if snapshotter, ok := machine.instance.(imageSnapshotProvider); ok {

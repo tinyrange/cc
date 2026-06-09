@@ -2,6 +2,7 @@ package vm
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strings"
 	"testing"
@@ -214,6 +215,39 @@ func TestSidecarWorkerClientExecStreamReturnsOnContextCancel(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("ExecStream() did not return after context cancel")
+	}
+}
+
+func TestSidecarWorkerClientCallLockRespectsContext(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+
+	workerClient := &sidecarWorkerClient{conn: left, codec: NewWorkerCodec(left)}
+	workerCodec := NewWorkerCodec(right)
+	execCtx, cancelExec := context.WithCancel(context.Background())
+	defer cancelExec()
+
+	execDone := make(chan error, 1)
+	go func() {
+		execDone <- workerClient.ExecStream(execCtx, "alpha", client.ExecRequest{Command: []string{"sleep", "100"}}, nil, nil)
+	}()
+	if _, err := workerCodec.Receive(); err != nil {
+		t.Fatalf("worker Receive() error = %v", err)
+	}
+
+	callCtx, cancelCall := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancelCall()
+	_, err := workerClient.ConsoleHistory(callCtx, "alpha")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ConsoleHistory() error = %v, want context deadline", err)
+	}
+
+	cancelExec()
+	select {
+	case <-execDone:
+	case <-time.After(time.Second):
+		t.Fatal("ExecStream did not return after cancellation")
 	}
 }
 

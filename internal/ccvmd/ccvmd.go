@@ -38,10 +38,23 @@ var debugPprof = strings.TrimSpace(os.Getenv("CCX3_DEBUG_PPROF")) != ""
 var bootEventWriteMu sync.Mutex
 
 const defaultVMBootTimeout = 5 * time.Second
+const defaultSaveSnapshotTimeout = 10 * time.Second
 
 func bootTimeoutFromRequest(seconds float64) time.Duration {
 	if seconds <= 0 {
 		return resolveVMBootTimeout()
+	}
+	return time.Duration(seconds * float64(time.Second))
+}
+
+func saveSnapshotTimeout() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("CCX3_SAVE_SNAPSHOT_TIMEOUT"))
+	if raw == "" {
+		return defaultSaveSnapshotTimeout
+	}
+	seconds, err := strconv.ParseFloat(raw, 64)
+	if err != nil || seconds <= 0 {
+		return defaultSaveSnapshotTimeout
 	}
 	return time.Duration(seconds * float64(time.Second))
 }
@@ -347,7 +360,7 @@ func run(args []string) (bool, error) {
 
 	var httpServer http.Server
 	shutdown := newServerShutdown(srvState, &httpServer)
-	watchdog := newWatchdogController(shutdown)
+	watchdog := newWatchdogController(watchdogExpiredShutdown(shutdown))
 	defer watchdog.Stop()
 	srvState.images.CVMFSActivity = watchdog.RecordCVMFSActivity
 	mux := newMux(srvState, watchdog, shutdown)
@@ -524,7 +537,10 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server) error {
 		case vm.WorkerFrameFlush:
 			var req vm.WorkerFlushRequest
 			_ = frame.DecodePayload(&req)
-			if err := srvState.vms.FlushInstance(context.Background(), req.ID); err != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), saveSnapshotTimeout())
+			err := srvState.vms.FlushInstance(ctx, req.ID)
+			cancel()
+			if err != nil {
 				_ = sendWorkerError(codec, frame.ID, err)
 				continue
 			}
@@ -641,13 +657,31 @@ func newServerShutdown(srvState *server, httpServer *http.Server) func() {
 		once.Do(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			if srvState != nil && srvState.vms != nil {
-				_ = srvState.vms.ShutdownAll(ctx)
-			}
 			if httpServer != nil {
 				_ = httpServer.Shutdown(ctx)
 			}
+			if srvState != nil && srvState.vms != nil {
+				_ = srvState.vms.ShutdownAll(ctx)
+			}
 		})
+	}
+}
+
+var watchdogForceExit = os.Exit
+var watchdogForceExitGrace = 2 * time.Second
+
+func watchdogExpiredShutdown(shutdown func()) func() {
+	return func() {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			shutdown()
+		}()
+		select {
+		case <-done:
+		case <-time.After(watchdogForceExitGrace):
+			watchdogForceExit(0)
+		}
 	}
 }
 
@@ -1086,8 +1120,27 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 		}
 		id := strings.TrimSpace(r.PathValue("id"))
 		requestedImage := strings.TrimSpace(req.Image)
-		root, sourceImage, err := srvState.vms.SnapshotRootFS(r.Context(), id, requestedImage)
+		var report func(client.ProgressEvent)
+		if wantsProgressStream(r) {
+			report = func(event client.ProgressEvent) {
+				if event.Artifact == "" {
+					event.Artifact = name
+				}
+				_ = writeProgressEvent(w, event)
+			}
+		}
+		timeout := saveSnapshotTimeout()
+		saveCtx, cancelSave := context.WithTimeout(r.Context(), timeout)
+		defer cancelSave()
+		root, sourceImage, err := srvState.vms.SnapshotRootFSWithProgress(saveCtx, id, requestedImage, report)
 		if err != nil {
+			if errors.Is(saveCtx.Err(), context.DeadlineExceeded) {
+				err = fmt.Errorf("save snapshot preparation timed out after %s", timeout)
+			}
+			if report != nil {
+				report(client.ProgressEvent{Status: "error", Error: err.Error()})
+				return
+			}
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -1104,9 +1157,17 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 		} else {
 			opts.Source = "vm:" + id
 		}
+		opts.Report = report
 		state, err := srvState.images.SaveRootFS(r.Context(), name, root, opts)
 		if err != nil {
+			if report != nil {
+				report(client.ProgressEvent{Status: "error", Error: err.Error()})
+				return
+			}
 			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		if report != nil {
 			return
 		}
 		writeJSON(w, http.StatusOK, state)
@@ -1715,9 +1776,6 @@ func bootProgressMessage(prefix string, event client.ProgressEvent) string {
 
 func writeProgressEvent(w http.ResponseWriter, event client.ProgressEvent) error {
 	w.Header().Set("Content-Type", "application/x-ndjson")
-	if _, ok := w.(http.Flusher); ok {
-		w.WriteHeader(http.StatusOK)
-	}
 	if err := json.NewEncoder(w).Encode(event); err != nil {
 		return err
 	}

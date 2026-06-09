@@ -386,6 +386,39 @@ func TestWatchdogLeaseFeedKeepsDaemonAliveUntilStale(t *testing.T) {
 	}
 }
 
+func TestWatchdogExpiredShutdownForceExitsWhenGracefulShutdownHangs(t *testing.T) {
+	oldExit := watchdogForceExit
+	oldGrace := watchdogForceExitGrace
+	defer func() {
+		watchdogForceExit = oldExit
+		watchdogForceExitGrace = oldGrace
+	}()
+
+	exited := make(chan int, 1)
+	watchdogForceExit = func(code int) {
+		exited <- code
+	}
+	watchdogForceExitGrace = 10 * time.Millisecond
+	shutdown := watchdogExpiredShutdown(func() {
+		select {}
+	})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		shutdown()
+	}()
+
+	select {
+	case code := <-exited:
+		if code != 0 {
+			t.Fatalf("watchdog forced exit code = %d, want 0", code)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("watchdog did not force exit after hung shutdown")
+	}
+}
+
 func TestWatchdogCVMFSActivityDoesNotFeedTimer(t *testing.T) {
 	expired := make(chan struct{}, 1)
 	watchdog := newWatchdogController(func() { expired <- struct{}{} })

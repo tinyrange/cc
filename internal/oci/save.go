@@ -50,9 +50,12 @@ func (s *Store) SaveRootFS(ctx context.Context, name string, root imagefs.Direct
 		return client.ImageState{}, fmt.Errorf("create rootfs dir: %w", err)
 	}
 	entries := map[string]fsmeta.Entry{}
-	if err := exportImageDirectory(ctx, root, "/", rootDir, entries); err != nil {
+	progress := newSaveProgress(name, opts.Report)
+	progress.emit("saving", "/", true)
+	if err := exportImageDirectory(ctx, root, "/", rootDir, entries, progress); err != nil {
 		return client.ImageState{}, err
 	}
+	progress.emit("saving", "metadata", true)
 	fsMetaBuf, err := json.MarshalIndent(entries, "", "  ")
 	if err != nil {
 		return client.ImageState{}, fmt.Errorf("marshal fs metadata: %w", err)
@@ -91,6 +94,7 @@ func (s *Store) SaveRootFS(ctx context.Context, name string, root imagefs.Direct
 	if err := os.Rename(tmpDir, imageDir); err != nil {
 		return client.ImageState{}, fmt.Errorf("activate saved image: %w", err)
 	}
+	progress.emit("saved", name, true)
 	return client.ImageState{Name: name, Source: source, SourceKind: SourceKindSaved, Status: "downloaded"}, nil
 }
 
@@ -98,7 +102,61 @@ func validateSavedImageName(name string) error {
 	return validateImageStoreName(name)
 }
 
-func exportImageDirectory(ctx context.Context, dir imagefs.Directory, guestPath, hostPath string, entries map[string]fsmeta.Entry) error {
+type saveProgress struct {
+	artifact     string
+	report       func(client.ProgressEvent)
+	started      time.Time
+	lastReported time.Time
+	files        int64
+	bytes        int64
+}
+
+func newSaveProgress(artifact string, report func(client.ProgressEvent)) *saveProgress {
+	return &saveProgress{artifact: artifact, report: report, started: time.Now()}
+}
+
+func (p *saveProgress) addFile(path string, bytes int64) {
+	if p == nil {
+		return
+	}
+	p.files++
+	p.bytes += bytes
+	p.emit("saving", path, false)
+}
+
+func (p *saveProgress) addBytes(path string, bytes int64) {
+	if p == nil || bytes <= 0 {
+		return
+	}
+	p.bytes += bytes
+	p.emit("saving", path, false)
+}
+
+func (p *saveProgress) emit(status, blob string, force bool) {
+	if p == nil || p.report == nil {
+		return
+	}
+	now := time.Now()
+	if !force && !p.lastReported.IsZero() && now.Sub(p.lastReported) < 200*time.Millisecond {
+		return
+	}
+	p.lastReported = now
+	elapsed := now.Sub(p.started).Seconds()
+	rate := 0.0
+	if elapsed > 0 {
+		rate = float64(p.bytes) / elapsed
+	}
+	p.report(client.ProgressEvent{
+		Status:             status,
+		Artifact:           p.artifact,
+		Blob:               blob,
+		BytesDownloaded:    p.bytes,
+		FilesDownloaded:    p.files,
+		RateBytesPerSecond: rate,
+	})
+}
+
+func exportImageDirectory(ctx context.Context, dir imagefs.Directory, guestPath, hostPath string, entries map[string]fsmeta.Entry, progress *saveProgress) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -137,17 +195,17 @@ func exportImageDirectory(ctx context.Context, dir imagefs.Directory, guestPath,
 			return fmt.Errorf("lookup %s: %w", childGuest, err)
 		}
 		childHost := filepath.Join(hostPath, filepath.FromSlash(child.Name))
-		if err := exportImageEntry(ctx, entry, childGuest, childHost, entries); err != nil {
+		if err := exportImageEntry(ctx, entry, childGuest, childHost, entries, progress); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func exportImageEntry(ctx context.Context, entry imagefs.Entry, guestPath, hostPath string, entries map[string]fsmeta.Entry) error {
+func exportImageEntry(ctx context.Context, entry imagefs.Entry, guestPath, hostPath string, entries map[string]fsmeta.Entry, progress *saveProgress) error {
 	switch {
 	case entry.Dir != nil:
-		return exportImageDirectory(ctx, entry.Dir, guestPath, hostPath, entries)
+		return exportImageDirectory(ctx, entry.Dir, guestPath, hostPath, entries, progress)
 	case entry.Symlink != nil:
 		mode := fs.ModeSymlink | entry.Symlink.Stat()
 		uid, gid := entry.Symlink.Owner()
@@ -162,15 +220,16 @@ func exportImageEntry(ctx context.Context, entry imagefs.Entry, guestPath, hostP
 		if err := os.Symlink(target, hostPath); err != nil {
 			return fmt.Errorf("symlink %s: %w", guestPath, err)
 		}
+		progress.addFile(guestPath, 0)
 		return nil
 	case entry.File != nil:
-		return exportImageFile(ctx, entry.File, guestPath, hostPath, entries)
+		return exportImageFile(ctx, entry.File, guestPath, hostPath, entries, progress)
 	default:
 		return fmt.Errorf("%s has no filesystem entry", guestPath)
 	}
 }
 
-func exportImageFile(ctx context.Context, file imagefs.File, guestPath, hostPath string, entries map[string]fsmeta.Entry) error {
+func exportImageFile(ctx context.Context, file imagefs.File, guestPath, hostPath string, entries map[string]fsmeta.Entry, progress *saveProgress) error {
 	size, mode := file.Stat()
 	uid, gid := file.Owner()
 	entries[fsmeta.Normalize(guestPath)] = fsmeta.Entry{
@@ -181,7 +240,11 @@ func exportImageFile(ctx context.Context, file imagefs.File, guestPath, hostPath
 	}
 	linuxMode := fsmeta.LinuxModeFromFileMode(mode)
 	if linuxMode&0o170000 != 0o100000 {
-		return os.WriteFile(hostPath, nil, 0o644)
+		if err := os.WriteFile(hostPath, nil, 0o644); err != nil {
+			return err
+		}
+		progress.addFile(guestPath, 0)
+		return nil
 	}
 	out, err := os.OpenFile(hostPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode.Perm())
 	if err != nil {
@@ -210,6 +273,7 @@ func exportImageFile(ctx context.Context, file imagefs.File, guestPath, hostPath
 			return fmt.Errorf("write %s: %w", guestPath, err)
 		}
 		off += uint64(len(data))
+		progress.addBytes(guestPath, int64(len(data)))
 	}
 	mtime := file.ModTime()
 	if mtime.IsZero() {
@@ -219,6 +283,7 @@ func exportImageFile(ctx context.Context, file imagefs.File, guestPath, hostPath
 		return fmt.Errorf("close %s: %w", guestPath, err)
 	}
 	_ = os.Chtimes(hostPath, mtime, mtime)
+	progress.addFile(guestPath, 0)
 	return nil
 }
 

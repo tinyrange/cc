@@ -825,8 +825,11 @@ func (c *sidecarWorkerClient) ExecStream(ctx context.Context, id string, req cli
 	if c == nil || c.codec == nil {
 		return fmt.Errorf("sidecar worker is not connected")
 	}
-	c.callMu.Lock()
-	defer c.callMu.Unlock()
+	unlock, err := c.lockCall(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	requestID := c.nextID()
 	frame, err := NewWorkerFrame(requestID, WorkerServiceControl, WorkerFrameExec, WorkerExecRequest{
@@ -908,8 +911,11 @@ func (c *sidecarWorkerClient) call(ctx context.Context, frameType string, payloa
 	if c == nil || c.codec == nil {
 		return fmt.Errorf("sidecar worker is not connected")
 	}
-	c.callMu.Lock()
-	defer c.callMu.Unlock()
+	unlock, err := c.lockCall(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	cancelDone := make(chan struct{})
 	go func() {
 		select {
@@ -970,6 +976,24 @@ func (c *sidecarWorkerClient) nextID() uint64 {
 	defer c.idMu.Unlock()
 	c.next++
 	return c.next
+}
+
+func (c *sidecarWorkerClient) lockCall(ctx context.Context) (func(), error) {
+	locked := make(chan struct{}, 1)
+	go func() {
+		c.callMu.Lock()
+		locked <- struct{}{}
+	}()
+	select {
+	case <-locked:
+		return c.callMu.Unlock, nil
+	case <-ctx.Done():
+		go func() {
+			<-locked
+			c.callMu.Unlock()
+		}()
+		return nil, ctx.Err()
+	}
 }
 
 func (c *sidecarWorkerClient) forwardWorkerExecInputs(id uint64, inputs <-chan client.ExecInput, stop <-chan struct{}) {

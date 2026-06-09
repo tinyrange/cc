@@ -162,6 +162,10 @@ func (c *Client) SaveInstanceImageContext(ctx context.Context, id string, req Sa
 	return ret, err
 }
 
+func (c *Client) SaveInstanceImageStream(ctx context.Context, id string, req SaveImageRequest, onEvent func(ProgressEvent) error) error {
+	return c.postJSONProgressStreamContext(ctx, "/vm/"+imagePathName(id)+"/save", req, onEvent)
+}
+
 func (c *Client) FlushInstance(id string) error {
 	return c.postJSONExpectOK("/vm/"+imagePathName(id)+"/flush", map[string]any{}, nil)
 }
@@ -603,7 +607,11 @@ func (c *Client) postJSONExpectOKContext(ctx context.Context, path string, reqBo
 }
 
 func (c *Client) postJSONProgressStream(path string, reqBody any, onEvent func(ProgressEvent) error) error {
-	resp, err := c.postJSONStream(path, reqBody)
+	return c.postJSONProgressStreamContext(context.Background(), path, reqBody, onEvent)
+}
+
+func (c *Client) postJSONProgressStreamContext(ctx context.Context, path string, reqBody any, onEvent func(ProgressEvent) error) error {
+	resp, err := c.postJSONStreamContext(ctx, path, reqBody)
 	if err != nil {
 		return err
 	}

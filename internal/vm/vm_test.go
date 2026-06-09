@@ -944,6 +944,25 @@ func TestManagerSnapshotRootFSFlushesBeforeSnapshot(t *testing.T) {
 	}
 }
 
+func TestManagerSnapshotRootFSReportsFlushAndSnapshotProgress(t *testing.T) {
+	inst := &fakeInstance{waitCh: make(chan error, 1)}
+	mgr := NewManagerWithBackend(fakeBackend{instance: inst})
+	mgr.supports = func() error { return nil }
+
+	if _, err := mgr.Start(context.Background(), client.CreateInstanceRequest{Image: "alpine"}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	var statuses []string
+	if _, _, err := mgr.SnapshotRootFSWithProgress(context.Background(), "default", "", func(event client.ProgressEvent) {
+		statuses = append(statuses, event.Status+":"+event.Blob)
+	}); err != nil {
+		t.Fatalf("SnapshotRootFSWithProgress() error = %v", err)
+	}
+	if got := fmt.Sprint(statuses); got != "[flushing:default snapshotting:default]" {
+		t.Fatalf("progress statuses = %s, want flush then snapshot", got)
+	}
+}
+
 func TestSidecarCommandResolverResolvesBeforeWorkerExec(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "opt", "bin"), 0o755); err != nil {

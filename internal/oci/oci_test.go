@@ -1021,9 +1021,13 @@ func TestStoreSaveRootFSPersistsImageAndExcludesRuntimePaths(t *testing.T) {
 	}
 
 	store := NewStore(t.TempDir())
+	var progressEvents []client.ProgressEvent
 	state, err := store.SaveRootFS(context.Background(), "saved", imagefs.NewHostFS(rootDir, nil), SaveOptions{
 		Source:       "vm:work from ubuntu",
 		Architecture: "amd64",
+		Report: func(event client.ProgressEvent) {
+			progressEvents = append(progressEvents, event)
+		},
 		Config: RuntimeConfig{
 			Env:        []string{"A=B"},
 			Entrypoint: []string{"/bin/sh"},
@@ -1035,6 +1039,23 @@ func TestStoreSaveRootFSPersistsImageAndExcludesRuntimePaths(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("SaveRootFS() error = %v", err)
+	}
+	if len(progressEvents) == 0 {
+		t.Fatal("SaveRootFS() reported no progress events")
+	}
+	lastEvent := progressEvents[len(progressEvents)-1]
+	if lastEvent.Status != "saved" || lastEvent.Artifact != "saved" {
+		t.Fatalf("last progress event = %#v, want saved event for image", lastEvent)
+	}
+	var sawFileProgress bool
+	for _, event := range progressEvents {
+		if event.Status == "saving" && event.FilesDownloaded > 0 && event.BytesDownloaded > 0 {
+			sawFileProgress = true
+			break
+		}
+	}
+	if !sawFileProgress {
+		t.Fatalf("progress events = %#v, want saving event with file and byte counts", progressEvents)
 	}
 	if state.Name != "saved" || state.SourceKind != SourceKindSaved {
 		t.Fatalf("state = %#v, want saved image state", state)
