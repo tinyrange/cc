@@ -153,8 +153,12 @@ func (c *Client) DeleteImage(name string) error {
 }
 
 func (c *Client) SaveInstanceImage(id string, req SaveImageRequest) (ImageState, error) {
+	return c.SaveInstanceImageContext(context.Background(), id, req)
+}
+
+func (c *Client) SaveInstanceImageContext(ctx context.Context, id string, req SaveImageRequest) (ImageState, error) {
 	var ret ImageState
-	err := c.postJSONExpectOK("/vm/"+imagePathName(id)+"/save", req, &ret)
+	err := c.postJSONExpectOKContext(ctx, "/vm/"+imagePathName(id)+"/save", req, &ret)
 	return ret, err
 }
 
@@ -561,6 +565,10 @@ func (c *Client) RunVM(req StartVMRequest) (RunVMResponse, error) {
 }
 
 func (c *Client) postJSONExpectOK(path string, reqBody any, respBody any) error {
+	return c.postJSONExpectOKContext(context.Background(), path, reqBody, respBody)
+}
+
+func (c *Client) postJSONExpectOKContext(ctx context.Context, path string, reqBody any, respBody any) error {
 	var body io.Reader
 	if reqBody != nil {
 		buf := &bytes.Buffer{}
@@ -570,7 +578,7 @@ func (c *Client) postJSONExpectOK(path string, reqBody any, respBody any) error 
 		body = buf
 	}
 
-	req, err := http.NewRequest(http.MethodPost, c.url+path, body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url+path, body)
 	if err != nil {
 		return err
 	}
