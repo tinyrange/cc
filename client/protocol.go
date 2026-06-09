@@ -381,6 +381,7 @@ type RunRequest struct {
 	WorkDir        string         `json:"workdir,omitempty"`
 	User           string         `json:"user,omitempty"`
 	Stdin          []byte         `json:"stdin,omitempty"`
+	StdinClosed    bool           `json:"stdin_closed,omitempty"`
 	TTY            bool           `json:"tty,omitempty"`
 	Cols           int            `json:"cols,omitempty"`
 	Rows           int            `json:"rows,omitempty"`
@@ -424,6 +425,7 @@ type ExecRequest struct {
 	WorkDir     string   `json:"workdir,omitempty"`
 	User        string   `json:"user,omitempty"`
 	Stdin       []byte   `json:"stdin,omitempty"`
+	StdinClosed bool     `json:"stdin_closed,omitempty"`
 	TTY         bool     `json:"tty,omitempty"`
 	Cols        int      `json:"cols,omitempty"`
 	Rows        int      `json:"rows,omitempty"`

@@ -266,6 +266,7 @@ func (h *sidecarVMHost) prepareRunInInstanceExec(ctx context.Context, inst *side
 		WorkDir:     workDir,
 		User:        req.User,
 		Stdin:       append([]byte(nil), req.Stdin...),
+		StdinClosed: req.StdinClosed,
 		TTY:         req.TTY,
 		Cols:        req.Cols,
 		Rows:        req.Rows,
@@ -503,16 +504,17 @@ func sidecarEffectiveExecEnv(base, overrides []string, replace bool) []string {
 
 func sidecarExecRequestFromRun(req client.RunRequest) client.ExecRequest {
 	return client.ExecRequest{
-		Command:    append([]string(nil), req.Command...),
-		Env:        append([]string(nil), req.Env...),
-		RootDir:    req.RootDir,
-		ReplaceEnv: req.ReplaceEnv,
-		WorkDir:    req.WorkDir,
-		User:       req.User,
-		Stdin:      append([]byte(nil), req.Stdin...),
-		TTY:        req.TTY,
-		Cols:       req.Cols,
-		Rows:       req.Rows,
+		Command:     append([]string(nil), req.Command...),
+		Env:         append([]string(nil), req.Env...),
+		RootDir:     req.RootDir,
+		ReplaceEnv:  req.ReplaceEnv,
+		WorkDir:     req.WorkDir,
+		User:        req.User,
+		Stdin:       append([]byte(nil), req.Stdin...),
+		StdinClosed: req.StdinClosed,
+		TTY:         req.TTY,
+		Cols:        req.Cols,
+		Rows:        req.Rows,
 	}
 }
 

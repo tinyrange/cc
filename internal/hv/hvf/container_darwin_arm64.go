@@ -257,6 +257,7 @@ type guestExecRequest struct {
 	WorkDir     string   `json:"workdir,omitempty"`
 	User        string   `json:"user,omitempty"`
 	Stdin       []byte   `json:"stdin,omitempty"`
+	StdinClosed bool     `json:"stdin_closed,omitempty"`
 	TTY         bool     `json:"tty,omitempty"`
 	Kind        string   `json:"kind,omitempty"`
 	Signal      string   `json:"signal,omitempty"`
@@ -468,6 +469,7 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 		WorkDir:     workDir,
 		User:        user,
 		Stdin:       append([]byte(nil), req.Stdin...),
+		StdinClosed: req.StdinClosed,
 		TTY:         req.TTY,
 		Cols:        req.Cols,
 		Rows:        req.Rows,
@@ -484,10 +486,12 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 		return client.ExecResponse{}, err
 	}
 	timingLog("session.Exec writeControlPayload took=%s argv=%q id=%s", time.Since(startTime), req.Command, id)
-	if err := s.sendStdinClose(id); err != nil {
-		return client.ExecResponse{}, err
+	if len(req.Stdin) == 0 && !req.StdinClosed {
+		if err := s.sendStdinClose(id); err != nil {
+			return client.ExecResponse{}, err
+		}
+		timingLog("session.Exec sendStdinClose took=%s argv=%q id=%s", time.Since(startTime), req.Command, id)
 	}
-	timingLog("session.Exec sendStdinClose took=%s argv=%q id=%s", time.Since(startTime), req.Command, id)
 
 	beginSegment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
 		return hasManagedExecBegin(text, id)
@@ -646,6 +650,7 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 		WorkDir:     workDir,
 		User:        user,
 		Stdin:       append([]byte(nil), req.Stdin...),
+		StdinClosed: req.StdinClosed,
 		TTY:         req.TTY,
 		Cols:        req.Cols,
 		Rows:        req.Rows,
@@ -667,7 +672,7 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 
 	if inputs != nil {
 		go s.forwardExecInputs(ctx, id, inputs)
-	} else {
+	} else if len(req.Stdin) == 0 && !req.StdinClosed {
 		stdinStart := time.Now()
 		if err := s.sendStdinClose(id); err != nil {
 			return err

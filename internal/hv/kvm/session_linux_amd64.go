@@ -275,27 +275,30 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 	}
 	if inputs != nil {
 		go s.forwardExecInputs(ctx, id, inputs)
-	} else if err := s.sendStdinClose(id); err != nil {
-		return transcriptError(err, s.serialOut.String(), s.transcript.String())
+	} else if len(req.Stdin) == 0 && !req.StdinClosed {
+		if err := s.sendStdinClose(id); err != nil {
+			return transcriptError(err, s.serialOut.String(), s.transcript.String())
+		}
 	}
 	return s.streamExecEvents(ctx, start, id, onEvent)
 }
 
 func (s *ManagedSession) sendExecStart(id string, req client.ExecRequest) error {
 	payload, err := json.Marshal(vmruntime.ManagedExecRequest{
-		Kind:      execRequestKind(req.Kind),
-		ID:        id,
-		Command:   append([]string(nil), req.Command...),
-		Env:       append([]string(nil), req.Env...),
-		RootDir:   req.RootDir,
-		Path:      req.Path,
-		Directory: req.Directory,
-		WorkDir:   req.WorkDir,
-		User:      req.User,
-		Stdin:     append([]byte(nil), req.Stdin...),
-		TTY:       req.TTY,
-		Cols:      req.Cols,
-		Rows:      req.Rows,
+		Kind:        execRequestKind(req.Kind),
+		ID:          id,
+		Command:     append([]string(nil), req.Command...),
+		Env:         append([]string(nil), req.Env...),
+		RootDir:     req.RootDir,
+		Path:        req.Path,
+		Directory:   req.Directory,
+		WorkDir:     req.WorkDir,
+		User:        req.User,
+		Stdin:       append([]byte(nil), req.Stdin...),
+		StdinClosed: req.StdinClosed,
+		TTY:         req.TTY,
+		Cols:        req.Cols,
+		Rows:        req.Rows,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal exec request: %w", err)

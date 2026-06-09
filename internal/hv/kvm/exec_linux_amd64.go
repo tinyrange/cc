@@ -381,19 +381,20 @@ func handleManagedExit(vm *VM, vcpuIndex int, uart *serial.UART8250, fsdevs []*v
 
 func sendManagedExec(control virtio.VsockConn, id string, req client.ExecRequest) error {
 	payload, err := json.Marshal(vmruntime.ManagedExecRequest{
-		Kind:      execRequestKind(req.Kind),
-		ID:        id,
-		Command:   append([]string(nil), req.Command...),
-		Env:       append([]string(nil), req.Env...),
-		RootDir:   req.RootDir,
-		Path:      req.Path,
-		Directory: req.Directory,
-		WorkDir:   req.WorkDir,
-		User:      req.User,
-		Stdin:     append([]byte(nil), req.Stdin...),
-		TTY:       req.TTY,
-		Cols:      req.Cols,
-		Rows:      req.Rows,
+		Kind:        execRequestKind(req.Kind),
+		ID:          id,
+		Command:     append([]string(nil), req.Command...),
+		Env:         append([]string(nil), req.Env...),
+		RootDir:     req.RootDir,
+		Path:        req.Path,
+		Directory:   req.Directory,
+		WorkDir:     req.WorkDir,
+		User:        req.User,
+		Stdin:       append([]byte(nil), req.Stdin...),
+		StdinClosed: req.StdinClosed,
+		TTY:         req.TTY,
+		Cols:        req.Cols,
+		Rows:        req.Rows,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal exec request: %w", err)
@@ -401,12 +402,14 @@ func sendManagedExec(control virtio.VsockConn, id string, req client.ExecRequest
 	if _, err := control.Write(append(payload, '\n')); err != nil {
 		return fmt.Errorf("write exec request: %w", err)
 	}
-	closePayload, err := json.Marshal(vmruntime.ManagedExecRequest{Kind: "stdin_close", ID: id})
-	if err != nil {
-		return fmt.Errorf("marshal stdin close request: %w", err)
-	}
-	if _, err := control.Write(append(closePayload, '\n')); err != nil {
-		return fmt.Errorf("write stdin close request: %w", err)
+	if len(req.Stdin) == 0 && !req.StdinClosed {
+		closePayload, err := json.Marshal(vmruntime.ManagedExecRequest{Kind: "stdin_close", ID: id})
+		if err != nil {
+			return fmt.Errorf("marshal stdin close request: %w", err)
+		}
+		if _, err := control.Write(append(closePayload, '\n')); err != nil {
+			return fmt.Errorf("write stdin close request: %w", err)
+		}
 	}
 	return nil
 }

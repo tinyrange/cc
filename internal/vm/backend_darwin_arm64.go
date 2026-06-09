@@ -152,16 +152,17 @@ func (b *runtimeBackend) RunInInstance(
 			return client.ExecResponse{}, err
 		}
 		return inst.Exec(ctx, client.ExecRequest{
-			Command:    append([]string(nil), req.Command...),
-			Env:        append([]string(nil), req.Env...),
-			RootDir:    req.RootDir,
-			ReplaceEnv: req.ReplaceEnv,
-			WorkDir:    req.WorkDir,
-			User:       req.User,
-			Stdin:      append([]byte(nil), req.Stdin...),
-			TTY:        req.TTY,
-			Cols:       req.Cols,
-			Rows:       req.Rows,
+			Command:     append([]string(nil), req.Command...),
+			Env:         append([]string(nil), req.Env...),
+			RootDir:     req.RootDir,
+			ReplaceEnv:  req.ReplaceEnv,
+			WorkDir:     req.WorkDir,
+			User:        req.User,
+			Stdin:       append([]byte(nil), req.Stdin...),
+			StdinClosed: req.StdinClosed,
+			TTY:         req.TTY,
+			Cols:        req.Cols,
+			Rows:        req.Rows,
 		})
 	}
 
@@ -207,6 +208,7 @@ func (b *runtimeBackend) RunInInstance(
 		WorkDir:     workDir,
 		User:        req.User,
 		Stdin:       append([]byte(nil), req.Stdin...),
+		StdinClosed: req.StdinClosed,
 		TTY:         req.TTY,
 		Cols:        req.Cols,
 		Rows:        req.Rows,
@@ -271,6 +273,7 @@ func (b *runtimeBackend) RunInInstanceStream(
 		WorkDir:     workDir,
 		User:        req.User,
 		Stdin:       append([]byte(nil), req.Stdin...),
+		StdinClosed: req.StdinClosed,
 		TTY:         req.TTY,
 		Cols:        req.Cols,
 		Rows:        req.Rows,

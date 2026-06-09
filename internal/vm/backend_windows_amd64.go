@@ -261,14 +261,15 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 			return client.ExecResponse{}, err
 		}
 		execReq := client.ExecRequest{
-			Command: command,
-			Env:     env,
-			WorkDir: workDir,
-			User:    req.User,
-			Stdin:   append([]byte(nil), req.Stdin...),
-			TTY:     req.TTY,
-			Cols:    req.Cols,
-			Rows:    req.Rows,
+			Command:     command,
+			Env:         env,
+			WorkDir:     workDir,
+			User:        req.User,
+			Stdin:       append([]byte(nil), req.Stdin...),
+			StdinClosed: req.StdinClosed,
+			TTY:         req.TTY,
+			Cols:        req.Cols,
+			Rows:        req.Rows,
 		}
 		resp, serial, err := whp.RunManagedExecWithFSAndNet(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, windowsNetworkDevice(network), execReq)
 		if err != nil && resp.Output == "" {
@@ -311,16 +312,17 @@ func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runni
 			return client.ExecResponse{}, err
 		}
 		return inst.Exec(ctx, client.ExecRequest{
-			Command:    append([]string(nil), req.Command...),
-			Env:        append([]string(nil), req.Env...),
-			RootDir:    req.RootDir,
-			ReplaceEnv: req.ReplaceEnv,
-			WorkDir:    req.WorkDir,
-			User:       req.User,
-			Stdin:      append([]byte(nil), req.Stdin...),
-			TTY:        req.TTY,
-			Cols:       req.Cols,
-			Rows:       req.Rows,
+			Command:     append([]string(nil), req.Command...),
+			Env:         append([]string(nil), req.Env...),
+			RootDir:     req.RootDir,
+			ReplaceEnv:  req.ReplaceEnv,
+			WorkDir:     req.WorkDir,
+			User:        req.User,
+			Stdin:       append([]byte(nil), req.Stdin...),
+			StdinClosed: req.StdinClosed,
+			TTY:         req.TTY,
+			Cols:        req.Cols,
+			Rows:        req.Rows,
 		})
 	}
 
@@ -369,6 +371,7 @@ func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runni
 		WorkDir:     workDir,
 		User:        req.User,
 		Stdin:       append([]byte(nil), req.Stdin...),
+		StdinClosed: req.StdinClosed,
 		TTY:         req.TTY,
 		Cols:        req.Cols,
 		Rows:        req.Rows,
@@ -429,6 +432,7 @@ func (b *runtimeBackend) RunInInstanceStream(ctx context.Context, inst Instance,
 		WorkDir:     workDir,
 		User:        req.User,
 		Stdin:       append([]byte(nil), req.Stdin...),
+		StdinClosed: req.StdinClosed,
 		TTY:         req.TTY,
 		Cols:        req.Cols,
 		Rows:        req.Rows,
@@ -527,6 +531,7 @@ func (i *windowsInstance) Exec(ctx context.Context, req client.ExecRequest) (cli
 		WorkDir:     workDir,
 		User:        req.User,
 		Stdin:       append([]byte(nil), req.Stdin...),
+		StdinClosed: req.StdinClosed,
 		TTY:         req.TTY,
 		Cols:        req.Cols,
 		Rows:        req.Rows,
@@ -568,6 +573,7 @@ func (i *windowsInstance) ExecStream(ctx context.Context, req client.ExecRequest
 		WorkDir:     workDir,
 		User:        req.User,
 		Stdin:       append([]byte(nil), req.Stdin...),
+		StdinClosed: req.StdinClosed,
 		TTY:         req.TTY,
 		Cols:        req.Cols,
 		Rows:        req.Rows,

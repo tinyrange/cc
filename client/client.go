@@ -418,17 +418,18 @@ func (c *Client) RunInteractiveStream(req RunRequest, inputs <-chan ExecInput, o
 
 func (c *Client) RunEvents(req RunRequest) ([]ExecEvent, error) {
 	return c.ExecEvents(ExecRequest{
-		ID:         req.ID,
-		Command:    append([]string(nil), req.Command...),
-		Env:        append([]string(nil), req.Env...),
-		RootDir:    req.RootDir,
-		ReplaceEnv: req.ReplaceEnv,
-		WorkDir:    req.WorkDir,
-		User:       req.User,
-		Stdin:      append([]byte(nil), req.Stdin...),
-		TTY:        req.TTY,
-		Cols:       req.Cols,
-		Rows:       req.Rows,
+		ID:          req.ID,
+		Command:     append([]string(nil), req.Command...),
+		Env:         append([]string(nil), req.Env...),
+		RootDir:     req.RootDir,
+		ReplaceEnv:  req.ReplaceEnv,
+		WorkDir:     req.WorkDir,
+		User:        req.User,
+		Stdin:       append([]byte(nil), req.Stdin...),
+		StdinClosed: req.StdinClosed,
+		TTY:         req.TTY,
+		Cols:        req.Cols,
+		Rows:        req.Rows,
 	})
 }
 

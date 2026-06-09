@@ -73,20 +73,21 @@ type share struct {
 }
 
 type execRequest struct {
-	Kind    string   `json:"kind,omitempty"`
-	ID      string   `json:"id"`
-	Command []string `json:"command,omitempty"`
-	Env     []string `json:"env,omitempty"`
-	RootDir string   `json:"root_dir,omitempty"`
-	Path    string   `json:"path,omitempty"`
-	Dir     bool     `json:"directory,omitempty"`
-	WorkDir string   `json:"workdir,omitempty"`
-	User    string   `json:"user,omitempty"`
-	Stdin   []byte   `json:"stdin,omitempty"`
-	TTY     bool     `json:"tty,omitempty"`
-	Signal  string   `json:"signal,omitempty"`
-	Cols    int      `json:"cols,omitempty"`
-	Rows    int      `json:"rows,omitempty"`
+	Kind        string   `json:"kind,omitempty"`
+	ID          string   `json:"id"`
+	Command     []string `json:"command,omitempty"`
+	Env         []string `json:"env,omitempty"`
+	RootDir     string   `json:"root_dir,omitempty"`
+	Path        string   `json:"path,omitempty"`
+	Dir         bool     `json:"directory,omitempty"`
+	WorkDir     string   `json:"workdir,omitempty"`
+	User        string   `json:"user,omitempty"`
+	Stdin       []byte   `json:"stdin,omitempty"`
+	StdinClosed bool     `json:"stdin_closed,omitempty"`
+	TTY         bool     `json:"tty,omitempty"`
+	Signal      string   `json:"signal,omitempty"`
+	Cols        int      `json:"cols,omitempty"`
+	Rows        int      `json:"rows,omitempty"`
 }
 
 type managedExec struct {
@@ -1137,11 +1138,13 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 			delete(active, req.ID)
 			activeMu.Unlock()
 		})
-		if len(req.Stdin) > 0 {
+		if len(req.Stdin) > 0 || req.StdinClosed {
 			initialStdin := append([]byte(nil), req.Stdin...)
 			go func(id string, managed *managedExec) {
-				if err := managed.writeStdin(initialStdin); err != nil {
-					writeKernel("ccx3-init: write initial stdin: " + err.Error())
+				if len(initialStdin) > 0 {
+					if err := managed.writeStdin(initialStdin); err != nil {
+						writeKernel("ccx3-init: write initial stdin: " + err.Error())
+					}
 				}
 				if err := managed.closeStdin(); err != nil {
 					writeKernel("ccx3-init: close initial stdin: " + err.Error())
