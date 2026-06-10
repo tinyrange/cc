@@ -105,6 +105,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		baseEnv: vmruntime.WithDefaultEnv(image.Config.Env),
 		workDir: workDir,
 		rootFS:  rootFS,
+		fsdevs:  fsdevs,
 		dmesg:   req.Dmesg,
 	}, nil
 }
@@ -168,6 +169,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 		baseEnv: vmruntime.WithDefaultEnv(nil),
 		workDir: "/",
 		rootFS:  rootFS,
+		fsdevs:  fsdevs,
 		dmesg:   req.Dmesg,
 	}, nil
 }
@@ -464,10 +466,25 @@ type linuxInstance struct {
 	baseEnv     []string
 	workDir     string
 	rootFS      virtio.ShareMounter
+	fsdevs      []*virtio.FS
 	dmesg       bool
 	shareMu     sync.Mutex
 	shares      map[string]client.ShareMount
 	imageMounts map[string]string
+}
+
+func (i *linuxInstance) VirtioFSStats() []virtio.FSStats {
+	if i == nil || len(i.fsdevs) == 0 {
+		return nil
+	}
+	out := make([]virtio.FSStats, 0, len(i.fsdevs))
+	for _, fsdev := range i.fsdevs {
+		if fsdev == nil {
+			continue
+		}
+		out = append(out, fsdev.Stats())
+	}
+	return out
 }
 
 func (i *linuxInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
@@ -519,19 +536,60 @@ func (i *linuxInstance) ExecStream(ctx context.Context, req client.ExecRequest, 
 	if i == nil || i.session == nil {
 		return fmt.Errorf("instance is not running")
 	}
-	resp, err := i.Exec(ctx, req)
+	if req.Kind != "" && req.Kind != "exec" {
+		workDir := req.WorkDir
+		if workDir == "" {
+			workDir = i.workDir
+		}
+		return i.session.ExecStream(ctx, client.ExecRequest{
+			Kind:      req.Kind,
+			RootDir:   req.RootDir,
+			Path:      req.Path,
+			Directory: req.Directory,
+			WorkDir:   workDir,
+			User:      req.User,
+			Stdin:     append([]byte(nil), req.Stdin...),
+		}, inputs, onEvent)
+	}
+	user, err := linuxResolveExecUser(req.User)
 	if err != nil {
 		return err
 	}
-	if onEvent != nil && resp.Output != "" {
-		if err := onEvent(client.ExecEvent{Kind: "stdout", Stream: "stdout", Output: resp.Output, Data: []byte(resp.Output)}); err != nil {
+	env := linuxEffectiveExecEnv(i.baseEnv, req.Env, req.ReplaceEnv)
+	command := append([]string(nil), req.Command...)
+	if !req.SkipResolve {
+		if i.image == nil || i.image.RootFS == nil {
+			return fmt.Errorf("running instance does not have a default image root filesystem")
+		}
+		var err error
+		command, err = imagefs.ResolveCommand(i.image.RootFS, req.Command, env)
+		if err != nil {
 			return err
 		}
 	}
-	if onEvent != nil {
-		return onEvent(client.ExecEvent{Kind: "exit", ExitCode: resp.ExitCode})
+	workDir := req.WorkDir
+	if workDir == "" {
+		workDir = i.workDir
 	}
-	return nil
+	if workDir == "" {
+		workDir = "/"
+	}
+	if !strings.HasPrefix(workDir, "/") {
+		return fmt.Errorf("workdir must be absolute")
+	}
+	return i.session.ExecStream(ctx, client.ExecRequest{
+		Command:     command,
+		Env:         env,
+		RootDir:     req.RootDir,
+		ReplaceEnv:  req.ReplaceEnv,
+		SkipResolve: req.SkipResolve,
+		WorkDir:     workDir,
+		User:        user,
+		Stdin:       append([]byte(nil), req.Stdin...),
+		TTY:         req.TTY,
+		Cols:        req.Cols,
+		Rows:        req.Rows,
+	}, inputs, onEvent)
 }
 
 func (i *linuxInstance) ConsoleHistory(ctx context.Context) (string, error) {

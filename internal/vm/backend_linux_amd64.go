@@ -569,10 +569,12 @@ func (i *linuxInstance) ExecStream(ctx context.Context, req client.ExecRequest, 
 		}
 		return i.session.ExecStream(ctx, client.ExecRequest{
 			Kind:      req.Kind,
+			RootDir:   req.RootDir,
 			Path:      req.Path,
 			Directory: req.Directory,
 			WorkDir:   workDir,
 			User:      req.User,
+			Stdin:     append([]byte(nil), req.Stdin...),
 		}, inputs, onEvent)
 	}
 	user, err := linuxResolveExecUser(req.User)

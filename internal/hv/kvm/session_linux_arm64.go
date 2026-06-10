@@ -4,7 +4,6 @@ package kvm
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"strconv"
@@ -279,17 +278,6 @@ func (s *ManagedSession) Close() error {
 	}
 	if s.cancel != nil {
 		s.cancel()
-	}
-	return nil
-}
-
-func sendManagedExecMessage(control virtio.VsockConn, msg vmruntime.ManagedExecRequest) error {
-	payload, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("marshal exec request: %w", err)
-	}
-	if _, err := control.Write(append(payload, '\n')); err != nil {
-		return fmt.Errorf("write exec request: %w", err)
 	}
 	return nil
 }

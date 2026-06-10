@@ -106,6 +106,7 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		baseEnv: vmruntime.WithDefaultEnv(image.Config.Env),
 		workDir: workDir,
 		rootFS:  rootFS,
+		fsdevs:  fsdevs,
 		network: network,
 		dmesg:   req.Dmesg,
 	}, nil
@@ -170,6 +171,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 		baseEnv: vmruntime.WithDefaultEnv(nil),
 		workDir: "/",
 		rootFS:  rootFS,
+		fsdevs:  fsdevs,
 		network: network,
 		dmesg:   req.Dmesg,
 	}, nil
@@ -485,11 +487,26 @@ type windowsInstance struct {
 	baseEnv     []string
 	workDir     string
 	rootFS      virtio.ShareMounter
+	fsdevs      []*virtio.FS
 	dmesg       bool
 	network     *windowsNetworkRuntime
 	shareMu     sync.Mutex
 	shares      map[string]client.ShareMount
 	imageMounts map[string]string
+}
+
+func (i *windowsInstance) VirtioFSStats() []virtio.FSStats {
+	if i == nil || len(i.fsdevs) == 0 {
+		return nil
+	}
+	out := make([]virtio.FSStats, 0, len(i.fsdevs))
+	for _, fsdev := range i.fsdevs {
+		if fsdev == nil {
+			continue
+		}
+		out = append(out, fsdev.Stats())
+	}
+	return out
 }
 
 func (i *windowsInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
@@ -536,6 +553,21 @@ func (i *windowsInstance) Exec(ctx context.Context, req client.ExecRequest) (cli
 func (i *windowsInstance) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	if i == nil || i.session == nil {
 		return fmt.Errorf("instance is not running")
+	}
+	if req.Kind != "" && req.Kind != "exec" {
+		workDir := req.WorkDir
+		if workDir == "" {
+			workDir = i.workDir
+		}
+		return i.session.ExecStream(ctx, client.ExecRequest{
+			Kind:      req.Kind,
+			RootDir:   req.RootDir,
+			Path:      req.Path,
+			Directory: req.Directory,
+			WorkDir:   workDir,
+			User:      req.User,
+			Stdin:     append([]byte(nil), req.Stdin...),
+		}, inputs, onEvent)
 	}
 	env := windowsEffectiveExecEnv(i.baseEnv, req.Env, req.ReplaceEnv)
 	command := append([]string(nil), req.Command...)

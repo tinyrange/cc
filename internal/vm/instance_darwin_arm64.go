@@ -10,6 +10,7 @@ import (
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/hv/hvf"
 	"j5.nz/cc/internal/imagefs"
+	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/virtio"
 )
 
@@ -21,6 +22,10 @@ type darwinInstance struct {
 
 func (i *darwinInstance) AddShare(ctx context.Context, share client.ShareMount) error {
 	return i.session.AddShare(ctx, share)
+}
+
+func (i *darwinInstance) AddImage(ctx context.Context, mountPath string, image *oci.Image) error {
+	return i.session.AddImage(ctx, mountPath, image)
 }
 
 func (i *darwinInstance) AddPortForward(ctx context.Context, forward client.PortForward) error {

@@ -3,6 +3,8 @@ package guestinit
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 )
 
@@ -11,10 +13,20 @@ func Build(ctx context.Context, cacheDir string) ([]byte, error) {
 }
 
 func BuildForArch(ctx context.Context, cacheDir, goarch string) ([]byte, error) {
-	_, _ = ctx, cacheDir
-	payload := embeddedPayload(goarch)
-	if err := validateEmbeddedPayload(goarch, payload); err != nil {
+	_ = cacheDir
+	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	payload := embeddedPayload(goarch)
+	if embeddedErr := validateEmbeddedPayload(goarch, payload); embeddedErr != nil {
+		sourcePayload, sourceErr := sourceTreePayload(goarch)
+		if sourceErr != nil {
+			return nil, embeddedErr
+		}
+		if err := validateEmbeddedPayload(goarch, sourcePayload); err != nil {
+			return nil, fmt.Errorf("source guest init payload for %q is invalid: %w", goarch, err)
+		}
+		payload = sourcePayload
 	}
 	return append([]byte(nil), payload...), nil
 }
@@ -37,6 +49,14 @@ func RequireEmbedded() error {
 		}
 	}
 	return nil
+}
+
+func sourceTreePayload(goarch string) ([]byte, error) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		return nil, fmt.Errorf("locate guest init package source")
+	}
+	return os.ReadFile(filepath.Join(filepath.Dir(file), "guest-init-linux-"+goarch))
 }
 
 func validateEmbeddedPayload(goarch string, payload []byte) error {
