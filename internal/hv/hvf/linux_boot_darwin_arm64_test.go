@@ -3,26 +3,32 @@
 package hvf_test
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"j5.nz/cc/client"
+	"j5.nz/cc/internal/arm64vm"
 	"j5.nz/cc/internal/hv/hvf"
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/oci"
+	"j5.nz/cc/internal/virtio"
+	"j5.nz/cc/internal/vmruntime"
 )
 
 const hvfCodesignedEnv = "CCX3_HVF_TEST_CODESIGNED"
@@ -88,6 +94,225 @@ func TestHVFBootsPersistentLinuxAndExecsCommands(t *testing.T) {
 	requireGuestOutput(t, second.Output, "42", "persisted")
 }
 
+func TestHVFPersistentLinuxExercisesRuntimeFeatures(t *testing.T) {
+	readOnlyShare := t.TempDir()
+	writableShare := t.TempDir()
+	lateShare := t.TempDir()
+	mustWriteFile(t, filepath.Join(readOnlyShare, "host.txt"), "read-only-share\n")
+	mustWriteFile(t, filepath.Join(lateShare, "late.txt"), "late-share\n")
+
+	req := hvfLinuxRunRequest(t)
+	req.Persistent = true
+	req.Env = []string{"HVF_BASE=base", "HVF_OVERRIDE=base"}
+	req.WorkDir = "/tmp"
+	req.Shares = []hvf.DirectoryShare{
+		{Source: readOnlyShare, Mount: "/mnt/ro", Writable: false},
+		{Source: writableShare, Mount: "/mnt/rw", Writable: true, Cache: "aggressive"},
+	}
+
+	bootEvents := &bootEventRecorder{}
+	ctx, cancel := context.WithTimeout(context.Background(), hvfBootTimeout())
+	defer cancel()
+
+	session, err := hvf.StartContainerStream(ctx, req, bootEvents.Record)
+	if err != nil {
+		t.Fatalf("boot persistent Linux guest with runtime features: %v", err)
+	}
+	defer session.Close()
+	bootEvents.RequireKind(t, "status")
+
+	shareEnv := execInGuestRequest(t, session, client.ExecRequest{
+		Command: []string{
+			"sh",
+			"-lc",
+			"set -eu; printf 'hvf-runtime-features\\n'; pwd; printf 'env=%s/%s/%s\\n' \"$HVF_BASE\" \"$HVF_OVERRIDE\" \"$HVF_EXTRA\"; cat /mnt/ro/host.txt; if printf denied >/mnt/ro/denied 2>/tmp/ro.err; then exit 41; fi; printf guest-write >/mnt/rw/guest.txt; cat /mnt/rw/guest.txt",
+		},
+		Env: []string{"HVF_OVERRIDE=exec", "HVF_EXTRA=extra"},
+	})
+	requireGuestOutput(t, shareEnv.Output, "hvf-runtime-features", "/tmp", "env=base/exec/extra", "read-only-share", "guest-write")
+	if got := mustReadHostFile(t, filepath.Join(writableShare, "guest.txt")); got != "guest-write" {
+		t.Fatalf("writable share did not receive guest write: %q", got)
+	}
+
+	addShareWithTimeout(t, session, client.ShareMount{Source: lateShare, Mount: "/mnt/late", Writable: true})
+	late := execInGuest(t, session, []string{
+		"sh",
+		"-lc",
+		"set -eu; cat /mnt/late/late.txt; printf late-write >/mnt/late/from-guest.txt",
+	})
+	requireGuestOutput(t, late.Output, "late-share")
+	if got := mustReadHostFile(t, filepath.Join(lateShare, "from-guest.txt")); got != "late-write" {
+		t.Fatalf("runtime share did not receive guest write: %q", got)
+	}
+
+	user := execInGuestRequest(t, session, client.ExecRequest{
+		Command: []string{"sh", "-lc", "set -eu; printf 'uid=%s gid=%s\\n' \"$(id -u)\" \"$(id -g)\"; printf user-write >/tmp/user-owned; test -s /tmp/user-owned"},
+		User:    "1234:1235",
+	})
+	requireGuestOutput(t, user.Output, "uid=1234 gid=1235")
+
+	addImageWithTimeout(t, session, "/.ccx3/images/alternate", req.Image)
+	imageRoot := execInGuestRequest(t, session, client.ExecRequest{
+		Command:     []string{"/bin/sh", "-lc", "set -eu; test -r /etc/alpine-release; printf 'image-rootdir\\n'; pwd"},
+		RootDir:     "/.ccx3/images/alternate",
+		SkipResolve: true,
+		WorkDir:     "/",
+	})
+	requireGuestOutput(t, imageRoot.Output, "image-rootdir", "/")
+
+	streamOutput := execStreamInGuest(t, session, client.ExecRequest{
+		Command: []string{"sh", "-lc", "set -eu; while IFS= read -r line; do printf 'line:%s\\n' \"$line\"; done"},
+	}, execStreamInput("alpha\n", "beta\n"), 0)
+	requireGuestOutput(t, streamOutput, "line:alpha", "line:beta")
+
+	ttyOutput := execStreamInGuest(t, session, client.ExecRequest{
+		Command: []string{"sh", "-lc", "set -eu; stty size; printf 'tty-ok\\n'"},
+		TTY:     true,
+		Cols:    77,
+		Rows:    33,
+	}, nil, 0)
+	requireGuestOutput(t, ttyOutput, "33 77", "tty-ok")
+
+	signalOutput := execStreamSignalOnOutput(t, session)
+	requireGuestOutput(t, signalOutput, "signal-ready", "got-term")
+
+	runGuestControl(t, session, client.ExecRequest{Kind: "fs_mkdir", Path: "/hvf-control"}, 0)
+	runGuestControl(t, session, client.ExecRequest{Kind: "fs_write", Path: "/hvf-control/file.txt", Stdin: []byte("control-write")}, 0)
+	archive := runGuestControl(t, session, client.ExecRequest{Kind: "fs_archive", Path: "/hvf-control"}, 0)
+	requireTarFile(t, archive, "hvf-control/file.txt", "control-write")
+	runGuestControl(t, session, client.ExecRequest{
+		Kind:      "fs_extract",
+		Path:      "/hvf-control",
+		Directory: true,
+		Stdin:     tarPayload(t, map[string]string{"extract.txt": "extracted"}),
+	}, 0)
+	extracted := execInGuest(t, session, []string{"sh", "-lc", "set -eu; cat /hvf-control/extract.txt"})
+	requireGuestOutput(t, extracted.Output, "extracted")
+
+	writtenRoot := execInGuest(t, session, []string{"sh", "-lc", "set -eu; printf snapshot-root >/hvf-snapshot.txt; sync"})
+	if writtenRoot.ExitCode != 0 {
+		t.Fatalf("write root snapshot fixture exited with %d", writtenRoot.ExitCode)
+	}
+	flushGuest(t, session)
+	rootSnapshot, err := session.RootSnapshot()
+	if err != nil {
+		t.Fatalf("snapshot guest root filesystem: %v", err)
+	}
+	if got := readImageFile(t, rootSnapshot, "/hvf-snapshot.txt"); got != "snapshot-root" {
+		t.Fatalf("root snapshot mismatch: %q", got)
+	}
+	shareSnapshot, err := session.RootSnapshotAt("/mnt/ro")
+	if err != nil {
+		t.Fatalf("snapshot read-only share: %v", err)
+	}
+	if got := readImageFile(t, shareSnapshot, "/host.txt"); got != "read-only-share\n" {
+		t.Fatalf("share snapshot mismatch: %q", got)
+	}
+
+	stats := session.VirtioFSStats()
+	if len(stats) == 0 {
+		t.Fatalf("expected virtio-fs stats after filesystem activity")
+	}
+	var fuseRequests uint64
+	for _, stat := range stats {
+		fuseRequests += stat.FUSERequests
+	}
+	if fuseRequests == 0 {
+		t.Fatalf("expected virtio-fs FUSE requests after filesystem activity: %+v", stats)
+	}
+}
+
+func TestHVFBootsLinuxWithVirtioDevicesNetworkAndSMP(t *testing.T) {
+	req := hvfLinuxRunRequestWithModules(t, []string{"CONFIG_VIRTIO_NET"}, map[string]string{
+		"CONFIG_VIRTIO_NET": "kernel/drivers/net/virtio_net.ko.gz",
+	})
+	req.CPUs = 2
+	req.Persistent = true
+	req.Network = &vmruntime.GuestNetworkConfig{
+		Interface: "eth0",
+		Address:   "10.42.0.2/24",
+		Gateway:   "10.42.0.1",
+		DNS:       "10.42.0.1",
+	}
+	req.NetDevice = virtio.NewNet(
+		arm64vm.NetBase,
+		arm64vm.NetSize,
+		arm64vm.NetIRQ,
+		net.HardwareAddr{0x02, 0x42, 0x0a, 0x2a, 0x00, 0x02},
+		acceptingNetBackend{},
+	)
+	command := []string{
+		"sh",
+		"-lc",
+		"set -eu; printf 'hvf-devices\\n'; cpus=$(grep -c '^processor' /proc/cpuinfo); test \"$cpus\" -ge 2; printf 'cpus=%s\\n' \"$cpus\"; dd if=/dev/hwrng of=/tmp/hvf-rng bs=16 count=1 2>/dev/null; test \"$(wc -c </tmp/hvf-rng)\" = 16; printf 'rng=ok\\n'; test -d /sys/class/net/eth0; test \"$(cat /sys/class/net/eth0/address)\" = '02:42:0a:2a:00:02'; grep -q '^nameserver 10.42.0.1$' /etc/resolv.conf; printf 'net=%s\\n' \"$(cat /sys/class/net/eth0/address)\"",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), hvfBootTimeout())
+	defer cancel()
+
+	session, err := hvf.StartContainer(ctx, req)
+	if err != nil {
+		t.Fatalf("boot Linux guest with virtio devices, network, and SMP: %v", err)
+	}
+	defer session.Close()
+
+	result := execInGuest(t, session, command)
+	requireGuestOutput(t, result.Output, "hvf-devices", "cpus=", "rng=ok", "net=02:42:0a:2a:00:02")
+}
+
+func TestHVFPersistentLinuxConsoleHistoryWithDmesg(t *testing.T) {
+	req := hvfLinuxRunRequest(t)
+	req.Persistent = true
+	req.Dmesg = true
+
+	ctx, cancel := context.WithTimeout(context.Background(), hvfBootTimeout())
+	defer cancel()
+
+	session, err := hvf.StartContainer(ctx, req)
+	if err != nil {
+		t.Fatalf("boot persistent Linux guest with dmesg enabled: %v", err)
+	}
+	defer session.Close()
+
+	execInGuest(t, session, []string{"sh", "-lc", "true"})
+	history, err := session.ConsoleHistory(context.Background())
+	if err != nil {
+		t.Fatalf("read console history: %v", err)
+	}
+	requireGuestOutput(t, history, "ccx3-init")
+}
+
+func TestHVFBootsLinuxWithNestedVirtualizationWhenSupported(t *testing.T) {
+	supported, err := hvf.NestedVirtualizationSupported()
+	if err != nil {
+		t.Fatalf("check nested virtualization support: %v", err)
+	}
+	if !supported {
+		t.Skip("nested virtualization is not supported on this Mac")
+	}
+
+	req := hvfLinuxRunRequest(t)
+	req.NestedVirt = true
+	req.Persistent = true
+	command := []string{
+		"sh",
+		"-lc",
+		"set -eu; printf 'hvf-nested\\n'; cat /proc/sys/kernel/ostype; test -r /proc/cpuinfo",
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), hvfBootTimeout())
+	defer cancel()
+
+	session, err := hvf.StartContainer(ctx, req)
+	if err != nil {
+		t.Fatalf("boot Linux guest with nested virtualization enabled: %v", err)
+	}
+	defer session.Close()
+
+	result := execInGuest(t, session, command)
+	requireGuestOutput(t, result.Output, "hvf-nested", "Linux")
+}
+
 func runCodesignedTestBinary() (int, error) {
 	exe, err := os.Executable()
 	if err != nil {
@@ -146,22 +371,213 @@ func copyFile(src, dst string) error {
 	return out.Close()
 }
 
+type acceptingNetBackend struct{}
+
+func (acceptingNetBackend) HandleTxPacket([]byte) error {
+	return nil
+}
+
+type bootEventRecorder struct {
+	mu     sync.Mutex
+	events []client.BootEvent
+}
+
+func (r *bootEventRecorder) Record(event client.BootEvent) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, event)
+	return nil
+}
+
+func (r *bootEventRecorder) RequireKind(t *testing.T, kind string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		r.mu.Lock()
+		for _, event := range r.events {
+			if event.Kind == kind {
+				r.mu.Unlock()
+				return
+			}
+		}
+		events := append([]client.BootEvent(nil), r.events...)
+		r.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatalf("boot events did not include kind %q: %+v", kind, events)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func execInGuest(t *testing.T, session *hvf.ContainerSession, command []string) client.ExecResponse {
+	t.Helper()
+	return execInGuestRequest(t, session, client.ExecRequest{Command: command})
+}
+
+func execInGuestRequest(t *testing.T, session *hvf.ContainerSession, req client.ExecRequest) client.ExecResponse {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), hvfExecTimeout())
 	defer cancel()
-	resp, err := session.Exec(ctx, client.ExecRequest{Command: command})
+	resp, err := session.Exec(ctx, req)
 	if err != nil {
 		history, _ := session.ConsoleHistory(context.Background())
-		t.Fatalf("run guest command %q: %v\nconsole:\n%s", command, err, history)
+		t.Fatalf("run guest command %q: %v\nconsole:\n%s", req.Command, err, history)
 	}
 	if resp.ExitCode != 0 {
-		t.Fatalf("guest command %q exited with %d\noutput:\n%s", command, resp.ExitCode, resp.Output)
+		t.Fatalf("guest command %q exited with %d\noutput:\n%s", req.Command, resp.ExitCode, resp.Output)
 	}
 	return resp
 }
 
+func execStreamInput(chunks ...string) <-chan client.ExecInput {
+	inputs := make(chan client.ExecInput, len(chunks))
+	for _, chunk := range chunks {
+		inputs <- client.ExecInput{Kind: "stdin", Input: chunk}
+	}
+	close(inputs)
+	return inputs
+}
+
+func execStreamInGuest(t *testing.T, session *hvf.ContainerSession, req client.ExecRequest, inputs <-chan client.ExecInput, wantExit int) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), hvfExecTimeout())
+	defer cancel()
+	var output bytes.Buffer
+	var exitCode *int
+	err := session.ExecStream(ctx, req, inputs, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "stdout", "stderr":
+			if len(event.Data) > 0 {
+				output.Write(event.Data)
+			} else {
+				output.WriteString(event.Output)
+			}
+		case "exit":
+			code := event.ExitCode
+			exitCode = &code
+		}
+		return nil
+	})
+	if err != nil {
+		history, _ := session.ConsoleHistory(context.Background())
+		t.Fatalf("stream guest exec %q: %v\noutput:\n%s\nconsole:\n%s", req.Command, err, output.String(), history)
+	}
+	if exitCode == nil {
+		t.Fatalf("stream guest exec %q did not report an exit\noutput:\n%s", req.Command, output.String())
+	}
+	if *exitCode != wantExit {
+		t.Fatalf("stream guest exec %q exited with %d, want %d\noutput:\n%s", req.Command, *exitCode, wantExit, output.String())
+	}
+	return output.String()
+}
+
+func execStreamSignalOnOutput(t *testing.T, session *hvf.ContainerSession) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), hvfExecTimeout())
+	defer cancel()
+	inputs := make(chan client.ExecInput, 1)
+	var output bytes.Buffer
+	var exitCode *int
+	signaled := false
+	err := session.ExecStream(ctx, client.ExecRequest{
+		Command: []string{"sh", "-lc", "trap 'echo got-term; exit 7' TERM; echo signal-ready; while :; do sleep 1; done"},
+	}, inputs, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "stdout", "stderr":
+			if len(event.Data) > 0 {
+				output.Write(event.Data)
+			} else {
+				output.WriteString(event.Output)
+			}
+			if !signaled && strings.Contains(output.String(), "signal-ready") {
+				signaled = true
+				inputs <- client.ExecInput{Kind: "signal", Signal: "TERM"}
+				close(inputs)
+			}
+		case "exit":
+			code := event.ExitCode
+			exitCode = &code
+		}
+		return nil
+	})
+	if err != nil {
+		history, _ := session.ConsoleHistory(context.Background())
+		t.Fatalf("stream guest signal exec: %v\noutput:\n%s\nconsole:\n%s", err, output.String(), history)
+	}
+	if exitCode == nil {
+		t.Fatalf("stream guest signal exec did not report an exit\noutput:\n%s", output.String())
+	}
+	if *exitCode != 7 {
+		t.Fatalf("stream guest signal exec exited with %d, want 7\noutput:\n%s", *exitCode, output.String())
+	}
+	return output.String()
+}
+
+func runGuestControl(t *testing.T, session *hvf.ContainerSession, req client.ExecRequest, wantExit int) []byte {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), hvfExecTimeout())
+	defer cancel()
+	var output bytes.Buffer
+	var exitCode *int
+	err := session.ExecStream(ctx, req, nil, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "stdout", "stderr":
+			if len(event.Data) > 0 {
+				output.Write(event.Data)
+			} else {
+				output.WriteString(event.Output)
+			}
+		case "exit":
+			code := event.ExitCode
+			exitCode = &code
+		}
+		return nil
+	})
+	if err != nil {
+		history, _ := session.ConsoleHistory(context.Background())
+		t.Fatalf("run guest control request %q path %q: %v\noutput:\n%s\nconsole:\n%s", req.Kind, req.Path, err, output.String(), history)
+	}
+	if exitCode == nil {
+		t.Fatalf("guest control request %q path %q did not report an exit\noutput:\n%s", req.Kind, req.Path, output.String())
+	}
+	if *exitCode != wantExit {
+		t.Fatalf("guest control request %q path %q exited with %d, want %d\noutput:\n%s", req.Kind, req.Path, *exitCode, wantExit, output.String())
+	}
+	return output.Bytes()
+}
+
+func addShareWithTimeout(t *testing.T, session *hvf.ContainerSession, share client.ShareMount) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), hvfExecTimeout())
+	defer cancel()
+	if err := session.AddShare(ctx, share); err != nil {
+		t.Fatalf("add runtime share %q: %v", share.Mount, err)
+	}
+}
+
+func addImageWithTimeout(t *testing.T, session *hvf.ContainerSession, mount string, image *oci.Image) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), hvfExecTimeout())
+	defer cancel()
+	if err := session.AddImage(ctx, mount, image); err != nil {
+		t.Fatalf("add runtime image at %q: %v", mount, err)
+	}
+}
+
+func flushGuest(t *testing.T, session *hvf.ContainerSession) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), hvfExecTimeout())
+	defer cancel()
+	if err := session.Flush(ctx); err != nil {
+		t.Fatalf("flush guest filesystem state: %v", err)
+	}
+}
+
 func hvfLinuxRunRequest(t *testing.T) hvf.ContainerRunRequest {
+	return hvfLinuxRunRequestWithModules(t, nil, nil)
+}
+
+func hvfLinuxRunRequestWithModules(t *testing.T, extraConfigVars []string, extraModuleMap map[string]string) hvf.ContainerRunRequest {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), hvfPrepareTimeout())
 	defer cancel()
@@ -198,6 +614,10 @@ func hvfLinuxRunRequest(t *testing.T) hvf.ContainerRunRequest {
 		"CONFIG_VIRTIO_VSOCKETS":  "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
 		"CONFIG_HW_RANDOM":        "kernel/drivers/char/hw_random/rng-core.ko.gz",
 		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
+	}
+	configVars = append(configVars, extraConfigVars...)
+	for key, value := range extraModuleMap {
+		moduleMap[key] = value
 	}
 
 	amd64EmulatorPath := ""
@@ -282,6 +702,90 @@ func withRuntimeMountDirs(image *oci.Image) *oci.Image {
 	cloned := *image
 	cloned.RootFS = overlay.Root()
 	return &cloned
+}
+
+func mustWriteFile(t *testing.T, path, contents string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func mustReadHostFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(data)
+}
+
+func readImageFile(t *testing.T, root imagefs.Directory, guestPath string) string {
+	t.Helper()
+	entry, err := imagefs.LookupPath(root, guestPath)
+	if err != nil {
+		t.Fatalf("lookup snapshot path %s: %v", guestPath, err)
+	}
+	if entry.File == nil {
+		t.Fatalf("snapshot path %s is not a file", guestPath)
+	}
+	size, _ := entry.File.Stat()
+	data, err := entry.File.ReadAt(0, uint32(size))
+	if err != nil {
+		t.Fatalf("read snapshot path %s: %v", guestPath, err)
+	}
+	return string(data)
+}
+
+func tarPayload(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for name, contents := range files {
+		header := &tar.Header{
+			Name: name,
+			Mode: 0o644,
+			Size: int64(len(contents)),
+		}
+		if err := tw.WriteHeader(header); err != nil {
+			t.Fatalf("write tar header %s: %v", name, err)
+		}
+		if _, err := io.WriteString(tw, contents); err != nil {
+			t.Fatalf("write tar contents %s: %v", name, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar payload: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func requireTarFile(t *testing.T, archive []byte, name, want string) {
+	t.Helper()
+	tr := tar.NewReader(bytes.NewReader(archive))
+	var names []string
+	for {
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read tar archive: %v", err)
+		}
+		names = append(names, header.Name)
+		if header.Name != name {
+			continue
+		}
+		data, err := io.ReadAll(tr)
+		if err != nil {
+			t.Fatalf("read tar file %s: %v", name, err)
+		}
+		if string(data) != want {
+			t.Fatalf("tar file %s = %q, want %q", name, string(data), want)
+		}
+		return
+	}
+	t.Fatalf("tar archive did not contain %s; entries: %s", name, strings.Join(names, ", "))
 }
 
 func requireGuestOutput(t *testing.T, output string, fragments ...string) {

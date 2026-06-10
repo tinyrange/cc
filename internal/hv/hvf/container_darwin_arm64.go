@@ -947,7 +947,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	if req.Image != nil {
 		baseEnv = append([]string(nil), req.Image.Config.Env...)
 	}
-	baseEnv = vmruntime.WithDefaultEnv(baseEnv)
+	baseEnv = vmruntime.WithDefaultEnv(vmruntime.MergeEnv(baseEnv, req.Env))
 
 	initrd, err := arm64vm.BuildPersistentInitramfs(req, baseEnv, workDir)
 	if err != nil {
