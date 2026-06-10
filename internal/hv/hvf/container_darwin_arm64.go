@@ -484,10 +484,12 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 		return client.ExecResponse{}, err
 	}
 	timingLog("session.Exec writeControlPayload took=%s argv=%q id=%s", time.Since(startTime), req.Command, id)
-	if err := s.sendStdinClose(id); err != nil {
-		return client.ExecResponse{}, err
+	if len(req.Stdin) == 0 {
+		if err := s.sendStdinClose(id); err != nil {
+			return client.ExecResponse{}, err
+		}
+		timingLog("session.Exec sendStdinClose took=%s argv=%q id=%s", time.Since(startTime), req.Command, id)
 	}
-	timingLog("session.Exec sendStdinClose took=%s argv=%q id=%s", time.Since(startTime), req.Command, id)
 
 	beginSegment, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
 		return hasManagedExecBegin(text, id)
@@ -667,7 +669,7 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 
 	if inputs != nil {
 		go s.forwardExecInputs(ctx, id, inputs)
-	} else {
+	} else if len(req.Stdin) == 0 {
 		stdinStart := time.Now()
 		if err := s.sendStdinClose(id); err != nil {
 			return err
@@ -683,23 +685,34 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 }
 
 func (s *ContainerSession) forwardExecInputs(ctx context.Context, id string, inputs <-chan client.ExecInput) {
+	stdinClosed := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case input, ok := <-inputs:
 			if !ok {
-				_ = s.sendStdinClose(id)
+				if !stdinClosed {
+					_ = s.sendStdinClose(id)
+				}
 				return
 			}
 			msg := guestExecRequest{ID: id, Kind: input.Kind}
 			switch input.Kind {
 			case "stdin":
+				if stdinClosed {
+					continue
+				}
 				if len(input.Data) > 0 {
 					msg.Stdin = append([]byte(nil), input.Data...)
 				} else if input.Input != "" {
 					msg.Stdin = []byte(input.Input)
 				}
+			case "stdin_close":
+				if stdinClosed {
+					continue
+				}
+				stdinClosed = true
 			case "signal":
 				msg.Signal = input.Signal
 			case "resize":

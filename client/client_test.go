@@ -6,6 +6,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"golang.org/x/net/websocket"
 )
 
 func TestClientRunForwardStatusAndErrorDecoding(t *testing.T) {
@@ -109,6 +112,84 @@ func TestClientRunStreamDecodesNDJSON(t *testing.T) {
 	}
 	if len(events) != 2 || events[0].Kind != "stdout" || events[1].Kind != "exit" || events[1].ExitCode != 7 {
 		t.Fatalf("events = %+v", events)
+	}
+}
+
+func TestClientRunInteractiveStreamHalfClosesStdin(t *testing.T) {
+	inputsSeen := make(chan []ExecInput, 1)
+	errs := make(chan error, 1)
+	mux := http.NewServeMux()
+	mux.Handle("/vm/run/stream", websocket.Server{
+		Handshake: func(*websocket.Config, *http.Request) error { return nil },
+		Handler: func(ws *websocket.Conn) {
+			var req RunRequest
+			if err := websocket.JSON.Receive(ws, &req); err != nil {
+				errs <- err
+				return
+			}
+			var got []ExecInput
+			for {
+				var input ExecInput
+				if err := websocket.JSON.Receive(ws, &input); err != nil {
+					errs <- err
+					return
+				}
+				got = append(got, input)
+				if input.Kind == "stdin_close" {
+					break
+				}
+			}
+			_ = ws.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+			var extra ExecInput
+			if err := websocket.JSON.Receive(ws, &extra); err == nil {
+				got = append(got, extra)
+			}
+			_ = ws.SetReadDeadline(time.Time{})
+			inputsSeen <- got
+			if err := websocket.JSON.Send(ws, ExecEvent{Kind: "stdout", Output: "after-eof"}); err != nil {
+				errs <- err
+				return
+			}
+			if err := websocket.JSON.Send(ws, ExecEvent{Kind: "exit", ExitCode: 0}); err != nil {
+				errs <- err
+				return
+			}
+			errs <- nil
+		},
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	inputs := make(chan ExecInput, 4)
+	inputs <- ExecInput{Kind: "stdin", Input: "hello"}
+	inputs <- ExecInput{Kind: "stdin_close"}
+	inputs <- ExecInput{Kind: "stdin", Input: "ignored-after-close"}
+	close(inputs)
+
+	c := &Client{url: srv.URL, client: *srv.Client()}
+	var output strings.Builder
+	err := c.RunInteractiveStreamIn("vm", RunRequest{Image: "alpine", Command: []string{"sh"}}, inputs, func(event ExecEvent) error {
+		if event.Kind == "stdout" {
+			output.WriteString(event.Output)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("RunInteractiveStreamIn: %v", err)
+	}
+	if output.String() != "after-eof" {
+		t.Fatalf("output = %q", output.String())
+	}
+	select {
+	case got := <-inputsSeen:
+		if len(got) != 2 || got[0].Kind != "stdin" || got[0].Input != "hello" || got[1].Kind != "stdin_close" {
+			t.Fatalf("inputs = %+v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("server did not receive stdin EOF")
+	}
+	if err := <-errs; err != nil {
+		t.Fatalf("server error: %v", err)
 	}
 }
 

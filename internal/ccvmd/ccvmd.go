@@ -1537,7 +1537,11 @@ func serveRunWebSocket(ws *websocket.Conn, runner func(context.Context, client.E
 			if err := websocket.JSON.Receive(ws, &input); err != nil {
 				return
 			}
-			inputs <- input
+			select {
+			case inputs <- input:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 
@@ -1570,7 +1574,11 @@ func serveRunRequestWebSocket(ws *websocket.Conn, runner func(context.Context, c
 			if err := websocket.JSON.Receive(ws, &input); err != nil {
 				return
 			}
-			inputs <- input
+			select {
+			case inputs <- input:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 

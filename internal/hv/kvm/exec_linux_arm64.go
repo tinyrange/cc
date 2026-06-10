@@ -225,6 +225,9 @@ func sendManagedExec(control virtio.VsockConn, id string, req client.ExecRequest
 	if _, err := control.Write(append(payload, '\n')); err != nil {
 		return fmt.Errorf("write exec request: %w", err)
 	}
+	if len(req.Stdin) != 0 {
+		return nil
+	}
 	closePayload, err := json.Marshal(vmruntime.ManagedExecRequest{Kind: "stdin_close", ID: id})
 	if err != nil {
 		return fmt.Errorf("marshal stdin close request: %w", err)

@@ -31,8 +31,10 @@ func (s *ManagedSession) ExecStream(ctx context.Context, req client.ExecRequest,
 	}
 	if inputs != nil {
 		go s.forwardExecInputs(ctx, id, inputs)
-	} else if err := s.sendStdinClose(id); err != nil {
-		return transcriptError(err, s.serialOut.String(), s.transcript.String())
+	} else if len(req.Stdin) == 0 {
+		if err := s.sendStdinClose(id); err != nil {
+			return transcriptError(err, s.serialOut.String(), s.transcript.String())
+		}
 	}
 	return s.streamExecEvents(ctx, start, id, onEvent)
 }
@@ -69,14 +71,25 @@ func (s *ManagedSession) sendExecStart(id string, req client.ExecRequest) error 
 }
 
 func (s *ManagedSession) forwardExecInputs(ctx context.Context, id string, inputs <-chan client.ExecInput) {
+	stdinClosed := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case input, ok := <-inputs:
 			if !ok {
-				_ = s.sendStdinClose(id)
+				if !stdinClosed {
+					_ = s.sendStdinClose(id)
+				}
 				return
+			}
+			if input.Kind == "stdin_close" {
+				if stdinClosed {
+					continue
+				}
+				stdinClosed = true
+			} else if input.Kind == "stdin" && stdinClosed {
+				continue
 			}
 			_ = s.sendExecInput(id, input)
 		}
