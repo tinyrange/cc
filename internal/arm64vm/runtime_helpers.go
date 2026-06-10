@@ -65,9 +65,11 @@ func BuildExecInitramfs(req RunRequest, command []string, env []string, workDir 
 		EmulatorTag:      EmulatorTagForPath(req.AMD64EmulatorPath),
 		RootFSTag:        RootFSTag,
 		BeginMarker:      CommandBeginMarker,
+		OutputMarkerPref: CommandOutputMarker,
 		ErrorMarkerPref:  CommandErrorMarker,
 		UsageMarkerPref:  vmruntime.CommandUsageMarker,
 		ExitMarkerPrefix: CommandExitMarkerPref,
+		Network:          req.Network,
 		UnixTime:         req.UnixTime,
 	})
 }

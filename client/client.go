@@ -320,6 +320,10 @@ func (c *Client) AddPortForwardTo(id string, forward PortForward) error {
 	return c.postJSONExpectOK("/vm/forward"+idQuery(id), forward, nil)
 }
 
+func (c *Client) AllowServiceProxyPortTo(id string, port int) error {
+	return c.postJSONExpectOK("/vm/service-proxy-port"+idQuery(id), ServiceProxyPortRequest{Port: port}, nil)
+}
+
 func (c *Client) Run(req RunRequest) (ExecResponse, error) {
 	var ret ExecResponse
 	err := c.postJSONExpectOK("/vm/run", req, &ret)

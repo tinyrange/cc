@@ -292,10 +292,12 @@ type ShareMount struct {
 }
 
 type NetworkConfig struct {
-	Enabled       bool          `json:"enabled,omitempty"`
-	AllowInternet bool          `json:"allow_internet,omitempty"`
-	HostDNSName   string        `json:"host_dns_name,omitempty"`
-	PortForwards  []PortForward `json:"port_forwards,omitempty"`
+	Enabled                  bool          `json:"enabled,omitempty"`
+	AllowInternet            bool          `json:"allow_internet,omitempty"`
+	BlockHostAccess          bool          `json:"block_host_access,omitempty"`
+	HostDNSName              string        `json:"host_dns_name,omitempty"`
+	AllowedServiceProxyPorts []int         `json:"allowed_service_proxy_ports,omitempty"`
+	PortForwards             []PortForward `json:"port_forwards,omitempty"`
 }
 
 type PortForward struct {
@@ -304,6 +306,10 @@ type PortForward struct {
 	HostPort  int    `json:"host_port,omitempty"`
 	GuestAddr string `json:"guest_addr,omitempty"`
 	GuestPort int    `json:"guest_port,omitempty"`
+}
+
+type ServiceProxyPortRequest struct {
+	Port int `json:"port"`
 }
 
 type VMSupportedResponse struct {

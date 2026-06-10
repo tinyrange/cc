@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -314,6 +316,13 @@ func TestRuntimePersistentLinuxExercisesRuntimeFeatures(t *testing.T) {
 	})
 	requireGuestOutput(t, user.Output, "uid=1234 gid=1235")
 
+	rootMount := execInRuntime(t, inst, []string{
+		"sh",
+		"-lc",
+		"set -eu; awk '$4 == \"/\" && $5 == \"/\" { found = 1 } END { exit found ? 0 : 1 }' /proc/self/mountinfo; printf 'root-mount-ok\n'",
+	})
+	requireGuestOutput(t, rootMount.Output, "root-mount-ok")
+
 	alt := runInRuntimeInstance(t, env, inst, client.RunRequest{
 		Image:   env.altImageName,
 		Command: []string{"sh", "-lc", "set -eu; test -r /etc/alpine-release; printf 'image-run-in-instance\n'; pwd"},
@@ -428,6 +437,183 @@ func TestRuntimeBootsLinuxWithVirtioDevicesNetworkAndSMP(t *testing.T) {
 			t.Fatalf("network-enabled instance reported an empty IPv4 address")
 		}
 	}
+}
+
+func TestRuntimeIsolatedGuestCanReachAllowedServiceProxyPort(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	if !runtimeBootContains(env.caps.NetworkModes, "user") {
+		t.Skip("runtime backend does not support user networking")
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen host proxy fixture: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	server := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/probe" {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = io.WriteString(w, "proxy-ok\n")
+		}),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- server.Serve(ln)
+	}()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = server.Shutdown(ctx)
+		if err := <-done; err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("host proxy fixture serve: %v", err)
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
+	defer cancel()
+	resp, err := env.backend.Run(ctx, client.RunRequest{
+		Image:    env.imageName,
+		MemoryMB: env.memoryMB,
+		CPUs:     1,
+		Network: &client.NetworkConfig{
+			Enabled:                  true,
+			AllowInternet:            true,
+			BlockHostAccess:          true,
+			AllowedServiceProxyPorts: []int{port},
+		},
+		Command: []string{
+			"sh",
+			"-lc",
+			fmt.Sprintf("set -eu; busybox wget -T 5 -qO- http://10.42.0.100:%d/probe", port),
+		},
+	})
+	requireRunResponse(t, resp, err, 0)
+	requireGuestOutput(t, resp.Output, "proxy-ok")
+}
+
+func TestRuntimeIsolatedAllowedServiceProxyStreamsFlushedResponse(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	if !runtimeBootContains(env.caps.NetworkModes, "user") {
+		t.Skip("runtime backend does not support user networking")
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen streaming host proxy fixture: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	server := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/events" {
+				http.NotFound(w, r)
+				return
+			}
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: alpha\n\n")
+			flusher.Flush()
+			time.Sleep(100 * time.Millisecond)
+			_, _ = io.WriteString(w, "data: omega\n\n")
+			flusher.Flush()
+		}),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- server.Serve(ln)
+	}()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = server.Shutdown(ctx)
+		if err := <-done; err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("streaming host proxy fixture serve: %v", err)
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
+	defer cancel()
+	resp, err := env.backend.Run(ctx, client.RunRequest{
+		Image:    env.imageName,
+		MemoryMB: env.memoryMB,
+		CPUs:     1,
+		Network: &client.NetworkConfig{
+			Enabled:                  true,
+			AllowInternet:            true,
+			BlockHostAccess:          true,
+			AllowedServiceProxyPorts: []int{port},
+		},
+		Command: []string{
+			"sh",
+			"-lc",
+			fmt.Sprintf("set -eu; busybox wget -T 10 -qO- http://10.42.0.100:%d/events >/tmp/events; grep -q 'data: alpha' /tmp/events; grep -q 'data: omega' /tmp/events; printf 'stream-ok\\n'", port),
+		},
+	})
+	requireRunResponse(t, resp, err, 0)
+	requireGuestOutput(t, resp.Output, "stream-ok")
+}
+
+func TestRuntimeIsolatedRunningGuestCanReachDynamicallyAllowedServiceProxyPort(t *testing.T) {
+	env := newRuntimeBootEnv(t)
+	if !runtimeBootContains(env.caps.NetworkModes, "user") {
+		t.Skip("runtime backend does not support user networking")
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen dynamic host proxy fixture: %v", err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	server := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/probe" {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = io.WriteString(w, "dynamic-proxy-ok\n")
+		}),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- server.Serve(ln)
+	}()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = server.Shutdown(ctx)
+		if err := <-done; err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("dynamic host proxy fixture serve: %v", err)
+		}
+	})
+
+	inst := startRuntimeInstance(t, env, client.CreateInstanceRequest{
+		Network: &client.NetworkConfig{
+			Enabled:         true,
+			AllowInternet:   true,
+			BlockHostAccess: true,
+		},
+	})
+	defer inst.Close()
+	allower, ok := inst.(serviceProxyPortAllower)
+	if !ok {
+		t.Fatalf("runtime instance does not support dynamic service proxy allowlist")
+	}
+	if err := allower.AllowServiceProxyPort(context.Background(), port); err != nil {
+		t.Fatalf("allow service proxy port: %v", err)
+	}
+
+	resp := execInRuntime(t, inst, []string{
+		"sh",
+		"-lc",
+		fmt.Sprintf("set -eu; busybox wget -T 5 -qO- http://10.42.0.100:%d/probe", port),
+	})
+	requireGuestOutput(t, resp.Output, "dynamic-proxy-ok")
 }
 
 func TestRuntimePersistentLinuxConsoleHistoryWithDmesg(t *testing.T) {

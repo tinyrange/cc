@@ -601,6 +601,14 @@ func (i *sidecarInstance) AddPortForward(ctx context.Context, forward client.Por
 	return fmt.Errorf("sidecar network is not enabled")
 }
 
+func (i *sidecarInstance) AllowServiceProxyPort(ctx context.Context, port int) error {
+	_ = ctx
+	if i.network != nil {
+		return i.network.AllowServiceProxyPort(port)
+	}
+	return fmt.Errorf("sidecar network is not enabled")
+}
+
 func (i *sidecarInstance) resolveExecRequest(req client.ExecRequest) (client.ExecRequest, error) {
 	if i == nil || i.resolver == nil {
 		return req, nil

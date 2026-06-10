@@ -36,6 +36,14 @@ func (i *darwinInstance) AddPortForward(ctx context.Context, forward client.Port
 	return i.network.AddPortForward(forward)
 }
 
+func (i *darwinInstance) AllowServiceProxyPort(ctx context.Context, port int) error {
+	_ = ctx
+	if i == nil || i.network == nil {
+		return fmt.Errorf("instance network is not enabled")
+	}
+	return i.network.AllowServiceProxyPort(port)
+}
+
 func (i *darwinInstance) VirtioFSStats() []virtio.FSStats {
 	if i == nil || i.session == nil {
 		return nil

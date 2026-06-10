@@ -248,7 +248,10 @@ type NetStack struct {
 	hostDNSName string  // Name resolved to hostIPv4 by the embedded DNS server.
 
 	serviceProxyEnabled bool // Forward connections destined to serviceIPv4
+	hostAccessEnabled   bool // Expose host/service addresses to guest-originated flows
 	allowInternet       bool // Allow DNS fallback et al
+	serviceProxyPortsMu sync.RWMutex
+	serviceProxyPorts   map[uint16]struct{}
 
 	// tcpDial is used for outbound TCP proxying (transparent gateway mode).
 	// It is injectable for tests.
@@ -296,6 +299,7 @@ func New(l *slog.Logger) *NetStack {
 		serviceIPv4:         defaultServiceIPv4,
 		hostDNSName:         "host.containers.internal",
 		serviceProxyEnabled: true,
+		hostAccessEnabled:   true,
 		allowInternet:       true,
 		tcpListen:           make(map[uint16]*tcpListener),
 		tcpConns:            make(map[tcpFourTuple]*tcpConn),
@@ -455,6 +459,49 @@ func (ns *NetStack) SetGuestIPv4(ip net.IP) error {
 // addressed to serviceIPv4.
 func (ns *NetStack) SetServiceProxyEnabled(enabled bool) {
 	ns.serviceProxyEnabled = enabled
+}
+
+// SetHostAccessEnabled toggles guest-originated access to synthetic host and
+// service addresses. DNS and outbound internet proxying remain available.
+func (ns *NetStack) SetHostAccessEnabled(enabled bool) {
+	ns.hostAccessEnabled = enabled
+}
+
+// SetAllowedServiceProxyPorts permits selected serviceIPv4 ports even when
+// general host access is disabled.
+func (ns *NetStack) SetAllowedServiceProxyPorts(ports []int) {
+	ns.serviceProxyPortsMu.Lock()
+	defer ns.serviceProxyPortsMu.Unlock()
+	if len(ports) == 0 {
+		ns.serviceProxyPorts = nil
+		return
+	}
+	allowed := make(map[uint16]struct{}, len(ports))
+	for _, port := range ports {
+		if port <= 0 || port > 65535 {
+			continue
+		}
+		allowed[uint16(port)] = struct{}{}
+	}
+	if len(allowed) == 0 {
+		ns.serviceProxyPorts = nil
+		return
+	}
+	ns.serviceProxyPorts = allowed
+}
+
+// AllowServiceProxyPort permits one serviceIPv4 port while preserving the
+// current allowlist.
+func (ns *NetStack) AllowServiceProxyPort(port int) {
+	if port <= 0 || port > 65535 {
+		return
+	}
+	ns.serviceProxyPortsMu.Lock()
+	defer ns.serviceProxyPortsMu.Unlock()
+	if ns.serviceProxyPorts == nil {
+		ns.serviceProxyPorts = make(map[uint16]struct{}, 1)
+	}
+	ns.serviceProxyPorts[uint16(port)] = struct{}{}
 }
 
 // SetInternetAccessEnabled toggles access to real DNS lookups, etc.
@@ -831,8 +878,8 @@ func (ns *NetStack) handleARP(srcMAC net.HardwareAddr, payload []byte) error {
 		return nil
 	}
 
-	// Respond if the request targets host IPv4 or service IPv4.
-	if ipEqual(targetIP, ns.hostIPv4[:]) || ipEqual(targetIP, ns.serviceIPv4[:]) {
+	// Respond if the request targets host IPv4 or a reachable service IPv4.
+	if ipEqual(targetIP, ns.hostIPv4[:]) || (ns.serviceARPEnabled() && ipEqual(targetIP, ns.serviceIPv4[:])) {
 		tracef("netstack.handleARP reply", "targetIP=%s", targetIP.String())
 		return ns.sendARPReply(srcMAC, senderMAC, senderIP, targetIP)
 	}
@@ -1734,6 +1781,12 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 
 		// Parse TCP options from SYN
 		opts := parseTCPOptions(hdr.options)
+		dstIP := h.dst.To4()
+		allowServiceProxy := ns.serviceProxyAllowed(dstIP, hdr.dstPort)
+		if !ns.hostAccessEnabled && isHostLocalIPv4(dstIP) && !allowServiceProxy {
+			ns.tcpMu.Unlock()
+			return ns.sendRST(h, hdr)
+		}
 
 		// Local listener present? Create a conn and complete handshake.
 		if listener, ok := ns.tcpListen[hdr.dstPort]; ok {
@@ -1746,25 +1799,18 @@ func (ns *NetStack) handleTCP(h ipv4Header, payload []byte) error {
 			return nil
 		}
 
-		dstIP := h.dst.To4()
 		if netstackTraceEnabled {
 			tracef("netstack.handleTCP connection attempt", "src=%s dst=%s", h.src.String(), h.dst.String())
 		}
 
 		// Proxy service connections to 127.0.0.1:dstPort if enabled.
 		if ns.shouldProxyService(dstIP) {
-			if !ns.serviceProxyEnabled {
+			if !ns.serviceProxyEnabled || (!ns.hostAccessEnabled && !allowServiceProxy) {
 				tracef("netstack.handleTCP proxy disabled -> reset", "dstIP=%s dstPort=%d", h.dst.String(), hdr.dstPort)
 				ns.tcpMu.Unlock()
 				return ns.sendRST(h, hdr)
 			}
-			slog.Info(
-				"raw: starting service proxy",
-				"src",
-				fmt.Sprintf("%v:%d", h.src, hdr.srcPort),
-				"dst",
-				fmt.Sprintf("%v:%d", h.dst, hdr.dstPort),
-			)
+			tracef("netstack.handleTCP service proxy", "src=%s:%d dst=%s:%d", h.src.String(), hdr.srcPort, h.dst.String(), hdr.dstPort)
 			onEstablished := func(c *tcpConn) {
 				ns.startServiceProxy(c)
 			}
@@ -2862,6 +2908,25 @@ func (ns *NetStack) shouldProxyService(ip net.IP) bool {
 	return ip.To4() != nil && ipEqual(ip.To4(), ns.serviceIPv4[:])
 }
 
+func (ns *NetStack) serviceProxyAllowed(ip net.IP, port uint16) bool {
+	if !ns.shouldProxyService(ip) {
+		return false
+	}
+	if ns.hostAccessEnabled {
+		return true
+	}
+	ns.serviceProxyPortsMu.RLock()
+	defer ns.serviceProxyPortsMu.RUnlock()
+	_, ok := ns.serviceProxyPorts[port]
+	return ok
+}
+
+func (ns *NetStack) serviceARPEnabled() bool {
+	ns.serviceProxyPortsMu.RLock()
+	defer ns.serviceProxyPortsMu.RUnlock()
+	return ns.hostAccessEnabled || len(ns.serviceProxyPorts) > 0
+}
+
 // startServiceProxy bridges the TCP conn to 127.0.0.1:dstPort.
 func (ns *NetStack) startServiceProxy(conn *tcpConn) {
 	go func() {
@@ -2871,7 +2936,7 @@ func (ns *NetStack) startServiceProxy(conn *tcpConn) {
 		}
 		outbound, err := net.DialTCP("tcp", nil, addr)
 		if err != nil {
-			slog.Warn(
+			slog.Debug(
 				"raw: service proxy dial failed",
 				"port", conn.key.dstPort,
 				"err", err,
@@ -2901,7 +2966,7 @@ func (ns *NetStack) startOutboundTCPProxy(conn *tcpConn) {
 
 		outbound, err := ns.tcpDial(context.Background(), addr)
 		if err != nil {
-			slog.Warn(
+			slog.Debug(
 				"raw: outbound proxy dial failed",
 				"dst", addr.String(),
 				"err", err,
@@ -3165,36 +3230,40 @@ func (ns *NetStack) StartDNSServer() error {
 		return nil
 	}
 
-	lookup := func(name string) (string, error) {
-		n := strings.TrimSuffix(strings.ToLower(name), ".")
-		switch n {
-		case ns.hostDNSName:
-			return net.IP(ns.hostIPv4[:]).String(), nil
-		case "host.internal":
-			return net.IP(ns.hostIPv4[:]).String(), nil
-		case "guest.internal":
-			return net.IP(ns.guestIPv4[:]).String(), nil
-		case "service.internal":
-			return net.IP(ns.serviceIPv4[:]).String(), nil
-		}
-		if !ns.allowInternet {
-			return "", fmt.Errorf("internet access disabled")
-		}
-		addr, err := net.ResolveIPAddr("ip4", strings.TrimSuffix(name, "."))
-		if err != nil {
-			return "", err
-		}
-		return addr.IP.String(), nil
-	}
-
 	packetConn, err := ns.ListenPacketInternal("udp", ":53")
 	if err != nil {
 		return fmt.Errorf("listen udp port 53: %w", err)
 	}
 
-	dnsSrv := newDNSServer(packetConn, lookup)
+	dnsSrv := newDNSServer(packetConn, ns.lookupDNSName)
 	ns.dnsServer = dnsSrv
 	return nil
+}
+
+func (ns *NetStack) lookupDNSName(name string) (string, error) {
+	n := strings.TrimSuffix(strings.ToLower(name), ".")
+	switch n {
+	case ns.hostDNSName, "host.internal":
+		if !ns.hostAccessEnabled {
+			return "", fmt.Errorf("host access disabled")
+		}
+		return net.IP(ns.hostIPv4[:]).String(), nil
+	case "guest.internal":
+		return net.IP(ns.guestIPv4[:]).String(), nil
+	case "service.internal":
+		if !ns.hostAccessEnabled {
+			return "", fmt.Errorf("host access disabled")
+		}
+		return net.IP(ns.serviceIPv4[:]).String(), nil
+	}
+	if !ns.allowInternet {
+		return "", fmt.Errorf("internet access disabled")
+	}
+	addr, err := net.ResolveIPAddr("ip4", strings.TrimSuffix(name, "."))
+	if err != nil {
+		return "", err
+	}
+	return addr.IP.String(), nil
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -3267,21 +3336,23 @@ func (ns *NetStack) handleDebugStatus(w http.ResponseWriter, r *http.Request) {
 
 // debugStatus is the JSON structure exposed at /status.
 type debugStatus struct {
-	HostIPv4       string   `json:"hostIPv4"`
-	GuestIPv4      string   `json:"guestIPv4"`
-	ServiceIPv4    string   `json:"serviceIPv4"`
-	AllowInternet  bool     `json:"allowInternet"`
-	ServiceProxy   bool     `json:"serviceProxy"`
-	Interfaces     int      `json:"interfaces"`
-	TCPListeners   []uint16 `json:"tcpListeners"`
-	TCPConnections []string `json:"tcpConnections"`
-	UDPSockets     []uint16 `json:"udpSockets"`
-	DebugAddr      string   `json:"debugAddr"`
-	UDPRxPackets   uint64   `json:"udpRxPackets"`
-	UDPTxPackets   uint64   `json:"udpTxPackets"`
-	HostMAC        string   `json:"hostMAC"`
-	ConfiguredMAC  string   `json:"configuredGuestMAC"`
-	ObservedMAC    string   `json:"observedGuestMAC"`
+	HostIPv4                 string   `json:"hostIPv4"`
+	GuestIPv4                string   `json:"guestIPv4"`
+	ServiceIPv4              string   `json:"serviceIPv4"`
+	AllowInternet            bool     `json:"allowInternet"`
+	HostAccess               bool     `json:"hostAccess"`
+	ServiceProxy             bool     `json:"serviceProxy"`
+	AllowedServiceProxyPorts []uint16 `json:"allowedServiceProxyPorts,omitempty"`
+	Interfaces               int      `json:"interfaces"`
+	TCPListeners             []uint16 `json:"tcpListeners"`
+	TCPConnections           []string `json:"tcpConnections"`
+	UDPSockets               []uint16 `json:"udpSockets"`
+	DebugAddr                string   `json:"debugAddr"`
+	UDPRxPackets             uint64   `json:"udpRxPackets"`
+	UDPTxPackets             uint64   `json:"udpTxPackets"`
+	HostMAC                  string   `json:"hostMAC"`
+	ConfiguredMAC            string   `json:"configuredGuestMAC"`
+	ObservedMAC              string   `json:"observedGuestMAC"`
 }
 
 func (ns *NetStack) collectDebugStatus() debugStatus {
@@ -3290,9 +3361,21 @@ func (ns *NetStack) collectDebugStatus() debugStatus {
 		GuestIPv4:     net.IP(ns.guestIPv4[:]).String(),
 		ServiceIPv4:   net.IP(ns.serviceIPv4[:]).String(),
 		AllowInternet: ns.allowInternet,
-		ServiceProxy:  ns.serviceProxyEnabled,
+		HostAccess:    ns.hostAccessEnabled,
+		ServiceProxy:  ns.hostAccessEnabled && ns.serviceProxyEnabled,
 		DebugAddr:     ns.DebugHTTPAddr(),
 	}
+	ns.serviceProxyPortsMu.RLock()
+	if len(ns.serviceProxyPorts) > 0 {
+		status.AllowedServiceProxyPorts = make([]uint16, 0, len(ns.serviceProxyPorts))
+		for port := range ns.serviceProxyPorts {
+			status.AllowedServiceProxyPorts = append(status.AllowedServiceProxyPorts, port)
+		}
+		sort.Slice(status.AllowedServiceProxyPorts, func(i, j int) bool {
+			return status.AllowedServiceProxyPorts[i] < status.AllowedServiceProxyPorts[j]
+		})
+	}
+	ns.serviceProxyPortsMu.RUnlock()
 
 	ns.mu.RLock()
 	if ns.iface != nil {
@@ -3382,6 +3465,33 @@ func ipEqual(a, b []byte) bool {
 		}
 	}
 	return true
+}
+
+func isHostLocalIPv4(ip net.IP) bool {
+	ip4 := ip.To4()
+	if ip4 == nil {
+		return false
+	}
+	switch {
+	case ip4[0] == 0:
+		return true
+	case ip4[0] == 10:
+		return true
+	case ip4[0] == 100 && ip4[1]&0xc0 == 0x40:
+		return true
+	case ip4[0] == 127:
+		return true
+	case ip4[0] == 169 && ip4[1] == 254:
+		return true
+	case ip4[0] == 172 && ip4[1]&0xf0 == 16:
+		return true
+	case ip4[0] == 192 && ip4[1] == 168:
+		return true
+	case ip4[0] >= 224:
+		return true
+	default:
+		return false
+	}
 }
 
 func checksum(data []byte) uint16 {

@@ -646,6 +646,11 @@ func (i *linuxInstance) AddPortForward(ctx context.Context, forward client.PortF
 	return fmt.Errorf("instance network port forwarding is not supported on linux/arm64")
 }
 
+func (i *linuxInstance) AllowServiceProxyPort(ctx context.Context, port int) error {
+	_, _ = ctx, port
+	return fmt.Errorf("instance service proxy port updates are not supported on linux/arm64")
+}
+
 func (i *linuxInstance) AddImage(ctx context.Context, mountPath string, image *oci.Image) error {
 	_ = ctx
 	if i == nil || i.rootFS == nil {

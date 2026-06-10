@@ -30,6 +30,7 @@ const guestQEMUBinfmtPath = "/run/ccx3-qemu-x86_64"
 const initDurationMarker = "__CCX3_INIT_MS__:"
 const execTimingMarker = "__CCX3_TIMING__:"
 const fatalBootMarker = "ccx3-init-fatal: "
+const execPivotMode = "--ccx3-exec-pivot"
 
 var consoleFD = 2
 var kmsgFD = -1
@@ -170,6 +171,13 @@ func (m *managedExec) resize(cols, rows int) error {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == execPivotMode {
+		if err := runExecPivot(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "ccx3-init: exec pivot: %v\n", err)
+			os.Exit(126)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		writeKernel(fatalBootMarker + err.Error())
 		writeConsole(fatalBootMarker + err.Error() + "\n")
@@ -296,6 +304,123 @@ func run() error {
 	return fmt.Errorf("exec command returned unexpectedly")
 }
 
+func runExecPivot(args []string) error {
+	if len(args) < 7 {
+		return fmt.Errorf("invalid exec pivot argument count")
+	}
+	rootDir := args[0]
+	workDir := args[1]
+	uid := args[2]
+	gid := args[3]
+	groups := args[4]
+	if args[5] != "--" {
+		return fmt.Errorf("invalid exec pivot separator")
+	}
+	argv := args[6:]
+	if len(argv) == 0 {
+		return fmt.Errorf("missing command")
+	}
+	if err := pivotExecRoot(rootDir); err != nil {
+		return err
+	}
+	if workDir != "" {
+		if err := os.Chdir(workDir); err != nil {
+			return fmt.Errorf("chdir %s: %w", workDir, err)
+		}
+	}
+	if uid != "" || gid != "" || groups != "" {
+		if err := applyExecCredential(uid, gid, groups); err != nil {
+			return err
+		}
+	}
+	argv0, err := lookPathForExec(argv[0])
+	if err != nil {
+		return err
+	}
+	return syscall.Exec(argv0, argv, os.Environ())
+}
+
+func pivotExecRoot(rootDir string) error {
+	if rootDir == "" {
+		return fmt.Errorf("missing root_dir")
+	}
+	if err := syscall.Mount("", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
+		return fmt.Errorf("make mount namespace private: %w", err)
+	}
+	putOld := filepath.Join(rootDir, ".ccx3-old-root")
+	if err := os.MkdirAll(putOld, 0o700); err != nil {
+		return fmt.Errorf("mkdir put_old: %w", err)
+	}
+	if err := syscall.PivotRoot(rootDir, putOld); err != nil {
+		return fmt.Errorf("pivot_root %s: %w", rootDir, err)
+	}
+	if err := os.Chdir("/"); err != nil {
+		return fmt.Errorf("chdir / after pivot_root: %w", err)
+	}
+	if err := syscall.Unmount("/.ccx3-old-root", syscall.MNT_DETACH); err != nil {
+		return fmt.Errorf("unmount old root: %w", err)
+	}
+	if err := os.Remove("/.ccx3-old-root"); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove old root: %w", err)
+	}
+	return nil
+}
+
+func applyExecCredential(uidText, gidText, groupsText string) error {
+	uid, err := parseUint32(uidText)
+	if err != nil {
+		return fmt.Errorf("invalid uid %q: %w", uidText, err)
+	}
+	gid, err := parseUint32(gidText)
+	if err != nil {
+		return fmt.Errorf("invalid gid %q: %w", gidText, err)
+	}
+	var groups []int
+	if groupsText != "" {
+		for _, part := range strings.Split(groupsText, ",") {
+			group, err := parseUint32(part)
+			if err != nil {
+				return fmt.Errorf("invalid group %q: %w", part, err)
+			}
+			groups = append(groups, int(group))
+		}
+	}
+	if err := syscall.Setgroups(groups); err != nil {
+		return fmt.Errorf("setgroups: %w", err)
+	}
+	if err := syscall.Setgid(int(gid)); err != nil {
+		return fmt.Errorf("setgid: %w", err)
+	}
+	if err := syscall.Setuid(int(uid)); err != nil {
+		return fmt.Errorf("setuid: %w", err)
+	}
+	return nil
+}
+
+func lookPathForExec(file string) (string, error) {
+	if strings.Contains(file, "/") {
+		return file, nil
+	}
+	pathEnv := os.Getenv("PATH")
+	if pathEnv == "" {
+		pathEnv = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	}
+	for _, dir := range strings.Split(pathEnv, ":") {
+		if dir == "" {
+			dir = "."
+		}
+		candidate := filepath.Join(dir, file)
+		info, err := os.Stat(candidate)
+		if err != nil {
+			continue
+		}
+		if info.Mode().IsRegular() && info.Mode()&0o111 != 0 {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("executable file not found in PATH: %s", file)
+}
+
 func writeStage(start time.Time, stage string) {
 	line := fmt.Sprintf("ccx3-init: +%dms %s", time.Since(start).Milliseconds(), stage)
 	writeKernel(line)
@@ -320,11 +445,8 @@ func mountRootFS(tag, emulatorTag string, disableCgroup bool) error {
 	if err := syscall.Mount(tag, "/mnt", "virtiofs", 0, ""); err != nil {
 		return fmt.Errorf("mount virtiofs %s: %w", tag, err)
 	}
-	if err := syscall.Chroot("/mnt"); err != nil {
-		return fmt.Errorf("chroot /mnt: %w", err)
-	}
-	if err := os.Chdir("/"); err != nil {
-		return fmt.Errorf("chdir / after chroot: %w", err)
+	if err := switchRootFS("/mnt"); err != nil {
+		return err
 	}
 
 	for _, dir := range []string{"/proc", "/sys", "/dev", "/tmp", "/run"} {
@@ -357,6 +479,74 @@ func mountRootFS(tag, emulatorTag string, disableCgroup bool) error {
 		}
 	}
 	_ = os.Symlink("/proc/self/fd", "/dev/fd")
+	return nil
+}
+
+func switchRootFS(newRoot string) error {
+	if err := os.Chdir(newRoot); err != nil {
+		return fmt.Errorf("chdir %s before switch_root: %w", newRoot, err)
+	}
+	// pivot_root cannot move away from the initramfs rootfs. Use the
+	// switch_root pattern so later exec roots are not nested under a chroot,
+	// which would prevent user-namespace sandboxes such as bubblewrap.
+	for _, mount := range []string{"/sys/fs/cgroup", "/sys", "/proc"} {
+		_ = syscall.Unmount(mount, syscall.MNT_DETACH)
+	}
+	if err := emptyRootFS(newRoot); err != nil {
+		return err
+	}
+	if err := syscall.Mount(".", "/", "", syscall.MS_MOVE, ""); err != nil {
+		return fmt.Errorf("move root %s to /: %w", newRoot, err)
+	}
+	if err := syscall.Chroot("."); err != nil {
+		return fmt.Errorf("chroot after switch_root: %w", err)
+	}
+	if err := os.Chdir("/"); err != nil {
+		return fmt.Errorf("chdir / after switch_root: %w", err)
+	}
+	return nil
+}
+
+func emptyRootFS(keep string) error {
+	keep = "/" + strings.Trim(strings.TrimSpace(keep), "/")
+	entries, err := os.ReadDir("/")
+	if err != nil {
+		return fmt.Errorf("read old root: %w", err)
+	}
+	for _, entry := range entries {
+		name := "/" + entry.Name()
+		if name == keep {
+			continue
+		}
+		if err := removeRootFSEntry(name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func removeRootFSEntry(name string) error {
+	info, err := os.Lstat(name)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("stat old root entry %s: %w", name, err)
+	}
+	if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+		entries, err := os.ReadDir(name)
+		if err != nil {
+			return fmt.Errorf("read old root dir %s: %w", name, err)
+		}
+		for _, entry := range entries {
+			if err := removeRootFSEntry(filepath.Join(name, entry.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	if err := os.Remove(name); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove old root entry %s: %w", name, err)
+	}
 	return nil
 }
 
@@ -1399,6 +1589,25 @@ func guestTarTarget(dst string, dstDir bool, name string) (string, error) {
 	return filepath.Join(dst, parts[1]), nil
 }
 
+func execPivotArgs(rootDir, workDir string, cred *syscall.Credential, argv []string) []string {
+	uid := ""
+	gid := ""
+	groups := ""
+	if cred != nil {
+		uid = fmt.Sprint(cred.Uid)
+		gid = fmt.Sprint(cred.Gid)
+		if len(cred.Groups) > 0 {
+			parts := make([]string, 0, len(cred.Groups))
+			for _, group := range cred.Groups {
+				parts = append(parts, fmt.Sprint(group))
+			}
+			groups = strings.Join(parts, ",")
+		}
+	}
+	args := []string{rootDir, workDir, uid, gid, groups, "--"}
+	return append(args, argv...)
+}
+
 func runManagedExec(cfg config, control io.Writer, id string, argv []string, env []string, rootDir string, workDir string, user string, stdin io.ReadCloser, managed *managedExec, tty bool, cols int, rows int, cleanup func()) {
 	defer cleanup()
 	execStart := time.Now()
@@ -1409,9 +1618,6 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	writeKernel("ccx3-init: exec " + strings.Join(argv, " "))
 	writeExecTiming(control, id, "start_begin", execStart)
 
-	cmd := exec.Command(argv[0], argv[1:]...)
-	cmd.Env = env
-	cmd.WaitDelay = 2 * time.Second
 	signalGroup := true
 	var rootMounts []string
 	if rootDir != "" {
@@ -1428,9 +1634,36 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		rootMounts = mounts
 		defer teardownExecRoot(rootMounts)
 	}
-	if workDir != "" {
-		cmd.Dir = workDir
+	execCred, err := credentialForUser(user)
+	if err != nil {
+		writeKernel("ccx3-init: resolve user: " + err.Error())
+		writeExecStderr(cfg, control, id, "ccx3-init: resolve user: "+err.Error()+"\n")
+		if cfg.ExitMarkerPrefix != "" {
+			writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
+		}
+		return
 	}
+	if execCred != nil {
+		if err := ensureCredentialUser(rootDir, execCred); err != nil {
+			writeKernel("ccx3-init: ensure user: " + err.Error())
+			writeExecStderr(cfg, control, id, "ccx3-init: ensure user: "+err.Error()+"\n")
+			if cfg.ExitMarkerPrefix != "" {
+				writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
+			}
+			return
+		}
+	}
+	var cmd *exec.Cmd
+	if rootDir != "" {
+		cmd = exec.Command("/proc/self/exe", append([]string{execPivotMode}, execPivotArgs(rootDir, workDir, execCred, argv)...)...)
+	} else {
+		cmd = exec.Command(argv[0], argv[1:]...)
+		if workDir != "" {
+			cmd.Dir = workDir
+		}
+	}
+	cmd.Env = env
+	cmd.WaitDelay = 2 * time.Second
 	var (
 		done       chan struct{}
 		stdoutW    *io.PipeWriter
@@ -1574,26 +1807,10 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	}
-	if cred, err := credentialForUser(user); err != nil {
-		writeKernel("ccx3-init: resolve user: " + err.Error())
-		writeExecStderr(cfg, control, id, "ccx3-init: resolve user: "+err.Error()+"\n")
-		if cfg.ExitMarkerPrefix != "" {
-			writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
-		}
-		return
-	} else if cred != nil {
-		if err := ensureCredentialUser(rootDir, cred); err != nil {
-			writeKernel("ccx3-init: ensure user: " + err.Error())
-			writeExecStderr(cfg, control, id, "ccx3-init: ensure user: "+err.Error()+"\n")
-			if cfg.ExitMarkerPrefix != "" {
-				writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
-			}
-			return
-		}
-		cmd.SysProcAttr.Credential = cred
-	}
 	if rootDir != "" {
-		cmd.SysProcAttr.Chroot = rootDir
+		cmd.SysProcAttr.Cloneflags |= syscall.CLONE_NEWNS
+	} else if execCred != nil {
+		cmd.SysProcAttr.Credential = execCred
 	}
 
 	writeExecTiming(control, id, "start_call", execStart)
@@ -1970,7 +2187,11 @@ func prepareExecRoot(rootDir string) (string, []string, error) {
 	if !strings.HasPrefix(cleaned, "/") {
 		return "", nil, fmt.Errorf("root_dir must be absolute")
 	}
-	mounts := make([]string, 0, 5)
+	mounts := make([]string, 0, 6)
+	if err := syscall.Mount(cleaned, cleaned, "", syscall.MS_BIND, ""); err != nil {
+		return "", nil, fmt.Errorf("bind mount exec root %s: %w", cleaned, err)
+	}
+	mounts = append(mounts, cleaned)
 	for _, dir := range []string{"/proc", "/sys", "/dev", "/run", "/tmp"} {
 		target := cleaned + dir
 		if err := os.MkdirAll(target, 0o755); err != nil {

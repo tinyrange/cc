@@ -675,6 +675,14 @@ func (i *linuxInstance) AddPortForward(ctx context.Context, forward client.PortF
 	return i.network.AddPortForward(forward)
 }
 
+func (i *linuxInstance) AllowServiceProxyPort(ctx context.Context, port int) error {
+	_ = ctx
+	if i == nil || i.network == nil {
+		return fmt.Errorf("instance network is not enabled")
+	}
+	return i.network.AllowServiceProxyPort(port)
+}
+
 func (i *linuxInstance) NetworkIPv4() string {
 	if i == nil || i.network == nil {
 		return ""

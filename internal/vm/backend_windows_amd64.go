@@ -663,6 +663,14 @@ func (i *windowsInstance) AddPortForward(ctx context.Context, forward client.Por
 	return i.network.AddPortForward(forward)
 }
 
+func (i *windowsInstance) AllowServiceProxyPort(ctx context.Context, port int) error {
+	_ = ctx
+	if i == nil || i.network == nil {
+		return fmt.Errorf("instance network is not enabled")
+	}
+	return i.network.AllowServiceProxyPort(port)
+}
+
 func (i *windowsInstance) AddImage(ctx context.Context, mountPath string, image *oci.Image) error {
 	_ = ctx
 	if i == nil || i.rootFS == nil {

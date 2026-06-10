@@ -71,6 +71,8 @@ func newNetworkRuntime(cfg networkDeviceConfig) (_ *networkRuntime, retErr error
 
 	stack := netstack.New(slog.Default())
 	stack.SetInternetAccessEnabled(cfg.Config.AllowInternet)
+	stack.SetHostAccessEnabled(!cfg.Config.BlockHostAccess)
+	stack.SetAllowedServiceProxyPorts(cfg.Config.AllowedServiceProxyPorts)
 	stack.SetHostDNSName(cfg.Config.HostDNSName)
 	if err := stack.SetGuestMAC(cfg.MAC); err != nil {
 		_ = stack.Close()
@@ -246,6 +248,17 @@ func (n *networkRuntime) AddPortForward(forward client.PortForward) error {
 	n.wg.Add(1)
 	n.mu.Unlock()
 	go n.acceptPortForward(ln, net.JoinHostPort(guestAddr, strconv.Itoa(forward.GuestPort)))
+	return nil
+}
+
+func (n *networkRuntime) AllowServiceProxyPort(port int) error {
+	if n == nil || n.stack == nil {
+		return fmt.Errorf("network is not enabled")
+	}
+	if port <= 0 || port > 65535 {
+		return fmt.Errorf("service proxy port %d out of range", port)
+	}
+	n.stack.AllowServiceProxyPort(port)
 	return nil
 }
 

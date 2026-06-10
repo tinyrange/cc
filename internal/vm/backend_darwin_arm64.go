@@ -110,7 +110,14 @@ func (b *runtimeBackend) StartBlankStream(
 }
 
 func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
-	runReq, err := b.buildRunRequest(ctx, req)
+	network, err := newDarwinARM64NetworkRuntime(req.Network)
+	if err != nil {
+		return client.ExecResponse{}, err
+	}
+	if network != nil {
+		defer network.Close()
+	}
+	runReq, err := b.buildRunRequest(ctx, req, network)
 	if err != nil {
 		return client.ExecResponse{}, err
 	}
@@ -128,6 +135,7 @@ func (b *runtimeBackend) RunStream(ctx context.Context, req client.RunRequest, i
 	inst, err := b.StartStream(ctx, client.CreateInstanceRequest{
 		Image:      req.Image,
 		Shares:     append([]client.ShareMount(nil), req.Shares...),
+		Network:    req.Network,
 		MemoryMB:   req.MemoryMB,
 		CPUs:       req.CPUs,
 		NestedVirt: req.NestedVirt,
@@ -654,8 +662,8 @@ func sidecarBundleImage(bundle *sidecarBootBundle) *oci.Image {
 	}
 }
 
-func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.RunRequest) (vmruntime.RunRequest, error) {
-	runReq, err := b.buildBaseRequest(ctx, req.Image, req.MemoryMB, req.CPUs, req.NestedVirt, req.Dmesg, nil)
+func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.RunRequest, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
+	runReq, err := b.buildBaseRequest(ctx, req.Image, req.MemoryMB, req.CPUs, req.NestedVirt, req.Dmesg, network)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}

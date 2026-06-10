@@ -65,6 +65,10 @@ type networkIPv4Provider interface {
 	NetworkIPv4() string
 }
 
+type serviceProxyPortAllower interface {
+	AllowServiceProxyPort(context.Context, int) error
+}
+
 type instanceFlushProvider interface {
 	Flush(context.Context) error
 }
@@ -502,6 +506,14 @@ func (i *hostedInstance) VirtioFSStats() []virtio.FSStats {
 	return provider.VirtioFSStats()
 }
 
+func (i *hostedInstance) AllowServiceProxyPort(ctx context.Context, port int) error {
+	allower, ok := i.Instance.(serviceProxyPortAllower)
+	if !ok {
+		return fmt.Errorf("network does not support service proxy port updates")
+	}
+	return allower.AllowServiceProxyPort(ctx, port)
+}
+
 func (h *placementVMHost) instanceHost(ctx context.Context, inst Instance) (VMHost, Instance, error) {
 	if hosted, ok := inst.(*hostedInstance); ok {
 		return hosted.host, hosted.Instance, nil
@@ -790,6 +802,21 @@ func (m *Manager) AddPortForwardTo(ctx context.Context, id string, forward clien
 		return fmt.Errorf("no VM %q is running", id)
 	}
 	return machine.instance.AddPortForward(ctx, forward)
+}
+
+func (m *Manager) AllowServiceProxyPortTo(ctx context.Context, id string, port int) error {
+	id = instanceID(id)
+	m.mu.Lock()
+	machine := m.running[id]
+	m.mu.Unlock()
+	if machine == nil {
+		return fmt.Errorf("no VM %q is running", id)
+	}
+	allower, ok := machine.instance.(serviceProxyPortAllower)
+	if !ok {
+		return fmt.Errorf("VM %q network does not support service proxy port updates", id)
+	}
+	return allower.AllowServiceProxyPort(ctx, port)
 }
 
 func (m *Manager) FlushInstance(ctx context.Context, id string) error {
