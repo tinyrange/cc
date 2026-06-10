@@ -1,11 +1,6 @@
 name: Build wheels
 
 "on":
-  workflow_run:
-    workflows:
-      - Unit tests
-    types:
-      - completed
   workflow_dispatch:
 
 permissions:
@@ -14,7 +9,6 @@ permissions:
 jobs:
   build-wheel:
     name: ${{ matrix.name }}
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false

@@ -57,7 +57,7 @@ go build ./cmd/cc
 go build ./cmd/ccvm
 ```
 
-For a throwaway local smoke test:
+For a throwaway local build:
 
 ```sh
 tmp="$(mktemp -d)"
@@ -145,11 +145,6 @@ expose container commands through Python or shell wrappers.
 pip install neurodesk
 ```
 
-```sh
-cd pyneurodesk
-uv run pytest
-```
-
 Example:
 
 ```python
@@ -160,36 +155,6 @@ print(nm.run("niimath", "-help"))
 ```
 
 See [pyneurodesk/README.md](pyneurodesk/README.md) for Python-specific usage.
-
-## Tests
-
-Fast checks:
-
-```sh
-go test ./...
-GOOS=linux GOARCH=amd64 go test ./...
-GOOS=linux GOARCH=arm64 go test -run '^$' ./...
-```
-
-Live Linux KVM checks are opt-in:
-
-```sh
-CCX3_KVM_BOOT=1 go test ./internal/hv/kvm ./internal/vm -run 'Test(KernelBootSerial|InitramfsBootReadyMarker|RuntimeBackendRunCommand)' -count=1 -v
-```
-
-Live Neurodesk CVMFS execution is also opt-in:
-
-```sh
-CCX3_KVM_BOOT=1 CCX3_CVMFS_LIVE=1 \
-  go test ./internal/vm -run 'TestRuntimeBackendRunNiimathFromCVMFSPath' -count=1 -v
-```
-
-Python tests:
-
-```sh
-cd pyneurodesk
-uv run pytest
-```
 
 ## Repository Layout
 
