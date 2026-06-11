@@ -133,7 +133,11 @@ func (c *Client) PullImage(name string, req PullImageRequest) error {
 }
 
 func (c *Client) PullImageStream(name string, req PullImageRequest, onEvent func(ProgressEvent) error) error {
-	return c.postJSONProgressStream("/image/"+imagePathName(name), req, onEvent)
+	return c.PullImageStreamContext(context.Background(), name, req, onEvent)
+}
+
+func (c *Client) PullImageStreamContext(ctx context.Context, name string, req PullImageRequest, onEvent func(ProgressEvent) error) error {
+	return c.postJSONProgressStreamContext(ctx, "/image/"+imagePathName(name), req, onEvent)
 }
 
 func (c *Client) DeleteImage(name string) error {
@@ -240,12 +244,20 @@ func (c *Client) StartInstanceWithID(id string, req StartInstanceRequest) (Insta
 }
 
 func (c *Client) StartInstanceStream(req StartInstanceRequest, onEvent func(BootEvent) error) (InstanceState, error) {
-	return c.postJSONBootStream("/vm/start", req, onEvent)
+	return c.StartInstanceStreamContext(context.Background(), req, onEvent)
+}
+
+func (c *Client) StartInstanceStreamContext(ctx context.Context, req StartInstanceRequest, onEvent func(BootEvent) error) (InstanceState, error) {
+	return c.postJSONBootStreamContext(ctx, "/vm/start", req, onEvent)
 }
 
 func (c *Client) StartInstanceStreamWithID(id string, req StartInstanceRequest, onEvent func(BootEvent) error) (InstanceState, error) {
+	return c.StartInstanceStreamWithIDContext(context.Background(), id, req, onEvent)
+}
+
+func (c *Client) StartInstanceStreamWithIDContext(ctx context.Context, id string, req StartInstanceRequest, onEvent func(BootEvent) error) (InstanceState, error) {
 	req.ID = id
-	return c.StartInstanceStream(req, onEvent)
+	return c.StartInstanceStreamContext(ctx, req, onEvent)
 }
 
 func (c *Client) InstanceStatus() (InstanceState, error) {
@@ -512,6 +524,10 @@ func (c *Client) ExecEventsIn(id string, req ExecRequest) ([]ExecEvent, error) {
 }
 
 func (c *Client) ExecStream(req ExecRequest, inputs <-chan ExecInput, onEvent func(ExecEvent) error) error {
+	return c.ExecStreamContext(context.Background(), req, inputs, onEvent)
+}
+
+func (c *Client) ExecStreamContext(ctx context.Context, req ExecRequest, inputs <-chan ExecInput, onEvent func(ExecEvent) error) error {
 	wsURL, err := websocketURL(c.url, "/vm/run")
 	if err != nil {
 		return err
@@ -532,8 +548,23 @@ func (c *Client) ExecStream(req ExecRequest, inputs <-chan ExecInput, onEvent fu
 	if err := websocket.JSON.Send(ws, req); err != nil {
 		return err
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctxDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = ws.Close()
+		case <-ctxDone:
+		}
+	}()
+	defer close(ctxDone)
 	sendErr := streamExecInputsToWebSocket(ws, inputs)
 	err = receiveExecEventsFromWebSocket(ws, onEvent)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if sendErrValue := currentWebSocketSendError(sendErr); sendErrValue != nil {
 		return sendErrValue
 	}
@@ -541,8 +572,12 @@ func (c *Client) ExecStream(req ExecRequest, inputs <-chan ExecInput, onEvent fu
 }
 
 func (c *Client) ExecStreamIn(id string, req ExecRequest, inputs <-chan ExecInput, onEvent func(ExecEvent) error) error {
+	return c.ExecStreamInContext(context.Background(), id, req, inputs, onEvent)
+}
+
+func (c *Client) ExecStreamInContext(ctx context.Context, id string, req ExecRequest, inputs <-chan ExecInput, onEvent func(ExecEvent) error) error {
 	req.ID = id
-	return c.ExecStream(req, inputs, onEvent)
+	return c.ExecStreamContext(ctx, req, inputs, onEvent)
 }
 
 func websocketURL(baseURL, path string) (string, error) {
@@ -619,7 +654,11 @@ func (c *Client) postJSONExpectOK(path string, reqBody any, respBody any) error 
 }
 
 func (c *Client) postJSONProgressStream(path string, reqBody any, onEvent func(ProgressEvent) error) error {
-	resp, err := c.postJSONStream(path, reqBody)
+	return c.postJSONProgressStreamContext(context.Background(), path, reqBody, onEvent)
+}
+
+func (c *Client) postJSONProgressStreamContext(ctx context.Context, path string, reqBody any, onEvent func(ProgressEvent) error) error {
+	resp, err := c.postJSONStreamContext(ctx, path, reqBody)
 	if err != nil {
 		return err
 	}
@@ -649,7 +688,11 @@ func (c *Client) postJSONProgressStream(path string, reqBody any, onEvent func(P
 }
 
 func (c *Client) postJSONBootStream(path string, reqBody any, onEvent func(BootEvent) error) (InstanceState, error) {
-	resp, err := c.postJSONStream(path, reqBody)
+	return c.postJSONBootStreamContext(context.Background(), path, reqBody, onEvent)
+}
+
+func (c *Client) postJSONBootStreamContext(ctx context.Context, path string, reqBody any, onEvent func(BootEvent) error) (InstanceState, error) {
+	resp, err := c.postJSONStreamContext(ctx, path, reqBody)
 	if err != nil {
 		return InstanceState{}, err
 	}
