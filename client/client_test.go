@@ -193,6 +193,55 @@ func TestClientRunInteractiveStreamHalfClosesStdin(t *testing.T) {
 	}
 }
 
+func TestClientRunInteractiveStreamNilInputsClosesStdin(t *testing.T) {
+	inputsSeen := make(chan []ExecInput, 1)
+	errs := make(chan error, 1)
+	mux := http.NewServeMux()
+	mux.Handle("/vm/run/stream", websocket.Server{
+		Handshake: func(*websocket.Config, *http.Request) error { return nil },
+		Handler: func(ws *websocket.Conn) {
+			var req RunRequest
+			if err := websocket.JSON.Receive(ws, &req); err != nil {
+				errs <- err
+				return
+			}
+			var got []ExecInput
+			var input ExecInput
+			if err := websocket.JSON.Receive(ws, &input); err != nil {
+				errs <- err
+				return
+			}
+			got = append(got, input)
+			inputsSeen <- got
+			if err := websocket.JSON.Send(ws, ExecEvent{Kind: "exit", ExitCode: 0}); err != nil {
+				errs <- err
+				return
+			}
+			errs <- nil
+		},
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := &Client{url: srv.URL, client: *srv.Client()}
+	if err := c.RunInteractiveStreamIn("vm", RunRequest{Image: "alpine", Command: []string{"true"}}, nil, func(ExecEvent) error {
+		return nil
+	}); err != nil {
+		t.Fatalf("RunInteractiveStreamIn: %v", err)
+	}
+	select {
+	case got := <-inputsSeen:
+		if len(got) != 1 || got[0].Kind != "stdin_close" {
+			t.Fatalf("inputs = %+v", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("server did not receive stdin EOF")
+	}
+	if err := <-errs; err != nil {
+		t.Fatalf("server error: %v", err)
+	}
+}
+
 func TestClientURLHelpers(t *testing.T) {
 	got, err := websocketURL("https://example.test/base?x=1", "/vm/run")
 	if err != nil {

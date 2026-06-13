@@ -30,6 +30,11 @@ import (
 var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
 var exitTiming = newExitTiming()
 
+const (
+	execTerminateGrace = 500 * time.Millisecond
+	execKillWait       = 2 * time.Second
+)
+
 func timingLog(format string, args ...any) {
 	if !debugTiming {
 		return
@@ -788,6 +793,7 @@ func (s *ContainerSession) streamExecEvents(ctx context.Context, start int, id s
 				if onEvent != nil {
 					callbackStart := time.Now()
 					if err := onEvent(event); err != nil {
+						s.terminateExecAndWait(id, start)
 						return err
 					}
 					timing.Since(ctx, "exec.stream_events.callback", callbackStart)
@@ -801,6 +807,7 @@ func (s *ContainerSession) streamExecEvents(ctx context.Context, start int, id s
 			continue
 		}
 		if ctx.Err() != nil {
+			s.terminateExecAndWait(id, start)
 			return ctx.Err()
 		}
 		sleeps++
@@ -808,6 +815,35 @@ func (s *ContainerSession) streamExecEvents(ctx context.Context, start int, id s
 		time.Sleep(5 * time.Millisecond)
 		timing.Since(ctx, "exec.stream_events.sleep", sleepStart)
 	}
+}
+
+func (s *ContainerSession) terminateExecAndWait(id string, start int) {
+	_ = s.sendExecSignal(id, "TERM")
+	if s.waitForExecExit(id, start, execTerminateGrace) {
+		return
+	}
+	_ = s.sendExecSignal(id, "KILL")
+	_ = s.waitForExecExit(id, start, execKillWait)
+}
+
+func (s *ContainerSession) sendExecSignal(id, name string) error {
+	payload, err := json.Marshal(guestExecRequest{ID: id, Kind: "signal", Signal: name})
+	if err != nil {
+		return fmt.Errorf("marshal signal request: %w", err)
+	}
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	return s.writeControlPayload(append(payload, '\n'))
+}
+
+func (s *ContainerSession) waitForExecExit(id string, start int, timeout time.Duration) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	_, err := s.transcript.WaitFor(ctx, start, func(text string) bool {
+		_, _, ok := extractManagedExecResult(text, id, s.dmesg)
+		return ok
+	})
+	return err == nil
 }
 
 func recordExecTimingLine(ctx context.Context, line, id string) (string, int, bool) {

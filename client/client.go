@@ -422,10 +422,13 @@ func (c *Client) RunInteractiveStreamContext(ctx context.Context, req RunRequest
 }
 
 func streamExecInputsToWebSocket(ws *websocket.Conn, inputs <-chan ExecInput) <-chan error {
-	if inputs == nil {
-		return nil
-	}
 	done := make(chan error, 1)
+	if inputs == nil {
+		go func() {
+			done <- websocket.JSON.Send(ws, ExecInput{Kind: "stdin_close"})
+		}()
+		return done
+	}
 	go func() {
 		stdinClosed := false
 		for input := range inputs {

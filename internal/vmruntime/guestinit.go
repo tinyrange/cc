@@ -14,6 +14,7 @@ type GuestInitConfig struct {
 	Env                []string            `json:"env"`
 	WorkDir            string              `json:"workdir"`
 	User               string              `json:"user,omitempty"`
+	InitSystem         string              `json:"init,omitempty"`
 	Hostname           string              `json:"hostname,omitempty"`
 	Modules            []string            `json:"modules,omitempty"`
 	EmulatorTag        string              `json:"emulator_tag,omitempty"`

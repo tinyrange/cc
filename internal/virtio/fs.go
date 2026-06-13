@@ -2812,6 +2812,7 @@ type imageHandle struct {
 
 type imageNode struct {
 	id            uint64
+	inode         uint64
 	parent        uint64
 	name          string
 	mode          fs.FileMode
@@ -4071,6 +4072,7 @@ func (p *imageFS) Link(nodeID uint64, newParent uint64, newName string) (uint64,
 	}
 	linked := &imageNode{
 		id:            p.nextNodeID,
+		inode:         p.imageNodeInodeLocked(node),
 		parent:        newParent,
 		name:          name,
 		mode:          node.mode,
@@ -4423,13 +4425,24 @@ func (p *imageFS) attr(node *imageNode) FuseAttr {
 	nlink := uint32(1)
 	if node.isDir() {
 		nlink = maxU32(2, 2+uint32(len(node.entries)))
+	} else {
+		inode := p.imageNodeInodeLocked(node)
+		nlink = 0
+		for _, candidate := range p.nodes {
+			if candidate != nil && !candidate.isDir() && p.imageNodeInodeLocked(candidate) == inode {
+				nlink++
+			}
+		}
+		if nlink == 0 {
+			nlink = 1
+		}
 	}
 	attrUID, attrGID := node.uid, node.gid
 	if p.mapOwner {
 		attrUID, attrGID = p.ownerUID, p.ownerGID
 	}
 	return FuseAttr{
-		Ino:       node.id,
+		Ino:       p.imageNodeInodeLocked(node),
 		Size:      size,
 		Blocks:    uint64((size + 511) / 512),
 		ATimeSec:  uint64(modTime.Unix()),
@@ -4445,6 +4458,16 @@ func (p *imageFS) attr(node *imageNode) FuseAttr {
 		RDev:      node.rdev,
 		BlkSize:   4096,
 	}
+}
+
+func (p *imageFS) imageNodeInodeLocked(node *imageNode) uint64 {
+	if node == nil {
+		return 0
+	}
+	if node.inode != 0 {
+		return node.inode
+	}
+	return node.id
 }
 
 func (p *imageFS) dirType(node *imageNode) uint32 {

@@ -106,7 +106,7 @@ func (b *runtimeBackend) StartBlankStream(
 		return nil, err
 	}
 	timingLog("runtime.StartBlank hvf.StartContainer took=%s", time.Since(start))
-	return &darwinInstance{session: session, network: network}, nil
+	return &darwinInstance{session: session, network: network, imageName: strings.TrimSpace(req.Image)}, nil
 }
 
 func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
@@ -315,7 +315,7 @@ func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance
 	return inst.ExecStream(ctx, req, inputs, onEvent)
 }
 
-func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, memoryMB uint64, cpus int, nestedVirt bool, dmesg bool, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
+func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, initSystem string, memoryMB uint64, cpus int, nestedVirt bool, dmesg bool, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
 	start := time.Now()
 	if bundle, err := workerBootBundle(); err != nil {
 		return vmruntime.RunRequest{}, err
@@ -326,6 +326,7 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 			AMD64EmulatorPath: bundle.AMD64EmulatorPath,
 			Modules:           append([]alpine.Module(nil), bundle.Modules...),
 			Image:             sidecarBundleImage(bundle),
+			InitSystem:        initSystem,
 			MemoryMB:          memoryMB,
 			CPUs:              cpus,
 			NestedVirt:        nestedVirt,
@@ -401,6 +402,7 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 		AMD64EmulatorPath: qemuX8664,
 		Modules:           modules,
 		Image:             image,
+		InitSystem:        initSystem,
 		MemoryMB:          memoryMB,
 		CPUs:              cpus,
 		NestedVirt:        nestedVirt,
@@ -438,7 +440,7 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 	if len(networks) > 0 {
 		network = networks[0]
 	}
-	runReq, err := b.buildBaseRequest(ctx, req.Image, req.MemoryMB, req.CPUs, req.NestedVirt, req.Dmesg, network)
+	runReq, err := b.buildBaseRequest(ctx, req.Image, req.InitSystem, req.MemoryMB, req.CPUs, req.NestedVirt, req.Dmesg, network)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
@@ -475,6 +477,7 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 			AMD64EmulatorPath: bundle.AMD64EmulatorPath,
 			Modules:           append([]alpine.Module(nil), bundle.Modules...),
 			Image:             sidecarBundleImage(bundle),
+			InitSystem:        req.InitSystem,
 			RootFS:            rootFS,
 			MemoryMB:          req.MemoryMB,
 			CPUs:              req.CPUs,
@@ -540,7 +543,7 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
-	if rootFS == nil {
+	if rootFS == nil && image == nil {
 		rootFS = virtio.NewImageFS(blankRuntimeRootFS(), "")
 	}
 	return vmruntime.RunRequest{
@@ -548,6 +551,8 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		Init:              initBin,
 		AMD64EmulatorPath: qemuX8664,
 		Modules:           modules,
+		Image:             image,
+		InitSystem:        req.InitSystem,
 		RootFS:            rootFS,
 		MemoryMB:          req.MemoryMB,
 		CPUs:              req.CPUs,
@@ -666,7 +671,7 @@ func sidecarBundleImage(bundle *sidecarBootBundle) *oci.Image {
 }
 
 func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.RunRequest, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
-	runReq, err := b.buildBaseRequest(ctx, req.Image, req.MemoryMB, req.CPUs, req.NestedVirt, req.Dmesg, network)
+	runReq, err := b.buildBaseRequest(ctx, req.Image, req.InitSystem, req.MemoryMB, req.CPUs, req.NestedVirt, req.Dmesg, network)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}

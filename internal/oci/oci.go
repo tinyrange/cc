@@ -2,6 +2,7 @@ package oci
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -20,7 +21,9 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/ulikunitz/xz"
 	"j5.nz/cc/client"
 	intcvmfs "j5.nz/cc/internal/cvmfs"
 	"j5.nz/cc/internal/fsmeta"
@@ -37,6 +40,7 @@ const (
 	SourceKindSIMG          = "simg"
 	SourceKindCVMFS         = "cvmfs"
 	SourceKindDockerArchive = "docker-archive"
+	SourceKindRootFSTar     = "rootfs-tar"
 	SourceKindSaved         = "saved"
 	SourceKindInternal      = "internal"
 )
@@ -489,6 +493,8 @@ func (s *Store) pullDirect(ctx context.Context, name string, spec SourceSpec, op
 		return s.pullOCIDirect(ctx, name, spec, options)
 	case SourceKindSIMG:
 		return s.pullSIMGDirect(ctx, name, spec)
+	case SourceKindRootFSTar:
+		return s.pullRootFSTarDirect(ctx, name, spec, options)
 	case SourceKindCVMFS:
 		return s.pullCVMFSDirect(ctx, name, spec, options)
 	case SourceKindDockerArchive:
@@ -501,6 +507,37 @@ func (s *Store) pullDirect(ctx context.Context, name string, spec SourceSpec, op
 	default:
 		return fmt.Errorf("unsupported image source kind %q", spec.Kind)
 	}
+}
+
+func (s *Store) pullRootFSTarDirect(ctx context.Context, name string, spec SourceSpec, options PullOptions) error {
+	reportPullProgress(options.Report, client.ProgressEvent{Status: "resolving", Artifact: name, Blob: "rootfs"})
+	imageDir := s.imageDir(name)
+	tmpDir := imageDir + ".tmp"
+	if err := os.RemoveAll(tmpDir); err != nil {
+		return fmt.Errorf("remove temp image dir: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(tmpDir, "layers"), 0o755); err != nil {
+		return fmt.Errorf("create temp image dir: %w", err)
+	}
+	layerTarRel := filepath.Join("layers", "rootfs.tar")
+	layerTarPath := filepath.Join(tmpDir, layerTarRel)
+	reportPullProgress(options.Report, client.ProgressEvent{Status: "downloading", Artifact: name, Blob: "rootfs"})
+	if err := s.fetchRootFSTar(ctx, name, strings.TrimPrefix(spec.Raw, "rootfs-tar:"), layerTarPath, options.Report); err != nil {
+		return err
+	}
+	reportPullProgress(options.Report, client.ProgressEvent{Status: "indexing", Artifact: name, Blob: "rootfs"})
+	build := newIndexedBuildState()
+	if err := applyIndexedLayer(layerTarPath, layerTarRel, build.merged, build.fsEntries); err != nil {
+		return fmt.Errorf("index rootfs tar: %w", err)
+	}
+	cfg := imageConfig{Architecture: firstNonEmpty(normalizeArchitecture(options.Architecture), nativeArch())}
+	cfg.Config.Env = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+	cfg.Config.WorkingDir = "/"
+	if err := s.finalizeIndexedImage(name, spec, imageDir, tmpDir, cfg, build); err != nil {
+		return err
+	}
+	reportPullProgress(options.Report, client.ProgressEvent{Status: "downloaded", Artifact: name})
+	return nil
 }
 
 func (s *Store) pullSIMGDirect(ctx context.Context, name string, spec SourceSpec) error {
@@ -811,6 +848,60 @@ func (s *Store) fetchSIMG(ctx context.Context, source, destPath string) error {
 	if err := copyFile(source, tmpPath, 0o644); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("copy simg source: %w", err)
+	}
+	return os.Rename(tmpPath, destPath)
+}
+
+func (s *Store) fetchRootFSTar(ctx context.Context, name, source, destPath string, report func(client.ProgressEvent)) error {
+	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+		return fmt.Errorf("create rootfs tar dir: %w", err)
+	}
+	tmpPath := destPath + ".tmp"
+	var src io.ReadCloser
+	totalBytes := int64(0)
+	if strings.HasPrefix(source, "http://") || strings.HasPrefix(source, "https://") {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, source, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := s.httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("download rootfs tar: %w", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			return fmt.Errorf("download rootfs tar: status %s (%s)", resp.Status, strings.TrimSpace(string(body)))
+		}
+		src = resp.Body
+		if resp.ContentLength > 0 {
+			totalBytes = resp.ContentLength
+		}
+	} else {
+		file, err := os.Open(source)
+		if err != nil {
+			return fmt.Errorf("open rootfs tar source: %w", err)
+		}
+		src = file
+		if info, err := file.Stat(); err == nil && info.Size() > 0 {
+			totalBytes = info.Size()
+		}
+	}
+	defer src.Close()
+	dst, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	progress := newDownloadProgressReader(src, name, "rootfs", totalBytes, report)
+	if err := writeUncompressedTar(dst, source, progress); err != nil {
+		_ = dst.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	progress.finish()
+	if err := dst.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
 	}
 	return os.Rename(tmpPath, destPath)
 }
@@ -1368,6 +1459,12 @@ func ParseSource(source string) (SourceSpec, error) {
 	switch {
 	case strings.HasPrefix(lower, "docker-archive:"):
 		return SourceSpec{Kind: SourceKindDockerArchive, Raw: source}, nil
+	case strings.HasPrefix(lower, "rootfs-tar:"):
+		pathValue := strings.TrimSpace(source[len("rootfs-tar:"):])
+		if pathValue == "" {
+			return SourceSpec{}, fmt.Errorf("rootfs tar source is required")
+		}
+		return SourceSpec{Kind: SourceKindRootFSTar, Raw: "rootfs-tar:" + pathValue}, nil
 	case strings.HasPrefix(lower, "http+cvmfs://"):
 		return SourceSpec{Kind: SourceKindCVMFS, Raw: source}, nil
 	case strings.HasPrefix(lower, "cvmfs://"):
@@ -1440,6 +1537,108 @@ func ParseImageRef(imageRef string) (registry string, image string, tag string, 
 		image = "library/" + image
 	}
 	return registry, image, tag, nil
+}
+
+func writeUncompressedTar(dst io.Writer, source string, body io.Reader) error {
+	buffered := bufio.NewReader(body)
+	var src io.Reader = buffered
+	lower := strings.ToLower(source)
+	switch {
+	case strings.HasSuffix(lower, ".tar.gz"), strings.HasSuffix(lower, ".tgz"), hasMagic(buffered, []byte{0x1f, 0x8b}):
+		gzr, err := gzip.NewReader(src)
+		if err != nil {
+			return fmt.Errorf("open gzip rootfs tar: %w", err)
+		}
+		defer gzr.Close()
+		src = gzr
+	case strings.HasSuffix(lower, ".tar.xz"), strings.HasSuffix(lower, ".txz"), hasMagic(buffered, []byte{0xfd, '7', 'z', 'X', 'Z', 0x00}):
+		xzr, err := xz.NewReader(src)
+		if err != nil {
+			return fmt.Errorf("open xz rootfs tar: %w", err)
+		}
+		src = xzr
+	}
+	if _, err := io.Copy(dst, src); err != nil {
+		return fmt.Errorf("write rootfs tar: %w", err)
+	}
+	return nil
+}
+
+type downloadProgressReader struct {
+	r          io.Reader
+	artifact   string
+	blob       string
+	total      int64
+	downloaded int64
+	started    time.Time
+	lastReport time.Time
+	report     func(client.ProgressEvent)
+}
+
+func newDownloadProgressReader(r io.Reader, artifact, blob string, total int64, report func(client.ProgressEvent)) *downloadProgressReader {
+	p := &downloadProgressReader{
+		r:          r,
+		artifact:   artifact,
+		blob:       blob,
+		total:      total,
+		started:    time.Now(),
+		lastReport: time.Time{},
+		report:     report,
+	}
+	p.emit(false)
+	return p
+}
+
+func (p *downloadProgressReader) Read(buf []byte) (int, error) {
+	n, err := p.r.Read(buf)
+	if n > 0 {
+		p.downloaded += int64(n)
+		p.emit(false)
+	}
+	return n, err
+}
+
+func (p *downloadProgressReader) finish() {
+	p.emit(true)
+}
+
+func (p *downloadProgressReader) emit(force bool) {
+	if p.report == nil {
+		return
+	}
+	now := time.Now()
+	if !force && !p.lastReport.IsZero() && now.Sub(p.lastReport) < 200*time.Millisecond {
+		return
+	}
+	p.lastReport = now
+	elapsed := now.Sub(p.started)
+	if elapsed <= 0 {
+		elapsed = time.Second
+	}
+	rate := float64(p.downloaded) / elapsed.Seconds()
+	etaSeconds := 0.0
+	if p.total > p.downloaded && rate > 0 {
+		etaSeconds = float64(p.total-p.downloaded) / rate
+	}
+	progress := 0.0
+	if p.total > 0 {
+		progress = float64(p.downloaded) / float64(p.total)
+	}
+	reportPullProgress(p.report, client.ProgressEvent{
+		Status:             "downloading",
+		Artifact:           p.artifact,
+		Blob:               p.blob,
+		Progress:           progress,
+		BytesDownloaded:    p.downloaded,
+		BytesTotal:         p.total,
+		RateBytesPerSecond: rate,
+		ETASeconds:         etaSeconds,
+	})
+}
+
+func hasMagic(r *bufio.Reader, magic []byte) bool {
+	buf, err := r.Peek(len(magic))
+	return err == nil && bytes.Equal(buf, magic)
 }
 
 func parseAuthenticate(value string) (map[string]string, error) {

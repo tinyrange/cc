@@ -24,6 +24,7 @@ func enrichHostFileAttr(info os.FileInfo, attr *FuseAttr) {
 		return
 	}
 	attr.Size = uint64(st.Size)
+	attr.Ino = st.Ino
 	attr.Blocks = uint64(st.Blocks)
 	attr.NLink = uint32(st.Nlink)
 	if st.Blksize > 0 {

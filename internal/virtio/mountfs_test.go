@@ -1,6 +1,8 @@
 package virtio
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -106,6 +108,63 @@ func TestMountedFSLookupRoutesSyntheticMountPaths(t *testing.T) {
 	}
 	if got := fsys.CachePolicy(shareID).Mode; got != fsCacheStrict {
 		t.Fatalf("share cache mode = %q, want normalized strict mode", got)
+	}
+}
+
+func TestMountedFSPassthroughHardlinkReportsSameInode(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a"), []byte("data"), 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	fsys := NewMountedFS(NewPassthroughFS(root, nil), nil).(*mountedFS)
+
+	aID, aAttr, errno := fsys.Lookup(1, "a")
+	if errno != 0 {
+		t.Fatalf("lookup a errno = %d", errno)
+	}
+	bID, bAttr, errno := fsys.Link(aID, 1, "b")
+	if errno != 0 {
+		t.Fatalf("link errno = %d", errno)
+	}
+	aAttrAfter, errno := fsys.GetAttr(aID)
+	if errno != 0 {
+		t.Fatalf("getattr a errno = %d", errno)
+	}
+	bAttrAfter, errno := fsys.GetAttr(bID)
+	if errno != 0 {
+		t.Fatalf("getattr b errno = %d", errno)
+	}
+	if aAttr.Ino != bAttr.Ino || aAttrAfter.Ino != bAttrAfter.Ino {
+		t.Fatalf("hardlink inodes before=(%d,%d) after=(%d,%d), want same", aAttr.Ino, bAttr.Ino, aAttrAfter.Ino, bAttrAfter.Ino)
+	}
+	if aAttrAfter.NLink < 2 || bAttrAfter.NLink < 2 {
+		t.Fatalf("hardlink nlink a=%d b=%d, want at least 2", aAttrAfter.NLink, bAttrAfter.NLink)
+	}
+}
+
+func TestImageFSHardlinkReportsSameInode(t *testing.T) {
+	fsys := imageBackend(t, map[string]string{"/a": "data"})
+	aID, aAttr, errno := fsys.Lookup(1, "a")
+	if errno != 0 {
+		t.Fatalf("lookup a errno = %d", errno)
+	}
+	bID, bAttr, errno := fsys.(fsLinkBackend).Link(aID, 1, "b")
+	if errno != 0 {
+		t.Fatalf("link errno = %d", errno)
+	}
+	aAttrAfter, errno := fsys.GetAttr(aID)
+	if errno != 0 {
+		t.Fatalf("getattr a errno = %d", errno)
+	}
+	bAttrAfter, errno := fsys.GetAttr(bID)
+	if errno != 0 {
+		t.Fatalf("getattr b errno = %d", errno)
+	}
+	if aAttr.Ino != bAttr.Ino || aAttrAfter.Ino != bAttrAfter.Ino {
+		t.Fatalf("hardlink inodes before=(%d,%d) after=(%d,%d), want same", aAttr.Ino, bAttr.Ino, aAttrAfter.Ino, bAttrAfter.Ino)
+	}
+	if aAttrAfter.NLink != 2 || bAttrAfter.NLink != 2 {
+		t.Fatalf("hardlink nlink a=%d b=%d, want 2", aAttrAfter.NLink, bAttrAfter.NLink)
 	}
 }
 

@@ -78,6 +78,32 @@ func TestManagerStartRoutesExistingInstanceOperations(t *testing.T) {
 	}
 }
 
+func TestManagerBlankStartRemembersImageForRunIn(t *testing.T) {
+	ctx := context.Background()
+	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2, SupportsL2: true})
+	host.queueInstance(newFakeInstance())
+	manager := testManager(host)
+	defer manager.ShutdownAll(ctx)
+
+	state, err := manager.StartBlankInstanceStream(ctx, "alpha", client.StartInstanceRequest{
+		Image:      "ubuntu",
+		InitSystem: "systemd",
+		MemoryMB:   512,
+	}, nil)
+	if err != nil {
+		t.Fatalf("start blank: %v", err)
+	}
+	if state.Image != "ubuntu" || state.InitSystem != "systemd" {
+		t.Fatalf("state = %+v, want image ubuntu and init systemd", state)
+	}
+	if _, err := manager.RunIn(ctx, "alpha", client.RunRequest{Image: "ubuntu", Command: []string{"systemctl"}}); err != nil {
+		t.Fatalf("run in blank instance: %v", err)
+	}
+	if got := host.runInCalls(); len(got) != 1 || got[0].runningImage != "ubuntu" || got[0].req.Image != "ubuntu" {
+		t.Fatalf("run-in calls = %+v", got)
+	}
+}
+
 func TestManagerRunWithoutInstanceRequiresOrUsesImage(t *testing.T) {
 	ctx := context.Background()
 	host := newFakeHost(VMHostCapabilities{Backend: "fake", MaxVMs: 2})

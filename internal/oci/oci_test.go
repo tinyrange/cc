@@ -1,12 +1,20 @@
 package oci
 
 import (
+	"archive/tar"
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/ulikunitz/xz"
+	"j5.nz/cc/client"
 	"j5.nz/cc/internal/imagefs"
 )
 
@@ -87,6 +95,72 @@ func TestStoreRecordsSIMGArchitectureAndSupportsInternalScratch(t *testing.T) {
 	}
 }
 
+func TestStorePullRootFSTarXZ(t *testing.T) {
+	t.Setenv(sharedCacheEnv, filepath.Join(t.TempDir(), "shared"))
+	source := writeRootFSTarXZFixture(t)
+	store := NewStore(filepath.Join(t.TempDir(), "store"))
+
+	state, err := store.Pull(context.Background(), "ubuntu", "rootfs-tar:"+source, PullOptions{Architecture: "arm64"})
+	if err != nil {
+		t.Fatalf("pull rootfs tar: %v", err)
+	}
+	if state.Name != "ubuntu" || state.Status != "downloaded" || state.SourceKind != SourceKindRootFSTar {
+		t.Fatalf("state = %+v", state)
+	}
+
+	image, err := store.Open("ubuntu")
+	if err != nil {
+		t.Fatalf("open rootfs image: %v", err)
+	}
+	if image.Architecture != "arm64" {
+		t.Fatalf("architecture = %q, want arm64", image.Architecture)
+	}
+	if !containsEnv(image.Config.Env, "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin") {
+		t.Fatalf("env = %v, want default PATH", image.Config.Env)
+	}
+	if _, err := imagefs.LookupPath(image.RootFS, "/etc/os-release"); err != nil {
+		t.Fatalf("lookup os-release: %v", err)
+	}
+}
+
+func TestStorePullRootFSTarReportsDownloadProgress(t *testing.T) {
+	t.Setenv(sharedCacheEnv, filepath.Join(t.TempDir(), "shared"))
+	source := writeRootFSTarXZFixture(t)
+	data, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatalf("read rootfs fixture: %v", err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+	store := NewStore(filepath.Join(t.TempDir(), "store"))
+	var events []client.ProgressEvent
+
+	_, err = store.Pull(context.Background(), "ubuntu", "rootfs-tar:"+server.URL+"/rootfs.tar.xz", PullOptions{
+		Architecture: "arm64",
+		Report: func(event client.ProgressEvent) {
+			if event.Status == "downloading" && event.Blob == "rootfs" {
+				events = append(events, event)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("pull rootfs tar: %v", err)
+	}
+	if len(events) == 0 {
+		t.Fatalf("no download progress events reported")
+	}
+	last := events[len(events)-1]
+	if last.BytesDownloaded != int64(len(data)) || last.BytesTotal != int64(len(data)) {
+		t.Fatalf("last progress bytes = %d/%d, want %d/%d", last.BytesDownloaded, last.BytesTotal, len(data), len(data))
+	}
+	if last.Progress != 1 {
+		t.Fatalf("last progress = %v, want 1", last.Progress)
+	}
+}
+
 func alpineFixture(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
@@ -94,4 +168,62 @@ func alpineFixture(t *testing.T) string {
 		t.Fatalf("resolve caller")
 	}
 	return filepath.Join(filepath.Dir(file), "..", "..", "fixtures", "alpine.simg")
+}
+
+func writeRootFSTarXZFixture(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "rootfs.tar.xz")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("create rootfs tar: %v", err)
+	}
+	xzw, err := xz.NewWriter(file)
+	if err != nil {
+		t.Fatalf("create xz writer: %v", err)
+	}
+	tw := tar.NewWriter(xzw)
+	entries := []struct {
+		name     string
+		mode     int64
+		body     string
+		typeflag byte
+	}{
+		{name: "etc/os-release", mode: 0o644, body: "ID=ubuntu\nVERSION_ID=\"24.04\"\n", typeflag: tar.TypeReg},
+		{name: "usr/bin/tool", mode: 0o755, body: "#!/bin/sh\nexit 0\n", typeflag: tar.TypeReg},
+		{name: "run/initctl", mode: 0o600, typeflag: tar.TypeFifo},
+	}
+	for _, entry := range entries {
+		hdr := &tar.Header{
+			Name:     entry.name,
+			Mode:     entry.mode,
+			Size:     int64(len(entry.body)),
+			ModTime:  time.Unix(1, 0),
+			Typeflag: entry.typeflag,
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatalf("write tar header: %v", err)
+		}
+		if _, err := tw.Write([]byte(entry.body)); err != nil {
+			t.Fatalf("write tar body: %v", err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar: %v", err)
+	}
+	if err := xzw.Close(); err != nil {
+		t.Fatalf("close xz: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close rootfs tar: %v", err)
+	}
+	return path
+}
+
+func containsEnv(env []string, want string) bool {
+	for _, entry := range env {
+		if entry == want {
+			return true
+		}
+	}
+	return false
 }

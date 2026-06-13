@@ -241,6 +241,11 @@ func (r PullImageRequest) SourceString() (string, error) {
 			return "", fmt.Errorf("simg path is required")
 		}
 		return r.SourceRef.Path, nil
+	case "rootfs-tar", "rootfs":
+		if strings.TrimSpace(r.SourceRef.Path) == "" {
+			return "", fmt.Errorf("rootfs tar path is required")
+		}
+		return "rootfs-tar:" + r.SourceRef.Path, nil
 	case "oci":
 		if strings.TrimSpace(r.SourceRef.Path) == "" {
 			return "", fmt.Errorf("oci path is required")
@@ -336,6 +341,7 @@ type CapabilitiesResponse struct {
 type CreateInstanceRequest struct {
 	ID             string         `json:"id,omitempty"`
 	Image          string         `json:"image"`
+	InitSystem     string         `json:"init,omitempty"`
 	Shares         []ShareMount   `json:"shares,omitempty"`
 	Network        *NetworkConfig `json:"network,omitempty"`
 	KernelModules  []string       `json:"kernel_modules,omitempty"`
@@ -349,6 +355,7 @@ type CreateInstanceRequest struct {
 type StartInstanceRequest struct {
 	ID             string         `json:"id,omitempty"`
 	Image          string         `json:"image,omitempty"`
+	InitSystem     string         `json:"init,omitempty"`
 	Network        *NetworkConfig `json:"network,omitempty"`
 	KernelModules  []string       `json:"kernel_modules,omitempty"`
 	MemoryMB       uint64         `json:"memory_mb,omitempty"`
@@ -362,6 +369,7 @@ type InstanceState struct {
 	ID          string `json:"id,omitempty"`
 	Status      string `json:"status"`
 	Image       string `json:"image,omitempty"`
+	InitSystem  string `json:"init,omitempty"`
 	MemoryMB    uint64 `json:"memory_mb,omitempty"`
 	CPUs        int    `json:"cpus,omitempty"`
 	NestedVirt  bool   `json:"nested_virtualization,omitempty"`
@@ -377,6 +385,7 @@ type ConsoleHistoryResponse struct {
 type RunRequest struct {
 	ID             string         `json:"id,omitempty"`
 	Image          string         `json:"image"`
+	InitSystem     string         `json:"init,omitempty"`
 	Shares         []ShareMount   `json:"shares,omitempty"`
 	Network        *NetworkConfig `json:"network,omitempty"`
 	KernelModules  []string       `json:"kernel_modules,omitempty"`

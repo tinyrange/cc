@@ -6,7 +6,9 @@ import (
 	"archive/tar"
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +34,11 @@ const execTimingMarker = "__CCX3_TIMING__:"
 const defaultControlMarkerPref = "__CCX3_CTL__:"
 const fatalBootMarker = "ccx3-init-fatal: "
 const execPivotMode = "--ccx3-exec-pivot"
+const stage2Mode = "--ccx3-stage2"
+const stage2Path = "/run/ccx3/stage2"
+const stage2ConfigPath = "/run/ccx3/config.json"
+const initSystemSystemd = "systemd"
+const systemdReadyTimeout = 30 * time.Second
 
 var consoleFD = 2
 var kmsgFD = -1
@@ -43,6 +50,7 @@ type config struct {
 	Env                []string `json:"env"`
 	WorkDir            string   `json:"workdir"`
 	User               string   `json:"user,omitempty"`
+	InitSystem         string   `json:"init,omitempty"`
 	Hostname           string   `json:"hostname,omitempty"`
 	Modules            []string `json:"modules"`
 	EmulatorTag        string   `json:"emulator_tag,omitempty"`
@@ -174,6 +182,13 @@ func (m *managedExec) resize(cols, rows int) error {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == stage2Mode {
+		if err := runStage2(); err != nil {
+			fmt.Fprintf(os.Stderr, "ccx3-init: stage2: %v\n", err)
+			os.Exit(126)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == execPivotMode {
 		if err := runExecPivot(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "ccx3-init: exec pivot: %v\n", err)
@@ -243,6 +258,9 @@ func run() error {
 		if err := configureHostname(cfg.Hostname); err != nil {
 			return fmt.Errorf("configure hostname: %w", err)
 		}
+		if err := configureRuntimeFilesystem(); err != nil {
+			return fmt.Errorf("configure runtime filesystem: %w", err)
+		}
 		if err := configurePackageManagers(""); err != nil {
 			return fmt.Errorf("configure package managers: %w", err)
 		}
@@ -254,10 +272,13 @@ func run() error {
 			writeStage(bootStart, "amd64 root precopied")
 		}
 		writeStage(bootStart, "configuring binfmt")
-		if err := configureBinfmt(); err != nil {
+		if configured, err := configureBinfmt(); err != nil {
 			return fmt.Errorf("configure binfmt: %w", err)
+		} else if configured {
+			writeStage(bootStart, "binfmt configured")
+		} else {
+			writeStage(bootStart, "binfmt unavailable")
 		}
-		writeStage(bootStart, "binfmt configured")
 	}
 	if cfg.Network != nil {
 		writeStage(bootStart, "configuring network")
@@ -273,6 +294,9 @@ func run() error {
 
 	if len(cfg.Command) == 0 {
 		if cfg.VsockPort != 0 {
+			if strings.TrimSpace(cfg.InitSystem) != "" {
+				return bootInitSystem(cfg, bootStart)
+			}
 			writeStage(bootStart, "connecting vsock control")
 			control, err := connectVsock(cfg.VsockPort)
 			if err != nil {
@@ -307,6 +331,247 @@ func run() error {
 	return fmt.Errorf("exec command returned unexpectedly")
 }
 
+func runStage2() error {
+	writeKernel("ccx3-init: stage2 starting")
+	var cfg config
+	buf, err := readStage2Config()
+	if err != nil {
+		return fmt.Errorf("read config: %w", err)
+	}
+	if err := json.Unmarshal(buf, &cfg); err != nil {
+		return fmt.Errorf("decode config: %w", err)
+	}
+	if cfg.WorkDir == "" {
+		cfg.WorkDir = "/"
+	}
+	if cfg.VsockPort == 0 {
+		return fmt.Errorf("vsock control port is not configured")
+	}
+	writeKernel("ccx3-init: stage2 config loaded")
+	if err := os.Chdir(cfg.WorkDir); err != nil {
+		return fmt.Errorf("chdir %s: %w", cfg.WorkDir, err)
+	}
+	control, err := connectStage2Control(cfg.VsockPort)
+	if err != nil {
+		return fmt.Errorf("connect vsock control: %w", err)
+	}
+	defer control.Close()
+	if cfg.ReadyMarker != "" {
+		if strings.TrimSpace(cfg.InitSystem) == initSystemSystemd {
+			if err := waitForSystemdControlSocket(systemdReadyTimeout); err != nil {
+				return err
+			}
+		}
+		writeProtocolLineTo(control, initDurationMarker+"0")
+		writeProtocolLineTo(control, cfg.ReadyMarker)
+	}
+	return commandLoop(cfg, control)
+}
+
+func waitForSystemdControlSocket(timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		ok, err := socketExists("/run/systemd/private")
+		if err != nil {
+			return err
+		}
+		if ok {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("systemd control socket did not appear within %s", timeout)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func socketExists(path string) (bool, error) {
+	info, err := os.Stat(path)
+	if err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return false, fmt.Errorf("%s exists but is not a socket", path)
+		}
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, fmt.Errorf("stat %s: %w", path, err)
+}
+
+func systemdSystemBusExpected() bool {
+	for _, candidate := range []string{
+		"/usr/bin/dbus-daemon",
+		"/bin/dbus-daemon",
+		"/usr/bin/dbus-broker-launch",
+		"/lib/systemd/system/dbus.service",
+		"/usr/lib/systemd/system/dbus.service",
+	} {
+		if pathExists(candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func readStage2Config() ([]byte, error) {
+	if path := strings.TrimSpace(os.Getenv("CCX3_STAGE2_CONFIG")); path != "" {
+		return os.ReadFile(path)
+	}
+	buf, err := os.ReadFile(stage2ConfigPath)
+	if err == nil {
+		return buf, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	return os.ReadFile(configPath)
+}
+
+func connectStage2Control(port uint32) (*os.File, error) {
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		control, err := connectVsock(port)
+		if err == nil {
+			if attempt > 0 {
+				writeKernel("ccx3-init: stage2 vsock connected")
+			}
+			return control, nil
+		}
+		lastErr = err
+		if attempt == 0 {
+			writeKernel("ccx3-init: stage2 waiting for vsock control: " + err.Error())
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return nil, lastErr
+}
+
+func bootInitSystem(cfg config, bootStart time.Time) error {
+	initSystem := strings.TrimSpace(cfg.InitSystem)
+	switch initSystem {
+	case "", "ccx3":
+		return fmt.Errorf("init system is not configured")
+	case initSystemSystemd:
+		return bootSystemd(cfg, bootStart)
+	default:
+		return fmt.Errorf("unsupported init system %q", initSystem)
+	}
+}
+
+func bootSystemd(cfg config, bootStart time.Time) error {
+	systemdPath, err := findSystemd()
+	if err != nil {
+		return err
+	}
+	writeStage(bootStart, "installing ccx3 stage2")
+	if err := installSystemdStage2(cfg); err != nil {
+		return err
+	}
+	writeStage(bootStart, "exec systemd")
+	env := append(os.Environ(),
+		"container=ccx3",
+		"container_uuid=ccx3",
+	)
+	return syscall.Exec(systemdPath, []string{systemdPath}, env)
+}
+
+func findSystemd() (string, error) {
+	for _, candidate := range []string{"/lib/systemd/systemd", "/usr/lib/systemd/systemd"} {
+		info, err := os.Stat(candidate)
+		if err != nil {
+			continue
+		}
+		if info.IsDir() {
+			continue
+		}
+		return candidate, nil
+	}
+	if target, err := filepath.EvalSymlinks("/sbin/init"); err == nil && strings.Contains(target, "systemd") {
+		return "/sbin/init", nil
+	}
+	return "", fmt.Errorf("systemd init requested but no systemd binary was found")
+}
+
+func installSystemdStage2(cfg config) error {
+	if err := copyCurrentExecutable(stage2Path); err != nil {
+		return err
+	}
+	configData, err := json.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("encode stage2 config: %w", err)
+	}
+	if err := os.WriteFile(stage2ConfigPath, append(configData, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", stage2ConfigPath, err)
+	}
+	if err := os.MkdirAll("/run/systemd/system/basic.target.wants", 0o755); err != nil {
+		return fmt.Errorf("mkdir systemd runtime units: %w", err)
+	}
+	unitPath := "/run/systemd/system/ccx3-stage2.service"
+	unit := `[Unit]
+Description=ccx3 guest control stage2
+DefaultDependencies=no
+After=local-fs.target
+Before=basic.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=CCX3_STAGE2_CONFIG=/run/ccx3/config.json
+ExecStart=/run/ccx3/stage2 --ccx3-stage2
+Restart=on-failure
+RestartSec=250ms
+StandardInput=null
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=basic.target
+`
+	if err := os.WriteFile(unitPath, []byte(unit), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", unitPath, err)
+	}
+	if err := ensureSymlink(unitPath, "/run/systemd/system/basic.target.wants/ccx3-stage2.service"); err != nil {
+		return fmt.Errorf("enable ccx3 stage2: %w", err)
+	}
+	for _, unit := range []string{
+		"systemd-networkd-wait-online.service",
+		"NetworkManager-wait-online.service",
+		"systemd-remount-fs.service",
+	} {
+		if err := ensureSymlink("/dev/null", filepath.Join("/run/systemd/system", unit)); err != nil {
+			return fmt.Errorf("mask %s: %w", unit, err)
+		}
+	}
+	return nil
+}
+
+func copyCurrentExecutable(dst string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", filepath.Dir(dst), err)
+	}
+	src, err := os.Open("/proc/self/exe")
+	if err != nil {
+		return fmt.Errorf("open current executable: %w", err)
+	}
+	defer src.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", dst, err)
+	}
+	if _, err := io.Copy(out, src); err != nil {
+		_ = out.Close()
+		return fmt.Errorf("copy current executable to %s: %w", dst, err)
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", dst, err)
+	}
+	if err := os.Chmod(dst, 0o755); err != nil {
+		return fmt.Errorf("chmod %s: %w", dst, err)
+	}
+	return nil
+}
+
 func runExecPivot(args []string) error {
 	if len(args) < 7 {
 		return fmt.Errorf("invalid exec pivot argument count")
@@ -323,8 +588,10 @@ func runExecPivot(args []string) error {
 	if len(argv) == 0 {
 		return fmt.Errorf("missing command")
 	}
-	if err := pivotExecRoot(rootDir); err != nil {
-		return err
+	if rootDir != "" {
+		if err := pivotExecRoot(rootDir); err != nil {
+			return err
+		}
 	}
 	if workDir != "" {
 		if err := os.Chdir(workDir); err != nil {
@@ -471,7 +738,7 @@ func mountRootFS(tag, emulatorTag string, disableCgroup bool) error {
 			return fmt.Errorf("mkdir %s: %w", dir, err)
 		}
 	}
-	_ = syscall.Mount("devpts", "/dev/pts", "devpts", 0, "")
+	_ = syscall.Mount("devpts", "/dev/pts", "devpts", 0, "gid=5,mode=620,ptmxmode=666")
 	_ = syscall.Mount("tmpfs", "/dev/shm", "tmpfs", 0, "mode=1777")
 	if emulatorTag != "" {
 		if err := os.MkdirAll("/run/ccx3", 0o755); err != nil {
@@ -481,7 +748,7 @@ func mountRootFS(tag, emulatorTag string, disableCgroup bool) error {
 			return fmt.Errorf("mount emulator virtiofs %s: %w", emulatorTag, err)
 		}
 	}
-	_ = os.Symlink("/proc/self/fd", "/dev/fd")
+	configureDeviceLinks()
 	return nil
 }
 
@@ -568,6 +835,151 @@ func mountCgroupFS(path string) {
 	}
 }
 
+func configureRuntimeFilesystem() error {
+	if err := mountRuntimeTmpFS("/var/tmp", "mode=1777"); err != nil {
+		return err
+	}
+	for _, dir := range []struct {
+		path string
+		mode os.FileMode
+	}{
+		{"/run/lock", 0o1777},
+		{"/run/user", 0o755},
+		{"/run/sshd", 0o755},
+		{"/var/log", 0o755},
+		{"/var/cache", 0o755},
+		{"/var/lib/dbus", 0o755},
+	} {
+		if err := os.MkdirAll(dir.path, dir.mode); err != nil {
+			return fmt.Errorf("mkdir %s: %w", dir.path, err)
+		}
+		if err := os.Chmod(dir.path, dir.mode); err != nil {
+			return fmt.Errorf("chmod %s: %w", dir.path, err)
+		}
+	}
+	if err := ensureMachineID(); err != nil {
+		return err
+	}
+	if err := ensureLocaltime(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func mountRuntimeTmpFS(path, options string) error {
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", path, err)
+	}
+	if err := syscall.Mount("tmpfs", path, "tmpfs", 0, options); err != nil && !errors.Is(err, syscall.EBUSY) {
+		return fmt.Errorf("mount tmpfs on %s: %w", path, err)
+	}
+	return nil
+}
+
+func configureDeviceLinks() {
+	for target, link := range map[string]string{
+		"/proc/self/fd":   "/dev/fd",
+		"/proc/self/fd/0": "/dev/stdin",
+		"/proc/self/fd/1": "/dev/stdout",
+		"/proc/self/fd/2": "/dev/stderr",
+	} {
+		if err := ensureSymlink(target, link); err != nil {
+			writeKernel("ccx3-init: link " + link + ": " + err.Error())
+		}
+	}
+}
+
+func ensureLocaltime() error {
+	if pathExists("/etc/localtime") {
+		return nil
+	}
+	if !pathExists("/usr/share/zoneinfo/Etc/UTC") {
+		return nil
+	}
+	return ensureSymlink("/usr/share/zoneinfo/Etc/UTC", "/etc/localtime")
+}
+
+func ensureSymlink(target, link string) error {
+	if existing, err := os.Readlink(link); err == nil {
+		if existing == target {
+			return nil
+		}
+		if err := os.Remove(link); err != nil {
+			return err
+		}
+	} else if os.IsNotExist(err) {
+		// Create it below.
+	} else if info, statErr := os.Lstat(link); statErr == nil {
+		if info.IsDir() {
+			return fmt.Errorf("%s is a directory", link)
+		}
+		if err := os.Remove(link); err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+		return err
+	}
+	return os.Symlink(target, link)
+}
+
+func ensureMachineID() error {
+	id, err := readMachineID("/etc/machine-id")
+	if err != nil {
+		return err
+	}
+	if id == "" {
+		id, err = newMachineID()
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile("/etc/machine-id", []byte(id+"\n"), 0o444); err != nil {
+			return fmt.Errorf("write /etc/machine-id: %w", err)
+		}
+	}
+	dbusPath := "/var/lib/dbus/machine-id"
+	if existing, err := readMachineID(dbusPath); err != nil {
+		return err
+	} else if existing == id {
+		return nil
+	}
+	_ = os.Remove(dbusPath)
+	if err := os.Symlink("/etc/machine-id", dbusPath); err == nil {
+		return nil
+	}
+	if err := os.WriteFile(dbusPath, []byte(id+"\n"), 0o444); err != nil {
+		return fmt.Errorf("write %s: %w", dbusPath, err)
+	}
+	return nil
+}
+
+func readMachineID(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read %s: %w", path, err)
+	}
+	id := strings.TrimSpace(string(data))
+	if id == "" || id == "uninitialized" {
+		return "", nil
+	}
+	return id, nil
+}
+
+func newMachineID() (string, error) {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "", fmt.Errorf("generate machine-id: %w", err)
+	}
+	buf[6] = (buf[6] & 0x0f) | 0x40
+	buf[8] = (buf[8] & 0x3f) | 0x80
+	return hex.EncodeToString(buf[:]), nil
+}
+
 func precopyAMD64Root() error {
 	for _, path := range []string{
 		"/run/ccx3/qemu-x86_64",
@@ -614,10 +1026,31 @@ func configureNetwork(cfg *network) error {
 	if err := configureNetworkDefaultRoute(iface, gateway); err != nil {
 		return err
 	}
-	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver "+dns+"\n"), 0o644); err != nil {
+	if err := writeResolverConfig(dns); err != nil {
+		return err
+	}
+	return nil
+}
+
+func writeResolverConfig(dns string) error {
+	data := []byte("nameserver " + dns + "\n")
+	if err := writeFileReplacingMissingSymlink("/etc/resolv.conf", data, 0o644); err != nil {
 		return fmt.Errorf("write /etc/resolv.conf: %w", err)
 	}
 	return nil
+}
+
+func writeFileReplacingMissingSymlink(name string, data []byte, perm os.FileMode) error {
+	if err := os.WriteFile(name, data, perm); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if info, err := os.Lstat(name); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		_ = os.Remove(name)
+		return os.WriteFile(name, data, perm)
+	}
+	return os.WriteFile(name, data, perm)
 }
 
 func configureNetworkLink(name string) error {
@@ -836,38 +1269,42 @@ func configureMemoryOvercommit(procRoot string) {
 	_ = os.WriteFile(path, []byte("1\n"), 0o644)
 }
 
-func configureBinfmt() error {
+func configureBinfmt() (bool, error) {
 	if _, err := os.Stat(guestQEMUPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			return false, nil
 		}
-		return err
+		return false, err
 	}
 	if err := copyPath(guestQEMUPath, guestQEMUBinfmtPath); err != nil {
-		return fmt.Errorf("copy qemu-x86_64 for binfmt: %w", err)
+		return false, fmt.Errorf("copy qemu-x86_64 for binfmt: %w", err)
 	}
 	if err := os.Chmod(guestQEMUBinfmtPath, 0o755); err != nil {
-		return fmt.Errorf("chmod %s: %w", guestQEMUBinfmtPath, err)
+		return false, fmt.Errorf("chmod %s: %w", guestQEMUBinfmtPath, err)
 	}
 	if err := os.MkdirAll("/proc/sys/fs/binfmt_misc", 0o755); err != nil {
-		return fmt.Errorf("mkdir binfmt_misc: %w", err)
+		return false, fmt.Errorf("mkdir binfmt_misc: %w", err)
 	}
 	if err := syscall.Mount("binfmt_misc", "/proc/sys/fs/binfmt_misc", "binfmt_misc", 0, ""); err != nil && !errors.Is(err, syscall.EBUSY) {
-		return fmt.Errorf("mount binfmt_misc: %w", err)
+		if errors.Is(err, syscall.ENODEV) {
+			writeKernel("ccx3-init: binfmt_misc unavailable: " + err.Error())
+			return false, nil
+		}
+		return false, fmt.Errorf("mount binfmt_misc: %w", err)
 	}
 	if _, err := os.Stat("/proc/sys/fs/binfmt_misc/qemu-x86_64"); err == nil {
-		return nil
+		return true, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("stat qemu-x86_64 registration: %w", err)
+		return false, fmt.Errorf("stat qemu-x86_64 registration: %w", err)
 	}
 	const qemuX8664Registration = ":qemu-x86_64:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00:\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:" + guestQEMUBinfmtPath + ":F"
 	if err := os.WriteFile("/proc/sys/fs/binfmt_misc/register", []byte(qemuX8664Registration), 0o644); err != nil {
-		return fmt.Errorf("register qemu-x86_64: %w", err)
+		return false, fmt.Errorf("register qemu-x86_64: %w", err)
 	}
 	if _, err := os.Stat("/proc/sys/fs/binfmt_misc/qemu-x86_64"); err != nil {
-		return fmt.Errorf("verify qemu-x86_64 registration: %w", err)
+		return false, fmt.Errorf("verify qemu-x86_64 registration: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 func writeString(fd int, value string) {
@@ -1180,7 +1617,28 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 	}
 	reader := bufio.NewReader(control)
 	active := map[string]*managedExec{}
+	pendingStdinClose := map[string]bool{}
 	var activeMu sync.Mutex
+	var systemdCommandMu sync.Mutex
+	systemdCommandReady := strings.TrimSpace(cfg.InitSystem) != initSystemSystemd
+	waitForCommandReady := func() error {
+		if strings.TrimSpace(cfg.InitSystem) != initSystemSystemd {
+			return nil
+		}
+		systemdCommandMu.Lock()
+		if systemdCommandReady {
+			systemdCommandMu.Unlock()
+			return nil
+		}
+		systemdCommandMu.Unlock()
+		if err := waitForSystemdCommandReady(systemdReadyTimeout); err != nil {
+			return err
+		}
+		systemdCommandMu.Lock()
+		systemdCommandReady = true
+		systemdCommandMu.Unlock()
+		return nil
+	}
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
@@ -1268,6 +1726,9 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 		case "stdin_close":
 			activeMu.Lock()
 			managed := active[req.ID]
+			if managed == nil {
+				pendingStdinClose[req.ID] = true
+			}
 			activeMu.Unlock()
 			if managed == nil {
 				continue
@@ -1333,13 +1794,20 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 		managed := &managedExec{stdin: stdinW, start: time.Now()}
 		activeMu.Lock()
 		active[req.ID] = managed
+		closeStdin := pendingStdinClose[req.ID]
+		delete(pendingStdinClose, req.ID)
 		activeMu.Unlock()
-		go runManagedExec(cfg, control, req.ID, req.Command, env, req.RootDir, workDir, user, stdinR, managed, req.TTY, req.ControlFD, req.Cols, req.Rows, func() {
+		go runManagedExec(cfg, control, req.ID, req.Command, env, req.RootDir, workDir, user, stdinR, managed, req.TTY, req.ControlFD, req.Cols, req.Rows, waitForCommandReady, func() {
 			_ = managed.closeStdin()
 			activeMu.Lock()
 			delete(active, req.ID)
 			activeMu.Unlock()
 		})
+		if closeStdin {
+			if err := managed.closeStdin(); err != nil {
+				writeKernel("ccx3-init: close pending stdin: " + err.Error())
+			}
+		}
 		if len(req.Stdin) > 0 {
 			initialStdin := append([]byte(nil), req.Stdin...)
 			go func(id string, managed *managedExec) {
@@ -1351,6 +1819,26 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 				}
 			}(req.ID, managed)
 		}
+	}
+}
+
+func waitForSystemdCommandReady(timeout time.Duration) error {
+	if !systemdSystemBusExpected() {
+		return nil
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		ok, err := socketExists("/run/dbus/system_bus_socket")
+		if err != nil {
+			return err
+		}
+		if ok {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("systemd system bus socket did not appear within %s", timeout)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -1621,7 +2109,7 @@ func execPivotArgs(rootDir, workDir string, cred *syscall.Credential, argv []str
 	return append(args, argv...)
 }
 
-func runManagedExec(cfg config, control io.Writer, id string, argv []string, env []string, rootDir string, workDir string, user string, stdin io.ReadCloser, managed *managedExec, tty bool, controlFD bool, cols int, rows int, cleanup func()) {
+func runManagedExec(cfg config, control io.Writer, id string, argv []string, env []string, rootDir string, workDir string, user string, stdin io.ReadCloser, managed *managedExec, tty bool, controlFD bool, cols int, rows int, waitReady func() error, cleanup func()) {
 	defer cleanup()
 	execStart := time.Now()
 	writeExecTiming(control, id, "recv", execStart)
@@ -1629,6 +2117,18 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		writeProtocolLineTo(control, cfg.BeginMarker+id)
 	}
 	writeKernel("ccx3-init: exec " + strings.Join(argv, " "))
+	if waitReady != nil {
+		writeExecTiming(control, id, "guest_ready_begin", execStart)
+		if err := waitReady(); err != nil {
+			writeKernel("ccx3-init: guest not ready for exec: " + err.Error())
+			writeExecStderr(cfg, control, id, "ccx3-init: guest not ready for exec: "+err.Error()+"\n")
+			if cfg.ExitMarkerPrefix != "" {
+				writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
+			}
+			return
+		}
+		writeExecTiming(control, id, "guest_ready_done", execStart)
+	}
 	writeExecTiming(control, id, "start_begin", execStart)
 
 	signalGroup := true
@@ -1665,9 +2165,18 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			}
 			return
 		}
+		if err := ensureCredentialWorkDir(rootDir, workDir, execCred); err != nil {
+			writeKernel("ccx3-init: ensure workdir: " + err.Error())
+			writeExecStderr(cfg, control, id, "ccx3-init: ensure workdir: "+err.Error()+"\n")
+			if cfg.ExitMarkerPrefix != "" {
+				writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
+			}
+			return
+		}
 	}
 	var cmd *exec.Cmd
-	if rootDir != "" {
+	useExecPivot := rootDir != "" || (tty && execCred != nil)
+	if useExecPivot {
 		cmd = exec.Command("/proc/self/exe", append([]string{execPivotMode}, execPivotArgs(rootDir, workDir, execCred, argv)...)...)
 	} else {
 		cmd = exec.Command(argv[0], argv[1:]...)
@@ -1868,7 +2377,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	}
 	if rootDir != "" {
 		cmd.SysProcAttr.Cloneflags |= syscall.CLONE_NEWNS
-	} else if execCred != nil {
+	} else if execCred != nil && !useExecPivot {
 		cmd.SysProcAttr.Credential = execCred
 	}
 
@@ -2052,6 +2561,10 @@ func ensureCredentialUser(rootDir string, cred *syscall.Credential) error {
 	if name == "" {
 		name = availableUserName(rootDir, "cc")
 	}
+	homeDir := homeDirForUID(rootDir, uid)
+	if homeDir == "" {
+		homeDir = "/home/" + name
+	}
 	group := groupNameForGID(rootDir, gid)
 	if group == "" {
 		group = availableGroupName(rootDir, name)
@@ -2060,17 +2573,42 @@ func ensureCredentialUser(rootDir string, cred *syscall.Credential) error {
 		}
 	}
 	if name != "" && passwdHasUID(rootDir, uid) {
-		return nil
+		return ensureCredentialHome(rootDir, homeDir, cred)
 	}
-	if err := appendPasswdEntry(rootDir, name, uid, gid, "/home/"+name, "/bin/sh"); err != nil {
+	if err := appendPasswdEntry(rootDir, name, uid, gid, homeDir, "/bin/sh"); err != nil {
 		return err
 	}
-	home := rootPath(rootDir, "/home/"+name)
-	if err := os.MkdirAll(home, 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", home, err)
+	return ensureCredentialHome(rootDir, homeDir, cred)
+}
+
+func ensureCredentialHome(rootDir, homeDir string, cred *syscall.Credential) error {
+	if strings.TrimSpace(homeDir) == "" || homeDir == "/" {
+		return nil
 	}
-	if err := os.Chown(home, int(cred.Uid), int(cred.Gid)); err != nil {
-		return fmt.Errorf("chown %s: %w", home, err)
+	return ensureCredentialDirectory(rootDir, homeDir, cred)
+}
+
+func ensureCredentialWorkDir(rootDir, workDir string, cred *syscall.Credential) error {
+	workDir = filepath.Clean(strings.TrimSpace(workDir))
+	if workDir == "" || workDir == "." || workDir == "/" {
+		return nil
+	}
+	if !strings.HasPrefix(workDir, "/home/") {
+		return nil
+	}
+	return ensureCredentialDirectory(rootDir, workDir, cred)
+}
+
+func ensureCredentialDirectory(rootDir, dir string, cred *syscall.Credential) error {
+	if strings.TrimSpace(dir) == "" || dir == "/" {
+		return nil
+	}
+	path := rootPath(rootDir, dir)
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", path, err)
+	}
+	if err := os.Chown(path, int(cred.Uid), int(cred.Gid)); err != nil {
+		return fmt.Errorf("chown %s: %w", path, err)
 	}
 	return nil
 }
@@ -2096,6 +2634,16 @@ func usernameForUID(rootDir, uid string) string {
 		fields := strings.Split(line, ":")
 		if len(fields) >= 3 && fields[2] == uid {
 			return fields[0]
+		}
+	}
+	return ""
+}
+
+func homeDirForUID(rootDir, uid string) string {
+	for _, line := range colonFileLines(rootPath(rootDir, "/etc/passwd")) {
+		fields := strings.Split(line, ":")
+		if len(fields) >= 6 && fields[2] == uid {
+			return fields[5]
 		}
 	}
 	return ""
@@ -2292,7 +2840,7 @@ func copyExecRootNetworkFiles(rootDir string) error {
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			return fmt.Errorf("mkdir %s: %w", filepath.Dir(dst), err)
 		}
-		if err := os.WriteFile(dst, data, 0o644); err != nil {
+		if err := writeFileReplacingMissingSymlink(dst, data, 0o644); err != nil {
 			return fmt.Errorf("write %s: %w", dst, err)
 		}
 	}

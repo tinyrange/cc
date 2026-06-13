@@ -564,6 +564,9 @@ func applyIndexedLayer(tarPath string, tarRef string, merged map[string]*indexed
 			node.TarOffset = 0
 		case tar.TypeReg, tar.TypeRegA:
 			node.Kind = indexedKindFile
+		case tar.TypeChar, tar.TypeBlock, tar.TypeFifo:
+			node.Kind = indexedKindFile
+			node.Size = 0
 		case tar.TypeSymlink:
 			node.Kind = indexedKindSymlink
 			node.LinkTarget = fsmeta.NormalizeSymlinkTarget(hdr.Linkname)

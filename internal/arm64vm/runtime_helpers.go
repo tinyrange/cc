@@ -38,6 +38,7 @@ func BuildPersistentInitramfs(req RunRequest, baseEnv []string, workDir string) 
 	return BuildInitramfs(req.Init, req.Modules, GuestInitConfig{
 		Env:               append([]string(nil), baseEnv...),
 		WorkDir:           workDir,
+		InitSystem:        req.InitSystem,
 		Modules:           ModulePaths(req.Modules),
 		EmulatorTag:       EmulatorTagForPath(req.AMD64EmulatorPath),
 		RootFSTag:         RootFSTag,
@@ -62,6 +63,7 @@ func BuildExecInitramfs(req RunRequest, command []string, env []string, workDir 
 		Env:               append([]string(nil), env...),
 		WorkDir:           workDir,
 		User:              req.User,
+		InitSystem:        req.InitSystem,
 		Modules:           ModulePaths(req.Modules),
 		EmulatorTag:       EmulatorTagForPath(req.AMD64EmulatorPath),
 		RootFSTag:         RootFSTag,

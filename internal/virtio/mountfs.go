@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -36,9 +37,11 @@ type mountedFS struct {
 
 	mu         sync.RWMutex
 	nextNodeID uint64
+	nextInode  uint64
 	nextHandle uint64
 	nodes      map[uint64]*mountedNode
 	pathToNode map[string]uint64
+	inodes     map[mountedBackendInode]uint64
 	handles    map[uint64]*mountedHandle
 }
 
@@ -62,6 +65,12 @@ type mountedHandle struct {
 	nodeID  uint64
 	fh      uint64
 	dir     bool
+}
+
+type mountedBackendInode struct {
+	backendType string
+	backendPtr  uintptr
+	inode       uint64
 }
 
 func NewMountedFS(root FSBackend, shares []ShareMount) FSBackend {
@@ -93,11 +102,13 @@ func NewMountedFS(root FSBackend, shares []ShareMount) FSBackend {
 		debugPaths: virtioFSDebugPathsFromEnv(),
 		debugLog:   os.Stderr,
 		nextNodeID: 2,
+		nextInode:  1 << 32,
 		nextHandle: 1,
 		nodes: map[uint64]*mountedNode{
 			1: {id: 1, path: "/"},
 		},
 		pathToNode: map[string]uint64{"/": 1},
+		inodes:     map[mountedBackendInode]uint64{},
 		handles:    map[uint64]*mountedHandle{},
 	}
 }
@@ -252,7 +263,6 @@ func (m *mountedFS) GetAttr(nodeID uint64) (FuseAttr, int32) {
 	if errno != 0 {
 		return FuseAttr{}, errno
 	}
-	attr.Ino = nodeID
 	return attr, 0
 }
 
@@ -293,7 +303,7 @@ func (m *mountedFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32)
 		return 0, FuseAttr{}, errno
 	}
 	id := m.ensureResolvedNode(childPath, backend, backendNodeID)
-	attr.Ino = id
+	attr = m.backendAttr(backend, backendNodeID, attr)
 	return id, attr, 0
 }
 
@@ -480,7 +490,7 @@ func (m *mountedFS) Mkdir(parent uint64, name string, mode uint32, uid uint32, g
 		return 0, FuseAttr{}, errno
 	}
 	id := m.ensureResolvedNode(childPath, backend, nodeID)
-	attr.Ino = id
+	attr = m.backendAttr(backend, nodeID, attr)
 	return id, attr, 0
 }
 
@@ -513,7 +523,7 @@ func (m *mountedFS) Mknod(parent uint64, name string, mode uint32, rdev uint32, 
 		return 0, FuseAttr{}, errno
 	}
 	id := m.ensureResolvedNode(childPath, backend, backendNodeID)
-	attr.Ino = id
+	attr = m.backendAttr(backend, backendNodeID, attr)
 	return id, attr, 0
 }
 
@@ -546,7 +556,7 @@ func (m *mountedFS) Symlink(parent uint64, name string, target string, uid uint3
 		return 0, FuseAttr{}, errno
 	}
 	id := m.ensureResolvedNode(childPath, backend, backendNodeID)
-	attr.Ino = id
+	attr = m.backendAttr(backend, backendNodeID, attr)
 	return id, attr, 0
 }
 
@@ -584,7 +594,7 @@ func (m *mountedFS) Link(nodeID uint64, newParent uint64, newName string) (uint6
 		return 0, FuseAttr{}, errno
 	}
 	id := m.ensureResolvedNode(childPath, backend, backendLinkedID)
-	attr.Ino = id
+	attr = m.backendAttr(backend, backendLinkedID, attr)
 	return id, attr, 0
 }
 
@@ -656,7 +666,7 @@ func (m *mountedFS) Create(parent uint64, name string, flags uint32, mode uint32
 		return 0, 0, FuseAttr{}, errno
 	}
 	id := m.ensureResolvedNode(childPath, backend, backendNodeID)
-	attr.Ino = id
+	attr = m.backendAttr(backend, backendNodeID, attr)
 	return id, m.storeHandle(backend, backendNodeID, fh, false), attr, 0
 }
 
@@ -700,7 +710,7 @@ func (m *mountedFS) SetAttr(nodeID uint64, valid uint32, fh uint64, size uint64,
 	if errno != 0 {
 		return FuseAttr{}, errno
 	}
-	attr.Ino = nodeID
+	attr = m.backendAttr(backend, backendNodeID, attr)
 	return attr, 0
 }
 
@@ -839,7 +849,12 @@ func (m *mountedFS) Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32
 
 func (m *mountedFS) resolveAttr(node *mountedNode) (FuseAttr, int32) {
 	if node.path == "/" {
-		return m.root.GetAttr(1)
+		attr, errno := m.root.GetAttr(1)
+		if errno != 0 {
+			return FuseAttr{}, errno
+		}
+		attr.Ino = 1
+		return attr, 0
 	}
 	if m.isSyntheticPath(node.path) {
 		return syntheticDirAttr(), 0
@@ -848,7 +863,46 @@ func (m *mountedFS) resolveAttr(node *mountedNode) (FuseAttr, int32) {
 	if errno != 0 {
 		return FuseAttr{}, errno
 	}
-	return backend.GetAttr(nodeID)
+	attr, errno := backend.GetAttr(nodeID)
+	if errno != 0 {
+		return FuseAttr{}, errno
+	}
+	return m.backendAttr(backend, nodeID, attr), 0
+}
+
+func (m *mountedFS) backendAttr(backend FSBackend, backendNodeID uint64, attr FuseAttr) FuseAttr {
+	if attr.Ino == 0 {
+		attr.Ino = backendNodeID
+	}
+	key := mountedBackendInode{
+		backendType: reflect.TypeOf(backend).String(),
+		backendPtr:  backendPointer(backend),
+		inode:       attr.Ino,
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if inode, ok := m.inodes[key]; ok {
+		attr.Ino = inode
+		return attr
+	}
+	inode := m.nextInode
+	m.nextInode++
+	m.inodes[key] = inode
+	attr.Ino = inode
+	return attr
+}
+
+func backendPointer(backend FSBackend) uintptr {
+	v := reflect.ValueOf(backend)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Slice, reflect.UnsafePointer:
+		if v.IsNil() {
+			return 0
+		}
+		return v.Pointer()
+	default:
+		return 0
+	}
 }
 
 func (m *mountedFS) resolveBackendNodeCached(guestPath string) (FSBackend, uint64, int32) {

@@ -31,6 +31,7 @@ type RunRequest struct {
 	AMD64EmulatorPath string
 	Modules           []alpine.Module
 	Image             *oci.Image
+	InitSystem        string
 	RootFS            virtio.FSBackend
 	Shares            []DirectoryShare
 	Command           []string
