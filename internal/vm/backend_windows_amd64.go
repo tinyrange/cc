@@ -263,14 +263,15 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 			return client.ExecResponse{}, err
 		}
 		execReq := client.ExecRequest{
-			Command: command,
-			Env:     env,
-			WorkDir: workDir,
-			User:    req.User,
-			Stdin:   append([]byte(nil), req.Stdin...),
-			TTY:     req.TTY,
-			Cols:    req.Cols,
-			Rows:    req.Rows,
+			Command:   command,
+			Env:       env,
+			WorkDir:   workDir,
+			User:      req.User,
+			Stdin:     append([]byte(nil), req.Stdin...),
+			TTY:       req.TTY,
+			ControlFD: req.ControlFD,
+			Cols:      req.Cols,
+			Rows:      req.Rows,
 		}
 		resp, serial, err := whp.RunManagedExecWithFSAndNet(ctx, kernel, initrd, req.MemoryMB, req.Dmesg, fsdevs, windowsNetworkDevice(network), execReq)
 		if err != nil && resp.Output == "" {
@@ -321,6 +322,7 @@ func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runni
 			User:       req.User,
 			Stdin:      append([]byte(nil), req.Stdin...),
 			TTY:        req.TTY,
+			ControlFD:  req.ControlFD,
 			Cols:       req.Cols,
 			Rows:       req.Rows,
 		})
@@ -372,6 +374,7 @@ func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runni
 		User:        req.User,
 		Stdin:       append([]byte(nil), req.Stdin...),
 		TTY:         req.TTY,
+		ControlFD:   req.ControlFD,
 		Cols:        req.Cols,
 		Rows:        req.Rows,
 	})
@@ -432,6 +435,7 @@ func (b *runtimeBackend) RunInInstanceStream(ctx context.Context, inst Instance,
 		User:        req.User,
 		Stdin:       append([]byte(nil), req.Stdin...),
 		TTY:         req.TTY,
+		ControlFD:   req.ControlFD,
 		Cols:        req.Cols,
 		Rows:        req.Rows,
 	}, inputs, onEvent)
@@ -545,6 +549,7 @@ func (i *windowsInstance) Exec(ctx context.Context, req client.ExecRequest) (cli
 		User:        req.User,
 		Stdin:       append([]byte(nil), req.Stdin...),
 		TTY:         req.TTY,
+		ControlFD:   req.ControlFD,
 		Cols:        req.Cols,
 		Rows:        req.Rows,
 	})
@@ -601,6 +606,7 @@ func (i *windowsInstance) ExecStream(ctx context.Context, req client.ExecRequest
 		User:        req.User,
 		Stdin:       append([]byte(nil), req.Stdin...),
 		TTY:         req.TTY,
+		ControlFD:   req.ControlFD,
 		Cols:        req.Cols,
 		Rows:        req.Rows,
 	}, inputs, onEvent)
@@ -742,6 +748,7 @@ func windowsGuestInitConfig(modules []alpine.Module, managedExec bool) vmruntime
 		BeginMarker:        vmruntime.CommandBeginMarker,
 		OutputMarkerPref:   vmruntime.CommandOutputMarker,
 		ErrorMarkerPref:    vmruntime.CommandErrorMarker,
+		ControlMarkerPref:  vmruntime.CommandControlMarker,
 		UsageMarkerPref:    vmruntime.CommandUsageMarker,
 		ExitMarkerPrefix:   vmruntime.CommandExitMarkerPref,
 		DisableCgroupMount: true,

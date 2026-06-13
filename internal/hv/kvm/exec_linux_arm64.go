@@ -216,6 +216,7 @@ func sendManagedExec(control virtio.VsockConn, id string, req client.ExecRequest
 		User:      req.User,
 		Stdin:     append([]byte(nil), req.Stdin...),
 		TTY:       req.TTY,
+		ControlFD: req.ControlFD,
 		Cols:      req.Cols,
 		Rows:      req.Rows,
 	})

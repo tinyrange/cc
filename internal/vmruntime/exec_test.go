@@ -93,6 +93,12 @@ func TestParseManagedExecEventLine(t *testing.T) {
 			wantOK: true,
 		},
 		{
+			name:   "control",
+			line:   CommandControlMarker + "9:" + b64("done\t0\t/work\n"),
+			want:   client.ExecEvent{Kind: "control", Output: "done\t0\t/work\n", Data: []byte("done\t0\t/work\n")},
+			wantOK: true,
+		},
+		{
 			name:     "exit",
 			line:     CommandExitMarkerPref + "9:13",
 			want:     client.ExecEvent{Kind: "exit", ExitCode: 13},

@@ -12,6 +12,7 @@ func runExecRequest(req client.RunRequest) client.ExecRequest {
 		User:       req.User,
 		Stdin:      append([]byte(nil), req.Stdin...),
 		TTY:        req.TTY,
+		ControlFD:  req.ControlFD,
 		Cols:       req.Cols,
 		Rows:       req.Rows,
 	}

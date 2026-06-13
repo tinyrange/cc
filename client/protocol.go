@@ -388,6 +388,7 @@ type RunRequest struct {
 	User           string         `json:"user,omitempty"`
 	Stdin          []byte         `json:"stdin,omitempty"`
 	TTY            bool           `json:"tty,omitempty"`
+	ControlFD      bool           `json:"control_fd,omitempty"`
 	Cols           int            `json:"cols,omitempty"`
 	Rows           int            `json:"rows,omitempty"`
 	MemoryMB       uint64         `json:"memory_mb,omitempty"`
@@ -431,6 +432,7 @@ type ExecRequest struct {
 	User        string   `json:"user,omitempty"`
 	Stdin       []byte   `json:"stdin,omitempty"`
 	TTY         bool     `json:"tty,omitempty"`
+	ControlFD   bool     `json:"control_fd,omitempty"`
 	Cols        int      `json:"cols,omitempty"`
 	Rows        int      `json:"rows,omitempty"`
 }

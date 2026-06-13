@@ -128,6 +128,7 @@ const (
 	commandBeginMarker    = vmruntime.CommandBeginMarker
 	commandOutputMarker   = vmruntime.CommandOutputMarker
 	commandErrorMarker    = vmruntime.CommandErrorMarker
+	commandControlMarker  = vmruntime.CommandControlMarker
 	commandExitMarkerPref = vmruntime.CommandExitMarkerPref
 	arm64VirtualTimerPPI  = 27
 )
@@ -258,6 +259,7 @@ type guestExecRequest struct {
 	User        string   `json:"user,omitempty"`
 	Stdin       []byte   `json:"stdin,omitempty"`
 	TTY         bool     `json:"tty,omitempty"`
+	ControlFD   bool     `json:"control_fd,omitempty"`
 	Kind        string   `json:"kind,omitempty"`
 	Signal      string   `json:"signal,omitempty"`
 	Cols        int      `json:"cols,omitempty"`
@@ -469,6 +471,7 @@ func (s *ContainerSession) Exec(ctx context.Context, req client.ExecRequest) (cl
 		User:        user,
 		Stdin:       append([]byte(nil), req.Stdin...),
 		TTY:         req.TTY,
+		ControlFD:   req.ControlFD,
 		Cols:        req.Cols,
 		Rows:        req.Rows,
 	})
@@ -649,6 +652,7 @@ func (s *ContainerSession) ExecStream(ctx context.Context, req client.ExecReques
 		User:        user,
 		Stdin:       append([]byte(nil), req.Stdin...),
 		TTY:         req.TTY,
+		ControlFD:   req.ControlFD,
 		Cols:        req.Cols,
 		Rows:        req.Rows,
 	})
@@ -2165,6 +2169,7 @@ func parseManagedExecEventLine(line, id string) (client.ExecEvent, bool, bool, e
 	beginMarker := commandBeginMarker + id
 	stdoutPrefix := commandOutputMarker + id + ":"
 	stderrPrefix := commandErrorMarker + id + ":"
+	controlPrefix := commandControlMarker + id + ":"
 	exitPrefix := commandExitMarkerPref + id + ":"
 
 	switch {
@@ -2182,6 +2187,12 @@ func parseManagedExecEventLine(line, id string) (client.ExecEvent, bool, bool, e
 			return client.ExecEvent{}, false, false, nil
 		}
 		return client.ExecEvent{Kind: "stderr", Stream: "stderr", Output: string(data), Data: data}, false, true, nil
+	case strings.HasPrefix(line, controlPrefix):
+		data, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(line, controlPrefix))
+		if err != nil {
+			return client.ExecEvent{}, false, false, nil
+		}
+		return client.ExecEvent{Kind: "control", Output: string(data), Data: data}, false, true, nil
 	case strings.HasPrefix(line, exitPrefix):
 		code, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, exitPrefix)))
 		if err != nil {

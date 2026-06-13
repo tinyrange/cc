@@ -29,6 +29,7 @@ const guestQEMUPath = "/run/ccx3/qemu-x86_64"
 const guestQEMUBinfmtPath = "/run/ccx3-qemu-x86_64"
 const initDurationMarker = "__CCX3_INIT_MS__:"
 const execTimingMarker = "__CCX3_TIMING__:"
+const defaultControlMarkerPref = "__CCX3_CTL__:"
 const fatalBootMarker = "ccx3-init-fatal: "
 const execPivotMode = "--ccx3-exec-pivot"
 
@@ -52,6 +53,7 @@ type config struct {
 	BeginMarker        string   `json:"begin_marker"`
 	OutputMarkerPref   string   `json:"output_marker_prefix"`
 	ErrorMarkerPref    string   `json:"error_marker_prefix"`
+	ControlMarkerPref  string   `json:"control_marker_prefix"`
 	UsageMarkerPref    string   `json:"usage_marker_prefix"`
 	ExitMarkerPrefix   string   `json:"exit_marker_prefix"`
 	PrecopyAMD64Root   bool     `json:"precopy_amd64_root,omitempty"`
@@ -74,20 +76,21 @@ type share struct {
 }
 
 type execRequest struct {
-	Kind    string   `json:"kind,omitempty"`
-	ID      string   `json:"id"`
-	Command []string `json:"command,omitempty"`
-	Env     []string `json:"env,omitempty"`
-	RootDir string   `json:"root_dir,omitempty"`
-	Path    string   `json:"path,omitempty"`
-	Dir     bool     `json:"directory,omitempty"`
-	WorkDir string   `json:"workdir,omitempty"`
-	User    string   `json:"user,omitempty"`
-	Stdin   []byte   `json:"stdin,omitempty"`
-	TTY     bool     `json:"tty,omitempty"`
-	Signal  string   `json:"signal,omitempty"`
-	Cols    int      `json:"cols,omitempty"`
-	Rows    int      `json:"rows,omitempty"`
+	Kind      string   `json:"kind,omitempty"`
+	ID        string   `json:"id"`
+	Command   []string `json:"command,omitempty"`
+	Env       []string `json:"env,omitempty"`
+	RootDir   string   `json:"root_dir,omitempty"`
+	Path      string   `json:"path,omitempty"`
+	Dir       bool     `json:"directory,omitempty"`
+	WorkDir   string   `json:"workdir,omitempty"`
+	User      string   `json:"user,omitempty"`
+	Stdin     []byte   `json:"stdin,omitempty"`
+	TTY       bool     `json:"tty,omitempty"`
+	ControlFD bool     `json:"control_fd,omitempty"`
+	Signal    string   `json:"signal,omitempty"`
+	Cols      int      `json:"cols,omitempty"`
+	Rows      int      `json:"rows,omitempty"`
 }
 
 type managedExec struct {
@@ -907,6 +910,13 @@ func writeExecStdoutBytes(cfg config, control io.Writer, id string, data []byte)
 	writeProtocolLineTo(control, cfg.OutputMarkerPref+id+":"+base64.StdEncoding.EncodeToString(data))
 }
 
+func writeExecControlBytes(cfg config, control io.Writer, id string, data []byte) {
+	if cfg.ControlMarkerPref == "" || len(data) == 0 {
+		return
+	}
+	writeProtocolLineTo(control, cfg.ControlMarkerPref+id+":"+base64.StdEncoding.EncodeToString(data))
+}
+
 func writeExecTiming(control io.Writer, id, phase string, start time.Time) {
 	if id == "" || phase == "" {
 		return
@@ -1165,6 +1175,9 @@ func execCommandGo(argv []string, env []string, workDir string, user string) (in
 }
 
 func commandLoop(cfg config, control io.ReadWriter) error {
+	if cfg.ControlMarkerPref == "" {
+		cfg.ControlMarkerPref = defaultControlMarkerPref
+	}
 	reader := bufio.NewReader(control)
 	active := map[string]*managedExec{}
 	var activeMu sync.Mutex
@@ -1321,7 +1334,7 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 		activeMu.Lock()
 		active[req.ID] = managed
 		activeMu.Unlock()
-		go runManagedExec(cfg, control, req.ID, req.Command, env, req.RootDir, workDir, user, stdinR, managed, req.TTY, req.Cols, req.Rows, func() {
+		go runManagedExec(cfg, control, req.ID, req.Command, env, req.RootDir, workDir, user, stdinR, managed, req.TTY, req.ControlFD, req.Cols, req.Rows, func() {
 			_ = managed.closeStdin()
 			activeMu.Lock()
 			delete(active, req.ID)
@@ -1608,7 +1621,7 @@ func execPivotArgs(rootDir, workDir string, cred *syscall.Credential, argv []str
 	return append(args, argv...)
 }
 
-func runManagedExec(cfg config, control io.Writer, id string, argv []string, env []string, rootDir string, workDir string, user string, stdin io.ReadCloser, managed *managedExec, tty bool, cols int, rows int, cleanup func()) {
+func runManagedExec(cfg config, control io.Writer, id string, argv []string, env []string, rootDir string, workDir string, user string, stdin io.ReadCloser, managed *managedExec, tty bool, controlFD bool, cols int, rows int, cleanup func()) {
 	defer cleanup()
 	execStart := time.Now()
 	writeExecTiming(control, id, "recv", execStart)
@@ -1668,10 +1681,34 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		done       chan struct{}
 		stdoutW    *io.PipeWriter
 		stderrW    *io.PipeWriter
+		controlR   *os.File
+		controlW   *os.File
 		ptyMaster  *os.File
 		ptySlave   *os.File
 		startError error
 	)
+	if controlFD {
+		controlR, controlW, startError = os.Pipe()
+		if startError != nil {
+			writeKernel("ccx3-init: open control fd: " + startError.Error())
+			writeExecStderr(cfg, control, id, "ccx3-init: open control fd: "+startError.Error()+"\n")
+			if cfg.ExitMarkerPrefix != "" {
+				writeProtocolLineTo(control, cfg.ExitMarkerPrefix+id+":126")
+			}
+			return
+		}
+		defer func() {
+			if controlR != nil {
+				_ = controlR.Close()
+			}
+		}()
+		defer func() {
+			if controlW != nil {
+				_ = controlW.Close()
+			}
+		}()
+		cmd.ExtraFiles = append(cmd.ExtraFiles, controlW)
+	}
 
 	if tty {
 		ptyMaster, ptySlave, startError = openPTY(cols, rows)
@@ -1703,6 +1740,9 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		}
 		streams := 1
 		if stdin != nil {
+			streams++
+		}
+		if controlR != nil {
 			streams++
 		}
 		done = make(chan struct{}, streams)
@@ -1764,7 +1804,11 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		cmd.Stdout = stdoutW
 		cmd.Stderr = stderrW
 
-		done = make(chan struct{}, 2)
+		streams := 2
+		if controlR != nil {
+			streams++
+		}
+		done = make(chan struct{}, streams)
 		go func() {
 			defer func() { done <- struct{}{} }()
 			defer stdoutR.Close()
@@ -1804,6 +1848,21 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			}
 		}()
 	}
+	if controlR != nil {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			var buf [256]byte
+			for {
+				n, err := controlR.Read(buf[:])
+				if n > 0 {
+					writeExecControlBytes(cfg, control, id, buf[:n])
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+	}
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	}
@@ -1815,6 +1874,10 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 
 	writeExecTiming(control, id, "start_call", execStart)
 	startErr := cmd.Start()
+	if controlW != nil {
+		_ = controlW.Close()
+		controlW = nil
+	}
 	if startErr != nil {
 		_ = managed.closeStdin()
 		if ptySlave != nil {

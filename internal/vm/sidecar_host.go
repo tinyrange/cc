@@ -267,6 +267,7 @@ func (h *sidecarVMHost) prepareRunInInstanceExec(ctx context.Context, inst *side
 		User:        req.User,
 		Stdin:       append([]byte(nil), req.Stdin...),
 		TTY:         req.TTY,
+		ControlFD:   req.ControlFD,
 		Cols:        req.Cols,
 		Rows:        req.Rows,
 	}, nil
@@ -511,6 +512,7 @@ func sidecarExecRequestFromRun(req client.RunRequest) client.ExecRequest {
 		User:       req.User,
 		Stdin:      append([]byte(nil), req.Stdin...),
 		TTY:        req.TTY,
+		ControlFD:  req.ControlFD,
 		Cols:       req.Cols,
 		Rows:       req.Rows,
 	}

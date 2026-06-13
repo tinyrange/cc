@@ -261,14 +261,15 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 			return client.ExecResponse{}, err
 		}
 		execReq := client.ExecRequest{
-			Command: command,
-			Env:     env,
-			WorkDir: workDir,
-			User:    resolvedUser,
-			Stdin:   append([]byte(nil), req.Stdin...),
-			TTY:     req.TTY,
-			Cols:    req.Cols,
-			Rows:    req.Rows,
+			Command:   command,
+			Env:       env,
+			WorkDir:   workDir,
+			User:      resolvedUser,
+			Stdin:     append([]byte(nil), req.Stdin...),
+			TTY:       req.TTY,
+			ControlFD: req.ControlFD,
+			Cols:      req.Cols,
+			Rows:      req.Rows,
 		}
 		resp, serial, err := kvm.RunManagedExecWithFSAndNet(ctx, kernel, initrd, req.MemoryMB, req.CPUs, req.Dmesg, fsdevs, networkDevice(network), execReq)
 		if err != nil && resp.Output == "" {
@@ -321,6 +322,7 @@ func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runni
 			User:       req.User,
 			Stdin:      append([]byte(nil), req.Stdin...),
 			TTY:        req.TTY,
+			ControlFD:  req.ControlFD,
 			Cols:       req.Cols,
 			Rows:       req.Rows,
 		})
@@ -372,6 +374,7 @@ func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runni
 		User:        req.User,
 		Stdin:       append([]byte(nil), req.Stdin...),
 		TTY:         req.TTY,
+		ControlFD:   req.ControlFD,
 		Cols:        req.Cols,
 		Rows:        req.Rows,
 	})
@@ -432,6 +435,7 @@ func (b *runtimeBackend) RunInInstanceStream(ctx context.Context, inst Instance,
 		User:        req.User,
 		Stdin:       append([]byte(nil), req.Stdin...),
 		TTY:         req.TTY,
+		ControlFD:   req.ControlFD,
 		Cols:        req.Cols,
 		Rows:        req.Rows,
 	}, inputs, onEvent)
@@ -553,6 +557,7 @@ func (i *linuxInstance) Exec(ctx context.Context, req client.ExecRequest) (clien
 		User:        user,
 		Stdin:       append([]byte(nil), req.Stdin...),
 		TTY:         req.TTY,
+		ControlFD:   req.ControlFD,
 		Cols:        req.Cols,
 		Rows:        req.Rows,
 	})
@@ -613,6 +618,7 @@ func (i *linuxInstance) ExecStream(ctx context.Context, req client.ExecRequest, 
 		User:        user,
 		Stdin:       append([]byte(nil), req.Stdin...),
 		TTY:         req.TTY,
+		ControlFD:   req.ControlFD,
 		Cols:        req.Cols,
 		Rows:        req.Rows,
 	}, inputs, onEvent)
@@ -747,15 +753,16 @@ func (i *linuxInstance) Close() error {
 
 func linuxGuestInitConfig(modules []alpine.Module, managedExec bool, network *client.NetworkConfig, runtime *linuxNetworkRuntime) vmruntime.GuestInitConfig {
 	cfg := vmruntime.GuestInitConfig{
-		Hostname:         vmruntime.DefaultHostname(""),
-		Modules:          vmruntime.ModulePaths(modules),
-		ReadyMarker:      linuxInitReadyMarker,
-		BeginMarker:      vmruntime.CommandBeginMarker,
-		OutputMarkerPref: vmruntime.CommandOutputMarker,
-		ErrorMarkerPref:  vmruntime.CommandErrorMarker,
-		UsageMarkerPref:  vmruntime.CommandUsageMarker,
-		ExitMarkerPrefix: vmruntime.CommandExitMarkerPref,
-		UnixTime:         time.Now().Unix(),
+		Hostname:          vmruntime.DefaultHostname(""),
+		Modules:           vmruntime.ModulePaths(modules),
+		ReadyMarker:       linuxInitReadyMarker,
+		BeginMarker:       vmruntime.CommandBeginMarker,
+		OutputMarkerPref:  vmruntime.CommandOutputMarker,
+		ErrorMarkerPref:   vmruntime.CommandErrorMarker,
+		ControlMarkerPref: vmruntime.CommandControlMarker,
+		UsageMarkerPref:   vmruntime.CommandUsageMarker,
+		ExitMarkerPrefix:  vmruntime.CommandExitMarkerPref,
+		UnixTime:          time.Now().Unix(),
 	}
 	if managedExec {
 		cfg.VsockPort = vmruntime.ControlPort

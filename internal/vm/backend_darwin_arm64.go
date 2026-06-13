@@ -168,6 +168,7 @@ func (b *runtimeBackend) RunInInstance(
 			User:       req.User,
 			Stdin:      append([]byte(nil), req.Stdin...),
 			TTY:        req.TTY,
+			ControlFD:  req.ControlFD,
 			Cols:       req.Cols,
 			Rows:       req.Rows,
 		})
@@ -216,6 +217,7 @@ func (b *runtimeBackend) RunInInstance(
 		User:        req.User,
 		Stdin:       append([]byte(nil), req.Stdin...),
 		TTY:         req.TTY,
+		ControlFD:   req.ControlFD,
 		Cols:        req.Cols,
 		Rows:        req.Rows,
 	})
@@ -280,6 +282,7 @@ func (b *runtimeBackend) RunInInstanceStream(
 		User:        req.User,
 		Stdin:       append([]byte(nil), req.Stdin...),
 		TTY:         req.TTY,
+		ControlFD:   req.ControlFD,
 		Cols:        req.Cols,
 		Rows:        req.Rows,
 	}, inputs, onEvent)

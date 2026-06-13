@@ -21,6 +21,7 @@ type ManagedExecRequest struct {
 	User      string   `json:"user,omitempty"`
 	Stdin     []byte   `json:"stdin,omitempty"`
 	TTY       bool     `json:"tty,omitempty"`
+	ControlFD bool     `json:"control_fd,omitempty"`
 	Kind      string   `json:"kind,omitempty"`
 	Signal    string   `json:"signal,omitempty"`
 	Cols      int      `json:"cols,omitempty"`
@@ -105,6 +106,7 @@ func ParseManagedExecEventLine(line, id string) (client.ExecEvent, bool, bool, e
 	beginMarker := CommandBeginMarker + id
 	stdoutPrefix := CommandOutputMarker + id + ":"
 	stderrPrefix := CommandErrorMarker + id + ":"
+	controlPrefix := CommandControlMarker + id + ":"
 	exitPrefix := CommandExitMarkerPref + id + ":"
 
 	switch {
@@ -122,6 +124,12 @@ func ParseManagedExecEventLine(line, id string) (client.ExecEvent, bool, bool, e
 			return client.ExecEvent{}, false, false, nil
 		}
 		return client.ExecEvent{Kind: "stderr", Stream: "stderr", Output: string(data), Data: data}, false, true, nil
+	case strings.HasPrefix(line, controlPrefix):
+		data, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(line, controlPrefix))
+		if err != nil {
+			return client.ExecEvent{}, false, false, nil
+		}
+		return client.ExecEvent{Kind: "control", Output: string(data), Data: data}, false, true, nil
 	case strings.HasPrefix(line, exitPrefix):
 		code, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, exitPrefix)))
 		if err != nil {

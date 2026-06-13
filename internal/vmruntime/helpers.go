@@ -18,6 +18,7 @@ const (
 	CommandBeginMarker    = "__CCX3_BEGIN__:"
 	CommandOutputMarker   = "__CCX3_OUT__:"
 	CommandErrorMarker    = "__CCX3_ERR__:"
+	CommandControlMarker  = "__CCX3_CTL__:"
 	CommandUsageMarker    = "__CCX3_USAGE__:"
 	CommandExitMarkerPref = "__CCX3_EXIT__:"
 )
