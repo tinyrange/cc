@@ -18,6 +18,7 @@ import (
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/guestinit"
 	"j5.nz/cc/internal/imagefs"
+	"j5.nz/cc/internal/kernel/ubuntu"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
@@ -59,7 +60,7 @@ func prepareSidecarCreateResources(h *sidecarVMHost, ctx context.Context, req cl
 		return sidecarStartResources{}, err
 	}
 	image = withRuntimeMountDirs(image)
-	bootResources, err := prepareSidecarBootResources(ctx, h, image, req.Network)
+	bootResources, err := prepareSidecarBootResources(ctx, h, image, req.Kernel, req.KernelModules, req.Network)
 	if err != nil {
 		return sidecarStartResources{}, err
 	}
@@ -106,7 +107,7 @@ func prepareSidecarBlankResources(h *sidecarVMHost, ctx context.Context, req cli
 	} else {
 		root = virtio.NewImageFS(blankRuntimeRootFS(), "")
 	}
-	bootResources, err := prepareSidecarBootResources(ctx, h, image, req.Network)
+	bootResources, err := prepareSidecarBootResources(ctx, h, image, req.Kernel, req.KernelModules, req.Network)
 	if err != nil {
 		return sidecarStartResources{}, err
 	}
@@ -138,37 +139,37 @@ func sidecarSnapshotRoot(backend virtio.FSBackend) (sidecarRootFS, error) {
 	return rootFS, nil
 }
 
-func prepareSidecarBootResources(ctx context.Context, h *sidecarVMHost, image *oci.Image, cfg *client.NetworkConfig) (sidecarStartResources, error) {
+func sidecarKernelProvider(h *sidecarVMHost, flavor string) runtimeKernelProvider {
+	if h != nil && h.images != nil && normalizeRuntimeKernel(flavor) == "ubuntu" {
+		return ubuntu.NewManager(filepath.Join(h.images.Root(), "_kernels", "ubuntu"))
+	}
+	if h == nil {
+		return nil
+	}
+	return h.kernel
+}
+
+func prepareSidecarBootResources(ctx context.Context, h *sidecarVMHost, image *oci.Image, kernelFlavor string, kernelModules []string, cfg *client.NetworkConfig) (sidecarStartResources, error) {
 	if h.kernel == nil {
 		return sidecarStartResources{}, fmt.Errorf("sidecar kernel manager is not configured")
 	}
 	if h.images == nil {
 		return sidecarStartResources{}, fmt.Errorf("sidecar image store is not configured")
 	}
-	kernel, err := h.kernel.ReadKernel()
+	kernelProvider := sidecarKernelProvider(h, kernelFlavor)
+	if kernelProvider == nil {
+		return sidecarStartResources{}, fmt.Errorf("sidecar kernel provider is not configured")
+	}
+	kernel, err := kernelProvider.ReadKernel()
 	if err != nil {
 		return sidecarStartResources{}, err
 	}
-	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO"}
-	if cfg != nil && cfg.Enabled {
-		configVars = append(configVars, "CONFIG_VIRTIO_NET")
-	}
-	moduleMap := map[string]string{
-		"CONFIG_VIRTIO_MMIO":      "kernel/drivers/virtio/virtio_mmio.ko.gz",
-		"CONFIG_FUSE_FS":          "kernel/fs/fuse/fuse.ko.gz",
-		"CONFIG_VIRTIO_FS":        "kernel/fs/fuse/virtiofs.ko.gz",
-		"CONFIG_VSOCKETS":         "kernel/net/vmw_vsock/vsock.ko.gz",
-		"CONFIG_VIRTIO_VSOCKETS":  "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
-		"CONFIG_HW_RANDOM":        "kernel/drivers/char/hw_random/rng-core.ko.gz",
-		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
-		"CONFIG_VIRTIO_NET":       "kernel/drivers/net/virtio_net.ko.gz",
-	}
+	configVars, moduleMap := runtimeKernelRequirements(kernelFlavor, image, cfg != nil && cfg.Enabled, kernelModules)
 	needsAMD64 := NeedsAMD64Emulation(image)
 	if needsAMD64 {
 		configVars = append(configVars, "CONFIG_BINFMT_MISC")
-		moduleMap["CONFIG_BINFMT_MISC"] = "kernel/fs/binfmt_misc.ko.gz"
 	}
-	modules, err := h.kernel.PlanModuleLoad(configVars, moduleMap)
+	modules, err := kernelProvider.PlanModuleLoad(configVars, moduleMap)
 	if err != nil {
 		return sidecarStartResources{}, err
 	}

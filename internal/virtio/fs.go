@@ -32,25 +32,26 @@ const (
 	fsRequestQueueCount = 4
 	fsQueueCount        = fsControlQueueCount + fsRequestQueueCount
 
-	fsCfgTagSize        = 36
-	fsCfgNumQueueOff    = fsCfgTagSize
-	fsCfgTotalSize      = fsCfgTagSize + 4
-	fsInterruptVring    = 0x1
-	featureRingEventIdx = uint64(1) << 29
-	fuseInHeaderSize    = 40
-	fuseOutHeaderSize   = 16
-	fuseAttrSize        = 88
-	fuseEntryOutSize    = 40 + fuseAttrSize
-	fuseAttrOutSize     = 16 + fuseAttrSize
-	fuseOpenOutSize     = 16
-	fuseInitOutSize     = 40
-	fuseStatfsOutSize   = 80
-	fuseStatxOutSize    = 288
-	fuseDirentBaseSize  = 24
-	fuseWriteOutSize    = 8
-	fuseLKInSize        = 48
-	fuseLKOutSize       = 24
-	linuxFUnlck         = 2
+	fsCfgTagSize           = 36
+	fsCfgNumQueueOff       = fsCfgTagSize
+	fsCfgTotalSize         = fsCfgTagSize + 4
+	fsInterruptVring       = 0x1
+	virtioStatusFeaturesOK = 0x8
+	featureRingEventIdx    = uint64(1) << 29
+	fuseInHeaderSize       = 40
+	fuseOutHeaderSize      = 16
+	fuseAttrSize           = 88
+	fuseEntryOutSize       = 40 + fuseAttrSize
+	fuseAttrOutSize        = 16 + fuseAttrSize
+	fuseOpenOutSize        = 16
+	fuseInitOutSize        = 40
+	fuseStatfsOutSize      = 80
+	fuseStatxOutSize       = 288
+	fuseDirentBaseSize     = 24
+	fuseWriteOutSize       = 8
+	fuseLKInSize           = 48
+	fuseLKOutSize          = 24
+	linuxFUnlck            = 2
 )
 
 const (
@@ -269,6 +270,7 @@ type FS struct {
 	cacheMode      string
 	writebackCache bool
 	directMemory   bool
+	eventIdx       bool
 	kickPoll       bool
 	kickPollIdle   time.Duration
 	kickPollSleep  time.Duration
@@ -286,6 +288,7 @@ type FS struct {
 	deviceFeatureSel uint32
 	driverFeatureSel uint32
 	driverFeatures   uint64
+	sharedMemorySel  uint32
 	queueSel         uint32
 	status           uint32
 	interruptStatus  uint32
@@ -374,6 +377,7 @@ type FSStats struct {
 	WorkerCount     int           `json:"worker_count"`
 	CacheMode       string        `json:"cache_mode"`
 	WritebackCache  bool          `json:"writeback_cache"`
+	EventIdx        bool          `json:"event_idx"`
 	MMIOReads       uint64        `json:"mmio_reads"`
 	MMIOWrites      uint64        `json:"mmio_writes"`
 	QueueNotifies   []uint64      `json:"queue_notifies"`
@@ -445,6 +449,7 @@ func NewFS(base, size uint64, irq uint32, tag string, backend FSBackend) *FS {
 		cacheMode:      cacheMode,
 		writebackCache: strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_WRITEBACK")) != "",
 		directMemory:   resolveVirtioFSDirectMemory(),
+		eventIdx:       resolveVirtioFSEventIdx(),
 		kickPoll:       resolveVirtioFSKickPoll(),
 		kickPollIdle:   resolveVirtioFSKickPollDuration("CCX3_VIRTIOFS_KICK_POLL_IDLE", 500*time.Microsecond),
 		kickPollSleep:  resolveVirtioFSKickPollDuration("CCX3_VIRTIOFS_KICK_POLL_SLEEP", 5*time.Microsecond),
@@ -507,6 +512,17 @@ func (f *FS) Close() error {
 
 func resolveVirtioFSKickPoll() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_KICK_POLL"))) {
+	case "", "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}
+
+func resolveVirtioFSEventIdx() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CCX3_VIRTIOFS_EVENT_IDX"))) {
 	case "1", "true", "yes", "on":
 		return true
 	case "", "0", "false", "no", "off":
@@ -642,14 +658,10 @@ func (f *FS) Read(addr uint64, size int) (uint64, error) {
 		return truncateValue(mmioVendorID, size), nil
 	case regDeviceFeatures:
 		if f.deviceFeatureSel == 0 {
-			features := uint64(0)
-			if !f.kickPoll {
-				features |= featureRingEventIdx
-			}
-			return truncateValue(features, size), nil
+			return truncateValue(f.deviceFeaturesLocked(), size), nil
 		}
 		if f.deviceFeatureSel == 1 {
-			return truncateValue(1, size), nil
+			return truncateValue(f.deviceFeaturesLocked()>>32, size), nil
 		}
 		return 0, nil
 	case regQueueNumMax:
@@ -677,6 +689,10 @@ func (f *FS) Read(addr uint64, size int) (uint64, error) {
 			f.logf("mmio-read status size=%d value=%#x", size, f.status)
 		}
 		return truncateValue(uint64(f.status), size), nil
+	case regSharedMemoryLenLow, regSharedMemoryLenHigh:
+		return truncateValue(^uint64(0), size), nil
+	case regSharedMemoryBaseLow, regSharedMemoryBaseHigh:
+		return truncateValue(^uint64(0), size), nil
 	case regConfigGen:
 		return truncateValue(uint64(f.configGeneration), size), nil
 	}
@@ -709,6 +725,8 @@ func (f *FS) Write(addr uint64, size int, value uint64) error {
 		} else if f.driverFeatureSel == 1 {
 			f.driverFeatures = (f.driverFeatures & 0xffffffff) | (uint64(uint32(value)) << 32)
 		}
+	case regSharedMemorySel:
+		f.sharedMemorySel = uint32(value)
 	case regQueueSel:
 		f.queueSel = uint32(value)
 	case regQueueNum:
@@ -774,7 +792,11 @@ func (f *FS) Write(addr uint64, size int, value uint64) error {
 		f.mu.Unlock()
 		return err
 	case regStatus:
-		f.status = uint32(value)
+		status := uint32(value)
+		if status&virtioStatusFeaturesOK != 0 && f.driverFeatures&^f.deviceFeaturesLocked() != 0 {
+			status &^= virtioStatusFeaturesOK
+		}
+		f.status = status
 		if f.status == 0 {
 			f.resetLocked()
 		}
@@ -814,39 +836,51 @@ func (f *FS) processQueueLocked(qidx int) error {
 		return nil
 	}
 
-	availFlags, availIdx, err := f.readAvailHeaderLocked(q)
-	if err != nil {
-		return err
-	}
 	oldUsedIdx := q.usedIdx
 	interruptNeeded := false
-	for q.lastAvailIdx != availIdx {
-		slot := q.lastAvailIdx % q.size
-		head, err := f.readAvailRingEntryLocked(q, slot)
+	availFlags := uint16(0)
+	for {
+		flags, availIdx, err := f.readAvailHeaderLocked(q)
 		if err != nil {
 			return err
 		}
-		if f.Log != nil {
-			f.logf("queue-notify q=%d head=%d", qidx, head)
-		}
-		usedLen, reply, err := f.handleRequestLocked(q, head)
-		if err != nil {
-			return err
-		}
-		if reply {
-			if err := f.writeUsedLocked(q, head, usedLen); err != nil {
+		availFlags = flags
+		for q.lastAvailIdx != availIdx {
+			slot := q.lastAvailIdx % q.size
+			head, err := f.readAvailRingEntryLocked(q, slot)
+			if err != nil {
 				return err
 			}
 			if f.Log != nil {
-				f.logf("used-ring q=%d head=%d len=%d", qidx, head, usedLen)
+				f.logf("queue-notify q=%d head=%d", qidx, head)
 			}
-			interruptNeeded = true
+			usedLen, reply, err := f.handleRequestLocked(q, head)
+			if err != nil {
+				return err
+			}
+			if reply {
+				if err := f.writeUsedLocked(q, head, usedLen); err != nil {
+					return err
+				}
+				if f.Log != nil {
+					f.logf("used-ring q=%d head=%d len=%d", qidx, head, usedLen)
+				}
+				interruptNeeded = true
+			}
+			q.lastAvailIdx++
 		}
-		q.lastAvailIdx++
-	}
-	if f.driverFeatures&featureRingEventIdx != 0 {
+		if f.driverFeatures&featureRingEventIdx == 0 {
+			break
+		}
 		if err := f.writeAvailEventLocked(q); err != nil {
 			return err
+		}
+		_, latestAvailIdx, err := f.readAvailHeaderLocked(q)
+		if err != nil {
+			return err
+		}
+		if q.lastAvailIdx == latestAvailIdx {
+			break
 		}
 	}
 	if interruptNeeded && f.isCompletingQueue(qidx) && f.shouldInterruptLocked(q, oldUsedIdx, q.usedIdx, availFlags) {
@@ -866,30 +900,40 @@ func (f *FS) processQueueAsyncLocked(qidx int, works []fsWork) ([]fsWork, error)
 		return nil, nil
 	}
 
-	availFlags, availIdx, err := f.readAvailHeaderLocked(q)
-	if err != nil {
-		return nil, err
-	}
-	suppressInterrupt := availFlags&1 != 0
-	for q.lastAvailIdx != availIdx {
-		slot := q.lastAvailIdx % q.size
-		head, err := f.readAvailRingEntryLocked(q, slot)
+	for {
+		availFlags, availIdx, err := f.readAvailHeaderLocked(q)
 		if err != nil {
 			return nil, err
 		}
-		if f.Log != nil {
-			f.logf("queue-notify q=%d head=%d", qidx, head)
+		suppressInterrupt := availFlags&1 != 0
+		for q.lastAvailIdx != availIdx {
+			slot := q.lastAvailIdx % q.size
+			head, err := f.readAvailRingEntryLocked(q, slot)
+			if err != nil {
+				return nil, err
+			}
+			if f.Log != nil {
+				f.logf("queue-notify q=%d head=%d", qidx, head)
+			}
+			work, err := f.prepareRequestLocked(qidx, q, head, suppressInterrupt)
+			if err != nil {
+				return nil, err
+			}
+			works = append(works, work)
+			q.lastAvailIdx++
 		}
-		work, err := f.prepareRequestLocked(qidx, q, head, suppressInterrupt)
-		if err != nil {
-			return nil, err
+		if f.driverFeatures&featureRingEventIdx == 0 {
+			break
 		}
-		works = append(works, work)
-		q.lastAvailIdx++
-	}
-	if f.driverFeatures&featureRingEventIdx != 0 {
 		if err := f.writeAvailEventLocked(q); err != nil {
 			return nil, err
+		}
+		_, latestAvailIdx, err := f.readAvailHeaderLocked(q)
+		if err != nil {
+			return nil, err
+		}
+		if q.lastAvailIdx == latestAvailIdx {
+			break
 		}
 	}
 	return works, nil
@@ -1088,8 +1132,27 @@ func (f *FS) runKickPoller(generation uint32) {
 			if err := f.setRequestQueueNoNotifyLocked(false); err != nil {
 				f.logf("kick-poll clear no-notify: %v", err)
 			}
-			f.kickPollActive = false
-			stop = true
+			for qidx := fsQueueRequest; qidx < fsQueueRequest+fsRequestQueueCount && qidx < len(f.queues); qidx++ {
+				var workScratch [16]fsWork
+				works, err := f.processQueueAsyncLocked(qidx, workScratch[:0])
+				if err != nil {
+					f.logf("kick-poll final q=%d: %v", qidx, err)
+					continue
+				}
+				if len(works) == 0 {
+					continue
+				}
+				processed += len(works)
+				allWorks = append(allWorks, works...)
+			}
+			if processed != 0 {
+				f.kickPollHits++
+				f.kickPollWorks += uint64(processed)
+				idleUntil = time.Now().Add(f.kickPollIdle)
+			} else {
+				f.kickPollActive = false
+				stop = true
+			}
 		} else {
 			f.kickPollMisses++
 		}
@@ -2525,6 +2588,7 @@ func (f *FS) Stats() FSStats {
 		WorkerCount:     f.workerCount,
 		CacheMode:       f.cacheMode,
 		WritebackCache:  f.writebackCache,
+		EventIdx:        f.eventIdx,
 		MMIOReads:       f.mmioReads,
 		MMIOWrites:      f.mmioWrites,
 		QueueNotifies:   append([]uint64(nil), f.queueNotifies...),
@@ -2635,6 +2699,7 @@ func (f *FS) resetLocked() {
 	f.deviceFeatureSel = 0
 	f.driverFeatureSel = 0
 	f.driverFeatures = 0
+	f.sharedMemorySel = 0
 	f.queueSel = 0
 	f.status = 0
 	f.interruptStatus = 0
@@ -2642,6 +2707,14 @@ func (f *FS) resetLocked() {
 	f.configGeneration++
 	f.kickPollActive = false
 	f.resetQueueStateLocked()
+}
+
+func (f *FS) deviceFeaturesLocked() uint64 {
+	features := featureVersion1
+	if f.eventIdx && !f.kickPoll {
+		features |= featureRingEventIdx
+	}
+	return features
 }
 
 func (f *FS) configBytesLocked() []byte {
@@ -3703,46 +3776,88 @@ func (p *imageFS) GetAttr(nodeID uint64) (FuseAttr, int32) {
 
 func (p *imageFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	parentNode := p.nodes[parent]
 	if parentNode == nil {
+		p.mu.Unlock()
 		return 0, FuseAttr{}, -linuxENOENT
 	}
 	name = path.Base(path.Clean("/" + name))
 	if name == "." {
-		return parentNode.id, p.attr(parentNode), 0
+		attr := p.attr(parentNode)
+		p.mu.Unlock()
+		return parentNode.id, attr, 0
 	}
 	p.debugChildfLocked("lookup", parent, name, "")
 	childID, ok := parentNode.entries[name]
 	if !ok {
 		if parentNode.whiteouts[name] {
 			p.debugChildfLocked("lookup-whiteout", parent, name, "errno=%d", -linuxENOENT)
+			p.mu.Unlock()
 			return 0, FuseAttr{}, -linuxENOENT
 		}
 		if parentNode.abstractDir == nil {
 			p.debugChildfLocked("lookup-miss", parent, name, "errno=%d", -linuxENOENT)
+			p.mu.Unlock()
 			return 0, FuseAttr{}, -linuxENOENT
 		}
-		entry, err := parentNode.abstractDir.Lookup(name)
+		lowerDir := parentNode.abstractDir
+		p.mu.Unlock()
+		entry, err := lowerDir.Lookup(name)
 		if err != nil {
+			p.mu.Lock()
 			p.debugChildfLocked("lookup-lower-miss", parent, name, "errno=%d", -linuxENOENT)
+			p.mu.Unlock()
+			return 0, FuseAttr{}, -linuxENOENT
+		}
+		p.mu.Lock()
+		parentNode = p.nodes[parent]
+		if parentNode == nil {
+			p.mu.Unlock()
+			return 0, FuseAttr{}, -linuxENOENT
+		}
+		if parentNode.whiteouts[name] {
+			p.debugChildfLocked("lookup-whiteout-after-lower", parent, name, "errno=%d", -linuxENOENT)
+			p.mu.Unlock()
+			return 0, FuseAttr{}, -linuxENOENT
+		}
+		if existingID, exists := parentNode.entries[name]; exists {
+			child := p.nodes[existingID]
+			if child == nil {
+				p.debugChildfLocked("lookup-stale-node", parent, name, "node=%d errno=%d", existingID, -linuxENOENT)
+				p.mu.Unlock()
+				return 0, FuseAttr{}, -linuxENOENT
+			}
+			attr := p.attr(child)
+			p.debugChildfLocked("lookup-raced-hit", parent, name, "node=%d mode=%#o", child.id, attr.Mode)
+			p.mu.Unlock()
+			return child.id, attr, 0
+		}
+		if parentNode.abstractDir != lowerDir {
+			p.debugChildfLocked("lookup-lower-miss", parent, name, "errno=%d", -linuxENOENT)
+			p.mu.Unlock()
 			return 0, FuseAttr{}, -linuxENOENT
 		}
 		child, errno := p.createAbstractNode(parentNode, name, entry)
 		if errno != 0 {
 			p.debugChildfLocked("lookup-lower-error", parent, name, "errno=%d", errno)
+			p.mu.Unlock()
 			return 0, FuseAttr{}, errno
 		}
-		p.debugChildfLocked("lookup-lower-hit", parent, name, "node=%d mode=%#o", child.id, p.attr(child).Mode)
-		return child.id, p.attr(child), 0
+		attr := p.attr(child)
+		p.debugChildfLocked("lookup-lower-hit", parent, name, "node=%d mode=%#o", child.id, attr.Mode)
+		p.mu.Unlock()
+		return child.id, attr, 0
 	}
 	child := p.nodes[childID]
 	if child == nil {
 		p.debugChildfLocked("lookup-stale-node", parent, name, "node=%d errno=%d", childID, -linuxENOENT)
+		p.mu.Unlock()
 		return 0, FuseAttr{}, -linuxENOENT
 	}
-	p.debugChildfLocked("lookup-hit", parent, name, "node=%d mode=%#o", child.id, p.attr(child).Mode)
-	return child.id, p.attr(child), 0
+	attr := p.attr(child)
+	p.debugChildfLocked("lookup-hit", parent, name, "node=%d mode=%#o", child.id, attr.Mode)
+	p.mu.Unlock()
+	return child.id, attr, 0
 }
 
 func (p *imageFS) Open(nodeID uint64, flags uint32) (uint64, int32) {
@@ -3864,6 +3979,9 @@ func (p *imageFS) Lseek(nodeID uint64, fh uint64, offset uint64, whence uint32) 
 }
 
 func (p *imageFS) OpenDir(nodeID uint64, _ uint32) (uint64, int32) {
+	if errno := p.materializeDirEntries(nodeID); errno != 0 {
+		return 0, errno
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	node := p.nodes[nodeID]
@@ -3872,11 +3990,6 @@ func (p *imageFS) OpenDir(nodeID uint64, _ uint32) (uint64, int32) {
 	}
 	if !node.isDir() {
 		return 0, -linuxENOTDIR
-	}
-	if node.abstractDir != nil && !node.entriesDone {
-		if _, errno := p.materializeDirEntriesLocked(node); errno != 0 {
-			return 0, errno
-		}
 	}
 	entries := []dirEntry{
 		{name: ".", typ: dirTypeDir, ino: node.id},
@@ -4562,6 +4675,72 @@ func (p *imageFS) materializeDirEntriesLocked(node *imageNode) ([]imagefs.DirEnt
 	}
 	node.entriesDone = true
 	return ents, 0
+}
+
+func (p *imageFS) materializeDirEntries(nodeID uint64) int32 {
+	p.mu.Lock()
+	node := p.nodes[nodeID]
+	if node == nil {
+		p.mu.Unlock()
+		return -linuxENOENT
+	}
+	if !node.isDir() {
+		p.mu.Unlock()
+		return -linuxENOTDIR
+	}
+	lowerDir := node.abstractDir
+	if lowerDir == nil || node.entriesDone {
+		p.mu.Unlock()
+		return 0
+	}
+	p.mu.Unlock()
+
+	ents, err := lowerDir.ReadDir()
+	if err != nil {
+		return -linuxENOENT
+	}
+	sort.Slice(ents, func(i, j int) bool { return ents[i].Name < ents[j].Name })
+	type lowerEntry struct {
+		name  string
+		entry imagefs.Entry
+	}
+	lowerEntries := make([]lowerEntry, 0, len(ents))
+	for _, ent := range ents {
+		if ent.Name == "." || ent.Name == ".." {
+			continue
+		}
+		entry, err := lowerDir.Lookup(ent.Name)
+		if err != nil {
+			continue
+		}
+		lowerEntries = append(lowerEntries, lowerEntry{name: ent.Name, entry: entry})
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	node = p.nodes[nodeID]
+	if node == nil {
+		return -linuxENOENT
+	}
+	if node.abstractDir != lowerDir {
+		return 0
+	}
+	if node.entriesDone {
+		return 0
+	}
+	for _, ent := range lowerEntries {
+		if node.whiteouts[ent.name] {
+			continue
+		}
+		if _, ok := node.entries[ent.name]; ok {
+			continue
+		}
+		if _, errno := p.createAbstractNode(node, ent.name, ent.entry); errno != 0 {
+			return errno
+		}
+	}
+	node.entriesDone = true
+	return 0
 }
 
 func (p *imageFS) copyUpFileLocked(node *imageNode) int32 {

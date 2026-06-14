@@ -342,6 +342,7 @@ type CreateInstanceRequest struct {
 	ID             string         `json:"id,omitempty"`
 	Image          string         `json:"image"`
 	InitSystem     string         `json:"init,omitempty"`
+	Kernel         string         `json:"kernel,omitempty"`
 	Shares         []ShareMount   `json:"shares,omitempty"`
 	Network        *NetworkConfig `json:"network,omitempty"`
 	KernelModules  []string       `json:"kernel_modules,omitempty"`
@@ -356,6 +357,7 @@ type StartInstanceRequest struct {
 	ID             string         `json:"id,omitempty"`
 	Image          string         `json:"image,omitempty"`
 	InitSystem     string         `json:"init,omitempty"`
+	Kernel         string         `json:"kernel,omitempty"`
 	Network        *NetworkConfig `json:"network,omitempty"`
 	KernelModules  []string       `json:"kernel_modules,omitempty"`
 	MemoryMB       uint64         `json:"memory_mb,omitempty"`
@@ -370,6 +372,7 @@ type InstanceState struct {
 	Status      string `json:"status"`
 	Image       string `json:"image,omitempty"`
 	InitSystem  string `json:"init,omitempty"`
+	Kernel      string `json:"kernel,omitempty"`
 	MemoryMB    uint64 `json:"memory_mb,omitempty"`
 	CPUs        int    `json:"cpus,omitempty"`
 	NestedVirt  bool   `json:"nested_virtualization,omitempty"`
@@ -386,6 +389,7 @@ type RunRequest struct {
 	ID             string         `json:"id,omitempty"`
 	Image          string         `json:"image"`
 	InitSystem     string         `json:"init,omitempty"`
+	Kernel         string         `json:"kernel,omitempty"`
 	Shares         []ShareMount   `json:"shares,omitempty"`
 	Network        *NetworkConfig `json:"network,omitempty"`
 	KernelModules  []string       `json:"kernel_modules,omitempty"`

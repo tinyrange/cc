@@ -66,3 +66,34 @@ func TestEnsureCredentialWorkDirCreatesHomeSubdirectory(t *testing.T) {
 		t.Fatalf("non-home workdir stat err = %v, want not created", err)
 	}
 }
+
+func TestCommandNeedsSystemdReady(t *testing.T) {
+	tests := []struct {
+		name string
+		argv []string
+		want bool
+	}{
+		{name: "empty", argv: nil, want: false},
+		{name: "ordinary command", argv: []string{"nproc"}, want: false},
+		{name: "direct systemctl", argv: []string{"systemctl", "status"}, want: true},
+		{name: "path systemctl", argv: []string{"/usr/bin/systemctl", "status"}, want: true},
+		{name: "journalctl", argv: []string{"journalctl", "-b"}, want: true},
+		{name: "service", argv: []string{"service", "ssh", "status"}, want: true},
+		{name: "service help", argv: []string{"service", "--help"}, want: false},
+		{name: "shell ordinary", argv: []string{"sh", "-lc", "printf ok"}, want: false},
+		{name: "shell systemctl", argv: []string{"sh", "-lc", "systemctl status"}, want: true},
+		{name: "shell path systemctl", argv: []string{"bash", "-c", "/bin/systemctl status"}, want: true},
+		{name: "sudo systemctl", argv: []string{"sudo", "-u", "root", "systemctl", "status"}, want: true},
+		{name: "env systemctl", argv: []string{"env", "LC_ALL=C", "systemctl", "status"}, want: true},
+		{name: "env ordinary", argv: []string{"env", "LC_ALL=C", "nproc"}, want: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := commandNeedsSystemdReady(test.argv)
+			if got != test.want {
+				t.Fatalf("commandNeedsSystemdReady(%q) = %v, want %v", test.argv, got, test.want)
+			}
+		})
+	}
+}

@@ -292,13 +292,16 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 
 func (b *runtimeBackend) RunStream(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	inst, err := b.StartStream(ctx, client.CreateInstanceRequest{
-		ID:       req.ID,
-		Image:    req.Image,
-		Shares:   append([]client.ShareMount(nil), req.Shares...),
-		Network:  req.Network,
-		MemoryMB: req.MemoryMB,
-		CPUs:     req.CPUs,
-		Dmesg:    req.Dmesg,
+		ID:            req.ID,
+		Image:         req.Image,
+		InitSystem:    req.InitSystem,
+		Kernel:        req.Kernel,
+		Shares:        append([]client.ShareMount(nil), req.Shares...),
+		Network:       req.Network,
+		KernelModules: append([]string(nil), req.KernelModules...),
+		MemoryMB:      req.MemoryMB,
+		CPUs:          req.CPUs,
+		Dmesg:         req.Dmesg,
 	}, nil)
 	if err != nil {
 		return err

@@ -135,8 +135,12 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 		return nil, fmt.Errorf("kernel load address %#x below RAM base %#x", loadAddr, opts.MemoryBase)
 	}
 
+	kernelReserveSize := uint64(len(image))
+	if probe.Header.ImageSize > kernelReserveSize {
+		kernelReserveSize = probe.Header.ImageSize
+	}
 	loadOff := loadAddr - opts.MemoryBase
-	if loadOff+uint64(len(image)) > uint64(len(memory)) {
+	if loadOff+kernelReserveSize > uint64(len(memory)) {
 		return nil, fmt.Errorf("kernel does not fit in guest RAM")
 	}
 	start = time.Now()
@@ -146,7 +150,7 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 	initrdAddr := opts.InitrdGPA
 	if len(opts.Initrd) > 0 {
 		if initrdAddr == 0 {
-			initrdAddr = alignUp(loadAddr+uint64(len(image)), initrdAlignment)
+			initrdAddr = alignUp(loadAddr+kernelReserveSize, initrdAlignment)
 		}
 		initrdOff := initrdAddr - opts.MemoryBase
 		if initrdAddr < opts.MemoryBase || initrdOff+uint64(len(opts.Initrd)) > uint64(len(memory)) {
@@ -175,7 +179,7 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 		return nil, err
 	}
 
-	dtbStart := loadAddr + uint64(len(image))
+	dtbStart := loadAddr + kernelReserveSize
 	if len(opts.Initrd) > 0 {
 		dtbStart = initrdAddr + uint64(len(opts.Initrd))
 	}

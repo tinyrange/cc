@@ -357,11 +357,6 @@ func runStage2() error {
 	}
 	defer control.Close()
 	if cfg.ReadyMarker != "" {
-		if strings.TrimSpace(cfg.InitSystem) == initSystemSystemd {
-			if err := waitForSystemdControlSocket(systemdReadyTimeout); err != nil {
-				return err
-			}
-		}
 		writeProtocolLineTo(control, initDurationMarker+"0")
 		writeProtocolLineTo(control, cfg.ReadyMarker)
 	}
@@ -469,11 +464,7 @@ func bootSystemd(cfg config, bootStart time.Time) error {
 		return err
 	}
 	writeStage(bootStart, "exec systemd")
-	env := append(os.Environ(),
-		"container=ccx3",
-		"container_uuid=ccx3",
-	)
-	return syscall.Exec(systemdPath, []string{systemdPath}, env)
+	return syscall.Exec(systemdPath, []string{systemdPath}, os.Environ())
 }
 
 func findSystemd() (string, error) {
@@ -1621,23 +1612,28 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 	var activeMu sync.Mutex
 	var systemdCommandMu sync.Mutex
 	systemdCommandReady := strings.TrimSpace(cfg.InitSystem) != initSystemSystemd
-	waitForCommandReady := func() error {
+	waitForCommandReady := func(argv []string) func() error {
 		if strings.TrimSpace(cfg.InitSystem) != initSystemSystemd {
 			return nil
 		}
-		systemdCommandMu.Lock()
-		if systemdCommandReady {
+		if !commandNeedsSystemdReady(argv) {
+			return nil
+		}
+		return func() error {
+			systemdCommandMu.Lock()
+			if systemdCommandReady {
+				systemdCommandMu.Unlock()
+				return nil
+			}
+			systemdCommandMu.Unlock()
+			if err := waitForSystemdCommandReady(systemdReadyTimeout); err != nil {
+				return err
+			}
+			systemdCommandMu.Lock()
+			systemdCommandReady = true
 			systemdCommandMu.Unlock()
 			return nil
 		}
-		systemdCommandMu.Unlock()
-		if err := waitForSystemdCommandReady(systemdReadyTimeout); err != nil {
-			return err
-		}
-		systemdCommandMu.Lock()
-		systemdCommandReady = true
-		systemdCommandMu.Unlock()
-		return nil
 	}
 	for {
 		line, err := reader.ReadBytes('\n')
@@ -1797,7 +1793,7 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 		closeStdin := pendingStdinClose[req.ID]
 		delete(pendingStdinClose, req.ID)
 		activeMu.Unlock()
-		go runManagedExec(cfg, control, req.ID, req.Command, env, req.RootDir, workDir, user, stdinR, managed, req.TTY, req.ControlFD, req.Cols, req.Rows, waitForCommandReady, func() {
+		go runManagedExec(cfg, control, req.ID, req.Command, env, req.RootDir, workDir, user, stdinR, managed, req.TTY, req.ControlFD, req.Cols, req.Rows, waitForCommandReady(req.Command), func() {
 			_ = managed.closeStdin()
 			activeMu.Lock()
 			delete(active, req.ID)
@@ -1822,7 +1818,85 @@ func commandLoop(cfg config, control io.ReadWriter) error {
 	}
 }
 
+func commandNeedsSystemdReady(argv []string) bool {
+	if len(argv) == 0 {
+		return false
+	}
+	return commandTextNeedsSystemdReady(argv[0], argv[1:])
+}
+
+func commandTextNeedsSystemdReady(cmd string, args []string) bool {
+	switch filepath.Base(cmd) {
+	case "systemctl", "journalctl", "loginctl", "busctl", "hostnamectl", "timedatectl", "localectl", "networkctl", "resolvectl":
+		return true
+	case "service":
+		return len(args) == 0 || args[0] != "--help"
+	case "sudo", "doas", "env", "command":
+		next, rest, ok := unwrapCommandPrefix(args)
+		if !ok {
+			return false
+		}
+		return commandTextNeedsSystemdReady(next, rest)
+	case "sh", "bash", "dash", "zsh":
+		for i, arg := range args {
+			if arg == "-c" && i+1 < len(args) {
+				return shellScriptNeedsSystemdReady(args[i+1])
+			}
+		}
+	}
+	return false
+}
+
+func unwrapCommandPrefix(args []string) (string, []string, bool) {
+	for len(args) > 0 {
+		arg := args[0]
+		if arg == "--" {
+			args = args[1:]
+			continue
+		}
+		if strings.Contains(arg, "=") && !strings.HasPrefix(arg, "-") {
+			args = args[1:]
+			continue
+		}
+		if strings.HasPrefix(arg, "-") {
+			args = args[1:]
+			if arg == "-u" || arg == "-g" || arg == "-C" || arg == "-S" || arg == "--user" || arg == "--group" || arg == "--chdir" || arg == "--shell" {
+				if len(args) > 0 {
+					args = args[1:]
+				}
+			}
+			continue
+		}
+		return arg, args[1:], true
+	}
+	return "", nil, false
+}
+
+func shellScriptNeedsSystemdReady(script string) bool {
+	fields := strings.FieldsFunc(script, func(r rune) bool {
+		switch r {
+		case ' ', '\t', '\n', '\r', ';', '&', '|', '(', ')', '<', '>', '`', '$', '"', '\'', '\\':
+			return true
+		default:
+			return false
+		}
+	})
+	for _, field := range fields {
+		if commandTextNeedsSystemdReady(field, nil) {
+			return true
+		}
+	}
+	return false
+}
+
 func waitForSystemdCommandReady(timeout time.Duration) error {
+	if ok, err := socketExists("/run/systemd/private"); err != nil {
+		return err
+	} else if !ok {
+		if err := waitForSystemdControlSocket(timeout); err != nil {
+			return err
+		}
+	}
 	if !systemdSystemBusExpected() {
 		return nil
 	}

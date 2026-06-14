@@ -98,6 +98,7 @@ type Machine struct {
 	id         string
 	image      string
 	initSystem string
+	kernel     string
 	memoryMB   uint64
 	cpus       int
 	nestedVirt bool
@@ -579,6 +580,7 @@ func (m *Manager) StartInstanceStream(ctx context.Context, id string, req client
 		id:         id,
 		image:      req.Image,
 		initSystem: req.InitSystem,
+		kernel:     req.Kernel,
 		memoryMB:   req.MemoryMB,
 		cpus:       req.CPUs,
 		nestedVirt: req.NestedVirt,
@@ -659,6 +661,7 @@ func (m *Manager) StartBlankInstanceStream(
 		id:         id,
 		image:      req.Image,
 		initSystem: req.InitSystem,
+		kernel:     req.Kernel,
 		memoryMB:   req.MemoryMB,
 		cpus:       req.CPUs,
 		nestedVirt: req.NestedVirt,
@@ -951,6 +954,7 @@ func (m *Manager) statusLocked(id string) client.InstanceState {
 		Status:     "running",
 		Image:      machine.image,
 		InitSystem: machine.initSystem,
+		Kernel:     machine.kernel,
 		MemoryMB:   machine.memoryMB,
 		CPUs:       machine.cpus,
 		NestedVirt: machine.nestedVirt,

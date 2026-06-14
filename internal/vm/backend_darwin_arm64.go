@@ -20,6 +20,7 @@ import (
 	"j5.nz/cc/internal/hv/hvf"
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/kernel/alpine"
+	"j5.nz/cc/internal/kernel/ubuntu"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/timing"
 	"j5.nz/cc/internal/virtio"
@@ -41,8 +42,89 @@ type runtimeBackend struct {
 	guestInitCache string
 }
 
+type runtimeKernelProvider interface {
+	ReadKernel() ([]byte, error)
+	PlanModuleLoad([]string, map[string]string) ([]alpine.Module, error)
+}
+
 func NewRuntimeBackend(kernel *alpine.Manager, images *oci.Store, guestInitCache string) Backend {
 	return &runtimeBackend{kernel: kernel, images: images, guestInitCache: guestInitCache}
+}
+
+func (b *runtimeBackend) kernelProvider(flavor string) runtimeKernelProvider {
+	if normalizeRuntimeKernel(flavor) == "ubuntu" && b.images != nil {
+		return ubuntu.NewManager(filepath.Join(b.images.Root(), "_kernels", "ubuntu"))
+	}
+	return b.kernel
+}
+
+func normalizeRuntimeKernel(flavor string) string {
+	flavor = strings.ToLower(strings.TrimSpace(flavor))
+	switch flavor {
+	case "", "default", "alpine":
+		return ""
+	default:
+		return flavor
+	}
+}
+
+func runtimeKernelRequirements(flavor string, image *oci.Image, network bool, extra []string) ([]string, map[string]string) {
+	if normalizeRuntimeKernel(flavor) == "ubuntu" {
+		return ubuntuRuntimeKernelRequirements(extra)
+	}
+	return alpineRuntimeKernelRequirements(network, extra)
+}
+
+func alpineRuntimeKernelRequirements(network bool, extra []string) ([]string, map[string]string) {
+	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO"}
+	if network {
+		configVars = append(configVars, "CONFIG_VIRTIO_NET")
+	}
+	configVars = append(configVars, extra...)
+	moduleMap := map[string]string{
+		"CONFIG_VIRTIO_MMIO":      "kernel/drivers/virtio/virtio_mmio.ko.gz",
+		"CONFIG_FUSE_FS":          "kernel/fs/fuse/fuse.ko.gz",
+		"CONFIG_VIRTIO_FS":        "kernel/fs/fuse/virtiofs.ko.gz",
+		"CONFIG_VSOCKETS":         "kernel/net/vmw_vsock/vsock.ko.gz",
+		"CONFIG_VIRTIO_VSOCKETS":  "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
+		"CONFIG_HW_RANDOM":        "kernel/drivers/char/hw_random/rng-core.ko.gz",
+		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
+		"CONFIG_VIRTIO_NET":       "kernel/drivers/net/virtio_net.ko.gz",
+		"CONFIG_BINFMT_MISC":      "kernel/fs/binfmt_misc.ko.gz",
+	}
+	return configVars, moduleMap
+}
+
+func ubuntuRuntimeKernelRequirements(extra []string) ([]string, map[string]string) {
+	configVars := []string{
+		"CONFIG_VIRTIO_MMIO",
+		"CONFIG_FUSE_FS",
+		"CONFIG_VIRTIO_FS",
+		"CONFIG_VSOCKETS",
+		"CONFIG_VIRTIO_VSOCKETS",
+		"CONFIG_HW_RANDOM",
+		"CONFIG_HW_RANDOM_VIRTIO",
+		"CONFIG_VIRTIO_NET",
+		"CONFIG_OVERLAY_FS",
+		"CONFIG_NF_TABLES",
+		"CONFIG_IP_NF_IPTABLES",
+		"CONFIG_BINFMT_MISC",
+		"MODULE:autofs4",
+	}
+	configVars = append(configVars, extra...)
+	moduleMap := map[string]string{
+		"CONFIG_VIRTIO_FS":        "kernel/fs/fuse/virtiofs.ko.zst",
+		"CONFIG_VSOCKETS":         "kernel/net/vmw_vsock/vsock.ko.zst",
+		"CONFIG_VIRTIO_VSOCKETS":  "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.zst",
+		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.zst",
+		"CONFIG_VIRTIO_NET":       "kernel/drivers/net/virtio_net.ko.zst",
+		"CONFIG_OVERLAY_FS":       "kernel/fs/overlayfs/overlay.ko.zst",
+		"CONFIG_NF_TABLES":        "kernel/net/netfilter/nf_tables.ko.zst",
+		"CONFIG_IP_NF_IPTABLES":   "kernel/net/ipv4/netfilter/ip_tables.ko.zst",
+		"CONFIG_BINFMT_MISC":      "kernel/fs/binfmt_misc.ko.zst",
+		"MODULE:autofs4":          "kernel/fs/autofs/autofs4.ko.zst",
+	}
+	return configVars, moduleMap
 }
 
 func (b *runtimeBackend) Start(ctx context.Context, req client.CreateInstanceRequest) (Instance, error) {
@@ -133,13 +215,17 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 
 func (b *runtimeBackend) RunStream(ctx context.Context, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	inst, err := b.StartStream(ctx, client.CreateInstanceRequest{
-		Image:      req.Image,
-		Shares:     append([]client.ShareMount(nil), req.Shares...),
-		Network:    req.Network,
-		MemoryMB:   req.MemoryMB,
-		CPUs:       req.CPUs,
-		NestedVirt: req.NestedVirt,
-		Dmesg:      req.Dmesg,
+		Image:          req.Image,
+		InitSystem:     req.InitSystem,
+		Kernel:         req.Kernel,
+		Shares:         append([]client.ShareMount(nil), req.Shares...),
+		Network:        req.Network,
+		KernelModules:  append([]string(nil), req.KernelModules...),
+		MemoryMB:       req.MemoryMB,
+		CPUs:           req.CPUs,
+		NestedVirt:     req.NestedVirt,
+		Dmesg:          req.Dmesg,
+		TimeoutSeconds: req.TimeoutSeconds,
 	}, nil)
 	if err != nil {
 		return err
@@ -315,7 +401,7 @@ func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance
 	return inst.ExecStream(ctx, req, inputs, onEvent)
 }
 
-func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, initSystem string, memoryMB uint64, cpus int, nestedVirt bool, dmesg bool, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
+func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string, initSystem string, kernelFlavor string, kernelModules []string, memoryMB uint64, cpus int, nestedVirt bool, dmesg bool, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
 	start := time.Now()
 	if bundle, err := workerBootBundle(); err != nil {
 		return vmruntime.RunRequest{}, err
@@ -347,32 +433,19 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 	timing.Since(ctx, "backend.image_open", start)
 	timingLog("buildBaseRequest image open took=%s image=%q", time.Since(start), imageName)
 	start = time.Now()
-	kernel, err := b.kernel.ReadKernel()
+	kernelProvider := b.kernelProvider(kernelFlavor)
+	kernel, err := kernelProvider.ReadKernel()
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
 	timing.Since(ctx, "backend.read_kernel", start)
 	timingLog("buildBaseRequest ReadKernel took=%s image=%q", time.Since(start), imageName)
 	start = time.Now()
-	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO"}
-	if network != nil {
-		configVars = append(configVars, "CONFIG_VIRTIO_NET")
-	}
-	moduleMap := map[string]string{
-		"CONFIG_VIRTIO_MMIO":      "kernel/drivers/virtio/virtio_mmio.ko.gz",
-		"CONFIG_FUSE_FS":          "kernel/fs/fuse/fuse.ko.gz",
-		"CONFIG_VIRTIO_FS":        "kernel/fs/fuse/virtiofs.ko.gz",
-		"CONFIG_VSOCKETS":         "kernel/net/vmw_vsock/vsock.ko.gz",
-		"CONFIG_VIRTIO_VSOCKETS":  "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
-		"CONFIG_HW_RANDOM":        "kernel/drivers/char/hw_random/rng-core.ko.gz",
-		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
-		"CONFIG_VIRTIO_NET":       "kernel/drivers/net/virtio_net.ko.gz",
-	}
+	configVars, moduleMap := runtimeKernelRequirements(kernelFlavor, image, network != nil, kernelModules)
 	if NeedsAMD64Emulation(image) {
 		configVars = append(configVars, "CONFIG_BINFMT_MISC")
-		moduleMap["CONFIG_BINFMT_MISC"] = "kernel/fs/binfmt_misc.ko.gz"
 	}
-	modules, err := b.kernel.PlanModuleLoad(configVars, moduleMap)
+	modules, err := kernelProvider.PlanModuleLoad(configVars, moduleMap)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
@@ -440,7 +513,7 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 	if len(networks) > 0 {
 		network = networks[0]
 	}
-	runReq, err := b.buildBaseRequest(ctx, req.Image, req.InitSystem, req.MemoryMB, req.CPUs, req.NestedVirt, req.Dmesg, network)
+	runReq, err := b.buildBaseRequest(ctx, req.Image, req.InitSystem, req.Kernel, req.KernelModules, req.MemoryMB, req.CPUs, req.NestedVirt, req.Dmesg, network)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
@@ -501,29 +574,16 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 			return vmruntime.RunRequest{}, err
 		}
 	}
-	kernel, err := b.kernel.ReadKernel()
+	kernelProvider := b.kernelProvider(req.Kernel)
+	kernel, err := kernelProvider.ReadKernel()
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
-	configVars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO"}
-	if network != nil {
-		configVars = append(configVars, "CONFIG_VIRTIO_NET")
-	}
-	moduleMap := map[string]string{
-		"CONFIG_VIRTIO_MMIO":      "kernel/drivers/virtio/virtio_mmio.ko.gz",
-		"CONFIG_FUSE_FS":          "kernel/fs/fuse/fuse.ko.gz",
-		"CONFIG_VIRTIO_FS":        "kernel/fs/fuse/virtiofs.ko.gz",
-		"CONFIG_VSOCKETS":         "kernel/net/vmw_vsock/vsock.ko.gz",
-		"CONFIG_VIRTIO_VSOCKETS":  "kernel/net/vmw_vsock/vmw_vsock_virtio_transport.ko.gz",
-		"CONFIG_HW_RANDOM":        "kernel/drivers/char/hw_random/rng-core.ko.gz",
-		"CONFIG_HW_RANDOM_VIRTIO": "kernel/drivers/char/hw_random/virtio-rng.ko.gz",
-		"CONFIG_VIRTIO_NET":       "kernel/drivers/net/virtio_net.ko.gz",
-	}
+	configVars, moduleMap := runtimeKernelRequirements(req.Kernel, image, network != nil, req.KernelModules)
 	if NeedsAMD64Emulation(image) {
 		configVars = append(configVars, "CONFIG_BINFMT_MISC")
-		moduleMap["CONFIG_BINFMT_MISC"] = "kernel/fs/binfmt_misc.ko.gz"
 	}
-	modules, err := b.kernel.PlanModuleLoad(configVars, moduleMap)
+	modules, err := kernelProvider.PlanModuleLoad(configVars, moduleMap)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
@@ -671,7 +731,7 @@ func sidecarBundleImage(bundle *sidecarBootBundle) *oci.Image {
 }
 
 func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.RunRequest, network *darwinNetworkRuntime) (vmruntime.RunRequest, error) {
-	runReq, err := b.buildBaseRequest(ctx, req.Image, req.InitSystem, req.MemoryMB, req.CPUs, req.NestedVirt, req.Dmesg, network)
+	runReq, err := b.buildBaseRequest(ctx, req.Image, req.InitSystem, req.Kernel, req.KernelModules, req.MemoryMB, req.CPUs, req.NestedVirt, req.Dmesg, network)
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
