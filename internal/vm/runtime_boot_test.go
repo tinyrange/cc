@@ -154,6 +154,64 @@ func TestRuntimeBootsOpenBSDBuiltinImage(t *testing.T) {
 	if resp.ExitCode != 0 || normalized != "openbsd-runtime:OpenBSD:copy:stdin-ok" {
 		t.Fatalf("OpenBSD exec response = code %d output %q", resp.ExitCode, resp.Output)
 	}
+	var controlOutput string
+	var controlExit *int
+	if err := inst.ExecStream(ctx, client.ExecRequest{
+		Command:   []string{"sh", "-c", "printf 'openbsd-control:%s\\n' \"$PWD\" >&3"},
+		WorkDir:   "/tmp",
+		ControlFD: true,
+	}, nil, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "control":
+			controlOutput += event.Output
+		case "exit":
+			code := event.ExitCode
+			controlExit = &code
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("OpenBSD runtime control fd exec: %v", err)
+	}
+	if controlExit == nil || *controlExit != 0 {
+		t.Fatalf("OpenBSD control fd exit = %v, want 0", controlExit)
+	}
+	if strings.TrimSpace(controlOutput) != "openbsd-control:/tmp" {
+		t.Fatalf("OpenBSD control fd output = %q, want openbsd-control:/tmp", controlOutput)
+	}
+	inputs := make(chan client.ExecInput, 2)
+	var interactiveControl strings.Builder
+	var sentInteractiveInput bool
+	var interactiveExit *int
+	if err := inst.ExecStream(ctx, client.ExecRequest{
+		Command:   []string{"sh", "-c", "printf 'ready:%s\\n' \"$PWD\" >&3; IFS= read -r line; eval \"$line\""},
+		WorkDir:   "/tmp",
+		ControlFD: true,
+	}, inputs, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "control":
+			interactiveControl.WriteString(event.Output)
+			if !sentInteractiveInput && strings.Contains(event.Output, "ready:/tmp") {
+				sentInteractiveInput = true
+				inputs <- client.ExecInput{Kind: "stdin", Data: []byte("printf 'done:%s\\n' \"$PWD\" >&3\n")}
+				close(inputs)
+			}
+		case "exit":
+			code := event.ExitCode
+			interactiveExit = &code
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("OpenBSD runtime interactive control fd exec: %v", err)
+	}
+	if !sentInteractiveInput {
+		t.Fatalf("OpenBSD interactive control fd never reported ready; control=%q", interactiveControl.String())
+	}
+	if interactiveExit == nil || *interactiveExit != 0 {
+		t.Fatalf("OpenBSD interactive control fd exit = %v, want 0", interactiveExit)
+	}
+	if got := interactiveControl.String(); !strings.Contains(got, "ready:/tmp") || !strings.Contains(got, "done:/tmp") {
+		t.Fatalf("OpenBSD interactive control fd output = %q, want ready and done", got)
+	}
 	flusher, ok := inst.(instanceFlushProvider)
 	if !ok {
 		t.Fatal("OpenBSD runtime does not expose flush")

@@ -26,6 +26,7 @@ const (
 	beginMarker = "__CCX3_BEGIN__:"
 	outMarker   = "__CCX3_OUT__:"
 	errMarker   = "__CCX3_ERR__:"
+	ctlMarker   = "__CCX3_CTL__:"
 	exitMarker  = "__CCX3_EXIT__:"
 )
 
@@ -39,7 +40,11 @@ type request struct {
 	Directory bool     `json:"directory,omitempty"`
 	WorkDir   string   `json:"workdir,omitempty"`
 	Stdin     []byte   `json:"stdin,omitempty"`
+	TTY       bool     `json:"tty,omitempty"`
+	ControlFD bool     `json:"control_fd,omitempty"`
 	Signal    string   `json:"signal,omitempty"`
+	Cols      int      `json:"cols,omitempty"`
+	Rows      int      `json:"rows,omitempty"`
 }
 
 type managedExec struct {
@@ -157,6 +162,20 @@ func commandLoop(control net.Conn) error {
 				startExecWithReader(control, req, io.NopCloser(bytes.NewReader(req.Stdin)), nil, func() {})
 				continue
 			}
+			if req.TTY || req.ControlFD {
+				stdinR, stdinW := io.Pipe()
+				managed := &managedExec{stdin: stdinW}
+				mu.Lock()
+				active[req.ID] = managed
+				mu.Unlock()
+				go runExec(control, req, stdinR, managed, func() {
+					_ = managed.close()
+					mu.Lock()
+					delete(active, req.ID)
+					mu.Unlock()
+				})
+				continue
+			}
 			mu.Lock()
 			pending[req.ID] = req
 			mu.Unlock()
@@ -260,13 +279,39 @@ func runExec(control io.Writer, req request, stdin io.ReadCloser, managed *manag
 	cmd.Stdout = stdoutW
 	cmd.Stderr = stderrW
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	var controlR, controlW *os.File
+	if req.ControlFD {
+		var err error
+		controlR, controlW, err = os.Pipe()
+		if err != nil {
+			if managed != nil {
+				_ = managed.close()
+			}
+			_ = stdoutW.Close()
+			_ = stderrW.Close()
+			writeErr(control, req.ID, fmt.Errorf("open control fd: %w", err))
+			writeLine(control, exitMarker+req.ID+":126")
+			return
+		}
+		cmd.ExtraFiles = append(cmd.ExtraFiles, controlW)
+	}
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go copyMarked(&wg, control, outMarker, req.ID, stdoutR)
 	go copyMarked(&wg, control, errMarker, req.ID, stderrR)
+	if controlR != nil {
+		wg.Add(1)
+		go copyMarked(&wg, control, ctlMarker, req.ID, controlR)
+	}
 	if err := cmd.Start(); err != nil {
 		if managed != nil {
 			_ = managed.close()
+		}
+		if controlR != nil {
+			_ = controlR.Close()
+		}
+		if controlW != nil {
+			_ = controlW.Close()
 		}
 		_ = stdoutW.Close()
 		_ = stderrW.Close()
@@ -274,6 +319,9 @@ func runExec(control io.Writer, req request, stdin io.ReadCloser, managed *manag
 		writeErr(control, req.ID, err)
 		writeLine(control, exitMarker+req.ID+":126")
 		return
+	}
+	if controlW != nil {
+		_ = controlW.Close()
 	}
 	if managed != nil {
 		managed.setProcess(cmd.Process)
@@ -283,6 +331,9 @@ func runExec(control io.Writer, req request, stdin io.ReadCloser, managed *manag
 	_ = stdoutW.Close()
 	_ = stderrW.Close()
 	wg.Wait()
+	if controlR != nil {
+		_ = controlR.Close()
+	}
 	code := 0
 	if waitErr != nil {
 		if exitErr, ok := waitErr.(*exec.ExitError); ok {
