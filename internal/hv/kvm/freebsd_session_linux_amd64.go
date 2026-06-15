@@ -24,10 +24,11 @@ import (
 const freeBSDControlPort = 10777
 
 type FreeBSDManagedConfig struct {
-	Kernel   []byte
-	Root     virtio.BlockBackend
-	MemoryMB uint64
-	Dmesg    bool
+	Kernel      []byte
+	Root        virtio.BlockBackend
+	ExtraBlocks []virtio.BlockBackend
+	MemoryMB    uint64
+	Dmesg       bool
 }
 
 func StartFreeBSDManagedSession(ctx context.Context, cfg FreeBSDManagedConfig, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
@@ -93,13 +94,25 @@ func StartFreeBSDManagedSession(ctx context.Context, cfg FreeBSDManagedConfig, o
 	uart := serial.NewUART8250(amd64vm.COM1Base, 0, serialWriter)
 	uart.AttachIRQ(kvmVM, amd64vm.COM1IRQ)
 
+	var pciDevices []*PCIDevice
 	block := virtio.NewBlock(0, 0x1000, 10, cfg.Root)
 	block.Attach(kvmVM, kvmVM)
+	pciDevices = append(pciDevices, NewVirtioBlockPCIDevice(1, 0x1000, 10, block))
+	for i, backend := range cfg.ExtraBlocks {
+		if backend == nil {
+			continue
+		}
+		dev := uint8(2 + i)
+		ioBase := uint16(0x1100 + i*0x100)
+		irq := uint8(11 + i)
+		extraBlock := virtio.NewBlock(0, 0x1000, uint32(irq), backend)
+		extraBlock.Attach(kvmVM, kvmVM)
+		pciDevices = append(pciDevices, NewVirtioBlockPCIDevice(dev, ioBase, irq, extraBlock))
+	}
 	netdev.Attach(kvmVM, kvmVM)
-	pci := NewPCIBus(
-		NewVirtioBlockPCIDevice(1, 0x1000, 10, block),
-		NewVirtioNetPCIDevice(2, 0x1100, 11, netdev),
-	)
+	netIndex := len(pciDevices) + 1
+	pciDevices = append(pciDevices, NewVirtioNetPCIDevice(uint8(netIndex), uint16(0x1000+netIndex*0x100), uint8(10+netIndex), netdev))
+	pci := NewPCIBus(pciDevices...)
 
 	plan, err := freebsdamd64.PrepareBoot(mem, cfg.Kernel, freebsdamd64.BootOptions{
 		MemorySize: amd64vm.MemorySizeBytes(cfg.MemoryMB),

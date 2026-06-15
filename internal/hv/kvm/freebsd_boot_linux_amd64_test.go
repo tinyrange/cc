@@ -11,6 +11,8 @@ import (
 
 	"j5.nz/cc/client"
 	freebsdrootfs "j5.nz/cc/internal/freebsd/rootfs"
+	"j5.nz/cc/internal/fsimage"
+	ffsimage "j5.nz/cc/internal/fsimage/ffs"
 	"j5.nz/cc/internal/virtio"
 )
 
@@ -94,5 +96,130 @@ func TestFreeBSDManagedSessionExec(t *testing.T) {
 	}
 	if resp.ExitCode != 0 || strings.TrimSpace(resp.Output) != "freebsd-managed:FreeBSD:copy:stdin-ok" {
 		t.Fatalf("FreeBSD exec response = code %d output %q", resp.ExitCode, resp.Output)
+	}
+	resp, err = session.Exec(ctx, client.ExecRequest{
+		Command: []string{"/bin/sh", "-c", strings.Join([]string{
+			"set -eu",
+			"mount | grep -E ' on /(tmp|root) ' && exit 1 || true",
+			"printf write-ok > /tmp/cc-freebsd-write-test",
+			"printf root-write-ok > /root/cc-freebsd-root-write-test",
+			"cat /tmp/cc-freebsd-write-test",
+			"printf ':'",
+			"cat /root/cc-freebsd-root-write-test",
+		}, "\n")},
+		WorkDir: "/tmp",
+	})
+	if err != nil {
+		t.Fatalf("FreeBSD managed write exec: %v", err)
+	}
+	if resp.ExitCode != 0 || strings.TrimSpace(resp.Output) != "write-ok:root-write-ok" {
+		t.Fatalf("FreeBSD write response = code %d output %q", resp.ExitCode, resp.Output)
+	}
+}
+
+func TestFreeBSDManagedSessionFsckFFSGeneratedRootOnSecondDisk(t *testing.T) {
+	if os.Getenv("CC_TEST_FREEBSD_ROOTFS") == "" {
+		t.Skip("set CC_TEST_FREEBSD_ROOTFS=1 to build and fsck the full FreeBSD rootfs")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	t.Log("building FreeBSD managed runtime")
+	rt, err := freebsdrootfs.BuildManagedRuntime(ctx, freebsdrootfs.Config{})
+	if err != nil {
+		t.Fatalf("build FreeBSD runtime: %v", err)
+	}
+	defer rt.Close()
+
+	t.Log("building FreeBSD fsck candidate root")
+	candidateRegion, err := fsimage.Build(ctx, rt.RootFS, fsimage.Options{
+		Type:              fsimage.TypeFFS,
+		FFSLayout:         ffsimage.LayoutRaw,
+		DeterministicTime: time.Unix(1700000001, 0),
+		ExtraBytes:        128 << 20,
+	})
+	if err != nil {
+		t.Fatalf("build FreeBSD fsck candidate root: %v", err)
+	}
+
+	t.Log("booting FreeBSD managed session with candidate root on vtbd1")
+	session, err := StartFreeBSDManagedSession(ctx, FreeBSDManagedConfig{
+		Kernel:      rt.Kernel,
+		Root:        rt.Root,
+		ExtraBlocks: []virtio.BlockBackend{candidateRegion},
+		MemoryMB:    1024,
+	}, nil)
+	if err != nil {
+		t.Fatalf("start FreeBSD managed fsck session: %v", err)
+	}
+	defer session.Close()
+
+	resp, err := session.Exec(ctx, client.ExecRequest{
+		Command: []string{"/bin/sh", "-c", "/sbin/fsck_ffs -fn /dev/vtbd1"},
+		WorkDir: "/tmp",
+	})
+	if err != nil {
+		t.Fatalf("FreeBSD pre-write fsck exec: %v", err)
+	}
+	assertFreeBSDFsckClean(t, "pre-write", resp)
+
+	resp, err = session.Exec(ctx, client.ExecRequest{
+		Command: []string{"/bin/sh", "-c", strings.Join([]string{
+			"set -eu",
+			"mkdir -p /tmp/cc-ufs-write",
+			"mount -t ufs /dev/vtbd1 /tmp/cc-ufs-write",
+			"trap 'umount /tmp/cc-ufs-write || true' EXIT",
+			"mkdir -p /tmp/cc-ufs-write/cc-write-test/nested",
+			"printf 'freebsd-write-ok' > /tmp/cc-ufs-write/cc-write-test/nested/payload.txt",
+			"dd if=/dev/zero bs=4096 count=3 2>/dev/null | tr '\\000' A > /tmp/cc-ufs-write/cc-write-test/nested/blob.bin",
+			"sync",
+			"cat /tmp/cc-ufs-write/cc-write-test/nested/payload.txt",
+			"test \"$(wc -c < /tmp/cc-ufs-write/cc-write-test/nested/blob.bin | tr -d ' ')\" = 12288",
+			"umount /tmp/cc-ufs-write",
+			"trap - EXIT",
+		}, "\n")},
+		WorkDir: "/tmp",
+	})
+	if err != nil {
+		t.Fatalf("FreeBSD write/mount exec: %v", err)
+	}
+	if resp.ExitCode != 0 || !strings.Contains(resp.Output, "freebsd-write-ok") {
+		t.Fatalf("FreeBSD write/mount response = code %d output:\n%s", resp.ExitCode, resp.Output)
+	}
+
+	resp, err = session.Exec(ctx, client.ExecRequest{
+		Command: []string{"/bin/sh", "-c", "/sbin/fsck_ffs -fn /dev/vtbd1"},
+		WorkDir: "/tmp",
+	})
+	if err != nil {
+		t.Fatalf("FreeBSD post-write fsck exec: %v", err)
+	}
+	assertFreeBSDFsckClean(t, "post-write", resp)
+}
+
+func assertFreeBSDFsckClean(t *testing.T, label string, resp client.ExecResponse) {
+	t.Helper()
+	t.Logf("FreeBSD %s fsck_ffs output:\n%s", label, resp.Output)
+	if resp.ExitCode != 0 {
+		t.Fatalf("FreeBSD %s fsck_ffs exit code = %d output:\n%s", label, resp.ExitCode, resp.Output)
+	}
+	for _, bad := range []string{
+		"BAD SUPER BLOCK",
+		"INCORRECT",
+		"UNREF",
+		"BAD/DUP",
+		"FREE BLK COUNT(S) WRONG",
+		"SUMMARY INFORMATION BAD",
+		"BLK(S) MISSING IN BIT MAPS",
+		"FILE SYSTEM WAS MODIFIED",
+		"INTEGRITY CHECK FAILED",
+		"REBUILD CYLINDER GROUP",
+		"MARKED",
+		"failed:",
+		"PHASE 5 SKIPPED",
+		"UPDATE FILESYSTEM",
+	} {
+		if strings.Contains(resp.Output, bad) {
+			t.Fatalf("FreeBSD %s fsck_ffs found FFS inconsistency %q:\n%s", label, bad, resp.Output)
+		}
 	}
 }

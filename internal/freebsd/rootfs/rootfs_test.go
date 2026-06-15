@@ -58,7 +58,8 @@ func TestBuildManagedRootFromFreeBSDBaseSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := initEntry.File.ReadAt(0, 256)
+	initSize, _ := initEntry.File.Stat()
+	data, err := initEntry.File.ReadAt(0, uint32(initSize))
 	if err != nil {
 		t.Fatal(err)
 	}

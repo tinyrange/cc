@@ -337,7 +337,10 @@ func versionNoDot(version string) string {
 }
 
 const managedInitScript = `#!/bin/sh
+/sbin/mount -u -o rw / || :
 /sbin/mount -t devfs devfs /dev || :
+/bin/chmod 1777 /tmp || :
+/bin/chmod 700 /root || :
 /sbin/ifconfig vtnet0 inet 10.42.0.2 netmask 255.255.255.0 up || {
 	while :; do /bin/sleep 3600; done
 }
