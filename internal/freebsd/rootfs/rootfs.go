@@ -28,10 +28,11 @@ const (
 )
 
 type Config struct {
-	CacheDir string
-	Version  string
-	Arch     string
-	Mirror   string
+	CacheDir  string
+	Version   string
+	Arch      string
+	Mirror    string
+	GuestIPv4 string
 }
 
 type Runtime struct {
@@ -75,7 +76,7 @@ func BuildManagedRuntime(ctx context.Context, cfg Config) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	root, closeRoot, err := buildManagedRoot(ctx, baseTXZ, initBin)
+	root, closeRoot, err := buildManagedRoot(ctx, baseTXZ, initBin, cfg.GuestIPv4)
 	if err != nil {
 		return nil, err
 	}
@@ -93,11 +94,12 @@ func BuildManagedRuntime(ctx context.Context, cfg Config) (*Runtime, error) {
 }
 
 func BuildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte) (imagefs.Directory, error) {
-	root, _, err := buildManagedRoot(ctx, baseSetPath, initBin)
+	root, _, err := buildManagedRoot(ctx, baseSetPath, initBin, "")
 	return root, err
 }
 
-func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte) (imagefs.Directory, func() error, error) {
+func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte, guestIPv4 string) (imagefs.Directory, func() error, error) {
+	guestIPv4 = normalizeGuestIPv4(guestIPv4)
 	root, closeRoot, err := buildBaseRoot(ctx, baseSetPath)
 	if err != nil {
 		return nil, nil, err
@@ -108,12 +110,12 @@ func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte) (
 		mode fs.FileMode
 		data []byte
 	}{
-		{"/sbin/init", 0o755, []byte(managedInitScript)},
+		{"/sbin/init", 0o755, []byte(fmt.Sprintf(managedInitScript, guestIPv4))},
 		{"/sbin/cc-freebsd-init", 0o755, initBin},
 		{"/etc/fstab", 0o644, []byte("/dev/vtbd0 / ufs rw 1 1\n")},
-		{"/etc/rc.conf", 0o644, []byte("hostname=\"cc-freebsd\"\nifconfig_vtnet0=\"inet 10.42.0.2 netmask 255.255.255.0\"\ndefaultrouter=\"10.42.0.1\"\n")},
+		{"/etc/rc.conf", 0o644, []byte(fmt.Sprintf("hostname=\"cc-freebsd\"\nifconfig_vtnet0=\"inet %s netmask 255.255.255.0\"\ndefaultrouter=\"10.42.0.1\"\n", guestIPv4))},
 		{"/etc/resolv.conf", 0o644, []byte("nameserver 10.42.0.1\n")},
-		{"/etc/hosts", 0o644, []byte("127.0.0.1 localhost\n10.42.0.2 cc-freebsd\n")},
+		{"/etc/hosts", 0o644, []byte(fmt.Sprintf("127.0.0.1 localhost\n%s cc-freebsd\n", guestIPv4))},
 	} {
 		if err := overlay.AddFile(file.path, file.mode, file.data); err != nil {
 			_ = closeRoot()
@@ -135,6 +137,14 @@ func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte) (
 		}
 	}
 	return overlay.Root(), closeRoot, nil
+}
+
+func normalizeGuestIPv4(ip string) string {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return "10.42.0.2"
+	}
+	return ip
 }
 
 func BuildBaseRoot(ctx context.Context, baseSetPath string) (imagefs.Directory, error) {
@@ -341,7 +351,7 @@ const managedInitScript = `#!/bin/sh
 /sbin/mount -t devfs devfs /dev || :
 /bin/chmod 1777 /tmp || :
 /bin/chmod 700 /root || :
-/sbin/ifconfig vtnet0 inet 10.42.0.2 netmask 255.255.255.0 up || {
+/sbin/ifconfig vtnet0 inet %s netmask 255.255.255.0 up || {
 	while :; do /bin/sleep 3600; done
 }
 /sbin/route add default 10.42.0.1 || true

@@ -77,6 +77,40 @@ func TestBuildManagedRootFromFreeBSDBaseSet(t *testing.T) {
 	if !strings.Contains(string(agentData), "test init") {
 		t.Fatalf("unexpected /sbin/cc-freebsd-init overlay: %q", agentData)
 	}
+	initScript := readRootFile(t, root, "/sbin/init")
+	if !strings.Contains(initScript, "ifconfig vtnet0 inet 10.42.0.2 ") {
+		t.Fatalf("default init script does not configure default IP: %q", initScript)
+	}
+	rcConf := readRootFile(t, root, "/etc/rc.conf")
+	if !strings.Contains(rcConf, `ifconfig_vtnet0="inet 10.42.0.2 netmask 255.255.255.0"`) {
+		t.Fatalf("default rc.conf does not contain default IP: %q", rcConf)
+	}
+}
+
+func TestBuildManagedRootFromFreeBSDBaseSetUsesGuestIPv4(t *testing.T) {
+	baseTXZ := writeTXZFixture(t, []tarFixtureEntry{
+		{name: "sbin", mode: 0o755, dir: true},
+		{name: "sbin/init", mode: 0o555, data: []byte("base init\n")},
+		{name: "etc", mode: 0o755, dir: true},
+		{name: "dev", mode: 0o755, dir: true},
+	})
+	root, closeRoot, err := buildManagedRoot(context.Background(), baseTXZ, []byte("#!/bin/sh\n"), "10.42.0.8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeRoot()
+	initScript := readRootFile(t, root, "/sbin/init")
+	if !strings.Contains(initScript, "ifconfig vtnet0 inet 10.42.0.8 ") {
+		t.Fatalf("init script does not configure leased IP: %q", initScript)
+	}
+	rcConf := readRootFile(t, root, "/etc/rc.conf")
+	if !strings.Contains(rcConf, `ifconfig_vtnet0="inet 10.42.0.8 netmask 255.255.255.0"`) {
+		t.Fatalf("rc.conf does not contain leased IP: %q", rcConf)
+	}
+	hosts := readRootFile(t, root, "/etc/hosts")
+	if !strings.Contains(hosts, "10.42.0.8 cc-freebsd") {
+		t.Fatalf("hosts does not contain leased IP: %q", hosts)
+	}
 }
 
 func TestBuildManagedRuntimeFromFreeBSDReleaseSets(t *testing.T) {
@@ -165,4 +199,21 @@ func localFreeBSDFixture(t *testing.T, name string) string {
 	}
 	t.Skipf("FreeBSD fixture %s not present", name)
 	return ""
+}
+
+func readRootFile(t *testing.T, root imagefs.Directory, guestPath string) string {
+	t.Helper()
+	entry, err := imagefs.LookupPath(root, guestPath)
+	if err != nil {
+		t.Fatalf("lookup %s: %v", guestPath, err)
+	}
+	if entry.File == nil {
+		t.Fatalf("%s is not a file", guestPath)
+	}
+	size, _ := entry.File.Stat()
+	data, err := entry.File.ReadAt(0, uint32(size))
+	if err != nil {
+		t.Fatalf("read %s: %v", guestPath, err)
+	}
+	return string(data)
 }

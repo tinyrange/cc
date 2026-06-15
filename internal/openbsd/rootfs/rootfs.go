@@ -25,10 +25,11 @@ const (
 )
 
 type Config struct {
-	CacheDir string
-	Version  string
-	Arch     string
-	Mirror   string
+	CacheDir  string
+	Version   string
+	Arch      string
+	Mirror    string
+	GuestIPv4 string
 }
 
 type Runtime struct {
@@ -72,7 +73,7 @@ func BuildManagedRuntime(ctx context.Context, cfg Config) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	root, closeRoot, err := buildManagedRoot(ctx, basePath, initBin)
+	root, closeRoot, err := buildManagedRoot(ctx, basePath, initBin, cfg.GuestIPv4)
 	if err != nil {
 		return nil, err
 	}
@@ -88,12 +89,13 @@ func BuildManagedRuntime(ctx context.Context, cfg Config) (*Runtime, error) {
 }
 
 func BuildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte) (imagefs.Directory, error) {
-	root, _, err := buildManagedRoot(ctx, baseSetPath, initBin)
+	root, _, err := buildManagedRoot(ctx, baseSetPath, initBin, "")
 	return root, err
 }
 
-func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte) (imagefs.Directory, func() error, error) {
-	root, closeRoot, err := buildBaseRoot(ctx, baseSetPath, []byte(managedInitScript))
+func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte, guestIPv4 string) (imagefs.Directory, func() error, error) {
+	guestIPv4 = normalizeGuestIPv4(guestIPv4)
+	root, closeRoot, err := buildBaseRoot(ctx, baseSetPath, []byte(fmt.Sprintf(managedInitScript, guestIPv4)))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -107,7 +109,7 @@ func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte) (
 		{"/etc/fstab", 0o644, []byte("/dev/sd0a / ffs rw 1 1\n")},
 		{"/etc/myname", 0o644, []byte("cc-openbsd\n")},
 		{"/etc/resolv.conf", 0o644, []byte("nameserver 10.42.0.1\n")},
-		{"/etc/hosts", 0o644, []byte("127.0.0.1 localhost\n10.42.0.2 cc-openbsd\n")},
+		{"/etc/hosts", 0o644, []byte(fmt.Sprintf("127.0.0.1 localhost\n%s cc-openbsd\n", guestIPv4))},
 	} {
 		if err := overlay.AddFile(file.path, file.mode, file.data); err != nil {
 			_ = closeRoot()
@@ -117,25 +119,27 @@ func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte) (
 	return overlay.Root(), closeRoot, nil
 }
 
+func normalizeGuestIPv4(ip string) string {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return "10.42.0.2"
+	}
+	return ip
+}
+
 func BuildBaseRoot(ctx context.Context, baseSetPath string, init []byte) (imagefs.Directory, error) {
 	root, _, err := buildBaseRoot(ctx, baseSetPath, init)
 	return root, err
 }
 
 func buildBaseRoot(ctx context.Context, baseSetPath string, init []byte) (imagefs.Directory, func() error, error) {
-	f, err := os.Open(baseSetPath)
+	baseTar, err := ensureDecompressedTar(ctx, baseSetPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("open OpenBSD base set %s: %w", baseSetPath, err)
+		return nil, nil, err
 	}
-	defer f.Close()
-	gz, err := gzip.NewReader(f)
+	tfs, err := imagefs.NewSeekableTarFS(ctx, baseTar)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read OpenBSD base gzip %s: %w", baseSetPath, err)
-	}
-	defer gz.Close()
-	tfs, err := imagefs.NewTarFS(ctx, gz)
-	if err != nil {
-		return nil, nil, fmt.Errorf("read OpenBSD base set %s: %w", baseSetPath, err)
+		return nil, nil, fmt.Errorf("read OpenBSD base set %s: %w", baseTar, err)
 	}
 	overlay := imagefs.NewOverlay(tfs.Root())
 	if err := addRuntimeLibraryLinks(overlay, tfs.Root()); err != nil {
@@ -165,6 +169,57 @@ func buildBaseRoot(ctx context.Context, baseSetPath string, init []byte) (imagef
 		return nil, nil, fmt.Errorf("overlay /sbin/init: %w", err)
 	}
 	return overlay.Root(), tfs.Close, nil
+}
+
+func ensureDecompressedTar(ctx context.Context, source string) (string, error) {
+	target := strings.TrimSuffix(source, filepath.Ext(source)) + ".tar"
+	if st, err := os.Stat(target); err == nil && st.Size() > 0 {
+		if src, srcErr := os.Stat(source); srcErr == nil && !st.ModTime().Before(src.ModTime()) {
+			return target, nil
+		}
+	}
+	f, err := os.Open(source)
+	if err != nil {
+		return "", fmt.Errorf("open OpenBSD base set %s: %w", source, err)
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return "", fmt.Errorf("read OpenBSD base gzip %s: %w", source, err)
+	}
+	defer gz.Close()
+	tmp := target + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return "", fmt.Errorf("create decompressed OpenBSD base set %s: %w", tmp, err)
+	}
+	_, copyErr := io.Copy(out, contextReader{ctx: ctx, r: gz})
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("decompress OpenBSD base set %s: %w", source, copyErr)
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("close decompressed OpenBSD base set %s: %w", tmp, closeErr)
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("install decompressed OpenBSD base set %s: %w", target, err)
+	}
+	return target, nil
+}
+
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
 }
 
 func normalizeConfig(cfg Config) Config {
@@ -293,7 +348,7 @@ exec >/dev/console 2>&1
 	echo OPENBSD_MANAGED_REMOUNT_FAILED
 	while :; do /bin/sleep 3600; done
 }
-/sbin/ifconfig vio0 inet 10.42.0.2 netmask 255.255.255.0 up || {
+/sbin/ifconfig vio0 inet %s netmask 255.255.255.0 up || {
 	echo OPENBSD_MANAGED_IFCONFIG_FAILED
 	while :; do /bin/sleep 3600; done
 }

@@ -613,27 +613,47 @@ func (b *runtimeBackend) startOpenBSDStream(ctx context.Context, req client.Crea
 	if req.NestedVirt {
 		return nil, fmt.Errorf("OpenBSD runtime does not support nested virtualization")
 	}
-	runtime, err := openbsdrootfs.BuildManagedRuntime(ctx, openBSDRuntimeConfig(b.guestInitCache))
+	lease := defaultLinuxVirtualSwitch.Register(req.ID)
+	leaseActive := true
+	cleanupLease := func() {
+		if leaseActive {
+			defaultLinuxVirtualSwitch.Unregister(lease.id)
+			leaseActive = false
+		}
+	}
+	defer func() {
+		if leaseActive {
+			cleanupLease()
+		}
+	}()
+	rootCfg := openBSDRuntimeConfig(b.guestInitCache)
+	rootCfg.GuestIPv4 = lease.ip.String()
+	runtime, err := openbsdrootfs.BuildManagedRuntime(ctx, rootCfg)
 	if err != nil {
 		return nil, err
 	}
 	session, err := kvm.StartOpenBSDManagedSession(ctx, kvm.OpenBSDManagedConfig{
-		Kernel:   runtime.Kernel,
-		Root:     runtime.Root,
-		MemoryMB: req.MemoryMB,
-		Dmesg:    req.Dmesg,
+		Kernel:    runtime.Kernel,
+		Root:      runtime.Root,
+		MemoryMB:  req.MemoryMB,
+		Dmesg:     req.Dmesg,
+		GuestIPv4: lease.ip,
+		GuestMAC:  lease.mac,
 	}, onEvent)
 	if err != nil {
 		_ = runtime.Close()
 		return nil, err
 	}
+	leaseActive = false
 	return &openbsdInstance{
-		session: session,
-		runtime: runtime,
-		root:    runtime.RootFS,
-		baseEnv: openBSDEffectiveExecEnv(nil, nil, false),
-		workDir: "/",
-		dmesg:   req.Dmesg,
+		session:        session,
+		runtime:        runtime,
+		root:           runtime.RootFS,
+		baseEnv:        openBSDEffectiveExecEnv(nil, nil, false),
+		workDir:        "/",
+		dmesg:          req.Dmesg,
+		networkLeaseID: lease.id,
+		networkIPv4:    lease.ip.String(),
 	}, nil
 }
 
@@ -648,12 +668,15 @@ func openBSDRuntimeConfig(guestInitCache string) openbsdrootfs.Config {
 }
 
 type openbsdInstance struct {
-	session *kvm.ManagedSession
-	runtime *openbsdrootfs.Runtime
-	root    imagefs.Directory
-	baseEnv []string
-	workDir string
-	dmesg   bool
+	session        *kvm.ManagedSession
+	runtime        *openbsdrootfs.Runtime
+	root           imagefs.Directory
+	baseEnv        []string
+	workDir        string
+	dmesg          bool
+	networkLeaseID string
+	networkLease   sync.Once
+	networkIPv4    string
 }
 
 func (i *openbsdInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
@@ -754,6 +777,7 @@ func (i *openbsdInstance) Wait() error {
 	if i == nil || i.session == nil {
 		return nil
 	}
+	defer i.releaseNetworkLease()
 	return i.session.Wait()
 }
 
@@ -762,10 +786,31 @@ func (i *openbsdInstance) Close() error {
 		return nil
 	}
 	err := i.session.Close()
+	i.releaseNetworkLease()
 	if closeErr := i.runtime.Close(); err == nil {
 		err = closeErr
 	}
 	return err
+}
+
+func (i *openbsdInstance) releaseNetworkLease() {
+	if i == nil {
+		return
+	}
+	i.networkLease.Do(func() {
+		if i.networkLeaseID == "" {
+			return
+		}
+		defaultLinuxVirtualSwitch.Unregister(i.networkLeaseID)
+		i.networkLeaseID = ""
+	})
+}
+
+func (i *openbsdInstance) NetworkIPv4() string {
+	if i == nil {
+		return ""
+	}
+	return i.networkIPv4
 }
 
 func openBSDEffectiveExecEnv(base, overrides []string, replace bool) []string {
@@ -796,27 +841,47 @@ func (b *runtimeBackend) startFreeBSDStream(ctx context.Context, req client.Crea
 	if req.NestedVirt {
 		return nil, fmt.Errorf("FreeBSD runtime does not support nested virtualization")
 	}
-	runtime, err := freebsdrootfs.BuildManagedRuntime(ctx, freeBSDRuntimeConfig(b.guestInitCache))
+	lease := defaultLinuxVirtualSwitch.Register(req.ID)
+	leaseActive := true
+	cleanupLease := func() {
+		if leaseActive {
+			defaultLinuxVirtualSwitch.Unregister(lease.id)
+			leaseActive = false
+		}
+	}
+	defer func() {
+		if leaseActive {
+			cleanupLease()
+		}
+	}()
+	rootCfg := freeBSDRuntimeConfig(b.guestInitCache)
+	rootCfg.GuestIPv4 = lease.ip.String()
+	runtime, err := freebsdrootfs.BuildManagedRuntime(ctx, rootCfg)
 	if err != nil {
 		return nil, err
 	}
 	session, err := kvm.StartFreeBSDManagedSession(ctx, kvm.FreeBSDManagedConfig{
-		Kernel:   runtime.Kernel,
-		Root:     runtime.Root,
-		MemoryMB: req.MemoryMB,
-		Dmesg:    req.Dmesg,
+		Kernel:    runtime.Kernel,
+		Root:      runtime.Root,
+		MemoryMB:  req.MemoryMB,
+		Dmesg:     req.Dmesg,
+		GuestIPv4: lease.ip,
+		GuestMAC:  lease.mac,
 	}, onEvent)
 	if err != nil {
 		_ = runtime.Close()
 		return nil, err
 	}
+	leaseActive = false
 	return &freebsdInstance{
-		session: session,
-		runtime: runtime,
-		root:    runtime.RootFS,
-		baseEnv: freeBSDEffectiveExecEnv(nil, nil, false),
-		workDir: "/",
-		dmesg:   req.Dmesg,
+		session:        session,
+		runtime:        runtime,
+		root:           runtime.RootFS,
+		baseEnv:        freeBSDEffectiveExecEnv(nil, nil, false),
+		workDir:        "/",
+		dmesg:          req.Dmesg,
+		networkLeaseID: lease.id,
+		networkIPv4:    lease.ip.String(),
 	}, nil
 }
 
@@ -831,12 +896,15 @@ func freeBSDRuntimeConfig(guestInitCache string) freebsdrootfs.Config {
 }
 
 type freebsdInstance struct {
-	session *kvm.ManagedSession
-	runtime *freebsdrootfs.Runtime
-	root    imagefs.Directory
-	baseEnv []string
-	workDir string
-	dmesg   bool
+	session        *kvm.ManagedSession
+	runtime        *freebsdrootfs.Runtime
+	root           imagefs.Directory
+	baseEnv        []string
+	workDir        string
+	dmesg          bool
+	networkLeaseID string
+	networkLease   sync.Once
+	networkIPv4    string
 }
 
 func (i *freebsdInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
@@ -937,6 +1005,7 @@ func (i *freebsdInstance) Wait() error {
 	if i == nil || i.session == nil {
 		return nil
 	}
+	defer i.releaseNetworkLease()
 	return i.session.Wait()
 }
 
@@ -945,10 +1014,31 @@ func (i *freebsdInstance) Close() error {
 		return nil
 	}
 	err := i.session.Close()
+	i.releaseNetworkLease()
 	if closeErr := i.runtime.Close(); err == nil {
 		err = closeErr
 	}
 	return err
+}
+
+func (i *freebsdInstance) releaseNetworkLease() {
+	if i == nil {
+		return
+	}
+	i.networkLease.Do(func() {
+		if i.networkLeaseID == "" {
+			return
+		}
+		defaultLinuxVirtualSwitch.Unregister(i.networkLeaseID)
+		i.networkLeaseID = ""
+	})
+}
+
+func (i *freebsdInstance) NetworkIPv4() string {
+	if i == nil {
+		return ""
+	}
+	return i.networkIPv4
 }
 
 func freeBSDEffectiveExecEnv(base, overrides []string, replace bool) []string {

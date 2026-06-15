@@ -29,6 +29,8 @@ type FreeBSDManagedConfig struct {
 	ExtraBlocks []virtio.BlockBackend
 	MemoryMB    uint64
 	Dmesg       bool
+	GuestIPv4   net.IP
+	GuestMAC    net.HardwareAddr
 }
 
 func StartFreeBSDManagedSession(ctx context.Context, cfg FreeBSDManagedConfig, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
@@ -37,7 +39,7 @@ func StartFreeBSDManagedSession(ctx context.Context, cfg FreeBSDManagedConfig, o
 		return nil, err
 	}
 
-	netdev, stack := newFreeBSDManagedNet()
+	netdev, stack := newFreeBSDManagedNet(cfg.GuestIPv4, cfg.GuestMAC)
 	ln, err := stack.ListenInternal("tcp", fmt.Sprintf(":%d", freeBSDControlPort))
 	if err != nil {
 		stack.Close()
@@ -191,6 +193,12 @@ func normalizeFreeBSDManagedConfig(cfg FreeBSDManagedConfig) (FreeBSDManagedConf
 	if cfg.MemoryMB == 0 {
 		cfg.MemoryMB = 1024
 	}
+	if cfg.GuestIPv4 == nil {
+		cfg.GuestIPv4 = net.IPv4(10, 42, 0, 2)
+	}
+	if cfg.GuestMAC == nil {
+		cfg.GuestMAC = net.HardwareAddr{0x02, 0x42, 0x0a, 0x2a, 0x00, 0x02}
+	}
 	return cfg, nil
 }
 
@@ -254,11 +262,10 @@ func (b freeBSDManagedNetBackend) HandleTxPacket(packet []byte) error {
 	return b.iface.DeliverGuestPacket(packet, true)
 }
 
-func newFreeBSDManagedNet() (*virtio.Net, *netstack.NetStack) {
-	mac := net.HardwareAddr{0x02, 0x42, 0x0a, 0x2a, 0x00, 0x02}
+func newFreeBSDManagedNet(guestIPv4 net.IP, mac net.HardwareAddr) (*virtio.Net, *netstack.NetStack) {
 	stack := netstack.New(slog.Default())
 	_ = stack.SetGuestMAC(mac)
-	_ = stack.SetGuestIPv4(net.IPv4(10, 42, 0, 2))
+	_ = stack.SetGuestIPv4(guestIPv4)
 	iface, _ := stack.AttachNetworkInterface()
 	dev := virtio.NewNet(0, 0x1000, 11, mac, freeBSDManagedNetBackend{iface: iface})
 	dev.DisableMergeRX = true

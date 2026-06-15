@@ -27,10 +27,12 @@ import (
 const openBSDControlPort = 10777
 
 type OpenBSDManagedConfig struct {
-	Kernel   []byte
-	Root     virtio.BlockBackend
-	MemoryMB uint64
-	Dmesg    bool
+	Kernel    []byte
+	Root      virtio.BlockBackend
+	MemoryMB  uint64
+	Dmesg     bool
+	GuestIPv4 net.IP
+	GuestMAC  net.HardwareAddr
 }
 
 func StartOpenBSDManagedSession(ctx context.Context, cfg OpenBSDManagedConfig, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
@@ -39,7 +41,7 @@ func StartOpenBSDManagedSession(ctx context.Context, cfg OpenBSDManagedConfig, o
 		return nil, err
 	}
 
-	netdev, stack := newOpenBSDManagedNet()
+	netdev, stack := newOpenBSDManagedNet(cfg.GuestIPv4, cfg.GuestMAC)
 	ln, err := stack.ListenInternal("tcp", fmt.Sprintf(":%d", openBSDControlPort))
 	if err != nil {
 		stack.Close()
@@ -181,6 +183,12 @@ func normalizeOpenBSDManagedConfig(cfg OpenBSDManagedConfig) (OpenBSDManagedConf
 	if cfg.MemoryMB == 0 {
 		cfg.MemoryMB = 768
 	}
+	if cfg.GuestIPv4 == nil {
+		cfg.GuestIPv4 = net.IPv4(10, 42, 0, 2)
+	}
+	if cfg.GuestMAC == nil {
+		cfg.GuestMAC = net.HardwareAddr{0x02, 0x42, 0x0a, 0x2a, 0x00, 0x02}
+	}
 	return cfg, nil
 }
 
@@ -270,11 +278,10 @@ func (b openBSDManagedNetBackend) HandleTxPacket(packet []byte) error {
 	return b.iface.DeliverGuestPacket(packet, true)
 }
 
-func newOpenBSDManagedNet() (*virtio.Net, *netstack.NetStack) {
-	mac := net.HardwareAddr{0x02, 0x42, 0x0a, 0x2a, 0x00, 0x02}
+func newOpenBSDManagedNet(guestIPv4 net.IP, mac net.HardwareAddr) (*virtio.Net, *netstack.NetStack) {
 	stack := netstack.New(slog.Default())
 	_ = stack.SetGuestMAC(mac)
-	_ = stack.SetGuestIPv4(net.IPv4(10, 42, 0, 2))
+	_ = stack.SetGuestIPv4(guestIPv4)
 	iface, _ := stack.AttachNetworkInterface()
 	dev := virtio.NewNet(0, 0x1000, 11, mac, openBSDManagedNetBackend{iface: iface})
 	iface.AttachVirtioBackend(func(frame []byte) error {
