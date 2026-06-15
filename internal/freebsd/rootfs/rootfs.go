@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ulikunitz/xz"
+	freebsdguestinit "j5.nz/cc/internal/freebsd/guestinit"
 	"j5.nz/cc/internal/fsimage"
 	ffsimage "j5.nz/cc/internal/fsimage/ffs"
 	"j5.nz/cc/internal/imagefs"
@@ -70,7 +71,11 @@ func BuildManagedRuntime(ctx context.Context, cfg Config) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	root, closeRoot, err := buildManagedRoot(ctx, baseTXZ, []byte(managedInitScript))
+	initBin, err := freebsdguestinit.Build(ctx, filepath.Join(cfg.CacheDir, "guestinit"))
+	if err != nil {
+		return nil, err
+	}
+	root, closeRoot, err := buildManagedRoot(ctx, baseTXZ, initBin)
 	if err != nil {
 		return nil, err
 	}
@@ -87,12 +92,12 @@ func BuildManagedRuntime(ctx context.Context, cfg Config) (*Runtime, error) {
 	return &Runtime{Kernel: kernel, Root: region, RootFS: root, close: closeRoot}, nil
 }
 
-func BuildManagedRoot(ctx context.Context, baseSetPath string, init []byte) (imagefs.Directory, error) {
-	root, _, err := buildManagedRoot(ctx, baseSetPath, init)
+func BuildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte) (imagefs.Directory, error) {
+	root, _, err := buildManagedRoot(ctx, baseSetPath, initBin)
 	return root, err
 }
 
-func buildManagedRoot(ctx context.Context, baseSetPath string, init []byte) (imagefs.Directory, func() error, error) {
+func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte) (imagefs.Directory, func() error, error) {
 	root, closeRoot, err := buildBaseRoot(ctx, baseSetPath)
 	if err != nil {
 		return nil, nil, err
@@ -103,7 +108,8 @@ func buildManagedRoot(ctx context.Context, baseSetPath string, init []byte) (ima
 		mode fs.FileMode
 		data []byte
 	}{
-		{"/sbin/init", 0o755, init},
+		{"/sbin/init", 0o755, []byte(managedInitScript)},
+		{"/sbin/cc-freebsd-init", 0o755, initBin},
 		{"/etc/fstab", 0o644, []byte("/dev/vtbd0 / ufs rw 1 1\n")},
 		{"/etc/rc.conf", 0o644, []byte("hostname=\"cc-freebsd\"\nifconfig_vtnet0=\"inet 10.42.0.2 netmask 255.255.255.0\"\ndefaultrouter=\"10.42.0.1\"\n")},
 		{"/etc/resolv.conf", 0o644, []byte("nameserver 10.42.0.1\n")},
@@ -137,33 +143,82 @@ func BuildBaseRoot(ctx context.Context, baseSetPath string) (imagefs.Directory, 
 }
 
 func buildBaseRoot(ctx context.Context, baseSetPath string) (imagefs.Directory, func() error, error) {
-	f, err := os.Open(baseSetPath)
+	baseTar, err := ensureDecompressedTar(ctx, baseSetPath)
 	if err != nil {
-		return nil, nil, fmt.Errorf("open FreeBSD base set %s: %w", baseSetPath, err)
+		return nil, nil, err
 	}
-	defer f.Close()
-	xzr, err := xz.NewReader(f)
+	tfs, err := imagefs.NewSeekableTarFS(ctx, baseTar)
 	if err != nil {
-		return nil, nil, fmt.Errorf("read FreeBSD base xz %s: %w", baseSetPath, err)
-	}
-	tfs, err := imagefs.NewTarFS(ctx, xzr)
-	if err != nil {
-		return nil, nil, fmt.Errorf("read FreeBSD base set %s: %w", baseSetPath, err)
+		return nil, nil, fmt.Errorf("read FreeBSD base set %s: %w", baseTar, err)
 	}
 	return tfs.Root(), tfs.Close, nil
 }
 
+func ensureDecompressedTar(ctx context.Context, source string) (string, error) {
+	target := strings.TrimSuffix(source, filepath.Ext(source)) + ".tar"
+	if st, err := os.Stat(target); err == nil && st.Size() > 0 {
+		if src, srcErr := os.Stat(source); srcErr == nil && !st.ModTime().Before(src.ModTime()) {
+			return target, nil
+		}
+	}
+	f, err := os.Open(source)
+	if err != nil {
+		return "", fmt.Errorf("open FreeBSD release set %s: %w", source, err)
+	}
+	defer f.Close()
+	xzr, err := xz.NewReader(f)
+	if err != nil {
+		return "", fmt.Errorf("read FreeBSD release xz %s: %w", source, err)
+	}
+	tmp := target + ".tmp"
+	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return "", fmt.Errorf("create decompressed FreeBSD release set %s: %w", tmp, err)
+	}
+	_, copyErr := io.Copy(out, contextReader{ctx: ctx, r: xzr})
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("decompress FreeBSD release set %s: %w", source, copyErr)
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("close decompressed FreeBSD release set %s: %w", tmp, closeErr)
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		_ = os.Remove(tmp)
+		return "", fmt.Errorf("install decompressed FreeBSD release set %s: %w", target, err)
+	}
+	return target, nil
+}
+
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
+}
+
 func ExtractKernel(kernelSetPath string) ([]byte, error) {
+	kernelTar, err := ensureDecompressedTar(context.Background(), kernelSetPath)
+	if err != nil {
+		return nil, err
+	}
+	return extractKernelFromTar(kernelTar)
+}
+
+func extractKernelFromTar(kernelSetPath string) ([]byte, error) {
 	f, err := os.Open(kernelSetPath)
 	if err != nil {
 		return nil, fmt.Errorf("open FreeBSD kernel set %s: %w", kernelSetPath, err)
 	}
 	defer f.Close()
-	xzr, err := xz.NewReader(f)
-	if err != nil {
-		return nil, fmt.Errorf("read FreeBSD kernel xz %s: %w", kernelSetPath, err)
-	}
-	tr := tar.NewReader(xzr)
+	tr := tar.NewReader(f)
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -283,8 +338,9 @@ func versionNoDot(version string) string {
 
 const managedInitScript = `#!/bin/sh
 /sbin/mount -t devfs devfs /dev || :
-echo FREEBSD_FULL_BASE_INIT_OK >/dev/console 2>&1 || :
-while :; do
-	/bin/sleep 3600
-done
+/sbin/ifconfig vtnet0 inet 10.42.0.2 netmask 255.255.255.0 up || {
+	while :; do /bin/sleep 3600; done
+}
+/sbin/route add default 10.42.0.1 || true
+exec /sbin/cc-freebsd-init
 `

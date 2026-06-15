@@ -260,6 +260,7 @@ func buildBootFADT(facs, dsdt uint64) []byte {
 		acpiPM1EventPort   = 0x400
 		acpiPM1ControlPort = 0x404
 		fadtFlagWBINVD     = 1 << 0
+		fadtBootArchNoVGA  = 1 << 2
 	)
 	body := make([]byte, fadtBodyLength)
 	binary.LittleEndian.PutUint32(body[0:], uint32(facs))
@@ -270,6 +271,7 @@ func buildBootFADT(facs, dsdt uint64) []byte {
 	binary.LittleEndian.PutUint32(body[28:], acpiPM1ControlPort)
 	body[52] = 4
 	body[53] = 2
+	binary.LittleEndian.PutUint16(body[73:], fadtBootArchNoVGA)
 	binary.LittleEndian.PutUint32(body[76:], fadtFlagWBINVD)
 	binary.LittleEndian.PutUint64(body[96:], facs)
 	binary.LittleEndian.PutUint64(body[104:], dsdt)

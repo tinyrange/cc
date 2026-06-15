@@ -2,6 +2,7 @@ package amd64
 
 import (
 	"bytes"
+	"crypto/rand"
 	"debug/elf"
 	"encoding/binary"
 	"errors"
@@ -33,8 +34,10 @@ const (
 	modInfoMDModulep = 0x1006
 	modInfoMDSMAP    = 0x1001
 
-	freeBSDKernelType = "elf kernel"
-	freeBSDKernelName = "/boot/kernel/kernel"
+	freeBSDKernelType          = "elf kernel"
+	freeBSDKernelName          = "/boot/kernel/kernel"
+	freeBSDBootEntropyType     = "boot_entropy_cache"
+	freeBSDPlatformEntropyType = "boot_entropy_platform"
 
 	rbVerbose  = 0x0800
 	rbSerial   = 0x1000
@@ -55,6 +58,7 @@ type BootOptions struct {
 	PagingGPA   uint64
 	Howto       uint32
 	Environment []string
+	Entropy     []byte
 }
 
 type BootPlan struct {
@@ -110,7 +114,15 @@ func PrepareBoot(memory []byte, kernel []byte, opts BootOptions) (*BootPlan, err
 		return nil, fmt.Errorf("unsupported FreeBSD kernel entry %#x", entry)
 	}
 
-	metadata, kernEnd, err := buildMetadata(kernelStart, kernelEnd, opts.MetadataGPA, opts.Howto|rbVerbose|rbSerial|rbMultiple, opts.Environment, defaultSMAP(opts.MemorySize))
+	entropy := opts.Entropy
+	if len(entropy) == 0 {
+		entropy = make([]byte, 4096)
+		if _, err := rand.Read(entropy); err != nil {
+			return nil, fmt.Errorf("generate FreeBSD boot entropy: %w", err)
+		}
+	}
+
+	metadata, kernEnd, err := buildMetadata(kernelStart, kernelEnd, opts.MetadataGPA, opts.Howto|rbSerial|rbMultiple, opts.Environment, entropy, defaultSMAP(opts.MemorySize))
 	if err != nil {
 		return nil, err
 	}
@@ -283,10 +295,12 @@ func freeBSDVirtualToPhysical(addr uint64) (uint64, error) {
 	return addr - kernBase, nil
 }
 
-func buildMetadata(kernelStart, kernelEnd, metadataGPA uint64, howto uint32, env []string, smap []smapEntry) ([]byte, uint32, error) {
+func buildMetadata(kernelStart, kernelEnd, metadataGPA uint64, howto uint32, env []string, entropy []byte, smap []smapEntry) ([]byte, uint32, error) {
 	envBytes := buildEnv(env)
 	envGPA := alignUp(metadataGPA+0x1000, pageSize)
-	kernEnd := uint32(alignUp(envGPA+uint64(len(envBytes)), pageSize))
+	entropyGPA := alignUp(envGPA+uint64(len(envBytes)), 16)
+	platformEntropyGPA := alignUp(entropyGPA+uint64(len(entropy)), 16)
+	kernEnd := uint32(alignUp(platformEntropyGPA+uint64(len(entropy)), pageSize))
 	records := metadataBuilder{}
 	records.addString(modInfoName, freeBSDKernelName)
 	records.addString(modInfoType, freeBSDKernelType)
@@ -297,16 +311,24 @@ func buildMetadata(kernelStart, kernelEnd, metadataGPA uint64, howto uint32, env
 	records.addUint64(modInfoMetadata|modInfoMDKernEnd, uint64(kernEnd))
 	records.addBytes(modInfoMetadata|modInfoMDSMAP, encodeSMAP(smap))
 	records.addUint64(modInfoMetadata|modInfoMDModulep, metadataGPA)
+	if len(entropy) > 0 {
+		records.addPreload(freeBSDKernelName+".entropy", freeBSDBootEntropyType, entropyGPA, uint64(len(entropy)))
+		records.addPreload(freeBSDKernelName+".platform_entropy", freeBSDPlatformEntropyType, platformEntropyGPA, uint64(len(entropy)))
+	}
 	records.addEnd()
 
 	metadata := records.bytes()
 	if len(metadata) > pageSize {
 		return nil, 0, fmt.Errorf("FreeBSD metadata too large: %d", len(metadata))
 	}
-	outLen := int(envGPA-metadataGPA) + len(envBytes)
+	outLen := int(uint64(kernEnd) - metadataGPA)
 	out := make([]byte, outLen)
 	copy(out, metadata)
 	copy(out[envGPA-metadataGPA:], envBytes)
+	if len(entropy) > 0 {
+		copy(out[entropyGPA-metadataGPA:], entropy)
+		copy(out[platformEntropyGPA-metadataGPA:], entropy)
+	}
 	return out, kernEnd, nil
 }
 
@@ -329,6 +351,13 @@ func (b *metadataBuilder) addUint64(typ uint32, value uint64) {
 	var data [8]byte
 	binary.LittleEndian.PutUint64(data[:], value)
 	b.addBytes(typ, data[:])
+}
+
+func (b *metadataBuilder) addPreload(name, typ string, addr, size uint64) {
+	b.addString(modInfoName, name)
+	b.addString(modInfoType, typ)
+	b.addUint64(modInfoAddr, addr)
+	b.addUint64(modInfoSize, size)
 }
 
 func (b *metadataBuilder) addBytes(typ uint32, data []byte) {
@@ -357,7 +386,7 @@ func buildEnv(values []string) []byte {
 			"comconsole_port=0x3f8",
 			"boot_serial=YES",
 			"boot_multicons=YES",
-			"boot_verbose=YES",
+			"hw.vga.textmode=1",
 			"hint.uart.0.at=isa",
 			"hint.uart.0.port=0x3f8",
 			"hint.uart.0.irq=4",

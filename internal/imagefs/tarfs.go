@@ -18,6 +18,7 @@ import (
 type TarFS struct {
 	root    *tarDir
 	backing *os.File
+	close   func() error
 	tmpDir  string
 	closed  bool
 }
@@ -52,7 +53,42 @@ func NewTarFSWithOptions(ctx context.Context, r io.Reader, opts TarFSOptions) (*
 		backing: backing,
 		tmpDir:  tmpDir,
 	}
+	tfs.close = func() error {
+		err := backing.Close()
+		if removeErr := os.RemoveAll(tmpDir); err == nil {
+			err = removeErr
+		}
+		return err
+	}
 	if err := tfs.read(ctx, r, opts); err != nil {
+		_ = tfs.Close()
+		return nil, err
+	}
+	return tfs, nil
+}
+
+func NewSeekableTarFS(ctx context.Context, filename string) (*TarFS, error) {
+	return NewSeekableTarFSWithOptions(ctx, filename, TarFSOptions{})
+}
+
+func NewSeekableTarFSWithOptions(ctx context.Context, filename string, opts TarFSOptions) (*TarFS, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, fmt.Errorf("open tarfs backing file: %w", err)
+	}
+	tfs := &TarFS{
+		root: &tarDir{
+			node: tarNode{
+				name:    "",
+				mode:    fs.ModeDir | 0o755,
+				modTime: time.Unix(0, 0),
+			},
+			children: map[string]tarEntry{},
+		},
+		backing: f,
+		close:   f.Close,
+	}
+	if err := tfs.readSeekable(ctx, f, opts); err != nil {
 		_ = tfs.Close()
 		return nil, err
 	}
@@ -71,11 +107,10 @@ func (t *TarFS) Close() error {
 		return nil
 	}
 	t.closed = true
-	err := t.backing.Close()
-	if removeErr := os.RemoveAll(t.tmpDir); err == nil {
-		err = removeErr
+	if t.close != nil {
+		return t.close()
 	}
-	return err
+	return nil
 }
 
 func (t *TarFS) read(ctx context.Context, r io.Reader, opts TarFSOptions) error {
@@ -104,6 +139,58 @@ func (t *TarFS) read(ctx context.Context, r io.Reader, opts TarFSOptions) error 
 			return err
 		}
 		entry, err := t.entryFromHeader(hdr, tr, clean, byPath)
+		if err != nil {
+			return err
+		}
+		parent.children[name] = entry
+		byPath[clean] = entry
+	}
+}
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	r.n += int64(n)
+	return n, err
+}
+
+func (t *TarFS) readSeekable(ctx context.Context, r io.Reader, opts TarFSOptions) error {
+	byPath := map[string]tarEntry{"/": {Dir: t.root}}
+	cr := &countingReader{r: r}
+	tr := tar.NewReader(cr)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read tar: %w", err)
+		}
+		clean := cleanTarPath(hdr.Name)
+		if clean == "/" {
+			continue
+		}
+		included := opts.Include == nil || opts.Include(clean, hdr)
+		if !included {
+			if hdr.Typeflag == tar.TypeReg || hdr.Typeflag == tar.TypeRegA {
+				if _, err := io.CopyN(io.Discard, tr, hdr.Size); err != nil {
+					return fmt.Errorf("skip %s payload: %w", clean, err)
+				}
+			}
+			continue
+		}
+		parent, name, err := t.ensureParent(clean, hdr.ModTime, byPath)
+		if err != nil {
+			return err
+		}
+		entry, err := t.entryFromSeekableHeader(hdr, tr, clean, cr.n, byPath)
 		if err != nil {
 			return err
 		}
@@ -152,6 +239,53 @@ func (t *TarFS) entryFromHeader(hdr *tar.Header, tr *tar.Reader, clean string, b
 			node:    node,
 			backing: t.backing,
 			offset:  offset,
+			size:    uint64(hdr.Size),
+			key:     clean,
+		}
+		return tarEntry{File: file}, nil
+	case tar.TypeChar, tar.TypeBlock, tar.TypeFifo:
+		return tarEntry{File: &tarFile{node: node, key: clean}}, nil
+	default:
+		return tarEntry{}, fmt.Errorf("%s has unsupported tar entry type %q", clean, hdr.Typeflag)
+	}
+}
+
+func (t *TarFS) entryFromSeekableHeader(hdr *tar.Header, tr *tar.Reader, clean string, dataOffset int64, byPath map[string]tarEntry) (tarEntry, error) {
+	mode := linuxModeToGo(fsmeta.LinuxModeFromTarHeader(hdr))
+	node := tarNode{
+		name:    path.Base(clean),
+		mode:    mode,
+		uid:     uint32(hdr.Uid),
+		gid:     uint32(hdr.Gid),
+		rdev:    tarRDev(hdr),
+		modTime: hdr.ModTime,
+	}
+	switch hdr.Typeflag {
+	case tar.TypeDir:
+		dir := &tarDir{node: node, children: map[string]tarEntry{}}
+		if existing, ok := byPath[clean]; ok && existing.Dir != nil {
+			existing.Dir.node = node
+			return existing, nil
+		}
+		return tarEntry{Dir: dir}, nil
+	case tar.TypeSymlink:
+		return tarEntry{Symlink: &tarSymlink{node: node, target: fsmeta.NormalizeSymlinkTarget(hdr.Linkname)}}, nil
+	case tar.TypeLink:
+		target := cleanTarPath(hdr.Linkname)
+		entry, ok := byPath[target]
+		if !ok || entry.File == nil {
+			return tarEntry{}, fmt.Errorf("%s hardlink target %s not found", clean, target)
+		}
+		entry.File.addLink(clean)
+		return tarEntry{File: entry.File}, nil
+	case tar.TypeReg, tar.TypeRegA:
+		if _, err := io.CopyN(io.Discard, tr, hdr.Size); err != nil {
+			return tarEntry{}, fmt.Errorf("skip %s payload: %w", clean, err)
+		}
+		file := &tarFile{
+			node:    node,
+			backing: t.backing,
+			offset:  dataOffset,
 			size:    uint64(hdr.Size),
 			key:     clean,
 		}

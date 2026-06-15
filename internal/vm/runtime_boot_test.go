@@ -221,6 +221,72 @@ func TestRuntimeBootsOpenBSDBuiltinImage(t *testing.T) {
 	}
 }
 
+func TestRuntimeBootsFreeBSDBuiltinImage(t *testing.T) {
+	if os.Getenv("CC_TEST_FREEBSD_KVM") == "" {
+		t.Skip("set CC_TEST_FREEBSD_KVM=1 to run FreeBSD runtime boot test")
+	}
+	if err := Supports(); err != nil {
+		t.Skipf("VM runtime unsupported on this host: %v", err)
+	}
+	cacheRoot := runtimeBootCacheRoot(t)
+	backend := NewRuntimeBackend(nil, nil, filepath.Join(cacheRoot, "guestinit"))
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	inst, err := backend.StartStream(ctx, client.CreateInstanceRequest{
+		Image:    "@freebsd",
+		MemoryMB: 1024,
+	}, nil)
+	if err != nil {
+		t.Fatalf("boot FreeBSD runtime: %v", err)
+	}
+	defer inst.Close()
+
+	resp, err := inst.Exec(ctx, client.ExecRequest{
+		Command: []string{"sh", "-c", "printf 'freebsd-runtime:'; printf %s \"$(uname -s)\"; printf ':copy:'; cat"},
+		WorkDir: "/tmp",
+		Stdin:   []byte("stdin-ok"),
+	})
+	if err != nil {
+		t.Fatalf("FreeBSD runtime exec: %v", err)
+	}
+	if resp.ExitCode != 0 || strings.TrimSpace(resp.Output) != "freebsd-runtime:FreeBSD:copy:stdin-ok" {
+		t.Fatalf("FreeBSD exec response = code %d output %q", resp.ExitCode, resp.Output)
+	}
+
+	var controlOutput string
+	var controlExit *int
+	if err := inst.ExecStream(ctx, client.ExecRequest{
+		Command:   []string{"sh", "-c", "printf 'freebsd-control:%s\\n' \"$PWD\" >&3"},
+		WorkDir:   "/tmp",
+		ControlFD: true,
+	}, nil, func(event client.ExecEvent) error {
+		switch event.Kind {
+		case "control":
+			controlOutput += event.Output
+		case "exit":
+			code := event.ExitCode
+			controlExit = &code
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("FreeBSD runtime control fd exec: %v", err)
+	}
+	if controlExit == nil || *controlExit != 0 {
+		t.Fatalf("FreeBSD control fd exit = %v, want 0", controlExit)
+	}
+	if strings.TrimSpace(controlOutput) != "freebsd-control:/tmp" {
+		t.Fatalf("FreeBSD control fd output = %q, want freebsd-control:/tmp", controlOutput)
+	}
+
+	flusher, ok := inst.(instanceFlushProvider)
+	if !ok {
+		t.Fatal("FreeBSD runtime does not expose flush")
+	}
+	if err := flusher.Flush(ctx); err != nil {
+		t.Fatalf("FreeBSD runtime flush: %v", err)
+	}
+}
+
 func TestRuntimeRejectsInvalidRequests(t *testing.T) {
 	env := newRuntimeBootEnv(t)
 	for _, tc := range []struct {

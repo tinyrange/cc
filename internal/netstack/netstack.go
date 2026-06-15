@@ -587,7 +587,7 @@ func (ns *NetStack) AttachNetworkInterface() (*NetworkInterface, error) {
 	if _, err := cryptoRand.Read(hostMAC); err != nil {
 		return nil, fmt.Errorf("generate host mac: %w", err)
 	}
-	hostMAC[0] |= 2 // Locally administered bit
+	hostMAC[0] = (hostMAC[0] | 2) &^ 1 // Locally administered unicast.
 	value, _ := macToUint64(hostMAC)
 	ns.hostMAC.Store(uint64(value))
 

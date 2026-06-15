@@ -26,6 +26,10 @@ func TestExtractKernelFromFreeBSDReleaseSet(t *testing.T) {
 	if len(kernel) < 4 || string(kernel[:4]) != "\x7fELF" {
 		t.Fatalf("kernel does not start with ELF magic: %x", kernel[:min(len(kernel), 4)])
 	}
+	kernelTar := strings.TrimSuffix(kernelTXZ, filepath.Ext(kernelTXZ)) + ".tar"
+	if st, err := os.Stat(kernelTar); err != nil || st.Size() == 0 {
+		t.Fatalf("decompressed kernel tar was not cached: stat=%v err=%v", st, err)
+	}
 }
 
 func TestBuildManagedRootFromFreeBSDBaseSet(t *testing.T) {
@@ -41,7 +45,11 @@ func TestBuildManagedRootFromFreeBSDBaseSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, guestPath := range []string{"/bin/sh", "/sbin/init", "/etc/fstab", "/dev/console"} {
+	baseTar := strings.TrimSuffix(baseTXZ, filepath.Ext(baseTXZ)) + ".tar"
+	if st, err := os.Stat(baseTar); err != nil || st.Size() == 0 {
+		t.Fatalf("decompressed base tar was not cached: stat=%v err=%v", st, err)
+	}
+	for _, guestPath := range []string{"/bin/sh", "/sbin/init", "/sbin/cc-freebsd-init", "/etc/fstab", "/dev/console"} {
 		if _, err := imagefs.LookupPath(root, guestPath); err != nil {
 			t.Fatalf("lookup %s: %v", guestPath, err)
 		}
@@ -50,12 +58,23 @@ func TestBuildManagedRootFromFreeBSDBaseSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := initEntry.File.ReadAt(0, 64)
+	data, err := initEntry.File.ReadAt(0, 256)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), "test init") {
+	if !strings.Contains(string(data), "cc-freebsd-init") {
 		t.Fatalf("unexpected /sbin/init overlay: %q", data)
+	}
+	agentEntry, err := imagefs.LookupPath(root, "/sbin/cc-freebsd-init")
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentData, err := agentEntry.File.ReadAt(0, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(agentData), "test init") {
+		t.Fatalf("unexpected /sbin/cc-freebsd-init overlay: %q", agentData)
 	}
 }
 

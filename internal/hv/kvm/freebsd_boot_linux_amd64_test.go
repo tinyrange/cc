@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"j5.nz/cc/client"
 	freebsdrootfs "j5.nz/cc/internal/freebsd/rootfs"
 	"j5.nz/cc/internal/virtio"
 )
@@ -60,5 +61,38 @@ func TestBootFreeBSDFullBaseRootFromReleaseSets(t *testing.T) {
 	}
 	if strings.Contains(serial, "init died") {
 		t.Fatalf("FreeBSD init died:\n%s", serial)
+	}
+}
+
+func TestFreeBSDManagedSessionExec(t *testing.T) {
+	if os.Getenv("CC_TEST_FREEBSD_ROOTFS") == "" {
+		t.Skip("set CC_TEST_FREEBSD_ROOTFS=1 to build and boot the full FreeBSD rootfs")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	rt, err := freebsdrootfs.BuildManagedRuntime(ctx, freebsdrootfs.Config{})
+	if err != nil {
+		t.Fatalf("build FreeBSD runtime: %v", err)
+	}
+	defer rt.Close()
+	session, err := StartFreeBSDManagedSession(ctx, FreeBSDManagedConfig{
+		Kernel:   rt.Kernel,
+		Root:     rt.Root,
+		MemoryMB: 1024,
+	}, nil)
+	if err != nil {
+		t.Fatalf("start FreeBSD managed session: %v", err)
+	}
+	defer session.Close()
+	resp, err := session.Exec(ctx, client.ExecRequest{
+		Command: []string{"/bin/sh", "-c", "printf 'freebsd-managed:'; printf %s \"$(uname -s)\"; printf ':copy:'; cat"},
+		Stdin:   []byte("stdin-ok"),
+		WorkDir: "/tmp",
+	})
+	if err != nil {
+		t.Fatalf("FreeBSD managed exec: %v", err)
+	}
+	if resp.ExitCode != 0 || strings.TrimSpace(resp.Output) != "freebsd-managed:FreeBSD:copy:stdin-ok" {
+		t.Fatalf("FreeBSD exec response = code %d output %q", resp.ExitCode, resp.Output)
 	}
 }
