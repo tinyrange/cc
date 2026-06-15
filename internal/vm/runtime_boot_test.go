@@ -122,6 +122,47 @@ func TestRuntimeBootsLinuxWithExt4Root(t *testing.T) {
 	}
 }
 
+func TestRuntimeBootsOpenBSDBuiltinImage(t *testing.T) {
+	if os.Getenv("CC_TEST_OPENBSD_KVM") == "" {
+		t.Skip("set CC_TEST_OPENBSD_KVM=1 to run OpenBSD runtime boot test")
+	}
+	if err := Supports(); err != nil {
+		t.Skipf("VM runtime unsupported on this host: %v", err)
+	}
+	cacheRoot := runtimeBootCacheRoot(t)
+	backend := NewRuntimeBackend(nil, nil, filepath.Join(cacheRoot, "guestinit"))
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	inst, err := backend.StartStream(ctx, client.CreateInstanceRequest{
+		Image:    "@openbsd",
+		MemoryMB: 768,
+	}, nil)
+	if err != nil {
+		t.Fatalf("boot OpenBSD runtime: %v", err)
+	}
+	defer inst.Close()
+
+	resp, err := inst.Exec(ctx, client.ExecRequest{
+		Command: []string{"sh", "-c", "printf 'openbsd-runtime:'; uname -s; printf ':copy:'; cat"},
+		WorkDir: "/tmp",
+		Stdin:   []byte("stdin-ok"),
+	})
+	if err != nil {
+		t.Fatalf("OpenBSD runtime exec: %v", err)
+	}
+	normalized := strings.ReplaceAll(strings.TrimSpace(resp.Output), "\n", "")
+	if resp.ExitCode != 0 || normalized != "openbsd-runtime:OpenBSD:copy:stdin-ok" {
+		t.Fatalf("OpenBSD exec response = code %d output %q", resp.ExitCode, resp.Output)
+	}
+	flusher, ok := inst.(instanceFlushProvider)
+	if !ok {
+		t.Fatal("OpenBSD runtime does not expose flush")
+	}
+	if err := flusher.Flush(ctx); err != nil {
+		t.Fatalf("OpenBSD runtime flush: %v", err)
+	}
+}
+
 func TestRuntimeRejectsInvalidRequests(t *testing.T) {
 	env := newRuntimeBootEnv(t)
 	for _, tc := range []struct {
