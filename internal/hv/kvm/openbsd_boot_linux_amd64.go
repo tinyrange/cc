@@ -30,7 +30,7 @@ func BootOpenBSDKernelToMarkerWithPCIBlock(ctx context.Context, kernel []byte, m
 	if strings.TrimSpace(marker) == "" {
 		return "", fmt.Errorf("boot marker is required")
 	}
-	return bootOpenBSDToCondition(ctx, kernel, memoryMB, block, nil, nil, func(serial string) bool {
+	return bootOpenBSDToCondition(ctx, kernel, memoryMB, []*virtio.Block{block}, nil, nil, func(serial string) bool {
 		return strings.Contains(serial, marker)
 	})
 }
@@ -39,7 +39,16 @@ func BootOpenBSDKernelToMarkerWithPCIBlockConsole(ctx context.Context, kernel []
 	if strings.TrimSpace(marker) == "" {
 		return "", fmt.Errorf("boot marker is required")
 	}
-	return bootOpenBSDToCondition(ctx, kernel, memoryMB, block, nil, input, func(serial string) bool {
+	return bootOpenBSDToCondition(ctx, kernel, memoryMB, []*virtio.Block{block}, nil, input, func(serial string) bool {
+		return strings.Contains(serial, marker)
+	})
+}
+
+func BootOpenBSDKernelToMarkerWithPCIBlocksConsole(ctx context.Context, kernel []byte, memoryMB uint64, marker string, blocks []*virtio.Block, input func(serial string) []byte) (string, error) {
+	if strings.TrimSpace(marker) == "" {
+		return "", fmt.Errorf("boot marker is required")
+	}
+	return bootOpenBSDToCondition(ctx, kernel, memoryMB, blocks, nil, input, func(serial string) bool {
 		return strings.Contains(serial, marker)
 	})
 }
@@ -48,7 +57,7 @@ func BootOpenBSDKernelToMarkerWithPCIBlockNetConsole(ctx context.Context, kernel
 	if strings.TrimSpace(marker) == "" {
 		return "", fmt.Errorf("boot marker is required")
 	}
-	return bootOpenBSDToCondition(ctx, kernel, memoryMB, block, netdev, input, func(serial string) bool {
+	return bootOpenBSDToCondition(ctx, kernel, memoryMB, []*virtio.Block{block}, netdev, input, func(serial string) bool {
 		return strings.Contains(serial, marker)
 	})
 }
@@ -59,7 +68,7 @@ func BootOpenBSDKernelToSerial(ctx context.Context, kernel []byte, memoryMB uint
 	})
 }
 
-func bootOpenBSDToCondition(ctx context.Context, kernel []byte, memoryMB uint64, block *virtio.Block, netdev *virtio.Net, input func(string) []byte, done func(string) bool) (string, error) {
+func bootOpenBSDToCondition(ctx context.Context, kernel []byte, memoryMB uint64, blocks []*virtio.Block, netdev *virtio.Net, input func(string) []byte, done func(string) bool) (string, error) {
 	vm, err := NewVM()
 	if err != nil {
 		return "", err
@@ -76,13 +85,17 @@ func bootOpenBSDToCondition(ctx context.Context, kernel []byte, memoryMB uint64,
 	uart.AttachIRQ(vm, amd64vm.COM1IRQ)
 	var pci *PCIBus
 	var pciDevices []*PCIDevice
-	if block != nil {
+	for i, block := range blocks {
+		if block == nil {
+			continue
+		}
 		block.Attach(vm, vm)
-		pciDevices = append(pciDevices, NewVirtioBlockPCIDevice(1, 0x1000, 10, block))
+		pciDevices = append(pciDevices, NewVirtioBlockPCIDevice(uint8(1+i), uint16(0x1000+i*0x100), uint8(10+i), block))
 	}
 	if netdev != nil {
 		netdev.Attach(vm, vm)
-		pciDevices = append(pciDevices, NewVirtioNetPCIDevice(2, 0x1100, 11, netdev))
+		netIndex := len(pciDevices) + 1
+		pciDevices = append(pciDevices, NewVirtioNetPCIDevice(uint8(netIndex), uint16(0x1000+netIndex*0x100), uint8(10+netIndex), netdev))
 	}
 	if len(pciDevices) > 0 {
 		pci = NewPCIBus(pciDevices...)

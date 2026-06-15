@@ -284,6 +284,71 @@ func TestBootOpenBSD79RegularKernelWithBaseSetRootAndGoInit(t *testing.T) {
 	}
 }
 
+func TestOpenBSD79FsckFFSGeneratedBaseSetRoot(t *testing.T) {
+	if os.Getenv("CC_TEST_OPENBSD_KVM") == "" {
+		t.Skip("set CC_TEST_OPENBSD_KVM=1 to run OpenBSD KVM boot smoke test")
+	}
+	kernelPath := filepath.Join("..", "..", "..", "local", "openbsd79-amd64", "bsd.rd")
+	kernel, err := os.ReadFile(kernelPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			t.Skipf("OpenBSD fixture not present: %s", kernelPath)
+		}
+		t.Fatalf("read fixture: %v", err)
+	}
+
+	candidateOverlay := imagefs.NewOverlay(buildOpenBSDBaseSetRoot(t))
+	if err := candidateOverlay.AddFile("/aaa/blob", 0o644, []byte("layout-sensitive file\n")); err != nil {
+		t.Fatalf("add layout-sensitive candidate file: %v", err)
+	}
+	candidateRegion, err := fsimage.Build(context.Background(), candidateOverlay.Root(), fsimage.Options{
+		Type:              fsimage.TypeFFS,
+		SizeBytes:         224 << 20,
+		DeterministicTime: time.Unix(1700000000, 0),
+	})
+	if err != nil {
+		t.Fatalf("build candidate FFS root: %v", err)
+	}
+
+	block := virtio.NewBlock(0, 0x1000, 10, candidateRegion)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	answeredShell := false
+	ranFsck := false
+	serial, err := BootOpenBSDKernelToMarkerWithPCIBlockConsole(ctx, kernel, 512, "OPENBSD_FSCK_FFS_DONE", block, func(serial string) []byte {
+		if !answeredShell && strings.Contains(serial, "(I)nstall") {
+			answeredShell = true
+			return []byte("S\n")
+		}
+		if answeredShell && !ranFsck && strings.Contains(serial, "# ") {
+			ranFsck = true
+			return []byte("cd /dev && sh MAKEDEV sd0; fsck_ffs -fn /dev/rsd0a; echo OPENBSD_FSCK_FFS_\"\"DONE\n")
+		}
+		return nil
+	})
+	t.Logf("OpenBSD fsck_ffs validator serial tail:\n%s", tailString(serial, 8192))
+	if err != nil {
+		t.Fatalf("boot OpenBSD fsck_ffs validator: %v\nserial:\n%s", err, serial)
+	}
+	if !strings.Contains(serial, "OPENBSD_FSCK_FFS_DONE") {
+		t.Fatalf("OpenBSD fsck_ffs rejected generated FFS image:\n%s", serial)
+	}
+	for _, bad := range []string{
+		"BAD SUPER BLOCK",
+		"INCORRECT",
+		"UNREF",
+		"BAD/DUP",
+		"FREE BLK COUNT(S) WRONG",
+		"SUMMARY INFORMATION BAD",
+		"BLK(S) MISSING IN BIT MAPS",
+		"FILE SYSTEM WAS MODIFIED",
+	} {
+		if strings.Contains(serial, bad) {
+			t.Fatalf("OpenBSD fsck_ffs found FFS inconsistency %q:\n%s", bad, serial)
+		}
+	}
+}
+
 func tailString(s string, max int) string {
 	if len(s) <= max {
 		return s
@@ -333,6 +398,38 @@ func buildOpenBSDBaseSetRoot(t *testing.T) imagefs.Directory {
 		t.Fatalf("overlay Go init: %v", err)
 	}
 	return overlay.Root()
+}
+
+func buildOpenBSDFsckRoot(t *testing.T) imagefs.Directory {
+	t.Helper()
+	rootDir := t.TempDir()
+	for _, dir := range []string{"dev", "sbin"} {
+		if err := os.MkdirAll(filepath.Join(rootDir, filepath.FromSlash(dir)), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	initBin := buildOpenBSDGoInit(t, openBSDFsckInitSource)
+	if err := os.WriteFile(filepath.Join(rootDir, "sbin", "init"), initBin, 0o755); err != nil {
+		t.Fatalf("write OpenBSD fsck init: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "dev", "console"), nil, 0o600); err != nil {
+		t.Fatalf("write dev console placeholder: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "dev", "null"), nil, 0o666); err != nil {
+		t.Fatalf("write dev null placeholder: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootDir, "dev", "rsd1a"), nil, 0o600); err != nil {
+		t.Fatalf("write dev rsd1a placeholder: %v", err)
+	}
+	if err := extractOpenBSDRuntime(rootDir, openBSDBaseSetPath(t), "/sbin/fsck_ffs"); err != nil {
+		t.Fatal(err)
+	}
+	meta := map[string]fsmeta.Entry{
+		"/dev/console": {Mode: fsmeta.LinuxModeFromFileMode(fs.ModeDevice | fs.ModeCharDevice | 0o600), RDev: 0},
+		"/dev/null":    {Mode: fsmeta.LinuxModeFromFileMode(fs.ModeDevice | fs.ModeCharDevice | 0o666), RDev: 514},
+		"/dev/rsd1a":   {Mode: fsmeta.LinuxModeFromFileMode(fs.ModeDevice | fs.ModeCharDevice | 0o600), RDev: 13<<8 | 16},
+	}
+	return imagefs.NewHostFS(rootDir, meta)
 }
 
 func addOpenBSDRuntimeLibraryLinks(t *testing.T, overlay *imagefs.Overlay, root imagefs.Directory) {
@@ -583,6 +680,44 @@ func main() {
 	} else {
 		writeConsole("OPENBSD_VIO0_FOUND " + iface.HardwareAddr.String() + "\n")
 	}
+	for {
+		time.Sleep(time.Hour)
+	}
+}
+`
+
+const openBSDFsckInitSource = `package main
+
+import (
+	"bytes"
+	"os"
+	"os/exec"
+	"time"
+)
+
+func writeConsole(s string) {
+	console, err := os.OpenFile("/dev/console", os.O_RDWR, 0)
+	if err == nil {
+		defer console.Close()
+		console.WriteString(s)
+		return
+	}
+	os.Stdout.WriteString(s)
+}
+
+func main() {
+	cmd := exec.Command("/sbin/fsck_ffs", "-fn", "/dev/rsd1a")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	writeConsole(out.String())
+	if err != nil {
+		writeConsole("OPENBSD_FSCK_FFS_FAILED: " + err.Error() + "\n")
+	} else {
+		writeConsole("OPENBSD_FSCK_FFS_OK\n")
+	}
+	writeConsole("OPENBSD_FSCK_FFS_DONE\n")
 	for {
 		time.Sleep(time.Hour)
 	}
