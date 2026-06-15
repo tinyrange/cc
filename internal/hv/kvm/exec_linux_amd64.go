@@ -379,7 +379,7 @@ func handleManagedExit(vm *VM, vcpuIndex int, uart *serial.UART8250, fsdevs []*v
 	return nil
 }
 
-func sendManagedExec(control virtio.VsockConn, id string, req client.ExecRequest) error {
+func sendManagedExec(control io.Writer, id string, req client.ExecRequest) error {
 	payload, err := json.Marshal(vmruntime.ManagedExecRequest{
 		Kind:      execRequestKind(req.Kind),
 		ID:        id,

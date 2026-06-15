@@ -6,12 +6,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"time"
 
 	"j5.nz/cc/client"
-	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
 )
 
@@ -128,7 +128,7 @@ func (s *ManagedSession) sendExecMessage(msg vmruntime.ManagedExecRequest) error
 	return sendManagedExecMessage(s.control, msg)
 }
 
-func sendManagedExecMessage(control virtio.VsockConn, msg vmruntime.ManagedExecRequest) error {
+func sendManagedExecMessage(control io.Writer, msg vmruntime.ManagedExecRequest) error {
 	payload, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("marshal exec request: %w", err)

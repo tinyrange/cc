@@ -22,12 +22,13 @@ import (
 type ManagedSession struct {
 	cancel     context.CancelFunc
 	doneCh     chan error
-	control    virtio.VsockConn
-	listener   virtio.VsockListener
+	control    io.ReadWriteCloser
+	listener   io.Closer
 	vsock      *virtio.Vsock
 	bootWriter *vmruntime.BootEventWriter
 	transcript *vmruntime.SerialTranscript
 	serialOut  *vmruntime.SerialTranscript
+	cleanup    func()
 	sendMu     sync.Mutex
 	nextID     atomic.Uint64
 	dmesg      bool
@@ -275,6 +276,9 @@ func (s *ManagedSession) Close() error {
 	}
 	if s.bootWriter != nil {
 		_ = s.bootWriter.Close()
+	}
+	if s.cleanup != nil {
+		s.cleanup()
 	}
 	if s.cancel != nil {
 		s.cancel()

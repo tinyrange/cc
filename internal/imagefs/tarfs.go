@@ -99,7 +99,7 @@ func (t *TarFS) read(ctx context.Context, r io.Reader, opts TarFSOptions) error 
 		if opts.Include != nil && !opts.Include(clean, hdr) {
 			continue
 		}
-		parent, name, err := t.ensureParent(clean, hdr.ModTime)
+		parent, name, err := t.ensureParent(clean, hdr.ModTime, byPath)
 		if err != nil {
 			return err
 		}
@@ -163,17 +163,20 @@ func (t *TarFS) entryFromHeader(hdr *tar.Header, tr *tar.Reader, clean string, b
 	}
 }
 
-func (t *TarFS) ensureParent(clean string, modTime time.Time) (*tarDir, string, error) {
+func (t *TarFS) ensureParent(clean string, modTime time.Time, byPath map[string]tarEntry) (*tarDir, string, error) {
 	parentPath := path.Dir(clean)
 	name := path.Base(clean)
 	current := t.root
 	if parentPath == "/" {
 		return current, name, nil
 	}
+	currentPath := ""
 	for _, part := range strings.Split(strings.TrimPrefix(parentPath, "/"), "/") {
 		if part == "" {
 			continue
 		}
+		currentPath = path.Join(currentPath, part)
+		guestPath := "/" + currentPath
 		entry, ok := current.children[part]
 		if !ok {
 			next := &tarDir{
@@ -184,7 +187,9 @@ func (t *TarFS) ensureParent(clean string, modTime time.Time) (*tarDir, string, 
 				},
 				children: map[string]tarEntry{},
 			}
-			current.children[part] = tarEntry{Dir: next}
+			entry := tarEntry{Dir: next}
+			current.children[part] = entry
+			byPath[guestPath] = entry
 			current = next
 			continue
 		}
