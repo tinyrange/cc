@@ -1219,11 +1219,6 @@ func (ns *NetStack) handleUDPWithReuse(h ipv4Header, payload []byte, releaseUnsa
 	v, ok := ns.udpSockets.Load(dstPort)
 	if !ok {
 		tracef("netstack.udpEndpointConn drop noSocket", "dstPort=%d", dstPort)
-		slog.Error("raw: drop udp packet not addressed to us",
-			"srcIP", h.src.String(),
-			"srcPort", srcPort,
-			"dstPort", dstPort,
-		)
 		return nil
 	}
 

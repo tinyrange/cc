@@ -35,10 +35,13 @@ const defaultControlMarkerPref = "__CCX3_CTL__:"
 const fatalBootMarker = "ccx3-init-fatal: "
 const execPivotMode = "--ccx3-exec-pivot"
 const stage2Mode = "--ccx3-stage2"
-const stage2Path = "/run/ccx3/stage2"
-const stage2ConfigPath = "/run/ccx3/config.json"
+const stage2Path = "/etc/ccx3/stage2"
+const stage2ConfigPath = "/etc/ccx3/config.json"
 const initSystemSystemd = "systemd"
 const systemdReadyTimeout = 30 * time.Second
+const execProtocolChunkSize = 256
+const defaultVsockConnectTimeout = 5 * time.Second
+const stage2VsockConnectAttemptTimeout = 500 * time.Millisecond
 
 var consoleFD = 2
 var kmsgFD = -1
@@ -427,17 +430,23 @@ func readStage2Config() ([]byte, error) {
 
 func connectStage2Control(port uint32) (*os.File, error) {
 	var lastErr error
+	start := time.Now()
+	lastLog := start
 	for attempt := 0; ; attempt++ {
-		control, err := connectVsock(port)
+		control, err := connectVsockWithTimeout(port, stage2VsockConnectAttemptTimeout)
 		if err == nil {
-			if attempt > 0 {
-				writeKernel("ccx3-init: stage2 vsock connected")
+			if attempt > 0 || time.Since(start) > stage2VsockConnectAttemptTimeout {
+				writeKernel(fmt.Sprintf("ccx3-init: stage2 vsock connected after %s (%d retries)", time.Since(start).Round(time.Millisecond), attempt))
 			}
 			return control, nil
 		}
 		lastErr = err
 		if attempt == 0 {
 			writeKernel("ccx3-init: stage2 waiting for vsock control: " + err.Error())
+			lastLog = time.Now()
+		} else if time.Since(lastLog) >= 5*time.Second {
+			writeKernel(fmt.Sprintf("ccx3-init: stage2 still waiting for vsock control after %s: %v", time.Since(start).Round(time.Millisecond), err))
+			lastLog = time.Now()
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -497,21 +506,20 @@ func installSystemdStage2(cfg config) error {
 	if err := os.WriteFile(stage2ConfigPath, append(configData, '\n'), 0o600); err != nil {
 		return fmt.Errorf("write %s: %w", stage2ConfigPath, err)
 	}
-	if err := os.MkdirAll("/run/systemd/system/basic.target.wants", 0o755); err != nil {
+	if err := os.MkdirAll("/etc/systemd/system/sysinit.target.wants", 0o755); err != nil {
 		return fmt.Errorf("mkdir systemd runtime units: %w", err)
 	}
-	unitPath := "/run/systemd/system/ccx3-stage2.service"
+	unitPath := "/etc/systemd/system/ccx3-stage2.service"
 	unit := `[Unit]
 Description=ccx3 guest control stage2
 DefaultDependencies=no
-After=local-fs.target
-Before=basic.target
+Before=sysinit.target
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-Environment=CCX3_STAGE2_CONFIG=/run/ccx3/config.json
-ExecStart=/run/ccx3/stage2 --ccx3-stage2
+Environment=CCX3_STAGE2_CONFIG=/etc/ccx3/config.json
+ExecStart=/etc/ccx3/stage2 --ccx3-stage2
 Restart=on-failure
 RestartSec=250ms
 StandardInput=null
@@ -519,12 +527,12 @@ StandardOutput=journal+console
 StandardError=journal+console
 
 [Install]
-WantedBy=basic.target
+WantedBy=sysinit.target
 `
 	if err := os.WriteFile(unitPath, []byte(unit), 0o644); err != nil {
 		return fmt.Errorf("write %s: %w", unitPath, err)
 	}
-	if err := ensureSymlink(unitPath, "/run/systemd/system/basic.target.wants/ccx3-stage2.service"); err != nil {
+	if err := ensureSymlink(unitPath, "/etc/systemd/system/sysinit.target.wants/ccx3-stage2.service"); err != nil {
 		return fmt.Errorf("enable ccx3 stage2: %w", err)
 	}
 	for _, unit := range []string{
@@ -2012,7 +2020,7 @@ func archivePathToControl(cfg config, control io.Writer, id, rootDir, src string
 		return fmt.Errorf("source path is required")
 	}
 	src = rootPath(rootDir, filepath.Clean(src))
-	info, err := os.Stat(src)
+	info, err := os.Lstat(src)
 	if err != nil {
 		return err
 	}
@@ -2021,7 +2029,7 @@ func archivePathToControl(cfg config, control io.Writer, id, rootDir, src string
 		err := writePathTar(pw, src, filepath.Base(src), info)
 		_ = pw.CloseWithError(err)
 	}()
-	var buf [32 * 1024]byte
+	var buf [execProtocolChunkSize]byte
 	for {
 		n, err := pr.Read(buf[:])
 		if n > 0 {
@@ -2123,11 +2131,11 @@ func chownPathForUser(target, user string) error {
 func writePathTar(w io.Writer, src, rootName string, rootInfo os.FileInfo) error {
 	tw := tar.NewWriter(w)
 	defer tw.Close()
-	return filepath.WalkDir(src, func(filePath string, entry os.DirEntry, walkErr error) error {
+	return filepath.WalkDir(src, func(filePath string, _ os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		info, err := entry.Info()
+		info, err := os.Lstat(filePath)
 		if err != nil {
 			return err
 		}
@@ -2139,7 +2147,14 @@ func writePathTar(w io.Writer, src, rootName string, rootInfo os.FileInfo) error
 			rel = rootName
 			info = rootInfo
 		}
-		header, err := tar.FileInfoHeader(info, "")
+		link := ""
+		if info.Mode()&os.ModeSymlink != 0 {
+			link, err = os.Readlink(filePath)
+			if err != nil {
+				return err
+			}
+		}
+		header, err := tar.FileInfoHeader(info, link)
 		if err != nil {
 			return err
 		}
@@ -2173,13 +2188,14 @@ func extractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
 	}
 	tr := tar.NewReader(r)
 	sawEntry := false
+	var dirs []tarDirMtime
 	for {
 		header, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			if !sawEntry {
 				return fmt.Errorf("archive is empty")
 			}
-			return nil
+			return restoreTarDirMtimes(dirs)
 		}
 		if err != nil {
 			return err
@@ -2192,6 +2208,18 @@ func extractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
 		switch header.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(target, os.FileMode(header.Mode).Perm()); err != nil {
+				return err
+			}
+			_ = os.Chmod(target, os.FileMode(header.Mode).Perm())
+			dirs = append(dirs, tarDirMtime{path: target, mtime: header.ModTime})
+		case tar.TypeSymlink:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			if err := os.Symlink(header.Linkname, target); err != nil {
 				return err
 			}
 		case tar.TypeReg, tar.TypeRegA:
@@ -2210,10 +2238,35 @@ func extractTarToPath(r io.Reader, rootDir, dst string, dstDir bool) error {
 			if closeErr != nil {
 				return closeErr
 			}
+			perm := os.FileMode(header.Mode).Perm()
+			if err := os.Chmod(target, perm); err != nil {
+				return err
+			}
+			if err := os.Chtimes(target, header.ModTime, header.ModTime); err != nil {
+				return err
+			}
 		default:
 			continue
 		}
 	}
+}
+
+type tarDirMtime struct {
+	path  string
+	mtime time.Time
+}
+
+func restoreTarDirMtimes(dirs []tarDirMtime) error {
+	for i := len(dirs) - 1; i >= 0; i-- {
+		dir := dirs[i]
+		if dir.mtime.IsZero() {
+			continue
+		}
+		if err := os.Chtimes(dir.path, dir.mtime, dir.mtime); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func guestTarTarget(dst string, dstDir bool, name string) (string, error) {
@@ -2398,7 +2451,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		done = make(chan struct{}, streams)
 		go func() {
 			defer func() { done <- struct{}{} }()
-			var buf [256]byte
+			var buf [execProtocolChunkSize]byte
 			first := true
 			for {
 				n, err := ptyMaster.Read(buf[:])
@@ -2418,7 +2471,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 			go func() {
 				defer func() { done <- struct{}{} }()
 				defer stdin.Close()
-				var buf [256]byte
+				var buf [execProtocolChunkSize]byte
 				for {
 					n, err := stdin.Read(buf[:])
 					if n > 0 {
@@ -2462,7 +2515,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		go func() {
 			defer func() { done <- struct{}{} }()
 			defer stdoutR.Close()
-			var buf [256]byte
+			var buf [execProtocolChunkSize]byte
 			first := true
 			for {
 				n, err := stdoutR.Read(buf[:])
@@ -2481,7 +2534,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 		go func() {
 			defer func() { done <- struct{}{} }()
 			defer stderrR.Close()
-			var buf [256]byte
+			var buf [execProtocolChunkSize]byte
 			first := true
 			for {
 				n, err := stderrR.Read(buf[:])
@@ -2501,7 +2554,7 @@ func runManagedExec(cfg config, control io.Writer, id string, argv []string, env
 	if controlR != nil {
 		go func() {
 			defer func() { done <- struct{}{} }()
-			var buf [256]byte
+			var buf [execProtocolChunkSize]byte
 			for {
 				n, err := controlR.Read(buf[:])
 				if n > 0 {
@@ -3003,9 +3056,24 @@ type sockaddrVM struct {
 }
 
 func connectVsock(port uint32) (*os.File, error) {
+	return connectVsockWithTimeout(port, defaultVsockConnectTimeout)
+}
+
+func connectVsockWithTimeout(port uint32, timeout time.Duration) (*os.File, error) {
 	fd, err := syscall.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
 	if err != nil {
 		return nil, err
+	}
+	closeFD := true
+	defer func() {
+		if closeFD {
+			_ = syscall.Close(fd)
+		}
+	}()
+	if timeout > 0 {
+		if err := syscall.SetNonblock(fd, true); err != nil {
+			return nil, err
+		}
 	}
 	addr := sockaddrVM{
 		Family: unix.AF_VSOCK,
@@ -3013,9 +3081,53 @@ func connectVsock(port uint32) (*os.File, error) {
 		CID:    2,
 	}
 	_, _, errno := syscall.Syscall(syscall.SYS_CONNECT, uintptr(fd), uintptr(unsafe.Pointer(&addr)), unsafe.Sizeof(addr))
-	if errno != 0 {
-		_ = syscall.Close(fd)
+	if errno == 0 {
+		if timeout > 0 {
+			if err := syscall.SetNonblock(fd, false); err != nil {
+				return nil, err
+			}
+		}
+		closeFD = false
+		return os.NewFile(uintptr(fd), fmt.Sprintf("vsock:%d", port)), nil
+	}
+	if timeout <= 0 || (errno != unix.EINPROGRESS && errno != unix.EALREADY && errno != unix.EWOULDBLOCK) {
 		return nil, errno
 	}
-	return os.NewFile(uintptr(fd), fmt.Sprintf("vsock:%d", port)), nil
+	deadline := time.Now().Add(timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, fmt.Errorf("vsock:%d connect timed out after %s", port, timeout)
+		}
+		timeoutMS := int(remaining / time.Millisecond)
+		if timeoutMS < 1 {
+			timeoutMS = 1
+		}
+		pollFD := []unix.PollFd{{
+			Fd:     int32(fd),
+			Events: unix.POLLOUT,
+		}}
+		n, err := unix.Poll(pollFD, timeoutMS)
+		if err != nil {
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			return nil, err
+		}
+		if n == 0 {
+			continue
+		}
+		socketErr, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ERROR)
+		if err != nil {
+			return nil, err
+		}
+		if socketErr != 0 {
+			return nil, syscall.Errno(socketErr)
+		}
+		if err := syscall.SetNonblock(fd, false); err != nil {
+			return nil, err
+		}
+		closeFD = false
+		return os.NewFile(uintptr(fd), fmt.Sprintf("vsock:%d", port)), nil
+	}
 }
