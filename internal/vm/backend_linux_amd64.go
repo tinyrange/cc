@@ -136,6 +136,21 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 			TimeoutSeconds: req.TimeoutSeconds,
 		}, onEvent)
 	}
+	if strings.TrimSpace(req.Image) != "" {
+		return b.StartStream(ctx, client.CreateInstanceRequest{
+			ID:             req.ID,
+			Image:          req.Image,
+			InitSystem:     req.InitSystem,
+			Kernel:         req.Kernel,
+			Network:        req.Network,
+			KernelModules:  append([]string(nil), req.KernelModules...),
+			MemoryMB:       req.MemoryMB,
+			CPUs:           req.CPUs,
+			NestedVirt:     req.NestedVirt,
+			Dmesg:          req.Dmesg,
+			TimeoutSeconds: req.TimeoutSeconds,
+		}, onEvent)
+	}
 	if b == nil || b.kernel == nil || b.images == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
 	}
