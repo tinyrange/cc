@@ -608,6 +608,53 @@ func (v *VM) SetLongMode(entry, zeroPage, stack, pagingBase uint64) error {
 	})
 }
 
+func (v *VM) SetFreeBSDLongMode(entry, stack, pagingBase uint64) error {
+	if v == nil || len(v.vcpus) == 0 {
+		return fmt.Errorf("missing bootstrap vcpu")
+	}
+	if err := v.setupFreeBSDPageTables(pagingBase, 4); err != nil {
+		return err
+	}
+	bsp := v.vcpus[0]
+	sregs, err := getSRegs(bsp.fd)
+	if err != nil {
+		return err
+	}
+	const (
+		cr0PE   = 1 << 0
+		cr0MP   = 1 << 1
+		cr0ET   = 1 << 4
+		cr0NE   = 1 << 5
+		cr0WP   = 1 << 16
+		cr0AM   = 1 << 18
+		cr0PG   = 1 << 31
+		cr4PAE  = 1 << 5
+		eferLME = 1 << 8
+		eferLMA = 1 << 10
+	)
+	sregs.Cr3 = pagingBase
+	sregs.Cr4 |= cr4PAE
+	sregs.Cr0 |= cr0PE | cr0MP | cr0ET | cr0NE | cr0WP | cr0AM | cr0PG
+	sregs.Efer = eferLME | eferLMA
+
+	code := kvmSegment{Base: 0, Limit: 0xffffffff, Selector: 0x8, Type: 11, Present: 1, S: 1, L: 1, G: 1}
+	data := kvmSegment{Base: 0, Limit: 0xffffffff, Selector: 0x10, Type: 3, Present: 1, S: 1, Db: 1, G: 1}
+	sregs.Cs = code
+	sregs.Ds = data
+	sregs.Es = data
+	sregs.Fs = data
+	sregs.Gs = data
+	sregs.Ss = data
+	if err := setSRegs(bsp.fd, &sregs); err != nil {
+		return err
+	}
+	return setRegs(bsp.fd, &kvmRegs{
+		Rip:    entry,
+		Rsp:    stack,
+		Rflags: 0x2,
+	})
+}
+
 func (v *VM) SetProtectedMode32(entry, stack uint64) error {
 	if v == nil || len(v.vcpus) == 0 {
 		return fmt.Errorf("missing bootstrap vcpu")
@@ -669,6 +716,31 @@ func (v *VM) setupPageTables(pagingBase uint64, giB int) error {
 			phys := (uint64(g) << 30) | (uint64(i) << 21)
 			put64(pd+uint64(i)*8, phys|p|rw|us|ps)
 		}
+	}
+	return nil
+}
+
+func (v *VM) setupFreeBSDPageTables(pagingBase uint64, giB int) error {
+	if pagingBase+0x3000 > uint64(len(v.mem)) {
+		return fmt.Errorf("paging structures do not fit")
+	}
+	put64 := func(addr, value uint64) {
+		binary.LittleEndian.PutUint64(v.mem[addr:addr+8], value)
+	}
+	pml4 := pagingBase
+	pdpt := pagingBase + 0x1000
+	pd := pagingBase + 0x2000
+	const (
+		p  = 1 << 0
+		rw = 1 << 1
+		us = 1 << 2
+		ps = 1 << 7
+	)
+	for i := 0; i < 512; i++ {
+		put64(pml4+uint64(i)*8, pdpt|p|rw|us)
+		put64(pdpt+uint64(i)*8, pd|p|rw|us)
+		phys := uint64(i) << 21
+		put64(pd+uint64(i)*8, phys|p|rw|us|ps)
 	}
 	return nil
 }

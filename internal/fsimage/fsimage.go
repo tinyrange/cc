@@ -30,6 +30,7 @@ type Options struct {
 	ExtraBytes        int64
 	DeterministicTime time.Time
 	Ext4UUID          ext4.UUID
+	FFSLayout         ffsimage.Layout
 	FATType           string
 	FATVolumeSerial   *uint32
 }
@@ -140,6 +141,7 @@ func ffsOptions(opts Options) ffsimage.Options {
 		SizeBytes:         opts.SizeBytes,
 		ExtraBytes:        opts.ExtraBytes,
 		DeterministicTime: opts.DeterministicTime,
+		Layout:            opts.FFSLayout,
 	}
 }
 

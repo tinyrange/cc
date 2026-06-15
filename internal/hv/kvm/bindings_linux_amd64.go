@@ -32,6 +32,7 @@ const (
 	kvmSetSregs            = 0x4138ae84
 	kvmSetMSRS             = 0x4008ae89
 	kvmSetCpuid2           = 0x4008ae90
+	kvmGetTSCKHz           = 0xaea3
 )
 
 const (
@@ -141,6 +142,17 @@ func getSupportedCPUID(kvmFd int) (*kvmCPUID2, error) {
 func setVCPUID(vcpuFd int, cpuid *kvmCPUID2) error {
 	_, err := ioctlWithRetry(uintptr(vcpuFd), uint64(kvmSetCpuid2), uintptr(unsafe.Pointer(cpuid)))
 	return err
+}
+
+func getVCPUTSCKHz(vcpuFd int) (uint32, error) {
+	value, err := ioctlInt(vcpuFd, kvmGetTSCKHz)
+	if err != nil {
+		return 0, err
+	}
+	if value <= 0 {
+		return 0, unix.EINVAL
+	}
+	return uint32(value), nil
 }
 
 func setVCPUMSR(vcpuFd int, index uint32, value uint64) error {
@@ -268,6 +280,39 @@ func setCPUIDBrandString(cpuid *kvmCPUID2, brand string) {
 		entry.Ecx = le32(encoded[off+8:])
 		entry.Edx = le32(encoded[off+12:])
 	}
+}
+
+func setCPUIDKVMHypervisorFrequency(cpuid *kvmCPUID2, tscKHz uint32) {
+	if cpuid == nil || tscKHz == 0 {
+		return
+	}
+	base := ensureCPUIDEntry(cpuid, 0x40000000, 0)
+	if base == nil {
+		return
+	}
+	base.Flags &^= kvmCPUIDFlagSignificantIndex
+	if base.Eax < 0x40000010 {
+		base.Eax = 0x40000010
+	}
+	copyCPUIDString12(base, "KVMKVMKVM\x00\x00\x00")
+
+	frequency := ensureCPUIDEntry(cpuid, 0x40000010, 0)
+	if frequency == nil {
+		return
+	}
+	frequency.Flags &^= kvmCPUIDFlagSignificantIndex
+	frequency.Eax = tscKHz
+	frequency.Ebx = 0
+	frequency.Ecx = 0
+	frequency.Edx = 0
+}
+
+func copyCPUIDString12(entry *kvmCPUIDEntry2, value string) {
+	var encoded [12]byte
+	copy(encoded[:], value)
+	entry.Ebx = le32(encoded[0:])
+	entry.Ecx = le32(encoded[4:])
+	entry.Edx = le32(encoded[8:])
 }
 
 func hostCPUBrandString() string {

@@ -79,6 +79,71 @@ func TestBuildFFSWritesOpenBSDRoot(t *testing.T) {
 	}
 }
 
+func TestBuildFFSRawLayoutStartsAtBlockDeviceRoot(t *testing.T) {
+	root := t.TempDir()
+	mustMkdir(t, filepath.Join(root, "sbin"))
+	mustWriteMode(t, filepath.Join(root, "sbin", "init"), "hello freebsd\n", 0o755)
+	img, err := Build(context.Background(), imagefs.NewHostFS(root, nil), Options{
+		SizeBytes:         16 << 20,
+		DeterministicTime: time.Unix(1234, 0),
+		Layout:            LayoutRaw,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, img.Size())
+	if _, err := img.ReadAt(data, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := binary.LittleEndian.Uint32(data[ffsSBOFF+1372 : ffsSBOFF+1376]); got != ffsMagic {
+		t.Fatalf("raw superblock magic = %#x, want %#x", got, ffsMagic)
+	}
+	labelOff := ffsPartLBA*ffsSectorSize + ffsSectorSize
+	if got := binary.LittleEndian.Uint32(data[labelOff : labelOff+4]); got == dlMagic {
+		t.Fatalf("raw layout unexpectedly wrote OpenBSD disklabel magic %#x", got)
+	}
+	reader := newRawFFSTestReader(t, data)
+	initIno := reader.lookupPath("/sbin/init")
+	if got := string(reader.fileData(initIno)); got != "hello freebsd\n" {
+		t.Fatalf("/sbin/init contents = %q", got)
+	}
+}
+
+func TestBuildFFSRawLayoutLargeCylinderGroupsAtFreeBSDOffsets(t *testing.T) {
+	root := t.TempDir()
+	mustMkdir(t, filepath.Join(root, "sbin"))
+	mustWriteMode(t, filepath.Join(root, "sbin", "init"), "hello freebsd\n", 0o755)
+	img, err := Build(context.Background(), imagefs.NewHostFS(root, nil), Options{
+		SizeBytes:         5 << 30,
+		DeterministicTime: time.Unix(1234, 0),
+		Layout:            LayoutRaw,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sb [ffsBSize]byte
+	if _, err := img.ReadAt(sb[:], ffsSBOFF); err != nil {
+		t.Fatal(err)
+	}
+	fpg := binary.LittleEndian.Uint32(sb[188:192])
+	if fpg == 0 {
+		t.Fatal("superblock fs_fpg is zero")
+	}
+	for cgx := uint32(0); cgx < 4; cgx++ {
+		var cg [ffsBSize]byte
+		off := int64((cgx*fpg + ffsCBlkNo) * ffsFSize)
+		if _, err := img.ReadAt(cg[:], off); err != nil {
+			t.Fatalf("read cg %d at %d: %v", cgx, off, err)
+		}
+		if got := binary.LittleEndian.Uint32(cg[4:8]); got != cgMagic {
+			t.Fatalf("cg %d magic at FreeBSD offset = %#x, want %#x", cgx, got, cgMagic)
+		}
+		if got := binary.LittleEndian.Uint32(cg[12:16]); got != cgx {
+			t.Fatalf("cg %d cgx at FreeBSD offset = %d", cgx, got)
+		}
+	}
+}
+
 func TestBuildFFSLazilyMapsRegularFiles(t *testing.T) {
 	file := &lazyTestFile{data: []byte("lazy payload\n")}
 	root := lazyTestDir{entries: map[string]imagefs.Entry{
@@ -445,6 +510,20 @@ type ffsTestReader struct {
 func newFFSTestReader(t *testing.T, data []byte) *ffsTestReader {
 	t.Helper()
 	return newFFSTestReaderAt(t, bytes.NewReader(data))
+}
+
+func newRawFFSTestReader(t *testing.T, data []byte) *ffsTestReader {
+	t.Helper()
+	sb := make([]byte, ffsSBOFF+192)
+	copy(sb, data[:len(sb)])
+	return &ffsTestReader{
+		t:     t,
+		data:  bytes.NewReader(data),
+		base:  0,
+		fsize: int(binary.LittleEndian.Uint32(sb[ffsSBOFF+52 : ffsSBOFF+56])),
+		ipg:   binary.LittleEndian.Uint32(sb[ffsSBOFF+184 : ffsSBOFF+188]),
+		fpg:   binary.LittleEndian.Uint32(sb[ffsSBOFF+188 : ffsSBOFF+192]),
+	}
 }
 
 func newFFSTestReaderAt(t *testing.T, data io.ReaderAt) *ffsTestReader {

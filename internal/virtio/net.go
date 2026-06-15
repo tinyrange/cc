@@ -23,7 +23,8 @@ const (
 	netHdrFlagNeedsChecksum = 1
 
 	netStatusLinkUp      = 1
-	netHeaderLen         = 12
+	netHeaderLen         = 10
+	netHeaderLenMergeRX  = 12
 	maxNetPacketPoolSize = 256 * 1024
 )
 
@@ -49,6 +50,7 @@ type Net struct {
 	IRQ  uint32
 	MAC  net.HardwareAddr
 
+	DisableMergeRX   bool
 	mu               sync.Mutex
 	mem              GuestMemory
 	irq              IRQController
@@ -124,7 +126,7 @@ func (n *Net) Read(addr uint64, size int) (uint64, error) {
 	case regVendorID:
 		return truncateValue(mmioVendorID, size), nil
 	case regDeviceFeatures:
-		features := featureVersion1 | netFeatureMAC | netFeatureStatus | netFeatureMergeRX
+		features := n.deviceFeaturesLocked()
 		if n.deviceFeatureSel == 0 {
 			return truncateValue(features, size), nil
 		}
@@ -415,13 +417,14 @@ func (n *Net) processTXLocked(packets []netTXPacket) ([]netTXPacket, error) {
 			return nil, err
 		}
 		releaseData := data
-		if len(data) >= netHeaderLen {
-			if err := fixTXChecksum(data); err != nil {
+		headerLen := n.netHeaderLenLocked()
+		if len(data) >= headerLen {
+			if err := fixTXChecksum(data, headerLen); err != nil {
 				releaseNetPacketBuffer(releaseData)
 				releaseNetTXPackets(packets)
 				return nil, err
 			}
-			packet := data[netHeaderLen:]
+			packet := data[headerLen:]
 			if n.backend != nil {
 				if len(packets) == cap(packets) {
 					releaseNetPacketBuffer(releaseData)
@@ -543,9 +546,12 @@ func (n *Net) readChainLocked(q *queue, head uint16, writable bool) ([]byte, err
 }
 
 func (n *Net) writeRXPacketLocked(q *queue, head uint16, packet []byte) (uint32, error) {
-	var hdr [netHeaderLen]byte
-	binary.LittleEndian.PutUint16(hdr[10:12], 1)
-	totalLen := netHeaderLen + len(packet)
+	headerLen := n.netHeaderLenLocked()
+	var hdr [netHeaderLenMergeRX]byte
+	if headerLen == netHeaderLenMergeRX {
+		binary.LittleEndian.PutUint16(hdr[10:12], 1)
+	}
+	totalLen := headerLen + len(packet)
 	offset := 0
 	index := head
 	for i := uint16(0); i < q.size; i++ {
@@ -554,7 +560,7 @@ func (n *Net) writeRXPacketLocked(q *queue, head uint16, packet []byte) (uint32,
 			return uint32(offset), err
 		}
 		if desc.flags&descFWrite != 0 && desc.length > 0 && offset < totalLen {
-			written, err := n.writeRXChunk(desc.addr, int(desc.length), hdr[:], packet, offset)
+			written, err := n.writeRXChunk(desc.addr, int(desc.length), hdr[:headerLen], packet, offset)
 			if err != nil {
 				return uint32(offset), err
 			}
@@ -683,7 +689,22 @@ func (n *Net) configBytesLocked() []byte {
 }
 
 func (n *Net) legacyFeaturesLocked() uint64 {
-	return netFeatureMAC | netFeatureStatus | netFeatureMergeRX
+	return n.deviceFeaturesLocked() &^ featureVersion1
+}
+
+func (n *Net) deviceFeaturesLocked() uint64 {
+	features := featureVersion1 | netFeatureMAC | netFeatureStatus
+	if !n.DisableMergeRX {
+		features |= netFeatureMergeRX
+	}
+	return features
+}
+
+func (n *Net) netHeaderLenLocked() int {
+	if n.driverFeatures&netFeatureMergeRX != 0 {
+		return netHeaderLenMergeRX
+	}
+	return netHeaderLen
 }
 
 func (n *Net) resetLocked() {
@@ -700,8 +721,8 @@ func (n *Net) resetLocked() {
 	n.pendingRx = nil
 }
 
-func fixTXChecksum(frame []byte) error {
-	if len(frame) < netHeaderLen {
+func fixTXChecksum(frame []byte, headerLen int) error {
+	if len(frame) < headerLen {
 		return nil
 	}
 	flags := frame[0]
@@ -710,7 +731,7 @@ func fixTXChecksum(frame []byte) error {
 	}
 	csumStart := int(binary.LittleEndian.Uint16(frame[6:8]))
 	csumOffset := int(binary.LittleEndian.Uint16(frame[8:10]))
-	packet := frame[netHeaderLen:]
+	packet := frame[headerLen:]
 	if csumStart < 0 || csumStart >= len(packet) || csumStart+csumOffset+2 > len(packet) {
 		return fmt.Errorf("virtio-net checksum range out of packet: start=%d offset=%d len=%d", csumStart, csumOffset, len(packet))
 	}

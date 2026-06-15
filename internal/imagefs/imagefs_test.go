@@ -144,6 +144,44 @@ func TestTarFSKeepsImplicitDirectoryChildrenWhenDirectoryHeaderAppearsLater(t *t
 	}
 }
 
+func TestSeekableTarFSReadsPayloadsFromTarFile(t *testing.T) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	mustWriteTarFile(t, tw, "bin/tool", "tool payload")
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     "bin/tool-hardlink",
+		Typeflag: tar.TypeLink,
+		Mode:     0o644,
+		Linkname: "bin/tool",
+	}); err != nil {
+		t.Fatalf("write hardlink header: %v", err)
+	}
+	mustWriteTarFile(t, tw, "etc/config", "config payload")
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar: %v", err)
+	}
+	tarPath := filepath.Join(t.TempDir(), "root.tar")
+	if err := os.WriteFile(tarPath, buf.Bytes(), 0o644); err != nil {
+		t.Fatalf("write tar: %v", err)
+	}
+
+	tfs, err := NewSeekableTarFS(context.Background(), tarPath)
+	if err != nil {
+		t.Fatalf("read seekable tarfs: %v", err)
+	}
+	defer tfs.Close()
+	root := tfs.Root()
+	if got := readFile(t, root, "/bin/tool"); got != "tool payload" {
+		t.Fatalf("tool = %q", got)
+	}
+	if got := readFile(t, root, "/bin/tool-hardlink"); got != "tool payload" {
+		t.Fatalf("hardlink = %q", got)
+	}
+	if got := readFile(t, root, "/etc/config"); got != "config payload" {
+		t.Fatalf("config = %q", got)
+	}
+}
+
 func direntNames(entries []DirEnt) string {
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {

@@ -26,6 +26,7 @@ import (
 	"golang.org/x/net/websocket"
 	"j5.nz/cc/client"
 	intcvmfs "j5.nz/cc/internal/cvmfs"
+	freebsdrootfs "j5.nz/cc/internal/freebsd/rootfs"
 	"j5.nz/cc/internal/hv/hvf"
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/macos"
@@ -33,6 +34,10 @@ import (
 	openbsdrootfs "j5.nz/cc/internal/openbsd/rootfs"
 	"j5.nz/cc/internal/vm"
 )
+
+func isBuiltInBSDImage(name string) bool {
+	return openbsdrootfs.IsBuiltInImage(name) || freebsdrootfs.IsBuiltInImage(name)
+}
 
 var debugTiming = strings.TrimSpace(os.Getenv("CCX3_DEBUG_TIMING")) != ""
 var debugPprof = strings.TrimSpace(os.Getenv("CCX3_DEBUG_PPROF")) != ""
@@ -1124,9 +1129,9 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 		defer cancel()
 		timingLog("POST /vm/start decode took=%s", time.Since(start))
 		var startImage *oci.Image
-		openBSDImage := openbsdrootfs.IsBuiltInImage(req.Image)
+		builtInBSDImage := isBuiltInBSDImage(req.Image)
 		if imageName := strings.TrimSpace(req.Image); imageName != "" {
-			if openBSDImage {
+			if builtInBSDImage {
 				if wantsBootEventStream(r) {
 					writeBootEvent(w, client.BootEvent{Kind: "status", Message: fmt.Sprintf("validated image %s", imageName)})
 				}
@@ -1163,7 +1168,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			writeError(w, http.StatusServiceUnavailable, err)
 			return
 		}
-		if !openBSDImage && srvState.kernel.Status().Status != "downloaded" {
+		if !builtInBSDImage && srvState.kernel.Status().Status != "downloaded" {
 			if wantsBootEventStream(r) {
 				writeBootEvent(w, client.BootEvent{Kind: "status", Message: "ensuring kernel is available"})
 			}
@@ -1260,8 +1265,8 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 		bootCtx, cancel := context.WithTimeout(r.Context(), bootTimeout)
 		defer cancel()
 		timingLog("POST /vm decode took=%s image=%q", time.Since(start), req.Image)
-		openBSDImage := openbsdrootfs.IsBuiltInImage(req.Image)
-		if !openBSDImage {
+		builtInBSDImage := isBuiltInBSDImage(req.Image)
+		if !builtInBSDImage {
 			if _, err := srvState.images.Get(req.Image); err != nil {
 				if wantsBootEventStream(r) {
 					writeBootEvent(w, client.BootEvent{Kind: "error", Error: fmt.Sprintf("image %q is not available", req.Image)})
@@ -1285,7 +1290,7 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			writeError(w, http.StatusServiceUnavailable, err)
 			return
 		}
-		if !openBSDImage && srvState.kernel.Status().Status != "downloaded" {
+		if !builtInBSDImage && srvState.kernel.Status().Status != "downloaded" {
 			if wantsBootEventStream(r) {
 				writeBootEvent(w, client.BootEvent{Kind: "status", Message: "ensuring kernel is available"})
 			}
@@ -1408,14 +1413,14 @@ func newMux(srvState *server, watchdog *watchdogController, shutdown func()) *ht
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
-		openBSDImage := openbsdrootfs.IsBuiltInImage(req.Image)
-		if req.Image != "" && !openBSDImage {
+		builtInBSDImage := isBuiltInBSDImage(req.Image)
+		if req.Image != "" && !builtInBSDImage {
 			if _, err := srvState.images.Open(req.Image); err != nil {
 				writeError(w, http.StatusBadRequest, fmt.Errorf("image %q is not available", req.Image))
 				return
 			}
 		}
-		if !openBSDImage && srvState.kernel.Status().Status != "downloaded" && (req.Image != "" || srvState.vms.Status().Status == "running") {
+		if !builtInBSDImage && srvState.kernel.Status().Status != "downloaded" && (req.Image != "" || srvState.vms.Status().Status == "running") {
 			if err := srvState.kernel.Ensure(r.Context()); err != nil {
 				writeError(w, http.StatusInternalServerError, err)
 				return
