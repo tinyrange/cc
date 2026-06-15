@@ -14,6 +14,7 @@ const (
 
 	pciVendorQumranet = 0x1af4
 
+	pciVirtioNetDeviceID   = 0x1000
 	pciVirtioBlockDeviceID = 0x1001
 )
 
@@ -67,6 +68,25 @@ func NewVirtioBlockPCIDevice(dev uint8, ioBase uint16, irq uint8, block *virtio.
 		IOBAR:       uint32(ioBase),
 		IOSize:      0x100,
 		legacyIO:    block,
+	}
+}
+
+func NewVirtioNetPCIDevice(dev uint8, ioBase uint16, irq uint8, netdev *virtio.Net) *PCIDevice {
+	if netdev != nil {
+		netdev.IRQ = uint32(irq)
+	}
+	return &PCIDevice{
+		Device:      dev,
+		VendorID:    pciVendorQumranet,
+		DeviceID:    pciVirtioNetDeviceID,
+		SubsystemID: 1,
+		Class:       0x02,
+		Subclass:    0x00,
+		IRQLine:     irq,
+		IRQPin:      1,
+		IOBAR:       uint32(ioBase),
+		IOSize:      0x100,
+		legacyIO:    netdev,
 	}
 }
 

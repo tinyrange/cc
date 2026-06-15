@@ -125,13 +125,21 @@ func (vm *VirtualMemory) mapFragment(region MemoryRegion, offset int64) error {
 	regionIndex := offset / int64(vm.pageSize)
 	regionOffset := offset % int64(vm.pageSize)
 
-	existingRegion := vm.pages.Get(uint64(regionIndex))
+	existingRegion := vm.writePages.Get(uint64(regionIndex))
+	if existingRegion == nil {
+		existingRegion = vm.pages.Get(uint64(regionIndex))
+	}
 	if existingRegion != nil {
 		// if a region already exists then check if it's a fragmentedRegion.
 		if frag, ok := existingRegion.(*fragmentedRegion); ok {
 			// If it's already a fragmentedRegion then map the new part.
 
-			return frag.mapFragment(region, regionOffset)
+			if err := frag.mapFragment(region, regionOffset); err != nil {
+				return err
+			}
+			vm.pages.Set(uint64(regionIndex), frag)
+			vm.writePages.Set(uint64(regionIndex), nil)
+			return nil
 		} else {
 			// Otherwise it's something else.
 
@@ -156,6 +164,7 @@ func (vm *VirtualMemory) mapFragment(region MemoryRegion, offset int64) error {
 			// slog.Info("", "newFrag", newFrag)
 
 			vm.pages.Set(uint64(regionIndex), newFrag)
+			vm.writePages.Set(uint64(regionIndex), nil)
 
 			return nil
 		}
@@ -167,6 +176,7 @@ func (vm *VirtualMemory) mapFragment(region MemoryRegion, offset int64) error {
 		}
 
 		vm.pages.Set(uint64(regionIndex), newFrag)
+		vm.writePages.Set(uint64(regionIndex), nil)
 
 		return nil
 	}
@@ -182,6 +192,7 @@ func (vm *VirtualMemory) mapRegion(region MemoryRegion, offset int64) error {
 	index := offset / int64(vm.pageSize)
 
 	vm.pages.Set(uint64(index), region)
+	vm.writePages.Set(uint64(index), nil)
 
 	return nil
 }
@@ -380,7 +391,11 @@ func (vm *VirtualMemory) ReadAt(p []byte, off int64) (n int, err error) {
 
 		if region != nil {
 			// If the region exists then forward the read to the region.
-			readSize, err = region.ReadAt(p, regionOffset)
+			end := int64(vm.pageSize)
+			if int64(len(p))+regionOffset < end {
+				end = int64(len(p)) + regionOffset
+			}
+			readSize, err = region.ReadAt(p[:end-regionOffset], regionOffset)
 			if err != nil {
 				return 0, err
 			}
@@ -424,7 +439,11 @@ func (vm *VirtualMemory) WriteAt(p []byte, off int64) (n int, err error) {
 
 		if region != nil {
 			// If the region exists then forward the write to the region.
-			writeSize, err = region.WriteAt(p, regionOffset)
+			end := int64(vm.pageSize)
+			if int64(len(p))+regionOffset < end {
+				end = int64(len(p)) + regionOffset
+			}
+			writeSize, err = region.WriteAt(p[:end-regionOffset], regionOffset)
 			if err != nil {
 				slog.Error("VirtualMemory WriteAt Error", "len", len(p), "off", off, "regionOffset", regionOffset)
 				return 0, err

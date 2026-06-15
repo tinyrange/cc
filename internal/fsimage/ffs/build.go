@@ -35,6 +35,8 @@ const (
 	ffsInodeSize  = 128
 	ffsInopb      = ffsBSize / ffsInodeSize
 	ffsNindir     = ffsBSize / 4
+	ffsNDaddr     = 12
+	ffsNIaddr     = 3
 
 	ffsSBOFF   = 8192
 	ffsPartLBA = 1024
@@ -71,11 +73,11 @@ type Superblock [8192]byte
 
 func (s *Superblock) setU32(off int, v uint32) { binary.LittleEndian.PutUint32(s[off:off+4], v) }
 func (s *Superblock) setU64(off int, v uint64) { binary.LittleEndian.PutUint64(s[off:off+8], v) }
-func (s *Superblock) SetBlockLayout() {
+func (s *Superblock) SetBlockLayout(dataStart uint32) {
 	s.setU32(8, ffsSBlkNo)
 	s.setU32(12, ffsCBlkNo)
 	s.setU32(16, ffsIBlkNo)
-	s.setU32(20, ffsDBlkNo)
+	s.setU32(20, dataStart)
 	s.setU32(48, ffsBSize)
 	s.setU32(52, ffsFSize)
 	s.setU32(56, ffsFrag)
@@ -104,13 +106,13 @@ func (s *Superblock) SetSize(fsSize, dsize uint32) {
 	s.setU64(1080, uint64(fsSize))
 	s.setU64(1088, uint64(dsize))
 }
-func (s *Superblock) SetCylinderGroups(ipg, fpg uint32) {
+func (s *Superblock) SetCylinderGroups(ipg, fpg, dataStart uint32) {
 	s.setU32(44, 1)
 	s.setU32(176, (fpg+63)/64)
 	s.setU32(180, 1)
 	s.setU32(184, 16)
 	s.setU32(188, ipg)
-	s.setU32(1096, ffsDBlkNo)
+	s.setU32(1096, dataStart)
 }
 func (s *Superblock) SetSummary(ndir, nbfree, nifree, nffree uint32) {
 	s.setU32(196, ndir)
@@ -305,7 +307,9 @@ type ffsNode struct {
 	parent   *ffsNode
 	children []*ffsNode
 	blocks   []uint32
-	indirect uint32
+	indir    [ffsNIaddr]uint32
+	indir2   []uint32
+	nlink    int
 }
 
 type ffsBuilder struct {
@@ -316,11 +320,15 @@ type ffsBuilder struct {
 	fsOffset  int64
 	fsSize    int64
 	fsFrags   uint32
+	dataStart uint32
 	nextIno   uint32
 	nextFrag  uint32
 	usedFrags []bool
 	usedInos  []bool
 	now       int64
+	hardlinks map[string]*ffsNode
+	assigned  map[uint32]bool
+	written   map[uint32]bool
 }
 
 func Build(ctx context.Context, root imagefs.Directory, opts Options) (*ffsimgvm.VirtualMemory, error) {
@@ -356,6 +364,9 @@ func Build(ctx context.Context, root imagefs.Directory, opts Options) (*ffsimgvm
 		nextFrag:  ffsDBlkNo,
 		usedFrags: make([]bool, uint32(fsSize/ffsFSize)),
 		now:       time.Now().Unix(),
+		hardlinks: make(map[string]*ffsNode),
+		assigned:  make(map[uint32]bool),
+		written:   make(map[uint32]bool),
 	}
 	if !opts.DeterministicTime.IsZero() {
 		b.now = opts.DeterministicTime.Unix()
@@ -366,11 +377,14 @@ func Build(ctx context.Context, root imagefs.Directory, opts Options) (*ffsimgvm
 		ipg = ffsInopb
 	}
 	inodeFrags := (ipg * ffsInodeSize) / ffsFSize
-	if ffsIBlkNo+inodeFrags > ffsDBlkNo {
-		return nil, fmt.Errorf("too many inodes for single-cylinder-group FFS image: %d", ipg)
+	dataStart := roundUpFrag(ffsIBlkNo+inodeFrags, ffsFrag)
+	if dataStart >= b.fsFrags {
+		return nil, fmt.Errorf("too many inodes for FFS image: %d", ipg)
 	}
+	b.dataStart = dataStart
+	b.nextFrag = dataStart
 	b.usedInos = make([]bool, ipg)
-	for frag := uint32(0); frag < ffsDBlkNo; frag++ {
+	for frag := uint32(0); frag < b.dataStart; frag++ {
 		b.usedFrags[frag] = true
 	}
 
@@ -493,6 +507,20 @@ func (b *ffsBuilder) collectEntry(entry imagefs.Entry, guestPath string, parent 
 	case entry.File != nil:
 		size, mode := entry.File.Stat()
 		uid, gid := entry.File.Owner()
+		if hardlink, ok := entry.File.(imagefs.HardlinkFile); ok {
+			if key := strings.TrimSpace(hardlink.HardlinkKey()); key != "" {
+				if master := b.hardlinks[key]; master != nil {
+					master.nlink++
+					return &ffsNode{name: name, ino: master.ino, mode: master.mode, uid: master.uid, gid: master.gid, rdev: master.rdev, file: master.file, parent: parent, size: master.size, modTime: master.modTime, nlink: master.nlink}, nil
+				}
+				node := &ffsNode{name: name, ino: b.allocIno(), mode: goModeToFFS(mode), uid: uid, gid: gid, rdev: entry.File.RDev(), file: entry.File, parent: parent, size: size, modTime: entry.File.ModTime(), nlink: 1}
+				if node.mode&ifmt == ifreg && mode.Type() != 0 {
+					return nil, fmt.Errorf("%s has unsupported file type %s for FFS filesystem", guestPath, mode.Type())
+				}
+				b.hardlinks[key] = node
+				return node, nil
+			}
+		}
 		node := &ffsNode{name: name, ino: b.allocIno(), mode: goModeToFFS(mode), uid: uid, gid: gid, rdev: entry.File.RDev(), file: entry.File, parent: parent, size: size, modTime: entry.File.ModTime()}
 		if node.mode&ifmt == ifreg && mode.Type() != 0 {
 			return nil, fmt.Errorf("%s has unsupported file type %s for FFS filesystem", guestPath, mode.Type())
@@ -513,6 +541,10 @@ func (b *ffsBuilder) allocIno() uint32 {
 }
 
 func (b *ffsBuilder) assignData(node *ffsNode) error {
+	if b.assigned[node.ino] {
+		return nil
+	}
+	b.assigned[node.ino] = true
 	switch node.mode & ifmt {
 	case ifdir:
 		data := encodeFFSDir(node)
@@ -525,13 +557,36 @@ func (b *ffsBuilder) assignData(node *ffsNode) error {
 			node.blocks = b.allocBlocksForSize(uint64(len(node.target)))
 		}
 	}
-	if len(node.blocks) > 12 {
-		node.indirect = b.allocBlock()
+	if err := b.allocIndirectBlocks(node); err != nil {
+		return err
 	}
 	for _, child := range node.children {
 		if err := b.assignData(child); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func (b *ffsBuilder) allocIndirectBlocks(node *ffsNode) error {
+	blocks := len(node.blocks)
+	if blocks <= ffsNDaddr {
+		return nil
+	}
+	remaining := blocks - ffsNDaddr
+	node.indir[0] = b.allocBlock()
+	if remaining <= ffsNindir {
+		return nil
+	}
+	remaining -= ffsNindir
+	node.indir[1] = b.allocBlock()
+	count := (remaining + ffsNindir - 1) / ffsNindir
+	if count > ffsNindir {
+		return fmt.Errorf("%s is too large for FFS double-indirect writer: %d blocks", node.name, blocks)
+	}
+	node.indir2 = make([]uint32, count)
+	for i := range node.indir2 {
+		node.indir2[i] = b.allocBlock()
 	}
 	return nil
 }
@@ -574,22 +629,25 @@ func (b *ffsBuilder) allocBlock() uint32 {
 }
 
 func (b *ffsBuilder) writeTree(node *ffsNode) error {
-	if node.mode&ifmt == ifdir {
-		if err := b.writeNodeData(node, encodeFFSDir(node)); err != nil {
-			return err
+	if !b.written[node.ino] {
+		b.written[node.ino] = true
+		if node.mode&ifmt == ifdir {
+			if err := b.writeNodeData(node, encodeFFSDir(node)); err != nil {
+				return err
+			}
 		}
-	}
-	if node.mode&ifmt == ifreg {
-		if err := b.writeFileData(node); err != nil {
-			return err
+		if node.mode&ifmt == ifreg {
+			if err := b.writeFileData(node); err != nil {
+				return err
+			}
 		}
-	}
-	if node.mode&ifmt == iflnk && len(node.target) > 60 {
-		if err := b.writeNodeData(node, []byte(node.target)); err != nil {
-			return err
+		if node.mode&ifmt == iflnk && len(node.target) > 60 {
+			if err := b.writeNodeData(node, []byte(node.target)); err != nil {
+				return err
+			}
 		}
+		b.writeInode(node)
 	}
-	b.writeInode(node)
 	for _, child := range node.children {
 		if err := b.writeTree(child); err != nil {
 			return err
@@ -678,27 +736,75 @@ func (b *ffsBuilder) writeInode(node *ffsNode) {
 	} else if node.mode&ifmt == ifchr || node.mode&ifmt == ifblk {
 		ino.SetRDev(node.rdev)
 	} else {
-		for i := 0; i < len(node.blocks) && i < 12; i++ {
+		for i := 0; i < len(node.blocks) && i < ffsNDaddr; i++ {
 			ino.SetDirectBlock(i, node.blocks[i])
 		}
-		if node.indirect != 0 {
-			ino.SetIndirectBlock(0, node.indirect)
-			var indirect [ffsBSize]byte
-			for i, block := range node.blocks[12:] {
-				binary.LittleEndian.PutUint32(indirect[i*4:i*4+4], block)
+		for i, block := range node.indir {
+			if block != 0 {
+				ino.SetIndirectBlock(i, block)
 			}
-			_, _ = b.vm.WriteAt(indirect[:], b.fsOffset+int64(node.indirect)*ffsFSize)
 		}
+		b.writeIndirectBlocks(node)
 	}
-	ino.SetBlocks(uint32(len(node.blocks) * ffsBSize / ffsSectorSize))
+	ino.SetBlocks(uint32((len(node.blocks) + b.indirectBlockCount(node)) * ffsBSize / ffsSectorSize))
 	ino.SetGeneration(node.ino*1103515245 + 12345)
 	ino.SetUID(node.uid)
 	ino.SetGID(node.gid)
 	_, _ = b.vm.WriteAt(ino[:], b.fsOffset+int64(ffsIBlkNo*ffsFSize+node.ino*ffsInodeSize))
 }
 
+func (b *ffsBuilder) writeIndirectBlocks(node *ffsNode) {
+	if node.indir[0] != 0 {
+		var indirect [ffsBSize]byte
+		start := ffsNDaddr
+		end := start + ffsNindir
+		if end > len(node.blocks) {
+			end = len(node.blocks)
+		}
+		for i, block := range node.blocks[start:end] {
+			binary.LittleEndian.PutUint32(indirect[i*4:i*4+4], block)
+		}
+		_, _ = b.vm.WriteAt(indirect[:], b.fsOffset+int64(node.indir[0])*ffsFSize)
+	}
+	if node.indir[1] != 0 {
+		var root [ffsBSize]byte
+		for i, block := range node.indir2 {
+			binary.LittleEndian.PutUint32(root[i*4:i*4+4], block)
+		}
+		_, _ = b.vm.WriteAt(root[:], b.fsOffset+int64(node.indir[1])*ffsFSize)
+
+		start := ffsNDaddr + ffsNindir
+		for i, indirectBlock := range node.indir2 {
+			var indirect [ffsBSize]byte
+			blockStart := start + i*ffsNindir
+			blockEnd := blockStart + ffsNindir
+			if blockEnd > len(node.blocks) {
+				blockEnd = len(node.blocks)
+			}
+			for j, block := range node.blocks[blockStart:blockEnd] {
+				binary.LittleEndian.PutUint32(indirect[j*4:j*4+4], block)
+			}
+			_, _ = b.vm.WriteAt(indirect[:], b.fsOffset+int64(indirectBlock)*ffsFSize)
+		}
+	}
+}
+
+func (b *ffsBuilder) indirectBlockCount(node *ffsNode) int {
+	n := 0
+	for _, block := range node.indir {
+		if block != 0 {
+			n++
+		}
+	}
+	n += len(node.indir2)
+	return n
+}
+
 func (b *ffsBuilder) linkCount(node *ffsNode) int {
 	if node.mode&ifmt != ifdir {
+		if node.nlink > 0 {
+			return node.nlink
+		}
 		return 1
 	}
 	n := 2
@@ -713,15 +819,15 @@ func (b *ffsBuilder) linkCount(node *ffsNode) int {
 func (b *ffsBuilder) writeSuperblocks(ipg uint32) {
 	var sb Superblock
 	fsSize := b.fsFrags
-	dsize := fsSize - ffsDBlkNo
+	dsize := fsSize - b.dataStart
 	nbfree, nffree := b.freeSummary()
 	ndir := uint32(countDirsFromInodes(b.usedInos))
 	nifree := uint32(len(b.usedInos)) - uint32(countUsedInos(b.usedInos))
-	sb.SetBlockLayout()
+	sb.SetBlockLayout(b.dataStart)
 	sb.SetOpenBSDDefaults()
 	sb.SetTimeAndID(b.now)
 	sb.SetSize(fsSize, dsize)
-	sb.SetCylinderGroups(ipg, fsSize)
+	sb.SetCylinderGroups(ipg, fsSize, b.dataStart)
 	sb.SetSummary(ndir, nbfree, nifree, nffree)
 	_, _ = b.vm.WriteAt(sb[:], b.fsOffset+ffsSBOFF)
 	_, _ = b.vm.WriteAt(sb[:], b.fsOffset+int64(ffsSBlkNo*ffsFSize))
@@ -777,7 +883,7 @@ func (b *ffsBuilder) writeMBR() {
 
 func (b *ffsBuilder) freeSummary() (uint32, uint32) {
 	var nbfree, nffree uint32
-	for frag := uint32(ffsDBlkNo); frag+ffsFrag <= b.fsFrags; frag += ffsFrag {
+	for frag := b.dataStart; frag+ffsFrag <= b.fsFrags; frag += ffsFrag {
 		free := true
 		for i := uint32(0); i < ffsFrag; i++ {
 			if b.usedFrags[frag+i] {

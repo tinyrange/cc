@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -183,6 +184,106 @@ func TestBootOpenBSD79RegularKernelWithGeneratedFFSRoot(t *testing.T) {
 	}
 }
 
+func TestBootOpenBSD79RegularKernelWithVirtioPCINet(t *testing.T) {
+	if os.Getenv("CC_TEST_OPENBSD_KVM") == "" {
+		t.Skip("set CC_TEST_OPENBSD_KVM=1 to run OpenBSD KVM boot smoke test")
+	}
+	kernelPath := filepath.Join("..", "..", "..", "local", "openbsd79-amd64", "bsd")
+	kernel, err := os.ReadFile(kernelPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			t.Skipf("OpenBSD fixture not present: %s", kernelPath)
+		}
+		t.Fatalf("read fixture: %v", err)
+	}
+	root := buildOpenBSDNetInitRoot(t)
+	region, err := fsimage.Build(context.Background(), root, fsimage.Options{
+		Type:              fsimage.TypeFFS,
+		SizeBytes:         128 << 20,
+		DeterministicTime: time.Unix(1700000000, 0),
+	})
+	if err != nil {
+		t.Fatalf("build FFS root: %v", err)
+	}
+	block := virtio.NewBlock(0, 0x1000, 10, region)
+	netdev := virtio.NewNet(0, 0x1000, 11, nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	answeredRoot := false
+	answeredSwap := false
+	answeredDump := false
+	serial, err := BootOpenBSDKernelToMarkerWithPCIBlockNetConsole(ctx, kernel, 512, "OPENBSD_VIO0_FOUND", block, netdev, func(serial string) []byte {
+		if !answeredRoot && strings.Contains(serial, "root device") {
+			answeredRoot = true
+			return []byte("sd0a\n")
+		}
+		if !answeredSwap && strings.Contains(serial, "swap device") {
+			answeredSwap = true
+			return []byte("\n")
+		}
+		if !answeredDump && strings.Contains(serial, "dump device") {
+			answeredDump = true
+			return []byte("\n")
+		}
+		return nil
+	})
+	t.Logf("generated FFS OpenBSD virtio-net serial tail:\n%s", tailString(serial, 4096))
+	if err != nil {
+		t.Fatalf("boot OpenBSD with generated FFS root and virtio-net: %v\nserial:\n%s", err, serial)
+	}
+	if !strings.Contains(serial, "vio0 at virtio") {
+		t.Fatalf("serial did not contain vio0 attachment:\n%s", serial)
+	}
+}
+
+func TestBootOpenBSD79RegularKernelWithBaseSetRootAndGoInit(t *testing.T) {
+	if os.Getenv("CC_TEST_OPENBSD_KVM") == "" {
+		t.Skip("set CC_TEST_OPENBSD_KVM=1 to run OpenBSD KVM boot smoke test")
+	}
+	kernelPath := filepath.Join("..", "..", "..", "local", "openbsd79-amd64", "bsd")
+	kernel, err := os.ReadFile(kernelPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			t.Skipf("OpenBSD fixture not present: %s", kernelPath)
+		}
+		t.Fatalf("read fixture: %v", err)
+	}
+	root := buildOpenBSDBaseSetRoot(t)
+	region, err := fsimage.Build(context.Background(), root, fsimage.Options{
+		Type:              fsimage.TypeFFS,
+		SizeBytes:         224 << 20,
+		DeterministicTime: time.Unix(1700000000, 0),
+	})
+	if err != nil {
+		t.Fatalf("build FFS root: %v", err)
+	}
+	block := virtio.NewBlock(0, 0x1000, 10, region)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	answeredRoot := false
+	answeredSwap := false
+	answeredDump := false
+	serial, err := BootOpenBSDKernelToMarkerWithPCIBlockConsole(ctx, kernel, 512, "OPENBSD_GO_INIT_OK", block, func(serial string) []byte {
+		if !answeredRoot && strings.Contains(serial, "root device") {
+			answeredRoot = true
+			return []byte("sd0a\n")
+		}
+		if !answeredSwap && strings.Contains(serial, "swap device") {
+			answeredSwap = true
+			return []byte("\n")
+		}
+		if !answeredDump && strings.Contains(serial, "dump device") {
+			answeredDump = true
+			return []byte("\n")
+		}
+		return nil
+	})
+	t.Logf("generated FFS OpenBSD base-set serial tail:\n%s", tailString(serial, 4096))
+	if err != nil {
+		t.Fatalf("boot OpenBSD with base-set FFS root: %v\nserial:\n%s", err, serial)
+	}
+}
+
 func tailString(s string, max int) string {
 	if len(s) <= max {
 		return s
@@ -192,13 +293,99 @@ func tailString(s string, max int) string {
 
 func buildOpenBSDGoInitRoot(t *testing.T) imagefs.Directory {
 	t.Helper()
+	return buildOpenBSDRoot(t, openBSDGoInitSource)
+}
+
+func buildOpenBSDNetInitRoot(t *testing.T) imagefs.Directory {
+	t.Helper()
+	return buildOpenBSDRoot(t, openBSDNetInitSource)
+}
+
+func buildOpenBSDBaseSetRoot(t *testing.T) imagefs.Directory {
+	t.Helper()
+	f, err := os.Open(openBSDBaseSetPath(t))
+	if err != nil {
+		t.Fatalf("open OpenBSD base set: %v", err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatalf("read OpenBSD base gzip: %v", err)
+	}
+	t.Cleanup(func() { _ = gz.Close() })
+	tfs, err := imagefs.NewTarFSWithOptions(context.Background(), gz, imagefs.TarFSOptions{
+		Include: includeOpenBSDBaseBootFile,
+	})
+	if err != nil {
+		t.Fatalf("read OpenBSD base set: %v", err)
+	}
+	t.Cleanup(func() { _ = tfs.Close() })
+	overlay := imagefs.NewOverlay(tfs.Root())
+	addOpenBSDRuntimeLibraryLinks(t, overlay, tfs.Root())
+	if err := overlay.AddDevice("/dev/console", fs.ModeDevice|fs.ModeCharDevice|0o600, 0); err != nil {
+		t.Fatalf("add console device: %v", err)
+	}
+	if err := overlay.AddDevice("/dev/null", fs.ModeDevice|fs.ModeCharDevice|0o666, 514); err != nil {
+		t.Fatalf("add null device: %v", err)
+	}
+	initBin := buildOpenBSDGoInit(t)
+	if err := overlay.AddFile("/sbin/init", 0o755, initBin); err != nil {
+		t.Fatalf("overlay Go init: %v", err)
+	}
+	return overlay.Root()
+}
+
+func addOpenBSDRuntimeLibraryLinks(t *testing.T, overlay *imagefs.Overlay, root imagefs.Directory) {
+	t.Helper()
+	entry, err := imagefs.LookupPath(root, "/usr/lib")
+	if err != nil {
+		t.Fatalf("lookup /usr/lib: %v", err)
+	}
+	if entry.Dir == nil {
+		t.Fatal("/usr/lib is not a directory")
+	}
+	entries, err := entry.Dir.ReadDir()
+	if err != nil {
+		t.Fatalf("read /usr/lib: %v", err)
+	}
+	var libcName, libpthreadName string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name, "libc.so.") {
+			libcName = entry.Name
+		}
+		if strings.HasPrefix(entry.Name, "libpthread.so.") {
+			libpthreadName = entry.Name
+		}
+	}
+	if libcName == "" || libpthreadName == "" {
+		t.Fatalf("runtime libraries missing: libc=%q libpthread=%q", libcName, libpthreadName)
+	}
+	if err := overlay.AddSymlink("/usr/lib/libc.so", libcName); err != nil {
+		t.Fatalf("add libc.so symlink: %v", err)
+	}
+	if err := overlay.AddSymlink("/usr/lib/libpthread.so", libpthreadName); err != nil {
+		t.Fatalf("add libpthread.so symlink: %v", err)
+	}
+}
+
+func includeOpenBSDBaseBootFile(name string, hdr *tar.Header) bool {
+	switch name {
+	case "/usr/libexec/ld.so":
+		return true
+	}
+	base := path.Base(name)
+	return strings.HasPrefix(name, "/usr/lib/") && (strings.HasPrefix(base, "libc.so.") || strings.HasPrefix(base, "libpthread.so."))
+}
+
+func buildOpenBSDRoot(t *testing.T, initSource string, extraBaseFiles ...string) imagefs.Directory {
+	t.Helper()
 	rootDir := t.TempDir()
 	for _, dir := range []string{"dev", "sbin", "usr/libexec", "usr/lib"} {
 		if err := os.MkdirAll(filepath.Join(rootDir, filepath.FromSlash(dir)), 0o755); err != nil {
 			t.Fatalf("mkdir %s: %v", dir, err)
 		}
 	}
-	initBin := buildOpenBSDGoInit(t)
+	initBin := buildOpenBSDGoInit(t, initSource)
 	if err := os.WriteFile(filepath.Join(rootDir, "sbin", "init"), initBin, 0o755); err != nil {
 		t.Fatalf("write OpenBSD init: %v", err)
 	}
@@ -208,7 +395,7 @@ func buildOpenBSDGoInitRoot(t *testing.T) imagefs.Directory {
 	if err := os.WriteFile(filepath.Join(rootDir, "dev", "null"), nil, 0o666); err != nil {
 		t.Fatalf("write dev null placeholder: %v", err)
 	}
-	if err := extractOpenBSDRuntime(rootDir, openBSDBaseSetPath(t)); err != nil {
+	if err := extractOpenBSDRuntime(rootDir, openBSDBaseSetPath(t), extraBaseFiles...); err != nil {
 		t.Fatal(err)
 	}
 	meta := map[string]fsmeta.Entry{
@@ -218,11 +405,15 @@ func buildOpenBSDGoInitRoot(t *testing.T) imagefs.Directory {
 	return imagefs.NewHostFS(rootDir, meta)
 }
 
-func buildOpenBSDGoInit(t *testing.T) []byte {
+func buildOpenBSDGoInit(t *testing.T, source ...string) []byte {
 	t.Helper()
 	dir := t.TempDir()
 	src := filepath.Join(dir, "init.go")
-	if err := os.WriteFile(src, []byte(openBSDGoInitSource), 0o644); err != nil {
+	initSource := openBSDGoInitSource
+	if len(source) > 0 {
+		initSource = source[0]
+	}
+	if err := os.WriteFile(src, []byte(initSource), 0o644); err != nil {
 		t.Fatalf("write init source: %v", err)
 	}
 	out := filepath.Join(dir, "init")
@@ -254,7 +445,7 @@ func openBSDBaseSetPath(t *testing.T) string {
 	return ""
 }
 
-func extractOpenBSDRuntime(rootDir, baseSet string) error {
+func extractOpenBSDRuntime(rootDir, baseSet string, extraFiles ...string) error {
 	f, err := os.Open(baseSet)
 	if err != nil {
 		return fmt.Errorf("open %s: %w", baseSet, err)
@@ -266,7 +457,10 @@ func extractOpenBSDRuntime(rootDir, baseSet string) error {
 	}
 	defer gz.Close()
 	want := map[string]bool{
-		"./usr/libexec/ld.so": false,
+		"/usr/libexec/ld.so": false,
+	}
+	for _, file := range extraFiles {
+		want[openBSDSetPath(file)] = false
 	}
 	var libcName, libpthreadName string
 	tr := tar.NewReader(gz)
@@ -278,8 +472,9 @@ func extractOpenBSDRuntime(rootDir, baseSet string) error {
 		if err != nil {
 			return fmt.Errorf("read %s tar: %w", baseSet, err)
 		}
-		name := strings.TrimPrefix(hdr.Name, ".")
-		if name == "/usr/libexec/ld.so" || strings.HasPrefix(name, "/usr/lib/libc.so.") || strings.HasPrefix(name, "/usr/lib/libpthread.so.") {
+		name := openBSDSetPath(hdr.Name)
+		_, wantFile := want[name]
+		if name == "/usr/libexec/ld.so" || strings.HasPrefix(name, "/usr/lib/libc.so.") || strings.HasPrefix(name, "/usr/lib/libpthread.so.") || wantFile {
 			target := filepath.Join(rootDir, filepath.FromSlash(strings.TrimPrefix(name, "/")))
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
@@ -306,7 +501,10 @@ func extractOpenBSDRuntime(rootDir, baseSet string) error {
 				continue
 			}
 			if name == "/usr/libexec/ld.so" {
-				want["./usr/libexec/ld.so"] = true
+				want["/usr/libexec/ld.so"] = true
+			}
+			if _, ok := want[name]; ok {
+				want[name] = true
 			}
 			if strings.HasPrefix(name, "/usr/lib/libc.so.") {
 				libcName = filepath.Base(name)
@@ -336,6 +534,10 @@ func extractOpenBSDRuntime(rootDir, baseSet string) error {
 	return nil
 }
 
+func openBSDSetPath(name string) string {
+	return path.Clean("/" + strings.TrimPrefix(strings.TrimPrefix(name, "."), "/"))
+}
+
 const openBSDGoInitSource = `package main
 
 import (
@@ -349,6 +551,37 @@ func main() {
 		console.WriteString("OPENBSD_GO_INIT_OK\n")
 	} else {
 		os.Stdout.WriteString("OPENBSD_GO_INIT_OK\n")
+	}
+	for {
+		time.Sleep(time.Hour)
+	}
+}
+`
+
+const openBSDNetInitSource = `package main
+
+import (
+	"net"
+	"os"
+	"time"
+)
+
+func writeConsole(s string) {
+	console, err := os.OpenFile("/dev/console", os.O_RDWR, 0)
+	if err == nil {
+		defer console.Close()
+		console.WriteString(s)
+		return
+	}
+	os.Stdout.WriteString(s)
+}
+
+func main() {
+	iface, err := net.InterfaceByName("vio0")
+	if err != nil {
+		writeConsole("OPENBSD_VIO0_LOOKUP_FAILED: " + err.Error() + "\n")
+	} else {
+		writeConsole("OPENBSD_VIO0_FOUND " + iface.HardwareAddr.String() + "\n")
 	}
 	for {
 		time.Sleep(time.Hour)
