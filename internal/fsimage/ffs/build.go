@@ -46,6 +46,7 @@ const (
 	ffsDBlkNo  = 32
 	ffsRootIno = 2
 	ffsMaxName = 255
+	ffsMaxFPG  = 65536
 
 	ffsMagic = 0x011954
 	ffsOkay  = 0x7c269d38
@@ -79,6 +80,7 @@ func (s *Superblock) SetBlockLayout(dataStart uint32) {
 	s.setU32(12, ffsCBlkNo)
 	s.setU32(16, ffsIBlkNo)
 	s.setU32(20, dataStart)
+	s.setU32(152, dataStart)
 	s.setU32(48, ffsBSize)
 	s.setU32(52, ffsFSize)
 	s.setU32(56, ffsFrag)
@@ -106,15 +108,15 @@ func (s *Superblock) SetSize(fsSize, dsize uint32) {
 	s.setU64(1080, uint64(fsSize))
 	s.setU64(1088, uint64(dsize))
 }
-func (s *Superblock) SetCylinderGroups(ipg, fpg, dataStart uint32) {
+func (s *Superblock) SetCylinderGroups(ncg, ipg, fpg, dataStart uint32) {
 	sectorsPerCylinder := fpg * ffsNSPF
 	cgsize := cylinderGroupSize(ipg, fpg)
-	s.setU32(44, 1)
+	s.setU32(44, ncg)
 	s.setU32(132, sectorsPerCylinder)
 	s.setU32(160, cgsize)
 	s.setU32(168, sectorsPerCylinder)
 	s.setU32(172, sectorsPerCylinder)
-	s.setU32(176, 1)
+	s.setU32(176, ncg)
 	s.setU32(180, 1)
 	s.setU32(184, ipg)
 	s.setU32(188, fpg)
@@ -144,7 +146,6 @@ func (s *Superblock) SetOpenBSDDefaults() {
 	s.setU32(132, 64)
 	s.setU32(136, 1)
 	s.setU32(140, 0)
-	s.setU32(152, ffsDBlkNo)
 	s.setU32(156, ffsFSize)
 	s.setU32(160, ffsFSize)
 	s.setU32(164, 0)
@@ -198,12 +199,13 @@ type CylinderGroup [ffsBSize]byte
 
 func (c *CylinderGroup) setU16(off int, v uint16) { binary.LittleEndian.PutUint16(c[off:off+2], v) }
 func (c *CylinderGroup) setU32(off int, v uint32) { binary.LittleEndian.PutUint32(c[off:off+4], v) }
-func (c *CylinderGroup) SetHeader(ts int64, ipg, fpg uint32) {
+func (c *CylinderGroup) SetHeader(cgx uint32, ts int64, ipg, ndblk uint32, ncyl uint16) {
 	c.setU32(4, cgMagic)
 	c.setU32(8, uint32(ts))
-	c.setU16(16, 0)
+	c.setU32(12, cgx)
+	c.setU16(16, ncyl)
 	c.setU16(18, uint16(ipg))
-	c.setU32(20, fpg)
+	c.setU32(20, ndblk)
 	c.setU32(112, 0)
 	c.setU32(116, 0)
 	c.setU32(136, uint32(ts))
@@ -345,6 +347,9 @@ type ffsBuilder struct {
 	fsOffset  int64
 	fsSize    int64
 	fsFrags   uint32
+	cgFrags   uint32
+	cgCount   uint32
+	ipg       uint32
 	dataStart uint32
 	nextIno   uint32
 	nextFrag  uint32
@@ -377,6 +382,11 @@ func Build(ctx context.Context, root imagefs.Directory, opts Options) (*ffsimgvm
 	}
 	fsOffset := int64(ffsPartLBA * ffsSectorSize)
 	totalSize := fsOffset + fsSize
+	cgFrags := uint32(fsSize / ffsFSize)
+	if cgFrags > ffsMaxFPG {
+		cgFrags = ffsMaxFPG
+	}
+	cgCount := uint32((fsSize/ffsFSize + int64(cgFrags) - 1) / int64(cgFrags))
 	b := &ffsBuilder{
 		ctx:       ctx,
 		root:      root,
@@ -385,6 +395,8 @@ func Build(ctx context.Context, root imagefs.Directory, opts Options) (*ffsimgvm
 		fsOffset:  fsOffset,
 		fsSize:    fsSize,
 		fsFrags:   uint32(fsSize / ffsFSize),
+		cgFrags:   cgFrags,
+		cgCount:   cgCount,
 		nextIno:   ffsRootIno,
 		nextFrag:  ffsDBlkNo,
 		usedFrags: make([]bool, uint32(fsSize/ffsFSize)),
@@ -401,20 +413,30 @@ func Build(ctx context.Context, root imagefs.Directory, opts Options) (*ffsimgvm
 	if ipg < ffsInopb {
 		ipg = ffsInopb
 	}
+	b.ipg = ipg
 	inodeFrags := (ipg * ffsInodeSize) / ffsFSize
 	dataStart := roundUpFrag(ffsIBlkNo+inodeFrags, ffsFrag)
-	if dataStart >= b.fsFrags {
+	if dataStart >= b.cgFrags {
 		return nil, fmt.Errorf("too many inodes for FFS image: %d", ipg)
 	}
 	b.dataStart = dataStart
 	b.nextFrag = roundUpFrag(dataStart+1, ffsFrag)
-	b.usedInos = make([]bool, ipg)
+	b.usedInos = make([]bool, ipg*cgCount)
 	b.usedInos[0] = true
 	b.usedInos[1] = true
-	for frag := uint32(0); frag < b.dataStart; frag++ {
-		b.usedFrags[frag] = true
+	for cgx := uint32(0); cgx < b.cgCount; cgx++ {
+		base, end := b.cgRange(cgx)
+		start := base
+		if cgx != 0 {
+			start += ffsSBlkNo
+		}
+		for frag := start; frag < base+b.dataStart && frag < end; frag++ {
+			b.usedFrags[frag] = true
+		}
 	}
-	b.usedFrags[dataStart] = true
+	if b.dataStart < b.fsFrags {
+		b.usedFrags[b.dataStart] = true
+	}
 
 	rootNode, err := b.collectDir(root, "/", nil, "")
 	if err != nil {
@@ -428,8 +450,8 @@ func Build(ctx context.Context, root imagefs.Directory, opts Options) (*ffsimgvm
 	}
 	b.writeMBR()
 	b.writeDisklabel()
-	b.writeSuperblocks(ipg, rootNode)
-	b.writeCylinderGroup(ipg, rootNode)
+	b.writeSuperblocks(rootNode)
+	b.writeCylinderGroups(rootNode)
 	return b.vm, nil
 }
 
@@ -810,7 +832,7 @@ func (b *ffsBuilder) writeInode(node *ffsNode) {
 	ino.SetGeneration(node.ino*1103515245 + 12345)
 	ino.SetUID(node.uid)
 	ino.SetGID(node.gid)
-	_, _ = b.vm.WriteAt(ino[:], b.fsOffset+int64(ffsIBlkNo*ffsFSize+node.ino*ffsInodeSize))
+	_, _ = b.vm.WriteAt(ino[:], b.inodeOffset(node.ino))
 }
 
 func (b *ffsBuilder) writeIndirectBlocks(node *ffsNode) {
@@ -885,10 +907,10 @@ func (b *ffsBuilder) linkCount(node *ffsNode) int {
 	return n
 }
 
-func (b *ffsBuilder) writeSuperblocks(ipg uint32, rootNode *ffsNode) {
+func (b *ffsBuilder) writeSuperblocks(rootNode *ffsNode) {
 	var sb Superblock
 	fsSize := b.fsFrags
-	dsize := fsSize - b.dataStart - 1
+	dsize := b.dataFragCount()
 	nbfree, nffree := b.freeSummary()
 	ndir := uint32(countDirNodes(rootNode))
 	nifree := uint32(len(b.usedInos)) - uint32(countUsedInos(b.usedInos))
@@ -896,64 +918,90 @@ func (b *ffsBuilder) writeSuperblocks(ipg uint32, rootNode *ffsNode) {
 	sb.SetOpenBSDDefaults()
 	sb.SetTimeAndID(b.now)
 	sb.SetSize(fsSize, dsize)
-	sb.SetCylinderGroups(ipg, fsSize, b.dataStart)
+	sb.SetCylinderGroups(b.cgCount, b.ipg, b.cgFrags, b.dataStart)
 	sb.SetSummary(ndir, nbfree, nifree, nffree)
 	_, _ = b.vm.WriteAt(sb[:], b.fsOffset+ffsSBOFF)
-	_, _ = b.vm.WriteAt(sb[:], b.fsOffset+int64(ffsSBlkNo*ffsFSize))
-	b.writeCylinderSummary(ndir, nbfree, nifree, nffree)
+	for cgx := uint32(0); cgx < b.cgCount; cgx++ {
+		base, end := b.cgRange(cgx)
+		if base+ffsSBlkNo+uint32(len(sb))/ffsFSize <= end {
+			_, _ = b.vm.WriteAt(sb[:], b.fsOffset+int64((base+ffsSBlkNo)*ffsFSize))
+		}
+	}
+	b.writeCylinderSummary(rootNode)
 }
 
-func (b *ffsBuilder) writeCylinderSummary(ndir, nbfree, nifree, nffree uint32) {
+func (b *ffsBuilder) writeCylinderSummary(rootNode *ffsNode) {
 	var summary [ffsFSize]byte
-	binary.LittleEndian.PutUint32(summary[0:4], ndir)
-	binary.LittleEndian.PutUint32(summary[4:8], nbfree)
-	binary.LittleEndian.PutUint32(summary[8:12], nifree)
-	binary.LittleEndian.PutUint32(summary[12:16], nffree)
-	_, _ = b.vm.WriteAt(summary[:], b.fsOffset+int64(ffsDBlkNo*ffsFSize))
+	for cgx := uint32(0); cgx < b.cgCount; cgx++ {
+		off := int(cgx * 16)
+		if off+16 > len(summary) {
+			break
+		}
+		base, cgFrags := b.cgBaseAndFrags(cgx)
+		nbfree, nffree := b.freeSummaryRange(base, base+cgFrags)
+		nifree := b.ipg - uint32(countUsedInos(b.usedInosForCG(cgx)))
+		ndir := uint32(countDirNodesInCG(rootNode, b.ipg, cgx))
+		binary.LittleEndian.PutUint32(summary[off:off+4], ndir)
+		binary.LittleEndian.PutUint32(summary[off+4:off+8], nbfree)
+		binary.LittleEndian.PutUint32(summary[off+8:off+12], nifree)
+		binary.LittleEndian.PutUint32(summary[off+12:off+16], nffree)
+	}
+	_, _ = b.vm.WriteAt(summary[:], b.fsOffset+int64(b.dataStart*ffsFSize))
 }
 
-func (b *ffsBuilder) writeCylinderGroup(ipg uint32, rootNode *ffsNode) {
+func (b *ffsBuilder) writeCylinderGroups(rootNode *ffsNode) {
+	for cgx := uint32(0); cgx < b.cgCount; cgx++ {
+		b.writeCylinderGroup(cgx, rootNode)
+	}
+}
+
+func (b *ffsBuilder) writeCylinderGroup(cgx uint32, rootNode *ffsNode) {
 	var cg CylinderGroup
-	nbfree, nffree := b.freeSummary()
-	ndir := uint32(countDirNodes(rootNode))
+	base, cgFrags := b.cgBaseAndFrags(cgx)
+	nbfree, nffree := b.freeSummaryRange(base, base+cgFrags)
+	ndir := uint32(countDirNodesInCG(rootNode, b.ipg, cgx))
 	btotoff := uint32(0xa8)
 	boff := uint32(0xac)
 	iusedoff := uint32(0xae)
-	freeoff := iusedoff + uint32((ipg+7)/8)
+	freeoff := iusedoff + uint32((b.ipg+7)/8)
 	if freeoff%2 != 0 {
 		freeoff++
 	}
-	nextfreeoff := freeoff + uint32((b.fsFrags+7)/8)
-	cg.SetHeader(b.now, ipg, b.fsFrags)
-	cg.SetSummary(ndir, nbfree, ipg-uint32(countUsedInos(b.usedInos)), nffree)
-	cg.SetRotors(b.nextFrag, b.nextFrag, b.nextIno)
+	nextfreeoff := freeoff + uint32((b.cgFrags+7)/8)
+	ncyl := uint16(1)
+	if cgx != 0 && cgx == b.cgCount-1 && cgFrags < b.cgFrags {
+		ncyl = 0
+	}
+	cg.SetHeader(cgx, b.now, b.ipg, cgFrags, ncyl)
+	cg.SetSummary(ndir, nbfree, b.ipg-uint32(countUsedInos(b.usedInosForCG(cgx))), nffree)
+	cg.SetRotors(b.dataStart, b.dataStart, b.nextIno%b.ipg)
 	cg.SetOffsets(btotoff, boff, iusedoff, freeoff, nextfreeoff)
-	for ino, used := range b.usedInos {
+	for ino, used := range b.usedInosForCG(cgx) {
 		if used {
 			cg.MarkInodeUsed(iusedoff, ino)
 		}
 	}
-	for frag := uint32(0); frag < b.fsFrags; frag++ {
-		if !b.usedFrags[frag] {
+	for frag := uint32(0); frag < cgFrags; frag++ {
+		if !b.usedFrags[base+frag] {
 			cg.MarkFragFree(freeoff, frag)
 		}
 	}
-	for size, count := range b.freeFragmentRuns() {
+	for size, count := range b.freeFragmentRunsRange(base, base+cgFrags) {
 		cg.SetFragSummary(uint32(size), count)
 	}
 	cg.SetBlockTotals(btotoff, boff, nbfree)
-	_, _ = b.vm.WriteAt(cg[:], b.fsOffset+int64(ffsCBlkNo*ffsFSize))
+	_, _ = b.vm.WriteAt(cg[:], b.fsOffset+int64((base+ffsCBlkNo)*ffsFSize))
 }
 
-func (b *ffsBuilder) freeFragmentRuns() [ffsFrag]uint32 {
+func (b *ffsBuilder) freeFragmentRunsRange(start, limit uint32) [ffsFrag]uint32 {
 	var out [ffsFrag]uint32
-	for frag := uint32(0); frag < b.fsFrags; frag += ffsFrag {
-		end := frag + ffsFrag
-		if end > b.fsFrags {
-			end = b.fsFrags
+	for frag := roundUpFrag(start, ffsFrag); frag < limit; frag += ffsFrag {
+		blockEnd := frag + ffsFrag
+		if blockEnd > limit {
+			blockEnd = limit
 		}
 		allFree := true
-		for i := frag; i < end; i++ {
+		for i := frag; i < blockEnd; i++ {
 			if b.usedFrags[i] {
 				allFree = false
 				break
@@ -962,13 +1010,13 @@ func (b *ffsBuilder) freeFragmentRuns() [ffsFrag]uint32 {
 		if allFree {
 			continue
 		}
-		for i := frag; i < end; {
+		for i := frag; i < blockEnd; {
 			if b.usedFrags[i] {
 				i++
 				continue
 			}
 			start := i
-			for i < end && !b.usedFrags[i] {
+			for i < blockEnd && !b.usedFrags[i] {
 				i++
 			}
 			if run := i - start; run < ffsFrag {
@@ -999,7 +1047,18 @@ func (b *ffsBuilder) writeMBR() {
 
 func (b *ffsBuilder) freeSummary() (uint32, uint32) {
 	var nbfree, nffree uint32
-	for frag := b.dataStart; frag+ffsFrag <= b.fsFrags; frag += ffsFrag {
+	for cgx := uint32(0); cgx < b.cgCount; cgx++ {
+		base, cgFrags := b.cgBaseAndFrags(cgx)
+		cgNbfree, cgNffree := b.freeSummaryRange(base, base+cgFrags)
+		nbfree += cgNbfree
+		nffree += cgNffree
+	}
+	return nbfree, nffree
+}
+
+func (b *ffsBuilder) freeSummaryRange(start, limit uint32) (uint32, uint32) {
+	var nbfree, nffree uint32
+	for frag := roundUpFrag(start, ffsFrag); frag+ffsFrag <= limit; frag += ffsFrag {
 		free := true
 		for i := uint32(0); i < ffsFrag; i++ {
 			if b.usedFrags[frag+i] {
@@ -1020,6 +1079,53 @@ func (b *ffsBuilder) freeSummary() (uint32, uint32) {
 	return nbfree, nffree
 }
 
+func (b *ffsBuilder) dataFragCount() uint32 {
+	var out uint32
+	for cgx := uint32(0); cgx < b.cgCount; cgx++ {
+		_, cgFrags := b.cgBaseAndFrags(cgx)
+		if cgFrags > b.dataStart {
+			reserved := b.dataStart
+			if cgx != 0 {
+				reserved -= ffsSBlkNo
+			}
+			out += cgFrags - reserved
+		}
+	}
+	if out > 0 {
+		out--
+	}
+	return out
+}
+
+func (b *ffsBuilder) cgBaseAndFrags(cgx uint32) (uint32, uint32) {
+	base, end := b.cgRange(cgx)
+	return base, end - base
+}
+
+func (b *ffsBuilder) cgRange(cgx uint32) (uint32, uint32) {
+	base := cgx * b.cgFrags
+	end := base + b.cgFrags
+	if end > b.fsFrags {
+		end = b.fsFrags
+	}
+	return base, end
+}
+
+func (b *ffsBuilder) usedInosForCG(cgx uint32) []bool {
+	start := cgx * b.ipg
+	end := start + b.ipg
+	if end > uint32(len(b.usedInos)) {
+		end = uint32(len(b.usedInos))
+	}
+	return b.usedInos[start:end]
+}
+
+func (b *ffsBuilder) inodeOffset(ino uint32) int64 {
+	cgx := ino / b.ipg
+	local := ino % b.ipg
+	return b.fsOffset + int64((cgx*b.cgFrags+ffsIBlkNo)*ffsFSize+local*ffsInodeSize)
+}
+
 func encodeFFSDir(node *ffsNode) []byte {
 	type ent struct {
 		ino  uint32
@@ -1034,27 +1140,36 @@ func encodeFFSDir(node *ffsNode) []byte {
 	for _, child := range node.children {
 		entries = append(entries, ent{child.ino, ffsDirType(child.mode), child.name})
 	}
-	total := 0
-	for _, e := range entries {
-		total += directSize(len(e.name))
-	}
-	size := int(roundUp(int64(total), ffsSectorSize))
-	if size < ffsSectorSize {
-		size = ffsSectorSize
-	}
-	buf := make([]byte, size)
+	var buf []byte
+	block := make([]byte, ffsSectorSize)
 	off := 0
-	for i, e := range entries {
-		reclen := directSize(len(e.name))
-		if i == len(entries)-1 {
-			reclen = size - off
+	prevOff := -1
+	for _, e := range entries {
+		minReclen := directSize(len(e.name))
+		if off != 0 && off+minReclen > ffsSectorSize {
+			Direct{buf: block[prevOff:ffsSectorSize]}.SetReclen(uint16(ffsSectorSize - prevOff))
+			buf = append(buf, block...)
+			block = make([]byte, ffsSectorSize)
+			off = 0
+			prevOff = -1
 		}
-		ent := Direct{buf: buf[off : off+reclen]}
+		if prevOff >= 0 {
+			Direct{buf: block[prevOff:off]}.SetReclen(uint16(off - prevOff))
+		}
+		ent := Direct{buf: block[off : off+minReclen]}
 		ent.SetIno(e.ino)
-		ent.SetReclen(uint16(reclen))
+		ent.SetReclen(uint16(minReclen))
 		ent.SetType(e.typ)
 		ent.SetName(e.name)
-		off += reclen
+		prevOff = off
+		off += minReclen
+	}
+	if prevOff >= 0 {
+		Direct{buf: block[prevOff:ffsSectorSize]}.SetReclen(uint16(ffsSectorSize - prevOff))
+		buf = append(buf, block...)
+	}
+	if len(buf) == 0 {
+		return make([]byte, ffsSectorSize)
 	}
 	return buf
 }
@@ -1138,6 +1253,20 @@ func countDirNodes(node *ffsNode) int {
 	}
 	for _, child := range node.children {
 		n += countDirNodes(child)
+	}
+	return n
+}
+
+func countDirNodesInCG(node *ffsNode, ipg, cgx uint32) int {
+	if node == nil || ipg == 0 {
+		return 0
+	}
+	n := 0
+	if node.mode&ifmt == ifdir && node.ino/ipg == cgx {
+		n++
+	}
+	for _, child := range node.children {
+		n += countDirNodesInCG(child, ipg, cgx)
 	}
 	return n
 }

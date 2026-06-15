@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -134,6 +135,11 @@ func TestBuildFFSDynamicInodeTableKeepsDirectoriesReadable(t *testing.T) {
 	if got := reader.inodeMode(initIno); got != ifreg|0o755 {
 		t.Fatalf("/sbin/init mode = %#o, want %#o", got, ifreg|0o755)
 	}
+	for _, ino := range []uint32{128, 129} {
+		if got := reader.inodeMode(ino); got&ifmt != ifdir {
+			t.Fatalf("inode %d mode = %#o, want directory; inode table may overlap metadata", ino, got)
+		}
+	}
 }
 
 func TestBuildFFSWritesIndirectFileData(t *testing.T) {
@@ -158,6 +164,48 @@ func TestBuildFFSWritesIndirectFileData(t *testing.T) {
 	for _, off := range []int{0, ffsBSize*12 - 1, ffsBSize * 12, len(got) - 1} {
 		if got[off] != patternByte(off) {
 			t.Fatalf("large[%d] = %#x, want %#x", off, got[off], patternByte(off))
+		}
+	}
+}
+
+func TestBuildFFSPacksLargeDirectoriesIntoDirectoryBlocks(t *testing.T) {
+	entries := map[string]imagefs.Entry{}
+	for i := 0; i < 120; i++ {
+		entries[fmt.Sprintf("file%03d", i)] = imagefs.Entry{File: &lazyTestFile{data: []byte("x")}}
+	}
+	root := lazyTestDir{entries: entries}
+	img, err := Build(context.Background(), root, Options{
+		SizeBytes:         32 << 20,
+		DeterministicTime: time.Unix(1234, 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, img.Size())
+	if _, err := img.ReadAt(data, 0); err != nil {
+		t.Fatal(err)
+	}
+	reader := newFFSTestReader(t, data)
+	rootData := reader.fileData(ffsRootIno)
+	if len(rootData) <= ffsSectorSize {
+		t.Fatalf("root directory size = %d, want more than one directory block", len(rootData))
+	}
+	for i := 0; i < 120; i++ {
+		name := fmt.Sprintf("file%03d", i)
+		if _, ok := reader.dirEntries(ffsRootIno)[name]; !ok {
+			t.Fatalf("%s not found", name)
+		}
+	}
+	for blockStart := 0; blockStart < len(rootData); blockStart += ffsSectorSize {
+		for off := blockStart; off < blockStart+ffsSectorSize; {
+			reclen := int(binary.LittleEndian.Uint16(rootData[off+4 : off+6]))
+			if reclen <= 0 {
+				t.Fatalf("zero reclen at directory offset %d", off)
+			}
+			if off+reclen > blockStart+ffsSectorSize {
+				t.Fatalf("directory record at %d crosses 512-byte boundary: reclen=%d", off, reclen)
+			}
+			off += reclen
 		}
 	}
 }
@@ -264,6 +312,54 @@ func TestBuildFFSOpenBSDBaseSubsetFileBytes(t *testing.T) {
 	}
 }
 
+func TestBuildFFSOpenBSDFullBaseFileBytes(t *testing.T) {
+	if os.Getenv("CC_TEST_OPENBSD_FULL_BASE_FFS") == "" {
+		t.Skip("set CC_TEST_OPENBSD_FULL_BASE_FFS=1 to validate full OpenBSD base FFS image bytes")
+	}
+	base := openBSDBaseSubsetTestPath(t)
+	root := openBSDBaseFullTestRoot(t, base)
+	img, err := Build(context.Background(), root, Options{
+		DeterministicTime: time.Unix(1234, 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := newFFSTestReaderAt(t, img)
+	names := []string{"/sbin/init", "/bin/sh", "/bin/echo", "/bin/sleep", "/usr/libexec/ld.so"}
+	libDir, err := imagefs.LookupPath(root, "/usr/lib")
+	if err != nil {
+		t.Fatalf("lookup /usr/lib: %v", err)
+	}
+	entries, err := libDir.Dir.ReadDir()
+	if err != nil {
+		t.Fatalf("read /usr/lib: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name, "libc.so.") {
+			names = append(names, "/usr/lib/"+entry.Name)
+			break
+		}
+	}
+	for _, name := range names {
+		entry, err := imagefs.LookupPath(root, name)
+		if err != nil {
+			t.Fatalf("lookup source %s: %v", name, err)
+		}
+		if entry.File == nil {
+			t.Fatalf("source %s is not a file", name)
+		}
+		size, _ := entry.File.Stat()
+		want, err := entry.File.ReadAt(0, uint32(size))
+		if err != nil {
+			t.Fatalf("read source %s: %v", name, err)
+		}
+		got := reader.fileData(reader.lookupPath(name))
+		if !bytes.Equal(got, want) {
+			t.Fatalf("%s data mismatch: got %d bytes, want %d", name, len(got), len(want))
+		}
+	}
+}
+
 func openBSDBaseSubsetTestPath(t *testing.T) string {
 	t.Helper()
 	base := os.Getenv("CC_TEST_OPENBSD_BASE79")
@@ -296,6 +392,31 @@ func openBSDBaseSubsetTestRoot(t *testing.T, base string) imagefs.Directory {
 	return tfs.Root()
 }
 
+func openBSDBaseFullTestRoot(t *testing.T, base string) imagefs.Directory {
+	t.Helper()
+	f, err := os.Open(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = gz.Close() })
+	tfs, err := imagefs.NewTarFS(context.Background(), gz)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tfs.Close() })
+	overlay := imagefs.NewOverlay(tfs.Root())
+	initScript := []byte("#!/bin/sh\n/bin/echo OPENBSD_FULL_BASE_INIT_OK >/dev/console\nwhile :; do /bin/sleep 3600; done\n")
+	if err := overlay.AddFile("/sbin/init", 0o755, initScript); err != nil {
+		t.Fatalf("overlay shell init: %v", err)
+	}
+	return overlay.Root()
+}
+
 func includeOpenBSDBaseSubsetTestFile(name string, hdr *tar.Header) bool {
 	if hdr.Typeflag == tar.TypeDir {
 		return true
@@ -314,16 +435,37 @@ func cleanTestTarPath(name string) string {
 
 type ffsTestReader struct {
 	t     *testing.T
-	data  []byte
+	data  io.ReaderAt
 	base  int
 	fsize int
+	ipg   uint32
+	fpg   uint32
 }
 
 func newFFSTestReader(t *testing.T, data []byte) *ffsTestReader {
 	t.Helper()
-	labelOff := ffsPartLBA*ffsSectorSize + ffsSectorSize
-	base := int(binary.LittleEndian.Uint32(data[labelOff+148+4:labelOff+148+8])) * ffsSectorSize
-	return &ffsTestReader{t: t, data: data, base: base, fsize: int(binary.LittleEndian.Uint32(data[base+ffsSBOFF+52 : base+ffsSBOFF+56]))}
+	return newFFSTestReaderAt(t, bytes.NewReader(data))
+}
+
+func newFFSTestReaderAt(t *testing.T, data io.ReaderAt) *ffsTestReader {
+	t.Helper()
+	label := make([]byte, 512)
+	if _, err := data.ReadAt(label, ffsPartLBA*ffsSectorSize+ffsSectorSize); err != nil {
+		t.Fatal(err)
+	}
+	sb := make([]byte, ffsSBOFF+192)
+	base := int(binary.LittleEndian.Uint32(label[148+4:148+8])) * ffsSectorSize
+	if _, err := data.ReadAt(sb, int64(base)); err != nil {
+		t.Fatal(err)
+	}
+	return &ffsTestReader{
+		t:     t,
+		data:  data,
+		base:  base,
+		fsize: int(binary.LittleEndian.Uint32(sb[ffsSBOFF+52 : ffsSBOFF+56])),
+		ipg:   binary.LittleEndian.Uint32(sb[ffsSBOFF+184 : ffsSBOFF+188]),
+		fpg:   binary.LittleEndian.Uint32(sb[ffsSBOFF+188 : ffsSBOFF+192]),
+	}
 }
 
 func (r *ffsTestReader) lookupPath(name string) uint32 {
@@ -345,18 +487,18 @@ func (r *ffsTestReader) lookupPath(name string) uint32 {
 
 func (r *ffsTestReader) inodeMode(ino uint32) uint16 {
 	off := r.inodeOff(ino)
-	return binary.LittleEndian.Uint16(r.data[off : off+2])
+	return binary.LittleEndian.Uint16(r.readAt(off, 2))
 }
 
 func (r *ffsTestReader) inodeSize(ino uint32) uint64 {
 	off := r.inodeOff(ino)
-	return binary.LittleEndian.Uint64(r.data[off+8 : off+16])
+	return binary.LittleEndian.Uint64(r.readAt(off+8, 8))
 }
 
 func (r *ffsTestReader) symlinkTarget(ino uint32) string {
 	off := r.inodeOff(ino)
 	size := int(r.inodeSize(ino))
-	return string(r.data[off+40 : off+40+size])
+	return string(r.readAt(off+40, size))
 }
 
 func (r *ffsTestReader) fileData(ino uint32) []byte {
@@ -371,7 +513,9 @@ func (r *ffsTestReader) fileData(ino uint32) []byte {
 		if n > size-fileOff {
 			n = size - fileOff
 		}
-		copy(out[fileOff:fileOff+n], r.data[start:start+n])
+		if _, err := r.data.ReadAt(out[fileOff:fileOff+n], int64(start)); err != nil && err != io.EOF {
+			r.t.Fatalf("read file block %d at %d: %v", lbn, start, err)
+		}
 		fileOff += n
 	}
 	return out
@@ -379,20 +523,20 @@ func (r *ffsTestReader) fileData(ino uint32) []byte {
 
 func (r *ffsTestReader) fileBlock(inodeOff, lbn int) uint32 {
 	if lbn < ffsNDaddr {
-		return binary.LittleEndian.Uint32(r.data[inodeOff+40+lbn*4 : inodeOff+44+lbn*4])
+		return binary.LittleEndian.Uint32(r.readAt(inodeOff+40+lbn*4, 4))
 	}
 	lbn -= ffsNDaddr
 	if lbn < ffsNindir {
-		indir := binary.LittleEndian.Uint32(r.data[inodeOff+88 : inodeOff+92])
+		indir := binary.LittleEndian.Uint32(r.readAt(inodeOff+88, 4))
 		off := r.base + int(indir)*r.fsize + lbn*4
-		return binary.LittleEndian.Uint32(r.data[off : off+4])
+		return binary.LittleEndian.Uint32(r.readAt(off, 4))
 	}
 	lbn -= ffsNindir
-	double := binary.LittleEndian.Uint32(r.data[inodeOff+92 : inodeOff+96])
+	double := binary.LittleEndian.Uint32(r.readAt(inodeOff+92, 4))
 	rootOff := r.base + int(double)*r.fsize + (lbn/ffsNindir)*4
-	indir := binary.LittleEndian.Uint32(r.data[rootOff : rootOff+4])
+	indir := binary.LittleEndian.Uint32(r.readAt(rootOff, 4))
 	off := r.base + int(indir)*r.fsize + (lbn%ffsNindir)*4
-	return binary.LittleEndian.Uint32(r.data[off : off+4])
+	return binary.LittleEndian.Uint32(r.readAt(off, 4))
 }
 
 func (r *ffsTestReader) dirEntries(ino uint32) map[string]uint32 {
@@ -414,7 +558,18 @@ func (r *ffsTestReader) dirEntries(ino uint32) map[string]uint32 {
 }
 
 func (r *ffsTestReader) inodeOff(ino uint32) int {
-	return r.base + ffsIBlkNo*ffsFSize + int(ino)*ffsInodeSize
+	cgx := ino / r.ipg
+	local := ino % r.ipg
+	return r.base + int((cgx*r.fpg+ffsIBlkNo)*uint32(r.fsize)+local*ffsInodeSize)
+}
+
+func (r *ffsTestReader) readAt(off, n int) []byte {
+	r.t.Helper()
+	buf := make([]byte, n)
+	if _, err := r.data.ReadAt(buf, int64(off)); err != nil && err != io.EOF {
+		r.t.Fatalf("read at %d: %v", off, err)
+	}
+	return buf
 }
 
 func splitTestPath(name string) []string {

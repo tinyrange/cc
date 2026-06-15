@@ -284,6 +284,48 @@ func TestBootOpenBSD79RegularKernelWithBaseSetRootAndGoInit(t *testing.T) {
 	}
 }
 
+func TestBootOpenBSD79RegularKernelWithFullBaseSetRootAndShellInit(t *testing.T) {
+	if os.Getenv("CC_TEST_OPENBSD_KVM") == "" {
+		t.Skip("set CC_TEST_OPENBSD_KVM=1 to run OpenBSD KVM boot smoke test")
+	}
+	kernelPath := filepath.Join("..", "..", "..", "local", "openbsd79-amd64", "bsd")
+	kernel, err := os.ReadFile(kernelPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			t.Skipf("OpenBSD fixture not present: %s", kernelPath)
+		}
+		t.Fatalf("read fixture: %v", err)
+	}
+	root := buildOpenBSDFullBaseSetRoot(t)
+	region, err := fsimage.Build(context.Background(), root, fsimage.Options{
+		Type:              fsimage.TypeFFS,
+		DeterministicTime: time.Unix(1700000000, 0),
+	})
+	if err != nil {
+		t.Fatalf("build full base-set FFS root: %v", err)
+	}
+	block := virtio.NewBlock(0, 0x1000, 10, region)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	answeredRoot := false
+	answeredSwap := false
+	serial, err := BootOpenBSDKernelToMarkerWithPCIBlockConsole(ctx, kernel, 768, "OPENBSD_FULL_BASE_INIT_OK", block, func(serial string) []byte {
+		if !answeredRoot && strings.Contains(serial, "root device:") {
+			answeredRoot = true
+			return []byte("sd0a\n")
+		}
+		if answeredRoot && !answeredSwap && strings.Contains(serial, "swap device") {
+			answeredSwap = true
+			return []byte("\n")
+		}
+		return nil
+	})
+	t.Logf("generated FFS OpenBSD full base-set serial tail:\n%s", tailString(serial, 4096))
+	if err != nil {
+		t.Fatalf("boot OpenBSD with full base-set FFS root: %v\nserial:\n%s", err, serial)
+	}
+}
+
 func TestOpenBSD79FsckFFSGeneratedBaseSetRoot(t *testing.T) {
 	if os.Getenv("CC_TEST_OPENBSD_KVM") == "" {
 		t.Skip("set CC_TEST_OPENBSD_KVM=1 to run OpenBSD KVM boot smoke test")
@@ -349,6 +391,66 @@ func TestOpenBSD79FsckFFSGeneratedBaseSetRoot(t *testing.T) {
 	}
 }
 
+func TestOpenBSD79FsckFFSGeneratedFullBaseSetRoot(t *testing.T) {
+	if os.Getenv("CC_TEST_OPENBSD_KVM") == "" || os.Getenv("CC_TEST_OPENBSD_FULL_BASE_FFS") == "" {
+		t.Skip("set CC_TEST_OPENBSD_KVM=1 and CC_TEST_OPENBSD_FULL_BASE_FFS=1 to run full OpenBSD FFS fsck smoke test")
+	}
+	kernelPath := filepath.Join("..", "..", "..", "local", "openbsd79-amd64", "bsd.rd")
+	kernel, err := os.ReadFile(kernelPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			t.Skipf("OpenBSD fixture not present: %s", kernelPath)
+		}
+		t.Fatalf("read fixture: %v", err)
+	}
+
+	candidateRegion, err := fsimage.Build(context.Background(), buildOpenBSDFullBaseSetRoot(t), fsimage.Options{
+		Type:              fsimage.TypeFFS,
+		DeterministicTime: time.Unix(1700000000, 0),
+	})
+	if err != nil {
+		t.Fatalf("build full candidate FFS root: %v", err)
+	}
+
+	block := virtio.NewBlock(0, 0x1000, 10, candidateRegion)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	answeredShell := false
+	ranFsck := false
+	serial, err := BootOpenBSDKernelToMarkerWithPCIBlockConsole(ctx, kernel, 768, "OPENBSD_FULL_FSCK_FFS_DONE", block, func(serial string) []byte {
+		if !answeredShell && strings.Contains(serial, "(I)nstall") {
+			answeredShell = true
+			return []byte("S\n")
+		}
+		if answeredShell && !ranFsck && strings.Contains(serial, "# ") {
+			ranFsck = true
+			return []byte("cd /dev && sh MAKEDEV sd0; fsck_ffs -fn /dev/rsd0a; echo OPENBSD_FULL_FSCK_FFS_\"\"DONE\n")
+		}
+		return nil
+	})
+	t.Logf("OpenBSD full fsck_ffs validator serial tail:\n%s", tailString(serial, 8192))
+	if err != nil {
+		t.Fatalf("boot OpenBSD full fsck_ffs validator: %v\nserial:\n%s", err, serial)
+	}
+	if !strings.Contains(serial, "OPENBSD_FULL_FSCK_FFS_DONE") {
+		t.Fatalf("OpenBSD fsck_ffs did not complete for full generated FFS image:\n%s", serial)
+	}
+	for _, bad := range []string{
+		"BAD SUPER BLOCK",
+		"INCORRECT",
+		"UNREF",
+		"BAD/DUP",
+		"FREE BLK COUNT(S) WRONG",
+		"SUMMARY INFORMATION BAD",
+		"BLK(S) MISSING IN BIT MAPS",
+		"FILE SYSTEM WAS MODIFIED",
+	} {
+		if strings.Contains(serial, bad) {
+			t.Fatalf("OpenBSD fsck_ffs found full FFS inconsistency %q:\n%s", bad, serial)
+		}
+	}
+}
+
 func tailString(s string, max int) string {
 	if len(s) <= max {
 		return s
@@ -396,6 +498,46 @@ func buildOpenBSDBaseSetRoot(t *testing.T) imagefs.Directory {
 	initBin := buildOpenBSDGoInit(t)
 	if err := overlay.AddFile("/sbin/init", 0o755, initBin); err != nil {
 		t.Fatalf("overlay Go init: %v", err)
+	}
+	return overlay.Root()
+}
+
+func buildOpenBSDFullBaseSetRoot(t *testing.T) imagefs.Directory {
+	t.Helper()
+	f, err := os.Open(openBSDBaseSetPath(t))
+	if err != nil {
+		t.Fatalf("open OpenBSD base set: %v", err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatalf("read OpenBSD base gzip: %v", err)
+	}
+	t.Cleanup(func() { _ = gz.Close() })
+	tfs, err := imagefs.NewTarFS(context.Background(), gz)
+	if err != nil {
+		t.Fatalf("read full OpenBSD base set: %v", err)
+	}
+	t.Cleanup(func() { _ = tfs.Close() })
+	overlay := imagefs.NewOverlay(tfs.Root())
+	for _, dev := range []struct {
+		path string
+		mode fs.FileMode
+		rdev uint32
+	}{
+		{"/dev/console", fs.ModeDevice | fs.ModeCharDevice | 0o600, 0},
+		{"/dev/null", fs.ModeDevice | fs.ModeCharDevice | 0o666, 514},
+		{"/dev/zero", fs.ModeDevice | fs.ModeCharDevice | 0o666, 515},
+		{"/dev/random", fs.ModeDevice | fs.ModeCharDevice | 0o644, 565},
+		{"/dev/urandom", fs.ModeDevice | fs.ModeCharDevice | 0o644, 566},
+	} {
+		if err := overlay.AddDevice(dev.path, dev.mode, dev.rdev); err != nil {
+			t.Fatalf("add %s: %v", dev.path, err)
+		}
+	}
+	initScript := []byte("#!/bin/sh\n/bin/echo OPENBSD_FULL_BASE_INIT_OK >/dev/console\nwhile :; do /bin/sleep 3600; done\n")
+	if err := overlay.AddFile("/sbin/init", 0o755, initScript); err != nil {
+		t.Fatalf("overlay shell init: %v", err)
 	}
 	return overlay.Root()
 }
