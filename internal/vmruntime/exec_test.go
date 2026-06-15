@@ -57,6 +57,9 @@ func TestExtractManagedExecResultDmesgReturnsTranscriptSegment(t *testing.T) {
 	if !strings.Contains(output, CommandBeginMarker+"abc") || !strings.Contains(output, CommandOutputMarker+"abc") {
 		t.Fatalf("dmesg output did not include transcript markers:\n%s", output)
 	}
+	if !strings.Contains(output, "guest output") {
+		t.Fatalf("dmesg output did not include decoded command output:\n%s", output)
+	}
 }
 
 func TestExtractManagedExecResultIgnoresMalformedMarkers(t *testing.T) {

@@ -25,6 +25,7 @@ const (
 	TypeRegular Type = iota
 	TypeDirectory
 	TypeCharDevice
+	TypeBlockDevice
 	TypeSymlink
 )
 
@@ -35,6 +36,7 @@ const (
 	newcRegularFileBit = 0o100000
 	newcDirectoryBit   = 0o040000
 	newcCharDeviceBit  = 0o020000
+	newcBlockDeviceBit = 0o060000
 	newcSymlinkBit     = 0o120000
 )
 
@@ -215,6 +217,8 @@ func encodeMode(file File) (uint32, error) {
 		return mode | newcDirectoryBit, nil
 	case TypeCharDevice:
 		return mode | newcCharDeviceBit, nil
+	case TypeBlockDevice:
+		return mode | newcBlockDeviceBit, nil
 	case TypeSymlink:
 		return mode | newcSymlinkBit, nil
 	default:

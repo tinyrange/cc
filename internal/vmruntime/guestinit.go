@@ -19,6 +19,9 @@ type GuestInitConfig struct {
 	Modules            []string            `json:"modules,omitempty"`
 	EmulatorTag        string              `json:"emulator_tag,omitempty"`
 	RootFSTag          string              `json:"rootfs_tag,omitempty"`
+	RootFSImagePath    string              `json:"rootfs_image_path,omitempty"`
+	RootFSImageType    string              `json:"rootfs_image_type,omitempty"`
+	RootFSImage        []byte              `json:"-"`
 	Shares             []GuestInitShare    `json:"shares,omitempty"`
 	VsockPort          uint32              `json:"vsock_port,omitempty"`
 	ReadyMarker        string              `json:"ready_marker,omitempty"`
@@ -136,6 +139,14 @@ func GuestShareConfigs(shares []DirectoryShare) []GuestInitShare {
 }
 
 func BuildInitramfs(initPayload []byte, modules []alpine.Module, config GuestInitConfig) ([]byte, error) {
+	if len(config.RootFSImage) > 0 {
+		if strings.TrimSpace(config.RootFSImagePath) == "" {
+			config.RootFSImagePath = "/ccx3/rootfs.ext4"
+		}
+		if strings.TrimSpace(config.RootFSImageType) == "" {
+			config.RootFSImageType = "ext4"
+		}
+	}
 	configJSON, err := json.Marshal(config)
 	if err != nil {
 		return nil, fmt.Errorf("marshal guest init config: %w", err)
@@ -153,8 +164,17 @@ func BuildInitramfs(initPayload []byte, modules []alpine.Module, config GuestIni
 		{Path: "/dev/console", Mode: 0o600, Type: initramfs.TypeCharDevice, DevMajor: 5, DevMinor: 1},
 		{Path: "/dev/null", Mode: 0o666, Type: initramfs.TypeCharDevice, DevMajor: 1, DevMinor: 3},
 		{Path: "/dev/kmsg", Mode: 0o600, Type: initramfs.TypeCharDevice, DevMajor: 1, DevMinor: 11},
+		{Path: "/dev/loop0", Mode: 0o660, Type: initramfs.TypeBlockDevice, DevMajor: 7, DevMinor: 0},
 		{Path: "/etc/ccx3-init.json", Mode: 0o600, Data: configJSON, Type: initramfs.TypeRegular},
 		{Path: "/init", Mode: 0o755, Data: initPayload, Type: initramfs.TypeRegular},
+	}
+	if len(config.RootFSImage) > 0 {
+		files = append(files, initramfs.File{
+			Path: config.RootFSImagePath,
+			Mode: 0o600,
+			Data: config.RootFSImage,
+			Type: initramfs.TypeRegular,
+		})
 	}
 	for _, mod := range modules {
 		files = append(files, initramfs.File{

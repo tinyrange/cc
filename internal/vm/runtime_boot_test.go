@@ -100,6 +100,28 @@ func TestRuntimeOneShotDmesgIncludesTranscript(t *testing.T) {
 	requireGuestOutput(t, resp.Output, "runtime-dmesg-one-shot", "ccx3-init")
 }
 
+func TestRuntimeBootsLinuxWithExt4Root(t *testing.T) {
+	t.Setenv("CCX3_ROOTFS_EXT4", "1")
+	env := newRuntimeBootEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
+	defer cancel()
+
+	resp, err := env.backend.Run(ctx, client.RunRequest{
+		Image:    env.imageName,
+		MemoryMB: env.memoryMB,
+		CPUs:     1,
+		Command: []string{
+			"sh",
+			"-lc",
+			"set -eu; awk '$5 == \"/\" { for (i = 1; i <= NF; i++) if ($i == \"-\") { print $(i+1); exit } }' /proc/self/mountinfo",
+		},
+	})
+	requireRunResponse(t, resp, err, 0)
+	if strings.TrimSpace(resp.Output) != "ext4" {
+		t.Fatalf("root filesystem type = %q, want ext4\noutput:\n%s", strings.TrimSpace(resp.Output), resp.Output)
+	}
+}
+
 func TestRuntimeRejectsInvalidRequests(t *testing.T) {
 	env := newRuntimeBootEnv(t)
 	for _, tc := range []struct {

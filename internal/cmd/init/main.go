@@ -55,6 +55,8 @@ type config struct {
 	Modules            []string `json:"modules"`
 	EmulatorTag        string   `json:"emulator_tag,omitempty"`
 	RootFSTag          string   `json:"rootfs_tag"`
+	RootFSImagePath    string   `json:"rootfs_image_path,omitempty"`
+	RootFSImageType    string   `json:"rootfs_image_type,omitempty"`
 	Shares             []share  `json:"shares,omitempty"`
 	VsockPort          uint32   `json:"vsock_port,omitempty"`
 	ReadyMarker        string   `json:"ready_marker"`
@@ -249,9 +251,9 @@ func run() error {
 		return err
 	}
 	writeStage(bootStart, "modules loaded")
-	if cfg.RootFSTag != "" {
+	if cfg.RootFSTag != "" || cfg.RootFSImagePath != "" {
 		writeStage(bootStart, "mounting rootfs")
-		if err := mountRootFS(cfg.RootFSTag, cfg.EmulatorTag, cfg.DisableCgroupMount); err != nil {
+		if err := mountConfiguredRootFS(cfg); err != nil {
 			return err
 		}
 		writeStage(bootStart, "rootfs mounted")
@@ -699,14 +701,72 @@ func configureClock(unixTime int64) error {
 	return nil
 }
 
-func mountRootFS(tag, emulatorTag string, disableCgroup bool) error {
+func mountConfiguredRootFS(cfg config) error {
+	if strings.TrimSpace(cfg.RootFSImagePath) != "" {
+		return mountImageRootFS(cfg.RootFSImagePath, cfg.RootFSImageType, cfg.EmulatorTag, cfg.DisableCgroupMount)
+	}
+	return mountVirtioRootFS(cfg.RootFSTag, cfg.EmulatorTag, cfg.DisableCgroupMount)
+}
+
+func mountVirtioRootFS(tag, emulatorTag string, disableCgroup bool) error {
 	if err := os.MkdirAll("/mnt", 0o755); err != nil {
 		return fmt.Errorf("mkdir /mnt: %w", err)
 	}
 	if err := syscall.Mount(tag, "/mnt", "virtiofs", 0, ""); err != nil {
 		return fmt.Errorf("mount virtiofs %s: %w", tag, err)
 	}
-	if err := switchRootFS("/mnt"); err != nil {
+	return finishRootFS("/mnt", emulatorTag, disableCgroup)
+}
+
+func mountImageRootFS(imagePath, imageType, emulatorTag string, disableCgroup bool) error {
+	imageType = strings.TrimSpace(imageType)
+	if imageType == "" {
+		imageType = "ext4"
+	}
+	if imageType != "ext4" {
+		return fmt.Errorf("unsupported rootfs image type %q", imageType)
+	}
+	if err := os.MkdirAll("/mnt", 0o755); err != nil {
+		return fmt.Errorf("mkdir /mnt: %w", err)
+	}
+	if err := attachLoop("/dev/loop0", imagePath); err != nil {
+		return err
+	}
+	if err := syscall.Mount("/dev/loop0", "/mnt", imageType, 0, ""); err != nil {
+		_ = clearLoop("/dev/loop0")
+		return fmt.Errorf("mount %s rootfs image %s: %w", imageType, imagePath, err)
+	}
+	return finishRootFS("/mnt", emulatorTag, disableCgroup)
+}
+
+func attachLoop(loopPath, imagePath string) error {
+	image, err := syscall.Open(imagePath, syscall.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("open rootfs image %s: %w", imagePath, err)
+	}
+	defer syscall.Close(image)
+	loop, err := syscall.Open(loopPath, syscall.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("open loop device %s: %w", loopPath, err)
+	}
+	defer syscall.Close(loop)
+	if err := unix.IoctlSetInt(loop, unix.LOOP_SET_FD, image); err != nil {
+		return fmt.Errorf("attach %s to %s: %w", imagePath, loopPath, err)
+	}
+	return nil
+}
+
+func clearLoop(loopPath string) error {
+	loop, err := syscall.Open(loopPath, syscall.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(loop)
+	return unix.IoctlSetInt(loop, unix.LOOP_CLR_FD, 0)
+}
+
+func finishRootFS(newRoot, emulatorTag string, disableCgroup bool) error {
+	if err := switchRootFS(newRoot); err != nil {
 		return err
 	}
 
@@ -1839,12 +1899,22 @@ func commandTextNeedsSystemdReady(cmd string, args []string) bool {
 		return commandTextNeedsSystemdReady(next, rest)
 	case "sh", "bash", "dash", "zsh":
 		for i, arg := range args {
-			if arg == "-c" && i+1 < len(args) {
+			if shellArgRunsCommand(arg) && i+1 < len(args) {
 				return shellScriptNeedsSystemdReady(args[i+1])
 			}
 		}
 	}
 	return false
+}
+
+func shellArgRunsCommand(arg string) bool {
+	if arg == "-c" {
+		return true
+	}
+	if !strings.HasPrefix(arg, "-") || strings.HasPrefix(arg, "--") {
+		return false
+	}
+	return strings.Contains(arg[1:], "c")
 }
 
 func unwrapCommandPrefix(args []string) (string, []string, bool) {

@@ -94,7 +94,12 @@ func ExtractManagedExecResult(serial, id string, dmesg bool) (int, string, *clie
 				return 0, "", nil, false
 			}
 			if dmesg {
-				return code, strings.TrimRight(serial[begin:], "\r\n"), usage, true
+				transcript := strings.TrimRight(serial[begin:], "\r\n")
+				decoded := strings.TrimRight(output.String(), "\r\n")
+				if decoded != "" {
+					transcript += "\n" + decoded
+				}
+				return code, transcript, usage, true
 			}
 			return code, strings.TrimRight(output.String(), "\r\n"), usage, true
 		}
