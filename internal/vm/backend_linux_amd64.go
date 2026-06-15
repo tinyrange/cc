@@ -16,7 +16,7 @@ import (
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/amd64vm"
-	"j5.nz/cc/internal/ext4image"
+	"j5.nz/cc/internal/fsimage"
 	"j5.nz/cc/internal/guestinit"
 	"j5.nz/cc/internal/hv/kvm"
 	"j5.nz/cc/internal/imagefs"
@@ -208,9 +208,9 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 		if err != nil {
 			return client.ExecResponse{}, err
 		}
-		if linuxExt4RootEnabled() {
+		if linuxRootFSImageEnabled() {
 			if len(req.Shares) != 0 {
-				return client.ExecResponse{}, fmt.Errorf("ext4 rootfs mode does not support runtime shares yet")
+				return client.ExecResponse{}, fmt.Errorf("rootfs image mode does not support runtime shares yet")
 			}
 		} else {
 			devs, _, err := amd64vm.BuildFSDevices(vmruntime.RunRequest{
@@ -246,14 +246,18 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 	initCfg := linuxGuestInitConfig(modules, len(req.Command) != 0, req.Network, network)
 	if len(fsdevs) != 0 {
 		initCfg.RootFSTag = vmruntime.RootFSTag
-	} else if image != nil && linuxExt4RootEnabled() {
-		rootImage, err := buildLinuxExt4RootImage(ctx, image.RootFS)
+	} else if image != nil && linuxRootFSImageEnabled() {
+		rootImageType, err := linuxRootFSImageType()
+		if err != nil {
+			return client.ExecResponse{}, err
+		}
+		rootImage, err := buildLinuxRootFSImage(ctx, image.RootFS, rootImageType)
 		if err != nil {
 			return client.ExecResponse{}, err
 		}
 		initCfg.RootFSImage = rootImage
-		initCfg.RootFSImagePath = "/ccx3/rootfs.ext4"
-		initCfg.RootFSImageType = "ext4"
+		initCfg.RootFSImagePath = rootImageType.InitramfsPath()
+		initCfg.RootFSImageType = rootImageType.String()
 	}
 	initrd, err := vmruntime.BuildInitramfs(initBin, modules, initCfg)
 	if err != nil {
@@ -808,28 +812,51 @@ func linuxRuntimeImageFS(image *oci.Image) virtio.FSBackend {
 	return virtio.NewImageFSWithOwner(image.RootFS, image.RootFSDir, uint32(uid), uint32(gid))
 }
 
-func linuxExt4RootEnabled() bool {
-	return strings.TrimSpace(os.Getenv("CCX3_ROOTFS_EXT4")) != ""
+func linuxRootFSImageEnabled() bool {
+	return strings.TrimSpace(os.Getenv("CCX3_ROOTFS_IMAGE_TYPE")) != "" || strings.TrimSpace(os.Getenv("CCX3_ROOTFS_EXT4")) != ""
 }
 
-func buildLinuxExt4RootImage(ctx context.Context, root imagefs.Directory) ([]byte, error) {
+func linuxRootFSImageType() (fsimage.Type, error) {
+	if value := strings.TrimSpace(os.Getenv("CCX3_ROOTFS_IMAGE_TYPE")); value != "" {
+		return fsimage.ParseType(value)
+	}
+	if strings.TrimSpace(os.Getenv("CCX3_ROOTFS_EXT4")) != "" {
+		return fsimage.TypeExt4, nil
+	}
+	return "", fmt.Errorf("rootfs image type is not configured")
+}
+
+func buildLinuxRootFSImage(ctx context.Context, root imagefs.Directory, typ fsimage.Type) ([]byte, error) {
 	var buf bytes.Buffer
-	if err := ext4image.Write(ctx, &buf, root, ext4image.Options{}); err != nil {
-		return nil, fmt.Errorf("build ext4 rootfs image: %w", err)
+	if err := fsimage.Write(ctx, &buf, root, fsimage.Options{Type: typ}); err != nil {
+		return nil, fmt.Errorf("build %s rootfs image: %w", typ, err)
 	}
 	return buf.Bytes(), nil
 }
 
 func linuxRuntimeConfigVars(image *oci.Image, extraModules ...string) []string {
 	vars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO", "CONFIG_VIRTIO_NET", "CONFIG_OVERLAY_FS"}
-	if linuxExt4RootEnabled() {
-		vars = append(vars, "CONFIG_BLK_DEV_LOOP", "CONFIG_EXT4_FS")
+	if linuxRootFSImageEnabled() {
+		vars = append(vars, "CONFIG_BLK_DEV_LOOP")
+		rootImageType, err := linuxRootFSImageType()
+		if err == nil {
+			vars = append(vars, linuxRootFSImageConfigVars(rootImageType)...)
+		}
 	}
 	vars = append(vars, linuxRuntimeExtraConfigVars(extraModules)...)
 	if NeedsAMD64Emulation(image) {
 		vars = append(vars, "CONFIG_BINFMT_MISC")
 	}
 	return vars
+}
+
+func linuxRootFSImageConfigVars(typ fsimage.Type) []string {
+	switch typ {
+	case fsimage.TypeExt4:
+		return []string{"CONFIG_EXT4_FS"}
+	default:
+		return nil
+	}
 }
 
 func linuxRuntimeExtraConfigVars(names []string) []string {

@@ -101,7 +101,7 @@ func TestRuntimeOneShotDmesgIncludesTranscript(t *testing.T) {
 }
 
 func TestRuntimeBootsLinuxWithExt4Root(t *testing.T) {
-	t.Setenv("CCX3_ROOTFS_EXT4", "1")
+	t.Setenv("CCX3_ROOTFS_IMAGE_TYPE", "ext4")
 	env := newRuntimeBootEnv(t)
 	ctx, cancel := context.WithTimeout(context.Background(), runtimeBootTimeout())
 	defer cancel()

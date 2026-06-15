@@ -140,11 +140,11 @@ func GuestShareConfigs(shares []DirectoryShare) []GuestInitShare {
 
 func BuildInitramfs(initPayload []byte, modules []alpine.Module, config GuestInitConfig) ([]byte, error) {
 	if len(config.RootFSImage) > 0 {
-		if strings.TrimSpace(config.RootFSImagePath) == "" {
-			config.RootFSImagePath = "/ccx3/rootfs.ext4"
-		}
 		if strings.TrimSpace(config.RootFSImageType) == "" {
 			config.RootFSImageType = "ext4"
+		}
+		if strings.TrimSpace(config.RootFSImagePath) == "" {
+			config.RootFSImagePath = "/ccx3/rootfs." + strings.TrimSpace(config.RootFSImageType)
 		}
 	}
 	configJSON, err := json.Marshal(config)

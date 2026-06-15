@@ -723,9 +723,6 @@ func mountImageRootFS(imagePath, imageType, emulatorTag string, disableCgroup bo
 	if imageType == "" {
 		imageType = "ext4"
 	}
-	if imageType != "ext4" {
-		return fmt.Errorf("unsupported rootfs image type %q", imageType)
-	}
 	if err := os.MkdirAll("/mnt", 0o755); err != nil {
 		return fmt.Errorf("mkdir /mnt: %w", err)
 	}
