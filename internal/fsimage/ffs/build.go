@@ -20,6 +20,7 @@ type Options struct {
 	SizeBytes         int64
 	ExtraBytes        int64
 	DeterministicTime time.Time
+	Layout            Layout
 }
 
 const (
@@ -69,6 +70,13 @@ const (
 	ifreg  = 0o100000
 	iflnk  = 0o120000
 	ifsock = 0o140000
+)
+
+type Layout string
+
+const (
+	LayoutOpenBSDDisk Layout = ""
+	LayoutRaw         Layout = "raw"
 )
 
 type Superblock [8192]byte
@@ -382,6 +390,14 @@ func Build(ctx context.Context, root imagefs.Directory, opts Options) (*ffsimgvm
 	}
 	fsOffset := int64(ffsPartLBA * ffsSectorSize)
 	totalSize := fsOffset + fsSize
+	switch opts.Layout {
+	case LayoutOpenBSDDisk:
+	case LayoutRaw:
+		fsOffset = 0
+		totalSize = fsSize
+	default:
+		return nil, fmt.Errorf("unsupported FFS layout %q", opts.Layout)
+	}
 	cgFrags := uint32(fsSize / ffsFSize)
 	if cgFrags > ffsMaxFPG {
 		cgFrags = ffsMaxFPG
@@ -448,8 +464,10 @@ func Build(ctx context.Context, root imagefs.Directory, opts Options) (*ffsimgvm
 	if err := b.writeTree(rootNode); err != nil {
 		return nil, err
 	}
-	b.writeMBR()
-	b.writeDisklabel()
+	if opts.Layout == LayoutOpenBSDDisk {
+		b.writeMBR()
+		b.writeDisklabel()
+	}
 	b.writeSuperblocks(rootNode)
 	b.writeCylinderGroups(rootNode)
 	return b.vm, nil

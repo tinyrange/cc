@@ -20,7 +20,7 @@ func installBootACPI(memory []byte, numCPUs int) (uint64, error) {
 	}
 	writer := acpiTableWriter{base: acpiTableAddress}
 	facs := writer.appendRaw(buildBootFACS())
-	dsdt := writer.append("DSDT", 2, "CCKVMDSD", nil)
+	dsdt := writer.append("DSDT", 2, "CCKVMDSD", buildBootDSDT())
 	fadt := writer.append("FACP", 6, "CCKVMFAD", buildBootFADT(facs, dsdt))
 	madt := writer.append("APIC", 3, "CCKVMAPC", buildBootMADT(numCPUs))
 	xsdt := writer.append("XSDT", 1, "CCKVMXSD", buildBootXSDT([]uint64{fadt, madt}))
@@ -80,6 +80,33 @@ func buildBootXSDT(entries []uint64) []byte {
 	return body
 }
 
+func buildBootDSDT() []byte {
+	pciBody := appendNameDWord(nil, "_HID", 0x030ad041) // PNP0A03 PCI bus.
+	pciBody = appendNameIntegerZero(pciBody, "_ADR")
+	pciBody = appendNameIntegerZero(pciBody, "_BBN")
+	pciBody = appendNameBuffer(pciBody, "_CRS", buildBootPCIResources())
+	device := append([]byte{0x5b, 0x82}, amlPkg(4+len(pciBody))...)
+	device = append(device, 'P', 'C', 'I', '0')
+	device = append(device, pciBody...)
+
+	scopeBody := device
+	scope := append([]byte{0x10}, amlPkg(5+len(scopeBody))...)
+	scope = append(scope, '\\', '_', 'S', 'B', '_')
+	scope = append(scope, scopeBody...)
+	return scope
+}
+
+func buildBootPCIResources() []byte {
+	var out []byte
+	out = appendWordAddressSpace(out, 2, 0, 0, 0, 0xff, 0, 0x100)  // Bus 0.
+	out = appendIOPortDescriptor(out, 0x0cf8, 0x0cf8, 1, 8)        // PCI config address.
+	out = appendWordIOAddressSpace(out, 0x0000, 0x0cf7, 0, 0x0cf8) // Low I/O below PCI config.
+	out = appendWordIOAddressSpace(out, 0x0d00, 0xffff, 0, 0xf300) // I/O window above PCI config.
+	out = appendDWordMemoryAddressSpace(out, 0x80000000, 0xfebfffff, 0, 0x7ec00000)
+	out = append(out, 0x79, 0x00) // End tag.
+	return out
+}
+
 func buildBootMADT(numCPUs int) []byte {
 	var body []byte
 	body = binary.LittleEndian.AppendUint32(body, acpiLocalAPICAddress)
@@ -94,6 +121,93 @@ func buildBootMADT(numCPUs int) []byte {
 	body = appendMADTInterruptOverride(body, 0, 2, 0)
 	body = appendMADTLocalAPICNMI(body)
 	return body
+}
+
+func appendNameDWord(out []byte, name string, value uint32) []byte {
+	out = append(out, 0x08)
+	out = append(out, acpiFixedString(name, 4)...)
+	out = append(out, 0x0c)
+	return binary.LittleEndian.AppendUint32(out, value)
+}
+
+func appendNameIntegerZero(out []byte, name string) []byte {
+	out = append(out, 0x08)
+	out = append(out, acpiFixedString(name, 4)...)
+	return append(out, 0x00)
+}
+
+func appendNameBuffer(out []byte, name string, data []byte) []byte {
+	out = append(out, 0x08)
+	out = append(out, acpiFixedString(name, 4)...)
+	out = append(out, 0x11)
+	body := append([]byte{0x0a, byte(len(data))}, data...)
+	out = append(out, amlPkg(len(body))...)
+	return append(out, body...)
+}
+
+func amlPkg(length int) []byte {
+	encodedLen := 1
+	for {
+		total := length + encodedLen
+		nextEncodedLen := 1
+		switch {
+		case total < 0x40:
+			nextEncodedLen = 1
+		case total < 0x1000:
+			nextEncodedLen = 2
+		case total < 0x100000:
+			nextEncodedLen = 3
+		default:
+			nextEncodedLen = 4
+		}
+		if nextEncodedLen == encodedLen {
+			length = total
+			break
+		}
+		encodedLen = nextEncodedLen
+	}
+	if length < 0x40 {
+		return []byte{byte(length)}
+	}
+	if length < 0x1000 {
+		return []byte{byte(0x40 | (length & 0x0f)), byte(length >> 4)}
+	}
+	if length < 0x100000 {
+		return []byte{byte(0x80 | (length & 0x0f)), byte(length >> 4), byte(length >> 12)}
+	}
+	return []byte{byte(0xc0 | (length & 0x0f)), byte(length >> 4), byte(length >> 12), byte(length >> 20)}
+}
+
+func appendIOPortDescriptor(out []byte, min, max uint16, align, length byte) []byte {
+	out = append(out, 0x47, 0x01)
+	out = binary.LittleEndian.AppendUint16(out, min)
+	out = binary.LittleEndian.AppendUint16(out, max)
+	out = append(out, align, length)
+	return out
+}
+
+func appendWordAddressSpace(out []byte, resourceType, flags, typeFlags byte, min, max, translation, length uint16) []byte {
+	out = append(out, 0x88, 0x0d, 0x00, resourceType, flags, typeFlags)
+	out = binary.LittleEndian.AppendUint16(out, 0)
+	out = binary.LittleEndian.AppendUint16(out, min)
+	out = binary.LittleEndian.AppendUint16(out, max)
+	out = binary.LittleEndian.AppendUint16(out, translation)
+	out = binary.LittleEndian.AppendUint16(out, length)
+	return out
+}
+
+func appendWordIOAddressSpace(out []byte, min, max, translation, length uint16) []byte {
+	return appendWordAddressSpace(out, 1, 0x00, 0x03, min, max, translation, length)
+}
+
+func appendDWordMemoryAddressSpace(out []byte, min, max, translation, length uint32) []byte {
+	out = append(out, 0x87, 0x17, 0x00, 0, 0x00, 0x06)
+	out = binary.LittleEndian.AppendUint32(out, 0)
+	out = binary.LittleEndian.AppendUint32(out, min)
+	out = binary.LittleEndian.AppendUint32(out, max)
+	out = binary.LittleEndian.AppendUint32(out, translation)
+	out = binary.LittleEndian.AppendUint32(out, length)
+	return out
 }
 
 func appendMADTInterruptOverride(body []byte, irq byte, gsi uint32, flags uint16) []byte {
