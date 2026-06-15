@@ -936,7 +936,8 @@ func (s *ContainerSession) Close() error {
 	s.cancel()
 	select {
 	case <-s.closeDone:
-	case <-time.After(2 * time.Second):
+	case <-time.After(15 * time.Second):
+		return fmt.Errorf("container session did not stop within 15s")
 	}
 	exitTiming.Dump()
 	return nil
@@ -1031,7 +1032,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 	serialOut := newSerialTranscript()
 	var serialWriter io.Writer = serialOut
 	var bootWriter *bootEventWriter
-	if onEvent != nil {
+	if onEvent != nil && req.Dmesg {
 		bootWriter = newBootEventWriter(onEvent)
 		serialWriter = io.MultiWriter(serialOut, bootWriter)
 		defer bootWriter.Close()
@@ -1361,7 +1362,7 @@ func startPersistentContainer(ctx context.Context, req ContainerRunRequest, onEv
 func persistentRunSlice(ready bool, active bool) time.Duration {
 	switch {
 	case !ready:
-		return 10 * time.Millisecond
+		return 5 * time.Second
 	case active:
 		return 5 * time.Millisecond
 	default:

@@ -95,18 +95,20 @@ type Manager struct {
 }
 
 type Machine struct {
-	id         string
-	image      string
-	initSystem string
-	kernel     string
-	memoryMB   uint64
-	cpus       int
-	nestedVirt bool
-	startedAt  time.Time
-	instance   Instance
-	lastErr    error
-	exitedAt   time.Time
-	shutdownCh chan struct{}
+	id           string
+	image        string
+	initSystem   string
+	kernel       string
+	memoryMB     uint64
+	cpus         int
+	nestedVirt   bool
+	startedAt    time.Time
+	instance     Instance
+	lastErr      error
+	exitedAt     time.Time
+	shutdownCh   chan struct{}
+	shutdownOnce sync.Once
+	stopping     bool
 }
 
 func NewManager() *Manager {
@@ -697,7 +699,9 @@ func (m *Manager) ShutdownAll(ctx context.Context) error {
 
 	var errs []error
 	for id, machine := range running {
-		close(machine.shutdownCh)
+		machine.shutdownOnce.Do(func() {
+			close(machine.shutdownCh)
+		})
 		if err := machine.instance.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("shutdown VM %q: %w", id, err))
 		}
@@ -718,11 +722,26 @@ func (m *Manager) ShutdownInstance(ctx context.Context, id string) error {
 		m.mu.Unlock()
 		return fmt.Errorf("no VM %q is running", id)
 	}
-	delete(m.running, id)
-	close(machine.shutdownCh)
+	if machine.stopping {
+		m.mu.Unlock()
+		return fmt.Errorf("VM %q is already shutting down", id)
+	}
+	machine.stopping = true
+	machine.shutdownOnce.Do(func() {
+		close(machine.shutdownCh)
+	})
 	m.mu.Unlock()
 
-	return machine.instance.Close()
+	if err := machine.instance.Close(); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	if m.running != nil && m.running[id] == machine {
+		delete(m.running, id)
+	}
+	m.mu.Unlock()
+	return nil
 }
 
 func (m *Manager) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
@@ -971,12 +990,6 @@ func (m *Manager) watch(machine *Machine) {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
-
-	select {
-	case <-machine.shutdownCh:
-		return
-	default:
-	}
 
 	if m.running != nil && m.running[machine.id] == machine {
 		delete(m.running, machine.id)

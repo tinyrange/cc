@@ -573,6 +573,7 @@ func (b *runtimeBackend) buildBlankStartRequest(ctx context.Context, req client.
 		if err != nil {
 			return vmruntime.RunRequest{}, err
 		}
+		image = withRuntimeMountDirs(image)
 	}
 	kernelProvider := b.kernelProvider(req.Kernel)
 	kernel, err := kernelProvider.ReadKernel()

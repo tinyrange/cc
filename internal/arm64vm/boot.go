@@ -27,13 +27,13 @@ func MemorySizeBytes(memoryMB uint64) uint64 {
 
 func BootCommandLine(dmesg bool) string {
 	args := []string{
+		"console=ttyS0,115200n8",
 		"nokaslr",
 		"panic=-1",
 		"rdinit=/init",
 	}
 	if dmesg {
 		args = append([]string{
-			"console=ttyS0,115200n8",
 			fmt.Sprintf("earlycon=uart8250,mmio,0x%x", bootarm64.DefaultUARTBase),
 			"keep_bootcon",
 			"loglevel=8",
@@ -49,7 +49,7 @@ func PrepareBoot(memory []byte, kernel []byte, initrd []byte, cfg BootConfig) (*
 		NumCPUs:    cfg.NumCPUs,
 		GICVersion: cfg.GICVersion,
 		Initrd:     initrd,
-		Console:    cfg.Dmesg,
+		Console:    true,
 		ExtraNodes: append([]fdt.Node(nil), cfg.ExtraNodes...),
 		RecordTime: cfg.RecordTime,
 		Cmdline:    BootCommandLine(cfg.Dmesg),
