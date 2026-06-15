@@ -156,11 +156,7 @@ func TestBootOpenBSD79RegularKernelWithGeneratedFFSRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build FFS root: %v", err)
 	}
-	disk := newTestDisk(int(region.Size()))
-	if _, err := io.Copy(io.NewOffsetWriter(disk, 0), io.NewSectionReader(region, 0, region.Size())); err != nil {
-		t.Fatalf("seed FFS disk: %v", err)
-	}
-	block := virtio.NewBlock(0, 0x1000, 10, disk)
+	block := virtio.NewBlock(0, 0x1000, 10, region)
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 	answeredRoot := false

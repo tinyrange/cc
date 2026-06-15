@@ -36,6 +36,7 @@ type Options struct {
 
 type FilesystemRegion interface {
 	io.ReaderAt
+	io.WriterAt
 	Size() int64
 }
 
