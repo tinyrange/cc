@@ -1,4 +1,4 @@
-package fsimage
+package ffs
 
 import (
 	"context"
@@ -27,8 +27,7 @@ func TestBuildFFSWritesOpenBSDRoot(t *testing.T) {
 	meta := map[string]fsmeta.Entry{
 		"/dev/console": {Mode: fsmeta.LinuxModeFromFileMode(fs.ModeDevice | fs.ModeCharDevice | 0o600), RDev: 0},
 	}
-	img, err := buildFFS(context.Background(), imagefs.NewHostFS(root, meta), Options{
-		Type:              TypeFFS,
+	img, err := Build(context.Background(), imagefs.NewHostFS(root, meta), Options{
 		SizeBytes:         16 << 20,
 		DeterministicTime: time.Unix(1234, 0),
 	})
@@ -70,6 +69,35 @@ func TestBuildFFSWritesOpenBSDRoot(t *testing.T) {
 	linkIno := reader.lookupPath("/etc/init")
 	if got := reader.symlinkTarget(linkIno); got != "/sbin/init" {
 		t.Fatalf("/etc/init target = %q", got)
+	}
+}
+
+func TestBuildFFSLazilyMapsRegularFiles(t *testing.T) {
+	file := &lazyTestFile{data: []byte("lazy payload\n")}
+	root := lazyTestDir{entries: map[string]imagefs.Entry{
+		"payload": {File: file},
+	}}
+	img, err := Build(context.Background(), root, Options{
+		SizeBytes:         16 << 20,
+		DeterministicTime: time.Unix(1234, 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if file.reads != 0 {
+		t.Fatalf("Build read file payload %d times; want lazy mapping", file.reads)
+	}
+	data := make([]byte, img.Size())
+	if _, err := img.ReadAt(data, 0); err != nil {
+		t.Fatal(err)
+	}
+	if file.reads == 0 {
+		t.Fatal("image read did not read mapped file payload")
+	}
+	reader := newFFSTestReader(t, data)
+	payloadIno := reader.lookupPath("/payload")
+	if got := string(reader.fileData(payloadIno)); got != "lazy payload\n" {
+		t.Fatalf("/payload contents = %q", got)
 	}
 }
 
@@ -173,4 +201,56 @@ func mustWriteMode(t *testing.T, path, contents string, mode fs.FileMode) {
 	if err := os.WriteFile(path, []byte(contents), mode); err != nil {
 		t.Fatal(err)
 	}
+}
+
+type lazyTestDir struct {
+	entries map[string]imagefs.Entry
+}
+
+func (d lazyTestDir) Stat() fs.FileMode       { return fs.ModeDir | 0o755 }
+func (d lazyTestDir) ModTime() time.Time      { return time.Unix(1234, 0) }
+func (d lazyTestDir) Owner() (uint32, uint32) { return 0, 0 }
+func (d lazyTestDir) RDev() uint32            { return 0 }
+func (d lazyTestDir) ReadDir() ([]imagefs.DirEnt, error) {
+	out := make([]imagefs.DirEnt, 0, len(d.entries))
+	for name, entry := range d.entries {
+		mode := fs.FileMode(0)
+		if entry.Dir != nil {
+			mode = fs.ModeDir | entry.Dir.Stat()
+		} else if entry.Symlink != nil {
+			mode = fs.ModeSymlink | entry.Symlink.Stat()
+		} else if entry.File != nil {
+			_, mode = entry.File.Stat()
+		}
+		out = append(out, imagefs.DirEnt{Name: name, Mode: mode})
+	}
+	return out, nil
+}
+func (d lazyTestDir) Lookup(name string) (imagefs.Entry, error) {
+	entry, ok := d.entries[name]
+	if !ok {
+		return imagefs.Entry{}, os.ErrNotExist
+	}
+	return entry, nil
+}
+
+type lazyTestFile struct {
+	data  []byte
+	reads int
+}
+
+func (f *lazyTestFile) Stat() (uint64, fs.FileMode) { return uint64(len(f.data)), 0o644 }
+func (f *lazyTestFile) ModTime() time.Time          { return time.Unix(1234, 0) }
+func (f *lazyTestFile) Owner() (uint32, uint32)     { return 0, 0 }
+func (f *lazyTestFile) RDev() uint32                { return 0 }
+func (f *lazyTestFile) ReadAt(off uint64, size uint32) ([]byte, error) {
+	f.reads++
+	if off >= uint64(len(f.data)) {
+		return nil, nil
+	}
+	end := off + uint64(size)
+	if end > uint64(len(f.data)) {
+		end = uint64(len(f.data))
+	}
+	return append([]byte(nil), f.data[off:end]...), nil
 }

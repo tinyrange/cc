@@ -1,4 +1,4 @@
-package fsimage
+package ffs
 
 import (
 	"context"
@@ -8,12 +8,19 @@ import (
 	"io/fs"
 	"math"
 	"path"
+	"sort"
 	"strings"
 	"time"
 
 	ffsimgvm "j5.nz/cc/internal/fsimage/vm"
 	"j5.nz/cc/internal/imagefs"
 )
+
+type Options struct {
+	SizeBytes         int64
+	ExtraBytes        int64
+	DeterministicTime time.Time
+}
 
 const (
 	defaultFFSSize = 64 << 20
@@ -60,6 +67,222 @@ const (
 	ifsock = 0o140000
 )
 
+type Superblock [8192]byte
+
+func (s *Superblock) setU32(off int, v uint32) { binary.LittleEndian.PutUint32(s[off:off+4], v) }
+func (s *Superblock) setU64(off int, v uint64) { binary.LittleEndian.PutUint64(s[off:off+8], v) }
+func (s *Superblock) SetBlockLayout() {
+	s.setU32(8, ffsSBlkNo)
+	s.setU32(12, ffsCBlkNo)
+	s.setU32(16, ffsIBlkNo)
+	s.setU32(20, ffsDBlkNo)
+	s.setU32(48, ffsBSize)
+	s.setU32(52, ffsFSize)
+	s.setU32(56, ffsFrag)
+	s.setU32(72, uint32(^uint32(ffsBSize-1)))
+	s.setU32(76, uint32(^uint32(ffsFSize-1)))
+	s.setU32(80, 14)
+	s.setU32(84, 11)
+	s.setU32(88, 1)
+	s.setU32(92, ffsBSize)
+	s.setU32(96, 3)
+	s.setU32(100, ffsFSBTODB)
+	s.setU32(104, 8192)
+	s.setU32(116, ffsNindir)
+	s.setU32(120, ffsInopb)
+	s.setU32(124, ffsNSPF)
+	s.setU32(844, ffsBSize)
+	s.setU32(1196, 16384)
+	s.setU32(1200, 64)
+	s.setU64(1336, uint64(ffsBSize-1))
+	s.setU64(1344, uint64(ffsFSize-1))
+}
+func (s *Superblock) SetSize(fsSize, dsize uint32) {
+	s.setU32(36, fsSize)
+	s.setU32(40, dsize)
+	s.setU32(192, fsSize)
+	s.setU64(1080, uint64(fsSize))
+	s.setU64(1088, uint64(dsize))
+}
+func (s *Superblock) SetCylinderGroups(ipg, fpg uint32) {
+	s.setU32(44, 1)
+	s.setU32(176, (fpg+63)/64)
+	s.setU32(180, 1)
+	s.setU32(184, 16)
+	s.setU32(188, ipg)
+	s.setU32(1096, ffsDBlkNo)
+}
+func (s *Superblock) SetSummary(ndir, nbfree, nifree, nffree uint32) {
+	s.setU32(196, ndir)
+	s.setU32(200, nbfree)
+	s.setU32(204, nifree)
+	s.setU32(208, nffree)
+	s.setU64(1008, uint64(ndir))
+	s.setU64(1016, uint64(nbfree))
+	s.setU64(1024, uint64(nifree))
+	s.setU64(1032, uint64(nffree))
+}
+func (s *Superblock) SetTimeAndID(ts int64) {
+	s.setU32(32, uint32(ts))
+	s.setU32(144, uint32(ts))
+	s.setU32(148, uint32(uint64(ts)^0x5a5a5a5a))
+	s.setU64(1072, uint64(ts))
+}
+func (s *Superblock) SetOpenBSDDefaults() {
+	s.setU32(28, 0xffffffff)
+	s.setU32(68, 60)
+	s.setU32(128, 0)
+	s.setU32(132, 64)
+	s.setU32(136, 1)
+	s.setU32(140, 0)
+	s.setU32(152, ffsDBlkNo)
+	s.setU32(156, 8192)
+	s.setU32(160, ffsBSize)
+	s.setU32(164, 1)
+	s.setU32(168, 64)
+	s.setU32(172, 64)
+	s[213] = 1
+	copy(s[216:217], "/")
+	s.setU32(840, 1)
+	s.setU64(1000, 8192)
+	s.setU32(1320, 60)
+	s.setU32(1324, 2)
+	s.setU64(1328, 0x000400400402ffff)
+	s.setU32(1356, 1)
+	s.setU32(1360, 1)
+	s.setU32(1372, ffsMagic)
+}
+
+type UFS1Dinode [ffsInodeSize]byte
+
+func (d *UFS1Dinode) SetMode(mode uint16)     { binary.LittleEndian.PutUint16(d[0:2], mode) }
+func (d *UFS1Dinode) SetNlink(n uint16)       { binary.LittleEndian.PutUint16(d[2:4], n) }
+func (d *UFS1Dinode) SetSize(size uint64)     { binary.LittleEndian.PutUint64(d[8:16], size) }
+func (d *UFS1Dinode) SetAccessTime(ts uint32) { binary.LittleEndian.PutUint32(d[16:20], ts) }
+func (d *UFS1Dinode) SetModifyTime(ts uint32) { binary.LittleEndian.PutUint32(d[24:28], ts) }
+func (d *UFS1Dinode) SetChangeTime(ts uint32) { binary.LittleEndian.PutUint32(d[32:36], ts) }
+func (d *UFS1Dinode) SetDirectBlock(i int, b uint32) {
+	binary.LittleEndian.PutUint32(d[40+i*4:44+i*4], b)
+}
+func (d *UFS1Dinode) SetIndirectBlock(i int, b uint32) {
+	binary.LittleEndian.PutUint32(d[88+i*4:92+i*4], b)
+}
+func (d *UFS1Dinode) SetInlineSymlink(target string) { copy(d[40:100], target) }
+func (d *UFS1Dinode) SetRDev(rdev uint32)            { d.SetDirectBlock(0, rdev) }
+func (d *UFS1Dinode) SetBlocks(blocks uint32)        { binary.LittleEndian.PutUint32(d[104:108], blocks) }
+func (d *UFS1Dinode) SetGeneration(gen uint32)       { binary.LittleEndian.PutUint32(d[108:112], gen) }
+func (d *UFS1Dinode) SetUID(uid uint32)              { binary.LittleEndian.PutUint32(d[112:116], uid) }
+func (d *UFS1Dinode) SetGID(gid uint32)              { binary.LittleEndian.PutUint32(d[116:120], gid) }
+
+type CylinderGroup [ffsBSize]byte
+
+func (c *CylinderGroup) setU16(off int, v uint16) { binary.LittleEndian.PutUint16(c[off:off+2], v) }
+func (c *CylinderGroup) setU32(off int, v uint32) { binary.LittleEndian.PutUint32(c[off:off+4], v) }
+func (c *CylinderGroup) SetHeader(ts int64, ipg, fpg uint32) {
+	c.setU32(4, cgMagic)
+	c.setU32(8, uint32(ts))
+	c.setU16(16, 1)
+	c.setU16(18, uint16(ipg/ffsInopb))
+	c.setU32(20, fpg)
+	c.setU32(112, ipg/ffsInopb)
+	c.setU32(116, ipg/ffsInopb)
+	c.setU32(136, uint32(ts))
+}
+func (c *CylinderGroup) SetSummary(ndir, nbfree, nifree, nffree uint32) {
+	c.setU32(24, ndir)
+	c.setU32(28, nbfree)
+	c.setU32(32, nifree)
+	c.setU32(36, nffree)
+}
+func (c *CylinderGroup) SetRotors(block, frag, ino uint32) {
+	c.setU32(40, block)
+	c.setU32(44, frag)
+	c.setU32(48, ino)
+}
+func (c *CylinderGroup) SetOffsets(btotoff, boff, iusedoff, freeoff, nextfreeoff uint32) {
+	c.setU32(80, btotoff)
+	c.setU32(84, boff)
+	c.setU32(88, iusedoff)
+	c.setU32(92, freeoff)
+	c.setU32(96, nextfreeoff)
+}
+func (c *CylinderGroup) MarkInodeUsed(iusedoff uint32, ino int) {
+	c[iusedoff+uint32(ino/8)] |= 1 << uint(ino%8)
+}
+func (c *CylinderGroup) MarkFragFree(freeoff, frag uint32) {
+	c[freeoff+frag/8] |= 1 << uint(frag%8)
+}
+func (c *CylinderGroup) SetBlockTotals(btotoff, boff, nbfree uint32) {
+	c.setU32(int(btotoff), nbfree)
+	c.setU16(int(boff), uint16(nbfree))
+}
+
+type Disklabel [ffsSectorSize]byte
+
+func (d *Disklabel) setU16(off int, v uint16) { binary.LittleEndian.PutUint16(d[off:off+2], v) }
+func (d *Disklabel) setU32(off int, v uint32) { binary.LittleEndian.PutUint32(d[off:off+4], v) }
+func (d *Disklabel) SetHeader(totalSectors uint32) {
+	d.setU32(0, dlMagic)
+	d.setU16(4, 12)
+	copy(d[8:24], []byte("vnd device"))
+	copy(d[24:40], []byte("fictitious"))
+	d.setU32(40, ffsSectorSize)
+	d.setU32(44, 100)
+	d.setU32(48, 1)
+	d.setU32(52, (totalSectors+99)/100)
+	d.setU32(56, 100)
+	d.setU32(60, totalSectors)
+	d.setU32(80, ffsPartLBA)
+	d.setU32(84, totalSectors)
+	d.setU32(92, totalSectors)
+	d.setU16(114, 1)
+	d.setU32(132, dlMagic)
+	d.setU16(138, 16)
+}
+func (d *Disklabel) SetPartition(index int, size, offset uint32, fstype, fragblock byte, cpg uint16) {
+	part := 148 + index*16
+	d.setU32(part, size)
+	d.setU32(part+4, offset)
+	d[part+12] = fstype
+	d[part+13] = fragblock
+	d.setU16(part+14, cpg)
+}
+func (d *Disklabel) UpdateChecksum() {
+	d.setU16(136, 0)
+	var sum uint16
+	for off := 0; off < 148+16*16; off += 2 {
+		sum ^= binary.LittleEndian.Uint16(d[off : off+2])
+	}
+	d.setU16(136, sum)
+}
+
+type MBR [ffsSectorSize]byte
+
+func (m *MBR) SetOpenBSDPartition(start, sectors uint32) {
+	part := m[446+3*16 : 446+4*16]
+	part[0] = 0x80
+	part[1] = 0x00
+	part[2] = 0x01
+	part[3] = 0x10
+	part[4] = 0xa6
+	part[5] = 0xfe
+	part[6] = 0xff
+	part[7] = 0xff
+	binary.LittleEndian.PutUint32(part[8:12], start)
+	binary.LittleEndian.PutUint32(part[12:16], sectors)
+	m[510] = 0x55
+	m[511] = 0xaa
+}
+
+type Direct struct {
+	buf []byte
+}
+
+func (d Direct) SetIno(ino uint32)   { binary.LittleEndian.PutUint32(d.buf[0:4], ino) }
+func (d Direct) SetReclen(n uint16)  { binary.LittleEndian.PutUint16(d.buf[4:6], n) }
+func (d Direct) SetType(typ uint8)   { d.buf[6] = typ }
+func (d Direct) SetName(name string) { d.buf[7] = byte(len(name)); copy(d.buf[8:], name) }
+
 type ffsStats struct {
 	files uint64
 	dirs  uint64
@@ -100,7 +323,7 @@ type ffsBuilder struct {
 	now       int64
 }
 
-func buildFFS(ctx context.Context, root imagefs.Directory, opts Options) (*ffsimgvm.VirtualMemory, error) {
+func Build(ctx context.Context, root imagefs.Directory, opts Options) (*ffsimgvm.VirtualMemory, error) {
 	if root == nil {
 		return nil, fmt.Errorf("root filesystem is required")
 	}
@@ -131,7 +354,7 @@ func buildFFS(ctx context.Context, root imagefs.Directory, opts Options) (*ffsim
 		fsFrags:   uint32(fsSize / ffsFSize),
 		nextIno:   ffsRootIno,
 		nextFrag:  ffsDBlkNo,
-		usedFrags: make([]bool, uint32(size/ffsFSize)),
+		usedFrags: make([]bool, uint32(fsSize/ffsFSize)),
 		now:       time.Now().Unix(),
 	}
 	if !opts.DeterministicTime.IsZero() {
@@ -166,6 +389,15 @@ func buildFFS(ctx context.Context, root imagefs.Directory, opts Options) (*ffsim
 	b.writeSuperblocks(ipg)
 	b.writeCylinderGroup(ipg, rootNode)
 	return b.vm, nil
+}
+
+func Write(ctx context.Context, w io.Writer, root imagefs.Directory, opts Options) error {
+	vm, err := Build(ctx, root, opts)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(w, io.NewSectionReader(vm, 0, vm.Size()))
+	return err
 }
 
 func scanFFS(ctx context.Context, dir imagefs.Directory, guestPath string) (ffsStats, error) {
@@ -367,27 +599,50 @@ func (b *ffsBuilder) writeTree(node *ffsNode) error {
 }
 
 func (b *ffsBuilder) writeFileData(node *ffsNode) error {
-	remaining := int64(node.size)
-	offset := uint64(0)
-	buf := make([]byte, ffsBSize)
-	for _, block := range node.blocks {
-		n := int64(len(buf))
-		if remaining < n {
-			n = remaining
+	region := imageFileRegion{file: node.file, size: int64(node.size)}
+	for i, block := range node.blocks {
+		srcOff := int64(i * ffsBSize)
+		size := int64(ffsBSize)
+		if remaining := int64(node.size) - srcOff; remaining < size {
+			size = remaining
 		}
-		data, err := node.file.ReadAt(offset, uint32(n))
-		if err != nil && err != io.EOF {
-			return fmt.Errorf("read %s: %w", node.name, err)
+		if size <= 0 {
+			break
 		}
-		clear(buf)
-		copy(buf, data)
-		if _, err := b.vm.WriteAt(buf, b.fsOffset+int64(block)*ffsFSize); err != nil {
+		blockRegion := ffsimgvm.NewTruncatedRegion(ffsimgvm.NewOffsetRegion(region, srcOff), size)
+		if err := b.vm.Map(blockRegion, b.fsOffset+int64(block)*ffsFSize); err != nil {
 			return err
 		}
-		offset += uint64(n)
-		remaining -= n
 	}
 	return nil
+}
+
+type imageFileRegion struct {
+	file imagefs.File
+	size int64
+}
+
+func (r imageFileRegion) Size() int64 { return r.size }
+
+func (r imageFileRegion) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, fmt.Errorf("off < 0")
+	}
+	if off >= r.size {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > r.size-off {
+		p = p[:int(r.size-off)]
+	}
+	data, err := r.file.ReadAt(uint64(off), uint32(len(p)))
+	if len(data) > len(p) {
+		data = data[:len(p)]
+	}
+	return copy(p, data), err
+}
+
+func (r imageFileRegion) WriteAt([]byte, int64) (int, error) {
+	return 0, fmt.Errorf("region is read only")
 }
 
 func (b *ffsBuilder) writeNodeData(node *ffsNode, data []byte) error {
@@ -407,27 +662,27 @@ func (b *ffsBuilder) writeNodeData(node *ffsNode, data []byte) error {
 }
 
 func (b *ffsBuilder) writeInode(node *ffsNode) {
-	var ino [ffsInodeSize]byte
-	binary.LittleEndian.PutUint16(ino[0:2], node.mode)
-	binary.LittleEndian.PutUint16(ino[2:4], uint16(b.linkCount(node)))
-	binary.LittleEndian.PutUint64(ino[8:16], node.size)
+	var ino UFS1Dinode
+	ino.SetMode(node.mode)
+	ino.SetNlink(uint16(b.linkCount(node)))
+	ino.SetSize(node.size)
 	t := uint32(b.now)
 	if !node.modTime.IsZero() {
 		t = uint32(node.modTime.Unix())
 	}
-	binary.LittleEndian.PutUint32(ino[16:20], t)
-	binary.LittleEndian.PutUint32(ino[24:28], t)
-	binary.LittleEndian.PutUint32(ino[32:36], t)
+	ino.SetAccessTime(t)
+	ino.SetModifyTime(t)
+	ino.SetChangeTime(t)
 	if node.mode&ifmt == iflnk && len(node.target) <= 60 {
-		copy(ino[40:100], []byte(node.target))
+		ino.SetInlineSymlink(node.target)
 	} else if node.mode&ifmt == ifchr || node.mode&ifmt == ifblk {
-		binary.LittleEndian.PutUint32(ino[40:44], node.rdev)
+		ino.SetRDev(node.rdev)
 	} else {
 		for i := 0; i < len(node.blocks) && i < 12; i++ {
-			binary.LittleEndian.PutUint32(ino[40+i*4:44+i*4], node.blocks[i])
+			ino.SetDirectBlock(i, node.blocks[i])
 		}
 		if node.indirect != 0 {
-			binary.LittleEndian.PutUint32(ino[88:92], node.indirect)
+			ino.SetIndirectBlock(0, node.indirect)
 			var indirect [ffsBSize]byte
 			for i, block := range node.blocks[12:] {
 				binary.LittleEndian.PutUint32(indirect[i*4:i*4+4], block)
@@ -435,10 +690,10 @@ func (b *ffsBuilder) writeInode(node *ffsNode) {
 			_, _ = b.vm.WriteAt(indirect[:], b.fsOffset+int64(node.indirect)*ffsFSize)
 		}
 	}
-	binary.LittleEndian.PutUint32(ino[104:108], uint32(len(node.blocks)*ffsBSize/ffsSectorSize))
-	binary.LittleEndian.PutUint32(ino[108:112], node.ino*1103515245+12345)
-	binary.LittleEndian.PutUint32(ino[112:116], node.uid)
-	binary.LittleEndian.PutUint32(ino[116:120], node.gid)
+	ino.SetBlocks(uint32(len(node.blocks) * ffsBSize / ffsSectorSize))
+	ino.SetGeneration(node.ino*1103515245 + 12345)
+	ino.SetUID(node.uid)
+	ino.SetGID(node.gid)
 	_, _ = b.vm.WriteAt(ino[:], b.fsOffset+int64(ffsIBlkNo*ffsFSize+node.ino*ffsInodeSize))
 }
 
@@ -456,111 +711,26 @@ func (b *ffsBuilder) linkCount(node *ffsNode) int {
 }
 
 func (b *ffsBuilder) writeSuperblocks(ipg uint32) {
-	var sb [8192]byte
+	var sb Superblock
 	fsSize := b.fsFrags
 	dsize := fsSize - ffsDBlkNo
 	nbfree, nffree := b.freeSummary()
 	ndir := uint32(countDirsFromInodes(b.usedInos))
-	put32 := func(off int, v uint32) { binary.LittleEndian.PutUint32(sb[off:off+4], v) }
-	put64 := func(off int, v uint64) { binary.LittleEndian.PutUint64(sb[off:off+8], v) }
-	put32(8, ffsSBlkNo)
-	put32(12, ffsCBlkNo)
-	put32(16, ffsIBlkNo)
-	put32(20, ffsDBlkNo)
-	put32(28, 0xffffffff)
-	put32(32, uint32(b.now))
-	put32(36, fsSize)
-	put32(40, dsize)
-	put32(44, 1)
-	put32(48, ffsBSize)
-	put32(52, ffsFSize)
-	put32(56, ffsFrag)
-	put32(68, 60)
-	put32(72, uint32(^uint32(ffsBSize-1)))
-	put32(76, uint32(^uint32(ffsFSize-1)))
-	put32(80, 14)
-	put32(84, 11)
-	put32(88, 1)
-	put32(92, ffsBSize)
-	put32(96, 3)
-	put32(100, ffsFSBTODB)
-	put32(104, 8192)
-	put32(116, ffsNindir)
-	put32(120, ffsInopb)
-	put32(124, ffsNSPF)
-	put32(128, 0)
-	put32(132, 64)
-	put32(136, 1)
-	put32(140, 0)
-	put32(144, uint32(b.now))
-	put32(148, uint32(uint64(b.now)^0x5a5a5a5a))
-	put32(152, ffsDBlkNo)
-	put32(156, 8192)
-	put32(160, ffsBSize)
-	put32(164, 1)
-	put32(168, 64)
-	put32(172, 64)
-	put32(176, (fsSize+63)/64)
-	put32(180, 1)
-	put32(184, 16)
-	put32(188, ipg)
-	put32(192, fsSize)
-	put32(196, ndir)
-	put32(200, nbfree)
-	put32(204, uint32(len(b.usedInos))-uint32(countUsedInos(b.usedInos)))
-	put32(208, nffree)
-	sb[212] = 0
-	sb[213] = 1
-	copy(sb[216:216+1], "/")
-	put32(808, 0)
-	put32(840, 1)
-	put32(844, ffsBSize)
-	put64(1000, 8192)
-	put64(1008, uint64(ndir))
-	put64(1016, uint64(nbfree))
-	put64(1024, uint64(len(b.usedInos)-countUsedInos(b.usedInos)))
-	put64(1032, uint64(nffree))
-	put64(1072, uint64(b.now))
-	put64(1080, uint64(fsSize))
-	put64(1088, uint64(dsize))
-	put64(1096, ffsDBlkNo)
-	put32(1196, 16384)
-	put32(1200, 64)
-	put32(1312, 0)
-	put32(1316, 0)
-	put32(1320, 60)
-	put32(1324, 2)
-	put64(1328, 0x000400400402ffff)
-	put64(1336, uint64(ffsBSize-1))
-	put64(1344, uint64(ffsFSize-1))
-	put32(1352, 0)
-	put32(1356, 1)
-	put32(1360, 1)
-	put32(1364, 0)
-	put32(1368, 0)
-	put32(1372, ffsMagic)
+	nifree := uint32(len(b.usedInos)) - uint32(countUsedInos(b.usedInos))
+	sb.SetBlockLayout()
+	sb.SetOpenBSDDefaults()
+	sb.SetTimeAndID(b.now)
+	sb.SetSize(fsSize, dsize)
+	sb.SetCylinderGroups(ipg, fsSize)
+	sb.SetSummary(ndir, nbfree, nifree, nffree)
 	_, _ = b.vm.WriteAt(sb[:], b.fsOffset+ffsSBOFF)
 	_, _ = b.vm.WriteAt(sb[:], b.fsOffset+int64(ffsSBlkNo*ffsFSize))
 }
 
 func (b *ffsBuilder) writeCylinderGroup(ipg uint32, rootNode *ffsNode) {
-	var cg [ffsBSize]byte
+	var cg CylinderGroup
 	nbfree, nffree := b.freeSummary()
 	ndir := uint32(countDirNodes(rootNode))
-	put32 := func(off int, v uint32) { binary.LittleEndian.PutUint32(cg[off:off+4], v) }
-	put16 := func(off int, v uint16) { binary.LittleEndian.PutUint16(cg[off:off+2], v) }
-	put32(4, cgMagic)
-	put32(8, uint32(b.now))
-	put16(16, 1)
-	put16(18, uint16(ipg/ffsInopb))
-	put32(20, b.fsFrags)
-	put32(24, ndir)
-	put32(28, nbfree)
-	put32(32, ipg-uint32(countUsedInos(b.usedInos)))
-	put32(36, nffree)
-	put32(40, b.nextFrag)
-	put32(44, b.nextFrag)
-	put32(48, b.nextIno)
 	btotoff := uint32(0xa8)
 	boff := uint32(0xac)
 	iusedoff := uint32(0xae)
@@ -569,85 +739,39 @@ func (b *ffsBuilder) writeCylinderGroup(ipg uint32, rootNode *ffsNode) {
 		freeoff++
 	}
 	nextfreeoff := freeoff + uint32((b.fsFrags+7)/8)
-	put32(80, btotoff)
-	put32(84, boff)
-	put32(88, iusedoff)
-	put32(92, freeoff)
-	put32(96, nextfreeoff)
-	put32(112, ipg/ffsInopb)
-	put32(116, ipg/ffsInopb)
-	put32(136, uint32(b.now))
+	cg.SetHeader(b.now, ipg, b.fsFrags)
+	cg.SetSummary(ndir, nbfree, ipg-uint32(countUsedInos(b.usedInos)), nffree)
+	cg.SetRotors(b.nextFrag, b.nextFrag, b.nextIno)
+	cg.SetOffsets(btotoff, boff, iusedoff, freeoff, nextfreeoff)
 	for ino, used := range b.usedInos {
 		if used {
-			cg[iusedoff+uint32(ino/8)] |= 1 << uint(ino%8)
+			cg.MarkInodeUsed(iusedoff, ino)
 		}
 	}
 	for frag := uint32(0); frag < b.fsFrags; frag++ {
 		if !b.usedFrags[frag] {
-			cg[freeoff+frag/8] |= 1 << uint(frag%8)
+			cg.MarkFragFree(freeoff, frag)
 		}
 	}
-	binary.LittleEndian.PutUint32(cg[btotoff:btotoff+4], nbfree)
-	binary.LittleEndian.PutUint16(cg[boff:boff+2], uint16(nbfree))
+	cg.SetBlockTotals(btotoff, boff, nbfree)
 	_, _ = b.vm.WriteAt(cg[:], b.fsOffset+int64(ffsCBlkNo*ffsFSize))
 }
 
 func (b *ffsBuilder) writeDisklabel() {
-	var sec [ffsSectorSize]byte
-	put32 := func(off int, v uint32) { binary.LittleEndian.PutUint32(sec[off:off+4], v) }
-	put16 := func(off int, v uint16) { binary.LittleEndian.PutUint16(sec[off:off+2], v) }
+	var label Disklabel
 	totalSectors := uint32(b.size / ffsSectorSize)
 	fsSectors := uint32(b.fsSize / ffsSectorSize)
-	put32(0, dlMagic)
-	put16(4, 12)
-	copy(sec[8:24], []byte("vnd device"))
-	copy(sec[24:40], []byte("fictitious"))
-	put32(40, ffsSectorSize)
-	put32(44, 100)
-	put32(48, 1)
-	put32(52, (totalSectors+99)/100)
-	put32(56, 100)
-	put32(60, totalSectors)
-	put32(80, ffsPartLBA)
-	put32(84, totalSectors)
-	put32(92, totalSectors)
-	put16(114, 1)
-	put32(132, dlMagic)
-	put16(138, 16)
-	part := 148
-	put32(part, fsSectors)
-	put32(part+4, ffsPartLBA)
-	sec[part+12] = 7
-	sec[part+13] = byte(((15 - 13) << 3) | 4)
-	put16(part+14, 16)
-	cpart := 148 + 2*16
-	put32(cpart, totalSectors)
-	put32(cpart+4, 0)
-	for off := 0; off < 148+16*16; off += 2 {
-		if off == 136 {
-			continue
-		}
-		put16(136, binary.LittleEndian.Uint16(sec[136:138])^binary.LittleEndian.Uint16(sec[off:off+2]))
-	}
-	_, _ = b.vm.WriteAt(sec[:], b.fsOffset+ffsSectorSize)
+	label.SetHeader(totalSectors)
+	label.SetPartition(0, fsSectors, ffsPartLBA, 7, byte(((15-13)<<3)|4), 16)
+	label.SetPartition(2, totalSectors, 0, 0, 0, 0)
+	label.UpdateChecksum()
+	_, _ = b.vm.WriteAt(label[:], b.fsOffset+ffsSectorSize)
 }
 
 func (b *ffsBuilder) writeMBR() {
-	var mbr [ffsSectorSize]byte
+	var mbr MBR
 	sectors := uint32(b.fsSize / ffsSectorSize)
-	part := mbr[446+3*16 : 446+4*16]
-	part[0] = 0x80
-	part[1] = 0x00
-	part[2] = 0x01
-	part[3] = 0x10
-	part[4] = 0xa6
-	part[5] = 0xfe
-	part[6] = 0xff
-	part[7] = 0xff
-	binary.LittleEndian.PutUint32(part[8:12], ffsPartLBA)
-	binary.LittleEndian.PutUint32(part[12:16], sectors)
-	mbr[510] = 0x55
-	mbr[511] = 0xaa
+	mbr.SetOpenBSDPartition(ffsPartLBA, sectors)
 	_, _ = b.vm.WriteAt(mbr[:], 0)
 }
 
@@ -703,11 +827,11 @@ func encodeFFSDir(node *ffsNode) []byte {
 		if i == len(entries)-1 {
 			reclen = size - off
 		}
-		binary.LittleEndian.PutUint32(buf[off:off+4], e.ino)
-		binary.LittleEndian.PutUint16(buf[off+4:off+6], uint16(reclen))
-		buf[off+6] = e.typ
-		buf[off+7] = byte(len(e.name))
-		copy(buf[off+8:], e.name)
+		ent := Direct{buf: buf[off : off+reclen]}
+		ent.SetIno(e.ino)
+		ent.SetReclen(uint16(reclen))
+		ent.SetType(e.typ)
+		ent.SetName(e.name)
 		off += reclen
 	}
 	return buf
@@ -750,6 +874,18 @@ func goModeToFFS(mode fs.FileMode) uint16 {
 	default:
 		return ifreg | perm
 	}
+}
+
+func sortedImageDirEnts(entries []imagefs.DirEnt) []imagefs.DirEnt {
+	out := append([]imagefs.DirEnt(nil), entries...)
+	sort.Slice(out, func(i, j int) bool {
+		return strings.Compare(out[i].Name, out[j].Name) < 0
+	})
+	return out
+}
+
+func roundUp(v, align int64) int64 {
+	return ((v + align - 1) / align) * align
 }
 
 func roundUpFrag(v, frag uint32) uint32 {
