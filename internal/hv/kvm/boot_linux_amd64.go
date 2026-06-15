@@ -5,10 +5,13 @@ package kvm
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"j5.nz/cc/internal/amd64vm"
 	"j5.nz/cc/internal/serial"
 	"j5.nz/cc/internal/virtio"
@@ -50,7 +53,7 @@ func BootInitramfsToMarkerWithFS(ctx context.Context, kernel []byte, initrd []by
 	if strings.TrimSpace(marker) == "" {
 		return "", fmt.Errorf("boot marker is required")
 	}
-	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, nil, func(serial string) bool {
+	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, nil, nil, func(serial string) bool {
 		return strings.Contains(serial, marker)
 	})
 }
@@ -59,16 +62,25 @@ func BootInitramfsToMarkerWithFSAndNet(ctx context.Context, kernel []byte, initr
 	if strings.TrimSpace(marker) == "" {
 		return "", fmt.Errorf("boot marker is required")
 	}
-	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, netdev, func(serial string) bool {
+	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, fsdevs, nil, netdev, nil, func(serial string) bool {
+		return strings.Contains(serial, marker)
+	})
+}
+
+func BootInitramfsToMarkerWithPCIBlock(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, marker string, block *virtio.Block) (string, error) {
+	if strings.TrimSpace(marker) == "" {
+		return "", fmt.Errorf("boot marker is required")
+	}
+	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, nil, nil, block, func(serial string) bool {
 		return strings.Contains(serial, marker)
 	})
 }
 
 func bootToCondition(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, done func(string) bool) (string, error) {
-	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, nil, nil, done)
+	return bootToConditionWithDevices(ctx, kernel, initrd, memoryMB, dmesg, nil, nil, nil, nil, done)
 }
 
-func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, done func(string) bool) (string, error) {
+func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byte, memoryMB uint64, dmesg bool, fsdevs []*virtio.FS, vsock *virtio.Vsock, netdev *virtio.Net, block *virtio.Block, done func(string) bool) (string, error) {
 	vm, err := NewVM()
 	if err != nil {
 		return "", err
@@ -93,6 +105,11 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 	if netdev != nil {
 		netdev.Attach(vm, vm)
 	}
+	var pci *PCIBus
+	if block != nil {
+		block.Attach(vm, vm)
+		pci = NewPCIBus(NewVirtioBlockPCIDevice(1, 0x1000, 10, block))
+	}
 	rng := virtio.NewRNG(amd64vm.RNGBase, amd64vm.RNGSize, amd64vm.RNGIRQ)
 	rng.Attach(vm, vm)
 
@@ -102,6 +119,9 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 	}
 	if netdev != nil {
 		extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(netdev.Base, netdev.IRQ))
+	}
+	if block != nil {
+		extraCmdline = append(extraCmdline, "acpi=off", "pci=conf1")
 	}
 	extraCmdline = append(extraCmdline, amd64vm.VirtioMMIODeviceArg(rng.Base, rng.IRQ))
 	plan, err := amd64vm.PrepareBoot(mem, kernel, initrd, amd64vm.BootConfig{
@@ -116,6 +136,20 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 		return "", fmt.Errorf("set long mode: %w", err)
 	}
 
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	vm.SetVCPUTID(0, unix.Gettid())
+	defer vm.SetVCPUTID(0, 0)
+	cancelDone := make(chan struct{})
+	defer close(cancelDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			vm.RequestImmediateExit()
+		case <-cancelDone:
+		}
+	}()
+
 	var exit Exit
 	for step := 0; ; step++ {
 		if err := ctx.Err(); err != nil {
@@ -124,7 +158,10 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 			}
 			return serialOut.String(), err
 		}
-		if err := vm.Run(&exit); err != nil {
+		if err := vm.RunVCPUInterruptible(0, &exit); err != nil {
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
 			return serialOut.String(), fmt.Errorf("run step %d: %w", step, err)
 		}
 		if done(serialOut.String()) {
@@ -132,7 +169,9 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 		}
 		switch exit.Reason {
 		case ExitIO:
-			if err := handleBootIO(uart, exit.IO); err != nil {
+			if err := handleBootIOWithPCI(func(ioExit IOExit) error {
+				return handleBootIO(uart, ioExit)
+			}, pci, exit.IO); err != nil {
 				return serialOut.String(), err
 			}
 		case ExitMMIO:
@@ -146,6 +185,9 @@ func bootToConditionWithDevices(ctx context.Context, kernel []byte, initrd []byt
 		default:
 			pc, _ := vm.GetPC()
 			return serialOut.String(), fmt.Errorf("unexpected exit reason %d at pc=%#x", exit.Reason, pc)
+		}
+		if done(serialOut.String()) {
+			return serialOut.String(), nil
 		}
 	}
 }

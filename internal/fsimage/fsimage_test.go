@@ -83,7 +83,7 @@ func TestWriteVFATPassesFsckIfInstalled(t *testing.T) {
 }
 
 func TestParseTypeAcceptsPlannedFormats(t *testing.T) {
-	for _, value := range []string{"ext4", "vfat", "iso9660"} {
+	for _, value := range []string{"ext4", "vfat", "ffs", "iso9660"} {
 		if _, err := ParseType(value); err != nil {
 			t.Fatalf("ParseType(%q): %v", value, err)
 		}

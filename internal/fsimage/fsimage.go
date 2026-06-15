@@ -19,6 +19,7 @@ type Type string
 const (
 	TypeExt4    Type = "ext4"
 	TypeVFAT    Type = "vfat"
+	TypeFFS     Type = "ffs"
 	TypeISO9660 Type = "iso9660"
 )
 
@@ -41,7 +42,7 @@ func ParseType(value string) (Type, error) {
 	switch typ := Type(strings.ToLower(strings.TrimSpace(value))); typ {
 	case "", TypeExt4:
 		return TypeExt4, nil
-	case TypeVFAT, TypeISO9660:
+	case TypeVFAT, TypeFFS, TypeISO9660:
 		return typ, nil
 	default:
 		return "", fmt.Errorf("unsupported rootfs image type %q", value)
@@ -69,6 +70,8 @@ func Build(ctx context.Context, root imagefs.Directory, opts Options) (Filesyste
 		return ext4image.Build(ctx, root, ext4Options(opts))
 	case TypeVFAT:
 		return buildFAT(ctx, root, opts)
+	case TypeFFS:
+		return buildFFS(ctx, root, opts)
 	default:
 		return nil, fmt.Errorf("rootfs image writer for type %q is not implemented", typ)
 	}
@@ -84,6 +87,13 @@ func Write(ctx context.Context, w io.Writer, root imagefs.Directory, opts Option
 		return ext4image.Write(ctx, w, root, ext4Options(opts))
 	case TypeVFAT:
 		region, err := buildFAT(ctx, root, opts)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(w, io.NewSectionReader(region, 0, region.Size()))
+		return err
+	case TypeFFS:
+		region, err := buildFFS(ctx, root, opts)
 		if err != nil {
 			return err
 		}
