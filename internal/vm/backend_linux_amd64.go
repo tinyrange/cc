@@ -22,6 +22,7 @@ import (
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/oci"
+	openbsdrootfs "j5.nz/cc/internal/openbsd/rootfs"
 	"j5.nz/cc/internal/virtio"
 	"j5.nz/cc/internal/vmruntime"
 )
@@ -43,6 +44,9 @@ func (b *runtimeBackend) Start(ctx context.Context, req client.CreateInstanceReq
 }
 
 func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	if openbsdrootfs.IsBuiltInImage(req.Image) {
+		return b.startOpenBSDStream(ctx, req, onEvent)
+	}
 	if b == nil || b.kernel == nil || b.images == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
 	}
@@ -117,6 +121,36 @@ func (b *runtimeBackend) StartBlank(ctx context.Context, req client.StartInstanc
 }
 
 func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	if openbsdrootfs.IsBuiltInImage(req.Image) {
+		return b.startOpenBSDStream(ctx, client.CreateInstanceRequest{
+			ID:             req.ID,
+			Image:          openbsdrootfs.BuiltInImageName,
+			InitSystem:     req.InitSystem,
+			Kernel:         req.Kernel,
+			Network:        req.Network,
+			KernelModules:  append([]string(nil), req.KernelModules...),
+			MemoryMB:       req.MemoryMB,
+			CPUs:           req.CPUs,
+			NestedVirt:     req.NestedVirt,
+			Dmesg:          req.Dmesg,
+			TimeoutSeconds: req.TimeoutSeconds,
+		}, onEvent)
+	}
+	if strings.TrimSpace(req.Image) != "" {
+		return b.StartStream(ctx, client.CreateInstanceRequest{
+			ID:             req.ID,
+			Image:          req.Image,
+			InitSystem:     req.InitSystem,
+			Kernel:         req.Kernel,
+			Network:        req.Network,
+			KernelModules:  append([]string(nil), req.KernelModules...),
+			MemoryMB:       req.MemoryMB,
+			CPUs:           req.CPUs,
+			NestedVirt:     req.NestedVirt,
+			Dmesg:          req.Dmesg,
+			TimeoutSeconds: req.TimeoutSeconds,
+		}, onEvent)
+	}
 	if b == nil || b.kernel == nil || b.images == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
 	}
@@ -174,6 +208,27 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 }
 
 func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
+	if openbsdrootfs.IsBuiltInImage(req.Image) {
+		inst, err := b.startOpenBSDStream(ctx, client.CreateInstanceRequest{
+			ID:             req.ID,
+			Image:          openbsdrootfs.BuiltInImageName,
+			InitSystem:     req.InitSystem,
+			Network:        req.Network,
+			MemoryMB:       req.MemoryMB,
+			CPUs:           req.CPUs,
+			Dmesg:          req.Dmesg,
+			TimeoutSeconds: req.TimeoutSeconds,
+		}, nil)
+		if err != nil {
+			return client.ExecResponse{}, err
+		}
+		defer inst.Close()
+		if len(req.Command) == 0 {
+			output, _ := inst.(*openbsdInstance).ConsoleHistory(ctx)
+			return client.ExecResponse{ExitCode: 0, Output: output}, nil
+		}
+		return inst.Exec(ctx, runExecRequest(req))
+	}
 	if b == nil || b.kernel == nil {
 		return client.ExecResponse{}, fmt.Errorf("runtime backend is not configured")
 	}
@@ -350,6 +405,9 @@ func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runni
 			Rows:       req.Rows,
 		})
 	}
+	if openbsdrootfs.IsBuiltInImage(runningImage) || openbsdrootfs.IsBuiltInImage(targetImage) {
+		return client.ExecResponse{}, fmt.Errorf("OpenBSD instances do not support executing commands from alternate images yet")
+	}
 
 	session, ok := inst.(*linuxInstance)
 	if !ok {
@@ -411,6 +469,9 @@ func (b *runtimeBackend) RunInInstanceStream(ctx context.Context, inst Instance,
 		}
 		return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
 	}
+	if openbsdrootfs.IsBuiltInImage(runningImage) || openbsdrootfs.IsBuiltInImage(targetImage) {
+		return fmt.Errorf("OpenBSD instances do not support executing commands from alternate images yet")
+	}
 
 	session, ok := inst.(*linuxInstance)
 	if !ok {
@@ -470,6 +531,9 @@ func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance
 	if targetImage == "" || targetImage == runningImage {
 		return inst.ExecStream(ctx, req, inputs, onEvent)
 	}
+	if openbsdrootfs.IsBuiltInImage(runningImage) || openbsdrootfs.IsBuiltInImage(targetImage) {
+		return fmt.Errorf("OpenBSD instances do not support executing commands from alternate images yet")
+	}
 	session, ok := inst.(*linuxInstance)
 	if !ok {
 		return fmt.Errorf("running instance does not support image mounts")
@@ -491,6 +555,189 @@ func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance
 	}
 	req.RootDir = rootDirWithinMount(mountPath, req.RootDir)
 	return inst.ExecStream(ctx, req, inputs, onEvent)
+}
+
+func (b *runtimeBackend) startOpenBSDStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	if b == nil {
+		return nil, fmt.Errorf("runtime backend is not configured")
+	}
+	if len(req.Shares) != 0 {
+		return nil, fmt.Errorf("OpenBSD runtime does not support filesystem shares yet")
+	}
+	if req.Network != nil && !req.Network.Enabled {
+		return nil, fmt.Errorf("OpenBSD runtime requires virtio-net for the managed control channel")
+	}
+	if req.CPUs > 1 {
+		return nil, fmt.Errorf("OpenBSD runtime currently supports one vCPU")
+	}
+	if req.NestedVirt {
+		return nil, fmt.Errorf("OpenBSD runtime does not support nested virtualization")
+	}
+	runtime, err := openbsdrootfs.BuildManagedRuntime(ctx, openBSDRuntimeConfig(b.guestInitCache))
+	if err != nil {
+		return nil, err
+	}
+	session, err := kvm.StartOpenBSDManagedSession(ctx, kvm.OpenBSDManagedConfig{
+		Kernel:   runtime.Kernel,
+		Root:     runtime.Root,
+		MemoryMB: req.MemoryMB,
+		Dmesg:    req.Dmesg,
+	}, onEvent)
+	if err != nil {
+		_ = runtime.Close()
+		return nil, err
+	}
+	return &openbsdInstance{
+		session: session,
+		runtime: runtime,
+		root:    runtime.RootFS,
+		baseEnv: openBSDEffectiveExecEnv(nil, nil, false),
+		workDir: "/",
+		dmesg:   req.Dmesg,
+	}, nil
+}
+
+func openBSDRuntimeConfig(guestInitCache string) openbsdrootfs.Config {
+	cacheDir := guestInitCache
+	if cacheDir == "" {
+		cacheDir = filepath.Join(os.TempDir(), "cc-openbsd")
+	} else {
+		cacheDir = filepath.Join(filepath.Dir(cacheDir), "openbsd")
+	}
+	return openbsdrootfs.Config{CacheDir: cacheDir}
+}
+
+type openbsdInstance struct {
+	session *kvm.ManagedSession
+	runtime *openbsdrootfs.Runtime
+	root    imagefs.Directory
+	baseEnv []string
+	workDir string
+	dmesg   bool
+}
+
+func (i *openbsdInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
+	if i == nil || i.session == nil {
+		return client.ExecResponse{}, fmt.Errorf("instance is not running")
+	}
+	if req.Kind != "" && req.Kind != "exec" {
+		return i.session.Exec(ctx, req)
+	}
+	execReq, err := i.openBSDExecRequest(req)
+	if err != nil {
+		return client.ExecResponse{}, err
+	}
+	return i.session.Exec(ctx, execReq)
+}
+
+func (i *openbsdInstance) AddShare(context.Context, client.ShareMount) error {
+	return fmt.Errorf("OpenBSD runtime does not support filesystem shares yet")
+}
+
+func (i *openbsdInstance) AddPortForward(context.Context, client.PortForward) error {
+	return fmt.Errorf("OpenBSD runtime does not support port forwards yet")
+}
+
+func (i *openbsdInstance) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
+	if i == nil || i.session == nil {
+		return fmt.Errorf("instance is not running")
+	}
+	if req.Kind != "" && req.Kind != "exec" {
+		workDir := req.WorkDir
+		if workDir == "" {
+			workDir = i.workDir
+		}
+		req.WorkDir = workDir
+		return i.session.ExecStream(ctx, req, inputs, onEvent)
+	}
+	execReq, err := i.openBSDExecRequest(req)
+	if err != nil {
+		return err
+	}
+	return i.session.ExecStream(ctx, execReq, inputs, onEvent)
+}
+
+func (i *openbsdInstance) openBSDExecRequest(req client.ExecRequest) (client.ExecRequest, error) {
+	env := openBSDEffectiveExecEnv(i.baseEnv, req.Env, req.ReplaceEnv)
+	command := append([]string(nil), req.Command...)
+	if !req.SkipResolve {
+		if i.root == nil {
+			return client.ExecRequest{}, fmt.Errorf("running OpenBSD instance does not have a root filesystem")
+		}
+		var err error
+		command, err = imagefs.ResolveCommand(i.root, req.Command, env)
+		if err != nil {
+			return client.ExecRequest{}, err
+		}
+	}
+	workDir := req.WorkDir
+	if workDir == "" {
+		workDir = i.workDir
+	}
+	if workDir == "" {
+		workDir = "/"
+	}
+	if !strings.HasPrefix(workDir, "/") {
+		return client.ExecRequest{}, fmt.Errorf("workdir must be absolute")
+	}
+	return client.ExecRequest{
+		Command:     command,
+		Env:         env,
+		RootDir:     req.RootDir,
+		ReplaceEnv:  req.ReplaceEnv,
+		SkipResolve: req.SkipResolve,
+		WorkDir:     workDir,
+		User:        req.User,
+		Stdin:       append([]byte(nil), req.Stdin...),
+		TTY:         req.TTY,
+		ControlFD:   req.ControlFD,
+		Cols:        req.Cols,
+		Rows:        req.Rows,
+	}, nil
+}
+
+func (i *openbsdInstance) Flush(ctx context.Context) error {
+	if i == nil || i.session == nil {
+		return nil
+	}
+	return i.session.Flush(ctx)
+}
+
+func (i *openbsdInstance) ConsoleHistory(ctx context.Context) (string, error) {
+	if i == nil || i.session == nil {
+		return "", nil
+	}
+	return i.session.ConsoleHistory(ctx)
+}
+
+func (i *openbsdInstance) Wait() error {
+	if i == nil || i.session == nil {
+		return nil
+	}
+	return i.session.Wait()
+}
+
+func (i *openbsdInstance) Close() error {
+	if i == nil || i.session == nil {
+		return nil
+	}
+	err := i.session.Close()
+	if closeErr := i.runtime.Close(); err == nil {
+		err = closeErr
+	}
+	return err
+}
+
+func openBSDEffectiveExecEnv(base, overrides []string, replace bool) []string {
+	defaults := []string{
+		"PATH=/bin:/sbin:/usr/bin:/usr/sbin",
+		"HOME=/root",
+		"TERM=xterm",
+	}
+	if replace {
+		return vmruntime.MergeEnv(defaults, overrides)
+	}
+	return vmruntime.MergeEnv(vmruntime.MergeEnv(defaults, base), overrides)
 }
 
 func linuxAMD64NotImplemented() error {

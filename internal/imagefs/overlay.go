@@ -60,6 +60,46 @@ func (o *Overlay) AddFile(guestPath string, mode fs.FileMode, data []byte) error
 	return nil
 }
 
+func (o *Overlay) AddDevice(guestPath string, mode fs.FileMode, rdev uint32) error {
+	if o == nil {
+		return fmt.Errorf("overlay is nil")
+	}
+	clean := cleanOverlayPath(guestPath)
+	if clean == "/" {
+		return fmt.Errorf("cannot replace overlay root with device")
+	}
+	parent, err := o.ensureDir(path.Dir(clean), fs.ModeDir|0o755)
+	if err != nil {
+		return err
+	}
+	parent.overrides[path.Base(clean)] = Entry{File: &overlayFile{
+		mode:    mode,
+		rdev:    rdev,
+		modTime: time.Now(),
+	}}
+	return nil
+}
+
+func (o *Overlay) AddSymlink(guestPath, target string) error {
+	if o == nil {
+		return fmt.Errorf("overlay is nil")
+	}
+	clean := cleanOverlayPath(guestPath)
+	if clean == "/" {
+		return fmt.Errorf("cannot replace overlay root with symlink")
+	}
+	parent, err := o.ensureDir(path.Dir(clean), fs.ModeDir|0o755)
+	if err != nil {
+		return err
+	}
+	parent.overrides[path.Base(clean)] = Entry{Symlink: &overlaySymlink{
+		mode:    fs.ModeSymlink | 0o777,
+		target:  target,
+		modTime: time.Now(),
+	}}
+	return nil
+}
+
 type overlayDir struct {
 	base      Directory
 	mode      fs.FileMode
@@ -197,6 +237,15 @@ type overlayFile struct {
 	modTime time.Time
 }
 
+type overlaySymlink struct {
+	mode    fs.FileMode
+	uid     uint32
+	gid     uint32
+	rdev    uint32
+	target  string
+	modTime time.Time
+}
+
 func (f *overlayFile) Stat() (uint64, fs.FileMode) { return f.size, f.mode }
 func (f *overlayFile) ModTime() time.Time          { return f.modTime }
 func (f *overlayFile) Owner() (uint32, uint32)     { return f.uid, f.gid }
@@ -211,6 +260,12 @@ func (f *overlayFile) ReadAt(off uint64, size uint32) ([]byte, error) {
 	}
 	return append([]byte(nil), f.data[off:end]...), nil
 }
+
+func (l *overlaySymlink) Stat() fs.FileMode       { return l.mode & 0o7777 }
+func (l *overlaySymlink) ModTime() time.Time      { return l.modTime }
+func (l *overlaySymlink) Target() string          { return l.target }
+func (l *overlaySymlink) Owner() (uint32, uint32) { return l.uid, l.gid }
+func (l *overlaySymlink) RDev() uint32            { return l.rdev }
 
 func cleanOverlayPath(guestPath string) string {
 	return path.Clean("/" + strings.TrimPrefix(strings.TrimSpace(guestPath), "/"))

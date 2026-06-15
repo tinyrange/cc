@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sort"
 	"sync"
 )
 
@@ -104,8 +105,9 @@ type VirtualMemory struct {
 	pageSize uint32
 	// The size of a page is always pageSize.
 	// Any pages smaller must be fragmentedRegions and any pages larger must be split into OffsetRegions.
-	pages     PageTable
-	totalSize int64
+	pages      PageTable
+	writePages PageTable
+	totalSize  int64
 
 	// stats
 	totalMaps         int64
@@ -123,13 +125,21 @@ func (vm *VirtualMemory) mapFragment(region MemoryRegion, offset int64) error {
 	regionIndex := offset / int64(vm.pageSize)
 	regionOffset := offset % int64(vm.pageSize)
 
-	existingRegion := vm.pages.Get(uint64(regionIndex))
+	existingRegion := vm.writePages.Get(uint64(regionIndex))
+	if existingRegion == nil {
+		existingRegion = vm.pages.Get(uint64(regionIndex))
+	}
 	if existingRegion != nil {
 		// if a region already exists then check if it's a fragmentedRegion.
 		if frag, ok := existingRegion.(*fragmentedRegion); ok {
 			// If it's already a fragmentedRegion then map the new part.
 
-			return frag.mapFragment(region, regionOffset)
+			if err := frag.mapFragment(region, regionOffset); err != nil {
+				return err
+			}
+			vm.pages.Set(uint64(regionIndex), frag)
+			vm.writePages.Set(uint64(regionIndex), nil)
+			return nil
 		} else {
 			// Otherwise it's something else.
 
@@ -154,6 +164,7 @@ func (vm *VirtualMemory) mapFragment(region MemoryRegion, offset int64) error {
 			// slog.Info("", "newFrag", newFrag)
 
 			vm.pages.Set(uint64(regionIndex), newFrag)
+			vm.writePages.Set(uint64(regionIndex), nil)
 
 			return nil
 		}
@@ -165,6 +176,7 @@ func (vm *VirtualMemory) mapFragment(region MemoryRegion, offset int64) error {
 		}
 
 		vm.pages.Set(uint64(regionIndex), newFrag)
+		vm.writePages.Set(uint64(regionIndex), nil)
 
 		return nil
 	}
@@ -180,6 +192,7 @@ func (vm *VirtualMemory) mapRegion(region MemoryRegion, offset int64) error {
 	index := offset / int64(vm.pageSize)
 
 	vm.pages.Set(uint64(index), region)
+	vm.writePages.Set(uint64(index), nil)
 
 	return nil
 }
@@ -341,36 +354,26 @@ func (vm *VirtualMemory) getRegion(offset int64, isWrite bool) (MemoryRegion, in
 	regionIndex := offset / int64(vm.pageSize)
 	regionOffset := offset % int64(vm.pageSize)
 
-	// Get the region.
-	region := vm.pages.Get(uint64(regionIndex))
-	if region == nil {
-		if isWrite {
-			// Create a new raw region for writing.
-			newRegion := make(RawRegion, vm.pageSize)
-			vm.pages.Set(uint64(regionIndex), &newRegion)
-			return vm.pages.Get(uint64(regionIndex)), regionOffset, nil
-		} else {
-			// Reading from unmapped region returns zeros.
-			return nil, regionOffset, nil
-		}
+	if region := vm.writePages.Get(uint64(regionIndex)); region != nil {
+		return region, regionOffset, nil
 	}
 
 	if isWrite {
-		// Check if region is a raw region.
-		if _, ok := region.(RawRegion); !ok {
-			// Not writable, create a new raw region.
-			newRegion := make(RawRegion, vm.pageSize)
-			// Copy existing data into new region.
-			if _, err := region.ReadAt(newRegion, 0); err != nil {
+		newWritePage := make(RawRegion, vm.pageSize)
+		if existingRegion := vm.pages.Get(uint64(regionIndex)); existingRegion != nil {
+			if _, err := existingRegion.ReadAt(newWritePage, 0); err != nil {
 				return nil, 0, err
 			}
-			// Replace region with new writable region.
-			vm.pages.Set(uint64(regionIndex), &newRegion)
-			return vm.pages.Get(uint64(regionIndex)), regionOffset, nil
 		}
+		vm.writePages.Set(uint64(regionIndex), &newWritePage)
+		return vm.writePages.Get(uint64(regionIndex)), regionOffset, nil
 	}
 
-	// Return the region.
+	region := vm.pages.Get(uint64(regionIndex))
+	if region == nil {
+		// Reading from unmapped region returns zeros.
+		return nil, regionOffset, nil
+	}
 	return region, regionOffset, nil
 }
 
@@ -388,7 +391,11 @@ func (vm *VirtualMemory) ReadAt(p []byte, off int64) (n int, err error) {
 
 		if region != nil {
 			// If the region exists then forward the read to the region.
-			readSize, err = region.ReadAt(p, regionOffset)
+			end := int64(vm.pageSize)
+			if int64(len(p))+regionOffset < end {
+				end = int64(len(p)) + regionOffset
+			}
+			readSize, err = region.ReadAt(p[:end-regionOffset], regionOffset)
 			if err != nil {
 				return 0, err
 			}
@@ -432,7 +439,11 @@ func (vm *VirtualMemory) WriteAt(p []byte, off int64) (n int, err error) {
 
 		if region != nil {
 			// If the region exists then forward the write to the region.
-			writeSize, err = region.WriteAt(p, regionOffset)
+			end := int64(vm.pageSize)
+			if int64(len(p))+regionOffset < end {
+				end = int64(len(p)) + regionOffset
+			}
+			writeSize, err = region.WriteAt(p[:end-regionOffset], regionOffset)
 			if err != nil {
 				slog.Error("VirtualMemory WriteAt Error", "len", len(p), "off", off, "regionOffset", regionOffset)
 				return 0, err
@@ -470,7 +481,8 @@ var batchBufferPool = sync.Pool{
 func (vm *VirtualMemory) WriteSparseTo(fh io.WriterAt) (int64, error) {
 	// Early exit if VM has no mapped pages
 	mlpt, ok := vm.pages.(*MultiLevelPageTable)
-	if ok && len(mlpt.topLevel) == 0 {
+	writeMLPT, writeOK := vm.writePages.(*MultiLevelPageTable)
+	if ok && writeOK && len(mlpt.topLevel) == 0 && len(writeMLPT.topLevel) == 0 {
 		return 0, nil
 	}
 
@@ -509,7 +521,34 @@ func (vm *VirtualMemory) WriteSparseTo(fh io.WriterAt) (int64, error) {
 
 	// Use ForEach to iterate only over non-nil regions (sparse optimization)
 	var writeErr error
-	vm.pages.ForEach(func(pageIndex uint64, region MemoryRegion) bool {
+	type mappedPage struct {
+		index  uint64
+		region MemoryRegion
+	}
+	forEachMappedPage := func(fn func(pageIndex uint64, region MemoryRegion) bool) {
+		mapped := make(map[uint64]MemoryRegion)
+		vm.pages.ForEach(func(pageIndex uint64, region MemoryRegion) bool {
+			mapped[pageIndex] = region
+			return true
+		})
+		vm.writePages.ForEach(func(pageIndex uint64, region MemoryRegion) bool {
+			mapped[pageIndex] = region
+			return true
+		})
+		pages := make([]mappedPage, 0, len(mapped))
+		for index, region := range mapped {
+			pages = append(pages, mappedPage{index: index, region: region})
+		}
+		sort.Slice(pages, func(i, j int) bool {
+			return pages[i].index < pages[j].index
+		})
+		for _, page := range pages {
+			if !fn(page.index, page.region) {
+				return
+			}
+		}
+	}
+	forEachMappedPage(func(pageIndex uint64, region MemoryRegion) bool {
 		// Check if this page is consecutive with the last one
 		isConsecutive := (lastPageIndex != ^uint64(0)) && (pageIndex == lastPageIndex+1)
 
@@ -553,6 +592,7 @@ func (vm *VirtualMemory) WriteSparseTo(fh io.WriterAt) (int64, error) {
 func (vm *VirtualMemory) Reset() error {
 	// Clear all the old pages and write pages.
 	vm.pages.Clear()
+	vm.writePages.Clear()
 
 	return nil
 }
@@ -801,9 +841,10 @@ func NewVirtualMemory(totalSize int64, pageSize uint32) *VirtualMemory {
 	totalPages := uint64(totalSize / int64(pageSize))
 
 	return &VirtualMemory{
-		pageSize:  pageSize,
-		totalSize: totalSize,
-		pages:     NewMultiLevelPageTable(totalPages),
+		pageSize:   pageSize,
+		totalSize:  totalSize,
+		pages:      NewMultiLevelPageTable(totalPages),
+		writePages: NewMultiLevelPageTable(totalPages),
 	}
 }
 

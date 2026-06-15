@@ -7,6 +7,12 @@ type TruncatedRegion struct {
 
 // ReadAt implements MemoryRegion.
 func (t *TruncatedRegion) ReadAt(p []byte, off int64) (n int, err error) {
+	if err := boundsCheck(t, off); err != nil {
+		return 0, err
+	}
+	if int64(len(p)) > t.MaxSize-off {
+		p = p[:t.MaxSize-off]
+	}
 	return t.Region.ReadAt(p, off)
 }
 
@@ -17,6 +23,12 @@ func (t *TruncatedRegion) Size() int64 {
 
 // WriteAt implements MemoryRegion.
 func (t *TruncatedRegion) WriteAt(p []byte, off int64) (n int, err error) {
+	if err := boundsCheck(t, off); err != nil {
+		return 0, err
+	}
+	if int64(len(p)) > t.MaxSize-off {
+		p = p[:t.MaxSize-off]
+	}
 	return t.Region.WriteAt(p, off)
 }
 

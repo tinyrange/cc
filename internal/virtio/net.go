@@ -63,6 +63,7 @@ type Net struct {
 	configGeneration uint32
 	queues           [2]queue
 	pendingRx        [][]byte
+	legacy           bool
 }
 
 type netTXPacket struct {
@@ -242,6 +243,95 @@ func (n *Net) Write(addr uint64, size int, value uint64) error {
 			err := n.processRXLocked()
 			n.mu.Unlock()
 			return err
+		}
+	}
+	n.mu.Unlock()
+	return nil
+}
+
+func (n *Net) ReadLegacy(offset uint16, size int) (uint64, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.legacy = true
+
+	switch offset {
+	case 0:
+		return truncateValue(n.legacyFeaturesLocked(), size), nil
+	case 8:
+		if q := n.selectedQueueLocked(); q != nil && q.ready {
+			return truncateValue(uint64(q.descAddr/4096), size), nil
+		}
+		return 0, nil
+	case 12:
+		if n.queueSel < uint32(len(n.queues)) {
+			return truncateValue(netQueueSize, size), nil
+		}
+		return 0, nil
+	case 14:
+		return truncateValue(uint64(n.queueSel), size), nil
+	case 18:
+		return truncateValue(uint64(n.status), size), nil
+	case 19:
+		isr := n.interruptStatus
+		n.interruptStatus = 0
+		if err := n.updateIRQLocked(); err != nil {
+			return 0, err
+		}
+		return truncateValue(uint64(isr), size), nil
+	}
+
+	if offset >= 20 && int(offset)+size <= 28 {
+		cfg := n.configBytesLocked()
+		return truncateValue(readConfigValue(cfg[offset-20:], size), size), nil
+	}
+	return 0, nil
+}
+
+func (n *Net) WriteLegacy(offset uint16, size int, value uint64) error {
+	n.mu.Lock()
+	n.legacy = true
+
+	switch offset {
+	case 4:
+		n.driverFeatures = uint64(uint32(value))
+	case 8:
+		if q := n.selectedQueueLocked(); q != nil {
+			if value == 0 {
+				q.ready = false
+				q.descAddr = 0
+				q.availAddr = 0
+				q.usedAddr = 0
+				n.mu.Unlock()
+				return nil
+			}
+			n.configureLegacyQueueLocked(q, uint32(value))
+		}
+	case 14:
+		n.queueSel = uint32(value)
+	case 16:
+		switch value {
+		case netQueueTX:
+			packetBatch := getNetTXPacketBatch()
+			packets, err := n.processTXLocked(packetBatch[:0])
+			n.mu.Unlock()
+			if err != nil {
+				releaseNetTXPackets(packets)
+				releaseNetTXPacketBatch(packetBatch)
+				return err
+			}
+			err = n.deliverTXPackets(packets)
+			releaseNetTXPacketBatch(packetBatch)
+			return err
+		case netQueueRX:
+			err := n.processRXLocked()
+			n.mu.Unlock()
+			return err
+		}
+	case 18:
+		n.status = uint32(uint8(value))
+		if n.status == 0 {
+			n.resetLocked()
+			n.legacy = true
 		}
 	}
 	n.mu.Unlock()
@@ -562,6 +652,17 @@ func (n *Net) setQueueAddr(target *uint64, value uint32, low bool) {
 	}
 }
 
+func (n *Net) configureLegacyQueueLocked(q *queue, pfn uint32) {
+	q.size = netQueueSize
+	q.ready = true
+	q.descAddr = uint64(pfn) * 4096
+	q.availAddr = q.descAddr + 16*uint64(q.size)
+	used := q.availAddr + 4 + 2*uint64(q.size)
+	q.usedAddr = alignVirtio(used, 4096)
+	q.lastAvailIdx = 0
+	q.usedIdx = 0
+}
+
 func (n *Net) updateIRQLocked() error {
 	if n.irq == nil {
 		return nil
@@ -581,6 +682,10 @@ func (n *Net) configBytesLocked() []byte {
 	return cfg[:]
 }
 
+func (n *Net) legacyFeaturesLocked() uint64 {
+	return netFeatureMAC | netFeatureStatus | netFeatureMergeRX
+}
+
 func (n *Net) resetLocked() {
 	n.deviceFeatureSel = 0
 	n.driverFeatureSel = 0
@@ -589,6 +694,7 @@ func (n *Net) resetLocked() {
 	n.status = 0
 	n.interruptStatus = 0
 	n.irqHigh = false
+	n.legacy = false
 	n.configGeneration++
 	n.queues = [2]queue{}
 	n.pendingRx = nil

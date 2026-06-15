@@ -1,6 +1,9 @@
 package imagefs
 
 import (
+	"archive/tar"
+	"bytes"
+	"context"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -100,6 +103,47 @@ func TestLookupPathCleansInputAndReportsNonDirectory(t *testing.T) {
 	}
 }
 
+func TestTarFSKeepsImplicitDirectoryChildrenWhenDirectoryHeaderAppearsLater(t *testing.T) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	mustWriteTarFile(t, tw, "usr/lib/libearly.so.1.0", "early")
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     "usr/lib",
+		Typeflag: tar.TypeDir,
+		Mode:     0o755,
+	}); err != nil {
+		t.Fatalf("write usr/lib header: %v", err)
+	}
+	mustWriteTarFile(t, tw, "usr/lib/late.o", "late")
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar: %v", err)
+	}
+
+	tfs, err := NewTarFS(context.Background(), bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatalf("read tarfs: %v", err)
+	}
+	defer tfs.Close()
+	root := tfs.Root()
+	if got := readFile(t, root, "/usr/lib/libearly.so.1.0"); got != "early" {
+		t.Fatalf("early file = %q", got)
+	}
+	if got := readFile(t, root, "/usr/lib/late.o"); got != "late" {
+		t.Fatalf("late file = %q", got)
+	}
+	entry, err := LookupPath(root, "/usr/lib")
+	if err != nil {
+		t.Fatalf("lookup /usr/lib: %v", err)
+	}
+	entries, err := entry.Dir.ReadDir()
+	if err != nil {
+		t.Fatalf("read /usr/lib: %v", err)
+	}
+	if got := direntNames(entries); got != "late.o,libearly.so.1.0" {
+		t.Fatalf("/usr/lib entries = %q", got)
+	}
+}
+
 func direntNames(entries []DirEnt) string {
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
@@ -136,6 +180,21 @@ func mustWriteExecutable(t *testing.T, path, contents string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(contents), 0o755); err != nil {
 		t.Fatalf("write executable %s: %v", path, err)
+	}
+}
+
+func mustWriteTarFile(t *testing.T, tw *tar.Writer, name, contents string) {
+	t.Helper()
+	if err := tw.WriteHeader(&tar.Header{
+		Name:     name,
+		Typeflag: tar.TypeReg,
+		Mode:     0o644,
+		Size:     int64(len(contents)),
+	}); err != nil {
+		t.Fatalf("write %s header: %v", name, err)
+	}
+	if _, err := tw.Write([]byte(contents)); err != nil {
+		t.Fatalf("write %s payload: %v", name, err)
 	}
 }
 

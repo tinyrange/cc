@@ -608,6 +608,43 @@ func (v *VM) SetLongMode(entry, zeroPage, stack, pagingBase uint64) error {
 	})
 }
 
+func (v *VM) SetProtectedMode32(entry, stack uint64) error {
+	if v == nil || len(v.vcpus) == 0 {
+		return fmt.Errorf("missing bootstrap vcpu")
+	}
+	bsp := v.vcpus[0]
+	sregs, err := getSRegs(bsp.fd)
+	if err != nil {
+		return err
+	}
+	const (
+		cr0PE = 1 << 0
+		cr0MP = 1 << 1
+		cr0ET = 1 << 4
+		cr0NE = 1 << 5
+	)
+	sregs.Cr0 = (sregs.Cr0 | cr0PE | cr0MP | cr0ET | cr0NE) &^ uint64(1<<31)
+	sregs.Cr3 = 0
+	sregs.Cr4 = 0
+	sregs.Efer = 0
+	code := kvmSegment{Base: 0, Limit: 0xffffffff, Selector: 0x10, Type: 11, Present: 1, S: 1, Db: 1, G: 1}
+	data := kvmSegment{Base: 0, Limit: 0xffffffff, Selector: 0x18, Type: 3, Present: 1, S: 1, Db: 1, G: 1}
+	sregs.Cs = code
+	sregs.Ds = data
+	sregs.Es = data
+	sregs.Fs = data
+	sregs.Gs = data
+	sregs.Ss = data
+	if err := setSRegs(bsp.fd, &sregs); err != nil {
+		return err
+	}
+	return setRegs(bsp.fd, &kvmRegs{
+		Rip:    entry,
+		Rsp:    stack,
+		Rflags: 0x2,
+	})
+}
+
 func (v *VM) setupPageTables(pagingBase uint64, giB int) error {
 	if pagingBase+uint64(0x3000+giB*0x1000) > uint64(len(v.mem)) {
 		return fmt.Errorf("paging structures do not fit")

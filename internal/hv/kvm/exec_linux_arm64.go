@@ -203,7 +203,7 @@ func runManagedExecVM(ctx context.Context, vm *VM, uart *serial.UART8250, fsdevs
 	}
 }
 
-func sendManagedExec(control virtio.VsockConn, id string, req client.ExecRequest) error {
+func sendManagedExec(control io.Writer, id string, req client.ExecRequest) error {
 	payload, err := json.Marshal(vmruntime.ManagedExecRequest{
 		Kind:      execRequestKind(req.Kind),
 		ID:        id,

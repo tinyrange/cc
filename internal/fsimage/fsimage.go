@@ -11,6 +11,7 @@ import (
 
 	"j5.nz/cc/internal/ext4image"
 	"j5.nz/cc/internal/ext4image/ext4"
+	ffsimage "j5.nz/cc/internal/fsimage/ffs"
 	"j5.nz/cc/internal/imagefs"
 )
 
@@ -19,6 +20,7 @@ type Type string
 const (
 	TypeExt4    Type = "ext4"
 	TypeVFAT    Type = "vfat"
+	TypeFFS     Type = "ffs"
 	TypeISO9660 Type = "iso9660"
 )
 
@@ -34,6 +36,7 @@ type Options struct {
 
 type FilesystemRegion interface {
 	io.ReaderAt
+	io.WriterAt
 	Size() int64
 }
 
@@ -41,7 +44,7 @@ func ParseType(value string) (Type, error) {
 	switch typ := Type(strings.ToLower(strings.TrimSpace(value))); typ {
 	case "", TypeExt4:
 		return TypeExt4, nil
-	case TypeVFAT, TypeISO9660:
+	case TypeVFAT, TypeFFS, TypeISO9660:
 		return typ, nil
 	default:
 		return "", fmt.Errorf("unsupported rootfs image type %q", value)
@@ -69,6 +72,8 @@ func Build(ctx context.Context, root imagefs.Directory, opts Options) (Filesyste
 		return ext4image.Build(ctx, root, ext4Options(opts))
 	case TypeVFAT:
 		return buildFAT(ctx, root, opts)
+	case TypeFFS:
+		return ffsimage.Build(ctx, root, ffsOptions(opts))
 	default:
 		return nil, fmt.Errorf("rootfs image writer for type %q is not implemented", typ)
 	}
@@ -89,6 +94,8 @@ func Write(ctx context.Context, w io.Writer, root imagefs.Directory, opts Option
 		}
 		_, err = io.Copy(w, io.NewSectionReader(region, 0, region.Size()))
 		return err
+	case TypeFFS:
+		return ffsimage.Write(ctx, w, root, ffsOptions(opts))
 	default:
 		return fmt.Errorf("rootfs image writer for type %q is not implemented", typ)
 	}
@@ -125,6 +132,14 @@ func ext4Options(opts Options) ext4image.Options {
 		ExtraBytes:        opts.ExtraBytes,
 		DeterministicTime: opts.DeterministicTime,
 		UUID:              opts.Ext4UUID,
+	}
+}
+
+func ffsOptions(opts Options) ffsimage.Options {
+	return ffsimage.Options{
+		SizeBytes:         opts.SizeBytes,
+		ExtraBytes:        opts.ExtraBytes,
+		DeterministicTime: opts.DeterministicTime,
 	}
 }
 

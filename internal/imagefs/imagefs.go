@@ -26,6 +26,10 @@ type OpenReaderFile interface {
 	OpenReader() (io.ReaderAt, io.Closer, error)
 }
 
+type HardlinkFile interface {
+	HardlinkKey() string
+}
+
 type Directory interface {
 	Stat() fs.FileMode
 	ModTime() time.Time
