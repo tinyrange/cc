@@ -53,4 +53,14 @@ func TestLinuxRootFSImageConfigVars(t *testing.T) {
 	if len(got) != 1 || got[0] != "CONFIG_EXT4_FS" {
 		t.Fatalf("ext4 config vars = %#v, want CONFIG_EXT4_FS", got)
 	}
+	got = linuxRootFSImageConfigVars(fsimage.TypeVFAT)
+	want := []string{"CONFIG_FAT_FS", "CONFIG_VFAT_FS", "CONFIG_NLS_CODEPAGE_437", "CONFIG_NLS_ISO8859_1"}
+	if len(got) != len(want) {
+		t.Fatalf("vfat config vars = %#v, want %#v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("vfat config vars = %#v, want %#v", got, want)
+		}
+	}
 }

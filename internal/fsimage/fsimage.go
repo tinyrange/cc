@@ -11,7 +11,6 @@ import (
 
 	"j5.nz/cc/internal/ext4image"
 	"j5.nz/cc/internal/ext4image/ext4"
-	"j5.nz/cc/internal/ext4image/vmregion"
 	"j5.nz/cc/internal/imagefs"
 )
 
@@ -29,6 +28,13 @@ type Options struct {
 	ExtraBytes        int64
 	DeterministicTime time.Time
 	Ext4UUID          ext4.UUID
+	FATType           string
+	FATVolumeSerial   *uint32
+}
+
+type FilesystemRegion interface {
+	io.ReaderAt
+	Size() int64
 }
 
 func ParseType(value string) (Type, error) {
@@ -53,7 +59,7 @@ func (typ Type) InitramfsPath() string {
 	return "/ccx3/rootfs." + typ.String()
 }
 
-func Build(ctx context.Context, root imagefs.Directory, opts Options) (*vmregion.VirtualMemory, error) {
+func Build(ctx context.Context, root imagefs.Directory, opts Options) (FilesystemRegion, error) {
 	typ, err := ParseType(opts.Type.String())
 	if err != nil {
 		return nil, err
@@ -61,6 +67,8 @@ func Build(ctx context.Context, root imagefs.Directory, opts Options) (*vmregion
 	switch typ {
 	case TypeExt4:
 		return ext4image.Build(ctx, root, ext4Options(opts))
+	case TypeVFAT:
+		return buildFAT(ctx, root, opts)
 	default:
 		return nil, fmt.Errorf("rootfs image writer for type %q is not implemented", typ)
 	}
@@ -74,6 +82,13 @@ func Write(ctx context.Context, w io.Writer, root imagefs.Directory, opts Option
 	switch typ {
 	case TypeExt4:
 		return ext4image.Write(ctx, w, root, ext4Options(opts))
+	case TypeVFAT:
+		region, err := buildFAT(ctx, root, opts)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(w, io.NewSectionReader(region, 0, region.Size()))
+		return err
 	default:
 		return fmt.Errorf("rootfs image writer for type %q is not implemented", typ)
 	}
@@ -111,4 +126,8 @@ func ext4Options(opts Options) ext4image.Options {
 		DeterministicTime: opts.DeterministicTime,
 		UUID:              opts.Ext4UUID,
 	}
+}
+
+func roundUp(v, align int64) int64 {
+	return ((v + align - 1) / align) * align
 }

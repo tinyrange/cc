@@ -854,6 +854,8 @@ func linuxRootFSImageConfigVars(typ fsimage.Type) []string {
 	switch typ {
 	case fsimage.TypeExt4:
 		return []string{"CONFIG_EXT4_FS"}
+	case fsimage.TypeVFAT:
+		return []string{"CONFIG_FAT_FS", "CONFIG_VFAT_FS", "CONFIG_NLS_CODEPAGE_437", "CONFIG_NLS_ISO8859_1"}
 	default:
 		return nil
 	}
@@ -941,6 +943,10 @@ func linuxRuntimeModuleMap() map[string]string {
 		"CONFIG_IP6_NF_TARGET_REJECT":           "kernel/net/ipv6/netfilter/ip6t_REJECT.ko.gz",
 		"CONFIG_EXT4_FS":                        "kernel/fs/ext4/ext4.ko.gz",
 		"CONFIG_BLK_DEV_LOOP":                   "kernel/drivers/block/loop.ko.gz",
+		"CONFIG_FAT_FS":                         "kernel/fs/fat/fat.ko.gz",
+		"CONFIG_VFAT_FS":                        "kernel/fs/fat/vfat.ko.gz",
+		"CONFIG_NLS_CODEPAGE_437":               "kernel/fs/nls/nls_cp437.ko.gz",
+		"CONFIG_NLS_ISO8859_1":                  "kernel/fs/nls/nls_iso8859-1.ko.gz",
 	}
 }
 
