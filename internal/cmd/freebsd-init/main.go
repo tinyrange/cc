@@ -19,6 +19,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/creack/pty"
 )
 
 const (
@@ -51,6 +53,7 @@ type managedExec struct {
 	mu      sync.Mutex
 	stdin   io.WriteCloser
 	process *os.Process
+	pty     *os.File
 }
 
 func (m *managedExec) write(data []byte) error {
@@ -78,6 +81,24 @@ func (m *managedExec) setProcess(p *os.Process) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.process = p
+}
+
+func (m *managedExec) setPTY(pty *os.File) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pty = pty
+}
+
+func (m *managedExec) resize(cols, rows int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pty == nil {
+		return fmt.Errorf("exec has no tty")
+	}
+	if cols <= 0 || rows <= 0 {
+		return fmt.Errorf("invalid tty size %dx%d", cols, rows)
+	}
+	return pty.Setsize(m.pty, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
 }
 
 func (m *managedExec) signal(name string) error {
@@ -255,12 +276,34 @@ func commandLoop(control net.Conn) error {
 			if managed != nil {
 				_ = managed.signal(req.Signal)
 			}
+		case "resize":
+			mu.Lock()
+			managed := active[req.ID]
+			mu.Unlock()
+			if managed != nil {
+				_ = managed.resize(req.Cols, req.Rows)
+			}
 		}
 	}
 }
 
 func startExecWithReader(control net.Conn, req request, stdin io.ReadCloser, managed *managedExec, cleanup func()) {
 	go runExec(control, req, stdin, managed, cleanup)
+}
+
+func openPTY(cols, rows int) (*os.File, *os.File, error) {
+	master, slave, err := pty.Open()
+	if err != nil {
+		return nil, nil, err
+	}
+	if cols > 0 && rows > 0 {
+		if err := pty.Setsize(master, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)}); err != nil {
+			_ = master.Close()
+			_ = slave.Close()
+			return nil, nil, fmt.Errorf("set initial winsize: %w", err)
+		}
+	}
+	return master, slave, nil
 }
 
 func runExec(control io.Writer, req request, stdin io.ReadCloser, managed *managedExec, cleanup func()) {
@@ -273,12 +316,6 @@ func runExec(control io.Writer, req request, stdin io.ReadCloser, managed *manag
 	if len(req.Env) != 0 {
 		cmd.Env = req.Env
 	}
-	cmd.Stdin = stdin
-	stdoutR, stdoutW := io.Pipe()
-	stderrR, stderrW := io.Pipe()
-	cmd.Stdout = stdoutW
-	cmd.Stderr = stderrW
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	var controlR, controlW *os.File
 	if req.ControlFD {
 		var err error
@@ -287,8 +324,6 @@ func runExec(control io.Writer, req request, stdin io.ReadCloser, managed *manag
 			if managed != nil {
 				_ = managed.close()
 			}
-			_ = stdoutW.Close()
-			_ = stderrW.Close()
 			writeErr(control, req.ID, fmt.Errorf("open control fd: %w", err))
 			writeLine(control, exitMarker+req.ID+":126")
 			return
@@ -296,9 +331,55 @@ func runExec(control io.Writer, req request, stdin io.ReadCloser, managed *manag
 		cmd.ExtraFiles = append(cmd.ExtraFiles, controlW)
 	}
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go copyMarked(&wg, control, outMarker, req.ID, stdoutR)
-	go copyMarked(&wg, control, errMarker, req.ID, stderrR)
+	var stdoutW, stderrW *io.PipeWriter
+	var ptyMaster, ptySlave *os.File
+	if req.TTY {
+		var err error
+		ptyMaster, ptySlave, err = openPTY(req.Cols, req.Rows)
+		if err != nil {
+			if managed != nil {
+				_ = managed.close()
+			}
+			if controlR != nil {
+				_ = controlR.Close()
+			}
+			if controlW != nil {
+				_ = controlW.Close()
+			}
+			writeErr(control, req.ID, fmt.Errorf("open pty: %w", err))
+			writeLine(control, exitMarker+req.ID+":126")
+			return
+		}
+		if managed != nil {
+			managed.setPTY(ptyMaster)
+		}
+		cmd.Stdin = ptySlave
+		cmd.Stdout = ptySlave
+		cmd.Stderr = ptySlave
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Setsid:  true,
+			Setctty: true,
+			Ctty:    0,
+		}
+		wg.Add(1)
+		go copyMarked(&wg, control, outMarker, req.ID, ptyMaster)
+		if stdin != nil {
+			wg.Add(1)
+			go copyPTYStdin(&wg, stdin, ptyMaster)
+		}
+	} else {
+		cmd.Stdin = stdin
+		stdoutR, stdoutPipeW := io.Pipe()
+		stderrR, stderrPipeW := io.Pipe()
+		stdoutW = stdoutPipeW
+		stderrW = stderrPipeW
+		cmd.Stdout = stdoutW
+		cmd.Stderr = stderrW
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		wg.Add(2)
+		go copyMarked(&wg, control, outMarker, req.ID, stdoutR)
+		go copyMarked(&wg, control, errMarker, req.ID, stderrR)
+	}
 	if controlR != nil {
 		wg.Add(1)
 		go copyMarked(&wg, control, ctlMarker, req.ID, controlR)
@@ -313,8 +394,18 @@ func runExec(control io.Writer, req request, stdin io.ReadCloser, managed *manag
 		if controlW != nil {
 			_ = controlW.Close()
 		}
-		_ = stdoutW.Close()
-		_ = stderrW.Close()
+		if stdoutW != nil {
+			_ = stdoutW.Close()
+		}
+		if stderrW != nil {
+			_ = stderrW.Close()
+		}
+		if ptyMaster != nil {
+			_ = ptyMaster.Close()
+		}
+		if ptySlave != nil {
+			_ = ptySlave.Close()
+		}
 		wg.Wait()
 		writeErr(control, req.ID, err)
 		writeLine(control, exitMarker+req.ID+":126")
@@ -328,8 +419,18 @@ func runExec(control io.Writer, req request, stdin io.ReadCloser, managed *manag
 	}
 	waitErr := cmd.Wait()
 	_ = stdin.Close()
-	_ = stdoutW.Close()
-	_ = stderrW.Close()
+	if stdoutW != nil {
+		_ = stdoutW.Close()
+	}
+	if stderrW != nil {
+		_ = stderrW.Close()
+	}
+	if ptySlave != nil {
+		_ = ptySlave.Close()
+	}
+	if ptyMaster != nil {
+		_ = ptyMaster.Close()
+	}
 	wg.Wait()
 	if controlR != nil {
 		_ = controlR.Close()
@@ -551,6 +652,26 @@ func copyMarked(wg *sync.WaitGroup, control io.Writer, marker, id string, r io.R
 			writeBytes(control, marker, id, buf[:n])
 		}
 		if err != nil {
+			return
+		}
+	}
+}
+
+func copyPTYStdin(wg *sync.WaitGroup, stdin io.ReadCloser, ptyMaster *os.File) {
+	defer wg.Done()
+	defer stdin.Close()
+	var buf [4096]byte
+	for {
+		n, err := stdin.Read(buf[:])
+		if n > 0 {
+			if _, writeErr := ptyMaster.Write(buf[:n]); writeErr != nil {
+				return
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				_, _ = ptyMaster.Write([]byte{4})
+			}
 			return
 		}
 	}

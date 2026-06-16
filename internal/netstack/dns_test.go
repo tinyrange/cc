@@ -57,6 +57,80 @@ func TestBuildDNSResponseNameErrorAndMalformedQueries(t *testing.T) {
 	}
 }
 
+func TestBuildDNSResponseSynthesizesSRVQueries(t *testing.T) {
+	query := dnsQuery(t, 0x4567, "_http._tcp.pkg.FreeBSD.org", dnsTypeSRV, dnsClassIN)
+	target, err := encodeDNSName("pkg0.example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := buildDNSResponse(query, nil, func(q dnsQuestion) ([]dnsResource, []dnsResource, error) {
+		if q.name != "_http._tcp.pkg.freebsd.org" || q.qtype != dnsTypeSRV {
+			t.Fatalf("resolver question = %+v", q)
+		}
+		data := make([]byte, 6+len(target))
+		binary.BigEndian.PutUint16(data[0:2], 10)
+		binary.BigEndian.PutUint16(data[2:4], 20)
+		binary.BigEndian.PutUint16(data[4:6], 443)
+		copy(data[6:], target)
+		return []dnsResource{{
+				nameStart: q.nameStart,
+				typ:       dnsTypeSRV,
+				class:     dnsClassIN,
+				ttl:       30,
+				data:      data,
+			}}, []dnsResource{{
+				name:      "pkg0.example.test",
+				nameStart: -1,
+				typ:       dnsTypeA,
+				class:     dnsClassIN,
+				ttl:       30,
+				data:      []byte{192, 0, 2, 10},
+			}}, nil
+	})
+
+	if id := binary.BigEndian.Uint16(resp[0:2]); id != 0x4567 {
+		t.Fatalf("response id = %#x, want original query id", id)
+	}
+	if answers := binary.BigEndian.Uint16(resp[6:8]); answers != 1 {
+		t.Fatalf("answers = %d, want 1", answers)
+	}
+	if additionals := binary.BigEndian.Uint16(resp[10:12]); additionals != 1 {
+		t.Fatalf("additionals = %d, want 1", additionals)
+	}
+	if typ := binary.BigEndian.Uint16(resp[len(query)+2 : len(query)+4]); typ != dnsTypeSRV {
+		t.Fatalf("answer type = %d, want SRV", typ)
+	}
+	if gotPort := binary.BigEndian.Uint16(resp[len(query)+16 : len(query)+18]); gotPort != 443 {
+		t.Fatalf("SRV port = %d, want 443", gotPort)
+	}
+}
+
+func TestBuildDNSResponseSynthesizesPublicAQueries(t *testing.T) {
+	query := dnsQuery(t, 0x2345, "pkg.FreeBSD.org", dnsTypeA, dnsClassIN)
+	resolved := false
+	resp := buildDNSResponse(query, func(string) (string, error) {
+		return "", errors.New("not synthetic")
+	}, func(q dnsQuestion) ([]dnsResource, []dnsResource, error) {
+		resolved = true
+		return []dnsResource{{
+			nameStart: q.nameStart,
+			typ:       dnsTypeA,
+			class:     dnsClassIN,
+			ttl:       30,
+			data:      []byte{198, 51, 100, 7},
+		}}, nil, nil
+	})
+	if !resolved {
+		t.Fatalf("public A query was not resolved")
+	}
+	if answers := binary.BigEndian.Uint16(resp[6:8]); answers != 1 {
+		t.Fatalf("answers = %d, want 1", answers)
+	}
+	if got := net.IP(resp[len(resp)-4:]).String(); got != "198.51.100.7" {
+		t.Fatalf("answer IP = %s", got)
+	}
+}
+
 func TestHostAccessDisabledHidesSyntheticHostDNSNames(t *testing.T) {
 	ns := New(nil)
 	ns.SetHostAccessEnabled(false)

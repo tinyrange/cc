@@ -3230,7 +3230,7 @@ func (ns *NetStack) StartDNSServer() error {
 		return fmt.Errorf("listen udp port 53: %w", err)
 	}
 
-	dnsSrv := newDNSServer(packetConn, ns.lookupDNSName)
+	dnsSrv := newDNSServer(packetConn, ns.lookupDNSName, ns.resolveDNSQuestion)
 	ns.dnsServer = dnsSrv
 	return nil
 }
@@ -3251,14 +3251,132 @@ func (ns *NetStack) lookupDNSName(name string) (string, error) {
 		}
 		return net.IP(ns.serviceIPv4[:]).String(), nil
 	}
+	return "", fmt.Errorf("not a synthetic DNS name")
+}
+
+func (ns *NetStack) resolveDNSQuestion(q dnsQuestion) ([]dnsResource, []dnsResource, error) {
 	if !ns.allowInternet {
-		return "", fmt.Errorf("internet access disabled")
+		return nil, nil, fmt.Errorf("internet access disabled")
 	}
-	addr, err := net.ResolveIPAddr("ip4", strings.TrimSuffix(name, "."))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	switch q.qtype {
+	case dnsTypeA:
+		return resolveIPDNSQuestion(ctx, q, "ip4")
+	case dnsTypeAAAA:
+		return resolveIPDNSQuestion(ctx, q, "ip6")
+	case dnsTypeSRV:
+		return resolveSRVDNSQuestion(ctx, q)
+	default:
+		return nil, nil, nil
+	}
+}
+
+func resolveIPDNSQuestion(ctx context.Context, q dnsQuestion, network string) ([]dnsResource, []dnsResource, error) {
+	ips, err := net.DefaultResolver.LookupIP(ctx, network, strings.TrimSuffix(q.name, "."))
 	if err != nil {
-		return "", err
+		return nil, nil, err
 	}
-	return addr.IP.String(), nil
+	answers := make([]dnsResource, 0, len(ips))
+	for _, ip := range ips {
+		if ip4 := ip.To4(); ip4 != nil && network == "ip4" {
+			answers = append(answers, dnsResource{
+				nameStart: q.nameStart,
+				typ:       dnsTypeA,
+				class:     dnsClassIN,
+				ttl:       30,
+				data:      append([]byte(nil), ip4...),
+			})
+			continue
+		}
+		if ip16 := ip.To16(); ip16 != nil && ip.To4() == nil && network == "ip6" {
+			answers = append(answers, dnsResource{
+				nameStart: q.nameStart,
+				typ:       dnsTypeAAAA,
+				class:     dnsClassIN,
+				ttl:       30,
+				data:      append([]byte(nil), ip16...),
+			})
+		}
+	}
+	return answers, nil, nil
+}
+
+func resolveSRVDNSQuestion(ctx context.Context, q dnsQuestion) ([]dnsResource, []dnsResource, error) {
+	service, proto, name := splitSRVQueryName(q.name)
+	_, records, err := net.DefaultResolver.LookupSRV(ctx, service, proto, strings.TrimSuffix(name, "."))
+	if err != nil {
+		return nil, nil, err
+	}
+	answers := make([]dnsResource, 0, len(records))
+	additionals := make([]dnsResource, 0)
+	addedAdditional := map[string]struct{}{}
+	for _, record := range records {
+		targetName := strings.TrimSuffix(strings.ToLower(record.Target), ".")
+		target, err := encodeDNSName(targetName)
+		if err != nil {
+			continue
+		}
+		data := make([]byte, 6+len(target))
+		binary.BigEndian.PutUint16(data[0:2], record.Priority)
+		binary.BigEndian.PutUint16(data[2:4], record.Weight)
+		binary.BigEndian.PutUint16(data[4:6], record.Port)
+		copy(data[6:], target)
+		answers = append(answers, dnsResource{
+			nameStart: q.nameStart,
+			typ:       dnsTypeSRV,
+			class:     dnsClassIN,
+			ttl:       30,
+			data:      data,
+		})
+		if _, ok := addedAdditional[targetName]; ok {
+			continue
+		}
+		addedAdditional[targetName] = struct{}{}
+		additionals = append(additionals, resolveAdditionalAddressRecords(ctx, targetName)...)
+	}
+	return answers, additionals, nil
+}
+
+func splitSRVQueryName(name string) (string, string, string) {
+	labels := strings.Split(strings.Trim(name, "."), ".")
+	if len(labels) < 3 || !strings.HasPrefix(labels[0], "_") || !strings.HasPrefix(labels[1], "_") {
+		return "", "", name
+	}
+	return strings.TrimPrefix(labels[0], "_"), strings.TrimPrefix(labels[1], "_"), strings.Join(labels[2:], ".")
+}
+
+func resolveAdditionalAddressRecords(ctx context.Context, name string) []dnsResource {
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", strings.TrimSuffix(name, "."))
+	if err != nil {
+		return nil
+	}
+	resources := make([]dnsResource, 0, len(ips))
+	for _, ip := range ips {
+		if ip4 := ip.To4(); ip4 != nil {
+			resources = append(resources, dnsResource{
+				name:      name,
+				nameStart: -1,
+				typ:       dnsTypeA,
+				class:     dnsClassIN,
+				ttl:       30,
+				data:      append([]byte(nil), ip4...),
+			})
+			continue
+		}
+		if ip16 := ip.To16(); ip16 != nil {
+			resources = append(resources, dnsResource{
+				name:      name,
+				nameStart: -1,
+				typ:       dnsTypeAAAA,
+				class:     dnsClassIN,
+				ttl:       30,
+				data:      append([]byte(nil), ip16...),
+			})
+		}
+	}
+	return resources
 }
 
 ////////////////////////////////////////////////////////////////////////////////
