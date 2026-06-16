@@ -308,6 +308,10 @@ func (m *mountedFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32)
 }
 
 func (m *mountedFS) Open(nodeID uint64, flags uint32) (uint64, int32) {
+	return m.OpenForCaller(nodeID, flags, 0, 0)
+}
+
+func (m *mountedFS) OpenForCaller(nodeID uint64, flags uint32, uid uint32, gid uint32) (uint64, int32) {
 	node := m.node(nodeID)
 	if node == nil {
 		return 0, -linuxENOENT
@@ -316,7 +320,12 @@ func (m *mountedFS) Open(nodeID uint64, flags uint32) (uint64, int32) {
 	if errno != 0 {
 		return 0, errno
 	}
-	fh, errno := backend.Open(backendNodeID, flags)
+	var fh uint64
+	if callerBE, ok := backend.(fsOpenCallerBackend); ok {
+		fh, errno = callerBE.OpenForCaller(backendNodeID, flags, uid, gid)
+	} else {
+		fh, errno = backend.Open(backendNodeID, flags)
+	}
 	if errno != 0 {
 		return 0, errno
 	}
@@ -561,6 +570,10 @@ func (m *mountedFS) Symlink(parent uint64, name string, target string, uid uint3
 }
 
 func (m *mountedFS) Link(nodeID uint64, newParent uint64, newName string) (uint64, FuseAttr, int32) {
+	return m.LinkForCaller(nodeID, newParent, newName, 0, 0)
+}
+
+func (m *mountedFS) LinkForCaller(nodeID uint64, newParent uint64, newName string, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
 	node := m.node(nodeID)
 	parentNode := m.node(newParent)
 	if node == nil || parentNode == nil {
@@ -589,7 +602,13 @@ func (m *mountedFS) Link(nodeID uint64, newParent uint64, newName string) (uint6
 	if !ok {
 		return 0, FuseAttr{}, -linuxEROFS
 	}
-	backendLinkedID, attr, errno := linkBackend.Link(backendNodeID, newParentID, childName)
+	var backendLinkedID uint64
+	var attr FuseAttr
+	if callerBE, ok := backend.(fsLinkCallerBackend); ok {
+		backendLinkedID, attr, errno = callerBE.LinkForCaller(backendNodeID, newParentID, childName, uid, gid)
+	} else {
+		backendLinkedID, attr, errno = linkBackend.Link(backendNodeID, newParentID, childName)
+	}
 	if errno != 0 {
 		return 0, FuseAttr{}, errno
 	}
@@ -599,6 +618,10 @@ func (m *mountedFS) Link(nodeID uint64, newParent uint64, newName string) (uint6
 }
 
 func (m *mountedFS) RmDir(parent uint64, name string) int32 {
+	return m.RmDirForCaller(parent, name, 0, 0)
+}
+
+func (m *mountedFS) RmDirForCaller(parent uint64, name string, uid uint32, gid uint32) int32 {
 	parentNode := m.node(parent)
 	if parentNode == nil {
 		return -linuxENOENT
@@ -623,7 +646,12 @@ func (m *mountedFS) RmDir(parent uint64, name string) int32 {
 		m.debugPathf("rmdir-error", childPath, "errno=%d", -linuxEROFS)
 		return -linuxEROFS
 	}
-	if errno := rmBackend.RmDir(backendParent, name); errno != 0 {
+	if callerBE, ok := backend.(fsRmDirCallerBackend); ok {
+		errno = callerBE.RmDirForCaller(backendParent, name, uid, gid)
+	} else {
+		errno = rmBackend.RmDir(backendParent, name)
+	}
+	if errno != 0 {
 		m.debugPathf("rmdir-error", childPath, "backend_errno=%d", errno)
 		return errno
 	}
@@ -632,6 +660,10 @@ func (m *mountedFS) RmDir(parent uint64, name string) int32 {
 }
 
 func (m *mountedFS) Create(parent uint64, name string, flags uint32, mode uint32, uid uint32, gid uint32) (uint64, uint64, FuseAttr, int32) {
+	return m.CreateForCaller(parent, name, flags, mode, uid, gid)
+}
+
+func (m *mountedFS) CreateForCaller(parent uint64, name string, flags uint32, mode uint32, uid uint32, gid uint32) (uint64, uint64, FuseAttr, int32) {
 	parentNode := m.node(parent)
 	if parentNode == nil {
 		return 0, 0, FuseAttr{}, -linuxENOENT
@@ -660,7 +692,14 @@ func (m *mountedFS) Create(parent uint64, name string, flags uint32, mode uint32
 		m.debugPathf("create-error", childPath, "errno=%d", -linuxEROFS)
 		return 0, 0, FuseAttr{}, -linuxEROFS
 	}
-	backendNodeID, fh, attr, errno := createBackend.Create(backendParent, childName, flags, mode, uid, gid)
+	var backendNodeID uint64
+	var fh uint64
+	var attr FuseAttr
+	if callerBE, ok := backend.(fsCreateCallerBackend); ok {
+		backendNodeID, fh, attr, errno = callerBE.CreateForCaller(backendParent, childName, flags, mode, uid, gid)
+	} else {
+		backendNodeID, fh, attr, errno = createBackend.Create(backendParent, childName, flags, mode, uid, gid)
+	}
 	if errno != 0 {
 		m.debugPathf("create-error", childPath, "backend_errno=%d", errno)
 		return 0, 0, FuseAttr{}, errno
@@ -671,6 +710,10 @@ func (m *mountedFS) Create(parent uint64, name string, flags uint32, mode uint32
 }
 
 func (m *mountedFS) Write(nodeID uint64, fh uint64, off uint64, data []byte, flags uint32) (uint32, int32) {
+	return m.WriteForCaller(nodeID, fh, off, data, flags, 0, 0)
+}
+
+func (m *mountedFS) WriteForCaller(nodeID uint64, fh uint64, off uint64, data []byte, flags uint32, uid uint32, gid uint32) (uint32, int32) {
 	handle := m.handle(fh, false)
 	if handle == nil {
 		return 0, -linuxEBADF
@@ -679,10 +722,17 @@ func (m *mountedFS) Write(nodeID uint64, fh uint64, off uint64, data []byte, fla
 	if !ok {
 		return 0, -linuxEROFS
 	}
+	if callerBE, ok := handle.backend.(fsWriteCallerBackend); ok {
+		return callerBE.WriteForCaller(handle.nodeID, handle.fh, off, data, flags, uid, gid)
+	}
 	return writeBackend.Write(handle.nodeID, handle.fh, off, data, flags)
 }
 
 func (m *mountedFS) SetAttr(nodeID uint64, valid uint32, fh uint64, size uint64, mode uint32, uid uint32, gid uint32, atime time.Time, mtime time.Time) (FuseAttr, int32) {
+	return m.SetAttrForCaller(nodeID, valid, fh, size, mode, uid, gid, atime, mtime, 0, 0)
+}
+
+func (m *mountedFS) SetAttrForCaller(nodeID uint64, valid uint32, fh uint64, size uint64, mode uint32, uid uint32, gid uint32, atime time.Time, mtime time.Time, callerUID uint32, callerGID uint32) (FuseAttr, int32) {
 	node := m.node(nodeID)
 	if node == nil {
 		return FuseAttr{}, -linuxENOENT
@@ -706,7 +756,12 @@ func (m *mountedFS) SetAttr(nodeID uint64, valid uint32, fh uint64, size uint64,
 		}
 		backendFH = handle.fh
 	}
-	attr, errno := setAttrBackend.SetAttr(backendNodeID, valid, backendFH, size, mode, uid, gid, atime, mtime)
+	var attr FuseAttr
+	if callerBE, ok := backend.(fsSetAttrCallerBackend); ok {
+		attr, errno = callerBE.SetAttrForCaller(backendNodeID, valid, backendFH, size, mode, uid, gid, atime, mtime, callerUID, callerGID)
+	} else {
+		attr, errno = setAttrBackend.SetAttr(backendNodeID, valid, backendFH, size, mode, uid, gid, atime, mtime)
+	}
 	if errno != 0 {
 		return FuseAttr{}, errno
 	}
@@ -715,6 +770,10 @@ func (m *mountedFS) SetAttr(nodeID uint64, valid uint32, fh uint64, size uint64,
 }
 
 func (m *mountedFS) Unlink(parent uint64, name string) int32 {
+	return m.UnlinkForCaller(parent, name, 0, 0)
+}
+
+func (m *mountedFS) UnlinkForCaller(parent uint64, name string, uid uint32, gid uint32) int32 {
 	parentNode := m.node(parent)
 	if parentNode == nil {
 		return -linuxENOENT
@@ -739,7 +798,12 @@ func (m *mountedFS) Unlink(parent uint64, name string) int32 {
 		m.debugPathf("unlink-error", childPath, "errno=%d", -linuxEROFS)
 		return -linuxEROFS
 	}
-	if errno := unlinkBackend.Unlink(backendParent, name); errno != 0 {
+	if callerBE, ok := backend.(fsUnlinkCallerBackend); ok {
+		errno = callerBE.UnlinkForCaller(backendParent, name, uid, gid)
+	} else {
+		errno = unlinkBackend.Unlink(backendParent, name)
+	}
+	if errno != 0 {
 		m.debugPathf("unlink-error", childPath, "backend_errno=%d", errno)
 		return errno
 	}
@@ -748,6 +812,10 @@ func (m *mountedFS) Unlink(parent uint64, name string) int32 {
 }
 
 func (m *mountedFS) Rename(parent uint64, name string, newParent uint64, newName string, flags uint32) int32 {
+	return m.RenameForCaller(parent, name, newParent, newName, flags, 0, 0)
+}
+
+func (m *mountedFS) RenameForCaller(parent uint64, name string, newParent uint64, newName string, flags uint32, uid uint32, gid uint32) int32 {
 	oldParentNode := m.node(parent)
 	newParentNode := m.node(newParent)
 	if oldParentNode == nil || newParentNode == nil {
@@ -780,7 +848,12 @@ func (m *mountedFS) Rename(parent uint64, name string, newParent uint64, newName
 		m.debugPathf("rename-error", oldPath, "new=%q errno=%d", newPath, -linuxEROFS)
 		return -linuxEROFS
 	}
-	if errno := renameBackend.Rename(oldParentID, name, newParentID, newName, flags); errno != 0 {
+	if callerBE, ok := oldBackend.(fsRenameCallerBackend); ok {
+		errno = callerBE.RenameForCaller(oldParentID, name, newParentID, newName, flags, uid, gid)
+	} else {
+		errno = renameBackend.Rename(oldParentID, name, newParentID, newName, flags)
+	}
+	if errno != 0 {
 		m.debugPathf("rename-error", oldPath, "new=%q backend_errno=%d", newPath, errno)
 		return errno
 	}
@@ -1274,11 +1347,19 @@ var _ FSBackend = (*mountedFS)(nil)
 var _ ShareMounter = (*mountedFS)(nil)
 var _ fsMkdirBackend = (*mountedFS)(nil)
 var _ fsRmDirBackend = (*mountedFS)(nil)
+var _ fsRmDirCallerBackend = (*mountedFS)(nil)
 var _ fsCreateBackend = (*mountedFS)(nil)
+var _ fsCreateCallerBackend = (*mountedFS)(nil)
 var _ fsWriteBackend = (*mountedFS)(nil)
+var _ fsWriteCallerBackend = (*mountedFS)(nil)
 var _ fsSetAttrBackend = (*mountedFS)(nil)
+var _ fsSetAttrCallerBackend = (*mountedFS)(nil)
 var _ fsUnlinkBackend = (*mountedFS)(nil)
+var _ fsUnlinkCallerBackend = (*mountedFS)(nil)
 var _ fsRenameBackend = (*mountedFS)(nil)
+var _ fsRenameCallerBackend = (*mountedFS)(nil)
+var _ fsOpenCallerBackend = (*mountedFS)(nil)
+var _ fsLinkCallerBackend = (*mountedFS)(nil)
 var _ fsFlushBackend = (*mountedFS)(nil)
 var _ fsFsyncBackend = (*mountedFS)(nil)
 var _ fsFsyncDirBackend = (*mountedFS)(nil)

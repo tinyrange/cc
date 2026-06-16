@@ -22,6 +22,17 @@ func newLinuxAMD64NetworkRuntime(id string, cfg *client.NetworkConfig) (*linuxNe
 	if cfg == nil || !cfg.Enabled {
 		return nil, nil
 	}
+	return newLinuxSwitchNetworkRuntime(id, cfg, amd64vm.NetBase, amd64vm.NetSize, amd64vm.NetIRQ)
+}
+
+func newLinuxPCINetworkRuntime(id string, cfg *client.NetworkConfig) (*linuxNetworkRuntime, error) {
+	if cfg == nil || !cfg.Enabled {
+		return nil, nil
+	}
+	return newLinuxSwitchNetworkRuntime(id, cfg, 0, 0x1000, 11)
+}
+
+func newLinuxSwitchNetworkRuntime(id string, cfg *client.NetworkConfig, base, size uint64, irq uint32) (*linuxNetworkRuntime, error) {
 	lease := defaultLinuxVirtualSwitch.Register(id)
 	runtime := &linuxNetworkRuntime{switchNet: defaultLinuxVirtualSwitch}
 	common, err := newNetworkRuntime(networkDeviceConfig{
@@ -29,9 +40,9 @@ func newLinuxAMD64NetworkRuntime(id string, cfg *client.NetworkConfig) (*linuxNe
 		Config: cfg,
 		IP:     lease.ip,
 		MAC:    lease.mac,
-		Base:   amd64vm.NetBase,
-		Size:   amd64vm.NetSize,
-		IRQ:    amd64vm.NetIRQ,
+		Base:   base,
+		Size:   size,
+		IRQ:    irq,
 		TXHook: func(packet []byte) {
 			defaultLinuxVirtualSwitch.Forward(runtime, packet)
 		},

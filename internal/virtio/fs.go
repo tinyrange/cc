@@ -202,28 +202,60 @@ type fsLinkBackend interface {
 	Link(nodeID uint64, newParent uint64, newName string) (newNodeID uint64, attr FuseAttr, errno int32)
 }
 
+type fsLinkCallerBackend interface {
+	LinkForCaller(nodeID uint64, newParent uint64, newName string, uid uint32, gid uint32) (newNodeID uint64, attr FuseAttr, errno int32)
+}
+
 type fsRmDirBackend interface {
 	RmDir(parent uint64, name string) int32
+}
+
+type fsRmDirCallerBackend interface {
+	RmDirForCaller(parent uint64, name string, uid uint32, gid uint32) int32
 }
 
 type fsCreateBackend interface {
 	Create(parent uint64, name string, flags uint32, mode uint32, uid uint32, gid uint32) (nodeID uint64, fh uint64, attr FuseAttr, errno int32)
 }
 
+type fsOpenCallerBackend interface {
+	OpenForCaller(nodeID uint64, flags uint32, uid uint32, gid uint32) (uint64, int32)
+}
+
+type fsCreateCallerBackend interface {
+	CreateForCaller(parent uint64, name string, flags uint32, mode uint32, uid uint32, gid uint32) (nodeID uint64, fh uint64, attr FuseAttr, errno int32)
+}
+
 type fsWriteBackend interface {
 	Write(nodeID uint64, fh uint64, off uint64, data []byte, flags uint32) (uint32, int32)
+}
+
+type fsWriteCallerBackend interface {
+	WriteForCaller(nodeID uint64, fh uint64, off uint64, data []byte, flags uint32, uid uint32, gid uint32) (uint32, int32)
 }
 
 type fsSetAttrBackend interface {
 	SetAttr(nodeID uint64, valid uint32, fh uint64, size uint64, mode uint32, uid uint32, gid uint32, atime time.Time, mtime time.Time) (FuseAttr, int32)
 }
 
+type fsSetAttrCallerBackend interface {
+	SetAttrForCaller(nodeID uint64, valid uint32, fh uint64, size uint64, mode uint32, uid uint32, gid uint32, atime time.Time, mtime time.Time, callerUID uint32, callerGID uint32) (FuseAttr, int32)
+}
+
 type fsUnlinkBackend interface {
 	Unlink(parent uint64, name string) int32
 }
 
+type fsUnlinkCallerBackend interface {
+	UnlinkForCaller(parent uint64, name string, uid uint32, gid uint32) int32
+}
+
 type fsRenameBackend interface {
 	Rename(parent uint64, name string, newParent uint64, newName string, flags uint32) int32
+}
+
+type fsRenameCallerBackend interface {
+	RenameForCaller(parent uint64, name string, newParent uint64, newName string, flags uint32, uid uint32, gid uint32) int32
 }
 
 type fsWritebackCacheBackend interface {
@@ -1536,7 +1568,13 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 			mode := binary.LittleEndian.Uint32(req[108:112])
 			uid := binary.LittleEndian.Uint32(req[116:120])
 			gid := binary.LittleEndian.Uint32(req[120:124])
-			attr, errno := be.SetAttr(nodeID, valid, fh, size, mode, uid, gid, atime, mtime)
+			var attr FuseAttr
+			var errno int32
+			if callerBE, ok := f.backend.(fsSetAttrCallerBackend); ok {
+				attr, errno = callerBE.SetAttrForCaller(nodeID, valid, fh, size, mode, uid, gid, atime, mtime, callerUID, callerGID)
+			} else {
+				attr, errno = be.SetAttr(nodeID, valid, fh, size, mode, uid, gid, atime, mtime)
+			}
 			if errno != 0 {
 				return reply(errno, nil), nil
 			}
@@ -1625,6 +1663,9 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 	case fuseUnlink:
 		name := readCStringName(req[fuseInHeaderSize:])
 		if be, ok := f.backend.(fsUnlinkBackend); ok {
+			if callerBE, ok := f.backend.(fsUnlinkCallerBackend); ok {
+				return reply(callerBE.UnlinkForCaller(nodeID, path.Clean(name), callerUID, callerGID), nil), nil
+			}
 			return reply(be.Unlink(nodeID, path.Clean(name)), nil), nil
 		}
 		return reply(-linuxENOSYS, nil), nil
@@ -1636,7 +1677,13 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 		if logEnabled {
 			f.logPathf("open", nodeID, fmt.Sprintf(" flags=%#x", flags))
 		}
-		fh, errno := f.backend.Open(nodeID, flags)
+		var fh uint64
+		var errno int32
+		if be, ok := f.backend.(fsOpenCallerBackend); ok {
+			fh, errno = be.OpenForCaller(nodeID, flags, callerUID, callerGID)
+		} else {
+			fh, errno = f.backend.Open(nodeID, flags)
+		}
 		if errno != 0 {
 			return reply(errno, nil), nil
 		}
@@ -1672,7 +1719,13 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 			if len(req) < dataStart+int(size) {
 				return fsReply{}, fmt.Errorf("virtio-fs WRITE short payload")
 			}
-			count, errno := be.Write(nodeID, fh, off, req[dataStart:dataStart+int(size)], writeFlags)
+			var count uint32
+			var errno int32
+			if callerBE, ok := f.backend.(fsWriteCallerBackend); ok {
+				count, errno = callerBE.WriteForCaller(nodeID, fh, off, req[dataStart:dataStart+int(size)], writeFlags, callerUID, callerGID)
+			} else {
+				count, errno = be.Write(nodeID, fh, off, req[dataStart:dataStart+int(size)], writeFlags)
+			}
 			if errno != 0 {
 				return reply(errno, nil), nil
 			}
@@ -1789,7 +1842,12 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 			f.logPathf("rmdir-parent", nodeID, fmt.Sprintf(" name=%q", name))
 		}
 		if be, ok := f.backend.(fsRmDirBackend); ok {
-			errno := be.RmDir(nodeID, path.Clean(name))
+			var errno int32
+			if callerBE, ok := f.backend.(fsRmDirCallerBackend); ok {
+				errno = callerBE.RmDirForCaller(nodeID, path.Clean(name), callerUID, callerGID)
+			} else {
+				errno = be.RmDir(nodeID, path.Clean(name))
+			}
 			return reply(errno, nil), nil
 		}
 		return fsReply{}, fmt.Errorf("virtio-fs missing rmdir backend for parent=%d name=%q", nodeID, name)
@@ -1806,6 +1864,9 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 			}
 			oldName := string(names[:split])
 			newName := readCStringName(names[split+1:])
+			if callerBE, ok := f.backend.(fsRenameCallerBackend); ok {
+				return reply(callerBE.RenameForCaller(nodeID, path.Clean(oldName), newParent, path.Clean(newName), 0, callerUID, callerGID), nil), nil
+			}
 			return reply(be.Rename(nodeID, path.Clean(oldName), newParent, path.Clean(newName), 0), nil), nil
 		}
 		return reply(-linuxENOSYS, nil), nil
@@ -1823,6 +1884,9 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 			}
 			oldName := string(names[:split])
 			newName := readCStringName(names[split+1:])
+			if callerBE, ok := f.backend.(fsRenameCallerBackend); ok {
+				return reply(callerBE.RenameForCaller(nodeID, path.Clean(oldName), newParent, path.Clean(newName), flags, callerUID, callerGID), nil), nil
+			}
 			return reply(be.Rename(nodeID, path.Clean(oldName), newParent, path.Clean(newName), flags), nil), nil
 		}
 		return reply(-linuxENOSYS, nil), nil
@@ -1834,7 +1898,14 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 			oldNodeID := binary.LittleEndian.Uint64(req[40:48])
 			newParent := nodeID
 			newName := readCStringName(req[fuseInHeaderSize+8:])
-			childID, attr, errno := be.Link(oldNodeID, newParent, path.Clean(newName))
+			var childID uint64
+			var attr FuseAttr
+			var errno int32
+			if callerBE, ok := f.backend.(fsLinkCallerBackend); ok {
+				childID, attr, errno = callerBE.LinkForCaller(oldNodeID, newParent, path.Clean(newName), callerUID, callerGID)
+			} else {
+				childID, attr, errno = be.Link(oldNodeID, newParent, path.Clean(newName))
+			}
 			if errno != 0 {
 				return reply(errno, nil), nil
 			}
@@ -2006,7 +2077,15 @@ func (f *FS) dispatchFUSE(req []byte) (fsReply, error) {
 			flags := binary.LittleEndian.Uint32(req[40:44])
 			mode := binary.LittleEndian.Uint32(req[44:48])
 			name := readCStringName(req[fuseInHeaderSize+16:])
-			childID, fh, attr, errno := be.Create(nodeID, path.Clean(name), flags, mode, callerUID, callerGID)
+			var childID uint64
+			var fh uint64
+			var attr FuseAttr
+			var errno int32
+			if callerBE, ok := f.backend.(fsCreateCallerBackend); ok {
+				childID, fh, attr, errno = callerBE.CreateForCaller(nodeID, path.Clean(name), flags, mode, callerUID, callerGID)
+			} else {
+				childID, fh, attr, errno = be.Create(nodeID, path.Clean(name), flags, mode, callerUID, callerGID)
+			}
 			if errno != 0 {
 				return reply(errno, nil), nil
 			}
@@ -3861,6 +3940,10 @@ func (p *imageFS) Lookup(parent uint64, name string) (uint64, FuseAttr, int32) {
 }
 
 func (p *imageFS) Open(nodeID uint64, flags uint32) (uint64, int32) {
+	return p.OpenForCaller(nodeID, flags, 0, 0)
+}
+
+func (p *imageFS) OpenForCaller(nodeID uint64, flags uint32, uid uint32, gid uint32) (uint64, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	node := p.nodes[nodeID]
@@ -3870,6 +3953,9 @@ func (p *imageFS) Open(nodeID uint64, flags uint32) (uint64, int32) {
 	p.debugNodefLocked("open", nodeID, "flags=%#x", flags)
 	if node.isDir() {
 		return 0, -linuxEISDIR
+	}
+	if errno := p.checkNodeAccessLocked(node, uid, gid, imageOpenAccessMask(flags)); errno != 0 {
+		return 0, errno
 	}
 	if flags&linuxOACCMODE != linuxORDONLY {
 		if errno := p.copyUpFileLocked(node); errno != 0 {
@@ -4055,12 +4141,94 @@ func (p *imageFS) Readlink(nodeID uint64) (string, int32) {
 	return node.symlinkTarget, 0
 }
 
+const (
+	imageAccessExec  = 1
+	imageAccessWrite = 2
+	imageAccessRead  = 4
+)
+
+func imageOpenAccessMask(flags uint32) uint32 {
+	switch flags & linuxOACCMODE {
+	case linuxOWRONLY:
+		return imageAccessWrite
+	case linuxORDWR:
+		return imageAccessRead | imageAccessWrite
+	default:
+		if flags&linuxOTRUNC != 0 {
+			return imageAccessRead | imageAccessWrite
+		}
+		return imageAccessRead
+	}
+}
+
+func (p *imageFS) checkNodeAccessLocked(node *imageNode, uid uint32, gid uint32, mask uint32) int32 {
+	if node == nil {
+		return -linuxENOENT
+	}
+	if mask == 0 || uid == 0 {
+		if uid == 0 && mask&imageAccessExec != 0 && !node.isDir() && p.attr(node).Mode&0o111 == 0 {
+			return -linuxEACCES
+		}
+		return 0
+	}
+	attr := p.attr(node)
+	perm := attr.Mode & linuxPermMask
+	var allowed uint32
+	switch {
+	case uid == attr.UID:
+		allowed = (perm >> 6) & 7
+	case gid == attr.GID:
+		allowed = (perm >> 3) & 7
+	default:
+		allowed = perm & 7
+	}
+	if allowed&mask != mask {
+		return -linuxEACCES
+	}
+	return 0
+}
+
+func (p *imageFS) checkParentMutationLocked(parent *imageNode, uid uint32, gid uint32) int32 {
+	return p.checkNodeAccessLocked(parent, uid, gid, imageAccessWrite|imageAccessExec)
+}
+
+func (p *imageFS) checkSetAttrLocked(node *imageNode, valid uint32, callerUID uint32, callerGID uint32) int32 {
+	if node == nil {
+		return -linuxENOENT
+	}
+	if callerUID == 0 {
+		return 0
+	}
+	attr := p.attr(node)
+	isOwner := callerUID == attr.UID
+	if valid&(fattrUID|fattrGID) != 0 {
+		return -linuxEPERM
+	}
+	if valid&fattrMode != 0 && !isOwner {
+		return -linuxEPERM
+	}
+	if valid&fattrSize != 0 {
+		if errno := p.checkNodeAccessLocked(node, callerUID, callerGID, imageAccessWrite); errno != 0 {
+			return errno
+		}
+	}
+	if valid&(fattrATime|fattrMTime) != 0 && !isOwner {
+		if errno := p.checkNodeAccessLocked(node, callerUID, callerGID, imageAccessWrite); errno != 0 {
+			return errno
+		}
+	}
+	return 0
+}
+
 func (p *imageFS) Mkdir(parent uint64, name string, mode uint32, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	parentNode := p.nodes[parent]
 	if parentNode == nil {
 		return 0, FuseAttr{}, -linuxENOENT
+	}
+	if errno := p.checkParentMutationLocked(parentNode, uid, gid); errno != 0 {
+		return 0, FuseAttr{}, errno
 	}
 	name = path.Base(path.Clean("/" + name))
 	p.debugChildfLocked("mkdir", parent, name, "mode=%#o uid=%d gid=%d", mode, uid, gid)
@@ -4089,6 +4257,9 @@ func (p *imageFS) Mknod(parent uint64, name string, mode uint32, rdev uint32, ui
 	parentNode := p.nodes[parent]
 	if parentNode == nil {
 		return 0, FuseAttr{}, -linuxENOENT
+	}
+	if errno := p.checkParentMutationLocked(parentNode, uid, gid); errno != 0 {
+		return 0, FuseAttr{}, errno
 	}
 	name = path.Base(path.Clean("/" + name))
 	fileType := mode & linuxSIFMT
@@ -4135,6 +4306,9 @@ func (p *imageFS) Symlink(parent uint64, name string, target string, uid uint32,
 	if parentNode == nil {
 		return 0, FuseAttr{}, -linuxENOENT
 	}
+	if errno := p.checkParentMutationLocked(parentNode, uid, gid); errno != 0 {
+		return 0, FuseAttr{}, errno
+	}
 	name = path.Base(path.Clean("/" + name))
 	p.debugChildfLocked("symlink", parent, name, "target=%q uid=%d gid=%d", target, uid, gid)
 	if _, exists := parentNode.entries[name]; exists {
@@ -4159,12 +4333,19 @@ func (p *imageFS) Symlink(parent uint64, name string, target string, uid uint32,
 }
 
 func (p *imageFS) Link(nodeID uint64, newParent uint64, newName string) (uint64, FuseAttr, int32) {
+	return p.LinkForCaller(nodeID, newParent, newName, 0, 0)
+}
+
+func (p *imageFS) LinkForCaller(nodeID uint64, newParent uint64, newName string, uid uint32, gid uint32) (uint64, FuseAttr, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	node := p.nodes[nodeID]
 	parentNode := p.nodes[newParent]
 	if node == nil || parentNode == nil {
 		return 0, FuseAttr{}, -linuxENOENT
+	}
+	if errno := p.checkParentMutationLocked(parentNode, uid, gid); errno != 0 {
+		return 0, FuseAttr{}, errno
 	}
 	if node.isDir() {
 		return 0, FuseAttr{}, -linuxEPERM
@@ -4208,11 +4389,18 @@ func (p *imageFS) Link(nodeID uint64, newParent uint64, newName string) (uint64,
 }
 
 func (p *imageFS) RmDir(parent uint64, name string) int32 {
+	return p.RmDirForCaller(parent, name, 0, 0)
+}
+
+func (p *imageFS) RmDirForCaller(parent uint64, name string, uid uint32, gid uint32) int32 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	parentNode := p.nodes[parent]
 	if parentNode == nil {
 		return -linuxENOENT
+	}
+	if errno := p.checkParentMutationLocked(parentNode, uid, gid); errno != 0 {
+		return errno
 	}
 	name = path.Base(path.Clean("/" + name))
 	p.debugChildfLocked("rmdir", parent, name, "")
@@ -4241,6 +4429,10 @@ func (p *imageFS) RmDir(parent uint64, name string) int32 {
 }
 
 func (p *imageFS) Create(parent uint64, name string, flags uint32, mode uint32, uid uint32, gid uint32) (uint64, uint64, FuseAttr, int32) {
+	return p.CreateForCaller(parent, name, flags, mode, uid, gid)
+}
+
+func (p *imageFS) CreateForCaller(parent uint64, name string, flags uint32, mode uint32, uid uint32, gid uint32) (uint64, uint64, FuseAttr, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	parentNode := p.nodes[parent]
@@ -4263,6 +4455,9 @@ func (p *imageFS) Create(parent uint64, name string, flags uint32, mode uint32, 
 			p.debugChildfLocked("create-existing-dir", parent, name, "existing=%d errno=%d", existingID, -linuxEISDIR)
 			return 0, 0, FuseAttr{}, -linuxEISDIR
 		}
+		if errno := p.checkNodeAccessLocked(node, uid, gid, imageOpenAccessMask(flags)); errno != 0 {
+			return 0, 0, FuseAttr{}, errno
+		}
 		p.debugChildfLocked("create-open-existing", parent, name, "existing=%d flags=%#x", existingID, flags)
 		if flags&linuxOACCMODE != linuxORDONLY {
 			if errno := p.copyUpFileLocked(node); errno != 0 {
@@ -4280,6 +4475,9 @@ func (p *imageFS) Create(parent uint64, name string, flags uint32, mode uint32, 
 		p.nextHandle++
 		p.handles[fh] = &imageHandle{nodeID: node.id}
 		return node.id, fh, p.attr(node), 0
+	}
+	if errno := p.checkParentMutationLocked(parentNode, uid, gid); errno != 0 {
+		return 0, 0, FuseAttr{}, errno
 	}
 	if parentNode.whiteouts != nil {
 		delete(parentNode.whiteouts, name)
@@ -4303,12 +4501,19 @@ func (p *imageFS) Create(parent uint64, name string, flags uint32, mode uint32, 
 }
 
 func (p *imageFS) Write(nodeID uint64, fh uint64, off uint64, data []byte, _ uint32) (uint32, int32) {
+	return p.WriteForCaller(nodeID, fh, off, data, 0, 0, 0)
+}
+
+func (p *imageFS) WriteForCaller(nodeID uint64, fh uint64, off uint64, data []byte, flags uint32, uid uint32, gid uint32) (uint32, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	handle := p.handles[fh]
 	node := p.nodes[nodeID]
 	if handle == nil || handle.nodeID != nodeID || node == nil {
 		return 0, -linuxEBADF
+	}
+	if errno := p.checkNodeAccessLocked(node, uid, gid, imageAccessWrite); errno != 0 {
+		return 0, errno
 	}
 	if errno := p.copyUpFileLocked(node); errno != 0 {
 		return 0, errno
@@ -4358,11 +4563,18 @@ func growImageNodeData(node *imageNode, size uint64) int32 {
 }
 
 func (p *imageFS) SetAttr(nodeID uint64, valid uint32, _ uint64, size uint64, mode uint32, uid uint32, gid uint32, _ time.Time, mtime time.Time) (FuseAttr, int32) {
+	return p.SetAttrForCaller(nodeID, valid, 0, size, mode, uid, gid, time.Time{}, mtime, 0, 0)
+}
+
+func (p *imageFS) SetAttrForCaller(nodeID uint64, valid uint32, _ uint64, size uint64, mode uint32, uid uint32, gid uint32, _ time.Time, mtime time.Time, callerUID uint32, callerGID uint32) (FuseAttr, int32) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	node := p.nodes[nodeID]
 	if node == nil {
 		return FuseAttr{}, -linuxENOENT
+	}
+	if errno := p.checkSetAttrLocked(node, valid, callerUID, callerGID); errno != 0 {
+		return FuseAttr{}, errno
 	}
 	if !node.isDir() {
 		if errno := p.copyUpFileLocked(node); errno != 0 {
@@ -4401,11 +4613,18 @@ func (p *imageFS) SetAttr(nodeID uint64, valid uint32, _ uint64, size uint64, mo
 }
 
 func (p *imageFS) Unlink(parent uint64, name string) int32 {
+	return p.UnlinkForCaller(parent, name, 0, 0)
+}
+
+func (p *imageFS) UnlinkForCaller(parent uint64, name string, uid uint32, gid uint32) int32 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	parentNode := p.nodes[parent]
 	if parentNode == nil {
 		return -linuxENOENT
+	}
+	if errno := p.checkParentMutationLocked(parentNode, uid, gid); errno != 0 {
+		return errno
 	}
 	name = path.Base(path.Clean("/" + name))
 	childID, ok := parentNode.entries[name]
@@ -4435,12 +4654,24 @@ func (p *imageFS) Unlink(parent uint64, name string) int32 {
 }
 
 func (p *imageFS) Rename(parent uint64, name string, newParent uint64, newName string, flags uint32) int32 {
+	return p.RenameForCaller(parent, name, newParent, newName, flags, 0, 0)
+}
+
+func (p *imageFS) RenameForCaller(parent uint64, name string, newParent uint64, newName string, flags uint32, uid uint32, gid uint32) int32 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	parentNode := p.nodes[parent]
 	newParentNode := p.nodes[newParent]
 	if parentNode == nil || newParentNode == nil {
 		return -linuxENOENT
+	}
+	if errno := p.checkParentMutationLocked(parentNode, uid, gid); errno != 0 {
+		return errno
+	}
+	if parentNode != newParentNode {
+		if errno := p.checkParentMutationLocked(newParentNode, uid, gid); errno != 0 {
+			return errno
+		}
 	}
 	name = path.Base(path.Clean("/" + name))
 	newName = path.Base(path.Clean("/" + newName))
@@ -4797,6 +5028,7 @@ const (
 	linuxENXIO     = linuxabi.ENXIO
 	linuxEIO       = linuxabi.EIO
 	linuxEBADF     = linuxabi.EBADF
+	linuxEACCES    = linuxabi.EACCES
 	linuxEPIPE     = linuxabi.EPIPE
 	linuxEEXIST    = linuxabi.EEXIST
 	linuxENOTDIR   = linuxabi.ENOTDIR

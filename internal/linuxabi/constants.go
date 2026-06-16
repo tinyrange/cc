@@ -18,6 +18,7 @@ const (
 	EIO       int32 = 5
 	ENXIO     int32 = 6
 	EBADF     int32 = 9
+	EACCES    int32 = 13
 	EBUSY     int32 = 16
 	EEXIST    int32 = 17
 	EXDEV     int32 = 18

@@ -488,9 +488,10 @@ func (b *runtimeBackend) buildBaseRequest(ctx context.Context, imageName string,
 
 func blankRuntimeRootFS() imagefs.Directory {
 	overlay := imagefs.NewOverlay(nil)
-	for _, dir := range []string{"/dev", "/proc", "/sys", "/run", "/tmp", "/.ccx3", "/.ccx3/images"} {
+	for _, dir := range []string{"/dev", "/proc", "/sys", "/run", "/.ccx3", "/.ccx3/images"} {
 		_ = overlay.AddDir(dir, fs.ModeDir|0o755)
 	}
+	_ = overlay.AddDir("/tmp", fs.ModeDir|0o1777)
 	return overlay.Root()
 }
 
@@ -499,9 +500,10 @@ func withRuntimeMountDirs(image *oci.Image) *oci.Image {
 		return image
 	}
 	overlay := imagefs.NewOverlay(image.RootFS)
-	for _, dir := range []string{"/dev", "/proc", "/sys", "/run", "/tmp"} {
+	for _, dir := range []string{"/dev", "/proc", "/sys", "/run"} {
 		_ = overlay.AddDir(dir, fs.ModeDir|0o755)
 	}
+	_ = overlay.AddDir("/tmp", fs.ModeDir|0o1777)
 	cloned := *image
 	cloned.RootFS = overlay.Root()
 	return &cloned

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"j5.nz/cc/internal/imagefs"
 )
@@ -166,6 +167,72 @@ func TestImageFSHardlinkReportsSameInode(t *testing.T) {
 	if aAttrAfter.NLink != 2 || bAttrAfter.NLink != 2 {
 		t.Fatalf("hardlink nlink a=%d b=%d, want 2", aAttrAfter.NLink, bAttrAfter.NLink)
 	}
+}
+
+func TestImageFSPreservesRootOwnershipForPermissionChecks(t *testing.T) {
+	fsys := imageBackend(t, map[string]string{"/db": "root-owned"})
+	fileID, _, errno := fsys.Lookup(1, "db")
+	if errno != 0 {
+		t.Fatalf("lookup db errno = %d", errno)
+	}
+
+	if _, errno := fsys.(fsOpenCallerBackend).OpenForCaller(fileID, linuxOWRONLY, 1000, 1000); errno != -linuxEACCES {
+		t.Fatalf("non-root open root-owned file for write errno = %d, want %d", errno, -linuxEACCES)
+	}
+	if _, _, _, errno := fsys.(fsCreateCallerBackend).CreateForCaller(1, "non-root-new", linuxOWRONLY, 0o644, 1000, 1000); errno != -linuxEACCES {
+		t.Fatalf("non-root create in root-owned dir errno = %d, want %d", errno, -linuxEACCES)
+	}
+
+	fh, errno := fsys.(fsOpenCallerBackend).OpenForCaller(fileID, linuxOWRONLY, 0, 0)
+	if errno != 0 {
+		t.Fatalf("root open root-owned file for write errno = %d", errno)
+	}
+	defer fsys.Release(fileID, fh)
+	if _, errno := fsys.(fsWriteCallerBackend).WriteForCaller(fileID, fh, 0, []byte("root-write"), 0, 0, 0); errno != 0 {
+		t.Fatalf("root write root-owned file errno = %d", errno)
+	}
+}
+
+func TestMountedFSPreservesRootOwnershipForPermissionChecks(t *testing.T) {
+	fsys := NewMountedFS(imageBackend(t, map[string]string{"/db": "root-owned"}), nil)
+	fileID, _, errno := fsys.Lookup(1, "db")
+	if errno != 0 {
+		t.Fatalf("lookup db errno = %d", errno)
+	}
+	if _, errno := fsys.(fsOpenCallerBackend).OpenForCaller(fileID, linuxOWRONLY, 1000, 1000); errno != -linuxEACCES {
+		t.Fatalf("non-root open mounted root-owned file for write errno = %d, want %d", errno, -linuxEACCES)
+	}
+	if _, _, _, errno := fsys.(fsCreateCallerBackend).CreateForCaller(1, "non-root-new", linuxOWRONLY, 0o644, 1000, 1000); errno != -linuxEACCES {
+		t.Fatalf("non-root create in mounted root-owned dir errno = %d, want %d", errno, -linuxEACCES)
+	}
+}
+
+func TestImageFSAllowsOwnerAfterRootChown(t *testing.T) {
+	fsys := imageBackend(t, map[string]string{"/owned": "initial"})
+	fileID, _, errno := fsys.Lookup(1, "owned")
+	if errno != 0 {
+		t.Fatalf("lookup owned errno = %d", errno)
+	}
+	if _, errno := fsys.(fsSetAttrCallerBackend).SetAttrForCaller(fileID, fattrUID|fattrGID, 0, 0, 0, 1000, 1000, zeroTime(), zeroTime(), 0, 0); errno != 0 {
+		t.Fatalf("root chown file errno = %d", errno)
+	}
+
+	fh, errno := fsys.(fsOpenCallerBackend).OpenForCaller(fileID, linuxOWRONLY, 1000, 1000)
+	if errno != 0 {
+		t.Fatalf("owner open chowned file for write errno = %d", errno)
+	}
+	defer fsys.Release(fileID, fh)
+	if _, errno := fsys.(fsWriteCallerBackend).WriteForCaller(fileID, fh, 0, []byte("owner-write"), 0, 1000, 1000); errno != 0 {
+		t.Fatalf("owner write chowned file errno = %d", errno)
+	}
+
+	if _, errno := fsys.(fsSetAttrCallerBackend).SetAttrForCaller(fileID, fattrUID, 0, 0, 0, 1001, 1000, zeroTime(), zeroTime(), 1000, 1000); errno != -linuxEPERM {
+		t.Fatalf("non-root chown errno = %d, want %d", errno, -linuxEPERM)
+	}
+}
+
+func zeroTime() time.Time {
+	return time.Time{}
 }
 
 func imageBackend(t *testing.T, files map[string]string) FSBackend {

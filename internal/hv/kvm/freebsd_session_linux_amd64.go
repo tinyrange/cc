@@ -31,6 +31,8 @@ type FreeBSDManagedConfig struct {
 	Dmesg       bool
 	GuestIPv4   net.IP
 	GuestMAC    net.HardwareAddr
+	NetDevice   *virtio.Net
+	NetStack    *netstack.NetStack
 }
 
 func StartFreeBSDManagedSession(ctx context.Context, cfg FreeBSDManagedConfig, onEvent func(client.BootEvent) error) (*ManagedSession, error) {
@@ -39,10 +41,12 @@ func StartFreeBSDManagedSession(ctx context.Context, cfg FreeBSDManagedConfig, o
 		return nil, err
 	}
 
-	netdev, stack := newFreeBSDManagedNet(cfg.GuestIPv4, cfg.GuestMAC)
+	netdev, stack, ownStack := freeBSDManagedNet(cfg)
 	ln, err := stack.ListenInternal("tcp", fmt.Sprintf(":%d", freeBSDControlPort))
 	if err != nil {
-		stack.Close()
+		if ownStack {
+			stack.Close()
+		}
 		return nil, fmt.Errorf("listen FreeBSD control tcp: %w", err)
 	}
 
@@ -54,7 +58,9 @@ func StartFreeBSDManagedSession(ctx context.Context, cfg FreeBSDManagedConfig, o
 			cancel()
 		}
 		_ = ln.Close()
-		stack.Close()
+		if ownStack {
+			stack.Close()
+		}
 		if bootWriter != nil {
 			_ = bootWriter.Close()
 		}
@@ -177,10 +183,20 @@ func StartFreeBSDManagedSession(ctx context.Context, cfg FreeBSDManagedConfig, o
 		transcript: controlTranscript,
 		serialOut:  serialOut,
 		cleanup: func() {
-			_ = stack.Close()
+			if ownStack {
+				_ = stack.Close()
+			}
 		},
 		dmesg: cfg.Dmesg,
 	}, nil
+}
+
+func freeBSDManagedNet(cfg FreeBSDManagedConfig) (*virtio.Net, *netstack.NetStack, bool) {
+	if cfg.NetDevice != nil && cfg.NetStack != nil {
+		return cfg.NetDevice, cfg.NetStack, false
+	}
+	netdev, stack := newFreeBSDManagedNet(cfg.GuestIPv4, cfg.GuestMAC)
+	return netdev, stack, true
 }
 
 func normalizeFreeBSDManagedConfig(cfg FreeBSDManagedConfig) (FreeBSDManagedConfig, error) {

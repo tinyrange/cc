@@ -612,7 +612,10 @@ func TestRuntimeBootsLinuxWithVirtioDevicesNetworkAndSMP(t *testing.T) {
 	if networkEnabled {
 		command += "; test -d /sys/class/net/eth0; mac=$(cat /sys/class/net/eth0/address); test -n \"$mac\"; grep -q '^nameserver 10.42.0.1$' /etc/resolv.conf; printf 'net=%s\n' \"$mac\""
 	}
-	resp := execInRuntime(t, inst, []string{"sh", "-lc", command})
+	resp := execInRuntimeRequest(t, inst, client.ExecRequest{
+		Command: []string{"sh", "-lc", command},
+		User:    "0:0",
+	})
 	requireGuestOutput(t, resp.Output, "runtime-devices", "cpus=", "rng=ok")
 	if networkEnabled {
 		requireGuestOutput(t, resp.Output, "net=")
