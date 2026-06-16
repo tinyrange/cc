@@ -161,6 +161,17 @@ func TestStorePullRootFSTarReportsDownloadProgress(t *testing.T) {
 	}
 }
 
+func TestResolvedOCISourceUsesImmutableDigest(t *testing.T) {
+	got := resolvedOCISource(defaultRegistry, "library/ubuntu", "sha256:abc123")
+	if got != "library/ubuntu@sha256:abc123" {
+		t.Fatalf("default registry source = %q", got)
+	}
+	got = resolvedOCISource("https://registry.example.com/v2", "team/image", "sha256:def456")
+	if got != "registry.example.com/team/image@sha256:def456" {
+		t.Fatalf("custom registry source = %q", got)
+	}
+}
+
 func alpineFixture(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)

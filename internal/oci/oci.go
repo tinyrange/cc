@@ -925,7 +925,7 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 		return fmt.Errorf("create layers dir: %w", err)
 	}
 
-	mani, err := s.fetchManifest(ctx, reg, imageName, tag, preferredManifestArchitectures(options.Architecture)...)
+	mani, manifestDigest, err := s.fetchManifest(ctx, reg, imageName, tag, preferredManifestArchitectures(options.Architecture)...)
 	if err != nil {
 		return err
 	}
@@ -950,7 +950,11 @@ func (s *Store) pullOCIDirect(ctx context.Context, name string, spec SourceSpec,
 			return fmt.Errorf("index layer %s: %w", layer.Digest, err)
 		}
 	}
-	return s.finalizeIndexedImage(name, spec, imageDir, tmpDir, cfg, build)
+	metaSpec := spec
+	if manifestDigest != "" {
+		metaSpec.Raw = resolvedOCISource(registry, imageName, manifestDigest)
+	}
+	return s.finalizeIndexedImage(name, metaSpec, imageDir, tmpDir, cfg, build)
 }
 
 type indexedBuildState struct {
@@ -1154,28 +1158,28 @@ func (s *Store) cloneFromStore(src *Store, srcName, dstName string, spec SourceS
 	return nil
 }
 
-func (s *Store) fetchManifest(ctx context.Context, reg *registryContext, imageName, tag string, archs ...string) (manifest, error) {
-	body, mediaType, err := s.getJSONBlob(ctx, reg, "/"+imageName+"/manifests/"+tag, []string{
+func (s *Store) fetchManifest(ctx context.Context, reg *registryContext, imageName, tag string, archs ...string) (manifest, string, error) {
+	body, mediaType, digest, err := s.getJSONBlobWithDigest(ctx, reg, "/"+imageName+"/manifests/"+tag, []string{
 		"application/vnd.docker.distribution.manifest.list.v2+json",
 		"application/vnd.oci.image.index.v1+json",
 		"application/vnd.docker.distribution.manifest.v2+json",
 		"application/vnd.oci.image.manifest.v1+json",
 	})
 	if err != nil {
-		return manifest{}, err
+		return manifest{}, "", err
 	}
 
 	if isManifestMediaType(mediaType) {
 		var mani manifest
 		if err := json.Unmarshal(body, &mani); err != nil {
-			return manifest{}, fmt.Errorf("decode manifest: %w", err)
+			return manifest{}, "", fmt.Errorf("decode manifest: %w", err)
 		}
-		return mani, nil
+		return mani, digest, nil
 	}
 
 	var index manifestList
 	if err := json.Unmarshal(body, &index); err != nil {
-		return manifest{}, fmt.Errorf("decode manifest list: %w", err)
+		return manifest{}, "", fmt.Errorf("decode manifest list: %w", err)
 	}
 
 	for _, arch := range archs {
@@ -1186,18 +1190,34 @@ func (s *Store) fetchManifest(ctx context.Context, reg *registryContext, imageNa
 					"application/vnd.oci.image.manifest.v1+json",
 				})
 				if err != nil {
-					return manifest{}, err
+					return manifest{}, "", err
 				}
 				var mani manifest
 				if err := json.Unmarshal(body, &mani); err != nil {
-					return manifest{}, fmt.Errorf("decode manifest: %w", err)
+					return manifest{}, "", fmt.Errorf("decode manifest: %w", err)
 				}
-				return mani, nil
+				return mani, entry.Digest, nil
 			}
 		}
 	}
 
-	return manifest{}, fmt.Errorf("manifest for %v not found", archs)
+	return manifest{}, "", fmt.Errorf("manifest for %v not found", archs)
+}
+
+func resolvedOCISource(registry, imageName, digest string) string {
+	digest = strings.TrimSpace(digest)
+	if digest == "" {
+		return imageName
+	}
+	registry = strings.TrimSpace(registry)
+	registry = strings.TrimPrefix(registry, "https://")
+	registry = strings.TrimPrefix(registry, "http://")
+	registry = strings.TrimSuffix(registry, "/")
+	registry = strings.TrimSuffix(registry, "/v2")
+	if registry == "" || registry == "registry-1.docker.io" {
+		return imageName + "@" + digest
+	}
+	return registry + "/" + imageName + "@" + digest
 }
 
 func (s *Store) fetchBlob(ctx context.Context, reg *registryContext, imageName, digest string) ([]byte, error) {
@@ -1240,16 +1260,26 @@ func (s *Store) fetchLayerTar(ctx context.Context, reg *registryContext, imageNa
 }
 
 func (s *Store) getJSONBlob(ctx context.Context, reg *registryContext, path string, accept []string) ([]byte, string, error) {
+	data, mediaType, _, err := s.getJSONBlobWithDigest(ctx, reg, path, accept)
+	return data, mediaType, err
+}
+
+func (s *Store) getJSONBlobWithDigest(ctx context.Context, reg *registryContext, path string, accept []string) ([]byte, string, string, error) {
 	resp, err := reg.do(ctx, path, accept)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, "", fmt.Errorf("read response body: %w", err)
+		return nil, "", "", fmt.Errorf("read response body: %w", err)
 	}
-	return data, resp.Header.Get("Content-Type"), nil
+	digest := strings.TrimSpace(resp.Header.Get("Docker-Content-Digest"))
+	if digest == "" {
+		sum := sha256.Sum256(data)
+		digest = "sha256:" + hex.EncodeToString(sum[:])
+	}
+	return data, resp.Header.Get("Content-Type"), digest, nil
 }
 
 func (s *Store) getRawBlob(ctx context.Context, reg *registryContext, path string) ([]byte, error) {
