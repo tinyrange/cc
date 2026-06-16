@@ -436,9 +436,12 @@ func workerControlDialEndpoint(network string, address string) string {
 type workerActiveExec struct {
 	cancel context.CancelFunc
 	inputs chan client.ExecInput
-	mu     sync.Mutex
-	closed bool
+	done   chan struct{}
 	once   sync.Once
+	mu     sync.Mutex
+	cond   *sync.Cond
+	queue  []client.ExecInput
+	closed bool
 }
 
 func (e *workerActiveExec) closeInputs() {
@@ -446,10 +449,13 @@ func (e *workerActiveExec) closeInputs() {
 		return
 	}
 	e.once.Do(func() {
+		close(e.done)
 		e.mu.Lock()
 		e.closed = true
+		if e.cond != nil {
+			e.cond.Broadcast()
+		}
 		e.mu.Unlock()
-		close(e.inputs)
 	})
 }
 
@@ -462,11 +468,38 @@ func (e *workerActiveExec) sendInput(input client.ExecInput) bool {
 	if e.closed {
 		return false
 	}
-	select {
-	case e.inputs <- input:
-		return true
-	default:
-		return false
+	if input.Kind == "stdin_close" {
+		e.closed = true
+	}
+	e.queue = append(e.queue, input)
+	e.cond.Signal()
+	return true
+}
+
+func (e *workerActiveExec) forwardInputs() {
+	defer close(e.inputs)
+	for {
+		e.mu.Lock()
+		for len(e.queue) == 0 && !e.closed {
+			e.cond.Wait()
+		}
+		if len(e.queue) == 0 && e.closed {
+			e.mu.Unlock()
+			return
+		}
+		input := e.queue[0]
+		copy(e.queue, e.queue[1:])
+		e.queue[len(e.queue)-1] = client.ExecInput{}
+		e.queue = e.queue[:len(e.queue)-1]
+		e.mu.Unlock()
+		if input.Kind == "stdin_close" {
+			return
+		}
+		select {
+		case e.inputs <- input:
+		case <-e.done:
+			return
+		}
 	}
 }
 
@@ -561,7 +594,7 @@ func serveWorkerControl(codec *vm.WorkerCodec, srvState *server) error {
 				continue
 			}
 			if req.Closed {
-				exec.closeInputs()
+				_ = exec.sendInput(client.ExecInput{Kind: "stdin_close"})
 				continue
 			}
 			if !exec.sendInput(req.Input) {
@@ -603,6 +636,9 @@ func serveWorkerExec(codec *vm.WorkerCodec, srvState *server, frame vm.WorkerFra
 	exec := &workerActiveExec{cancel: cancel}
 	if req.InputStream {
 		exec.inputs = make(chan client.ExecInput, 16)
+		exec.done = make(chan struct{})
+		exec.cond = sync.NewCond(&exec.mu)
+		go exec.forwardInputs()
 	}
 	activeMu.Lock()
 	activeExecs[frame.ID] = exec

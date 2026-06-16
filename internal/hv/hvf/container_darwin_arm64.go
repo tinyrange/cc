@@ -945,13 +945,28 @@ func (s *ContainerSession) Close() error {
 
 func (s *ContainerSession) writeControlPayload(payload []byte) error {
 	if s.control != nil {
-		_, err := s.control.Write(payload)
-		return err
+		return writeFull(s.control, payload)
 	}
 	if s.uart == nil {
 		return fmt.Errorf("control channel is not available")
 	}
 	return s.uart.InjectRXBytes(payload)
+}
+
+func writeFull(w io.Writer, payload []byte) error {
+	for len(payload) > 0 {
+		n, err := w.Write(payload)
+		if n > 0 {
+			payload = payload[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
 
 func (s *ContainerSession) markExecActive() {

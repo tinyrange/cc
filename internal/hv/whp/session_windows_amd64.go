@@ -317,8 +317,24 @@ func (s *ManagedSession) sendExecMessage(msg vmruntime.ManagedExecRequest) error
 	}
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
-	if _, err := s.control.Write(append(payload, '\n')); err != nil {
+	if err := writeFull(s.control, append(payload, '\n')); err != nil {
 		return fmt.Errorf("write exec request: %w", err)
+	}
+	return nil
+}
+
+func writeFull(w io.Writer, payload []byte) error {
+	for len(payload) > 0 {
+		n, err := w.Write(payload)
+		if n > 0 {
+			payload = payload[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
 	}
 	return nil
 }
