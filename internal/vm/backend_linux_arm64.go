@@ -128,6 +128,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 		if err != nil {
 			return nil, err
 		}
+		image = withLinuxRuntimeMountDirs(image)
 	}
 	modules, err := b.kernel.PlanModuleLoad(linuxRuntimeConfigVars(image, req.KernelModules...), linuxRuntimeModuleMap())
 	if err != nil {
@@ -164,14 +165,28 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if err != nil {
 		return nil, err
 	}
-	return &linuxInstance{
+	inst := &linuxInstance{
 		session: session,
+		image:   image,
 		baseEnv: vmruntime.WithDefaultEnv(nil),
 		workDir: "/",
 		rootFS:  rootFS,
 		fsdevs:  fsdevs,
 		dmesg:   req.Dmesg,
-	}, nil
+	}
+	if image != nil {
+		mountPath := linuxImageMountPath(imageName)
+		if err := inst.AddImage(ctx, mountPath, image); err != nil {
+			_ = session.Close()
+			return nil, err
+		}
+		inst.defaultRootDir = mountPath
+		inst.baseEnv = vmruntime.WithDefaultEnv(image.Config.Env)
+		if image.Config.WorkingDir != "" {
+			inst.workDir = image.Config.WorkingDir
+		}
+	}
+	return inst, nil
 }
 
 func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
@@ -212,15 +227,31 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 		if err != nil {
 			return client.ExecResponse{}, err
 		}
-		devs, _, err := arm64vm.BuildFSDevices(vmruntime.RunRequest{
-			Image:             image,
-			AMD64EmulatorPath: qemuX8664,
-			Shares:            convertLinuxShareMounts(req.Shares),
-		}, nil)
-		if err != nil {
-			return client.ExecResponse{}, err
+		if linuxRootFSImageEnabled() {
+			if len(req.Shares) != 0 {
+				return client.ExecResponse{}, fmt.Errorf("rootfs image mode does not support runtime shares yet")
+			}
+			if qemuX8664 != "" {
+				devs, _, err := arm64vm.BuildFSDevices(vmruntime.RunRequest{
+					RootFS:            linuxRuntimeImageFS(image),
+					AMD64EmulatorPath: qemuX8664,
+				}, nil)
+				if err != nil {
+					return client.ExecResponse{}, err
+				}
+				fsdevs = devs
+			}
+		} else {
+			devs, _, err := arm64vm.BuildFSDevices(vmruntime.RunRequest{
+				RootFS:            linuxRuntimeImageFS(image),
+				AMD64EmulatorPath: qemuX8664,
+				Shares:            convertLinuxShareMounts(req.Shares),
+			}, nil)
+			if err != nil {
+				return client.ExecResponse{}, err
+			}
+			fsdevs = devs
 		}
-		fsdevs = devs
 		env = vmruntime.WithDefaultEnv(vmruntime.MergeEnv(image.Config.Env, req.Env))
 		workDir = req.WorkDir
 		if workDir == "" {
@@ -236,7 +267,19 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 		return client.ExecResponse{}, fmt.Errorf("build guest init: %w", err)
 	}
 	initCfg := linuxGuestInitConfig(modules, len(req.Command) != 0)
-	if len(fsdevs) != 0 {
+	if image != nil && linuxRootFSImageEnabled() {
+		rootImageType, err := linuxRootFSImageType()
+		if err != nil {
+			return client.ExecResponse{}, err
+		}
+		rootImage, err := buildLinuxRootFSImage(ctx, image.RootFS, rootImageType)
+		if err != nil {
+			return client.ExecResponse{}, err
+		}
+		initCfg.RootFSImage = rootImage
+		initCfg.RootFSImagePath = rootImageType.InitramfsPath()
+		initCfg.RootFSImageType = rootImageType.String()
+	} else if len(fsdevs) != 0 {
 		initCfg.RootFSTag = vmruntime.RootFSTag
 	}
 	if qemuX8664 != "" {
@@ -318,7 +361,11 @@ func (b *runtimeBackend) RunStream(ctx context.Context, req client.RunRequest, i
 func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runningImage string, req client.RunRequest) (client.ExecResponse, error) {
 	targetImage := strings.TrimSpace(req.Image)
 	if targetImage == "" || targetImage == runningImage {
-		if err := addRuntimeShares(ctx, inst, req.Shares); err != nil {
+		shares := req.Shares
+		if session, ok := inst.(*linuxInstance); ok && session.defaultRootDir != "" {
+			shares = rebaseRuntimeShares(session.defaultRootDir, shares)
+		}
+		if err := addRuntimeShares(ctx, inst, shares); err != nil {
 			return client.ExecResponse{}, err
 		}
 		return inst.Exec(ctx, client.ExecRequest{
@@ -388,7 +435,11 @@ func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runni
 func (b *runtimeBackend) RunInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	targetImage := strings.TrimSpace(req.Image)
 	if targetImage == "" || targetImage == runningImage {
-		if err := addRuntimeShares(ctx, inst, req.Shares); err != nil {
+		shares := req.Shares
+		if session, ok := inst.(*linuxInstance); ok && session.defaultRootDir != "" {
+			shares = rebaseRuntimeShares(session.defaultRootDir, shares)
+		}
+		if err := addRuntimeShares(ctx, inst, shares); err != nil {
 			return err
 		}
 		return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
@@ -470,16 +521,17 @@ func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance
 }
 
 type linuxInstance struct {
-	session     *kvm.ManagedSession
-	image       *oci.Image
-	baseEnv     []string
-	workDir     string
-	rootFS      virtio.ShareMounter
-	fsdevs      []*virtio.FS
-	dmesg       bool
-	shareMu     sync.Mutex
-	shares      map[string]client.ShareMount
-	imageMounts map[string]string
+	session        *kvm.ManagedSession
+	image          *oci.Image
+	baseEnv        []string
+	workDir        string
+	defaultRootDir string
+	rootFS         virtio.ShareMounter
+	fsdevs         []*virtio.FS
+	dmesg          bool
+	shareMu        sync.Mutex
+	shares         map[string]client.ShareMount
+	imageMounts    map[string]string
 }
 
 func (i *linuxInstance) VirtioFSStats() []virtio.FSStats {
@@ -526,10 +578,14 @@ func (i *linuxInstance) Exec(ctx context.Context, req client.ExecRequest) (clien
 	if !strings.HasPrefix(workDir, "/") {
 		return client.ExecResponse{}, fmt.Errorf("workdir must be absolute")
 	}
+	rootDir := req.RootDir
+	if rootDir == "" {
+		rootDir = i.defaultRootDir
+	}
 	return i.session.Exec(ctx, client.ExecRequest{
 		Command:     command,
 		Env:         env,
-		RootDir:     req.RootDir,
+		RootDir:     rootDir,
 		ReplaceEnv:  req.ReplaceEnv,
 		SkipResolve: req.SkipResolve,
 		WorkDir:     workDir,
@@ -587,10 +643,14 @@ func (i *linuxInstance) ExecStream(ctx context.Context, req client.ExecRequest, 
 	if !strings.HasPrefix(workDir, "/") {
 		return fmt.Errorf("workdir must be absolute")
 	}
+	rootDir := req.RootDir
+	if rootDir == "" {
+		rootDir = i.defaultRootDir
+	}
 	return i.session.ExecStream(ctx, client.ExecRequest{
 		Command:     command,
 		Env:         env,
-		RootDir:     req.RootDir,
+		RootDir:     rootDir,
 		ReplaceEnv:  req.ReplaceEnv,
 		SkipResolve: req.SkipResolve,
 		WorkDir:     workDir,
@@ -733,6 +793,13 @@ func linuxGuestInitConfig(modules []alpine.Module, managedExec bool) vmruntime.G
 
 func linuxRuntimeConfigVars(image *oci.Image, extraModules ...string) []string {
 	vars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO", "CONFIG_OVERLAY_FS"}
+	if linuxRootFSImageEnabled() {
+		vars = append(vars, "CONFIG_BLK_DEV_LOOP")
+		rootImageType, err := linuxRootFSImageType()
+		if err == nil {
+			vars = append(vars, linuxRootFSImageConfigVars(rootImageType)...)
+		}
+	}
 	vars = append(vars, linuxRuntimeExtraConfigVars(extraModules)...)
 	if NeedsAMD64Emulation(image) {
 		vars = append(vars, "CONFIG_BINFMT_MISC")
@@ -819,6 +886,12 @@ func linuxRuntimeModuleMap() map[string]string {
 		"MODULE:xt_tcpudp":                      "kernel/net/netfilter/xt_tcpudp.ko.gz",
 		"CONFIG_IP_NF_TARGET_REJECT":            "kernel/net/ipv4/netfilter/ipt_REJECT.ko.gz",
 		"CONFIG_IP6_NF_TARGET_REJECT":           "kernel/net/ipv6/netfilter/ip6t_REJECT.ko.gz",
+		"CONFIG_EXT4_FS":                        "kernel/fs/ext4/ext4.ko.gz",
+		"CONFIG_BLK_DEV_LOOP":                   "kernel/drivers/block/loop.ko.gz",
+		"CONFIG_FAT_FS":                         "kernel/fs/fat/fat.ko.gz",
+		"CONFIG_VFAT_FS":                        "kernel/fs/fat/vfat.ko.gz",
+		"CONFIG_NLS_CODEPAGE_437":               "kernel/fs/nls/nls_cp437.ko.gz",
+		"CONFIG_NLS_ISO8859_1":                  "kernel/fs/nls/nls_iso8859-1.ko.gz",
 	}
 }
 

@@ -788,7 +788,7 @@ func (m *Manager) RunStreamIn(ctx context.Context, id string, req client.RunRequ
 		return m.host.RunStream(ctx, req, inputs, onEvent)
 	}
 	targetImage := strings.TrimSpace(req.Image)
-	if _, hosted := machine.instance.(*hostedInstance); hosted || (targetImage != "" && targetImage != machine.image) {
+	if _, hosted := machine.instance.(*hostedInstance); hosted || len(req.Shares) != 0 || (targetImage != "" && targetImage != machine.image) {
 		return m.host.RunInInstanceStream(ctx, machine.instance, machine.image, req, inputs, onEvent)
 	}
 	for _, share := range req.Shares {

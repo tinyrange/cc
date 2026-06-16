@@ -3,7 +3,6 @@
 package vm
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io/fs"
@@ -17,7 +16,6 @@ import (
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/amd64vm"
 	freebsdrootfs "j5.nz/cc/internal/freebsd/rootfs"
-	"j5.nz/cc/internal/fsimage"
 	"j5.nz/cc/internal/guestinit"
 	"j5.nz/cc/internal/hv/kvm"
 	"j5.nz/cc/internal/imagefs"
@@ -177,7 +175,19 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if err != nil {
 		return nil, err
 	}
-	modules, err := b.kernel.PlanModuleLoad(linuxRuntimeConfigVars(nil, req.KernelModules...), linuxRuntimeModuleMap())
+	var image *oci.Image
+	imageName := strings.TrimSpace(req.Image)
+	if imageName != "" {
+		image, err = b.images.Open(imageName)
+		if err != nil {
+			return nil, err
+		}
+		if err := ensureLinuxAMD64Image(image); err != nil {
+			return nil, err
+		}
+		image = withLinuxRuntimeMountDirs(image)
+	}
+	modules, err := b.kernel.PlanModuleLoad(linuxRuntimeConfigVars(image, req.KernelModules...), linuxRuntimeModuleMap())
 	if err != nil {
 		return nil, err
 	}
@@ -215,7 +225,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 	if err != nil {
 		return nil, err
 	}
-	return &linuxInstance{
+	inst := &linuxInstance{
 		session: session,
 		baseEnv: vmruntime.WithDefaultEnv(nil),
 		workDir: "/",
@@ -223,7 +233,21 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 		fsdevs:  fsdevs,
 		network: network,
 		dmesg:   req.Dmesg,
-	}, nil
+	}
+	if image != nil {
+		mountPath := linuxImageMountPath(imageName)
+		if err := inst.AddImage(ctx, mountPath, image); err != nil {
+			_ = session.Close()
+			return nil, err
+		}
+		inst.image = image
+		inst.defaultRootDir = mountPath
+		inst.baseEnv = vmruntime.WithDefaultEnv(image.Config.Env)
+		if image.Config.WorkingDir != "" {
+			inst.workDir = image.Config.WorkingDir
+		}
+	}
+	return inst, nil
 }
 
 func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
@@ -428,7 +452,11 @@ func (b *runtimeBackend) RunStream(ctx context.Context, req client.RunRequest, i
 func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runningImage string, req client.RunRequest) (client.ExecResponse, error) {
 	targetImage := strings.TrimSpace(req.Image)
 	if targetImage == "" || targetImage == runningImage {
-		if err := addRuntimeShares(ctx, inst, req.Shares); err != nil {
+		shares := req.Shares
+		if session, ok := inst.(*linuxInstance); ok && session.defaultRootDir != "" {
+			shares = rebaseRuntimeShares(session.defaultRootDir, shares)
+		}
+		if err := addRuntimeShares(ctx, inst, shares); err != nil {
 			return client.ExecResponse{}, err
 		}
 		return inst.Exec(ctx, client.ExecRequest{
@@ -504,7 +532,11 @@ func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runni
 func (b *runtimeBackend) RunInInstanceStream(ctx context.Context, inst Instance, runningImage string, req client.RunRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	targetImage := strings.TrimSpace(req.Image)
 	if targetImage == "" || targetImage == runningImage {
-		if err := addRuntimeShares(ctx, inst, req.Shares); err != nil {
+		shares := req.Shares
+		if session, ok := inst.(*linuxInstance); ok && session.defaultRootDir != "" {
+			shares = rebaseRuntimeShares(session.defaultRootDir, shares)
+		}
+		if err := addRuntimeShares(ctx, inst, shares); err != nil {
 			return err
 		}
 		return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
@@ -1069,17 +1101,18 @@ func ensureLinuxAMD64Image(image *oci.Image) error {
 }
 
 type linuxInstance struct {
-	session     *kvm.ManagedSession
-	image       *oci.Image
-	baseEnv     []string
-	workDir     string
-	rootFS      virtio.ShareMounter
-	fsdevs      []*virtio.FS
-	network     *linuxNetworkRuntime
-	dmesg       bool
-	shareMu     sync.Mutex
-	shares      map[string]client.ShareMount
-	imageMounts map[string]string
+	session        *kvm.ManagedSession
+	image          *oci.Image
+	baseEnv        []string
+	workDir        string
+	defaultRootDir string
+	rootFS         virtio.ShareMounter
+	fsdevs         []*virtio.FS
+	network        *linuxNetworkRuntime
+	dmesg          bool
+	shareMu        sync.Mutex
+	shares         map[string]client.ShareMount
+	imageMounts    map[string]string
 }
 
 func (i *linuxInstance) VirtioFSStats() []virtio.FSStats {
@@ -1126,10 +1159,14 @@ func (i *linuxInstance) Exec(ctx context.Context, req client.ExecRequest) (clien
 	if !strings.HasPrefix(workDir, "/") {
 		return client.ExecResponse{}, fmt.Errorf("workdir must be absolute")
 	}
+	rootDir := req.RootDir
+	if rootDir == "" {
+		rootDir = i.defaultRootDir
+	}
 	return i.session.Exec(ctx, client.ExecRequest{
 		Command:     command,
 		Env:         env,
-		RootDir:     req.RootDir,
+		RootDir:     rootDir,
 		ReplaceEnv:  req.ReplaceEnv,
 		SkipResolve: req.SkipResolve,
 		WorkDir:     workDir,
@@ -1187,10 +1224,14 @@ func (i *linuxInstance) ExecStream(ctx context.Context, req client.ExecRequest, 
 	if !strings.HasPrefix(workDir, "/") {
 		return fmt.Errorf("workdir must be absolute")
 	}
+	rootDir := req.RootDir
+	if rootDir == "" {
+		rootDir = i.defaultRootDir
+	}
 	return i.session.ExecStream(ctx, client.ExecRequest{
 		Command:     command,
 		Env:         env,
-		RootDir:     req.RootDir,
+		RootDir:     rootDir,
 		ReplaceEnv:  req.ReplaceEnv,
 		SkipResolve: req.SkipResolve,
 		WorkDir:     workDir,
@@ -1357,35 +1398,6 @@ func linuxGuestInitConfig(modules []alpine.Module, managedExec bool, network *cl
 	return cfg
 }
 
-func linuxRuntimeImageFS(image *oci.Image) virtio.FSBackend {
-	if image == nil {
-		return nil
-	}
-	return virtio.NewImageFS(image.RootFS, image.RootFSDir)
-}
-
-func linuxRootFSImageEnabled() bool {
-	return strings.TrimSpace(os.Getenv("CCX3_ROOTFS_IMAGE_TYPE")) != "" || strings.TrimSpace(os.Getenv("CCX3_ROOTFS_EXT4")) != ""
-}
-
-func linuxRootFSImageType() (fsimage.Type, error) {
-	if value := strings.TrimSpace(os.Getenv("CCX3_ROOTFS_IMAGE_TYPE")); value != "" {
-		return fsimage.ParseType(value)
-	}
-	if strings.TrimSpace(os.Getenv("CCX3_ROOTFS_EXT4")) != "" {
-		return fsimage.TypeExt4, nil
-	}
-	return "", fmt.Errorf("rootfs image type is not configured")
-}
-
-func buildLinuxRootFSImage(ctx context.Context, root imagefs.Directory, typ fsimage.Type) ([]byte, error) {
-	var buf bytes.Buffer
-	if err := fsimage.Write(ctx, &buf, root, fsimage.Options{Type: typ}); err != nil {
-		return nil, fmt.Errorf("build %s rootfs image: %w", typ, err)
-	}
-	return buf.Bytes(), nil
-}
-
 func linuxRuntimeConfigVars(image *oci.Image, extraModules ...string) []string {
 	vars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO", "CONFIG_VIRTIO_NET", "CONFIG_OVERLAY_FS"}
 	if linuxRootFSImageEnabled() {
@@ -1400,17 +1412,6 @@ func linuxRuntimeConfigVars(image *oci.Image, extraModules ...string) []string {
 		vars = append(vars, "CONFIG_BINFMT_MISC")
 	}
 	return vars
-}
-
-func linuxRootFSImageConfigVars(typ fsimage.Type) []string {
-	switch typ {
-	case fsimage.TypeExt4:
-		return []string{"CONFIG_EXT4_FS"}
-	case fsimage.TypeVFAT:
-		return []string{"CONFIG_FAT_FS", "CONFIG_VFAT_FS", "CONFIG_NLS_CODEPAGE_437", "CONFIG_NLS_ISO8859_1"}
-	default:
-		return nil
-	}
 }
 
 func linuxRuntimeExtraConfigVars(names []string) []string {

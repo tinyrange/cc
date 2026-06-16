@@ -54,10 +54,13 @@ func TestManagerStartRoutesExistingInstanceOperations(t *testing.T) {
 	}, nil, appendExecEvents(&runEvents)); err != nil {
 		t.Fatalf("run stream in existing instance: %v", err)
 	}
-	if len(inst.shares) != 1 || inst.shares[0] != share {
-		t.Fatalf("shares = %+v", inst.shares)
+	if len(inst.shares) != 0 {
+		t.Fatalf("instance shares = %+v", inst.shares)
 	}
-	if len(inst.execStreamReqs) != 1 || strings.Join(inst.execStreamReqs[0].Command, " ") != "pwd" {
+	if got := host.runInStreamCalls(); len(got) != 1 || got[0].runningImage != "alpine" || len(got[0].req.Shares) != 1 || got[0].req.Shares[0] != share {
+		t.Fatalf("host run-in-stream calls = %+v", got)
+	}
+	if len(inst.execStreamReqs) != 0 {
 		t.Fatalf("instance exec stream reqs = %+v", inst.execStreamReqs)
 	}
 	if len(runEvents) == 0 || runEvents[len(runEvents)-1].Kind != "exit" {
@@ -67,8 +70,8 @@ func TestManagerStartRoutesExistingInstanceOperations(t *testing.T) {
 	if err := manager.StreamIn(ctx, "alpha", client.ExecRequest{Command: []string{"id"}}, nil, nil); err != nil {
 		t.Fatalf("exec stream in instance: %v", err)
 	}
-	if len(inst.execStreamReqs) != 2 {
-		t.Fatalf("exec stream count = %d, want 2", len(inst.execStreamReqs))
+	if len(inst.execStreamReqs) != 1 {
+		t.Fatalf("exec stream count = %d, want 1", len(inst.execStreamReqs))
 	}
 	if err := manager.StreamIn(ctx, "alpha", client.ExecRequest{Image: "other", Command: []string{"true"}}, nil, nil); err != nil {
 		t.Fatalf("multi-image exec stream: %v", err)
@@ -363,6 +366,12 @@ func (h *fakeHost) runInCalls() []fakeRunInCall {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return append([]fakeRunInCall(nil), h.runIns...)
+}
+
+func (h *fakeHost) runInStreamCalls() []fakeRunInCall {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]fakeRunInCall(nil), h.runInStreams...)
 }
 
 func (h *fakeHost) execInStreamCalls() []fakeExecInCall {
