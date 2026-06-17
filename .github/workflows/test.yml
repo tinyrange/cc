@@ -1,0 +1,81 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go-test:
+    name: Go tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install test tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dosfstools
+
+      - name: Run tests
+        run: go test ./... -count=1 -timeout 30m
+
+  kvm-test:
+    name: KVM and rootfs tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install test tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dosfstools
+
+      - name: Enable KVM for the runner user
+        run: |
+          set -euo pipefail
+          test -e /dev/kvm
+          sudo chmod 666 /dev/kvm
+          test -r /dev/kvm -a -w /dev/kvm
+
+      - name: Cache runtime artifacts
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccx3
+          key: cc-runtime-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            cc-runtime-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Run all tests with KVM suites enabled
+        env:
+          CC_TEST_LINUX_KVM_PCI: "1"
+          CC_TEST_OPENBSD_KVM: "1"
+          CC_TEST_OPENBSD_FULL_BASE_FFS: "1"
+          CC_TEST_FREEBSD_ROOTFS: "1"
+          CC_TEST_FREEBSD_KVM: "1"
+          CC_TEST_NETBSD_ROOTFS: "1"
+        run: go test ./... -count=1 -timeout 75m
