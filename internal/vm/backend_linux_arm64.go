@@ -506,8 +506,6 @@ type linuxInstance struct {
 func linuxARM64Capabilities() guestCapabilities {
 	caps := managedguest.LinuxProfile.Caps
 	caps.PortForward = false
-	caps.RootSnapshot = false
-	caps.ImageSnapshot = false
 	return caps
 }
 
