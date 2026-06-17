@@ -26,6 +26,7 @@ import (
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/netstack"
 	openbsdguestinit "j5.nz/cc/internal/openbsd/guestinit"
+	openbsdrootfs "j5.nz/cc/internal/openbsd/rootfs"
 	"j5.nz/cc/internal/virtio"
 )
 
@@ -532,6 +533,58 @@ func TestOpenBSD79ManagedSessionExecAndCopy(t *testing.T) {
 	assertOpenBSDFFSReadOnlyFsckClean(t, fsckKernel, region, 768, "OPENBSD_MANAGED_FSCK_FFS_DONE")
 }
 
+func TestOpenBSD79ManagedSessionStartup(t *testing.T) {
+	if os.Getenv("CC_TEST_OPENBSD_KVM") == "" {
+		t.Skip("set CC_TEST_OPENBSD_KVM=1 to run OpenBSD KVM managed session startup test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	cacheDir := filepath.Join(openBSDKVMTestCacheDir(t), "openbsd")
+	rt, err := openbsdrootfs.BuildManagedRuntime(ctx, openbsdrootfs.Config{CacheDir: cacheDir})
+	if err != nil {
+		t.Fatalf("build OpenBSD runtime: %v", err)
+	}
+	defer rt.Close()
+	start := time.Now()
+	session, err := StartOpenBSDManagedSession(ctx, OpenBSDManagedConfig{
+		Kernel:   rt.Kernel,
+		Root:     rt.Root,
+		MemoryMB: 768,
+	}, nil)
+	if err != nil {
+		t.Fatalf("start OpenBSD managed session: %v", err)
+	}
+	defer session.Close()
+	elapsed := time.Since(start)
+	t.Logf("OpenBSD managed session ready in %s", elapsed.Round(time.Millisecond))
+	if elapsed > 1500*time.Millisecond {
+		t.Fatalf("OpenBSD managed session startup took %s, want under 1.5s", elapsed.Round(time.Millisecond))
+	}
+
+	resp, err := session.Exec(ctx, client.ExecRequest{
+		Command: []string{"/bin/sh", "-c", "printf 'openbsd-managed:'; uname -s"},
+		WorkDir: "/tmp",
+	})
+	if err != nil {
+		t.Fatalf("OpenBSD managed exec: %v", err)
+	}
+	if resp.ExitCode != 0 || strings.TrimSpace(resp.Output) != "openbsd-managed:OpenBSD" {
+		t.Fatalf("OpenBSD exec response = code %d output %q", resp.ExitCode, resp.Output)
+	}
+}
+
+func openBSDKVMTestCacheDir(t *testing.T) string {
+	t.Helper()
+	if cache := strings.TrimSpace(os.Getenv("CC_TEST_OPENBSD_CACHE")); cache != "" {
+		return cache
+	}
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(cache, "ccx3", "runtime")
+}
+
 func TestBootOpenBSD79RegularKernelWithBaseSetRootAndGoInit(t *testing.T) {
 	if os.Getenv("CC_TEST_OPENBSD_KVM") == "" {
 		t.Skip("set CC_TEST_OPENBSD_KVM=1 to run OpenBSD KVM boot smoke test")
@@ -858,6 +911,13 @@ func newOpenBSDTestNet(t *testing.T) (*virtio.Net, *netstack.NetStack) {
 	}
 	if err := stack.SetGuestIPv4(net.IPv4(10, 42, 0, 2)); err != nil {
 		t.Fatalf("set guest ipv4: %v", err)
+	}
+	hostMAC, err := net.ParseMAC("02:42:0a:2a:00:01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stack.SetHostMAC(hostMAC); err != nil {
+		t.Fatalf("set host mac: %v", err)
 	}
 	iface, err := stack.AttachNetworkInterface()
 	if err != nil {
@@ -1234,6 +1294,7 @@ exec >/dev/console 2>&1
 	echo OPENBSD_NET_IFCONFIG_FAILED
 	while :; do /bin/sleep 3600; done
 }
+/usr/sbin/arp -s 10.42.0.1 02:42:0a:2a:00:01 >/dev/null 2>&1 || true
 /sbin/route add default 10.42.0.1 || true
 /sbin/ccnetctl
 while :; do /bin/sleep 3600; done
@@ -1300,6 +1361,7 @@ exec >/dev/console 2>&1
 	echo OPENBSD_MANAGED_IFCONFIG_FAILED
 	while :; do /bin/sleep 3600; done
 }
+/usr/sbin/arp -s 10.42.0.1 02:42:0a:2a:00:01 >/dev/null 2>&1 || true
 /sbin/route add default 10.42.0.1 || true
 exec /sbin/cc-openbsd-init
 `

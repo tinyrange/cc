@@ -36,6 +36,9 @@ const (
 	rbSercons = 0x02000
 
 	com1Base = 0x3f8
+
+	bootdevTypeSCSI = 4
+	bootdevMagic    = 0xa0000000
 )
 
 type BootOptions struct {
@@ -43,6 +46,7 @@ type BootOptions struct {
 	BootArgsGPA uint64
 	StackGPA    uint64
 	Howto       uint32
+	BootDev     uint32
 }
 
 type BootPlan struct {
@@ -97,7 +101,7 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 		return nil, fmt.Errorf("write bootargs: %w", err)
 	}
 
-	stack := buildLegacyStack(opts.Howto|rbSercons, 0, bootargAPIVER, kernelEnd, 640, uint32(len(bootArgs)), uint32(opts.BootArgsGPA))
+	stack := buildLegacyStack(opts.Howto|rbSercons, opts.BootDev, bootargAPIVER, kernelEnd, 640, uint32(len(bootArgs)), uint32(opts.BootArgsGPA))
 	stackGPA := opts.StackGPA - uint64(len(stack))
 	if stackGPA >= opts.StackGPA {
 		return nil, errors.New("invalid stack placement")
@@ -113,6 +117,19 @@ func PrepareBoot(memory []byte, kernelFile []byte, opts BootOptions) (*BootPlan,
 		BootArgsLen: uint32(len(bootArgs)),
 		KernelEnd:   kernelEnd,
 	}, nil
+}
+
+func BootDev(typeID, adaptor, controller, unit, partition uint32) uint32 {
+	return bootdevMagic |
+		((typeID & 0xff) << 0) |
+		((partition & 0xff) << 8) |
+		((unit & 0xf) << 16) |
+		((controller & 0xf) << 20) |
+		((adaptor & 0xf) << 24)
+}
+
+func SCSIBootDev(unit, partition uint32) uint32 {
+	return BootDev(bootdevTypeSCSI, 0, 0, unit, partition)
 }
 
 func decompressKernel(kernelFile []byte) ([]byte, error) {

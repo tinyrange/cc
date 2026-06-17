@@ -1,10 +1,20 @@
 package amd64
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestSCSIBootDevEncodesOpenBSDBootDevice(t *testing.T) {
+	if got, want := SCSIBootDev(0, 0), uint32(0xa0000004); got != want {
+		t.Fatalf("SCSIBootDev(0, 0) = %#x, want %#x", got, want)
+	}
+	if got, want := SCSIBootDev(2, 3), uint32(0xa0020304); got != want {
+		t.Fatalf("SCSIBootDev(2, 3) = %#x, want %#x", got, want)
+	}
+}
 
 func TestPrepareBootOpenBSD79BSD(t *testing.T) {
 	testPrepareBootFixture(t, filepath.Join("..", "..", "..", "..", "local", "openbsd79-amd64", "bsd"))
@@ -44,5 +54,24 @@ func testPrepareBootFixture(t *testing.T, path string) {
 	}
 	if plan.StackGPA == 0 || plan.StackGPA >= defaultStackGPA {
 		t.Fatalf("StackGPA = %#x, want below default stack top", plan.StackGPA)
+	}
+}
+
+func TestPrepareBootPlacesBootDevOnLegacyStack(t *testing.T) {
+	kernel, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "local", "openbsd79-amd64", "bsd"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			t.Skip("OpenBSD fixture not present")
+		}
+		t.Fatal(err)
+	}
+	mem := make([]byte, 128<<20)
+	bootdev := SCSIBootDev(0, 0)
+	plan, err := PrepareBoot(mem, kernel, BootOptions{MemorySize: uint64(len(mem)), BootDev: bootdev})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := binary.LittleEndian.Uint32(mem[plan.StackGPA+8:]); got != bootdev {
+		t.Fatalf("legacy stack bootdev = %#x, want %#x", got, bootdev)
 	}
 }
