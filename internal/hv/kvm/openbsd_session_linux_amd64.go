@@ -66,6 +66,7 @@ func StartOpenBSDManagedSession(ctx context.Context, cfg OpenBSDManagedConfig, o
 		Prepare: func(vm *VM, mem []byte) error {
 			plan, err := openbsdamd64.PrepareBoot(mem, cfg.Kernel, openbsdamd64.BootOptions{
 				MemorySize: amd64vm.MemorySizeBytes(cfg.MemoryMB),
+				BootDev:    openbsdamd64.SCSIBootDev(0, 0),
 			})
 			if err != nil {
 				return fmt.Errorf("prepare OpenBSD boot: %w", err)
@@ -196,6 +197,9 @@ func newOpenBSDManagedNet(guestIPv4 net.IP, mac net.HardwareAddr) (*virtio.Net, 
 	stack := netstack.New(slog.Default())
 	_ = stack.SetGuestMAC(mac)
 	_ = stack.SetGuestIPv4(guestIPv4)
+	if hostMAC, err := net.ParseMAC("02:42:0a:2a:00:01"); err == nil {
+		_ = stack.SetHostMAC(hostMAC)
+	}
 	iface, _ := stack.AttachNetworkInterface()
 	dev := virtio.NewNet(0, 0x1000, 11, mac, openBSDManagedNetBackend{iface: iface})
 	iface.AttachVirtioBackend(func(frame []byte) error {

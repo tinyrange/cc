@@ -444,6 +444,23 @@ func (ns *NetStack) SetGuestMAC(mac net.HardwareAddr) error {
 	return nil
 }
 
+// SetHostMAC sets the MAC address used by the synthetic host side of the
+// network. It must be called before attaching the network interface.
+func (ns *NetStack) SetHostMAC(mac net.HardwareAddr) error {
+	if len(mac) != 6 {
+		return fmt.Errorf("invalid MAC address length: %d", len(mac))
+	}
+	if isBroadcast(mac) || mac[0]&1 != 0 {
+		return fmt.Errorf("host MAC %s is not a unicast address", mac.String())
+	}
+	value, ok := macToUint64(mac)
+	if !ok {
+		return fmt.Errorf("invalid MAC address length: %d", len(mac))
+	}
+	ns.hostMAC.Store(uint64(value))
+	return nil
+}
+
 // SetGuestIPv4 sets the guest IPv4 address expected by synthetic host-side
 // connections such as port forwards.
 func (ns *NetStack) SetGuestIPv4(ip net.IP) error {
@@ -583,13 +600,15 @@ func (ns *NetStack) AttachNetworkInterface() (*NetworkInterface, error) {
 		return nil, errors.New("guest mac must be configured before attaching interface")
 	}
 
-	hostMAC := make([]byte, 6)
-	if _, err := cryptoRand.Read(hostMAC); err != nil {
-		return nil, fmt.Errorf("generate host mac: %w", err)
+	if !macIsSet(macAddr(ns.hostMAC.Load())) {
+		hostMAC := make([]byte, 6)
+		if _, err := cryptoRand.Read(hostMAC); err != nil {
+			return nil, fmt.Errorf("generate host mac: %w", err)
+		}
+		hostMAC[0] = (hostMAC[0] | 2) &^ 1 // Locally administered unicast.
+		value, _ := macToUint64(hostMAC)
+		ns.hostMAC.Store(uint64(value))
 	}
-	hostMAC[0] = (hostMAC[0] | 2) &^ 1 // Locally administered unicast.
-	value, _ := macToUint64(hostMAC)
-	ns.hostMAC.Store(uint64(value))
 
 	iface := &NetworkInterface{stack: ns}
 	ns.iface = iface

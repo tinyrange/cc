@@ -17,6 +17,8 @@ import (
 	"j5.nz/cc/internal/vmruntime"
 )
 
+const defaultGatewayMAC = "02:42:0a:2a:00:01"
+
 type networkRuntime struct {
 	id        string
 	ip        net.IP
@@ -79,6 +81,15 @@ func newNetworkRuntime(cfg networkDeviceConfig) (_ *networkRuntime, retErr error
 		return nil, err
 	}
 	if err := stack.SetGuestIPv4(cfg.IP); err != nil {
+		_ = stack.Close()
+		return nil, err
+	}
+	gatewayMAC, err := net.ParseMAC(defaultGatewayMAC)
+	if err != nil {
+		_ = stack.Close()
+		return nil, err
+	}
+	if err := stack.SetHostMAC(gatewayMAC); err != nil {
 		_ = stack.Close()
 		return nil, err
 	}

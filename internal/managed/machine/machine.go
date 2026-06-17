@@ -25,6 +25,7 @@ type ControlSpec struct {
 type NetworkSpec struct {
 	GuestIPv4   string
 	GatewayIPv4 string
+	GatewayMAC  string
 	DNSIPv4     string
 	MAC         string
 	Hostname    string

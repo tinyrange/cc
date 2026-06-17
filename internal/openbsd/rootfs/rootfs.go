@@ -22,10 +22,11 @@ import (
 )
 
 const (
-	BuiltInImageName = managedguest.OpenBSDImageName
-	defaultVersion   = "7.9"
-	defaultArch      = "amd64"
-	defaultMirror    = "https://mirror.aarnet.edu.au/pub/OpenBSD"
+	BuiltInImageName  = managedguest.OpenBSDImageName
+	defaultVersion    = "7.9"
+	defaultArch       = "amd64"
+	defaultMirror     = "https://mirror.aarnet.edu.au/pub/OpenBSD"
+	defaultGatewayMAC = "02:42:0a:2a:00:01"
 )
 
 type Config struct {
@@ -110,7 +111,7 @@ func BuildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte) (
 
 func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte, network machine.NetworkSpec) (imagefs.Directory, func() error, error) {
 	network = normalizeOpenBSDNetwork(network)
-	root, closeRoot, err := buildBaseRoot(ctx, baseSetPath, []byte(fmt.Sprintf(managedInitScript, network.Interface, network.GuestIPv4, network.GatewayIPv4)))
+	root, closeRoot, err := buildBaseRoot(ctx, baseSetPath, []byte(fmt.Sprintf(managedInitScript, network.Interface, network.GuestIPv4, network.GatewayIPv4, network.GatewayMAC, network.GatewayIPv4)))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -142,6 +143,9 @@ func normalizeOpenBSDNetwork(network machine.NetworkSpec) machine.NetworkSpec {
 	}
 	if strings.TrimSpace(network.GatewayIPv4) == "" {
 		network.GatewayIPv4 = "10.42.0.1"
+	}
+	if strings.TrimSpace(network.GatewayMAC) == "" {
+		network.GatewayMAC = defaultGatewayMAC
 	}
 	if strings.TrimSpace(network.DNSIPv4) == "" {
 		network.DNSIPv4 = network.GatewayIPv4
@@ -292,6 +296,7 @@ exec >/dev/console 2>&1
 	echo OPENBSD_MANAGED_IFCONFIG_FAILED
 	while :; do /bin/sleep 3600; done
 }
+/usr/sbin/arp -s %s %s >/dev/null 2>&1 || true
 /sbin/route add default %s || true
 exec /sbin/cc-openbsd-init
 `

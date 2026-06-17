@@ -152,6 +152,7 @@ func (b *runtimeBackend) startBSDManagedStream(ctx context.Context, req client.C
 	networkSpec := machine.NetworkSpec{
 		GuestIPv4:   network.GuestAddress(),
 		GatewayIPv4: "10.42.0.1",
+		GatewayMAC:  defaultGatewayMAC,
 		DNSIPv4:     "10.42.0.1",
 		Hostname:    def.Hostname,
 		Interface:   def.Interface,
