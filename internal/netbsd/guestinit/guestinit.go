@@ -10,6 +10,13 @@ import (
 )
 
 func Build(ctx context.Context, cacheDir string) ([]byte, error) {
+	return BuildForArch(ctx, cacheDir, "amd64")
+}
+
+func BuildForArch(ctx context.Context, cacheDir string, arch string) ([]byte, error) {
+	if arch == "" {
+		arch = "amd64"
+	}
 	if cacheDir == "" {
 		var err error
 		cacheDir, err = os.MkdirTemp("", "cc-netbsd-guestinit-*")
@@ -20,7 +27,7 @@ func Build(ctx context.Context, cacheDir string) ([]byte, error) {
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return nil, err
 	}
-	out := filepath.Join(cacheDir, "guest-init-netbsd-amd64")
+	out := filepath.Join(cacheDir, "guest-init-netbsd-"+arch)
 	if data, err := os.ReadFile(out); err == nil && len(data) != 0 {
 		return data, nil
 	}
@@ -31,7 +38,7 @@ func Build(ctx context.Context, cacheDir string) ([]byte, error) {
 	moduleRoot := filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", ".."))
 	cmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-o", out, "./internal/cmd/netbsd-init")
 	cmd.Dir = moduleRoot
-	cmd.Env = append(os.Environ(), "GOOS=netbsd", "GOARCH=amd64", "CGO_ENABLED=0")
+	cmd.Env = append(os.Environ(), "GOOS=netbsd", "GOARCH="+arch, "CGO_ENABLED=0")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return nil, fmt.Errorf("build NetBSD guest init: %w\n%s", err, output)
 	}

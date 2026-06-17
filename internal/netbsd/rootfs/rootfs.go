@@ -75,7 +75,7 @@ func IsBuiltInImage(name string) bool {
 
 func BuildManagedRuntime(ctx context.Context, cfg Config) (*Runtime, error) {
 	cfg = normalizeConfig(cfg)
-	kernelGZ, err := ensureArtifact(ctx, cfg, "netbsd-GENERIC.gz", "kernel")
+	kernelGZ, err := ensureArtifact(ctx, cfg, kernelArtifactName(cfg), "kernel")
 	if err != nil {
 		return nil, err
 	}
@@ -87,11 +87,11 @@ func BuildManagedRuntime(ctx context.Context, cfg Config) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	initBin, err := netbsdguestinit.Build(ctx, filepath.Join(cfg.CacheDir, "guestinit"))
+	initBin, err := netbsdguestinit.BuildForArch(ctx, filepath.Join(cfg.CacheDir, "guestinit"), goArchForNetBSD(cfg.Arch))
 	if err != nil {
 		return nil, err
 	}
-	root, closeRoot, err := buildManagedRoot(ctx, baseTXZ, initBin, netBSDNetworkSpec(cfg))
+	root, closeRoot, err := buildManagedRoot(ctx, baseTXZ, initBin, cfg.Arch, netBSDNetworkSpec(cfg), rootDeviceForNetBSD(cfg.Arch))
 	if err != nil {
 		return nil, err
 	}
@@ -109,12 +109,19 @@ func BuildManagedRuntime(ctx context.Context, cfg Config) (*Runtime, error) {
 }
 
 func BuildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte) (imagefs.Directory, error) {
-	root, _, err := buildManagedRoot(ctx, baseSetPath, initBin, machine.NetworkSpec{})
+	root, _, err := buildManagedRoot(ctx, baseSetPath, initBin, defaultArch, machine.NetworkSpec{}, "ld0a")
 	return root, err
 }
 
-func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte, network machine.NetworkSpec) (imagefs.Directory, func() error, error) {
+func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte, arch string, network machine.NetworkSpec, rootDevices ...string) (imagefs.Directory, func() error, error) {
 	network = normalizeNetBSDNetwork(network)
+	rootDevice := ""
+	if len(rootDevices) > 0 {
+		rootDevice = rootDevices[0]
+	}
+	if strings.TrimSpace(rootDevice) == "" {
+		rootDevice = "ld0a"
+	}
 	root, closeRoot, err := buildBaseRoot(ctx, baseSetPath)
 	if err != nil {
 		return nil, nil, err
@@ -123,7 +130,7 @@ func buildManagedRoot(ctx context.Context, baseSetPath string, initBin []byte, n
 	if err := rootplan.AddFiles(overlay, []rootplan.File{
 		{"/sbin/init", 0o755, []byte(fmt.Sprintf(managedInitScript, network.Interface, network.GuestIPv4, network.GatewayIPv4))},
 		{"/sbin/cc-netbsd-init", 0o755, initBin},
-		{"/etc/fstab", 0o644, []byte("/dev/ld0a / ffs rw 1 1\n")},
+		{"/etc/fstab", 0o644, []byte(fmt.Sprintf("/dev/%s / ffs rw 1 1\n", rootDevice))},
 		{"/etc/rc.conf", 0o644, []byte(fmt.Sprintf("rc_configured=YES\nhostname=\"%s\"\ndefaultroute=\"%s\"\n", network.Hostname, network.GatewayIPv4))},
 		{"/etc/ifconfig." + network.Interface, 0o644, []byte(fmt.Sprintf("inet %s netmask 255.255.255.0\n", network.GuestIPv4))},
 		{"/etc/resolv.conf", 0o644, []byte("nameserver " + network.DNSIPv4 + "\n")},
@@ -135,25 +142,66 @@ export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/pkg/bin:/usr/pkg/sbin
 		_ = closeRoot()
 		return nil, nil, err
 	}
-	if err := rootplan.AddDevices(overlay, []rootplan.Device{
-		{"/dev/console", fs.ModeDevice | fs.ModeCharDevice | 0o600, rdev(0, 0)},
-		{"/dev/constty", fs.ModeDevice | fs.ModeCharDevice | 0o600, rdev(0, 1)},
-		{"/dev/tty", fs.ModeDevice | fs.ModeCharDevice | 0o666, rdev(1, 0)},
-		{"/dev/null", fs.ModeDevice | fs.ModeCharDevice | 0o666, rdev(2, 2)},
-		{"/dev/zero", fs.ModeDevice | fs.ModeCharDevice | 0o666, rdev(2, 12)},
-		{"/dev/random", fs.ModeDevice | fs.ModeCharDevice | 0o444, rdev(46, 0)},
-		{"/dev/urandom", fs.ModeDevice | fs.ModeCharDevice | 0o644, rdev(46, 1)},
-		{"/dev/ld0", fs.ModeDevice | 0o640, rdev(19, 3)},
-		{"/dev/ld0a", fs.ModeDevice | 0o640, rdev(19, 0)},
-		{"/dev/ld0d", fs.ModeDevice | 0o640, rdev(19, 3)},
-		{"/dev/rld0", fs.ModeDevice | fs.ModeCharDevice | 0o640, rdev(69, 3)},
-		{"/dev/rld0a", fs.ModeDevice | fs.ModeCharDevice | 0o640, rdev(69, 0)},
-		{"/dev/rld0d", fs.ModeDevice | fs.ModeCharDevice | 0o640, rdev(69, 3)},
-	}); err != nil {
+	if err := rootplan.AddDevices(overlay, netBSDManagedDevices(arch)); err != nil {
 		_ = closeRoot()
 		return nil, nil, err
 	}
 	return overlay.Root(), closeRoot, nil
+}
+
+type netBSDDeviceMajors struct {
+	consChar uint32
+	cttyChar uint32
+	memChar  uint32
+	rndChar  uint32
+	ldBlock  uint32
+	ldChar   uint32
+}
+
+func netBSDDeviceMajorsForArch(arch string) netBSDDeviceMajors {
+	if arch == "evbarm-aarch64" {
+		return netBSDDeviceMajors{
+			consChar: 2,
+			cttyChar: 3,
+			memChar:  0,
+			rndChar:  52,
+			ldBlock:  92,
+			ldChar:   92,
+		}
+	}
+	return netBSDDeviceMajors{
+		consChar: 0,
+		cttyChar: 1,
+		memChar:  2,
+		rndChar:  46,
+		ldBlock:  19,
+		ldChar:   69,
+	}
+}
+
+func netBSDManagedDevices(arch string) []rootplan.Device {
+	maj := netBSDDeviceMajorsForArch(arch)
+	return []rootplan.Device{
+		{"/dev/console", fs.ModeDevice | fs.ModeCharDevice | 0o600, rdev(maj.consChar, 0)},
+		{"/dev/constty", fs.ModeDevice | fs.ModeCharDevice | 0o600, rdev(maj.consChar, 1)},
+		{"/dev/tty", fs.ModeDevice | fs.ModeCharDevice | 0o666, rdev(maj.cttyChar, 0)},
+		{"/dev/null", fs.ModeDevice | fs.ModeCharDevice | 0o666, rdev(maj.memChar, 2)},
+		{"/dev/zero", fs.ModeDevice | fs.ModeCharDevice | 0o666, rdev(maj.memChar, 12)},
+		{"/dev/random", fs.ModeDevice | fs.ModeCharDevice | 0o444, rdev(maj.rndChar, 0)},
+		{"/dev/urandom", fs.ModeDevice | fs.ModeCharDevice | 0o644, rdev(maj.rndChar, 1)},
+		{"/dev/ld0", fs.ModeDevice | 0o640, rdev(maj.ldBlock, 3)},
+		{"/dev/ld0a", fs.ModeDevice | 0o640, rdev(maj.ldBlock, 0)},
+		{"/dev/ld0d", fs.ModeDevice | 0o640, rdev(maj.ldBlock, 3)},
+		{"/dev/rld0", fs.ModeDevice | fs.ModeCharDevice | 0o640, rdev(maj.ldChar, 3)},
+		{"/dev/rld0a", fs.ModeDevice | fs.ModeCharDevice | 0o640, rdev(maj.ldChar, 0)},
+		{"/dev/rld0d", fs.ModeDevice | fs.ModeCharDevice | 0o640, rdev(maj.ldChar, 3)},
+		{"/dev/ld4", fs.ModeDevice | 0o640, rdev(maj.ldBlock, 35)},
+		{"/dev/ld4a", fs.ModeDevice | 0o640, rdev(maj.ldBlock, 32)},
+		{"/dev/ld4d", fs.ModeDevice | 0o640, rdev(maj.ldBlock, 35)},
+		{"/dev/rld4", fs.ModeDevice | fs.ModeCharDevice | 0o640, rdev(maj.ldChar, 35)},
+		{"/dev/rld4a", fs.ModeDevice | fs.ModeCharDevice | 0o640, rdev(maj.ldChar, 32)},
+		{"/dev/rld4d", fs.ModeDevice | fs.ModeCharDevice | 0o640, rdev(maj.ldChar, 35)},
+	}
 }
 
 func rdev(major, minor uint32) uint32 {
@@ -253,6 +301,27 @@ func normalizeConfig(cfg Config) Config {
 	}
 	cfg.Mirror = strings.TrimRight(cfg.Mirror, "/")
 	return cfg
+}
+
+func kernelArtifactName(cfg Config) string {
+	if cfg.Arch == "evbarm-aarch64" {
+		return "netbsd-GENERIC64.img.gz"
+	}
+	return "netbsd-GENERIC.gz"
+}
+
+func goArchForNetBSD(arch string) string {
+	if arch == "evbarm-aarch64" {
+		return "arm64"
+	}
+	return arch
+}
+
+func rootDeviceForNetBSD(arch string) string {
+	if arch == "evbarm-aarch64" {
+		return "ld4a"
+	}
+	return "ld0a"
 }
 
 func ensureArtifact(ctx context.Context, cfg Config, name, subdir string) (string, error) {

@@ -28,6 +28,8 @@ func (b *runtimeBackend) startBuiltinGuestProfile(ctx context.Context, profile m
 		return b.startOpenBSDStream(ctx, req, onEvent)
 	case managedguest.FreeBSDImageName:
 		return b.startFreeBSDStream(ctx, req, onEvent)
+	case managedguest.NetBSDImageName:
+		return b.startNetBSDStream(ctx, req, onEvent)
 	default:
 		return nil, fmt.Errorf("managed guest profile %q is not supported on linux/arm64", profile.Canonical)
 	}
@@ -102,6 +104,10 @@ func (b *runtimeBackend) startFreeBSDStream(ctx context.Context, req client.Crea
 	return b.startFreeBSDManagedStream(ctx, req, onEvent, builtin.FreeBSDDefinitionForArch(b.guestInitCache, "arm64"))
 }
 
+func (b *runtimeBackend) startNetBSDStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	return b.startNetBSDManagedStream(ctx, req, onEvent, builtin.NetBSDDefinitionForArch(b.guestInitCache, "evbarm-aarch64"))
+}
+
 func managedBSDNetworkConfig(cfg *client.NetworkConfig) *client.NetworkConfig {
 	if cfg == nil {
 		return &client.NetworkConfig{Enabled: true, AllowInternet: true}
@@ -119,6 +125,21 @@ func (b *runtimeBackend) startOpenBSDManagedStream(ctx context.Context, req clie
 func (b *runtimeBackend) startFreeBSDManagedStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error, def builtin.BSDDefinition) (inst Instance, err error) {
 	return b.startBSDArm64ManagedStream(ctx, req, onEvent, def, func(ctx context.Context, cfg kvm.OpenBSDManagedConfig, onEvent func(client.BootEvent) error) (*kvm.ManagedSession, error) {
 		return kvm.StartFreeBSDManagedSession(ctx, kvm.FreeBSDManagedConfig{
+			Kernel:    cfg.Kernel,
+			Root:      cfg.Root,
+			MemoryMB:  cfg.MemoryMB,
+			Dmesg:     cfg.Dmesg,
+			GuestIPv4: cfg.GuestIPv4,
+			GuestMAC:  cfg.GuestMAC,
+			NetDevice: cfg.NetDevice,
+			NetStack:  cfg.NetStack,
+		}, onEvent)
+	})
+}
+
+func (b *runtimeBackend) startNetBSDManagedStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error, def builtin.BSDDefinition) (inst Instance, err error) {
+	return b.startBSDArm64ManagedStream(ctx, req, onEvent, def, func(ctx context.Context, cfg kvm.OpenBSDManagedConfig, onEvent func(client.BootEvent) error) (*kvm.ManagedSession, error) {
+		return kvm.StartNetBSDManagedSession(ctx, kvm.NetBSDManagedConfig{
 			Kernel:    cfg.Kernel,
 			Root:      cfg.Root,
 			MemoryMB:  cfg.MemoryMB,

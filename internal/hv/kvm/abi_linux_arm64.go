@@ -16,6 +16,13 @@ type kvmCreateDeviceArgs struct {
 	Flags uint32
 }
 
+type kvmEnableCapData struct {
+	Cap   uint32
+	Flags uint32
+	Args  [4]uint64
+	Pad   [64]uint8
+}
+
 type kvmDeviceAttr struct {
 	Flags uint32
 	Group uint32
@@ -66,6 +73,11 @@ type kvmExitMMIOData struct {
 	data     [8]byte
 	len      uint32
 	isWrite  uint8
+}
+
+type kvmExitArmNISVData struct {
+	esrISS   uint64
+	faultIPA uint64
 }
 
 type kvmSystemEvent struct {

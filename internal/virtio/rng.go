@@ -16,10 +16,11 @@ const (
 )
 
 type RNG struct {
-	Base   uint64
-	Size   uint64
-	IRQ    uint32
-	Reader io.Reader
+	Base       uint64
+	Size       uint64
+	IRQ        uint32
+	Reader     io.Reader
+	LegacyMMIO bool
 
 	mu               sync.Mutex
 	mem              GuestMemory
@@ -61,10 +62,11 @@ func (r *RNG) DeviceTreeNode() fdt.Node {
 	return fdt.Node{
 		Name: fmt.Sprintf("virtio@%x", r.Base),
 		Properties: map[string]fdt.Property{
-			"compatible": {Strings: []string{"virtio,mmio"}},
-			"reg":        {U64: []uint64{r.Base, r.Size}},
-			"interrupts": {U32: []uint32{0, r.IRQ, 4}},
-			"status":     {Strings: []string{"okay"}},
+			"compatible":   {Strings: []string{"virtio,mmio"}},
+			"dma-coherent": {Flag: true},
+			"reg":          {U64: []uint64{r.Base, r.Size}},
+			"interrupts":   {U32: []uint32{0, r.IRQ, 4}},
+			"status":       {Strings: []string{"okay"}},
 		},
 	}
 }
@@ -78,12 +80,15 @@ func (r *RNG) Read(addr uint64, size int) (uint64, error) {
 	case regMagicValue:
 		return truncateValue(mmioMagicValue, size), nil
 	case regVersion:
-		return truncateValue(mmioVersion, size), nil
+		return truncateValue(uint64(mmioTransportVersion(r.LegacyMMIO)), size), nil
 	case regDeviceID:
 		return truncateValue(mmioDeviceIDRNG, size), nil
 	case regVendorID:
 		return truncateValue(mmioVendorID, size), nil
 	case regDeviceFeatures:
+		if r.LegacyMMIO {
+			return 0, nil
+		}
 		if r.deviceFeatureSel == 1 {
 			return truncateValue(1, size), nil
 		}
@@ -99,8 +104,16 @@ func (r *RNG) Read(addr uint64, size int) (uint64, error) {
 		}
 		return 0, nil
 	case regQueueReady:
+		if r.LegacyMMIO {
+			return 0, nil
+		}
 		if r.queueSel == rngQueue && r.queue.ready {
 			return truncateValue(1, size), nil
+		}
+		return 0, nil
+	case regQueuePFN:
+		if r.LegacyMMIO && r.queueSel == rngQueue && r.queue.ready {
+			return truncateValue(r.queue.descAddr/4096, size), nil
 		}
 		return 0, nil
 	case regInterruptStatus:
@@ -137,12 +150,30 @@ func (r *RNG) Write(addr uint64, size int, value uint64) error {
 			r.queue.size = uint16(value)
 		}
 	case regQueueReady:
+		if r.LegacyMMIO {
+			return nil
+		}
 		if r.queueSel == rngQueue {
 			r.queue.ready = value != 0
 			if value == 0 {
 				r.queue.lastAvailIdx = 0
 				r.queue.usedIdx = 0
 			}
+		}
+	case regGuestPageSize, regQueueAlign:
+		if r.LegacyMMIO {
+			return nil
+		}
+	case regQueuePFN:
+		if r.LegacyMMIO && r.queueSel == rngQueue {
+			if value == 0 {
+				r.queue.ready = false
+				r.queue.descAddr = 0
+				r.queue.availAddr = 0
+				r.queue.usedAddr = 0
+				return nil
+			}
+			r.configureLegacyQueueLocked(uint32(value))
 		}
 	case regQueueDescLow:
 		if r.queueSel == rngQueue {
@@ -295,6 +326,20 @@ func (r *RNG) setQueueAddr(target *uint64, value uint32, low bool) {
 	} else {
 		*target = (*target & 0xffffffff) | (uint64(value) << 32)
 	}
+}
+
+func (r *RNG) configureLegacyQueueLocked(pfn uint32) {
+	q := &r.queue
+	if q.size == 0 {
+		q.size = 256
+	}
+	q.ready = true
+	q.descAddr = uint64(pfn) * 4096
+	q.availAddr = q.descAddr + 16*uint64(q.size)
+	used := q.availAddr + 4 + 2*uint64(q.size)
+	q.usedAddr = alignVirtio(used, 4096)
+	q.lastAvailIdx = 0
+	q.usedIdx = 0
 }
 
 func (r *RNG) resetLocked() {

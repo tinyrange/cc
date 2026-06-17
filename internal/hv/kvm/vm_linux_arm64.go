@@ -20,6 +20,7 @@ const (
 	ExitMMIO        ExitReason = 6
 	ExitShutdown    ExitReason = 8
 	ExitSystemEvent ExitReason = 24
+	ExitArmNISV     ExitReason = 28
 )
 
 type Exit struct {
@@ -27,7 +28,13 @@ type Exit struct {
 	PhysicalIPA uint64
 	Syndrome    uint64
 	MMIO        MMIOExit
+	ArmNISV     ArmNISVExit
 	SystemEvent uint32
+}
+
+type ArmNISVExit struct {
+	ESRISS   uint64
+	FaultIPA uint64
 }
 
 type MMIOExit struct {
@@ -44,6 +51,7 @@ type VM struct {
 	vgicfd    int
 	run       []byte
 	mem       []byte
+	extraMem  [][]byte
 	memRegion kvmUserspaceMemoryRegion
 	tid       atomic.Int32
 }
@@ -116,6 +124,12 @@ func (v *VM) Close() error {
 		_ = unix.Munmap(v.mem)
 		v.mem = nil
 	}
+	for _, mem := range v.extraMem {
+		if len(mem) != 0 {
+			_ = unix.Munmap(mem)
+		}
+	}
+	v.extraMem = nil
 	if v.kvm != nil {
 		_ = v.kvm.CloseVCPU(v.vcpufd)
 		if v.vgicfd >= 0 {
@@ -151,6 +165,41 @@ func (v *VM) MapAnonymousMemory(size uint64, guestPhysAddr uint64) ([]byte, erro
 	return mem, nil
 }
 
+func (v *VM) MapAnonymousMemorySlot(slot uint32, size uint64, guestPhysAddr uint64) ([]byte, error) {
+	mem, err := unix.Mmap(-1, 0, int(size), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANONYMOUS|unix.MAP_PRIVATE)
+	if err != nil {
+		return nil, fmt.Errorf("mmap guest memory slot %d: %w", slot, err)
+	}
+	region := kvmUserspaceMemoryRegion{
+		Slot:          slot,
+		GuestPhysAddr: guestPhysAddr,
+		MemorySize:    size,
+		UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[0]))),
+	}
+	if err := setUserMemoryRegion(v.vmfd, &region); err != nil {
+		_ = unix.Munmap(mem)
+		return nil, fmt.Errorf("set user memory region slot %d: %w", slot, err)
+	}
+	v.extraMem = append(v.extraMem, mem)
+	return mem, nil
+}
+
+func (v *VM) MapMemoryAlias(slot uint32, guestPhysAddr uint64, mem []byte) error {
+	if len(mem) == 0 {
+		return fmt.Errorf("alias memory is empty")
+	}
+	region := kvmUserspaceMemoryRegion{
+		Slot:          slot,
+		GuestPhysAddr: guestPhysAddr,
+		MemorySize:    uint64(len(mem)),
+		UserspaceAddr: uint64(uintptr(unsafe.Pointer(&mem[0]))),
+	}
+	if err := setUserMemoryRegion(v.vmfd, &region); err != nil {
+		return fmt.Errorf("set user memory alias: %w", err)
+	}
+	return nil
+}
+
 func (v *VM) SetX(index int, value uint64) error {
 	if index < 0 || index > 30 {
 		return fmt.Errorf("invalid x register %d", index)
@@ -184,6 +233,14 @@ func (v *VM) SetSpEl1(value uint64) error {
 func (v *VM) GetPC() (uint64, error) {
 	var value uint64
 	if err := getOneReg(v.vcpufd, regPC, unsafe.Pointer(&value)); err != nil {
+		return 0, err
+	}
+	return value, nil
+}
+
+func (v *VM) GetArm64SysReg(op0, op1, crn, crm, op2 uint64) (uint64, error) {
+	var value uint64
+	if err := getOneReg(v.vcpufd, arm64SysReg(op0, op1, crn, crm, op2), unsafe.Pointer(&value)); err != nil {
 		return 0, err
 	}
 	return value, nil
@@ -226,6 +283,9 @@ func (v *VM) execute(exit *Exit, interruptible bool) error {
 	case ExitSystemEvent:
 		system := (*kvmSystemEvent)(unsafe.Pointer(&run.anon0[0]))
 		exit.SystemEvent = system.typ
+	case ExitArmNISV:
+		nisv := (*kvmExitArmNISVData)(unsafe.Pointer(&run.anon0[0]))
+		exit.ArmNISV = ArmNISVExit{ESRISS: nisv.esrISS, FaultIPA: nisv.faultIPA}
 	case ExitShutdown:
 	case ExitException:
 		// KVM arm64 MMIO should normally be surfaced as KVM_EXIT_MMIO.

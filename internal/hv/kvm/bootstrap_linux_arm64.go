@@ -147,7 +147,17 @@ func (b *Bootstrap) CreateVM() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	return createVM(b.fd, uint32(ipaBits))
+	vmfd, err := createVM(b.fd, uint32(ipaBits))
+	if err != nil {
+		return 0, err
+	}
+	if supported, err := b.CheckExtension(kvmCapArmNISVToUser); err == nil && supported != 0 {
+		if err := enableCapability(vmfd, &kvmEnableCapData{Cap: kvmCapArmNISVToUser}); err != nil {
+			_ = unix.Close(vmfd)
+			return 0, fmt.Errorf("enable arm NISV exits: %w", err)
+		}
+	}
+	return vmfd, nil
 }
 
 func (b *Bootstrap) CloseVM(fd int) error {

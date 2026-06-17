@@ -103,6 +103,10 @@ func FreeBSDRuntimeCacheDir(guestInitCache string) string {
 }
 
 func NetBSDDefinition(guestInitCache string) BSDDefinition {
+	return NetBSDDefinitionForArch(guestInitCache, "")
+}
+
+func NetBSDDefinitionForArch(guestInitCache, arch string) BSDDefinition {
 	return BSDDefinition{
 		Profile:   managedguest.NetBSDProfile,
 		BootKind:  "netbsd",
@@ -110,7 +114,7 @@ func NetBSDDefinition(guestInitCache string) BSDDefinition {
 		Interface: "vioif0",
 		CacheDir:  NetBSDRuntimeCacheDir(guestInitCache),
 		BuildArtifact: func(ctx context.Context, cacheDir string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
-			runtime, err := netbsdrootfs.BuildManagedRuntime(ctx, netbsdrootfs.Config{CacheDir: cacheDir, Network: network})
+			runtime, err := netbsdrootfs.BuildManagedRuntime(ctx, netbsdrootfs.Config{CacheDir: cacheDir, Arch: arch, Network: network})
 			if err != nil {
 				return rootartifact.Artifact{}, err
 			}

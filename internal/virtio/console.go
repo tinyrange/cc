@@ -23,9 +23,12 @@ const (
 	regDeviceFeatSel        = 0x014
 	regDriverFeatures       = 0x020
 	regDriverFeatSel        = 0x024
+	regGuestPageSize        = 0x028
 	regQueueSel             = 0x030
 	regQueueNumMax          = 0x034
 	regQueueNum             = 0x038
+	regQueueAlign           = 0x03c
+	regQueuePFN             = 0x040
 	regQueueReady           = 0x044
 	regQueueNotify          = 0x050
 	regInterruptStatus      = 0x060
@@ -56,6 +59,13 @@ const (
 	descFNext  = 1
 	descFWrite = 2
 )
+
+func mmioTransportVersion(legacy bool) uint32 {
+	if legacy {
+		return 1
+	}
+	return mmioVersion
+}
 
 type GuestMemory interface {
 	ReadIPA(addr uint64, size int) ([]byte, error)

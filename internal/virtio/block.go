@@ -38,9 +38,10 @@ type BlockBackend interface {
 }
 
 type Block struct {
-	Base uint64
-	Size uint64
-	IRQ  uint32
+	Base       uint64
+	Size       uint64
+	IRQ        uint32
+	LegacyMMIO bool
 
 	DisableSizeMax bool
 
@@ -86,10 +87,11 @@ func (b *Block) DeviceTreeNode() fdt.Node {
 	return fdt.Node{
 		Name: fmt.Sprintf("virtio@%x", b.Base),
 		Properties: map[string]fdt.Property{
-			"compatible": {Strings: []string{"virtio,mmio"}},
-			"reg":        {U64: []uint64{b.Base, b.Size}},
-			"interrupts": {U32: []uint32{0, b.IRQ, 4}},
-			"status":     {Strings: []string{"okay"}},
+			"compatible":   {Strings: []string{"virtio,mmio"}},
+			"dma-coherent": {Flag: true},
+			"reg":          {U64: []uint64{b.Base, b.Size}},
+			"interrupts":   {U32: []uint32{0, b.IRQ, 4}},
+			"status":       {Strings: []string{"okay"}},
 		},
 	}
 }
@@ -103,13 +105,16 @@ func (b *Block) Read(addr uint64, size int) (uint64, error) {
 	case regMagicValue:
 		return truncateValue(mmioMagicValue, size), nil
 	case regVersion:
-		return truncateValue(mmioVersion, size), nil
+		return truncateValue(uint64(mmioTransportVersion(b.LegacyMMIO)), size), nil
 	case regDeviceID:
 		return truncateValue(mmioDeviceIDBlock, size), nil
 	case regVendorID:
 		return truncateValue(mmioVendorID, size), nil
 	case regDeviceFeatures:
 		features := b.deviceFeaturesLocked()
+		if b.LegacyMMIO {
+			features = b.legacyFeaturesLocked()
+		}
 		if b.deviceFeatureSel == 0 {
 			return truncateValue(features, size), nil
 		}
@@ -128,8 +133,16 @@ func (b *Block) Read(addr uint64, size int) (uint64, error) {
 		}
 		return 0, nil
 	case regQueueReady:
+		if b.LegacyMMIO {
+			return 0, nil
+		}
 		if b.queueSel == blockQueue && b.queue.ready {
 			return truncateValue(1, size), nil
+		}
+		return 0, nil
+	case regQueuePFN:
+		if b.LegacyMMIO && b.queueSel == blockQueue && b.queue.ready {
+			return truncateValue(b.queue.descAddr/4096, size), nil
 		}
 		return 0, nil
 	case regInterruptStatus:
@@ -170,12 +183,30 @@ func (b *Block) Write(addr uint64, size int, value uint64) error {
 			b.queue.size = uint16(value)
 		}
 	case regQueueReady:
+		if b.LegacyMMIO {
+			return nil
+		}
 		if b.queueSel == blockQueue {
 			b.queue.ready = value != 0
 			if value == 0 {
 				b.queue.lastAvailIdx = 0
 				b.queue.usedIdx = 0
 			}
+		}
+	case regGuestPageSize, regQueueAlign:
+		if b.LegacyMMIO {
+			return nil
+		}
+	case regQueuePFN:
+		if b.LegacyMMIO && b.queueSel == blockQueue {
+			if value == 0 {
+				b.queue.ready = false
+				b.queue.descAddr = 0
+				b.queue.availAddr = 0
+				b.queue.usedAddr = 0
+				return nil
+			}
+			b.configureLegacyQueueLocked(uint32(value))
 		}
 	case regQueueDescLow:
 		if b.queueSel == blockQueue {
@@ -472,7 +503,9 @@ func (b *Block) writeUsedLocked(q *queue, head uint16, usedLen uint32) error {
 
 func (b *Block) configureLegacyQueueLocked(pfn uint32) {
 	q := &b.queue
-	q.size = blockQueueSize
+	if q.size == 0 {
+		q.size = blockQueueSize
+	}
 	q.ready = true
 	q.descAddr = uint64(pfn) * 4096
 	q.availAddr = q.descAddr + 16*uint64(q.size)

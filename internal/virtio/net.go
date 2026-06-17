@@ -45,10 +45,11 @@ type NetBackend interface {
 }
 
 type Net struct {
-	Base uint64
-	Size uint64
-	IRQ  uint32
-	MAC  net.HardwareAddr
+	Base       uint64
+	Size       uint64
+	IRQ        uint32
+	MAC        net.HardwareAddr
+	LegacyMMIO bool
 
 	DisableMergeRX   bool
 	HeaderLength     int
@@ -104,10 +105,11 @@ func (n *Net) DeviceTreeNode() fdt.Node {
 	return fdt.Node{
 		Name: fmt.Sprintf("virtio@%x", n.Base),
 		Properties: map[string]fdt.Property{
-			"compatible": {Strings: []string{"virtio,mmio"}},
-			"reg":        {U64: []uint64{n.Base, n.Size}},
-			"interrupts": {U32: []uint32{0, n.IRQ, 4}},
-			"status":     {Strings: []string{"okay"}},
+			"compatible":   {Strings: []string{"virtio,mmio"}},
+			"dma-coherent": {Flag: true},
+			"reg":          {U64: []uint64{n.Base, n.Size}},
+			"interrupts":   {U32: []uint32{0, n.IRQ, 4}},
+			"status":       {Strings: []string{"okay"}},
 		},
 	}
 }
@@ -121,13 +123,16 @@ func (n *Net) Read(addr uint64, size int) (uint64, error) {
 	case regMagicValue:
 		return truncateValue(mmioMagicValue, size), nil
 	case regVersion:
-		return truncateValue(mmioVersion, size), nil
+		return truncateValue(uint64(mmioTransportVersion(n.LegacyMMIO)), size), nil
 	case regDeviceID:
 		return truncateValue(mmioDeviceIDNet, size), nil
 	case regVendorID:
 		return truncateValue(mmioVendorID, size), nil
 	case regDeviceFeatures:
 		features := n.deviceFeaturesLocked()
+		if n.LegacyMMIO {
+			features = n.legacyFeaturesLocked()
+		}
 		if n.deviceFeatureSel == 0 {
 			return truncateValue(features, size), nil
 		}
@@ -146,8 +151,18 @@ func (n *Net) Read(addr uint64, size int) (uint64, error) {
 		}
 		return 0, nil
 	case regQueueReady:
+		if n.LegacyMMIO {
+			return 0, nil
+		}
 		if q := n.selectedQueueLocked(); q != nil && q.ready {
 			return truncateValue(1, size), nil
+		}
+		return 0, nil
+	case regQueuePFN:
+		if n.LegacyMMIO {
+			if q := n.selectedQueueLocked(); q != nil && q.ready {
+				return truncateValue(q.descAddr/4096, size), nil
+			}
 		}
 		return 0, nil
 	case regInterruptStatus:
@@ -187,6 +202,10 @@ func (n *Net) Write(addr uint64, size int, value uint64) error {
 			q.size = uint16(value)
 		}
 	case regQueueReady:
+		if n.LegacyMMIO {
+			n.mu.Unlock()
+			return nil
+		}
 		if q := n.selectedQueueLocked(); q != nil {
 			q.ready = value != 0
 			if value == 0 {
@@ -196,6 +215,31 @@ func (n *Net) Write(addr uint64, size int, value uint64) error {
 				if err := n.processRXLocked(); err != nil {
 					n.mu.Unlock()
 					return err
+				}
+			}
+		}
+	case regGuestPageSize, regQueueAlign:
+		if n.LegacyMMIO {
+			n.mu.Unlock()
+			return nil
+		}
+	case regQueuePFN:
+		if n.LegacyMMIO {
+			if q := n.selectedQueueLocked(); q != nil {
+				if value == 0 {
+					q.ready = false
+					q.descAddr = 0
+					q.availAddr = 0
+					q.usedAddr = 0
+					n.mu.Unlock()
+					return nil
+				}
+				n.configureLegacyQueueLocked(q, uint32(value))
+				if n.queueSel == netQueueRX {
+					if err := n.processRXLocked(); err != nil {
+						n.mu.Unlock()
+						return err
+					}
 				}
 			}
 		}
@@ -671,7 +715,9 @@ func (n *Net) setQueueAddr(target *uint64, value uint32, low bool) {
 }
 
 func (n *Net) configureLegacyQueueLocked(q *queue, pfn uint32) {
-	q.size = netQueueSize
+	if q.size == 0 {
+		q.size = netQueueSize
+	}
 	q.ready = true
 	q.descAddr = uint64(pfn) * 4096
 	q.availAddr = q.descAddr + 16*uint64(q.size)

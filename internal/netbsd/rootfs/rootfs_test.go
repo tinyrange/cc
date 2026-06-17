@@ -99,7 +99,7 @@ func TestBuildManagedRootFromNetBSDBaseSetUsesNetworkSpec(t *testing.T) {
 		{name: "dev", mode: 0o755, dir: true},
 		{name: "root", mode: 0o700, dir: true},
 	})
-	root, closeRoot, err := buildManagedRoot(context.Background(), baseTXZ, []byte("#!/bin/sh\n"), machine.NetworkSpec{
+	root, closeRoot, err := buildManagedRoot(context.Background(), baseTXZ, []byte("#!/bin/sh\n"), defaultArch, machine.NetworkSpec{
 		GuestIPv4:   "10.42.0.8",
 		GatewayIPv4: "10.42.0.9",
 		DNSIPv4:     "10.42.0.10",

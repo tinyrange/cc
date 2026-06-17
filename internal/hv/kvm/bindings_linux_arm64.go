@@ -21,10 +21,12 @@ const (
 	kvmIRQLine             = 0x4008ae61
 	kvmCreateDevice        = 0xc00caee0
 	kvmSetDeviceAttr       = 0x4018aee1
+	kvmEnableCap           = 0x4068aea3
 )
 
 const (
-	kvmCapArmVmIpaSize = 165
+	kvmCapArmVmIpaSize  = 165
+	kvmCapArmNISVToUser = 177
 
 	kvmDevTypeArmVgicV2 = 5
 	kvmDevTypeArmVgicV3 = 7
@@ -84,6 +86,11 @@ func createVCPU(fd int, id int) (int, error) {
 		return 0, err
 	}
 	return int(v1), nil
+}
+
+func enableCapability(fd int, cap *kvmEnableCapData) error {
+	_, err := ioctlWithRetry(uintptr(fd), uint64(kvmEnableCap), uintptr(unsafe.Pointer(cap)))
+	return err
 }
 
 func checkExtension(fd int, cap int) (uint64, error) {

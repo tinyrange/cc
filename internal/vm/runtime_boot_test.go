@@ -181,6 +181,18 @@ func TestRuntimeBootsFreeBSDBuiltinImage(t *testing.T) {
 	})
 }
 
+func TestRuntimeBootsNetBSDBuiltinImage(t *testing.T) {
+	_, _ = bootManagedBSDRuntimeContract(t, managedBSDRuntimeBootCase{
+		name:     "NetBSD",
+		envVar:   "CC_TEST_NETBSD_KVM",
+		image:    "@netbsd",
+		memoryMB: 1024,
+		timeout:  180 * time.Second,
+		guestOS:  "NetBSD",
+		label:    "netbsd",
+	})
+}
+
 type managedBSDRuntimeBootCase struct {
 	name     string
 	envVar   string
