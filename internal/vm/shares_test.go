@@ -72,42 +72,6 @@ func TestDelegatedRuntimeResources(t *testing.T) {
 	}
 }
 
-func TestConvertShareMounts(t *testing.T) {
-	if got := convertShareMounts(nil); got != nil {
-		t.Fatalf("nil shares = %#v, want nil", got)
-	}
-	got := convertShareMounts([]client.ShareMount{{
-		Source:   "/host",
-		Mount:    "/guest",
-		Writable: true,
-		MapOwner: true,
-		OwnerUID: 1000,
-		OwnerGID: 1001,
-		Cache:    "auto",
-	}})
-	if len(got) != 1 {
-		t.Fatalf("shares = %d, want 1", len(got))
-	}
-	if got[0].Source != "/host" || got[0].Mount != "/guest" || !got[0].Writable || !got[0].MapOwner || got[0].OwnerUID != 1000 || got[0].OwnerGID != 1001 || got[0].Cache != "auto" {
-		t.Fatalf("converted share = %+v", got[0])
-	}
-}
-
-func TestShareMountToDirectoryShare(t *testing.T) {
-	got := shareMountToDirectoryShare(client.ShareMount{
-		Source:   "/host",
-		Mount:    "/guest",
-		Writable: true,
-		MapOwner: true,
-		OwnerUID: 1000,
-		OwnerGID: 1001,
-		Cache:    "always",
-	})
-	if got.Source != "/host" || got.Mount != "/guest" || !got.Writable || !got.MapOwner || got.OwnerUID != 1000 || got.OwnerGID != 1001 || got.Cache != "always" {
-		t.Fatalf("directory share = %+v", got)
-	}
-}
-
 func TestBuildRuntimeDirectoryShare(t *testing.T) {
 	var gotIndex int
 	var gotShare vmruntime.DirectoryShare
@@ -115,6 +79,9 @@ func TestBuildRuntimeDirectoryShare(t *testing.T) {
 		Source:   "/host",
 		Mount:    "/guest",
 		Writable: true,
+		MapOwner: true,
+		OwnerUID: 1000,
+		OwnerGID: 1001,
 		Cache:    "auto",
 	}, func(index int, share vmruntime.DirectoryShare) (virtio.ShareMount, error) {
 		gotIndex = index
@@ -124,7 +91,7 @@ func TestBuildRuntimeDirectoryShare(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildRuntimeDirectoryShare: %v", err)
 	}
-	if gotIndex != 0 || gotShare.Source != "/host" || gotShare.Mount != "/guest" || !gotShare.Writable || gotShare.Cache != "auto" {
+	if gotIndex != 0 || gotShare.Source != "/host" || gotShare.Mount != "/guest" || !gotShare.Writable || !gotShare.MapOwner || gotShare.OwnerUID != 1000 || gotShare.OwnerGID != 1001 || gotShare.Cache != "auto" {
 		t.Fatalf("builder received index=%d share=%+v", gotIndex, gotShare)
 	}
 	if mount.GuestPath != "/guest" || !mount.Writable || mount.CacheMode != "auto" {

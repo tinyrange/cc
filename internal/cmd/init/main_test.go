@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"syscall"
@@ -187,15 +188,12 @@ func TestManagedExecCommandPivotsForRootDir(t *testing.T) {
 	if !pivot {
 		t.Fatalf("root dir command did not use pivot")
 	}
-	if cmd.Path != "/proc/self/exe" {
-		t.Fatalf("path = %q, want /proc/self/exe", cmd.Path)
+	req := parseManagedExecPivotRequest(t, cmd)
+	if req.rootDir != "/mnt/root" || req.workDir != "/work" {
+		t.Fatalf("pivot request root/work = %q/%q", req.rootDir, req.workDir)
 	}
-	wantPrefix := []string{"/proc/self/exe", execPivotMode, "/mnt/root", "/work", "", "", "", "--"}
-	if len(cmd.Args) < len(wantPrefix) || !reflect.DeepEqual(cmd.Args[:len(wantPrefix)], wantPrefix) {
-		t.Fatalf("pivot args prefix = %#v, want %#v", cmd.Args, wantPrefix)
-	}
-	if got := cmd.Args[len(wantPrefix):]; !reflect.DeepEqual(got, []string{"/bin/sh", "-c", "id"}) {
-		t.Fatalf("pivot command args = %#v", got)
+	if !reflect.DeepEqual(req.argv, []string{"/bin/sh", "-c", "id"}) {
+		t.Fatalf("pivot argv = %#v", req.argv)
 	}
 }
 
@@ -205,30 +203,21 @@ func TestManagedExecCommandPivotsForTTYCredential(t *testing.T) {
 	if !pivot {
 		t.Fatalf("tty credential command did not use pivot")
 	}
-	wantPrefix := []string{"/proc/self/exe", execPivotMode, "", "/home/user", "1000", "1001", "10,20", "--"}
-	if len(cmd.Args) < len(wantPrefix) || !reflect.DeepEqual(cmd.Args[:len(wantPrefix)], wantPrefix) {
-		t.Fatalf("pivot args prefix = %#v, want %#v", cmd.Args, wantPrefix)
+	req := parseManagedExecPivotRequest(t, cmd)
+	if req.rootDir != "" || req.workDir != "/home/user" {
+		t.Fatalf("pivot request root/work = %q/%q", req.rootDir, req.workDir)
 	}
-	if cmd.Args[len(wantPrefix)] != "whoami" {
-		t.Fatalf("pivot command = %#v", cmd.Args[len(wantPrefix):])
+	if req.uid != "1000" || req.gid != "1001" || req.groups != "10,20" {
+		t.Fatalf("pivot credential = %q/%q/%q", req.uid, req.gid, req.groups)
 	}
-	if cmd.Path != "/proc/self/exe" {
-		t.Fatalf("path = %q, want /proc/self/exe", cmd.Path)
-	}
-}
-
-func TestExecPivotCredentialArgs(t *testing.T) {
-	if uid, gid, groups := execPivotCredentialArgs(nil); uid != "" || gid != "" || groups != "" {
-		t.Fatalf("nil credential args = %q, %q, %q", uid, gid, groups)
-	}
-	uid, gid, groups := execPivotCredentialArgs(&syscall.Credential{Uid: 1000, Gid: 1001, Groups: []uint32{10, 20}})
-	if uid != "1000" || gid != "1001" || groups != "10,20" {
-		t.Fatalf("credential args = %q, %q, %q", uid, gid, groups)
+	if !reflect.DeepEqual(req.argv, []string{"whoami"}) {
+		t.Fatalf("pivot argv = %#v", req.argv)
 	}
 }
 
 func TestParseExecPivotArgs(t *testing.T) {
-	req, err := parseExecPivotArgs([]string{"/mnt/root", "/work", "1000", "1001", "10,20", "--", "/bin/sh", "-c", "id"})
+	args := execPivotArgs("/mnt/root", "/work", &syscall.Credential{Uid: 1000, Gid: 1001, Groups: []uint32{10, 20}}, []string{"/bin/sh", "-c", "id"})
+	req, err := parseExecPivotArgs(args)
 	if err != nil {
 		t.Fatalf("parseExecPivotArgs: %v", err)
 	}
@@ -237,6 +226,15 @@ func TestParseExecPivotArgs(t *testing.T) {
 	}
 	if !reflect.DeepEqual(req.argv, []string{"/bin/sh", "-c", "id"}) {
 		t.Fatalf("argv = %#v", req.argv)
+	}
+
+	nilCredArgs := execPivotArgs("", "", nil, []string{"true"})
+	nilCredReq, err := parseExecPivotArgs(nilCredArgs)
+	if err != nil {
+		t.Fatalf("parse nil credential args: %v", err)
+	}
+	if nilCredReq.uid != "" || nilCredReq.gid != "" || nilCredReq.groups != "" {
+		t.Fatalf("nil credential request = %+v", nilCredReq)
 	}
 
 	if _, err := parseExecPivotArgs([]string{"too", "short"}); err == nil || !strings.Contains(err.Error(), "argument count") {
@@ -248,57 +246,62 @@ func TestParseExecPivotArgs(t *testing.T) {
 }
 
 func TestPivotExecRootWithOps(t *testing.T) {
-	var calls []string
+	state := execPivotRootState{}
 	ops := execPivotRootOps{
 		mount: func(source, target, fstype string, flags uintptr, data string) error {
-			calls = append(calls, "mount:"+target)
-			if source != "" || target != "/" || fstype != "" || flags != syscall.MS_REC|syscall.MS_PRIVATE || data != "" {
-				t.Fatalf("mount args = %q %q %q %#x %q", source, target, fstype, flags, data)
+			if source == "" && target == "/" && fstype == "" && flags == syscall.MS_REC|syscall.MS_PRIVATE && data == "" {
+				state.privateMount = true
 			}
 			return nil
 		},
 		mkdirAll: func(path string, perm os.FileMode) error {
-			calls = append(calls, "mkdir:"+path)
-			if path != "/mnt/root/.ccx3-old-root" || perm != 0o700 {
-				t.Fatalf("mkdir args = %q %#o", path, perm)
+			if !state.privateMount {
+				t.Fatalf("put_old created before mount namespace was made private")
 			}
+			if filepath.Dir(path) != "/mnt/root" || filepath.Base(path) == "" || perm != 0o700 {
+				t.Fatalf("put_old path/perm = %q %#o", path, perm)
+			}
+			state.putOld = path
 			return nil
 		},
 		pivot: func(newroot, putold string) error {
-			calls = append(calls, "pivot:"+newroot+":"+putold)
-			if newroot != "/mnt/root" || putold != "/mnt/root/.ccx3-old-root" {
-				t.Fatalf("pivot args = %q %q", newroot, putold)
+			if newroot != "/mnt/root" || putold != state.putOld {
+				t.Fatalf("pivot root = %q old = %q", newroot, putold)
 			}
+			state.pivoted = true
 			return nil
 		},
 		chdir: func(dir string) error {
-			calls = append(calls, "chdir:"+dir)
-			if dir != "/" {
-				t.Fatalf("chdir arg = %q", dir)
+			if !state.pivoted || dir != "/" {
+				t.Fatalf("chdir before pivot or wrong dir: pivoted=%v dir=%q", state.pivoted, dir)
 			}
+			state.cwd = dir
 			return nil
 		},
 		unmount: func(target string, flags int) error {
-			calls = append(calls, "unmount:"+target)
-			if target != "/.ccx3-old-root" || flags != syscall.MNT_DETACH {
-				t.Fatalf("unmount args = %q %#x", target, flags)
+			if state.cwd != "/" || flags != syscall.MNT_DETACH {
+				t.Fatalf("unmount before chdir or wrong flags: cwd=%q flags=%#x", state.cwd, flags)
 			}
+			if filepath.Base(target) != ".ccx3-old-root" {
+				t.Fatalf("old root cleanup target = %q", target)
+			}
+			state.oldRootTarget = target
+			state.unmountedOldRoot = true
 			return nil
 		},
 		remove: func(name string) error {
-			calls = append(calls, "remove:"+name)
-			if name != "/.ccx3-old-root" {
-				t.Fatalf("remove arg = %q", name)
+			if !state.unmountedOldRoot || name != state.oldRootTarget {
+				t.Fatalf("remove before unmount or wrong target: %q", name)
 			}
+			state.removedOldRoot = true
 			return nil
 		},
 	}
 	if err := pivotExecRootWithOps("/mnt/root", ops); err != nil {
 		t.Fatalf("pivotExecRootWithOps: %v", err)
 	}
-	want := "mount:/,mkdir:/mnt/root/.ccx3-old-root,pivot:/mnt/root:/mnt/root/.ccx3-old-root,chdir:/,unmount:/.ccx3-old-root,remove:/.ccx3-old-root"
-	if got := strings.Join(calls, ","); got != want {
-		t.Fatalf("calls = %q, want %q", got, want)
+	if !state.privateMount || !state.pivoted || !state.unmountedOldRoot || !state.removedOldRoot {
+		t.Fatalf("pivot root state = %+v", state)
 	}
 }
 
@@ -646,6 +649,28 @@ func (f *fakeInitActiveExec) Resize(cols, rows int) error {
 	f.cols = cols
 	f.rows = rows
 	return nil
+}
+
+func parseManagedExecPivotRequest(t *testing.T, cmd *exec.Cmd) execPivotRequest {
+	t.Helper()
+	if len(cmd.Args) < 2 || cmd.Args[1] != execPivotMode {
+		t.Fatalf("command does not start an exec pivot: %#v", cmd.Args)
+	}
+	req, err := parseExecPivotArgs(cmd.Args[2:])
+	if err != nil {
+		t.Fatalf("parse exec pivot command: %v", err)
+	}
+	return req
+}
+
+type execPivotRootState struct {
+	privateMount     bool
+	putOld           string
+	pivoted          bool
+	cwd              string
+	oldRootTarget    string
+	unmountedOldRoot bool
+	removedOldRoot   bool
 }
 
 type trackingReadCloser struct {

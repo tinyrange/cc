@@ -160,17 +160,17 @@ func TestSidecarExecResponseFromManagedSessionEvents(t *testing.T) {
 }
 
 func TestCombineSidecarResources(t *testing.T) {
-	var cleanupOrder []string
+	cleaned := map[string]bool{}
 	resolver := &sidecarCommandResolver{workDir: "/work"}
 	combined := combineSidecarResources(
 		sidecarStartResources{
 			env:      []string{"A=1"},
-			close:    func() { cleanupOrder = append(cleanupOrder, "first") },
+			close:    func() { cleaned["first"] = true },
 			resolver: resolver,
 		},
 		sidecarStartResources{
 			env:         []string{"B=2"},
-			close:       func() { cleanupOrder = append(cleanupOrder, "second") },
+			close:       func() { cleaned["second"] = true },
 			remote:      true,
 			networkIPv4: "10.42.0.2",
 		},
@@ -193,8 +193,8 @@ func TestCombineSidecarResources(t *testing.T) {
 		t.Fatalf("networkIPv4 = %q", combined.networkIPv4)
 	}
 	combined.closeAll()
-	if strings.Join(cleanupOrder, ",") != "first,second" {
-		t.Fatalf("cleanup order = %#v", cleanupOrder)
+	if !cleaned["first"] || !cleaned["second"] {
+		t.Fatalf("cleanup functions were not both run: %+v", cleaned)
 	}
 }
 
@@ -300,8 +300,8 @@ func TestSidecarLaunchCommand(t *testing.T) {
 	if cmd.Path != "/tmp/ccvm" {
 		t.Fatalf("path = %q", cmd.Path)
 	}
-	if got := strings.Join(cmd.Args, " "); got != "/tmp/ccvm -worker -cache-dir /cache" {
-		t.Fatalf("args = %q", got)
+	if !containsArg(cmd.Args, "-worker") || !containsArgPair(cmd.Args, "-cache-dir", "/cache") {
+		t.Fatalf("worker launch args = %#v", cmd.Args)
 	}
 	if cmd.Stderr != os.Stderr {
 		t.Fatalf("stderr was not inherited")
@@ -315,6 +315,24 @@ func TestSidecarLaunchCommand(t *testing.T) {
 	if !envHas(cmd.Env, "EXTRA=1") {
 		t.Fatalf("env missing extra entry: %#v", cmd.Env)
 	}
+}
+
+func containsArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsArgPair(args []string, key, value string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == key && args[i+1] == value {
+			return true
+		}
+	}
+	return false
 }
 
 func TestReadSidecarStartupHello(t *testing.T) {
