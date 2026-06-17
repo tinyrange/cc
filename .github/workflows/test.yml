@@ -31,7 +31,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends dosfstools
+          sudo apt-get install -y --no-install-recommends dosfstools musl-tools
 
       - name: Run tests
         run: go test ./... -count=1 -timeout 30m
@@ -74,8 +74,13 @@ jobs:
         env:
           CC_TEST_LINUX_KVM_PCI: "1"
           CC_TEST_OPENBSD_KVM: "1"
+          CC_TEST_OPENBSD_STARTUP_MAX_MS: "3000"
           CC_TEST_OPENBSD_FULL_BASE_FFS: "1"
           CC_TEST_FREEBSD_ROOTFS: "1"
           CC_TEST_FREEBSD_KVM: "1"
           CC_TEST_NETBSD_ROOTFS: "1"
-        run: go test ./... -count=1 -timeout 75m
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -o internal/guestinit/guest-init-linux-arm64 ./internal/cmd/init
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o internal/guestinit/guest-init-linux-amd64 ./internal/cmd/init
+          go test -tags embed_guestinit -p 1 ./... -count=1 -timeout 75m

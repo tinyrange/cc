@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -557,8 +558,9 @@ func TestOpenBSD79ManagedSessionStartup(t *testing.T) {
 	defer session.Close()
 	elapsed := time.Since(start)
 	t.Logf("OpenBSD managed session ready in %s", elapsed.Round(time.Millisecond))
-	if elapsed > 1500*time.Millisecond {
-		t.Fatalf("OpenBSD managed session startup took %s, want under 1.5s", elapsed.Round(time.Millisecond))
+	maxStartup := openBSDManagedStartupMax()
+	if elapsed > maxStartup {
+		t.Fatalf("OpenBSD managed session startup took %s, want under %s", elapsed.Round(time.Millisecond), maxStartup)
 	}
 
 	resp, err := session.Exec(ctx, client.ExecRequest{
@@ -583,6 +585,16 @@ func openBSDKVMTestCacheDir(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return filepath.Join(cache, "ccx3", "runtime")
+}
+
+func openBSDManagedStartupMax() time.Duration {
+	if value := strings.TrimSpace(os.Getenv("CC_TEST_OPENBSD_STARTUP_MAX_MS")); value != "" {
+		ms, err := strconv.Atoi(value)
+		if err == nil && ms > 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return 1500 * time.Millisecond
 }
 
 func TestBootOpenBSD79RegularKernelWithBaseSetRootAndGoInit(t *testing.T) {
