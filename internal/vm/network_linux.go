@@ -10,6 +10,7 @@ import (
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/amd64vm"
+	"j5.nz/cc/internal/arm64vm"
 	"j5.nz/cc/internal/virtio"
 )
 
@@ -23,6 +24,13 @@ func newLinuxAMD64NetworkRuntime(id string, cfg *client.NetworkConfig) (*linuxNe
 		return nil, nil
 	}
 	return newLinuxSwitchNetworkRuntime(id, cfg, amd64vm.NetBase, amd64vm.NetSize, amd64vm.NetIRQ)
+}
+
+func newLinuxARM64NetworkRuntime(id string, cfg *client.NetworkConfig) (*linuxNetworkRuntime, error) {
+	if cfg == nil || !cfg.Enabled {
+		return nil, nil
+	}
+	return newLinuxSwitchNetworkRuntime(id, cfg, arm64vm.NetBase, arm64vm.NetSize, arm64vm.NetIRQ)
 }
 
 func newLinuxPCINetworkRuntime(id string, cfg *client.NetworkConfig) (*linuxNetworkRuntime, error) {

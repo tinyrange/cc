@@ -84,7 +84,7 @@ func BuildManagedRuntime(ctx context.Context, cfg Config) (*Runtime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read OpenBSD kernel %s: %w", kernelPath, err)
 	}
-	initBin, err := openbsdguestinit.Build(ctx, filepath.Join(cfg.CacheDir, "guestinit"))
+	initBin, err := openbsdguestinit.BuildForArch(ctx, filepath.Join(cfg.CacheDir, "guestinit"), cfg.Arch)
 	if err != nil {
 		return nil, err
 	}

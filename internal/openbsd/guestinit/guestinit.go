@@ -10,6 +10,13 @@ import (
 )
 
 func Build(ctx context.Context, cacheDir string) ([]byte, error) {
+	return BuildForArch(ctx, cacheDir, "amd64")
+}
+
+func BuildForArch(ctx context.Context, cacheDir string, arch string) ([]byte, error) {
+	if arch == "" {
+		arch = "amd64"
+	}
 	if cacheDir == "" {
 		var err error
 		cacheDir, err = os.MkdirTemp("", "cc-openbsd-guestinit-*")
@@ -25,9 +32,9 @@ func Build(ctx context.Context, cacheDir string) ([]byte, error) {
 		return nil, fmt.Errorf("locate OpenBSD guest init package")
 	}
 	moduleRoot := filepath.Clean(filepath.Join(filepath.Dir(file), "..", "..", ".."))
-	out := filepath.Join(cacheDir, "guest-init-openbsd-amd64")
+	out := filepath.Join(cacheDir, "guest-init-openbsd-"+arch)
 	cmd := exec.CommandContext(ctx, "go", "build", "-trimpath", "-o", out, "./internal/cmd/openbsd-init")
-	cmd.Env = append(os.Environ(), "GOOS=openbsd", "GOARCH=amd64", "CGO_ENABLED=0")
+	cmd.Env = append(os.Environ(), "GOOS=openbsd", "GOARCH="+arch, "CGO_ENABLED=0")
 	cmd.Dir = moduleRoot
 	data, err := cmd.CombinedOutput()
 	if err != nil {

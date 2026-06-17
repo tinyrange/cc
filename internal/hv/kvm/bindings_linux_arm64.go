@@ -60,6 +60,16 @@ func ioctlWithRetry(fd uintptr, request uint64, arg uintptr) (uintptr, error) {
 	}
 }
 
+func ioctlRunVCPUInterruptible(fd uintptr) (uintptr, error) {
+	for {
+		v1, err := ioctl(fd, uint64(kvmRun), 0)
+		if err == unix.EAGAIN {
+			continue
+		}
+		return v1, err
+	}
+}
+
 func createVM(fd int, ipaBits uint32) (int, error) {
 	v1, err := ioctlWithRetry(uintptr(fd), uint64(kvmCreateVM), uintptr(ipaBits))
 	if err != nil {

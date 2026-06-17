@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -44,6 +45,7 @@ type VM struct {
 	run       []byte
 	mem       []byte
 	memRegion kvmUserspaceMemoryRegion
+	tid       atomic.Int32
 }
 
 func NewVM() (*VM, error) {
@@ -188,12 +190,26 @@ func (v *VM) GetPC() (uint64, error) {
 }
 
 func (v *VM) Run(exit *Exit) error {
+	return v.execute(exit, false)
+}
+
+func (v *VM) RunInterruptible(exit *Exit) error {
+	return v.execute(exit, true)
+}
+
+func (v *VM) execute(exit *Exit, interruptible bool) error {
 	if exit == nil {
 		return fmt.Errorf("exit is nil")
 	}
 	run := (*kvmRunData)(unsafe.Pointer(&v.run[0]))
 	run.immediateExit = 0
-	if _, err := ioctlWithRetry(uintptr(v.vcpufd), uint64(kvmRun), 0); err != nil {
+	var err error
+	if interruptible {
+		_, err = ioctlRunVCPUInterruptible(uintptr(v.vcpufd))
+	} else {
+		_, err = ioctlWithRetry(uintptr(v.vcpufd), uint64(kvmRun), 0)
+	}
+	if err != nil {
 		return fmt.Errorf("run vcpu: %w", err)
 	}
 	reason := ExitReason(run.exitReason)
@@ -220,6 +236,24 @@ func (v *VM) Run(exit *Exit) error {
 		}
 	}
 	return nil
+}
+
+func (v *VM) RequestImmediateExit() {
+	if v == nil || len(v.run) == 0 {
+		return
+	}
+	run := (*kvmRunData)(unsafe.Pointer(&v.run[0]))
+	run.immediateExit = 1
+	if tid := v.tid.Load(); tid > 0 {
+		_ = unix.Tgkill(unix.Getpid(), int(tid), unix.SIGURG)
+	}
+}
+
+func (v *VM) SetVCPUTID(tid int) {
+	if v == nil {
+		return
+	}
+	v.tid.Store(int32(tid))
 }
 
 func (v *VM) CancelRun() error {

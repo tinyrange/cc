@@ -46,6 +46,9 @@ func (b *runtimeBackend) StartBlank(ctx context.Context, req client.StartInstanc
 }
 
 func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	if inst, ok, err := b.startBuiltinGuestStream(ctx, req, onEvent); ok || err != nil {
+		return inst, err
+	}
 	if b == nil || b.kernel == nil || b.images == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
 	}
@@ -120,6 +123,24 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 }
 
 func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
+	if inst, ok, err := b.startBuiltinGuestBlankStream(ctx, req, onEvent); ok || err != nil {
+		return inst, err
+	}
+	if strings.TrimSpace(req.Image) != "" {
+		return b.StartStream(ctx, client.CreateInstanceRequest{
+			ID:             req.ID,
+			Image:          req.Image,
+			InitSystem:     req.InitSystem,
+			Kernel:         req.Kernel,
+			Network:        req.Network,
+			KernelModules:  append([]string(nil), req.KernelModules...),
+			MemoryMB:       req.MemoryMB,
+			CPUs:           req.CPUs,
+			NestedVirt:     req.NestedVirt,
+			Dmesg:          req.Dmesg,
+			TimeoutSeconds: req.TimeoutSeconds,
+		}, onEvent)
+	}
 	if b == nil || b.kernel == nil || b.images == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
 	}
@@ -207,6 +228,9 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 }
 
 func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client.ExecResponse, error) {
+	if resp, ok, err := b.runBuiltinGuest(ctx, req); ok || err != nil {
+		return resp, err
+	}
 	if b == nil || b.kernel == nil {
 		return client.ExecResponse{}, fmt.Errorf("runtime backend is not configured")
 	}

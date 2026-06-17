@@ -78,6 +78,37 @@ func TestNetLegacyTXStripsTenByteHeader(t *testing.T) {
 	}
 }
 
+func TestNetTXCanForceTwelveByteHeader(t *testing.T) {
+	mem := make(testGuestMemory, 0x20000)
+	backend := &testNetBackend{}
+	irq := &testIRQ{}
+	dev := NewNet(0, 0x1000, 11, net.HardwareAddr{0x02, 0x42, 0x0a, 0x2a, 0x00, 0x02}, backend)
+	dev.HeaderLength = netHeaderLenMergeRX
+	dev.Attach(mem, irq)
+
+	if err := dev.WriteLegacy(14, 2, netQueueTX); err != nil {
+		t.Fatal(err)
+	}
+	if err := dev.WriteLegacy(8, 4, 0x10); err != nil {
+		t.Fatal(err)
+	}
+	packet := []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0x42, 0x0a, 0x2a, 0x00, 0x02, 0x08, 0x06}
+	copy(mem[0x2000+netHeaderLenMergeRX:], packet)
+	writeDesc(mem, 0x10000, 0x2000, uint32(netHeaderLenMergeRX+len(packet)), 0, 0)
+	binary.LittleEndian.PutUint16(mem[0x10000+16*netQueueSize+2:], 1)
+	binary.LittleEndian.PutUint16(mem[0x10000+16*netQueueSize+4:], 0)
+
+	if err := dev.WriteLegacy(16, 2, netQueueTX); err != nil {
+		t.Fatal(err)
+	}
+	if len(backend.packets) != 1 {
+		t.Fatalf("packets = %d", len(backend.packets))
+	}
+	if !bytes.Equal(backend.packets[0], packet) {
+		t.Fatalf("packet = %x, want %x", backend.packets[0], packet)
+	}
+}
+
 func TestNetLegacyRXWritesTenByteHeader(t *testing.T) {
 	mem := make(testGuestMemory, 0x20000)
 	irq := &testIRQ{}

@@ -87,7 +87,7 @@ func BuildManagedRuntime(ctx context.Context, cfg Config) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	initBin, err := freebsdguestinit.Build(ctx, filepath.Join(cfg.CacheDir, "guestinit"))
+	initBin, err := freebsdguestinit.BuildForArch(ctx, filepath.Join(cfg.CacheDir, "guestinit"), cfg.Arch)
 	if err != nil {
 		return nil, err
 	}

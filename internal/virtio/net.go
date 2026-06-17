@@ -51,6 +51,7 @@ type Net struct {
 	MAC  net.HardwareAddr
 
 	DisableMergeRX   bool
+	HeaderLength     int
 	mu               sync.Mutex
 	mem              GuestMemory
 	irq              IRQController
@@ -712,6 +713,9 @@ func (n *Net) deviceFeaturesLocked() uint64 {
 }
 
 func (n *Net) netHeaderLenLocked() int {
+	if n.HeaderLength != 0 {
+		return n.HeaderLength
+	}
 	if n.driverFeatures&netFeatureMergeRX != 0 {
 		return netHeaderLenMergeRX
 	}
