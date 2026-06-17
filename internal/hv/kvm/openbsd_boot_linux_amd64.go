@@ -124,6 +124,7 @@ func bootOpenBSDToCondition(ctx context.Context, kernel []byte, memoryMB uint64,
 		}
 	}()
 
+	kbc := NewI8042()
 	var exit Exit
 	for step := 0; ; step++ {
 		if err := ctx.Err(); err != nil {
@@ -151,6 +152,9 @@ func bootOpenBSDToCondition(ctx context.Context, kernel []byte, memoryMB uint64,
 		switch exit.Reason {
 		case ExitIO:
 			if err := handleBootIOWithPCI(func(ioExit IOExit) error {
+				if handled, err := kbc.HandleIO(ioExit); handled || err != nil {
+					return err
+				}
 				return handleBootIO(uart, ioExit)
 			}, pci, exit.IO); err != nil {
 				return serialOut.String(), err

@@ -148,6 +148,7 @@ func runOpenBSDManagedVM(ctx context.Context, vm *VM, uart *serial.UART8250, pci
 			}
 		}
 	}()
+	kbc := NewI8042()
 	var exit Exit
 	for step := 0; ; step++ {
 		if err := ctx.Err(); err != nil {
@@ -162,6 +163,9 @@ func runOpenBSDManagedVM(ctx context.Context, vm *VM, uart *serial.UART8250, pci
 		switch exit.Reason {
 		case ExitIO:
 			if err := handleBootIOWithPCI(func(ioExit IOExit) error {
+				if handled, err := kbc.HandleIO(ioExit); handled || err != nil {
+					return err
+				}
 				return handleBootIO(uart, ioExit)
 			}, pci, exit.IO); err != nil {
 				return err
