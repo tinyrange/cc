@@ -6,6 +6,8 @@ import (
 	"context"
 
 	"j5.nz/cc/internal/imagefs"
+	whphost "j5.nz/cc/internal/vm/host/whp"
+	"j5.nz/cc/internal/vm/mounts"
 )
 
 func (i *windowsInstance) Flush(ctx context.Context) error {
@@ -14,17 +16,17 @@ func (i *windowsInstance) Flush(ctx context.Context) error {
 
 func (i *windowsInstance) RootSnapshot() (imagefs.Directory, error) {
 	if i == nil || i.rootFS == nil {
-		return managedRootSnapshot(nil, "")
+		return mounts.RootSnapshot(nil, "")
 	}
-	return managedRootSnapshotWithCapabilities("Linux", i.ManagedCapabilities(), i.rootFS, "")
+	return mounts.RootSnapshotWithCapabilities("Linux", i.ManagedCapabilities(), i.rootFS, "")
 }
 
 func (i *windowsInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
 	if i == nil || i.rootFS == nil {
-		return managedRootSnapshot(nil, "")
+		return mounts.RootSnapshot(nil, "")
 	}
 	if i.image != nil && i.image.Name == imageName {
 		return i.RootSnapshot()
 	}
-	return managedImageSnapshotWithCapabilities("Linux", i.ManagedCapabilities(), i.rootFS, imageName, windowsImageMountPath(imageName))
+	return mounts.ImageSnapshotWithCapabilities("Linux", i.ManagedCapabilities(), i.rootFS, imageName, whphost.ImageMountPath(imageName))
 }

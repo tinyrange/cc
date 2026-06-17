@@ -5,27 +5,22 @@ package vm
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 
 	"j5.nz/cc/client"
-	freebsdrootfs "j5.nz/cc/internal/freebsd/rootfs"
 	"j5.nz/cc/internal/hv/kvm"
 	managedguest "j5.nz/cc/internal/managed/guest"
 	"j5.nz/cc/internal/managed/machine"
-	"j5.nz/cc/internal/managed/rootartifact"
 	managedruntime "j5.nz/cc/internal/managed/runtime"
-	openbsdrootfs "j5.nz/cc/internal/openbsd/rootfs"
-	"j5.nz/cc/internal/vmruntime"
+	"j5.nz/cc/internal/vm/builtin"
+	"j5.nz/cc/internal/vm/execplan"
 )
 
 func builtinGuestForImage(image string) (managedguest.Profile, bool) {
-	return managedguest.BuiltinBSDProfileForImage(image)
+	return builtin.GuestForImage(image)
 }
 
 func isBuiltinGuestImage(image string) bool {
-	_, ok := builtinGuestForImage(image)
-	return ok
+	return builtin.IsGuestImage(image)
 }
 
 func (b *runtimeBackend) startBuiltinGuestProfile(ctx context.Context, profile managedguest.Profile, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
@@ -101,34 +96,7 @@ func (b *runtimeBackend) runBuiltinGuest(ctx context.Context, req client.RunRequ
 }
 
 func (b *runtimeBackend) startOpenBSDStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
-	return b.startBSDManagedStream(ctx, req, onEvent, bsdManagedDefinition{
-		Profile:   managedguest.OpenBSDProfile,
-		BootKind:  "openbsd",
-		Hostname:  "cc-openbsd",
-		Interface: "vio0",
-		CacheDir:  openBSDRuntimeCacheDir(b.guestInitCache),
-		BuildArtifact: func(ctx context.Context, cacheDir string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
-			runtime, err := openbsdrootfs.BuildManagedRuntime(ctx, openbsdrootfs.Config{CacheDir: cacheDir, Network: network})
-			if err != nil {
-				return rootartifact.Artifact{}, err
-			}
-			return runtime.Artifact(), nil
-		},
-	})
-}
-
-func openBSDRuntimeConfig(guestInitCache string) openbsdrootfs.Config {
-	return openbsdrootfs.Config{CacheDir: openBSDRuntimeCacheDir(guestInitCache)}
-}
-
-func openBSDRuntimeCacheDir(guestInitCache string) string {
-	cacheDir := guestInitCache
-	if cacheDir == "" {
-		cacheDir = filepath.Join(os.TempDir(), "cc-openbsd")
-	} else {
-		cacheDir = filepath.Join(filepath.Dir(cacheDir), "openbsd")
-	}
-	return cacheDir
+	return b.startBSDManagedStream(ctx, req, onEvent, builtin.OpenBSDDefinition(b.guestInitCache))
 }
 
 func managedBSDNetworkConfig(cfg *client.NetworkConfig) *client.NetworkConfig {
@@ -140,32 +108,10 @@ func managedBSDNetworkConfig(cfg *client.NetworkConfig) *client.NetworkConfig {
 }
 
 func (b *runtimeBackend) startFreeBSDStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (Instance, error) {
-	return b.startBSDManagedStream(ctx, req, onEvent, bsdManagedDefinition{
-		Profile:   managedguest.FreeBSDProfile,
-		BootKind:  "freebsd",
-		Hostname:  "cc-freebsd",
-		Interface: "vtnet0",
-		CacheDir:  freeBSDRuntimeCacheDir(b.guestInitCache),
-		BuildArtifact: func(ctx context.Context, cacheDir string, network machine.NetworkSpec) (rootartifact.Artifact, error) {
-			runtime, err := freebsdrootfs.BuildManagedRuntime(ctx, freebsdrootfs.Config{CacheDir: cacheDir, Network: network})
-			if err != nil {
-				return rootartifact.Artifact{}, err
-			}
-			return runtime.Artifact(), nil
-		},
-	})
+	return b.startBSDManagedStream(ctx, req, onEvent, builtin.FreeBSDDefinition(b.guestInitCache))
 }
 
-type bsdManagedDefinition struct {
-	Profile       managedguest.Profile
-	BootKind      string
-	Hostname      string
-	Interface     string
-	CacheDir      string
-	BuildArtifact func(context.Context, string, machine.NetworkSpec) (rootartifact.Artifact, error)
-}
-
-func (b *runtimeBackend) startBSDManagedStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error, def bsdManagedDefinition) (inst Instance, err error) {
+func (b *runtimeBackend) startBSDManagedStream(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error, def builtin.BSDDefinition) (inst Instance, err error) {
 	if b == nil {
 		return nil, fmt.Errorf("runtime backend is not configured")
 	}
@@ -174,7 +120,7 @@ func (b *runtimeBackend) startBSDManagedStream(ctx context.Context, req client.C
 		displayName = def.BootKind
 	}
 	if len(req.Shares) != 0 {
-		return nil, unsupportedManagedFeature(displayName, def.Profile.Caps, "filesystem shares")
+		return nil, execplan.UnsupportedFeature(displayName, def.Profile.Caps, "filesystem shares")
 	}
 	if req.Network != nil && !req.Network.Enabled {
 		return nil, fmt.Errorf("%s runtime requires virtio-net for the managed control channel", displayName)
@@ -236,38 +182,12 @@ func (b *runtimeBackend) startBSDManagedStream(ctx context.Context, req client.C
 		session:      started.Session,
 		closeRuntime: started.Artifact.Close,
 		root:         started.Artifact.RootFS,
-		baseEnv:      bsdEffectiveExecEnv(nil, nil, false),
+		baseEnv:      builtin.EffectiveExecEnv(nil, nil, false),
 		workDir:      "/",
 		network:      network,
 		caps:         def.Profile.Caps,
-		env:          bsdEffectiveExecEnv,
+		env:          builtin.EffectiveExecEnv,
 	}, nil
-}
-
-func freeBSDRuntimeConfig(guestInitCache string) freebsdrootfs.Config {
-	return freebsdrootfs.Config{CacheDir: freeBSDRuntimeCacheDir(guestInitCache)}
-}
-
-func freeBSDRuntimeCacheDir(guestInitCache string) string {
-	cacheDir := guestInitCache
-	if cacheDir == "" {
-		cacheDir = filepath.Join(os.TempDir(), "cc-freebsd")
-	} else {
-		cacheDir = filepath.Join(filepath.Dir(cacheDir), "freebsd")
-	}
-	return cacheDir
-}
-
-func bsdEffectiveExecEnv(base, overrides []string, replace bool) []string {
-	defaults := []string{
-		"PATH=/bin:/sbin:/usr/bin:/usr/sbin",
-		"HOME=/root",
-		"TERM=xterm",
-	}
-	if replace {
-		return vmruntime.MergeEnv(defaults, overrides)
-	}
-	return vmruntime.MergeEnv(vmruntime.MergeEnv(defaults, base), overrides)
 }
 
 func builtinGuestCapabilities(image string) guestCapabilities {

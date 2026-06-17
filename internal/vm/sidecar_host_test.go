@@ -1,22 +1,20 @@
 package vm
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/imagefs"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/virtio"
+	sidecarpkg "j5.nz/cc/internal/vm/sidecar"
 )
 
 func TestSidecarCommandResolverUsesManagedResolver(t *testing.T) {
@@ -74,21 +72,21 @@ func TestSidecarCommandResolverSkipsResolvedRequests(t *testing.T) {
 }
 
 func TestSidecarBlankRootPassthroughDecision(t *testing.T) {
-	blankCore := newSidecarManagedCore(&sidecarManagedSession{}, nil)
-	if !sidecarShouldPassthroughToWorker(blankCore, client.ExecRequest{Command: []string{"echo"}}) {
+	blankCore := newSidecarManagedCore(sidecarpkg.NewManagedSession(nil, ""), nil)
+	if !sidecarShouldPassthroughToWorker(false, blankCore, client.ExecRequest{Command: []string{"echo"}}) {
 		t.Fatalf("blank unresolved exec should pass through to worker")
 	}
-	if sidecarShouldPassthroughToWorker(blankCore, client.ExecRequest{Kind: "fs_archive"}) {
+	if sidecarShouldPassthroughToWorker(false, blankCore, client.ExecRequest{Kind: "fs_archive"}) {
 		t.Fatalf("control request should use managed core")
 	}
-	if sidecarShouldPassthroughToWorker(blankCore, client.ExecRequest{Command: []string{"/bin/echo"}, SkipResolve: true}) {
+	if sidecarShouldPassthroughToWorker(false, blankCore, client.ExecRequest{Command: []string{"/bin/echo"}, SkipResolve: true}) {
 		t.Fatalf("already-resolved request should use managed core")
 	}
-	imageCore := newSidecarManagedCore(&sidecarManagedSession{}, &sidecarCommandResolver{
+	imageCore := newSidecarManagedCore(sidecarpkg.NewManagedSession(nil, ""), &sidecarCommandResolver{
 		root:    imagefs.NewHostFS(sidecarResolverRoot(t), nil),
 		baseEnv: []string{"PATH=/bin"},
 	})
-	if sidecarShouldPassthroughToWorker(imageCore, client.ExecRequest{Command: []string{"tool"}}) {
+	if sidecarShouldPassthroughToWorker(true, imageCore, client.ExecRequest{Command: []string{"tool"}}) {
 		t.Fatalf("image-backed exec should use managed core")
 	}
 }
@@ -142,20 +140,6 @@ func TestPrepareRunInInstanceExecAlternateImageUsesManagedResolver(t *testing.T)
 	}
 	if string(got.Stdin) != "input" {
 		t.Fatalf("Stdin = %q", got.Stdin)
-	}
-}
-
-func TestSidecarExecResponseFromManagedSessionEvents(t *testing.T) {
-	resp := sidecarExecResponse([]client.ExecEvent{
-		{Kind: "stdout", Output: "out"},
-		{Kind: "stderr", Output: "err"},
-		{Kind: "exit", ExitCode: 7},
-	})
-	if resp.Output != "outerr" {
-		t.Fatalf("Output = %q", resp.Output)
-	}
-	if resp.ExitCode != 7 {
-		t.Fatalf("ExitCode = %d", resp.ExitCode)
 	}
 }
 
@@ -292,184 +276,6 @@ func TestServeSidecarUnixOnceConnCanLeaveConnectionOpen(t *testing.T) {
 	}
 	_ = conn.Close()
 	cleanup()
-}
-
-func TestSidecarLaunchCommand(t *testing.T) {
-	t.Setenv(sidecarModeEnv, "")
-	cmd := sidecarLaunchCommand("/tmp/ccvm", "/cache", "/tmp/control.sock", []string{"EXTRA=1"})
-	if cmd.Path != "/tmp/ccvm" {
-		t.Fatalf("path = %q", cmd.Path)
-	}
-	if !containsArg(cmd.Args, "-worker") || !containsArgPair(cmd.Args, "-cache-dir", "/cache") {
-		t.Fatalf("worker launch args = %#v", cmd.Args)
-	}
-	if cmd.Stderr != os.Stderr {
-		t.Fatalf("stderr was not inherited")
-	}
-	if !envHas(cmd.Env, sidecarDisableEnv+"=1") {
-		t.Fatalf("env missing %s=1: %#v", sidecarDisableEnv, cmd.Env)
-	}
-	if !envHas(cmd.Env, sidecarControlEnv+"=/tmp/control.sock") {
-		t.Fatalf("env missing control socket: %#v", cmd.Env)
-	}
-	if !envHas(cmd.Env, "EXTRA=1") {
-		t.Fatalf("env missing extra entry: %#v", cmd.Env)
-	}
-}
-
-func containsArg(args []string, want string) bool {
-	for _, arg := range args {
-		if arg == want {
-			return true
-		}
-	}
-	return false
-}
-
-func containsArgPair(args []string, key, value string) bool {
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == key && args[i+1] == value {
-			return true
-		}
-	}
-	return false
-}
-
-func TestReadSidecarStartupHello(t *testing.T) {
-	got, err := readSidecarStartupHello(bytes.NewBufferString(`{"addr":"127.0.0.1:1234"}`))
-	if err != nil {
-		t.Fatalf("readSidecarStartupHello: %v", err)
-	}
-	if got.Addr != "127.0.0.1:1234" {
-		t.Fatalf("Addr = %q", got.Addr)
-	}
-}
-
-func TestReadSidecarStartupHelloRejectsMalformedJSON(t *testing.T) {
-	_, err := readSidecarStartupHello(bytes.NewBufferString(`{`))
-	if err == nil || !strings.Contains(err.Error(), "read sidecar startup banner") {
-		t.Fatalf("err = %v", err)
-	}
-}
-
-func TestReadSidecarStartupHelloRejectsErrorBanner(t *testing.T) {
-	_, err := readSidecarStartupHello(bytes.NewBufferString(`{"kind":"error","detail":"no host support"}`))
-	if err == nil || !strings.Contains(err.Error(), "sidecar ccvm failed to start: no host support") {
-		t.Fatalf("err = %v", err)
-	}
-}
-
-func TestReadSidecarStartupHelloRejectsMissingAddress(t *testing.T) {
-	_, err := readSidecarStartupHello(bytes.NewBufferString(`{"addr":"   "}`))
-	if err == nil || !strings.Contains(err.Error(), "did not report an address") {
-		t.Fatalf("err = %v", err)
-	}
-}
-
-func TestSidecarWorkerDialTarget(t *testing.T) {
-	network, address := sidecarWorkerDialTarget("tcp://127.0.0.1:1234")
-	if network != "tcp" || address != "127.0.0.1:1234" {
-		t.Fatalf("tcp target = %q %q", network, address)
-	}
-	network, address = sidecarWorkerDialTarget("/tmp/worker.sock")
-	if network != "unix" || address != "/tmp/worker.sock" {
-		t.Fatalf("unix target = %q %q", network, address)
-	}
-}
-
-func TestDialSidecarWorkerReadsHello(t *testing.T) {
-	addr, done := serveSidecarWorkerFrame(t, WorkerFrame{Type: WorkerFrameHello})
-	worker, err := dialSidecarWorker(context.Background(), "tcp://"+addr)
-	if err != nil {
-		t.Fatalf("dialSidecarWorker: %v", err)
-	}
-	if worker == nil || worker.codec == nil {
-		t.Fatalf("worker client was not initialized")
-	}
-	_ = worker.Close()
-	if err := <-done; err != nil {
-		t.Fatalf("server: %v", err)
-	}
-}
-
-func TestDialSidecarWorkerRejectsNonHello(t *testing.T) {
-	addr, done := serveSidecarWorkerFrame(t, WorkerFrame{Type: WorkerFrameError})
-	worker, err := dialSidecarWorker(context.Background(), "tcp://"+addr)
-	if worker != nil {
-		_ = worker.Close()
-	}
-	if err == nil || !strings.Contains(err.Error(), "before hello") {
-		t.Fatalf("err = %v", err)
-	}
-	if err := <-done; err != nil {
-		t.Fatalf("server: %v", err)
-	}
-}
-
-func serveSidecarWorkerFrame(t *testing.T, frame WorkerFrame) (string, <-chan error) {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	done := make(chan error, 1)
-	go func() {
-		defer ln.Close()
-		conn, err := ln.Accept()
-		if err != nil {
-			done <- err
-			return
-		}
-		codec := NewWorkerCodec(conn)
-		if err := codec.Send(frame); err != nil {
-			_ = codec.Close()
-			done <- err
-			return
-		}
-		done <- codec.Close()
-	}()
-	return ln.Addr().String(), done
-}
-
-func TestSidecarDaemonCloseRunsCleanupsOnceInReverseOrder(t *testing.T) {
-	var order []string
-	daemon := &sidecarDaemon{cleanups: []func(){
-		func() { order = append(order, "first") },
-		nil,
-		func() { order = append(order, "second") },
-	}}
-	if err := daemon.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	if err := daemon.Close(); err != nil {
-		t.Fatalf("second Close: %v", err)
-	}
-	if got := strings.Join(order, ","); got != "second,first" {
-		t.Fatalf("cleanup order = %q", got)
-	}
-}
-
-func TestWaitSidecarCommand(t *testing.T) {
-	cmd := exec.Command("true")
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start true: %v", err)
-	}
-	if err := waitSidecarCommand(cmd, time.Second); err != nil {
-		t.Fatalf("wait true: %v", err)
-	}
-
-	slow := exec.Command("sh", "-c", "sleep 10")
-	if err := slow.Start(); err != nil {
-		t.Fatalf("start sleep: %v", err)
-	}
-	start := time.Now()
-	err := waitSidecarCommand(slow, 10*time.Millisecond)
-	if err == nil {
-		t.Fatalf("wait sleep unexpectedly succeeded")
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("wait sleep took %s, want timeout kill", elapsed)
-	}
 }
 
 func sidecarResolverRoot(t *testing.T) string {

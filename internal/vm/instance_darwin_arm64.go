@@ -12,6 +12,10 @@ import (
 	managedguest "j5.nz/cc/internal/managed/guest"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/virtio"
+	hvfhost "j5.nz/cc/internal/vm/host/hvf"
+	hostmanaged "j5.nz/cc/internal/vm/host/managed"
+	"j5.nz/cc/internal/vm/mounts"
+	"j5.nz/cc/internal/vm/netstate"
 	"j5.nz/cc/internal/vmruntime"
 )
 
@@ -37,17 +41,17 @@ func newDarwinManagedCore(session *hvf.ContainerSession) *managedInstanceCore {
 		return nil
 	}
 	metadata := session.ManagedMetadata()
-	return &managedInstanceCore{
-		osName:         "Linux",
-		session:        session,
-		root:           metadata.Root,
-		baseEnv:        metadata.BaseEnv,
-		workDir:        metadata.WorkDir,
-		caps:           managedguest.LinuxProfile.Caps,
-		env:            mergeDarwinManagedEnv,
-		missingRootErr: "running instance does not have a default image root filesystem",
-		markResolved:   true,
-	}
+	return hostmanaged.NewCore(hostmanaged.Config{
+		OSName:         "Linux",
+		Session:        session,
+		Root:           metadata.Root,
+		BaseEnv:        metadata.BaseEnv,
+		WorkDir:        metadata.WorkDir,
+		Capabilities:   managedguest.LinuxProfile.Caps,
+		Env:            mergeDarwinManagedEnv,
+		MissingRootErr: "running instance does not have a default image root filesystem",
+		MarkResolved:   true,
+	})
 }
 
 func (i *darwinInstance) ManagedCapabilities() guestCapabilities {
@@ -66,34 +70,34 @@ func (i *darwinInstance) managedCore() *managedInstanceCore {
 
 func (i *darwinInstance) AddShare(ctx context.Context, share client.ShareMount) error {
 	if i == nil {
-		return addDelegatedRuntimeShare(ctx, nil, share, "runtime shares")
+		return mounts.AddDelegatedRuntimeShare(ctx, nil, share, "runtime shares")
 	}
-	return addDelegatedRuntimeShare(ctx, i.session, share, "runtime shares")
+	return mounts.AddDelegatedRuntimeShare(ctx, i.session, share, "runtime shares")
 }
 
 func (i *darwinInstance) AddImage(ctx context.Context, mountPath string, image *oci.Image) error {
 	if i == nil {
-		return addDelegatedRuntimeImage(ctx, nil, mountPath, image)
+		return mounts.AddDelegatedRuntimeImage(ctx, nil, mountPath, image)
 	}
-	return addDelegatedRuntimeImage(ctx, i.session, mountPath, image)
+	return mounts.AddDelegatedRuntimeImage(ctx, i.session, mountPath, image)
 }
 
 func (i *darwinInstance) AddPortForward(ctx context.Context, forward client.PortForward) error {
 	if i == nil {
-		return addManagedNetworkPortForwardWithFallback(ctx, nil, forward, nil)
+		return netstate.AddManagedNetworkPortForwardWithFallback(ctx, nil, forward, nil)
 	}
 	var runtime *networkRuntime
 	if i.network != nil {
 		runtime = i.network.networkRuntime
 	}
-	return addManagedNetworkPortForwardWithFallback(ctx, runtime, forward, i.session)
+	return netstate.AddManagedNetworkPortForwardWithFallback(ctx, runtime, forward, i.session)
 }
 
 func (i *darwinInstance) AllowServiceProxyPort(ctx context.Context, port int) error {
 	if i == nil || i.network == nil {
-		return allowManagedNetworkServiceProxyPort(ctx, nil, port)
+		return netstate.AllowManagedNetworkServiceProxyPort(ctx, nil, port)
 	}
-	return allowManagedNetworkServiceProxyPort(ctx, i.network.networkRuntime, port)
+	return netstate.AllowManagedNetworkServiceProxyPort(ctx, i.network.networkRuntime, port)
 }
 
 func (i *darwinInstance) VirtioFSStats() []virtio.FSStats {
@@ -126,19 +130,19 @@ func (i *darwinInstance) ConsoleHistory(ctx context.Context) (string, error) {
 
 func (i *darwinInstance) RootSnapshot() (imagefs.Directory, error) {
 	if i == nil || i.session == nil {
-		return managedRootSnapshot(nil, "")
+		return mounts.RootSnapshot(nil, "")
 	}
-	return managedRootSnapshotWithCapabilities("Linux", i.ManagedCapabilities(), i.session, "")
+	return mounts.RootSnapshotWithCapabilities("Linux", i.ManagedCapabilities(), i.session, "")
 }
 
 func (i *darwinInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
 	if i == nil || i.session == nil {
-		return managedRootSnapshot(nil, "")
+		return mounts.RootSnapshot(nil, "")
 	}
 	if strings.TrimSpace(i.imageName) == imageName {
 		return i.RootSnapshot()
 	}
-	return managedImageSnapshotWithCapabilities("Linux", i.ManagedCapabilities(), i.session, imageName, imageMountPath(imageName))
+	return mounts.ImageSnapshotWithCapabilities("Linux", i.ManagedCapabilities(), i.session, imageName, hvfhost.ImageMountPath(imageName))
 }
 
 func (i *darwinInstance) Wait() error {
@@ -152,14 +156,14 @@ func (i *darwinInstance) Close() error {
 	if i == nil {
 		return nil
 	}
-	return closeManagedSessionWithNetwork(i.session, i.network)
+	return hostmanaged.CloseSessionWithNetwork(i.session, i.network)
 }
 
 func (i *darwinInstance) NetworkIPv4() string {
 	if i == nil || i.network == nil {
 		return ""
 	}
-	return managedNetworkIPv4(i.network.networkRuntime, "")
+	return netstate.IPv4(i.network.networkRuntime, "")
 }
 
 func darwinContainerSession(inst Instance) (*hvf.ContainerSession, bool) {

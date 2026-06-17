@@ -27,6 +27,9 @@ import (
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/timing"
 	"j5.nz/cc/internal/virtio"
+	"j5.nz/cc/internal/vm/execplan"
+	hvfhost "j5.nz/cc/internal/vm/host/hvf"
+	"j5.nz/cc/internal/vm/mounts"
 	"j5.nz/cc/internal/vmruntime"
 )
 
@@ -265,13 +268,13 @@ func (b *runtimeBackend) RunInInstance(
 ) (client.ExecResponse, error) {
 	targetImage := strings.TrimSpace(req.Image)
 	if targetImage == "" || targetImage == runningImage {
-		if err := addRuntimeShares(ctx, inst, req.Shares); err != nil {
+		if err := mounts.AddRuntimeShares(ctx, inst, req.Shares); err != nil {
 			return client.ExecResponse{}, err
 		}
 		return inst.Exec(ctx, runExecRequest(req))
 	}
 
-	if err := checkAlternateImageExec(inst); err != nil {
+	if err := execplan.CheckAlternateImageExec(inst); err != nil {
 		return client.ExecResponse{}, err
 	}
 	session, ok := darwinContainerSession(inst)
@@ -284,16 +287,16 @@ func (b *runtimeBackend) RunInInstance(
 		return client.ExecResponse{}, err
 	}
 	image = withRuntimeMountDirs(image)
-	mountPath := imageMountPath(targetImage)
-	if err := mountAlternateImageWithShares(ctx, inst, session, mountPath, image, req.Shares); err != nil {
+	mountPath := hvfhost.ImageMountPath(targetImage)
+	if err := mounts.MountAlternateImageWithShares(ctx, inst, session, mountPath, image, req.Shares); err != nil {
 		return client.ExecResponse{}, err
 	}
 
-	execReq, err := resolveRunExecRequest(req, mountPath, managedExecResolver{
-		root:           image.RootFS,
-		baseEnv:        image.Config.Env,
-		defaultWorkDir: image.Config.WorkingDir,
-		env: func(base, overrides []string, _ bool) []string {
+	execReq, err := execplan.ResolveRunRequest(req, mountPath, execplan.Resolver{
+		Root:           image.RootFS,
+		BaseEnv:        image.Config.Env,
+		DefaultWorkDir: image.Config.WorkingDir,
+		Env: func(base, overrides []string, _ bool) []string {
 			return mergeRuntimeEnv(append([]string(nil), base...), overrides)
 		},
 	})
@@ -313,13 +316,13 @@ func (b *runtimeBackend) RunInInstanceStream(
 ) error {
 	targetImage := strings.TrimSpace(req.Image)
 	if targetImage == "" || targetImage == runningImage {
-		if err := addRuntimeShares(ctx, inst, req.Shares); err != nil {
+		if err := mounts.AddRuntimeShares(ctx, inst, req.Shares); err != nil {
 			return err
 		}
 		return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
 	}
 
-	if err := checkAlternateImageExec(inst); err != nil {
+	if err := execplan.CheckAlternateImageExec(inst); err != nil {
 		return err
 	}
 	session, ok := darwinContainerSession(inst)
@@ -332,16 +335,16 @@ func (b *runtimeBackend) RunInInstanceStream(
 		return err
 	}
 	image = withRuntimeMountDirs(image)
-	mountPath := imageMountPath(targetImage)
-	if err := mountAlternateImageWithShares(ctx, inst, session, mountPath, image, req.Shares); err != nil {
+	mountPath := hvfhost.ImageMountPath(targetImage)
+	if err := mounts.MountAlternateImageWithShares(ctx, inst, session, mountPath, image, req.Shares); err != nil {
 		return err
 	}
 
-	execReq, err := resolveRunExecRequest(req, mountPath, managedExecResolver{
-		root:           image.RootFS,
-		baseEnv:        image.Config.Env,
-		defaultWorkDir: image.Config.WorkingDir,
-		env: func(base, overrides []string, _ bool) []string {
+	execReq, err := execplan.ResolveRunRequest(req, mountPath, execplan.Resolver{
+		Root:           image.RootFS,
+		BaseEnv:        image.Config.Env,
+		DefaultWorkDir: image.Config.WorkingDir,
+		Env: func(base, overrides []string, _ bool) []string {
 			return mergeRuntimeEnv(append([]string(nil), base...), overrides)
 		},
 	})
@@ -358,7 +361,7 @@ func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance
 		return inst.ExecStream(ctx, req, inputs, onEvent)
 	}
 
-	if err := checkAlternateImageExec(inst); err != nil {
+	if err := execplan.CheckAlternateImageExec(inst); err != nil {
 		return err
 	}
 	session, ok := darwinContainerSession(inst)
@@ -373,8 +376,8 @@ func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance
 		return err
 	}
 	image = withRuntimeMountDirs(image)
-	mountPath := imageMountPath(targetImage)
-	if err := mountAlternateImageWithShares(ctx, inst, session, mountPath, image, nil); err != nil {
+	mountPath := hvfhost.ImageMountPath(targetImage)
+	if err := mounts.MountAlternateImageWithShares(ctx, inst, session, mountPath, image, nil); err != nil {
 		return err
 	}
 	req.RootDir = rootDirWithinMount(mountPath, req.RootDir)
@@ -519,7 +522,7 @@ func (b *runtimeBackend) buildStartRequest(ctx context.Context, req client.Creat
 	}
 	shareStart := time.Now()
 	if runReq.RootFS == nil {
-		runReq.Shares = append(runReq.Shares, convertShareMounts(req.Shares)...)
+		runReq.Shares = append(runReq.Shares, mounts.ConvertShareMounts(req.Shares)...)
 	}
 	timing.Since(ctx, "backend.convert_share_mounts", shareStart)
 	runReq.Persistent = true
@@ -730,17 +733,12 @@ func (b *runtimeBackend) buildRunRequest(ctx context.Context, req client.RunRequ
 	if err != nil {
 		return vmruntime.RunRequest{}, err
 	}
-	runReq.Shares = append(runReq.Shares, convertShareMounts(req.Shares)...)
+	runReq.Shares = append(runReq.Shares, mounts.ConvertShareMounts(req.Shares)...)
 	runReq.Command = append([]string(nil), req.Command...)
 	runReq.Env = append([]string(nil), req.Env...)
 	runReq.WorkDir = req.WorkDir
 	runReq.User = req.User
 	return runReq, nil
-}
-
-func imageMountPath(image string) string {
-	replacer := strings.NewReplacer("/", "_", ":", "_", "@", "_", " ", "_")
-	return filepath.Join("/.ccx3", "images", replacer.Replace(image))
 }
 
 func mergeRuntimeEnv(base []string, extra []string) []string {

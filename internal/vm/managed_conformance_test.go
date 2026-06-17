@@ -4,7 +4,10 @@ import (
 	"strings"
 	"testing"
 
+	"j5.nz/cc/internal/imagefs"
 	managedguest "j5.nz/cc/internal/managed/guest"
+	"j5.nz/cc/internal/vm/execplan"
+	"j5.nz/cc/internal/vm/mounts"
 	"j5.nz/cc/internal/vmruntime"
 )
 
@@ -102,35 +105,35 @@ func TestManagedConformanceMatrixMatchesFeatureGates(t *testing.T) {
 			name:      "copy in",
 			supported: func(c guestCapabilities) bool { return c.CopyIn },
 			check: func(profile managedguest.Profile) error {
-				return checkManagedControlRequest(profile.Name, guestCapabilities(profile.Caps), "fs_write")
+				return execplan.CheckControlRequest(profile.Name, guestCapabilities(profile.Caps), "fs_write")
 			},
 		},
 		{
 			name:      "copy out",
 			supported: func(c guestCapabilities) bool { return c.CopyOut },
 			check: func(profile managedguest.Profile) error {
-				return checkManagedControlRequest(profile.Name, guestCapabilities(profile.Caps), "fs_archive")
+				return execplan.CheckControlRequest(profile.Name, guestCapabilities(profile.Caps), "fs_archive")
 			},
 		},
 		{
 			name:      "archive extract",
 			supported: func(c guestCapabilities) bool { return c.CopyIn && c.ArchiveExtract },
 			check: func(profile managedguest.Profile) error {
-				return checkManagedControlRequest(profile.Name, guestCapabilities(profile.Caps), "fs_extract")
+				return execplan.CheckControlRequest(profile.Name, guestCapabilities(profile.Caps), "fs_extract")
 			},
 		},
 		{
 			name:      "alternate image exec",
 			supported: func(c guestCapabilities) bool { return c.AlternateImageExec },
 			check: func(profile managedguest.Profile) error {
-				return checkAlternateImageExec(staticCapabilityProvider{caps: guestCapabilities(profile.Caps)})
+				return execplan.CheckAlternateImageExec(staticCapabilityProvider{caps: guestCapabilities(profile.Caps)})
 			},
 		},
 		{
 			name:      "root snapshot",
 			supported: func(c guestCapabilities) bool { return c.RootSnapshot },
 			check: func(profile managedguest.Profile) error {
-				_, err := managedRootSnapshotWithCapabilities(profile.Name, guestCapabilities(profile.Caps), &recordingSnapshotter{}, "")
+				_, err := mounts.RootSnapshotWithCapabilities(profile.Name, guestCapabilities(profile.Caps), &recordingSnapshotter{}, "")
 				return err
 			},
 		},
@@ -138,7 +141,7 @@ func TestManagedConformanceMatrixMatchesFeatureGates(t *testing.T) {
 			name:      "image snapshot",
 			supported: func(c guestCapabilities) bool { return c.ImageSnapshot },
 			check: func(profile managedguest.Profile) error {
-				_, err := managedImageSnapshotWithCapabilities(profile.Name, guestCapabilities(profile.Caps), &recordingSnapshotter{}, "tools", "/run/images/tools")
+				_, err := mounts.ImageSnapshotWithCapabilities(profile.Name, guestCapabilities(profile.Caps), &recordingSnapshotter{}, "tools", "/run/images/tools")
 				return err
 			},
 		},
@@ -181,6 +184,24 @@ func managedConformanceSupport(overrides map[string]bool) map[string]bool {
 		out[feature] = supported
 	}
 	return out
+}
+
+type recordingSnapshotter struct{}
+
+func (recordingSnapshotter) RootSnapshot() (imagefs.Directory, error) {
+	return nil, nil
+}
+
+func (recordingSnapshotter) RootSnapshotAt(string) (imagefs.Directory, error) {
+	return nil, nil
+}
+
+type staticCapabilityProvider struct {
+	caps guestCapabilities
+}
+
+func (p staticCapabilityProvider) ManagedCapabilities() guestCapabilities {
+	return p.caps
 }
 
 func TestManagedBootFatalTextMarkers(t *testing.T) {

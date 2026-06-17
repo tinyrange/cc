@@ -10,6 +10,7 @@ import (
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/imagefs"
 	managedsession "j5.nz/cc/internal/managed/session"
+	hostmanaged "j5.nz/cc/internal/vm/host/managed"
 )
 
 type managedInstance struct {
@@ -32,18 +33,18 @@ func (i *managedInstance) core() *managedInstanceCore {
 	if i == nil {
 		return nil
 	}
-	return &managedInstanceCore{
-		osName:         i.osName,
-		session:        i.session,
-		root:           i.root,
-		baseEnv:        i.baseEnv,
-		defaultRootDir: i.defaultRootDir,
-		workDir:        i.workDir,
-		caps:           i.caps,
-		env:            i.env,
-		user:           i.user,
-		missingRootErr: i.missingRootErr,
-	}
+	return hostmanaged.NewCore(hostmanaged.Config{
+		OSName:         i.osName,
+		Session:        i.session,
+		Root:           i.root,
+		BaseEnv:        i.baseEnv,
+		DefaultRootDir: i.defaultRootDir,
+		WorkDir:        i.workDir,
+		Capabilities:   i.caps,
+		Env:            i.env,
+		User:           i.user,
+		MissingRootErr: i.missingRootErr,
+	})
 }
 
 func (i *managedInstance) ManagedCapabilities() guestCapabilities {
@@ -59,7 +60,7 @@ func (i *managedInstance) ExecStream(ctx context.Context, req client.ExecRequest
 }
 
 func (i *managedInstance) execRequest(req client.ExecRequest) (client.ExecRequest, error) {
-	return i.core().execRequest(req)
+	return i.core().ExecRequest(req)
 }
 
 func (i *managedInstance) AddShare(ctx context.Context, share client.ShareMount) error {
@@ -83,14 +84,14 @@ func (i *managedInstance) Wait() error {
 		return nil
 	}
 	defer i.closeNetwork()
-	return waitManagedSession(i.session)
+	return hostmanaged.WaitSession(i.session)
 }
 
 func (i *managedInstance) Close() error {
 	if i == nil {
 		return nil
 	}
-	return closeManagedSession(i.session, func() error {
+	return hostmanaged.CloseSession(i.session, func() error {
 		i.closeNetwork()
 		return nil
 	}, i.closeRuntime)
@@ -129,5 +130,5 @@ func (i *managedInstance) closeNetwork() {
 }
 
 func (i *managedInstance) unsupported(feature string) error {
-	return i.core().unsupported(feature)
+	return i.core().Unsupported(feature)
 }

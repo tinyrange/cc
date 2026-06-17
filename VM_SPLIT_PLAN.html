@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>internal/vm Split Plan</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f7f7f4;
+      --fg: #202124;
+      --muted: #5d625f;
+      --line: #d8d8d2;
+      --panel: #ffffff;
+      --accent: #1f6f5b;
+      --code: #f0f1ed;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #171917;
+        --fg: #ecefea;
+        --muted: #aab0aa;
+        --line: #343832;
+        --panel: #20231f;
+        --accent: #7ec7ad;
+        --code: #2a2e29;
+      }
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 16px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 48px 24px 72px;
+    }
+    h1, h2, h3 {
+      line-height: 1.2;
+      margin: 0;
+    }
+    h1 {
+      font-size: 2.1rem;
+      margin-bottom: 12px;
+    }
+    h2 {
+      font-size: 1.35rem;
+      margin-top: 40px;
+      padding-top: 24px;
+      border-top: 1px solid var(--line);
+    }
+    h3 {
+      font-size: 1.05rem;
+      margin-top: 24px;
+    }
+    p {
+      margin: 12px 0;
+    }
+    ul, ol {
+      margin: 10px 0 18px 24px;
+      padding: 0;
+    }
+    li {
+      margin: 6px 0;
+    }
+    code {
+      background: var(--code);
+      padding: 0.1rem 0.28rem;
+      border-radius: 4px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+    pre {
+      overflow-x: auto;
+      background: var(--code);
+      padding: 16px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+    }
+    pre code {
+      background: transparent;
+      padding: 0;
+    }
+    .summary {
+      color: var(--muted);
+      font-size: 1.05rem;
+      max-width: 760px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px 20px;
+      margin: 18px 0;
+    }
+    .tag {
+      display: inline-block;
+      color: var(--accent);
+      font-weight: 650;
+      margin-right: 8px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+      margin-top: 16px;
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>internal/vm Split Plan</h1>
+  <p class="summary">
+    The current <code>internal/vm</code> package is carrying too many responsibilities: public VM facade,
+    platform backend orchestration, managed guest policy, sidecar protocol, mount state, network state,
+    built-in BSD launch policy, and large integration tests. This plan splits leaf subsystems first and
+    keeps the top-level VM facade stable while the internals move into clearer packages.
+  </p>
+
+  <h2>Problem</h2>
+  <p>
+    <code>internal/vm</code> has become the place where cross-cutting runtime features land because it already
+    imports the request types, image store, virtio filesystems, managed guest packages, and host-specific
+    backends. That made sense incrementally, but it now obscures ownership and makes every new operating
+    system look like another partial VMM living inside the same package.
+  </p>
+  <div class="card">
+    <p><span class="tag">Current shape</span>63 Go files, roughly 12.7k lines in <code>internal/vm</code>.</p>
+    <p>
+      The largest files are <code>vm.go</code>, <code>sidecar_host.go</code>, <code>runtime_boot_test.go</code>,
+      and the platform backend files for Linux, Darwin, and Windows.
+    </p>
+  </div>
+
+  <h2>Design Rules</h2>
+  <ul>
+    <li><code>internal/vm</code> should be the facade and orchestration layer, not the owner of every subsystem.</li>
+    <li>Extract leaf packages first to avoid circular imports and reduce review risk.</li>
+    <li>Package names should describe the domain directly. Avoid naming everything <code>vm...</code>.</li>
+    <li>Keep client-facing APIs and runtime behavior stable during the split.</li>
+    <li>Move tests with the code they validate, and keep integration tests at the facade boundary.</li>
+  </ul>
+
+  <h2>Target Package Shape</h2>
+  <div class="grid">
+    <div class="card">
+      <h3><code>internal/vm</code></h3>
+      <p>
+        Public facade, request routing, instance interface, backend selection, and high-level orchestration.
+      </p>
+    </div>
+    <div class="card">
+      <h3><code>internal/vm/mounts</code></h3>
+      <p>
+        Runtime share state, image mount state, duplicate tracking, share conversion, and snapshot helpers.
+      </p>
+    </div>
+    <div class="card">
+      <h3><code>internal/vm/netstate</code></h3>
+      <p>
+        Managed network state, guest IPv4 reporting, port forward wrappers, service proxy allowlist helpers.
+      </p>
+    </div>
+    <div class="card">
+      <h3><code>internal/vm/execplan</code></h3>
+      <p>
+        Managed exec request resolution, control request validation, capability-gated feature errors,
+        environment merging, rootdir handling, and user normalization hooks.
+      </p>
+    </div>
+    <div class="card">
+      <h3><code>internal/vm/sidecar</code></h3>
+      <p>
+        Worker protocol, startup handshake, launch/dial helpers, sidecar managed session, and daemon lifecycle.
+      </p>
+    </div>
+    <div class="card">
+      <h3><code>internal/vm/builtin</code></h3>
+      <p>
+        Built-in guest image lookup and launch descriptors for operating systems like OpenBSD and FreeBSD.
+      </p>
+    </div>
+  </div>
+
+  <h2>Dependency Direction</h2>
+  <p>
+    The split should keep dependencies flowing in one direction. Lower-level packages should not import
+    <code>internal/vm</code>.
+  </p>
+  <pre><code>client, imagefs, oci, virtio, vmruntime
+        ↓
+mounts, netstate, managed/execplan, sidecar protocol
+        ↓
+internal/vm facade and backend orchestration
+        ↓
+host-specific hv/kvm/hvf/whp implementation details</code></pre>
+
+  <h2>Phase 1: Extract Mount State</h2>
+  <p>
+    Move <code>shares.go</code> and <code>managed_snapshot_helpers.go</code> into <code>internal/vm/mounts</code>.
+    This is the cleanest first step because the code mostly depends on <code>client</code>, <code>oci</code>,
+    <code>virtio</code>, <code>imagefs</code>, and <code>vmruntime</code>.
+  </p>
+  <h3>Moves</h3>
+  <ul>
+    <li><code>managedMountState</code> becomes <code>mounts.State</code>.</li>
+    <li><code>addRuntimeShareMount</code> becomes a method or small package function.</li>
+    <li><code>addImageMount</code> becomes a method or small package function.</li>
+    <li>Snapshot helpers move beside mount state because they operate on mounted roots/images.</li>
+  </ul>
+  <h3>Acceptance</h3>
+  <ul>
+    <li>No <code>internal/vm/mounts</code> import of <code>internal/vm</code>.</li>
+    <li>Existing share/image/snapshot behavior stays covered by moved tests.</li>
+    <li><code>internal/vm</code> only calls the package instead of owning the state maps.</li>
+  </ul>
+
+  <h2>Phase 2: Extract Network State</h2>
+  <p>
+    Move shared network state and wrappers out of <code>network_common.go</code> into <code>internal/vm/netstate</code>.
+    Leave platform-specific network runtime implementations in place initially.
+  </p>
+  <h3>Moves</h3>
+  <ul>
+    <li><code>managedNetworkState</code> becomes <code>netstate.State</code>.</li>
+    <li>Port forward and service proxy wrapper helpers move with it.</li>
+    <li>IPv4 fallback/reporting logic moves with it.</li>
+  </ul>
+  <h3>Acceptance</h3>
+  <ul>
+    <li>Linux/Darwin/Windows network runtimes still satisfy small interfaces used by <code>netstate</code>.</li>
+    <li>No package cycle through <code>internal/vm</code>.</li>
+    <li>Tests validate user-visible behavior: disabled network errors, fallback behavior, and IPv4 reporting.</li>
+  </ul>
+
+  <h2>Phase 3: Extract Managed Exec Planning</h2>
+  <p>
+    Move the policy code for managed exec/control requests into <code>internal/vm/execplan</code>.
+    This makes it clear that request normalization and capability checks are guest-management policy,
+    not backend orchestration.
+  </p>
+  <h3>Moves</h3>
+  <ul>
+    <li><code>managed_exec_request.go</code></li>
+    <li><code>managed_control_request.go</code></li>
+    <li><code>managed_feature.go</code></li>
+    <li>Applicable helpers from <code>managed_session_helpers.go</code></li>
+  </ul>
+  <h3>Acceptance</h3>
+  <ul>
+    <li>Capability gates are tested through allowed/denied operations, not table mirrors.</li>
+    <li>The package accepts interfaces/functions for path resolution and user lookup.</li>
+    <li><code>internal/vm</code> composes the planner with roots, env defaults, and user resolution.</li>
+  </ul>
+
+  <h2>Phase 4: Extract Sidecar Protocol and Session</h2>
+  <p>
+    Move the sidecar worker protocol and managed session out before moving the entire sidecar host.
+    This avoids a large tangled extraction and immediately shrinks <code>sidecar_host.go</code>.
+  </p>
+  <h3>Moves</h3>
+  <ul>
+    <li><code>worker_protocol.go</code></li>
+    <li><code>sidecar_managed_session.go</code></li>
+    <li>Startup hello parsing, worker dialing, launch command creation, daemon close/wait helpers.</li>
+  </ul>
+  <h3>Deferred</h3>
+  <p>
+    Keep <code>sidecarVMHost</code> orchestration in <code>internal/vm</code> until the protocol/session boundary
+    is stable. The full host extraction can happen later.
+  </p>
+
+  <h2>Phase 5: Extract Built-in Guest Policy</h2>
+  <p>
+    Move built-in image lookup and guest launch descriptors into <code>internal/vm/builtin</code>.
+    This package should describe what <code>@openbsd</code> and <code>@freebsd</code> mean without owning the
+    low-level backend boot process.
+  </p>
+  <h3>Moves</h3>
+  <ul>
+    <li>Profile lookup for built-in BSD images.</li>
+    <li>Guest-specific hostname/interface/cache defaults.</li>
+    <li>Artifact builder descriptors for OpenBSD and FreeBSD, parameterized by network spec.</li>
+  </ul>
+  <h3>Acceptance</h3>
+  <ul>
+    <li>Adding another built-in OS does not require editing backend-specific routing tables in multiple places.</li>
+    <li>Backend code receives a launch descriptor and handles the host mechanics.</li>
+  </ul>
+
+  <h2>Phase 6: Backend Package Split</h2>
+  <p>
+    Split host backend implementations only after the leaf packages are extracted. Doing this first would be
+    mostly mechanical churn and would likely create import cycles.
+  </p>
+  <h3>Possible End State</h3>
+  <ul>
+    <li><code>internal/vm/host/kvm</code></li>
+    <li><code>internal/vm/host/hvf</code></li>
+    <li><code>internal/vm/host/whp</code></li>
+    <li><code>internal/vm/host/sidecar</code></li>
+  </ul>
+  <p>
+    The exact names can be revisited when the boundaries are clearer. The important part is that host packages
+    implement small backend interfaces and do not own guest policy.
+  </p>
+
+  <h2>Testing Strategy</h2>
+  <ul>
+    <li>Move unit tests with extracted code.</li>
+    <li>Keep runtime boot tests in <code>internal/vm</code> or a future integration package because they validate the facade.</li>
+    <li>Avoid tests that mirror private tables or exact helper construction.</li>
+    <li>Prefer tests that validate functional requirements: mount conflict behavior, capability gates, network fallback, worker handshake, and guest exec behavior.</li>
+  </ul>
+
+  <h2>Review Strategy</h2>
+  <ol>
+    <li>One extraction per commit where possible.</li>
+    <li>No behavior changes in extraction commits unless a bug falls out and is separately explained.</li>
+    <li>Run <code>go test ./internal/vm ./internal/managed/... ./internal/vm/mounts ./internal/vm/netstate ./internal/vm/sidecar</code> as packages appear.</li>
+    <li>Run <code>go test ./...</code> before each PR update.</li>
+  </ol>
+
+  <h2>Risks</h2>
+  <ul>
+    <li>Package cycles through <code>client</code>, <code>vmruntime</code>, or <code>internal/vm</code>.</li>
+    <li>Over-exporting internals just to make extraction easy.</li>
+    <li>Moving build-tagged files without preserving platform behavior.</li>
+    <li>Large sidecar extraction turning into behavioral changes.</li>
+  </ul>
+
+  <h2>First Concrete Step</h2>
+  <p>
+    Start with <code>internal/vm/mounts</code>. It has the best dependency shape, it removes real clutter from
+    <code>internal/vm</code>, and it gives the refactor a low-risk first merge point.
+  </p>
+</main>
+</body>
+</html>

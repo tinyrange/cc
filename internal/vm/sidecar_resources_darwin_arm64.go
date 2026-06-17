@@ -20,6 +20,7 @@ import (
 	"j5.nz/cc/internal/kernel/ubuntu"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/virtio"
+	"j5.nz/cc/internal/vm/mounts"
 	"j5.nz/cc/internal/vmruntime"
 )
 
@@ -545,7 +546,7 @@ func sidecarShareMounts(shares []client.ShareMount) ([]virtio.ShareMount, error)
 		return nil, nil
 	}
 	out := make([]virtio.ShareMount, 0, len(shares))
-	for i, share := range convertShareMounts(shares) {
+	for i, share := range mounts.ConvertShareMounts(shares) {
 		mount, err := arm64ShareMount(share)
 		if err != nil {
 			return nil, fmt.Errorf("share %d: %w", i, err)
@@ -556,7 +557,7 @@ func sidecarShareMounts(shares []client.ShareMount) ([]virtio.ShareMount, error)
 }
 
 func sidecarRuntimeShareMount(share client.ShareMount) (virtio.ShareMount, error) {
-	shares := convertShareMounts([]client.ShareMount{share})
+	shares := mounts.ConvertShareMounts([]client.ShareMount{share})
 	if len(shares) != 1 {
 		return virtio.ShareMount{}, fmt.Errorf("runtime share is required")
 	}

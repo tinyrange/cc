@@ -2,17 +2,13 @@ package vm
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"j5.nz/cc/client"
@@ -21,6 +17,11 @@ import (
 	managedguest "j5.nz/cc/internal/managed/guest"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/virtio"
+	"j5.nz/cc/internal/vm/execplan"
+	hostmanaged "j5.nz/cc/internal/vm/host/managed"
+	"j5.nz/cc/internal/vm/mounts"
+	"j5.nz/cc/internal/vm/netstate"
+	sidecarpkg "j5.nz/cc/internal/vm/sidecar"
 	"j5.nz/cc/internal/vmruntime"
 )
 
@@ -106,9 +107,9 @@ func (h *sidecarVMHost) StartStream(ctx context.Context, req client.CreateInstan
 		resources.closeAll()
 		return nil, err
 	}
-	sidecar.cleanups = append(sidecar.cleanups, resources.close)
+	sidecar.AddCleanup(resources.close)
 	req.ID = DefaultInstanceID
-	if _, err := sidecar.worker.Start(ctx, req, onEvent); err != nil {
+	if _, err := sidecar.Worker().Start(ctx, req, onEvent); err != nil {
 		_ = sidecar.Close()
 		return nil, err
 	}
@@ -129,9 +130,9 @@ func (h *sidecarVMHost) StartBlankStream(ctx context.Context, req client.StartIn
 		resources.closeAll()
 		return nil, err
 	}
-	sidecar.cleanups = append(sidecar.cleanups, resources.close)
+	sidecar.AddCleanup(resources.close)
 	req.ID = DefaultInstanceID
-	if _, err := sidecar.worker.StartBlank(ctx, req, onEvent); err != nil {
+	if _, err := sidecar.Worker().StartBlank(ctx, req, onEvent); err != nil {
 		_ = sidecar.Close()
 		return nil, err
 	}
@@ -198,7 +199,7 @@ func (h *sidecarVMHost) prepareExecInInstance(ctx context.Context, inst *sidecar
 	if targetImage == "" || targetImage == runningImage {
 		return req, nil
 	}
-	if err := checkAlternateImageExec(inst); err != nil {
+	if err := execplan.CheckAlternateImageExec(inst); err != nil {
 		return client.ExecRequest{}, err
 	}
 	if h.images == nil {
@@ -228,12 +229,12 @@ func rootDirWithinMount(mountPath, rootDir string) string {
 func (h *sidecarVMHost) prepareRunInInstanceExec(ctx context.Context, inst *sidecarInstance, runningImage string, req client.RunRequest) (client.ExecRequest, error) {
 	targetImage := strings.TrimSpace(req.Image)
 	if targetImage == "" || targetImage == runningImage {
-		if err := addRuntimeShares(ctx, inst, req.Shares); err != nil {
+		if err := mounts.AddRuntimeShares(ctx, inst, req.Shares); err != nil {
 			return client.ExecRequest{}, err
 		}
 		return runExecRequest(req), nil
 	}
-	if err := checkAlternateImageExec(inst); err != nil {
+	if err := execplan.CheckAlternateImageExec(inst); err != nil {
 		return client.ExecRequest{}, err
 	}
 	if h.images == nil {
@@ -245,14 +246,14 @@ func (h *sidecarVMHost) prepareRunInInstanceExec(ctx context.Context, inst *side
 	}
 	image = sidecarWithRuntimeMountDirs(image)
 	mountPath := sidecarImageMountPath(targetImage)
-	if err := mountAlternateImageWithShares(ctx, inst, inst, mountPath, image, req.Shares); err != nil {
+	if err := mounts.MountAlternateImageWithShares(ctx, inst, inst, mountPath, image, req.Shares); err != nil {
 		return client.ExecRequest{}, err
 	}
-	return resolveRunExecRequest(req, mountPath, managedExecResolver{
-		root:           image.RootFS,
-		baseEnv:        image.Config.Env,
-		defaultWorkDir: image.Config.WorkingDir,
-		env:            sidecarEffectiveExecEnv,
+	return execplan.ResolveRunRequest(req, mountPath, execplan.Resolver{
+		Root:           image.RootFS,
+		BaseEnv:        image.Config.Env,
+		DefaultWorkDir: image.Config.WorkingDir,
+		Env:            sidecarEffectiveExecEnv,
 	})
 }
 
@@ -327,7 +328,7 @@ func (h *sidecarVMHost) prepareBlankResources(ctx context.Context, req client.St
 	return prepareSidecarBlankResources(h, ctx, req)
 }
 
-func (h *sidecarVMHost) launch(ctx context.Context, env []string) (*sidecarDaemon, error) {
+func (h *sidecarVMHost) launch(ctx context.Context, env []string) (*sidecarpkg.Daemon, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, err
@@ -336,7 +337,11 @@ func (h *sidecarVMHost) launch(ctx context.Context, env []string) (*sidecarDaemo
 	if err != nil {
 		return nil, err
 	}
-	cmd := sidecarLaunchCommand(exe, h.cacheDir, controlSocket, env)
+	cmd := sidecarpkg.LaunchCommand(exe, h.cacheDir, controlSocket, env, sidecarpkg.LaunchOptions{
+		DisableEnv: sidecarDisableEnv,
+		ControlEnv: sidecarControlEnv,
+		ModeEnv:    sidecarModeEnv,
+	})
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("prepare sidecar stdout: %w", err)
@@ -347,7 +352,7 @@ func (h *sidecarVMHost) launch(ctx context.Context, env []string) (*sidecarDaemo
 	started := true
 	defer func() {
 		if !started && cmd.Process != nil {
-			_ = killSidecarCommand(cmd)
+			_ = sidecarpkg.KillCommand(cmd)
 		}
 	}()
 	select {
@@ -356,32 +361,17 @@ func (h *sidecarVMHost) launch(ctx context.Context, env []string) (*sidecarDaemo
 		return nil, ctx.Err()
 	default:
 	}
-	hello, err := readSidecarStartupHello(stdout)
+	hello, err := sidecarpkg.ReadStartupHello(stdout)
 	if err != nil {
 		started = false
 		return nil, err
 	}
-	worker, err := dialSidecarWorker(ctx, hello.Addr)
+	worker, err := sidecarpkg.DialWorker(ctx, hello.Addr)
 	if err != nil {
 		started = false
 		return nil, err
 	}
-	return &sidecarDaemon{cmd: cmd, worker: worker, stdout: stdout, cleanups: []func(){sidecarControlCleanup(controlSocket)}}, nil
-}
-
-func readSidecarStartupHello(r io.Reader) (client.ServerHello, error) {
-	var hello client.ServerHello
-	if err := json.NewDecoder(r).Decode(&hello); err != nil {
-		return client.ServerHello{}, fmt.Errorf("read sidecar startup banner: %w", err)
-	}
-	if hello.Error != "" || hello.Kind == "error" {
-		detail := firstNonEmpty(hello.Detail, hello.Error, "unknown startup error")
-		return client.ServerHello{}, fmt.Errorf("sidecar ccvm failed to start: %s", detail)
-	}
-	if strings.TrimSpace(hello.Addr) == "" {
-		return client.ServerHello{}, fmt.Errorf("sidecar ccvm did not report an address")
-	}
-	return hello, nil
+	return sidecarpkg.NewDaemon(cmd, worker, stdout, []func(){sidecarControlCleanup(controlSocket)}), nil
 }
 
 func (h *sidecarVMHost) sidecarControlSocketPath() (string, error) {
@@ -455,129 +445,48 @@ func sidecarControlCleanup(address string) func() {
 	}
 }
 
-func sidecarLaunchCommand(exe, cacheDir, controlSocket string, env []string) *exec.Cmd {
-	args := sidecarLaunchArgs()
-	args = append(args, "-worker", "-cache-dir", cacheDir)
-	cmd := exec.Command(exe, args...)
-	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), sidecarDisableEnv+"=1", sidecarControlEnv+"="+controlSocket)
-	cmd.Env = append(cmd.Env, env...)
-	return cmd
-}
-
-func sidecarLaunchArgs() []string {
-	switch strings.TrimSpace(os.Getenv(sidecarModeEnv)) {
-	case "vmsh-internal":
-		return nil
-	default:
-		return nil
-	}
-}
-
-type sidecarDaemon struct {
-	cmd      *exec.Cmd
-	worker   *sidecarWorkerClient
-	stdout   io.ReadCloser
-	once     sync.Once
-	err      error
-	cleanups []func()
-}
-
-func (d *sidecarDaemon) Close() error {
-	d.once.Do(func() {
-		if d.worker != nil {
-			d.err = d.worker.Close()
-		}
-		if d.stdout != nil {
-			_ = d.stdout.Close()
-		}
-		closeSidecarCleanups(d.cleanups)
-		if d.cmd != nil {
-			if err := waitSidecarCommand(d.cmd, 5*time.Second); d.err == nil && err != nil {
-				d.err = err
-			}
-		}
-	})
-	return d.err
-}
-
-func waitSidecarCommand(cmd *exec.Cmd, timeout time.Duration) error {
-	if cmd == nil {
-		return nil
-	}
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Wait()
-	}()
-	select {
-	case err := <-done:
-		return err
-	case <-time.After(timeout):
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		return <-done
-	}
-}
-
-func killSidecarCommand(cmd *exec.Cmd) error {
-	if cmd == nil {
-		return nil
-	}
-	if cmd.Process != nil {
-		_ = cmd.Process.Kill()
-	}
-	return cmd.Wait()
-}
-
-func closeSidecarCleanups(cleanups []func()) {
-	for i := len(cleanups) - 1; i >= 0; i-- {
-		if cleanups[i] != nil {
-			cleanups[i]()
-		}
-	}
-}
-
 type sidecarInstance struct {
 	*managedInstanceCore
-	id          string
-	sidecar     *sidecarDaemon
-	rootFS      sidecarRootFS
-	imageName   string
-	resolver    *sidecarCommandResolver
-	mounts      managedMountState
-	networkIPv4 string
-	network     *networkRuntime
+	id           string
+	sidecar      *sidecarpkg.Daemon
+	rootFS       sidecarRootFS
+	imageName    string
+	resolver     *sidecarCommandResolver
+	mounts       mounts.State
+	networkIPv4  string
+	network      *networkRuntime
+	hasImageRoot bool
 }
 
-func newSidecarInstance(id string, sidecar *sidecarDaemon, imageName string, resources sidecarStartResources) *sidecarInstance {
+func newSidecarInstance(id string, sidecar *sidecarpkg.Daemon, imageName string, resources sidecarStartResources) *sidecarInstance {
 	inst := &sidecarInstance{
-		id:          id,
-		sidecar:     sidecar,
-		rootFS:      resources.rootFS,
-		imageName:   imageName,
-		resolver:    resources.resolver,
-		networkIPv4: resources.networkIPv4,
-		network:     resources.network,
+		id:           id,
+		sidecar:      sidecar,
+		rootFS:       resources.rootFS,
+		imageName:    imageName,
+		resolver:     resources.resolver,
+		networkIPv4:  resources.networkIPv4,
+		network:      resources.network,
+		hasImageRoot: resources.resolver != nil,
 	}
 	inst.managedInstanceCore = newSidecarManagedCore(inst.managedSession(), resources.resolver)
 	return inst
 }
 
-func newSidecarManagedCore(session *sidecarManagedSession, resolver *sidecarCommandResolver) *managedInstanceCore {
-	core := &managedInstanceCore{
-		osName:       "sidecar",
-		session:      session,
-		caps:         managedguest.LinuxProfile.Caps,
-		env:          sidecarEffectiveExecEnv,
-		markResolved: true,
+func newSidecarManagedCore(session *sidecarpkg.ManagedSession, resolver *sidecarCommandResolver) *managedInstanceCore {
+	cfg := hostmanaged.Config{
+		OSName:       "sidecar",
+		Session:      session,
+		Capabilities: managedguest.LinuxProfile.Caps,
+		Env:          sidecarEffectiveExecEnv,
+		MarkResolved: true,
 	}
 	if resolver != nil {
-		core.root = resolver.root
-		core.baseEnv = append([]string(nil), resolver.baseEnv...)
-		core.workDir = resolver.workDir
+		cfg.Root = resolver.root
+		cfg.BaseEnv = resolver.baseEnv
+		cfg.WorkDir = resolver.workDir
 	}
-	return core
+	return hostmanaged.NewCore(cfg)
 }
 
 func (i *sidecarInstance) ManagedCapabilities() guestCapabilities {
@@ -614,11 +523,11 @@ func (r *sidecarCommandResolver) resolve(req client.ExecRequest) (client.ExecReq
 	if r == nil || req.SkipResolve {
 		return req, nil
 	}
-	resolved, err := resolveManagedExecRequest(req, managedExecResolver{
-		root:           r.root,
-		baseEnv:        r.baseEnv,
-		defaultWorkDir: r.workDir,
-		env:            sidecarEffectiveExecEnv,
+	resolved, err := execplan.ResolveExecRequest(req, execplan.Resolver{
+		Root:           r.root,
+		BaseEnv:        r.baseEnv,
+		DefaultWorkDir: r.workDir,
+		Env:            sidecarEffectiveExecEnv,
 	})
 	if err != nil {
 		return client.ExecRequest{}, err
@@ -636,11 +545,11 @@ func sidecarEffectiveExecEnv(base, overrides []string, replace bool) []string {
 
 func (i *sidecarInstance) addCoordinatorShare(share client.ShareMount) error {
 	if i == nil || i.rootFS == nil {
-		return addRuntimeShareMount(nil, nil, nil, share, "runtime shares", nil)
+		return mounts.AddRuntimeShareMount(nil, nil, nil, share, "runtime shares", nil)
 	}
 	mounter, ok := i.rootFS.(virtio.ShareMounter)
 	if !ok {
-		return addRuntimeShareMount(nil, nil, nil, share, "runtime shares", nil)
+		return mounts.AddRuntimeShareMount(nil, nil, nil, share, "runtime shares", nil)
 	}
 	return i.mounts.AddShare(mounter, share, "runtime shares", sidecarRuntimeShareMount)
 }
@@ -653,46 +562,46 @@ func (i *sidecarInstance) AddShare(ctx context.Context, share client.ShareMount)
 func (i *sidecarInstance) AddImage(ctx context.Context, mountPath string, image *oci.Image) error {
 	_ = ctx
 	if i == nil || i.rootFS == nil {
-		return addImageMount(nil, nil, nil, mountPath, image, imageFSBackend(image))
+		return mounts.AddImageMount(nil, nil, nil, mountPath, image, mounts.ImageFSBackend(image))
 	}
 	mounter, ok := i.rootFS.(virtio.ShareMounter)
 	if !ok {
-		return addImageMount(nil, nil, nil, mountPath, image, imageFSBackend(image))
+		return mounts.AddImageMount(nil, nil, nil, mountPath, image, mounts.ImageFSBackend(image))
 	}
-	return i.mounts.AddImage(mounter, mountPath, image, imageFSBackend(image))
+	return i.mounts.AddImage(mounter, mountPath, image, mounts.ImageFSBackend(image))
 }
 
 func (i *sidecarInstance) AddPortForward(ctx context.Context, forward client.PortForward) error {
 	if i == nil {
-		return addManagedNetworkPortForward(ctx, nil, forward)
+		return netstate.AddManagedNetworkPortForward(ctx, nil, forward)
 	}
-	return addManagedNetworkPortForward(ctx, i.network, forward)
+	return netstate.AddManagedNetworkPortForward(ctx, i.network, forward)
 }
 
 func (i *sidecarInstance) AllowServiceProxyPort(ctx context.Context, port int) error {
 	if i == nil {
-		return allowManagedNetworkServiceProxyPort(ctx, nil, port)
+		return netstate.AllowManagedNetworkServiceProxyPort(ctx, nil, port)
 	}
-	return allowManagedNetworkServiceProxyPort(ctx, i.network, port)
+	return netstate.AllowManagedNetworkServiceProxyPort(ctx, i.network, port)
 }
 
 func (i *sidecarInstance) resolveExecRequest(req client.ExecRequest) (client.ExecRequest, error) {
 	core := i.managedCore()
-	if sidecarShouldPassthroughToWorker(core, req) {
+	if sidecarShouldPassthroughToWorker(i.hasImageRoot, core, req) {
 		return req, nil
 	}
-	resolved, err := core.execRequest(req)
+	resolved, err := core.ExecRequest(req)
 	if err != nil {
 		return client.ExecRequest{}, err
 	}
 	return resolved, nil
 }
 
-func (i *sidecarInstance) managedSession() *sidecarManagedSession {
+func (i *sidecarInstance) managedSession() *sidecarpkg.ManagedSession {
 	if i == nil || i.sidecar == nil {
-		return &sidecarManagedSession{}
+		return sidecarpkg.NewManagedSession(nil, "")
 	}
-	return &sidecarManagedSession{worker: i.sidecar.worker, id: i.id}
+	return sidecarpkg.NewManagedSession(i.sidecar.Worker(), i.id)
 }
 
 func (i *sidecarInstance) managedCore() *managedInstanceCore {
@@ -705,8 +614,8 @@ func (i *sidecarInstance) managedCore() *managedInstanceCore {
 	return newSidecarManagedCore(i.managedSession(), i.resolver)
 }
 
-func sidecarShouldPassthroughToWorker(core *managedInstanceCore, req client.ExecRequest) bool {
-	return core == nil || (req.Kind == "" && !req.SkipResolve && core.root == nil)
+func sidecarShouldPassthroughToWorker(hasImageRoot bool, core *managedInstanceCore, req client.ExecRequest) bool {
+	return core == nil || (req.Kind == "" && !req.SkipResolve && !hasImageRoot)
 }
 
 func (i *sidecarInstance) Flush(ctx context.Context) error {
@@ -719,31 +628,31 @@ func (i *sidecarInstance) ConsoleHistory(ctx context.Context) (string, error) {
 
 func (i *sidecarInstance) RootSnapshot() (imagefs.Directory, error) {
 	if i == nil || i.rootFS == nil {
-		return managedRootSnapshot(nil, "")
+		return mounts.RootSnapshot(nil, "")
 	}
-	return managedRootSnapshotWithCapabilities("sidecar", i.ManagedCapabilities(), i.rootFS, "")
+	return mounts.RootSnapshotWithCapabilities("sidecar", i.ManagedCapabilities(), i.rootFS, "")
 }
 
 func (i *sidecarInstance) SnapshotImage(imageName string) (imagefs.Directory, error) {
 	if i == nil || i.rootFS == nil {
-		return managedRootSnapshot(nil, "")
+		return mounts.RootSnapshot(nil, "")
 	}
 	if strings.TrimSpace(i.imageName) == imageName {
 		return i.RootSnapshot()
 	}
-	return managedImageSnapshotWithCapabilities("sidecar", i.ManagedCapabilities(), i.rootFS, imageName, sidecarImageMountPath(imageName))
+	return mounts.ImageSnapshotWithCapabilities("sidecar", i.ManagedCapabilities(), i.rootFS, imageName, sidecarImageMountPath(imageName))
 }
 
 func (i *sidecarInstance) NetworkIPv4() string {
 	if i == nil {
 		return ""
 	}
-	return managedNetworkIPv4(i.network, i.networkIPv4)
+	return netstate.IPv4(i.network, i.networkIPv4)
 }
 
 func (i *sidecarInstance) Exec(ctx context.Context, req client.ExecRequest) (client.ExecResponse, error) {
 	core := i.managedCore()
-	if sidecarShouldPassthroughToWorker(core, req) {
+	if sidecarShouldPassthroughToWorker(i.hasImageRoot, core, req) {
 		return i.managedSession().Exec(ctx, req)
 	}
 	return core.Exec(ctx, req)
@@ -751,7 +660,7 @@ func (i *sidecarInstance) Exec(ctx context.Context, req client.ExecRequest) (cli
 
 func (i *sidecarInstance) ExecStream(ctx context.Context, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
 	core := i.managedCore()
-	if sidecarShouldPassthroughToWorker(core, req) {
+	if sidecarShouldPassthroughToWorker(i.hasImageRoot, core, req) {
 		return i.managedSession().ExecStream(ctx, req, inputs, onEvent)
 	}
 	return core.ExecStream(ctx, req, inputs, onEvent)
@@ -765,331 +674,5 @@ func (i *sidecarInstance) Close() error {
 	if i == nil || i.sidecar == nil {
 		return nil
 	}
-	return closeManagedSession(i.managedSession(), i.sidecar.Close)
-}
-
-type sidecarWorkerClient struct {
-	conn   net.Conn
-	codec  *WorkerCodec
-	callMu sync.Mutex
-	idMu   sync.Mutex
-	next   uint64
-}
-
-func dialSidecarWorker(ctx context.Context, socketPath string) (*sidecarWorkerClient, error) {
-	var conn net.Conn
-	var err error
-	network, address := sidecarWorkerDialTarget(socketPath)
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		conn, err = net.Dial(network, address)
-		if err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("dial sidecar worker control socket: %w", err)
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
-	client := &sidecarWorkerClient{conn: conn, codec: NewWorkerCodec(conn)}
-	frame, err := client.codec.Receive()
-	if err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("read sidecar worker hello: %w", err)
-	}
-	if frame.Type != WorkerFrameHello {
-		_ = conn.Close()
-		return nil, fmt.Errorf("sidecar worker sent %q before hello", frame.Type)
-	}
-	return client, nil
-}
-
-func sidecarWorkerDialTarget(address string) (string, string) {
-	if strings.HasPrefix(address, "tcp://") {
-		return "tcp", strings.TrimPrefix(address, "tcp://")
-	}
-	return "unix", address
-}
-
-func (c *sidecarWorkerClient) Close() error {
-	if c == nil || c.conn == nil {
-		return nil
-	}
-	return c.conn.Close()
-}
-
-func (c *sidecarWorkerClient) Start(ctx context.Context, req client.CreateInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
-	var resp WorkerStartResponse
-	err := c.call(ctx, WorkerFrameStart, req, func(frame WorkerFrame) error {
-		if frame.Type != WorkerFrameEvent || onEvent == nil {
-			return nil
-		}
-		var event client.BootEvent
-		if err := frame.DecodePayload(&event); err != nil {
-			return err
-		}
-		return onEvent(event)
-	}, &resp)
-	return resp.State, err
-}
-
-func (c *sidecarWorkerClient) StartBlank(ctx context.Context, req client.StartInstanceRequest, onEvent func(client.BootEvent) error) (client.InstanceState, error) {
-	var resp WorkerStartResponse
-	err := c.call(ctx, WorkerFrameStartBlank, req, func(frame WorkerFrame) error {
-		if frame.Type != WorkerFrameEvent || onEvent == nil {
-			return nil
-		}
-		var event client.BootEvent
-		if err := frame.DecodePayload(&event); err != nil {
-			return err
-		}
-		return onEvent(event)
-	}, &resp)
-	return resp.State, err
-}
-
-func (c *sidecarWorkerClient) Status(ctx context.Context, id string) (client.InstanceState, error) {
-	var resp WorkerStatusResponse
-	err := c.call(ctx, WorkerFrameStatus, WorkerStatusRequest{ID: id}, nil, &resp)
-	return resp.State, err
-}
-
-func (c *sidecarWorkerClient) Stop(ctx context.Context, id string) error {
-	var resp WorkerStatusResponse
-	return c.call(ctx, WorkerFrameStop, WorkerStopRequest{ID: id}, nil, &resp)
-}
-
-func (c *sidecarWorkerClient) Wait(ctx context.Context, id string) error {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		state, err := c.Status(ctx, id)
-		if err != nil {
-			return err
-		}
-		if state.Status != "running" && state.Status != "starting" {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
-	}
-}
-
-func (c *sidecarWorkerClient) Flush(ctx context.Context, id string) error {
-	var resp map[string]string
-	return c.call(ctx, WorkerFrameFlush, WorkerFlushRequest{ID: id}, nil, &resp)
-}
-
-func (c *sidecarWorkerClient) ConsoleHistory(ctx context.Context, id string) (string, error) {
-	var resp WorkerConsoleResponse
-	err := c.call(ctx, WorkerFrameConsole, WorkerConsoleRequest{ID: id}, nil, &resp)
-	return resp.History, err
-}
-
-func (c *sidecarWorkerClient) Exec(ctx context.Context, id string, req client.ExecRequest) ([]client.ExecEvent, error) {
-	var events []client.ExecEvent
-	err := c.ExecStream(ctx, id, req, nil, func(event client.ExecEvent) error {
-		events = append(events, event)
-		return nil
-	})
-	return events, err
-}
-
-func (c *sidecarWorkerClient) ExecStream(ctx context.Context, id string, req client.ExecRequest, inputs <-chan client.ExecInput, onEvent func(client.ExecEvent) error) error {
-	if c == nil || c.codec == nil {
-		return fmt.Errorf("sidecar worker is not connected")
-	}
-	c.callMu.Lock()
-	defer c.callMu.Unlock()
-
-	requestID := c.nextID()
-	frame, err := NewWorkerFrame(requestID, WorkerServiceControl, WorkerFrameExec, WorkerExecRequest{
-		ID:          id,
-		Request:     req,
-		InputStream: inputs != nil,
-	})
-	if err != nil {
-		return err
-	}
-	if err := c.codec.Send(frame); err != nil {
-		return err
-	}
-
-	var stopInputs chan struct{}
-	if inputs != nil {
-		stopInputs = make(chan struct{})
-		defer close(stopInputs)
-		go c.forwardWorkerExecInputs(requestID, inputs, stopInputs)
-	}
-
-	cancelDone := make(chan struct{})
-	cancelSent := make(chan struct{}, 1)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = c.conn.SetReadDeadline(time.Now())
-			_ = c.sendWorkerCancel(requestID)
-			cancelSent <- struct{}{}
-		case <-cancelDone:
-		}
-	}()
-	defer func() {
-		close(cancelDone)
-		_ = c.conn.SetReadDeadline(time.Time{})
-	}()
-
-	for {
-		got, err := c.codec.Receive()
-		if err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return err
-		}
-		if got.ID != requestID {
-			continue
-		}
-		switch got.Type {
-		case WorkerFrameError:
-			var workerErr WorkerError
-			if err := got.DecodePayload(&workerErr); err != nil {
-				return err
-			}
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return fmt.Errorf("%s", workerErr.Error)
-		case WorkerFrameDone:
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			return nil
-		case WorkerFrameEvent:
-			var event client.ExecEvent
-			if err := got.DecodePayload(&event); err != nil {
-				return err
-			}
-			if onEvent != nil {
-				if err := onEvent(event); err != nil {
-					return err
-				}
-			}
-		}
-	}
-}
-
-func (c *sidecarWorkerClient) call(ctx context.Context, frameType string, payload any, onFrame func(WorkerFrame) error, out any) error {
-	if c == nil || c.codec == nil {
-		return fmt.Errorf("sidecar worker is not connected")
-	}
-	c.callMu.Lock()
-	defer c.callMu.Unlock()
-	cancelDone := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = c.conn.SetReadDeadline(time.Now())
-		case <-cancelDone:
-		}
-	}()
-	defer func() {
-		close(cancelDone)
-		_ = c.conn.SetReadDeadline(time.Time{})
-	}()
-	id := c.nextID()
-	frame, err := NewWorkerFrame(id, WorkerServiceControl, frameType, payload)
-	if err != nil {
-		return err
-	}
-	if err := c.codec.Send(frame); err != nil {
-		return err
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		got, err := c.codec.Receive()
-		if err != nil {
-			return err
-		}
-		if got.ID != id {
-			continue
-		}
-		switch got.Type {
-		case WorkerFrameError:
-			var workerErr WorkerError
-			if err := got.DecodePayload(&workerErr); err != nil {
-				return err
-			}
-			return fmt.Errorf("%s", workerErr.Error)
-		case WorkerFrameDone:
-			if out != nil && len(got.Payload) != 0 {
-				return got.DecodePayload(out)
-			}
-			return nil
-		default:
-			if onFrame != nil {
-				if err := onFrame(got); err != nil {
-					return err
-				}
-			}
-		}
-	}
-}
-
-func (c *sidecarWorkerClient) nextID() uint64 {
-	c.idMu.Lock()
-	defer c.idMu.Unlock()
-	c.next++
-	return c.next
-}
-
-func (c *sidecarWorkerClient) forwardWorkerExecInputs(id uint64, inputs <-chan client.ExecInput, stop <-chan struct{}) {
-	for {
-		select {
-		case <-stop:
-			return
-		case input, ok := <-inputs:
-			if !ok {
-				frame, err := NewWorkerFrame(id, WorkerServiceControl, WorkerFrameExecInput, WorkerExecInput{Closed: true})
-				if err == nil {
-					_ = c.codec.Send(frame)
-				}
-				return
-			}
-			frame, err := NewWorkerFrame(id, WorkerServiceControl, WorkerFrameExecInput, WorkerExecInput{Input: input})
-			if err != nil {
-				return
-			}
-			if err := c.codec.Send(frame); err != nil {
-				return
-			}
-		}
-	}
-}
-
-func (c *sidecarWorkerClient) sendWorkerCancel(id uint64) error {
-	frame, err := NewWorkerFrame(id, WorkerServiceControl, WorkerFrameCancel, WorkerCancelRequest{})
-	if err != nil {
-		return err
-	}
-	return c.codec.Send(frame)
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if value != "" {
-			return value
-		}
-	}
-	return ""
+	return hostmanaged.CloseSession(i.managedSession(), i.sidecar.Close)
 }

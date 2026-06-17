@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -23,6 +22,10 @@ import (
 	managedruntime "j5.nz/cc/internal/managed/runtime"
 	"j5.nz/cc/internal/oci"
 	"j5.nz/cc/internal/virtio"
+	"j5.nz/cc/internal/vm/execplan"
+	kvmhost "j5.nz/cc/internal/vm/host/kvm"
+	"j5.nz/cc/internal/vm/mounts"
+	"j5.nz/cc/internal/vm/netstate"
 	"j5.nz/cc/internal/vmruntime"
 )
 
@@ -77,8 +80,8 @@ func (b *runtimeBackend) StartStream(ctx context.Context, req client.CreateInsta
 		}()
 	}
 	fsdevs, rootFS, err := amd64vm.BuildFSDevices(vmruntime.RunRequest{
-		RootFS: linuxRuntimeImageFS(image),
-		Shares: convertShareMounts(req.Shares),
+		RootFS: kvmhost.RuntimeImageFS(image),
+		Shares: mounts.ConvertShareMounts(req.Shares),
 	}, nil)
 	if err != nil {
 		return nil, err
@@ -240,7 +243,7 @@ func (b *runtimeBackend) StartBlankStream(ctx context.Context, req client.StartI
 		dmesg:   req.Dmesg,
 	}
 	if image != nil {
-		mountPath := linuxImageMountPath(imageName)
+		mountPath := kvmhost.ImageMountPath(imageName)
 		if err := inst.AddImage(ctx, mountPath, image); err != nil {
 			_ = started.Session.Close()
 			return nil, err
@@ -261,7 +264,7 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 	if resp, ok, err := b.runBuiltinGuest(ctx, req); ok || err != nil {
 		return resp, err
 	}
-	if len(req.Command) != 0 && !linuxRootFSImageEnabled() {
+	if len(req.Command) != 0 && !kvmhost.RootFSImageEnabled() {
 		inst, err := b.StartStream(ctx, client.CreateInstanceRequest{
 			ID:             req.ID,
 			Image:          req.Image,
@@ -316,14 +319,14 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 		if err != nil {
 			return client.ExecResponse{}, err
 		}
-		if linuxRootFSImageEnabled() {
+		if kvmhost.RootFSImageEnabled() {
 			if len(req.Shares) != 0 {
 				return client.ExecResponse{}, fmt.Errorf("rootfs image mode does not support runtime shares yet")
 			}
 		} else {
 			devs, _, err := amd64vm.BuildFSDevices(vmruntime.RunRequest{
-				RootFS: linuxRuntimeImageFS(image),
-				Shares: convertShareMounts(req.Shares),
+				RootFS: kvmhost.RuntimeImageFS(image),
+				Shares: mounts.ConvertShareMounts(req.Shares),
 			}, nil)
 			if err != nil {
 				return client.ExecResponse{}, err
@@ -354,12 +357,12 @@ func (b *runtimeBackend) Run(ctx context.Context, req client.RunRequest) (client
 	initCfg := linuxGuestInitConfig(modules, len(req.Command) != 0, req.Network, network)
 	if len(fsdevs) != 0 {
 		initCfg.RootFSTag = vmruntime.RootFSTag
-	} else if image != nil && linuxRootFSImageEnabled() {
-		rootImageType, err := linuxRootFSImageType()
+	} else if image != nil && kvmhost.RootFSImageEnabled() {
+		rootImageType, err := kvmhost.RootFSImageType()
 		if err != nil {
 			return client.ExecResponse{}, err
 		}
-		rootImage, err := buildLinuxRootFSImage(ctx, image.RootFS, rootImageType)
+		rootImage, err := kvmhost.BuildRootFSImage(ctx, image.RootFS, rootImageType)
 		if err != nil {
 			return client.ExecResponse{}, err
 		}
@@ -443,14 +446,14 @@ func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runni
 	if targetImage == "" || targetImage == runningImage {
 		shares := req.Shares
 		if session, ok := inst.(*linuxInstance); ok && session.defaultRootDir != "" {
-			shares = rebaseRuntimeShares(session.defaultRootDir, shares)
+			shares = mounts.RebaseRuntimeShares(session.defaultRootDir, shares)
 		}
-		if err := addRuntimeShares(ctx, inst, shares); err != nil {
+		if err := mounts.AddRuntimeShares(ctx, inst, shares); err != nil {
 			return client.ExecResponse{}, err
 		}
 		return inst.Exec(ctx, runExecRequest(req))
 	}
-	if err := checkAlternateImageExec(inst); err != nil {
+	if err := execplan.CheckAlternateImageExec(inst); err != nil {
 		return client.ExecResponse{}, err
 	}
 	if isBuiltinGuestImage(targetImage) {
@@ -472,16 +475,16 @@ func (b *runtimeBackend) RunInInstance(ctx context.Context, inst Instance, runni
 		return client.ExecResponse{}, err
 	}
 	image = withLinuxRuntimeMountDirs(image)
-	mountPath := linuxImageMountPath(targetImage)
-	if err := mountAlternateImageWithShares(ctx, inst, session, mountPath, image, req.Shares); err != nil {
+	mountPath := kvmhost.ImageMountPath(targetImage)
+	if err := mounts.MountAlternateImageWithShares(ctx, inst, session, mountPath, image, req.Shares); err != nil {
 		return client.ExecResponse{}, err
 	}
 
-	execReq, err := resolveRunExecRequest(req, mountPath, managedExecResolver{
-		root:           image.RootFS,
-		baseEnv:        image.Config.Env,
-		defaultWorkDir: image.Config.WorkingDir,
-		env:            mergeImageRunEnv,
+	execReq, err := execplan.ResolveRunRequest(req, mountPath, execplan.Resolver{
+		Root:           image.RootFS,
+		BaseEnv:        image.Config.Env,
+		DefaultWorkDir: image.Config.WorkingDir,
+		Env:            mergeImageRunEnv,
 	})
 	if err != nil {
 		return client.ExecResponse{}, err
@@ -494,14 +497,14 @@ func (b *runtimeBackend) RunInInstanceStream(ctx context.Context, inst Instance,
 	if targetImage == "" || targetImage == runningImage {
 		shares := req.Shares
 		if session, ok := inst.(*linuxInstance); ok && session.defaultRootDir != "" {
-			shares = rebaseRuntimeShares(session.defaultRootDir, shares)
+			shares = mounts.RebaseRuntimeShares(session.defaultRootDir, shares)
 		}
-		if err := addRuntimeShares(ctx, inst, shares); err != nil {
+		if err := mounts.AddRuntimeShares(ctx, inst, shares); err != nil {
 			return err
 		}
 		return inst.ExecStream(ctx, runExecRequest(req), inputs, onEvent)
 	}
-	if err := checkAlternateImageExec(inst); err != nil {
+	if err := execplan.CheckAlternateImageExec(inst); err != nil {
 		return err
 	}
 	if isBuiltinGuestImage(targetImage) {
@@ -523,16 +526,16 @@ func (b *runtimeBackend) RunInInstanceStream(ctx context.Context, inst Instance,
 		return err
 	}
 	image = withLinuxRuntimeMountDirs(image)
-	mountPath := linuxImageMountPath(targetImage)
-	if err := mountAlternateImageWithShares(ctx, inst, session, mountPath, image, req.Shares); err != nil {
+	mountPath := kvmhost.ImageMountPath(targetImage)
+	if err := mounts.MountAlternateImageWithShares(ctx, inst, session, mountPath, image, req.Shares); err != nil {
 		return err
 	}
 
-	execReq, err := resolveRunExecRequest(req, mountPath, managedExecResolver{
-		root:           image.RootFS,
-		baseEnv:        image.Config.Env,
-		defaultWorkDir: image.Config.WorkingDir,
-		env:            mergeImageRunEnv,
+	execReq, err := execplan.ResolveRunRequest(req, mountPath, execplan.Resolver{
+		Root:           image.RootFS,
+		BaseEnv:        image.Config.Env,
+		DefaultWorkDir: image.Config.WorkingDir,
+		Env:            mergeImageRunEnv,
 	})
 	if err != nil {
 		return err
@@ -546,7 +549,7 @@ func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance
 	if targetImage == "" || targetImage == runningImage {
 		return inst.ExecStream(ctx, req, inputs, onEvent)
 	}
-	if err := checkAlternateImageExec(inst); err != nil {
+	if err := execplan.CheckAlternateImageExec(inst); err != nil {
 		return err
 	}
 	if isBuiltinGuestImage(targetImage) {
@@ -567,8 +570,8 @@ func (b *runtimeBackend) ExecInInstanceStream(ctx context.Context, inst Instance
 		return err
 	}
 	image = withLinuxRuntimeMountDirs(image)
-	mountPath := linuxImageMountPath(targetImage)
-	if err := mountAlternateImageWithShares(ctx, inst, session, mountPath, image, nil); err != nil {
+	mountPath := kvmhost.ImageMountPath(targetImage)
+	if err := mounts.MountAlternateImageWithShares(ctx, inst, session, mountPath, image, nil); err != nil {
 		return err
 	}
 	req.RootDir = rootDirWithinMount(mountPath, req.RootDir)
@@ -628,7 +631,7 @@ type linuxInstance struct {
 	fsdevs         []*virtio.FS
 	network        *linuxNetworkRuntime
 	dmesg          bool
-	mounts         managedMountState
+	mounts         mounts.State
 }
 
 func (i *linuxInstance) VirtioFSStats() []virtio.FSStats {
@@ -641,33 +644,33 @@ func (i *linuxInstance) VirtioFSStats() []virtio.FSStats {
 func (i *linuxInstance) AddShare(ctx context.Context, share client.ShareMount) error {
 	_ = ctx
 	if i == nil || i.rootFS == nil {
-		return addRuntimeShareMount(nil, nil, nil, share, "shares", nil)
+		return mounts.AddRuntimeShareMount(nil, nil, nil, share, "shares", nil)
 	}
 	return i.mounts.AddShare(i.rootFS, share, "shares", func(share client.ShareMount) (virtio.ShareMount, error) {
-		return buildRuntimeDirectoryShare(share, amd64vm.BuildShareMount)
+		return mounts.BuildRuntimeDirectoryShare(share, amd64vm.BuildShareMount)
 	})
 }
 
 func (i *linuxInstance) AddPortForward(ctx context.Context, forward client.PortForward) error {
 	if i == nil || i.network == nil {
-		return addManagedNetworkPortForward(ctx, nil, forward)
+		return netstate.AddManagedNetworkPortForward(ctx, nil, forward)
 	}
-	return addManagedNetworkPortForward(ctx, i.network.networkRuntime, forward)
+	return netstate.AddManagedNetworkPortForward(ctx, i.network.networkRuntime, forward)
 }
 
 func (i *linuxInstance) AllowServiceProxyPort(ctx context.Context, port int) error {
 	if i == nil || i.network == nil {
-		return allowManagedNetworkServiceProxyPort(ctx, nil, port)
+		return netstate.AllowManagedNetworkServiceProxyPort(ctx, nil, port)
 	}
-	return allowManagedNetworkServiceProxyPort(ctx, i.network.networkRuntime, port)
+	return netstate.AllowManagedNetworkServiceProxyPort(ctx, i.network.networkRuntime, port)
 }
 
 func (i *linuxInstance) AddImage(ctx context.Context, mountPath string, image *oci.Image) error {
 	_ = ctx
 	if i == nil {
-		return addImageMount(nil, nil, nil, mountPath, image, nil)
+		return mounts.AddImageMount(nil, nil, nil, mountPath, image, nil)
 	}
-	return i.mounts.AddImage(i.rootFS, mountPath, image, linuxRuntimeImageFS(image))
+	return i.mounts.AddImage(i.rootFS, mountPath, image, kvmhost.RuntimeImageFS(image))
 }
 
 func linuxGuestInitConfig(modules []alpine.Module, managedExec bool, network *client.NetworkConfig, runtime *linuxNetworkRuntime) vmruntime.GuestInitConfig {
@@ -699,11 +702,11 @@ func linuxGuestInitConfig(modules []alpine.Module, managedExec bool, network *cl
 
 func linuxRuntimeConfigVars(image *oci.Image, extraModules ...string) []string {
 	vars := []string{"CONFIG_VIRTIO_MMIO", "CONFIG_FUSE_FS", "CONFIG_VIRTIO_FS", "CONFIG_VSOCKETS", "CONFIG_VIRTIO_VSOCKETS", "CONFIG_HW_RANDOM", "CONFIG_HW_RANDOM_VIRTIO", "CONFIG_VIRTIO_NET", "CONFIG_OVERLAY_FS"}
-	if linuxRootFSImageEnabled() {
+	if kvmhost.RootFSImageEnabled() {
 		vars = append(vars, "CONFIG_BLK_DEV_LOOP")
-		rootImageType, err := linuxRootFSImageType()
+		rootImageType, err := kvmhost.RootFSImageType()
 		if err == nil {
-			vars = append(vars, linuxRootFSImageConfigVars(rootImageType)...)
+			vars = append(vars, kvmhost.RootFSImageConfigVars(rootImageType)...)
 		}
 	}
 	vars = append(vars, linuxRuntimeExtraConfigVars(extraModules)...)
@@ -811,8 +814,8 @@ func withLinuxRuntimeMountDirs(image *oci.Image) *oci.Image {
 		_ = overlay.AddDir(dir, fs.ModeDir|0o755)
 	}
 	_ = overlay.AddDir("/tmp", fs.ModeDir|0o1777)
-	addLinuxRuntimeIdentityFiles(overlay, os.Getuid(), os.Getgid())
-	addLinuxRuntimeHostnameFiles(overlay)
+	kvmhost.AddRuntimeIdentityFiles(overlay, os.Getuid(), os.Getgid())
+	kvmhost.AddRuntimeHostnameFiles(overlay)
 	cloned := *image
 	cloned.RootFS = overlay.Root()
 	return &cloned
@@ -824,14 +827,9 @@ func blankLinuxRuntimeRootFS() imagefs.Directory {
 		_ = overlay.AddDir(dir, fs.ModeDir|0o755)
 	}
 	_ = overlay.AddDir("/tmp", fs.ModeDir|0o1777)
-	addLinuxRuntimeIdentityFiles(overlay, os.Getuid(), os.Getgid())
-	addLinuxRuntimeHostnameFiles(overlay)
+	kvmhost.AddRuntimeIdentityFiles(overlay, os.Getuid(), os.Getgid())
+	kvmhost.AddRuntimeHostnameFiles(overlay)
 	return overlay.Root()
-}
-
-func linuxImageMountPath(image string) string {
-	replacer := strings.NewReplacer("/", "_", ":", "_", "@", "_", " ", "_")
-	return filepath.Join("/.ccx3", "images", replacer.Replace(image))
 }
 
 func linuxEffectiveExecEnv(base, overrides []string, replace bool) []string {
@@ -842,5 +840,5 @@ func linuxEffectiveExecEnv(base, overrides []string, replace bool) []string {
 }
 
 func linuxResolveExecUser(user string) (string, error) {
-	return resolveLinuxRuntimeExecUser("linux amd64", user)
+	return kvmhost.ResolveRuntimeExecUser("linux amd64", user)
 }

@@ -10,6 +10,7 @@ import (
 	"j5.nz/cc/client"
 	"j5.nz/cc/internal/kernel/alpine"
 	"j5.nz/cc/internal/oci"
+	vmhost "j5.nz/cc/internal/vm/host"
 )
 
 func NewRuntimeManager(kernel *alpine.Manager, images *oci.Store, guestInitCache string, rootCache string, worker bool) *Manager {
@@ -18,7 +19,7 @@ func NewRuntimeManager(kernel *alpine.Manager, images *oci.Store, guestInitCache
 		return NewManagerWithBackend(backend)
 	}
 	mgr := NewManagerWithHosts(
-		newInProcessVMHost(backend, darwinInProcessCapabilities),
+		vmhost.NewInProcess(backend, darwinInProcessCapabilities),
 		NewLocalSidecarVMHost(rootCache, kernel, images, guestInitCache),
 	)
 	mgr.capabilities = func() client.CapabilitiesResponse {

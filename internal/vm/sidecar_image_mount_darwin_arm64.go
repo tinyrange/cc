@@ -2,6 +2,8 @@
 
 package vm
 
+import hvfhost "j5.nz/cc/internal/vm/host/hvf"
+
 func sidecarImageMountPath(image string) string {
-	return imageMountPath(image)
+	return hvfhost.ImageMountPath(image)
 }

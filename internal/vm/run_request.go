@@ -21,18 +21,6 @@ func runExecRequest(req client.RunRequest) client.ExecRequest {
 	}
 }
 
-func resolveRunExecRequest(req client.RunRequest, rootDir string, resolver managedExecResolver) (client.ExecRequest, error) {
-	execReq := runExecRequest(req)
-	execReq.RootDir = rootDir
-	resolved, err := resolveManagedExecRequest(execReq, resolver)
-	if err != nil {
-		return client.ExecRequest{}, err
-	}
-	resolved.ReplaceEnv = true
-	resolved.SkipResolve = true
-	return resolved, nil
-}
-
 func mergeImageRunEnv(base, overrides []string, _ bool) []string {
 	return vmruntime.WithDefaultEnv(vmruntime.MergeEnv(base, overrides))
 }

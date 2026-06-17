@@ -35,15 +35,6 @@ type netstackVirtioBackend struct {
 	runtime *networkRuntime
 }
 
-type managedNetworkState struct {
-	runtime *networkRuntime
-	ipv4    string
-}
-
-type portForwardFallback interface {
-	AddPortForward(context.Context, client.PortForward) error
-}
-
 type networkDeviceConfig struct {
 	ID      string
 	Config  *client.NetworkConfig
@@ -269,66 +260,6 @@ func (n *networkRuntime) AllowServiceProxyPort(port int) error {
 	}
 	n.stack.AllowServiceProxyPort(port)
 	return nil
-}
-
-func addPortForwardToNetwork(network *networkRuntime, forward client.PortForward) error {
-	if network == nil {
-		return fmt.Errorf("instance network is not enabled")
-	}
-	return network.AddPortForward(forward)
-}
-
-func allowServiceProxyPortOnNetwork(network *networkRuntime, port int) error {
-	if network == nil {
-		return fmt.Errorf("instance network is not enabled")
-	}
-	return network.AllowServiceProxyPort(port)
-}
-
-func (s managedNetworkState) AddPortForward(forward client.PortForward) error {
-	return addPortForwardToNetwork(s.runtime, forward)
-}
-
-func (s managedNetworkState) AddPortForwardWithFallback(ctx context.Context, forward client.PortForward, fallback portForwardFallback) error {
-	if s.runtime != nil {
-		return s.runtime.AddPortForward(forward)
-	}
-	if fallback != nil {
-		return fallback.AddPortForward(ctx, forward)
-	}
-	return addPortForwardToNetwork(nil, forward)
-}
-
-func (s managedNetworkState) AllowServiceProxyPort(port int) error {
-	return allowServiceProxyPortOnNetwork(s.runtime, port)
-}
-
-func (s managedNetworkState) IPv4() string {
-	if strings.TrimSpace(s.ipv4) != "" {
-		return s.ipv4
-	}
-	if s.runtime == nil {
-		return ""
-	}
-	return s.runtime.GuestAddress()
-}
-
-func addManagedNetworkPortForward(ctx context.Context, runtime *networkRuntime, forward client.PortForward) error {
-	_ = ctx
-	return (managedNetworkState{runtime: runtime}).AddPortForward(forward)
-}
-
-func addManagedNetworkPortForwardWithFallback(ctx context.Context, runtime *networkRuntime, forward client.PortForward, fallback portForwardFallback) error {
-	return (managedNetworkState{runtime: runtime}).AddPortForwardWithFallback(ctx, forward, fallback)
-}
-
-func allowManagedNetworkServiceProxyPort(ctx context.Context, runtime *networkRuntime, port int) error {
-	_ = ctx
-	return (managedNetworkState{runtime: runtime}).AllowServiceProxyPort(port)
-}
-
-func managedNetworkIPv4(runtime *networkRuntime, explicit string) string {
-	return (managedNetworkState{runtime: runtime, ipv4: explicit}).IPv4()
 }
 
 func (n *networkRuntime) acceptPortForward(ln net.Listener, guestAddress string) {
